@@ -59,10 +59,10 @@ describe('view registry settings flow', () => {
   });
 
   it('opens and closes settings through the dedicated view store', () => {
-    useViewStore.getState().openSettings('model');
+    useViewStore.getState().openSettings('tools');
 
     expect(useViewStore.getState().viewMode).toBe('settings');
-    expect(useViewStore.getState().activeSettingsTab).toBe('model');
+    expect(useViewStore.getState().activeSettingsTab).toBe('tools');
 
     useViewStore.getState().closeSettings();
 
@@ -77,9 +77,9 @@ describe('view registry settings flow', () => {
     }
     expect(screen.getByRole('button', { name: '客户端' })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '模型' }));
+    fireEvent.click(screen.getByRole('button', { name: '工具与权限' }));
 
-    expect(useViewStore.getState().activeSettingsTab).toBe('model');
+    expect(useViewStore.getState().activeSettingsTab).toBe('tools');
   });
 
   it('falls back to the first registered settings page when the active tab is unknown', () => {

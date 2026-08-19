@@ -3,7 +3,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { Sidebar } from '../components/layout';
+import { Header, Sidebar } from '../components/layout';
 import { SettingsRightPanel } from '../components/settings/SettingsRightPanel';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
 import { SystemSettingsPage } from '../components/settings/pages/SystemSettingsPage';
@@ -218,12 +218,12 @@ describe('设置页上下文右栏', () => {
   });
 });
 
-describe('模型页右栏的会话来源', () => {
+// 设置里那个只读的「模型」页删掉后，会话级模型覆盖只剩顶栏模型标签一个入口。
+describe('会话模型覆盖的入口与去向', () => {
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     useSettingsStore.setState({ adminToken: 'admin-token', isAuthenticated: true });
-    useViewStore.setState({ activeSettingsTab: 'model' });
     fetchMock = vi.fn(async () => jsonResponse({}));
     vi.stubGlobal('fetch', fetchMock);
   });
@@ -234,16 +234,28 @@ describe('模型页右栏的会话来源', () => {
     vi.restoreAllMocks();
   });
 
-  async function editAndSave() {
-    fireEvent.change(screen.getByPlaceholderText('留空以保留当前值'), { target: { value: 'sk-test' } });
+  function renderHeader(sessionId: string) {
+    return render(
+      <Header
+        isGenerating={false}
+        onCancel={() => undefined}
+        onReset={() => undefined}
+        onTitleChange={() => undefined}
+        sessionId={sessionId}
+        title="父对话"
+      />,
+    );
+  }
+
+  async function openModelModalAndSave() {
+    fireEvent.click(screen.getByTitle('模型配置'));
+    fireEvent.change(await screen.findByPlaceholderText('留空以保留当前值'), { target: { value: 'sk-test' } });
     fireEvent.click(await screen.findByRole('button', { name: '保存' }));
   }
 
-  it('覆盖写到聊天里当前选中的会话上', async () => {
-    useChatStore.setState({ conversations: [conversation], activeConversationId: 'conv-1' });
-
-    render(<SettingsRightPanel />);
-    await editAndSave();
+  it('覆盖写到顶栏当前那个会话上', async () => {
+    renderHeader('sess-abcdef');
+    await openModelModalAndSave();
 
     await waitFor(() => {
       const targets = fetchMock.mock.calls.map(([input]) => String(input));
@@ -252,10 +264,8 @@ describe('模型页右栏的会话来源', () => {
   });
 
   it('没有活动会话时拒绝保存并说明原因', async () => {
-    useChatStore.setState({ conversations: [], activeConversationId: null });
-
-    render(<SettingsRightPanel />);
-    await editAndSave();
+    renderHeader('');
+    await openModelModalAndSave();
 
     expect(await screen.findByText('没有活动会话')).toBeInTheDocument();
     const targets = fetchMock.mock.calls.map(([input]) => String(input));
