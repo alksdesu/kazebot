@@ -98,6 +98,15 @@ export const PermissionsPage = () => (
             默认关：这条兜底分不清引用的是它、还是另一张已经处理过的卡片，是误批的直接成因。开了也仍然要求只剩一条待审批、且那张卡片确实发给了本人。
           </p>
         </BoolOption>
+        <BoolOption
+          configKey="approval_bare_verb_unique"
+          desc="不引用卡片、整句只发「同意」时，按当前唯一待审批处理。"
+          label="直接回同意"
+        >
+          <p className="qc-opt-desc">
+            默认开：收到卡片后直接回「同意」就能批。只在你名下恰好剩一条待审批、且那张卡片确实发给你时成立；有多条会让你指定，一条都没有时就当普通聊天。
+          </p>
+        </BoolOption>
       </Grid>
     </Block>
 

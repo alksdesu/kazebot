@@ -932,6 +932,26 @@ def _parse_approval_reply_verb(text: str) -> Optional[str]:
     return _approval_verb(normalized)
 
 
+def _unique_pending_approval_for(user_id: Any) -> str:
+    """恰好一条待审批、且那张卡片确实发给本人时返回它的 id，否则空串。"""
+    _prune_expired_approvals()
+    if len(_pending_approvals) != 1:
+        return ""
+    only_id = next(iter(_pending_approvals))
+    uid = _as_qq_id(user_id)
+    if uid is None or uid not in _approval_card_recipients(only_id):
+        return ""
+    return only_id
+
+
+def _pending_approvals_for(user_id: Any) -> int:
+    """本人收到过卡片的待审批条数，用于裸动词歧义时给出可操作的提示。"""
+    uid = _as_qq_id(user_id)
+    if uid is None:
+        return 0
+    return sum(1 for aid in _pending_approvals if uid in _approval_card_recipients(aid))
+
+
 def _resolve_pending_approval_id(token: str) -> tuple[Optional[str], str]:
     """允许管理员用完整 approval_id 或唯一前缀审批；命中已处理条目时告知而非误批。"""
     _prune_expired_approvals()
@@ -8622,6 +8642,20 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
             if not approval_id:
                 await _private_matcher.finish(error)
             await _finish_approval_decision(user_id, approval_id, decision)
+
+    # 收到卡片后最自然的回复就是「同意」两个字，既没引用也没带 ID。只认本人名下恰好
+    # 一条待审批的情况：0 条说明这就是句普通聊天，多条则无从判断指的是哪一条。
+    if live.approval_bare_verb_unique:
+        bare_verb = _parse_approval_reply_verb(user_text)
+        if bare_verb is not None and _can("approval", event):
+            unique_id = _unique_pending_approval_for(user_id)
+            if unique_id:
+                await _finish_approval_decision(user_id, unique_id, bare_verb)
+            elif _pending_approvals_for(user_id) > 1:
+                await _private_matcher.finish(
+                    "你名下有多条待审批，分不清是哪一条。请引用那张卡片回复，"
+                    "或发送：审批 同意 <ID>。"
+                )
 
     # 命令顺序与群侧一致：清记忆 / 死信 / 切模型在私聊里只有名单能用，而名单恒过闸门。
     clear_mem_reply = await _maybe_handle_clear_group_memory_command(

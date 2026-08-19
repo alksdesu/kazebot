@@ -529,6 +529,11 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         env=("ONEBOT_APPROVAL_REPLY_UNIQUE_FALLBACK",),
         note="引用审批卡片但取不到 approval_id 时，回退到「当前唯一待审批」；开着更好用，也更容易误批",
     ),
+    LiveKey(
+        "approval_bare_verb_unique", "approval.bare_verb_unique", BOOL, True,
+        env=("ONEBOT_APPROVAL_BARE_VERB_UNIQUE",),
+        note="不引用卡片、整句只发「同意」时按当前唯一待审批处理；要求那张卡片确实发给本人",
+    ),
     # 群历史
     LiveKey(
         "group_history_max", "history.group_max", int_in(min_value=0), 20,
