@@ -1,20 +1,16 @@
 """把存量部署的会话键摘要从无盐迁移到加盐：离线、可 dry-run、失败可中止。
 
-只改 bot 拥有的三样东西（记忆目录名、.hit_cache.json 前缀、路由状态键），
+只改 bot 拥有的东西（记忆目录名、.hit_cache.json 前缀、路由状态键），
 按 real_conversation_keys 逐条重算摘要，不动 supervisor 的 sessions.json。
 """
 from __future__ import annotations
 
 import argparse
 import importlib.util
-import json
 import os
 import secrets
-import shutil
 import sys
-import time
 from dataclasses import dataclass, field
-from hashlib import sha256
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -34,26 +30,11 @@ digest = _conversation_hash.digest
 LEGACY_MARKER = _conversation_hash.LEGACY_MARKER
 _SECRET_RE = _conversation_hash._SECRET_RE
 
-import engine.memory_hit_cache as hit_cache  # noqa: E402
-from engine.eventlog_rotation import eventlog_file_lock  # noqa: E402
+from engine.conversation_migration import (  # noqa: E402
+    Rename, apply_migration, plan_migration,
+)
 
 _SECRET_BYTES = 32
-_HIT_KEY_SEP = "/"
-
-
-def _namespace_dir(stable_key: str) -> str:
-    return "conv_" + sha256(stable_key.encode("utf-8")).hexdigest()[:24]
-
-
-@dataclass
-class Rename:
-    real: str
-    old_stable: str
-    new_stable: str
-    old_ns: str
-    new_ns: str
-    dir_exists: bool
-    target_exists: bool
 
 
 @dataclass
@@ -74,22 +55,7 @@ class MigrationReport:
 
     @property
     def changed_renames(self) -> list[Rename]:
-        return [r for r in self.renames if r.old_stable != r.new_stable]
-
-
-def _load_route_map(route_state_file: Path) -> dict[str, str]:
-    if not route_state_file.exists():
-        return {}
-    try:
-        data = json.loads(route_state_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    real_map = data.get("real_conversation_keys")
-    if not isinstance(real_map, dict):
-        return {}
-    return {str(k): str(v) for k, v in real_map.items() if str(k) and str(v)}
+        return [r for r in self.renames if r.changed]
 
 
 def _resolve_target_secret(secret_file: Path, override: str | None) -> tuple[str, bool]:
@@ -110,48 +76,6 @@ def _resolve_target_secret(secret_file: Path, override: str | None) -> tuple[str
     return secrets.token_hex(_SECRET_BYTES), already
 
 
-def _rewrite_hit_cache(workspace: Path, ns_renames: dict[str, str]) -> int:
-    """把 .hit_cache.json 里被改名 namespace 的前缀换成新目录名，复用侧车的锁与原子写。"""
-    if not ns_renames:
-        return 0
-    path = hit_cache.hit_cache_path(workspace)
-    if not path.exists():
-        return 0
-    with eventlog_file_lock(path):
-        cache = hit_cache.read_hit_cache(workspace)
-        rewritten: dict[str, str] = {}
-        changed = 0
-        for key, stamp in cache.items():
-            ns_part, sep, rest = key.partition(_HIT_KEY_SEP)
-            if sep and ns_part in ns_renames:
-                rewritten[f"{ns_renames[ns_part]}{_HIT_KEY_SEP}{rest}"] = stamp
-                changed += 1
-            else:
-                rewritten[key] = stamp
-        if not changed:
-            return 0
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(rewritten), encoding="utf-8")
-        os.replace(tmp, path)
-        return changed
-
-
-def _rewrite_route_state(route_state_file: Path, renames: list[Rename]) -> int:
-    remap = {r.old_stable: r.new_stable for r in renames if r.old_stable != r.new_stable}
-    if not remap:
-        return 0
-    data = json.loads(route_state_file.read_text(encoding="utf-8"))
-    real_map = data.get("real_conversation_keys")
-    if not isinstance(real_map, dict):
-        return 0
-    rebuilt = {remap.get(str(k), str(k)): str(v) for k, v in real_map.items()}
-    data["real_conversation_keys"] = rebuilt
-    tmp = route_state_file.with_suffix(route_state_file.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, route_state_file)
-    return len(remap)
-
-
 def _write_secret(secret_file: Path, secret: str) -> None:
     secret_file.parent.mkdir(parents=True, exist_ok=True)
     tmp = secret_file.with_name(f"{secret_file.name}.{os.getpid()}.tmp")
@@ -163,87 +87,34 @@ def _write_secret(secret_file: Path, secret: str) -> None:
         pass
 
 
-def _fresh_backup_dir(workspace: Path) -> Path:
-    base = workspace / "data" / f"migration_backup_{time.strftime('%Y%m%d_%H%M%S')}"
-    candidate = base
-    suffix = 1
-    while candidate.exists():
-        candidate = base.with_name(f"{base.name}_{suffix}")
-        suffix += 1
-    return candidate
-
-
-def _backup(backup_dir: Path, memory_root: Path, route_state_file: Path, renames: list[Rename]) -> None:
-    backup_dir.mkdir(parents=True, exist_ok=False)
-    if route_state_file.exists():
-        shutil.copy2(route_state_file, backup_dir / route_state_file.name)
-    hit_file = hit_cache.hit_cache_path(memory_root.parent.parent)
-    if hit_file.exists():
-        shutil.copy2(hit_file, backup_dir / hit_file.name)
-    for rename in renames:
-        if rename.old_stable == rename.new_stable or not rename.dir_exists:
-            continue
-        src = memory_root / rename.old_ns
-        if src.is_dir():
-            shutil.copytree(src, backup_dir / rename.old_ns)
-
-
 def run_migration(
     *, workspace: Path, apply: bool, secret: str | None = None,
 ) -> MigrationReport:
     workspace = Path(workspace)
-    route_state_file = workspace / "data" / "onebot_plugin_state.json"
-    memory_root = workspace / "data" / "memory"
     secret_file = workspace / "data" / "onebot_conversation_hash_secret"
 
     report = MigrationReport(workspace=workspace, apply=apply)
     report.target_secret, report.already_salted = _resolve_target_secret(secret_file, secret)
 
-    real_map = _load_route_map(route_state_file)
-    known_old_ns: set[str] = set()
-    known_new_ns: set[str] = set()
-    for old_stable, real in real_map.items():
-        prefix = old_stable.split(":", 1)[0]
-        new_stable = f"{prefix}:{digest(real, report.target_secret)}"
-        old_ns = _namespace_dir(old_stable)
-        new_ns = _namespace_dir(new_stable)
-        known_old_ns.add(old_ns)
-        known_new_ns.add(new_ns)
-        dir_exists = (memory_root / old_ns).is_dir()
-        target_exists = old_ns != new_ns and (memory_root / new_ns).exists()
-        report.renames.append(
-            Rename(real, old_stable, new_stable, old_ns, new_ns, dir_exists, target_exists),
-        )
-        if old_stable != new_stable and not dir_exists:
-            report.missing_source_dirs.append(old_ns)
-
-    if memory_root.is_dir():
-        for child in sorted(memory_root.glob("conv_*")):
-            if child.is_dir() and child.name not in known_old_ns and child.name not in known_new_ns:
-                report.unknown_conv_dirs.append(child.name)
+    plan = plan_migration(
+        workspace=workspace,
+        restable=lambda old_stable, real: (
+            f"{old_stable.split(':', 1)[0]}:{digest(real, report.target_secret)}"
+        ),
+    )
+    report.renames = plan.renames
+    report.missing_source_dirs = plan.missing_source_dirs
+    report.unknown_conv_dirs = plan.unknown_conv_dirs
 
     if not apply:
         return report
 
-    if report.changed_renames:
-        report.backup_dir = _fresh_backup_dir(workspace)
-        _backup(report.backup_dir, memory_root, route_state_file, report.renames)
-
-        ns_renames: dict[str, str] = {}
-        for rename in report.renames:
-            if rename.old_stable == rename.new_stable:
-                continue
-            if not rename.dir_exists:
-                continue
-            if rename.target_exists:
-                report.skipped_target_exists.append((rename.old_ns, rename.new_ns))
-                continue
-            shutil.move(str(memory_root / rename.old_ns), str(memory_root / rename.new_ns))
-            report.moved_dirs.append((rename.old_ns, rename.new_ns))
-            ns_renames[rename.old_ns] = rename.new_ns
-
-        report.hit_keys_rewritten = _rewrite_hit_cache(workspace, ns_renames)
-        report.route_keys_changed = _rewrite_route_state(route_state_file, report.renames)
+    outcome = apply_migration(workspace=workspace, plan=plan)
+    report.moved_dirs = outcome.moved_dirs
+    report.skipped_target_exists = outcome.skipped_target_exists
+    report.hit_keys_rewritten = outcome.hit_keys_rewritten
+    report.route_keys_changed = outcome.route_keys_changed
+    report.backup_dir = outcome.backup_dir
 
     # 密钥写在最后：前面任何一步抛异常都不会到这里，摘要模式保持原样，脚本可重跑。
     current = ""

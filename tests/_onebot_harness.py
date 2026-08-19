@@ -32,6 +32,9 @@ def install_nonebot_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
         def on_shutdown(self, func=None):
             return (lambda value: value) if func is None else func
 
+        def on_bot_connect(self, func=None):
+            return (lambda value: value) if func is None else func
+
     nonebot = types.ModuleType("nonebot")
     nonebot.get_bot = lambda *a, **k: None
     nonebot.get_driver = lambda: Driver()

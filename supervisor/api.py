@@ -1318,6 +1318,132 @@ def create_app(
             raise HTTPException(status_code=404, detail="session has no conversation to reset")
         return _reset_conversation(st, conv_key)
 
+    def _scope_migration():
+        """按文件加载迁移脚本：它绕开了 adapters.onebot 的 nonebot 依赖，
+        而摘要算法必须和 bot 跑的是同一份。"""
+        import importlib.util
+        import sys
+
+        key = "_supervisor_scope_migration"
+        cached = sys.modules.get(key)
+        if cached is not None:
+            return cached
+        path = Path(__file__).resolve().parents[1] / "deploy" / "migrate_qq_bot_scope.py"
+        spec = importlib.util.spec_from_file_location(key, path)
+        if spec is None or spec.loader is None:
+            raise HTTPException(status_code=500, detail="迁移脚本不可用")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[key] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def _bot_liveness(st: "SupervisorState") -> tuple[bool, str]:
+        """(bot 是否还活着, 当前登录的号)。搬迁必须在 bot 停掉之后做。"""
+        path = st.workspace_root / "data" / "qq_live_state.json"
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False, ""
+        if not isinstance(state, dict):
+            return False, ""
+        runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
+        # bot 至少每 30s 重写一次，留三倍余量再判定它真的停了。
+        alive = (time.time() - float(state.get("published_at") or 0.0)) <= 90.0
+        return alive, str(runtime.get("bot_scope") or "")
+
+    def _scope_plan_rows(report: Any) -> list[dict[str, Any]]:
+        return [
+            {
+                "old_namespace": rename.old_ns,
+                "new_namespace": rename.new_ns,
+                "has_memory": rename.dir_exists,
+                "blocked": rename.target_exists,
+            }
+            for rename in report.changed_renames
+        ]
+
+    @app.get("/v1/admin/qq/scope")
+    async def admin_qq_scope(request: Request, target: str = Query("")) -> dict[str, Any]:
+        """当前账号归属，以及搬到 target 名下会动哪些东西的预览。"""
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        migration = _scope_migration()
+        bot_alive, live_scope = _bot_liveness(st)
+        current = migration._bot_scope.load_scope(st.workspace_root)
+        payload: dict[str, Any] = {
+            "current_scope": current,
+            "live_scope": live_scope,
+            "bot_alive": bot_alive,
+            "preview": None,
+        }
+        if not target.strip():
+            return payload
+        try:
+            report = migration.run_scope_migration(
+                workspace=st.workspace_root, target_scope=target, apply=False,
+            )
+        except migration.ScopeMismatch as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        payload["preview"] = {
+            "source_scope": report.source_scope,
+            "target_scope": report.target_scope,
+            "conversations": _scope_plan_rows(report),
+            "unknown_namespaces": report.unknown_conv_dirs,
+        }
+        return payload
+
+    @app.post("/v1/admin/qq/scope/migrate")
+    async def admin_qq_scope_migrate(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        """把全部会话与长期记忆搬到另一个 bot 账号名下。"""
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        migration = _scope_migration()
+        bot_alive, _live_scope = _bot_liveness(st)
+        if bot_alive:
+            raise HTTPException(
+                status_code=409,
+                detail="bot 进程还在运行。它内存里存着按旧账号算出的会话键，搬迁会被它写回去 —— 请先停掉 bot。",
+            )
+        try:
+            report = migration.run_scope_migration(
+                workspace=st.workspace_root,
+                target_scope=str(payload.get("target") or ""),
+                source_scope=payload.get("source"),
+                apply=True,
+            )
+        except migration.ScopeMismatch as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # 立刻把内存拉回与盘一致：晚一步 flush 就会拿旧的 conversation_key 覆盖掉刚搬好的。
+        reloaded = st.reload_session_registry()
+        st.eventlog.append(
+            session_id="", component="supervisor", type_="qq_scope_migrated",
+            payload={
+                "source_scope": report.source_scope, "target_scope": report.target_scope,
+                "moved": len(report.moved_dirs), "sessions": report.sessions_changed,
+            },
+        )
+        return {
+            "ok": True,
+            "source_scope": report.source_scope,
+            "target_scope": report.target_scope,
+            "moved_memory_dirs": len(report.moved_dirs),
+            "moved_attachment_dirs": len(report.moved_attachment_dirs),
+            "hit_keys_rewritten": report.hit_keys_rewritten,
+            "route_keys_changed": report.route_keys_changed,
+            "sessions_changed": report.sessions_changed,
+            "sessions_reloaded": reloaded,
+            "skipped": [
+                {"old_namespace": old, "new_namespace": new}
+                for old, new in report.skipped_target_exists
+            ],
+            "unknown_namespaces": report.unknown_conv_dirs,
+            "backup_dir": str(report.backup_dir) if report.backup_dir else "",
+        }
+
     @app.post("/v1/tasks/{task_id}/cancel")
     async def task_cancel(task_id: str) -> dict[str, Any]:
         """取消单个 task 及其所有子任务链。"""

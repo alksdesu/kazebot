@@ -186,6 +186,20 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._defer_post_work_enqueue = False
         self.recover_pending_post_completion_work()
 
+    def reload_session_registry(self) -> int:
+        """重读 sessions.json 并重建会话键映射，返回活跃会话数。
+
+        账号迁移改的是盘上的 conversation_key，而内存才是权威 —— 不重读的话
+        下一次 flush 会把旧键写回去，迁移结果当场失效。
+        """
+        loaded_sessions, loaded_conv_map, _child_map, _parent_children = self._session_store.reload()
+        with self._lock:
+            self.sessions.clear()
+            self.sessions.update(loaded_sessions)
+            self.conversation_map.clear()
+            self.conversation_map.update(loaded_conv_map)
+        return len(loaded_sessions)
+
     def _restore_branch_finalize_claims_from_events(self) -> int:
         """Seed missing SQLite identities from legacy EventLog ownership receipts."""
         event_types = {

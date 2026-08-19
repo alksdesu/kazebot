@@ -21,9 +21,20 @@ _SECRET_BYTES = 32
 _SECRET_RE = re.compile(r"[0-9a-fA-F]{64,}")
 
 
-def digest(conversation_key: str, secret: str) -> str:
-    """会话键的 24 位摘要；secret 为空时退化成可枚举的裸 SHA256。"""
-    raw = str(conversation_key or "").strip().encode("utf-8")
+def scoped_key(conversation_key: str, bot_scope: str) -> str:
+    """按 bot 账号给会话键加作用域。空 scope 原样返回，摘要与加账号隔离前逐字相同。"""
+    raw = str(conversation_key or "").strip()
+    scope = str(bot_scope or "").strip()
+    return f"bot{scope}|{raw}" if scope else raw
+
+
+def digest(conversation_key: str, secret: str, *, bot_scope: str = "") -> str:
+    """会话键的 24 位摘要；secret 为空时退化成可枚举的裸 SHA256。
+
+    bot_scope 是当前登录的 QQ 号：拌进摘要输入，同一个群在不同 bot 号下就落到
+    不同的会话键与记忆目录，换号自动隔离、换回来自动复原。
+    """
+    raw = scoped_key(conversation_key, bot_scope).encode("utf-8")
     key = str(secret or "").encode("utf-8")
     if key:
         return hmac.new(key, raw, hashlib.sha256).hexdigest()[:24]

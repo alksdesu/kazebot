@@ -817,6 +817,40 @@ export async function resetConversationBySession(token: string, sessionId: strin
   return resp.json();
 }
 
+export interface ScopePlanRow {
+  old_namespace: string;
+  new_namespace: string;
+  has_memory: boolean;
+  blocked: boolean;
+}
+
+export interface ScopeStatus {
+  current_scope: string;
+  live_scope: string;
+  bot_alive: boolean;
+  preview: {
+    source_scope: string;
+    target_scope: string;
+    conversations: ScopePlanRow[];
+    unknown_namespaces: string[];
+  } | null;
+}
+
+export async function getQqScope(token: string, target = ''): Promise<ScopeStatus> {
+  const query = target ? `?target=${encodeURIComponent(target)}` : '';
+  const resp = await apiFetch(`/admin/qq/scope${query}`, { headers: authHeaders(token) });
+  return resp.json();
+}
+
+export async function migrateQqScope(token: string, target: string, source?: string): Promise<any> {
+  const resp = await apiFetch('/admin/qq/scope/migrate', {
+    method: 'POST',
+    headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify(source === undefined ? { target } : { target, source }),
+  });
+  return resp.json();
+}
+
 export function getSchedulesRaw(token: string): Promise<string> {
   return readRawConfig('/admin/config/schedules/raw', token);
 }

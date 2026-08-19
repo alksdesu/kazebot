@@ -71,6 +71,7 @@ from .config import (
     PENDING_APPROVAL_TTL_SECONDS,
 )
 from . import capability
+from . import bot_scope as _bot_scope
 from .conversation_hash import digest as _digest_conversation_key, resolve_secret
 from .yaml_loader import load_yaml
 from .trigger_policy import (
@@ -3841,6 +3842,42 @@ def _reset_group_history_watermark(group_id: int) -> None:
     _group_history_gap.pop(int(group_id), None)
 
 
+def _purge_conversation_side_state(conversation_key: str, target: Dict[str, Any]) -> None:
+    """清掉一个会话散落在 bot 进程与附件目录里的上下文副本，让它真正从零重新积累。
+
+    只在 clear 语义下调用 —— 漏掉任何一份，重置后它都会把旧上下文重新喂回模型。
+    """
+    _recent_images.pop(conversation_key, None)
+    _sticky_subjects.pop(conversation_key, None)
+    bucket = _sent_attachment_bucket_key(target) or f"conv:{conversation_key}"
+    _recent_sent_attachments.pop(bucket, None)
+    _sent_attachment_seq.pop(bucket, None)
+    group_id = target.get("group_id")
+    if target.get("type") == "group" and group_id is not None:
+        _group_history.pop(int(group_id), None)
+        # qq_forward 的转发候选是群历史的第二份副本，只清前者等于没清。
+        _group_content_records.pop(int(group_id), None)
+        # 清了会话还让它继续静默没有道理：运营者刚说「重新开始」，下一句就该有人应。
+        _trigger_cooldown.forget_group(int(group_id))
+    _remove_conversation_attachment_dir(conversation_key)
+
+
+def _remove_conversation_attachment_dir(conversation_key: str) -> None:
+    """删掉这个会话的入站附件目录。历史一清，里面的路径就再没有东西引用得到。"""
+    name = str(conversation_key or "").replace(":", "_")
+    # 前缀校验挡住异常 key：conversation_key 为空时拼出的会是 data/attachments 本身。
+    if not name.startswith(_QQ_ATTACHMENT_DIR_PREFIXES):
+        return
+    att_dir = Path(CLONOTH_WORKSPACE) / "data" / "attachments" / name
+    if not att_dir.is_dir():
+        return
+    import shutil as _shutil
+    try:
+        _shutil.rmtree(att_dir)
+    except OSError:
+        logger.warning("remove conversation attachment dir failed: %s", att_dir, exc_info=True)
+
+
 def _compose_history_line(
     *,
     timestamp: Any,
@@ -4504,8 +4541,36 @@ _CONVERSATION_SECRET, CONVERSATION_DIGEST_SALTED = resolve_secret(
 )
 
 
+# 当前登录的 QQ 号，参与会话键摘要。进程启动时从盘上读回来：等第一条消息才知道
+# 账号的话，那之前算出的键会落在空作用域里，记忆静默分叉成两份。
+_ACTIVE_BOT_SCOPE: str = _bot_scope.load_scope(Path(CLONOTH_WORKSPACE))
+
+
+def _active_bot_scope() -> str:
+    return _ACTIVE_BOT_SCOPE
+
+
+def _adopt_bot_scope(bot: Any) -> None:
+    """记住当前账号；换号时丢掉按旧账号算出的键缓存，让它们按新作用域重算。"""
+    global _ACTIVE_BOT_SCOPE
+    scope = _bot_scope.normalize(getattr(bot, "self_id", None))
+    if not scope or scope == _ACTIVE_BOT_SCOPE:
+        return
+    previous = _ACTIVE_BOT_SCOPE
+    _ACTIVE_BOT_SCOPE = scope
+    _bot_scope.save_scope(Path(CLONOTH_WORKSPACE), scope)
+    # real→stable 必须重算。反向表留着：旧键的在途回调还要靠它找回真实会话。
+    _stable_conversation_keys.clear()
+    logger.warning(
+        "QQ account changed (%s -> %s): conversations and memory now use a separate namespace",
+        previous or "<none>", scope,
+    )
+
+
 def _conversation_digest(conversation_key: str) -> str:
-    return _digest_conversation_key(conversation_key, _CONVERSATION_SECRET)
+    return _digest_conversation_key(
+        conversation_key, _CONVERSATION_SECRET, bot_scope=_active_bot_scope(),
+    )
 
 
 def _stable_conversation_key(real_conversation_key: str) -> str:
@@ -7047,21 +7112,17 @@ class TangQiuCallbacks:
         return None
 
     async def on_context_reset(self, conversation_key: str, reason: str, cleaned_triggers: List[TriggerInfo]) -> None:
-        """上下文重置时同步清理 QQ 侧历史缓存并重置高水位。"""
+        """上下文重置时同步清理 QQ 侧的上下文副本并重置高水位。"""
         target = _target_from_conversation_key(conversation_key)
-        if not target or target.get("type") != "group":
-            return
-        group_id = target.get("group_id")
-        if group_id is None:
+        if not target:
             return
         # compact 只是把早期原文换成摘要，缓存要留着：重置水位后下一轮重发这 20 行，
         # 是把摘要里丢掉的近期细节补回来最便宜的办法。clear 则连缓存一起丢。
         if reason != "compact":
-            _group_history.pop(int(group_id), None)
-            # 清了会话还让它继续静默没有道理：运营者刚说「重新开始」，下一句就该有人应。
-            # compact 只换掉早期原文，对话没断，冷却照旧。
-            _trigger_cooldown.forget_group(int(group_id))
-        _reset_group_history_watermark(int(group_id))
+            _purge_conversation_side_state(conversation_key, target)
+        group_id = target.get("group_id")
+        if target.get("type") == "group" and group_id is not None:
+            _reset_group_history_watermark(int(group_id))
 
     async def on_engine_restarted(self, payload: Dict[str, Any]) -> None:
         """Engine 重启后无法确认各群历史是否还在 engine 侧，全部重置以重发一次完整历史。"""
@@ -8078,6 +8139,8 @@ def _live_runtime_facts() -> Dict[str, Any]:
             "hash_secret_set": bool(CONVERSATION_HASH_SECRET),
             "conversation_digest_salted": CONVERSATION_DIGEST_SALTED,
         },
+        # 迁移功能靠它认「当前号」。空串 = 还没连上过任何账号，此时全部会话键都没作用域。
+        "bot_scope": _active_bot_scope(),
         "volatile": {
             "queue_pending": len(_qq_queue),
             "cached_groups": len(_group_history),
@@ -8278,6 +8341,13 @@ async def _startup() -> None:
     logger.info("Clonoth Agent QQ adapter started: %s", CLONOTH_BASE_URL)
 
 
+@driver.on_bot_connect
+async def _on_bot_connect(bot: Bot) -> None:
+    """连上就认账号。等第一条消息再认的话，那条消息本身还是按上一个号算键。"""
+    _adopt_bot_scope(bot)
+    _publish_live_state(force=True)
+
+
 @driver.on_shutdown
 async def _shutdown() -> None:
     """NoneBot 关闭时停止事件路由并释放 HTTP 连接。"""
@@ -8442,6 +8512,8 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
     """
     global _last_bot
     _last_bot = bot
+    # on_bot_connect 已经认过一次，这里是兜底：漏认一次就是记忆分叉，代价不对等。
+    _adopt_bot_scope(bot)
 
     if _client is None or _session_state is None:
         await matcher.finish("Clonoth Agent 尚未初始化，请稍后重试。")
@@ -8646,6 +8718,8 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     """把当前 QQ 私聊请求提交给 ClonothZX。"""
     global _last_bot
     _last_bot = bot
+    # on_bot_connect 已经认过一次，这里是兜底：漏认一次就是记忆分叉，代价不对等。
+    _adopt_bot_scope(bot)
 
     if not _is_private_allowed(event):
         # 未放行的人连「这个号是不是 bot」都不该确认；要提示就自己填 channels.private_denied_reply。

@@ -96,7 +96,9 @@ export const AccountPage = () => {
     const current = account?.nick || account?.uin || '当前账号';
     if (!window.confirm(
       `确定要换号吗？\n\n${current} 会立刻下线，NapCat 容器重启后停在等扫码状态，`
-      + '期间 bot 完全不可用。新号如果不在原来的群里，群名单和管理员名单都要重配。',
+      + '期间 bot 完全不可用。新号如果不在原来的群里，群名单和管理员名单都要重配。\n\n'
+      + '新号的会话和长期记忆从零开始，各号各记各的。想把这个号的数据带过去，'
+      + '去「记忆」页搬迁；换回来时旧数据会自动回来。',
     )) return;
     setBusy(true);
     setQrImage('');
@@ -113,7 +115,7 @@ export const AccountPage = () => {
 
   const switchTo = async (uin: string) => {
     if (!token) return;
-    if (!window.confirm(`切换到 ${uin}？当前账号会下线。`)) return;
+    if (!window.confirm(`切换到 ${uin}？当前账号会下线，会话和长期记忆各号各算。`)) return;
     setBusy(true);
     try {
       await qqQuickLogin(token, uin);

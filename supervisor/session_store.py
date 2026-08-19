@@ -173,6 +173,21 @@ class SessionStore:
         )
         return sessions, conv_map, child_map, parent_children
 
+    def reload(self) -> tuple[dict[str, SessionInfo], dict[str, str], dict[tuple[str, str, str], str], dict[str, set[str]]]:
+        """丢掉内存副本重读 sessions.json，返回与 load 相同的四元组。
+
+        只在离线改动（账号迁移改写 conversation_key）之后调用：内存才是权威，
+        不重读的话下一次 flush 会把盘上刚改好的内容原样覆盖回去。
+        """
+        with self._lock:
+            self._registry.clear()
+        result = self.load()
+        with self._lock:
+            # 内存此刻等于盘上内容，标成已落盘，免得立刻回写一遍。
+            self._generation += 1
+            self._flushed_generation = self._generation
+        return result
+
     # ------------------------------------------------------------------ #
     #  Thread-safe registry API
     # ------------------------------------------------------------------ #
