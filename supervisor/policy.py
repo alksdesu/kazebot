@@ -352,6 +352,8 @@ class PolicyEngine:
             self._policy_path.parent.mkdir(parents=True, exist_ok=True)
             text = yaml.safe_dump(_default_policy_dict(), sort_keys=False, allow_unicode=True)
             self._policy_path.write_text(text, encoding="utf-8")
+            with contextlib.suppress(OSError):
+                os.chmod(self._policy_path, 0o600)
         except Exception:
             pass
 
@@ -380,9 +382,16 @@ class PolicyEngine:
         validated = _validate_policy_dict(data)
         text = yaml.safe_dump(validated, sort_keys=False, allow_unicode=True)
         tmp = self._policy_path.with_name(self._policy_path.name + '.' + str(os.getpid()) + '.tmp')
+        # 新建的临时文件走 umask 通常是 0644，直接替换过去会把原文件的权限降下来。
+        # 策略暴露的是整套防护面的形状，同机其他用户没有理由读到。
+        mode = 0o600
+        with contextlib.suppress(OSError):
+            mode = self._policy_path.stat().st_mode & 0o777
         try:
             self._policy_path.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(text, encoding='utf-8')
+            with contextlib.suppress(OSError):
+                os.chmod(tmp, mode)
             os.replace(tmp, self._policy_path)
         except OSError as exc:
             with contextlib.suppress(OSError):
