@@ -315,7 +315,8 @@ const ScopeBlock = () => {
   const migrate = async () => {
     if (!adminToken) return;
     const to = target.trim();
-    const from = status?.current_scope || '无归属';
+    // 显示探测出的实际归属，而不是记录的当前账号 —— 存量数据两者往往不一样。
+    const from = status?.preview?.source_scope || '无归属';
     if (!window.confirm(`把全部会话与长期记忆从「${from}」搬到「${to}」？搬之前会自动备份。`)) return;
     setBusy(true);
     try {
@@ -355,7 +356,8 @@ const ScopeBlock = () => {
           <p className="qc-mem-kw">
             {plan.conversations.length === 0
               ? '这批数据已经在这个号名下了，无需搬迁。'
-              : `${plan.conversations.length} 个会话待搬，其中 ${movable.length} 个可以直接搬。`}
+              : `这批数据现属「${plan.source_scope || '无归属'}」，`
+                + `${plan.conversations.length} 个会话待搬，其中 ${movable.length} 个可以直接搬。`}
           </p>
           {plan.conversations.map((row) => (
             <p className="qc-mem-text" key={row.old_namespace}>

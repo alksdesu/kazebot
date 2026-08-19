@@ -76,6 +76,42 @@ def read_secret(workspace: Path) -> str:
     return "" if content == LEGACY_MARKER else content
 
 
+def scope_matches(workspace: Path, secret: str, scope: str) -> bool:
+    """盘上的会话键是不是按这个账号算出来的。路由表为空时无从判断，一律算匹配。"""
+    return not [
+        old_stable
+        for old_stable, real in load_route_map(route_state_file(workspace)).items()
+        if old_stable != f"{old_stable.split(':', 1)[0]}:{digest(real, secret, bot_scope=scope)}"
+    ]
+
+
+def detect_source_scope(workspace: Path, secret: str) -> str | None:
+    """认出盘上这批数据实际属于哪个账号，认不出返回 None。
+
+    记录的当前账号未必就是数据的归属：加账号隔离之前攒的数据没有作用域，而 bot
+    一登录就把当前号记下来了，两者天然对不上。
+    """
+    recorded = _bot_scope.load_scope(workspace)
+    seen: list[str] = []
+    for candidate in (recorded, "", *_known_accounts(workspace)):
+        if candidate in seen:
+            continue
+        seen.append(candidate)
+        if scope_matches(workspace, secret, candidate):
+            return candidate
+    return None
+
+
+def _known_accounts(workspace: Path) -> list[str]:
+    """NapCat 留下的账号配置文件名里带 QQ 号，用作探测候选。"""
+    config_dir = Path(workspace) / "napcat" / "config"
+    try:
+        names = [path.stem.rsplit("_", 1)[-1] for path in config_dir.glob("onebot11_*.json")]
+    except OSError:
+        return []
+    return [name for name in names if name.isdigit()]
+
+
 def verify_source_scope(workspace: Path, secret: str, source_scope: str) -> None:
     """用 --from 重算一遍，对不上就中止。
 
@@ -100,7 +136,14 @@ def run_scope_migration(
 ) -> ScopeReport:
     workspace = Path(workspace)
     secret = read_secret(workspace)
-    source = _bot_scope.load_scope(workspace) if source_scope is None else _bot_scope.normalize(source_scope)
+    if source_scope is None:
+        # 不指定源就自己认：记录的当前账号未必是这批数据的归属。
+        detected = detect_source_scope(workspace, secret)
+        if detected is None:
+            raise ScopeMismatch("认不出盘上这批会话键属于哪个账号，用 --from 显式指定")
+        source = detected
+    else:
+        source = _bot_scope.normalize(source_scope)
     target = _bot_scope.normalize(target_scope)
     if not target:
         raise ValueError("--to 必须是目标 bot 的 QQ 号（纯数字）")
@@ -186,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--to", required=True, help="目标 bot 的 QQ 号。")
     parser.add_argument(
         "--from", dest="source", default=None,
-        help='源 bot 的 QQ 号；存量无作用域数据传空串 ""。默认取已记录的当前账号。',
+        help='源 bot 的 QQ 号；存量无作用域数据传空串 ""。不给则按盘上的会话键自动认。',
     )
     parser.add_argument("--apply", action="store_true", help="真正执行；不加则只 dry-run。")
     parser.add_argument(

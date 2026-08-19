@@ -165,6 +165,26 @@ class TestScopeMigration:
         assert (report.backup_dir / seed["ns"] / "book.yaml").is_file()
         assert (report.backup_dir / "sessions.json").is_file()
 
+    def test_the_source_is_detected_when_the_recorded_account_disagrees(self, tmp_path: Path) -> None:
+        # 存量数据没有作用域，而 bot 一登录就把当前号记下了，两者天然对不上。
+        seed = _seed(tmp_path)
+        bot_scope.save_scope(tmp_path, _OLD_BOT)
+        assert migrate.detect_source_scope(tmp_path, _SECRET) == ""
+
+        report = migrate.run_scope_migration(
+            workspace=tmp_path, target_scope=_NEW_BOT, apply=True,
+        )
+
+        assert report.source_scope == ""
+        assert not (tmp_path / "data" / "memory" / seed["ns"]).exists()
+
+    def test_an_unrecognisable_source_refuses_to_guess(self, tmp_path: Path) -> None:
+        _seed(tmp_path, scope="70000009")
+        bot_scope.save_scope(tmp_path, _OLD_BOT)
+        assert migrate.detect_source_scope(tmp_path, _SECRET) is None
+        with pytest.raises(migrate.ScopeMismatch):
+            migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=True)
+
     def test_a_wrong_source_account_aborts_before_touching_anything(self, tmp_path: Path) -> None:
         seed = _seed(tmp_path, scope=_OLD_BOT)
         with pytest.raises(migrate.ScopeMismatch):
