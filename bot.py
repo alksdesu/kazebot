@@ -5,6 +5,7 @@ NapCat 的反向 WebSocket 应指向 ws://<host>:<port>/onebot/v11/ws。
 """
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -22,8 +23,25 @@ import nonebot
 from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 
 
+def _bridge_stdlib_logging() -> None:
+    """把插件与 SDK 的标准 logging 接到 loguru。
+
+    两边都用 logging.getLogger 打日志，而 NoneBot 只配置 loguru：这些 logger 没有
+    handler，propagate 到 root 后由 lastResort 兜底，等于 INFO 全部消失、只有 WARNING
+    以上漏得出来。审批归属、路由决策这类关键线索都打在 INFO 上，丢了就没法排障。
+    """
+    from nonebot.log import LoguruHandler
+
+    for name in ("nonebot.plugin.clonoth_agent", "clonoth_sdk"):
+        target = logging.getLogger(name)
+        target.handlers = [LoguruHandler()]
+        target.setLevel(logging.INFO)
+        target.propagate = False
+
+
 def main() -> None:
     nonebot.init()
+    _bridge_stdlib_logging()
     driver = nonebot.get_driver()
     driver.register_adapter(OneBotV11Adapter)
     nonebot.load_plugin("adapters.onebot")
