@@ -8,6 +8,8 @@ tool_access:
   mode: all
   deny:
     - execute_command
+    # 本节点的提示词要求命令一律交给审核节点，remote_exec 不拦就等于留了条绕过去的路。
+    - remote_exec
 prompt: |
   {{include:_shared.md}}
 

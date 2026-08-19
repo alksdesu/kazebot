@@ -16,7 +16,7 @@ SPEC = {
         'Clonoth 内部调试工具。查询任务状态、事件流、活跃任务、pending 审批等。避免每次手写 execute_command + grep。\n'
         '\n'
         'action 可选值：\n'
-        '- api: 调用任意 supervisor API 端点（需要 path，可选 method/body/params）\n'
+        '- api: 只读查询 supervisor API 端点（需要 path，可选 params；仅 GET）\n'
         '- task_events: 查某个 task 的事件流（需要 task_id，支持前缀匹配）\n'
         '- active_tasks: 列出所有活跃任务（running/pending/suspended）\n'
         '- pending_approvals: 列出未决审批\n'
@@ -37,13 +37,9 @@ SPEC = {
                 'type': 'string',
             },
             'method': {
-                'description': 'api action 用：HTTP 方法，默认 GET',
-                'enum': ['GET', 'POST', 'PUT', 'DELETE'],
+                'description': 'api action 用：只读工具，仅支持 GET',
+                'enum': ['GET'],
                 'type': 'string',
-            },
-            'body': {
-                'description': 'api action 用：POST/PUT 请求体（JSON 对象）',
-                'type': 'object',
             },
             'params': {
                 'description': 'api action 用：URL query 参数（JSON 对象）',
@@ -142,10 +138,13 @@ if __name__ == "__main__":
         path = args.get("path", "")
         if not path:
             fail("api action 需要 path 参数")
-        method = args.get("method", "GET")
-        body = args.get("body")
-        params = args.get("params")
-        output(api_call(path, method=method, body=body, params=params))
+        method = str(args.get("method", "GET") or "GET").upper()
+        # supervisor 在回环上对多数写端点不校验令牌，靠的是「同机进程可信」。
+        # 这个工具让模型也成了同机进程，放开写方法等于把那条假设作废
+        # —— POST /v1/inbound 能自带 platform_auth.is_admin，整套鉴权就绕过去了。
+        if method != "GET":
+            fail(f"api action 只能发 GET，收到 {method}；写操作请用对应的专用工具")
+        output(api_call(path, method="GET", params=args.get("params")))
     # ── task_events: 查事件流（events.jsonl） ──
     elif action == "task_events":
         if not task_id:

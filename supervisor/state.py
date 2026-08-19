@@ -13,6 +13,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# adapter 侧 platform_auth.platform 的取值，与 toolbox 那份判断保持一致。
+_QQ_PLATFORMS = {"qq", "onebot", "onebot11"}
+
 from ._helpers import SessionInfo, _now
 from .branch_finalize_store import BranchFinalizeClaimStore
 from .compact_breaker import CompactBreaker
@@ -1561,19 +1564,13 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
     ) -> OpRequestOut:
         conv_key = self._authorizing_conversation_key(session_id, task_id)
         platform_auth = dict(parameters.get("platform_auth") or {}) if isinstance(parameters.get("platform_auth"), dict) else {}
-        is_qq = conv_key.startswith("qq_")
+        # 只认 conv_key 前缀的话，一旦某条路径把 key 换成 scheduler:/agent: 之类，
+        # 底下那一整段 QQ 硬规则就静默失效；带着 QQ 身份跑的任务照样得吃这些限制。
+        is_qq = conv_key.startswith("qq_") or str(platform_auth.get("platform") or "").strip().lower() in _QQ_PLATFORMS
         is_admin = bool(platform_auth.get("is_admin"))
 
         # QQ 普通用户硬限制：禁止敏感工具与提示词读取。
         if is_qq and not is_admin:
-            path = str(parameters.get("path") or "")
-            sensitive_read_prefixes = (
-                "config/nodes/",
-                "engine/system_nodes/",
-                "data/",
-                # manage_secret 的虚拟路径，不是真目录。
-                ".secret",
-            )
             if op == "execute_command":
                 # 例外：允许非管理员群友用 curl 纯 GET 读取公网网页。
                 # 方法：由 policy.is_safe_public_curl 严格判定（不落盘、无注入、
@@ -1603,10 +1600,14 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     reason="qq non-admin users cannot modify files",
                     approval_id=None,
                 )
-            if op == "read_file" and path.replace('\\', '/').startswith(sensitive_read_prefixes):
+            # 读取一律拒绝，不再逐条列敏感前缀：源码里有鉴权逻辑本身、工具脚本里有
+            # 服务器地址、config 里有管理员 QQ 号，黑名单补不全，漏一条就是全泄。
+            # 群友没有读工作区文件的正当用途 —— 他们发的图和文件走附件通道，不经这里。
+            # list_dir 与 search_in_files 也报 read_file，一并挡住。
+            if op == "read_file":
                 return OpRequestOut(
                     safety_level=SafetyLevel.deny,
-                    reason="qq non-admin users cannot read sensitive files",
+                    reason="qq non-admin users cannot read workspace files",
                     approval_id=None,
                 )
 

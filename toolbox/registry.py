@@ -12,6 +12,7 @@ from clonoth_runtime import get_float, load_runtime_config
 
 from . import builtins as _builtins
 from ._common import kill_process_group as _kill_process_group
+from ._common import request_guard as _request_guard
 from ._common import safe_subprocess_env as _safe_subprocess_env
 from . import mcp_runtime
 
@@ -213,7 +214,39 @@ def _script_tool_env(ctx: Any) -> dict[str, str]:
     return env
 
 
-def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFunc:
+async def _script_guard_error(
+    guard: dict[str, Any], tool_name: str, args: dict[str, Any], ctx: Any,
+) -> dict[str, Any] | None:
+    """跑脚本前先过 supervisor 的策略与审批，放行返回 None。
+
+    脚本本体在子进程里，拿不到 ToolContext，这层 wrapper 是唯一挂得上闸门的地方。
+    """
+    op = str(guard.get("op") or "").strip()
+    if not op:
+        return None
+
+    parameters: dict[str, Any] = {"tool_name": tool_name}
+    mapping = guard.get("params")
+    if isinstance(mapping, dict):
+        for policy_key, arg_key in mapping.items():
+            parameters[str(policy_key)] = args.get(str(arg_key), "")
+
+    _op_res, err = await _request_guard(ctx, op, parameters)
+    if err is None:
+        return None
+    return _error_tool_response(
+        err.get("error", "denied"),
+        **{k: v for k, v in err.items() if k not in {"ok", "error"}},
+    )
+
+
+def _make_script_tool(
+    *,
+    script_path: Path,
+    timeout_sec: float | None,
+    tool_name: str = "",
+    guard: dict[str, Any] | None = None,
+) -> ToolFunc:
     """Create a tool function that runs a Python script as a subprocess.
 
     Protocol:
@@ -221,9 +254,15 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
     - Output: result as JSON on stdout
     - Environment: sensitive variables stripped
     - Timeout: configurable
+    - Guard: SPEC["guard"] declares the policy op to clear before running
     """
 
     async def _run(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        if guard:
+            denied = await _script_guard_error(guard, tool_name, args or {}, ctx)
+            if denied is not None:
+                return denied
+
         root = getattr(ctx, "workspace_root", None)
         default_timeout_sec = 60.0
         if isinstance(root, Path):
@@ -745,8 +784,12 @@ class ToolRegistry:
             if isinstance(result_format, str) and result_format.strip():
                 registered_spec["result_format"] = result_format.strip()
             self._tool_specs[name] = registered_spec
+            guard = spec.get("guard")
             self._tool_funcs[name] = _make_script_tool(
-                script_path=py.resolve(), timeout_sec=timeout_sec,
+                script_path=py.resolve(),
+                timeout_sec=timeout_sec,
+                tool_name=name,
+                guard=guard if isinstance(guard, dict) else None,
             )
 
         return len(self._tool_specs)

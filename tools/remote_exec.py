@@ -10,8 +10,10 @@ At invocation this file runs as a subprocess:
   - Sensitive env vars are stripped
 """
 
-SPEC = {'description': '在备用扫描服务器 (154.37.215.248) 上远程执行命令。通过 SSH ControlMaster '
-                '长连接复用，延迟极低（~13ms）。用于扫描任务、文件操作等。',
+SPEC = {'description': '在备用扫描服务器上远程执行命令。通过 SSH ControlMaster 长连接复用，'
+                '延迟极低。用于扫描任务、文件操作等。'
+                # 地址写在这里等于写进系统提示词，模型会当成可以复述的普通事实。
+                '目标主机由服务端 ssh 配置决定，调用方不需要也不应该知道。',
  'input_schema': {'properties': {'command': {'description': '要在远程服务器上执行的 shell 命令',
                                              'type': 'string'},
                                  'timeout_sec': {'default': 30,
@@ -19,7 +21,10 @@ SPEC = {'description': '在备用扫描服务器 (154.37.215.248) 上远程执�
                                                  'type': 'number'}},
                   'required': ['command'],
                   'type': 'object'},
- 'name': 'remote_exec'}
+ 'name': 'remote_exec',
+ # 远程 shell 与本地 shell 是同一件事，走同一套策略与审批；少了它，
+ # deny execute_command 的节点换个工具名就能把命令跑出去。
+ 'guard': {'op': 'execute_command', 'params': {'command': 'command'}}}
 
 TIMEOUT_SEC = 35.0
 

@@ -506,7 +506,10 @@ def create_app(
         }
 
     @app.post("/v1/inbound", response_model=InboundMessageOut)
-    async def inbound(msg: InboundMessageIn) -> InboundMessageOut:
+    async def inbound(msg: InboundMessageIn, request: Request) -> InboundMessageOut:
+        # platform_auth 是整套鉴权的源头，这里不校验就等于谁都能声明自己是管理员。
+        # adapter、engine、cli、tui 四个调用方本来就都带令牌。
+        verify_admin_token(request)
         st: SupervisorState = app.state.state
         session_id = st.get_or_create_session(channel=msg.channel, conversation_key=msg.conversation_key)
 
