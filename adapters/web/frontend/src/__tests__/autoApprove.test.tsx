@@ -106,7 +106,7 @@ describe('client auto-approval', () => {
     ws.receive(event(2, 'tool_call_start', { source_inbound_seq: 1, tool_call_id: 'call-auto', tool_name: 'read_file', arguments: { path: 'README.md' } }));
     ws.receive(event(3, 'approval_requested', { source_inbound_seq: 1, approval_id: 'approval-auto', tool_call_id: 'call-auto', operation: 'read_file', details: { path: 'README.md' }, status: 'pending' }));
 
-    await waitFor(() => expect(approvalSpy).toHaveBeenCalledWith('approval-auto', 'allow', 'auto-approved by client preference'));
+    await waitFor(() => expect(approvalSpy).toHaveBeenCalledWith('', 'approval-auto', 'allow', 'auto-approved by client preference'));
 
     // [2026-06-02] Why: auto-approved ids used to be module-only state and were lost
     // after a browser refresh. How: assert the dedicated localStorage cache receives
@@ -132,7 +132,7 @@ describe('client auto-approval', () => {
     ws.receive(event(2, 'tool_call_start', { source_inbound_seq: 1, tool_call_id: 'call-auto', tool_name: 'read_file', arguments: { path: 'README.md' } }));
     ws.receive(event(3, 'approval_requested', { source_inbound_seq: 1, approval_id: 'approval-auto', tool_call_id: 'call-auto', operation: 'read_file', details: { path: 'README.md' }, status: 'pending' }));
 
-    await waitFor(() => expect(approvalSpy).toHaveBeenCalledWith('approval-auto', 'allow', 'auto-approved by client preference'));
+    await waitFor(() => expect(approvalSpy).toHaveBeenCalledWith('', 'approval-auto', 'allow', 'auto-approved by client preference'));
     await waitFor(() => expect(JSON.parse(localStorage.getItem('clonoth_auto_approved_ids') || '[]')).not.toContain('approval-auto'));
   });
 

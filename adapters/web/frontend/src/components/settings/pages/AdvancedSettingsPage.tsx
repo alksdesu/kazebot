@@ -22,7 +22,7 @@ interface RawFileState {
 
 const FILES: Array<{ key: FileKey; title: string; filename: string; description: string }> = [
   { key: 'runtime', title: '运行时配置 (runtime.yaml)', filename: 'runtime.yaml', description: '运行时参数、入口节点、工具模式、记忆和进程配置。' },
-  { key: 'policy', title: '安全策略 (policy.yaml)', filename: 'policy.yaml', description: '工具、文件、命令等安全策略配置。' },
+  { key: 'policy', title: '安全策略 (policy.yaml)', filename: 'policy.yaml', description: '原始 YAML 兜底。读写规则和敏感路径请在「工具与权限」页改，这里用于 deny_patterns 等结构化编辑覆盖不到的字段。' },
 ];
 
 // [2026-06-02] Shared compact field styles for the Advanced structured editor.

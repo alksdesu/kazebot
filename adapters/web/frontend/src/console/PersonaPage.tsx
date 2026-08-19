@@ -108,6 +108,7 @@ const Capabilities = () => {
   // 取消勾选后要是从候选表里消失，就再也勾不回来了。
   const [known, setKnown] = useState<{ tools: string[]; targets: string[] }>({ tools: [], targets: [] });
   const [model, setModel] = useState('');
+  const [mode, setMode] = useState('');
   const [providerModels, setProviderModels] = useState<string[]>([]);
   const [nodeModels, setNodeModels] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
@@ -120,6 +121,7 @@ const Capabilities = () => {
     setTools(allow);
     setTargets(delegates);
     setModel(readYamlScalar(body, ['model']));
+    setMode(readYamlScalar(body, ['tool_access', 'mode']));
     setKnown((prev) => ({
       tools: [...new Set([...prev.tools, ...allow])],
       targets: [...new Set([...prev.targets, ...delegates])],
@@ -192,6 +194,16 @@ const Capabilities = () => {
 
   return (
     <>
+      {/* allow 只在 allowlist 模式下被读，别的模式勾了也不生效，界面上看不出来。 */}
+      {mode && mode !== 'allowlist' && (
+        <p className="qc-mismatch">
+          这个节点的 tool_access.mode 是 {mode}，下面的勾选不生效
+          {mode === 'all'
+            ? '：all 模式读的是 deny 列表，所有工具都放行。'
+            : '：none 模式一个工具都不给。'}
+          改模式请到设置的「工具与权限」页。
+        </p>
+      )}
       <div className="qc-checks">
         {toolChoices.length === 0 && <span className="qc-chip-empty">没有可选工具</span>}
         {toolChoices.map((name) => (

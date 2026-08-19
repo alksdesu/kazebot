@@ -11,7 +11,6 @@ import {
   type TitleGenerationMode,
   useClientPrefsStore,
 } from '../../../store/clientPrefsStore';
-import { PolicyRulesSection } from './PolicyRulesSection';
 import { useSettingsStore } from '../../../store/settingsStore';
 import type { NodeDef } from '../../../types';
 import { inferToolRisk, riskClassName, riskLabel, type RiskLevel } from '../../../utils/toolRisk';
@@ -263,10 +262,10 @@ export const ClientSettingsPage = () => {
               </div>
             )}
           </div>
+          <p className="mt-3 border-t border-[var(--duties-border)] pt-3 text-xs leading-5 text-[var(--duties-tertiary)]">
+            以上只影响当前浏览器。对所有渠道（含 QQ）都生效的审批策略在「工具与权限」页。
+          </p>
         </section>
-
-
-        <PolicyRulesSection />
 
         <section className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
           <h2 className="font-mono text-sm font-semibold">对话标题</h2>

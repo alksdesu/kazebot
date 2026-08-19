@@ -73,7 +73,7 @@ export const settingsTabs: SettingsTabDefinition[] = [
   { id: 'approvals', label: '审批', icon: 'approval', order: 5, Page: ApprovalsSettingsPage, RightPanel: ApprovalsSettingsRightPanel },
   { id: 'agents', label: '节点', icon: 'smart_toy', order: 6, Page: AgentsSettingsPage, RightPanel: AgentsSettingsRightPanel },
   { id: 'node-files', label: '节点文件', icon: 'folder_managed', order: 7, Page: NodeFilesSettingsPage },
-  { id: 'tools', label: '工具', icon: 'build', order: 8, Page: ToolsSettingsPage, RightPanel: ToolsSettingsRightPanel },
+  { id: 'tools', label: '工具与权限', icon: 'build', order: 8, Page: ToolsSettingsPage, RightPanel: ToolsSettingsRightPanel },
   { id: 'drawtools', label: '绘图', icon: 'palette', order: 9, Page: DrawtoolsSettingsPage },
   { id: 'skills', label: '技能', icon: 'menu_book', order: 10, Page: SkillsSettingsPage, RightPanel: SkillsSettingsRightPanel },
   { id: 'mcp', label: 'MCP', icon: 'cable', order: 11, Page: McpSettingsPage, RightPanel: McpSettingsRightPanel },

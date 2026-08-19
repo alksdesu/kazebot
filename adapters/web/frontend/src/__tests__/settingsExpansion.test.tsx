@@ -58,7 +58,7 @@ describe('expanded settings registry', () => {
       'advanced',
     ]);
     expect(settingsTabs.find((tab) => tab.id === 'system')).toMatchObject({ label: '系统', icon: 'settings_power', order: 4 });
-    expect(settingsTabs.find((tab) => tab.id === 'tools')).toMatchObject({ label: '工具', icon: 'build', order: 8 });
+    expect(settingsTabs.find((tab) => tab.id === 'tools')).toMatchObject({ label: '工具与权限', icon: 'build', order: 8 });
   });
 });
 

@@ -262,6 +262,10 @@ export const PolicyRulesSection = () => {
             paths={doc.execute_command?.sensitive_path_patterns || []}
           />
 
+          <p className="text-[0.6rem] leading-4 text-[var(--duties-tertiary)]">
+            命令的硬拦截规则（deny_patterns）和各段默认档位不在这里，要改去「高级」页编辑 policy.yaml 原文。
+          </p>
+
           <div className="flex items-center gap-2 border-t border-[var(--duties-border)] pt-3">
             <span className="min-w-0 flex-1 truncate text-[0.65rem] text-[var(--duties-tertiary)]">
               {message || (dirty ? '有未保存的改动' : '与服务器一致')}

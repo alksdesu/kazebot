@@ -1,8 +1,5 @@
-// [2026-06-02] External tool management settings page.
-// Why: custom Python tools need list, create, delete, reload, and risk display in one
-// operations screen. How: keep only the list and action buttons here while the Python
-// script editor is rendered by the Settings right panel. Purpose: tool management is
-// clearer and the editor no longer stacks below the list.
+// Tools and permissions: which tools exist, which node may call them, and what needs approval.
+// The three answers used to live on three unrelated pages, so they are stacked here instead.
 import { useEffect, useState } from 'react';
 
 import { createTool, deleteTool, getAllToolNames, getTools, reloadTools, type AdminTool } from '../../../api/supervisorClient';
@@ -10,6 +7,8 @@ import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore
 import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
 import { Button } from '../../common';
+import { NodeGrantsSection } from './NodeGrantsSection';
+import { PolicyRulesSection } from './PolicyRulesSection';
 import { AuthRequired, Card, FieldLabel, PageHeader, PageShell, StatusText, TextInput } from './settingsPagePrimitives';
 
 function defaultToolScript(name: string): string {
@@ -20,7 +19,7 @@ function defaultToolScript(name: string): string {
   return `# [2026-06-02] Created from Settings. Why: the web UI creates a minimal external tool. How: edit SPEC and the script body before enabling real behavior. Purpose: keep new tool files syntactically valid.\nSPEC = {\n    "name": "${name}",\n    "description": "通过设置页面创建的工具。",\n    "input_schema": {"type": "object", "properties": {}}\n}\nTIMEOUT_SEC = 30\n\noutput({"ok": True, "args": args})\n`;
 }
 
-export const ToolsSettingsPage = () => {
+const ToolInventorySection = () => {
   // [2026-06-02] Pull the right-panel opener into the list page. Why: selecting a
   // tool on mobile should reveal the Python editor immediately. How: call the shared
   // settings-store setter from each row click. Purpose: users do not need a second tap
@@ -100,10 +99,8 @@ export const ToolsSettingsPage = () => {
   };
 
   return (
-    <PageShell>
-      <PageHeader description="管理外部 Python 工具，查看风险等级，并触发工具重载。选择工具后，请在右栏编辑脚本。" title="工具管理" />
-      {!isAuthenticated ? <AuthRequired /> : (
-        <Card title="工具列表" description="风险等级根据工具名前缀自动推断。Python 编辑器位于右栏。">
+    <Card title="工具清单" description="外部 Python 工具可在这里增删与重载；风险等级根据工具名前缀推断，脚本编辑器在右栏。">
+      <>
           <div className="mb-3 flex flex-wrap gap-2">
             <Button disabled={loading} onClick={load}>{loading ? '刷新中...' : '刷新工具'}</Button>
             <Button onClick={reload} variant="primary">重载工具</Button>
@@ -126,7 +123,25 @@ export const ToolsSettingsPage = () => {
             <Button className="mt-2" onClick={create} variant="primary">创建工具</Button>
           </div>
           <StatusText message={message} />
-        </Card>
+      </>
+    </Card>
+  );
+};
+
+export const ToolsSettingsPage = () => {
+  const { isAuthenticated } = useSettingsStore();
+  return (
+    <PageShell>
+      <PageHeader
+        description="三件事按顺序排在下面：有哪些工具、哪个节点能调、调了要不要审批。"
+        title="工具与权限"
+      />
+      {!isAuthenticated ? <AuthRequired /> : (
+        <>
+          <ToolInventorySection />
+          <NodeGrantsSection />
+          <PolicyRulesSection />
+        </>
       )}
     </PageShell>
   );

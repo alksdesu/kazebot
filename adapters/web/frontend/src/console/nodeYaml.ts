@@ -185,6 +185,50 @@ export function upsertYamlNested(raw: string, path: string[], value: string): st
   return [...next.slice(0, insertAt), ...block, ...next.slice(insertAt)].join(eol);
 }
 
+/** 写一个块状列表，键不在就顺路建出来。mode:all 的节点通常没有 allow 键。 */
+export function upsertYamlList(raw: string, path: string[], items: readonly string[]): string {
+  if (!path.length) throw new NodeYamlShapeError('路径为空');
+  const { lines, eol } = splitLines(raw);
+
+  let known = path.length;
+  while (known > 0) {
+    try {
+      locate(lines, path.slice(0, known));
+      break;
+    } catch {
+      known -= 1;
+    }
+  }
+  if (known === path.length) return replaceYamlList(raw, path, items);
+
+  const missing = path.slice(known);
+  const render = (baseIndent: number): string[] => {
+    const head = missing.map((key, depth) => `${' '.repeat(baseIndent + 2 * depth)}${key}:`);
+    const pad = ' '.repeat(baseIndent + 2 * missing.length);
+    return [...head, ...items.map((item) => `${pad}- ${item}`)];
+  };
+
+  if (!known) {
+    const tail = lines.length && !lines[lines.length - 1].trim() ? lines.slice(0, -1) : lines;
+    return [...tail, ...render(0), ''].join(eol);
+  }
+
+  const parent = locate(lines, path.slice(0, known));
+  const head = lines[parent.at];
+  const inline = head.slice(head.indexOf(':') + 1).trim();
+  const next = [...lines];
+  if (inline) {
+    if (inline !== '{}' && inline !== '[]' && inline !== 'null' && inline !== '~') {
+      throw new NodeYamlShapeError(
+        `${path.slice(0, known).join('.')} 已经有值 ${inline}，无法在它下面加 ${missing.join('.')}`,
+      );
+    }
+    next[parent.at] = `${' '.repeat(parent.indent)}${head.trimStart().split(':')[0]}:`;
+  }
+  const insertAt = blockEnd(next, parent.at, parent.indent);
+  return [...next.slice(0, insertAt), ...render(parent.indent + 2), ...next.slice(insertAt)].join(eol);
+}
+
 export function readYamlScalar(raw: string, path: string[]): string {
   const { lines } = splitLines(raw);
   try {
