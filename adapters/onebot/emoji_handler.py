@@ -7,12 +7,15 @@ Clonoth 后端可能输出 QQ 表情标记、Discord 表情标记、Reaction 标
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List
+
+logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
 # 模型易写的收藏表情标记。兼容旧格式 [QQ_EMOJI:名称]，并新增：
 # [表情: 开心] / [emoji: 开心] / [收藏表情: 开心]
@@ -777,8 +780,9 @@ async def process_emojis(
                 # （sub_type=1），让客户端按小图/贴纸渲染，而不是普通大图。
                 segments.append({"type": "image", "url": url, "emoji": True})
             else:
-                # 未命中或未取到可发送地址时保留可读占位，避免内容无声丢失。
-                segments.append({"type": "text", "content": f"[表情:{name}]"})
+                # 名字对不上说明是模型臆造的，留占位等于把内部格式发给用户，而提示词
+                # 里正要求不要暴露它。丢掉标记只丢一个编出来的名字，留日志便于发现。
+                logger.info("custom face not found, marker dropped: %s", name)
 
         last_end = end
 
