@@ -42,6 +42,10 @@ class DataCleanupScheduleHandler:
     def on_tick(self, ctx: dict[str, Any]) -> None:
         if str(ctx.get("schedule_type") or "").strip() != _SCHEDULE_TYPE:
             return
+        # poll() 是唯一的 reap 动作。放在 cron 判断之后，退出的子进程要挂到下次命中才回收，
+        # 而 cron 每小时才命中一次；清理一旦被停用，最后那个僵尸就再也没人收。
+        if self._running is not None and self._running.poll() is not None:
+            self._running = None
         workspace_root = ctx.get("workspace_root")
         if workspace_root is None:
             return
@@ -70,7 +74,7 @@ class DataCleanupScheduleHandler:
 
         # 上一轮还在跑就跳过：清理是幂等的，但两个进程同时遍历同一批目录只会互相
         # 撞上「文件已被对方删掉」的竞态。
-        if self._running is not None and self._running.poll() is None:
+        if self._running is not None:
             log.info("[data_cleanup] previous run still active, skipping this tick")
             return
 

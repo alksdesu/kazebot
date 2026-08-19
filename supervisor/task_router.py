@@ -1810,15 +1810,27 @@ class TaskRouterMixin:
         route_session_id = self._route_session_id_for_task_locked(task)
         session_info = self.sessions.get(route_session_id)
         if not session_info:
+            log.warning(
+                "async dispatch result dropped: session %s not found for task %s",
+                route_session_id[:12], task.task_id[:12],
+            )
             return
 
-        # 检查 session generation 是否过期
+        # 等待期间用户又说了一句就会 bump generation，子节点结果随之丢弃；对用户表现为
+        # 「说了稍等然后再无下文」，不留声就无从查起。
         current_gen = self._current_session_generation_locked(route_session_id)
         if task.session_generation and current_gen and task.session_generation != current_gen:
+            log.warning(
+                "async dispatch result dropped: session %s generation %s != %s for task %s",
+                route_session_id[:12], task.session_generation, current_gen, task.task_id[:12],
+            )
             return
 
-        # 检查 session 是否已被 cancel
         if route_session_id in self._cancelled_sessions:
+            log.warning(
+                "async dispatch result dropped: session %s cancelled for task %s",
+                route_session_id[:12], task.task_id[:12],
+            )
             return
 
         # [Fork/Merge 2026-05-12] 异步 dispatch 结果不再自动 preempt 入口 task。
@@ -1927,12 +1939,20 @@ class TaskRouterMixin:
             )
             return
 
-        # 检查 session generation 是否过期
+        # 等待期间用户又说了一句就会 bump generation，子节点结果随之丢弃；对用户表现为
+        # 「说了稍等然后再无下文」，不留声就无从查起。
         current_gen = self._current_session_generation_locked(target_session_id)
         if task.session_generation and current_gen and task.session_generation != current_gen:
+            log.warning(
+                "dispatch_origin callback skipped: session %s generation %s != %s for task %s",
+                target_session_id[:12], task.session_generation, current_gen, task.task_id[:12],
+            )
             return
-        # 检查 session 是否已被 cancel
         if target_session_id in self._cancelled_sessions:
+            log.warning(
+                "dispatch_origin callback skipped: session %s cancelled for task %s",
+                target_session_id[:12], task.task_id[:12],
+            )
             return
 
         result_text = str(fallback_result.get("text") or "").strip()

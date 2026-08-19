@@ -137,7 +137,8 @@ def _dispatch_delegate_spec(target_id: str, info: dict[str, str] | None = None) 
         f"将任务委派给固定目标节点 {node_name}（{target}）。",
         node_description,
         "",
-        "目标节点会独立执行，完成后结果返回给你。",
+        "目标节点在自己的会话里异步执行；本工具立即返回，返回值只表示「已派出」，不含执行结果。",
+        "结果稍后会作为一条新消息送达，那时再向用户汇报；本轮不要臆测结果，也不要承诺完成时间。",
         "参数中不再提供 target；该工具名已经固定了目标节点。",
         "需要并行委派时，可以在同一轮并行调用多个 dispatch:{target_id} 工具。",
     ]
