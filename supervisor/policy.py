@@ -122,11 +122,48 @@ def _default_policy_dict() -> dict[str, Any]:
                 # 网络监听（可能开后门）。
                 r"\b(?:nc|ncat|netcat|socat)\b[^|]*(?:\s-l\b|--listen\b)",
             ],
+            # 命令里提到这些路径时，按 read_file 对同一路径的档次处理。read_file 的
+            # 规则会自动并进来，这里只补工作区之外的凭据位置。写成 [] 表示关掉这层。
+            "sensitive_path_patterns": list(_DEFAULT_SENSITIVE_PATH_LITERALS),
         },
         "restart": {
             "default": "approval_required",
         },
     }
+
+
+# 工作区之外的经典凭据位置。read_file 的规则只覆盖工作区内，命令却能读任意路径。
+_DEFAULT_SENSITIVE_PATH_LITERALS: tuple[str, ...] = (
+    ".ssh/", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+    ".aws/credentials", ".docker/config.json", ".kube/config",
+    ".netrc", ".git-credentials", ".pgpass",
+    "/etc/shadow", "/etc/sudoers", "/proc/self/environ",
+)
+
+# glob 从第一个通配符起截断，只留字面前缀：data/** → data/，**/.env → .env。
+_GLOB_TAIL = re.compile(r"[*?\[].*$")
+
+
+def _rule_path_literal(pattern: str) -> str:
+    """把 read_file 的 glob 规则还原成能在命令行文本里查找的字面片段。"""
+    p = pattern.strip().replace("\\", "/")
+    if p.startswith("**/"):
+        p = p[3:]
+    return _GLOB_TAIL.sub("", p).strip()
+
+
+def _path_text_pattern(literal: str) -> re.Pattern[str] | None:
+    r"""字面路径 → 命令行文本匹配器。
+
+    前一个字符不能是 "\w"/"."/"-"，否则 metadata/ 会被 data/ 命中；但要允许 / 打头，
+    因为 /opt/kazebot/data/config.yaml 正是要拦的形态。
+    """
+    token = literal.strip().replace("\\", "/")
+    if len(token) < 4:
+        # 太短的片段（如 a/）在自由文本里几乎必然误报，宁可不拦。
+        return None
+    tail = "" if token.endswith("/") else r"(?![\w])"
+    return re.compile(r"(?<![\w.\-])" + re.escape(token) + tail, re.IGNORECASE)
 
 
 def _to_safety_level(s: str) -> SafetyLevel:
@@ -198,6 +235,7 @@ class PolicyEngine:
         self._write_rules: list[tuple[str, SafetyLevel, str]] = []
         self._deny_command_patterns: list[re.Pattern[str]] = []
         self._sensitive_command_patterns: list[re.Pattern[str]] = []
+        self._sensitive_path_patterns: list[tuple[re.Pattern[str], SafetyLevel, str]] = []
 
         self._ensure_policy_file_exists()
         self._reload_if_needed(force=True)
@@ -248,6 +286,34 @@ class PolicyEngine:
                 rules.append((pat, dec, reason))
         return default, rules
 
+    def _compile_sensitive_paths(
+        self, extra_literals: Any,
+    ) -> list[tuple[re.Pattern[str], SafetyLevel, str]]:
+        """命令行里出现哪些路径要算敏感。
+
+        主体从 read_file 规则推导：命令能读到的东西不该比 read_file 宽，两边各写一份
+        迟早漂移。额外清单只补工作区之外的凭据位置，read_file 的 glob 管不到那里。
+        """
+        compiled: list[tuple[re.Pattern[str], SafetyLevel, str]] = []
+        seen: set[str] = set()
+
+        def add(literal: str, level: SafetyLevel) -> None:
+            if not literal or literal in seen:
+                return
+            pattern = _path_text_pattern(literal)
+            if pattern is None:
+                return
+            seen.add(literal)
+            compiled.append((pattern, level, literal))
+
+        for pat, dec, _reason in self._read_rules:
+            if dec == SafetyLevel.auto:
+                continue
+            add(_rule_path_literal(pat), dec)
+        for item in (extra_literals if isinstance(extra_literals, list) else []):
+            add(str(item or "").strip(), SafetyLevel.approval_required)
+        return compiled
+
     def _compile(self) -> None:
         self._extra_roots = parse_extra_roots(self._root, self._cfg.get("extra_roots"))
 
@@ -268,10 +334,12 @@ class PolicyEngine:
             self._command_default = _to_safety_level(str(cmd_sec.get("default", "approval_required")))
             deny_pats = cmd_sec.get("deny_patterns")
             sensitive_pats = cmd_sec.get("sensitive_patterns")
+            path_literals = cmd_sec.get("sensitive_path_patterns")
         else:
             self._command_default = SafetyLevel.approval_required
             deny_pats = None
             sensitive_pats = None
+            path_literals = None
 
         self._deny_command_patterns = [
             re.compile(p, re.IGNORECASE)
@@ -283,6 +351,12 @@ class PolicyEngine:
             for p in (sensitive_pats if isinstance(sensitive_pats, list) else [])
             if isinstance(p, str) and p.strip()
         ]
+
+        if path_literals is None:
+            # 升级上来的旧 policy.yaml 没有这一项。当成空表等于静默丢掉这层防护，
+            # 所以缺省用内置清单；只有显式写成 [] 才是关闭。
+            path_literals = list(_DEFAULT_SENSITIVE_PATH_LITERALS)
+        self._sensitive_path_patterns = self._compile_sensitive_paths(path_literals)
 
         restart_sec = self._cfg.get("restart")
         if isinstance(restart_sec, dict):
@@ -340,6 +414,21 @@ class PolicyEngine:
             if pat.search(cmd):
                 return PolicyDecision(SafetyLevel.deny, f"command denied by pattern: {pat.pattern}")
 
+        # read_file 拦得住 read_file data/config.yaml，拦不住 cat data/config.yaml。
+        # 命令提到敏感路径时按同一档处理，否则管理员免审批那条快车道等于给凭据开了后门。
+        for path_pat, level, literal in self._sensitive_path_patterns:
+            if not path_pat.search(cmd):
+                continue
+            if level == SafetyLevel.deny:
+                return PolicyDecision(
+                    SafetyLevel.deny, f"command touches denied path: {literal}",
+                )
+            return PolicyDecision(
+                SafetyLevel.approval_required,
+                f"command touches sensitive path: {literal}",
+                sensitive=True,
+            )
+
         # 敏感命令（下载落盘、包安装、chmod +x、监听等）：保持审批且标记敏感，
         # 使管理员任务也不自动放行，必须管理员亲自审批确认。
         for pat in self._sensitive_command_patterns:
@@ -383,6 +472,9 @@ class PolicyEngine:
                 return False
         for pat in self._sensitive_command_patterns:
             if pat.search(cmd):
+                return False
+        for path_pat, _level, _literal in self._sensitive_path_patterns:
+            if path_pat.search(cmd):
                 return False
 
         try:

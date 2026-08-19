@@ -128,6 +128,24 @@ execute_command:
     - "\\bchmod\\b[^|]*\\+x\\b"
     # 网络监听（可能开后门）。
     - "\\b(?:nc|ncat|netcat|socat)\\b[^|]*(?:\\s-l\\b|--listen\\b)"
+  # 命令里提到这些路径时，按 read_file 对同一路径的档次处理。否则 read_file 拦住了
+  # data/config.yaml，一句 cat 就绕过去。read_file 的规则会自动并进来，这里只补工作区
+  # 之外的凭据位置；写成 [] 表示关掉这层。
+  sensitive_path_patterns:
+    - ".ssh/"
+    - "id_rsa"
+    - "id_dsa"
+    - "id_ecdsa"
+    - "id_ed25519"
+    - ".aws/credentials"
+    - ".docker/config.json"
+    - ".kube/config"
+    - ".netrc"
+    - ".git-credentials"
+    - ".pgpass"
+    - "/etc/shadow"
+    - "/etc/sudoers"
+    - "/proc/self/environ"
 
 restart:
   default: approval_required
