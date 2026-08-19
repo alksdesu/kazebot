@@ -8,6 +8,7 @@ import { useMemo, useState, type ReactNode } from 'react';
 
 import { decideApproval } from '../../../api/supervisorClient';
 import { shouldAutoApproveTool, useClientPrefsStore } from '../../../store/clientPrefsStore';
+import { useSettingsStore } from '../../../store/settingsStore';
 import type { ToolExecution, ToolStatus } from '../../../types/message';
 import { Icon } from '../../common';
 
@@ -616,6 +617,7 @@ function renderResult(tool: ToolExecution): ReactNode {
 export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
   const toolResultsDefaultCollapsed = useClientPrefsStore(state => state.toolResultsDefaultCollapsed);
   const autoApproveTools = useClientPrefsStore(state => state.autoApproveTools);
+  const adminToken = useSettingsStore(state => state.adminToken);
   // [2026-06-01] Tool detail expansion now follows clientPrefsStore.
   // Why: result disclosure was hard-coded as collapsed. How: initialize the local
   // disclosure state from the browser preference. Purpose: each frontend can choose
@@ -652,7 +654,7 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
     setApprovalLoading(true);
     setApprovalError('');
     try {
-      await decideApproval(approvalId, decision, `${decision} via tool card`);
+      await decideApproval(adminToken || '', approvalId, decision, `${decision} via tool card`);
     } catch (error) {
       setApprovalError(error instanceof Error ? error.message : '提交审批决定失败。');
     } finally {

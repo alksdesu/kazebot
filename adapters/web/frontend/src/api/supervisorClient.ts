@@ -1069,13 +1069,14 @@ export async function clearSessionProviderOverride(sessionId: string, token: str
 // ── Approvals ──
 
 export async function decideApproval(
+  token: string,
   approvalId: string,
   decision: 'allow' | 'deny',
   comment = '',
 ): Promise<any> {
   const resp = await apiFetch(`/approvals/${approvalId}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
     body: JSON.stringify({ decision, comment: comment || `${decision} via web` }),
   });
   return resp.json();

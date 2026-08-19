@@ -14,6 +14,8 @@ from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll, Center
 from textual.widgets import Static, Button, Label
 
+from clonoth_runtime import read_admin_token
+
 from .styles import DEFAULT_CSS
 from .services.supervisor_client import SupervisorClient
 from .services.event_poller import EventPoller
@@ -117,7 +119,9 @@ class ClonothApp(App):
         self._thinking_buf: str = ""  # 累积 thinking 文本
         self._streamed_this_turn: bool = False  # 本轮是否已通过流式输出
 
-        self.supervisor = SupervisorClient(supervisor_url)
+        self.supervisor = SupervisorClient(
+            supervisor_url, admin_token=read_admin_token(self.workspace_root),
+        )
         self.poller = EventPoller(self.supervisor, self)
 
     # ---- compose ----

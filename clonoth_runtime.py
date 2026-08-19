@@ -194,6 +194,20 @@ def load_text_file(path: Path, default: str = "") -> str:
         return default
 
 
+def read_admin_token(workspace_root: Path) -> str:
+    """Supervisor 管理令牌：环境变量优先，其次 supervisor 启动时写出的 data/.admin_token。"""
+    token = os.getenv("CLONOTH_ADMIN_TOKEN", "").strip()
+    if token:
+        return token
+    return load_text_file(workspace_root / "data" / ".admin_token").strip()
+
+
+def admin_auth_headers(workspace_root: Path) -> dict[str, str]:
+    """取不到令牌时返回空 dict：请求照发，由服务端决定拒不拒，不在客户端提前失败。"""
+    token = read_admin_token(workspace_root)
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def _resolve_env_names(names: str, extra: Mapping[str, str] | None = None) -> str:
     """Resolve a ``|``-separated list of env var names with fallback.
 

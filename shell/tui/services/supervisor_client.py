@@ -11,12 +11,13 @@ import httpx
 class SupervisorClient:
     """封装 Supervisor 全部 HTTP 端点，全部 async。"""
 
-    def __init__(self, base_url: str, timeout: float = 10.0) -> None:
+    def __init__(self, base_url: str, timeout: float = 10.0, *, admin_token: str = "") -> None:
         self._base_url = base_url
         self._client = httpx.AsyncClient(
             base_url=base_url,
             timeout=timeout,
             trust_env=False,
+            headers={"Authorization": f"Bearer {admin_token}"} if admin_token else {},
         )
 
     # ---- 生命周期 ----

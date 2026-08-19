@@ -521,7 +521,8 @@ function maybeAutoApproveApprovalRequest(event: SupervisorEvent, get: StoreGette
   // a backend policy change. How: submit the normal approval decision endpoint and
   // ignore transport errors so the pending card remains available for manual action.
   // Purpose: low-risk local rules can proceed while high-risk tools still need users.
-  void decideApproval(approvalId, 'allow', 'auto-approved by client preference').catch(() => {
+  const token = useSettingsStore.getState().adminToken || '';
+  void decideApproval(token, approvalId, 'allow', 'auto-approved by client preference').catch(() => {
     autoApprovedApprovalIds.delete(approvalId);
     saveAutoApproved(autoApprovedApprovalIds);
   });

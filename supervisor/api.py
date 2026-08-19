@@ -1250,7 +1250,8 @@ def create_app(
         return st.get_session_context_usage(route_session_id)
 
     @app.post("/v1/approvals/request", response_model=Approval)
-    async def approval_request(inp: ApprovalRequestIn) -> Approval:
+    async def approval_request(inp: ApprovalRequestIn, request: Request) -> Approval:
+        verify_admin_token(request)
         st: SupervisorState = app.state.state
         # [AutoC 2026-05-31] Why: direct approval API callers may know which tool
         # produced the request. How: forward optional identity fields accepted by
@@ -1273,7 +1274,11 @@ def create_app(
         return st.approvals[approval_id]
 
     @app.post("/v1/approvals/{approval_id}", response_model=Approval)
-    async def approval_decide(approval_id: str, body: ApprovalDecisionIn) -> Approval:
+    async def approval_decide(
+        approval_id: str, body: ApprovalDecisionIn, request: Request,
+    ) -> Approval:
+        # 这个端点能批准写源码、改 policy、重启；:8765 只绑回环不等于同机进程都可信。
+        verify_admin_token(request)
         st: SupervisorState = app.state.state
         a = st.decide_approval(approval_id=approval_id, decision=body.decision, comment=body.comment)
         if a is None:

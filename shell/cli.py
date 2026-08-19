@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from clonoth_runtime import get_float, load_runtime_config, strip_tool_trace_blocks
+from clonoth_runtime import admin_auth_headers, get_float, load_runtime_config, strip_tool_trace_blocks
 
 
 def wait_supervisor(
@@ -235,7 +235,10 @@ def main() -> None:
     )
     events_poll_interval_sec = get_float(runtime_cfg, "shell.events_poll_interval_sec", 0.5, min_value=0.1, max_value=10.0)
 
-    with httpx.Client(timeout=client_timeout_sec, trust_env=False) as client:
+    with httpx.Client(
+        timeout=client_timeout_sec, trust_env=False,
+        headers=admin_auth_headers(workspace_root),
+    ) as client:
         wait_supervisor(
             client,
             base_url,

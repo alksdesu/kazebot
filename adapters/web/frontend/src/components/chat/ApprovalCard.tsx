@@ -1,8 +1,9 @@
 // [2026-05-16] Approval card — approve/deny pending operations.
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { decideApproval } from '../../api/supervisorClient';
 import { shouldAutoApproveTool, useClientPrefsStore } from '../../store/clientPrefsStore';
+import { useSettingsStore } from '../../store/settingsStore';
 import type { ApprovalInfo } from '../../types';
 import { Button, Icon } from '../common';
 
@@ -13,13 +14,16 @@ interface ApprovalCardProps {
 export const ApprovalCard = ({ approval }: ApprovalCardProps) => {
   const [status, setStatus] = useState(approval.status);
   const [loading, setLoading] = useState(false);
+  // Decisions also land from QQ, the settings page, or another tab, so local state alone stays 'pending' forever.
+  useEffect(() => { setStatus(approval.status); }, [approval.status]);
   const autoApproveTools = useClientPrefsStore(state => state.autoApproveTools);
+  const adminToken = useSettingsStore(state => state.adminToken);
   const isAutoApprovedPending = status === 'pending' && shouldAutoApproveTool(approval.operation, autoApproveTools);
 
   const handleDecision = async (decision: 'allow' | 'deny') => {
     setLoading(true);
     try {
-      await decideApproval(approval.id, decision, `${decision} via web`);
+      await decideApproval(adminToken || '', approval.id, decision, `${decision} via web`);
       setStatus(decision === 'allow' ? 'allowed' : 'denied');
     } catch {
       setStatus('denied');

@@ -74,7 +74,7 @@ export const ApprovalsSettingsPage = () => {
 
   const decide = async (approval: AdminApproval, decision: 'allow' | 'deny') => {
     try {
-      await decideApproval(approval.approval_id, decision, `settings ${decision}`);
+      await decideApproval(adminToken || '', approval.approval_id, decision, `settings ${decision}`);
       setMessage(decision === 'allow' ? '已允许审批' : '已拒绝审批');
       await load();
     } catch (error) {
