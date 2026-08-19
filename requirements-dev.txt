@@ -1,0 +1,4 @@
+# 只跑测试用，生产环境不需要。
+# pytest-asyncio 缺失时 async 测试会被静默当成普通函数收集，表现为大量失败而非报错。
+pytest>=8.0
+pytest-asyncio>=1.0,<2

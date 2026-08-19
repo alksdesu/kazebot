@@ -1352,6 +1352,7 @@ def test_branch_store_windows_wait_and_exit_code_are_conservative(
     assert kernel32.CloseHandle.argtypes is not None
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows process-handle semantics")
 def test_branch_store_access_denied_does_not_take_active_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

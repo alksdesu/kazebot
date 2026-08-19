@@ -34,6 +34,12 @@ _EXTERNAL_ENV = frozenset({"ONEBOT_ACCESS_TOKEN", "ONEBOT_SECRET"})
 _REMOVED_ENV = ("ONEBOT_IMAGE_TIMEOUT_RESEND_DELAY_SEC", "ONEBOT_IMAGE_PREFER_SAME_SENDER")
 _DEPLOY_DOC = "docs/DEPLOY-QQ.md"
 
+# docs/ 和 README.md 不进公开仓库，clone 出来的检出没有可校验的对象。
+pytestmark = pytest.mark.skipif(
+    not (_ROOT / _DEPLOY_DOC).exists(),
+    reason="此检出不含 docs/，文档一致性校验跳过",
+)
+
 
 @pytest.fixture(scope="module")
 def source_blob() -> str:
