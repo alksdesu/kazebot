@@ -21,6 +21,7 @@ from typing import Any, TYPE_CHECKING
 import yaml
 
 from engine.context_store import cleanup_old_contexts
+from engine.cron import cron_match
 
 
 if TYPE_CHECKING:
@@ -56,60 +57,6 @@ def save_schedules(workspace_root: Path, schedules: list[dict[str, Any]]) -> Non
     p.parent.mkdir(parents=True, exist_ok=True)
     text = yaml.safe_dump({"schedules": schedules}, sort_keys=False, allow_unicode=True)
     p.write_text(text, encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-#  Cron 匹配（5 字段：minute hour day month weekday）
-# ---------------------------------------------------------------------------
-
-def _match_field(field: str, value: int, max_val: int) -> bool:
-    """判断 cron 单个字段是否匹配。支持 * / , - 和 */step。"""
-    field = field.strip()
-    if field == "*":
-        return True
-
-    # */step
-    if field.startswith("*/"):
-        try:
-            step = int(field[2:])
-            return step > 0 and value % step == 0
-        except ValueError:
-            return False
-
-    # 逗号分隔
-    for part in field.split(","):
-        part = part.strip()
-        if "-" in part:
-            try:
-                lo, hi = part.split("-", 1)
-                if int(lo) <= value <= int(hi):
-                    return True
-            except ValueError:
-                continue
-        else:
-            try:
-                if int(part) == value:
-                    return True
-            except ValueError:
-                continue
-
-    return False
-
-
-def cron_match(expr: str, dt: datetime) -> bool:
-    """判断 5 字段 cron 表达式是否匹配指定时间。"""
-    parts = expr.strip().split()
-    if len(parts) != 5:
-        return False
-
-    minute, hour, day, month, weekday = parts
-    return (
-        _match_field(minute, dt.minute, 59)
-        and _match_field(hour, dt.hour, 23)
-        and _match_field(day, dt.day, 31)
-        and _match_field(month, dt.month, 12)
-        and _match_field(weekday, dt.weekday(), 6)  # 0=Monday
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -174,11 +121,12 @@ class SchedulerThread:
             stype = str(s.get("type") or "message").strip()
 
             if stype == "script":
-                self._fire_script(s, sid)
+                fired = self._fire_script(s, sid)
             else:
-                self._fire_message(s, sid)
+                fired = self._fire_message(s, sid)
 
-            if once:
+            # 注入失败还照删，这条一次性提醒就再也不会响；留着等下次 cron 匹配重试。
+            if once and fired:
                 self._remove_schedule(sid)
 
         # Why: system-level scheduled features now live in engine.builtin
@@ -199,8 +147,11 @@ class SchedulerThread:
                     ),
                 )
 
-    def _inject_inbound(self, sid: str, text: str, conv_key: str, entry_node_id: str = "", attachments: list | None = None) -> None:
-        """共用的 inbound 注入逻辑。"""
+    def _inject_inbound(
+        self, sid: str, text: str, conv_key: str, entry_node_id: str = "",
+        attachments: list | None = None, created_by: str = "",
+    ) -> bool:
+        """共用的 inbound 注入逻辑。返回是否真的注入成功。"""
         msg_id = f"scheduler:{sid}:{uuid.uuid4()}"
         if ":" in conv_key:
             channel = conv_key.split(":", 1)[0]
@@ -218,6 +169,11 @@ class SchedulerThread:
                 "schedule_id": sid,
                 "entry_node_id": entry_node_id,
             }
+            if created_by:
+                # 定时任务一律按非管理员跑：无人值守的高权限操作没人能当场喊停。
+                payload["platform_auth"] = {
+                    "platform": "qq", "user_id": created_by, "is_admin": False,
+                }
             if attachments:
                 payload["attachments"] = attachments
             evt = self._state.eventlog.append(
@@ -228,25 +184,29 @@ class SchedulerThread:
             )
             self._state.record_inbound_message_event(evt)
             log.info(f"[scheduler] fired: {sid} -> session={session_id}")
+            return True
         except Exception as e:
             log.warning(f"[scheduler] inject failed for {sid}: {e}")
+            return False
 
-    def _fire_message(self, s: dict, sid: str) -> None:
+    def _fire_message(self, s: dict, sid: str) -> bool:
         """type=message：直接注入文本（原有逻辑）。"""
         text = str(s.get("text") or f"[scheduled:{sid}]").strip()
         conv_key = str(s.get("conversation_key") or f"scheduler:{sid}").strip()
         entry_node_id = str(s.get("entry_node_id") or "").strip()
-        self._inject_inbound(sid, text, conv_key, entry_node_id)
+        return self._inject_inbound(
+            sid, text, conv_key, entry_node_id, created_by=str(s.get("created_by") or ""),
+        )
 
-    def _fire_script(self, s: dict, sid: str) -> None:
-        """type=script：执行脚本，stdout JSON 解析后注入 inbound。"""
+    def _fire_script(self, s: dict, sid: str) -> bool:
+        """type=script：执行脚本，stdout JSON 解析后注入 inbound。返回是否真的注入成功。"""
         command = str(s.get("command") or "").strip()
         if not command:
             log.error(f"[scheduler] script {sid}: missing 'command' field")
-            return
+            return False
         if sid in self._running_scripts:
             log.warning(f"[scheduler] script {sid}: still running, skipping")
-            return
+            return False
         self._running_scripts.add(sid)
         try:
             timeout = int(s.get("timeout") or 30)
@@ -262,34 +222,42 @@ class SchedulerThread:
                 log.warning(f"[scheduler] script {sid} stderr: {result.stderr.strip()[:500]}")
             if result.returncode != 0:
                 log.error(f"[scheduler] script {sid} exited with rc={result.returncode}")
-                return
+                return False
             stdout = (result.stdout or "").strip()
             if not stdout:
                 if silent:
                     log.debug(f"[scheduler] script {sid}: empty stdout, silent skip")
-                else:
-                    log.info(f"[scheduler] script {sid}: empty stdout, injecting prefix")
-                    if text_prefix:
-                        self._inject_inbound(sid, text_prefix, conv_key, entry_node_id)
-                return
+                    return False
+                log.info(f"[scheduler] script {sid}: empty stdout, injecting prefix")
+                if not text_prefix:
+                    return False
+                return self._inject_inbound(
+                    sid, text_prefix, conv_key, entry_node_id,
+                    created_by=str(s.get("created_by") or ""),
+                )
             # 解析 JSON
             try:
                 data = json.loads(stdout)
             except json.JSONDecodeError as e:
                 log.error(f"[scheduler] script {sid}: invalid JSON output: {e}")
-                return
+                return False
             body_text = str(data.get("text") or "").strip()
             if not body_text:
                 log.error(f"[scheduler] script {sid}: JSON missing 'text' field")
-                return
+                return False
             if text_prefix:
                 body_text = text_prefix + "\n" + body_text
             attachments = data.get("attachments") or None
-            self._inject_inbound(sid, body_text, conv_key, entry_node_id, attachments)
+            return self._inject_inbound(
+                sid, body_text, conv_key, entry_node_id, attachments,
+                created_by=str(s.get("created_by") or ""),
+            )
         except subprocess.TimeoutExpired:
             log.error(f"[scheduler] script {sid}: timed out after {s.get('timeout', 30)}s")
+            return False
         except Exception as e:
             log.error(f"[scheduler] script {sid}: unexpected error: {e}")
+            return False
         finally:
             self._running_scripts.discard(sid)
 

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from clonoth_runtime import get_bool, get_str, load_runtime_config
+from engine.cron import cron_match
 
 log = logging.getLogger(__name__)
 
@@ -66,9 +67,7 @@ class DataCleanupScheduleHandler:
         if not cron_expr:
             return
 
-        from engine.builtin.dream import _cron_match
-
-        if not _cron_match(cron_expr, now):
+        if not cron_match(cron_expr, now):
             return
         self._last_fired = now_key
 
