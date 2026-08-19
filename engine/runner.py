@@ -53,6 +53,7 @@ def _provider_init_kwargs(
     api_key: str,
     base_url: str,
     provider_options: dict[str, Any],
+    active_provider: str = "",
 ) -> dict[str, Any]:
     """Build common constructor kwargs for provider classes."""
     # [provider-registry 2026-05-03] 统一构造 provider 参数。
@@ -64,7 +65,15 @@ def _provider_init_kwargs(
     else:
         env_prefix = provider_name.upper().replace("-", "_")
         resolved_api_key = rp.api_key or os.environ.get(f"{env_prefix}_API_KEY", "") or api_key
-        resolved_base_url = rp.base_url or os.environ.get(f"{env_prefix}_BASE_URL", "") or None
+        # 本轮 provider 就是全局活跃渠道时，config.yaml 里那一块的 base_url 才是它的。
+        # 少了这层兜底，控制台填的地址会被丢掉，provider 静默回落自己的官方域名；
+        # 换成别家 provider 的节点则不能套用主渠道地址，会把请求发错门。
+        resolved_base_url = (
+            rp.base_url
+            or os.environ.get(f"{env_prefix}_BASE_URL", "")
+            or (base_url if provider_name == str(active_provider or "").strip().lower() else "")
+            or None
+        )
     return {
         "http": llm_http,
         "api_key": resolved_api_key,
@@ -115,6 +124,7 @@ def _create_provider_from_registry(
     api_key: str,
     base_url: str,
     provider_options: dict[str, Any],
+    active_provider: str = "",
 ) -> Any:
     """Resolve and instantiate the configured provider through ProviderRegistry."""
     requested_name = (rp.provider_type or "openai").strip().lower()
@@ -139,6 +149,7 @@ def _create_provider_from_registry(
         api_key=api_key,
         base_url=base_url,
         provider_options=provider_options,
+        active_provider=active_provider,
     )
     return _instantiate_provider(provider_cls, init_kwargs)
 
@@ -1003,6 +1014,7 @@ async def _run_node_task(
         api_key=api_key,
         base_url=base_url,
         provider_options=_po,
+        active_provider=default_provider,
     )
 
     await rctx.emit_event("node_started", {
