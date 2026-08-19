@@ -208,6 +208,12 @@ class PolicyUpdateIn(BaseModel):
     policy: dict[str, Any]
 
 
+class QqQuickLoginIn(BaseModel):
+    """切到某个此前登录过的 QQ 号。没有缓存登录态的号只能扫码。"""
+
+    uin: str
+
+
 class ApprovalDecisionIn(BaseModel):
     decision: Literal["allow", "deny"]
     comment: str | None = None

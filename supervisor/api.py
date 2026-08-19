@@ -46,6 +46,7 @@ from .types import (
     FallbacksUpdateIn,
     NodeFallbacksUpdateIn,
     PolicyUpdateIn,
+    QqQuickLoginIn,
     OpRequestIn,
     OpRequestOut,
     OutboundMessageIn,
@@ -59,6 +60,7 @@ from .types import (
 )
 from .admin_api import create_admin_router
 from .admin_api import init_admin_token, verify_admin_token
+from .napcat import NapCatClient, NapCatError
 
 
 log = logging.getLogger(__name__)
@@ -135,6 +137,7 @@ def create_app(
     app.state.state = state
     app.state.process_manager = process_manager
     app.state.config_store = config_store
+    app.state.napcat = NapCatClient(state.workspace_root)
 
     @app.get("/v1/health", response_model=HealthOut)
     async def health() -> HealthOut:
@@ -237,6 +240,49 @@ def create_app(
             },
         )
         return {"policy": saved}
+
+    @app.get("/v1/qq/account")
+    async def get_qq_account(request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        client: NapCatClient = app.state.napcat
+        if not client.configured:
+            return {"configured": False}
+        try:
+            return {"configured": True, **await client.account()}
+        except NapCatError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/v1/qq/account/quick-login")
+    async def qq_quick_login(body: QqQuickLoginIn, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        client: NapCatClient = app.state.napcat
+        uin = body.uin.strip()
+        if not uin.isdigit():
+            raise HTTPException(status_code=400, detail="QQ 号必须是数字")
+        try:
+            await client.call("SetQuickLogin", {"uin": uin})
+        except NapCatError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        st: SupervisorState = app.state.state
+        # 换号等于换掉 bot 的身份，出事时必须查得到是谁在什么时候换的。
+        st.eventlog.append(
+            session_id="",
+            component="supervisor",
+            type_="qq_account_switched",
+            payload={"uin": uin},
+        )
+        return {"ok": True, "uin": uin}
+
+    @app.post("/v1/qq/account/qrcode")
+    async def qq_login_qrcode(request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        client: NapCatClient = app.state.napcat
+        try:
+            data = await client.call("GetQQLoginQrcode")
+        except NapCatError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        payload = data if isinstance(data, dict) else {}
+        return {"qrcode": str(payload.get("qrcode") or payload.get("qrcodeurl") or "")}
 
     @app.get("/v1/config/system-models")
     async def get_system_models(request: Request) -> dict[str, Any]:
