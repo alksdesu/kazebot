@@ -91,7 +91,7 @@ export const SettingsSidebar = () => {
               <Icon name="dashboard" size={16} />
             </span>
             <span className="flex-1 font-mono">QQ 控制台</span>
-            <Icon name={consoleOpen ? 'expand_less' : 'expand_more'} size={16} />
+            <Icon name={consoleOpen ? 'keyboard_arrow_up' : 'keyboard_arrow_down'} size={16} />
           </button>
           {consoleOpen && CONSOLE_DOMAINS.map(domain => (
             <button

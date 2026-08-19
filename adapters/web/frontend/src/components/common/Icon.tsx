@@ -26,6 +26,8 @@ import { FolderManagedW400 } from '@material-symbols-svg/react/icons/folder-mana
 import { HubW400 } from '@material-symbols-svg/react/icons/hub';
 import { InboxW400 } from '@material-symbols-svg/react/icons/inbox';
 import { InfoW400 } from '@material-symbols-svg/react/icons/info';
+import { KeyboardArrowDownW400 } from '@material-symbols-svg/react/icons/keyboard-arrow-down';
+import { KeyboardArrowUpW400 } from '@material-symbols-svg/react/icons/keyboard-arrow-up';
 import { KeyboardReturnW400 } from '@material-symbols-svg/react/icons/keyboard-return';
 import { MenuW400 } from '@material-symbols-svg/react/icons/menu';
 import { MenuBookW400 } from '@material-symbols-svg/react/icons/menu-book';
@@ -69,6 +71,8 @@ const ICON_MAP: Record<string, SvgIcon> = {
   hub: HubW400,
   inbox: InboxW400,
   info: InfoW400,
+  keyboard_arrow_down: KeyboardArrowDownW400,
+  keyboard_arrow_up: KeyboardArrowUpW400,
   keyboard_return: KeyboardReturnW400,
   menu: MenuW400,
   menu_book: MenuBookW400,
