@@ -261,19 +261,25 @@ def create_app(
             raise HTTPException(status_code=400, detail="QQ 号必须是数字")
         try:
             await client.call("SetQuickLogin", {"uin": uin})
-            # 一并钉成自动登录账号，否则下次容器重启又停在等扫码。
-            await client.set_auto_login(uin)
         except NapCatError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        # 号已经切过去了，钉自动登录只是锦上添花：这一步失败不该让人以为没切成。
+        pinned = True
+        pin_error = ""
+        try:
+            await client.set_auto_login(uin)
+        except NapCatError as exc:
+            pinned = False
+            pin_error = str(exc)
         st: SupervisorState = app.state.state
         # 换号等于换掉 bot 的身份，出事时必须查得到是谁在什么时候换的。
         st.eventlog.append(
             session_id="",
             component="supervisor",
             type_="qq_account_switched",
-            payload={"uin": uin},
+            payload={"uin": uin, "pinned": pinned},
         )
-        return {"ok": True, "uin": uin}
+        return {"ok": True, "uin": uin, "pinned": pinned, "pin_error": pin_error}
 
     @app.post("/v1/qq/account/qrcode")
     async def qq_login_qrcode(request: Request) -> dict[str, Any]:
