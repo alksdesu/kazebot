@@ -1098,6 +1098,8 @@ def _user_identity_lines(event: Any, display_name: str) -> List[str]:
     lines = [
         f"稳定用户标识: {stable_user}",
         f"显示名: {_sanitize_name(display_name)}",
+        # 标识排在显示名前面、历史里又每行都跟着，模型很容易拿它当称呼；而 @ 标记确实要用它，不能一概禁。
+        f"称呼规则: 说到这个人时用显示名，{stable_user} 只在 [at:{stable_user}] 里用，不要写进正文",
     ]
     address_as = str(profile.get("address_as") or "").strip()
     if address_as:
