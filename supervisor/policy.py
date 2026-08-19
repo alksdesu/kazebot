@@ -52,6 +52,8 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "**/.env", "decision": "deny", "reason": "do not allow reading dotenv secrets"},
                 # manage_secret 的虚拟路径，不是真目录；list 只回键名与是否已配，不回值。
                 {"pattern": ".secret", "decision": "auto", "reason": "listing secret names exposes no values"},
+                # 排队中的账号操作请求里带着 admin token。
+                {"pattern": "data/napcat-account.*", "decision": "deny", "reason": "queued account actions carry the admin token"},
                 {"pattern": "config/nodes/**", "decision": "deny", "reason": "node prompts are internal"},
                 {"pattern": "engine/system_nodes/**", "decision": "deny", "reason": "system prompts are internal"},
                 # data/ 下有 config.yaml、.admin_token、会话与事件流。落到 default:auto
@@ -94,6 +96,8 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "**/.env", "decision": "deny", "reason": "do not allow writing dotenv secrets"},
                 # 同上，虚拟路径。写的是 .env 里的单个键，值不经过 supervisor。
                 {"pattern": ".secret/**", "decision": "auto", "reason": "admins may set api keys via manage_secret"},
+                # 这个文件名会被 root 侧 runner 执行，只有 supervisor 该往里写。
+                {"pattern": "data/napcat-account.*", "decision": "deny", "reason": "account actions are executed as root"},
             ],
         },
         "execute_command": {

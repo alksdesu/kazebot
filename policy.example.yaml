@@ -24,6 +24,10 @@ read_file:
     - pattern: ".secret"
       decision: auto
       reason: "listing secret names exposes no values"
+    # 排队中的账号操作请求里带着 admin token。
+    - pattern: "data/napcat-account.*"
+      decision: deny
+      reason: "queued account actions carry the admin token"
     - pattern: "config/nodes/**"
       decision: deny
       reason: "node prompts are internal"
@@ -118,6 +122,10 @@ write_file:
     - pattern: ".secret/**"
       decision: auto
       reason: "admins may set api keys via manage_secret"
+    # 这个文件名会被 root 侧 runner 执行，只有 supervisor 该往里写。
+    - pattern: "data/napcat-account.*"
+      decision: deny
+      reason: "account actions are executed as root"
 
 # 命令执行策略。
 # default=approval_required：AI 审核之后，仍需人类审批。
