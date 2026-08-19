@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,8 @@ from engine.builtin.knowledge_inject import (
     _save_book,
     memory_dir,
 )
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "MemoryAdminError",
@@ -225,6 +228,7 @@ def delete_entry(workspace_root: Path, namespace: str, book: str, entry_id: str)
                 path.unlink(missing_ok=True)
     if removed:
         _invalidate_cache(Path(workspace_root), memory_book=namespace)
+        _prune_hits(Path(workspace_root), namespace, entry_id)
     return removed
 
 
@@ -244,4 +248,18 @@ def clear_namespace(workspace_root: Path, namespace: str) -> int:
             with contextlib.suppress(OSError):
                 directory.rmdir()
     _invalidate_cache(Path(workspace_root), memory_book=namespace)
+    _prune_hits(Path(workspace_root), namespace)
     return removed
+
+
+def _prune_hits(workspace_root: Path, namespace: str, entry_id: str = "") -> None:
+    """摘掉命中戳。留着的话 14 天扫除会把新建的同 id 记忆当成老记忆判龄。"""
+    from engine.memory_hit_cache import prune_entry_hits, prune_namespace_hits
+
+    try:
+        if entry_id:
+            prune_entry_hits(workspace_root, namespace, entry_id)
+        elif namespace:
+            prune_namespace_hits(workspace_root, namespace)
+    except Exception:
+        logger.debug("prune hit cache failed", exc_info=True)

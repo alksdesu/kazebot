@@ -11,7 +11,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from engine.eventlog_rotation import eventlog_file_lock
 
@@ -147,9 +147,26 @@ def prune_namespace_hits(workspace_root: Path, namespace: str) -> int:
     if not ns:
         return 0
     prefix = f"{ns}{_HIT_KEY_SEP}"
-    # 先在内存锁内摘掉待落盘的同前缀项，文件锁在锁外拿（顺序同 flush_hit_cache）。
+    return _drop_hit_keys(workspace_root, lambda key: key.startswith(prefix))
+
+
+def prune_entry_hits(workspace_root: Path, namespace: str, entry_id: str) -> int:
+    """Drop one entry's hit stamp.
+
+    留着的话，之后在同一个会话里新建同 id 的记忆会继承旧命中时间，一进来就是「老热记忆」。
+    """
+    entry = str(entry_id or "").strip()
+    if not entry:
+        return 0
+    doomed = hit_cache_key(namespace, entry)
+    return _drop_hit_keys(workspace_root, lambda key: key == doomed)
+
+
+def _drop_hit_keys(workspace_root: Path, matches: Callable[[str], bool]) -> int:
+    """从待落盘缓冲和盘上侧车里摘掉命中的 key，返回删掉的条数。"""
+    # 先在内存锁内摘掉待落盘的项，文件锁在锁外拿（顺序同 flush_hit_cache）。
     with _hit_cache_lock:
-        for key in [k for k in _hit_pending if k.startswith(prefix)]:
+        for key in [k for k in _hit_pending if matches(k)]:
             del _hit_pending[key]
     path = hit_cache_path(workspace_root)
     if not path.exists():
@@ -157,7 +174,7 @@ def prune_namespace_hits(workspace_root: Path, namespace: str) -> int:
     try:
         with eventlog_file_lock(path):
             cache = read_hit_cache(workspace_root)
-            doomed = [k for k in cache if k.startswith(prefix)]
+            doomed = [k for k in cache if matches(k)]
             if not doomed:
                 return 0
             for key in doomed:
@@ -167,7 +184,7 @@ def prune_namespace_hits(workspace_root: Path, namespace: str) -> int:
             os.replace(tmp, path)
             return len(doomed)
     except Exception as prune_error:
-        logger.warning("pruning namespace hits failed: %s", prune_error)
+        logger.warning("pruning hit stamps failed: %s", prune_error)
         return 0
 
 
