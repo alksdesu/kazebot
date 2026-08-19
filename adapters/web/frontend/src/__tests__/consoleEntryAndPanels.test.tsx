@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { Sidebar } from '../components/layout';
 import { SettingsRightPanel } from '../components/settings/SettingsRightPanel';
+import { SettingsSidebar } from '../components/settings/SettingsSidebar';
 import { SystemSettingsPage } from '../components/settings/pages/SystemSettingsPage';
 import { useConsoleStore } from '../console/consoleStore';
 import { useChatStore, type ConversationMeta } from '../store/chatStore';
@@ -48,22 +49,23 @@ describe('控制台入口', () => {
     vi.restoreAllMocks();
   });
 
-  it('左栏底部提供进入 QQ 控制台的按钮', () => {
-    renderSidebar();
+  it('设置侧栏展开后能直接进到控制台的指定分区', () => {
+    render(<SettingsSidebar />);
 
     fireEvent.click(screen.getByRole('button', { name: 'QQ 控制台' }));
+    fireEvent.click(screen.getByRole('button', { name: 'QQ 控制台 权限' }));
 
     expect(useViewStore.getState().viewMode).toBe('console');
+    expect(useConsoleStore.getState().domain).toBe('permissions');
   });
 
-  it('控制台入口与设置入口互不干扰', () => {
+  it('聊天侧栏只留设置入口，控制台入口收敛到设置里', () => {
     renderSidebar();
+
+    expect(screen.queryByRole('button', { name: 'QQ 控制台' })).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: '设置' }));
     expect(useViewStore.getState().viewMode).toBe('settings');
-
-    fireEvent.click(screen.getByRole('button', { name: 'QQ 控制台' }));
-    expect(useViewStore.getState().viewMode).toBe('console');
   });
 });
 

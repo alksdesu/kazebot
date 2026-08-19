@@ -58,7 +58,6 @@ export const Sidebar = ({
 }: SidebarProps) => {
   const isConnected = useSettingsStore(state => state.isConnected);
   const openSettings = useViewStore(state => state.openSettings);
-  const openConsole = useViewStore(state => state.openConsole);
   const childNodeMap = useChatStore(state => state.childNodes);
   const viewChildSession = useChatStore(state => state.viewChildSession);
   const groupedChildNodes = useMemo(
@@ -188,16 +187,6 @@ export const Sidebar = ({
               actions stay on the same icon system as layout and message controls. */}
           <Icon name="settings" size={16} />
           <span>设置</span>
-        </button>
-        <button
-          className="flex w-full items-center gap-2 px-2 py-1.5 text-xs text-[var(--duties-secondary)] transition-colors hover:bg-[var(--duties-muted)]"
-          onClick={() => {
-            openConsole();
-          }}
-          type="button"
-        >
-          <Icon name="dashboard" size={16} />
-          <span>QQ 控制台</span>
         </button>
       </div>
     </div>

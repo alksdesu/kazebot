@@ -3,6 +3,9 @@
 // keeping the right panel independent. How: render tabs from settingsTabs and route
 // all selection through viewStore. Purpose: new settings pages only need registry
 // entries and do not require Sidebar or App changes.
+import { useState } from 'react';
+
+import { CONSOLE_DOMAINS, DOMAIN_LABELS, useConsoleStore, type ConsoleDomain } from '../../console/consoleStore';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
 import { Icon } from '../common';
@@ -10,7 +13,15 @@ import { settingsTabs } from './settingsTabs';
 
 export const SettingsSidebar = () => {
   const { isConnected } = useSettingsStore();
-  const { activeSettingsTab, closeSettings, setSettingsTab } = useViewStore();
+  const { activeSettingsTab, closeSettings, openConsole, setSettingsTab } = useViewStore();
+  const setConsoleDomain = useConsoleStore(state => state.setDomain);
+  const [consoleOpen, setConsoleOpen] = useState(false);
+
+  // 先落 domain 再切视图：syncViewQuery 只在离开 console 时才删 ?domain=，顺序反了定位会丢。
+  const enterConsole = (domain: ConsoleDomain) => {
+    setConsoleDomain(domain);
+    openConsole();
+  };
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -67,6 +78,33 @@ export const SettingsSidebar = () => {
             </button>
           );
         })}
+
+        <div className="mt-2 border-t border-[var(--duties-border)] pt-2">
+          <button
+            aria-expanded={consoleOpen}
+            aria-label="QQ 控制台"
+            className="mb-1 flex w-full items-center gap-2 px-3 py-2.5 text-left text-xs text-[var(--duties-secondary)] transition-colors hover:bg-[var(--duties-accent)] hover:text-[var(--duties-text)]"
+            onClick={() => setConsoleOpen(open => !open)}
+            type="button"
+          >
+            <span className="w-4 text-center text-[var(--duties-tertiary)]">
+              <Icon name="dashboard" size={16} />
+            </span>
+            <span className="flex-1 font-mono">QQ 控制台</span>
+            <Icon name={consoleOpen ? 'expand_less' : 'expand_more'} size={16} />
+          </button>
+          {consoleOpen && CONSOLE_DOMAINS.map(domain => (
+            <button
+              aria-label={`QQ 控制台 ${DOMAIN_LABELS[domain]}`}
+              className="mb-1 flex w-full items-center py-2 pl-9 pr-3 text-left text-xs text-[var(--duties-secondary)] transition-colors hover:bg-[var(--duties-accent)] hover:text-[var(--duties-text)]"
+              key={domain}
+              onClick={() => enterConsole(domain)}
+              type="button"
+            >
+              <span className="font-mono">{DOMAIN_LABELS[domain]}</span>
+            </button>
+          ))}
+        </div>
       </nav>
 
       <div className="border-t border-[var(--duties-border)] p-3">
