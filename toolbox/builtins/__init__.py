@@ -28,6 +28,7 @@ RESERVED_TOOL_NAMES = {
     "write_file",
     "execute_command",
     "search_in_files",
+    "manage_secret",
     "create_or_update_skill",
     "list_skills",
     "delete_skill",
@@ -58,6 +59,7 @@ from .read_file import read_file  # noqa: E402,F401
 from .write_file import write_file  # noqa: E402,F401
 from .execute_command import execute_command  # noqa: E402,F401
 from .search_in_files import search_in_files  # noqa: E402,F401
+from .manage_secret import manage_secret  # noqa: E402,F401
 # Why: skill CRUD tools moved into engine.builtin.knowledge_inject. How: keep the
 # names reserved above but stop importing the removed skill-tool module.
 # Purpose: registry startup no longer depends on deleted knowledge files.

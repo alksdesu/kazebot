@@ -50,6 +50,8 @@ def _default_policy_dict() -> dict[str, Any]:
             "rules": [
                 {"pattern": ".env", "decision": "deny", "reason": "do not allow reading dotenv secrets"},
                 {"pattern": "**/.env", "decision": "deny", "reason": "do not allow reading dotenv secrets"},
+                # manage_secret 的虚拟路径，不是真目录；list 只回键名与是否已配，不回值。
+                {"pattern": ".secret", "decision": "auto", "reason": "listing secret names exposes no values"},
                 {"pattern": "config/nodes/**", "decision": "deny", "reason": "node prompts are internal"},
                 {"pattern": "engine/system_nodes/**", "decision": "deny", "reason": "system prompts are internal"},
                 # data/ 下有 config.yaml、.admin_token、会话与事件流。落到 default:auto
@@ -90,6 +92,8 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "main.py", "decision": "approval_required", "reason": "entrypoint changes require approval"},
                 {"pattern": ".env", "decision": "deny", "reason": "do not allow writing dotenv secrets"},
                 {"pattern": "**/.env", "decision": "deny", "reason": "do not allow writing dotenv secrets"},
+                # 同上，虚拟路径。写的是 .env 里的单个键，值不经过 supervisor。
+                {"pattern": ".secret/**", "decision": "auto", "reason": "admins may set api keys via manage_secret"},
             ],
         },
         "execute_command": {

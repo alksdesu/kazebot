@@ -427,6 +427,32 @@ class ToolRegistry:
                 _builtins.write_file,
             ),
             (
+                "manage_secret",
+                "Manage API keys in .env, one key at a time. "
+                "action=list returns key names and whether each is set; values are never returned. "
+                "action=set writes or updates a single key, leaving every other line untouched. "
+                "action=unset removes one key. "
+                "Reading or writing .env directly is denied, so use this tool instead. "
+                "Common keys: EXA_API_KEY, XAI_API_KEY, DEEPSEEK_API_KEY, ANTHROPIC_API_KEY. "
+                "Policy+approval guarded.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "set", "unset"]},
+                        "name": {
+                            "type": "string",
+                            "description": "Key name in UPPER_SNAKE_CASE. Required for set and unset.",
+                        },
+                        "value": {
+                            "type": "string",
+                            "description": "Secret value. Required for set. Never echoed back in any result.",
+                        },
+                    },
+                    "required": ["action"],
+                },
+                _builtins.manage_secret,
+            ),
+            (
                 "apply_diff",
                 "Apply sequential search/replace diffs to a file. "
                 "Each diff specifies an exact 'search' string and a 'replace' string. "

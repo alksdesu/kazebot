@@ -1571,6 +1571,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 "config/nodes/",
                 "engine/system_nodes/",
                 "data/",
+                # manage_secret 的虚拟路径，不是真目录。
+                ".secret",
             )
             if op == "execute_command":
                 # 例外：允许非管理员群友用 curl 纯 GET 读取公网网页。

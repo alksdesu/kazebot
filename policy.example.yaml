@@ -20,6 +20,10 @@ read_file:
     - pattern: "**/.env"
       decision: deny
       reason: "do not allow reading dotenv secrets"
+    # manage_secret 的虚拟路径，不是真目录；list 只回键名与是否已配，不回值。
+    - pattern: ".secret"
+      decision: auto
+      reason: "listing secret names exposes no values"
     - pattern: "config/nodes/**"
       decision: deny
       reason: "node prompts are internal"
@@ -110,6 +114,10 @@ write_file:
     - pattern: "**/.env"
       decision: deny
       reason: "do not allow writing dotenv secrets"
+    # 同上，虚拟路径。写的是 .env 里的单个键，值不经过 supervisor。
+    - pattern: ".secret/**"
+      decision: auto
+      reason: "admins may set api keys via manage_secret"
 
 # 命令执行策略。
 # default=approval_required：AI 审核之后，仍需人类审批。
