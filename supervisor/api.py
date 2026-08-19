@@ -261,6 +261,8 @@ def create_app(
             raise HTTPException(status_code=400, detail="QQ 号必须是数字")
         try:
             await client.call("SetQuickLogin", {"uin": uin})
+            # 一并钉成自动登录账号，否则下次容器重启又停在等扫码。
+            await client.set_auto_login(uin)
         except NapCatError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         st: SupervisorState = app.state.state
@@ -283,6 +285,38 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         payload = data if isinstance(data, dict) else {}
         return {"qrcode": str(payload.get("qrcode") or payload.get("qrcodeurl") or "")}
+
+    @app.post("/v1/qq/account/relogin")
+    async def qq_relogin(request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        client: NapCatClient = app.state.napcat
+        st: SupervisorState = app.state.state
+        # NapCat 在已登录状态下拒发二维码，且不提供登出，只能重启进等扫码状态。
+        st.eventlog.append(
+            session_id="",
+            component="supervisor",
+            type_="qq_account_relogin_requested",
+            payload={},
+        )
+        try:
+            await client.enter_login_mode()
+        except NapCatError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @app.post("/v1/qq/account/pin")
+    async def qq_pin_account(request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        client: NapCatClient = app.state.napcat
+        try:
+            info = await client.account()
+            uin = str(info.get("uin") or "")
+            if not uin:
+                raise HTTPException(status_code=409, detail="当前没有登录任何账号")
+            await client.set_auto_login(uin)
+        except NapCatError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {"ok": True, "uin": uin}
 
     @app.get("/v1/config/system-models")
     async def get_system_models(request: Request) -> dict[str, Any]:

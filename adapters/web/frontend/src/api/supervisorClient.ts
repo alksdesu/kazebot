@@ -580,6 +580,61 @@ export async function updatePolicy(token: string, policy: PolicyDoc): Promise<Po
   return (data && data.policy) || {};
 }
 
+// ── bot 登录账号（经 supervisor 转发 NapCat WebUI）──
+
+export interface QqAccount {
+  configured: boolean;
+  uin?: string;
+  nick?: string;
+  online?: boolean;
+  is_login?: boolean;
+  login_error?: string;
+  /** 此前登录过、可以免扫码切回去的号。 */
+  quick_login?: string[];
+}
+
+export async function getQqAccount(token: string): Promise<QqAccount> {
+  const resp = await apiFetch('/qq/account', { headers: authHeaders(token) });
+  const data = await resp.json();
+  return data || { configured: false };
+}
+
+export async function qqQuickLogin(token: string, uin: string): Promise<void> {
+  await apiFetch('/qq/account/quick-login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify({ uin }),
+  });
+}
+
+/** 清掉自动登录并重启容器：NapCat 在已登录状态下拒发二维码，也没有登出接口。 */
+export async function qqEnterLoginMode(token: string): Promise<void> {
+  await apiFetch('/qq/account/relogin', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: '{}',
+  });
+}
+
+/** 把当前在线的号钉成自动登录，否则下次容器重启会停在等扫码。 */
+export async function qqPinAccount(token: string): Promise<void> {
+  await apiFetch('/qq/account/pin', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: '{}',
+  });
+}
+
+export async function getQqLoginQrcode(token: string): Promise<string> {
+  const resp = await apiFetch('/qq/account/qrcode', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: '{}',
+  });
+  const data = await resp.json();
+  return String((data && data.qrcode) || '');
+}
+
 /** 字段留空串表示删掉这一项（回到跟随主渠道）；不传表示不动。 */
 export async function updateSystemModel(
   token: string,

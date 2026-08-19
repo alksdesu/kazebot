@@ -13,11 +13,12 @@ import {
 } from '../api/supervisorClient';
 
 export const CONSOLE_DOMAINS = [
-  'channels', 'timing', 'permissions', 'persona', 'providers', 'models', 'runtime',
+  'account', 'channels', 'timing', 'permissions', 'persona', 'providers', 'models', 'runtime',
 ] as const;
 export type ConsoleDomain = (typeof CONSOLE_DOMAINS)[number];
 
 export const DOMAIN_LABELS: Record<ConsoleDomain, string> = {
+  account: '账号',
   channels: '信道',
   timing: '时机',
   permissions: '权限',

@@ -2,6 +2,7 @@
 // sidebar/header 都是必填槽，塞进去就没法视觉独立。
 import { useEffect } from 'react';
 
+import { AccountPage } from './AccountPage';
 import { ChannelsPage } from './ChannelsPage';
 import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
@@ -16,13 +17,14 @@ import { RuntimePage } from './RuntimePage';
 import { TimingPage } from './TimingPage';
 
 const READY: ReadonlySet<ConsoleDomain> = new Set<ConsoleDomain>([
-  'channels', 'timing', 'permissions', 'persona', 'providers', 'models', 'runtime',
+  'account', 'channels', 'timing', 'permissions', 'persona', 'providers', 'models', 'runtime',
 ]);
 
 // 这些页写的不是 qq.yaml，也就不需要等 bot 公布生效配置——bot 没跑也该能改。
-const WITHOUT_BOT: ReadonlySet<ConsoleDomain> = new Set<ConsoleDomain>(['providers', 'models']);
+const WITHOUT_BOT: ReadonlySet<ConsoleDomain> = new Set<ConsoleDomain>(['account', 'providers', 'models']);
 
 const PAGES: Partial<Record<ConsoleDomain, () => JSX.Element>> = {
+  account: AccountPage,
   channels: ChannelsPage,
   timing: TimingPage,
   permissions: PermissionsPage,
@@ -33,6 +35,7 @@ const PAGES: Partial<Record<ConsoleDomain, () => JSX.Element>> = {
 };
 
 const PAGE_NOTES: Partial<Record<ConsoleDomain, string>> = {
+  account: 'bot 用哪个 QQ 号登录。换号会重启 NapCat，期间 bot 不可用；新号不在原来的群里的话，群名单和管理员名单都要重配。',
   channels: 'bot 只在名单里的群和私聊里出现。两份名单都是白名单，不在名单里的消息连处理都不会处理。',
   timing: '决定 bot 在群里什么时候说话。多个条件之间是「或」——命中任意一条就会回应，再由冷却决定是否真的开口。',
   permissions: '谁能对 bot 下管理命令。管理员权限跨所有群和私聊生效，不区分场景。',

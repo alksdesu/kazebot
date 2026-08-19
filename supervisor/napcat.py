@@ -5,6 +5,7 @@ WebUI 只监听 127.0.0.1，且有独立于本系统的 token——浏览器既�
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import time
 from pathlib import Path
@@ -19,6 +20,8 @@ _CREDENTIAL_TTL_SEC = 2400.0
 _TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 
 _UNAUTHORIZED = object()
+# 改 root 的 webui.json 与重启容器都超出本进程权限，收在这个只做固定动作的脚本里。
+_HELPER = "/usr/local/bin/napcat-account"
 
 
 class NapCatError(RuntimeError):
@@ -109,6 +112,31 @@ class NapCatClient:
             if result is _UNAUTHORIZED:
                 raise NapCatError("NapCat 鉴权失败，请确认 " + _TOKEN_KEY + " 是当前的 WebUI token")
             return result
+
+    async def _helper(self, *args: str) -> None:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "sudo", "-n", _HELPER, *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await proc.communicate()
+        except OSError as exc:
+            raise NapCatError("调用 " + _HELPER + " 失败：" + str(exc)) from exc
+        if proc.returncode != 0:
+            detail = (err or out or b"").decode("utf-8", "replace").strip()[:200]
+            raise NapCatError("napcat-account " + args[0] + " 失败：" + (detail or "未知原因"))
+
+    async def set_auto_login(self, uin: str) -> None:
+        """让容器重启后自己登回来。不设的话 NapCat 起来只会停在等扫码。"""
+        await self._helper("set-auto", uin)
+
+    async def enter_login_mode(self) -> None:
+        """清掉自动登录再重启，容器起来就停在等扫码，这时才拿得到二维码。"""
+        await self._helper("clear-auto")
+        await self._helper("restart")
+        self._credential = ""
+        self._issued_at = 0.0
 
     async def account(self) -> dict[str, Any]:
         """当前账号 + 可免扫码切换的号。任一子查询失败都不该让整页打不开。"""
