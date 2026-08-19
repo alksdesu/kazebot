@@ -6,7 +6,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterator
 
 from clonoth_runtime import get_float, load_runtime_config
 
@@ -149,6 +149,26 @@ def _extract_tool_spec(py: Path) -> tuple[dict[str, Any] | None, float | None]:
         timeout_sec = float(vals.get("TIMEOUT_SEC"))
 
     return spec, timeout_sec
+
+
+# 注册与列举共用同一份提取器，否则「界面列得出来」和「引擎认」会各自漂移。
+extract_tool_spec = _extract_tool_spec
+
+
+def iter_external_tool_files(tools_dir: Path) -> Iterator[Path]:
+    """tools/ 下算作外部工具的 .py。
+
+    stocktool、drawtools 这类工具包把入口放在子目录里，所以要递归；包初始化文件、
+    下划线开头的私有模块和 .disabled.py 都不是工具入口。
+    """
+    if not tools_dir.is_dir():
+        return
+    for py in sorted(tools_dir.rglob("*.py")):
+        if py.name == "__init__.py" or py.name.startswith("_") or py.name.endswith(".disabled.py"):
+            continue
+        if any(part == "__pycache__" for part in py.parts):
+            continue
+        yield py
 
 
 _SCRIPT_IDENTITY_ENV_KEYS = {
@@ -692,17 +712,7 @@ class ToolRegistry:
 
         builtin_names = set(self._tool_specs.keys())
 
-        # [AutoC 2026-06-24] Why: stocktool and future tool packs keep their
-        # public tool entrypoints in subdirectories such as tools/stocktool/.
-        # How: scan tools/**/*.py while preserving the existing top-level format,
-        # skipping package/private/disabled helper files. Purpose: allow grouped
-        # external tools without requiring thin wrappers in tools/ root.
-        for py in sorted(self.tools_dir.rglob("*.py")):
-            if py.name == "__init__.py" or py.name.startswith("_") or py.name.endswith(".disabled.py"):
-                continue
-            if any(part == "__pycache__" for part in py.parts):
-                continue
-
+        for py in iter_external_tool_files(self.tools_dir):
             spec, timeout_sec = _extract_tool_spec(py)
             if spec is None:
                 continue

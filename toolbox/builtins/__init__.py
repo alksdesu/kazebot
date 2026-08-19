@@ -44,6 +44,7 @@ RESERVED_TOOL_NAMES = {
     "save_memory",
     "list_memories",
     "delete_memory",
+    "create_agent",
     "get_context_window",
 }
 

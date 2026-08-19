@@ -787,19 +787,15 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     @router.get("/all-tool-names")
     def all_tool_names() -> list[str]:
         from toolbox.builtins import RESERVED_TOOL_NAMES
-        builtin = set(RESERVED_TOOL_NAMES)
+        from toolbox.registry import extract_tool_spec, iter_external_tool_files
+
         # Also include tools registered but not in _RESERVED (like cancel_active_tasks)
-        extra_builtins = {'cancel_active_tasks'}
-        names = builtin | extra_builtins
-        # Scan external tools
-        tools_dir = workspace_root / "tools"
-        if tools_dir.exists():
-            for f in tools_dir.glob("*.py"):
-                if f.name.startswith("_"):
-                    continue
-                spec, _ = _extract_tool_spec_ast(f)
-                if spec and isinstance(spec.get("name"), str):
-                    names.add(spec["name"])
+        names = set(RESERVED_TOOL_NAMES) | {'cancel_active_tasks'}
+        # 用 registry 那份扫描规则：这里少认一个工具，界面上就永远勾不到它。
+        for f in iter_external_tool_files(workspace_root / "tools"):
+            spec, _ = extract_tool_spec(f)
+            if spec and isinstance(spec.get("name"), str):
+                names.add(spec["name"])
         return sorted(names)
 
     return router
