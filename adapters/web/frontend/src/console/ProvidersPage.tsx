@@ -17,7 +17,7 @@ import {
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { mergeModelChoices, modelsFromProviders } from '../utils/modelChoices';
-import { EnvHint, HostMismatchHint } from './channelFields';
+import { EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields';
 import { Block, Empty, Footnote, SaveBar } from './components';
 import { SystemSlots } from './SystemSlots';
 import { VisionRouting } from './VisionRouting';
@@ -113,27 +113,31 @@ const Row = ({
       </button>
     </div>
 
-    <div className="qc-cap-head">
-      <input
-        aria-label={draft.name + ' 模型'}
-        className="qc-inp"
-        list={choices.length ? listId : undefined}
-        onChange={(event) => onChange({ ...draft, model: event.target.value })}
-        placeholder="模型名"
-        value={draft.model}
-      />
-      {choices.length > 0 && (
-        <datalist id={listId}>
-          {choices.map((model) => <option key={model} value={model} />)}
-        </datalist>
-      )}
+    <ModelField
+      apiKey={draft.apiKeyInput}
+      ariaLabel={draft.name + ' 模型'}
+      baseUrl={draft.baseUrl}
+      choices={choices}
+      listId={listId}
+      provider={draft.name}
+      value={draft.model}
+      onChange={(model) => onChange({ ...draft, model })}
+    />
+    <EnvHint raw={draft.model} resolved={draft.modelResolved} savedRaw={stored?.model ?? ''} />
+
+    <FieldRow label="地址">
       <input
         aria-label={draft.name + ' 地址'}
-        className="qc-inp qc-inp-wide"
+        className="qc-inp"
         onChange={(event) => onChange({ ...draft, baseUrl: event.target.value })}
-        placeholder="接口地址，留空用这家的默认"
+        placeholder="留空用这家的默认地址"
         value={draft.baseUrl}
       />
+    </FieldRow>
+    <EnvHint raw={draft.baseUrl} resolved={draft.baseUrlResolved} savedRaw={stored?.baseUrl ?? ''} />
+    <HostMismatchHint baseUrl={draft.baseUrl} profiles={profiles} provider={draft.name} />
+
+    <FieldRow label="密钥">
       <input
         aria-label={draft.name + ' 密钥'}
         className="qc-inp"
@@ -142,10 +146,9 @@ const Row = ({
         type="password"
         value={draft.apiKeyInput}
       />
-    </div>
+    </FieldRow>
 
-    <div className="qc-cap-head">
-      <label className="qc-cap-desc" htmlFor={listId + '-vision'}>带图消息</label>
+    <FieldRow label="带图">
       <select
         aria-label={draft.name + ' 读图能力'}
         className="qc-inp"
@@ -159,11 +162,7 @@ const Row = ({
         <option value="yes">能看图</option>
         <option value="no">看不了图</option>
       </select>
-    </div>
-
-    <EnvHint raw={draft.model} resolved={draft.modelResolved} savedRaw={stored?.model ?? ''} />
-    <EnvHint raw={draft.baseUrl} resolved={draft.baseUrlResolved} savedRaw={stored?.baseUrl ?? ''} />
-    <HostMismatchHint baseUrl={draft.baseUrl} profiles={profiles} provider={draft.name} />
+    </FieldRow>
   </li>
 );
 
@@ -361,7 +360,11 @@ export const ProvidersPage = () => {
 
       <VisionRouting />
 
-      <SystemSlots profiles={profiles} providerNames={data.registered || []} />
+      <SystemSlots
+        activeProvider={data.active_provider}
+        profiles={profiles}
+        providerNames={data.registered || []}
+      />
 
       <Footnote>
         密钥可以写成环境变量引用，只把变量名留在 config.yaml 里，值放 .env。地址留空时用这家的默认端点。

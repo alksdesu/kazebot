@@ -40,6 +40,7 @@ from .types import (
     ActiveProviderSecret,
     SystemModelUpdateIn,
     OpenAIConfigUpdateIn,
+    ProviderModelsIn,
     ProviderUpdateIn,
     ActiveProviderIn,
     FallbacksUpdateIn,
@@ -259,6 +260,49 @@ def create_app(
             name, base_url=body.base_url, api_key=body.api_key, model=body.model,
             supports_vision=body.supports_vision,
         )
+
+    @app.post("/v1/config/providers/{name}/models")
+    async def list_provider_models(
+        name: str, body: ProviderModelsIn, request: Request,
+    ) -> dict[str, Any]:
+        """问上游这个渠道有哪些模型。密钥只出不进：不回显、不进错误信息。"""
+        verify_admin_token(request)
+        import httpx
+        from providers import registry as provider_registry
+
+        cls = provider_registry.get(name)
+        if cls is None:
+            raise HTTPException(status_code=400, detail=f"没有叫 '{name}' 的渠道")
+        cs: ConfigStore = app.state.config_store
+        stored_url, stored_key = cs.resolve_provider_credentials(name)
+        # 页面上清空了地址是「用默认」，没传这个字段才是「沿用已存的」。
+        base_url = stored_url if body.base_url is None else body.base_url.strip()
+        api_key = (body.api_key or "").strip() or stored_key
+        if not api_key:
+            raise HTTPException(status_code=400, detail="这个渠道还没有密钥，先填上再拉取")
+        target = cls.catalog_request(base_url=base_url, api_key=api_key)
+        if target is None:
+            raise HTTPException(status_code=400, detail=f"{name} 没有列模型的接口，模型名请手填")
+        url, headers = target
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url, headers=headers)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"连不上 {url}：{exc}") from exc
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"上游返回 {resp.status_code}：{resp.text[:200]}",
+            )
+        try:
+            payload = resp.json()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail="上游返回的不是 JSON") from exc
+        models = cls.parse_catalog(payload)
+        if not models:
+            # 空列表当成功回去，界面会显示成「这家没有模型」，比报错更难查。
+            raise HTTPException(status_code=502, detail="上游没有返回任何模型")
+        return {"models": sorted(set(models))}
 
     @app.delete("/v1/config/providers/{name}")
     async def delete_provider(name: str, request: Request) -> dict[str, Any]:

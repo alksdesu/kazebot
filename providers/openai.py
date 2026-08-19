@@ -46,7 +46,7 @@ def _normalize_base_url(base_url: str | None) -> str:
 
     base = (base_url or "").strip().rstrip("/")
     if not base:
-        base = "https://api.openai.com/v1"
+        base = OpenAIProvider.default_base_url
 
     # 缺少协议前缀时补上 https://
     if base and not base.startswith("http://") and not base.startswith("https://"):
@@ -117,6 +117,25 @@ class OpenAIProvider(BaseProvider):
     provider_name = "openai"
     wire_format = "openai"
     official_hosts = ("api.openai.com",)
+    default_base_url = "https://api.openai.com/v1"
+
+    @classmethod
+    def catalog_request(cls, *, base_url: str, api_key: str):
+        return (
+            f"{_normalize_base_url(base_url or cls.default_base_url)}/models",
+            {"Authorization": f"Bearer {api_key}"},
+        )
+
+    @staticmethod
+    def parse_catalog(payload):
+        items = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return []
+        return [
+            str(item.get("id") or "").strip()
+            for item in items
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        ]
 
     # ------------------------------------------------------------------
     #  L3 Provider 层：消息预处理

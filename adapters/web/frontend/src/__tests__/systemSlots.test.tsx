@@ -52,7 +52,9 @@ beforeEach(() => {
 const rows = () => screen.getAllByRole('listitem');
 const rowFor = (label: string) => rows().find((row) => within(row).queryByText(label))!;
 const save = () => fireEvent.click(screen.getByRole('button', { name: '保存槽位' }));
-const render1 = (profiles: any = PROFILES) => render(<SystemSlots profiles={profiles} providerNames={NAMES} />);
+const render1 = (profiles: any = PROFILES) => render(
+  <SystemSlots activeProvider="openai" profiles={profiles} providerNames={NAMES} />,
+);
 
 describe('系统槽位', () => {
   it('六个槽位都摆出来，两个生图也在', async () => {

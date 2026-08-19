@@ -443,6 +443,29 @@ class AnthropicProvider(BaseProvider):
     # 目的：registry 能把配置里的 "anthropic" 映射回这个类。
     provider_name = "anthropic"
     official_hosts = ("api.anthropic.com",)
+    default_base_url = "https://api.anthropic.com"
+
+    @classmethod
+    def catalog_request(cls, *, base_url: str, api_key: str):
+        base = (base_url or cls.default_base_url).rstrip("/")
+        headers = {"anthropic-version": "2023-06-01"}
+        # 认证方式跟 _headers() 一致：官方域名收 x-api-key，中转站收 Bearer。
+        if _is_anthropic_domain(base):
+            headers["x-api-key"] = api_key
+        else:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return f"{base}/v1/models", headers
+
+    @staticmethod
+    def parse_catalog(payload):
+        items = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return []
+        return [
+            str(item.get("id") or "").strip()
+            for item in items
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        ]
 
     OPTIONS: tuple[OptionSpec, ...] = (
         OptionSpec(
@@ -558,7 +581,7 @@ class AnthropicProvider(BaseProvider):
         self._http = http
         self._api_key = api_key
         # Default to official Anthropic API; strip trailing slash
-        self._base_url = (base_url or "https://api.anthropic.com").rstrip("/")
+        self._base_url = (base_url or self.default_base_url).rstrip("/")
         self._options = OptionSet(self.OPTIONS, provider_options)
         self._timeout = float(self._options.get("timeout_sec"))
         unknown = self._options.unknown_keys()

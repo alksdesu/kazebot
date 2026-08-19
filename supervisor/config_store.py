@@ -308,6 +308,20 @@ class ConfigStore:
                 "node_fallbacks": node_chains,
             }
 
+    def resolve_provider_credentials(self, name: str) -> tuple[str, str]:
+        """按渠道名取展开后的 (base_url, api_key)。只给服务端自己发请求用。
+
+        绝不能进任何响应体：调用方要么拿它去请求上游，要么什么都不做。
+        """
+        with self._lock:
+            block = self._load_raw().get(name)
+        if not isinstance(block, dict):
+            return "", ""
+        return (
+            _resolve_env_value(str(block.get("base_url") or "")),
+            _resolve_env_value(str(block.get("api_key") or "")),
+        )
+
     def supports_vision(self, name: str = "") -> bool:
         """这个渠道收不收图片。不给名字就问当前活跃的那个。
 

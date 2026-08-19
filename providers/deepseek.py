@@ -18,7 +18,6 @@ from .options import BOOL, ENUM, OptionSet, OptionSpec
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_BASE_URL = "https://api.deepseek.com"
 # 这几项 DeepSeek 不认：详尽度没有，缓存分组是自动的不接受手动分组。
 _UNSUPPORTED = frozenset({"verbosity", "prompt_cache_key"})
 
@@ -28,6 +27,7 @@ class DeepSeekProvider(OpenAIProvider):
 
     provider_name = "deepseek"
     official_hosts = ("api.deepseek.com",)
+    default_base_url = "https://api.deepseek.com"
     # DeepSeek 至今没有收图的模型，带图请求会 400。
     default_supports_vision = False
 
@@ -72,7 +72,7 @@ class DeepSeekProvider(OpenAIProvider):
         super().__init__(
             http=http or httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10.0)),
             api_key=api_key,
-            base_url=base_url or _DEFAULT_BASE_URL,
+            base_url=base_url or self.default_base_url,
             model=model,
             provider_options=provider_options,
         )

@@ -29,6 +29,9 @@
   --qc-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   --qc-sans: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
 
+  /* 渠道字段前那一列标签的宽度。提示行靠它缩进，两处必须同源。 */
+  --qc-chan-label: 3em;
+
   --qc-rail: 56px;
   --qc-bar: 44px;
 
@@ -732,6 +735,45 @@
     display: flex;
     align-items: center;
     gap: 8px;
+  }
+
+  /* 渠道字段：标签一列 + 输入一列。全局 .qc-inp 是定宽 88px，模型名会被截成
+     claude-s，所以在这个容器里交回给 flex 分配。后代选择器压得住，不用 !important。 */
+  .qc-chan-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 6px;
+  }
+
+  .qc-chan-label {
+    flex: 0 0 var(--qc-chan-label);
+    color: var(--qc-mute);
+    font-size: 12px;
+  }
+
+  .qc-chan-body {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    /* min-width:0 不能省：flex 子项默认不肯缩到内容以下，长地址会把整行撑出去。 */
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .qc-chan-body .qc-inp {
+    width: auto;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .qc-chan-body .qc-btn {
+    flex: 0 0 auto;
+  }
+
+  /* 提示行跟输入框左边缘对齐，不跟标签对齐。 */
+  .qc-chan-note {
+    margin-left: calc(var(--qc-chan-label) + 10px);
   }
 
   .qc-cap-name {

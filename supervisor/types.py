@@ -347,6 +347,17 @@ class ProvidersResponse(BaseModel):
     node_fallbacks: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
 
 
+class ProviderModelsIn(BaseModel):
+    """列模型时用的地址和密钥。都可以不给：不给就用已经存下的那份。
+
+    页面上改了还没保存时要用改后的值去问，所以不能只读配置。
+    base_url 给空串表示「用这家的默认地址」，与不给是两回事。
+    """
+
+    base_url: str | None = None
+    api_key: str | None = None
+
+
 class ProviderUpdateIn(BaseModel):
     """更新渠道请求（部分更新）"""
     base_url: str | None = None

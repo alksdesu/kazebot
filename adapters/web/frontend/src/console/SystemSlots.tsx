@@ -12,7 +12,7 @@ import {
   type SystemModelsResponse,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
-import { EnvHint, HostMismatchHint } from './channelFields';
+import { EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields';
 import { Block, Empty, SaveBar } from './components';
 
 interface Draft {
@@ -42,11 +42,13 @@ const changed = (draft: Draft): boolean => (
 );
 
 const Row = ({
-  draft, providerNames, profiles, onChange,
+  draft, providerNames, profiles, activeProvider, onChange,
 }: {
   draft: Draft;
   providerNames: string[];
   profiles: ProviderProfiles | null;
+  /** 槽位没自选渠道时落到哪家 —— 拉模型要按那一家的格式问。 */
+  activeProvider: string;
   onChange: (next: Draft) => void;
 }) => {
   const { slot } = draft;
@@ -58,21 +60,43 @@ const Row = ({
       </div>
       <p className="qc-cap-desc">{slot.desc}</p>
 
-      <div className="qc-cap-head">
-        <input
-          aria-label={slot.label + ' 模型'}
-          className="qc-inp"
-          onChange={(event) => onChange({ ...draft, model: event.target.value })}
-          placeholder="留空 = 跟随主渠道"
+      {slot.supports_provider ? (
+        <ModelField
+          apiKey={draft.apiKeyInput}
+          ariaLabel={slot.label + ' 模型'}
+          baseUrl={draft.baseUrl}
+          choices={[]}
+          listId={'slot-' + slot.key}
+          provider={draft.provider || activeProvider}
           value={draft.model}
+          onChange={(model) => onChange({ ...draft, model })}
         />
+      ) : (
+        // 这几个槽位由工具进程直接请求，格式写死在工具源码里，没有可问的列模型接口。
+        <FieldRow label="模型">
+          <input
+            aria-label={slot.label + ' 模型'}
+            className="qc-inp"
+            onChange={(event) => onChange({ ...draft, model: event.target.value })}
+            placeholder="留空 = 跟随主渠道"
+            value={draft.model}
+          />
+        </FieldRow>
+      )}
+      <EnvHint raw={draft.model} resolved={slot.model} savedRaw={slot.model_raw} />
+
+      <FieldRow label="地址">
         <input
           aria-label={slot.label + ' 地址'}
-          className="qc-inp qc-inp-wide"
+          className="qc-inp"
           onChange={(event) => onChange({ ...draft, baseUrl: event.target.value })}
           placeholder="留空 = 跟随主渠道"
           value={draft.baseUrl}
         />
+      </FieldRow>
+      <EnvHint raw={draft.baseUrl} resolved={slot.base_url} savedRaw={slot.base_url_raw} />
+
+      <FieldRow label="密钥">
         <input
           aria-label={slot.label + ' 密钥'}
           className="qc-inp"
@@ -81,7 +105,10 @@ const Row = ({
           type="password"
           value={draft.apiKeyInput}
         />
-        {slot.supports_provider && (
+      </FieldRow>
+
+      {slot.supports_provider && (
+        <FieldRow label="渠道">
           <select
             aria-label={slot.label + ' 渠道'}
             className="qc-inp"
@@ -91,11 +118,8 @@ const Row = ({
             <option value="">跟随主渠道</option>
             {providerNames.map((name) => <option key={name} value={name}>{name}</option>)}
           </select>
-        )}
-      </div>
-
-      <EnvHint raw={draft.model} resolved={slot.model} savedRaw={slot.model_raw} />
-      <EnvHint raw={draft.baseUrl} resolved={slot.base_url} savedRaw={slot.base_url_raw} />
+        </FieldRow>
+      )}
 
       {!slot.supports_provider && draft.baseUrl && (
         <p className="qc-cap-desc">这一项由工具进程直接请求，格式固定，换成别家的地址会失败。</p>
@@ -110,9 +134,10 @@ const Row = ({
   );
 };
 
-export const SystemSlots = ({ providerNames, profiles }: {
+export const SystemSlots = ({ providerNames, profiles, activeProvider }: {
   providerNames: string[];
   profiles: ProviderProfiles | null;
+  activeProvider: string;
 }) => {
   const token = useSettingsStore((state) => state.adminToken);
   const [drafts, setDrafts] = useState<Draft[]>([]);
@@ -176,6 +201,7 @@ export const SystemSlots = ({ providerNames, profiles }: {
               draft={draft}
               key={draft.slot.key}
               onChange={(next) => setDrafts(drafts.map((item, i) => (i === index ? next : item)))}
+              activeProvider={activeProvider}
               profiles={profiles}
               providerNames={providerNames}
             />

@@ -27,7 +27,7 @@ import httpx
 from providers.base import BaseProvider, ProviderResponse, ToolCall, image_part_url
 # Reuse the base-URL normalizer from the sibling openai provider
 from providers.degrade import DegradeRule, degrade, unset_options
-from providers.openai import _normalize_base_url
+from providers.openai import OpenAIProvider, _normalize_base_url
 from providers.options import ENUM, FLOAT, INT, TEXT, OptionSet, OptionSpec
 
 _MAX_DEGRADE_ROUNDS = 3
@@ -125,6 +125,11 @@ class OpenAIResponsesProvider(BaseProvider):
     provider_name = "openai-responses"
     # 和 openai 同域名不同请求体，所以自成一族：Responses API 收不了 chat/completions 的 body。
     official_hosts = ("api.openai.com",)
+    default_base_url = "https://api.openai.com/v1"
+
+    # /models 与 chat/completions 同一套地址和认证，没有第二种写法。
+    catalog_request = OpenAIProvider.catalog_request
+    parse_catalog = OpenAIProvider.parse_catalog
 
     OPTIONS: tuple[OptionSpec, ...] = (
         OptionSpec(

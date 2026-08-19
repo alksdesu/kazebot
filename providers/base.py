@@ -84,6 +84,25 @@ class BaseProvider(ABC):
     # 带图消息按它决定走主模型还是绕去视觉节点，猜错只是绕一趟，不至于出错。
     default_supports_vision: bool = True
 
+    # 这家默认的接口地址。渠道块留空时用它，列模型时也用它。
+    default_base_url: str = ""
+
+    @classmethod
+    def catalog_request(
+        cls, *, base_url: str, api_key: str,
+    ) -> tuple[str, dict[str, str]] | None:
+        """列模型请求的 (url, headers)。None 表示这家没有模型列表接口。
+
+        是类方法而不是实例方法：控制台在渠道还没保存时就要用页面上刚填的
+        地址和密钥去问，那时候没有实例。
+        """
+        return None
+
+    @staticmethod
+    def parse_catalog(payload: Any) -> list[str]:
+        """把列模型响应解析成模型名。形状不认识就返回空。"""
+        return []
+
     # [fix 2026-04-18] 新增 name 参数：让 engine 能动态获取 provider 名称。
     # [provider-registry 2026-05-03] name 默认回落到 provider_name，避免实例名和注册 key 分叉。
     def __init__(self, *, model: str, name: str = ""):

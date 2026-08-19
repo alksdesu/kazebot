@@ -1,12 +1,20 @@
 // 渠道编辑共用的小件。渠道页和系统槽位都摆 model/地址/密钥三项，回填规则也一样。
-import type { ProviderProfiles } from '../api/supervisorClient';
+import { useMemo, useState, type ReactNode } from 'react';
+
+import { listUpstreamModels, type ProviderProfiles } from '../api/supervisorClient';
+import { useSettingsStore } from '../store/settingsStore';
 
 /** 填的是变量引用时，别处看不到它当前指向谁。改动过就不显示：展开值配不上刚敲进去的变量名。 */
 export const EnvHint = ({
   raw, savedRaw, resolved,
 }: { raw: string; savedRaw: string; resolved: string }) => {
   if (raw !== savedRaw || !raw || raw === resolved) return null;
-  return <p className="qc-cap-desc">{resolved ? '解析为 ' + resolved : '环境变量未设置，解析为空'}</p>;
+  // 说的是哪个字段由位置交代：这一行就贴在那个输入框下面，且与它左对齐。
+  return (
+    <p className="qc-cap-desc qc-chan-note">
+      {resolved ? '解析为 ' + resolved : '环境变量未设置，解析为空'}
+    </p>
+  );
 };
 
 const hostOf = (raw: string): string => {
@@ -54,5 +62,91 @@ export const HostMismatchHint = ({
       这个地址是 {mismatch.looksLike} 的，而 {provider} 按 {mismatch.wire} 的格式发请求，会被对面拒掉。
       真要换家的话，新建一个 {mismatch.looksLike} 渠道再填。
     </p>
+  );
+};
+
+/** 标签一列、内容一列。渠道页和系统槽位共用，改布局只动这一处。 */
+export const FieldRow = ({ label, children }: { label: string; children: ReactNode }) => (
+  <div className="qc-chan-row">
+    <span className="qc-chan-label">{label}</span>
+    <div className="qc-chan-body">{children}</div>
+  </div>
+);
+
+/**
+ * 模型名一行：手填 + 从上游拉真实列表。
+ *
+ * 拉取用的是页面上当前的地址和密钥，不是存盘的那份 —— 改完还没保存时也要能试。
+ * 密钥留空表示沿用已存的，后端自己去取，明文不用往回传。
+ */
+export const ModelField = ({
+  provider, value, baseUrl, apiKey, choices, listId, ariaLabel, onChange,
+}: {
+  provider: string;
+  value: string;
+  baseUrl: string;
+  apiKey: string;
+  /** 别处已经在用的模型名。上游定义值空间，这只是提示，不是封闭集合。 */
+  choices: string[];
+  listId: string;
+  ariaLabel: string;
+  onChange: (next: string) => void;
+}) => {
+  const token = useSettingsStore((state) => state.adminToken);
+  const [pulled, setPulled] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState('');
+
+  // 拉到的排前面：那是这家真有的，比从别处抄来的名字可信。
+  const options = useMemo(
+    () => Array.from(new Set([...pulled, ...choices])).filter(Boolean),
+    [pulled, choices],
+  );
+
+  const pull = async () => {
+    if (!token) return;
+    setBusy(true);
+    setNote('');
+    try {
+      const models = await listUpstreamModels(token, provider, {
+        base_url: baseUrl,
+        ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
+      });
+      setPulled(models);
+      setNote(models.length + ' 个模型，点输入框选');
+    } catch (caught) {
+      setNote(caught instanceof Error ? caught.message : String(caught));
+    }
+    setBusy(false);
+  };
+
+  return (
+    <>
+      <FieldRow label="模型">
+        <input
+          aria-label={ariaLabel}
+          className="qc-inp"
+          list={options.length ? listId : undefined}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder="模型名"
+          value={value}
+        />
+        {options.length > 0 && (
+          <datalist id={listId}>
+            {options.map((model) => <option key={model} value={model} />)}
+          </datalist>
+        )}
+        <button
+          className="qc-btn qc-btn-quiet"
+          disabled={busy || !token}
+          onClick={() => void pull()}
+          title="用当前填的地址和密钥问上游要模型列表"
+          type="button"
+        >
+          {busy ? '拉取中' : '拉取'}
+        </button>
+      </FieldRow>
+      {note && <p className="qc-cap-desc qc-chan-note">{note}</p>}
+    </>
   );
 };

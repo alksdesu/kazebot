@@ -468,6 +468,21 @@ export async function getProviderProfiles(token: string): Promise<ProviderProfil
   };
 }
 
+/** 问上游这个渠道有哪些模型。base_url 传空串是「用这家默认地址」，不传是「沿用已存的」。 */
+export async function listUpstreamModels(
+  token: string,
+  name: string,
+  data: { base_url?: string; api_key?: string },
+): Promise<string[]> {
+  const resp = await apiFetch(`/config/providers/${encodeURIComponent(name)}/models`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify(data),
+  });
+  const body = await resp.json();
+  return Array.isArray(body?.models) ? body.models.map(String) : [];
+}
+
 export async function upsertProvider(
   token: string,
   name: string,
