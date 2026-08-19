@@ -102,6 +102,33 @@ class TestFaceTable:
         assert all(runtime._REACT_MODEL_EMOJIS.values())
 
 
+class TestTheInboundFaceFormatDoesNotEscape:
+    """入站把内置表情渲染成 [QQ表情:名字] 给模型看，照抄回来就是群里一行裸标记。"""
+
+    @pytest.mark.parametrize("written", [
+        "[QQ表情:微笑]", "[QQ表情：笑哭]", "[QQ表情]", "[QQ表情:99999]", "[QQ表情: 带空格 ]",
+    ])
+    def test_it_is_stripped_before_sending(self, runtime, written: str) -> None:
+        assert runtime.strip_output_markers("嗨" + written + "呀") == "嗨呀"
+
+    @pytest.mark.parametrize("legal", [
+        "[表情:开心]", "[emoji:抱抱]", "[收藏表情:狗头]", "[QQ_EMOJI:旧格式]",
+    ])
+    def test_the_sendable_formats_are_untouched(self, runtime, legal: str) -> None:
+        # 这四个真能发出图来，跟着剥就是把功能一起剥了。
+        assert runtime.strip_output_markers(legal) == legal
+
+    def test_a_plain_emoji_character_survives(self, runtime) -> None:
+        # 想表达情绪的正路：直接写字符，不需要任何标记。
+        assert runtime.strip_output_markers("哈哈" + chr(0x1F602)) == "哈哈" + chr(0x1F602)
+
+    def test_it_does_not_reach_the_group_history(self, runtime) -> None:
+        # 历史会回喂给模型，留在里面等于教它下次接着写。
+        runtime._record_bot_reply(123, "好的[QQ表情:微笑]")
+
+        assert "QQ表情" not in str(list(runtime._group_history[123]))
+
+
 class TestStickerSegments:
     @pytest.mark.parametrize("seg_type", ["mface", "marketface"])
     def test_a_market_sticker_is_collected_as_an_image(self, runtime, seg_type: str) -> None:

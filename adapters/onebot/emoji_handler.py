@@ -18,6 +18,9 @@ from typing import Any, Dict, List
 # [表情: 开心] / [emoji: 开心] / [收藏表情: 开心]
 _QQ_EMOJI_RE = re.compile(r"\[(?:QQ_EMOJI|表情|emoji|收藏表情)\s*[:：]\s*(.+?)\]", re.IGNORECASE)
 
+# 入站把内置表情渲染成 [QQ表情:微笑] 给模型看，模型会照抄回来；出站没有这个语义，漏出去就是一行裸标记。
+_INBOUND_FACE_RE = re.compile(r"\[QQ表情(?:\s*[:：]\s*[^\]]*)?\]")
+
 # Clonoth 模型输出 [at:QQ号] 格式的 at 标记。QQ 端需要将其
 # 转换为 OneBot MessageSegment.at()，否则只会被当作纯文本发送。
 # 同时兼容旧的 [CQ:at,qq=xxx] 格式。
@@ -275,6 +278,7 @@ def strip_output_markers(
 
     text = _DC_EMOJI_RE.sub("", text)
     text = _REACT_RE.sub("", text)
+    text = _INBOUND_FACE_RE.sub("", text)
     text = _CODE_BLOCK_RE.sub(lambda m: m.group(1), text)
     text = _INLINE_CODE_RE.sub(lambda m: m.group(1), text)
     text = _LINK_RE.sub(lambda m: f"{m.group(1)}（{m.group(2)}）", text)
