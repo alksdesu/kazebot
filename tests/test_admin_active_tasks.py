@@ -176,18 +176,30 @@ def test_admin_active_tasks_returns_summaries_sorted_and_requires_auth(tmp_path:
         assert "must-not-leak" not in str(item)
 
 
-def test_generated_admin_token_is_never_printed(monkeypatch, capsys) -> None:
-    """Auto-generated credentials must not be exposed through startup stdout."""
+def test_generated_admin_token_is_never_printed(tmp_path: Path, monkeypatch, capsys) -> None:
+    """没有控制台链接可给时，自动生成的令牌不进 stdout，只报去哪儿取。"""
     secret = "generated-admin-token-must-stay-secret"
+    monkeypatch.delenv("CLONOTH_ADMIN_TOKEN", raising=False)
+    monkeypatch.setattr(admin_api, "_admin_token", "")
+    monkeypatch.setattr(admin_api.secrets, "token_urlsafe", lambda _length: secret)
+
+    assert admin_api.init_admin_token(tmp_path) == secret
+
+    output = capsys.readouterr().out
+    assert secret not in output
+    assert str(tmp_path / "data" / ".admin_token") in output
+
+
+def test_the_fallback_getter_stays_silent(monkeypatch, capsys) -> None:
+    """回退取值没有「首次引导」的语境，喊一声只会把令牌洒进不相干的日志。"""
+    secret = "fallback-admin-token-must-stay-secret"
     monkeypatch.delenv("CLONOTH_ADMIN_TOKEN", raising=False)
     monkeypatch.setattr(admin_api, "_admin_token", "")
     monkeypatch.setattr(admin_api.secrets, "token_urlsafe", lambda _length: secret)
 
     assert admin_api.get_admin_token() == secret
 
-    output = capsys.readouterr().out
-    assert secret not in output
-    assert "内容不输出" in output
+    assert capsys.readouterr().out == ""
 
 
 def test_create_app_writes_but_does_not_print_admin_token(
@@ -207,5 +219,5 @@ def test_create_app_writes_but_does_not_print_admin_token(
 
     output = capsys.readouterr().out
     assert secret not in output
-    assert "管理 Token 已初始化（内容不输出）" in output
+    assert "管理令牌取自 CLONOTH_ADMIN_TOKEN（内容不输出）" in output
     assert (tmp_path / "data" / ".admin_token").read_text(encoding="utf-8") == secret

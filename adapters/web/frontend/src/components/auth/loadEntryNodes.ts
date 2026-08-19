@@ -18,4 +18,4 @@ export async function loadEntryNodes(token: string): Promise<void> {
 }
 
 /** 令牌从哪来。只说「无效」等于让人去翻源码。 */
-export const TOKEN_SOURCE_HINT = '令牌在 data/.admin_token，或由 CLONOTH_ADMIN_TOKEN 环境变量指定。';
+export const TOKEN_SOURCE_HINT = '首启日志里有带令牌的直达链接；也可以读 data/.admin_token，或用 CLONOTH_ADMIN_TOKEN 指定。';

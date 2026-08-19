@@ -56,7 +56,7 @@ from .types import (
     TaskStatus,
 )
 from .admin_api import create_admin_router
-from .admin_api import get_admin_token, verify_admin_token
+from .admin_api import init_admin_token, verify_admin_token
 
 
 log = logging.getLogger(__name__)
@@ -1753,18 +1753,13 @@ def create_app(
             raise HTTPException(status_code=401, detail="Unauthorized")
         return {"ok": True}
 
-    # [2026-05-16] Web chat frontend
     web_dist = state.workspace_root / "adapters" / "web" / "frontend" / "dist"
+    console_url = ""
     if web_dist.is_dir():
         app.mount("/web", StaticFiles(directory=str(web_dist), html=True), name="web")
-        print(f"[web] 前端地址: http://{host}:{port}/web/", flush=True)
+        console_url = f"http://{host}:{port}/web/"
+        print(f"[web] 前端地址: {console_url}", flush=True)
 
-    # 启动时初始化 token 并写入共享文件供 engine 读取；严禁输出 token 原文。
-    token = get_admin_token()
-    _token_file = state.workspace_root / "data" / ".admin_token"
-    _token_file.parent.mkdir(parents=True, exist_ok=True)
-    _token_file.write_text(token, encoding="utf-8")
-    print("[admin] 管理 Token 已初始化（内容不输出）", flush=True)
-    print(f"[admin] Token 已写入: {_token_file}", flush=True)
+    init_admin_token(state.workspace_root, console_url=console_url)
 
     return app

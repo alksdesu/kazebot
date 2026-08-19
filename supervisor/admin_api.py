@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import os
 import shutil
@@ -35,18 +36,83 @@ class FragmentCreate(BaseModel):
 _admin_token: str = ""
 
 
+def _token_file(workspace_root: Path) -> Path:
+    return workspace_root / "data" / ".admin_token"
+
+
+def _harden(path: Path) -> None:
+    # 这个令牌能改 policy、编辑节点、重启引擎，同机其他用户没有理由读到它。
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+
+
+def _read_token(path: Path) -> str:
+    # 空文件和只剩空白的文件都当作没有：拿空串当令牌等于把 admin 面敞开。
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _persist_token(path: Path, token: str) -> bool:
+    """落盘失败不阻断启动：令牌在内存里，控制台照常能进，只有适配器读不到。"""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # 同目录 tmp + replace：适配器每次请求都重读这个文件，读到写了一半的就是一次 401。
+        tmp.write_text(token, encoding="utf-8")
+        _harden(tmp)
+        os.replace(tmp, path)
+        return True
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        print(f"[admin] 令牌写入 {path} 失败：{exc}", flush=True)
+        print("[admin] engine 与各适配器将读不到令牌，它们发起的请求会返回 401", flush=True)
+        return False
+
+
+def init_admin_token(workspace_root: Path, *, console_url: str = "") -> str:
+    """确定本进程的管理令牌并落盘，engine 与各适配器都从这个文件读。
+
+    取值优先级：CLONOTH_ADMIN_TOKEN > data/.admin_token 已有值 > 新生成。
+    回读那一级不能省：少了它，没配环境变量的部署每次重启都换一个令牌，
+    浏览器里存的和 discord 适配器启动时读进内存的会一起失效。
+    """
+    global _admin_token
+    path = _token_file(workspace_root)
+
+    env_token = os.environ.get("CLONOTH_ADMIN_TOKEN", "").strip()
+    if env_token:
+        _admin_token = env_token
+        _persist_token(path, env_token)
+        print("[admin] 管理令牌取自 CLONOTH_ADMIN_TOKEN（内容不输出）", flush=True)
+        return _admin_token
+
+    existing = _read_token(path)
+    if existing:
+        _admin_token = existing
+        _harden(path)
+        print(f"[admin] 管理令牌沿用 {path}（内容不输出）", flush=True)
+        return _admin_token
+
+    token = secrets.token_urlsafe(24)
+    _admin_token = token
+    if _persist_token(path, token):
+        print(f"[admin] 尚未设置管理令牌，已生成并写入 {path}", flush=True)
+    if console_url:
+        print("[admin] 首次登录请打开：", flush=True)
+        print(f"        {console_url}?token={token}", flush=True)
+        print("[admin] 设置 CLONOTH_ADMIN_TOKEN 后本行不再输出", flush=True)
+    return _admin_token
+
+
 def get_admin_token() -> str:
     global _admin_token
     if _admin_token:
         return _admin_token
-    token = os.environ.get("CLONOTH_ADMIN_TOKEN", "").strip()
-    if not token:
-        token = secrets.token_urlsafe(24)
-        print(
-            "[admin] 未设置 CLONOTH_ADMIN_TOKEN，已自动生成管理 Token（内容不输出）",
-            flush=True,
-        )
-    _admin_token = token
+    # 没走 init_admin_token 的调用方也必须拿到非空值，否则校验形同虚设。
+    _admin_token = os.environ.get("CLONOTH_ADMIN_TOKEN", "").strip() or secrets.token_urlsafe(24)
     return _admin_token
 
 
