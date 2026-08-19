@@ -42,10 +42,8 @@ secret_skills/
 # 配置端点覆盖写入前留的备份，内容等同原文件（data/config.yaml.bak 含明文 api_key）
 *.bak
 
-# 只留代码：文档、节点提示词、内部工程说明都不进公开仓库
+# 文档与内部工程说明不进公开仓库；节点定义要进，否则 clone 下来没有入口节点
 /docs/
 /AGENTS.md
 /INTEGRATION.md
 /README.md
-# 整个目录一起排：qq.orchestrator.example.yaml 和真实那份只差 29 行，留着等于没排
-/config/nodes/

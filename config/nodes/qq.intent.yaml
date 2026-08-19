@@ -1,0 +1,51 @@
+id: qq.intent
+type: ai
+name: "QQ 接话意愿判断"
+description: "群消息不命中任何显式触发规则时，判断这句话是不是在跟 bot 说话。内部节点，对用户不可见。"
+
+# 模型/渠道优先级由 runner 按 system_model_slot 统一解析：
+#   1) data/config.yaml 的 system_models.intent.{model,base_url,api_key}
+#   2) CLONOTH_INTENT_MODEL / CLONOTH_INTENT_BASE_URL / CLONOTH_INTENT_API_KEY
+#   3) 留空 → 跟随主渠道
+# 这个节点每条不命中的群消息都会跑一次，务必指到便宜的小模型。
+system_model_slot: intent
+model: $ENV{CLONOTH_INTENT_MODEL}
+
+# 不进 switch_node 枚举：它回的是给程序看的判定值，被切过去就是群里收到一句 "no|..."。
+internal: true
+
+# 单轮是非题，没有重试价值：模型抽风时快速失败，调用方按「不接话」处理。
+max_steps: 2
+retry_max: 1
+
+tool_access:
+  mode: none
+skills:
+  mode: none
+memories:
+  mode: none
+
+prompt: |
+  你在判断一条 QQ 群消息是不是在跟群里的 bot 说话，只输出判定结果。
+
+  判 yes 的情况：
+  - 明确在叫 bot、问 bot、要 bot 做事，只是没打 @ 也没喊名字
+  - 在追问 bot 刚说过的话，或对 bot 上一条回复做出反应
+  - 群里在聊的事情 bot 刚参与过，这句话是接着那条线说的
+
+  判 no 的情况（默认倾向）：
+  - 群友之间在互相说话，bot 只是恰好在场
+  - 在讨论 bot 但不是在跟 bot 讲话（「这机器人真慢」）
+  - 纯表情、复读、语气词、刷屏
+  - 看不出在跟谁说话
+
+  拿不准就判 no。群里的 bot 突然插话比漏接一句更让人反感。
+
+  **重要**：判定结果必须作为 finish 工具的 `text` 参数传入，格式是 `yes` 或 `no`，
+  后面可以跟一个竖线和不超过 20 字的理由。对话正文不会被调用方接收，会被丢弃。
+
+  禁止调用 reply 工具——你是内部节点，不与用户直接交互。
+
+  示例：
+  finish(text="no|群友之间在对话")
+  finish(text="yes|在追问上一条回复")

@@ -1,0 +1,68 @@
+# 长期方向专属 persistent 节点模板
+#
+# 用法：复制本文件为 config/nodes/<你的方向名>.yaml，替换 id/name/description，
+# 并按需要调整 delegate_targets / tool_access / provider。
+#
+# 关键约定：
+# - persistent: true  → 被 dispatch 时默认 context_mode=accumulate（长期累积上下文，
+#   触发轮摘要 / 压缩 / 记忆提取），不再像一次性节点那样默认 fresh。
+# - memory_book        → 独立记忆命名空间，物理落在 data/memory/{memory_book}/，
+#   与其他节点/会话的记忆文件隔离，避免逸散与串扰。每个长期方向一个节点一个 book。
+#
+# 立项建议：一个长期方向（研究领域 / 项目 / 专属助手）= 一个 persistent 节点 = 一个 memory_book。
+# 不要用一个节点靠 context_key 分叉多个方向——那样对话隔离了，但记忆仍共用同一个 book。
+
+id: my_persistent_agent
+type: ai
+name: "长期专属 Agent"
+description: "某个长期方向的专属持久节点：累积上下文、独立记忆库。"
+
+# [必填] 声明为持久节点：dispatch 未显式指定 context_mode 时默认 accumulate。
+persistent: true
+
+# [必填] 独立记忆命名空间（建议与 id 一致），记忆写入 data/memory/{memory_book}/。
+memory_book: my_persistent_agent
+
+# 可选：该节点可继续委派的下游节点。
+delegate_targets: []
+
+tool_access:
+  mode: allowlist
+  allow:
+    - save_memory
+    - list_memory
+    - read_file
+    - grep_search
+
+skills:
+  mode: all
+
+memories:
+  mode: all
+
+prompt: |
+  {{include:_shared.md}}
+
+  # Role: 长期专属 Agent
+
+  你是 {{node_name}}（{{node_id}}），负责某个长期方向的持续跟进。
+
+  当前任务在本轮用户消息中给出。
+
+  ## 长期记忆使用约定
+
+  - 你拥有独立的长期记忆库（memory namespace）。重要结论、稳定事实、用户长期偏好、
+    已验证/已排除的方向，应通过 save_memory 主动写入，便于后续任务复用。
+  - 每次开始新任务时，先回顾自己已有的记忆，避免重复劳动或与既有结论矛盾。
+  - 不要把一次性、时效性很强、下次就无意义的内容写进长期记忆。
+
+  ## 输出
+
+  - 用 finish 给出最终结论；信息不足时用 ask 补问。
+  - 结论清晰、可追溯，必要时说明依据与不确定性。
+
+  # %%DYNAMIC%%
+
+  以下是本轮的动态信息，每轮可能变化。
+
+  当前时间：{{now}}
