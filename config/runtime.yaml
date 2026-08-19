@@ -70,6 +70,12 @@ providers:
   openai:
     timeout_sec: 600.0
     options: {}
+  gemini:
+    options:
+      thinking_mode: auto
+      # 引号不能省：YAML 会把裸 off 读成布尔。Gemini 默认会拦掉不少角色扮演内容，
+      # 被拦时回复为空且不报错。
+      safety_threshold: "off"
 
 # Capability routing. When an inbound message contains image attachments, the
 # supervisor can route it to a vision-capable entry node. Empty entry_node_id

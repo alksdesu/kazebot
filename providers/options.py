@@ -46,6 +46,13 @@ class OptionSpec:
         if self.kind in (INT, FLOAT):
             return self._coerce_number(value)
         if self.kind == ENUM:
+            # YAML 1.1 把裸 off/on/no/yes 读成布尔，于是 `safety_threshold: off`
+            # 到这里是 False，str() 得到 "false" 匹配不上任何档位，静默回落成默认 ——
+            # 界面上写着关掉了过滤，实际全开着。选项里有同名档就按用户的字面意思还原。
+            if isinstance(value, bool):
+                spelled = "on" if value else "off"
+                if spelled in self.values():
+                    return spelled
             text = str(value).strip().lower()
             return text if text in self.values() else self.default
         # 只认标量。给文本项写个 dict 时 str() 会得到 "{'a': 1}" 并原样发出去，
