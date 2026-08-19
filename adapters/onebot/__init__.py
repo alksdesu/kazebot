@@ -197,21 +197,7 @@ DRAW_NODE_ID = "draw.novelai_planner"
 # 2026-05-03 修改原因：QQ 端需要把 Clonoth 任务生命周期映射为离散 React 阶段。
 # 做法是集中维护阶段到 emoji_id 的映射和阶段顺序，目的在于后续回调只声明
 # 目标阶段，避免 stream_delta 高频到达时重复调用 OneBot React API。
-_REACT_STAGE_EMOJIS = {
-    "submitted": "281",
-    "thinking": "178",
-    "tool": "97",
-    "writing": "326",
-}
-_REACT_STAGE_ORDER = {
-    "submitted": 1,
-    "thinking": 2,
-    "tool": 3,
-    "writing": 4,
-}
-_REACT_CLEANUP_EMOJIS = tuple(_REACT_STAGE_EMOJIS.values())
-# 模型可用的表态 emoji。必须与阶段机 ID 互斥：send_reply 收尾会把阶段 ID 全部摘掉，
-# 表态若撞上阶段 ID 就会被自己的收尾逻辑抹掉，且没有任何报错。
+# 模型可用的表态 emoji。
 _REACT_MODEL_EMOJI_IDS = (
     "4", "5", "9", "14", "63", "66", "76", "79", "99", "182", "201", "264", "271", "319",
 )
@@ -220,7 +206,6 @@ _REACT_MODEL_EMOJIS: Dict[str, str] = {
     eid: face_display_name(eid) for eid in _REACT_MODEL_EMOJI_IDS
 }
 assert all(_REACT_MODEL_EMOJIS.values())
-assert not (set(_REACT_MODEL_EMOJIS) & set(_REACT_CLEANUP_EMOJIS))
 _SEARCH_PROGRESS_FIRST_NOTICE = "已收到联网搜索请求，正在检索网页资料，可能需要几秒钟……"
 _SEARCH_PROGRESS_STILL_RUNNING_NOTICE = "还在联网搜索中，我会拿到结果后马上整理回复。"
 _SEARCH_PROGRESS_STILL_RUNNING_INTERVAL_SEC = 20.0
@@ -5240,11 +5225,6 @@ async def _submit_or_preempt_inbound(
 
     if result.inbound_seq:
         react_meta: Dict[str, Any] = {}
-        if platform_updates.get("type") == "group" and live.enable_reactions:
-            react_meta = {
-                "_react_stage": "submitted",
-                "_react_stage_emoji": _REACT_STAGE_EMOJIS["submitted"],
-            }
         trigger = TriggerInfo(
             inbound_seq=result.inbound_seq,
             conversation_key=stable_conversation_key,
@@ -6611,50 +6591,6 @@ async def _set_message_react(bot: Bot, event: Any, emoji_id: str, enabled: bool)
         return False
 
 
-async def _switch_react_stage(
-    bot: Bot,
-    event: Any,
-    platform_data: Dict[str, Any],
-    stage: str,
-) -> None:
-    """按单调阶段切换触发消息 React，防止流式事件造成重复抖动。"""
-    # 2026-05-03 修改原因：stream_delta 会持续到达，tool 进度也可能被 sweep 多次看到。
-    # 做法是在 trigger.platform_data 中记录当前阶段和 emoji_id，并只允许阶段前进；
-    # 目的在于首个推理片段和首次工具调用各切换一次，不对每条事件重复调 API。
-    next_order = _REACT_STAGE_ORDER.get(stage, 0)
-    current_stage = str(platform_data.get("_react_stage") or "")
-    current_order = _REACT_STAGE_ORDER.get(current_stage, 0)
-    if not next_order or current_order >= next_order:
-        return
-
-    next_emoji = _REACT_STAGE_EMOJIS[stage]
-    current_emoji = str(platform_data.get("_react_stage_emoji") or _REACT_STAGE_EMOJIS.get(current_stage, ""))
-    if current_emoji and current_emoji != next_emoji:
-        await _set_message_react(bot, event, current_emoji, False)
-    elif not current_emoji:
-        # 2026-05-03 修改原因：旧 trigger 或私聊路径可能没有阶段元数据。
-        # 做法是在缺少当前 emoji 时清理所有已知阶段 emoji；目的在于补齐状态链时
-        # 不让 76、281、178 或 97 残留在同一条触发消息上。
-        for emoji_id in _REACT_CLEANUP_EMOJIS:
-            if emoji_id != next_emoji:
-                await _set_message_react(bot, event, emoji_id, False)
-
-    if await _set_message_react(bot, event, next_emoji, True):
-        platform_data["_react_stage"] = stage
-        platform_data["_react_stage_emoji"] = next_emoji
-
-
-async def _clear_message_reacts(bot: Bot, event: Any) -> None:
-    """移除任务生命周期使用过的全部 QQ React。"""
-    # 2026-05-03 修改原因：最终回复代表任务结束，触发消息不应继续显示中间状态。
-    # 做法是按统一清理列表逐个移除 76、281、178、97、326；目的在于包含本轮
-    # 新增的推理和工具阶段，并让任一移除失败都不影响最终回复发送。
-    for emoji_id in _REACT_CLEANUP_EMOJIS:
-        await _set_message_react(bot, event, emoji_id, False)
-
-
-
-
 def _progress_mentions_search(record: str) -> bool:
     """判断进度记录是否与联网搜索工具相关。"""
     text = str(record or "").lower()
@@ -6753,11 +6689,6 @@ class TangQiuCallbacks:
             source_attachments=source_attachments,
             send_context=send_context,
         )
-        # 2026-05-03 修改原因：最终回复到达时，触发消息上可能仍残留生命周期 React。
-        # 做法是调用统一清理函数移除 76、281、178、97、326，目的在于把本轮
-        # 新增的推理和工具阶段也纳入最终收尾。
-        event = platform_data.get("event")
-        await _clear_message_reacts(bot, event)
 
     async def send_reply_attachment(self, session_id: str, path: str, *args: Any, **kwargs: Any) -> None:
         """兼容旧式 session_id 附件回调；当前 SDK 通常把附件放在 send_reply 中。"""
@@ -6799,11 +6730,6 @@ class TangQiuCallbacks:
             trigger=trigger,
             platform_data=callback_data.get("platform_data"),
         )
-        # 2026-05-03 修改原因：中间回复回调表示 Clonoth 已经开始产出用户可见内容。
-        # 做法是通过统一阶段切换进入 writing，目的在于从 281、178 或 97 中
-        # 任一状态平滑切到 326，并继续让 React API 失败不影响中间文本发送。
-        event = platform_data.get("event")
-        await _switch_react_stage(bot, event, platform_data, "writing")
         # 提取 [REACT:ID] 标记
         from .emoji_handler import _extract_reactions
         text, reactions = _extract_reactions(text)
@@ -6888,12 +6814,9 @@ class TangQiuCallbacks:
         has_tool_progress = any("执行" in record and "个工具" in record for record in state.progress_records)
         has_search_progress = any(_progress_mentions_search(record) for record in state.progress_records)
         if has_tool_progress or has_search_progress:
-            await _switch_react_stage(bot, event, platform_data, "tool")
             if has_search_progress and target:
                 await _maybe_send_search_progress_notice(bot, target, platform_data)
             return
-        if state.stream_parts:
-            await _switch_react_stage(bot, event, platform_data, "thinking")
 
     async def create_child_progress(
         self,
@@ -7018,11 +6941,17 @@ class TangQiuCallbacks:
         event = platform_data.get("event")
         if not bot or not event:
             return
+        # 提示词里那句「一条回复最多一个」只是请求：模型能一次写好几个标记，中间回复和
+        # 最终回复还会各解析一次。按触发消息记账，贴上一个就不再贴。
+        if platform_data.get("_react_done"):
+            return
         for emoji_id in reactions:
             eid = str(emoji_id or "").strip()
             if eid not in _REACT_MODEL_EMOJIS:
                 continue
-            await _set_message_react(bot, event, eid, True)
+            if await _set_message_react(bot, event, eid, True):
+                platform_data["_react_done"] = True
+            break
 
     async def on_task_created(self, trigger: TriggerInfo, task_id: str) -> None:
         return None
@@ -8488,8 +8417,6 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
             history_watermark=history_watermark,
             direct_interaction=direct_interaction,
         ))
-        if live.enable_reactions:
-            await _set_message_react(bot, event, _REACT_STAGE_EMOJIS["submitted"], True)
     except Exception as exc:
         logger.exception("submit inbound failed")
         await matcher.finish(f"无法连接到 Clonoth Agent：{exc}")

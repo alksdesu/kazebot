@@ -94,11 +94,6 @@ def test_reactions_drop_ids_outside_the_whitelist(runtime: Any) -> None:
     assert [kwargs["emoji_id"] for _api, kwargs in bot.calls] == ["66"]
 
 
-# ---- #25 白名单不变式（本步随 #26 一起落地）----
-
-def test_model_and_stage_emojis_never_overlap(runtime: Any) -> None:
-    assert set(runtime._REACT_MODEL_EMOJIS) & set(runtime._REACT_CLEANUP_EMOJIS) == set()
-
 
 # ---- #25 提示词通路 ----
 
@@ -157,65 +152,51 @@ def test_orchestrator_nodes_teach_react(runtime: Any) -> None:
         assert "[REACT:" in (base / name).read_text(encoding="utf-8")
 
 
-# ---- #23: received 阶段退役 ----
+# ---- 模型表态的数量硬约束 ----
 
-def test_received_stage_is_gone(runtime: Any) -> None:
-    assert "received" not in runtime._REACT_STAGE_EMOJIS
-    assert "76" not in runtime._REACT_CLEANUP_EMOJIS
-
-
-def test_readme_stage_table_matches_implementation(runtime: Any) -> None:
-    text = README_PATH.read_text(encoding="utf-8")
-    rows = re.findall(r"^\|\s*(\w+)\s*\|\s*(\d+)\s*\|", text, re.MULTILINE)
-    parsed = {stage: emoji for stage, emoji in rows}
-
-    assert parsed == runtime._REACT_STAGE_EMOJIS
-
-
-def test_process_group_message_uses_the_stage_table(
-    runtime: Any, monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def _react_probe(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, list[str]]:
     set_live_config(runtime, enable_reactions=True)
-    bot = ReactBot()
-    reacts: list[str] = []
+    stuck: list[str] = []
 
-    async def record_react(_bot: Any, _event: Any, emoji_id: str, _enabled: bool) -> bool:
-        reacts.append(emoji_id)
+    async def record(_bot: Any, _event: Any, emoji_id: str, _enabled: bool) -> bool:
+        stuck.append(emoji_id)
         return True
 
-    async def noop(*args: Any, **kwargs: Any) -> Any:
-        return None
+    monkeypatch.setattr(runtime, "_set_message_react", record)
+    callbacks = runtime.TangQiuCallbacks()
+    trigger = SimpleNamespace(platform_data={"bot": ReactBot(), "event": _group_event()})
+    return callbacks, trigger, stuck
 
-    monkeypatch.setattr(runtime, "_client", SimpleNamespace(), raising=False)
-    monkeypatch.setattr(runtime, "_session_state", SimpleNamespace(), raising=False)
-    monkeypatch.setattr(runtime, "_set_message_react", record_react)
-    monkeypatch.setattr(runtime, "_remember_message_for_reply_context", lambda *a, **k: None)
-    monkeypatch.setattr(runtime, "_event_text_with_forward", _resolved("hi"))
-    monkeypatch.setattr(runtime, "_is_direct_bot_interaction", lambda *a, **k: True)
-    monkeypatch.setattr(runtime, "_strip_trigger_prefix", lambda text: text)
-    monkeypatch.setattr(runtime, "_auto_like_user", noop)
-    monkeypatch.setattr(runtime, "_collect_qq_attachments", _resolved(([], [])))
-    monkeypatch.setattr(runtime, "_remember_recent_images", lambda *a, **k: None)
-    for name in (
-        "_maybe_handle_clear_group_memory_command", "_maybe_handle_model_command",
-        "_maybe_handle_drawtools_command", "_maybe_handle_custom_face_command",
-        "_maybe_handle_proactive_command", "_merge_recent_images_after_text",
-    ):
-        monkeypatch.setattr(runtime, name, noop)
-    monkeypatch.setattr(runtime, "_record_group_message", lambda *a, **k: 1)
-    monkeypatch.setattr(runtime, "_parse_direct_draw_command", lambda text: None)
-    monkeypatch.setattr(runtime, "_build_inbound_text", _resolved(("text", -1)))
-    monkeypatch.setattr(runtime, "_apply_attachment_hints", lambda text, *a, **k: text)
-    monkeypatch.setattr(runtime, "_enqueue_or_submit_inbound", _resolved(True))
-    # 用哨兵改写阶段表，证明提交处读的是表而不是写死的字面量。
-    monkeypatch.setitem(runtime._REACT_STAGE_EMOJIS, "submitted", "999")
 
-    event = SimpleNamespace(user_id=USER_QQ, group_id=HOME_GROUP, message_id=42, get_message=lambda: [])
-    matcher = SimpleNamespace(finish=noop)
-    asyncio.run(runtime._process_group_message(bot, event, matcher))
+def test_model_reaction_is_capped_at_one(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """提示词只是请求「最多一个」，守不守得住要看代码。"""
+    callbacks, trigger, stuck = _react_probe(runtime, monkeypatch)
 
-    assert reacts == ["999"]
+    asyncio.run(callbacks.add_reactions(trigger, ["4", "14", "182"]))
 
+    assert stuck == ["4"]
+
+
+def test_second_reaction_pass_on_same_message_is_ignored(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """中间回复与最终回复各解析一次，同一条触发消息不该被贴两回。"""
+    callbacks, trigger, stuck = _react_probe(runtime, monkeypatch)
+
+    asyncio.run(callbacks.add_reactions(trigger, ["4"]))
+    asyncio.run(callbacks.add_reactions(trigger, ["66"]))
+
+    assert stuck == ["4"]
+
+
+def test_ids_outside_whitelist_never_reach_the_api(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks, trigger, stuck = _react_probe(runtime, monkeypatch)
+
+    asyncio.run(callbacks.add_reactions(trigger, ["999", "4"]))
+
+    assert stuck == ["4"]
 
 def _resolved(value: Any):
     async def call(*args: Any, **kwargs: Any) -> Any:
