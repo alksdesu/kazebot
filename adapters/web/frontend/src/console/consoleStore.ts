@@ -125,6 +125,47 @@ const syncDomainQuery = (domain: ConsoleDomain): void => {
   window.history.replaceState(null, '', `${window.location.pathname}?${params.toString()}${window.location.hash}`);
 };
 
+const sleep = (ms: number) => new Promise((done) => { setTimeout(done, ms); });
+
+/** 把刚写进去的值叠到 live 上。键空间与 /qq/state 的 values 一致，可以直接铺。 */
+const withApplied = (live: QqLiveState | null, draft: Draft): QqLiveState | null => {
+  if (!live?.state) return live;
+  return {
+    ...live,
+    state: { ...live.state, values: { ...(live.state.values || {}), ...draft } },
+  };
+};
+
+/**
+ * 轮询到 bot 认账为止。
+ *
+ * applied 比的是 bot 实际加载的那份配置的指纹，不是它看到的文件指纹 —— 后者在文件
+ * 写坏时也等于当前文件。中途没认账的快照一律不写回 state：那是保存前的值，
+ * 覆盖上去界面就会闪回旧值，等于这个修复没做。
+ */
+const settle = async (
+  token: string,
+  set: (partial: Partial<ConsoleState>) => void,
+  get: () => ConsoleState,
+): Promise<void> => {
+  for (let round = 0; round < 12; round += 1) {
+    await sleep(250);
+    try {
+      const [state, file] = await Promise.all([getQqState(token), getQqRaw(token)]);
+      if (state.applied) {
+        set({ live: state, raw: file.content, rawExists: file.exists });
+        return;
+      }
+    } catch {
+      // 读不到就维持乐观值：文件已经写进去了，读状态失败不代表没保存。
+      return;
+    }
+  }
+  if (!get().error) {
+    set({ notice: '已写入配置文件，但 bot 没在 3 秒内确认生效' });
+  }
+};
+
 export const useConsoleStore = create<ConsoleState>((set, get) => ({
   domain: initialDomain(),
   live: null,
@@ -169,8 +210,15 @@ export const useConsoleStore = create<ConsoleState>((set, get) => ({
     try {
       const paths = live?.state?.paths || {};
       const result = await updateQqRaw(token, mergeDraft(raw, draft, paths));
-      set({ draft: {}, saving: false, notice: result.warnings.join('；') });
-      await get().refresh(token);
+      // bot 每 2s 才重读一次配置并公布生效值。这里先按刚写进去的值显示：
+      // 草稿一清、live 又还是旧快照的话，界面会退回保存前的样子，看着像没存上。
+      set({
+        draft: {},
+        saving: false,
+        notice: result.warnings.join('；'),
+        live: withApplied(live, draft),
+      });
+      await settle(token, set, get);
     } catch (error) {
       set({ saving: false, error: error instanceof Error ? error.message : '保存失败' });
     }
