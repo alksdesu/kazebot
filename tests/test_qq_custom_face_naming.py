@@ -102,7 +102,7 @@ def test_duplicate_names_carry_md5_and_unnamed_does_not(runtime: Any) -> None:
 def test_detail_command_prints_true_index(runtime: Any) -> None:
     bot = FaceBot(FACES)
 
-    reply = custom_face(runtime, bot, in_group(ADMIN_QQ), "表情详情列表")
+    reply = custom_face(runtime, bot, in_group(ADMIN_QQ), "/表情详情列表")
 
     assert reply is not None
     assert "3. 未命名#3" in reply
@@ -113,7 +113,7 @@ def test_name_list_command_has_no_locator_numbers(runtime: Any) -> None:
     bot = FaceBot(FACES)
     runtime.write_custom_face_names(runtime.CUSTOM_FACE_NAMES_PATH, ["开心", "点赞", "微笑"])
 
-    reply = custom_face(runtime, bot, in_group(ADMIN_QQ), "表情列表")
+    reply = custom_face(runtime, bot, in_group(ADMIN_QQ), "/表情列表")
 
     assert reply is not None
     for name in ("开心", "点赞", "微笑"):

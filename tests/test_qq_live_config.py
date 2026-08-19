@@ -457,7 +457,7 @@ class TestARealBooleanIsDroppedNotStringified:
             _write_yaml_text(live, "trigger:\n  prefixes: true\n")
             prefixes = live.live.trigger_prefixes
 
-        assert prefixes == ("!", "！", "/")
+        assert prefixes == ("!", "！", "/", "／")
         assert any("quote it" in r.getMessage() for r in caplog.records)
 
 

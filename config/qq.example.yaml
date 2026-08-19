@@ -68,6 +68,7 @@ trigger:
     - "!"
     - "！"
     - "/"
+    - "／"
 
   # 七个信号各自独立，命中任一就回。
   # 前四个是三态：留 null 表示「跟随上面的 group_mode」，写 true/false 才算接管。
@@ -75,6 +76,8 @@ trigger:
     all: null           # 群内任意消息都回
     at: null            # 被 @（含句中）
     reply: null         # 被回复（回复 bot 自己的消息）
+    # 本地命令一律 / 开头。这一项没开的话，群里得先 @Bot 再写命令；
+    # 想直接发 /帮助 就把它改成 true。私聊不受影响。
     prefix: null        # 命中 prefixes 里的前缀
     name: false         # 出现名字
     keyword: false      # 命中关键词

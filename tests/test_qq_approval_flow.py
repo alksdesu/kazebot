@@ -101,16 +101,22 @@ class TestApprovalVerb:
     def test_one_table_feeds_both_entries(self, runtime: Any) -> None:
         for verb in runtime._APPROVAL_ALLOW_VERBS:
             assert runtime._approval_verb(verb) == "allow"
-            assert runtime._parse_approval_command(f"审批 {verb} {AID}") == ("allow", AID)
+            assert runtime._parse_approval_command(f"/审批 {verb} {AID}") == ("allow", AID)
         for verb in runtime._APPROVAL_DENY_VERBS:
             assert runtime._approval_verb(verb) == "deny"
-            assert runtime._parse_approval_command(f"审批 {verb} {AID}") == ("deny", AID)
+            assert runtime._parse_approval_command(f"/审批 {verb} {AID}") == ("deny", AID)
         assert runtime._APPROVAL_ALLOW_VERBS & runtime._APPROVAL_DENY_VERBS == frozenset()
 
     def test_bare_verb_needs_id_shaped_token(self, runtime: Any) -> None:
-        assert runtime._parse_approval_command("通过 微信发给我") is None
-        assert runtime._parse_approval_command(f"同意 {AID[:8]}") == ("allow", AID[:8])
-        assert runtime._parse_approval_command(f"审批 同意 {AID}") == ("allow", AID)
+        assert runtime._parse_approval_command("/通过 微信发给我") is None
+        assert runtime._parse_approval_command(f"/同意 {AID[:8]}") == ("allow", AID[:8])
+        assert runtime._parse_approval_command(f"/审批 同意 {AID}") == ("allow", AID)
+
+    def test_a_command_without_the_slash_is_ordinary_chat(self, runtime: Any) -> None:
+        # 引用卡片那条路径仍然免斜杠，走的是 _parse_approval_reply_verb。
+        assert runtime._parse_approval_command(f"同意 {AID}") is None
+        assert runtime._parse_approval_command(f"审批 同意 {AID}") is None
+        assert runtime._parse_approval_reply_verb("同意") == "allow"
 
 
 class TestReplyTargetAnchoring:

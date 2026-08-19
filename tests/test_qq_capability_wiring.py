@@ -309,8 +309,8 @@ class TestOffShutsTheDoorOnEveryone:
         [
             ("draw_preset", "/切换画师串 x"),
             ("model", "/切换模型 gpt-4o"),
-            ("custom_face", "表情列表"),
-            ("proactive", "群发 700001 你好"),
+            ("custom_face", "/表情列表"),
+            ("proactive", "/群发 700001 你好"),
             ("clear_memory", "/清除群记忆"),
         ],
     )
@@ -345,7 +345,7 @@ class TestProactiveTargetsAreClamped:
 
         reply = asyncio.run(runtime._maybe_handle_proactive_command(
             bot=None, event=in_group(OWNER_QQ, role="owner"),
-            user_text=f"群发 {HOME_GROUP} 晚上八点开会",
+            user_text=f"/群发 {HOME_GROUP} 晚上八点开会",
             conversation_key="k", current_attachments=[],
         ))
 
@@ -357,7 +357,7 @@ class TestProactiveTargetsAreClamped:
 
         reply = asyncio.run(runtime._maybe_handle_proactive_command(
             bot=None, event=in_group(OWNER_QQ, role="owner"),
-            user_text=f"群发 {OTHER_GROUP} 晚上八点开会",
+            user_text=f"/群发 {OTHER_GROUP} 晚上八点开会",
             conversation_key="k", current_attachments=[],
         ))
 
@@ -376,7 +376,7 @@ class TestProactiveTargetsAreClamped:
 
         reply = asyncio.run(runtime._maybe_handle_proactive_command(
             bot=None, event=in_group(OWNER_QQ, role="owner"),
-            user_text=f"私信 {MEMBER_QQ} 你好",
+            user_text=f"/私信 {MEMBER_QQ} 你好",
             conversation_key="k", current_attachments=[],
         ))
 
@@ -396,7 +396,7 @@ class TestProactiveTargetsAreClamped:
 
         reply = asyncio.run(runtime._maybe_handle_proactive_command(
             bot=None, event=in_group(OWNER_QQ, role="owner"),
-            user_text=f"私信 {HOME_GROUP} 你好",
+            user_text=f"/私信 {HOME_GROUP} 你好",
             conversation_key="k", current_attachments=[],
         ))
 
@@ -407,7 +407,7 @@ class TestProactiveTargetsAreClamped:
         set_live_config(runtime, grant_proactive="owner")
 
         reply = asyncio.run(runtime._maybe_handle_proactive_command(
-            bot=None, event=in_group(OWNER_QQ, role="owner"), user_text="主动目标",
+            bot=None, event=in_group(OWNER_QQ, role="owner"), user_text="/主动目标",
             conversation_key="k", current_attachments=[],
         ))
 
@@ -417,7 +417,7 @@ class TestProactiveTargetsAreClamped:
         set_live_config(runtime, grant_proactive="owner")
 
         reply = asyncio.run(runtime._maybe_handle_proactive_command(
-            bot=None, event=in_group(MEMBER_QQ), user_text=f"群发 {HOME_GROUP} 你好",
+            bot=None, event=in_group(MEMBER_QQ), user_text=f"/群发 {HOME_GROUP} 你好",
             conversation_key="k", current_attachments=[],
         ))
 

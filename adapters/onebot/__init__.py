@@ -170,27 +170,64 @@ _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _QQ_EMOJI_MARK_RE = re.compile(r"\[QQ_EMOJI:(.+?)\]")
 _CQ_RE = re.compile(r"\[CQ:([^,\]]+)(?:,([^\]]*))?\]")
 _AT_QQ_RE = re.compile(r"\[(?:CQ:)?at[,:][^\]]*?qq=([^,\]\s]+)", re.IGNORECASE)
-_CUSTOM_FACE_LIST_RE = re.compile(r"^(?:表情列表|收藏表情列表|emoji列表|可用表情)(?:\s+(\d+))?$", re.IGNORECASE)
-_CUSTOM_FACE_DETAIL_LIST_RE = re.compile(r"^(?:表情详情列表|收藏表情详情|表情管理列表)(?:\s+(\d+))?$", re.IGNORECASE)
-_CUSTOM_FACE_SYNC_RE = re.compile(r"^(?:同步表情列表|刷新表情列表|更新表情列表)$", re.IGNORECASE)
-_CUSTOM_FACE_HELP_RE = re.compile(r"^(?:表情包帮助|表情帮助|表情包命令|表情命令帮助)$", re.IGNORECASE)
-_CUSTOM_FACE_ADD_RE = re.compile(r"^(?:收藏表情|添加表情|保存表情|表情收藏)\s+(.+?)\s*$", re.IGNORECASE)
-_CUSTOM_FACE_RENAME_RE = re.compile(r"^(?:命名表情|重命名表情|改名表情)\s+(\S+)\s+(.+?)\s*$", re.IGNORECASE)
-_CUSTOM_FACE_DELETE_RE = re.compile(r"^(?:删除表情|移除表情|取消收藏表情)\s+(.+?)\s*$", re.IGNORECASE)
-_DRAW_DIRECT_RE = re.compile(r"^(?:[/／!！]?\s*(?:生图|画图|绘图|nai生图|novelai生图)|/(?:draw|nai|novelai))\s*(.*)$", re.IGNORECASE)
-_DRAW_HELP_RE = re.compile(r"^(?:[/／!！]?\s*(?:生图帮助|画图帮助|绘图帮助|画师串帮助)|/(?:drawhelp|naihelp))\s*$", re.IGNORECASE)
-_DRAW_PRESET_LIST_RE = re.compile(r"^(?:[/／!！]?\s*(?:画师串列表|绘图预设列表|生图预设列表|画风列表)|/(?:drawpresets|presets))\s*$", re.IGNORECASE)
-# [AutoC] 管理员快捷切换全局主模型：/切换模型 <模型名>。
-# 兼容 /切模型、/setmodel、切换主模型 等别名；"模型帮助"/"当前模型" 用于查看。
-_MODEL_SWITCH_RE = re.compile(
-    r"^[/／!！]?\s*(?:切换模型|切换主模型|切模型|设置模型|/?(?:setmodel|switchmodel|model\s+set))\s+(.+?)\s*$",
-    re.IGNORECASE,
+# 命令一律 / 开头。裸词会把「画图软件推荐哪个」「可用表情」这类日常句子当命令截胡，
+# 而 / 不在可剥离前缀里，群聊私聊拿到的都是同一个字面量。全角 ／ 一并收：
+# 中文输入法下打出来的是另一个码位，用户看不出区别。
+_CMD_PREFIX = r"[/／]"
+# 尾参形态。命令只在这里分叉，别名表各自维护。
+_CMD_NO_ARG = r"\s*$"
+_CMD_OPT_COUNT = r"(?:\s+(\d+))?\s*$"
+_CMD_ONE_ARG = r"\s+(.+?)\s*$"
+_CMD_TWO_ARGS = r"\s+(\S+)\s+(.+?)\s*$"
+# 吞掉剩余全部内容。中文别名后面常常不带空格（/生图画只猫），所以不能要求词边界，
+# 代价是 /drawhelp 会被 draw 分支吃掉 —— 靠分派链里 help 先判来保证，顺序不能动。
+_CMD_REST = r"\s*(.*)$"
+
+
+def _cmd_re(aliases: tuple[str, ...], tail: str = _CMD_NO_ARG) -> "re.Pattern[str]":
+    """把别名表编成「/别名 + 尾参」的命令正则。"""
+    body = "|".join(re.escape(alias) for alias in aliases)
+    return re.compile(rf"^{_CMD_PREFIX}(?:{body}){tail}", re.IGNORECASE)
+
+
+def _strip_command_prefix(text: str) -> str:
+    """剥掉引导斜杠交给集合式命令解析；不是命令返回空串。
+
+    首段里再出现斜杠的一律不认：群里贴 /var/log/x 这类路径很常见，
+    而开了前缀触发信号之后它们照样会走到命令链上来。
+    """
+    raw = str(text or "").strip()
+    if not raw or raw[0] not in "/／":
+        return ""
+    body = raw[1:].lstrip()
+    head = body.split(None, 1)[0] if body else ""
+    if not head or "/" in head or "／" in head:
+        return ""
+    return body
+
+
+_CUSTOM_FACE_LIST_RE = _cmd_re(("表情列表", "收藏表情列表", "emoji列表", "可用表情"), _CMD_OPT_COUNT)
+_CUSTOM_FACE_DETAIL_LIST_RE = _cmd_re(("表情详情列表", "收藏表情详情", "表情管理列表"), _CMD_OPT_COUNT)
+_CUSTOM_FACE_SYNC_RE = _cmd_re(("同步表情列表", "刷新表情列表", "更新表情列表"))
+_CUSTOM_FACE_HELP_RE = _cmd_re(("表情包帮助", "表情帮助", "表情包命令", "表情命令帮助"))
+_CUSTOM_FACE_ADD_RE = _cmd_re(("收藏表情", "添加表情", "保存表情", "表情收藏"), _CMD_ONE_ARG)
+_CUSTOM_FACE_RENAME_RE = _cmd_re(("命名表情", "重命名表情", "改名表情"), _CMD_TWO_ARGS)
+_CUSTOM_FACE_DELETE_RE = _cmd_re(("删除表情", "移除表情", "取消收藏表情"), _CMD_ONE_ARG)
+_DRAW_DIRECT_RE = _cmd_re(
+    ("生图", "画图", "绘图", "nai生图", "novelai生图", "draw", "nai", "novelai"), _CMD_REST,
 )
-_MODEL_SHOW_RE = re.compile(
-    r"^[/／!！]?\s*(?:当前模型|查看模型|模型帮助|/?(?:model|showmodel|model\s+show))\s*$",
-    re.IGNORECASE,
+_DRAW_HELP_RE = _cmd_re(("生图帮助", "画图帮助", "绘图帮助", "画师串帮助", "drawhelp", "naihelp"))
+_DRAW_PRESET_LIST_RE = _cmd_re(
+    ("画师串列表", "绘图预设列表", "生图预设列表", "画风列表", "drawpresets", "presets"),
 )
-_DRAW_PRESET_SWITCH_RE = re.compile(r"^(?:[/／!！]?\s*(?:切换画师串|切换绘图预设|切换生图预设|切换画风)|/(?:setdrawpreset|preset))\s+(.+?)\s*$", re.IGNORECASE)
+_DRAW_PRESET_SWITCH_RE = _cmd_re(
+    ("切换画师串", "切换绘图预设", "切换生图预设", "切换画风", "setdrawpreset", "preset"), _CMD_ONE_ARG,
+)
+_MODEL_SWITCH_RE = _cmd_re(
+    ("切换模型", "切换主模型", "切模型", "设置模型", "setmodel", "switchmodel"), _CMD_ONE_ARG,
+)
+# 去掉了「模型帮助」：它和「当前模型」是同一个分支，只回一行模型名，叫帮助属于误导。
+_MODEL_SHOW_RE = _cmd_re(("当前模型", "查看模型", "model", "showmodel"))
 DRAW_NODE_ID = "draw.novelai_planner"
 # 2026-07-09: 旧的"5~12 位数字一律当作 QQ 号"兜底匿名正则已废弃（会误伤金额/验证码/
 # 日期等普通数字）。现改为只对采集入口登记的已知真实 ID 做精确匿名，不再保留该正则。
@@ -882,8 +919,11 @@ def _approval_verb(token: str) -> Optional[str]:
 
 
 def _parse_approval_command(text: str) -> Optional[tuple[str, str]]:
-    """解析管理员私聊审批命令，返回 (decision, approval_id_or_prefix)。"""
-    normalized = re.sub(r"\s+", " ", (text or "").strip())
+    """解析管理员私聊审批命令，返回 (decision, approval_id_or_prefix)。
+
+    引用审批卡片回一个词那条路径不经过这里，仍然免斜杠 —— 卡片在，指向就是唯一的。
+    """
+    normalized = re.sub(r"\s+", " ", _strip_command_prefix(text))
     if not normalized:
         return None
     parts = normalized.split(" ")
@@ -2471,7 +2511,53 @@ async def _add_custom_face_from_attachment(bot: Bot, alias: str, attachment: Dic
         # 描述设置失败不影响“已收藏”的主体结果，模型仍可用序号/md5/文件名兜底调用。
         logger.warning("set_custom_face_desc after add_custom_face failed", exc_info=True)
 
-    return f"已尝试收藏表情：{alias}\n之后模型可用 [表情:{alias}] 调用；如描述设置失败，也可用“表情列表”查看实际名称。"
+    return f"已尝试收藏表情：{alias}\n之后模型可用 [表情:{alias}] 调用；如描述设置失败，也可用 /表情列表 查看实际名称。"
+
+
+_HELP_RE = _cmd_re(("帮助", "命令", "命令列表", "菜单", "help", "commands"))
+
+# (能力, 用法, 说明)。能力为空 = 谁都能用。这张表是 /帮助 的唯一数据源，
+# 加命令不更新它，用户就永远不知道它存在。
+_COMMAND_CATALOG: tuple[tuple[str, str, str], ...] = (
+    ("", "/生图 <描述>", "直接出图，不走闲聊"),
+    ("", "/生图帮助", "绘图的参数与写法"),
+    ("", "/画师串列表", "可用画风预设"),
+    ("draw_preset", "/切换画师串 <名>", "改所有人的默认画风"),
+    ("model", "/当前模型", "看主模型是哪个"),
+    ("model", "/切换模型 <名>", "改全局主模型"),
+    ("custom_face", "/表情包帮助", "收藏表情的全部命令"),
+    ("clear_memory", "/清除群记忆 [群名]", "清掉群的长期记忆"),
+    ("proactive", "/主动发送帮助", "借 bot 发消息、文件、合并转发"),
+    ("send_dead_letter", "/发送死信", "查看并放行卡住的投递（只能私聊）"),
+    ("approval", "/审批 同意 <ID>", "处理审批（只能私聊）"),
+)
+
+
+def _help_text(event: Any) -> str:
+    """按调用者实际拿得到的能力过滤命令表。"""
+    lines = [f"{usage} —— {desc}" for cap, usage, desc in _COMMAND_CATALOG if not cap or _can(cap, event)]
+    if not lines:
+        return "你当前没有可用命令。"
+    return "【可用命令】\n" + "\n".join(lines) + "\n\n命令都要以 / 开头，不带斜杠的话我会当成普通聊天。"
+
+
+async def _maybe_handle_help_command(*, event: Event, user_text: str) -> str | None:
+    """总命令表。不设权限门 —— 列出来的本来就只有你能用的那些。"""
+    if not _HELP_RE.match((user_text or "").strip()):
+        return None
+    return _help_text(event)
+
+
+async def _maybe_handle_private_only_in_group(*, event: Event, user_text: str) -> str | None:
+    """群里命中「只能私聊」的命令时说清楚，别默默丢给模型烧一轮。
+
+    没这项能力的人拿到 None，照常走聊天 —— 提示本身也会暴露命令存在。
+    """
+    if not _DEAD_LETTER_RE.match((user_text or "").strip()):
+        return None
+    if not _can("send_dead_letter", event):
+        return None
+    return "死信清单里有真实群号和 QQ 号，只在私聊里出。私聊我发 /发送死信。"
 
 
 def _drawtools_help_text() -> str:
@@ -2630,17 +2716,17 @@ async def _maybe_handle_custom_face_command(
             return _capability_denial("custom_face", event, "表情包命令仅限 Clonoth 管理员使用。")
         return (
             "【表情包管理命令示例（仅管理员）】\n"
-            "1) 同步表情列表\n"
+            "1) /同步表情列表\n"
             "   从 NapCat 收藏同步已命名表情到本地文件。\n"
-            "2) 表情列表 / 表情列表 50\n"
+            "2) /表情列表 或 /表情列表 50\n"
             "   查看 AI 当前可用的表情名称。\n"
-            "3) 表情详情列表 / 表情详情列表 50\n"
+            "3) /表情详情列表 或 /表情详情列表 50\n"
             "   查看收藏详情（含未命名项）与序号。\n"
-            "4) 收藏表情 开心\n"
+            "4) /收藏表情 开心\n"
             "   收藏当前消息/引用/最近的一张图片，并命名为“开心”。\n"
-            "5) 命名表情 3 开心 或 重命名表情 3 开心\n"
+            "5) /命名表情 3 开心\n"
             "   给第 3 个收藏表情命名/改名（也可用 md5/resId/文件名定位）。\n"
-            "6) 删除表情 开心\n"
+            "6) /删除表情 开心\n"
             "   删除名为“开心”的收藏表情。\n"
             "提示：AI 发送表情用 [表情:名称]；未命名表情不会给 AI 使用。"
         )
@@ -2681,7 +2767,7 @@ async def _maybe_handle_custom_face_command(
         limit = max(1, min(100, limit))
         names = _load_custom_face_names_file()
         if not names:
-            return f"AI 表情列表文件为空：{CUSTOM_FACE_NAMES_PATH}\n可发送“同步表情列表”从 NapCat 写入已命名表情；未命名表情不会写入。"
+            return f"AI 表情列表文件为空：{CUSTOM_FACE_NAMES_PATH}\n可发送 /同步表情列表 从 NapCat 写入已命名表情；未命名表情不会写入。"
         shown = names[:limit]
         lines = [f"・{name}" for name in shown]
         more = "" if len(names) <= limit else f"\n……还有 {len(names) - limit} 个，可发送“表情列表 {min(len(names), 100)}”查看更多。"
@@ -2828,6 +2914,16 @@ async def _maybe_handle_custom_face_command(
 _PROACTIVE_PRIVATE_KINDS = {"私聊", "好友", "private", "pm", "user"}
 _PROACTIVE_GROUP_KINDS = {"群聊", "群", "group"}
 
+_PROACTIVE_HELP_WORDS = {"主动发送帮助", "主动转发帮助", "通知帮助", "转发帮助"}
+_PROACTIVE_LIST_WORDS = {"主动目标", "通知目标", "转发目标", "目标列表"}
+_PROACTIVE_PRIVATE_WORDS = {"私信", "私聊通知"}
+_PROACTIVE_GROUP_WORDS = {"群发", "群通知"}
+_PROACTIVE_FILE_WORDS = {"发文件", "发送文件"}
+# 英文别名并进同一个集合。加了斜杠之后中英已经对等，再单开 startswith 分支
+# 就是第三份逐字相同的代码。
+_PROACTIVE_SEND_WORDS = {"发送", "通知", "主动发送", "send"}
+_PROACTIVE_FORWARD_WORDS = {"合并转发", "转发", "转发到", "转发给", "合并转发到", "合并转发给", "forward"}
+
 
 def _normalize_target_ref(text: str) -> str:
     """把管理员输入的目标名规整为可匹配 token，不写入模型上下文。"""
@@ -2840,23 +2936,20 @@ def _proactive_help_text() -> str:
         "权限：仅 CLONOTH_ADMIN_QQ_USERS 中的管理员可用；命令在 QQ 适配器本地处理，不进入普通模型上下文。\n"
         "目标：使用联系人显示名/好友备注/群名/配置别名；目标列表不会展示真实 QQ 号。\n\n"
         "1) 查看可用目标\n"
-        "   主动目标 / 主动目标 私聊 / 主动目标 群\n"
+        "   /主动目标 或 /主动目标 私聊 或 /主动目标 群\n"
         "2) 主动发文本（可在同条消息附图，图片会一起发送）\n"
-        "   私信 <联系人名> <内容>\n"
-        "   群发 <群名> <内容>\n"
-        "   发送 私聊 <联系人名> <内容>\n"
-        "   发送 群 <群名> <内容>\n"
+        "   /私信 <联系人名> <内容>\n"
+        "   /群发 <群名> <内容>\n"
+        "   /发送 私聊 <联系人名> <内容>\n"
+        "   /发送 群 <群名> <内容>\n"
         "3) 主动发本地文件（路径限制在 Clonoth 工作区内，推荐 data/attachments/）\n"
-        "   发文件 私聊 <联系人名> data/attachments/xxx.png\n"
-        "   发文件 群 <群名> data/attachments/xxx.zip 展示文件名.zip\n"
+        "   /发文件 私聊 <联系人名> data/attachments/xxx.png\n"
+        "   /发文件 群 <群名> data/attachments/xxx.zip 展示文件名.zip\n"
         "4) 合并转发\n"
-        "   合并转发 私聊 <联系人名> <内容>\n"
-        "   合并转发 群 <群名> <内容>\n"
-        "   也可以引用一条消息/合并转发卡片后发送：合并转发 群 <群名>\n"
-        "   文本中用单独一行 --- 可拆成多条转发 node。\n\n"
-        "5) 清除群记忆（清空指定 QQ 群的长期记忆）\n"
-        "   /清除群记忆            —— 群聊内直接清空当前群；私聊内列出可清理的群\n"
-        "   /清除群记忆 <群名>     —— 清空指定群（群名/别名/群号均可）"
+        "   /合并转发 私聊 <联系人名> <内容>\n"
+        "   /合并转发 群 <群名> <内容>\n"
+        "   也可以引用一条消息/合并转发卡片后发送：/合并转发 群 <群名>\n"
+        "   文本中用单独一行 --- 可拆成多条转发 node。"
     )
 
 
@@ -2866,48 +2959,33 @@ def _parse_proactive_command(text: str) -> dict[str, str] | None:
     返回字段：action(send/file/forward/list/help), target_type(private/group), target_ref, body。
     目标名按单个 token 解析；如群名含空格，请在配置里设置无空格别名/显示名。
     """
-    raw = str(text or "").strip()
+    raw = _strip_command_prefix(text)
     if not raw:
         return None
-    lowered = raw.lower()
-    if raw in {"主动发送帮助", "主动转发帮助", "通知帮助", "转发帮助"}:
+    if raw in _PROACTIVE_HELP_WORDS:
         return {"action": "help"}
     parts = raw.split()
     if not parts:
         return None
     head = parts[0]
-    if head in {"主动目标", "通知目标", "转发目标", "目标列表"}:
+    head_l = head.lower()
+    if head in _PROACTIVE_LIST_WORDS:
         kind = parts[1] if len(parts) >= 2 else ""
         return {"action": "list", "target_type": _canonical_proactive_target_type(kind)}
-    if head in {"私信", "私聊通知"} and len(parts) >= 3:
+    if head in _PROACTIVE_PRIVATE_WORDS and len(parts) >= 3:
         return {"action": "send", "target_type": "private", "target_ref": parts[1], "body": raw.split(None, 2)[2]}
-    if head in {"群发", "群通知"} and len(parts) >= 3:
+    if head in _PROACTIVE_GROUP_WORDS and len(parts) >= 3:
         return {"action": "send", "target_type": "group", "target_ref": parts[1], "body": raw.split(None, 2)[2]}
-    if head in {"发送", "通知", "主动发送"} and len(parts) >= 4:
+    if head_l in _PROACTIVE_SEND_WORDS and len(parts) >= 4:
         target_type = _canonical_proactive_target_type(parts[1])
         if target_type:
             return {"action": "send", "target_type": target_type, "target_ref": parts[2], "body": raw.split(None, 3)[3]}
-    if head in {"发文件", "发送文件"} and len(parts) >= 4:
+    if head in _PROACTIVE_FILE_WORDS and len(parts) >= 4:
         target_type = _canonical_proactive_target_type(parts[1])
         if target_type:
             body = raw.split(None, 3)[3]
             return {"action": "file", "target_type": target_type, "target_ref": parts[2], "body": body}
-    if head in {"合并转发", "转发"} and len(parts) >= 3:
-        target_type = _canonical_proactive_target_type(parts[1])
-        if target_type:
-            body = raw.split(None, 3)[3] if len(parts) >= 4 else ""
-            return {"action": "forward", "target_type": target_type, "target_ref": parts[2], "body": body}
-    if head in {"转发到", "转发给", "合并转发到", "合并转发给"} and len(parts) >= 3:
-        target_type = _canonical_proactive_target_type(parts[1])
-        if target_type:
-            body = raw.split(None, 3)[3] if len(parts) >= 4 else ""
-            return {"action": "forward", "target_type": target_type, "target_ref": parts[2], "body": body}
-    # English aliases for admins that copy/paste commands.
-    if lowered.startswith("send ") and len(parts) >= 4:
-        target_type = _canonical_proactive_target_type(parts[1])
-        if target_type:
-            return {"action": "send", "target_type": target_type, "target_ref": parts[2], "body": raw.split(None, 3)[3]}
-    if lowered.startswith("forward ") and len(parts) >= 3:
+    if head_l in _PROACTIVE_FORWARD_WORDS and len(parts) >= 3:
         target_type = _canonical_proactive_target_type(parts[1])
         if target_type:
             body = raw.split(None, 3)[3] if len(parts) >= 4 else ""
@@ -3459,8 +3537,8 @@ async def _maybe_handle_proactive_command(
 # ---------------------------------------------------------------------------
 
 # 命令别名：群聊里直接清当前群；私聊里列可清理群名或按群名清指定群。
-_CLEAR_GROUP_MEMORY_RE = re.compile(
-    r"^[/／!！]?\s*(?:清除群记忆|清空群记忆|清理群记忆|清除群聊记忆|清空群聊记忆)\s*(.*)$"
+_CLEAR_GROUP_MEMORY_RE = _cmd_re(
+    ("清除群记忆", "清空群记忆", "清理群记忆", "清除群聊记忆", "清空群聊记忆", "清理群聊记忆"), _CMD_REST,
 )
 
 
@@ -3611,7 +3689,7 @@ async def _maybe_handle_clear_group_memory_command(
 #  管理员命令：/发送死信 —— 查看并放行 ambiguous 投递死信
 # ---------------------------------------------------------------------------
 
-_DEAD_LETTER_RE = re.compile(r"^[/／!！]?\s*(?:发送死信|投递死信)\s*(.*)$")
+_DEAD_LETTER_RE = _cmd_re(("发送死信", "投递死信"), _CMD_REST)
 _DEAD_LETTER_CLEAR_RE = re.compile(r"^(?:清理|清除|放行)\s*(\S+)$")
 _DEAD_LETTER_ALL_WORDS = frozenset({"全部", "所有", "all"})
 _DEAD_LETTER_LIST_LIMIT = 20
@@ -8381,6 +8459,14 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
 
     attachments, attachment_errors = await _collect_qq_attachments(bot, event, stable_conversation_key)
     _remember_recent_images(stable_conversation_key, event, attachments)
+    help_reply = await _maybe_handle_help_command(event=event, user_text=user_text)
+    if help_reply is not None:
+        await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=help_reply)
+    private_only_reply = await _maybe_handle_private_only_in_group(event=event, user_text=user_text)
+    if private_only_reply is not None:
+        await _finish_local_command(
+            matcher, bot, event, user_text=user_text, attachments=attachments, reply=private_only_reply,
+        )
     clear_mem_reply = await _maybe_handle_clear_group_memory_command(
         bot=bot,
         event=event,
@@ -8611,10 +8697,11 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
                 await _private_matcher.finish(error)
             await _finish_approval_decision(user_id, approval_id, decision)
 
-    # 收到卡片后最自然的回复就是「同意」两个字，既没引用也没带 ID。只认本人名下恰好
+    # 收到卡片后最自然的回复就是「同意」两个字，既没引用也没带 ID。这条没有卡片可依，
+    # 所以要求带斜杠 —— 否则私聊里一句「ok」就能批掉一条待审批。只认本人名下恰好
     # 一条待审批的情况：0 条说明这就是句普通聊天，多条则无从判断指的是哪一条。
     if live.approval_bare_verb_unique:
-        bare_verb = _parse_approval_reply_verb(user_text)
+        bare_verb = _parse_approval_reply_verb(_strip_command_prefix(user_text))
         if bare_verb is not None and _can("approval", event):
             unique_id = _unique_pending_approval_for(user_id)
             if unique_id:
@@ -8622,10 +8709,13 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
             elif _pending_approvals_for(user_id) > 1:
                 await _private_matcher.finish(
                     "你名下有多条待审批，分不清是哪一条。请引用那张卡片回复，"
-                    "或发送：审批 同意 <ID>。"
+                    "或发送：/审批 同意 <ID>。"
                 )
 
     # 命令顺序与群侧一致：清记忆 / 死信 / 切模型在私聊里只有名单能用，而名单恒过闸门。
+    help_reply = await _maybe_handle_help_command(event=event, user_text=user_text)
+    if help_reply is not None:
+        await _private_matcher.finish(help_reply)
     clear_mem_reply = await _maybe_handle_clear_group_memory_command(
         bot=bot,
         event=event,

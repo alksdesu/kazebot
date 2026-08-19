@@ -335,8 +335,10 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         "group_trigger", "trigger.group_mode", TRIGGER_MODE, "mention_only",
         env=("ONEBOT_GROUP_TRIGGER",),
     ),
+    # ／ 必须在列：命令正则认全角斜杠，但它不在触发前缀里的话，群里发 ／帮助 连
+    # 触发都触发不了，用户只会看到 bot 对半角斜杠有反应、对全角没有。
     LiveKey(
-        "trigger_prefixes", "trigger.prefixes", PREFIX_LIST, "!,！,/",
+        "trigger_prefixes", "trigger.prefixes", PREFIX_LIST, "!,！,/,／",
         env=("ONEBOT_TRIGGER_PREFIXES",),
     ),
     # 七个信号开关。前四个是三态：没配就跟随 group_mode 的旧语义（见 trigger_policy）。

@@ -1318,7 +1318,7 @@ def test_the_ops_command_shows_usage_for_a_trailing_word(monkeypatch: Any, tmp_p
     set_live_config(runtime, admin_users=frozenset({777}))
 
     reply = asyncio.run(
-        runtime._maybe_handle_dead_letter_command(event=_ops_admin(), user_text="发送死信吧")
+        runtime._maybe_handle_dead_letter_command(event=_ops_admin(), user_text="/发送死信吧")
     )
     assert reply is not None
     assert "用法" in reply

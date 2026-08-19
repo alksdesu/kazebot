@@ -38,13 +38,14 @@ def _strip_trigger_prefix(module: Any, text: str) -> str:
     return value
 
 
-def test_default_prefixes_are_three_half_width_tokens(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_default_prefixes_cover_both_slash_widths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     module = _load(monkeypatch, tmp_path)
 
-    assert module.live.trigger_prefixes == ("!", "！", "/")
+    # ／ 少一个，全角斜杠写的命令就只能在私聊里用。
+    assert module.live.trigger_prefixes == ("!", "！", "/", "／")
 
 
-@pytest.mark.parametrize("text", ["/生图 猫", "!生图 猫", "！生图 猫"])
+@pytest.mark.parametrize("text", ["/生图 猫", "／生图 猫", "!生图 猫", "！生图 猫"])
 def test_default_prefixes_trigger_slash_and_bang(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str) -> None:
     module = _load(monkeypatch, tmp_path)
 
