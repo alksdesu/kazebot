@@ -13,7 +13,9 @@ import yaml
 
 from clonoth_runtime import get_bool, get_str, load_runtime_config
 from engine.builtin.knowledge_inject import _MEMORY_NAMESPACE_RE, _conversation_memory_namespace, memory_dir
+from engine.cron import cron_match
 from engine.builtin.memory_extract import _format_transcript_for_extract
+from engine import memory_subjects
 
 
 log = logging.getLogger(__name__)
@@ -70,57 +72,6 @@ PLUGIN_META = {
     # Purpose: fail clearly if knowledge_inject is missing.
     "requires": ["knowledge_inject"],
 }
-
-
-# Why: DreamHandler cannot depend on the scheduler module for cron matching.
-# How: keep a local copy of the small 5-field matcher. Purpose: move dream logic
-# into engine.builtin without creating an engine/supervisor import cycle.
-def _match_field(field: str, value: int, max_val: int) -> bool:
-    """Return whether one cron field matches the provided integer value."""
-    field = field.strip()
-    if field == "*":
-        return True
-
-    if field.startswith("*/"):
-        try:
-            step = int(field[2:])
-            return step > 0 and value % step == 0
-        except ValueError:
-            return False
-
-    for part in field.split(","):
-        part = part.strip()
-        if "-" in part:
-            try:
-                lo, hi = part.split("-", 1)
-                if int(lo) <= value <= int(hi):
-                    return True
-            except ValueError:
-                continue
-        else:
-            try:
-                if int(part) == value:
-                    return True
-            except ValueError:
-                continue
-
-    return False
-
-
-def _cron_match(expr: str, dt: datetime) -> bool:
-    """Return whether a 5-field cron expression matches a datetime."""
-    parts = expr.strip().split()
-    if len(parts) != 5:
-        return False
-
-    minute, hour, day, month, weekday = parts
-    return (
-        _match_field(minute, dt.minute, 59)
-        and _match_field(hour, dt.hour, 23)
-        and _match_field(day, dt.day, 31)
-        and _match_field(month, dt.month, 12)
-        and _match_field(weekday, dt.weekday(), 6)
-    )
 
 
 class DreamHandler:
@@ -183,7 +134,7 @@ class DreamHandler:
         if self._last_dream_fired == now_key:
             return
 
-        if not _cron_match(cron_expr, now):
+        if not cron_match(cron_expr, now):
             return
 
         self._last_dream_fired = now_key
@@ -366,6 +317,10 @@ class DreamHandler:
             if task_id:
                 created.append(task_id)
 
+        created.extend(self._create_profile_dream_tasks(
+            ctx=ctx, runtime_cfg=runtime_cfg, workspace_root=workspace_root, now=now,
+        ))
+
         if not created:
             # 没有任何 namespace 需要整理时直接收尾：过去这里无条件建任务，
             # 于是每晚都拿空 signals + 空 topology 烧一次模型调用。
@@ -385,6 +340,63 @@ class DreamHandler:
             len(signals_by_namespace),
             len(created),
         )
+
+    def _create_profile_dream_tasks(
+        self,
+        *,
+        ctx: dict[str, Any],
+        runtime_cfg: dict[str, Any],
+        workspace_root: Path,
+        now: datetime,
+    ) -> list[str]:
+        """给每份人物档案建一个去重任务。
+
+        档案跨会话共享、又不参与年龄淘汰，同一件事被反复记成好几条只增不减，
+        长期会把注入预算吃满。这里用的是不带 create_or_update_skill 的专用节点：
+        整理人物记忆不该有能力改变 bot 自己的行为。
+        """
+        if not get_bool(runtime_cfg, "memory.dream.organize_profiles", True):
+            return []
+        node_id = get_str(
+            runtime_cfg, "memory.dream.profile_node_id", "system.dream_profile",
+        ).strip()
+        skill_list = ""
+        created: list[str] = []
+        for subject in sorted(memory_subjects.enrolled_subjects(workspace_root)):
+            namespace = memory_subjects.subject_namespace(subject)
+            if not namespace:
+                continue
+            entries = self._load_memory_topology_entries(workspace_root, namespace)
+            # 一条记忆无从谈起重复，两条起才有合并的余地。
+            if len(entries) < 2:
+                continue
+            hits = self._hit_stamps(workspace_root, namespace, {entry["id"] for entry in entries})
+            instruction = self._build_dream_instruction(
+                run_id=str(uuid.uuid4()),
+                now=now,
+                signals=[],
+                topology_json=self._build_keyword_topology_json(workspace_root, namespace),
+                hit_cache_json=self._load_hit_cache_json(
+                    workspace_root, namespace, {entry["id"] for entry in entries},
+                ),
+                maintenance_json=json.dumps(
+                    self._maintenance_candidates(entries, hits, now=now), ensure_ascii=False,
+                ),
+                skill_list=skill_list,
+                book_list=self._build_book_list(workspace_root, namespace),
+            )
+            task_id = self._create_final_dream_task(
+                ctx=ctx,
+                runtime_cfg=runtime_cfg,
+                now=now,
+                namespace=namespace,
+                instruction=f"整理 {subject} 的人物档案。subject 参数一律填 {subject}。\n\n{instruction}",
+                node_id=node_id,
+                subject=subject,
+            )
+            if task_id:
+                created.append(task_id)
+        return created
 
     def _create_namespace_dream_task(
         self,
@@ -436,12 +448,14 @@ class DreamHandler:
         now: datetime,
         namespace: str,
         instruction: str,
+        node_id: str = "",
+        subject: str = "",
     ) -> str:
         """Create the final system.dream task and return its task id."""
         create_task = ctx.get("create_task")
         if not callable(create_task):
             return ""
-        node_id = get_str(runtime_cfg, "memory.dream.node_id", "system.dream").strip()
+        node_id = node_id or get_str(runtime_cfg, "memory.dream.node_id", "system.dream").strip()
         # conversation_key 就是目标 namespace：save_memory/delete_memory 只认
         # ToolContext.conversation_key 推出来的目录，写死 system:dream 的话整理动作
         # 全部落在 Dream 自己的目录里。用 namespace 而不是真实 key，是因为真实 key
@@ -472,6 +486,9 @@ class DreamHandler:
                         "entry_node_id": node_id,
                         "is_system_task": True,
                         "use_context": False,
+                        # 人物档案的 namespace 推不出 conv_ 摘要，记忆工具靠这里定位
+                        # 已有条目；漏了它，改写会在会话目录另长一条。
+                        **({"memory_hints": {"subjects": [subject]}} if subject else {}),
                     },
                 },
                 continuation={},

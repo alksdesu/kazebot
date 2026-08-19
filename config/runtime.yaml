@@ -130,6 +130,10 @@ memory:
     enabled: true             # true = 启用定期记忆整理（dream）
     cron: "0 19 * * *"         # 触发时间，北京时间凌晨 3 点（UTC 19:00）
     node_id: "system.dream"   # 记忆整理节点 id
+    organize_profiles: true   # true = 顺带给每份人物档案做一次去重
+    # 人物档案专用节点：只有 save_memory / delete_memory，没有 create_or_update_skill。
+    # 整理某个人的记忆不该有能力顺手改变 bot 自己的行为。
+    profile_node_id: "system.dream_profile"
 
 maintenance:
   # data_cleanup 以前只有 systemd timer 一个入口，Windows 部署上从来没跑过，

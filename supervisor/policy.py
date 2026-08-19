@@ -78,6 +78,9 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "plugins/**", "decision": "approval_required", "reason": "plugin source changes require approval"},
                 {"pattern": "deploy/**", "decision": "approval_required", "reason": "deployment units run as services"},
                 # skill 正文直接进系统提示词，和 config/nodes/** 是同一类影响。
+                # 注意副作用：dream 想把高频记忆提升成 skill 会被这条挡下 —— scheduler
+                # 会话遇到 sensitive 决策是直接拒绝而非转审批。要那个功能就在
+                # data/policy.yaml 里显式放宽，别在这里改默认值。
                 {"pattern": "skills/**", "decision": "approval_required", "reason": "skill bodies are injected into prompts"},
                 {"pattern": "data/config.yaml", "decision": "approval_required", "reason": "config changes require approval"},
                 {"pattern": "data/policy.yaml", "decision": "deny", "reason": "policy is high-risk (human-only)"},
