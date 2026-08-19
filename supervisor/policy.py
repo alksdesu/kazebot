@@ -356,9 +356,20 @@ class PolicyEngine:
             pass
 
     def export_config(self) -> dict[str, Any]:
-        """当前生效的 policy 原文，给控制台编辑用。"""
+        """当前生效的 policy，给控制台编辑用。
+
+        缺省项补成实际生效的值。文件里没写 sensitive_path_patterns 时运行期用的是内置
+        清单，直接回原文会让界面显示成空 —— 照着存一次就把默认换成了「明确关闭」。
+        """
         self._reload_if_needed()
-        return copy.deepcopy(self._cfg)
+        cfg = copy.deepcopy(self._cfg)
+        cmd = cfg.get("execute_command")
+        if not isinstance(cmd, dict):
+            cmd = {"default": self._command_default.value}
+            cfg["execute_command"] = cmd
+        if cmd.get("sensitive_path_patterns") is None:
+            cmd["sensitive_path_patterns"] = list(_DEFAULT_SENSITIVE_PATH_LITERALS)
+        return cfg
 
     def replace_config(self, data: Any) -> dict[str, Any]:
         """整份替换并落盘，返回落盘后的内容。
