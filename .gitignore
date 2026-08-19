@@ -1,0 +1,51 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+pip-wheel-metadata/
+.pytest_cache/
+
+# local secrets
+.env
+**/.env
+
+# all runtime data
+/data/
+
+# backup archives
+*.tar.gz
+
+# frontend build deps
+node_modules/
+
+# IDE / tool configs
+.limcode/
+
+# private skills
+secret_skills/
+
+# drawtools user runtime configs (keep *.example.* templates versioned)
+/tools/drawtools/settings.yaml
+/tools/drawtools/character_tags.yaml
+/tools/drawtools/prompts/novelai/top-system.md
+/tools/drawtools/prompts/novelai/output-format.md
+/tools/drawtools/prompts/novelai/tag-guide.md
+
+# user node configs / fragments that may be created from examples
+/config/nodes/_persona.md
+
+# QQ 热载配置：装的是真实群号与管理员 QQ 号，和 .env 同级敏感（模板见 qq.example.yaml）
+/config/qq.yaml
+
+# 配置端点覆盖写入前留的备份，内容等同原文件（data/config.yaml.bak 含明文 api_key）
+*.bak
+
+# 只留代码：文档、节点提示词、内部工程说明都不进公开仓库
+/docs/
+/AGENTS.md
+/INTEGRATION.md
+/README.md
+# 整个目录一起排：qq.orchestrator.example.yaml 和真实那份只差 29 行，留着等于没排
+/config/nodes/

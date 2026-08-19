@@ -1,0 +1,107 @@
+api:
+  base_url: https://image.novelai.net
+  api_key_env: NOVELAI_API_KEY
+  api_key: ''
+  timeout_sec: 130
+# 生成队列 / 重试设置
+#
+# 【普通错误重试】适用于 5xx / 连接失败 / 超时等非并发锁错误：
+#   request_delay_sec: 每张图生成请求结束后，队列释放前额外等待秒数，用于降低 429 风险。
+#   retry_wait_sec:     每次重试前固定等待秒数。
+#   retry_max_attempts: 最大重试次数；默认 5 表示失败后最多再试 5 次。
+#   lock_timeout_sec:   等待本地全局 NovelAI 队列锁（同进程串行）的最长秒数。
+#
+# 【并发锁专用重试】仅适用于 NovelAI 服务端返回 HTTP 429 "Concurrent generation is locked"（账号层面并发额度未释放）：
+#   与上面普通重试互斥，且并发锁判定优先；命中并发锁时不会消耗 retry_max_attempts 名额。
+#   lock_retry_max_attempts: 命中并发锁时的最大重试次数（默认 8）。
+#   lock_retry_wait_min_sec: 每次重试前的随机等待秒数下限（默认 6）。
+#   lock_retry_wait_max_sec: 每次重试前的随机等待秒数上限（默认 8）；每次在 [min, max] 区间内随机取值，不递增。
+generation:
+  request_delay_sec: 0
+  retry_wait_sec: 3
+  retry_max_attempts: 5
+  lock_timeout_sec: 3600
+  lock_retry_max_attempts: 8
+  lock_retry_wait_min_sec: 6
+  lock_retry_wait_max_sec: 8
+# 附件清理设置。清理对象：data/attachments/novelai 下的生成图。
+# retention_days: 删除超过 N 天的旧图。
+# max_total_mb: 若目录总容量超过该值，按修改时间从旧到新继续删除，直到低于上限。
+# cleanup_interval_sec: 自动清理最小间隔；生成图片时会顺带触发一次轻量检查。
+storage:
+  cleanup_enabled: true
+  retention_days: 7
+  max_total_mb: 2048
+  cleanup_interval_sec: 3600
+params:
+  selected_preset_id: default-v45-full
+  size_options:
+    横图:
+      width: 1216
+      height: 832
+    竖图:
+      width: 832
+      height: 1216
+    方图:
+      width: 1024
+      height: 1024
+  presets:
+  - id: default-v45-full
+    name: 默认 (V4.5 Full)
+    positive_prefix: best quality, amazing quality, very aesthetic, absurdres
+    negative_prefix: lowres, bad anatomy, bad hands, missing fingers, extra digits,
+      fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts,
+      signature, watermark, username, blurry
+    max_images: 4
+    max_characters_per_image: 4
+    params:
+      model: nai-diffusion-4-5-full
+      sampler: k_euler_ancestral
+      scheduler: karras
+      steps: 28
+      scale: 6
+      seed: -1
+      qualityToggle: true
+      ucPreset: 0
+      autoSmea: false
+      cfg_rescale: 0
+      variety_boost: false
+      sm: false
+      sm_dyn: false
+      decrisper: false
+  - id: cute-v45
+    name: 可爱风
+    positive_prefix: best quality, amazing quality, very aesthetic, absurdres, cute
+      anime style, soft lighting, pastel colors, delicate eyes
+    negative_prefix: lowres, bad anatomy, bad hands, missing fingers, extra digits,
+      fewer digits, cropped, worst quality, low quality, watermark, blurry
+    max_images: 4
+    max_characters_per_image: 4
+    params:
+      model: nai-diffusion-4-5-full
+      sampler: k_euler_ancestral
+      scheduler: karras
+      steps: 28
+      scale: 5.5
+      seed: -1
+      qualityToggle: true
+      ucPreset: 0
+      autoSmea: false
+      cfg_rescale: 0
+      variety_boost: false
+      sm: false
+      sm_dyn: false
+      decrisper: false
+character_tags:
+  path: tools/drawtools/character_tags.yaml
+  auto_search_unknown: true
+llm:
+  provider: openai
+  model_env: DRAW_PLANNER_MODEL
+  api_key_env: DRAW_PLANNER_API_KEY
+  base_url_env: DRAW_PLANNER_BASE_URL
+  use_stream: false
+prompts:
+  top_system_path: tools/drawtools/prompts/novelai/top-system.md
+  output_format_path: tools/drawtools/prompts/novelai/output-format.md
+  tag_guide_path: tools/drawtools/prompts/novelai/tag-guide.md

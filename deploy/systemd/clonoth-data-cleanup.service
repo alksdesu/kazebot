@@ -1,0 +1,14 @@
+[Unit]
+Description=Clonoth periodic data cleanup
+Documentation=file:/opt/Clonoth/engine/data_cleanup.py
+Wants=clonoth.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/Clonoth
+EnvironmentFile=-/opt/Clonoth/.env
+ExecStart=/opt/Clonoth/.venv/bin/python -m engine.data_cleanup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

@@ -1,0 +1,22 @@
+# NovelAI 角色标签库
+# 后续可由 Web UI 编辑。绘图分析节点会把这里的角色作为“已录入角色”参考。
+#
+# 示例：
+# - name: "初音未来"
+#   aliases: ["miku", "hatsune miku", "miku hatsune"]
+#   danbooru: "hatsune_miku"
+#   type: "girl"
+#   appearance: "very long hair, aqua hair, twintails, aqua eyes"
+#   outfits:
+#     - name: "默认演出服"
+#       tags: "sleeveless shirt, grey shirt, detached sleeves, black skirt, necktie, thighhighs, headset"
+
+characters:
+  - name: "初音未来"
+    aliases: ["Hatsune Miku", "Miku", "miku hatsune", "初音ミク"]
+    danbooru: "hatsune_miku"
+    type: "girl"
+    appearance: "very long hair, aqua hair, twintails, aqua eyes"
+    outfits:
+      - name: "默认演出服"
+        tags: "sleeveless shirt, grey shirt, detached sleeves, black skirt, aqua necktie, black thighhighs, headset, arm warmers"

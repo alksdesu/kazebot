@@ -1,0 +1,196 @@
+// 系统槽位：压缩、摘要、接话意愿、读图、两个生图工具，各自可以走独立渠道。
+//
+// 留空表示跟随主渠道。工具那三个（读图 / 两个生图）由独立子进程解析，请求格式写死在
+// 工具源码里，所以不给它们 provider 选项 —— 配了也不生效。
+import { useEffect, useMemo, useState } from 'react';
+
+import {
+  getSystemModels,
+  updateSystemModel,
+  type ProviderProfiles,
+  type SystemModelSlot,
+  type SystemModelsResponse,
+} from '../api/supervisorClient';
+import { useSettingsStore } from '../store/settingsStore';
+import { EnvHint, HostMismatchHint } from './channelFields';
+import { Block, Empty, SaveBar } from './components';
+
+interface Draft {
+  slot: SystemModelSlot;
+  model: string;
+  baseUrl: string;
+  provider: string;
+  apiKeyInput: string;
+}
+
+const say = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+const toDraft = (slot: SystemModelSlot): Draft => ({
+  slot,
+  // 回填展开前的原文，否则保存一次就把变量引用烧成了当时的展开值。
+  model: slot.model_raw,
+  baseUrl: slot.base_url_raw,
+  provider: slot.provider,
+  apiKeyInput: '',
+});
+
+const changed = (draft: Draft): boolean => (
+  draft.model !== draft.slot.model_raw
+  || draft.baseUrl !== draft.slot.base_url_raw
+  || draft.provider !== draft.slot.provider
+  || draft.apiKeyInput.trim() !== ''
+);
+
+const Row = ({
+  draft, providerNames, profiles, onChange,
+}: {
+  draft: Draft;
+  providerNames: string[];
+  profiles: ProviderProfiles | null;
+  onChange: (next: Draft) => void;
+}) => {
+  const { slot } = draft;
+  return (
+    <li className="qc-cap">
+      <div className="qc-cap-head">
+        <span className="qc-cap-name">{slot.label}</span>
+        <code className="qc-cap-scope">{slot.key}</code>
+      </div>
+      <p className="qc-cap-desc">{slot.desc}</p>
+
+      <div className="qc-cap-head">
+        <input
+          aria-label={slot.label + ' 模型'}
+          className="qc-inp"
+          onChange={(event) => onChange({ ...draft, model: event.target.value })}
+          placeholder="留空 = 跟随主渠道"
+          value={draft.model}
+        />
+        <input
+          aria-label={slot.label + ' 地址'}
+          className="qc-inp qc-inp-wide"
+          onChange={(event) => onChange({ ...draft, baseUrl: event.target.value })}
+          placeholder="留空 = 跟随主渠道"
+          value={draft.baseUrl}
+        />
+        <input
+          aria-label={slot.label + ' 密钥'}
+          className="qc-inp"
+          onChange={(event) => onChange({ ...draft, apiKeyInput: event.target.value })}
+          placeholder={slot.api_key_present ? '已设置 ' + slot.api_key_redacted + '，留空不改' : '跟随主渠道'}
+          type="password"
+          value={draft.apiKeyInput}
+        />
+        {slot.supports_provider && (
+          <select
+            aria-label={slot.label + ' 渠道'}
+            className="qc-inp"
+            onChange={(event) => onChange({ ...draft, provider: event.target.value })}
+            value={draft.provider}
+          >
+            <option value="">跟随主渠道</option>
+            {providerNames.map((name) => <option key={name} value={name}>{name}</option>)}
+          </select>
+        )}
+      </div>
+
+      <EnvHint raw={draft.model} resolved={slot.model} savedRaw={slot.model_raw} />
+      <EnvHint raw={draft.baseUrl} resolved={slot.base_url} savedRaw={slot.base_url_raw} />
+
+      {!slot.supports_provider && draft.baseUrl && (
+        <p className="qc-cap-desc">这一项由工具进程直接请求，格式固定，换成别家的地址会失败。</p>
+      )}
+      {slot.supports_provider && draft.baseUrl && !draft.provider && (
+        <p className="qc-cap-desc">换家要连渠道一起选，只改地址会按主渠道的格式发出去。</p>
+      )}
+      {slot.supports_provider && (
+        <HostMismatchHint baseUrl={draft.baseUrl} profiles={profiles} provider={draft.provider} />
+      )}
+    </li>
+  );
+};
+
+export const SystemSlots = ({ providerNames, profiles }: {
+  providerNames: string[];
+  profiles: ProviderProfiles | null;
+}) => {
+  const token = useSettingsStore((state) => state.adminToken);
+  const [drafts, setDrafts] = useState<Draft[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState('');
+  const [error, setError] = useState('');
+
+  const absorb = (data: SystemModelsResponse) => {
+    setDrafts(data.slots.map(toDraft));
+    setLoaded(true);
+  };
+
+  useEffect(() => {
+    if (!token) return;
+    void getSystemModels(token).then(absorb).catch((caught) => {
+      setError(say(caught));
+      setLoaded(true);
+    });
+  }, [token]);
+
+  const dirty = useMemo(() => drafts.some(changed), [drafts]);
+
+  const save = async () => {
+    if (!token) return;
+    setBusy(true);
+    setError('');
+    try {
+      let latest: SystemModelsResponse | null = null;
+      for (const draft of drafts) {
+        if (!changed(draft)) continue;
+        const key = draft.apiKeyInput.trim();
+        latest = await updateSystemModel(token, draft.slot.key, {
+          // 空串是「删掉这一项」的信号，和「不传」不是一回事。
+          model: draft.model.trim(),
+          base_url: draft.baseUrl.trim(),
+          provider: draft.slot.supports_provider ? draft.provider : '',
+          ...(key ? { api_key: key } : {}),
+        });
+      }
+      if (latest) {
+        absorb(latest);
+        setNote('已保存。下一个任务就用新配置。');
+      }
+    } catch (caught) {
+      setError(say(caught));
+    }
+    setBusy(false);
+  };
+
+  if (!loaded) return <Empty>正在读取系统槽位…</Empty>;
+
+  return (
+    <Block hint="压缩、摘要、读图这些内部用途各自可以走独立渠道，留空则跟随主渠道" title="系统槽位">
+      {drafts.length === 0 ? (
+        <Empty>没有可配的槽位。</Empty>
+      ) : (
+        <ul className="qc-caps">
+          {drafts.map((draft, index) => (
+            <Row
+              draft={draft}
+              key={draft.slot.key}
+              onChange={(next) => setDrafts(drafts.map((item, i) => (i === index ? next : item)))}
+              profiles={profiles}
+              providerNames={providerNames}
+            />
+          ))}
+        </ul>
+      )}
+      {error && <p className="qc-login-error">{error}</p>}
+      <SaveBar
+        busy={busy}
+        dirty={dirty}
+        label="保存槽位"
+        note={note}
+        onReset={() => setDrafts(drafts.map((draft) => toDraft(draft.slot)))}
+        onSave={() => void save()}
+      />
+    </Block>
+  );
+};

@@ -1,0 +1,192 @@
+# QQ 适配层热载配置。复制成 config/qq.yaml 后改哪一项都不用重启 bot 进程。
+#
+# 取值优先级：本文件 > 环境变量 > 内置默认。写在这里的键会盖掉 .env 里的同名设置，
+# 所以只保留你真的要接管的键，其余整行删掉或注释掉，让 .env 继续生效。
+#
+# 每个键的解析规则、环境变量兜底和生效方式都声明在 adapters/onebot/live_config.py 的
+# LIVE_KEYS 里；GET /qq/state 返回 bot 进程当前实际生效的值，改完对着它确认。
+
+version: 1
+
+# ── 信道：能在哪些群说话、谁能私聊 ──────────────
+channels:
+  # 空列表 = 不在任何群说话。未配置时的默认状态就是空，这是刻意的 fail-closed。
+  allowed_groups: []
+  #   - 123456789
+  allowed_private_users: []
+  #   - 10001
+  # 已通过好友请求的人是否自动放行私聊。
+  allow_private_friends: true
+  # 未放行的人私聊时回什么。留空 = 一个字都不回，不向陌生人确认这个号是 bot。
+  private_denied_reply: ""
+
+# ── 权限 ──────────────────────────────────────
+permissions:
+  # 空列表 = 所有管理命令不可用，且每个审批请求都会被自动拒绝。
+  admin_users: []
+  #   - 10001
+
+  # 每项能力授予到哪一档：
+  #   off          谁都不能用，名单里的人也一样
+  #   admin        只有上面那份名单（默认）
+  #   owner        名单 + 本群群主
+  #   group_admin  名单 + 本群群主 + 本群管理员
+  # 群角色由 OneBot 上报，只在群消息里成立 —— 群主在私聊里就是个普通用户。
+  # 前六项影响面超出单个群或会泄露真实号（改全局配置、借 bot 身份发给任意人、
+  # 投递死信清单带真实群号/QQ 号），写 owner 会被夹回 admin。
+  capabilities:
+    approval: admin
+    model: admin
+    draw_preset: admin
+    custom_face: admin
+    cross_session: admin
+    send_dead_letter: admin
+    # 这两项能给到群主/群管，但目标会被夹在他自己那个群里。
+    clear_memory: admin
+    proactive: admin
+
+# ── 审批 ──────────────────────────────────────
+approval:
+  # 引用了审批卡片、却取不到 approval_id 时，是否回退到「当前唯一待审批」。
+  # 默认关：这条回退分不清引用的是它、还是另一张已经处理过的卡片，是误批的直接成因。
+  # 开启后仍要求有 reply 段、只剩一条待审批、且那张卡片确实是发给本人的。
+  reply_unique_fallback: false
+
+# ── 开口时机 ──────────────────────────────────
+trigger:
+  # 旧的单选枚举。signals 下面留空的那几项跟着它推导，行为和升级前逐位一致。
+  # mention_only（只 @Bot）/ prefix（@Bot 或前缀）/ all（所有消息）
+  group_mode: mention_only
+  # / 与 ／ 只参与触发判定，不会从正文里剥掉 —— /draw 这类命令要保留字面斜杠。
+  # true / false 要当前缀用就得加引号，裸写是布尔，会被丢掉。
+  prefixes:
+    - "!"
+    - "！"
+    - "/"
+
+  # 七个信号各自独立，命中任一就回。
+  # 前四个是三态：留 null 表示「跟随上面的 group_mode」，写 true/false 才算接管。
+  signals:
+    all: null           # 群内任意消息都回
+    at: null            # 被 @（含句中）
+    reply: null         # 被回复（回复 bot 自己的消息）
+    prefix: null        # 命中 prefixes 里的前缀
+    name: false         # 出现名字
+    keyword: false      # 命中关键词
+    random: false       # 随机插话
+
+  name:
+    # 自己实现而不是用 NoneBot 的 NICKNAME：那个命中后会把名字从正文里删掉，
+    # AI 和群历史看到的是「你好」而不是「咪啪你好」，点名这个信号在进模型前就丢了。
+    # on、off、yes、no 读成字符串，true、false 要当名字用得加引号写成 "true"。
+    words: []
+    #   - 咪啪
+    # 关掉就只认句首。英文名按词边界匹配，中文按子串。
+    anywhere: true
+
+  keyword:
+    # 同上：true、false 当关键词要加引号，其余词照写。
+    words: []
+
+  random:
+    probability: 0.02
+
+  llm_intent:
+    # 其他规则全不命中时，问一次轻量模型「这句话需要你接话吗」。
+    # 每条不命中的群消息都会产生一次模型往返，务必配独立的便宜渠道。
+    # 冷却剩得比 timeout_sec 还久时不去问：答案到手也只会被冷却丢掉。
+    enabled: false
+    node_id: qq.intent
+    timeout_sec: 8.0
+    # 同时在跑的判定上限。engine worker 只有两三个，占满了真实对话就得排队。
+    max_inflight: 1
+    # 带给判定模型的最近几条群聊。0 = 只看当前这一条。
+    context_messages: 8
+
+  cooldown:
+    # 「命中也不说」，和触发信号是不同维度，所以放在最后一层。0 = 不限。
+    per_group_sec: 0
+    per_user_sec: 0
+    # 被 @ 时无视冷却。关掉会让用户直接叫 bot 却被静默忽略，体验最差。
+    exempt_at: true
+
+# ── 输出格式 ──────────────────────────────────
+output:
+  # 剥掉 *斜体* / **粗体** 的星号。
+  strip_asterisk_styles: true
+  # 下划线默认不当 Markdown，否则 PUB_CACHE、user_id、_literal_ 会被改写。
+  strip_underscore_styles: false
+  # 回复时引用触发那条消息。
+  reply_to_trigger: true
+  message_limit: 4300
+  history_text_limit: 400
+  # 注入给模型的收藏表情名上限，0 = 不注入。
+  face_prompt_limit: 50
+  # 多图合并成一条转发发出。默认关：合并转发会长时间占住那条唯一的反向 WS，
+  # 期间这个 bot 的发消息、贴表情全部排队。出问题时把它关掉即时生效。
+  image_forward_merge: false
+  # 至少几张图才走合并，少于这个数继续逐张直发。
+  image_forward_merge_threshold: 2
+
+# ── 扩展能力 ──────────────────────────────────
+extensions:
+  # 任务阶段用 QQ 表情反馈：submitted 281 → thinking 178 → tool 97 → writing 326，收尾全部摘掉。
+  reactions: true
+  auto_like: false
+  auto_like_times: 10
+  # 开启后新消息会打断同会话正在进行的那轮，而不是并行开一轮。
+  preempt: false
+
+# ── 输入能力 ──────────────────────────────────
+input:
+  image: true
+  max_images_per_turn: 4
+  # 单图下载上限（字节）。超限会回一句「图片太大，已超过当前限制 XMB」。
+  image_max_bytes: 10485760
+  # QQ 常把「文字＋图」拆成两条事件发过来，收到纯文本后等这么久看有没有图跟上。
+  image_wait_after_text_sec: 2.5
+  file: true
+  max_files_per_turn: 3
+  # 单文件下载上限（字节）。
+  file_max_bytes: 52428800
+  # 内置白名单之外额外放行的入站文件扩展名；可执行/脚本宿主类型不受此项影响，
+  # 内容为可执行文件的伪装上传也照样拒绝。
+  # 事件里带的本机绝对路径另有一道闸：默认只读工作区内，放开要配
+  # ONEBOT_LOCAL_SOURCE_ROOTS（不是热载键，改了要重启）。
+  file_extra_allowed_extensions: []
+  forward_msg: true
+  forward_msg_max_depth: 3
+  forward_msg_max_messages: 80
+  forward_msg_text_limit: 12000
+  # 展开一条消息里全部转发卡片的总时限。超时按没展开处理，正文只剩占位符。
+  forward_msg_timeout_sec: 8.0
+  # 群触发判定要不要看展开后的正文。关掉后转发消息得 @ 或回复才理，关键词判不中。
+  forward_msg_expand_for_trigger: true
+  # 转发卡片里的图片和文件一并采集，条数仍受 max_images_per_turn / max_files_per_turn 限制。
+  forward_msg_media: true
+
+# ── 串行队列 ──────────────────────────────────
+queue:
+  # 关掉就是每条消息各开一轮并行处理。
+  enabled: false
+  workers: 4
+  interval_sec: 2.0
+  wait_for_reply: false
+  reply_timeout_sec: 120.0
+
+# ── 群历史缓存 ────────────────────────────────
+history:
+  # 每个群保留多少行原文随 inbound 带给模型。改小会丢掉超出的旧行。
+  # 丢掉的行如果还没送到 Engine，下一轮 inbound 会写明少了几条。
+  group_max: 20
+  # 还没送到 Engine 的行可以额外多占几倍位置，硬上限 = group_max × 本值。
+  # 1.0 = 不给额外空间，满了就丢。已送达的行永远只占 group_max 之内。
+  undelivered_ratio: 1.0
+
+# ── 自然语言转发 Bridge ───────────────────────
+forward_bridge:
+  enabled: true
+  max_messages: 30
+  # 监听地址与令牌不在这里：ONEBOT_FORWARD_BRIDGE_HOST/PORT/TOKEN 在启动时绑定，改了要重启。
+  # TOKEN 为空时 bot 自签一份写到 ONEBOT_FORWARD_BRIDGE_TOKEN_FILE
+  # （默认 ${CLONOTH_WORKSPACE}/data/onebot_forward_bridge_token），仍强制校验；文件不可写则 Bridge 不启动。

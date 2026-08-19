@@ -1,0 +1,208 @@
+# Clonoth configuration example
+# Copy to data/config.yaml and fill in your settings.
+#
+# 敏感信息（api_key / base_url）建议放到 .env，再用 ${VAR} 在这里引用。
+# ${VAR} / $ENV{VAR} 会在运行时从进程环境变量展开：
+#   - 主渠道（openai 块）由 ConfigStore 解析
+#   - fallbacks 及其继承的 provider 块由 fallback_provider 插件解析
+#     （2026-07-09 起同样支持 ${VAR} 展开）
+#
+# ===========================================================================
+# 【配置生效优先级】（重要）
+# ===========================================================================
+# 系统模型渠道（下方 system_models：compact / summary / image）的每个字段
+# （model / base_url / api_key）都是“逐字段、独立”地按下面顺序取第一个非空值：
+#
+#   1) config.yaml 的 system_models.<slot>.<字段>   （最高优先）
+#   2) slot 专属环境变量 CLONOTH_<SLOT>_<字段>
+#   3) 主渠道对应字段（上方 openai 块）              （兵底）
+#
+# 关键点：
+#   - config.yaml 比同名环境变量优先；两处都设时以 config.yaml 为准。
+#     若希望用环境变量控制某字段，就不要在 system_models 里写该字段。
+#   - 逐字段生效：只写 model 时，base_url/api_key 仍各自回退到主渠道，
+#     不需要把三个字段一起写。
+#   - 主渠道（openai 块）自身：api_key/base_url/model 支持 ${VAR}；留空时
+#     base_url 回退 https://api.openai.com/v1，model 回退 gpt-4o-mini。
+# ===========================================================================
+
+version: 1
+
+# 当前生效的主渠道，对应下方的一个 provider 块名。它同时决定用哪套请求格式，
+# 所以改这里就是换家。写了自己 provider 的节点不跟随。控制台「渠道」页可改。
+provider: openai
+
+# ---------------------------------------------------------------------------
+# 主渠道（primary provider）
+# ---------------------------------------------------------------------------
+openai:
+  # OpenAI 兼容的 base URL：
+  #   - 官方:      https://api.openai.com/v1
+  #   - 本地/中转:  http://localhost:11434/v1
+  # 留空时内核回退到 https://api.openai.com/v1
+  base_url: "${OPENAI_BASE_URL}"
+
+  # API key（切勿提交到 git，推荐放 .env）
+  api_key: "${OPENAI_API_KEY}"
+
+  # 默认模型；留空时回退到 gpt-4o-mini
+  model: "${OPENAI_MODEL}"
+
+# ---------------------------------------------------------------------------
+# 系统模型渠道（压缩 / 轮摘要 / 读图 / 生图）
+# ---------------------------------------------------------------------------
+# 压缩节点 system.compactor、轮摘要节点 system.turn_summarizer、read_image 工具，
+# 以及生图工具 gpt_image_2 / gemini_image，都不再硬编码模型。每个用途（slot）
+# 各自可单独配置 model/base_url/api_key，也可仅换模型名而 url/key 跟随主渠道。
+#
+# 逐字段解析优先级见文件顶部【配置生效优先级】：
+#   config.yaml.system_models > CLONOTH_<SLOT>_* 环境变量 > 主渠道
+# slot 专属环境变量名：
+#   compact      -> CLONOTH_COMPACT_MODEL / CLONOTH_COMPACT_BASE_URL / CLONOTH_COMPACT_API_KEY
+#   summary      -> CLONOTH_SUMMARY_MODEL / CLONOTH_SUMMARY_BASE_URL / CLONOTH_SUMMARY_API_KEY
+#   image        -> CLONOTH_IMAGE_MODEL   / CLONOTH_IMAGE_BASE_URL   / CLONOTH_IMAGE_API_KEY   （read_image 读图）
+#   image_gpt    -> CLONOTH_IMAGE_GPT_MODEL / CLONOTH_IMAGE_GPT_BASE_URL / CLONOTH_IMAGE_GPT_API_KEY   （gpt_image_2 生图）
+#   image_gemini -> CLONOTH_IMAGE_GEMINI_MODEL / CLONOTH_IMAGE_GEMINI_BASE_URL / CLONOTH_IMAGE_GEMINI_API_KEY   （gemini_image 生图）
+# 下面这些槽位都能在 QQ 控制台的「渠道」页里改，不必手写。
+#
+# 每个 slot 还可写 provider（或 CLONOTH_<SLOT>_PROVIDER），指定这一槽用哪套请求格式。
+# 只对引擎跑的槽位有效：compact / summary / intent。改了 base_url 换家却不改它，
+# 就是拿主渠道那家的格式去打这个地址 —— 换中转没事，换家必挂，日志里会有一行提醒。
+# image / image_gpt / image_gemini 三个是工具进程自己读的，格式写死在工具里，provider 不生效。
+#
+# 留空→跟随主渠道（上方 openai 块）；
+# 各 slot 的回退与默认：
+#   image        : api_key 回退额外含 GEMINI_API_KEY，model 默认 gemini-3.5-flash。
+#   image_gpt    : api_key/base_url 回退 OPENAI_API_KEY/OPENAI_BASE_URL，model 默认 gpt-image-2。
+#   image_gemini : api_key 回退 GEMINI_API_KEY>OPENAI_API_KEY，base_url 回退
+#                  GEMINI_BASE_URL>OPENAI_BASE_URL，model 默认 gemini-3-pro-image-preview。
+#
+# 压缩/轮摘要节点也受 fallbacks / node_fallbacks 保护：主渠道失败时自动切备选。
+#
+# system_models:
+#   compact:
+#     model: "gemini-3.5-flash"          # 只换模型，url/key/格式跟随主渠道
+#   intent:
+#     provider: "deepseek"               # 换家：provider 和 url/key 要一起给
+#     model: "deepseek-v4-flash"
+#     base_url: "${DEEPSEEK_BASE_URL}"
+#     api_key: "${DEEPSEEK_API_KEY}"
+#   summary:
+#     model: "${SUMMARY_MODEL}"
+#     base_url: "${SUMMARY_BASE_URL}"     # 也可单独指定渠道 url/key
+#     api_key: "${SUMMARY_API_KEY}"
+#   image:
+#     model: "gemini-3.5-flash"
+#     base_url: "${GEMINI_BASE_URL}"
+#     api_key: "${GEMINI_API_KEY}"
+#   image_gpt:                            # gpt_image_2 生图渠道
+#     model: "gpt-image-2"
+#     base_url: "${GPT_IMAGE_BASE_URL}"   # 例如生图专用反代 https://relay.example.com/v1
+#     api_key: "${GPT_IMAGE_API_KEY}"
+#   image_gemini:                         # gemini_image 生图渠道
+#     model: "gemini-3-pro-image-preview"
+#     base_url: "${GEMINI_BASE_URL}"
+#     api_key: "${GEMINI_API_KEY}"
+#
+# 也可不写 system_models，只在 .env 设置对应变量，例如：
+#   CLONOTH_COMPACT_MODEL=gemini-3.5-flash
+#   CLONOTH_IMAGE_GPT_BASE_URL=https://relay.example.com/v1
+
+# ---------------------------------------------------------------------------
+# 备选渠道（fallback providers）
+# ---------------------------------------------------------------------------
+# 触发机制：
+#   1) 主渠道调用失败时，先在同一模型上按 runtime.yaml 的 retry 配置重试
+#      （默认 max_retries=3，指数退避）。
+#   2) 重试全部耗尽仍失败（429/5xx、限流、配额耗尽、空响应、内容审核 403 等），
+#      自动按 fallbacks 顺序切换到不同的 url/api_key/model 重放同一请求。
+#   3) 任一备选成功 -> 用户无感知继续；全部失败 -> 才真正报错。
+#
+# 说明：
+#   - fallbacks[].provider 既是 provider 类型（需在 ProviderRegistry 注册，
+#     如 openai / deepseek / anthropic / gemini），
+#     也是继承字段的配置块名（同名块的 base_url/api_key/model 会被继承）。
+#   - fallback 条目里显式写的字段优先于被继承的 provider 块。
+#   - base_url / api_key / model 均支持 ${VAR} 从 .env 展开。
+#   - 多模态请求只会尝试显式标记 `supports_vision: true` 的备选；未标记的
+#     文本模型会被跳过，避免剥掉图片后根据聊天上下文猜图。
+#   - supports_vision 也能写在 provider 块自己身上（不只是 fallback 条目）：
+#     备选会继承它，带图路由也读它 —— 决定这条消息直接交给主渠道，还是绕去
+#     视觉入口节点。不写就按这家 provider 的默认算（deepseek 视作不收图，其余收）。
+#     控制台「渠道」页每张卡片上的「带图消息」就是这一项。
+
+# 备选渠道用到的 provider 配置块（key 建议直接用 provider 类型名）。
+# api_key / base_url 放 .env，用 ${VAR} 引用即可。
+deepseek:
+  base_url: "${DEEPSEEK_BASE_URL}"   # 例如 https://api.deepseek.com/v1
+  api_key: "${DEEPSEEK_API_KEY}"
+  # deepseek-chat / deepseek-reasoner 这两个旧别名已经停用，写了会被直接拒。
+  model: deepseek-v4-pro
+  # options 是发给这个渠道的请求参数，键名由 provider 自己声明，
+  # 控制台「模型」页列的就是它。这里配的会被节点上的同名项盖掉。
+  options:
+    thinking: true
+    reasoning_effort: high
+
+anthropic:
+  base_url: "${ANTHROPIC_BASE_URL}"  # 例如 https://api.anthropic.com
+  api_key: "${ANTHROPIC_API_KEY}"
+  model: claude-sonnet-4-6
+  options:
+    # 新老模型认的思考写法不一样，拿不准就留 auto —— 那样根本不发这个字段。
+    thinking_mode: auto
+    max_tokens: 32000
+
+fallbacks:
+  # 写法一：只写 provider 名，字段全部继承同名块（推荐）
+  - provider: deepseek
+
+  # 写法二：继承块字段，但覆盖 model
+  - provider: anthropic
+    model: claude-haiku-4-5
+
+  # 写法三：完全内联，不依赖任何 provider 块（适合同类型的多个中转）
+  - provider: openai
+    base_url: "${OPENAI_BACKUP_BASE_URL}"   # 例如 https://backup-relay.example.com/v1
+    api_key: "${OPENAI_BACKUP_API_KEY}"
+    model: gpt-4o
+    supports_vision: true                   # 只有确认支持图片输入时才设为 true
+    # 备选也能有自己的请求参数；不写就继承同名 provider 块的 options。
+    options:
+      reasoning_effort: low
+
+# ---------------------------------------------------------------------------
+# 按节点的专属备选链（node_fallbacks，可选）
+# ---------------------------------------------------------------------------
+# 作用：给特定节点（尤其是系统节点）配与主对话不同的备选渠道/模型。
+# 典型场景：主对话用大模型，但上下文压缩 / 轮摘要想用更便宜、更快的模型。
+#
+# 解析优先级（fallback_provider 插件）：
+#   1) 节点调用失败时，先看 node_fallbacks 里有没有以该节点 id 为 key 的条目；
+#      命中则用这个专属备选链。
+#   2) 未命中则回退到上方全局 fallbacks。
+#   3) 显式配置空列表（如 `qq.vision: []`）可禁用该节点的全部 fallback。
+# 每个条目的写法与 fallbacks 完全一致（provider 名 + 可选覆盖 base_url/api_key/model，
+# 支持 ${VAR} 展开，可继承同名 provider 块）。
+#
+# 这一段和上面的 fallbacks 都能在 QQ 控制台的「模型」页里改，不必手写。
+#
+# 常用节点 id：
+#   system.compactor        上下文压缩节点
+#   system.turn_summarizer  轮摘要节点
+#   qq.vision               QQ 原生视觉入口（备选必须 supports_vision: true；
+#                           只有主渠道收不下图时才会路由到它，见 runtime.yaml 的 routing.vision）
+# （read_image 是工具而非 AI 节点，不走 fallback；它的模型由 CLONOTH_IMAGE_MODEL 控制。）
+#
+# node_fallbacks:
+#   system.compactor:
+#     # 压缩节点专用备选：优先用便宜模型，失败再退到另一个
+#     - provider: deepseek
+#       model: deepseek-v4-flash
+#     - provider: openai
+#       base_url: "${OPENAI_BACKUP_BASE_URL}"
+#       api_key: "${OPENAI_BACKUP_API_KEY}"
+#       model: gpt-4o-mini
+#   system.turn_summarizer:
+#     - provider: deepseek
+#       model: deepseek-v4-flash

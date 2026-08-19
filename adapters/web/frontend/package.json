@@ -1,0 +1,38 @@
+{
+  "name": "clonoth-web-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "vitest",
+    "test:run": "vitest run"
+  },
+  "dependencies": {
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@material-symbols-svg/react": "^0.8.0",
+    "@tailwindcss/vite": "4.1.0",
+    "js-yaml": "^4.2.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "tailwindcss": "4.1.0",
+    "zustand": "^5.0.8"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.6.4",
+    "@testing-library/react": "15.0.7",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^18.19.120",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "4.7.0",
+    "jsdom": "24.1.3",
+    "typescript": "5.6.3",
+    "vite": "6.4.2",
+    "vitest": "3.2.4"
+  }
+}

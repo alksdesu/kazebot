@@ -1,0 +1,70 @@
+# QQ 用户身份/称呼 Profile 示例。
+#
+# 作用：
+# - 只控制“模型能看到的用户显示名、称呼要求、身份标签、语气备注”。
+# - 不授予任何 Clonoth 权限；管理员权限仍只由 CLONOTH_ADMIN_QQ_USERS / ONEBOT_ADMIN_USERS 判定。
+# - 适合把“某个 QQ 号应该被称呼为老大/老师/管理员”等规则从节点提示词中移出来。
+#
+# 使用方式：
+# 1. 默认会读取 Clonoth 工作区下的 config/qq_user_profiles.yaml。
+#    如果你使用默认位置，复制本文件为：
+#      cp config/qq_user_profiles.example.yaml config/qq_user_profiles.yaml
+# 2. 修改 users 下的 QQ 号和字段值。
+# 3. 如果要使用其它路径，只设置这个环境变量：
+#      CLONOTH_QQ_USER_PROFILES_PATH=/test/clonoth-onebot/qq_user_profiles.yaml
+# 4. 如果 config/qq_user_profiles.yaml 或指定文件不存在，Bot 会静默跳过，不报错。
+# 5. 重启 QQ/OneBot 适配器：
+#      systemctl restart clonoth-onebot.service
+#
+# 配置格式说明：
+# users:
+#   "QQ号":
+#     display_name: "模型看到的显示名"
+#     address_as: "要求模型称呼这个用户的称谓"
+#     title: "身份标签，只用于提示模型理解身份，不代表权限"
+#     note: "额外语气/称呼备注"
+#
+# 字段含义：
+# - users 的 key：必须是真实 QQ 号，建议加引号，避免 YAML 把大数字当成数字处理。
+# - display_name：覆盖群名片/QQ 昵称后展示给模型的名字。例如“张三”“Alice”。
+# - address_as：模型回复时应该如何称呼该用户。例如“老大”“老师”“前辈”。
+# - title：身份描述，例如“Clonoth 主人”“Clonoth 管理员”“项目维护者”。
+#          这只是给模型看的身份标签，不会授予审批/重启等权限。
+# - note：额外说明，例如“语气亲近一点”“保持正式”。
+#
+# 模型最终会看到类似：
+# 【当前用户身份】
+# 稳定用户标识: UserA
+# 显示名: 张三
+# 称呼要求: 请称呼该用户为「老大」
+# 身份标签: Clonoth 主人
+# 称呼/语气备注: 回复时语气可以亲近一点。
+# Clonoth 管理员: 是
+# 权限说明: 管理员权限仅由系统配置判定，以上称呼配置不授予任何权限。
+#
+# 注意：
+# - 如果某个 QQ 用户没有写在这里，会回退到群名片 > QQ 昵称 > QQ 号。
+# - 如果用户是管理员但没写在这里，权限仍然有效，只是没有自定义称呼。
+# - 如果修改 display_name，不会影响权限，也不会影响 conversation_key 级 memory namespace。
+# - 不建议在 note 中写敏感信息，因为它会进入模型上下文。
+
+users:
+  # 示例 1：主用户/Owner。
+  # 把 QQ_USER_ID_PLACEHOLDER_1 改成真实 QQ 号，例如 "123456789"。
+  "QQ_USER_ID_PLACEHOLDER_1":
+    # 展示给模型看的名字；会优先于群名片/QQ 昵称。
+    display_name: "DISPLAY_NAME_PLACEHOLDER_1"
+    # 模型回复时应该使用的称呼，例如“老大”。
+    address_as: "ADDRESS_AS_PLACEHOLDER_1"
+    # 只给模型看的身份标签，不代表权限。
+    title: "TITLE_PLACEHOLDER_1"
+    # 额外语气/称呼备注，可留空或删除。
+    note: "STYLE_NOTE_PLACEHOLDER_1"
+
+  # 示例 2：其他管理员或特殊成员。
+  # 是否真是管理员不看这里，而看 CLONOTH_ADMIN_QQ_USERS / ONEBOT_ADMIN_USERS。
+  "QQ_USER_ID_PLACEHOLDER_2":
+    display_name: "DISPLAY_NAME_PLACEHOLDER_2"
+    address_as: "ADDRESS_AS_PLACEHOLDER_2"
+    title: "TITLE_PLACEHOLDER_2"
+    note: "STYLE_NOTE_PLACEHOLDER_2"

@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Clonoth data cleanup hourly
+Documentation=file:/opt/Clonoth/engine/data_cleanup.py
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+Unit=clonoth-data-cleanup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+# This ignore file is added because the frontend now has npm dependencies and Vite build output.
+# It keeps generated folders out of version control while preserving source, tests, and lockfile.
+# The purpose is to make the new web skeleton safe to commit without node_modules or dist artifacts.
+node_modules/
+dist/
+.vite/
+coverage/
+*.tsbuildinfo
+*.local

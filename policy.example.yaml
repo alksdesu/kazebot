@@ -1,0 +1,133 @@
+# Clonoth policy configuration
+# Copy to data/policy.yaml to override defaults.
+#
+# 命令安全采用双层机制：
+# 1. cmd_reviewer 节点做 AI 前置审核。
+# 2. Supervisor 继续做人类审批与硬规则兜底。
+#
+# AI 审核不能替代人类审批。
+
+version: 1
+
+extra_roots: []
+
+read_file:
+  default: auto
+  rules:
+    - pattern: ".env"
+      decision: deny
+      reason: "do not allow reading dotenv secrets"
+    - pattern: "**/.env"
+      decision: deny
+      reason: "do not allow reading dotenv secrets"
+    - pattern: "config/nodes/**"
+      decision: deny
+      reason: "node prompts are internal"
+    - pattern: "engine/system_nodes/**"
+      decision: deny
+      reason: "system prompts are internal"
+    - pattern: "data/**"
+      decision: approval_required
+      reason: "runtime data may contain secrets or private context"
+
+write_file:
+  default: auto
+  rules:
+    - pattern: "tools/**"
+      decision: approval_required
+      reason: "creating/updating tools requires approval"
+    - pattern: "config/runtime.yaml"
+      decision: auto
+      reason: "runtime tuning config"
+    - pattern: "config/nodes/**"
+      decision: approval_required
+      reason: "node definition changes affect execution, prompts, and model selection"
+    - pattern: "config/workflows/**"
+      decision: approval_required
+      reason: "workflow changes affect node graph"
+    - pattern: "data/config.yaml"
+      decision: approval_required
+      reason: "config changes require approval"
+    - pattern: "data/policy.yaml"
+      decision: deny
+      reason: "policy is high-risk (human-only)"
+    - pattern: "data/mcp_clients.yaml"
+      decision: approval_required
+      reason: "mcp stdio clients execute local commands"
+    - pattern: "data/events.jsonl"
+      decision: deny
+      reason: "event log is append-only; never modify"
+    - pattern: "data/schedules.yaml"
+      decision: approval_required
+      reason: "schedule changes require approval"
+    - pattern: "engine/**"
+      decision: approval_required
+      reason: "engine source changes require approval"
+    - pattern: "supervisor/**"
+      decision: approval_required
+      reason: "supervisor source changes require approval"
+    - pattern: "toolbox/**"
+      decision: approval_required
+      reason: "toolbox source changes require approval"
+    - pattern: "providers/**"
+      decision: approval_required
+      reason: "provider source changes require approval"
+    - pattern: "shell/**"
+      decision: approval_required
+      reason: "shell source changes require approval"
+    - pattern: "clonoth_runtime.py"
+      decision: approval_required
+      reason: "runtime lib changes require approval"
+    - pattern: "main.py"
+      decision: approval_required
+      reason: "entrypoint changes require approval"
+    - pattern: ".env"
+      decision: deny
+      reason: "do not allow writing dotenv secrets"
+    - pattern: "**/.env"
+      decision: deny
+      reason: "do not allow writing dotenv secrets"
+
+# 命令执行策略。
+# default=approval_required：AI 审核之后，仍需人类审批。
+# deny_patterns：硬拦截，命中即拒绝，即使管理员任务也不放行、不发审批。
+#   仅用于不可逆破坏 + 极危险的“下载后直接执行 / 反弹 shell”用法。
+# sensitive_patterns：敏感但允许“管理员亲自决定”。命中则保持 approval_required 且
+#   标记 sensitive，使管理员任务不再自动放行、必须弹审批亲自确认；
+#   非管理员的 execute_command 本就被整体拒绝，普通命令（如 curl 纯读取网页不落盘）
+#   仍可对管理员免审批直接执行。
+execute_command:
+  default: approval_required
+  deny_patterns:
+    - "\\brm\\s+-rf\\s+/"
+    - "\\brm\\s+-rf\\s+~"
+    - "\\brm\\s+-rf\\s+\\*"
+    - "\\bformat\\b"
+    - "\\bmkfs\\b"
+    - "\\bfdisk\\b"
+    - "\\bdd\\s+if=/dev/zero\\b"
+    - "\\bshutdown\\b"
+    - "\\breboot\\b"
+    # 下载后直接管道到 shell/解释器执行（curl ... | sh、wget ... | bash 等）。
+    - "(?:curl|wget)\\b[^|]*\\|\\s*(?:sudo\\s+)?(?:sh|bash|zsh|python[0-9.]*|perl|ruby|node)\\b"
+    # 反弹 shell。
+    - "/dev/tcp/"
+    - "\\bbash\\s+-i\\b"
+  sensitive_patterns:
+    # 下载到本地文件（curl -o/-O/--output、wget、重定向到文件）。
+    - "\\bcurl\\b[^|]*(?:\\s-O\\b|\\s-o\\b|--output\\b|--remote-name\\b)"
+    - "\\bwget\\b"
+    - "(?:curl|wget)\\b[^|<>]*>\\s*\\S+"
+    # 包管理器安装（引入外部代码）。
+    - "\\bpip[0-9.]*\\s+install\\b"
+    - "\\bpipx\\s+install\\b"
+    - "\\bnpm\\s+(?:install|i|add)\\b"
+    - "\\b(?:pnpm|yarn)\\s+add\\b"
+    - "\\b(?:apt|apt-get|yum|dnf|pacman|apk|brew|zypper)\\s+(?:install|add|-S)\\b"
+    # 给文件加可执行权限。
+    - "\\bchmod\\b[^|]*\\+x\\b"
+    # 网络监听（可能开后门）。
+    - "\\b(?:nc|ncat|netcat|socat)\\b[^|]*(?:\\s-l\\b|--listen\\b)"
+
+restart:
+  default: approval_required
