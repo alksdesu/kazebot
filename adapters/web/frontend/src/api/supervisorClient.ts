@@ -533,6 +533,53 @@ export async function getSystemModels(token: string): Promise<SystemModelsRespon
   return resp.json();
 }
 
+// ── Policy（服务端策略，对所有渠道生效） ──
+
+export type PolicyDecision = 'auto' | 'approval_required' | 'deny';
+
+export interface PolicyRule {
+  pattern: string;
+  decision: PolicyDecision;
+  reason?: string;
+}
+
+export interface PolicyRuleSection {
+  default: PolicyDecision;
+  rules: PolicyRule[];
+}
+
+export interface PolicyDoc {
+  version?: number;
+  extra_roots?: string[];
+  read_file?: PolicyRuleSection;
+  write_file?: PolicyRuleSection;
+  execute_command?: {
+    default: PolicyDecision;
+    deny_patterns?: string[];
+    sensitive_patterns?: string[];
+    sensitive_path_patterns?: string[];
+  };
+  restart?: { default: PolicyDecision };
+}
+
+export async function getPolicy(token: string): Promise<PolicyDoc> {
+  const resp = await apiFetch('/config/policy', { headers: authHeaders(token) });
+  const data = await resp.json();
+  // 拿不到 policy 字段就给空文档：调用方按对象用，返回 undefined 会让渲染直接炸。
+  return (data && data.policy) || {};
+}
+
+/** 整份替换。部分更新没法表达「删掉一条规则」，后端也按整份校验。 */
+export async function updatePolicy(token: string, policy: PolicyDoc): Promise<PolicyDoc> {
+  const resp = await apiFetch('/config/policy', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify({ policy }),
+  });
+  const data = await resp.json();
+  return (data && data.policy) || {};
+}
+
 /** 字段留空串表示删掉这一项（回到跟随主渠道）；不传表示不动。 */
 export async function updateSystemModel(
   token: string,

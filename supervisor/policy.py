@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import contextlib
+import copy
 import fnmatch
 import ipaddress
+import os
 import re
 import shlex
 from dataclasses import dataclass
@@ -47,6 +50,11 @@ def _default_policy_dict() -> dict[str, Any]:
             "rules": [
                 {"pattern": ".env", "decision": "deny", "reason": "do not allow reading dotenv secrets"},
                 {"pattern": "**/.env", "decision": "deny", "reason": "do not allow reading dotenv secrets"},
+                {"pattern": "config/nodes/**", "decision": "deny", "reason": "node prompts are internal"},
+                {"pattern": "engine/system_nodes/**", "decision": "deny", "reason": "system prompts are internal"},
+                # data/ 下有 config.yaml、.admin_token、会话与事件流。落到 default:auto
+                # 等于任何人问一句就能把密钥读出来。
+                {"pattern": "data/**", "decision": "approval_required", "reason": "runtime data may contain secrets or private context"},
             ],
         },
         "write_file": {
@@ -55,6 +63,7 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "tools/**", "decision": "approval_required", "reason": "creating/updating tools requires approval"},
                 {"pattern": "config/runtime.yaml", "decision": "auto", "reason": "runtime tuning config"},
                 {"pattern": "config/nodes/**", "decision": "approval_required", "reason": "node definition changes affect execution, prompts, and model selection"},
+                {"pattern": "config/workflows/**", "decision": "approval_required", "reason": "workflow changes affect node graph"},
                 # 第一个命中的规则赢，所以这条兜底必须排在上面两条之后。config/ 下的任何
                 # 文件都参与决定 engine 怎么跑，落到 default:auto 等于免审批改行为。
                 {"pattern": "config/**", "decision": "approval_required", "reason": "config changes affect execution"},
@@ -174,6 +183,102 @@ def _to_safety_level(s: str) -> SafetyLevel:
         return SafetyLevel.deny
 
 
+_SAFETY_NAMES: frozenset[str] = frozenset(level.value for level in SafetyLevel)
+_SAFETY_HINT = " / ".join(sorted(_SAFETY_NAMES))
+
+
+def _validate_rules_section(name: str, section: Any) -> dict[str, Any]:
+    if not isinstance(section, dict):
+        raise ValueError(f"{name} 必须是一个映射")
+    default = str(section.get("default", "deny")).strip()
+    if default not in _SAFETY_NAMES:
+        raise ValueError(f"{name}.default 只能是 {_SAFETY_HINT}，收到 {default!r}")
+    raw_rules = section.get("rules") or []
+    if not isinstance(raw_rules, list):
+        raise ValueError(f"{name}.rules 必须是列表")
+    rules: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_rules):
+        if not isinstance(item, dict):
+            raise ValueError(f"{name}.rules[{index}] 必须是一个映射")
+        pattern = str(item.get("pattern") or "").strip()
+        if not pattern:
+            raise ValueError(f"{name}.rules[{index}].pattern 不能为空")
+        decision = str(item.get("decision") or "").strip()
+        if decision not in _SAFETY_NAMES:
+            raise ValueError(
+                f"{name}.rules[{index}].decision 只能是 {_SAFETY_HINT}，收到 {decision!r}"
+            )
+        rule: dict[str, Any] = {"pattern": pattern, "decision": decision}
+        reason = str(item.get("reason") or "").strip()
+        if reason:
+            rule["reason"] = reason
+        rules.append(rule)
+    return {"default": default, "rules": rules}
+
+
+def _validate_command_section(section: Any) -> dict[str, Any]:
+    if not isinstance(section, dict):
+        raise ValueError("execute_command 必须是一个映射")
+    default = str(section.get("default", "approval_required")).strip()
+    if default not in _SAFETY_NAMES:
+        raise ValueError(f"execute_command.default 只能是 {_SAFETY_HINT}，收到 {default!r}")
+    out: dict[str, Any] = {"default": default}
+    for key in ("deny_patterns", "sensitive_patterns"):
+        raw = section.get(key)
+        if raw is None:
+            continue
+        if not isinstance(raw, list):
+            raise ValueError(f"execute_command.{key} 必须是列表")
+        items: list[str] = []
+        for index, entry in enumerate(raw):
+            text = str(entry or "").strip()
+            if not text:
+                continue
+            try:
+                re.compile(text)
+            except re.error as exc:
+                raise ValueError(
+                    f"execute_command.{key}[{index}] 不是合法正则：{exc}"
+                ) from exc
+            items.append(text)
+        out[key] = items
+    raw_paths = section.get("sensitive_path_patterns")
+    if raw_paths is not None:
+        if not isinstance(raw_paths, list):
+            raise ValueError("execute_command.sensitive_path_patterns 必须是列表")
+        out["sensitive_path_patterns"] = [
+            str(entry or "").strip() for entry in raw_paths if str(entry or "").strip()
+        ]
+    return out
+
+
+def _validate_policy_dict(data: Any) -> dict[str, Any]:
+    """整份校验并规范化。宁可整体拒绝，也不要落一份半对的策略。"""
+    if not isinstance(data, dict):
+        raise ValueError("policy 必须是一个映射")
+    raw_roots = data.get("extra_roots") or []
+    if not isinstance(raw_roots, list):
+        raise ValueError("extra_roots 必须是列表")
+    out: dict[str, Any] = {
+        "version": 1,
+        "extra_roots": [str(e or "").strip() for e in raw_roots if str(e or "").strip()],
+    }
+    for name in ("read_file", "write_file"):
+        if name in data:
+            out[name] = _validate_rules_section(name, data[name])
+    if "execute_command" in data:
+        out["execute_command"] = _validate_command_section(data["execute_command"])
+    restart = data.get("restart")
+    if restart is not None:
+        if not isinstance(restart, dict):
+            raise ValueError("restart 必须是一个映射")
+        value = str(restart.get("default", "approval_required")).strip()
+        if value not in _SAFETY_NAMES:
+            raise ValueError(f"restart.default 只能是 {_SAFETY_HINT}，收到 {value!r}")
+        out["restart"] = {"default": value}
+    return out
+
+
 def _is_public_http_url(raw: str) -> bool:
     """判定 URL 是否为“公网 http(s) 地址”，用于防 SSRF。
 
@@ -249,6 +354,31 @@ class PolicyEngine:
             self._policy_path.write_text(text, encoding="utf-8")
         except Exception:
             pass
+
+    def export_config(self) -> dict[str, Any]:
+        """当前生效的 policy 原文，给控制台编辑用。"""
+        self._reload_if_needed()
+        return copy.deepcopy(self._cfg)
+
+    def replace_config(self, data: Any) -> dict[str, Any]:
+        """整份替换并落盘，返回落盘后的内容。
+
+        校验不过就抛 ValueError 且不写盘：一份解析不了的 yaml 会让 _reload_if_needed
+        静默退回内置默认，策略被换掉却看不出任何迹象。
+        """
+        validated = _validate_policy_dict(data)
+        text = yaml.safe_dump(validated, sort_keys=False, allow_unicode=True)
+        tmp = self._policy_path.with_name(self._policy_path.name + '.' + str(os.getpid()) + '.tmp')
+        try:
+            self._policy_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(text, encoding='utf-8')
+            os.replace(tmp, self._policy_path)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise ValueError('策略写入失败：' + str(exc)) from exc
+        self._reload_if_needed(force=True)
+        return self.export_config()
 
     def _reload_if_needed(self, *, force: bool = False) -> None:
         try:

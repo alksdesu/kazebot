@@ -45,6 +45,7 @@ from .types import (
     ActiveProviderIn,
     FallbacksUpdateIn,
     NodeFallbacksUpdateIn,
+    PolicyUpdateIn,
     OpRequestIn,
     OpRequestOut,
     OutboundMessageIn,
@@ -208,6 +209,34 @@ def create_app(
         result = cs.get_providers_public()
         result["registered"] = provider_registry.list()
         return result
+
+    @app.get("/v1/config/policy")
+    async def get_policy(request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        return {"policy": st.policy.export_config()}
+
+    @app.put("/v1/config/policy")
+    async def put_policy(body: PolicyUpdateIn, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        try:
+            saved = st.policy.replace_config(body.policy)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # 策略是整套权限判定的根。改了什么必须能事后查，否则出事时无从复盘。
+        st.eventlog.append(
+            session_id="",
+            component="supervisor",
+            type_="policy_updated",
+            payload={
+                "read_rules": len((saved.get("read_file") or {}).get("rules") or []),
+                "write_rules": len((saved.get("write_file") or {}).get("rules") or []),
+                "command_default": (saved.get("execute_command") or {}).get("default", ""),
+                "policy": saved,
+            },
+        )
+        return {"policy": saved}
 
     @app.get("/v1/config/system-models")
     async def get_system_models(request: Request) -> dict[str, Any]:

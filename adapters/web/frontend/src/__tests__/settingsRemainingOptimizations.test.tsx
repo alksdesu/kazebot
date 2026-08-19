@@ -76,7 +76,7 @@ describe('remaining Settings optimizations', () => {
     render(<ClientSettingsPage />);
 
     const entrySection = screen.getByRole('heading', { name: '入口节点' }).closest('section');
-    const approvalSection = screen.getByRole('heading', { name: '自动审批规则' }).closest('section');
+    const approvalSection = screen.getByRole('heading', { name: /自动审批规则/ }).closest('section');
     if (!entrySection || !approvalSection) throw new Error('settings sections not found');
 
     expect(entrySection.compareDocumentPosition(approvalSection) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();

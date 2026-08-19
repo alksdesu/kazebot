@@ -202,6 +202,12 @@ class ApprovalRequestIn(BaseModel):
     task_id: str | None = None
 
 
+class PolicyUpdateIn(BaseModel):
+    """整份替换 policy。部分更新会让"删掉一条规则"没法表达。"""
+
+    policy: dict[str, Any]
+
+
 class ApprovalDecisionIn(BaseModel):
     decision: Literal["allow", "deny"]
     comment: str | None = None

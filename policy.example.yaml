@@ -45,6 +45,29 @@ write_file:
     - pattern: "config/workflows/**"
       decision: approval_required
       reason: "workflow changes affect node graph"
+    # 第一个命中的规则赢，所以下面这条兜底必须排在上面几条具体规则之后。
+    # config/ 下任何文件都参与决定 engine 怎么跑，落到 default:auto 等于免审批改行为。
+    - pattern: "config/**"
+      decision: approval_required
+      reason: "config changes affect execution"
+    - pattern: "bot.py"
+      decision: approval_required
+      reason: "qq adapter entrypoint changes require approval"
+    - pattern: "adapters/**"
+      decision: approval_required
+      reason: "adapter source changes require approval"
+    - pattern: "clonoth_sdk/**"
+      decision: approval_required
+      reason: "sdk source changes require approval"
+    - pattern: "plugins/**"
+      decision: approval_required
+      reason: "plugin source changes require approval"
+    - pattern: "deploy/**"
+      decision: approval_required
+      reason: "deployment units run as services"
+    - pattern: "skills/**"
+      decision: approval_required
+      reason: "skill bodies are injected into prompts"
     - pattern: "data/config.yaml"
       decision: approval_required
       reason: "config changes require approval"

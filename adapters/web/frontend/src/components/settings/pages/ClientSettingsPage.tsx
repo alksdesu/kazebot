@@ -11,6 +11,7 @@ import {
   type TitleGenerationMode,
   useClientPrefsStore,
 } from '../../../store/clientPrefsStore';
+import { PolicyRulesSection } from './PolicyRulesSection';
 import { useSettingsStore } from '../../../store/settingsStore';
 import type { NodeDef } from '../../../types';
 import { inferToolRisk, riskClassName, riskLabel, type RiskLevel } from '../../../utils/toolRisk';
@@ -219,9 +220,9 @@ export const ClientSettingsPage = () => {
 
         <section className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
           <div className="mb-3">
-            <h2 className="font-mono text-sm font-semibold">自动审批规则</h2>
+            <h2 className="font-mono text-sm font-semibold">自动审批规则（仅本浏览器）</h2>
             <p className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]">
-              低风险只读工具默认自动放行。未知工具和较高风险工具默认保持手动审批，除非在这里明确修改。
+              存在这台浏览器里，只作用于控制台聊天页收到的审批请求。QQ 等其他渠道走的是下面那份服务端策略，勾这里没用。
             </p>
           </div>
 
@@ -264,6 +265,8 @@ export const ClientSettingsPage = () => {
           </div>
         </section>
 
+
+        <PolicyRulesSection />
 
         <section className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
           <h2 className="font-mono text-sm font-semibold">对话标题</h2>
