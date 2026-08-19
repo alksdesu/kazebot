@@ -70,7 +70,38 @@ def is_enrolled(workspace_root: Path, subject: Any) -> bool:
     return is_valid_subject(text) and text in enrolled_subjects(workspace_root)
 
 
-def record_interaction(workspace_root: Path, subject: str, *, now: str = "") -> bool:
+_DISPLAY_NAME_MAX_LEN = 64
+
+
+def _clean_display_name(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    # 名片能塞换行和控制字符，落进名册后会污染后续的字面匹配。
+    text = "".join(ch for ch in text if ch.isprintable())
+    return text.strip()[:_DISPLAY_NAME_MAX_LEN]
+
+
+def subject_display_names(workspace_root: Path) -> dict[str, str]:
+    """已建档者最近一次露面时用的显示名。同名者一并剔除。
+
+    重名时无法判断文本里说的是谁，认错人会把别人的档案念出来，比认不出更糟。
+    """
+    names: dict[str, str] = {}
+    for alias, entry in load_roster(workspace_root).items():
+        display = _clean_display_name(entry.get("display_name"))
+        if display:
+            names[alias] = display
+    duplicated = {
+        name for name in names.values()
+        if sum(1 for other in names.values() if other == name) > 1
+    }
+    return {alias: name for alias, name in names.items() if name not in duplicated}
+
+
+def record_interaction(
+    workspace_root: Path, subject: str, *, now: str = "", display_name: Any = "",
+) -> bool:
     """Enroll *subject* on a direct interaction and return whether the file changed.
 
     只在本人主动找 bot 时调用 —— bot 因关键词或随机回复插话不算，否则群一活跃
@@ -80,15 +111,20 @@ def record_interaction(workspace_root: Path, subject: str, *, now: str = "") -> 
     if not is_valid_subject(text):
         return False
     stamp = now or datetime.now(timezone.utc).isoformat()
+    display = _clean_display_name(display_name)
     path = roster_path(workspace_root)
     with _write_lock:
         roster = load_roster(workspace_root)
         entry = roster.get(text)
         if entry is None:
             roster[text] = {"first_seen": stamp, "last_seen": stamp, "interactions": 1}
+            entry = roster[text]
         else:
             entry["last_seen"] = stamp
             entry["interactions"] = int(entry.get("interactions") or 0) + 1
+        # 改了名就跟着改：认人靠的是他现在用的名字，不是第一次见到的那个。
+        if display:
+            entry["display_name"] = display
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(

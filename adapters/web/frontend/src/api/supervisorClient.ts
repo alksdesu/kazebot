@@ -711,6 +711,112 @@ export function updatePolicyRaw(token: string, yaml: string): Promise<any> {
   return writeRawConfig('/admin/config/policy/raw', token, yaml);
 }
 
+// ── Memory & conversation context ──
+
+export interface MemoryOwner {
+  kind: 'group' | 'private' | 'agent' | 'subject' | 'unknown';
+  label: string;
+  alias?: string;
+  real_id?: string;
+  conversation_key?: string;
+}
+
+export interface MemoryNamespace {
+  key: string;
+  namespace: string;
+  kind: 'conversation' | 'subject' | 'orphan';
+  subject: string;
+  entry_count: number;
+  books: string[];
+  updated_at: string;
+  owner: MemoryOwner;
+}
+
+export interface MemoryEntry {
+  id: string;
+  book: string;
+  content: string;
+  keywords?: string[];
+  constant?: boolean;
+  enabled?: boolean;
+  priority?: number;
+  scan_depth?: number;
+  subject?: string;
+  source?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export async function getMemoryOverview(token: string): Promise<MemoryNamespace[]> {
+  const resp = await apiFetch('/admin/config/memory/overview', { headers: authHeaders(token) });
+  return (await resp.json()).namespaces || [];
+}
+
+export async function getMemoryEntries(token: string, namespace: string): Promise<MemoryEntry[]> {
+  const resp = await apiFetch(
+    `/admin/config/memory/${encodeURIComponent(namespace)}/entries`, { headers: authHeaders(token) },
+  );
+  return (await resp.json()).entries || [];
+}
+
+export async function saveMemoryEntry(
+  token: string, namespace: string, entry: Partial<MemoryEntry>,
+): Promise<MemoryEntry> {
+  const resp = await apiFetch(`/admin/config/memory/${encodeURIComponent(namespace)}/entries`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify(entry),
+  });
+  return (await resp.json()).entry;
+}
+
+export async function deleteMemoryEntry(
+  token: string, namespace: string, book: string, entryId: string,
+): Promise<void> {
+  await apiFetch(
+    `/admin/config/memory/${encodeURIComponent(namespace)}/entries/${encodeURIComponent(book)}/${encodeURIComponent(entryId)}`,
+    { method: 'DELETE', headers: authHeaders(token) },
+  );
+}
+
+export async function clearMemoryNamespace(token: string, namespace: string): Promise<number> {
+  const resp = await apiFetch(`/admin/config/memory/${encodeURIComponent(namespace)}`, {
+    method: 'DELETE', headers: authHeaders(token),
+  });
+  return (await resp.json()).removed || 0;
+}
+
+export interface ConversationRow {
+  session_id: string;
+  conversation_key: string;
+  channel: string;
+  bytes: number;
+  updated_at: number;
+  owner: MemoryOwner | null;
+}
+
+export async function getConversations(token: string): Promise<ConversationRow[]> {
+  const resp = await apiFetch('/admin/conversations', { headers: authHeaders(token) });
+  return (await resp.json()).conversations || [];
+}
+
+export async function getConversationMessages(
+  token: string, sessionId: string, limit = 200,
+): Promise<{ total: number; messages: Array<Record<string, any>> }> {
+  const resp = await apiFetch(
+    `/admin/conversations/${encodeURIComponent(sessionId)}/messages?limit=${limit}`,
+    { headers: authHeaders(token) },
+  );
+  return resp.json();
+}
+
+export async function resetConversationBySession(token: string, sessionId: string): Promise<any> {
+  const resp = await apiFetch(`/admin/conversations/${encodeURIComponent(sessionId)}/reset`, {
+    method: 'POST', headers: authHeaders(token),
+  });
+  return resp.json();
+}
+
 export function getSchedulesRaw(token: string): Promise<string> {
   return readRawConfig('/admin/config/schedules/raw', token);
 }

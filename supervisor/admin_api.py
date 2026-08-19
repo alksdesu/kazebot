@@ -798,4 +798,78 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 names.add(spec["name"])
         return sorted(names)
 
+    # ----- Memory -----
+    # data/memory 根目录是 conversation_key 缺失时的落点，URL 里没法用空串表示。
+    _ROOT_NAMESPACE = "__root__"
+
+    def _namespace_arg(namespace: str) -> str:
+        return "" if namespace == _ROOT_NAMESPACE else namespace
+
+    def _memory_call(fn, *args):
+        from engine.memory_admin import MemoryAdminError
+
+        try:
+            return fn(*args)
+        except MemoryAdminError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.get("/memory/overview")
+    def memory_overview() -> dict[str, Any]:
+        from engine import memory_admin
+
+        from .conversation_labels import describe_namespaces, subject_label
+
+        labels = describe_namespaces(workspace_root)
+        rows: list[dict[str, Any]] = []
+        for row in memory_admin.list_namespaces(workspace_root):
+            namespace = row["namespace"]
+            described = labels.get(namespace)
+            if row["kind"] == "subject":
+                described = {
+                    "kind": "subject",
+                    "label": subject_label(workspace_root, row["subject"]),
+                    "alias": row["subject"],
+                }
+            rows.append({
+                **row,
+                "key": namespace or _ROOT_NAMESPACE,
+                # 认不出归属的目录多半是用完即弃的子代理会话，堆着没人清。
+                "owner": described or {"kind": "unknown", "label": "未知来源"},
+            })
+        return {"namespaces": rows}
+
+    @router.get("/memory/{namespace}/entries")
+    def memory_entries(namespace: str) -> dict[str, Any]:
+        from engine import memory_admin
+
+        entries = _memory_call(memory_admin.list_entries, workspace_root, _namespace_arg(namespace))
+        return {"entries": entries}
+
+    @router.post("/memory/{namespace}/entries")
+    def memory_upsert(namespace: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        from engine import memory_admin
+
+        entry = _memory_call(
+            memory_admin.upsert_entry, workspace_root, _namespace_arg(namespace), payload,
+        )
+        return {"ok": True, "entry": entry}
+
+    @router.delete("/memory/{namespace}/entries/{book}/{entry_id}")
+    def memory_delete(namespace: str, book: str, entry_id: str) -> dict[str, Any]:
+        from engine import memory_admin
+
+        removed = _memory_call(
+            memory_admin.delete_entry, workspace_root, _namespace_arg(namespace), book, entry_id,
+        )
+        if not removed:
+            raise HTTPException(status_code=404, detail="memory entry not found")
+        return {"ok": True}
+
+    @router.delete("/memory/{namespace}")
+    def memory_clear(namespace: str) -> dict[str, Any]:
+        from engine import memory_admin
+
+        removed = _memory_call(memory_admin.clear_namespace, workspace_root, _namespace_arg(namespace))
+        return {"ok": True, "removed": removed}
+
     return router

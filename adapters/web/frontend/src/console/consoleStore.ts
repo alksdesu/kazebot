@@ -13,7 +13,7 @@ import {
 } from '../api/supervisorClient';
 
 export const CONSOLE_DOMAINS = [
-  'account', 'channels', 'timing', 'permissions', 'persona', 'providers', 'models', 'runtime',
+  'account', 'channels', 'timing', 'permissions', 'persona', 'providers', 'models', 'runtime', 'memory',
 ] as const;
 export type ConsoleDomain = (typeof CONSOLE_DOMAINS)[number];
 
@@ -26,6 +26,7 @@ export const DOMAIN_LABELS: Record<ConsoleDomain, string> = {
   providers: '渠道',
   models: '模型',
   runtime: '运行',
+  memory: '记忆',
 };
 
 /** 草稿按 live_config 的键名存（如 signal_at），不是 yaml 的点分路径。

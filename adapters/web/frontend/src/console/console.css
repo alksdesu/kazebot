@@ -1106,6 +1106,222 @@
   outline-offset: 2px;
 }
 
+[data-surface='console'] {
+  .qc-mem {
+    display: grid;
+    grid-template-columns: 15rem 1fr;
+    gap: 14px;
+    align-items: start;
+  }
+
+  .qc-mem-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .qc-mem-bucket {
+    margin: 0 0 4px;
+    color: var(--qc-mute);
+    font-size: 11px;
+    font-family: var(--qc-mono);
+  }
+
+  .qc-mem-item {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    width: 100%;
+    padding: 5px 9px;
+    border: 1px solid var(--qc-rule);
+    border-radius: var(--qc-r-sm);
+    background: var(--qc-paper);
+    color: var(--qc-ink);
+    text-align: left;
+    font-size: 12px;
+    font-family: var(--qc-sans);
+    cursor: pointer;
+  }
+
+  .qc-mem-item + .qc-mem-item {
+    margin-top: 4px;
+  }
+
+  .qc-mem-item:hover {
+    background: var(--qc-paper-hover);
+  }
+
+  .qc-mem-item[aria-current='true'] {
+    border-color: var(--qc-ink);
+    background: var(--qc-shelf);
+  }
+
+  .qc-mem-name {
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .qc-mem-count {
+    color: var(--qc-mute);
+    font-size: 11px;
+    font-family: var(--qc-mono);
+  }
+
+  .qc-mem-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .qc-mem-head {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 12px;
+    font-family: var(--qc-mono);
+  }
+
+  .qc-mem-entry {
+    padding: 8px 10px;
+    border: 1px solid var(--qc-rule);
+    border-radius: var(--qc-r-sm);
+    background: var(--qc-paper);
+  }
+
+  .qc-mem-entry + .qc-mem-entry {
+    margin-top: 6px;
+  }
+
+  .qc-mem-entry-head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .qc-mem-entry-head .qc-btn {
+    margin-left: auto;
+  }
+
+  .qc-mem-entry-head .qc-btn + .qc-btn {
+    margin-left: 0;
+  }
+
+  .qc-mem-id {
+    color: var(--qc-ink);
+    font-size: 12px;
+    font-family: var(--qc-mono);
+  }
+
+  .qc-mem-tag {
+    padding: 1px 6px;
+    border-radius: var(--qc-r-sm);
+    background: var(--qc-shelf);
+    color: var(--qc-mute);
+    font-size: 11px;
+    font-family: var(--qc-mono);
+  }
+
+  /* 常驻条目每轮都进 prompt，一直占着注入预算，扫一眼就该看出是哪几条。 */
+  .qc-mem-entry-const {
+    border-left: 3px solid var(--qc-live);
+  }
+
+  .qc-mem-tag-const {
+    background: var(--qc-live);
+    color: var(--qc-paper);
+  }
+
+  .qc-mem-const-note {
+    margin-left: 8px;
+    padding: 1px 6px;
+    border-radius: var(--qc-r-sm);
+    background: var(--qc-live);
+    color: var(--qc-paper);
+    font-size: 11px;
+  }
+
+  .qc-mem-text {
+    margin: 5px 0 0;
+    color: var(--qc-ink);
+    font-size: 12px;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+  }
+
+  .qc-mem-kw {
+    margin: 4px 0 0;
+    color: var(--qc-mute);
+    font-size: 11px;
+    font-family: var(--qc-mono);
+    overflow-wrap: anywhere;
+  }
+
+  /* 上下文预览可能有上百条，给个高度上限，不然整页被它撑开。 */
+  .qc-mem-log {
+    max-height: 20rem;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid var(--qc-rule);
+    overflow: auto;
+  }
+
+  .qc-mem-add {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 10px;
+    border-top: 1px solid var(--qc-rule);
+  }
+
+  .qc-mem-field {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .qc-mem-field > span {
+    flex: 0 0 3.5rem;
+    color: var(--qc-mute);
+    font-size: 12px;
+  }
+
+  .qc-mem-field > input {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 5px 9px;
+    border: 1px solid var(--qc-rule);
+    border-radius: var(--qc-r-sm);
+    background: var(--qc-paper);
+    color: var(--qc-ink);
+    font-size: 12px;
+    font-family: var(--qc-mono);
+  }
+
+  .qc-mem-check {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    color: var(--qc-mute);
+    font-size: 11px;
+    line-height: 1.5;
+  }
+
+  .qc-mem-add .qc-btn {
+    align-self: flex-start;
+  }
+}
+
+@media (max-width: 720px) {
+  [data-surface='console'] .qc-mem {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 720px) {
   [data-surface='console'] {
     .qc-shell {

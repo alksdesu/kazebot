@@ -4246,11 +4246,13 @@ def _anonymize_group_id(group_id: Any) -> str:
 def _enrolled_subject_display_names() -> Dict[str, str]:
     """已建档者的别名 -> 显示名，用于在自由文本里认出「提到了谁」。
 
-    只覆盖已建档的人：候选集小，误命中代价低。显示名取 profile 配置，没配就跳过 ——
-    群名片是每群不同的，拿它当跨会话身份反而会串。
+    profile 配的名字跨会话稳定，优先；没配就回落到名册里记下的最近显示名 ——
+    群名片确实每群不同，但没有它这条召回路径在没配 profile 的部署上完全是死的。
+    重名的已经在名册侧剔除，认错人比认不出更糟。
     """
-    names: Dict[str, str] = {}
-    for alias in memory_subjects.enrolled_subjects(Path(CLONOTH_WORKSPACE)):
+    workspace = Path(CLONOTH_WORKSPACE)
+    names = dict(memory_subjects.subject_display_names(workspace))
+    for alias in memory_subjects.enrolled_subjects(workspace):
         real = _anon_user_reverse.get(alias)
         if not real:
             continue
@@ -4269,7 +4271,12 @@ def _record_memory_subject_interaction(event: Event, direct: bool = True) -> str
     alias = _event_user_alias(event)
     # 匿名身份不可核验且按天轮换，建档等于把不同人的记忆混进同一份档案。
     if direct and alias and alias != "UserUnknown" and not alias.startswith("Anon"):
-        memory_subjects.record_interaction(Path(CLONOTH_WORKSPACE), alias)
+        display = _event_display_name(event)
+        # 没名片时显示名就是别名本身，别名另有匹配路径，存进去只是冗余。
+        memory_subjects.record_interaction(
+            Path(CLONOTH_WORKSPACE), alias,
+            display_name="" if display == alias else display,
+        )
     return alias
 
 
@@ -8004,6 +8011,36 @@ def _live_runtime_facts() -> Dict[str, Any]:
     }
 
 
+_group_names: Dict[str, str] = {}
+_group_names_at = 0.0
+# 群名极少变，而 reconcile 每 2 秒转一圈，跟着它调 API 纯属浪费。
+_GROUP_NAME_REFRESH_SEC = 300.0
+
+
+async def _refresh_group_names() -> None:
+    """把群号→群名缓存下来发给控制台。
+
+    只有 bot 进程连着 OneBot，supervisor 自己拿不到群名；不给的话控制台上
+    只能显示 GroupA 这种脱敏别名，管理员分不清是哪个群。
+    """
+    global _group_names_at
+    now = time.time()
+    if now - _group_names_at < _GROUP_NAME_REFRESH_SEC:
+        return
+    bot = _get_fallback_bot()
+    if bot is None:
+        return
+    _group_names_at = now
+    for row in await _safe_call_onebot_list(bot, "get_group_list"):
+        try:
+            gid = int(row.get("group_id"))
+        except Exception:
+            continue
+        name = str(row.get("group_name") or row.get("group_remark") or "").strip()
+        if name:
+            _group_names[str(gid)] = _sanitize_name(name, max_len=40)
+
+
 def _publish_live_state(*, force: bool = False) -> None:
     """把「bot 进程实际生效的配置」写给 supervisor 的 GET /qq/state 读。
 
@@ -8013,6 +8050,7 @@ def _publish_live_state(*, force: bool = False) -> None:
     global _live_state_published_at, _live_state_signature
     payload: Dict[str, Any] = live_config_state_payload()
     payload["runtime"] = _live_runtime_facts()
+    payload["group_names"] = dict(_group_names)
     signature = json.dumps(
         {k: v for k, v in payload.items() if k != "runtime"}
         | {k: v for k, v in payload["runtime"].items() if k != "volatile"},
@@ -8061,6 +8099,7 @@ async def _live_config_reconcile_forever() -> None:
                     )
                 await _reconcile_live_config()
                 previous = snapshot
+            await _refresh_group_names()
             _publish_live_state()
         except asyncio.CancelledError:
             raise

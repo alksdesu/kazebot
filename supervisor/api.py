@@ -14,7 +14,7 @@ from typing import Any
 
 from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import Response
+from fastapi.responses import RedirectResponse, Response
 
 from .config_store import ConfigStore
 from .process_manager import ProcessManager
@@ -1223,13 +1223,8 @@ def create_app(
         st.clear_cancelled(session_id)
         return {"ok": True}
 
-    @app.post("/v1/conversations/reset")
-    async def conversation_reset(body: dict[str, Any]) -> dict[str, Any]:
-        """Reset a conversation, forcing next message to create a new session."""
-        st: SupervisorState = app.state.state
-        conv_key = str(body.get("conversation_key") or "").strip()
-        if not conv_key:
-            raise HTTPException(status_code=400, detail="conversation_key required")
+    def _reset_conversation(st: "SupervisorState", conv_key: str) -> dict[str, Any]:
+        """重置一个会话。控制台和 /clear 走同一条路，否则一边清了另一边还留着。"""
         result = st.reset_conversation(conversation_key=conv_key)
         if not result.get("ok"):
             raise HTTPException(status_code=404, detail=result.get("error", "not found"))
@@ -1251,6 +1246,74 @@ def create_app(
             except Exception:
                 pass
         return result
+
+    @app.post("/v1/conversations/reset")
+    async def conversation_reset(body: dict[str, Any]) -> dict[str, Any]:
+        """Reset a conversation, forcing next message to create a new session."""
+        st: SupervisorState = app.state.state
+        conv_key = str(body.get("conversation_key") or "").strip()
+        if not conv_key:
+            raise HTTPException(status_code=400, detail="conversation_key required")
+        return _reset_conversation(st, conv_key)
+
+    @app.get("/v1/admin/conversations")
+    async def admin_list_conversations(request: Request) -> dict[str, Any]:
+        """控制台用的会话清单：每条带归属、消息数和体积。"""
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        from .conversation_labels import describe_namespaces, load_sessions, memory_namespace
+
+        labels = describe_namespaces(st.workspace_root)
+        sessions = load_sessions(st.workspace_root)
+        conv_dir = st.workspace_root / "data" / "conversations"
+        rows: list[dict[str, Any]] = []
+        for path in sorted(conv_dir.glob("*.jsonl")) if conv_dir.is_dir() else []:
+            session_id = path.stem
+            info = sessions.get(session_id) or {}
+            conv_key = str(info.get("conversation_key") or "")
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            rows.append({
+                "session_id": session_id,
+                "conversation_key": conv_key,
+                # session 已被清掉但 jsonl 还在的孤儿也要列出来，否则永远没人删。
+                "owner": labels.get(memory_namespace(conv_key)) if conv_key else None,
+                "channel": str(info.get("channel") or ""),
+                "bytes": stat.st_size,
+                "updated_at": stat.st_mtime,
+            })
+        rows.sort(key=lambda row: row["updated_at"], reverse=True)
+        return {"conversations": rows}
+
+    @app.get("/v1/admin/conversations/{session_id}/messages")
+    async def admin_conversation_messages(
+        session_id: str, request: Request, limit: int = Query(200, ge=1, le=2000),
+    ) -> dict[str, Any]:
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        from engine.conversation_store import ConversationStore
+
+        store = ConversationStore(st.workspace_root / "data" / "conversations")
+        messages = store.load(session_id)
+        return {
+            "total": len(messages),
+            "messages": [message.to_dict() for message in messages[-limit:]],
+        }
+
+    @app.post("/v1/admin/conversations/{session_id}/reset")
+    async def admin_conversation_reset(session_id: str, request: Request) -> dict[str, Any]:
+        """按 session 重置。走和 /clear 同一条路，adapter 侧的群历史缓存才会跟着清。"""
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        from .conversation_labels import load_sessions
+
+        info = load_sessions(st.workspace_root).get(session_id) or {}
+        conv_key = str(info.get("conversation_key") or "").strip()
+        if not conv_key:
+            raise HTTPException(status_code=404, detail="session has no conversation to reset")
+        return _reset_conversation(st, conv_key)
 
     @app.post("/v1/tasks/{task_id}/cancel")
     async def task_cancel(task_id: str) -> dict[str, Any]:
@@ -1920,6 +1983,11 @@ def create_app(
     web_dist = state.workspace_root / "adapters" / "web" / "frontend" / "dist"
     console_url = ""
     if web_dist.is_dir():
+        @app.get("/", include_in_schema=False)
+        async def web_root() -> RedirectResponse:
+            """域名直接指到这个端口，根路径不给个去处就只有一个 404。"""
+            return RedirectResponse(url="/web/")
+
         app.mount("/web", StaticFiles(directory=str(web_dist), html=True), name="web")
         console_url = f"http://{host}:{port}/web/"
         print(f"[web] 前端地址: {console_url}", flush=True)

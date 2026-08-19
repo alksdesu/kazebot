@@ -77,6 +77,48 @@ class TestRoster:
         assert roster["UserA"]["interactions"] == 2
         assert roster["UserA"]["first_seen"] <= roster["UserA"]["last_seen"]
 
+    def test_the_latest_display_name_is_remembered(self, tmp_path: Path) -> None:
+        # 没配 qq_user_profiles.yaml 时，这是「正文里提到某人」唯一的反查依据。
+        memory_subjects.record_interaction(tmp_path, "UserA", display_name="小明")
+
+        assert memory_subjects.subject_display_names(tmp_path) == {"UserA": "小明"}
+
+    def test_a_renamed_person_is_tracked_by_the_new_name(self, tmp_path: Path) -> None:
+        memory_subjects.record_interaction(tmp_path, "UserA", display_name="小明")
+        memory_subjects.record_interaction(tmp_path, "UserA", display_name="老明")
+
+        assert memory_subjects.subject_display_names(tmp_path) == {"UserA": "老明"}
+
+    def test_an_omitted_display_name_keeps_the_previous_one(self, tmp_path: Path) -> None:
+        memory_subjects.record_interaction(tmp_path, "UserA", display_name="小明")
+        memory_subjects.record_interaction(tmp_path, "UserA")
+
+        assert memory_subjects.subject_display_names(tmp_path) == {"UserA": "小明"}
+
+    def test_people_sharing_a_display_name_are_both_dropped(self, tmp_path: Path) -> None:
+        # 重名时无法判断说的是谁，念错人的档案比认不出更糟。
+        memory_subjects.record_interaction(tmp_path, "UserA", display_name="小明")
+        memory_subjects.record_interaction(tmp_path, "UserB", display_name="小明")
+        memory_subjects.record_interaction(tmp_path, "UserC", display_name="小红")
+
+        assert memory_subjects.subject_display_names(tmp_path) == {"UserC": "小红"}
+
+    def test_a_control_character_display_name_is_scrubbed(self, tmp_path: Path) -> None:
+        memory_subjects.record_interaction(tmp_path, "UserA", display_name=" 小\n明\t ")
+
+        assert memory_subjects.subject_display_names(tmp_path) == {"UserA": "小明"}
+
+    def test_a_roster_without_display_names_still_loads(self, tmp_path: Path) -> None:
+        # 升级前写下的名册没有这个字段，读到就该当作「不知道他叫什么」。
+        path = memory_subjects.roster_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"subjects": {"UserA": {"interactions": 3}}}), encoding="utf-8",
+        )
+
+        assert memory_subjects.is_enrolled(tmp_path, "UserA")
+        assert memory_subjects.subject_display_names(tmp_path) == {}
+
     def test_an_invalid_alias_is_refused(self, tmp_path: Path) -> None:
         # 别名会被拼进目录名，路径穿越必须在入口就挡掉。
         for bad in ["", "  ", "../etc", "user/../x", "1User", "a" * 200]:

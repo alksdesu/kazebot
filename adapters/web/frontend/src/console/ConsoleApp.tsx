@@ -9,6 +9,7 @@ import { useViewStore } from '../store/viewStore';
 import { Empty, Page, Rail, StatusBar } from './components';
 import './console.css';
 import { DOMAIN_LABELS, useConsoleStore, type ConsoleDomain } from './consoleStore';
+import { MemoryPage } from './MemoryPage';
 import { ModelsPage } from './ModelsPage';
 import { PermissionsPage } from './PermissionsPage';
 import { PersonaPage } from './PersonaPage';
@@ -17,11 +18,11 @@ import { RuntimePage } from './RuntimePage';
 import { TimingPage } from './TimingPage';
 
 const READY: ReadonlySet<ConsoleDomain> = new Set<ConsoleDomain>([
-  'account', 'channels', 'timing', 'permissions', 'persona', 'providers', 'models', 'runtime',
+  'account', 'channels', 'timing', 'permissions', 'persona', 'providers', 'models', 'runtime', 'memory',
 ]);
 
 // 这些页写的不是 qq.yaml，也就不需要等 bot 公布生效配置——bot 没跑也该能改。
-const WITHOUT_BOT: ReadonlySet<ConsoleDomain> = new Set<ConsoleDomain>(['account', 'providers', 'models']);
+const WITHOUT_BOT: ReadonlySet<ConsoleDomain> = new Set<ConsoleDomain>(['account', 'providers', 'models', 'memory']);
 
 const PAGES: Partial<Record<ConsoleDomain, () => JSX.Element>> = {
   account: AccountPage,
@@ -32,6 +33,7 @@ const PAGES: Partial<Record<ConsoleDomain, () => JSX.Element>> = {
   models: ModelsPage,
   persona: PersonaPage,
   runtime: RuntimePage,
+  memory: MemoryPage,
 };
 
 const PAGE_NOTES: Partial<Record<ConsoleDomain, string>> = {
@@ -43,6 +45,7 @@ const PAGE_NOTES: Partial<Record<ConsoleDomain, string>> = {
   providers: 'bot 用哪一家的模型，以及它的地址和密钥。改完下一条消息就生效，不用重启。',
   models: '发给模型的请求里带哪些参数。清单由各家 provider 自己声明，全局与节点分两层，节点优先。',
   runtime: '进程与链路的实况，以及几个改完立刻重建运行期对象的参数。',
+  memory: 'bot 记住了什么、每个会话攒了多少上下文。改动直接落盘，不用点应用。',
 };
 
 export const ConsoleApp = () => {
