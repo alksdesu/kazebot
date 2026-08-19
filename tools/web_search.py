@@ -14,7 +14,8 @@ SPEC = {
     "description": (
         "极简联网搜索工具。用于网页搜索、最新资料检索、新闻查询，以及 X/Twitter 帖子搜索。"
         "只需要填写 query 字段，例如：{\"query\": \"今天 AI 新闻\"}。"
-        "不要调用 exa_search 或 x_search；本工具会根据配置自动选择 Exa 或 X 搜索。"
+        "不要调用 native_search / exa_search / x_search；"
+        "本工具会先用主模型自带的联网能力，不可用时自动退回 Exa 或 X。"
     ),
     "input_schema": {
         "type": "object",
@@ -31,8 +32,8 @@ SPEC = {
             "source": {
                 "type": "string",
                 "default": "auto",
-                "enum": ["auto", "exa", "x", "both"],
-                "description": "可选搜索来源。默认 auto。一般不要填写；需要 X/Twitter 时可填 x。",
+                "enum": ["auto", "native", "exa", "x", "both"],
+                "description": "可选搜索来源。默认 auto（主模型自带能力优先）。一般不要填写；需要 X/Twitter 时可填 x。",
             },
         },
         "required": ["query"],
@@ -162,6 +163,8 @@ if __name__ == "__main__":
             "general": "exa",
             "google": "exa",
             "exa_search": "exa",
+            "native_search": "native",
+            "model": "native",
             "twitter": "x",
             "tweet": "x",
             "tweets": "x",
@@ -171,23 +174,18 @@ if __name__ == "__main__":
             "multi": "both",
         }
         source = aliases.get(raw, raw)
-        if source not in {"auto", "exa", "x", "both"}:
+        if source not in {"auto", "native", "exa", "x", "both"}:
             source = "auto"
 
         if source != "auto":
             return source
 
+        # 点名要 X 的问题直接走 X：主模型的联网搜索覆盖不到站内帖子。
         lower_query = query.lower()
         wants_x = any(token in lower_query for token in ["twitter", "tweet", "tweets", "x 上", "x上", "推特", "推文"])
-        has_exa = has_config_key(dotenv, "EXA_API_KEY")
-        has_x = has_config_key(dotenv, "XAI_API_KEY", "OPENAI_API_KEY")
-        if wants_x and has_x:
+        if wants_x and has_config_key(dotenv, "XAI_API_KEY", "OPENAI_API_KEY"):
             return "x"
-        if has_exa:
-            return "exa"
-        if has_x:
-            return "x"
-        return "exa"
+        return "auto"
 
     def child_error(tool_name: str, error: str) -> dict[str, Any]:
         return {"ok": False, "error": error, "data": {"result": f"ERROR: {error}"}}
@@ -321,40 +319,81 @@ if __name__ == "__main__":
         total_timeout_sec,
     )
 
-    calls: list[tuple[str, dict[str, Any]]] = []
-    if source in {"exa", "both"}:
-        calls.append(("exa_search", {"query": query, "num_results": num_results}))
-    if source in {"x", "both"}:
-        calls.append(("x_search", {"query": query, "max_tokens": 8000}))
+    labels = {
+        "native_search": "主模型联网搜索",
+        "exa_search": "Exa 网页搜索",
+        "x_search": "X/Twitter 搜索",
+    }
 
-    if not calls:
-        calls.append(("exa_search", {"query": query, "num_results": num_results}))
+    def keyed_calls() -> list[tuple[str, dict[str, Any]]]:
+        planned: list[tuple[str, dict[str, Any]]] = []
+        if source in {"auto", "exa", "both"}:
+            planned.append(("exa_search", {"query": query, "num_results": num_results}))
+        if source in {"x", "both"}:
+            planned.append(("x_search", {"query": query, "max_tokens": 8000}))
+        return planned or [("exa_search", {"query": query, "num_results": num_results})]
+
+    # 主模型自带的联网能力不额外收费也不用配密钥，所以 auto 先问它，不行再花钱。
+    # 第二项是每阶段的时间上限：原生这一路必须留够预算给后面的降级。
+    stages: list[tuple[list[tuple[str, dict[str, Any]]], float]] = []
+    if source in {"auto", "native"}:
+        stages.append(([("native_search", {"query": query})], 35.0))
+    if source != "native":
+        stages.append((keyed_calls(), total_timeout_sec))
 
     child_results: dict[str, dict[str, Any]] = {}
     result_sections: list[str] = [f"联网搜索结果：{query}"]
+    failed_sections: list[str] = []
     citations: list[str] = []
     any_ok = False
+    deadline = time.monotonic() + total_timeout_sec
 
-    child_results = run_children(calls, total_timeout_sec=total_timeout_sec, child_timeout_sec=child_timeout_sec)
+    for calls, stage_cap in stages:
+        remaining = deadline - time.monotonic()
+        if remaining <= 1.0:
+            break
+        stage_total = min(remaining, stage_cap)
+        stage_results = run_children(
+            calls,
+            total_timeout_sec=stage_total,
+            child_timeout_sec=min(child_timeout_sec, stage_total),
+        )
+        child_results.update(stage_results)
 
-    for tool_name, _child_args in calls:
-        result = child_results.get(tool_name) or child_error(tool_name, f"{tool_name} did not return a result")
-        data = result.get("data") if isinstance(result.get("data"), dict) else {}
-        result_text = str(data.get("result") or result.get("error") or "").strip()
-        label = "Exa 网页搜索" if tool_name == "exa_search" else "X/Twitter 搜索"
-        if result.get("ok") is True:
+        stage_sections: list[str] = []
+        stage_ok = False
+        for tool_name, _child_args in calls:
+            result = stage_results.get(tool_name) or child_error(tool_name, f"{tool_name} did not return a result")
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            result_text = str(data.get("result") or result.get("error") or "").strip()
+            label = labels.get(tool_name, tool_name)
+            if result.get("ok") is True:
+                stage_ok = True
+                stage_sections.extend(["", f"## {label}", result_text or "搜索成功，但没有返回可读文本。"])
+                for url in data.get("citations") or []:
+                    url_text = str(url or "").strip()
+                    if url_text and url_text not in citations:
+                        citations.append(url_text)
+            else:
+                stage_sections.extend(["", f"## {label}失败", result_text or str(result.get("error") or "未知错误")])
+
+        if stage_ok:
             any_ok = True
-            result_sections.extend(["", f"## {label}", result_text or "搜索成功，但没有返回可读文本。"])
-            for url in data.get("citations") or []:
-                url_text = str(url or "").strip()
-                if url_text and url_text not in citations:
-                    citations.append(url_text)
-        else:
-            result_sections.extend(["", f"## {label}失败", result_text or str(result.get("error") or "未知错误")])
+            result_sections.extend(stage_sections)
+            break
+        # 降级过程留到全部落空时再讲，成功时不必拿它打扰模型。
+        failed_sections.extend(stage_sections)
+
+    if not any_ok:
+        result_sections.extend(failed_sections)
 
     final_text = "\n".join(result_sections).strip()
     if not any_ok:
-        final_text += "\n\n修复建议：请确认 .env 或环境变量中已配置 EXA_API_KEY，或 XAI_API_KEY/OPENAI_API_KEY。工具调用格式固定为：{\"query\": \"要搜索的内容\"}。"
+        final_text += (
+            "\n\n修复建议：主模型没有可用的联网搜索能力，且没有配置 Exa/X 密钥。"
+            "可以用 manage_secret 设置 EXA_API_KEY，"
+            "或把 data/config.yaml 的 system_models.native_search 指向一个支持联网搜索的模型。"
+        )
         output({
             "ok": False,
             "error": "all configured search providers failed",
