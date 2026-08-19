@@ -36,7 +36,25 @@ const EMPTY_RUNTIME_CONFIG_FORM: RuntimeConfigFormState = {
   entry_node_id: '',
   tool_mode: 'fake-native',
   max_workers: '',
+  compact_threshold_tokens: '',
+  compact_hard_threshold_tokens: '',
+  compact_keep_recent_tokens: '',
+  compact_keep_recent: '',
 };
+
+const CompactNumberField = ({ hint, label, min, onChange, value }: {
+  hint: string;
+  label: string;
+  min: string;
+  onChange: (value: string) => void;
+  value: string;
+}) => (
+  <label className="block">
+    <span className={STRUCTURED_LABEL_CLASS}>{label}</span>
+    <input className={STRUCTURED_INPUT_CLASS} min={min} onChange={(event) => onChange(event.target.value)} type="number" value={value} />
+    <span className="mt-1 block text-[0.65rem] leading-4 text-[var(--duties-tertiary)]">{hint}</span>
+  </label>
+);
 
 export const AdvancedSettingsPage = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
@@ -162,6 +180,38 @@ export const AdvancedSettingsPage = () => {
                             <span className={STRUCTURED_LABEL_CLASS}>并发 task 处理数，留空使用默认值</span>
                             <input className={STRUCTURED_INPUT_CLASS} min="1" onChange={(event) => updateRuntimeConfigForm({ max_workers: event.target.value })} type="number" value={runtimeConfigForm.max_workers} />
                           </label>
+                          <div className="space-y-3 border-t border-[var(--duties-border)] pt-3">
+                            <p className="font-mono text-[0.65rem] font-semibold text-[var(--duties-text)]">上下文压缩</p>
+                            <p className="text-[0.65rem] leading-4 text-[var(--duties-tertiary)]">对话超过阈值后自动摘要历史。改完下一个任务就生效，不用重启。全部留空则使用代码默认值。</p>
+                            <CompactNumberField
+                              hint="超过就在后台静默压缩，当轮回复照常进行。填 0 关闭自动压缩。"
+                              label="软阈值（token）"
+                              min="0"
+                              onChange={(value) => updateRuntimeConfigForm({ compact_threshold_tokens: value })}
+                              value={runtimeConfigForm.compact_threshold_tokens}
+                            />
+                            <CompactNumberField
+                              hint="超过则挂起当轮同步压缩，用户会多等一次调用。填 0 表示取软阈值的 1.25 倍。"
+                              label="硬阈值（token）"
+                              min="0"
+                              onChange={(value) => updateRuntimeConfigForm({ compact_hard_threshold_tokens: value })}
+                              value={runtimeConfigForm.compact_hard_threshold_tokens}
+                            />
+                            <CompactNumberField
+                              hint="压缩时保留多少最新原文，更早的压成摘要。填 0 则改按下面的段数保留。"
+                              label="保留原文（token）"
+                              min="0"
+                              onChange={(value) => updateRuntimeConfigForm({ compact_keep_recent_tokens: value })}
+                              value={runtimeConfigForm.compact_keep_recent_tokens}
+                            />
+                            <CompactNumberField
+                              hint="仅在上一项为 0 时生效：保留最近几个完整任务段。最小 2。"
+                              label="保留段数"
+                              min="2"
+                              onChange={(value) => updateRuntimeConfigForm({ compact_keep_recent: value })}
+                              value={runtimeConfigForm.compact_keep_recent}
+                            />
+                          </div>
                         </div>
                         <details className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
                           <summary className="cursor-pointer font-mono text-[0.65rem] font-semibold text-[var(--duties-tertiary)]">高级 YAML 编辑</summary>

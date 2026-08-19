@@ -40,6 +40,16 @@ function locate(lines: string[], path: string[]): { at: number; indent: number }
   return found;
 }
 
+/** 取出行尾注释（含前导空白），没有则返回空串。
+ *  runtime.yaml 的每个调参键后面都跟着一句说明，改一次值就冲掉等于把文档吃了。
+ *  值里出现引号或 # 时无法判断哪个 # 才是注释起点，宁可不认。 */
+function trailingComment(line: string): string {
+  const colon = line.indexOf(':');
+  if (colon < 0) return '';
+  const matched = /^[^"'#]*?(\s+#.*)$/.exec(line.slice(colon + 1));
+  return matched ? matched[1] : '';
+}
+
 /** key 所辖的块到哪一行为止（不含）。 */
 function blockEnd(lines: string[], at: number, indent: number): number {
   let end = at + 1;
@@ -113,7 +123,7 @@ export function replaceYamlScalar(raw: string, path: string[], value: string): s
   const key = lines[at].trimStart().split(':')[0];
   return [
     ...lines.slice(0, at),
-    `${' '.repeat(indent)}${key}: ${value}`,
+    `${' '.repeat(indent)}${key}: ${value}${trailingComment(lines[at])}`,
     ...lines.slice(at + 1),
   ].join(eol);
 }

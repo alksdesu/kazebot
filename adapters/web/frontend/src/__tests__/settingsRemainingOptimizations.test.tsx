@@ -109,8 +109,8 @@ describe('remaining Settings optimizations', () => {
     const nameInput = await screen.findByLabelText('名称');
     expect(nameInput).toHaveValue('EreunaMain');
     expect(screen.getByLabelText('节点 ID')).toHaveTextContent('ereuna_main');
-    expect(screen.getByLabelText('工具权限模式')).toHaveValue('allowlist');
-    expect(screen.getByLabelText('允许工具，使用英文逗号分隔')).toHaveValue('read_file');
+    // 工具权限收归「节点授权」页独家管，这里只留一句指路。
+    expect(screen.getByText(/工具权限在「工具与权限 → 节点授权」改/)).toBeInTheDocument();
 
     fireEvent.change(nameInput, { target: { value: 'Ereuna' } });
     fireEvent.change(screen.getByLabelText('委派目标，使用英文逗号分隔'), { target: { value: 'smith, scout' } });

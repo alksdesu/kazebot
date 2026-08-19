@@ -30,9 +30,9 @@ tool_access:
   mode: allowlist
   allow:
     - save_memory
-    - list_memory
+    - list_memories
     - read_file
-    - grep_search
+    - search_in_files
 
 skills:
   mode: all

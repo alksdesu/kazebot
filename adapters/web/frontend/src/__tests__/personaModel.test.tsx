@@ -98,7 +98,7 @@ describe('模型候选', () => {
     vi.mocked(getNodes).mockRejectedValue(new Error('500'));
     const { container } = render(<PersonaPage />);
 
-    await waitFor(() => expect(screen.getByText('read_file')).toBeInTheDocument());
+    await waitFor(() => expect(modelBox()).toHaveValue('$ENV{QQ_MAIN_MODEL}'));
 
     expect(container.querySelector('datalist')).toBeNull();
     expect(modelBox()).not.toHaveAttribute('list');

@@ -18,7 +18,7 @@ import { getMcpClientsRaw, getNodeRaw, getNodes, getProviders, getSchedulesRaw, 
 // parser/serializer functions from settingsStructuredConfig. Purpose: the new forms
 // can edit structured fields while writing valid raw YAML back to Supervisor.
 import { mergeModelChoices, modelsFromNodes, modelsFromProviders } from '../../../utils/modelChoices';
-import { parseMcpClients, parseNodeConfig, parseSchedules, serializeMcpClients, serializeNodeConfig, serializeSchedules, type McpClientFormState, type NodeConfigFormState, type NodeConfigType, type ScheduleFormState, type ToolAccessMode } from '../settingsStructuredConfig';
+import { parseMcpClients, parseNodeConfig, parseSchedules, serializeMcpClients, serializeNodeConfig, serializeSchedules, type McpClientFormState, type NodeConfigFormState, type NodeConfigType, type ScheduleFormState } from '../settingsStructuredConfig';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
@@ -56,9 +56,6 @@ const EMPTY_NODE_CONFIG_FORM: NodeConfigFormState = {
   memory_book: '',
   persistent: false,
   delegate_targetsText: '',
-  tool_access_mode: 'all',
-  tool_access_allowText: '',
-  tool_access_denyText: '',
   prompt: '',
 };
 
@@ -303,26 +300,10 @@ export const AgentsSettingsRightPanel = () => {
                   <span className={STRUCTURED_LABEL_CLASS}>委派目标，使用英文逗号分隔</span>
                   <input className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ delegate_targetsText: event.target.value })} value={nodeConfigForm.delegate_targetsText} />
                 </label>
-                <label className="block">
-                  <span className={STRUCTURED_LABEL_CLASS}>工具权限模式</span>
-                  <select className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ tool_access_mode: event.target.value as ToolAccessMode })} value={nodeConfigForm.tool_access_mode}>
-                    <option value="all">all — 除下方拒绝项外全部可用</option>
-                    <option value="allowlist">allowlist — 只有下方允许项可用</option>
-                    <option value="none">none — 不给任何工具</option>
-                  </select>
-                </label>
-                {nodeConfigForm.tool_access_mode === 'allowlist' && (
-                  <label className="block">
-                    <span className={STRUCTURED_LABEL_CLASS}>允许工具，使用英文逗号分隔</span>
-                    <input className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ tool_access_allowText: event.target.value })} value={nodeConfigForm.tool_access_allowText} />
-                  </label>
-                )}
-                {nodeConfigForm.tool_access_mode === 'all' && (
-                  <label className="block">
-                    <span className={STRUCTURED_LABEL_CLASS}>拒绝工具，使用英文逗号分隔；留空表示全部可用</span>
-                    <input className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ tool_access_denyText: event.target.value })} value={nodeConfigForm.tool_access_denyText} />
-                  </label>
-                )}
+                <p className="text-[0.6rem] text-[var(--duties-tertiary)]">
+                  工具权限在「工具与权限 → 节点授权」改。保存这里会重排 YAML 并丢掉注释，
+                  想保留注释请用下面的高级 YAML 编辑。
+                </p>
                 <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50" disabled={nodeYamlSaving} onClick={saveNodeConfig} type="button">保存节点配置</button>
                 {nodeMessage && <p className="text-[var(--duties-tertiary)]">{nodeMessage}</p>}
               </div>

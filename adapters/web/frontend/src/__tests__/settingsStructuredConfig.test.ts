@@ -4,6 +4,8 @@
 // Purpose: future UI edits do not silently corrupt the common config shapes.
 import { describe, expect, it } from 'vitest';
 
+import type { RuntimeConfigFormState } from '../components/settings/settingsStructuredConfig';
+
 import {
   parseMcpClients,
   parseNodeConfig,
@@ -19,9 +21,9 @@ import {
   serializeSkillMarkdown,
 } from '../components/settings/settingsStructuredConfig';
 
-// 后端取值：engine/node.py 的 ToolAccess.mode ∈ {none, all, allowlist}，未知值降级为 none；
-// 过滤语义见 engine/inference/pseudo_tools.py：all 用 deny，allowlist 用 allow。
-describe('node tool_access mode', () => {
+// tool_access 归「工具与权限 → 节点授权」独家管，结构化表单只能原样带过去。
+// 以前它跟着 mode 整份重写 tool_access，从 all 切到 allowlist 会顺手抹掉 deny。
+describe('node config keeps tool_access untouched', () => {
   const ALLOWLIST_NODE = [
     'id: qq.orchestrator',
     'name: QQ 综合入口',
@@ -34,46 +36,32 @@ describe('node tool_access mode', () => {
     '',
   ].join('\n');
 
-  it('keeps allowlist as allowlist instead of falling back to all', () => {
-    expect(parseNodeConfig(ALLOWLIST_NODE).tool_access_mode).toBe('allowlist');
-  });
-
-  it('survives a load-then-save round trip without losing the allow list', () => {
-    const form = parseNodeConfig(ALLOWLIST_NODE);
-
-    const saved = serializeNodeConfig(ALLOWLIST_NODE, form);
+  it('carries the allow list through a load-then-save round trip', () => {
+    const saved = serializeNodeConfig(ALLOWLIST_NODE, parseNodeConfig(ALLOWLIST_NODE));
 
     expect(saved).toContain('mode: allowlist');
     expect(saved).toContain('- web_search');
     expect(saved).toContain('- qq_forward');
-    expect(parseNodeConfig(saved).tool_access_allowText).toBe('web_search, qq_forward');
   });
 
-  it('writes deny only under all, and omits it when empty', () => {
-    const form = parseNodeConfig('tool_access:\n  mode: all\n  deny:\n    - execute_command\n');
-    expect(form.tool_access_mode).toBe('all');
+  it('keeps deny under mode all instead of dropping it', () => {
+    const raw = ['id: bootstrap.executor', 'tool_access:', '  mode: all',
+      '  deny:', '    - execute_command', ''].join('\n');
 
-    expect(serializeNodeConfig('', form)).toContain('- execute_command');
-    expect(serializeNodeConfig('', { ...form, tool_access_denyText: '' })).not.toContain('deny');
-  });
-
-  it('never emits a mode the backend would downgrade to none', () => {
-    for (const written of ['allow', 'deny', 'ALLOWLIST', 'whatever', '']) {
-      const saved = serializeNodeConfig('', {
-        ...parseNodeConfig(`tool_access:\n  mode: ${written}\n`),
-        tool_access_mode: written as never,
-      });
-      expect(saved).toMatch(/mode: (none|all|allowlist)\b/);
-    }
-  });
-
-  it('drops the allow list when the user really switches to all', () => {
-    const form = parseNodeConfig(ALLOWLIST_NODE);
-
-    const saved = serializeNodeConfig(ALLOWLIST_NODE, { ...form, tool_access_mode: 'all' });
+    const saved = serializeNodeConfig(raw, parseNodeConfig(raw));
 
     expect(saved).toContain('mode: all');
-    expect(saved).not.toContain('- web_search');
+    expect(saved).toContain('- execute_command');
+  });
+
+  it('still writes the fields it does own', () => {
+    const saved = serializeNodeConfig(ALLOWLIST_NODE, {
+      ...parseNodeConfig(ALLOWLIST_NODE),
+      name: '改过的名字',
+    });
+
+    expect(saved).toContain('改过的名字');
+    expect(saved).toContain('mode: allowlist');
   });
 });
 
@@ -88,6 +76,17 @@ describe('runtime config key paths', () => {
     '',
   ].join('\n');
 
+  const form = (over: Partial<RuntimeConfigFormState> = {}): RuntimeConfigFormState => ({
+    entry_node_id: '',
+    tool_mode: 'fake-native',
+    max_workers: '',
+    compact_threshold_tokens: '',
+    compact_hard_threshold_tokens: '',
+    compact_keep_recent_tokens: '',
+    compact_keep_recent: '',
+    ...over,
+  });
+
   it('reads the nested keys the engine actually consumes', () => {
     const form = parseRuntimeConfig(RUNTIME);
 
@@ -97,9 +96,9 @@ describe('runtime config key paths', () => {
   });
 
   it('writes back into the nested keys without inventing top-level ones', () => {
-    const saved = serializeRuntimeConfig(RUNTIME, {
+    const saved = serializeRuntimeConfig(RUNTIME, form({
       entry_node_id: 'qq.orchestrator', tool_mode: 'native', max_workers: '8',
-    });
+    }));
 
     expect(saved).toContain('  entry_node_id: qq.orchestrator');
     expect(saved).toContain('  tool_mode: native');
@@ -112,12 +111,8 @@ describe('runtime config key paths', () => {
   it('refuses to serialize onto an empty base', () => {
     // 空基底会让整份 runtime.yaml 被这三个键替换掉：163 行的文件剩三行，
     // providers / routing / meta / tools / skills / memory / maintenance 全没了。
-    expect(() => serializeRuntimeConfig('', {
-      entry_node_id: '', tool_mode: 'fake-native', max_workers: '',
-    })).toThrow();
-    expect(() => serializeRuntimeConfig('    ', {
-      entry_node_id: '', tool_mode: 'fake-native', max_workers: '',
-    })).toThrow();
+    expect(() => serializeRuntimeConfig('', form())).toThrow();
+    expect(() => serializeRuntimeConfig('    ', form())).toThrow();
   });
 
   it('keeps every key the form does not own', () => {
@@ -135,9 +130,9 @@ describe('runtime config key paths', () => {
       '',
     ].join('\n');
 
-    const saved = serializeRuntimeConfig(full, {
+    const saved = serializeRuntimeConfig(full, form({
       entry_node_id: 'qq.orchestrator', tool_mode: 'native', max_workers: '8',
-    });
+    }));
 
     expect(saved).toContain('version: 1');
     expect(saved).toContain('max_steps: 64');
@@ -150,20 +145,103 @@ describe('runtime config key paths', () => {
   });
 
   it('leaves max_workers unset rather than writing 0', () => {
-    const saved = serializeRuntimeConfig(RUNTIME, {
-      entry_node_id: 'x', tool_mode: 'json', max_workers: '',
-    });
+    const saved = serializeRuntimeConfig(RUNTIME, form({ entry_node_id: 'x', tool_mode: 'json' }));
 
     expect(saved).not.toContain('max_workers');
   });
 
   it('creates the parent block when runtime.yaml lacks it', () => {
-    const saved = serializeRuntimeConfig('version: 1\n', {
+    const saved = serializeRuntimeConfig('version: 1\n', form({
       entry_node_id: 'qq.orchestrator', tool_mode: 'json', max_workers: '2',
-    });
+    }));
 
     expect(parseRuntimeConfig(saved).entry_node_id).toBe('qq.orchestrator');
     expect(parseRuntimeConfig(saved).max_workers).toBe('2');
+  });
+
+  // engine.compact 决定何时压缩历史，之前只能手写 YAML。
+  describe('compact thresholds', () => {
+    const COMMENTED = [
+      '# Clonoth runtime tuning config',
+      'version: 1',
+      '',
+      'engine:',
+      '  max_steps: 64            # 单轮最多几步',
+      '',
+      '  compact:',
+      '    threshold_tokens: 256000   # 软阈值：超过此值在后台静默压缩',
+      '    hard_threshold_tokens: 0   # 0 = 取软阈值的 1.25 倍',
+      '    keep_recent_tokens: 30000  # 压缩时保留的原文 token 量',
+      '    keep_recent: 6             # keep_recent_tokens 为 0 时生效',
+      '',
+      'shell:',
+      '  entry_node_id: bootstrap.shell_orchestrator',
+      '',
+    ].join('\n');
+
+    it('reads every compact key', () => {
+      const parsed = parseRuntimeConfig(COMMENTED);
+
+      expect(parsed.compact_threshold_tokens).toBe('256000');
+      expect(parsed.compact_hard_threshold_tokens).toBe('0');
+      expect(parsed.compact_keep_recent_tokens).toBe('30000');
+      expect(parsed.compact_keep_recent).toBe('6');
+    });
+
+    it('writes new values back into the nested keys', () => {
+      const saved = serializeRuntimeConfig(COMMENTED, form({
+        entry_node_id: 'bootstrap.shell_orchestrator',
+        compact_threshold_tokens: '120000',
+        compact_hard_threshold_tokens: '150000',
+        compact_keep_recent_tokens: '20000',
+        compact_keep_recent: '4',
+      }));
+
+      const parsed = parseRuntimeConfig(saved);
+      expect(parsed.compact_threshold_tokens).toBe('120000');
+      expect(parsed.compact_hard_threshold_tokens).toBe('150000');
+      expect(parsed.compact_keep_recent_tokens).toBe('20000');
+      expect(parsed.compact_keep_recent).toBe('4');
+    });
+
+    // load/dump 一轮会把整份文件的注释抹掉，等于每存一次就吃掉一次文档。
+    it('keeps both standalone and trailing comments', () => {
+      const saved = serializeRuntimeConfig(COMMENTED, form({
+        entry_node_id: 'bootstrap.shell_orchestrator',
+        compact_threshold_tokens: '120000',
+      }));
+
+      expect(saved).toContain('# Clonoth runtime tuning config');
+      expect(saved).toContain('max_steps: 64            # 单轮最多几步');
+      expect(saved).toContain('threshold_tokens: 120000   # 软阈值：超过此值在后台静默压缩');
+    });
+
+    it('keeps 0 rather than treating it as unset', () => {
+      const saved = serializeRuntimeConfig(COMMENTED, form({
+        entry_node_id: 'bootstrap.shell_orchestrator',
+        compact_threshold_tokens: '0',
+      }));
+
+      expect(parseRuntimeConfig(saved).compact_threshold_tokens).toBe('0');
+    });
+
+    it('builds the compact block when runtime.yaml has none', () => {
+      const saved = serializeRuntimeConfig('engine:\n  max_steps: 64\n', form({
+        compact_threshold_tokens: '90000',
+      }));
+
+      expect(parseRuntimeConfig(saved).compact_threshold_tokens).toBe('90000');
+      expect(saved).toContain('max_steps: 64');
+    });
+
+    it('drops the key when the field is cleared', () => {
+      const saved = serializeRuntimeConfig(COMMENTED, form({
+        entry_node_id: 'bootstrap.shell_orchestrator',
+      }));
+
+      expect(saved).not.toContain('threshold_tokens');
+      expect(saved).toContain('# Clonoth runtime tuning config');
+    });
   });
 });
 

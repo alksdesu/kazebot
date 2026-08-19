@@ -1,9 +1,8 @@
-// 人格与能力。这一页有两套保存路径：人设和节点配置各自就地存盘，
+// 人格。这一页有两套保存路径：人设和模型各自就地存盘，
 // 下半页的开关走 qq.yaml，由顶部那个「应用」统一提交。
 import { useEffect, useId, useState } from 'react';
 
 import {
-  getAllToolNames,
   getNodeFileRaw,
   getNodeRaw,
   getNodes,
@@ -18,9 +17,7 @@ import { BoolOption, NumberField, SubOption } from './fields';
 import { WordList } from './WordList';
 import {
   NodeYamlShapeError,
-  readYamlList,
   readYamlScalar,
-  replaceYamlList,
   upsertYamlScalar,
 } from './nodeYaml';
 
@@ -96,36 +93,19 @@ const Persona = () => {
   );
 };
 
-const Capabilities = () => {
+const ModelChoice = () => {
   const token = useSettingsStore((state) => state.adminToken);
   const modelListId = useId();
   const [raw, setRaw] = useState('');
-  const [tools, setTools] = useState<string[]>([]);
-  const [targets, setTargets] = useState<string[]>([]);
-  const [allTools, setAllTools] = useState<string[]>([]);
-  const [allNodes, setAllNodes] = useState<string[]>([]);
-  // 配过的名字只增不减。插件注册的工具（stocktool_* 之类）不在 all-tool-names 里，
-  // 取消勾选后要是从候选表里消失，就再也勾不回来了。
-  const [known, setKnown] = useState<{ tools: string[]; targets: string[] }>({ tools: [], targets: [] });
   const [model, setModel] = useState('');
-  const [mode, setMode] = useState('');
   const [providerModels, setProviderModels] = useState<string[]>([]);
   const [nodeModels, setNodeModels] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('正在读取…');
 
   const adopt = (body: string) => {
-    const allow = readYamlList(body, ['tool_access', 'allow']);
-    const delegates = readYamlList(body, ['delegate_targets']);
     setRaw(body);
-    setTools(allow);
-    setTargets(delegates);
     setModel(readYamlScalar(body, ['model']));
-    setMode(readYamlScalar(body, ['tool_access', 'mode']));
-    setKnown((prev) => ({
-      tools: [...new Set([...prev.tools, ...allow])],
-      targets: [...new Set([...prev.targets, ...delegates])],
-    }));
   };
 
   useEffect(() => {
@@ -137,17 +117,10 @@ const Capabilities = () => {
       } catch (error) {
         setNote(say(error));
       }
-      // 候选表拉不到不影响改已有的项，所以各自吞掉失败。
-      void getAllToolNames(token).then(setAllTools).catch(() => undefined);
+      // 候选表拉不到不影响改模型，所以各自吞掉失败。
       void getNodes(token)
-        .then((nodes) => {
-          setAllNodes(
-            nodes.filter((n: any) => n.id !== NODE_ID && !String(n.id).startsWith('system.'))
-              .map((n: any) => String(n.id)),
-          );
-          // 系统节点也算进来：它们写的多半是 $ENV{...}，正好把这种写法摆到候选里。
-          setNodeModels(modelsFromNodes(nodes, NODE_ID));
-        })
+        // 系统节点也算进来：它们写的多半是 $ENV{...}，正好把这种写法摆到候选里。
+        .then((nodes) => setNodeModels(modelsFromNodes(nodes, NODE_ID)))
         .catch(() => undefined);
       void getProviders(token)
         .then((data) => setProviderModels(modelsFromProviders(data)))
@@ -155,23 +128,13 @@ const Capabilities = () => {
     })();
   }, [token]);
 
-  const current = raw
-    ? {
-      tools: readYamlList(raw, ['tool_access', 'allow']),
-      targets: readYamlList(raw, ['delegate_targets']),
-      model: readYamlScalar(raw, ['model']),
-    }
-    : { tools: [], targets: [], model: '' };
-  const dirty = JSON.stringify([tools, targets, model])
-    !== JSON.stringify([current.tools, current.targets, current.model]);
+  const dirty = model !== (raw ? readYamlScalar(raw, ['model']) : '');
 
   const save = async () => {
     if (!token) return;
     setBusy(true);
     try {
-      let next = replaceYamlList(raw, ['tool_access', 'allow'], tools);
-      next = replaceYamlList(next, ['delegate_targets'], targets);
-      next = upsertYamlScalar(next, 'model', model.trim(), 'type');
+      const next = upsertYamlScalar(raw, 'model', model.trim(), 'type');
       await updateNodeRaw(token, NODE_ID, next);
       adopt(next);
       setNote('已保存。节点文件每次任务都重新读，立刻生效。');
@@ -183,49 +146,10 @@ const Capabilities = () => {
     setBusy(false);
   };
 
-  const toggle = (list: string[], set: (next: string[]) => void, name: string) => {
-    set(list.includes(name) ? list.filter((item) => item !== name) : [...list, name]);
-  };
-
-  // 候选表拉不到时至少要能看到已配的项，否则界面会显得像被清空了。
-  const toolChoices = [...new Set([...known.tools, ...tools, ...allTools])].sort();
-  const nodeChoices = [...new Set([...known.targets, ...targets, ...allNodes])].sort();
   const modelChoices = mergeModelChoices(providerModels, nodeModels);
 
   return (
     <>
-      {/* allow 只在 allowlist 模式下被读，别的模式勾了也不生效，界面上看不出来。 */}
-      {mode && mode !== 'allowlist' && (
-        <p className="qc-mismatch">
-          这个节点的 tool_access.mode 是 {mode}，下面的勾选不生效
-          {mode === 'all'
-            ? '：all 模式读的是 deny 列表，所有工具都放行。'
-            : '：none 模式一个工具都不给。'}
-          改模式请到设置的「工具与权限」页。
-        </p>
-      )}
-      <div className="qc-checks">
-        {toolChoices.length === 0 && <span className="qc-chip-empty">没有可选工具</span>}
-        {toolChoices.map((name) => (
-          <label className="qc-check" key={name}>
-            <input checked={tools.includes(name)} onChange={() => toggle(tools, setTools, name)} type="checkbox" />
-            <code>{name}</code>
-          </label>
-        ))}
-      </div>
-
-      <p className="qc-words-label">可以委派给这些节点</p>
-      <div className="qc-checks">
-        {nodeChoices.length === 0 && <span className="qc-chip-empty">没有其他节点</span>}
-        {nodeChoices.map((id) => (
-          <label className="qc-check" key={id}>
-            <input checked={targets.includes(id)} onChange={() => toggle(targets, setTargets, id)} type="checkbox" />
-            <code>{id}</code>
-          </label>
-        ))}
-      </div>
-
-      <p className="qc-words-label">模型</p>
       <input
         className="qc-inp qc-inp-wide"
         list={modelChoices.length ? modelListId : undefined}
@@ -255,10 +179,10 @@ export const PersonaPage = () => (
       </div>
     </Block>
 
-    <Block hint="综合入口节点能调哪些工具、能把活派给谁" title="能力">
+    <Block hint="综合入口节点用哪个模型。能调哪些工具在设置的「工具与权限 → 节点授权」改" title="模型">
       <div className="qc-panel">
         <p className="qc-words-label">可以调用这些工具</p>
-        <Capabilities />
+        <ModelChoice />
       </div>
     </Block>
 
@@ -299,7 +223,7 @@ export const PersonaPage = () => (
       </Grid>
     </Block>
 
-    <Block hint="除了说话之外还能做什么" title="扩展能力">
+    <Block hint="除了说话之外还能做什么" title="群内互动">
       <Grid>
         <BoolOption
           configKey="enable_reactions"
@@ -322,7 +246,7 @@ export const PersonaPage = () => (
       </Grid>
     </Block>
 
-    <Block hint="群友发来的东西里，哪些交给模型看" title="输入能力">
+    <Block hint="群友发来的东西里，哪些交给模型看" title="能接收什么">
       <Grid>
         <BoolOption configKey="enable_image_input" desc="把图片交给视觉节点识别。" fallback label="看图片">
           <NumberField configKey="max_images_per_turn" label="每轮最多" unit="张" />

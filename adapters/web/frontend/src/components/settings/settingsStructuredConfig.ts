@@ -4,6 +4,8 @@
 // signature so that consuming components need zero changes.
 import yaml from 'js-yaml';
 
+import { upsertYamlNested } from '../../console/nodeYaml';
+
 // ==================== Type Definitions ====================
 
 export type ScalarValue = string | number | boolean | null;
@@ -73,15 +75,16 @@ export interface NodeConfigFormState {
   persistent: boolean;
   prompt: string;
   delegate_targetsText: string;
-  tool_access_mode: ToolAccessMode;
-  tool_access_allowText: string;
-  tool_access_denyText: string;
 }
 
 export interface RuntimeConfigFormState {
   entry_node_id: string;
   tool_mode: EngineToolMode;
   max_workers: string;
+  compact_threshold_tokens: string;
+  compact_hard_threshold_tokens: string;
+  compact_keep_recent_tokens: string;
+  compact_keep_recent: string;
 }
 
 // ==================== Core Helpers ====================
@@ -114,10 +117,6 @@ function str(value: any, fallback = ''): string {
   return String(value);
 }
 
-function normalizeToolAccessMode(value: string, fallback: ToolAccessMode = 'all'): ToolAccessMode {
-  return value === 'allowlist' || value === 'none' || value === 'all' ? value : fallback;
-}
-
 function normalizeEngineToolMode(value: string, fallback: EngineToolMode = 'fake-native'): EngineToolMode {
   const normalized = value.trim().toLowerCase().replace(/_/g, '-');
   return normalized === 'native' || normalized === 'json' || normalized === 'fake-native' ? normalized : fallback;
@@ -131,17 +130,6 @@ function nested(doc: Record<string, any>, path: readonly string[]): any {
     cur = cur[key];
   }
   return cur;
-}
-
-/** 写嵌套路径，按需建中间层；value 为 undefined 时删键而不是写空值。 */
-function setNested(doc: Record<string, any>, path: readonly string[], value: any): void {
-  const leaf = path[path.length - 1];
-  let cur: any = doc;
-  for (const key of path.slice(0, -1)) {
-    if (!cur[key] || typeof cur[key] !== 'object' || Array.isArray(cur[key])) cur[key] = {};
-    cur = cur[key];
-  }
-  if (value === undefined) delete cur[leaf]; else cur[leaf] = value;
 }
 
 function normalizeNodeConfigType(value: string): NodeConfigType {
@@ -179,8 +167,6 @@ function parseLooseKV(text: string): Record<string, string> {
 
 export function parseNodeConfig(raw: string, fallbackId = ''): NodeConfigFormState {
   const doc = safeLoad(raw);
-  const ta = (doc.tool_access && typeof doc.tool_access === 'object' && !Array.isArray(doc.tool_access))
-    ? doc.tool_access as Record<string, any> : {};
   return {
     id: str(doc.id, fallbackId),
     name: str(doc.name),
@@ -192,9 +178,6 @@ export function parseNodeConfig(raw: string, fallbackId = ''): NodeConfigFormSta
     persistent: doc.persistent === true,
     prompt: str(doc.prompt),
     delegate_targetsText: Array.isArray(doc.delegate_targets) ? doc.delegate_targets.map(String).join(', ') : '',
-    tool_access_mode: normalizeToolAccessMode(str(ta.mode, 'all')),
-    tool_access_allowText: Array.isArray(ta.allow) ? ta.allow.map(String).join(', ') : '',
-    tool_access_denyText: Array.isArray(ta.deny) ? ta.deny.map(String).join(', ') : '',
   };
 }
 
@@ -210,16 +193,8 @@ export function serializeNodeConfig(raw: string, form: NodeConfigFormState): str
   doc.persistent = form.persistent;
   if (form.prompt.trim()) doc.prompt = form.prompt; else delete doc.prompt;
   doc.delegate_targets = commaTextToItems(form.delegate_targetsText);
-  const mode = normalizeToolAccessMode(form.tool_access_mode);
-  const ta: Record<string, any> = { mode };
-  // allowlist 读 allow、all 读 deny —— 与 engine/inference/pseudo_tools.py 的过滤一致。
-  // 写错一边就等于把节点的工具白名单整个丢掉。
-  if (mode === 'allowlist') ta.allow = commaTextToItems(form.tool_access_allowText);
-  if (mode === 'all') {
-    const deny = commaTextToItems(form.tool_access_denyText);
-    if (deny.length) ta.deny = deny;
-  }
-  doc.tool_access = ta;
+  // tool_access 归「工具与权限 → 节点授权」独家管；这里整份 dump 会把 mode 对应
+  // 不上的那半（allowlist 下的 deny）连同注释一起洗掉。
   return safeDump(doc);
 }
 
@@ -230,29 +205,51 @@ export function serializeNodeConfig(raw: string, form: NodeConfigFormState): str
 const RUNTIME_ENTRY_NODE_PATH = ['shell', 'entry_node_id'] as const;
 const RUNTIME_TOOL_MODE_PATH = ['engine', 'tool_mode'] as const;
 const RUNTIME_MAX_WORKERS_PATH = ['engine', 'max_workers'] as const;
+const RUNTIME_COMPACT_THRESHOLD_PATH = ['engine', 'compact', 'threshold_tokens'] as const;
+const RUNTIME_COMPACT_HARD_THRESHOLD_PATH = ['engine', 'compact', 'hard_threshold_tokens'] as const;
+const RUNTIME_COMPACT_KEEP_TOKENS_PATH = ['engine', 'compact', 'keep_recent_tokens'] as const;
+const RUNTIME_COMPACT_KEEP_SEGMENTS_PATH = ['engine', 'compact', 'keep_recent'] as const;
+
+/** 数字键读成输入框文本。缺键读空串，表示「不覆盖代码默认值」。 */
+function numText(doc: Record<string, any>, path: readonly string[]): string {
+  const value = nested(doc, path);
+  return value === undefined || value === null ? '' : String(value);
+}
+
+/** 整数输入框回写成 yaml 标量。空串与非法值都返回 ''，由调用方当作删键。 */
+function intText(value: string, min = 0): string {
+  const parsed = Number.parseInt(value.trim(), 10);
+  return Number.isFinite(parsed) && parsed >= min ? String(parsed) : '';
+}
 
 export function parseRuntimeConfig(raw: string): RuntimeConfigFormState {
   const doc = safeLoad(raw);
-  const maxWorkers = nested(doc, RUNTIME_MAX_WORKERS_PATH);
   return {
     entry_node_id: str(nested(doc, RUNTIME_ENTRY_NODE_PATH)),
     tool_mode: normalizeEngineToolMode(str(nested(doc, RUNTIME_TOOL_MODE_PATH), 'fake-native')),
-    max_workers: maxWorkers === undefined || maxWorkers === null ? '' : String(maxWorkers),
+    max_workers: numText(doc, RUNTIME_MAX_WORKERS_PATH),
+    compact_threshold_tokens: numText(doc, RUNTIME_COMPACT_THRESHOLD_PATH),
+    compact_hard_threshold_tokens: numText(doc, RUNTIME_COMPACT_HARD_THRESHOLD_PATH),
+    compact_keep_recent_tokens: numText(doc, RUNTIME_COMPACT_KEEP_TOKENS_PATH),
+    compact_keep_recent: numText(doc, RUNTIME_COMPACT_KEEP_SEGMENTS_PATH),
   };
 }
 
 export function serializeRuntimeConfig(raw: string, form: RuntimeConfigFormState): string {
-  // 空基底会让整份 runtime.yaml 被这三个键的输出替换掉，而 safeLoad 对空串是静默返回 {}。
-  // 表单永远只覆盖它认识的那三项，其余内容必须来自读进来的原文。
+  // 空基底会让整份 runtime.yaml 被这几个键的输出替换掉，而 safeLoad 对空串是静默返回 {}。
   if (!raw.trim()) throw new Error('尚未读入 runtime.yaml，拒绝用空内容覆盖');
-  const doc = safeLoad(raw);
-  const entryNode = form.entry_node_id.trim();
-  setNested(doc, RUNTIME_ENTRY_NODE_PATH, entryNode || undefined);
-  setNested(doc, RUNTIME_TOOL_MODE_PATH, normalizeEngineToolMode(form.tool_mode));
+  // 逐键定点改写而不是 load/dump 一轮：runtime.yaml 里一百多行说明注释全靠原文留着。
+  let out = raw;
+  out = upsertYamlNested(out, [...RUNTIME_ENTRY_NODE_PATH], form.entry_node_id.trim());
+  out = upsertYamlNested(out, [...RUNTIME_TOOL_MODE_PATH], normalizeEngineToolMode(form.tool_mode));
   // 留空表示不覆盖默认值；写 0 会让 engine 一个 worker 都不起。
-  const workers = Number.parseInt(form.max_workers.trim(), 10);
-  setNested(doc, RUNTIME_MAX_WORKERS_PATH, Number.isFinite(workers) && workers > 0 ? workers : undefined);
-  return safeDump(doc);
+  out = upsertYamlNested(out, [...RUNTIME_MAX_WORKERS_PATH], intText(form.max_workers, 1));
+  // 0 各有含义：软阈值 0 关掉自动压缩，硬阈值 0 取软阈值的 1.25 倍，保留量 0 改按段数算。
+  out = upsertYamlNested(out, [...RUNTIME_COMPACT_THRESHOLD_PATH], intText(form.compact_threshold_tokens));
+  out = upsertYamlNested(out, [...RUNTIME_COMPACT_HARD_THRESHOLD_PATH], intText(form.compact_hard_threshold_tokens));
+  out = upsertYamlNested(out, [...RUNTIME_COMPACT_KEEP_TOKENS_PATH], intText(form.compact_keep_recent_tokens));
+  out = upsertYamlNested(out, [...RUNTIME_COMPACT_KEEP_SEGMENTS_PATH], intText(form.compact_keep_recent, 2));
+  return out;
 }
 
 // ==================== Providers ====================

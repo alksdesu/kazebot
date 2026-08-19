@@ -3,10 +3,12 @@ import { useEffect, useMemo, useState } from 'react';
 
 import {
   getAllToolNames,
+  getEffectiveTools,
   getNodeRaw,
   getNodes,
-  updateNodeRaw,
   type AdminNode,
+  type EffectiveTool,
+  updateNodeRaw,
 } from '../../../api/supervisorClient';
 import {
   NodeYamlShapeError,
@@ -50,6 +52,24 @@ const readAccess = (node: AdminNode): Access => {
 const sameList = (a: readonly string[], b: readonly string[]): boolean =>
   a.length === b.length && a.every((item, index) => item === b[index]);
 
+const EffectiveNotes = ({ rows }: { rows: EffectiveTool[] }) => {
+  const dead = rows.filter((row) => !row.registered).map((row) => row.name);
+  const gated = rows.filter((row) => row.gated).map((row) => row.name);
+  const loose = rows.filter((row) => row.guarded === false).length;
+  if (!dead.length && !gated.length && !loose) return null;
+  return (
+    <div className="mb-2 space-y-0.5 text-[0.6rem] text-[var(--duties-tertiary)]">
+      {!!dead.length && (
+        <p className="text-red-600">这些名字不存在，注入时会被静默忽略：{dead.join('、')}</p>
+      )}
+      {!!gated.length && (
+        <p className="text-red-600">配了但用不了，渠道没设 model：{gated.join('、')}</p>
+      )}
+      {!!loose && <p>其中 {loose} 个是外部脚本，没声明 guard，「服务端策略」那一页管不到它们。</p>}
+    </div>
+  );
+};
+
 const NodeRow = ({
   node, tools, onSaved,
 }: { node: AdminNode; tools: string[]; onSaved: () => void }) => {
@@ -62,12 +82,26 @@ const NodeRow = ({
   const [filter, setFilter] = useState('');
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
+  const [effective, setEffective] = useState<Record<string, EffectiveTool>>({});
 
   useEffect(() => {
     setMode(saved.mode);
     setAllow(saved.allow);
     setDeny(saved.deny);
   }, [saved]);
+
+  // 勾了不等于能用，展开时才去问，避免为折叠着的节点白跑一趟。
+  useEffect(() => {
+    if (!open || !adminToken) return;
+    let alive = true;
+    void getEffectiveTools(adminToken, node.id)
+      .then((data) => {
+        if (!alive) return;
+        setEffective(Object.fromEntries(data.tools.map((item) => [item.name, item])));
+      })
+      .catch(() => undefined);
+    return () => { alive = false; };
+  }, [open, adminToken, node.id, saved]);
 
   const picked = mode === 'all' ? deny : allow;
   const setPicked = mode === 'all' ? setDeny : setAllow;
@@ -86,6 +120,13 @@ const NodeRow = ({
 
   const save = async () => {
     if (!adminToken) return;
+    // 白名单里写错的名字注入时是静默忽略的，配了半天不生效也没有任何提示。
+    // 不硬拦：插件没加载时注册表会短一截，拦死就没法保存了。
+    const dead = mode === 'allowlist' ? allow.filter((name) => !tools.includes(name)) : [];
+    if (dead.length
+      && !window.confirm(`这些名字不在注册表里，保存后会被静默忽略：\n${dead.join('、')}\n\n仍要保存？`)) {
+      return;
+    }
     setBusy(true);
     setMessage('');
     try {
@@ -159,6 +200,7 @@ const NodeRow = ({
                 <Button onClick={() => setPicked(candidates)}>全选</Button>
                 <Button onClick={() => setPicked([])}>清空</Button>
               </div>
+              <EffectiveNotes rows={Object.values(effective)} />
               <div className="grid max-h-64 grid-cols-1 gap-1 overflow-y-auto sm:grid-cols-2">
                 {candidates.map((name) => {
                   const risk = inferToolRisk(name);
@@ -179,6 +221,19 @@ const NodeRow = ({
                       {missing && (
                         <span className="font-mono text-[0.55rem] text-[var(--duties-tertiary)]" title="当前注册表里没有这个工具">
                           未注册
+                        </span>
+                      )}
+                      {!!effective[name]?.gated && (
+                        <span className="font-mono text-[0.55rem] text-red-600" title={effective[name].gated}>
+                          不可用
+                        </span>
+                      )}
+                      {effective[name]?.guarded === false && (
+                        <span
+                          className="font-mono text-[0.55rem] text-[var(--duties-tertiary)]"
+                          title="外部脚本没声明 guard，服务端策略那一页对它不生效"
+                        >
+                          策略外
                         </span>
                       )}
                       <span className={`border px-1 py-0.5 font-mono text-[0.5rem] ${riskClassName(risk)}`}>

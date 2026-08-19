@@ -34,6 +34,9 @@ const INPUT_CLASS =
   'min-w-0 flex-1 border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-[0.7rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]';
 const GHOST_BUTTON_CLASS =
   'border border-[var(--duties-border)] px-2 py-1 font-mono text-[0.65rem] text-[var(--duties-secondary)] transition-colors hover:border-[var(--duties-text)] hover:text-[var(--duties-text)] disabled:opacity-40';
+// 理由以前只藏在 hover 的 title 里，改了档位没人想得起来同步，留下一堆自相矛盾的规则。
+const REASON_CLASS =
+  'mt-1 w-full bg-transparent font-mono text-[0.6rem] text-[var(--duties-tertiary)] outline-none focus:text-[var(--duties-text)]';
 
 const DecisionSelect = ({
   value, onChange, label,
@@ -78,31 +81,42 @@ const RuleRows = ({
       <div className="space-y-1">
         {section.rules.map((rule, index) => (
           <div
-            className="flex items-center gap-2 border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1.5"
+            className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1.5"
             key={sectionKey + ':' + index + ':' + rule.pattern}
           >
-            <code
-              className="min-w-0 flex-1 truncate font-mono text-[0.7rem] text-[var(--duties-text)]"
-              title={rule.reason || ''}
-            >
-              {rule.pattern}
-            </code>
-            <DecisionSelect
-              label={rule.pattern + ' 的档位'}
-              onChange={(decision) => onChange({
+            <div className="flex items-center gap-2">
+              <code className="min-w-0 flex-1 truncate font-mono text-[0.7rem] text-[var(--duties-text)]">
+                {rule.pattern}
+              </code>
+              <DecisionSelect
+                label={rule.pattern + ' 的档位'}
+                onChange={(decision) => onChange({
+                  ...section,
+                  rules: section.rules.map((item, i) => (i === index ? { ...item, decision } : item)),
+                })}
+                value={rule.decision}
+              />
+              <button
+                aria-label={'删除规则 ' + rule.pattern}
+                className="px-1.5 py-1 font-mono text-[0.65rem] text-[var(--duties-tertiary)] transition-colors hover:text-red-600"
+                onClick={() => onChange({ ...section, rules: section.rules.filter((_, i) => i !== index) })}
+                type="button"
+              >
+                删除
+              </button>
+            </div>
+            <input
+              aria-label={rule.pattern + ' 的理由'}
+              className={REASON_CLASS}
+              onChange={(event) => onChange({
                 ...section,
-                rules: section.rules.map((item, i) => (i === index ? { ...item, decision } : item)),
+                rules: section.rules.map((item, i) => (
+                  i === index ? { ...item, reason: event.target.value } : item
+                )),
               })}
-              value={rule.decision}
+              placeholder="理由：会显示在审批卡片上，改了档位记得一并改"
+              value={rule.reason || ''}
             />
-            <button
-              aria-label={'删除规则 ' + rule.pattern}
-              className="px-1.5 py-1 font-mono text-[0.65rem] text-[var(--duties-tertiary)] transition-colors hover:text-red-600"
-              onClick={() => onChange({ ...section, rules: section.rules.filter((_, i) => i !== index) })}
-              type="button"
-            >
-              删除
-            </button>
           </div>
         ))}
       </div>

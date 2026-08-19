@@ -1206,6 +1206,30 @@ export async function reloadTools(token: string): Promise<any> {
   return resp.json();
 }
 
+export interface EffectiveTool {
+  name: string;
+  registered: boolean;
+  external: boolean;
+  /** 内置工具走不走服务端策略要看源码，后端不猜，返回 null。 */
+  guarded: boolean | null;
+  /** 非空 = 这个工具会在构建工具表时被摘掉，理由就是这段文字。 */
+  gated: string;
+}
+
+export interface EffectiveTools {
+  node_id: string;
+  mode: string;
+  listed_as: 'allow' | 'deny';
+  tools: EffectiveTool[];
+}
+
+export async function getEffectiveTools(token: string, nodeId: string): Promise<EffectiveTools> {
+  const resp = await apiFetch(`/admin/config/nodes/${encodeURIComponent(nodeId)}/effective-tools`, {
+    headers: authHeaders(token),
+  });
+  return resp.json();
+}
+
 export async function getAllToolNames(token: string): Promise<string[]> {
   // [2026-06-01] Why: approval preferences must list the backend's complete tool
   // set instead of a stale frontend constant. How: call the protected Supervisor
