@@ -28,7 +28,6 @@ PLUGIN_META = {
 }
 
 _SCHEDULE_TYPE = "data_cleanup"
-_SCRIPT = Path(__file__).resolve().parent.parent / "data_cleanup.py"
 
 
 class DataCleanupScheduleHandler:
@@ -78,7 +77,10 @@ class DataCleanupScheduleHandler:
             return
 
         dry_run = get_bool(runtime_cfg, "maintenance.data_cleanup.dry_run", True)
-        args = [sys.executable, str(_SCRIPT)]
+        # 必须 -m：直接给脚本路径的话 sys.path[0] 是 engine/ 而不是工作区根，
+        # 清理脚本里 `from engine.memory_hit_cache import ...` 会 ImportError，
+        # 记忆老化于是退化成只看 yaml 时间戳，把老而常被召回的热记忆判成过期。
+        args = [sys.executable, "-m", "engine.data_cleanup"]
         if dry_run:
             args.append("--dry-run")
         try:
