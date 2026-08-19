@@ -1,33 +1,56 @@
 // 控制台外壳的基础件。样式全在 console.css，这里只管结构与语义。
 import type { ReactNode } from 'react';
 
-import { CONSOLE_DOMAINS, DOMAIN_LABELS, type ConsoleDomain } from './consoleStore';
+import { Icon } from '../components/common';
+import { CONSOLE_DOMAINS, DOMAIN_ICONS, DOMAIN_LABELS, type ConsoleDomain } from './consoleStore';
 
 interface RailProps {
   domain: ConsoleDomain;
   onSelect: (domain: ConsoleDomain) => void;
   ready: ReadonlySet<ConsoleDomain>;
+  onBack: () => void;
   onExit: () => void;
 }
 
-export const Rail = ({ domain, onSelect, ready, onExit }: RailProps) => (
+export const Rail = ({ domain, onSelect, ready, onBack, onExit }: RailProps) => (
   <nav aria-label="控制台" className="qc-rail">
-    {CONSOLE_DOMAINS.map((item) => (
-      <button
-        aria-current={item === domain ? 'page' : undefined}
-        className="qc-rail-item"
-        disabled={!ready.has(item)}
-        key={item}
-        onClick={() => onSelect(item)}
-        title={ready.has(item) ? undefined : '这一页还没做'}
-        type="button"
-      >
-        {DOMAIN_LABELS[item]}
+    <div className="qc-rail-head">
+      <button className="qc-rail-back" onClick={onBack} type="button">
+        <Icon name="arrow_back" size={15} />
+        <span>返回设置</span>
       </button>
-    ))}
-    <button className="qc-rail-item qc-rail-exit" onClick={onExit} title="回到对话界面" type="button">
-      对话
-    </button>
+      <div className="qc-rail-brand">
+        <Icon name="dashboard" size={18} />
+        <span>
+          <strong>QQ 控制台</strong>
+          <small>bot 配置</small>
+        </span>
+      </div>
+    </div>
+
+    <div className="qc-rail-group">
+      {CONSOLE_DOMAINS.map((item) => (
+        <button
+          aria-current={item === domain ? 'page' : undefined}
+          className="qc-rail-item"
+          disabled={!ready.has(item)}
+          key={item}
+          onClick={() => onSelect(item)}
+          title={ready.has(item) ? undefined : '这一页还没做'}
+          type="button"
+        >
+          <Icon className="qc-rail-icon" name={DOMAIN_ICONS[item]} size={16} />
+          <span>{DOMAIN_LABELS[item]}</span>
+        </button>
+      ))}
+    </div>
+
+    <div className="qc-rail-foot">
+      <button className="qc-rail-item" onClick={onExit} type="button">
+        <Icon className="qc-rail-icon" name="keyboard_return" size={16} />
+        <span>回到对话</span>
+      </button>
+    </div>
   </nav>
 );
 

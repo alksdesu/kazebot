@@ -32,7 +32,9 @@
   /* 渠道字段前那一列标签的宽度。提示行靠它缩进，两处必须同源。 */
   --qc-chan-label: 3em;
 
-  --qc-rail: 56px;
+  /* 与 AppLayout 的设置侧栏同宽，两个侧栏切换时内容区不会横向跳一下。 */
+  --qc-rail: 15rem;
+  --qc-rail-item-min: 38px;
   --qc-bar: 44px;
 
   /* 动效时长走变量：reduced-motion 下只改这一个值，不用 !important 去压 transition。 */
@@ -59,31 +61,106 @@
     position: sticky;
     top: 0;
     flex-direction: column;
-    align-items: center;
-    gap: 2px;
     height: 100vh;
-    padding-top: 10px;
     border-right: 1px solid var(--qc-rule);
     background: var(--qc-paper);
   }
 
-  .qc-rail-item {
+  .qc-rail-head {
+    flex: none;
+    padding: 12px;
+    border-bottom: 1px solid var(--qc-rule);
+  }
+
+  .qc-rail-back {
     display: flex;
-    justify-content: center;
-    width: 40px;
-    padding: 11px 0;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    margin-bottom: 12px;
+    padding: 6px 8px;
     border: 0;
     border-radius: var(--qc-r-sm);
     background: none;
     color: var(--qc-mute);
-    font-weight: 500;
-    font-size: 11px;
+    font-size: 12px;
     font-family: var(--qc-mono);
-    letter-spacing: 0.22em;
-    /* 竖排：窄轨里横排中文只能塞两个字，竖排能放完整域名且不用缩字号。 */
-    writing-mode: vertical-rl;
-    text-orientation: upright;
     cursor: pointer;
+    transition: background var(--qc-motion), color var(--qc-motion);
+  }
+
+  .qc-rail-back:hover {
+    background: var(--qc-shelf);
+    color: var(--qc-ink);
+  }
+
+  .qc-rail-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding-left: 8px;
+    color: var(--qc-ink);
+  }
+
+  .qc-rail-brand span {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .qc-rail-brand strong {
+    font-weight: 600;
+    font-size: 15px;
+    letter-spacing: -0.02em;
+  }
+
+  .qc-rail-brand small {
+    color: var(--qc-mute);
+    font-size: 10px;
+  }
+
+  .qc-rail-group {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 2px;
+    /* 视口矮到装不下九项时让这一列自己滚，别把底部的出口挤出屏幕。 */
+    min-height: 0;
+    padding: 8px;
+    overflow-y: auto;
+  }
+
+  .qc-rail-foot {
+    flex: none;
+    padding: 8px;
+    border-top: 1px solid var(--qc-rule);
+  }
+
+  .qc-rail-item {
+    display: flex;
+    position: relative;
+    flex: none;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    min-height: var(--qc-rail-item-min);
+    padding: 0 12px;
+    border: 0;
+    border-radius: var(--qc-r-md);
+    background: none;
+    color: var(--qc-mute);
+    font-weight: 500;
+    font-size: 12px;
+    font-family: var(--qc-mono);
+    letter-spacing: 0.04em;
+    text-align: left;
+    cursor: pointer;
+    transition: background var(--qc-motion), color var(--qc-motion);
+  }
+
+  /* 图标恒定比文字淡一档，不随选中变色 —— 设置侧栏也是这个处理。 */
+  .qc-rail-icon {
+    flex: none;
+    color: var(--qc-mute);
   }
 
   .qc-rail-item:hover:not(:disabled) {
@@ -97,13 +174,20 @@
   }
 
   .qc-rail-item[aria-current='page'] {
-    background: var(--qc-ink);
-    color: var(--qc-paper);
+    background: var(--qc-shelf);
+    color: var(--qc-ink);
+    font-weight: 600;
   }
 
-  .qc-rail-exit {
-    margin-top: auto;
-    margin-bottom: 10px;
+  /* 选中态和 hover 都是 shelf 底，靠这根竖条区分，不再多引一个底色。 */
+  .qc-rail-item[aria-current='page']::before {
+    position: absolute;
+    left: 0;
+    border-radius: 0 var(--qc-r-sm) var(--qc-r-sm) 0;
+    background: var(--qc-ink);
+    width: 2px;
+    height: 18px;
+    content: '';
   }
 
   /* ── 生效状态条 ─────────────────────────────────── */
@@ -1331,26 +1415,62 @@
     .qc-rail {
       position: static;
       flex-direction: row;
-      gap: 0;
+      align-items: center;
       width: 100%;
       height: auto;
-      padding: 0 8px;
-      overflow-x: auto;
       border-right: 0;
       border-bottom: 1px solid var(--qc-rule);
     }
 
-    .qc-rail-item {
-      align-items: center;
-      width: auto;
-      min-height: 44px;
-      padding: 0 14px;
-      letter-spacing: 0.1em;
-      writing-mode: horizontal-tb;
+    /* 横过来之后品牌区只是占地方，但返回入口不能跟着一起没，挪到尾部去。 */
+    .qc-rail-head {
+      display: flex;
+      order: 1;
+      padding: 0 8px;
+      border-bottom: 0;
+      border-left: 1px solid var(--qc-rule);
     }
 
-    .qc-rail-exit {
-      margin: 0;
+    .qc-rail-brand {
+      display: none;
+    }
+
+    .qc-rail-back {
+      width: auto;
+      min-height: 44px;
+      margin-bottom: 0;
+      padding: 0 12px;
+      white-space: nowrap;
+    }
+
+    .qc-rail-group {
+      flex-direction: row;
+      gap: 0;
+      /* 横排后靠自身滚动；不给 min-width 就撑破外壳，滚动条永远出不来。 */
+      min-width: 0;
+      padding: 0 8px;
+      overflow-x: auto;
+      overflow-y: visible;
+    }
+
+    .qc-rail-foot {
+      display: flex;
+      order: 2;
+      flex-direction: row;
+      padding: 0 8px;
+      border-top: 0;
+      border-left: 1px solid var(--qc-rule);
+    }
+
+    .qc-rail-item {
+      width: auto;
+      min-height: 44px;
+      padding: 0 12px;
+      white-space: nowrap;
+    }
+
+    .qc-rail-item[aria-current='page']::before {
+      display: none;
     }
 
     .qc-bar {

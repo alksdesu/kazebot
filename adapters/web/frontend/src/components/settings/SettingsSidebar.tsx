@@ -5,7 +5,7 @@
 // entries and do not require Sidebar or App changes.
 import { useState } from 'react';
 
-import { CONSOLE_DOMAINS, DOMAIN_LABELS, useConsoleStore, type ConsoleDomain } from '../../console/consoleStore';
+import { CONSOLE_DOMAINS, DOMAIN_ICONS, DOMAIN_LABELS, useConsoleStore, type ConsoleDomain } from '../../console/consoleStore';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
 import { Icon } from '../common';
@@ -96,11 +96,14 @@ export const SettingsSidebar = () => {
           {consoleOpen && CONSOLE_DOMAINS.map(domain => (
             <button
               aria-label={`QQ 控制台 ${DOMAIN_LABELS[domain]}`}
-              className="mb-1 flex w-full items-center py-2 pl-9 pr-3 text-left text-xs text-[var(--duties-secondary)] transition-colors hover:bg-[var(--duties-accent)] hover:text-[var(--duties-text)]"
+              className="mb-1 flex w-full items-center gap-2 py-2 pl-9 pr-3 text-left text-xs text-[var(--duties-secondary)] transition-colors hover:bg-[var(--duties-accent)] hover:text-[var(--duties-text)]"
               key={domain}
               onClick={() => enterConsole(domain)}
               type="button"
             >
+              <span className="w-4 text-center text-[var(--duties-tertiary)]">
+                <Icon name={DOMAIN_ICONS[domain]} size={16} />
+              </span>
               <span className="font-mono">{DOMAIN_LABELS[domain]}</span>
             </button>
           ))}

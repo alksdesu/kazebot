@@ -51,6 +51,9 @@ const PAGE_NOTES: Partial<Record<ConsoleDomain, string>> = {
 export const ConsoleApp = () => {
   const adminToken = useSettingsStore((state) => state.adminToken);
   const closeSettings = useViewStore((state) => state.closeSettings);
+  const openSettings = useViewStore((state) => state.openSettings);
+  // 进控制台不会清掉 activeSettingsTab，带着它回去就落在离开时那一页，而不是弹回 general。
+  const activeSettingsTab = useViewStore((state) => state.activeSettingsTab);
   const {
     domain, live, loading, saving, error, notice, draft,
     setDomain, refresh, apply, discard,
@@ -67,7 +70,13 @@ export const ConsoleApp = () => {
   return (
     <div data-surface="console">
       <div className="qc-shell">
-        <Rail domain={domain} onExit={closeSettings} onSelect={setDomain} ready={READY} />
+        <Rail
+          domain={domain}
+          onBack={() => openSettings(activeSettingsTab)}
+          onExit={closeSettings}
+          onSelect={setDomain}
+          ready={READY}
+        />
         <main>
           <StatusBar
             live={live}

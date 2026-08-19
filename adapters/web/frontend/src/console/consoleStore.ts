@@ -29,6 +29,19 @@ export const DOMAIN_LABELS: Record<ConsoleDomain, string> = {
   memory: '记忆',
 };
 
+/** Icon 的 ICON_MAP 键名。控制台侧栏与设置侧栏的控制台展开项共用，两处图标不会走散。 */
+export const DOMAIN_ICONS: Record<ConsoleDomain, string> = {
+  account: 'smart_toy',
+  channels: 'inbox',
+  timing: 'timer',
+  permissions: 'verified_user',
+  persona: 'draft',
+  providers: 'cable',
+  models: 'tune',
+  runtime: 'settings_power',
+  memory: 'menu_book',
+};
+
 /** 草稿按 live_config 的键名存（如 signal_at），不是 yaml 的点分路径。
  *
  * /qq/state 的 values 就是按键名给的，paths 负责键名 → 点分路径。写 yaml 时才转换，
