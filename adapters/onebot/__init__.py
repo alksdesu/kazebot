@@ -8493,6 +8493,7 @@ def _echo_key_for_message(message: Any, text: str) -> str:
     segments = list(message) if message is not None else []
     kinds = set()
     image_id = ""
+    face_ids: List[str] = []
     for segment in segments:
         seg_type, data = _segment_type_and_data(segment)
         if seg_type == "text":
@@ -8506,13 +8507,21 @@ def _echo_key_for_message(message: Any, text: str) -> str:
                 data.get("emoji_id") or data.get("file") or _segment_image_url(data) or ""
             ).strip()
             continue
+        if seg_type == "face":
+            # 系统表情有稳定 id，跟文字一样能精确比对，复读它也不指向任何人。群里复读
+            # 的句子十句有九句夹着表情，把它算成不可跟的类型，这个功能就等于没开。
+            kinds.add("text")
+            face_ids.append(str(data.get("id") or "").strip())
+            continue
         # 语音、视频、卡片、@ 之类一律不跟。
         kinds.add("other")
 
     if kinds == {"image"} and image_id:
         return f"img:{image_id}"
     if kinds == {"text"}:
-        return f"txt:{text.strip()}"
+        # id 单独进指纹：正文里的「[QQ表情:捂脸]」是查表得来的显示名，两个 id 撞名就会
+        # 把不同的表情比成同一条。
+        return f"txt:{text.strip()}" + (f"|face:{','.join(face_ids)}" if face_ids else "")
     return ""
 
 
@@ -8524,11 +8533,12 @@ async def _maybe_echo_group_message(bot: Bot, event: GroupMessageEvent, text: st
     try:
         message = event.get_message()
     except Exception:
-        message = None
+        return
     key = _echo_key_for_message(message, text)
     if not key:
         return
-    if key.startswith("txt:") and not is_echoable_text(key[4:], max_length=live.echo_max_length):
+    # 校验正文本身而不是 key[4:]：指纹尾部还挂着表情 id，会把长度算多。
+    if key.startswith("txt:") and not is_echoable_text(text, max_length=live.echo_max_length):
         return
 
     now = time.time()
@@ -8546,12 +8556,11 @@ async def _maybe_echo_group_message(bot: Bot, event: GroupMessageEvent, text: st
     if not hit:
         return
 
-    if hit.startswith("img:"):
-        payload = MessageSegment.image(hit[4:])
-    else:
-        payload = MessageSegment.text(hit[4:])
+    # 命中的必然是刚进来这条：detect_echo 要求尾部 N 条指纹全同，而这条就在尾部。
+    # 所以文本直接原样回发 —— 拿指纹反解会把「[QQ表情:捂脸]」当字面量发出去。
+    outgoing = Message(MessageSegment.image(hit[4:])) if hit.startswith("img:") else message
     try:
-        await bot.send_group_msg(group_id=group_id, message=Message(payload))
+        await bot.send_group_msg(group_id=group_id, message=outgoing)
     except Exception:
         # 跟读失败无所谓，不值得惊动用户，更不该把异常抛回 matcher 链。
         logger.debug("echo send failed for group %s", group_id, exc_info=True)

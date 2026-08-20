@@ -448,7 +448,7 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         note="几条相同消息才跟，且必须来自不同的人",
     ),
     LiveKey(
-        "echo_max_length", "extensions.echo.max_text_length", int_in(min_value=1, max_value=200), 30,
+        "echo_max_length", "extensions.echo.max_text_length", int_in(min_value=1, max_value=500), 30,
         env=("ONEBOT_ECHO_MAX_TEXT_LENGTH",),
         note="超过这个长度不跟：长文本复读是刷屏，不是接龙",
     ),
