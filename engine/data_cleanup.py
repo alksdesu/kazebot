@@ -7,8 +7,10 @@ artifacts and child-session state, conservative QQ cache cleanup, and stale
 non-constant memory entry cleanup.
 """
 
+import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -74,6 +76,13 @@ TEMP_GLOBS = [
 # Child Session 隔离（Phase C）：过期 child session 的 JSONL 文件清理
 # child_*.jsonl 超过此时间未修改则删除。与 runtime.yaml 中 child_session.ttl_hours 对齐。
 CHILD_SESSION_MAX_AGE = 24 * 3600     # 24 h（与默认 TTL 一致）
+# dream 的整理任务会话。留 7 天够回溯几轮整理做了什么，再久没有价值。
+TASK_CONVERSATION_MAX_AGE = float(
+    os.getenv("CLONOTH_TASK_CONVERSATION_MAX_AGE_SECONDS", str(7 * 24 * 3600)))
+# 与 supervisor.conversation_labels._TASK_KEY_RE 同一个形态，两边改一起改。
+# conv_<摘要> 是会话记忆整理，user_<别名> 是人物档案整理。
+_TASK_CONVERSATION_KEY_RE = re.compile(
+    r"^(?:conv_[0-9a-f]{24}|user_[A-Za-z][A-Za-z0-9_]{0,63})$")
 
 # Phase D：node_contexts 目录清理。child session 已替代 snapshot 机制，
 # 保留 48h 宽裕期后清理旧文件（比 child session TTL 长一倍，确保兼容期充分）。
@@ -574,6 +583,52 @@ def purge_expired_child_sessions():
     logging.info("[child_sessions] deleted %d expired files", deleted)
 
 
+# ── 内部任务会话 JSONL cleanup ───────────────
+def purge_expired_task_conversations():
+    """清理内部任务会话的对话记录。
+
+    dream 拿 memory namespace 当 conversation_key 建整理任务（save_memory 靠它推
+    目录），supervisor 于是给它开一条 session，每跑一轮就往同一个 jsonl 追一段。
+    文件名是 session_id，看不出类型，只能回 sessions.json 按会话键形态反查。
+    """
+    if TASK_CONVERSATION_MAX_AGE <= 0:
+        logging.info("[task_conversations] cleanup disabled")
+        return
+    conv_dir = DATA_DIR / "conversations"
+    sessions_path = DATA_DIR / "sessions.json"
+    if not conv_dir.exists() or not sessions_path.exists():
+        return
+    try:
+        raw = json.loads(sessions_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logging.info("[task_conversations] sessions.json unreadable: %s", exc)
+        return
+
+    rows = raw.values() if isinstance(raw, dict) else raw
+    session_ids = {
+        str(row.get("session_id") or "").strip()
+        for row in rows
+        if isinstance(row, dict)
+        and _TASK_CONVERSATION_KEY_RE.match(str(row.get("conversation_key") or "").strip())
+    }
+    cutoff = time.time() - TASK_CONVERSATION_MAX_AGE
+    deleted = 0
+    for session_id in sorted(session_ids):
+        if not session_id:
+            continue
+        path = conv_dir / f"{session_id}.jsonl"
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                _unlink(path)
+                deleted += 1
+        except Exception:
+            pass
+    logging.info(
+        "[task_conversations] scanned=%d deleted=%d max_age_hours=%.1f",
+        len(session_ids), deleted, TASK_CONVERSATION_MAX_AGE / 3600.0,
+    )
+
+
 # ── transcripts cleanup ────────────────
 def purge_expired_transcripts():
     """清理 data/transcripts/ 中长期未更新的 TaskRecord 转写文件。
@@ -641,6 +696,7 @@ def main(argv: list[str] | None = None):
                          max_age=NODE_CONTEXTS_MAX_AGE, label="node_contexts",
                          recursive=True)),
         (purge_expired_child_sessions, {}),
+        (purge_expired_task_conversations, {}),
         (purge_temp_globs, {}),
         (purge_dir, dict(directory=DATA_DIR / "temp",
                          max_age=TEMP_MAX_AGE, label="temp", recursive=True)),

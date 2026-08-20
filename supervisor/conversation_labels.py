@@ -11,8 +11,13 @@ import re
 from pathlib import Path
 from typing import Any
 
-_NAMESPACE_RE = re.compile(r"^conv_[0-9a-f]{24}$")
+# 两种 memory namespace 形态：会话记忆按摘要建目录，人物档案按别名
+# （别名规则见 engine.memory_subjects.SUBJECT_RE）。
+_CONV_NAMESPACE = r"conv_[0-9a-f]{24}"
+_SUBJECT_NAMESPACE = r"user_[A-Za-z][A-Za-z0-9_]{0,63}"
+_NAMESPACE_RE = re.compile(rf"^{_CONV_NAMESPACE}$")
 _STABLE_KEY_RE = re.compile(r"qq_(?:group|private):[0-9a-f]{24}")
+_TASK_KEY_RE = re.compile(rf"^(?:{_CONV_NAMESPACE}|{_SUBJECT_NAMESPACE})$")
 _ROUTE_STATE = "onebot_plugin_state.json"
 _ANON_MAP = "onebot_anon_map.json"
 _SESSIONS = "sessions.json"
@@ -36,6 +41,16 @@ def memory_namespace(conversation_key: str) -> str:
     if _NAMESPACE_RE.match(raw):
         return raw
     return "conv_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def is_internal_task_key(conversation_key: str) -> bool:
+    """这条会话键是内部任务借 memory namespace 建的，不是真人对话。
+
+    dream 拿 namespace 当 conversation_key 建整理任务（save_memory 靠它推目录），
+    supervisor 于是给它开一条 session。会话整理用 conv_<摘要>，人物档案整理用
+    user_<别名>；真人会话键永远带 qq_group: / qq_private: 这类前缀，两种都长不成。
+    """
+    return bool(_TASK_KEY_RE.match(str(conversation_key or "").strip()))
 
 
 def _label_for_stable(

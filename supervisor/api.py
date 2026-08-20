@@ -1295,7 +1295,9 @@ def create_app(
         """控制台用的会话清单：每条带归属、消息数和体积。"""
         verify_admin_token(request)
         st: SupervisorState = app.state.state
-        from .conversation_labels import describe_namespaces, load_sessions, memory_namespace
+        from .conversation_labels import (
+            describe_namespaces, is_internal_task_key, load_sessions, memory_namespace,
+        )
 
         labels = describe_namespaces(st.workspace_root)
         sessions = load_sessions(st.workspace_root)
@@ -1305,6 +1307,10 @@ def create_app(
             session_id = path.stem
             info = sessions.get(session_id) or {}
             conv_key = str(info.get("conversation_key") or "")
+            # dream 的整理任务借 namespace 当会话键，会在这里冒出一条与真实群同名的
+            # 假会话 —— 它不是对话，点删除也只是清掉任务记录，下轮又写回来。
+            if is_internal_task_key(conv_key):
+                continue
             try:
                 stat = path.stat()
             except OSError:
