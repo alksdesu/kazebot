@@ -105,3 +105,36 @@ class TestRepairFallback:
         raw = '<<<TOOL_CALL>>>\n{"name": "some_tool", "arguments": {"weird": "x"'
 
         assert JsonToolFormatter._repair_tool_call_json(raw) is None
+
+
+class TestTrailingNoise:
+    """模型爱在 JSON 尾巴上挂非 JSON 的东西，不能让它跟着正文发出去。"""
+
+    def _text_of(self, raw: str) -> str:
+        calls = JsonToolFormatter().parse_tool_calls(
+            ProviderResponse(ok=True, text=f"<<<TOOL_CALL>>>\n{raw}\n<<<END_TOOL_CALL>>>"))
+        assert len(calls) == 1
+        return str(calls[0].arguments.get("text") or "")
+
+    def test_a_trailing_tools_assignment_is_dropped(self) -> None:
+        # 生产原文：{"text": "...", tools=[]}} —— 等号不是 JSON，strict=False 也救不回来。
+        text = self._text_of('{"name": "finish", "arguments": {"text": "已整理并发送，请查收。" tools=[]}}')
+
+        assert text == "已整理并发送，请查收。"
+        assert "tools=" not in text
+
+    def test_bare_quotes_inside_the_body_still_survive(self) -> None:
+        # 退回「最后一个引号」不能把正文里的引号也切掉。
+        text = self._text_of('{"name": "finish", "arguments": {"text": "他说"你好"就走了"}}')
+
+        assert text == '他说"你好"就走了'
+
+    def test_a_properly_closed_string_is_untouched(self) -> None:
+        text = self._text_of('{"name": "finish", "arguments": {"text": "普通回复"}}')
+
+        assert text == "普通回复"
+
+    def test_noise_after_a_quoted_body_with_quotes(self) -> None:
+        raw = '{"name": "finish", "arguments": {"text": "引用「他说"好"」完毕" tools=[]}}'
+
+        assert self._text_of(raw) == '引用「他说"好"」完毕'

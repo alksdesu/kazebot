@@ -691,6 +691,8 @@ class JsonToolFormatter(ToolFormatter):
             return None
         start = match.end()
         chars: list[str] = []
+        # 最后一个引号处的快照。一路扫到底都没等到正经闭合时用它收尾。
+        at_last_quote: list[str] | None = None
         escaped = False
         i = start
         while i < len(raw):
@@ -709,8 +711,14 @@ class JsonToolFormatter(ToolFormatter):
                 tail = raw[i + 1:].lstrip()
                 if not tail or tail.startswith((",", "}", "]")):
                     break
+                at_last_quote = list(chars)
             chars.append(ch)
             i += 1
+        else:
+            # 没等到闭合。模型爱在 JSON 尾巴上挂 `tools=[]}}` 这类非 JSON 噪音，
+            # 全吞进去就会原样发给用户，退回最后一个引号处更接近它想说的那句话。
+            if at_last_quote is not None:
+                chars = at_last_quote
         value = "".join(chars).strip()
         try:
             return json.loads('"' + value.replace('"', '\\"') + '"')
