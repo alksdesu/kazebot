@@ -11,6 +11,7 @@ Purpose: provide forensic evidence for intermittent provider errors without
 modifying any core code path.
 """
 
+import inspect
 import json
 import logging
 from datetime import datetime, timezone
@@ -32,6 +33,21 @@ PLUGIN_META = {
     "name": "error_snapshot",
     "description": "Dump LLM request payload to disk on provider error",
 }
+
+
+def _build_payload_for_snapshot(provider: Any, llm_msgs: Any) -> dict[str, Any]:
+    """Call ``_build_payload`` with whatever required arguments its signature declares.
+
+    Why: OpenAIProvider takes ``tools`` as a required positional argument, so a
+    bare ``_build_payload(msgs)`` raises and every snapshot from that provider
+    records the TypeError instead of the request body. Only ``messages`` is read
+    back, so an empty tool list is enough.
+    """
+    parameters = inspect.signature(provider._build_payload).parameters
+    extra: dict[str, Any] = {}
+    if "tools" in parameters:
+        extra["tools"] = []
+    return provider._build_payload(llm_msgs, **extra)
 
 
 class ErrorSnapshotHandler:
@@ -72,7 +88,7 @@ class ErrorSnapshotHandler:
                     ls = ctx.extra.get("loop_state")
                     formatter = getattr(ls, "formatter", None) if ls else None
                     llm_msgs = _build_messages_for_provider(messages, formatter, provider)
-                    payload = provider._build_payload(llm_msgs)
+                    payload = _build_payload_for_snapshot(provider, llm_msgs)
                     converted_payload = payload.get("messages")
             except Exception as conv_err:
                 converted_payload = {"conversion_error": str(conv_err)}

@@ -45,6 +45,24 @@ from engine.signals import get_bus
 from engine.signals.bridge import install_event_bridge
 
 
+_OPENAI_COMPATIBLE_PROVIDERS = frozenset({"openai", "openai-responses"})
+
+
+def _shares_endpoint_with_main(provider_name: str, active_provider: str) -> bool:
+    """本轮 provider 和主渠道是不是同一套请求格式，决定主渠道地址能不能套用。
+
+    两个 OpenAI 变体算同一族：同一个兼容网关同时提供 chat/completions 和 responses。
+    """
+    active = str(active_provider or "").strip().lower()
+    if provider_name in _OPENAI_COMPATIBLE_PROVIDERS and active in _OPENAI_COMPATIBLE_PROVIDERS:
+        return True
+    return provider_name == active
+
+
+def _provider_endpoint_from_env(provider_name: str) -> str:
+    return os.environ.get(f"{provider_name.upper().replace('-', '_')}_BASE_URL", "").strip()
+
+
 def _provider_init_kwargs(
     rp: Any,
     *,
@@ -59,19 +77,21 @@ def _provider_init_kwargs(
     # [provider-registry 2026-05-03] 统一构造 provider 参数。
     # 原因：runner 不应再按 provider 类型实例化不同类；做法：先组装一个超集 kwargs，
     # 再由 _instantiate_provider 按构造签名过滤；目的：保留旧 provider 行为，同时支持新插件。
-    if provider_name in {"openai", "openai-responses"}:
+    # 主渠道地址只在格式对得上时才套用。差一层就会拿着别家的 url 发本家的格式，
+    # 报出来的 404 跟地址毫无关系，排查时根本想不到是渠道串了。
+    borrowed_base_url = base_url if _shares_endpoint_with_main(provider_name, active_provider) else ""
+    if provider_name in _OPENAI_COMPATIBLE_PROVIDERS:
         resolved_api_key = rp.api_key or api_key
-        resolved_base_url = rp.base_url or base_url or None
+        resolved_base_url = rp.base_url or borrowed_base_url or None
     else:
         env_prefix = provider_name.upper().replace("-", "_")
         resolved_api_key = rp.api_key or os.environ.get(f"{env_prefix}_API_KEY", "") or api_key
-        # 本轮 provider 就是全局活跃渠道时，config.yaml 里那一块的 base_url 才是它的。
-        # 少了这层兜底，控制台填的地址会被丢掉，provider 静默回落自己的官方域名；
-        # 换成别家 provider 的节点则不能套用主渠道地址，会把请求发错门。
+        # 控制台填的地址走 config.yaml 那一块；少了这层兜底会被丢掉，
+        # provider 静默回落自己的官方域名。
         resolved_base_url = (
             rp.base_url
-            or os.environ.get(f"{env_prefix}_BASE_URL", "")
-            or (base_url if provider_name == str(active_provider or "").strip().lower() else "")
+            or _provider_endpoint_from_env(provider_name)
+            or borrowed_base_url
             or None
         )
     return {
@@ -117,6 +137,26 @@ def _instantiate_provider(provider_cls: type, init_kwargs: dict[str, Any]) -> An
     return provider_cls(**{key: value for key, value in init_kwargs.items() if key in allowed})
 
 
+def _rooted_provider_name(rp: Any, *, active_provider: str) -> str:
+    """节点声明的 provider 没有配套地址时改用主渠道的那个。
+
+    只写 provider、地址却交给 $ENV{} 供给的节点，一旦那几个环境变量为空就剩下一份
+    无根声明。照着它发请求等于拿主渠道的地址发另一家的格式，换来一个跟地址毫无
+    关系的 404。
+    """
+    requested = (rp.provider_type or "openai").strip().lower()
+    active = str(active_provider or "").strip().lower()
+    if not active or _shares_endpoint_with_main(requested, active):
+        return requested
+    if rp.base_url or _provider_endpoint_from_env(requested):
+        return requested
+    print(
+        f"[engine] provider {requested!r} 没有配套 base_url，改用主渠道 {active!r} 发送",
+        flush=True,
+    )
+    return active
+
+
 def _create_provider_from_registry(
     rp: Any,
     *,
@@ -127,7 +167,7 @@ def _create_provider_from_registry(
     active_provider: str = "",
 ) -> Any:
     """Resolve and instantiate the configured provider through ProviderRegistry."""
-    requested_name = (rp.provider_type or "openai").strip().lower()
+    requested_name = _rooted_provider_name(rp, active_provider=active_provider)
     provider_cls = provider_registry.get(requested_name)
     provider_name = requested_name
     if provider_cls is None:

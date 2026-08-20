@@ -1,7 +1,7 @@
-"""非 openai 渠道的 base_url 兜底。
+"""节点渠道的 base_url 归属。
 
 控制台把地址填进 config.yaml 的渠道块，engine 每个任务都会重新拉这份配置；
-少了这层兜底，地址会被丢掉、provider 静默回落自己的官方域名，报错还跟地址无关。
+主渠道的地址只在请求格式对得上时才能借，借错了得到的是一个跟地址无关的 404。
 """
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from engine.model import ResolvedProvider
-from engine.runner import _provider_init_kwargs
+from engine.runner import _provider_init_kwargs, _rooted_provider_name
 
 RELAY = "https://relay.example.com/g/tok"
 MAIN_KEY = "sk-main"
@@ -59,10 +59,24 @@ def test_env_overrides_config_but_config_is_the_last_resort(monkeypatch):
     assert kwargs(rp, active="gemini")["base_url"] == RELAY
 
 
-def test_openai_channel_behaviour_is_untouched():
+def test_openai_node_borrows_the_address_of_an_openai_main_channel():
     rp = ResolvedProvider(model="m", provider_type="openai")
 
-    assert kwargs(rp, active="gemini")["base_url"] == RELAY
+    assert kwargs(rp, active="openai")["base_url"] == RELAY
+
+
+def test_the_two_openai_variants_count_as_one_family():
+    """同一个兼容网关同时提供 chat/completions 和 responses，地址是通用的。"""
+    rp = ResolvedProvider(model="m", provider_type="openai-responses")
+
+    assert kwargs(rp, active="openai")["base_url"] == RELAY
+
+
+def test_an_openai_node_does_not_borrow_a_native_gemini_address():
+    """拿 Gemini 反代地址发 /chat/completions 只会 404，报错还跟地址毫无关系。"""
+    rp = ResolvedProvider(model="m", provider_type="openai")
+
+    assert kwargs(rp, active="gemini")["base_url"] is None
 
 
 @pytest.mark.parametrize("active", ["GEMINI", " gemini ", "Gemini"])
@@ -71,3 +85,36 @@ def test_active_provider_comparison_ignores_case_and_padding(monkeypatch, active
     rp = ResolvedProvider(model="m", provider_type="gemini")
 
     assert kwargs(rp, active=active)["base_url"] == RELAY
+
+
+class TestRootedProviderName:
+    """节点只写 provider、地址交给空掉的 $ENV{} 时，那份声明没有根。"""
+
+    def test_a_declaration_without_an_address_follows_the_main_channel(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        rp = ResolvedProvider(model="m", provider_type="openai")
+
+        assert _rooted_provider_name(rp, active_provider="gemini") == "gemini"
+
+    def test_its_own_base_url_keeps_the_declaration(self):
+        rp = ResolvedProvider(model="m", provider_type="openai", base_url="https://gw.example.com/v1")
+
+        assert _rooted_provider_name(rp, active_provider="gemini") == "openai"
+
+    def test_an_env_supplied_address_keeps_it_too(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://from-env.example.com")
+        rp = ResolvedProvider(model="m", provider_type="anthropic")
+
+        assert _rooted_provider_name(rp, active_provider="gemini") == "anthropic"
+
+    def test_matching_the_main_channel_needs_no_address(self, monkeypatch):
+        monkeypatch.delenv("GEMINI_BASE_URL", raising=False)
+        rp = ResolvedProvider(model="m", provider_type="gemini")
+
+        assert _rooted_provider_name(rp, active_provider="gemini") == "gemini"
+
+    def test_an_unknown_main_channel_leaves_the_declaration_alone(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        rp = ResolvedProvider(model="m", provider_type="openai")
+
+        assert _rooted_provider_name(rp, active_provider="") == "openai"
