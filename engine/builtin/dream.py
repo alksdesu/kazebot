@@ -29,6 +29,8 @@ _MAX_DREAM_SESSIONS = 5
 _DREAM_TRANSCRIPT_MAX_CHARS = 12000
 _DREAM_PENDING_TIMEOUT_MINUTES = 15
 _TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "missing"}
+# 手动触发的回执要能读完，dream 的摘要可以很长。
+_NOTIFY_SUMMARY_LIMIT = 800
 # [AutoC 2026-06-01] Why: the final Dream node no longer has shell
 # access to update scheduler state itself. How: centralize the lock note
 # beside the polling constants. Purpose: keep the generated .dream-lock
@@ -116,29 +118,43 @@ class DreamHandler:
         # minute has passed, and pending now covers both extractor tasks and the
         # final Dream task. How: poll the pipeline before cron checks. Purpose:
         # finish a Dream run and update .dream-lock as soon as the task is ready.
+        # 手动触发跳过 enabled / cron / 同分钟去重，但仍受在飞那轮的互斥约束。
+        # 不碰 _last_dream_fired：那是 cron 的去重游标，手动跑一次不该顶掉当天的自动整理。
+        manual = bool(ctx.get("manual"))
+        outcome = ctx.get("outcome")
+        if not isinstance(outcome, dict):
+            outcome = {}
+
         # 在飞的那轮先轮到终态再谈 enabled/cron：关掉 dream 不该把一个已经派出去的
         # 整理任务留在 pending 里。真正会造成冻结的是 organizer 没有轮询期限，
         # 见 _organizer_expired。
         if self._dream_pending is not None:
+            outcome["status"] = "busy"
             self._poll_and_create_dream(ctx=ctx, workspace_root=workspace_root, now=now)
             return
 
-        runtime_cfg = load_runtime_config(workspace_root)
-        if not get_bool(runtime_cfg, "memory.dream.enabled", False):
-            return
+        if not manual:
+            runtime_cfg = load_runtime_config(workspace_root)
+            if not get_bool(runtime_cfg, "memory.dream.enabled", False):
+                return
 
-        cron_expr = get_str(runtime_cfg, "memory.dream.cron", "0 3 * * *").strip()
-        if not cron_expr:
-            return
+            cron_expr = get_str(runtime_cfg, "memory.dream.cron", "0 3 * * *").strip()
+            if not cron_expr:
+                return
 
-        if self._last_dream_fired == now_key:
-            return
+            if self._last_dream_fired == now_key:
+                return
 
-        if not cron_match(cron_expr, now):
-            return
+            if not cron_match(cron_expr, now):
+                return
 
-        self._last_dream_fired = now_key
-        self._start_dream_run(ctx=ctx, workspace_root=workspace_root, now=now, now_key=now_key)
+            self._last_dream_fired = now_key
+
+        self._start_dream_run(
+            ctx=ctx, workspace_root=workspace_root, now=now, now_key=now_key,
+            notify_session_id=str(ctx.get("notify_session_id") or ""),
+        )
+        outcome["status"] = "started" if self._dream_pending is not None else "unavailable"
 
     def _start_dream_run(
         self,
@@ -147,6 +163,7 @@ class DreamHandler:
         workspace_root: Path,
         now: datetime,
         now_key: str,
+        notify_session_id: str = "",
     ) -> None:
         """Create extractor tasks and compute keyword topology for one Dream run."""
         create_task = ctx.get("create_task")
@@ -219,6 +236,7 @@ class DreamHandler:
             "now_key": now_key,
             "extractors": extractors,
             "session_ids": session_ids,
+            "notify_session_id": notify_session_id,
         }
         log.info(
             "[scheduler] dream preprocessing started sessions=%d extractors=%d namespaces=%d time=%s",
@@ -227,6 +245,37 @@ class DreamHandler:
             len({item["namespace"] for item in extractors}),
             now.strftime("%Y-%m-%d %H:%M UTC"),
         )
+
+    def _notify_trigger(self, ctx: dict[str, Any], pending: dict[str, Any], text: str) -> None:
+        """把整理结果回报给手动触发的人。cron 那轮没有触发者，直接跳过。
+
+        每条退出路径都要调：手动发了指令却什么都等不到，比整理失败本身更难查。
+        """
+        session_id = str((pending or {}).get("notify_session_id") or "").strip()
+        body = str(text or "").strip()
+        if not session_id or not body:
+            return
+        post = ctx.get("post_outbound")
+        if not callable(post):
+            return
+        try:
+            post(session_id=session_id, text=body)
+        except Exception:
+            log.warning("[scheduler] dream notify failed session=%s", session_id, exc_info=True)
+
+    @staticmethod
+    def _dream_summary(snapshots: dict[str, Any], task_ids: list[str]) -> str:
+        """把各整理任务的 finish 正文拼成一份回执。"""
+        parts: list[str] = []
+        for tid in task_ids:
+            snapshot = snapshots.get(tid) if isinstance(snapshots, dict) else None
+            text = str((snapshot or {}).get("result_text") or "").strip()
+            if text:
+                parts.append(text)
+        summary = "\n".join(parts)
+        if len(summary) > _NOTIFY_SUMMARY_LIMIT:
+            summary = summary[:_NOTIFY_SUMMARY_LIMIT] + "…（后略）"
+        return summary
 
     def _poll_and_create_dream(
         self,
@@ -243,6 +292,7 @@ class DreamHandler:
         task_snapshots = ctx.get("task_snapshots")
         if not callable(task_snapshots):
             log.warning("[scheduler] dream pipeline cannot poll tasks: missing task_snapshots callback")
+            self._notify_trigger(ctx, pending, "记忆整理没能进行下去：任务状态查不到，这一轮已放弃。")
             self._dream_pending = None
             return
 
@@ -254,6 +304,7 @@ class DreamHandler:
             # Purpose: write .dream-lock only after the actual Dream cycle has
             # completed successfully.
             self._poll_final_dream_tasks(
+                ctx=ctx,
                 task_snapshots=task_snapshots,
                 workspace_root=workspace_root,
                 now=now,
@@ -264,6 +315,7 @@ class DreamHandler:
 
         if self._pending_expired(pending, now=now):
             log.warning("[scheduler] dream preprocessing expired from %s; dropping pending run", pending.get("now_key"))
+            self._notify_trigger(ctx, pending, "记忆整理超时了（提取阶段），这一轮已放弃。")
             self._dream_pending = None
             return
 
@@ -325,6 +377,7 @@ class DreamHandler:
             # 没有任何 namespace 需要整理时直接收尾：过去这里无条件建任务，
             # 于是每晚都拿空 signals + 空 topology 烧一次模型调用。
             log.info("[scheduler] dream found nothing to organize; skipping final tasks")
+            self._notify_trigger(ctx, pending, "扫过一遍，没有需要整理的记忆。")
             self._dream_pending = None
             return
 
@@ -507,6 +560,7 @@ class DreamHandler:
     def _poll_final_dream_tasks(
         self,
         *,
+        ctx: dict[str, Any],
         task_snapshots: Any,
         workspace_root: Path,
         now: datetime,
@@ -525,6 +579,7 @@ class DreamHandler:
                     pending.get("dream_created_at"),
                     ",".join(sorted(set(statuses.values()))),
                 )
+                self._notify_trigger(ctx, pending, "记忆整理超时了（整理阶段），这一轮已放弃。")
                 self._dream_pending = None
             return
 
@@ -538,6 +593,11 @@ class DreamHandler:
                 len(dream_task_ids),
                 pending.get("dream_created_at"),
             )
+            summary = self._dream_summary(snapshots, dream_task_ids)
+            self._notify_trigger(
+                ctx, pending,
+                f"记忆整理完成。\n{summary}" if summary else "记忆整理完成。",
+            )
         else:
             # [AutoC 2026-06-01] Why: failed, cancelled, or missing final Dream
             # tasks must not mark the cycle as successful. How: clear the pending
@@ -548,6 +608,10 @@ class DreamHandler:
                 len(failed),
                 len(dream_task_ids),
                 ",".join(sorted({statuses[tid] for tid in failed})),
+            )
+            self._notify_trigger(
+                ctx, pending,
+                f"记忆整理没能完成：{len(dream_task_ids)} 个整理任务里有 {len(failed)} 个失败。",
             )
         self._dream_pending = None
 

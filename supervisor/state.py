@@ -655,9 +655,47 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             "cancel_memory_extract_intents": self._cancel_memory_extract_intents,
             "complete_memory_extract_intent": self._complete_memory_extract_intent,
             "memory_extract_task_exists": self._memory_extract_task_exists,
+            "post_outbound": self._post_outbound_from_hook_locked,
         }
         ctx.update(extra)
         return ctx
+
+    def fire_manual_schedule(self, schedule_type: str, **extra: Any) -> dict[str, Any]:
+        """按需触发一次系统级定时特性，返回 handler 写回 outcome 的内容。
+
+        走的是 cron 那条 on_schedule_tick 路径，handler 靠 manual 标志自己决定
+        跳过哪些门槛 —— 复制一条并行的启动路径迟早会和定时那条走散。
+        """
+        outcome: dict[str, Any] = {}
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            self.hook_registry.fire(
+                "on_schedule_tick",
+                self._build_supervisor_hook_ctx(
+                    schedule_type=str(schedule_type or "").strip(),
+                    manual=True,
+                    outcome=outcome,
+                    now=now,
+                    now_key=now.strftime("%Y-%m-%d %H:%M"),
+                    **extra,
+                ),
+            )
+        return outcome
+
+    def _post_outbound_from_hook_locked(self, *, session_id: str, text: str) -> bool:
+        """让内置 handler 直接往会话推一条消息，不经过 LLM。
+
+        用于长流程结束后回报结果 —— 触发的人早已离开那一轮对话，没有 inbound 可以搭。
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        try:
+            result = self.append_outbound_message(session_id=sid, text=str(text or ""))
+        except Exception:
+            logger.exception("hook outbound failed", extra={"session_id": sid})
+            return False
+        return bool(result.get("ok", True))
 
     def _task_snapshots_from_hook_locked(self, task_ids: list[str]) -> dict[str, dict[str, str]]:
         """Return safe task status/result snapshots for built-in hook handlers."""

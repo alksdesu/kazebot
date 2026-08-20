@@ -40,6 +40,8 @@ from .types import (
     OpenAIConfigPublic,
     ActiveProviderSecret,
     SystemModelUpdateIn,
+    DreamRunIn,
+    DreamRunOut,
     OpenAIConfigUpdateIn,
     ProviderModelsIn,
     ProviderUpdateIn,
@@ -794,6 +796,23 @@ def create_app(
         st: SupervisorState = app.state.state
         seq = st.bump_tools_reload()
         return {"ok": True, "seq": seq}
+
+    @app.post("/v1/memory/dream/run", response_model=DreamRunOut)
+    async def run_dream_now(body: DreamRunIn, request: Request) -> DreamRunOut:
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+
+        notify_session_id = ""
+        key = str(body.notify_conversation_key or "").strip()
+        if key:
+            channel = str(body.notify_channel or "").strip()
+            if not channel:
+                channel = key.split(":", 1)[0] if ":" in key else "system"
+            notify_session_id = st.get_or_create_session(channel=channel, conversation_key=key)
+
+        outcome = st.fire_manual_schedule("dream", notify_session_id=notify_session_id)
+        status = str(outcome.get("status") or "unavailable")
+        return DreamRunOut(ok=status == "started", status=status)
 
     @app.post("/v1/sessions/{session_id}/outbound", response_model=OutboundMessageOut)
     async def session_outbound(session_id: str, body: OutboundMessageIn) -> OutboundMessageOut:

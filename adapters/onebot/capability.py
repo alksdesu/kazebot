@@ -89,6 +89,11 @@ CAPABILITIES: tuple[Capability, ...] = (
         widest=GROUP_ADMIN, group_scoped=True,
     ),
     Capability(
+        "dream", "整理记忆",
+        "手动触发一次记忆整理：合并重复、清掉过期。整理的是全部会话和人物档案，不限本群，所以不给群主。",
+        widest=LISTED,
+    ),
+    Capability(
         "proactive", "主动发送",
         "让 bot 主动发消息、发文件、发合并转发。给到群主时目标只能是他自己那个群。",
         widest=GROUP_ADMIN, group_scoped=True,

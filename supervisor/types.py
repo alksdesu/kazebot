@@ -403,6 +403,19 @@ class NodeFallbacksUpdateIn(BaseModel):
     fallbacks: list[dict[str, Any]]
 
 
+class DreamRunIn(BaseModel):
+    """手动触发一次记忆整理。"""
+    # 整理要跑几分钟，触发的人早就不在那一轮对话里了；给了会话键才知道把结果回报到哪。
+    notify_conversation_key: str = ""
+    notify_channel: str = ""
+
+
+class DreamRunOut(BaseModel):
+    ok: bool
+    # started=已启动；busy=上一轮还在跑；unavailable=引擎侧没接住
+    status: str
+
+
 class ConfigReloadOut(BaseModel):
     ok: bool = True
     config: AppConfigPublic

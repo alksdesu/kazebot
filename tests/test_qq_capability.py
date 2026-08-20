@@ -32,7 +32,8 @@ MEMBER_QQ = 30003
 HOME_GROUP = 700001
 OTHER_GROUP = 700002
 
-GLOBAL_CAPS = ("approval", "model", "draw_preset", "custom_face", "cross_session", "send_dead_letter")
+GLOBAL_CAPS = ("approval", "model", "draw_preset", "custom_face", "cross_session", "send_dead_letter",
+               "dream")
 SCOPED_CAPS = ("clear_memory", "proactive")
 
 

@@ -32,8 +32,8 @@ permissions:
   #   owner        名单 + 本群群主
   #   group_admin  名单 + 本群群主 + 本群管理员
   # 群角色由 OneBot 上报，只在群消息里成立 —— 群主在私聊里就是个普通用户。
-  # 前六项影响面超出单个群或会泄露真实号（改全局配置、借 bot 身份发给任意人、
-  # 投递死信清单带真实群号/QQ 号），写 owner 会被夹回 admin。
+  # 前七项影响面超出单个群或会泄露真实号（改全局配置、借 bot 身份发给任意人、
+  # 投递死信清单带真实群号/QQ 号、整理全部会话与人物档案），写 owner 会被夹回 admin。
   capabilities:
     approval: admin
     model: admin
@@ -41,6 +41,7 @@ permissions:
     custom_face: admin
     cross_session: admin
     send_dead_letter: admin
+    dream: admin
     # 这两项能给到群主/群管，但目标会被夹在他自己那个群里。
     clear_memory: admin
     proactive: admin

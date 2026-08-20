@@ -511,6 +511,29 @@ class ClonothClient:
         resp.raise_for_status()
         return resp.json()
 
+    # ---- Memory ----
+
+    async def run_dream_now(
+        self, *, notify_conversation_key: str = "", notify_channel: str = "",
+    ) -> dict[str, Any]:
+        """手动触发一次记忆整理，对应 POST /v1/memory/dream/run。
+
+        整理要跑几分钟，这里只等到「已受理」。给了 notify_conversation_key 的话，
+        引擎跑完会把摘要推回那个会话。
+
+        Returns:
+            {"ok": bool, "status": "started" | "busy" | "unavailable"}
+        """
+        resp = await self._http().post(
+            f"{self._base_url}/v1/memory/dream/run",
+            json={
+                "notify_conversation_key": notify_conversation_key,
+                "notify_channel": notify_channel,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     # ---- Session Provider Override ----
 
     async def get_session_provider_override(self, session_id: str) -> dict[str, Any]:

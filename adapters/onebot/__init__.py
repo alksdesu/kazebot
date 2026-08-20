@@ -2581,6 +2581,7 @@ _COMMAND_CATALOG: tuple[tuple[str, str, str], ...] = (
     ("model", "/切换模型 <名>", "改全局主模型"),
     ("custom_face", "/表情包帮助", "收藏表情的全部命令"),
     ("clear_memory", "/清除群记忆 [群名]", "清掉群的长期记忆"),
+    ("dream", "/整理记忆", "立刻整理一遍记忆：合并重复、清掉过期"),
     ("proactive", "/主动发送帮助", "借 bot 发消息、文件、合并转发"),
     ("send_dead_letter", "/发送死信", "查看并放行卡住的投递（只能私聊）"),
     ("approval", "/审批 同意 <ID>", "处理审批（只能私聊）"),
@@ -3737,6 +3738,44 @@ async def _maybe_handle_clear_group_memory_command(
     if existed:
         return f"已清空群「{label}」的记忆（删除 {count} 个记忆本）。"
     return f"群「{label}」没有可清理的记忆（记忆目录为空或从未生成）。"
+
+
+# ---------------------------------------------------------------------------
+#  管理员命令：/整理记忆 —— 手动触发一次 dream
+# ---------------------------------------------------------------------------
+
+_DREAM_RE = _cmd_re(("整理记忆", "记忆整理", "整理一下记忆", "dream"))
+
+
+async def _maybe_handle_dream_command(
+    *,
+    event: Event,
+    user_text: str,
+    conversation_key: str,
+) -> str | None:
+    """处理 /整理记忆：手动跑一次记忆整理。
+
+    整理要几分钟，这里只等到「已受理」；摘要由引擎跑完后推回本会话。
+    """
+    if not _DREAM_RE.match((user_text or "").strip()):
+        return None
+    if not _can("dream", event):
+        return _capability_denial("dream", event, "该请求不可用。")
+    if _client is None:
+        return "Clonoth Agent 尚未初始化，请稍后重试。"
+
+    try:
+        out = await _client.run_dream_now(notify_conversation_key=conversation_key)
+    except Exception as exc:
+        logger.warning("trigger dream failed: %s", exc, exc_info=True)
+        return f"❌ 触发整理失败：{exc}"
+
+    status = str((out or {}).get("status") or "")
+    if status == "started":
+        return "已开始整理记忆，跑完把摘要发这儿。通常要几分钟。"
+    if status == "busy":
+        return "上一轮整理还在跑，等它结束再来。"
+    return "引擎没接住这次触发（任务通道不可用），看一下服务状态。"
 
 
 # ---------------------------------------------------------------------------
@@ -8736,6 +8775,11 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
     )
     if clear_mem_reply is not None:
         await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=clear_mem_reply)
+    dream_reply = await _maybe_handle_dream_command(
+        event=event, user_text=user_text, conversation_key=stable_conversation_key,
+    )
+    if dream_reply is not None:
+        await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=dream_reply)
     model_reply = await _maybe_handle_model_command(event=event, user_text=user_text)
     if model_reply is not None:
         await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=model_reply)
@@ -8998,6 +9042,11 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     stable_conversation_key = _stable_conversation_key(real_conversation_key)
     attachments, attachment_errors = await _collect_qq_attachments(bot, event, stable_conversation_key)
     _remember_recent_images(stable_conversation_key, event, attachments)
+    dream_reply = await _maybe_handle_dream_command(
+        event=event, user_text=user_text, conversation_key=stable_conversation_key,
+    )
+    if dream_reply is not None:
+        await _private_matcher.finish(dream_reply)
     drawtools_reply = await _maybe_handle_drawtools_command(event=event, user_text=user_text)
     if drawtools_reply is not None:
         await _private_matcher.finish(drawtools_reply)
