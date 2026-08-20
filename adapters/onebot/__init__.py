@@ -56,6 +56,8 @@ from .config import (
     IMAGE_DOWNLOAD_TIMEOUT,
     LOCAL_SOURCE_ROOTS,
     IMAGE_FORWARD_MERGE_NICKNAME,
+    RECENT_FILE_MAX_AGE_SECONDS,
+    RECENT_FILE_MAX_ITEMS,
     RECENT_IMAGE_MAX_AGE_SECONDS,
     RECENT_IMAGE_MAX_ITEMS,
     USER_PROFILES_PATH,
@@ -92,9 +94,10 @@ from .live_config import (
 )
 from .attachment_policy import (
     inbound_file_reject_reason,
+    looks_like_file_query,
     looks_like_image_query,
-    select_recent_image_entries,
-    should_fallback_to_recent_images,
+    select_recent_attachment_entries,
+    should_fallback_to_recent_attachments,
     source_attachments_from_merged,
 )
 from .forward_authz import (
@@ -274,7 +277,7 @@ _last_bot: Optional[Bot] = None
 
 
 @dataclass
-class RecentImageEntry:
+class RecentAttachmentEntry:
     attachment: Dict[str, Any]
     created_at: float
     sender_id: str
@@ -345,6 +348,9 @@ class _BucketMap(OrderedDict):
 
 
 _recent_images: "_BucketMap" = _BucketMap(lambda: deque(maxlen=RECENT_IMAGE_MAX_ITEMS), _CONVERSATION_BUCKET_MAX_KEYS)
+# QQ 群文件是独立一条消息、带不了 @，那条永远不会触发 bot。不在这里留一手，
+# 下一条「读一下上面那个文件」就再也拿不到它了。
+_recent_files: "_BucketMap" = _BucketMap(lambda: deque(maxlen=RECENT_FILE_MAX_ITEMS), _CONVERSATION_BUCKET_MAX_KEYS)
 # 借 group_history_max 定容量，但语义不同：这份副本只供 qq_forward 挑选转发候选，没有送达账本，
 # 因此不参与缺口记账、也不吃未送达倍数。调小群历史条数会顺带缩小可转发范围，至少 20 条。
 _group_content_records: DefaultDict[int, Deque[GroupContentRecord]] = defaultdict(lambda: deque(maxlen=max(live.group_history_max, 20)))
@@ -1754,15 +1760,27 @@ def _remember_recent_images(conversation_key: str, event: Event, attachments: Li
     message_id = str(getattr(event, "message_id", "") or "")
     now = time.time()
     q = _recent_images[conversation_key]
+    fq = _recent_files[conversation_key]
     image_atts: list[dict[str, Any]] = []
+    kept: list[dict[str, Any]] = []
     for att in attachments:
-        if str(att.get("type") or "") == "image" and att.get("path"):
-            att_copy = dict(att)
+        if not att.get("path"):
+            continue
+        att_copy = dict(att)
+        kind = str(att.get("type") or "")
+        if kind == "image":
             image_atts.append(att_copy)
-            q.append(RecentImageEntry(att_copy, now, sender_key, message_id))
+            q.append(RecentAttachmentEntry(att_copy, now, sender_key, message_id))
+        elif kind == "file":
+            fq.append(RecentAttachmentEntry(att_copy, now, sender_key, message_id))
+        else:
+            continue
+        kept.append(att_copy)
     _recent_images.touch(conversation_key)
-    if image_atts and message_id:
-        _remember_reply_attachments(message_id, conversation_key, sender_qq, image_atts, created_at=now)
+    _recent_files.touch(conversation_key)
+    # 引用索引收全部类型：引用一条文件消息再问，和引用图片一样是明确的指向。
+    if kept and message_id:
+        _remember_reply_attachments(message_id, conversation_key, sender_qq, kept, created_at=now)
 
 
 def _remember_reply_attachments(
@@ -1778,16 +1796,19 @@ def _remember_reply_attachments(
     if not mid or not attachments:
         return
     now = time.time() if created_at is None else float(created_at)
-    image_atts = [dict(att) for att in attachments if isinstance(att, dict) and att.get("path")]
-    if not image_atts:
+    kept = [dict(att) for att in attachments if isinstance(att, dict) and att.get("path")]
+    if not kept:
         return
     # 旧图绑到新消息时把 mtime 推到现在，否则按 mtime 判龄的清理会在保留期内先删掉源文件。
-    _touch_attachment_files(image_atts)
+    _touch_attachment_files(kept)
+    images = [att for att in kept if str(att.get("type") or "") != "file"]
+    files = [att for att in kept if str(att.get("type") or "") == "file"]
     _reply_attachment_cache[mid] = {
         "conversation_key": str(conversation_key or ""),
         "sender_id": str(sender_id or ""),
         "created_at": now,
-        "attachments": image_atts[:live.max_images_per_turn],
+        # 两类各按各的上限截断：混在一起用图片那个数，三个文件就能把图全挤掉。
+        "attachments": images[:live.max_images_per_turn] + files[:live.max_files_per_turn],
     }
     _trim_reply_attachment_cache()
     try:
@@ -1864,12 +1885,23 @@ def _cached_reply_image_attachments(message_id: Any, conversation_key: str = "")
 
 def _recent_images_for_text(conversation_key: str, event: Event) -> List[Dict[str, Any]]:
     """Return one unambiguous recent image batch from the current sender only."""
-    return select_recent_image_entries(
+    return select_recent_attachment_entries(
         _recent_images.get(conversation_key, ()),
         sender_id=_event_sender_key(event),
         now=time.time(),
         max_age_seconds=RECENT_IMAGE_MAX_AGE_SECONDS,
-        max_images=live.max_images_per_turn,
+        max_items=live.max_images_per_turn,
+    )
+
+
+def _recent_files_for_text(conversation_key: str, event: Event) -> List[Dict[str, Any]]:
+    """Return one unambiguous recent file batch from the current sender only."""
+    return select_recent_attachment_entries(
+        _recent_files.get(conversation_key, ()),
+        sender_id=_event_sender_key(event),
+        now=time.time(),
+        max_age_seconds=RECENT_FILE_MAX_AGE_SECONDS,
+        max_items=live.max_files_per_turn,
     )
 
 
@@ -1877,7 +1909,11 @@ def _text_looks_like_image_query(text: str) -> bool:
     return looks_like_image_query(text)
 
 
-async def _merge_recent_images_after_text(
+def _text_looks_like_file_query(text: str) -> bool:
+    return looks_like_file_query(text)
+
+
+async def _merge_recent_attachments_after_text(
     *,
     event: Event,
     conversation_key: str,
@@ -1892,18 +1928,25 @@ async def _merge_recent_images_after_text(
     # recover an image directly from the quoted message or from the Bot reply's
     # persisted source-image binding. Falling back to an unrelated recent image
     # here caused "再仔细看看图" to replace the intended PNG with an older GIF.
-    if not should_fallback_to_recent_images(
+    if should_fallback_to_recent_attachments(
         has_attachments=bool(attachments),
-        image_input_enabled=live.enable_image_input,
-        looks_like_image_query=_text_looks_like_image_query(user_text),
+        input_enabled=live.enable_image_input,
+        looks_like_query=_text_looks_like_image_query(user_text),
         reply_message_id=reply_message_id,
     ):
-        return
-    if live.image_wait_after_text_sec > 0:
-        await asyncio.sleep(live.image_wait_after_text_sec)
-    recent = _recent_images_for_text(conversation_key, event)
-    if recent:
-        attachments.extend(recent)
+        if live.image_wait_after_text_sec > 0:
+            await asyncio.sleep(live.image_wait_after_text_sec)
+        attachments.extend(_recent_images_for_text(conversation_key, event))
+
+    # 文件走同一套约束，但不等：群文件那条消息早就发完了，不像图那样可能还在路上。
+    # 上面真取到图时 has_attachments 已经变真，这一段自己就不会再进。
+    if should_fallback_to_recent_attachments(
+        has_attachments=bool(attachments),
+        input_enabled=live.enable_file_input,
+        looks_like_query=_text_looks_like_file_query(user_text),
+        reply_message_id=reply_message_id,
+    ):
+        attachments.extend(_recent_files_for_text(conversation_key, event))
 
 
 def _segment_image_url(data: Mapping[str, Any]) -> str:
@@ -3848,6 +3891,7 @@ def _purge_conversation_side_state(conversation_key: str, target: Dict[str, Any]
     只在 clear 语义下调用 —— 漏掉任何一份，重置后它都会把旧上下文重新喂回模型。
     """
     _recent_images.pop(conversation_key, None)
+    _recent_files.pop(conversation_key, None)
     _sticky_subjects.pop(conversation_key, None)
     bucket = _sent_attachment_bucket_key(target) or f"conv:{conversation_key}"
     _recent_sent_attachments.pop(bucket, None)
@@ -4052,12 +4096,18 @@ async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) ->
         else:
             text = text.replace(IMAGE_PLACEHOLDER, STICKER_PLACEHOLDER)
     else:
-        images, _ = await _collect_message_media(bot, message)
-        if not images:
-            images, _ = await _collect_message_media(bot, raw_message)
+        images, files = await _collect_message_media(bot, message)
+        if not images and not files:
+            images, files = await _collect_message_media(bot, raw_message)
         quoted_attachments, quoted_errors = await _image_sources_to_attachments(images, conversation_key)
         for att in quoted_attachments:
             text = text.replace(IMAGE_PLACEHOLDER, f"[{_attachment_label(att)}: {att['path']}]", 1)
+        # 引用一条群文件消息是最明确的「读这个」，而群文件带不了 @，只能这样指。
+        # 正文里没有占位符可替，直接挂到附件上让 engine 去读内容。
+        if files and live.enable_file_input:
+            file_atts, file_errors = await _file_sources_to_attachments(files, conversation_key)
+            quoted_attachments.extend(file_atts)
+            quoted_errors.extend(file_errors)
         # 下载失败的图（太大/格式不支持）把占位符换成原因，否则引用块里会静默少一张图。
         for note in dict.fromkeys(quoted_errors):
             text = text.replace(IMAGE_PLACEHOLDER, f"[{note}]", 1)
@@ -8573,7 +8623,7 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
     draw_direct_prompt = _parse_direct_draw_command(user_text)
     if draw_direct_prompt is None:
         # /生图 不吃历史图：混进来的图会把这一轮拽到视觉节点。
-        await _merge_recent_images_after_text(event=event, conversation_key=stable_conversation_key, user_text=user_text, attachments=attachments)
+        await _merge_recent_attachments_after_text(event=event, conversation_key=stable_conversation_key, user_text=user_text, attachments=attachments)
     current_seq = _record_group_message(event, bot, override_text=user_text, attachments=attachments)
     entry_node_id = DRAW_NODE_ID if draw_direct_prompt is not None else ""
     if draw_direct_prompt is not None:
@@ -8832,7 +8882,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     draw_direct_prompt = _parse_direct_draw_command(user_text)
     if draw_direct_prompt is None:
         # /生图 不吃历史图：混进来的图会把这一轮拽到视觉节点。
-        await _merge_recent_images_after_text(event=event, conversation_key=stable_conversation_key, user_text=user_text, attachments=attachments)
+        await _merge_recent_attachments_after_text(event=event, conversation_key=stable_conversation_key, user_text=user_text, attachments=attachments)
     entry_node_id = DRAW_NODE_ID if draw_direct_prompt is not None else ""
     if draw_direct_prompt is not None:
         if attachments:

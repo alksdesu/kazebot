@@ -179,6 +179,10 @@ IMAGE_CACHE_TTL_SECONDS = _env_int(
 RECENT_IMAGE_MAX_ITEMS = _env_int("ONEBOT_RECENT_IMAGE_MAX_ITEMS", 20, min_value=1, max_value=200)
 # 最近图片只认同一发送者的同一条消息，跨人/跨消息一律不兜底（策略固定在 attachment_policy 内）。
 RECENT_IMAGE_MAX_AGE_SECONDS = _env_float("ONEBOT_RECENT_IMAGE_MAX_AGE_SECONDS", 60.0, min_value=1.0)
+# 文件桶单独定容：一个文件可以有 50MB，不能跟着图片那 20 条的容量走。
+RECENT_FILE_MAX_ITEMS = _env_int("ONEBOT_RECENT_FILE_MAX_ITEMS", 6, min_value=1, max_value=50)
+# 传文件比发图慢，窗口给得比图片宽一些：等上传转圈完再打字问是常态。
+RECENT_FILE_MAX_AGE_SECONDS = _env_float("ONEBOT_RECENT_FILE_MAX_AGE_SECONDS", 180.0, min_value=1.0)
 
 # 合并转发单个 node 的署名。
 IMAGE_FORWARD_MERGE_NICKNAME = _env_first("ONEBOT_IMAGE_FORWARD_MERGE_NICKNAME", default="Clonoth")

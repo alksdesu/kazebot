@@ -84,6 +84,25 @@ def inbound_file_reject_reason(name: str, content: bytes = b"", *, extra_allowed
     return "unsupported_type"
 
 
+def looks_like_file_query(text: str) -> bool:
+    """Detect a follow-up that points at a file just sent to the group.
+
+    QQ 的群文件是独立一条消息、带不了 @，所以「读一下上面那个」永远是下一条才来。
+    只认明确提到文件的说法，别把「看看这个」这种含糊指代也算进来。
+    """
+    value = str(text or "").strip().lower()
+    if not value:
+        return False
+    keywords = (
+        "这个文件", "那个文件", "上面的文件", "刚发的文件", "刚才的文件", "发的文件",
+        "这份文件", "那份文件", "文件里", "文件内容", "读一下文件", "看一下文件",
+        "这个表格", "这份表格", "这个文档", "这份文档", "附件",
+        "json", "csv", "yaml", "yml", "excel", "pdf", "docx", "xlsx", "zip",
+        "read the file", "this file", "that file", "attachment",
+    )
+    return any(keyword in value for keyword in keywords)
+
+
 def looks_like_image_query(text: str) -> bool:
     """Detect explicit image references without matching generic text requests."""
     value = str(text or "").strip().lower()
@@ -97,18 +116,21 @@ def looks_like_image_query(text: str) -> bool:
     return any(keyword in value for keyword in keywords)
 
 
-def should_fallback_to_recent_images(
+def should_fallback_to_recent_attachments(
     *,
     has_attachments: bool,
-    image_input_enabled: bool,
-    looks_like_image_query: bool,
+    input_enabled: bool,
+    looks_like_query: bool,
     reply_message_id: Any,
 ) -> bool:
-    """Allow implicit recent-image lookup only for non-reply image queries."""
+    """Allow implicit recent-attachment lookup only for non-reply queries.
+
+    引用有自己的消息链，绝不能在这里回退：「再仔细看看图」曾因此拿到无关的旧图。
+    """
     return bool(
         not has_attachments
-        and image_input_enabled
-        and looks_like_image_query
+        and input_enabled
+        and looks_like_query
         and reply_message_id is None
     )
 
@@ -128,15 +150,15 @@ def source_attachments_from_merged(attachments: Iterable[Any]) -> list[dict[str,
     return result
 
 
-def select_recent_image_entries(
+def select_recent_attachment_entries(
     entries: Iterable[Any],
     *,
     sender_id: str,
     now: float,
     max_age_seconds: float,
-    max_images: int,
+    max_items: int,
 ) -> list[dict[str, Any]]:
-    """Select the latest single-message image batch from the current sender.
+    """Select the latest single-message attachment batch from the current sender.
 
     Never falls back across senders and never combines separate QQ messages. This
     prevents a follow-up such as “再仔细看看图” from silently receiving an older,
@@ -148,7 +170,7 @@ def select_recent_image_entries(
         if str(getattr(item, "sender_id", "") or "") == str(sender_id or "")
         and now - float(getattr(item, "created_at", 0.0) or 0.0) <= max_age_seconds
     ]
-    if not eligible or max_images <= 0:
+    if not eligible or max_items <= 0:
         return []
 
     latest_message_id = str(getattr(eligible[-1], "message_id", "") or "")
@@ -161,7 +183,7 @@ def select_recent_image_entries(
     else:
         eligible = eligible[-1:]
 
-    selected = eligible[-max_images:]
+    selected = eligible[-max_items:]
     return [
         dict(getattr(item, "attachment", {}) or {})
         for item in selected

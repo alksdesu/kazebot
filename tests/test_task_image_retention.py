@@ -158,10 +158,10 @@ def test_plain_text_request_is_not_misclassified_as_image_query() -> None:
 
 
 def test_reply_image_query_never_uses_unrelated_recent_image() -> None:
-    assert not _ATTACHMENT_POLICY.should_fallback_to_recent_images(
+    assert not _ATTACHMENT_POLICY.should_fallback_to_recent_attachments(
         has_attachments=False,
-        image_input_enabled=True,
-        looks_like_image_query=True,
+        input_enabled=True,
+        looks_like_query=True,
         reply_message_id="bot-reply-1",
     )
 
@@ -173,12 +173,12 @@ def test_recent_image_policy_keeps_latest_same_sender_message_batch() -> None:
         _RecentEntry({"type": "image", "path": "new-1.png"}, 99.0, "user-a", "msg-new"),
         _RecentEntry({"type": "image", "path": "new-2.png"}, 99.0, "user-a", "msg-new"),
     ]
-    selected = _ATTACHMENT_POLICY.select_recent_image_entries(
+    selected = _ATTACHMENT_POLICY.select_recent_attachment_entries(
         entries,
         sender_id="user-a",
         now=100.0,
         max_age_seconds=10.0,
-        max_images=4,
+        max_items=4,
     )
     assert [item["path"] for item in selected] == ["new-1.png", "new-2.png"]
 
@@ -193,12 +193,12 @@ def test_queue_source_attachment_binding_keeps_all_merged_images() -> None:
 
 
 def test_recent_image_policy_never_crosses_sender() -> None:
-    selected = _ATTACHMENT_POLICY.select_recent_image_entries(
+    selected = _ATTACHMENT_POLICY.select_recent_attachment_entries(
         [_RecentEntry({"type": "image", "path": "other.gif"}, 99.0, "user-b", "msg")],
         sender_id="user-a",
         now=100.0,
         max_age_seconds=10.0,
-        max_images=4,
+        max_items=4,
     )
     assert selected == []
 

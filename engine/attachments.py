@@ -42,6 +42,8 @@ _JPEG_QUALITY = 85
 
 # 没有哪家 provider 收矢量图，发出去整轮请求会 400。压缩层也转不了它——PIL 读不了 SVG。
 _UNSENDABLE_IMAGE_MIMES = frozenset({"image/svg+xml"})
+# 超过这个大小只给路径，让模型用 read_file 自己取，别把上下文窗口撑爆。
+_TEXT_FILE_MAX_BYTES = 102400  # 100KB
 
 # Discord CDN 等来源经常返回无意义的 MIME，需要清洗掉以便 fallback 到扩展名猜测
 _USELESS_MIMES = frozenset({
@@ -104,6 +106,19 @@ def _looks_like_svg(data: bytes) -> bool:
     SVG 一旦被认成图片就会当附件收下来，再一路走到 provider 那里 400。
     """
     return b"<svg" in data[:1024].lower()
+
+
+def _decode_text_file(raw: bytes) -> str | None:
+    """把附件字节解成文本；判定为二进制时返回 None。
+
+    NUL 字节是最省事的二进制信号，剩下的交给严格 UTF-8 解码（不吞错）来判。
+    """
+    if 0 in raw:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def _is_allowed_attachment_path(rel_path: str) -> bool:
@@ -176,7 +191,6 @@ def attachments_to_content_parts(
         # 之前只注入一行元数据引用，LLM 无法直接看到文件内容，需要额外调用 read_file。
         # 改为：小文件直接注入完整内容到上下文，减少不必要的工具调用轮次。
         # 大文件（>100KB）保持 metadata-only，避免撑爆上下文窗口。
-        _TEXT_FILE_MAX_BYTES = 102400  # 100KB
         if att_type == "file":
             name = att.get("name") or Path(path).name
             mime = att.get("mime_type") or "text/plain"
@@ -188,14 +202,24 @@ def attachments_to_content_parts(
                 try:
                     file_size = full_path.stat().st_size
                     if file_size <= _TEXT_FILE_MAX_BYTES:
-                        # 小文件：注入元数据 + 完整内容
-                        file_content = full_path.read_text(
-                            encoding="utf-8", errors="replace"
-                        )
-                        parts.append({
-                            "type": "text",
-                            "text": f"{metadata}\n---\n{file_content}\n---",
-                        })
+                        # 入站白名单放行 pdf/docx/zip 等二进制格式，errors="replace" 会把它们
+                        # 解成满屏替换字符灌进 prompt。判不出文本就只给路径，与 read_file
+                        # 的处理保持一致（它遇到二进制也是只报类型、不给内容）。
+                        decoded = _decode_text_file(full_path.read_bytes())
+                        if decoded is None:
+                            parts.append({
+                                "type": "text",
+                                "text": (
+                                    f"{metadata}\n"
+                                    f"(Binary file, {file_size / 1024:.1f}KB. Not injected as "
+                                    f"text — use read_file or a dedicated parser.)"
+                                ),
+                            })
+                        else:
+                            parts.append({
+                                "type": "text",
+                                "text": f"{metadata}\n---\n{decoded}\n---",
+                            })
                     else:
                         # 大文件：metadata-only + 大小提示
                         size_kb = file_size / 1024
