@@ -477,12 +477,21 @@ def _locate_memory_entry(
     return "", None, None, -1
 
 
-def _memory_source(ctx: ToolContext) -> str:
-    """Return the provenance tag Dream uses to decide what it may prune."""
-    # dream 只清理 source=auto，其余一律当手工记忆保护。空 source 会让 Prune 和
-    # Promote 两条规则永远匹配不到条目，所以这里必须落实到具体值。
-    node_id = str(getattr(ctx, "node_id", "") or getattr(ctx, "_node_id", "") or "")
-    return "auto" if node_id.startswith("system.") else "manual"
+_AUTO_SOURCE = "auto"
+
+
+def _memory_source() -> str:
+    """工具写的一律 auto。人只能从控制台写，那条路径由 memory_admin 打 manual。
+
+    曾按节点名前缀判定，于是 qq.orchestrator 写的全成了 manual —— bot 自己记的
+    东西自己删不掉、dream 也清不掉，只能靠新增一条「上面那条错了」打补丁。
+    """
+    return _AUTO_SOURCE
+
+
+def _is_tool_writable(entry: dict[str, Any]) -> bool:
+    """工具只动得了自己写的。空 source 按手工保护：早期 save_memory 不写这个字段。"""
+    return str(entry.get("source") or "").strip() == _AUTO_SOURCE
 
 
 def load_memory_catalog(
@@ -1708,9 +1717,15 @@ def _save_memory_locked(
     found = found_index >= 0
     if found:
         old = entries[found_index]
-        # 更新：保留原 created_at 和 source，刷新 updated_at
+        # 手工记忆对工具只读。挡在这里而不只挡 delete：整条覆盖 content、或者一个
+        # enabled=false，效果和删掉没区别，守卫不对称就等于没有守卫。
+        if not _is_tool_writable(old):
+            return _tool_err(f"cannot modify manually authored memory: {mid}")
+        # constant 卸不掉：卸得掉就能先解锁再 delete，绕开那边的 constant 守卫。
+        if bool(old.get("constant", False)) and "constant" in args and not constant:
+            return _tool_err(f"cannot clear constant flag: {mid}")
         new_entry["created_at"] = str(old.get("created_at") or "").strip() or _now_iso
-        new_entry["source"] = str(old.get("source") or "").strip() or _memory_source(ctx)
+        new_entry["source"] = _AUTO_SOURCE
         new_entry["updated_at"] = _now_iso
         # 整条替换会抹掉旧字段。判据必须是「args 里有没有这个键」—— keywords/constant
         # 这些在 new_entry 里总带默认值，按 "not in new_entry" 判等于永远不继承，
@@ -1721,7 +1736,7 @@ def _save_memory_locked(
     else:
         new_entry["created_at"] = _now_iso
         new_entry["updated_at"] = _now_iso
-        new_entry["source"] = _memory_source(ctx)
+        new_entry["source"] = _memory_source()
 
     # 三者皆无的条目在注入侧被直接 continue 掉，而工具此前照样返回成功 ——
     # 等于允许静默写一条永远不会被读到的记忆。
@@ -1824,10 +1839,8 @@ def _delete_memory_locked(
     if bool(target.get("constant", False)):
         return _tool_err(f"cannot delete constant memory: {mid}")
 
-    # 手工记忆只能由人删。dream 的提示词早就写了「保护 source != auto」，但那只是
-    # 一句话；14 天扫除侧已按同一规则落成代码，工具侧不跟上就是两套标准。
-    # 空 source 一律当手工：save_memory 早期不写这个字段。
-    if str(target.get("source") or "").strip() != "auto":
+    # 手工记忆只能由人删。与 save_memory 共用一个判据，避免两套标准。
+    if not _is_tool_writable(target):
         return _tool_err(f"cannot delete manually authored memory: {mid}")
 
     new_entries = [
