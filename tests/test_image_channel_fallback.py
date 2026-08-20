@@ -63,6 +63,7 @@ def _no_ambient_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "OPENAI_API_KEY", "OPENAI_BASE_URL", "GEMINI_API_KEY", "GEMINI_BASE_URL",
         "CLONOTH_IMAGE_GPT_API_KEY", "CLONOTH_IMAGE_GPT_BASE_URL",
         "CLONOTH_IMAGE_GEMINI_API_KEY", "CLONOTH_IMAGE_GEMINI_BASE_URL",
+        "NOVELAI_API_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -274,3 +275,88 @@ class TestRealPrompt:
 
                 assert "<<IF:" not in rendered, (gpt, gem)
                 assert "<<ENDIF>>" not in rendered, (gpt, gem)
+
+
+def _drawtools_workspace(tmp_path: Path, config: str, settings: str | None) -> Path:
+    """带 tools/ 的完整工作区。按路径加载靠的是模块位置，所以文件得真的在。"""
+    root = _workspace(tmp_path, config)
+    (root / "tools" / "drawtools").mkdir(parents=True, exist_ok=True)
+    for name in ("_channel.py",):
+        (root / "tools" / name).write_text(
+            (_ROOT / "tools" / name).read_text(encoding="utf-8"), encoding="utf-8")
+    for name in ("common.py", "settings.example.yaml"):
+        (root / "tools" / "drawtools" / name).write_text(
+            (_ROOT / "tools" / "drawtools" / name).read_text(encoding="utf-8"), encoding="utf-8")
+    if settings is not None:
+        (root / "tools" / "drawtools" / "settings.yaml").write_text(settings, encoding="utf-8")
+    return root
+
+
+class TestNovelaiAvailability:
+    def test_a_key_in_settings_counts(self, tmp_path: Path) -> None:
+        from clonoth_runtime import novelai_available
+
+        root = _drawtools_workspace(tmp_path, _GEMINI_MAIN, "api:\n  api_key: nai-key\n")
+
+        assert novelai_available(root)
+
+    def test_the_env_variable_counts(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # safe_subprocess_env 对 NOVELAI_API_KEY 开了白名单，这条回退是真的能用。
+        from clonoth_runtime import novelai_available
+
+        monkeypatch.setenv("NOVELAI_API_KEY", "from-env")
+        root = _drawtools_workspace(tmp_path, _GEMINI_MAIN, "api:\n  api_key: ''\n")
+
+        assert novelai_available(root)
+
+    def test_nothing_configured(self, tmp_path: Path) -> None:
+        from clonoth_runtime import novelai_available
+
+        root = _drawtools_workspace(tmp_path, _GEMINI_MAIN, "api:\n  api_key: ''\n")
+
+        assert not novelai_available(root)
+
+    def test_falling_back_to_the_example_is_not_configured(self, tmp_path: Path) -> None:
+        # settings.example.yaml 里 api_key 是空串，不能让它把示例当成已配。
+        from clonoth_runtime import novelai_available
+
+        root = _drawtools_workspace(tmp_path, _GEMINI_MAIN, None)
+
+        assert not novelai_available(root)
+
+    def test_a_workspace_without_drawtools(self, tmp_path: Path) -> None:
+        from clonoth_runtime import novelai_available
+
+        assert not novelai_available(_workspace(tmp_path, _GEMINI_MAIN))
+
+
+class TestDisabledDrawNodes:
+    """画不出图的节点不该留在委派目标里 —— 留着就是白烧一轮再失败。"""
+
+    def _disabled(self, root: Path) -> set[str]:
+        from engine.builtin.image_gen_gating import disabled_draw_nodes
+
+        return disabled_draw_nodes(root)
+
+    def test_novelai_without_a_key_is_dropped(self, tmp_path: Path) -> None:
+        # 主渠道是 gemini，所以 image_gen 活着，novelai 该被摘掉。
+        root = _drawtools_workspace(tmp_path, _GEMINI_MAIN, "api:\n  api_key: ''\n")
+
+        assert self._disabled(root) == {"draw.novelai_planner"}
+
+    def test_both_configured_drops_nothing(self, tmp_path: Path) -> None:
+        root = _drawtools_workspace(tmp_path, _GEMINI_MAIN, "api:\n  api_key: nai-key\n")
+
+        assert self._disabled(root) == set()
+
+    def test_neither_configured_drops_both(self, tmp_path: Path) -> None:
+        root = _drawtools_workspace(
+            tmp_path, "version: 1\nprovider: openai\n", "api:\n  api_key: ''\n")
+
+        assert self._disabled(root) == {"draw.image_gen", "draw.novelai_planner"}
+
+    def test_image_gen_alone_is_dropped_when_only_novelai_works(self, tmp_path: Path) -> None:
+        root = _drawtools_workspace(
+            tmp_path, "version: 1\nprovider: openai\n", "api:\n  api_key: nai-key\n")
+
+        assert self._disabled(root) == {"draw.image_gen"}

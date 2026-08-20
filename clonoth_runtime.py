@@ -326,27 +326,26 @@ IMAGE_TOOL_SLOTS: dict[str, str] = {
     "gemini_image": "image_gemini",
 }
 
-_image_channel_module: Any = None
+_loaded_modules: dict[str, Any] = {}
 
 
-def _load_image_channel_module(workspace_root: Path) -> Any:
-    """加载 tools/_channel.py。
+def load_module_from(path: Path, module_name: str) -> Any:
+    """按文件路径加载模块并缓存，取不到返回 None。
 
-    生图渠道的回退链只此一份，工具子进程和主进程都读它 —— 各写各的必然演化成
-    「工具能跑但提示词说没配」。不走 sys.path：`_channel` 这名字太通用会撞。
+    工具那几个文件得让主进程也能读（判定必须同源），但它们的模块名 —— `_channel`、
+    `common` —— 太通用，插进 sys.path 迟早跟别的东西撞。
     """
-    global _image_channel_module
-    if _image_channel_module is not None:
-        return _image_channel_module
-    path = Path(workspace_root) / "tools" / "_channel.py"
+    key = str(path)
+    if key in _loaded_modules:
+        return _loaded_modules[key]
     if not path.exists():
         return None
-    spec = importlib.util.spec_from_file_location("clonoth_image_channel", path)
+    spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         return None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    _image_channel_module = module
+    _loaded_modules[key] = module
     return module
 
 
@@ -355,11 +354,28 @@ def image_tool_available(workspace_root: Path, tool_name: str) -> bool:
     slot = IMAGE_TOOL_SLOTS.get(str(tool_name or "").strip())
     if not slot:
         return False
-    module = _load_image_channel_module(workspace_root)
+    root = Path(workspace_root)
+    module = load_module_from(root / "tools" / "_channel.py", "clonoth_image_channel")
     if module is None:
         return False
     try:
-        return bool(module.resolve_image_channel(slot, root=Path(workspace_root)).usable)
+        return bool(module.resolve_image_channel(slot, root=root).usable)
+    except Exception:
+        return False
+
+
+def novelai_available(workspace_root: Path) -> bool:
+    """NovelAI 配了 key 才算可用：settings.yaml 优先，其次 NOVELAI_API_KEY。
+
+    判定借 drawtools 自己那份 —— 它的路径常量按模块位置算，从这里加载正好指向同一个
+    工作区。settings.example.yaml 里 api_key 是空串，回退到示例不会判成已配。
+    """
+    module = load_module_from(
+        Path(workspace_root) / "tools" / "drawtools" / "common.py", "clonoth_drawtools_common")
+    if module is None:
+        return False
+    try:
+        return bool(module.resolve_api_key(module.load_settings()))
     except Exception:
         return False
 
