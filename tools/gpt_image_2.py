@@ -12,10 +12,9 @@ GPT Image 2 生图工具 (Clonoth external tool)
   - 【重要】工具本身**不再** POST intermediate_reply 推图，否则会与 dispatch_attachment
     双发（同一张图发两次）——这正是 NovelAI 插件当年修复过的坑。
 
-API 渠道配置（与 read_image / system_models 一致）：
-  优先读 data/config.yaml 的 system_models.image_gpt（model/base_url/api_key），
-  其次 slot 专属环境变量 CLONOTH_IMAGE_GPT_*，留空则回退主渠道
-  （OPENAI_BASE_URL / OPENAI_API_KEY，model 默认 gpt-image-2）。
+API 渠道配置见 _channel.resolve_image_channel：system_models.image_gpt >
+CLONOTH_IMAGE_GPT_* > OPENAI_* > 主渠道（仅当主渠道本身收 OpenAI 格式）。
+model 不跟主渠道走，默认 gpt-image-2。
 """
 
 SPEC = {
@@ -98,17 +97,18 @@ if __name__ == "__main__":
     except ValueError:
         fail(f'Invalid size format: {size}. Use WxH, e.g. 1024x1536')
 
-    # 生图渠道独立于主渠道：这是个专用端点，跟着主渠道换家没有意义。
-    # 优先级：config.yaml system_models.image_gpt > CLONOTH_IMAGE_GPT_* > OPENAI_*
+    # 优先级：config.yaml system_models.image_gpt > CLONOTH_IMAGE_GPT_* > OPENAI_* > 主渠道。
+    # 主渠道只在它本来就收 OpenAI 格式时才借，否则地址对了格式也不对。
+    # model 不跟着借：主渠道那个是聊天模型，生图得用这里的默认值。
     if str(Path(__file__).resolve().parent) not in sys.path:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _channel import Channel
+    from _channel import resolve_image_channel
     from _image import ImagePayloadError, build_image_part, family_for_base_url
 
-    channel = Channel("image_gpt")
-    api_key = channel.pick("api_key", "API_KEY", channel.env("OPENAI_API_KEY"))
-    base_url = channel.pick("base_url", "BASE_URL", channel.env("OPENAI_BASE_URL")).rstrip("/")
-    model_name = channel.pick("model", "MODEL", "gpt-image-2")
+    channel = resolve_image_channel("image_gpt")
+    api_key = channel.api_key
+    base_url = channel.base_url
+    model_name = channel.model
 
     if not api_key:
         fail('No API key found in config.yaml / env / .env file')

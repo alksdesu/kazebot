@@ -1,22 +1,41 @@
-"""四条 env 展开路径的一致性：节点 yaml、config.yaml provider、fallback 块、生图门控。
+"""四条 env 展开路径的一致性：节点 yaml、config.yaml provider、fallback 块、生图渠道。
 
 仓库自己的节点文件在用 $ENV{NEW|OLD} 回退写法，另外三条路径必须认同一套语法。
+生图那条住在 tools/ 里：工具是只吃标准库的子进程，导不了 clonoth_runtime，
+所以它只能自带一份实现 —— 也正因如此更要盯着别漂移。
 """
 from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
 
 import pytest
 
 from clonoth_runtime import resolve_env_ref
 from engine.builtin.fallback_provider import _resolve_env_value as fallback_resolve
-from engine.builtin.image_gen_gating import _resolve_ref as gating_resolve
 from supervisor.config_store import _resolve_env_value as config_resolve
 
-# 四条路径的入口签名不同，但语义必须一致。gating 多一个 .env 兜底参数。
+_spec = importlib.util.spec_from_file_location(
+    "_test_env_channel", Path(__file__).resolve().parents[1] / "tools" / "_channel.py")
+assert _spec and _spec.loader
+_channel = importlib.util.module_from_spec(_spec)
+sys.modules["_test_env_channel"] = _channel
+_spec.loader.exec_module(_channel)
+
+
+def channel_resolve(value: str, dotenv: dict[str, str] | None = None) -> str:
+    """走 Channel 的 _deref。槽位没配就是空块，这里只关心展开语法。"""
+    channel = _channel.Channel("image_gemini", root=Path(__file__).resolve().parents[1])
+    channel._dotenv = dict(dotenv or {})
+    return channel._deref(value)
+
+
 RESOLVERS = [
     pytest.param(resolve_env_ref, id="node_yaml"),
     pytest.param(config_resolve, id="config_provider"),
     pytest.param(fallback_resolve, id="fallback_block"),
-    pytest.param(lambda v: gating_resolve(v, {}), id="image_gating"),
+    pytest.param(channel_resolve, id="image_channel"),
 ]
 
 
@@ -67,18 +86,18 @@ def test_crlf_residue_is_stripped(resolve, monkeypatch):
     assert resolve("$ENV{DIRTY_MODEL}") == "gpt-4o-mini"
 
 
-def test_gating_falls_back_to_dotenv_when_process_env_missing(monkeypatch):
-    # 生图门控在引擎加载 .env 之前就要判断"配没配"，所以它多一层文件兜底。
+def test_channel_falls_back_to_dotenv_when_process_env_missing(monkeypatch):
+    # 工具是子进程，safe_subprocess_env() 会把 *_API_KEY 从环境里剥掉，只能读 .env 文件。
     monkeypatch.delenv("DRAW_MODEL", raising=False)
 
-    assert gating_resolve("$ENV{DRAW_MODEL}", {"DRAW_MODEL": "sd-xl"}) == "sd-xl"
-    assert gating_resolve("$ENV{ABSENT|DRAW_MODEL}", {"DRAW_MODEL": "sd-xl"}) == "sd-xl"
+    assert channel_resolve("$ENV{DRAW_MODEL}", {"DRAW_MODEL": "sd-xl"}) == "sd-xl"
+    assert channel_resolve("$ENV{ABSENT|DRAW_MODEL}", {"DRAW_MODEL": "sd-xl"}) == "sd-xl"
 
 
-def test_gating_prefers_process_env_over_dotenv(monkeypatch):
+def test_channel_prefers_process_env_over_dotenv(monkeypatch):
     monkeypatch.setenv("DRAW_MODEL", "from-process")
 
-    assert gating_resolve("${DRAW_MODEL}", {"DRAW_MODEL": "from-file"}) == "from-process"
+    assert channel_resolve("${DRAW_MODEL}", {"DRAW_MODEL": "from-file"}) == "from-process"
 
 
 def test_repo_node_syntax_resolves_through_config_store(monkeypatch):

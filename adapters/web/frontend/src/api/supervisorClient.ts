@@ -524,8 +524,17 @@ export interface SystemModelSlot {
   api_key_redacted: string;
 }
 
+/** 生图工具当前能不能跑通。含主渠道回退，与工具子进程同一份判定。 */
+export interface ImageToolStatus {
+  name: string;
+  slot: string;
+  available: boolean;
+}
+
 export interface SystemModelsResponse {
   slots: SystemModelSlot[];
+  image_tools?: ImageToolStatus[];
+  image_default_channel?: string;
 }
 
 export async function getSystemModels(token: string): Promise<SystemModelsResponse> {
@@ -645,6 +654,19 @@ export async function updateSystemModel(
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
     body: JSON.stringify(data),
+  });
+  return resp.json();
+}
+
+/** 配了多个生图渠道时默认用哪个。空串 = 交给模型按用途判断。 */
+export async function updateImageDefaultChannel(
+  token: string,
+  defaultChannel: string,
+): Promise<SystemModelsResponse> {
+  const resp = await apiFetch('/config/image-default-channel', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify({ default_channel: defaultChannel }),
   });
   return resp.json();
 }

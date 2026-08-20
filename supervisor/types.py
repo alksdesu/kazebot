@@ -323,6 +323,12 @@ class SystemModelUpdateIn(BaseModel):
     provider: str | None = None
 
 
+class ImageDefaultChannelIn(BaseModel):
+    """配了多个生图渠道时默认用哪个。空串 = 交给模型按用途判断。"""
+
+    default_channel: str = ""
+
+
 class OpenAIConfigPublic(BaseModel):
     # 只报有没有，不报是什么：这个形状走的是 /v1/config 和 /v1/config/openai，
     # 两个都没有令牌门，CLONOTH_HOST 一改就是全网可读。

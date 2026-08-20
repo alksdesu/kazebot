@@ -24,8 +24,8 @@ class MainChannel(NamedTuple):
     model: str = ""
 
 
-def _read_dotenv() -> dict[str, str]:
-    path = Path.cwd() / ".env"
+def _read_dotenv(root: Path) -> dict[str, str]:
+    path = root / ".env"
     if not path.exists():
         return {}
     pairs: dict[str, str] = {}
@@ -38,12 +38,12 @@ def _read_dotenv() -> dict[str, str]:
     return pairs
 
 
-def _read_config() -> dict:
+def _read_config(root: Path) -> dict:
     try:
         import yaml  # type: ignore
     except Exception:
         return {}
-    path = Path.cwd() / "data" / "config.yaml"
+    path = root / "data" / "config.yaml"
     if not path.exists():
         return {}
     try:
@@ -60,10 +60,13 @@ def _is_provider_block(value: object) -> bool:
 class Channel:
     """一个 system_models 槽位的配置视图。"""
 
-    def __init__(self, slot: str) -> None:
+    def __init__(self, slot: str, *, root: Path | None = None) -> None:
+        # root 默认 cwd：工具是以工作区为 cwd 拉起的子进程。主进程里的调用方
+        # （提示词注入）cwd 不一定在工作区，得把 root 显式传进来。
+        base = Path(root) if root is not None else Path.cwd()
         self.slot = (slot or "").strip().lower()
-        self._dotenv = _read_dotenv()
-        self._config = _read_config()
+        self._dotenv = _read_dotenv(base)
+        self._config = _read_config(base)
         block = (self._config.get("system_models") or {}) if isinstance(self._config, dict) else {}
         block = block.get(self.slot) if isinstance(block, dict) else None
         self._block = block if isinstance(block, dict) else {}
@@ -71,11 +74,19 @@ class Channel:
     def env(self, key: str) -> str:
         return (os.environ.get(key, "") or self._dotenv.get(key, "")).strip()
 
+    def first_env(self, names: str) -> str:
+        """取第一个有值的变量。仓库的节点文件在用 $ENV{NEW|OLD} 这种回退写法。"""
+        for name in str(names or "").split("|"):
+            value = self.env(name.strip())
+            if value:
+                return value
+        return ""
+
     def _deref(self, value: object) -> str:
         text = str(value or "").strip()
         for head in ("${", "$ENV{"):
             if text.startswith(head) and text.endswith("}") and len(text) > len(head) + 1:
-                return self.env(text[len(head):-1].strip())
+                return self.first_env(text[len(head):-1].strip())
         return text
 
     def own(self, field: str, env_suffix: str) -> str:
@@ -113,3 +124,77 @@ class Channel:
             api_key=self._deref(block.get("api_key")),
             model=self._deref(block.get("model")),
         )
+
+    def main_for(self, *providers: str) -> MainChannel:
+        """主渠道属于这几家之一时才把它交出去，否则当作没配。
+
+        专用端点的请求格式跟 provider 绑死，拿 Gemini 的地址发 OpenAI 格式只会 404。
+        """
+        wanted = {str(p or "").strip().lower() for p in providers if str(p or "").strip()}
+        main = self.main()
+        return main if main.provider in wanted else MainChannel()
+
+
+class ImageSlotSpec(NamedTuple):
+    """一个生图槽位的回退链。"""
+
+    providers: tuple[str, ...]      # 主渠道属于这几家时才可借
+    key_envs: tuple[str, ...]
+    url_envs: tuple[str, ...]
+    default_model: str
+    default_base_url: str = ""      # 留空表示这家没有公开的默认端点，必须配地址
+    strip_v1_suffix: bool = False
+
+
+IMAGE_SLOTS: dict[str, ImageSlotSpec] = {
+    "image_gpt": ImageSlotSpec(
+        providers=tuple(sorted(OPENAI_COMPATIBLE)),
+        key_envs=("OPENAI_API_KEY",),
+        url_envs=("OPENAI_BASE_URL",),
+        default_model="gpt-image-2",
+    ),
+    "image_gemini": ImageSlotSpec(
+        providers=("gemini",),
+        key_envs=("GEMINI_API_KEY", "OPENAI_API_KEY"),
+        url_envs=("GEMINI_BASE_URL", "OPENAI_BASE_URL"),
+        default_model="gemini-3-pro-image-preview",
+        default_base_url="https://generativelanguage.googleapis.com",
+        strip_v1_suffix=True,
+    ),
+}
+
+
+class ImageChannel(NamedTuple):
+    api_key: str = ""
+    base_url: str = ""
+    model: str = ""
+
+    @property
+    def usable(self) -> bool:
+        return bool(self.api_key and self.base_url)
+
+
+def resolve_image_channel(
+    slot: str, *, root: Path | None = None, model_override: str = "",
+) -> ImageChannel:
+    """生图槽位的完整解析。工具和提示词注入共用这一份，判定才不会打架。
+
+    model 不跟着主渠道借：那边配的是聊天模型，生图端点认不了。
+    """
+    spec = IMAGE_SLOTS.get((slot or "").strip().lower())
+    if spec is None:
+        return ImageChannel()
+    channel = Channel(slot, root=root)
+    main = channel.main_for(*spec.providers)
+    api_key = channel.pick(
+        "api_key", "API_KEY", *(channel.env(name) for name in spec.key_envs), main.api_key,
+    )
+    base_url = channel.pick(
+        "base_url", "BASE_URL", *(channel.env(name) for name in spec.url_envs), main.base_url,
+    ).rstrip("/")
+    if spec.strip_v1_suffix and base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+    model = str(model_override or "").strip() or channel.pick("model", "MODEL", spec.default_model)
+    return ImageChannel(
+        api_key=api_key, base_url=base_url or spec.default_base_url, model=model,
+    )

@@ -12,11 +12,9 @@ as an attachment path compatible with Clonoth's multimodal pipeline.
   - 图片发送统一交给 supervisor 的 dispatch_attachment 路由（子节点任务完成时
     自动发送），工具本身不再 POST intermediate_reply，避免双发同一张图。
 
-API 渠道配置（与 read_image / system_models 一致）：
-  优先读 data/config.yaml 的 system_models.image_gemini（model/base_url/api_key），
-  其次 slot 专属环境变量 CLONOTH_IMAGE_GEMINI_*，留空则回退主渠道
-  （api_key: GEMINI_API_KEY > OPENAI_API_KEY；base_url: OPENAI_BASE_URL；
-   model 默认 gemini-3-pro-image-preview）。
+API 渠道配置见 _channel.resolve_image_channel：system_models.image_gemini >
+CLONOTH_IMAGE_GEMINI_* > GEMINI_* > OPENAI_* > 主渠道（仅当主渠道本身是 Gemini）。
+model 不跟主渠道走，默认 gemini-3-pro-image-preview。
 """
 
 SPEC = {
@@ -109,34 +107,23 @@ if __name__ == "__main__":
     else:
         image_paths = []
 
-    # 生图渠道独立于主渠道：这是个专用端点，跟着主渠道换家没有意义。
-    # 优先级：config.yaml system_models.image_gemini > CLONOTH_IMAGE_GEMINI_* > GEMINI_* > OPENAI_*
+    # 优先级：config.yaml system_models.image_gemini > CLONOTH_IMAGE_GEMINI_* > GEMINI_*
+    # > OPENAI_* > 主渠道。主渠道只在它本身就是 Gemini 时才借 —— 这里走的是原生
+    # generateContent，别家的地址接不住。model 不跟着借：那个是聊天模型。
     if str(Path(__file__).resolve().parent) not in sys.path:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _channel import Channel
+    from _channel import resolve_image_channel
     from _image import ImagePayloadError, build_image_part
 
-    channel = Channel("image_gemini")
-
-    model = str(args.get("model") or "").strip()
-    if not model:
-        model = channel.pick("model", "MODEL", "gemini-3-pro-image-preview")
-
-    api_key = channel.pick(
-        "api_key", "API_KEY", channel.env("GEMINI_API_KEY"), channel.env("OPENAI_API_KEY"),
-    )
-    base_url = channel.pick(
-        "base_url", "BASE_URL", channel.env("GEMINI_BASE_URL"), channel.env("OPENAI_BASE_URL"),
-    ).rstrip("/")
+    channel = resolve_image_channel("image_gemini", model_override=str(args.get("model") or ""))
+    model = channel.model
+    api_key = channel.api_key
+    base_url = channel.base_url
 
     if not api_key:
         fail("No API key found in config.yaml / env / .env file")
 
     # ---- 构建请求 ----
-    if base_url.endswith("/v1"):
-        base_url = base_url[:-3]
-    if not base_url:
-        base_url = "https://generativelanguage.googleapis.com"
     url = f"{base_url}/v1beta/models/{model}:generateContent?key={api_key}"
 
     parts = []

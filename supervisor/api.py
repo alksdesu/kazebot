@@ -31,6 +31,7 @@ from .types import (
     Event,
     HandoffEventIn,
     HealthOut,
+    ImageDefaultChannelIn,
     InboundAckIn,
     InboundAckOut,
     InboundMessageIn,
@@ -346,6 +347,17 @@ def create_app(
                 slot, base_url=body.base_url, api_key=body.api_key,
                 model=body.model, provider=body.provider,
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put("/v1/config/image-default-channel")
+    async def put_image_default_channel(
+        body: ImageDefaultChannelIn, request: Request,
+    ) -> dict[str, Any]:
+        verify_admin_token(request)
+        cs: ConfigStore = app.state.config_store
+        try:
+            return cs.set_image_default_channel(body.default_channel)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

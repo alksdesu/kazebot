@@ -5,7 +5,12 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from clonoth_runtime import SYSTEM_MODEL_SLOTS, resolve_env_ref
+from clonoth_runtime import (
+    IMAGE_TOOL_SLOTS,
+    SYSTEM_MODEL_SLOTS,
+    image_tool_available,
+    resolve_env_ref,
+)
 
 from .types import (
     ActiveProviderSecret,
@@ -215,7 +220,9 @@ class ConfigStore:
 
     # [2026-07-16] node_fallbacks / system_models 是可选配置块，不是 provider
     # 块，列为 meta key 避免被当成 provider 展示/删除。
-    _META_KEYS = frozenset({"version", "provider", "fallbacks", "node_fallbacks", "system_models"})
+    _META_KEYS = frozenset({
+        "version", "provider", "fallbacks", "node_fallbacks", "system_models", "image_gen",
+    })
 
     def _load_raw(self) -> dict[str, Any]:
         """Load raw YAML dict from disk."""
@@ -389,7 +396,55 @@ class ConfigStore:
                     "api_key_present": present,
                     "api_key_redacted": redacted,
                 })
-            return {"slots": slots}
+            return {
+                "slots": slots,
+                "image_tools": self._image_tools_public(),
+                "image_default_channel": self._read_image_default_channel(),
+            }
+
+    @property
+    def _workspace_root(self) -> Path:
+        """config.yaml 固定在 <workspace>/data/ 下。"""
+        return self.path.parent.parent
+
+    def _image_tools_public(self) -> list[dict[str, Any]]:
+        """生图工具的真实可用性。含主渠道回退，跟工具子进程同源。"""
+        root = self._workspace_root
+        return [
+            {"name": name, "slot": slot, "available": image_tool_available(root, name)}
+            for name, slot in IMAGE_TOOL_SLOTS.items()
+        ]
+
+    def _read_image_default_channel(self) -> str:
+        block = self._load_raw().get("image_gen")
+        if not isinstance(block, dict):
+            return ""
+        name = str(block.get("default_channel") or "").strip()
+        return name if name in IMAGE_TOOL_SLOTS else ""
+
+    def set_image_default_channel(self, name: str) -> dict[str, Any]:
+        """配了多个生图渠道时用哪个。空串 = 交给模型按用途判断。"""
+        text = str(name or "").strip()
+        if text and text not in IMAGE_TOOL_SLOTS:
+            raise ValueError(f"Unknown image tool '{text}'")
+        with self._lock:
+            data = self._load_raw()
+            block = data.get("image_gen")
+            if not isinstance(block, dict):
+                block = {}
+            if text:
+                block["default_channel"] = text
+                data["image_gen"] = block
+            else:
+                block.pop("default_channel", None)
+                # 空块留在 yaml 里只会让人以为配过什么。
+                if block:
+                    data["image_gen"] = block
+                else:
+                    data.pop("image_gen", None)
+            self._save_raw(data)
+            self.reload()
+            return self.get_system_models_public()
 
     def update_system_model(
         self, slot: str, *, base_url: str | None = None, api_key: str | None = None,

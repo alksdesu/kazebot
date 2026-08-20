@@ -6,7 +6,9 @@ import { useEffect, useMemo, useState } from 'react';
 
 import {
   getSystemModels,
+  updateImageDefaultChannel,
   updateSystemModel,
+  type ImageToolStatus,
   type ProviderProfiles,
   type SystemModelSlot,
   type SystemModelsResponse,
@@ -134,6 +136,35 @@ const Row = ({
   );
 };
 
+/** 只在真有得选时出现：一个渠道时没什么可选，一个都没有时该去填 key 而不是选默认。 */
+const ImageDefault = ({ tools, value, onPick }: {
+  tools: ImageToolStatus[];
+  value: string;
+  onPick: (next: string) => void;
+}) => {
+  const live = tools.filter((tool) => tool.available);
+  if (live.length < 2) return null;
+  return (
+    <li className="qc-cap">
+      <div className="qc-cap-head">
+        <span className="qc-cap-name">默认生图渠道</span>
+      </div>
+      <p className="qc-cap-desc">两个渠道都配好了。模型拿不准用哪个时走这里选的那个。</p>
+      <FieldRow label="默认用">
+        <select
+          aria-label="默认生图渠道"
+          className="qc-inp"
+          onChange={(event) => onPick(event.target.value)}
+          value={value}
+        >
+          <option value="">按用途自动判断</option>
+          {live.map((tool) => <option key={tool.name} value={tool.name}>{tool.name}</option>)}
+        </select>
+      </FieldRow>
+    </li>
+  );
+};
+
 export const SystemSlots = ({ providerNames, profiles, activeProvider }: {
   providerNames: string[];
   profiles: ProviderProfiles | null;
@@ -141,6 +172,9 @@ export const SystemSlots = ({ providerNames, profiles, activeProvider }: {
 }) => {
   const token = useSettingsStore((state) => state.adminToken);
   const [drafts, setDrafts] = useState<Draft[]>([]);
+  const [imageTools, setImageTools] = useState<ImageToolStatus[]>([]);
+  const [imageDefault, setImageDefault] = useState('');
+  const [savedImageDefault, setSavedImageDefault] = useState('');
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
@@ -148,6 +182,9 @@ export const SystemSlots = ({ providerNames, profiles, activeProvider }: {
 
   const absorb = (data: SystemModelsResponse) => {
     setDrafts(data.slots.map(toDraft));
+    setImageTools(data.image_tools ?? []);
+    setImageDefault(data.image_default_channel ?? '');
+    setSavedImageDefault(data.image_default_channel ?? '');
     setLoaded(true);
   };
 
@@ -159,7 +196,10 @@ export const SystemSlots = ({ providerNames, profiles, activeProvider }: {
     });
   }, [token]);
 
-  const dirty = useMemo(() => drafts.some(changed), [drafts]);
+  const dirty = useMemo(
+    () => drafts.some(changed) || imageDefault !== savedImageDefault,
+    [drafts, imageDefault, savedImageDefault],
+  );
 
   const save = async () => {
     if (!token) return;
@@ -177,6 +217,10 @@ export const SystemSlots = ({ providerNames, profiles, activeProvider }: {
           provider: draft.slot.supports_provider ? draft.provider : '',
           ...(key ? { api_key: key } : {}),
         });
+      }
+      // 放在槽位之后：改完 key 才知道现在到底有几个渠道可选。
+      if (imageDefault !== savedImageDefault) {
+        latest = await updateImageDefaultChannel(token, imageDefault);
       }
       if (latest) {
         absorb(latest);
@@ -206,6 +250,7 @@ export const SystemSlots = ({ providerNames, profiles, activeProvider }: {
               providerNames={providerNames}
             />
           ))}
+          <ImageDefault onPick={setImageDefault} tools={imageTools} value={imageDefault} />
         </ul>
       )}
       {error && <p className="qc-login-error">{error}</p>}
@@ -214,7 +259,10 @@ export const SystemSlots = ({ providerNames, profiles, activeProvider }: {
         dirty={dirty}
         label="保存槽位"
         note={note}
-        onReset={() => setDrafts(drafts.map((draft) => toDraft(draft.slot)))}
+        onReset={() => {
+          setDrafts(drafts.map((draft) => toDraft(draft.slot)));
+          setImageDefault(savedImageDefault);
+        }}
         onSave={() => void save()}
       />
     </Block>

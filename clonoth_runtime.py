@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -318,6 +319,49 @@ SYSTEM_MODEL_SLOTS: tuple[SlotSpec, ...] = (
 )
 
 _SYSTEM_MODEL_ENV_PREFIX = {spec.key: spec.env_prefix for spec in SYSTEM_MODEL_SLOTS}
+
+# 生图工具名 → system_models 槽位。控制台的默认渠道选项也认这两个名字。
+IMAGE_TOOL_SLOTS: dict[str, str] = {
+    "gpt_image_2": "image_gpt",
+    "gemini_image": "image_gemini",
+}
+
+_image_channel_module: Any = None
+
+
+def _load_image_channel_module(workspace_root: Path) -> Any:
+    """加载 tools/_channel.py。
+
+    生图渠道的回退链只此一份，工具子进程和主进程都读它 —— 各写各的必然演化成
+    「工具能跑但提示词说没配」。不走 sys.path：`_channel` 这名字太通用会撞。
+    """
+    global _image_channel_module
+    if _image_channel_module is not None:
+        return _image_channel_module
+    path = Path(workspace_root) / "tools" / "_channel.py"
+    if not path.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("clonoth_image_channel", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _image_channel_module = module
+    return module
+
+
+def image_tool_available(workspace_root: Path, tool_name: str) -> bool:
+    """这个生图工具现在能不能跑通。"""
+    slot = IMAGE_TOOL_SLOTS.get(str(tool_name or "").strip())
+    if not slot:
+        return False
+    module = _load_image_channel_module(workspace_root)
+    if module is None:
+        return False
+    try:
+        return bool(module.resolve_image_channel(slot, root=Path(workspace_root)).usable)
+    except Exception:
+        return False
 
 
 def _load_config_yaml(workspace_root: Path) -> dict[str, Any]:
