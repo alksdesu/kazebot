@@ -267,6 +267,11 @@ _group_history: DefaultDict[int, Deque["GroupHistoryLine"]] = defaultdict(lambda
 _group_history_seq: DefaultDict[int, int] = defaultdict(int)
 # 被缓存上限吃掉、且当时还没送到 engine 的最高序号。seq 逐 1 递增，缺了几行由它和水位算出来。
 _group_history_gap: Dict[int, int] = {}
+# 群号 → 清空上下文那一刻的 inbound 序号。清空时还在飞的任务照样会回来投递，
+# 它带的是上一段上下文的产物，落回刚清空的缓存就等于没清。
+_context_clear_barrier: Dict[int, int] = {}
+# 至今见过的最大 inbound 序号，用来给上面那道门槛定位。
+_last_inbound_seq: int = 0
 
 # EventRouter 回调只拿到 session/trigger，因此这里保存发送最终回复所需的平台对象。
 _session_targets: Dict[str, Dict[str, Any]] = {}
@@ -3890,6 +3895,35 @@ def _reset_group_history_watermark(group_id: int) -> None:
     _group_history_gap.pop(int(group_id), None)
 
 
+def _note_inbound_seq(seq: Any) -> None:
+    """记下见过的最大 inbound 序号。清空上下文时拿它划界。"""
+    global _last_inbound_seq
+    value = int(seq or 0)
+    if value > _last_inbound_seq:
+        _last_inbound_seq = value
+
+
+def _raise_context_clear_barrier(group_id: int, cleaned_triggers: Any = None) -> None:
+    """把清空时刻记成一道门槛，序号不高于它的投递都算上一段上下文的产物。"""
+    seqs = [
+        int(getattr(trigger, "inbound_seq", 0) or 0)
+        for trigger in (cleaned_triggers or [])
+    ]
+    _context_clear_barrier[int(group_id)] = max([_last_inbound_seq, *seqs])
+
+
+def _is_stale_delivery(group_id: Any, send_context: Any) -> bool:
+    """这次投递是不是清空之前那段上下文的产物。"""
+    if group_id is None:
+        return False
+    barrier = _context_clear_barrier.get(int(group_id), 0)
+    if not barrier:
+        return False
+    seq = int(getattr(send_context, "source_inbound_seq", 0) or 0)
+    # 取不到来源序号就放行：宁可多留一条，也不能把正常回复从群历史里抹掉。
+    return bool(seq) and seq <= barrier
+
+
 def _purge_conversation_side_state(conversation_key: str, target: Dict[str, Any]) -> None:
     """清掉一个会话散落在 bot 进程与附件目录里的上下文副本，让它真正从零重新积累。
 
@@ -5410,6 +5444,8 @@ async def _submit_or_preempt_inbound(
     if not result.session_id or not result.accepted:
         return False
 
+    _note_inbound_seq(result.inbound_seq)
+
     if group_id is not None and history_watermark >= 0:
         if result.inbound_seq:
             # 等 inbound_accepted 再推进：supervisor 没真正收下就推，那几行历史就没人再发了。
@@ -6734,7 +6770,9 @@ async def _send_attachments_confirmed(
                 bot, target, attachments, send_context=send_context
             )
             # Register/finish only after every platform-visible send is confirmed.
-            _record_sent_attachments(_ensure_bucket_target(dict(target)), attachments)
+            # 清空上下文之前派出去的那轮除外：图照发，但索引不该留在刚清空的会话里。
+            if not _is_stale_delivery(target.get("group_id"), send_context):
+                _record_sent_attachments(_ensure_bucket_target(dict(target)), attachments)
     except Exception:
         logger.warning("onebot_attachment_batch_failed", exc_info=True)
         raise
@@ -6754,6 +6792,11 @@ async def _send_text_and_attachments(
 ) -> None:
     """统一发送最终文本/附件，并持久绑定回复所依据的来源图片。"""
     conv_key = target.get("conversation_key")
+    # 上下文被清空时这一轮还在飞，回复照发（群友问了总得有个答复），但一律不落缓存 ——
+    # 它是上一段上下文的产物，落回去下一轮又会被带给模型，等于那次清空没生效。
+    stale = target.get("type") == "group" and _is_stale_delivery(target.get("group_id"), send_context)
+    if stale:
+        logger.info("skip context write-back for group %s: delivery predates the reset", target.get("group_id"))
     # 2026-05-01 修改原因：私聊没有群历史缓存，不应写入 _group_history；群聊
     # 仍保留原来的 Bot 回复入库逻辑，维持后续 @Bot 请求的上下文连续性。
     if text:
@@ -6765,7 +6808,7 @@ async def _send_text_and_attachments(
             send_context=send_context,
         ) and target.get("type") == "group":
             group_id = target.get("group_id")
-            if group_id is not None:
+            if group_id is not None and not stale:
                 _record_bot_reply(int(group_id), text)
     if attachments:
         # Delivery completion means the platform-confirmed final attachment send,
@@ -7178,9 +7221,16 @@ class TangQiuCallbacks:
         group_id = target.get("group_id")
         if target.get("type") == "group" and group_id is not None:
             _reset_group_history_watermark(int(group_id))
+            if reason != "compact":
+                # compact 不清缓存，也就没有「旧产物落回空缓存」这回事。
+                _raise_context_clear_barrier(int(group_id), cleaned_triggers)
 
     async def on_engine_restarted(self, payload: Dict[str, Any]) -> None:
         """Engine 重启后无法确认各群历史是否还在 engine 侧，全部重置以重发一次完整历史。"""
+        # 序号由 supervisor 分配，重启后不保证还在原来那条线上；留着旧门槛会把之后
+        # 每一条正常回复都判成过期。此时在飞的任务也已经全没了，门槛没有意义。
+        # 放在 _session_state 守卫之前：这件事跟水位存不存在无关。
+        _context_clear_barrier.clear()
         if _session_state is None:
             return
         for group_id in list(_group_history.keys()):
