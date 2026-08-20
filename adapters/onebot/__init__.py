@@ -73,6 +73,7 @@ from .config import (
     PENDING_APPROVAL_TTL_SECONDS,
 )
 from . import capability
+from .echo_policy import EchoEntry, detect_echo, is_echoable_text
 from . import bot_scope as _bot_scope
 from .conversation_hash import digest as _digest_conversation_key, resolve_secret
 from .yaml_loader import load_yaml
@@ -351,6 +352,10 @@ _recent_images: "_BucketMap" = _BucketMap(lambda: deque(maxlen=RECENT_IMAGE_MAX_
 # QQ 群文件是独立一条消息、带不了 @，那条永远不会触发 bot。不在这里留一手，
 # 下一条「读一下上面那个文件」就再也拿不到它了。
 _recent_files: "_BucketMap" = _BucketMap(lambda: deque(maxlen=RECENT_FILE_MAX_ITEMS), _CONVERSATION_BUCKET_MAX_KEYS)
+# 复读判定只看内容指纹和发言人，不用整条历史：判完就丢，不参与任何送达账本。
+_echo_recent: DefaultDict[int, Deque[EchoEntry]] = defaultdict(lambda: deque(maxlen=12))
+# 每个群最近跟过的那句，防止人再补一条又凑够数、Bot 一路接力。
+_echo_last: Dict[int, tuple[str, float]] = {}
 # 借 group_history_max 定容量，但语义不同：这份副本只供 qq_forward 挑选转发候选，没有送达账本，
 # 因此不参与缺口记账、也不吃未送达倍数。调小群历史条数会顺带缩小可转发范围，至少 20 条。
 _group_content_records: DefaultDict[int, Deque[GroupContentRecord]] = defaultdict(lambda: deque(maxlen=max(live.group_history_max, 20)))
@@ -8476,6 +8481,82 @@ async def _record_non_trigger_message(bot: Bot, event: GroupMessageEvent) -> Non
         )
         _remember_recent_images(stable_conversation_key, event, attachments)
         _record_group_message(event, bot, override_text=expanded_text, attachments=attachments)
+        await _maybe_echo_group_message(bot, event, expanded_text)
+
+
+def _echo_key_for_message(message: Any, text: str) -> str:
+    """这条消息用于复读比对的内容指纹。跟不了就返回空串。
+
+    表情包不能用正文比：三个人各发一张不同的图，_message_to_text 都会渲染成
+    「[表情包]」，光比文本会把它们判成复读。所以图片一律拿 file/url 当指纹。
+    """
+    segments = list(message) if message is not None else []
+    kinds = set()
+    image_id = ""
+    for segment in segments:
+        seg_type, data = _segment_type_and_data(segment)
+        if seg_type == "text":
+            if str(data.get("text") or "").strip():
+                kinds.add("text")
+            continue
+        if seg_type in IMAGE_SEGMENT_TYPES:
+            kinds.add("image")
+            # emoji_id 是商城表情的稳定标识，url 每次取都可能带不同的鉴权参数。
+            image_id = str(
+                data.get("emoji_id") or data.get("file") or _segment_image_url(data) or ""
+            ).strip()
+            continue
+        # 语音、视频、卡片、@ 之类一律不跟。
+        kinds.add("other")
+
+    if kinds == {"image"} and image_id:
+        return f"img:{image_id}"
+    if kinds == {"text"}:
+        return f"txt:{text.strip()}"
+    return ""
+
+
+async def _maybe_echo_group_message(bot: Bot, event: GroupMessageEvent, text: str) -> None:
+    """连着 N 个不同的人刷同一句，Bot 也跟一条。全程不进模型。"""
+    if not live.enable_echo:
+        return
+    group_id = int(event.group_id)
+    try:
+        message = event.get_message()
+    except Exception:
+        message = None
+    key = _echo_key_for_message(message, text)
+    if not key:
+        return
+    if key.startswith("txt:") and not is_echoable_text(key[4:], max_length=live.echo_max_length):
+        return
+
+    now = time.time()
+    _echo_recent[group_id].append(EchoEntry(key, str(event.user_id), now))
+    last_key, last_at = _echo_last.get(group_id, ("", 0.0))
+    if now - last_at < live.echo_cooldown_sec:
+        return
+    hit = detect_echo(
+        _echo_recent[group_id],
+        threshold=live.echo_threshold,
+        now=now,
+        max_age_seconds=live.echo_window_sec,
+        already_echoed=last_key,
+    )
+    if not hit:
+        return
+
+    if hit.startswith("img:"):
+        payload = MessageSegment.image(hit[4:])
+    else:
+        payload = MessageSegment.text(hit[4:])
+    try:
+        await bot.send_group_msg(group_id=group_id, message=Message(payload))
+    except Exception:
+        # 跟读失败无所谓，不值得惊动用户，更不该把异常抛回 matcher 链。
+        logger.debug("echo send failed for group %s", group_id, exc_info=True)
+        return
+    _echo_last[group_id] = (hit, now)
 
 
 # 群文件上传通知记录器。部分 OneBot 实现把普通文件作为 notice 上报，而不是 message file 段。

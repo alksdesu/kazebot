@@ -239,6 +239,20 @@ export const PersonaPage = () => (
           desc="上一条还没答完就来了新消息时，放弃旧的去答新的。"
           label="抢答"
         />
+        <BoolOption
+          configKey="enable_echo"
+          desc="连着几个人刷同一句时，也跟一条。"
+          label="跟复读"
+        >
+          <NumberField configKey="echo_threshold" label="连续" unit="条才跟" />
+          <NumberField configKey="echo_max_length" label="最长" unit="字" />
+          <NumberField configKey="echo_window_sec" label="时间窗" unit="秒" />
+          <NumberField configKey="echo_cooldown_sec" label="跟完歇" unit="秒" />
+          <p className="qc-opt-desc">
+            必须是不同的人发的，同一个人连刷不算。命令、@、回复和长文本一律不跟；表情包按图片本身比对，
+            三个人发三张不同的图不会被当成复读。
+          </p>
+        </BoolOption>
         <Option checked disabled name="表情提示" onChange={() => undefined}>
           <p className="qc-opt-desc">告诉模型有哪些收藏表情可用。0 表示不告诉它。</p>
           <NumberField configKey="face_prompt_limit" label="最多列出" unit="个" />

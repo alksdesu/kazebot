@@ -437,6 +437,31 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         "enable_preempt", "extensions.preempt", BOOL, False,
         env=("ONEBOT_ENABLE_PREEMPT",),
     ),
+    LiveKey(
+        "enable_echo", "extensions.echo.enabled", BOOL, False,
+        env=("ONEBOT_ECHO_ENABLED",),
+        note="连着几个人刷同一句时 Bot 也跟一条",
+    ),
+    LiveKey(
+        "echo_threshold", "extensions.echo.threshold", int_in(min_value=2, max_value=10), 3,
+        env=("ONEBOT_ECHO_THRESHOLD",),
+        note="几条相同消息才跟，且必须来自不同的人",
+    ),
+    LiveKey(
+        "echo_max_length", "extensions.echo.max_text_length", int_in(min_value=1, max_value=200), 30,
+        env=("ONEBOT_ECHO_MAX_TEXT_LENGTH",),
+        note="超过这个长度不跟：长文本复读是刷屏，不是接龙",
+    ),
+    LiveKey(
+        "echo_window_sec", "extensions.echo.window_sec", float_in(min_value=1.0, max_value=3600.0), 120.0,
+        env=("ONEBOT_ECHO_WINDOW_SEC",),
+        note="复读要在这个时间窗内连续发生才算数",
+    ),
+    LiveKey(
+        "echo_cooldown_sec", "extensions.echo.cooldown_sec", float_in(min_value=0.0, max_value=86400.0), 90.0,
+        env=("ONEBOT_ECHO_COOLDOWN_SEC",),
+        note="同一个群两次跟读之间至少隔这么久",
+    ),
     # 输入能力
     LiveKey(
         "enable_image_input", "input.image", BOOL, True,
