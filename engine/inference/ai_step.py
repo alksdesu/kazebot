@@ -2171,6 +2171,22 @@ async def run_ai_node(
                         "llm_request_id": getattr(ls.rctx, "current_llm_request_id", ""),
                         "text": _clean_text,
                     })
+            else:
+                # 解析失败也得把协议标记剥掉。hybrid 会把剩下的正文当隐式 finish 发出去，
+                # 不剥就是把 <<<TOOL_CALL>>> 连同脚本原样甩给用户 —— 越出错暴露得越多。
+                _stripped = formatter.get_plain_text(resp)
+                if (_stripped or "") != (resp.text or ""):
+                    logger.error(
+                        "tool call parse failed; stripped protocol markers from plain text (node=%s)",
+                        ls.node.id,
+                    )
+                    resp = ProviderResponse(
+                        ok=True,
+                        text=_stripped,
+                        reasoning=resp.reasoning,
+                        status_code=resp.status_code,
+                        usage=resp.usage,
+                    )
 
         if resp.tool_calls:
             action = await _handle_tool_calls(ls, resp, step)

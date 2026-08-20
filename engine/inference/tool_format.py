@@ -667,7 +667,9 @@ class JsonToolFormatter(ToolFormatter):
         except Exception:
             name = name_match.group(1)
         args: dict[str, Any] = {}
-        for key in ("text", "summary", "target", "query", "message"):
+        # command / content / path 是多行参数的重灾区 —— 脚本和文件正文里全是裸换行，
+        # 正好是让 json.loads 失败的那种输入，捞不出来就等于整个调用丢了。
+        for key in ("text", "summary", "target", "query", "message", "command", "content", "path"):
             value = cls._extract_broken_json_string(raw, key)
             if value is not None:
                 args[key] = value
@@ -733,9 +735,17 @@ class JsonToolFormatter(ToolFormatter):
                 return obj
         except json.JSONDecodeError:
             pass
+        # 宽松解析：往 command / content 里塞多行脚本时，模型给的是裸换行而不是 \n，
+        # 严格模式判它非法控制字符。strict=False 照收，字符串内容一字不差。
+        try:
+            obj = json.loads(text, strict=False)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
         # 回退：用 raw_decode 提取第一个 JSON 对象
         try:
-            decoder = json.JSONDecoder()
+            decoder = json.JSONDecoder(strict=False)
             idx = text.find("{")
             if idx >= 0:
                 obj, _ = decoder.raw_decode(text, idx)
