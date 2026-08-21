@@ -124,11 +124,7 @@ const Row = ({
       )}
 
       {!slot.supports_provider && draft.baseUrl && (
-        <p className="qc-cap-desc">
-          这一项由工具进程直接请求，格式固定，换成别家的地址会失败。
-          {/* Gemini 那栏会自己剥掉 /v1，只有这里少写一段就静默 404。 */}
-          {slot.key === 'image_gpt' && '地址要写到 /v1 为止。'}
-        </p>
+        <p className="qc-cap-desc">这一项由工具进程直接请求，格式固定，换成别家的地址会失败。</p>
       )}
       {slot.supports_provider && draft.baseUrl && !draft.provider && (
         <p className="qc-cap-desc">换家要连渠道一起选，只改地址会按主渠道的格式发出去。</p>
@@ -240,6 +236,10 @@ export const SystemSlots = ({ providerNames, profiles, activeProvider }: {
 
   return (
     <Block hint="压缩、摘要、读图这些内部用途各自可以走独立渠道，留空则跟随主渠道" title="系统槽位">
+      {/* 各家的版本段位置不同，填错了一律静默 404，光看输入框看不出来。 */}
+      <p className="qc-facts">
+        地址写到哪一级看渠道：OpenAI 系（含生图 GPT）要带 <code>/v1</code>，Claude 与 Gemini 不带。
+      </p>
       {drafts.length === 0 ? (
         <Empty>没有可配的槽位。</Empty>
       ) : (
