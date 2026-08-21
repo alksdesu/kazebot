@@ -9,6 +9,7 @@ import {
   qqPinAccount,
   qqQuickLogin,
   type QqAccount,
+  type QqQuickLoginTarget,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Empty } from './components';
@@ -122,9 +123,11 @@ export const AccountPage = () => {
     setBusy(false);
   };
 
-  const switchTo = async (uin: string) => {
+  const switchTo = async (target: QqQuickLoginTarget) => {
     if (!token) return;
-    if (!window.confirm(`切换到 ${uin}？当前账号会下线，会话和长期记忆各号各算。`)) return;
+    const { uin } = target;
+    const who = target.nick ? `${target.nick}（${uin}）` : uin;
+    if (!window.confirm(`切换到 ${who}？当前账号会下线，会话和长期记忆各号各算。`)) return;
     setBusy(true);
     try {
       await qqQuickLogin(token, uin);
@@ -265,7 +268,7 @@ export const AccountPage = () => {
                     <button
                       className="qc-btn qc-btn-quiet"
                       disabled={busy || current || !usable}
-                      onClick={() => void switchTo(target.uin)}
+                      onClick={() => void switchTo(target)}
                       type="button"
                     >
                       {current ? '当前账号' : '切到这个号'}
