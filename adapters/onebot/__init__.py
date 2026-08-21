@@ -4701,6 +4701,33 @@ def _conversation_digest(conversation_key: str) -> str:
     )
 
 
+def _scoped_stable_key(real_conversation_key: str) -> str:
+    """按当前作用域算稳定键。纯计算，不登记映射也不分配别名。"""
+    if real_conversation_key.startswith("qq_group:"):
+        prefix = "qq_group"
+    elif real_conversation_key.startswith("qq_private:"):
+        prefix = "qq_private"
+    else:
+        prefix = "qq_unknown"
+    return f"{prefix}:{_conversation_digest(real_conversation_key)}"
+
+
+def _current_scope_keys() -> List[str]:
+    """已知会话在当前号下的稳定键。
+
+    摘要带 bot 作用域，换号后同一个群算出的键完全不同，两个号的会话于是并排堆在
+    控制台里分不出谁是谁。密钥只有本进程有，所以这里正推一遍结果交给 supervisor，
+    它拿集合做归类就行，不必知道密钥。
+    """
+    keys: set[str] = set()
+    for real in set(_real_conversation_keys.values()):
+        try:
+            keys.add(_scoped_stable_key(str(real)))
+        except Exception:
+            continue
+    return sorted(keys)
+
+
 def _stable_conversation_key(real_conversation_key: str) -> str:
     """把真实 QQ 会话键转换为可持久化的稳定哈希键，避免 Supervisor 泄漏群号/QQ号。"""
     if real_conversation_key.startswith("qq_group:"):
@@ -8298,8 +8325,33 @@ def _live_runtime_facts() -> Dict[str, Any]:
 
 _group_names: Dict[str, str] = {}
 _group_names_at = 0.0
+_group_names_seeded = False
 # 群名极少变，而 reconcile 每 2 秒转一圈，跟着它调 API 纯属浪费。
 _GROUP_NAME_REFRESH_SEC = 300.0
+
+
+def _seed_group_names() -> None:
+    """把上次记下的群名读回来。
+
+    这份字典是「已知群名」而不是「当前登录号的群」：get_group_list 只给得出当前
+    号看得见的群，进程重启或换号后直接整体覆盖，历史会话的群名就没了，控制台上
+    只剩 GroupA 这种脱敏别名。已经见过的群名是既成事实，退群或换号都不该抹掉。
+    """
+    global _group_names_seeded
+    if _group_names_seeded:
+        return
+    _group_names_seeded = True
+    try:
+        known = json.loads(_live_state_file().read_text(encoding="utf-8")).get("group_names")
+    except Exception:
+        return
+    if not isinstance(known, dict):
+        return
+    for gid, name in known.items():
+        text = str(name or "").strip()
+        # 内存里已有的更新，不要被磁盘上的旧值盖回去。
+        if text and str(gid) not in _group_names:
+            _group_names[str(gid)] = text
 
 
 async def _refresh_group_names() -> None:
@@ -8335,7 +8387,9 @@ def _publish_live_state(*, force: bool = False) -> None:
     global _live_state_published_at, _live_state_signature
     payload: Dict[str, Any] = live_config_state_payload()
     payload["runtime"] = _live_runtime_facts()
+    _seed_group_names()
     payload["group_names"] = dict(_group_names)
+    payload["scope_conversation_keys"] = _current_scope_keys()
     signature = json.dumps(
         {k: v for k, v in payload.items() if k != "runtime"}
         | {k: v for k, v in payload["runtime"].items() if k != "volatile"},

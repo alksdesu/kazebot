@@ -1312,10 +1312,13 @@ def create_app(
         st: SupervisorState = app.state.state
         from .conversation_labels import (
             describe_namespaces, is_internal_task_key, load_sessions, memory_namespace,
+            scoped_conversation_keys,
         )
 
         labels = describe_namespaces(st.workspace_root)
         sessions = load_sessions(st.workspace_root)
+        # 适配器没发布过归属就全部按当前号算，不凭空把人分成两组。
+        scoped_keys = scoped_conversation_keys(st.workspace_root)
         conv_dir = st.workspace_root / "data" / "conversations"
         rows: list[dict[str, Any]] = []
         for path in sorted(conv_dir.glob("*.jsonl")) if conv_dir.is_dir() else []:
@@ -1335,6 +1338,11 @@ def create_app(
                 "conversation_key": conv_key,
                 # session 已被清掉但 jsonl 还在的孤儿也要列出来，否则永远没人删。
                 "owner": labels.get(memory_namespace(conv_key)) if conv_key else None,
+                # 非 QQ 会话（web / cli）不参与账号归属，始终算当前。
+                "current_account": (
+                    True if scoped_keys is None or not conv_key.startswith(("qq_group:", "qq_private:"))
+                    else conv_key in scoped_keys
+                ),
                 "channel": str(info.get("channel") or ""),
                 "bytes": stat.st_size,
                 "updated_at": stat.st_mtime,

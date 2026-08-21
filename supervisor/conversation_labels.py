@@ -53,6 +53,19 @@ def is_internal_task_key(conversation_key: str) -> bool:
     return bool(_TASK_KEY_RE.match(str(conversation_key or "").strip()))
 
 
+def scoped_conversation_keys(workspace_root: Path) -> set[str] | None:
+    """当前登录号名下的会话键。适配器没发布过就返回 None，表示无从判断。
+
+    摘要带 bot 作用域，换号后同一个群另起一条，两个号的会话会并排堆在列表里。
+    密钥只有 bot 进程有，这里只消费它算好的集合。
+    """
+    live = _read_json(Path(workspace_root) / "data" / _LIVE_STATE)
+    keys = live.get("scope_conversation_keys")
+    if not isinstance(keys, list):
+        return None
+    return {str(key) for key in keys if str(key or "").strip()}
+
+
 def _label_for_stable(
     stable: str, real_map: dict[str, Any], anon: dict[str, Any], names: "_DisplayNames",
 ) -> dict[str, Any]:

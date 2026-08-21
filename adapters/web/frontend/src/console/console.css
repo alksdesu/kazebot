@@ -1282,6 +1282,17 @@
     background: var(--qc-shelf);
   }
 
+  /* 会话按登录账号分组时的小标题。只在换过号之后才出现。 */
+  .qc-mem-group {
+    margin: 14px 0 6px;
+    color: var(--qc-mute);
+    font-size: 12px;
+  }
+
+  .qc-mem-group:first-child {
+    margin-top: 0;
+  }
+
   .qc-mem-name {
     flex: 1 1 auto;
     overflow: hidden;

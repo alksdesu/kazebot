@@ -840,6 +840,8 @@ export interface ConversationRow {
   bytes: number;
   updated_at: number;
   owner: MemoryOwner | null;
+  /** 属于当前登录的 QQ 号。换号后旧号的会话仍在磁盘上，但不该跟当前的混在一起。 */
+  current_account?: boolean;
 }
 
 export async function getConversations(token: string): Promise<ConversationRow[]> {

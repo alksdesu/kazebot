@@ -253,41 +253,54 @@ const ContextBlock = () => {
     } catch (error) { setNote(say(error)); }
   };
 
+  const entry = (row: ConversationRow) => (
+    <div className="qc-mem-entry" key={row.session_id}>
+      <div className="qc-mem-entry-head">
+        <span className="qc-mem-name">{row.owner?.label || row.channel || '未知来源'}</span>
+        <span className="qc-mem-count">{sizeText(row.bytes)}</span>
+        <button className="qc-btn" onClick={() => void open(row)} type="button">
+          {preview?.id === row.session_id ? '收起' : '查看'}
+        </button>
+        <button
+          className="qc-btn"
+          disabled={!row.conversation_key}
+          onClick={() => void drop(row)}
+          title={row.conversation_key ? '' : '这条会话已经没有归属，只能在服务器上删'}
+          type="button"
+        >
+          删除
+        </button>
+      </div>
+      {preview?.id === row.session_id && (
+        <div className="qc-mem-log">
+          <p className="qc-mem-kw">共 {preview.total} 条，显示最近 {preview.messages.length} 条</p>
+          {preview.messages.map((msg, index) => (
+            <p className="qc-mem-text" key={index}>
+              <span className="qc-mem-id">{String(msg.role || '')}</span>
+              {' '}
+              {String(msg.content || '').slice(0, 400)}
+            </p>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
+  // 会话键摘要带 QQ 号，换号后同一个群另起一条。没换过号时 stale 为空，视图跟以前一样。
+  const stale = rows.filter((row) => row.current_account === false);
+  const mine = rows.filter((row) => row.current_account !== false);
+
   return (
     <Block hint="删除会连带清掉 bot 侧的消息缓存与附件；长期记忆另算" title="会话上下文">
       {rows.length === 0 && <Empty>还没有任何会话。</Empty>}
-      {rows.map((row) => (
-        <div className="qc-mem-entry" key={row.session_id}>
-          <div className="qc-mem-entry-head">
-            <span className="qc-mem-name">{row.owner?.label || row.channel || '未知来源'}</span>
-            <span className="qc-mem-count">{sizeText(row.bytes)}</span>
-            <button className="qc-btn" onClick={() => void open(row)} type="button">
-              {preview?.id === row.session_id ? '收起' : '查看'}
-            </button>
-            <button
-              className="qc-btn"
-              disabled={!row.conversation_key}
-              onClick={() => void drop(row)}
-              title={row.conversation_key ? '' : '这条会话已经没有归属，只能在服务器上删'}
-              type="button"
-            >
-              删除
-            </button>
-          </div>
-          {preview?.id === row.session_id && (
-            <div className="qc-mem-log">
-              <p className="qc-mem-kw">共 {preview.total} 条，显示最近 {preview.messages.length} 条</p>
-              {preview.messages.map((msg, index) => (
-                <p className="qc-mem-text" key={index}>
-                  <span className="qc-mem-id">{String(msg.role || '')}</span>
-                  {' '}
-                  {String(msg.content || '').slice(0, 400)}
-                </p>
-              ))}
-            </div>
-          )}
-        </div>
-      ))}
+      {stale.length === 0 ? rows.map(entry) : (
+        <>
+          <p className="qc-mem-group">当前账号</p>
+          {mine.length === 0 ? <Empty>这个号还没有任何会话。</Empty> : mine.map(entry)}
+          <p className="qc-mem-group">其它账号 · 换号前留下的，上下文和长期记忆都不互通</p>
+          {stale.map(entry)}
+        </>
+      )}
       {note && <Footnote>{note}</Footnote>}
     </Block>
   );
