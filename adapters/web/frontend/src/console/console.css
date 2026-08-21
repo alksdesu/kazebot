@@ -32,6 +32,9 @@
   /* 渠道字段前那一列标签的宽度。提示行靠它缩进，两处必须同源。 */
   --qc-chan-label: 3em;
 
+  /* 快速切换列表里的 QQ 头像。 */
+  --qc-acct-face: 28px;
+
   /* 与 AppLayout 的设置侧栏同宽，两个侧栏切换时内容区不会横向跳一下。 */
   --qc-rail: 15rem;
   --qc-rail-item-min: 38px;
@@ -853,6 +856,45 @@
 
   .qc-chan-body .qc-btn {
     flex: 0 0 auto;
+  }
+
+  /* 快速切换的账号列，占 .qc-chan-label 的位置但要放得下头像，所以不复用它。 */
+  .qc-acct-who {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+    min-width: 0;
+  }
+
+  .qc-acct-face {
+    width: var(--qc-acct-face);
+    height: var(--qc-acct-face);
+    flex: 0 0 auto;
+    border-radius: 50%;
+    object-fit: cover;
+    /* 外链头像拉不到时留一块底色，不要露出碎图图标。 */
+    background: var(--qc-shelf);
+  }
+
+  .qc-acct-name {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+  }
+
+  .qc-acct-name strong {
+    overflow: hidden;
+    color: var(--qc-ink);
+    font-weight: 500;
+    font-size: 13px;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .qc-acct-name code {
+    color: var(--qc-mute);
+    font-size: 12px;
   }
 
   /* 提示行跟输入框左边缘对齐，不跟标签对齐。 */

@@ -591,15 +591,28 @@ export async function updatePolicy(token: string, policy: PolicyDoc): Promise<Po
 
 // ── bot 登录账号（经 supervisor 转发 NapCat WebUI）──
 
+/** 此前登录过、可以免扫码切回去的号。 */
+export interface QqQuickLoginTarget {
+  uin: string;
+  nick?: string;
+  avatar?: string;
+  /** NapCat 说这个号的登录态还能用。false 时切过去会失败。 */
+  available?: boolean;
+}
+
 export interface QqAccount {
   configured: boolean;
+  /** NapCat 有没有应答。容器重启期间为 false，这不是错误。 */
+  reachable?: boolean;
+  reason?: string;
   uin?: string;
   nick?: string;
   online?: boolean;
   is_login?: boolean;
   login_error?: string;
-  /** 此前登录过、可以免扫码切回去的号。 */
-  quick_login?: string[];
+  /** 等扫码时 NapCat 会把二维码一并带出来。 */
+  qrcode?: string;
+  quick_login?: QqQuickLoginTarget[];
 }
 
 export async function getQqAccount(token: string): Promise<QqAccount> {
@@ -634,14 +647,25 @@ export async function qqPinAccount(token: string): Promise<void> {
   });
 }
 
-export async function getQqLoginQrcode(token: string): Promise<string> {
+export interface QqQrcode {
+  qrcode: string;
+  /** false 表示 NapCat 还没起来，等下一轮即可，不必当成失败。 */
+  reachable: boolean;
+  reason?: string;
+}
+
+export async function getQqLoginQrcode(token: string): Promise<QqQrcode> {
   const resp = await apiFetch('/qq/account/qrcode', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
     body: '{}',
   });
   const data = await resp.json();
-  return String((data && data.qrcode) || '');
+  return {
+    qrcode: String((data && data.qrcode) || ''),
+    reachable: (data && data.reachable) !== false,
+    reason: String((data && data.reason) || ''),
+  };
 }
 
 /** 字段留空串表示删掉这一项（回到跟随主渠道）；不传表示不动。 */

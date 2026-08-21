@@ -63,7 +63,7 @@ from .types import (
 )
 from .admin_api import create_admin_router
 from .admin_api import init_admin_token, verify_admin_token
-from .napcat import NapCatClient, NapCatError
+from .napcat import NapCatClient, NapCatError, NapCatUnreachable
 
 
 log = logging.getLogger(__name__)
@@ -251,7 +251,11 @@ def create_app(
         if not client.configured:
             return {"configured": False}
         try:
-            return {"configured": True, **await client.account()}
+            return {"configured": True, "reachable": True, **await client.account()}
+        except NapCatUnreachable as exc:
+            # 换号重启和首次部署都会经过这里。判成 502 的话，页面上什么都渲染不出来，
+            # 连「正在重启」都说不了 —— 而这恰恰是最需要告诉人的时候。
+            return {"configured": True, "reachable": False, "reason": str(exc)}
         except NapCatError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -290,10 +294,15 @@ def create_app(
         client: NapCatClient = app.state.napcat
         try:
             data = await client.call("GetQQLoginQrcode")
+        except NapCatUnreachable as exc:
+            return {"qrcode": "", "reachable": False, "reason": str(exc)}
         except NapCatError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         payload = data if isinstance(data, dict) else {}
-        return {"qrcode": str(payload.get("qrcode") or payload.get("qrcodeurl") or "")}
+        return {
+            "qrcode": str(payload.get("qrcode") or payload.get("qrcodeurl") or ""),
+            "reachable": True,
+        }
 
     @app.post("/v1/qq/account/relogin")
     async def qq_relogin(request: Request) -> dict[str, Any]:

@@ -37,7 +37,7 @@ export const AccountPage = () => {
       setAccount(next);
       return next;
     } catch (error) {
-      // 换号期间容器正在重启，读不到是预期中的，不要把它当故障刷屏。
+      // 只有网络层或鉴权失败才到这里。NapCat 没起来是正常响应，由 reachable 表达。
       setAccount((prev) => prev);
       setNote(say(error));
       return null;
@@ -48,20 +48,28 @@ export const AccountPage = () => {
     void refresh().then((next) => { if (next) setNote(''); });
   }, [refresh]);
 
-  // 换号过程要一直盯着：先等容器活过来拿二维码，再等扫码成功把号钉住。
+  // 没登录上就一直盯着：等容器应答、等二维码、等扫码结果。首次部署进页面就是
+  // 这个状态，早先只在换号时才轮询，于是第一次进来只能靠人反复手点。
+  const watching = account !== null && (account.reachable === false || !account.is_login);
+
   useEffect(() => {
-    if (stage === 'idle' || !token) return undefined;
+    if (!token || (stage === 'idle' && !watching)) return undefined;
     let alive = true;
     const timer = window.setInterval(() => {
       void (async () => {
         if (!alive) return;
-        if (Date.now() - stageStartedAt.current > RESTART_TIMEOUT_MS) {
+        if (stage !== 'idle' && Date.now() - stageStartedAt.current > RESTART_TIMEOUT_MS) {
           setStage('idle');
           setNote('等待超时。NapCat 可能没起来，去服务器上看看容器状态。');
           return;
         }
         const next = await refresh();
         if (!alive || !next) return;
+
+        if (next.reachable === false) {
+          setNote('NapCat 还没应答，等它起来…');
+          return;
+        }
 
         if (next.is_login && next.uin) {
           setQrImage('');
@@ -77,19 +85,20 @@ export const AccountPage = () => {
 
         if (stage === 'restarting' || !qrImage) {
           try {
-            const raw = await getQqLoginQrcode(token);
+            // CheckLoginStatus 在等扫码时就带着二维码，能省一次请求。
+            const raw = next.qrcode || (await getQqLoginQrcode(token)).qrcode;
             if (!raw || !alive) return;
             setQrImage(await QRCode.toDataURL(raw, { width: 240, margin: 1 }));
             setStage('scanning');
             setNote('用要登录的那个 QQ 扫码。二维码会过期，过期就点一下「刷新二维码」。');
-          } catch {
-            setNote('容器重启中，等它起来…');
+          } catch (error) {
+            setNote(say(error));
           }
         }
       })();
     }, POLL_MS);
     return () => { alive = false; window.clearInterval(timer); };
-  }, [stage, token, qrImage, refresh]);
+  }, [stage, token, qrImage, refresh, watching]);
 
   const startRelogin = async () => {
     if (!token) return;
@@ -132,9 +141,10 @@ export const AccountPage = () => {
     if (!token) return;
     setBusy(true);
     try {
-      const raw = await getQqLoginQrcode(token);
-      setQrImage(raw ? await QRCode.toDataURL(raw, { width: 240, margin: 1 }) : '');
-      setNote(raw ? '' : '拿不到二维码，可能已经登录上了。');
+      const { qrcode, reachable } = await getQqLoginQrcode(token);
+      setQrImage(qrcode ? await QRCode.toDataURL(qrcode, { width: 240, margin: 1 }) : '');
+      if (qrcode) setNote('');
+      else setNote(reachable ? '拿不到二维码，可能已经登录上了。' : 'NapCat 还没应答，等它起来…');
     } catch (error) {
       setNote(say(error));
     }
@@ -173,7 +183,11 @@ export const AccountPage = () => {
                 <span className="qc-chan-label">状态</span>
                 <div className="qc-chan-body">
                   <span className="qc-cap-desc">
-                    {account.is_login ? (account.online ? '在线' : '已登录，但不在线') : '未登录'}
+                    {account.reachable === false
+                      ? 'NapCat 没应答，容器可能正在重启'
+                      : account.is_login
+                        ? (account.online ? '在线' : '已登录，但不在线')
+                        : '未登录'}
                     {account.login_error ? ` — ${account.login_error}` : ''}
                   </span>
                 </div>
@@ -228,21 +242,41 @@ export const AccountPage = () => {
       <Block hint="以前在这台机器上登录过的号，切回去不用扫码" title="快速切换">
         <div className="qc-panel">
           {account?.quick_login?.length ? (
-            account.quick_login.map((uin) => (
-              <div className="qc-chan-row" key={uin}>
-                <span className="qc-chan-label"><code>{uin}</code></span>
-                <div className="qc-chan-body">
-                  <button
-                    className="qc-btn qc-btn-quiet"
-                    disabled={busy || uin === account.uin}
-                    onClick={() => void switchTo(uin)}
-                    type="button"
-                  >
-                    {uin === account.uin ? '当前账号' : '切到这个号'}
-                  </button>
+            account.quick_login.map((target) => {
+              const current = target.uin === account.uin;
+              const usable = target.available !== false;
+              return (
+                <div className="qc-chan-row" key={target.uin}>
+                  <span className="qc-acct-who">
+                    {target.avatar && (
+                      <img
+                        alt=""
+                        className="qc-acct-face"
+                        referrerPolicy="no-referrer"
+                        src={target.avatar}
+                      />
+                    )}
+                    <span className="qc-acct-name">
+                      {target.nick && <strong>{target.nick}</strong>}
+                      <code>{target.uin}</code>
+                    </span>
+                  </span>
+                  <div className="qc-chan-body">
+                    <button
+                      className="qc-btn qc-btn-quiet"
+                      disabled={busy || current || !usable}
+                      onClick={() => void switchTo(target.uin)}
+                      type="button"
+                    >
+                      {current ? '当前账号' : '切到这个号'}
+                    </button>
+                    {!current && !usable && (
+                      <span className="qc-cap-desc">登录态已失效，只能扫码</span>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))
+              );
+            })
           ) : (
             <p className="qc-facts">
               没有可免扫码切换的号。一个号在这台机器上登录过之后才会出现在这里。
