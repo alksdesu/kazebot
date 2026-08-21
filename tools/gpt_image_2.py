@@ -72,6 +72,26 @@ if __name__ == "__main__":
         print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False)); sys.exit(1)
     args = _input
     import base64, json, urllib.request, urllib.error, os, time, hashlib
+
+    _MIME_BY_EXT = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp'}
+
+    def _encode_multipart(fields, files):
+        """images/edits 只收 multipart，而工具进程能用的只有标准库。"""
+        boundary = 'clonoth' + hashlib.md5(str(time.time()).encode()).hexdigest()
+        buf = bytearray()
+        for key, value in fields:
+            buf += (
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'
+            ).encode('utf-8')
+        for key, name, blob in files:
+            mime = _MIME_BY_EXT.get(os.path.splitext(name)[1].lower(), 'application/octet-stream')
+            buf += (
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"; filename="{name}"\r\n'
+                f'Content-Type: {mime}\r\n\r\n'
+            ).encode('utf-8')
+            buf += blob + b'\r\n'
+        buf += f'--{boundary}--\r\n'.encode('utf-8')
+        return bytes(buf), f'multipart/form-data; boundary={boundary}'
     from pathlib import Path
 
     # [2026-07-19] 方案 X：工具不再自己推图，发图统一交给 supervisor 的
@@ -115,41 +135,59 @@ if __name__ == "__main__":
     if not base_url:
         fail('No base_url configured (system_models.image_gpt / OPENAI_BASE_URL)')
 
-    if base_url.endswith("/chat/completions"):
-        url = base_url
+    root = base_url[:-len("/chat/completions")] if base_url.endswith("/chat/completions") else base_url
+    root = root.rstrip("/")
+    # 官方 GPT image 模型只在 images 端点提供，打 chat/completions 会被直接拒；
+    # 中转站包装出来的生图模型（gpt-4o-image 之类）正相反，只认 chat 协议。
+    native = model_name.startswith("gpt-image-")
+
+    headers = {'Authorization': f'Bearer {api_key}'}
+
+    def _read_inputs():
+        """把垫图读成 (文件名, 字节)。路径不存在就直接失败，别让模型以为垫上了。"""
+        loaded = []
+        for img_path in raw_image_paths:
+            text = str(img_path).strip()
+            if not text:
+                continue
+            img_file = Path.cwd() / text
+            if not img_file.exists():
+                fail(f'Input image not found: {text}')
+            loaded.append((img_file, text))
+        return loaded
+
+    if native and raw_image_paths:
+        url = root + "/images/edits"
+        payload_body, content_type = _encode_multipart(
+            [('model', model_name), ('prompt', prompt), ('size', size), ('quality', quality)],
+            [('image[]', f.name, f.read_bytes()) for f, _ in _read_inputs()],
+        )
+    elif native:
+        url = root + "/images/generations"
+        # GPT image 模型固定回 base64，传 response_format 反而会被拒。
+        payload_body = json.dumps({
+            'model': model_name, 'prompt': prompt, 'size': size, 'quality': quality, 'n': 1,
+        }).encode('utf-8')
+        content_type = 'application/json'
     else:
-        url = base_url.rstrip("/") + "/chat/completions"
+        url = root + "/chat/completions"
+        content_parts = []
+        for img_file, _ in _read_inputs():
+            try:
+                part = build_image_part(img_file, family_for_base_url(base_url))
+            except ImagePayloadError as e:
+                fail(str(e))
+            content_parts.append({'type': 'image_url', 'image_url': {'url': part.data_url()}})
+        content_parts.append({'type': 'text', 'text': prompt})
+        payload_body = json.dumps({
+            'model': model_name,
+            'messages': [{'role': 'user', 'content': content_parts if len(content_parts) > 1 else prompt}],
+            'size': size,
+            'quality': quality,
+        }).encode('utf-8')
+        content_type = 'application/json'
 
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {api_key}'
-    }
-
-    # === 构建消息体（支持垫图） ===
-    content_parts = []
-    for img_path in raw_image_paths:
-        img_path = str(img_path).strip()
-        if not img_path:
-            continue
-        img_file = Path.cwd() / img_path
-        if not img_file.exists():
-            fail(f'Input image not found: {img_path}')
-        try:
-            part = build_image_part(img_file, family_for_base_url(base_url))
-        except ImagePayloadError as e:
-            fail(str(e))
-        content_parts.append({'type': 'image_url', 'image_url': {'url': part.data_url()}})
-    content_parts.append({'type': 'text', 'text': prompt})
-
-    msg_content = content_parts if len(content_parts) > 1 else prompt
-
-    payload = {
-        'model': model_name,
-        'messages': [{'role': 'user', 'content': msg_content}],
-        'size': size,
-        'quality': quality
-    }
-    payload_json = json.dumps(payload)
+    headers['Content-Type'] = content_type
 
     # === 发起请求（带自动重试） ===
     def _is_retryable(exc) -> bool:
@@ -161,7 +199,7 @@ if __name__ == "__main__":
     res_data = None
     last_error = ""
     for attempt in range(1, _MAX_ATTEMPTS + 1):
-        req = urllib.request.Request(url, data=payload_json.encode('utf-8'), headers=headers, method='POST')
+        req = urllib.request.Request(url, data=payload_body, headers=headers, method='POST')
         try:
             resp = urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT)
             res_data = json.loads(resp.read().decode('utf-8'))
@@ -184,20 +222,29 @@ if __name__ == "__main__":
         fail(f'API request failed: {last_error}')
 
     # === 从响应中提取图片数据 ===
-    msg = res_data.get('choices', [{}])[0].get('message', {})
-    images = msg.get('images', [])
-
     img_data = None
-    if images:
-        raw = images[0]
-        img_data = base64.b64decode(raw.split(',')[-1] if ',' in raw else raw)
+    if native:
+        first = (res_data.get('data') or [{}])[0]
+        blob = str(first.get('b64_json') or '')
+        if blob:
+            img_data = base64.b64decode(blob)
+        elif first.get('url'):
+            # 官方 GPT image 固定回 b64，但中转站有可能改成回 URL。
+            with urllib.request.urlopen(str(first['url']), timeout=_REQUEST_TIMEOUT) as r:
+                img_data = r.read()
     else:
-        content = msg.get('content', '')
-        if content:
-            import re
-            m = re.search(r'data:image/[^;]+;base64,([A-Za-z0-9+/=]+)', str(content))
-            if m:
-                img_data = base64.b64decode(m.group(1))
+        msg = res_data.get('choices', [{}])[0].get('message', {})
+        images = msg.get('images', [])
+        if images:
+            raw = images[0]
+            img_data = base64.b64decode(raw.split(',')[-1] if ',' in raw else raw)
+        else:
+            content = msg.get('content', '')
+            if content:
+                import re
+                m = re.search(r'data:image/[^;]+;base64,([A-Za-z0-9+/=]+)', str(content))
+                if m:
+                    img_data = base64.b64decode(m.group(1))
 
     if not img_data:
         fail('No image data in response: ' + json.dumps(res_data)[:500])
