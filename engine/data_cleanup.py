@@ -567,13 +567,16 @@ def purge_expired_child_sessions():
     Child Session 隔离（Phase C）：扫描 data/conversations/ 下所有 child_*.jsonl，
     按文件修改时间判断是否超过 CHILD_SESSION_MAX_AGE。超期则删除文件。
     映射表的清理由 supervisor 侧在 dispatch 时懒过期处理。
+
+    入口分支同理：merge 后由 supervisor 删，但进程崩在半路就会留下一个 fork 自
+    父会话的全量副本，没有别的清理者。
     """
     conv_dir = DATA_DIR / "conversations"
     if not conv_dir.exists():
         return
     cutoff = time.time() - CHILD_SESSION_MAX_AGE
     deleted = 0
-    for p in conv_dir.glob("child_*.jsonl"):
+    for p in [*conv_dir.glob("child_*.jsonl"), *conv_dir.glob("branch_*.jsonl")]:
         try:
             if p.is_file() and p.stat().st_mtime < cutoff:
                 _unlink(p)

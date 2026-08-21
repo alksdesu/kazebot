@@ -1311,8 +1311,8 @@ def create_app(
         verify_admin_token(request)
         st: SupervisorState = app.state.state
         from .conversation_labels import (
-            describe_namespaces, is_internal_task_key, load_sessions, memory_namespace,
-            scoped_conversation_keys,
+            describe_namespaces, is_internal_task_key, is_runtime_copy_session,
+            load_sessions, memory_namespace, scoped_conversation_keys,
         )
 
         labels = describe_namespaces(st.workspace_root)
@@ -1323,6 +1323,9 @@ def create_app(
         rows: list[dict[str, Any]] = []
         for path in sorted(conv_dir.glob("*.jsonl")) if conv_dir.is_dir() else []:
             session_id = path.stem
+            # 入口分支/子代理副本会照抄父会话的 conversation_key，不挡掉就是同名同大小的第二行。
+            if is_runtime_copy_session(session_id):
+                continue
             info = sessions.get(session_id) or {}
             conv_key = str(info.get("conversation_key") or "")
             # dream 的整理任务借 namespace 当会话键，会在这里冒出一条与真实群同名的

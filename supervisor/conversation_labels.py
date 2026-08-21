@@ -53,6 +53,16 @@ def is_internal_task_key(conversation_key: str) -> bool:
     return bool(_TASK_KEY_RE.match(str(conversation_key or "").strip()))
 
 
+def is_runtime_copy_session(session_id: str) -> bool:
+    """入口分支与子代理副本：一次 inbound 的执行态，不是用户的会话。
+
+    入口分支从父会话 fork 全部历史，conversation_key 也照抄，于是在列表里变成
+    一条与真实会话同名、大小也几乎相同的第二行。它 merge 完就删，点进去往往
+    已经没了，显示成「共 0 条」。
+    """
+    return str(session_id or "").strip().startswith(("branch_", "child_"))
+
+
 def scoped_conversation_keys(workspace_root: Path) -> set[str] | None:
     """当前登录号名下的会话键。适配器没发布过就返回 None，表示无从判断。
 
