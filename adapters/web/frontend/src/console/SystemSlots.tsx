@@ -124,7 +124,11 @@ const Row = ({
       )}
 
       {!slot.supports_provider && draft.baseUrl && (
-        <p className="qc-cap-desc">这一项由工具进程直接请求，格式固定，换成别家的地址会失败。</p>
+        <p className="qc-cap-desc">
+          这一项由工具进程直接请求，格式固定，换成别家的地址会失败。
+          {/* Gemini 那栏会自己剥掉 /v1，只有这里少写一段就静默 404。 */}
+          {slot.key === 'image_gpt' && '地址要写到 /v1 为止。'}
+        </p>
       )}
       {slot.supports_provider && draft.baseUrl && !draft.provider && (
         <p className="qc-cap-desc">换家要连渠道一起选，只改地址会按主渠道的格式发出去。</p>
