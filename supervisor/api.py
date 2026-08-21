@@ -268,7 +268,13 @@ def create_app(
             raise HTTPException(status_code=400, detail="QQ 号必须是数字")
         try:
             await client.call("SetQuickLogin", {"uin": uin})
+        except NapCatUnreachable as exc:
+            # 容器没起来跟这个号本身没关系，标死了下次就再也点不动。
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         except NapCatError as exc:
+            # QQ 明确拒了才算死号：缓存的登录态过期后 isQuickLogin 仍报 true，
+            # 不记一笔的话这个号会永远停在列表里，点一次失败一次。
+            client.mark_login_dead(uin, str(exc))
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         # 号已经切过去了，钉自动登录只是锦上添花：这一步失败不该让人以为没切成。
         pinned = True

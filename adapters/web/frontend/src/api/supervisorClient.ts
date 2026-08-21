@@ -596,8 +596,9 @@ export interface QqQuickLoginTarget {
   uin: string;
   nick?: string;
   avatar?: string;
-  /** NapCat 说这个号的登录态还能用。false 时切过去会失败。 */
+  /** 切过一次被 QQ 拒了。NapCat 自报的 isQuickLogin 在这种情况下仍会给 true。 */
   available?: boolean;
+  dead_reason?: string;
 }
 
 export interface QqAccount {

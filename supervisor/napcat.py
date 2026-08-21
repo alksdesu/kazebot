@@ -12,6 +12,7 @@ import json
 import os
 import secrets
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,9 @@ _UNAUTHORIZED = object()
 # 请求写成文件，由 napcat-account.path 触发的 root 侧 runner 校验令牌后执行。
 _REQUEST_NAME = "napcat-account.request"
 _RESULT_NAME = "napcat-account.result"
+# 切换被 QQ 拒过的号。NapCat 自报的 isQuickLogin 会在登录态早就失效时仍然给 true，
+# 唯一可信的信号是真切一次的结果，所以记下来供下次置灰。
+_DEAD_LOGINS_NAME = "qq_dead_logins.json"
 _ACTION_TIMEOUT_SEC = 150.0
 # 容器重启到 QQ 核心能应答通常十几秒，留足余量。
 _READY_TIMEOUT_SEC = 90.0
@@ -62,6 +66,10 @@ def _read_env_value(env_path: Path, key: str) -> str:
     return ""
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 def _quick_login_target(item: Any) -> dict[str, Any] | None:
     """GetQuickLoginListNew 给对象，旧版 GetQuickLoginList 给裸 uin，两种都认。
 
@@ -78,6 +86,14 @@ def _quick_login_target(item: Any) -> dict[str, Any] | None:
     if not uin.isdigit():
         return None
     return {"uin": uin, "nick": nick, "avatar": avatar, "available": available}
+
+
+def _read_dead_logins(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 class NapCatClient:
@@ -220,6 +236,38 @@ class NapCatClient:
         # 调用方拿到 ok 就会立刻来查账号，撞上的必然是连不上。
         await self.wait_ready()
 
+    @property
+    def _dead_path(self) -> Path:
+        return self._env_path.parent / "data" / _DEAD_LOGINS_NAME
+
+    def _save_dead_logins(self, dead: dict[str, Any]) -> None:
+        path = self._dead_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(dead, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            # 标记只影响一个按钮灰不灰，写不进去不值得让切换整体失败。
+            pass
+
+    def mark_login_dead(self, uin: str, reason: str) -> None:
+        """记下这个号切不过去。只在 QQ 明确拒绝时调，连不上不算。"""
+        key = str(uin or "").strip()
+        if not key:
+            return
+        dead = _read_dead_logins(self._dead_path)
+        dead[key] = {"at": _now_iso(), "reason": str(reason or "").strip()}
+        self._save_dead_logins(dead)
+
+    def clear_login_dead(self, uin: str) -> bool:
+        """这个号又能用了，撤掉标记。"""
+        key = str(uin or "").strip()
+        dead = _read_dead_logins(self._dead_path)
+        if not key or key not in dead:
+            return False
+        dead.pop(key)
+        self._save_dead_logins(dead)
+        return True
+
     async def account(self) -> dict[str, Any]:
         """当前账号 + 可免扫码切换的号。任一子查询失败都不该让整页打不开。"""
         info = await self.call("GetQQLoginInfo")
@@ -235,7 +283,21 @@ class NapCatClient:
             quick = []
         current = info or {}
         is_login = bool(status.get("isLogin", False))
-        targets = [_quick_login_target(item) for item in quick]
+        uin = str(current.get("uin") or "")
+        # 扫码登回来了就撤掉死号标记，否则一次失效会永久跟着这个号。
+        if is_login and uin:
+            self.clear_login_dead(uin)
+        dead = _read_dead_logins(self._dead_path)
+        targets = []
+        for item in quick:
+            target = _quick_login_target(item)
+            if not target:
+                continue
+            note = dead.get(target["uin"])
+            if isinstance(note, dict):
+                target["available"] = False
+                target["dead_reason"] = str(note.get("reason") or "")
+            targets.append(target)
         return {
             "uin": str(current.get("uin") or ""),
             "nick": str(current.get("nick") or ""),
@@ -245,5 +307,5 @@ class NapCatClient:
             "login_error": str(status.get("loginError") or ""),
             # 等扫码时这里就带着二维码，前端不必再单发一次请求去撞重启窗口。
             "qrcode": str(status.get("qrcodeurl") or ""),
-            "quick_login": [target for target in targets if target],
+            "quick_login": targets,
         }

@@ -136,6 +136,8 @@ export const AccountPage = () => {
       setNote('已请求切换，等它上线…');
     } catch (error) {
       setNote(say(error));
+      // 切失败会把这个号记成死号，刷一次列表让它立刻置灰。
+      void refresh();
     }
     setBusy(false);
   };
@@ -274,7 +276,9 @@ export const AccountPage = () => {
                       {current ? '当前账号' : '切到这个号'}
                     </button>
                     {!current && !usable && (
-                      <span className="qc-cap-desc">登录态已失效，只能扫码</span>
+                      <span className="qc-cap-desc" title={target.dead_reason || ''}>
+                        登录态已失效，只能扫码
+                      </span>
                     )}
                   </div>
                 </div>

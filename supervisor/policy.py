@@ -101,6 +101,8 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": ".secret/**", "decision": "auto", "reason": "admins may set api keys via manage_secret"},
                 # 这个文件名会被 root 侧 runner 执行，只有 supervisor 该往里写。
                 {"pattern": "data/napcat-account.*", "decision": "deny", "reason": "account actions are executed as root"},
+                # 决定账号页哪个号能点，改了只会让界面撒谎。
+                {"pattern": "data/qq_dead_logins.json", "decision": "deny", "reason": "quick-login state is derived from real switch results"},
             ],
         },
         "execute_command": {
