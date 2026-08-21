@@ -304,8 +304,10 @@ class NapCatClient:
             # GetQQLoginInfo 不返回在线状态，只有 CheckLoginStatus 有；用它推会恒为「不在线」。
             "online": is_login and not bool(status.get("isOffline", False)),
             "is_login": is_login,
-            "login_error": str(status.get("loginError") or ""),
+            # NapCat 登录成功后不清扫码流程的残留，loginError 和 qrcodeurl 会一直留着
+            # 上一轮的值 —— 照搬就成了「在线 — 二维码已过期」。登录上了就没有这两样。
+            "login_error": "" if is_login else str(status.get("loginError") or ""),
             # 等扫码时这里就带着二维码，前端不必再单发一次请求去撞重启窗口。
-            "qrcode": str(status.get("qrcodeurl") or ""),
+            "qrcode": "" if is_login else str(status.get("qrcodeurl") or ""),
             "quick_login": targets,
         }
