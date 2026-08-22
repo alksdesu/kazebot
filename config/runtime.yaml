@@ -147,8 +147,7 @@ maintenance:
   data_cleanup:
     enabled: true
     cron: "17 * * * *"        # 每小时 17 分，错开整点的其它定时任务
-    # 先只报告要删什么，不真删。看过 data/logs/cleanup.log 确认无误后改成 false。
-    dry_run: true
+    dry_run: false
 
 shell:
   default_conversation_key: "cli:default"
