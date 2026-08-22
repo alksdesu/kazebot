@@ -16,6 +16,7 @@ from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFi
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, Response
 
+from . import provisioning
 from .config_store import ConfigStore
 from .instances import load_instances, url_prefix
 from .process_manager import ProcessManager
@@ -2204,6 +2205,54 @@ def create_app(
                 for row in load_instances(st.workspace_root)
             ],
         }
+
+    @app.post("/v1/instances")
+    async def create_instance(request: Request) -> dict[str, Any]:
+        """开一个新号。工作区在这里建，docker/systemd/cloudflared 交给 root 侧单元。"""
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        body = await request.json() if await request.body() else {}
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="请求体要是对象")
+        try:
+            plan = provisioning.plan_instance(
+                st.workspace_root,
+                uin=str(body.get("uin") or ""),
+                label=str(body.get("label") or ""),
+            )
+            # 先占清单再触发：并发两个请求时后来的会看见序号已被占，不会分到同一组端口。
+            provisioning.scaffold(plan, st.workspace_root)
+            await provisioning.start_unit(provisioning.CREATE_UNIT.format(uin=plan.uin))
+        except provisioning.ProvisionError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {
+            "uin": plan.uin, "label": plan.label, "idx": plan.idx,
+            "prefix": plan.prefix, "ports": plan.ports,
+            "workspace": str(plan.workspace),
+        }
+
+    @app.get("/v1/instances/{uin}/progress")
+    async def instance_progress(uin: str, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        try:
+            return provisioning.progress(st.workspace_root, uin)
+        except provisioning.ProvisionError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.delete("/v1/instances/{uin}")
+    async def delete_instance(uin: str, request: Request) -> dict[str, Any]:
+        """停掉并归档一个号。清单条目由 root 侧完成后自己摘，避免留下幽灵实例。"""
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        try:
+            row = provisioning.guard_removable(
+                st.workspace_root, uin, current_prefix=url_prefix(),
+            )
+            await provisioning.start_unit(provisioning.REMOVE_UNIT.format(uin=row["uin"]))
+        except provisioning.ProvisionError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"ok": True, "uin": row["uin"]}
 
     web_dist = state.workspace_root / "adapters" / "web" / "frontend" / "dist"
     console_url = ""
