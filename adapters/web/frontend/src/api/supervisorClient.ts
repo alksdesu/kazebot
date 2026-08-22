@@ -1007,6 +1007,144 @@ export async function migrateQqScope(token: string, target: string, source?: str
   return resp.json();
 }
 
+// ── Sticker library ──
+
+export type StickerState = 'pending' | 'library' | 'discarded';
+
+export interface Sticker {
+  sha256: string;
+  name: string;
+  state: StickerState;
+  source: string;
+  /** auto_tags 与 manual_tags 合并后的检索用标签，由后端算好。 */
+  tags: string[];
+  auto_tags: string[];
+  manual_tags: string[];
+  manual_override: boolean;
+  caption_state: 'pending' | 'running' | 'done' | 'failed';
+  caption_error: string;
+  width: number;
+  height: number;
+  animated: boolean;
+  size: number;
+  from_group: string;
+  from_user: string;
+  sent_count: number;
+  last_sent_at: number;
+  created_at: number;
+  usable: boolean;
+}
+
+export interface StickerCounts {
+  pending: number;
+  library: number;
+  discarded: number;
+  usable: number;
+  awaiting_caption: number;
+}
+
+export interface StickerPage {
+  items: Sticker[];
+  counts: StickerCounts;
+}
+
+export interface StickerImportResult {
+  scanned: number;
+  added: number;
+  known: number;
+  skipped: number;
+}
+
+/** 预览图地址。token 走 query 而不是请求头：img 标签带不了 Authorization。 */
+export function stickerImageHref(sha256: string, token: string | null): string {
+  const query = token ? `?token=${encodeURIComponent(token)}` : '';
+  return `${API}/stickers/${encodeURIComponent(sha256)}/image${query}`;
+}
+
+export async function listStickers(
+  token: string,
+  params: { state?: string; search?: string; limit?: number; offset?: number } = {},
+): Promise<StickerPage> {
+  const query = new URLSearchParams({
+    state: params.state || '',
+    search: params.search || '',
+    limit: String(params.limit ?? 60),
+    offset: String(params.offset ?? 0),
+  });
+  const resp = await apiFetch(`/stickers?${query}`, { headers: authHeaders(token) });
+  return resp.json();
+}
+
+export async function updateSticker(
+  token: string,
+  sha256: string,
+  patch: { name?: string; manual_tags?: string[]; manual_override?: boolean },
+): Promise<Sticker> {
+  const resp = await apiFetch(`/stickers/${encodeURIComponent(sha256)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify(patch),
+  });
+  return resp.json();
+}
+
+export async function acceptSticker(token: string, sha256: string): Promise<Sticker> {
+  const resp = await apiFetch(`/stickers/${encodeURIComponent(sha256)}/accept`, {
+    method: 'POST', headers: authHeaders(token),
+  });
+  return resp.json();
+}
+
+export async function discardSticker(token: string, sha256: string): Promise<void> {
+  await apiFetch(`/stickers/${encodeURIComponent(sha256)}/discard`, {
+    method: 'POST', headers: authHeaders(token),
+  });
+}
+
+export async function deleteSticker(token: string, sha256: string): Promise<void> {
+  await apiFetch(`/stickers/${encodeURIComponent(sha256)}`, {
+    method: 'DELETE', headers: authHeaders(token),
+  });
+}
+
+export async function recaptionStickers(token: string, onlyFailed: boolean): Promise<number> {
+  const resp = await apiFetch('/stickers/recaption', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify({ only_failed: onlyFailed }),
+  });
+  return (await resp.json()).queued || 0;
+}
+
+export async function uploadSticker(
+  token: string,
+  file: File,
+  options: { name?: string; accept?: boolean } = {},
+): Promise<Sticker> {
+  const form = new FormData();
+  form.append('file', file);
+  const query = new URLSearchParams({
+    name: options.name || '',
+    accept: String(options.accept ?? true),
+  });
+  // 不手动设 Content-Type：浏览器要自己填 multipart boundary。
+  const resp = await apiFetch(`/stickers/upload?${query}`, {
+    method: 'POST', body: form, headers: authHeaders(token),
+  });
+  return resp.json();
+}
+
+export async function importStickers(
+  token: string, path: string, accept: boolean,
+): Promise<StickerImportResult> {
+  const resp = await apiFetch('/stickers/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify({ path, accept }),
+  });
+  return resp.json();
+}
+
 export function getSchedulesRaw(token: string): Promise<string> {
   return readRawConfig('/admin/config/schedules/raw', token);
 }

@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 
 from . import provisioning
 from .config_store import ConfigStore
+from .sticker_api import create_sticker_router
 from .instances import load_instances, url_prefix
 from .process_manager import ProcessManager
 from .qq_intent import IntentResult as QQIntentResult, build_instruction as qq_intent_instruction
@@ -2181,6 +2182,9 @@ def create_app(
 
     admin_router = create_admin_router(workspace_root=state.workspace_root)
     app.include_router(admin_router, prefix="/v1/admin/config")
+    app.include_router(
+        create_sticker_router(workspace_root=state.workspace_root), prefix="/v1/stickers",
+    )
 
     # 认证校验端点：前端用来验证 token 是否正确
     @app.get("/v1/admin/auth/check")

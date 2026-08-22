@@ -35,6 +35,7 @@ import { ModelTrainingW400 } from '@material-symbols-svg/react/icons/model-train
 import { OpenInNewW400 } from '@material-symbols-svg/react/icons/open-in-new';
 import { PaletteW400 } from '@material-symbols-svg/react/icons/palette';
 import { PendingW400 } from '@material-symbols-svg/react/icons/pending';
+import { PhotoLibraryW400 } from '@material-symbols-svg/react/icons/photo-library';
 import { ProgressActivityW400 } from '@material-symbols-svg/react/icons/progress-activity';
 import { RefreshW400 } from '@material-symbols-svg/react/icons/refresh';
 import { ScheduleW400 } from '@material-symbols-svg/react/icons/schedule';
@@ -80,6 +81,7 @@ const ICON_MAP: Record<string, SvgIcon> = {
   open_in_new: OpenInNewW400,
   palette: PaletteW400,
   pending: PendingW400,
+  photo_library: PhotoLibraryW400,
   progress_activity: ProgressActivityW400,
   refresh: RefreshW400,
   schedule: ScheduleW400,

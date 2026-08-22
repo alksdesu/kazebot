@@ -19,6 +19,7 @@ import {
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Empty, Footnote } from './components';
+import { sizeText } from './format';
 
 const EMPTY_DRAFT = { id: '', content: '', keywords: '', constant: false };
 
@@ -31,12 +32,6 @@ function bucketOf(row: MemoryNamespace): (typeof BUCKETS)[number] {
   if (row.kind === 'subject' || row.owner.kind === 'private') return '人物';
   if (row.owner.kind === 'group' || row.owner.kind === 'agent') return '群组';
   return '通用';
-}
-
-function sizeText(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 const MemoryBlock = () => {

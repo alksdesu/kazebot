@@ -35,6 +35,10 @@
   /* 快速切换列表里的 QQ 头像。 */
   --qc-acct-face: 28px;
 
+  /* 表情包缩略图的格宽与图高。四个操作按钮一行放不下时格子就该更宽。 */
+  --qc-stk-cell: 176px;
+  --qc-stk-face: 116px;
+
   /* 与 AppLayout 的设置侧栏同宽，两个侧栏切换时内容区不会横向跳一下。 */
   --qc-rail: 15rem;
   --qc-rail-item-min: 38px;
@@ -156,7 +160,7 @@
     flex: 1;
     flex-direction: column;
     gap: 2px;
-    /* 视口矮到装不下九项时让这一列自己滚，别把底部的出口挤出屏幕。 */
+    /* 视口矮到装不下全部分区时让这一列自己滚，别把底部的出口挤出屏幕。 */
     min-height: 0;
     padding: 8px;
     overflow-y: auto;
@@ -1511,6 +1515,117 @@
 
   .qc-mem-add .qc-btn {
     align-self: flex-start;
+  }
+
+  /* ── 表情包库 ───────────────────────────────────── */
+
+  .qc-stk-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin: 12px 0;
+  }
+
+  /* 全局 .qc-inp 是定宽 88px，搜索框在这一行要吃掉剩下的空间。 */
+  .qc-stk-bar .qc-inp {
+    width: auto;
+    min-width: 0;
+    flex: 1 1 12em;
+  }
+
+  .qc-stk-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(var(--qc-stk-cell), 1fr));
+    gap: 10px;
+  }
+
+  .qc-stk {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 0;
+    padding: 8px;
+    border: 1px solid var(--qc-rule);
+    border-radius: var(--qc-r-md);
+    background: var(--qc-paper);
+  }
+
+  /* 表情包长宽参差，定高加 contain 才对得成网格；底色衬出透明图的边界。 */
+  .qc-stk-img {
+    width: 100%;
+    height: var(--qc-stk-face);
+    border-radius: var(--qc-r-sm);
+    background: var(--qc-shelf);
+    object-fit: contain;
+  }
+
+  .qc-stk-cap {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .qc-stk-name {
+    overflow: hidden;
+    font-weight: 500;
+    font-size: 12px;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .qc-stk-meta {
+    color: var(--qc-mute);
+    font-size: 11px;
+  }
+
+  .qc-stk-flag {
+    align-self: flex-start;
+    padding: 0 6px;
+    border: 1px solid var(--qc-rule);
+    border-radius: var(--qc-r-sm);
+    color: var(--qc-mute);
+    font-size: 11px;
+  }
+
+  .qc-stk-flag-halt {
+    border-color: var(--qc-halt);
+    color: var(--qc-halt);
+  }
+
+  .qc-stk-tags {
+    margin: 0;
+  }
+
+  /* 这里的 chip 不带删除按钮，右边留给按钮的那点内边距收回来。 */
+  .qc-stk-tags .qc-chip {
+    padding-right: 7px;
+  }
+
+  .qc-stk-acts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  /* 一张卡上最多四个操作，全局按钮的内边距会把它们挤成四行。 */
+  .qc-stk-acts .qc-btn {
+    padding: 3px 8px;
+    font-size: 11px;
+  }
+
+  .qc-stk-edit {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .qc-stk-page {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
   }
 }
 

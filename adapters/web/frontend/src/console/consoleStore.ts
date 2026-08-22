@@ -14,6 +14,7 @@ import {
 
 export const CONSOLE_DOMAINS = [
   'account', 'channels', 'timing', 'permissions', 'persona', 'providers', 'models', 'runtime', 'memory',
+  'stickers',
 ] as const;
 export type ConsoleDomain = (typeof CONSOLE_DOMAINS)[number];
 
@@ -27,6 +28,7 @@ export const DOMAIN_LABELS: Record<ConsoleDomain, string> = {
   models: '模型',
   runtime: '运行',
   memory: '记忆',
+  stickers: '表情包',
 };
 
 /** Icon 的 ICON_MAP 键名。控制台侧栏与设置侧栏的控制台展开项共用，两处图标不会走散。 */
@@ -40,6 +42,7 @@ export const DOMAIN_ICONS: Record<ConsoleDomain, string> = {
   models: 'tune',
   runtime: 'settings_power',
   memory: 'menu_book',
+  stickers: 'photo_library',
 };
 
 /** 草稿按 live_config 的键名存（如 signal_at），不是 yaml 的点分路径。

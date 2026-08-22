@@ -70,12 +70,15 @@ export const SubOption = ({
 export const NumberField = ({
   configKey,
   label,
+  max,
   step = 1,
   unit,
   scale = 1,
 }: {
   configKey: string;
   label: string;
+  // 后端也会夹范围，但界面上放行再被悄悄改回去，用的人会以为没保存成功。
+  max?: number;
   step?: number;
   unit?: string;
   // 存的是字节、给人看的是 MB 这类换算。写回按 scale 还原成整数，界面上不出现 10485760。
@@ -92,6 +95,7 @@ export const NumberField = ({
           const shown = Number.isFinite(next) ? next : 0;
           setDraft(configKey, scale === 1 ? shown : Math.round(shown * scale));
         }}
+        max={max}
         step={step}
         type="number"
         value={String(scale === 1 ? stored : stored / scale)}
@@ -136,6 +140,39 @@ export const PercentField = ({ configKey, label }: { configKey: string; label: s
         value={String(Math.round(value * 10000) / 100)}
       />
       <label>%</label>
+    </Field>
+  );
+};
+
+/** 固定枚举的键。横排档位而不是下拉：三四个选项摊开比点开看更快。 */
+export const ChoiceField = ({
+  choices,
+  configKey,
+  fallback,
+  label,
+}: {
+  choices: ReadonlyArray<readonly [string, string]>;
+  configKey: string;
+  fallback: string;
+  label: string;
+}) => {
+  const setDraft = useConsoleStore((state) => state.setDraft);
+  const value = useLiveValue<string>(configKey, fallback);
+  return (
+    <Field label={label}>
+      <div className="qc-grants" role="group">
+        {choices.map(([option, text]) => (
+          <button
+            aria-pressed={option === value}
+            className={`qc-grant${option === value ? ' qc-grant-on' : ''}`}
+            key={option}
+            onClick={() => setDraft(configKey, option)}
+            type="button"
+          >
+            {text}
+          </button>
+        ))}
+      </div>
     </Field>
   );
 };
