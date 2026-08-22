@@ -41,6 +41,20 @@ if [[ -n "$STRAY" ]]; then
   chown -R "$OWNER:$OWNER" "$ROOT"
 fi
 
+# dist 不进 git，服务器得自己构建。跳过这步的话后端更新了、控制台还是上一版，
+# 而且没有任何迹象说明这件事。
+FRONTEND="$ROOT/adapters/web/frontend"
+if [[ -d "$FRONTEND/node_modules" ]]; then
+  echo "[deploy] 构建前端"
+  if ! git -C "$ROOT" diff --quiet HEAD@{1} HEAD -- adapters/web/frontend/package-lock.json 2>/dev/null; then
+    echo "[deploy] 依赖有变动，先 npm ci"
+    sudo -u "$OWNER" npm --prefix "$FRONTEND" ci
+  fi
+  sudo -u "$OWNER" npm --prefix "$FRONTEND" run build
+else
+  echo "[deploy] 前端没装依赖，跳过构建（控制台会停在上一版）" >&2
+fi
+
 echo "[deploy] 重启 ${SERVICE}"
 STARTED_AT=$(date +%s)
 systemctl restart "$SERVICE"
