@@ -4678,6 +4678,24 @@ def _active_bot_scope() -> str:
     return _ACTIVE_BOT_SCOPE
 
 
+def _purge_account_scoped_caches() -> None:
+    """丢掉按真实群号缓存、实为上一个账号视角的进程内状态。
+
+    群历史会直接进新号第一条 inbound 的上下文；成员名片、复读判定、冷却窗口也都是
+    旧号看见的样子。按会话键分桶的那些换号后自然另起，不在此列。
+    """
+    _group_history.clear()
+    _group_history_seq.clear()
+    _group_history_gap.clear()
+    _context_clear_barrier.clear()
+    # qq_forward 的转发候选是群历史的第二份副本，只清前者等于没清。
+    _group_content_records.clear()
+    _echo_recent.clear()
+    _echo_last.clear()
+    _group_member_cache.clear()
+    _trigger_cooldown.forget_all()
+
+
 def _adopt_bot_scope(bot: Any) -> None:
     """记住当前账号；换号时丢掉按旧账号算出的键缓存，让它们按新作用域重算。"""
     global _ACTIVE_BOT_SCOPE
@@ -4689,6 +4707,7 @@ def _adopt_bot_scope(bot: Any) -> None:
     _bot_scope.save_scope(Path(CLONOTH_WORKSPACE), scope)
     # real→stable 必须重算。反向表留着：旧键的在途回调还要靠它找回真实会话。
     _stable_conversation_keys.clear()
+    _purge_account_scoped_caches()
     logger.warning(
         "QQ account changed (%s -> %s): conversations and memory now use a separate namespace",
         previous or "<none>", scope,

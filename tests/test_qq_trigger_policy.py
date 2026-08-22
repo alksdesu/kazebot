@@ -361,6 +361,18 @@ class TestCooldown:
         assert tp.evaluate(_input(group_id=1, user_id=10001, reply_to_bot=True, now=1005.0), config, cooldown).triggered is True
         assert tp.evaluate(_input(group_id=2, user_id=10001, reply_to_bot=True, now=1005.0), config, cooldown).triggered is False
 
+    def test_forgetting_everything_clears_every_group(self) -> None:
+        """换号时用：上一个号的静默窗口不该让新号一上来就哑着。"""
+        cooldown = tp.CooldownState()
+        config = _config(cooldown_group_sec=30.0, cooldown_user_sec=30.0)
+        cooldown.record(_input(group_id=1, user_id=10001, now=1000.0))
+        cooldown.record(_input(group_id=2, user_id=20002, now=1000.0))
+
+        cooldown.forget_all()
+
+        assert tp.evaluate(_input(group_id=1, user_id=10001, reply_to_bot=True, now=1005.0), config, cooldown).triggered is True
+        assert tp.evaluate(_input(group_id=2, user_id=20002, reply_to_bot=True, now=1005.0), config, cooldown).triggered is True
+
     def test_the_reason_names_which_dimension_held_it(self) -> None:
         cooldown = tp.CooldownState()
         cooldown.record(_input(now=1000.0))

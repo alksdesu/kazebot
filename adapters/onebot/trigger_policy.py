@@ -190,6 +190,11 @@ class CooldownState:
         for key in [k for k in self._by_user if k[0] == gid]:
             self._by_user.pop(key, None)
 
+    def forget_all(self) -> None:
+        """清掉全部冷却。换号时用：上一个号的静默窗口跟新号没有关系。"""
+        self._by_group.clear()
+        self._by_user.clear()
+
 
 def _matches_name(text: str, words: tuple[str, ...], *, anywhere: bool) -> str:
     """命中的名字，空串表示没命中。
