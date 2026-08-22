@@ -19,6 +19,8 @@ echo "==> 安装 root 侧组件到 $LIB"
 install -d -m 0755 -o root -g root "$LIB" "$LIB/units"
 install -m 0755 -o root -g root "$REPO/deploy/provision_instance.sh" "$LIB/provision_instance.sh"
 install -m 0755 -o root -g root "$REPO/deploy/cloudflared_ingress.py" "$LIB/cloudflared_ingress.py"
+# 这一份不用重装：它每次跑都会先把自己同步成仓库里的最新版。
+install -m 0755 -o root -g root "$REPO/deploy/deploy.sh" "$LIB/deploy.sh"
 install -m 0644 -o root -g root \
   "$REPO/deploy/systemd/kazebot@.service" \
   "$REPO/deploy/systemd/kazebot-qq@.service" \
