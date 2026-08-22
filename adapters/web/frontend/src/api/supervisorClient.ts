@@ -1865,6 +1865,60 @@ export async function getSessionChildren(sessionId: string): Promise<ChildSessio
   }
 }
 
+// ── 运行诊断 ──
+
+export interface WorkerHealth {
+  alive: boolean;
+  pid: number | null;
+  uptime_sec: number;
+  failures: number;
+  respawns: number;
+  given_up: boolean;
+  last_exit_code: number | null;
+  last_log: string;
+  retry_in_sec: number;
+  generation: string;
+}
+
+export interface RuntimeStatus {
+  /** false = 这个部署的 engine 不由 supervisor 拉起，worker 那栏是「测不到」而不是「都挂了」。 */
+  supervised: boolean;
+  workers: Record<string, WorkerHealth>;
+  tasks: { queued: number; running: number };
+  started_at: string;
+  uptime_sec: number;
+}
+
+export interface LogFileInfo {
+  name: string;
+  size: number;
+  modified: number;
+}
+
+export async function getRuntimeStatus(token: string): Promise<RuntimeStatus> {
+  const resp = await apiFetch('/admin/runtime/status', { headers: authHeaders(token) });
+  return resp.json();
+}
+
+export async function listLogFiles(token: string): Promise<LogFileInfo[]> {
+  const resp = await apiFetch('/admin/runtime/logs', { headers: authHeaders(token) });
+  return (await resp.json()).files || [];
+}
+
+export async function readLogTail(
+  token: string, name: string, lines = 500,
+): Promise<{ text: string; truncated: boolean }> {
+  const resp = await apiFetch(
+    `/admin/runtime/logs/${encodeURIComponent(name)}?lines=${lines}`,
+    { headers: authHeaders(token) },
+  );
+  return resp.json();
+}
+
+export async function retryEngine(token: string): Promise<void> {
+  await apiFetch('/admin/runtime/engine/retry', { method: 'POST', headers: authHeaders(token) });
+}
+
 // ── Legacy compat exports ──
 
 export const sendInbound = postInbound;

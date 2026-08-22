@@ -45,6 +45,7 @@ describe('expanded settings registry', () => {
     expect(settingsTabs.map((tab) => tab.id)).toEqual([
       'general',
       'client',
+      'runtime',
       'system',
       'approvals',
       'agents',
@@ -58,6 +59,10 @@ describe('expanded settings registry', () => {
     ]);
     expect(settingsTabs.find((tab) => tab.id === 'system')).toMatchObject({ label: '系统', icon: 'settings_power', order: 4 });
     expect(settingsTabs.find((tab) => tab.id === 'tools')).toMatchObject({ label: '工具与权限', icon: 'build', order: 8 });
+  });
+
+  it('每个 tab 都归了组，侧栏才摆得下二十多项', () => {
+    expect(settingsTabs.every((tab) => tab.group)).toBe(true);
   });
 });
 
