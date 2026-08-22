@@ -5,6 +5,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 
 import {
+  createInstance,
+  deleteInstance,
+  getInstanceProgress,
   getInstances,
   getQqAccount,
   getQqLoginQrcode,
@@ -14,6 +17,7 @@ import {
   qqPinAccount,
   qqQuickLogin,
   type ConsoleInstance,
+  type InstanceProgress,
   type QqAccount,
   type QqQuickLoginTarget,
 } from '../api/supervisorClient';
@@ -36,6 +40,9 @@ export const AccountPage = () => {
   const [note, setNote] = useState('正在读取…');
   const [busy, setBusy] = useState(false);
   const [instances, setInstances] = useState<ConsoleInstance[]>([]);
+  const [newUin, setNewUin] = useState('');
+  const [newLabel, setNewLabel] = useState('');
+  const [job, setJob] = useState<InstanceProgress | null>(null);
   const stageStartedAt = useRef(0);
 
   const refresh = useCallback(async (): Promise<QqAccount | null> => {
@@ -152,6 +159,68 @@ export const AccountPage = () => {
       setNote(say(error));
       // 切失败会把这个号记成死号，刷一次列表让它立刻置灰。
       void refresh();
+    }
+    setBusy(false);
+  };
+
+  // root 侧那一串动作要一两分钟，进度只能靠轮询日志文件。
+  useEffect(() => {
+    if (!token || !job || job.finished) return undefined;
+    const timer = window.setInterval(() => {
+      void getInstanceProgress(token, job.uin)
+        .then((next) => {
+          setJob(next);
+          // 建完/删完清单才变，这时候刷一次列表就够，不必一直拉。
+          if (next.finished) void getInstances(token).then(setInstances).catch(() => {});
+        })
+        .catch(() => {});
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [token, job]);
+
+  const addInstance = async () => {
+    if (!token) return;
+    const uin = newUin.trim();
+    if (!/^[1-9]\d{4,10}$/.test(uin)) {
+      setNote('QQ 号要是 5-11 位数字');
+      return;
+    }
+    if (!window.confirm(
+      `给 ${uin} 建一套独立实例？\n\n`
+      + '会新建 NapCat 容器、systemd 服务和域名路由，约一两分钟。\n'
+      + '建好后要去它自己的控制台扫码登录，当前这个号不受影响。',
+    )) return;
+    setBusy(true);
+    try {
+      const plan = await createInstance(token, uin, newLabel.trim());
+      setNewUin('');
+      setNewLabel('');
+      setJob({ uin: plan.uin, lines: ['已提交，等 root 侧接手…'], finished: false, ok: false, detail: '' });
+    } catch (error) {
+      setNote(say(error));
+    }
+    setBusy(false);
+  };
+
+  const dropInstance = async (row: ConsoleInstance) => {
+    if (!token) return;
+    // 手打号码而不是点确定：这一步会停掉一个号的全部服务。
+    const typed = window.prompt(
+      `删掉实例 ${row.label}（${row.uin}）？\n\n`
+      + '它的进程会停掉，NapCat 容器会被移除，工作区和聊天记录改名归档——不是真删，\n'
+      + '确认无误后要自己上服务器清理。\n\n输入这个 QQ 号确认：',
+    );
+    if (typed === null) return;
+    if (typed.trim() !== row.uin) {
+      setNote('输入的号对不上，没有执行');
+      return;
+    }
+    setBusy(true);
+    try {
+      await deleteInstance(token, row.uin);
+      setJob({ uin: row.uin, lines: ['已提交删除…'], finished: false, ok: false, detail: '' });
+    } catch (error) {
+      setNote(say(error));
     }
     setBusy(false);
   };
@@ -320,7 +389,13 @@ export const AccountPage = () => {
 
       <Block hint="一个号一套进程，会话、记忆、渠道、人格全部各自一份" title="多开实例">
         <div className="qc-panel">
-          {instances.length > 1 ? (
+          {instances.length === 0 ? (
+            <p className="qc-facts">
+              还没启用多开。在服务器上执行一次{' '}
+              <code>sudo deploy/install_provision.sh {account?.uin || '<当前QQ号>'}</code>
+              ，之后这里就能直接加号。
+            </p>
+          ) : (
             instances.map((row) => (
               <div className="qc-chan-row" key={row.uin}>
                 <span className="qc-acct-who">
@@ -333,18 +408,69 @@ export const AccountPage = () => {
                   {row.current ? (
                     <span className="qc-cap-desc">就是这一个</span>
                   ) : (
-                    <a className="qc-btn qc-btn-quiet" href={instanceConsoleHref(row.path)}>
-                      去它的控制台
-                    </a>
+                    <>
+                      <a className="qc-btn qc-btn-quiet" href={instanceConsoleHref(row.path)}>
+                        去它的控制台
+                      </a>
+                      {row.idx !== 0 && (
+                        <button
+                          className="qc-btn qc-btn-danger"
+                          disabled={busy || (job !== null && !job.finished)}
+                          onClick={() => void dropInstance(row)}
+                          type="button"
+                        >
+                          删掉
+                        </button>
+                      )}
+                    </>
                   )}
                 </div>
               </div>
             ))
-          ) : (
-            <p className="qc-facts">
-              这台机器上只有当前这一个号在跑。加一个号：在服务器上执行{' '}
-              <code>deploy/new_instance.sh &lt;QQ号&gt; 1</code>，它会打印剩下要做的三步。
-            </p>
+          )}
+
+          {instances.length > 0 && (
+            <div className="qc-chan-row">
+              <span className="qc-chan-label">加号</span>
+              <div className="qc-chan-body">
+                <input
+                  className="qc-inp"
+                  disabled={busy || (job !== null && !job.finished)}
+                  inputMode="numeric"
+                  onChange={(event) => setNewUin(event.target.value)}
+                  placeholder="QQ 号"
+                  value={newUin}
+                />
+                <input
+                  className="qc-inp"
+                  disabled={busy || (job !== null && !job.finished)}
+                  onChange={(event) => setNewLabel(event.target.value)}
+                  placeholder="备注，可留空"
+                  value={newLabel}
+                />
+                <button
+                  className="qc-btn qc-btn-quiet"
+                  disabled={busy || !newUin.trim() || (job !== null && !job.finished)}
+                  onClick={() => void addInstance()}
+                  type="button"
+                >
+                  建实例
+                </button>
+              </div>
+            </div>
+          )}
+
+          {job && (
+            <>
+              <pre className="qc-prov-log">{job.lines.join('\n')}</pre>
+              {job.finished && (
+                <p className="qc-facts">
+                  {job.ok
+                    ? '完成了。新号要去它自己的控制台扫码登录。'
+                    : `没成功：${job.detail || '看上面的日志'}`}
+                </p>
+              )}
+            </>
           )}
         </div>
       </Block>

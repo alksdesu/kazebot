@@ -308,6 +308,17 @@
     background: var(--qc-shelf);
   }
 
+  .qc-btn-danger {
+    border-color: var(--qc-halt);
+    background: none;
+    color: var(--qc-halt);
+  }
+
+  .qc-btn-danger:hover:not(:disabled) {
+    background: var(--qc-halt);
+    color: var(--qc-paper);
+  }
+
   /* ── 页面骨架 ───────────────────────────────────── */
 
   .qc-page {
@@ -889,6 +900,23 @@
 
   .qc-chan-body .qc-btn {
     flex: 0 0 auto;
+  }
+
+  /* 建号进度。root 侧一行行 append，这里只负责能滚动、不撑破面板。 */
+  .qc-prov-log {
+    max-height: 15em;
+    margin: 10px 0 0;
+    padding: 10px 12px;
+    overflow: auto;
+    border: 1px solid var(--qc-rule);
+    border-radius: var(--qc-r-sm);
+    background: var(--qc-shelf);
+    color: var(--qc-ink);
+    font-size: 12px;
+    font-family: var(--qc-mono);
+    line-height: 1.6;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
 
   /* 快速切换的账号列，占 .qc-chan-label 的位置但要放得下头像，所以不复用它。 */

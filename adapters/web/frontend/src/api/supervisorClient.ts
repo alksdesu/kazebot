@@ -641,6 +641,8 @@ export interface ConsoleInstance {
   /** 挂载前缀，根实例为空串。 */
   path: string;
   current: boolean;
+  /** 序号，决定端口。老清单没有这个字段时后端给 -1。 */
+  idx?: number;
 }
 
 /**
@@ -670,6 +672,55 @@ export async function getInstances(token: string): Promise<ConsoleInstance[]> {
   const resp = await apiFetch('/instances', { headers: authHeaders(token) });
   const data = await resp.json();
   return Array.isArray(data?.instances) ? data.instances : [];
+}
+
+/** 新实例落点。序号决定端口，前缀决定它挂在域名的哪一层。 */
+export interface InstancePlan {
+  uin: string;
+  label: string;
+  idx: number;
+  prefix: string;
+  ports: Record<string, number>;
+  workspace: string;
+}
+
+/** root 侧建号的实时进度。finished 之前一直轮询。 */
+export interface InstanceProgress {
+  uin: string;
+  lines: string[];
+  finished: boolean;
+  ok: boolean;
+  detail: string;
+}
+
+export async function createInstance(
+  token: string,
+  uin: string,
+  label: string,
+): Promise<InstancePlan> {
+  const resp = await apiFetch('/instances', {
+    method: 'POST',
+    headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uin, label }),
+  });
+  return resp.json();
+}
+
+export async function getInstanceProgress(
+  token: string,
+  uin: string,
+): Promise<InstanceProgress> {
+  const resp = await apiFetch(`/instances/${encodeURIComponent(uin)}/progress`, {
+    headers: authHeaders(token),
+  });
+  return resp.json();
+}
+
+export async function deleteInstance(token: string, uin: string): Promise<void> {
+  await apiFetch(`/instances/${encodeURIComponent(uin)}`, {
+    method: 'DELETE',
+    headers: authHeaders(token),
+  });
 }
 
 export async function getQqAccount(token: string): Promise<QqAccount> {
