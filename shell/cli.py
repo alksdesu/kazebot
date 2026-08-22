@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from clonoth_runtime import admin_auth_headers, get_float, load_runtime_config, strip_tool_trace_blocks
+from workspace import resolve_workspace_root
 
 
 def wait_supervisor(
@@ -216,7 +217,7 @@ def main() -> None:
 
     base_url = args.supervisor.rstrip("/")
 
-    workspace_root = Path(__file__).resolve().parents[1]
+    workspace_root = resolve_workspace_root(Path(__file__).resolve().parents[1])
     runtime_cfg = load_runtime_config(workspace_root)
 
     conversation_key = str(args.conversation_key or "").strip()

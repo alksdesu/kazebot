@@ -24,8 +24,13 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - direct ``python engine/data_cleanup.py``
     from eventlog_rotation import SIGNALS_BACKUPS, SIGNALS_MAX_BYTES, rotate_event_log
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:  # 直接 ``python engine/data_cleanup.py`` 时项目根不在路径上
+    sys.path.insert(0, str(_REPO_ROOT))
+from workspace import resolve_workspace_root  # noqa: E402
+
 # ── Paths ──────────────────────────────────────
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = resolve_workspace_root(_REPO_ROOT) / "data"
 EVENTS_FILE = DATA_DIR / "events.jsonl"
 SIGNALS_FILE = DATA_DIR / "signals.jsonl"
 LOG_FILE = DATA_DIR / "logs" / "cleanup.log"

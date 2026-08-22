@@ -23,6 +23,7 @@ import yaml
 # imported through the compatibility shim or directly during deployment checks.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from clonoth_sdk import BotConfig, ClonothClient, EventRouter, SessionState  # noqa: E402
+from workspace import resolve_workspace_root  # noqa: E402
 
 from .agent import ApprovalView, _start_bridge, handle_agent, handle_model_command
 from .callbacks import EreunaCallbacks
@@ -47,9 +48,7 @@ logger = logging.getLogger("ereuna_v2")
 # ============================================================
 
 CLONOTH_BASE_URL = os.environ.get("CLONOTH_URL", "http://127.0.0.1:8765")
-CLONOTH_WORKSPACE: Path = Path(
-    os.environ.get("CLONOTH_WORKSPACE", "") or Path(__file__).resolve().parents[2]
-)
+CLONOTH_WORKSPACE: Path = resolve_workspace_root(Path(__file__).resolve().parents[2])
 AGENT_LOG_CHANNEL_ID = int(os.environ.get("DISCORD_LOG_CHANNEL", "0"))
 BRIDGE_PORT = int(os.environ.get("DISCORD_BRIDGE_PORT", "8768"))
 HISTORY_MAX_LEN = int(os.environ.get("DISCORD_HISTORY_LEN", "15"))

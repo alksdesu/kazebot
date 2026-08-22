@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
-CACHE_ROOT = Path("data") / "stocktool" / "cache"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:  # 工具以子进程跑，sys.path 里只有自己那一级
+    sys.path.insert(0, str(_REPO_ROOT))
+from workspace import resolve_workspace_root  # noqa: E402
+
+CACHE_ROOT = resolve_workspace_root(_REPO_ROOT) / "data" / "stocktool" / "cache"
 
 
 def _safe_name(value: str) -> str:

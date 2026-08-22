@@ -15,6 +15,7 @@ from textual.containers import Vertical, VerticalScroll, Center
 from textual.widgets import Static, Button, Label
 
 from clonoth_runtime import read_admin_token
+from workspace import resolve_workspace_root
 
 from .styles import DEFAULT_CSS
 from .services.supervisor_client import SupervisorClient
@@ -107,7 +108,7 @@ class ClonothApp(App):
     ) -> None:
         super().__init__()
         self._supervisor_url = supervisor_url
-        self.workspace_root = workspace_root or Path(__file__).resolve().parents[2]
+        self.workspace_root = workspace_root or resolve_workspace_root(Path(__file__).resolve().parents[2])
         self.conversation_key = conversation_key or f"cli:{uuid.uuid4()}"
         self.session_id: str | None = None
         self.approval_mode: str = "normal"

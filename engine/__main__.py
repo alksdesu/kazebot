@@ -8,6 +8,8 @@ import os
 import uuid
 from pathlib import Path
 
+from workspace import resolve_workspace_root
+
 # [2026-05-25] Ensure all loggers (including plugins like fallback_provider)
 # output to stderr so PM2 can capture them.
 logging.basicConfig(
@@ -29,7 +31,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    workspace_root = Path(__file__).resolve().parents[1]
+    workspace_root = resolve_workspace_root(Path(__file__).resolve().parents[1])
 
     from .runner import worker_loop
 

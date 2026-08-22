@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 DRAWTOOLS_DIR = Path(__file__).resolve().parent
-WORKSPACE_ROOT = DRAWTOOLS_DIR.parents[1]
+_REPO_ROOT = DRAWTOOLS_DIR.parents[1]
+if str(_REPO_ROOT) not in sys.path:  # 工具以子进程跑，sys.path 里只有自己那一级
+    sys.path.insert(0, str(_REPO_ROOT))
+from workspace import resolve_workspace_root  # noqa: E402
+
+WORKSPACE_ROOT = resolve_workspace_root(_REPO_ROOT)
 SETTINGS_PATH = DRAWTOOLS_DIR / "settings.yaml"
 SETTINGS_EXAMPLE_PATH = DRAWTOOLS_DIR / "settings.example.yaml"
 CHARACTER_TAGS_PATH = DRAWTOOLS_DIR / "character_tags.yaml"

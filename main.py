@@ -16,16 +16,30 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 RESTART_EXIT_CODE = 75
 
 
+def _child_env() -> dict[str, str]:
+    """让子进程找得到本仓库。
+
+    多实例的 cwd 是各自的工作区而非代码目录，而 -m 只把 cwd 加进 sys.path。
+    """
+    env = os.environ.copy()
+    root = str(Path(__file__).resolve().parent)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (root, env.get("PYTHONPATH", "")) if p)
+    return env
+
+
 def main() -> None:
+    env = _child_env()
     while True:
-        result = subprocess.call([sys.executable, "-m", "supervisor.main", *sys.argv[1:]])
+        result = subprocess.call([sys.executable, "-m", "supervisor.main", *sys.argv[1:]], env=env)
         if result == RESTART_EXIT_CODE:
             print(f"[launcher] supervisor exited with code {RESTART_EXIT_CODE}, restarting in 1s...", flush=True)
             time.sleep(1)  # 等待端口释放

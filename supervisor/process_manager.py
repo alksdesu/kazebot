@@ -157,7 +157,16 @@ class ProcessManager:
             stdout = log_f
             stderr = subprocess.STDOUT
 
-        env = {**os.environ, "CLONOTH_SUPERVISOR_URL": self.supervisor_url}
+        # cwd 是工作区而非代码目录，而 -m 只把 cwd 加进 sys.path：不补这一条，
+        # 工作区与代码分离时子进程连自己的包都 import 不到。
+        repo_root = str(Path(__file__).resolve().parents[1])
+        env = {
+            **os.environ,
+            "CLONOTH_SUPERVISOR_URL": self.supervisor_url,
+            "PYTHONPATH": os.pathsep.join(
+                p for p in (repo_root, os.environ.get("PYTHONPATH", "")) if p
+            ),
+        }
 
         cmd = [sys.executable, "-m", module, "--supervisor", self.supervisor_url]
         if extra_args:

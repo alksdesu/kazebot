@@ -160,7 +160,9 @@ class EventRouter:
         """Derive an adapter-local path without changing existing constructors."""
         identity = config.conversation_key_prefix or config.entry_node_id or "default"
         safe_identity = re.sub(r"[^A-Za-z0-9_.-]+", "_", identity).strip("._")
-        return Path("data") / f"clonoth_sdk_outbound_{safe_identity or 'default'}.sqlite3"
+        # 挂在工作区下而不是 cwd：待发队列落错地方就是整批消息重发或丢失。
+        root = Path(config.workspace_root) if config.workspace_root else Path.cwd()
+        return root / "data" / f"clonoth_sdk_outbound_{safe_identity or 'default'}.sqlite3"
 
     # ------------------------------------------------------------------
     #  公共接口

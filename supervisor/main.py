@@ -15,6 +15,8 @@ from pathlib import Path
 import uvicorn
 from dotenv import load_dotenv
 
+from workspace import resolve_workspace_root
+
 from .api import create_app
 from .config_store import ConfigStore
 from .eventlog import EventLog
@@ -47,7 +49,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    workspace_root = Path(__file__).resolve().parents[1]
+    # 放在 load_dotenv 之后：多实例靠各自 cwd 的 .env 指定自己的工作区。
+    workspace_root = resolve_workspace_root(Path(__file__).resolve().parents[1])
     data_dir = workspace_root / "data"
     log_dir = data_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)

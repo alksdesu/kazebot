@@ -10,6 +10,8 @@ import re
 from pathlib import Path
 from typing import Any, Callable
 
+from workspace import resolve_workspace_root
+
 
 def _env_bool(name: str, default: bool) -> bool:
     """解析布尔环境变量，兼容 onebot11_adapter.py 的 ONEBOT_* 配置风格。"""
@@ -129,12 +131,9 @@ def parse_path_list(raw: str) -> tuple[str, ...]:
 CLONOTH_BASE_URL = _env_first("CLONOTH_BASE_URL", "CLONOTH_SUPERVISOR_URL", default="http://127.0.0.1:8765")
 
 # Clonoth 工作区根目录（用于 clonoth_sdk 导入和附件路径解析）。
-# 默认从本文件位置推导仓库根：值与 supervisor/engine 不一致时，附件、记忆、admin token 会静默落到两个地方。
-CLONOTH_WORKSPACE = _env_first(
-    "CLONOTH_WORKSPACE",
-    "ONEBOT_WORKSPACE_ROOT",
-    default=str(Path(__file__).resolve().parents[2]),
-)
+# 与 supervisor/engine 共用同一个解析函数：各算各的时 `~` 和相对路径会被展开成两个根，
+# 附件、记忆、admin token 于是静默落到两个地方。
+CLONOTH_WORKSPACE = str(resolve_workspace_root(Path(__file__).resolve().parents[2]))
 
 # 入口节点 ID。默认使用 QQ 综合入口，兼顾联网搜索、调度、重启和取消任务。
 # 如需搜索-only 安全窄入口，可显式设置 CLONOTH_ENTRY_NODE=qq.web_search。
