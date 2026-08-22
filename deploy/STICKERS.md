@@ -8,9 +8,19 @@
 
 **不配这一步，收进来的图永远打不上标签，也就永远进不了检索。**
 
-控制台「表情包」页有一块看图渠道，填接口地址、模型名和 key。它写的是 `data/config.yaml` 的 `system_models.image`，`read_image` 工具用的是同一份。
+控制台「表情包」页有一块看图渠道：选渠道、填地址、点「拉取」挑模型、填 key。它写的是 `data/config.yaml` 的 `system_models.image`，`read_image` 工具用的是同一份。
 
-留空表示跟随主渠道，但**主渠道不是 OpenAI 兼容格式时这条跟随会失败** —— 打标发的是 `/chat/completions`，gemini/anthropic 原生端点不收。日志里会看到「主渠道 X 不收 OpenAI 格式的 /chat/completions」，那就是这个情况，必须单独配。
+「渠道」决定按谁的格式发请求，四种都支持（OpenAI / Responses / Claude / Gemini 原生）。它也决定地址写到哪一级：OpenAI 系要带 `/v1`，Claude 和 Gemini 不带，多带的版本段会被去掉。
+
+留空的规则是分层的，不是一刀切：
+
+| 填了什么 | 按谁的格式发 |
+|---|---|
+| 全空 | 整条跟随主渠道，格式也跟着它 |
+| 只填了地址 | OpenAI —— 换了地址就不能假定对面还说主渠道那套话，中转站按最小公约数算 |
+| 选了渠道 | 就按选的那家 |
+
+所以主渠道是 Gemini 或 Claude 原生时，什么都不填也能打标；而填了一个中转站地址却没选渠道时，发的是 OpenAI 格式。
 
 ## 开始收图
 
