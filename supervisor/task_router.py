@@ -1702,7 +1702,7 @@ class TaskRouterMixin:
         # [Fix] finish(text="") 空文本时也产出 outbound_message 事件。
         # 原先 `if text or atts:` 导致空文本 finish 不发事件，
         # Bot 侧 trigger 和 status_msg（含 stream_delta 累积的原始标记预览）永远无法清理。
-        # 去掉守卫后，Bot 侧 send_reply 会跳过 Discord 发送但正常执行清理收尾。
+        # 去掉守卫后，Bot 侧 send_reply 会跳过平台发送但正常执行清理收尾。
         # [fix 2026-07-17] 路由竞态防护：任务完成到这里时，目标 session 可能已被
         # 合并/清理（例如 branch 已 merge 回主 session、或 fresh/fork dispatch session
         # 已删除），此时 append_outbound_message 会抛 KeyError('session not found')并

@@ -7,7 +7,7 @@ Phase 3 step 1 (2026-04-17): 初始创建。
 
 设计原则：
   - 使用 typing.Protocol，适配器通过鸭子类型实现，无需继承
-  - 不依赖 discord.py 或任何平台库
+  - 不依赖任何平台库
   - 所有方法均为 async
   - 方法签名使用 clonoth_sdk/state.py 和 clonoth_sdk/types.py 中的类型
   - SDK 协议标记（[CLONOTH_TOOL_TRACE]）由 SDK 清理；
@@ -31,7 +31,7 @@ class AdapterCallbacks(Protocol):
     EventRouter 在处理每个事件的协议逻辑（trigger 匹配、状态更新、
     去重、节流）后，通过此接口通知适配器执行平台特定操作。
 
-    适配器（如 bot_adapter.py 的 Discord Bot）需要实现全部方法。
+    适配器需要实现全部方法。
     SDK 保证只在协议处理完成后调用回调，适配器无需关心事件解析、
     trigger 匹配、状态管理等协议细节。
 
@@ -83,7 +83,7 @@ class AdapterCallbacks(Protocol):
 
         Args:
             trigger: 被消费的触发信息。platform_data 中包含平台消息引用
-                     （如 Discord 适配器的 message、status_msg、channel_id）。
+                     （如 message、status_msg、channel_id）。
             text: 清理过 SDK 协议标记后的回复文本（可能为空字符串）。
                   仍包含 Bot 自定义标记，适配器自行解析处理。
             attachments: 附件列表，每个元素为 dict（含 path / filename 等字段），
@@ -147,12 +147,12 @@ class AdapterCallbacks(Protocol):
           - 清理内部协议标记
 
         适配器需要：
-          - 从 conversation_key 解析平台频道标识（如 "discord:123" → channel 123）
+          - 从 conversation_key 解析平台频道标识（如 "qq_group:123" → channel 123）
           - 非入口节点的消息可加节点显示名前缀以区分来源
           - 发送文本和附件到对应频道
 
         Args:
-            conversation_key: 目标会话键（如 "discord:123456789"）。
+            conversation_key: 目标会话键（如 "qq_group:123456789"）。
             text: 清理过 SDK 协议标记后的文本。仍含 Bot 自定义标记。
             attachments: 附件列表。
             node_id: 发送方节点 ID。空字符串表示未知。
@@ -212,7 +212,7 @@ class AdapterCallbacks(Protocol):
         适配器需要：
           - 从 trigger.platform_data 获取 status_msg 引用
           - 调用平台 API 编辑消息内容
-          - 移除交互组件（如 Discord view=None）
+          - 移除交互组件
 
         Args:
             trigger: 关联的触发信息。
@@ -389,7 +389,7 @@ class AdapterCallbacks(Protocol):
         适配器需要：
           - 确定目标频道（查找链：活跃 trigger → session_conv_map → DM → 日志频道）
           - 从 details 提取操作信息并格式化描述文本
-          - 构造并发送审批 UI（如 Discord ApprovalView 按钮）
+          - 构造并发送审批 UI
 
         Args:
             approval_id: 审批请求唯一 ID。用户做出决策后传给 ClonothClient.approve()。
@@ -418,7 +418,7 @@ class AdapterCallbacks(Protocol):
 
         适配器需要：
           - 在 trigger 关联的频道触发 typing 指示
-            （如 Discord channel.typing()）
+            （即平台的「正在输入」状态）
           - 更新 trigger.platform_data 中的 last_typing_time
 
         Args:
@@ -449,7 +449,7 @@ class AdapterCallbacks(Protocol):
 
         Args:
             trigger: 目标触发消息。platform_data 中包含原始平台消息引用。
-            reactions: 反应标识列表（如 emoji 字符串、Discord 自定义表情格式等）。
+            reactions: 反应标识列表（如 emoji 字符串、平台自定义表情 ID 等）。
                        格式由 Bot 自定义约定决定，SDK 不解读内容。
         """
         ...
@@ -474,7 +474,7 @@ class AdapterCallbacks(Protocol):
           - 将 task_id 回填到 trigger.task_id
 
         适配器需要：
-          - 更新 UI 组件中的 task_id（如 Discord CancelView），
+          - 更新 UI 组件中的 task_id（如取消按钮），
             使取消按钮能精准取消单个任务而非整个 session
 
         Args:
@@ -525,13 +525,13 @@ class AdapterCallbacks(Protocol):
               * 被清理的 trigger 通过 cleaned_triggers 传出
 
         适配器需要：
-          - 清理平台侧历史缓存（如 Discord 频道消息历史队列）
+          - 清理平台侧历史缓存（如频道消息历史队列）
           - 遍历 cleaned_triggers，编辑其 status_msg（如 "🔄 上下文已重置。"）
           - 清理关联的 MainTaskState 中的 log_msg
             （通过 trigger.platform_data["_stale_main_state"].platform_data["log_msg"]）
 
         Args:
-            conversation_key: 被重置的会话键（如 "discord:123456789"）。
+            conversation_key: 被重置的会话键（如 "qq_group:123456789"）。
             reason: 重置原因。"compact" 表示上下文压缩，其他值表示完整清除。
             cleaned_triggers: 被清理的 trigger 列表（仅非 compact 时有内容）。
                               每个 trigger 的 platform_data["_stale_main_state"]

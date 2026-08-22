@@ -71,8 +71,8 @@ def test_session_store_persists_and_restores_entry_node_id(tmp_path: Path) -> No
     store.on_session_created(
         SessionInfo(
             session_id="session-new",
-            channel="discord",
-            conversation_key="discord:new",
+            channel="chat",
+            conversation_key="chat:new",
             created_at=created_at,
             updated_at=created_at,
             entry_node_id="persisted.entry",
@@ -87,8 +87,8 @@ def test_session_store_persists_and_restores_entry_node_id(tmp_path: Path) -> No
 
     raw["session-old"] = {
         "session_id": "session-old",
-        "channel": "discord",
-        "conversation_key": "discord:old",
+        "channel": "chat",
+        "conversation_key": "chat:old",
         "created_at": created_at.isoformat(),
         "reset": False,
     }
@@ -101,7 +101,7 @@ def test_session_store_persists_and_restores_entry_node_id(tmp_path: Path) -> No
     # old session registries continue loading after the schema extension.
     assert restored["session-new"].entry_node_id == "persisted.entry"
     assert restored["session-old"].entry_node_id == ""
-    assert conv_map["discord:new"] == "session-new"
+    assert conv_map["chat:new"] == "session-new"
     assert child_map == {}
     assert parent_children == {}
 
@@ -110,7 +110,7 @@ def test_recorded_entry_node_is_used_after_restart(tmp_path: Path) -> None:
     """Inbound task creation should prefer the session record over the global default."""
     _write_runtime_config(tmp_path, entry_node_id="global.default")
     state = _make_state(tmp_path)
-    session_id = state.get_or_create_session(channel="discord", conversation_key="discord:restart")
+    session_id = state.get_or_create_session(channel="chat", conversation_key="chat:restart")
     state.sessions[session_id].entry_node_id = "recorded.entry"
     state._session_store.update_entry_node(session_id, "recorded.entry")
 
@@ -171,7 +171,7 @@ def test_first_inbound_records_entry_node_when_session_has_none(tmp_path: Path) 
     """The first routed inbound should backfill entry_node_id into sessions.json."""
     _write_runtime_config(tmp_path, entry_node_id="global.default")
     state = _make_state(tmp_path)
-    session_id = state.get_or_create_session(channel="discord", conversation_key="discord:first")
+    session_id = state.get_or_create_session(channel="chat", conversation_key="chat:first")
 
     with state._lock:
         task = state._create_entry_task_for_inbound_locked(
@@ -195,22 +195,22 @@ def test_dispatch_inbound_task_context_carries_route_metadata(tmp_path: Path) ->
     """Dispatch-created task snapshots should expose structured parent route metadata."""
     _write_runtime_config(tmp_path, entry_node_id="global.default")
     state = _make_state(tmp_path)
-    session_id = state.get_or_create_session(channel="discord", conversation_key="agent:coder:discord:parent")
+    session_id = state.get_or_create_session(channel="chat", conversation_key="agent:coder:chat:parent")
 
     with state._lock:
         task = state._create_entry_task_for_inbound_locked(
             inbound_seq=3,
             session_id=session_id,
             payload={
-                "channel": "discord",
-                "conversation_key": "agent:coder:discord:parent",
+                "channel": "chat",
+                "conversation_key": "agent:coder:chat:parent",
                 "text": "run delegated task",
                 "entry_node_id": "coder.node",
                 "dispatch_context_mode": "accumulate",
                 "dispatch_origin": {
                     "parent_session_id": "parent-session",
                     "caller_node_id": "scout.node",
-                    "parent_conversation_key": "discord:parent",
+                    "parent_conversation_key": "chat:parent",
                     "context_mode": "accumulate",
                 },
             },
@@ -222,15 +222,15 @@ def test_dispatch_inbound_task_context_carries_route_metadata(tmp_path: Path) ->
     # can be mapped without reverse-parsing agent:-prefixed conversation keys.
     assert task is not None
     task_context = task.input["task_context"]
-    assert task.input["_dispatch_origin"]["parent_conversation_key"] == "discord:parent"
+    assert task.input["_dispatch_origin"]["parent_conversation_key"] == "chat:parent"
     assert task_context["dispatch_context_mode"] == "accumulate"
-    assert task_context["parent_conversation_key"] == "discord:parent"
-    assert task_context["route_conversation_key"] == "discord:parent"
+    assert task_context["parent_conversation_key"] == "chat:parent"
+    assert task_context["route_conversation_key"] == "chat:parent"
 
     created_events = [evt for evt in state.eventlog.list_all_events() if evt.get("type") == "task_created"]
     created_input = created_events[-1]["payload"]["input"]
-    assert created_input["_dispatch_origin"]["parent_conversation_key"] == "discord:parent"
-    assert created_input["task_context"]["route_conversation_key"] == "discord:parent"
+    assert created_input["_dispatch_origin"]["parent_conversation_key"] == "chat:parent"
+    assert created_input["task_context"]["route_conversation_key"] == "chat:parent"
 
 
 def _draw_pinned_payload(*, pinned: bool) -> dict:
@@ -302,7 +302,7 @@ def test_switch_session_node_persists_and_clears_entry_node(tmp_path: Path) -> N
     """switch_node persistence should survive restart and clear stale targets."""
     _write_runtime_config(tmp_path, entry_node_id="global.default")
     state = _make_state(tmp_path)
-    session_id = state.get_or_create_session(channel="discord", conversation_key="discord:switch")
+    session_id = state.get_or_create_session(channel="chat", conversation_key="chat:switch")
 
     result = state.switch_session_node(session_id, "switched.entry")
     raw = json.loads((tmp_path / "data" / "sessions.json").read_text(encoding="utf-8"))

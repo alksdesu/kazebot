@@ -150,7 +150,7 @@ def _router(state: SessionState, callbacks: _FakeCallbacks | None = None) -> Eve
         BotConfig(
             base_url="http://127.0.0.1:8765",
             entry_node_id="ereuna_main",
-            conversation_key_prefix="discord",
+            conversation_key_prefix="chat",
             workspace_root=Path(__file__).resolve().parents[1],
             auto_approve_internal=False,
         ),
@@ -159,8 +159,8 @@ def _router(state: SessionState, callbacks: _FakeCallbacks | None = None) -> Eve
 
 def test_dispatch_child_session_uses_structured_parent_conversation_key() -> None:
     state = SessionState()
-    state.register_session("discord:test-parent-channel", "parent-session")
-    state.register_session("agent:coder:agent:scout:discord:wrong", "child-session")
+    state.register_session("chat:test-parent-channel", "parent-session")
+    state.register_session("agent:coder:agent:scout:chat:wrong", "child-session")
     router = _router(state)
 
     payload = {
@@ -172,12 +172,12 @@ def test_dispatch_child_session_uses_structured_parent_conversation_key() -> Non
             "_dispatch_origin": {
                 "parent_session_id": "parent-session",
                 "caller_node_id": "scout",
-                "parent_conversation_key": "discord:test-parent-channel",
+                "parent_conversation_key": "chat:test-parent-channel",
                 "context_mode": "accumulate",
             },
             "task_context": {
-                "conversation_key": "agent:coder:agent:scout:discord:wrong",
-                "route_conversation_key": "discord:test-parent-channel",
+                "conversation_key": "agent:coder:agent:scout:chat:wrong",
+                "route_conversation_key": "chat:test-parent-channel",
                 "dispatch_context_mode": "accumulate",
             },
         },
@@ -188,8 +188,8 @@ def test_dispatch_child_session_uses_structured_parent_conversation_key() -> Non
     # Purpose: approvals and progress from child sessions resolve to the parent channel.
     router._register_dispatch_child_session(_event("task_created", session_id="branch-session", payload=payload), payload)
 
-    assert state.get_conversation_key("child-session") == "discord:test-parent-channel"
-    assert state.get_conversation_key("branch-session") == "discord:test-parent-channel"
+    assert state.get_conversation_key("child-session") == "chat:test-parent-channel"
+    assert state.get_conversation_key("branch-session") == "chat:test-parent-channel"
 
 
 def test_unowned_approval_is_not_marked_handled() -> None:
@@ -238,7 +238,7 @@ def test_unowned_child_progress_is_skipped_before_state_creation() -> None:
 
 def test_owned_child_progress_uses_parent_conversation_key() -> None:
     state = SessionState()
-    state.session_conv_map["child-session"] = "discord:test-parent-channel"
+    state.session_conv_map["child-session"] = "chat:test-parent-channel"
     callbacks = _FakeCallbacks()
     router = _router(state, callbacks)
     event = _event(
@@ -254,7 +254,7 @@ def test_owned_child_progress_uses_parent_conversation_key() -> None:
 
     asyncio.run(router._handle_handoff_progress(event))
 
-    assert callbacks.child_creations[0]["conversation_key"] == "discord:test-parent-channel"
+    assert callbacks.child_creations[0]["conversation_key"] == "chat:test-parent-channel"
     assert callbacks.child_creations[0]["session_id"] == "child-session"
 
 
@@ -268,7 +268,7 @@ def test_outbound_fallback_prefers_payload_conversation_key() -> None:
         "outbound_message",
         session_id="parent-session-without-local-map",
         payload={
-            "conversation_key": "discord:test-parent-channel",
+            "conversation_key": "chat:test-parent-channel",
             "text": "",
             "attachments": [attachment],
             "message_type": "dispatch_attachment",
@@ -280,12 +280,12 @@ def test_outbound_fallback_prefers_payload_conversation_key() -> None:
 
     assert len(callbacks.channel_sends) == 1
     sent = callbacks.channel_sends[0]
-    assert sent["conversation_key"] == "discord:test-parent-channel"
+    assert sent["conversation_key"] == "chat:test-parent-channel"
     assert sent["attachments"] == [attachment]
     assert sent["kwargs"]["node_id"] == "draw.novelai_planner"
     context = sent["kwargs"]["delivery_context"]
     assert (context.event_id, context.event_seq, context.conversation_key) == (
-        "evt-1", 1, "discord:test-parent-channel",
+        "evt-1", 1, "chat:test-parent-channel",
     )
 
 
@@ -314,7 +314,7 @@ def _recovery_router(path: Path, state: SessionState, callbacks: _RecoveringCall
         BotConfig(
             base_url="http://127.0.0.1:8765",
             entry_node_id="ereuna_main",
-            conversation_key_prefix="discord",
+            conversation_key_prefix="chat",
             outbound_store_path=path,
             outbound_retry_initial=retry,
             outbound_retry_max=max(retry, 60.0),
@@ -330,7 +330,7 @@ def _recovery_event(event_id: str = "evt-outbound-70") -> Event:
         component="supervisor", type="outbound_message",
         payload={
             "task_id": "task-recovery", "source_inbound_seq": 42,
-            "conversation_key": "discord:recovery-channel",
+            "conversation_key": "chat:recovery-channel",
             "node_id": "ereuna_main", "text": "hello", "attachments": [],
         },
     )
@@ -339,7 +339,7 @@ def _recovery_event(event_id: str = "evt-outbound-70") -> Event:
 def _recovery_state() -> tuple[SessionState, TriggerInfo, MainTaskState]:
     state = SessionState()
     trigger = TriggerInfo(
-        inbound_seq=42, conversation_key="discord:recovery-channel",
+        inbound_seq=42, conversation_key="chat:recovery-channel",
         session_id="session-recovery", is_dm=False,
         platform_data={"opaque_message": object()},
     )
@@ -413,7 +413,7 @@ def test_outbound_startup_retry_recovers_without_server_replay(tmp_path: Path) -
     assert recovered.reply_calls == []
     assert len(recovered.channel_sends) == 1
     sent = recovered.channel_sends[0]
-    assert sent["conversation_key"] == "discord:recovery-channel"
+    assert sent["conversation_key"] == "chat:recovery-channel"
     assert sent["text"] == "hello"
     assert sent["kwargs"]["node_id"] == "ereuna_main"
     assert sent["kwargs"]["delivery_context"].attempt == 2
@@ -492,10 +492,10 @@ def test_formal_delivery_context_is_not_shared_between_concurrent_events(tmp_pat
     router = _recovery_router(tmp_path / "concurrent.sqlite3", SessionState(), callbacks)
     first = _recovery_event("concurrent-one")
     first.seq = 81
-    first.payload = {**first.payload, "task_id": "task-one", "conversation_key": "discord:one"}
+    first.payload = {**first.payload, "task_id": "task-one", "conversation_key": "chat:one"}
     second = _recovery_event("concurrent-two")
     second.seq = 82
-    second.payload = {**second.payload, "task_id": "task-two", "conversation_key": "discord:two"}
+    second.payload = {**second.payload, "task_id": "task-two", "conversation_key": "chat:two"}
 
     async def dispatch_both() -> None:
         await asyncio.gather(router._dispatch(first), router._dispatch(second))
@@ -505,8 +505,8 @@ def test_formal_delivery_context_is_not_shared_between_concurrent_events(tmp_pat
         (context.event_id, context.event_seq, context.task_id, context.conversation_key)
         for context in callbacks.contexts
     } == {
-        ("concurrent-one", 81, "task-one", "discord:one"),
-        ("concurrent-two", 82, "task-two", "discord:two"),
+        ("concurrent-one", 81, "task-one", "chat:one"),
+        ("concurrent-two", 82, "task-two", "chat:two"),
     }
 
 
@@ -622,7 +622,7 @@ def test_force_replay_of_sent_uses_new_platform_identity(tmp_path: Path) -> None
 
 def _intermediate_event(
     *, seq: int = 170, node_id: str = "ereuna_main",
-    conversation_key: str = "discord:intermediate",
+    conversation_key: str = "chat:intermediate",
 ) -> Event:
     return Event(
         seq=seq, event_id=f"intermediate-{seq}", ts="", run_id="run",
@@ -703,7 +703,7 @@ def test_onebot_like_child_intermediate_nonretryable_failure_becomes_dead_letter
 def test_intermediate_startup_recovery_uses_captured_route_and_acks(tmp_path: Path) -> None:
     path = tmp_path / "intermediate-restart.sqlite3"
     state, trigger, _ = _recovery_state()
-    trigger.conversation_key = "discord:intermediate"
+    trigger.conversation_key = "chat:intermediate"
     first = _recovery_router(path, state, _IntermediateCallbacks(failures=1), 0.05)
     asyncio.run(first._dispatch(_intermediate_event()))
     recovered = _IntermediateCallbacks()
@@ -719,7 +719,7 @@ def test_intermediate_startup_recovery_uses_captured_route_and_acks(tmp_path: Pa
 
     asyncio.run(recover())
     assert len(recovered.channel_sends) == 1
-    assert recovered.channel_sends[0]["conversation_key"] == "discord:intermediate"
+    assert recovered.channel_sends[0]["conversation_key"] == "chat:intermediate"
     assert recovered.channel_sends[0]["kwargs"]["delivery_context"].attempt == 2
     assert second._outbound_store.pending() == []
 
@@ -805,21 +805,21 @@ def test_sent_retention_prunes_only_sent_event_json(tmp_path: Path) -> None:
 
 
 
-def test_discord_legacy_intermediate_callback_failure_is_not_swallowed(tmp_path: Path) -> None:
-    class DiscordLikeCallbacks(_FakeCallbacks):
+def test_legacy_intermediate_callback_failure_is_not_swallowed(tmp_path: Path) -> None:
+    class ExternalCallbacks(_FakeCallbacks):
         async def send_intermediate_reply(
             self, trigger: TriggerInfo, text: str,
         ) -> None:
-            raise ConnectionError("discord send failed")
+            raise ConnectionError("chat send failed")
 
     state, trigger, _ = _recovery_state()
     router = _recovery_router(
-        tmp_path / "discord-intermediate.sqlite3", state, DiscordLikeCallbacks(),
+        tmp_path / "chat-intermediate.sqlite3", state, ExternalCallbacks(),
     )
     asyncio.run(router._dispatch(_intermediate_event()))
     rows = router._outbound_store.pending()
     assert len(rows) == 1 and rows[0].record_type == "intermediate_reply"
-    assert "discord send failed" in rows[0].last_error
+    assert "chat send failed" in rows[0].last_error
     assert state.get_trigger(42) is trigger
 
 

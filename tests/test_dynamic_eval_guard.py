@@ -19,12 +19,8 @@ if str(_ROOT) not in sys.path:
 _SKIP_DIRS = {".venv", "__pycache__", "_research", "tests", "node_modules", ".git"}
 
 # 例外必须写清「为什么它不是洞」，而不是单纯登记文件名。
-_ALLOWED_EXEC = {
-    # Discord bridge 的设计用途就是在 bot 进程里跑代码，tools/clear_context.py 与
-    # tools/discord_manage.py 是它的两个调用方。绑 127.0.0.1、且 QQ 栈从不启动
-    # discord 适配器，所以本项目里这个端点压根不存在。
-    "adapters/discord/agent.py",
-}
+# 空集 = 全仓不允许 exec。要加就先在这里写清「为什么它不是洞」。
+_ALLOWED_EXEC: set[str] = set()
 _ALLOWED_SHELL_TRUE = {
     # schedule 的 type=script 就是「定时跑一条命令」。命令在 create_schedule 时已经过
     # request_guard(execute_command)，deny_patterns / sensitive_patterns 都已生效。

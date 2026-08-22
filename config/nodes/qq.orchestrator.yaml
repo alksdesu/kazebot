@@ -29,8 +29,6 @@ tool_access:
     - create_or_update_skill
     - create_or_update_tool
     - delete_skill
-    - discord_manage
-    - clear_context
     - list_dir
     - clonoth_debug
     - exa_search

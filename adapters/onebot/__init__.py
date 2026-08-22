@@ -383,7 +383,7 @@ _sent_attachment_seq: DefaultDict[str, int] = defaultdict(int)
 _last_attachment_cleanup_at = 0.0
 # 清理频率不是运营期要调的旋钮（保留期才是），所以是代码常量。
 _ATTACHMENT_CLEANUP_INTERVAL_SEC = 3600.0
-# data/attachments 同时住着 engine 产物和 Discord 附件，只清 QQ 自己的会话目录。
+# data/attachments 同时住着 engine 产物和其他适配器的附件，只清 QQ 自己的会话目录。
 # 前缀 = _stable_conversation_key 的三种 prefix 把 ":" 换成 "_"。
 _QQ_ATTACHMENT_DIR_PREFIXES = ("qq_group_", "qq_private_", "qq_unknown_")
 
@@ -1745,7 +1745,7 @@ def _cleanup_old_qq_attachments(now: float | None = None) -> None:
     cutoff = now - IMAGE_CACHE_TTL_SECONDS
     try:
         for conv_dir in root.iterdir():
-            # data/attachments 同时住着 engine 产物和 Discord 附件，只清 QQ 自己的会话目录。
+            # data/attachments 同时住着 engine 产物和其他适配器的附件，只清 QQ 自己的会话目录。
             if not conv_dir.is_dir() or not conv_dir.name.startswith(_QQ_ATTACHMENT_DIR_PREFIXES):
                 continue
             for p in conv_dir.rglob("*"):
@@ -5792,10 +5792,8 @@ async def _try_preempt_running_task(
     platform_updates: Dict[str, Any],
 ) -> bool:
     """尝试把 QQ 新消息注入当前会话正在运行的入口任务。"""
-    # 2026-05-03 修改原因：TangQiu 以前每次消息都 submit_inbound，会在同一
-    # 会话已有入口任务运行时并发启动新任务。这里移植 Discord 的 Preempt V2：
-    # 先查询当前 session 的入口任务，再用 preempt_task 注入新消息；目的
-    # 是让同一会话的新指令打断并接续旧任务，而不是重复开任务。
+    # 先查询当前 session 的入口任务，再用 preempt_task 注入新消息：让同一会话的
+    # 新指令打断并接续旧任务，而不是在已有入口任务运行时并发开新任务。
     if _client is None or _session_state is None:
         return False
 
@@ -7407,9 +7405,6 @@ class TangQiuCallbacks:
     """Clonoth SDK 的 QQ 平台回调实现。
 
     发送最终回复、附件和主节点中间回复；其余进度、审批、typing、子任务日志均静默。
-
-    2026-05-01 修改原因：QQ 端已开启 send_intermediate_reply，因此类说明需要
-    同步说明中间回复会发送；审批流程仍由 Discord 端处理，避免 QQ 侧误展示审批控件。
     """
 
     async def send_reply(

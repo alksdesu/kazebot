@@ -1,6 +1,6 @@
 """QQ 表情和输出文本清理工具。
 
-Clonoth 后端可能输出 QQ 表情标记、Discord 表情标记、Reaction 标记或 Markdown。
+Clonoth 后端可能输出 QQ 表情标记、`<:name:id>` 自定义表情标记、Reaction 标记或 Markdown。
 本模块在发往 QQ 前统一处理这些内容，目的是让 QQ 群只看到可渲染的纯文本
 和可发送的自定义/收藏表情图片。
 """
@@ -121,8 +121,8 @@ def _resolve_at_tokens(raw_token: str) -> List[Dict[str, str]]:
         parts = [raw]
     return [{"raw": part, "qq": _resolve_at_token(part)} for part in parts]
 
-# Discord 自定义表情在 QQ 无法渲染。这里直接剥离，避免群内出现平台私有格式。
-_DC_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
+# `<:name:id>` 这种自定义表情标记在 QQ 无法渲染，直接剥离，避免群内出现平台私有格式。
+_CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
 
 # [REACT:...] 反应标记。QQ 端现在支持 reaction，由 _extract_reactions 提取后执行。
 _REACT_RE = re.compile(r"\[REACT:[^\]]+\]")
@@ -290,7 +290,7 @@ def strip_output_markers(
         strip_asterisk_styles = strip_markdown_styles
         strip_underscore_styles = strip_markdown_styles
 
-    text = _DC_EMOJI_RE.sub("", text)
+    text = _CUSTOM_EMOJI_RE.sub("", text)
     text = _REACT_RE.sub("", text)
     text = _INBOUND_FACE_RE.sub("", text)
     text = _CODE_BLOCK_RE.sub(lambda m: m.group(1), text)
@@ -709,7 +709,7 @@ async def process_emojis(
     """处理文本中的 QQ 收藏表情标记，返回可发送的消息段描述。
 
     处理方式如下：
-    1. 先移除 Discord 表情、Reaction 标记和 Markdown 标记。
+    1. 先移除自定义表情标记、Reaction 标记和 Markdown 标记。
     2. 遇到 [表情:name] / [emoji:name] / [QQ_EMOJI:name] 时拆分文本。
     3. 通过 NapCat fetch_custom_face_detail 获取收藏表情详情，并按别名索引取图。
 

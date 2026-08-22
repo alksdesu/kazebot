@@ -138,7 +138,7 @@ nb run
 
 ### 附件处理
 
-图片附件从 QQ 临时 URL 下载并保存到 `data/attachments/` 目录，与 Discord 适配器使用相同的路径格式。MIME 类型根据 URL 和响应头自动推断。
+图片附件从 QQ 临时 URL 下载并保存到 `data/attachments/` 目录。MIME 类型根据 URL 和响应头自动推断。
 
 普通文件附件也会尽量从 OneBot `file` 消息段或群文件上传通知中下载到 `data/attachments/`，用于管理员后续转发；文件下载受 `ONEBOT_ENABLE_FILE_INPUT`、`ONEBOT_FILE_MAX_BYTES`、`ONEBOT_MAX_FILES_PER_TURN` 限制。入站文件按扩展名白名单收取（文档/文本/图片/音视频/压缩包/常见源码），可执行/脚本宿主类型一律拒绝，且拒绝内容为可执行文件的伪装上传；白名单之外的类型可通过 `input.file_extra_allowed_extensions`（`ONEBOT_FILE_EXTRA_ALLOWED_EXTENSIONS`）补充放行，但可执行类型不受此项影响。事件携带的本机路径（`file://` 或绝对路径）只允许读取 Clonoth 工作区内的文件；同机 NapCat 只上报缓存绝对路径的部署需把该缓存目录加入 `ONEBOT_LOCAL_SOURCE_ROOTS`，否则文件入站会被拒绝并给出提示。若当前 OneBot 实现不提供文件 URL，则只能在历史中记录文件名，无法自动转发实际文件。
 
@@ -243,14 +243,3 @@ QQ 适配器不会再自动放行 `approval_requested`。当 Clonoth 触发需�
 - 如果需要使用 QQ 收藏表情的 `收藏表情` 命令，`CLONOTH_WORKSPACE/data/attachments` 必须在创建 NapCat 容器时以相同绝对路径挂载进容器；已创建容器不能动态增加 volume，只能重建容器。
 - `CLONOTH_WORKSPACE` 指向的路径需要在容器内可访问（挂载为卷或与 Supervisor 共享卷）。
 - NoneBot2 与 NapCat 之间的 WebSocket 连接需在容器网络中可达。
-
-## 与 Discord 适配器的区别
-
-| 特性 | Discord | OneBot |
-|---|---|---|
-| 协议 | Discord Gateway (WebSocket) | OneBot 11 (反向 WebSocket) |
-| 框架 | discord.py | NoneBot2 |
-| 触发方式 | 所有消息 / @Bot | 七信号 + 冷却 + LLM 意愿判定（默认只认 @Bot 与被回复）/ 私聊 |
-| 审批按钮 | Discord UI Button | QQ 管理员私聊命令审批（不自动放行） |
-| Bridge Server | 有（discord_manage 工具） | 有（qq_forward 工具） |
-| 附件上传 | Discord CDN 下载 → 本地保存 | QQ 临时 URL 下载 → 本地保存 |

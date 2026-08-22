@@ -582,7 +582,7 @@ def create_app(
         content = await file.read()
         if len(content) > 50 * 1024 * 1024:
             raise HTTPException(status_code=413, detail="File too large (max 50MB)")
-        # 只挡「永远不该收」的可执行/脚本宿主：通用上传端点不套 QQ 入站白名单，否则会误拒 Discord/Web 的正当上传。
+        # 只挡「永远不该收」的可执行/脚本宿主：通用上传端点不套 QQ 入站白名单，否则会误拒 Web 的正当上传。
         policy = _load_attachment_policy()
         reject = policy.blocked_file_reject_reason(file.filename or unique_name, content)
         if reject:

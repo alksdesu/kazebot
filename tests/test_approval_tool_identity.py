@@ -142,7 +142,7 @@ def test_scheduler_task_execute_command_auto_approves_without_event(tmp_path: Pa
         task_id="task-scheduler",
     )
 
-    # Why: scheduler-triggered tasks have no Discord approval route. How: the
+    # Why: scheduler-triggered tasks have no adapter approval route. How: the
     # supervisor returns an auto decision instead of creating an approval event.
     # Purpose: scheduled maintenance jobs do not block forever on silent approvals.
     assert out.safety_level == SafetyLevel.auto

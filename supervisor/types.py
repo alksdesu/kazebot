@@ -72,7 +72,7 @@ class InboundMessageIn(BaseModel):
     dispatch_context_mode: str | None = None
     dispatch_fork_from_session: str | None = None
     # Platform-provided identity metadata. This is produced by trusted adapters
-    # such as OneBot/Discord, not parsed from user text.
+    # such as OneBot, not parsed from user text.
     platform_auth: dict[str, Any] = Field(default_factory=dict)
     # Adapter-provided routing hints, e.g. has_image/channel/platform. These are
     # trusted platform metadata and are used only for capability routing.

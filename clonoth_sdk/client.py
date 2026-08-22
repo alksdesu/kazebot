@@ -2,7 +2,7 @@
 
 Phase 1 (2026-04-17): 初始创建，从 bot_adapter.py 中提取所有直接 HTTP 调用。
 使用 httpx.AsyncClient 作为底层 HTTP 库。
-SDK 是纯协议层，不包含任何平台（Discord / Telegram 等）相关逻辑。
+SDK 是纯协议层，不包含任何平台（OneBot / Telegram 等）相关逻辑。
 
 封装的 API 端点及对应原始代码位置：
   POST   /v1/inbound                         ← _submit_inbound()
@@ -37,8 +37,8 @@ class ClonothClient:
 
         client = ClonothClient("http://127.0.0.1:8765")
         result = await client.submit_inbound(
-            channel="discord_guild",
-            conversation_key="discord:123456",
+            channel="qq_group",
+            conversation_key="qq_group:123456",
             text="你好",
         )
         events = await client.poll_events(after_seq=0)
@@ -126,8 +126,8 @@ class ClonothClient:
         提取自 bot_adapter.py _submit_inbound() 中的 HTTP 调用逻辑。
 
         Args:
-            channel: 频道类型标识，如 "discord_guild"、"discord_dm"、"cli"
-            conversation_key: 会话键，如 "discord:123456"
+            channel: 频道类型标识，如 "qq_group"、"qq_private"、"cli"
+            conversation_key: 会话键，如 "qq_group:123456"
             text: 用户消息文本（含历史上下文）
             message_id: 平台消息 ID（可选）
             attachments: 附件列表（可选），每项为 {"path": ..., "name": ...} 格式

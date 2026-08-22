@@ -236,7 +236,7 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                 # (e.g. NovelAI generated images), not normal user-uploaded input.
                 # The caller LLM often replies with a textual summary like "image
                 # generated" without explicitly passing attachment_paths, which used
-                # to drop the file before it reached QQ/Discord. Auto-forward only
+                # to drop the file before it reached QQ. Auto-forward only
                 # for dispatch_result payloads so ordinary image-analysis turns do
                 # not echo the user's pictures back.
                 final_atts = _dispatch_result_input_attachments(ls)

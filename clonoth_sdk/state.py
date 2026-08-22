@@ -17,9 +17,9 @@ Phase 2 (2026-04-17): 初始创建，将 bot_adapter.py 中散落的全局 dict 
   _channel_history / _history_seq_counter — 平台相关（频道历史队列），留在 Bot 适配器
 
 设计约束：
-  - 不依赖 discord.py 或任何平台库
+  - 不依赖任何平台库
   - asyncio 单线程模型，不加线程锁
-  - platform_data: dict[str, Any] 携带平台特定数据（如 discord.Message）
+  - platform_data: dict[str, Any] 携带平台特定数据（如平台消息对象）
   - register_trigger / consume_trigger 的时序保证与原代码一致
 """
 from __future__ import annotations
@@ -44,17 +44,17 @@ class TriggerInfo:
     """触发消息信息 — 跟踪 inbound 请求与平台消息的映射。
 
     替代 bot_adapter.py _trigger_messages[seq] 中的内联 dict（L131-132）：
-      {"message": discord.Message, "channel_id": int, "conversation_key": str,
-       "is_dm": bool, "status_msg": discord.Message|None, "session_id": str,
+      {"message": Message, "channel_id": int, "conversation_key": str,
+       "is_dm": bool, "status_msg": Message|None, "session_id": str,
        "created_at": float, "cancel_view": CancelView, "last_typing_time": float}
 
     SDK 管协议字段（inbound_seq, conversation_key, session_id, is_dm, created_at,
-    task_id）。平台数据（discord.Message, status_msg, cancel_view 等）通过
-    platform_data 字典携带，不引入 discord.py 依赖。
+    task_id）。平台数据（message, status_msg, cancel_view 等）通过
+    platform_data 字典携带，不引入平台库依赖。
 
-    platform_data 典型用法（Discord 适配器）：
-      message — discord.Message（触发消息，用于 reply）
-      status_msg — discord.Message | None（⏳处理中 的状态消息）
+    platform_data 典型用法：
+      message — 平台消息对象（触发消息，用于 reply）
+      status_msg — 平台消息对象 | None（⏳处理中 的状态消息）
       cancel_view — CancelView（取消按钮 UI 组件）
       last_typing_time — float（上次触发 typing 的时间）
       channel_id — int（冗余存储供平台快速定位频道）
@@ -94,8 +94,8 @@ class MainTaskState:
     handled_approvals 是 per-trigger 级别的审批去重（区别于 ApprovalTracker 的
     全局级去重），防止同一 trigger 关联的审批被重复记录到进度日志。
 
-    platform_data 典型用法（Discord 适配器）：
-      log_msg — discord.Message | None（Agent 日志频道的进度消息）
+    platform_data 典型用法：
+      log_msg — 平台消息对象 | None（Agent 日志频道的进度消息）
     """
     progress_records: list[str] = field(default_factory=list)
     stream_parts: list[str] = field(default_factory=list)
@@ -112,8 +112,8 @@ class ChildTaskState:
     替代 bot_adapter.py _child_task_logs[task_key] 中的内联 dict：
       {"msg": Message, "lines": list, "prefix": str}
 
-    platform_data 典型用法（Discord 适配器）：
-      msg — discord.Message（子节点进度日志消息）
+    platform_data 典型用法：
+      msg — 平台消息对象（子节点进度日志消息）
     """
     lines: list[str] = field(default_factory=list)
     prefix: str = ""
@@ -144,9 +144,9 @@ class SessionState:
 
         # 注册触发
         trigger = TriggerInfo(
-            inbound_seq=42, conversation_key="discord:123",
+            inbound_seq=42, conversation_key="qq_group:123",
             session_id="sid-abc", is_dm=False,
-            platform_data={"message": discord_msg, "channel_id": 123},
+            platform_data={"message": platform_msg, "channel_id": 123},
         )
         state.register_trigger(trigger)
 
@@ -389,7 +389,7 @@ class SessionState:
 
         Returns:
             (state, is_new)。is_new=True 表示新创建，
-            适配器需要在平台侧创建显示消息（如 Discord send）。
+            适配器需要在平台侧创建显示消息。
         """
         is_new = task_key not in self.child_task_states
         if is_new:
@@ -554,7 +554,7 @@ class SessionState:
           3. 如提供 channel_id，重置水位并清理 DM 频道映射
 
         Args:
-            conversation_key: 被重置的会话键（如 "discord:123456"）
+            conversation_key: 被重置的会话键（如 "qq_group:123456"）
             channel_id: 平台频道标识符（可选；提供时额外清理水位和 DM 映射）
 
         Returns:

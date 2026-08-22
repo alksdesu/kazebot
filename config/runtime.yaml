@@ -159,7 +159,7 @@ shell:
     auto_scroll: true
     node_panel: false
     max_message_height: 50
-  # inbound 未显式带 entry_node_id 时的兜底入口。QQ / Discord / TUI 每条 inbound 都自带入口，不受此值影响。
+  # inbound 未显式带 entry_node_id 时的兜底入口。QQ / TUI 每条 inbound 都自带入口，不受此值影响。
   entry_node_id: "bootstrap.shell_orchestrator"
 
   http:

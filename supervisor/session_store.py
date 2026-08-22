@@ -8,8 +8,8 @@ session 信息仍可从此文件完整恢复。
 {
   "af4fdfc5-...": {
     "session_id": "af4fdfc5-...",
-    "channel": "discord_dm",
-    "conversation_key": "discord:1491668801836548166",
+    "channel": "qq_private",
+    "conversation_key": "qq_private:1491668801836548166",
     "created_at": "2026-04-15T...",
     "reset": false,
     "entry_node_id": "ereuna_main"

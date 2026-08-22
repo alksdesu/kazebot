@@ -45,7 +45,7 @@ _UNSENDABLE_IMAGE_MIMES = frozenset({"image/svg+xml"})
 # 超过这个大小只给路径，让模型用 read_file 自己取，别把上下文窗口撑爆。
 _TEXT_FILE_MAX_BYTES = 102400  # 100KB
 
-# Discord CDN 等来源经常返回无意义的 MIME，需要清洗掉以便 fallback 到扩展名猜测
+# 平台 CDN 经常返回无意义的 MIME，需要清洗掉以便 fallback 到扩展名猜测
 _USELESS_MIMES = frozenset({
     "application/octet-stream",
     "binary/octet-stream",
@@ -136,7 +136,7 @@ def save_attachment(
     mime_type: str = "",
 ) -> dict[str, Any]:
     """Save attachment bytes to data/attachments/{session_id}/. Returns attachment dict."""
-    # 清洗无意义的 MIME（如 Discord CDN 返回的 application/octet-stream）
+    # 清洗无意义的 MIME（如平台 CDN 返回的 application/octet-stream）
     mime_type = _sanitize_mime(mime_type)
 
     sid = (session_id or "unknown").strip() or "unknown"

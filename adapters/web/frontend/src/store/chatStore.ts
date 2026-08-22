@@ -273,10 +273,6 @@ function isEntryBranchSessionId(sessionId: string): boolean {
 function titleFromSession(conversationKey: string, sessionId: string): string {
   const normalized = normalizeConversationKey(conversationKey);
   if (normalized && normalized !== sessionId) return normalized.length > 30 ? `${normalized.slice(0, 30)}…` : normalized;
-  // [AutoC 2026-06-03] Why: discord:{id} is a backend channel key prefix. How:
-  // parse that protocol marker only for fallback labels, never localized message
-  // content. Purpose: retained string matching remains tied to structured metadata.
-  if (conversationKey.startsWith('discord:')) return `Discord ${conversationKey.slice(8)}`;
   return sessionId ? `网页 ${sessionId.slice(0, 8)}` : '新对话';
 }
 
@@ -732,7 +728,7 @@ function isAgentEventRoutedToConversation(
 }
 
 function resolveEventConversationId(state: ChatStoreState, event: SupervisorEvent): string {
-  // [2026-06-03] Why: /v1/ws emits every Supervisor session, including Discord and
+  // [2026-06-03] Why: /v1/ws emits every Supervisor session, including QQ and
   // internal branch sessions. How: prefer explicit web conversation metadata, then
   // source inbound and parent-session metadata, before falling back to direct
   // session routes. Purpose: a stale branch_1→branch_1 route cannot override the

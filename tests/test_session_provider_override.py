@@ -54,8 +54,8 @@ def test_session_store_persists_and_restores_provider_override(tmp_path: Path) -
     store.on_session_created(
         SessionInfo(
             session_id="session-new",
-            channel="discord",
-            conversation_key="discord:new",
+            channel="chat",
+            conversation_key="chat:new",
             created_at=created_at,
             updated_at=created_at,
             provider_override={"provider": "anthropic", "model": "claude-test"},
@@ -69,8 +69,8 @@ def test_session_store_persists_and_restores_provider_override(tmp_path: Path) -
 
     raw["session-old"] = {
         "session_id": "session-old",
-        "channel": "discord",
-        "conversation_key": "discord:old",
+        "channel": "chat",
+        "conversation_key": "chat:old",
         "created_at": created_at.isoformat(),
         "reset": False,
     }
@@ -86,7 +86,7 @@ def test_session_store_persists_and_restores_provider_override(tmp_path: Path) -
         "model": "claude-test",
     }
     assert restored["session-old"].provider_override == {}
-    assert conv_map["discord:new"] == "session-new"
+    assert conv_map["chat:new"] == "session-new"
     assert child_map == {}
     assert parent_children == {}
 
@@ -140,7 +140,7 @@ def test_provider_override_admin_api_requires_auth_and_persists(tmp_path: Path, 
     monkeypatch.setattr(admin_api, "_admin_token", "")
 
     state = _make_state(tmp_path)
-    session_id = state.get_or_create_session(channel="discord", conversation_key="discord:provider")
+    session_id = state.get_or_create_session(channel="chat", conversation_key="chat:provider")
     app = create_app(
         state=state,
         process_manager=None,

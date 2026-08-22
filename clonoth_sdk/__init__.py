@@ -15,7 +15,7 @@ SDK 边界（参见 data/sdk_refactor_plan_final.md 一、核心原则）：
   不进 SDK：
     - [SPLIT] 消息分段、[REACT:xxx] 表情提取、[BOT_RESTART] 信号
     - TextProcessor / 协议标记清理（Bot 自定义标记部分）
-    - Discord / Telegram 等平台库依赖
+    - OneBot / Telegram 等平台库依赖
 
 使用方式::
 

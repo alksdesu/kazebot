@@ -2,7 +2,7 @@
 
 Pure protocol layer that encapsulates all communication between a Bot adapter and the Clonoth Supervisor. The SDK handles HTTP API calls, event polling, protocol state management, and approval logic — so adapters only need to implement platform-specific operations (sending messages, editing UI, etc.).
 
-The SDK has **zero platform dependencies** (no discord.py, no telegram, etc.). Platform concerns live in the adapter.
+The SDK has **zero platform dependencies** (no nonebot, no telegram, etc.). Platform concerns live in the adapter.
 
 ## Architecture
 
@@ -60,7 +60,7 @@ from clonoth_sdk import (
 config = BotConfig(
     base_url="http://127.0.0.1:8765",
     entry_node_id="ereuna_main",
-    conversation_key_prefix="discord",
+    conversation_key_prefix="qq_group",
 )
 
 # 2. Core objects
@@ -119,7 +119,7 @@ asyncio.run(router.run())
 **Outside SDK (adapter responsibility):**
 - `[SPLIT]` message segmentation, `[REACT:xxx]` reaction extraction, `[BOT_RESTART]` signal handling
 - `TextProcessor` / protocol marker display formatting
-- Platform libraries (discord.py, telegram, etc.)
+- Platform libraries (nonebot, telegram, etc.)
 - Dot animation, typing throttle, streaming preview — display-layer logic
 - Channel history queue management
 - UI components (approval buttons, cancel buttons, embeds)

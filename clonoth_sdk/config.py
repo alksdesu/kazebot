@@ -18,7 +18,7 @@ class BotConfig:
         base_url: Supervisor HTTP API 地址，如 "http://127.0.0.1:8765"
         secret: 认证密钥（保留字段，当前 Supervisor 未启用认证）
         entry_node_id: 默认入口节点 ID，如 "ereuna_main"
-        conversation_key_prefix: 会话键前缀，如 "discord" 使生成的 key 为 "discord:{channel_id}"
+        conversation_key_prefix: 会话键前缀，如 "qq_group" 使生成的 key 为 "qq_group:{channel_id}"
         poll_interval: 事件轮询间隔（秒）
         max_history: 频道历史队列最大长度
         workspace_root: Clonoth 工作区根目录

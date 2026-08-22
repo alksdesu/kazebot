@@ -1674,7 +1674,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             return OpRequestOut(safety_level=SafetyLevel.deny, reason=decision.reason, approval_id=None)
 
         # [AutoC 2026-06-04] Why: scheduler-triggered tasks have no source inbound
-        # sequence, so their approval events cannot be routed to Discord and would
+        # sequence, so their approval events cannot be routed to an adapter and would
         # leave the task suspended forever. How: when the active task belongs to a
         # session whose conversation_key starts with "scheduler:", convert the
         # approval-required decision into an automatic allow. Purpose: scheduled
