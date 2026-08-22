@@ -30,6 +30,64 @@ async function buildStylesheet(): Promise<BuiltFile[]> {
   return Array.isArray(result) ? result[0].output : result.output;
 }
 
+/** 某条规则落在哪个级联层。层的比较排在优先级之前，所以这个归属决定谁赢。 */
+function layerOf(css: string, needle: string): string {
+  const target = css.indexOf(needle);
+  if (target < 0) return '(missing)';
+  const stack: Array<{ name: string; depth: number }> = [];
+  let depth = 0;
+  let i = 0;
+  while (i < target) {
+    if (css.startsWith('@layer', i)) {
+      const brace = css.indexOf('{', i);
+      const semi = css.indexOf(';', i);
+      // `@layer a, b;` 只声明顺序，不开块。
+      if (semi >= 0 && (semi < brace || brace < 0)) { i = semi + 1; continue; }
+      stack.push({ name: css.slice(i + 6, brace).trim(), depth });
+      depth += 1;
+      i = brace + 1;
+      continue;
+    }
+    const char = css[i];
+    if (char === '{') depth += 1;
+    else if (char === '}') {
+      depth -= 1;
+      if (stack.length && stack[stack.length - 1].depth === depth) stack.pop();
+    }
+    i += 1;
+  }
+  return stack.map((entry) => entry.name).join('>') || '(unlayered)';
+}
+
+// 出过一次：这段 reset 裸写在 layer 外，把所有按钮的字色吃成 color:inherit
+// （黑底黑字，只剩一块黑）、字号吃成 font:inherit。:where() 归零的是优先级，
+// 而无 layer 的规则赢过所有 layer 内的规则，根本轮不到比优先级。
+describe('全局 reset 的级联层', () => {
+  it('压不到 utility', async () => {
+    const output = await buildStylesheet();
+    const css = String(output.find((file) => file.fileName.endsWith('.css'))?.source ?? '');
+
+    for (const rule of [
+      ':where(button,input,select,textarea){color:inherit',
+      'button,textarea{border-radius:0}',
+      ':where(:focus-visible)',
+    ]) {
+      expect(layerOf(css, rule)).toBe('base');
+    }
+    expect(layerOf(css, '.markdown-body code{')).toBe('components');
+    expect(layerOf(css, '.text-xs{font-size')).toBe('utilities');
+  }, 30000);
+
+  it('实心按钮的字色真的写出来了', async () => {
+    // bg 与 text 成对，缺了字色那一半就是黑底黑字。
+    const output = await buildStylesheet();
+    const css = String(output.find((file) => file.fileName.endsWith('.css'))?.source ?? '');
+
+    expect(css).toContain('color:var(--duties-bg)');
+    expect(css).toContain('background-color:var(--duties-text)');
+  }, 30000);
+});
+
 describe('global Duties styles', () => {
   it('defines cross-browser custom scrollbar styling', () => {
     expect(stylesheet).toContain('scrollbar-width: thin;');

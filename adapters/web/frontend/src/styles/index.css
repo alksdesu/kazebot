@@ -47,80 +47,151 @@
   font-family: ui-sans-serif, system-ui, sans-serif;
 }
 
-* {
-  box-sizing: border-box;
-  /* Why: any element can become scrollable through Tailwind overflow utilities across sidebars, message panes, and logs.
-     How: apply the standards-based Firefox scrollbar controls globally while keeping the track transparent.
-     Purpose: ensure all scrollable regions inherit the Duties theme without per-component classes. */
-  scrollbar-color: var(--duties-scrollbar-thumb) var(--duties-scrollbar-track);
-  scrollbar-width: thin;
+/* 这一段必须在 @layer base 里。无 layer 的规则赢过所有 layer 内的规则，
+   和优先级无关 —— 层的比较排在优先级之前。裸写会让 :where() 归零的 reset
+   压掉 Tailwind 的 utility：按钮字色被 color:inherit 吃成黑底黑字，
+   字号被 font:inherit 吃回父级。 */
+@layer base {
+  * {
+    box-sizing: border-box;
+    /* Why: any element can become scrollable through Tailwind overflow utilities across sidebars, message panes, and logs.
+       How: apply the standards-based Firefox scrollbar controls globally while keeping the track transparent.
+       Purpose: ensure all scrollable regions inherit the Duties theme without per-component classes. */
+    scrollbar-color: var(--duties-scrollbar-thumb) var(--duties-scrollbar-track);
+    scrollbar-width: thin;
+  }
+
+  /* Why: Chromium, Edge, and Safari still use WebKit scrollbar pseudo-elements instead of the Firefox properties above.
+     How: style the global pseudo-elements with a narrow transparent track and a muted rounded thumb.
+     Purpose: keep the same minimal scrollbar appearance in message lists, side rails, modals, code previews, and event logs. */
+  *::-webkit-scrollbar {
+    width: 0.45rem;
+    height: 0.45rem;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: var(--duties-scrollbar-track);
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background: var(--duties-scrollbar-thumb);
+    border: 0.125rem solid transparent;
+    border-radius: 999px;
+    background-clip: content-box;
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background: var(--duties-scrollbar-thumb-hover);
+    background-clip: content-box;
+  }
+
+  *::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  /* 表单控件的 UA 默认样式。不显式接管的话按钮拿不到页面字体，复选框是系统蓝，
+     焦点环是 Chrome 那个蓝双环 —— 跟这套暖灰配色对不上。
+     :where() 让优先级归零，任何组件 class 都盖得住。 */
+  :where(button, input, select, textarea) {
+    color: inherit;
+    font: inherit;
+  }
+
+  :where(input[type='checkbox'], input[type='radio']) {
+    accent-color: var(--duties-text);
+  }
+
+  :where(:focus-visible) {
+    outline: 2px solid var(--duties-text);
+    outline-offset: 2px;
+  }
+
+  html,
+  body,
+  #root {
+    min-height: 100%;
+    margin: 0;
+  }
+
+  body {
+    min-width: 0;
+    background: var(--duties-bg);
+  }
+
+  button,
+  textarea {
+    border-radius: 0;
+  }
+
+  ::selection {
+    background: var(--duties-accent);
+    color: var(--duties-text);
+  }
 }
 
-/* Why: Chromium, Edge, and Safari still use WebKit scrollbar pseudo-elements instead of the Firefox properties above.
-   How: style the global pseudo-elements with a narrow transparent track and a muted rounded thumb.
-   Purpose: keep the same minimal scrollbar appearance in message lists, side rails, modals, code previews, and event logs. */
-*::-webkit-scrollbar {
-  width: 0.45rem;
-  height: 0.45rem;
-}
+@layer components {
+  .markdown-body > :first-child {
+    margin-top: 0;
+  }
 
-*::-webkit-scrollbar-track {
-  background: var(--duties-scrollbar-track);
-}
+  .markdown-body > :last-child {
+    margin-bottom: 0;
+  }
 
-*::-webkit-scrollbar-thumb {
-  background: var(--duties-scrollbar-thumb);
-  border: 0.125rem solid transparent;
-  border-radius: 999px;
-  background-clip: content-box;
-}
+  .markdown-body p,
+  .markdown-body ul,
+  .markdown-body ol,
+  .markdown-body table,
+  .markdown-body pre {
+    margin: 0 0 0.9rem;
+  }
 
-*::-webkit-scrollbar-thumb:hover {
-  background: var(--duties-scrollbar-thumb-hover);
-  background-clip: content-box;
-}
+  .markdown-body ul,
+  .markdown-body ol {
+    padding-left: 1.25rem;
+  }
 
-*::-webkit-scrollbar-corner {
-  background: transparent;
-}
+  .markdown-body code {
+    background: var(--duties-panel);
+    border: 1px solid var(--duties-border);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85em;
+    padding: 0.08rem 0.25rem;
+  }
 
-/* 表单控件的 UA 默认样式。不显式接管的话按钮拿不到页面字体，复选框是系统蓝，
-   焦点环是 Chrome 那个蓝双环 —— 跟这套暖灰配色对不上。
-   :where() 让优先级归零，任何组件 class 都盖得住。 */
-:where(button, input, select, textarea) {
-  color: inherit;
-  font: inherit;
-}
+  .markdown-body pre {
+    overflow-x: auto;
+    background: var(--duties-panel);
+    border: 1px solid var(--duties-border);
+    padding: 1rem;
+  }
 
-:where(input[type='checkbox'], input[type='radio']) {
-  accent-color: var(--duties-text);
-}
+  .markdown-body pre code {
+    display: block;
+    background: transparent;
+    border: 0;
+    padding: 0;
+  }
 
-:where(:focus-visible) {
-  outline: 2px solid var(--duties-text);
-  outline-offset: 2px;
-}
+  .markdown-body table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9em;
+  }
 
-html,
-body,
-#root {
-  min-height: 100%;
-  margin: 0;
-}
+  .markdown-body th,
+  .markdown-body td {
+    border: 1px solid var(--duties-border);
+    padding: 0.45rem 0.55rem;
+    text-align: left;
+  }
 
-body {
-  min-width: 0;
-  background: var(--duties-bg);
-}
-
-button,
-textarea {
-  border-radius: 0;
-}
-
-::selection {
-  background: var(--duties-accent);
-  color: var(--duties-text);
+  .markdown-body a {
+    color: var(--duties-text);
+    text-decoration: underline;
+    text-decoration-color: var(--duties-accent);
+    text-underline-offset: 0.2rem;
+  }
 }
 
 /* 试听判定翻转时重播，让「改开关 → 结论变了」的因果可见。 */
@@ -134,67 +205,4 @@ textarea {
     opacity: 1;
     transform: none;
   }
-}
-
-.markdown-body > :first-child {
-  margin-top: 0;
-}
-
-.markdown-body > :last-child {
-  margin-bottom: 0;
-}
-
-.markdown-body p,
-.markdown-body ul,
-.markdown-body ol,
-.markdown-body table,
-.markdown-body pre {
-  margin: 0 0 0.9rem;
-}
-
-.markdown-body ul,
-.markdown-body ol {
-  padding-left: 1.25rem;
-}
-
-.markdown-body code {
-  background: var(--duties-panel);
-  border: 1px solid var(--duties-border);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.85em;
-  padding: 0.08rem 0.25rem;
-}
-
-.markdown-body pre {
-  overflow-x: auto;
-  background: var(--duties-panel);
-  border: 1px solid var(--duties-border);
-  padding: 1rem;
-}
-
-.markdown-body pre code {
-  display: block;
-  background: transparent;
-  border: 0;
-  padding: 0;
-}
-
-.markdown-body table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.9em;
-}
-
-.markdown-body th,
-.markdown-body td {
-  border: 1px solid var(--duties-border);
-  padding: 0.45rem 0.55rem;
-  text-align: left;
-}
-
-.markdown-body a {
-  color: var(--duties-text);
-  text-decoration: underline;
-  text-decoration-color: var(--duties-accent);
-  text-underline-offset: 0.2rem;
 }
