@@ -65,9 +65,10 @@ instances:
     label: koki
     path: /i/1000000002
 """)
+    # idx 是后加的：根实例推得出是 0，带前缀的老条目推不出来，标 -1 交给端口探测。
     assert load_instances(tmp_path) == [
-        {"uin": "1000000001", "label": "Rong", "path": ""},
-        {"uin": "1000000002", "label": "koki", "path": "/i/1000000002"},
+        {"uin": "1000000001", "label": "Rong", "path": "", "idx": 0},
+        {"uin": "1000000002", "label": "koki", "path": "/i/1000000002", "idx": -1},
     ]
 
 
