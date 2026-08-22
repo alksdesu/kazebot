@@ -263,7 +263,7 @@ class _Reply:
 class _Sink(list):
     """顶掉 httpx.AsyncClient，把发出去的那一份留下来看。"""
 
-    def client(self, reply: _Reply):
+    def client(self, *replies: _Reply):
         sink = self
 
         class _Client:
@@ -278,7 +278,8 @@ class _Sink(list):
 
             async def post(self, url, headers=None, json=None):
                 sink.append({"url": url, "headers": headers or {}, "body": json or {}})
-                return reply
+                # 回复用完就一直返回最后一个，省得每个用例都数清楚发了几次。
+                return replies[min(len(sink) - 1, len(replies) - 1)]
 
         return _Client
 
@@ -357,6 +358,77 @@ async def test_the_upstream_reason_reaches_the_failure_record(
 
     with pytest.raises(ValueError, match="model not found"):
         await bench.tagger._describe(_vision("openai", "https://relay.example/v1"), path)
+
+
+@pytest.mark.asyncio
+async def test_thinking_is_off_so_the_budget_goes_to_the_tags(
+    bench, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    path = _seed_real_png(bench)
+    sink = _Sink()
+    reply = _Reply(200, {"candidates": [{"content": {"parts": [{"text": '["表情包"]'}]}}]})
+    monkeypatch.setattr(httpx, "AsyncClient", sink.client(reply))
+
+    await bench.tagger._describe(_vision("gemini", "https://relay.example"), path)
+
+    assert sink[0]["body"]["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
+
+
+@pytest.mark.asyncio
+async def test_a_model_that_refuses_to_stop_thinking_is_retried_with_room(
+    bench, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Gemini 的 pro 系列不收 thinkingBudget=0，退让一次比整库打不上标强。
+    import httpx
+
+    path = _seed_real_png(bench)
+    sink = _Sink()
+    refuse = _Reply(400, {"error": {"message": "thinkingBudget must be at least 128"}})
+    ok = _Reply(200, {"candidates": [{"content": {"parts": [{"text": '["表情包","猫"]'}]}}]})
+    monkeypatch.setattr(httpx, "AsyncClient", sink.client(refuse, ok))
+
+    tags = await bench.tagger._describe(_vision("gemini", "https://relay.example"), path)
+
+    assert tags == ["表情包", "猫"]
+    assert len(sink) == 2
+    assert "thinkingConfig" not in sink[1]["body"]["generationConfig"]
+
+
+@pytest.mark.asyncio
+async def test_an_unrelated_error_is_not_retried(
+    bench, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    path = _seed_real_png(bench)
+    sink = _Sink()
+    monkeypatch.setattr(
+        httpx, "AsyncClient",
+        sink.client(_Reply(400, {"error": {"message": "model not found"}})),
+    )
+
+    with pytest.raises(ValueError, match="model not found"):
+        await bench.tagger._describe(_vision("gemini", "https://relay.example"), path)
+    assert len(sink) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_reply_says_so_instead_of_blaming_the_prompt(
+    bench, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 截断的正文是半截 JSON，报"没给出标签"会让人去查提示词，方向就错了。
+    import httpx
+
+    path = _seed_real_png(bench)
+    cut = _Reply(200, {"candidates": [
+        {"finishReason": "MAX_TOKENS", "content": {"parts": [{"text": '["表情包","笑'}]}},
+    ]})
+    monkeypatch.setattr(httpx, "AsyncClient", _Sink().client(cut))
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        await bench.tagger._describe(_vision("gemini", "https://relay.example"), path)
 
 
 @pytest.mark.asyncio

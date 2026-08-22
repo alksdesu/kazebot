@@ -97,7 +97,7 @@ if __name__ == "__main__":
         sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _channel import resolve_vision_channel
     from _image import ImagePayloadError, build_image_part
-    from _vision_wire import build_request, parse_text
+    from _vision_wire import build_request, error_detail, parse_text, relax_body, truncated
 
     vision = resolve_vision_channel()
     if vision.error:
@@ -154,47 +154,65 @@ if __name__ == "__main__":
         temperature=0.1,
     )
 
-    req = urllib_request.Request(
-        request.url,
-        data=json.dumps(request.body).encode("utf-8"),
-        headers=request.headers,
-        method="POST",
-    )
-
     # ---- Send request ----
-    try:
-        with urllib_request.urlopen(req, timeout=100) as resp:
-            response_status = int(getattr(resp, "status", 200) or 200)
-            response_type = str(resp.headers.get("Content-Type") or "unknown")
-            response_text = resp.read().decode("utf-8", errors="replace")
+    def send(payload):
+        """POST and return (status, content_type, raw_text). Never raises on 4xx/5xx."""
+        req = urllib_request.Request(
+            request.url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=request.headers,
+            method="POST",
+        )
         try:
-            resp_json = json.loads(response_text)
-        except json.JSONDecodeError as exc:
-            # Do not echo an upstream body into the tool transcript: proxy login
-            # pages and gateway diagnostics may contain cookies, request metadata,
-            # or reflected secrets. Status, type, size and parse location are enough
-            # for safe diagnosis.
-            fail(
-                "API returned invalid JSON "
-                f"(status={response_status}, content_type={response_type}, "
-                f"body_bytes={len(response_text.encode('utf-8'))}, parse_error={exc})"
-            )
-    except HTTPError as e:
-        content_type = "unknown"
-        body_bytes = 0
+            with urllib_request.urlopen(req, timeout=100) as resp:
+                return (
+                    int(getattr(resp, "status", 200) or 200),
+                    str(resp.headers.get("Content-Type") or "unknown"),
+                    resp.read().decode("utf-8", errors="replace"),
+                )
+        except HTTPError as exc:
+            try:
+                return (
+                    exc.code,
+                    str(exc.headers.get("Content-Type") or "unknown"),
+                    exc.read().decode("utf-8", errors="replace"),
+                )
+            except Exception:
+                return (exc.code, "unknown", "")
+        except URLError as exc:
+            fail(f"API connection error: {exc.reason}")
+        except Exception as exc:
+            fail(f"API request failed: {exc}")
+
+    status, content_type, raw = send(request.body)
+    if status != 200:
+        # Read the body to decide whether a retry is worth it, but never echo it:
+        # proxy login pages and gateway diagnostics may carry cookies or reflected
+        # secrets. Status, type and size are enough for safe diagnosis.
         try:
-            content_type = str(e.headers.get("Content-Type") or "unknown")
-            body_bytes = len(e.read())
+            detail = error_detail(json.loads(raw))
         except Exception:
-            pass
-        fail(f"API HTTP {e.code} (content_type={content_type}, body_bytes={body_bytes})")
-    except URLError as e:
-        fail(f"API connection error: {e.reason}")
-    except Exception as e:
-        fail(f"API request failed: {e}")
+            detail = ""
+        retry = relax_body(vision.wire, request.body, detail)
+        if retry is not None:
+            status, content_type, raw = send(retry)
+    if status != 200:
+        fail(f"API HTTP {status} (content_type={content_type}, body_bytes={len(raw.encode('utf-8'))})")
+
+    try:
+        resp_json = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        fail(
+            "API returned invalid JSON "
+            f"(status={status}, content_type={content_type}, "
+            f"body_bytes={len(raw.encode('utf-8'))}, parse_error={exc})"
+        )
 
     # ---- Parse response ----
     description = parse_text(vision.wire, resp_json)
+
+    if truncated(vision.wire, resp_json) and not description:
+        fail("Vision model hit max_tokens before producing any text.")
 
     if not description:
         fail(f"Empty response from vision model: {json.dumps(resp_json)[:500]}")

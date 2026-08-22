@@ -151,7 +151,13 @@ def _body(
         parts.append({"text": prompt})
         body: dict[str, Any] = {
             "contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+                # 看图只要一段描述，思考纯属浪费：它照样算进 maxOutputTokens，
+                # 几百个思考 token 就能把正文顶掉，回来的是半截 JSON。
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
         }
         if system:
             body["systemInstruction"] = {"parts": [{"text": system}]}
@@ -206,6 +212,50 @@ def _body(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+
+
+# 关不掉思考的模型（Gemini 的 pro 系列就是）留出的余量，够思考加一段标签。
+_RELAXED_MAX_TOKENS = 2048
+
+
+def relax_body(wire: str, body: dict[str, Any], detail: str) -> dict[str, Any] | None:
+    """按上游的抱怨退让一档，返回可以重发的请求体；没得退返回 None。
+
+    只退让「我们主动加的优化」，不碰调用方给的参数 —— 退让不该改变结果的含义。
+    """
+    if wire != WIRE_GEMINI:
+        return None
+    config = body.get("generationConfig")
+    if not isinstance(config, dict) or "thinkingConfig" not in config:
+        return None
+    if not any(word in detail.lower() for word in ("thinking", "thought", "budget")):
+        return None
+    relaxed = {**body, "generationConfig": {**config}}
+    relaxed["generationConfig"].pop("thinkingConfig", None)
+    # 思考关不掉就得给它留位置，否则正文一样会被顶掉。
+    relaxed["generationConfig"]["maxOutputTokens"] = max(
+        int(config.get("maxOutputTokens") or 0), _RELAXED_MAX_TOKENS,
+    )
+    return relaxed
+
+
+def truncated(wire: str, payload: Any) -> bool:
+    """输出是不是撞上限断掉了。断掉的正文多半是半截 JSON，解析失败得说清原因。"""
+    if not isinstance(payload, dict):
+        return False
+    if wire == WIRE_GEMINI:
+        candidates = payload.get("candidates")
+        first = candidates[0] if isinstance(candidates, list) and candidates else {}
+        return str((first or {}).get("finishReason") or "").upper() == "MAX_TOKENS"
+    if wire == WIRE_ANTHROPIC:
+        return str(payload.get("stop_reason") or "") == "max_tokens"
+    if wire == WIRE_OPENAI_RESPONSES:
+        incomplete = payload.get("incomplete_details")
+        reason = (incomplete or {}).get("reason") if isinstance(incomplete, dict) else ""
+        return str(reason or "") == "max_output_tokens"
+    choices = payload.get("choices")
+    first = choices[0] if isinstance(choices, list) and choices else {}
+    return str((first or {}).get("finish_reason") or "") == "length"
 
 
 def _texts(items: Any, key: str) -> list[str]:

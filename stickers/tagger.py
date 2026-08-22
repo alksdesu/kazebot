@@ -106,6 +106,13 @@ def normalize_tags(tags: Sequence[str], *, fallback: str = "") -> list[str]:
     return ordered[:_TAG_MAX]
 
 
+def _json_or_none(response: Any) -> Any:
+    try:
+        return response.json()
+    except ValueError:
+        return None
+
+
 class StickerTagger:
     def __init__(
         self,
@@ -219,7 +226,9 @@ class StickerTagger:
         import httpx
 
         from tools._image import build_image_part
-        from tools._vision_wire import build_request, error_detail, parse_text
+        from tools._vision_wire import (
+            build_request, error_detail, parse_text, relax_body, truncated,
+        )
 
         part = await asyncio.to_thread(build_image_part, path, vision.family)
         request = build_request(
@@ -237,16 +246,23 @@ class StickerTagger:
             response = await client.post(
                 request.url, headers=request.headers, json=request.body,
             )
-        body: Any = None
-        try:
-            body = response.json()
-        except ValueError:
-            pass
-        if response.status_code != 200:
-            # 带上游原文：只报 HTTP 400 的话，分不清是模型名错还是格式选错。
-            detail = error_detail(body) or response.text[:200]
-            raise ValueError(f"上游返回 HTTP {response.status_code}：{detail}")
+            body = _json_or_none(response)
+            if response.status_code != 200:
+                detail = error_detail(body) or response.text[:200]
+                retry = relax_body(vision.wire, request.body, detail)
+                if retry is None:
+                    # 带上游原文：只报 HTTP 400 的话，分不清是模型名错还是格式选错。
+                    raise ValueError(f"上游返回 HTTP {response.status_code}：{detail}")
+                response = await client.post(request.url, headers=request.headers, json=retry)
+                body = _json_or_none(response)
+                if response.status_code != 200:
+                    detail = error_detail(body) or response.text[:200]
+                    raise ValueError(f"上游返回 HTTP {response.status_code}：{detail}")
+
         text = parse_text(vision.wire, body)
+        if truncated(vision.wire, body):
+            # 截断的正文是半截 JSON，报"没给出标签"会让人去查提示词，方向就错了。
+            raise ValueError("输出撞上 max_tokens 断了，标签没写完")
         if not text:
             raise ValueError("模型返回里没有正文")
         return parse_tags(text)

@@ -289,6 +289,75 @@ def test_error_detail_finds_the_human_sentence(payload) -> None:
     assert vw.error_detail(payload) == "配额用光了"
 
 
+# ── 思考预算与退让 ──
+
+def test_gemini_turns_thinking_off() -> None:
+    # 思考照样算进 maxOutputTokens，几百个思考 token 就能把正文顶掉。
+    config = _build("gemini").body["generationConfig"]
+    assert config["thinkingConfig"] == {"thinkingBudget": 0}
+
+
+@pytest.mark.parametrize("wire", ["openai", "openai-responses", "anthropic"])
+def test_other_wires_have_no_thinking_knob(wire: str) -> None:
+    assert "thinkingConfig" not in str(_build(wire).body)
+
+
+def test_a_model_that_refuses_to_stop_thinking_gets_room_instead() -> None:
+    body = _build("gemini").body
+    relaxed = vw.relax_body("gemini", body, "thinkingBudget must be at least 128 for this model")
+
+    assert relaxed is not None
+    assert "thinkingConfig" not in relaxed["generationConfig"]
+    # 思考关不掉就得给它留位置，否则正文一样会被顶掉。
+    assert relaxed["generationConfig"]["maxOutputTokens"] > body["generationConfig"]["maxOutputTokens"]
+
+
+def test_relaxing_does_not_mutate_the_original_body() -> None:
+    body = _build("gemini").body
+    vw.relax_body("gemini", body, "thinking budget invalid")
+
+    assert body["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
+
+
+def test_unrelated_errors_are_not_retried() -> None:
+    # 退让只针对我们自己加的那个优化，模型名写错重发一次也还是错。
+    assert vw.relax_body("gemini", _build("gemini").body, "model not found") is None
+
+
+@pytest.mark.parametrize("wire", ["openai", "openai-responses", "anthropic"])
+def test_only_gemini_has_something_to_relax(wire: str) -> None:
+    assert vw.relax_body(wire, _build(wire).body, "thinking budget invalid") is None
+
+
+def test_relaxing_twice_finds_nothing_left() -> None:
+    body = _build("gemini").body
+    once = vw.relax_body("gemini", body, "thinking budget invalid")
+    assert vw.relax_body("gemini", once, "thinking budget invalid") is None
+
+
+# ── 截断 ──
+
+@pytest.mark.parametrize(("wire", "payload"), [
+    ("gemini", {"candidates": [{"finishReason": "MAX_TOKENS"}]}),
+    ("anthropic", {"stop_reason": "max_tokens"}),
+    ("openai", {"choices": [{"finish_reason": "length"}]}),
+    ("openai-responses", {"incomplete_details": {"reason": "max_output_tokens"}}),
+])
+def test_truncation_is_recognised(wire: str, payload) -> None:
+    assert vw.truncated(wire, payload) is True
+
+
+@pytest.mark.parametrize(("wire", "payload"), [
+    ("gemini", {"candidates": [{"finishReason": "STOP"}]}),
+    ("anthropic", {"stop_reason": "end_turn"}),
+    ("openai", {"choices": [{"finish_reason": "stop"}]}),
+    ("openai-responses", {"status": "completed"}),
+    ("openai", {}),
+])
+def test_a_clean_finish_is_not_truncation(wire: str, payload) -> None:
+    assert vw.truncated(wire, payload) is False
+
+
 def test_error_detail_gives_up_quietly() -> None:
     assert vw.error_detail({"weird": 1}) == ""
     assert vw.error_detail(None) == ""
