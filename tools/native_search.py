@@ -190,15 +190,19 @@ if __name__ == "__main__":
 
     channel = Channel("native_search")
     main = channel.main()
-    provider = (channel.own("provider", "PROVIDER") or main.provider or "openai").strip().lower()
-    model = channel.pick("model", "MODEL", main.model)
-    api_key = channel.pick("api_key", "API_KEY", main.api_key)
+    # 槽位的 provider 可以写成一个渠道名，那就连它的地址密钥模型一并用上。
+    referenced = channel.named(channel.own("provider", "PROVIDER"))
+    provider = referenced.provider or main.provider or "openai"
+    model = channel.pick("model", "MODEL", referenced.model, main.model)
+    api_key = channel.pick("api_key", "API_KEY", referenced.api_key, main.api_key)
     # 搜索请求发出去就计费，认不出的渠道宁可直说，不按 OpenAI 猜着发一次。
     if provider not in PROVIDER_WIRES:
         fail("不认识渠道 " + provider + "，没法判断它的搜索接口该怎么调。")
     wire = wire_for(provider)
     base_url = normalize_base_url(
-        wire, channel.pick("base_url", "BASE_URL", main.base_url) or default_base_url(wire),
+        wire,
+        channel.pick("base_url", "BASE_URL", referenced.base_url, main.base_url)
+        or default_base_url(wire),
     )
 
     if not model or not api_key:

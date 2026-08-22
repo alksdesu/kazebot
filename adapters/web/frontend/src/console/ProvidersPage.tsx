@@ -5,6 +5,7 @@
 import { useEffect, useId, useMemo, useState } from 'react';
 
 import {
+  channelChoices,
   deleteProvider,
   getNodes,
   getProviders,
@@ -420,8 +421,9 @@ export const ProvidersPage = () => {
 
       <SystemSlots
         activeProvider={data.active_provider}
+        channels={channelChoices(data).channels}
         profiles={profiles}
-        providerNames={data.registered || []}
+        wires={data.registered || []}
       />
 
       <Footnote>

@@ -972,6 +972,9 @@ def test_qq_forward_http_retry_reuses_identity_and_new_call_is_distinct() -> Non
             "ONEBOT_FORWARD_HTTP_RETRY_DELAY": "0",
             "CLONOTH_SESSION_ID": "session-test",
             "CLONOTH_TASK_ID": "task-shared-by-both-logical-calls",
+            # 两端都钉死 UTF-8：子进程默认按系统 locale 输出，父进程按 locale 解码，
+            # 在中文 Windows 上撞见编不出的字符就整条流报 UnicodeDecodeError。
+            "PYTHONIOENCODING": "utf-8",
         })
         args = json.dumps({
             "op": "remind",
@@ -985,6 +988,7 @@ def test_qq_forward_http_retry_reuses_identity_and_new_call_is_distinct() -> Non
                 [sys.executable, str(tool_path)],
                 input=args,
                 text=True,
+                encoding="utf-8",
                 capture_output=True,
                 cwd=_ROOT,
                 env=env,

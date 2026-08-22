@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -118,10 +119,14 @@ class TestReadImageFollowsTheMainChannel:
     """黑盒跑真脚本。图片路径给一个不存在的，跑到那一步就说明渠道解析已经过了。"""
 
     def _run(self, cwd: Path) -> dict:
+        # 两端都钉死 UTF-8：子进程默认按系统 locale 输出，父进程按 locale 解码，
+        # 在中文 Windows 上撞见编不出的字符就整条流报 UnicodeDecodeError。
         done = subprocess.run(
             [sys.executable, str(_ROOT / "tools" / "read_image.py")],
             input=json.dumps({"image_path": "no-such-file.png"}),
-            capture_output=True, text=True, cwd=str(cwd), timeout=120,
+            capture_output=True, text=True, encoding="utf-8",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            cwd=str(cwd), timeout=120,
         )
         return json.loads(done.stdout.strip().splitlines()[-1])
 

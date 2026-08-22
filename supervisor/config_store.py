@@ -343,6 +343,15 @@ class ConfigStore:
         with self._lock:
             return self._type_of((name or "").strip() or self._active_name())
 
+    def channel_names(self) -> list[str]:
+        """配置里有块的那些渠道名。大小写敏感 —— 节点和备选链是按原名查块的。"""
+        with self._lock:
+            data = self._load_raw()
+        return [
+            key for key, val in data.items()
+            if key not in self._META_KEYS and self._is_provider_block(val)
+        ]
+
     def resolve_provider_credentials(self, name: str) -> tuple[str, str]:
         """按渠道名取展开后的 (base_url, api_key)。只给服务端自己发请求用。
 

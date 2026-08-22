@@ -437,6 +437,33 @@ export interface ProvidersResponse {
   registered: string[];
 }
 
+export interface ChannelChoice {
+  /** 写进 yaml 的值。渠道名区分大小写，转小写就查不到那个块了。 */
+  value: string;
+  label: string;
+  wire: string;
+}
+
+/**
+ * provider 字段能填的两类值：已配渠道带着地址密钥模型，裸线格式只定请求怎么发。
+ * 后者不能省 —— 只想换格式、地址走环境变量的节点要用它。
+ */
+export function channelChoices(
+  resp: ProvidersResponse | null | undefined,
+): { channels: ChannelChoice[]; wires: string[] } {
+  const providers = resp?.providers || {};
+  const named = new Set(Object.keys(providers));
+  return {
+    channels: Object.entries(providers).map(([name, cfg]) => ({
+      value: name,
+      label: cfg.label ? `${name} · ${cfg.label}` : name,
+      wire: cfg.type || name.toLowerCase(),
+    })),
+    // 有同名块时这个名字一定被解析成渠道，再摆一个同名的线格式只是两个一模一样的选项。
+    wires: (resp?.registered || []).filter((wire) => !named.has(wire)),
+  };
+}
+
 // 活跃渠道的公开配置。别用 /config/openai/secret 拿这几个字段 —— 那个端点连明文
 // api_key 一起返回，它是给 engine 进程取密钥用的，不该让密钥落进浏览器。
 export function activeProviderConfig(

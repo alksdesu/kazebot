@@ -15,7 +15,7 @@ from typing import Any
 
 import yaml
 
-from clonoth_runtime import resolve_env_ref
+from clonoth_runtime import resolve_channel, resolve_env_ref
 
 # [fix 2026-05-28] Import message formatting utilities so fallback calls go
 # through the same conversion pipeline as the primary call (llm_call.py L171-172).
@@ -110,8 +110,12 @@ def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) ->
           base_url: https://api.deepseek.com
           api_key: sk-xxx
           model: deepseek-v4-pro
+        gemini-中转A:
+          type: gemini                  # 渠道名随便起，type 决定线格式
+          base_url: https://relay.example/v1
         fallbacks:
           - provider: deepseek          # just reference, auto-inherits from deepseek: block
+          - provider: gemini-中转A       # 命名渠道同样能引用
           - provider: openai            # inherits from openai: block
             model: claude-sonnet-4-6    # override model only
 
@@ -119,8 +123,9 @@ def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) ->
       1. Explicit value in fallback entry
       2. Value from the provider config block (e.g. deepseek:)
     """
-    provider_name = (fb_cfg.get("provider") or "openai").strip().lower()
-    provider_block = full_cfg.get(provider_name, {})
+    channel_name = str(fb_cfg.get("provider") or "openai").strip()
+    channel = resolve_channel("", channel_name, config=full_cfg)
+    provider_block = full_cfg.get(channel_name)
     if not isinstance(provider_block, dict):
         provider_block = {}
 
@@ -137,17 +142,18 @@ def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) ->
 
     # 备选的 provider 类型往往和主渠道不同，参数键名不通用，所以不继承主渠道的
     # options，只从同名 provider 块继承，再让条目自己覆盖。
-    block_options = provider_block.get("options")
     entry_options = fb_cfg.get("options")
-    options = dict(block_options) if isinstance(block_options, dict) else {}
+    options = dict(channel.options)
     if isinstance(entry_options, dict):
         options.update(entry_options)
 
     return {
-        "provider": provider_name,
-        "base_url": _resolve_env_value(fb_cfg.get("base_url")) or _resolve_env_value(provider_block.get("base_url")),
-        "api_key": _resolve_env_value(fb_cfg.get("api_key")) or _resolve_env_value(provider_block.get("api_key")),
-        "model": _resolve_env_value(fb_cfg.get("model")) or _resolve_env_value(provider_block.get("model")),
+        # provider 是渠道名，只用来说人话；wire 才是 registry 认的那个 key。
+        "provider": channel_name,
+        "wire": channel.wire,
+        "base_url": _resolve_env_value(fb_cfg.get("base_url")) or channel.base_url,
+        "api_key": _resolve_env_value(fb_cfg.get("api_key")) or channel.api_key,
+        "model": _resolve_env_value(fb_cfg.get("model")) or channel.model,
         "supports_vision": supports_vision,
         "options": options,
     }
@@ -380,7 +386,8 @@ class FallbackProviderHandler:
             if not isinstance(fb_raw, dict):
                 continue
             fb_cfg = _resolve_fallback_entry(fb_raw, full_cfg)
-            fb_provider_type = fb_cfg["provider"]
+            fb_channel = fb_cfg["provider"]
+            fb_provider_type = fb_cfg["wire"]
             fb_base_url = fb_cfg["base_url"]
             fb_api_key = fb_cfg["api_key"]
             fb_model = fb_cfg["model"] or original_model
@@ -390,17 +397,17 @@ class FallbackProviderHandler:
                 logger.warning(
                     "fallback_provider: skipping fallback[%d] (%s/%s) — "
                     "request contains images but fallback is not marked supports_vision=true",
-                    i, fb_provider_type, fb_model,
+                    i, fb_channel, fb_model,
                 )
                 fallback_errors.append(
-                    f"[Fallback {fb_provider_type}/{fb_model} skipped: vision unsupported]"
+                    f"[Fallback {fb_channel}/{fb_model} skipped: vision unsupported]"
                 )
                 continue
 
             if not fb_base_url or not fb_api_key:
                 logger.warning(
                     "fallback_provider: skipping fallback[%d] (%s) — no base_url/api_key after resolve",
-                    i, fb_provider_type,
+                    i, fb_channel,
                 )
                 continue
 
@@ -416,8 +423,8 @@ class FallbackProviderHandler:
                 )
                 if fb_provider is None:
                     logger.warning(
-                        "fallback_provider: skipping fallback[%d] — unsupported provider type '%s'",
-                        i, fb_provider_type,
+                        "fallback_provider: skipping fallback[%d] (%s) — unsupported wire format '%s'",
+                        i, fb_channel, fb_provider_type,
                     )
                     continue
 
@@ -494,7 +501,7 @@ class FallbackProviderHandler:
                     # [fix 2026-05-28] Record this fallback's failure for later
                     # aggregation into the user-facing error message.
                     fallback_errors.append(
-                        f"[Fallback {fb_provider_type} failed: {str(_fb_err)[:150]}]"
+                        f"[Fallback {fb_channel} failed: {str(_fb_err)[:150]}]"
                     )
 
             except Exception as exc:

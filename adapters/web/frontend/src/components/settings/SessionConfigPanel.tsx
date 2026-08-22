@@ -8,6 +8,7 @@ import { useEffect, useId, useMemo, useState } from 'react';
 
 import {
   activeProviderConfig,
+  channelChoices,
   clearSessionProviderOverride,
   getActiveNode,
   getAppConfig,
@@ -244,7 +245,9 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
     getProviders(adminToken)
       .then(providers => {
         setModelChoices(literalModelsOnly(mergeModelChoices(modelsFromProviders(providers))));
-        setProviderChoices(providers.registered || []);
+        // 已配渠道排前面：它们带着地址密钥，裸线格式还得自己填。
+        const choices = channelChoices(providers);
+        setProviderChoices([...choices.channels.map((c) => c.value), ...choices.wires]);
         setInheritedProvider(providers.active_provider || '');
         setModelConfig(activeProviderConfig(providers));
       })

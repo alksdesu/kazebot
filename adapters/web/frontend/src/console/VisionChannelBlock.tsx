@@ -2,16 +2,18 @@
 import { useEffect, useState } from 'react';
 
 import {
+  channelChoices,
   getProviderProfiles,
   getProviders,
   getSystemModels,
   updateSystemModel,
+  type ChannelChoice,
   type ProviderProfiles,
   type SystemModelSlot,
   type SystemModelsResponse,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
-import { EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields';
+import { ChannelOptions, EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields';
 import { Block, Empty, SaveBar } from './components';
 
 const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');
@@ -23,7 +25,8 @@ export const VisionChannelBlock = () => {
   const [model, setModel] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [provider, setProvider] = useState('');
-  const [providerNames, setProviderNames] = useState<string[]>([]);
+  const [channels, setChannels] = useState<ChannelChoice[]>([]);
+  const [wires, setWires] = useState<string[]>([]);
   const [profiles, setProfiles] = useState<ProviderProfiles | null>(null);
   const [mainProvider, setMainProvider] = useState('');
   const [loaded, setLoaded] = useState(false);
@@ -52,7 +55,9 @@ export const VisionChannelBlock = () => {
           getProviders(adminToken), getProviderProfiles(adminToken),
         ]);
         setMainProvider(providers.active_provider);
-        setProviderNames(providers.registered || []);
+        const choices = channelChoices(providers);
+        setChannels(choices.channels);
+        setWires(choices.wires);
         setProfiles(catalog);
       } catch {
         // 这两份只用来渲染渠道下拉和对不上的提示，取不到不该挡住保存。
@@ -123,7 +128,7 @@ export const VisionChannelBlock = () => {
               value={provider}
             >
               <option value="">跟随主渠道{mainProvider ? `（${mainProvider}）` : ''}</option>
-              {providerNames.map((name) => <option key={name} value={name}>{name}</option>)}
+              <ChannelOptions channels={channels} current={provider} wires={wires} />
             </select>
           </FieldRow>
           <p className="qc-facts">

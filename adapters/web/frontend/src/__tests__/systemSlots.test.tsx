@@ -34,7 +34,11 @@ const SLOTS = {
   ],
 };
 
-const NAMES = ['openai', 'anthropic', 'deepseek'];
+const WIRES = ['openai', 'anthropic', 'deepseek'];
+const CHANNELS = [
+  { value: 'gemini-中转A', label: 'gemini-中转A · 便宜那个', wire: 'gemini' },
+  { value: 'deepseek', label: 'deepseek', wire: 'deepseek' },
+];
 
 const PROFILES = {
   options: {},
@@ -53,7 +57,7 @@ const rows = () => screen.getAllByRole('listitem');
 const rowFor = (label: string) => rows().find((row) => within(row).queryByText(label))!;
 const save = () => fireEvent.click(screen.getByRole('button', { name: '保存槽位' }));
 const render1 = (profiles: any = PROFILES) => render(
-  <SystemSlots activeProvider="openai" profiles={profiles} providerNames={NAMES} />,
+  <SystemSlots activeProvider="openai" channels={CHANNELS} profiles={profiles} wires={WIRES} />,
 );
 
 describe('系统槽位', () => {

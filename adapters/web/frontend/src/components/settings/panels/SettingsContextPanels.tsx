@@ -11,7 +11,7 @@ import { useEffect, useId, useMemo, useState, type ReactNode } from 'react';
 // through full raw YAML reloads. How: import only the existing raw read/write wrappers
 // alongside the earlier node, skill, and tool helpers. Purpose: the panel can update
 // one selected item without introducing new API contracts or touching other panels.
-import { getMcpClientsRaw, getNodeRaw, getNodes, getProviders, getSchedulesRaw, getSkillRaw, getToolRaw, listUpstreamModels, reloadTools, updateMcpClientsRaw, updateNodeRaw, updateSchedulesRaw, updateSkillRaw, updateToolRaw } from '../../../api/supervisorClient';
+import { channelChoices, getMcpClientsRaw, getNodeRaw, getNodes, getProviders, getSchedulesRaw, getSkillRaw, getToolRaw, listUpstreamModels, reloadTools, updateMcpClientsRaw, updateNodeRaw, updateSchedulesRaw, updateSkillRaw, updateToolRaw, type ChannelChoice } from '../../../api/supervisorClient';
 // [2026-06-02] Use shared lightweight structured YAML helpers in the two requested panels.
 // Why: MCP clients and automation schedules already have parse and serialize helpers
 // that preserve the expected config shape. How: import the form state types and
@@ -108,7 +108,14 @@ export const AgentsSettingsRightPanel = () => {
   const [nodeYamlSaving, setNodeYamlSaving] = useState(false);
   const [nodeMessage, setNodeMessage] = useState('');
   const [modelChoices, setModelChoices] = useState<string[]>([]);
-  const [providerChoices, setProviderChoices] = useState<string[]>([]);
+  const [channels, setChannels] = useState<ChannelChoice[]>([]);
+  const [wires, setWires] = useState<string[]>([]);
+  // 存着的值可能是手写进 yaml 的。列不出来的选项会在保存时被悄悄换掉。
+  const providerIsListed = useMemo(
+    () => channels.some((c) => c.value === nodeConfigForm.provider)
+      || wires.includes(nodeConfigForm.provider),
+    [channels, wires, nodeConfigForm.provider],
+  );
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [modelFetchNote, setModelFetchNote] = useState('');
@@ -185,7 +192,8 @@ export const AgentsSettingsRightPanel = () => {
     let cancelled = false;
     if (!adminToken) {
       setModelChoices([]);
-      setProviderChoices([]);
+      setChannels([]);
+      setWires([]);
       return () => { cancelled = true; };
     }
     Promise.all([
@@ -197,8 +205,9 @@ export const AgentsSettingsRightPanel = () => {
         modelsFromProviders(providers),
         modelsFromNodes(nodes, node?.id || ''),
       ));
-      // 节点的 provider 得是后端注册过的名字，写别的要到运行时才报错。
-      setProviderChoices(providers?.registered || []);
+      const choices = channelChoices(providers);
+      setChannels(choices.channels);
+      setWires(choices.wires);
     });
     return () => { cancelled = true; };
   }, [adminToken, node?.id]);
@@ -293,12 +302,23 @@ export const AgentsSettingsRightPanel = () => {
                     value={nodeConfigForm.provider}
                   >
                     <option value="">跟随活跃渠道</option>
-                    {/* 存着的值可能是手写进 yaml 的，列不出来就会在保存时被悄悄改掉。 */}
-                    {nodeConfigForm.provider && !providerChoices.includes(nodeConfigForm.provider) && (
+                    {nodeConfigForm.provider && !providerIsListed && (
                       <option value={nodeConfigForm.provider}>{nodeConfigForm.provider}（后端不认）</option>
                     )}
-                    {providerChoices.map((choice) => <option key={choice} value={choice}>{choice}</option>)}
+                    {channels.length > 0 && (
+                      <optgroup label="已配渠道">
+                        {channels.map((choice) => (
+                          <option key={choice.value} value={choice.value}>{choice.label}</option>
+                        ))}
+                      </optgroup>
+                    )}
+                    <optgroup label="线格式">
+                      {wires.map((wire) => <option key={wire} value={wire}>{wire}</option>)}
+                    </optgroup>
                   </select>
+                  <span className="mt-1 block font-mono text-[0.55rem] text-[var(--duties-muted)]">
+                    选已配渠道会连它的地址密钥一起用；选线格式只定请求怎么发，地址得另填。
+                  </span>
                 </label>
                 {/* 不用 label 包：里头那颗按钮会连带触发 label 的聚焦。 */}
                 <div className="block">

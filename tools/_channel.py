@@ -12,8 +12,6 @@ from typing import NamedTuple
 # 这几家收 OpenAI 格式的 /chat/completions；anthropic 与 gemini 原生走自己的端点和请求体。
 OPENAI_COMPATIBLE = frozenset({"openai", "deepseek"})
 
-_META_KEYS = frozenset({"version", "provider", "fallbacks", "node_fallbacks", "system_models"})
-
 
 class MainChannel(NamedTuple):
     """data/config.yaml 里当前活跃的那个渠道块。字段可能为空。"""
@@ -54,7 +52,7 @@ def _read_config(root: Path) -> dict:
 
 
 def _is_provider_block(value: object) -> bool:
-    return isinstance(value, dict) and any(k in value for k in ("base_url", "api_key", "model"))
+    return isinstance(value, dict) and any(k in value for k in ("base_url", "api_key", "model", "type"))
 
 
 class Channel:
@@ -108,22 +106,32 @@ class Channel:
                 return text
         return ""
 
-    def main(self) -> MainChannel:
-        """当前活跃渠道。块名同时是 provider 类型，决定请求格式。"""
-        if not isinstance(self._config, dict):
-            return MainChannel()
-        name = str(self._config.get("provider") or "").strip() or "openai"
-        block = self._config.get(name)
+    def named(self, name: str) -> MainChannel:
+        """按名字取一个渠道块。名字底下没有块时只当它是个线格式名。
+
+        provider 报的一律是线格式，不是块名 —— 块名由用户随便起，发请求认不得。
+        """
+        text = str(name or "").strip()
+        block = self._config.get(text) if (text and isinstance(self._config, dict)) else None
         if not _is_provider_block(block):
-            name, block = "openai", self._config.get("openai")
-        if not _is_provider_block(block):
-            return MainChannel()
+            return MainChannel(provider=text.lower())
         return MainChannel(
-            provider=name,
+            provider=str(block.get("type") or "").strip().lower() or text.lower(),
             base_url=self._deref(block.get("base_url")),
             api_key=self._deref(block.get("api_key")),
             model=self._deref(block.get("model")),
         )
+
+    def main(self) -> MainChannel:
+        """当前活跃渠道。"""
+        if not isinstance(self._config, dict):
+            return MainChannel()
+        name = str(self._config.get("provider") or "").strip() or "openai"
+        if not _is_provider_block(self._config.get(name)):
+            name = "openai"
+        if not _is_provider_block(self._config.get(name)):
+            return MainChannel()
+        return self.named(name)
 
     def main_for(self, *providers: str) -> MainChannel:
         """主渠道属于这几家之一时才把它交出去，否则当作没配。
@@ -242,22 +250,21 @@ def resolve_vision_channel(*, root: Path | None = None) -> VisionChannel:
     channel = Channel("image", root=root)
     main = channel.main()
 
-    base_url = channel.own("base_url", "BASE_URL")
+    # 槽位的 provider 可以写成一个渠道名，那就连它的地址密钥一并用上。
+    referenced = channel.named(channel.own("provider", "PROVIDER"))
+    base_url = channel.own("base_url", "BASE_URL") or referenced.base_url
     # 地址和格式是绑死的一对：这一槽自己指了地址，就不能假定对面还说主渠道那套话。
     # 没明说是哪家时按中转站的最小公约数算，只有整条跟随主渠道时才连格式一起跟。
-    provider = (
-        channel.own("provider", "PROVIDER").strip().lower()
-        or ("openai" if base_url else main.provider)
-    )
+    provider = referenced.provider or ("openai" if base_url else main.provider)
     if not base_url:
         base_url = main.base_url or channel.env("OPENAI_BASE_URL")
         api_key = channel.pick(
-            "api_key", "API_KEY", main.api_key,
+            "api_key", "API_KEY", referenced.api_key, main.api_key,
             channel.env("GEMINI_API_KEY"), channel.env("OPENAI_API_KEY"),
         )
     else:
         api_key = channel.pick(
-            "api_key", "API_KEY",
+            "api_key", "API_KEY", referenced.api_key,
             channel.env("GEMINI_API_KEY"), channel.env("OPENAI_API_KEY"),
         )
     if not api_key:
@@ -272,7 +279,7 @@ def resolve_vision_channel(*, root: Path | None = None) -> VisionChannel:
             base_url, wire, provider = _VISION_FALLBACK_URL, _VISION_FALLBACK_WIRE, "gemini"
     base_url = wire_mod.normalize_base_url(wire, base_url)
 
-    model = channel.pick("model", "MODEL", _VISION_DEFAULT_MODELS.get(wire, ""))
+    model = channel.pick("model", "MODEL", referenced.model, _VISION_DEFAULT_MODELS.get(wire, ""))
     if not model:
         return VisionChannel(error=(
             f"看图渠道选了 {provider}，但没有能替它猜的模型名。"

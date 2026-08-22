@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any
 
 from clonoth_runtime import load_yaml_dict, load_runtime_config, resolve_env_ref
-from providers import registry as provider_registry
 
 
 @dataclass
@@ -46,8 +45,7 @@ class Node:
     # hybrid output_mode: 纯文本输出不再 reject 重试，直接作为隐式 finish 投递给用户。
     # tool_only = 现有行为（强制 finish）；hybrid = 允许纯文本直接投递。
     output_mode: str = "tool_only"  # "tool_only" | "hybrid"
-    # [provider-registry 2026-05-03] provider 是 registry key，空字符串表示使用默认 provider。
-    # 原因：provider 列表已插件化；做法：不在类型注释中列死内置名称；目的：新增 provider 无需改 Node 定义。
+    # config.yaml 里的渠道名，或直接写线格式名。空表示跟随全局活跃渠道。
     provider: str = ""
     provider_options: dict = field(default_factory=dict)  # 透传给 provider 的参数（thinking/reasoning 等）
     delegate_targets: list[str] = field(default_factory=list)
@@ -167,12 +165,10 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         raw_output_mode = str((_rt_om.get("engine") or {}).get("output_mode") or "tool_only").strip().lower()
     output_mode = raw_output_mode if raw_output_mode in {"tool_only", "hybrid"} else "tool_only"
 
-    # provider — 节点 yaml 可指定 provider 类型
-    raw_provider = str(data.get("provider") or "").strip().lower()
-    # [provider-registry 2026-05-03] 从 registry 动态校验 provider 名称。
-    # 原因：固定白名单会阻止新 provider 插件；做法：读取 ProviderRegistry.list()；
-    # 目的：注册成功的 provider 可以直接被节点配置使用，未知值仍回退为空字符串。
-    provider = raw_provider if raw_provider in {"", *provider_registry.list()} else ""
+    # provider — 渠道名或线格式名，空表示跟随全局活跃渠道。
+    # 不在这里校验也不转小写：认得的只有线格式，config.yaml 里的自定义渠道名会被
+    # 判成非法而静默清空，而渠道名是区分大小写的。真解析在 model.resolve_provider。
+    provider = str(data.get("provider") or "").strip()
 
     # provider_options — 透传给 provider 的参数（如 Anthropic thinking、OpenAI reasoning 等）
     raw_po = data.get("provider_options")

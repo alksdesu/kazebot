@@ -109,9 +109,10 @@ class TestTheSlotProvider:
         assert slot.model == "claude-haiku-4-5"
 
     def test_provider_comes_from_the_slot_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 原样带出来，只 strip 不转小写：它可能是个渠道名，转了就查不到那个块。
         monkeypatch.setenv("CLONOTH_SUMMARY_PROVIDER", "  DeepSeek ")
 
-        assert resolve_system_model(tmp_path, "summary").provider == "deepseek"
+        assert resolve_system_model(tmp_path, "summary").provider == "DeepSeek"
 
     def test_an_unset_provider_means_follow_the_main_channel(self, tmp_path: Path) -> None:
         # 空串是「跟随」的信号，调用方靠它决定要不要覆盖。

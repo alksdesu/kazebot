@@ -99,8 +99,13 @@ describe('模型候选', () => {
   });
 });
 
+const groupOf = (value: string): string => {
+  const option = [...channelBox().options].find((item) => item.value === value);
+  return (option?.parentElement as HTMLOptGroupElement | null)?.label || '';
+};
+
 describe('渠道下拉', () => {
-  it('只列后端注册过的渠道，外加一个跟随全局', async () => {
+  it('只列后端认的名字，外加一个跟随全局', async () => {
     // 手打的名字要到运行时才报错，封闭下拉是唯一的事前防线。
     vi.mocked(getProviders).mockResolvedValue({ ...PROVIDERS, registered: ['openai', 'deepseek'] } as any);
     selectNode();
@@ -110,6 +115,46 @@ describe('渠道下拉', () => {
 
     expect([...channelBox().options].map((option) => option.value))
       .toEqual(['', 'openai', 'deepseek']);
+  });
+
+  it('已配渠道排在裸线格式前面，分两组', async () => {
+    vi.mocked(getProviders).mockResolvedValue({
+      ...PROVIDERS,
+      providers: {
+        ...PROVIDERS.providers,
+        'gemini-中转A': { base_url: '', model: '', api_key_present: true, type: 'gemini' },
+      },
+      registered: ['openai', 'gemini'],
+    } as any);
+    selectNode();
+    render(<AgentsSettingsRightPanel />);
+
+    await waitFor(() => expect([...channelBox().options].length).toBe(4));
+
+    expect([...channelBox().options].map((option) => option.value))
+      .toEqual(['', 'openai', 'gemini-中转A', 'gemini']);
+    expect(groupOf('gemini-中转A')).toBe('已配渠道');
+    expect(groupOf('gemini')).toBe('线格式');
+  });
+
+  it('同一家可以配好几个，各是各的一项', async () => {
+    vi.mocked(getProviders).mockResolvedValue({
+      ...PROVIDERS,
+      providers: {
+        'gemini-中转A': { base_url: '', model: '', api_key_present: true, type: 'gemini', label: '便宜' },
+        'gemini-官方': { base_url: '', model: '', api_key_present: true, type: 'gemini' },
+      },
+      registered: ['gemini'],
+    } as any);
+    selectNode();
+    render(<AgentsSettingsRightPanel />);
+
+    await waitFor(() => expect([...channelBox().options].length).toBe(4));
+
+    const texts = [...channelBox().options].map((option) => option.textContent);
+    // 备注跟在名字后面，否则两个 gemini 摆一起分不出谁是谁。
+    expect(texts).toContain('gemini-中转A · 便宜');
+    expect(texts).toContain('gemini-官方');
   });
 
   it('yaml 里手写的野名字照样列出来，不会被悄悄改掉', async () => {

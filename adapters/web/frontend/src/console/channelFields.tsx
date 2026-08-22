@@ -1,7 +1,7 @@
 // 渠道编辑共用的小件。渠道页和系统槽位都摆 model/地址/密钥三项，回填规则也一样。
 import { useMemo, useState, type ReactNode } from 'react';
 
-import { listUpstreamModels, type ProviderProfiles } from '../api/supervisorClient';
+import { listUpstreamModels, type ChannelChoice, type ProviderProfiles } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 
 /** 填的是变量引用时，别处看不到它当前指向谁。改动过就不显示：展开值配不上刚敲进去的变量名。 */
@@ -66,6 +66,38 @@ export const HostMismatchHint = ({
 };
 
 /** 标签一列、内容一列。渠道页和系统槽位共用，改布局只动这一处。 */
+/** 渠道名 → 线格式。按线格式索引的东西（可调参数、默认端点）查之前都得先过这一层。 */
+export const wireOf = (name: string, channels: ChannelChoice[]): string => (
+  channels.find((c) => c.value === name)?.wire || (name || '').toLowerCase()
+);
+
+/**
+ * provider 下拉的选项。已配渠道带着地址密钥模型，裸线格式只定请求怎么发 ——
+ * 后者不能省：只想换格式、地址走环境变量的配置要用它。
+ *
+ * current 列不出来时补一条「后端不认」，否则手写进 yaml 的值会在保存时被悄悄换掉。
+ */
+export const ChannelOptions = ({
+  channels, wires, current,
+}: { channels: ChannelChoice[]; wires: string[]; current: string }) => {
+  const listed = channels.some((c) => c.value === current) || wires.includes(current);
+  return (
+    <>
+      {current && !listed && <option value={current}>{current}（后端不认）</option>}
+      {channels.length > 0 && (
+        <optgroup label="已配渠道">
+          {channels.map((choice) => (
+            <option key={choice.value} value={choice.value}>{choice.label}</option>
+          ))}
+        </optgroup>
+      )}
+      <optgroup label="线格式">
+        {wires.map((wire) => <option key={wire} value={wire}>{wire}</option>)}
+      </optgroup>
+    </>
+  );
+};
+
 export const FieldRow = ({ label, children }: { label: string; children: ReactNode }) => (
   <div className="qc-chan-row">
     <span className="qc-chan-label">{label}</span>

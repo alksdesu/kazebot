@@ -67,9 +67,13 @@ def _run(
 
     env = {k: v for k, v in os.environ.items() if not k.startswith(("CLONOTH_", "ONEBOT_"))}
     env.update(extra_env or {})
+    # 两端都钉死 UTF-8：子进程默认按系统 locale 输出，父进程按 locale 解码，
+    # 在中文 Windows 上撞见编不出的字符就整条流报 UnicodeDecodeError。
+    env["PYTHONIOENCODING"] = "utf-8"
     done = subprocess.run(
         [sys.executable, str(harness), str(home / "bot.py"), str(dumped)],
-        cwd=str(cwd), env=env, capture_output=True, text=True, timeout=120,
+        cwd=str(cwd), env=env, capture_output=True, text=True,
+        encoding="utf-8", timeout=120,
     )
     assert done.returncode == 0, done.stderr
     return json.loads(dumped.read_text(encoding="utf-8"))
@@ -176,7 +180,8 @@ def test_main_runs_end_to_end_with_nonebot_stubbed(tmp_path: Path) -> None:
 
     done = subprocess.run(
         [sys.executable, str(harness), str(home / "bot.py"), str(REPO_ROOT), str(dumped)],
-        cwd=str(home), env=os.environ.copy(), capture_output=True, text=True, timeout=120,
+        cwd=str(home), env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        capture_output=True, text=True, encoding="utf-8", timeout=120,
     )
     assert done.returncode == 0, done.stderr
 

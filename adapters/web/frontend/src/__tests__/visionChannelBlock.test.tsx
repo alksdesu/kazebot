@@ -69,12 +69,27 @@ const picker = () => screen.getByLabelText('看图渠道类型') as HTMLSelectEl
 const addr = () => screen.getByLabelText('看图渠道地址');
 const save = () => fireEvent.click(screen.getByRole('button', { name: '保存渠道' }));
 
+const groupOf = (value: string): string => {
+  const option = [...picker().options].find((item) => item.value === value);
+  return (option?.parentElement as HTMLOptGroupElement | null)?.label || '';
+};
+
 describe('选渠道', () => {
-  it('列出全部已注册渠道，并说明留空跟随的是哪一家', async () => {
+  it('已配渠道和裸线格式分两组，留空说明跟随的是哪一家', async () => {
+    await show();
+    expect([...picker().options].map((option) => option.value))
+      .toEqual(['', 'gemini', 'anthropic', 'openai']);
+    // gemini 有自己的块，选它连地址密钥一起用；另外两个只定请求格式。
+    expect(groupOf('gemini')).toBe('已配渠道');
+    expect(groupOf('anthropic')).toBe('线格式');
+    expect(screen.getByText('跟随主渠道（gemini）')).toBeTruthy();
+  });
+
+  it('配过的那家不会在线格式里再出现一次', async () => {
+    // 两个一模一样的选项，选哪个结果都一样 —— 摆出来只会让人以为有区别。
     await show();
     const names = [...picker().options].map((option) => option.value);
-    expect(names).toEqual(['', 'anthropic', 'gemini', 'openai']);
-    expect(screen.getByText('跟随主渠道（gemini）')).toBeTruthy();
+    expect(names.filter((name) => name === 'gemini')).toHaveLength(1);
   });
 
   it('选了就提交上去', async () => {

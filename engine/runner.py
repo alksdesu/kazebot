@@ -19,6 +19,7 @@ from clonoth_runtime import (
     get_int,
     load_runtime_config,
     normalize_openai_secret,
+    resolve_channel,
     resolve_system_model,
 )
 from providers import registry as provider_registry
@@ -811,14 +812,20 @@ def _resolve_system_model_slot(node: Any) -> str:
     return _LEGACY_SYSTEM_MODEL_SLOTS.get(node.id, "")
 
 
-def _apply_system_slot(rp: Any, slot: Any, slot_name: str) -> None:
+def _apply_system_slot(ws_root: Path, rp: Any, slot: Any, slot_name: str) -> None:
     """把系统槽位的配置盖到已解析的渠道上。空字段表示这一项跟随主渠道。"""
     for field in ("model", "base_url", "api_key"):
         value = getattr(slot, field, "")
         if value:
             setattr(rp, field, value)
     if slot.provider:
-        rp.provider_type = slot.provider
+        # 槽位的 provider 跟节点的一样，可以是渠道名。只填它不填地址就整块继承过来。
+        channel = resolve_channel(ws_root, slot.provider)
+        rp.provider_type = channel.wire
+        if channel.known:
+            rp.base_url = rp.base_url or channel.base_url or None
+            rp.api_key = rp.api_key or channel.api_key or None
+            rp.model = rp.model or channel.model
     elif slot.base_url:
         # 换中转没事，换家必挂 —— 这一条日志是唯一的线索。
         print(
@@ -1026,7 +1033,7 @@ async def _run_node_task(
     # 节点 yaml 方便地“跟随主渠道”，故在 runner 统一叠加。
     _sys_slot = _resolve_system_model_slot(node)
     if _sys_slot:
-        _apply_system_slot(rp, resolve_system_model(
+        _apply_system_slot(ws_root, rp, resolve_system_model(
             ws_root, _sys_slot,
             default_model=rp.model or default_model,
             default_base_url="",   # 留空→下方 _create_provider_from_registry 用主渠道 base_url
@@ -1039,7 +1046,11 @@ async def _run_node_task(
     node_provider_options = getattr(node, "provider_options", {}) or {}
     if not isinstance(node_provider_options, dict):
         node_provider_options = {}
-    _po = _merge_provider_options(global_provider_options, node_provider_options)
+    # 三层由宽到窄：runtime.yaml 按线格式定的 < 这个渠道块自己写的 < 节点写的。
+    _po = _merge_provider_options(
+        _merge_provider_options(global_provider_options, rp.channel_options),
+        node_provider_options,
+    )
     # [AutoC 2026-06-01] Why: runtime.yaml now supports provider-wide options, but
     # node YAML must remain the most specific layer. How: read
     # providers.<provider_type>.options and merge it with node.provider_options.

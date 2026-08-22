@@ -5,7 +5,7 @@ import importlib.util
 import os
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -421,6 +421,72 @@ def _load_config_yaml(workspace_root: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+# ---------------------------------------------------------------------------
+#  命名渠道解析
+# ---------------------------------------------------------------------------
+# config.yaml 顶层的渠道块由用户自己命名，只能靠排除法认出来。
+CONFIG_META_KEYS = frozenset({
+    "version", "provider", "fallbacks", "node_fallbacks", "system_models", "image_gen",
+})
+
+_CHANNEL_BLOCK_KEYS = ("base_url", "api_key", "model", "type")
+
+
+def is_channel_block(value: Any) -> bool:
+    return isinstance(value, dict) and any(k in value for k in _CHANNEL_BLOCK_KEYS)
+
+
+@dataclass(frozen=True)
+class Channel:
+    """config.yaml 里的一个渠道块。known=False 表示这名字底下没有块。"""
+
+    name: str = ""
+    wire: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    options: dict[str, Any] = field(default_factory=dict)
+    known: bool = False
+
+
+def resolve_channel(
+    workspace_root: Path | str,
+    name: str,
+    *,
+    config: dict[str, Any] | None = None,
+) -> Channel:
+    """把 provider 字段上的那个名字解析成一个渠道。
+
+    渠道名区分大小写（`gemini-中转A` 就是这么存进 config.yaml 的），线格式名不区分。
+    名字底下没有块时按线格式名处理，老配置的 `provider: deepseek` 因此原样继续可用。
+    """
+    requested = str(name or "").strip()
+    if not requested:
+        return Channel()
+
+    if isinstance(config, dict):
+        data = config
+    elif workspace_root:
+        data = _load_config_yaml(Path(workspace_root))
+    else:
+        data = {}
+    block = data.get(requested)
+    if requested in CONFIG_META_KEYS or not is_channel_block(block):
+        return Channel(name=requested, wire=requested.lower())
+
+    declared = str(block.get("type") or "").strip().lower()
+    raw_options = block.get("options")
+    return Channel(
+        name=requested,
+        wire=declared or requested.lower(),
+        base_url=resolve_env_ref(str(block.get("base_url") or "").strip()),
+        api_key=resolve_env_ref(str(block.get("api_key") or "").strip()),
+        model=resolve_env_ref(str(block.get("model") or "").strip()),
+        options=dict(raw_options) if isinstance(raw_options, dict) else {},
+        known=True,
+    )
+
+
 @dataclass(frozen=True)
 class SystemModel:
     """系统槽位解析结果。空字段表示这一项跟随主渠道。"""
@@ -445,8 +511,8 @@ def resolve_system_model(
     每项独立回退：config.yaml system_models.<slot> > slot 专属环境变量 > 调用方给的
     主渠道值。留空表示跟随主渠道。
 
-    provider 决定用哪套请求格式。给了 base_url 却不给它，就会拿主渠道那家的格式去打
-    这个地址 —— 换中转没事，换家必挂。
+    provider 决定用哪套请求格式，也可以写成一个渠道名让调用方去继承那个块。给了
+    base_url 却不给它，就会拿主渠道那家的格式去打这个地址 —— 换中转没事，换家必挂。
     """
     slot = (slot or "").strip().lower()
     prefix = _SYSTEM_MODEL_ENV_PREFIX.get(slot, "")
@@ -476,7 +542,8 @@ def resolve_system_model(
         model=_pick("model", "MODEL", default_model),
         base_url=_pick("base_url", "BASE_URL", default_base_url),
         api_key=_pick("api_key", "API_KEY", default_api_key),
-        provider=_pick("provider", "PROVIDER", default_provider).strip().lower(),
+        # 不转小写：渠道名区分大小写，转了就查不到那个块。
+        provider=_pick("provider", "PROVIDER", default_provider).strip(),
     )
 
 

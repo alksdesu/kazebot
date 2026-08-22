@@ -97,6 +97,25 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _verify_channel_ref(cs: ConfigStore, name: str) -> None:
+    """provider 字段可以是已配渠道名，也可以是裸线格式名。都不是就当场拦。
+
+    放过去的话 engine 会静默回退成 openai 格式，拿着别家的 url+key 发出去，
+    只看得到一个没头没尾的 400。渠道名区分大小写，线格式名不区分。
+    """
+    wanted = (name or "").strip()
+    if not wanted:
+        return
+    from providers import registry as provider_registry
+    channels = cs.channel_names()
+    if wanted in channels or wanted.lower() in provider_registry.list():
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=f"不认识的渠道 '{wanted}'。已配渠道：{channels}；线格式：{provider_registry.list()}",
+    )
+
+
 # [WS events 2026-05-17] Why: WebSocket clients should keep long-lived event
 # streams through proxies. How: send an application-level ping at this cadence
 # when no EventLog row is available. Purpose: avoid idle timeout without changing
@@ -355,13 +374,7 @@ def create_app(
     async def put_system_model(slot: str, body: SystemModelUpdateIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
-        if body.provider:
-            from providers import registry as provider_registry
-            if body.provider.strip().lower() not in provider_registry.list():
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unknown provider '{body.provider}'. Available: {provider_registry.list()}",
-                )
+        _verify_channel_ref(cs, body.provider or "")
         try:
             return cs.update_system_model(
                 slot, base_url=body.base_url, api_key=body.api_key,
@@ -1611,16 +1624,10 @@ def create_app(
         # malformed requests get a clear 400 response.
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail="provider_override must be a JSON object")
-        # 拼错的名字会一路走到 engine 那边静默回退成 openai 格式，然后拿着别家的
-        # url+key 发出去，只看得到一个没头没尾的 400。这里先拦。
-        wanted = str(body.get("provider") or body.get("provider_type") or "").strip().lower()
-        if wanted:
-            from providers import registry as provider_registry
-            if wanted not in provider_registry.list():
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unknown provider '{wanted}'. Available: {provider_registry.list()}",
-                )
+        _verify_channel_ref(
+            app.state.config_store,
+            str(body.get("provider") or body.get("provider_type") or ""),
+        )
         result = st.set_session_provider_override(session_id, body)
         if result is None:
             raise HTTPException(status_code=404, detail="session not found")

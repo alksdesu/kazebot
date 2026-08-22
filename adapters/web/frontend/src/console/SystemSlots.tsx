@@ -8,13 +8,14 @@ import {
   getSystemModels,
   updateImageDefaultChannel,
   updateSystemModel,
+  type ChannelChoice,
   type ImageToolStatus,
   type ProviderProfiles,
   type SystemModelSlot,
   type SystemModelsResponse,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
-import { EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields';
+import { ChannelOptions, EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields';
 import { Block, Empty, SaveBar } from './components';
 
 interface Draft {
@@ -44,10 +45,11 @@ const changed = (draft: Draft): boolean => (
 );
 
 const Row = ({
-  draft, providerNames, profiles, activeProvider, onChange,
+  draft, channels, wires, profiles, activeProvider, onChange,
 }: {
   draft: Draft;
-  providerNames: string[];
+  channels: ChannelChoice[];
+  wires: string[];
   profiles: ProviderProfiles | null;
   /** 槽位没自选渠道时落到哪家 —— 拉模型要按那一家的格式问。 */
   activeProvider: string;
@@ -119,7 +121,7 @@ const Row = ({
             value={draft.provider}
           >
             <option value="">跟随主渠道</option>
-            {providerNames.map((name) => <option key={name} value={name}>{name}</option>)}
+            <ChannelOptions channels={channels} current={draft.provider} wires={wires} />
           </select>
         </FieldRow>
       )}
@@ -166,8 +168,9 @@ const ImageDefault = ({ tools, value, onPick }: {
   );
 };
 
-export const SystemSlots = ({ providerNames, profiles, activeProvider }: {
-  providerNames: string[];
+export const SystemSlots = ({ channels, wires, profiles, activeProvider }: {
+  channels: ChannelChoice[];
+  wires: string[];
   profiles: ProviderProfiles | null;
   activeProvider: string;
 }) => {
@@ -252,7 +255,8 @@ export const SystemSlots = ({ providerNames, profiles, activeProvider }: {
               onChange={(next) => setDrafts(drafts.map((item, i) => (i === index ? next : item)))}
               activeProvider={activeProvider}
               profiles={profiles}
-              providerNames={providerNames}
+              channels={channels}
+              wires={wires}
             />
           ))}
           <ImageDefault onPick={setImageDefault} tools={imageTools} value={imageDefault} />

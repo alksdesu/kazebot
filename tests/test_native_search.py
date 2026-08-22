@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -40,10 +41,14 @@ def _workspace(tmp_path: Path, config: str) -> Path:
 
 def _run(cwd: Path) -> dict:
     """黑盒跑真脚本。整段逻辑都在 __main__ 里，只能这么测。"""
+    # 两端都钉死 UTF-8：子进程默认按系统 locale 输出，父进程按 locale 解码，
+    # 在中文 Windows 上撞见编不出的字符就整条流报 UnicodeDecodeError。
     done = subprocess.run(
         [sys.executable, str(_ROOT / "tools" / "native_search.py")],
         input=json.dumps({"query": "今天天气"}),
-        capture_output=True, text=True, cwd=str(cwd), timeout=120,
+        capture_output=True, text=True, encoding="utf-8",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        cwd=str(cwd), timeout=120,
     )
     return json.loads(done.stdout.strip().splitlines()[-1])
 

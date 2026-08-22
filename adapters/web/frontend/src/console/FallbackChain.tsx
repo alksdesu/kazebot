@@ -5,15 +5,18 @@
 import { useEffect, useMemo, useState } from 'react';
 
 import {
+  channelChoices,
   clearNodeFallbacks,
   updateFallbacks,
   updateNodeFallbacks,
+  type ChannelChoice,
   type FallbackEntryPublic,
   type FallbackEntryUpdate,
   type ProviderOptionsCatalog,
   type ProvidersResponse,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
+import { ChannelOptions, wireOf } from './channelFields';
 import { Block, Empty, SaveBar } from './components';
 import { OptionRow, shownFromValue, valueFromShown, visibleSpecs } from './optionFields';
 
@@ -67,19 +70,21 @@ const sameChain = (a: Draft[], b: FallbackEntryPublic[]): boolean => (
 );
 
 const Row = ({
-  draft, index, total, catalog, providerNames, onChange, onMove, onRemove,
+  draft, index, total, catalog, channels, wires, onChange, onMove, onRemove,
 }: {
   draft: Draft;
   index: number;
   total: number;
   catalog: ProviderOptionsCatalog;
-  providerNames: string[];
+  channels: ChannelChoice[];
+  wires: string[];
   onChange: (next: Draft) => void;
   onMove: (delta: number) => void;
   onRemove: () => void;
 }) => {
   const [open, setOpen] = useState(false);
-  const specs = catalog[draft.provider] || [];
+  // catalog 按线格式索引，拿渠道名去查什么都查不到。
+  const specs = catalog[wireOf(draft.provider, channels)] || [];
   const shownOf = (key: string): string => shownFromValue(draft.options?.[key]);
   const setOption = (key: string, shown: string) => {
     const spec = specs.find((item) => item.key === key);
@@ -103,9 +108,7 @@ const Row = ({
           onChange={(event) => onChange({ ...draft, provider: event.target.value, options: {} })}
           value={draft.provider}
         >
-          {[...new Set([draft.provider, ...providerNames])].filter(Boolean).map((name) => (
-            <option key={name} value={name}>{name}</option>
-          ))}
+          <ChannelOptions channels={channels} current={draft.provider} wires={wires} />
         </select>
         <input
           aria-label="模型"
@@ -241,7 +244,9 @@ export const FallbackChain = ({
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
 
-  const providerNames = useMemo(() => Object.keys(catalog).sort(), [catalog]);
+  const { channels, wires } = useMemo(() => channelChoices(data), [data]);
+  // 新建的一条默认指向第一个已配渠道 —— 那才是马上能用的，裸线格式还得再填地址密钥。
+  const defaultProvider = channels[0]?.value || wires[0] || 'openai';
   const custom = scope === null ? true : scope in (data?.node_fallbacks || {});
   const stored = useMemo<FallbackEntryPublic[]>(() => {
     if (!data) return [];
@@ -309,7 +314,7 @@ export const FallbackChain = ({
           onEnable={(id) => run(
             (auth) => updateNodeFallbacks(auth, id, drafts.length
               ? drafts.map(toPayload)
-              : [toPayload(blankDraft(providerNames[0] || 'openai'))]),
+              : [toPayload(blankDraft(defaultProvider))]),
             '已改为使用这个节点自己的链。',
           )}
           onFollowGlobal={(id) => run(
@@ -333,7 +338,8 @@ export const FallbackChain = ({
                   onChange={(next) => update(index, next)}
                   onMove={(delta) => move(index, delta)}
                   onRemove={() => setDrafts(drafts.filter((_, i) => i !== index))}
-                  providerNames={providerNames}
+                  channels={channels}
+                  wires={wires}
                   total={drafts.length}
                 />
               ))}
@@ -342,7 +348,7 @@ export const FallbackChain = ({
           <div className="qc-cap-head">
             <button
               className="qc-btn qc-btn-quiet"
-              onClick={() => setDrafts([...drafts, blankDraft(providerNames[0] || 'openai')])}
+              onClick={() => setDrafts([...drafts, blankDraft(defaultProvider)])}
               type="button"
             >
               添加备选
