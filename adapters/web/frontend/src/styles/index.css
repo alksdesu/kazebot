@@ -23,6 +23,9 @@
   --duties-scrollbar-track: transparent;
   --duties-scrollbar-thumb: var(--duties-border);
   --duties-scrollbar-thumb-hover: var(--duties-secondary);
+  /* 三栏宽度。右栏可拖拽，AppLayout 会就地覆盖这一项。 */
+  --duties-sidebar-w: 15rem;
+  --duties-right-w: 18rem;
   color: var(--duties-text);
   background: var(--duties-bg);
   font-family: ui-sans-serif, system-ui, sans-serif;

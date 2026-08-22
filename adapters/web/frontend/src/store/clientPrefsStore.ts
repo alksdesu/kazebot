@@ -14,6 +14,8 @@ export interface ClientPrefs {
   titleGeneration: TitleGenerationMode;
   thinkingDefaultCollapsed: boolean;
   toolResultsDefaultCollapsed: boolean;
+  /** Right panel width in px on desktop. */
+  rightPanelWidth: number;
 }
 
 interface ClientPrefsState extends ClientPrefs {
@@ -21,7 +23,17 @@ interface ClientPrefsState extends ClientPrefs {
   setTitleGeneration: (mode: TitleGenerationMode) => void;
   setThinkingDefaultCollapsed: (collapsed: boolean) => void;
   setToolResultsDefaultCollapsed: (collapsed: boolean) => void;
+  setRightPanelWidth: (width: number) => void;
   resetClientPrefs: () => void;
+}
+
+export const RIGHT_PANEL_MIN_WIDTH = 240;
+export const RIGHT_PANEL_MAX_WIDTH = 880;
+export const RIGHT_PANEL_DEFAULT_WIDTH = 288;
+
+export function clampRightPanelWidth(width: number): number {
+  if (!Number.isFinite(width)) return RIGHT_PANEL_DEFAULT_WIDTH;
+  return Math.min(RIGHT_PANEL_MAX_WIDTH, Math.max(RIGHT_PANEL_MIN_WIDTH, Math.round(width)));
 }
 
 const LS_KEY_CLIENT_PREFS = scopedKey('clonoth_client_prefs');
@@ -41,6 +53,7 @@ export const DEFAULT_CLIENT_PREFS: ClientPrefs = {
   titleGeneration: 'first-message',
   thinkingDefaultCollapsed: true,
   toolResultsDefaultCollapsed: true,
+  rightPanelWidth: RIGHT_PANEL_DEFAULT_WIDTH,
 };
 
 function isTitleGenerationMode(value: unknown): value is TitleGenerationMode {
@@ -62,6 +75,9 @@ function readStoredPrefs(): Partial<ClientPrefs> {
       titleGeneration: isTitleGenerationMode(parsed.titleGeneration) ? parsed.titleGeneration : undefined,
       thinkingDefaultCollapsed: typeof parsed.thinkingDefaultCollapsed === 'boolean' ? parsed.thinkingDefaultCollapsed : undefined,
       toolResultsDefaultCollapsed: typeof parsed.toolResultsDefaultCollapsed === 'boolean' ? parsed.toolResultsDefaultCollapsed : undefined,
+      rightPanelWidth: typeof parsed.rightPanelWidth === 'number'
+        ? clampRightPanelWidth(parsed.rightPanelWidth)
+        : undefined,
     };
   } catch {
     return {};
@@ -92,6 +108,7 @@ function publicPrefs(state: ClientPrefsState): ClientPrefs {
     titleGeneration: state.titleGeneration,
     thinkingDefaultCollapsed: state.thinkingDefaultCollapsed,
     toolResultsDefaultCollapsed: state.toolResultsDefaultCollapsed,
+    rightPanelWidth: state.rightPanelWidth,
   };
 }
 
@@ -133,6 +150,12 @@ export const useClientPrefsStore = create<ClientPrefsState>((set, get) => ({
     const nextState = { ...state, toolResultsDefaultCollapsed: collapsed };
     persistPrefs(publicPrefs(nextState));
     return { toolResultsDefaultCollapsed: collapsed };
+  }),
+
+  setRightPanelWidth: (width) => set((state) => {
+    const next = clampRightPanelWidth(width);
+    persistPrefs(publicPrefs({ ...state, rightPanelWidth: next }));
+    return { rightPanelWidth: next };
   }),
 
   resetClientPrefs: () => {

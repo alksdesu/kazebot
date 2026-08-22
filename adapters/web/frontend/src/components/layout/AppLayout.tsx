@@ -6,8 +6,17 @@
 // Purpose: AppLayout remains unaware of chat, settings, or any concrete panel type.
 import { type PropsWithChildren, type ReactNode, useRef, useState } from 'react';
 
+import {
+  RIGHT_PANEL_DEFAULT_WIDTH,
+  RIGHT_PANEL_MAX_WIDTH,
+  RIGHT_PANEL_MIN_WIDTH,
+  clampRightPanelWidth,
+  useClientPrefsStore,
+} from '../../store/clientPrefsStore';
 import { useSettingsStore } from '../../store/settingsStore';
 import { Icon } from '../common';
+
+const RESIZE_STEP = 16;
 
 interface AppLayoutProps extends PropsWithChildren {
   sidebar: ReactNode;
@@ -20,8 +29,38 @@ interface AppLayoutProps extends PropsWithChildren {
 export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, children }: AppLayoutProps) => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { rightPanelOpen, setRightPanelOpen } = useSettingsStore();
+  const { rightPanelWidth, setRightPanelWidth } = useClientPrefsStore();
+  // 拖拽途中不写 localStorage，松手才落一次。
+  const [dragWidth, setDragWidth] = useState<number | null>(null);
   const hasRightPanel = Boolean(logPanel || rightPanel);
   const touchStart = useRef<{ x: number; y: number } | null>(null);
+  const panelWidth = dragWidth ?? rightPanelWidth;
+
+  const beginResize = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = panelWidth;
+    // 面板贴着右边，指针往左走才是变宽。
+    const widthAt = (clientX: number) => clampRightPanelWidth(startWidth - (clientX - startX));
+    const onMove = (moveEvent: PointerEvent) => setDragWidth(widthAt(moveEvent.clientX));
+    const onUp = (upEvent: PointerEvent) => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      setDragWidth(null);
+      setRightPanelWidth(widthAt(upEvent.clientX));
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
+
+  const onResizeKey = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'ArrowLeft') setRightPanelWidth(panelWidth + RESIZE_STEP);
+    else if (event.key === 'ArrowRight') setRightPanelWidth(panelWidth - RESIZE_STEP);
+    else if (event.key === 'Home') setRightPanelWidth(RIGHT_PANEL_DEFAULT_WIDTH);
+    else return;
+    event.preventDefault();
+  };
 
   const handleTouchStart = (event: React.TouchEvent<HTMLDivElement>) => {
     // [2026-06-02] Store only the first touch point for mobile panel gestures. Why:
@@ -69,6 +108,7 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, chi
       data-testid="app-layout-root"
       onTouchEnd={handleTouchEnd}
       onTouchStart={handleTouchStart}
+      style={{ '--duties-right-w': `${panelWidth}px` } as React.CSSProperties}
     >
       {sidebarOpen && (
         <div
@@ -84,7 +124,7 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, chi
       )}
 
       <aside
-        className={`fixed inset-y-0 left-0 z-40 w-[15rem] flex-shrink-0 border-r border-[var(--duties-border)] bg-[var(--duties-panel)] transition-transform md:relative md:z-auto md:translate-x-0 ${
+        className={`fixed inset-y-0 left-0 z-40 w-[var(--duties-sidebar-w)] flex-shrink-0 border-r border-[var(--duties-border)] bg-[var(--duties-panel)] transition-transform md:relative md:z-auto md:translate-x-0 ${
           sidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
@@ -126,14 +166,32 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, chi
         )}
       </main>
 
+      {hasRightPanel && rightPanelOpen && (
+        <div
+          aria-label="调整右侧面板宽度"
+          aria-orientation="vertical"
+          aria-valuemax={RIGHT_PANEL_MAX_WIDTH}
+          aria-valuemin={RIGHT_PANEL_MIN_WIDTH}
+          aria-valuenow={panelWidth}
+          className="hidden w-1 flex-shrink-0 cursor-col-resize bg-[var(--duties-border)] transition-colors hover:bg-[var(--duties-text)] focus-visible:bg-[var(--duties-text)] focus-visible:outline-none md:block"
+          onDoubleClick={() => setRightPanelWidth(RIGHT_PANEL_DEFAULT_WIDTH)}
+          onKeyDown={onResizeKey}
+          onPointerDown={beginResize}
+          role="separator"
+          tabIndex={0}
+          title="拖动调整宽度，双击复位"
+        />
+      )}
+
       {hasRightPanel && (
         <aside
           aria-label="右侧面板"
           className={`flex-shrink-0 flex-col overflow-hidden border-l border-[var(--duties-border)] bg-[var(--duties-panel)] ${
             rightPanelOpen
-              ? 'fixed inset-y-0 right-0 z-40 flex w-[85vw] translate-x-0 transition-transform duration-200 md:relative md:z-auto md:w-72 md:translate-x-0 md:transition-[width]'
+              ? 'fixed inset-y-0 right-0 z-40 flex w-[85vw] translate-x-0 transition-transform duration-200 md:relative md:z-auto md:w-[var(--duties-right-w)] md:translate-x-0'
               : 'fixed inset-y-0 right-0 z-40 w-[85vw] translate-x-full transition-transform duration-200 md:relative md:z-auto md:w-0 md:translate-x-0 md:transition-[width] md:duration-200'
-          }`}
+          // 拖拽时留着 width 过渡，面板会追着指针慢半拍。
+          } ${dragWidth === null && rightPanelOpen ? 'md:transition-[width]' : ''}`}
         >
           {logPanel ? (
             <>
