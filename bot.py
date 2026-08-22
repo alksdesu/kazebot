@@ -6,6 +6,7 @@ NapCat 的反向 WebSocket 应指向 ws://<host>:<port>/onebot/v11/ws。
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -26,6 +27,14 @@ from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 
 # supervisor 冷启动约需半分钟，留足余量；等不到也照常起，卡死更难查。
 _SUPERVISOR_WAIT_SEC = 180.0
+# 与 adapters/onebot/config.py 认同一组变量名。这里不 import 那个模块：导入子模块
+# 会先执行包的 __init__.py，而它是 nonebot 插件，在 nonebot.init() 之前跑必然抛
+# NoneBot has not been initialized。
+_SUPERVISOR_URL = (
+    os.environ.get("CLONOTH_BASE_URL")
+    or os.environ.get("CLONOTH_SUPERVISOR_URL")
+    or "http://127.0.0.1:8765"
+)
 
 
 def _bridge_stdlib_logging() -> None:
@@ -45,15 +54,14 @@ def _bridge_stdlib_logging() -> None:
 
 
 def main() -> None:
-    # 仓库内的模块延迟到这里再取：本文件会被单独复制出去做入口冒烟，import 期
-    # 要求整个仓库在位就跑不起来。
-    from adapters.onebot.config import CLONOTH_BASE_URL
+    # 延迟到这里再取：本文件会被单独复制出去做入口冒烟，import 期要求整个仓库在位
+    # 就跑不起来。
     from clonoth_runtime import wait_supervisor
 
     # 先等 supervisor。systemd 的 After/BindsTo 只排启动顺序，不等它 ready，而
     # NoneBot 一 run 起来就开始收 QQ 消息 —— 那十几秒里的 submit inbound 全部失败，
     # 每次重启都静默吞掉几条群消息。
-    wait_supervisor(CLONOTH_BASE_URL, label="qq", max_wait_sec=_SUPERVISOR_WAIT_SEC)
+    wait_supervisor(_SUPERVISOR_URL, label="qq", max_wait_sec=_SUPERVISOR_WAIT_SEC)
 
     nonebot.init()
     _bridge_stdlib_logging()
