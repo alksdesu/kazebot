@@ -100,6 +100,52 @@ def auto_discover_and_register(
     return handlers
 
 
+def iter_plugin_tool_meta(
+    *,
+    package: str = "engine.builtin",
+    directory: Path | None = None,
+) -> list[dict[str, Any]]:
+    """插件自带工具的 name / description / input_schema。
+
+    只导入模块读 PLUGIN_META，不实例化 handler —— 实例化会把定时器和游标一起拉起来，
+    而问「有哪些工具」的是管理接口。
+    """
+    base_dir = Path(directory) if directory is not None else Path(__file__).parent
+    out: list[dict[str, Any]] = []
+    if not base_dir.is_dir():
+        return out
+
+    for py_file in sorted(base_dir.glob("*.py")):
+        if _should_skip(py_file):
+            continue
+        module_name = f"{package}.{py_file.stem}"
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:
+            logger.error("Failed to import built-in hook %s: %s", module_name, exc, exc_info=True)
+            continue
+        meta = getattr(module, "PLUGIN_META", None)
+        if not isinstance(meta, dict):
+            continue
+        raw_tools = meta.get("tools")
+        if not isinstance(raw_tools, list):
+            continue
+        for tool in raw_tools:
+            if not isinstance(tool, dict):
+                continue
+            name = str(tool.get("name") or "").strip()
+            if not name:
+                continue
+            input_schema = tool.get("input_schema")
+            out.append({
+                "name": name,
+                "description": str(tool.get("description") or ""),
+                "input_schema": input_schema if isinstance(input_schema, dict) else {},
+                "module": py_file.stem,
+            })
+    return out
+
+
 def _resolve_load_order(pending: dict[str, tuple]) -> list[str]:
     """Return handler names in dependency-first order.
 

@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from . import qq_trigger
+from .tool_catalog import ToolEntry, tool_catalog, tool_names
 
 class RawContent(BaseModel):
     content: str
@@ -76,7 +77,7 @@ def init_admin_token(workspace_root: Path, *, console_url: str = "") -> str:
 
     取值优先级：CLONOTH_ADMIN_TOKEN > data/.admin_token 已有值 > 新生成。
     回读那一级不能省：少了它，没配环境变量的部署每次重启都换一个令牌，
-    浏览器里存的和 discord 适配器启动时读进内存的会一起失效。
+    浏览器里存的和适配器启动时读进内存的会一起失效。
     """
     global _admin_token
     path = _token_file(workspace_root)
@@ -683,74 +684,53 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
             shutil.rmtree(p)
         return {"ok": True}
 
-    # ----- Tools (external scripts) -----
-    def _external_tools() -> list[tuple[str, Path, dict[str, Any] | None, float | None]]:
-        """外部工具的 (名字, 文件, SPEC, 超时)，扫描规则和注册表同一份。
+    # ----- Tools -----
+    def _catalog() -> list[ToolEntry]:
+        return tool_catalog(workspace_root)
 
-        自己写一遍遍历就会漂：老版本用不递归的 glob 加文件名当工具名，于是
-        drawtools/ 和 stocktool/ 里六个真在被调用的工具在界面上根本不存在。
+    def _tool_file(name: str) -> Path:
+        """工具名对应的源码文件。
+
+        子目录里的工具、SPEC 名和文件名对不上的都得走这里。内置和插件工具没有源码，
+        直接说清楚 —— 拼一条 tools/{name}.py 出来只会让人看到「文件不存在」。
         """
-        from toolbox.registry import extract_tool_spec, iter_external_tool_files
-
-        tools_dir = workspace_root / "tools"
-        rows: list[tuple[str, Path, dict[str, Any] | None, float | None]] = []
-        for f in iter_external_tool_files(tools_dir):
-            spec, timeout = extract_tool_spec(f)
-            name = spec.get("name") if isinstance(spec, dict) else None
-            if isinstance(name, str) and name.strip():
-                rows.append((name.strip(), f, spec, timeout))
-            elif f.parent == tools_dir:
-                # SPEC 写坏的顶层脚本要留在列表里，否则唯一能修它的编辑器打不开它。
-                rows.append((f.stem, f, None, None))
-        rows.sort(key=lambda row: row[0])
-        return rows
-
-    def _tool_path(name: str) -> Path:
-        """工具名对应的文件。子目录里的工具、SPEC 名和文件名对不上的都得走这里。"""
-        for candidate, path, _spec, _timeout in _external_tools():
-            if candidate == name:
-                return path
-        return _safe_path(workspace_root / "tools", name, ".py")
+        for entry in _catalog():
+            if entry.name != name:
+                continue
+            if not entry.editable or not entry.file:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{name} 是{'插件' if entry.source == 'plugin' else '内置'}工具，没有可编辑的源码文件",
+                )
+            return workspace_root / entry.file
+        raise HTTPException(status_code=404, detail="Tool not found")
 
     @router.get("/tools")
     def list_tools() -> list[dict[str, Any]]:
-        tools_dir = workspace_root / "tools"
-        res: list[dict[str, Any]] = []
-        for name, path, spec, timeout in _external_tools():
-            item: dict[str, Any] = {
-                "name": name,
-                "file": path.relative_to(tools_dir).as_posix(),
-                "has_spec": spec is not None,
-            }
-            if spec:
-                item["description"] = spec.get("description", "")
-                item["input_schema"] = spec.get("input_schema", {})
-            if timeout is not None:
-                item["timeout_sec"] = timeout
-            res.append(item)
-        return res
+        return [entry.to_dict() for entry in _catalog()]
 
     @router.get("/tools/{name}/raw")
     def get_tool_raw(name: str) -> dict[str, str]:
-        return _read_text(_tool_path(name))
+        return _read_text(_tool_file(name))
 
     @router.put("/tools/{name}/raw")
     def update_tool_raw(name: str, payload: RawContent) -> dict[str, Any]:
-        return _write_text(_tool_path(name), payload.content)
+        return _write_text(_tool_file(name), payload.content)
 
     @router.post("/tools")
     def create_tool(payload: NodeCreate) -> dict[str, Any]:
         p = _safe_path(workspace_root / "tools", payload.id, ".py")
-        # 子目录里已经有同名工具时新建一个平级文件，注册表只会认其中一个。
-        if p.exists() or any(name == payload.id for name, *_rest in _external_tools()):
+        # 重名的新文件建了也没用：注册表只认其中一个，内置工具还会直接盖掉外部同名。
+        if p.exists() or any(entry.name == payload.id for entry in _catalog()):
             raise HTTPException(status_code=409, detail="Tool already exists")
         return _write_text(p, payload.content)
 
     @router.delete("/tools/{name}")
     def delete_tool(name: str) -> dict[str, Any]:
-        p = _tool_path(name)
-        if p.exists():
-            p.unlink()
+        p = _tool_file(name)
+        if not p.exists():
+            raise HTTPException(status_code=404, detail="Tool not found")
+        p.unlink()
         return {"ok": True}
 
     # ----- MCP Clients -----
@@ -784,20 +764,10 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         p = workspace_root / "data" / "mcp_clients.yaml"
         return _write_text(p, payload.content)
 
-    # ----- All tool names (builtin + external) -----
+    # ----- All tool names -----
     @router.get("/all-tool-names")
     def all_tool_names() -> list[str]:
-        from toolbox.builtins import RESERVED_TOOL_NAMES
-        from toolbox.registry import extract_tool_spec, iter_external_tool_files
-
-        # Also include tools registered but not in _RESERVED (like cancel_active_tasks)
-        names = set(RESERVED_TOOL_NAMES) | {'cancel_active_tasks'}
-        # 用 registry 那份扫描规则：这里少认一个工具，界面上就永远勾不到它。
-        for f in iter_external_tool_files(workspace_root / "tools"):
-            spec, _ = extract_tool_spec(f)
-            if spec and isinstance(spec.get("name"), str):
-                names.add(spec["name"])
-        return sorted(names)
+        return tool_names(workspace_root)
 
     # ----- Effective tools -----
     @router.get("/nodes/{node_id}/effective-tools")
@@ -807,7 +777,6 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         勾了不等于能用：名字可能根本不存在，生图渠道没配 model 会在构建工具表时
         被摘掉，而外部脚本除非自己声明 guard，否则服务端策略那一页管不到它。
         """
-        from toolbox.builtins import RESERVED_TOOL_NAMES
         from toolbox.registry import extract_tool_spec, iter_external_tool_files
 
         for nodes_dir in (workspace_root / "engine" / "system_nodes", workspace_root / "config" / "nodes"):
@@ -833,7 +802,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
             if spec and isinstance(spec.get("name"), str):
                 external[spec["name"]] = isinstance(spec.get("guard"), dict)
 
-        builtin = set(RESERVED_TOOL_NAMES) | {"cancel_active_tasks"}
+        known = {entry.name for entry in _catalog()}
         try:
             from engine.builtin.image_gen_gating import disabled_image_tools
             gated = disabled_image_tools(workspace_root)
@@ -845,7 +814,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
             is_external = name in external
             rows.append({
                 "name": name,
-                "registered": is_external or name in builtin,
+                "registered": name in known,
                 "external": is_external,
                 # 内置工具走不走 request_guard 得看源码，这里不猜；只有外部脚本
                 # 能从 SPEC.guard 得到确定答案。None = 不下结论。

@@ -264,8 +264,13 @@ export interface AdminNode extends NodeDef {
   skills?: unknown;
 }
 
+export type ToolSource = 'builtin' | 'plugin' | 'external';
+
 export interface AdminTool {
   name: string;
+  source: ToolSource;
+  /** 只有外部脚本工具有源码文件，内置和插件工具打不开编辑器。 */
+  editable: boolean;
   file?: string;
   description?: string;
   input_schema?: Record<string, unknown>;

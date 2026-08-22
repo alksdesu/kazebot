@@ -410,6 +410,8 @@ export const ToolsSettingsRightPanel = () => {
     setToolScriptLoaded(false);
     setToolMessage('');
     if (!tool) return () => { cancelled = true; };
+    // 内置和插件工具没有源码文件，请求只会换回一句 409。
+    if (!tool.editable) return () => { cancelled = true; };
     if (!adminToken) {
       setToolMessage('缺少管理员令牌，无法加载工具脚本。');
       return () => { cancelled = true; };
@@ -489,6 +491,12 @@ export const ToolsSettingsRightPanel = () => {
               <p className="mt-1 text-[var(--duties-secondary)]">{tool.description || '无描述'}</p>
             </div>
             <JsonBlock value={tool.input_schema || {}} />
+            {!tool.editable ? (
+              <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-xs leading-5 text-[var(--duties-secondary)]">
+                {tool.source === 'plugin' ? '插件' : '内置'}工具的实现跟着源码走，改它要改仓库代码。
+                这里能做的只有决定哪些节点可以调用它，以及调用要不要审批。
+              </p>
+            ) : (
             <div className="space-y-2 text-xs leading-5">
               <h3 className="mb-2 font-mono text-[0.65rem] font-semibold text-[var(--duties-tertiary)]">Python 脚本编辑</h3>
               {/* [2026-06-02] Add the requested raw Python editor below schema details.
@@ -510,6 +518,7 @@ export const ToolsSettingsRightPanel = () => {
               </div>
               {toolMessage && <p className="text-[var(--duties-tertiary)]">{toolMessage}</p>}
             </div>
+            )}
           </div>
         ) : (
           <p className="text-xs leading-5 text-[var(--duties-secondary)]">选择一个工具后，这里会显示 input_schema 文档。</p>

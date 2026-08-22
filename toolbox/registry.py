@@ -381,7 +381,7 @@ def _make_script_tool(
 
 
 class ToolRegistry:
-    def __init__(self, *, workspace_root: Path, tools_dir: Path) -> None:
+    def __init__(self, *, workspace_root: Path, tools_dir: Path, load_external: bool = True) -> None:
         self.workspace_root = workspace_root
         self.tools_dir = tools_dir
 
@@ -392,7 +392,10 @@ class ToolRegistry:
         self._builtin_specs = dict(self._tool_specs)
         self._builtin_funcs = dict(self._tool_funcs)
 
-        self.reload()
+        # 只想读内置工具元数据的调用方（管理接口）跳过这一步：reload 会 mkdir、
+        # touch tools/__init__.py 并改 sys.path，一个 GET 不该留下这些痕迹。
+        if load_external:
+            self.reload()
 
     def register_builtin_tool(self, name: str, description: str, input_schema: dict[str, Any], func: ToolFunc) -> None:
         """Register one builtin tool declared by a built-in plugin."""
@@ -796,6 +799,10 @@ class ToolRegistry:
 
     def list_specs(self) -> list[dict[str, Any]]:
         return list(self._tool_specs.values())
+
+    def builtin_specs(self) -> list[dict[str, Any]]:
+        """内置工具的 spec 快照。外部脚本工具不在内，reload 也冲不掉。"""
+        return list(self._builtin_specs.values())
 
     def get_spec(self, name: str) -> dict[str, Any] | None:
         """按名称获取单个工具的 spec，不存在返回 None。"""

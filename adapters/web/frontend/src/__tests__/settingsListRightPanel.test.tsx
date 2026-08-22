@@ -69,7 +69,7 @@ describe('settings list pages open the right panel on selection', () => {
       const url = String(input);
       if (url.endsWith('/admin/config/all-tool-names')) return jsonResponse(['tool_alpha']);
       return jsonResponse([
-        { name: 'tool_alpha', description: '测试工具', input_schema: { type: 'object' }, timeout_sec: 30, has_spec: true },
+        { name: 'tool_alpha', source: 'external', editable: true, description: '测试工具', input_schema: { type: 'object' }, timeout_sec: 30, has_spec: true },
       ]);
     }));
 
