@@ -58,6 +58,16 @@ describe('IBM Plex Mono', () => {
     expect(css).toMatch(/--font-mono:\s*["']IBM Plex Mono["']/);
   }, 30000);
 
+  // Plex 没有中文字形，中文全靠后面这条栈接住。截短过一次：少了 Consolas，
+  // Windows 上直接掉到泛型 monospace，整个界面的中文换了字体和字号。
+  // 在 macOS 上看不出来 —— 那边 Menlo 就接住了。
+  it('keeps the whole fallback stack behind it', () => {
+    const stack = stylesheet.match(/--font-mono:\s*([^;]+);/)?.[1].replace(/\s+/g, ' ') ?? '';
+    for (const family of ['Menlo', 'Monaco', 'Consolas', 'Liberation Mono', 'Courier New', 'monospace']) {
+      expect(stack).toContain(family);
+    }
+  });
+
   // 光有 font-family 声明说明不了什么：@import 可能在构建时被解析掉，
   // 留下一个没有 @font-face 的字体栈和一次无声的系统回退。
   it('ships one face per weight through the CSS build', async () => {

@@ -32,6 +32,7 @@ import { KeyboardReturnW400 } from '@material-symbols-svg/react/icons/keyboard-r
 import { MenuW400 } from '@material-symbols-svg/react/icons/menu';
 import { MenuBookW400 } from '@material-symbols-svg/react/icons/menu-book';
 import { ModelTrainingW400 } from '@material-symbols-svg/react/icons/model-training';
+import { MonitorHeartW400 } from '@material-symbols-svg/react/icons/monitor-heart';
 import { OpenInNewW400 } from '@material-symbols-svg/react/icons/open-in-new';
 import { PaletteW400 } from '@material-symbols-svg/react/icons/palette';
 import { PendingW400 } from '@material-symbols-svg/react/icons/pending';
@@ -78,6 +79,7 @@ const ICON_MAP: Record<string, SvgIcon> = {
   menu: MenuW400,
   menu_book: MenuBookW400,
   model_training: ModelTrainingW400,
+  monitor_heart: MonitorHeartW400,
   open_in_new: OpenInNewW400,
   palette: PaletteW400,
   pending: PendingW400,
@@ -108,11 +110,23 @@ interface IconProps {
 export const Icon = ({ name, size = 20, className = '' }: IconProps) => {
   const SvgComponent = ICON_MAP[name];
   if (!SvgComponent) {
-    // [2026-06-02] Preserve the previous text fallback for unknown icon names.
-    // Why: dynamic tool data can provide icon strings before ICON_MAP is updated.
-    // How: render readable text at the requested size instead of failing the component tree.
-    // Purpose: the interface degrades visibly and keeps the missing icon easy to diagnose.
-    return <span className={className} style={{ fontSize: size, lineHeight: 1, verticalAlign: 'middle' }}>{name}</span>;
+    // 认不出的名字（工具数据可以自带图标名）。原样把名字吐出来会撑破图标那一格，
+    // 跟旁边的文字叠在一起 —— 缺个图标是小事，把导航压花了是大事。
+    // 名字挂在 title 上，鼠标移上去仍然查得到是哪个缺了。
+    return (
+      <span
+        aria-hidden="true"
+        className={className}
+        style={{
+          display: 'inline-block', width: size, height: size, overflow: 'hidden',
+          fontSize: size * 0.5, lineHeight: `${size}px`, textAlign: 'center',
+          verticalAlign: 'middle', opacity: 0.4,
+        }}
+        title={name}
+      >
+        {name.slice(0, 2)}
+      </span>
+    );
   }
 
   return <SvgComponent className={className} width={size} height={size} style={{ verticalAlign: 'middle' }} />;

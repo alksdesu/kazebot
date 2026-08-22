@@ -24,15 +24,21 @@ describe('Material Symbols SVG icon system', () => {
     expect(icon).not.toHaveTextContent('menu');
   });
 
-  it('falls back to readable text for unknown icon names', () => {
-    // [2026-06-02] Why: some icon names are data-driven and can arrive before ICON_MAP is updated.
-    // How: verify the fallback remains a sized text span rather than a broken SVG import.
-    // Purpose: missing icons are visible to users and easy for maintainers to identify.
-    const { getByText } = render(<Icon name="unknown_symbol" size={18} className="text-red-600" />);
-    const fallback = getByText('unknown_symbol');
+  it('falls back within the icon slot for unknown names', () => {
+    // 图标名可以来自工具数据，赶在 ICON_MAP 更新之前到达。缺一个图标是小事，
+    // 但把整个名字按 size 吐出来会撑破那一格，跟旁边的导航文字叠在一起。
+    const { container } = render(<Icon name="unknown_symbol" size={18} className="text-red-600" />);
+    const fallback = container.firstElementChild as HTMLElement;
 
     expect(fallback).toHaveClass('text-red-600');
-    expect(fallback).toHaveStyle({ fontSize: '18px', verticalAlign: 'middle', lineHeight: '1' });
+    expect(fallback).toHaveStyle({ width: '18px', height: '18px', overflow: 'hidden' });
+    expect(fallback.textContent!.length).toBeLessThanOrEqual(2);
+  });
+
+  it('keeps the missing name findable', () => {
+    // 名字不显示了，但排查的人还得知道是哪个缺了。
+    const { container } = render(<Icon name="unknown_symbol" />);
+    expect(container.firstElementChild).toHaveAttribute('title', 'unknown_symbol');
   });
 
   it('stores Material Symbol names in the settings tab registry', () => {

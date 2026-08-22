@@ -8,9 +8,12 @@
 @import '@fontsource/ibm-plex-mono/latin-500.css';
 @import '@fontsource/ibm-plex-mono/latin-600.css';
 
-/* 界面里到处是 QQ 号、模型名、密钥尾号，要逐字看。Plex 的零带斜杠，0/O 和 1/l 分得开。 */
+/* 界面里到处是 QQ 号、模型名、密钥尾号，要逐字看。Plex 的零带斜杠，0/O 和 1/l 分得开。
+   Plex 之后必须原样接回 Tailwind 那条默认栈：中文在 Plex 里没有字形，会逐字回退到
+   后面去，少一个 Consolas 就落到泛型 monospace，字号字形全交给浏览器默认值。 */
 @theme {
-  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    'Liberation Mono', 'Courier New', monospace;
 }
 
 :root {
