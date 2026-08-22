@@ -59,6 +59,14 @@ ReadWritePaths=$DATA_ROOT
 Environment=CLONOTH_INSTANCES_FILE=$DATA_ROOT/instances.yaml
 EOF
 
+# bot 进程也要能开表情包库。工作区里那个 data/stickers 只是软链，
+# 而 systemd 按真实路径判权限，不放开共享目录它就打不开库文件。
+install -d -m 0755 /etc/systemd/system/kazebot-qq.service.d
+cat >/etc/systemd/system/kazebot-qq.service.d/10-stickers.conf <<EOF
+[Service]
+ReadWritePaths=$DATA_ROOT/stickers
+EOF
+
 systemctl daemon-reload
 
 echo "==> 把主实例登记进清单"

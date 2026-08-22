@@ -27,6 +27,9 @@ TimeoutStopSec=30
 # Agent 能执行任意命令，所以边界靠内核而不是正则黑名单
 ProtectSystem=strict
 ReadWritePaths=/opt/kazebot-data/%i
+# 表情包库是几个号共用的一份，工作区里那个 data/stickers 只是软链；
+# systemd 按真实路径判权限，不放开共享目录进程就打不开库文件。
+ReadWritePaths=/opt/kazebot-data/stickers
 ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes
