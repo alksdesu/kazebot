@@ -120,6 +120,8 @@ class StickerTagger:
         self._task: asyncio.Task[None] | None = None
         self._attempts: dict[str, int] = {}
         self._last_call = 0.0
+        # 渠道没配好时每轮都喊一遍就把日志刷没了，只在状态变化时说。
+        self._last_channel_error = ""
 
     def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -166,8 +168,12 @@ class StickerTagger:
 
         vision = resolve_vision_channel(root=self.workspace_root)
         if not vision.usable:
-            logger.warning("表情包打标停用：%s", vision.error or "看图渠道没配好")
+            reason = vision.error or "看图渠道没配好"
+            if reason != self._last_channel_error:
+                logger.warning("表情包打标停用：%s", reason)
+                self._last_channel_error = reason
             return 0
+        self._last_channel_error = ""
 
         done = 0
         for row in pending:

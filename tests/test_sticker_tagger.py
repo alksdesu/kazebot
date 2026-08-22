@@ -239,3 +239,44 @@ class _FakeChannel:
 
     def resolve_vision_channel(self, **_kwargs):
         return self._vision
+
+
+@pytest.mark.asyncio
+async def test_channel_problems_are_logged_once_not_every_sweep(
+    bench, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    # 打标每分钟醒一次，渠道没配好时每轮都喊一遍会把日志刷没。
+    _seed(bench)
+    broken = _Vision()
+    broken.usable = False
+    broken.error = "没配 key"
+    monkeypatch.setitem(sys.modules, "tools._channel", _FakeChannel(broken))
+
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            await bench.tagger._sweep(bench.holder["config"])
+
+    assert len([r for r in caplog.records if "打标停用" in r.getMessage()]) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_warning_comes_back_after_the_channel_recovers(
+    bench, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _seed(bench)
+    broken = _Vision()
+    broken.usable = False
+    broken.error = "没配 key"
+    monkeypatch.setitem(sys.modules, "tools._channel", _FakeChannel(broken))
+    monkeypatch.setattr(bench.tagger, "_describe", lambda *_a, **_k: _async(["表情包", "猫"]))
+
+    with caplog.at_level("WARNING"):
+        await bench.tagger._sweep(bench.holder["config"])
+        monkeypatch.setitem(sys.modules, "tools._channel", _FakeChannel(_Vision()))
+        await bench.tagger._sweep(bench.holder["config"])
+        # 上一轮把队列清空了，而队列空时压根不解析渠道，得再给一张才谈得上重新报错。
+        _seed(bench, "b" * 64)
+        monkeypatch.setitem(sys.modules, "tools._channel", _FakeChannel(broken))
+        await bench.tagger._sweep(bench.holder["config"])
+
+    assert len([r for r in caplog.records if "打标停用" in r.getMessage()]) == 2
