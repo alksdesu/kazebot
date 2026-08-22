@@ -15,6 +15,18 @@
 
 软链那四个目录不能省：`workspace_root` 既用来找 `data/`，也用来找 `tools/`、`engine/system_nodes/` 和前端 `dist`。
 
+## 已有单实例部署：第一个号留在原地
+
+不必把现役的号搬进 `kazebot-data/`。序号 0 的端口和 URL 前缀本来就等同于单实例部署，所以让它继续拿 `/opt/kazebot` 当工作区即可，加号时只要在它的 `.env` 里补一行：
+
+```bash
+CLONOTH_INSTANCES_FILE=/opt/kazebot-data/instances.yaml
+```
+
+两个号读同一份清单，切换器就认得彼此。
+
+搬反而有代价：NapCat 容器 bind mount 了 `/opt/kazebot/data/attachments`，而 docker 不支持给已存在的容器改挂载。目录搬走后容器暂时还能用（`mv` 不换 inode），但它下次重启就会挂在一个不存在的路径上，届时只能重建容器。
+
 ## 端口
 
 按序号推导，序号 0 就是单实例部署原有的那一组。
