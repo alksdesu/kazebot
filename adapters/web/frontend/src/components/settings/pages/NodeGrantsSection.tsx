@@ -392,7 +392,8 @@ export const NodeGrantsSection = () => {
         getNodes(adminToken),
         getAllToolNames(adminToken),
       ]);
-      setNodes(nodeList);
+      // 模板和示例文件派发不到，摆在授权页里只会让人配一份永远不生效的权限。
+      setNodes(nodeList.filter((node) => node.active !== false));
       setTools(toolNames);
       setMessage('');
     } catch (error) {

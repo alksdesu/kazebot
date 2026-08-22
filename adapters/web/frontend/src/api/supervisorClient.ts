@@ -262,6 +262,10 @@ export interface ActiveTask {
 export interface AdminNode extends NodeDef {
   tool_access?: unknown;
   skills?: unknown;
+  /** false = 模板或示例文件，不会被派发到。 */
+  active?: boolean;
+  /** yaml 里写的 id，且和文件名不一致。engine 认文件名，这个字段改了不换节点。 */
+  declared_id?: string;
 }
 
 export type ToolSource = 'builtin' | 'plugin' | 'external';

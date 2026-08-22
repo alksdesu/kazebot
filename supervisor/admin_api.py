@@ -239,8 +239,15 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     # ----- Nodes -----
     @router.get("/nodes")
     def list_nodes() -> list[dict[str, Any]]:
-        # 系统节点目录分离：扫描 engine/system_nodes/ 和 config/nodes/ 两个目录，
-        # engine 内建目录优先，同 id 节点只保留首次出现的。
+        """节点列表。id 一律取文件名。
+
+        engine 的 load_node 是拿 node_id 直接拼 {node_id}.yaml 去找文件的，yaml 里那个
+        id 字段它根本不读。这里以前用 id 字段去重，于是 qq.orchestrator.example.yaml
+        把同名的 qq.orchestrator.yaml 顶掉了：界面显示示例文件的内容，写回却按文件名
+        落到真文件上——读一份、写另一份。
+        """
+        # 系统节点目录分离：engine/system_nodes/ 优先，同名时用户目录那份不再列出，
+        # 和 load_node 的取舍顺序一致。
         dirs = [
             workspace_root / "engine" / "system_nodes",
             workspace_root / "config" / "nodes",
@@ -250,19 +257,24 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         for nodes_dir in dirs:
             if not nodes_dir.exists():
                 continue
-            for f in nodes_dir.glob("*.yaml"):
-                data = _read_yaml(f)
-                nid = data.get("id", f.stem)
+            for f in sorted(nodes_dir.glob("*.yaml")):
+                nid = f.stem
                 if nid in seen_ids:
                     continue
                 seen_ids.add(nid)
+                data = _read_yaml(f)
                 ta_raw = data.get("tool_access", {})
                 if isinstance(ta_raw, str):
                     ta_raw = {"mode": ta_raw}
                 elif not isinstance(ta_raw, dict):
                     ta_raw = {"mode": "none"}
+                declared = str(data.get("id") or "").strip()
                 res.append({
                     "id": nid,
+                    # 模板和示例不会被派发到，列出来只是为了能编辑，别混进要配置的节点里。
+                    "active": not (nid.startswith("_") or ".example" in nid),
+                    # yaml 里写的 id。和文件名不一致时它是个摆设，改了也不会换节点。
+                    "declared_id": declared if declared and declared != nid else "",
                     "name": data.get("name", ""),
                     "type": data.get("type", ""),
                     "model": data.get("model", ""),
@@ -273,15 +285,29 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 })
         return res
 
+    def _node_file(node_id: str, *, for_write: bool = False) -> Path:
+        """节点 id 对应的文件，取舍顺序和 engine 的 load_node 一样。
+
+        写系统节点要挡住：落到 config/nodes/ 下的同名文件永远不会被加载，
+        改完看着成功，实际什么也没变。
+        """
+        sys_path = _safe_path(workspace_root / "engine" / "system_nodes", node_id, ".yaml")
+        if sys_path.exists():
+            if for_write:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{node_id} 是系统节点，跟着代码仓库走，不能从这里改",
+                )
+            return sys_path
+        return _safe_path(workspace_root / "config" / "nodes", node_id, ".yaml")
+
     @router.get("/nodes/{node_id}/raw")
     def get_node_raw(node_id: str) -> dict[str, str]:
-        p = _safe_path(workspace_root / "config" / "nodes", node_id, ".yaml")
-        return _read_text(p)
+        return _read_text(_node_file(node_id))
 
     @router.put("/nodes/{node_id}/raw")
     def update_node_raw(node_id: str, payload: RawContent) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "config" / "nodes", node_id, ".yaml")
-        return _write_text(p, payload.content)
+        return _write_text(_node_file(node_id, for_write=True), payload.content)
 
     @router.post("/nodes")
     def create_node(payload: NodeCreate) -> dict[str, Any]:
@@ -292,9 +318,10 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     @router.delete("/nodes/{node_id}")
     def delete_node(node_id: str) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "config" / "nodes", node_id, ".yaml")
-        if p.exists():
-            p.unlink()
+        p = _node_file(node_id, for_write=True)
+        if not p.exists():
+            raise HTTPException(status_code=404, detail="Node not found")
+        p.unlink()
         return {"ok": True}
 
     # ----- Node files: YAML nodes and Markdown fragments under config/nodes/ -----
@@ -779,11 +806,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         """
         from toolbox.registry import extract_tool_spec, iter_external_tool_files
 
-        for nodes_dir in (workspace_root / "engine" / "system_nodes", workspace_root / "config" / "nodes"):
-            path = _safe_path(nodes_dir, node_id, ".yaml")
-            if path.exists():
-                break
-        else:
+        path = _node_file(node_id)
+        if not path.exists():
             raise HTTPException(status_code=404, detail="Node not found")
 
         data = _read_yaml(path)

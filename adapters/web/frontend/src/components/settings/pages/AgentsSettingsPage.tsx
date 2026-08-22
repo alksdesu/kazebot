@@ -102,7 +102,20 @@ export const AgentsSettingsPage = () => {
           <div className="max-h-[34rem] space-y-2 overflow-y-auto">
             {nodes.map((node) => (
               <button className={`w-full border p-3 text-left ${selectedNode?.id === node.id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={node.id} onClick={() => { setSelectedNode(node); setMessage(''); setRightPanelOpen(true); }} type="button">
-                <p className="font-mono text-xs font-semibold">{node.id}</p>
+                <p className="flex flex-wrap items-center gap-1.5 font-mono text-xs font-semibold">
+                  {node.id}
+                  {node.active === false && (
+                    <span className="border border-[var(--duties-border)] px-1.5 py-0.5 text-[0.55rem] font-normal text-[var(--duties-secondary)]">
+                      模板，派发不到
+                    </span>
+                  )}
+                </p>
+                {node.declared_id && (
+                  // engine 拿 node_id 直接拼文件名找文件，yaml 里这个 id 它不读。
+                  <p className="mt-1 text-xs text-[var(--duties-danger)]">
+                    文件里写着 id: {node.declared_id}，但节点认的是文件名，改那一行不会换节点
+                  </p>
+                )}
                 <p className="mt-1 text-xs text-[var(--duties-secondary)]">{node.name || '未命名'} · {node.type || '未知类型'} · {describeEnvRef(node.model || '') || '未设置模型'}</p>
                 {node.description && <p className="mt-1 line-clamp-2 text-xs leading-5 text-[var(--duties-secondary)]">{node.description}</p>}
               </button>
