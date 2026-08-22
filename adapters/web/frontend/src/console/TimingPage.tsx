@@ -1,6 +1,6 @@
 // 开口时机。七个信号里的三态那几项留空表示跟随旧的 group_mode 推导，界面上要说清。
 import { Audition } from './Audition';
-import { Block, Footnote, Grid, Option } from './components';
+import { Block, Desc, Footnote, Grid, Loose, Option } from './components';
 import { useLiveValue } from './consoleStore';
 import {
   BoolOption,
@@ -11,6 +11,8 @@ import {
   TristateOption,
 } from './fields';
 import { WordList } from './WordList';
+
+const CODE = 'bg-[var(--duties-muted)] px-1 py-px font-mono text-[0.65rem]';
 
 export const TimingPage = () => {
   const legacyMode = useLiveValue<string>('group_trigger', 'mention_only').toLowerCase();
@@ -78,18 +80,19 @@ export const TimingPage = () => {
             <PercentField configKey="random_probability" label="每条消息" />
           </BoolOption>
         </Grid>
-        <div className="qc-loose">
+        <Loose>
           <WordList
             configKey="trigger_prefixes"
             empty="没有前缀，前缀触发不会命中"
             label="触发前缀"
             placeholder="输入一个前缀，回车添加"
+            spacing="loose"
           />
-          <p className="qc-footnote">
-            前缀同时用于剥离正文，但 <code>/</code> 与 <code>／</code> 例外 ——
-            <code>/draw</code> 这类命令要求字面斜杠，剥掉会失配。
-          </p>
-        </div>
+          <Footnote>
+            前缀同时用于剥离正文，但 <code className={CODE}>/</code> 与 <code className={CODE}>／</code> 例外 ——
+            <code className={CODE}>/draw</code> 这类命令要求字面斜杠，剥掉会失配。
+          </Footnote>
+        </Loose>
       </Block>
 
       <Block hint="前面全不命中时才问模型" title="接话意愿判断">
@@ -103,9 +106,7 @@ export const TimingPage = () => {
             <NumberField configKey="llm_intent_context_messages" label="带上最近" unit="条" />
           </BoolOption>
           <Option checked disabled name="并发上限" onChange={() => undefined}>
-            <p className="qc-opt-desc">
-              判定会占住 engine worker，占满了真实对话就得排队。
-            </p>
+            <Desc>判定会占住 engine worker，占满了真实对话就得排队。</Desc>
             <NumberField label="同时最多" configKey="llm_intent_max_inflight" unit="个" />
             <NumberField
               label="超时"
@@ -120,7 +121,7 @@ export const TimingPage = () => {
       <Block hint="命中之后仍可能不说话" title="冷却">
         <Grid>
           <Option checked disabled name="发言间隔" onChange={() => undefined}>
-            <p className="qc-opt-desc">刚说过话的群里先歇一会儿。0 表示不限制。</p>
+            <Desc>刚说过话的群里先歇一会儿。0 表示不限制。</Desc>
             <NumberField label="每群" configKey="cooldown_group_sec" unit="秒" />
             <NumberField label="每人" configKey="cooldown_user_sec" unit="秒" />
           </Option>

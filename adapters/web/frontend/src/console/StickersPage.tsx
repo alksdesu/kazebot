@@ -16,13 +16,40 @@ import {
   type StickerState,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
-import { Block, Empty, Footnote, Grid, Option, SaveBar } from './components';
+import {
+  Block,
+  Button,
+  Check,
+  Chip,
+  Desc,
+  Empty,
+  Facts,
+  Footnote,
+  Grid,
+  Input,
+  Option,
+  Panel,
+  Segmented,
+} from './components';
 import { BoolOption, ChoiceField, NumberField, SubOption } from './fields';
 import { sizeText } from './format';
 import { IdList } from './IdList';
 import { VisionChannelBlock } from './VisionChannelBlock';
 
 const PAGE_SIZE = 60;
+
+const META = 'text-[0.65rem] text-[var(--duties-tertiary)]';
+
+const ACTS = 'flex flex-wrap gap-1';
+
+const CHAN_ROW = 'mt-1.5 flex items-center gap-2.5';
+const CHAN_LABEL = 'flex-none basis-[3em] text-xs text-[var(--duties-secondary)]';
+const CHAN_BODY = 'flex min-w-0 flex-1 items-center gap-2';
+
+// 文件选择框拿 ref 清值，函数组件的 Input 传不进 ref，只能自己披皮。
+const FILE_PICKER =
+  'min-w-0 flex-1 border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1'
+  + ' font-mono text-xs text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]';
 
 const STATE_TABS: ReadonlyArray<readonly [StickerState, string]> = [
   ['pending', '待审'],
@@ -186,82 +213,88 @@ const LibraryBlock = () => {
   const to = offset + items.length;
 
   const card = (row: Sticker) => (
-    <figure className="qc-stk" key={row.sha256}>
+    <figure
+      className="m-0 flex flex-col gap-1.5 border border-[var(--duties-border)] bg-[var(--duties-panel)] p-2"
+      key={row.sha256}
+    >
+      {/* 表情包长宽参差，定高加 contain 才对得成网格；底色衬出透明图的边界。 */}
       <img
         alt={row.name || row.sha256.slice(0, 8)}
-        className="qc-stk-img"
+        className="h-[7.25rem] w-full bg-[var(--duties-muted)] object-contain"
         loading="lazy"
         src={stickerImageHref(row.sha256, adminToken)}
       />
-      <figcaption className="qc-stk-cap">
-        <span className="qc-stk-name">{row.name || '未命名'}</span>
-        <span className="qc-stk-meta">
+      <figcaption className="flex min-w-0 flex-col gap-1">
+        <span className="truncate text-xs font-medium">{row.name || '未命名'}</span>
+        <span className={META}>
           {row.width}×{row.height} · {sizeText(row.size)}
           {row.animated && ' · 动图'}
           {row.sent_count > 0 && ` · 发过 ${row.sent_count} 次`}
         </span>
         <span
-          className={`qc-stk-flag${row.caption_state === 'failed' ? ' qc-stk-flag-halt' : ''}`}
+          className={`self-start border px-1.5 text-[0.65rem] ${
+            row.caption_state === 'failed'
+              ? 'border-[var(--duties-danger)] text-[var(--duties-danger)]'
+              : 'border-[var(--duties-border)] text-[var(--duties-secondary)]'
+          }`}
           title={row.caption_error}
         >
           {CAPTION_TEXT[row.caption_state]}
         </span>
 
         {editing === row.sha256 ? (
-          <div className="qc-stk-edit">
-            <input
-              className="qc-inp qc-inp-wide"
+          <div className="flex flex-col gap-1.5">
+            <Input
               onChange={(event) => setDraft({ ...draft, name: event.target.value })}
               placeholder="名字，模型靠它点图"
               value={draft.name}
+              width="wide"
             />
-            <input
-              className="qc-inp qc-inp-wide"
+            <Input
               onChange={(event) => setDraft({ ...draft, tags: event.target.value })}
               placeholder="人工标签，逗号分隔"
               value={draft.tags}
+              width="wide"
             />
-            <label className="qc-check">
-              <input
-                checked={draft.override}
-                onChange={(event) => setDraft({ ...draft, override: event.target.checked })}
-                type="checkbox"
-              />
-              <span>人工覆盖自动标签</span>
-            </label>
-            <div className="qc-stk-acts">
-              <button className="qc-btn" disabled={busy} onClick={() => void saveEdit(row)} type="button">
+            <Check
+              checked={draft.override}
+              onChange={(checked) => setDraft({ ...draft, override: checked })}
+            >
+              人工覆盖自动标签
+            </Check>
+            <div className={ACTS}>
+              <Button disabled={busy} onClick={() => void saveEdit(row)} size="sm">
                 保存
-              </button>
-              <button className="qc-btn qc-btn-quiet" onClick={() => setEditing('')} type="button">
+              </Button>
+              <Button onClick={() => setEditing('')} size="sm" tone="quiet">
                 取消
-              </button>
+              </Button>
             </div>
           </div>
         ) : (
           <>
-            <div className="qc-chips qc-stk-tags">
+            <div className="flex flex-wrap gap-1.5">
               {row.tags.length === 0
-                ? <span className="qc-chip-empty">还没有标签</span>
-                : row.tags.map((word) => <span className="qc-chip" key={word}>{word}</span>)}
+                ? <span className="text-xs text-[var(--duties-secondary)]">还没有标签</span>
+                : row.tags.map((word) => <Chip key={word}>{word}</Chip>)}
             </div>
-            <div className="qc-stk-acts">
-              <button className="qc-btn qc-btn-quiet" onClick={() => openEditor(row)} type="button">
+            <div className={ACTS}>
+              <Button onClick={() => openEditor(row)} size="sm" tone="quiet">
                 编辑
-              </button>
+              </Button>
               {row.state === 'pending' && (
-                <button className="qc-btn" disabled={busy} onClick={() => void accept(row)} type="button">
+                <Button disabled={busy} onClick={() => void accept(row)} size="sm">
                   转正
-                </button>
+                </Button>
               )}
               {row.state !== 'discarded' && (
-                <button className="qc-btn qc-btn-quiet" disabled={busy} onClick={() => discard(row)} type="button">
+                <Button disabled={busy} onClick={() => discard(row)} size="sm" tone="quiet">
                   丢弃
-                </button>
+                </Button>
               )}
-              <button className="qc-btn qc-btn-danger" disabled={busy} onClick={() => forget(row)} type="button">
+              <Button disabled={busy} onClick={() => forget(row)} size="sm" tone="danger">
                 删除
-              </button>
+              </Button>
             </div>
           </>
         )}
@@ -272,150 +305,119 @@ const LibraryBlock = () => {
   return (
     <>
       <Block hint="待审的转正之后模型才挑得到；丢弃会记住哈希，彻底删不会" title="图库">
-        <p className="qc-facts">
+        <Facts>
           在库 {counts.library} 张，其中 {counts.usable} 张打过标能用 ·
           待审 {counts.pending} 张 · 已弃 {counts.discarded} 张 ·
           还有 {counts.awaiting_caption} 张没打标
-        </p>
+        </Facts>
 
-        <div className="qc-stk-bar">
-          <div className="qc-grants" role="group">
-            {STATE_TABS.map(([key, label]) => (
-              <button
-                aria-pressed={key === tab}
-                className={`qc-grant${key === tab ? ' qc-grant-on' : ''}`}
-                key={key}
-                onClick={() => { setTab(key); setOffset(0); setEditing(''); }}
-                type="button"
-              >
-                {label} {counts[key]}
-              </button>
-            ))}
-          </div>
-          <input
-            className="qc-inp"
+        <div className="my-3 flex flex-wrap items-center gap-2">
+          <Segmented
+            choices={STATE_TABS.map(([key, label]) => [key, `${label} ${counts[key]}`] as const)}
+            onPick={(key) => { setTab(key); setOffset(0); setEditing(''); }}
+            value={tab}
+          />
+          <Input
             onChange={(event) => setTyped(event.target.value)}
             placeholder="搜名字或标签"
             value={typed}
+            width="flex"
           />
-          <span className="qc-bar-spacer" />
-          <label className="qc-check">
-            <input
-              checked={onlyFailed}
-              onChange={(event) => setOnlyFailed(event.target.checked)}
-              type="checkbox"
-            />
-            <span>只重试失败的</span>
-          </label>
-          <button className="qc-btn qc-btn-quiet" disabled={busy} onClick={recaption} type="button">
+          <span className="flex-1" />
+          <Check checked={onlyFailed} onChange={setOnlyFailed}>只重试失败的</Check>
+          <Button disabled={busy} onClick={recaption} tone="quiet">
             重新打标
-          </button>
+          </Button>
         </div>
 
         {items.length === 0 ? (
           <Empty>{search ? '没有匹配的图。' : '这一档还是空的。'}</Empty>
         ) : (
-          <div className="qc-stk-grid">{items.map(card)}</div>
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(11rem,1fr))] gap-2.5">
+            {items.map(card)}
+          </div>
         )}
 
         {total > PAGE_SIZE && (
-          <div className="qc-stk-page">
-            <span className="qc-stk-meta">第 {from}–{to} 张，共 {total} 张</span>
-            <span className="qc-bar-spacer" />
-            <button
-              className="qc-btn qc-btn-quiet"
+          <div className="mt-3 flex items-center gap-2">
+            <span className={META}>第 {from}–{to} 张，共 {total} 张</span>
+            <span className="flex-1" />
+            <Button
               disabled={offset === 0}
               onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
-              type="button"
+              tone="quiet"
             >
               上一页
-            </button>
-            <button
-              className="qc-btn qc-btn-quiet"
+            </Button>
+            <Button
               disabled={to >= total}
               onClick={() => setOffset(offset + PAGE_SIZE)}
-              type="button"
+              tone="quiet"
             >
               下一页
-            </button>
+            </Button>
           </div>
         )}
         {note && <Footnote>{note}</Footnote>}
       </Block>
 
       <Block hint="上传与导入立刻落盘，不用点顶部的应用" title="添加">
-        <div className="qc-panel">
-          <div className="qc-chan-row">
-            <span className="qc-chan-label">文件</span>
-            <div className="qc-chan-body">
+        <Panel>
+          <div className={CHAN_ROW}>
+            <span className={CHAN_LABEL}>文件</span>
+            <div className={CHAN_BODY}>
               <input
                 accept="image/*"
-                className="qc-inp"
+                className={FILE_PICKER}
                 onChange={(event) => setFile(event.target.files?.[0] || null)}
                 ref={filePicker}
                 type="file"
               />
-              <button
-                className="qc-btn"
+              <Button
+                className="flex-none"
                 disabled={busy || !file}
                 onClick={() => void upload()}
-                type="button"
               >
                 上传
-              </button>
+              </Button>
             </div>
           </div>
-          <div className="qc-chan-row">
-            <span className="qc-chan-label">名字</span>
-            <div className="qc-chan-body">
-              <input
-                className="qc-inp"
+          <div className={CHAN_ROW}>
+            <span className={CHAN_LABEL}>名字</span>
+            <div className={CHAN_BODY}>
+              <Input
                 onChange={(event) => setUploadName(event.target.value)}
                 placeholder="留空就用文件名"
                 value={uploadName}
+                width="flex"
               />
-              <label className="qc-check">
-                <input
-                  checked={uploadAccept}
-                  onChange={(event) => setUploadAccept(event.target.checked)}
-                  type="checkbox"
-                />
-                <span>直接入库</span>
-              </label>
+              <Check checked={uploadAccept} onChange={setUploadAccept}>直接入库</Check>
             </div>
           </div>
 
-          <div className="qc-chan-row">
-            <span className="qc-chan-label">目录</span>
-            <div className="qc-chan-body">
-              <input
-                className="qc-inp"
+          <div className={CHAN_ROW}>
+            <span className={CHAN_LABEL}>目录</span>
+            <div className={CHAN_BODY}>
+              <Input
                 onChange={(event) => setImportPath(event.target.value)}
                 placeholder="工作区里的相对路径，例如 data/stickers-inbox"
                 value={importPath}
+                width="flex"
               />
-              <label className="qc-check">
-                <input
-                  checked={importAccept}
-                  onChange={(event) => setImportAccept(event.target.checked)}
-                  type="checkbox"
-                />
-                <span>直接入库</span>
-              </label>
-              <button
-                className="qc-btn"
+              <Check checked={importAccept} onChange={setImportAccept}>直接入库</Check>
+              <Button
+                className="flex-none"
                 disabled={busy || !importPath.trim()}
                 onClick={() => void importDir()}
-                type="button"
               >
                 导入
-              </button>
+              </Button>
             </div>
           </div>
-          <p className="qc-facts">
+          <Facts>
             目录必须在工作区内，会连子目录一起扫。单张超过 8 MB 或认不出格式的会被跳过。
-          </p>
-        </div>
+          </Facts>
+        </Panel>
       </Block>
     </>
   );
@@ -429,9 +431,9 @@ const CollectBlock = () => (
         desc="把群里刷过的表情包攒进图库。"
         label="收集表情包"
       >
-        <p className="qc-opt-desc">
+        <Desc>
           严格只收 QQ 标了表情包的，宽松再放行看着不像截图的，全收连群友随手发的照片都要。
-        </p>
+        </Desc>
         <ChoiceField
           choices={STRATEGY_CHOICES}
           configKey="sticker_strategy"
@@ -448,14 +450,14 @@ const CollectBlock = () => (
       </BoolOption>
 
       <Option checked disabled name="容量" onChange={() => undefined}>
-        <p className="qc-opt-desc">待审池满了就不再收新的；图库超出上限时最旧的先出局。</p>
+        <Desc>待审池满了就不再收新的；图库超出上限时最旧的先出局。</Desc>
         <NumberField configKey="sticker_pending_limit" label="待审池" step={10} unit="张" />
         <NumberField configKey="sticker_library_limit" label="图库" step={50} unit="张" />
         <NumberField configKey="sticker_pending_ttl_days" label="待审保留" unit="天" />
       </Option>
 
       <Option checked disabled name="发图" onChange={() => undefined}>
-        <p className="qc-opt-desc">候选给多了是 token 炸弹，给少了模型挑不出合适的。</p>
+        <Desc>候选给多了是 token 炸弹，给少了模型挑不出合适的。</Desc>
         <NumberField configKey="sticker_prompt_limit" label="每轮候选" unit="张" />
         <NumberField configKey="sticker_repeat_window_sec" label="同图间隔" step={60} unit="秒" />
       </Option>

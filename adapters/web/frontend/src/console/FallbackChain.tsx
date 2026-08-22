@@ -17,7 +17,7 @@ import {
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { ChannelOptions, wireOf } from './channelFields';
-import { Block, Empty, SaveBar } from './components';
+import { Block, Button, Check, Desc, Empty, Facts, Input, Item, Panel, SaveBar, Segmented, Select } from './components';
 import { OptionRow, shownFromValue, valueFromShown, visibleSpecs } from './optionFields';
 
 /** 编辑态。api_key 单独存：空串表示不改，不是清空。 */
@@ -69,6 +69,8 @@ const sameChain = (a: Draft[], b: FallbackEntryPublic[]): boolean => (
   === JSON.stringify(b.map((entry) => ({ ...toPayload(toDraft(entry, 0)), _origin: undefined })))
 );
 
+const HEAD = 'flex items-center gap-2';
+
 const Row = ({
   draft, index, total, catalog, channels, wires, onChange, onMove, onRemove,
 }: {
@@ -99,74 +101,60 @@ const Row = ({
   const tuned = Object.keys(draft.options || {}).length;
 
   return (
-    <li className="qc-cap">
-      <div className="qc-cap-head">
-        <span className="qc-cap-name">{index + 1}</span>
-        <select
+    <Item>
+      <div className={HEAD}>
+        <span className="font-medium">{index + 1}</span>
+        <Select
           aria-label="渠道"
-          className="qc-inp"
           onChange={(event) => onChange({ ...draft, provider: event.target.value, options: {} })}
           value={draft.provider}
         >
           <ChannelOptions channels={channels} current={draft.provider} wires={wires} />
-        </select>
-        <input
+        </Select>
+        <Input
           aria-label="模型"
-          className="qc-inp"
           onChange={(event) => onChange({ ...draft, model_raw: event.target.value, model: event.target.value })}
           placeholder="留空 = 继承同名渠道"
           value={draft.model_raw}
         />
-        <span className="qc-bar-spacer" />
-        <button className="qc-btn qc-btn-quiet" disabled={index === 0} onClick={() => onMove(-1)} type="button">
-          上移
-        </button>
-        <button
-          className="qc-btn qc-btn-quiet"
-          disabled={index === total - 1}
-          onClick={() => onMove(1)}
-          type="button"
-        >
-          下移
-        </button>
-        <button className="qc-btn qc-btn-halt" onClick={onRemove} type="button">删除</button>
+        <span className="flex-1" />
+        <Button disabled={index === 0} onClick={() => onMove(-1)} tone="quiet">上移</Button>
+        <Button disabled={index === total - 1} onClick={() => onMove(1)} tone="quiet">下移</Button>
+        <Button onClick={onRemove} tone="halt">删除</Button>
       </div>
 
-      <div className="qc-cap-head">
-        <input
+      <div className={HEAD}>
+        <Input
           aria-label="地址"
-          className="qc-inp qc-inp-wide"
           onChange={(event) => onChange({ ...draft, base_url_raw: event.target.value, base_url: event.target.value })}
           placeholder="留空 = 继承同名渠道的地址"
           value={draft.base_url_raw}
+          width="wide"
         />
-        <input
+        <Input
           aria-label="密钥"
-          className="qc-inp"
           onChange={(event) => onChange({ ...draft, apiKeyInput: event.target.value })}
           placeholder={draft.api_key_present ? '已设置，留空不改' : '留空 = 继承同名渠道'}
           type="password"
           value={draft.apiKeyInput}
         />
-        <label className="qc-check">
-          <input
-            checked={draft.supports_vision}
-            onChange={(event) => onChange({ ...draft, supports_vision: event.target.checked })}
-            type="checkbox"
-          />
-          <span>支持图片</span>
-        </label>
-        <span className="qc-bar-spacer" />
-        <button className="qc-btn qc-btn-quiet" onClick={() => setOpen(!open)} type="button">
+        <Check
+          checked={draft.supports_vision}
+          onChange={(checked) => onChange({ ...draft, supports_vision: checked })}
+        >
+          支持图片
+        </Check>
+        <span className="flex-1" />
+        <Button onClick={() => setOpen(!open)} tone="quiet">
           参数{tuned ? ` · ${tuned}` : ''}
-        </button>
+        </Button>
       </div>
 
       {open && (
         specs.length === 0
-          ? <p className="qc-facts">这个渠道没有可调参数。</p>
+          ? <Facts>这个渠道没有可调参数。</Facts>
           : (
-            <div className="qc-panel">
+            <Panel>
               {visibleSpecs(specs, shownOf).map((spec) => (
                 <OptionRow
                   key={spec.key}
@@ -175,14 +163,14 @@ const Row = ({
                   value={shownOf(spec.key)}
                 />
               ))}
-            </div>
+            </Panel>
           )
       )}
 
       {!draft.supports_vision && (
-        <p className="qc-cap-desc">带图的请求会跳过这一条 —— 没勾「支持图片」就当它读不了图。</p>
+        <Desc indent={false}>带图的请求会跳过这一条 —— 没勾「支持图片」就当它读不了图。</Desc>
       )}
-    </li>
+    </Item>
   );
 };
 
@@ -204,30 +192,24 @@ const NodeChainMode = ({
     ['禁用', disabledNow, onDisable],
   ];
   return (
-    <div className="qc-panel">
-      <div className="qc-grants" role="group">
-        {modes.map(([label, on, act]) => (
-          <button
-            aria-pressed={on}
-            className={`qc-grant${on ? ' qc-grant-on' : ''}`}
-            disabled={busy}
-            key={label}
-            onClick={() => void act(nodeId)}
-            type="button"
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+    <Panel>
+      {/* fieldset 是为了把 busy 一次性传到三个档位上，disabled 只有原生元素继承得了。 */}
+      <fieldset className={busy ? 'opacity-50' : ''} disabled={busy}>
+        <Segmented
+          choices={modes.map(([label]) => [label, label] as const)}
+          onPick={(label) => void modes.find(([name]) => name === label)?.[2](nodeId)}
+          value={modes.find(([, on]) => on)?.[0] ?? ''}
+        />
+      </fieldset>
       {!custom && (
-        <p className="qc-facts">
+        <Facts>
           现在跟随全局链（{globalCount} 条）。选「自定义」才会给这个节点单独配。
-        </p>
+        </Facts>
       )}
       {disabledNow && (
-        <p className="qc-facts">已禁用：这个节点的调用失败后直接报错，不再试别的渠道。</p>
+        <Facts>已禁用：这个节点的调用失败后直接报错，不再试别的渠道。</Facts>
       )}
-    </div>
+    </Panel>
   );
 };
 
@@ -328,7 +310,7 @@ export const FallbackChain = ({
           {drafts.length === 0 ? (
             <Empty>还没有备选渠道。主渠道失败时任务直接报错。</Empty>
           ) : (
-            <ul className="qc-caps">
+            <ul className="overflow-hidden border border-[var(--duties-border)]">
               {drafts.map((draft, index) => (
                 <Row
                   catalog={catalog}
@@ -345,14 +327,10 @@ export const FallbackChain = ({
               ))}
             </ul>
           )}
-          <div className="qc-cap-head">
-            <button
-              className="qc-btn qc-btn-quiet"
-              onClick={() => setDrafts([...drafts, blankDraft(defaultProvider)])}
-              type="button"
-            >
+          <div className={HEAD}>
+            <Button onClick={() => setDrafts([...drafts, blankDraft(defaultProvider)])} tone="quiet">
               添加备选
-            </button>
+            </Button>
           </div>
           <SaveBar
             busy={busy}

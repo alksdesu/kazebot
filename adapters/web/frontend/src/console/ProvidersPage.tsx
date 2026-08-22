@@ -2,7 +2,7 @@
 //
 // 读到的是脱敏视图，密钥只回来一个星号串，所以留空表示不改而不是清空。
 // 新建的渠道先留在本地，存盘时才建块 —— 后端认不出空块，先建会让它从列表里消失。
-import { useEffect, useId, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState, type ReactNode } from 'react';
 
 import {
   channelChoices,
@@ -19,7 +19,7 @@ import {
 import { useSettingsStore } from '../store/settingsStore';
 import { mergeModelChoices, modelsFromProviders } from '../utils/modelChoices';
 import { EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields';
-import { Block, Empty, Footnote, SaveBar } from './components';
+import { Block, Button, Empty, ErrorText, Facts, Footnote, Input, Item, ItemTitle, SaveBar, Select } from './components';
 import { SystemSlots } from './SystemSlots';
 import { VisionRouting } from './VisionRouting';
 
@@ -82,6 +82,15 @@ const changed = (draft: Draft, stored: Draft | undefined): boolean => (
   || draft.apiKeyInput.trim() !== ''
 );
 
+const HEAD = 'flex items-center gap-2';
+
+/** 名字旁边那枚绿标：块名、以及「在用」。 */
+const Scope = ({ children }: { children: ReactNode }) => (
+  <span className="flex-none border border-[var(--duties-live)] px-1.5 text-[0.65rem] text-[var(--duties-live)]">
+    {children}
+  </span>
+);
+
 const Row = ({
   draft, stored, active, busy, choices, listId, profiles, families, onChange, onActivate, onRemove,
 }: {
@@ -99,57 +108,55 @@ const Row = ({
   onActivate: () => void;
   onRemove: () => void;
 }) => (
-  <li className="qc-cap">
-    <div className="qc-cap-head">
-      <span className="qc-cap-name">{draft.label || draft.name}</span>
-      {draft.label && <span className="qc-cap-scope">{draft.name}</span>}
+  <Item>
+    <div className={HEAD}>
+      <ItemTitle>{draft.label || draft.name}</ItemTitle>
+      {draft.label && <Scope>{draft.name}</Scope>}
       {active
-        ? <span className="qc-cap-scope">在用</span>
+        ? <Scope>在用</Scope>
         : (
-          <button
-            className="qc-btn qc-btn-quiet"
+          <Button
             disabled={busy || draft.fresh}
             onClick={onActivate}
             title={draft.fresh ? '先保存这个渠道，再设为活跃' : undefined}
-            type="button"
+            tone="quiet"
           >
             设为活跃
-          </button>
+          </Button>
         )}
-      <span className="qc-bar-spacer" />
-      <button
-        className="qc-btn qc-btn-halt"
+      <span className="flex-1" />
+      <Button
         disabled={busy || active}
         onClick={onRemove}
         title={active ? '正在用的渠道不能删' : undefined}
-        type="button"
+        tone="halt"
       >
         删除
-      </button>
+      </Button>
     </div>
 
     <FieldRow label="格式">
-      <select
+      <Select
         aria-label={draft.name + ' 线格式'}
-        className="qc-inp"
         onChange={(event) => onChange({ ...draft, type: event.target.value, typeExplicit: true })}
         value={draft.type}
+        width="flex"
       >
         {!families.includes(draft.type) && <option value={draft.type}>{draft.type}</option>}
         {families.map((family) => <option key={family} value={family}>{family}</option>)}
-      </select>
+      </Select>
     </FieldRow>
     {!draft.typeExplicit && !draft.fresh && (
-      <p className="qc-facts">没写 type，按渠道名当成了 {draft.type}。改这一项会把它明确写进配置。</p>
+      <Facts>没写 type，按渠道名当成了 {draft.type}。改这一项会把它明确写进配置。</Facts>
     )}
 
     <FieldRow label="备注">
-      <input
+      <Input
         aria-label={draft.name + ' 备注'}
-        className="qc-inp"
         onChange={(event) => onChange({ ...draft, label: event.target.value })}
         placeholder="给自己看的名字，留空就显示渠道名"
         value={draft.label}
+        width="flex"
       />
     </FieldRow>
 
@@ -166,55 +173,55 @@ const Row = ({
     <EnvHint raw={draft.model} resolved={draft.modelResolved} savedRaw={stored?.model ?? ''} />
 
     <FieldRow label="地址">
-      <input
+      <Input
         aria-label={draft.name + ' 地址'}
-        className="qc-inp"
         onChange={(event) => onChange({ ...draft, baseUrl: event.target.value })}
         placeholder="留空用这家的默认地址"
         value={draft.baseUrl}
+        width="flex"
       />
     </FieldRow>
     <EnvHint raw={draft.baseUrl} resolved={draft.baseUrlResolved} savedRaw={stored?.baseUrl ?? ''} />
     <HostMismatchHint baseUrl={draft.baseUrl} profiles={profiles} provider={draft.type} />
 
     <FieldRow label="密钥">
-      <input
+      <Input
         aria-label={draft.name + ' 密钥'}
-        className="qc-inp"
         onChange={(event) => onChange({ ...draft, apiKeyInput: event.target.value })}
         placeholder={draft.keyPresent ? '已设置 ' + draft.keyRedacted + '，留空不改' : '未设置'}
         type="password"
         value={draft.apiKeyInput}
+        width="flex"
       />
     </FieldRow>
 
     <FieldRow label="带图">
-      <select
+      <Select
         aria-label={draft.name + ' 读图能力'}
-        className="qc-inp"
         id={listId + '-vision'}
         onChange={(event) => onChange({ ...draft, vision: event.target.value as Draft['vision'] })}
         value={draft.vision}
+        width="flex"
       >
         <option value="auto">
           {'跟随 ' + draft.type + ' 默认（' + (profiles?.defaultVision?.[draft.type] === false ? '看不了图' : '能看图') + '）'}
         </option>
         <option value="yes">能看图</option>
         <option value="no">看不了图</option>
-      </select>
+      </Select>
     </FieldRow>
-  </li>
+  </Item>
 );
 
 /** 写死了自己渠道的节点不会跟随全局，切换前得让人知道。 */
 const NodeOverrides = ({ nodes }: { nodes: Array<{ id: string; provider: string }> }) => {
   if (!nodes.length) return null;
   return (
-    <p className="qc-facts">
+    <Facts>
       这 {nodes.length} 个节点写死了自己的渠道，切换活跃渠道不影响它们：
       {nodes.map((node) => node.id + '（' + node.provider + '）').join('、')}。
       要改去「设置 → 节点文件」。
-    </p>
+    </Facts>
   );
 };
 
@@ -326,7 +333,7 @@ export const ProvidersPage = () => {
         {drafts.length === 0 ? (
           <Empty>还没有配置任何渠道。</Empty>
         ) : (
-          <ul className="qc-caps">
+          <ul className="overflow-hidden border border-[var(--duties-border)]">
             {drafts.map((draft, index) => (
               <Row
                 active={draft.name === data.active_provider}
@@ -357,25 +364,22 @@ export const ProvidersPage = () => {
 
         {families.length > 0 && (
           <>
-            <div className="qc-cap-head">
-              <input
+            <div className={HEAD}>
+              <Input
                 aria-label="新渠道名"
-                className="qc-inp"
                 onChange={(event) => setAddName(event.target.value)}
                 placeholder="渠道名，留空就用格式名"
                 value={addName}
               />
-              <select
+              <Select
                 aria-label="新渠道格式"
-                className="qc-inp"
                 onChange={(event) => setAddType(event.target.value)}
                 value={addType}
               >
                 <option value="">选格式…</option>
                 {families.map((name) => <option key={name} value={name}>{name}</option>)}
-              </select>
-              <button
-                className="qc-btn qc-btn-quiet"
+              </Select>
+              <Button
                 disabled={!addType || nameTaken}
                 onClick={() => {
                   setDrafts([...drafts, {
@@ -396,17 +400,17 @@ export const ProvidersPage = () => {
                   setAddName('');
                   setAddType('');
                 }}
-                type="button"
+                tone="quiet"
               >
                 添加
-              </button>
+              </Button>
             </div>
-            {nameTaken && <p className="qc-facts">已经有一个叫 {pendingName} 的渠道了，换个名字。</p>}
+            {nameTaken && <Facts>已经有一个叫 {pendingName} 的渠道了，换个名字。</Facts>}
           </>
         )}
 
         <NodeOverrides nodes={overrides} />
-        {error && <p className="qc-login-error">{error}</p>}
+        {error && <ErrorText>{error}</ErrorText>}
         <SaveBar
           busy={busy}
           dirty={dirty}

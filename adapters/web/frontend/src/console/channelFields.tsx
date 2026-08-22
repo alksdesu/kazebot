@@ -3,6 +3,20 @@ import { useMemo, useState, type ReactNode } from 'react';
 
 import { listUpstreamModels, type ChannelChoice, type ProviderProfiles } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
+import { Button, ErrorText, Input } from './components';
+
+// FieldRow 的两列尺寸。旁注靠这两个值缩进，才能和输入框左边缘对齐。
+const LABEL_COL = '3em';
+const COL_GAP = '10px';
+
+const ChanNote = ({ children }: { children: ReactNode }) => (
+  <p
+    className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]"
+    style={{ marginLeft: `calc(${LABEL_COL} + ${COL_GAP})` }}
+  >
+    {children}
+  </p>
+);
 
 /** 填的是变量引用时，别处看不到它当前指向谁。改动过就不显示：展开值配不上刚敲进去的变量名。 */
 export const EnvHint = ({
@@ -11,9 +25,9 @@ export const EnvHint = ({
   if (raw !== savedRaw || !raw || raw === resolved) return null;
   // 说的是哪个字段由位置交代：这一行就贴在那个输入框下面，且与它左对齐。
   return (
-    <p className="qc-cap-desc qc-chan-note">
+    <ChanNote>
       {resolved ? '解析为 ' + resolved : '环境变量未设置，解析为空'}
-    </p>
+    </ChanNote>
   );
 };
 
@@ -58,10 +72,10 @@ export const HostMismatchHint = ({
   const mismatch = hostMismatch(baseUrl, provider, profiles);
   if (!mismatch) return null;
   return (
-    <p className="qc-mismatch">
+    <ErrorText>
       这个地址是 {mismatch.looksLike} 的，而 {provider} 按 {mismatch.wire} 的格式发请求，会被对面拒掉。
       真要换家的话，新建一个 {mismatch.looksLike} 渠道再填。
-    </p>
+    </ErrorText>
   );
 };
 
@@ -99,9 +113,11 @@ export const ChannelOptions = ({
 };
 
 export const FieldRow = ({ label, children }: { label: string; children: ReactNode }) => (
-  <div className="qc-chan-row">
-    <span className="qc-chan-label">{label}</span>
-    <div className="qc-chan-body">{children}</div>
+  <div className="mt-1.5 flex items-center" style={{ gap: COL_GAP }}>
+    <span className="text-xs text-[var(--duties-secondary)]" style={{ flex: `0 0 ${LABEL_COL}` }}>
+      {label}
+    </span>
+    <div className="flex min-w-0 flex-1 items-center gap-2">{children}</div>
   </div>
 );
 
@@ -158,30 +174,30 @@ export const ModelField = ({
   return (
     <>
       <FieldRow label="模型">
-        <input
+        <Input
           aria-label={ariaLabel}
-          className="qc-inp"
           list={options.length ? listId : undefined}
           onChange={(event) => onChange(event.target.value)}
           placeholder="模型名"
           value={value}
+          width="flex"
         />
         {options.length > 0 && (
           <datalist id={listId}>
             {options.map((model) => <option key={model} value={model} />)}
           </datalist>
         )}
-        <button
-          className="qc-btn qc-btn-quiet"
+        <Button
+          className="flex-none"
           disabled={busy || !token}
           onClick={() => void pull()}
           title="用当前填的地址和密钥问上游要模型列表"
-          type="button"
+          tone="quiet"
         >
           {busy ? '拉取中' : '拉取'}
-        </button>
+        </Button>
       </FieldRow>
-      {note && <p className="qc-cap-desc qc-chan-note">{note}</p>}
+      {note && <ChanNote>{note}</ChanNote>}
     </>
   );
 };

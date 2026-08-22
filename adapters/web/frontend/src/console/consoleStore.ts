@@ -12,39 +12,6 @@ import {
   type QqRuntimeFacts,
 } from '../api/supervisorClient';
 
-export const CONSOLE_DOMAINS = [
-  'account', 'channels', 'timing', 'permissions', 'persona', 'providers', 'models', 'runtime', 'memory',
-  'stickers',
-] as const;
-export type ConsoleDomain = (typeof CONSOLE_DOMAINS)[number];
-
-export const DOMAIN_LABELS: Record<ConsoleDomain, string> = {
-  account: '账号',
-  channels: '信道',
-  timing: '时机',
-  permissions: '权限',
-  persona: '人格',
-  providers: '渠道',
-  models: '模型',
-  runtime: '运行',
-  memory: '记忆',
-  stickers: '表情包',
-};
-
-/** Icon 的 ICON_MAP 键名。控制台侧栏与设置侧栏的控制台展开项共用，两处图标不会走散。 */
-export const DOMAIN_ICONS: Record<ConsoleDomain, string> = {
-  account: 'smart_toy',
-  channels: 'inbox',
-  timing: 'timer',
-  permissions: 'verified_user',
-  persona: 'draft',
-  providers: 'cable',
-  models: 'tune',
-  runtime: 'settings_power',
-  memory: 'menu_book',
-  stickers: 'photo_library',
-};
-
 /** 草稿按 live_config 的键名存（如 signal_at），不是 yaml 的点分路径。
  *
  * /qq/state 的 values 就是按键名给的，paths 负责键名 → 点分路径。写 yaml 时才转换，
@@ -52,7 +19,6 @@ export const DOMAIN_ICONS: Record<ConsoleDomain, string> = {
 export type Draft = Record<string, unknown>;
 
 export interface ConsoleState {
-  domain: ConsoleDomain;
   live: QqLiveState | null;
   /** 磁盘上那份 yaml 的原文，应用时作为合并基底。 */
   raw: string;
@@ -63,7 +29,6 @@ export interface ConsoleState {
   notice: string;
   draft: Draft;
 
-  setDomain: (domain: ConsoleDomain) => void;
   refresh: (token: string) => Promise<void>;
   setDraft: (name: string, value: unknown) => void;
   discard: () => void;
@@ -129,20 +94,6 @@ export function mergeDraft(raw: string, draft: Draft, paths: Record<string, stri
   return yaml.dump(doc, DUMP_OPTIONS);
 }
 
-const initialDomain = (): ConsoleDomain => {
-  const requested = new URLSearchParams(window.location.search).get('domain');
-  return (CONSOLE_DOMAINS as readonly string[]).includes(requested || '')
-    ? (requested as ConsoleDomain)
-    : 'timing';
-};
-
-// 域是从地址栏恢复的，切了不写回去会让刷新退回默认域。
-const syncDomainQuery = (domain: ConsoleDomain): void => {
-  const params = new URLSearchParams(window.location.search);
-  params.set('domain', domain);
-  window.history.replaceState(null, '', `${window.location.pathname}?${params.toString()}${window.location.hash}`);
-};
-
 const sleep = (ms: number) => new Promise((done) => { setTimeout(done, ms); });
 
 /** 把刚写进去的值叠到 live 上。键空间与 /qq/state 的 values 一致，可以直接铺。 */
@@ -185,7 +136,6 @@ const settle = async (
 };
 
 export const useConsoleStore = create<ConsoleState>((set, get) => ({
-  domain: initialDomain(),
   live: null,
   raw: '',
   rawExists: false,
@@ -194,11 +144,6 @@ export const useConsoleStore = create<ConsoleState>((set, get) => ({
   error: '',
   notice: '',
   draft: {},
-
-  setDomain: (domain) => {
-    syncDomainQuery(domain);
-    set({ domain });
-  },
 
   refresh: async (token) => {
     set({ loading: true, error: '' });

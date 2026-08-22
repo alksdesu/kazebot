@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 
 import { getInstances, instanceConsoleHref, MOUNT, type ConsoleInstance } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
+import { Select } from './components';
 
 export const InstanceSwitch = () => {
   const token = useSettingsStore((state) => state.adminToken);
@@ -24,18 +25,18 @@ export const InstanceSwitch = () => {
   };
 
   return (
-    <label className="qc-rail-acct">
-      <span className="qc-rail-acct-cap">当前账号</span>
-      <select
+    <label className="flex items-center gap-2.5">
+      <span className="flex-none text-xs text-[var(--duties-secondary)]">当前账号</span>
+      <Select
         aria-label="切换账号"
-        className="qc-rail-acct-pick"
         onChange={(event) => go(event.target.value)}
         value={current}
+        width="alias"
       >
         {rows.map((row) => (
           <option key={row.uin} value={row.path}>{row.label}</option>
         ))}
-      </select>
+      </Select>
     </label>
   );
 };

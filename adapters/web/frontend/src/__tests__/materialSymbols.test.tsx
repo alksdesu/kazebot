@@ -60,7 +60,24 @@ describe('Material Symbols SVG icon system', () => {
       'cable',
       'schedule',
       'code',
+      'account_circle',
+      'inbox',
+      'timer',
+      'verified_user',
+      'draft',
+      'psychology',
+      'photo_library',
+      'lan',
+      'hub',
+      'model_training',
     ]);
+
+    // 注册了却没 import 过 —— ICON_MAP 落空，回退件会把名字塞进 16px 的格子里，
+    // 跟旁边的导航文字叠在一起。出过一次。
+    for (const tab of settingsTabs) {
+      const { container } = render(<Icon name={tab.icon!} />);
+      expect(container.querySelector('svg')).not.toBeNull();
+    }
 
     // [2026-06-01] Why: grep-based migration checks should not find old glyphs in
     // test source either. How: express legacy icon values with Unicode escapes instead

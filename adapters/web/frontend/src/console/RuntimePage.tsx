@@ -3,19 +3,29 @@ import { useEffect, useState } from 'react';
 
 import { checkHealth, restartEngine, type HealthState } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
-import { Block, Footnote, Grid, Option } from './components';
+import {
+  Block,
+  Button,
+  DangerPanel,
+  Desc,
+  Facts,
+  Footnote,
+  Grid,
+  List,
+  Option,
+  Panel,
+  Pip,
+  ReadOnlyRow,
+  Row,
+} from './components';
 import { useConsoleStore, useLiveValue, useRuntime } from './consoleStore';
-import { BoolOption, NumberField, ReadOnlyRow } from './fields';
-
-const Pip = ({ ok, off }: { ok: boolean; off?: boolean }) => (
-  <span aria-hidden="true" className={`qc-pip${ok ? '' : off ? ' qc-pip-idle' : ' qc-pip-halt'}`} />
-);
+import { BoolOption, NumberField } from './fields';
 
 const Link = ({ name, state, detail }: { name: string; state: string; detail: string }) => (
-  <div className="qc-link">
-    <span className="qc-link-name">{name}</span>
-    <span className="qc-link-state">{state}</span>
-    <span className="qc-link-detail">{detail}</span>
+  <div className="flex flex-wrap items-baseline gap-2.5">
+    <span className="min-w-[9em] font-mono text-xs font-medium">{name}</span>
+    <span className="font-mono text-xs">{state}</span>
+    <span className="font-mono text-[0.65rem] text-[var(--duties-tertiary)]">{detail}</span>
   </div>
 );
 
@@ -33,32 +43,32 @@ const Connections = () => {
   const supervisor = !health ? '连不上' : health.status === 'ok' ? '在线' : health.status || '在线';
 
   return (
-    <div className="qc-links">
-      <div className="qc-link-row">
-        <Pip ok={Boolean(health)} />
+    <List>
+      <Row>
+        <Pip tone={health ? 'live' : 'halt'} />
         <Link
           detail={uptime === undefined ? '' : `已运行 ${Math.floor(uptime / 60)} 分钟`}
           name="Supervisor"
           state={supervisor}
         />
-      </div>
-      <div className="qc-link-row">
-        <Pip ok={botAlive} />
+      </Row>
+      <Row>
+        <Pip tone={botAlive ? 'live' : 'halt'} />
         <Link
           detail={runtime.pid ? `pid ${runtime.pid}` : ''}
           name="QQ 适配进程"
           state={botAlive ? '在线' : live?.published ? '心跳中断' : '没在跑'}
         />
-      </div>
-      <div className="qc-link-row">
-        <Pip ok={napcat} off={!botAlive} />
+      </Row>
+      <Row>
+        <Pip tone={napcat ? 'live' : botAlive ? 'halt' : 'idle'} />
         <Link
           detail={botAlive ? '' : '适配进程没在跑，这一项无从判断'}
           name="NapCat"
           state={!botAlive ? '未知' : napcat ? '已连接' : '未连接'}
         />
-      </div>
-    </div>
+      </Row>
+    </List>
   );
 };
 
@@ -70,9 +80,9 @@ const QueueFacts = () => {
   const pending = runtime.volatile?.queue_pending ?? 0;
   if (!enabled) return null;
   return (
-    <p className="qc-facts">
+    <Facts>
       实际在跑 {running} 个 worker{running !== wanted && '，正在向配置对齐'}，队列里积压 {pending} 条。
-    </p>
+    </Facts>
   );
 };
 
@@ -81,13 +91,13 @@ const HistoryFacts = () => {
   const caps = runtime.group_history_capacities || [];
   const cached = runtime.volatile?.cached_groups ?? 0;
   const gaps = runtime.volatile?.history_gap_groups ?? 0;
-  if (!cached) return <p className="qc-facts">还没有群的历史被缓存。</p>;
+  if (!cached) return <Facts>还没有群的历史被缓存。</Facts>;
   return (
-    <p className="qc-facts">
+    <Facts>
       已缓存 {cached} 个群
       {caps.length === 1 ? `，容量 ${caps[0]} 条` : caps.length > 1 ? `，容量还在对齐（${caps.join(' / ')}）` : ''}。
       {gaps > 0 && `${gaps} 个群有历史被缓存上限挤掉，模型那边会看到「此前 N 条未包含」的说明。`}
-    </p>
+    </Facts>
   );
 };
 
@@ -96,11 +106,13 @@ const BridgeFacts = () => {
   const enabled = useLiveValue<boolean>('enable_forward_bridge', true);
   if (!enabled) return null;
   return (
-    <p className="qc-facts">
+    <Facts>
       {runtime.forward_bridge_running ? '正在监听' : '尚未启动'}
-      {runtime.forward_bridge_endpoint && <> <code>{runtime.forward_bridge_endpoint}</code></>}
+      {runtime.forward_bridge_endpoint && (
+        <> <code className="font-mono text-[0.65rem]">{runtime.forward_bridge_endpoint}</code></>
+      )}
       ，令牌{runtime.forward_bridge_token_set ? '已设置' : '未设置'}。
-    </p>
+    </Facts>
   );
 };
 
@@ -108,7 +120,7 @@ const Environment = () => {
   const runtime = useRuntime();
   const env = runtime.environment || {};
   return (
-    <div className="qc-panel">
+    <Panel>
       <ReadOnlyRow name="Supervisor 地址" value={env.supervisor_url || ''} />
       <ReadOnlyRow name="工作目录" value={env.workspace || ''} />
       <ReadOnlyRow
@@ -120,7 +132,7 @@ const Environment = () => {
         name="转发桥令牌"
         value={runtime.forward_bridge_token_set ? '已设置' : '未设置'}
       />
-    </div>
+    </Panel>
   );
 };
 
@@ -142,29 +154,23 @@ const RestartEngine = () => {
   };
 
   return (
-    <div className="qc-danger">
+    <DangerPanel>
       <div>
-        <p className="qc-danger-name">重启 engine worker</p>
-        <p className="qc-opt-desc">
+        <p className="font-medium">重启 engine worker</p>
+        <Desc indent={false}>
           只重启跑模型的 worker，调度器和这个界面不受影响。正在跑的任务会被中断，QQ 那边表现为没有回音。
-        </p>
+        </Desc>
       </div>
       {armed ? (
-        <span className="qc-danger-confirm">
-          <button className="qc-btn qc-btn-quiet" onClick={() => setArmed(false)} type="button">
-            算了
-          </button>
-          <button className="qc-btn qc-btn-halt" onClick={() => void fire()} type="button">
-            确认重启
-          </button>
+        <span className="inline-flex gap-2">
+          <Button onClick={() => setArmed(false)} tone="quiet">算了</Button>
+          <Button onClick={() => void fire()} tone="halt">确认重启</Button>
         </span>
       ) : (
-        <button className="qc-btn qc-btn-quiet" onClick={() => setArmed(true)} type="button">
-          重启
-        </button>
+        <Button onClick={() => setArmed(true)} tone="danger">重启</Button>
       )}
-      {said && <p className="qc-facts">{said}</p>}
-    </div>
+      {said && <Facts className="basis-full">{said}</Facts>}
+    </DangerPanel>
   );
 };
 
@@ -198,13 +204,13 @@ export const RuntimePage = () => (
     <Block hint="给模型看的上下文，不是 QQ 的聊天记录" title="群历史">
       <Grid>
         <Option checked disabled name="缓存条数" onChange={() => undefined}>
-          <p className="qc-opt-desc">每个群留多少条最近消息。0 表示不缓存。</p>
+          <Desc>每个群留多少条最近消息。0 表示不缓存。</Desc>
           <NumberField configKey="group_history_max" label="每群" unit="条" />
         </Option>
         <Option checked disabled name="未送达余量" onChange={() => undefined}>
-          <p className="qc-opt-desc">
+          <Desc>
             还没送到 Engine 的行可以多占几倍位置，硬上限 = 缓存条数 × 本值。1.0 表示不给余量，满了就丢。
-          </p>
+          </Desc>
           <NumberField configKey="group_history_undelivered_ratio" label="上限倍数" step={0.5} unit="倍" />
         </Option>
       </Grid>

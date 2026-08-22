@@ -22,13 +22,19 @@ import {
   type QqQuickLoginTarget,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
-import { Block, Empty } from './components';
+import { Block, Button, Empty, Facts, Input, LinkButton, Panel, Pre } from './components';
+import { InstanceSwitch } from './InstanceSwitch';
 
 type Stage = 'idle' | 'restarting' | 'scanning';
 
 const POLL_MS = 3000;
 // 容器重启到 WebUI 能应答通常十几秒，给足余量再放弃。
 const RESTART_TIMEOUT_MS = 180000;
+
+const ROW = 'mt-1.5 flex items-center gap-2.5';
+const LABEL = 'w-9 flex-none text-xs text-[var(--duties-secondary)]';
+const BODY = 'flex min-w-0 flex-1 items-center gap-2';
+const DESC = 'text-xs text-[var(--duties-secondary)]';
 
 const say = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
@@ -244,12 +250,12 @@ export const AccountPage = () => {
   if (account && !account.configured) {
     return (
       <Block hint="supervisor 拿不到 NapCat 的 WebUI token" title="机器人账号">
-        <div className="qc-panel">
-          <p className="qc-facts">
-            请把 NapCat 容器里 <code>/app/napcat/config/webui.json</code> 的 token 写进工作区
-            <code>.env</code> 的 <code>NAPCAT_WEBUI_TOKEN</code>，或让模型用 manage_secret 设置。
-          </p>
-        </div>
+        <Panel>
+          <Facts>
+            请把 NapCat 容器里 <code className="text-[0.65rem]">/app/napcat/config/webui.json</code> 的 token 写进工作区
+            <code className="text-[0.65rem]">.env</code> 的 <code className="text-[0.65rem]">NAPCAT_WEBUI_TOKEN</code>，或让模型用 manage_secret 设置。
+          </Facts>
+        </Panel>
       </Block>
     );
   }
@@ -257,20 +263,20 @@ export const AccountPage = () => {
   return (
     <>
       <Block hint="这一个实例现在用哪个号在说话" title="机器人账号">
-        <div className="qc-panel">
+        <Panel>
           {account ? (
             <>
-              <div className="qc-chan-row">
-                <span className="qc-chan-label">账号</span>
-                <div className="qc-chan-body">
-                  <code>{account.uin || '未登录'}</code>
-                  {account.nick && <span className="qc-cap-desc">{account.nick}</span>}
+              <div className={ROW}>
+                <span className={LABEL}>账号</span>
+                <div className={BODY}>
+                  <code className="text-xs">{account.uin || '未登录'}</code>
+                  {account.nick && <span className={DESC}>{account.nick}</span>}
                 </div>
               </div>
-              <div className="qc-chan-row">
-                <span className="qc-chan-label">状态</span>
-                <div className="qc-chan-body">
-                  <span className="qc-cap-desc">
+              <div className={ROW}>
+                <span className={LABEL}>状态</span>
+                <div className={BODY}>
+                  <span className={DESC}>
                     {account.reachable === false
                       ? 'NapCat 没应答，容器可能正在重启'
                       : account.is_login
@@ -282,94 +288,103 @@ export const AccountPage = () => {
               </div>
             </>
           ) : (
-            <p className="qc-facts">{note || '正在读取…'}</p>
+            <Facts>{note || '正在读取…'}</Facts>
           )}
-          <div className="qc-chan-row">
-            <span className="qc-chan-label" />
-            <div className="qc-chan-body">
-              <button
-                className="qc-btn qc-btn-quiet"
+          <div className={ROW}>
+            <span className={LABEL} />
+            <div className={BODY}>
+              <Button
+                className="flex-none"
                 disabled={busy || stage !== 'idle'}
                 onClick={() => void startRelogin()}
-                type="button"
+                tone="quiet"
               >
                 换个号登录
-              </button>
-              <span className="qc-cap-desc">会重启 NapCat，bot 期间不可用</span>
+              </Button>
+              <span className={DESC}>会重启 NapCat，bot 期间不可用</span>
             </div>
           </div>
-        </div>
+        </Panel>
       </Block>
 
       {(stage !== 'idle' || qrImage) && (
         <Block hint="用要登录的那个 QQ 扫" title="扫码登录">
-          <div className="qc-panel">
+          <Panel>
             {qrImage ? (
               <>
                 <img alt="QQ 登录二维码" height={240} src={qrImage} width={240} />
-                <p className="qc-facts">扫完不用管，这一页会自己确认登录结果。</p>
+                <Facts>扫完不用管，这一页会自己确认登录结果。</Facts>
               </>
             ) : (
-              <p className="qc-facts">{note || '等 NapCat 起来…'}</p>
+              <Facts>{note || '等 NapCat 起来…'}</Facts>
             )}
-            <div className="qc-chan-row">
-              <span className="qc-chan-label" />
-              <div className="qc-chan-body">
-                <button className="qc-btn qc-btn-quiet" disabled={busy} onClick={() => void refreshQrcode()} type="button">
+            <div className={ROW}>
+              <span className={LABEL} />
+              <div className={BODY}>
+                <Button className="flex-none" disabled={busy} onClick={() => void refreshQrcode()} tone="quiet">
                   刷新二维码
-                </button>
-                <button className="qc-btn qc-btn-quiet" disabled={busy} onClick={() => { setStage('idle'); setQrImage(''); setNote(''); }} type="button">
+                </Button>
+                <Button
+                  className="flex-none"
+                  disabled={busy}
+                  onClick={() => { setStage('idle'); setQrImage(''); setNote(''); }}
+                  tone="quiet"
+                >
                   停止等待
-                </button>
+                </Button>
               </div>
             </div>
-          </div>
+          </Panel>
         </Block>
       )}
 
       <Block hint="换这一个实例登录的号，免扫码。数据不跟着走" title="快速切换">
-        <div className="qc-panel">
+        <Panel>
           {account?.quick_login?.length ? (
             account.quick_login.map((target) => {
               const current = target.uin === account.uin;
               const usable = target.available !== false;
               const elsewhere = ownedByAnotherInstance(target.uin, instances);
               return (
-                <div className="qc-chan-row" key={target.uin}>
-                  <span className="qc-acct-who">
+                <div className={ROW} key={target.uin}>
+                  <span className="flex min-w-0 flex-none items-center gap-2">
                     {target.avatar && (
                       <img
                         alt=""
-                        className="qc-acct-face"
+                        className="h-7 w-7 flex-none rounded-full bg-[var(--duties-muted)] object-cover"
                         referrerPolicy="no-referrer"
                         src={target.avatar}
                       />
                     )}
-                    <span className="qc-acct-name">
-                      {target.nick && <strong>{target.nick}</strong>}
-                      <code>{target.uin}</code>
+                    <span className="flex min-w-0 flex-col">
+                      {target.nick && (
+                        <strong className="overflow-hidden text-ellipsis whitespace-nowrap text-xs font-medium">
+                          {target.nick}
+                        </strong>
+                      )}
+                      <code className={DESC}>{target.uin}</code>
                     </span>
                   </span>
-                  <div className="qc-chan-body">
+                  <div className={BODY}>
                     {elsewhere ? (
                       <>
-                        <a className="qc-btn qc-btn-quiet" href={instanceConsoleHref(elsewhere.path)}>
+                        <LinkButton className="flex-none" href={instanceConsoleHref(elsewhere.path)} tone="quiet">
                           去它的控制台
-                        </a>
-                        <span className="qc-cap-desc">这个号有自己的实例，不能从这里登</span>
+                        </LinkButton>
+                        <span className={DESC}>这个号有自己的实例，不能从这里登</span>
                       </>
                     ) : (
                       <>
-                        <button
-                          className="qc-btn qc-btn-quiet"
+                        <Button
+                          className="flex-none"
                           disabled={busy || current || !usable}
                           onClick={() => void switchTo(target)}
-                          type="button"
+                          tone="quiet"
                         >
                           {current ? '当前账号' : '切到这个号'}
-                        </button>
+                        </Button>
                         {!current && !usable && (
-                          <span className="qc-cap-desc" title={target.dead_reason || ''}>
+                          <span className={DESC} title={target.dead_reason || ''}>
                             登录态已失效，只能扫码
                           </span>
                         )}
@@ -380,47 +395,51 @@ export const AccountPage = () => {
               );
             })
           ) : (
-            <p className="qc-facts">
+            <Facts>
               没有可免扫码切换的号。一个号在这台机器上登录过之后才会出现在这里。
-            </p>
+            </Facts>
           )}
-        </div>
+        </Panel>
       </Block>
 
       <Block hint="一个号一套进程，会话、记忆、渠道、人格全部各自一份" title="多开实例">
-        <div className="qc-panel">
+        {/* 跳到另一个实例。原来长在控制台左窄轨上，那条轨随控制台一起没了。 */}
+        <InstanceSwitch />
+        <Panel>
           {instances.length === 0 ? (
-            <p className="qc-facts">
+            <Facts>
               还没启用多开。在服务器上执行一次{' '}
-              <code>sudo deploy/install_provision.sh {account?.uin || '<当前QQ号>'}</code>
+              <code className="text-[0.65rem]">sudo deploy/install_provision.sh {account?.uin || '<当前QQ号>'}</code>
               ，之后这里就能直接加号。
-            </p>
+            </Facts>
           ) : (
             instances.map((row) => (
-              <div className="qc-chan-row" key={row.uin}>
-                <span className="qc-acct-who">
-                  <span className="qc-acct-name">
-                    <strong>{row.label}</strong>
-                    <code>{row.uin}</code>
+              <div className={ROW} key={row.uin}>
+                <span className="flex min-w-0 flex-none items-center gap-2">
+                  <span className="flex min-w-0 flex-col">
+                    <strong className="overflow-hidden text-ellipsis whitespace-nowrap text-xs font-medium">
+                      {row.label}
+                    </strong>
+                    <code className={DESC}>{row.uin}</code>
                   </span>
                 </span>
-                <div className="qc-chan-body">
+                <div className={BODY}>
                   {row.current ? (
-                    <span className="qc-cap-desc">就是这一个</span>
+                    <span className={DESC}>就是这一个</span>
                   ) : (
                     <>
-                      <a className="qc-btn qc-btn-quiet" href={instanceConsoleHref(row.path)}>
+                      <LinkButton className="flex-none" href={instanceConsoleHref(row.path)} tone="quiet">
                         去它的控制台
-                      </a>
+                      </LinkButton>
                       {row.idx !== 0 && (
-                        <button
-                          className="qc-btn qc-btn-danger"
+                        <Button
+                          className="flex-none"
                           disabled={busy || (job !== null && !job.finished)}
                           onClick={() => void dropInstance(row)}
-                          type="button"
+                          tone="danger"
                         >
                           删掉
-                        </button>
+                        </Button>
                       )}
                     </>
                   )}
@@ -430,52 +449,52 @@ export const AccountPage = () => {
           )}
 
           {instances.length > 0 && (
-            <div className="qc-chan-row">
-              <span className="qc-chan-label">加号</span>
-              <div className="qc-chan-body">
-                <input
-                  className="qc-inp"
+            <div className={ROW}>
+              <span className={LABEL}>加号</span>
+              <div className={BODY}>
+                <Input
                   disabled={busy || (job !== null && !job.finished)}
                   inputMode="numeric"
                   onChange={(event) => setNewUin(event.target.value)}
                   placeholder="QQ 号"
                   value={newUin}
+                  width="flex"
                 />
-                <input
-                  className="qc-inp"
+                <Input
                   disabled={busy || (job !== null && !job.finished)}
                   onChange={(event) => setNewLabel(event.target.value)}
                   placeholder="备注，可留空"
                   value={newLabel}
+                  width="flex"
                 />
-                <button
-                  className="qc-btn qc-btn-quiet"
+                <Button
+                  className="flex-none"
                   disabled={busy || !newUin.trim() || (job !== null && !job.finished)}
                   onClick={() => void addInstance()}
-                  type="button"
+                  tone="quiet"
                 >
                   建实例
-                </button>
+                </Button>
               </div>
             </div>
           )}
 
           {job && (
             <>
-              <pre className="qc-prov-log">{job.lines.join('\n')}</pre>
+              <Pre className="mt-2.5 max-h-60">{job.lines.join('\n')}</Pre>
               {job.finished && (
-                <p className="qc-facts">
+                <Facts>
                   {job.ok
                     ? '完成了。新号要去它自己的控制台扫码登录。'
                     : `没成功：${job.detail || '看上面的日志'}`}
-                </p>
+                </Facts>
               )}
             </>
           )}
-        </div>
+        </Panel>
       </Block>
 
-      {note && account && <p className="qc-facts">{note}</p>}
+      {note && account && <Facts>{note}</Facts>}
     </>
   );
 };

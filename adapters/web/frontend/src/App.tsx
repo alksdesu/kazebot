@@ -13,16 +13,14 @@ import { useEffect } from 'react';
 import { checkHealth, resetConversation } from './api/supervisorClient';
 import { LoginPage } from './components/auth/LoginPage';
 import { AppLayout } from './components/layout';
-import { ConsoleApp } from './console/ConsoleApp';
-import { ConsoleLogin } from './console/ConsoleLogin';
 import { useChat } from './hooks/useChat';
 import { useChatStore } from './store/chatStore';
 import { useSettingsStore } from './store/settingsStore';
-import { useViewStore, type ShellViewMode } from './store/viewStore';
+import { useViewStore, type ViewMode } from './store/viewStore';
 import type { Attachment } from './types';
 import { viewRegistry, type AppViewContext } from './views/viewRegistry';
 
-const MainApp = ({ viewMode }: { viewMode: ShellViewMode }) => {
+const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
   const {
     conversations, activeConversationId, activeConversation, messages, isGenerating,
     selectConversation, createConversation, deleteConversation, renameConversation, sendMessage, cancelCurrentTask,
@@ -123,9 +121,6 @@ const MainApp = ({ viewMode }: { viewMode: ShellViewMode }) => {
 const App = () => {
   const { isAuthenticated } = useSettingsStore();
   const viewMode = useViewStore(state => state.viewMode);
-  // 控制台自带左窄轨与状态条，和 AppLayout 的三栏槽位没有交集；登录页也各用一套视觉，
-  // 但认的是同一个 token。
-  if (viewMode === 'console') return isAuthenticated ? <ConsoleApp /> : <ConsoleLogin />;
   if (!isAuthenticated) return <LoginPage />;
   return <MainApp viewMode={viewMode} />;
 };

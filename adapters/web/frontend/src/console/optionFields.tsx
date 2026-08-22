@@ -1,6 +1,7 @@
 // provider 参数的控件。清单由后端按 provider 类公布，这里只负责把一条 spec 变成一行界面。
 // 两个作用域共用：全局与节点存的是 yaml 标量文本，备选链存的是 JSON 值，靠下面两组转换对齐。
 import type { ProviderOptionSpec } from '../api/supervisorClient';
+import { Input, Segmented } from './components';
 
 /** 界面字符串 → yaml 标量写法。空串表示删掉这一行。 */
 export function toYamlScalar(spec: ProviderOptionSpec, shown: string): string {
@@ -60,39 +61,30 @@ export const placeholderOf = (spec: ProviderOptionSpec): string => (
   spec.default === undefined || spec.default === null ? '不指定' : shownFromValue(spec.default)
 );
 
+const BOOL_CHOICES: ReadonlyArray<readonly [string, string]> = [
+  ['', '不指定'],
+  ['true', '开'],
+  ['false', '关'],
+];
+
 const BoolControl = ({ value, onChange }: { value: string; onChange: (next: string) => void }) => (
-  <div className="qc-grants" role="group">
-    {[['', '不指定'], ['true', '开'], ['false', '关']].map(([option, label]) => (
-      <button
-        aria-pressed={value === option}
-        className={`qc-grant${value === option ? ' qc-grant-on' : ''}`}
-        key={option || 'unset'}
-        onClick={() => onChange(option)}
-        type="button"
-      >
-        {label}
-      </button>
-    ))}
-  </div>
+  <Segmented choices={BOOL_CHOICES} onPick={onChange} value={value} />
 );
 
 const EnumControl = ({
   spec, value, onChange,
-}: { spec: ProviderOptionSpec; value: string; onChange: (next: string) => void }) => (
-  <div className="qc-grants" role="group">
-    {(spec.choices || []).map((choice) => (
-      <button
-        aria-pressed={value === choice.value}
-        className={`qc-grant${value === choice.value ? ' qc-grant-on' : ''}`}
-        key={choice.value}
-        onClick={() => onChange(value === choice.value ? '' : choice.value)}
-        type="button"
-      >
-        {choice.label}
-      </button>
-    ))}
-  </div>
-);
+}: { spec: ProviderOptionSpec; value: string; onChange: (next: string) => void }) => {
+  const choices: ReadonlyArray<readonly [string, string]> = (spec.choices || []).map(
+    (choice) => [choice.value, choice.label] as const,
+  );
+  return (
+    <Segmented
+      choices={choices}
+      onPick={(picked) => onChange(value === picked ? '' : picked)}
+      value={value}
+    />
+  );
+};
 
 export const OptionRow = ({
   spec, value, onChange,
@@ -101,16 +93,17 @@ export const OptionRow = ({
   value: string;
   onChange: (next: string) => void;
 }) => (
-  <div className="qc-opt-row">
-    <div className="qc-cap-head">
-      <span className="qc-cap-name">{spec.label}</span>
-      <code className="qc-cap-scope">{spec.key}</code>
-      <span className="qc-bar-spacer" />
+  <div className="flex items-center gap-2.5">
+    <div className="flex items-center gap-2">
+      <span className="font-medium">{spec.label}</span>
+      <code className="border border-[var(--duties-live)] px-1.5 text-[0.65rem] text-[var(--duties-live)]">
+        {spec.key}
+      </code>
+      <span className="flex-1" />
       {spec.kind === 'bool' && <BoolControl onChange={onChange} value={value} />}
       {spec.kind === 'enum' && <EnumControl onChange={onChange} spec={spec} value={value} />}
       {(spec.kind === 'int' || spec.kind === 'float') && (
-        <input
-          className="qc-inp"
+        <Input
           inputMode="decimal"
           onBlur={(event) => onChange(clampNumber(spec, event.target.value))}
           onChange={(event) => onChange(event.target.value)}
@@ -119,14 +112,14 @@ export const OptionRow = ({
         />
       )}
       {spec.kind === 'text' && (
-        <input
-          className="qc-inp qc-inp-wide"
+        <Input
           onChange={(event) => onChange(event.target.value)}
           placeholder={placeholderOf(spec)}
           value={value}
+          width="wide"
         />
       )}
     </div>
-    {spec.desc && <p className="qc-cap-desc">{spec.desc}</p>}
+    {spec.desc && <p className="mt-1 text-xs text-[var(--duties-secondary)]">{spec.desc}</p>}
   </div>
 );

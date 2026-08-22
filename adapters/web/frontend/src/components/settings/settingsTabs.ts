@@ -5,6 +5,7 @@
 // pages from the same data source.
 import { type ComponentType } from 'react';
 
+import { QQ_PAGES, wrapQqPage } from '../../console/pages';
 import { ClientSettingsPage } from './pages/ClientSettingsPage';
 import { GeneralSettingsPage } from './pages/GeneralSettingsPage';
 import { NodeFilesSettingsPage } from './pages/NodeFilesSettingsPage';
@@ -54,7 +55,7 @@ export interface SettingsTabDefinition {
   RightPanel?: ComponentType;
 }
 
-export const settingsTabs: SettingsTabDefinition[] = ([
+const CORE_TABS = [
   { id: 'general', label: '通用', icon: 'tune', group: 'basics', order: 0, Page: GeneralSettingsPage },
   // [2026-06-01] Register browser-only preferences as a first-class settings tab.
   // Why: auto-approval and render defaults are local frontend choices, not backend
@@ -78,7 +79,20 @@ export const settingsTabs: SettingsTabDefinition[] = ([
   { id: 'advanced', label: '高级', icon: 'code', group: 'engine', order: 13, Page: AdvancedSettingsPage, RightPanel: AdvancedSettingsRightPanel },
   // 出过一次事：engine 崩了三个半小时没人发现，因为界面上没有任何地方看得到它。
   { id: 'runtime', label: '运行', icon: 'monitor_heart', group: 'engine', order: 3, Page: RuntimeSettingsPage },
-] satisfies SettingsTabDefinition[]).sort((a, b) => a.order - b.order);
+] satisfies SettingsTabDefinition[];
+
+// QQ 域的十页登记在 console/pages。渠道与模型归模型侧，其余归 bot。
+const QQ_TABS: SettingsTabDefinition[] = QQ_PAGES.map((page, index) => ({
+  id: page.id,
+  label: page.label,
+  icon: page.icon,
+  group: page.id === 'qq-providers' || page.id === 'qq-models' ? 'models' : 'qq',
+  order: 20 + index,
+  Page: wrapQqPage(page),
+}));
+
+export const settingsTabs: SettingsTabDefinition[] = [...CORE_TABS, ...QQ_TABS]
+  .sort((a, b) => a.order - b.order);
 
 export function getSettingsTab(tabId: string): SettingsTabDefinition {
   // [2026-06-01] Unknown tab ids fall back to the first registered settings page.

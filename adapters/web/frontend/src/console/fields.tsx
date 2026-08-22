@@ -1,7 +1,7 @@
 // 绑定到某个热载键的表单件。各页共用，避免同一个键在两处有两套读写规则。
 import type { ReactNode } from 'react';
 
-import { Field, Option, Sub } from './components';
+import { Field, Input, Option, Segmented, Sub } from './components';
 import { useConsoleStore, useLiveValue, useNote, useTristate } from './consoleStore';
 
 interface BoolOptionProps {
@@ -88,8 +88,7 @@ export const NumberField = ({
   const stored = useLiveValue<number>(configKey, 0);
   return (
     <Field label={label}>
-      <input
-        className="qc-inp"
+      <Input
         onChange={(event) => {
           const next = Number.parseFloat(event.target.value);
           const shown = Number.isFinite(next) ? next : 0;
@@ -100,7 +99,7 @@ export const NumberField = ({
         type="number"
         value={String(scale === 1 ? stored : stored / scale)}
       />
-      {unit && <label>{unit}</label>}
+      {unit && <label className="text-[var(--duties-secondary)]">{unit}</label>}
     </Field>
   );
 };
@@ -110,11 +109,7 @@ export const TextField = ({ configKey, label }: { configKey: string; label: stri
   const value = useLiveValue<string>(configKey, '');
   return (
     <Field label={label}>
-      <input
-        className="qc-inp qc-inp-wide"
-        onChange={(event) => setDraft(configKey, event.target.value)}
-        value={value}
-      />
+      <Input onChange={(event) => setDraft(configKey, event.target.value)} value={value} width="wide" />
     </Field>
   );
 };
@@ -125,8 +120,7 @@ export const PercentField = ({ configKey, label }: { configKey: string; label: s
   const value = useLiveValue<number>(configKey, 0);
   return (
     <Field label={label}>
-      <input
-        className="qc-inp"
+      <Input
         max={100}
         min={0}
         onChange={(event) => {
@@ -139,12 +133,12 @@ export const PercentField = ({ configKey, label }: { configKey: string; label: s
         // 0.15 * 100 会算出 15.000000000000002，定到小数点后两位再显示。
         value={String(Math.round(value * 10000) / 100)}
       />
-      <label>%</label>
+      <label className="text-[var(--duties-secondary)]">%</label>
     </Field>
   );
 };
 
-/** 固定枚举的键。横排档位而不是下拉：三四个选项摊开比点开看更快。 */
+/** 固定枚举的键。 */
 export const ChoiceField = ({
   choices,
   configKey,
@@ -160,28 +154,7 @@ export const ChoiceField = ({
   const value = useLiveValue<string>(configKey, fallback);
   return (
     <Field label={label}>
-      <div className="qc-grants" role="group">
-        {choices.map(([option, text]) => (
-          <button
-            aria-pressed={option === value}
-            className={`qc-grant${option === value ? ' qc-grant-on' : ''}`}
-            key={option}
-            onClick={() => setDraft(configKey, option)}
-            type="button"
-          >
-            {text}
-          </button>
-        ))}
-      </div>
+      <Segmented choices={choices} onPick={(next) => setDraft(configKey, next)} value={value} />
     </Field>
   );
 };
-
-/** 只读展示：改动需要重启的那几个键。 */
-export const ReadOnlyRow = ({ hint, name, value }: { hint?: string; name: string; value: string }) => (
-  <div className="qc-ro">
-    <span className="qc-ro-name">{name}</span>
-    <code className="qc-ro-value">{value || '未设置'}</code>
-    {hint && <span className="qc-ro-hint">{hint}</span>}
-  </div>
-);

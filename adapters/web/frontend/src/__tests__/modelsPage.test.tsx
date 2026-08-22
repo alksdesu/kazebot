@@ -13,10 +13,12 @@ import {
   updateNodeRaw,
   updateRuntimeRaw,
 } from '../api/supervisorClient';
-import { ConsoleApp } from '../console/ConsoleApp';
+import { SettingsPageHost } from '../components/settings/SettingsPageHost';
+import { SettingsSidebar } from '../components/settings/SettingsSidebar';
 import { useConsoleStore } from '../console/consoleStore';
 import { ModelsPage } from '../console/ModelsPage';
 import { useSettingsStore } from '../store/settingsStore';
+import { useViewStore } from '../store/viewStore';
 
 vi.mock('../api/supervisorClient', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../api/supervisorClient')>()),
@@ -171,18 +173,22 @@ describe('模型参数页', () => {
   });
 });
 
-describe('控制台外壳里的模型页', () => {
+describe('设置页外壳里的模型页', () => {
+  beforeEach(() => {
+    useConsoleStore.setState({ live: null, loading: false, draft: {} });
+    useViewStore.setState({ viewMode: 'settings', activeSettingsTab: 'qq-models' });
+    useSettingsStore.setState({ adminToken: 'admin-token', isAuthenticated: true });
+  });
+
   it('bot 没跑也能打开——这一页写的不是 qq.yaml', async () => {
     // live 为空时其它页显示「bot 还没公布生效配置」，模型页不该被这个门挡住。
-    useConsoleStore.setState({ domain: 'models', live: null, loading: false, draft: {} });
-    render(<ConsoleApp />);
+    render(<SettingsPageHost />);
     expect(await screen.findByText('思考档位')).toBeTruthy();
     expect(screen.queryByText(/还没公布生效配置/)).toBeNull();
   });
 
-  it('左轨上有「模型」这一格', () => {
-    useConsoleStore.setState({ domain: 'models', live: null, loading: false, draft: {} });
-    render(<ConsoleApp />);
+  it('侧栏上有「模型」这一格', () => {
+    render(<SettingsSidebar />);
     expect(screen.getByRole('button', { name: '模型' })).toBeTruthy();
   });
 });

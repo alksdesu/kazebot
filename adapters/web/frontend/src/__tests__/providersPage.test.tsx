@@ -81,7 +81,7 @@ const rows = () => screen.getAllByRole('listitem');
 const ready = () => screen.findAllByRole('listitem');
 // 认标题里的渠道名，不能按行内文本找：每行的格式下拉都列着全部家族名。
 const rowFor = (name: string) => rows().find(
-  (row) => row.querySelector('.qc-cap-name')?.textContent === name,
+  (row) => within(row).getByRole('heading').textContent === name,
 )!;
 const saveChain = () => fireEvent.click(screen.getByRole('button', { name: '保存渠道' }));
 

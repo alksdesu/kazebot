@@ -12,7 +12,19 @@ import {
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { mergeModelChoices, modelsFromNodes, modelsFromProviders } from '../utils/modelChoices';
-import { Block, Footnote, Grid, Option, SaveBar } from './components';
+import {
+  Block,
+  Desc,
+  ErrorText,
+  Facts,
+  Footnote,
+  Grid,
+  Input,
+  Option,
+  Panel,
+  SaveBar,
+  Textarea,
+} from './components';
 import { BoolOption, NumberField, SubOption } from './fields';
 import { WordList } from './WordList';
 import {
@@ -70,13 +82,12 @@ const Persona = () => {
   return (
     <>
       {onlyExample && (
-        <p className="qc-facts qc-halt-text">
+        <ErrorText>
           还没有 <code>_persona.md</code>，bot 现在读的是 <code>_persona.example.md</code>。
           在这里保存一次就会创建它，示例从此不再生效。
-        </p>
+        </ErrorText>
       )}
-      <textarea
-        className="qc-area"
+      <Textarea
         onChange={(event) => setText(event.target.value)}
         placeholder="写 bot 的性格、说话方式、忌讳。这段会原样拼进提示词。"
         rows={14}
@@ -150,21 +161,21 @@ const ModelChoice = () => {
 
   return (
     <>
-      <input
-        className="qc-inp qc-inp-wide"
+      <Input
         list={modelChoices.length ? modelListId : undefined}
         onChange={(event) => setModel(event.target.value)}
         placeholder="留空 = 跟随全局默认模型"
         value={model}
+        width="wide"
       />
       {modelChoices.length > 0 && (
         <datalist id={modelListId}>
           {modelChoices.map((name) => <option key={name} value={name} />)}
         </datalist>
       )}
-      <p className="qc-facts">
+      <Facts>
         任意模型 id 都能填；也可以写 <code>$ENV{'{VAR}'}</code>，从环境变量取。
-      </p>
+      </Facts>
 
       <SaveBar busy={busy} dirty={dirty} note={note} onReset={() => adopt(raw)} onSave={() => void save()} />
     </>
@@ -174,16 +185,16 @@ const ModelChoice = () => {
 export const PersonaPage = () => (
   <>
     <Block hint="拼进提示词的那段人设，改完下一条消息就生效" title="人设">
-      <div className="qc-panel">
+      <Panel>
         <Persona />
-      </div>
+      </Panel>
     </Block>
 
     <Block hint="综合入口节点用哪个模型。能调哪些工具在设置的「节点」页改节点 YAML 的 tool_access" title="模型">
-      <div className="qc-panel">
-        <p className="qc-words-label">可以调用这些工具</p>
+      <Panel>
+        <p className="mb-1.5 text-xs text-[var(--duties-secondary)]">可以调用这些工具</p>
         <ModelChoice />
-      </div>
+      </Panel>
     </Block>
 
     <Block hint="消息发出去之前的处理" title="回复格式">
@@ -206,7 +217,7 @@ export const PersonaPage = () => (
           label="去掉下划线强调"
         />
         <Option checked disabled name="长度上限" onChange={() => undefined}>
-          <p className="qc-opt-desc">超长的回复会被截断，避免被 QQ 拒收。</p>
+          <Desc>超长的回复会被截断，避免被 QQ 拒收。</Desc>
           <NumberField configKey="message_limit" label="单条消息" step={100} unit="字" />
           <NumberField configKey="history_text_limit" label="历史里每条" step={50} unit="字" />
         </Option>
@@ -216,9 +227,9 @@ export const PersonaPage = () => (
           label="合并发图"
         >
           <NumberField configKey="image_forward_merge_threshold" label="至少" unit="张才合并" />
-          <p className="qc-opt-desc">
+          <Desc>
             默认关是有原因的：合并转发会长时间占住那条唯一的反向 WS，期间发消息、贴表情全部排队。发现卡顿就关掉，即时生效。
-          </p>
+          </Desc>
         </BoolOption>
       </Grid>
     </Block>
@@ -248,13 +259,13 @@ export const PersonaPage = () => (
           <NumberField configKey="echo_max_length" label="最长" unit="字" />
           <NumberField configKey="echo_window_sec" label="时间窗" unit="秒" />
           <NumberField configKey="echo_cooldown_sec" label="跟完歇" unit="秒" />
-          <p className="qc-opt-desc">
+          <Desc>
             必须是不同的人发的，同一个人连刷不算。命令、@、回复和长文本一律不跟；表情包按图片本身比对，
             三个人发三张不同的图不会被当成复读。
-          </p>
+          </Desc>
         </BoolOption>
         <Option checked disabled name="表情提示" onChange={() => undefined}>
-          <p className="qc-opt-desc">告诉模型有哪些收藏表情可用。0 表示不告诉它。</p>
+          <Desc>告诉模型有哪些收藏表情可用。0 表示不告诉它。</Desc>
           <NumberField configKey="face_prompt_limit" label="最多列出" unit="个" />
         </Option>
       </Grid>
@@ -266,7 +277,7 @@ export const PersonaPage = () => (
           <NumberField configKey="max_images_per_turn" label="每轮最多" unit="张" />
           <NumberField configKey="image_max_bytes" label="单图上限" scale={1024 * 1024} step={1} unit="MB" />
           <NumberField configKey="image_wait_after_text_sec" label="等图窗口" step={0.5} unit="秒" />
-          <p className="qc-opt-desc">QQ 常把「文字＋图」拆成两条发过来，收到纯文本后等这么久看有没有图跟上。</p>
+          <Desc>QQ 常把「文字＋图」拆成两条发过来，收到纯文本后等这么久看有没有图跟上。</Desc>
         </BoolOption>
         <BoolOption configKey="enable_file_input" desc="读取群文件的内容。" fallback label="读文件">
           <NumberField configKey="max_files_per_turn" label="每轮最多" unit="个" />
@@ -277,7 +288,7 @@ export const PersonaPage = () => (
             label="额外放行"
             placeholder="输入一个扩展名，回车添加"
           />
-          <p className="qc-opt-desc">可执行文件与脚本类型不受这里影响，填了也不会收。</p>
+          <Desc>可执行文件与脚本类型不受这里影响，填了也不会收。</Desc>
         </BoolOption>
         <BoolOption
           configKey="enable_forward_msg_input"
@@ -291,7 +302,7 @@ export const PersonaPage = () => (
           <NumberField configKey="forward_msg_timeout_sec" label="展开超时" step={0.5} unit="秒" />
           <SubOption configKey="enable_forward_msg_media" fallback label="里面的图片和文件也收" />
           <SubOption configKey="forward_msg_expand_for_trigger" fallback label="群里靠关键词也能触发" />
-          <p className="qc-opt-desc">后一项关掉，转发消息就只有 @ 或回复才理。</p>
+          <Desc>后一项关掉，转发消息就只有 @ 或回复才理。</Desc>
         </BoolOption>
       </Grid>
     </Block>

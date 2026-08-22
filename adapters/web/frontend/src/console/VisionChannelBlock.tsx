@@ -14,7 +14,9 @@ import {
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { ChannelOptions, EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields';
-import { Block, Empty, SaveBar } from './components';
+import {
+  Block, Button, Empty, ErrorText, Facts, Input, Panel, SaveBar, Select,
+} from './components';
 
 const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');
 
@@ -114,41 +116,41 @@ export const VisionChannelBlock = () => {
   return (
     <Block hint="打标和 read_image 工具共用这一条，改完点这一块自己的保存" title="看图渠道">
       {!loaded ? <Empty>正在读取看图渠道…</Empty> : (
-        <div className="qc-panel">
-          <p className="qc-facts">
+        <Panel>
+          <Facts>
             {slot?.desc || '给看不了图的模型描述图片内容。'}
             全部留空则整条跟随主渠道，连请求格式一起跟。
-          </p>
+          </Facts>
 
           <FieldRow label="渠道">
-            <select
+            <Select
               aria-label="看图渠道类型"
-              className="qc-inp"
               onChange={(event) => setProvider(event.target.value)}
               value={provider}
+              width="flex"
             >
               <option value="">跟随主渠道{mainProvider ? `（${mainProvider}）` : ''}</option>
               <ChannelOptions channels={channels} current={provider} wires={wires} />
-            </select>
+            </Select>
           </FieldRow>
-          <p className="qc-facts">
-            决定按谁的格式发请求。地址填到哪一级也看它：OpenAI 系要带 <code>/v1</code>，
-            Claude 与 Gemini 不带。
-          </p>
+          <Facts>
+            决定按谁的格式发请求。地址填到哪一级也看它：OpenAI 系要带{' '}
+            <code className="font-mono text-[0.65rem]">/v1</code>，Claude 与 Gemini 不带。
+          </Facts>
           {wireUnstated && (
-            <p className="qc-mismatch">
+            <ErrorText>
               填了地址却没选渠道，请求按 OpenAI 格式发。中转站一般没问题，
               直连 Claude 或 Gemini 的话这里要一起选。
-            </p>
+            </ErrorText>
           )}
 
           <FieldRow label="地址">
-            <input
+            <Input
               aria-label="看图渠道地址"
-              className="qc-inp"
               onChange={(event) => setBaseUrl(event.target.value)}
               placeholder="留空 = 跟随主渠道的地址"
               value={baseUrl}
+              width="flex"
             />
           </FieldRow>
           <EnvHint raw={baseUrl} resolved={slot?.base_url || ''} savedRaw={slot?.base_url_raw || ''} />
@@ -166,35 +168,35 @@ export const VisionChannelBlock = () => {
             onChange={setModel}
           />
           <EnvHint raw={model} resolved={slot?.model || ''} savedRaw={slot?.model_raw || ''} />
-          <p className="qc-facts">模型名不跟随主渠道 —— 主渠道那个多半正是看不了图的纯文本模型。</p>
+          <Facts>模型名不跟随主渠道 —— 主渠道那个多半正是看不了图的纯文本模型。</Facts>
 
           <FieldRow label="密钥">
-            <input
+            <Input
               aria-label="看图渠道密钥"
-              className="qc-inp"
               onChange={(event) => setApiKey(event.target.value)}
               placeholder={slot?.api_key_present
                 ? `已设置 ${slot.api_key_redacted}，留空不改`
                 : '留空 = 跟随主渠道的密钥'}
               type="password"
               value={apiKey}
+              width="flex"
             />
             {slot?.api_key_present && (
-              <button className="qc-btn qc-btn-danger" disabled={busy} onClick={clearKey} type="button">
+              <Button className="flex-none" disabled={busy} onClick={clearKey} tone="danger">
                 清除
-              </button>
+              </Button>
             )}
           </FieldRow>
-          <p className="qc-facts">
+          <Facts>
             密钥只存不回显。
             {slot?.api_key_present
               ? '这里留空表示沿用已存的那一把，不会清掉；真要清就点上面的「清除」。'
               : '这一项还没配。'}
-          </p>
+          </Facts>
 
-          {error && <p className="qc-login-error">{error}</p>}
+          {error && <ErrorText>{error}</ErrorText>}
           <SaveBar busy={busy} dirty={dirty} label="保存渠道" note={note} onReset={reset} onSave={save} />
-        </div>
+        </Panel>
       )}
     </Block>
   );

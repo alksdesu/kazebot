@@ -14,7 +14,7 @@ import {
   type ProvidersResponse,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
-import { Block, Empty, Footnote, SaveBar } from './components';
+import { Block, Empty, Facts, Footnote, Panel, SaveBar, Segmented } from './components';
 import { FallbackChain } from './FallbackChain';
 import { NodeYamlShapeError, readYamlScalar, upsertYamlNested } from './nodeYaml';
 import { OptionRow, toYamlScalar, visibleSpecs } from './optionFields';
@@ -91,7 +91,15 @@ export const ModelsPage = () => {
     : (scopeProvider || activeProvider);
   const specs = catalog[selected] || [];
 
-  const pathFor = (key: string): string[] => (
+  const scopeChoices: ReadonlyArray<readonly [string, string]> = [
+    [GLOBAL, '全局'],
+    ...nodes.map((item) => [item.id, item.id] as const),
+  ];
+  const providerChoices: ReadonlyArray<readonly [string, string]> = providerNames.map(
+    (name) => [name, name === activeProvider ? `${name} ·在用` : name] as const,
+  );
+
+  const pathFor =(key: string): string[] => (
     scope === GLOBAL ? ['providers', selected, 'options', key] : ['provider_options', key]
   );
 
@@ -133,60 +141,27 @@ export const ModelsPage = () => {
   return (
     <>
       <Block hint="全局给这个渠道兜底，节点上配的会盖住全局" title="改谁的参数">
-        <div className="qc-panel">
-          <div className="qc-grants" role="group">
-            <button
-              aria-pressed={scope === GLOBAL}
-              className={`qc-grant${scope === GLOBAL ? ' qc-grant-on' : ''}`}
-              onClick={() => setScope(GLOBAL)}
-              type="button"
-            >
-              全局
-            </button>
-            {nodes.map((item) => (
-              <button
-                aria-pressed={scope === item.id}
-                className={`qc-grant${scope === item.id ? ' qc-grant-on' : ''}`}
-                key={item.id}
-                onClick={() => setScope(item.id)}
-                type="button"
-              >
-                {item.id}
-              </button>
-            ))}
-          </div>
+        <Panel>
+          <Segmented choices={scopeChoices} onPick={setScope} value={scope} />
           {scope === GLOBAL ? (
             <>
-              <p className="qc-words-label">渠道</p>
-              <div className="qc-grants" role="group">
-                {providerNames.map((name) => (
-                  <button
-                    aria-pressed={selected === name}
-                    className={`qc-grant${selected === name ? ' qc-grant-on' : ''}`}
-                    key={name}
-                    onClick={() => setProvider(name)}
-                    type="button"
-                  >
-                    {name}
-                    {name === activeProvider && ' ·在用'}
-                  </button>
-                ))}
-              </div>
+              <p className="mb-1.5 text-xs text-[var(--duties-secondary)]">渠道</p>
+              <Segmented choices={providerChoices} onPick={setProvider} value={selected} />
             </>
           ) : (
-            <p className="qc-facts">
+            <Facts>
               这个节点走 <code>{selected}</code>
               {scopeProvider ? '' : '（它自己没指定渠道，跟随全局在用的那个）'}。
-            </p>
+            </Facts>
           )}
-        </div>
+        </Panel>
       </Block>
 
       <Block hint="留空表示不发这一项，由对面的默认值决定" title="参数">
         {specs.length === 0 ? (
           <Empty>这个渠道没有可调参数。</Empty>
         ) : (
-          <div className="qc-panel">
+          <Panel>
             {visible.map((spec) => (
               <OptionRow
                 key={spec.key}
@@ -195,7 +170,7 @@ export const ModelsPage = () => {
                 value={shownOf(spec.key)}
               />
             ))}
-          </div>
+          </Panel>
         )}
         <SaveBar
           busy={busy}

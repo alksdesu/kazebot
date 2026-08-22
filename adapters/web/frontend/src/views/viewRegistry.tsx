@@ -15,7 +15,7 @@ import { SettingsPageHost } from '../components/settings/SettingsPageHost';
 import { SettingsRightPanel } from '../components/settings/SettingsRightPanel';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
 import type { ConversationMeta } from '../store/chatStore';
-import type { ShellViewMode } from '../store/viewStore';
+import type { ViewMode } from '../store/viewStore';
 import type { Attachment } from '../types';
 import type { ToolExecution, WsMessage } from '../types/message';
 
@@ -51,8 +51,7 @@ export interface AppViewDefinition {
 
 const safeSessionId = (sessionId: string) => sessionId || 'no-session';
 
-// 只登记走三栏外壳的域。控制台自带外壳，写进来会被 AppLayout 套上侧栏与顶栏。
-export const viewRegistry: Record<ShellViewMode, AppViewDefinition> = {
+export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
   chat: {
     id: 'chat',
     sidebar: (ctx) => (

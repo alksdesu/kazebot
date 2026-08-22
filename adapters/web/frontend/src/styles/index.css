@@ -123,6 +123,19 @@ textarea {
   color: var(--duties-text);
 }
 
+/* 试听判定翻转时重播，让「改开关 → 结论变了」的因果可见。 */
+@keyframes verdict-flip {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
 .markdown-body > :first-child {
   margin-top: 0;
 }

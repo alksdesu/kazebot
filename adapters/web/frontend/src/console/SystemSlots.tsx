@@ -16,7 +16,7 @@ import {
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { ChannelOptions, EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields';
-import { Block, Empty, SaveBar } from './components';
+import { Block, Empty, ErrorText, Facts, Input, Item, ItemTitle, List, SaveBar, Select } from './components';
 
 interface Draft {
   slot: SystemModelSlot;
@@ -44,6 +44,8 @@ const changed = (draft: Draft): boolean => (
   || draft.apiKeyInput.trim() !== ''
 );
 
+const CAP_DESC = 'mt-1 text-xs text-[var(--duties-secondary)]';
+
 const Row = ({
   draft, channels, wires, profiles, activeProvider, onChange,
 }: {
@@ -57,12 +59,14 @@ const Row = ({
 }) => {
   const { slot } = draft;
   return (
-    <li className="qc-cap">
-      <div className="qc-cap-head">
-        <span className="qc-cap-name">{slot.label}</span>
-        <code className="qc-cap-scope">{slot.key}</code>
+    <Item>
+      <div className="flex items-center gap-2">
+        <ItemTitle>{slot.label}</ItemTitle>
+        <code className="border border-[var(--duties-live)] px-1.5 text-[0.65rem] text-[var(--duties-live)]">
+          {slot.key}
+        </code>
       </div>
-      <p className="qc-cap-desc">{slot.desc}</p>
+      <p className={CAP_DESC}>{slot.desc}</p>
 
       {slot.supports_provider ? (
         <ModelField
@@ -79,63 +83,63 @@ const Row = ({
       ) : (
         // 生图那两个的格式写死在工具源码里，没有可问的列模型接口。
         <FieldRow label="模型">
-          <input
+          <Input
             aria-label={slot.label + ' 模型'}
-            className="qc-inp"
             onChange={(event) => onChange({ ...draft, model: event.target.value })}
             placeholder="留空 = 跟随主渠道"
             value={draft.model}
+            width="flex"
           />
         </FieldRow>
       )}
       <EnvHint raw={draft.model} resolved={slot.model} savedRaw={slot.model_raw} />
 
       <FieldRow label="地址">
-        <input
+        <Input
           aria-label={slot.label + ' 地址'}
-          className="qc-inp"
           onChange={(event) => onChange({ ...draft, baseUrl: event.target.value })}
           placeholder="留空 = 跟随主渠道"
           value={draft.baseUrl}
+          width="flex"
         />
       </FieldRow>
       <EnvHint raw={draft.baseUrl} resolved={slot.base_url} savedRaw={slot.base_url_raw} />
 
       <FieldRow label="密钥">
-        <input
+        <Input
           aria-label={slot.label + ' 密钥'}
-          className="qc-inp"
           onChange={(event) => onChange({ ...draft, apiKeyInput: event.target.value })}
           placeholder={slot.api_key_present ? '已设置 ' + slot.api_key_redacted + '，留空不改' : '跟随主渠道'}
           type="password"
           value={draft.apiKeyInput}
+          width="flex"
         />
       </FieldRow>
 
       {slot.supports_provider && (
         <FieldRow label="渠道">
-          <select
+          <Select
             aria-label={slot.label + ' 渠道'}
-            className="qc-inp"
             onChange={(event) => onChange({ ...draft, provider: event.target.value })}
             value={draft.provider}
+            width="flex"
           >
             <option value="">跟随主渠道</option>
             <ChannelOptions channels={channels} current={draft.provider} wires={wires} />
-          </select>
+          </Select>
         </FieldRow>
       )}
 
       {!slot.supports_provider && draft.baseUrl && (
-        <p className="qc-cap-desc">这一项的请求格式固定，换成别家的地址会失败。</p>
+        <p className={CAP_DESC}>这一项的请求格式固定，换成别家的地址会失败。</p>
       )}
       {slot.supports_provider && draft.baseUrl && !draft.provider && (
-        <p className="qc-cap-desc">换家要连渠道一起选，只改地址会按主渠道的格式发出去。</p>
+        <p className={CAP_DESC}>换家要连渠道一起选，只改地址会按主渠道的格式发出去。</p>
       )}
       {slot.supports_provider && (
         <HostMismatchHint baseUrl={draft.baseUrl} profiles={profiles} provider={draft.provider} />
       )}
-    </li>
+    </Item>
   );
 };
 
@@ -148,23 +152,23 @@ const ImageDefault = ({ tools, value, onPick }: {
   const live = tools.filter((tool) => tool.available);
   if (live.length < 2) return null;
   return (
-    <li className="qc-cap">
-      <div className="qc-cap-head">
-        <span className="qc-cap-name">默认生图渠道</span>
+    <Item>
+      <div className="flex items-center gap-2">
+        <ItemTitle>默认生图渠道</ItemTitle>
       </div>
-      <p className="qc-cap-desc">两个渠道都配好了。模型拿不准用哪个时走这里选的那个。</p>
+      <p className={CAP_DESC}>两个渠道都配好了。模型拿不准用哪个时走这里选的那个。</p>
       <FieldRow label="默认用">
-        <select
+        <Select
           aria-label="默认生图渠道"
-          className="qc-inp"
           onChange={(event) => onPick(event.target.value)}
           value={value}
+          width="flex"
         >
           <option value="">按用途自动判断</option>
           {live.map((tool) => <option key={tool.name} value={tool.name}>{tool.name}</option>)}
-        </select>
+        </Select>
       </FieldRow>
-    </li>
+    </Item>
   );
 };
 
@@ -241,13 +245,13 @@ export const SystemSlots = ({ channels, wires, profiles, activeProvider }: {
   return (
     <Block hint="压缩、摘要、读图这些内部用途各自可以走独立渠道，留空则跟随主渠道" title="系统槽位">
       {/* 各家的版本段位置不同，填错了一律静默 404，光看输入框看不出来。 */}
-      <p className="qc-facts">
+      <Facts>
         地址写到哪一级看渠道：OpenAI 系（含生图 GPT）要带 <code>/v1</code>，Claude 与 Gemini 不带。
-      </p>
+      </Facts>
       {drafts.length === 0 ? (
         <Empty>没有可配的槽位。</Empty>
       ) : (
-        <ul className="qc-caps">
+        <List>
           {drafts.map((draft, index) => (
             <Row
               draft={draft}
@@ -260,9 +264,9 @@ export const SystemSlots = ({ channels, wires, profiles, activeProvider }: {
             />
           ))}
           <ImageDefault onPick={setImageDefault} tools={imageTools} value={imageDefault} />
-        </ul>
+        </List>
       )}
-      {error && <p className="qc-login-error">{error}</p>}
+      {error && <ErrorText>{error}</ErrorText>}
       <SaveBar
         busy={busy}
         dirty={dirty}

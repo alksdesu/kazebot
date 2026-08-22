@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 
 import { getRuntimeRaw, updateRuntimeRaw } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
-import { Block, Empty, Field, SaveBar } from './components';
+import { Block, Desc, Empty, ErrorText, Facts, Field, SaveBar, Select } from './components';
 import { readYamlScalar, upsertYamlNested } from './nodeYaml';
 
 const PATH = ['routing', 'vision', 'enabled'];
@@ -73,24 +73,24 @@ export const VisionRouting = () => {
   return (
     <Block hint="带图消息交给主渠道还是绕去视觉入口节点" title="带图消息">
       <Field label="路由方式">
-        <select
+        <Select
           aria-label="带图消息路由"
-          className="qc-inp qc-inp-wide"
           onChange={(event) => setMode(event.target.value)}
           value={mode}
+          width="wide"
         >
           {MODES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
-        </select>
+        </Select>
       </Field>
-      <p className="qc-cap-desc">{NOTES[mode]}</p>
+      <Desc indent={false}>{NOTES[mode]}</Desc>
       {mode === 'auto' && (
-        <p className="qc-facts">
+        <Facts>
           按上面每个渠道的「带图消息」判定。绕过去还有一个前提：视觉入口节点得有自己的
           QQ_VISION_MODEL 或 QQ_VISION_BASE_URL。两个都空时它解析出来就是主渠道那个模型，
           绕过去只是白丢工具，所以自动档会留在主渠道并在日志里说一声。
-        </p>
+        </Facts>
       )}
-      {error && <p className="qc-login-error">{error}</p>}
+      {error && <ErrorText>{error}</ErrorText>}
       <SaveBar
         busy={busy}
         dirty={mode !== saved}

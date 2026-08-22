@@ -4,6 +4,7 @@ import { type ComponentType, type SVGProps } from 'react';
 // Why: the font-based ligature path required a custom subset script and a generated woff2 asset.
 // How: each icon currently used by the frontend is imported through a single-icon deep path and stored in ICON_MAP.
 // Purpose: the public Icon API remains stable while builds no longer depend on a font file or prebuild step.
+import { AccountCircleW400 } from '@material-symbols-svg/react/icons/account-circle';
 import { ApprovalW400 } from '@material-symbols-svg/react/icons/approval';
 import { ArrowBackW400 } from '@material-symbols-svg/react/icons/arrow-back';
 import { AttachFileW400 } from '@material-symbols-svg/react/icons/attach-file';
@@ -15,7 +16,6 @@ import { ChevronLeftW400 } from '@material-symbols-svg/react/icons/chevron-left'
 import { ChevronRightW400 } from '@material-symbols-svg/react/icons/chevron-right';
 import { CloseW400 } from '@material-symbols-svg/react/icons/close';
 import { CodeW400 } from '@material-symbols-svg/react/icons/code';
-import { DashboardW400 } from '@material-symbols-svg/react/icons/dashboard';
 import { DeleteW400 } from '@material-symbols-svg/react/icons/delete';
 import { EditW400 } from '@material-symbols-svg/react/icons/edit';
 import { DisplaySettingsW400 } from '@material-symbols-svg/react/icons/display-settings';
@@ -28,7 +28,7 @@ import { InboxW400 } from '@material-symbols-svg/react/icons/inbox';
 import { InfoW400 } from '@material-symbols-svg/react/icons/info';
 import { KeyboardArrowDownW400 } from '@material-symbols-svg/react/icons/keyboard-arrow-down';
 import { KeyboardArrowUpW400 } from '@material-symbols-svg/react/icons/keyboard-arrow-up';
-import { KeyboardReturnW400 } from '@material-symbols-svg/react/icons/keyboard-return';
+import { LanW400 } from '@material-symbols-svg/react/icons/lan';
 import { MenuW400 } from '@material-symbols-svg/react/icons/menu';
 import { MenuBookW400 } from '@material-symbols-svg/react/icons/menu-book';
 import { ModelTrainingW400 } from '@material-symbols-svg/react/icons/model-training';
@@ -38,6 +38,7 @@ import { PaletteW400 } from '@material-symbols-svg/react/icons/palette';
 import { PendingW400 } from '@material-symbols-svg/react/icons/pending';
 import { PhotoLibraryW400 } from '@material-symbols-svg/react/icons/photo-library';
 import { ProgressActivityW400 } from '@material-symbols-svg/react/icons/progress-activity';
+import { PsychologyW400 } from '@material-symbols-svg/react/icons/psychology';
 import { RefreshW400 } from '@material-symbols-svg/react/icons/refresh';
 import { ScheduleW400 } from '@material-symbols-svg/react/icons/schedule';
 import { SettingsW400 } from '@material-symbols-svg/react/icons/settings';
@@ -51,6 +52,7 @@ import { WarningW400 } from '@material-symbols-svg/react/icons/warning';
 type SvgIcon = ComponentType<SVGProps<SVGSVGElement>>;
 
 const ICON_MAP: Record<string, SvgIcon> = {
+  account_circle: AccountCircleW400,
   approval: ApprovalW400,
   arrow_back: ArrowBackW400,
   attach_file: AttachFileW400,
@@ -62,7 +64,6 @@ const ICON_MAP: Record<string, SvgIcon> = {
   chevron_right: ChevronRightW400,
   close: CloseW400,
   code: CodeW400,
-  dashboard: DashboardW400,
   delete: DeleteW400,
   edit: EditW400,
   display_settings: DisplaySettingsW400,
@@ -75,7 +76,7 @@ const ICON_MAP: Record<string, SvgIcon> = {
   info: InfoW400,
   keyboard_arrow_down: KeyboardArrowDownW400,
   keyboard_arrow_up: KeyboardArrowUpW400,
-  keyboard_return: KeyboardReturnW400,
+  lan: LanW400,
   menu: MenuW400,
   menu_book: MenuBookW400,
   model_training: ModelTrainingW400,
@@ -85,6 +86,7 @@ const ICON_MAP: Record<string, SvgIcon> = {
   pending: PendingW400,
   photo_library: PhotoLibraryW400,
   progress_activity: ProgressActivityW400,
+  psychology: PsychologyW400,
   refresh: RefreshW400,
   schedule: ScheduleW400,
   settings: SettingsW400,

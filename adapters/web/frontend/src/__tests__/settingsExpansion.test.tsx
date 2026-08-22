@@ -56,6 +56,17 @@ describe('expanded settings registry', () => {
       'mcp',
       'automation',
       'advanced',
+      // QQ 那十页从独立控制台并进来，排在最后。
+      'qq-account',
+      'qq-channels',
+      'qq-timing',
+      'qq-permissions',
+      'qq-persona',
+      'qq-memory',
+      'qq-stickers',
+      'qq-link',
+      'qq-providers',
+      'qq-models',
     ]);
     expect(settingsTabs.find((tab) => tab.id === 'system')).toMatchObject({ label: '系统', icon: 'settings_power', order: 4 });
     expect(settingsTabs.find((tab) => tab.id === 'tools')).toMatchObject({ label: '工具与权限', icon: 'build', order: 8 });
@@ -63,6 +74,16 @@ describe('expanded settings registry', () => {
 
   it('每个 tab 都归了组，侧栏才摆得下二十多项', () => {
     expect(settingsTabs.every((tab) => tab.group)).toBe(true);
+  });
+
+  it('id 不重复 —— 撞了的那个会被 getSettingsTab 永久遮住', () => {
+    const ids = settingsTabs.map((tab) => tab.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('label 也不重复 —— 侧栏两行同名没法选', () => {
+    const labels = settingsTabs.map((tab) => tab.label);
+    expect(new Set(labels).size).toBe(labels.length);
   });
 });
 

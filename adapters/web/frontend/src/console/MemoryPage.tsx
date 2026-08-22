@@ -18,10 +18,27 @@ import {
   type ScopeStatus,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
-import { Block, Empty, Footnote } from './components';
+import { Block, Button, Check, Empty, Footnote, Input, Tag } from './components';
 import { sizeText } from './format';
 
 const EMPTY_DRAFT = { id: '', content: '', keywords: '', constant: false };
+
+const ENTRY = 'mt-1.5 border border-[var(--duties-border)] bg-[var(--duties-panel)] px-2.5 py-2';
+// 常驻条目每轮都进 prompt、一直占着注入预算，扫一眼就该看出是哪几条。
+const ENTRY_CONST = 'border-l-[3px] border-l-[var(--duties-live)]';
+const HEAD = 'flex flex-wrap items-center gap-1.5';
+const ID = 'font-mono text-xs';
+const META = 'font-mono text-[0.65rem] text-[var(--duties-tertiary)]';
+const TEXT = 'mt-1.5 break-words text-xs leading-relaxed';
+const KW = 'mt-1 break-words font-mono text-[0.65rem] text-[var(--duties-secondary)]';
+// 上下文预览可能上百条，给个高度上限，不然整页被它撑开。
+const LOG = 'mt-1.5 max-h-80 overflow-auto border-t border-[var(--duties-border)] pt-1.5';
+const ADD = 'flex flex-col gap-1.5 border-t border-[var(--duties-border)] pt-2.5';
+const FIELD = 'flex items-center gap-2';
+const LABEL = 'w-14 flex-none text-xs text-[var(--duties-secondary)]';
+const BUCKET = 'font-mono text-[0.65rem] text-[var(--duties-secondary)]';
+// 会话按登录账号分组时的小标题。只在换过号之后才出现。
+const GROUP = 'mb-1.5 mt-3.5 text-xs text-[var(--duties-secondary)]';
 
 const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');
 
@@ -112,99 +129,102 @@ const MemoryBlock = () => {
   return (
     <Block hint="模型聊天时自己攒下来的。手动加的不会被自动清理" title="长期记忆">
       {namespaces.length === 0 && <Empty>还没有任何记忆。</Empty>}
-      <div className="qc-mem">
-        <div className="qc-mem-list">
+      <div className="grid grid-cols-1 items-start gap-3.5 md:grid-cols-[15rem_1fr]">
+        <div className="flex flex-col gap-2.5">
           {grouped.map(([label, rows]) => (
-            <div key={label}>
-              <p className="qc-mem-bucket">{label}</p>
+            <div className="flex flex-col gap-1" key={label}>
+              <p className={BUCKET}>{label}</p>
               {rows.map((row) => (
                 <button
                   aria-current={selected === row.key ? 'true' : undefined}
-                  className="qc-mem-item"
+                  className="flex w-full items-baseline gap-2 border border-[var(--duties-border)] bg-[var(--duties-panel)] px-2.5 py-1.5 text-left text-xs hover:bg-[var(--duties-muted)] aria-[current=true]:border-[var(--duties-text)] aria-[current=true]:bg-[var(--duties-muted)]"
                   key={row.key}
                   onClick={() => setSelected(row.key)}
                   type="button"
                 >
-                  <span className="qc-mem-name">{row.owner.label}</span>
-                  <span className="qc-mem-count">{row.entry_count}</span>
+                  <span className="min-w-0 flex-1 truncate">{row.owner.label}</span>
+                  <span className={META}>{row.entry_count}</span>
                 </button>
               ))}
             </div>
           ))}
         </div>
 
-        <div className="qc-mem-body">
+        <div className="flex min-w-0 flex-col gap-2">
           {!selected && <Empty>左边选一项来查看。</Empty>}
           {selected && (
             <>
-              <div className="qc-mem-head">
+              <div className="flex items-center justify-between gap-2 font-mono text-xs">
                 <span>
                   {current?.owner.label} · {entries.length} 条
                   {constantCount > 0 && (
-                    <span className="qc-mem-const-note">其中 {constantCount} 条常驻</span>
+                    <Tag className="ml-2" tone="live">其中 {constantCount} 条常驻</Tag>
                   )}
                 </span>
-                <button className="qc-btn" onClick={clearAll} type="button">清空</button>
+                <Button onClick={clearAll}>清空</Button>
               </div>
               {entries.map((entry) => (
                 <div
-                  className={`qc-mem-entry${entry.constant ? ' qc-mem-entry-const' : ''}`}
+                  className={`${ENTRY}${entry.constant ? ` ${ENTRY_CONST}` : ''}`}
                   key={`${entry.book}/${entry.id}`}
                 >
-                  <div className="qc-mem-entry-head">
-                    <span className="qc-mem-id">{entry.id}</span>
-                    {entry.constant && <span className="qc-mem-tag qc-mem-tag-const">常驻 · 每轮都注入</span>}
-                    {entry.source === 'manual' && <span className="qc-mem-tag">手动</span>}
-                    <button className="qc-btn" onClick={() => void remove(entry)} type="button">删除</button>
+                  <div className={HEAD}>
+                    <span className={ID}>{entry.id}</span>
+                    {entry.constant && <Tag tone="live">常驻 · 每轮都注入</Tag>}
+                    {entry.source === 'manual' && <Tag>手动</Tag>}
+                    <span className="flex-1" />
+                    <Button onClick={() => void remove(entry)}>删除</Button>
                   </div>
-                  <p className="qc-mem-text">{entry.content}</p>
+                  <p className={TEXT}>{entry.content}</p>
                   {!!entry.keywords?.length && (
-                    <p className="qc-mem-kw">关键词：{entry.keywords.join('、')}</p>
+                    <p className={KW}>关键词：{entry.keywords.join('、')}</p>
                   )}
                 </div>
               ))}
 
-              <div className="qc-mem-add">
-                <p className="qc-mem-bucket">添加一条</p>
-                <label className="qc-mem-field">
-                  <span>标识</span>
-                  <input
+              <div className={ADD}>
+                <p className={BUCKET}>添加一条</p>
+                <label className={FIELD}>
+                  <span className={LABEL}>标识</span>
+                  <Input
                     onChange={(event) => setDraft({ ...draft, id: event.target.value })}
                     placeholder="英文、数字、下划线"
                     value={draft.id}
+                    width="flex"
                   />
                 </label>
-                <label className="qc-mem-field">
-                  <span>内容</span>
-                  <input
+                <label className={FIELD}>
+                  <span className={LABEL}>内容</span>
+                  <Input
                     onChange={(event) => setDraft({ ...draft, content: event.target.value })}
                     value={draft.content}
+                    width="flex"
                   />
                 </label>
-                <label className="qc-mem-field">
-                  <span>关键词</span>
-                  <input
+                <label className={FIELD}>
+                  <span className={LABEL}>关键词</span>
+                  <Input
                     onChange={(event) => setDraft({ ...draft, keywords: event.target.value })}
                     placeholder="逗号分隔，说到这些词时才会想起来"
                     value={draft.keywords}
+                    width="flex"
                   />
                 </label>
-                <label className="qc-mem-check">
-                  <input
-                    checked={draft.constant}
-                    onChange={(event) => setDraft({ ...draft, constant: event.target.checked })}
-                    type="checkbox"
-                  />
-                  <span>常驻：每轮都注入，不用关键词命中。占注入预算，只给必须一直记住的事。</span>
-                </label>
-                <button
-                  className="qc-btn qc-btn-primary"
+                <Check
+                  align="start"
+                  checked={draft.constant}
+                  onChange={(checked) => setDraft({ ...draft, constant: checked })}
+                  tone="muted"
+                >
+                  常驻：每轮都注入，不用关键词命中。占注入预算，只给必须一直记住的事。
+                </Check>
+                <Button
+                  className="self-start"
                   disabled={busy || !draft.id.trim() || !draft.content.trim()}
                   onClick={submit}
-                  type="button"
                 >
                   {busy ? '保存中' : '添加'}
-                </button>
+                </Button>
               </div>
             </>
           )}
@@ -249,29 +269,27 @@ const ContextBlock = () => {
   };
 
   const entry = (row: ConversationRow) => (
-    <div className="qc-mem-entry" key={row.session_id}>
-      <div className="qc-mem-entry-head">
-        <span className="qc-mem-name">{row.owner?.label || row.channel || '未知来源'}</span>
-        <span className="qc-mem-count">{sizeText(row.bytes)}</span>
-        <button className="qc-btn" onClick={() => void open(row)} type="button">
+    <div className={ENTRY} key={row.session_id}>
+      <div className={HEAD}>
+        <span className="min-w-0 flex-1 truncate text-xs">{row.owner?.label || row.channel || '未知来源'}</span>
+        <span className={META}>{sizeText(row.bytes)}</span>
+        <Button onClick={() => void open(row)}>
           {preview?.id === row.session_id ? '收起' : '查看'}
-        </button>
-        <button
-          className="qc-btn"
+        </Button>
+        <Button
           disabled={!row.conversation_key}
           onClick={() => void drop(row)}
           title={row.conversation_key ? '' : '这条会话已经没有归属，只能在服务器上删'}
-          type="button"
         >
           删除
-        </button>
+        </Button>
       </div>
       {preview?.id === row.session_id && (
-        <div className="qc-mem-log">
-          <p className="qc-mem-kw">共 {preview.total} 条，显示最近 {preview.messages.length} 条</p>
+        <div className={LOG}>
+          <p className={KW}>共 {preview.total} 条，显示最近 {preview.messages.length} 条</p>
           {preview.messages.map((msg, index) => (
-            <p className="qc-mem-text" key={index}>
-              <span className="qc-mem-id">{String(msg.role || '')}</span>
+            <p className={TEXT} key={index}>
+              <span className={ID}>{String(msg.role || '')}</span>
               {' '}
               {String(msg.content || '').slice(0, 400)}
             </p>
@@ -290,9 +308,9 @@ const ContextBlock = () => {
       {rows.length === 0 && <Empty>还没有任何会话。</Empty>}
       {stale.length === 0 ? rows.map(entry) : (
         <>
-          <p className="qc-mem-group">当前账号</p>
+          <p className={GROUP}>当前账号</p>
           {mine.length === 0 ? <Empty>这个号还没有任何会话。</Empty> : mine.map(entry)}
-          <p className="qc-mem-group">其它账号 · 换号前留下的，上下文和长期记忆都不互通</p>
+          <p className={GROUP}>其它账号 · 换号前留下的，上下文和长期记忆都不互通</p>
           {stale.map(entry)}
         </>
       )}
@@ -339,37 +357,38 @@ const ScopeBlock = () => {
 
   return (
     <Block hint="换号后同一个群会各记各的；搬迁把旧号名下的全部数据划给新号" title="记忆归属">
-      <p className="qc-mem-text">
+      <p className={TEXT}>
         当前归属：<strong>{status?.current_scope || '还没绑定账号'}</strong>
         {status?.bot_alive && status?.live_scope && status.live_scope !== status.current_scope
           && `（bot 正跑在 ${status.live_scope}）`}
       </p>
-      <div className="qc-mem-add">
-        <label className="qc-mem-field">
-          <span>搬到</span>
-          <input
+      <div className={ADD}>
+        <label className={FIELD}>
+          <span className={LABEL}>搬到</span>
+          <Input
             inputMode="numeric"
             onChange={(event) => setTarget(event.target.value)}
             placeholder="目标 bot 的 QQ 号"
             value={target}
+            width="flex"
           />
         </label>
-        <button className="qc-btn" disabled={!target.trim()} onClick={() => void preview()} type="button">
+        <Button className="self-start" disabled={!target.trim()} onClick={() => void preview()}>
           预览
-        </button>
+        </Button>
       </div>
 
       {plan && (
-        <div className="qc-mem-log">
-          <p className="qc-mem-kw">
+        <div className={LOG}>
+          <p className={KW}>
             {plan.conversations.length === 0
               ? '这批数据已经在这个号名下了，无需搬迁。'
               : `这批数据现属「${plan.source_scope || '无归属'}」，`
                 + `${plan.conversations.length} 个会话待搬，其中 ${movable.length} 个可以直接搬。`}
           </p>
           {plan.conversations.map((row) => (
-            <p className="qc-mem-text" key={row.old_namespace}>
-              <span className="qc-mem-id">{row.old_namespace.slice(0, 12)}…</span>
+            <p className={TEXT} key={row.old_namespace}>
+              <span className={ID}>{row.old_namespace.slice(0, 12)}…</span>
               {' → '}
               {row.new_namespace.slice(0, 12)}…
               {!row.has_memory && ' （没有长期记忆）'}
@@ -377,21 +396,16 @@ const ScopeBlock = () => {
             </p>
           ))}
           {plan.unknown_namespaces.length > 0 && (
-            <p className="qc-mem-kw">
+            <p className={KW}>
               另有 {plan.unknown_namespaces.length} 份记忆查不到归属，搬不了，会原样留着。
             </p>
           )}
           {status?.bot_alive ? (
             <Footnote>bot 还在跑。它内存里存着按旧账号算的会话键，先停掉 bot 再搬。</Footnote>
           ) : (
-            <button
-              className="qc-btn"
-              disabled={busy || movable.length === 0}
-              onClick={() => void migrate()}
-              type="button"
-            >
+            <Button disabled={busy || movable.length === 0} onClick={() => void migrate()}>
               {busy ? '搬迁中…' : '执行搬迁'}
-            </button>
+            </Button>
           )}
         </div>
       )}

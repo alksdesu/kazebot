@@ -1,6 +1,6 @@
 // 权限：谁是管理员，以及每项能力放到哪一档。能力清单由 bot 公布，这一页只负责显示和写回。
 import type { QqCapability } from '../api/supervisorClient';
-import { Block, Footnote, Grid } from './components';
+import { Block, Desc, ErrorText, Facts, Footnote, Grid, Item, ItemTitle, List, Panel, Segmented } from './components';
 import { useCapabilities, useConsoleStore, useIdList, useLiveValue, useNote } from './consoleStore';
 import { BoolOption } from './fields';
 import { IdList } from './IdList';
@@ -20,7 +20,7 @@ const EmptyWarning = () => {
   const admins = useIdList('admin_users');
   const note = useNote('admin_users');
   if (admins.length) return null;
-  return <p className="qc-login-error">{note || '名单为空，管理命令全部不可用。'}</p>;
+  return <ErrorText>{note || '名单为空，管理命令全部不可用。'}</ErrorText>;
 };
 
 const CapabilityRow = ({ cap }: { cap: QqCapability }) => {
@@ -31,56 +31,53 @@ const CapabilityRow = ({ cap }: { cap: QqCapability }) => {
   const scoped = cap.group_scoped && GROUP_ROLE_GRANTS.has(grant);
 
   return (
-    <li className="qc-cap">
-      <div className="qc-cap-head">
-        <span className="qc-cap-name">{cap.name}</span>
-        {scoped && <span className="qc-cap-scope">只在本群</span>}
-        <span className="qc-bar-spacer" />
-        <div className="qc-grants" role="group">
-          {cap.grants.map((option) => (
-            <button
-              aria-pressed={option === grant}
-              className={`qc-grant${option === grant ? ' qc-grant-on' : ''}`}
-              key={option}
-              onClick={() => setDraft(configKey, option)}
-              type="button"
-            >
-              {GRANT_LABELS[option] || option}
-            </button>
-          ))}
-        </div>
+    <Item>
+      <div className="flex items-center gap-2">
+        <ItemTitle>{cap.name}</ItemTitle>
+        {scoped && (
+          <span className="border border-[var(--duties-live)] px-1.5 text-[0.65rem] text-[var(--duties-live)]">
+            只在本群
+          </span>
+        )}
+        <span className="flex-1" />
+        <Segmented
+          choices={cap.grants.map((option) => [option, GRANT_LABELS[option] || option] as const)}
+          onPick={(option) => setDraft(configKey, option)}
+          value={grant}
+        />
       </div>
-      <p className="qc-cap-desc">{cap.desc}</p>
-    </li>
+      <Desc indent={false}>{cap.desc}</Desc>
+    </Item>
   );
 };
 
 const Capabilities = () => {
   const caps = useCapabilities();
   if (!caps.length) {
-    return <p className="qc-facts">bot 还没公布能力清单，连上之后这里才会有内容。</p>;
+    return <Facts>bot 还没公布能力清单，连上之后这里才会有内容。</Facts>;
   }
   return (
-    <ul className="qc-caps">
+    <List>
       {caps.map((cap) => (
         <CapabilityRow cap={cap} key={cap.key} />
       ))}
-    </ul>
+    </List>
   );
 };
 
 export const PermissionsPage = () => (
   <>
     <Block hint="名单里的 QQ 号在所有会话里都算管理员" title="管理员">
-      <div className="qc-panel">
+      <Panel>
         <IdList
           configKey="admin_users"
           empty="名单为空"
           label="管理员 QQ"
           placeholder="输入 QQ 号，回车添加"
+          spacing="panel"
         />
         <EmptyWarning />
-      </div>
+      </Panel>
     </Block>
 
     <Block hint="每项各自决定放到哪一档" title="这些人能做什么">
@@ -94,18 +91,18 @@ export const PermissionsPage = () => (
           desc="引用了审批卡片却取不到编号时，按「当前唯一待审批」处理。"
           label="唯一待审批兜底"
         >
-          <p className="qc-opt-desc">
+          <Desc>
             默认关：这条兜底分不清引用的是它、还是另一张已经处理过的卡片，是误批的直接成因。开了也仍然要求只剩一条待审批、且那张卡片确实发给了本人。
-          </p>
+          </Desc>
         </BoolOption>
         <BoolOption
           configKey="approval_bare_verb_unique"
           desc="不引用卡片、整句只发「同意」时，按当前唯一待审批处理。"
           label="直接回同意"
         >
-          <p className="qc-opt-desc">
+          <Desc>
             默认开：收到卡片后直接回「同意」就能批。只在你名下恰好剩一条待审批、且那张卡片确实发给你时成立；有多条会让你指定，一条都没有时就当普通聊天。
-          </p>
+          </Desc>
         </BoolOption>
       </Grid>
     </Block>

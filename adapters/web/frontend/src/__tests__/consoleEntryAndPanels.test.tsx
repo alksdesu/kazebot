@@ -1,5 +1,5 @@
-// 控制台入口与三个上下文右栏的注册回归。
-// 控制台此前只能靠 ?view=console 深链进入，三个右栏组件实现完整却从未被注册。
+// QQ 分区入口与三个上下文右栏的注册回归。
+// QQ 那十页此前是独立视图，只能靠 ?view=console 深链进入；三个右栏组件实现完整却从未被注册。
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -7,11 +7,11 @@ import { Header, Sidebar } from '../components/layout';
 import { SettingsRightPanel } from '../components/settings/SettingsRightPanel';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
 import { SystemSettingsPage } from '../components/settings/pages/SystemSettingsPage';
-import { useConsoleStore } from '../console/consoleStore';
+import { settingsTabs } from '../components/settings/settingsTabs';
 import { useChatStore, type ConversationMeta } from '../store/chatStore';
 import { useSettingsSelectionStore } from '../store/settingsSelectionStore';
 import { useSettingsStore } from '../store/settingsStore';
-import { useViewStore } from '../store/viewStore';
+import { tabForLegacyDomain, useViewStore } from '../store/viewStore';
 import type { AdminApproval } from '../api/supervisorClient';
 
 const conversation: ConversationMeta = {
@@ -37,7 +37,7 @@ function renderSidebar() {
   );
 }
 
-describe('控制台入口', () => {
+describe('QQ 分区入口', () => {
   beforeEach(() => {
     window.history.replaceState(null, '', '/');
     useViewStore.setState({ viewMode: 'chat', activeSettingsTab: 'general' });
@@ -49,17 +49,32 @@ describe('控制台入口', () => {
     vi.restoreAllMocks();
   });
 
-  it('设置侧栏展开后能直接进到控制台的指定分区', () => {
+  it('QQ 那十页和别的设置分区平铺在同一栏里，点一下就到', () => {
     render(<SettingsSidebar />);
 
-    fireEvent.click(screen.getByRole('button', { name: 'QQ 控制台' }));
-    fireEvent.click(screen.getByRole('button', { name: 'QQ 控制台 权限' }));
+    fireEvent.click(screen.getByRole('button', { name: '权限' }));
 
-    expect(useViewStore.getState().viewMode).toBe('console');
-    expect(useConsoleStore.getState().domain).toBe('permissions');
+    expect(useViewStore.getState().activeSettingsTab).toBe('qq-permissions');
   });
 
-  it('聊天侧栏只留设置入口，控制台入口收敛到设置里', () => {
+  it('分组标题把 QQ 页和引擎页分开', () => {
+    render(<SettingsSidebar />);
+
+    expect(screen.getByText('QQ 机器人')).toBeInTheDocument();
+    expect(screen.getByText('模型与渠道')).toBeInTheDocument();
+  });
+
+  it('两个「运行」不再撞：诊断页和链路页各是各的', () => {
+    render(<SettingsSidebar />);
+
+    fireEvent.click(screen.getByRole('button', { name: '运行' }));
+    expect(useViewStore.getState().activeSettingsTab).toBe('runtime');
+
+    fireEvent.click(screen.getByRole('button', { name: '链路' }));
+    expect(useViewStore.getState().activeSettingsTab).toBe('qq-link');
+  });
+
+  it('聊天侧栏只留设置入口', () => {
     renderSidebar();
 
     expect(screen.queryByRole('button', { name: 'QQ 控制台' })).toBeNull();
@@ -80,14 +95,8 @@ describe('视图与地址栏同步', () => {
     window.history.replaceState(null, '', '/');
   });
 
-  it('进入控制台会写进地址栏', () => {
-    useViewStore.getState().openConsole();
-
-    expect(new URLSearchParams(window.location.search).get('view')).toBe('console');
-  });
-
-  it('退出后地址栏不再残留 view，刷新不会弹回控制台', () => {
-    window.history.replaceState(null, '', '/?view=console');
+  it('退出后地址栏不再残留 view，刷新不会弹回设置', () => {
+    window.history.replaceState(null, '', '/?view=settings&tab=qq-timing');
 
     useViewStore.getState().closeSettings();
 
@@ -104,40 +113,44 @@ describe('视图与地址栏同步', () => {
     expect(new URLSearchParams(window.location.search).get('tab')).toBe('skills');
   });
 
-  it('控制台不携带设置分区参数', () => {
-    useViewStore.getState().openSettings('tools');
-    useViewStore.getState().openConsole();
+  it('QQ 分区跟别的分区一样写 tab，没有第二套参数', () => {
+    useViewStore.getState().openSettings('qq-permissions');
 
     const params = new URLSearchParams(window.location.search);
-    expect(params.get('view')).toBe('console');
-    expect(params.get('tab')).toBeNull();
+    expect(params.get('tab')).toBe('qq-permissions');
+    expect(params.get('domain')).toBeNull();
   });
 
-  it('不动其他人的 query 参数', () => {
+  it('不动其他人的 query 参数，但会清掉废弃的 domain', () => {
     window.history.replaceState(null, '', '/?token=abc&domain=timing');
 
-    useViewStore.getState().openConsole();
+    useViewStore.getState().openSettings('qq-timing');
 
     const params = new URLSearchParams(window.location.search);
     expect(params.get('token')).toBe('abc');
-    expect(params.get('domain')).toBe('timing');
+    // ?domain= 是控制台时代的定位参数，现在由 ?tab= 承担，留着会误导。
+    expect(params.get('domain')).toBeNull();
+  });
+});
+
+// 书签和聊天记录里还躺着 ?view=console&domain=x 的老链接。
+describe('老控制台链接', () => {
+  it('域名换算成对应的设置分区', () => {
+    expect(tabForLegacyDomain('timing')).toBe('qq-timing');
+    expect(tabForLegacyDomain('stickers')).toBe('qq-stickers');
   });
 
-  it('控制台切换域会写进地址栏', () => {
-    useViewStore.getState().openConsole();
-
-    useConsoleStore.getState().setDomain('permissions');
-
-    expect(new URLSearchParams(window.location.search).get('domain')).toBe('permissions');
+  it('「运行」不能直译：设置页已经有一个 runtime 了', () => {
+    expect(tabForLegacyDomain('runtime')).toBe('qq-link');
+    expect(settingsTabs.filter(tab => tab.id === 'runtime')).toHaveLength(1);
   });
 
-  it('离开控制台后不残留域参数', () => {
-    useViewStore.getState().openConsole();
-    useConsoleStore.getState().setDomain('permissions');
-
-    useViewStore.getState().closeSettings();
-
-    expect(new URLSearchParams(window.location.search).get('domain')).toBeNull();
+  it('换算出来的每个 id 都真的注册过', () => {
+    const ids = new Set(settingsTabs.map(tab => tab.id));
+    for (const domain of ['account', 'channels', 'timing', 'permissions', 'persona',
+      'providers', 'models', 'runtime', 'memory', 'stickers']) {
+      expect(ids.has(tabForLegacyDomain(domain))).toBe(true);
+    }
   });
 });
 

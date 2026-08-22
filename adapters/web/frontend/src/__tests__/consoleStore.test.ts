@@ -3,6 +3,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import type { QqInputRule } from '../api/supervisorClient';
+import { barState } from '../console/components';
 import {
   addWord,
   asWordList,
@@ -421,5 +422,35 @@ describe('apply', () => {
     expect(state.draft).toEqual({ signal_name: true });
     expect(state.error).toContain('无人消费的配置项');
     expect(state.saving).toBe(false);
+  });
+});
+
+// 顶部那条状态条。它是「bot 有没有吃到这份配置」的唯一显示，报错了等于没有。
+describe('生效状态条', () => {
+  const live = (over: Record<string, unknown> = {}) =>
+    ({ published: true, stale: false, applied: true, ...over }) as Parameters<typeof barState>[0];
+
+  it('bot 认账了才是已生效', () => {
+    expect(barState(live(), '')).toEqual({ tone: 'live', text: '已生效' });
+  });
+
+  it('心跳断了不能显示成已生效', () => {
+    expect(barState(live({ stale: true }), '').tone).toBe('halt');
+  });
+
+  it('bot 还在用旧配置也是红的', () => {
+    expect(barState(live({ applied: false }), '').tone).toBe('halt');
+  });
+
+  // 语法错误压过一切：文件写坏时 applied 仍然为真（bot 用的是上一份），
+  // 按 applied 判就会显示「已生效」，而实际上刚才那次改动一个字都没进去。
+  it('语法错误压过 applied', () => {
+    expect(barState(live(), 'line 3: bad indent')).toEqual({
+      tone: 'halt', text: '配置有语法错误，bot 仍在用上一份',
+    });
+  });
+
+  it('bot 没上报时是灰的，不是红的', () => {
+    expect(barState(null, '')).toEqual({ tone: 'idle', text: '等待 bot 上报' });
   });
 });
