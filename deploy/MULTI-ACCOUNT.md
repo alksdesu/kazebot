@@ -4,8 +4,10 @@
 
 ```
 /opt/kazebot/                 代码，git 更新一次，全部实例生效
+/usr/local/lib/kazebot/       root 侧建号组件，kazebot 写不到
 /opt/kazebot-data/
   ├ instances.yaml            控制台切换器读的共享清单
+  ├ provision-<uin>.log       建号进度，控制台轮询它
   ├ 1000000001/               序号 0：端口与路径都和单实例时一样
   │   ├ data/ config/ .env
   │   └ adapters engine plugins tools   → 软链回代码目录
@@ -15,42 +17,74 @@
 
 软链那四个目录不能省：`workspace_root` 既用来找 `data/`，也用来找 `tools/`、`engine/system_nodes/` 和前端 `dist`。
 
-## 已有单实例部署：第一个号留在原地
+## 启用
 
-不必把现役的号搬进 `kazebot-data/`。序号 0 的端口和 URL 前缀本来就等同于单实例部署，所以让它继续拿 `/opt/kazebot` 当工作区即可，加号时只要在它的 `.env` 里补一行：
+一次性，需要 root：
 
 ```bash
-CLONOTH_INSTANCES_FILE=/opt/kazebot-data/instances.yaml
+sudo /opt/kazebot/deploy/install_provision.sh <主实例QQ号>
 ```
 
-两个号读同一份清单，切换器就认得彼此。
+它会装好 root 侧组件与 polkit 规则、建 `/opt/kazebot-data`、用 drop-in 放开主实例对它的写权限，并把主实例登记进清单。装完控制台的「账号 → 多开实例」里就能直接加号。
 
-搬反而有代价：NapCat 容器 bind mount 了 `/opt/kazebot/data/attachments`，而 docker 不支持给已存在的容器改挂载。目录搬走后容器暂时还能用（`mv` 不换 inode），但它下次重启就会挂在一个不存在的路径上，届时只能重建容器。
+**改过 `provision_instance.sh`、`cloudflared_ingress.py` 或 `deploy/systemd/` 里的模板之后要重跑一次** —— git 更新的是 `/opt/kazebot` 里的源，不会自动同步到 `/usr/local/lib`。
+
+## 加号
+
+控制台「账号 → 多开实例 → 加号」，填 QQ 号点「建实例」，进度就在下面滚。约一两分钟，完成后去它自己的控制台扫码。
+
+命令行等价物（控制台不可用时）：
+
+```bash
+sudo /opt/kazebot/deploy/new_instance.sh <uin> [标签]
+tail -f /opt/kazebot-data/provision-<uin>.log
+```
+
+两条路都走同一份脚手架逻辑（`supervisor/provisioning.py`）和同一个 root 侧脚本。
+
+## 删号
+
+控制台里点「删掉」，手打 QQ 号确认。**数据不会真删**：工作区和 NapCat 目录改名成 `.deleted-<时间戳>`，确认无误后自己清理。序号 0 和当前正在看的实例删不掉。
+
+## 为什么 root 侧要单独一套
+
+supervisor 跑在 `kazebot` 下，`ProtectSystem=strict` + `NoNewPrivileges=yes`，碰不到 docker、systemd 和 `/etc`。而 agent 能以 kazebot 身份执行任意命令 —— 边界靠内核而不是黑名单，这是 `kazebot.service` 的既定设计。
+
+所以建号被拆成两半：无特权的（工作区、软链、`.env`、清单）由 supervisor 做，其余交给 root 的 oneshot 单元，polkit 只放行 `kazebot-provision@<数字>` 和 `kazebot-deprovision@<数字>` 的 `start`。
+
+由此推出几条**改这套东西时不能破的规矩**：
+
+- **root 脚本必须在 `/usr/local/lib/kazebot/`。** 放 `/opt/kazebot/deploy/` 下等于没有 polkit 白名单 —— 那里 kazebot 可写，改写脚本内容再触发就是 root。
+- **不 `source` 工作区的 `.env`。** 那是 kazebot 可写的，当输入看待：grep 取值，逐个按形状校验。
+- **不用 `/opt/kazebot/.venv` 的解释器。** 同理，用 `/usr/bin/python3`。
+- **脚本里不出现递归删除。** 删号只 `mv` 归档。
+- **uin 正则三处必须一致**：`supervisor/provisioning.py`、`provision_instance.sh`、polkit 规则。宽的那一处说了算。
+
+`tests/test_provisioning.py` 会静态检查上面每一条。
 
 ## 端口
 
-按序号推导，序号 0 就是单实例部署原有的那一组。
+按序号推导，序号 0 就是单实例部署原有的那一组。唯一真源是 `supervisor/instances.py` 的 `ports_for()`。
 
 | | supervisor | NoneBot | bridge | NapCat WebUI |
 |---|---|---|---|---|
 | 序号 0 | 8765 | 8080 | 8769 | 6099 |
 | 序号 N | 8765+10N | 8080+10N | 8769+10N | 6099+100N |
 
-## 建实例
+序号上限 8。分配时除了避开清单里已登记的，还会实测端口 —— 清单被手改漏记也不会撞上正在跑的实例。
 
-```bash
-/opt/kazebot/deploy/new_instance.sh <uin> <序号> [标签]
-```
+## 已有单实例部署：第一个号留在原地
 
-脚本幂等，只建目录骨架、软链、`.env` 和清单条目。NapCat 容器、systemd、入口这三步需要 root，脚本会把命令打印出来。已有的 `.env` 和真实目录它不会覆盖。
+不必把现役的号搬进 `kazebot-data/`。序号 0 的端口和 URL 前缀本来就等同于单实例部署，`install_provision.sh` 用 drop-in 给它补上清单路径即可。
+
+搬反而有代价：NapCat 容器 bind mount 了 `/opt/kazebot/data/attachments`，而 docker 不支持给已存在的容器改挂载。目录搬走后容器暂时还能用（`mv` 不换 inode），但它下次重启就会挂在一个不存在的路径上，届时只能重建容器。
 
 ## 容易踩的点
 
 - **序号 0 的 NapCat 容器不要重建。** 现有容器跑 `--network host`，第二个 host 容器会抢 6099 以及 QQ NT 自己占的 4001/4301。新号一律用 bridge 网络加 `-p 127.0.0.1:<端口>:6099`。
+- bridge 网络下 NoneBot 不能只监听 `127.0.0.1`，且必须配 `ONEBOT_ACCESS_TOKEN` —— 这两条 `provisioning.py` 会按序号自动写进 `.env`。
 - **附件目录必须挂成同一个绝对路径**（NapCat 靠路径发图），所以每个实例挂自己那份 `data/attachments`。
-- bridge 网络下 NoneBot 不能只监听 `127.0.0.1`，且必须配 `ONEBOT_ACCESS_TOKEN`。
-- 几个号共用一个域名，靠 `CLONOTH_URL_PREFIX` 分流。cloudflared 只需把 `/i/<号>/` 指到对应端口，**不需要重写路径**——supervisor 自己就挂在那个前缀下。
-- 控制台左轨的账号切换器只在清单里有两个及以上条目时出现，单实例看不到任何变化。
+- 几个号共用一个域名，靠 `CLONOTH_URL_PREFIX` 分流。cloudflared 那条 path 规则由建号脚本自动加，**它会先备份再 `ingress validate`，不过就回滚** —— 同一条 tunnel 上还挂着别的站点。
 - 前端 `dist` 只有一份，build 一次即可。
 
 ## 隔离到什么程度
