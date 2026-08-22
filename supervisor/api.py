@@ -20,6 +20,7 @@ from . import provisioning
 from .config_store import ConfigStore
 from .sticker_api import create_sticker_router
 from .instances import load_instances, url_prefix
+from .log_access import LogReader
 from .process_manager import ProcessManager
 from .qq_intent import IntentResult as QQIntentResult, build_instruction as qq_intent_instruction
 from .state import SupervisorState
@@ -1754,6 +1755,58 @@ def create_app(
                 })
         result.sort(key=lambda x: x["created_at"], reverse=True)
         return result
+
+    @app.get("/v1/admin/runtime/logs")
+    async def runtime_logs(request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        reader = LogReader(app.state.state.workspace_root / "data" / "logs")
+        return {
+            "files": [
+                {"name": row.name, "size": row.size, "modified": row.modified}
+                for row in reader.list()
+            ],
+        }
+
+    @app.get("/v1/admin/runtime/logs/{name}")
+    async def runtime_log_tail(name: str, request: Request, lines: int = 500) -> dict[str, Any]:
+        verify_admin_token(request)
+        reader = LogReader(app.state.state.workspace_root / "data" / "logs")
+        result = reader.tail(name, lines=lines)
+        if result is None:
+            raise HTTPException(status_code=404, detail="没有这个日志文件")
+        text, truncated = result
+        return {"name": name, "text": text, "truncated": truncated}
+
+    @app.get("/v1/admin/runtime/status")
+    async def runtime_status(request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        pm: ProcessManager | None = app.state.process_manager
+        with st._lock:
+            generations = dict(st._engine_generations)
+            queued = sum(1 for t in st.tasks.values() if t.status == "queued")
+            running = sum(1 for t in st.tasks.values() if t.status == "running")
+        workers = pm.worker_health() if pm is not None else {}
+        for name, row in workers.items():
+            row["generation"] = generations.get(name, "")
+        return {
+            # 没有 process manager 时 workers 是空的 —— 界面要能说清「测不到」而不是「都挂了」。
+            "supervised": pm is not None,
+            "workers": workers,
+            "tasks": {"queued": queued, "running": running},
+            "started_at": st.started_at.isoformat(),
+            "uptime_sec": round((_now() - st.started_at).total_seconds(), 1),
+        }
+
+    @app.post("/v1/admin/runtime/engine/retry")
+    async def runtime_engine_retry(request: Request) -> dict[str, Any]:
+        """看门狗停手之后的人工重试。"""
+        verify_admin_token(request)
+        pm: ProcessManager | None = app.state.process_manager
+        if pm is None:
+            raise HTTPException(status_code=409, detail="这个部署没有 process manager，engine 不由它拉起")
+        pm.clear_given_up()
+        return {"ok": True}
 
     @app.post("/v1/admin/restart", response_model=RestartOut)
     async def admin_restart(inp: RestartIn, request: Request) -> RestartOut:

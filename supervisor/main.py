@@ -21,7 +21,7 @@ from workspace import resolve_workspace_root
 from .api import create_app
 from .instances import url_prefix
 from .config_store import ConfigStore
-from .eventlog import EventLog
+from .eventlog import EventLog, SYSTEM_SESSION_ID
 from .policy import PolicyEngine
 from .process_manager import ProcessManager
 from .scheduler import SchedulerThread
@@ -147,6 +147,18 @@ def main() -> None:
         )
         if not args.no_kernel:
             process_manager.start_engine()
+
+            # engine 崩了 supervisor 照样活着，systemd 看到的仍是 active running。
+            # 没有这条看门狗，界面和进程表都不会有任何异常迹象。
+            def _watchdog_event(kind: str, payload: dict) -> None:
+                state.eventlog.append(
+                    session_id=SYSTEM_SESSION_ID,
+                    component="supervisor",
+                    type_=kind,
+                    payload=payload,
+                )
+
+            process_manager.start_watchdog(on_event=_watchdog_event)
         if not args.no_shell and process_manager.spawn_shell_cli:
             process_manager.start_shell_cli()
 
