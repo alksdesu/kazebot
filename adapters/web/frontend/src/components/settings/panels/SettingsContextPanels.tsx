@@ -4,14 +4,14 @@
 // tool schemas, and MCP connection data. How: read snapshots from the settings
 // selection store and render small Chinese summaries. Purpose: each tab can keep its
 // main workflow focused while the right rail provides reference details.
-import { useEffect, useId, useState, type ReactNode } from 'react';
+import { useEffect, useId, useMemo, useState, type ReactNode } from 'react';
 
 // [2026-06-02] Add raw MCP and schedule endpoints for the right-panel form editors.
 // Why: the second editable Settings batch saves selected MCP clients and schedules
 // through full raw YAML reloads. How: import only the existing raw read/write wrappers
 // alongside the earlier node, skill, and tool helpers. Purpose: the panel can update
 // one selected item without introducing new API contracts or touching other panels.
-import { getMcpClientsRaw, getNodeRaw, getNodes, getProviders, getSchedulesRaw, getSkillRaw, getToolRaw, reloadTools, updateMcpClientsRaw, updateNodeRaw, updateSchedulesRaw, updateSkillRaw, updateToolRaw } from '../../../api/supervisorClient';
+import { getMcpClientsRaw, getNodeRaw, getNodes, getProviders, getSchedulesRaw, getSkillRaw, getToolRaw, listUpstreamModels, reloadTools, updateMcpClientsRaw, updateNodeRaw, updateSchedulesRaw, updateSkillRaw, updateToolRaw } from '../../../api/supervisorClient';
 // [2026-06-02] Use shared lightweight structured YAML helpers in the two requested panels.
 // Why: MCP clients and automation schedules already have parse and serialize helpers
 // that preserve the expected config shape. How: import the form state types and
@@ -109,8 +109,32 @@ export const AgentsSettingsRightPanel = () => {
   const [nodeMessage, setNodeMessage] = useState('');
   const [modelChoices, setModelChoices] = useState<string[]>([]);
   const [providerChoices, setProviderChoices] = useState<string[]>([]);
+  const [fetchedModels, setFetchedModels] = useState<string[]>([]);
+  const [fetchingModels, setFetchingModels] = useState(false);
+  const [modelFetchNote, setModelFetchNote] = useState('');
   const modelListId = useId();
-  const providerListId = useId();
+  // 刚从上游拉回来的排前面：那才是这个渠道真有的。
+  const modelOptions = useMemo(
+    () => [...new Set([...fetchedModels, ...modelChoices])],
+    [fetchedModels, modelChoices],
+  );
+
+  const fetchModels = async () => {
+    const provider = nodeConfigForm.provider.trim();
+    if (!adminToken || !provider) return;
+    setFetchingModels(true);
+    setModelFetchNote('');
+    try {
+      // 地址和密钥后端按渠道名自己取，这里不该也没必要碰它们。
+      const models = await listUpstreamModels(adminToken, provider, {});
+      setFetchedModels(models);
+      setModelFetchNote(`拉到 ${models.length} 个模型。`);
+    } catch (error) {
+      setModelFetchNote(error instanceof Error ? error.message : '拉取模型失败');
+    } finally {
+      setFetchingModels(false);
+    }
+  };
 
   const updateNodeConfigForm = (patch: Partial<NodeConfigFormState>) => {
     // [2026-06-02] Apply small form patches instead of editing raw YAML directly.
@@ -257,33 +281,55 @@ export const AgentsSettingsRightPanel = () => {
                   </select>
                 </label>
                 <label className="block">
-                  <span className={STRUCTURED_LABEL_CLASS}>模型</span>
-                  <input
+                  <span className={STRUCTURED_LABEL_CLASS}>渠道，可选</span>
+                  <select
+                    aria-label="渠道"
                     className={STRUCTURED_INPUT_CLASS}
-                    list={modelChoices.length ? modelListId : undefined}
-                    onChange={(event) => updateNodeConfigForm({ model: event.target.value })}
-                    value={nodeConfigForm.model}
-                  />
-                  {modelChoices.length > 0 && (
-                    <datalist id={modelListId}>
-                      {modelChoices.map((choice) => <option key={choice} value={choice} />)}
-                    </datalist>
-                  )}
-                </label>
-                <label className="block">
-                  <span className={STRUCTURED_LABEL_CLASS}>供应商，可选</span>
-                  <input
-                    className={STRUCTURED_INPUT_CLASS}
-                    list={providerChoices.length ? providerListId : undefined}
-                    onChange={(event) => updateNodeConfigForm({ provider: event.target.value })}
+                    onChange={(event) => {
+                      updateNodeConfigForm({ provider: event.target.value });
+                      setFetchedModels([]);
+                      setModelFetchNote('');
+                    }}
                     value={nodeConfigForm.provider}
-                  />
-                  {providerChoices.length > 0 && (
-                    <datalist id={providerListId}>
-                      {providerChoices.map((choice) => <option key={choice} value={choice} />)}
+                  >
+                    <option value="">跟随活跃渠道</option>
+                    {/* 存着的值可能是手写进 yaml 的，列不出来就会在保存时被悄悄改掉。 */}
+                    {nodeConfigForm.provider && !providerChoices.includes(nodeConfigForm.provider) && (
+                      <option value={nodeConfigForm.provider}>{nodeConfigForm.provider}（后端不认）</option>
+                    )}
+                    {providerChoices.map((choice) => <option key={choice} value={choice}>{choice}</option>)}
+                  </select>
+                </label>
+                {/* 不用 label 包：里头那颗按钮会连带触发 label 的聚焦。 */}
+                <div className="block">
+                  <span className={STRUCTURED_LABEL_CLASS}>模型</span>
+                  <div className="flex gap-2">
+                    <input
+                      aria-label="模型"
+                      className={STRUCTURED_INPUT_CLASS}
+                      list={modelOptions.length ? modelListId : undefined}
+                      onChange={(event) => updateNodeConfigForm({ model: event.target.value })}
+                      value={nodeConfigForm.model}
+                    />
+                    <button
+                      className="flex-shrink-0 border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-[0.6rem] hover:border-[var(--duties-text)] disabled:opacity-50"
+                      disabled={!nodeConfigForm.provider.trim() || fetchingModels}
+                      onClick={() => void fetchModels()}
+                      title={nodeConfigForm.provider.trim() ? '问这个渠道有哪些模型' : '先选一个渠道'}
+                      type="button"
+                    >
+                      {fetchingModels ? '拉取中' : '拉取模型'}
+                    </button>
+                  </div>
+                  {modelOptions.length > 0 && (
+                    <datalist id={modelListId}>
+                      {modelOptions.map((choice) => <option key={choice} value={choice} />)}
                     </datalist>
                   )}
-                </label>
+                  {modelFetchNote && (
+                    <p className="mt-1 text-[0.6rem] text-[var(--duties-tertiary)]">{modelFetchNote}</p>
+                  )}
+                </div>
                 <label className="block">
                   <span className={STRUCTURED_LABEL_CLASS}>记忆簿，可选</span>
                   <input className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ memory_book: event.target.value })} value={nodeConfigForm.memory_book} />
