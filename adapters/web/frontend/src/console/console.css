@@ -2,11 +2,6 @@
    全部收在 [data-surface="console"] 里：既有 chat/settings 用暖调 --duties-*，
    两套变量同名会互相污染，所以控制台的 --qc-* 一层都不往外泄。 */
 
-/* 只拉丁子集、只本文件实际用到的三档字重，多拉一档就多一个没人下载的 woff2。 */
-@import '@fontsource/ibm-plex-mono/latin-400.css';
-@import '@fontsource/ibm-plex-mono/latin-500.css';
-@import '@fontsource/ibm-plex-mono/latin-600.css';
-
 [data-surface='console'] {
   --qc-paper: #ffffff;
   --qc-shelf: #f6f7f6;

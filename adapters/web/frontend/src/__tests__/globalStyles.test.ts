@@ -11,25 +11,20 @@ import { describe, expect, it } from 'vitest';
 const stylesheetPath = resolve(__dirname, '../styles/index.css');
 const stylesheet = readFileSync(stylesheetPath, 'utf8');
 
-const consoleStylesheetPath = resolve(__dirname, '../console/console.css');
-const consoleStylesheet = readFileSync(consoleStylesheetPath, 'utf8');
-
-// 400 is never spelled out: it is what every console element falls back to.
-const consoleFontWeights = new Set([
-  '400',
-  ...[...consoleStylesheet.matchAll(/font-weight:\s*(\d+)/g)].map((match) => match[1]),
-]);
+// 拉丁子集的三档。字重写在这里而不是从 css 里扫：接进 Tailwind 之后字重来自
+// font-medium/font-semibold 这类 utility，css 文本里根本没有 font-weight 声明。
+const FONT_WEIGHTS = ['400', '500', '600'];
 
 type BuiltFile = { fileName: string; source?: string | Uint8Array };
 
-async function buildConsoleStylesheet(): Promise<BuiltFile[]> {
+async function buildStylesheet(): Promise<BuiltFile[]> {
   const result = (await build({
     configFile: false,
     logLevel: 'silent',
     plugins: [tailwindcss()],
     build: {
       write: false,
-      rollupOptions: { input: consoleStylesheetPath },
+      rollupOptions: { input: stylesheetPath },
     },
   })) as unknown as { output: BuiltFile[] } | Array<{ output: BuiltFile[] }>;
   return Array.isArray(result) ? result[0].output : result.output;
@@ -46,16 +41,19 @@ describe('global Duties styles', () => {
   });
 });
 
-describe('console monospace font', () => {
-  it('names IBM Plex Mono first in the console monospace stack', () => {
-    const stack = consoleStylesheet.match(/--qc-mono:\s*([^;]+);/)?.[1];
-    expect(stack?.split(',')[0].trim()).toBe("'IBM Plex Mono'");
+describe('IBM Plex Mono', () => {
+  // 字体曾经只由 console.css 引入。那个文件一删，全站的等宽字体会静默退回系统栈，
+  // 而 font-family 声明还在，看不出任何异常。
+  it('is imported by the global stylesheet, not by any one surface', () => {
+    expect(stylesheet).toContain('@fontsource/ibm-plex-mono/latin-400.css');
+    expect(stylesheet).toContain('@fontsource/ibm-plex-mono/latin-500.css');
+    expect(stylesheet).toContain('@fontsource/ibm-plex-mono/latin-600.css');
   });
 
-  // A font-family declaration proves nothing on its own: an @import can be resolved away
-  // during the CSS build, leaving the stack with no @font-face and a silent system fallback.
-  it('ships one IBM Plex Mono face per console font weight through the CSS build', async () => {
-    const output = await buildConsoleStylesheet();
+  // 光有 font-family 声明说明不了什么：@import 可能在构建时被解析掉，
+  // 留下一个没有 @font-face 的字体栈和一次无声的系统回退。
+  it('ships one face per weight through the CSS build', async () => {
+    const output = await buildStylesheet();
 
     const css = String(output.find((file) => file.fileName.endsWith('.css'))?.source ?? '');
     const faceBodies = [...css.matchAll(/@font-face\s*\{([^}]*)\}/g)].map((match) => match[1]);
@@ -63,9 +61,9 @@ describe('console monospace font', () => {
       .filter((body) => /font-family:\s*['"]?IBM Plex Mono['"]?/.test(body))
       .map((body) => body.match(/font-weight:\s*(\d+)/)?.[1] ?? '');
 
-    expect([...shippedWeights].sort()).toEqual([...consoleFontWeights].sort());
+    expect([...shippedWeights].sort()).toEqual([...FONT_WEIGHTS].sort());
 
     const woff2 = output.filter((file) => file.fileName.endsWith('.woff2'));
-    expect(woff2).toHaveLength(consoleFontWeights.size);
+    expect(woff2).toHaveLength(FONT_WEIGHTS.length);
   }, 30000);
 });

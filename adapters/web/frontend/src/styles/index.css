@@ -3,6 +3,11 @@
    The purpose is to keep visual tokens reusable while allowing components to use Tailwind utility classes. */
 @import 'tailwindcss';
 
+/* 只拉丁子集、只实际用到的三档字重，多拉一档就多一个没人下载的 woff2。 */
+@import '@fontsource/ibm-plex-mono/latin-400.css';
+@import '@fontsource/ibm-plex-mono/latin-500.css';
+@import '@fontsource/ibm-plex-mono/latin-600.css';
+
 :root {
   --duties-bg: #f1f0ee;
   --duties-panel: #e8e7e5;
@@ -17,6 +22,9 @@
   --duties-tertiary: #6e6e73;
   --duties-border: #ccc;
   --duties-accent: #feaf2c;
+  /* 语义色。删除按钮、在线指示这类东西没法用中性灰表达，靠位置猜要出事。 */
+  --duties-danger: #8a2b1e;
+  --duties-live: #0b6e4f;
   /* Why: browser default scrollbars are visually heavy against the minimal Duties shell.
      How: expose scrollbar-specific tokens derived from the existing theme palette.
      Purpose: let Firefox and WebKit/Blink share one low-contrast, maintainable scrollbar design. */
@@ -66,6 +74,23 @@
 
 *::-webkit-scrollbar-corner {
   background: transparent;
+}
+
+/* 表单控件的 UA 默认样式。不显式接管的话按钮拿不到页面字体，复选框是系统蓝，
+   焦点环是 Chrome 那个蓝双环 —— 跟这套暖灰配色对不上。
+   :where() 让优先级归零，任何组件 class 都盖得住。 */
+:where(button, input, select, textarea) {
+  color: inherit;
+  font: inherit;
+}
+
+:where(input[type='checkbox'], input[type='radio']) {
+  accent-color: var(--duties-text);
+}
+
+:where(:focus-visible) {
+  outline: 2px solid var(--duties-text);
+  outline-offset: 2px;
 }
 
 html,
