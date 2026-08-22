@@ -355,6 +355,10 @@ class ProviderConfigPublic(BaseModel):
     model: str = ""
     api_key_present: bool = False
     api_key_redacted: str = ""
+    # 块名只是名字，这个才决定请求按谁的格式发。没写就等于块名。
+    type: str = ""
+    type_explicit: bool = False
+    label: str = ""
 
 
 class ProvidersResponse(BaseModel):
@@ -385,6 +389,9 @@ class ProviderUpdateIn(BaseModel):
     model: str | None = None
     # 收不收图片。auto 表示删掉这一项、回去跟随这家的默认；None 表示不动。
     supports_vision: Literal["auto", "yes", "no"] | None = None
+    # 线格式。空串表示删掉这一项、回去按块名猜；None 表示不动。
+    type: str | None = None
+    label: str | None = None
 
 
 class ActiveProviderIn(BaseModel):

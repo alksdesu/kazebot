@@ -77,7 +77,10 @@ beforeEach(() => {
 });
 
 const rows = () => screen.getAllByRole('listitem');
-const rowFor = (name: string) => rows().find((row) => within(row).queryByText(name))!;
+// 认标题里的渠道名，不能按行内文本找：每行的格式下拉都列着全部家族名。
+const rowFor = (name: string) => rows().find(
+  (row) => row.querySelector('.qc-cap-name')?.textContent === name,
+)!;
 const saveChain = () => fireEvent.click(screen.getByRole('button', { name: '保存渠道' }));
 
 describe('渠道列表', () => {
@@ -164,7 +167,7 @@ describe('新增与删除', () => {
     // 后端认不出空块，先建会让它从列表里消失。
     render(<ProvidersPage />);
     await screen.findByText('渠道');
-    fireEvent.change(screen.getByLabelText('新增渠道'), { target: { value: 'deepseek' } });
+    fireEvent.change(screen.getByLabelText('新渠道格式'), { target: { value: 'deepseek' } });
     fireEvent.click(screen.getByRole('button', { name: '添加' }));
 
     expect(rows()).toHaveLength(3);
@@ -178,17 +181,49 @@ describe('新增与删除', () => {
     expect(vi.mocked(upsertProvider).mock.calls[0][1]).toBe('deepseek');
   });
 
-  it('已经配过的渠道不再出现在新增列表里', async () => {
+  it('每种格式都能再开一个，已经配过的也不例外', async () => {
+    // 同一家挂两个中转是常态，可选格式不该因为配过一次就少一项。
     render(<ProvidersPage />);
     await screen.findByText('渠道');
-    const options = within(screen.getByLabelText('新增渠道')).getAllByRole('option');
-    expect(options.map((option) => (option as HTMLOptionElement).value)).toEqual(['', 'deepseek']);
+    const options = within(screen.getByLabelText('新渠道格式')).getAllByRole('option');
+
+    expect(options.map((option) => (option as HTMLOptionElement).value))
+      .toEqual(['', 'openai', 'anthropic', 'deepseek']);
+  });
+
+  it('同一格式的第二个渠道自己起名，格式一起提交', async () => {
+    render(<ProvidersPage />);
+    await screen.findByText('渠道');
+    fireEvent.change(screen.getByLabelText('新渠道名'), { target: { value: 'openai-relay' } });
+    fireEvent.change(screen.getByLabelText('新渠道格式'), { target: { value: 'openai' } });
+    fireEvent.click(screen.getByRole('button', { name: '添加' }));
+
+    fireEvent.change(within(rowFor('openai-relay')).getByLabelText('openai-relay 模型'), {
+      target: { value: 'gpt-5.5' },
+    });
+    saveChain();
+
+    await waitFor(() => expect(upsertProvider).toHaveBeenCalledTimes(1));
+    const [, name, body] = vi.mocked(upsertProvider).mock.calls[0];
+    expect(name).toBe('openai-relay');
+    // 名字猜不出家族，不带上 type 后端只能拒。
+    expect(body.type).toBe('openai');
+  });
+
+  it('重名的渠道加不进去', async () => {
+    render(<ProvidersPage />);
+    await screen.findByText('渠道');
+    fireEvent.change(screen.getByLabelText('新渠道名'), { target: { value: 'openai' } });
+    fireEvent.change(screen.getByLabelText('新渠道格式'), { target: { value: 'anthropic' } });
+
+    expect((screen.getByRole('button', { name: '添加' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/已经有一个叫 openai 的渠道/)).toBeTruthy();
   });
 
   it('还没保存的渠道不能设为活跃', async () => {
     render(<ProvidersPage />);
     await screen.findByText('渠道');
-    fireEvent.change(screen.getByLabelText('新增渠道'), { target: { value: 'deepseek' } });
+    fireEvent.change(screen.getByLabelText('新渠道格式'), { target: { value: 'deepseek' } });
     fireEvent.click(screen.getByRole('button', { name: '添加' }));
 
     const button = within(rowFor('deepseek')).getByRole('button', { name: '设为活跃' });
@@ -198,7 +233,7 @@ describe('新增与删除', () => {
   it('删掉还没保存的渠道只是丢掉草稿，不打后端', async () => {
     render(<ProvidersPage />);
     await screen.findByText('渠道');
-    fireEvent.change(screen.getByLabelText('新增渠道'), { target: { value: 'deepseek' } });
+    fireEvent.change(screen.getByLabelText('新渠道格式'), { target: { value: 'deepseek' } });
     fireEvent.click(screen.getByRole('button', { name: '添加' }));
     fireEvent.click(within(rowFor('deepseek')).getByRole('button', { name: '删除' }));
 

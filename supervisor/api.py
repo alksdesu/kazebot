@@ -400,12 +400,17 @@ def create_app(
     async def upsert_provider(name: str, body: ProviderUpdateIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
         from providers import registry as provider_registry
-        if name not in provider_registry.list():
-            raise HTTPException(status_code=400, detail=f"Unknown provider '{name}'. Available: {provider_registry.list()}")
         cs: ConfigStore = app.state.config_store
+        # 渠道名随便起，同一家可以开好几个；被校验的是它说自己走哪种线格式。
+        wire = (body.type or "").strip().lower() or cs.wire_of(name)
+        if wire not in provider_registry.list():
+            raise HTTPException(
+                status_code=400,
+                detail=f"不认识的线格式 '{wire}'。可选：{provider_registry.list()}",
+            )
         return cs.upsert_provider(
             name, base_url=body.base_url, api_key=body.api_key, model=body.model,
-            supports_vision=body.supports_vision,
+            supports_vision=body.supports_vision, wire=body.type, label=body.label,
         )
 
     @app.post("/v1/config/providers/{name}/models")
@@ -417,10 +422,11 @@ def create_app(
         import httpx
         from providers import registry as provider_registry
 
-        cls = provider_registry.get(name)
+        cs: ConfigStore = app.state.config_store
+        # 列模型的接口按家族走，名字是用户自己起的，先换成线格式再查。
+        cls = provider_registry.get(cs.wire_of(name))
         if cls is None:
             raise HTTPException(status_code=400, detail=f"没有叫 '{name}' 的渠道")
-        cs: ConfigStore = app.state.config_store
         stored_url, stored_key = cs.resolve_provider_credentials(name)
         if body.slot:
             # 槽位自己配的那份优先：它才是这个页面在编辑的东西，渠道块只是它的兜底。

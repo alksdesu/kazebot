@@ -28,8 +28,8 @@
 
 version: 1
 
-# 当前生效的主渠道，对应下方的一个 provider 块名。它同时决定用哪套请求格式，
-# 所以改这里就是换家。写了自己 provider 的节点不跟随。控制台「渠道」页可改。
+# 当前生效的主渠道，对应下方的一个渠道块名。写了自己 provider 的节点不跟随。
+# 控制台「渠道」页可改。
 provider: openai
 
 # ---------------------------------------------------------------------------
@@ -47,6 +47,26 @@ openai:
 
   # 默认模型；留空时回退到 gpt-4o-mini
   model: "${OPENAI_MODEL}"
+
+# ---------------------------------------------------------------------------
+# 同一家挂多个渠道
+# ---------------------------------------------------------------------------
+# 块名只是名字，随便起；决定请求按谁的格式发的是块内的 type。不写 type 就拿块名
+# 当 type，所以上面那种「块名就是家族名」的老写法原样继续有效。
+# 这样同一家可以挂好几个（不同中转、不同额度），provider: 指到哪个就用哪个。
+#
+# gemini-relay:
+#   type: gemini                     # 必填：openai / openai-responses / anthropic / gemini
+#   label: "Gemini 中转（便宜）"      # 可选：控制台上显示的名字
+#   base_url: https://relay-a.example
+#   api_key: "${RELAY_A_KEY}"
+#   model: gemini-3-pro
+#
+# gemini-official:
+#   type: gemini
+#   base_url: https://generativelanguage.googleapis.com
+#   api_key: "${GEMINI_API_KEY}"
+#   model: gemini-3-flash
 
 # ---------------------------------------------------------------------------
 # 系统模型渠道（压缩 / 轮摘要 / 读图 / 生图）
@@ -134,7 +154,7 @@ openai:
 #     视觉入口节点。不写就按这家 provider 的默认算（deepseek 视作不收图，其余收）。
 #     控制台「渠道」页每张卡片上的「带图消息」就是这一项。
 
-# 备选渠道用到的 provider 配置块（key 建议直接用 provider 类型名）。
+# 备选渠道用到的渠道块。名字随便起，非家族名的记得在块里写 type。
 # api_key / base_url 放 .env，用 ${VAR} 引用即可。
 deepseek:
   base_url: "${DEEPSEEK_BASE_URL}"   # 例如 https://api.deepseek.com/v1

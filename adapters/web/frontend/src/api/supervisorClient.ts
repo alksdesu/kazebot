@@ -400,9 +400,16 @@ export interface ProviderConfigPublic {
   api_key_redacted: string;
   /** 收不收图片。null = 没配，跟随这家 provider 的默认。 */
   supports_vision: boolean | null;
+  /** 线格式。渠道名随便起，这个才决定请求按谁的格式发。 */
+  type: string;
+  /** 块里真写了 type，false 表示是从渠道名猜的。 */
+  type_explicit: boolean;
+  label: string;
 }
 
-export interface FallbackEntryPublic extends Omit<ProviderConfigPublic, 'supports_vision'> {
+// 备选条目靠 provider 指向某个渠道，自己不带 type/label。
+export interface FallbackEntryPublic
+  extends Omit<ProviderConfigPublic, 'supports_vision' | 'type' | 'type_explicit' | 'label'> {
   provider: string;
   supports_vision: boolean;
   // 只含该 provider 声明过的参数；手写进 yaml 的其余键不公布，保存时由后端保住。
@@ -509,6 +516,8 @@ export async function upsertProvider(
   data: {
     base_url?: string; api_key?: string; model?: string;
     supports_vision?: 'auto' | 'yes' | 'no';
+    // 空串是「回去按渠道名猜」，不传才是「不动」。
+    type?: string; label?: string;
   },
 ): Promise<ProvidersResponse> {
   const resp = await apiFetch(`/config/providers/${encodeURIComponent(name)}`, {

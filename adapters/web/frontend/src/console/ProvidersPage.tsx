@@ -24,6 +24,12 @@ import { VisionRouting } from './VisionRouting';
 
 interface Draft {
   name: string;
+  /** 线格式。决定请求按谁的格式发，和渠道名再无关系。 */
+  type: string;
+  /** 块里真写了 type，而不是从名字猜出来的。 */
+  typeExplicit: boolean;
+  /** 给人看的名字，留空就显示块名。 */
+  label: string;
   model: string;
   baseUrl: string;
   apiKeyInput: string;
@@ -42,6 +48,9 @@ const say = (error: unknown): string => (error instanceof Error ? error.message 
 
 const toDraft = (name: string, block: ProviderConfigPublic): Draft => ({
   name,
+  type: block.type || name,
+  typeExplicit: !!block.type_explicit,
+  label: block.label || '',
   // 回填展开前的原文，否则保存一次就把变量引用烧成了当时的展开值。
   model: block.model_raw,
   baseUrl: block.base_url_raw,
@@ -67,11 +76,13 @@ const changed = (draft: Draft, stored: Draft | undefined): boolean => (
   || draft.model !== stored.model
   || draft.baseUrl !== stored.baseUrl
   || draft.vision !== stored.vision
+  || draft.type !== stored.type
+  || draft.label !== stored.label
   || draft.apiKeyInput.trim() !== ''
 );
 
 const Row = ({
-  draft, stored, active, busy, choices, listId, profiles, onChange, onActivate, onRemove,
+  draft, stored, active, busy, choices, listId, profiles, families, onChange, onActivate, onRemove,
 }: {
   draft: Draft;
   stored: Draft | undefined;
@@ -80,6 +91,8 @@ const Row = ({
   profiles: ProviderProfiles | null;
   /** 别的渠道和备选链在用的模型名。上游中转定义值空间，这只是提示，不是封闭集合。 */
   choices: string[];
+  /** 后端注册过的线格式。 */
+  families: string[];
   listId: string;
   onChange: (next: Draft) => void;
   onActivate: () => void;
@@ -87,7 +100,8 @@ const Row = ({
 }) => (
   <li className="qc-cap">
     <div className="qc-cap-head">
-      <span className="qc-cap-name">{draft.name}</span>
+      <span className="qc-cap-name">{draft.label || draft.name}</span>
+      {draft.label && <span className="qc-cap-scope">{draft.name}</span>}
       {active
         ? <span className="qc-cap-scope">在用</span>
         : (
@@ -113,6 +127,31 @@ const Row = ({
       </button>
     </div>
 
+    <FieldRow label="格式">
+      <select
+        aria-label={draft.name + ' 线格式'}
+        className="qc-inp"
+        onChange={(event) => onChange({ ...draft, type: event.target.value, typeExplicit: true })}
+        value={draft.type}
+      >
+        {!families.includes(draft.type) && <option value={draft.type}>{draft.type}</option>}
+        {families.map((family) => <option key={family} value={family}>{family}</option>)}
+      </select>
+    </FieldRow>
+    {!draft.typeExplicit && !draft.fresh && (
+      <p className="qc-facts">没写 type，按渠道名当成了 {draft.type}。改这一项会把它明确写进配置。</p>
+    )}
+
+    <FieldRow label="备注">
+      <input
+        aria-label={draft.name + ' 备注'}
+        className="qc-inp"
+        onChange={(event) => onChange({ ...draft, label: event.target.value })}
+        placeholder="给自己看的名字，留空就显示渠道名"
+        value={draft.label}
+      />
+    </FieldRow>
+
     <ModelField
       apiKey={draft.apiKeyInput}
       ariaLabel={draft.name + ' 模型'}
@@ -135,7 +174,7 @@ const Row = ({
       />
     </FieldRow>
     <EnvHint raw={draft.baseUrl} resolved={draft.baseUrlResolved} savedRaw={stored?.baseUrl ?? ''} />
-    <HostMismatchHint baseUrl={draft.baseUrl} profiles={profiles} provider={draft.name} />
+    <HostMismatchHint baseUrl={draft.baseUrl} profiles={profiles} provider={draft.type} />
 
     <FieldRow label="密钥">
       <input
@@ -157,7 +196,7 @@ const Row = ({
         value={draft.vision}
       >
         <option value="auto">
-          {'跟随 ' + draft.name + ' 默认（' + (profiles?.defaultVision?.[draft.name] === false ? '看不了图' : '能看图') + '）'}
+          {'跟随 ' + draft.type + ' 默认（' + (profiles?.defaultVision?.[draft.type] === false ? '看不了图' : '能看图') + '）'}
         </option>
         <option value="yes">能看图</option>
         <option value="no">看不了图</option>
@@ -186,7 +225,8 @@ export const ProvidersPage = () => {
   const [pinned, setPinned] = useState<Draft[]>([]);
   const [overrides, setOverrides] = useState<Array<{ id: string; provider: string }>>([]);
   const [profiles, setProfiles] = useState<ProviderProfiles | null>(null);
-  const [adding, setAdding] = useState('');
+  const [addName, setAddName] = useState('');
+  const [addType, setAddType] = useState('');
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
   const [error, setError] = useState('');
@@ -226,10 +266,10 @@ export const ProvidersPage = () => {
   );
   const dirty = drafts.some((draft) => changed(draft, storedBy.get(draft.name)));
 
-  const addable = useMemo(() => {
-    const taken = new Set(drafts.map((draft) => draft.name));
-    return (data?.registered || []).filter((name) => !taken.has(name));
-  }, [data, drafts]);
+  const families = data?.registered || [];
+  // 名字留空就拿格式名当名字：同一家只开一个时，这和以前的行为一模一样。
+  const pendingName = addName.trim() || addType;
+  const nameTaken = drafts.some((draft) => draft.name === pendingName);
 
   const absorb = (next: ProvidersResponse, done: string) => {
     setData(next);
@@ -263,6 +303,9 @@ export const ProvidersPage = () => {
           model: draft.model.trim(),
           base_url: draft.baseUrl.trim(),
           supports_vision: draft.vision,
+          label: draft.label.trim(),
+          // 名字猜不出格式时必须写死，否则后端只能按块名去查，查不到就拒。
+          ...(draft.typeExplicit || draft.type !== draft.name ? { type: draft.type } : {}),
           // 只有真填了才提交，留空表示沿用原值。
           ...(key ? { api_key: key } : {}),
         });
@@ -289,6 +332,7 @@ export const ProvidersPage = () => {
                 busy={busy}
                 choices={mergeModelChoices(modelsFromProviders(data, draft.name))}
                 draft={draft}
+                families={families}
                 key={draft.name}
                 listId={listPrefix + '-' + draft.name}
                 profiles={profiles}
@@ -310,40 +354,54 @@ export const ProvidersPage = () => {
           </ul>
         )}
 
-        {addable.length > 0 && (
-          <div className="qc-cap-head">
-            <select
-              aria-label="新增渠道"
-              className="qc-inp"
-              onChange={(event) => setAdding(event.target.value)}
-              value={adding}
-            >
-              <option value="">选一家接入…</option>
-              {addable.map((name) => <option key={name} value={name}>{name}</option>)}
-            </select>
-            <button
-              className="qc-btn qc-btn-quiet"
-              disabled={!adding}
-              onClick={() => {
-                setDrafts([...drafts, {
-                  name: adding,
-                  model: '',
-                  baseUrl: '',
-                  apiKeyInput: '',
-                  keyPresent: false,
-                  keyRedacted: '',
-                  modelResolved: '',
-                  baseUrlResolved: '',
-                  vision: 'auto',
-                  fresh: true,
-                }]);
-                setAdding('');
-              }}
-              type="button"
-            >
-              添加
-            </button>
-          </div>
+        {families.length > 0 && (
+          <>
+            <div className="qc-cap-head">
+              <input
+                aria-label="新渠道名"
+                className="qc-inp"
+                onChange={(event) => setAddName(event.target.value)}
+                placeholder="渠道名，留空就用格式名"
+                value={addName}
+              />
+              <select
+                aria-label="新渠道格式"
+                className="qc-inp"
+                onChange={(event) => setAddType(event.target.value)}
+                value={addType}
+              >
+                <option value="">选格式…</option>
+                {families.map((name) => <option key={name} value={name}>{name}</option>)}
+              </select>
+              <button
+                className="qc-btn qc-btn-quiet"
+                disabled={!addType || nameTaken}
+                onClick={() => {
+                  setDrafts([...drafts, {
+                    name: pendingName,
+                    type: addType,
+                    typeExplicit: true,
+                    label: '',
+                    model: '',
+                    baseUrl: '',
+                    apiKeyInput: '',
+                    keyPresent: false,
+                    keyRedacted: '',
+                    modelResolved: '',
+                    baseUrlResolved: '',
+                    vision: 'auto',
+                    fresh: true,
+                  }]);
+                  setAddName('');
+                  setAddType('');
+                }}
+                type="button"
+              >
+                添加
+              </button>
+            </div>
+            {nameTaken && <p className="qc-facts">已经有一个叫 {pendingName} 的渠道了，换个名字。</p>}
+          </>
         )}
 
         <NodeOverrides nodes={overrides} />

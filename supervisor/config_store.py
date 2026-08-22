@@ -178,7 +178,8 @@ class ConfigStore:
             name = self._active_name()
             cfg = self._block_of(name)
             return ActiveProviderSecret(
-                provider=name,
+                # engine 拿它去 registry 取实现类，只能给线格式，不能给渠道名。
+                provider=self._type_of(name),
                 base_url=_resolve_env_value(cfg.base_url),
                 api_key=_resolve_env_value(cfg.api_key),
                 model=_resolve_env_value(cfg.model),
@@ -234,12 +235,26 @@ class ConfigStore:
         self.path.write_text(text, encoding="utf-8")
 
     def _is_provider_block(self, val: Any) -> bool:
-        return isinstance(val, dict) and any(k in val for k in ("base_url", "api_key", "model"))
+        return isinstance(val, dict) and any(k in val for k in ("base_url", "api_key", "model", "type"))
 
-    def _public_block(self, val: dict[str, Any]) -> dict[str, Any]:
+    def _type_of(self, name: str, data: dict[str, Any] | None = None) -> str:
+        """这个渠道说哪种线格式。
+
+        块名从此只是个名字，谁都能叫；决定请求怎么发的是块内的 type。没写 type 就
+        拿块名当 type —— 老配置里块名本来就是家族名，于是原样继续可用。
+        """
+        block = (self._load_raw() if data is None else data).get(name)
+        if isinstance(block, dict):
+            declared = str(block.get("type") or "").strip().lower()
+            if declared:
+                return declared
+        return (name or "").strip().lower() or "openai"
+
+    def _public_block(self, val: dict[str, Any], name: str = "") -> dict[str, Any]:
         # raw 一并给出去：编辑器回填展开值再保存，就把 ${VAR} 这层间接烧死在 config.yaml 里了。
         # api_key 没有 raw —— 那等于用明文换掉旁边的脱敏串。
         present, redacted = _redact_api_key(_resolve_env_value(val.get("api_key", "")))
+        declared = str(val.get("type") or "").strip().lower()
         return {
             "base_url": _resolve_env_value(val.get("base_url", "")),
             "model": _resolve_env_value(val.get("model", "")),
@@ -249,6 +264,10 @@ class ConfigStore:
             "api_key_redacted": redacted,
             # 没配就是 None：带图路由要区分「显式说了不收图」和「没说，按这家默认算」。
             "supports_vision": _tristate(val.get("supports_vision")),
+            "type": declared or (name or "").strip().lower(),
+            # 没写 type 的老块，界面上不该显示成「显式选过 gemini」。
+            "type_explicit": bool(declared),
+            "label": str(val.get("label") or "").strip(),
         }
 
     @staticmethod
@@ -278,11 +297,15 @@ class ConfigStore:
         if not isinstance(entry, dict):
             return {"provider": str(entry or "")}
         provider_name = str(entry.get("provider", "") or "").strip().lower()
-        public = self._public_block(entry)
+        public = self._public_block(entry, provider_name)
+        # 备选条目用 provider 指渠道，没有自己的 type/label；漏出去编辑器会原样回写。
+        for derived in ("type", "type_explicit", "label"):
+            public.pop(derived, None)
         public["provider"] = provider_name
         # 这两项引擎真在读：漏了它们，编辑器存一次就会把「支持图片」和请求参数抹掉。
         public["supports_vision"] = bool(entry.get("supports_vision", False))
-        public["options"] = self._public_options(provider_name, entry.get("options"))
+        # 条目指的可能是个自定义渠道名，得先问出它是哪家才知道有哪些参数可公布。
+        public["options"] = self._public_options(self._type_of(provider_name), entry.get("options"))
         return public
 
     def get_providers_public(self) -> dict[str, Any]:
@@ -297,7 +320,7 @@ class ConfigStore:
                 if key in self._META_KEYS:
                     continue
                 if self._is_provider_block(val):
-                    providers[key] = self._public_block(val)
+                    providers[key] = self._public_block(val, key)
 
             raw_chains = data.get("node_fallbacks")
             node_chains: dict[str, list[dict[str, Any]]] = {}
@@ -314,6 +337,11 @@ class ConfigStore:
                 "fallbacks": [self._public_fallback(fb) for fb in fallbacks],
                 "node_fallbacks": node_chains,
             }
+
+    def wire_of(self, name: str) -> str:
+        """这个渠道按哪种线格式发请求。查 providers 注册表前都得先过这一层。"""
+        with self._lock:
+            return self._type_of((name or "").strip() or self._active_name())
 
     def resolve_provider_credentials(self, name: str) -> tuple[str, str]:
         """按渠道名取展开后的 (base_url, api_key)。只给服务端自己发请求用。
@@ -351,25 +379,42 @@ class ConfigStore:
         直接走主模型还是绕去视觉节点。
         """
         with self._lock:
+            data = self._load_raw()
             block_name = (name or "").strip() or self._active_name()
-            block = self._load_raw().get(block_name)
+            block = data.get(block_name)
             explicit = _tristate(block.get("supports_vision") if isinstance(block, dict) else None)
+            wire = self._type_of(block_name, data)
         if explicit is not None:
             return explicit
         try:
             from providers import registry as provider_registry
-            return provider_registry.default_vision_support().get(block_name, True)
+            # 默认值是按家族定的，自定义渠道名在这张表里查不到。
+            return provider_registry.default_vision_support().get(wire, True)
         except Exception:
             return True
 
     def upsert_provider(self, name: str, *, base_url: str | None = None,
                         api_key: str | None = None, model: str | None = None,
-                        supports_vision: str | None = None) -> dict[str, Any]:
+                        supports_vision: str | None = None,
+                        wire: str | None = None, label: str | None = None) -> dict[str, Any]:
         """Create or update a provider entry."""
         with self._lock:
             data = self._load_raw()
             if name not in data or not isinstance(data.get(name), dict):
                 data[name] = {}
+            if wire is not None:
+                # 空字符串是「回去按块名猜」，和没传这个字段不是一回事。
+                cleaned = wire.strip().lower()
+                if cleaned:
+                    data[name]["type"] = cleaned
+                else:
+                    data[name].pop("type", None)
+            if label is not None:
+                cleaned = label.strip()
+                if cleaned:
+                    data[name]["label"] = cleaned
+                else:
+                    data[name].pop("label", None)
             if base_url is not None:
                 data[name]["base_url"] = base_url.strip()
             if api_key is not None:
@@ -510,7 +555,11 @@ class ConfigStore:
             return self.get_providers_public()
 
     # 读接口派生出来给编辑器用的字段。原样回写会在 yaml 里留下引擎不认识的键。
-    _DERIVED_KEYS = frozenset({"model_raw", "base_url_raw", "api_key_present", "api_key_redacted"})
+    # 备选条目认 provider 不认 type：那两个键是渠道块的东西，跟着读接口漏过来的。
+    _DERIVED_KEYS = frozenset({
+        "model_raw", "base_url_raw", "api_key_present", "api_key_redacted",
+        "type", "type_explicit", "label",
+    })
 
     # 编辑器用来指认「这一条是原来第几条」的传输字段，不写进 yaml。
     _ORIGIN_KEY = "_origin"
@@ -608,6 +657,13 @@ class ConfigStore:
             del data[name]
             fb = data.get("fallbacks", []) or []
             data["fallbacks"] = [f for f in fb if f.get("provider") != name]
+            # 节点链也得跟着清：漏在这里的条目会拿着已经不存在的渠道名去查配置，
+            # 继承到一份空的 url+key，然后在真的降级时才炸。
+            chains = data.get("node_fallbacks")
+            if isinstance(chains, dict):
+                for node_id, chain in list(chains.items()):
+                    if isinstance(chain, list):
+                        chains[node_id] = [f for f in chain if f.get("provider") != name]
             self._save_raw(data)
             self.reload()
             return self.get_providers_public()
