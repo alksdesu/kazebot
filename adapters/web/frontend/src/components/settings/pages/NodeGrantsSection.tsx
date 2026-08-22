@@ -120,10 +120,14 @@ const DefaultsNotice = ({ nodes }: { nodes: AdminNode[] }) => {
 
   return (
     <div className="mb-4 border border-[var(--duties-danger)] bg-[var(--duties-bg)] px-4 py-3">
-      <h3 className="m-0 text-sm font-semibold text-[var(--duties-danger)]">这里的默认值是「全放开」，不是「全收紧」</h3>
+      <h3 className="m-0 text-sm font-semibold text-[var(--duties-danger)]">新建节点默认是「全放开」，不是「全收紧」</h3>
       <p className="mt-1.5 text-xs leading-5 text-[var(--duties-secondary)]">
         在「智能体」页新建 AI 节点，模板写的是 <code>tool_access.mode: all</code>：一建出来就握着当前
         注册的每一个工具，以后新装的工具也自动算它的。要收紧得自己来，没人会替你收。
+      </p>
+      <p className="mt-1.5 text-xs leading-5 text-[var(--duties-secondary)]">
+        反过来，节点文件里<em className="not-italic text-[var(--duties-text)]">漏写</em> <code>tool_access</code>{' '}
+        是一个工具都不给，不会报错——模型只会看着什么都不做。
       </p>
       {wide.length > 0 && (
         <ul className="m-0 mt-2 list-none p-0">
