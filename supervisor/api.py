@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse, Response
 
 from .config_store import ConfigStore
+from .instances import load_instances, url_prefix
 from .process_manager import ProcessManager
 from .qq_intent import IntentResult as QQIntentResult, build_instruction as qq_intent_instruction
 from .state import SupervisorState
@@ -2172,16 +2173,32 @@ def create_app(
             raise HTTPException(status_code=401, detail="Unauthorized")
         return {"ok": True}
 
+    @app.get("/v1/instances")
+    async def list_instances(request: Request) -> dict[str, Any]:
+        """控制台账号切换器的数据源。单实例时 instances 为空，前端据此不渲染切换器。"""
+        # 清单里是真实 QQ 号，跟其它 admin 数据同一个门槛。
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        prefix = url_prefix()
+        return {
+            "current_prefix": prefix,
+            "instances": [
+                {**row, "current": row["path"] == prefix}
+                for row in load_instances(st.workspace_root)
+            ],
+        }
+
     web_dist = state.workspace_root / "adapters" / "web" / "frontend" / "dist"
     console_url = ""
     if web_dist.is_dir():
         @app.get("/", include_in_schema=False)
-        async def web_root() -> RedirectResponse:
+        async def web_root(request: Request) -> RedirectResponse:
             """域名直接指到这个端口，根路径不给个去处就只有一个 404。"""
-            return RedirectResponse(url="/web/")
+            # 挂在前缀下时 root_path 是那个前缀；不带上就会跳出本实例。
+            return RedirectResponse(url=f"{request.scope.get('root_path', '')}/web/")
 
         app.mount("/web", StaticFiles(directory=str(web_dist), html=True), name="web")
-        console_url = f"http://{host}:{port}/web/"
+        console_url = f"http://{host}:{port}{url_prefix()}/web/"
         print(f"[web] 前端地址: {console_url}", flush=True)
 
     init_admin_token(state.workspace_root, console_url=console_url)

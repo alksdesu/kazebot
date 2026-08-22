@@ -14,10 +14,12 @@ from pathlib import Path
 
 import uvicorn
 from dotenv import load_dotenv
+from fastapi import FastAPI
 
 from workspace import resolve_workspace_root
 
 from .api import create_app
+from .instances import url_prefix
 from .config_store import ConfigStore
 from .eventlog import EventLog
 from .policy import PolicyEngine
@@ -249,6 +251,14 @@ def main() -> None:
         state=state, process_manager=process_manager, config_store=config_store,
         host=args.host, port=args.port,
     )
+
+    prefix = url_prefix()
+    if prefix:
+        # 多开时几个号共用一个域名，靠路径前缀分流：同源才能共用登录态，
+        # WebSocket 也就不必经过任何代理。Mount 会自己剥前缀并设好 root_path。
+        mounted = FastAPI()
+        mounted.mount(prefix, app)
+        app = mounted
 
     env_access_log = (os.getenv("CLONOTH_ACCESS_LOG") or "").strip().lower() in {"1", "true", "yes", "y"}
     access_log = bool(args.access_log or env_access_log)
