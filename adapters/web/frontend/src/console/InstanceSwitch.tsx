@@ -1,7 +1,7 @@
 // 账号切换器。多开时几个号各是一套独立后端，共用域名、各挂一个路径前缀。
 import { useEffect, useState } from 'react';
 
-import { getInstances, MOUNT, type ConsoleInstance } from '../api/supervisorClient';
+import { getInstances, instanceConsoleHref, MOUNT, type ConsoleInstance } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 
 export const InstanceSwitch = () => {
@@ -20,9 +20,7 @@ export const InstanceSwitch = () => {
   const current = rows.find((row) => row.current)?.path ?? MOUNT;
 
   const go = (path: string) => {
-    if (path === current) return;
-    // 换的是后端不是页面，只能整页跳。带上 query 才能停在同一页而不是弹回第一页。
-    window.location.assign(`${path}/web/${window.location.search}`);
+    if (path !== current) window.location.assign(instanceConsoleHref(path));
   };
 
   return (

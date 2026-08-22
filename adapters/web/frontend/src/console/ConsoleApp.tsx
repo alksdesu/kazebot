@@ -37,7 +37,7 @@ const PAGES: Partial<Record<ConsoleDomain, () => JSX.Element>> = {
 };
 
 const PAGE_NOTES: Partial<Record<ConsoleDomain, string>> = {
-  account: 'bot 用哪个 QQ 号登录。换号会重启 NapCat，期间 bot 不可用；新号不在原来的群里的话，群名单和管理员名单都要重配。',
+  account: '两件事：换这一个实例登录的号（会重启 NapCat，期间 bot 不可用，新号不在原来的群里就得重配名单），和让多个号同时在线（多开，每个号一套独立进程与数据）。',
   channels: 'bot 只在名单里的群和私聊里出现。两份名单都是白名单，不在名单里的消息连处理都不会处理。',
   timing: '决定 bot 在群里什么时候说话。多个条件之间是「或」——命中任意一条就会回应，再由冷却决定是否真的开口。',
   permissions: '谁能对 bot 下管理命令。管理员权限跨所有群和私聊生效，不区分场景。',

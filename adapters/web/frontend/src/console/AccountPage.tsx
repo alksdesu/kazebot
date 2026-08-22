@@ -1,13 +1,19 @@
-// bot 用哪个 QQ 号登录。NapCat 只监听本机、且带自己的 token，所有动作都由 supervisor 代转。
+// 两件容易混的事：换这一个实例登录的号（下面的扫码与快速切换），和这台机器上
+// 同时跑着几个号（多开，各有各的进程与数据）。NapCat 只监听本机、且带自己的
+// token，所有账号动作都由 supervisor 代转。
 import { useCallback, useEffect, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 
 import {
+  getInstances,
   getQqAccount,
   getQqLoginQrcode,
+  instanceConsoleHref,
+  ownedByAnotherInstance,
   qqEnterLoginMode,
   qqPinAccount,
   qqQuickLogin,
+  type ConsoleInstance,
   type QqAccount,
   type QqQuickLoginTarget,
 } from '../api/supervisorClient';
@@ -29,6 +35,7 @@ export const AccountPage = () => {
   const [qrImage, setQrImage] = useState('');
   const [note, setNote] = useState('正在读取…');
   const [busy, setBusy] = useState(false);
+  const [instances, setInstances] = useState<ConsoleInstance[]>([]);
   const stageStartedAt = useRef(0);
 
   const refresh = useCallback(async (): Promise<QqAccount | null> => {
@@ -48,6 +55,12 @@ export const AccountPage = () => {
   useEffect(() => {
     void refresh().then((next) => { if (next) setNote(''); });
   }, [refresh]);
+
+  useEffect(() => {
+    if (!token) return;
+    // 读不到就当单实例：宁可少一块说明，也不能因为清单缺失把所有号都禁掉。
+    void getInstances(token).then(setInstances).catch(() => setInstances([]));
+  }, [token]);
 
   // 没登录上就一直盯着：等容器应答、等二维码、等扫码结果。首次部署进页面就是
   // 这个状态，早先只在换号时才轮询，于是第一次进来只能靠人反复手点。
@@ -108,7 +121,8 @@ export const AccountPage = () => {
       `确定要换号吗？\n\n${current} 会立刻下线，NapCat 容器重启后停在等扫码状态，`
       + '期间 bot 完全不可用。新号如果不在原来的群里，群名单和管理员名单都要重配。\n\n'
       + '新号的会话和长期记忆从零开始，各号各记各的。想把这个号的数据带过去，'
-      + '去「记忆」页搬迁；换回来时旧数据会自动回来。',
+      + '去「记忆」页搬迁；换回来时旧数据会自动回来。\n\n'
+      + '如果只是想让两个号同时在线，要的是多开而不是换号——见本页最下面那一块。',
     )) return;
     setBusy(true);
     setQrImage('');
@@ -173,7 +187,7 @@ export const AccountPage = () => {
 
   return (
     <>
-      <Block hint="bot 现在用哪个号在说话" title="机器人账号">
+      <Block hint="这一个实例现在用哪个号在说话" title="机器人账号">
         <div className="qc-panel">
           {account ? (
             <>
@@ -244,12 +258,13 @@ export const AccountPage = () => {
         </Block>
       )}
 
-      <Block hint="以前在这台机器上登录过的号，切回去不用扫码" title="快速切换">
+      <Block hint="换这一个实例登录的号，免扫码。数据不跟着走" title="快速切换">
         <div className="qc-panel">
           {account?.quick_login?.length ? (
             account.quick_login.map((target) => {
               const current = target.uin === account.uin;
               const usable = target.available !== false;
+              const elsewhere = ownedByAnotherInstance(target.uin, instances);
               return (
                 <div className="qc-chan-row" key={target.uin}>
                   <span className="qc-acct-who">
@@ -267,18 +282,29 @@ export const AccountPage = () => {
                     </span>
                   </span>
                   <div className="qc-chan-body">
-                    <button
-                      className="qc-btn qc-btn-quiet"
-                      disabled={busy || current || !usable}
-                      onClick={() => void switchTo(target)}
-                      type="button"
-                    >
-                      {current ? '当前账号' : '切到这个号'}
-                    </button>
-                    {!current && !usable && (
-                      <span className="qc-cap-desc" title={target.dead_reason || ''}>
-                        登录态已失效，只能扫码
-                      </span>
+                    {elsewhere ? (
+                      <>
+                        <a className="qc-btn qc-btn-quiet" href={instanceConsoleHref(elsewhere.path)}>
+                          去它的控制台
+                        </a>
+                        <span className="qc-cap-desc">这个号有自己的实例，不能从这里登</span>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          className="qc-btn qc-btn-quiet"
+                          disabled={busy || current || !usable}
+                          onClick={() => void switchTo(target)}
+                          type="button"
+                        >
+                          {current ? '当前账号' : '切到这个号'}
+                        </button>
+                        {!current && !usable && (
+                          <span className="qc-cap-desc" title={target.dead_reason || ''}>
+                            登录态已失效，只能扫码
+                          </span>
+                        )}
+                      </>
                     )}
                   </div>
                 </div>
@@ -287,6 +313,37 @@ export const AccountPage = () => {
           ) : (
             <p className="qc-facts">
               没有可免扫码切换的号。一个号在这台机器上登录过之后才会出现在这里。
+            </p>
+          )}
+        </div>
+      </Block>
+
+      <Block hint="一个号一套进程，会话、记忆、渠道、人格全部各自一份" title="多开实例">
+        <div className="qc-panel">
+          {instances.length > 1 ? (
+            instances.map((row) => (
+              <div className="qc-chan-row" key={row.uin}>
+                <span className="qc-acct-who">
+                  <span className="qc-acct-name">
+                    <strong>{row.label}</strong>
+                    <code>{row.uin}</code>
+                  </span>
+                </span>
+                <div className="qc-chan-body">
+                  {row.current ? (
+                    <span className="qc-cap-desc">就是这一个</span>
+                  ) : (
+                    <a className="qc-btn qc-btn-quiet" href={instanceConsoleHref(row.path)}>
+                      去它的控制台
+                    </a>
+                  )}
+                </div>
+              </div>
+            ))
+          ) : (
+            <p className="qc-facts">
+              这台机器上只有当前这一个号在跑。加一个号：在服务器上执行{' '}
+              <code>deploy/new_instance.sh &lt;QQ号&gt; 1</code>，它会打印剩下要做的三步。
             </p>
           )}
         </div>

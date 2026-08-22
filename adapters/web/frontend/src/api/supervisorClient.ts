@@ -643,6 +643,29 @@ export interface ConsoleInstance {
   current: boolean;
 }
 
+/**
+ * 另一个实例的控制台地址。
+ *
+ * 换的是后端不是页面，所以只能整页跳；带上 query 才会停在同一页而不是弹回第一页。
+ */
+export function instanceConsoleHref(path: string): string {
+  return `${path}/web/${window.location.search}`;
+}
+
+/**
+ * 这个号归不归别的实例管。归了就不能从本实例登过去 —— 同一个 QQ 双登，
+ * 两边会互相把对方踢下线，数据也会分成两份。
+ *
+ * 清单为空（单实例，或读不到）时一律返回 null：宁可不拦，也不能把所有号都锁死。
+ */
+export function ownedByAnotherInstance(
+  uin: string,
+  instances: ConsoleInstance[],
+): ConsoleInstance | null {
+  const owner = instances.find((row) => row.uin === uin);
+  return owner && !owner.current ? owner : null;
+}
+
 export async function getInstances(token: string): Promise<ConsoleInstance[]> {
   const resp = await apiFetch('/instances', { headers: authHeaders(token) });
   const data = await resp.json();
