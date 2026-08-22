@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import secrets
 from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, Response
@@ -96,6 +97,42 @@ def _load_attachment_policy() -> Any:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _audit_ops_caller(st: Any, request: Request, inp: Any) -> None:
+    """观察期：只记录，不拦。
+
+    /v1/ops/request 是全部策略判定的入口，而 is_admin 由调用方自报，端点本身不认凭证 ——
+    能连上这个端口的进程都可以把 approval_required 换成 auto。改成拒绝之前先跑一段，
+    确认日志里除了 engine 没有别的调用方，免得漏掉某条路径把工具调用全打死。
+
+    不走 verify_admin_token：那个失败会进退避表，观察期不该有任何副作用。
+    """
+    from .admin_api import get_admin_token
+
+    auth = request.headers.get("Authorization", "")
+    presented = auth[7:].strip() if auth.startswith("Bearer ") else ""
+    expected = get_admin_token()
+    if presented and expected and secrets.compare_digest(presented, expected):
+        return
+    try:
+        st.eventlog.append(
+            session_id="__system__",
+            component="supervisor",
+            type_="ops_request_unauthenticated",
+            # 只记有没有带、带了多长，不记值本身。
+            payload={
+                "op": str(getattr(inp, "op", "") or ""),
+                "node_id": str(getattr(inp, "node_id", "") or ""),
+                "session_id": str(getattr(inp, "session_id", "") or ""),
+                "token_presented": bool(presented),
+                "token_len": len(presented),
+                "client": getattr(getattr(request, "client", None), "host", "") or "",
+                "ts": _now().isoformat(),
+            },
+        )
+    except Exception:
+        pass  # 观察用的旁路，记不上不能影响工具执行
 
 
 def _verify_channel_ref(cs: ConfigStore, name: str) -> None:
@@ -1695,8 +1732,9 @@ def create_app(
         return a
 
     @app.post("/v1/ops/request", response_model=OpRequestOut)
-    async def ops_request(inp: OpRequestIn) -> OpRequestOut:
+    async def ops_request(inp: OpRequestIn, request: Request) -> OpRequestOut:
         st: SupervisorState = app.state.state
+        _audit_ops_caller(st, request, inp)
         # [AutoC 2026-05-31] Why: ops/request is the policy path used by tools.
         # How: pass optional tool_call_id/node_id/task_id through to the supervisor
         # state layer. Purpose: approval_requested events can update the active tool

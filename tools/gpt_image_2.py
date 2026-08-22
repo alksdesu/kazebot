@@ -49,7 +49,9 @@ SPEC = {
                 'description': '可选，本地图片路径列表，作为参考垫图传入模型'
             }
         }
-    }
+    },
+    # filename 直接拼进落盘路径，逃逸出图目录就能覆写任意文件，交给 write_file 规则判。
+    'guard': {'op': 'write_file', 'params': {'path': 'filename'}}
 }
 
 # [2026-07-19] 超时/重试对齐：单次请求 120s（正常生图 30-90s，超过基本是挂了），

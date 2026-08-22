@@ -472,14 +472,19 @@ def _to_openai_tools(specs: list[dict]) -> list[dict]:
     return result
 
 
-def _filter_tool_specs(node: "Node", all_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def tool_allowed(node: "Node", name: str) -> bool:
+    """这个节点能不能调这个工具。
+
+    授权语义只此一份：列表过滤和单名校验都走它，不然两处迟早漂移成两套规则。
+    未知 mode 落 none —— 配错了宁可什么都不给。
+    """
     mode = (node.tool_access.mode or "none").lower()
     if mode == "all":
-        denied = set(node.tool_access.deny)
-        if denied:
-            return [s for s in all_specs if s.get("name") not in denied]
-        return list(all_specs)
+        return name not in set(node.tool_access.deny)
     if mode == "allowlist":
-        allowed = set(node.tool_access.allow)
-        return [s for s in all_specs if s.get("name") in allowed]
-    return []
+        return name in set(node.tool_access.allow)
+    return False
+
+
+def _filter_tool_specs(node: "Node", all_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [s for s in all_specs if tool_allowed(node, s.get("name") or "")]

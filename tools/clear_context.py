@@ -14,7 +14,9 @@ SPEC = {'description': '清空指定 Discord 频道的对话上下文（Bot 端�
  'input_schema': {'properties': {'channel_id': {'description': 'Discord 频道 ID', 'type': 'string'}},
                   'required': ['channel_id'],
                   'type': 'object'},
- 'name': 'clear_context'}
+ 'name': 'clear_context',
+ # channel_id 会被拼进送往 Bot 进程执行的 Python 代码，policy 要看到拼进去的原值。
+ 'guard': {'op': 'execute_command', 'params': {'command': 'channel_id'}}}
 
 TIMEOUT_SEC = 30.0
 
@@ -35,6 +37,10 @@ if __name__ == "__main__":
     channel_id = str(args.get("channel_id", "")).strip()
     if not channel_id:
         fail("channel_id is required")
+    # 下面这个值会被拼进一段 Python 源码，交给 Bot 进程执行。不是纯数字就等于任意代码。
+    # isascii 一起查：int() 认全角数字，放过去 conversation_key 又会和拼进去的对不上。
+    if not (channel_id.isascii() and channel_id.isdigit()):
+        fail("channel_id must be a numeric Discord channel id")
 
     results = {}
 

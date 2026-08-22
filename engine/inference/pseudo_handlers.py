@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes as _mimetypes
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,8 @@ from .tool_format import ParsedToolCall
 from .pseudo_tools import _dispatch_target_from_tool_name
 from .message_model import MessageMeta, set_message_meta
 from ..conversation_store import MessageType
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +449,25 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     """
     target = str(args.get("target") or "").strip()
     instr = str(args.get("instruction") or "").strip()
+
+    # 目标是从工具名反查出来的，而反查表 _DISPATCH_TOOL_REVERSE 是进程内全局的，
+    # 别的节点注册过的目标这里一样查得到，查不到还会原样退回字符串。
+    # 不复核的话，白名单只管住了「模型看得见什么」，管不住「它敢写什么」——
+    # 编一个名字就能把活派给委派清单外的节点，连带用上那个节点的全部工具。
+    if target not in ls.allowed_dispatch_targets:
+        logger.warning(
+            "node %s attempted dispatch to non-delegate target: %s (allowed: %s)",
+            ls.node.id, target, sorted(ls.allowed_dispatch_targets),
+        )
+        _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
+            "success": False,
+            "error": (
+                f"'{target}' is not in this node's delegate_targets. "
+                f"Allowed: {sorted(ls.allowed_dispatch_targets) or '(none)'}"
+            ),
+        }, ensure_ascii=False))
+        return None
+
     # [AutoC 2026-07-09] Why: dispatch 的默认 context_mode 原先写死 accumulate，
     # 导致所有未显式指定模式的子节点都长期复用 child session（历史污染 / 成本上升）。
     # How: 显式传参优先；未传时按 target 节点的 persistent 声明推导——

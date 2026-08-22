@@ -31,6 +31,7 @@ from .attachments import build_multimodal_content
 from .context import RunContext
 from .model import resolve_provider
 from .context_store import load_context_snapshot
+from .inference.pseudo_tools import tool_allowed
 from .inference.tool_format import sanitize_control_tool_history
 
 from .node import Node, load_node
@@ -1316,6 +1317,20 @@ async def _run_tool_task(
         tool_call_id=str(input_data.get("tool_call_id") or task_id or ""),
         node_id=tool_name,
     )
+
+    # 独立 tool task 不经过 ai_step 那道白名单，这里得自己复核一遍，
+    # 否则派发方能借它调用自己 tool_access 之外的工具。
+    # 查不到发起节点就不放行：宁可这条路走不通，也不要一条没人管的执行入口。
+    _origin_node_id = str(input_data.get("origin_node_id") or "").strip()
+    _origin_node = load_node(ws_root, _origin_node_id) if _origin_node_id else None
+    if _origin_node is None or not tool_allowed(_origin_node, tool_name):
+        _why = (
+            f"发起节点 {_origin_node_id!r} 不存在或未指定"
+            if _origin_node is None
+            else f"工具 {tool_name} 不在节点 {_origin_node_id} 的授权列表内"
+        )
+        print(f"[engine] tool task refused: {_why} (task={task_id})", flush=True)
+        return {"action": "error", "node_id": tool_name, "summary": f"拒绝执行：{_why}"}
 
     await kctx.emit_event("handoff_progress", {
         "message": f"[tool] 开始执行 {tool_name}",

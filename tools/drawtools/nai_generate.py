@@ -47,6 +47,8 @@ SPEC = {
         },
         "required": ["prompt"],
     },
+    # filename 直接拼进落盘路径，逃逸出图目录就能覆写任意文件，交给 write_file 规则判。
+    "guard": {"op": "write_file", "params": {"path": "filename"}},
 }
 
 TIMEOUT_SEC = 180.0

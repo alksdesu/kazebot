@@ -39,7 +39,9 @@ SPEC = {
             }
         },
         "required": ["code", "port"]
-    }
+    },
+    # code 会在 Bot 进程里以 async 函数体执行，和本地 shell 是同一档危险，走同一套策略。
+    "guard": {"op": "execute_command", "params": {"command": "code"}}
 }
 
 TIMEOUT_SEC = 65

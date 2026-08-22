@@ -1350,6 +1350,9 @@ class TaskRouterMixin:
                     _tool_input = {
                         "arguments": item.get("arguments", {}),
                         "call_id": str(item.get("call_id") or ""),
+                        # 独立 tool task 不走 ai_step 那道白名单，engine 侧要能查出
+                        # 是谁派的才复核得了；缺这一项就没有可依据的授权表。
+                        "origin_node_id": str(task.node_id or ""),
                     }
                     if route_parent_for_child:
                         # [Fork/Merge 2026-05-17] Why: batch tool tasks inherit

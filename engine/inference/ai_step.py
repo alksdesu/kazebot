@@ -2044,6 +2044,7 @@ async def run_ai_node(
         tool_produced_attachments=_tool_produced_attachments,
         formatter=formatter,
         allowed_real_tools=_allowed_real_tools,
+        allowed_dispatch_targets=set(delegate_targets),
         compact_threshold=get_int(runtime_cfg, "engine.compact.threshold_tokens", 100_000, min_value=0),
         compact_keep_recent=get_int(runtime_cfg, "engine.compact.keep_recent", 6, min_value=2, max_value=50),
         compact_hard_threshold=_resolve_compact_hard_threshold(runtime_cfg),

@@ -13,6 +13,7 @@ from typing import Any
 
 import yaml
 
+from toolbox._common import request_guard
 from toolbox.context import ToolContext
 
 # ---------------------------------------------------------------------------
@@ -61,6 +62,15 @@ def _err(message: Any) -> dict[str, Any]:
     # error payloads during migration.
     text = str(message)
     return {"ok": False, "error": text, "data": {"result": f"ERROR: {text}"}}
+
+
+def _guard_err(err: Any) -> dict[str, Any]:
+    """策略拒绝 / 用户驳回 / 任务取消。cancelled 要透传，调用方靠它区分「被拒」和「没跑完」。"""
+    text = str(err.get("error", "denied")) if isinstance(err, dict) else str(err)
+    out = _err(text)
+    if isinstance(err, dict) and err.get("cancelled"):
+        out["cancelled"] = True
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -132,15 +142,30 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
         tmpl_data["provider"] = provider
 
     # Step 5: 写入新节点 yaml
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    target_path.write_text(
-        yaml.safe_dump(tmpl_data, default_flow_style=False, allow_unicode=True),
-        encoding="utf-8",
+    # 节点定义里有 prompt、模型和 tool_access，落一份就等于加一条新的执行路径，
+    # 和 write_file 写 config/nodes/** 是同一件事，走同一道策略。
+    _node_yaml = yaml.safe_dump(tmpl_data, default_flow_style=False, allow_unicode=True)
+    _rel_target = f"config/nodes/{name}.yaml"
+    _op, err = await request_guard(
+        ctx,
+        "write_file",
+        {
+            "path": _rel_target,
+            "content_preview": _node_yaml[:200],
+            "content_len": len(_node_yaml),
+            "create_agent": True,
+        },
     )
+    if err is not None:
+        return _guard_err(err)
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(_node_yaml, encoding="utf-8")
 
     # Step 6: 更新调用者的 delegate_targets（如果指定了 caller_node_id）
     # 追加新节点到调用者的委派列表，使调用者可以 dispatch 到新节点
     caller_updated = False
+    caller_denied = ""
     if caller_node_id:
         caller_path = workspace_root / "config" / "nodes" / f"{caller_node_id}.yaml"
         if not caller_path.exists():
@@ -155,11 +180,27 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
                     if name not in targets:
                         targets.append(name)
                         caller_data["delegate_targets"] = targets
-                        caller_path.write_text(
-                            yaml.safe_dump(caller_data, default_flow_style=False, allow_unicode=True),
-                            encoding="utf-8",
+                        # 改的是别人的委派清单，等于给调用者开一条新的下派路径，
+                        # 和上面写节点定义一样送策略，不能因为「只加一行」就免检。
+                        _caller_rel = caller_path.relative_to(workspace_root).as_posix()
+                        _caller_yaml = yaml.safe_dump(
+                            caller_data, default_flow_style=False, allow_unicode=True,
                         )
-                        caller_updated = True
+                        _op, err = await request_guard(
+                            ctx,
+                            "write_file",
+                            {
+                                "path": _caller_rel,
+                                "content_preview": _caller_yaml[:200],
+                                "content_len": len(_caller_yaml),
+                                "delegate_target_added": name,
+                            },
+                        )
+                        if err is None:
+                            caller_path.write_text(_caller_yaml, encoding="utf-8")
+                            caller_updated = True
+                        else:
+                            caller_denied = str(err.get("error", "denied")) if isinstance(err, dict) else str(err)
             except Exception:
                 pass  # 非致命：节点已创建但调用者更新失败
 
@@ -175,6 +216,8 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
         memory_dir=f"data/memory/{memory_book}/",
         persistent=persistent,
         caller_updated=caller_updated,
+        # 委派清单没改成要说出来，否则模型以为能 dispatch 到新节点，实际派不过去。
+        caller_denied=caller_denied,
         template=template,
     )
 

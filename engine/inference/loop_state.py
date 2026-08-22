@@ -135,6 +135,11 @@ class _LoopState:
     # ---- 已授权的真工具名集合（由 _filter_tool_specs 输出决定）----
     allowed_real_tools: set = field(default_factory=set)
 
+    # ---- 可委派的目标节点（node.delegate_targets 去掉被 gating 摘掉的）----
+    # 和上面那份一样，装的是「给模型看的那一份」。执行时拿它复核：
+    # dispatch 目标是从工具名反查的，反查表是进程内全局的，别的节点注册过就查得到。
+    allowed_dispatch_targets: set = field(default_factory=set)
+
     # ---- 本任务内真实工具执行记录 ----
     # [AutoC 2026-07-11] Why: 某些绘图/媒体节点的模型会“伪造工具调用”——
     # 在自然语言里编造 tool result 说生图成功，却从未真正调用 nai_generate_*，
