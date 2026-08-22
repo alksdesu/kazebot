@@ -1,6 +1,6 @@
 // 开口时机。七个信号里的三态那几项留空表示跟随旧的 group_mode 推导，界面上要说清。
 import { Audition } from './Audition';
-import { Block, Desc, Footnote, Grid, Loose, Option } from './components';
+import { Block, Desc, Fixed, Footnote, Grid, Loose } from './components';
 import { useLiveValue } from './consoleStore';
 import {
   BoolOption,
@@ -105,7 +105,7 @@ export const TimingPage = () => {
             <TextField configKey="llm_intent_node_id" label="判定节点" />
             <NumberField configKey="llm_intent_context_messages" label="带上最近" unit="条" />
           </BoolOption>
-          <Option checked disabled name="并发上限" onChange={() => undefined}>
+          <Fixed name="并发上限">
             <Desc>判定会占住 engine worker，占满了真实对话就得排队。</Desc>
             <NumberField label="同时最多" configKey="llm_intent_max_inflight" unit="个" />
             <NumberField
@@ -114,17 +114,17 @@ export const TimingPage = () => {
               step={0.5}
               unit="秒"
             />
-          </Option>
+          </Fixed>
         </Grid>
       </Block>
 
       <Block hint="命中之后仍可能不说话" title="冷却">
         <Grid>
-          <Option checked disabled name="发言间隔" onChange={() => undefined}>
+          <Fixed name="发言间隔">
             <Desc>刚说过话的群里先歇一会儿。0 表示不限制。</Desc>
             <NumberField label="每群" configKey="cooldown_group_sec" unit="秒" />
             <NumberField label="每人" configKey="cooldown_user_sec" unit="秒" />
-          </Option>
+          </Fixed>
           <BoolOption
             desc="有人直接叫 bot，就不该被静默忽略。"
             fallback

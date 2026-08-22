@@ -24,10 +24,10 @@ import {
   Desc,
   Empty,
   Facts,
+  Fixed,
   Footnote,
   Grid,
   Input,
-  Option,
   Panel,
   Segmented,
 } from './components';
@@ -449,18 +449,18 @@ const CollectBlock = () => (
         />
       </BoolOption>
 
-      <Option checked disabled name="容量" onChange={() => undefined}>
+      <Fixed name="容量">
         <Desc>待审池满了就不再收新的；图库超出上限时最旧的先出局。</Desc>
         <NumberField configKey="sticker_pending_limit" label="待审池" step={10} unit="张" />
         <NumberField configKey="sticker_library_limit" label="图库" step={50} unit="张" />
         <NumberField configKey="sticker_pending_ttl_days" label="待审保留" unit="天" />
-      </Option>
+      </Fixed>
 
-      <Option checked disabled name="发图" onChange={() => undefined}>
+      <Fixed name="发图">
         <Desc>候选给多了是 token 炸弹，给少了模型挑不出合适的。</Desc>
         <NumberField configKey="sticker_prompt_limit" label="每轮候选" unit="张" />
         <NumberField configKey="sticker_repeat_window_sec" label="同图间隔" step={60} unit="秒" />
-      </Option>
+      </Fixed>
 
       <BoolOption
         configKey="sticker_combat"

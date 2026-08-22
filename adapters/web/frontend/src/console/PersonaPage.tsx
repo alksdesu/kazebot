@@ -17,10 +17,10 @@ import {
   Desc,
   ErrorText,
   Facts,
+  Fixed,
   Footnote,
   Grid,
   Input,
-  Option,
   Panel,
   SaveBar,
   Textarea,
@@ -216,11 +216,11 @@ export const PersonaPage = () => (
           desc="下划线同理。但代码和文件名里常有下划线，默认不动。"
           label="去掉下划线强调"
         />
-        <Option checked disabled name="长度上限" onChange={() => undefined}>
+        <Fixed name="长度上限">
           <Desc>超长的回复会被截断，避免被 QQ 拒收。</Desc>
           <NumberField configKey="message_limit" label="单条消息" step={100} unit="字" />
           <NumberField configKey="history_text_limit" label="历史里每条" step={50} unit="字" />
-        </Option>
+        </Fixed>
         <BoolOption
           configKey="enable_image_forward_merge"
           desc="多张图合并成一条转发发出，而不是一张张发。"
@@ -264,10 +264,10 @@ export const PersonaPage = () => (
             三个人发三张不同的图不会被当成复读。
           </Desc>
         </BoolOption>
-        <Option checked disabled name="表情提示" onChange={() => undefined}>
+        <Fixed name="表情提示">
           <Desc>告诉模型有哪些收藏表情可用。0 表示不告诉它。</Desc>
           <NumberField configKey="face_prompt_limit" label="最多列出" unit="个" />
-        </Option>
+        </Fixed>
       </Grid>
     </Block>
 

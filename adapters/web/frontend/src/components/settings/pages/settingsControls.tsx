@@ -93,21 +93,19 @@ interface OptionProps {
   checked: boolean;
   children?: ReactNode;
   desc?: string;
-  disabled?: boolean;
   name: string;
   onChange: (checked: boolean) => void;
 }
 
 // children 刻意留在 label 外面：词表和数字框都在这一层，包进 label 之后点它们旁边的
 // 空白会连带翻转开关。
-export const Option = ({ checked, children, desc, disabled, name, onChange }: OptionProps) => (
-  <div className={`bg-[var(--duties-panel)] px-4 py-3.5${disabled ? ' opacity-50' : ''}`}>
-    <label className={disabled ? 'block' : 'block cursor-pointer'}>
+export const Option = ({ checked, children, desc, name, onChange }: OptionProps) => (
+  <div className="bg-[var(--duties-panel)] px-4 py-3.5">
+    <label className="block cursor-pointer">
       <span className="flex items-center gap-2.5">
         <input
           checked={checked}
           className={CHECKBOX}
-          disabled={disabled}
           onChange={(event) => onChange(event.target.checked)}
           type="checkbox"
         />
@@ -115,6 +113,27 @@ export const Option = ({ checked, children, desc, disabled, name, onChange }: Op
       </span>
       {desc && <p className={`ml-[25px] mt-1.5 text-xs leading-5 ${MUTED}`}>{desc}</p>}
     </label>
+    {children}
+  </div>
+);
+
+/** 没有开关、只能调参数的一组配置。
+ *  别拿勾不动的复选框冒充：整块会淡成灰的，看着不可用，其实里面的输入框改得动。 */
+export const Fixed = ({ children, desc, name }: {
+  children?: ReactNode;
+  desc?: string;
+  name: string;
+}) => (
+  <div className="bg-[var(--duties-panel)] px-4 py-3.5">
+    <span className="flex items-center gap-2.5">
+      {/* 占住复选框的位置，好和同一行里带开关的卡片对齐。 */}
+      <span aria-hidden className="h-[15px] w-[15px] flex-none" />
+      <span className="font-medium">{name}</span>
+      <span className="flex-none border border-[var(--duties-border)] px-1.5 py-0.5 font-mono text-[0.55rem] text-[var(--duties-secondary)]">
+        常开
+      </span>
+    </span>
+    {desc && <p className={`ml-[25px] mt-1.5 text-xs leading-5 ${MUTED}`}>{desc}</p>}
     {children}
   </div>
 );

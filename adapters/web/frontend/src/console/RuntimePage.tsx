@@ -9,10 +9,10 @@ import {
   DangerPanel,
   Desc,
   Facts,
+  Fixed,
   Footnote,
   Grid,
   List,
-  Option,
   Panel,
   Pip,
   ReadOnlyRow,
@@ -203,16 +203,16 @@ export const RuntimePage = () => (
 
     <Block hint="给模型看的上下文，不是 QQ 的聊天记录" title="群历史">
       <Grid>
-        <Option checked disabled name="缓存条数" onChange={() => undefined}>
+        <Fixed name="缓存条数">
           <Desc>每个群留多少条最近消息。0 表示不缓存。</Desc>
           <NumberField configKey="group_history_max" label="每群" unit="条" />
-        </Option>
-        <Option checked disabled name="未送达余量" onChange={() => undefined}>
+        </Fixed>
+        <Fixed name="未送达余量">
           <Desc>
             还没送到 Engine 的行可以多占几倍位置，硬上限 = 缓存条数 × 本值。1.0 表示不给余量，满了就丢。
           </Desc>
           <NumberField configKey="group_history_undelivered_ratio" label="上限倍数" step={0.5} unit="倍" />
-        </Option>
+        </Fixed>
       </Grid>
       <HistoryFacts />
     </Block>

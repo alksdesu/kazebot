@@ -26,6 +26,7 @@ export {
   ErrorText,
   Facts,
   Field,
+  Fixed,
   Footnote,
   Grid,
   Input,
