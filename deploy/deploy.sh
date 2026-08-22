@@ -10,7 +10,9 @@ ROOT=/opt/kazebot
 OWNER=kazebot
 SERVICE=kazebot
 BRANCH="${1:-origin/master}"
-SETTLE_SEC=15
+# supervisor 起 uvicorn、engine 等它应答再注册，整条链路二十几秒。定死一个 sleep
+# 要么误报要么白等，所以轮询。
+WAIT_SEC=90
 
 if [[ $EUID -ne 0 ]]; then
   echo "要用 root 跑：systemctl 和 chown 都需要。" >&2
@@ -40,13 +42,29 @@ if [[ -n "$STRAY" ]]; then
 fi
 
 echo "[deploy] 重启 ${SERVICE}"
+STARTED_AT=$(date +%s)
 systemctl restart "$SERVICE"
-sleep "$SETTLE_SEC"
 
-# systemd 只看得到 supervisor。engine 是它 fork 出来的，崩了这里照样 active。
-if ! pgrep -af "python -m engine" >/dev/null; then
+# systemd 只看得到 supervisor。engine 是它 spawn 的，崩了这里照样 active running。
+echo -n "[deploy] 等 engine worker"
+for ((i = 0; i < WAIT_SEC; i += 2)); do
+  if pgrep -f "python -m engine" >/dev/null; then
+    echo " —— ${i}s"
+    break
+  fi
+  echo -n .
+  sleep 2
+done
+
+if ! pgrep -f "python -m engine" >/dev/null; then
+  echo
   echo "[deploy] engine worker 没起来 —— supervisor 活着也没人接任务" >&2
-  tail -30 "$(ls -t "$ROOT"/data/logs/engine-*.log 2>/dev/null | head -1)" >&2 || true
+  # 挑这次重启之后建的那个：上一批的日志还在，按 mtime 取会拿到旧的。
+  for log in "$ROOT"/data/logs/engine-*.log; do
+    [[ -f "$log" && $(stat -c %Y "$log") -ge $STARTED_AT ]] || continue
+    echo "--- $log ---" >&2
+    tail -30 "$log" >&2
+  done
   exit 1
 fi
 
