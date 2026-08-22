@@ -7,7 +7,7 @@
 import { useMemo, useState, type ReactNode } from 'react';
 
 import { decideApproval } from '../../../api/supervisorClient';
-import { shouldAutoApproveTool, useClientPrefsStore } from '../../../store/clientPrefsStore';
+import { shouldAutoApproveToolCall, useClientPrefsStore } from '../../../store/clientPrefsStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import type { ToolExecution, ToolStatus } from '../../../types/message';
 import { Icon } from '../../common';
@@ -642,9 +642,11 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
   const approvalDetails = getApprovalDetailsRecord(tool);
   const approvalOperation = getApprovalOperation(tool);
   const canExpand = Boolean(argumentDisplay || resultDisplay || tool.taskId || tool.nodeId || tool.nodeName || tool.approvalDetails);
+  // Same tool name plus operation pair that chatStore submits the automatic allow with,
+  // otherwise the badge and the actual decision can disagree on one approval.
   const isAutoApprovedPending = tool.status === 'awaiting_approval'
     && tool.approvalStatus === 'pending'
-    && shouldAutoApproveTool(tool.name, autoApproveTools);
+    && shouldAutoApproveToolCall({ toolName: tool.name, operation: approvalOperation }, autoApproveTools);
 
   const handleApproval = async (approvalId: string, decision: 'allow' | 'deny') => {
     // [AutoC 2026-05-31] Why: the same tool card now owns the approval action.

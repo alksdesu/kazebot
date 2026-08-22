@@ -33,10 +33,10 @@ import type {
   ToolStatus,
   WsMessage,
 } from '../types/message';
-import { shouldAutoApproveTool, useClientPrefsStore } from './clientPrefsStore';
+import { shouldAutoApproveToolCall, useClientPrefsStore, type ApprovalMatch } from './clientPrefsStore';
 import { useSettingsStore } from './settingsStore';
 import { scopedKey } from './storageKey';
-import { createInitialChatState, reduceChatEvent } from './eventReducer';
+import { createInitialChatState, findToolByCallId, reduceChatEvent } from './eventReducer';
 
 export interface ConversationMeta {
   id: string;
@@ -490,19 +490,16 @@ function isTerminalTaskEvent(event: SupervisorEvent): boolean {
   return TERMINAL_TASK_EVENTS.has(event.type);
 }
 
-function getToolNameForApprovalEvent(state: ChatStoreState, event: SupervisorEvent): string {
+function getApprovalMatch(state: ChatStoreState, event: SupervisorEvent): ApprovalMatch {
   const payload = event.payload || {};
   const operation = typeof payload.operation === 'string' ? payload.operation : '';
-  if (operation) return operation;
-
   const toolCallId = typeof payload.tool_call_id === 'string' ? payload.tool_call_id : '';
-  if (!toolCallId) return '';
 
-  // [2026-06-01] Why: some approval events identify only the tool call id. How:
-  // look up the normalized ToolExecution that the reducer just updated. Purpose:
-  // auto-approval can still use the same clientPrefs tool-name rules.
-  const stableId = state.toolStableIdByExternalId[toolCallId];
-  return stableId ? state.toolExecutionsById[stableId]?.name || '' : '';
+  // The payload only carries the policy operation, and several tools share one: list_dir
+  // and search_in_files both report read_file, apply_diff reports write_file. Resolving the
+  // ToolExecution is the only way to learn which tool the user actually ticked; an approval
+  // with no matching tool card stays manual.
+  return { toolName: findToolByCallId(state, toolCallId)?.name || '', operation };
 }
 
 function maybeAutoApproveApprovalRequest(event: SupervisorEvent, get: StoreGetter) {
@@ -512,9 +509,8 @@ function maybeAutoApproveApprovalRequest(event: SupervisorEvent, get: StoreGette
   if (!approvalId || autoApprovedApprovalIds.has(approvalId)) return;
 
   const state = get();
-  const toolName = getToolNameForApprovalEvent(state, event);
   const prefs = useClientPrefsStore.getState();
-  if (!toolName || !shouldAutoApproveTool(toolName, prefs.autoApproveTools)) return;
+  if (!shouldAutoApproveToolCall(getApprovalMatch(state, event), prefs.autoApproveTools)) return;
 
   autoApprovedApprovalIds.add(approvalId);
   saveAutoApproved(autoApprovedApprovalIds);

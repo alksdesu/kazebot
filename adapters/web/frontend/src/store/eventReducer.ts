@@ -1744,10 +1744,11 @@ function normalizeApprovalStatus(status: unknown, decision: unknown): ApprovalBl
   return 'pending';
 }
 
-function findToolByCallId(state: ChatState, toolCallId: string): ToolExecution | undefined {
+export function findToolByCallId(state: ChatState, toolCallId: string): ToolExecution | undefined {
   // [AutoC 2026-05-31] Why: approval events carry the provider tool_call_id, not
   // the reducer's stable id. How: scan the normalized tool table for the external
   // id field. Purpose: approvals can attach to tools regardless of block location.
+  if (!toolCallId) return undefined;
   return Object.values(state.toolExecutionsById).find((tool) => tool.id === toolCallId);
 }
 

@@ -8,6 +8,8 @@ import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
 import { Button } from '../../common';
 import { AutoApproveSection } from './AutoApproveSection';
+import { NodeGrantsSection } from './NodeGrantsSection';
+import { PolicyAudienceSection } from './PolicyAudienceSection';
 import { PolicyRulesSection } from './PolicyRulesSection';
 import { AuthRequired, Card, FieldLabel, PageHeader, PageShell, StatusText, TextInput } from './settingsPagePrimitives';
 
@@ -137,13 +139,16 @@ export const ToolsSettingsPage = () => {
   return (
     <PageShell>
       <PageHeader
-        description="有哪些工具、调了要不要审批。每块都标了生效范围：标「所有渠道」的连 QQ 和定时任务一起管，标「仅此浏览器」的只管你眼前这个页面。哪个节点能调哪些工具，在「节点文件」页改 tool_access。"
+        description="有哪些工具、哪个节点能调、调了要不要审批。每块都标了生效范围：标「所有渠道」的连 QQ 和定时任务一起管，标「仅此浏览器」的只管你眼前这个页面。"
         title="工具与权限"
       />
       {!isAuthenticated ? <AuthRequired /> : (
         <>
           <ToolInventorySection />
+          <NodeGrantsSection />
           <PolicyRulesSection />
+          {/* 紧跟规则表：这两块讲的是同一件事的两半，分开看会得出相反的结论。 */}
+          <PolicyAudienceSection />
           <AutoApproveSection />
         </>
       )}

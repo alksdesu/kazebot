@@ -2,7 +2,6 @@
 import { useEffect, useState } from 'react';
 
 import { decideApproval } from '../../api/supervisorClient';
-import { shouldAutoApproveTool, useClientPrefsStore } from '../../store/clientPrefsStore';
 import { useSettingsStore } from '../../store/settingsStore';
 import type { ApprovalInfo } from '../../types';
 import { Button, Icon } from '../common';
@@ -16,9 +15,7 @@ export const ApprovalCard = ({ approval }: ApprovalCardProps) => {
   const [loading, setLoading] = useState(false);
   // Decisions also land from QQ, the settings page, or another tab, so local state alone stays 'pending' forever.
   useEffect(() => { setStatus(approval.status); }, [approval.status]);
-  const autoApproveTools = useClientPrefsStore(state => state.autoApproveTools);
   const adminToken = useSettingsStore(state => state.adminToken);
-  const isAutoApprovedPending = status === 'pending' && shouldAutoApproveTool(approval.operation, autoApproveTools);
 
   const handleDecision = async (decision: 'allow' | 'deny') => {
     setLoading(true);
@@ -52,30 +49,20 @@ export const ApprovalCard = ({ approval }: ApprovalCardProps) => {
         )}
       </div>
       {isPending ? (
-        isAutoApprovedPending ? (
-          <div className="inline-flex items-center gap-1 rounded-sm bg-gray-100 px-2 py-1 text-xs font-semibold text-gray-600">
-            {/* [2026-06-01] Why: legacy approval blocks can still be rendered for
-                events without tool_call_id. How: mirror ToolCallCard's muted local
-                auto-approval badge. Purpose: auto-approved requests do not show
-                contradictory manual buttons in either renderer. */}
+        // 这张卡只在审批找不到对应工具卡时才出现，自动审批按工具名匹配，这里注定匹配不上。
+        <div className="flex gap-2">
+          <Button disabled={loading} onClick={() => handleDecision('allow')} variant="primary">
+            {/* [2026-06-01] Why: approval action buttons used emoji marks.
+                How: render check_circle and cancel as Material Symbols. Purpose:
+                pending approval controls no longer emit emoji. */}
             <Icon name="check_circle" size={14} />
-            <span>已自动放行</span>
-          </div>
-        ) : (
-          <div className="flex gap-2">
-            <Button disabled={loading} onClick={() => handleDecision('allow')} variant="primary">
-              {/* [2026-06-01] Why: approval action buttons used emoji marks.
-                  How: render check_circle and cancel as Material Symbols. Purpose:
-                  pending approval controls no longer emit emoji. */}
-              <Icon name="check_circle" size={14} />
-              <span>允许</span>
-            </Button>
-            <Button disabled={loading} onClick={() => handleDecision('deny')} variant="ghost">
-              <Icon name="cancel" size={14} />
-              <span>拒绝</span>
-            </Button>
-          </div>
-        )
+            <span>允许</span>
+          </Button>
+          <Button disabled={loading} onClick={() => handleDecision('deny')} variant="ghost">
+            <Icon name="cancel" size={14} />
+            <span>拒绝</span>
+          </Button>
+        </div>
       ) : (
         <div className={`inline-flex items-center gap-1 text-xs font-semibold ${status === 'allowed' ? 'text-green-600' : 'text-red-500'}`}>
           {/* [2026-06-01] Why: approval result text embedded emoji.

@@ -1578,6 +1578,30 @@ export async function getAllToolNames(token: string): Promise<string[]> {
   return resp.json();
 }
 
+export interface EffectiveTool {
+  name: string;
+  registered: boolean;
+  external: boolean;
+  /** 内置工具走不走服务端策略要看源码，后端不猜，返回 null。 */
+  guarded: boolean | null;
+  /** 非空 = 这个工具会在构建工具表时被摘掉，理由就是这段文字。 */
+  gated: string;
+}
+
+export interface EffectiveTools {
+  node_id: string;
+  mode: string;
+  listed_as: 'allow' | 'deny';
+  tools: EffectiveTool[];
+}
+
+export async function getEffectiveTools(token: string, nodeId: string): Promise<EffectiveTools> {
+  const resp = await apiFetch(`/admin/config/nodes/${encodeURIComponent(nodeId)}/effective-tools`, {
+    headers: authHeaders(token),
+  });
+  return resp.json();
+}
+
 // ── Model config ──
 
 // 没有读接口：/config/openai/secret 返回明文 api_key，那是 engine 取密钥的通道。
