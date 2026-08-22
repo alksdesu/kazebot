@@ -259,8 +259,8 @@ _REACT_MODEL_EMOJIS: Dict[str, str] = {
 }
 assert all(_REACT_MODEL_EMOJIS.values())
 _SEARCH_PROGRESS_FIRST_NOTICE = "已收到联网搜索请求，正在检索网页资料，可能需要几秒钟……"
-_SEARCH_PROGRESS_STILL_RUNNING_NOTICE = "还在联网搜索中，我会拿到结果后马上整理回复。"
-_SEARCH_PROGRESS_STILL_RUNNING_INTERVAL_SEC = 20.0
+_SEARCH_PROGRESS_STILL_RUNNING_NOTICE = "还在联网搜索中（已等 {waited} 秒），我会拿到结果后马上整理回复。"
+_SEARCH_PROGRESS_STILL_RUNNING_DELAY_SEC = 20.0
 _SEARCH_PROGRESS_KEYWORDS = ("web_search", "exa_search", "x_search")
 
 
@@ -7368,8 +7368,11 @@ async def _maybe_send_search_progress_notice(
     target: Dict[str, Any],
     platform_data: Dict[str, Any],
 ) -> None:
-    """在 QQ 侧为长搜索任务发送低频可见进度提示。"""
+    """在 QQ 侧为长搜索任务发送低频可见进度提示。至多两条：开工一条，久等一条。"""
     now = time.time()
+    # 答案已经在投递路上就闭嘴：两者同一秒并发时，「还在搜索」会紧贴着结果出现。
+    if platform_data.get("_qq_final_reply_sent"):
+        return
     request_identity = str(
         platform_data.setdefault("_qq_search_request_identity", uuid.uuid4().hex)
     )
@@ -7379,7 +7382,7 @@ async def _maybe_send_search_progress_notice(
     )
     if not platform_data.get("_qq_search_notice_sent"):
         platform_data["_qq_search_notice_sent"] = True
-        platform_data["_qq_search_notice_last_at"] = now
+        platform_data["_qq_search_notice_started_at"] = now
         try:
             await _send_qq_message(
                 bot, target, _SEARCH_PROGRESS_FIRST_NOTICE,
@@ -7389,14 +7392,18 @@ async def _maybe_send_search_progress_notice(
             logger.debug("send QQ search progress notice failed", exc_info=True)
         return
 
-    last_at = float(platform_data.get("_qq_search_notice_last_at") or 0.0)
-    if now - last_at < _SEARCH_PROGRESS_STILL_RUNNING_INTERVAL_SEC:
+    if platform_data.get("_qq_search_still_notice_sent"):
         return
-    platform_data["_qq_search_notice_last_at"] = now
+    started_at = float(platform_data.get("_qq_search_notice_started_at") or now)
+    waited = now - started_at
+    if waited < _SEARCH_PROGRESS_STILL_RUNNING_DELAY_SEC:
+        return
+    platform_data["_qq_search_still_notice_sent"] = True
     try:
         await _send_qq_message(
-            bot, target, _SEARCH_PROGRESS_STILL_RUNNING_NOTICE,
-            send_context=context.child(f"still:{int(now // _SEARCH_PROGRESS_STILL_RUNNING_INTERVAL_SEC)}"),
+            bot, target,
+            _SEARCH_PROGRESS_STILL_RUNNING_NOTICE.format(waited=int(waited)),
+            send_context=context.child("still"),
         )
     except Exception:
         logger.debug("send QQ search still-running notice failed", exc_info=True)
@@ -7429,6 +7436,8 @@ class TangQiuCallbacks:
             raise OneBotSendContractError(
                 f"send_reply missing target for session={trigger.session_id}"
             )
+        # 进度提示靠这个标记闭嘴。设在校验之后：发不出去的回复不该顺带把提示也堵掉。
+        platform_data["_qq_final_reply_sent"] = True
         send_context = delivery_context or context_from_sources(
             trigger=trigger,
             main_state=main_state,
@@ -7575,7 +7584,11 @@ class TangQiuCallbacks:
 
         target = _target_from_platform_data(platform_data) or _target_from_conversation_key(trigger.conversation_key)
         has_tool_progress = any("执行" in record and "个工具" in record for record in state.progress_records)
-        has_search_progress = any(_progress_mentions_search(record) for record in state.progress_records)
+        # 只看最新一条：progress_records 是累积的，用 any() 扫全量的话，搜索工具跑完之后
+        # 那条记录还留着，条件就永远成立 —— 后面明明在跑别的命令，报的还是「还在联网搜索中」。
+        has_search_progress = bool(state.progress_records) and _progress_mentions_search(
+            state.progress_records[-1]
+        )
         if has_tool_progress or has_search_progress:
             if has_search_progress and target:
                 await _maybe_send_search_progress_notice(bot, target, platform_data)
