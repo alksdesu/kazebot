@@ -82,18 +82,20 @@ beforeEach(() => {
 
 const saveChain = () => fireEvent.click(screen.getByRole('button', { name: '保存备选链' }));
 const rows = () => screen.getAllByRole('listitem');
+// 标题是静态的，等到它的时候数据还在路上。等列表出现才算加载完。
+const ready = () => screen.findAllByRole('listitem');
 
 describe('备选链', () => {
   it('把已配的两条都摆出来', async () => {
     render(<ModelsPage />);
-    await screen.findByText('备选链');
+    await ready();
     expect(rows()).toHaveLength(2);
     expect((within(rows()[1]).getByLabelText('模型') as HTMLInputElement).value).toBe('backup');
   });
 
   it('密钥只显示状态，不回填明文', async () => {
     render(<ModelsPage />);
-    await screen.findByText('备选链');
+    await ready();
     const key = within(rows()[1]).getByLabelText('密钥') as HTMLInputElement;
     expect(key.value).toBe('');
     expect(key.placeholder).toContain('已设置');
@@ -102,13 +104,13 @@ describe('备选链', () => {
 
   it('没动过就存不了，避免空存一次反而改坏', async () => {
     render(<ModelsPage />);
-    await screen.findByText('备选链');
+    await ready();
     expect((screen.getByRole('button', { name: '保存备选链' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('改一个字段时，密钥不提交、原始位置照带', async () => {
     render(<ModelsPage />);
-    await screen.findByText('备选链');
+    await ready();
     fireEvent.change(within(rows()[1]).getByLabelText('模型'), { target: { value: 'backup-v2' } });
     saveChain();
 
@@ -124,7 +126,7 @@ describe('备选链', () => {
 
   it('填了密钥才提交它', async () => {
     render(<ModelsPage />);
-    await screen.findByText('备选链');
+    await ready();
     fireEvent.change(within(rows()[1]).getByLabelText('密钥'), { target: { value: 'sk-new' } });
     saveChain();
 
@@ -134,7 +136,7 @@ describe('备选链', () => {
 
   it('换顺序时原始位置跟着条目走', async () => {
     render(<ModelsPage />);
-    await screen.findByText('备选链');
+    await ready();
     fireEvent.click(within(rows()[1]).getByRole('button', { name: '上移' }));
     saveChain();
 
@@ -146,7 +148,7 @@ describe('备选链', () => {
 
   it('新加的条目不带原始位置', async () => {
     render(<ModelsPage />);
-    await screen.findByText('备选链');
+    await ready();
     fireEvent.click(screen.getByRole('button', { name: '添加备选' }));
     saveChain();
 
@@ -158,7 +160,7 @@ describe('备选链', () => {
 
   it('删掉一条只删那一条', async () => {
     render(<ModelsPage />);
-    await screen.findByText('备选链');
+    await ready();
     fireEvent.click(within(rows()[0]).getByRole('button', { name: '删除' }));
     saveChain();
 
@@ -170,7 +172,7 @@ describe('备选链', () => {
 
   it('每条能单独调参数', async () => {
     render(<ModelsPage />);
-    await screen.findByText('备选链');
+    await ready();
     fireEvent.click(within(rows()[0]).getByRole('button', { name: /参数/ }));
     fireEvent.click(within(rows()[0]).getByRole('button', { name: '关' }));
     saveChain();
@@ -183,7 +185,7 @@ describe('备选链', () => {
     // 不把「选中的值恰好等于默认值」当成清空 —— tool_choice: auto、thinking: true
     // 这类默认值是真要发出去的，一刀切会把它们静默抹掉。
     render(<ModelsPage />);
-    await screen.findByText('备选链');
+    await ready();
     fireEvent.click(within(rows()[1]).getByRole('button', { name: /参数/ }));
 
     fireEvent.click(within(rows()[1]).getByRole('button', { name: '不指定' }));
@@ -195,7 +197,7 @@ describe('备选链', () => {
 
   it('再点同一档等于取消选中，这一项彻底不配', async () => {
     render(<ModelsPage />);
-    await screen.findByText('备选链');
+    await ready();
     fireEvent.click(within(rows()[1]).getByRole('button', { name: /参数/ }));
 
     fireEvent.click(within(rows()[1]).getByRole('button', { name: '不指定' }));
@@ -208,7 +210,7 @@ describe('备选链', () => {
 
   it('换渠道会清掉上一家的参数——键名各家不通用', async () => {
     render(<ModelsPage />);
-    await screen.findByText('备选链');
+    await ready();
     fireEvent.change(within(rows()[1]).getByLabelText('渠道'), { target: { value: 'deepseek' } });
     saveChain();
 
@@ -220,7 +222,7 @@ describe('备选链', () => {
 
   it('没勾支持图片的条目会提示带图请求会跳过它', async () => {
     render(<ModelsPage />);
-    await screen.findByText('备选链');
+    await ready();
     expect(within(rows()[0]).getByText(/带图的请求会跳过/)).toBeTruthy();
     expect(within(rows()[1]).queryByText(/带图的请求会跳过/)).toBeNull();
   });
@@ -230,7 +232,8 @@ describe('按节点的备选链', () => {
   const openNode = async (id: string) => {
     render(<ModelsPage />);
     fireEvent.click(await screen.findByRole('button', { name: id }));
-    await screen.findByText('备选链');
+    // 节点链可以是空的，这里不能等列表；等档位按钮才是这一块真的画好了。
+    await screen.findByRole('button', { name: '跟随全局' });
   };
 
   it('没配过的节点显示为跟随全局', async () => {

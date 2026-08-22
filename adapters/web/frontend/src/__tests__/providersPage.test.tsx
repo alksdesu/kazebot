@@ -77,6 +77,8 @@ beforeEach(() => {
 });
 
 const rows = () => screen.getAllByRole('listitem');
+// 标题是静态的，等到它的时候数据还在路上。等列表出现才算加载完。
+const ready = () => screen.findAllByRole('listitem');
 // 认标题里的渠道名，不能按行内文本找：每行的格式下拉都列着全部家族名。
 const rowFor = (name: string) => rows().find(
   (row) => row.querySelector('.qc-cap-name')?.textContent === name,
@@ -86,7 +88,7 @@ const saveChain = () => fireEvent.click(screen.getByRole('button', { name: '保�
 describe('渠道列表', () => {
   it('把配好的渠道都摆出来，并标出在用的那个', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     expect(rows()).toHaveLength(2);
     expect(within(rowFor('openai')).getByText('在用')).toBeTruthy();
     expect(within(rowFor('anthropic')).getByRole('button', { name: '设为活跃' })).toBeTruthy();
@@ -95,7 +97,7 @@ describe('渠道列表', () => {
   it('回填的是变量引用原文，不是展开后的值', async () => {
     // 回填展开值再保存，就把这层间接烧死在 config.yaml 里了。
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     const model = within(rowFor('openai')).getByLabelText('openai 模型') as HTMLInputElement;
     expect(model.value).toBe('${OPENAI_MODEL}');
     expect(model.value).not.toBe('gpt-5.4');
@@ -103,7 +105,7 @@ describe('渠道列表', () => {
 
   it('密钥只显示状态，不回填明文', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     const key = within(rowFor('openai')).getByLabelText('openai 密钥') as HTMLInputElement;
     expect(key.value).toBe('');
     expect(key.type).toBe('password');
@@ -115,7 +117,7 @@ describe('渠道列表', () => {
 
   it('没动过就存不了', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     expect((screen.getByRole('button', { name: '保存渠道' }) as HTMLButtonElement).disabled).toBe(true);
   });
 });
@@ -123,7 +125,7 @@ describe('渠道列表', () => {
 describe('保存', () => {
   it('改模型时不提交密钥', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     fireEvent.change(within(rowFor('openai')).getByLabelText('openai 模型'), {
       target: { value: 'gpt-5.5' },
     });
@@ -139,7 +141,7 @@ describe('保存', () => {
 
   it('填了密钥才提交它', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     fireEvent.change(within(rowFor('anthropic')).getByLabelText('anthropic 密钥'), {
       target: { value: 'sk-ant-new' },
     });
@@ -151,7 +153,7 @@ describe('保存', () => {
 
   it('只提交改过的那一个，没动的渠道不重写', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     fireEvent.change(within(rowFor('anthropic')).getByLabelText('anthropic 模型'), {
       target: { value: 'claude-opus-4-2' },
     });
@@ -166,7 +168,7 @@ describe('新增与删除', () => {
   it('新加的渠道先留在本地，保存时才建块', async () => {
     // 后端认不出空块，先建会让它从列表里消失。
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     fireEvent.change(screen.getByLabelText('新渠道格式'), { target: { value: 'deepseek' } });
     fireEvent.click(screen.getByRole('button', { name: '添加' }));
 
@@ -184,7 +186,7 @@ describe('新增与删除', () => {
   it('每种格式都能再开一个，已经配过的也不例外', async () => {
     // 同一家挂两个中转是常态，可选格式不该因为配过一次就少一项。
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     const options = within(screen.getByLabelText('新渠道格式')).getAllByRole('option');
 
     expect(options.map((option) => (option as HTMLOptionElement).value))
@@ -193,7 +195,7 @@ describe('新增与删除', () => {
 
   it('同一格式的第二个渠道自己起名，格式一起提交', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     fireEvent.change(screen.getByLabelText('新渠道名'), { target: { value: 'openai-relay' } });
     fireEvent.change(screen.getByLabelText('新渠道格式'), { target: { value: 'openai' } });
     fireEvent.click(screen.getByRole('button', { name: '添加' }));
@@ -212,7 +214,7 @@ describe('新增与删除', () => {
 
   it('重名的渠道加不进去', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     fireEvent.change(screen.getByLabelText('新渠道名'), { target: { value: 'openai' } });
     fireEvent.change(screen.getByLabelText('新渠道格式'), { target: { value: 'anthropic' } });
 
@@ -222,7 +224,7 @@ describe('新增与删除', () => {
 
   it('还没保存的渠道不能设为活跃', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     fireEvent.change(screen.getByLabelText('新渠道格式'), { target: { value: 'deepseek' } });
     fireEvent.click(screen.getByRole('button', { name: '添加' }));
 
@@ -232,7 +234,7 @@ describe('新增与删除', () => {
 
   it('删掉还没保存的渠道只是丢掉草稿，不打后端', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     fireEvent.change(screen.getByLabelText('新渠道格式'), { target: { value: 'deepseek' } });
     fireEvent.click(screen.getByRole('button', { name: '添加' }));
     fireEvent.click(within(rowFor('deepseek')).getByRole('button', { name: '删除' }));
@@ -243,7 +245,7 @@ describe('新增与删除', () => {
 
   it('正在用的渠道不能删', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     const button = within(rowFor('openai')).getByRole('button', { name: '删除' });
     expect((button as HTMLButtonElement).disabled).toBe(true);
   });
@@ -252,7 +254,7 @@ describe('新增与删除', () => {
 describe('切换活跃渠道', () => {
   it('点一下就切，不用先保存', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     fireEvent.click(within(rowFor('anthropic')).getByRole('button', { name: '设为活跃' }));
     await waitFor(() => expect(setActiveProvider).toHaveBeenCalledWith('admin-token', 'anthropic'));
     expect(upsertProvider).not.toHaveBeenCalled();
@@ -260,7 +262,7 @@ describe('切换活跃渠道', () => {
 
   it('提示哪些节点写死了自己的渠道，切换不影响它们', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     const hint = await screen.findByText(/写死了自己的渠道/);
     expect(hint.textContent).toContain('qq.vision');
     expect(hint.textContent).toContain('draw.image_gen');
@@ -271,7 +273,7 @@ describe('切换活跃渠道', () => {
   it('取不到节点清单时不提示，但页面照常能用', async () => {
     vi.mocked(getNodes).mockRejectedValue(new Error('boom'));
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     expect(screen.queryByText(/写死了自己的渠道/)).toBeNull();
     expect(rows()).toHaveLength(2);
   });
@@ -280,7 +282,7 @@ describe('切换活跃渠道', () => {
 describe('这个渠道看不看得了图', () => {
   it('没配时跟随这家的默认，并把推断结果写在选项里', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     const picker = within(rowFor('openai')).getByLabelText('openai 读图能力') as HTMLSelectElement;
 
     expect(picker.value).toBe('auto');
@@ -299,7 +301,7 @@ describe('这个渠道看不看得了图', () => {
       },
     } as any);
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
 
     expect(screen.getByText(/跟随 deepseek 默认（看不了图）/)).toBeTruthy();
   });
@@ -313,7 +315,7 @@ describe('这个渠道看不看得了图', () => {
       },
     } as any);
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
 
     expect((within(rowFor('openai')).getByLabelText('openai 读图能力') as HTMLSelectElement).value)
       .toBe('no');
@@ -321,7 +323,7 @@ describe('这个渠道看不看得了图', () => {
 
   it('改了档位会跟着保存提交上去', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     fireEvent.change(within(rowFor('openai')).getByLabelText('openai 读图能力'), {
       target: { value: 'no' },
     });
@@ -335,7 +337,7 @@ describe('这个渠道看不看得了图', () => {
 describe('地址填成别家的', () => {
   it('填了 anthropic 的官方地址就提醒，但照样存得下去', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     fireEvent.change(within(rowFor('openai')).getByLabelText('openai 地址'), {
       target: { value: 'https://api.anthropic.com' },
     });
@@ -347,7 +349,7 @@ describe('地址填成别家的', () => {
 
   it('原样的官方地址不触发提醒', async () => {
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
 
     expect(screen.queryByText(/这个地址是/)).toBeNull();
   });
@@ -355,7 +357,7 @@ describe('地址填成别家的', () => {
   it('取不到那份清单就不提醒', async () => {
     vi.mocked(getProviderProfiles).mockRejectedValue(new Error('401'));
     render(<ProvidersPage />);
-    await screen.findByText('渠道');
+    await ready();
     fireEvent.change(within(rowFor('openai')).getByLabelText('openai 地址'), {
       target: { value: 'https://api.anthropic.com' },
     });
