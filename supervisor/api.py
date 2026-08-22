@@ -422,6 +422,11 @@ def create_app(
             raise HTTPException(status_code=400, detail=f"没有叫 '{name}' 的渠道")
         cs: ConfigStore = app.state.config_store
         stored_url, stored_key = cs.resolve_provider_credentials(name)
+        if body.slot:
+            # 槽位自己配的那份优先：它才是这个页面在编辑的东西，渠道块只是它的兜底。
+            slot_url, slot_key = cs.resolve_slot_credentials(body.slot.strip())
+            stored_url = slot_url or stored_url
+            stored_key = slot_key or stored_key
         # 页面上清空了地址是「用默认」，没传这个字段才是「沿用已存的」。
         base_url = stored_url if body.base_url is None else body.base_url.strip()
         api_key = (body.api_key or "").strip() or stored_key

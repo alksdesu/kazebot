@@ -486,11 +486,13 @@ export async function getProviderProfiles(token: string): Promise<ProviderProfil
   };
 }
 
-/** 问上游这个渠道有哪些模型。base_url 传空串是「用这家默认地址」，不传是「沿用已存的」。 */
+/** 问上游这个渠道有哪些模型。base_url 传空串是「用这家默认地址」，不传是「沿用已存的」。
+ *
+ * slot 是发起方所在的系统槽位。带上它，后端才会拿那一槽自己存的密钥兜底。 */
 export async function listUpstreamModels(
   token: string,
   name: string,
-  data: { base_url?: string; api_key?: string },
+  data: { base_url?: string; api_key?: string; slot?: string },
 ): Promise<string[]> {
   const resp = await apiFetch(`/config/providers/${encodeURIComponent(name)}/models`, {
     method: 'POST',

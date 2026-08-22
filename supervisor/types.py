@@ -374,6 +374,8 @@ class ProviderModelsIn(BaseModel):
 
     base_url: str | None = None
     api_key: str | None = None
+    # 从某个系统槽位发起时填它。槽位自己那把密钥问不到渠道块里去，不带这个就会拿错。
+    slot: str | None = None
 
 
 class ProviderUpdateIn(BaseModel):

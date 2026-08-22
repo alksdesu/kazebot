@@ -80,7 +80,7 @@ export const FieldRow = ({ label, children }: { label: string; children: ReactNo
  * 密钥留空表示沿用已存的，后端自己去取，明文不用往回传。
  */
 export const ModelField = ({
-  provider, value, baseUrl, apiKey, choices, listId, ariaLabel, onChange,
+  provider, value, baseUrl, apiKey, choices, listId, ariaLabel, slot, onChange,
 }: {
   provider: string;
   value: string;
@@ -90,6 +90,8 @@ export const ModelField = ({
   choices: string[];
   listId: string;
   ariaLabel: string;
+  /** 在编辑某个系统槽位时给上。密钥框留空时，后端要拿这一槽存的那把去问。 */
+  slot?: string;
   onChange: (next: string) => void;
 }) => {
   const token = useSettingsStore((state) => state.adminToken);
@@ -111,6 +113,7 @@ export const ModelField = ({
       const models = await listUpstreamModels(token, provider, {
         base_url: baseUrl,
         ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
+        ...(slot ? { slot } : {}),
       });
       setPulled(models);
       setNote(models.length + ' 个模型，点输入框选');
