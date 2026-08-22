@@ -9,12 +9,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import contextvars
 import datetime as dt
 import hashlib
 import hmac
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import sys
@@ -146,10 +148,17 @@ from .emoji_handler import (
     process_emojis,
     resolve_custom_face,
     set_at_alias_resolver,
+    set_sticker_resolver,
     strip_output_markers,
     write_custom_face_metadata,
     write_custom_face_names,
 )
+from stickers.collect import CollectConfig, StickerCollector, any_marked_segment
+from stickers.combat import CombatConfig, CombatTracker
+from stickers.collect import store_path as sticker_store_path
+from stickers.rank import prompt_lines, rank
+from stickers.store import STATE_LIBRARY, STATE_PENDING, StickerStore
+from stickers.tagger import StickerTagger, TaggerConfig
 
 # clonoth_sdk 随工作区分发而非 pip 安装，插件加载时先把工作区加进 sys.path。
 if CLONOTH_WORKSPACE not in sys.path:
@@ -214,6 +223,7 @@ def _strip_command_prefix(text: str) -> str:
 _CUSTOM_FACE_LIST_RE = _cmd_re(("表情列表", "收藏表情列表", "emoji列表", "可用表情"), _CMD_OPT_COUNT)
 _CUSTOM_FACE_DETAIL_LIST_RE = _cmd_re(("表情详情列表", "收藏表情详情", "表情管理列表"), _CMD_OPT_COUNT)
 _CUSTOM_FACE_SYNC_RE = _cmd_re(("同步表情列表", "刷新表情列表", "更新表情列表"))
+_STICKER_RE = _cmd_re(("表情包", "表情包库", "图库"), _CMD_REST)
 _CUSTOM_FACE_HELP_RE = _cmd_re(("表情包帮助", "表情帮助", "表情包命令", "表情命令帮助"))
 _CUSTOM_FACE_ADD_RE = _cmd_re(("收藏表情", "添加表情", "保存表情", "表情收藏"), _CMD_ONE_ARG)
 _CUSTOM_FACE_RENAME_RE = _cmd_re(("命名表情", "重命名表情", "改名表情"), _CMD_TWO_ARGS)
@@ -2416,19 +2426,284 @@ def _current_custom_face_metadata() -> List[Dict[str, Any]]:
     return list(_custom_face_metadata)
 
 
-def _custom_face_prompt_block() -> str:
-    """构造注入给 AI 的 QQ 收藏表情使用说明。"""
-    current_names = _current_custom_face_names()
-    if live.face_prompt_limit <= 0 or not current_names:
-        return ""
-    names = current_names[:live.face_prompt_limit]
-    more = "" if len(current_names) <= live.face_prompt_limit else f"（另有 {len(current_names) - live.face_prompt_limit} 个未展示）"
-    return (
-        "【QQ可用收藏表情】\n"
-        "你可以在回复中用 [表情:名称] 发送 QQ 收藏表情。"
-        "只使用下列名称，不要臆造未列出的表情名。\n"
-        f"可用名称：{'、'.join(names)}{more}"
+_sticker_store: Optional[StickerStore] = None
+_sticker_collector: Optional[StickerCollector] = None
+_sticker_tagger: Optional[StickerTagger] = None
+
+
+def _sticker_store_handle() -> Optional[StickerStore]:
+    """惰性开库。开不了就当没这个功能，不能连累消息处理。"""
+    global _sticker_store
+    if _sticker_store is None:
+        try:
+            _sticker_store = StickerStore(sticker_store_path(Path(CLONOTH_WORKSPACE)))
+        except Exception:
+            logger.warning("表情包库打不开，相关功能停用", exc_info=True)
+            return None
+    return _sticker_store
+
+
+def _sticker_collect_config() -> CollectConfig:
+    return CollectConfig(
+        enabled=bool(live.sticker_collect),
+        strategy=str(live.sticker_strategy),
+        groups=tuple(live.sticker_groups),
+        auto_accept=bool(live.sticker_auto_accept),
+        pending_limit=int(live.sticker_pending_limit),
+        library_limit=int(live.sticker_library_limit),
+        pending_ttl_sec=int(live.sticker_pending_ttl_days) * 86400,
+        max_bytes=int(live.image_max_bytes),
     )
+
+
+def _sticker_collector_handle() -> Optional[StickerCollector]:
+    global _sticker_collector
+    if _sticker_collector is None:
+        _sticker_collector = StickerCollector(
+            Path(CLONOTH_WORKSPACE),
+            config=_sticker_collect_config,
+            open_store=_sticker_store_handle,
+        )
+    return _sticker_collector
+
+
+def _collect_stickers_from_event(
+    event: GroupMessageEvent, attachments: List[Dict[str, Any]],
+) -> None:
+    """把这条消息里的图丢进收集队列。只入队，落盘和查库都在后台。"""
+    if not attachments or not live.sticker_collect:
+        return
+    collector = _sticker_collector_handle()
+    if collector is None:
+        return
+    try:
+        marked = any_marked_segment(list(_iter_segments(event.get_message())))
+        collector.submit(
+            attachments,
+            group_id=event.group_id,
+            # 存化名而非真实 QQ 号：这张图会长期留在共享库里。
+            user_key=_event_user_alias(event),
+            marked=marked,
+        )
+    except Exception:
+        logger.debug("表情包入队失败", exc_info=True)
+
+
+# 发图时要记"这个会话刚发过这张"，而 process_emojis 的签名里没有会话键。
+_sticker_send_conversation: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "sticker_send_conversation", default="",
+)
+# 超过这个大小就不发了：base64 会再胀三分之一，而表情包本来就该是小图。
+_STICKER_SEND_MAX_BYTES = 3 * 1024 * 1024
+
+
+def _sticker_conversation_key(target: Dict[str, Any]) -> str:
+    kind = _target_forward_kind(target)
+    if kind is None:
+        return ""
+    prefix = "qq_group" if kind[0] == "group" else "qq_private"
+    return _stable_conversation_key(f"{prefix}:{kind[1]}")
+
+
+async def _resolve_sticker(name: str) -> str:
+    """按名字取图库里的表情包，返回可直接塞进 image 段的地址。
+
+    走 base64 而不是本地路径：图库是几个实例共享的，NapCat 容器里没有那个挂载。
+    """
+    store = _sticker_store_handle()
+    if store is None:
+        return ""
+    try:
+        row = store.by_name(name)
+        if row is None or not row.usable or not row.rel_path:
+            return ""
+        raw = await asyncio.to_thread((Path(CLONOTH_WORKSPACE) / row.rel_path).read_bytes)
+        if not raw or len(raw) > _STICKER_SEND_MAX_BYTES:
+            return ""
+        key = _sticker_send_conversation.get("")
+        if key:
+            await asyncio.to_thread(store.record_sent, key, row.sha256)
+        return "base64://" + base64.b64encode(raw).decode("ascii")
+    except OSError:
+        return ""
+    except Exception:
+        logger.warning("表情包取图失败: %s", name, exc_info=True)
+        return ""
+
+
+_sticker_combat = CombatTracker()
+
+
+def _sticker_combat_config() -> CombatConfig:
+    return CombatConfig(
+        enabled=bool(live.sticker_combat),
+        burst_probability=float(live.sticker_burst_probability),
+    )
+
+
+async def _maybe_join_sticker_combat(
+    bot: Bot, event: GroupMessageEvent, *, has_image: bool, text: str,
+) -> None:
+    """群里连着刷图时跟一张。
+
+    语境取群历史里最近的文本，取不到就不发 —— 为了接一张图再调一次多模态不划算，
+    而没有语境的随机发图看着就是个乱按键的机器人。
+    """
+    config = _sticker_combat_config()
+    if not config.enabled:
+        return
+    group = str(event.group_id)
+    now = time.monotonic()
+    if has_image:
+        _sticker_combat.on_image(group, user=str(event.user_id), now=now, config=config)
+    else:
+        if text.strip():
+            _sticker_combat.on_text(group, now=now)
+        return
+    if not _sticker_combat.should_battle(group, now=now, config=config):
+        return
+
+    conversation_key = _stable_conversation_key(f"qq_group:{int(event.group_id)}")
+    history = list(_group_history[int(event.group_id)])[-6:]
+    context_text = " ".join(entry.text for entry in history if entry.text)
+    payload = await _pick_combat_sticker(context_text, conversation_key)
+    if not payload:
+        return
+    try:
+        await bot.send_group_msg(
+            group_id=int(event.group_id),
+            message=_message_from_processed_segments(
+                [{"type": "image", "url": payload, "emoji": True}],
+            ),
+        )
+    except Exception:
+        logger.warning("表情包接梗发送失败", exc_info=True)
+        return
+    # 自己发完必须清 streak，否则这张图会算进下一轮，自己跟自己斗下去。
+    sent_at = time.monotonic()
+    _sticker_combat.mark_battled(group, now=sent_at)
+    _sticker_combat.on_self_send(group, now=sent_at)
+
+    if not _sticker_combat.should_burst(
+        group, now=sent_at, config=config, roll=random.random(),
+    ):
+        return
+    # 刚发那张已经记进 sent_log，检索时会自动排除，补的一定是另一张。
+    extra = await _pick_combat_sticker(context_text, conversation_key)
+    if not extra:
+        return
+    await asyncio.sleep(0.9)
+    try:
+        await bot.send_group_msg(
+            group_id=int(event.group_id),
+            message=_message_from_processed_segments(
+                [{"type": "image", "url": extra, "emoji": True}],
+            ),
+        )
+    except Exception:
+        logger.warning("表情包连发失败", exc_info=True)
+        return
+    _sticker_combat.mark_burst(group, now=time.monotonic())
+
+
+async def _pick_combat_sticker(context_text: str, conversation_key: str) -> str:
+    """按语境挑一张，挑不出就返回空串。"""
+    store = _sticker_store_handle()
+    if store is None or not context_text.strip():
+        return ""
+    try:
+        usable = store.all_usable()
+        if not usable:
+            return ""
+        recent = store.recently_sent(
+            conversation_key, within_sec=int(live.sticker_repeat_window_sec),
+        )
+        result = rank(context_text, usable, recently_sent=recent, limit=1)
+        # generic 是闲聊闸门：语境不明确时宁可不发。
+        if result.generic or result.best is None:
+            return ""
+        token = _sticker_send_conversation.set(conversation_key)
+        try:
+            return await _resolve_sticker(result.best.name)
+        finally:
+            _sticker_send_conversation.reset(token)
+    except Exception:
+        logger.debug("表情包接梗选图失败", exc_info=True)
+        return ""
+
+
+def _start_sticker_tagger() -> None:
+    """图库没启用也照跑：手动传的图同样要打标，只是平时没活会一直空转睡着。"""
+    global _sticker_tagger
+    if _sticker_tagger is None:
+        _sticker_tagger = StickerTagger(
+            Path(CLONOTH_WORKSPACE),
+            config=TaggerConfig,
+            open_store=_sticker_store_handle,
+        )
+    _sticker_tagger.start()
+
+
+async def _stop_stickers() -> None:
+    global _sticker_store, _sticker_collector, _sticker_tagger
+    if _sticker_tagger is not None:
+        await _sticker_tagger.stop()
+        _sticker_tagger = None
+    if _sticker_collector is not None:
+        await _sticker_collector.stop()
+        _sticker_collector = None
+    if _sticker_store is not None:
+        _sticker_store.close()
+        _sticker_store = None
+
+
+def _sticker_prompt_entries(text: str, conversation_key: str) -> list[str]:
+    """按当前语境粗排出的图库候选。
+
+    不像收藏表情那样把名字全量塞进去 —— 图库会长到几百张，全给等于 token 炸弹，
+    而且模型在几百个名字里也挑不准。
+    """
+    limit = int(live.sticker_prompt_limit)
+    if limit <= 0 or not text.strip():
+        return []
+    store = _sticker_store_handle()
+    if store is None:
+        return []
+    try:
+        usable = store.all_usable()
+        if not usable:
+            return []
+        recent = store.recently_sent(
+            conversation_key, within_sec=int(live.sticker_repeat_window_sec),
+        )
+        return prompt_lines(rank(text, usable, recently_sent=recent, limit=limit))
+    except Exception:
+        logger.debug("表情包检索失败", exc_info=True)
+        return []
+
+
+def _custom_face_prompt_block(context_text: str = "", conversation_key: str = "") -> str:
+    """构造注入给 AI 的表情使用说明。收藏表情按名单给全，图库按语境挑几张。"""
+    current_names = _current_custom_face_names()
+    faces = current_names[:live.face_prompt_limit] if live.face_prompt_limit > 0 else []
+    stickers = _sticker_prompt_entries(context_text, conversation_key)
+    if not faces and not stickers:
+        return ""
+
+    lines = [
+        "【可用表情】",
+        "你可以在回复中用 [表情:名称] 发送表情。只使用下列名称，不要臆造未列出的。",
+    ]
+    if faces:
+        more = (
+            "" if len(current_names) <= live.face_prompt_limit
+            else f"（另有 {len(current_names) - live.face_prompt_limit} 个未展示）"
+        )
+        lines.append(f"收藏表情：{'、'.join(faces)}{more}")
+    if stickers:
+        # 带上标签，模型才判断得出哪张跟当前语境搭。
+        lines.append("表情包（括号里是它的标签）：" + "；".join(stickers))
+    return "\n".join(lines)
 
 
 def _reaction_prompt_block() -> str:
@@ -2749,6 +3024,143 @@ async def _maybe_handle_model_command(
         return f"✅ model → {new_model or model_name}"
 
     return None
+
+
+_STICKER_HELP = (
+    "表情包库命令：\n"
+    "1) /表情包 统计\n"
+    "2) /表情包 列表 或 /表情包 列表 30\n"
+    "3) /表情包 待审 —— 看还没过筛的\n"
+    "4) /表情包 通过 名字 —— 待审转入库\n"
+    "5) /表情包 丢弃 名字 —— 丢掉并记住，同一张不会再收\n"
+    "6) /表情包 删除 名字 —— 彻底删，之后还能被重新收\n"
+    "7) /表情包 改名 旧名 新名\n"
+    "8) /表情包 标签 名字 开心,猫\n"
+    "9) /表情包 重打标 或 /表情包 重打标 失败\n"
+    "10) /表情包 备份\n"
+    "提示：AI 发表情包和发收藏表情用的是同一个 [表情:名称]；开关在控制台的表情包页。"
+)
+
+
+def _sticker_line(row: Any) -> str:
+    tags = "、".join(row.tags[:5]) or "还没打标"
+    return f"{row.name}（{tags}）"
+
+
+def _find_sticker(store: Any, token: str) -> Any:
+    """先按名字找，找不到再当哈希前缀。名字是给人用的，哈希是给出问题时兜底的。"""
+    row = store.by_name(token)
+    if row is not None:
+        return row
+    token = token.strip().lower()
+    if len(token) < 6:
+        return None
+    return next((item for item in store.browse(limit=500) if item.sha256.startswith(token)), None)
+
+
+async def _maybe_handle_sticker_command(
+    *, event: Event, user_text: str,
+) -> str | None:
+    """处理表情包库管理命令；返回回复文本，None 表示不是命令。"""
+    match = _STICKER_RE.match((user_text or "").strip())
+    if match is None:
+        return None
+    rest = (match.group(1) or "").strip()
+    if not rest or rest in ("帮助", "help", "?", "？"):
+        return _STICKER_HELP
+
+    store = _sticker_store_handle()
+    if store is None:
+        return "表情包库打不开，去看看 bot 日志。"
+    head, _, tail = rest.partition(" ")
+    tail = tail.strip()
+
+    if head in ("统计", "状态"):
+        counts = store.counts()
+        return (
+            f"在库 {counts['library']} 张，其中 {counts['usable']} 张可用；"
+            f"待审 {counts['pending']}，已弃 {counts['discarded']}，"
+            f"等打标 {counts['awaiting_caption']}。"
+        )
+
+    if head in ("列表", "待审"):
+        state = STATE_LIBRARY if head == "列表" else STATE_PENDING
+        try:
+            limit = min(max(int(tail), 1), 50) if tail else 20
+        except ValueError:
+            limit = 20
+        rows = store.browse(state=state, limit=limit)
+        if not rows:
+            return "待审池是空的。" if state == STATE_PENDING else "图库里还没有图。"
+        return "\n".join([f"共 {len(rows)} 张：", *(_sticker_line(row) for row in rows)])
+
+    allowed = _can("custom_face", event)
+    if not allowed:
+        return _capability_denial("custom_face", event, "表情包库的写操作仅限 Clonoth 管理员。")
+
+    if head == "重打标":
+        queued = store.reset_captions(only_failed=tail in ("失败", "failed"))
+        return f"已把 {queued} 张排进打标队列，后台慢慢跑。"
+
+    if head == "备份":
+        from stickers.backup import export_library
+
+        try:
+            result = await asyncio.to_thread(export_library, Path(CLONOTH_WORKSPACE))
+        except Exception as exc:
+            logger.warning("表情包备份失败", exc_info=True)
+            return f"备份失败：{exc}"
+        return f"已备份 {result.stickers} 条记录、{result.images} 张图到 {result.path.name}。"
+
+    if not tail:
+        return f"这个命令要带名字。{_STICKER_HELP}"
+
+    if head == "改名":
+        old, _, new = tail.partition(" ")
+        row = _find_sticker(store, old.strip())
+        if row is None:
+            return f"没找到：{old}"
+        if not new.strip():
+            return "要给新名字。"
+        return f"已改名为：{store.rename(row.sha256, new.strip())}"
+
+    if head == "标签":
+        name, _, raw = tail.partition(" ")
+        row = _find_sticker(store, name.strip())
+        if row is None:
+            return f"没找到：{name}"
+        tags = [item.strip() for item in re.split(r"[,，、\s]+", raw) if item.strip()]
+        if not tags:
+            return "要给至少一个标签。"
+        store.set_manual_tags(row.sha256, tags, override=True)
+        return f"{row.name} 的标签已改为：{'、'.join(tags)}（人工标签覆盖自动标签）"
+
+    row = _find_sticker(store, tail)
+    if row is None:
+        return f"没找到：{tail}"
+
+    if head == "通过":
+        from stickers.collect import accept_pending
+
+        if not accept_pending(Path(CLONOTH_WORKSPACE), store, row.sha256):
+            return f"{row.name} 不在待审池里。"
+        return f"{row.name} 已入库，打完标就能用。"
+
+    if head == "丢弃":
+        from stickers.collect import drop_sticker_file
+
+        drop_sticker_file(Path(CLONOTH_WORKSPACE), row.rel_path)
+        store.discard(row.sha256)
+        return f"已丢弃 {row.name}，同一张图不会再被收进来。"
+
+    if head == "删除":
+        from stickers.collect import drop_sticker_file
+
+        drop_sticker_file(Path(CLONOTH_WORKSPACE), row.rel_path)
+        store.forget(row.sha256)
+        return f"已删除 {row.name}。它再出现在群里还会被重新收。"
+
+    return _STICKER_HELP
 
 
 async def _maybe_handle_custom_face_command(
@@ -5254,7 +5666,8 @@ async def _build_inbound_text(
         attachments.extend(quoted_attachments)
     if reply_context:
         parts.extend(["", "【当前消息引用】", reply_context])
-    custom_face_prompt = _custom_face_prompt_block()
+    # 拿当前这句话去检索，不用整段群历史：历史里的情绪早过去了，按它挑图会驴唇不对马嘴。
+    custom_face_prompt = _custom_face_prompt_block(user_text, conversation_key)
     if custom_face_prompt:
         parts.extend(["", custom_face_prompt])
     reaction_prompt = _reaction_prompt_block()
@@ -5321,7 +5734,7 @@ async def _build_private_inbound_text(event: PrivateMessageEvent, bot: Bot, user
         attachments.extend(quoted_attachments)
     if reply_context:
         parts.extend(["", "【当前消息引用】", reply_context])
-    custom_face_prompt = _custom_face_prompt_block()
+    custom_face_prompt = _custom_face_prompt_block(text, conversation_key)
     if custom_face_prompt:
         parts.extend(["", custom_face_prompt])
     parts.extend([
@@ -6200,6 +6613,26 @@ async def _send_split_text(
     # _send_qq_message 处理，确保私聊也能复用表情替换和分段发送能力。
     sent_any = False
     parts = text.split(_SPLIT_SIGNAL) if text else []
+    conversation_token = _sticker_send_conversation.set(_sticker_conversation_key(target))
+    try:
+        sent_any = await _send_split_parts(
+            bot, target, parts,
+            source_attachments=source_attachments, send_context=send_context,
+        )
+    finally:
+        _sticker_send_conversation.reset(conversation_token)
+    return sent_any
+
+
+async def _send_split_parts(
+    bot: Bot,
+    target: Dict[str, Any],
+    parts: List[str],
+    *,
+    source_attachments: List[Dict[str, Any]] | None = None,
+    send_context: OutboundSendContext | None = None,
+) -> bool:
+    sent_any = False
     for index, raw_part in enumerate(parts):
         part = _truncate_qq_text(raw_part.strip())
         if not part:
@@ -8498,10 +8931,12 @@ async def _startup() -> None:
         logger.info("loaded %d QQ user profiles", len(_QQ_USER_PROFILES))
     _load_route_state()
     _load_reply_attachment_cache()
+    _start_sticker_tagger()
     _load_anon_map()
     # [2026-07-14] 注入 at 别名反查，让 emoji_handler 在处理 [at:UserAF]/[at:显示名]
     # 时能把匿名别名/群昵称回解为真实 QQ 号，避免直接把代号当纯文本 @ 出去。
     set_at_alias_resolver(_resolve_at_alias_to_real)
+    set_sticker_resolver(_resolve_sticker)
     # [AutoC] QQ 管理员 /切换模型 命令需要调用受 admin_token 保护的
     # POST /v1/config/openai，因此这里把 Supervisor 写出的 data/.admin_token
     # 传给 ClonothClient（每次请求实时读取，token 轮换也能跟上）。
@@ -8586,6 +9021,7 @@ async def _shutdown() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await _attachment_cleanup_task
         _attachment_cleanup_task = None
+    await _stop_stickers()
     if _qq_queue_tasks:
         for task in _qq_queue_tasks.values():
             task.cancel()
@@ -8642,8 +9078,14 @@ async def _record_non_trigger_message(bot: Bot, event: GroupMessageEvent) -> Non
             bot, event, stable_conversation_key, expand_forward=False,
         )
         _remember_recent_images(stable_conversation_key, event, attachments)
+        _collect_stickers_from_event(event, attachments)
         _record_group_message(event, bot, override_text=expanded_text, attachments=attachments)
         await _maybe_echo_group_message(bot, event, expanded_text)
+        await _maybe_join_sticker_combat(
+            bot, event,
+            has_image=any(item.get("type") == "image" for item in attachments),
+            text=expanded_text,
+        )
 
 
 def _echo_key_for_message(message: Any, text: str) -> str:
@@ -8868,6 +9310,9 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
     )
     if custom_face_reply is not None:
         await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=custom_face_reply)
+    sticker_reply = await _maybe_handle_sticker_command(event=event, user_text=user_text)
+    if sticker_reply is not None:
+        await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=sticker_reply)
     proactive_reply = await _maybe_handle_proactive_command(
         bot=bot,
         event=event,
@@ -9132,6 +9577,9 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     )
     if custom_face_reply is not None:
         await _private_matcher.finish(custom_face_reply)
+    sticker_reply = await _maybe_handle_sticker_command(event=event, user_text=user_text)
+    if sticker_reply is not None:
+        await _private_matcher.finish(sticker_reply)
     proactive_reply = await _maybe_handle_proactive_command(
         bot=bot,
         event=event,

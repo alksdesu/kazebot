@@ -154,6 +154,22 @@ extensions:
     max_text_length: 30   # 超过这个长度不跟
     window_sec: 120.0     # 复读要在这个时间窗内连续发生
     cooldown_sec: 90.0    # 同群两次跟读之间至少隔这么久
+  # 把群里的表情包攒进图库，打上标签后按语境挑着发。图库是几个实例共用的一份。
+  # 收进来的图先进待审池，打标后才参与检索；丢弃过的会记住哈希，不会再收第二次。
+  sticker:
+    collect: false
+    # strict 只收 QQ 标了表情包的；loose 再放行看着不像截图的；none 全收
+    strategy: loose
+    groups: []              # 只从这些群收，留空表示所有已授权的群
+    auto_accept: false      # 收到就直接入库，跳过人工筛选
+    pending_limit: 200      # 待审池上限，满了不再收新的
+    library_limit: 1000     # 图库上限，超出时最旧的先出局
+    pending_ttl_days: 7     # 待审池里放这么多天没人管就丢掉
+    prompt_limit: 12        # 每轮给模型看几张候选，给多了是 token 炸弹
+    repeat_window_sec: 1800 # 同一会话这段时间内发过的图不再发
+    # 群里连着刷图时跟着接一张。要求连图来自至少两个人，中间夹了纯文本就不算。
+    combat: false
+    burst_probability: 0.0  # 自己发完图后再补一张的概率，0 表示不补
 
 # ── 输入能力 ──────────────────────────────────
 input:

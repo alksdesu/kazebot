@@ -462,6 +462,63 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         env=("ONEBOT_ECHO_COOLDOWN_SEC",),
         note="同一个群两次跟读之间至少隔这么久",
     ),
+    LiveKey(
+        "sticker_collect", "extensions.sticker.collect", BOOL, False,
+        env=("ONEBOT_STICKER_COLLECT",),
+        note="把群里的表情包攒进图库",
+    ),
+    LiveKey(
+        "sticker_strategy", "extensions.sticker.strategy", PLAIN_STR, "loose",
+        env=("ONEBOT_STICKER_STRATEGY",),
+        note="收多严：strict 只收 QQ 标了表情包的，loose 再放行看着不像截图的，none 全收",
+    ),
+    LiveKey(
+        "sticker_groups", "extensions.sticker.groups", ID_LIST, (),
+        env=("ONEBOT_STICKER_GROUPS",),
+        note="只从这些群收，留空表示所有已授权的群",
+    ),
+    LiveKey(
+        "sticker_auto_accept", "extensions.sticker.auto_accept", BOOL, False,
+        env=("ONEBOT_STICKER_AUTO_ACCEPT",),
+        note="收到就直接入库，跳过人工筛选",
+    ),
+    LiveKey(
+        "sticker_pending_limit", "extensions.sticker.pending_limit", int_in(min_value=0, max_value=5000), 200,
+        env=("ONEBOT_STICKER_PENDING_LIMIT",),
+        note="待审池上限，满了不再收新的",
+    ),
+    LiveKey(
+        "sticker_library_limit", "extensions.sticker.library_limit", int_in(min_value=0, max_value=20000), 1000,
+        env=("ONEBOT_STICKER_LIBRARY_LIMIT",),
+        note="图库上限，超出时最旧的先出局",
+    ),
+    LiveKey(
+        "sticker_pending_ttl_days", "extensions.sticker.pending_ttl_days", int_in(min_value=0, max_value=365), 7,
+        env=("ONEBOT_STICKER_PENDING_TTL_DAYS",),
+        note="待审池里放这么多天还没人管就丢掉",
+    ),
+    LiveKey(
+        "sticker_prompt_limit", "extensions.sticker.prompt_limit", int_in(min_value=0, max_value=60), 12,
+        env=("ONEBOT_STICKER_PROMPT_LIMIT",),
+        note="每轮给模型看几张候选。给多了是 token 炸弹，给少了挑不出合适的",
+    ),
+    LiveKey(
+        "sticker_repeat_window_sec", "extensions.sticker.repeat_window_sec",
+        int_in(min_value=0, max_value=86400), 1800,
+        env=("ONEBOT_STICKER_REPEAT_WINDOW_SEC",),
+        note="同一个会话里这段时间内发过的图不再发",
+    ),
+    LiveKey(
+        "sticker_combat", "extensions.sticker.combat", BOOL, False,
+        env=("ONEBOT_STICKER_COMBAT",),
+        note="群里连着刷图时跟着接一张；阈值和冷却用内置默认值",
+    ),
+    LiveKey(
+        "sticker_burst_probability", "extensions.sticker.burst_probability",
+        float_in(min_value=0.0, max_value=1.0), 0.0,
+        env=("ONEBOT_STICKER_BURST_PROBABILITY",),
+        note="自己发完图后再补一张的概率，0 表示不补",
+    ),
     # 输入能力
     LiveKey(
         "enable_image_input", "input.image", BOOL, True,

@@ -46,6 +46,17 @@ def set_at_alias_resolver(resolver: Any) -> None:
     _at_alias_resolver = resolver
 
 
+# 表情包名 -> 可发送地址的解析回调，同样由 __init__.py 注入。收藏表情查不到时才问它，
+# 所以同名的收藏表情优先级更高。
+_sticker_resolver: Any = None
+
+
+def set_sticker_resolver(resolver: Any) -> None:
+    """注入表情包名 -> 可发送地址（base64:// 或 http）的解析回调。"""
+    global _sticker_resolver
+    _sticker_resolver = resolver
+
+
 # 一个 [at:...] 标记内多个目标的分隔符：英文逗号、中文逗号、顿号、分号、或连续空白。
 # 例如 [at:UserA,UserB、木] 会拆成 ["UserA", "UserB", "张三"]。
 _AT_TOKEN_SPLIT_RE = re.compile(r"[,\uFF0C\u3001;\uFF1B]+|\s{2,}")
@@ -775,6 +786,11 @@ async def process_emojis(
                 face = None if (isinstance(entry, dict) and "__group__" in entry) else entry
             if not url:
                 url = _custom_face_url(face) if face is not None else ""
+            if not url and _sticker_resolver is not None:
+                try:
+                    url = await _sticker_resolver(name) or ""
+                except Exception:
+                    logger.warning("sticker resolve failed: %s", name, exc_info=True)
             if url:
                 # 标记 emoji=True：这是 QQ 收藏表情，发送时走 image 表情子类型
                 # （sub_type=1），让客户端按小图/贴纸渲染，而不是普通大图。
