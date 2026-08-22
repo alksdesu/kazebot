@@ -38,6 +38,19 @@ install -m 0644 -o root -g root \
 echo "==> 准备 $DATA_ROOT"
 install -d -m 0755 -o "$OWNER" -g "$OWNER" "$DATA_ROOT"
 
+echo "==> 表情包库软链到共享目录"
+install -d -m 0755 -o "$OWNER" -g "$OWNER" "$DATA_ROOT/stickers"
+# 附件白名单只认工作区内的 data/ 前缀，所以是软链过去而不是配一个绝对路径。
+if [ -L "$REPO/data/stickers" ]; then
+  ln -sfn "$DATA_ROOT/stickers" "$REPO/data/stickers"
+elif [ -e "$REPO/data/stickers" ]; then
+  echo "    $REPO/data/stickers 已是真实目录，跳过；要共用的话自己把内容并过去再建软链"
+else
+  install -d -m 0755 -o "$OWNER" -g "$OWNER" "$REPO/data"
+  ln -s "$DATA_ROOT/stickers" "$REPO/data/stickers"
+  chown -h "$OWNER:$OWNER" "$REPO/data/stickers"
+fi
+
 echo "==> 放开主实例对 $DATA_ROOT 的写权限（drop-in，不动原 unit）"
 install -d -m 0755 /etc/systemd/system/kazebot.service.d
 cat >/etc/systemd/system/kazebot.service.d/10-instances.conf <<EOF

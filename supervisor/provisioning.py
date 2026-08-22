@@ -62,6 +62,25 @@ def data_root(workspace_root: Path) -> Path:
     return instances_file(workspace_root).parent
 
 
+def link_shared_stickers(workspace: Path, workspace_root: Path) -> bool:
+    """表情包库几个号共用一份。
+
+    做成软链而不是配一个绝对路径：附件白名单只认工作区内的 data/ 前缀，
+    库放在工作区外就发不出去。
+    """
+    shared = data_root(workspace_root) / "stickers"
+    shared.mkdir(parents=True, exist_ok=True)
+    link = Path(workspace) / "data" / "stickers"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink():
+        return Path(os.readlink(link)) == shared
+    if link.exists():
+        # 已经是真目录说明这个号自己攒过图，合并要人工决定，不能默默覆盖。
+        return False
+    link.symlink_to(shared, target_is_directory=True)
+    return True
+
+
 def log_path(workspace_root: Path, uin: str) -> Path:
     """进度文件放工作区外：删号会把工作区改名，日志跟着搬走就再也读不到结果。"""
     return data_root(workspace_root) / f"provision-{uin}.log"
@@ -139,6 +158,8 @@ def scaffold(plan: Plan, workspace_root: Path) -> None:
             raise ProvisionError(f"{link} 是真实目录，不敢覆盖")
         else:
             link.symlink_to(source, target_is_directory=True)
+
+    link_shared_stickers(plan.workspace, workspace_root)
 
     env_file = plan.workspace / ".env"
     if not env_file.exists():
