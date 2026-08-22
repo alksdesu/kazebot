@@ -97,7 +97,7 @@ if __name__ == "__main__":
         sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _channel import resolve_vision_channel
     from _image import ImagePayloadError, build_image_part
-    from _vision_wire import build_request, error_detail, parse_text, relax_body, truncated
+    from _wire import build_request, error_detail, parse_text, relax_body, truncated
 
     vision = resolve_vision_channel()
     if vision.error:

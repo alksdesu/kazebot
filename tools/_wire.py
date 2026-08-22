@@ -13,7 +13,7 @@ WIRE_ANTHROPIC = "anthropic"
 WIRE_GEMINI = "gemini"
 
 # provider 名 → 线格式。唯一权威是 providers/registry.wire_formats()，但工具是只吃标准库的
-# 子进程，导不了那个包（它依赖 httpx），所以在这里存一份，一致性由 test_vision_wire.py 钉住。
+# 子进程，导不了那个包（它依赖 httpx），所以在这里存一份，一致性由 test_wire.py 钉住。
 PROVIDER_WIRES: dict[str, str] = {
     "openai": WIRE_OPENAI,
     "deepseek": WIRE_OPENAI,
@@ -32,6 +32,18 @@ _WIRE_FAMILIES: dict[str, str] = {
 
 _ANTHROPIC_DOMAIN = "api.anthropic.com"
 _GEMINI_DOMAIN = "googleapis.com"
+
+# 各家的官方根，和 providers/*.py 的 default_base_url 同值。
+_DEFAULT_URLS: dict[str, str] = {
+    WIRE_OPENAI: "https://api.openai.com/v1",
+    WIRE_OPENAI_RESPONSES: "https://api.openai.com/v1",
+    WIRE_ANTHROPIC: "https://api.anthropic.com",
+    WIRE_GEMINI: "https://generativelanguage.googleapis.com",
+}
+
+
+def default_base_url(wire: str) -> str:
+    return _DEFAULT_URLS.get(str(wire or "").strip().lower(), _DEFAULT_URLS[WIRE_OPENAI])
 
 
 def wire_for(provider: str) -> str:

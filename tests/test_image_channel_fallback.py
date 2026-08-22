@@ -506,7 +506,7 @@ system_models:
         """_channel.py 有三种被加载的方式，线格式那份不能靠模块级 import 拿。
 
         包内 `tools._channel`、工具子进程里的裸 `_channel`、以及按路径加载 —— 这个文件
-        用的正是第三种，模块级 `from . import _vision_wire` 会在这里直接炸掉整个模块。
+        用的正是第三种，模块级 `from . import _wire` 会在这里直接炸掉整个模块。
         """
         assert not channel.__package__
         root = _workspace(tmp_path, """

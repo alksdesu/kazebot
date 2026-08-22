@@ -214,22 +214,22 @@ _WIRE_DEFAULT_URLS = {
 
 
 def _wire_module():
-    """加载同目录的 _vision_wire。
+    """加载同目录的 _wire。
 
     这个文件有三种被加载的方式 —— 包内 `tools._channel`、工具子进程里的裸 `_channel`、
     以及 clonoth_runtime 按路径加载 —— 模块级 import 会在后两种下炸掉整个模块。
     """
     try:
-        from . import _vision_wire  # type: ignore[no-redef]
-        return _vision_wire
+        from . import _wire  # type: ignore[no-redef]
+        return _wire
     except ImportError:
         pass
     import sys
     here = str(Path(__file__).resolve().parent)
     if here not in sys.path:
         sys.path.insert(0, here)
-    import _vision_wire  # type: ignore[no-redef]
-    return _vision_wire
+    import _wire  # type: ignore[no-redef]
+    return _wire
 
 
 def resolve_vision_channel(*, root: Path | None = None) -> VisionChannel:

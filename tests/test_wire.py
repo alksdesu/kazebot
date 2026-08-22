@@ -16,7 +16,7 @@ if str(_ROOT) not in sys.path:
 if str(_ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(_ROOT / "tools"))
 
-import _vision_wire as vw  # noqa: E402
+import _wire as vw  # noqa: E402
 
 _PNG = "data:image/png;base64,QUJD"
 
@@ -96,6 +96,18 @@ def test_anthropic_strips_the_version_segment(given: str) -> None:
 ])
 def test_gemini_strips_the_version_segment(given: str) -> None:
     assert vw.normalize_base_url("gemini", given) == "https://generativelanguage.googleapis.com"
+
+
+@pytest.mark.parametrize("wire", ["openai", "openai-responses", "anthropic", "gemini"])
+def test_every_wire_has_an_official_root_to_fall_back_on(wire: str) -> None:
+    # 归一化过它自己：默认地址拿去拼端点之前不该再被改写。
+    root = vw.default_base_url(wire)
+    assert root.startswith("https://")
+    assert vw.normalize_base_url(wire, root) == root
+
+
+def test_an_unknown_wire_falls_back_to_the_openai_root() -> None:
+    assert vw.default_base_url("some-relay-brand") == vw.default_base_url("openai")
 
 
 def test_a_bare_host_gets_a_scheme() -> None:

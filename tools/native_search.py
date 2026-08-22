@@ -41,7 +41,11 @@ if __name__ == "__main__":
     TOOL_DIR = Path(__file__).resolve().parent
     if str(TOOL_DIR) not in sys.path:
         sys.path.insert(0, str(TOOL_DIR))
-    from _channel import OPENAI_COMPATIBLE, Channel
+    from _channel import Channel
+    from _wire import (
+        PROVIDER_WIRES, WIRE_ANTHROPIC, WIRE_GEMINI, WIRE_OPENAI,
+        default_base_url, endpoint, headers, normalize_base_url, wire_for,
+    )
 
     PROMPT = (
         "请联网搜索并回答下面的问题。必须实际使用你的联网搜索能力获取最新信息，"
@@ -81,21 +85,15 @@ if __name__ == "__main__":
             fail(type(exc).__name__ + ": " + str(exc)[:200])
         return {}
 
-    def strip_version_suffix(url: str) -> str:
-        for suffix in ("/v1beta", "/v1"):
-            if url.endswith(suffix):
-                return url[: -len(suffix)]
-        return url
-
     def search_openai(model: str, key: str, base: str, query: str) -> tuple[str, list[str]]:
         data = post(
-            base + "/chat/completions",
+            endpoint(WIRE_OPENAI, base, model),
             {
                 "model": model,
                 "messages": [{"role": "user", "content": PROMPT.format(query=query)}],
                 "tools": [{"type": "web_search"}],
             },
-            {"Authorization": "Bearer " + key},
+            headers(WIRE_OPENAI, base, key),
         )
         message = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
         text = str(message.get("content") or "")
@@ -108,14 +106,13 @@ if __name__ == "__main__":
         return text, urls
 
     def search_gemini(model: str, key: str, base: str, query: str) -> tuple[str, list[str]]:
-        root = strip_version_suffix(base) or "https://generativelanguage.googleapis.com"
         data = post(
-            root + "/v1beta/models/" + model + ":generateContent?key=" + key,
+            endpoint(WIRE_GEMINI, base, model),
             {
                 "contents": [{"role": "user", "parts": [{"text": PROMPT.format(query=query)}]}],
                 "tools": [{"google_search": {}}],
             },
-            {},
+            headers(WIRE_GEMINI, base, key),
         )
         candidate = (data.get("candidates") or [{}])[0] or {}
         parts = ((candidate.get("content") or {}).get("parts")) or []
@@ -129,14 +126,14 @@ if __name__ == "__main__":
 
     def search_anthropic(model: str, key: str, base: str, query: str) -> tuple[str, list[str]]:
         data = post(
-            strip_version_suffix(base) + "/v1/messages",
+            endpoint(WIRE_ANTHROPIC, base, model),
             {
                 "model": model,
                 "max_tokens": 2000,
                 "messages": [{"role": "user", "content": PROMPT.format(query=query)}],
                 "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
             },
-            {"x-api-key": key, "anthropic-version": "2023-06-01"},
+            headers(WIRE_ANTHROPIC, base, key),
         )
         chunks: list[str] = []
         urls: list[str] = []
@@ -153,8 +150,9 @@ if __name__ == "__main__":
         return "".join(chunks), urls
 
     ENGINES = {
-        "gemini": search_gemini,
-        "anthropic": search_anthropic,
+        WIRE_GEMINI: search_gemini,
+        WIRE_ANTHROPIC: search_anthropic,
+        WIRE_OPENAI: search_openai,
     }
 
     raw_input = json.loads((sys.stdin.read() or "{}").lstrip("﻿"))
@@ -168,15 +166,21 @@ if __name__ == "__main__":
     provider = (channel.own("provider", "PROVIDER") or main.provider or "openai").strip().lower()
     model = channel.pick("model", "MODEL", main.model)
     api_key = channel.pick("api_key", "API_KEY", main.api_key)
-    base_url = channel.pick("base_url", "BASE_URL", main.base_url).rstrip("/")
+    # 搜索请求发出去就计费，认不出的渠道宁可直说，不按 OpenAI 猜着发一次。
+    if provider not in PROVIDER_WIRES:
+        fail("不认识渠道 " + provider + "，没法判断它的搜索接口该怎么调。")
+    wire = wire_for(provider)
+    base_url = normalize_base_url(
+        wire, channel.pick("base_url", "BASE_URL", main.base_url) or default_base_url(wire),
+    )
 
     if not model or not api_key:
         fail("主模型渠道没有配好 model 或 api_key，无法使用自带搜索。")
 
-    engine = ENGINES.get(provider)
-    if engine is None and provider not in OPENAI_COMPATIBLE:
-        fail("provider " + provider + " 没有已知的原生搜索接口。")
-    answer, citations = (engine or search_openai)(model, api_key, base_url, query)
+    engine = ENGINES.get(wire)
+    if engine is None:
+        fail("渠道 " + provider + " 的搜索走 " + wire + " 格式，本工具还没接。")
+    answer, citations = engine(model, api_key, base_url, query)
 
     unique: list[str] = []
     for url in citations:

@@ -226,7 +226,7 @@ class StickerTagger:
         import httpx
 
         from tools._image import build_image_part
-        from tools._vision_wire import (
+        from tools._wire import (
             build_request, error_detail, parse_text, relax_body, truncated,
         )
 

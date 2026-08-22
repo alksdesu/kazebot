@@ -296,7 +296,7 @@ def _seed_real_png(bench, digest: str = "c" * 64) -> Path:
 
 
 def _vision(wire: str, base_url: str) -> _Vision:
-    import _vision_wire as vw
+    import _wire as vw
 
     channel = _Vision()
     channel.wire = wire
