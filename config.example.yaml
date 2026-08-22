@@ -66,9 +66,11 @@ openai:
 # 下面这些槽位都能在 QQ 控制台的「渠道」页里改，不必手写。
 #
 # 每个 slot 还可写 provider（或 CLONOTH_<SLOT>_PROVIDER），指定这一槽用哪套请求格式。
-# 只对引擎跑的槽位有效：compact / summary / intent。改了 base_url 换家却不改它，
-# 就是拿主渠道那家的格式去打这个地址 —— 换中转没事，换家必挂，日志里会有一行提醒。
-# image / image_gpt / image_gemini 三个是工具进程自己读的，格式写死在工具里，provider 不生效。
+# compact / summary / intent：改了 base_url 换家却不改它，就是拿主渠道那家的格式去打这个
+# 地址 —— 换中转没事，换家必挂，日志里会有一行提醒。
+# image：四套格式都支持。三档规则 —— 全空跟随主渠道（连格式一起跟）；只填地址按 openai 算；
+# 写了 provider 就按它。地址写到哪一级也看它：OpenAI 系带 /v1，Claude 与 Gemini 不带。
+# image_gpt / image_gemini 各自绑死一家，格式写死在工具里，provider 不生效。
 #
 # 留空→跟随主渠道（上方 openai 块）；
 # 各 slot 的回退与默认：
@@ -91,7 +93,8 @@ openai:
 #     model: "${SUMMARY_MODEL}"
 #     base_url: "${SUMMARY_BASE_URL}"     # 也可单独指定渠道 url/key
 #     api_key: "${SUMMARY_API_KEY}"
-#   image:
+#   image:                                # 读图：read_image 工具和表情包打标共用
+#     provider: "gemini"                  # 走 Gemini 原生；不写则按上面的三档规则
 #     model: "gemini-3.5-flash"
 #     base_url: "${GEMINI_BASE_URL}"
 #     api_key: "${GEMINI_API_KEY}"

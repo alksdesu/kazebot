@@ -327,12 +327,14 @@ def normalize_openai_secret(data: dict[str, Any]) -> MainChannel:
 
 @dataclass(frozen=True)
 class SlotSpec:
-    """一个系统槽位。engine=False 的由工具子进程自己解析，请求格式写死在工具里。"""
+    """一个系统槽位。engine=False 的由工具子进程自己解析。"""
 
     key: str
     label: str
     desc: str
     engine: bool
+    # 能不能自选渠道。生图那两个的请求格式写死在工具源码里，配了也不生效。
+    supports_provider: bool = True
 
     @property
     def env_prefix(self) -> str:
@@ -344,8 +346,11 @@ SYSTEM_MODEL_SLOTS: tuple[SlotSpec, ...] = (
     SlotSpec("summary", "轮摘要", "每轮结束后写一条摘要，供回忆和抽取用。", True),
     SlotSpec("intent", "接话意愿", "判断群里这句话要不要接。调用频繁，务必用便宜的。", True),
     SlotSpec("image", "读图", "给看不了图的模型描述图片内容。留空跟随主渠道。", False),
-    SlotSpec("image_gpt", "生图（GPT）", "gpt_image_2 工具用的渠道。", False),
-    SlotSpec("image_gemini", "生图（Gemini）", "gemini_image 工具用的渠道，走 Gemini 原生接口。", False),
+    SlotSpec("image_gpt", "生图（GPT）", "gpt_image_2 工具用的渠道。", False, supports_provider=False),
+    SlotSpec(
+        "image_gemini", "生图（Gemini）", "gemini_image 工具用的渠道，走 Gemini 原生接口。",
+        False, supports_provider=False,
+    ),
 )
 
 _SYSTEM_MODEL_ENV_PREFIX = {spec.key: spec.env_prefix for spec in SYSTEM_MODEL_SLOTS}

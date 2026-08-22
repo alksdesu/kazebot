@@ -1,7 +1,7 @@
 // 系统槽位：压缩、摘要、接话意愿、读图、两个生图工具，各自可以走独立渠道。
 //
-// 留空表示跟随主渠道。工具那三个（读图 / 两个生图）由独立子进程解析，请求格式写死在
-// 工具源码里，所以不给它们 provider 选项 —— 配了也不生效。
+// 留空表示跟随主渠道。生图那两个的请求格式写死在工具源码里，所以不给它们 provider
+// 选项 —— 配了也不生效。
 import { useEffect, useMemo, useState } from 'react';
 
 import {
@@ -70,11 +70,12 @@ const Row = ({
           choices={[]}
           listId={'slot-' + slot.key}
           provider={draft.provider || activeProvider}
+          slot={slot.key}
           value={draft.model}
           onChange={(model) => onChange({ ...draft, model })}
         />
       ) : (
-        // 这几个槽位由工具进程直接请求，格式写死在工具源码里，没有可问的列模型接口。
+        // 生图那两个的格式写死在工具源码里，没有可问的列模型接口。
         <FieldRow label="模型">
           <input
             aria-label={slot.label + ' 模型'}
@@ -124,7 +125,7 @@ const Row = ({
       )}
 
       {!slot.supports_provider && draft.baseUrl && (
-        <p className="qc-cap-desc">这一项由工具进程直接请求，格式固定，换成别家的地址会失败。</p>
+        <p className="qc-cap-desc">这一项的请求格式固定，换成别家的地址会失败。</p>
       )}
       {slot.supports_provider && draft.baseUrl && !draft.provider && (
         <p className="qc-cap-desc">换家要连渠道一起选，只改地址会按主渠道的格式发出去。</p>

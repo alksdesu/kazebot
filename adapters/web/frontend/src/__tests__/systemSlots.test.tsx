@@ -1,5 +1,5 @@
-// 系统槽位。工具那几个由子进程直接请求、格式写死，所以不该给它们渠道选项；
-// 引擎那几个换家必须连渠道一起改，只换地址会按主渠道的格式发出去。
+// 系统槽位。生图那两个的格式写死在工具源码里，所以不该给它们渠道选项；
+// 其余的换家必须连渠道一起改，只换地址会按主渠道的格式发出去。
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -28,7 +28,7 @@ const SLOTS = {
     }),
     slot({ key: 'summary', label: '轮摘要', supports_provider: true }),
     slot({ key: 'intent', label: '接话意愿', supports_provider: true }),
-    slot({ key: 'image', label: '读图' }),
+    slot({ key: 'image', label: '读图', supports_provider: true }),
     slot({ key: 'image_gpt', label: '生图（GPT）', base_url: 'https://img.example/v1', base_url_raw: 'https://img.example/v1' }),
     slot({ key: 'image_gemini', label: '生图（Gemini）' }),
   ],
@@ -65,13 +65,14 @@ describe('系统槽位', () => {
     expect(rowFor('生图（Gemini）')).toBeTruthy();
   });
 
-  it('工具槽位没有渠道选择器，引擎槽位有', async () => {
-    // 工具子进程的请求格式写死在源码里，摆个选项等于骗人。
+  it('生图那两个没有渠道选择器，其余都有', async () => {
+    // 生图工具的请求格式写死在源码里，摆个选项等于骗人。
     render1();
     await screen.findByText('系统槽位');
     expect(within(rowFor('上下文压缩')).getByLabelText('上下文压缩 渠道')).toBeTruthy();
+    expect(within(rowFor('读图')).getByLabelText('读图 渠道')).toBeTruthy();
     expect(within(rowFor('生图（GPT）')).queryByLabelText('生图（GPT） 渠道')).toBeNull();
-    expect(within(rowFor('读图')).queryByLabelText('读图 渠道')).toBeNull();
+    expect(within(rowFor('生图（Gemini）')).queryByLabelText('生图（Gemini） 渠道')).toBeNull();
   });
 
   it('回填的是变量引用原文', async () => {
@@ -140,10 +141,12 @@ describe('保存', () => {
     expect(vi.mocked(updateSystemModel).mock.calls[0][2].base_url).toBe('');
   });
 
-  it('工具槽位提交的 provider 恒为空', async () => {
+  it('生图槽位提交的 provider 恒为空', async () => {
     render1();
     await screen.findByText('系统槽位');
-    fireEvent.change(within(rowFor('读图')).getByLabelText('读图 模型'), { target: { value: 'gemini-x' } });
+    fireEvent.change(within(rowFor('生图（GPT）')).getByLabelText('生图（GPT） 模型'), {
+      target: { value: 'gpt-image-3' },
+    });
     save();
 
     await waitFor(() => expect(updateSystemModel).toHaveBeenCalled());
@@ -184,7 +187,7 @@ describe('换家提示', () => {
     expect(within(rowFor('轮摘要')).queryByText(/换家要连渠道一起选/)).toBeNull();
   });
 
-  it('工具槽位改地址时说明格式是固定的', async () => {
+  it('生图槽位改地址时说明格式是固定的', async () => {
     render1();
     await screen.findByText('系统槽位');
     expect(within(rowFor('生图（GPT）')).getByText(/格式固定/)).toBeTruthy();

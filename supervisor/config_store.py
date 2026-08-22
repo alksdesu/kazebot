@@ -329,6 +329,21 @@ class ConfigStore:
             _resolve_env_value(str(block.get("api_key") or "")),
         )
 
+    def resolve_slot_credentials(self, slot: str) -> tuple[str, str]:
+        """按系统槽位取展开后的 (base_url, api_key)。和上面那个一样，只出不进。"""
+        known = {spec.key for spec in SYSTEM_MODEL_SLOTS}
+        if slot not in known:
+            return "", ""
+        with self._lock:
+            blocks = self._load_raw().get("system_models")
+            block = blocks.get(slot) if isinstance(blocks, dict) else None
+        if not isinstance(block, dict):
+            return "", ""
+        return (
+            _resolve_env_value(str(block.get("base_url") or "")),
+            _resolve_env_value(str(block.get("api_key") or "")),
+        )
+
     def supports_vision(self, name: str = "") -> bool:
         """这个渠道收不收图片。不给名字就问当前活跃的那个。
 
@@ -385,8 +400,7 @@ class ConfigStore:
                     "key": spec.key,
                     "label": spec.label,
                     "desc": spec.desc,
-                    # 工具子进程的格式写死在源码里，给它配 provider 不生效。
-                    "supports_provider": spec.engine,
+                    "supports_provider": spec.supports_provider,
                     "env_prefix": spec.env_prefix,
                     "model": _resolve_env_value(str(block.get("model") or "")),
                     "base_url": _resolve_env_value(str(block.get("base_url") or "")),

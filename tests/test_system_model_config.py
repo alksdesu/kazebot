@@ -53,11 +53,12 @@ class TestPublicShape:
         assert compact["model_raw"] == "${COMPACT_MODEL}"
         assert compact["model"] == "gemini-3.5-flash"
 
-    def test_tool_slots_do_not_offer_a_provider(self, store):
-        # 工具子进程的请求格式写死在源码里，配了也不生效。
+    def test_image_gen_slots_do_not_offer_a_provider(self, store):
+        # 生图那两个工具的请求格式写死在源码里，配了也不生效。
         assert _slot(store, "compact")["supports_provider"] is True
         assert _slot(store, "intent")["supports_provider"] is True
-        for key in ("image", "image_gpt", "image_gemini"):
+        assert _slot(store, "image")["supports_provider"] is True
+        for key in ("image_gpt", "image_gemini"):
             assert _slot(store, key)["supports_provider"] is False
 
     def test_the_env_prefix_matches_what_the_tools_read(self, store):
