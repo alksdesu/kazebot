@@ -43,8 +43,8 @@ if __name__ == "__main__":
         sys.path.insert(0, str(TOOL_DIR))
     from _channel import Channel
     from _wire import (
-        PROVIDER_WIRES, WIRE_ANTHROPIC, WIRE_GEMINI, WIRE_OPENAI,
-        default_base_url, endpoint, headers, normalize_base_url, wire_for,
+        PROVIDER_WIRES, WIRE_ANTHROPIC, WIRE_GEMINI, WIRE_OPENAI, WIRE_OPENAI_RESPONSES,
+        default_base_url, endpoint, headers, normalize_base_url, parse_text, wire_for,
     )
 
     PROMPT = (
@@ -105,6 +105,32 @@ if __name__ == "__main__":
                 urls.append(url)
         return text, urls
 
+    def search_responses(model: str, key: str, base: str, query: str) -> tuple[str, list[str]]:
+        data = post(
+            endpoint(WIRE_OPENAI_RESPONSES, base, model),
+            {
+                "model": model,
+                "input": PROMPT.format(query=query),
+                "tools": [{"type": "web_search"}],
+            },
+            headers(WIRE_OPENAI_RESPONSES, base, key),
+        )
+        urls: list[str] = []
+        for item in data.get("output") or []:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for block in item.get("content") or []:
+                if not isinstance(block, dict):
+                    continue
+                for note in block.get("annotations") or []:
+                    if not isinstance(note, dict) or note.get("type") != "url_citation":
+                        continue
+                    url = str(note.get("url") or "").strip()
+                    if url:
+                        urls.append(url)
+        # 正文交给共用那份：它还认 output_text 这个拼好的快捷字段。
+        return parse_text(WIRE_OPENAI_RESPONSES, data), urls
+
     def search_gemini(model: str, key: str, base: str, query: str) -> tuple[str, list[str]]:
         data = post(
             endpoint(WIRE_GEMINI, base, model),
@@ -153,6 +179,7 @@ if __name__ == "__main__":
         WIRE_GEMINI: search_gemini,
         WIRE_ANTHROPIC: search_anthropic,
         WIRE_OPENAI: search_openai,
+        WIRE_OPENAI_RESPONSES: search_responses,
     }
 
     raw_input = json.loads((sys.stdin.read() or "{}").lstrip("﻿"))
