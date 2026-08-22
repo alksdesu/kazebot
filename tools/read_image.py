@@ -92,44 +92,19 @@ if __name__ == "__main__":
     focus = str(args.get("focus") or "").strip()
 
     # ---- API Configuration ----
-    # 读图渠道先看 system_models.image；没配就跟随主渠道 —— 常见部署是同一个中转站
-    # 换个模型名。模型名不跟随：主渠道多半正是那个看不了图的纯文本模型。
     if str(Path(__file__).resolve().parent) not in sys.path:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _channel import OPENAI_COMPATIBLE, Channel
+    from _channel import resolve_vision_channel
     from _image import ImagePayloadError, build_image_part, family_for_base_url
 
-    channel = Channel("image")
-    main = channel.main()
+    vision = resolve_vision_channel()
+    if vision.error:
+        fail(vision.error)
 
-    base_url = channel.own("base_url", "BASE_URL")
-    following = not base_url
-    if following:
-        # 跟随时格式也得对得上：这里发的是 OpenAI 的 /chat/completions。
-        if main.base_url and main.provider not in OPENAI_COMPATIBLE:
-            fail(
-                "主渠道 " + main.provider + " 不收 OpenAI 格式的 /chat/completions，read_image 没法跟随。"
-                "请在 data/config.yaml 的 system_models.image 里单独配 base_url 和 api_key。"
-            )
-        base_url = main.base_url or channel.env("OPENAI_BASE_URL")
-
-    api_key = channel.pick(
-        "api_key", "API_KEY",
-        main.api_key if following else "",
-        channel.env("GEMINI_API_KEY"),
-        channel.env("OPENAI_API_KEY"),
-    )
-    if not api_key:
-        fail("No API key found in config.yaml / env / .env file")
-
-    base_url = base_url.rstrip("/")
-    if not base_url:
-        base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
-    if not base_url.endswith("/v1"):
-        base_url = base_url.rstrip("/") + "/v1" if "/v1" not in base_url else base_url
-
-    model = channel.pick("model", "MODEL", "gemini-3.5-flash")
-    url = f"{base_url}/chat/completions"
+    base_url = vision.base_url
+    api_key = vision.api_key
+    model = vision.model
+    url = vision.endpoint()
     family = family_for_base_url(base_url)
 
     # ---- Build content parts ----

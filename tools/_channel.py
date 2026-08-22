@@ -174,6 +174,68 @@ class ImageChannel(NamedTuple):
         return bool(self.api_key and self.base_url)
 
 
+class VisionChannel(NamedTuple):
+    """看图渠道。error 非空时不可用，文案由调用方自己决定怎么呈现。"""
+
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    error: str = ""
+
+    @property
+    def usable(self) -> bool:
+        return bool(self.api_key and self.base_url and not self.error)
+
+    def endpoint(self) -> str:
+        return f"{self.base_url}/chat/completions"
+
+
+# 没配 base_url 时的兜底：这家的 OpenAI 兼容端点能直接收 /chat/completions。
+_VISION_FALLBACK_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+_VISION_DEFAULT_MODEL = "gemini-3.5-flash"
+
+
+def resolve_vision_channel(*, root: Path | None = None) -> VisionChannel:
+    """看图渠道的完整解析。读图工具和表情包打标共用这一份，判定才不会打架。
+
+    先看 system_models.image；没配就跟随主渠道 —— 常见部署是同一个中转站换个模型名。
+    模型名不跟随：主渠道多半正是那个看不了图的纯文本模型。
+    """
+    channel = Channel("image", root=root)
+    main = channel.main()
+
+    base_url = channel.own("base_url", "BASE_URL")
+    if not base_url:
+        # 跟随时格式也得对得上：这里发的是 OpenAI 的 /chat/completions。
+        if main.base_url and main.provider not in OPENAI_COMPATIBLE:
+            return VisionChannel(error=(
+                f"主渠道 {main.provider} 不收 OpenAI 格式的 /chat/completions。"
+                "请在 data/config.yaml 的 system_models.image 里单独配 base_url 和 api_key。"
+            ))
+        base_url = main.base_url or channel.env("OPENAI_BASE_URL")
+        api_key = channel.pick(
+            "api_key", "API_KEY", main.api_key,
+            channel.env("GEMINI_API_KEY"), channel.env("OPENAI_API_KEY"),
+        )
+    else:
+        api_key = channel.pick(
+            "api_key", "API_KEY",
+            channel.env("GEMINI_API_KEY"), channel.env("OPENAI_API_KEY"),
+        )
+    if not api_key:
+        # 与同目录其它工具同一句：排障时按这句话搜得到所有缺 key 的场景。
+        return VisionChannel(error="No API key found in config.yaml / env / .env file")
+
+    base_url = (base_url or _VISION_FALLBACK_URL).rstrip("/")
+    if "/v1" not in base_url:
+        base_url += "/v1"
+    return VisionChannel(
+        base_url=base_url,
+        api_key=api_key,
+        model=channel.pick("model", "MODEL", _VISION_DEFAULT_MODEL),
+    )
+
+
 def resolve_image_channel(
     slot: str, *, root: Path | None = None, model_override: str = "",
 ) -> ImageChannel:

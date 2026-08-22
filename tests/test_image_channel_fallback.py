@@ -360,3 +360,117 @@ class TestDisabledDrawNodes:
             tmp_path, "version: 1\nprovider: openai\n", "api:\n  api_key: nai-key\n")
 
         assert self._disabled(root) == {"draw.image_gen"}
+
+
+class TestVisionChannel:
+    """看图渠道。读图工具和表情包打标共用这一份，两边判定必须一致。"""
+
+    def _resolve(self, root: Path):
+        return channel.resolve_vision_channel(root=root)
+
+    def test_dedicated_slot_wins(self, tmp_path: Path) -> None:
+        root = _workspace(tmp_path, """
+version: 1
+provider: openai
+openai:
+  base_url: https://main.example.com/v1
+  api_key: main-key
+system_models:
+  image:
+    base_url: https://vision.example.com/v1
+    api_key: vision-key
+    model: my-vision
+""")
+        result = self._resolve(root)
+
+        assert result.usable
+        assert result.base_url == "https://vision.example.com/v1"
+        assert result.api_key == "vision-key"
+        assert result.model == "my-vision"
+
+    def test_follows_an_openai_compatible_main(self, tmp_path: Path) -> None:
+        # 常见部署就是同一个中转站换个模型名，地址和 key 该借就借。
+        root = _workspace(tmp_path, """
+version: 1
+provider: openai
+openai:
+  base_url: https://main.example.com/v1
+  api_key: main-key
+""")
+        result = self._resolve(root)
+
+        assert result.usable
+        assert result.base_url == "https://main.example.com/v1"
+        assert result.api_key == "main-key"
+
+    def test_model_never_follows_the_main_channel(self, tmp_path: Path) -> None:
+        # 主渠道配的是聊天模型，多半正是那个看不了图的。
+        root = _workspace(tmp_path, """
+version: 1
+provider: openai
+openai:
+  base_url: https://main.example.com/v1
+  api_key: main-key
+  model: some-text-only-model
+""")
+        assert self._resolve(root).model != "some-text-only-model"
+
+    def test_non_openai_main_is_refused_instead_of_borrowed(self, tmp_path: Path) -> None:
+        # 借错家不会报地址错误，只会得到一个和配置毫无关系的 404。
+        root = _workspace(tmp_path, """
+version: 1
+provider: anthropic
+anthropic:
+  base_url: https://api.anthropic.com
+  api_key: main-key
+""")
+        result = self._resolve(root)
+
+        assert not result.usable
+        assert "anthropic" in result.error
+
+    def test_missing_key_is_reported_not_guessed(self, tmp_path: Path) -> None:
+        result = self._resolve(_workspace(tmp_path, "version: 1\nprovider: openai\n"))
+
+        assert not result.usable and result.error
+
+    def test_key_can_come_from_dotenv(self, tmp_path: Path) -> None:
+        root = _workspace(
+            tmp_path, "version: 1\nprovider: openai\n", "OPENAI_API_KEY=from-dotenv\n",
+        )
+        result = self._resolve(root)
+
+        assert result.usable and result.api_key == "from-dotenv"
+
+    def test_bare_host_gets_a_v1_suffix(self, tmp_path: Path) -> None:
+        root = _workspace(tmp_path, """
+version: 1
+provider: openai
+system_models:
+  image:
+    base_url: https://vision.example.com
+    api_key: k
+""")
+        assert self._resolve(root).base_url == "https://vision.example.com/v1"
+
+    def test_existing_version_segment_is_left_alone(self, tmp_path: Path) -> None:
+        root = _workspace(tmp_path, """
+version: 1
+provider: openai
+system_models:
+  image:
+    base_url: https://vision.example.com/v1beta/openai
+    api_key: k
+""")
+        assert self._resolve(root).base_url == "https://vision.example.com/v1beta/openai"
+
+    def test_endpoint_appends_chat_completions(self, tmp_path: Path) -> None:
+        root = _workspace(tmp_path, """
+version: 1
+provider: openai
+system_models:
+  image:
+    base_url: https://vision.example.com/v1
+    api_key: k
+""")
+        assert self._resolve(root).endpoint() == "https://vision.example.com/v1/chat/completions"
