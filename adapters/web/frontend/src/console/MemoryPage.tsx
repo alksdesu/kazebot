@@ -1,5 +1,5 @@
 // 长期记忆与会话上下文。这一页直接对文件动手，不走顶部那条 qq.yaml 状态条。
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 
 import {
   clearMemoryNamespace,
@@ -18,10 +18,20 @@ import {
   type ScopeStatus,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
-import { Block, Button, Check, Empty, Footnote, Input, Tag } from './components';
+import { Block, Button, Check, Empty, Footnote, Input, Pager, Tag } from './components';
 import { sizeText } from './format';
 
 const EMPTY_DRAFT = { id: '', content: '', keywords: '', constant: false };
+
+// 三处列表都会随使用量无限变长，右边内容却还是那么点 —— 分页管住高度。
+// 数值取到各自那一栏跟邻栏高度相当为止。
+const SOURCE_PAGE = 10;
+const ENTRY_PAGE = 12;
+const CONV_PAGE = 15;
+
+// 末页被删空之后要退回上一页，否则界面停在一片空白上，看着像数据没了。
+const lastOffset = (count: number, size: number) =>
+  Math.max(0, Math.floor((count - 1) / size) * size);
 
 const ENTRY = 'mt-1.5 border border-[var(--duties-border)] bg-[var(--duties-panel)] px-2.5 py-2';
 // 常驻条目每轮都进 prompt、一直占着注入预算，扫一眼就该看出是哪几条。
@@ -59,6 +69,9 @@ const MemoryBlock = () => {
   const [draft, setDraft] = useState(EMPTY_DRAFT);
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
+  const [query, setQuery] = useState('');
+  const [sourceOffset, setSourceOffset] = useState(0);
+  const [entryOffset, setEntryOffset] = useState(0);
 
   const loadOverview = async () => {
     if (!adminToken) return;
@@ -71,16 +84,33 @@ const MemoryBlock = () => {
   };
 
   useEffect(() => { void loadOverview(); }, [adminToken]);
-  useEffect(() => { void loadEntries(selected); }, [selected]);
+  useEffect(() => { void loadEntries(selected); setEntryOffset(0); }, [selected]);
 
-  // 固定按「群组 / 人物 / 通用」排，空的那档不显示。
-  const grouped = useMemo(
-    () => BUCKETS
-      .map((bucket) => [bucket, namespaces.filter((row) => bucketOf(row) === bucket)] as const)
-      .filter(([, rows]) => rows.length > 0),
-    [namespaces],
-  );
+  // 固定按「群组 / 人物 / 通用」排，拍平成一条序列再分页 —— 按组各自分页会在一栏
+  // 里挂出三个分页器。组标题在每页按需重新出现，翻页不会丢掉这一项属于哪一档。
+  const sources = useMemo(() => {
+    const wanted = query.trim().toLowerCase();
+    return BUCKETS
+      .flatMap((bucket) => namespaces
+        .filter((row) => bucketOf(row) === bucket)
+        .map((row) => ({ bucket, row })))
+      .filter(({ row }) => !wanted || row.owner.label.toLowerCase().includes(wanted));
+  }, [namespaces, query]);
 
+  useEffect(() => {
+    if (sourceOffset > 0 && sourceOffset >= sources.length) {
+      setSourceOffset(lastOffset(sources.length, SOURCE_PAGE));
+    }
+  }, [sources.length, sourceOffset]);
+
+  useEffect(() => {
+    if (entryOffset > 0 && entryOffset >= entries.length) {
+      setEntryOffset(lastOffset(entries.length, ENTRY_PAGE));
+    }
+  }, [entries.length, entryOffset]);
+
+  const pageSources = sources.slice(sourceOffset, sourceOffset + SOURCE_PAGE);
+  const pageEntries = entries.slice(entryOffset, entryOffset + ENTRY_PAGE);
   const current = namespaces.find((row) => row.key === selected);
   const constantCount = entries.filter((entry) => entry.constant).length;
 
@@ -130,24 +160,39 @@ const MemoryBlock = () => {
     <Block hint="模型聊天时自己攒下来的。手动加的不会被自动清理" title="长期记忆">
       {namespaces.length === 0 && <Empty>还没有任何记忆。</Empty>}
       <div className="grid grid-cols-1 items-start gap-3.5 md:grid-cols-[15rem_1fr]">
-        <div className="flex flex-col gap-2.5">
-          {grouped.map(([label, rows]) => (
-            <div className="flex flex-col gap-1" key={label}>
-              <p className={BUCKET}>{label}</p>
-              {rows.map((row) => (
-                <button
-                  aria-current={selected === row.key ? 'true' : undefined}
-                  className="flex w-full items-baseline gap-2 border border-[var(--duties-border)] bg-[var(--duties-panel)] px-2.5 py-1.5 text-left text-xs hover:bg-[var(--duties-muted)] aria-[current=true]:border-[var(--duties-text)] aria-[current=true]:bg-[var(--duties-muted)]"
-                  key={row.key}
-                  onClick={() => setSelected(row.key)}
-                  type="button"
-                >
-                  <span className="min-w-0 flex-1 truncate">{row.owner.label}</span>
-                  <span className={META}>{row.entry_count}</span>
-                </button>
-              ))}
-            </div>
+        <div className="flex flex-col gap-1">
+          <Input
+            aria-label="按名字筛选来源"
+            onChange={(event) => { setQuery(event.target.value); setSourceOffset(0); }}
+            placeholder="筛选来源"
+            value={query}
+            width="flex"
+          />
+          {sources.length === 0 && namespaces.length > 0 && <Empty>没有名字含「{query}」的来源。</Empty>}
+          {pageSources.map(({ bucket, row }, index) => (
+            <Fragment key={row.key}>
+              {(index === 0 || pageSources[index - 1].bucket !== bucket) && (
+                // 组间比组内多空一档；容器的 gap 只有一个值，差额补在这儿。
+                <p className={`${BUCKET}${index === 0 ? ' mt-1.5' : ' mt-2.5'}`}>{bucket}</p>
+              )}
+              <button
+                aria-current={selected === row.key ? 'true' : undefined}
+                className="flex w-full items-baseline gap-2 border border-[var(--duties-border)] bg-[var(--duties-panel)] px-2.5 py-1.5 text-left text-xs hover:bg-[var(--duties-muted)] aria-[current=true]:border-[var(--duties-text)] aria-[current=true]:bg-[var(--duties-muted)]"
+                onClick={() => setSelected(row.key)}
+                type="button"
+              >
+                <span className="min-w-0 flex-1 truncate">{row.owner.label}</span>
+                <span className={META}>{row.entry_count}</span>
+              </button>
+            </Fragment>
           ))}
+          <Pager
+            offset={sourceOffset}
+            onOffset={setSourceOffset}
+            pageSize={SOURCE_PAGE}
+            total={sources.length}
+            unit="项"
+          />
         </div>
 
         <div className="flex min-w-0 flex-col gap-2">
@@ -163,7 +208,7 @@ const MemoryBlock = () => {
                 </span>
                 <Button onClick={clearAll}>清空</Button>
               </div>
-              {entries.map((entry) => (
+              {pageEntries.map((entry) => (
                 <div
                   className={`${ENTRY}${entry.constant ? ` ${ENTRY_CONST}` : ''}`}
                   key={`${entry.book}/${entry.id}`}
@@ -181,6 +226,13 @@ const MemoryBlock = () => {
                   )}
                 </div>
               ))}
+              <Pager
+                offset={entryOffset}
+                onOffset={setEntryOffset}
+                pageSize={ENTRY_PAGE}
+                total={entries.length}
+                unit="条"
+              />
 
               <div className={ADD}>
                 <p className={BUCKET}>添加一条</p>
@@ -240,6 +292,7 @@ const ContextBlock = () => {
   const [rows, setRows] = useState<ConversationRow[]>([]);
   const [preview, setPreview] = useState<{ id: string; total: number; messages: Array<Record<string, any>> } | null>(null);
   const [note, setNote] = useState('');
+  const [offset, setOffset] = useState(0);
 
   const load = async () => {
     if (!adminToken) return;
@@ -303,17 +356,39 @@ const ContextBlock = () => {
   const stale = rows.filter((row) => row.current_account === false);
   const mine = rows.filter((row) => row.current_account !== false);
 
+  // 拍平后再分页，两段各自分页会挂出两个分页器。没换过号时只有一段，标题不出现。
+  const listed = stale.length === 0
+    ? rows.map((row) => ({ group: '', row }))
+    : [
+      ...mine.map((row) => ({ group: '当前账号', row })),
+      ...stale.map((row) => ({ group: '其它账号 · 换号前留下的，上下文和长期记忆都不互通', row })),
+    ];
+
+  useEffect(() => {
+    if (offset > 0 && offset >= listed.length) setOffset(lastOffset(listed.length, CONV_PAGE));
+  }, [listed.length, offset]);
+
+  const page = listed.slice(offset, offset + CONV_PAGE);
+
   return (
     <Block hint="删除会连带清掉 bot 侧的消息缓存与附件；长期记忆另算" title="会话上下文">
       {rows.length === 0 && <Empty>还没有任何会话。</Empty>}
-      {stale.length === 0 ? rows.map(entry) : (
+      {/* 空的那一段拍平后不留痕迹，可「这个号一条都没有」正是要说的话，所以单拎出来。 */}
+      {stale.length > 0 && mine.length === 0 && (
         <>
           <p className={GROUP}>当前账号</p>
-          {mine.length === 0 ? <Empty>这个号还没有任何会话。</Empty> : mine.map(entry)}
-          <p className={GROUP}>其它账号 · 换号前留下的，上下文和长期记忆都不互通</p>
-          {stale.map(entry)}
+          <Empty>这个号还没有任何会话。</Empty>
         </>
       )}
+      {page.map(({ group, row }, index) => (
+        <Fragment key={row.session_id}>
+          {group && (index === 0 || page[index - 1].group !== group) && (
+            <p className={GROUP}>{group}</p>
+          )}
+          {entry(row)}
+        </Fragment>
+      ))}
+      <Pager offset={offset} onOffset={setOffset} pageSize={CONV_PAGE} total={listed.length} unit="个" />
       {note && <Footnote>{note}</Footnote>}
     </Block>
   );

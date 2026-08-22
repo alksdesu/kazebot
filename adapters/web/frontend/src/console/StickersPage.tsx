@@ -28,6 +28,7 @@ import {
   Footnote,
   Grid,
   Input,
+  Pager,
   Panel,
   Segmented,
 } from './components';
@@ -209,8 +210,6 @@ const LibraryBlock = () => {
   });
 
   const total = counts[tab];
-  const from = items.length === 0 ? 0 : offset + 1;
-  const to = offset + items.length;
 
   const card = (row: Sticker) => (
     <figure
@@ -338,26 +337,7 @@ const LibraryBlock = () => {
           </div>
         )}
 
-        {total > PAGE_SIZE && (
-          <div className="mt-3 flex items-center gap-2">
-            <span className={META}>第 {from}–{to} 张，共 {total} 张</span>
-            <span className="flex-1" />
-            <Button
-              disabled={offset === 0}
-              onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
-              tone="quiet"
-            >
-              上一页
-            </Button>
-            <Button
-              disabled={to >= total}
-              onClick={() => setOffset(offset + PAGE_SIZE)}
-              tone="quiet"
-            >
-              下一页
-            </Button>
-          </div>
-        )}
+        <Pager offset={offset} onOffset={setOffset} pageSize={PAGE_SIZE} total={total} unit="张" />
         {note && <Footnote>{note}</Footnote>}
       </Block>
 

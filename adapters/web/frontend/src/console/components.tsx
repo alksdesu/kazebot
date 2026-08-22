@@ -36,6 +36,7 @@ export {
   List,
   Loose,
   Option,
+  Pager,
   Panel,
   Pip,
   Pre,

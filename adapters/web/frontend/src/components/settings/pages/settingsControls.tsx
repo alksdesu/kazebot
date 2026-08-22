@@ -384,6 +384,34 @@ export const SaveBar = ({ busy, dirty, label = '保存', note, onReset, onSave }
   </div>
 );
 
+/** 列表底部的翻页条。装不满一页时整条不出现，省得留一排永远点不动的按钮。 */
+export const Pager = ({ offset, onOffset, pageSize, total, unit }: {
+  offset: number;
+  onOffset: (next: number) => void;
+  pageSize: number;
+  total: number;
+  /** 量词，跟在数字后面：条 / 张 / 个。 */
+  unit: string;
+}) => {
+  if (total <= pageSize) return null;
+  const to = Math.min(offset + pageSize, total);
+
+  return (
+    <div className="mt-3 flex items-center gap-2">
+      <span className="text-[0.65rem] text-[var(--duties-tertiary)]">
+        第 {offset + 1}–{to} {unit}，共 {total} {unit}
+      </span>
+      <span className="flex-1" />
+      <Button disabled={offset === 0} onClick={() => onOffset(Math.max(0, offset - pageSize))} tone="quiet">
+        上一页
+      </Button>
+      <Button disabled={to >= total} onClick={() => onOffset(offset + pageSize)} tone="quiet">
+        下一页
+      </Button>
+    </div>
+  );
+};
+
 export type PipTone = 'live' | 'idle' | 'halt';
 
 const PIP_TONE: Record<PipTone, string> = {
