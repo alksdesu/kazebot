@@ -22,6 +22,7 @@ from clonoth_runtime import read_admin_token
 
 _BASE_URL = "http://127.0.0.1:6099"
 _TOKEN_KEY = "NAPCAT_WEBUI_TOKEN"
+_URL_KEY = "NAPCAT_WEBUI_URL"
 # NapCat 的凭证一小时作废，留足余量提前换。
 _CREDENTIAL_TTL_SEC = 2400.0
 _TIMEOUT = httpx.Timeout(20.0, connect=5.0)
@@ -99,9 +100,12 @@ def _read_dead_logins(path: Path) -> dict[str, Any]:
 class NapCatClient:
     """带凭证缓存的最小 WebUI 客户端。"""
 
-    def __init__(self, workspace_root: Path, *, base_url: str = _BASE_URL) -> None:
+    def __init__(self, workspace_root: Path, *, base_url: str = "") -> None:
         self._env_path = Path(workspace_root) / ".env"
-        self._base = base_url.rstrip("/")
+        # 与 token 读同一份 .env：多开时每个实例连自己那个容器，地址和令牌必须成对，
+        # 分成两个来源迟早会拿甲的令牌敲乙的容器。
+        resolved = base_url or _read_env_value(self._env_path, _URL_KEY) or _BASE_URL
+        self._base = resolved.rstrip("/")
         self._credential = ""
         self._issued_at = 0.0
 
