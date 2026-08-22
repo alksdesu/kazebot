@@ -4,7 +4,8 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
 import type { ChatMessage, ToolCall } from '../../types';
-import { MOUNT } from '../../api/supervisorClient';
+import { attachmentHref } from '../../api/supervisorClient';
+import { useSettingsStore } from '../../store/settingsStore';
 import { Icon } from '../common';
 import { ApprovalCard } from './ApprovalCard';
 
@@ -113,6 +114,7 @@ const ToolCallRow = ({ toolCall, index, expanded, onToggle }: ToolCallRowProps) 
 export const MessageBubble = ({ message }: MessageBubbleProps) => {
   const [thinkingOpen, setThinkingOpen] = useState(false);
   const [expandedToolIds, setExpandedToolIds] = useState<Set<string>>(new Set());
+  const adminToken = useSettingsStore((state) => state.adminToken);
 
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
@@ -235,8 +237,7 @@ export const MessageBubble = ({ message }: MessageBubbleProps) => {
           <div className="mt-2 flex flex-wrap gap-2">
             {message.attachments.map((att, i) => {
               const isImage = att.type === 'image' || att.mime_type?.startsWith('image/');
-              // path 是工作区相对路径，带上本实例前缀才不会指到隔壁那个号去。
-              const href = att.path ? `${MOUNT}/${att.path}` : att.url;
+              const href = att.path ? attachmentHref(att.path, adminToken) : att.url;
               if (isImage && href) {
                 return <img key={i} src={href} alt={att.name} className="max-h-64 border border-[var(--duties-border)]" />;
               }

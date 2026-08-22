@@ -4,8 +4,9 @@
 // rendering, and attachments from WsMessage only. Purpose: make active and historical
 // messages follow the same UI contract before the app is rewired to v2.
 import type { Attachment, MessageRole, MessageStatus, TextBlock, ToolExecution, WsMessage } from '../../../types/message';
-import { MOUNT } from '../../../api/supervisorClient';
+import { attachmentHref } from '../../../api/supervisorClient';
 import { useChatStore } from '../../../store/chatStore';
+import { useSettingsStore } from '../../../store/settingsStore';
 import { Icon } from '../../common';
 import { RenderBlockView } from './RenderBlockView';
 
@@ -102,9 +103,8 @@ function formatTime(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(date);
 }
 
-function getAttachmentHref(attachment: Attachment): string | undefined {
-  // path 是工作区相对路径，带上本实例前缀才不会指到隔壁那个号去。
-  if (attachment.path) return `${MOUNT}/${attachment.path}`;
+function getAttachmentHref(attachment: Attachment, token: string | null): string | undefined {
+  if (attachment.path) return attachmentHref(attachment.path, token);
   return attachment.url;
 }
 
@@ -124,6 +124,7 @@ export const MessageCard = ({ message, toolsById }: MessageCardProps) => {
   const active = isActiveStatus(message.status);
   const blocksContainerClassName = getBlocksContainerClassName(message);
   const attachments = message.attachments ?? [];
+  const adminToken = useSettingsStore((state) => state.adminToken);
   // [AutoC 2026-06-03] Why: only dispatch callback cards can navigate to child
   // sessions. How: read the backend-provided source.childSessionId and leave normal
   // messages without an action. Purpose: navigation stays structured and does not
@@ -198,7 +199,7 @@ export const MessageCard = ({ message, toolsById }: MessageCardProps) => {
         {attachments.length > 0 && (
           <footer className="mt-2 flex flex-wrap gap-2">
             {attachments.map((attachment, index) => {
-              const href = getAttachmentHref(attachment);
+              const href = getAttachmentHref(attachment, adminToken);
               const key = `${attachment.name}-${index}`;
 
               if (isImageAttachment(attachment) && href) {

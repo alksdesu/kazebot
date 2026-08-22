@@ -14,7 +14,7 @@ from typing import Any
 
 from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import FileResponse, RedirectResponse, Response
 
 from .config_store import ConfigStore
 from .instances import load_instances, url_prefix
@@ -525,7 +525,8 @@ def create_app(
             raise HTTPException(status_code=415, detail=f"Rejected attachment: {reject}")
         save_path.write_bytes(content)
 
-        rel_path = str(save_path.relative_to(st.workspace_root))
+        # as_posix：Windows 上不转就是反斜杠，拼进 URL 直接取不到。
+        rel_path = save_path.relative_to(st.workspace_root).as_posix()
         mime_type = file.content_type or "application/octet-stream"
         return {
             "path": rel_path,
@@ -534,6 +535,22 @@ def create_app(
             "mime_type": mime_type,
             "type": "image" if mime_type.startswith("image/") else "file",
         }
+
+    @app.get("/v1/files/{rel:path}")
+    async def read_attachment(rel: str, request: Request) -> FileResponse:
+        """按工作区相对路径取附件。
+
+        只开放 data/attachments 子树。token 走 query 也认（见 verify_admin_token）——
+        img 标签带不了 Authorization 头。
+        """
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        root = (st.workspace_root / "data" / "attachments").resolve()
+        target = (st.workspace_root / rel).resolve()
+        # resolve 之后再比：'..'、绝对路径和符号链接都会在这一步现形。
+        if root not in target.parents or not target.is_file():
+            raise HTTPException(status_code=404, detail="Not found")
+        return FileResponse(target)
 
     @app.post("/v1/inbound", response_model=InboundMessageOut)
     async def inbound(msg: InboundMessageIn, request: Request) -> InboundMessageOut:

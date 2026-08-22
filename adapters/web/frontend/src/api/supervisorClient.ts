@@ -27,6 +27,16 @@ function authHeaders(token: string): Record<string, string> {
   return { Authorization: `Bearer ${token}` };
 }
 
+/**
+ * 附件的可访问地址。path 是工作区相对路径，例如 data/attachments/xxx/yyy.png。
+ *
+ * token 走 query 而不是请求头：img 标签带不了 Authorization（后端两种都认）。
+ */
+export function attachmentHref(path: string, token: string | null): string {
+  const safe = path.split('/').map(encodeURIComponent).join('/');
+  return `${API}/files/${safe}${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+}
+
 // ── Attachment upload ──
 
 export interface UploadedAttachment {
