@@ -1,0 +1,9 @@
+[Unit]
+Description=Remove kazebot instance %i
+After=docker.service
+
+[Service]
+Type=oneshot
+# 脚本里没有递归删除：工作区和 NapCat 目录只改名归档，人工确认后再清。
+ExecStart=/usr/local/lib/kazebot/provision_instance.sh remove %i
+TimeoutStartSec=300

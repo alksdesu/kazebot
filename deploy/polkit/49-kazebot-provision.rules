@@ -1,0 +1,17 @@
+// 允许 kazebot 启动建号/删号的 oneshot 单元，仅此两个模板、仅 start 动作。
+// 装到 /etc/polkit-1/rules.d/（root 拥有）。放在 kazebot 可写的地方等于没有规则。
+polkit.addRule(function (action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units") {
+        return undefined;
+    }
+    if (subject.user !== "kazebot") {
+        return undefined;
+    }
+    // 实例名收得和 supervisor 侧一样紧：宽一格就多一格提权面。
+    var unit = "" + action.lookup("unit");
+    var allowed = /^kazebot-(provision|deprovision)@[1-9][0-9]{4,10}\.service$/.test(unit);
+    if (allowed && action.lookup("verb") === "start") {
+        return polkit.Result.YES;
+    }
+    return undefined;
+});

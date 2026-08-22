@@ -1,0 +1,11 @@
+[Unit]
+Description=Provision kazebot instance %i
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# 以 root 跑：docker、systemd、cloudflared 都要。脚本必须在 kazebot 写不到的地方，
+# 否则 agent 改写脚本内容再触发就是提权。
+ExecStart=/usr/local/lib/kazebot/provision_instance.sh create %i
+TimeoutStartSec=900
