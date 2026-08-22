@@ -50,6 +50,14 @@ describe('IBM Plex Mono', () => {
     expect(stylesheet).toContain('@fontsource/ibm-plex-mono/latin-600.css');
   });
 
+  // 194 处 font-mono 全靠这一个 token。少了它字体照样下载，但没人用得上。
+  it('backs the font-mono utility, not just some local variable', async () => {
+    const output = await buildStylesheet();
+    const css = String(output.find((file) => file.fileName.endsWith('.css'))?.source ?? '');
+
+    expect(css).toMatch(/--font-mono:\s*["']IBM Plex Mono["']/);
+  }, 30000);
+
   // 光有 font-family 声明说明不了什么：@import 可能在构建时被解析掉，
   // 留下一个没有 @font-face 的字体栈和一次无声的系统回退。
   it('ships one face per weight through the CSS build', async () => {

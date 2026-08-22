@@ -8,6 +8,11 @@
 @import '@fontsource/ibm-plex-mono/latin-500.css';
 @import '@fontsource/ibm-plex-mono/latin-600.css';
 
+/* 界面里到处是 QQ 号、模型名、密钥尾号，要逐字看。Plex 的零带斜杠，0/O 和 1/l 分得开。 */
+@theme {
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 :root {
   --duties-bg: #f1f0ee;
   --duties-panel: #e8e7e5;
