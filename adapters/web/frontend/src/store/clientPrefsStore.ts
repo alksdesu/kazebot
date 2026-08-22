@@ -5,6 +5,8 @@
 // each deployed frontend can choose its own approval and display preferences.
 import { create } from 'zustand';
 
+import { scopedKey } from './storageKey';
+
 export type TitleGenerationMode = 'auto' | 'manual' | 'first-message';
 
 export interface ClientPrefs {
@@ -22,7 +24,7 @@ interface ClientPrefsState extends ClientPrefs {
   resetClientPrefs: () => void;
 }
 
-const LS_KEY_CLIENT_PREFS = 'clonoth_client_prefs';
+const LS_KEY_CLIENT_PREFS = scopedKey('clonoth_client_prefs');
 
 export const DEFAULT_AUTO_APPROVE_TOOLS: Record<string, boolean> = {
   read_file: true,

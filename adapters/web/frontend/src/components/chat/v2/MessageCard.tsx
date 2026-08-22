@@ -4,6 +4,7 @@
 // rendering, and attachments from WsMessage only. Purpose: make active and historical
 // messages follow the same UI contract before the app is rewired to v2.
 import type { Attachment, MessageRole, MessageStatus, TextBlock, ToolExecution, WsMessage } from '../../../types/message';
+import { MOUNT } from '../../../api/supervisorClient';
 import { useChatStore } from '../../../store/chatStore';
 import { Icon } from '../../common';
 import { RenderBlockView } from './RenderBlockView';
@@ -102,7 +103,8 @@ function formatTime(value: string): string {
 }
 
 function getAttachmentHref(attachment: Attachment): string | undefined {
-  if (attachment.path) return `/${attachment.path}`;
+  // path 是工作区相对路径，带上本实例前缀才不会指到隔壁那个号去。
+  if (attachment.path) return `${MOUNT}/${attachment.path}`;
   return attachment.url;
 }
 

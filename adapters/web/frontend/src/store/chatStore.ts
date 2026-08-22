@@ -35,6 +35,7 @@ import type {
 } from '../types/message';
 import { shouldAutoApproveTool, useClientPrefsStore } from './clientPrefsStore';
 import { useSettingsStore } from './settingsStore';
+import { scopedKey } from './storageKey';
 import { createInitialChatState, reduceChatEvent } from './eventReducer';
 
 export interface ConversationMeta {
@@ -143,8 +144,8 @@ const CHILD_NODE_STATUS_BY_EVENT: Readonly<Record<string, ChildNodeStatus | unde
   task_failed: 'failed',
   task_cancelled: 'cancelled',
 };
-const LS_KEY_TITLES = 'clonoth_conversation_titles';
-const LS_KEY_AUTO_APPROVED = 'clonoth_auto_approved_ids';
+const LS_KEY_TITLES = scopedKey('clonoth_conversation_titles');
+const LS_KEY_AUTO_APPROVED = scopedKey('clonoth_auto_approved_ids');
 
 let startupLoaded = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;

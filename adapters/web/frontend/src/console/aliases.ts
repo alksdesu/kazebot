@@ -1,6 +1,8 @@
 // 群号与 QQ 号的本地备注。只存在这台浏览器里，不进 qq.yaml、不下发模型 ——
 // 群名往往带真实身份，写进配置就等于让它进 bot 的上下文。
-const STORE_KEY = 'qq_console_aliases';
+import { scopedKey } from '../store/storageKey';
+
+const STORE_KEY = scopedKey('qq_console_aliases');
 
 export type AliasMap = Record<string, string>;
 

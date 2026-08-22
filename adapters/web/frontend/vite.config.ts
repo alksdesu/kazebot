@@ -8,7 +8,9 @@ import tailwindcss from '@tailwindcss/vite';
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
-  base: '/web/',
+  // 相对而非 /web/：多开时每个号挂在自己的路径前缀下，绝对 base 会让第二个号的
+  // 资源请求全部落到第一个号那里。页面切换只改 query，pathname 不变，相对解析是安全的。
+  base: './',
   plugins: [react(), tailwindcss()],
   test: {
     environment: 'jsdom',

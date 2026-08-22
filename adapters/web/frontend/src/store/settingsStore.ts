@@ -7,9 +7,11 @@
 import { create } from 'zustand';
 
 import type { NodeDef } from '../types';
+import { scopedKey } from './storageKey';
 
-const LS_KEY_TOKEN = 'clonoth_admin_token';
-const LS_KEY_NODE = 'clonoth_entry_node';
+const LS_KEY_TOKEN = scopedKey('clonoth_admin_token');
+/** 导出给 loadEntryNodes 复用：两处各写一遍字面量，加实例后缀时必漏一处。 */
+export const LS_KEY_NODE = scopedKey('clonoth_entry_node');
 
 type SessionProviderOverride = Record<string, unknown>;
 

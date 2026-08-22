@@ -1,7 +1,15 @@
 // [2026-05-16] Real Supervisor API client — zero mock.
 import type { NodeDef, SupervisorEvent } from '../types';
 
-const API = '/v1';
+/** 本实例挂载的路径前缀。多开时几个号共用一个域名，各自挂在 /i/<号>/ 下。 */
+export const MOUNT = (() => {
+  // lastIndexOf：前缀本身含 web 时（/web/1/web/），从前往后找会截出空串，
+  // 于是这个实例的请求全部打到根实例上去。
+  const at = window.location.pathname.lastIndexOf('/web/');
+  return at > 0 ? window.location.pathname.slice(0, at) : '';
+})();
+
+const API = `${MOUNT}/v1`;
 
 // ── Helper ──
 
@@ -102,7 +110,7 @@ export function connectGlobalWS(
   disconnectGlobalWS();
 
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${wsProtocol}//${window.location.host}/v1/ws`;
+  const wsUrl = `${wsProtocol}//${window.location.host}${MOUNT}/v1/ws`;
   const ws = new WebSocket(wsUrl);
   _globalWs = ws;
 
@@ -614,6 +622,21 @@ export interface QqAccount {
   /** 等扫码时 NapCat 会把二维码一并带出来。 */
   qrcode?: string;
   quick_login?: QqQuickLoginTarget[];
+}
+
+/** 一个后端实例 = 一个 QQ 号。多开时它们共用域名，各自挂在 path 下。 */
+export interface ConsoleInstance {
+  uin: string;
+  label: string;
+  /** 挂载前缀，根实例为空串。 */
+  path: string;
+  current: boolean;
+}
+
+export async function getInstances(token: string): Promise<ConsoleInstance[]> {
+  const resp = await apiFetch('/instances', { headers: authHeaders(token) });
+  const data = await resp.json();
+  return Array.isArray(data?.instances) ? data.instances : [];
 }
 
 export async function getQqAccount(token: string): Promise<QqAccount> {

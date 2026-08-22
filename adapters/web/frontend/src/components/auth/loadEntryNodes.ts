@@ -1,7 +1,7 @@
 // 登录成功后填入口节点列表。两个登录页共用：控制台不需要它，但登录状态是全局的，
 // 从控制台登录后切回对话界面同样得有节点可选。
 import { getNodes } from '../../api/supervisorClient';
-import { useSettingsStore } from '../../store/settingsStore';
+import { LS_KEY_NODE, useSettingsStore } from '../../store/settingsStore';
 
 export async function loadEntryNodes(token: string): Promise<void> {
   const { setAvailableNodes, setEntryNodeId } = useSettingsStore.getState();
@@ -9,7 +9,7 @@ export async function loadEntryNodes(token: string): Promise<void> {
     const nodes = await getNodes(token);
     const aiNodes = nodes.filter((node: any) => node.type === 'ai' && !node.id.startsWith('system.'));
     setAvailableNodes(aiNodes);
-    const saved = localStorage.getItem('clonoth_entry_node') || '';
+    const saved = localStorage.getItem(LS_KEY_NODE) || '';
     const savedIsValid = aiNodes.some((node: any) => node.id === saved);
     if ((!saved || !savedIsValid) && aiNodes.length > 0) setEntryNodeId(aiNodes[0].id);
   } catch {

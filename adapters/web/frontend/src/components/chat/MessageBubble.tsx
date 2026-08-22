@@ -4,6 +4,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
 import type { ChatMessage, ToolCall } from '../../types';
+import { MOUNT } from '../../api/supervisorClient';
 import { Icon } from '../common';
 import { ApprovalCard } from './ApprovalCard';
 
@@ -234,7 +235,8 @@ export const MessageBubble = ({ message }: MessageBubbleProps) => {
           <div className="mt-2 flex flex-wrap gap-2">
             {message.attachments.map((att, i) => {
               const isImage = att.type === 'image' || att.mime_type?.startsWith('image/');
-              const href = att.path ? `/${att.path}` : att.url;
+              // path 是工作区相对路径，带上本实例前缀才不会指到隔壁那个号去。
+              const href = att.path ? `${MOUNT}/${att.path}` : att.url;
               if (isImage && href) {
                 return <img key={i} src={href} alt={att.name} className="max-h-64 border border-[var(--duties-border)]" />;
               }

@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 
 import { Icon } from '../components/common';
 import { CONSOLE_DOMAINS, DOMAIN_ICONS, DOMAIN_LABELS, type ConsoleDomain } from './consoleStore';
+import { InstanceSwitch } from './InstanceSwitch';
 
 interface RailProps {
   domain: ConsoleDomain;
@@ -26,6 +27,7 @@ export const Rail = ({ domain, onSelect, ready, onBack, onExit }: RailProps) => 
           <small>bot 配置</small>
         </span>
       </div>
+      <InstanceSwitch />
     </div>
 
     <div className="qc-rail-group">

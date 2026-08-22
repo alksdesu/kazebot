@@ -121,6 +121,36 @@
     font-size: 10px;
   }
 
+  .qc-rail-acct {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 12px;
+    padding-left: 8px;
+  }
+
+  .qc-rail-acct-cap {
+    color: var(--qc-mute);
+    font-size: 10px;
+  }
+
+  .qc-rail-acct-pick {
+    width: 100%;
+    padding: 4px 8px;
+    border: 1px solid var(--qc-rule);
+    border-radius: var(--qc-r-sm);
+    background: var(--qc-paper);
+    color: var(--qc-ink);
+    font-size: 12px;
+    font-family: var(--qc-mono);
+    cursor: pointer;
+  }
+
+  .qc-rail-acct-pick:focus {
+    border-color: var(--qc-ink);
+    outline: none;
+  }
+
   .qc-rail-group {
     display: flex;
     flex: 1;
