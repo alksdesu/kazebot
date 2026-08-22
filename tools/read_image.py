@@ -3,7 +3,8 @@ from __future__ import annotations
 """Image understanding tool for text-only models.
 
 Provides vision capabilities to non-multimodal models (like DeepSeek) by calling
-a multimodal model (Gemini) via OpenAI-compatible API to describe image content.
+a multimodal model to describe image content. The channel is whatever
+system_models.image points at; the wire format follows that channel's provider.
 
 ONLY for text-only models. Multimodal models should read images directly.
 
@@ -20,8 +21,8 @@ SPEC = {
         "[ONLY for text-only models like DeepSeek. Do NOT use if you can see images natively.] "
         "Analyze image(s) and return a comprehensive text description including all visible text (OCR), "
         "layout, colors, objects, people, style, and context. "
-        "Provide local image paths to analyze. Uses a Gemini vision model internally "
-        "(configurable via CLONOTH_IMAGE_MODEL)."
+        "Provide local image paths to analyze. Uses the vision channel configured in "
+        "system_models.image (or CLONOTH_IMAGE_MODEL)."
     ),
     "input_schema": {
         "type": "object",
@@ -95,20 +96,17 @@ if __name__ == "__main__":
     if str(Path(__file__).resolve().parent) not in sys.path:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _channel import resolve_vision_channel
-    from _image import ImagePayloadError, build_image_part, family_for_base_url
+    from _image import ImagePayloadError, build_image_part
+    from _vision_wire import build_request, parse_text
 
     vision = resolve_vision_channel()
     if vision.error:
         fail(vision.error)
 
-    base_url = vision.base_url
-    api_key = vision.api_key
     model = vision.model
-    url = vision.endpoint()
-    family = family_for_base_url(base_url)
 
     # ---- Build content parts ----
-    content_parts = []
+    image_urls = []
 
     for img_path in image_paths:
         p = Path.cwd() / str(img_path).strip()
@@ -116,13 +114,10 @@ if __name__ == "__main__":
             fail(f"Image not found: {img_path}")
 
         try:
-            part = build_image_part(p, family)
+            part = build_image_part(p, vision.family)
         except ImagePayloadError as e:
             fail(str(e))
-        content_parts.append({
-            "type": "image_url",
-            "image_url": {"url": part.data_url()},
-        })
+        image_urls.append(part.data_url())
 
     # ---- System & user prompt ----
     focus_instruction = ""
@@ -147,29 +142,22 @@ if __name__ == "__main__":
         + focus_instruction
     )
 
-    content_parts.append({
-        "type": "text",
-        "text": "Describe this image in complete detail following your instructions."
-    })
+    request = build_request(
+        wire=vision.wire,
+        base_url=vision.base_url,
+        api_key=vision.api_key,
+        model=model,
+        image_urls=image_urls,
+        system=system_prompt,
+        prompt="Describe this image in complete detail following your instructions.",
+        max_tokens=4096,
+        temperature=0.1,
+    )
 
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": content_parts}
-        ],
-        "temperature": 0.1,
-        "max_tokens": 4096
-    }
-
-    req_data = json.dumps(body).encode("utf-8")
     req = urllib_request.Request(
-        url,
-        data=req_data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        },
+        request.url,
+        data=json.dumps(request.body).encode("utf-8"),
+        headers=request.headers,
         method="POST",
     )
 
@@ -206,12 +194,7 @@ if __name__ == "__main__":
         fail(f"API request failed: {e}")
 
     # ---- Parse response ----
-    choices = resp_json.get("choices")
-    if not isinstance(choices, list) or not choices:
-        fail(f"No choices in response: {json.dumps(resp_json)[:500]}")
-
-    message = choices[0].get("message", {})
-    description = message.get("content", "").strip()
+    description = parse_text(vision.wire, resp_json)
 
     if not description:
         fail(f"Empty response from vision model: {json.dumps(resp_json)[:500]}")

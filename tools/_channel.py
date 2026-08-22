@@ -181,18 +181,55 @@ class VisionChannel(NamedTuple):
     api_key: str = ""
     model: str = ""
     error: str = ""
+    provider: str = ""
+    wire: str = "openai"
 
     @property
     def usable(self) -> bool:
-        return bool(self.api_key and self.base_url and not self.error)
+        return bool(self.api_key and self.base_url and self.model and not self.error)
+
+    @property
+    def family(self) -> str:
+        """图片格式接受集用哪一套。渠道是明说的，不必再拿域名去猜。"""
+        return _wire_module().family_for_wire(self.wire)
 
     def endpoint(self) -> str:
-        return f"{self.base_url}/chat/completions"
+        return _wire_module().endpoint(self.wire, self.base_url, self.model)
 
 
-# 没配 base_url 时的兜底：这家的 OpenAI 兼容端点能直接收 /chat/completions。
+# 什么都没配时的兜底。Gemini 的 OpenAI 兼容端点谁都收得下，且它的免费额度最容易拿到。
 _VISION_FALLBACK_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
-_VISION_DEFAULT_MODEL = "gemini-3.5-flash"
+_VISION_FALLBACK_WIRE = "openai"
+# 按线格式给默认模型。Anthropic 没有能猜的名字，缺了就让人自己填，别拿别家的名字去撞 404。
+_VISION_DEFAULT_MODELS = {
+    "openai": "gemini-3.5-flash",
+    "openai-responses": "gemini-3.5-flash",
+    "gemini": "gemini-3.5-flash",
+}
+# 各家没配地址时的官方根。和 providers/*.py 的 default_base_url 同值。
+_WIRE_DEFAULT_URLS = {
+    "gemini": "https://generativelanguage.googleapis.com",
+    "anthropic": "https://api.anthropic.com",
+}
+
+
+def _wire_module():
+    """加载同目录的 _vision_wire。
+
+    这个文件有三种被加载的方式 —— 包内 `tools._channel`、工具子进程里的裸 `_channel`、
+    以及 clonoth_runtime 按路径加载 —— 模块级 import 会在后两种下炸掉整个模块。
+    """
+    try:
+        from . import _vision_wire  # type: ignore[no-redef]
+        return _vision_wire
+    except ImportError:
+        pass
+    import sys
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import _vision_wire  # type: ignore[no-redef]
+    return _vision_wire
 
 
 def resolve_vision_channel(*, root: Path | None = None) -> VisionChannel:
@@ -201,17 +238,18 @@ def resolve_vision_channel(*, root: Path | None = None) -> VisionChannel:
     先看 system_models.image；没配就跟随主渠道 —— 常见部署是同一个中转站换个模型名。
     模型名不跟随：主渠道多半正是那个看不了图的纯文本模型。
     """
+    wire_mod = _wire_module()
     channel = Channel("image", root=root)
     main = channel.main()
 
     base_url = channel.own("base_url", "BASE_URL")
+    # 地址和格式是绑死的一对：这一槽自己指了地址，就不能假定对面还说主渠道那套话。
+    # 没明说是哪家时按中转站的最小公约数算，只有整条跟随主渠道时才连格式一起跟。
+    provider = (
+        channel.own("provider", "PROVIDER").strip().lower()
+        or ("openai" if base_url else main.provider)
+    )
     if not base_url:
-        # 跟随时格式也得对得上：这里发的是 OpenAI 的 /chat/completions。
-        if main.base_url and main.provider not in OPENAI_COMPATIBLE:
-            return VisionChannel(error=(
-                f"主渠道 {main.provider} 不收 OpenAI 格式的 /chat/completions。"
-                "请在 data/config.yaml 的 system_models.image 里单独配 base_url 和 api_key。"
-            ))
         base_url = main.base_url or channel.env("OPENAI_BASE_URL")
         api_key = channel.pick(
             "api_key", "API_KEY", main.api_key,
@@ -226,13 +264,22 @@ def resolve_vision_channel(*, root: Path | None = None) -> VisionChannel:
         # 与同目录其它工具同一句：排障时按这句话搜得到所有缺 key 的场景。
         return VisionChannel(error="No API key found in config.yaml / env / .env file")
 
-    base_url = (base_url or _VISION_FALLBACK_URL).rstrip("/")
-    if "/v1" not in base_url:
-        base_url += "/v1"
+    wire = wire_mod.wire_for(provider)
+    if not base_url:
+        base_url = _WIRE_DEFAULT_URLS.get(wire, "")
+        if not base_url:
+            # 连主渠道都没地址，退到那个谁都收的兼容端点，渠道类型也跟着退。
+            base_url, wire, provider = _VISION_FALLBACK_URL, _VISION_FALLBACK_WIRE, "gemini"
+    base_url = wire_mod.normalize_base_url(wire, base_url)
+
+    model = channel.pick("model", "MODEL", _VISION_DEFAULT_MODELS.get(wire, ""))
+    if not model:
+        return VisionChannel(error=(
+            f"看图渠道选了 {provider}，但没有能替它猜的模型名。"
+            "请在控制台的表情包页或 data/config.yaml 的 system_models.image 里填上 model。"
+        ))
     return VisionChannel(
-        base_url=base_url,
-        api_key=api_key,
-        model=channel.pick("model", "MODEL", _VISION_DEFAULT_MODEL),
+        base_url=base_url, api_key=api_key, model=model, provider=provider, wire=wire,
     )
 
 

@@ -415,8 +415,25 @@ openai:
 """)
         assert self._resolve(root).model != "some-text-only-model"
 
-    def test_non_openai_main_is_refused_instead_of_borrowed(self, tmp_path: Path) -> None:
-        # 借错家不会报地址错误，只会得到一个和配置毫无关系的 404。
+    def test_a_non_openai_main_is_borrowed_with_its_own_wire(self, tmp_path: Path) -> None:
+        # 整条跟随时格式也跟着一起借，不能拿别家的地址发 OpenAI 的请求体。
+        root = _workspace(tmp_path, """
+version: 1
+provider: gemini
+gemini:
+  base_url: https://generativelanguage.googleapis.com
+  api_key: main-key
+""")
+        result = self._resolve(root)
+
+        assert result.usable
+        assert result.wire == "gemini"
+        assert result.family == "gemini"
+        assert result.base_url == "https://generativelanguage.googleapis.com"
+        assert ":generateContent" in result.endpoint()
+
+    def test_a_main_without_a_model_default_says_so(self, tmp_path: Path) -> None:
+        # 这家没有能替它猜的模型名，与其发一个别家的名字去撞 404，不如直说。
         root = _workspace(tmp_path, """
 version: 1
 provider: anthropic
@@ -427,7 +444,85 @@ anthropic:
         result = self._resolve(root)
 
         assert not result.usable
-        assert "anthropic" in result.error
+        assert "model" in result.error
+
+    def test_an_explicit_provider_decides_the_wire(self, tmp_path: Path) -> None:
+        root = _workspace(tmp_path, """
+version: 1
+provider: openai
+openai:
+  base_url: https://main.example.com/v1
+  api_key: main-key
+system_models:
+  image:
+    provider: anthropic
+    base_url: https://api.anthropic.com
+    api_key: vision-key
+    model: claude-4-vision
+""")
+        result = self._resolve(root)
+
+        assert result.usable and result.wire == "anthropic"
+        assert result.endpoint() == "https://api.anthropic.com/v1/messages"
+
+    def test_a_slot_url_without_a_provider_is_treated_as_openai(self, tmp_path: Path) -> None:
+        # 地址和格式是绑死的一对：自己指了地址就不能假定对面还说主渠道那套话。
+        root = _workspace(tmp_path, """
+version: 1
+provider: gemini
+gemini:
+  base_url: https://generativelanguage.googleapis.com
+  api_key: main-key
+system_models:
+  image:
+    base_url: https://relay.example.com/v1
+    api_key: vision-key
+""")
+        result = self._resolve(root)
+
+        assert result.usable and result.wire == "openai"
+        assert result.endpoint() == "https://relay.example.com/v1/chat/completions"
+
+    def test_a_gemini_slot_does_not_gain_a_v1_suffix(self, tmp_path: Path) -> None:
+        # 端点自己拼 /v1beta/models/...，地址上再带一个版本段就发到不存在的路径去了。
+        root = _workspace(tmp_path, """
+version: 1
+provider: openai
+system_models:
+  image:
+    provider: gemini
+    base_url: https://generativelanguage.googleapis.com
+    api_key: k
+    model: flash
+""")
+        result = self._resolve(root)
+
+        assert result.base_url == "https://generativelanguage.googleapis.com"
+        assert result.endpoint().endswith("/v1beta/models/flash:generateContent")
+
+    def test_it_still_resolves_when_loaded_by_path_instead_of_as_a_package(
+        self, tmp_path: Path,
+    ) -> None:
+        """_channel.py 有三种被加载的方式，线格式那份不能靠模块级 import 拿。
+
+        包内 `tools._channel`、工具子进程里的裸 `_channel`、以及按路径加载 —— 这个文件
+        用的正是第三种，模块级 `from . import _vision_wire` 会在这里直接炸掉整个模块。
+        """
+        assert not channel.__package__
+        root = _workspace(tmp_path, """
+version: 1
+provider: openai
+system_models:
+  image:
+    provider: gemini
+    base_url: https://generativelanguage.googleapis.com
+    api_key: k
+    model: flash
+""")
+        result = self._resolve(root)
+
+        assert result.wire == "gemini" and result.family == "gemini"
+        assert ":generateContent" in result.endpoint()
 
     def test_missing_key_is_reported_not_guessed(self, tmp_path: Path) -> None:
         result = self._resolve(_workspace(tmp_path, "version: 1\nprovider: openai\n"))

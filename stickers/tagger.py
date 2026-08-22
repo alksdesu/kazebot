@@ -218,33 +218,35 @@ class StickerTagger:
     async def _describe(self, vision: Any, path: Path) -> list[str]:
         import httpx
 
-        from tools._image import build_image_part, family_for_base_url
+        from tools._image import build_image_part
+        from tools._vision_wire import build_request, error_detail, parse_text
 
-        part = await asyncio.to_thread(
-            build_image_part, path, family_for_base_url(vision.base_url),
+        part = await asyncio.to_thread(build_image_part, path, vision.family)
+        request = build_request(
+            wire=vision.wire,
+            base_url=vision.base_url,
+            api_key=vision.api_key,
+            model=vision.model,
+            image_urls=[part.data_url()],
+            system=SYSTEM_PROMPT,
+            prompt=PROMPT,
+            max_tokens=300,
+            temperature=0.2,
         )
-        payload = {
-            "model": vision.model,
-            "temperature": 0.2,
-            "max_tokens": 300,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": part.data_url()}},
-                    {"type": "text", "text": PROMPT},
-                ]},
-            ],
-        }
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             response = await client.post(
-                vision.endpoint(),
-                headers={"Authorization": f"Bearer {vision.api_key}"},
-                json=payload,
+                request.url, headers=request.headers, json=request.body,
             )
-            response.raise_for_status()
+        body: Any = None
+        try:
             body = response.json()
-        choices = body.get("choices") if isinstance(body, dict) else None
-        if not isinstance(choices, list) or not choices:
-            raise ValueError("模型返回里没有 choices")
-        content = ((choices[0] or {}).get("message") or {}).get("content")
-        return parse_tags(content if isinstance(content, str) else "")
+        except ValueError:
+            pass
+        if response.status_code != 200:
+            # 带上游原文：只报 HTTP 400 的话，分不清是模型名错还是格式选错。
+            detail = error_detail(body) or response.text[:200]
+            raise ValueError(f"上游返回 HTTP {response.status_code}：{detail}")
+        text = parse_text(vision.wire, body)
+        if not text:
+            raise ValueError("模型返回里没有正文")
+        return parse_tags(text)

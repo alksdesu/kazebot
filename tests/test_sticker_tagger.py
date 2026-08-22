@@ -13,6 +13,8 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+if str(_ROOT / "tools") not in sys.path:
+    sys.path.insert(0, str(_ROOT / "tools"))
 
 
 from stickers import store as ss
@@ -124,6 +126,9 @@ class _Vision:
     base_url = "https://vision.example.com/v1"
     api_key = "k"
     model = "m"
+    provider = "openai"
+    wire = "openai"
+    family = "openai"
 
     def endpoint(self) -> str:
         return f"{self.base_url}/chat/completions"
@@ -239,6 +244,133 @@ class _FakeChannel:
 
     def resolve_vision_channel(self, **_kwargs):
         return self._vision
+
+
+# ── 真发出去的那一份 ──
+
+class _Reply:
+    def __init__(self, status: int, payload, text: str = "") -> None:
+        self.status_code = status
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("not json")
+        return self._payload
+
+
+class _Sink(list):
+    """顶掉 httpx.AsyncClient，把发出去的那一份留下来看。"""
+
+    def client(self, reply: _Reply):
+        sink = self
+
+        class _Client:
+            def __init__(self, **_kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc) -> bool:
+                return False
+
+            async def post(self, url, headers=None, json=None):
+                sink.append({"url": url, "headers": headers or {}, "body": json or {}})
+                return reply
+
+        return _Client
+
+
+def _seed_real_png(bench, digest: str = "c" * 64) -> Path:
+    path = bench.root / "data" / "stickers" / f"{digest}.png"
+    # 只看文件头认格式，不解码整图，所以这几个字节就够。
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"junk")
+    bench.store.add(
+        sha256=digest, rel_path=path.relative_to(bench.root).as_posix(),
+        source=ss.SOURCE_GROUP, state=ss.STATE_LIBRARY, name="待标",
+    )
+    return path
+
+
+def _vision(wire: str, base_url: str) -> _Vision:
+    import _vision_wire as vw
+
+    channel = _Vision()
+    channel.wire = wire
+    channel.family = vw.family_for_wire(wire)
+    channel.base_url = base_url
+    return channel
+
+
+@pytest.mark.asyncio
+async def test_a_gemini_channel_gets_gemini_shaped_requests(
+    bench, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    path = _seed_real_png(bench)
+    sink = _Sink()
+    reply = _Reply(200, {"candidates": [{"content": {"parts": [{"text": '["表情包","猫"]'}]}}]})
+    monkeypatch.setattr(httpx, "AsyncClient", sink.client(reply))
+
+    tags = await bench.tagger._describe(
+        _vision("gemini", "https://generativelanguage.googleapis.com"), path,
+    )
+
+    assert tags == ["表情包", "猫"]
+    sent = sink[0]
+    assert sent["url"].endswith("/v1beta/models/m:generateContent")
+    assert sent["headers"]["x-goog-api-key"] == "k"
+    assert sent["body"]["contents"][0]["parts"][0]["inlineData"]["mimeType"] == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_an_openai_channel_still_gets_chat_completions(
+    bench, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    path = _seed_real_png(bench)
+    sink = _Sink()
+    reply = _Reply(200, {"choices": [{"message": {"content": '["表情包","猫"]'}}]})
+    monkeypatch.setattr(httpx, "AsyncClient", sink.client(reply))
+
+    tags = await bench.tagger._describe(_vision("openai", "https://relay.example/v1"), path)
+
+    assert tags == ["表情包", "猫"]
+    assert sink[0]["url"] == "https://relay.example/v1/chat/completions"
+    assert sink[0]["headers"]["Authorization"] == "Bearer k"
+
+
+@pytest.mark.asyncio
+async def test_the_upstream_reason_reaches_the_failure_record(
+    bench, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 只报一句 HTTP 400 的话，分不清是模型名错还是格式选错。
+    import httpx
+
+    path = _seed_real_png(bench)
+    reply = _Reply(400, {"error": {"message": "model not found"}})
+    monkeypatch.setattr(httpx, "AsyncClient", _Sink().client(reply))
+
+    with pytest.raises(ValueError, match="model not found"):
+        await bench.tagger._describe(_vision("openai", "https://relay.example/v1"), path)
+
+
+@pytest.mark.asyncio
+async def test_a_reply_without_text_is_an_error_not_an_empty_tag_list(
+    bench, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 空标签会被当成"模型没给出标签"重试三次，但渠道形状不对时重试没有意义。
+    import httpx
+
+    path = _seed_real_png(bench)
+    monkeypatch.setattr(httpx, "AsyncClient", _Sink().client(_Reply(200, {"choices": []})))
+
+    with pytest.raises(ValueError):
+        await bench.tagger._describe(_vision("openai", "https://relay.example/v1"), path)
 
 
 @pytest.mark.asyncio
