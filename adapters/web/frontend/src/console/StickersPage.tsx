@@ -5,18 +5,25 @@ import {
   acceptSticker,
   deleteSticker,
   discardSticker,
+  getProviderProfiles,
+  getProviders,
+  getSystemModels,
   importStickers,
   listStickers,
   recaptionStickers,
   stickerImageHref,
   updateSticker,
+  updateSystemModel,
   uploadSticker,
   type Sticker,
   type StickerCounts,
   type StickerState,
+  type SystemModelSlot,
+  type SystemModelsResponse,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
-import { Block, Empty, Footnote, Grid, Option } from './components';
+import { EnvHint, FieldRow } from './channelFields';
+import { Block, Empty, Footnote, Grid, Option, SaveBar } from './components';
 import { BoolOption, ChoiceField, NumberField, SubOption } from './fields';
 import { sizeText } from './format';
 import { IdList } from './IdList';
@@ -420,6 +427,162 @@ const LibraryBlock = () => {
   );
 };
 
+// 看图渠道存在 data/config.yaml 的 system_models.image，不是 qq.yaml，所以这一块自己存盘。
+const VisionBlock = () => {
+  const adminToken = useSettingsStore((state) => state.adminToken);
+  const [slot, setSlot] = useState<SystemModelSlot | null>(null);
+  const [baseUrl, setBaseUrl] = useState('');
+  const [model, setModel] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [mainProvider, setMainProvider] = useState('');
+  const [mainWire, setMainWire] = useState('');
+  const [mainHasUrl, setMainHasUrl] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState('');
+  const [error, setError] = useState('');
+
+  const absorb = (data: SystemModelsResponse) => {
+    const found = data.slots.find((item) => item.key === 'image') || null;
+    setSlot(found);
+    // 回填展开前的原文，否则保存一次就把变量引用烧成了当时的展开值。
+    setBaseUrl(found?.base_url_raw || '');
+    setModel(found?.model_raw || '');
+    setApiKey('');
+  };
+
+  useEffect(() => {
+    if (!adminToken) return;
+    void (async () => {
+      try {
+        absorb(await getSystemModels(adminToken));
+      } catch (caught) { setError(say(caught)); }
+      try {
+        const [providers, profiles] = await Promise.all([
+          getProviders(adminToken), getProviderProfiles(adminToken),
+        ]);
+        setMainProvider(providers.active_provider);
+        setMainWire(profiles.wireFormats[providers.active_provider] || '');
+        setMainHasUrl(Boolean(providers.providers?.[providers.active_provider]?.base_url));
+      } catch {
+        // 这两份只用来判断「跟随主渠道会不会失败」，取不到就退回静态说明，不该挡住保存。
+      }
+      setLoaded(true);
+    })();
+  }, [adminToken]);
+
+  const run = async (job: (token: string) => Promise<string>) => {
+    if (!adminToken || busy) return;
+    setBusy(true);
+    setError('');
+    setNote('');
+    try { setNote(await job(adminToken)); } catch (caught) { setError(say(caught)); }
+    setBusy(false);
+  };
+
+  const dirty = slot !== null && (
+    baseUrl !== slot.base_url_raw || model !== slot.model_raw || apiKey.trim() !== ''
+  );
+
+  const save = () => void run(async (token) => {
+    const key = apiKey.trim();
+    absorb(await updateSystemModel(token, 'image', {
+      base_url: baseUrl.trim(),
+      model: model.trim(),
+      // 只在真敲了东西时才带上 api_key：空串是「删掉这一项」的信号，不是「不动」。
+      ...(key ? { api_key: key } : {}),
+    }));
+    return '已保存。下一轮打标就用新配置。';
+  });
+
+  const clearKey = () => {
+    if (!window.confirm('清除看图渠道的密钥？清掉之后这一项回到跟随主渠道，存的那把密钥找不回来。')) return;
+    void run(async (token) => {
+      absorb(await updateSystemModel(token, 'image', { api_key: '' }));
+      return '已清除密钥';
+    });
+  };
+
+  const reset = () => {
+    setBaseUrl(slot?.base_url_raw || '');
+    setModel(slot?.model_raw || '');
+    setApiKey('');
+  };
+
+  // 地址留空才谈得上跟随；主渠道发的不是 OpenAI 格式时这条跟随必然失败。
+  const followBroken = !baseUrl.trim() && mainHasUrl && !!mainWire && mainWire !== 'openai';
+
+  return (
+    <Block hint="打标和 read_image 工具共用这一条，改完点这一块自己的保存" title="看图渠道">
+      {!loaded ? <Empty>正在读取看图渠道…</Empty> : (
+        <div className="qc-panel">
+          <p className="qc-facts">
+            {slot?.desc || '给看不了图的模型描述图片内容。'}
+            地址与密钥留空则跟随主渠道，但跟随时发的是 OpenAI 格式的
+            {' '}<code>/chat/completions</code>，主渠道不收这个格式就会失败。
+          </p>
+          {followBroken && (
+            <p className="qc-mismatch">
+              主渠道 {mainProvider} 按 {mainWire} 的格式发请求，收不下 OpenAI 的 /chat/completions。
+              地址和密钥不在这里单独填一份的话，表情包打标和读图都会停用。
+            </p>
+          )}
+
+          <FieldRow label="地址">
+            <input
+              aria-label="看图渠道地址"
+              className="qc-inp"
+              onChange={(event) => setBaseUrl(event.target.value)}
+              placeholder="留空 = 跟随主渠道；OpenAI 系的地址要带 /v1"
+              value={baseUrl}
+            />
+          </FieldRow>
+          <EnvHint raw={baseUrl} resolved={slot?.base_url || ''} savedRaw={slot?.base_url_raw || ''} />
+
+          <FieldRow label="模型">
+            <input
+              aria-label="看图渠道模型"
+              className="qc-inp"
+              onChange={(event) => setModel(event.target.value)}
+              placeholder="留空 = 用内置的默认看图模型"
+              value={model}
+            />
+          </FieldRow>
+          <EnvHint raw={model} resolved={slot?.model || ''} savedRaw={slot?.model_raw || ''} />
+          <p className="qc-facts">模型名不跟随主渠道 —— 主渠道那个多半正是看不了图的纯文本模型。</p>
+
+          <FieldRow label="密钥">
+            <input
+              aria-label="看图渠道密钥"
+              className="qc-inp"
+              onChange={(event) => setApiKey(event.target.value)}
+              placeholder={slot?.api_key_present
+                ? `已设置 ${slot.api_key_redacted}，留空不改`
+                : '留空 = 跟随主渠道的密钥'}
+              type="password"
+              value={apiKey}
+            />
+            {slot?.api_key_present && (
+              <button className="qc-btn qc-btn-danger" disabled={busy} onClick={clearKey} type="button">
+                清除
+              </button>
+            )}
+          </FieldRow>
+          <p className="qc-facts">
+            密钥只存不回显。
+            {slot?.api_key_present
+              ? '这里留空表示沿用已存的那一把，不会清掉；真要清就点上面的「清除」。'
+              : '这一项还没配。'}
+          </p>
+
+          {error && <p className="qc-login-error">{error}</p>}
+          <SaveBar busy={busy} dirty={dirty} label="保存渠道" note={note} onReset={reset} onSave={save} />
+        </div>
+      )}
+    </Block>
+  );
+};
+
 const CollectBlock = () => (
   <Block hint="改完点顶部的应用，bot 读到之后才生效" title="收集设置">
     <Grid>
@@ -478,10 +641,12 @@ const CollectBlock = () => (
 export const StickersPage = () => (
   <>
     <LibraryBlock />
+    <VisionBlock />
     <CollectBlock />
     <Footnote>
       只有在库且打过标的图才会进候选 —— 没打标的图对模型来说是不可描述的，给了也挑不出来。
-      打标走视觉模型，跟着 bot 进程慢慢跑，刚收进来的图要等一会儿才可用。
+      打标走上面那条看图渠道，跟着 bot 进程慢慢跑，刚收进来的图要等一会儿才可用；
+      渠道没配好时打标会整个停用，「还有多少没打标」就一直降不下去。
     </Footnote>
   </>
 );

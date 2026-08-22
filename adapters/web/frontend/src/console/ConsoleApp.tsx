@@ -49,7 +49,7 @@ const PAGE_NOTES: Partial<Record<ConsoleDomain, string>> = {
   models: '发给模型的请求里带哪些参数。清单由各家 provider 自己声明，全局与节点分两层，节点优先。',
   runtime: '进程与链路的实况，以及几个改完立刻重建运行期对象的参数。',
   memory: 'bot 记住了什么、每个会话攒了多少上下文。改动直接落盘，不用点应用。',
-  stickers: 'bot 能发哪些表情包。群里收来的先进待审，人工转正之后才进候选；底部的收集设置走 qq.yaml，改完点应用。',
+  stickers: 'bot 能发哪些表情包。群里收来的先进待审，人工转正之后才进候选。看图渠道决定图能不能被打上标签，这一块自己存盘；底部的收集设置走 qq.yaml，改完点应用。',
 };
 
 export const ConsoleApp = () => {
