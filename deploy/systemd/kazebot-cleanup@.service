@@ -1,0 +1,24 @@
+[Unit]
+Description=Kazebot periodic data cleanup (%i)
+Wants=kazebot@%i.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=kazebot
+Group=kazebot
+WorkingDirectory=/opt/kazebot-data/%i
+Environment=PYTHONPATH=/opt/kazebot
+Environment=CLONOTH_WORKSPACE=/opt/kazebot-data/%i
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=-/opt/kazebot-data/%i/.env
+ExecStart=/opt/kazebot/.venv/bin/python -m engine.data_cleanup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+ProtectSystem=strict
+ReadWritePaths=/opt/kazebot-data/%i
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

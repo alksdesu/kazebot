@@ -1,0 +1,40 @@
+[Unit]
+Description=Kazebot Supervisor (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kazebot
+Group=kazebot
+# 工作区是实例目录，代码在 /opt/kazebot；cwd 不是代码目录，所以要显式给 PYTHONPATH
+WorkingDirectory=/opt/kazebot-data/%i
+Environment=PYTHONPATH=/opt/kazebot
+Environment=CLONOTH_WORKSPACE=/opt/kazebot-data/%i
+Environment=CLONOTH_INSTANCES_FILE=/opt/kazebot-data/instances.yaml
+# 代码目录只读，几个实例同时写 __pycache__ 只会互相打架
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=-/opt/kazebot-data/%i/.env
+ExecStart=/opt/kazebot/.venv/bin/python /opt/kazebot/main.py
+Restart=always
+RestartSec=3
+# main.py 内部循环处理退出码 75；98 是端口被占，重启无意义，停住等人
+SuccessExitStatus=75
+RestartPreventExitStatus=98
+KillMode=mixed
+TimeoutStopSec=30
+
+# Agent 能执行任意命令，所以边界靠内核而不是正则黑名单
+ProtectSystem=strict
+ReadWritePaths=/opt/kazebot-data/%i
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target

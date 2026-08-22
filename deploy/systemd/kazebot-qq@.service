@@ -1,0 +1,35 @@
+[Unit]
+Description=Kazebot QQ Adapter (%i)
+After=network-online.target kazebot@%i.service
+Wants=network-online.target
+# Supervisor 不在时 QQ 侧只能空转，一起停
+BindsTo=kazebot@%i.service
+
+[Service]
+Type=simple
+User=kazebot
+Group=kazebot
+WorkingDirectory=/opt/kazebot-data/%i
+Environment=PYTHONPATH=/opt/kazebot
+Environment=CLONOTH_WORKSPACE=/opt/kazebot-data/%i
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=-/opt/kazebot-data/%i/.env
+ExecStart=/opt/kazebot/.venv/bin/python /opt/kazebot/bot.py
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=20
+
+ProtectSystem=strict
+ReadWritePaths=/opt/kazebot-data/%i
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target

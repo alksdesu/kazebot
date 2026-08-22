@@ -2,6 +2,18 @@
 
 This directory contains optional systemd unit templates for a Debian deployment under `/opt/Clonoth`.
 
+## Multi-account templates
+
+`kazebot@.service` and `kazebot-qq@.service` run one QQ account per instance, all sharing a single checkout. The instance name is the uin; the workspace is `/opt/kazebot-data/<uin>`. Use `deploy/new_instance.sh <uin> <index>` to lay out a workspace, then:
+
+```bash
+sudo cp deploy/systemd/kazebot@.service deploy/systemd/kazebot-qq@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now kazebot@<uin> kazebot-qq@<uin>
+```
+
+See `deploy/MULTI-ACCOUNT.md` for ports, NapCat containers, and the shared console.
+
 ## Data cleanup timer
 
 `clonoth-data-cleanup.timer` runs `engine.data_cleanup` periodically. The cleanup script rotates large event logs and removes expired temporary files, artifacts, child-session files, node-context files, and files under `data/attachments/`.

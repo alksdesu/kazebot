@@ -1,0 +1,13 @@
+[Unit]
+Description=Hourly data cleanup for kazebot %i
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+# 几个实例错开，避免整点一起扫盘
+RandomizedDelaySec=5min
+Persistent=true
+Unit=kazebot-cleanup@%i.service
+
+[Install]
+WantedBy=timers.target
