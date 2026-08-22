@@ -798,61 +798,6 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 names.add(spec["name"])
         return sorted(names)
 
-    # ----- Effective tools -----
-    @router.get("/nodes/{node_id}/effective-tools")
-    def node_effective_tools(node_id: str) -> dict[str, Any]:
-        """节点配了这些工具，实际还剩下哪些能用。
-
-        勾了不等于能用：名字可能根本不存在，生图渠道没配 model 会在构建工具表时
-        被摘掉，而外部脚本除非自己声明 guard，否则服务端策略那一页管不到它。
-        """
-        from toolbox.builtins import RESERVED_TOOL_NAMES
-        from toolbox.registry import extract_tool_spec, iter_external_tool_files
-
-        for nodes_dir in (workspace_root / "engine" / "system_nodes", workspace_root / "config" / "nodes"):
-            path = nodes_dir / f"{node_id}.yaml"
-            if path.exists():
-                break
-        else:
-            raise HTTPException(status_code=404, detail="Node not found")
-
-        data = _read_yaml(path)
-        ta = data.get("tool_access", {})
-        if isinstance(ta, str):
-            ta = {"mode": ta}
-        elif not isinstance(ta, dict):
-            ta = {}
-        mode = str(ta.get("mode") or "none").strip()
-        listed = ta.get("allow") if mode == "allowlist" else ta.get("deny")
-        names = [str(x).strip() for x in (listed or []) if str(x or "").strip()]
-
-        external: dict[str, bool] = {}
-        for f in iter_external_tool_files(workspace_root / "tools"):
-            spec, _timeout = extract_tool_spec(f)
-            if spec and isinstance(spec.get("name"), str):
-                external[spec["name"]] = isinstance(spec.get("guard"), dict)
-
-        builtin = set(RESERVED_TOOL_NAMES) | {"cancel_active_tasks"}
-        try:
-            from engine.builtin.image_gen_gating import disabled_image_tools
-            gated = disabled_image_tools(workspace_root)
-        except Exception:
-            gated = set()
-
-        rows: list[dict[str, Any]] = []
-        for name in names:
-            is_external = name in external
-            rows.append({
-                "name": name,
-                "registered": is_external or name in builtin,
-                "external": is_external,
-                # 内置工具走不走 request_guard 得看源码，这里不猜；只有外部脚本
-                # 能从 SPEC.guard 得到确定答案。None = 不下结论。
-                "guarded": external.get(name) if is_external else None,
-                "gated": "渠道未配置 model，构建工具表时会被摘掉" if name in gated else "",
-            })
-        return {"node_id": node_id, "mode": mode, "listed_as": "allow" if mode == "allowlist" else "deny", "tools": rows}
-
     # ----- Memory -----
     # data/memory 根目录是 conversation_key 缺失时的落点，URL 里没法用空串表示。
     _ROOT_NAMESPACE = "__root__"

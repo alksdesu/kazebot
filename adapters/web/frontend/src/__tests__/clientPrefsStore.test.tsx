@@ -1,12 +1,10 @@
-// [2026-06-01] Client preferences tests for browser-local settings.
-// Why: auto-approval, title generation, and render defaults must stay frontend-only.
-// How: exercise the store helpers and the settings page controls against localStorage.
-// Purpose: future backend policy changes cannot accidentally replace local build prefs.
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+// 本机偏好：自动审批、标题生成、渲染折叠都只写 localStorage，后端策略碰不到它们。
+import { fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { AutoApproveSection } from '../components/settings/pages/AutoApproveSection';
 import { ClientSettingsPage } from '../components/settings/pages/ClientSettingsPage';
-import * as supervisorClient from '../api/supervisorClient';
+import { useSettingsSelectionStore } from '../store/settingsSelectionStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { shouldAutoApproveTool, useClientPrefsStore } from '../store/clientPrefsStore';
 
@@ -14,20 +12,19 @@ describe('client preferences store and page', () => {
   beforeEach(() => {
     localStorage.clear();
     useClientPrefsStore.getState().resetClientPrefs();
+    useSettingsSelectionStore.setState({ allToolNames: [] });
     useSettingsStore.setState({ adminToken: null, isAuthenticated: false, availableNodes: [], modelConfig: null });
   });
 
   afterEach(() => {
     localStorage.clear();
     useClientPrefsStore.getState().resetClientPrefs();
+    useSettingsSelectionStore.setState({ allToolNames: [] });
     useSettingsStore.setState({ adminToken: null, isAuthenticated: false, availableNodes: [], modelConfig: null });
     vi.restoreAllMocks();
   });
 
   it('uses safe defaults for known and unknown tool approval rules', () => {
-    // [2026-06-01] Why: low-risk tools should be allowed locally by default while
-    // write and command tools remain manual. How: test the pure resolver without a
-    // component. Purpose: the approval automation path can share the same rule table.
     expect(shouldAutoApproveTool('read_file', {})).toBe(true);
     expect(shouldAutoApproveTool('search_in_files', {})).toBe(true);
     expect(shouldAutoApproveTool('list_dir', {})).toBe(true);
@@ -47,11 +44,6 @@ describe('client preferences store and page', () => {
   it('renders client settings controls and updates preferences from the UI', () => {
     render(<ClientSettingsPage />);
 
-    const executeToggle = screen.getByLabelText('自动放行 execute_command');
-    expect(executeToggle).not.toBeChecked();
-    fireEvent.click(executeToggle);
-    expect(useClientPrefsStore.getState().autoApproveTools.execute_command).toBe(true);
-
     const titleSelect = screen.getByLabelText('对话标题生成方式');
     expect(titleSelect).toHaveValue('first-message');
     fireEvent.change(titleSelect, { target: { value: 'manual' } });
@@ -62,34 +54,39 @@ describe('client preferences store and page', () => {
     expect(useClientPrefsStore.getState().thinkingDefaultCollapsed).toBe(false);
   });
 
-  it('loads additional backend tools below the recommended approval rules', async () => {
-    // [2026-06-01] Why: the UI must show every approval-capable backend tool, not
-    // only the seven recommended defaults. How: mock the new API and verify an
-    // extra tool appears in the separate "other tools" section with manual default.
-    // Purpose: future backend tools become configurable without a frontend release.
-    useSettingsStore.setState({ adminToken: 'secret-token', isAuthenticated: true });
-    vi.spyOn(supervisorClient, 'getAllToolNames').mockResolvedValue(['read_file', 'execute_command', 'gemini_image']);
-
+  it('no longer offers approval rules on the client page', () => {
+    // 自动审批挪去了「工具与权限」，留在这里会让人以为它跟服务端策略是一回事。
     render(<ClientSettingsPage />);
 
+    expect(screen.queryByLabelText('自动放行 execute_command')).not.toBeInTheDocument();
+    expect(screen.queryByText('推荐工具')).not.toBeInTheDocument();
+  });
+
+  it('toggles an approval rule from the tools page section', () => {
+    render(<AutoApproveSection />);
+
+    const executeToggle = screen.getByLabelText('自动放行 execute_command');
+    expect(executeToggle).not.toBeChecked();
+    fireEvent.click(executeToggle);
+    expect(useClientPrefsStore.getState().autoApproveTools.execute_command).toBe(true);
+  });
+
+  it('lists additional backend tools below the recommended approval rules', () => {
+    // 工具名由同页的工具清单拉好放进 store，这里不再自己发一次请求。
+    useSettingsSelectionStore.setState({ allToolNames: ['read_file', 'execute_command', 'gemini_image'] });
+
+    render(<AutoApproveSection />);
+
     expect(screen.getByText('推荐工具')).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByText('其他工具')).toBeInTheDocument());
+    expect(screen.getByText('其他工具')).toBeInTheDocument();
     expect(screen.getByText('gemini_image')).toBeInTheDocument();
     expect(screen.getByLabelText('自动放行 gemini_image')).not.toBeChecked();
   });
 
-  it('falls back to recommended tools when backend tool loading fails', async () => {
-    // [2026-06-01] Why: unauthenticated users can still edit the safe recommended
-    // local rules. How: force the dynamic list request to fail and assert the
-    // fallback list stays visible. Purpose: settings remain usable without admin
-    // access while unknown backend tools stay manual by omission.
-    useSettingsStore.setState({ adminToken: 'bad-token', isAuthenticated: true });
-    vi.spyOn(supervisorClient, 'getAllToolNames').mockRejectedValue(new Error('401'));
-
-    render(<ClientSettingsPage />);
+  it('falls back to recommended tools when the tool list is unavailable', () => {
+    render(<AutoApproveSection />);
 
     expect(screen.getByText('推荐工具')).toBeInTheDocument();
-    await waitFor(() => expect(supervisorClient.getAllToolNames).toHaveBeenCalledWith('bad-token'));
     expect(screen.queryByText('其他工具')).not.toBeInTheDocument();
     expect(screen.getByText('read_file')).toBeInTheDocument();
   });

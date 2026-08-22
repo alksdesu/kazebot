@@ -18,11 +18,36 @@ export const PageHeader = ({ eyebrow = '设置', title, description }: { eyebrow
   </header>
 );
 
-export const Card = ({ title, description, children }: { title?: string; description?: string; children: ReactNode }) => (
+// 一条规则管到哪些渠道。写错过一次：QQ 的权限被当成浏览器设置，没人敢动。
+export type SettingScope = 'all-channels' | 'this-browser';
+
+const SCOPE_TEXT: Record<SettingScope, string> = {
+  'all-channels': '所有渠道',
+  'this-browser': '仅此浏览器',
+};
+
+export const ScopeBadge = ({ scope }: { scope: SettingScope }) => (
+  <span
+    className={`flex-shrink-0 border px-1.5 py-0.5 font-mono text-[0.55rem] tracking-[0.08em] ${
+      scope === 'all-channels'
+        ? 'border-[var(--duties-text)] bg-[var(--duties-text)] text-[var(--duties-bg)]'
+        : 'border-[var(--duties-border)] text-[var(--duties-secondary)]'
+    }`}
+  >
+    {SCOPE_TEXT[scope]}
+  </span>
+);
+
+export const Card = ({ title, description, scope, children }: { title?: string; description?: string; scope?: SettingScope; children: ReactNode }) => (
   <section className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
     {(title || description) && (
       <div className="mb-3">
-        {title && <h2 className="font-mono text-sm font-semibold">{title}</h2>}
+        {title && (
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="font-mono text-sm font-semibold">{title}</h2>
+            {scope && <ScopeBadge scope={scope} />}
+          </div>
+        )}
         {description && <p className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]">{description}</p>}
       </div>
     )}

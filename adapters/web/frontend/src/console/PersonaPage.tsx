@@ -179,7 +179,7 @@ export const PersonaPage = () => (
       </div>
     </Block>
 
-    <Block hint="综合入口节点用哪个模型。能调哪些工具在设置的「工具与权限 → 节点授权」改" title="模型">
+    <Block hint="综合入口节点用哪个模型。能调哪些工具在设置的「节点」页改节点 YAML 的 tool_access" title="模型">
       <div className="qc-panel">
         <p className="qc-words-label">可以调用这些工具</p>
         <ModelChoice />

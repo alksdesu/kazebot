@@ -7,7 +7,7 @@ import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore
 import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
 import { Button } from '../../common';
-import { NodeGrantsSection } from './NodeGrantsSection';
+import { AutoApproveSection } from './AutoApproveSection';
 import { PolicyRulesSection } from './PolicyRulesSection';
 import { AuthRequired, Card, FieldLabel, PageHeader, PageShell, StatusText, TextInput } from './settingsPagePrimitives';
 
@@ -99,7 +99,11 @@ const ToolInventorySection = () => {
   };
 
   return (
-    <Card title="工具清单" description="外部 Python 工具可在这里增删与重载；风险等级根据工具名前缀推断，脚本编辑器在右栏。">
+    <Card
+      description="外部 Python 工具可在这里增删与重载；风险等级根据工具名前缀推断，脚本编辑器在右栏。"
+      scope="all-channels"
+      title="工具清单"
+    >
       <>
           <div className="mb-3 flex flex-wrap gap-2">
             <Button disabled={loading} onClick={load}>{loading ? '刷新中...' : '刷新工具'}</Button>
@@ -133,14 +137,14 @@ export const ToolsSettingsPage = () => {
   return (
     <PageShell>
       <PageHeader
-        description="三件事按顺序排在下面：有哪些工具、哪个节点能调、调了要不要审批。"
+        description="有哪些工具、调了要不要审批。每块都标了生效范围：标「所有渠道」的连 QQ 和定时任务一起管，标「仅此浏览器」的只管你眼前这个页面。哪个节点能调哪些工具，在「节点文件」页改 tool_access。"
         title="工具与权限"
       />
       {!isAuthenticated ? <AuthRequired /> : (
         <>
           <ToolInventorySection />
-          <NodeGrantsSection />
           <PolicyRulesSection />
+          <AutoApproveSection />
         </>
       )}
     </PageShell>

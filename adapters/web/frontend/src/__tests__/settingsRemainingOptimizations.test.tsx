@@ -76,10 +76,10 @@ describe('remaining Settings optimizations', () => {
     render(<ClientSettingsPage />);
 
     const entrySection = screen.getByRole('heading', { name: '入口节点' }).closest('section');
-    const approvalSection = screen.getByRole('heading', { name: /自动审批规则/ }).closest('section');
-    if (!entrySection || !approvalSection) throw new Error('settings sections not found');
+    const titleSection = screen.getByRole('heading', { name: '对话标题' }).closest('section');
+    if (!entrySection || !titleSection) throw new Error('settings sections not found');
 
-    expect(entrySection.compareDocumentPosition(approvalSection) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(entrySection.compareDocumentPosition(titleSection) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     const select = await screen.findByLabelText('入口节点');
     await waitFor(() => expect(select).toHaveValue('ereuna_main'));
     expect(within(select).getByRole('option', { name: /EreunaMain/ })).toBeInTheDocument();
@@ -109,8 +109,8 @@ describe('remaining Settings optimizations', () => {
     const nameInput = await screen.findByLabelText('名称');
     expect(nameInput).toHaveValue('EreunaMain');
     expect(screen.getByLabelText('节点 ID')).toHaveTextContent('ereuna_main');
-    // 工具权限收归「节点授权」页独家管，这里只留一句指路。
-    expect(screen.getByText(/工具权限在「工具与权限 → 节点授权」改/)).toBeInTheDocument();
+    // tool_access 只有 YAML 原文能改，结构化表单必须把人指过去。
+    expect(screen.getByText(/工具权限（tool_access）要在下面的高级 YAML 编辑里改/)).toBeInTheDocument();
 
     fireEvent.change(nameInput, { target: { value: 'Ereuna' } });
     fireEvent.change(screen.getByLabelText('委派目标，使用英文逗号分隔'), { target: { value: 'smith, scout' } });

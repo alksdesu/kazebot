@@ -1,4 +1,4 @@
-// 服务端策略：决定每条路径要不要审批。与同页的本机偏好不同，这份对所有渠道生效，包括 QQ。
+// 服务端策略：决定每条路径要不要审批。QQ、控制台、定时任务共用这一份。
 import { useEffect, useState } from 'react';
 
 import {
@@ -9,6 +9,7 @@ import {
   type PolicyRule,
 } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { ScopeBadge } from './settingsPagePrimitives';
 
 type RuleSectionKey = 'read_file' | 'write_file';
 
@@ -246,9 +247,13 @@ export const PolicyRulesSection = () => {
   return (
     <section className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
       <div className="mb-3">
-        <h2 className="font-mono text-sm font-semibold">服务端策略（所有渠道生效）</h2>
+        <div className="flex flex-wrap items-center gap-2">
+          <h2 className="font-mono text-sm font-semibold">服务端策略</h2>
+          <ScopeBadge scope="all-channels" />
+        </div>
         <p className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]">
-          写进 data/policy.yaml，QQ、控制台、定时任务共用这一份。上面那块只影响当前浏览器的聊天页，管不到 QQ。
+          写进 data/policy.yaml，QQ、控制台、定时任务共用这一份。只管 read_file、write_file、
+          execute_command、restart 这四类操作；外部脚本工具除非自己声明 guard，否则不受这里约束。
         </p>
       </div>
 

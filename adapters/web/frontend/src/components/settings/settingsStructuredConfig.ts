@@ -193,8 +193,8 @@ export function serializeNodeConfig(raw: string, form: NodeConfigFormState): str
   doc.persistent = form.persistent;
   if (form.prompt.trim()) doc.prompt = form.prompt; else delete doc.prompt;
   doc.delegate_targets = commaTextToItems(form.delegate_targetsText);
-  // tool_access 归「工具与权限 → 节点授权」独家管；这里整份 dump 会把 mode 对应
-  // 不上的那半（allowlist 下的 deny）连同注释一起洗掉。
+  // tool_access 只能改 YAML 原文；这里整份 dump 会把 mode 对应不上的那半
+  // （allowlist 下的 deny）连同注释一起洗掉。
   return safeDump(doc);
 }
 

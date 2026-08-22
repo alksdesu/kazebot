@@ -301,8 +301,8 @@ export const AgentsSettingsRightPanel = () => {
                   <input className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ delegate_targetsText: event.target.value })} value={nodeConfigForm.delegate_targetsText} />
                 </label>
                 <p className="text-[0.6rem] text-[var(--duties-tertiary)]">
-                  工具权限在「工具与权限 → 节点授权」改。保存这里会重排 YAML 并丢掉注释，
-                  想保留注释请用下面的高级 YAML 编辑。
+                  工具权限（tool_access）要在下面的高级 YAML 编辑里改。保存这里会重排 YAML
+                  并丢掉注释，想保留注释也走那边。
                 </p>
                 <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50" disabled={nodeYamlSaving} onClick={saveNodeConfig} type="button">保存节点配置</button>
                 {nodeMessage && <p className="text-[var(--duties-tertiary)]">{nodeMessage}</p>}

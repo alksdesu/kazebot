@@ -1,19 +1,10 @@
-// [2026-06-01] Client-only settings page.
-// Why: users need frontend-local controls for approval automation, title behavior,
-// and rendering defaults without changing Supervisor policy. How: bind form controls
-// directly to clientPrefsStore, which persists in browser localStorage. Purpose:
-// each build or browser profile can keep independent preferences.
-import { useEffect, useMemo, useState } from 'react';
+// 客户端设置：只存 localStorage 的前端偏好，不碰后端配置。
+import { useEffect, useState } from 'react';
 
-import { getAllToolNames, getConfig, getNodes } from '../../../api/supervisorClient';
-import {
-  DEFAULT_AUTO_APPROVE_TOOLS,
-  type TitleGenerationMode,
-  useClientPrefsStore,
-} from '../../../store/clientPrefsStore';
+import { getConfig, getNodes } from '../../../api/supervisorClient';
+import { type TitleGenerationMode, useClientPrefsStore } from '../../../store/clientPrefsStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import type { NodeDef } from '../../../types';
-import { inferToolRisk, riskClassName, riskLabel, type RiskLevel } from '../../../utils/toolRisk';
 
 export function parseNodeList(nodes: NodeDef[]): NodeDef[] {
   // [2026-06-02] Parse real Supervisor nodes into selectable entry nodes.
@@ -43,110 +34,30 @@ function configuredEntryNodeId(config: Awaited<ReturnType<typeof getConfig>> | n
   return String(config?.entry_node_id || config?.default_entry_node_id || config?.shell?.entry_node_id || storedEntryNodeId || '').trim();
 }
 
-interface ToolRuleRow {
-  toolName: string;
-  label: string;
-  risk: RiskLevel;
-  description: string;
-}
-
-interface KnownToolInfo {
-  toolName: string;
-  label: string;
-  description: string;
-}
-
-const KNOWN_TOOL_RULES: KnownToolInfo[] = [
-  // [2026-06-02] Keep only curated labels and Chinese descriptions here.
-  // Why: risk levels are now inferred from tool-name prefixes so new backend tools do
-  // not need frontend edits. How: ToolRuleToggle receives inferToolRisk(toolName) at
-  // render time. Purpose: recommended rows retain helpful copy while risk badges stay
-  // automatic and never depend on hard-coded levels.
-  { toolName: 'read_file', label: 'read_file', description: '读取项目文件。只读操作，默认自动放行。' },
-  { toolName: 'search_in_files', label: 'search_in_files', description: '搜索源码文件。只读操作，默认自动放行。' },
-  { toolName: 'list_dir', label: 'list_dir', description: '列出目录内容。只读操作，默认自动放行。' },
-  { toolName: 'execute_command', label: 'execute_command', description: '执行 Shell 命令。可能影响系统，默认需要审批。' },
-  { toolName: 'write_file', label: 'write_file', description: '创建或覆盖文件。会修改工作区，默认需要审批。' },
-  { toolName: 'apply_diff', label: 'apply_diff', description: '修改现有文件。会修改工作区，默认需要审批。' },
-  { toolName: 'request_restart', label: 'request_restart', description: '请求重启服务。影响运行中的服务，默认需要审批。' },
-];
-
-const RECOMMENDED_TOOL_NAMES = new Set(KNOWN_TOOL_RULES.map((rule) => rule.toolName));
-
 const TITLE_OPTIONS: Array<{ value: TitleGenerationMode; label: string; description: string }> = [
   { value: 'auto', label: '由模型生成', description: '在支持此模式时，请助手为对话生成标题。' },
   { value: 'manual', label: '手动输入', description: '保持标题不变，直到用户手动编辑。' },
   { value: 'first-message', label: '首条消息', description: '使用首条消息文本，最多保留 50 个字符。' },
 ];
 
-function toolListFromApi(names: string[]): string[] {
-  // [2026-06-01] Why: the backend may return duplicated, empty, or unsorted names
-  // as tools are registered from multiple sources. How: trim, de-duplicate, and sort
-  // in one small helper. Purpose: the approval settings list remains stable and does
-  // not show malformed rows from transient registry data.
-  return Array.from(new Set(names.map((name) => name.trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b));
-}
-
-function ToolRuleToggle({ rule, checked, onChange }: { rule: ToolRuleRow; checked: boolean; onChange: (enabled: boolean) => void }) {
-  return (
-    <label
-      className="flex items-start justify-between gap-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3"
-      key={rule.toolName}
-    >
-      <span className="min-w-0">
-        <span className="flex flex-wrap items-center gap-2">
-          <span className="font-mono text-xs font-semibold text-[var(--duties-text)]">{rule.label}</span>
-          <span className={`rounded-sm border px-1.5 py-0.5 font-mono text-[0.55rem] uppercase tracking-[0.12em] ${riskClassName(rule.risk)}`}>
-            {riskLabel(rule.risk)}
-          </span>
-        </span>
-        <span className="mt-1 block text-xs leading-5 text-[var(--duties-secondary)]">{rule.description}</span>
-      </span>
-      <input
-        aria-label={`自动放行 ${rule.toolName}`}
-        checked={checked}
-        className="mt-1 h-4 w-4 flex-shrink-0 accent-[var(--duties-text)]"
-        onChange={(event) => onChange(event.target.checked)}
-        type="checkbox"
-      />
-    </label>
-  );
-}
-
 export const ClientSettingsPage = () => {
   const {
-    autoApproveTools,
     titleGeneration,
     thinkingDefaultCollapsed,
     toolResultsDefaultCollapsed,
-    setAutoApproveTool,
     setTitleGeneration,
     setThinkingDefaultCollapsed,
     setToolResultsDefaultCollapsed,
   } = useClientPrefsStore();
   const { adminToken, entryNodeId, setEntryNodeId } = useSettingsStore();
-  const [allToolNames, setAllToolNames] = useState<string[]>([]);
   const [entryNodes, setEntryNodes] = useState<NodeDef[]>([]);
 
   useEffect(() => {
-    // [2026-06-01] Why: approval rules must reflect every tool registered by the
-    // running Supervisor, but the API requires admin auth and can fail. How: fetch
-    // on mount/token change, keep only valid names, and clear dynamic names on
-    // failure. Purpose: authenticated users see the complete tool list while
-    // unauthenticated users safely fall back to the recommended default rows.
     if (!adminToken) {
-      setAllToolNames([]);
       setEntryNodes([]);
       return;
     }
     let cancelled = false;
-    getAllToolNames(adminToken)
-      .then((names) => {
-        if (!cancelled) setAllToolNames(toolListFromApi(names));
-      })
-      .catch(() => {
-        if (!cancelled) setAllToolNames([]);
-      });
     Promise.all([
       getNodes(adminToken),
       getConfig().catch(() => null),
@@ -175,18 +86,6 @@ export const ClientSettingsPage = () => {
     };
   }, [adminToken, setEntryNodeId]);
 
-  const otherToolRules = useMemo(
-    () => allToolNames
-      .filter((toolName) => !RECOMMENDED_TOOL_NAMES.has(toolName))
-      .map((toolName): ToolRuleRow => ({
-        toolName,
-        label: toolName,
-        risk: inferToolRisk(toolName),
-        description: '后端返回的其他工具。默认需要手动审批。',
-      })),
-    [allToolNames],
-  );
-
   return (
     <section className="h-full min-h-0 overflow-y-auto p-4 sm:p-6">
       <div className="mx-auto max-w-3xl space-y-6">
@@ -195,6 +94,7 @@ export const ClientSettingsPage = () => {
           <h1 className="mt-2 font-mono text-xl font-semibold tracking-[-0.04em]">客户端设置</h1>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--duties-secondary)]">
             这些偏好只保存在当前浏览器中，不会修改后端策略、共享会话状态或服务器配置。
+            自动审批挪到了「工具与权限」页，好跟服务端策略摆在一起对照。
           </p>
         </header>
 
@@ -215,56 +115,6 @@ export const ClientSettingsPage = () => {
             ))}
           </select>
           <p className="mt-2 font-mono text-[0.6rem] text-[var(--duties-tertiary)]">当前值：{entryNodeId || '（未设置）'}</p>
-        </section>
-
-        <section className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
-          <div className="mb-3">
-            <h2 className="font-mono text-sm font-semibold">自动审批规则（仅本浏览器）</h2>
-            <p className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]">
-              存在这台浏览器里，只作用于控制台聊天页收到的审批请求。QQ 等其他渠道走的是下面那份服务端策略，勾这里没用。
-            </p>
-          </div>
-
-          <div className="space-y-4">
-            <div>
-              <h3 className="mb-2 font-mono text-xs font-semibold text-[var(--duties-secondary)]">推荐工具</h3>
-              <div className="space-y-2">
-                {KNOWN_TOOL_RULES.map((rule) => {
-                  const checked = autoApproveTools[rule.toolName] ?? DEFAULT_AUTO_APPROVE_TOOLS[rule.toolName] ?? false;
-                  return (
-                    <ToolRuleToggle
-                      checked={checked}
-                      key={rule.toolName}
-                      onChange={(enabled) => setAutoApproveTool(rule.toolName, enabled)}
-                      rule={{ ...rule, risk: inferToolRisk(rule.toolName) }}
-                    />
-                  );
-                })}
-              </div>
-            </div>
-
-            {otherToolRules.length > 0 && (
-              <div>
-                <h3 className="mb-2 font-mono text-xs font-semibold text-[var(--duties-secondary)]">其他工具</h3>
-                <div className="space-y-2">
-                  {otherToolRules.map((rule) => {
-                    const checked = autoApproveTools[rule.toolName] ?? false;
-                    return (
-                      <ToolRuleToggle
-                        checked={checked}
-                        key={rule.toolName}
-                        onChange={(enabled) => setAutoApproveTool(rule.toolName, enabled)}
-                        rule={rule}
-                      />
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-          </div>
-          <p className="mt-3 border-t border-[var(--duties-border)] pt-3 text-xs leading-5 text-[var(--duties-tertiary)]">
-            以上只影响当前浏览器。对所有渠道（含 QQ）都生效的审批策略在「工具与权限」页。
-          </p>
         </section>
 
         <section className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
