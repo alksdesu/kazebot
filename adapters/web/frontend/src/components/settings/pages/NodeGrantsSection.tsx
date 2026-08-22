@@ -1,4 +1,6 @@
-// 节点授权：这个节点自己能调哪些工具。allowlist 勾中的是允许，all 勾中的是禁止，两者相反。
+// 节点授权：这个节点自己能调哪些工具。
+// 勾选一律表示「能调用」。底下 allowlist 存 allow、all 存 deny，含义正相反，
+// 让复选框直接绑名单，同一个勾在两种模式下就是两个意思 —— 点一次「全选」能把工具全关掉。
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 
 import {
@@ -43,16 +45,17 @@ interface Access {
 }
 
 const MODE_CHOICES: ReadonlyArray<readonly [Mode, string]> = [
-  ['allowlist', '白名单'],
-  ['all', '全部放开'],
+  ['allowlist', '按勾选给'],
+  ['all', '默认全给'],
   ['none', '不给工具'],
 ];
 
 const MODE_LABEL = Object.fromEntries(MODE_CHOICES) as Record<Mode, string>;
 
+// 两种模式的差别只剩一件事：以后新增的工具默认给不给。当下谁能调，看勾选就够了。
 const MODE_HINT: Record<Mode, string> = {
-  allowlist: '勾中的可以调用，其余一律看不到',
-  all: '勾中的被禁止，其余全部可以调用',
+  allowlist: '以后新增的工具默认不给',
+  all: '以后新增的工具默认也能调',
   none: '这个节点拿不到任何工具',
 };
 
@@ -136,36 +139,40 @@ const DefaultsNotice = ({ nodes }: { nodes: AdminNode[] }) => {
   );
 };
 
-const EffectiveNotes = ({ rows }: { rows: EffectiveTool[] }) => {
-  const dead = rows.filter((row) => !row.registered).map((row) => row.name);
+const EffectiveNotes = ({ dead, mode, rows }: { dead: string[]; mode: Mode; rows: EffectiveTool[] }) => {
   const gated = rows.filter((row) => row.gated).map((row) => row.name);
   const loose = rows.filter((row) => row.guarded === false).length;
   if (!dead.length && !gated.length && !loose) return null;
   return (
     <div className="mb-2">
-      {!!dead.length && <ErrorText>这些名字不存在，注入时会被静默忽略：{dead.join('、')}</ErrorText>}
-      {!!gated.length && <ErrorText>配了但用不了，渠道没设 model：{gated.join('、')}</ErrorText>}
+      {!!dead.length && (
+        <ErrorText>
+          {mode === 'all'
+            ? `这些禁令没生效，注册表里没有这个名字：${dead.join('、')}`
+            : `这些名字不存在，注入时会被静默忽略：${dead.join('、')}`}
+        </ErrorText>
+      )}
+      {!!gated.length && <ErrorText>能调但用不了，渠道没设 model：{gated.join('、')}</ErrorText>}
       {!!loose && <Facts>其中 {loose} 个是外部脚本，没声明 guard，「服务端策略」那一页管不到它们。</Facts>}
     </div>
   );
 };
 
-const ToolCell = ({ effective, missing, name, picked, onToggle }: {
+const ToolCell = ({ effective, enabled, missing, missingTitle, name, onToggle }: {
   effective?: EffectiveTool;
+  enabled: boolean;
   missing: boolean;
+  missingTitle: string;
   name: string;
-  picked: boolean;
   onToggle: () => void;
 }) => {
   const risk = inferToolRisk(name);
   return (
-    <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1">
-      <Check checked={picked} onChange={onToggle}>
+    <div className={`border border-[var(--duties-border)] px-2 py-1 ${enabled ? 'bg-[var(--duties-bg)]' : 'bg-[var(--duties-muted)]'}`}>
+      <Check checked={enabled} onChange={onToggle}>
         <span className="flex flex-wrap items-center gap-1.5">
-          <span className="break-all font-mono text-[0.7rem] text-[var(--duties-text)]">{name}</span>
-          {missing && (
-            <Mark title="当前注册表里没有这个工具，注入时会被静默忽略" tone="danger">未注册</Mark>
-          )}
+          <span className={`break-all font-mono text-[0.7rem] ${enabled ? 'text-[var(--duties-text)]' : 'text-[var(--duties-tertiary)] line-through'}`}>{name}</span>
+          {missing && <Mark title={missingTitle} tone="danger">未注册</Mark>}
           {!!effective?.gated && <Mark title={effective.gated} tone="danger">不可用</Mark>}
           {effective?.guarded === false && (
             <Mark title="外部脚本没声明 guard，服务端策略那一页对它不生效" tone="muted">策略外</Mark>
@@ -192,6 +199,7 @@ const NodeRow = ({ node, tools, onSaved }: {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [effective, setEffective] = useState<Record<string, EffectiveTool>>({});
+  const [deadNames, setDeadNames] = useState<string[]>([]);
 
   useEffect(() => {
     setMode(saved.mode);
@@ -207,27 +215,43 @@ const NodeRow = ({ node, tools, onSaved }: {
       .then((data) => {
         if (!alive) return;
         setEffective(Object.fromEntries(data.tools.map((item) => [item.name, item])));
+        setDeadNames(data.dead_names || []);
       })
       .catch(() => undefined);
     return () => { alive = false; };
   }, [open, adminToken, node.id, saved]);
 
-  const picked = mode === 'all' ? deny : allow;
-  const setPicked = mode === 'all' ? setDeny : setAllow;
   const dirty = mode !== saved.mode || !sameList(allow, saved.allow) || !sameList(deny, saved.deny);
 
-  // 已经配过但当前注册表里没有的名字要留着：插件没加载时把它清掉，就再也勾不回来了。
-  const candidates = useMemo(() => {
-    const merged = [...new Set([...tools, ...saved.allow, ...saved.deny])].sort();
-    const keyword = filter.trim().toLowerCase();
-    return keyword ? merged.filter((name) => name.toLowerCase().includes(keyword)) : merged;
-  }, [tools, saved, filter]);
+  // all 模式存的是禁用名单，勾中即「不在名单里」。这里翻一次，界面上就只有一种含义。
+  const isEnabled = (name: string) => (mode === 'all' ? !deny.includes(name) : allow.includes(name));
 
-  const toggle = (name: string) => {
-    setPicked(picked.includes(name)
-      ? picked.filter((item) => item !== name)
-      : [...picked, name].sort());
+  const setEnabled = (names: readonly string[], next: boolean) => {
+    const touched = new Set(names);
+    if (mode === 'all') {
+      setDeny(next
+        ? deny.filter((name) => !touched.has(name))
+        : [...new Set([...deny, ...names])].sort());
+      return;
+    }
+    setAllow(next
+      ? [...new Set([...allow, ...names])].sort()
+      : allow.filter((name) => !touched.has(name)));
   };
+
+  // 已经配过但当前注册表里没有的名字要留着：插件没加载时把它清掉，就再也勾不回来了。
+  const everyTool = useMemo(
+    () => [...new Set([...tools, ...saved.allow, ...saved.deny])].sort(),
+    [tools, saved],
+  );
+
+  const candidates = useMemo(() => {
+    const keyword = filter.trim().toLowerCase();
+    return keyword ? everyTool.filter((name) => name.toLowerCase().includes(keyword)) : everyTool;
+  }, [everyTool, filter]);
+
+  const enabledCount = everyTool.filter(isEnabled).length;
+  const filtered = candidates.length !== everyTool.length;
 
   const save = async () => {
     if (!adminToken) return;
@@ -295,19 +319,41 @@ const NodeRow = ({ node, tools, onSaved }: {
                   value={filter}
                   width="flex"
                 />
-                <Button onClick={() => setPicked(candidates)} size="sm" tone="quiet">全选</Button>
-                <Button onClick={() => setPicked([])} size="sm" tone="quiet">清空</Button>
+                <Button
+                  aria-label={filtered ? `让筛出的 ${candidates.length} 个工具可调用` : '让全部工具可调用'}
+                  onClick={() => setEnabled(candidates, true)}
+                  size="sm"
+                  tone="quiet"
+                >
+                  {filtered ? `这 ${candidates.length} 个可调用` : '全部可调用'}
+                </Button>
+                <Button
+                  aria-label={filtered ? `禁止筛出的 ${candidates.length} 个工具` : '禁止全部工具'}
+                  onClick={() => setEnabled(candidates, false)}
+                  size="sm"
+                  tone="quiet"
+                >
+                  {filtered ? `这 ${candidates.length} 个禁止` : '全部禁止'}
+                </Button>
               </div>
-              <EffectiveNotes rows={Object.values(effective)} />
+              <p className="mb-2 font-mono text-[0.65rem] text-[var(--duties-secondary)]">
+                勾中的能调用，划掉的调不了。{everyTool.length} 个工具里{' '}
+                <span className="text-[var(--duties-text)]">{enabledCount} 个可调用</span>
+                {filtered && `，当前筛出 ${candidates.length} 个`}
+              </p>
+              <EffectiveNotes dead={deadNames} mode={mode} rows={Object.values(effective)} />
               <div className="grid max-h-64 grid-cols-1 gap-1 overflow-y-auto sm:grid-cols-2">
                 {candidates.map((name) => (
                   <ToolCell
                     effective={effective[name]}
+                    enabled={isEnabled(name)}
                     key={name}
                     missing={!tools.includes(name)}
+                    missingTitle={mode === 'all'
+                      ? '注册表里没有这个名字，这条禁令没生效'
+                      : '注册表里没有这个名字，注入时会被静默忽略'}
                     name={name}
-                    onToggle={() => toggle(name)}
-                    picked={picked.includes(name)}
+                    onToggle={() => setEnabled([name], !isEnabled(name))}
                   />
                 ))}
               </div>

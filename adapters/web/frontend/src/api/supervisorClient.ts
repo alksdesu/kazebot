@@ -1578,7 +1578,6 @@ export async function reloadTools(token: string): Promise<any> {
 }
 
 export async function getAllToolNames(token: string): Promise<string[]> {
-  // 内置工具不在 tools/ 目录，只有这个端点认得全，getTools 那份是漏的。
   const resp = await apiFetch('/admin/config/all-tool-names', { headers: authHeaders(token) });
   return resp.json();
 }
@@ -1596,7 +1595,9 @@ export interface EffectiveTool {
 export interface EffectiveTools {
   node_id: string;
   mode: string;
-  listed_as: 'allow' | 'deny';
+  /** 配了却不存在的名字。白名单里是「这条从没生效过」，禁用名单里是「以为禁了其实没禁」。 */
+  dead_names: string[];
+  /** 这个节点实际能调的那些，不是它列在 yaml 里的那些。 */
   tools: EffectiveTool[];
 }
 

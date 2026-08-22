@@ -6,7 +6,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   getAllToolNames,
   getEffectiveTools,
+  getNodeRaw,
   getNodes,
+  updateNodeRaw,
   type AdminNode,
   type EffectiveTool,
 } from '../api/supervisorClient';
@@ -55,7 +57,7 @@ beforeEach(() => {
   vi.mocked(getNodes).mockResolvedValue([ORCHESTRATOR, INTENT]);
   vi.mocked(getAllToolNames).mockResolvedValue(REGISTERED);
   vi.mocked(getEffectiveTools).mockResolvedValue({
-    node_id: 'qq.orchestrator', mode: 'allowlist', listed_as: 'allow', tools: EFFECTIVE,
+    node_id: 'qq.orchestrator', mode: 'allowlist', dead_names: ['ghost_tool'], tools: EFFECTIVE,
   });
 });
 
@@ -74,7 +76,7 @@ describe('某个节点授权了哪些工具', () => {
     await screen.findByRole('heading', { name: 'qq.orchestrator' });
 
     const orchestrator = within(nodeRow('qq.orchestrator'));
-    expect(orchestrator.getByText('白名单')).toBeTruthy();
+    expect(orchestrator.getByText('按勾选给')).toBeTruthy();
     expect(orchestrator.getByText('5 个工具')).toBeTruthy();
 
     const intent = within(nodeRow('qq.intent'));
@@ -135,7 +137,7 @@ describe('勾了不等于能用', () => {
     render(<NodeGrantsSection />);
     const item = within(await expand('qq.orchestrator'));
 
-    const note = await item.findByText(/配了但用不了/);
+    const note = await item.findByText(/能调但用不了/);
     expect(note).toHaveTextContent('gemini_image');
     const cell = item.getByText('gemini_image').closest('div') as HTMLElement;
     expect(within(cell).getByText('不可用')).toBeTruthy();
@@ -192,6 +194,83 @@ describe('默认给得有多宽', () => {
     const line = await screen.findByText(/现在拿着/);
     expect(line).toHaveTextContent('manage_secret');
     expect(line).not.toHaveTextContent('remote_exec');
+  });
+});
+
+describe('勾选在两种模式下是同一个意思', () => {
+  // 之前复选框直接绑底层名单：allowlist 绑 allow、all 绑 deny，同一个勾正好相反。
+  // 于是「默认全给 + 全选」= 一个工具都不能用，而界面看着像全开了。
+  const EXECUTOR: AdminNode = {
+    id: 'bootstrap.executor',
+    type: 'ai',
+    tool_access: { mode: 'all', deny: ['execute_command'] },
+  };
+
+  const cellFor = (item: ReturnType<typeof within>, name: string) =>
+    within(item.getByText(name).closest('div') as HTMLElement).getByRole('checkbox');
+
+  beforeEach(() => {
+    vi.mocked(getNodes).mockResolvedValue([EXECUTOR]);
+    vi.mocked(getEffectiveTools).mockResolvedValue({
+      node_id: EXECUTOR.id, mode: 'all', dead_names: [], tools: [],
+    });
+    vi.mocked(getNodeRaw).mockResolvedValue('id: bootstrap.executor\ntool_access:\n  mode: all\n  deny:\n    - execute_command\n');
+    vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true } as never);
+  });
+
+  it('默认全给时，禁用名单里的那个才是没勾的', async () => {
+    render(<NodeGrantsSection />);
+    const item = within(await expand('bootstrap.executor'));
+
+    expect(cellFor(item, 'execute_command')).not.toBeChecked();
+    expect(cellFor(item, 'read_file')).toBeChecked();
+    expect(cellFor(item, 'write_file')).toBeChecked();
+  });
+
+  it('取消勾选就是写进禁用名单', async () => {
+    render(<NodeGrantsSection />);
+    const item = within(await expand('bootstrap.executor'));
+
+    fireEvent.click(cellFor(item, 'read_file'));
+    fireEvent.click(item.getByRole('button', { name: '保存授权' }));
+
+    await vi.waitFor(() => expect(updateNodeRaw).toHaveBeenCalled());
+    const written = vi.mocked(updateNodeRaw).mock.calls[0][2];
+    expect(written).toContain('- execute_command');
+    expect(written).toContain('- read_file');
+  });
+
+  it('「全部可调用」在默认全给下是清空禁用名单，不是禁掉全部', async () => {
+    render(<NodeGrantsSection />);
+    const item = within(await expand('bootstrap.executor'));
+
+    fireEvent.click(item.getByRole('button', { name: '让全部工具可调用' }));
+
+    expect(cellFor(item, 'execute_command')).toBeChecked();
+    expect(item.getByText(/5 个可调用/)).toBeTruthy();
+  });
+
+  it('「全部禁止」才是全关，而且说得出关了几个', async () => {
+    render(<NodeGrantsSection />);
+    const item = within(await expand('bootstrap.executor'));
+
+    fireEvent.click(item.getByRole('button', { name: '禁止全部工具' }));
+
+    expect(cellFor(item, 'read_file')).not.toBeChecked();
+    expect(item.getByText(/0 个可调用/)).toBeTruthy();
+  });
+
+  it('筛选之后批量操作只动筛出来的那些', async () => {
+    // 之前批量按钮直接把整份名单替换成筛选结果，搜一下再点全选，没显示的全没了。
+    render(<NodeGrantsSection />);
+    const item = within(await expand('bootstrap.executor'));
+
+    fireEvent.change(item.getByLabelText('筛选 bootstrap.executor 的工具名'), { target: { value: 'read' } });
+    fireEvent.click(item.getByRole('button', { name: /禁止筛出的 \d+ 个工具/ }));
+    fireEvent.change(item.getByLabelText('筛选 bootstrap.executor 的工具名'), { target: { value: '' } });
+
+    expect(cellFor(item, 'read_file')).not.toBeChecked();
+    expect(cellFor(item, 'write_file')).toBeChecked();
   });
 });
 

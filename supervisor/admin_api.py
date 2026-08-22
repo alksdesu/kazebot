@@ -793,8 +793,9 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         elif not isinstance(ta, dict):
             ta = {}
         mode = str(ta.get("mode") or "none").strip()
-        listed = ta.get("allow") if mode == "allowlist" else ta.get("deny")
-        names = [str(x).strip() for x in (listed or []) if str(x or "").strip()]
+
+        def _names(key: str) -> list[str]:
+            return [str(x).strip() for x in (ta.get(key) or []) if str(x or "").strip()]
 
         external: dict[str, bool] = {}
         for f in iter_external_tool_files(workspace_root / "tools"):
@@ -803,6 +804,20 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 external[spec["name"]] = isinstance(spec.get("guard"), dict)
 
         known = {entry.name for entry in _catalog()}
+
+        # 报的是「这个节点实际能调什么」，两种模式算法不同但答案同质。
+        # 只报 deny 名单的话，最宽的那些节点反而什么注解都看不到。
+        if mode == "allowlist":
+            names = _names("allow")
+            # 白名单里写错的名字注入时静默忽略，那一条从来没生效过。
+            dead = [name for name in names if name not in known]
+        elif mode == "all":
+            denied = set(_names("deny"))
+            names = sorted(known - denied)
+            # 禁令写错的名字更要紧：以为禁掉了，其实那个工具一直开着。
+            dead = sorted(denied - known)
+        else:
+            names, dead = [], []
         try:
             from engine.builtin.image_gen_gating import disabled_image_tools
             gated = disabled_image_tools(workspace_root)
@@ -821,7 +836,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 "guarded": external.get(name) if is_external else None,
                 "gated": "渠道未配置 model，构建工具表时会被摘掉" if name in gated else "",
             })
-        return {"node_id": node_id, "mode": mode, "listed_as": "allow" if mode == "allowlist" else "deny", "tools": rows}
+        return {"node_id": node_id, "mode": mode, "dead_names": dead, "tools": rows}
 
     # ----- Memory -----
     # data/memory 根目录是 conversation_key 缺失时的落点，URL 里没法用空串表示。

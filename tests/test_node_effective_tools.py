@@ -99,7 +99,6 @@ tool_access:
     assert resp.status_code == 200
     body = resp.json()
     assert body["mode"] == "allowlist"
-    assert body["listed_as"] == "allow"
     assert [row["name"] for row in body["tools"]] == ["read_file", "guarded_tool"]
 
 
@@ -143,7 +142,9 @@ tool_access:
     assert rows["loose_tool"]["guarded"] is False
 
 
-def test_reads_the_deny_list_when_the_node_is_wide_open(client, workspace: Path) -> None:
+def test_a_wide_open_node_reports_what_it_can_call_not_what_it_cannot(client, workspace: Path) -> None:
+    # 只注解 deny 名单的话，权限最宽的那些节点在界面上一条警告都看不到 ——
+    # 而「没声明 guard 的外部脚本」正是要在它们身上提醒的。
     _write_node(workspace, "bootstrap.executor", """
 id: bootstrap.executor
 tool_access:
@@ -153,9 +154,43 @@ tool_access:
 """)
 
     body = client("GET", f"{_BASE}/bootstrap.executor/effective-tools", headers=_AUTH).json()
+    names = [row["name"] for row in body["tools"]]
 
-    assert body["listed_as"] == "deny"
-    assert [row["name"] for row in body["tools"]] == ["execute_command"]
+    assert "execute_command" not in names
+    assert "read_file" in names
+    assert {"guarded_tool", "loose_tool"} <= set(names)
+    assert next(r for r in body["tools"] if r["name"] == "loose_tool")["guarded"] is False
+
+
+def test_a_typo_in_the_deny_list_is_called_out(client, workspace: Path) -> None:
+    # 禁令写错等于没禁，而界面上那一行看着和真禁掉了一模一样。
+    _write_node(workspace, "bootstrap.executor", """
+id: bootstrap.executor
+tool_access:
+  mode: all
+  deny:
+    - execute_commnad
+""")
+
+    body = client("GET", f"{_BASE}/bootstrap.executor/effective-tools", headers=_AUTH).json()
+
+    assert body["dead_names"] == ["execute_commnad"]
+    assert "execute_command" in [row["name"] for row in body["tools"]]
+
+
+def test_a_typo_in_the_allowlist_is_called_out_too(client, workspace: Path) -> None:
+    _write_node(workspace, "qq.orchestrator", """
+id: qq.orchestrator
+tool_access:
+  mode: allowlist
+  allow:
+    - read_file
+    - ghost_tool
+""")
+
+    body = client("GET", f"{_BASE}/qq.orchestrator/effective-tools", headers=_AUTH).json()
+
+    assert body["dead_names"] == ["ghost_tool"]
 
 
 def test_accepts_the_string_shorthand(client, workspace: Path) -> None:
