@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import os
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -240,6 +241,35 @@ def resolve_env_ref(text: str, extra: Mapping[str, str] | None = None) -> str:
     if s.startswith("${") and s.endswith("}") and len(s) > 3:
         return _resolve_env_names(s[2:-1], extra)
     return s
+
+
+def wait_supervisor(
+    base_url: str,
+    *,
+    label: str,
+    health_timeout_sec: float = 2.0,
+    poll_interval_sec: float = 0.5,
+    max_wait_sec: float = 0.0,
+) -> bool:
+    """轮询 /v1/health 直到 supervisor 应答。max_wait_sec 为 0 表示一直等。
+
+    返回是否等到。等不到也让调用方自己决定要不要继续，卡死在这里更难排查。
+    """
+    url = f"{base_url.rstrip('/')}/v1/health"
+    print(f"[{label}] waiting for supervisor: {base_url}", flush=True)
+    deadline = (time.monotonic() + max_wait_sec) if max_wait_sec > 0 else 0.0
+    with httpx.Client() as client:
+        while True:
+            try:
+                if client.get(url, timeout=health_timeout_sec).status_code == 200:
+                    print(f"[{label}] supervisor connected", flush=True)
+                    return True
+            except Exception:
+                pass
+            if deadline and time.monotonic() >= deadline:
+                print(f"[{label}] supervisor still down after {max_wait_sec:.0f}s, going ahead", flush=True)
+                return False
+            time.sleep(poll_interval_sec)
 
 
 async def fetch_openai_secret(http: httpx.AsyncClient, supervisor_url: str) -> dict[str, Any]:

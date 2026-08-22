@@ -24,6 +24,9 @@ load_dotenv(_LOCAL_ENV if _LOCAL_ENV.is_file() else _REPO_ROOT / ".env")
 import nonebot
 from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 
+# supervisor 冷启动约需半分钟，留足余量；等不到也照常起，卡死更难查。
+_SUPERVISOR_WAIT_SEC = 180.0
+
 
 def _bridge_stdlib_logging() -> None:
     """把插件与 SDK 的标准 logging 接到 loguru。
@@ -42,6 +45,16 @@ def _bridge_stdlib_logging() -> None:
 
 
 def main() -> None:
+    # 仓库内的模块延迟到这里再取：本文件会被单独复制出去做入口冒烟，import 期
+    # 要求整个仓库在位就跑不起来。
+    from adapters.onebot.config import CLONOTH_BASE_URL
+    from clonoth_runtime import wait_supervisor
+
+    # 先等 supervisor。systemd 的 After/BindsTo 只排启动顺序，不等它 ready，而
+    # NoneBot 一 run 起来就开始收 QQ 消息 —— 那十几秒里的 submit inbound 全部失败，
+    # 每次重启都静默吞掉几条群消息。
+    wait_supervisor(CLONOTH_BASE_URL, label="qq", max_wait_sec=_SUPERVISOR_WAIT_SEC)
+
     nonebot.init()
     _bridge_stdlib_logging()
     driver = nonebot.get_driver()

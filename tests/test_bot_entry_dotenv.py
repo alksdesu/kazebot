@@ -92,6 +92,15 @@ def test_env_file_found_by_file_location_not_cwd(tmp_path: Path) -> None:
     assert seen["CLONOTH_ADMIN_QQ_USERS"] == "111222333"
 
 
+def test_cwd_env_file_wins_over_the_one_beside_the_entry(tmp_path: Path) -> None:
+    # 多开时几个号共用一份代码，端口与工作区只能靠各自 cwd 下那份 .env 区分。
+    here = tmp_path / "instance"
+    here.mkdir()
+    (here / ".env").write_text("CLONOTH_ADMIN_QQ_USERS=444555666", encoding="utf-8")
+    seen = _run(tmp_path, ["CLONOTH_ADMIN_QQ_USERS=111222333"], cwd=here)
+    assert seen["CLONOTH_ADMIN_QQ_USERS"] == "444555666"
+
+
 def test_real_environment_wins_over_env_file(tmp_path: Path) -> None:
     # systemd Environment= 和 docker -e 是部署时的显式覆盖，.env 不能把它盖回去。
     seen = _run(

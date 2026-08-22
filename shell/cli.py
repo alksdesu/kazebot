@@ -11,26 +11,14 @@ from typing import Any
 
 import httpx
 
-from clonoth_runtime import admin_auth_headers, get_float, load_runtime_config, strip_tool_trace_blocks
+from clonoth_runtime import (
+    admin_auth_headers,
+    get_float,
+    load_runtime_config,
+    strip_tool_trace_blocks,
+    wait_supervisor,
+)
 from workspace import resolve_workspace_root
-
-
-def wait_supervisor(
-    client: httpx.Client,
-    base_url: str,
-    *,
-    health_timeout_sec: float = 2.0,
-    poll_interval_sec: float = 0.5,
-) -> None:
-    print(f"[shell-cli] waiting for supervisor: {base_url}", flush=True)
-    while True:
-        try:
-            r = client.get(f"{base_url}/v1/health", timeout=health_timeout_sec)
-            if r.status_code == 200:
-                return
-        except Exception:
-            pass
-        time.sleep(poll_interval_sec)
 
 
 def _print_outbound(text: str) -> None:
@@ -241,8 +229,8 @@ def main() -> None:
         headers=admin_auth_headers(workspace_root),
     ) as client:
         wait_supervisor(
-            client,
             base_url,
+            label="shell-cli",
             health_timeout_sec=health_timeout_sec,
             poll_interval_sec=wait_poll_interval_sec,
         )
