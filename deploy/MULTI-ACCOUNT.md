@@ -91,7 +91,7 @@ supervisor 跑在 `kazebot` 下，`ProtectSystem=strict` + `NoNewPrivileges=yes`
 
 会话上下文、长期记忆、人物画像、渠道密钥、人格、群白名单、附件全部各自一份。
 
-**表情包库是唯一共享的数据**：图片和索引都在 `/opt/kazebot-data/stickers/`，各工作区的 `data/stickers` 是指向它的软链。一个号在群里攒到的表情包，其它号立刻能用；谁丢弃的图，谁都不会再收第二次。
+**表情包库是唯一共享的数据**：图片和索引都在 `/opt/kazebot-data/stickers/`，各工作区的 `data/stickers` 是指向它的软链。一个号在群里攒到的表情包，其它号立刻能用；谁丢弃的图，谁都不会再收第二次。用法见 [STICKERS.md](STICKERS.md)。
 
 之所以做成软链而不是配一个绝对路径：附件白名单（`engine/attachments.py`）只认工作区内的 `data/` 前缀，库放在工作区外就发不出去。
 
