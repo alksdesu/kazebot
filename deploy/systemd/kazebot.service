@@ -1,0 +1,33 @@
+[Unit]
+Description=Kazebot Supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kazebot
+Group=kazebot
+WorkingDirectory=/opt/kazebot
+ExecStart=/opt/kazebot/.venv/bin/python main.py
+Restart=always
+RestartSec=3
+# main.py 内部循环处理退出码 75；98 是端口被占，重启无意义，停住等人
+SuccessExitStatus=75
+RestartPreventExitStatus=98
+KillMode=mixed
+TimeoutStopSec=30
+
+# Agent 能执行任意命令，所以边界靠内核而不是正则黑名单
+ProtectSystem=strict
+ReadWritePaths=/opt/kazebot
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target

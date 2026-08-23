@@ -28,7 +28,7 @@ pip install nonebot2 nonebot-adapter-onebot httpx
 
 运营期配置已经搬到 `config/qq.yaml`（声明表在 `live_config.py` 的 `LIVE_KEYS`），改完即时生效。
 取值优先级 **`qq.yaml` > env > 内置默认**：下表标了热载键的四项，只要 yaml 里写了就不看 env。
-完整清单见 `config/qq.example.yaml` 与 `docs/DEPLOY-QQ.md` §6。
+完整清单见 `config/qq.example.yaml`。
 
 | 变量名 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
