@@ -1,6 +1,7 @@
-"""表情包的本地粗排。
+"""接梗时的本地选图。
 
-两条要紧的：闲聊时必须压分（宁可不发也不要乱发），刚发过的必须排除（同一张反复刷最像机器人）。
+这条路没有模型把关，只能拿群里最近的文本去猜，所以两条都要紧：语境不明时必须弃权
+（generic），刚发过的必须排除（同一张反复刷最像机器人）。模型自己发图不经过这里。
 """
 from __future__ import annotations
 
@@ -191,22 +192,3 @@ def test_zero_limit_yields_nothing() -> None:
 def test_empty_library_is_handled() -> None:
     result = sr.rank("开心", [])
     assert result.items == [] and result.best is None
-
-
-# ── 给模型看的候选行 ──
-
-def test_prompt_lines_carry_tags() -> None:
-    result = sr.rank("开心", [_item("甲", ["开心", "猫"])])
-    line = sr.prompt_lines(result)[0]
-    assert "甲" in line and "开心" in line
-
-
-def test_prompt_lines_handle_untagged_items() -> None:
-    result = sr.rank("甲", [_item("甲", [])])
-    assert sr.prompt_lines(result) == ["甲（无标签）"]
-
-
-def test_prompt_lines_cap_tag_count() -> None:
-    # 候选行会乘以 N 张图进提示词，标签不截断就是 token 炸弹。
-    result = sr.rank("开心", [_item("甲", [f"标签{i}" for i in range(20)] + ["开心"])])
-    assert sr.prompt_lines(result)[0].count("、") <= 5

@@ -468,6 +468,11 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         note="把群里的表情包攒进图库",
     ),
     LiveKey(
+        "sticker_auto_tag", "extensions.sticker.auto_tag", BOOL, True,
+        env=("ONEBOT_STICKER_AUTO_TAG",),
+        note="收进来的图自动打标签。关掉就不再花看图渠道的钱，但没标签的图检索不到",
+    ),
+    LiveKey(
         "sticker_strategy", "extensions.sticker.strategy", PLAIN_STR, "loose",
         env=("ONEBOT_STICKER_STRATEGY",),
         note="收多严：strict 只收 QQ 标了表情包的，loose 再放行看着不像截图的，none 全收",
@@ -498,9 +503,15 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         note="待审池里放这么多天还没人管就丢掉",
     ),
     LiveKey(
-        "sticker_prompt_limit", "extensions.sticker.prompt_limit", int_in(min_value=0, max_value=60), 12,
+        "sticker_send_probability", "extensions.sticker.send_probability",
+        float_in(min_value=0.0, max_value=1.0), 0.2,
+        env=("ONEBOT_STICKER_SEND_PROBABILITY",),
+        note="每轮多大概率把表情包清单给模型看。0 表示从不发；给了它也可以不发",
+    ),
+    LiveKey(
+        "sticker_prompt_limit", "extensions.sticker.prompt_limit", int_in(min_value=0, max_value=200), 60,
         env=("ONEBOT_STICKER_PROMPT_LIMIT",),
-        note="每轮给模型看几张候选。给多了是 token 炸弹，给少了挑不出合适的",
+        note="清单最多列几张。库比这个大就只列发得最少的那些，轮着上",
     ),
     LiveKey(
         "sticker_repeat_window_sec", "extensions.sticker.repeat_window_sec",

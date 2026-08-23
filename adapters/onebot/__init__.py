@@ -156,7 +156,7 @@ from .emoji_handler import (
 from stickers.collect import CollectConfig, StickerCollector, any_marked_segment
 from stickers.combat import CombatConfig, CombatTracker
 from stickers.collect import store_path as sticker_store_path
-from stickers.rank import prompt_lines, rank
+from stickers.rank import rank
 from stickers.store import STATE_LIBRARY, STATE_PENDING, StickerStore
 from stickers.tagger import StickerTagger, TaggerConfig
 
@@ -2515,6 +2515,14 @@ async def _resolve_sticker(name: str) -> str:
         return ""
     try:
         row = store.by_name(name)
+        if row is None:
+            # 名单里没有中意的时，模型会直接写想表达的情绪。拿这个词去标签里找 ——
+            # 这一跳的检索词是它自己挑的，比拿群友那句话去猜要准。
+            key = _sticker_send_conversation.get("")
+            skip = store.recently_sent(
+                key, within_sec=int(live.sticker_repeat_window_sec),
+            ) if key else set()
+            row = store.by_tag(name, exclude=skip)
         if row is None or not row.usable or not row.rel_path:
             return ""
         raw = await asyncio.to_thread((Path(CLONOTH_WORKSPACE) / row.rel_path).read_bytes)
@@ -2633,12 +2641,15 @@ async def _pick_combat_sticker(context_text: str, conversation_key: str) -> str:
 
 
 def _start_sticker_tagger() -> None:
-    """图库没启用也照跑：手动传的图同样要打标，只是平时没活会一直空转睡着。"""
+    """图库没启用也照跑：手动传的图同样要打标，只是平时没活会一直空转睡着。
+
+    每轮循环都重新读一次开关，所以关掉之后正在跑的这一批做完就停，不用重启。
+    """
     global _sticker_tagger
     if _sticker_tagger is None:
         _sticker_tagger = StickerTagger(
             Path(CLONOTH_WORKSPACE),
-            config=TaggerConfig,
+            config=lambda: TaggerConfig(enabled=bool(live.sticker_auto_tag)),
             open_store=_sticker_store_handle,
         )
     _sticker_tagger.start()
@@ -2657,52 +2668,59 @@ async def _stop_stickers() -> None:
         _sticker_store = None
 
 
-def _sticker_prompt_entries(text: str, conversation_key: str) -> list[str]:
-    """按当前语境粗排出的图库候选。
+def _sticker_prompt_entries(conversation_key: str) -> list[str]:
+    """这一轮摆给模型看的表情包清单。
 
-    不像收藏表情那样把名字全量塞进去 —— 图库会长到几百张，全给等于 token 炸弹，
-    而且模型在几百个名字里也挑不准。
+    不按群友那句话预筛。表情包配的是 bot 自己要回的语气，而候选是在模型开口之前
+    就得定下来的 —— 拿对方说的话去筛，筛出来的情绪往往正好是反的。清单直接摊开，
+    让唯一同时知道「对方说了什么」和「我要回什么」的角色去挑。
     """
     limit = int(live.sticker_prompt_limit)
-    if limit <= 0 or not text.strip():
+    if limit <= 0 or random.random() >= float(live.sticker_send_probability):
         return []
     store = _sticker_store_handle()
     if store is None:
         return []
     try:
-        usable = store.all_usable()
-        if not usable:
-            return []
         recent = store.recently_sent(
             conversation_key, within_sec=int(live.sticker_repeat_window_sec),
         )
-        return prompt_lines(rank(text, usable, recently_sent=recent, limit=limit))
+        usable = [row for row in store.all_usable() if row.sha256 not in recent]
+        # 装不下就让发得最少的先上，轮着来；否则冷门图永远排在字典序后面没人见过。
+        usable.sort(key=lambda row: (row.sent_count, row.name))
+        return [
+            f"{row.name}（{'、'.join(row.tags[:8]) or '无标签'}）"
+            for row in usable[:limit]
+        ]
     except Exception:
-        logger.debug("表情包检索失败", exc_info=True)
+        logger.debug("表情包清单读取失败", exc_info=True)
         return []
 
 
-def _custom_face_prompt_block(context_text: str = "", conversation_key: str = "") -> str:
-    """构造注入给 AI 的表情使用说明。收藏表情按名单给全，图库按语境挑几张。"""
+def _custom_face_prompt_block(conversation_key: str = "") -> str:
+    """构造注入给 AI 的表情使用说明。收藏表情按名单给全，表情包这一轮抽中了才给。"""
     current_names = _current_custom_face_names()
     faces = current_names[:live.face_prompt_limit] if live.face_prompt_limit > 0 else []
-    stickers = _sticker_prompt_entries(context_text, conversation_key)
+    stickers = _sticker_prompt_entries(conversation_key)
     if not faces and not stickers:
         return ""
 
-    lines = [
-        "【可用表情】",
-        "你可以在回复中用 [表情:名称] 发送表情。只使用下列名称，不要臆造未列出的。",
-    ]
+    lines = ["【可用表情】", "在回复里写 [表情:名称] 就能发。"]
     if faces:
         more = (
             "" if len(current_names) <= live.face_prompt_limit
             else f"（另有 {len(current_names) - live.face_prompt_limit} 个未展示）"
         )
-        lines.append(f"收藏表情：{'、'.join(faces)}{more}")
+        lines.append(f"收藏表情（只能用这些名字）：{'、'.join(faces)}{more}")
     if stickers:
-        # 带上标签，模型才判断得出哪张跟当前语境搭。
         lines.append("表情包（括号里是它的标签）：" + "；".join(stickers))
+        lines.extend([
+            "配不配表情包你自己定，不合适就别写 —— 每句话都配图很烦人。",
+            "只想甩一张图不说话时，整条回复就写一个 [表情:名称]，别硬凑话。",
+            # 名单外的词照样能用：模型想表达的情绪未必对得上某张图的名字，
+            # 但多半对得上它的某个标签。查不到的标记会被丢掉，不会漏成文字。
+            "名单里挑不出想要的，也可以直接写想表达的情绪，比如 [表情:无语]，会去标签里找。",
+        ])
     return "\n".join(lines)
 
 
@@ -5666,8 +5684,7 @@ async def _build_inbound_text(
         attachments.extend(quoted_attachments)
     if reply_context:
         parts.extend(["", "【当前消息引用】", reply_context])
-    # 拿当前这句话去检索，不用整段群历史：历史里的情绪早过去了，按它挑图会驴唇不对马嘴。
-    custom_face_prompt = _custom_face_prompt_block(user_text, conversation_key)
+    custom_face_prompt = _custom_face_prompt_block(conversation_key)
     if custom_face_prompt:
         parts.extend(["", custom_face_prompt])
     reaction_prompt = _reaction_prompt_block()
@@ -5734,7 +5751,7 @@ async def _build_private_inbound_text(event: PrivateMessageEvent, bot: Bot, user
         attachments.extend(quoted_attachments)
     if reply_context:
         parts.extend(["", "【当前消息引用】", reply_context])
-    custom_face_prompt = _custom_face_prompt_block(text, conversation_key)
+    custom_face_prompt = _custom_face_prompt_block(conversation_key)
     if custom_face_prompt:
         parts.extend(["", custom_face_prompt])
     parts.extend([

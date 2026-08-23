@@ -1,6 +1,7 @@
-"""表情包检索的本地粗排。
+"""接梗时的本地选图。
 
-拿标签去正文里找，不切查询词 —— 中文没有空格，剔停用词会把含停用词子串的实词切碎。
+群里连着刷图时系统自己跟一张，那条路没有模型参与，只能拿群里最近的文本去猜。
+模型自己发图不走这里 —— 它看得到清单，用不着猜。
 零平台依赖，可脱 NoneBot 单测。
 """
 from __future__ import annotations
@@ -218,11 +219,3 @@ def rank(
             for row in scored
         ]
     return RankResult(scored[: max(int(limit), 0)], generic, intents)
-
-
-def prompt_lines(result: RankResult) -> list[str]:
-    """给模型看的候选行。带上标签，模型才判断得出语境合不合。"""
-    return [
-        f"{row.name}（{('、'.join(row.tags[:6])) or '无标签'}）"
-        for row in result.items
-    ]

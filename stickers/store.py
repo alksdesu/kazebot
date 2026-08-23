@@ -14,7 +14,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Collection, Iterator, Sequence
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
@@ -300,6 +300,30 @@ class StickerStore:
             (str(name or "").strip(), STATE_LIBRARY),
         )
         return _row_to_sticker(row) if row else None
+
+    def by_tag(self, word: str, *, exclude: Collection[str] = ()) -> Sticker | None:
+        """按描述词取一张。模型没照抄名单里的名字、自己写了个词时走这里。
+
+        精确等于某个标签的优先于只是被标签包含的：写「大笑」时不该输给「大笑不止」。
+        同一档里发得最少的先出场，让冷门的有机会。
+        """
+        wanted = str(word or "").strip().lower()
+        if not wanted:
+            return None
+        exact: list[Sticker] = []
+        loose: list[Sticker] = []
+        for row in self.all_usable():
+            if row.sha256 in exclude:
+                continue
+            tags = [str(tag).strip().lower() for tag in row.tags if str(tag).strip()]
+            if wanted in tags:
+                exact.append(row)
+            elif any(wanted in tag for tag in tags):
+                loose.append(row)
+        pool = exact or loose
+        if not pool:
+            return None
+        return min(pool, key=lambda row: (row.sent_count, row.name))
 
     def accept(self, sha256: str, *, rel_path: str = "") -> bool:
         """待审转在库。rel_path 非空表示文件同时搬了家。"""

@@ -436,9 +436,22 @@ const CollectBlock = () => (
         <NumberField configKey="sticker_pending_ttl_days" label="待审保留" unit="天" />
       </Fixed>
 
+      <BoolOption
+        configKey="sticker_auto_tag"
+        desc="收进来的图自动送去看图渠道打标签。关掉就不再产生这笔开销，但没标签的图检索不到，也就发不出去。"
+        fallback
+        label="自动打标签"
+      />
+
       <Fixed name="发图">
-        <Desc>候选给多了是 token 炸弹，给少了模型挑不出合适的。</Desc>
-        <NumberField configKey="sticker_prompt_limit" label="每轮候选" unit="张" />
+        <Desc>清单按概率整份摊给模型，发不发、发哪张由它自己定。库比上限大就先给发得最少的。</Desc>
+        <NumberField
+          configKey="sticker_send_probability"
+          label="每轮出现概率"
+          max={1}
+          step={0.05}
+        />
+        <NumberField configKey="sticker_prompt_limit" label="最多列出" unit="张" />
         <NumberField configKey="sticker_repeat_window_sec" label="同图间隔" step={60} unit="秒" />
       </Fixed>
 

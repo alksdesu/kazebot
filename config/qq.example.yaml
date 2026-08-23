@@ -162,10 +162,12 @@ extensions:
     strategy: loose
     groups: []              # 只从这些群收，留空表示所有已授权的群
     auto_accept: false      # 收到就直接入库，跳过人工筛选
+    auto_tag: true          # 自动打标签。关掉不再花看图渠道的钱，但没标签的图检索不到
     pending_limit: 200      # 待审池上限，满了不再收新的
     library_limit: 1000     # 图库上限，超出时最旧的先出局
     pending_ttl_days: 7     # 待审池里放这么多天没人管就丢掉
-    prompt_limit: 12        # 每轮给模型看几张候选，给多了是 token 炸弹
+    send_probability: 0.2   # 每轮多大概率把清单摊给模型，0 表示从不发
+    prompt_limit: 60        # 清单最多列几张，库更大就先给发得最少的
     repeat_window_sec: 1800 # 同一会话这段时间内发过的图不再发
     # 群里连着刷图时跟着接一张。要求连图来自至少两个人，中间夹了纯文本就不算。
     combat: false
