@@ -208,3 +208,35 @@ class TestAutoTag:
 class _Stub:
     def start(self) -> None:
         return None
+
+
+class TestRosterLayout:
+    """一行一张。挤成一行时，标签自带顿号或名字带括号就分不清归属了。"""
+
+    def test_每张图各占一行(
+        self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _add(store, "甲", ["大笑", "猫"])
+        _add(store, "乙", ["无语"])
+        set_live_config(runtime, sticker_send_probability=1.0)
+        _always(runtime, monkeypatch, True)
+
+        block = runtime._custom_face_prompt_block(_CONV)
+        rows = [line.strip() for line in block.splitlines() if line.startswith("  ")]
+
+        # 顺序另有规则（发得少的在前），这里只认「一张一行、标签不串行」。
+        assert sorted(rows) == sorted(["甲（大笑、猫）", "乙（无语）"])
+
+    def test_标签自带顿号也不会串到别张图上(
+        self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 打标模型偶尔会把两个标签合成一个，normalize_tags 只 strip 首尾不拆中间。
+        _add(store, "甲", ["开心、快乐"])
+        _add(store, "乙", ["无语"])
+        set_live_config(runtime, sticker_send_probability=1.0)
+        _always(runtime, monkeypatch, True)
+
+        block = runtime._custom_face_prompt_block(_CONV)
+
+        assert "  甲（开心、快乐）" in block
+        assert "  乙（无语）" in block

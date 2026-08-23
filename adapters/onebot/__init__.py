@@ -2713,7 +2713,10 @@ def _custom_face_prompt_block(conversation_key: str = "") -> str:
         )
         lines.append(f"收藏表情（只能用这些名字）：{'、'.join(faces)}{more}")
     if stickers:
-        lines.append("表情包（括号里是它的标签）：" + "；".join(stickers))
+        lines.append("表情包，一行一张，括号里是它的标签：")
+        # 一行一张。挤成一行靠顿号分隔的话，标签自己带顿号（normalize_tags 只 strip
+        # 首尾）或者名字带括号时，就分不清哪组标签属于哪张图了。
+        lines.extend(f"  {entry}" for entry in stickers)
         lines.extend([
             "配不配表情包你自己定，不合适就别写 —— 每句话都配图很烦人。",
             "只想甩一张图不说话时，整条回复就写一个 [表情:名称]，别硬凑话。",
