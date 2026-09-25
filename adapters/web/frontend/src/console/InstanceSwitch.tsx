@@ -1,19 +1,14 @@
 // 账号切换器。多开时几个号各是一套独立后端，共用域名、各挂一个路径前缀。
-import { useEffect, useState } from 'react';
+import type { ComponentProps } from 'react';
 
-import { getInstances, instanceConsoleHref, MOUNT, type ConsoleInstance } from '../api/supervisorClient';
-import { useSettingsStore } from '../store/settingsStore';
-import { Select } from './components';
+import { instanceConsoleHref, MOUNT, type ConsoleInstance } from '../api/supervisorClient';
+import { LinkButton, Select } from './components';
 
-export const InstanceSwitch = () => {
-  const token = useSettingsStore((state) => state.adminToken);
-  const [rows, setRows] = useState<ConsoleInstance[]>([]);
+export const InstanceLink = ({ path, ...props }: Omit<ComponentProps<typeof LinkButton>, 'href'> & { path: string }) => (
+  <LinkButton {...props} href={instanceConsoleHref(path)} />
+);
 
-  useEffect(() => {
-    if (!token) return;
-    void getInstances(token).then(setRows).catch(() => setRows([]));
-  }, [token]);
-
+export const InstanceSwitch = ({ rows }: { rows: ConsoleInstance[] }) => {
   // 单实例部署无处可切，清单读不到时同理：不显示好过显示一个点不动的下拉。
   if (rows.length < 2) return null;
 
@@ -21,14 +16,16 @@ export const InstanceSwitch = () => {
   const current = rows.find((row) => row.current)?.path ?? MOUNT;
 
   const go = (path: string) => {
-    if (path !== current) window.location.assign(instanceConsoleHref(path));
+    if (path !== current && rows.some(row => row.path === path)) {
+      window.location.assign(instanceConsoleHref(path));
+    }
   };
 
   return (
     <label className="flex items-center gap-2.5">
-      <span className="flex-none text-xs text-[var(--duties-secondary)]">当前账号</span>
+      <span className="flex-none text-xs text-[var(--duties-secondary)]">当前实例</span>
       <Select
-        aria-label="切换账号"
+        aria-label="切换实例"
         onChange={(event) => go(event.target.value)}
         value={current}
         width="alias"

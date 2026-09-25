@@ -35,6 +35,8 @@ _QUERY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_AUTH_SCHEME_PATTERN = re.compile(r"\b((?:Bearer|Basic)\s+)([^\s'\",;]+)", re.IGNORECASE)
+
 
 def _mask(value: str) -> str:
     if len(value) <= _KEEP_TAIL:
@@ -44,6 +46,7 @@ def _mask(value: str) -> str:
 
 def redact(text: str) -> str:
     """把看得出是密钥的东西打码。宁可多打，看日志的人不需要那几位。"""
+    text = _AUTH_SCHEME_PATTERN.sub(lambda match: match.group(1) + _mask(match.group(2)), text)
     for pattern in _TOKEN_PATTERNS:
         text = pattern.sub(lambda m: _mask(m.group(1)), text)
     text = _ASSIGN_PATTERN.sub(lambda m: m.group(1) + m.group(2) + _mask(m.group(3)), text)

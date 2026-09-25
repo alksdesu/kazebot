@@ -13,6 +13,11 @@ import httpx
 import yaml
 
 
+def qq_config_path(workspace_root: Path) -> Path:
+    override = os.environ.get("CLONOTH_QQ_CONFIG_PATH", "").strip()
+    return Path(override) if override else Path(workspace_root) / "config" / "qq.yaml"
+
+
 DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "version": 1,
     "engine": {

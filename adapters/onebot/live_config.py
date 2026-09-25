@@ -676,10 +676,8 @@ DERIVED_NAMES: tuple[str, ...] = ("trigger_prefixes_strippable", "group_trigger_
 
 def config_path() -> Path:
     """config/qq.yaml 的位置。env 覆盖只为测试与非常规部署留口子。"""
-    override = os.environ.get("CLONOTH_QQ_CONFIG_PATH", "").strip()
-    if override:
-        return Path(override)
-    return Path(CLONOTH_WORKSPACE) / "config" / "qq.yaml"
+    from clonoth_runtime import qq_config_path
+    return qq_config_path(Path(CLONOTH_WORKSPACE))
 
 
 @dataclass
@@ -851,9 +849,14 @@ def save(document: Mapping[str, Any]) -> Mapping[str, Any]:
     text = yaml.safe_dump(dict(document), allow_unicode=True, sort_keys=False)
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    from engine.eventlog_rotation import eventlog_file_lock
+    with eventlog_file_lock(path):
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
     invalidate()
     # 解开调用方自己钉住的快照：保存完立刻读到旧值会被当成「没生效」。
     _SNAPSHOT.set(None)

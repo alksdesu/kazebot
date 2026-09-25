@@ -1,5 +1,6 @@
 // QQ 域各页在设置侧栏里的登记项。页面本体只写内容，外壳与生效状态条由 QqPage 统一给。
 import { AccountPage } from './AccountPage';
+import { DiagnosticsPanel } from '../features/operations/DiagnosticsPanel';
 import { ChannelsPage } from './ChannelsPage';
 import { QqPage } from './components';
 import { MemoryPage } from './MemoryPage';
@@ -18,6 +19,7 @@ export interface QqPageDefinition {
   icon: string;
   note: string;
   Page: () => JSX.Element;
+  AlwaysPanel?: () => JSX.Element;
   /** 写的不是 qq.yaml。bot 没跑也该能改，不等它公布生效配置。 */
   standalone?: boolean;
 }
@@ -79,6 +81,7 @@ export const QQ_PAGES: QqPageDefinition[] = [
     label: '链路',
     icon: 'lan',
     Page: RuntimePage,
+    AlwaysPanel: DiagnosticsPanel,
     note: '进程与链路的实况，以及几个改完立刻重建运行期对象的参数。',
   },
   {
@@ -100,9 +103,9 @@ export const QQ_PAGES: QqPageDefinition[] = [
 ];
 
 /** 把域页包进共同外壳。settingsTabs 注册的是包装后的组件。 */
-export function wrapQqPage({ label, note, Page, standalone }: QqPageDefinition): () => JSX.Element {
+export function wrapQqPage({ label, note, Page, AlwaysPanel, standalone }: QqPageDefinition): () => JSX.Element {
   const Wrapped = () => (
-    <QqPage note={note} standalone={standalone} title={label}>
+    <QqPage note={note} standalone={standalone} title={label} alwaysContent={AlwaysPanel ? <AlwaysPanel /> : undefined}>
       <Page />
     </QqPage>
   );

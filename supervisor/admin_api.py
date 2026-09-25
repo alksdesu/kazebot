@@ -14,6 +14,8 @@ import yaml
 from fastapi import APIRouter, Depends, HTTPException, Body, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from engine.eventlog_rotation import eventlog_file_lock
+from clonoth_runtime import qq_config_path
 
 from . import qq_trigger
 from .tool_catalog import ToolEntry, tool_catalog, tool_names
@@ -514,7 +516,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     # 只管文件；「实际生效值」由 bot 进程写 data/qq_live_state.json 公布。supervisor 不
     # 自己算生效值 —— bot 是独立进程，env 可能和这里不一样，算出来的会是另一份配置。
     def _qq_config_path() -> Path:
-        return workspace_root / "config" / "qq.yaml"
+        return qq_config_path(workspace_root)
 
     def _qq_live_state() -> dict[str, Any]:
         p = workspace_root / "data" / "qq_live_state.json"
@@ -569,9 +571,13 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         p = _qq_config_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         # 同目录 tmp + replace：bot 进程随时在读，读到半截 yaml 等于整份配置塌掉。
-        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
-        tmp.write_text(payload.content, encoding="utf-8")
-        os.replace(tmp, p)
+        with eventlog_file_lock(p):
+            tmp = p.with_name(f"{p.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+            try:
+                tmp.write_text(payload.content, encoding="utf-8")
+                os.replace(tmp, p)
+            finally:
+                tmp.unlink(missing_ok=True)
         return {"ok": True, "warnings": warnings}
 
     @router.get("/qq/state")
