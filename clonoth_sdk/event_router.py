@@ -135,7 +135,7 @@ class EventRouter:
         if not store_path.is_absolute():
             store_path = Path(config.workspace_root or Path.cwd()) / store_path
         self._outbound_store = OutboundStore(store_path)
-        self._after_seq = self._outbound_store.processed_seq
+        self._after_seq = self._outbound_store.received_seq or 0
         self._outbound_inflight: set[str] = set()
         self._outbound_owner = f"router:{uuid.uuid4().hex}"
         self._outbound_retry_wakeup = asyncio.Event()
@@ -218,12 +218,14 @@ class EventRouter:
         """Pass formal context while preserving adapters with old signatures."""
         callback = getattr(self._cb, method_name)
         signature = inspect.signature(callback)
-        accepts_context = "delivery_context" in signature.parameters or any(
+        accepts_keywords = any(
             parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in signature.parameters.values()
         )
-        if accepts_context:
+        if "delivery_context" in signature.parameters or accepts_keywords:
             kwargs["delivery_context"] = delivery_context
+        if "is_final" not in signature.parameters and not accepts_keywords:
+            kwargs.pop("is_final", None)
         return await callback(*args, **kwargs)
 
     async def run(self) -> None:
@@ -278,19 +280,29 @@ class EventRouter:
         # the old poll loop.
         sweep_task = asyncio.create_task(self._run_ws_sweep_loop())
         try:
-            async for raw_event in self._client.ws_connect(last_seq=self._after_seq):
+            async for raw_event in self._client.ws_connect(last_seq=self._outbound_store.received_seq):
                 if not self._running:
                     break
                 if raw_event.get("type") == "ping":
                     continue
+                if raw_event.get("type") == "outbound_replay_gap":
+                    logger.error(
+                        "Outbound recovery exceeds retained logs: requested_after=%s oldest_retained=%s",
+                        raw_event.get("after_seq"), raw_event.get("oldest_seq"),
+                    )
+                    continue
+                if raw_event.get("type") == "outbound_checkpoint":
+                    seq = int(raw_event["seq"])
+                    self._outbound_store.advance_received_seq(seq)
+                    self._after_seq = max(self._after_seq, seq)
+                    continue
                 event = Event.from_dict(raw_event)
                 accepted = await self._dispatch(event)
-                # Runtime receive cursor may advance after local outbox acceptance.
-                # A persistence failure deliberately leaves it unchanged. The
-                # durable processing cursor advances only on successful outbound
-                # delivery in OutboundStore.acknowledge().
-                if accepted:
-                    self._after_seq = max(self._after_seq, event.seq)
+                if not accepted:
+                    raise OSError(f"event receipt was not persisted: seq={event.seq}")
+                if event.type in {"outbound_message", "intermediate_reply"}:
+                    self._outbound_store.advance_received_seq(event.seq)
+                self._after_seq = max(self._after_seq, event.seq)
             if self._running:
                 raise ConnectionError("WebSocket stream ended")
         finally:
@@ -400,8 +412,12 @@ class EventRouter:
     async def _dispatch_durable_outbound(self, event: Event) -> bool:
         """Persist/deliver one outbound and report whether local receipt is safe."""
         try:
+            delivery = self._outbound_delivery_metadata(event)
+            route = str(delivery.get("conversation_key") or "")
+            if route and not self._adapter_owns_conversation_key(route):
+                return True
             record = self._outbound_store.enqueue(
-                event, delivery=self._outbound_delivery_metadata(event),
+                event, delivery=delivery,
             )
         except Exception as exc:
             # Never invoke a platform send if the recovery record could not be
@@ -508,7 +524,6 @@ class EventRouter:
                     event, record.delivery, delivery_context=delivery_context,
                 )
             self._outbound_store.acknowledge(record, owner=self._outbound_owner)
-            self._after_seq = max(self._after_seq, record.seq)
             self._maybe_prune_outbound_sent()
             logger.info(
                 "outbound_delivery_succeeded",
@@ -1026,7 +1041,7 @@ class EventRouter:
                 if attachments:
                     await self._invoke_callback(
                         "send_to_channel", trigger.conversation_key, text, attachments,
-                        node_id=node_id,
+                        node_id=node_id, is_final=False,
                         delivery_context=replace(
                             context, conversation_key=trigger.conversation_key,
                         ),
@@ -1046,7 +1061,7 @@ class EventRouter:
             return
         await self._invoke_callback(
             "send_to_channel", conv_key, text, attachments,
-            node_id=node_id, delivery_context=context,
+            node_id=node_id, is_final=False, delivery_context=context,
         )
 
         # Mark child progress only after the user-visible send succeeds. Retries do

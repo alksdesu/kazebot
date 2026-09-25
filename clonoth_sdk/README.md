@@ -1,6 +1,6 @@
 # Clonoth SDK
 
-Pure protocol layer that encapsulates all communication between a Bot adapter and the Clonoth Supervisor. The SDK handles HTTP API calls, event polling, protocol state management, and approval logic — so adapters only need to implement platform-specific operations (sending messages, editing UI, etc.).
+Pure protocol layer that encapsulates all communication between a Bot adapter and the Clonoth Supervisor. The SDK handles HTTP API calls, WebSocket events, protocol state management, and approval logic — so adapters only need to implement platform-specific operations (sending messages, editing UI, etc.).
 
 The SDK has **zero platform dependencies** (no nonebot, no telegram, etc.). Platform concerns live in the adapter.
 
@@ -12,10 +12,20 @@ Four layers, bottom to top:
 |-------|-------|------|
 | **HTTP Client** | `ClonothClient` | 11 typed async methods wrapping every Supervisor HTTP endpoint |
 | **State** | `SessionState` | Centralized runtime state — replaces scattered global dicts (triggers, session maps, watermarks, task states) |
-| **Event Router** | `EventRouter` | Polls `/v1/events`, dispatches 18 event types through protocol handlers, then notifies the adapter |
+| **Event Router** | `EventRouter` | Consumes `/v1/ws`, recovers missed replies, and dispatches events to adapter callbacks |
 | **Callbacks** | `AdapterCallbacks` | 15-method `Protocol` interface — the adapter implements these to perform platform operations |
 
 Supporting modules: `BotConfig` (configuration injection), `types` (dataclasses for API responses), `approval` (dedup + path classification + auto-approve).
+
+## Reply recovery and upgrades
+
+Upgrade the SDK and Supervisor together. The SDK requires outbound recovery protocol version 1 on `/v1/ws`; an older Supervisor produces an explicit compatibility error instead of silently using an unreliable stream. Recovery requires an admin token. HTTP requests and WebSocket reconnects both read the latest `admin_token_path` value, falling back to the constructor's `admin_token` if the file is unavailable or empty. Both legacy and current `websockets` header argument names are supported.
+
+The first connection of a new outbox starts with new events and does not resend historical replies. Once initialized, its SQLite receive cursor survives restarts. Reconnection recovers only `outbound_message` and `intermediate_reply` in bounded pages, while approvals and progress events remain live only. The Supervisor subscribes atomically with the replay boundary so replies produced during the handshake or catch-up are preserved. A local persistence failure stops consumption before later events can advance the cursor; platform delivery failures remain in the local outbox for retry. Delivery acknowledgements cannot move the receive cursor, and sent deduplication records are retained until receipt is checkpointed.
+
+Recovery covers the Supervisor's retained event logs, including rotated files. If an outage exceeds log retention, the SDK logs `Outbound recovery exceeds retained logs` and recovers the remaining retained replies; deleted logs cannot be reconstructed. Keep the adapter outbox when restarting or upgrading. Existing Web clients that do not request recovery keep their live event behavior.
+
+Adapters may accept `is_final: bool = True` in `send_to_channel`. Intermediate replies, including attachments, pass `is_final=False` so an adapter can keep waiting for the final reply. Callbacks without this optional parameter keep working.
 
 ## Two-Layer Hook Architecture
 
@@ -64,7 +74,10 @@ config = BotConfig(
 )
 
 # 2. Core objects
-client = ClonothClient(config.base_url)
+client = ClonothClient(
+    config.base_url,
+    admin_token_path="/www/wwwroot/Clonoth/data/.admin_token",
+)
 state = SessionState()
 
 # 3. Implement AdapterCallbacks (all 15 async methods)
@@ -99,7 +112,7 @@ asyncio.run(router.run())
 | `client.py` | `ClonothClient` — async HTTP client for 11 Supervisor API endpoints |
 | `state.py` | `SessionState` + dataclasses (`TriggerInfo`, `MainTaskState`, `ChildTaskState`) — centralized runtime state |
 | `callbacks.py` | `AdapterCallbacks` — 15-method `typing.Protocol` the adapter implements |
-| `event_router.py` | `EventRouter` — poll loop, 18 event handlers, Layer 1/2 dispatch, `strip_protocol_markers()` |
+| `event_router.py` | `EventRouter` — WebSocket recovery, event handlers, Layer 1/2 dispatch, `strip_protocol_markers()` |
 | `config.py` | `BotConfig` — configuration dataclass injected into router and client |
 | `types.py` | `Event`, `InboundResult`, `RunningTask`, `HealthInfo`, `OpenAIConfig` — API response types |
 | `approval.py` | `ApprovalTracker` (dedup), `classify_path` / `is_external_operation` (path classification), `auto_approve` (retry logic) |
@@ -111,7 +124,7 @@ asyncio.run(router.run())
 - Data types — `InboundResult`, `Event`, `RunningTask`, etc.
 - Approval policy — dedup, path classification, auto-approve
 - `SessionState` — trigger lifecycle, session mapping, watermarks, task states
-- `EventRouter` — event polling, protocol dispatch, 18 event handlers
+- `EventRouter` — WebSocket events and reply recovery, protocol dispatch
 - `AdapterCallbacks` — callback protocol definition
 - `BotConfig` — configuration injection
 - Protocol marker cleanup — `[CLONOTH_TOOL_TRACE]` stripping
@@ -126,4 +139,4 @@ asyncio.run(router.run())
 
 ## Restart Scope
 
-Modifying any file in `clonoth_sdk/` only requires restarting the **Bot process**. The Clonoth Supervisor backend is unaffected — no engine restart, no session loss.
+SDK implementation changes that preserve the wire protocol only require restarting the **Bot process**. Protocol changes require updating and restarting the affected backend as well. The outbound recovery protocol introduced here requires matching SDK and Supervisor versions: update both, then restart the **Supervisor and Bot processes** while preserving their event logs and outbox. Engine changes require a separate Engine restart.

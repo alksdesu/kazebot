@@ -63,6 +63,11 @@ class OutboundStore:
         try:
             self._verify_integrity(self._db)
             self._create_or_upgrade_schema()
+            if self.processed_seq or self._db.execute("SELECT 1 FROM outbound LIMIT 1").fetchone():
+                self._db.execute(
+                    "INSERT OR IGNORE INTO metadata(key,value) VALUES('received_seq',?)",
+                    (str(self.processed_seq),),
+                )
             self._verify_integrity(self._db)
         except Exception:
             self._db.close()
@@ -127,6 +132,21 @@ class OutboundStore:
     def processed_seq(self) -> int:
         row = self._db.execute("SELECT value FROM metadata WHERE key='processed_seq'").fetchone()
         return int(row[0]) if row else 0
+
+    @property
+    def received_seq(self) -> int | None:
+        row = self._db.execute("SELECT value FROM metadata WHERE key='received_seq'").fetchone()
+        if row is not None:
+            return int(row[0])
+        return None
+
+    def advance_received_seq(self, seq: int) -> None:
+        with self._transaction():
+            self._db.execute(
+                """INSERT INTO metadata(key,value) VALUES('received_seq',?)
+                ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(value AS INTEGER), ?) AS TEXT)""",
+                (str(max(0, seq)), max(0, seq)),
+            )
 
     @staticmethod
     def _create_schema_on(db: sqlite3.Connection) -> None:
@@ -467,7 +487,7 @@ class OutboundStore:
         cutoff = current - max(0.0, ttl_seconds)
         removed = 0
         with self._transaction():
-            cursor_seq = self.processed_seq
+            cursor_seq = min(self.processed_seq, self.received_seq or 0)
             cursor = self._db.execute(
                 "DELETE FROM outbound WHERE status='sent' AND seq<=? AND sent_at>0 AND sent_at<=?",
                 (cursor_seq, cutoff),

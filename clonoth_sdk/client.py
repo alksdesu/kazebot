@@ -19,6 +19,8 @@ SDK 是纯协议层，不包含任何平台（OneBot / Telegram 等）相关逻�
 """
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 from typing import Any, AsyncGenerator
 
@@ -270,17 +272,8 @@ class ClonothClient:
         resp.raise_for_status()
         return [Event.from_dict(e) for e in resp.json()]
 
-    async def ws_connect(self, last_seq: int = 0) -> AsyncGenerator[dict[str, Any], None]:
-        """连接全局 WebSocket 事件流，逐条 yield 解析后的事件字典。
-
-        对应 WS /v1/ws。调用方发送 {"last_seq": N} 作为协议兼容帧，
-        Supervisor 不再 replay 历史事件，仅推送连接后的实时事件。
-        """
-        # [SDK WS 2026-05-19] Why: EventRouter needs lower-latency delivery than
-        # HTTP polling while keeping /v1/events as fallback. How: derive /v1/ws
-        # from the configured HTTP base URL and send the durable EventLog cursor as
-        # the first frame. Purpose: let adapters consume the global event stream
-        # without learning websocket URL construction or handshake details.
+    async def ws_connect(self, last_seq: int | None = None) -> AsyncGenerator[dict[str, Any], None]:
+        """连接事件流，并从已持久接收的位置补收回复；首次连接只接收新事件。"""
         try:
             import websockets
         except ImportError as exc:  # pragma: no cover - exercised only in lean installs.
@@ -295,15 +288,23 @@ class ClonothClient:
         ws_url = f"{ws_url}/v1/ws"
 
         connect_kwargs: dict[str, Any] = {"open_timeout": self._timeout}
-        if self._admin_token:
-            # Why: deployments may protect every Supervisor endpoint with the same
-            # bearer token used by HTTP. How: pass the header through websockets'
-            # extra_headers parameter. Purpose: keep WS auth behavior aligned with
-            # the shared httpx client.
-            connect_kwargs["extra_headers"] = {"Authorization": f"Bearer {self._admin_token}"}
+        token = self._resolve_admin_token()
+        if token:
+            header_parameter = (
+                "additional_headers"
+                if "additional_headers" in inspect.signature(websockets.connect).parameters
+                else "extra_headers"
+            )
+            connect_kwargs[header_parameter] = {"Authorization": f"Bearer {token}"}
 
         async with websockets.connect(ws_url, **connect_kwargs) as ws:
-            await ws.send(json.dumps({"last_seq": int(last_seq or 0)}))
+            await ws.send(json.dumps({"last_seq": last_seq, "replay_outbound": True}))
+            try:
+                ready = json.loads(await asyncio.wait_for(ws.recv(), timeout=self._timeout))
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("Supervisor did not acknowledge outbound recovery; upgrade the Supervisor") from exc
+            if not isinstance(ready, dict) or ready.get("type") != "outbound_replay_start" or ready.get("version") != 1:
+                raise RuntimeError("Supervisor does not support outbound recovery protocol version 1")
             async for message in ws:
                 data = json.loads(message)
                 if not isinstance(data, dict):

@@ -25,6 +25,7 @@ Phase 2 (2026-04-17): 初始创建，将 bot_adapter.py 中散落的全局 dict 
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -157,6 +158,9 @@ class SessionState:
         result = state.find_trigger_by_session("sid-abc")
     """
 
+    _EARLY_WATERMARK_LIMIT = 2048
+    _EARLY_WATERMARK_TTL = 600.0
+
     def __init__(self) -> None:
         # ---- conversation_key ↔ session_id 双向映射 ----
         # 对应 bot_adapter.py:
@@ -180,6 +184,8 @@ class SessionState:
         self.pending_watermarks: dict[int, tuple[int, int]] = {}
         # 对应 _last_ctx_seq: dict[int, int]  (channel_id → high watermark seq, L250)
         self.last_ctx_seq: dict[int, int] = {}
+        self._accepted_watermarks: OrderedDict[int, float] = OrderedDict()
+        self._watermark_generations: dict[int, int] = {}
 
         # ---- DM 频道映射 ----
         # trigger 消费后子节点仍能找到 DM 频道
@@ -447,6 +453,7 @@ class SessionState:
 
     def register_watermark(
         self, inbound_seq: int, channel_id: int, watermark_seq: int,
+        *, generation: int | None = None,
     ) -> None:
         """注册待确认的水位标记。
 
@@ -456,7 +463,24 @@ class SessionState:
         水位在 inbound_accepted 事件到达后才正式推进，防止 engine 未接受
         消息时错误地认为历史已发送。
         """
-        self.pending_watermarks[inbound_seq] = (channel_id, watermark_seq)
+        self._prune_accepted_watermarks()
+        if generation is not None and generation != self.watermark_generation(channel_id):
+            return
+        if inbound_seq in self._accepted_watermarks:
+            self.advance_watermark(channel_id, watermark_seq)
+        else:
+            self.pending_watermarks[inbound_seq] = (channel_id, watermark_seq)
+
+    def watermark_generation(self, channel_id: int) -> int:
+        return self._watermark_generations.get(channel_id, 0)
+
+    def _prune_accepted_watermarks(self) -> None:
+        cutoff = time.monotonic() - self._EARLY_WATERMARK_TTL
+        while self._accepted_watermarks:
+            if len(self._accepted_watermarks) <= self._EARLY_WATERMARK_LIMIT:
+                if next(iter(self._accepted_watermarks.values())) >= cutoff:
+                    break
+            self._accepted_watermarks.popitem(last=False)
 
     def advance_watermark(self, channel_id: int, watermark_seq: int) -> int:
         """直接推进频道高水位，返回推进后的值。
@@ -479,6 +503,11 @@ class SessionState:
         Returns:
             成功推进时返回 (channel_id, new_watermark)，无待确认水位返回 None。
         """
+        if inbound_seq <= 0:
+            return None
+        self._accepted_watermarks[inbound_seq] = time.monotonic()
+        self._accepted_watermarks.move_to_end(inbound_seq)
+        self._prune_accepted_watermarks()
         wm = self.pending_watermarks.pop(inbound_seq, None)
         if wm is None:
             return None
@@ -493,6 +522,10 @@ class SessionState:
         重置后下一轮 inbound 会带完整频道历史。
         """
         self.last_ctx_seq.pop(channel_id, None)
+        self._watermark_generations[channel_id] = self.watermark_generation(channel_id) + 1
+        for seq, (pending_channel, _) in list(self.pending_watermarks.items()):
+            if pending_channel == channel_id:
+                self.pending_watermarks.pop(seq, None)
 
     def get_high_watermark(self, channel_id: int) -> int:
         """获取频道的当前高水位序号。默认 -1（表示无历史发送记录）。"""

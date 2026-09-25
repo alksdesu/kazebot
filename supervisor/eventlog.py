@@ -42,6 +42,32 @@ class EventAppendResult:
     event: dict[str, Any]
 
 
+class _EventQueue(asyncio.Queue):
+    def __init__(self, publisher_lock: Any):
+        super().__init__()
+        self._publisher_lock = publisher_lock
+        try:
+            self._event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._event_loop = None
+
+    async def get(self) -> Any:
+        with self._publisher_lock:
+            loop = asyncio.get_running_loop()
+            if self._event_loop is None:
+                self._event_loop = loop
+            elif self._event_loop is not loop:
+                raise RuntimeError("event subscriber belongs to another event loop")
+        return await super().get()
+
+    def _publish_locked(self, event: dict[str, Any]) -> None:
+        if self._event_loop is None:
+            self.put_nowait(event)
+        elif not self._event_loop.is_closed():
+            # Always schedule, including local publishers, to preserve sequence order.
+            self._event_loop.call_soon_threadsafe(self.put_nowait, event)
+
+
 class EventLog:
     """Append-only JSONL event log.
 
@@ -56,6 +82,7 @@ class EventLog:
         self._lock = threading.Lock()
         self._events: list[dict[str, Any]] = []
         self._seq: int = 0
+        self._durable_seq: int = 0
         # [2026-07-16] 在线轮转护栏：距上次检查写入的条数计数器。
         self._append_since_size_check: int = 0
         # [WS events 2026-05-17] Why: WebSocket clients need live updates while
@@ -63,13 +90,13 @@ class EventLog:
         # asyncio.Queue subscribers beside the append-only memory buffer. Purpose:
         # append() can fan out each new event without changing persistence or the
         # existing polling API.
-        self._subscribers: dict[str, list[asyncio.Queue]] = {}
+        self._subscribers: dict[str, list[_EventQueue]] = {}
         # [WS events 2026-05-19] Why: the web client needs an all-session stream
         # in addition to the existing per-session stream. How: keep a separate
         # subscriber list that append() fans out to after the session-specific
         # queues. Purpose: add global observation without changing session
         # isolation for subscribe()/unsubscribe().
-        self._global_subscribers: list[asyncio.Queue] = []
+        self._global_subscribers: list[_EventQueue] = []
 
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._load_existing()
@@ -85,6 +112,19 @@ class EventLog:
     @property
     def path(self) -> Path:
         return self._path
+
+    @property
+    def durable_seq(self) -> int:
+        with self._lock:
+            return self._durable_seq
+
+    def oldest_retained_seq(self) -> int:
+        events = self.iter_persisted_events()
+        try:
+            first = next(events, None)
+            return int(first.get("seq") or 0) if first else 0
+        finally:
+            events.close()
 
     def _load_existing(self) -> None:
         """Restore global seq and the recent cache across active and backups."""
@@ -103,6 +143,7 @@ class EventLog:
                 if isinstance(seq, int) and seq > max_seq:
                     max_seq = seq
         self._seq = max_seq
+        self._durable_seq = max_seq
         self._events = list(recent_events)
 
     def _read_recent_lines_locked(self) -> list[str]:
@@ -202,6 +243,7 @@ class EventLog:
                 with eventlog_file_lock(self._path):
                     with self._path.open("a", encoding="utf-8") as f:
                         f.write(line + "\n")
+                    self._durable_seq = seq
                     self._append_since_size_check += 1
                     if self._append_since_size_check >= _ONLINE_ROTATE_CHECK_EVERY:
                         self._append_since_size_check = 0
@@ -218,34 +260,13 @@ class EventLog:
             # Trim with hysteresis to prevent unbounded memory growth
             if len(self._events) > _MAX_MEMORY_EVENTS + 500:
                 self._events = self._events[-_MAX_MEMORY_EVENTS:]
-            # [WS events 2026-05-17] Why: broadcasting while holding the threading
-            # lock would make subscriber callbacks part of the critical section.
-            # How: copy the current session queues and fan out after leaving the
-            # lock. Purpose: keep append() fast and avoid awaiting under this lock.
-            subscribers = list(self._subscribers.get(session_id, []))
-            # [WS events 2026-05-19] Why: /v1/ws must see every EventLog row.
-            # How: snapshot global subscribers under the same lock used for
-            # per-session subscribers, then fan out outside the critical section.
-            # Purpose: avoid races with subscribe_global()/unsubscribe_global()
-            # while preserving the existing append() lock behavior.
-            global_subscribers = list(self._global_subscribers)
-
-        for queue in subscribers:
-            try:
-                queue.put_nowait(evt)
-            except asyncio.QueueFull:
-                # The current queues are unbounded, but this keeps future bounded
-                # queues from breaking event persistence if a client falls behind.
-                continue
-        for queue in global_subscribers:
-            try:
-                queue.put_nowait(evt)
-            except asyncio.QueueFull:
-                # [WS events 2026-05-19] Why: global observers are optional
-                # consumers and must not block persistence. How: mirror the
-                # per-session overflow behavior. Purpose: a slow global client
-                # cannot affect EventLog writes or session-specific streams.
-                continue
+            subscribers = [*self._subscribers.get(session_id, []), *self._global_subscribers]
+            for queue in subscribers:
+                try:
+                    queue._publish_locked(evt)
+                except RuntimeError:
+                    # A disconnected subscriber may close its loop during publication.
+                    continue
         return evt
 
     def _iter_persisted_events_locked(self):
@@ -318,7 +339,7 @@ class EventLog:
         asyncio.Queue that append() fills with matching session events. Purpose:
         consumers can combine catch-up reads with live delivery.
         """
-        queue: asyncio.Queue = asyncio.Queue()
+        queue = _EventQueue(self._lock)
         with self._lock:
             self._subscribers.setdefault(session_id, []).append(queue)
         return queue
@@ -342,13 +363,14 @@ class EventLog:
 
     def subscribe_global(self) -> asyncio.Queue:
         """Subscribe to all new events across all sessions."""
-        queue: asyncio.Queue = asyncio.Queue()
-        # [WS events 2026-05-19] Why: global subscribers must not be mixed into
-        # the per-session mapping. How: append their queues to a dedicated list.
-        # Purpose: unsubscribe_global() can clean up without knowing a session id.
+        return self.subscribe_global_with_cursor()[0]
+
+    def subscribe_global_with_cursor(self) -> tuple[asyncio.Queue, int]:
+        """Subscribe and capture the durable replay boundary under the same lock."""
+        queue = _EventQueue(self._lock)
         with self._lock:
             self._global_subscribers.append(queue)
-        return queue
+            return queue, self._durable_seq
 
     def unsubscribe_global(self, queue: asyncio.Queue) -> None:
         """Remove a queue previously returned by subscribe_global()."""

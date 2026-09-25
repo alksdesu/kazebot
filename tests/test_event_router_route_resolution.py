@@ -795,6 +795,8 @@ def test_sent_retention_prunes_only_sent_event_json(tmp_path: Path) -> None:
     assert delivering and dead_claim
     store.mark_dead_letter(dead_claim, _NonRetryable("bad"), owner="dead")
     store._db.execute("UPDATE outbound SET sent_at=1 WHERE status='sent'")
+    assert store.prune_sent(ttl_seconds=10, max_rows=1, now=100) == 0
+    store.advance_received_seq(303)
     removed = store.prune_sent(ttl_seconds=10, max_rows=1, now=100)
     assert removed == 4
     states = dict(store._db.execute("SELECT key,status FROM outbound").fetchall())
@@ -836,6 +838,7 @@ def test_sent_retention_max_rows_reclaims_oldest_processed_events(tmp_path: Path
         store._db.execute(
             "UPDATE outbound SET sent_at=? WHERE key=?", (float(seq), record.key),
         )
+    store.advance_received_seq(404)
     assert store.prune_sent(ttl_seconds=10_000, max_rows=2, now=500) == 3
     remaining = store._db.execute(
         "SELECT seq FROM outbound WHERE status='sent' ORDER BY seq"

@@ -165,6 +165,34 @@ _WS_HEARTBEAT_SEC = 30.0
 _WS_INITIAL_MESSAGE_TIMEOUT_SEC = 0.5
 
 _WS_MAX_EVENT_BYTES = 65_536  # 64 KiB soft cap for individual WS events
+_OUTBOUND_REPLAY_PAGE_SIZE = 200
+_OUTBOUND_REPLAY_SCAN_SIZE = 5000
+_OUTBOUND_EVENT_TYPES = frozenset({"outbound_message", "intermediate_reply"})
+
+
+def _outbound_replay_page(eventlog: Any, after_seq: int, until_seq: int) -> tuple[list[dict[str, Any]], int]:
+    cached = list(eventlog.events)
+    use_cache = bool(cached) and after_seq >= int(cached[0]["seq"]) - 1
+    source = iter(cached) if use_cache else eventlog.iter_persisted_events()
+    page: list[dict[str, Any]] = []
+    scanned = 0
+    try:
+        for event in source:
+            seq = int(event.get("seq") or 0)
+            if seq <= after_seq:
+                continue
+            if seq > until_seq:
+                break
+            scanned += 1
+            if event.get("type") in _OUTBOUND_EVENT_TYPES:
+                page.append(event)
+            if len(page) >= _OUTBOUND_REPLAY_PAGE_SIZE or scanned >= _OUTBOUND_REPLAY_SCAN_SIZE:
+                return page, seq
+        return page, until_seq
+    finally:
+        close = getattr(source, "close", None)
+        if close is not None:
+            close()
 
 
 async def _send_ws_json(websocket: WebSocket, payload: dict[str, Any]) -> None:
@@ -1052,31 +1080,47 @@ def create_app(
     async def global_ws(websocket: WebSocket) -> None:
         """Stream durable EventLog rows for all sessions over WebSocket."""
         st: SupervisorState = app.state.state
-        await websocket.accept()
-
-        # [2026-06-03] Why: replay is removed. WS is a pure live-forward stream.
-        # Web frontend rebuilds state via loadSessionHistoryIntoStore(); SDK uses
-        # _init_seq() to fast-forward before connecting. No client depends on WS
-        # catch-up replay. How: consume the optional initial message for backward
-        # compat, then go straight to the live loop. Purpose: eliminate full-history
-        # replay that caused 109KB tool_call_end events to blow up browsers and
-        # stale approval_requested events to trigger 404 auto-approve errors.
-        try:
-            await asyncio.wait_for(
-                websocket.receive_text(),
-                timeout=_WS_INITIAL_MESSAGE_TIMEOUT_SEC,
-            )
-        except asyncio.TimeoutError:
-            pass
-        except WebSocketDisconnect:
-            return
-        except Exception:
-            pass
-
-        queue = st.eventlog.subscribe_global()
+        # 先订阅再握手，补收结束与实时推送之间才不会漏掉新回复。
+        queue, snapshot_seq = st.eventlog.subscribe_global_with_cursor()
         sent_seq = 0
         receive_task: asyncio.Task | None = None
+        event_task: asyncio.Task | None = None
         try:
+            await websocket.accept()
+            try:
+                initial = json.loads(await asyncio.wait_for(
+                    websocket.receive_text(), timeout=_WS_INITIAL_MESSAGE_TIMEOUT_SEC,
+                ))
+            except (asyncio.TimeoutError, ValueError):
+                initial = {}
+            if isinstance(initial, dict) and initial.get("replay_outbound") is True:
+                try:
+                    verify_admin_token(websocket)
+                except HTTPException:
+                    await websocket.close(code=1008, reason="Unauthorized outbound replay")
+                    return
+                cursor = initial.get("last_seq")
+                if cursor is not None and (type(cursor) is not int or cursor < 0 or cursor > snapshot_seq):
+                    await websocket.close(code=1008, reason="Invalid outbound cursor")
+                    return
+                await _send_ws_json(websocket, {"type": "outbound_replay_start", "version": 1})
+                if cursor is not None:
+                    oldest_seq = await asyncio.to_thread(st.eventlog.oldest_retained_seq)
+                    if oldest_seq and cursor < oldest_seq - 1:
+                        await _send_ws_json(websocket, {
+                            "type": "outbound_replay_gap", "after_seq": cursor,
+                            "oldest_seq": oldest_seq,
+                        })
+                    while cursor < snapshot_seq:
+                        page, checkpoint = await asyncio.to_thread(
+                            _outbound_replay_page, st.eventlog, cursor, snapshot_seq,
+                        )
+                        for event in page:
+                            await _send_ws_json(websocket, event)
+                        await _send_ws_json(websocket, {"type": "outbound_checkpoint", "seq": checkpoint})
+                        cursor = checkpoint
+                await _send_ws_json(websocket, {"type": "outbound_checkpoint", "seq": snapshot_seq})
+                sent_seq = snapshot_seq
             receive_task = asyncio.create_task(websocket.receive_text())
             while True:
                 event_task = asyncio.create_task(queue.get())
@@ -1122,8 +1166,14 @@ def create_app(
         except WebSocketDisconnect:
             pass
         except Exception:
-            pass
+            log.exception("Global event stream failed")
+            with contextlib.suppress(Exception):
+                await websocket.close(code=1011, reason="Event stream unavailable")
         finally:
+            if event_task is not None and not event_task.done():
+                event_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await event_task
             if receive_task is not None and not receive_task.done():
                 receive_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
