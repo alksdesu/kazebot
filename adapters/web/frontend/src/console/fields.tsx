@@ -19,7 +19,7 @@ export const BoolOption = ({ children, configKey, desc, fallback = false, label 
   return (
     <Option
       checked={checked}
-      desc={[desc, note].filter(Boolean).join(' ')}
+      desc={desc || note}
       name={label}
       onChange={(next) => setDraft(configKey, next)}
     >
@@ -89,6 +89,7 @@ export const NumberField = ({
   return (
     <Field label={label}>
       <Input
+        aria-label={label}
         onChange={(event) => {
           const next = Number.parseFloat(event.target.value);
           const shown = Number.isFinite(next) ? next : 0;
@@ -109,7 +110,7 @@ export const TextField = ({ configKey, label }: { configKey: string; label: stri
   const value = useLiveValue<string>(configKey, '');
   return (
     <Field label={label}>
-      <Input onChange={(event) => setDraft(configKey, event.target.value)} value={value} width="wide" />
+      <Input aria-label={label} onChange={(event) => setDraft(configKey, event.target.value)} value={value} width="wide" />
     </Field>
   );
 };
@@ -121,6 +122,7 @@ export const PercentField = ({ configKey, label }: { configKey: string; label: s
   return (
     <Field label={label}>
       <Input
+        aria-label={label}
         max={100}
         min={0}
         onChange={(event) => {
@@ -154,7 +156,7 @@ export const ChoiceField = ({
   const value = useLiveValue<string>(configKey, fallback);
   return (
     <Field label={label}>
-      <Segmented choices={choices} onPick={(next) => setDraft(configKey, next)} value={value} />
+      <Segmented label={label} choices={choices} onPick={(next) => setDraft(configKey, next)} value={value} />
     </Field>
   );
 };

@@ -10,8 +10,8 @@ export const Block = ({ children, hint, title }: {
   title: string;
 }) => (
   <section className="mb-8">
-    <div className="mb-4 flex items-baseline gap-2.5 border-b border-[var(--duties-border)] pb-2">
-      <h2 className="m-0 font-mono text-sm font-semibold tracking-[-0.02em]">{title}</h2>
+    <div className="mb-4 flex flex-wrap items-baseline gap-x-2.5 gap-y-1 border-b border-[var(--duties-border)] pb-2">
+      <h2 className="m-0 text-base font-semibold">{title}</h2>
       {hint && <span className={`text-xs ${MUTED}`}>{hint}</span>}
     </div>
     {children}
@@ -20,18 +20,18 @@ export const Block = ({ children, hint, title }: {
 
 /** 开关格。1px 间隙靠容器底色透出来当分隔线，省掉每格各画一条边。 */
 export const Grid = ({ children }: { children: ReactNode }) => (
-  <div className="grid gap-px overflow-hidden border border-[var(--duties-border)] bg-[var(--duties-border)] [grid-template-columns:repeat(auto-fit,minmax(238px,1fr))]">
+  <div className="settings-control-grid grid min-w-0 gap-px overflow-hidden border border-[var(--duties-border)] bg-[var(--duties-border)]">
     {children}
   </div>
 );
 
 export const Empty = ({ children }: { children: ReactNode }) => (
-  <p className={`px-4 py-6 text-center text-[0.8rem] ${MUTED}`}>{children}</p>
+  <p className={`px-4 py-6 text-center text-sm ${MUTED}`}>{children}</p>
 );
 
 /** Grid 之外的独立面板，用于整块只有一份名单、一组只读行的分区。 */
 export const Panel = ({ children, className = '' }: { children: ReactNode; className?: string }) => (
-  <div className={`border border-[var(--duties-border)] bg-[var(--duties-panel)] px-4 py-3.5 ${className}`}>
+  <div className={`border border-[var(--duties-border)] bg-[var(--duties-surface)] px-4 py-3.5 ${className}`}>
     {children}
   </div>
 );
@@ -45,7 +45,7 @@ export const List = ({ children }: { children: ReactNode }) => (
 
 export const Row = ({ children, className = '' }: { children: ReactNode; className?: string }) => (
   <li
-    className={`flex items-center gap-2.5 border-b border-[var(--duties-border)] bg-[var(--duties-panel)] px-4 py-3 last:border-b-0 ${className}`}
+    className={`flex min-w-0 flex-wrap items-center gap-2.5 border-b border-[var(--duties-border)] bg-[var(--duties-surface)] px-4 py-3 last:border-b-0 ${className}`}
   >
     {children}
   </li>
@@ -56,10 +56,10 @@ export const ItemTitle = ({ children, className = '' }: { children: ReactNode; c
   <h3 className={`m-0 text-sm font-medium ${className}`}>{children}</h3>
 );
 
-/** 内容多于一行的列表项。Row 是单行 flex 版，两者只差排布。 */
+/** 内容多于一行的列表项，与 Row 的横向布局区分。 */
 export const Item = ({ children, className = '' }: { children: ReactNode; className?: string }) => (
   <li
-    className={`border-b border-[var(--duties-border)] bg-[var(--duties-panel)] px-4 py-2.5 last:border-b-0 ${className}`}
+    className={`border-b border-[var(--duties-border)] bg-[var(--duties-surface)] px-4 py-2.5 last:border-b-0 ${className}`}
   >
     {children}
   </li>
@@ -79,7 +79,7 @@ export const Facts = ({ children, className = '' }: { children: ReactNode; class
 
 /** 开关名底下那行说明。缩进对齐复选框右侧，与 Option 的 desc 同一档。 */
 export const Desc = ({ children, indent = true }: { children: ReactNode; indent?: boolean }) => (
-  <p className={`mt-1.5 text-xs leading-5 ${indent ? 'ml-[25px]' : ''} ${MUTED}`}>{children}</p>
+  <p className={`mt-1.5 text-xs leading-5 ${indent ? 'ml-[var(--duties-option-indent)]' : ''} ${MUTED}`}>{children}</p>
 );
 
 /** Grid 之外的松散区块，放不属于任何单个开关的配置。 */
@@ -87,7 +87,7 @@ export const Loose = ({ children }: { children: ReactNode }) => (
   <div className="mt-4">{children}</div>
 );
 
-const CHECKBOX = 'h-[15px] w-[15px] flex-none accent-[var(--duties-text)]';
+const CHECKBOX = 'h-[var(--duties-checkbox-size)] w-[var(--duties-checkbox-size)] flex-none accent-[var(--duties-text)]';
 
 interface OptionProps {
   checked: boolean;
@@ -100,9 +100,9 @@ interface OptionProps {
 // children 刻意留在 label 外面：词表和数字框都在这一层，包进 label 之后点它们旁边的
 // 空白会连带翻转开关。
 export const Option = ({ checked, children, desc, name, onChange }: OptionProps) => (
-  <div className="bg-[var(--duties-panel)] px-4 py-3.5">
-    <label className="block cursor-pointer">
-      <span className="flex items-center gap-2.5">
+  <div className="bg-[var(--duties-surface)] px-4 py-3.5">
+    <label className="block cursor-pointer text-sm">
+      <span className="flex min-h-[var(--duties-control-size)] items-center gap-2.5">
         <input
           checked={checked}
           className={CHECKBOX}
@@ -111,7 +111,7 @@ export const Option = ({ checked, children, desc, name, onChange }: OptionProps)
         />
         <span className="font-medium">{name}</span>
       </span>
-      {desc && <p className={`ml-[25px] mt-1.5 text-xs leading-5 ${MUTED}`}>{desc}</p>}
+      {desc && <p className={`ml-[var(--duties-option-indent)] mt-1.5 text-xs leading-5 ${MUTED}`}>{desc}</p>}
     </label>
     {children}
   </div>
@@ -124,16 +124,16 @@ export const Fixed = ({ children, desc, name }: {
   desc?: string;
   name: string;
 }) => (
-  <div className="bg-[var(--duties-panel)] px-4 py-3.5">
-    <span className="flex items-center gap-2.5">
+  <div className="bg-[var(--duties-surface)] px-4 py-3.5">
+    <span className="flex min-h-[var(--duties-control-size)] items-center gap-2.5">
       {/* 占住复选框的位置，好和同一行里带开关的卡片对齐。 */}
-      <span aria-hidden className="h-[15px] w-[15px] flex-none" />
+      <span aria-hidden className="h-[var(--duties-checkbox-size)] w-[var(--duties-checkbox-size)] flex-none" />
       <span className="font-medium">{name}</span>
-      <span className="flex-none border border-[var(--duties-border)] px-1.5 py-0.5 font-mono text-[0.55rem] text-[var(--duties-secondary)]">
+      <span className="flex-none border border-[var(--duties-border)] px-1.5 py-0.5 text-xs text-[var(--duties-secondary)]">
         常开
       </span>
     </span>
-    {desc && <p className={`ml-[25px] mt-1.5 text-xs leading-5 ${MUTED}`}>{desc}</p>}
+    {desc && <p className={`ml-[var(--duties-option-indent)] mt-1.5 text-xs leading-5 ${MUTED}`}>{desc}</p>}
     {children}
   </div>
 );
@@ -144,7 +144,7 @@ export const Sub = ({ checked, label, onChange }: {
   label: string;
   onChange: (checked: boolean) => void;
 }) => (
-  <label className={`ml-[25px] mt-2.5 flex cursor-pointer items-center gap-2.5 text-xs ${MUTED}`}>
+  <label className={`ml-[var(--duties-option-indent)] mt-2.5 flex min-h-[var(--duties-control-size)] cursor-pointer items-center gap-2.5 text-sm ${MUTED}`}>
     <input
       checked={checked}
       className={CHECKBOX}
@@ -156,7 +156,7 @@ export const Sub = ({ checked, label, onChange }: {
 );
 
 export const Field = ({ children, label }: { children: ReactNode; label: string }) => (
-  <span className="ml-[25px] mt-2.5 flex items-center gap-2.5 text-xs">
+  <span className="ml-[var(--duties-option-indent)] mt-2.5 flex min-w-0 flex-wrap items-center gap-2.5 text-sm">
     <label className={MUTED}>{label}</label>
     {children}
   </span>
@@ -165,7 +165,7 @@ export const Field = ({ children, label }: { children: ReactNode; label: string 
 // 变体走 prop 不走 className 追加：align-items 与 font-size 都是同属性覆盖，
 // 谁赢取决于 Tailwind 生成 CSS 的顺序，不由 class 属性里的先后决定。
 const CHECK_ALIGN = { center: 'items-center', start: 'items-start' } as const;
-const CHECK_TONE = { default: 'text-xs', muted: 'text-[0.65rem] leading-5 ' + MUTED } as const;
+const CHECK_TONE = { default: 'text-sm', muted: 'text-sm leading-5 ' + MUTED } as const;
 
 /** 行内复选框。Option 那种整格命中区之外的零散开关用它。 */
 export const Check = ({
@@ -180,7 +180,7 @@ export const Check = ({
   tone?: keyof typeof CHECK_TONE;
 }) => (
   <label
-    className={`flex gap-1.5 ${CHECK_ALIGN[align]} ${CHECK_TONE[tone]} ${disabled ? '' : 'cursor-pointer'}`}
+    className={`flex min-h-[var(--duties-control-size)] gap-2.5 ${CHECK_ALIGN[align]} ${CHECK_TONE[tone]} ${disabled ? '' : 'cursor-pointer'}`}
   >
     <input
       checked={checked}
@@ -198,35 +198,34 @@ export type InputWidth = 'default' | 'wide' | 'tiny' | 'flex' | 'alias';
 // 定宽是默认档：数字框排在开关下面，各自撑到内容宽会参差不齐。
 // flex 留给同一行里要吃掉剩余空间的（模型名、地址、搜索框）—— 用定宽会把它们截断。
 const INPUT_WIDTH: Record<InputWidth, string> = {
-  default: 'w-[5.5rem]',
+  default: 'w-[var(--duties-input-width)]',
   wide: 'w-full',
-  tiny: 'w-[3.25rem]',
+  tiny: 'w-[var(--duties-input-tiny-width)]',
   flex: 'min-w-0 flex-1',
-  alias: 'w-40',
+  alias: 'w-[var(--duties-input-alias-width)]',
 };
 
 const CONTROL_SKIN =
-  'border border-[var(--duties-border)] bg-[var(--duties-bg)] font-mono text-xs text-[var(--duties-text)]' +
-  ' outline-none focus:border-[var(--duties-text)] disabled:bg-[var(--duties-muted)] disabled:text-[var(--duties-secondary)]';
+  'app-input min-w-0 max-w-full disabled:bg-[var(--duties-muted)] disabled:text-[var(--duties-secondary)]';
 
 // 转发 ref：上传完要清空文件选择框，那只能拿到 DOM 节点自己改 value。
 export const Input = forwardRef<HTMLInputElement, React.InputHTMLAttributes<HTMLInputElement> & { width?: InputWidth }>(
   ({ width = 'default', className = '', ...props }, ref) => (
-    <input {...props} className={`px-2 py-1 ${CONTROL_SKIN} ${INPUT_WIDTH[width]} ${className}`} ref={ref} />
+    <input {...props} className={`${CONTROL_SKIN} ${INPUT_WIDTH[width]} ${className}`} ref={ref} />
   ),
 );
 Input.displayName = 'Input';
 
 export const Select = forwardRef<HTMLSelectElement, React.SelectHTMLAttributes<HTMLSelectElement> & { width?: InputWidth }>(
   ({ width = 'default', className = '', ...props }, ref) => (
-    <select {...props} className={`px-2 py-1 ${CONTROL_SKIN} ${INPUT_WIDTH[width]} ${className}`} ref={ref} />
+    <select {...props} className={`${CONTROL_SKIN} ${INPUT_WIDTH[width]} ${className}`} ref={ref} />
   ),
 );
 Select.displayName = 'Select';
 
 export const Textarea = forwardRef<HTMLTextAreaElement, React.TextareaHTMLAttributes<HTMLTextAreaElement>>(
   ({ className = '', ...props }, ref) => (
-    <textarea {...props} className={`block w-full resize-y p-3 leading-6 ${CONTROL_SKIN} ${className}`} ref={ref} />
+    <textarea {...props} className={`block w-full resize-y leading-6 ${CONTROL_SKIN} ${className}`} ref={ref} />
   ),
 );
 Textarea.displayName = 'Textarea';
@@ -234,7 +233,7 @@ Textarea.displayName = 'Textarea';
 /** 日志、进度这类只读长文本。往下追加的内容要能滚，且不能撑破面板。 */
 export const Pre = ({ children, className = '' }: { children: ReactNode; className?: string }) => (
   <pre
-    className={`overflow-auto whitespace-pre-wrap break-all border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 font-mono text-[0.65rem] leading-5 ${className}`}
+    className={`overflow-auto whitespace-pre-wrap break-all border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 font-mono text-xs leading-5 ${className}`}
   >
     {children}
   </pre>
@@ -256,7 +255,7 @@ export const Tag = ({ children, className = '', tone = 'neutral' }: {
   tone?: TagTone;
 }) => (
   <span
-    className={`flex-none border px-1.5 py-0.5 font-mono text-[0.65rem] tracking-[-0.01em] ${TAG_TONE[tone]} ${className}`}
+    className={`flex-none border px-1.5 py-0.5 font-mono text-xs tracking-[-0.01em] ${TAG_TONE[tone]} ${className}`}
   >
     {children}
   </span>
@@ -280,7 +279,7 @@ export const Chip = ({ children, onRemove, removeLabel }: {
     {onRemove && (
       <button
         aria-label={removeLabel}
-        className={`px-1.5 leading-tight ${MUTED} hover:text-[var(--duties-danger)]`}
+        className={`app-icon-button leading-tight ${MUTED} hover:text-[var(--duties-danger)]`}
         onClick={onRemove}
         type="button"
       >
@@ -293,9 +292,9 @@ export const Chip = ({ children, onRemove, removeLabel }: {
 /** 只读展示：改动需要重启进程的那几个值。 */
 export const ReadOnlyRow = ({ hint, name, value }: { hint?: string; name: string; value: string }) => (
   <div className="flex flex-wrap items-baseline gap-2.5 py-1.5">
-    <span className={`min-w-[9em] text-xs ${MUTED}`}>{name}</span>
+    <span className={`min-w-[9em] text-sm ${MUTED}`}>{name}</span>
     <code className="break-all text-xs">{value || '未设置'}</code>
-    {hint && <span className={`text-[0.65rem] ${MUTED}`}>{hint}</span>}
+    {hint && <span className={`text-xs ${MUTED}`}>{hint}</span>}
   </div>
 );
 
@@ -307,17 +306,17 @@ const TONE: Record<ButtonTone, string> = {
   quiet: 'border-[var(--duties-border)] bg-transparent text-[var(--duties-text)] hover:border-[var(--duties-text)]',
   halt: 'border-[var(--duties-danger)] bg-[var(--duties-danger)] text-[var(--duties-bg)]',
   // 描边红：破坏性但还没确认的那一步。确认之后才换成实心的 halt。
-  danger: 'border-[var(--duties-danger)] bg-transparent text-[var(--duties-danger)] hover:bg-[var(--duties-danger)] hover:text-[var(--duties-bg)]',
+  danger: 'border-[var(--duties-danger-border)] bg-[var(--duties-danger-bg)] text-[var(--duties-danger)] hover:bg-[var(--duties-danger-hover)]',
 };
 
-// 一张卡上挤四个操作时默认尺寸会把它们撑成四行。
+// 小号只收窄横向留白，保留相同的可点击高度。
 const SIZE: Record<ButtonSize, string> = {
-  default: 'px-3.5 py-1 text-xs',
-  sm: 'px-2 py-0.5 text-[0.65rem]',
+  default: 'px-3.5 py-2',
+  sm: 'px-2.5 py-1.5',
 };
 
 const buttonSkin = (tone: ButtonTone, size: ButtonSize, className: string) =>
-  `inline-block border font-mono font-medium ${SIZE[size]} ${TONE[tone]} ${className}`;
+  `app-button inline-flex min-h-[var(--duties-control-size)] items-center justify-center gap-2 border text-sm font-medium ${SIZE[size]} ${TONE[tone]} ${className}`;
 
 export const Button = ({ tone = 'solid', size = 'default', className = '', ...props }:
   React.ButtonHTMLAttributes<HTMLButtonElement> & { tone?: ButtonTone; size?: ButtonSize }) => (
@@ -335,16 +334,19 @@ export const LinkButton = ({ tone = 'quiet', size = 'default', className = '', .
 );
 
 /** 横排档位。三四个选项摊开比点开下拉更快，边框合并成一条。 */
-export const Segmented = <T extends string>({ choices, onPick, value }: {
+export const Segmented = <T extends string>({ choices, onPick, value, label, disabled = false }: {
   choices: ReadonlyArray<readonly [T, string]>;
   onPick: (value: T) => void;
   value: T;
+  label?: string;
+  disabled?: boolean;
 }) => (
-  <div className="flex flex-none border border-[var(--duties-border)]" role="group">
+  <div className="flex min-w-0 max-w-full flex-wrap border border-[var(--duties-border)]" role="group" aria-label={label}>
     {choices.map(([option, text]) => (
       <button
+        disabled={disabled}
         aria-pressed={option === value}
-        className={`whitespace-nowrap border-l border-[var(--duties-border)] px-2.5 py-0.5 font-mono text-[0.65rem] first:border-l-0 ${
+        className={`app-button settings-segment border-l border-[var(--duties-border)] px-3 py-2 text-sm first:border-l-0 ${
           option === value
             ? 'bg-[var(--duties-text)] text-[var(--duties-bg)]'
             : `bg-[var(--duties-panel)] ${MUTED} hover:bg-[var(--duties-muted)] hover:text-[var(--duties-text)]`
@@ -361,7 +363,7 @@ export const Segmented = <T extends string>({ choices, onPick, value }: {
 
 /** 会中断正在进行的工作的操作。红边把它和同页的普通设置隔开。 */
 export const DangerPanel = ({ children }: { children: ReactNode }) => (
-  <div className="flex flex-wrap items-center justify-between gap-3 border border-[var(--duties-danger)] bg-[var(--duties-panel)] px-4 py-3.5">
+  <div className="flex flex-wrap items-center justify-between gap-3 border border-[var(--duties-danger)] bg-[var(--duties-surface)] px-4 py-3.5">
     {children}
   </div>
 );
@@ -376,7 +378,7 @@ export const SaveBar = ({ busy, dirty, label = '保存', note, onReset, onSave }
   onReset: () => void;
   onSave: () => void;
 }) => (
-  <div className="mt-3 flex items-center gap-2 border-t border-[var(--duties-border)] pt-3">
+  <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-[var(--duties-border)] pt-3">
     <span className={`text-xs ${MUTED}`}>{note}</span>
     <span className="flex-1" />
     <Button disabled={!dirty || busy} onClick={onReset} tone="quiet">还原</Button>
@@ -397,8 +399,8 @@ export const Pager = ({ offset, onOffset, pageSize, total, unit }: {
   const to = Math.min(offset + pageSize, total);
 
   return (
-    <div className="mt-3 flex items-center gap-2">
-      <span className="text-[0.65rem] text-[var(--duties-tertiary)]">
+    <div className="mt-3 flex flex-wrap items-center gap-2">
+      <span className="text-xs text-[var(--duties-tertiary)]">
         第 {offset + 1}–{to} {unit}，共 {total} {unit}
       </span>
       <span className="flex-1" />
@@ -426,7 +428,7 @@ export const Pip = ({ tone }: { tone: PipTone }) => (
 );
 
 export const StatusBar = ({ children, tone }: { children: ReactNode; tone: PipTone }) => (
-  <div className="flex min-h-[44px] items-center gap-2 border-b border-[var(--duties-border)] px-4 font-mono text-xs">
+  <div className="flex min-h-[var(--duties-control-size)] flex-wrap items-center gap-2 border-b border-[var(--duties-border)] px-4 py-2 text-sm">
     <Pip tone={tone} />
     {children}
   </div>

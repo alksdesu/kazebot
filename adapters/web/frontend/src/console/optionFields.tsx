@@ -67,8 +67,8 @@ const BOOL_CHOICES: ReadonlyArray<readonly [string, string]> = [
   ['false', '关'],
 ];
 
-const BoolControl = ({ value, onChange }: { value: string; onChange: (next: string) => void }) => (
-  <Segmented choices={BOOL_CHOICES} onPick={onChange} value={value} />
+const BoolControl = ({ value, onChange, label }: { value: string; onChange: (next: string) => void; label: string }) => (
+  <Segmented label={label} choices={BOOL_CHOICES} onPick={onChange} value={value} />
 );
 
 const EnumControl = ({
@@ -79,6 +79,7 @@ const EnumControl = ({
   );
   return (
     <Segmented
+      label={spec.label}
       choices={choices}
       onPick={(picked) => onChange(value === picked ? '' : picked)}
       value={value}
@@ -93,17 +94,18 @@ export const OptionRow = ({
   value: string;
   onChange: (next: string) => void;
 }) => (
-  <div className="flex items-center gap-2.5">
-    <div className="flex items-center gap-2">
+  <div className="min-w-0 space-y-1">
+    <div className="flex min-w-0 flex-wrap items-center gap-2">
       <span className="font-medium">{spec.label}</span>
       <code className="border border-[var(--duties-live)] px-1.5 text-[0.65rem] text-[var(--duties-live)]">
         {spec.key}
       </code>
       <span className="flex-1" />
-      {spec.kind === 'bool' && <BoolControl onChange={onChange} value={value} />}
+      {spec.kind === 'bool' && <BoolControl label={spec.label} onChange={onChange} value={value} />}
       {spec.kind === 'enum' && <EnumControl onChange={onChange} spec={spec} value={value} />}
       {(spec.kind === 'int' || spec.kind === 'float') && (
         <Input
+          aria-label={spec.label}
           inputMode="decimal"
           onBlur={(event) => onChange(clampNumber(spec, event.target.value))}
           onChange={(event) => onChange(event.target.value)}
@@ -113,6 +115,7 @@ export const OptionRow = ({
       )}
       {spec.kind === 'text' && (
         <Input
+          aria-label={spec.label}
           onChange={(event) => onChange(event.target.value)}
           placeholder={placeholderOf(spec)}
           value={value}

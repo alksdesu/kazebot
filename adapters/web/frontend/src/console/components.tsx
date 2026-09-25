@@ -13,6 +13,7 @@ import {
 import { AuthRequired, PageHeader } from '../components/settings/pages/settingsPagePrimitives';
 import { useSettingsStore } from '../store/settingsStore';
 import { useConsoleStore } from './consoleStore';
+import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
 export {
   Block,
@@ -67,7 +68,7 @@ function barState(
   return { tone: 'idle', text: '等待 bot 上报' };
 }
 
-const QqStatusBar = () => {
+const QqStatusBar = ({ confirmDiscard }: { confirmDiscard: () => boolean }) => {
   const adminToken = useSettingsStore((state) => state.adminToken);
   const { live, saving, draft, apply, discard } = useConsoleStore();
   const pending = Object.keys(draft).length;
@@ -83,7 +84,7 @@ const QqStatusBar = () => {
         </>
       )}
       <span className="flex-1" />
-      <Button disabled={pending === 0 || saving} onClick={discard} tone="quiet">丢弃</Button>
+      <Button disabled={pending === 0 || saving} onClick={() => { if (confirmDiscard()) discard(); }} tone="quiet">丢弃</Button>
       <Button disabled={pending === 0 || saving} onClick={() => adminToken && void apply(adminToken)}>
         {saving ? '正在应用…' : '应用'}
       </Button>
@@ -93,6 +94,7 @@ const QqStatusBar = () => {
 
 interface QqPageProps {
   children: ReactNode;
+  alwaysContent?: ReactNode;
   /** 写的不是 qq.yaml 的页面。bot 没跑也该能改，所以不等它公布生效配置。 */
   standalone?: boolean;
   note: string;
@@ -102,9 +104,10 @@ interface QqPageProps {
 /** QQ 域页面的共同外壳：生效状态条、错误提示，以及「bot 还没上报」时的空态。
  *
  * 状态条不进滚动区：改完页尾的开关要能直接点应用，滚回顶部才找得到等于没有。 */
-export const QqPage = ({ children, standalone = false, note, title }: QqPageProps) => {
+export const QqPage = ({ children, alwaysContent, standalone = false, note, title }: QqPageProps) => {
   const { adminToken, isAuthenticated } = useSettingsStore();
-  const { live, loading, error, notice, refresh } = useConsoleStore();
+  const { live, loading, error, notice, refresh, draft } = useConsoleStore();
+  const confirmDiscard = useUnsavedChanges(Object.keys(draft).length > 0, 'QQ 配置还有未应用修改，确定离开或丢弃吗？');
   const parseError = String(live?.state?.parse_error || '');
 
   // 每页各自拉一次。以前由控制台外壳统一拉，拆进设置页之后没有那个共同父级了。
@@ -122,7 +125,7 @@ export const QqPage = ({ children, standalone = false, note, title }: QqPageProp
 
   return (
     <section className="flex h-full min-h-0 flex-col">
-      {isAuthenticated && <QqStatusBar />}
+      {isAuthenticated && !standalone && <QqStatusBar confirmDiscard={confirmDiscard} />}
       <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
         {/* 基准字号。控制台自带的那条 13px 随 console.css 一起没了，不接住的话
             所有靠继承的文本会跳到浏览器默认的 16px，比旁边显式写死的小字大一整档。 */}
@@ -134,9 +137,10 @@ export const QqPage = ({ children, standalone = false, note, title }: QqPageProp
               {notice && <Facts>{notice}</Facts>}
               {parseError && (
                 <ErrorText>
-                  qq.yaml 解析失败：{parseError}。bot 仍在用上一份有效配置，改完应用即可恢复。
+                  qq.yaml 解析失败：{parseError}。bot 仍在用上一份有效配置。请先修复原文件语法；本页不会覆盖损坏文件。
                 </ErrorText>
               )}
+              {alwaysContent}
               {body}
             </>
           )}

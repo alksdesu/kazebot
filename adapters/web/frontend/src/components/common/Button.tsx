@@ -7,6 +7,7 @@ type ButtonVariant = 'primary' | 'ghost' | 'danger';
 
 interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: ButtonVariant;
+  loading?: boolean;
 }
 
 const variantClassName: Record<ButtonVariant, string> = {
@@ -17,15 +18,17 @@ const variantClassName: Record<ButtonVariant, string> = {
   // operation, so they should not look like neutral ghost buttons. How: expose a red
   // variant while preserving the same square Duties button shape. Purpose: callers
   // can mark destructive actions consistently without custom class strings.
-  danger: 'border-red-700 bg-red-950/30 text-red-300 hover:border-red-400 hover:bg-red-900/40 hover:text-red-100',
+  danger: 'border-[var(--duties-danger-border)] bg-[var(--duties-danger-bg)] text-[var(--duties-danger)] hover:bg-[var(--duties-danger-hover)]',
 };
 
-export const Button = ({ children, className = '', variant = 'ghost', type = 'button', ...props }: PropsWithChildren<ButtonProps>) => (
+export const Button = ({ children, className = '', variant = 'ghost', type = 'button', loading = false, disabled, ...props }: PropsWithChildren<ButtonProps>) => (
   <button
-    className={`inline-flex h-10 items-center justify-center border px-3 font-mono text-xs uppercase tracking-[0.18em] transition-colors focus:border-[var(--duties-text)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 ${variantClassName[variant]} ${className}`}
+    className={`app-button inline-flex min-h-10 items-center justify-center gap-2 border px-3 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${variantClassName[variant]} ${className}`}
     type={type}
+    disabled={disabled || loading}
+    aria-busy={loading || undefined}
     {...props}
   >
-    {children}
+    {loading && <span aria-hidden="true" className="app-button-spinner" />}{children}
   </button>
 );

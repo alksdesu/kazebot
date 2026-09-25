@@ -68,7 +68,7 @@ describe('控制台各页', () => {
     const { container } = render(<Fixed name="长度上限" />);
 
     const placeholder = container.querySelector('[aria-hidden]');
-    expect(placeholder).toHaveClass('w-[15px]');
+    expect(placeholder).toHaveClass('w-[var(--duties-checkbox-size)]');
   });
 });
 
@@ -82,7 +82,7 @@ describe('说明文字的缩进', () => {
     );
     const optionDesc = within(option as HTMLElement).getByText('a');
 
-    expect(fixedDesc.className).toContain('ml-[25px]');
-    expect(optionDesc.className).toContain('ml-[25px]');
+    expect(fixedDesc.className).toContain('ml-[var(--duties-option-indent)]');
+    expect(optionDesc.className).toContain('ml-[var(--duties-option-indent)]');
   });
 });

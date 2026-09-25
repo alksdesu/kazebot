@@ -3,6 +3,7 @@
 // control patterns. How: keep the repeated JSX in one local settings helper file.
 // Purpose: new pages stay readable while preserving the existing Duties visual style.
 import type { ReactNode } from 'react';
+import yaml from 'js-yaml';
 
 export const PageShell = ({ children }: { children: ReactNode }) => (
   <section className="h-full min-h-0 overflow-y-auto p-4 sm:p-6">
@@ -10,13 +11,15 @@ export const PageShell = ({ children }: { children: ReactNode }) => (
   </section>
 );
 
-export const PageHeader = ({ eyebrow = '设置', title, description }: { eyebrow?: string; title: string; description: string }) => (
-  <header>
-    <p className="font-mono text-[0.6rem] uppercase tracking-[0.22em] text-[var(--duties-tertiary)]">{eyebrow}</p>
-    <h1 className="mt-2 font-mono text-xl font-semibold tracking-[-0.04em]">{title}</h1>
+export const PageHeader = ({ eyebrow, title, description, level = 1 }: { eyebrow?: string; title: string; description: string; level?: 1 | 2 }) => {
+  const Heading = level === 1 ? 'h1' : 'h2';
+  return (
+  <header aria-label={eyebrow ? `${eyebrow}：${title}` : undefined}>
+    <Heading className={`${level === 1 ? 'text-2xl' : 'text-xl'} font-semibold tracking-tight`}>{title}</Heading>
     <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--duties-secondary)]">{description}</p>
   </header>
-);
+  );
+};
 
 // 一条规则管到哪些渠道。写错过一次：QQ 的权限被当成浏览器设置，没人敢动。
 export type SettingScope = 'all-channels' | 'this-browser';
@@ -28,7 +31,7 @@ const SCOPE_TEXT: Record<SettingScope, string> = {
 
 export const ScopeBadge = ({ scope }: { scope: SettingScope }) => (
   <span
-    className={`flex-shrink-0 border px-1.5 py-0.5 font-mono text-[0.55rem] tracking-[0.08em] ${
+    className={`flex-shrink-0 rounded border px-2 py-0.5 text-xs ${
       scope === 'all-channels'
         ? 'border-[var(--duties-text)] bg-[var(--duties-text)] text-[var(--duties-bg)]'
         : 'border-[var(--duties-border)] text-[var(--duties-secondary)]'
@@ -44,7 +47,7 @@ export const Card = ({ title, description, scope, children }: { title?: string; 
       <div className="mb-3">
         {title && (
           <div className="flex flex-wrap items-center gap-2">
-            <h2 className="font-mono text-sm font-semibold">{title}</h2>
+            <h2 className="text-base font-semibold">{title}</h2>
             {scope && <ScopeBadge scope={scope} />}
           </div>
         )}
@@ -67,35 +70,27 @@ export const AuthRequired = () => (
 );
 
 export const StatusText = ({ message }: { message: string }) => (
-  message ? <p className="mt-2 text-xs leading-5 text-[var(--duties-tertiary)]">{message}</p> : null
+  message ? <p role="status" aria-live="polite" className="mt-2 text-sm leading-6 text-[var(--duties-secondary)]">{message}</p> : null
 );
 
 export const FieldLabel = ({ children, htmlFor }: { children: ReactNode; htmlFor?: string }) => (
-  <label className="mb-1 block text-xs font-semibold text-[var(--duties-secondary)]" htmlFor={htmlFor}>{children}</label>
+  <label className="mb-1 block text-sm font-medium text-[var(--duties-secondary)]" htmlFor={htmlFor}>{children}</label>
 );
 
 export const TextInput = (props: React.InputHTMLAttributes<HTMLInputElement>) => (
   <input
     {...props}
-    className={`w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)] ${props.className || ''}`}
+    className={`w-full min-w-0 rounded border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)] ${props.className || ''}`}
   />
 );
 
 export const SelectInput = (props: React.SelectHTMLAttributes<HTMLSelectElement>) => (
   <select
     {...props}
-    className={`w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)] ${props.className || ''}`}
+    className={`w-full min-w-0 rounded border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)] ${props.className || ''}`}
   />
 );
 
 export function hasLikelyYamlSyntaxIssue(value: string): string {
-  // [2026-06-02] Lightweight frontend YAML check. Why: js-yaml is not installed and
-  // adding a dependency is unnecessary for this task. How: catch leading tab
-  // indentation and unclosed quotes before saving, then let the backend perform final
-  // validation. Purpose: users get immediate feedback for common raw-config mistakes.
-  if (value.split('\n').some((line) => /^\t+/.test(line))) return 'YAML 缩进不能使用制表符。';
-  const singleQuotes = (value.match(/'/g) || []).length;
-  const doubleQuotes = (value.match(/"/g) || []).length;
-  if (singleQuotes % 2 === 1 || doubleQuotes % 2 === 1) return '文本中可能存在未闭合的引号。';
-  return '';
+  try { yaml.load(value); return ''; } catch (error) { return error instanceof Error ? error.message : 'YAML 语法错误'; }
 }

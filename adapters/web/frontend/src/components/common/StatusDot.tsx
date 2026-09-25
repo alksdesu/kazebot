@@ -6,11 +6,11 @@
 import type { ChildNodeStatus } from '../../store/chatStore';
 
 const statusColors: Record<ChildNodeStatus, string> = {
-  running: 'bg-green-500 animate-pulse',
-  awaiting_approval: 'bg-orange-400',
-  completed: 'bg-gray-400',
-  failed: 'bg-red-500',
-  cancelled: 'bg-gray-400',
+  running: 'bg-[var(--duties-live)] animate-pulse',
+  awaiting_approval: 'bg-[var(--duties-accent)]',
+  completed: 'bg-[var(--duties-tertiary)]',
+  failed: 'bg-[var(--duties-danger)]',
+  cancelled: 'bg-[var(--duties-tertiary)]',
 };
 
 const statusLabels: Record<ChildNodeStatus, string> = {
@@ -38,7 +38,7 @@ export function getChildNodeStatusLabel(status: ChildNodeStatus | string): strin
 export const StatusDot = ({ status, label, className = '' }: StatusDotProps) => (
   <span
     aria-label={label}
-    className={`inline-block h-2 w-2 rounded-full ${statusColors[status as ChildNodeStatus] || 'bg-gray-400'} ${className}`}
+    className={`inline-block h-2 w-2 rounded-full ${statusColors[status as ChildNodeStatus] || 'bg-[var(--duties-tertiary)]'} ${className}`}
   />
 );
 

@@ -11,6 +11,11 @@ import { AttachFileW400 } from '@material-symbols-svg/react/icons/attach-file';
 import { BuildW400 } from '@material-symbols-svg/react/icons/build';
 import { CableW400 } from '@material-symbols-svg/react/icons/cable';
 import { CancelW400 } from '@material-symbols-svg/react/icons/cancel';
+import { ChatW400 } from '@material-symbols-svg/react/icons/chat';
+import { ChecklistW400 } from '@material-symbols-svg/react/icons/checklist';
+import { FolderOpenW400 } from '@material-symbols-svg/react/icons/folder-open';
+import { ForumW400 } from '@material-symbols-svg/react/icons/forum';
+import { GroupsW400 } from '@material-symbols-svg/react/icons/groups';
 import { CheckCircleW400 } from '@material-symbols-svg/react/icons/check-circle';
 import { ChevronLeftW400 } from '@material-symbols-svg/react/icons/chevron-left';
 import { ChevronRightW400 } from '@material-symbols-svg/react/icons/chevron-right';
@@ -52,6 +57,11 @@ import { WarningW400 } from '@material-symbols-svg/react/icons/warning';
 type SvgIcon = ComponentType<SVGProps<SVGSVGElement>>;
 
 const ICON_MAP: Record<string, SvgIcon> = {
+  chat: ChatW400,
+  checklist: ChecklistW400,
+  folder_open: FolderOpenW400,
+  forum: ForumW400,
+  groups: GroupsW400,
   account_circle: AccountCircleW400,
   approval: ApprovalW400,
   arrow_back: ArrowBackW400,
