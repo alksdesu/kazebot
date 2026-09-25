@@ -27,7 +27,7 @@ function kindName(row: ConversationDescriptor): string {
 }
 
 function baseName(row: ConversationDescriptor, webTitles: ReadonlyMap<string, string>): string {
-  if (row.scope === 'web:console') return '控制台';
+  if (row.scope === 'web:console') return '控制台会话（非全局）';
   if (row.scope === 'web:materials') return '资料工作区';
   const kind = kindName(row);
   const label = cleanName(row.owner?.label);

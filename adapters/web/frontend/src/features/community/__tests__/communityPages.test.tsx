@@ -1,25 +1,33 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as api from '../../../api/supervisorClient';
+import { useSettingsStore } from '../../../store/settingsStore';
 import { featureRequest } from '../../client';
 import { CommunityPage } from '../CommunityPage';
 import { ConversationSettings } from '../ConversationSettings';
 import type { CommunityState } from '../types';
 
 vi.mock('../../client', () => ({ featureRequest: vi.fn() }));
-vi.mock('../../execution/ScopeSelect', () => ({ ScopeSelect: ({ value, onChange }: { value: string; onChange: (value: string) => void }) => <select aria-label="所属会话" value={value} onChange={event => onChange(event.target.value)}><option value="qq_group:a">群 A</option><option value="qq_group:b">群 B</option></select> }));
+vi.mock('../../../api/supervisorClient', async original => ({ ...await original<typeof import('../../../api/supervisorClient')>(), getConversations: vi.fn() }));
 
 const request = vi.mocked(featureRequest);
 let state: CommunityState;
 let activities: unknown[];
 
 beforeEach(() => {
+  vi.spyOn(window, 'confirm').mockReturnValue(true);
+  useSettingsStore.setState({ adminToken: 'community-fixture', isAuthenticated: true });
+  vi.mocked(api.getConversations).mockResolvedValue(['a', 'b'].map(id => ({ conversation_key: `qq_group:${id}`, session_id: id, channel: 'qq', bytes: 0, updated_at: 0, current_account: true, owner: { kind: 'group', label: `群 ${id}`, name_available: true } })));
   activities = [];
   state = { scope: 'qq_group:a', revision: 0, guide: {}, quiet: {}, settings: {
     response_policy_enabled: false, topic_enabled: false, merge_window_sec: 0,
     merge_max_wait_sec: 4, reply_budget_per_minute: 6, welcome_enabled: false,
   } };
+  const { welcome_enabled: _welcome, ...policy } = state.settings;
+  state.defaults = { ...policy }; state.overrides = { ...policy }; state.inherited_fields = []; state.defaults_revision = 0;
   request.mockReset();
   request.mockImplementation(async (path, options = {}) => {
+    if (path.endsWith('/settings/scopes')) return { items: [] };
     if (path.endsWith('/activities') && options.method === 'POST') {
       activities = [{ id: 'A123', ...(options.body as object), status: 'open', participants: [], remaining: 8 }];
       return activities[0];
@@ -27,6 +35,14 @@ beforeEach(() => {
     if (path.endsWith('/activities')) return { items: activities };
     if (path.endsWith('/guide')) { state.guide = options.body as CommunityState['guide']; return state; }
     if (path.endsWith('/settings')) { Object.assign(state.settings, options.body); return structuredClone(state); }
+    if (path.endsWith('/settings/overrides')) {
+      const body = options.body as { values: object; reset_fields: (keyof typeof policy)[] };
+      Object.assign(state.overrides!, body.values);
+      for (const key of body.reset_fields) delete state.overrides![key];
+      state.settings = { ...state.defaults!, ...state.overrides, welcome_enabled: state.settings.welcome_enabled }; state.revision++;
+      state.inherited_fields = (Object.keys(policy) as (keyof typeof policy)[]).filter(key => !(key in state.overrides!));
+      return structuredClone(state);
+    }
     if (path.endsWith('/decisions')) return { items: [] };
     if (path.endsWith('/quiet')) {
       const body = options.body as { mode: string; duration_sec: number };
@@ -36,11 +52,12 @@ beforeEach(() => {
     return structuredClone(state);
   });
 });
+afterEach(() => vi.restoreAllMocks());
 
 describe('群协作真实请求流程', () => {
   it('创建活动后读取服务端的编号和名额', async () => {
     render(<CommunityPage scope="qq_group:a" />);
-    fireEvent.change(screen.getByLabelText('活动标题'), { target: { value: '周六聚餐' } });
+    fireEvent.change(await screen.findByLabelText('活动标题'), { target: { value: '周六聚餐' } });
     fireEvent.change(screen.getByLabelText('活动名额'), { target: { value: '8' } });
     fireEvent.click(screen.getByRole('button', { name: '创建' }));
     expect(await screen.findByText(/A123/)).toBeTruthy();
@@ -63,7 +80,7 @@ describe('群协作真实请求流程', () => {
     const checkbox = await screen.findByRole('checkbox', { name: '统一选择忽略、表态、短答和办事' });
     fireEvent.click(checkbox);
     fireEvent.change(screen.getByLabelText('同人短句等待秒数'), { target: { value: '1.2' } });
-    fireEvent.click(screen.getByRole('button', { name: '保存对话设置' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存会话覆盖' }));
     await waitFor(() => expect(state.settings.merge_window_sec).toBe(1.2));
     fireEvent.click(screen.getByRole('button', { name: '完全安静' }));
     await waitFor(() => expect(state.quiet.mode).toBe('silent'));
@@ -75,31 +92,35 @@ describe('群协作真实请求流程', () => {
 
   it('后端拒绝操作时显示原因并保留原状态', async () => {
     request.mockImplementation(async path => {
-      if (path.endsWith('/settings')) throw new Error('403 需要本群管理权限');
+      if (path.endsWith('/settings/scopes')) return { items: [] };
+      if (path.endsWith('/settings/overrides')) throw new Error('403 需要本群管理权限');
       if (path.endsWith('/decisions')) return { items: [] };
       return state;
     });
     render(<ConversationSettings scope="qq_group:a" />);
-    fireEvent.click(await screen.findByRole('button', { name: '保存对话设置' }));
+    fireEvent.click(await screen.findByLabelText('统一选择忽略、表态、短答和办事'));
+    fireEvent.click(screen.getByRole('button', { name: '保存会话覆盖' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('需要本群管理权限');
   });
 });
 
 it.each([
   ['协作', CommunityPage, '发布群指引', '/guide'],
-  ['设置', ConversationSettings, '保存对话设置', '/settings'],
+  ['设置', ConversationSettings, '保存会话覆盖', '/settings/overrides'],
 ] as const)('切换群后丢弃旧群%s操作的迟到刷新', async (_name, Page, button, endpoint) => {
   let finish!: (value: unknown) => void;
   request.mockImplementation(async (path, options = {}) => {
+    if (path.endsWith('/settings/scopes')) return { items: [] };
     if (path.endsWith(endpoint) && options.scope === 'qq_group:a') return new Promise(resolve => { finish = resolve; });
     if (path.endsWith('/activities') || path.endsWith('/decisions')) return { items: [] };
-    return { ...structuredClone(state), scope: options.scope, guide: { rules: options.scope === 'qq_group:a' ? '甲群规' : '乙群规' }, settings: { ...state.settings, merge_window_sec: options.scope === 'qq_group:a' ? 1 : 2 } };
+    return { ...structuredClone(state), scope: options.scope, guide: { rules: options.scope === 'qq_group:a' ? '甲群规' : '乙群规' }, settings: { ...state.settings, merge_window_sec: options.scope === 'qq_group:a' ? 1 : 2 }, overrides: { ...state.overrides, merge_window_sec: options.scope === 'qq_group:a' ? 1 : 2 } };
   });
   render(<Page scope="qq_group:a" />);
+  if (_name === '设置') fireEvent.click(await screen.findByLabelText('统一选择忽略、表态、短答和办事'));
   fireEvent.click(await screen.findByRole('button', { name: button }));
   await waitFor(() => expect(finish).toBeTypeOf('function'));
-  fireEvent.change(screen.getByLabelText('所属会话'), { target: { value: 'qq_group:b' } });
-  await waitFor(() => expect(screen.getByRole('button', { name: button })).toBeEnabled());
+  fireEvent.change(screen.getByLabelText(_name === '设置' ? '配置作用域' : '所属会话'), { target: { value: 'qq_group:b' } });
+  await screen.findByRole('button', { name: button });
   const before = request.mock.calls.length;
   finish({});
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -145,8 +166,8 @@ it('preserves decimal input while editing and validates the numeric range before
   render(<ConversationSettings scope="qq_group:a" />);
   const input = await screen.findByLabelText('同人短句等待秒数');
   fireEvent.change(input, { target: { value: '' } });
-  expect(input).toHaveValue(''); expect(screen.getByRole('button', { name: '保存对话设置' })).toBeDisabled();
+  expect(input).toHaveValue(''); expect(screen.getByRole('button', { name: '保存会话覆盖' })).toBeDisabled();
   for (const value of ['1', '1.', '1.2']) { fireEvent.change(input, { target: { value } }); expect(input).toHaveValue(value); }
-  fireEvent.click(screen.getByRole('button', { name: '保存对话设置' }));
+  fireEvent.click(screen.getByRole('button', { name: '保存会话覆盖' }));
   await waitFor(() => expect(state.settings.merge_window_sec).toBe(1.2));
 });

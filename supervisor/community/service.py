@@ -9,15 +9,22 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from fastapi import HTTPException
 
-DEFAULT_SETTINGS = {
+
+POLICY_DEFAULTS = {
     "response_policy_enabled": False,
     "topic_enabled": False,
     "merge_window_sec": 0.0,
     "merge_max_wait_sec": 4.0,
     "reply_budget_per_minute": 6,
-    "welcome_enabled": False,
 }
+POLICY_FIELDS = tuple(POLICY_DEFAULTS)
+DEFAULT_SETTINGS = {**POLICY_DEFAULTS, "welcome_enabled": False}
+
+
+class SettingsConflict(ValueError):
+    pass
 
 
 class CommunityService:
@@ -30,6 +37,10 @@ class CommunityService:
                 CREATE TABLE IF NOT EXISTS groups (
                     scope TEXT PRIMARY KEY, settings TEXT NOT NULL DEFAULT '{}',
                     guide TEXT NOT NULL DEFAULT '{}', quiet TEXT NOT NULL DEFAULT '{}', revision INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS conversation_defaults (
+                    id INTEGER PRIMARY KEY CHECK (id=1), settings TEXT NOT NULL DEFAULT '{}',
+                    revision INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS activities (
                     id TEXT PRIMARY KEY, scope TEXT NOT NULL, data TEXT NOT NULL, updated REAL NOT NULL
@@ -54,8 +65,10 @@ class CommunityService:
                     scope TEXT NOT NULL, ref TEXT NOT NULL, data TEXT NOT NULL, created REAL NOT NULL,
                     PRIMARY KEY(scope, ref)
                 );
-                PRAGMA user_version=1;
             """)
+            db.execute("INSERT OR IGNORE INTO conversation_defaults(id) VALUES (1)")
+            if db.execute("PRAGMA user_version").fetchone()[0] in {0, 1}:
+                db.execute("PRAGMA user_version=2")
 
     @contextmanager
     def _db(self, write: bool = False):
@@ -80,6 +93,24 @@ class CommunityService:
         actor.require_scope(scope)
         return scope
 
+    @classmethod
+    def _group_scope(cls, actor) -> str:
+        scope = cls._scope(actor)
+        if not scope.startswith("qq_group:") or not scope.removeprefix("qq_group:"):
+            raise ValueError("这项群协作功能只能用于 QQ 群，请先选择一个群")
+        return scope
+
+    @staticmethod
+    def _inherits_defaults(scope: str) -> bool:
+        prefix, _, identity = scope.partition(":")
+        return prefix in {"qq_group", "qq_private"} and bool(identity.strip())
+
+    @staticmethod
+    def _require_defaults_actor(actor) -> None:
+        if not actor.is_admin or actor.channel != "web" or actor.owner != "console:admin":
+            raise HTTPException(status_code=403, detail="全局默认只能由当前实例的控制台管理员设置")
+        actor.require_interaction()
+
     @staticmethod
     def _dump(value) -> str:
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -91,18 +122,173 @@ class CommunityService:
             raise ValueError(f"内容不能超过 {limit} 字")
         return text
 
-    def state(self, actor) -> dict[str, Any]:
-        scope = self._scope(actor)
-        with self._db() as db:
-            row = db.execute("SELECT * FROM groups WHERE scope=?", (scope,)).fetchone()
-        settings = dict(DEFAULT_SETTINGS)
+    @staticmethod
+    def _stored_settings(raw: str) -> dict:
+        try:
+            settings = json.loads(raw)
+        except (ValueError, TypeError) as error:
+            raise ValueError("已保存的对话设置损坏，请先恢复有效数据，当前内容未修改") from error
+        if not isinstance(settings, dict):
+            raise ValueError("已保存的对话设置必须是对象，当前内容未修改")
+        return settings
+
+    @classmethod
+    def _parse_values(cls, values: dict, *, policy_only: bool = True, legacy: bool = False) -> dict:
+        if not isinstance(values, dict):
+            raise ValueError("设置值必须是对象")
+        parsed = {}
+        allowed = POLICY_FIELDS if policy_only else DEFAULT_SETTINGS
+        for key, value in values.items():
+            if key not in allowed:
+                raise ValueError(f"未知对话设置：{key}")
+            if isinstance(DEFAULT_SETTINGS[key], bool):
+                if type(value) is not bool:
+                    raise ValueError(f"{key} 必须是开关")
+                parsed[key] = value
+            elif key == "reply_budget_per_minute":
+                if type(value) is not int or not 1 <= value <= 60:
+                    raise ValueError("每分钟回复预算应为 1～60 的整数")
+                parsed[key] = value
+            else:
+                if legacy and isinstance(value, str):
+                    try:
+                        value = float(value)
+                    except ValueError as error:
+                        raise ValueError("合并等待时间应为 0～10 秒的有限数值") from error
+                if type(value) not in {int, float} or not 0 <= value <= 10 or not math.isfinite(value):
+                    raise ValueError("合并等待时间应为 0～10 秒的有限数值")
+                parsed[key] = float(value)
+        return parsed
+
+    @staticmethod
+    def _validate_pair(settings: dict) -> None:
+        if settings["merge_max_wait_sec"] < settings["merge_window_sec"]:
+            raise ValueError("最长等待时间不能小于短句等待窗口，请同时检查实例默认和本会话覆盖")
+
+    @classmethod
+    def _patch(cls, body: dict, *, local: bool = False) -> tuple[dict, list[str]]:
+        allowed = {"values", "reset_fields", "expected_revision"}
+        if local:
+            allowed.add("expected_defaults_revision")
+        if not isinstance(body, dict) or set(body) - allowed:
+            raise ValueError("设置请求包含未知字段或不是对象")
+        for key in ("expected_revision", "expected_defaults_revision") if local else ("expected_revision",):
+            if type(body.get(key)) is not int or body[key] < 0:
+                raise ValueError("请提供有效的非负整数设置版本")
+        values = cls._parse_values(body.get("values", {}))
+        reset = body.get("reset_fields", [])
+        if not isinstance(reset, list) or any(not isinstance(key, str) or key not in POLICY_FIELDS for key in reset):
+            raise ValueError("恢复继承字段必须是接话策略字段列表")
+        if len(set(reset)) != len(reset) or set(reset) & set(values):
+            raise ValueError("恢复继承字段不能重复，也不能同时设置和恢复同一字段")
+        return values, reset
+
+    @classmethod
+    def _defaults_in(cls, db) -> dict:
+        row = db.execute("SELECT settings,revision FROM conversation_defaults WHERE id=1").fetchone()
+        values = cls._parse_values(cls._stored_settings(row["settings"]))
+        settings = {key: values.get(key, DEFAULT_SETTINGS[key]) for key in POLICY_FIELDS}
+        cls._validate_pair(settings)
+        return {"settings": settings, "values": values, "revision": row["revision"]}
+
+    def _defaults_for_scope(self, db, scope: str) -> dict:
+        if self._inherits_defaults(scope):
+            return self._defaults_in(db)
+        return {"settings": {key: DEFAULT_SETTINGS[key] for key in POLICY_FIELDS}, "values": {}, "revision": 0}
+
+    @classmethod
+    def _local_settings(cls, row) -> dict:
+        settings = cls._stored_settings(row["settings"]) if row else {}
+        return cls._parse_values(settings, policy_only=False)
+
+    def _state_in(self, db, scope: str) -> dict[str, Any]:
+        defaults = self._defaults_for_scope(db, scope)
+        row = db.execute("SELECT * FROM groups WHERE scope=?", (scope,)).fetchone()
+        local = self._local_settings(row)
+        settings = {**DEFAULT_SETTINGS, **defaults["settings"], **local}
+        self._validate_pair(settings)
         guide, quiet, revision = {}, {}, 0
         if row:
-            settings.update(json.loads(row["settings"]))
             guide, quiet, revision = json.loads(row["guide"]), json.loads(row["quiet"]), row["revision"]
         if quiet and float(quiet.get("expires_at", 0)) <= time.time():
             quiet = {}
-        return {"scope": scope, "settings": settings, "guide": guide, "quiet": quiet, "revision": revision}
+        overrides = {key: local[key] for key in POLICY_FIELDS if key in local}
+        return {"scope": scope, "settings": settings, "guide": guide, "quiet": quiet, "revision": revision,
+                "defaults": defaults["settings"], "overrides": overrides,
+                "inherited_fields": [key for key in POLICY_FIELDS if key not in overrides],
+                "defaults_revision": defaults["revision"]}
+
+    def state(self, actor) -> dict[str, Any]:
+        scope = self._scope(actor)
+        with self._db() as db:
+            db.execute("BEGIN")
+            return self._state_in(db, scope)
+
+    def guide(self, actor) -> dict[str, Any]:
+        self._group_scope(actor)
+        return self.state(actor)
+
+    def defaults(self, actor) -> dict:
+        self._require_defaults_actor(actor)
+        with self._db() as db:
+            return self._defaults_in(db)
+
+    def settings_scopes(self, actor) -> list[str]:
+        self._require_defaults_actor(actor)
+        with self._db() as db:
+            rows = db.execute("SELECT scope,settings FROM groups ORDER BY scope").fetchall()
+        scopes = []
+        for row in rows:
+            if not self._inherits_defaults(row["scope"]):
+                continue
+            settings = self._stored_settings(row["settings"])
+            if set(settings) & set(POLICY_FIELDS):
+                scopes.append(row["scope"])
+        return scopes
+
+    def update_defaults(self, actor, body: dict) -> dict:
+        self._require_defaults_actor(actor)
+        values, reset = self._patch(body)
+        with self._db(True) as db:
+            previous = self._defaults_in(db)
+            if body["expected_revision"] != previous["revision"]:
+                raise SettingsConflict("实例默认已被修改，请刷新后重试，当前草稿尚未保存")
+            updated = {key: value for key, value in previous["values"].items() if key not in reset}
+            updated.update(values)
+            effective = {key: updated.get(key, DEFAULT_SETTINGS[key]) for key in POLICY_FIELDS}
+            self._validate_pair(effective)
+            conflicts = 0
+            for row in db.execute("SELECT scope,settings FROM groups"):
+                if not self._inherits_defaults(row["scope"]):
+                    continue
+                local = self._local_settings(row)
+                try:
+                    self._validate_pair({**effective, **local})
+                except ValueError:
+                    conflicts += 1
+            if conflicts:
+                raise ValueError(f"实例默认会与 {conflicts} 个会话的等待时间覆盖冲突，请先调整相关覆盖，或同时修改两个等待值；此次修改未保存")
+            if updated != previous["values"]:
+                db.execute("UPDATE conversation_defaults SET settings=?,revision=revision+1 WHERE id=1", (self._dump(updated),))
+            return self._defaults_in(db)
+
+    def update_overrides(self, actor, body: dict) -> dict:
+        scope = self._scope(actor)
+        actor.require_manager(scope)
+        values, reset = self._patch(body, local=True)
+        with self._db(True) as db:
+            defaults = self._defaults_for_scope(db, scope)
+            row = db.execute("SELECT settings,revision FROM groups WHERE scope=?", (scope,)).fetchone()
+            if body["expected_revision"] != (row["revision"] if row else 0) or body["expected_defaults_revision"] != defaults["revision"]:
+                raise SettingsConflict("会话设置或实例默认已被修改，请刷新后重试，当前草稿尚未保存")
+            current = self._local_settings(row)
+            updated = {key: value for key, value in current.items() if key not in reset}
+            updated.update(values)
+            self._validate_pair({**defaults["settings"], **updated})
+            if updated != current:
+                db.execute("INSERT OR IGNORE INTO groups(scope) VALUES (?)", (scope,))
+                db.execute("UPDATE groups SET settings=?,revision=revision+1 WHERE scope=?", (self._dump(updated), scope))
+            return self._state_in(db, scope)
 
     def clear_context(self, scope: str) -> None:
         with self._db(True) as db:
@@ -112,34 +298,27 @@ class CommunityService:
     def update_settings(self, actor, changes: dict) -> dict:
         scope = self._scope(actor)
         actor.require_manager(scope)
-        parsed = {}
-        for key, value in changes.items():
-            if key not in DEFAULT_SETTINGS:
-                raise ValueError(f"未知对话设置：{key}")
-            if isinstance(DEFAULT_SETTINGS[key], bool):
-                if not isinstance(value, bool):
-                    raise ValueError(f"{key} 必须是开关")
-                parsed[key] = value
-            elif key == "reply_budget_per_minute":
-                if type(value) is not int or not 1 <= value <= 60:
-                    raise ValueError("每分钟回复预算应为 1～60")
-                parsed[key] = int(value)
-            else:
-                number = float(value)
-                if not 0 <= number <= 10:
-                    raise ValueError("合并等待时间应为 0～10 秒")
-                parsed[key] = number
+        parsed = self._parse_values(changes, policy_only=False, legacy=True)
+        ignore_welcome = "welcome_enabled" in parsed and (not scope.startswith("qq_group:") or not scope.removeprefix("qq_group:").strip())
+        if ignore_welcome:
+            if parsed["welcome_enabled"]:
+                self._group_scope(actor)
+            parsed.pop("welcome_enabled")
         with self._db(True) as db:
-            db.execute("INSERT OR IGNORE INTO groups(scope) VALUES (?)", (scope,))
-            current = json.loads(db.execute("SELECT settings FROM groups WHERE scope=?", (scope,)).fetchone()[0])
-            current.update(parsed)
-            if current.get("merge_max_wait_sec", 4) < current.get("merge_window_sec", 0):
-                raise ValueError("最长等待时间不能小于短句等待窗口")
-            db.execute("UPDATE groups SET settings=?, revision=revision+1 WHERE scope=?", (self._dump(current), scope))
-        return self.state(actor)
+            row = db.execute("SELECT settings FROM groups WHERE scope=?", (scope,)).fetchone()
+            current = self._local_settings(row)
+            updated = {**current, **parsed}
+            if ignore_welcome:
+                updated.pop("welcome_enabled", None)
+            defaults = self._defaults_for_scope(db, scope)
+            self._validate_pair({**defaults["settings"], **updated})
+            if updated != current:
+                db.execute("INSERT OR IGNORE INTO groups(scope) VALUES (?)", (scope,))
+                db.execute("UPDATE groups SET settings=?, revision=revision+1 WHERE scope=?", (self._dump(updated), scope))
+            return self._state_in(db, scope)
 
     def update_guide(self, actor, body: dict) -> dict:
-        scope = self._scope(actor)
+        scope = self._group_scope(actor)
         actor.require_manager(scope)
         guide = {
             "rules": self._text(body.get("rules"), 12000),
@@ -151,7 +330,7 @@ class CommunityService:
         with self._db(True) as db:
             db.execute("INSERT OR IGNORE INTO groups(scope) VALUES (?)", (scope,))
             db.execute("UPDATE groups SET guide=?,revision=revision+1 WHERE scope=?", (self._dump(guide), scope))
-        return self.state(actor)
+            return self._state_in(db, scope)
 
     def set_quiet(self, actor, mode: str, duration_sec: float = 1800) -> dict:
         scope = self._scope(actor)
@@ -168,10 +347,10 @@ class CommunityService:
         with self._db(True) as db:
             db.execute("INSERT OR IGNORE INTO groups(scope) VALUES (?)", (scope,))
             db.execute("UPDATE groups SET quiet=?,revision=revision+1 WHERE scope=?", (self._dump(quiet), scope))
-        return self.state(actor)
+            return self._state_in(db, scope)
 
     def activities(self, actor) -> list[dict]:
-        scope = self._scope(actor)
+        scope = self._group_scope(actor)
         with self._db() as db:
             rows = db.execute("SELECT data FROM activities WHERE scope=? ORDER BY updated DESC LIMIT 100", (scope,))
             return [self._public_activity(json.loads(row[0]), actor.owner) for row in rows]
@@ -188,7 +367,7 @@ class CommunityService:
         return result
 
     def create_activity(self, actor, body: dict) -> dict:
-        scope = self._scope(actor)
+        scope = self._group_scope(actor)
         actor.require_manager(scope)
         kind = body.get("kind", "event")
         title = self._text(body.get("title"), 200)
@@ -234,7 +413,7 @@ class CommunityService:
         return result
 
     def activity_action(self, actor, identity: str, action: str, body: dict) -> dict:
-        scope = self._scope(actor)
+        scope = self._group_scope(actor)
         if action in {"close", "cancel", "remind"}:
             actor.require_manager(scope)
         operation_key = f"activity:{identity}:{actor.owner}:{actor.message_id}:{action}" if actor.message_id and action != "view" else ""
@@ -302,7 +481,7 @@ class CommunityService:
             return result
 
     def notice(self, actor, body: dict) -> dict:
-        scope = self._scope(actor)
+        scope = self._group_scope(actor)
         actor.require_manager(scope)
         state = self.state(actor)
         if not state["settings"]["welcome_enabled"] or body.get("notice_type") != "group_increase":
@@ -322,7 +501,7 @@ class CommunityService:
         return {"queued": True}
 
     def notifications(self, actor) -> list[dict]:
-        scope = self._scope(actor)
+        scope = self._group_scope(actor)
         actor.require_manager(scope)
         now = time.time()
         state = self.state(actor)
@@ -348,7 +527,7 @@ class CommunityService:
             return results
 
     def acknowledge_notification(self, actor, identity: str, message_id: str) -> dict:
-        scope = self._scope(actor)
+        scope = self._group_scope(actor)
         actor.require_manager(scope)
         if not message_id:
             raise ValueError("发送确认缺少平台消息 ID")

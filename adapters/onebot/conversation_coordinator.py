@@ -18,27 +18,65 @@ class PendingBurst:
     identity: Any
 
 
+@dataclass
+class PendingPolicy:
+    task: asyncio.Task | None = None
+    invalidated: bool = False
+
+
 class ConversationCoordinator:
     def __init__(self):
         self.messages: OrderedDict[tuple[str, str], dict] = OrderedDict()
         self.policies: OrderedDict[str, tuple[float, dict]] = OrderedDict()
+        self._policy_requests: dict[str, PendingPolicy] = {}
         self.bursts: dict[str, PendingBurst] = {}
         self.replies: dict[str, deque[float]] = defaultdict(deque)
 
     async def policy(self, client, actor, *, refresh=False):
         scope = actor["scope"]
-        cached = self.policies.get(scope)
-        if cached and not refresh and time.monotonic() - cached[0] < 3:
-            return cached[1]
-        state = await client.request_feature("GET", "/v1/community/state", actor=actor)
-        self.policies[scope] = (time.monotonic(), state)
-        self.policies.move_to_end(scope)
-        while len(self.policies) > 512:
-            self.policies.popitem(last=False)
-        return state
+        for _ in range(2):
+            cached = self.policies.get(scope)
+            if cached and not refresh and time.monotonic() - cached[0] < 3:
+                self.policies.move_to_end(scope)
+                return cached[1]
+            pending = self._policy_requests.get(scope)
+            if pending is None:
+                if len(self._policy_requests) >= 512:
+                    raise RuntimeError("Too many conversation policy requests")
+                pending = PendingPolicy()
+                self._policy_requests[scope] = pending
+                pending.task = asyncio.create_task(self._load_policy(client, dict(actor), pending))
+                pending.task.add_done_callback(self._consume_policy_error)
+            await asyncio.shield(pending.task)
+            cached = self.policies.get(scope)
+            if cached and time.monotonic() - cached[0] < 3:
+                self.policies.move_to_end(scope)
+                return cached[1]
+        raise RuntimeError("Conversation policy changed during refresh; retry later")
+
+    async def _load_policy(self, client, actor, pending):
+        scope = actor["scope"]
+        try:
+            state = await client.request_feature("GET", "/v1/community/state", actor=actor)
+            if not pending.invalidated:
+                self.policies[scope] = (time.monotonic(), state)
+                self.policies.move_to_end(scope)
+                while len(self.policies) > 512:
+                    self.policies.popitem(last=False)
+        finally:
+            if self._policy_requests.get(scope) is pending:
+                self._policy_requests.pop(scope)
+
+    @staticmethod
+    def _consume_policy_error(task):
+        if not task.cancelled():
+            task.exception()
 
     def invalidate(self, scope):
         self.policies.pop(scope, None)
+        pending = self._policy_requests.get(scope)
+        if pending is not None:
+            pending.invalidated = True
 
     def clear_context(self, scope):
         for key in [key for key in self.messages if key[0] == scope]:

@@ -80,18 +80,23 @@ describe('共享会话名称', () => {
   it.each([
     ['提醒', RemindersPage, '/v1/reminders'], ['任务', ExecutionPage, '/v1/execution/plans'],
     ['群协作', CommunityPage, '/v1/community/activities'], ['会话设置', ConversationSettings, '/v1/community/state'],
-  ] as const)('真实%s页选名称后读取请求仍携带原key', async (_name, Page, endpoint) => {
+  ] as const)('真实%s页选名称后读取请求仍携带原key', async (name, Page, endpoint) => {
+    const selectedScope = name === '群协作' ? group : person;
+    const selectedName = name === '群协作' ? '周末群' : '小周';
+    const policy = { response_policy_enabled: false, topic_enabled: false, merge_window_sec: 0, merge_max_wait_sec: 4, reply_budget_per_minute: 6 };
     vi.mocked(featureRequest).mockImplementation(async (path, options) => {
-      if (path.endsWith('/state')) return { scope: options?.scope, revision: 0, guide: {}, quiet: {}, settings: { response_policy_enabled: false, topic_enabled: false, merge_window_sec: 0, merge_max_wait_sec: 4, reply_budget_per_minute: 6, welcome_enabled: false } } as never;
+      if (path.endsWith('/settings/scopes')) return { items: [] } as never;
+      if (path.endsWith('/state')) return { scope: options?.scope, revision: 0, guide: {}, quiet: {}, settings: { ...policy, welcome_enabled: false }, defaults: policy, overrides: {}, inherited_fields: Object.keys(policy), defaults_revision: 0 } as never;
+      if (path.endsWith('/settings/defaults')) return { settings: policy, values: {}, revision: 0 } as never;
       if (path.endsWith('/plans')) return { plans: [] } as never;
       if (path.endsWith('/tools')) return { tools: [] } as never;
       if (path.endsWith('/activities') || path.endsWith('/decisions')) return { items: [] } as never;
       return { reminders: [] } as never;
     });
-    vi.mocked(api.getConversations).mockResolvedValue([row(person, '小周')]); render(<Page />);
-    await screen.findByRole('option', { name: '小周' }); fireEvent.change(screen.getByLabelText('所属会话'), { target: { value: person } });
-    await waitFor(() => expect(featureRequest).toHaveBeenCalledWith(endpoint, expect.objectContaining({ scope: person })));
-    expect(screen.getByText('当前范围：小周')).toBeInTheDocument();
+    vi.mocked(api.getConversations).mockResolvedValue([row(selectedScope, selectedName)]); render(<Page />);
+    await screen.findByRole('option', { name: selectedName }); fireEvent.change(screen.getByLabelText(name === '会话设置' ? '配置作用域' : '所属会话'), { target: { value: selectedScope } });
+    await waitFor(() => expect(featureRequest).toHaveBeenCalledWith(endpoint, expect.objectContaining({ scope: selectedScope })));
+    expect(screen.getByText(`当前范围：${selectedName}`)).toBeInTheDocument();
   });
   it('联合identity区分同scope不同机器人，名称视为文本并移除控制字符', () => {
     const names = conversationNames([{ scope: group, bot_scope: 'one', owner: { kind: 'group', label: '<img>\n相同' } }, { scope: group, bot_scope: 'two', owner: { kind: 'group', label: '<img>\n相同' } }]);

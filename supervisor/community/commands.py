@@ -33,7 +33,7 @@ def command(service, actor, body: dict) -> dict | None:
         result = HELP
     elif name in {"/群规", "/群资料", "/常见问题"}:
         key = {"/群规": "rules", "/群资料": "resources", "/常见问题": "faq"}[name]
-        result = service.state(actor)["guide"].get(key) or "本群还没有发布这部分指引，请联系群管理员。"
+        result = service.guide(actor)["guide"].get(key) or "本群还没有发布这部分指引，请联系群管理员。"
     elif name in {"/旁听", "/安静", "/恢复", "/安静状态"}:
         if name == "/安静状态":
             state = service.state(actor)

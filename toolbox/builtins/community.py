@@ -8,7 +8,7 @@ async def community(args, ctx):
     if operation == "list":
         return await request(ctx, "GET", "/v1/community/activities")
     if operation == "guide":
-        return await request(ctx, "GET", "/v1/community/state")
+        return await request(ctx, "GET", "/v1/community/guide")
     if operation == "create":
         return await request(ctx, "POST", "/v1/community/activities", body=args.get("activity") or {})
     if operation in {"join", "leave", "vote", "confirm", "view", "close", "cancel", "remind"}:

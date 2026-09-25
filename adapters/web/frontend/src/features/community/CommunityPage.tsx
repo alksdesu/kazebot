@@ -2,16 +2,24 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { featureRequest } from '../client';
 import { ScopeSelect } from '../execution/ScopeSelect';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
-import { useRequestScope } from '../asyncState';
+import { SupersededRequest } from '../asyncState';
+import { useActorRequestScope } from '../useActorRequestScope';
 import { actionClass, controlClass, EmptyState, FeatureFeedback, FeaturePage, primaryClass } from '../ui';
 import type { Activity, CommunityState } from './types';
+import { useScopePicker } from '../useScopePicker';
+import { useSettingsStore } from '../../store/settingsStore';
 
 const INPUT = controlClass;
 const BUTTON = actionClass;
 const states: Record<string, string> = { open: '进行中', closed: '已结束', cancelled: '已取消', joined: '待确认', confirmed: '已确认', waiting: '候补', left: '已退出' };
 
-export function CommunityPage({ scope: initialScope = 'web:console' }: { scope?: string }) {
+export function CommunityPage({ scope: initialScope = '' }: { scope?: string }) {
   const [scope, setScope] = useState(initialScope);
+  const token = useSettingsStore(state => state.adminToken);
+  const picker = useScopePicker('groups', scope);
+  const identity = useActorRequestScope(JSON.stringify([scope, token]));
+  const viewKey = identity.key;
+  const [loadedKey, setLoadedKey] = useState('');
   const [items, setItems] = useState<Activity[]>([]);
   const [state, setState] = useState<CommunityState | null>(null);
   const [guide, setGuide] = useState<CommunityState['guide']>({});
@@ -28,7 +36,7 @@ export function CommunityPage({ scope: initialScope = 'web:console' }: { scope?:
   const [filter, setFilter] = useState('all');
   const [query, setQuery] = useState('');
   const [welcome, setWelcome] = useState(false);
-  const identity = useRequestScope(scope);
+  const isCurrent = () => identity.isCurrent() && useSettingsStore.getState().adminToken === token;
   const guideDirty = Boolean(state && (JSON.stringify(guide) !== JSON.stringify(state.guide) || welcome !== state.settings.welcome_enabled));
   const dirtyRef = useRef(false); dirtyRef.current = guideDirty;
   const confirmDiscard = useUnsavedChanges(guideDirty || Boolean(title || options || deadline || reminder));
@@ -38,33 +46,37 @@ export function CommunityPage({ scope: initialScope = 'web:console' }: { scope?:
   const activeScope = useRef(scope);
   activeScope.current = scope;
   const refresh = useCallback(async (resetDraft = false) => {
+    if (!picker.valid || !isCurrent()) return;
     const request = ++generation.current;
     const [activityResult, current] = await Promise.all([
       featureRequest<{ items: Activity[] }>('/v1/community/activities', { scope }),
       featureRequest<CommunityState>('/v1/community/state', { scope }),
     ]);
-    if (request !== generation.current || activeScope.current !== scope) return;
-    setItems(activityResult.items); setState(current);
+    if (!isCurrent() || request !== generation.current || activeScope.current !== scope) return;
+    setItems(activityResult.items); setState(current); setLoadedKey(viewKey);
     if (resetDraft || !dirtyRef.current) { setGuide(current.guide); setWelcome(current.settings.welcome_enabled); }
     setLoading(false);
-  }, [scope]);
-  useEffect(() => { mutationSequence.current++; mutating.current = false; setState(null); setItems([]); setGuide({}); setWelcome(false); dirtyRef.current = false; setBusy(false); setLoading(true); setError(''); setNotice(''); void refresh(true).catch(reason => { if (identity.isCurrent()) { setError(String(reason)); setLoading(false); } }); return () => { generation.current++; }; }, [refresh, scope]);
+  }, [viewKey, picker.valid]);
+  useEffect(() => { mutationSequence.current++; mutating.current = false; setState(null); setLoadedKey(''); setItems([]); setGuide({}); setWelcome(false); setTitle(''); setOptions(''); setDeadline(''); setReminder(''); dirtyRef.current = false; setBusy(false); setError(''); setNotice(''); return () => { generation.current++; }; }, [viewKey]);
+  useEffect(() => { setLoading(picker.valid); if (picker.valid) void refresh().catch(reason => { if (isCurrent()) { setError(String(reason)); setLoading(false); } }); return () => { generation.current++; }; }, [refresh]);
   const run = async (action: () => Promise<unknown>, message = '操作已完成。', resetDraft = false) => {
-    if (mutating.current) return; mutating.current = true; const mutation = ++mutationSequence.current;
+    if (!picker.valid || !isCurrent() || mutating.current) return; mutating.current = true; const mutation = ++mutationSequence.current;
     setBusy(true); setError(''); setNotice('');
-    try { await action(); if (identity.isCurrent()) { await refresh(resetDraft); if (identity.isCurrent()) setNotice(message); } } catch (reason) { if (identity.isCurrent()) setError(String(reason)); } finally { if (mutation === mutationSequence.current) { mutating.current = false; if (identity.isCurrent()) setBusy(false); } }
+    try { await action(); if (isCurrent()) { await refresh(resetDraft); if (isCurrent()) setNotice(message); } } catch (reason) { if (isCurrent()) setError(String(reason)); } finally { if (mutation === mutationSequence.current) { mutating.current = false; if (isCurrent()) setBusy(false); } }
   };
   const visible = items.filter(item => (filter === 'all' || item.status === filter) && `${item.title} ${item.id}`.toLowerCase().includes(query.toLowerCase()));
-  return <FeaturePage title="群协作" description="管理当前会话的活动、投票和群指引。发布前可以保留草稿；活动操作不会覆盖未发布的指引。">
-    <ScopeSelect value={scope} onChange={value => { if (confirmDiscard()) { setTitle(''); setOptions(''); setDeadline(''); setReminder(''); setScope(value); } }} />
+  return <FeaturePage title="群协作" description="先选择当前账号的群聊，再管理活动、投票和群指引。不会自动选群，也不会发布到控制台或私聊。">
+    <ScopeSelect picker={picker} value={scope} onChange={value => { if (value !== scope && confirmDiscard()) { setTitle(''); setOptions(''); setDeadline(''); setReminder(''); setScope(value); } }} />
     <FeatureFeedback error={error} notice={notice} retry={() => void run(() => refresh(), '列表已更新。')} />
+    {!picker.valid && !picker.loading && !picker.error && <EmptyState>{picker.options.size ? '请选择要管理的群聊。' : '当前账号暂无可选群聊；收到群消息并建立会话后，可重试会话列表。'} <button className={BUTTON} type="button" onClick={() => void picker.reload()}>刷新可选群聊</button></EmptyState>}
     {loading && <p role="status">正在读取活动和群指引…</p>}
+    {picker.valid && loadedKey === viewKey && <>
     <form className="space-y-3 border border-[var(--duties-border)] p-4" onSubmit={event => { event.preventDefault(); void run(async () => {
       await featureRequest('/v1/community/activities', { scope, method: 'POST', body: {
         kind, title, options: options.split('\n').map(value => value.trim()).filter(Boolean), capacity: Number(capacity),
         deadline: deadline ? new Date(deadline).getTime() / 1000 : 0,
         reminder_at: reminder ? new Date(reminder).getTime() / 1000 : 0,
-      } }); if (identity.isCurrent()) { setTitle(''); setOptions(''); setDeadline(''); setReminder(''); }
+      } }); if (isCurrent()) { setTitle(''); setOptions(''); setDeadline(''); setReminder(''); }
     }); }}>
       <fieldset disabled={busy} className="min-w-0 space-y-3"><legend className="font-semibold">创建投票或活动</legend>
       <label className="block">类型<select aria-label="活动类型" className={INPUT} value={kind} onChange={event => setKind(event.target.value as 'poll' | 'event')}><option value="event">活动报名</option><option value="poll">投票</option></select></label>
@@ -88,6 +100,7 @@ export function CommunityPage({ scope: initialScope = 'web:console' }: { scope?:
     </article>)}
     {state && <form className="space-y-3 border border-[var(--duties-border)] p-4" onSubmit={event => { event.preventDefault(); void run(async () => {
       await featureRequest('/v1/community/guide', { scope, method: 'PUT', body: guide });
+      if (!isCurrent()) throw new SupersededRequest();
       await featureRequest('/v1/community/settings', { scope, method: 'PATCH', body: { welcome_enabled: welcome } });
     }, '群指引已发布。', true); }}>
       <fieldset disabled={busy} className="min-w-0 space-y-3"><legend className="font-semibold">群指引{guideDirty ? ' · 有未发布修改' : ''}</legend><p className="text-sm">发布后，群成员发送 /群规、/群资料、/常见问题 即可读取。未填写的内容不会由模型补造。</p>
@@ -95,5 +108,6 @@ export function CommunityPage({ scope: initialScope = 'web:console' }: { scope?:
       <label className="flex gap-2"><input type="checkbox" checked={welcome} onChange={event => setWelcome(event.target.checked)} />新成员欢迎（随群指引一起发布，默认关闭）</label>
       <button className={primaryClass} disabled={busy}>发布群指引</button></fieldset>
     </form>}
+    </>}
   </FeaturePage>;
 }
