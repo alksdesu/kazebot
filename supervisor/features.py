@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 import asyncio
 import logging
 
-from . import community, execution, materials_api
+from . import community, execution, materials_api, reminders
 
 logger = logging.getLogger(__name__)
 
@@ -13,14 +13,15 @@ def register_features(app, state, process_manager, config_store) -> None:
     state.feature_process_manager = process_manager
     state.feature_config_store = config_store
     state.execution = execution.ExecutionService(state)
-    for module in (execution, community, materials_api):
+    state.reminders = reminders.ReminderService(state)
+    for module in (execution, reminders, community, materials_api):
         app.include_router(module.create_router(state))
 
 
 @asynccontextmanager
 async def feature_lifespan(app):
     state = app.state.state
-    services = (state.execution,)
+    services = (state.execution, state.reminders)
     started = []
     try:
         for service in services:

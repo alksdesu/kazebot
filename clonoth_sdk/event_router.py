@@ -513,6 +513,9 @@ class EventRouter:
         delivery_key = record.key
         if record.replay_generation:
             delivery_key = f"{record.key}:replay:{record.replay_generation}"
+        reminder_delivery = str(event.payload.get("delivery_id") or "") if event.payload.get("reminder_id") else ""
+        delivery_started = False
+        platform_sent = False
         try:
             logger.info(
                 "outbound_delivery_start",
@@ -535,6 +538,14 @@ class EventRouter:
                 topic_id=str(event.payload.get("topic_id") or ""),
                 reply_message_id=str(event.payload.get("reply_message_id") or ""),
             )
+            if reminder_delivery:
+                status = await self._client.request_feature(
+                    "GET", "/v1/reminders/delivery-status", params={"delivery_id": reminder_delivery},
+                )
+                if status.get("deliver") is not True:
+                    self._outbound_store.acknowledge(record, owner=self._outbound_owner)
+                    return True
+            delivery_started = True
             if event.type == "intermediate_reply":
                 await self._deliver_intermediate_reply(
                     event, record.delivery, delivery_context=delivery_context,
@@ -542,6 +553,11 @@ class EventRouter:
             else:
                 await self._deliver_outbound_message(
                     event, record.delivery, delivery_context=delivery_context,
+                )
+            platform_sent = True
+            if reminder_delivery:
+                await self._client.request_feature(
+                    "POST", "/v1/reminders/receipts", body={"delivery_id": reminder_delivery, "status": "delivered"},
                 )
             self._outbound_store.acknowledge(record, owner=self._outbound_owner)
             self._maybe_prune_outbound_sent()
@@ -572,6 +588,14 @@ class EventRouter:
                 return False
             retryable = getattr(exc, "retryable", True) is not False
             ambiguous_ack = getattr(exc, "ambiguous_ack", False) is True
+            if reminder_delivery and delivery_started and not platform_sent:
+                with contextlib.suppress(Exception):
+                    await self._client.request_feature(
+                        "POST", "/v1/reminders/receipts", body={
+                            "delivery_id": reminder_delivery,
+                            "status": "outcome_unknown" if ambiguous_ack else "failed",
+                        },
+                    )
             try:
                 if not retryable:
                     self._outbound_store.mark_dead_letter(

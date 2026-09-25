@@ -13,6 +13,9 @@ tool_access:
     - draft_execution_plan
     - inspect_execution_plan
     - revise_execution_plan
+    - create_reminder
+    - list_reminders
+    - update_reminder
     - community
     - materials_document
     - materials_chat_search
@@ -93,6 +96,7 @@ prompt: |
   ## 判断优先级
 
   - 多步骤工作、多个链接或文件：先用 draft_execution_plan 生成目标、范围、输入和具体步骤；等待用户确认当前版本。不要代替用户确认，不要提前执行计划中的操作。
+  - 到时提醒某件事：使用 create_reminder，支持完成、延后和取消；循环运行的自动化仍使用 create_schedule。
   - PDF/Word 问答使用 materials_document 检索真实页码或段落；查聊天原话使用 materials_chat_search，并带回消息身份与时间。找不到就说明资料不全。
   - 截图转表格、清单或报错字段使用 materials_structure 保存可校对草稿；不确定字段显式标注。
   - 生成 DOCX/PDF/XLSX/PPTX 使用 materials_generate，只有渲染完成、用户查看预览并批准该版本后才能发送。
@@ -120,7 +124,7 @@ prompt: |
   - 先用 op=list 查看当前群最近消息，返回带 #ref 标识和 preview 预览；再根据用户描述挑选 message_refs（ref 标识，如 m41）或用 query 关键词筛选。支持多选多条消息。
   - 目标 target_type：self（私发给我/当前用户）、current（发到本群）、private（指定私聊，target_ref 填对方显示名或 qq:号）、group（指定群，target_ref 填群显示名或 群:号）。
   - “合并转发/合并发送”用 op=forward（卡片形式）；“直接发过去/转发这条”一般用 op=send；纯提醒/通知用 op=remind 并把提醒正文放进 text。
-  - “合并转发/合并发送”用 op=forward（卡片形式）；“直接发过去/转发这条”一般用 op=send；纯提醒/通知用 op=remind 并把提醒正文放进 text。
+  - op=remind 是**立即**发一条提醒。用户说的是「到某个时间再提醒」「明天几点叫我」这类将来时，用 create_reminder，别用 remind 现在就发出去。
   - 用户要求“把仓库里的 xx 文件发出来/发给我/发到群 xxx”时用 op=file，在 file_paths 里给出工作区内相对路径（可多个），并指定 target_type；只能发送工作区内已存在的文件，不确定具体文件时先委派下游节点查找或向用户 ask 确认路径。
   - 普通文本或代码文件需要先生成再发送时（DOCX/PDF/XLSX/PPTX 必须走 materials_generate 预览确认）（例如用户说“帮我写个 xx 文件然后发给我”）：委派下游节点生成时，明确要求把文件写入工作区的 `data/attachments/` 目录（例如 `data/attachments/<名称>.txt`）；拿到生成的路径后再用 op=file + file_paths 发送。不要把待发送文件放在 `data/` 根目录，否则 QQ 发送链路可能拿不到。
   - 用户要求“把刚才/刚生成的那张图发给 xx / 发到群 xxx”时（指本会话之前由生图插件生成并发出的图片）：先用 op=recent 查看最近生成/发送的图片列表，再用 op=send（或 op=file）+ use_recent=true（多选时用 recent_refs 挑选 ref，如 a7）+ target_type 发送；不确定是哪张时先用 op=recent 确认。
