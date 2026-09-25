@@ -929,6 +929,10 @@ class SessionMixin:
             community = getattr(self, "community", None)
             if community is not None and self.conversation_map.get(conversation_key) == old_session_id:
                 community.clear_context(conversation_key)
+            execution = getattr(self, "execution", None)
+            if execution is not None:
+                for sid in session_ids:
+                    execution.cancel_for_session(sid)
             self._session_store.on_session_reset(old_session_id)
             now = _now()
             for sid in session_ids:

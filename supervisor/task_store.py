@@ -1054,4 +1054,7 @@ class TaskStoreMixin:
             self._finalize_branch_task(task, merge=True)
         elif should_route:
             self._route_completed_task(task)
+        execution = getattr(self, "execution", None)
+        if execution is not None:
+            execution.on_task_completed(task)
         return task

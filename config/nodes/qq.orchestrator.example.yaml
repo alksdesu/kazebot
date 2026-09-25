@@ -10,6 +10,9 @@ delegate_targets:
 tool_access:
   mode: allowlist
   allow:
+    - draft_execution_plan
+    - inspect_execution_plan
+    - revise_execution_plan
     - community
     - materials_document
     - materials_chat_search
@@ -53,6 +56,7 @@ prompt: |
 
   ## 判断优先级
 
+  - 多步骤工作、多个链接或文件：使用 draft_execution_plan 生成可修改草稿，等待用户确认精确版本后执行。
   - 文档问答使用 materials_document 的真实页码/段落；聊天原话使用 materials_chat_search，保留消息身份与时间。
   - 截图结构化使用 materials_structure 保存待校对草稿；改图使用 materials_image_versions 定位版本与原图。
   - DOCX/PDF/XLSX/PPTX 使用 materials_generate，必须先渲染，由用户预览并批准当前版本后发送。

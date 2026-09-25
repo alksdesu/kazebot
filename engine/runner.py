@@ -1397,5 +1397,7 @@ async def _run_tool_task(
             "raw_inline": raw_inline,
             "tool_name": tool_name,
             "arguments": arguments,
+            "tool_ok": not isinstance(result, dict) or result.get("ok") is not False,
+            "tool_error": str(result.get("error") or "") if isinstance(result, dict) else "",
         },
     }
