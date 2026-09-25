@@ -1137,7 +1137,7 @@ def _render_memory_messages(
             parts.append(f"\n## {entry['id']}\n")
             parts.append(str(entry.get("content") or ""))
         parts.append("\n[/MEMORY:CONSTANT]")
-        static_msgs.append({"role": "system", "content": "\n".join(parts)})
+        static_msgs.append({"role": "system", "content": "\n".join(parts), "_knowledge_source": "memory"})
 
     dynamic_parts: list[str] = []
     if dynamic_entries:

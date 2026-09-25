@@ -721,10 +721,21 @@ def create_app(
             body = await request.json()
         except Exception:
             pass
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=422, detail="body must be an object")
         msg = body.get("message", "")
         atts = body.get("attachments", [])
+        memory_hints = body.get("memory_hints")
+        if memory_hints is not None and (
+            not isinstance(memory_hints, dict)
+            or not isinstance(memory_hints.get("subjects", []), list)
+        ):
+            raise HTTPException(status_code=422, detail="memory_hints.subjects must be a list")
         st: SupervisorState = app.state.state
-        ok = st.preempt_task(task_id, message=msg, attachments=atts)
+        kwargs = {"message": msg, "attachments": atts}
+        if memory_hints is not None:
+            kwargs["memory_hints"] = memory_hints
+        ok = st.preempt_task(task_id, **kwargs)
         if not ok:
             raise HTTPException(status_code=404, detail="task not found or not active")
         return {"ok": True, "task_id": task_id}
@@ -736,10 +747,23 @@ def create_app(
         return st.is_task_preempted(task_id)
 
     @app.post("/v1/tasks/{task_id}/preempt_consumed")
-    async def task_preempt_consumed(task_id: str) -> dict[str, Any]:
+    async def task_preempt_consumed(task_id: str, request: Request) -> dict[str, Any]:
         """Engine 读取完 preempt message 后调用，清空 message 防止重复注入。"""
+        raw = await request.body()
+        try:
+            body = json.loads(raw) if raw.strip() else {}
+        except (ValueError, UnicodeDecodeError):
+            raise HTTPException(status_code=422, detail="body must be an object")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=422, detail="body must be an object")
+        revision = body.get("revision")
+        if revision is not None and (type(revision) is not int or revision < 0):
+            raise HTTPException(status_code=422, detail="revision must be a non-negative integer")
         st: SupervisorState = app.state.state
-        result = st.consume_preempt_message(task_id)
+        result = (
+            st.consume_preempt_message(task_id, expected_revision=revision)
+            if revision is not None else st.consume_preempt_message(task_id)
+        )
         return {"ok": True, **result}
 
     @app.post("/v1/sessions/{session_id}/async_tool_result")

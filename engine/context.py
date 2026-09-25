@@ -130,12 +130,13 @@ class RunContext:
             pass
         return {"preempted": False, "message": "", "attachments": []}
 
-    async def consume_preempt(self) -> None:
+    async def consume_preempt(self, revision: int | None = None) -> None:
         """通知 supervisor 已消费 preempt message，防止重复注入。"""
         try:
             if self.task_id:
                 await self.http.post(
-                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/preempt_consumed"
+                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/preempt_consumed",
+                    json={"revision": revision} if revision is not None else {},
                 )
         except Exception:
             pass

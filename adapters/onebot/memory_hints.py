@@ -56,18 +56,29 @@ def display_name_mentions(
     """
     body = str(text or "")
     skip = set(exclude)
-    candidates = [
-        (name, alias) for alias, name in display_names.items()
-        if alias not in skip and len(str(name or "").strip()) >= _MIN_DISPLAY_NAME_LEN
-    ]
-    candidates.sort(key=lambda item: len(item[0]), reverse=True)
-
+    names: dict[str, list[str]] = {}
+    for alias, raw_name in display_names.items():
+        name = str(raw_name or "").strip()
+        if len(name) >= _MIN_DISPLAY_NAME_LEN:
+            names.setdefault(name, []).append(alias)
+    occupied: list[tuple[int, int]] = []
     result: list[str] = []
-    for name, alias in candidates:
-        if alias in result:
-            continue
-        if str(name).strip() in body:
-            result.append(alias)
+    for name in sorted(names, key=len, reverse=True):
+        pattern = re.escape(name)
+        if name[0].isascii() and (name[0].isalnum() or name[0] == "_"):
+            pattern = r"(?<![A-Za-z0-9_])" + pattern
+        if name[-1].isascii() and (name[-1].isalnum() or name[-1] == "_"):
+            pattern += r"(?![A-Za-z0-9_])"
+        matched = False
+        for match in re.finditer(pattern, body):
+            start, end = match.span()
+            if any(start < right and left < end for left, right in occupied):
+                continue
+            occupied.append((start, end))
+            matched = True
+        aliases = names[name]
+        if matched and len(aliases) == 1 and aliases[0] not in skip:
+            result.append(aliases[0])
     return result
 
 

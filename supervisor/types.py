@@ -147,6 +147,8 @@ class Task(BaseModel):
     preempted_context_ref: str = ""
     preempt_message: str = ""
     preempt_attachments: list = Field(default_factory=list)
+    preempt_memory_hints: dict[str, Any] | None = None
+    preempt_revision: int = 0
     worker_id: str | None = None
     created_at: datetime
     updated_at: datetime

@@ -833,7 +833,10 @@ class TaskStoreMixin:
 
     # ---- preempt ----
 
-    def preempt_task(self, task_id: str, message: str = "", attachments: list | None = None) -> bool:
+    def preempt_task(
+        self, task_id: str, message: str = "", attachments: list | None = None,
+        memory_hints: dict[str, Any] | None = None,
+    ) -> bool:
         """标记单个 task 为 preempt_requested。不影响 session 状态。"""
         with self._lock:
             task = self.tasks.get(task_id)
@@ -841,8 +844,17 @@ class TaskStoreMixin:
                 return False
             task.preempt_requested = True
             task.preempt_message = message
-            if attachments:
-                task.preempt_attachments = attachments
+            task.preempt_attachments = list(attachments or [])
+            task.preempt_revision += 1
+            task.preempt_memory_hints = None
+            if memory_hints is not None:
+                from engine.memory_subjects import resolve_load_subjects
+
+                task.preempt_memory_hints = {
+                    "subjects": resolve_load_subjects(
+                        self.workspace_root, memory_hints.get("subjects"),
+                    ),
+                }
             # [Fork/Merge 2026-05-17] Why: a task can be running inside a
             # temporary entry branch, but session event consumers watch the
             # durable parent session. How: use the task route helper when the
@@ -867,30 +879,51 @@ class TaskStoreMixin:
             )
             return True
 
-    def consume_preempt_message(self, task_id: str) -> dict:
-        """消费 preempt message，返回 {message, attachments} 并清空。同时重置 preempt_requested。"""
+    def consume_preempt_message(self, task_id: str, expected_revision: int | None = None) -> dict:
+        """只清除已确认的补充消息，避免旧请求覆盖刚到的新补充。"""
         with self._lock:
             task = self.tasks.get(task_id)
             if task is None:
-                return {"message": "", "attachments": []}
-            msg = task.preempt_message
-            atts = list(task.preempt_attachments)
+                return {"consumed": False, "message": "", "attachments": [], "revision": 0}
+            if expected_revision is not None and expected_revision != task.preempt_revision:
+                return {"consumed": False, "revision": task.preempt_revision}
+            payload = {
+                "consumed": True,
+                "message": task.preempt_message,
+                "attachments": list(task.preempt_attachments),
+                "revision": task.preempt_revision,
+            }
+            if task.preempt_memory_hints is not None:
+                hints = {"subjects": list(task.preempt_memory_hints.get("subjects") or [])}
+                payload["memory_hints"] = hints
+                task_context = task.input.get("task_context")
+                if not isinstance(task_context, dict):
+                    task_context = {}
+                    task.input["task_context"] = task_context
+                task_context["memory_hints"] = hints
             task.preempt_message = ""
             task.preempt_attachments = []
+            task.preempt_memory_hints = None
             task.preempt_requested = False
-            return {"message": msg, "attachments": atts}
+            return payload
 
     def is_task_preempted(self, task_id: str) -> dict:
         """查询 task 的 preempt 状态，包含 message。"""
         with self._lock:
             task = self.tasks.get(task_id)
             if task is None:
-                return {"preempted": False, "message": "", "attachments": []}
-            return {
+                return {"preempted": False, "message": "", "attachments": [], "revision": 0}
+            payload = {
                 "preempted": task.preempt_requested,
                 "message": task.preempt_message,
                 "attachments": list(task.preempt_attachments),
+                "revision": task.preempt_revision,
             }
+            if task.preempt_memory_hints is not None:
+                payload["memory_hints"] = {
+                    "subjects": list(task.preempt_memory_hints.get("subjects") or []),
+                }
+            return payload
 
     def renew_lease(self, task_id: str, worker_id: str, lease_sec: float = 120.0) -> bool:
         """续租 task 的 lease，延长 lease_expires_at。仅 status=running 且 worker_id 匹配时生效。"""

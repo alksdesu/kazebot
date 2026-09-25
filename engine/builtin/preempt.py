@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from engine.attachments import build_multimodal_content
+from engine.memory_subjects import resolve_load_subjects
 # Why: engine.builtin handlers must not depend on the hook package after relocation.
 # How: return a local HookResult-compatible shape instead. Purpose: avoid
 # cycles while keeping the existing hook registry duck-typed.
@@ -86,6 +87,14 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     """
     new_instruction = ls.preempt_inject_info.get("message", "")
     new_attachments = ls.preempt_inject_info.get("attachments", [])
+    memory_hints = ls.preempt_inject_info.get("memory_hints")
+    task_context = dict(getattr(ls.rctx, "task_context", {}) or {})
+    if isinstance(memory_hints, dict):
+        task_context["memory_hints"] = {
+            "subjects": resolve_load_subjects(ls.rctx.workspace_root, memory_hints.get("subjects")),
+        }
+        ls.rctx.task_context = task_context
+    ls.rctx.user_text = new_instruction
 
     ls.messages = [m for m in ls.messages if not m.get("_dynamic")]
     ctx.messages = ls.messages
@@ -93,20 +102,17 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     from engine.inference.message_assembly import _conversational_history
 
     scan_history = _conversational_history(ls.history)
-    # Why: built-in preempt handling must use the same knowledge boundary as
-    # initial prompt assembly. How: call build_knowledge_context, then discard
-    # static blocks because this reinjection path historically used only dynamic
-    # skill and memory blocks. Purpose: preserve preempt prompt placement while
-    # removing direct builder imports from this handler.
     skill_static, skill_dynamic, memory_static, memory_dynamic = build_knowledge_context(
         ls.rctx.workspace_root,
         ls.node,
         new_instruction,
         scan_history,
         ls.runtime_cfg,
-        task_context=getattr(ls.rctx, "task_context", {}) or {},
+        task_context=task_context,
     )
-    _ = (skill_static, memory_static)
+    if isinstance(memory_hints, dict):
+        _replace_static_memories(ls, skill_static, memory_static)
+        ctx.messages = ls.messages
 
     dynamic_parts: list[str] = []
     if not ls.is_block_mode and len(ls.system_prompt) >= 2 and ls.system_prompt[1].get("content"):
@@ -187,7 +193,11 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     except Exception:
         pass
 
-    await ls.rctx.consume_preempt()
+    revision = ls.preempt_inject_info.get("revision")
+    if isinstance(revision, int) and not isinstance(revision, bool):
+        await ls.rctx.consume_preempt(revision=revision)
+    else:
+        await ls.rctx.consume_preempt()
     await ls.rctx.emit_event("preempt_injected", {
         "node_id": ls.node.id,
         "task_id": ls.rctx.task_id,
@@ -197,3 +207,28 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     ls.preempt_inject_info = None
     ls.plaintext_retry_count = 0
     ls.compacted = False
+
+
+def _replace_static_memories(ls: Any, skill_static: list, memory_static: list) -> None:
+    memory_indices = [
+        index for index, message in enumerate(ls.messages)
+        if message.get("_knowledge_source") == "memory"
+        or (
+            message.get("role") == "system"
+            and str(message.get("content") or "").startswith("[MEMORY:CONSTANT]\n")
+        )
+    ]
+    if memory_indices:
+        insertion_index = memory_indices[0]
+        removed = set(memory_indices)
+        ls.messages = [message for index, message in enumerate(ls.messages) if index not in removed]
+    else:
+        prefix_length = 0
+        for message in ls.system_prompt:
+            if message.get("role") == "history":
+                break
+            prefix_length += 1
+            if not ls.is_block_mode:
+                break
+        insertion_index = prefix_length + len(skill_static)
+    ls.messages[insertion_index:insertion_index] = memory_static

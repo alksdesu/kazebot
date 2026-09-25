@@ -302,7 +302,7 @@ class TestEnrollmentGate:
 
         def _item(direct: bool):
             return runtime.QueuedInbound(
-                matcher=None, bot=None, event=None, channel="qq_group",
+                matcher=None, bot=None, event=SimpleNamespace(user_id=10001), channel="qq_group",
                 real_conversation_key="qq_group:1", stable_conversation_key="conv_merge",
                 text="正文", attachments=[], is_dm=False, platform_updates={},
                 user_text="在吗", direct_interaction=direct,
@@ -312,6 +312,7 @@ class TestEnrollmentGate:
         asyncio.run(runtime._enqueue_or_submit_inbound(first))
         asyncio.run(runtime._enqueue_or_submit_inbound(_item(False)))
 
+        assert len(runtime._qq_queue) == 1
         assert first.direct_interaction is True
 
     def test_the_prefix_check_runs_before_the_prefix_is_stripped(self, runtime) -> None:

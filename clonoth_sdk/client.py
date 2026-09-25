@@ -391,6 +391,7 @@ class ClonothClient:
         *,
         message: str = "",
         attachments: list[dict[str, Any]] | None = None,
+        memory_hints: dict[str, Any] | None = None,
     ) -> bool:
         """向正在运行的任务注入 preempt 请求。
 
@@ -410,6 +411,8 @@ class ClonothClient:
         body: dict[str, Any] = {"message": message}
         if attachments:
             body["attachments"] = attachments
+        if memory_hints is not None:
+            body["memory_hints"] = memory_hints
         resp = await self._http().post(
             f"{self._base_url}/v1/tasks/{task_id}/preempt", json=body,
         )

@@ -4982,6 +4982,7 @@ def _sticky_memory_subjects(conversation_key: str, subjects: List[str]) -> List[
 
 def _collect_memory_subjects(
     event: Event, user_text: str, conversation_key: str, direct: bool = True,
+    *, mentioned_user_ids: Iterable[str] = (),
 ) -> List[str]:
     """收集本轮涉及的人的别名，供 engine 按人加载长期记忆。
 
@@ -4997,7 +4998,7 @@ def _collect_memory_subjects(
     subjects = collect_memory_subjects(
         sender_alias=sender_alias,
         anonymized_text=_anonymize_text_for_ai(user_text),
-        at_user_ids=at_segment_user_ids(message),
+        at_user_ids=[*at_segment_user_ids(message), *mentioned_user_ids],
         alias_of_user_id=_anonymize_user_id,
         display_names=_enrolled_subject_display_names(),
     )

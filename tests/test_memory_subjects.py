@@ -205,7 +205,26 @@ class TestDisplayNameMentions:
     def test_prefers_the_longer_name_when_one_contains_the_other(self) -> None:
         names = {"UserA": "张三", "UserB": "张三丰"}
 
-        assert display_name_mentions("张三丰在吗", display_names=names)[0] == "UserB"
+        assert display_name_mentions("张三丰在吗", display_names=names) == ["UserB"]
+
+    def test_short_name_still_matches_an_independent_occurrence(self) -> None:
+        names = {"UserA": "张三", "UserB": "张三丰"}
+        assert display_name_mentions("张三和张三丰都在吗", display_names=names) == ["UserB", "UserA"]
+
+    def test_excluded_long_name_still_masks_overlapping_short_name(self) -> None:
+        names = {"UserA": "张三", "UserB": "张三丰"}
+        assert display_name_mentions("张三丰在吗", display_names=names, exclude=["UserB"]) == []
+
+    def test_duplicate_names_remain_ambiguous_after_profile_overrides(self) -> None:
+        names = {"UserA": "张三", "UserB": " 张三 ", "UserC": "三丰"}
+        assert display_name_mentions("张三在吗", display_names=names, exclude=["UserA"]) == []
+
+    @pytest.mark.parametrize("text", ["Annette", "JoAnn", "Ann_2", "foo_Ann", "Ann2"])
+    def test_english_names_require_boundaries(self, text: str) -> None:
+        assert display_name_mentions(text, display_names={"UserA": "Ann"}) == []
+
+    def test_english_name_next_to_chinese_is_recognized(self) -> None:
+        assert display_name_mentions("叫Ann来看看", display_names={"UserA": "Ann"}) == ["UserA"]
 
     def test_ignores_names_too_short_to_be_safe(self) -> None:
         # 一个人叫「明」，「明天下雨」就会中。

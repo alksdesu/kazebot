@@ -177,6 +177,17 @@ class TestAdapterCollection:
         assert speaker in self._collect(runtime, self._event(10001), history_block)
         assert speaker not in self._collect(runtime, self._event(10001), "在吗", key="qq_group:t2")
 
+    def test_profile_overrides_cannot_resolve_ambiguous_names(self, runtime, tmp_path: Path, monkeypatch) -> None:
+        aliases = []
+        for user_id in (10007, 10008):
+            alias = runtime._anonymize_user_id(user_id)
+            aliases.append(alias)
+            memory_subjects.record_interaction(tmp_path, alias, display_name=str(user_id))
+            monkeypatch.setitem(runtime._QQ_USER_PROFILES, str(user_id), {"display_name": "张三"})
+
+        subjects = self._collect(runtime, self._event(10001), "张三昨天说要请客")
+        assert not set(aliases).intersection(subjects)
+
     def test_last_round_subjects_stay_loaded_this_round(self, runtime, tmp_path: Path) -> None:
         # 「@张三」的下一句通常是「他电话多少」，那句里没有任何别名。
         other = runtime._anonymize_user_id(10011)
@@ -320,10 +331,27 @@ class TestHintPlumbing:
                 found.append(keys)
         return found
 
-    def test_the_adapter_sends_memory_hints_with_the_inbound(self) -> None:
-        source = Path("adapters/onebot/__init__.py").read_text(encoding="utf-8")
+    def test_the_adapter_sends_memory_hints_with_the_inbound(self, monkeypatch, tmp_path) -> None:
+        from clonoth_sdk.state import SessionState
+        from tests._onebot_harness import set_live_config
 
-        assert "memory_hints={" in source
+        runtime = load_runtime(monkeypatch, tmp_path)
+        runtime._session_state = SessionState()
+        set_live_config(runtime, enable_preempt=False)
+        captured = []
+
+        async def submit(**kwargs):
+            captured.append(kwargs)
+            return SimpleNamespace(session_id="", accepted=False, inbound_seq=0)
+
+        runtime._client = SimpleNamespace(submit_inbound=submit)
+        event = SimpleNamespace(user_id=10001, message_id=1, get_message=lambda: [])
+        asyncio.run(runtime._submit_or_preempt_inbound(
+            bot=None, event=event, channel="qq_group", real_conversation_key="qq_group:1",
+            stable_conversation_key="group-1", inbound_text="hello", user_text="hello",
+            attachments=[], is_dm=False, platform_updates={"type": "group", "group_id": 1},
+        ))
+        assert captured[0]["memory_hints"] == {"subjects": [runtime._anonymize_user_id(10001)]}
 
     def test_the_sdk_forwards_memory_hints(self) -> None:
         source = Path("clonoth_sdk/client.py").read_text(encoding="utf-8")
