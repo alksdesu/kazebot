@@ -9,7 +9,7 @@ from typing import Any
 
 from ._helpers import SessionInfo, _now
 from .eventlog import SYSTEM_SESSION_ID
-from .types import ApprovalStatus, TaskStatus
+from .types import ApprovalStatus, RouteStatus, TaskStatus
 
 
 logger = logging.getLogger(__name__)
@@ -858,91 +858,121 @@ class SessionMixin:
                 "delivery_id": delivery_key,
             }
 
+    def _session_tree_locked(self, session_id: str, conversation_key: str) -> set[str]:
+        self._ensure_entry_branch_indexes_locked()
+        children = {sid: set(ids) for sid, ids in self.parent_children.items()}
+
+        def link(parent: str, child: str) -> None:
+            if parent and child and parent != child:
+                children.setdefault(parent, set()).add(child)
+
+        for parent, branches in self.parent_entry_branches.items():
+            for branch in branches:
+                link(parent, branch)
+        for branch, parent in self.entry_branch_parents.items():
+            link(parent, branch)
+        for key, child in self.child_session_map.items():
+            link(key[0], child)
+        for sid, entry in self._session_store.items_snapshot():
+            link(str(entry.get("parent_session_id") or ""), sid)
+        for task in self.tasks.values():
+            task_input = task.input
+            origin = task_input.get("_dispatch_origin")
+            if isinstance(origin, dict):
+                link(str(origin.get("parent_session_id") or ""), task.session_id)
+                link(str(origin.get("parent_session_id") or ""), str(task_input.get("parent_session_id") or ""))
+            link(str(task_input.get("parent_session_id") or ""), task.session_id)
+            link(task.session_id, str(task_input.get("child_session_id") or ""))
+            caller = self.tasks.get(task.caller_task_id)
+            if caller is not None:
+                link(caller.session_id, task.session_id)
+
+        # 旧派发没有结构化父会话，只能从原有会话键恢复归属。
+        suffix = f":{conversation_key}"
+        if self.conversation_map.get(conversation_key) == session_id:
+            for key, sid in self.conversation_map.items():
+                if key.startswith("agent:") and (key.endswith(suffix) or suffix + ":" in key):
+                    link(session_id, sid)
+
+        sessions: set[str] = set()
+        pending = [session_id]
+        while pending:
+            current = pending.pop()
+            if current in sessions:
+                continue
+            sessions.add(current)
+            pending.extend(children.get(current, set()))
+        return sessions
+
     def reset_conversation(self, *, conversation_key: str) -> dict[str, Any]:
-        """Reset a conversation by removing the conversation_map entry.
-
-        Next inbound message with this conversation_key will create a fresh session.
-        Also cleans up node_contexts for the old session.
-
-        Child Session 隔离（Phase C）：级联清理所有关联的 child session，
-        包括 JSONL 文件、映射表条目、sessions.json 标记。
-        """
+        """清空会话键当前指向的会话。"""
         with self._lock:
-            old_session_id = self.conversation_map.pop(conversation_key, None)
-            if not old_session_id:
+            session_id = self.conversation_map.get(conversation_key)
+            if not session_id:
                 return {"ok": False, "error": f"conversation not found: {conversation_key}"}
+            return self.reset_session(session_id=session_id)
 
-            # 方案 A: 标记 session 为已重置
+    def reset_session(self, *, session_id: str) -> dict[str, Any]:
+        """取消指定会话及其派生任务，不影响同名会话键的新会话。"""
+        with self._lock:
+            old_session_id = str(session_id or "").strip()
+            info = self.sessions.get(old_session_id)
+            if info is None:
+                return {"ok": False, "error": f"session not found: {old_session_id}"}
+            conversation_key = info.conversation_key
+            session_ids = self._session_tree_locked(old_session_id, conversation_key)
             self._session_store.on_session_reset(old_session_id)
-
-            # Child Session 隔离（Phase C）：级联清理所有关联的 child session
-            cleared_children = 0
-
-            # 删除主 session 的运行期文件
-            self.purge_session_files(old_session_id)
-
-            # [Fork/Merge 2026-05-12] reset 时必须先收集未合并入口分支。
-            # 原因：branch session 可能已从内存索引丢失，但仍存在于 parent_children 或
-            # sessions.json。做法：把 parent_children 和 entry_branch 索引合并后逐个判断。
-            # 目的：清理对话时不会留下未 merge 的 branch JSONL 和派生 child session。
-            child_ids = set(self.parent_children.pop(old_session_id, set()))
-            child_ids.update(self._entry_branch_ids_for_parent_locked(old_session_id))
-            for child_sid in list(child_ids):
-                if self._is_entry_branch_session_locked(child_sid, parent_session_id=old_session_id):
-                    self._cleanup_branch_locked(child_sid)
-                    cleared_children += 1
+            now = _now()
+            for sid in session_ids:
+                self._next_session_generation_locked(sid)
+                self._cancelled_sessions.add(sid)
+            for task in self.tasks.values():
+                if task.session_id not in session_ids:
                     continue
-                self.purge_session_files(child_sid)
-                self._remove_child_mapping_for_session_locked(child_sid)
-                self.sessions.pop(child_sid, None)
-                self.session_generations.pop(child_sid, None)
-                self._cancelled_sessions.discard(child_sid)
-                self._session_context_usage.pop(child_sid, None)
-                # [AutoC 2026-05-30] Why: reset 主会话时清理的是 child session，
-                # 这些临时上下文不应在 sessions.json 中保留 reset 标记。
-                # How: 对 child 使用物理删除，主 session 仍在上方保留 on_session_reset。
-                # Purpose: 清理对话时同步收缩 child registry。
-                self._session_store.remove_session(child_sid)
-                cleared_children += 1
+                task.input["_session_reset"] = True
+                if task.input.get("branch_session_id"):
+                    task.input["_branch_finalized"] = True
+                if self._task_terminal(task) and task.route_status == RouteStatus.routed:
+                    continue
+                task.cancel_requested = True
+                task.status = TaskStatus.cancelled
+                task.waiting_for_task_id = None
+                task.lease_expires_at = None
+                task.updated_at = now
+                task.route_status = RouteStatus.routed
+                task.routed_at = now
+                task.route_error = ""
+                self._event_task_snapshot("task_cancelled", task)
 
-            # 清理 child_session_map 中所有以 old_session_id 为 parent 的条目
-            keys_to_remove = [k for k in self.child_session_map if k[0] == old_session_id]
-            for k in keys_to_remove:
-                del self.child_session_map[k]
-
-            # [2026-05-28] dispatch session 级联清理。
-            # 为什么：异步 dispatch 统一走 inbound 后，子节点 session 的 conversation_key
-            #   以 agent:{node_id}:{parent_conv_key} 为前缀。重置父会话时应级联清除。
-            # 怎么改：扫描 conversation_map 中以 agent:*:{conversation_key} 为前缀的
-            #   条目，删除对应 session 及其 JSONL。
-            # 目的：避免父会话重置后赖留已无用的 dispatch session。
-            _dispatch_prefix = f":{conversation_key}"
-            _dispatch_keys_to_remove: list[str] = []
-            for ck, sid in self.conversation_map.items():
-                if ck.startswith("agent:") and ck.endswith(_dispatch_prefix):
-                    _dispatch_keys_to_remove.append(ck)
-                elif ck.startswith("agent:") and _dispatch_prefix + ":" in ck:
-                    # 匹配 fresh/fork 模式的 agent:{node}:{parent_conv}:{uuid}
-                    _dispatch_keys_to_remove.append(ck)
-            for ck in _dispatch_keys_to_remove:
-                _dsid = self.conversation_map.pop(ck, None)
-                if _dsid:
-                    # 清理 dispatch session 的运行期文件和内存状态
-                    self.purge_session_files(_dsid)
-                    self.sessions.pop(_dsid, None)
-                    self.session_generations.pop(_dsid, None)
-                    self._cancelled_sessions.discard(_dsid)
-                    self._session_context_usage.pop(_dsid, None)
-                    # [AutoC 2026-05-30] Why: dispatch session 是由父会话派生的临时
-                    # child/fork 会话，重置父会话时不需要保留其 registry 行。
-                    # How: 物理删除 sessions.json 条目。
-                    # Purpose: 避免 agent:* 派生 session 在主会话 reset 后继续堆积。
-                    self._session_store.remove_session(_dsid)
-                    cleared_children += 1
-
-            return {"ok": True, "old_session_id": old_session_id,
-                    "conversation_key": conversation_key,
-                    "cleared_children": cleared_children}
+            for sid in session_ids:
+                # 与已开始的分支合并共用锁，清空必须是最后一次写文件。
+                with self._branch_parent_write_lock(sid):
+                    self.purge_session_files(sid)
+                self.sessions.pop(sid, None)
+                self._session_context_usage.pop(sid, None)
+                self.session_entry_overrides.pop(sid, None)
+                self.session_last_entry_node.pop(sid, None)
+                self.parent_children.pop(sid, None)
+                self.parent_entry_branches.pop(sid, None)
+                self.entry_branch_parents.pop(sid, None)
+            for children in self.parent_children.values():
+                children.difference_update(session_ids)
+            for branches in self.parent_entry_branches.values():
+                branches.difference_update(session_ids)
+            for key, child in list(self.child_session_map.items()):
+                if key[0] in session_ids or child in session_ids:
+                    self.child_session_map.pop(key, None)
+            for key, sid in list(self.conversation_map.items()):
+                if sid in session_ids:
+                    self.conversation_map.pop(key, None)
+            self._session_store.remove_sessions(session_ids - {old_session_id})
+            for sid in session_ids:
+                self._cancel_memory_extract_intents(sid)
+            return {
+                "ok": True, "old_session_id": old_session_id,
+                "conversation_key": conversation_key,
+                "cleared_children": len(session_ids) - 1,
+            }
 
     def session_messages(self, *, session_id: str, limit: int = 50) -> list[dict[str, Any]]:
         msgs: list[dict[str, Any]] = []

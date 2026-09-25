@@ -811,7 +811,12 @@ class TaskRouterMixin:
 
         merged_count = 0
         store = ConversationStore(self.workspace_root / "data" / "conversations")
-        if plan.merge:
+        task = self.tasks.get(plan.task_id)
+        parent_entry = self._session_store.get_entry(plan.parent_session_id)
+        session_reset = bool(task and task.input.get("_session_reset")) or bool(
+            parent_entry and parent_entry.get("reset")
+        )
+        if plan.merge and not session_reset:
             branch_messages = list(store.load(plan.branch_session_id))
             tail = branch_messages[plan.base_count:]
             parent_ids = {str(getattr(message, "id", "") or "") for message in store.load(plan.parent_session_id)}
@@ -1942,13 +1947,15 @@ class TaskRouterMixin:
             )
             return
 
-        # 等待期间用户又说了一句就会 bump generation，子节点结果随之丢弃；对用户表现为
-        # 「说了稍等然后再无下文」，不留声就无从查起。
+        # 旧任务没有父代次快照，继续沿用原来的保守校验。
+        parent_generation = self._to_positive_int(origin.get("parent_session_generation"))
+        if parent_generation is None:
+            parent_generation = task.session_generation
         current_gen = self._current_session_generation_locked(target_session_id)
-        if task.session_generation and current_gen and task.session_generation != current_gen:
+        if parent_generation and current_gen and parent_generation != current_gen:
             log.warning(
                 "dispatch_origin callback skipped: session %s generation %s != %s for task %s",
-                target_session_id[:12], task.session_generation, current_gen, task.task_id[:12],
+                target_session_id[:12], parent_generation, current_gen, task.task_id[:12],
             )
             return
         if target_session_id in self._cancelled_sessions:

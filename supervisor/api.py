@@ -1280,32 +1280,13 @@ def create_app(
     async def delete_session(session_id: str) -> dict[str, Any]:
         """Delete a session and its conversation store."""
         st: SupervisorState = app.state.state
-        if session_id not in st.sessions:
+        result = st.reset_session(session_id=session_id)
+        if not result.get("ok"):
             raise HTTPException(status_code=404, detail="session not found")
-        si = st.sessions[session_id]
-        # Remove from sessions and conversation_map
-        with st._lock:
-            del st.sessions[session_id]
-            conv_key = si.conversation_key
-            if conv_key and st.conversation_map.get(conv_key) == session_id:
-                del st.conversation_map[conv_key]
-        # Delete ConversationStore JSONL
-        try:
-            from pathlib import Path
-            from engine.conversation_store import ConversationStore
-            conv_store = ConversationStore(Path(st.workspace_root) / "data" / "conversations")
-            conv_store.delete(session_id)
-        except Exception:
-            pass
         # Clean up node contexts
         try:
             from engine.context_store import cleanup_session_contexts
             cleanup_session_contexts(st.workspace_root, session_id)
-        except Exception:
-            pass
-        # Mark as reset in sessions.json
-        try:
-            st._session_store.on_session_reset(session_id)
         except Exception:
             pass
         return {"ok": True, "session_id": session_id}

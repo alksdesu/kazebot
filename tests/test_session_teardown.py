@@ -174,7 +174,7 @@ class TestNoTeardownPathHandRollsPaths:
 
     _TEARDOWN_FUNCTIONS = {
         ("supervisor/session.py", "_cleanup_branch_locked"),
-        ("supervisor/session.py", "reset_conversation"),
+        ("supervisor/session.py", "reset_session"),
         ("supervisor/state.py", "_expire_child_session"),
         ("supervisor/state.py", "_reconcile_after_restart"),
         ("supervisor/task_router.py", "_execute_post_cleanup"),
@@ -214,8 +214,6 @@ class TestNoTeardownPathHandRollsPaths:
             if fn is None:
                 continue
             body = ast.unparse(fn)
-            # reset_conversation 通过 _cleanup_branch_locked 间接清理 branch，
-            # 但它自己也要清主 session 和普通 child。
             if "purge_session_files" not in body:
                 offenders.append(f"{rel}:{name}")
         assert offenders == [], f"这些拆除路径没有走共享 helper: {offenders}"

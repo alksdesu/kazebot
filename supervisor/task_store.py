@@ -250,7 +250,7 @@ class TaskStoreMixin:
                     "task_context", "_dispatch_origin", "dispatch_context_mode",
                     "parent_session_id", "branch_session_id", "base_count",
                     "_route_session_id", "_branch_finalized", "child_session_id",
-                    "_compact_dispatch_pending", "_system_task", "_async_dispatch",
+                    "_compact_dispatch_pending", "_system_task", "_async_dispatch", "_session_reset",
                 ):
                     if _k in raw_input:
                         slim_input[_k] = raw_input[_k]
@@ -515,6 +515,13 @@ class TaskStoreMixin:
         _dispatch_origin = payload.get("dispatch_origin")
         if not isinstance(_dispatch_origin, dict):
             _dispatch_origin = {}
+        else:
+            _dispatch_origin = dict(_dispatch_origin)
+        _dispatch_parent = str(_dispatch_origin.get("parent_session_id") or "").strip()
+        if _dispatch_parent and "parent_session_generation" not in _dispatch_origin:
+            _dispatch_origin["parent_session_generation"] = (
+                self._current_session_generation_locked(_dispatch_parent) or 1
+            )
         _dispatch_context_mode = str(payload.get("dispatch_context_mode") or "").strip()
         _dispatch_parent_conv_key = str(_dispatch_origin.get("parent_conversation_key") or "").strip()
 
@@ -957,11 +964,14 @@ class TaskStoreMixin:
             return None
         should_route = False
         finalize_only = False
+        reset_cleanup = False
         with self._lock:
             task = self.tasks.get(tid)
             if task is None:
                 return None
-            if self._task_terminal(task):
+            if task.input.get("_session_reset"):
+                reset_cleanup = True
+            elif self._task_terminal(task):
                 should_route = task.route_status != RouteStatus.routed
                 if not should_route:
                     logger.info(
@@ -998,7 +1008,16 @@ class TaskStoreMixin:
                     self._event_task_snapshot("task_completed", task, component="engine")
                     should_route = True
 
-        if finalize_only:
+        if reset_cleanup:
+            session_ids = {
+                task.session_id,
+                str(task.input.get("branch_session_id") or ""),
+                str(task.input.get("child_session_id") or ""),
+            }
+            for session_id in session_ids - {""}:
+                with self._branch_parent_write_lock(session_id):
+                    self.purge_session_files(session_id)
+        elif finalize_only:
             self._finalize_branch_task(task, merge=True)
         elif should_route:
             self._route_completed_task(task)

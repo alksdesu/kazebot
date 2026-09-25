@@ -532,6 +532,9 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         },
         "dispatch_context_mode": ctx_mode,
     }
+    parent_generation = getattr(ls.rctx, "session_generation", 0)
+    if parent_generation:
+        inbound_payload["dispatch_origin"]["parent_session_generation"] = parent_generation
     if ctx_mode == "fork":
         inbound_payload["dispatch_fork_from_session"] = parent_session_id
 

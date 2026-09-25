@@ -143,11 +143,15 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
     使子节点的消息写入自己的 JSONL 而非父 session。
     """
     try:
-        store = getattr(ls.rctx, 'conversation_store', None)
-        if store is None:
-            return
         # 跳过 dynamic context 和 ephemeral 消息（如 retry hint）
         if msg_dict.get('_dynamic') or msg_dict.get('_ephemeral'):
+            return
+        from ..conversation_routing import routing_meta
+        _routing_meta = routing_meta(getattr(ls.rctx, "task_context", {}) or {})
+        _routing_meta["source_task_id"] = getattr(ls.rctx, "task_id", "")
+        msg_dict.setdefault("_meta", {}).update(_routing_meta)
+        store = getattr(ls.rctx, 'conversation_store', None)
+        if store is None:
             return
         # [2026-05-07] 不再按 control_tool_name 跳过 finish。
         # 原因：finish 已恢复为真实 API 工具，正常结果必须像普通工具一样进入 ConversationStore。
