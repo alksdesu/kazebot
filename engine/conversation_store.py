@@ -9,9 +9,13 @@ See: data/session_conversation_store_design.md
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from engine.eventlog_rotation import eventlog_file_lock
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +125,10 @@ class Message:
 #  带内存缓存，cache miss 时从文件加载。
 # ---------------------------------------------------------------------------
 
+class ConversationChangedError(RuntimeError):
+    pass
+
+
 class ConversationStore:
     """Session-level conversation store backed by JSONL files.
 
@@ -148,23 +156,33 @@ class ConversationStore:
         if message.ephemeral:
             return
         path = self._data_dir / f"{session_id}.jsonl"
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(message.to_dict(), ensure_ascii=False) + "\n")
-        # 如果缓存中有该 session，同步追加。指纹要跟着更新，否则自己刚写的这一条
-        # 会让下一次 load 认为文件被别人改了而整文件重读。
-        if session_id in self._cache:
-            self._cache[session_id].append(message)
-            self._cache_stamps[session_id] = self._file_stamp(path)
+        encoded = json.dumps(message.to_dict(), ensure_ascii=False) + "\n"
+        with eventlog_file_lock(path):
+            if self._cache_stamps.get(session_id) != self._file_stamp(path):
+                self.invalidate_cache(session_id)
+            try:
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write(encoded)
+            except Exception:
+                self.invalidate_cache(session_id)
+                raise
+            if session_id in self._cache:
+                self._cache[session_id].append(message)
+                self._cache_stamps[session_id] = self._file_stamp(path)
 
     def append_batch(self, session_id: str, messages: list[Message]) -> None:
         """批量追加（一次文件 I/O）。写入后使缓存失效以保证一致性。"""
         path = self._data_dir / f"{session_id}.jsonl"
-        with open(path, "a", encoding="utf-8") as f:
-            for msg in messages:
-                if not msg.ephemeral:
-                    f.write(json.dumps(msg.to_dict(), ensure_ascii=False) + "\n")
-        # 批量写入后使缓存失效，下次 load 时重新从文件读取
-        self.invalidate_cache(session_id)
+        encoded = "".join(
+            json.dumps(msg.to_dict(), ensure_ascii=False) + "\n"
+            for msg in messages if not msg.ephemeral
+        )
+        with eventlog_file_lock(path):
+            try:
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write(encoded)
+            finally:
+                self.invalidate_cache(session_id)
 
     # ── 读取 ──
 
@@ -185,43 +203,63 @@ class ConversationStore:
         压缩前，下一轮又超阈值。一次 stat 换掉这个。
         """
         path = self._data_dir / f"{session_id}.jsonl"
-        stamp = self._file_stamp(path)
-        cached = self._cache.get(session_id)
-        if cached is not None and self._cache_stamps.get(session_id) == stamp:
-            return cached
-        messages: list[Message] = []
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            messages.append(Message.from_dict(json.loads(line)))
-                        except Exception:
-                            pass  # 跳过损坏行，不中断加载
-        self._cache[session_id] = messages
-        self._cache_stamps[session_id] = self._file_stamp(path)
-        return messages
+        with eventlog_file_lock(path):
+            stamp = self._file_stamp(path)
+            cached = self._cache.get(session_id)
+            if cached is not None and self._cache_stamps.get(session_id) == stamp:
+                return cached
+            messages: list[Message] = []
+            if path.exists():
+                with path.open("r", encoding="utf-8") as stream:
+                    for line in stream:
+                        line = line.strip()
+                        if line:
+                            try:
+                                messages.append(Message.from_dict(json.loads(line)))
+                            except Exception:
+                                pass  # 跳过损坏行，不中断加载
+            self._cache[session_id] = messages
+            self._cache_stamps[session_id] = self._file_stamp(path)
+            return messages
 
     # ── 清理 ──
 
     def delete(self, session_id: str) -> None:
         """删除 session 的对话存储文件和缓存。用于 context_reset reason=clear。"""
         path = self._data_dir / f"{session_id}.jsonl"
-        if path.exists():
-            path.unlink()
-        self.invalidate_cache(session_id)
+        with eventlog_file_lock(path):
+            path.unlink(missing_ok=True)
+            self.invalidate_cache(session_id)
 
     def replace_all(self, session_id: str, messages: list[Message]) -> None:
-        """原子替换 session 的全部消息。
-
-        Step 2（2026-04-16）修复 compact：主节点/child session 切到 ConversationStore
-        后，压缩需要用 summary 消息替换旧消息，而不是追加。此方法以 delete + append_batch
-        实现。不是真正的文件级 atomic，但 compact 结果写入失败时下次还能重试。
-        """
-        self.delete(session_id)
-        if messages:
-            self.append_batch(session_id, messages)
+        """完整写入临时文件后替换历史，失败时保留旧文件。"""
+        path = self._data_dir / f"{session_id}.jsonl"
+        with eventlog_file_lock(path):
+            expected_stamp = self._cache_stamps.get(session_id)
+            if expected_stamp is not None and expected_stamp != self._file_stamp(path):
+                self.invalidate_cache(session_id)
+                raise ConversationChangedError(f"conversation changed before replacement: {session_id}")
+            temporary: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=path.parent,
+                    prefix=f".{path.name}.", suffix=".tmp", delete=False,
+                ) as stream:
+                    temporary = Path(stream.name)
+                    for message in messages:
+                        if not message.ephemeral:
+                            stream.write(json.dumps(message.to_dict(), ensure_ascii=False) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+                temporary = None
+                self.invalidate_cache(session_id)
+            except Exception:
+                self.invalidate_cache(session_id)
+                raise
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
 
     # ── 查询 ──
 

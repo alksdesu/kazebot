@@ -18,3 +18,4 @@ yfinance>=0.2.40
 # QQ 适配器（adapters/onebot 是 NoneBot2 插件，由 bot.py 加载）
 nonebot2>=2.3.0
 nonebot-adapter-onebot>=2.4.0
+-r requirements-materials.txt

@@ -2509,6 +2509,27 @@ class TaskRouterMixin:
         self, target_session_id: str, summary: str, *, keep_recent: int,
         threshold_tokens: int = 256000, keep_recent_tokens: int = 0,
     ) -> dict[str, int]:
+        from engine.conversation_store import ConversationChangedError, ConversationStore
+
+        for _ in range(3):
+            try:
+                return self._apply_compact_via_conv_store_once_locked(
+                    target_session_id, summary, keep_recent=keep_recent,
+                    threshold_tokens=threshold_tokens, keep_recent_tokens=keep_recent_tokens,
+                )
+            except ConversationChangedError:
+                continue
+        log.info("compact deferred while conversation is changing: %s", target_session_id)
+        count = ConversationStore(self.workspace_root / "data" / "conversations").message_count(target_session_id)
+        return {
+            "before": count, "after": count,
+            "total_segments": 0, "kept_segments": 0, "compressed_segments": 0,
+        }
+
+    def _apply_compact_via_conv_store_once_locked(
+        self, target_session_id: str, summary: str, *, keep_recent: int,
+        threshold_tokens: int = 256000, keep_recent_tokens: int = 0,
+    ) -> dict[str, int]:
         """Step 2（2026-04-16）：在 ConversationStore 层面执行压缩。
 
         读取 target session 的 JSONL，用 summary 消息替换旧 task segment，保留
