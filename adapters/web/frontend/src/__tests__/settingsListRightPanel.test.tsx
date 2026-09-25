@@ -68,6 +68,7 @@ describe('settings list pages open the right panel on selection', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith('/admin/config/all-tool-names')) return jsonResponse(['tool_alpha']);
+      if (url.endsWith('/admin/config/nodes')) return jsonResponse([]);
       return jsonResponse([
         { name: 'tool_alpha', source: 'external', editable: true, description: '测试工具', input_schema: { type: 'object' }, timeout_sec: 30, has_spec: true },
       ]);
@@ -105,16 +106,21 @@ describe('settings list pages open the right panel on selection', () => {
   });
 
   it('opens the right panel when an automation task is selected', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => settingsYamlResponse([
-      'schedules:',
-      '- id: schedule_alpha',
-      '  cron: 0 0 * * *',
-      '  type: message',
-      '  text: 测试任务',
-      '  enabled: true',
-      '  once: false',
-      '',
-    ].join('\n'))));
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'http://localhost');
+      if (url.pathname.endsWith('/v1/reminders')) return jsonResponse({ reminders: [] });
+      if (url.pathname.endsWith('/v1/admin/conversations')) return jsonResponse({ conversations: [] });
+      return settingsYamlResponse([
+        'schedules:',
+        '- id: schedule_alpha',
+        '  cron: 0 0 * * *',
+        '  type: message',
+        '  text: 测试任务',
+        '  enabled: true',
+        '  once: false',
+        '',
+      ].join('\n'));
+    }));
 
     render(<AutomationSettingsPage />);
     fireEvent.click(await screen.findByRole('button', { name: /schedule_alpha/ }));

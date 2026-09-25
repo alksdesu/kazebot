@@ -51,6 +51,13 @@ describe('归一化', () => {
 });
 
 describe('读取', () => {
+  it('读取失败时不允许用空配置覆盖 runtime.yaml', async () => {
+    vi.mocked(getRuntimeRaw).mockRejectedValue(new Error('synthetic offline'));
+    render(<VisionRouting />);
+    expect(await screen.findByText('synthetic offline')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '保存路由' })).not.toBeInTheDocument();
+    expect(updateRuntimeRaw).not.toHaveBeenCalled();
+  });
   it('读出当前档位', async () => {
     render(<VisionRouting />);
     await ready();

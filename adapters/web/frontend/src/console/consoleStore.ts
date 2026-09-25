@@ -47,15 +47,10 @@ const DUMP_OPTIONS: yaml.DumpOptions = {
 };
 
 function parseDocument(raw: string): Record<string, unknown> {
-  try {
-    const loaded = yaml.load(raw);
-    if (loaded && typeof loaded === 'object' && !Array.isArray(loaded)) {
-      return loaded as Record<string, unknown>;
-    }
-  } catch {
-    // 磁盘上的 yaml 写坏了也要能进控制台改回来，所以这里不抛。
-  }
-  return {};
+  const loaded = yaml.load(raw);
+  if (loaded === undefined || loaded === null) return {};
+  if (typeof loaded !== 'object' || Array.isArray(loaded)) throw new Error('配置顶层必须是映射，请先修复 YAML，原文件未修改');
+  return loaded as Record<string, unknown>;
 }
 
 /** 把点分路径写进嵌套对象。undefined 表示删掉这个键（回落默认值）。 */
@@ -65,7 +60,8 @@ export function setByPath(doc: Record<string, unknown>, path: string, value: unk
   let cursor: Record<string, unknown> = doc;
   for (const key of parts.slice(0, -1)) {
     const next = cursor[key];
-    if (!next || typeof next !== 'object' || Array.isArray(next)) cursor[key] = {};
+    if (next !== undefined && (!next || typeof next !== 'object' || Array.isArray(next))) throw new Error(`配置路径 ${key} 不是映射，原文件未修改`);
+    if (next === undefined) cursor[key] = {};
     cursor = cursor[key] as Record<string, unknown>;
   }
   if (value === undefined) delete cursor[leaf];
@@ -101,6 +97,7 @@ const withApplied = (live: QqLiveState | null, draft: Draft): QqLiveState | null
   if (!live?.state) return live;
   return {
     ...live,
+    applied: false,
     state: { ...live.state, values: { ...(live.state.values || {}), ...draft } },
   };
 };
@@ -116,17 +113,22 @@ const settle = async (
   token: string,
   set: (partial: Partial<ConsoleState>) => void,
   get: () => ConsoleState,
+  savedRaw: string,
 ): Promise<void> => {
   for (let round = 0; round < 12; round += 1) {
     await sleep(250);
     try {
       const [state, file] = await Promise.all([getQqState(token), getQqRaw(token)]);
+      if (file.content !== savedRaw) {
+        set({ notice: '配置文件在保存后又发生变更，请刷新核对当前内容。' });
+        return;
+      }
       if (state.applied) {
         set({ live: state, raw: file.content, rawExists: file.exists });
         return;
       }
     } catch {
-      // 读不到就维持乐观值：文件已经写进去了，读状态失败不代表没保存。
+      set({ notice: '配置已写入，但暂时无法确认 bot 是否生效，请稍后刷新。' });
       return;
     }
   }
@@ -134,6 +136,8 @@ const settle = async (
     set({ notice: '已写入配置文件，但 bot 没在 3 秒内确认生效' });
   }
 };
+
+let refreshVersion = 0;
 
 export const useConsoleStore = create<ConsoleState>((set, get) => ({
   live: null,
@@ -146,11 +150,15 @@ export const useConsoleStore = create<ConsoleState>((set, get) => ({
   draft: {},
 
   refresh: async (token) => {
+    if (get().saving) return;
+    const version = ++refreshVersion;
     set({ loading: true, error: '' });
     try {
       const [state, file] = await Promise.all([getQqState(token), getQqRaw(token)]);
+      if (version !== refreshVersion) return;
       set({ live: state, raw: file.content, rawExists: file.exists, loading: false });
     } catch (error) {
+      if (version !== refreshVersion) return;
       set({ loading: false, error: error instanceof Error ? error.message : '读取配置失败' });
     }
   },
@@ -159,7 +167,7 @@ export const useConsoleStore = create<ConsoleState>((set, get) => ({
     const draft = { ...get().draft };
     const applied = get().live?.state?.values?.[name];
     // 改回生效值就不该继续算成待应用，否则「3 项待应用」里会混进已经撤销的改动。
-    if (JSON.stringify(value) === JSON.stringify(applied)) delete draft[name];
+    if (!get().saving && JSON.stringify(value) === JSON.stringify(applied)) delete draft[name];
     else draft[name] = value;
     set({ draft, notice: '' });
   },
@@ -167,23 +175,32 @@ export const useConsoleStore = create<ConsoleState>((set, get) => ({
   discard: () => set({ draft: {}, notice: '', error: '' }),
 
   apply: async (token) => {
-    const { raw, draft, live } = get();
-    if (!Object.keys(draft).length) return;
-    set({ saving: true, error: '', notice: '' });
+    const { draft, live, saving } = get();
+    if (saving || !Object.keys(draft).length) return;
+    ++refreshVersion;
+    set({ saving: true, loading: false, error: '', notice: '' });
     try {
       const paths = live?.state?.paths || {};
-      const result = await updateQqRaw(token, mergeDraft(raw, draft, paths));
+      const latest = await getQqRaw(token);
+      const raw = mergeDraft(latest.content, draft, paths);
+      const result = await updateQqRaw(token, raw);
       // bot 每 2s 才重读一次配置并公布生效值。这里先按刚写进去的值显示：
       // 草稿一清、live 又还是旧快照的话，界面会退回保存前的样子，看着像没存上。
+      const pending = { ...get().draft };
+      for (const [name, value] of Object.entries(draft)) {
+        if (JSON.stringify(pending[name]) === JSON.stringify(value)) delete pending[name];
+      }
       set({
-        draft: {},
-        saving: false,
+        draft: pending,
+        raw, rawExists: true,
         notice: result.warnings.join('；'),
         live: withApplied(live, draft),
       });
-      await settle(token, set, get);
+      await settle(token, set, get, raw);
     } catch (error) {
-      set({ saving: false, error: error instanceof Error ? error.message : '保存失败' });
+      set({ error: error instanceof Error ? error.message : '保存失败' });
+    } finally {
+      set({ saving: false });
     }
   },
 

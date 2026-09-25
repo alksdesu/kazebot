@@ -1,6 +1,7 @@
 // 人格。这一页有两套保存路径：人设和模型各自就地存盘，
 // 下半页的开关走 qq.yaml，由顶部那个「应用」统一提交。
 import { useEffect, useId, useState } from 'react';
+import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
 import {
   getNodeFileRaw,
@@ -40,33 +41,47 @@ const say = (error: unknown): string => (error instanceof Error ? error.message 
 
 /** 一块独立存盘的区域共用的底栏。草稿在这一块自己手里，不进顶部的「N 项待应用」。 */
 const Persona = () => {
+  const token = useSettingsStore(state => state.adminToken);
+  return <PersonaEditor key={token || ""} />;
+};
+
+const PersonaEditor = () => {
   const token = useSettingsStore((state) => state.adminToken);
   const [saved, setSaved] = useState('');
   const [text, setText] = useState('');
   /** 文件不存在时 bot 读的是 _persona.example.md，第一次保存会把这层回退关掉。 */
   const [onlyExample, setOnlyExample] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [loaded, setLoaded] = useState(false);
   const [note, setNote] = useState('正在读取…');
+  const confirmDiscard = useUnsavedChanges(text !== saved, '人设有未保存修改，确定离开或还原吗？');
 
   useEffect(() => {
     if (!token) return;
+    let cancelled = false;
+    setLoaded(false);
     void (async () => {
       try {
         const body = await getNodeFileRaw(token, PERSONA_FILE);
+        if (cancelled) return;
         setSaved(body);
         setText(body);
         setOnlyExample(false);
         setNote('');
-      } catch {
-        // 读不到就是还没建过这个文件，example 正在顶班。
-        setOnlyExample(true);
-        setNote('');
+        setLoaded(true);
+      } catch (error) {
+        if (cancelled) return;
+        const missing = error instanceof Error && /^404\b/.test(error.message);
+        setOnlyExample(missing);
+        setLoaded(missing);
+        setNote(missing ? '' : say(error));
       }
     })();
+    return () => { cancelled = true; };
   }, [token]);
 
   const save = async () => {
-    if (!token) return;
+    if (!token || busy || !loaded) return;
     setBusy(true);
     try {
       await updateNodeFileRaw(token, PERSONA_FILE, text);
@@ -88,6 +103,8 @@ const Persona = () => {
         </ErrorText>
       )}
       <Textarea
+        aria-label="人设内容"
+        disabled={busy || !loaded}
         onChange={(event) => setText(event.target.value)}
         placeholder="写 bot 的性格、说话方式、忌讳。这段会原样拼进提示词。"
         rows={14}
@@ -95,9 +112,9 @@ const Persona = () => {
       />
       <SaveBar
         busy={busy}
-        dirty={text !== saved}
+        dirty={loaded && text !== saved}
         note={note}
-        onReset={() => setText(saved)}
+        onReset={() => { if (confirmDiscard()) setText(saved); }}
         onSave={() => void save()}
       />
     </>
@@ -105,6 +122,11 @@ const Persona = () => {
 };
 
 const ModelChoice = () => {
+  const token = useSettingsStore(state => state.adminToken);
+  return <ModelChoiceEditor key={token || ""} />;
+};
+
+const ModelChoiceEditor = () => {
   const token = useSettingsStore((state) => state.adminToken);
   const modelListId = useId();
   const [raw, setRaw] = useState('');
@@ -115,8 +137,9 @@ const ModelChoice = () => {
   const [note, setNote] = useState('正在读取…');
 
   const adopt = (body: string) => {
+    const currentModel = readYamlScalar(body, ['model']);
     setRaw(body);
-    setModel(readYamlScalar(body, ['model']));
+    setModel(currentModel);
   };
 
   useEffect(() => {
@@ -140,9 +163,10 @@ const ModelChoice = () => {
   }, [token]);
 
   const dirty = model !== (raw ? readYamlScalar(raw, ['model']) : '');
+  const confirmDiscard = useUnsavedChanges(dirty, '节点模型还有未保存修改，确定离开或还原吗？');
 
   const save = async () => {
-    if (!token) return;
+    if (!token || !raw || busy) return;
     setBusy(true);
     try {
       const next = upsertYamlScalar(raw, 'model', model.trim(), 'type');
@@ -162,6 +186,8 @@ const ModelChoice = () => {
   return (
     <>
       <Input
+        aria-label="综合入口模型"
+        disabled={busy || !raw}
         list={modelChoices.length ? modelListId : undefined}
         onChange={(event) => setModel(event.target.value)}
         placeholder="留空 = 跟随全局默认模型"
@@ -177,7 +203,7 @@ const ModelChoice = () => {
         任意模型 id 都能填；也可以写 <code>$ENV{'{VAR}'}</code>，从环境变量取。
       </Facts>
 
-      <SaveBar busy={busy} dirty={dirty} note={note} onReset={() => adopt(raw)} onSave={() => void save()} />
+      <SaveBar busy={busy} dirty={dirty && Boolean(raw)} note={note} onReset={() => { if (confirmDiscard()) adopt(raw); }} onSave={() => void save()} />
     </>
   );
 };

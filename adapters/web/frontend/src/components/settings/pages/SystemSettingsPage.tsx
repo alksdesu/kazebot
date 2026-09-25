@@ -1,3 +1,4 @@
+import { useExclusiveAction } from '../../../hooks/useExclusiveAction';
 // [2026-06-02] System settings page for Supervisor status and runtime controls.
 // Why: operators need one tab for health, admin state, config reload, and engine
 // restart. How: combine existing health/admin endpoints with guarded action buttons
@@ -35,6 +36,7 @@ export const SystemSettingsPage = () => {
   const [health, setHealth] = useState<HealthState | null>(null);
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
+  const { busy, run } = useExclusiveAction();
   const [activeTasksOpen, setActiveTasksOpen] = useState(false);
   const addSystemLog = useSettingsSelectionStore(state => state.addSystemLog);
 
@@ -83,7 +85,7 @@ export const SystemSettingsPage = () => {
     return '无工作进程';
   }, [adminState]);
 
-  const handleReload = async () => {
+  const handleReload = () => run(async () => {
     if (!adminToken) return;
     try {
       await reloadConfig(adminToken);
@@ -92,9 +94,8 @@ export const SystemSettingsPage = () => {
     } catch (error) {
       report(error instanceof Error ? error.message : '配置重载失败');
     }
-  };
-
-  const handleRestart = async () => {
+  });
+  const handleRestart = () => run(async () => {
     if (!adminToken) return;
     if (!window.confirm('确认要重启引擎吗？运行中的任务会全部中断，调度器与本页面的连接不受影响。')) return;
     try {
@@ -104,8 +105,7 @@ export const SystemSettingsPage = () => {
     } catch (error) {
       report(error instanceof Error ? error.message : '重启失败');
     }
-  };
-
+  });
   return (
     <PageShell>
       <PageHeader description="查看 Supervisor 运行状态，并执行配置重载或引擎重启。" title="系统" />
@@ -122,7 +122,7 @@ export const SystemSettingsPage = () => {
               <p><span className="text-[var(--duties-tertiary)]">Engine worker：</span><span className="font-mono">{engineInfo}</span></p>
             </div>
             <div className="mt-3 flex flex-wrap gap-2">
-              <Button disabled={loading} onClick={() => load()}>{loading ? '刷新中...' : '刷新状态'}</Button>
+              <Button disabled={loading || busy} onClick={() => load()}>{loading ? '刷新中...' : '刷新状态'}</Button>
             </div>
           </Card>
 
@@ -130,8 +130,8 @@ export const SystemSettingsPage = () => {
 
           <Card title="运行控制" description="配置重载会重新读取配置；引擎重启需要二次确认。">
             <div className="flex flex-wrap gap-2">
-              <Button onClick={handleReload} variant="primary">重载配置</Button>
-              <Button onClick={handleRestart} variant="danger">重启引擎</Button>
+              <Button disabled={busy} onClick={handleReload} variant="primary">重载配置</Button>
+              <Button disabled={busy} onClick={handleRestart} variant="danger">重启引擎</Button>
             </div>
             <StatusText message={message} />
           </Card>

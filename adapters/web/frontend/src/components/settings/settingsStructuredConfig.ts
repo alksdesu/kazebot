@@ -18,6 +18,7 @@ export interface ParsedProvidersResult {
 }
 
 export interface ScheduleFormState {
+  original?: Record<string, unknown>;
   id: string;
   cron: string;
   type: 'message' | 'script';
@@ -33,6 +34,7 @@ export interface ScheduleFormState {
 }
 
 export interface McpClientFormState {
+  original?: Record<string, unknown>;
   id: string;
   description: string;
   enabled: boolean;
@@ -56,7 +58,7 @@ export interface SkillFormState {
   body: string;
 }
 
-export type NodeConfigType = 'ai' | 'tool' | 'router';
+export type NodeConfigType = 'ai' | 'tool';
 // 与 engine/node.py 的 ToolAccess.mode 取值一致；后端把未知值降级成 none，
 // 曾经这里写 allow/deny 导致节点被静默改成「无任何工具」。
 export type ToolAccessMode = 'all' | 'allowlist' | 'none';
@@ -74,6 +76,7 @@ export interface NodeConfigFormState {
   memory_book: string;
   persistent: boolean;
   prompt: string;
+  promptIsStructured?: boolean;
   delegate_targetsText: string;
 }
 
@@ -101,11 +104,10 @@ const DUMP_OPTS: yaml.DumpOptions = {
 };
 
 function safeLoad(raw: string): Record<string, any> {
-  try {
-    const result = yaml.load(raw);
-    if (result && typeof result === 'object' && !Array.isArray(result)) return result as Record<string, any>;
-  } catch { /* swallow parse errors — form stays at defaults */ }
-  return {};
+  const result = yaml.load(raw);
+  if (result === undefined || result === null) return {};
+  if (typeof result !== 'object' || Array.isArray(result)) throw new Error('YAML 顶层必须是映射，原文件未修改');
+  return result as Record<string, any>;
 }
 
 function safeDump(obj: any): string {
@@ -133,7 +135,7 @@ function nested(doc: Record<string, any>, path: readonly string[]): any {
 }
 
 function normalizeNodeConfigType(value: string): NodeConfigType {
-  return value === 'tool' || value === 'router' || value === 'ai' ? value : 'ai';
+  return value === 'tool' ? value : 'ai';
 }
 
 function commaTextToItems(value: string): string[] {
@@ -176,7 +178,8 @@ export function parseNodeConfig(raw: string, fallbackId = ''): NodeConfigFormSta
     provider: str(doc.provider),
     memory_book: str(doc.memory_book),
     persistent: doc.persistent === true,
-    prompt: str(doc.prompt),
+    prompt: Array.isArray(doc.prompt) ? JSON.stringify(doc.prompt, null, 2) : str(doc.prompt),
+    promptIsStructured: Array.isArray(doc.prompt),
     delegate_targetsText: Array.isArray(doc.delegate_targets) ? doc.delegate_targets.map(String).join(', ') : '',
   };
 }
@@ -191,7 +194,13 @@ export function serializeNodeConfig(raw: string, form: NodeConfigFormState): str
   if (form.provider.trim()) doc.provider = form.provider.trim(); else delete doc.provider;
   if (form.memory_book.trim()) doc.memory_book = form.memory_book.trim(); else delete doc.memory_book;
   doc.persistent = form.persistent;
-  if (form.prompt.trim()) doc.prompt = form.prompt; else delete doc.prompt;
+  if (form.prompt.trim()) {
+    if (form.promptIsStructured) {
+      const prompt = JSON.parse(form.prompt);
+      if (!Array.isArray(prompt)) throw new Error('结构化提示词必须是 JSON 数组，原文件未修改');
+      doc.prompt = prompt;
+    } else doc.prompt = form.prompt;
+  } else delete doc.prompt;
   doc.delegate_targets = commaTextToItems(form.delegate_targetsText);
   // tool_access 只能改 YAML 原文；这里整份 dump 会把 mode 对应不上的那半
   // （allowlist 下的 deny）连同注释一起洗掉。
@@ -239,6 +248,7 @@ export function serializeRuntimeConfig(raw: string, form: RuntimeConfigFormState
   // 空基底会让整份 runtime.yaml 被这几个键的输出替换掉，而 safeLoad 对空串是静默返回 {}。
   if (!raw.trim()) throw new Error('尚未读入 runtime.yaml，拒绝用空内容覆盖');
   // 逐键定点改写而不是 load/dump 一轮：runtime.yaml 里一百多行说明注释全靠原文留着。
+  safeLoad(raw);
   let out = raw;
   out = upsertYamlNested(out, [...RUNTIME_ENTRY_NODE_PATH], form.entry_node_id.trim());
   out = upsertYamlNested(out, [...RUNTIME_TOOL_MODE_PATH], normalizeEngineToolMode(form.tool_mode));
@@ -285,10 +295,12 @@ export function replaceProvidersInRuntime(raw: string, providers: Record<string,
 
 export function parseSchedules(raw: string): ScheduleFormState[] {
   const doc = safeLoad(raw);
-  const list = Array.isArray(doc.schedules) ? doc.schedules : [];
+  const list = doc.schedules === undefined ? [] : doc.schedules;
+  if (!Array.isArray(list) || list.some(item => !item || typeof item !== 'object' || Array.isArray(item))) throw new Error('schedules 必须是对象数组，原文件未修改');
+  if (list.some(item => item.type !== undefined && !['message', 'script'].includes(item.type))) throw new Error('存在不支持的定时任务类型，请用原文编辑');
   return list
-    .filter((item: any): item is Record<string, any> => Boolean(item && typeof item === 'object' && !Array.isArray(item)))
     .map((item: Record<string, any>) => ({
+      original: { ...item },
       id: str(item.id),
       cron: str(item.cron),
       type: (item.type === 'script' ? 'script' : 'message') as 'message' | 'script',
@@ -300,28 +312,31 @@ export function parseSchedules(raw: string): ScheduleFormState[] {
       entry_node_id: str(item.entry_node_id),
       workflow_id: str(item.workflow_id),
       timeout: item.timeout === undefined ? '' : String(item.timeout),
-      silent: item.silent === true,
+      silent: item.silent !== false,
     }));
 }
 
-export function serializeSchedules(schedules: ScheduleFormState[]): string {
+export function serializeSchedules(schedules: ScheduleFormState[], raw = ''): string {
+  parseSchedules(raw);
   const items = schedules.map((s) => {
     const obj: Record<string, any> = {
+      ...s.original,
       id: s.id, cron: s.cron, type: s.type, text: s.text,
       enabled: s.enabled, once: s.once,
     };
-    if (s.conversation_key) obj.conversation_key = s.conversation_key;
-    if (s.entry_node_id) obj.entry_node_id = s.entry_node_id;
-    if (s.workflow_id) obj.workflow_id = s.workflow_id;
+    for (const key of ['conversation_key', 'entry_node_id', 'workflow_id'] as const) {
+      if (s[key]) obj[key] = s[key]; else delete obj[key];
+    }
     if (s.type === 'script') {
       obj.command = s.command;
-      if (s.timeout) obj.timeout = Number(s.timeout) || s.timeout;
+      if (s.timeout) obj.timeout = Number(s.timeout) || s.timeout; else delete obj.timeout;
       obj.silent = s.silent;
+    } else {
+      delete obj.command; delete obj.timeout; delete obj.silent;
     }
     return obj;
   });
-  if (items.length === 0) return 'schedules: []\n';
-  return yaml.dump({ schedules: items }, DUMP_OPTS);
+  return yaml.dump({ ...safeLoad(raw), schedules: items }, DUMP_OPTS);
 }
 
 // ==================== MCP Clients ====================
@@ -329,18 +344,20 @@ export function serializeSchedules(schedules: ScheduleFormState[]): string {
 export function parseMcpClients(raw: string): McpClientFormState[] {
   const doc = safeLoad(raw);
   const clients = doc.clients;
-  if (!clients || typeof clients !== 'object' || Array.isArray(clients)) return [];
+  if (clients === undefined) return [];
+  if (!clients || typeof clients !== 'object' || Array.isArray(clients) || Object.values(clients).some(v => !v || typeof v !== 'object' || Array.isArray(v))) throw new Error('clients 必须是对象映射，原文件未修改');
   return Object.entries(clients)
-    .filter(([, v]) => v && typeof v === 'object' && !Array.isArray(v))
     .map(([id, v]) => {
       const c = v as Record<string, any>;
+      if (c.transport !== undefined && !['stdio', 'sse', 'streamable_http'].includes(c.transport)) throw new Error('存在不支持的 MCP 传输方式，请用原文编辑');
       return {
+        original: { ...c },
         id,
         description: str(c.description),
         enabled: c.enabled !== false,
         transport: (c.transport === 'sse' ? 'sse' : c.transport === 'stdio' ? 'stdio' : 'streamable_http') as 'stdio' | 'sse' | 'streamable_http',
         command: str(c.command),
-        argsText: Array.isArray(c.args) ? c.args.map(String).join('\n') : '',
+        argsText: Array.isArray(c.args) ? JSON.stringify(c.args) : '[]',
         envText: serializeLooseKV(c.env),
         url: str(c.url),
         headersText: serializeLooseKV(c.headers),
@@ -348,26 +365,31 @@ export function parseMcpClients(raw: string): McpClientFormState[] {
     });
 }
 
-export function serializeMcpClients(clients: McpClientFormState[]): string {
-  if (clients.length === 0) return 'version: 1\nclients: {}\n';
+export function serializeMcpClients(clients: McpClientFormState[], raw = ''): string {
+  parseMcpClients(raw);
   const obj: Record<string, any> = {};
   for (const c of clients) {
     const entry: Record<string, any> = {
+      ...c.original,
       transport: c.transport,
       enabled: c.enabled,
       description: c.description,
     };
     if (c.transport === 'stdio') {
       entry.command = c.command;
-      entry.args = c.argsText.split('\n').map((s) => s.trim()).filter(Boolean);
-      entry.env = parseLooseKV(c.envText);
+      const args = c.argsText.trim().startsWith('[') ? JSON.parse(c.argsText) : c.argsText.split('\n').map(s => s.trim()).filter(Boolean);
+      if (!Array.isArray(args) || args.some(item => typeof item !== 'string')) throw new Error('MCP 启动参数必须是字符串数组');
+      entry.args = args;
+      entry.env = c.original && c.envText === serializeLooseKV(c.original.env) ? c.original.env : parseLooseKV(c.envText);
+      delete entry.url; delete entry.headers;
     } else {
       entry.url = c.url;
-      entry.headers = parseLooseKV(c.headersText);
+      entry.headers = c.original && c.headersText === serializeLooseKV(c.original.headers) ? c.original.headers : parseLooseKV(c.headersText);
+      delete entry.command; delete entry.args; delete entry.env;
     }
     obj[c.id] = entry;
   }
-  return yaml.dump({ version: 1, clients: obj }, DUMP_OPTS);
+  return yaml.dump({ version: 1, ...safeLoad(raw), clients: obj }, DUMP_OPTS);
 }
 
 // ==================== Skills ====================

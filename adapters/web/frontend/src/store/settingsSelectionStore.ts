@@ -4,6 +4,7 @@
 // config file. How: keep a small Zustand store with serializable snapshots. Purpose:
 // pages can update contextual right-panel data without changing the settings host.
 import { create } from 'zustand';
+import { confirmNavigation } from '../hooks/useUnsavedChanges';
 
 import type { AdminApproval, AdminNode, AdminSkill, AdminTool, McpClient } from '../api/supervisorClient';
 
@@ -28,7 +29,7 @@ export interface SettingsSelectionState {
   setAdvancedFile: (file: 'runtime' | 'policy') => void;
 }
 
-export const useSettingsSelectionStore = create<SettingsSelectionState>((set) => ({
+export const useSettingsSelectionStore = create<SettingsSelectionState>((set, get) => ({
   systemLogs: [],
   selectedApproval: null,
   selectedNode: null,
@@ -51,11 +52,29 @@ export const useSettingsSelectionStore = create<SettingsSelectionState>((set) =>
     systemLogs: [`${new Date().toLocaleTimeString()} ${message}`, ...state.systemLogs].slice(0, 10),
   })),
   setSelectedApproval: (approval) => set({ selectedApproval: approval }),
-  setSelectedNode: (node) => set({ selectedNode: node }),
-  setSelectedTool: (tool) => set({ selectedTool: tool }),
+  setSelectedNode: (node) => {
+    if (get().selectedNode?.id !== node?.id && !confirmNavigation()) return;
+    set({ selectedNode: node });
+  },
+  setSelectedTool: (tool) => {
+    if (get().selectedTool?.name !== tool?.name && !confirmNavigation()) return;
+    set({ selectedTool: tool });
+  },
   setAllToolNames: (names) => set({ allToolNames: names }),
-  setSelectedSkill: (skill) => set({ selectedSkill: skill }),
-  setSelectedMcpClient: (client) => set({ selectedMcpClient: client }),
-  setSelectedScheduleId: (scheduleId) => set({ selectedScheduleId: scheduleId }),
-  setAdvancedFile: (file) => set({ advancedFile: file }),
+  setSelectedSkill: (skill) => {
+    if (get().selectedSkill?.name !== skill?.name && !confirmNavigation()) return;
+    set({ selectedSkill: skill });
+  },
+  setSelectedMcpClient: (client) => {
+    if (get().selectedMcpClient?.id !== client?.id && !confirmNavigation()) return;
+    set({ selectedMcpClient: client });
+  },
+  setSelectedScheduleId: (scheduleId) => {
+    if (get().selectedScheduleId !== scheduleId && !confirmNavigation()) return;
+    set({ selectedScheduleId: scheduleId });
+  },
+  setAdvancedFile: (file) => {
+    if (get().advancedFile !== file && !confirmNavigation()) return;
+    set({ advancedFile: file });
+  },
 }));

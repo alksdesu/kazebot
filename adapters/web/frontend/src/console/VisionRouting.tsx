@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react';
 
 import { getRuntimeRaw, updateRuntimeRaw } from '../api/supervisorClient';
+import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Desc, Empty, ErrorText, Facts, Field, SaveBar, Select } from './components';
 import { readYamlScalar, upsertYamlNested } from './nodeYaml';
@@ -38,26 +39,33 @@ export const VisionRouting = () => {
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
   const [error, setError] = useState('');
+  const confirmDiscard = useUnsavedChanges(mode !== saved, '带图路由尚未保存，确定离开或还原吗？');
 
   useEffect(() => {
     if (!token) return;
+    let cancelled = false;
+    setRaw(null);
     void getRuntimeRaw(token).then((text) => {
+      if (cancelled) return;
       setRaw(text);
       const current = normalizeMode(readYamlScalar(text, PATH));
       setMode(current);
       setSaved(current);
     }).catch((caught) => {
+      if (cancelled) return;
       setError(say(caught));
-      setRaw('');
+      setRaw(null);
     });
+    return () => { cancelled = true; };
   }, [token]);
 
   const save = async () => {
-    if (!token || raw === null) return;
+    if (!token || !raw || busy) return;
     setBusy(true);
     setError('');
     try {
-      const next = upsertYamlNested(raw, PATH, mode);
+      const latest = await getRuntimeRaw(token);
+      const next = upsertYamlNested(latest, PATH, mode);
       await updateRuntimeRaw(token, next);
       setRaw(next);
       setSaved(mode);
@@ -68,12 +76,13 @@ export const VisionRouting = () => {
     setBusy(false);
   };
 
-  if (raw === null) return <Empty>正在读取带图路由…</Empty>;
+  if (raw === null) return <Empty>{error || '正在读取带图路由…'}</Empty>;
 
   return (
     <Block hint="带图消息交给主渠道还是绕去视觉入口节点" title="带图消息">
       <Field label="路由方式">
         <Select
+          disabled={busy || !raw}
           aria-label="带图消息路由"
           onChange={(event) => setMode(event.target.value)}
           value={mode}
@@ -96,7 +105,7 @@ export const VisionRouting = () => {
         dirty={mode !== saved}
         label="保存路由"
         note={note}
-        onReset={() => setMode(saved)}
+        onReset={() => { if (confirmDiscard()) setMode(saved); }}
         onSave={() => void save()}
       />
     </Block>

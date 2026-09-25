@@ -1,3 +1,5 @@
+import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
+import { useExclusiveAction } from '../../../hooks/useExclusiveAction';
 // [2026-06-02] Skill management settings page.
 // Why: skills are Markdown files with frontmatter that operators frequently adjust.
 // How: list parsed skill metadata and support create/delete actions here, while the
@@ -30,6 +32,7 @@ export const SkillsSettingsPage = () => {
   const [newName, setNewName] = useState('');
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
+  const { busy, run } = useExclusiveAction();
 
   const load = async () => {
     if (!adminToken || !isAuthenticated) return;
@@ -58,10 +61,11 @@ export const SkillsSettingsPage = () => {
     return () => window.removeEventListener('settings:skills-updated', handler);
   }, [adminToken, isAuthenticated, selectedSkill?.name]);
 
-  const create = async () => {
+  const create = () => run(async () => {
     if (!adminToken) return;
     const name = newName.trim();
     if (!name) { setMessage('请输入技能名称'); return; }
+    if (!confirmNavigation()) return;
     try {
       await createSkill(adminToken, { id: name, content: defaultSkillMarkdown(name) });
       setNewName('');
@@ -71,11 +75,11 @@ export const SkillsSettingsPage = () => {
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '创建技能失败');
     }
-  };
-
-  const remove = async () => {
+  });
+  const remove = () => run(async () => {
     if (!adminToken || !selectedSkill) return;
     if (!window.confirm(`确定要删除技能 ${selectedSkill.name} 吗？`)) return;
+    if (!confirmNavigation()) return;
     try {
       await deleteSkill(adminToken, selectedSkill.name);
       setSelectedSkill(null);
@@ -84,20 +88,19 @@ export const SkillsSettingsPage = () => {
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '删除技能失败');
     }
-  };
-
+  });
   return (
     <PageShell>
       <PageHeader description="管理 skills 目录下的 SKILL.md 文件。选择技能后，请在右栏编辑 frontmatter 和 Markdown 正文。" title="技能管理" />
       {!isAuthenticated ? <AuthRequired /> : (
         <Card title="技能列表" description="列表展示技能名称、启用状态、策略和关键词预览。编辑器位于右栏。">
           <div className="mb-3 flex flex-wrap gap-2">
-            <Button disabled={loading} onClick={load}>{loading ? '刷新中...' : '刷新技能'}</Button>
-            <Button disabled={!selectedSkill} onClick={remove} variant="danger">删除选中技能</Button>
+            <Button disabled={loading || busy} onClick={load}>{loading ? '刷新中...' : '刷新技能'}</Button>
+            <Button disabled={busy || !selectedSkill} onClick={remove} variant="danger">删除选中技能</Button>
           </div>
           <div className="max-h-[34rem] space-y-2 overflow-y-auto">
             {skills.map((skill) => (
-              <button className={`w-full border p-3 text-left ${selectedSkill?.name === skill.name ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={skill.name} onClick={() => { setSelectedSkill(skill); setMessage(''); setRightPanelOpen(true); }} type="button">
+              <button className={`w-full border p-3 text-left ${selectedSkill?.name === skill.name ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={skill.name} disabled={busy} onClick={() => { setSelectedSkill(skill); setMessage(''); setRightPanelOpen(true); }} type="button">
                 <div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs font-semibold">{skill.name}</span><span className={`border px-1.5 py-0.5 text-[0.55rem] ${skill.enabled === false ? 'border-red-200 bg-red-50 text-red-700' : 'border-green-200 bg-green-50 text-green-700'}`}>{skill.enabled === false ? '禁用' : '启用'}</span><span className="font-mono text-[0.6rem] text-[var(--duties-tertiary)]">{skill.strategy || 'normal'}</span></div>
                 <p className="mt-1 text-xs text-[var(--duties-secondary)]">{skill.description || skill.body_preview || '无描述'}</p>
                 {(skill.keywords || []).length > 0 && <p className="mt-1 truncate font-mono text-[0.65rem] text-[var(--duties-tertiary)]">{(skill.keywords || []).join(', ')}</p>}
@@ -106,8 +109,8 @@ export const SkillsSettingsPage = () => {
           </div>
           <div className="mt-4 border-t border-[var(--duties-border)] pt-3">
             <FieldLabel htmlFor="new-skill-name">创建技能</FieldLabel>
-            <TextInput id="new-skill-name" onChange={(event) => setNewName(event.target.value)} placeholder="技能目录名" value={newName} />
-            <Button className="mt-2" onClick={create} variant="primary">创建技能</Button>
+            <TextInput disabled={busy} id="new-skill-name" onChange={(event) => setNewName(event.target.value)} placeholder="技能目录名" value={newName} />
+            <Button className="mt-2" disabled={busy} onClick={create} variant="primary">创建技能</Button>
           </div>
           <StatusText message={message} />
         </Card>

@@ -1,3 +1,5 @@
+import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
+import { useExclusiveAction } from '../../../hooks/useExclusiveAction';
 // [2026-06-02] Agent and node management settings page.
 // Why: node YAML files are core runtime assets and need a first-class editor. How:
 // list configured nodes, support template-based creation and deletion, and keep the
@@ -34,6 +36,7 @@ export const AgentsSettingsPage = () => {
   const [template, setTemplate] = useState('ai');
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
+  const { busy, run } = useExclusiveAction();
 
   const loadNodes = async () => {
     if (!adminToken || !isAuthenticated) return;
@@ -62,10 +65,11 @@ export const AgentsSettingsPage = () => {
     return () => window.removeEventListener('settings:nodes-updated', handler);
   }, [adminToken, isAuthenticated, selectedNode?.id]);
 
-  const create = async () => {
+  const create = () => run(async () => {
     if (!adminToken) return;
     const id = newId.trim();
     if (!id) { setMessage('请输入节点 ID'); return; }
+    if (!confirmNavigation()) return;
     try {
       await createNode(adminToken, { id, content: nodeTemplate(id, template) });
       setNewId('');
@@ -75,11 +79,11 @@ export const AgentsSettingsPage = () => {
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '创建节点失败');
     }
-  };
-
-  const remove = async () => {
+  });
+  const remove = () => run(async () => {
     if (!adminToken || !selectedNode) return;
     if (!window.confirm(`确定要删除节点 ${selectedNode.id} 吗？此操作会删除对应 YAML 文件。`)) return;
+    if (!confirmNavigation()) return;
     try {
       await deleteNode(adminToken, selectedNode.id);
       setSelectedNode(null);
@@ -88,20 +92,19 @@ export const AgentsSettingsPage = () => {
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '删除节点失败');
     }
-  };
-
+  });
   return (
     <PageShell>
       <PageHeader description="查看、创建和删除节点配置文件。选择节点后，请在右侧面板编辑对应 YAML。" title="节点管理" />
       {!isAuthenticated ? <AuthRequired /> : (
         <Card title="节点列表" description="中间区域只负责列表和操作，节点 YAML 编辑器显示在右栏。">
           <div className="mb-3 flex flex-wrap gap-2">
-            <Button disabled={loading} onClick={loadNodes}>{loading ? '刷新中...' : '刷新节点'}</Button>
-            <Button disabled={!selectedNode} onClick={remove} variant="danger">删除选中节点</Button>
+            <Button disabled={loading || busy} onClick={loadNodes}>{loading ? '刷新中...' : '刷新节点'}</Button>
+            <Button disabled={busy || !selectedNode} onClick={remove} variant="danger">删除选中节点</Button>
           </div>
           <div className="max-h-[34rem] space-y-2 overflow-y-auto">
             {nodes.map((node) => (
-              <button className={`w-full border p-3 text-left ${selectedNode?.id === node.id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={node.id} onClick={() => { setSelectedNode(node); setMessage(''); setRightPanelOpen(true); }} type="button">
+              <button className={`w-full border p-3 text-left ${selectedNode?.id === node.id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={node.id} disabled={busy} onClick={() => { setSelectedNode(node); setMessage(''); setRightPanelOpen(true); }} type="button">
                 <p className="flex flex-wrap items-center gap-1.5 font-mono text-xs font-semibold">
                   {node.id}
                   {node.active === false && (
@@ -123,12 +126,12 @@ export const AgentsSettingsPage = () => {
           </div>
           <div className="mt-4 border-t border-[var(--duties-border)] pt-3">
             <FieldLabel htmlFor="new-node-id">创建节点</FieldLabel>
-            <TextInput id="new-node-id" onChange={(event) => setNewId(event.target.value)} placeholder="节点 ID" value={newId} />
-            <SelectInput className="mt-2" onChange={(event) => setTemplate(event.target.value)} value={template}>
+            <TextInput disabled={busy} id="new-node-id" onChange={(event) => setNewId(event.target.value)} placeholder="节点 ID" value={newId} />
+            <SelectInput aria-label="新节点模板" disabled={busy} className="mt-2" onChange={(event) => setTemplate(event.target.value)} value={template}>
               <option value="ai">AI 节点模板</option>
               <option value="tool">工具节点模板</option>
             </SelectInput>
-            <Button className="mt-2" onClick={create} variant="primary">创建节点</Button>
+            <Button className="mt-2" disabled={busy} onClick={create} variant="primary">创建节点</Button>
           </div>
           <StatusText message={message} />
         </Card>

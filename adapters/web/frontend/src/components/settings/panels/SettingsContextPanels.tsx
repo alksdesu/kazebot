@@ -4,7 +4,7 @@
 // tool schemas, and MCP connection data. How: read snapshots from the settings
 // selection store and render small Chinese summaries. Purpose: each tab can keep its
 // main workflow focused while the right rail provides reference details.
-import { useEffect, useId, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 
 // [2026-06-02] Add raw MCP and schedule endpoints for the right-panel form editors.
 // Why: the second editable Settings batch saves selected MCP clients and schedules
@@ -23,17 +23,18 @@ import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore
 import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
 import { YamlEditor } from '../../common';
+import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
+import yaml from 'js-yaml';
 
-const PanelShell = ({ title, eyebrow, children }: { title: string; eyebrow?: string; children: ReactNode }) => (
+const PanelShell = ({ title, eyebrow, disabled, children }: { title: string; eyebrow?: string; disabled?: boolean; children: ReactNode }) => (
   <section className="flex h-full min-h-0 flex-col overflow-y-auto p-3">
-    <p className="font-mono text-[0.55rem] uppercase tracking-[0.18em] text-[var(--duties-tertiary)]">{eyebrow || '设置详情'}</p>
-    <h2 className="mt-1 mb-3 font-mono text-sm font-semibold tracking-[-0.03em]">{title}</h2>
-    {children}
+    <h2 aria-label={eyebrow ? `${eyebrow}：${title}` : title} className="mb-3 text-base font-semibold">{title}</h2>
+    <fieldset disabled={disabled} className="min-w-0">{children}</fieldset>
   </section>
 );
 
 const JsonBlock = ({ value }: { value: unknown }) => (
-  <pre className="max-h-80 overflow-auto border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 font-mono text-[0.65rem] leading-4 text-[var(--duties-secondary)]">
+  <pre className="max-h-80 overflow-auto border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 font-mono text-xs leading-4 text-[var(--duties-secondary)]">
     {JSON.stringify(value || {}, null, 2)}
   </pre>
 );
@@ -44,7 +45,7 @@ const JsonBlock = ({ value }: { value: unknown }) => (
 // label class names in constants used by the new controls. Purpose: new form fields
 // stay visually consistent and are easy to audit against the task requirements.
 const STRUCTURED_INPUT_CLASS = 'w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-xs';
-const STRUCTURED_LABEL_CLASS = 'block mb-1 text-[var(--duties-tertiary)] text-[0.65rem]';
+const STRUCTURED_LABEL_CLASS = 'block mb-1 text-[var(--duties-tertiary)] text-xs';
 
 const EMPTY_NODE_CONFIG_FORM: NodeConfigFormState = {
   id: '',
@@ -99,14 +100,22 @@ export const ApprovalsSettingsRightPanel = () => {
 };
 
 export const AgentsSettingsRightPanel = () => {
+  const id = useSettingsSelectionStore(state => state.selectedNode?.id);
+  const token = useSettingsStore(state => state.adminToken);
+  return <AgentsEditor key={`${token}\0${id || ''}`} />;
+};
+
+const AgentsEditor = () => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const node = useSettingsSelectionStore(state => state.selectedNode);
   const [nodeYaml, setNodeYaml] = useState('');
+  const [nodeBaseline, setNodeBaseline] = useState('');
   const [nodeConfigForm, setNodeConfigForm] = useState<NodeConfigFormState>(EMPTY_NODE_CONFIG_FORM);
   const [nodeYamlEditable, setNodeYamlEditable] = useState(false);
   const [nodeYamlLoading, setNodeYamlLoading] = useState(false);
   const [nodeYamlSaving, setNodeYamlSaving] = useState(false);
   const [nodeMessage, setNodeMessage] = useState('');
+  useUnsavedChanges(nodeYamlEditable && JSON.stringify([nodeYaml, nodeConfigForm]) !== nodeBaseline);
   const [modelChoices, setModelChoices] = useState<string[]>([]);
   const [channels, setChannels] = useState<ChannelChoice[]>([]);
   const [wires, setWires] = useState<string[]>([]);
@@ -119,6 +128,8 @@ export const AgentsSettingsRightPanel = () => {
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [modelFetchNote, setModelFetchNote] = useState('');
+  const selectedProvider = useRef(nodeConfigForm.provider);
+  selectedProvider.current = nodeConfigForm.provider;
   const modelListId = useId();
   // 刚从上游拉回来的排前面：那才是这个渠道真有的。
   const modelOptions = useMemo(
@@ -128,16 +139,17 @@ export const AgentsSettingsRightPanel = () => {
 
   const fetchModels = async () => {
     const provider = nodeConfigForm.provider.trim();
-    if (!adminToken || !provider) return;
+    if (!adminToken || !provider || fetchingModels) return;
     setFetchingModels(true);
     setModelFetchNote('');
     try {
       // 地址和密钥后端按渠道名自己取，这里不该也没必要碰它们。
       const models = await listUpstreamModels(adminToken, provider, {});
+      if (selectedProvider.current !== provider) return;
       setFetchedModels(models);
       setModelFetchNote(`拉到 ${models.length} 个模型。`);
     } catch (error) {
-      setModelFetchNote(error instanceof Error ? error.message : '拉取模型失败');
+      if (selectedProvider.current === provider) setModelFetchNote(error instanceof Error ? error.message : '拉取模型失败');
     } finally {
       setFetchingModels(false);
     }
@@ -173,11 +185,12 @@ export const AgentsSettingsRightPanel = () => {
         if (cancelled) return;
         setNodeYaml(raw);
         setNodeConfigForm(parseNodeConfig(raw, node.id));
+        setNodeBaseline(JSON.stringify([raw, parseNodeConfig(raw, node.id)]));
         setNodeYamlEditable(true);
       })
-      .catch(() => {
+      .catch((error) => {
         if (cancelled) return;
-        setNodeMessage('系统内建节点不可编辑');
+        setNodeMessage(error instanceof Error ? error.message : '节点配置加载失败，请重试');
         setNodeYamlEditable(false);
       })
       .finally(() => {
@@ -213,7 +226,7 @@ export const AgentsSettingsRightPanel = () => {
   }, [adminToken, node?.id]);
 
   const saveNodeConfig = async () => {
-    if (!adminToken || !node || !nodeYamlEditable) return;
+    if (!adminToken || !node || !nodeYamlEditable || nodeYamlSaving) return;
     setNodeYamlSaving(true);
     setNodeMessage('保存中。');
     try {
@@ -226,6 +239,7 @@ export const AgentsSettingsRightPanel = () => {
       await updateNodeRaw(adminToken, node.id, nextYaml);
       setNodeYaml(nextYaml);
       setNodeConfigForm(parseNodeConfig(nextYaml, node.id));
+      setNodeBaseline(JSON.stringify([nextYaml, parseNodeConfig(nextYaml, node.id)]));
       window.dispatchEvent(new Event('settings:nodes-updated'));
       setNodeMessage('节点配置已保存。');
     } catch (error) {
@@ -236,7 +250,7 @@ export const AgentsSettingsRightPanel = () => {
   };
 
   const saveNodeYaml = async () => {
-    if (!adminToken || !node || !nodeYamlEditable) return;
+    if (!adminToken || !node || !nodeYamlEditable || nodeYamlSaving) return;
     setNodeYamlSaving(true);
     setNodeMessage('保存中。');
     try {
@@ -247,6 +261,7 @@ export const AgentsSettingsRightPanel = () => {
       // YAML the default editing surface.
       await updateNodeRaw(adminToken, node.id, nodeYaml);
       setNodeConfigForm(parseNodeConfig(nodeYaml, node.id));
+      setNodeBaseline(JSON.stringify([nodeYaml, parseNodeConfig(nodeYaml, node.id)]));
       window.dispatchEvent(new Event('settings:nodes-updated'));
       setNodeMessage('节点 YAML 已保存。');
     } catch (error) {
@@ -257,7 +272,7 @@ export const AgentsSettingsRightPanel = () => {
   };
 
   return (
-    <PanelShell eyebrow="节点" title="节点结构化编辑">
+    <PanelShell disabled={nodeYamlSaving} eyebrow="节点" title="节点结构化编辑">
       {!node ? (
         <p className="text-xs leading-5 text-[var(--duties-secondary)]">选择一个节点后，这里会显示节点属性、委派关系和工具权限表单。</p>
       ) : (
@@ -286,7 +301,6 @@ export const AgentsSettingsRightPanel = () => {
                   <select className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ type: event.target.value as NodeConfigType })} value={nodeConfigForm.type}>
                     <option value="ai">ai</option>
                     <option value="tool">tool</option>
-                    <option value="router">router</option>
                   </select>
                 </label>
                 <label className="block">
@@ -316,7 +330,7 @@ export const AgentsSettingsRightPanel = () => {
                       {wires.map((wire) => <option key={wire} value={wire}>{wire}</option>)}
                     </optgroup>
                   </select>
-                  <span className="mt-1 block font-mono text-[0.55rem] text-[var(--duties-muted)]">
+                  <span className="mt-1 block text-xs text-[var(--duties-secondary)]">
                     选已配渠道会连它的地址密钥一起用；选线格式只定请求怎么发，地址得另填。
                   </span>
                 </label>
@@ -332,7 +346,7 @@ export const AgentsSettingsRightPanel = () => {
                       value={nodeConfigForm.model}
                     />
                     <button
-                      className="flex-shrink-0 border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-[0.6rem] hover:border-[var(--duties-text)] disabled:opacity-50"
+                      className="flex-shrink-0 border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-xs hover:border-[var(--duties-text)] disabled:opacity-50"
                       disabled={!nodeConfigForm.provider.trim() || fetchingModels}
                       onClick={() => void fetchModels()}
                       title={nodeConfigForm.provider.trim() ? '问这个渠道有哪些模型' : '先选一个渠道'}
@@ -347,7 +361,7 @@ export const AgentsSettingsRightPanel = () => {
                     </datalist>
                   )}
                   {modelFetchNote && (
-                    <p className="mt-1 text-[0.6rem] text-[var(--duties-tertiary)]">{modelFetchNote}</p>
+                    <p className="mt-1 text-xs text-[var(--duties-tertiary)]">{modelFetchNote}</p>
                   )}
                 </div>
                 <label className="block">
@@ -360,21 +374,22 @@ export const AgentsSettingsRightPanel = () => {
                 </label>
                 <label className="block">
                   <span className={STRUCTURED_LABEL_CLASS}>系统提示词</span>
+                  {nodeConfigForm.promptIsStructured && <span className="block text-xs text-[var(--duties-secondary)]">此提示词使用结构化块，请保留 JSON 数组格式。</span>}
                   <textarea className={`${STRUCTURED_INPUT_CLASS} min-h-[12rem]`} onChange={(event) => updateNodeConfigForm({ prompt: event.target.value })} rows={12} value={nodeConfigForm.prompt} />
                 </label>
                 <label className="block">
                   <span className={STRUCTURED_LABEL_CLASS}>委派目标，使用英文逗号分隔</span>
                   <input className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ delegate_targetsText: event.target.value })} value={nodeConfigForm.delegate_targetsText} />
                 </label>
-                <p className="text-[0.6rem] text-[var(--duties-tertiary)]">
+                <p className="text-xs text-[var(--duties-tertiary)]">
                   工具权限（tool_access）要在下面的高级 YAML 编辑里改。保存这里会重排 YAML
                   并丢掉注释，想保留注释也走那边。
                 </p>
-                <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50" disabled={nodeYamlSaving} onClick={saveNodeConfig} type="button">保存节点配置</button>
+                <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs hover:border-[var(--duties-text)] disabled:opacity-50" disabled={nodeYamlSaving} onClick={saveNodeConfig} type="button">保存节点配置</button>
                 {nodeMessage && <p className="text-[var(--duties-tertiary)]">{nodeMessage}</p>}
               </div>
               <details className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
-                <summary className="cursor-pointer font-mono text-[0.65rem] font-semibold text-[var(--duties-tertiary)]">高级 YAML 编辑</summary>
+                <summary className="cursor-pointer font-mono text-xs font-semibold text-[var(--duties-tertiary)]">高级 YAML 编辑</summary>
                 <div className="mt-3 space-y-2">
                   {/* [2026-06-02] Keep raw node YAML only as a collapsed fallback.
                       Why: the task explicitly requires structured form editing as the
@@ -383,7 +398,7 @@ export const AgentsSettingsRightPanel = () => {
                       users can recover unsupported fields without reverting the panel
                       to a raw YAML editor. */}
                   <YamlEditor aria-label="节点 YAML 编辑器" height="16rem" onChange={setNodeYaml} value={nodeYaml} />
-                  <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50" disabled={nodeYamlSaving} onClick={saveNodeYaml} type="button">保存 YAML</button>
+                  <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs hover:border-[var(--duties-text)] disabled:opacity-50" disabled={nodeYamlSaving} onClick={saveNodeYaml} type="button">保存 YAML</button>
                 </div>
               </details>
             </>
@@ -395,14 +410,22 @@ export const AgentsSettingsRightPanel = () => {
 };
 
 export const ToolsSettingsRightPanel = () => {
+  const id = useSettingsSelectionStore(state => state.selectedTool?.name);
+  const token = useSettingsStore(state => state.adminToken);
+  return <ToolsEditor key={`${token}\0${id || ''}`} />;
+};
+
+const ToolsEditor = () => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const tool = useSettingsSelectionStore(state => state.selectedTool);
   const [toolScript, setToolScript] = useState('');
+  const [toolBaseline, setToolBaseline] = useState('');
   const [toolScriptLoaded, setToolScriptLoaded] = useState(false);
   const [toolScriptLoading, setToolScriptLoading] = useState(false);
   const [toolScriptSaving, setToolScriptSaving] = useState(false);
   const [toolReloading, setToolReloading] = useState(false);
   const [toolMessage, setToolMessage] = useState('');
+  const confirmToolDiscard = useUnsavedChanges(toolScriptLoaded && toolScript !== toolBaseline);
 
   useEffect(() => {
     let cancelled = false;
@@ -426,6 +449,7 @@ export const ToolsSettingsRightPanel = () => {
       .then((raw) => {
         if (cancelled) return;
         setToolScript(raw);
+        setToolBaseline(raw);
         setToolScriptLoaded(true);
       })
       .catch((error) => {
@@ -440,7 +464,7 @@ export const ToolsSettingsRightPanel = () => {
   }, [adminToken, tool?.name]);
 
   const saveToolScript = async () => {
-    if (!adminToken || !tool || !toolScriptLoaded) return;
+    if (!adminToken || !tool || !toolScriptLoaded || toolScriptSaving || toolReloading) return;
     setToolScriptSaving(true);
     setToolMessage('保存中。');
     try {
@@ -450,6 +474,7 @@ export const ToolsSettingsRightPanel = () => {
       // script and dispatch settings:tools-updated after success. Purpose: the tool
       // list can refresh after a raw script save without requiring an engine restart.
       await updateToolRaw(adminToken, tool.name, toolScript);
+      setToolBaseline(toolScript);
       window.dispatchEvent(new Event('settings:tools-updated'));
       setToolMessage('工具脚本已保存。');
     } catch (error) {
@@ -460,7 +485,7 @@ export const ToolsSettingsRightPanel = () => {
   };
 
   const reloadToolRegistry = async () => {
-    if (!adminToken) return;
+    if (!adminToken || toolScriptSaving || toolReloading || !confirmToolDiscard()) return;
     setToolReloading(true);
     setToolMessage('正在重载工具。');
     try {
@@ -479,14 +504,14 @@ export const ToolsSettingsRightPanel = () => {
   };
 
   return (
-    <PanelShell eyebrow="工具" title="工具说明">
+    <PanelShell disabled={toolScriptSaving || toolReloading} eyebrow="工具" title="工具说明">
       <div className="space-y-3">
         {tool ? (
           <div className="space-y-2">
             <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-xs leading-5">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="font-mono font-semibold">{tool.name}</span>
-                <span className={`border px-1.5 py-0.5 font-mono text-[0.55rem] ${riskClassName(inferToolRisk(tool.name))}`}>{riskLabel(inferToolRisk(tool.name))}</span>
+                <span className={`border px-1.5 py-0.5 font-mono text-xs ${riskClassName(inferToolRisk(tool.name))}`}>{riskLabel(inferToolRisk(tool.name))}</span>
               </div>
               <p className="mt-1 text-[var(--duties-secondary)]">{tool.description || '无描述'}</p>
             </div>
@@ -498,7 +523,7 @@ export const ToolsSettingsRightPanel = () => {
               </p>
             ) : (
             <div className="space-y-2 text-xs leading-5">
-              <h3 className="mb-2 font-mono text-[0.65rem] font-semibold text-[var(--duties-tertiary)]">Python 脚本编辑</h3>
+              <h3 className="mb-2 font-mono text-xs font-semibold text-[var(--duties-tertiary)]">Python 脚本编辑</h3>
               {/* [2026-06-02] Add the requested raw Python editor below schema details.
                   Why: tool metadata alone cannot change implementation code. How: bind
                   the selected tool's raw script to the specified monospace textarea and
@@ -506,6 +531,7 @@ export const ToolsSettingsRightPanel = () => {
                   Tools batch changes only this panel while preserving current context. */}
               <textarea
                 className="w-full resize-y border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 font-mono text-xs"
+                aria-label="工具脚本"
                 disabled={!toolScriptLoaded || toolScriptLoading}
                 onChange={(event) => setToolScript(event.target.value)}
                 rows={16}
@@ -513,8 +539,8 @@ export const ToolsSettingsRightPanel = () => {
                 value={toolScriptLoading ? '正在加载工具脚本。' : toolScript}
               />
               <div className="flex flex-wrap gap-2">
-                <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50" disabled={!toolScriptLoaded || toolScriptLoading || toolScriptSaving} onClick={saveToolScript} type="button">保存</button>
-                <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50" disabled={!adminToken || toolReloading} onClick={reloadToolRegistry} type="button">重载工具</button>
+                <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs hover:border-[var(--duties-text)] disabled:opacity-50" disabled={!toolScriptLoaded || toolScriptLoading || toolScriptSaving} onClick={saveToolScript} type="button">保存</button>
+                <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs hover:border-[var(--duties-text)] disabled:opacity-50" disabled={!adminToken || toolReloading} onClick={reloadToolRegistry} type="button">重载工具</button>
               </div>
               {toolMessage && <p className="text-[var(--duties-tertiary)]">{toolMessage}</p>}
             </div>
@@ -538,56 +564,52 @@ interface SkillFrontmatterEdit {
   scan_depth: string;
 }
 
-function replaceFrontmatterValue(raw: string, key: string, value: string): string {
-  // [2026-06-02] Update one YAML frontmatter scalar while preserving Markdown body.
-  // Why: the Skills right panel offers quick metadata edits without replacing the
-  // whole editor content. How: change an existing key line inside the leading
-  // frontmatter block, or insert it before the closing delimiter. Purpose: users can
-  // adjust common activation fields quickly while raw Markdown remains authoritative.
-  if (!raw.startsWith('---\n')) return raw;
-  const end = raw.indexOf('\n---\n', 4);
-  if (end < 0) return raw;
-  const head = raw.slice(0, end);
-  const body = raw.slice(end);
-  const line = `${key}: ${value}`;
-  if (new RegExp(`^${key}:`, 'm').test(head)) return `${head.replace(new RegExp(`^${key}:.*$`, 'm'), line)}${body}`;
-  return `${head}\n${line}${body}`;
-}
-
-function frontmatterScalar(raw: string, key: string, fallback: string): string {
-  // [2026-06-02] Read one scalar field from a skill frontmatter block.
-  // Why: the parsed skills list currently omits order, priority, and scan_depth. How:
-  // scan the raw header text for a simple key-value line and strip surrounding quotes.
-  // Purpose: the quick editor can show the actual current values before saving.
-  if (!raw.startsWith('---\n')) return fallback;
-  const end = raw.indexOf('\n---\n', 4);
-  if (end < 0) return fallback;
-  const head = raw.slice(0, end);
-  const match = head.match(new RegExp(`^${key}:\\s*(.*)$`, 'm'));
-  return match?.[1]?.trim().replace(/^['\"]|['\"]$/g, '') || fallback;
+function parseSkillEdit(raw: string): SkillFrontmatterEdit {
+  const match = raw.replace(/\r\n/g, '\n').match(/^---\n([\s\S]*?)\n---(?:\n|$)/);
+  if (!match) throw new Error('技能文件缺少 YAML frontmatter，请修复后再保存。');
+  const parsed = yaml.load(match[1]);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('技能 frontmatter 必须是对象。');
+  const value = parsed as Record<string, unknown>;
+  return {
+    enabled: value.enabled !== false, strategy: String(value.strategy || 'normal'),
+    keywords: Array.isArray(value.keywords) ? value.keywords.map(String).join(', ') : String(value.keywords || ''),
+    order: String(value.order ?? 0), priority: String(value.priority ?? 0), scan_depth: String(value.scan_depth ?? 0),
+  };
 }
 
 function applySkillFrontmatter(raw: string, edit: SkillFrontmatterEdit): string {
-  const keywordItems = edit.keywords.split(',').map((item) => item.trim()).filter(Boolean);
-  let next = raw;
-  next = replaceFrontmatterValue(next, 'enabled', edit.enabled ? 'true' : 'false');
-  next = replaceFrontmatterValue(next, 'strategy', edit.strategy || 'normal');
-  next = replaceFrontmatterValue(next, 'keywords', `[${keywordItems.map((item) => `"${item.replace(/"/g, '\\"')}"`).join(', ')}]`);
-  next = replaceFrontmatterValue(next, 'order', edit.order || '0');
-  next = replaceFrontmatterValue(next, 'priority', edit.priority || '0');
-  next = replaceFrontmatterValue(next, 'scan_depth', edit.scan_depth || '0');
-  return next;
+  parseSkillEdit(raw);
+  const normalized = raw.replace(/\r\n/g, '\n');
+  const match = normalized.match(/^---\n([\s\S]*?)\n---(?:\n|$)/)!;
+  const meta = yaml.load(match[1]) as Record<string, unknown>;
+  const keywords = Array.isArray(meta.keywords) && edit.keywords === meta.keywords.map(String).join(', ')
+    ? meta.keywords : edit.keywords.split(',').map(item => item.trim()).filter(Boolean);
+  Object.assign(meta, { enabled: edit.enabled, strategy: edit.strategy || 'normal', keywords });
+  for (const key of ['order', 'priority', 'scan_depth'] as const) {
+    const value = Number(edit[key] || 0);
+    if (!Number.isFinite(value)) throw new Error(`${key} 必须是数字`);
+    meta[key] = value;
+  }
+  return `---\n${yaml.dump(meta, { lineWidth: -1 })}---\n${normalized.slice(match[0].length)}`;
 }
 
 export const SkillsSettingsRightPanel = () => {
+  const id = useSettingsSelectionStore(state => state.selectedSkill?.name);
+  const token = useSettingsStore(state => state.adminToken);
+  return <SkillsEditor key={`${token}\0${id || ''}`} />;
+};
+
+const SkillsEditor = () => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const skill = useSettingsSelectionStore(state => state.selectedSkill);
   const [edit, setEdit] = useState<SkillFrontmatterEdit>({ enabled: true, strategy: 'normal', keywords: '', order: '0', priority: '0', scan_depth: '0' });
   const [rawMarkdown, setRawMarkdown] = useState('');
+  const [skillBaseline, setSkillBaseline] = useState('');
   const [rawMarkdownLoaded, setRawMarkdownLoaded] = useState(false);
   const [rawMarkdownLoading, setRawMarkdownLoading] = useState(false);
   const [rawMarkdownSaving, setRawMarkdownSaving] = useState(false);
   const [message, setMessage] = useState('');
+  useUnsavedChanges(rawMarkdownLoaded && JSON.stringify([rawMarkdown, edit]) !== skillBaseline);
 
   useEffect(() => {
     let cancelled = false;
@@ -615,20 +637,18 @@ export const SkillsSettingsRightPanel = () => {
         // Purpose: one fetch initializes quick metadata and the advanced raw editor.
         setRawMarkdown(raw);
         setRawMarkdownLoaded(true);
-        setEdit({
-          ...baseEdit,
-          order: frontmatterScalar(raw, 'order', baseEdit.order),
-          priority: frontmatterScalar(raw, 'priority', baseEdit.priority),
-          scan_depth: frontmatterScalar(raw, 'scan_depth', baseEdit.scan_depth),
-        });
+        const parsed = parseSkillEdit(raw);
+        setEdit(parsed);
+        setSkillBaseline(JSON.stringify([raw, parsed]));
       })
-      .catch(() => { if (!cancelled) setRawMarkdownLoaded(false); /* keep parsed list defaults if the raw file cannot be read */ })
+      .catch((error) => { if (!cancelled) { setRawMarkdownLoaded(false); setMessage(error instanceof Error ? error.message : '加载技能失败'); } })
       .finally(() => { if (!cancelled) setRawMarkdownLoading(false); });
     return () => { cancelled = true; };
-  }, [adminToken, skill?.name, skill?.enabled, skill?.strategy, skill?.keywords?.join('|')]);
+  }, [adminToken, skill?.name]);
 
   const save = async () => {
-    if (!adminToken || !skill) return;
+    if (!adminToken || !skill || !rawMarkdownLoaded || rawMarkdownSaving) return;
+    setRawMarkdownSaving(true);
     try {
       // [2026-06-02] Keep the quick frontmatter save in sync with the raw editor.
       // Why: users may open the advanced Markdown section after saving quick fields.
@@ -639,16 +659,19 @@ export const SkillsSettingsRightPanel = () => {
       const next = applySkillFrontmatter(raw, edit);
       await updateSkillRaw(adminToken, skill.name, next);
       setRawMarkdown(next);
+      const parsed = parseSkillEdit(next);
+      setEdit(parsed);
+      setSkillBaseline(JSON.stringify([next, parsed]));
       setRawMarkdownLoaded(true);
       window.dispatchEvent(new Event('settings:skills-updated'));
       setMessage('快捷字段已保存。请刷新技能列表查看解析结果。');
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '保存快捷字段失败');
-    }
+    } finally { setRawMarkdownSaving(false); }
   };
 
   const saveRawMarkdown = async () => {
-    if (!adminToken || !skill) return;
+    if (!adminToken || !skill || !rawMarkdownLoaded || rawMarkdownSaving) return;
     setRawMarkdownSaving(true);
     setMessage('保存中。');
     try {
@@ -657,7 +680,10 @@ export const SkillsSettingsRightPanel = () => {
       // form cannot represent. How: write the controlled raw Markdown textarea through
       // the existing skill raw endpoint and notify the list page to reload metadata.
       // Purpose: advanced editing remains available while hidden until requested.
+      const parsed = parseSkillEdit(rawMarkdown);
       await updateSkillRaw(adminToken, skill.name, rawMarkdown);
+      setEdit(parsed);
+      setSkillBaseline(JSON.stringify([rawMarkdown, parsed]));
       setRawMarkdownLoaded(true);
       window.dispatchEvent(new Event('settings:skills-updated'));
       setMessage('Raw Markdown 已保存。');
@@ -669,7 +695,7 @@ export const SkillsSettingsRightPanel = () => {
   };
 
   return (
-    <PanelShell eyebrow="技能" title="Frontmatter 快捷编辑">
+    <PanelShell disabled={rawMarkdownSaving || rawMarkdownLoading} eyebrow="技能" title="Frontmatter 快捷编辑">
       {!skill ? (
         <p className="text-xs leading-5 text-[var(--duties-secondary)]">选择一个技能后，这里会显示启用状态、策略和关键词。</p>
       ) : (
@@ -698,9 +724,9 @@ export const SkillsSettingsRightPanel = () => {
               </label>
             ))}
           </div>
-          <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)]" onClick={save} type="button">保存快捷字段</button>
+          <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs hover:border-[var(--duties-text)]" onClick={save} type="button">保存快捷字段</button>
           <details className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
-            <summary className="cursor-pointer font-mono text-[0.65rem] font-semibold text-[var(--duties-tertiary)]">Raw Markdown 编辑（高级）</summary>
+            <summary className="cursor-pointer font-mono text-xs font-semibold text-[var(--duties-tertiary)]">Raw Markdown 编辑（高级）</summary>
             <div className="mt-3 space-y-2">
               {/* [2026-06-02] Put full SKILL.md editing behind a collapsed details row.
                   Why: the quick form should stay the primary workflow, while raw body
@@ -721,7 +747,7 @@ export const SkillsSettingsRightPanel = () => {
                   value={rawMarkdown}
                 />
               )}
-              <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50" disabled={!rawMarkdownLoaded || rawMarkdownLoading || rawMarkdownSaving} onClick={saveRawMarkdown} type="button">保存 Raw Markdown</button>
+              <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs hover:border-[var(--duties-text)] disabled:opacity-50" disabled={!rawMarkdownLoaded || rawMarkdownLoading || rawMarkdownSaving} onClick={saveRawMarkdown} type="button">保存 Raw Markdown</button>
             </div>
           </details>
           {message && <p className="text-[var(--duties-tertiary)]">{message}</p>}
@@ -732,27 +758,8 @@ export const SkillsSettingsRightPanel = () => {
 };
 
 const fieldClass = 'w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-xs';
-const labelClass = 'block mb-1 text-[var(--duties-tertiary)] text-[0.65rem]';
-const buttonClass = 'border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50';
-
-function displayMcpArgs(argsText: string): string {
-  // [2026-06-02] Convert parsed newline-separated MCP args into the requested comma field.
-  // Why: serializeMcpClients stores argsText as newline-delimited text, but this right
-  // panel must present a single comma-separated input. How: split existing lines,
-  // trim empty entries, and join them with comma-space for editing. Purpose: selected
-  // stdio clients reset into the format requested by the user without changing the
-  // shared serializer contract.
-  return argsText.split('\n').map((item) => item.trim()).filter(Boolean).join(', ');
-}
-
-function serializeMcpArgsForYaml(argsText: string): string {
-  // [2026-06-02] Convert the comma-separated MCP args input back for serialization.
-  // Why: the shared MCP serializer expects newline-delimited argsText and then writes
-  // a YAML list. How: split the input on commas, trim whitespace, remove empty items,
-  // and rejoin with newlines. Purpose: the UI follows the requested comma input while
-  // saved YAML still contains an args array.
-  return argsText.split(',').map((item) => item.trim()).filter(Boolean).join('\n');
-}
+const labelClass = 'block mb-1 text-[var(--duties-tertiary)] text-xs';
+const buttonClass = 'border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs hover:border-[var(--duties-text)] disabled:opacity-50';
 
 function displayEnvText(envText: string): string {
   // [2026-06-02] Convert parsed MCP env rows from object style to KEY=VALUE rows.
@@ -784,12 +791,20 @@ function serializeEnvTextForYaml(envText: string): string {
 }
 
 export const McpSettingsRightPanel = () => {
+  const id = useSettingsSelectionStore(state => state.selectedMcpClient?.id);
+  const token = useSettingsStore(state => state.adminToken);
+  return <McpEditor key={`${token}\0${id || ''}`} />;
+};
+
+const McpEditor = () => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const client = useSettingsSelectionStore(state => state.selectedMcpClient);
   const [form, setForm] = useState<McpClientFormState | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
+  const [baseline, setBaseline] = useState('');
+  useUnsavedChanges(Boolean(form) && JSON.stringify(form) !== baseline);
 
   useEffect(() => {
     let cancelled = false;
@@ -815,7 +830,9 @@ export const McpSettingsRightPanel = () => {
           setForm(null);
           return;
         }
-        setForm({ ...selected, argsText: displayMcpArgs(selected.argsText), envText: displayEnvText(selected.envText) });
+        const next = { ...selected, argsText: selected.argsText, envText: displayEnvText(selected.envText) };
+        setForm(next);
+        setBaseline(JSON.stringify(next));
       })
       .catch((error) => {
         if (cancelled) return;
@@ -828,7 +845,7 @@ export const McpSettingsRightPanel = () => {
   }, [adminToken, client?.id]);
 
   const save = async () => {
-    if (!adminToken || !client || !form) return;
+    if (!adminToken || !client || !form || saving) return;
     setSaving(true);
     setMessage('保存中。');
     try {
@@ -842,8 +859,9 @@ export const McpSettingsRightPanel = () => {
       const forms = parseMcpClients(raw);
       const index = forms.findIndex((item) => item.id === client.id);
       if (index < 0) throw new Error('未在 MCP YAML 中找到此 Client。');
-      forms[index] = { ...form, argsText: serializeMcpArgsForYaml(form.argsText), envText: serializeEnvTextForYaml(form.envText) };
-      await updateMcpClientsRaw(adminToken, serializeMcpClients(forms));
+      forms[index] = { ...form, original: forms[index].original, argsText: form.argsText, envText: serializeEnvTextForYaml(form.envText) };
+      await updateMcpClientsRaw(adminToken, serializeMcpClients(forms, raw));
+      setBaseline(JSON.stringify(form));
       window.dispatchEvent(new Event('settings:mcp-updated'));
       setMessage('MCP Client 已保存。');
     } catch (error) {
@@ -854,7 +872,7 @@ export const McpSettingsRightPanel = () => {
   };
 
   return (
-    <PanelShell eyebrow="MCP" title="连接信息">
+    <PanelShell eyebrow="MCP" title="连接信息" disabled={saving}>
       {!client ? (
         <p className="text-xs leading-5 text-[var(--duties-secondary)]">选择一个 MCP Client 后，这里会显示连接配置。</p>
       ) : loading ? (
@@ -887,8 +905,9 @@ export const McpSettingsRightPanel = () => {
                 <input className={fieldClass} onChange={(event) => setForm((current) => current && ({ ...current, command: event.target.value }))} value={form.command} />
               </label>
               <label className="block">
-                <span className={labelClass}>args，使用英文逗号分隔</span>
-                <input className={fieldClass} onChange={(event) => setForm((current) => current && ({ ...current, argsText: event.target.value }))} value={form.argsText} />
+                <span className={labelClass}>启动参数（JSON 字符串数组）</span>
+                <textarea rows={3} className={fieldClass} onChange={(event) => setForm((current) => current && ({ ...current, argsText: event.target.value }))} value={form.argsText} />
+                <span className="text-xs text-[var(--duties-secondary)]">例如 ["--port", "8080"]，参数内的逗号、空格和换行均保留。</span>
               </label>
               <label className="block">
                 <span className={labelClass}>env，每行 KEY=VALUE</span>
@@ -916,12 +935,20 @@ export const McpSettingsRightPanel = () => {
 };
 
 export const AutomationSettingsRightPanel = () => {
+  const id = useSettingsSelectionStore(state => state.selectedScheduleId);
+  const token = useSettingsStore(state => state.adminToken);
+  return <AutomationEditor key={`${token}\0${id || ''}`} />;
+};
+
+const AutomationEditor = () => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const selectedScheduleId = useSettingsSelectionStore(state => state.selectedScheduleId);
   const [form, setForm] = useState<ScheduleFormState | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
+  const [baseline, setBaseline] = useState('');
+  useUnsavedChanges(Boolean(form) && JSON.stringify(form) !== baseline);
 
   useEffect(() => {
     let cancelled = false;
@@ -943,6 +970,7 @@ export const AutomationSettingsRightPanel = () => {
         if (cancelled) return;
         const selected = parseSchedules(raw).find((item) => item.id === selectedScheduleId) || null;
         setForm(selected);
+        setBaseline(JSON.stringify(selected));
         if (!selected) setMessage('未在 schedules.yaml 中找到此定时任务。');
       })
       .catch((error) => {
@@ -956,7 +984,7 @@ export const AutomationSettingsRightPanel = () => {
   }, [adminToken, selectedScheduleId]);
 
   const save = async () => {
-    if (!adminToken || !selectedScheduleId || !form) return;
+    if (!adminToken || !selectedScheduleId || !form || saving) return;
     setSaving(true);
     setMessage('保存中。');
     try {
@@ -970,8 +998,9 @@ export const AutomationSettingsRightPanel = () => {
       const schedules = parseSchedules(raw);
       const index = schedules.findIndex((item) => item.id === selectedScheduleId);
       if (index < 0) throw new Error('未在 schedules.yaml 中找到此定时任务。');
-      schedules[index] = form;
-      await updateSchedulesRaw(adminToken, serializeSchedules(schedules));
+      schedules[index] = { ...form, original: schedules[index].original };
+      await updateSchedulesRaw(adminToken, serializeSchedules(schedules, raw));
+      setBaseline(JSON.stringify(form));
       window.dispatchEvent(new Event('settings:schedules-updated'));
       setMessage('定时任务已保存。');
     } catch (error) {
@@ -982,7 +1011,7 @@ export const AutomationSettingsRightPanel = () => {
   };
 
   return (
-    <PanelShell eyebrow="自动化" title="定时任务编辑">
+    <PanelShell eyebrow="自动化" title="定时任务编辑" disabled={saving}>
       {!selectedScheduleId ? (
         <p className="text-xs leading-5 text-[var(--duties-secondary)]">选择一个定时任务后，这里会显示可编辑字段。</p>
       ) : loading ? (
@@ -1032,7 +1061,7 @@ export const AutomationSettingsRightPanel = () => {
             <span>once</span>
           </label>
           <details className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
-            <summary className="cursor-pointer font-mono text-[0.65rem] text-[var(--duties-tertiary)]">高级字段</summary>
+            <summary className="cursor-pointer font-mono text-xs text-[var(--duties-tertiary)]">高级字段</summary>
             <div className="mt-3 space-y-3">
               {(['conversation_key', 'entry_node_id', 'workflow_id'] as const).map((key) => (
                 <label className="block" key={key}>

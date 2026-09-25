@@ -1,10 +1,7 @@
-// [2026-06-02] Advanced raw configuration settings page.
-// Why: runtime, policy, and schedules are cross-cutting YAML files that need direct
-// editing for advanced operators. How: render accordion sections backed by raw admin
-// endpoints and run lightweight checks before saving. Purpose: risky configuration
-// edits remain centralized and visible without hiding backend validation results.
-import { useEffect, useState } from 'react';
+// Advanced configuration supports structured fields and explicit raw YAML editing.
+import { useEffect, useMemo, useRef, useState } from 'react';
 
+import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { getPolicyRaw, getRuntimeRaw, updatePolicyRaw, updateRuntimeRaw } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
@@ -18,6 +15,8 @@ interface RawFileState {
   value: string;
   message: string;
   loading: boolean;
+  loaded: boolean;
+  saved: string;
 }
 
 const FILES: Array<{ key: FileKey; title: string; filename: string; description: string }> = [
@@ -25,10 +24,6 @@ const FILES: Array<{ key: FileKey; title: string; filename: string; description:
   { key: 'policy', title: '安全策略 (policy.yaml)', filename: 'policy.yaml', description: '原始 YAML 兜底。读写规则和敏感路径请在「工具与权限」页改，这里用于 deny_patterns 等结构化编辑覆盖不到的字段。' },
 ];
 
-// [2026-06-02] Shared compact field styles for the Advanced structured editor.
-// Why: runtime.yaml is now edited primarily through direct form controls. How: keep
-// the required input and label classes in constants reused by the runtime fields.
-// Purpose: the structured form matches the requested Settings visual language.
 const STRUCTURED_INPUT_CLASS = 'w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-xs';
 const STRUCTURED_LABEL_CLASS = 'block mb-1 text-[var(--duties-tertiary)] text-[0.65rem]';
 
@@ -60,92 +55,95 @@ export const AdvancedSettingsPage = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const { setAdvancedFile } = useSettingsSelectionStore();
   const [files, setFiles] = useState<Record<FileKey, RawFileState>>({
-    runtime: { value: '', message: '', loading: false },
-    policy: { value: '', message: '', loading: false },
+    runtime: { value: '', saved: '', message: '', loading: false, loaded: false },
+    policy: { value: '', saved: '', message: '', loading: false, loaded: false },
   });
   const [runtimeConfigForm, setRuntimeConfigForm] = useState<RuntimeConfigFormState>(EMPTY_RUNTIME_CONFIG_FORM);
 
-  const setFileState = (key: FileKey, patch: Partial<RawFileState>) => {
-    // [2026-06-02] Patch one raw file state entry without touching the other file.
-    // Why: runtime and policy load independently inside separate accordion sections.
-    // How: merge the provided partial state into the keyed entry. Purpose: structured
-    // runtime saves and raw policy edits can share the same state container safely.
-    setFiles((current) => ({ ...current, [key]: { ...current[key], ...patch } }));
-  };
+  const [runtimeBaseline, setRuntimeBaseline] = useState(EMPTY_RUNTIME_CONFIG_FORM);
+  const [runtimeFormEdited, setRuntimeFormEdited] = useState(false);
+  const operations = useRef({ runtime: { id: 0, busy: false }, policy: { id: 0, busy: false } });
+  const mounted = useRef(true);
+  const currentAuth = useRef(adminToken);
+  currentAuth.current = adminToken;
+  const fileDirty = (key: FileKey) => files[key].value !== files[key].saved || (key === 'runtime' && JSON.stringify(runtimeConfigForm) !== JSON.stringify(runtimeBaseline));
+  useUnsavedChanges(fileDirty('runtime') || fileDirty('policy'), '高级配置还有未保存修改，离开会丢失这些草稿。确定继续吗？');
 
+  useEffect(() => {
+    mounted.current = true;
+    for (const operation of Object.values(operations.current)) { operation.id++; operation.busy = false; }
+    setFiles({
+      runtime: { value: '', saved: '', message: '', loading: false, loaded: false },
+      policy: { value: '', saved: '', message: '', loading: false, loaded: false },
+    });
+    setRuntimeConfigForm(EMPTY_RUNTIME_CONFIG_FORM); setRuntimeBaseline(EMPTY_RUNTIME_CONFIG_FORM); setRuntimeFormEdited(false);
+    return () => {
+      mounted.current = false;
+      for (const operation of Object.values(operations.current)) { operation.id++; operation.busy = false; }
+    };
+  }, [adminToken, isAuthenticated]);
+
+  const setFileState = (key: FileKey, patch: Partial<RawFileState>) => setFiles(current => ({ ...current, [key]: { ...current[key], ...patch } }));
+  const isCurrent = (key: FileKey, id: number) => mounted.current && currentAuth.current === adminToken && operations.current[key].id === id;
+  const begin = (key: FileKey) => {
+    const operation = operations.current[key]; operation.busy = true; operation.id++;
+    setFileState(key, { loading: true, message: '' }); return operation.id;
+  };
+  const finish = (key: FileKey, id: number) => { if (isCurrent(key, id)) { operations.current[key].busy = false; setFileState(key, { loading: false }); } };
   const updateRuntimeConfigForm = (patch: Partial<RuntimeConfigFormState>) => {
-    // [2026-06-02] Keep runtime field edits separate from raw YAML fallback edits.
-    // Why: the main runtime editor is a form and the raw YAML area is only advanced
-    // fallback. How: merge field-level changes into runtimeConfigForm. Purpose: save
-    // can serialize the form into the loaded YAML while preserving unrelated fields.
-    setRuntimeConfigForm((current) => ({ ...current, ...patch }));
+    if (!files.runtime.loaded || operations.current.runtime.busy) return;
+    setRuntimeConfigForm(current => ({ ...current, ...patch })); setRuntimeFormEdited(true);
   };
-
-  const fetchRaw = async (key: FileKey): Promise<string> => {
-    if (!adminToken) return '';
-    if (key === 'runtime') return getRuntimeRaw(adminToken);
-    return getPolicyRaw(adminToken);
-  };
-
-  const saveRaw = async (key: FileKey, value: string): Promise<void> => {
-    if (!adminToken) return;
-    if (key === 'runtime') { await updateRuntimeRaw(adminToken, value); return; }
-    await updatePolicyRaw(adminToken, value);
+  const runtimeEditorValue = useMemo(() => {
+    if (!runtimeFormEdited) return files.runtime.value;
+    try { return serializeRuntimeConfig(files.runtime.value, runtimeConfigForm); } catch { return files.runtime.value; }
+  }, [files.runtime.value, runtimeConfigForm, runtimeFormEdited]);
+  const editRaw = (key: FileKey, value: string) => {
+    if (!files[key].loaded || operations.current[key].busy) return;
+    setFileState(key, { value, message: '' });
+    if (key === 'runtime') {
+      setRuntimeFormEdited(false);
+      try { setRuntimeConfigForm(parseRuntimeConfig(value)); } catch {}
+    }
   };
 
   const loadOne = async (key: FileKey) => {
-    setFileState(key, { loading: true, message: '' });
+    if (!adminToken || !isAuthenticated || operations.current[key].busy) return;
+    if (fileDirty(key) && !window.confirm(`重新加载 ${key}.yaml 会丢弃这个文件的未保存修改，确定继续吗？`)) return;
+    const id = begin(key);
     try {
-      // [2026-06-02] Parse runtime YAML into form fields immediately after loading.
-      // Why: runtime.yaml must no longer be presented as a primary raw editor. How:
-      // keep the raw value for fallback and initialize the three structured fields
-      // from parseRuntimeConfig. Purpose: the user can save common runtime settings
-      // through the form while advanced YAML remains available below.
-      const raw = await fetchRaw(key);
-      setFileState(key, { value: raw, message: '' });
-      if (key === 'runtime') setRuntimeConfigForm(parseRuntimeConfig(raw));
+      const raw = key === 'runtime' ? await getRuntimeRaw(adminToken) : await getPolicyRaw(adminToken);
+      if (!isCurrent(key, id)) return;
+      setFileState(key, { value: raw, saved: raw, loaded: true, message: '' });
+      if (key === 'runtime') {
+        setRuntimeFormEdited(false); setRuntimeConfigForm(EMPTY_RUNTIME_CONFIG_FORM); setRuntimeBaseline(EMPTY_RUNTIME_CONFIG_FORM);
+        const form = parseRuntimeConfig(raw);
+        setRuntimeConfigForm(form); setRuntimeBaseline(form);
+      }
     } catch (error) {
-      setFileState(key, { message: error instanceof Error ? error.message : '加载失败' });
-    } finally {
-      setFileState(key, { loading: false });
-    }
+      if (isCurrent(key, id)) setFileState(key, { message: error instanceof Error ? error.message : '加载失败' });
+    } finally { finish(key, id); }
   };
 
-  useEffect(() => {
-    if (!adminToken || !isAuthenticated) return;
-    // [2026-06-02] Do not auto-load raw configuration files on page mount.
-    // Why: this P0 Advanced tab is an accordion whose sections should be collapsed by
-    // default and loaded only when the operator asks. How: keep the authentication
-    // effect as a no-op placeholder for future per-file preflight checks. Purpose:
-    // opening Advanced does not fetch or expose raw configuration until requested.
-  }, [adminToken, isAuthenticated]);
-
   const saveOne = async (key: FileKey) => {
-    // 没加载过就保存 = 拿空字符串当基底序列化，163 行的 runtime.yaml 会被截成三行，
-    // engine.tool_mode 还会静默翻回 fake-native。按钮也禁用了，这里是第二道。
-    if (!files[key].value) {
-      setFileState(key, { message: '请先点「加载」读入当前内容，再保存' });
-      return;
-    }
+    if (!adminToken || !isAuthenticated || operations.current[key].busy) return;
+    if (!files[key].loaded || !files[key].value) { setFileState(key, { message: '请先点「加载」读入当前内容，再保存' }); return; }
     if (key === 'policy' && !window.confirm('修改安全策略可能影响系统安全性')) return;
-    // [2026-06-02] Save runtime through the form serializer and policy through raw YAML.
-    // Why: runtime has stable common fields, while policy changes shape frequently.
-    // How: serialize runtimeConfigForm into the loaded YAML only for runtime; keep
-    // policy's raw editor as the saved value. Purpose: the main runtime path is a
-    // structured form and policy remains an advanced fallback-oriented editor.
-    const value = key === 'runtime' ? serializeRuntimeConfig(files.runtime.value, runtimeConfigForm) : files.policy.value;
-    const issue = hasLikelyYamlSyntaxIssue(value);
-    if (issue) { setFileState(key, { message: issue }); return; }
-    setFileState(key, { loading: true, message: '' });
+    const id = begin(key);
     try {
-      await saveRaw(key, value);
-      setFileState(key, { value, message: '已保存' });
-      if (key === 'runtime') setRuntimeConfigForm(parseRuntimeConfig(value));
+      const value = key === 'runtime' && runtimeFormEdited ? serializeRuntimeConfig(files.runtime.value, runtimeConfigForm) : files[key].value;
+      if (key === 'runtime' && !value.trim()) throw new Error('运行时配置不能为空，原文件未修改');
+      const issue = hasLikelyYamlSyntaxIssue(value);
+      if (issue) throw new Error(issue);
+      const form = key === 'runtime' ? parseRuntimeConfig(value) : null;
+      if (key === 'runtime') await updateRuntimeRaw(adminToken, value);
+      else await updatePolicyRaw(adminToken, value);
+      if (!isCurrent(key, id)) return;
+      setFileState(key, { value, saved: value, message: '已保存' });
+      if (form) { setRuntimeConfigForm(form); setRuntimeBaseline(form); setRuntimeFormEdited(false); }
     } catch (error) {
-      setFileState(key, { message: error instanceof Error ? error.message : '保存失败' });
-    } finally {
-      setFileState(key, { loading: false });
-    }
+      if (isCurrent(key, id)) setFileState(key, { message: error instanceof Error ? error.message : '保存失败' });
+    } finally { finish(key, id); }
   };
 
   return (
@@ -159,11 +157,11 @@ export const AdvancedSettingsPage = () => {
               <Card description={file.description} key={file.key}>
                 <details onToggle={(event) => { if ((event.currentTarget as HTMLDetailsElement).open) setAdvancedFile(file.key); }}>
                   <summary className="cursor-pointer font-mono text-xs font-semibold text-[var(--duties-text)]">{file.title}</summary>
-                  <div className="mt-3 space-y-3">
+                  <fieldset disabled={state.loading} className="mt-3 min-w-0 space-y-3">
                     {file.key === 'runtime' ? (
                       <>
-                        <div className="flex flex-wrap gap-2"><Button disabled={state.loading} onClick={() => loadOne(file.key)}>{state.loading ? '处理中...' : '加载'}</Button><Button disabled={state.loading || !state.value} onClick={() => saveOne(file.key)} variant="primary">保存运行时配置</Button></div>
-                        <div className="space-y-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-xs leading-5">
+                        <div className="flex flex-wrap gap-2"><Button disabled={state.loading} onClick={() => loadOne(file.key)}>{state.loading ? '处理中...' : '加载'}</Button><Button disabled={state.loading || !state.loaded || !state.value} onClick={() => saveOne(file.key)} variant="primary">保存运行时配置</Button></div>
+                        <fieldset disabled={!state.loaded} className="min-w-0 space-y-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-sm leading-5">
                           <label className="block">
                             <span className={STRUCTURED_LABEL_CLASS}>入口节点 ID</span>
                             <input className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateRuntimeConfigForm({ entry_node_id: event.target.value })} value={runtimeConfigForm.entry_node_id} />
@@ -212,40 +210,29 @@ export const AdvancedSettingsPage = () => {
                               value={runtimeConfigForm.compact_keep_recent}
                             />
                           </div>
-                        </div>
+                        </fieldset>
                         <details className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
                           <summary className="cursor-pointer font-mono text-[0.65rem] font-semibold text-[var(--duties-tertiary)]">高级 YAML 编辑</summary>
                           <div className="mt-3">
-                            {/* [2026-06-02] Keep runtime raw YAML only as a fallback editor.
-                                Why: the requested primary runtime surface is a structured
-                                form. How: place YamlEditor inside a collapsed details
-                                section while saving still serializes the form fields into
-                                this raw value. Purpose: operators can preserve uncommon
-                                runtime settings without treating YAML as the main editor. */}
-                            <YamlEditor aria-label={`${file.filename} YAML 编辑器`} height="18rem" onChange={(value) => setFileState(file.key, { value })} value={state.value} />
+                            <YamlEditor aria-label={`${file.filename} YAML 编辑器`} height="18rem" readOnly={!state.loaded || state.loading} onChange={(value) => editRaw(file.key, value)} value={runtimeEditorValue} />
                           </div>
                         </details>
                       </>
                     ) : (
                       <>
-                        <p className="text-xs leading-5 text-orange-400">警告：修改安全策略可能影响系统安全性。</p>
-                        <div className="flex flex-wrap gap-2"><Button disabled={state.loading} onClick={() => loadOne(file.key)}>{state.loading ? '处理中...' : '加载'}</Button><Button disabled={state.loading || !state.value} onClick={() => saveOne(file.key)} variant="primary">保存策略 YAML</Button></div>
+                        <p className="text-xs leading-5 text-[var(--duties-danger)]">警告：修改安全策略可能影响系统安全性。</p>
+                        <div className="flex flex-wrap gap-2"><Button disabled={state.loading} onClick={() => loadOne(file.key)}>{state.loading ? '处理中...' : '加载'}</Button><Button disabled={state.loading || !state.loaded || !state.value} onClick={() => saveOne(file.key)} variant="primary">保存策略 YAML</Button></div>
                         <details className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
                           <summary className="cursor-pointer font-mono text-[0.65rem] font-semibold text-[var(--duties-tertiary)]">高级 YAML 编辑</summary>
                           <div className="mt-3">
-                            {/* [2026-06-02] Keep policy editing raw but collapsed.
-                                Why: policy.yaml has a variable safety-rule structure and
-                                the task allows retaining YAML for this panel. How: move
-                                the raw editor under an advanced details block and keep
-                                the confirmation on save. Purpose: policy remains editable
-                                without showing raw YAML as an always-open main editor. */}
-                            <YamlEditor aria-label={`${file.filename} YAML 编辑器`} height="26rem" onChange={(value) => setFileState(file.key, { value })} value={state.value} />
+                            <YamlEditor aria-label={`${file.filename} YAML 编辑器`} height="26rem" readOnly={!state.loaded || state.loading} onChange={(value) => editRaw(file.key, value)} value={state.value} />
                           </div>
                         </details>
                       </>
                     )}
                     <StatusText message={state.message} />
-                  </div>
+                    {fileDirty(file.key) && <p role="status" className="text-sm text-[var(--duties-secondary)]">有未保存修改</p>}
+                  </fieldset>
                 </details>
               </Card>
             );

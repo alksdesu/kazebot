@@ -156,7 +156,8 @@ describe('模型参数页', () => {
     expect((screen.getByRole('button', { name: '保存参数' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it('换作用域会丢掉上一份草稿，不把值带到别的文件里', async () => {
+  it('确认换作用域后丢掉上一份草稿，不把值带到别的文件里', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
     render(<ModelsPage />);
     fireEvent.click(await screen.findByRole('button', { name: '高' }));
     fireEvent.click(screen.getByRole('button', { name: 'qq.vision' }));

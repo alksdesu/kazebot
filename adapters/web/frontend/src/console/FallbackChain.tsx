@@ -15,6 +15,7 @@ import {
   type ProviderOptionsCatalog,
   type ProvidersResponse,
 } from '../api/supervisorClient';
+import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
 import { ChannelOptions, wireOf } from './channelFields';
 import { Block, Button, Check, Desc, Empty, Facts, Input, Item, Panel, SaveBar, Segmented, Select } from './components';
@@ -69,7 +70,7 @@ const sameChain = (a: Draft[], b: FallbackEntryPublic[]): boolean => (
   === JSON.stringify(b.map((entry) => ({ ...toPayload(toDraft(entry, 0)), _origin: undefined })))
 );
 
-const HEAD = 'flex items-center gap-2';
+const HEAD = 'flex min-w-0 flex-wrap items-center gap-2';
 
 const Row = ({
   draft, index, total, catalog, channels, wires, onChange, onMove, onRemove,
@@ -222,7 +223,6 @@ export const FallbackChain = ({
   onSaved: (next: ProvidersResponse) => void;
 }) => {
   const token = useSettingsStore((state) => state.adminToken);
-  const [drafts, setDrafts] = useState<Draft[]>([]);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
 
@@ -235,13 +235,14 @@ export const FallbackChain = ({
     return scope === null ? data.fallbacks : (data.node_fallbacks?.[scope] || []);
   }, [data, scope]);
 
-  // 换作用域或重新拉到数据时重建编辑态，草稿属于上一份。
-  useEffect(() => {
-    setDrafts(stored.map(toDraft));
-    setNote('');
-  }, [stored]);
+  const [editor, setEditor] = useState(() => ({ source: stored, drafts: stored.map(toDraft) }));
+  const drafts = editor.source === stored ? editor.drafts : stored.map(toDraft);
+  const setDrafts = (next: Draft[]) => setEditor({ source: stored, drafts: next });
+
+  useEffect(() => { setNote(''); }, [stored]);
 
   const dirty = !sameChain(drafts, stored);
+  const confirmDiscard = useUnsavedChanges(dirty || busy, '备选链还有未保存修改或保存进行中，确定切换或重置吗？');
 
   const update = (index: number, next: Draft) => {
     setDrafts(drafts.map((item, i) => (i === index ? next : item)));
@@ -256,7 +257,7 @@ export const FallbackChain = ({
 
   // action 收 token：外面判过空了，但闭包里 TS 不认收窄，传进来才不用到处写断言。
   const run = async (action: (auth: string) => Promise<ProvidersResponse>, done: string) => {
-    if (!token) return;
+    if (!token || busy) return;
     setBusy(true);
     try {
       onSaved(await action(token));
@@ -282,6 +283,7 @@ export const FallbackChain = ({
 
   return (
     <Block hint={hint} title="备选链">
+      <fieldset disabled={busy} className="min-w-0">
       {scope !== null && (
         <NodeChainMode
           busy={busy}
@@ -337,11 +339,12 @@ export const FallbackChain = ({
             dirty={dirty}
             label="保存备选链"
             note={note}
-            onReset={() => setDrafts(stored.map(toDraft))}
+            onReset={() => { if (confirmDiscard()) setDrafts(stored.map(toDraft)); }}
             onSave={() => void save()}
           />
         </>
       )}
+      </fieldset>
     </Block>
   );
 };

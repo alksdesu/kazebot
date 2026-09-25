@@ -3,7 +3,7 @@
 // list outside individual chat cards. How: read pending_approvals from admin state,
 // expose allow and deny actions, and mirror the selected approval into the right
 // panel. Purpose: approvals can be reviewed and decided from Settings.
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { decideApproval, getAdminState, type AdminApproval } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
@@ -44,6 +44,8 @@ export const ApprovalsSettingsPage = () => {
   const [approvals, setApprovals] = useState<AdminApproval[]>([]);
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
+  const pending = useRef(new Set<string>());
+  const [deciding, setDeciding] = useState<string[]>([]);
 
   const load = useCallback(async (showSpinner = true) => {
     if (!adminToken || !isAuthenticated) return;
@@ -73,13 +75,15 @@ export const ApprovalsSettingsPage = () => {
   }, [adminToken, isAuthenticated, load]);
 
   const decide = async (approval: AdminApproval, decision: 'allow' | 'deny') => {
+    if (!adminToken || pending.current.has(approval.approval_id)) return;
+    pending.current.add(approval.approval_id); setDeciding([...pending.current]);
     try {
       await decideApproval(adminToken || '', approval.approval_id, decision, `settings ${decision}`);
       setMessage(decision === 'allow' ? '已允许审批' : '已拒绝审批');
       await load();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '审批操作失败');
-    }
+    } finally { pending.current.delete(approval.approval_id); setDeciding([...pending.current]); }
   };
 
   return (
@@ -129,8 +133,8 @@ export const ApprovalsSettingsPage = () => {
                     </div>
                   </button>
                   <div className="mt-3 flex flex-wrap gap-2">
-                    <Button onClick={() => decide(approval, 'allow')} variant="primary">允许</Button>
-                    <Button onClick={() => decide(approval, 'deny')} variant="danger">拒绝</Button>
+                    <Button disabled={deciding.includes(approval.approval_id)} onClick={() => decide(approval, 'allow')} variant="primary">允许</Button>
+                    <Button disabled={deciding.includes(approval.approval_id)} onClick={() => decide(approval, 'deny')} variant="danger">拒绝</Button>
                   </div>
                 </article>
               ))}

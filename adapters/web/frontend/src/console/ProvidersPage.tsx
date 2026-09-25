@@ -3,6 +3,7 @@
 // 读到的是脱敏视图，密钥只回来一个星号串，所以留空表示不改而不是清空。
 // 新建的渠道先留在本地，存盘时才建块 —— 后端认不出空块，先建会让它从列表里消失。
 import { useEffect, useId, useMemo, useState, type ReactNode } from 'react';
+import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
 import {
   channelChoices,
@@ -109,6 +110,7 @@ const Row = ({
   onRemove: () => void;
 }) => (
   <Item>
+    <fieldset disabled={busy} className="min-w-0">
     <div className={HEAD}>
       <ItemTitle>{draft.label || draft.name}</ItemTitle>
       {draft.label && <Scope>{draft.name}</Scope>}
@@ -210,6 +212,7 @@ const Row = ({
         <option value="no">看不了图</option>
       </Select>
     </FieldRow>
+    </fieldset>
   </Item>
 );
 
@@ -227,6 +230,11 @@ const NodeOverrides = ({ nodes }: { nodes: Array<{ id: string; provider: string 
 
 export const ProvidersPage = () => {
   const token = useSettingsStore((state) => state.adminToken);
+  return <ProvidersEditor key={token || ""} />;
+};
+
+const ProvidersEditor = () => {
+  const token = useSettingsStore((state) => state.adminToken);
   const listPrefix = useId();
   const [data, setData] = useState<ProvidersResponse | null>(null);
   const [drafts, setDrafts] = useState<Draft[]>([]);
@@ -241,17 +249,21 @@ export const ProvidersPage = () => {
 
   useEffect(() => {
     if (!token) return;
+    let cancelled = false;
     void (async () => {
       try {
         const resp = await getProviders(token);
+        if (cancelled) return;
         setData(resp);
         setDrafts(fromResponse(resp));
         setPinned(fromResponse(resp));
       } catch (caught) {
+        if (cancelled) return;
         setError(say(caught));
       }
       try {
         const list = await getNodes(token);
+        if (cancelled) return;
         setOverrides(
           list
             .map((node) => ({ id: String(node.id || ''), provider: String(node.provider || '') }))
@@ -261,11 +273,13 @@ export const ProvidersPage = () => {
         // 提示性信息，取不到就不提示，不该挡住这一页。
       }
       try {
-        setProfiles(await getProviderProfiles(token));
+        const received = await getProviderProfiles(token);
+        if (!cancelled) setProfiles(received);
       } catch {
         // 同上：认不出域名就是不提示。
       }
     })();
+    return () => { cancelled = true; };
   }, [token]);
 
   const storedBy = useMemo(
@@ -273,25 +287,40 @@ export const ProvidersPage = () => {
     [pinned],
   );
   const dirty = drafts.some((draft) => changed(draft, storedBy.get(draft.name)));
+  const confirmDiscard = useUnsavedChanges(dirty, '渠道配置还有未保存修改，确定离开或丢弃吗？');
 
   const families = data?.registered || [];
   // 名字留空就拿格式名当名字：同一家只开一个时，这和以前的行为一模一样。
   const pendingName = addName.trim() || addType;
   const nameTaken = drafts.some((draft) => draft.name === pendingName);
 
-  const absorb = (next: ProvidersResponse, done: string) => {
+  const absorb = (next: ProvidersResponse, done: string, preserveDrafts = false) => {
+    const received = fromResponse(next);
     setData(next);
-    setDrafts(fromResponse(next));
-    setPinned(fromResponse(next));
+    setDrafts(current => {
+      if (!preserveDrafts) return received;
+      const kept = received.map(saved => {
+        const local = current.find(item => item.name === saved.name);
+        const prior = storedBy.get(saved.name);
+        if (!local || !prior) return local?.fresh ? local : saved;
+        const result = { ...saved };
+        for (const key of ['model', 'baseUrl', 'vision', 'type', 'typeExplicit', 'label', 'apiKeyInput'] as const) {
+          if (local[key] !== prior[key]) Object.assign(result, { [key]: local[key] });
+        }
+        return result;
+      });
+      return [...kept, ...current.filter(item => item.fresh && !received.some(saved => saved.name === item.name))];
+    });
+    setPinned(received);
     setNote(done);
   };
 
   const run = async (action: (auth: string) => Promise<ProvidersResponse>, done: string) => {
-    if (!token) return;
+    if (!token || busy) return;
     setBusy(true);
     setError('');
     try {
-      absorb(await action(token), done);
+      absorb(await action(token), done, true);
     } catch (caught) {
       setError(say(caught));
     }
@@ -299,7 +328,7 @@ export const ProvidersPage = () => {
   };
 
   const save = async () => {
-    if (!token) return;
+    if (!token || busy) return;
     setBusy(true);
     setError('');
     try {
@@ -355,6 +384,7 @@ export const ProvidersPage = () => {
                     setDrafts(drafts.filter((_, i) => i !== index));
                     return;
                   }
+                  if (!window.confirm(`删除渠道“${draft.label || draft.name}”？其地址、模型和密钥配置将被移除。`)) return;
                   void run((auth) => deleteProvider(auth, draft.name), '已删除 ' + draft.name + '。');
                 }}
               />
@@ -366,13 +396,13 @@ export const ProvidersPage = () => {
           <>
             <div className={HEAD}>
               <Input
-                aria-label="新渠道名"
+                disabled={busy} aria-label="新渠道名"
                 onChange={(event) => setAddName(event.target.value)}
                 placeholder="渠道名，留空就用格式名"
                 value={addName}
               />
               <Select
-                aria-label="新渠道格式"
+                disabled={busy} aria-label="新渠道格式"
                 onChange={(event) => setAddType(event.target.value)}
                 value={addType}
               >
@@ -380,7 +410,7 @@ export const ProvidersPage = () => {
                 {families.map((name) => <option key={name} value={name}>{name}</option>)}
               </Select>
               <Button
-                disabled={!addType || nameTaken}
+                disabled={busy || !addType || nameTaken}
                 onClick={() => {
                   setDrafts([...drafts, {
                     name: pendingName,
@@ -416,7 +446,7 @@ export const ProvidersPage = () => {
           dirty={dirty}
           label="保存渠道"
           note={note}
-          onReset={() => setDrafts(pinned.map((draft) => ({ ...draft })))}
+          onReset={() => { if (confirmDiscard()) setDrafts(pinned.map((draft) => ({ ...draft }))); }}
           onSave={() => void save()}
         />
       </Block>

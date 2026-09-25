@@ -71,12 +71,11 @@ describe('setByPath', () => {
     expect(doc).toEqual({ trigger: { signals: {} } });
   });
 
-  it('replaces a non-object on the way down', () => {
+  it('refuses to overwrite a non-object on the way down', () => {
     const doc: Record<string, unknown> = { trigger: 'nonsense' };
 
-    setByPath(doc, 'trigger.signals.at', true);
-
-    expect(doc).toEqual({ trigger: { signals: { at: true } } });
+    expect(() => setByPath(doc, 'trigger.signals.at', true)).toThrow();
+    expect(doc).toEqual({ trigger: 'nonsense' });
   });
 });
 
@@ -105,11 +104,8 @@ describe('mergeDraft', () => {
     expect(() => mergeDraft('', { made_up_key: 1 }, PATHS)).toThrow(/made_up_key/);
   });
 
-  it('survives a corrupt base document', () => {
-    // 磁盘上的 yaml 写坏了也必须能从控制台改回来。
-    const out = mergeDraft('trigger:\n  signals:\n   at: [unclosed', { signal_at: true }, PATHS);
-
-    expect(out).toContain('    at: true');
+  it('rejects a corrupt base document without overwriting it', () => {
+    expect(() => mergeDraft('broken: [', { signal_at: true }, PATHS)).toThrow();
   });
 
   it('writes numbers as numbers', () => {
@@ -385,7 +381,7 @@ describe('apply', () => {
           headers: { 'Content-Type': 'application/json' },
         });
       }
-      return new Response(JSON.stringify({ content: '', exists: false }), {
+      return new Response(JSON.stringify({ content: sent[0] || 'version: 1\n', exists: true }), {
         headers: { 'Content-Type': 'application/json' },
       });
     }) as typeof fetch;

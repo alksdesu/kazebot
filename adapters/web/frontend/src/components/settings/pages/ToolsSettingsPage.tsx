@@ -1,3 +1,5 @@
+import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
+import { useExclusiveAction } from '../../../hooks/useExclusiveAction';
 // Tools and permissions: which tools exist, which node may call them, and what needs approval.
 // The three answers used to live on three unrelated pages, so they are stacked here instead.
 import { useEffect, useState } from 'react';
@@ -51,6 +53,7 @@ const ToolInventorySection = () => {
   const [newName, setNewName] = useState('');
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
+  const { busy, run } = useExclusiveAction();
   const [query, setQuery] = useState('');
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all');
 
@@ -83,10 +86,11 @@ const ToolInventorySection = () => {
     return () => window.removeEventListener('settings:tools-updated', handler);
   }, [adminToken, isAuthenticated, selectedTool?.name]);
 
-  const create = async () => {
+  const create = () => run(async () => {
     if (!adminToken) return;
     const name = newName.trim();
     if (!name) { setMessage('请输入工具名称'); return; }
+    if (!confirmNavigation()) return;
     try {
       await createTool(adminToken, { id: name, content: defaultToolScript(name) });
       setNewName('');
@@ -96,11 +100,11 @@ const ToolInventorySection = () => {
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '创建工具失败');
     }
-  };
-
-  const remove = async () => {
+  });
+  const remove = () => run(async () => {
     if (!adminToken || !selectedTool || !selectedTool.editable) return;
     if (!window.confirm(`确定要删除工具 ${selectedTool.name} 吗？`)) return;
+    if (!confirmNavigation()) return;
     try {
       await deleteTool(adminToken, selectedTool.name);
       setSelectedTool(null);
@@ -109,10 +113,10 @@ const ToolInventorySection = () => {
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '删除工具失败');
     }
-  };
-
-  const reload = async () => {
+  });
+  const reload = () => run(async () => {
     if (!adminToken) return;
+    if (!confirmNavigation()) return;
     try {
       const result = await reloadTools(adminToken);
       setMessage(`工具已重载，序号 ${result.seq ?? '未知'}`);
@@ -120,8 +124,7 @@ const ToolInventorySection = () => {
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '重载工具失败');
     }
-  };
-
+  });
   const keyword = query.trim().toLowerCase();
   const visible = tools.filter((tool) => (
     matchesSource(tool, sourceFilter)
@@ -138,9 +141,9 @@ const ToolInventorySection = () => {
     >
       <>
           <div className="mb-3 flex flex-wrap gap-2">
-            <Button disabled={loading} onClick={load}>{loading ? '刷新中...' : '刷新工具'}</Button>
-            <Button onClick={reload} variant="primary">重载工具</Button>
-            <Button disabled={!selectedTool?.editable} onClick={remove} variant="danger">删除选中工具</Button>
+            <Button disabled={loading || busy} onClick={load}>{loading ? '刷新中...' : '刷新工具'}</Button>
+            <Button disabled={busy} onClick={reload} variant="primary">重载工具</Button>
+            <Button disabled={busy || !selectedTool?.editable} onClick={remove} variant="danger">删除选中工具</Button>
           </div>
           <div className="mb-3 flex flex-wrap items-center gap-2">
             <TextInput
@@ -173,7 +176,7 @@ const ToolInventorySection = () => {
               const risk = inferToolRisk(tool.name);
               return (
                 <li key={tool.name}>
-                  <button className={`w-full border p-3 text-left ${selectedTool?.name === tool.name ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} onClick={() => { setSelectedTool(tool); setMessage(''); setRightPanelOpen(true); }} type="button">
+                  <button className={`w-full border p-3 text-left ${selectedTool?.name === tool.name ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} disabled={busy} onClick={() => { setSelectedTool(tool); setMessage(''); setRightPanelOpen(true); }} type="button">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="font-mono text-xs font-semibold">{tool.name}</span>
                       <span className={`border px-1.5 py-0.5 font-mono text-[0.55rem] ${riskClassName(risk)}`}>{riskLabel(risk)}</span>
@@ -196,8 +199,8 @@ const ToolInventorySection = () => {
           </ul>
           <div className="mt-4 border-t border-[var(--duties-border)] pt-3">
             <FieldLabel htmlFor="new-tool-name">创建工具</FieldLabel>
-            <TextInput id="new-tool-name" onChange={(event) => setNewName(event.target.value)} placeholder="工具名称" value={newName} />
-            <Button className="mt-2" onClick={create} variant="primary">创建工具</Button>
+            <TextInput disabled={busy} id="new-tool-name" onChange={(event) => setNewName(event.target.value)} placeholder="工具名称" value={newName} />
+            <Button className="mt-2" disabled={busy} onClick={create} variant="primary">创建工具</Button>
           </div>
           <StatusText message={message} />
       </>

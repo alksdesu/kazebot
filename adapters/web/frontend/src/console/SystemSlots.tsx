@@ -14,6 +14,7 @@ import {
   type SystemModelSlot,
   type SystemModelsResponse,
 } from '../api/supervisorClient';
+import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
 import { ChannelOptions, EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields';
 import { Block, Empty, ErrorText, Facts, Input, Item, ItemTitle, List, SaveBar, Select } from './components';
@@ -209,8 +210,10 @@ export const SystemSlots = ({ channels, wires, profiles, activeProvider }: {
     [drafts, imageDefault, savedImageDefault],
   );
 
+  const confirmDiscard = useUnsavedChanges(dirty, '系统槽位还有未保存修改，确定离开或还原吗？');
+
   const save = async () => {
-    if (!token) return;
+    if (!token || busy || !loaded) return;
     setBusy(true);
     setError('');
     try {
@@ -244,6 +247,7 @@ export const SystemSlots = ({ channels, wires, profiles, activeProvider }: {
 
   return (
     <Block hint="压缩、摘要、读图这些内部用途各自可以走独立渠道，留空则跟随主渠道" title="系统槽位">
+      <fieldset disabled={busy} className="min-w-0">
       {/* 各家的版本段位置不同，填错了一律静默 404，光看输入框看不出来。 */}
       <Facts>
         地址写到哪一级看渠道：OpenAI 系（含生图 GPT）要带 <code>/v1</code>，Claude 与 Gemini 不带。
@@ -273,11 +277,13 @@ export const SystemSlots = ({ channels, wires, profiles, activeProvider }: {
         label="保存槽位"
         note={note}
         onReset={() => {
+          if (!confirmDiscard()) return;
           setDrafts(drafts.map((draft) => toDraft(draft.slot)));
           setImageDefault(savedImageDefault);
         }}
         onSave={() => void save()}
       />
+      </fieldset>
     </Block>
   );
 };

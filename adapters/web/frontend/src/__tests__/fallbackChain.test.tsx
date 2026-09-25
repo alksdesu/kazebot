@@ -1,7 +1,7 @@
 // 备选链编辑。这一页读到的是脱敏视图，所以最要紧的是「界面看不见的东西不能被存没」：
 // 内联密钥、支持图片、手写进 yaml 的参数，都靠提交原始位置由后端合并保住。
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   clearNodeFallbacks,
@@ -14,6 +14,8 @@ import {
   updateNodeFallbacks,
 } from '../api/supervisorClient';
 import { ModelsPage } from '../console/ModelsPage';
+import { FallbackChain } from '../console/FallbackChain';
+import * as unsaved from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
 
 vi.mock('../api/supervisorClient', async (importOriginal) => ({
@@ -79,6 +81,7 @@ beforeEach(() => {
   vi.mocked(updateNodeFallbacks).mockResolvedValue(structuredClone(PROVIDERS) as any);
   vi.mocked(clearNodeFallbacks).mockResolvedValue(structuredClone(PROVIDERS) as any);
 });
+afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 const saveChain = () => fireEvent.click(screen.getByRole('button', { name: '保存备选链' }));
 const rows = () => screen.getAllByRole('listitem');
@@ -86,6 +89,33 @@ const rows = () => screen.getAllByRole('listitem');
 const ready = () => screen.findAllByRole('listitem');
 
 describe('备选链', () => {
+  it('载入已保存数据时任何一帧都不把尚未同步的空草稿登记为修改', () => {
+    const guard = vi.spyOn(unsaved, 'useUnsavedChanges');
+    const confirmed = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const props = { catalog: CATALOG as any, scope: null, onSaved: vi.fn() };
+    const { rerender } = render(<FallbackChain {...props} data={null} />);
+    rerender(<FallbackChain {...props} data={structuredClone(PROVIDERS) as any} />);
+    expect(guard.mock.calls.map(([dirty]) => dirty)).not.toContain(true);
+    expect(unsaved.confirmNavigation()).toBe(true);
+    expect(confirmed).not.toHaveBeenCalled();
+  });
+
+  it('真修改拒绝切换，卸载后清理登记而不污染下一个编辑器', async () => {
+    const confirmed = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const first = render(<ModelsPage />);
+    await ready();
+    fireEvent.change(within(rows()[0]).getByLabelText('模型'), { target: { value: 'unsaved' } });
+    fireEvent.click(screen.getByRole('button', { name: 'qq.chat' }));
+    expect(confirmed).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', { name: '跟随全局' })).not.toBeInTheDocument();
+    first.unmount();
+    expect(unsaved.confirmNavigation()).toBe(true);
+    render(<ModelsPage />);
+    await ready();
+    fireEvent.click(screen.getByRole('button', { name: 'qq.chat' }));
+    expect(await screen.findByRole('button', { name: '跟随全局' })).toBeInTheDocument();
+    expect(confirmed).toHaveBeenCalledTimes(1);
+  });
   it('把已配的两条都摆出来', async () => {
     render(<ModelsPage />);
     await ready();

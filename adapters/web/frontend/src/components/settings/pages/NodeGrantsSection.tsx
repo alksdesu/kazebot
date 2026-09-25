@@ -122,7 +122,7 @@ const DefaultsNotice = ({ nodes }: { nodes: AdminNode[] }) => {
     <div className="mb-4 border border-[var(--duties-danger)] bg-[var(--duties-bg)] px-4 py-3">
       <h3 className="m-0 text-sm font-semibold text-[var(--duties-danger)]">新建节点默认是「全放开」，不是「全收紧」</h3>
       <p className="mt-1.5 text-xs leading-5 text-[var(--duties-secondary)]">
-        在「智能体」页新建 AI 节点，模板写的是 <code>tool_access.mode: all</code>：一建出来就握着当前
+        在「节点」页新建 AI 节点，模板写的是 <code>tool_access.mode: all</code>：一建出来就握着当前
         注册的每一个工具，以后新装的工具也自动算它的。要收紧得自己来，没人会替你收。
       </p>
       <p className="mt-1.5 text-xs leading-5 text-[var(--duties-secondary)]">
