@@ -35,6 +35,7 @@ from ..attachments import build_multimodal_content
 from ..conversation_store import ConversationStore, Message, MessageType
 from ..node import Node
 from .message_assembly import assemble_initial_messages
+from ..conversation_routing import concise_text, routing_meta, short_reply, topic_history
 from ..protocol import (
     TaskAction,
     ACTION_DISPATCH,
@@ -1590,6 +1591,10 @@ def _build_unauthorized_implicit_finish(ls: _LoopState, resp, text: str, step: i
     导致在循环里空转到 max_steps。怎么改：把模型本轮输出的文本当作成果直接
     交付（与 hybrid 隐式 finish 一致）。目的：摘要/压缩结果能落地，不再空转。
     """
+    from ..conversation_routing import concise_text, short_reply
+    concise = short_reply(getattr(ls.rctx, "task_context", {}) or {})
+    if concise:
+        text = concise_text(text)
     _assistant_msg = ls.formatter.build_assistant_message(resp, text, [])
     _provider_name = getattr(ls.provider, "name", "") or "unknown"
     _meta = MessageMeta(
@@ -1612,7 +1617,7 @@ def _build_unauthorized_implicit_finish(ls: _LoopState, resp, text: str, step: i
         action=ACTION_FINISH, node_id=ls.node.id,
         result={
             "text": text,
-            "attachments": list(ls.tool_produced_attachments),
+            "attachments": [] if concise else list(ls.tool_produced_attachments),
             "implicit_finish": True,
             "unauthorized_tool_recovery": True,
         },
@@ -1799,7 +1804,10 @@ async def _fire_task_end_hook_if_finish(ls: _LoopState, action: TaskAction, step
     )
     _end_result = await hook_registry.afire("on_task_end", _end_ctx)
     if _end_result.action is not None:
-        return _end_result.action
+        action = _end_result.action
+    if short_reply(getattr(ls.rctx, "task_context", {}) or {}) and action.action in (ACTION_FINISH, ACTION_ASK):
+        action.action = ACTION_FINISH
+        action.result = {**(action.result or {}), "text": concise_text(str((action.result or {}).get("text") or "")), "attachments": []}
     if _end_ctx.extra.get("snapshot_saved"):
         action.context_ref = str(_end_ctx.extra.get("context_ref") or "")
     return action
@@ -1841,6 +1849,9 @@ async def run_ai_node(
     load_external_plugins(hook_registry, rctx.workspace_root / "plugins")
 
     runtime_cfg = load_runtime_config(rctx.workspace_root)
+    route_meta = routing_meta(rctx.task_context)
+    topic_id = str(route_meta.get("topic_id") or "")
+    history = topic_history(history, topic_id, current_task_id=rctx.task_id)
     max_steps = get_int(runtime_cfg, "engine.max_steps", 32, min_value=1, max_value=200)
     # [fix 2026-07-17] 支持节点级 max_steps 覆盖：系统节点（压缩/摘要/读图等）是
     # 单轮一次性任务，不需要 32 步的大循环。压缩模型持续空响应/非法 JSON 时，若沿用
@@ -1898,7 +1909,7 @@ async def run_ai_node(
     _assembled_fresh = False
     snapshot = load_context_snapshot(rctx.workspace_root, context_ref) if context_ref else None
     if snapshot and isinstance(snapshot.get("messages"), list):
-        messages = list(snapshot.get("messages") or [])
+        messages = topic_history(list(snapshot.get("messages") or []), topic_id, current_task_id=rctx.task_id)
         try:
             step_count = int(snapshot.get("step_count") or 0)
         except Exception:
@@ -1950,7 +1961,10 @@ async def run_ai_node(
 
     # ---- 追加恢复消息 ----
     if resume_data:
-        messages.extend(_build_resume_messages(resume_data))
+        resumed_messages = _build_resume_messages(resume_data)
+        for message in resumed_messages:
+            message.setdefault("_meta", {}).update({**route_meta, "source_task_id": rctx.task_id})
+        messages.extend(resumed_messages)
         if str(resume_data.get("type") or "") == "compact_done":
             # Phase 2 Signal: compact.done 信号，通过 SignalBus 发射供监控使用
             _cd_payload = {
@@ -1965,6 +1979,14 @@ async def run_ai_node(
                     _cd_payload[_k] = resume_data[_k]
             get_bus().emit(Signal(name="compact.done", payload=_cd_payload))
             await rctx.emit_event("compact_done", _cd_payload)
+
+    if instruction:
+        for message in reversed(messages):
+            if message.get("role") == "user" and not message.get("_dynamic"):
+                content = message.get("content")
+                if content == instruction or isinstance(content, list):
+                    message.setdefault("_meta", {}).update({**route_meta, "source_task_id": rctx.task_id})
+                    break
 
     # ---- 构建工具列表 ----
     tool_specs = _filter_tool_specs(node, registry.list_specs())
@@ -2017,6 +2039,16 @@ async def run_ai_node(
     openai_tools.append(_reply_spec())
     openai_tools.append(_compact_context_spec())
     openai_tools.append(_preempt_task_spec())
+
+    if short_reply(rctx.task_context):
+        max_steps = min(max_steps, 2)
+        _allowed_real_tools = set()
+        delegate_targets = []
+        openai_tools = [_finish_spec()]
+        messages.append({
+            "role": "system",
+            "content": "本轮只接一句自然的简短回应，最多240字。无需工具或委派，直接用finish给出回复；不展开任务、不连续发消息。",
+        })
 
     # ---- 工具定义注入（formatter 统一处理 native/json 差异）----
     formatter = create_tool_formatter(node.tool_mode)
@@ -2101,6 +2133,7 @@ async def run_ai_node(
         # Purpose: avoid knowledge injection imports in this loop while keeping the
         # migrated execution order visible.
 
+        ls.messages = topic_history(ls.messages, topic_id, current_task_id=rctx.task_id)
         result = await _call_llm_with_retry(ls, step)
         if isinstance(result, TaskAction):
             return result

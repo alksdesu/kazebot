@@ -196,6 +196,18 @@ class EventRouter:
         self._outbound_retry_wakeup.set()
         return record
 
+    def resume_deferred(self, conversation_key: str) -> int:
+        count = self._outbound_store.resume_deferred(conversation_key)
+        self._outbound_retry_wakeup.set()
+        return count
+
+    @staticmethod
+    def _delivery_purpose(payload: dict) -> str:
+        if payload.get("reminder_id"):
+            return "ambient"
+        purpose = payload.get("delivery_purpose", "direct")
+        return purpose if purpose in {"direct", "ambient", "control"} else "direct"
+
     @staticmethod
     def _event_delivery_context(
         event: Event, conversation_key: str = "", *, attempt: int = 1,
@@ -210,6 +222,10 @@ class EventRouter:
             idempotency_key=OutboundStore.stable_key(
                 event.event_id, event.seq, event.type,
             ),
+            purpose=EventRouter._delivery_purpose(payload),
+            feature_delivery_id=str(payload.get("delivery_id") or ""),
+            topic_id=str(payload.get("topic_id") or ""),
+            reply_message_id=str(payload.get("reply_message_id") or ""),
         )
 
     async def _invoke_callback(
@@ -447,7 +463,7 @@ class EventRouter:
                 },
             )
             return True
-        if record.attempt > 0 and record.next_retry > time.time():
+        if record.next_retry > time.time():
             logger.info(
                 "outbound_duplicate_deferred event_id=%s seq=%s task_id=%s attempt=%s next_retry=%s outcome=deferred",
                 record.event_id, record.seq, record.task_id, record.attempt,
@@ -514,6 +530,10 @@ class EventRouter:
                 idempotency_key=delivery_key,
                 replay_generation=record.replay_generation,
                 force_replay=record.replay_generation > 0,
+                purpose=self._delivery_purpose(event.payload),
+                feature_delivery_id=str(event.payload.get("delivery_id") or ""),
+                topic_id=str(event.payload.get("topic_id") or ""),
+                reply_message_id=str(event.payload.get("reply_message_id") or ""),
             )
             if event.type == "intermediate_reply":
                 await self._deliver_intermediate_reply(
@@ -543,6 +563,13 @@ class EventRouter:
                 self._outbound_store.release_claim(record, owner=self._outbound_owner)
             raise
         except Exception as exc:
+            if getattr(exc, "deferred", False) is True:
+                self._outbound_store.defer(
+                    record, owner=self._outbound_owner,
+                    retry_after=float(getattr(exc, "retry_after", 60.0)),
+                )
+                self._outbound_retry_wakeup.set()
+                return False
             retryable = getattr(exc, "retryable", True) is not False
             ambiguous_ack = getattr(exc, "ambiguous_ack", False) is True
             try:

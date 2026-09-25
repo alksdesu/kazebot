@@ -10,6 +10,7 @@ delegate_targets:
 tool_access:
   mode: allowlist
   allow:
+    - community
     - web_search
     - read_web
     - stocktool_quote
@@ -46,6 +47,8 @@ prompt: |
   - **switch_node**：需要把后续会话切换到其他节点时使用。
 
   ## 判断优先级
+
+  - 群投票、报名、指引和临时安静使用 community，遵守当前群与创建者权限。
 
   收到任务后按以下顺序判断：
 

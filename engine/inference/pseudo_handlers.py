@@ -160,6 +160,12 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     返回 None 表示已处理完毕，调用方判断是否继续。
     """
     args = pseudo_call.arguments or {}
+    from ..conversation_routing import concise_text, short_reply
+    if short_reply(getattr(ls.rctx, "task_context", {}) or {}):
+        if pseudo_call.name != "finish":
+            _emit_pseudo_tool_result(ls, pseudo_call, "本轮为简短回应，请仅调用 finish。")
+            return None
+        args = {**args, "text": concise_text(str(args.get("text") or "")), "attachment_paths": []}
 
     # reply: 非终止，发送中间消息
     if pseudo_call.name == "reply":
@@ -240,6 +246,8 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                 # for dispatch_result payloads so ordinary image-analysis turns do
                 # not echo the user's pictures back.
                 final_atts = _dispatch_result_input_attachments(ls)
+        if short_reply(getattr(ls.rctx, "task_context", {}) or {}):
+            final_atts = []
         result_payload = {
             "summary": summary_text,
             "text": result_text,

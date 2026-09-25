@@ -40,6 +40,7 @@ from .tool_step import result_to_raw, summarize_result
 # Phase 1 (Session Conversation Store): 导入 ConversationStore 用于影子写入，
 # 在每个 node task 执行时实例化并挂载到 RunContext，供 ai_step 影子写入消息。
 from .conversation_store import ConversationStore, Message, MessageType
+from .conversation_routing import routing_meta, topic_history
 # Phase 0/1: Signal System — 导入信号总线初始化和桥接函数。
 # 在 _run_node_task 中初始化 bus 并安装 EventLog 桥接，使 LLM 调用信号
 # 自动转发到 data/signals.jsonl 供监控使用。
@@ -1017,6 +1018,8 @@ async def _run_node_task(
     elif not context_ref and use_context:
         history = await _fetch_history(rctx)
 
+    _route_meta = routing_meta(rctx.task_context)
+    history = topic_history(history, str(_route_meta.get("topic_id") or ""), current_task_id=task_id)
     ds_info = _collect_node_info(ws_root, list(node.delegate_targets))
 
     runtime_cfg = load_runtime_config(ws_root)
@@ -1145,7 +1148,7 @@ async def _run_node_task(
         # selected structured fields in Message.meta while leaving content as the raw
         # child result. Purpose: refreshed history can render callbacks without storing
         # the LLM-only English prefix or any backend-localized prose.
-        _inbound_meta: dict[str, Any] = {}
+        _inbound_meta: dict[str, Any] = dict(_route_meta)
         if _inbound_summary:
             _inbound_meta["summary"] = _inbound_summary
         if _inbound_child_session_id:

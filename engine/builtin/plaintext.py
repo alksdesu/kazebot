@@ -89,6 +89,11 @@ def _build_implicit_finish(
     额外在 result 中打 plaintext_recovery 标记，便于事件日志区分。
     """
     from engine.inference.ai_step import _shadow_write
+    from engine.conversation_routing import concise_text, short_reply
+
+    concise = short_reply(getattr(ls.rctx, "task_context", {}) or {})
+    if concise:
+        text = concise_text(text)
 
     assistant_msg = ls.formatter.build_assistant_message(resp, text, [])
     provider_name = getattr(ls.provider, "name", "") or "unknown"
@@ -113,7 +118,7 @@ def _build_implicit_finish(
         node_id=ls.node.id,
         result={
             "text": text,
-            "attachments": list(ls.tool_produced_attachments),
+            "attachments": [] if concise else list(ls.tool_produced_attachments),
             "implicit_finish": True,
             **({"plaintext_recovery": True} if plaintext_recovery else {}),
         },

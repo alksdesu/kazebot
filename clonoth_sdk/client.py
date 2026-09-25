@@ -251,6 +251,9 @@ class ClonothClient:
             error=str(data.get("error") or ""),
             decided=bool(data.get("decided")),
             task_id=str(data.get("task_id") or ""),
+            action=str(data.get("action") or "reply"),
+            reaction_id=str(data.get("reaction_id") or ""),
+            topic_ref=str(data.get("topic_ref") or ""),
         )
 
     # ================================================================

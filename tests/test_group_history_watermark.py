@@ -368,6 +368,31 @@ class TestWatermarkAdvance:
         assert runtime._session_state.get_high_watermark(_GROUP_ID) == -1
         assert runtime._session_state.pending_watermarks == {}
 
+    def test_acceptance_before_submit_returns_still_advances(self, runtime, submitted, monkeypatch) -> None:
+        original_submit = runtime._client.submit_inbound
+
+        async def submit(**kwargs):
+            runtime._session_state.accept_watermark(77)
+            return await original_submit(**kwargs)
+
+        monkeypatch.setattr(runtime._client, "submit_inbound", submit)
+        assert submitted.run(9)
+        assert runtime._session_state.get_high_watermark(_GROUP_ID) == 9
+        assert not runtime._session_state.pending_watermarks
+
+    def test_reset_during_submit_rejects_its_old_watermark(self, runtime, submitted, monkeypatch) -> None:
+        original_submit = runtime._client.submit_inbound
+
+        async def submit(**kwargs):
+            runtime._session_state.accept_watermark(77)
+            runtime._session_state.reset_channel_watermark(_GROUP_ID)
+            return await original_submit(**kwargs)
+
+        monkeypatch.setattr(runtime._client, "submit_inbound", submit)
+        assert submitted.run(9)
+        assert runtime._session_state.get_high_watermark(_GROUP_ID) == -1
+        assert not runtime._session_state.pending_watermarks
+
     def test_a_submit_without_an_inbound_seq_advances_immediately(self, runtime, submitted) -> None:
         # 没有 seq 就等不到 inbound_accepted，只能就地推进。
         submitted.outcome.inbound_seq = 0
@@ -437,7 +462,7 @@ class TestQueueMerge:
 
         def _item(watermark: int):
             return runtime.QueuedInbound(
-                matcher=None, bot=None, event=None, channel="qq_group",
+                matcher=None, bot=None, event=_event(runtime), channel="qq_group",
                 real_conversation_key=_REAL_KEY, stable_conversation_key="conv_abc",
                 text="正文", attachments=[], is_dm=False, platform_updates={},
                 user_text="在吗", history_watermark=watermark,
@@ -448,6 +473,51 @@ class TestQueueMerge:
         asyncio.run(runtime._enqueue_or_submit_inbound(_item(9)))
 
         assert first.history_watermark == 9
+
+
+class TestEarlyWatermarkAcceptance:
+    def test_acknowledgement_before_registration_is_applied(self) -> None:
+        state = SessionState()
+        assert state.accept_watermark(77) is None
+        state.register_watermark(77, _GROUP_ID, 9)
+        state.accept_watermark(77)
+        assert state.get_high_watermark(_GROUP_ID) == 9
+        assert not state.pending_watermarks
+
+    def test_early_out_of_order_acknowledgements_stay_monotonic(self) -> None:
+        state = SessionState()
+        state.accept_watermark(102)
+        state.accept_watermark(101)
+        state.register_watermark(102, _GROUP_ID, 9)
+        state.register_watermark(101, _GROUP_ID, 4)
+        assert state.get_high_watermark(_GROUP_ID) == 9
+
+    def test_early_acknowledgements_are_bounded(self) -> None:
+        state = SessionState()
+        for seq in range(1, state._EARLY_WATERMARK_LIMIT + 4):
+            state.accept_watermark(seq)
+        assert len(state._accepted_watermarks) == state._EARLY_WATERMARK_LIMIT
+        assert 1 not in state._accepted_watermarks
+
+    def test_expired_acknowledgements_do_not_confirm_unrelated_registration(self, monkeypatch) -> None:
+        state = SessionState()
+        now = [1.0]
+        monkeypatch.setattr("clonoth_sdk.state.time.monotonic", lambda: now[0])
+        state.accept_watermark(77)
+        now[0] += state._EARLY_WATERMARK_TTL + 1
+        state.register_watermark(77, _GROUP_ID, 9)
+        assert state.get_high_watermark(_GROUP_ID) == -1
+
+    def test_reset_invalidates_pending_and_late_registrations(self) -> None:
+        state = SessionState()
+        generation = state.watermark_generation(_GROUP_ID)
+        state.register_watermark(77, _GROUP_ID, 8, generation=generation)
+        state.accept_watermark(78)
+        state.reset_channel_watermark(_GROUP_ID)
+        state.accept_watermark(77)
+        state.register_watermark(78, _GROUP_ID, 9, generation=generation)
+        assert state.get_high_watermark(_GROUP_ID) == -1
+        assert not state.pending_watermarks
 
 
 class TestResetPaths:

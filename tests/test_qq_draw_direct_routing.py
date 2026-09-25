@@ -125,7 +125,7 @@ def test_queue_does_not_merge_across_entry_nodes(runtime: Any) -> None:
 
     def _item(entry_node_id: str):
         return runtime.QueuedInbound(
-            matcher=None, bot=None, event=None, channel="qq_group",
+            matcher=None, bot=None, event=SimpleNamespace(user_id=10001), channel="qq_group",
             real_conversation_key=_REAL_KEY, stable_conversation_key="conv_draw",
             text="正文", attachments=[], is_dm=False, platform_updates={},
             user_text="x", entry_node_id=entry_node_id,

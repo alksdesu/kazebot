@@ -403,6 +403,32 @@ class OutboundStore:
                 )
         record.status, record.owner = "sent", ""
 
+    def defer(
+        self, record: OutboundRecord, *, owner: str, retry_after: float,
+        now: float | None = None,
+    ) -> None:
+        next_retry = (time.time() if now is None else now) + max(0.05, retry_after)
+        with self._transaction():
+            cursor = self._db.execute(
+                """UPDATE outbound SET status='pending',owner='',lease_until=0,
+                last_error='deferred:quiet',next_retry=?
+                WHERE key=? AND status='delivering' AND owner=?""",
+                (next_retry, record.key, owner),
+            )
+            if cursor.rowcount != 1:
+                raise OutboundOwnershipError(f"outbox defer ownership lost: {record.key}")
+        record.status, record.owner = "pending", ""
+        record.last_error, record.next_retry = "deferred:quiet", next_retry
+
+    def resume_deferred(self, conversation_key: str) -> int:
+        with self._transaction():
+            rows = self._db.execute(
+                "SELECT key,delivery_json FROM outbound WHERE status='pending' AND last_error='deferred:quiet'",
+            ).fetchall()
+            keys = [row["key"] for row in rows if json.loads(row["delivery_json"]).get("conversation_key") == conversation_key]
+            self._db.executemany("UPDATE outbound SET next_retry=0 WHERE key=?", [(key,) for key in keys])
+        return len(keys)
+
     def mark_failed(
         self, record: OutboundRecord, error: BaseException, *, owner: str,
         initial_delay: float, max_delay: float, now: float | None = None,

@@ -1727,6 +1727,7 @@ class TaskRouterMixin:
             action_type=action_type,
             llm_request_id=str(task.result.get("llm_request_id") or "").strip(),
             delivery_id=task.delivery_id,
+            route_hints=(task.input.get("task_context") or {}).get("route_hints"),
         )
 
 
@@ -1759,6 +1760,10 @@ class TaskRouterMixin:
             "child_task_id": task.task_id,
             "child_node_id": node_id,
         }
+        hints = (task.input.get("task_context") or {}).get("route_hints") or {}
+        for key in ("delivery_purpose", "topic_id", "reply_message_id"):
+            if key in hints:
+                payload[key] = hints[key]
         if attachment_delivery_id:
             payload["delivery_id"] = attachment_delivery_id
         child_session_id = str(task.input.get("child_session_id") or "").strip()
@@ -2110,6 +2115,11 @@ class TaskRouterMixin:
                     payload["node_id"] = event_node_id
                 if event_task_id:
                     payload["task_id"] = event_task_id
+                    origin = self.tasks.get(event_task_id)
+                    hints = ((origin.input.get("task_context") or {}).get("route_hints") or {}) if origin else {}
+                    for key in ("delivery_purpose", "topic_id", "reply_message_id"):
+                        if key in hints:
+                            payload[key] = hints[key]
                 tool = str(tool_name or "").strip()
                 if tool:
                     payload["tool_name"] = tool

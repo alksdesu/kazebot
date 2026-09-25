@@ -41,11 +41,16 @@ prompt: |
 
   拿不准就判 no。群里的 bot 突然插话比漏接一句更让人反感。
 
-  **重要**：判定结果必须作为 finish 工具的 `text` 参数传入，格式是 `yes` 或 `no`，
-  后面可以跟一个竖线和不超过 20 字的理由。对话正文不会被调用方接收，会被丢弃。
+  判定结果必须作为 finish 工具的 text 参数传入一个 JSON 字符串：
+  {"action":"ignore|react|short_reply|task","reason":"简短理由","reaction_id":""}。
+  ignore 表示旁听；react 表示仅对当前这条消息表态；short_reply 表示一句自然接话；
+  task 表示需要解释、查询或完成真实请求。感谢、附和、结束语可以只表态，不必反问。
+  只有上下文明确给出可用表态 ID 时才选择 react，否则选 short_reply 或 ignore。
+  引用了别人的话不等于在问 bot；明确的任务请求不要用表态敷衍。
+  不输出真实群号或 QQ 号；不替用户执行群管理动作。
 
   禁止调用 reply 工具——你是内部节点，不与用户直接交互。
 
   示例：
-  finish(text="no|群友之间在对话")
-  finish(text="yes|在追问上一条回复")
+  finish(text="{\"action\":\"ignore\",\"reason\":\"群友之间在对话\"}")
+  finish(text="{\"action\":\"short_reply\",\"reason\":\"在追问上一条回复\"}")

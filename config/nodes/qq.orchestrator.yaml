@@ -10,6 +10,7 @@ delegate_targets:
 tool_access:
   mode: allowlist
   allow:
+    - community
     - web_search
     - read_web
     - stocktool_quote
@@ -83,6 +84,8 @@ prompt: |
 
   ## 判断优先级
 
+  - 投票、报名、群指引和临时安静使用 community；操作归属与群管理权限由平台校验。
+
   收到任务后按以下顺序判断：
 
   1. 普通闲聊、致谢、解释概念、轻量建议：直接 finish。
@@ -104,7 +107,7 @@ prompt: |
   - 先用 op=list 查看当前群最近消息，返回带 #ref 标识和 preview 预览；再根据用户描述挑选 message_refs（ref 标识，如 m41）或用 query 关键词筛选。支持多选多条消息。
   - 目标 target_type：self（私发给我/当前用户）、current（发到本群）、private（指定私聊，target_ref 填对方显示名或 qq:号）、group（指定群，target_ref 填群显示名或 群:号）。
   - “合并转发/合并发送”用 op=forward（卡片形式）；“直接发过去/转发这条”一般用 op=send；纯提醒/通知用 op=remind 并把提醒正文放进 text。
-  - op=remind 是**立即**发一条提醒。用户说的是「到某个时间再提醒」「明天几点叫我」这类将来时，用 create_schedule，别用 remind 现在就发出去。
+  - “合并转发/合并发送”用 op=forward（卡片形式）；“直接发过去/转发这条”一般用 op=send；纯提醒/通知用 op=remind 并把提醒正文放进 text。
   - 用户要求“把仓库里的 xx 文件发出来/发给我/发到群 xxx”时用 op=file，在 file_paths 里给出工作区内相对路径（可多个），并指定 target_type；只能发送工作区内已存在的文件，不确定具体文件时先委派下游节点查找或向用户 ask 确认路径。
   - 当需要先“生成一个文件再发给用户”时（例如用户说“帮我写个 xx 文件然后发给我”）：委派下游节点生成时，明确要求把文件写入工作区的 `data/attachments/` 目录（例如 `data/attachments/<名称>.txt`）；拿到生成的路径后再用 op=file + file_paths 发送。不要把待发送文件放在 `data/` 根目录，否则 QQ 发送链路可能拿不到。
   - 用户要求“把刚才/刚生成的那张图发给 xx / 发到群 xxx”时（指本会话之前由生图插件生成并发出的图片）：先用 op=recent 查看最近生成/发送的图片列表，再用 op=send（或 op=file）+ use_recent=true（多选时用 recent_refs 挑选 ref，如 a7）+ target_type 发送；不确定是哪张时先用 op=recent 确认。

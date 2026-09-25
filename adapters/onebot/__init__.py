@@ -23,7 +23,7 @@ import sys
 import time
 import uuid
 from collections import OrderedDict, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, DefaultDict, Deque, Dict, Iterable, List, Mapping, Optional
 
@@ -38,6 +38,7 @@ from engine import memory_subjects
 from engine.attachments import sniff_image_mime
 
 from .faces import face_display_name
+from .feature_gateway import FeatureGateway
 from engine.memory_hit_cache import prune_namespace_hits
 
 from .config import (
@@ -415,12 +416,23 @@ class QueuedInbound:
     history_watermark: int = -1
     # 发言人是不是主动找 bot（@ / 前缀 / 私聊）。只有主动的才给他建记忆档案。
     direct_interaction: bool = True
+    merge_identity: tuple[Any, ...] | None = None
+    memory_user_ids: tuple[str, ...] = ()
+
+
+@dataclass
+class QueueReplyWaiter:
+    event: asyncio.Event
+    inbound_seq: int = 0
 
 
 _qq_queue: Deque[QueuedInbound] = deque()
 _qq_queue_by_key: Dict[str, QueuedInbound] = {}
 _qq_queue_condition = asyncio.Condition()
-_qq_waiting_replies: Dict[str, asyncio.Event] = {}
+_qq_waiting_replies: Dict[str, QueueReplyWaiter] = {}
+_qq_active_conversations: set[str] = set()
+_qq_completed_replies: OrderedDict[int, None] = OrderedDict()
+_features = FeatureGateway(sys.modules[__name__])
 _auto_like_today: Dict[int, str] = {}
 _reply_message_cache: Dict[str, Dict[str, Any]] = {}
 _reply_message_cache_order: Deque[str] = deque()
@@ -856,6 +868,11 @@ async def _agent_group_rule(bot: Bot, event: Event) -> bool:
     refresh_live_config()
     if not _is_group_allowed(int(event.group_id)):
         return False
+    metadata = await _features.prepare(bot, event)
+    if _features.blocked(metadata):
+        return False
+    if metadata and _features.coordinator.can_continue(metadata["actor"], metadata.get("reply_ref", "")):
+        return True
     text = await _group_trigger_text(bot, event)
     decision = _group_trigger_decision_once(event, bot, text)
     if decision.blocked_by:
@@ -880,11 +897,18 @@ async def _intent_group_rule(bot: Bot, event: Event) -> bool:
     if not isinstance(event, GroupMessageEvent):
         return False
     refresh_live_config()
-    if not live.llm_intent_enabled:
-        return False
     if not _is_group_allowed(int(event.group_id)):
         return False
+    metadata = await _features.prepare(bot, event)
+    if _features.blocked(metadata):
+        return False
+    coordinated = metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled", False)
+    if not live.llm_intent_enabled and not coordinated:
+        return False
     text = await _group_trigger_text(bot, event)
+    if coordinated:
+        config = replace(TriggerConfig.from_live(live), llm_intent=True)
+        return trigger_evaluate(_trigger_input(event, bot, text), config, _trigger_cooldown).awaits_llm_intent()
     return _group_trigger_decision_once(event, bot, text).awaits_llm_intent()
 
 
@@ -2578,9 +2602,9 @@ async def _maybe_join_sticker_combat(
     if not payload:
         return
     try:
-        await bot.send_group_msg(
-            group_id=int(event.group_id),
-            message=_message_from_processed_segments(
+        await _send_qq_message(
+            bot, {"type": "group", "group_id": int(event.group_id), "_response_purpose": "ambient"},
+            _message_from_processed_segments(
                 [{"type": "image", "url": payload, "emoji": True}],
             ),
         )
@@ -2602,9 +2626,9 @@ async def _maybe_join_sticker_combat(
         return
     await asyncio.sleep(0.9)
     try:
-        await bot.send_group_msg(
-            group_id=int(event.group_id),
-            message=_message_from_processed_segments(
+        await _send_qq_message(
+            bot, {"type": "group", "group_id": int(event.group_id), "_response_purpose": "ambient"},
+            _message_from_processed_segments(
                 [{"type": "image", "url": extra, "emoji": True}],
             ),
         )
@@ -2889,7 +2913,7 @@ def _help_text(event: Any) -> str:
     lines = [f"{usage} —— {desc}" for cap, usage, desc in _COMMAND_CATALOG if not cap or _can(cap, event)]
     if not lines:
         return "你当前没有可用命令。"
-    return "【可用命令】\n" + "\n".join(lines) + "\n\n命令都要以 / 开头，不带斜杠的话我会当成普通聊天。"
+    return "【可用命令】\n" + "\n".join(lines) + "\n\n功能入口：/群协作帮助、/任务、/提醒列表、/资料。\n命令都要以 / 开头，不带斜杠的话我会当成普通聊天。"
 
 
 async def _maybe_handle_help_command(*, event: Event, user_text: str) -> str | None:
@@ -3847,6 +3871,7 @@ async def _send_forward_nodes(
     image_attachments: list[Any] | None = None,
 ) -> None:
     target_dict = _target_to_send_dict(target)
+    await _features.check_send(bot, target_dict)
     identity = "forward-nodes:" + hashlib.sha256(
         json.dumps(nodes, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
@@ -3866,6 +3891,7 @@ async def _send_forward_nodes(
     heartbeat = asyncio.create_task(_heartbeat_idempotency_claim(claim))
     try:
         async def send_forward() -> Any:
+            await _features.check_send(bot, target_dict)
             if target.target_type == "group":
                 return await bot.call_api(
                     "send_group_forward_msg", group_id=int(target.target_id), messages=nodes,
@@ -4407,6 +4433,8 @@ def _purge_conversation_side_state(conversation_key: str, target: Dict[str, Any]
     bucket = _sent_attachment_bucket_key(target) or f"conv:{conversation_key}"
     _recent_sent_attachments.pop(bucket, None)
     _sent_attachment_seq.pop(bucket, None)
+    _features.coordinator.clear_context(conversation_key)
+    _features.burst_store.clear_scope(conversation_key)
     group_id = target.get("group_id")
     if target.get("type") == "group" and group_id is not None:
         _group_history.pop(int(group_id), None)
@@ -5517,6 +5545,12 @@ async def _judge_llm_intent(bot: Bot, event: GroupMessageEvent, text: str) -> In
     group_id = int(event.group_id)
     limit = int(live.llm_intent_context_messages)
     context_lines = [entry.text for entry in list(_group_history[group_id])[-limit:]] if limit > 0 else []
+    metadata = _features.coordinator.metadata(_features.actor(bot, event)) if _features.available else {}
+    topic = metadata.get("topic", {})
+    if topic.get("context"):
+        context_lines = [f"{line['label']}: {line['text']}" for line in topic["context"]]
+    if metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled"):
+        context_lines.append(_reaction_prompt_block())
     speaker = _anonymize_text_for_ai(_event_display_name(event))
     return await _client.judge_qq_intent(
         conversation_key=_stable_conversation_key(f"qq_group:{group_id}"),
@@ -5674,12 +5708,20 @@ async def _build_inbound_text(
     now = dt.datetime.now(_CST).strftime("%Y-%m-%d %H:%M CST")
 
     parts: List[str] = ["【群聊上下文记录】"]
-    if lost > 0:
+    metadata = _features.coordinator.metadata(_features.actor(bot, event)) if _features.available else {}
+    topic = metadata.get("topic", {})
+    if topic.get("topic_id"):
+        parts.extend(f"[{line['ref']}] {line['label']}: {line['text']}" for line in topic.get("context", [])
+                     if str(line['ref']) != str(getattr(event, "message_id", "")))
+        if len(parts) == 1:
+            parts.append("（当前话题暂无前文）")
+        covered_seq = watermark
+    elif lost > 0:
         # 不说这一句，模型会把中间断掉的一段群聊当连续的推理。
         parts.append(f"（此前 {lost} 条群消息超出缓存上限，未包含在内）")
-    if fresh:
+    if not topic.get("topic_id") and fresh:
         parts.extend(entry.text for entry in fresh)
-    elif lost <= 0:
+    elif not topic.get("topic_id") and lost <= 0:
         # 已带过历史却没有新行，和「这个群从没说过话」是两回事，不能都说“暂无”。
         parts.append("（无新消息）" if watermark >= 0 else "（暂无）")
 
@@ -5811,6 +5853,7 @@ async def _try_preempt_running_task(
     attachments: Optional[List[Dict[str, Any]]],
     is_dm: bool,
     platform_updates: Dict[str, Any],
+    get_memory_hints: Callable[[], Dict[str, Any]] | None = None,
 ) -> bool:
     """尝试把 QQ 新消息注入当前会话正在运行的入口任务。"""
     # 先查询当前 session 的入口任务，再用 preempt_task 注入新消息：让同一会话的
@@ -5847,12 +5890,22 @@ async def _try_preempt_running_task(
             rt_event = rt_trigger.platform_data.get("event")
             if getattr(rt_event, "user_id", None) != getattr(event, "user_id", None):
                 continue
+        previous_topic = (rt_trigger.platform_data.get("_route_hints") or {}).get("topic_id", "") if rt_trigger else ""
+        current_topic = (platform_updates.get("_route_hints") or {}).get("topic_id", "")
+        if current_topic != previous_topic:
+            continue
+        previous_action = (rt_trigger.platform_data.get("_route_hints") or {}).get("response_action", "reply") if rt_trigger else "reply"
+        current_action = (platform_updates.get("_route_hints") or {}).get("response_action", "reply")
+        if current_action != previous_action:
+            continue
 
         try:
+            preempt_args: Dict[str, Any] = {"message": inbound_text, "attachments": attachments}
+            if get_memory_hints is not None:
+                preempt_args["memory_hints"] = get_memory_hints()
             ok = await _client.preempt_task(
                 rt.task_id,
-                message=inbound_text,
-                attachments=attachments,
+                **preempt_args,
             )
         except Exception:
             logger.exception("preempt_v2: preempt task failed")
@@ -5860,6 +5913,8 @@ async def _try_preempt_running_task(
 
         if not ok:
             continue
+
+        _bind_qq_reply_waiter(conversation_key, rt_src_seq)
 
         # 2026-05-03 修改原因：Preempt 成功后不会生成新的 inbound_seq。
         # 因此必须把旧 trigger 的平台对象更新为本次 QQ event 和 bot；目的
@@ -5908,12 +5963,24 @@ async def _submit_or_preempt_inbound(
     entry_node_id: str = "",
     history_watermark: int = -1,
     direct_interaction: bool = True,
+    memory_user_ids: tuple[str, ...] = (),
 ) -> bool:
     """提交或打断 QQ 入站消息；对外使用稳定哈希 conversation_key，对内保留真实路由。"""
     if _client is None or _session_state is None:
         return False
 
     group_id = platform_updates.get("group_id") if platform_updates.get("type") == "group" else None
+    watermark_generation = _session_state.watermark_generation(int(group_id)) if group_id is not None else None
+    memory_hints: Dict[str, Any] | None = None
+
+    def get_memory_hints() -> Dict[str, Any]:
+        nonlocal memory_hints
+        if memory_hints is None:
+            memory_hints = {"subjects": _collect_memory_subjects(
+                event, user_text, stable_conversation_key, direct_interaction,
+                mentioned_user_ids=memory_user_ids,
+            )}
+        return memory_hints
 
     # 显式命令自带入口节点，打断注入会落到正在跑的那个节点上。
     if live.enable_preempt and not entry_node_id:
@@ -5925,12 +5992,18 @@ async def _submit_or_preempt_inbound(
             attachments=attachments or None,
             is_dm=is_dm,
             platform_updates=platform_updates,
+            get_memory_hints=get_memory_hints,
         )
         if preempt_ok:
             # preempt 注入的消息会被写进 ConversationStore（engine/builtin/preempt.py），
             # 但不产生新的 inbound_seq，没有 inbound_accepted 可等，只能就地推进。
-            if group_id is not None and history_watermark >= 0:
+            if (
+                group_id is not None and history_watermark >= 0
+                and watermark_generation == _session_state.watermark_generation(int(group_id))
+            ):
                 _session_state.advance_watermark(int(group_id), history_watermark)
+            if _features.available:
+                _features.burst_store.remove(stable_conversation_key, platform_updates.get("_route_hints", {}).get("source_message_refs", []))
             return True
 
     result = await _client.submit_inbound(
@@ -5947,28 +6020,35 @@ async def _submit_or_preempt_inbound(
             "platform": "qq",
             "user_id": str(getattr(event, "user_id", "")),
             "is_admin": _is_admin_user(getattr(event, "user_id", "")),
+            "group_role": _requester(event).group_role if not is_dm else "",
+            "group_scope": stable_conversation_key if not is_dm else "",
+            "bot_scope": _active_bot_scope(),
         },
         route_hints={
             "platform": "qq",
             "channel": channel,
             "has_image": any(str(a.get("type") or "") == "image" for a in (attachments or [])),
             "target_type": "private" if is_dm else "group",
+            **dict(platform_updates.get("_route_hints") or {}),
         },
-        memory_hints={"subjects": _collect_memory_subjects(
-            event, user_text, stable_conversation_key, direct_interaction,
-        )},
+        memory_hints=get_memory_hints(),
     )
     if not result.session_id or not result.accepted:
         return False
 
     _note_inbound_seq(result.inbound_seq)
+    _bind_qq_reply_waiter(stable_conversation_key, int(result.inbound_seq or 0))
 
     if group_id is not None and history_watermark >= 0:
         if result.inbound_seq:
             # 等 inbound_accepted 再推进：supervisor 没真正收下就推，那几行历史就没人再发了。
-            _session_state.register_watermark(int(result.inbound_seq), int(group_id), history_watermark)
+            _session_state.register_watermark(
+                int(result.inbound_seq), int(group_id), history_watermark,
+                generation=watermark_generation,
+            )
         else:
-            _session_state.advance_watermark(int(group_id), history_watermark)
+            if watermark_generation == _session_state.watermark_generation(int(group_id)):
+                _session_state.advance_watermark(int(group_id), history_watermark)
 
     _real_conversation_keys[stable_conversation_key] = real_conversation_key
     _session_state.register_session(stable_conversation_key, result.session_id)
@@ -5997,10 +6077,85 @@ async def _submit_or_preempt_inbound(
             },
         )
         _session_state.register_trigger(trigger)
+    if _features.available:
+        _features.burst_store.remove(stable_conversation_key, platform_updates.get("_route_hints", {}).get("source_message_refs", []))
     return True
 
 
+def _queue_merge_identity(item: QueuedInbound) -> tuple[Any, ...] | None:
+    user_id = str(getattr(item.event, "user_id", "") or "")
+    if not user_id or _anonymous_identity(item.event):
+        return None
+    sender = getattr(item.event, "sender", None)
+    role = sender.get("role", "") if isinstance(sender, dict) else getattr(sender, "role", "")
+    return (
+        item.real_conversation_key, item.channel, item.is_dm, item.entry_node_id,
+        str(getattr(item.bot, "self_id", "") or ""), user_id, role,
+        _is_admin_user(user_id), tuple(_grant_of(cap.key) for cap in capability.CAPABILITIES),
+        item.platform_updates.get("_route_hints", {}).get("topic_id", ""),
+    )
+
+
+def _merge_queued_inbound(existing: QueuedInbound, item: QueuedInbound) -> None:
+    previous_hints = dict(existing.platform_updates.get("_route_hints") or {})
+    direct_response = "direct" in {existing.platform_updates.get("_response_purpose", "direct"), item.platform_updates.get("_response_purpose", "direct")}
+    correction = re.match(r"^(?:更正|纠正|刚才(?:说|写)错|不对[,，]|不是.+[，,])", item.user_text.strip())
+    heading = "同一用户更正此前输入，以这条更正为准；已完成的外部操作不能据此假定已撤销" if correction else "排队期间追加消息"
+    existing.text = f"{existing.text}\n\n【{heading}】\n{item.text}"
+    existing.history_watermark = max(existing.history_watermark, item.history_watermark)
+    existing.direct_interaction = existing.direct_interaction or item.direct_interaction
+    existing.attachments.extend(item.attachments)
+    existing.memory_user_ids = tuple(dict.fromkeys((*existing.memory_user_ids, *item.memory_user_ids)))
+    source_refs = list(dict.fromkeys([
+        *existing.platform_updates.get("_route_hints", {}).get("source_message_refs", []),
+        *item.platform_updates.get("_route_hints", {}).get("source_message_refs", []),
+    ]))
+    existing.event = item.event
+    existing.platform_updates = dict(item.platform_updates)
+    existing.platform_updates["_source_attachments"] = source_attachments_from_merged(existing.attachments)
+    if source_refs:
+        existing.platform_updates.setdefault("_route_hints", {})["source_message_refs"] = source_refs
+    hints = existing.platform_updates.setdefault("_route_hints", {})
+    actions = {previous_hints.get("response_action", "reply"), hints.get("response_action", "reply")}
+    hints["response_action"] = "task" if "task" in actions else "reply" if "reply" in actions else "short_reply"
+    existing.platform_updates["_response_purpose"] = "direct" if direct_response else "ambient"
+    hints["delivery_purpose"] = existing.platform_updates["_response_purpose"]
+    existing.user_text = f"{existing.user_text}\n{item.user_text}"
+    if _features.available and source_refs:
+        _features.stage_burst(existing)
+
+
 async def _enqueue_or_submit_inbound(item: QueuedInbound) -> bool:
+    if not _features.available:
+        return await _queue_or_submit_ready(item)
+    metadata = await _features.prepare(item.bot, item.event)
+    if not metadata:
+        return await _queue_or_submit_ready(item)
+    topic = metadata.get("topic", {})
+    topic_id = topic.get("topic_id", "")
+    if topic_id and item.is_dm:
+        context = "\n".join(f"[{line['ref']}] {line['label']}: {line['text']}" for line in topic.get("context", []))
+        item.text += f"\n\n【当前话题 {topic_id}】\n{context}"
+    item.platform_updates["_route_hints"] = {
+        "topic_id": topic_id, "response_action": metadata.get("action", "reply"),
+        "source_message_refs": [str(getattr(item.event, "message_id", ""))],
+        "reply_message_id": str(getattr(item.event, "message_id", "")),
+    }
+    item.platform_updates["_response_purpose"] = "direct" if metadata.get("direct") else "ambient"
+    item.platform_updates["_feature_actor"] = metadata["actor"]
+    item.platform_updates["_route_hints"]["delivery_purpose"] = item.platform_updates["_response_purpose"]
+    message = item.event.get_message() if hasattr(item.event, "get_message") else []
+    item.memory_user_ids = tuple(dict.fromkeys((*item.memory_user_ids, *at_segment_user_ids(message))))
+    identity = _queue_merge_identity(item)
+    if identity:
+        identity += (topic_id,)
+    if metadata["policy"].get("settings", {}).get("merge_window_sec", 0) > 0:
+        _features.stage_burst(item)
+    return await _features.coordinator.submit(item, metadata["policy"].get("settings", {}), identity,
+                                               _queue_or_submit_ready, _merge_queued_inbound)
+
+
+async def _queue_or_submit_ready(item: QueuedInbound) -> bool:
     if not live.enable_queue:
         return await _submit_or_preempt_inbound(
             bot=item.bot,
@@ -6016,27 +6171,16 @@ async def _enqueue_or_submit_inbound(item: QueuedInbound) -> bool:
             entry_node_id=item.entry_node_id,
             history_watermark=item.history_watermark,
             direct_interaction=item.direct_interaction,
+            memory_user_ids=item.memory_user_ids,
         )
 
     async with _qq_queue_condition:
+        item.merge_identity = _queue_merge_identity(item)
+        message = item.event.get_message() if hasattr(item.event, "get_message") else []
+        item.memory_user_ids = tuple(dict.fromkeys((*item.memory_user_ids, *at_segment_user_ids(message))))
         existing = _qq_queue_by_key.get(item.stable_conversation_key)
-        # 入口节点不同的两条不能并成一轮：合并会把 /生图 选定的节点吃掉。
-        if existing is not None and existing.entry_node_id == item.entry_node_id:
-            existing.text = f"{existing.text}\n\n【排队期间追加消息】\n{item.text}"
-            # 合并后的文本包含两条各自的历史块，水位取两者较高的那个。
-            existing.history_watermark = max(existing.history_watermark, item.history_watermark)
-            # 排队期间只要有一条是主动找 bot，合并后的这一轮就算主动。
-            existing.direct_interaction = existing.direct_interaction or item.direct_interaction
-            existing.attachments.extend(item.attachments)
-            existing.event = item.event
-            existing.platform_updates = dict(item.platform_updates)
-            # The merged task uses all accumulated attachments, so its eventual
-            # Bot text reply must bind all of those same source images rather than
-            # only the last queued message's list.
-            existing.platform_updates["_source_attachments"] = source_attachments_from_merged(
-                existing.attachments
-            )
-            existing.user_text = item.user_text
+        if existing is not None and item.merge_identity is not None and existing.merge_identity == item.merge_identity:
+            _merge_queued_inbound(existing, item)
         else:
             _qq_queue.append(item)
             _qq_queue_by_key[item.stable_conversation_key] = item
@@ -6068,21 +6212,28 @@ async def _qq_queue_worker_forever(worker_index: int) -> None:
             while True:
                 if _queue_worker_should_exit(worker_index):
                     return
-                if _qq_queue:
+                index = next(
+                    (index for index, queued in enumerate(_qq_queue)
+                     if queued.stable_conversation_key not in _qq_active_conversations),
+                    None,
+                )
+                if index is not None:
                     break
                 await _qq_queue_condition.wait()
-            item = _qq_queue.popleft()
+            item = _qq_queue[index]
+            del _qq_queue[index]
+            _qq_active_conversations.add(item.stable_conversation_key)
             # 只删指向本件的合并槽：同会话已允许存在多件时，别把指向后来那件的槽误删。
             if _qq_queue_by_key.get(item.stable_conversation_key) is item:
                 _qq_queue_by_key.pop(item.stable_conversation_key, None)
 
         with pinned_live_config():
-            reply_event: Optional[asyncio.Event] = None
+            reply_waiter: QueueReplyWaiter | None = None
             if live.queue_wait_for_reply:
-                reply_event = asyncio.Event()
-                _qq_waiting_replies[item.stable_conversation_key] = reply_event
+                reply_waiter = QueueReplyWaiter(asyncio.Event())
+                _qq_waiting_replies[item.stable_conversation_key] = reply_waiter
             try:
-                await _submit_or_preempt_inbound(
+                accepted = await _submit_or_preempt_inbound(
                     bot=item.bot,
                     event=item.event,
                     channel=item.channel,
@@ -6096,10 +6247,11 @@ async def _qq_queue_worker_forever(worker_index: int) -> None:
                     entry_node_id=item.entry_node_id,
                     history_watermark=item.history_watermark,
                     direct_interaction=item.direct_interaction,
+                    memory_user_ids=item.memory_user_ids,
                 )
-                if reply_event is not None:
+                if accepted and reply_waiter is not None and reply_waiter.inbound_seq > 0:
                     try:
-                        await asyncio.wait_for(reply_event.wait(), timeout=live.queue_reply_timeout)
+                        await asyncio.wait_for(reply_waiter.event.wait(), timeout=live.queue_reply_timeout)
                     except asyncio.TimeoutError:
                         logger.warning("QQ queue reply wait timed out conversation=%s timeout=%ss", item.real_conversation_key, live.queue_reply_timeout)
             except asyncio.CancelledError:
@@ -6107,8 +6259,11 @@ async def _qq_queue_worker_forever(worker_index: int) -> None:
             except Exception:
                 logger.exception("failed to process QQ queue item conversation=%s", item.real_conversation_key)
             finally:
-                if reply_event is not None:
-                    _qq_waiting_replies.pop(item.stable_conversation_key, None)
+                async with _qq_queue_condition:
+                    if _qq_waiting_replies.get(item.stable_conversation_key) is reply_waiter:
+                        _qq_waiting_replies.pop(item.stable_conversation_key, None)
+                    _qq_active_conversations.discard(item.stable_conversation_key)
+                    _qq_queue_condition.notify_all()
             interval = live.queue_interval
         if interval > 0:
             await asyncio.sleep(interval)
@@ -6166,6 +6321,8 @@ def _target_from_platform_data(platform_data: Dict[str, Any]) -> Optional[Dict[s
     conversation_key = str(platform_data.get("conversation_key") or "")
     if target_type == "private" and platform_data.get("user_id") is not None:
         t: Dict[str, Any] = {"type": "private", "user_id": int(platform_data["user_id"])}
+        if "_feature_actor" in platform_data:
+            t["_feature_actor"] = platform_data["_feature_actor"]
         if conversation_key:
             t["conversation_key"] = conversation_key
         if msg_id is not None:
@@ -6173,6 +6330,10 @@ def _target_from_platform_data(platform_data: Dict[str, Any]) -> Optional[Dict[s
         return t
     if target_type == "group" and platform_data.get("group_id") is not None:
         t = {"type": "group", "group_id": int(platform_data["group_id"])}
+        if "_response_purpose" in platform_data:
+            t["_response_purpose"] = platform_data["_response_purpose"]
+        if "_feature_actor" in platform_data:
+            t["_feature_actor"] = platform_data["_feature_actor"]
         if conversation_key:
             t["conversation_key"] = conversation_key
         if msg_id is not None:
@@ -6238,11 +6399,24 @@ def _message_from_processed_segments(segments: List[Dict[str, Any]]) -> Message:
     return Message(message_segments)
 
 
-def _mark_qq_reply_finished(conversation_key: str) -> None:
-    for key in {conversation_key, _real_conversation_key(conversation_key)}:
-        event = _qq_waiting_replies.get(key)
-        if event is not None:
-            event.set()
+def _bind_qq_reply_waiter(conversation_key: str, inbound_seq: int) -> None:
+    waiter = _qq_waiting_replies.get(conversation_key)
+    if waiter is not None and inbound_seq > 0:
+        waiter.inbound_seq = inbound_seq
+        if inbound_seq in _qq_completed_replies:
+            waiter.event.set()
+
+
+def _mark_qq_reply_finished(inbound_seq: int) -> None:
+    if inbound_seq <= 0:
+        return
+    _qq_completed_replies[inbound_seq] = None
+    _qq_completed_replies.move_to_end(inbound_seq)
+    while len(_qq_completed_replies) > 512:
+        _qq_completed_replies.popitem(last=False)
+    for waiter in _qq_waiting_replies.values():
+        if waiter.inbound_seq == inbound_seq:
+            waiter.event.set()
 
 
 def _message_dedup_text(message: Any) -> str:
@@ -6470,6 +6644,7 @@ async def _send_qq_message_once(
     bot: Bot, target: Dict[str, Any], message: Any, *, idempotency_key: str = "",
 ) -> str:
     """执行一次 OneBot 发送；失败后最多再物理发一次，且只在确认没发出时才发。"""
+    await _features.check_send(bot, target)
     sender: Callable[[Any], Awaitable[Any]]
     if target.get("type") == "private":
         user_id = target.get("user_id")
@@ -6493,7 +6668,9 @@ async def _send_qq_message_once(
     else:
         raise OneBotSendContractError(f"unknown QQ target type: {target!r}")
     try:
-        return _extract_sent_message_id(await sender(outbound))
+        message_id = _extract_sent_message_id(await sender(outbound))
+        await _features.record_outbound(bot, target, outbound, message_id)
+        return message_id
     except ActionFailed as exc:
         at_as_text = (
             _strip_at_to_text(outbound, target.get("group_id"))
@@ -6512,7 +6689,9 @@ async def _send_qq_message_once(
                 "send_error": str(exc),
             },
         )
-        return _extract_sent_message_id(await sender(resend_message))
+        message_id = _extract_sent_message_id(await sender(resend_message))
+        await _features.record_outbound(bot, target, resend_message, message_id)
+        return message_id
 
 
 def _send_audit_fields(
@@ -6591,7 +6770,9 @@ async def _send_qq_message(
     )
     if not claim.acquired:
         logger.info("onebot_send_duplicate", extra={**fields, "claim_state": claim.state})
-        return f"idempotent:{key}"
+        platform_message_id = await _outbound_idempotency.sent_message_id(key)
+        await _features.bind_reminder_message(bot, target, context, platform_message_id)
+        return platform_message_id or f"idempotent:{key}"
     logger.info("onebot_send_started", extra=fields)
     heartbeat = asyncio.create_task(_heartbeat_idempotency_claim(claim))
     try:
@@ -6612,6 +6793,7 @@ async def _send_qq_message(
                 attempt=attempt, idempotency_key=key,
             ),
         )
+        await _features.bind_reminder_message(bot, target, context, platform_message_id)
         return platform_message_id
     finally:
         heartbeat.cancel()
@@ -6630,6 +6812,7 @@ async def _send_split_text(
     """按 [SPLIT] 拆分文本，并把每段回复绑定到本轮来源图片。"""
     # 2026-05-01 修改原因：文本拆分逻辑对群聊和私聊相同，实际发送交给
     # _send_qq_message 处理，确保私聊也能复用表情替换和分段发送能力。
+    await _features.check_send(bot, target)
     sent_any = False
     parts = text.split(_SPLIT_SIGNAL) if text else []
     conversation_token = _sticker_send_conversation.set(_sticker_conversation_key(target))
@@ -6750,6 +6933,7 @@ async def _send_attachment_path(
     send_context: OutboundSendContext | None = None,
 ) -> str:
     """Send one attachment under one persistent logical owner claim."""
+    await _features.check_send(bot, target)
     display_name = filename or path.name
     if not path.exists():
         raise OneBotSendContractError(f"attachment does not exist: {path}")
@@ -6794,6 +6978,8 @@ async def _send_attachment_path(
                             bot, target, message, idempotency_key=key,
                         )
                     except Exception as exc:
+                        if getattr(exc, "deferred", False):
+                            raise
                         classified = classify_send_exception(exc)
                         if classified.ambiguous_ack:
                             raise classified from exc
@@ -6848,6 +7034,7 @@ async def _send_attachment_path(
         file_str = "base64://" + base64.b64encode(raw_bytes).decode("ascii")
 
         async def upload_file() -> Any:
+            await _features.check_send(bot, target)
             if target.get("type") == "group" and target.get("group_id") is not None:
                 return await bot.call_api(
                     "upload_group_file", group_id=target["group_id"],
@@ -6965,6 +7152,7 @@ async def _try_send_images_as_forward(
         call_timeout = min(240.0, max(60.0, len(nodes) * 45.0))
 
         async def send_forward() -> Any:
+            await _features.check_send(bot, target)
             if forward_type == "group":
                 return await bot.call_api(
                     "send_group_forward_msg", group_id=forward_id, messages=nodes, _timeout=call_timeout,
@@ -7089,6 +7277,8 @@ async def _send_attachments_one_by_one(
                 send_context=send_context,
             )
         except Exception as exc:  # noqa: BLE001
+            if getattr(exc, "deferred", False):
+                raise
             classified = classify_send_exception(exc)
             failures.append(classified)
             logger.warning(
@@ -7310,12 +7500,10 @@ async def _send_attachments_confirmed(
             # 清空上下文之前派出去的那轮除外：图照发，但索引不该留在刚清空的会话里。
             if not _is_stale_delivery(target.get("group_id"), send_context):
                 _record_sent_attachments(_ensure_bucket_target(dict(target)), attachments)
+            await _features.register_sent_attachments(bot, target, attachments, send_context)
     except Exception:
         logger.warning("onebot_attachment_batch_failed", exc_info=True)
         raise
-    conv_key = target.get("conversation_key")
-    if conv_key:
-        _mark_qq_reply_finished(str(conv_key))
 
 
 async def _send_text_and_attachments(
@@ -7328,7 +7516,7 @@ async def _send_text_and_attachments(
     send_context: OutboundSendContext | None = None,
 ) -> None:
     """统一发送最终文本/附件，并持久绑定回复所依据的来源图片。"""
-    conv_key = target.get("conversation_key")
+    await _features.check_send(bot, target)
     # 上下文被清空时这一轮还在飞，回复照发（群友问了总得有个答复），但一律不落缓存 ——
     # 它是上一段上下文的产物，落回去下一轮又会被带给模型，等于那次清空没生效。
     stale = target.get("type") == "group" and _is_stale_delivery(target.get("group_id"), send_context)
@@ -7355,8 +7543,6 @@ async def _send_text_and_attachments(
             bot, target, attachments, send_context=send_context
         )
         return
-    if conv_key:
-        _mark_qq_reply_finished(str(conv_key))
 
 
 async def _set_message_react(bot: Bot, event: Any, emoji_id: str, enabled: bool) -> bool:
@@ -7367,6 +7553,10 @@ async def _set_message_react(bot: Bot, event: Any, emoji_id: str, enabled: bool)
     if not live.enable_reactions or not bot or not event or not hasattr(event, "message_id"):
         return False
     try:
+        if enabled and getattr(event, "group_id", None) is not None:
+            metadata = await _features.prepare(bot, event)
+            await _features.check_send(bot, {"type": "group", "group_id": event.group_id,
+                                            "_response_purpose": "direct" if metadata.get("direct") else "ambient"})
         await bot.call_api(
             "set_msg_emoji_like",
             message_id=int(event.message_id),
@@ -7429,6 +7619,17 @@ async def _maybe_send_search_progress_notice(
     except Exception:
         logger.debug("send QQ search still-running notice failed", exc_info=True)
 
+def _apply_delivery_context(target: Dict[str, Any], context: OutboundSendContext) -> None:
+    purpose = getattr(context, "purpose", "direct")
+    if purpose == "ambient" or "_response_purpose" not in target:
+        target["_response_purpose"] = purpose
+    reply_ref = str(getattr(context, "reply_message_id", "") or "")
+    if reply_ref and reply_ref.lstrip("-").isdigit():
+        target["reply_message_id"] = int(reply_ref)
+    if getattr(context, "topic_id", ""):
+        target["_topic_id"] = context.topic_id
+
+
 class TangQiuCallbacks:
     """Clonoth SDK 的 QQ 平台回调实现。
 
@@ -7464,6 +7665,8 @@ class TangQiuCallbacks:
             main_state=main_state,
             platform_data=callback_data.get("platform_data"),
         )
+        _apply_delivery_context(target, send_context)
+        await _features.check_send(bot, target)
         # 提取 [REACT:ID] 标记
         final_text = text or ""
         if final_text:
@@ -7482,6 +7685,7 @@ class TangQiuCallbacks:
             source_attachments=source_attachments,
             send_context=send_context,
         )
+        _mark_qq_reply_finished(trigger.inbound_seq)
 
     async def send_reply_attachment(self, session_id: str, path: str, *args: Any, **kwargs: Any) -> None:
         """兼容旧式 session_id 附件回调；当前 SDK 通常把附件放在 send_reply 中。"""
@@ -7523,6 +7727,8 @@ class TangQiuCallbacks:
             trigger=trigger,
             platform_data=callback_data.get("platform_data"),
         )
+        _apply_delivery_context(target, send_context)
+        await _features.check_send(bot, target)
         # 提取 [REACT:ID] 标记
         from .emoji_handler import _extract_reactions
         text, reactions = _extract_reactions(text)
@@ -7532,16 +7738,13 @@ class TangQiuCallbacks:
             source_attachments = platform_data.get("_source_attachments")
             if not isinstance(source_attachments, list):
                 source_attachments = []
-            if await _send_split_text(
+            await _send_split_text(
                 bot,
                 target,
                 text,
                 source_attachments=source_attachments,
                 send_context=send_context,
-            ):
-                conv_key = target.get("conversation_key")
-                if conv_key:
-                    _mark_qq_reply_finished(str(conv_key))
+            )
 
     async def send_to_channel(
         self,
@@ -7550,10 +7753,11 @@ class TangQiuCallbacks:
         attachments: List[Dict[str, Any]],
         *,
         node_id: str = "",
+        is_final: bool = True,
         delivery_context: OutboundSendContext | None = None,
         **callback_data: Any,
     ) -> None:
-        """处理没有 trigger 的 fallback 最终输出。"""
+        """发送按会话路由的输出。"""
         target = _target_from_conversation_key(conversation_key)
         if target is None:
             raise OneBotSendContractError(
@@ -7575,6 +7779,7 @@ class TangQiuCallbacks:
             platform_data=callback_data.get("platform_data"),
             conversation_key=conversation_key,
         )
+        _apply_delivery_context(target, send_context)
         await _send_text_and_attachments(
             bot,
             target,
@@ -7582,12 +7787,14 @@ class TangQiuCallbacks:
             attachments or [],
             send_context=send_context,
         )
+        if is_final:
+            _mark_qq_reply_finished(send_context.source_inbound_seq)
 
     async def delete_status_message(self, trigger: TriggerInfo) -> None:
         return None
 
     async def edit_status_message(self, trigger: TriggerInfo, content: str) -> None:
-        return None
+        _mark_qq_reply_finished(trigger.inbound_seq)
 
     async def update_progress(self, trigger: TriggerInfo, state: MainTaskState) -> None:
         """根据主任务进度切换触发消息上的 React 表情。"""
@@ -7758,6 +7965,8 @@ class TangQiuCallbacks:
 
     async def on_context_reset(self, conversation_key: str, reason: str, cleaned_triggers: List[TriggerInfo]) -> None:
         """上下文重置时同步清理 QQ 侧的上下文副本并重置高水位。"""
+        for trigger in cleaned_triggers:
+            _mark_qq_reply_finished(trigger.inbound_seq)
         target = _target_from_conversation_key(conversation_key)
         if not target:
             return
@@ -9019,6 +9228,7 @@ async def _startup() -> None:
     _publish_live_state(force=True)
     _live_reconcile_task = asyncio.create_task(_live_config_reconcile_forever())
     _attachment_cleanup_task = asyncio.create_task(_attachment_cleanup_forever())
+    _features.poll_task = asyncio.create_task(_features.poll())
     logger.info("Clonoth Agent QQ adapter started: %s", CLONOTH_BASE_URL)
 
 
@@ -9033,6 +9243,11 @@ async def _on_bot_connect(bot: Bot) -> None:
 async def _shutdown() -> None:
     """NoneBot 关闭时停止事件路由并释放 HTTP 连接。"""
     global _client, _event_router, _router_task, _callbacks, _anon_map_save_task, _live_reconcile_task, _attachment_cleanup_task
+    if _features.poll_task is not None:
+        _features.poll_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _features.poll_task
+        _features.poll_task = None
     if _event_router is not None:
         _event_router.stop()
     if _router_task is not None:
@@ -9076,6 +9291,67 @@ async def _shutdown() -> None:
     logger.info("Clonoth Agent QQ adapter stopped")
 
 
+async def _feature_command_rule(bot: Bot, event: Event) -> bool:
+    group_id = getattr(event, "group_id", None)
+    if not hasattr(event, "get_message"):
+        return False
+    refresh_live_config()
+    if group_id is not None:
+        if not _is_group_allowed(int(group_id)):
+            return False
+    elif not _is_private_allowed(event):
+        return False
+    metadata = await _features.prepare(bot, event)
+    text = metadata.get("raw_text") or _message_to_text(event.get_message(), getattr(bot, "self_id", None))
+    head = text.strip().replace("／", "/", 1).split(maxsplit=1)
+    reply_ref = str(_extract_reply_message_id(event.get_message(), getattr(event, "raw_message", None)) or "")
+    return bool(await _features.matches_command(bot, event, text, reply_ref) or (head and head[0] in {"/帮助", "/help"}))
+
+
+_feature_matcher = on_message(rule=Rule(_feature_command_rule), priority=5, block=True)
+
+
+@_feature_matcher.handle()
+async def _handle_feature_command(bot: Bot, event: Event) -> None:
+    text = (await _event_text_with_forward(bot, event)).strip()
+    result = await _features.handle_command(bot, event, text)
+    if result is None:
+        result = {"text": _help_text(event), "attachments": []}
+    actor = _features.actor(bot, event)
+    if getattr(event, "group_id", None) is not None:
+        _record_group_message(event, bot, override_text=text)
+        target = {"type": "group", "group_id": event.group_id, "conversation_key": actor["scope"], "reply_message_id": event.message_id}
+    else:
+        target = {"type": "private", "user_id": event.user_id, "conversation_key": actor["scope"]}
+    target["_quiet_control"] = bool(result.get("control"))
+    target["_feature_actor"] = actor
+    context = _request_send_context("feature-command", actor["message_id"], actor["scope"])
+    if result.get("text"):
+        await _send_qq_message(bot, target, Message(MessageSegment.text(result["text"])), send_context=context)
+        if target["type"] == "group":
+            _record_bot_reply(target["group_id"], result["text"])
+    if result.get("attachments"):
+        await _send_attachments_confirmed(bot, target, result["attachments"], send_context=context)
+    await _feature_matcher.finish()
+
+
+_community_notice_matcher = on_notice(priority=90, block=False)
+
+
+@_community_notice_matcher.handle()
+async def _handle_community_notice(bot: Bot, event: Event) -> None:
+    if getattr(event, "notice_type", "") != "group_increase" or not _features.available:
+        return
+    group_id = int(getattr(event, "group_id", 0) or 0)
+    if not _is_group_allowed(group_id):
+        return
+    actor = _features.target_actor(bot, {"type": "group", "group_id": group_id})
+    await _client.request_feature("POST", "/v1/community/notices", actor=actor, body={
+        "notice_type": "group_increase", "member_id": str(getattr(event, "user_id", "")),
+        "timestamp": getattr(event, "time", time.time()), "display_name": _event_display_name(event),
+    })
+
+
 # 普通群消息记录器。priority 较低且 block=False，只负责维护上下文缓存。
 _history_matcher = on_message(rule=Rule(_allowed_group_rule), priority=99, block=False)
 
@@ -9107,8 +9383,12 @@ async def _record_non_trigger_message(bot: Bot, event: GroupMessageEvent) -> Non
             bot, event, stable_conversation_key, expand_forward=False,
         )
         _remember_recent_images(stable_conversation_key, event, attachments)
+        await _features.register_attachments(bot, event, attachments)
         _collect_stickers_from_event(event, attachments)
         _record_group_message(event, bot, override_text=expanded_text, attachments=attachments)
+        metadata = await _features.prepare(bot, event)
+        if _features.blocked(metadata) or metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled"):
+            return
         await _maybe_echo_group_message(bot, event, expanded_text)
         await _maybe_join_sticker_combat(
             bot, event,
@@ -9193,7 +9473,7 @@ async def _maybe_echo_group_message(bot: Bot, event: GroupMessageEvent, text: st
     # 所以文本直接原样回发 —— 拿指纹反解会把「[QQ表情:捂脸]」当字面量发出去。
     outgoing = Message(MessageSegment.image(hit[4:])) if hit.startswith("img:") else message
     try:
-        await bot.send_group_msg(group_id=group_id, message=outgoing)
+        await _send_qq_message(bot, {"type": "group", "group_id": group_id, "_response_purpose": "ambient"}, outgoing)
     except Exception:
         # 跟读失败无所谓，不值得惊动用户，更不该把异常抛回 matcher 链。
         logger.debug("echo send failed for group %s", group_id, exc_info=True)
@@ -9272,9 +9552,27 @@ async def _finish_local_command(
     本地命令不经 engine，也已经被 agent matcher block 掉了 priority=99 的历史 matcher：
     不在这里记，整段交互在群历史里就消失，后面的对话看不到「刚才有人改过模型」。
     """
+    await _check_local_group_send(bot, event)
     _record_group_message(event, bot, override_text=user_text, attachments=attachments)
     _record_bot_reply(int(event.group_id), reply)
     await matcher.finish(reply)
+
+
+async def _check_local_group_send(bot: Bot, event: GroupMessageEvent) -> None:
+    metadata = await _features.prepare(bot, event)
+    await _features.check_send(bot, {"type": "group", "group_id": event.group_id,
+                                    "_response_purpose": "direct" if metadata.get("direct", True) else "ambient"})
+
+
+def _coordinated_response_action(verdict: IntentVerdict, metadata: Dict[str, Any]) -> str:
+    if not verdict.decided:
+        return "task" if metadata.get("direct") else "ignore"
+    action = getattr(verdict, "action", "reply") if verdict.agreed else "ignore"
+    if action == "ignore" and metadata.get("direct"):
+        return "task"
+    if action == "react" and (not live.enable_reactions or getattr(verdict, "reaction_id", "") not in _REACT_MODEL_EMOJIS):
+        return "short_reply"
+    return action
 
 
 async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: Any) -> None:
@@ -9289,6 +9587,7 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
     _adopt_bot_scope(bot)
 
     if _client is None or _session_state is None:
+        await _check_local_group_send(bot, event)
         await matcher.finish("Clonoth Agent 尚未初始化，请稍后重试。")
 
     _remember_message_for_reply_context(event)
@@ -9299,11 +9598,31 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
     # 前缀判定必须在剥前缀之前做，否则 all 模式下所有人都会被当成主动找 bot。
     direct_interaction = _is_direct_bot_interaction(event, bot, raw_user_text)
     user_text = _strip_trigger_prefix(raw_user_text)
+    metadata = await _features.prepare(bot, event)
+    if metadata and _features.coordinator.can_continue(metadata["actor"], metadata.get("reply_ref", "")):
+        pending = _features.coordinator.bursts[metadata["actor"]["scope"]].item
+        metadata["direct"] = metadata.get("direct", False) or pending.platform_updates.get("_response_purpose") == "direct"
+        await _features.decision(bot, event, pending.platform_updates.get("_route_hints", {}).get("response_action", "task"), "同一用户正在补充当前请求")
+    if metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled") and not metadata.get("classified") and not user_text.startswith(("/", "／")):
+        verdict = await _judge_llm_intent(bot, event, user_text)
+        action = _coordinated_response_action(verdict, metadata)
+        if action != "ignore" and not _features.coordinator.allow_response(metadata["actor"]["scope"], metadata["policy"]["settings"], direct=metadata.get("direct", False)):
+            action = "ignore"
+        await _features.decision(bot, event, action, verdict.reason)
+        if action == "react" and getattr(verdict, "reaction_id", "") in _REACT_MODEL_EMOJIS:
+            if await _set_message_react(bot, event, verdict.reaction_id, True):
+                _record_group_message(event, bot, override_text=user_text)
+                await matcher.finish()
+            await _features.decision(bot, event, "short_reply", "表态未送达，改为短答")
+        if action == "ignore":
+            await _record_non_trigger_message(bot, event)
+            await matcher.finish()
     if not _anonymous_identity(event):
         asyncio.create_task(_auto_like_user(bot, int(event.user_id)))
 
     attachments, attachment_errors = await _collect_qq_attachments(bot, event, stable_conversation_key)
     _remember_recent_images(stable_conversation_key, event, attachments)
+    await _features.register_attachments(bot, event, attachments)
     help_reply = await _maybe_handle_help_command(event=event, user_text=user_text)
     if help_reply is not None:
         await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=help_reply)
@@ -9360,6 +9679,7 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
     if draw_direct_prompt is not None:
         if attachments:
             attachments.clear()
+            await _check_local_group_send(bot, event)
             await matcher.send(_DRAW_REFERENCE_IMAGE_NOTICE)
         # 直达绘图不带群历史，水位保持不动，那些行留给下一条正常消息带出去。
         inbound_text, history_watermark = await _build_draw_direct_inbound_text(event, draw_direct_prompt, False), -1
@@ -9399,9 +9719,11 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
         ))
     except Exception as exc:
         logger.exception("submit inbound failed")
+        await _check_local_group_send(bot, event)
         await matcher.finish(f"无法连接到 Clonoth Agent：{exc}")
 
     if not ok:
+        await _check_local_group_send(bot, event)
         await matcher.finish("Clonoth Agent 未接受本次请求。")
     await matcher.finish()
 
@@ -9416,6 +9738,21 @@ async def _handle_intent(bot: Bot, event: GroupMessageEvent) -> None:
     """问一次模型再决定这条群消息要不要接。"""
     text = await _group_trigger_text(bot, event)
     verdict = await _judge_llm_intent(bot, event, text)
+    metadata = await _features.prepare(bot, event)
+    settings = metadata.get("policy", {}).get("settings", {})
+    if settings.get("response_policy_enabled"):
+        action = _coordinated_response_action(verdict, metadata)
+        if action != "ignore" and not _features.coordinator.allow_response(metadata["actor"]["scope"], settings, direct=metadata.get("direct", False)):
+            action = "ignore"
+        await _features.decision(bot, event, action, verdict.reason)
+        if action == "react":
+            if await _set_message_react(bot, event, verdict.reaction_id, True):
+                await _record_non_trigger_message(bot, event)
+                return
+            await _features.decision(bot, event, "short_reply", "表态未送达，改为短答")
+        if action == "ignore":
+            await _record_non_trigger_message(bot, event)
+            return
     inp = _trigger_input(event, bot, text)
     decision = resolve_llm_intent(
         inp, TriggerConfig.from_live(live), _trigger_cooldown,
@@ -9589,6 +9926,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     stable_conversation_key = _stable_conversation_key(real_conversation_key)
     attachments, attachment_errors = await _collect_qq_attachments(bot, event, stable_conversation_key)
     _remember_recent_images(stable_conversation_key, event, attachments)
+    await _features.register_attachments(bot, event, attachments)
     dream_reply = await _maybe_handle_dream_command(
         event=event, user_text=user_text, conversation_key=stable_conversation_key,
     )

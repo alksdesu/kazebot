@@ -252,6 +252,7 @@ class TwoPhaseIdempotencyStore:
 
     async def commit(
         self, claim: IdempotencyClaim, *, sent_ttl: float | None = None,
+        platform_message_id: str = "",
     ) -> None:
         if not claim.acquired:
             raise IdempotencyOwnershipError(claim.key)
@@ -261,8 +262,8 @@ class TwoPhaseIdempotencyStore:
                 now = self._clock()
                 ttl = self.sent_ttl if sent_ttl is None else max(1.0, sent_ttl)
                 cursor = self._db.execute(
-                    "UPDATE claims SET state='sent',updated=?,owner='',lease_until=0,retention_until=? WHERE key=? AND state='pending' AND owner=?",
-                    (now, now + ttl, claim.key, claim.owner),
+                    "UPDATE claims SET state='sent',updated=?,owner='',lease_until=0,retention_until=?,platform_message_id=? WHERE key=? AND state='pending' AND owner=?",
+                    (now, now + ttl, str(platform_message_id or ""), claim.key, claim.owner),
                 )
                 if cursor.rowcount != 1:
                     raise IdempotencyOwnershipError(claim.key)
@@ -271,6 +272,11 @@ class TwoPhaseIdempotencyStore:
             except Exception:
                 self._db.execute("ROLLBACK")
                 raise
+
+    async def sent_message_id(self, key: str) -> str:
+        async with self._lock:
+            row = self._db.execute("SELECT platform_message_id FROM claims WHERE key=? AND state='sent'", (key,)).fetchone()
+            return str(row[0] or "") if row else ""
 
     async def mark_ambiguous(
         self,
@@ -437,7 +443,7 @@ async def protected_claim_send(
 
         platform_message_id = message_id_getter(result)
         try:
-            await store.commit(claim, sent_ttl=sent_ttl)
+            await store.commit(claim, sent_ttl=sent_ttl, platform_message_id=platform_message_id)
         except asyncio.CancelledError as exc:
             await asyncio.shield(store.mark_ambiguous(
                 claim, platform_message_id=platform_message_id, error=exc,

@@ -65,6 +65,9 @@ class RunContext:
         return self.current_llm_request_id
 
     async def emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        from .conversation_routing import routing_meta
+        for key, value in routing_meta(self.task_context).items():
+            payload.setdefault(key, value)
         if self.source_inbound_seq is not None:
             payload.setdefault("source_inbound_seq", self.source_inbound_seq)
         if self.current_llm_request_id:

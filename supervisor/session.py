@@ -730,6 +730,7 @@ class SessionMixin:
         action_type: str | None = None,
         llm_request_id: str | None = None,
         delivery_id: str | None = None,
+        route_hints: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         text_clean = str(text or "").strip()
         # [Fix] 当 source_inbound_seq 存在时，允许空文本通过。
@@ -799,6 +800,10 @@ class SessionMixin:
                     return {"ok": True, "deduped": True, "route": existing}
 
             payload: dict[str, Any] = {"text": text_clean}
+            if isinstance(route_hints, dict):
+                for key in ("delivery_purpose", "topic_id", "response_action", "reply_message_id", "source_message_refs"):
+                    if key in route_hints:
+                        payload[key] = route_hints[key]
             if delivery_key:
                 payload["delivery_id"] = delivery_key
             if attachments:
@@ -921,6 +926,9 @@ class SessionMixin:
                 return {"ok": False, "error": f"session not found: {old_session_id}"}
             conversation_key = info.conversation_key
             session_ids = self._session_tree_locked(old_session_id, conversation_key)
+            community = getattr(self, "community", None)
+            if community is not None and self.conversation_map.get(conversation_key) == old_session_id:
+                community.clear_context(conversation_key)
             self._session_store.on_session_reset(old_session_id)
             now = _now()
             for sid in session_ids:

@@ -36,6 +36,9 @@ class IntentVerdict:
     error: str = ""
     decided: bool = False
     task_id: str = ""
+    action: str = "reply"
+    reaction_id: str = ""
+    topic_ref: str = ""
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,10 @@ class DeliveryContext:
     idempotency_key: str = ""
     replay_generation: int = 0
     force_replay: bool = False
+    purpose: str = "direct"
+    feature_delivery_id: str = ""
+    topic_id: str = ""
+    reply_message_id: str = ""
 
     def child(self, identity: str) -> "DeliveryContext":
         """Derive a stable logical-message context without mutating the parent."""

@@ -484,7 +484,7 @@ def test_real_pending_owner_waits_and_forward_batch_is_claimed(
         assert not second.done()
         gate.set()
         assert await first == "9"
-        assert (await second).startswith("idempotent:")
+        assert await second == "9"
 
     asyncio.run(owner_conflict())
     assert bot.send_count == 1

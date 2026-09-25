@@ -224,7 +224,8 @@ def create_app(
     host: str = "127.0.0.1",
     port: int = 8765,
 ) -> FastAPI:
-    app = FastAPI(title="Clonoth Supervisor", version="0.1.0")
+    from .features import feature_lifespan, register_features
+    app = FastAPI(title="Clonoth Supervisor", version="0.1.0", lifespan=feature_lifespan)
     app.state.state = state
     app.state.process_manager = process_manager
     app.state.config_store = config_store
@@ -2437,4 +2438,5 @@ def create_app(
 
     init_admin_token(state.workspace_root, console_url=console_url)
 
+    register_features(app, state, process_manager, config_store)
     return app

@@ -4,6 +4,8 @@
 // panel component. Purpose: the settings sidebar, host, and right panel all resolve
 // pages from the same data source.
 import { type ComponentType } from 'react';
+import { CommunityPage } from '../../features/community/CommunityPage';
+import { ConversationSettings } from '../../features/community/ConversationSettings';
 
 import { QQ_PAGES, wrapQqPage } from '../../console/pages';
 import { ClientSettingsPage } from './pages/ClientSettingsPage';
@@ -56,6 +58,8 @@ export interface SettingsTabDefinition {
 }
 
 const CORE_TABS = [
+  { id: 'qq-community', label: '群协作', icon: 'groups', group: 'qq', order: 23.1, Page: CommunityPage },
+  { id: 'qq-conversation', label: '会话与接话', icon: 'forum', group: 'qq', order: 22.1, Page: ConversationSettings },
   { id: 'general', label: '通用', icon: 'tune', group: 'basics', order: 0, Page: GeneralSettingsPage },
   // [2026-06-01] Register browser-only preferences as a first-class settings tab.
   // Why: auto-approval and render defaults are local frontend choices, not backend
