@@ -737,8 +737,8 @@ class ToolRegistry:
             # validating and storing builtin specs.
             self.register_builtin_tool(name, desc, schema, func)
 
-        from .builtins import community
-        for module in (community,):
+        from .builtins import community, materials
+        for module in (community, materials):
             module.register_tools(self)
 
     def reload(self) -> int:

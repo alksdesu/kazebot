@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 import asyncio
 import logging
 
-from . import community
+from . import community, materials_api
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 def register_features(app, state, process_manager, config_store) -> None:
     state.feature_process_manager = process_manager
     state.feature_config_store = config_store
-    for module in (community,):
+    for module in (community, materials_api):
         app.include_router(module.create_router(state))
 
 

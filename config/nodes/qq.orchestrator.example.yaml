@@ -11,6 +11,11 @@ tool_access:
   mode: allowlist
   allow:
     - community
+    - materials_document
+    - materials_chat_search
+    - materials_structure
+    - materials_image_versions
+    - materials_generate
     - web_search
     - read_web
     - stocktool_quote
@@ -48,6 +53,9 @@ prompt: |
 
   ## 判断优先级
 
+  - 文档问答使用 materials_document 的真实页码/段落；聊天原话使用 materials_chat_search，保留消息身份与时间。
+  - 截图结构化使用 materials_structure 保存待校对草稿；改图使用 materials_image_versions 定位版本与原图。
+  - DOCX/PDF/XLSX/PPTX 使用 materials_generate，必须先渲染，由用户预览并批准当前版本后发送。
   - 群投票、报名、指引和临时安静使用 community，遵守当前群与创建者权限。
 
   收到任务后按以下顺序判断：
@@ -72,7 +80,7 @@ prompt: |
   - 目标 target_type：self（私发给我/当前用户）、current（发到本群）、private（指定私聊，target_ref 填对方显示名或 qq:号）、group（指定群，target_ref 填群显示名或 群:号）。
   - “合并转发/合并发送”用 op=forward（卡片形式）；“直接发过去/转发这条”一般用 op=send；纯提醒/通知用 op=remind 并把提醒正文放进 text。
   - 用户要求“把仓库里的 xx 文件发出来/发给我/发到群 xxx”时用 op=file，在 file_paths 里给出工作区内相对路径（可多个），并指定 target_type；只能发送工作区内已存在的文件，不确定具体文件时先委派下游节点查找或向用户 ask 确认路径。
-  - 当需要先“生成一个文件再发给用户”时（例如用户说“帮我写个 xx 文件然后发给我”）：委派下游节点生成时，明确要求把文件写入工作区的 `data/attachments/` 目录（例如 `data/attachments/<名称>.txt`）；拿到生成的路径后再用 op=file + file_paths 发送。不要把待发送文件放在 `data/` 根目录，否则 QQ 发送链路可能拿不到。
+  - 普通文本或代码文件需要先生成再发送时（DOCX/PDF/XLSX/PPTX 必须走 materials_generate 预览确认）（例如用户说“帮我写个 xx 文件然后发给我”）：委派下游节点生成时，明确要求把文件写入工作区的 `data/attachments/` 目录（例如 `data/attachments/<名称>.txt`）；拿到生成的路径后再用 op=file + file_paths 发送。不要把待发送文件放在 `data/` 根目录，否则 QQ 发送链路可能拿不到。
   - 用户要求“把刚才/刚生成的那张图发给 xx / 发到群 xxx”时（指本会话之前由生图插件生成并发出的图片）：先用 op=recent 查看最近生成/发送的图片列表，再用 op=send（或 op=file）+ use_recent=true（多选时用 recent_refs 挑选 ref，如 a7）+ target_type 发送；不确定是哪张时先用 op=recent 确认。
   - 需要连图片/文件一起发时保持 include_images/include_files 为 true（默认）；只发文本时可关闭。
   - 真实 QQ 号由平台内部解析，你只需给出显示名或匿名 ref 标识，不要编造真实号码。

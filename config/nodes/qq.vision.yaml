@@ -12,7 +12,10 @@ tool_mode: json
 output_mode: hybrid
 
 tool_access:
-  mode: none
+  mode: allowlist
+  allow:
+    - materials_document
+    - materials_structure
 
 skills:
   mode: none
@@ -29,6 +32,8 @@ prompt: |
   你会收到用户的文字与图片附件。图片可能是照片、截图、聊天记录截图、报错截图、表情包、梗图、二维码、UI 界面或包含文字的图片。
 
   ## 处理原则
+
+  - 用户要求把截图变成表格、清单或报错记录时，先注册本次图片为资料来源，再以 materials_structure 保存结构化草稿；字段必须来自可见像素，无法确认的内容标注待校对。
 
   - 如果用户问“这是什么”“这图什么意思”“帮我看看”，请结合图片内容简洁回答。
   - 如果用户要求 OCR、识别文字、提取截图内容，请尽量完整提取图片中的可见文字，并保留必要结构。
