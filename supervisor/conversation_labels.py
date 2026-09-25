@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -79,20 +80,26 @@ def scoped_conversation_keys(workspace_root: Path) -> set[str] | None:
 def _label_for_stable(
     stable: str, real_map: dict[str, Any], anon: dict[str, Any], names: "_DisplayNames",
 ) -> dict[str, Any]:
-    real_key = str(real_map.get(stable) or "")
+    raw_key = real_map.get(stable)
+    real_key = raw_key if isinstance(raw_key, str) else ""
     kind = "group" if stable.startswith("qq_group:") else "private"
     real_id = real_key.split(":", 1)[1] if ":" in real_key else ""
     bucket = anon.get("groups" if kind == "group" else "users") or {}
-    alias = str((bucket.get(real_id) or {}).get("alias") or "") if isinstance(bucket, dict) else ""
+    entry = bucket.get(real_id) if isinstance(bucket, dict) else None
+    alias = str(entry.get("alias") or "") if isinstance(entry, dict) else ""
     # 别名是给模型脱敏用的，管理员看的应该是真名；拿不到真名才退回别名。
     display = names.group(real_id) if kind == "group" else names.user(alias)
-    fallback = alias or (f"群 {real_id}" if kind == "group" else f"私聊 {real_id}") or stable
+    fallback = alias or (
+        (f"群 {real_id}" if kind == "group" else f"私聊 {real_id}") if real_id
+        else ("群聊（名称暂不可用）" if kind == "group" else "私聊（名称暂不可用）")
+    )
     return {
         "kind": kind,
         "conversation_key": stable,
         "real_id": real_id,
         "alias": alias,
         "label": display or fallback,
+        "name_available": bool(display),
     }
 
 
@@ -108,11 +115,13 @@ class _DisplayNames:
         self._users = roster if isinstance(roster, dict) else {}
 
     def group(self, real_id: str) -> str:
-        return str(self._groups.get(str(real_id)) or "").strip()
+        name = self._groups.get(str(real_id))
+        return name.strip() if isinstance(name, str) else ""
 
     def user(self, alias: str) -> str:
         entry = self._users.get(str(alias)) if alias else None
-        return str((entry or {}).get("display_name") or "").strip() if isinstance(entry, dict) else ""
+        name = entry.get("display_name") if isinstance(entry, dict) else None
+        return name.strip() if isinstance(name, str) else ""
 
 
 def subject_label(workspace_root: Path, alias: str) -> str:
@@ -140,7 +149,9 @@ def _candidate_keys(workspace_root: Path, real_map: dict[str, Any]) -> set[str]:
     return keys
 
 
-def describe_namespaces(workspace_root: Path) -> dict[str, dict[str, Any]]:
+def describe_namespaces(
+    workspace_root: Path, *, conversation_keys: Iterable[str] = (),
+) -> dict[str, dict[str, Any]]:
     """namespace -> 归属描述。认不出来的目录不会出现在结果里。"""
     root = Path(workspace_root)
     real_map = _read_json(root / "data" / _ROUTE_STATE).get("real_conversation_keys") or {}
@@ -149,7 +160,8 @@ def describe_namespaces(workspace_root: Path) -> dict[str, dict[str, Any]]:
     names = _DisplayNames(root)
 
     described: dict[str, dict[str, Any]] = {}
-    for key in _candidate_keys(root, real_map):
+    keys = _candidate_keys(root, real_map) | {key for key in conversation_keys if isinstance(key, str) and key}
+    for key in keys:
         namespace = memory_namespace(key)
         if not namespace:
             continue

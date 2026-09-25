@@ -1,11 +1,11 @@
 // 长期记忆与会话上下文。这一页直接对文件动手，不走顶部那条 qq.yaml 状态条。
-import { Fragment, useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
 import {
   clearMemoryNamespace,
   deleteMemoryEntry,
   getConversationMessages,
-  getConversations,
   getMemoryEntries,
   getMemoryOverview,
   getQqScope,
@@ -20,6 +20,10 @@ import {
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Button, Check, Empty, Footnote, Input, Pager, Tag } from './components';
 import { sizeText } from './format';
+import { useConversationDirectory } from '../features/useConversationDirectory';
+import { useConversationNames } from '../features/useConversationNames';
+import { scopeIdentity } from '../features/conversationNames';
+import { useRequestScope } from '../features/asyncState';
 
 const EMPTY_DRAFT = { id: '', content: '', keywords: '', constant: false };
 
@@ -69,33 +73,53 @@ const MemoryBlock = () => {
   const [draft, setDraft] = useState(EMPTY_DRAFT);
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [overviewLoading, setOverviewLoading] = useState(true);
+  const [entriesScope, setEntriesScope] = useState('');
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
+  const entryVersion = useRef(0);
+  const confirmDiscard = useUnsavedChanges(JSON.stringify(draft) !== JSON.stringify(EMPTY_DRAFT), '记忆草稿尚未保存，确定切换来源或离开吗？');
   const [query, setQuery] = useState('');
   const [sourceOffset, setSourceOffset] = useState(0);
   const [entryOffset, setEntryOffset] = useState(0);
+  const namespaceNames = useConversationNames(namespaces.map(row => ({ scope: row.owner.conversation_key || row.namespace || row.key, owner: row.owner })));
+  const describedNamespaces = useMemo(() => namespaces.map(row => ({ ...row, owner: { ...row.owner, label: namespaceNames.get(scopeIdentity(row.owner.conversation_key || row.namespace || row.key))! } })), [namespaces, namespaceNames]);
 
   const loadOverview = async () => {
     if (!adminToken) return;
-    try { setNamespaces(await getMemoryOverview(adminToken)); } catch (error) { setNote(say(error)); }
+    setOverviewLoading(true);
+    try { setNamespaces(await getMemoryOverview(adminToken)); } catch (error) { setNote(say(error)); } finally { setOverviewLoading(false); }
   };
 
   const loadEntries = async (namespace: string) => {
+    const version = ++entryVersion.current;
     if (!adminToken || !namespace) { setEntries([]); return; }
-    try { setEntries(await getMemoryEntries(adminToken, namespace)); } catch (error) { setNote(say(error)); }
+    setLoading(true);
+    try {
+      const result = await getMemoryEntries(adminToken, namespace);
+      if (version !== entryVersion.current || selectedRef.current !== namespace) return;
+      setEntries(result); setEntriesScope(namespace);
+    } catch (error) {
+      if (version === entryVersion.current && selectedRef.current === namespace) setNote(say(error));
+    } finally {
+      if (version === entryVersion.current) setLoading(false);
+    }
   };
 
   useEffect(() => { void loadOverview(); }, [adminToken]);
-  useEffect(() => { void loadEntries(selected); setEntryOffset(0); }, [selected]);
+  useEffect(() => { setEntries([]); setEntriesScope(''); void loadEntries(selected); setEntryOffset(0); return () => { ++entryVersion.current; }; }, [selected, adminToken]);
 
   // 固定按「群组 / 人物 / 通用」排，拍平成一条序列再分页 —— 按组各自分页会在一栏
   // 里挂出三个分页器。组标题在每页按需重新出现，翻页不会丢掉这一项属于哪一档。
   const sources = useMemo(() => {
     const wanted = query.trim().toLowerCase();
     return BUCKETS
-      .flatMap((bucket) => namespaces
+      .flatMap((bucket) => describedNamespaces
         .filter((row) => bucketOf(row) === bucket)
         .map((row) => ({ bucket, row })))
       .filter(({ row }) => !wanted || row.owner.label.toLowerCase().includes(wanted));
-  }, [namespaces, query]);
+  }, [describedNamespaces, query]);
 
   useEffect(() => {
     if (sourceOffset > 0 && sourceOffset >= sources.length) {
@@ -110,12 +134,12 @@ const MemoryBlock = () => {
   }, [entries.length, entryOffset]);
 
   const pageSources = sources.slice(sourceOffset, sourceOffset + SOURCE_PAGE);
-  const pageEntries = entries.slice(entryOffset, entryOffset + ENTRY_PAGE);
-  const current = namespaces.find((row) => row.key === selected);
+  const pageEntries = entriesScope === selected ? entries.slice(entryOffset, entryOffset + ENTRY_PAGE) : [];
+  const current = describedNamespaces.find((row) => row.key === selected);
   const constantCount = entries.filter((entry) => entry.constant).length;
 
   const submit = async () => {
-    if (!adminToken || !selected) return;
+    if (!adminToken || !selected || busy || loading || entriesScope !== selected) return;
     setBusy(true);
     setNote('');
     try {
@@ -137,28 +161,31 @@ const MemoryBlock = () => {
   };
 
   const remove = async (entry: MemoryEntry) => {
-    if (!adminToken || !selected || !window.confirm(`删除「${entry.id}」？`)) return;
+    if (!adminToken || !selected || busy || loading || entriesScope !== selected || !window.confirm(`从「${current?.owner.label || '所选来源'}」删除「${entry.id}」？`)) return;
+    setBusy(true);
     try {
       await deleteMemoryEntry(adminToken, selected, entry.book, entry.id);
       await loadEntries(selected);
       await loadOverview();
-    } catch (error) { setNote(say(error)); }
+    } catch (error) { setNote(say(error)); } finally { setBusy(false); }
   };
 
   const clearAll = async () => {
-    if (!adminToken || !selected) return;
-    if (!window.confirm('清空这一份的全部记忆？不可恢复。')) return;
+    if (!adminToken || !selected || busy || loading || entriesScope !== selected) return;
+    if (!window.confirm(`清空「${current?.owner.label || '所选来源'}」的全部记忆？不可恢复。`)) return;
+    setBusy(true);
     try {
       const removed = await clearMemoryNamespace(adminToken, selected);
       setSelected('');
+      setDraft(EMPTY_DRAFT);
       await loadOverview();
       setNote(`已清空 ${removed} 条`);
-    } catch (error) { setNote(say(error)); }
+    } catch (error) { setNote(say(error)); } finally { setBusy(false); }
   };
 
   return (
     <Block hint="模型聊天时自己攒下来的。手动加的不会被自动清理" title="长期记忆">
-      {namespaces.length === 0 && <Empty>还没有任何记忆。</Empty>}
+      {overviewLoading ? <Empty>正在读取记忆来源…</Empty> : namespaces.length === 0 && <Empty>{note || '还没有任何记忆。'}</Empty>}
       <div className="grid grid-cols-1 items-start gap-3.5 md:grid-cols-[15rem_1fr]">
         <div className="flex flex-col gap-1">
           <Input
@@ -176,9 +203,10 @@ const MemoryBlock = () => {
                 <p className={`${BUCKET}${index === 0 ? ' mt-1.5' : ' mt-2.5'}`}>{bucket}</p>
               )}
               <button
+                disabled={busy}
                 aria-current={selected === row.key ? 'true' : undefined}
                 className="flex w-full items-baseline gap-2 border border-[var(--duties-border)] bg-[var(--duties-panel)] px-2.5 py-1.5 text-left text-xs hover:bg-[var(--duties-muted)] aria-[current=true]:border-[var(--duties-text)] aria-[current=true]:bg-[var(--duties-muted)]"
-                onClick={() => setSelected(row.key)}
+                onClick={() => { if (row.key !== selected && confirmDiscard()) { setEntries([]); setEntriesScope(''); setDraft(EMPTY_DRAFT); setNote(''); setSelected(row.key); } }}
                 type="button"
               >
                 <span className="min-w-0 flex-1 truncate">{row.owner.label}</span>
@@ -206,8 +234,9 @@ const MemoryBlock = () => {
                     <Tag className="ml-2" tone="live">其中 {constantCount} 条常驻</Tag>
                   )}
                 </span>
-                <Button onClick={clearAll}>清空</Button>
+                <Button disabled={busy || loading || entriesScope !== selected} onClick={clearAll}>清空</Button>
               </div>
+              {loading && <Empty>正在读取该来源的记忆…</Empty>}
               {pageEntries.map((entry) => (
                 <div
                   className={`${ENTRY}${entry.constant ? ` ${ENTRY_CONST}` : ''}`}
@@ -218,7 +247,7 @@ const MemoryBlock = () => {
                     {entry.constant && <Tag tone="live">常驻 · 每轮都注入</Tag>}
                     {entry.source === 'manual' && <Tag>手动</Tag>}
                     <span className="flex-1" />
-                    <Button onClick={() => void remove(entry)}>删除</Button>
+                    <Button disabled={busy || loading} onClick={() => void remove(entry)}>删除</Button>
                   </div>
                   <p className={TEXT}>{entry.content}</p>
                   {!!entry.keywords?.length && (
@@ -234,7 +263,7 @@ const MemoryBlock = () => {
                 unit="条"
               />
 
-              <div className={ADD}>
+              <fieldset disabled={busy || loading || entriesScope !== selected} className={ADD}>
                 <p className={BUCKET}>添加一条</p>
                 <label className={FIELD}>
                   <span className={LABEL}>标识</span>
@@ -277,7 +306,7 @@ const MemoryBlock = () => {
                 >
                   {busy ? '保存中' : '添加'}
                 </Button>
-              </div>
+              </fieldset>
             </>
           )}
         </div>
@@ -289,48 +318,60 @@ const MemoryBlock = () => {
 
 const ContextBlock = () => {
   const adminToken = useSettingsStore((state) => state.adminToken);
-  const [rows, setRows] = useState<ConversationRow[]>([]);
+  const { rows, error: directoryError, loading: directoryLoading, reload: load } = useConversationDirectory();
+  const identity = useRequestScope(adminToken || '');
+  const names = useConversationNames(rows.map(row => ({ scope: row.conversation_key || `session:${row.session_id}`, owner: row.owner, current_account: row.current_account })));
+  const labelFor = (row: ConversationRow) => names.get(scopeIdentity(row.conversation_key || `session:${row.session_id}`)) || '会话（名称暂不可用）';
   const [preview, setPreview] = useState<{ id: string; total: number; messages: Array<Record<string, any>> } | null>(null);
   const [note, setNote] = useState('');
   const [offset, setOffset] = useState(0);
+  const previewVersion = useRef(0);
+  const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(false);
 
-  const load = async () => {
-    if (!adminToken) return;
-    try { setRows(await getConversations(adminToken)); } catch (error) { setNote(say(error)); }
-  };
-
-  useEffect(() => { void load(); }, [adminToken]);
+  useEffect(() => () => { previewVersion.current += 1; }, [adminToken]);
 
   const open = async (row: ConversationRow) => {
-    if (!adminToken) return;
-    if (preview?.id === row.session_id) { setPreview(null); return; }
+    if (!adminToken || busy) return;
+    const version = ++previewVersion.current;
+    if (preview?.id === row.session_id) { setPreview(null); setLoading(false); return; }
+    setPreview(null);
+    setLoading(true);
+    setNote('');
     try {
-      setPreview({ id: row.session_id, ...(await getConversationMessages(adminToken, row.session_id, 100)) });
-    } catch (error) { setNote(say(error)); }
+      const result = await getConversationMessages(adminToken, row.session_id, 100);
+      if (identity.isCurrent() && version === previewVersion.current) setPreview({ id: row.session_id, ...result });
+    } catch (error) { if (identity.isCurrent() && version === previewVersion.current) setNote(say(error)); }
+    finally { if (identity.isCurrent() && version === previewVersion.current) setLoading(false); }
   };
 
   const drop = async (row: ConversationRow) => {
-    if (!adminToken) return;
-    const name = row.owner?.label || row.session_id;
+    if (!adminToken || busy) return;
+    const name = labelFor(row);
     if (!window.confirm(`删除「${name}」的上下文？聊天记录清空，之后重新积累。长期记忆不受影响。`)) return;
+    setBusy(true);
+    previewVersion.current += 1;
+    setLoading(false);
     try {
       await resetConversationBySession(adminToken, row.session_id);
+      if (!identity.isCurrent()) return;
       setPreview(null);
       await load();
+      if (!identity.isCurrent()) return;
       setNote('已删除，下一条消息开始重新积累');
-    } catch (error) { setNote(say(error)); }
+    } catch (error) { if (identity.isCurrent()) setNote(say(error)); } finally { if (identity.isCurrent()) setBusy(false); }
   };
 
   const entry = (row: ConversationRow) => (
     <div className={ENTRY} key={row.session_id}>
       <div className={HEAD}>
-        <span className="min-w-0 flex-1 truncate text-xs">{row.owner?.label || row.channel || '未知来源'}</span>
+        <span className="min-w-0 flex-1 truncate text-xs">{labelFor(row)}</span>
         <span className={META}>{sizeText(row.bytes)}</span>
-        <Button onClick={() => void open(row)}>
+        <Button disabled={busy} onClick={() => void open(row)}>
           {preview?.id === row.session_id ? '收起' : '查看'}
         </Button>
         <Button
-          disabled={!row.conversation_key}
+          disabled={busy || !row.conversation_key}
           onClick={() => void drop(row)}
           title={row.conversation_key ? '' : '这条会话已经没有归属，只能在服务器上删'}
         >
@@ -372,7 +413,10 @@ const ContextBlock = () => {
 
   return (
     <Block hint="删除会连带清掉 bot 侧的消息缓存与附件；长期记忆另算" title="会话上下文">
-      {rows.length === 0 && <Empty>还没有任何会话。</Empty>}
+      {loading && <Footnote>正在读取会话…</Footnote>}
+      {directoryLoading && <Footnote>正在读取会话名称…</Footnote>}
+      {directoryError && <Footnote>{directoryError} <Button onClick={() => void load()}>重试会话列表</Button></Footnote>}
+      {!directoryLoading && !directoryError && rows.length === 0 && <Empty>还没有任何会话。</Empty>}
       {/* 空的那一段拍平后不留痕迹，可「这个号一条都没有」正是要说的话，所以单拎出来。 */}
       {stale.length > 0 && mine.length === 0 && (
         <>
@@ -400,21 +444,33 @@ const ScopeBlock = () => {
   const [target, setTarget] = useState('');
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
+  const [previewTarget, setPreviewTarget] = useState('');
+  const requestVersion = useRef(0);
 
   const load = async (withTarget = '') => {
     if (!adminToken) return;
-    try { setStatus(await getQqScope(adminToken, withTarget)); } catch (error) { setNote(say(error)); }
+    const version = ++requestVersion.current;
+    setPreviewTarget('');
+    setBusy(true);
+    try {
+      const result = await getQqScope(adminToken, withTarget);
+      if (version !== requestVersion.current) return;
+      setStatus(result);
+      setPreviewTarget(withTarget);
+    } catch (error) { if (version === requestVersion.current) setNote(say(error)); }
+    finally { if (version === requestVersion.current) setBusy(false); }
   };
 
-  useEffect(() => { void load(); }, [adminToken]);
+  useEffect(() => { void load(); return () => { requestVersion.current += 1; }; }, [adminToken]);
 
   const preview = async () => {
+    if (busy || !target.trim()) return;
     setNote('');
     await load(target.trim());
   };
 
   const migrate = async () => {
-    if (!adminToken) return;
+    if (!adminToken || busy || !status?.preview || !previewTarget || previewTarget !== target.trim()) return;
     const to = target.trim();
     // 显示探测出的实际归属，而不是记录的当前账号 —— 存量数据两者往往不一样。
     const from = status?.preview?.source_scope || '无归属';
@@ -427,7 +483,7 @@ const ScopeBlock = () => {
     } catch (error) { setNote(say(error)); } finally { setBusy(false); }
   };
 
-  const plan = status?.preview;
+  const plan = previewTarget && previewTarget === target.trim() ? status?.preview : undefined;
   const movable = plan?.conversations.filter((row) => !row.blocked) ?? [];
 
   return (
@@ -442,13 +498,14 @@ const ScopeBlock = () => {
           <span className={LABEL}>搬到</span>
           <Input
             inputMode="numeric"
-            onChange={(event) => setTarget(event.target.value)}
+            disabled={busy}
+            onChange={(event) => { setTarget(event.target.value); setPreviewTarget(''); }}
             placeholder="目标 bot 的 QQ 号"
             value={target}
             width="flex"
           />
         </label>
-        <Button className="self-start" disabled={!target.trim()} onClick={() => void preview()}>
+        <Button className="self-start" disabled={busy || !target.trim()} onClick={() => void preview()}>
           预览
         </Button>
       </div>
@@ -489,10 +546,13 @@ const ScopeBlock = () => {
   );
 };
 
-export const MemoryPage = () => (
-  <>
+export const MemoryPage = () => {
+  const token = useSettingsStore(state => state.adminToken);
+  const identity = useRef({ token, generation: 0 });
+  if (identity.current.token !== token) identity.current = { token, generation: identity.current.generation + 1 };
+  return <Fragment key={identity.current.generation}>
     <MemoryBlock />
     <ContextBlock />
     <ScopeBlock />
-  </>
-);
+  </Fragment>;
+};

@@ -917,6 +917,7 @@ export function updatePolicyRaw(token: string, yaml: string): Promise<any> {
 export interface MemoryOwner {
   kind: 'group' | 'private' | 'agent' | 'subject' | 'unknown';
   label: string;
+  name_available?: boolean;
   alias?: string;
   real_id?: string;
   conversation_key?: string;
@@ -995,6 +996,13 @@ export interface ConversationRow {
   updated_at: number;
   owner: MemoryOwner | null;
   /** 属于当前登录的 QQ 号。换号后旧号的会话仍在磁盘上，但不该跟当前的混在一起。 */
+  current_account?: boolean;
+}
+
+export interface MaterialScope {
+  scope: string;
+  bot_scope: string;
+  owner?: MemoryOwner | null;
   current_account?: boolean;
 }
 

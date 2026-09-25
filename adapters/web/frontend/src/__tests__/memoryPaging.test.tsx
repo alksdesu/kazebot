@@ -243,7 +243,7 @@ describe('会话上下文', () => {
 
     clickNext('个');
 
-    await screen.findByText('会话100');
+    await screen.findByText('会话100（历史账号）');
     expect(screen.getByText(/其它账号/)).toBeInTheDocument();
   });
 
@@ -251,7 +251,7 @@ describe('会话上下文', () => {
     stub({ conversations: Array.from({ length: 3 }, (_, index) => conversation(100 + index, false)) });
     render(<MemoryPage />);
 
-    await screen.findByText('会话100');
+    await screen.findByText('会话100（历史账号）');
     expect(screen.getByText('当前账号')).toBeInTheDocument();
     expect(screen.getByText('这个号还没有任何会话。')).toBeInTheDocument();
   });

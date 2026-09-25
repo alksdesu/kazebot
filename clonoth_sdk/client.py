@@ -103,6 +103,21 @@ class ClonothClient:
             self._last_token = current_token
         return self._client
 
+    async def request_feature(
+        self, method: str, path: str, *, body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None, actor: dict[str, Any] | None = None,
+    ) -> Any:
+        from .feature_paths import validate_feature_path
+        validate_feature_path(path, operations=True)
+        headers = {}
+        if actor is not None:
+            headers["X-Clonoth-Adapter-Actor"] = json.dumps(actor, ensure_ascii=True, separators=(",", ":"))
+        response = await self._http().request(
+            method, f"{self._base_url}{path}", json=body, params=params, headers=headers,
+        )
+        response.raise_for_status()
+        return response.json()
+
     # ================================================================
     #  Inbound — 提交用户消息
     # ================================================================
