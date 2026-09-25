@@ -210,8 +210,8 @@ export interface HealthState {
   uptime_seconds?: number;
 }
 
-export async function checkHealth(): Promise<HealthState> {
-  const resp = await apiFetch('/health');
+export async function checkHealth(signal?: AbortSignal): Promise<HealthState> {
+  const resp = await apiFetch('/health', signal ? { signal } : undefined);
   return resp.json();
 }
 
@@ -373,10 +373,19 @@ export async function cancelTask(adminToken: string, taskId: string): Promise<vo
 
 // ── Admin auth ──
 
+export async function verifyAdminAuth(token: string, signal?: AbortSignal): Promise<boolean> {
+  const resp = await fetch(`${API}/admin/auth/check`, {
+    headers: authHeaders(token),
+    ...(signal ? { signal } : {}),
+  });
+  if (resp.status === 401 || resp.status === 403) return false;
+  if (!resp.ok) throw new Error(`登录验证服务暂不可用（${resp.status}）`);
+  return true;
+}
+
 export async function checkAdminAuth(token: string): Promise<boolean> {
   try {
-    const resp = await fetch(`${API}/admin/auth/check`, { headers: authHeaders(token) });
-    return resp.ok;
+    return await verifyAdminAuth(token);
   } catch {
     return false;
   }
@@ -1773,25 +1782,19 @@ export interface SessionListItem {
 }
 
 export async function listSessions(channel = 'web', limit = 50): Promise<SessionListItem[]> {
-  try {
-    const resp = await fetch(`${API}/sessions?channel=${channel}&limit=${limit}`);
-    if (!resp.ok) return [];
-    return resp.json();
-  } catch {
-    return [];
-  }
+  const resp = await apiFetch(`/sessions?channel=${encodeURIComponent(channel)}&limit=${limit}`);
+  const data = await resp.json();
+  if (!Array.isArray(data)) throw new Error('会话列表响应格式无效');
+  return data;
 }
 
 // ── Delete session ──
 
 export async function deleteSession(sessionId: string): Promise<{ ok: boolean }> {
-  try {
-    const resp = await fetch(`${API}/sessions/${sessionId}`, { method: 'DELETE' });
-    if (!resp.ok) return { ok: false };
-    return resp.json();
-  } catch {
-    return { ok: false };
-  }
+  const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+  const result = await resp.json();
+  if (result?.ok !== true) throw new Error('服务端未确认删除会话，请重试');
+  return result;
 }
 
 // ── Session messages (legacy, flat text) ──

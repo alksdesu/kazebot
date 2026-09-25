@@ -87,7 +87,7 @@ describe('view registry settings flow', () => {
 
     render(<SettingsPageHost />);
 
-    expect(screen.getByText('连接')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '调度器连接' })).toBeInTheDocument();
   });
 
   it('keeps the settings right column dedicated to settings content', () => {

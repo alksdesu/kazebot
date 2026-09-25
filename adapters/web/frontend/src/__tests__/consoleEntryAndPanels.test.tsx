@@ -262,7 +262,9 @@ describe('会话模型覆盖的入口与去向', () => {
 
   async function openModelModalAndSave() {
     fireEvent.click(screen.getByTitle('模型配置'));
-    fireEvent.change(await screen.findByPlaceholderText('留空以保留当前值'), { target: { value: 'sk-test' } });
+    const keyInput = await screen.findByPlaceholderText('留空以保留当前值');
+    await waitFor(() => expect(keyInput).toBeEnabled());
+    fireEvent.change(keyInput, { target: { value: 'sk-test' } });
     fireEvent.click(await screen.findByRole('button', { name: '保存' }));
   }
 
@@ -271,14 +273,15 @@ describe('会话模型覆盖的入口与去向', () => {
     await openModelModalAndSave();
 
     await waitFor(() => {
-      const targets = fetchMock.mock.calls.map(([input]) => String(input));
-      expect(targets.some(url => url.includes('/v1/sessions/sess-abcdef/provider_override'))).toBe(true);
+      expect(fetchMock.mock.calls.some(([input, init]) => String(input).includes('/v1/sessions/sess-abcdef/provider_override') && init?.method === 'PUT')).toBe(true);
     });
   });
 
   it('没有活动会话时拒绝保存并说明原因', async () => {
     renderHeader('');
-    await openModelModalAndSave();
+    fireEvent.click(screen.getByTitle('模型配置'));
+    expect(await screen.findByPlaceholderText('留空以保留当前值')).toBeDisabled();
+    expect(screen.queryByRole('button', { name: '保存' })).not.toBeInTheDocument();
 
     expect(await screen.findByText('没有活动会话')).toBeInTheDocument();
     const targets = fetchMock.mock.calls.map(([input]) => String(input));

@@ -58,7 +58,7 @@ describe('Clonoth web app', () => {
     render(<App />);
     expect(screen.getByRole('heading', { name: /^Clonoth$/i })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /新对话/i })).toBeInTheDocument();
-    expect(screen.getByText(/请选择或创建一个对话/i)).toBeInTheDocument();
+    expect(screen.getByText(/发送消息，开始对话/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/事件日志面板/i)).toBeInTheDocument();
   });
 });

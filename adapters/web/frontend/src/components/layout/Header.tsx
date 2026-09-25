@@ -1,20 +1,17 @@
-// [2026-05-17] Header: node display from backend (source of truth).
-// [2026-05-31] Step 3 renames the activity prop from isTyping to isGenerating.
-// Why: V2 no longer has typingConversationId or streamPreview state. How: the header
-// consumes the store-level generation flag directly. Purpose: keep cancel/reset UI
-// aligned with the reducer-backed chat flow.
 import { useEffect, useState } from 'react';
 
-import { getActiveNode, getAppConfig, getNodes } from '../../api/supervisorClient';
+import { getActiveNode, getAppConfig, getNodes, getSessionProviderOverride } from '../../api/supervisorClient';
+import { confirmNavigation, useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../store/settingsStore';
 import { describeEnvRef } from '../../utils/envRef';
-import { Button, Icon } from '../common';
+import { Button, Icon, Modal } from '../common';
 import { SessionConfigModal } from '../settings/SessionConfigModal';
 
 interface HeaderProps {
   title: string;
   sessionId: string;
   isGenerating: boolean;
+  isCancelling?: boolean;
   onCancel?: () => void;
   onReset?: () => void;
   onTitleChange?: (newTitle: string) => void;
@@ -22,162 +19,98 @@ interface HeaderProps {
   onExitChildSession?: () => void;
 }
 
-export const Header = ({ title, sessionId, isGenerating, onCancel, onReset, onTitleChange, viewingChildNodeId, onExitChildSession }: HeaderProps) => {
+export const Header = ({ title, sessionId, isGenerating, isCancelling = false, onCancel, onReset, onTitleChange, viewingChildNodeId, onExitChildSession }: HeaderProps) => {
   const {
-    adminToken, availableNodes, activeNodeId, entryNodeId, globalModel, sessionProviderOverride,
-    setActiveNode, setGlobalConfig, setAvailableNodes,
+    adminToken, availableNodes, activeNodeId, activeNodeSessionId, entryNodeId, globalModel,
+    sessionProviderOverride, sessionProviderOverrideSessionId, setActiveNode, setGlobalConfig,
+    setAvailableNodes, setSessionProviderOverride,
   } = useSettingsStore();
   const [configModalFocus, setConfigModalFocus] = useState<'node' | 'model' | 'title' | null>(null);
   const [draftTitle, setDraftTitle] = useState(title);
+  const [nodeError, setNodeError] = useState('');
+  const [refresh, setRefresh] = useState(0);
+  const confirmDiscardTitle = useUnsavedChanges(configModalFocus === 'title' && draftTitle.trim() !== title, '对话标题尚未保存，确定放弃修改吗？');
+  const sid = sessionId === 'no-session' ? '' : sessionId;
+  const nodeResolved = !sid || activeNodeSessionId === sid;
+  const displayNodeId = nodeResolved ? (activeNodeSessionId === sid ? activeNodeId : '') || entryNodeId : '';
+  const activeNode = availableNodes.find(node => node.id === displayNodeId);
+  const nodeModel = typeof activeNode?.model === 'string' ? activeNode.model : '';
+  const sessionModel = sessionProviderOverrideSessionId === sid && typeof sessionProviderOverride?.model === 'string' ? sessionProviderOverride.model : '';
+  const displayModel = describeEnvRef(sessionModel || nodeModel || globalModel) || '跟随默认模型';
 
-  // Sync draft when title prop changes from outside
   useEffect(() => { setDraftTitle(title); }, [title]);
-
-  const displayNodeId = activeNodeId || entryNodeId;
-  const activeNode = availableNodes.find(n => n.id === displayNodeId);
-  const nodeModel = (activeNode as any)?.model || '';
-  const sessionModel = typeof sessionProviderOverride?.model === 'string' ? sessionProviderOverride.model : '';
-  // 节点写的是 $ENV{...}，展开在引擎侧 —— 顶栏摆模板还不如摆变量名。
-  const displayModel = describeEnvRef(sessionModel || nodeModel || globalModel) || '(默认)';
-
-  const openSessionConfigModal = (focus: 'node' | 'model' | 'title') => {
-    if (focus === 'title') {
-      setDraftTitle(title);
-    }
-    setConfigModalFocus(focus);
-  };
-
-  const handleTitleSave = () => {
-    const trimmed = draftTitle.trim();
-    setConfigModalFocus(null);
-    if (trimmed && trimmed !== title && onTitleChange) {
-      onTitleChange(trimmed);
-    } else {
-      setDraftTitle(title);
-    }
-  };
-
-  // Fetch active node from backend when sessionId changes — backend is source of truth
+  useEffect(() => { setConfigModalFocus(null); }, [sessionId]);
   useEffect(() => {
-    if (!sessionId || sessionId === 'no-session') return;
-    getActiveNode(sessionId)
-      .then(r => {
-        setActiveNode(r.node_id, r.is_override, r.default_node_id);
-      })
-      .catch(() => {});
-  }, [sessionId, setActiveNode]);
-
-  // Fetch global config once
+    let active = true;
+    setNodeError('');
+    if (sid) {
+      getActiveNode(sid).then(result => {
+        if (active) setActiveNode(result.node_id, result.is_override, result.default_node_id, sid);
+      }).catch(() => { if (active) setNodeError('节点状态读取失败'); });
+    }
+    if (sid && adminToken) {
+      getSessionProviderOverride(sid, adminToken).then(result => {
+        if (active) setSessionProviderOverride(result, sid);
+      }).catch(() => { if (active) setSessionProviderOverride(null, sid); });
+    }
+    return () => { active = false; };
+  }, [sid, adminToken, refresh, setActiveNode, setSessionProviderOverride]);
   useEffect(() => {
-    getAppConfig()
-      .then(r => setGlobalConfig(r.openai?.model || '', r.openai?.base_url || ''))
-      .catch(() => {});
+    let active = true;
+    getAppConfig().then(result => {
+      if (active) setGlobalConfig(result.openai?.model || '', result.openai?.base_url || '');
+    }).catch(() => {});
+    return () => { active = false; };
   }, [setGlobalConfig]);
-
-  // Load nodes if needed
   useEffect(() => {
     if (availableNodes.length > 0 || !adminToken) return;
-    getNodes(adminToken)
-      .then(n => setAvailableNodes(n.filter((nd: any) => nd.type === 'ai' && !nd.id.startsWith('system.'))))
-      .catch(() => {});
+    let active = true;
+    getNodes(adminToken).then(nodes => {
+      if (active) setAvailableNodes(nodes.filter(node => node.type === 'ai' && !node.id.startsWith('system.')));
+    }).catch(() => {});
+    return () => { active = false; };
   }, [adminToken, availableNodes.length, setAvailableNodes]);
 
-  return (
-    <>
-      <header className="px-3 py-2 sm:px-4 sm:py-3">
-      <div className="mx-auto flex max-w-3xl items-center justify-between gap-2">
-        {/* Left: title + badges */}
-        <div className="min-w-0 flex-1">
-          {/* [2026-06-03] Why: the child-view title is derived from childNodes and
-              should not edit the parent conversation title. How: disable the title
-              click affordance while viewingChildNodeId is present. Purpose: the
-              title editor remains scoped to parent conversations only. */}
-          <h2
-            className={`truncate font-mono text-sm font-semibold tracking-[-0.03em]${onTitleChange && !viewingChildNodeId ? ' cursor-pointer transition-colors hover:text-[var(--duties-text)]' : ''}`}
-            onClick={onTitleChange && !viewingChildNodeId ? () => openSessionConfigModal('title') : undefined}
-            title={onTitleChange && !viewingChildNodeId ? '点击编辑标题' : undefined}
-          >
-            {title}
-          </h2>
-          <div className="mt-1 flex flex-wrap items-center gap-1.5 font-mono text-[0.6rem] text-[var(--duties-tertiary)]">
-            <span
-              className="cursor-pointer transition-colors hover:text-[var(--duties-text)]"
-              onClick={() => openSessionConfigModal('node')}
-              title="切换节点"
-            >
-              <span className="inline-flex items-center gap-1">
-                <Icon name="hub" size={13} />
-                <span>{activeNode?.name || displayNodeId || '选择节点'}</span>
-              </span>
-            </span>
-            <span className="text-[var(--duties-border)]">/</span>
-            <span
-              className="cursor-pointer transition-colors hover:text-[var(--duties-text)]"
-              onClick={() => openSessionConfigModal('model')}
-              title="模型配置"
-            >
-              <span className="inline-flex items-center gap-1">
-                <Icon name="model_training" size={13} />
-                <span>{displayModel}</span>
-              </span>
-            </span>
-          </div>
-        </div>
+  const closeConfig = () => {
+    if (configModalFocus === 'title' ? !confirmDiscardTitle() : !confirmNavigation()) return;
+    setConfigModalFocus(null);
+  };
+  const saveTitle = () => {
+    const trimmed = draftTitle.trim();
+    if (!trimmed) return;
+    if (trimmed !== title) onTitleChange?.(trimmed);
+    setConfigModalFocus(null);
+  };
 
-        {/* Right: action buttons */}
-        <div className="flex items-center gap-2">
-          {viewingChildNodeId && onExitChildSession && (
-            <Button className="h-7 px-2 text-[0.6rem]" onClick={onExitChildSession} variant="ghost">
-              {/* [2026-06-03] Why: child-session view temporarily replaces the parent
-                  message list. How: show an explicit return action in the header.
-                  Purpose: users can leave the child stream without selecting the parent
-                  conversation again from the sidebar. */}
-              <Icon name="arrow_back" size={14} /> 返回父会话
-            </Button>
-          )}
-          {isGenerating && onCancel && (
-            <Button className="h-7 px-2 text-[0.6rem]" onClick={onCancel} variant="ghost">
-              <Icon name="cancel" size={14} /> 取消
-            </Button>
-          )}
-          {!isGenerating && onReset && (
-            <Button className="h-7 px-2 text-[0.6rem]" onClick={onReset} variant="ghost" title="重置对话">
-              <Icon name="refresh" size={14} />
-            </Button>
-          )}
+  return <>
+    <header className="app-header">
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <h2 className="min-w-0 truncate text-base font-semibold">
+          {onTitleChange && !viewingChildNodeId ? <button className="max-w-full truncate text-left" title="点击编辑标题" type="button" onClick={() => { setDraftTitle(title); setConfigModalFocus('title'); }}>{title}</button> : title}
+        </h2>
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[var(--duties-secondary)]">
+          <button className="inline-flex max-w-full items-center gap-1.5 text-left" type="button" onClick={() => setConfigModalFocus('node')} title="切换节点">
+            <Icon name="hub" size={15} /><span className="truncate">{!nodeResolved ? '读取节点…' : activeNode?.name || displayNodeId || '选择节点'}</span>
+          </button>
+          <button className="inline-flex max-w-full items-center gap-1.5 text-left" type="button" onClick={() => setConfigModalFocus('model')} title="模型配置">
+            <Icon name="model_training" size={15} /><span className="truncate">{displayModel}</span>
+          </button>
+          {nodeError && <button type="button" className="text-[var(--duties-danger)] underline" onClick={() => setRefresh(value => value + 1)}>{nodeError}，重试</button>}
         </div>
       </div>
+      <div className="flex shrink-0 items-center gap-2">
+        {viewingChildNodeId && onExitChildSession && <Button onClick={onExitChildSession}><Icon name="arrow_back" size={16} /><span className="hidden sm:inline">返回父会话</span><span className="sm:hidden">返回</span></Button>}
+        {!viewingChildNodeId && isGenerating && onCancel && <Button loading={isCancelling} onClick={onCancel}><Icon name="cancel" size={16} />取消</Button>}
+        {!viewingChildNodeId && !isGenerating && onReset && <Button aria-label="重置对话" onClick={onReset} title="重置对话"><Icon name="refresh" size={16} /></Button>}
+      </div>
     </header>
-      {/* Title edit modal */}
-      {configModalFocus === 'title' && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setConfigModalFocus(null)}>
-          <div className="w-full max-w-sm border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4 shadow-lg" onClick={(e) => e.stopPropagation()}>
-            <p className="mb-3 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">编辑对话标题</p>
-            <input
-              autoFocus
-              className="mb-3 w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1.5 font-mono text-sm outline-none focus:border-[var(--duties-accent)]"
-              onChange={(e) => setDraftTitle(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') handleTitleSave();
-                if (e.key === 'Escape') setConfigModalFocus(null);
-              }}
-              value={draftTitle}
-            />
-            <div className="flex justify-end gap-2">
-              <Button className="h-7 px-3 text-[0.6rem]" onClick={() => setConfigModalFocus(null)} variant="ghost">取消</Button>
-              <Button className="h-7 px-3 text-[0.6rem]" onClick={handleTitleSave}>保存</Button>
-            </div>
-          </div>
-        </div>
-      )}
-      {/* Node/Model config modal */}
-      {(configModalFocus === 'node' || configModalFocus === 'model') && (
-        <SessionConfigModal
-          focus={configModalFocus}
-          onClose={() => setConfigModalFocus(null)}
-          sessionId={sessionId}
-        />
-      )}
-    </>
-  );
+    <Modal open={configModalFocus === 'title'} title="编辑对话标题" onClose={closeConfig} maxWidth="max-w-sm">
+      <div className="space-y-4 p-4">
+        <label className="block text-sm" htmlFor="conversation-title">对话标题</label>
+        <input id="conversation-title" data-autofocus="true" className="app-input w-full" value={draftTitle} maxLength={200} onChange={event => setDraftTitle(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.nativeEvent.isComposing) saveTitle(); }} />
+        <div className="flex justify-end gap-2"><Button onClick={closeConfig}>取消</Button><Button variant="primary" disabled={!draftTitle.trim()} onClick={saveTitle}>保存</Button></div>
+      </div>
+    </Modal>
+    {(configModalFocus === 'node' || configModalFocus === 'model') && <SessionConfigModal focus={configModalFocus} onClose={closeConfig} sessionId={sessionId} />}
+  </>;
 };

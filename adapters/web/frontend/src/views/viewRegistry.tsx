@@ -4,6 +4,9 @@
 // and right-column slots as render functions. Purpose: adding a future app view or
 // settings page does not create a root-level if-else chain.
 import type { ReactNode } from 'react';
+import { ExecutionPage } from '../features/execution';
+import { MaterialsPage } from '../features/materials/MaterialsPage';
+import { ConversationPlans } from '../features/execution/ConversationPlans';
 
 import { ChatInput } from '../components/chat';
 import { ChildNodePanel, MessageListV2 } from '../components/chat/v2';
@@ -14,6 +17,7 @@ import { SettingsHeader } from '../components/settings/SettingsHeader';
 import { SettingsPageHost } from '../components/settings/SettingsPageHost';
 import { SettingsRightPanel } from '../components/settings/SettingsRightPanel';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
+import { getSettingsTab } from '../components/settings/settingsTabs';
 import type { ConversationMeta } from '../store/chatStore';
 import type { ViewMode } from '../store/viewStore';
 import type { Attachment } from '../types';
@@ -27,15 +31,17 @@ export interface AppViewContext {
   messages: WsMessage[];
   toolsById: Record<string, ToolExecution>;
   isGenerating: boolean;
+  isCancelling?: boolean;
   viewingChildSessionId?: string | null;
   viewingChildNodeId?: string;
   onExitChildSession?: () => void;
   onCreateConversation: () => void;
   onSelectConversation: (conversationId: string) => void;
-  onDeleteConversation: (conversationId: string) => void;
+  onDeleteConversation: (conversationId: string) => Promise<void> | void;
+  activeSettingsTab?: string;
   onSendMessage: (text: string, attachments?: Attachment[]) => Promise<void> | void;
   onCancel: () => void;
-  onReset: () => void;
+  onReset?: () => void;
   onTitleChange?: (newTitle: string) => void;
 }
 
@@ -47,11 +53,22 @@ export interface AppViewDefinition {
   composer?: (ctx: AppViewContext) => ReactNode;
   rightTop?: (ctx: AppViewContext) => ReactNode;
   rightBottom?: (ctx: AppViewContext) => ReactNode;
+  hasRightPanel?: (ctx: AppViewContext) => boolean;
 }
 
 const safeSessionId = (sessionId: string) => sessionId || 'no-session';
 
 export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
+  execution: {
+    id: 'execution', sidebar: () => <SettingsSidebar />,
+    header: () => <div className="border-b border-[var(--duties-border)] p-4 font-semibold">任务工作区</div>,
+    main: () => <ExecutionPage />,
+  },
+  materials: {
+    id: 'materials', sidebar: () => <SettingsSidebar />,
+    header: () => <div className="border-b border-[var(--duties-border)] p-4 font-semibold">资料工作区</div>,
+    main: () => <MaterialsPage />,
+  },
   chat: {
     id: 'chat',
     sidebar: (ctx) => (
@@ -70,6 +87,7 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
       // parent remains available even before child metadata has loaded.
       <Header
         isGenerating={ctx.isGenerating}
+        isCancelling={ctx.isCancelling}
         onCancel={ctx.onCancel}
         onReset={ctx.onReset}
         onExitChildSession={ctx.onExitChildSession}
@@ -92,11 +110,13 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
     ),
     composer: (ctx) => (
       <>
+        {!ctx.viewingChildSessionId && <ConversationPlans sessionId={ctx.sessionId} />}
         {/* [2026-06-03] Why: child-session view is an inspection view, while sending
             still targets the selected parent conversation. How: disable the composer
             whenever a child stream is open. Purpose: users cannot accidentally submit a
             parent message while looking at child history. */}
         <ChatInput
+          conversationId={ctx.activeConversationId || 'new'}
           disabled={ctx.isGenerating || Boolean(ctx.viewingChildSessionId)}
           onSend={ctx.onSendMessage}
         />
@@ -115,6 +135,7 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
     header: () => <SettingsHeader />,
     main: () => <SettingsPageHost />,
     rightTop: () => <SettingsRightPanel />,
+    hasRightPanel: (ctx) => Boolean(getSettingsTab(ctx.activeSettingsTab || 'general').RightPanel),
     // [2026-06-02] Settings no longer reserves a lower EventLog slot. Why: contextual
     // settings editors need the full right rail, especially on narrow screens. How:
     // leave rightBottom undefined for settings while chat keeps EventLogPanel. Purpose:

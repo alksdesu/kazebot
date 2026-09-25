@@ -4,8 +4,9 @@
 // Zustand store. Purpose: App.tsx can select a registered view without growing new
 // modal booleans or business conditionals.
 import { create } from 'zustand';
+import { confirmNavigation } from '../hooks/useUnsavedChanges';
 
-export type ViewMode = 'chat' | 'settings';
+export type ViewMode = 'chat' | 'settings' | 'execution' | 'materials';
 
 export interface ViewState {
   viewMode: ViewMode;
@@ -13,6 +14,7 @@ export interface ViewState {
   openSettings: (tab?: string) => void;
   closeSettings: () => void;
   setSettingsTab: (tab: string) => void;
+  openWorkspace: (view: 'chat' | 'execution' | 'materials') => void;
 }
 
 const DEFAULT_SETTINGS_TAB = 'general';
@@ -29,7 +31,8 @@ const query = new URLSearchParams(window.location.search);
 const REQUESTED_VIEW = query.get('view');
 const LEGACY_DOMAIN = REQUESTED_VIEW === 'console' ? query.get('domain') : null;
 const initialViewMode: ViewMode =
-  REQUESTED_VIEW === 'settings' || REQUESTED_VIEW === 'console' ? 'settings' : 'chat';
+  REQUESTED_VIEW === 'settings' || REQUESTED_VIEW === 'console' ? 'settings' :
+    REQUESTED_VIEW === 'execution' || REQUESTED_VIEW === 'materials' ? REQUESTED_VIEW : 'chat';
 const initialSettingsTab = LEGACY_DOMAIN
   ? tabForLegacyDomain(LEGACY_DOMAIN)
   : query.get('tab') || DEFAULT_SETTINGS_TAB;
@@ -43,7 +46,8 @@ function syncViewQuery(viewMode: ViewMode, tab: string): void {
     params.delete('tab');
   } else {
     params.set('view', viewMode);
-    params.set('tab', tab);
+    if (viewMode === 'settings') params.set('tab', tab);
+    else params.delete('tab');
   }
   // ?domain= 是控制台时代的定位参数，现在由 ?tab= 承担，留着会误导。
   params.delete('domain');
@@ -55,18 +59,25 @@ function syncViewQuery(viewMode: ViewMode, tab: string): void {
 export const useViewStore = create<ViewState>((set, get) => ({
   viewMode: initialViewMode,
   activeSettingsTab: initialSettingsTab,
+  openWorkspace: (viewMode) => {
+    if (viewMode !== get().viewMode && !confirmNavigation()) return;
+    syncViewQuery(viewMode, get().activeSettingsTab);
+    set({ viewMode });
+  },
 
   openSettings: (tab) => {
     // [2026-06-01] Opening settings optionally selects the requested tab first.
     // Why: Header node/model labels should land directly on the related settings
     // page. How: set both the view mode and tab in one store update. Purpose: the
     // shell swaps left and center content atomically.
-    const nextTab = tab || DEFAULT_SETTINGS_TAB;
+    const nextTab = tab || get().activeSettingsTab || DEFAULT_SETTINGS_TAB;
+    if ((get().viewMode !== 'settings' || nextTab !== get().activeSettingsTab) && !confirmNavigation()) return;
     syncViewQuery('settings', nextTab);
     set({ viewMode: 'settings', activeSettingsTab: nextTab });
   },
 
   closeSettings: () => {
+    if (get().viewMode !== 'chat' && !confirmNavigation()) return;
     // [2026-06-01] Closing settings returns to chat without erasing the tab.
     // Why: preserving the tab makes a later Settings click reopen where the user
     // left off if a caller does not request a tab. How: only change viewMode.
@@ -76,12 +87,13 @@ export const useViewStore = create<ViewState>((set, get) => ({
   },
 
   setSettingsTab: (tab) => {
+    if ((get().viewMode !== 'settings' || tab !== get().activeSettingsTab) && !confirmNavigation()) return;
     // [2026-06-01] Tab changes are local to the settings view.
     // Why: adding future settings pages should not require App.tsx changes. How:
     // store only the tab id and let SettingsPageHost resolve it through the tab
     // registry. Purpose: tab routing remains data-driven.
-    if (get().viewMode === 'settings') syncViewQuery('settings', tab);
-    set({ activeSettingsTab: tab });
+    syncViewQuery('settings', tab);
+    set({ activeSettingsTab: tab, viewMode: 'settings' });
   },
 }));
 

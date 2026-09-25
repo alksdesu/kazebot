@@ -1,22 +1,31 @@
-// [2026-06-01] Three-column slot layout inspired by IdoFront.
-// Left, center, and right columns are pure slots; viewRegistry decides what each
-// slot contains. Why: settings mode should replace the left and center content
-// without adding App-level conditionals or layout-specific overrides. How: make the
-// composer optional and split the right column into upper and lower slots only.
-// Purpose: AppLayout remains unaware of chat, settings, or any concrete panel type.
-import { type PropsWithChildren, type ReactNode, useRef, useState } from 'react';
+import { type PropsWithChildren, type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react';
 
-import {
-  RIGHT_PANEL_DEFAULT_WIDTH,
-  RIGHT_PANEL_MAX_WIDTH,
-  RIGHT_PANEL_MIN_WIDTH,
-  clampRightPanelWidth,
-  useClientPrefsStore,
-} from '../../store/clientPrefsStore';
+import { useModalFocus } from '../../hooks/useModalFocus';
+import { RIGHT_PANEL_DEFAULT_WIDTH, RIGHT_PANEL_MAX_WIDTH, RIGHT_PANEL_MIN_WIDTH, clampRightPanelWidth, useClientPrefsStore } from '../../store/clientPrefsStore';
 import { useSettingsStore } from '../../store/settingsStore';
+import { useViewStore } from '../../store/viewStore';
 import { Icon } from '../common';
 
 const RESIZE_STEP = 16;
+
+function cssPixels(name: string, fallback: number) {
+  const style = getComputedStyle(document.documentElement);
+  const value = style.getPropertyValue(name).trim();
+  const number = Number.parseFloat(value);
+  if (!Number.isFinite(number)) return fallback;
+  return value.endsWith('rem') ? number * (Number.parseFloat(style.fontSize) || 16) : number;
+}
+
+function layoutMetrics() {
+  const width = window.innerWidth || document.documentElement.clientWidth;
+  return {
+    width,
+    sidebar: width >= cssPixels('--duties-sidebar-breakpoint', 768),
+    rail: width >= cssPixels('--duties-rail-breakpoint', 1280),
+    maxWidth: Math.min(RIGHT_PANEL_MAX_WIDTH, Math.max(RIGHT_PANEL_MIN_WIDTH,
+      width - cssPixels('--duties-sidebar-w', 240) - cssPixels('--duties-main-min-width', 480) - 4)),
+  };
+}
 
 interface AppLayoutProps extends PropsWithChildren {
   sidebar: ReactNode;
@@ -24,198 +33,115 @@ interface AppLayoutProps extends PropsWithChildren {
   composer?: ReactNode;
   logPanel?: ReactNode;
   rightPanel?: ReactNode;
+  navigationKey?: string;
 }
 
-export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, children }: AppLayoutProps) => {
+export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, navigationKey = '', children }: AppLayoutProps) => {
+  const [metrics, setMetrics] = useState(layoutMetrics);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { rightPanelOpen, setRightPanelOpen } = useSettingsStore();
   const { rightPanelWidth, setRightPanelWidth } = useClientPrefsStore();
-  // 拖拽途中不写 localStorage，松手才落一次。
   const [dragWidth, setDragWidth] = useState<number | null>(null);
   const hasRightPanel = Boolean(logPanel || rightPanel);
+  const rightVisible = hasRightPanel && rightPanelOpen;
+  const rightOverlay = rightVisible && !metrics.rail;
+  const leftVisible = metrics.sidebar || (sidebarOpen && !rightOverlay);
+  const leftOverlay = leftVisible && !metrics.sidebar;
+  const panelWidth = Math.min(clampRightPanelWidth(dragWidth ?? rightPanelWidth), metrics.maxWidth);
+  const sidebarRef = useRef<HTMLElement>(null);
+  const rightRef = useRef<HTMLElement>(null);
+  const stopResize = useRef<(() => void) | null>(null);
   const touchStart = useRef<{ x: number; y: number } | null>(null);
-  const panelWidth = dragWidth ?? rightPanelWidth;
+  const viewMode = useViewStore(state => state.viewMode);
+  const settingsTab = useViewStore(state => state.activeSettingsTab);
+  const desktopOpen = useRef(rightPanelOpen);
+  const previousRail = useRef(metrics.rail);
+  const closeLeft = () => setSidebarOpen(false);
+  const closeRight = () => setRightPanelOpen(false);
+  useModalFocus(leftOverlay, sidebarRef, closeLeft);
+  useModalFocus(rightOverlay, rightRef, closeRight);
+
+  useLayoutEffect(() => {
+    if (!metrics.rail) setRightPanelOpen(false);
+    const resize = () => setMetrics(layoutMetrics());
+    window.addEventListener('resize', resize);
+    return () => { window.removeEventListener('resize', resize); stopResize.current?.(); };
+  }, [setRightPanelOpen]);
+  useLayoutEffect(() => {
+    if (previousRail.current === metrics.rail) return;
+    stopResize.current?.();
+    if (metrics.rail) setRightPanelOpen(desktopOpen.current);
+    else { desktopOpen.current = rightPanelOpen; setRightPanelOpen(false); }
+    setSidebarOpen(false);
+    previousRail.current = metrics.rail;
+  }, [metrics.rail, rightPanelOpen, setRightPanelOpen]);
+  useEffect(() => {
+    setSidebarOpen(false);
+    if (!metrics.rail) setRightPanelOpen(false);
+  }, [viewMode, settingsTab, navigationKey, metrics.rail, setRightPanelOpen]);
+  useEffect(() => { if (!hasRightPanel) stopResize.current?.(); }, [hasRightPanel]);
 
   const beginResize = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return;
-    event.preventDefault();
+    if (event.button !== 0 || !metrics.rail) return;
+    event.preventDefault(); stopResize.current?.();
     const startX = event.clientX;
     const startWidth = panelWidth;
-    // 面板贴着右边，指针往左走才是变宽。
-    const widthAt = (clientX: number) => clampRightPanelWidth(startWidth - (clientX - startX));
-    const onMove = (moveEvent: PointerEvent) => setDragWidth(widthAt(moveEvent.clientX));
-    const onUp = (upEvent: PointerEvent) => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-      setDragWidth(null);
-      setRightPanelWidth(widthAt(upEvent.clientX));
-    };
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
+    const widthAt = (x: number) => Math.min(metrics.maxWidth, clampRightPanelWidth(startWidth - (x - startX)));
+    const controller = new AbortController();
+    const cleanup = () => { controller.abort(); stopResize.current = null; setDragWidth(null); };
+    stopResize.current = cleanup;
+    window.addEventListener('pointermove', move => setDragWidth(widthAt(move.clientX)), { signal: controller.signal });
+    window.addEventListener('pointerup', up => { setRightPanelWidth(widthAt(up.clientX)); cleanup(); }, { signal: controller.signal });
+    window.addEventListener('pointercancel', cleanup, { signal: controller.signal });
+    window.addEventListener('blur', cleanup, { signal: controller.signal });
   };
-
   const onResizeKey = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === 'ArrowLeft') setRightPanelWidth(panelWidth + RESIZE_STEP);
-    else if (event.key === 'ArrowRight') setRightPanelWidth(panelWidth - RESIZE_STEP);
-    else if (event.key === 'Home') setRightPanelWidth(RIGHT_PANEL_DEFAULT_WIDTH);
-    else return;
-    event.preventDefault();
+    const width = event.key === 'ArrowLeft' ? panelWidth + RESIZE_STEP : event.key === 'ArrowRight' ? panelWidth - RESIZE_STEP : event.key === 'Home' ? RIGHT_PANEL_DEFAULT_WIDTH : event.key === 'End' ? metrics.maxWidth : null;
+    if (width === null) return;
+    event.preventDefault(); setRightPanelWidth(Math.min(width, metrics.maxWidth));
   };
-
+  const openLeft = () => { setRightPanelOpen(false); setSidebarOpen(true); };
+  const toggleRight = () => { setSidebarOpen(false); setRightPanelOpen(!rightVisible); };
   const handleTouchStart = (event: React.TouchEvent<HTMLDivElement>) => {
-    // [2026-06-02] Store only the first touch point for mobile panel gestures. Why:
-    // side panels should be accessible by swiping without interfering with normal
-    // content rendering. How: capture the starting x/y coordinates and defer direction
-    // checks until touch end. Purpose: AppLayout owns consistent sidebar gestures.
     const touch = event.touches[0];
-    touchStart.current = { x: touch.clientX, y: touch.clientY };
+    if (touch) touchStart.current = { x: touch.clientX, y: touch.clientY };
   };
-
   const handleTouchEnd = (event: React.TouchEvent<HTMLDivElement>) => {
-    // [2026-06-02] Convert horizontal swipes into panel open/close actions. Why: mobile
-    // users need a larger interaction target than the header toggles. How: require a
-    // 50px horizontal movement, ignore mostly vertical gestures, and only open hidden
-    // panels from a 48px screen edge zone while allowing reverse swipes to close the
-    // currently open opposite panel. Purpose: right and left panels can be opened or
-    // dismissed with predictable swipes without hijacking normal horizontal content.
-    if (!touchStart.current) return;
-    const start = touchStart.current;
-    const touch = event.changedTouches[0];
-    const dx = touch.clientX - start.x;
-    const dy = touch.clientY - start.y;
-    touchStart.current = null;
-
+    const start = touchStart.current; const touch = event.changedTouches[0]; touchStart.current = null;
+    if (!start || !touch || metrics.rail) return;
+    const dx = touch.clientX - start.x; const dy = touch.clientY - start.y;
     if (Math.abs(dx) < 50 || Math.abs(dx) < Math.abs(dy)) return;
-
-    const edgeSwipeZone = 48;
-    const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
-    const startedNearLeftEdge = start.x <= edgeSwipeZone;
-    const startedNearRightEdge = start.x >= viewportWidth - edgeSwipeZone;
-
     if (dx > 0) {
-      if (rightPanelOpen) setRightPanelOpen(false);
-      else if (startedNearLeftEdge) setSidebarOpen(true);
-      return;
-    }
-
-    if (sidebarOpen) setSidebarOpen(false);
-    else if (hasRightPanel && startedNearRightEdge) setRightPanelOpen(true);
+      if (rightOverlay) closeRight();
+      else if (!metrics.sidebar && start.x <= 48) openLeft();
+    } else if (leftOverlay) closeLeft();
+    else if (hasRightPanel && start.x >= metrics.width - 48) { setSidebarOpen(false); setRightPanelOpen(true); }
   };
 
-  return (
-    <div
-      className="flex h-[100dvh] min-h-0 bg-[var(--duties-bg)] text-[var(--duties-text)]"
-      data-testid="app-layout-root"
-      onTouchEnd={handleTouchEnd}
-      onTouchStart={handleTouchStart}
-      style={{ '--duties-right-w': `${panelWidth}px` } as React.CSSProperties}
-    >
-      {sidebarOpen && (
-        <div
-          className="fixed inset-0 z-30 bg-black/30 md:hidden"
-          onClick={() => setSidebarOpen(false)}
-        />
-      )}
-      {rightPanelOpen && (
-        <div
-          className="fixed inset-0 z-30 bg-black/30 md:hidden"
-          onClick={() => setRightPanelOpen(false)}
-        />
-      )}
-
-      <aside
-        className={`fixed inset-y-0 left-0 z-40 w-[var(--duties-sidebar-w)] flex-shrink-0 border-r border-[var(--duties-border)] bg-[var(--duties-panel)] transition-transform md:relative md:z-auto md:translate-x-0 ${
-          sidebarOpen ? 'translate-x-0' : '-translate-x-full'
-        }`}
-      >
-        {sidebar}
-      </aside>
-
-      <main className="flex min-w-0 flex-1 flex-col">
-        <div className="flex-shrink-0 border-b border-[var(--duties-border)] bg-[var(--duties-bg)]">
-          <div className="flex items-center">
-            <button
-              className="flex-shrink-0 px-3 py-3 text-lg text-[var(--duties-secondary)] md:hidden"
-              onClick={() => setSidebarOpen(!sidebarOpen)}
-              type="button"
-            >
-              {/* [2026-06-01] Why: replace the hamburger Unicode glyph with Material Symbols.
-                  How: render the shared Icon with the menu symbol. Purpose: navigation
-                  controls use the same icon font as the rest of the frontend. */}
-              <Icon name="menu" size={22} />
-            </button>
-            <div className="min-w-0 flex-1">{header}</div>
-            {hasRightPanel && (
-              <button
-                className="flex-shrink-0 px-3 py-2 font-mono text-[0.6rem] text-[var(--duties-secondary)] transition-colors hover:text-[var(--duties-text)]"
-                onClick={() => setRightPanelOpen(!rightPanelOpen)}
-                type="button"
-                title={rightPanelOpen ? '收起面板' : '展开面板'}
-              >
-                {/* [2026-06-01] Why: replace triangle toggle glyphs with Material Symbols.
-                    How: choose the chevron symbol from rightPanelOpen. Purpose: the
-                    right panel toggle follows the shared icon system. */}
-                <Icon name={rightPanelOpen ? 'chevron_right' : 'chevron_left'} size={18} />
-              </button>
-            )}
-          </div>
-        </div>
-        <section className="relative min-h-0 flex-1 overflow-hidden">{children}</section>
-        {composer && (
-          <div className="flex-shrink-0 border-t border-[var(--duties-border)] bg-[var(--duties-bg)]">{composer}</div>
-        )}
-      </main>
-
-      {hasRightPanel && rightPanelOpen && (
-        <div
-          aria-label="调整右侧面板宽度"
-          aria-orientation="vertical"
-          aria-valuemax={RIGHT_PANEL_MAX_WIDTH}
-          aria-valuemin={RIGHT_PANEL_MIN_WIDTH}
-          aria-valuenow={panelWidth}
-          className="hidden w-1 flex-shrink-0 cursor-col-resize bg-[var(--duties-border)] transition-colors hover:bg-[var(--duties-text)] focus-visible:bg-[var(--duties-text)] focus-visible:outline-none md:block"
-          onDoubleClick={() => setRightPanelWidth(RIGHT_PANEL_DEFAULT_WIDTH)}
-          onKeyDown={onResizeKey}
-          onPointerDown={beginResize}
-          role="separator"
-          tabIndex={0}
-          title="拖动调整宽度，双击复位"
-        />
-      )}
-
-      {hasRightPanel && (
-        <aside
-          aria-label="右侧面板"
-          className={`flex-shrink-0 flex-col overflow-hidden border-l border-[var(--duties-border)] bg-[var(--duties-panel)] ${
-            rightPanelOpen
-              ? 'fixed inset-y-0 right-0 z-40 flex w-[85vw] translate-x-0 transition-transform duration-200 md:relative md:z-auto md:w-[var(--duties-right-w)] md:translate-x-0'
-              : 'fixed inset-y-0 right-0 z-40 w-[85vw] translate-x-full transition-transform duration-200 md:relative md:z-auto md:w-0 md:translate-x-0 md:transition-[width] md:duration-200'
-          // 拖拽时留着 width 过渡，面板会追着指针慢半拍。
-          } ${dragWidth === null && rightPanelOpen ? 'md:transition-[width]' : ''}`}
-        >
-          {logPanel ? (
-            <>
-              {/* [2026-06-02] Preserve the split layout only when a log panel exists.
-                  Why: chat mode still needs status plus EventLogPanel. How: keep the
-                  historical 60/40 wrappers inside this branch. Purpose: settings mode
-                  can omit logPanel without inheriting a stale 60 percent height. */}
-              <div className="flex h-[60%] min-h-0 flex-shrink-0 flex-col overflow-hidden border-b border-[var(--duties-border)]">
-                {rightPanel}
-              </div>
-              <div
-                aria-label="事件日志面板"
-                className="flex h-[40%] min-h-0 flex-shrink-0 flex-col overflow-hidden"
-              >
-                {logPanel}
-              </div>
-            </>
-          ) : (
-            <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
-              {rightPanel}
-            </div>
-          )}
-        </aside>
-      )}
-    </div>
-  );
+  return <div className="app-shell flex h-[100dvh] min-h-0 overflow-hidden bg-[var(--duties-bg)] text-[var(--duties-text)]" data-testid="app-layout-root"
+    onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd}
+    style={{ '--duties-right-w': `${panelWidth}px` } as React.CSSProperties}>
+    {(leftOverlay || rightOverlay) && <div data-overlay-backdrop="true" data-testid="panel-backdrop" className="app-modal-overlay fixed inset-0 z-30" onClick={leftOverlay ? closeLeft : closeRight} />}
+    <aside ref={sidebarRef} id="app-navigation" aria-label="主导航" aria-modal={leftOverlay || undefined} role={leftOverlay ? 'dialog' : undefined} tabIndex={-1} hidden={!leftVisible}
+      className={`app-sidebar shrink-0 border-r border-[var(--duties-border)] bg-[var(--duties-panel)] ${metrics.sidebar ? 'relative' : 'fixed inset-y-0 left-0 z-40'} ${leftVisible ? 'translate-x-0' : '-translate-x-full'}`}>
+      {!metrics.sidebar && <div className="flex justify-end border-b border-[var(--duties-border)] px-2"><button type="button" className="app-icon-button" aria-label="关闭导航" onClick={closeLeft}><Icon name="close" /></button></div>}
+      <div className="min-h-0 flex-1">{sidebar}</div>
+    </aside>
+    <main id="app-main" className="flex min-w-0 flex-1 flex-col" tabIndex={-1}>
+      <div className="flex shrink-0 items-center border-b border-[var(--duties-border)] bg-[var(--duties-surface)]">
+        {!metrics.sidebar && <button type="button" className="app-icon-button ml-1 shrink-0" aria-label="打开导航" aria-controls="app-navigation" aria-expanded={leftOverlay} onClick={openLeft}><Icon name="menu" size={22} /></button>}
+        <div className="min-w-0 flex-1">{header}</div>
+        {hasRightPanel && <button type="button" className="app-icon-button mr-1 shrink-0" aria-controls="app-right-panel" aria-expanded={rightVisible} onClick={toggleRight} title={rightVisible ? '收起面板' : '展开面板'} aria-label={rightVisible ? '收起面板' : '展开面板'}><Icon name={rightVisible ? 'chevron_right' : 'chevron_left'} size={20} /></button>}
+      </div>
+      <section className="relative min-h-0 flex-1 overflow-hidden">{children}</section>
+      {composer && <div className="shrink-0 border-t border-[var(--duties-border)] bg-[var(--duties-surface)]">{composer}</div>}
+    </main>
+    {hasRightPanel && rightVisible && metrics.rail && <div role="separator" aria-label="调整右侧面板宽度" aria-orientation="vertical" aria-valuemax={metrics.maxWidth} aria-valuemin={RIGHT_PANEL_MIN_WIDTH} aria-valuenow={panelWidth} tabIndex={0}
+      className="app-resize-handle w-1 shrink-0 cursor-col-resize bg-[var(--duties-border)] hover:bg-[var(--duties-secondary)]" onDoubleClick={() => setRightPanelWidth(RIGHT_PANEL_DEFAULT_WIDTH)} onKeyDown={onResizeKey} onPointerDown={beginResize} title="拖动调整宽度，双击复位" />}
+    {hasRightPanel && <aside ref={rightRef} id="app-right-panel" aria-label="右侧面板" role={rightOverlay ? 'dialog' : undefined} aria-modal={rightOverlay || undefined} tabIndex={-1} hidden={!rightVisible}
+      className={`app-right-panel shrink-0 flex-col overflow-hidden border-l border-[var(--duties-border)] bg-[var(--duties-surface)] ${metrics.rail ? 'relative w-[var(--duties-right-w)]' : 'app-drawer fixed inset-y-0 right-0 z-40'} ${rightVisible ? 'flex translate-x-0' : 'translate-x-full'}`}>
+      {!metrics.rail && <div className="flex shrink-0 items-center justify-between border-b border-[var(--duties-border)] px-4 py-1"><span className="text-sm font-semibold">详情与操作</span><button className="app-icon-button" type="button" aria-label="关闭右侧面板" onClick={closeRight}><Icon name="close" /></button></div>}
+      {logPanel ? <><div className="flex h-[60%] min-h-0 shrink-0 flex-col overflow-hidden border-b border-[var(--duties-border)]">{rightPanel}</div><div aria-label="事件日志面板" className="flex h-[40%] min-h-0 shrink-0 flex-col overflow-hidden">{logPanel}</div></> : <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">{rightPanel}</div>}
+    </aside>}
+  </div>;
 };

@@ -24,6 +24,7 @@ interface StoredClientPrefs extends ClientPrefs {
 }
 
 interface ClientPrefsState extends ClientPrefs {
+  storageWarning: string;
   setAutoApproveTool: (toolName: string, enabled: boolean) => void;
   setTitleGeneration: (mode: TitleGenerationMode) => void;
   setThinkingDefaultCollapsed: (collapsed: boolean) => void;
@@ -42,6 +43,7 @@ export function clampRightPanelWidth(width: number): number {
 }
 
 const LS_KEY_CLIENT_PREFS = scopedKey('clonoth_client_prefs');
+let storageWarning = '';
 
 /** Bumped whenever autoApproveTools changes meaning and stored rules need migrating. */
 const CLIENT_PREFS_VERSION = 2;
@@ -141,9 +143,10 @@ function readStoredPrefs(): { stored: Partial<ClientPrefs>; migrated: boolean } 
 }
 
 function mergePrefs(stored: Partial<ClientPrefs>): ClientPrefs {
+  const valid = Object.fromEntries(Object.entries(stored).filter(([, value]) => value !== undefined));
   return {
     ...DEFAULT_CLIENT_PREFS,
-    ...stored,
+    ...valid,
     autoApproveTools: {
       ...DEFAULT_AUTO_APPROVE_TOOLS,
       ...(stored.autoApproveTools || {}),
@@ -164,7 +167,9 @@ function persistPrefs(prefs: ClientPrefs) {
   // How: write the serialized public preference object after every setter. Purpose:
   // tests and runtime code can inspect one stable localStorage key.
   const stored: StoredClientPrefs = { ...prefs, version: CLIENT_PREFS_VERSION };
-  localStorage.setItem(LS_KEY_CLIENT_PREFS, JSON.stringify(stored));
+  try { localStorage.setItem(LS_KEY_CLIENT_PREFS, JSON.stringify(stored)); storageWarning = ''; }
+  catch { storageWarning = '浏览器无法保存偏好，本次设置仅在当前窗口生效。'; }
+  return storageWarning;
 }
 
 function publicPrefs(state: ClientPrefsState): ClientPrefs {
@@ -216,44 +221,45 @@ export function shouldAutoApproveToolCall(match: ApprovalMatch, rules: Record<st
 
 export const useClientPrefsStore = create<ClientPrefsState>((set, get) => ({
   ...hydratePrefs(),
+  storageWarning,
 
   setAutoApproveTool: (toolName, enabled) => set((state) => {
     const nextState = {
       ...state,
       autoApproveTools: { ...state.autoApproveTools, [toolName]: enabled },
     };
-    persistPrefs(publicPrefs(nextState));
-    return { autoApproveTools: nextState.autoApproveTools };
+    const warning = persistPrefs(publicPrefs(nextState));
+    return { autoApproveTools: nextState.autoApproveTools, storageWarning: warning };
   }),
 
   setTitleGeneration: (mode) => set((state) => {
     const nextState = { ...state, titleGeneration: mode };
-    persistPrefs(publicPrefs(nextState));
-    return { titleGeneration: mode };
+    const warning = persistPrefs(publicPrefs(nextState));
+    return { titleGeneration: mode, storageWarning: warning };
   }),
 
   setThinkingDefaultCollapsed: (collapsed) => set((state) => {
     const nextState = { ...state, thinkingDefaultCollapsed: collapsed };
-    persistPrefs(publicPrefs(nextState));
-    return { thinkingDefaultCollapsed: collapsed };
+    const warning = persistPrefs(publicPrefs(nextState));
+    return { thinkingDefaultCollapsed: collapsed, storageWarning: warning };
   }),
 
   setToolResultsDefaultCollapsed: (collapsed) => set((state) => {
     const nextState = { ...state, toolResultsDefaultCollapsed: collapsed };
-    persistPrefs(publicPrefs(nextState));
-    return { toolResultsDefaultCollapsed: collapsed };
+    const warning = persistPrefs(publicPrefs(nextState));
+    return { toolResultsDefaultCollapsed: collapsed, storageWarning: warning };
   }),
 
   setRightPanelWidth: (width) => set((state) => {
     const next = clampRightPanelWidth(width);
-    persistPrefs(publicPrefs({ ...state, rightPanelWidth: next }));
-    return { rightPanelWidth: next };
+    const warning = persistPrefs(publicPrefs({ ...state, rightPanelWidth: next }));
+    return { rightPanelWidth: next, storageWarning: warning };
   }),
 
   resetClientPrefs: () => {
     const next = { ...DEFAULT_CLIENT_PREFS, autoApproveTools: { ...DEFAULT_AUTO_APPROVE_TOOLS } };
-    persistPrefs(next);
-    set(next);
+    const warning = persistPrefs(next);
+    set({ ...next, storageWarning: warning });
   },
 }));
 

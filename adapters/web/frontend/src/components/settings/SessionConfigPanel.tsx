@@ -4,7 +4,7 @@
 // combines session identity, connection status, node switching, and provider
 // override editing in the 60% upper section of the right panel. Purpose: Header
 // text clicks and the default right panel all operate on the current session.
-import { useEffect, useId, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 
 import {
   activeProviderConfig,
@@ -19,6 +19,7 @@ import {
   updateSessionProviderOverride,
 } from '../../api/supervisorClient';
 import { useChatStore } from '../../store/chatStore';
+import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
 import type { NodeDef } from '../../types';
@@ -139,28 +140,38 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
   const {
     adminToken,
     availableNodes,
-    activeNodeId,
+    activeNodeId: cachedNodeId,
+    activeNodeSessionId,
     activeNodeIsOverride,
     defaultNodeId,
     entryNodeId,
     globalModel,
     globalBaseUrl,
-    sessionProviderOverride,
+    sessionProviderOverride: cachedOverride,
+    sessionProviderOverrideSessionId,
     setActiveNode,
     setAvailableNodes,
     setGlobalConfig,
     setModelConfig,
     setSessionProviderOverride,
   } = useSettingsStore();
+  const activeNodeId = activeNodeSessionId === sid ? cachedNodeId : '';
+  const sessionProviderOverride = sessionProviderOverrideSessionId === sid ? cachedOverride : null;
+  const scopeKey = `${sid}\0${adminToken || ''}`;
+  const currentScope = useRef(scopeKey);
+  currentScope.current = scopeKey;
   const setSettingsTab = useViewStore(state => state.setSettingsTab);
 
   const [copyMsg, setCopyMsg] = useState('');
   const [nodeMsg, setNodeMsg] = useState('');
   const [nodeSaving, setNodeSaving] = useState(false);
   const [modelSaving, setModelSaving] = useState(false);
+  const [modelLoaded, setModelLoaded] = useState(false);
   const [modelMsg, setModelMsg] = useState('');
   const [apiKeyPresent, setApiKeyPresent] = useState(false);
   const [edit, setEdit] = useState<SessionModelEdit>({ provider: '', model: '', base_url: '', api_key: '' });
+  const [savedEdit, setSavedEdit] = useState<SessionModelEdit>({ provider: '', model: '', base_url: '', api_key: '' });
+  useUnsavedChanges(JSON.stringify(edit) !== JSON.stringify(savedEdit), '会话模型还有未保存修改，确定离开吗？');
   const [modelChoices, setModelChoices] = useState<string[]>([]);
   const [providerChoices, setProviderChoices] = useState<string[]>([]);
   const [inheritedProvider, setInheritedProvider] = useState('');
@@ -197,7 +208,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
     // 读当前值而不是列进依赖：列进去就会被本 effect 自己的 setAvailableNodes 触发重跑。
     if (useSettingsStore.getState().availableNodes.length === 0) {
       getNodes(adminToken)
-        .then(nodes => setAvailableNodes(nodes.filter((n: NodeDef) => n.type === 'ai' && !n.id.startsWith('system.'))))
+        .then(nodes => { if (useSettingsStore.getState().adminToken === adminToken) setAvailableNodes(nodes.filter((n: NodeDef) => n.type === 'ai' && !n.id.startsWith('system.'))); })
         .catch(() => {});
     }
   }, [adminToken, setAvailableNodes]);
@@ -206,21 +217,30 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
     // 换会话先清掉上一个会话的覆盖再拉新的。cancelled 挡住乱序响应：慢的那个回来时
     // 面板可能已经指向别的会话了。
     let cancelled = false;
-    setSessionProviderOverride(null);
+    setSessionProviderOverride(null, sid);
+    setNodeSaving(false); setModelSaving(false); setModelLoaded(false); setModelMsg(sid ? '' : '没有活动会话'); setNodeMsg('');
     setEdit({ provider: '', model: '', base_url: '', api_key: '' });
+    setSavedEdit({ provider: '', model: '', base_url: '', api_key: '' });
     setApiKeyPresent(false);
 
     if (sid) {
       getActiveNode(sid)
-        .then(r => { if (!cancelled) setActiveNode(r.node_id, r.is_override, r.default_node_id); })
+        .then(r => { if (!cancelled) setActiveNode(r.node_id, r.is_override, r.default_node_id, sid); })
         .catch(() => {});
     }
     if (sid && adminToken) {
       getSessionProviderOverride(sid, adminToken)
         .then(override => {
           if (cancelled) return;
-          setSessionProviderOverride(override);
+          setSessionProviderOverride(override, sid);
+          setModelLoaded(true);
           setEdit({
+            provider: stringField(override, 'provider') || stringField(override, 'provider_type'),
+            model: stringField(override, 'model'),
+            base_url: stringField(override, 'base_url'),
+            api_key: '',
+          });
+          setSavedEdit({
             provider: stringField(override, 'provider') || stringField(override, 'provider_type'),
             model: stringField(override, 'model'),
             base_url: stringField(override, 'base_url'),
@@ -229,7 +249,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
           // 只认会话自己那把钥匙：全局配了 key 不代表这个会话有专属覆盖。
           setApiKeyPresent(Boolean(override.api_key));
         })
-        .catch(() => {});
+        .catch(error => { if (!cancelled) setModelMsg(error instanceof Error ? error.message : '会话模型读取失败，请重新打开面板重试'); });
     }
     return () => { cancelled = true; };
   }, [adminToken, setActiveNode, setSessionProviderOverride, sid]);
@@ -244,6 +264,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
     }
     getProviders(adminToken)
       .then(providers => {
+        if (useSettingsStore.getState().adminToken !== adminToken) return;
         setModelChoices(literalModelsOnly(mergeModelChoices(modelsFromProviders(providers))));
         // 已配渠道排前面：它们带着地址密钥，裸线格式还得自己填。
         const choices = channelChoices(providers);
@@ -251,14 +272,15 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
         setInheritedProvider(providers.active_provider || '');
         setModelConfig(activeProviderConfig(providers));
       })
-      .catch(() => { setModelChoices([]); setProviderChoices([]); setInheritedProvider(''); });
+      .catch(() => { if (useSettingsStore.getState().adminToken === adminToken) { setModelChoices([]); setProviderChoices([]); setInheritedProvider(''); } });
   }, [adminToken, setModelConfig]);
 
   const handleCopySessionId = async () => {
     if (!sid) return;
     setCopyMsg('');
     try {
-      await navigator.clipboard?.writeText(sid);
+      if (!navigator.clipboard?.writeText) throw new Error('浏览器不支持复制');
+      await navigator.clipboard.writeText(sid);
       setCopyMsg('已复制');
     } catch {
       setCopyMsg('复制失败');
@@ -266,29 +288,33 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
   };
 
   const handleSwitchNode = async (targetId: string) => {
+    if (nodeSaving) return;
     setNodeMsg('');
     if (!sid) {
-      setActiveNode(targetId, Boolean(targetId), defaultNodeId || '');
+      setActiveNode(targetId, Boolean(targetId), defaultNodeId || '', '');
       setNodeMsg('已为下一条消息保存');
       return;
     }
     setNodeSaving(true);
     try {
       const result = await switchNode(sid, targetId);
+      if (currentScope.current !== scopeKey) return;
       if (result?.ok) {
-        setActiveNode(result.target_node_id, result.is_override, result.default_node_id || '');
+        setActiveNode(result.target_node_id, result.is_override, result.default_node_id || '', sid);
         setNodeMsg('已保存');
       } else {
         setNodeMsg('切换失败');
       }
     } catch (err) {
+      if (currentScope.current !== scopeKey) return;
       setNodeMsg(err instanceof Error ? err.message : '切换失败');
     } finally {
-      setNodeSaving(false);
+      if (currentScope.current === scopeKey) setNodeSaving(false);
     }
   };
 
   const handleSaveModel = async () => {
+    if (modelSaving || !modelLoaded) return;
     setModelMsg('');
     if (!sid) { setModelMsg('没有活动会话'); return; }
     if (!adminToken) { setModelMsg('需要管理员令牌'); return; }
@@ -304,8 +330,15 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
       if (edit.api_key.trim()) next.api_key = edit.api_key.trim();
 
       const saved = await updateSessionProviderOverride(sid, adminToken, next);
-      setSessionProviderOverride(saved);
+      if (currentScope.current !== scopeKey) return;
+      setSessionProviderOverride(saved, sid);
       setEdit({
+        provider: stringField(saved, 'provider') || stringField(saved, 'provider_type'),
+        model: stringField(saved, 'model'),
+        base_url: stringField(saved, 'base_url'),
+        api_key: '',
+      });
+      setSavedEdit({
         provider: stringField(saved, 'provider') || stringField(saved, 'provider_type'),
         model: stringField(saved, 'model'),
         base_url: stringField(saved, 'base_url'),
@@ -314,13 +347,15 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
       setApiKeyPresent(Boolean(saved.api_key));
       setModelMsg('已保存');
     } catch (err) {
+      if (currentScope.current !== scopeKey) return;
       setModelMsg(err instanceof Error ? err.message : '保存失败');
     } finally {
-      setModelSaving(false);
+      if (currentScope.current === scopeKey) setModelSaving(false);
     }
   };
 
   const handleClearModel = async () => {
+    if (modelSaving || !modelLoaded || !window.confirm('清除当前会话的模型、地址和密钥覆盖，恢复继承配置？')) return;
     setModelMsg('');
     if (!sid) { setModelMsg('没有活动会话'); return; }
     if (!adminToken) { setModelMsg('需要管理员令牌'); return; }
@@ -328,14 +363,17 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
     setModelSaving(true);
     try {
       const cleared = await clearSessionProviderOverride(sid, adminToken);
-      setSessionProviderOverride(cleared);
+      if (currentScope.current !== scopeKey) return;
+      setSessionProviderOverride(cleared, sid);
       setEdit({ provider: '', model: '', base_url: '', api_key: '' });
+    setSavedEdit({ provider: '', model: '', base_url: '', api_key: '' });
       setApiKeyPresent(false);
       setModelMsg('已清除');
     } catch (err) {
+      if (currentScope.current !== scopeKey) return;
       setModelMsg(err instanceof Error ? err.message : '清除失败');
     } finally {
-      setModelSaving(false);
+      if (currentScope.current === scopeKey) setModelSaving(false);
     }
   };
 
@@ -401,7 +439,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
             </span>
           </div>
           <select
-            className="mb-2 w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            className="app-input mb-2 w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
             disabled={nodeSaving}
             onChange={e => handleSwitchNode(e.target.value)}
             value={activeNodeIsOverride ? activeNodeId : ''}
@@ -435,9 +473,9 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
           <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">供应商</label>
           <input
             aria-label="供应商"
-            className="mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            className="app-input mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
             list={providerChoices.length ? providerListId : undefined}
-            onChange={e => setEdit(p => ({ ...p, provider: e.target.value }))}
+            disabled={modelSaving || !modelLoaded} onChange={e => setEdit(p => ({ ...p, provider: e.target.value }))}
             placeholder={stringField(sessionProviderOverride, 'provider')
               || inheritedPlaceholder(inheritedProvider, '继承的供应商')}
             value={edit.provider}
@@ -450,9 +488,9 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
 
           <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">模型</label>
           <input
-            className="mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            className="app-input mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
             list={modelChoices.length ? modelListId : undefined}
-            onChange={e => setEdit(p => ({ ...p, model: e.target.value }))}
+            disabled={modelSaving || !modelLoaded} aria-label="模型" onChange={e => setEdit(p => ({ ...p, model: e.target.value }))}
             placeholder={inheritedPlaceholder(nodeModel || globalModel, '继承的模型')}
             value={edit.model}
           />
@@ -464,16 +502,16 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
 
           <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">基础 URL</label>
           <input
-            className="mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-            onChange={e => setEdit(p => ({ ...p, base_url: e.target.value }))}
+            className="app-input mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            disabled={modelSaving || !modelLoaded} aria-label="基础 URL" onChange={e => setEdit(p => ({ ...p, base_url: e.target.value }))}
             placeholder={inheritedPlaceholder(nodeBaseUrl || globalBaseUrl, '继承的基础 URL')}
             value={edit.base_url}
           />
 
           <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">API 密钥 {apiKeyPresent ? '（已设置）' : '（可选）'}</label>
           <input
-            className="mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-            onChange={e => setEdit(p => ({ ...p, api_key: e.target.value }))}
+            className="app-input mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            disabled={modelSaving || !modelLoaded} aria-label="API 密钥" onChange={e => setEdit(p => ({ ...p, api_key: e.target.value }))}
             placeholder="留空以保留当前值"
             type="password"
             value={edit.api_key}
@@ -484,11 +522,11 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
           {/* Save/Clear only visible when user has modified something */}
           {(edit.provider.trim() !== '' || edit.model.trim() !== '' || edit.base_url.trim() !== '' || edit.api_key.trim() !== '' || hasSessionOverride) && (
             <div className="flex gap-2">
-              <Button className="h-8 flex-1 px-2 text-[0.55rem]" disabled={modelSaving || (!edit.provider.trim() && !edit.model.trim() && !edit.base_url.trim() && !edit.api_key.trim())} onClick={handleSaveModel} variant="primary">
+              <Button className="h-8 flex-1 px-2 text-[0.55rem]" disabled={modelSaving || !modelLoaded || (!edit.provider.trim() && !edit.model.trim() && !edit.base_url.trim() && !edit.api_key.trim())} onClick={handleSaveModel} variant="primary">
                 {modelSaving ? '保存中…' : '保存'}
               </Button>
               {hasSessionOverride && (
-                <Button className="h-8 flex-1 px-2 text-[0.55rem]" disabled={modelSaving} onClick={handleClearModel} variant="ghost">
+                <Button className="h-8 flex-1 px-2 text-[0.55rem]" disabled={modelSaving || !modelLoaded} onClick={handleClearModel} variant="ghost">
                   清除
                 </Button>
               )}

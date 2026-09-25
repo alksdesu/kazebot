@@ -22,6 +22,7 @@ const handle = () => screen.getByRole('separator', { name: '调整右侧面板�
 const root = () => screen.getByTestId('app-layout-root');
 
 beforeEach(() => {
+  Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1680 });
   localStorage.clear();
   useClientPrefsStore.getState().resetClientPrefs();
   useSettingsStore.setState({ rightPanelOpen: true });

@@ -22,7 +22,7 @@ export const MessageList = ({ conversation, isTyping, streamPreview }: MessageLi
   if (!conversation) {
     return (
       <div className="flex h-full items-center justify-center p-6 text-sm text-[var(--duties-tertiary)]">
-        请选择或创建一个对话。
+        发送消息，开始对话。也可以添加文件并说明要处理什么。
       </div>
     );
   }

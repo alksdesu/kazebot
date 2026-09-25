@@ -3,15 +3,17 @@
 import { getNodes } from '../../api/supervisorClient';
 import { LS_KEY_NODE, useSettingsStore } from '../../store/settingsStore';
 
-export async function loadEntryNodes(token: string): Promise<void> {
+export async function loadEntryNodes(token: string, isCurrent: () => boolean = () => useSettingsStore.getState().adminToken === token): Promise<void> {
   const { setAvailableNodes, setEntryNodeId } = useSettingsStore.getState();
   try {
     const nodes = await getNodes(token);
-    const aiNodes = nodes.filter((node: any) => node.type === 'ai' && !node.id.startsWith('system.'));
+    if (!isCurrent() || !Array.isArray(nodes)) return;
+    const aiNodes = nodes.filter(node => node && node.type === 'ai' && typeof node.id === 'string' && !node.id.startsWith('system.'));
     setAvailableNodes(aiNodes);
-    const saved = localStorage.getItem(LS_KEY_NODE) || '';
+    let saved = useSettingsStore.getState().entryNodeId || '';
+    try { saved = localStorage.getItem(LS_KEY_NODE) || saved; } catch {}
     const savedIsValid = aiNodes.some((node: any) => node.id === saved);
-    if ((!saved || !savedIsValid) && aiNodes.length > 0) setEntryNodeId(aiNodes[0].id);
+    if (!savedIsValid) setEntryNodeId(aiNodes[0]?.id || '');
   } catch {
     // 节点列表是可选装饰：拉不到不该把人挡在登录页外面。
   }

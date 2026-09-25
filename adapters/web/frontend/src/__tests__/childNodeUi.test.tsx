@@ -77,7 +77,7 @@ describe('child node UI', () => {
     expect(screen.getByText('父对话')).toBeInTheDocument();
     expect(screen.getByText('scout')).toBeInTheDocument();
     expect(screen.queryByText('smith')).not.toBeInTheDocument();
-    expect(screen.getByLabelText('子节点 scout 状态：运行中')).toHaveClass('bg-green-500', 'animate-pulse');
+    expect(screen.getByLabelText('子节点 scout 状态：运行中')).toHaveClass('bg-[var(--duties-live)]', 'animate-pulse');
   });
 
   it('shows the current conversation child nodes in a floating panel with live runtime labels and opens child session view', () => {

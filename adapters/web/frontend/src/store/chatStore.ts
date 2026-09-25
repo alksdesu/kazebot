@@ -4,6 +4,7 @@
 // every SupervisorEvent is replayed through eventReducer into ChatState. Purpose:
 // let the new message model run beside the old store until the UI migration is done.
 import { create } from 'zustand';
+import { confirmNavigation } from '../hooks/useUnsavedChanges';
 
 import { connectGlobalWS, disconnectGlobalWS } from '../api';
 import {
@@ -77,7 +78,10 @@ export interface ChatStoreState extends ChatState {
   activeConversationId: string | null;
   isGenerating: boolean;
   connectionStatus: ConnectionStatus;
+  startupError: string;
   generatingBySession: Readonly<Record<string, boolean>>;
+  sendingByConversation: Readonly<Record<string, boolean>>;
+  deletingByConversation: Readonly<Record<string, boolean>>;
   childNodes: Readonly<Record<string, ChildNodeState>>;
   viewingChildSessionId: string | null;
   childSessionMessages: Readonly<Record<string, WsMessage[]>>;
@@ -87,7 +91,8 @@ export interface ChatStoreState extends ChatState {
   selectChildNodes: (conversationId: string) => ChildNodeState[];
   selectHasActiveChildNodes: (conversationId: string) => boolean;
   createConversation: () => string;
-  deleteConversation: (id: string) => void;
+  deleteConversation: (id: string) => Promise<void>;
+  resetConversationView: (id: string, previousSessionId: string) => void;
   renameConversation: (id: string, newTitle: string) => void;
   sendMessage: (text: string, attachments?: any[], entryNodeId?: string) => Promise<void>;
   cancelCurrentTask: () => Promise<void>;
@@ -148,6 +153,7 @@ const LS_KEY_TITLES = scopedKey('clonoth_conversation_titles');
 const LS_KEY_AUTO_APPROVED = scopedKey('clonoth_auto_approved_ids');
 
 let startupLoaded = false;
+let startupGeneration = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 const autoApprovedApprovalIds = loadAutoApproved();
 
@@ -230,13 +236,16 @@ function createConversationMeta(id = createConversationId(), sessionId = ''): Co
   return { id, sessionId, title: '新对话', updatedAt: timestamp };
 }
 
-function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus' | 'generatingBySession' | 'childNodes' | 'viewingChildSessionId' | 'childSessionMessages' | 'taskActivities'> {
+function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus' | 'startupError' | 'generatingBySession' | 'sendingByConversation' | 'deletingByConversation' | 'childNodes' | 'viewingChildSessionId' | 'childSessionMessages' | 'taskActivities'> {
   return {
     conversations: [],
     activeConversationId: null,
     isGenerating: false,
     connectionStatus: 'idle',
+    startupError: '',
     generatingBySession: {},
+    sendingByConversation: {},
+    deletingByConversation: {},
     // [2026-06-03] Why: child-node state is frontend-only routing metadata, not part
     // of reducer ChatState. How: initialize it beside other store-owned maps.
     // Purpose: resetState and startup create a clean child session tracker.
@@ -1035,7 +1044,9 @@ function isConversationGenerating(
   activeConversationId: string | null,
   generatingBySession: Readonly<Record<string, boolean>>,
   fallback: boolean,
+  sendingByConversation: Readonly<Record<string, boolean>> = {},
 ): boolean {
+  if (activeConversationId && sendingByConversation[activeConversationId]) return true;
   const active = activeConversationId ? conversations.find((conversation) => conversation.id === activeConversationId) : undefined;
   return active?.sessionId ? Boolean(generatingBySession[active.sessionId]) : fallback;
 }
@@ -1052,6 +1063,9 @@ function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
   connectGlobalWS(
     0,
     (event) => {
+      if (event.type === 'execution_updated') {
+        window.dispatchEvent(new CustomEvent('clonoth:execution-updated', { detail: event.payload }));
+      }
       let terminalConversationId = '';
       let terminalSessionId = '';
 
@@ -1116,6 +1130,7 @@ function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
           state.activeConversationId,
           generatingBySession,
           state.isGenerating,
+          state.sendingByConversation,
         );
 
         if (isTerminalTaskEvent(event)) {
@@ -1755,6 +1770,7 @@ async function loadSessionHistoryIntoStore(conversationId: string, sessionId: st
   }
 
   set((state) => {
+    if (state.conversations.find(item => item.id === conversationId)?.sessionId !== sessionId) return {};
     const preserveExistingMessages = shouldPreserveConversationMessagesDuringHistoryLoad(state, conversationId, sessionId);
     const hydrated = history.length > 0
       ? hydrateStructuredHistory(state, sessionId, conversationId, history, preserveExistingMessages)
@@ -1808,8 +1824,11 @@ async function loadChildSessionHistoryIntoStore(sessionId: string, set: StoreSet
 async function loadStartupSessions(set: StoreSetter, get: StoreGetter) {
   if (startupLoaded) return;
   startupLoaded = true;
+  const generation = startupGeneration;
+  set({ startupError: '' });
 
   const serverSessions = await listSessions('web', 50);
+  if (generation !== startupGeneration) return;
   const userSessions = (serverSessions || []).filter((session) => !isEntryBranchSessionId(session.session_id));
   if (userSessions.length === 0) {
     startGlobalWebSocket(set, get);
@@ -1855,14 +1874,20 @@ async function loadStartupSessions(set: StoreSetter, get: StoreGetter) {
   // [2026-06-03] Sort once on initial load so the sidebar opens with the most
   // recently updated conversations on top, regardless of backend list order.
   const sortedConversations = sortConversationsByRecency(conversations);
-  set((state) => ({
-    conversations: sortedConversations,
-    activeConversationId: state.activeConversationId || sortedConversations[0]?.id || null,
-    conversationIdsBySession: sortedConversations.reduce<Record<string, string>>((acc, conversation) => {
-      if (conversation.sessionId) acc[conversation.sessionId] = conversation.id;
-      return acc;
-    }, { ...state.conversationIdsBySession }),
-  }));
+  set((state) => {
+    const merged = sortConversationsByRecency([
+      ...state.conversations,
+      ...sortedConversations.filter(item => !state.conversations.some(current => current.id === item.id)),
+    ]);
+    return {
+      conversations: merged,
+      activeConversationId: state.activeConversationId || merged[0]?.id || null,
+      conversationIdsBySession: merged.reduce<Record<string, string>>((acc, conversation) => {
+        if (conversation.sessionId) acc[conversation.sessionId] = conversation.id;
+        return acc;
+      }, { ...state.conversationIdsBySession }),
+    };
+  });
 
   // [2026-06-03] Why: realtime is now an all-session subscription that should
   // exist as soon as the web app starts. How: open /v1/ws after session metadata
@@ -1883,6 +1908,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
   resetState: () => {
     stopGlobalRealtimeConnection();
     startupLoaded = false;
+    startupGeneration += 1;
     autoApprovedApprovalIds.clear();
     saveAutoApproved(autoApprovedApprovalIds);
     set({
@@ -1892,6 +1918,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
   },
 
   selectConversation: (id) => {
+    if (id !== get().activeConversationId && !confirmNavigation()) return;
     const target = get().conversations.find((conversation) => conversation.id === id);
     set((state) => ({
       // [2026-06-03] Why: multiple sessions can generate concurrently, so the
@@ -1901,7 +1928,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       // incorrectly disable another conversation.
       activeConversationId: id,
       viewingChildSessionId: null,
-      isGenerating: target?.sessionId ? Boolean(state.generatingBySession[target.sessionId]) : false,
+      isGenerating: Boolean(state.sendingByConversation[id]) || (target?.sessionId ? Boolean(state.generatingBySession[target.sessionId]) : false),
     }));
     if (target?.sessionId) {
       // [2026-06-03] Why: selecting a conversation is a view action, not a
@@ -1930,6 +1957,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
   viewChildSession: (sessionId, taskId) => {
     const trimmed = sessionId.trim();
     if (!trimmed) return;
+    if (trimmed !== get().viewingChildSessionId && !confirmNavigation()) return;
     // [AutoC 2026-06-04] Why: this is a virtual temporary session overlay — it must
     // not pollute the sidebar conversation list or leave stale state from a previous
     // virtual session. How: immediately set the new viewingChildSessionId and clear
@@ -1947,6 +1975,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
   },
 
   exitChildSession: () => {
+    if (get().viewingChildSessionId && !confirmNavigation()) return;
     // [2026-06-03] Why: returning from child view should reveal the still-selected
     // parent conversation. How: clear only the view marker and leave message caches in
     // place. Purpose: reopening the same child can reuse cached messages while history
@@ -1955,58 +1984,91 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
   },
 
   createConversation: () => {
+    if (!confirmNavigation()) return get().activeConversationId || '';
     const conversation = createConversationMeta();
     set((state) => ({
       conversations: [conversation, ...state.conversations],
       activeConversationId: conversation.id,
       viewingChildSessionId: null,
+      isGenerating: false,
     }));
     return conversation.id;
   },
 
-  deleteConversation: (id) => {
+  deleteConversation: async (id) => {
+    if (get().sendingByConversation[id]) throw new Error('消息仍在发送，请发送结束后再删除会话');
+    if (get().deletingByConversation[id]) throw new Error('会话正在删除，请稍候');
     const conversation = get().conversations.find((item) => item.id === id);
-    if (conversation?.sessionId) {
-      void deleteSession(conversation.sessionId).catch(() => undefined);
+    if (!conversation) return;
+    const generation = startupGeneration;
+    set(state => ({ deletingByConversation: { ...state.deletingByConversation, [id]: true } }));
+    try {
+      if (conversation.sessionId) {
+        await deleteSession(conversation.sessionId);
+      }
+
+      if (generation !== startupGeneration || get().conversations.find(item => item.id === id)?.sessionId !== conversation.sessionId) {
+        throw new Error('原会话已删除，但当前会话已变更；新上下文未移除');
+      }
+      set((state) => {
+        const conversations = state.conversations.filter((item) => item.id !== id);
+        const activeConversationId = state.activeConversationId === id ? conversations[0]?.id || null : state.activeConversationId;
+        const nextChatState = removeConversationMessages(state, id);
+        const conversationIdsBySession = Object.fromEntries(
+          // [2026-06-03] Why: child and branch sessions can be registered to the same
+          // parent conversation. How: remove every session route whose value is the
+          // deleted conversation id. Purpose: later global events cannot revive a
+          // deleted parent conversation through stale child-session mappings.
+          Object.entries(nextChatState.conversationIdsBySession).filter(([, conversationId]) => conversationId !== id),
+        );
+        const childNodes = Object.fromEntries(
+          // [2026-06-03] Why: childNodes is keyed independently from conversations.
+          // How: drop entries grouped under the deleted parent conversation. Purpose:
+          // selectors cannot report stale scout/smith work after a chat is removed.
+          Object.entries(state.childNodes).filter(([, child]) => child.parentConversationId !== id),
+        );
+
+        const generatingBySession = conversation?.sessionId
+          ? { ...state.generatingBySession, [conversation.sessionId]: false }
+          : state.generatingBySession;
+        const sendingByConversation = { ...state.sendingByConversation };
+        delete sendingByConversation[id];
+
+        return {
+          ...nextChatState,
+          conversationIdsBySession,
+          conversations,
+          activeConversationId,
+          viewingChildSessionId: state.viewingChildSessionId && childNodes[state.viewingChildSessionId]
+            ? state.viewingChildSessionId
+            : null,
+          generatingBySession,
+          sendingByConversation,
+          childNodes,
+          // [2026-06-03] Why: generation is tracked per session now. How: after a
+          // deletion chooses a new active conversation, derive the composer lock from
+          // that conversation's session flag. Purpose: deleting a running or old chat
+          // cannot leave the next selected chat incorrectly disabled.
+          isGenerating: isConversationGenerating(conversations, activeConversationId, generatingBySession, false, sendingByConversation),
+        };
+      });
+    } finally {
+      if (generation === startupGeneration) set(state => ({ deletingByConversation: { ...state.deletingByConversation, [id]: false } }));
     }
+  },
 
-    set((state) => {
-      const conversations = state.conversations.filter((item) => item.id !== id);
-      const activeConversationId = state.activeConversationId === id ? conversations[0]?.id || null : state.activeConversationId;
-      const nextChatState = removeConversationMessages(state, id);
-      const conversationIdsBySession = Object.fromEntries(
-        // [2026-06-03] Why: child and branch sessions can be registered to the same
-        // parent conversation. How: remove every session route whose value is the
-        // deleted conversation id. Purpose: later global events cannot revive a
-        // deleted parent conversation through stale child-session mappings.
-        Object.entries(nextChatState.conversationIdsBySession).filter(([, conversationId]) => conversationId !== id),
-      );
-      const childNodes = Object.fromEntries(
-        // [2026-06-03] Why: childNodes is keyed independently from conversations.
-        // How: drop entries grouped under the deleted parent conversation. Purpose:
-        // selectors cannot report stale scout/smith work after a chat is removed.
-        Object.entries(state.childNodes).filter(([, child]) => child.parentConversationId !== id),
-      );
-
-      const generatingBySession = conversation?.sessionId
-        ? { ...state.generatingBySession, [conversation.sessionId]: false }
-        : state.generatingBySession;
-
+  resetConversationView: (id, previousSessionId) => {
+    set(state => {
+      if (state.conversations.find(item => item.id === id)?.sessionId !== previousSessionId) return {};
+      const conversations = state.conversations.map(item => item.id === id ? { ...item, sessionId: '' } : item);
+      const childNodes = Object.fromEntries(Object.entries(state.childNodes).filter(([, child]) => child.parentConversationId !== id));
+      const generatingBySession = { ...state.generatingBySession, [previousSessionId]: false };
+      const sendingByConversation = { ...state.sendingByConversation, [id]: false };
       return {
-        ...nextChatState,
-        conversationIdsBySession,
-        conversations,
-        activeConversationId,
-        viewingChildSessionId: state.viewingChildSessionId && childNodes[state.viewingChildSessionId]
-          ? state.viewingChildSessionId
-          : null,
-        generatingBySession,
-        childNodes,
-        // [2026-06-03] Why: generation is tracked per session now. How: after a
-        // deletion chooses a new active conversation, derive the composer lock from
-        // that conversation's session flag. Purpose: deleting a running or old chat
-        // cannot leave the next selected chat incorrectly disabled.
-        isGenerating: isConversationGenerating(conversations, activeConversationId, generatingBySession, false),
+        ...removeConversationMessages(state, id), conversations, childNodes, generatingBySession, sendingByConversation,
+        conversationIdsBySession: Object.fromEntries(Object.entries(state.conversationIdsBySession).filter(([, conversationId]) => conversationId !== id)),
+        viewingChildSessionId: state.viewingChildSessionId && state.childNodes[state.viewingChildSessionId]?.parentConversationId === id ? null : state.viewingChildSessionId,
+        isGenerating: isConversationGenerating(conversations, state.activeConversationId, generatingBySession, false, sendingByConversation),
       };
     });
   },
@@ -2030,7 +2092,14 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     if (!trimmed && (!attachments || attachments.length === 0)) return;
 
     const state = get();
-    const conversationId = state.activeConversationId || state.createConversation();
+    let conversationId = state.activeConversationId;
+    if (!conversationId) {
+      const conversation = createConversationMeta();
+      conversationId = conversation.id;
+      set(current => ({ conversations: [conversation, ...current.conversations], activeConversationId: conversation.id, viewingChildSessionId: null }));
+    }
+    if (get().sendingByConversation[conversationId]) throw new Error('这条消息正在发送，请稍候');
+    if (get().deletingByConversation[conversationId]) throw new Error('当前会话正在删除，消息未发送');
     const conversationKey = `web:${conversationId}`;
     const existingConversation = get().conversations.find((conversation) => conversation.id === conversationId);
 
@@ -2045,6 +2114,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       }),
       activeConversationId: conversationId,
       isGenerating: true,
+      sendingByConversation: { ...current.sendingByConversation, [conversationId]: true },
       connectionStatus: current.connectionStatus === 'open' ? 'open' : 'connecting',
     }));
 
@@ -2146,10 +2216,11 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       // an already-open realtime status intact. Purpose: one failed send cannot make
       // the all-session event stream look disconnected.
       set((current) => ({
-        isGenerating: false,
+        isGenerating: isConversationGenerating(current.conversations, current.activeConversationId, current.generatingBySession, false, { ...current.sendingByConversation, [conversationId]: false }),
+        sendingByConversation: { ...current.sendingByConversation, [conversationId]: false },
         connectionStatus: current.connectionStatus === 'open' ? 'open' : 'closed',
       }));
-      return;
+      throw error;
     }
 
     set((current) => ({
@@ -2170,6 +2241,8 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         ...current.generatingBySession,
         [sessionId]: true,
       },
+      sendingByConversation: { ...current.sendingByConversation, [conversationId]: false },
+      isGenerating: isConversationGenerating(current.conversations.map(item => item.id === conversationId ? { ...item, sessionId } : item), current.activeConversationId, { ...current.generatingBySession, [sessionId]: true }, false, { ...current.sendingByConversation, [conversationId]: false }),
     }));
 
     // [2026-06-03] Why: sending a message should not replace another session's
@@ -2183,13 +2256,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     const activeConversation = getActiveConversation(get());
     if (!activeConversation?.sessionId) return;
 
-    try {
-      await cancelActiveTasks(activeConversation.sessionId);
-    } catch {
-      // Why: cancel is a best-effort transport action. How: ignore API failures here
-      // and still clear the local realtime state. Purpose: the composer should not
-      // remain locked if the cancel endpoint races with task completion.
-    }
+    await cancelActiveTasks(activeConversation.sessionId);
 
     // [2026-06-03] Why: cancellation should not manage the global WebSocket and
     // should unlock the active composer immediately. How: clear only the active
@@ -2197,7 +2264,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     // completion. Purpose: resetState remains the only normal path that disconnects
     // realtime transport, while cancel stays a task action.
     set((state) => ({
-      isGenerating: false,
+      isGenerating: isConversationGenerating(state.conversations, state.activeConversationId, { ...state.generatingBySession, [activeConversation.sessionId]: false }, false, state.sendingByConversation),
       generatingBySession: {
         ...state.generatingBySession,
         [activeConversation.sessionId]: false,
@@ -2206,6 +2273,11 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
   },
 
   loadStartup: () => {
-    void loadStartupSessions(set, get);
+    const generation = startupGeneration;
+    void loadStartupSessions(set, get).catch(error => {
+      if (generation !== startupGeneration) return;
+      startupLoaded = false;
+      set({ startupError: error instanceof Error ? error.message : '加载会话失败，请重试' });
+    });
   },
 }));

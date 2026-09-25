@@ -74,7 +74,7 @@ export const MessageListV2 = ({ messages, toolsById }: MessageListV2Props) => {
   if (messages.length === 0) {
     return (
       <div className="flex h-full items-center justify-center p-6 text-sm text-[var(--duties-tertiary)]">
-        请选择或创建一个对话。
+        发送消息，开始对话。也可以添加文件并说明要处理什么。
       </div>
     );
   }

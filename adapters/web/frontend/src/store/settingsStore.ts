@@ -15,10 +15,23 @@ export const LS_KEY_NODE = scopedKey('clonoth_entry_node');
 
 type SessionProviderOverride = Record<string, unknown>;
 
-const initialRightPanelOpen = () => window.innerWidth >= 768;
+const initialRightPanelOpen = () => window.innerWidth >= 1280;
+let storageWarning = '';
+function readStored(key: string): string | null {
+  try { return localStorage.getItem(key); }
+  catch { storageWarning = '浏览器存储不可用，登录和偏好仅在当前窗口保留。'; return null; }
+}
+function writeStored(key: string, value: string | null): string {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+    return '';
+  } catch { return '浏览器存储不可用，登录和偏好仅在当前窗口保留。'; }
+}
 
 interface SettingsState {
   adminToken: string | null;
+  storageWarning: string;
   isAuthenticated: boolean;
   isConnected: boolean;
   entryNodeId: string;
@@ -26,6 +39,7 @@ interface SettingsState {
   modelConfig: { model: string; base_url: string; api_key_present: boolean } | null;
   // Active node tracking
   activeNodeId: string;
+  activeNodeSessionId: string;
   activeNodeIsOverride: boolean;
   defaultNodeId: string;
   globalModel: string;
@@ -36,6 +50,7 @@ interface SettingsState {
   // Purpose: Header, compact panel, and settings help read the same session-scoped
   // model state without duplicating fetch results.
   sessionProviderOverride: SessionProviderOverride | null;
+  sessionProviderOverrideSessionId: string;
   // [2026-06-01] Right-panel visibility remains layout state shared by Header and
   // AppLayout. Why: viewStore selects which app view is active, but the right column
   // still needs an independent collapse flag. How: keep one boolean here. Purpose:
@@ -48,46 +63,45 @@ interface SettingsState {
   setEntryNodeId: (id: string) => void;
   setAvailableNodes: (nodes: NodeDef[]) => void;
   setModelConfig: (cfg: { model: string; base_url: string; api_key_present: boolean } | null) => void;
-  setActiveNode: (nodeId: string, isOverride: boolean, defaultId: string) => void;
+  setActiveNode: (nodeId: string, isOverride: boolean, defaultId: string, sessionId?: string) => void;
   setGlobalConfig: (model: string, baseUrl: string) => void;
-  setSessionProviderOverride: (override: SessionProviderOverride | null) => void;
+  setSessionProviderOverride: (override: SessionProviderOverride | null, sessionId?: string) => void;
   setRightPanelOpen: (open: boolean) => void;
 }
 
 export const useSettingsStore = create<SettingsState>((set) => ({
-  adminToken: localStorage.getItem(LS_KEY_TOKEN),
+  adminToken: readStored(LS_KEY_TOKEN),
   isAuthenticated: false,
   isConnected: false,
-  entryNodeId: localStorage.getItem(LS_KEY_NODE) || '',
+  entryNodeId: readStored(LS_KEY_NODE) || '',
+  storageWarning,
   availableNodes: [],
   modelConfig: null,
   activeNodeId: '',
+  activeNodeSessionId: '',
   activeNodeIsOverride: false,
   defaultNodeId: '',
   globalModel: '',
   globalBaseUrl: '',
   sessionProviderOverride: null,
+  sessionProviderOverrideSessionId: '',
   rightPanelOpen: initialRightPanelOpen(),
 
   setAdminToken: (token) => {
-    if (token) {
-      localStorage.setItem(LS_KEY_TOKEN, token);
-    } else {
-      localStorage.removeItem(LS_KEY_TOKEN);
-    }
-    set({ adminToken: token });
+    const warning = writeStored(LS_KEY_TOKEN, token);
+    set({ adminToken: token, storageWarning: warning });
   },
   setAuthenticated: (v) => set({ isAuthenticated: v }),
   setConnected: (v) => set({ isConnected: v }),
   setEntryNodeId: (id) => {
-    localStorage.setItem(LS_KEY_NODE, id);
-    set({ entryNodeId: id });
+    const warning = writeStored(LS_KEY_NODE, id);
+    set({ entryNodeId: id, storageWarning: warning });
   },
   setAvailableNodes: (nodes) => set({ availableNodes: nodes }),
   setModelConfig: (cfg) => set({ modelConfig: cfg }),
-  setActiveNode: (nodeId, isOverride, defaultId) => set({ activeNodeId: nodeId, activeNodeIsOverride: isOverride, defaultNodeId: defaultId }),
+  setActiveNode: (nodeId, isOverride, defaultId, sessionId = '') => set({ activeNodeId: nodeId, activeNodeSessionId: sessionId, activeNodeIsOverride: isOverride, defaultNodeId: defaultId }),
   setGlobalConfig: (model, baseUrl) => set({ globalModel: model, globalBaseUrl: baseUrl }),
-  setSessionProviderOverride: (override) => set({ sessionProviderOverride: override }),
+  setSessionProviderOverride: (override, sessionId = '') => set({ sessionProviderOverride: override, sessionProviderOverrideSessionId: sessionId }),
   setRightPanelOpen: (open) => set({ rightPanelOpen: open }),
 }));
 

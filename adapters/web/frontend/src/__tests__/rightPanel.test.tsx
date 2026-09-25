@@ -12,6 +12,7 @@ import { useViewStore } from '../store/viewStore';
 
 describe('view-mode session configuration entry points', () => {
   beforeEach(() => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1440 });
     localStorage.clear();
     useViewStore.setState({ viewMode: 'chat', activeSettingsTab: 'general' });
     useSettingsStore.setState({
