@@ -1228,6 +1228,20 @@ async def _execute_real_tools(
         _is_async = _spec.get("async_mode", False) if _spec else False
 
         if _is_async:
+            _async_tool_ctx = _snapshot_tool_context(_tool_ctx)
+            prepare = getattr(ls.registry, "prepare", None)
+            if prepare is not None:
+                try:
+                    await prepare(name=_t_name, arguments=_t_args, ctx=_async_tool_ctx)
+                except Exception as error:
+                    _blocked_msg = f"工具准备失败，尚未执行：{error}"
+                    ls.failed_real_tools.add(_t_name)
+                    _tool_entries.append({
+                        "id": _rtc.get("id", ""), "name": _t_name, "args": _t_args,
+                        "format": "text", "raw_inline": _blocked_msg, "truncated": False,
+                        "ref": "", "summary": _blocked_msg[:200],
+                    })
+                    continue
             # [WS tool result fields 2026-05-19] Why: tool_call_end now exposes
             # elapsed_ms for both synchronous and async-started tools. How: capture
             # a monotonic timestamp before the lifecycle start event is emitted.
@@ -1267,7 +1281,7 @@ async def _execute_real_tools(
                     session_id=ls.rctx.parent_session_id or ls.rctx.session_id,
                     tool_name=_t_name,
                     tool_args=_t_args,
-                    tool_ctx=_tool_ctx,
+                    tool_ctx=_async_tool_ctx,
                     async_tool_id=_async_id,
                 ),
                 name=f"async_tool_{_t_name}_{_async_id}",

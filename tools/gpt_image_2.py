@@ -25,6 +25,9 @@ SPEC = {
         'type': 'object',
         'required': ['prompt'],
         'properties': {
+            'material_artifact_id': {'type': 'string', 'description': 'Existing image artifact to extend.'},
+            'material_base_version': {'type': 'string', 'description': 'Immutable reference version for this edit.'},
+            'material_expected_version': {'type': 'string', 'description': 'Current artifact version observed before generation.'},
             'prompt': {
                 'type': 'string',
                 'description': '图片描述文本（支持中英文）'

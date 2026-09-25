@@ -15,6 +15,9 @@ SPEC = {
     "input_schema": {
         "type": "object",
         "properties": {
+            "material_artifact_id": {"type": "string", "description": "已有图片作品 ID"},
+            "material_base_version": {"type": "string", "description": "本次参考的确定版本"},
+            "material_expected_version": {"type": "string", "description": "生成前看到的作品当前版本"},
             "plan_yaml": {"type": "string", "description": "绘图分析节点输出的 YAML 文本，包含 images 列表。推荐且标准字段。"},
             "yaml": {"type": "string", "description": "兼容字段：等同 plan_yaml"},
             "plan": {"description": "兼容字段：可以是 YAML 字符串，也可以是已解析的计划对象"},

@@ -812,12 +812,26 @@ class ToolRegistry:
         """按名称获取单个工具的 spec，不存在返回 None。"""
         return self._tool_specs.get(name)
 
+    async def prepare(self, *, name: str, arguments: dict[str, Any], ctx: Any) -> Any:
+        if name in {"gpt_image_2", "gemini_image", "nai_generate", "nai_generate_from_plan"}:
+            from engine.materials.integration import begin_image_generation
+            return await begin_image_generation(ctx, name, arguments)
+        return None
+
     async def execute(self, *, name: str, arguments: dict[str, Any], ctx: Any) -> dict[str, Any]:
         if name not in self._tool_funcs:
             return _error_tool_response(f"tool not found: {name}")
 
         func = self._tool_funcs[name]
-        return _ensure_tool_response_shape(await func(arguments, ctx))
+        try:
+            operation = await self.prepare(name=name, arguments=arguments, ctx=ctx)
+        except Exception as error:
+            return _error_tool_response(f"图像版本登记失败，尚未调用生图服务：{error}")
+        result = await func(arguments, ctx)
+        if name in {"gpt_image_2", "gemini_image", "nai_generate", "nai_generate_from_plan"}:
+            from engine.materials.integration import persist_generated_images
+            result = await persist_generated_images(ctx, name, arguments, result, operation=operation)
+        return _ensure_tool_response_shape(result)
 
     async def load_mcp_tools(self) -> int:
         """Scan enabled MCP clients and register their tools as first-class tools."""

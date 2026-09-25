@@ -19,6 +19,9 @@ SPEC = {
     "input_schema": {
         "type": "object",
         "properties": {
+            "material_artifact_id": {"type": "string", "description": "已有图片作品 ID"},
+            "material_base_version": {"type": "string", "description": "本次参考的确定版本"},
+            "material_expected_version": {"type": "string", "description": "生成前看到的作品当前版本"},
             "prompt": {"type": "string", "description": "正面提示词 / base scene prompt"},
             "negative_prompt": {"type": "string", "description": "负面提示词 / base negative prompt"},
             "character_prompts": {
