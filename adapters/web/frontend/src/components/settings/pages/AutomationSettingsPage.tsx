@@ -4,7 +4,6 @@
 // and delete actions here, and render the selected task form in the Settings right
 // panel. Purpose: common schedule edits become safer while raw YAML fallback remains.
 import { useEffect, useRef, useState } from 'react';
-import { RemindersPage } from '../../../features/execution';
 
 import { getSchedulesRaw, updateSchedulesRaw } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
@@ -107,7 +106,6 @@ export const AutomationSettingsPage = () => {
 
   return (
     <PageShell authed={isAuthenticated} description="查看 data/schedules.yaml 中的定时任务。cron 时间按 UTC 解释，选择任务后在右栏编辑字段。" title="自动化">
-      <RemindersPage embedded />
       <Block frame="boxed" title="定时任务列表" hint="每项显示 ID、cron、类型、启用状态和 text 预览。字段表单与 Raw YAML fallback 位于右栏。">
         <div className="mb-3 flex flex-wrap gap-2">
           <Button disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新'}</Button>

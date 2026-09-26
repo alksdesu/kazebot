@@ -8,7 +8,7 @@ import { useViewStore } from '../store/viewStore';
 import { Block, Empty, ErrorText, Facts, LinkButton, Panel, ReadOnlyRow } from './components';
 import { SYSTEM_SLOTS_ANCHOR } from './SystemSlots';
 
-const CHANNELS_TAB = 'qq-providers';
+const CHANNELS_TAB = 'providers';
 const SLOT_HREF = `?view=settings&tab=${CHANNELS_TAB}#${SYSTEM_SLOTS_ANCHOR}`;
 
 const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');

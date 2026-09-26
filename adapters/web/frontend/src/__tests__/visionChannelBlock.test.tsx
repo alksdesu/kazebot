@@ -29,7 +29,7 @@ const slots = (over: Record<string, unknown> = {}) => ({
 beforeEach(() => {
   vi.clearAllMocks();
   useSettingsStore.setState({ adminToken: 'admin-token' });
-  useViewStore.setState({ viewMode: 'settings', activeSettingsTab: 'qq-stickers' });
+  useViewStore.setState({ viewMode: 'settings', activeSettingsTab: 'stickers' });
   window.history.replaceState(null, '', '/');
   vi.mocked(getSystemModels).mockResolvedValue(structuredClone(slots()) as any);
 });
@@ -75,13 +75,13 @@ describe('去渠道页', () => {
     await show();
     fireEvent.click(screen.getByRole('link', { name: '去渠道页改读图槽位' }));
 
-    expect(useViewStore.getState().activeSettingsTab).toBe('qq-providers');
+    expect(useViewStore.getState().activeSettingsTab).toBe('providers');
     expect(window.location.hash).toBe(`#${SYSTEM_SLOTS_ANCHOR}`);
   });
 
   it('是真链接，能中键开新页', async () => {
     await show();
     const link = screen.getByRole('link', { name: '去渠道页改读图槽位' }) as HTMLAnchorElement;
-    expect(link.getAttribute('href')).toBe(`?view=settings&tab=qq-providers#${SYSTEM_SLOTS_ANCHOR}`);
+    expect(link.getAttribute('href')).toBe(`?view=settings&tab=providers#${SYSTEM_SLOTS_ANCHOR}`);
   });
 });

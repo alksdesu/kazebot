@@ -1,5 +1,5 @@
-// QQ 域各页的控件出口。通用件出自 settingsControls，这里只加该域独有的两件：
-// 顶部那条 qq.yaml 生效状态条，和把它与加载/未发布态串起来的页壳。
+// 控制台各页的控件出口。通用件出自 settingsControls，这里只加两件页壳：
+// 平台页的生效状态条，以及不碰平台配置的页所用的素壳。
 import { useEffect, type ReactNode } from 'react';
 
 import { Button, Empty, ErrorText, PageShell, StatusBar, type PipTone } from '../components/settings/pages/settingsControls';
@@ -43,6 +43,9 @@ export {
   Textarea,
 } from '../components/settings/pages/settingsControls';
 
+/** 平台注册表里 NapCat QQ 的 display_name。页头、侧栏分组和读屏标签都用它。 */
+export const QQ_PLATFORM_NAME = 'QQ · NapCat';
+
 interface BarState {
   tone: PipTone;
   text: string;
@@ -84,16 +87,31 @@ const QqStatusBar = ({ confirmDiscard }: { confirmDiscard: () => boolean }) => {
   );
 };
 
+/** 不碰平台配置的页面：只有标题、说明和登录提示，不去拉任何平台的生效状态。 */
+export const PlainPage = ({ children, eyebrow, note, title }: {
+  children: ReactNode;
+  eyebrow: string;
+  note: string;
+  title: string;
+}) => {
+  const isAuthenticated = useSettingsStore((state) => state.isAuthenticated);
+  return (
+    <PageShell authed={isAuthenticated} description={note} eyebrow={eyebrow} title={title}>
+      {children}
+    </PageShell>
+  );
+};
+
 interface QqPageProps {
   children: ReactNode;
   alwaysContent?: ReactNode;
-  /** 写的不是 qq.yaml 的页面。bot 没跑也该能改，所以不等它公布生效配置。 */
+  /** 写的不是 qq.yaml 的分区。bot 没跑也该能改，所以不等它公布生效配置。 */
   standalone?: boolean;
   note: string;
   title: string;
 }
 
-/** QQ 域页面的共同外壳：在统一页壳上加生效状态条、解析错误提示和「bot 还没上报」的空态。 */
+/** QQ 平台分区的共同外壳：在统一页壳上加生效状态条、解析错误提示和「bot 还没上报」的空态。 */
 export const QqPage = ({ children, alwaysContent, standalone = false, note, title }: QqPageProps) => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const { live, loading, error, notice, refresh, draft } = useConsoleStore();
@@ -119,7 +137,7 @@ export const QqPage = ({ children, alwaysContent, standalone = false, note, titl
       bar={isAuthenticated && !standalone ? <QqStatusBar confirmDiscard={confirmDiscard} /> : undefined}
       description={note}
       error={error}
-      eyebrow="QQ 机器人"
+      eyebrow={QQ_PLATFORM_NAME}
       notice={notice}
       title={title}
     >

@@ -27,6 +27,7 @@ import { DisplaySettingsW400 } from '@material-symbols-svg/react/icons/display-s
 import { DraftW400 } from '@material-symbols-svg/react/icons/draft';
 import { ErrorW400 } from '@material-symbols-svg/react/icons/error';
 import { FolderW400 } from '@material-symbols-svg/react/icons/folder';
+import { FormatAlignLeftW400 } from '@material-symbols-svg/react/icons/format-align-left';
 import { FolderManagedW400 } from '@material-symbols-svg/react/icons/folder-managed';
 import { HubW400 } from '@material-symbols-svg/react/icons/hub';
 import { InboxW400 } from '@material-symbols-svg/react/icons/inbox';
@@ -38,6 +39,8 @@ import { MenuW400 } from '@material-symbols-svg/react/icons/menu';
 import { MenuBookW400 } from '@material-symbols-svg/react/icons/menu-book';
 import { ModelTrainingW400 } from '@material-symbols-svg/react/icons/model-training';
 import { MonitorHeartW400 } from '@material-symbols-svg/react/icons/monitor-heart';
+import { MoodW400 } from '@material-symbols-svg/react/icons/mood';
+import { NotificationsActiveW400 } from '@material-symbols-svg/react/icons/notifications-active';
 import { OpenInNewW400 } from '@material-symbols-svg/react/icons/open-in-new';
 import { PaletteW400 } from '@material-symbols-svg/react/icons/palette';
 import { PendingW400 } from '@material-symbols-svg/react/icons/pending';
@@ -81,6 +84,7 @@ const ICON_MAP: Record<string, SvgIcon> = {
   error: ErrorW400,
   folder: FolderW400,
   folder_managed: FolderManagedW400,
+  format_align_left: FormatAlignLeftW400,
   hub: HubW400,
   inbox: InboxW400,
   info: InfoW400,
@@ -91,6 +95,8 @@ const ICON_MAP: Record<string, SvgIcon> = {
   menu_book: MenuBookW400,
   model_training: ModelTrainingW400,
   monitor_heart: MonitorHeartW400,
+  mood: MoodW400,
+  notifications_active: NotificationsActiveW400,
   open_in_new: OpenInNewW400,
   palette: PaletteW400,
   pending: PendingW400,

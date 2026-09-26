@@ -4,6 +4,7 @@
 // Zustand store. Purpose: App.tsx can select a registered view without growing new
 // modal booleans or business conditionals.
 import { create } from 'zustand';
+import { resolveSettingsTabId } from '../components/settings/settingsTabAliases';
 import { confirmNavigation } from '../hooks/useUnsavedChanges';
 
 export type ViewMode = 'chat' | 'settings' | 'execution' | 'materials';
@@ -24,7 +25,7 @@ const DEFAULT_SETTINGS_TAB = 'general';
 const LEGACY_DOMAIN_TABS: Record<string, string> = { runtime: 'qq-link' };
 
 export function tabForLegacyDomain(domain: string): string {
-  return LEGACY_DOMAIN_TABS[domain] || `qq-${domain}`;
+  return resolveSettingsTabId(LEGACY_DOMAIN_TABS[domain] || `qq-${domain}`);
 }
 
 const query = new URLSearchParams(window.location.search);
@@ -35,7 +36,7 @@ const initialViewMode: ViewMode =
     REQUESTED_VIEW === 'execution' || REQUESTED_VIEW === 'materials' ? REQUESTED_VIEW : 'chat';
 const initialSettingsTab = LEGACY_DOMAIN
   ? tabForLegacyDomain(LEGACY_DOMAIN)
-  : query.get('tab') || DEFAULT_SETTINGS_TAB;
+  : resolveSettingsTabId(query.get('tab') || DEFAULT_SETTINGS_TAB);
 
 function syncViewQuery(viewMode: ViewMode, tab: string): void {
   // Why: the view is restored from the query string on load, so leaving a stale
@@ -70,7 +71,7 @@ export const useViewStore = create<ViewState>((set, get) => ({
     // Why: Header node/model labels should land directly on the related settings
     // page. How: set both the view mode and tab in one store update. Purpose: the
     // shell swaps left and center content atomically.
-    const nextTab = tab || get().activeSettingsTab || DEFAULT_SETTINGS_TAB;
+    const nextTab = resolveSettingsTabId(tab || get().activeSettingsTab || DEFAULT_SETTINGS_TAB);
     if ((get().viewMode !== 'settings' || nextTab !== get().activeSettingsTab) && !confirmNavigation()) return;
     syncViewQuery('settings', nextTab);
     set({ viewMode: 'settings', activeSettingsTab: nextTab });
@@ -86,7 +87,8 @@ export const useViewStore = create<ViewState>((set, get) => ({
     set({ viewMode: 'chat' });
   },
 
-  setSettingsTab: (tab) => {
+  setSettingsTab: (requested) => {
+    const tab = resolveSettingsTabId(requested);
     if ((get().viewMode !== 'settings' || tab !== get().activeSettingsTab) && !confirmNavigation()) return;
     // [2026-06-01] Tab changes are local to the settings view.
     // Why: adding future settings pages should not require App.tsx changes. How:
@@ -98,6 +100,8 @@ export const useViewStore = create<ViewState>((set, get) => ({
 }));
 
 // 老链接进来先把地址栏改写成新参数，不然刷新一次又走一遍迁移，且 ?domain= 一直挂着。
-if (REQUESTED_VIEW === 'console') syncViewQuery('settings', initialSettingsTab);
+if (REQUESTED_VIEW === 'console' || (initialViewMode === 'settings' && query.get('tab') && query.get('tab') !== initialSettingsTab)) {
+  syncViewQuery('settings', initialSettingsTab);
+}
 
 export { DEFAULT_SETTINGS_TAB };

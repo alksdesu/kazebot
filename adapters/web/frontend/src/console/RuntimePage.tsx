@@ -1,7 +1,7 @@
-// 运行：谁连上了、队列与缓存的实况、改一次要重启的那几个值，以及唯一的危险操作。
-import { useEffect, useState } from 'react';
+// 链路：队列与缓存的实况、改一次要重启的那几个值，以及唯一的危险操作。
+import { useState } from 'react';
 
-import { checkHealth, restartEngine, type HealthState } from '../api/supervisorClient';
+import { restartEngine } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import {
   Block,
@@ -12,65 +12,11 @@ import {
   Fixed,
   Footnote,
   Grid,
-  List,
   Panel,
-  Pip,
   ReadOnlyRow,
-  Row,
 } from './components';
-import { useConsoleStore, useLiveValue, useRuntime } from './consoleStore';
+import { useLiveValue, useRuntime } from './consoleStore';
 import { BoolOption, NumberField } from './fields';
-
-const Link = ({ name, state, detail }: { name: string; state: string; detail: string }) => (
-  <div className="flex flex-wrap items-baseline gap-2.5">
-    <span className="min-w-[var(--duties-label-min-width)] font-mono text-xs font-medium">{name}</span>
-    <span className="font-mono text-xs">{state}</span>
-    <span className="font-mono text-mini text-[var(--duties-tertiary)]">{detail}</span>
-  </div>
-);
-
-const Connections = () => {
-  const live = useConsoleStore((state) => state.live);
-  const runtime = useRuntime();
-  const [health, setHealth] = useState<HealthState | null>(null);
-
-  useEffect(() => { void checkHealth().then(setHealth).catch(() => setHealth(null)); }, []);
-
-  const botAlive = Boolean(live?.published && !live.stale);
-  const napcat = Boolean(runtime.onebot_connected);
-  const uptime = health?.uptime_seconds;
-  // health.status 是给程序看的字面量（"ok"），别原样摆在中文界面上。
-  const supervisor = !health ? '连不上' : health.status === 'ok' ? '在线' : health.status || '在线';
-
-  return (
-    <List>
-      <Row>
-        <Pip tone={health ? 'live' : 'halt'} />
-        <Link
-          detail={uptime === undefined ? '' : `已运行 ${Math.floor(uptime / 60)} 分钟`}
-          name="Supervisor"
-          state={supervisor}
-        />
-      </Row>
-      <Row>
-        <Pip tone={botAlive ? 'live' : 'halt'} />
-        <Link
-          detail={runtime.pid ? `pid ${runtime.pid}` : ''}
-          name="QQ 适配进程"
-          state={botAlive ? '在线' : live?.published ? '心跳中断' : '没在跑'}
-        />
-      </Row>
-      <Row>
-        <Pip tone={napcat ? 'live' : botAlive ? 'halt' : 'idle'} />
-        <Link
-          detail={botAlive ? '' : '适配进程没在跑，这一项无从判断'}
-          name="NapCat"
-          state={!botAlive ? '未知' : napcat ? '已连接' : '未连接'}
-        />
-      </Row>
-    </List>
-  );
-};
 
 const QueueFacts = () => {
   const runtime = useRuntime();
@@ -145,7 +91,7 @@ const RestartEngine = () => {
     if (!token) return;
     setSaid('正在请求…');
     try {
-      const result = await restartEngine(token, '用户从 QQ 控制台请求重启引擎');
+      const result = await restartEngine(token, '用户从控制台请求重启引擎');
       setSaid(result?.scheduled ? '已排上重启，几秒后 worker 会重新起来。' : '调度器拒绝了这次重启。');
     } catch (error) {
       setSaid(error instanceof Error ? error.message : '请求失败');
@@ -176,10 +122,6 @@ const RestartEngine = () => {
 
 export const RuntimePage = () => (
   <>
-    <Block hint="三段链路，断一段 bot 就不说话" title="连接">
-      <Connections />
-    </Block>
-
     <Block hint="开着的时候群消息排队处理，不再并发" title="消息队列">
       <Grid>
         <BoolOption

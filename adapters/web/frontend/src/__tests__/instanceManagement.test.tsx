@@ -9,7 +9,7 @@ vi.mock('../api/supervisorClient', async importOriginal => ({
   ...await importOriginal<typeof import('../api/supervisorClient')>(),
   getInstances: vi.fn(), getQqAccount: vi.fn(), getQqLoginQrcode: vi.fn(),
   createInstance: vi.fn(), deleteInstance: vi.fn(), getInstanceProgress: vi.fn(),
-  qqEnterLoginMode: vi.fn(), qqQuickLogin: vi.fn(), qqPinAccount: vi.fn(),
+  qqEnterLoginMode: vi.fn(), qqQuickLogin: vi.fn(), qqPinAccount: vi.fn(), getQqScope: vi.fn(),
 }));
 
 const rows: api.ConsoleInstance[] = [
@@ -29,6 +29,7 @@ beforeEach(() => {
   useSettingsStore.setState({ adminToken: 'current-token', isAuthenticated: true });
   vi.mocked(api.getInstances).mockResolvedValue(rows);
   vi.mocked(api.getQqAccount).mockResolvedValue(account);
+  vi.mocked(api.getQqScope).mockResolvedValue({ current_scope: '1000001', live_scope: '1000001', bot_alive: false, preview: null });
   vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('unexpected request')));
   window.history.replaceState(null, '', '/web/?view=settings&tab=qq-account');
 });

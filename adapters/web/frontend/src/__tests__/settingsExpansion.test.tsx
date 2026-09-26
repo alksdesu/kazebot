@@ -56,19 +56,26 @@ describe('expanded settings registry', () => {
       'mcp',
       'automation',
       'advanced',
-      // QQ 那十页从独立控制台并进来，排在最后。
+      // 机器人组：全平台共用的那几页。
+      'persona',
+      'memory',
+      'stickers',
+      'community',
+      'conversation',
+      'reminders',
+      // 模型与渠道从 QQ 页表里移出来，自成一组。
+      'providers',
+      'models',
+      // 平台组：QQ · NapCat 的各个分区。
       'qq-account',
       'qq-channels',
-      'qq-timing',
-      'qq-conversation',
+      'qq-trigger',
       'qq-permissions',
-      'qq-community',
-      'qq-persona',
-      'qq-memory',
-      'qq-stickers',
+      'qq-input',
+      'qq-output',
+      'qq-interaction',
+      'qq-sticker',
       'qq-link',
-      'qq-providers',
-      'qq-models',
     ]);
     expect(settingsTabs.find((tab) => tab.id === 'system')).toMatchObject({ label: '系统', icon: 'settings_power', order: 4 });
     expect(settingsTabs.find((tab) => tab.id === 'tools')).toMatchObject({ label: '工具与权限', icon: 'build', order: 8 });

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as api from '../api/supervisorClient';
 import { ModelsPage } from '../console/ModelsPage';
 import { ProvidersPage } from '../console/ProvidersPage';
+import { AccountScope } from '../console/AccountScope';
 import { MemoryPage } from '../console/MemoryPage';
 import { useSettingsStore } from '../store/settingsStore';
 
@@ -216,7 +217,7 @@ describe('记忆来源与上下文读取', () => {
 
 describe('迁移预览目标绑定', () => {
   it('目标变更立即作废旧预览，必须重新预览才能迁移', async () => {
-    render(<MemoryPage />); await screen.findByText('10001');
+    render(<AccountScope />); await screen.findByText('10001');
     fireEvent.change(screen.getByLabelText('搬到'), { target: { value: '20002' } }); fireEvent.click(screen.getByRole('button', { name: '预览' }));
     await screen.findByRole('button', { name: '执行搬迁' });
     fireEvent.change(screen.getByLabelText('搬到'), { target: { value: '30003' } });
@@ -229,7 +230,7 @@ describe('迁移预览目标绑定', () => {
     const preview = deferred<api.ScopeStatus>(); const write = deferred<Awaited<ReturnType<typeof api.migrateQqScope>>>();
     vi.mocked(api.getQqScope).mockImplementation(async (_auth, target) => target ? preview.promise : scopeStatus());
     vi.mocked(api.migrateQqScope).mockReturnValue(write.promise);
-    render(<MemoryPage />); await screen.findByText('10001');
+    render(<AccountScope />); await screen.findByText('10001');
     fireEvent.change(screen.getByLabelText('搬到'), { target: { value: ' 20002 ' } }); fireEvent.click(screen.getByRole('button', { name: '预览' }));
     expect(screen.getByLabelText('搬到')).toBeDisabled();
     await act(async () => preview.resolve(scopeStatus('20002')));

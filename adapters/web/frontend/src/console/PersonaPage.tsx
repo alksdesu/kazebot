@@ -1,5 +1,4 @@
-// 人格。这一页有两套写入路径：人设和模型各自就地保存，
-// 下半页的开关走 qq.yaml，由顶部那个「应用」统一写入。
+// 人格：bot 是谁、用哪个模型。两块各自就地保存，写的是节点文件，不经过任何平台配置。
 import { useEffect, useId, useState } from 'react';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
@@ -15,19 +14,14 @@ import { useSettingsStore } from '../store/settingsStore';
 import { mergeModelChoices, modelsFromNodes, modelsFromProviders } from '../utils/modelChoices';
 import {
   Block,
-  Desc,
   ErrorText,
   Facts,
-  Fixed,
   Footnote,
-  Grid,
   Input,
   Panel,
   SaveBar,
   Textarea,
 } from './components';
-import { BoolOption, NumberField, SubOption } from './fields';
-import { WordList } from './WordList';
 import {
   NodeYamlShapeError,
   readYamlScalar,
@@ -224,119 +218,8 @@ export const PersonaPage = () => (
       </Panel>
     </Block>
 
-    <Block hint="消息发出去之前的处理" title="回复格式">
-      <Grid>
-        <BoolOption
-          configKey="reply_to_trigger"
-          desc="回复时引用触发它的那条消息，群里热闹时能看清在回谁。"
-          fallback
-          label="引用原消息"
-        />
-        <BoolOption
-          configKey="strip_asterisk_styles"
-          desc="QQ 不渲染 Markdown，*强调* 会原样显示成星号。"
-          fallback
-          label="去掉星号强调"
-        />
-        <BoolOption
-          configKey="strip_underscore_styles"
-          desc="下划线同理。但代码和文件名里常有下划线，默认不动。"
-          label="去掉下划线强调"
-        />
-        <Fixed name="长度上限">
-          <Desc>超长的回复会被截断，避免被 QQ 拒收。</Desc>
-          <NumberField configKey="message_limit" label="单条消息" step={100} unit="字" />
-          <NumberField configKey="history_text_limit" label="历史里每条" step={50} unit="字" />
-        </Fixed>
-        <BoolOption
-          configKey="enable_image_forward_merge"
-          desc="多张图合并成一条转发发出，而不是一张张发。"
-          label="合并发图"
-        >
-          <NumberField configKey="image_forward_merge_threshold" label="至少" unit="张才合并" />
-          <Desc>
-            默认关是有原因的：合并转发会长时间占住那条唯一的反向 WS，期间发消息、贴表情全部排队。发现卡顿就关掉，即时生效。
-          </Desc>
-        </BoolOption>
-      </Grid>
-    </Block>
-
-    <Block hint="除了说话之外还能做什么" title="群内互动">
-      <Grid>
-        <BoolOption
-          configKey="enable_reactions"
-          desc="给群消息贴表情回应。"
-          fallback
-          label="表情回应"
-        />
-        <BoolOption configKey="enable_auto_like" desc="给群友的资料卡点赞。" label="自动点赞">
-          <NumberField configKey="auto_like_times" label="每人每天" unit="次" />
-        </BoolOption>
-        <BoolOption
-          configKey="enable_preempt"
-          desc="上一条还没答完就来了新消息时，放弃旧的去答新的。"
-          label="抢答"
-        />
-        <BoolOption
-          configKey="enable_echo"
-          desc="连着几个人刷同一句时，也跟一条。"
-          label="跟复读"
-        >
-          <NumberField configKey="echo_threshold" label="连续" unit="条才跟" />
-          <NumberField configKey="echo_max_length" label="最长" unit="字" />
-          <NumberField configKey="echo_window_sec" label="时间窗" unit="秒" />
-          <NumberField configKey="echo_cooldown_sec" label="跟完歇" unit="秒" />
-          <Desc>
-            必须是不同的人发的，同一个人连刷不算。命令、@、回复和长文本一律不跟；表情包按图片本身比对，
-            三个人发三张不同的图不会被当成复读。
-          </Desc>
-        </BoolOption>
-        <Fixed name="表情提示">
-          <Desc>告诉模型有哪些收藏表情可用。0 表示不告诉它。</Desc>
-          <NumberField configKey="face_prompt_limit" label="最多列出" unit="个" />
-        </Fixed>
-      </Grid>
-    </Block>
-
-    <Block hint="群友发来的东西里，哪些交给模型看" title="能接收什么">
-      <Grid>
-        <BoolOption configKey="enable_image_input" desc="把图片交给视觉节点识别。" fallback label="看图片">
-          <NumberField configKey="max_images_per_turn" label="每轮最多" unit="张" />
-          <NumberField configKey="image_max_bytes" label="单图上限" scale={1024 * 1024} step={1} unit="MB" />
-          <NumberField configKey="image_wait_after_text_sec" label="等图窗口" step={0.5} unit="秒" />
-          <Desc>QQ 常把「文字＋图」拆成两条发过来，收到纯文本后等这么久看有没有图跟上。</Desc>
-        </BoolOption>
-        <BoolOption configKey="enable_file_input" desc="读取群文件的内容。" fallback label="读文件">
-          <NumberField configKey="max_files_per_turn" label="每轮最多" unit="个" />
-          <NumberField configKey="file_max_bytes" label="单文件上限" scale={1024 * 1024} step={1} unit="MB" />
-          <WordList
-            configKey="file_extra_allowed_extensions"
-            empty="只收内置白名单里的类型"
-            label="额外放行"
-            placeholder="输入一个扩展名，回车添加"
-          />
-          <Desc>可执行文件与脚本类型不受这里影响，填了也不会收。</Desc>
-        </BoolOption>
-        <BoolOption
-          configKey="enable_forward_msg_input"
-          desc="展开合并转发的聊天记录。"
-          fallback
-          label="读合并转发"
-        >
-          <NumberField configKey="forward_msg_max_depth" label="嵌套深度" unit="层" />
-          <NumberField configKey="forward_msg_max_messages" label="最多" step={10} unit="条" />
-          <NumberField configKey="forward_msg_text_limit" label="总字数" step={1000} unit="字" />
-          <NumberField configKey="forward_msg_timeout_sec" label="展开超时" step={0.5} unit="秒" />
-          <SubOption configKey="enable_forward_msg_media" fallback label="里面的图片和文件也收" />
-          <SubOption configKey="forward_msg_expand_for_trigger" fallback label="群里靠关键词也能触发" />
-          <Desc>后一项关掉，转发消息就只有 @ 或回复才理。</Desc>
-        </BoolOption>
-      </Grid>
-    </Block>
-
     <Footnote>
-      上面两块各自保存，和顶部的「应用」无关 —— 它们写的是节点文件，不是 qq.yaml。
-      下面三块才走 qq.yaml，改完要点顶部的「应用」。
+      两块各自保存，写的是节点文件，所有平台共用同一份人格。各平台自己的发送处理在「平台」组里改。
     </Footnote>
   </>
 );

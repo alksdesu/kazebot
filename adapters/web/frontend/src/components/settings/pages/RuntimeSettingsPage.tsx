@@ -4,16 +4,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import {
+  checkHealth,
   getRuntimeStatus,
   listLogFiles,
   readLogTail,
   retryEngine,
+  type HealthState,
   type LogFileInfo,
   type RuntimeStatus,
   type WorkerHealth,
 } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
-import { Block, Button, Empty, Facts, Footnote, PageShell, Pip, StatusText } from './settingsControls';
+import { Block, Button, Empty, Facts, Footnote, List, PageShell, Pip, Row, StatusText } from './settingsControls';
 
 const POLL_MS = 5000;
 const TAIL_LINES = 500;
@@ -31,6 +33,38 @@ const sizeText = (bytes: number): string => {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+};
+
+/** 调度器自己的死活。它挂了这一页的其余内容全都读不到，所以判据不能只靠带鉴权的接口。 */
+const SupervisorBlock = () => {
+  const [health, setHealth] = useState<HealthState | null>(null);
+
+  useEffect(() => {
+    const probe = () => { void checkHealth().then(setHealth).catch(() => setHealth(null)); };
+    probe();
+    const timer = setInterval(probe, POLL_MS);
+    return () => clearInterval(timer);
+  }, []);
+
+  const uptime = health?.uptime_seconds;
+  // health.status 是给程序看的字面量（"ok"），别原样摆在中文界面上。
+  const state = !health ? '连不上' : health.status === 'ok' ? '在线' : health.status || '在线';
+
+  return (
+    <Block hint="控制台、任务路由与审批都跑在它里面" title="Supervisor">
+      <List>
+        <Row>
+          <Pip tone={health ? 'live' : 'halt'} />
+          <span className="font-mono text-xs font-semibold">Supervisor</span>
+          <span className="font-mono text-xs text-[var(--duties-secondary)]">{state}</span>
+          <span className="flex-1" />
+          {uptime !== undefined && (
+            <span className="font-mono text-micro text-[var(--duties-tertiary)]">已运行 {duration(uptime)}</span>
+          )}
+        </Row>
+      </List>
+    </Block>
+  );
 };
 
 const WorkerRow = ({ name, health }: { name: string; health: WorkerHealth }) => {
@@ -227,6 +261,8 @@ export const RuntimeSettingsPage = () => {
         {gaveUp.length > 0 && (
           <GaveUpNotice busy={retrying} onRetry={() => void onRetry()} workers={gaveUp} />
         )}
+
+        <SupervisorBlock />
 
         <Block
           hint={status ? `supervisor 已运行 ${duration(status.uptime_sec)}` : ''}

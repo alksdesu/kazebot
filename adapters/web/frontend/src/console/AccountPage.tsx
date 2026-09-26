@@ -21,7 +21,9 @@ import {
   type QqQuickLoginTarget,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
+import { AccountScope } from './AccountScope';
 import { Block, Button, Empty, Facts, Input, Panel, Pre } from './components';
+import { ConnectionCard } from './ConnectionCard';
 import { InstanceLink, InstanceSwitch } from './InstanceSwitch';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useRequestScope } from '../features/asyncState';
@@ -65,8 +67,10 @@ const AccountWorkspace = ({ token }: { token: string }) => {
   }, [token]);
   useEffect(() => { void refresh(); return () => { sequence.current++; }; }, [refresh]);
   return <>
+    <ConnectionCard />
     <InstanceManagement token={token} instances={instances} loading={loading} error={error} refresh={refresh} />
     <AccountConnectionPage token={token} instances={instances} ownershipReady={!loading && !error} />
+    <AccountScope />
   </>;
 };
 
@@ -292,7 +296,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
       `确定要换号吗？\n\n${current} 会立刻下线，NapCat 容器重启后停在等扫码状态，`
       + '期间 bot 完全不可用。新号如果不在原来的群里，群名单和管理员名单都要重配。\n\n'
       + '新号的会话和长期记忆从零开始，各号各记各的。想把这个号的数据带过去，'
-      + '去「记忆」页搬迁；换回来时旧数据会自动回来。\n\n'
+      + '用本页的「记忆归属」搬迁；换回来时旧数据会自动回来。\n\n'
       + '如果只是想让两个号同时在线，要的是多开而不是换号——见本页「多开实例」。',
     )) return;
     if (!isCurrent()) return;

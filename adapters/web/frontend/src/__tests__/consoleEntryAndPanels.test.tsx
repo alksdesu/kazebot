@@ -57,11 +57,12 @@ describe('QQ 分区入口', () => {
     expect(useViewStore.getState().activeSettingsTab).toBe('qq-permissions');
   });
 
-  it('分组标题把 QQ 页和引擎页分开', () => {
+  it('分组标题把机器人、模型、引擎和平台分开', () => {
     render(<SettingsSidebar />);
 
-    expect(screen.getByText('QQ 机器人')).toBeInTheDocument();
-    expect(screen.getByText('模型与渠道')).toBeInTheDocument();
+    for (const group of ['机器人', '模型与渠道', '引擎', '平台']) {
+      expect(screen.getByText(group)).toBeInTheDocument();
+    }
   });
 
   it('两个「运行」不再撞：诊断页和链路页各是各的', () => {
@@ -135,9 +136,11 @@ describe('视图与地址栏同步', () => {
 
 // 书签和聊天记录里还躺着 ?view=console&domain=x 的老链接。
 describe('老控制台链接', () => {
-  it('域名换算成对应的设置分区', () => {
-    expect(tabForLegacyDomain('timing')).toBe('qq-timing');
-    expect(tabForLegacyDomain('stickers')).toBe('qq-stickers');
+  it('域名换算成对应的设置分区，改过名的走别名', () => {
+    expect(tabForLegacyDomain('channels')).toBe('qq-channels');
+    expect(tabForLegacyDomain('timing')).toBe('qq-trigger');
+    expect(tabForLegacyDomain('stickers')).toBe('stickers');
+    expect(tabForLegacyDomain('providers')).toBe('providers');
   });
 
   it('「运行」不能直译：设置页已经有一个 runtime 了', () => {

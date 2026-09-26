@@ -6,8 +6,16 @@
 import { type ComponentType } from 'react';
 import { CommunityPage } from '../../features/community/CommunityPage';
 import { ConversationSettings } from '../../features/community/ConversationSettings';
+import { RemindersPage } from '../../features/execution/RemindersPage';
 
-import { QQ_PAGES, wrapQqPage } from '../../console/pages';
+import {
+  BOT_PAGES,
+  MODEL_PAGES,
+  QQ_SECTIONS,
+  wrapConsolePage,
+  wrapPlatformSection,
+} from '../../console/pages';
+import { resolveSettingsTabId } from './settingsTabAliases';
 import { ClientSettingsPage } from './pages/ClientSettingsPage';
 import { GeneralSettingsPage } from './pages/GeneralSettingsPage';
 import { NodeFilesSettingsPage } from './pages/NodeFilesSettingsPage';
@@ -33,16 +41,18 @@ import {
 } from './panels/SettingsContextPanels';
 
 // 侧栏分段。合并控制台之后这里有二十多项，一长条平铺没法找。
-export type SettingsGroup = 'basics' | 'qq' | 'models' | 'engine';
+// 机器人是「它是谁、记得什么」，平台是「它在哪、怎么收发」，引擎是「它怎么跑」。
+export type SettingsGroup = 'basics' | 'bot' | 'models' | 'engine' | 'platform';
 
 export const SETTINGS_GROUP_LABELS: Record<SettingsGroup, string> = {
   basics: '',
-  qq: 'QQ 机器人',
+  bot: '机器人',
   models: '模型与渠道',
   engine: '引擎',
+  platform: '平台',
 };
 
-export const SETTINGS_GROUP_ORDER: SettingsGroup[] = ['basics', 'qq', 'models', 'engine'];
+export const SETTINGS_GROUP_ORDER: SettingsGroup[] = ['basics', 'bot', 'models', 'engine', 'platform'];
 
 export interface SettingsTabDefinition {
   id: string;
@@ -58,8 +68,6 @@ export interface SettingsTabDefinition {
 }
 
 const CORE_TABS = [
-  { id: 'qq-community', label: '群协作', icon: 'groups', group: 'qq', order: 23.1, Page: CommunityPage },
-  { id: 'qq-conversation', label: '会话与接话', icon: 'forum', group: 'qq', order: 22.1, Page: ConversationSettings },
   { id: 'general', label: '通用', icon: 'tune', group: 'basics', order: 0, Page: GeneralSettingsPage },
   // [2026-06-01] Register browser-only preferences as a first-class settings tab.
   // Why: auto-approval and render defaults are local frontend choices, not backend
@@ -83,19 +91,40 @@ const CORE_TABS = [
   { id: 'advanced', label: '高级', icon: 'code', group: 'engine', order: 13, Page: AdvancedSettingsPage, RightPanel: AdvancedSettingsRightPanel },
   // 出过一次事：engine 崩了三个半小时没人发现，因为界面上没有任何地方看得到它。
   { id: 'runtime', label: '运行', icon: 'monitor_heart', group: 'engine', order: 3, Page: RuntimeSettingsPage },
+  // 提醒是人在聊天里建的，和 cron 定时任务两回事，不该藏在自动化里。
+  { id: 'reminders', label: '提醒', icon: 'notifications_active', group: 'bot', order: 25, Page: RemindersPage },
+  { id: 'community', label: '群协作', icon: 'groups', group: 'bot', order: 23, Page: CommunityPage },
+  { id: 'conversation', label: '会话与接话', icon: 'forum', group: 'bot', order: 24, Page: ConversationSettings },
 ] satisfies SettingsTabDefinition[];
 
-// QQ 域的十页登记在 console/pages。渠道与模型归模型侧，其余归 bot。
-const QQ_TABS: SettingsTabDefinition[] = QQ_PAGES.map((page, index) => ({
+const BOT_TABS: SettingsTabDefinition[] = BOT_PAGES.map((page, index) => ({
   id: page.id,
   label: page.label,
   icon: page.icon,
-  group: page.id === 'qq-providers' || page.id === 'qq-models' ? 'models' : 'qq',
+  group: 'bot',
   order: 20 + index,
-  Page: wrapQqPage(page),
+  Page: wrapConsolePage(SETTINGS_GROUP_LABELS.bot, page),
 }));
 
-export const settingsTabs: SettingsTabDefinition[] = [...CORE_TABS, ...QQ_TABS]
+const MODEL_TABS: SettingsTabDefinition[] = MODEL_PAGES.map((page, index) => ({
+  id: page.id,
+  label: page.label,
+  icon: page.icon,
+  group: 'models',
+  order: 30 + index,
+  Page: wrapConsolePage(SETTINGS_GROUP_LABELS.models, page),
+}));
+
+const PLATFORM_TABS: SettingsTabDefinition[] = QQ_SECTIONS.map((section, index) => ({
+  id: section.id,
+  label: section.label,
+  icon: section.icon,
+  group: 'platform',
+  order: 40 + index,
+  Page: wrapPlatformSection(section),
+}));
+
+export const settingsTabs: SettingsTabDefinition[] = [...CORE_TABS, ...BOT_TABS, ...MODEL_TABS, ...PLATFORM_TABS]
   .sort((a, b) => a.order - b.order);
 
 export function getSettingsTab(tabId: string): SettingsTabDefinition {
@@ -103,5 +132,6 @@ export function getSettingsTab(tabId: string): SettingsTabDefinition {
   // Why: stale links or future removed tabs should not blank the settings view. How:
   // resolve through the registry and return settingsTabs[0] as a safe default.
   // Purpose: the host and right panel share identical fallback behavior.
-  return settingsTabs.find(tab => tab.id === tabId) || settingsTabs[0];
+  const resolved = resolveSettingsTabId(tabId);
+  return settingsTabs.find(tab => tab.id === resolved) || settingsTabs[0];
 }

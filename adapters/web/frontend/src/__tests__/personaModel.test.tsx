@@ -104,7 +104,7 @@ describe('模型候选', () => {
     expect(modelBox()).not.toHaveAttribute('list');
     expect(modelBox()).toHaveValue('$ENV{QQ_MAIN_MODEL}');
     expect(screen.getByText('人设')).toBeInTheDocument();
-    expect(screen.getByText('引用原消息')).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: '人设内容' })).toBeInTheDocument();
   });
 });
 
