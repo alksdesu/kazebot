@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable, DefaultDict, Deque, Dict, List,
 
 from adapters._shared.active_account import ActiveAccountStore
 from adapters._shared.aliases import AliasBook
+from adapters._shared.approvals import ApprovalBook
 from adapters._shared.conversation_queue import ConversationQueue
 from adapters._shared.history_window import ClearBarriers, HistoryWindows
 from adapters._shared.trigger_policy import CooldownState, TriggerDecision
@@ -26,10 +27,12 @@ from .config import (
     ONEBOT_IDEMPOTENCY_MAX_ITEMS,
     ONEBOT_IDEMPOTENCY_SENT_TTL_SECONDS,
     ONEBOT_IDEMPOTENCY_STORE_FILE,
+    PENDING_APPROVAL_TTL_SECONDS,
     RECENT_FILE_MAX_ITEMS,
     RECENT_IMAGE_MAX_ITEMS,
 )
 from .emoji_handler import EmojiRenderer
+from .segments import normalize_message_id
 from .send_contract import OneBotIdempotencyStore
 
 if TYPE_CHECKING:
@@ -46,7 +49,6 @@ if TYPE_CHECKING:
         GroupContentRecord,
         QueuedInbound,
         QueueReplyWaiter,
-        _ApprovalCard,
         _AttachmentSendLock,
     )
 
@@ -204,15 +206,11 @@ class OneBotAdapter:
         self.qq_user_profiles: Dict[str, Dict[str, Any]] = {}
 
         # ---- 审批 ----
-        # 待管理员审批的 Clonoth 操作。key 为 approval_id，value 保存操作、详情和来源会话。
-        self.pending_approvals: Dict[str, Dict[str, Any]] = {}
-        # 发给管理员的审批消息 message_id -> 卡片锚点，支持「引用卡片回同意/拒绝」。
-        # 记录收件人是为了反查时校验「引用者就是这张卡片的收件人」。
-        self.approval_message_ids: "OrderedDict[str, _ApprovalCard]" = OrderedDict()
-        # 已决策/已失效的审批：重复决策或引用已处理卡片时回一句「已被处理」，而非误批另一条。
-        self.settled_approvals: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
-        # 多个管理员同时决策同一条时，只有抢到锁的人能提交。
-        self.approval_decision_lock = asyncio.Lock()
+        self.approvals = ApprovalBook(
+            id_shape=QQ_NAPCAT.id_shape,
+            normalize_ref=normalize_message_id,
+            ttl_seconds=PENDING_APPROVAL_TTL_SECONDS,
+        )
 
         # ---- 表情 ----
         self.bqbs: List[str] = []

@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import asyncio
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from nonebot import on_message, on_notice
 from nonebot.adapters.onebot.v11 import (
     Bot,
@@ -16,6 +16,7 @@ from nonebot.adapters.onebot.v11 import (
     PrivateMessageEvent,
 )
 from nonebot.rule import Rule
+from adapters._shared.approvals import parse_reply_verb
 from adapters._shared.echo_policy import EchoEntry, detect_echo, is_echoable_text
 from adapters._shared.trigger_policy import TriggerConfig, resolve_llm_intent
 from ..echo_rules import QQ_ECHO_RULES
@@ -516,35 +517,14 @@ async def _handle_intent(bot: Bot, event: GroupMessageEvent) -> None:
 _private_matcher = on_message(rule=Rule(permissions._private_message_rule), priority=10, block=True)
 
 
-async def _claim_pending_approval(approval_id: str, admin_id: int, decision: str) -> Optional[Dict[str, Any]]:
-    """原子领取待审批：抢到才返回 info，其余返回 None。领取即登记 settled。"""
-    async with state._adapter.approval_decision_lock:
-        approval._prune_expired_approvals()
-        info = state._adapter.pending_approvals.pop(approval_id, None)
-        if info is None:
-            return None
-        # 领取后进程崩溃则这条在 QQ 侧变 settled、无法再批，engine 侧超时 auto-deny，属 fail-closed。
-        approval._record_settled_approval(
-            approval_id, admin_id=admin_id, decision=decision,
-            operation=str(info.get("operation") or ""),
-        )
-        return info
-
-
-async def _release_approval_claim(approval_id: str, info: Dict[str, Any]) -> None:
-    async with state._adapter.approval_decision_lock:
-        # 一次网络错误不该把审批永久吞掉，放回待审批让人重试。
-        state._adapter.settled_approvals.pop(approval_id, None)
-        state._adapter.pending_approvals[approval_id] = info
-
-
 async def _finish_approval_decision(user_id: int, approval_id: str, decision: str) -> None:
     """提交审批决策并结束当前私聊处理（末尾总会抛出 FinishedException）。
 
     同时服务于“引用回复审批”和“手输审批命令”两个入口，避免重复代码。
     """
+    book = state._adapter.approvals
     # 先摘走再提交：多个管理员同时决策时只有抢到的人能提交。
-    info = await _claim_pending_approval(approval_id, user_id, decision)
+    info = await book.claim(approval_id, user_id, decision)
     if info is None:
         await _private_matcher.finish(approval._settled_approval_notice(approval_id))
     try:
@@ -554,11 +534,11 @@ async def _finish_approval_decision(user_id: int, approval_id: str, decision: st
             comment=f"QQ admin {user_id} {decision}ed via private message.",
         )
     except Exception as exc:
-        await _release_approval_claim(approval_id, info)
+        await book.release(approval_id, info)
         common.logger.exception("submit QQ approval decision failed")
         await _private_matcher.finish(f"提交审批失败：{exc}")
     if not ok:
-        await _release_approval_claim(approval_id, info)
+        await book.release(approval_id, info)
         await _private_matcher.finish("审批提交被 Supervisor 拒绝，请检查日志。")
     common.logger.info(
         "approval decided on QQ: id=%s decision=%s admin=%s", approval_id, decision, user_id,
@@ -592,7 +572,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     user_text = (await message_text._event_text_with_forward(bot, event)).strip() or "你好"
 
     # 裸发“同意”不是审批意图：必须引用 bot 发出的审批卡片才认。
-    reply_verb = approval._parse_approval_reply_verb(user_text)
+    reply_verb = parse_reply_verb(user_text)
     if reply_verb is not None:
         target = await approval._resolve_approval_reply_target(bot, event)
         if target.matched():
@@ -630,12 +610,12 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     # 所以要求带斜杠 —— 否则私聊里一句「ok」就能批掉一条待审批。只认本人名下恰好
     # 一条待审批的情况：0 条说明这就是句普通聊天，多条则无从判断指的是哪一条。
     if live.approval_bare_verb_unique:
-        bare_verb = approval._parse_approval_reply_verb(common._strip_command_prefix(user_text))
+        bare_verb = parse_reply_verb(common._strip_command_prefix(user_text))
         if bare_verb is not None and permissions._can("approval", event):
-            unique_id = approval._unique_pending_approval_for(user_id)
+            unique_id = state._adapter.approvals.unique_pending_for(user_id)
             if unique_id:
                 await _finish_approval_decision(user_id, unique_id, bare_verb)
-            elif approval._pending_approvals_for(user_id) > 1:
+            elif state._adapter.approvals.pending_count_for(user_id) > 1:
                 await _private_matcher.finish(
                     "你名下有多条待审批，分不清是哪一条。请引用那张卡片回复，"
                     "或发送：/审批 同意 <ID>。"

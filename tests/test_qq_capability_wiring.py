@@ -290,7 +290,7 @@ class TestOffShutsTheDoorOnEveryone:
         asyncio.run(runtime.callbacks.TangQiuCallbacks().show_approval_ui("ap-1", "read_file", {}))
 
         assert decisions and decisions[0][1] == "deny"
-        assert not runtime.state._adapter.pending_approvals
+        assert not runtime.state._adapter.approvals.pending
 
     def test_a_member_is_not_told_the_capability_exists(self, runtime: Any) -> None:
         """对名单之外的人说「这项能力关了」等于把这项能力的存在念给他听。"""

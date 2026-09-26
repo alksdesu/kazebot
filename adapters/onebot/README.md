@@ -16,7 +16,7 @@ adapters/onebot/
 │   ├── identity.py              # 发送者 Profile、显示名、匿名成员
 │   ├── anonymize.py             # 匿名别名映射、记忆主体、送模型文本脱敏
 │   ├── permissions.py           # 群 / 私聊 / 管理员准入与 NoneBot Rule
-│   ├── approval.py              # 审批卡片、引用快捷审批、审批命令
+│   ├── approval.py              # 审批卡片的渲染与反查、引用快捷审批入口、回执措辞
 │   ├── message_text.py          # 消息段转文本、合并转发展开、引用解析
 │   ├── media.py                 # 入站图片与文件解析、下载、近期缓存
 │   ├── emotes.py                # 表情包库与收藏表情
@@ -38,7 +38,7 @@ adapters/onebot/
 ├── send_contract.py             # QQ 目标身份与 NapCat 错误指纹，绑定共享的发送防重
 ├── forward_authz.py             # qq_forward 投递鉴权
 ├── echo_rules.py                # 复读判定里 QQ 这一侧的边界：CQ 码、渲染占位符
-├── segments.py                  # OneBot 消息段的纯解析
+├── segments.py                  # OneBot 消息段与消息 id 的纯解析
 ├── attachment_policy.py         # 附件挑选策略
 ├── emoji_handler.py             # QQ 表情与输出文本清理
 ├── faces.py                     # 内置表情 id → 名字
@@ -51,7 +51,7 @@ NoneBot 只出现在 `napcat/` 里，由插件入口加载。
 不分平台的逻辑在 `adapters/_shared/`：触发判定、管理能力档位、复读判定、会话键摘要（盐、稳定键、当前账号记录）、记忆提示，
 以及热载配置引擎（`live_config.py`）、环境变量读取（`env.py`）、手写 yaml 解析（`yaml_loader.py`）、
 出站发送防重（`send_guard.py`）、匿名别名表（`aliases.py`）、群历史窗口与清空门槛（`history_window.py`），
-会话排队（`conversation_queue.py`）、连发合并与暂存（`conversation_coordinator.py`、`burst_store.py`）和抢占候选判定（`preemption.py`）。
+会话排队（`conversation_queue.py`）、连发合并与暂存（`conversation_coordinator.py`、`burst_store.py`）、抢占候选判定（`preemption.py`）和审批状态机（`approvals.py`）。
 `live_config.py` 这边只声明 QQ 的键和配置文件位置，缓存与快照在它持有的 `LiveConfig` 实例上。
 那边不认识 QQ，平台专属的部分（群角色映射、CQ 码边界、消息段解析）留在这里，调用时传进去。
 

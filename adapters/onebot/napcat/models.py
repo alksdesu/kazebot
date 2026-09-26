@@ -97,26 +97,6 @@ class QueueReplyWaiter:
 
 
 @dataclass(frozen=True)
-class _ApprovalCard:
-    """一张审批卡片的锚点：卡片对应的 approval_id 与收件管理员。"""
-
-    approval_id: str
-    admin_id: int
-
-
-@dataclass(frozen=True)
-class _ApprovalReplyTarget:
-    """引用快捷审批的反查结果。from_card 为真表示确认引用的是 bot 发出的审批卡片。"""
-
-    approval_id: str = ""
-    settled_id: str = ""
-    from_card: bool = False
-
-    def matched(self) -> bool:
-        return bool(self.approval_id or self.settled_id or self.from_card)
-
-
-@dataclass(frozen=True)
 class ForwardSource:
     """一张转发卡片的来源。forward_id 要调接口拉，inline 是上报里直接内嵌的子消息。"""
 

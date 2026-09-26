@@ -8,6 +8,7 @@ MUTABLE_FACTORIES = frozenset({
     "dict", "list", "set", "deque", "defaultdict", "OrderedDict", "Lock", "Condition", "ContextVar",
     "CooldownState", "CombatTracker", "TwoPhaseIdempotencyStore", "OneBotIdempotencyStore", "FeatureGateway",
     "AliasBook", "HistoryWindows", "ClearBarriers", "ConversationQueue", "ConversationCoordinator", "BurstStore",
+    "ApprovalBook",
 })
 
 

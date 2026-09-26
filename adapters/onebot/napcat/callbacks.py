@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import logging
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from adapters._shared import capability
+from adapters._shared.approvals import DECISION_DENY
 from ..live_config import live
 from adapters._shared.send_guard import OutboundSendContext, SendContractError, context_from_sources
 from clonoth_sdk import ChildTaskState, MainTaskState, TriggerInfo
@@ -249,14 +249,10 @@ class TangQiuCallbacks:
             )
             return
 
-        approval._prune_expired_approvals()
-        state._adapter.pending_approvals[approval_id] = {
-            "operation": operation,
-            "details": dict(details or {}),
-            "conversation_key": conversation_key,
-            "session_id": session_id,
-            "created_at": time.time(),
-        }
+        state._adapter.approvals.open(
+            approval_id, operation=operation, details=details,
+            conversation_key=conversation_key, session_id=session_id,
+        )
 
         # 档位关掉和名单为空是同一种局面：没有任何人能作出决定，挂着只会等到超时。
         approval_off = permissions._grant_of("approval") == capability.OFF
@@ -274,8 +270,7 @@ class TangQiuCallbacks:
                 )
             except Exception:
                 common.logger.exception("approval deny failed on QQ: id=%s operation=%s", approval_id, operation)
-            state._adapter.pending_approvals.pop(approval_id, None)
-            approval._record_settled_approval(approval_id, admin_id=0, decision="deny", operation=operation)
+            state._adapter.approvals.close(approval_id, decision=DECISION_DENY)
             common.logger.warning("approval denied on QQ: %s id=%s operation=%s", why, approval_id, operation)
             return
 
@@ -297,7 +292,7 @@ class TangQiuCallbacks:
                 )
                 delivered += 1
                 # 记录审批消息 id -> 卡片锚点，使管理员可直接引用该消息回复“审批同意/拒绝”。
-                approval._remember_approval_message(sent_mid, approval_id, int(admin_id))
+                state._adapter.approvals.remember_card(sent_mid, approval_id, admin_id)
             except Exception:
                 common.logger.exception("send approval request to QQ admin failed: admin=%s id=%s", admin_id, approval_id)
 
