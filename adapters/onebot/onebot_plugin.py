@@ -36,7 +36,10 @@ from nonebot.rule import Rule
 # 按人记忆的建档名册由适配层写、engine worker 读，两侧共用这一份判定。
 from engine import memory_subjects
 from engine.attachments import sniff_image_mime
+from platforms.builtin import QQ_NAPCAT
+from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE
 from platforms.ids import normalize_id
+from platforms.inbound import InboundConversation, InboundFacts, InboundSender
 
 from .adapter import OneBotAdapter
 from .faces import face_display_name
@@ -337,6 +340,7 @@ class QueuedInbound:
     direct_interaction: bool = True
     merge_identity: tuple[Any, ...] | None = None
     memory_user_ids: tuple[str, ...] = ()
+    facts: InboundFacts | None = None
 
 
 @dataclass
@@ -362,20 +366,14 @@ class _OneBotFeatureHost:
     def event_router(self) -> Optional[EventRouter]:
         return _adapter.event_router
 
-    def requester(self, event: Any) -> capability.Requester:
-        return _requester(event)
+    def inbound_facts(self, bot: Any, event: Any) -> InboundFacts:
+        return _inbound_facts(bot, event)
+
+    async def replay_event(self, bot: Any, facts: InboundFacts) -> Any:
+        return await _replay_event(bot, facts)
 
     def stable_conversation_key(self, real_conversation_key: str) -> str:
         return _stable_conversation_key(real_conversation_key)
-
-    def anonymous_identity(self, event: Any) -> str:
-        return _anonymous_identity(event)
-
-    def event_display_name(self, event: Any) -> str:
-        return _event_display_name(event)
-
-    def extract_reply_message_id(self, message: Any, raw_message: Any = None) -> Any | None:
-        return _extract_reply_message_id(message, raw_message)
 
     def anonymize_text_for_ai(self, text: str) -> str:
         return _anonymize_text_for_ai(text)
@@ -2401,23 +2399,20 @@ def _sticker_collector_handle() -> Optional[StickerCollector]:
     return _adapter.sticker_collector
 
 
-def _collect_stickers_from_event(
-    event: GroupMessageEvent, attachments: List[Dict[str, Any]],
-) -> None:
+def _collect_stickers(facts: InboundFacts) -> None:
     """把这条消息里的图丢进收集队列。只入队，落盘和查库都在后台。"""
-    if not attachments or not live.sticker_collect:
+    if not facts.attachments or not live.sticker_collect:
         return
     collector = _sticker_collector_handle()
     if collector is None:
         return
     try:
-        marked = any_marked_segment(list(_iter_segments(event.get_message())))
         collector.submit(
-            attachments,
-            group_id=event.group_id,
+            facts.attachments,
+            group_id=facts.conversation.raw_id,
             # 存化名而非真实 QQ 号：这张图会长期留在共享库里。
-            user_key=_event_user_alias(event),
-            marked=marked,
+            user_key=facts.sender.alias,
+            marked=facts.marked_sticker,
         )
     except Exception:
         logger.debug("表情包入队失败", exc_info=True)
@@ -4488,15 +4483,15 @@ def _compose_history_line(
     return f"[{_format_hhmm(timestamp)}] {name}({alias}): {safe_text}"
 
 
-def _format_history_line(event: GroupMessageEvent, bot: Bot, override_text: str = "") -> str:
+def _history_line(facts: InboundFacts) -> str:
     """把群消息格式化为 tangqiu_main 提示词要求的历史行，并匿名化 QQ ID。"""
     return _compose_history_line(
-        timestamp=getattr(event, "time", None),
-        sender=getattr(event, "sender", None),
-        sender_id=event.user_id,
-        text=override_text or _message_to_text(event.get_message(), getattr(bot, "self_id", None)),
-        name_override=_event_display_name(event),
-        alias_override=_event_user_alias(event),
+        timestamp=facts.sent_at,
+        sender=None,
+        sender_id=facts.sender.platform_id,
+        text=facts.text,
+        name_override=facts.sender.display_name,
+        alias_override=facts.sender.alias,
     )
 
 
@@ -4530,30 +4525,22 @@ def _append_group_record(
     return seq
 
 
-def _record_group_message(
-    event: GroupMessageEvent,
-    bot: Bot,
-    override_text: str = "",
-    attachments: List[Dict[str, Any]] | None = None,
-) -> int:
+def _record_group_message(facts: InboundFacts) -> int:
     """记录群最近消息；@Bot 触发消息由 Agent matcher 手动记录，避免被 block 跳过。
 
     返回这条消息在群历史里的序号，0 = 正文为空没有记。
     """
-    text = override_text or _message_to_text(event.get_message(), getattr(bot, "self_id", None))
-    if text.strip():
+    if facts.text.strip():
         # 转发 node 的 user_id 要真实号；匿名占位号发不出去，落库留空由 self_id 兜底。
-        anonymous = bool(_anonymous_identity(event))
-        sender_id = "" if anonymous else str(getattr(event, "user_id", "") or "")
         return _append_group_record(
-            int(event.group_id),
-            _format_history_line(event, bot, override_text=text),
-            text=_compact_text(text, limit=max(live.history_text_limit, 1200)),
-            sender_name=_event_display_name(event),
-            sender_id=sender_id,
-            timestamp=float(getattr(event, "time", None) or time.time()),
-            message_id=str(getattr(event, "message_id", "") or ""),
-            attachments=attachments,
+            int(facts.conversation.raw_id),
+            _history_line(facts),
+            text=_compact_text(facts.text, limit=max(live.history_text_limit, 1200)),
+            sender_name=facts.sender.display_name,
+            sender_id=facts.sender.platform_id,
+            timestamp=facts.sent_at,
+            message_id=facts.message_id,
+            attachments=[dict(item) for item in facts.attachments] or None,
         )
     return 0
 
@@ -5491,14 +5478,124 @@ def _trigger_roll(event: GroupMessageEvent) -> float:
     return int.from_bytes(digest, "big") / float(1 << 64)
 
 
-def _trigger_input(event: GroupMessageEvent, bot: Bot, text: str) -> TriggerInput:
-    """把 NoneBot 事件摊成纯判定要的事实。dry-run 从 JSON 构造同一个结构。"""
-    return TriggerInput(
+def _event_segments(event: Any) -> List[tuple[str, Dict[str, Any]]]:
+    try:
+        return _iter_segments(event.get_message())
+    except Exception:
+        return []
+
+
+def _event_sender_role(event: Any) -> str:
+    sender = getattr(event, "sender", None)
+    role = sender.get("role", "") if isinstance(sender, dict) else getattr(sender, "role", "")
+    return str(role or "")
+
+
+def _inbound_facts(
+    bot: Any,
+    event: Any,
+    *,
+    text: str | None = None,
+    attachments: Iterable[Mapping[str, Any]] = (),
+) -> InboundFacts:
+    """OneBot 事件翻译成平台无关的入站事实。text 为 None 时按消息段渲染正文。"""
+    group_id = getattr(event, "group_id", None)
+    user_id = getattr(event, "user_id", None)
+    self_id = getattr(bot, "self_id", None)
+    anonymous = bool(_anonymous_identity(event))
+    segments = _event_segments(event)
+    is_group = group_id is not None
+    if is_group:
+        real_key = f"qq_group:{normalize_id(group_id)}"
+        channel, kind, raw_id = "qq_group", CHANNEL_GROUP, group_id
+    else:
+        real_key = f"qq_private:{normalize_id(user_id)}"
+        channel, kind, raw_id = "qq_private", CHANNEL_PRIVATE, user_id
+    if text is None:
+        text = _message_to_text(event.get_message(), self_id) if hasattr(event, "get_message") else ""
+    try:
+        reply_to = str(_extract_reply_message_id(event.get_message(), getattr(event, "raw_message", None)) or "")
+    except Exception:
+        reply_to = ""
+    return InboundFacts(
+        sender=InboundSender(
+            platform_id="" if anonymous else user_id,
+            alias=_event_user_alias(event),
+            display_name=_event_display_name(event),
+            group_role="" if anonymous or not is_group else _event_sender_role(event),
+            anonymous=anonymous,
+            listed_admin=(not anonymous) and _is_admin_user(user_id),
+        ),
+        conversation=InboundConversation(
+            platform=QQ_NAPCAT.id, channel=channel, kind=kind, raw_id=raw_id,
+            conversation_key=_stable_conversation_key(real_key), real_conversation_key=real_key,
+        ),
+        self_id=self_id,
+        message_id=str(getattr(event, "message_id", "") or ""),
         text=text or "",
-        group_id=normalize_id(getattr(event, "group_id", None)),
-        user_id=normalize_id(getattr(event, "user_id", None)),
-        at_me=_event_at_mentions_bot(event, bot),
-        reply_to_bot=_event_replies_to_bot(event, bot),
+        text_segments=tuple(str(data.get("text") or "") for kind_, data in segments if kind_ == "text"),
+        mentions=tuple(data.get("qq") for kind_, data in segments if kind_ == "at" and data.get("qq") != "all"),
+        mentions_self=is_group and _event_at_mentions_bot(event, bot),
+        reply_to=reply_to,
+        reply_to_self=is_group and _event_replies_to_bot(event, bot),
+        attachments=tuple(attachments or ()),
+        marked_sticker=any_marked_segment(segments),
+        sent_at=float(getattr(event, "time", None) or time.time()),
+    )
+
+
+@dataclass
+class _ReplayedSender:
+    role: str = "member"
+    card: str = ""
+    nickname: str = ""
+
+
+@dataclass
+class _ReplayedEvent:
+    """重启后从暂存恢复的一条入站，只带下游真正会读的字段。"""
+
+    user_id: int
+    message_id: int
+    time: float
+    sender: _ReplayedSender
+    text: str
+    group_id: int | None = None
+
+    def get_message(self) -> Message:
+        return Message(MessageSegment.text(self.text))
+
+
+async def _replay_event(bot: Any, facts: InboundFacts) -> _ReplayedEvent:
+    """把暂存的入站事实还原成排队链路能吃的事件；群角色现查，暂存时的可能已经变了。"""
+    event = _ReplayedEvent(
+        user_id=int(facts.sender.platform_id),
+        message_id=int(facts.message_id),
+        time=facts.sent_at,
+        sender=_ReplayedSender(nickname=facts.sender.display_name),
+        text=facts.text,
+    )
+    if facts.conversation.is_group:
+        event.group_id = int(facts.conversation.raw_id)
+        try:
+            member = await bot.call_api("get_group_member_info", group_id=event.group_id, user_id=event.user_id)
+            event.sender.role = str(member.get("role", "member"))
+        except Exception:
+            pass
+    return event
+
+
+def _queued_facts(item: QueuedInbound) -> InboundFacts:
+    """排队项的入站事实；老路径构造的排队项没带，就地补一份。"""
+    if item.facts is None:
+        item.facts = _inbound_facts(item.bot, item.event, text=item.user_text)
+    return item.facts
+
+
+def _trigger_input(event: GroupMessageEvent, bot: Bot, text: str) -> TriggerInput:
+    """判定只吃入站事实；dry-run 从 JSON 构造同一个结构。"""
+    return TriggerInput.from_facts(
+        _inbound_facts(bot, event, text=text or ""),
         now=time.time(),
         roll=_trigger_roll(event),
     )
@@ -6095,15 +6192,14 @@ async def _submit_or_preempt_inbound(
 
 
 def _queue_merge_identity(item: QueuedInbound) -> tuple[Any, ...] | None:
-    user_id = str(getattr(item.event, "user_id", "") or "")
-    if not user_id or _anonymous_identity(item.event):
+    facts = _queued_facts(item)
+    sender = facts.sender
+    if not sender.platform_id or sender.anonymous:
         return None
-    sender = getattr(item.event, "sender", None)
-    role = sender.get("role", "") if isinstance(sender, dict) else getattr(sender, "role", "")
     return (
         item.real_conversation_key, item.channel, item.is_dm, item.entry_node_id,
-        str(getattr(item.bot, "self_id", "") or ""), user_id, role,
-        _is_admin_user(user_id), tuple(_grant_of(cap.key) for cap in capability.CAPABILITIES),
+        facts.self_id, sender.platform_id, _event_sender_role(item.event),
+        sender.listed_admin, tuple(_grant_of(cap.key) for cap in capability.CAPABILITIES),
         item.platform_updates.get("_route_hints", {}).get("topic_id", ""),
     )
 
@@ -6123,6 +6219,7 @@ def _merge_queued_inbound(existing: QueuedInbound, item: QueuedInbound) -> None:
         *item.platform_updates.get("_route_hints", {}).get("source_message_refs", []),
     ]))
     existing.event = item.event
+    existing.facts = item.facts
     existing.platform_updates = dict(item.platform_updates)
     existing.platform_updates["_source_attachments"] = source_attachments_from_merged(existing.attachments)
     if source_refs:
@@ -9404,7 +9501,7 @@ async def _handle_feature_command(bot: Bot, event: Event) -> None:
         result = {"text": _help_text(event), "attachments": []}
     actor = _adapter.features.actor(bot, event)
     if getattr(event, "group_id", None) is not None:
-        _record_group_message(event, bot, override_text=text)
+        _record_group_message(_inbound_facts(bot, event, text=text or None))
         target = {"type": "group", "group_id": event.group_id, "conversation_key": actor["scope"], "reply_message_id": event.message_id}
     else:
         target = {"type": "private", "user_id": event.user_id, "conversation_key": actor["scope"]}
@@ -9469,8 +9566,9 @@ async def _record_non_trigger_message(bot: Bot, event: GroupMessageEvent) -> Non
         )
         _remember_recent_images(stable_conversation_key, event, attachments)
         await _adapter.features.register_attachments(bot, event, attachments)
-        _collect_stickers_from_event(event, attachments)
-        _record_group_message(event, bot, override_text=expanded_text, attachments=attachments)
+        facts = _inbound_facts(bot, event, text=expanded_text or None, attachments=attachments)
+        _collect_stickers(facts)
+        _record_group_message(facts)
         metadata = await _adapter.features.prepare(bot, event)
         if _adapter.features.blocked(metadata) or metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled"):
             return
@@ -9638,7 +9736,7 @@ async def _finish_local_command(
     不在这里记，整段交互在群历史里就消失，后面的对话看不到「刚才有人改过模型」。
     """
     await _check_local_group_send(bot, event)
-    _record_group_message(event, bot, override_text=user_text, attachments=attachments)
+    _record_group_message(_inbound_facts(bot, event, text=user_text or None, attachments=attachments))
     _record_bot_reply(int(event.group_id), reply)
     await matcher.finish(reply)
 
@@ -9695,7 +9793,7 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
         await _adapter.features.decision(bot, event, action, verdict.reason)
         if action == "react" and getattr(verdict, "reaction_id", "") in _REACT_MODEL_EMOJIS:
             if await _set_message_react(bot, event, verdict.reaction_id, True):
-                _record_group_message(event, bot, override_text=user_text)
+                _record_group_message(_inbound_facts(bot, event, text=user_text or None))
                 await matcher.finish()
             await _adapter.features.decision(bot, event, "short_reply", "表态未送达，改为短答")
         if action == "ignore":
@@ -9758,7 +9856,8 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
     if draw_direct_prompt is None:
         # /生图 不吃历史图：混进来的图会把这一轮拽到视觉节点。
         await _merge_recent_attachments_after_text(event=event, conversation_key=stable_conversation_key, user_text=user_text, attachments=attachments)
-    current_seq = _record_group_message(event, bot, override_text=user_text, attachments=attachments)
+    facts = _inbound_facts(bot, event, text=user_text or None, attachments=attachments)
+    current_seq = _record_group_message(facts)
     entry_node_id = DRAW_NODE_ID if draw_direct_prompt is not None else ""
     if draw_direct_prompt is not None:
         if attachments:
@@ -9800,6 +9899,7 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
             entry_node_id=entry_node_id,
             history_watermark=history_watermark,
             direct_interaction=direct_interaction,
+            facts=facts,
         ))
     except Exception as exc:
         logger.exception("submit inbound failed")
@@ -10075,6 +10175,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
             platform_updates=platform_updates,
             user_text=user_text,
             entry_node_id=entry_node_id,
+            facts=_inbound_facts(bot, event, text=user_text or None, attachments=attachments),
         ))
         try:
             await bot.call_api("set_input_status", user_id=int(event.user_id), event_type=1)

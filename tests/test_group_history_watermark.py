@@ -52,11 +52,9 @@ def _build(runtime, user_id: int = 10001, group_id: int = _GROUP_ID, *, exclude_
 
 def _record(runtime, text: str = "在吗", group_id: int = _GROUP_ID) -> int:
     """走真实记录路径写一条群消息，返回它的序号。"""
-    return runtime._record_group_message(
-        _event(runtime, group_id=group_id),
-        SimpleNamespace(self_id="90000"),
-        override_text=text,
-    )
+    return runtime._record_group_message(runtime._inbound_facts(
+        SimpleNamespace(self_id="90000"), _event(runtime, group_id=group_id), text=text,
+    ))
 
 
 def _history_block(text: str) -> list[str]:
@@ -103,7 +101,7 @@ class TestSequenceAllocation:
         set_live_config(runtime, allowed_groups=[_GROUP_ID])
 
         runtime._record_group_message(
-            _event(runtime), SimpleNamespace(self_id="90000"), override_text="hi",
+            runtime._inbound_facts(SimpleNamespace(self_id="90000"), _event(runtime), text="hi"),
         )
         assert (
             runtime._adapter.group_content_records[_GROUP_ID][-1].seq

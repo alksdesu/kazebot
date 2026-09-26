@@ -4,9 +4,13 @@ import asyncio
 import importlib
 import logging
 import time
+from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
+
+from platforms.builtin import QQ_NAPCAT
+from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE
+from platforms.inbound import InboundConversation, InboundFacts, InboundSender
 
 from . import community_commands
 from .conversation_coordinator import ConversationCoordinator
@@ -38,15 +42,11 @@ class FeatureHost(Protocol):
     @property
     def event_router(self) -> Any: ...
 
-    def requester(self, event: Any) -> Any: ...
+    def inbound_facts(self, bot: Any, event: Any) -> InboundFacts: ...
+
+    async def replay_event(self, bot: Any, facts: InboundFacts) -> Any: ...
 
     def stable_conversation_key(self, real_conversation_key: str) -> str: ...
-
-    def anonymous_identity(self, event: Any) -> str: ...
-
-    def event_display_name(self, event: Any) -> str: ...
-
-    def extract_reply_message_id(self, message: Any, raw_message: Any = None) -> Any | None: ...
 
     def anonymize_text_for_ai(self, text: str) -> str: ...
 
@@ -84,18 +84,21 @@ class FeatureGateway:
         self.recovered_accounts: set[str] = set()
         self.burst_store = BurstStore(Path(host.workspace) / "data" / "onebot_bursts.sqlite3")
 
-    def actor(self, bot, event) -> dict:
-        group_id = getattr(event, "group_id", None)
-        requester = self.host.requester(event)
-        real_key = f"qq_group:{group_id}" if group_id is not None else f"qq_private:{getattr(event, 'user_id', '')}"
+    def facts_of(self, bot, source) -> InboundFacts:
+        return source if isinstance(source, InboundFacts) else self.host.inbound_facts(bot, source)
+
+    def actor(self, bot, source) -> dict:
+        facts = self.facts_of(bot, source)
+        group = facts.conversation.is_group
         return {
-            "scope": self.host.stable_conversation_key(real_key),
-            "user_id": "" if self.host.anonymous_identity(event) else str(getattr(event, "user_id", "") or ""),
-            "is_admin": requester.listed_admin, "role": (requester.group_role or "member") if group_id is not None else "member",
-            "channel": "qq_group" if group_id is not None else "qq_private",
-            "bot_scope": str(getattr(bot, "self_id", "") or ""),
-            "message_id": str(getattr(event, "message_id", "") or ""),
-            "display_name": self.host.event_display_name(event),
+            "scope": facts.conversation.conversation_key,
+            "user_id": facts.sender.platform_id,
+            "is_admin": facts.sender.listed_admin,
+            "role": (facts.sender.group_role or "member") if group else "member",
+            "channel": facts.conversation.channel,
+            "bot_scope": facts.self_id,
+            "message_id": facts.message_id,
+            "display_name": facts.sender.display_name,
         }
 
     def target_actor(self, bot, target) -> dict:
@@ -174,34 +177,36 @@ class FeatureGateway:
     async def prepare(self, bot, event):
         if not self.available:
             return {}
-        actor = self.actor(bot, event)
+        facts = self.facts_of(bot, event)
+        actor = self.actor(bot, facts)
         if not actor["user_id"]:
             return {}
-        text = await self.host.group_trigger_text(bot, event) if getattr(event, "group_id", None) is not None else await self.host.event_text_with_forward(bot, event)
-        reply_ref = str(self.host.extract_reply_message_id(event.get_message(), getattr(event, "raw_message", None)) or "")
+        text = await self.host.group_trigger_text(bot, event) if facts.conversation.is_group else await self.host.event_text_with_forward(bot, event)
+        facts = replace(facts, text=text)
+        reply_ref = facts.reply_to
         existing = self.coordinator.metadata(actor)
         if existing:
             return existing
         try:
             result = await self.coordinator.prepare(self.host.client, actor, self.host.anonymize_text_for_ai(text),
-                                                    reply_ref=reply_ref, sender_name=self.host.event_display_name(event))
+                                                    reply_ref=reply_ref, sender_name=facts.sender.display_name)
             result["raw_text"] = text
             result["actor"] = actor
-            result["direct"] = bool(getattr(event, "group_id", None) is None or self.host.is_direct_bot_interaction(event, bot, text)
+            result["direct"] = bool(not facts.conversation.is_group or self.host.is_direct_bot_interaction(event, bot, text)
                                     or self.host.group_trigger_decision_once(event, bot, text).signal in {"name", "reply", "at", "prefix"})
-            journal = await self.record_inbound(bot, event, actor, text, reply_ref)
+            journal = await self.record_inbound(facts, actor)
             result["journal_recorded"] = bool((journal or {}).get("recorded"))
             return result
         except Exception:
             logger.warning("feature preparation failed", exc_info=True)
             return {}
 
-    async def record_inbound(self, bot, event, actor, text, reply_ref):
+    async def record_inbound(self, facts: InboundFacts, actor):
         try:
             module = importlib.import_module(f"{__package__}.material_commands")
-            return await module.record_message(self.host.client, actor, message_id=actor["message_id"], text=text,
-                                        timestamp=float(getattr(event, "time", None) or time.time()),
-                                        sender_name=self.host.event_display_name(event), reply_ref=reply_ref)
+            return await module.record_message(self.host.client, actor, message_id=actor["message_id"], text=facts.text,
+                                        timestamp=facts.sent_at, sender_name=facts.sender.display_name,
+                                        reply_ref=facts.reply_to)
         except (ModuleNotFoundError, AttributeError):
             return
         except Exception:
@@ -231,7 +236,8 @@ class FeatureGateway:
     async def register_attachments(self, bot, event, attachments):
         if not self.available or not attachments:
             return
-        actor = self.actor(bot, event)
+        facts = self.facts_of(bot, event)
+        actor = self.actor(bot, facts)
         metadata = self.coordinator.metadata(actor)
         if not actor["user_id"] or not (metadata.get("direct") or metadata.get("journal_recorded")):
             return
@@ -242,12 +248,12 @@ class FeatureGateway:
                 if not attachment.get("path"):
                     continue
                 source = await module.register_attachment(self.host.client, actor, attachment,
-                                                         message_id=actor["message_id"], source_time=getattr(event, "time", None))
+                                                         message_id=actor["message_id"], source_time=facts.sent_at)
                 attachment["material_source_id"] = source["id"]
                 ids.append(source["id"])
             if metadata.get("journal_recorded"):
                 await module.record_message(self.host.client, actor, message_id=actor["message_id"],
-                                            text=metadata.get("raw_text", ""), timestamp=float(getattr(event, "time", None) or time.time()),
+                                            text=metadata.get("raw_text", ""), timestamp=facts.sent_at,
                                             sender_name=actor.get("display_name", ""), attachments=ids,
                                             reply_ref=metadata.get("reply_ref", ""))
         except Exception:
@@ -268,7 +274,8 @@ class FeatureGateway:
 
     def stage_burst(self, item):
         event = item.event
-        actor = self.actor(item.bot, event)
+        facts = replace(item.facts or self.host.inbound_facts(item.bot, event), text=item.user_text)
+        actor = self.actor(item.bot, facts)
         refs = item.platform_updates.get("_route_hints", {}).get("source_message_refs", [actor["message_id"]])
         data = {"scope": item.stable_conversation_key, "real_key": item.real_conversation_key,
                 "text": item.text, "user_text": item.user_text, "attachments": item.attachments,
@@ -277,7 +284,8 @@ class FeatureGateway:
                 "memory_user_ids": item.memory_user_ids, "actor": actor, "refs": refs,
                 "route_hints": item.platform_updates.get("_route_hints", {}),
                 "response_purpose": item.platform_updates.get("_response_purpose", "direct"),
-                "event_time": getattr(event, "time", time.time()), "group_id": getattr(event, "group_id", None)}
+                "event_time": getattr(event, "time", time.time()), "group_id": getattr(event, "group_id", None),
+                "facts": facts.to_dict()}
         self.burst_store.save(item.stable_conversation_key, actor["message_id"], actor["bot_scope"], data)
 
     async def recover_bursts(self, bot):
@@ -285,38 +293,57 @@ class FeatureGateway:
         if account in self.recovered_accounts:
             return
         for data in self.burst_store.recover(account, self.started_at):
-            if data["group_id"] is not None and not self.host.is_group_allowed(int(data["group_id"])):
+            staged = self.staged_facts(data)
+            if not staged.sender.platform_id or not staged.message_id:
+                # 匿名消息没有能回放的真实身份，丢掉这一条，不能让它卡住整批恢复。
+                logger.warning("skip staged burst without a replayable sender: scope=%s", data.get("scope"))
                 continue
-            actor = data["actor"]
-            event = SimpleNamespace(user_id=int(actor["user_id"]), message_id=int(actor["message_id"]),
-                                    time=data["event_time"], sender=SimpleNamespace(role="member", card="", nickname=actor.get("display_name", "")),
-                                    get_message=lambda body=data["user_text"]: self.host.Message(self.host.MessageSegment.text(body)))
-            if data["group_id"] is not None:
-                event.group_id = int(data["group_id"])
-                try:
-                    member = await bot.call_api("get_group_member_info", group_id=event.group_id, user_id=event.user_id)
-                    event.sender.role = str(member.get("role", "member"))
-                except Exception:
-                    pass
-            elif not self.host.is_private_allowed(event):
+            if staged.conversation.is_group and not self.host.is_group_allowed(int(staged.conversation.raw_id)):
                 continue
+            event = await self.host.replay_event(bot, staged)
+            if staged.conversation.is_private and not self.host.is_private_allowed(event):
+                continue
+            facts = replace(self.host.inbound_facts(bot, event), text=data["user_text"])
             platform = {"bot": bot, "event": event, "type": "private" if data["is_dm"] else "group", "user_id": event.user_id,
                         "conversation_key": data["scope"], "_route_hints": data.get("route_hints") or {"source_message_refs": data["refs"]},
-                        "_response_purpose": data.get("response_purpose", "direct"), "_feature_actor": self.actor(bot, event),
+                        "_response_purpose": data.get("response_purpose", "direct"), "_feature_actor": self.actor(bot, facts),
                         "_source_attachments": data["attachments"]}
             if data["group_id"] is not None:
                 platform["group_id"] = data["group_id"]
             item = self.host.QueuedInbound(None, bot, event, data["channel"], data["real_key"], data["scope"],
                                                data["text"], data["attachments"], data["is_dm"], platform, data["user_text"],
                                                entry_node_id=data["entry_node_id"], history_watermark=-1,
-                                               direct_interaction=data["direct_interaction"], memory_user_ids=tuple(data["memory_user_ids"]))
+                                               direct_interaction=data["direct_interaction"], memory_user_ids=tuple(data["memory_user_ids"]),
+                                               facts=facts)
             if not await self.host.queue_or_submit_ready(item):
                 return
         self.recovered_accounts.add(account)
 
+    @staticmethod
+    def staged_facts(data: Mapping[str, Any]) -> InboundFacts:
+        """暂存行里的入站事实。只有 actor 字段的旧行按当时的写法拼回来。"""
+        if isinstance(data.get("facts"), Mapping):
+            return InboundFacts.from_dict(data["facts"])
+        actor = data.get("actor") or {}
+        group_id = data.get("group_id")
+        return InboundFacts(
+            sender=InboundSender(platform_id=actor.get("user_id", ""), display_name=str(actor.get("display_name") or "")),
+            conversation=InboundConversation(
+                platform=QQ_NAPCAT.id, channel=str(data.get("channel") or ""),
+                kind=CHANNEL_GROUP if group_id is not None else CHANNEL_PRIVATE,
+                raw_id=group_id if group_id is not None else actor.get("user_id", ""),
+                conversation_key=str(data.get("scope") or ""), real_conversation_key=str(data.get("real_key") or ""),
+            ),
+            self_id=actor.get("bot_scope", ""),
+            message_id=str(actor.get("message_id") or ""),
+            text=str(data.get("user_text") or ""),
+            sent_at=float(data.get("event_time") or 0.0),
+        )
+
     async def handle_command(self, bot, event, text):
-        actor = self.actor(bot, event)
-        reply_ref = str(self.host.extract_reply_message_id(event.get_message(), getattr(event, "raw_message", None)) or "")
+        facts = self.facts_of(bot, event)
+        actor = self.actor(bot, facts)
+        reply_ref = facts.reply_to
         module = self.command_module(text, reply_ref)
         if module is None or not self.available or not actor["user_id"]:
             return None

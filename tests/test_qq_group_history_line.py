@@ -126,10 +126,9 @@ class TestOneAssembler:
         # 文件名同时踩上结构符号和已登记 QQ 号：两条路径任何一处不共享，等式立刻不成立。
         runtime._anonymize_user_id("1234567890")
         name = "[图片]1234567890.pdf"
-        runtime._record_group_message(
-            _MessageEvent([{"type": "file", "data": {"name": name}}]),
-            SimpleNamespace(self_id="900001"),
-        )
+        runtime._record_group_message(runtime._inbound_facts(
+            SimpleNamespace(self_id="900001"), _MessageEvent([{"type": "file", "data": {"name": name}}]),
+        ))
         _upload(runtime, {"name": name, "url": "http://x/a.pdf", "size": 12})
 
         lines = _history(runtime)

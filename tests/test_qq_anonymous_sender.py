@@ -71,8 +71,8 @@ def test_placeholder_never_registers_as_real_user(runtime: Any) -> None:
 
 def test_history_line_keeps_anonymous_members_distinct(runtime: Any) -> None:
     bot = SimpleNamespace(self_id="90000")
-    line1 = runtime._format_history_line(anon_event(11), bot, override_text="a")
-    line2 = runtime._format_history_line(anon_event(22, flag="f2"), bot, override_text="b")
+    line1 = runtime._history_line(runtime._inbound_facts(bot, anon_event(11), text="a"))
+    line2 = runtime._history_line(runtime._inbound_facts(bot, anon_event(22, flag="f2"), text="b"))
 
     assert "匿名成员" in line1 and "匿名成员" in line2
     ident1 = line1[line1.index("(") + 1:line1.index(")")]

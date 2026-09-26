@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from platforms.ids import normalize_id
+from platforms.inbound import InboundFacts
 
 # 信号名。命中哪个要报给试听，所以是稳定字面量而不是随手写的字符串。
 SIGNAL_ALL = "all"
@@ -127,6 +128,18 @@ class TriggerInput:
     def __post_init__(self) -> None:
         object.__setattr__(self, "group_id", normalize_id(self.group_id))
         object.__setattr__(self, "user_id", normalize_id(self.user_id))
+
+    @classmethod
+    def from_facts(cls, facts: InboundFacts, *, now: float, roll: float = 1.0) -> "TriggerInput":
+        return cls(
+            text=facts.text,
+            group_id=facts.conversation.raw_id if facts.conversation.is_group else "",
+            user_id=facts.sender.platform_id,
+            at_me=facts.mentions_self,
+            reply_to_bot=facts.reply_to_self,
+            now=now,
+            roll=roll,
+        )
 
 
 @dataclass(frozen=True)
