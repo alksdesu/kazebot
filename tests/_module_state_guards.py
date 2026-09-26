@@ -7,7 +7,7 @@ MUTABLE_LITERALS = (ast.Dict, ast.List, ast.Set, ast.DictComp, ast.ListComp, ast
 MUTABLE_FACTORIES = frozenset({
     "dict", "list", "set", "deque", "defaultdict", "OrderedDict", "Lock", "Condition", "ContextVar",
     "CooldownState", "CombatTracker", "TwoPhaseIdempotencyStore", "OneBotIdempotencyStore", "FeatureGateway",
-    "AliasBook",
+    "AliasBook", "HistoryWindows", "ClearBarriers",
 })
 
 

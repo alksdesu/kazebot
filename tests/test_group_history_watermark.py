@@ -90,7 +90,7 @@ class TestSequenceAllocation:
     def test_sequences_survive_a_cache_reset(self, runtime) -> None:
         # 计数器不跟着缓存清零：万一水位没能一起重置，重开的小序号会被旧水位吞掉。
         runtime.history._append_group_history(_GROUP_ID, "a")
-        runtime.state._adapter.group_history.pop(_GROUP_ID, None)
+        runtime.state._adapter.group_history.drop(_GROUP_ID)
 
         assert runtime.history._append_group_history(_GROUP_ID, "b") == 2
 
@@ -254,7 +254,7 @@ class TestOverflowIsNotSilent:
         set_live_config(runtime, group_history_max=2)
 
         assert runtime.lifecycle._reconcile_group_history_capacity() is True
-        assert runtime.history._group_history_lost(_GROUP_ID, -1) == 3
+        assert runtime.state._adapter.group_history.lost(_GROUP_ID, -1) == 3
         assert _history_block(_build(runtime)[0])[0].startswith("（此前 3 条")
 
     def test_a_watermark_reset_clears_the_gap(self, runtime) -> None:
@@ -264,7 +264,7 @@ class TestOverflowIsNotSilent:
 
         runtime.history._reset_group_history_watermark(_GROUP_ID)
 
-        assert runtime.state._adapter.group_history_gap.get(_GROUP_ID, 0) == 0
+        assert runtime.state._adapter.group_history.lost(_GROUP_ID, -1) == 0
         assert not _history_block(_build(runtime)[0])[0].startswith("（此前")
 
     def test_history_is_off_when_the_cap_is_zero(self, runtime) -> None:
@@ -304,7 +304,7 @@ class TestUndeliveredLinesCanOverflowTheSoftCap:
         for index in range(8):
             doubled.history._append_group_history(_GROUP_ID, f"line{index}")
 
-        assert doubled.history._group_history_lost(_GROUP_ID, -1) == 2
+        assert doubled.state._adapter.group_history.lost(_GROUP_ID, -1) == 2
 
 
 class TestWatermarkAdvance:

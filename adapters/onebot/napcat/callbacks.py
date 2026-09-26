@@ -371,10 +371,10 @@ class TangQiuCallbacks:
         # 序号由 supervisor 分配，重启后不保证还在原来那条线上；留着旧门槛会把之后
         # 每一条正常回复都判成过期。此时在飞的任务也已经全没了，门槛没有意义。
         # 放在 session_state 守卫之前：这件事跟水位存不存在无关。
-        state._adapter.context_clear_barrier.clear()
+        state._adapter.clear_barriers.clear()
         if state._adapter.session_state is None:
             return
-        for group_id in list(state._adapter.group_history.keys()):
+        for group_id in state._adapter.group_history.channels():
             history._reset_group_history_watermark(int(group_id))
 
     async def on_task_complete(self, *args: Any, **kwargs: Any) -> None:

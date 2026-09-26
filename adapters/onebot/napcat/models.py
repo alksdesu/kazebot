@@ -24,14 +24,6 @@ class ProactiveTarget:
     label: str
 
 
-@dataclass(frozen=True)
-class GroupHistoryLine:
-    """群历史缓存里的一行，seq 用于和 engine 侧高水位比对。"""
-
-    seq: int
-    text: str
-
-
 @dataclass
 class GroupContentRecord:
     """保留最近群消息的结构化副本，供管理员自然语言转发筛选。"""

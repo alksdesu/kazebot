@@ -450,12 +450,12 @@ async def _build_inbound_text(
     当前这条触发消息的序号，它由【当前用户指令】带出，不再进历史块。
     """
     group_id = int(event.group_id)
-    watermark = history._group_history_watermark(group_id)
-    pending = [entry for entry in state._adapter.group_history[group_id] if entry.seq > watermark]
+    pending = state._adapter.group_history.pending(group_id)
+    watermark = pending.watermark
     # 水位仍然盖过被排除那一行：它已随指令块进了 durable history，下一轮不该再当历史重发。
-    covered_seq = max((entry.seq for entry in pending), default=watermark)
-    fresh = [entry for entry in pending if entry.seq != exclude_seq]
-    lost = history._group_history_lost(group_id, watermark)
+    covered_seq = pending.covered_seq
+    fresh = [entry for entry in pending.lines if entry.seq != exclude_seq]
+    lost = pending.lost
     current_name = anonymize._anonymize_text_for_ai(identity._event_display_name(event))
     current_user = identity._event_user_alias(event)
     now = dt.datetime.now(common._CST).strftime("%Y-%m-%d %H:%M CST")

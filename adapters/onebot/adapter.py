@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable, DefaultDict, Deque, Dict, List,
 
 from adapters._shared.active_account import ActiveAccountStore
 from adapters._shared.aliases import AliasBook
+from adapters._shared.history_window import ClearBarriers, HistoryWindows
 from adapters._shared.trigger_policy import CooldownState, TriggerDecision
 from platforms.builtin import QQ_NAPCAT
 from stickers.combat import CombatTracker
@@ -42,7 +43,6 @@ if TYPE_CHECKING:
     from .napcat.callbacks import TangQiuCallbacks
     from .napcat.models import (
         GroupContentRecord,
-        GroupHistoryLine,
         QueuedInbound,
         QueueReplyWaiter,
         _ApprovalCard,
@@ -94,19 +94,15 @@ class OneBotAdapter:
 
         # ---- 群历史与水位 ----
         # 群聊上下文只保留最近 N 条：给入口节点社交语境，又不让每次 inbound 带过长历史。
-        self.group_history: DefaultDict[int, Deque["GroupHistoryLine"]] = defaultdict(
-            lambda: deque(maxlen=self.group_history_capacity())
+        # engine 确认收下某轮 inbound 后水位推进到那轮带过的最大序号，之后只补新行 ——
+        # 否则每条群消息都会被 20 轮 inbound 各带一次，在 durable history 里存 20 份。
+        self.group_history = HistoryWindows(
+            capacity=self.group_history_capacity,
+            soft_cap=lambda: self.live.group_history_max,
+            watermark=self.group_history_watermark,
         )
-        # 每行的序号来源。engine 确认收下某轮 inbound 后，水位推进到那轮带过的最大序号，
-        # 之后只补新行 —— 否则每条群消息都会被 20 轮 inbound 各带一次，在 durable history 里存 20 份。
-        self.group_history_seq: DefaultDict[int, int] = defaultdict(int)
-        # 被缓存上限吃掉、且当时还没送到 engine 的最高序号。seq 逐 1 递增，缺了几行由它和水位算出来。
-        self.group_history_gap: Dict[int, int] = {}
-        # 群号 → 清空上下文那一刻的 inbound 序号。清空时还在飞的任务照样会回来投递，
-        # 它带的是上一段上下文的产物，落回刚清空的缓存就等于没清。
-        self.context_clear_barrier: Dict[int, int] = {}
-        # 至今见过的最大 inbound 序号，用来给上面那道门槛定位。
-        self.last_inbound_seq: int = 0
+        # 群号 → 清空上下文那一刻的 inbound 序号。
+        self.clear_barriers = ClearBarriers()
         # 借 group_history_max 定容量，但语义不同：这份副本只供 qq_forward 挑选转发候选，没有送达账本，
         # 因此不参与缺口记账、也不吃未送达倍数。调小群历史条数会顺带缩小可转发范围，至少 20 条。
         self.group_content_records: DefaultDict[int, Deque["GroupContentRecord"]] = defaultdict(
@@ -249,6 +245,12 @@ class OneBotAdapter:
         self.forward_bridge_site: Any = None
         self.forward_bridge_started: bool = False
         self.forward_bridge_token_cache: str = ""
+
+    def group_history_watermark(self, group_id: Any) -> int:
+        """engine 侧已确认收到的最大群历史序号；-1 表示这一轮要带完整历史。"""
+        if self.session_state is None:
+            return -1
+        return self.session_state.get_high_watermark(int(group_id))
 
     def group_history_capacity(self) -> int:
         """群历史 deque 的硬上限：软上限之上的位置只租给还没送到 engine 的行。"""

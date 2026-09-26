@@ -19,8 +19,8 @@ _GROUP = 778899
 @pytest.fixture()
 def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     module = load_runtime(monkeypatch, tmp_path)
-    module.state._adapter.context_clear_barrier.clear()
-    module.state._adapter.last_inbound_seq = 0
+    module.state._adapter.clear_barriers.clear()
+    module.state._adapter.clear_barriers.last_inbound_seq = 0
     return module
 
 
@@ -34,14 +34,14 @@ class TestBarrier:
         runtime.history._note_inbound_seq(12)
         runtime.history._raise_context_clear_barrier(_GROUP)
 
-        assert runtime.state._adapter.context_clear_barrier[_GROUP] == 40
+        assert runtime.state._adapter.clear_barriers.barrier(_GROUP) == 40
 
     def test_triggers_still_in_flight_raise_it_further(self, runtime) -> None:
         # 被清掉的 trigger 可能比 adapter 记下的最大序号还新。
         runtime.history._note_inbound_seq(40)
         runtime.history._raise_context_clear_barrier(_GROUP, [SimpleNamespace(inbound_seq=57)])
 
-        assert runtime.state._adapter.context_clear_barrier[_GROUP] == 57
+        assert runtime.state._adapter.clear_barriers.barrier(_GROUP) == 57
 
     def test_a_seq_at_or_below_the_barrier_is_stale(self, runtime) -> None:
         runtime.history._note_inbound_seq(40)
@@ -132,4 +132,4 @@ class TestEngineRestart:
 
         asyncio.run(runtime.callbacks.TangQiuCallbacks().on_engine_restarted({}))
 
-        assert runtime.state._adapter.context_clear_barrier == {}
+        assert len(runtime.state._adapter.clear_barriers) == 0

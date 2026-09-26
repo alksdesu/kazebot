@@ -50,7 +50,7 @@ NoneBot 只出现在 `napcat/` 里，由插件入口加载。
 
 不分平台的逻辑在 `adapters/_shared/`：触发判定、管理能力档位、复读判定、会话键摘要（盐、稳定键、当前账号记录）、记忆提示，
 以及热载配置引擎（`live_config.py`）、环境变量读取（`env.py`）、手写 yaml 解析（`yaml_loader.py`）、
-出站发送防重（`send_guard.py`）和匿名别名表（`aliases.py`）。
+出站发送防重（`send_guard.py`）、匿名别名表（`aliases.py`）和群历史窗口与清空门槛（`history_window.py`）。
 `live_config.py` 这边只声明 QQ 的键和配置文件位置，缓存与快照在它持有的 `LiveConfig` 实例上。
 那边不认识 QQ，平台专属的部分（群角色映射、CQ 码边界、消息段解析）留在这里，调用时传进去。
 

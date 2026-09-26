@@ -26,7 +26,7 @@ from ..live_config import RECONCILED_KEYS, live, state_payload as live_config_st
 from ..emoji_handler import load_bqbs
 from clonoth_sdk import BotConfig, ClonothClient, EventRouter, SessionState
 
-from . import anonymize, callbacks, common, emotes, forward_bridge, history, identity, inbound, media, models, proactive, queueing, routing, state
+from . import anonymize, callbacks, common, emotes, forward_bridge, identity, inbound, media, models, proactive, queueing, routing, state
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
@@ -42,18 +42,11 @@ _LIVE_STATE_HEARTBEAT_SEC = 30.0
 def _reconcile_group_history_capacity() -> bool:
     """群历史条数改了就按新上限重建每个群的 deque。
 
-    maxlen 不可变，只能重建。序号水位在 group_history_seq 里不受影响，但调小容量丢的
-    最旧几行里可能有还没送到 engine 的，那几条要记进缺口，否则 prompt 里悄悄少一段。
+    maxlen 不可变，只能重建。序号不受影响，但调小容量丢的最旧几行里可能有还没送到
+    engine 的，那几条要记进缺口，否则 prompt 里悄悄少一段。
     """
-    target = state._adapter.group_history_capacity()
     records_target = state._adapter.group_content_capacity()
-    changed = False
-    for group_id, lines in list(state._adapter.group_history.items()):
-        if lines.maxlen != target:
-            for entry in list(lines)[:max(0, len(lines) - target)]:
-                history._note_history_gap(group_id, entry.seq)
-            state._adapter.group_history[group_id] = deque(lines, maxlen=target)
-            changed = True
+    changed = state._adapter.group_history.resize()
     for group_id, records in list(state._adapter.group_content_records.items()):
         if records.maxlen != records_target:
             state._adapter.group_content_records[group_id] = deque(records, maxlen=records_target)
@@ -122,7 +115,7 @@ def _live_runtime_facts() -> Dict[str, Any]:
         "forward_bridge_running": bool(state._adapter.forward_bridge_started),
         "forward_bridge_endpoint": f"http://{FORWARD_BRIDGE_HOST}:{FORWARD_BRIDGE_PORT}/qq_forward",
         "forward_bridge_token_set": bool(forward_bridge._forward_bridge_token()),
-        "group_history_capacities": sorted({int(d.maxlen or 0) for d in state._adapter.group_history.values()}),
+        "group_history_capacities": state._adapter.group_history.capacities(),
         # 改一次就要重启的那几个键，控制台只读展示。密钥一律只报「设没设」——
         # 回传值等于把它摊在任何能打开控制台的人面前。
         "environment": {
@@ -136,10 +129,7 @@ def _live_runtime_facts() -> Dict[str, Any]:
         "volatile": {
             "queue_pending": len(state._adapter.qq_queue),
             "cached_groups": len(state._adapter.group_history),
-            "history_gap_groups": len([
-                gid for gid in state._adapter.group_history_gap
-                if history._group_history_lost(gid, history._group_history_watermark(gid)) > 0
-            ]),
+            "history_gap_groups": len(state._adapter.group_history.gapped_channels()),
         },
     }
 

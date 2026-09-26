@@ -82,8 +82,8 @@ class TestGroupHistoryCapacity:
         set_live_config(runtime, group_history_max=3)
         runtime.lifecycle._reconcile_group_history_capacity()
 
-        assert runtime.state._adapter.group_history_seq[1] == 10
-        assert runtime.history._group_history_watermark(1) == 6
+        assert runtime.state._adapter.group_history.last_seq(1) == 10
+        assert runtime.state._adapter.group_history.watermark(1) == 6
         fresh = [e.text for e in runtime.state._adapter.group_history[1] if e.seq > 6]
         assert fresh == ["line-7", "line-8", "line-9"]
 
@@ -663,11 +663,13 @@ class TestWiring:
         assert missing == []
 
     def test_history_capacity_is_recomputed_on_every_reconcile(self) -> None:
-        """容量算在 helper 里，重建函数必须每次重算——缓存住就等于改了不生效。"""
+        """容量算在 helper 里，重建时必须每次重算——缓存住就等于改了不生效。"""
         rebuild = ast.unparse(self._function("_reconcile_group_history_capacity"))
 
-        assert "_adapter.group_history_capacity()" in rebuild
+        assert "_adapter.group_history.resize()" in rebuild
         assert "_adapter.group_content_capacity()" in rebuild
+        # 窗口拿到的是方法本身，resize 时现算；传进去一个算好的数就钉死了启动那一刻的容量。
+        assert "capacity=self.group_history_capacity," in self._source()
 
     def test_startup_builds_its_runtime_objects_through_the_reconciler(self) -> None:
         """启动和运行期改配置必须走同一条路径，否则两侧会漂移。"""

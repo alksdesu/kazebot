@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any, Deque, Dict, List
+from typing import Any, Dict, List
 from nonebot.adapters.onebot.v11 import Bot, Event
 from platforms.inbound import InboundFacts
 from ..config import CLONOTH_WORKSPACE
@@ -17,51 +17,8 @@ logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
 
 def _append_group_history(group_id: int, line: str) -> int:
-    """把一行写入群历史缓存并返回它的序号。所有写入点都必须走这里。"""
-    gid = int(group_id)
-    seq = state._adapter.group_history_seq[gid] + 1
-    state._adapter.group_history_seq[gid] = seq
-    lines = state._adapter.group_history[gid]
-    _evict_delivered_history(gid, lines)
-    if lines.maxlen and len(lines) == lines.maxlen:
-        # group_history_max 允许配 0（关掉群历史），那不是缺口，所以先看 maxlen。
-        _note_history_gap(gid, lines[0].seq)
-    lines.append(models.GroupHistoryLine(seq=seq, text=line))
-    return seq
-
-
-def _evict_delivered_history(group_id: int, lines: Deque["GroupHistoryLine"]) -> None:
-    """软上限之上的空间只留给还没送到 engine 的行，已送达的行到点就让位。"""
-    soft_cap = max(int(live.group_history_max), 0)
-    watermark = _group_history_watermark(group_id)
-    while lines and len(lines) >= soft_cap and lines[0].seq <= watermark:
-        lines.popleft()
-
-
-def _note_history_gap(group_id: int, dropped_seq: int) -> None:
-    """记下一条因为缓存满而被丢掉的行；只有还没送到 engine 的行才算缺口。"""
-    gid = int(group_id)
-    if int(dropped_seq) <= _group_history_watermark(gid):
-        return
-    if gid not in state._adapter.group_history_gap:
-        common.logger.warning("QQ group history overflow: group=%s dropped undelivered seq=%s", gid, dropped_seq)
-    state._adapter.group_history_gap[gid] = max(state._adapter.group_history_gap.get(gid, 0), int(dropped_seq))
-
-
-def _group_history_lost(group_id: int, watermark: int) -> int:
-    """缓存上限吃掉了几条还没送出去的行。
-
-    seq 从 1 开始逐 1 递增，缺的是 (watermark, gap] 这一段；水位 -1（什么都没送出去）
-    要按 0 算，否则第一行会被多数一条。
-    """
-    return max(0, state._adapter.group_history_gap.get(int(group_id), 0) - max(int(watermark), 0))
-
-
-def _group_history_watermark(group_id: int) -> int:
-    """engine 侧已确认收到的最大群历史序号；-1 表示这一轮要带完整历史。"""
-    if state._adapter.session_state is None:
-        return -1
-    return state._adapter.session_state.get_high_watermark(int(group_id))
+    """把一行写入群历史并返回它的序号。所有写入点都必须走这里。"""
+    return state._adapter.group_history.append(int(group_id), line)
 
 
 def _reset_group_history_watermark(group_id: int) -> None:
@@ -71,36 +28,29 @@ def _reset_group_history_watermark(group_id: int) -> None:
     """
     if state._adapter.session_state is not None:
         state._adapter.session_state.reset_channel_watermark(int(group_id))
-    # 缺口是按旧水位算出来的差值，水位一被重定义它就不再成立。
-    state._adapter.group_history_gap.pop(int(group_id), None)
+    state._adapter.group_history.forget_gap(int(group_id))
 
 
 def _note_inbound_seq(seq: Any) -> None:
     """记下见过的最大 inbound 序号。清空上下文时拿它划界。"""
-    value = int(seq or 0)
-    if value > state._adapter.last_inbound_seq:
-        state._adapter.last_inbound_seq = value
+    state._adapter.clear_barriers.note_inbound(seq)
 
 
 def _raise_context_clear_barrier(group_id: int, cleaned_triggers: Any = None) -> None:
     """把清空时刻记成一道门槛，序号不高于它的投递都算上一段上下文的产物。"""
-    seqs = [
-        int(getattr(trigger, "inbound_seq", 0) or 0)
-        for trigger in (cleaned_triggers or [])
-    ]
-    state._adapter.context_clear_barrier[int(group_id)] = max([state._adapter.last_inbound_seq, *seqs])
+    state._adapter.clear_barriers.raise_for(
+        int(group_id),
+        [int(getattr(trigger, "inbound_seq", 0) or 0) for trigger in (cleaned_triggers or [])],
+    )
 
 
 def _is_stale_delivery(group_id: Any, send_context: Any) -> bool:
     """这次投递是不是清空之前那段上下文的产物。"""
     if group_id is None:
         return False
-    barrier = state._adapter.context_clear_barrier.get(int(group_id), 0)
-    if not barrier:
-        return False
-    seq = int(getattr(send_context, "source_inbound_seq", 0) or 0)
-    # 取不到来源序号就放行：宁可多留一条，也不能把正常回复从群历史里抹掉。
-    return bool(seq) and seq <= barrier
+    return state._adapter.clear_barriers.is_stale(
+        int(group_id), int(getattr(send_context, "source_inbound_seq", 0) or 0),
+    )
 
 
 def _purge_conversation_side_state(conversation_key: str, target: Dict[str, Any]) -> None:
@@ -118,7 +68,7 @@ def _purge_conversation_side_state(conversation_key: str, target: Dict[str, Any]
     state._adapter.features.burst_store.clear_scope(conversation_key)
     group_id = target.get("group_id")
     if target.get("type") == "group" and group_id is not None:
-        state._adapter.group_history.pop(int(group_id), None)
+        state._adapter.group_history.drop(int(group_id))
         # qq_forward 的转发候选是群历史的第二份副本，只清前者等于没清。
         state._adapter.group_content_records.pop(int(group_id), None)
         # 清了会话还让它继续静默没有道理：运营者刚说「重新开始」，下一句就该有人应。

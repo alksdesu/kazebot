@@ -30,9 +30,7 @@ def _purge_account_scoped_caches() -> None:
     旧号看见的样子。按会话键分桶的那些换号后自然另起，不在此列。
     """
     state._adapter.group_history.clear()
-    state._adapter.group_history_seq.clear()
-    state._adapter.group_history_gap.clear()
-    state._adapter.context_clear_barrier.clear()
+    state._adapter.clear_barriers.clear()
     # qq_forward 的转发候选是群历史的第二份副本，只清前者等于没清。
     state._adapter.group_content_records.clear()
     state._adapter.echo_recent.clear()
