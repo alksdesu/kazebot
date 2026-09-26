@@ -1,0 +1,699 @@
+"""只在测试里存在的聊天平台 fakechat：平台描述、收发、SDK 回调全用 platforms/、adapters/_shared/ 和 SDK 拼成。
+
+不导入任何 QQ 代码。契约测试拿它和 QQ 跑同一套断言，共享层缺了什么，这里最先拼不起来。
+"""
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
+from typing import Any, Iterable, Mapping
+
+from adapters._shared.aliases import AliasBook
+from adapters._shared.approvals import (
+    DECISION_ALLOW,
+    DECISION_DENY,
+    LOOKUP_FOUND,
+    LOOKUP_SETTLED,
+    LOOKUP_UNKNOWN,
+    ApprovalBook,
+    ApprovalLookup,
+    parse_command,
+    parse_reply_verb,
+)
+from adapters._shared.conversation_hash import ConversationKeys
+from adapters._shared.feature_gateway import FeatureGateway, TargetConversation
+from adapters._shared.history_window import ClearBarriers, HistoryWindows
+from adapters._shared.memory_hints import collect_subjects
+from adapters._shared.send_guard import (
+    AmbiguousAckError,
+    IdempotencyClaim,
+    OutboundSendContext,
+    SendContractError,
+    SendError,
+    SendNotStartedError,
+    TwoPhaseIdempotencyStore,
+    context_from_sources,
+    idempotency_key,
+    protected_claim_send,
+)
+from adapters._shared.trigger_policy import CooldownState, TriggerConfig, TriggerInput, evaluate
+from clonoth_sdk.state import SessionState, TriggerInfo
+from platforms.descriptor import (
+    CHANNEL_GROUP,
+    CHANNEL_OTHER,
+    CHANNEL_PRIVATE,
+    HOOK_TRIGGER_POLICY,
+    ID_STRING,
+    ChannelDescriptor,
+    PlatformDescriptor,
+)
+from platforms.ids import normalize_id
+from platforms.inbound import InboundConversation, InboundFacts, InboundSender
+
+FAKE_CHAT = PlatformDescriptor(
+    id="fakechat",
+    display_name="Fake Chat",
+    short_name="Fake",
+    channels=(
+        ChannelDescriptor("fake_room", CHANNEL_GROUP),
+        ChannelDescriptor("fake_dm", CHANNEL_PRIVATE),
+        ChannelDescriptor("fake_unknown", CHANNEL_OTHER),
+    ),
+    id_shape=ID_STRING,
+    hooks={HOOK_TRIGGER_POLICY: "adapters._shared.trigger_policy"},
+)
+
+ROOM_TARGET = "room"
+DM_TARGET = "dm"
+HISTORY_LINES = 20
+APPROVAL_TTL_SECONDS = 600.0
+FAULT_LOST_ACK = "lost_ack"
+FAULT_REFUSED = "refused"
+FAULT_HANG = "hang"
+FAULTS = frozenset({FAULT_LOST_ACK, FAULT_REFUSED, FAULT_HANG})
+
+# 平台自己的房间角色词表映射到能力档位的词表。
+_ROLE_OF = MappingProxyType({"owner": "owner", "moderator": "admin", "member": "member"})
+
+APPROVAL_PENDING_NOTICE = "This operation is waiting for an admin to approve it."
+
+
+def channel_name(kind: str) -> str:
+    return next(channel.name for channel in FAKE_CHAT.channels if channel.kind == kind)
+
+
+@dataclass(frozen=True)
+class ChatUser:
+    id: str
+    name: str
+    role: str = "member"
+
+
+@dataclass(frozen=True)
+class ChatMessage:
+    """平台推过来的一条消息。room 为空串是私聊。"""
+
+    id: str
+    sender: ChatUser
+    text: str
+    room: str = ""
+    mentions: tuple[str, ...] = ()
+    reply_to: str = ""
+    sent_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class Posted:
+    """bot 发到平台上的一条消息。room 为空串是私聊，这时 user 是收件人。"""
+
+    id: str
+    room: str
+    user: str
+    text: str
+    reply_to: str = ""
+
+
+class ChatTimeout(TimeoutError):
+    """平台收下了消息，回执没回来。"""
+
+
+class ChatRefused(ConnectionRefusedError):
+    """请求没到平台。"""
+
+
+class ChatServer:
+    """假平台的服务端：记下 bot 发出的每条消息，可以预约下一次发送出错。"""
+
+    def __init__(self, bot_id: str) -> None:
+        self.bot_id = bot_id
+        self.posted: list[Posted] = []
+        self._faults: list[str] = []
+
+    def fail_next(self, fault: str) -> None:
+        if fault not in FAULTS:
+            raise ValueError(f"unknown fault: {fault!r}")
+        self._faults.append(fault)
+
+    async def post(self, *, room: str = "", user: str = "", text: str, reply_to: str = "") -> str:
+        fault = self._faults.pop(0) if self._faults else ""
+        if fault == FAULT_REFUSED:
+            raise ChatRefused("connection refused")
+        message_id = f"p{len(self.posted) + 1}"
+        self.posted.append(Posted(message_id, room, user, text, reply_to))
+        if fault == FAULT_LOST_ACK:
+            raise ChatTimeout(f"acknowledgement lost after {message_id}")
+        if fault == FAULT_HANG:
+            await asyncio.Event().wait()
+        return message_id
+
+
+def target_identity(target: Mapping[str, Any]) -> str:
+    kind = str(target.get("kind") or "")
+    if kind not in {ROOM_TARGET, DM_TARGET}:
+        raise SendContractError(f"unknown fakechat target kind: {dict(target)!r}")
+    identity = normalize_id(target.get("id"), FAKE_CHAT.id_shape)
+    if not identity:
+        raise SendContractError(f"fakechat {kind} target has a malformed id: {target.get('id')!r}")
+    return f"{kind}:{identity}"
+
+
+def classify_send_failure(exc: BaseException) -> SendError:
+    if isinstance(exc, SendError):
+        return exc
+    if isinstance(exc, ChatRefused):
+        return SendNotStartedError(f"fakechat post did not reach the server: {exc}", cause=exc)
+    # 认不出的失败一律当回执不明：宁可进死信等人看，也不能冒重复投递的险。
+    return AmbiguousAckError(f"fakechat post acknowledgement is unknown: {exc}", cause=exc)
+
+
+class FakeChatAdapter:
+    """fakechat 适配器：进程内状态、入站翻译与提交、受防重保护的发送、审批与上下文重置。"""
+
+    def __init__(
+        self,
+        workspace: Path,
+        server: ChatServer,
+        client: Any,
+        *,
+        admins: Iterable[str] = (),
+        rooms: Iterable[str] = (),
+        secret: str = "fakechat-test-secret",
+    ) -> None:
+        shape = FAKE_CHAT.id_shape
+        data = Path(workspace) / "data"
+        self.server = server
+        self.client = client
+        self.event_router = None
+        self.bot = SimpleNamespace(self_id=server.bot_id)
+        self.account = normalize_id(server.bot_id, shape)
+        self.admins = frozenset(filter(None, (normalize_id(value, shape) for value in admins)))
+        self.rooms = frozenset(filter(None, (normalize_id(value, shape) for value in rooms)))
+        self.keys = ConversationKeys(FAKE_CHAT, secret)
+        self.aliases = AliasBook(data / "fakechat_aliases.json", workspace=Path(workspace), id_shape=shape)
+        self.session_state = SessionState()
+        self.history = HistoryWindows(
+            capacity=lambda: HISTORY_LINES,
+            soft_cap=lambda: HISTORY_LINES,
+            watermark=self.session_state.get_high_watermark,
+        )
+        self.barriers = ClearBarriers()
+        self.approvals = ApprovalBook(id_shape=shape, normalize_ref=str, ttl_seconds=APPROVAL_TTL_SECONDS)
+        self.outbound = TwoPhaseIdempotencyStore(
+            data / "fakechat_outbound.sqlite3", target_identity=target_identity, log_namespace="fakechat",
+        )
+        self.trigger = TriggerConfig()
+        self.cooldown = CooldownState()
+        self.routes: dict[str, dict[str, Any]] = {}
+        self.features = FeatureGateway(
+            FakeChatFeatureHost(self), platform=FAKE_CHAT, burst_path=data / "fakechat_bursts.sqlite3",
+        )
+        self.callbacks = FakeChatCallbacks(self)
+
+    def close(self) -> None:
+        self.outbound.close()
+
+    def stable_key(self, real_key: str) -> str:
+        return self.keys.stable_key(real_key, bot_scope=self.account)
+
+    def anonymize(self, text: str) -> str:
+        return self.aliases.substitute(text)
+
+    def conversation_of(self, message: ChatMessage) -> InboundConversation:
+        kind = CHANNEL_GROUP if message.room else CHANNEL_PRIVATE
+        raw_id = normalize_id(message.room or message.sender.id, FAKE_CHAT.id_shape)
+        channel = channel_name(kind)
+        real_key = f"{channel}:{raw_id}"
+        return InboundConversation(
+            platform=FAKE_CHAT.id, channel=channel, kind=kind, raw_id=raw_id,
+            conversation_key=self.stable_key(real_key), real_conversation_key=real_key,
+        )
+
+    def facts(self, message: ChatMessage) -> InboundFacts:
+        conversation = self.conversation_of(message)
+        sender_id = normalize_id(message.sender.id, FAKE_CHAT.id_shape)
+        if conversation.is_group:
+            self.aliases.group_alias(conversation.raw_id)
+        return InboundFacts(
+            sender=InboundSender(
+                platform_id=sender_id,
+                alias=self.aliases.user_alias(sender_id),
+                display_name=message.sender.name,
+                group_role=_ROLE_OF.get(message.sender.role, "member") if conversation.is_group else "",
+                listed_admin=sender_id in self.admins,
+            ),
+            conversation=conversation,
+            self_id=self.account,
+            message_id=message.id,
+            text=message.text,
+            mentions=message.mentions,
+            mentions_self=self.account in message.mentions,
+            reply_to=message.reply_to,
+            reply_to_self=bool(message.reply_to) and any(
+                posted.id == message.reply_to for posted in self.server.posted
+            ),
+            sent_at=message.sent_at or time.time(),
+        )
+
+    def platform_auth(self, facts: InboundFacts) -> dict[str, Any]:
+        group = facts.conversation.is_group
+        return {
+            "platform": FAKE_CHAT.id,
+            "user_id": facts.sender.platform_id,
+            "is_admin": facts.sender.listed_admin,
+            "group_role": facts.sender.group_role if group else "",
+            "group_scope": facts.conversation.conversation_key if group else "",
+            "bot_scope": self.account,
+        }
+
+    def target_of(self, conversation: InboundConversation, *, reply_to: str = "") -> dict[str, Any]:
+        return {
+            "kind": ROOM_TARGET if conversation.is_group else DM_TARGET,
+            "id": conversation.raw_id,
+            "conversation_key": conversation.conversation_key,
+            "reply_to": reply_to,
+        }
+
+    def dm_target(self, user_id: str) -> dict[str, Any]:
+        user = normalize_id(user_id, FAKE_CHAT.id_shape)
+        return {
+            "kind": DM_TARGET, "id": user,
+            "conversation_key": self.stable_key(f"{channel_name(CHANNEL_PRIVATE)}:{user}"),
+        }
+
+    def history_line(self, facts: InboundFacts) -> str:
+        name = self.anonymize(facts.sender.display_name) or facts.sender.alias
+        return f"{name}({facts.sender.alias}): {self.anonymize(facts.text)}"
+
+    async def receive(self, message: ChatMessage) -> bool:
+        """平台推来一条消息。返回这条有没有交给核心。"""
+        facts = self.facts(message)
+        if facts.conversation.is_group:
+            if facts.conversation.raw_id not in self.rooms:
+                return False
+            seq = self.history.append(facts.conversation.raw_id, self.history_line(facts))
+            trigger_input = TriggerInput.from_facts(facts, now=facts.sent_at)
+            if not evaluate(trigger_input, self.trigger, self.cooldown).triggered:
+                return False
+            self.cooldown.record(trigger_input)
+            return await self.submit(facts, exclude_seq=seq)
+        if await self.handle_approval_reply(facts):
+            return False
+        if not facts.sender.listed_admin:
+            return False
+        return await self.submit(facts)
+
+    def inbound_text(self, facts: InboundFacts, *, exclude_seq: int) -> tuple[str, int]:
+        lines: list[str] = []
+        covered = -1
+        if facts.conversation.is_group:
+            pending = self.history.pending(facts.conversation.raw_id)
+            covered = pending.covered_seq
+            lines.append("[recent messages]")
+            if pending.lost:
+                lines.append(f"({pending.lost} earlier messages did not fit and are missing)")
+            lines.extend(line.text for line in pending.lines if line.seq != exclude_seq)
+            lines.append("")
+        lines.append("[current message]")
+        lines.append(f"{facts.sender.alias}: {self.anonymize(facts.text)}")
+        return "\n".join(lines), covered
+
+    def memory_hints(self, facts: InboundFacts) -> dict[str, Any]:
+        mentioned = [user for user in facts.mentions if user != self.account]
+        return {"subjects": collect_subjects(
+            sender_alias=facts.sender.alias,
+            anonymized_text=self.anonymize(facts.text),
+            at_user_ids=mentioned,
+            alias_of_user_id=self.aliases.user_alias,
+        )}
+
+    async def submit(self, facts: InboundFacts, *, exclude_seq: int = 0) -> bool:
+        conversation = facts.conversation
+        text, covered = self.inbound_text(facts, exclude_seq=exclude_seq)
+        channel_id = conversation.raw_id if conversation.is_group else ""
+        generation = self.session_state.watermark_generation(channel_id) if channel_id else None
+        result = await self.client.submit_inbound(
+            channel=conversation.channel,
+            conversation_key=conversation.conversation_key,
+            text=text,
+            message_id=facts.message_id,
+            use_context=True,
+            platform_auth=self.platform_auth(facts),
+            route_hints={
+                "platform": FAKE_CHAT.id,
+                "channel": conversation.channel,
+                "has_image": False,
+                "target_type": conversation.kind,
+            },
+            memory_hints=self.memory_hints(facts),
+        )
+        if not result.session_id or not result.accepted:
+            return False
+        self.barriers.note_inbound(result.inbound_seq)
+        if channel_id and covered >= 0:
+            if result.inbound_seq:
+                self.session_state.register_watermark(result.inbound_seq, channel_id, covered, generation=generation)
+            elif generation == self.session_state.watermark_generation(channel_id):
+                self.session_state.advance_watermark(channel_id, covered)
+        target = self.target_of(conversation, reply_to=facts.message_id)
+        self.routes[conversation.conversation_key] = target
+        self.session_state.register_session(conversation.conversation_key, result.session_id)
+        if result.inbound_seq:
+            self.session_state.register_trigger(TriggerInfo(
+                inbound_seq=result.inbound_seq,
+                conversation_key=conversation.conversation_key,
+                session_id=result.session_id,
+                is_dm=conversation.is_private,
+                platform_data={"target": dict(target)},
+            ))
+        return True
+
+    async def send(self, target: Mapping[str, Any], text: str, *, context: OutboundSendContext | None = None) -> str:
+        """发一条纯文本。同一投递身份只会真正发出一次，回执不明时不重发。"""
+        identity = target_identity(target)
+        context = context or OutboundSendContext(conversation_key=str(target.get("conversation_key") or ""))
+        await self.features.check_send(self.bot, target)
+        key = idempotency_key(identity, text, event_id=context.idempotency_key or context.event_id)
+        claim = await self.outbound.begin(key)
+        if not claim.acquired and claim.state == "pending":
+            resolved = await self.outbound.wait_for_resolution(key)
+            claim = await self.outbound.begin(key) if resolved is None else IdempotencyClaim(
+                key=key, acquired=False, state=resolved,
+            )
+        if not claim.acquired:
+            message_id = await self.outbound.sent_message_id(key)
+            await self.features.bind_reminder_message(self.bot, target, context, message_id)
+            return message_id or f"idempotent:{key}"
+        room = str(target["id"]) if target["kind"] == ROOM_TARGET else ""
+        user = str(target["id"]) if target["kind"] == DM_TARGET else ""
+        message_id = await protected_claim_send(
+            self.outbound, claim,
+            lambda: self.server.post(room=room, user=user, text=text, reply_to=str(target.get("reply_to") or "")),
+            classify=classify_send_failure,
+        )
+        await self.features.record_outbound(self.bot, target, text, message_id)
+        await self.features.bind_reminder_message(self.bot, target, context, message_id)
+        return message_id
+
+    async def deliver(self, target: dict[str, Any], text: str, *, context: OutboundSendContext, record: bool) -> str:
+        purpose = getattr(context, "purpose", "direct")
+        if purpose == "ambient" or "_response_purpose" not in target:
+            target["_response_purpose"] = purpose
+        in_room = target["kind"] == ROOM_TARGET
+        # 清空上下文时还在飞的回复照发，但它是上一段上下文的产物，不能落回刚清空的窗口。
+        stale = in_room and self.barriers.is_stale(target["id"], int(context.source_inbound_seq or 0))
+        message_id = await self.send(target, text, context=context)
+        if record and in_room and not stale:
+            self.history.append(target["id"], f"Bot: {self.anonymize(text)}")
+        return message_id
+
+    def target_for(self, conversation_key: str, platform_data: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        stored = (platform_data or {}).get("target") or self.routes.get(conversation_key)
+        if not stored:
+            raise SendContractError(f"fakechat has no route for conversation {conversation_key!r}")
+        return dict(stored)
+
+    async def request_approval(
+        self, approval_id: str, operation: str, details: Mapping[str, Any], *, conversation_key: str = "",
+        session_id: str = "",
+    ) -> None:
+        self.approvals.open(
+            approval_id, operation=operation, details=dict(details or {}),
+            conversation_key=conversation_key, session_id=session_id,
+        )
+        if not self.admins:
+            # 没人能批，挂着只会等到超时。
+            await self.client.approve(approval_id, decision=DECISION_DENY, comment="fakechat has no admins to review this.")
+            self.approvals.close(approval_id, decision=DECISION_DENY)
+            return
+        card = f"Approval needed: {operation}\nID: {approval_id}\nReply 'approve' or 'deny' to this message."
+        for admin in sorted(self.admins):
+            message_id = await self.send(
+                self.dm_target(admin), card,
+                context=OutboundSendContext(idempotency_key=f"approval:{approval_id}:{admin}"),
+            )
+            self.approvals.remember_card(message_id, approval_id, admin)
+        target = self.routes.get(conversation_key)
+        if target:
+            await self.send(
+                dict(target), APPROVAL_PENDING_NOTICE,
+                context=OutboundSendContext(idempotency_key=f"approval-notice:{approval_id}", conversation_key=conversation_key),
+            )
+
+    def approval_intent(self, facts: InboundFacts) -> tuple[str, ApprovalLookup] | None:
+        """这条私聊是不是审批决定：引用自己收到的卡片回一个动词，或者带引导符的审批命令。"""
+        verb = parse_reply_verb(facts.text)
+        if verb and facts.reply_to:
+            card = self.approvals.resolve_card(facts.reply_to, facts.sender.platform_id)
+            if card.approval_id:
+                return verb, ApprovalLookup(LOOKUP_FOUND, card.approval_id, card.approval_id)
+            if card.settled_id:
+                return verb, ApprovalLookup(LOOKUP_SETTLED, card.settled_id, card.settled_id)
+            if card.matched():
+                return verb, ApprovalLookup(LOOKUP_UNKNOWN, facts.reply_to)
+        body = facts.text.strip()
+        command = parse_command(body[1:]) if body.startswith("/") else None
+        if command is None:
+            return None
+        decision, token = command
+        return decision, self.approvals.lookup(token)
+
+    async def handle_approval_reply(self, facts: InboundFacts) -> bool:
+        """私聊里的审批决定。返回这条是不是审批；是的话已经回过话了。"""
+        intent = self.approval_intent(facts)
+        if intent is None:
+            return False
+        decision, lookup = intent
+        if not facts.sender.listed_admin:
+            await self.reply_private(facts, "Only admins can decide approvals.")
+            return True
+        if lookup.outcome == LOOKUP_SETTLED:
+            await self.reply_private(facts, f"Approval {lookup.approval_id} was already handled.")
+            return True
+        if lookup.outcome != LOOKUP_FOUND:
+            await self.reply_private(facts, f"No pending approval matches {lookup.token!r}.")
+            return True
+        approval_id = lookup.approval_id
+        info = await self.approvals.claim(approval_id, facts.sender.platform_id, decision)
+        if info is None:
+            await self.reply_private(facts, f"Approval {approval_id} was already handled.")
+            return True
+        try:
+            accepted = await self.client.approve(
+                approval_id, decision=decision, comment=f"fakechat admin {facts.sender.platform_id} {decision}",
+            )
+        except Exception:
+            await self.approvals.release(approval_id, info)
+            raise
+        if not accepted:
+            await self.approvals.release(approval_id, info)
+            await self.reply_private(facts, f"The supervisor refused the decision on {approval_id}.")
+            return True
+        outcome = "Approved" if decision == DECISION_ALLOW else "Denied"
+        await self.reply_private(facts, f"{outcome} {approval_id} ({info.get('operation') or 'unknown'}).")
+        return True
+
+    async def reply_private(self, facts: InboundFacts, text: str) -> str:
+        return await self.send(
+            self.dm_target(facts.sender.platform_id), text,
+            context=OutboundSendContext(idempotency_key=f"reply:{facts.message_id}"),
+        )
+
+    def reset_context(self, conversation_key: str, reason: str, cleaned_triggers: Iterable[TriggerInfo]) -> None:
+        target = self.routes.get(conversation_key)
+        if not target or target["kind"] != ROOM_TARGET:
+            return
+        room = target["id"]
+        # compact 只把早期原文换成摘要：留着窗口、重置水位，下一轮把近期原文补回去。
+        if reason != "compact":
+            self.history.drop(room)
+            self.barriers.raise_for(room, [trigger.inbound_seq for trigger in cleaned_triggers])
+        self.session_state.reset_channel_watermark(room)
+        self.history.forget_gap(room)
+
+    def engine_restarted(self) -> None:
+        self.barriers.clear()
+        for room in self.history.channels():
+            self.session_state.reset_channel_watermark(room)
+            self.history.forget_gap(room)
+
+
+class FakeChatCallbacks:
+    """AdapterCallbacks 的 fakechat 实现。没有文件发送能力，带附件的投递明确报错。"""
+
+    def __init__(self, adapter: FakeChatAdapter) -> None:
+        self._adapter = adapter
+
+    @staticmethod
+    def _refuse_attachments(attachments: list[dict[str, Any]] | None) -> None:
+        if attachments:
+            raise SendContractError("fakechat cannot send attachments")
+
+    async def send_reply(
+        self, trigger: TriggerInfo, text: str, attachments: list[dict[str, Any]], *,
+        main_state: Any = None, delivery_context: OutboundSendContext | None = None, **callback_data: Any,
+    ) -> None:
+        self._refuse_attachments(attachments)
+        target = self._adapter.target_for(trigger.conversation_key, trigger.platform_data)
+        context = delivery_context or context_from_sources(
+            trigger=trigger, main_state=main_state, platform_data=callback_data.get("platform_data"),
+        )
+        if text:
+            await self._adapter.deliver(target, text, context=context, record=True)
+
+    async def send_intermediate_reply(
+        self, trigger: TriggerInfo, text: str, *, delivery_context: OutboundSendContext | None = None,
+        **callback_data: Any,
+    ) -> None:
+        if not text:
+            return
+        target = self._adapter.target_for(trigger.conversation_key, trigger.platform_data)
+        context = delivery_context or context_from_sources(
+            trigger=trigger, platform_data=callback_data.get("platform_data"),
+        )
+        await self._adapter.deliver(target, text, context=context, record=False)
+
+    async def send_to_channel(
+        self, conversation_key: str, text: str, attachments: list[dict[str, Any]], *,
+        node_id: str = "", is_final: bool = True, delivery_context: OutboundSendContext | None = None,
+        **callback_data: Any,
+    ) -> None:
+        self._refuse_attachments(attachments)
+        target = self._adapter.target_for(conversation_key)
+        context = delivery_context or context_from_sources(
+            platform_data=callback_data.get("platform_data"), conversation_key=conversation_key,
+        )
+        if text:
+            await self._adapter.deliver(target, text, context=context, record=True)
+
+    async def delete_status_message(self, trigger: TriggerInfo) -> None:
+        return None
+
+    async def edit_status_message(self, trigger: TriggerInfo, content: str) -> None:
+        return None
+
+    async def update_progress(self, trigger: TriggerInfo, state: Any) -> None:
+        return None
+
+    async def create_child_progress(self, task_key: str, state: Any, **kwargs: Any) -> None:
+        return None
+
+    async def update_child_progress(self, task_key: str, state: Any) -> None:
+        return None
+
+    async def finalize_child_progress(self, task_key: str, state: Any, status: str, **kwargs: Any) -> None:
+        return None
+
+    async def show_approval_ui(
+        self, approval_id: str, operation: str, details: dict[str, Any], *,
+        conversation_key: str = "", session_id: str = "",
+    ) -> None:
+        await self._adapter.request_approval(
+            approval_id, operation, details, conversation_key=conversation_key, session_id=session_id,
+        )
+
+    async def refresh_typing(self, trigger: TriggerInfo) -> None:
+        return None
+
+    async def add_reactions(self, trigger: TriggerInfo, reactions: list[str]) -> None:
+        return None
+
+    async def on_task_created(self, trigger: TriggerInfo, task_id: str) -> None:
+        return None
+
+    async def on_restart_signal(self, conversation_key: str) -> None:
+        return None
+
+    async def on_context_reset(self, conversation_key: str, reason: str, cleaned_triggers: list[TriggerInfo]) -> None:
+        self._adapter.reset_context(conversation_key, reason, cleaned_triggers)
+
+    async def on_engine_restarted(self, payload: dict[str, Any]) -> None:
+        self._adapter.engine_restarted()
+
+
+class FakeChatFeatureHost:
+    """FeatureGateway 对 fakechat 的全部依赖。没有连发合并与社区通知，对应的问法如实答空。"""
+
+    def __init__(self, adapter: FakeChatAdapter) -> None:
+        self._adapter = adapter
+
+    @property
+    def client(self) -> Any:
+        return self._adapter.client
+
+    @property
+    def event_router(self) -> Any:
+        return self._adapter.event_router
+
+    def inbound_facts(self, bot: Any, event: Any) -> InboundFacts:
+        return self._adapter.facts(event)
+
+    async def replay_event(self, bot: Any, facts: InboundFacts) -> Any:
+        conversation = facts.conversation
+        return ChatMessage(
+            id=facts.message_id,
+            sender=ChatUser(facts.sender.platform_id, facts.sender.display_name),
+            text=facts.text,
+            room=conversation.raw_id if conversation.is_group else "",
+            mentions=facts.mentions,
+            reply_to=facts.reply_to,
+            sent_at=facts.sent_at,
+        )
+
+    def stable_conversation_key(self, real_conversation_key: str) -> str:
+        return self._adapter.stable_key(real_conversation_key)
+
+    def anonymize_text_for_ai(self, text: str) -> str:
+        return self._adapter.anonymize(text)
+
+    def message_to_text(self, message: Any, bot_self_id: Any = None) -> str:
+        return message.text if isinstance(message, ChatMessage) else str(message or "")
+
+    def is_group_allowed(self, group_id: Any) -> bool:
+        return normalize_id(group_id, FAKE_CHAT.id_shape) in self._adapter.rooms
+
+    def is_private_allowed(self, event: Any) -> bool:
+        return normalize_id(event.sender.id, FAKE_CHAT.id_shape) in self._adapter.admins
+
+    def is_direct_bot_interaction(self, event: Any, bot: Any, text: str) -> bool:
+        facts = self._adapter.facts(event)
+        return facts.conversation.is_private or facts.mentions_self or facts.reply_to_self
+
+    def group_trigger_decision_once(self, event: Any, bot: Any, text: str) -> Any:
+        facts = self._adapter.facts(event)
+        return evaluate(TriggerInput.from_facts(facts, now=facts.sent_at), self._adapter.trigger)
+
+    def get_fallback_bot(self) -> Any:
+        return self._adapter.bot
+
+    def request_send_context(self, scope: str, request_identity: str, conversation_key: str = "") -> Any:
+        return OutboundSendContext(idempotency_key=f"{scope}:{request_identity}", conversation_key=conversation_key)
+
+    async def group_trigger_text(self, bot: Any, event: Any) -> str:
+        return event.text
+
+    async def event_text_with_forward(self, bot: Any, event: Any) -> str:
+        return event.text
+
+    async def queue_or_submit_ready(self, item: Any) -> bool:
+        return await self._adapter.submit(item.facts)
+
+    def describe_target(self, target: Mapping[str, Any]) -> TargetConversation:
+        kind = CHANNEL_GROUP if target.get("kind") == ROOM_TARGET else CHANNEL_PRIVATE
+        return TargetConversation(kind=kind, identity=target.get("id"), reply_ref=str(target.get("reply_to") or ""))
+
+    def community_targets(self) -> Iterable[Mapping[str, Any]]:
+        return [{"kind": ROOM_TARGET, "id": room} for room in sorted(self._adapter.rooms)]
+
+    def staged_event_fields(self, event: Any) -> Mapping[str, Any]:
+        return {"event_time": event.sent_at, "group_id": event.room}
+
+    def restore_inbound(
+        self, bot: Any, event: Any, data: Mapping[str, Any], facts: InboundFacts, actor: dict[str, Any],
+    ) -> Any:
+        return SimpleNamespace(facts=facts, user_text=data.get("user_text", ""), actor=actor)
+
+    async def send_text(self, bot: Any, target: Mapping[str, Any], text: str, *, send_context: Any = None) -> Any:
+        return await self._adapter.send(target, text, context=send_context)
