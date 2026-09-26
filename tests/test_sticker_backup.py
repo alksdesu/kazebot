@@ -644,3 +644,20 @@ def test_receipt_extension_does_not_export_runtime_plan_tables(source: Library) 
     with zipfile.ZipFile(archive) as zf:
         assert zf.namelist() == [sb.MANIFEST_NAME]
         assert b"private-runtime-plan" not in zf.read(sb.MANIFEST_NAME)
+
+
+def test_claim_state_stays_out_of_the_backup(source: Library, target: Library) -> None:
+    # 领取令牌和失败次数只在本机有意义；带进备份会让新旧备份的列对不上而拒绝导入。
+    _populate(source)
+    _seed(source, b"captioning-image-bytes", name="打标中")
+    claim = source.store.claim_caption()
+    assert claim is not None
+
+    archive = source.export().path
+    manifest = _manifest_of(archive)
+
+    assert not set(manifest["columns"]) & ss.TRANSIENT_COLUMNS
+    target.restore(archive)
+    restored = target.store.get(claim.sticker.sha256)
+    assert restored is not None and restored.caption_state == ss.CAPTION_RUNNING
+    assert target.store.claim_caption() is not None

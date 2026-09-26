@@ -4501,8 +4501,7 @@ def _group_history_watermark(group_id: int) -> int:
 def _reset_group_history_watermark(group_id: int) -> None:
     """重置水位，让下一轮重新带完整历史。
 
-    SDK 的 reset 路径（event_router._handle_context_reset）按 `prefix:channel_id`
-    解析 conv_key，而 QQ 用的是 conv_<sha256> 哈希，解析不出群号，那条路径对 QQ 恒不生效。
+    会话键对 SDK 不透明，SDK 不碰水位；上下文重置时只有这里知道对应哪个群。
     """
     if _session_state is not None:
         _session_state.reset_channel_watermark(int(group_id))

@@ -6,6 +6,7 @@ list_schedules 曾无任何鉴权，非管理员可读出全部条目——含 t
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -357,3 +358,69 @@ async def test_a_reminder_records_who_created_it(tmp_path: Path) -> None:
     saved = yaml.safe_load((workspace / "data" / "schedules.yaml").read_text(encoding="utf-8"))
     entry = next(s for s in saved["schedules"] if s["id"] == "owned")
     assert entry["created_by"] == _MEMBER["user_id"]
+
+
+@pytest.mark.asyncio
+async def test_a_reminder_records_the_platform_it_came_from(tmp_path: Path) -> None:
+    # 历史别名要记成规范的平台 id，到点回填的身份才和适配器上报的一致。
+    workspace = _workspace(tmp_path)
+
+    await create_schedule(
+        {"id": "owned", "cron": "0 9 * * *", "text": "hi"},
+        _Ctx(workspace, platform_auth={**_MEMBER, "platform": "onebot11"}, safety="auto"),
+    )
+
+    saved = yaml.safe_load((workspace / "data" / "schedules.yaml").read_text(encoding="utf-8"))
+    entry = next(s for s in saved["schedules"] if s["id"] == "owned")
+    assert entry["created_platform"] == "qq"
+
+
+@pytest.mark.asyncio
+async def test_an_admin_of_another_platform_skips_the_file_approval(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    ctx = _Ctx(
+        workspace,
+        platform_auth={"platform": "telegram", "user_id": "7", "is_admin": True},
+        safety="deny",
+        conversation_key="tg_group:abc",
+    )
+
+    result = await create_schedule({"id": "tg", "cron": "0 9 * * *", "text": "hi"}, ctx)
+
+    assert result["ok"] is True
+    assert not ctx.requested
+
+
+class _SchedulerState:
+    """只接住 _inject_inbound 用到的三个入口。"""
+
+    def __init__(self) -> None:
+        self.payloads: list[dict[str, Any]] = []
+        self.eventlog = self
+        self._lock = threading.RLock()
+
+    def get_or_create_session(self, *, channel: str, conversation_key: str) -> str:
+        return "sess"
+
+    def append(self, *, session_id: str, component: str, type_: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.payloads.append(payload)
+        return {"seq": len(self.payloads), "payload": payload}
+
+    def record_inbound_message_event(self, evt: dict[str, Any]) -> None:
+        return None
+
+
+@pytest.mark.parametrize("schedule,expected", [
+    ({"created_by": "7", "created_platform": "telegram"}, "telegram"),
+    ({"created_by": "30003"}, "qq"),
+])
+def test_fired_reminders_carry_the_creator_platform(tmp_path: Path, schedule: dict, expected: str) -> None:
+    from supervisor.scheduler import SchedulerThread
+
+    state = _SchedulerState()
+    scheduler = SchedulerThread(state=state, workspace_root=tmp_path)  # type: ignore[arg-type]
+
+    assert scheduler._fire_message({"text": "hi", "conversation_key": "tg_group:abc", **schedule}, "r1")
+
+    auth = state.payloads[-1]["platform_auth"]
+    assert auth == {"platform": expected, "user_id": schedule["created_by"], "is_admin": False}

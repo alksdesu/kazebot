@@ -13,9 +13,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# adapter 侧 platform_auth.platform 的取值，与 toolbox 那份判断保持一致。
-_QQ_PLATFORMS = {"qq", "onebot", "onebot11"}
-
 from ._helpers import SessionInfo, _now
 from .branch_finalize_store import BranchFinalizeClaimStore
 from .compact_breaker import CompactBreaker
@@ -23,6 +20,7 @@ from .qq_intent import IntentRegistry
 from .eventlog import EventLog, SYSTEM_SESSION_ID
 from engine.builtin.loader import auto_discover_and_register
 from engine.hooks import HookRegistry
+from platforms.sources import classify_operation_source
 from .policy import PolicyEngine
 from .session import SessionMixin
 from .session_store import SessionStore
@@ -1581,28 +1579,38 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             )
             return a
 
-    def _authorizing_conversation_key(self, session_id: str, task_id: str | None) -> str:
-        """Conversation key whose permissions govern this operation.
+    def _authorizing_origin(self, session_id: str, task_id: str | None) -> tuple[str, str]:
+        """(conversation_key, channel) whose permissions govern this operation.
 
         dispatch 出去的子任务跑在自己的 `agent:...` 会话里，按运行期 session 判权就等于：
-        任何群成员只要能让 bot 派一个子节点，「QQ 非管理员禁止写文件 / 禁止敏感命令」
+        任何群成员只要能让 bot 派一个子节点，「外部平台非管理员禁止写文件 / 禁止敏感命令」
         那几道硬拒就整段跳过。发起会话的 key 由 dispatch 一路透传，嵌套派发也保留最初那个。
         """
+        channel = ""
         if task_id:
             task = self.tasks.get(task_id)
             if task is not None:
                 raw_ctx = task.input.get("task_context")
                 ctx = raw_ctx if isinstance(raw_ctx, dict) else {}
+                channel = str(ctx.get("channel") or "").strip()
                 routed = str(
                     ctx.get("route_conversation_key") or ctx.get("parent_conversation_key") or ""
                 ).strip()
                 if routed:
-                    return routed
+                    return routed, channel
                 session = self.sessions.get(task.session_id or session_id)
                 if session is not None:
-                    return str(getattr(session, "conversation_key", "") or "")
+                    return (
+                        str(getattr(session, "conversation_key", "") or ""),
+                        channel or str(getattr(session, "channel", "") or ""),
+                    )
         session = self.sessions.get(session_id)
-        return str(getattr(session, "conversation_key", "") or "") if session else ""
+        if session is None:
+            return "", channel
+        return (
+            str(getattr(session, "conversation_key", "") or ""),
+            channel or str(getattr(session, "channel", "") or ""),
+        )
 
     def request_operation(
         self,
@@ -1614,54 +1622,21 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         node_id: str | None = None,
         task_id: str | None = None,
     ) -> OpRequestOut:
-        conv_key = self._authorizing_conversation_key(session_id, task_id)
+        conv_key, channel = self._authorizing_origin(session_id, task_id)
         platform_auth = dict(parameters.get("platform_auth") or {}) if isinstance(parameters.get("platform_auth"), dict) else {}
         # 只认 conv_key 前缀的话，一旦某条路径把 key 换成 scheduler:/agent: 之类，
-        # 底下那一整段 QQ 硬规则就静默失效；带着 QQ 身份跑的任务照样得吃这些限制。
-        is_qq = conv_key.startswith("qq_") or str(platform_auth.get("platform") or "").strip().lower() in _QQ_PLATFORMS
+        # 底下那一整段硬规则就静默失效；带着外部平台身份跑的任务照样得吃这些限制。
+        source = classify_operation_source(
+            conversation_key=conv_key,
+            channel=channel,
+            platform=platform_auth.get("platform"),
+        )
         is_admin = bool(platform_auth.get("is_admin"))
 
-        # QQ 普通用户硬限制：禁止敏感工具与提示词读取。
-        if is_qq and not is_admin:
-            if op == "execute_command":
-                # 例外：允许非管理员群友用 curl 纯 GET 读取公网网页。
-                # 方法：由 policy.is_safe_public_curl 严格判定（不落盘、无注入、
-                # 非写方法、禁 localhost/内网）。群友无审批入口，故安全情况下直接 auto放行；
-                # 其余命令（下载、装包、危险命令等）仍然拒绝。
-                command = str(parameters.get("command") or "")
-                if self.policy.is_safe_public_curl(command):
-                    return OpRequestOut(
-                        safety_level=SafetyLevel.auto,
-                        reason="auto-allowed: qq non-admin safe public curl read",
-                        approval_id=None,
-                    )
-                return OpRequestOut(
-                    safety_level=SafetyLevel.deny,
-                    reason="qq non-admin users cannot execute sensitive operations",
-                    approval_id=None,
-                )
-            if op == "restart":
-                return OpRequestOut(
-                    safety_level=SafetyLevel.deny,
-                    reason="qq non-admin users cannot execute sensitive operations",
-                    approval_id=None,
-                )
-            if op == "write_file":
-                return OpRequestOut(
-                    safety_level=SafetyLevel.deny,
-                    reason="qq non-admin users cannot modify files",
-                    approval_id=None,
-                )
-            # 读取一律拒绝，不再逐条列敏感前缀：源码里有鉴权逻辑本身、工具脚本里有
-            # 服务器地址、config 里有管理员 QQ 号，黑名单补不全，漏一条就是全泄。
-            # 群友没有读工作区文件的正当用途 —— 他们发的图和文件走附件通道，不经这里。
-            # list_dir 与 search_in_files 也报 read_file，一并挡住。
-            if op == "read_file":
-                return OpRequestOut(
-                    safety_level=SafetyLevel.deny,
-                    reason="qq non-admin users cannot read workspace files",
-                    approval_id=None,
-                )
+        if source.external and not is_admin:
+            verdict = self._external_non_admin_verdict(op, parameters, source.label)
+            if verdict is not None:
+                return verdict
 
         decision = self.policy.evaluate(op=op, parameters=parameters)
         if decision.safety_level == SafetyLevel.auto:
@@ -1702,14 +1677,12 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 approval_id=None,
             )
 
-        #  Why: QQ 管理员亲自触发的任务，对普通命令/文件操作不再逐条审批，
-        # 避免管理员反复确认。How: is_admin 且本次决策不是敏感规则(sensitive=False)
-        # 时，将 approval_required 直接转为 auto。Purpose: 改源码、重启、动
-        # config/nodes、data、工作区外部路径等敏感操作仍需人工确认，deny 硬拦截不变。
-        if is_qq and is_admin and not getattr(decision, "sensitive", False):
+        # 外部平台管理员亲自触发的任务，普通命令和文件操作不再逐条审批；
+        # 改源码、重启、动 config/nodes、data、工作区外部路径等敏感操作仍需人工确认。
+        if source.external and is_admin and not getattr(decision, "sensitive", False):
             return OpRequestOut(
                 safety_level=SafetyLevel.auto,
-                reason=f"auto-approved: qq admin task ({decision.reason})",
+                reason=f"auto-approved: {source.label} admin task ({decision.reason})",
                 approval_id=None,
             )
 
@@ -1725,6 +1698,48 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             task_id=task_id,
         )
         return OpRequestOut(safety_level=SafetyLevel.approval_required, reason=decision.reason, approval_id=approval.approval_id)
+
+    def _external_non_admin_verdict(
+        self, op: str, parameters: dict[str, Any], label: str,
+    ) -> OpRequestOut | None:
+        """外部平台普通用户的硬限制：不能执行命令、改文件、重启、读工作区。"""
+        if op == "execute_command":
+            # 群友没有审批入口，公网网页的纯 GET 读取由 is_safe_public_curl 严格判定后直接放行，
+            # 其余命令（下载、装包、危险命令等）一律拒绝。
+            command = str(parameters.get("command") or "")
+            if self.policy.is_safe_public_curl(command):
+                return OpRequestOut(
+                    safety_level=SafetyLevel.auto,
+                    reason=f"auto-allowed: {label} non-admin safe public curl read",
+                    approval_id=None,
+                )
+            return OpRequestOut(
+                safety_level=SafetyLevel.deny,
+                reason=f"{label} non-admin users cannot execute sensitive operations",
+                approval_id=None,
+            )
+        if op == "restart":
+            return OpRequestOut(
+                safety_level=SafetyLevel.deny,
+                reason=f"{label} non-admin users cannot execute sensitive operations",
+                approval_id=None,
+            )
+        if op == "write_file":
+            return OpRequestOut(
+                safety_level=SafetyLevel.deny,
+                reason=f"{label} non-admin users cannot modify files",
+                approval_id=None,
+            )
+        # 读取一律拒绝，不再逐条列敏感前缀：源码里有鉴权逻辑本身、工具脚本里有
+        # 服务器地址、config 里有管理员名单，黑名单补不全，漏一条就是全泄。
+        # 群友发的图和文件走附件通道，不经这里；list_dir 与 search_in_files 也报 read_file。
+        if op == "read_file":
+            return OpRequestOut(
+                safety_level=SafetyLevel.deny,
+                reason=f"{label} non-admin users cannot read workspace files",
+                approval_id=None,
+            )
+        return None
 
     # ------------------------------------------------------------------ #
     #  Admin / 杂项

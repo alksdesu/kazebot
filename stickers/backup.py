@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .collect import LIBRARY_DIR, PENDING_DIR, sticker_root, store_path
-from .store import ensure_receipt_schema, normalize_name
+from .store import TRANSIENT_COLUMNS, ensure_receipt_schema, normalize_name
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
@@ -146,7 +146,7 @@ def _columns(db: sqlite3.Connection) -> list[str]:
     rows = db.execute("PRAGMA table_info(stickers)").fetchall()
     if not rows:
         raise BackupError("表情包库里没有 stickers 表")
-    return [str(row["name"]) for row in rows]
+    return [str(row["name"]) for row in rows if str(row["name"]) not in TRANSIENT_COLUMNS]
 
 
 def _library_schema(db: sqlite3.Connection) -> str:

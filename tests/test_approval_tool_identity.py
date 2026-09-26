@@ -39,6 +39,18 @@ def _state(tmp_path: Path) -> SupervisorState:
     )
 
 
+def _register_console_session(state: SupervisorState, session_id: str) -> None:
+    """A request always runs inside a known session; an unknown one is treated as external."""
+    now = _now()
+    state.sessions[session_id] = SessionInfo(
+        session_id=session_id,
+        channel="cli",
+        conversation_key=f"cli:{session_id}",
+        created_at=now,
+        updated_at=now,
+    )
+
+
 def _attach_task_to_session(
     state: SupervisorState,
     *,
@@ -76,6 +88,7 @@ def _attach_task_to_session(
 
 def test_request_operation_emits_approval_tool_identity(tmp_path: Path) -> None:
     state = _state(tmp_path)
+    _register_console_session(state, "session-1")
 
     out = state.request_operation(
         session_id="session-1",
@@ -102,6 +115,7 @@ def test_request_operation_emits_approval_tool_identity(tmp_path: Path) -> None:
 
 def test_decide_approval_emits_tool_identity(tmp_path: Path) -> None:
     state = _state(tmp_path)
+    _register_console_session(state, "session-1")
     out = state.request_operation(
         session_id="session-1",
         op="execute_command",

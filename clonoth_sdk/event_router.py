@@ -1046,7 +1046,7 @@ class EventRouter:
             context = replace(context, conversation_key=conv_key)
         await self._invoke_callback(
             "send_to_channel", conv_key, text, attachments,
-            node_id=node_id, delivery_context=context,
+            node_id=node_id, is_final=True, delivery_context=context,
         )
 
     # ------------------------------------------------------------------
@@ -1607,41 +1607,18 @@ class EventRouter:
     async def _handle_context_reset(self, event: Event) -> None:
         """处理 context_reset 事件。
 
-        按 reason 区分：
-          reason='compact' → 仅重置水位标记，不清理 trigger/session 状态。
-          其他 reason → 通过 cleanup_for_context_reset 完整清理。
-        然后通知适配器执行平台侧清理。
-        对应 bot_adapter.py L1950-1982。
+        reason='compact' 不清理 trigger/session 状态；其他 reason 通过
+        cleanup_for_context_reset 完整清理。水位只有适配器知道对应哪个频道，
+        由适配器在 on_context_reset 里重置。
         """
         p = event.payload
         conv_key = p.get("conversation_key", "")
         reason = p.get("reason", "")
 
         if reason == "compact":
-            # Compact：仅重置水位标记
-            # 约定：conv_key 格式为 "prefix:channel_id"（如 "qq_group:123456"）
-            parts = conv_key.split(":", 1)
-            if len(parts) == 2:
-                try:
-                    ch_id = int(parts[1])
-                    self._state.reset_channel_watermark(ch_id)
-                except ValueError:
-                    pass
             cleaned_triggers: list[TriggerInfo] = []
         else:
-            # 完整清理
-            # 约定：conv_key 格式为 "prefix:channel_id"（如 "qq_group:123456"）
-            # 若其他平台 conv_key 含多个冒号，int(parts[1]) 会失败并被 except 捕获
-            parts = conv_key.split(":", 1)
-            ch_id = None
-            if len(parts) == 2:
-                try:
-                    ch_id = int(parts[1])
-                except ValueError:
-                    pass
-            cleaned_triggers = self._state.cleanup_for_context_reset(
-                conv_key, channel_id=ch_id,
-            )
+            cleaned_triggers = self._state.cleanup_for_context_reset(conv_key)
 
         try:
             await self._cb.on_context_reset(conv_key, reason, cleaned_triggers)

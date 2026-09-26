@@ -484,3 +484,63 @@ async def test_the_warning_comes_back_after_the_channel_recovers(
         await bench.tagger._sweep(bench.holder["config"])
 
     assert len([r for r in caplog.records if "打标停用" in r.getMessage()]) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_pass_puts_the_image_back(bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    # CancelledError 不是 Exception；接不住的话重启时正在打的那张会永远停在 running。
+    import asyncio
+
+    digest = _seed(bench)
+    monkeypatch.setitem(sys.modules, "tools._channel", _FakeChannel(_Vision()))
+
+    async def cancelled(*_a, **_k):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(bench.tagger, "_describe", cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await bench.tagger._sweep(bench.holder["config"])
+
+    assert bench.store.get(digest).caption_state == ss.CAPTION_PENDING
+    assert bench.store.claim_caption() is not None
+
+
+@pytest.mark.asyncio
+async def test_two_taggers_never_describe_the_same_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    (tmp_path / "data" / "stickers").mkdir(parents=True)
+    path = tmp_path / "stickers.sqlite3"
+    first, second = ss.StickerStore(path), ss.StickerStore(path)
+    for index in range(4):
+        digest = str(index) * 64
+        image = tmp_path / "data" / "stickers" / f"{digest}.png"
+        image.write_bytes(b"fake png bytes")
+        first.add(sha256=digest, rel_path=image.relative_to(tmp_path).as_posix(),
+                  source=ss.SOURCE_GROUP, state=ss.STATE_LIBRARY, name="待标")
+    monkeypatch.setitem(sys.modules, "tools._channel", _FakeChannel(_Vision()))
+    seen: list[str] = []
+
+    def make(store):
+        tagger = st.StickerTagger(
+            tmp_path, config=lambda: st.TaggerConfig(min_interval=0.0), open_store=lambda: store,
+        )
+
+        async def describe(_vision, image_path):
+            seen.append(Path(image_path).stem)
+            await asyncio.sleep(0)
+            return ["表情包", "开心", "猫"]
+
+        monkeypatch.setattr(tagger, "_describe", describe)
+        return tagger
+
+    try:
+        config = st.TaggerConfig(min_interval=0.0)
+        await asyncio.gather(make(first)._sweep(config), make(second)._sweep(config))
+    finally:
+        first.close()
+        second.close()
+
+    assert sorted(seen) == sorted(set(seen))
+    assert len(seen) == 4

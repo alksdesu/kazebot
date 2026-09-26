@@ -7,6 +7,7 @@ from typing import Any
 # How: return a local HookResult-compatible shape instead. Purpose: avoid
 # cycles while keeping the existing hook registry duck-typed.
 from .result import hook_result
+from engine.inference.resume_builder import resume_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +241,19 @@ def _finish_required_tools(node: Any) -> set[str]:
     return {str(n).strip() for n in names if str(n).strip()}
 
 
+def vision_node_ids(runtime_cfg: Any) -> frozenset[str]:
+    """routing.vision 里配置的视觉入口节点，含按通道覆盖的那几个。"""
+    routing = runtime_cfg.get("routing") if isinstance(runtime_cfg, dict) else None
+    vision = routing.get("vision") if isinstance(routing, dict) else None
+    if not isinstance(vision, dict):
+        return frozenset()
+    candidates = [vision.get("entry_node_id")]
+    channels = vision.get("channels")
+    if isinstance(channels, dict):
+        candidates.extend(cfg.get("entry_node_id") for cfg in channels.values() if isinstance(cfg, dict))
+    return frozenset(str(item).strip() for item in candidates if str(item or "").strip())
+
+
 def _has_unresolved_vision_failure_for_context(ctx: Any) -> bool:
     """Prefer structured current-task tool state, then inspect resumed callbacks."""
     loop_state = ctx.extra.get("loop_state") if isinstance(getattr(ctx, "extra", None), dict) else None
@@ -253,10 +267,29 @@ def _has_unresolved_vision_failure_for_context(ctx: Any) -> bool:
         return True
     # Both sets are cumulative. When retries produced both outcomes, use the
     # ordered message history to determine which result happened last.
-    return _has_unresolved_vision_failure(getattr(ctx, "messages", None))
+    return _has_unresolved_vision_failure(
+        getattr(ctx, "messages", None),
+        vision_nodes=vision_node_ids(getattr(loop_state, "runtime_cfg", None)),
+    )
 
 
-def _has_unresolved_vision_failure(messages: Any) -> bool:
+def _vision_node_outcome(message: dict[str, Any], text: str, vision_nodes: frozenset[str]) -> bool | None:
+    """True 表示视觉节点失败，False 表示已完成，None 表示这条不是视觉节点的结果。"""
+    resume_type, from_node = resume_outcome(message)
+    if resume_type:
+        if from_node not in vision_nodes:
+            return None
+        return {"child_failed": True, "child_result": False}.get(resume_type)
+    # 结构化字段只存在于本进程构建的消息里，从快照恢复的旧消息只剩正文。
+    for node in vision_nodes:
+        if text.startswith(f"下游节点 {node} 执行失败"):
+            return True
+        if text.startswith(f"下游节点 {node} 已完成"):
+            return False
+    return None
+
+
+def _has_unresolved_vision_failure(messages: Any, *, vision_nodes: frozenset[str] = frozenset()) -> bool:
     """Find the latest vision status within the current user turn.
 
     Scan backwards without an arbitrary message-count window. Stop at the current
@@ -270,9 +303,12 @@ def _has_unresolved_vision_failure(messages: Any) -> bool:
         if not isinstance(message, dict):
             continue
         content = message.get("content")
+        text = content.strip() if isinstance(content, str) else ""
+        node_outcome = _vision_node_outcome(message, text, vision_nodes)
+        if node_outcome is not None:
+            return node_outcome
         if not isinstance(content, str):
             continue
-        text = content.strip()
         is_read_image_result = text.startswith('Tool result for "read_image"')
         failed_result = is_read_image_result and any(
             marker in text for marker in ("ERROR:", '"ok": false', "must_not_guess")
@@ -280,14 +316,12 @@ def _has_unresolved_vision_failure(messages: Any) -> bool:
         if (
             text.startswith('\u274c Async tool "read_image"')
             or text.startswith('Tool "read_image" 执行失败')
-            or text.startswith("下游节点 qq.vision 执行失败")
             or text.startswith("read_image 工具调用失败")
             or failed_result
         ):
             return True
         if (
             text.startswith('\u2705 Async tool "read_image"')
-            or text.startswith("下游节点 qq.vision 已完成")
             or (is_read_image_result and not failed_result)
         ):
             return False

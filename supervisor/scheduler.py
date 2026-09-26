@@ -29,6 +29,16 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# 记录创建平台之前，只有 QQ 适配器会写 created_by。
+_LEGACY_CREATOR_PLATFORM = "qq"
+
+
+def _creator_fields(schedule: dict) -> dict[str, str]:
+    return {
+        "created_by": str(schedule.get("created_by") or ""),
+        "created_platform": str(schedule.get("created_platform") or ""),
+    }
+
 
 # ---------------------------------------------------------------------------
 #  schedules.yaml CRUD
@@ -149,7 +159,7 @@ class SchedulerThread:
 
     def _inject_inbound(
         self, sid: str, text: str, conv_key: str, entry_node_id: str = "",
-        attachments: list | None = None, created_by: str = "",
+        attachments: list | None = None, created_by: str = "", created_platform: str = "",
     ) -> bool:
         """共用的 inbound 注入逻辑。返回是否真的注入成功。"""
         msg_id = f"scheduler:{sid}:{uuid.uuid4()}"
@@ -172,7 +182,9 @@ class SchedulerThread:
             if created_by:
                 # 定时任务一律按非管理员跑：无人值守的高权限操作没人能当场喊停。
                 payload["platform_auth"] = {
-                    "platform": "qq", "user_id": created_by, "is_admin": False,
+                    "platform": created_platform or _LEGACY_CREATOR_PLATFORM,
+                    "user_id": created_by,
+                    "is_admin": False,
                 }
             if attachments:
                 payload["attachments"] = attachments
@@ -194,9 +206,7 @@ class SchedulerThread:
         text = str(s.get("text") or f"[scheduled:{sid}]").strip()
         conv_key = str(s.get("conversation_key") or f"scheduler:{sid}").strip()
         entry_node_id = str(s.get("entry_node_id") or "").strip()
-        return self._inject_inbound(
-            sid, text, conv_key, entry_node_id, created_by=str(s.get("created_by") or ""),
-        )
+        return self._inject_inbound(sid, text, conv_key, entry_node_id, **_creator_fields(s))
 
     def _fire_script(self, s: dict, sid: str) -> bool:
         """type=script：执行脚本，stdout JSON 解析后注入 inbound。返回是否真的注入成功。"""
@@ -232,8 +242,7 @@ class SchedulerThread:
                 if not text_prefix:
                     return False
                 return self._inject_inbound(
-                    sid, text_prefix, conv_key, entry_node_id,
-                    created_by=str(s.get("created_by") or ""),
+                    sid, text_prefix, conv_key, entry_node_id, **_creator_fields(s),
                 )
             # 解析 JSON
             try:
@@ -249,8 +258,7 @@ class SchedulerThread:
                 body_text = text_prefix + "\n" + body_text
             attachments = data.get("attachments") or None
             return self._inject_inbound(
-                sid, body_text, conv_key, entry_node_id, attachments,
-                created_by=str(s.get("created_by") or ""),
+                sid, body_text, conv_key, entry_node_id, attachments, **_creator_fields(s),
             )
         except subprocess.TimeoutExpired:
             log.error(f"[scheduler] script {sid}: timed out after {s.get('timeout', 30)}s")

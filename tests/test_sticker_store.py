@@ -656,3 +656,141 @@ def test_two_handles_can_initialize_a_new_library_together(tmp_path: Path) -> No
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         assert list(pool.map(open_library, range(2))) == ["wal", "wal"]
+
+
+# ── 打标领取 ──
+
+def test_a_claimed_item_is_not_handed_out_twice(store) -> None:
+    _add(store, "a" * 64)
+    _add(store, "b" * 64)
+
+    first = store.claim_caption()
+    second = store.claim_caption()
+    third = store.claim_caption()
+
+    assert first is not None and second is not None
+    assert {first.sticker.sha256, second.sticker.sha256} == {"a" * 64, "b" * 64}
+    assert third is None
+    assert store.get("a" * 64).caption_state == ss.CAPTION_RUNNING
+
+
+def test_concurrent_claimers_split_the_work(tmp_path: Path) -> None:
+    # 多开时几个进程共用一个库，先查后标会让几个进程同时花钱打同一张。
+    path = tmp_path / "stickers.sqlite3"
+    seed = ss.StickerStore(path)
+    for index in range(8):
+        _add(seed, str(index) * 64)
+    seed.close()
+
+    stores = [ss.StickerStore(path) for _ in range(4)]
+    try:
+        def drain(handle):
+            got = []
+            while True:
+                claim = handle.claim_caption()
+                if claim is None:
+                    return got
+                got.append(claim.sticker.sha256)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            batches = list(pool.map(drain, stores))
+    finally:
+        for handle in stores:
+            handle.close()
+
+    claimed = [digest for batch in batches for digest in batch]
+    assert sorted(claimed) == sorted(str(index) * 64 for index in range(8))
+
+
+def test_an_expired_claim_goes_back_into_the_queue(store, monkeypatch: pytest.MonkeyPatch) -> None:
+    _add(store, "a" * 64)
+    assert store.claim_caption() is not None
+    assert store.claim_caption() is None
+
+    later = ss.time.time() + ss.CAPTION_LEASE_SEC + 5
+    monkeypatch.setattr(ss.time, "time", lambda: later)
+
+    assert store.claim_caption() is not None
+
+
+def test_a_row_stuck_before_leases_existed_is_recovered(store) -> None:
+    # 旧版本在取消时把图留在 running，claimed_at 是迁移补的默认值 0。
+    _add(store, "a" * 64)
+    with store._tx() as db:
+        db.execute("UPDATE stickers SET caption_state=?,caption_claimed_at=0", (ss.CAPTION_RUNNING,))
+
+    assert [row.sha256 for row in store.due_for_caption()] == ["a" * 64]
+    assert store.claim_caption() is not None
+
+
+def test_a_late_result_cannot_overwrite_the_new_owner(store, monkeypatch: pytest.MonkeyPatch) -> None:
+    _add(store, "a" * 64, name="待标")
+    stale = store.claim_caption()
+    later = ss.time.time() + ss.CAPTION_LEASE_SEC + 5
+    monkeypatch.setattr(ss.time, "time", lambda: later)
+    fresh = store.claim_caption()
+    assert stale is not None and fresh is not None
+
+    assert store.finish_caption(fresh, ["表情包", "开心", "猫"]) is True
+    assert store.fail_caption(stale, error="超时", max_attempts=1) == ""
+    assert store.finish_caption(stale, ["表情包", "难过"]) is False
+
+    row = store.get("a" * 64)
+    assert row.caption_state == ss.CAPTION_DONE
+    assert row.tags == ["表情包", "开心", "猫"]
+
+
+def test_failures_are_counted_across_claims(store) -> None:
+    _add(store, "a" * 64)
+    states = []
+    for _ in range(3):
+        claim = store.claim_caption()
+        assert claim is not None
+        states.append(store.fail_caption(claim, error="超时", max_attempts=3))
+
+    assert states == [ss.CAPTION_PENDING, ss.CAPTION_PENDING, ss.CAPTION_FAILED]
+    assert store.claim_caption() is None
+
+
+def test_a_final_failure_skips_the_retries(store) -> None:
+    _add(store, "a" * 64)
+    claim = store.claim_caption()
+    assert store.fail_caption(claim, error="文件不在了", max_attempts=3, final=True) == ss.CAPTION_FAILED
+
+
+def test_releasing_puts_it_back_without_counting_a_failure(store) -> None:
+    _add(store, "a" * 64)
+    claim = store.claim_caption()
+
+    assert store.release_caption(claim) is True
+    assert store.get("a" * 64).caption_state == ss.CAPTION_PENDING
+    again = store.claim_caption()
+    assert store.fail_caption(again, error="x", max_attempts=2) == ss.CAPTION_PENDING
+
+
+def test_reset_clears_attempts_and_claims(store) -> None:
+    _add(store, "a" * 64)
+    claim = store.claim_caption()
+    store.fail_caption(claim, error="x", max_attempts=1)
+
+    assert store.reset_captions(only_failed=True) == 1
+    claim = store.claim_caption()
+    assert store.fail_caption(claim, error="x", max_attempts=2) == ss.CAPTION_PENDING
+
+
+def test_an_old_library_gains_the_claim_columns(tmp_path: Path) -> None:
+    path = tmp_path / "stickers.sqlite3"
+    handle = ss.StickerStore(path)
+    _add(handle, "a" * 64)
+    handle.close()
+    db = sqlite3.connect(path)
+    for column in ("caption_claim", "caption_claimed_at", "caption_attempts"):
+        db.execute(f"ALTER TABLE stickers DROP COLUMN {column}")
+    db.commit()
+    db.close()
+
+    reopened = ss.StickerStore(path)
+    try:
+        assert reopened.claim_caption() is not None
+    finally:
+        reopened.close()

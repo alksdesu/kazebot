@@ -12,13 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from .store import (
-    CAPTION_FAILED,
-    CAPTION_PENDING,
-    CAPTION_PROMPT_VERSION,
-    CAPTION_RUNNING,
-    StickerStore,
-)
+from .store import CAPTION_PROMPT_VERSION, CaptionClaim, StickerStore
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
@@ -125,7 +119,6 @@ class StickerTagger:
         self._config = config
         self._open_store = open_store
         self._task: asyncio.Task[None] | None = None
-        self._attempts: dict[str, int] = {}
         self._last_call = 0.0
         # 渠道没配好时每轮都喊一遍就把日志刷没了，只在状态变化时说。
         self._last_channel_error = ""
@@ -166,9 +159,7 @@ class StickerTagger:
         store = self._open_store()
         if store is None:
             return 0
-        pending = store.due_for_caption(limit=max(int(config.batch), 1))
-        if not pending:
-            self._attempts.clear()
+        if not store.due_for_caption(limit=1):
             return 0
 
         from tools._channel import resolve_vision_channel
@@ -183,44 +174,49 @@ class StickerTagger:
         self._last_channel_error = ""
 
         done = 0
-        for row in pending:
-            path = self.workspace_root / row.rel_path
-            if not row.rel_path or not path.is_file():
-                store.mark_caption(row.sha256, CAPTION_FAILED, error="文件不在了")
-                continue
-            gap = config.min_interval - (asyncio.get_running_loop().time() - self._last_call)
-            if gap > 0:
-                await asyncio.sleep(gap)
-            self._last_call = asyncio.get_running_loop().time()
-            store.mark_caption(row.sha256, CAPTION_RUNNING)
+        # 失败的图会立刻回到待办，同一轮不再领它，免得一次扫描就把重试次数用完。
+        handled: set[str] = set()
+        for _ in range(max(int(config.batch), 1)):
+            claim = store.claim_caption(exclude=handled)
+            if claim is None:
+                break
+            handled.add(claim.sticker.sha256)
             try:
-                tags = await self._describe(vision, path)
-            except Exception as exc:
-                self._record_failure(store, row.sha256, str(exc))
-                continue
-            # 先判空再归一化：fallback 是给"给了但不够"补位的，不能让它把
-            # "一个标签都没给"也伪装成成功，那样图片会带个没意义的名字进检索。
-            if not tags:
-                self._record_failure(store, row.sha256, "模型没给出标签")
-                continue
-            cleaned = normalize_tags(tags, fallback=row.name)
-            if not cleaned:
-                self._record_failure(store, row.sha256, "标签全被归一化丢弃")
-                continue
-            store.set_auto_tags(row.sha256, cleaned, version=CAPTION_PROMPT_VERSION)
-            self._attempts.pop(row.sha256, None)
-            done += 1
+                if await self._caption(store, vision, config, claim):
+                    done += 1
+            except asyncio.CancelledError:
+                # CancelledError 不是 Exception，不放回的话这张图会一直停在 running。
+                store.release_caption(claim)
+                raise
         return done
 
-    def _record_failure(self, store: StickerStore, sha256: str, reason: str) -> None:
-        attempts = self._attempts.get(sha256, 0) + 1
-        self._attempts[sha256] = attempts
-        if attempts >= _MAX_ATTEMPTS:
-            store.mark_caption(sha256, CAPTION_FAILED, error=reason)
-            self._attempts.pop(sha256, None)
-        else:
-            # 留在待办里下轮再试，别让一次超时把图永久判死。
-            store.mark_caption(sha256, CAPTION_PENDING, error=reason)
+    async def _caption(
+        self, store: StickerStore, vision: Any, config: TaggerConfig, claim: CaptionClaim,
+    ) -> bool:
+        row = claim.sticker
+        path = self.workspace_root / row.rel_path
+        if not row.rel_path or not path.is_file():
+            store.fail_caption(claim, error="文件不在了", max_attempts=_MAX_ATTEMPTS, final=True)
+            return False
+        gap = config.min_interval - (asyncio.get_running_loop().time() - self._last_call)
+        if gap > 0:
+            await asyncio.sleep(gap)
+        self._last_call = asyncio.get_running_loop().time()
+        try:
+            tags = await self._describe(vision, path)
+        except Exception as exc:
+            store.fail_caption(claim, error=str(exc), max_attempts=_MAX_ATTEMPTS)
+            return False
+        # 先判空再归一化：fallback 是给"给了但不够"补位的，不能让它把
+        # "一个标签都没给"也伪装成成功，那样图片会带个没意义的名字进检索。
+        if not tags:
+            store.fail_caption(claim, error="模型没给出标签", max_attempts=_MAX_ATTEMPTS)
+            return False
+        cleaned = normalize_tags(tags, fallback=row.name)
+        if not cleaned:
+            store.fail_caption(claim, error="标签全被归一化丢弃", max_attempts=_MAX_ATTEMPTS)
+            return False
+        return store.finish_caption(claim, cleaned, version=CAPTION_PROMPT_VERSION)
 
     async def _describe(self, vision: Any, path: Path) -> list[str]:
         import httpx

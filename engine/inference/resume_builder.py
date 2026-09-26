@@ -27,6 +27,19 @@ def _attachments_from_payload(payload: Any) -> list[Any]:
 #  恢复消息构建（同时兼容 v1 和 v2 格式）
 # ---------------------------------------------------------------------------
 
+_CHILD_RESUME_TYPES = frozenset(
+    {"child_result", "child_ask", "child_failed", "child_cancelled", "child_preempted"}
+)
+
+
+def resume_outcome(message: Any) -> tuple[str, str]:
+    """(resume_type, from_node)，不是下游节点的恢复消息返回两个空串。"""
+    meta = message.get("_meta") if isinstance(message, dict) else None
+    if not isinstance(meta, dict):
+        return "", ""
+    return str(meta.get("resume_type") or ""), str(meta.get("resume_from_node") or "")
+
+
 def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
     """从 resume_data / resume_event 构建恢复消息。
 
@@ -38,6 +51,19 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
       - tool_results:    工具调用结果
       - handoff_result:  子链返回结果
     """
+    messages = _resume_messages(resume_data)
+    rtype = str(resume_data.get("type") or "").strip()
+    if rtype in _CHILD_RESUME_TYPES:
+        # 下游结果的判定读这里，不去匹配中文正文；_meta 发给模型前会被剥掉。
+        from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
+        for message in messages:
+            message.setdefault("_meta", {}).update(
+                {"resume_type": rtype, "resume_from_node": from_node}
+            )
+    return messages
+
+
+def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
     rtype = str(resume_data.get("type") or "").strip()
 
     # v2: child_result

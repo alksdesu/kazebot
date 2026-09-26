@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from platforms.sources import classify_source_name, is_external_platform
+
 from ..context import ToolContext
 from .._common import request_guard
 
@@ -33,25 +35,25 @@ def _err(message: Any, **fields: Any) -> dict[str, Any]:
 
 
 def _platform_admin_can_manage_schedules(ctx: ToolContext) -> bool:
-    """Return whether the current platform user may manage schedules without approval.
+    """外部平台管理员管理定时任务不再走 write_file 审批。
 
-    [QQ schedule 2026-06-21] Why: create_schedule used the generic write_file
-    guard for data/schedules.yaml. In QQ chats this produced approval_requested
-    events and the task waited forever if the approval prompt was not surfaced.
-    How: trust the platform_auth.is_admin flag that adapters already derive from
-    server-side admin lists. Purpose: QQ admins can create/delete reminders as a
-    normal chat action without blocking on a second write_file approval.
+    聊天里弹出的审批没人点，任务会一直挂着；管理员身份由适配器按服务端名单判定，直接信任。
     """
     auth = getattr(ctx, "platform_auth", None)
     if not isinstance(auth, dict):
         return False
-    platform = str(auth.get("platform") or "").strip().lower()
-    return platform in {"qq", "onebot", "onebot11"} and bool(auth.get("is_admin"))
+    return is_external_platform(auth.get("platform")) and bool(auth.get("is_admin"))
 
 
 def _creator_id(ctx: ToolContext) -> str:
     auth = getattr(ctx, "platform_auth", None)
     return str((auth or {}).get("user_id") or "").strip() if isinstance(auth, dict) else ""
+
+
+def _creator_platform(ctx: ToolContext) -> str:
+    auth = getattr(ctx, "platform_auth", None)
+    source = classify_source_name(auth.get("platform")) if isinstance(auth, dict) else None
+    return source.label if source is not None and source.external else ""
 
 
 def _originating_conversation_key(ctx: ToolContext) -> str:
@@ -187,9 +189,12 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         "once": once,
     }
     # 到点注入时按它回填 platform_auth：没有创建者身份，运行期就拿不到「非管理员」
-    # 这个事实，QQ 那套硬规则会整段落空。
+    # 这个事实，外部平台那套硬规则会整段落空。
     if creator:
         entry["created_by"] = creator
+        platform = _creator_platform(ctx)
+        if platform:
+            entry["created_platform"] = platform
     if stype == "script":
         entry["type"] = "script"
         entry["command"] = command

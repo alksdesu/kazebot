@@ -131,6 +131,7 @@ class AdapterCallbacks(Protocol):
         attachments: list[dict[str, Any]],
         *,
         node_id: str = "",
+        is_final: bool = True,
         delivery_context: DeliveryContext | None = None,
     ) -> None:
         """消息需要发送到频道，但没有匹配的 trigger（fallback 路径）。
@@ -138,7 +139,7 @@ class AdapterCallbacks(Protocol):
         触发时机：
           - outbound_message 事件，source_inbound_seq 不在 triggers 中
             （主节点 finish 后子节点或调度任务的输出）
-          - intermediate_reply 事件，非入口节点的中间回复
+          - intermediate_reply 事件，非入口节点的中间回复，或入口节点带附件的中间回复
         对应 bot_adapter.py L1375-1434（outbound fallback）和 L1467-1520（intermediate fallback）。
 
         SDK 已完成：
@@ -147,16 +148,19 @@ class AdapterCallbacks(Protocol):
           - 清理内部协议标记
 
         适配器需要：
-          - 从 conversation_key 解析平台频道标识（如 "qq_group:123" → channel 123）
+          - 从 conversation_key 解析平台频道标识
           - 非入口节点的消息可加节点显示名前缀以区分来源
           - 发送文本和附件到对应频道
+          - is_final 为真时收尾这一轮的回复状态（如撤掉处理中表态）
 
         Args:
-            conversation_key: 目标会话键（如 "qq_group:123456789"）。
+            conversation_key: 目标会话键。
             text: 清理过 SDK 协议标记后的文本。仍含 Bot 自定义标记。
             attachments: 附件列表。
             node_id: 发送方节点 ID。空字符串表示未知。
                      适配器可据此为非入口节点消息添加来源标识前缀。
+            is_final: 这是不是这一轮的最终输出。中间回复传 False，
+                      outbound_message 的 fallback 传 True。
         """
         ...
 
@@ -515,23 +519,22 @@ class AdapterCallbacks(Protocol):
         对应 bot_adapter.py L1950-1982。
 
         SDK 已根据 reason 区分处理（SessionState 方法）：
-          - reason="compact" → 仅重置水位标记（reset_channel_watermark），
-            不清理 trigger / session 状态。cleaned_triggers 为空列表。
+          - reason="compact" → 不清理 trigger / session 状态，cleaned_triggers 为空列表。
           - 其他 reason（如 "clear"）→ 完整清理（cleanup_for_context_reset）：
               * 清理 conversation_key 匹配的所有 trigger
               * 删除 session 双向映射
-              * 重置水位标记
-              * 清理 DM 频道映射
               * 被清理的 trigger 通过 cleaned_triggers 传出
 
         适配器需要：
+          - 重置这个会话对应频道的历史水位（两种 reason 都要）：会话键对 SDK 不透明，
+            SDK 推不出是哪个频道
           - 清理平台侧历史缓存（如频道消息历史队列）
           - 遍历 cleaned_triggers，编辑其 status_msg（如 "🔄 上下文已重置。"）
           - 清理关联的 MainTaskState 中的 log_msg
             （通过 trigger.platform_data["_stale_main_state"].platform_data["log_msg"]）
 
         Args:
-            conversation_key: 被重置的会话键（如 "qq_group:123456789"）。
+            conversation_key: 被重置的会话键。
             reason: 重置原因。"compact" 表示上下文压缩，其他值表示完整清除。
             cleaned_triggers: 被清理的 trigger 列表（仅非 compact 时有内容）。
                               每个 trigger 的 platform_data["_stale_main_state"]

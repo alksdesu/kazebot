@@ -572,23 +572,18 @@ class SessionState:
     #  复合清理操作
     # ================================================================
 
-    def cleanup_for_context_reset(
-        self,
-        conversation_key: str,
-        channel_id: int | None = None,
-    ) -> list[TriggerInfo]:
+    def cleanup_for_context_reset(self, conversation_key: str) -> list[TriggerInfo]:
         """context_reset(clear) 时清理指定会话的所有关联状态。
-
-        对应 bot_adapter.py L1964-1982 context_reset 非 compact 分支的完整清理。
 
         操作内容：
           1. 清理 conversation_key 匹配的所有 trigger 及关联状态
           2. 删除 conversation_key ↔ session_id 双向映射
-          3. 如提供 channel_id，重置水位并清理 DM 频道映射
+
+        会话键在 SDK 看来是不透明的字符串，推不出平台频道，所以水位由适配器在
+        on_context_reset 里重置；DM 映射跟着 session 走，重置后同一 session 仍然有效。
 
         Args:
-            conversation_key: 被重置的会话键（如 "qq_group:123456"）
-            channel_id: 平台频道标识符（可选；提供时额外清理水位和 DM 映射）
+            conversation_key: 被重置的会话键。
 
         Returns:
             被清理的 trigger 列表，供适配器处理平台侧清理
@@ -612,11 +607,6 @@ class SessionState:
 
         # 2. 清理 session 映射
         self.unregister_session(conversation_key)
-
-        # 3. 清理水位和 DM 映射（需要 channel_id）
-        if channel_id is not None:
-            self.reset_channel_watermark(channel_id)
-            self.cleanup_dm_channels_for(channel_id)
 
         return cleaned_triggers
 

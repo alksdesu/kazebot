@@ -564,29 +564,35 @@ class TestResetPaths:
         assert runtime._session_state.get_high_watermark(_GROUP_ID + 1) == -1
 
 
-class TestSdkResetPathDoesNotCoverQq:
-    def test_the_sdk_cannot_parse_a_qq_conversation_key(self) -> None:
-        """SDK 的 context_reset 处理按 `prefix:channel_id` 取群号，QQ 用的是 sha256 哈希。
+class TestSdkLeavesWatermarksToTheAdapter:
+    @pytest.mark.parametrize("reason", ["compact", "clear"])
+    @pytest.mark.parametrize("conversation_key", [
+        "qq_group:bc3f12b0621298e191a49fa7",
+        f"qq_group:{_GROUP_ID}",
+    ])
+    def test_the_sdk_never_resets_a_watermark(self, reason: str, conversation_key: str) -> None:
+        """会话键对 SDK 不透明，哪怕长得像「前缀:数字」也不拿来当频道号。
 
-        这条不通，才需要 onebot 自己在 on_context_reset 里重置 —— 谁看到两处都在重置
-        想删掉一处时，这个测试会指出该留哪一处。
+        水位只由 onebot 在 on_context_reset 里重置 —— 谁想在 SDK 里再补一处时，
+        这个测试会指出该留哪一处。
         """
         from clonoth_sdk.event_router import EventRouter
 
         state = SessionState()
         state.advance_watermark(_GROUP_ID, 5)
+        seen: list[tuple[str, str]] = []
+
+        async def on_context_reset(key: str, why: str, _cleaned: Any) -> None:
+            seen.append((key, why))
 
         router = EventRouter.__new__(EventRouter)
         router._state = state
-        router._cb = SimpleNamespace(on_context_reset=_async_noop)
+        router._cb = SimpleNamespace(on_context_reset=on_context_reset)
 
         asyncio.run(router._handle_context_reset(SimpleNamespace(payload={
-            "conversation_key": "conv_bc3f12b0621298e191a49fa7",
-            "reason": "compact",
+            "conversation_key": conversation_key,
+            "reason": reason,
         })))
 
         assert state.get_high_watermark(_GROUP_ID) == 5
-
-
-async def _async_noop(*args: Any, **kwargs: Any) -> None:
-    return None
+        assert seen == [(conversation_key, reason)]

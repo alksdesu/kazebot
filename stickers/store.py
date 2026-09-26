@@ -11,6 +11,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +37,20 @@ SOURCE_IMAGEBED = "imagebed"
 
 # 改这个数会让全库重新打标，烧的是真钱。只有 prompt 语义真的变了才 +1。
 CAPTION_PROMPT_VERSION = 1
+
+# 一张图的打标最多两次 HTTP 请求、每次 60 秒超时；租约留足余量，过期才算领取者死了。
+CAPTION_LEASE_SEC = 600
+
+# 建表语句之后加的列统一走 ALTER，新库旧库同一条路径。
+_LATE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("caption_claim", "TEXT NOT NULL DEFAULT ''"),
+    ("caption_claimed_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("caption_attempts", "INTEGER NOT NULL DEFAULT 0"),
+)
+# 打标领取的运行态只在本机有意义，备份导出导入都不带，新旧备份因此格式一致。
+TRANSIENT_COLUMNS: frozenset[str] = frozenset(
+    {"caption_claim", "caption_claimed_at", "caption_attempts"}
+)
 
 # 名字要能被模型照抄回来，所以剔掉标记语法会用到的字符。
 _NAME_STRIP = re.compile(r"[\[\]:：,，\s]+")
@@ -73,6 +88,14 @@ class Sticker:
     def usable(self) -> bool:
         """能不能进检索。没打标的图对模型来说是不可描述的，给了也选不出来。"""
         return self.state == STATE_LIBRARY and self.caption_state == CAPTION_DONE
+
+
+@dataclass(frozen=True)
+class CaptionClaim:
+    """一次打标领取。后续写回都要带着令牌，租约过期被别人接手后，迟到的结果写不进去。"""
+
+    sticker: Sticker
+    token: str
 
 
 def normalize_name(wanted: Any, *, digest: str = "") -> str:
@@ -261,6 +284,10 @@ class StickerStore:
                 )"""
             )
             db.execute("CREATE INDEX IF NOT EXISTS sent_log_at ON sent_log(conversation_key,sent_at)")
+            present = {str(row[1]) for row in db.execute("PRAGMA table_info(stickers)")}
+            for column, ddl in _LATE_COLUMNS:
+                if column not in present:
+                    db.execute(f"ALTER TABLE stickers ADD COLUMN {column} {ddl}")
             db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('schema','1')")
             ensure_receipt_schema(db)
@@ -411,20 +438,33 @@ class StickerStore:
 
     def set_auto_tags(self, sha256: str, tags: Sequence[str], *, version: int) -> None:
         with self._tx() as db:
-            row = db.execute(
-                "SELECT manual_tags,manual_override FROM stickers WHERE sha256=?", (sha256,)
-            ).fetchone()
-            if not row:
-                return
-            manual = _loads(row["manual_tags"])
-            override = bool(row["manual_override"])
-            db.execute(
-                """UPDATE stickers SET auto_tags=?,tags=?,caption_state=?,caption_error='',
-                   caption_prompt_version=?,updated_at=? WHERE sha256=?""",
-                (json.dumps(list(tags), ensure_ascii=False),
-                 json.dumps(merge_tags(tags, manual, override=override), ensure_ascii=False),
-                 CAPTION_DONE, int(version), int(time.time()), sha256),
-            )
+            self._write_auto_tags_locked(db, sha256, tags, version=version)
+
+    @staticmethod
+    def _write_auto_tags_locked(
+        db: sqlite3.Connection, sha256: str, tags: Sequence[str], *, version: int,
+        claim: str | None = None,
+    ) -> bool:
+        where, params = "sha256=?", [sha256]
+        if claim is not None:
+            where += " AND caption_state=? AND caption_claim=?"
+            params += [CAPTION_RUNNING, claim]
+        row = db.execute(
+            f"SELECT manual_tags,manual_override FROM stickers WHERE {where}", params
+        ).fetchone()
+        if not row:
+            return False
+        manual = _loads(row["manual_tags"])
+        override = bool(row["manual_override"])
+        db.execute(
+            """UPDATE stickers SET auto_tags=?,tags=?,caption_state=?,caption_error='',
+               caption_prompt_version=?,caption_claim='',caption_claimed_at=0,
+               caption_attempts=0,updated_at=? WHERE sha256=?""",
+            (json.dumps(list(tags), ensure_ascii=False),
+             json.dumps(merge_tags(tags, manual, override=override), ensure_ascii=False),
+             CAPTION_DONE, int(version), int(time.time()), sha256),
+        )
+        return True
 
     def set_manual_tags(
         self, sha256: str, tags: Sequence[str], *, override: bool | None = None,
@@ -446,12 +486,15 @@ class StickerStore:
             )
 
     def mark_caption(self, sha256: str, state: str, *, error: str = "") -> None:
+        """不经领取直接改状态。打标流程走 claim_caption，这里给导入、测试和人工修正用。"""
         if state not in CAPTION_STATES:
             raise ValueError(f"未知打标状态: {state}")
+        now = int(time.time())
         with self._tx() as db:
             db.execute(
-                "UPDATE stickers SET caption_state=?,caption_error=?,updated_at=? WHERE sha256=?",
-                (state, str(error)[:500], int(time.time()), sha256),
+                """UPDATE stickers SET caption_state=?,caption_error=?,caption_claim='',
+                   caption_claimed_at=?,updated_at=? WHERE sha256=?""",
+                (state, str(error)[:500], now if state == CAPTION_RUNNING else 0, now, sha256),
             )
 
     def reset_captions(self, *, only_failed: bool = False) -> int:
@@ -459,20 +502,98 @@ class StickerStore:
         clause = f"AND caption_state='{CAPTION_FAILED}'" if only_failed else ""
         with self._tx() as db:
             return db.execute(
-                f"""UPDATE stickers SET caption_state=?,caption_error='',updated_at=?
+                f"""UPDATE stickers SET caption_state=?,caption_error='',caption_claim='',
+                    caption_claimed_at=0,caption_attempts=0,updated_at=?
                     WHERE state<>? {clause}""",
                 (CAPTION_PENDING, int(time.time()), STATE_DISCARDED),
             ).rowcount
 
-    def due_for_caption(self, limit: int = 20, *, version: int = CAPTION_PROMPT_VERSION) -> list[Sticker]:
-        """待打标的活。版本落后的也算 —— prompt 变了旧标签就不可比。"""
+    @staticmethod
+    def _due_clause(*, version: int, lease_sec: float) -> tuple[str, list[Any]]:
+        """待打标的条件。版本落后的也算，领取后租约过期的也算（领取者进程已经没了）。"""
+        cutoff = int(time.time()) - max(int(lease_sec), 1)
+        return (
+            """state<>? AND (
+                   caption_state=?
+                   OR (caption_state=? AND caption_prompt_version<?)
+                   OR (caption_state=? AND caption_claimed_at<?)
+               )""",
+            [STATE_DISCARDED, CAPTION_PENDING, CAPTION_DONE, int(version), CAPTION_RUNNING, cutoff],
+        )
+
+    def due_for_caption(
+        self, limit: int = 20, *, version: int = CAPTION_PROMPT_VERSION,
+        lease_sec: float = CAPTION_LEASE_SEC,
+    ) -> list[Sticker]:
+        clause, params = self._due_clause(version=version, lease_sec=lease_sec)
         rows = self._all(
-            """SELECT * FROM stickers WHERE state<>? AND (
-                   caption_state=? OR (caption_state=? AND caption_prompt_version<?)
-               ) ORDER BY created_at LIMIT ?""",
-            (STATE_DISCARDED, CAPTION_PENDING, CAPTION_DONE, int(version), int(limit)),
+            f"SELECT * FROM stickers WHERE {clause} ORDER BY created_at LIMIT ?",
+            [*params, int(limit)],
         )
         return [_row_to_sticker(row) for row in rows]
+
+    def claim_caption(
+        self, *, version: int = CAPTION_PROMPT_VERSION, lease_sec: float = CAPTION_LEASE_SEC,
+        exclude: Collection[str] = (),
+    ) -> CaptionClaim | None:
+        """原子领取一张待打标的图。多个进程共用一个库，先查后标会让几个进程同时花钱打同一张。"""
+        clause, params = self._due_clause(version=version, lease_sec=lease_sec)
+        skipped = [str(item) for item in exclude]
+        if skipped:
+            clause += f" AND sha256 NOT IN ({','.join('?' * len(skipped))})"
+            params += skipped
+        token = uuid.uuid4().hex
+        now = int(time.time())
+        with self._tx() as db:
+            row = db.execute(
+                f"SELECT * FROM stickers WHERE {clause} ORDER BY created_at LIMIT 1", params,
+            ).fetchone()
+            if row is None:
+                return None
+            db.execute(
+                """UPDATE stickers SET caption_state=?,caption_claim=?,caption_claimed_at=?,
+                   updated_at=? WHERE sha256=?""",
+                (CAPTION_RUNNING, token, now, now, row["sha256"]),
+            )
+        return CaptionClaim(sticker=_row_to_sticker(row), token=token)
+
+    def finish_caption(
+        self, claim: CaptionClaim, tags: Sequence[str], *, version: int = CAPTION_PROMPT_VERSION,
+    ) -> bool:
+        with self._tx() as db:
+            return self._write_auto_tags_locked(
+                db, claim.sticker.sha256, tags, version=version, claim=claim.token,
+            )
+
+    def fail_caption(
+        self, claim: CaptionClaim, *, error: str, max_attempts: int, final: bool = False,
+    ) -> str:
+        """记一次失败，返回写入后的状态；领取已失效时什么都不写，返回空串。"""
+        with self._tx() as db:
+            row = db.execute(
+                """SELECT caption_attempts FROM stickers
+                   WHERE sha256=? AND caption_state=? AND caption_claim=?""",
+                (claim.sticker.sha256, CAPTION_RUNNING, claim.token),
+            ).fetchone()
+            if row is None:
+                return ""
+            attempts = int(row["caption_attempts"] or 0) + 1
+            state = CAPTION_FAILED if final or attempts >= max(int(max_attempts), 1) else CAPTION_PENDING
+            db.execute(
+                """UPDATE stickers SET caption_state=?,caption_error=?,caption_attempts=?,
+                   caption_claim='',caption_claimed_at=0,updated_at=? WHERE sha256=?""",
+                (state, str(error)[:500], attempts, int(time.time()), claim.sticker.sha256),
+            )
+        return state
+
+    def release_caption(self, claim: CaptionClaim) -> bool:
+        """放回待打标，不计失败次数。用于领取者被取消、还没来得及出结果的情况。"""
+        with self._tx() as db:
+            return db.execute(
+                """UPDATE stickers SET caption_state=?,caption_claim='',caption_claimed_at=0,
+                   updated_at=? WHERE sha256=? AND caption_state=? AND caption_claim=?""",
+                (CAPTION_PENDING, int(time.time()), claim.sticker.sha256, CAPTION_RUNNING, claim.token),
+            ).rowcount > 0
 
     # ── 查询 ──
 
