@@ -13,8 +13,8 @@ from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE
 from platforms.inbound import InboundConversation, InboundFacts, InboundSender
 
 from . import community_commands
-from .conversation_coordinator import ConversationCoordinator
-from .burst_store import BurstStore
+from adapters._shared.burst_store import BurstStore
+from adapters._shared.conversation_coordinator import ConversationCoordinator
 from adapters._shared.send_guard import SendError
 
 logger = logging.getLogger(__name__)

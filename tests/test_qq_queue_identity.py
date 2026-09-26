@@ -94,7 +94,7 @@ def test_same_sender_keeps_all_memory_mentions_when_merged(runtime):
 
     asyncio.run(exercise())
     assert len(runtime.state._adapter.qq_queue) == 1
-    merged = runtime.state._adapter.qq_queue[0]
+    merged = next(iter(runtime.state._adapter.qq_queue))
     assert merged.user_text == "first\nsecond"
     subjects = runtime.anonymize._collect_memory_subjects(
         merged.event, merged.user_text, merged.stable_conversation_key,
@@ -162,7 +162,7 @@ def test_waiters_serialize_each_group_without_blocking_other_groups(runtime, mon
             runtime.sending._mark_qq_reply_finished(21)
             await settle()
             assert not runtime.state._adapter.qq_waiting_replies
-            assert not runtime.state._adapter.qq_active_conversations
+            assert not runtime.state._adapter.qq_queue.active_keys()
         finally:
             await stop(tasks)
 

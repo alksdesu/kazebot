@@ -22,7 +22,7 @@ adapters/onebot/
 │   ├── emotes.py                # 表情包库与收藏表情
 │   ├── history.py               # 群历史窗口、水位、清空门槛
 │   ├── inbound.py               # 入站判定、InboundFacts 翻译、触发与 inbound 文本
-│   ├── queueing.py              # 排队、抢占、连发合并
+│   ├── queueing.py              # 排队 worker、合并规则、抢占注入
 │   ├── sending.py               # 文本发送、分条、@ 校验、发送防重
 │   ├── outbound_attachments.py  # 附件发送与已发附件记账
 │   ├── proactive.py             # 主动发送与合并转发
@@ -42,7 +42,7 @@ adapters/onebot/
 ├── attachment_policy.py         # 附件挑选策略
 ├── emoji_handler.py             # QQ 表情与输出文本清理
 ├── faces.py                     # 内置表情 id → 名字
-└── *_commands.py、burst_store.py、conversation_coordinator.py  # 社区功能的命令与连发存储
+└── *_commands.py                # 社区功能的命令
 ```
 
 包本身没有导入副作用，根目录下的兄弟模块也不导入 NoneBot：supervisor、迁移脚本可以直接 `import adapters.onebot.<兄弟模块>`。
@@ -50,7 +50,8 @@ NoneBot 只出现在 `napcat/` 里，由插件入口加载。
 
 不分平台的逻辑在 `adapters/_shared/`：触发判定、管理能力档位、复读判定、会话键摘要（盐、稳定键、当前账号记录）、记忆提示，
 以及热载配置引擎（`live_config.py`）、环境变量读取（`env.py`）、手写 yaml 解析（`yaml_loader.py`）、
-出站发送防重（`send_guard.py`）、匿名别名表（`aliases.py`）和群历史窗口与清空门槛（`history_window.py`）。
+出站发送防重（`send_guard.py`）、匿名别名表（`aliases.py`）、群历史窗口与清空门槛（`history_window.py`），
+会话排队（`conversation_queue.py`）、连发合并与暂存（`conversation_coordinator.py`、`burst_store.py`）和抢占候选判定（`preemption.py`）。
 `live_config.py` 这边只声明 QQ 的键和配置文件位置，缓存与快照在它持有的 `LiveConfig` 实例上。
 那边不认识 QQ，平台专属的部分（群角色映射、CQ 码边界、消息段解析）留在这里，调用时传进去。
 

@@ -1,15 +1,37 @@
+"""会话级协调：功能策略缓存、消息元数据、连发合并、回复频率。
+
+连发窗口里同一身份的追加消息合进还没提交的那件；换了人、窗口到期或等满上限就提交。
+"""
 from __future__ import annotations
 
 import asyncio
 import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Protocol, TypeVar
+
+
+class BurstItem(Protocol):
+    """能进连发窗口的待提交消息。"""
+
+    stable_conversation_key: str
+    entry_node_id: str
+    user_text: str
+    platform_updates: dict[str, Any]
+
+    @property
+    def sender_id(self) -> str: ...
+
+    @property
+    def message_ref(self) -> str: ...
+
+
+Burst = TypeVar("Burst", bound=BurstItem)
 
 
 @dataclass
 class PendingBurst:
-    item: Any
+    item: BurstItem
     future: asyncio.Future
     started: float
     last: float
@@ -112,17 +134,17 @@ class ConversationCoordinator:
         while len(self.messages) > 1024:
             self.messages.popitem(last=False)
         burst = self.bursts.get(actor["scope"])
-        if burst and str(getattr(burst.item.event, "user_id", "")) != str(actor.get("user_id", "")):
+        if burst and burst.item.sender_id != str(actor.get("user_id", "")):
             burst.deadline = time.monotonic()
             burst.wakeup.set()
         return result
 
     def can_continue(self, actor, reply_ref="") -> bool:
         burst = self.bursts.get(actor["scope"])
-        if not burst or str(getattr(burst.item.event, "user_id", "")) != str(actor.get("user_id", "")):
+        if not burst or burst.item.sender_id != str(actor.get("user_id", "")):
             return False
         refs = burst.item.platform_updates.get("_route_hints", {}).get("source_message_refs", [])
-        return not reply_ref or reply_ref in {str(ref) for ref in refs} | {str(getattr(burst.item.event, "message_id", ""))}
+        return not reply_ref or reply_ref in {str(ref) for ref in refs} | {burst.item.message_ref}
 
     def allow_response(self, scope, settings, *, direct=False):
         if direct or not settings.get("response_policy_enabled"):
@@ -136,7 +158,7 @@ class ConversationCoordinator:
         times.append(now)
         return True
 
-    async def submit(self, item, settings, identity, submit: Callable[[Any], Awaitable[bool]], merge: Callable[[Any, Any], None]):
+    async def submit(self, item: Burst, settings, identity, submit: Callable[[Burst], Awaitable[bool]], merge: Callable[[Burst, Burst], None]):
         window = float(settings.get("merge_window_sec", 0))
         if window <= 0 or not identity or item.entry_node_id or item.user_text.lstrip().startswith(("/", "／")):
             return await submit(item)

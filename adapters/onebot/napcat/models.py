@@ -78,9 +78,16 @@ class QueuedInbound:
     history_watermark: int = -1
     # 发言人是不是主动找 bot（@ / 前缀 / 私聊）。只有主动的才给他建记忆档案。
     direct_interaction: bool = True
-    merge_identity: tuple[Any, ...] | None = None
     memory_user_ids: tuple[str, ...] = ()
     facts: InboundFacts | None = None
+
+    @property
+    def sender_id(self) -> str:
+        return str(getattr(self.event, "user_id", ""))
+
+    @property
+    def message_ref(self) -> str:
+        return str(getattr(self.event, "message_id", ""))
 
 
 @dataclass

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import gc
-import importlib.util
 import sys
 import time
 from pathlib import Path
@@ -11,15 +10,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-MODULE_NAME = "_conversation_policy_cache_test"
-SPEC = importlib.util.spec_from_file_location(
-    MODULE_NAME,
-    Path(__file__).resolve().parents[1] / "adapters/onebot/conversation_coordinator.py",
-)
-coordinator_module = importlib.util.module_from_spec(SPEC)
-sys.modules[MODULE_NAME] = coordinator_module
-SPEC.loader.exec_module(coordinator_module)
+from adapters._shared import conversation_coordinator as coordinator_module  # noqa: E402
+
 ConversationCoordinator = coordinator_module.ConversationCoordinator
 
 

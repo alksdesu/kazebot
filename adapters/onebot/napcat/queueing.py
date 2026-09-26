@@ -10,6 +10,7 @@ from nonebot import get_bot
 from nonebot.adapters.onebot.v11 import Bot, Event
 from ..config import ENTRY_NODE_ID
 from adapters._shared import capability
+from adapters._shared.preemption import preempt_candidates
 from ..live_config import live, pinned as pinned_live_config
 from ..attachment_policy import source_attachments_from_merged
 from ..segments import at_segment_user_ids
@@ -47,34 +48,25 @@ async def _try_preempt_running_task(
         common.logger.exception("preempt_v2: get running tasks failed")
         return False
 
-    for rt in running_tasks:
-        if not rt.task_id or not rt.is_user_entry:
-            continue
+    def trigger_of(task: Any) -> TriggerInfo | None:
+        source_seq = task.source_inbound_seq or 0
+        trigger = state._adapter.session_state.get_trigger(source_seq) if source_seq else None
+        if not trigger:
+            found = state._adapter.session_state.find_trigger_by_session(existing_sid)
+            trigger = found[1] if found else None
+        return trigger
 
+    def same_sender(trigger: TriggerInfo) -> bool:
+        return getattr(trigger.platform_data.get("event"), "user_id", None) == getattr(event, "user_id", None)
+
+    for rt, rt_trigger in preempt_candidates(
+        running_tasks,
+        trigger_of=trigger_of,
+        is_dm=is_dm,
+        same_sender=same_sender,
+        route_hints=platform_updates.get("_route_hints") or {},
+    ):
         rt_src_seq = rt.source_inbound_seq or 0
-        rt_trigger = state._adapter.session_state.get_trigger(rt_src_seq) if rt_src_seq else None
-        if not rt_trigger:
-            result = state._adapter.session_state.find_trigger_by_session(existing_sid)
-            rt_trigger = result[1] if result else None
-
-        if not is_dm:
-            # 2026-05-03 修改原因：群聊里多个用户共享同一个 conversation_key。
-            # 这里必须用旧 trigger 保存的 event.user_id 校验来源；无法确认同一用户
-            # 时不执行 preempt，目的是避免一个群成员打断另一个群成员的任务。
-            if not rt_trigger:
-                continue
-            rt_event = rt_trigger.platform_data.get("event")
-            if getattr(rt_event, "user_id", None) != getattr(event, "user_id", None):
-                continue
-        previous_topic = (rt_trigger.platform_data.get("_route_hints") or {}).get("topic_id", "") if rt_trigger else ""
-        current_topic = (platform_updates.get("_route_hints") or {}).get("topic_id", "")
-        if current_topic != previous_topic:
-            continue
-        previous_action = (rt_trigger.platform_data.get("_route_hints") or {}).get("response_action", "reply") if rt_trigger else "reply"
-        current_action = (platform_updates.get("_route_hints") or {}).get("response_action", "reply")
-        if current_action != previous_action:
-            continue
-
         try:
             preempt_args: Dict[str, Any] = {"message": inbound_text, "attachments": attachments}
             if get_memory_hints is not None:
@@ -350,17 +342,12 @@ async def _queue_or_submit_ready(item: models.QueuedInbound) -> bool:
             memory_user_ids=item.memory_user_ids,
         )
 
-    async with state._adapter.qq_queue_condition:
-        item.merge_identity = _queue_merge_identity(item)
-        message = item.event.get_message() if hasattr(item.event, "get_message") else []
-        item.memory_user_ids = tuple(dict.fromkeys((*item.memory_user_ids, *at_segment_user_ids(message))))
-        existing = state._adapter.qq_queue_by_key.get(item.stable_conversation_key)
-        if existing is not None and item.merge_identity is not None and existing.merge_identity == item.merge_identity:
-            _merge_queued_inbound(existing, item)
-        else:
-            state._adapter.qq_queue.append(item)
-            state._adapter.qq_queue_by_key[item.stable_conversation_key] = item
-        state._adapter.qq_queue_condition.notify()
+    message = item.event.get_message() if hasattr(item.event, "get_message") else []
+    item.memory_user_ids = tuple(dict.fromkeys((*item.memory_user_ids, *at_segment_user_ids(message))))
+    await state._adapter.qq_queue.put(
+        item.stable_conversation_key, item,
+        identity_of=_queue_merge_identity, merge=_merge_queued_inbound,
+    )
     return True
 
 
@@ -369,7 +356,7 @@ def _queue_worker_should_exit(worker_index: int) -> bool:
 
     缩容时多出来的那几个立刻退，留下的接着干；整个队列被关掉时最后一批要先把已排队的
     消息清完再退 —— 关开关不该让排在队里的用户消息无声消失。
-    调用方必须持有 _qq_queue_condition。
+    只作为 qq_queue.take 的退出判定调用：持着队列锁读排队件数才不会过期。
     """
     target = live.queue_workers if live.enable_queue else 0
     if worker_index < target:
@@ -384,24 +371,10 @@ async def _qq_queue_worker_forever(worker_index: int) -> None:
     看不到运营者刚改的 workers 数量。取到件之后才钉住，处理这一条期间配置不再变。
     """
     while True:
-        async with state._adapter.qq_queue_condition:
-            while True:
-                if _queue_worker_should_exit(worker_index):
-                    return
-                index = next(
-                    (index for index, queued in enumerate(state._adapter.qq_queue)
-                     if queued.stable_conversation_key not in state._adapter.qq_active_conversations),
-                    None,
-                )
-                if index is not None:
-                    break
-                await state._adapter.qq_queue_condition.wait()
-            item = state._adapter.qq_queue[index]
-            del state._adapter.qq_queue[index]
-            state._adapter.qq_active_conversations.add(item.stable_conversation_key)
-            # 只删指向本件的合并槽：同会话已允许存在多件时，别把指向后来那件的槽误删。
-            if state._adapter.qq_queue_by_key.get(item.stable_conversation_key) is item:
-                state._adapter.qq_queue_by_key.pop(item.stable_conversation_key, None)
+        taken = await state._adapter.qq_queue.take(lambda: _queue_worker_should_exit(worker_index))
+        if taken is None:
+            return
+        _, item = taken
 
         with pinned_live_config():
             reply_waiter: models.QueueReplyWaiter | None = None
@@ -435,11 +408,9 @@ async def _qq_queue_worker_forever(worker_index: int) -> None:
             except Exception:
                 common.logger.exception("failed to process QQ queue item conversation=%s", item.real_conversation_key)
             finally:
-                async with state._adapter.qq_queue_condition:
-                    if state._adapter.qq_waiting_replies.get(item.stable_conversation_key) is reply_waiter:
-                        state._adapter.qq_waiting_replies.pop(item.stable_conversation_key, None)
-                    state._adapter.qq_active_conversations.discard(item.stable_conversation_key)
-                    state._adapter.qq_queue_condition.notify_all()
+                if state._adapter.qq_waiting_replies.get(item.stable_conversation_key) is reply_waiter:
+                    state._adapter.qq_waiting_replies.pop(item.stable_conversation_key, None)
+                await state._adapter.qq_queue.release(item.stable_conversation_key)
             interval = live.queue_interval
         if interval > 0:
             await asyncio.sleep(interval)

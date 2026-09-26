@@ -72,8 +72,7 @@ async def _reconcile_queue_workers() -> bool:
             if index not in state._adapter.qq_queue_tasks:
                 state._adapter.qq_queue_tasks[index] = asyncio.create_task(queueing._qq_queue_worker_forever(index))
     else:
-        async with state._adapter.qq_queue_condition:
-            state._adapter.qq_queue_condition.notify_all()
+        await state._adapter.qq_queue.wake_all()
     common.logger.info(
         "QQ queue reconciled: workers %d -> %d (enabled=%s pending=%d)",
         running, target, live.enable_queue, len(state._adapter.qq_queue),

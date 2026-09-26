@@ -138,7 +138,7 @@ def test_queue_does_not_merge_across_entry_nodes(runtime: Any) -> None:
 
     assert len(runtime.state._adapter.qq_queue) == 2
     assert first.entry_node_id == ""
-    assert runtime.state._adapter.qq_queue_by_key["conv_draw"] is second
+    assert runtime.state._adapter.qq_queue.open_item("conv_draw") is second
 
 
 def test_draw_command_does_not_absorb_recent_history_images(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable, DefaultDict, Deque, Dict, List,
 
 from adapters._shared.active_account import ActiveAccountStore
 from adapters._shared.aliases import AliasBook
+from adapters._shared.conversation_queue import ConversationQueue
 from adapters._shared.history_window import ClearBarriers, HistoryWindows
 from adapters._shared.trigger_policy import CooldownState, TriggerDecision
 from platforms.builtin import QQ_NAPCAT
@@ -159,11 +160,8 @@ class OneBotAdapter:
         self.echo_last: Dict[int, tuple[str, float]] = {}
 
         # ---- 排队与发送 ----
-        self.qq_queue: Deque["QueuedInbound"] = deque()
-        self.qq_queue_by_key: Dict[str, "QueuedInbound"] = {}
-        self.qq_queue_condition = asyncio.Condition()
+        self.qq_queue: ConversationQueue["QueuedInbound"] = ConversationQueue()
         self.qq_waiting_replies: Dict[str, "QueueReplyWaiter"] = {}
-        self.qq_active_conversations: set[str] = set()
         self.qq_completed_replies: "OrderedDict[int, None]" = OrderedDict()
         # 按 worker 下标存而不是列表：下标决定缩容时谁该退，某个 worker 意外退出后
         # 补位也要补回它原来那个空位，否则会出现两个同下标的 worker。

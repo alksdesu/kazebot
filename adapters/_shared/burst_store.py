@@ -1,3 +1,4 @@
+"""连发窗口里还没提交的消息落盘：进程重启后按账号取回来重放，提交后删掉。"""
 from __future__ import annotations
 
 import json

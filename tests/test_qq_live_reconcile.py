@@ -463,7 +463,10 @@ class TestPublishedState:
         runtime.lifecycle._publish_live_state(force=True)
         writes = self._count_writes(runtime, monkeypatch)
 
-        runtime.state._adapter.qq_queue.append(_queued(runtime, "conv-a"))
+        asyncio.run(runtime.state._adapter.qq_queue.put(
+            "conv-a", _queued(runtime, "conv-a"),
+            identity_of=lambda queued: None, merge=runtime.queueing._merge_queued_inbound,
+        ))
         runtime.history._append_group_history(7, "again")
         runtime.lifecycle._publish_live_state()
 
