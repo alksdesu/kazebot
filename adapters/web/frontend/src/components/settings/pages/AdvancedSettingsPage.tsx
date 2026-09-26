@@ -6,8 +6,8 @@ import { getPolicyRaw, getRuntimeRaw, updatePolicyRaw, updateRuntimeRaw } from '
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { parseRuntimeConfig, serializeRuntimeConfig, type EngineToolMode, type RuntimeConfigFormState } from '../settingsStructuredConfig';
-import { Button, YamlEditor } from '../../common';
-import { Block, PageShell, StatusText } from './settingsControls';
+import { YamlEditor } from '../../common';
+import { Block, Button, PageShell, StatusText } from './settingsControls';
 import { hasLikelyYamlSyntaxIssue } from '../settingsStructuredConfig';
 
 type FileKey = 'runtime' | 'policy';
@@ -159,7 +159,7 @@ export const AdvancedSettingsPage = () => {
                 <fieldset disabled={state.loading} className="mt-3 min-w-0 space-y-3">
                   {file.key === 'runtime' ? (
                     <>
-                      <div className="flex flex-wrap gap-2"><Button disabled={state.loading} onClick={() => loadOne(file.key)}>{state.loading ? '正在加载…' : '加载'}</Button><Button disabled={state.loading || !state.loaded || !state.value} onClick={() => saveOne(file.key)} variant="primary">保存运行时配置</Button></div>
+                      <div className="flex flex-wrap gap-2"><Button tone="quiet" disabled={state.loading} onClick={() => loadOne(file.key)}>{state.loading ? '正在加载…' : '加载'}</Button><Button disabled={state.loading || !state.loaded || !state.value} onClick={() => saveOne(file.key)}>保存运行时配置</Button></div>
                       <fieldset disabled={!state.loaded} className="min-w-0 space-y-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-sm leading-5">
                         <label className="block">
                           <span className={STRUCTURED_LABEL_CLASS}>入口节点 ID</span>
@@ -220,7 +220,7 @@ export const AdvancedSettingsPage = () => {
                   ) : (
                     <>
                       <p className="text-xs leading-5 text-[var(--duties-danger)]">警告：修改安全策略可能影响系统安全性。</p>
-                      <div className="flex flex-wrap gap-2"><Button disabled={state.loading} onClick={() => loadOne(file.key)}>{state.loading ? '正在加载…' : '加载'}</Button><Button disabled={state.loading || !state.loaded || !state.value} onClick={() => saveOne(file.key)} variant="primary">保存策略 YAML</Button></div>
+                      <div className="flex flex-wrap gap-2"><Button tone="quiet" disabled={state.loading} onClick={() => loadOne(file.key)}>{state.loading ? '正在加载…' : '加载'}</Button><Button disabled={state.loading || !state.loaded || !state.value} onClick={() => saveOne(file.key)}>保存策略 YAML</Button></div>
                       <details className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
                         <summary className="cursor-pointer font-mono text-mini font-semibold text-[var(--duties-tertiary)]">高级 YAML 编辑</summary>
                         <div className="mt-3">

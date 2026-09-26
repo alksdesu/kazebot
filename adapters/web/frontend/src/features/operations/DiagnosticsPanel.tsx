@@ -1,6 +1,5 @@
 import { useState } from 'react';
-import { Button } from '../../components/common';
-import { Block, StatusText } from '../../components/settings/pages/settingsControls';
+import { Block, Button, StatusText } from '../../components/settings/pages/settingsControls';
 import { downloadFeature, featureRequest } from '../client';
 
 interface Check { name: string; status: string; detail: string; action: string; latency_ms?: number }
@@ -31,8 +30,8 @@ export function DiagnosticsPanel() {
       <label><input type="checkbox" disabled={busy} checked={includeLogs} onChange={event => setIncludeLogs(event.target.checked)} /> 附带脱敏日志</label>
     </div>
     <div className="my-3 flex flex-wrap gap-2">
-      <Button variant="primary" disabled={busy} onClick={() => void run()}>{busy ? '正在检查…' : '开始诊断'}</Button>
-      {report && <Button disabled={busy} onClick={() => void downloadFeature(`/v1/operations/diagnostics/${report.id}/export`, `diagnostics-${report.id}.json`).catch(failure => setError(String(failure)))}>导出报告</Button>}
+      <Button disabled={busy} onClick={() => void run()}>{busy ? '正在检查…' : '开始诊断'}</Button>
+      {report && <Button tone="quiet" disabled={busy} onClick={() => void downloadFeature(`/v1/operations/diagnostics/${report.id}/export`, `diagnostics-${report.id}.json`).catch(failure => setError(String(failure)))}>导出报告</Button>}
     </div>
     <StatusText message={error} />
     {stale && <p role="status">下方保留的是上一份诊断报告；本次诊断{busy ? '仍在进行' : '未完成'}。</p>}

@@ -3,8 +3,10 @@
 import { useEffect, type ReactNode } from 'react';
 
 import { Button, Empty, ErrorText, PageShell, StatusBar, type PipTone } from '../components/settings/pages/settingsControls';
+import { QQ_NAPCAT } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
 import { useConsoleStore } from './consoleStore';
+import { PlatformProvider } from './platformContext';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
 export {
@@ -42,9 +44,6 @@ export {
   Tag,
   Textarea,
 } from '../components/settings/pages/settingsControls';
-
-/** 平台注册表里 NapCat QQ 的 display_name。页头、侧栏分组和读屏标签都用它。 */
-export const QQ_PLATFORM_NAME = 'QQ · NapCat';
 
 interface BarState {
   tone: PipTone;
@@ -137,7 +136,7 @@ export const QqPage = ({ children, alwaysContent, standalone = false, note, titl
       bar={isAuthenticated && !standalone ? <QqStatusBar confirmDiscard={confirmDiscard} /> : undefined}
       description={note}
       error={error}
-      eyebrow={QQ_PLATFORM_NAME}
+      eyebrow={QQ_NAPCAT.displayName}
       notice={notice}
       title={title}
     >
@@ -146,8 +145,10 @@ export const QqPage = ({ children, alwaysContent, standalone = false, note, titl
           qq.yaml 解析失败：{parseError}。bot 仍在用上一份有效配置。请先修复原文件语法；本页不会覆盖损坏文件。
         </ErrorText>
       )}
-      {alwaysContent}
-      {body}
+      <PlatformProvider platform={QQ_NAPCAT}>
+        {alwaysContent}
+        {body}
+      </PlatformProvider>
     </PageShell>
   );
 };

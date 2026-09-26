@@ -8,9 +8,8 @@ import { useEffect, useRef, useState } from 'react';
 import { getMcpClients, getMcpClientsRaw, updateMcpClientsRaw, type McpClient } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
-import { Button } from '../../common';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
-import { Block, Field, Input, PageShell, StatusText } from './settingsControls';
+import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
 import { parseMcpClients, serializeMcpClients, type McpClientFormState } from '../settingsStructuredConfig';
 
 function emptyMcpClient(id: string): McpClientFormState {
@@ -114,8 +113,8 @@ export const McpSettingsPage = () => {
     <PageShell authed={isAuthenticated} description="查看 MCP Client 列表，选择后在右栏编辑连接字段和保存。" title="MCP">
       <Block frame="boxed" title="Client 列表" hint="展示 ID、传输方式、启用状态和连接预览。编辑表单位于右栏。">
         <div className="mb-3 flex flex-wrap gap-2">
-          <Button disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新 MCP'}</Button>
-          <Button disabled={loading || busy || !selectedMcpClient} onClick={remove} variant="danger">删除选中 Client</Button>
+          <Button tone="quiet" disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新 MCP'}</Button>
+          <Button tone="danger" disabled={loading || busy || !selectedMcpClient} onClick={remove}>删除选中 Client</Button>
         </div>
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">
           {clients.length === 0 ? <p className="text-sm text-[var(--duties-secondary)]">暂无 MCP Client。</p> : clients.map((client) => (
@@ -128,7 +127,7 @@ export const McpSettingsPage = () => {
         <div className="mt-4 border-t border-[var(--duties-border)] pt-3">
           <Field htmlFor="new-mcp-id" label="创建 MCP Client" layout="stacked">
             <Input width="wide" disabled={busy} id="new-mcp-id" onChange={(event) => setNewId(event.target.value)} placeholder="Client ID" value={newId} />
-            <Button className="mt-2" disabled={busy || loading || !newId.trim()} onClick={create} variant="primary">创建 Client</Button>
+            <Button className="mt-2" disabled={busy || loading || !newId.trim()} onClick={create}>创建 Client</Button>
           </Field>
         </div>
         <StatusText message={message} />

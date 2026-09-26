@@ -1,5 +1,5 @@
 import { Component, type ReactNode } from 'react';
-import { Button } from './Button';
+import { Button } from '../settings/pages/settingsControls';
 
 interface PageBoundaryProps {
   children: ReactNode;
@@ -28,7 +28,7 @@ export class PageBoundary extends Component<PageBoundaryProps, PageBoundaryState
         <h2 className="text-base font-semibold">{this.props.label}暂时无法显示</h2>
         <p className="leading-relaxed text-[var(--duties-secondary)]">你仍可使用导航切换页面。请先核对已提交操作的状态；尚未保存的内容可能需要重新输入。</p>
       </div>
-      <Button onClick={() => this.setState({ failed: false })}>重新加载此区域</Button>
+      <Button tone="quiet" onClick={() => this.setState({ failed: false })}>重新加载此区域</Button>
     </section>;
   }
 }

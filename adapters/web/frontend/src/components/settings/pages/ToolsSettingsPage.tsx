@@ -8,11 +8,10 @@ import { createTool, deleteTool, getTools, reloadTools, type AdminTool } from '.
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
-import { Button } from '../../common';
 import { AutoApproveSection } from './AutoApproveSection';
 import { NodeGrantsSection } from './NodeGrantsSection';
 import { PolicyRulesSection } from './PolicyRulesSection';
-import { Block, Field, Input, PageShell, StatusText } from './settingsControls';
+import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
 
 function defaultToolScript(name: string): string {
   // [2026-06-02] Provide a safe external-tool starter file. Why: Supervisor expects
@@ -141,9 +140,9 @@ const ToolInventorySection = () => {
     >
       <>
           <div className="mb-3 flex flex-wrap gap-2">
-            <Button disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新工具'}</Button>
-            <Button disabled={busy} onClick={reload} variant="primary">重载工具</Button>
-            <Button disabled={busy || !selectedTool?.editable} onClick={remove} variant="danger">删除选中工具</Button>
+            <Button tone="quiet" disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新工具'}</Button>
+            <Button disabled={busy} onClick={reload}>重载工具</Button>
+            <Button tone="danger" disabled={busy || !selectedTool?.editable} onClick={remove}>删除选中工具</Button>
           </div>
           <div className="mb-3 flex flex-wrap items-center gap-2">
             <Input width="wide"
@@ -200,7 +199,7 @@ const ToolInventorySection = () => {
           <div className="mt-4 border-t border-[var(--duties-border)] pt-3">
             <Field htmlFor="new-tool-name" label="创建工具" layout="stacked">
               <Input width="wide" disabled={busy} id="new-tool-name" onChange={(event) => setNewName(event.target.value)} placeholder="工具名称" value={newName} />
-              <Button className="mt-2" disabled={busy} onClick={create} variant="primary">创建工具</Button>
+              <Button className="mt-2" disabled={busy} onClick={create}>创建工具</Button>
             </Field>
           </div>
           <StatusText message={message} />

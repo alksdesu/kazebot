@@ -33,8 +33,8 @@ describe('独立实例入口', () => {
     client.connectGlobalWS(0, () => {});
     expect(socket).toHaveBeenCalledExactlyOnceWith(`ws://${window.location.host}${mount}/v1/ws`);
     client.disconnectGlobalWS();
-    writeAlias('123', '本实例备注');
-    expect(JSON.parse(localStorage.getItem(`qq_console_aliases${mount}`)!)).toEqual({ '123': '本实例备注' });
+    writeAlias('qq', '123', '本实例备注');
+    expect(JSON.parse(localStorage.getItem(`qq_console_aliases${mount}`)!)).toEqual({ 'qq:123': '本实例备注' });
     if (mount) expect(JSON.parse(localStorage.getItem('qq_console_aliases')!)).toEqual({ '123': '根实例备注' });
     expect(client.instanceConsoleHref('/i/1000003')).toBe('/i/1000003/web/?view=settings&tab=qq-persona');
   });

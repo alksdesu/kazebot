@@ -2,7 +2,8 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as api from '../api/supervisorClient';
-import { Button, Modal } from '../components/common';
+import { Modal } from '../components/common';
+import { Button } from '../components/settings/pages/settingsControls';
 import { AppLayout, Header, Sidebar } from '../components/layout';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useClientPrefsStore } from '../store/clientPrefsStore';

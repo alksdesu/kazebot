@@ -11,9 +11,8 @@ import { ActiveTasksModal } from '../../dashboard/ActiveTasksModal';
 import { checkHealth, getAdminState, reloadConfig, restartEngine, type AdminState, type HealthState } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
-import { Button } from '../../common';
 import { countActiveTasks, formatUptime } from '../../../utils/systemStatus';
-import { Block, PageShell, StatusText } from './settingsControls';
+import { Block, Button, PageShell, StatusText } from './settingsControls';
 
 const Stat = ({ label, value, detail, onClick }: { label: string; value: string | number; detail?: string; onClick?: () => void }) => {
   const content = (
@@ -120,7 +119,7 @@ export const SystemSettingsPage = () => {
             <p><span className="text-[var(--duties-tertiary)]">Engine worker：</span><span className="font-mono">{engineInfo}</span></p>
           </div>
           <div className="mt-3 flex flex-wrap gap-2">
-            <Button disabled={loading || busy} onClick={() => load()}>{loading ? '正在刷新…' : '刷新状态'}</Button>
+            <Button tone="quiet" disabled={loading || busy} onClick={() => load()}>{loading ? '正在刷新…' : '刷新状态'}</Button>
           </div>
         </Block>
 
@@ -128,8 +127,8 @@ export const SystemSettingsPage = () => {
 
         <Block frame="boxed" title="运行控制" hint="配置重载会重新读取配置；引擎重启需要二次确认。">
           <div className="flex flex-wrap gap-2">
-            <Button disabled={busy} onClick={handleReload} variant="primary">重载配置</Button>
-            <Button disabled={busy} onClick={handleRestart} variant="danger">重启引擎</Button>
+            <Button disabled={busy} onClick={handleReload}>重载配置</Button>
+            <Button tone="danger" disabled={busy} onClick={handleRestart}>重启引擎</Button>
           </div>
           <StatusText message={message} />
         </Block>

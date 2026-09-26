@@ -1,3 +1,4 @@
+import { conversationKindForScope } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
 import { scopeIdentity, type ConversationDescriptor } from './conversationNames';
 import { useConversationDirectory } from './useConversationDirectory';
@@ -13,7 +14,8 @@ export function useScopePicker(mode: ScopePickerMode, value: string) {
     if (!row.conversation_key) return false;
     if (mode === 'all') return true;
     if ((mode === 'groups' && row.current_account === false) || row.owner?.kind === 'agent') return false;
-    return /^qq_group:.+/.test(row.conversation_key) || (mode === 'policy' && /^qq_private:.+/.test(row.conversation_key));
+    const kind = conversationKindForScope(row.conversation_key);
+    return kind === 'group' || (mode === 'policy' && kind === 'private');
   });
   const descriptions = new Map<string, ConversationDescriptor>(eligible.map(row => [row.conversation_key, { scope: row.conversation_key, owner: row.owner, current_account: row.current_account }]));
   if (mode === 'all') {

@@ -8,9 +8,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { decideApproval, getAdminState, type AdminApproval } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
-import { Button, Icon } from '../../common';
+import { Icon } from '../../common';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
-import { Block, PageShell, StatusText } from './settingsControls';
+import { Block, Button, PageShell, StatusText } from './settingsControls';
 
 function detailString(approval: AdminApproval, key: string): string {
   // [2026-06-02] Read common approval detail fields from arbitrary backend payloads.
@@ -90,7 +90,7 @@ export const ApprovalsSettingsPage = () => {
     <PageShell authed={isAuthenticated} description="查看所有会话的待审批项，并对工具或操作请求执行允许或拒绝。" title="审批">
       <Block frame="boxed" title="全局待审批列表" hint="列表来自 /v1/admin/state 的 pending_approvals 字段。">
         <div className="mb-3 flex flex-wrap gap-2">
-          <Button disabled={loading} onClick={() => load()}>{loading ? '正在刷新…' : '刷新列表'}</Button>
+          <Button tone="quiet" disabled={loading} onClick={() => load()}>{loading ? '正在刷新…' : '刷新列表'}</Button>
         </div>
         {approvals.length === 0 ? (
           <div className="flex items-center gap-2 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-4 text-sm text-[var(--duties-secondary)]">
@@ -131,8 +131,8 @@ export const ApprovalsSettingsPage = () => {
                   </div>
                 </button>
                 <div className="mt-3 flex flex-wrap gap-2">
-                  <Button disabled={deciding.includes(approval.approval_id)} onClick={() => decide(approval, 'allow')} variant="primary">允许</Button>
-                  <Button disabled={deciding.includes(approval.approval_id)} onClick={() => decide(approval, 'deny')} variant="danger">拒绝</Button>
+                  <Button disabled={deciding.includes(approval.approval_id)} onClick={() => decide(approval, 'allow')}>允许</Button>
+                  <Button tone="danger" disabled={deciding.includes(approval.approval_id)} onClick={() => decide(approval, 'deny')}>拒绝</Button>
                 </div>
               </article>
             ))}

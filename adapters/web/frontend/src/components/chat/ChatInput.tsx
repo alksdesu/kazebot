@@ -4,7 +4,8 @@ import { type FormEvent, type KeyboardEvent, useEffect, useRef, useState } from 
 
 import type { Attachment } from '../../types';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
-import { Button, Icon } from '../common';
+import { Icon } from '../common';
+import { Button } from '../settings/pages/settingsControls';
 
 interface ChatInputProps {
   disabled?: boolean;
@@ -172,7 +173,7 @@ export const ChatInput = ({ disabled = false, onSend, conversationId = 'new' }: 
           placeholder="输入消息…"
           value={draft}
         />
-        <Button className="self-end min-w-20" disabled={!canSend} type="submit" variant="primary">
+        <Button className="self-end min-w-20" disabled={!canSend} type="submit">
           {busy ? '发送中…' : '发送'}
         </Button>
         <input

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 
 import { checkHealth, getActiveNode, resetConversation } from './api/supervisorClient';
 import { LoginPage } from './components/auth/LoginPage';
-import { Button, Icon, Modal } from './components/common';
+import { Icon, Modal } from './components/common';
 import { PageBoundary } from './components/common/PageBoundary';
 import { AppLayout } from './components/layout';
 import { useChat } from './hooks/useChat';
@@ -12,6 +12,7 @@ import { useSettingsStore } from './store/settingsStore';
 import { useViewStore, type ViewMode } from './store/viewStore';
 import type { Attachment } from './types';
 import { viewRegistry, type AppViewContext } from './views/viewRegistry';
+import { Button } from './components/settings/pages/settingsControls';
 
 const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
   const {
@@ -131,7 +132,7 @@ const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
       <div className="space-y-4 p-4">
         <p>重置“{resetTarget?.title}”的上下文？原上下文与正在进行的任务将被清理，其他对话不受影响。</p>
         {notice?.error && <p className="text-sm text-[var(--duties-danger)]" role="alert">{notice.text}</p>}
-        <div className="flex justify-end gap-2"><Button disabled={resetting} onClick={() => setResetTarget(null)}>保留对话</Button><Button variant="danger" loading={resetting} onClick={() => void confirmReset()}>确认重置</Button></div>
+        <div className="flex justify-end gap-2"><Button tone="quiet" disabled={resetting} onClick={() => setResetTarget(null)}>保留对话</Button><Button tone="danger" loading={resetting} onClick={() => void confirmReset()}>确认重置</Button></div>
       </div>
     </Modal>
   </>;

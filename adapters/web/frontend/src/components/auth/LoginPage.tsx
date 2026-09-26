@@ -2,8 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { verifyAdminAuth } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
-import { Button } from '../common';
 import { loadEntryNodes, TOKEN_SOURCE_HINT } from './loadEntryNodes';
+import { Button } from '../settings/pages/settingsControls';
 
 type VerificationMode = 'saved' | 'link' | 'manual';
 const AUTH_TIMEOUT_MS = 10000;
@@ -110,9 +110,9 @@ export const LoginPage = ({ embedded = false }: { embedded?: boolean }) => {
           </div>
           {error && <p id="login-error" role="alert" className="text-sm text-[var(--duties-danger)]">{error}</p>}
           {verifying && <p role="status" className="text-sm text-[var(--duties-secondary)]">{verifying === 'manual' ? '正在验证令牌…' : '正在恢复已保存的登录…'}</p>}
-          <Button className="w-full" disabled={Boolean(verifying)} type="submit" variant="primary">{verifying ? '正在验证…' : '登录'}</Button>
-          {!verifying && error && adminToken && !tokenInput && <Button className="w-full" onClick={() => void verify(adminToken, 'saved')} type="button">重试已保存登录</Button>}
-          {verifying && <Button className="w-full" onClick={useAnotherToken} type="button">使用其他令牌</Button>}
+          <Button className="w-full" disabled={Boolean(verifying)} type="submit">{verifying ? '正在验证…' : '登录'}</Button>
+          {!verifying && error && adminToken && !tokenInput && <Button tone="quiet" className="w-full" onClick={() => void verify(adminToken, 'saved')} type="button">重试已保存登录</Button>}
+          {verifying && <Button tone="quiet" className="w-full" onClick={useAnotherToken} type="button">使用其他令牌</Button>}
         </form>
         <p id="login-help" className="mt-5 text-sm leading-relaxed text-[var(--duties-secondary)]">{TOKEN_SOURCE_HINT}</p>
       </section>

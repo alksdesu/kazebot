@@ -4,7 +4,8 @@ import { useEffect, useRef, useState } from 'react';
 import { decideApproval } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
 import type { ApprovalInfo } from '../../types';
-import { Button, Icon } from '../common';
+import { Icon } from '../common';
+import { Button } from '../settings/pages/settingsControls';
 
 interface ApprovalCardProps {
   approval: ApprovalInfo;
@@ -59,14 +60,14 @@ export const ApprovalCard = ({ approval }: ApprovalCardProps) => {
       {isPending ? (
         // 这张卡只在审批找不到对应工具卡时才出现，自动审批按工具名匹配，这里注定匹配不上。
         <div className="flex gap-2">
-          <Button disabled={loading} onClick={() => handleDecision('allow')} variant="primary">
+          <Button disabled={loading} onClick={() => handleDecision('allow')}>
             {/* [2026-06-01] Why: approval action buttons used emoji marks.
                 How: render check_circle and cancel as Material Symbols. Purpose:
                 pending approval controls no longer emit emoji. */}
             <Icon name="check_circle" size={14} />
             <span>允许</span>
           </Button>
-          <Button disabled={loading} onClick={() => handleDecision('deny')} variant="ghost">
+          <Button tone="quiet" disabled={loading} onClick={() => handleDecision('deny')}>
             <Icon name="cancel" size={14} />
             <span>拒绝</span>
           </Button>

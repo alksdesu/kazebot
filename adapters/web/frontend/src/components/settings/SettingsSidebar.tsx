@@ -18,7 +18,7 @@ export const SettingsSidebar = () => {
   return <div className="flex h-full min-h-0 flex-col">
     <div className="border-b border-[var(--duties-border)] p-4">
       <button className="mb-3 inline-flex min-h-10 items-center gap-2 text-sm text-[var(--duties-secondary)] hover:text-[var(--duties-text)]" onClick={closeSettings} type="button"><Icon name="arrow_back" size={18} />返回聊天</button>
-      <div className="flex items-center gap-3"><img src={`${import.meta.env.BASE_URL}logo-sm.jpg`} alt="Clonoth" className="h-9 w-9 rounded-lg" /><div><h1 className="text-base font-semibold">{viewMode === 'settings' ? '设置' : '工作区'}</h1><p className="mt-0.5 text-xs text-[var(--duties-tertiary)]">QQ Bot 控制台</p></div></div>
+      <div className="flex items-center gap-3"><img src={`${import.meta.env.BASE_URL}logo-sm.jpg`} alt="Clonoth" className="h-9 w-9 rounded-lg" /><div><h1 className="text-base font-semibold">{viewMode === 'settings' ? '设置' : '工作区'}</h1><p className="mt-0.5 text-xs text-[var(--duties-tertiary)]">Clonoth 控制台</p></div></div>
     </div>
     <WorkspaceNav />
     <div className="px-3 pb-2 pt-3"><label className="sr-only" htmlFor="settings-search">搜索设置</label><input id="settings-search" type="search" className="app-input w-full" placeholder="搜索设置" value={search} onChange={event => setSearch(event.target.value)} /></div>

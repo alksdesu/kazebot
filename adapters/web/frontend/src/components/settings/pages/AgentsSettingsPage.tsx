@@ -11,8 +11,7 @@ import { createNode, deleteNode, getNodes, type AdminNode } from '../../../api/s
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { describeEnvRef } from '../../../utils/envRef';
-import { Button } from '../../common';
-import { Block, Field, Input, PageShell, Select, StatusText } from './settingsControls';
+import { Block, Button, Field, Input, PageShell, Select, StatusText } from './settingsControls';
 
 function nodeTemplate(id: string, template: string): string {
   // [2026-06-02] Build a minimal node YAML from the selected template type. Why: the
@@ -97,8 +96,8 @@ export const AgentsSettingsPage = () => {
     <PageShell authed={isAuthenticated} description="查看、创建和删除节点配置文件。选择节点后，请在右侧面板编辑对应 YAML。" title="节点管理">
       <Block frame="boxed" title="节点列表" hint="中间区域只负责列表和操作，节点 YAML 编辑器显示在右栏。">
         <div className="mb-3 flex flex-wrap gap-2">
-          <Button disabled={loading || busy} onClick={loadNodes}>{loading ? '正在刷新…' : '刷新节点'}</Button>
-          <Button disabled={busy || !selectedNode} onClick={remove} variant="danger">删除选中节点</Button>
+          <Button tone="quiet" disabled={loading || busy} onClick={loadNodes}>{loading ? '正在刷新…' : '刷新节点'}</Button>
+          <Button tone="danger" disabled={busy || !selectedNode} onClick={remove}>删除选中节点</Button>
         </div>
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">
           {nodes.map((node) => (
@@ -129,7 +128,7 @@ export const AgentsSettingsPage = () => {
               <option value="ai">AI 节点模板</option>
               <option value="tool">工具节点模板</option>
             </Select>
-            <Button className="mt-2" disabled={busy} onClick={create} variant="primary">创建节点</Button>
+            <Button className="mt-2" disabled={busy} onClick={create}>创建节点</Button>
           </Field>
         </div>
         <StatusText message={message} />

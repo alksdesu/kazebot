@@ -9,7 +9,8 @@ import { WorkspaceNav } from '../../features/WorkspaceNav';
 import { useChatStore, type ChildNodeState, type ConversationMeta } from '../../store/chatStore';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
-import { Button, getChildNodeStatusLabel, Icon, StatusDot } from '../common';
+import { getChildNodeStatusLabel, Icon, StatusDot } from '../common';
+import { Button } from '../settings/pages/settingsControls';
 
 interface SidebarProps {
   conversations: ConversationMeta[];
@@ -100,7 +101,7 @@ export const Sidebar = ({
             <p className="text-xs text-[var(--duties-tertiary)]">调度器网页界面</p>
           </div>
         </div>
-        <Button className="mt-3 w-full" onClick={onCreateConversation} variant="primary">
+        <Button className="mt-3 w-full" onClick={onCreateConversation}>
           新对话
         </Button>
       </div>
@@ -112,7 +113,7 @@ export const Sidebar = ({
       <nav aria-label="对话" className="min-h-0 flex-1 overflow-y-auto">
         {startupError && <div className="mx-3 mb-3 space-y-2">
           <p className="break-words text-sm text-[var(--duties-danger)]" role="alert">会话列表未加载：{startupError}</p>
-          <Button className="w-full" onClick={loadStartup}>重试加载</Button>
+          <Button tone="quiet" className="w-full" onClick={loadStartup}>重试加载</Button>
         </div>}
         {visible.length === 0 && !startupError && (
           <p className="p-3 text-center text-xs text-[var(--duties-tertiary)]">{search ? '没有匹配的对话' : '暂无对话'}</p>

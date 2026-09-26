@@ -10,8 +10,7 @@ import { useEffect, useState } from 'react';
 import { createSkill, deleteSkill, getSkills, type AdminSkill } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
-import { Button } from '../../common';
-import { Block, Field, Input, PageShell, StatusText } from './settingsControls';
+import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
 
 function defaultSkillMarkdown(name: string): string {
   // [2026-06-02] Provide a complete starter SKILL.md with frontmatter. Why: the
@@ -93,8 +92,8 @@ export const SkillsSettingsPage = () => {
     <PageShell authed={isAuthenticated} description="管理 skills 目录下的 SKILL.md 文件。选择技能后，请在右栏编辑 frontmatter 和 Markdown 正文。" title="技能管理">
       <Block frame="boxed" title="技能列表" hint="列表展示技能名称、启用状态、策略和关键词预览。编辑器位于右栏。">
         <div className="mb-3 flex flex-wrap gap-2">
-          <Button disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新技能'}</Button>
-          <Button disabled={busy || !selectedSkill} onClick={remove} variant="danger">删除选中技能</Button>
+          <Button tone="quiet" disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新技能'}</Button>
+          <Button tone="danger" disabled={busy || !selectedSkill} onClick={remove}>删除选中技能</Button>
         </div>
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">
           {skills.map((skill) => (
@@ -108,7 +107,7 @@ export const SkillsSettingsPage = () => {
         <div className="mt-4 border-t border-[var(--duties-border)] pt-3">
           <Field htmlFor="new-skill-name" label="创建技能" layout="stacked">
             <Input width="wide" disabled={busy} id="new-skill-name" onChange={(event) => setNewName(event.target.value)} placeholder="技能目录名" value={newName} />
-            <Button className="mt-2" disabled={busy} onClick={create} variant="primary">创建技能</Button>
+            <Button className="mt-2" disabled={busy} onClick={create}>创建技能</Button>
           </Field>
         </div>
         <StatusText message={message} />

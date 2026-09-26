@@ -1,4 +1,5 @@
 import type { MemoryOwner } from '../api/supervisorClient';
+import { conversationKindForScope, looksLikeScopeKey } from '../platforms/registry';
 
 export interface ConversationDescriptor {
   scope: string;
@@ -21,8 +22,9 @@ function shortIdentity(value: string): string {
 
 function kindName(row: ConversationDescriptor): string {
   if (row.owner?.kind === 'agent') return '子代理会话';
-  if (row.scope.startsWith('qq_group:') || row.owner?.kind === 'group') return '群聊';
-  if (row.scope.startsWith('qq_private:') || row.owner?.kind === 'private') return '私聊';
+  const channelKind = conversationKindForScope(row.scope);
+  if (channelKind === 'group' || row.owner?.kind === 'group') return '群聊';
+  if (channelKind === 'private' || row.owner?.kind === 'private') return '私聊';
   return row.scope.startsWith('web:') ? '网页会话' : '会话';
 }
 
@@ -34,7 +36,7 @@ function baseName(row: ConversationDescriptor, webTitles: ReadonlyMap<string, st
   const alias = cleanName(row.owner?.alias);
   const realId = cleanName(row.owner?.real_id);
   if (row.owner?.name_available === true && label) return label;
-  const technical = (name: string) => name === row.scope || /^(?:qq_group:|qq_private:|agent:|conv[-_]|session[_-]|[a-f\d]{20,}$)/i.test(name);
+  const technical = (name: string) => name === row.scope || looksLikeScopeKey(name) || /^(?:agent:|conv[-_]|session[_-]|[a-f\d]{20,}$)/i.test(name);
   if (row.owner?.name_available === false && alias && !technical(alias)) return `${kind}（匿名别名：${alias}）`;
   if (row.owner?.name_available !== false && label && !technical(label)) {
     if (alias && label === alias) return `${kind}（匿名别名：${alias}）`;

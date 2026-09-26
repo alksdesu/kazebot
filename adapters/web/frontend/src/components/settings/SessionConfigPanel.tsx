@@ -25,7 +25,7 @@ import { useViewStore } from '../../store/viewStore';
 import type { NodeDef } from '../../types';
 import { describeEnvRef, envRefNames } from '../../utils/envRef';
 import { literalModelsOnly, mergeModelChoices, modelsFromProviders } from '../../utils/modelChoices';
-import { Button } from '../common';
+import { Button } from '../settings/pages/settingsControls';
 
 interface SessionConfigPanelProps {
   sessionId: string;
@@ -522,11 +522,11 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
           {/* Save/Clear only visible when user has modified something */}
           {(edit.provider.trim() !== '' || edit.model.trim() !== '' || edit.base_url.trim() !== '' || edit.api_key.trim() !== '' || hasSessionOverride) && (
             <div className="flex gap-2">
-              <Button className="h-8 flex-1 px-2 text-nano" disabled={modelSaving || !modelLoaded || (!edit.provider.trim() && !edit.model.trim() && !edit.base_url.trim() && !edit.api_key.trim())} onClick={handleSaveModel} variant="primary">
+              <Button className="h-8 flex-1 px-2 text-nano" disabled={modelSaving || !modelLoaded || (!edit.provider.trim() && !edit.model.trim() && !edit.base_url.trim() && !edit.api_key.trim())} onClick={handleSaveModel}>
                 {modelSaving ? '正在保存…' : '保存'}
               </Button>
               {hasSessionOverride && (
-                <Button className="h-8 flex-1 px-2 text-nano" disabled={modelSaving || !modelLoaded} onClick={handleClearModel} variant="danger">
+                <Button tone="danger" className="h-8 flex-1 px-2 text-nano" disabled={modelSaving || !modelLoaded} onClick={handleClearModel}>
                   清除
                 </Button>
               )}

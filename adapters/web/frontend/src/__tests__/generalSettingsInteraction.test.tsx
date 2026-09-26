@@ -31,10 +31,10 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 describe('通用设置', () => {
-  it('清楚区分调度器连接与 QQ 状态，并可重新检查连接', async () => {
+  it('清楚区分调度器连接与适配进程状态，并可重新检查连接', async () => {
     render(<GeneralSettingsPage />);
     expect(await screen.findByText('调度器已连接')).toBeVisible();
-    expect(screen.getByText(/QQ 适配器和模型工作进程/)).toBeVisible();
+    expect(screen.getByText(/平台适配进程的状态在该平台的「链路」页/)).toBeVisible();
     fireEvent.click(screen.getByRole('button', { name: '刷新连接' }));
     await act(async () => {});
     expect(mocks.health).toHaveBeenCalledTimes(2);

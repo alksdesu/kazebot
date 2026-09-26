@@ -1,9 +1,10 @@
 // 号码表：群白名单、私聊白名单、管理员名单共用。备注只存本地，见 aliases.ts。
 import { useState } from 'react';
 
-import { readAliases, writeAlias, type AliasMap } from './aliases';
+import { aliasKey, readAliases, writeAlias, type AliasMap } from './aliases';
 import { ErrorText, Input } from './components';
 import { addId, idIsValid, useConsoleStore, useIdList, useInputRule } from './consoleStore';
+import { usePlatform } from './platformContext';
 import { LIST_SPACING, type ListSpacing } from './WordList';
 
 interface IdListProps {
@@ -15,6 +16,7 @@ interface IdListProps {
 }
 
 export const IdList = ({ configKey, empty, label, placeholder, spacing = 'option' }: IdListProps) => {
+  const platform = usePlatform();
   const setDraft = useConsoleStore((state) => state.setDraft);
   const ids = useIdList(configKey);
   const rule = useInputRule(configKey);
@@ -46,10 +48,10 @@ export const IdList = ({ configKey, empty, label, placeholder, spacing = 'option
               <Input
                 autoFocus
                 onBlur={() => setEditing(null)}
-                onChange={(event) => setAliases(writeAlias(id, event.target.value))}
+                onChange={(event) => setAliases(writeAlias(platform.id, id, event.target.value))}
                 onKeyDown={(event) => event.key === 'Enter' && setEditing(null)}
                 placeholder="备注（只存在本机）"
-                value={aliases[String(id)] || ''}
+                value={aliases[aliasKey(platform.id, id)] || ''}
                 width="alias"
               />
             ) : (
@@ -58,7 +60,7 @@ export const IdList = ({ configKey, empty, label, placeholder, spacing = 'option
                 onClick={() => setEditing(id)}
                 type="button"
               >
-                {aliases[String(id)] || '加个备注'}
+                {aliases[aliasKey(platform.id, id)] || '加个备注'}
               </button>
             )}
             <button

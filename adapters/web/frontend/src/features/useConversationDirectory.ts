@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getConversations, type ConversationRow } from '../api/supervisorClient';
+import { isConversationScope, platformForScope } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
 import { useActorRequestScope } from './useActorRequestScope';
 import { featureRequest } from './client';
@@ -24,7 +25,7 @@ export function useConversationDirectory(includePolicies = false) {
       let rows = result.filter(row => row && typeof row.conversation_key === 'string');
       const policyOnlyScopes: string[] = [];
       if (includePolicies) {
-        if (!Array.isArray(policies?.items) || policies.items.some(row => !row || typeof row.scope !== 'string' || !/^qq_(group|private):.+/.test(row.scope) || typeof row.current_account !== 'boolean')) throw new Error('invalid policy scopes');
+        if (!Array.isArray(policies?.items) || policies.items.some(row => !row || typeof row.scope !== 'string' || !isConversationScope(row.scope) || typeof row.current_account !== 'boolean')) throw new Error('invalid policy scopes');
         const merged = new Map(rows.map(row => [row.conversation_key, row]));
         for (const policy of policies.items) {
           const existing = merged.get(policy.scope);
@@ -33,7 +34,7 @@ export function useConversationDirectory(includePolicies = false) {
             merged.set(policy.scope, { ...existing, owner, current_account: existing.current_account ?? policy.current_account });
           } else {
             policyOnlyScopes.push(policy.scope);
-            merged.set(policy.scope, { conversation_key: policy.scope, session_id: '', channel: 'qq', bytes: 0, updated_at: 0, owner: policy.owner, current_account: policy.current_account });
+            merged.set(policy.scope, { conversation_key: policy.scope, session_id: '', channel: platformForScope(policy.scope)?.id || '', bytes: 0, updated_at: 0, owner: policy.owner, current_account: policy.current_account });
           }
         }
         rows = [...merged.values()];

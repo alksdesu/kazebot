@@ -14,8 +14,7 @@ import {
 } from '../../../api/supervisorClient';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../../store/settingsStore';
-import { Button } from '../../common';
-import { Block, Field, Input, PageShell, Select, StatusText } from './settingsControls';
+import { Block, Button, Field, Input, PageShell, Select, StatusText } from './settingsControls';
 
 const presetTextAreaClass = 'w-full resize-y overflow-hidden border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-sm leading-5 text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]';
 
@@ -456,8 +455,8 @@ export const DrawtoolsSettingsPage = () => {
       <>
         <Block frame="boxed" title="运行期配置" hint="用户配置写入 settings.yaml / character_tags.yaml / prompt .md；仓库更新只维护 .example。">
           <div className="flex flex-wrap gap-2">
-            <Button disabled={loading} onClick={load}>{loading ? '正在刷新…' : '刷新'}</Button>
-            <Button onClick={initConfigs} variant="primary">从 Example 初始化用户配置</Button>
+            <Button tone="quiet" disabled={loading} onClick={load}>{loading ? '正在刷新…' : '刷新'}</Button>
+            <Button onClick={initConfigs}>从 Example 初始化用户配置</Button>
           </div>
           <StatusText message={message} />
         </Block>
@@ -524,7 +523,7 @@ export const DrawtoolsSettingsPage = () => {
               </Field>
             </div>
           </div>
-          <Button className="mt-3" onClick={runCleanup} variant="danger">立即清理</Button>
+          <Button tone="danger" className="mt-3" onClick={runCleanup}>立即清理</Button>
         </Block>
 
         <Block frame="boxed" title="画师串 / 预设" hint="绘图节点只看见预设名称，具体参数由工具层自动拼接。">
@@ -536,9 +535,9 @@ export const DrawtoolsSettingsPage = () => {
             </Field>
           </div>
           <div className="mb-3 flex flex-wrap gap-2">
-            <Button onClick={addPreset} variant="primary">+ 新增预设</Button>
-            <Button disabled={!selectedPreset?.id} onClick={renameSelectedPreset}>重命名当前预设</Button>
-            <Button disabled={!selectedPreset?.id} onClick={deleteSelectedPreset} variant="danger">删除当前预设</Button>
+            <Button onClick={addPreset}>+ 新增预设</Button>
+            <Button tone="quiet" disabled={!selectedPreset?.id} onClick={renameSelectedPreset}>重命名当前预设</Button>
+            <Button tone="danger" disabled={!selectedPreset?.id} onClick={deleteSelectedPreset}>删除当前预设</Button>
           </div>
           {selectedPreset?.id && (
             <div className="mb-4 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3">
@@ -655,7 +654,7 @@ export const DrawtoolsSettingsPage = () => {
                   <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3" key={preset.id}>
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="font-mono text-xs font-semibold">{preset.name || preset.id} {String(preset.id) === effectiveSelectedPresetId ? '· 当前默认' : ''}</div>
-                      <Button onClick={() => switchPreset(String(preset.id))}>设为默认/编辑</Button>
+                      <Button tone="quiet" onClick={() => switchPreset(String(preset.id))}>设为默认/编辑</Button>
                     </div>
                     <p className="mt-1 text-xs text-[var(--duties-secondary)]">id: {preset.id} · model: {preset.params?.model} · sampler: {preset.params?.sampler} · scheduler: {preset.params?.scheduler} · CFG: {preset.params?.scale} · steps: {preset.params?.steps}</p>
                   </div>
@@ -668,8 +667,8 @@ export const DrawtoolsSettingsPage = () => {
         <Block frame="boxed" title="角色标签库" hint="管理绘图分析节点可参考的固定角色外貌、别名、Danbooru tag 和服装标签。保存后写入 character_tags.yaml。">
           <div className="mb-3 grid gap-2 md:grid-cols-[var(--duties-entry-columns)]">
             <Input width="wide" onChange={(event) => setCharacterQuery(event.currentTarget.value)} placeholder="搜索角色名称、别名、Danbooru、外貌、服装..." value={characterQuery} />
-            <Button onClick={() => setCharacterQuery('')}>清空搜索</Button>
-            <Button onClick={addCharacter} variant="primary">+ 新增角色</Button>
+            <Button tone="quiet" onClick={() => setCharacterQuery('')}>清空搜索</Button>
+            <Button onClick={addCharacter}>+ 新增角色</Button>
           </div>
           <div className="mb-3 grid gap-2 text-xs text-[var(--duties-secondary)] md:grid-cols-4">
             <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">总角色：{characters.length}</div>
@@ -694,9 +693,9 @@ export const DrawtoolsSettingsPage = () => {
                       </p>
                     </div>
                     <div className="flex flex-wrap gap-2">
-                      <Button onClick={() => setEditingCharacterIndex(isEditing ? null : index)}>{isEditing ? '收起编辑' : '编辑'}</Button>
-                      <Button onClick={() => renameCharacter(index)}>重命名</Button>
-                      <Button onClick={() => deleteCharacter(index)} variant="danger">删除</Button>
+                      <Button tone="quiet" onClick={() => setEditingCharacterIndex(isEditing ? null : index)}>{isEditing ? '收起编辑' : '编辑'}</Button>
+                      <Button tone="quiet" onClick={() => renameCharacter(index)}>重命名</Button>
+                      <Button tone="danger" onClick={() => deleteCharacter(index)}>删除</Button>
                     </div>
                   </div>
                   {!isEditing && (
@@ -742,7 +741,7 @@ export const DrawtoolsSettingsPage = () => {
                       <div className="md:col-span-2">
                         <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
                           <Field label="角色服装" layout="stacked" />
-                          <Button onClick={() => addCharacterOutfit(index)}>+ 添加服装</Button>
+                          <Button tone="quiet" onClick={() => addCharacterOutfit(index)}>+ 添加服装</Button>
                         </div>
                         {!outfits.length && <p className="mb-2 text-xs text-[var(--duties-secondary)]">未配置服装时可留空；添加后会在生图规划时作为服装参考发送给 AI。</p>}
                         <div className="space-y-2">
@@ -750,7 +749,7 @@ export const DrawtoolsSettingsPage = () => {
                             <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-3" key={`${outfit.name || 'outfit'}-${outfitIndex}`}>
                               <div className="mb-2 flex items-center justify-between gap-2">
                                 <div className="font-mono text-xs font-semibold">服装 {outfitIndex + 1}</div>
-                                <Button onClick={() => deleteCharacterOutfit(index, outfitIndex)} variant="danger">删除服装</Button>
+                                <Button tone="danger" onClick={() => deleteCharacterOutfit(index, outfitIndex)}>删除服装</Button>
                               </div>
                               <div className="grid gap-2 md:grid-cols-3">
                                 <div>
@@ -791,8 +790,8 @@ export const DrawtoolsSettingsPage = () => {
             value={editor}
           />
           <div className="mt-3 flex flex-wrap gap-2">
-            <Button disabled={!editorDirty} onClick={saveCurrent} variant="primary">保存当前文件</Button>
-            <Button disabled={!editorDirty} onClick={() => setEditor(sourceText)}>丢弃</Button>
+            <Button disabled={!editorDirty} onClick={saveCurrent}>保存当前文件</Button>
+            <Button tone="quiet" disabled={!editorDirty} onClick={() => setEditor(sourceText)}>丢弃</Button>
           </div>
         </Block>
       </>

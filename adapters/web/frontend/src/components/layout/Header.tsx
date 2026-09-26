@@ -4,8 +4,9 @@ import { getActiveNode, getAppConfig, getNodes, getSessionProviderOverride } fro
 import { confirmNavigation, useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../store/settingsStore';
 import { describeEnvRef } from '../../utils/envRef';
-import { Button, Icon, Modal } from '../common';
+import { Icon, Modal } from '../common';
 import { SessionConfigModal } from '../settings/SessionConfigModal';
+import { Button } from '../settings/pages/settingsControls';
 
 interface HeaderProps {
   title: string;
@@ -99,16 +100,16 @@ export const Header = ({ title, sessionId, isGenerating, isCancelling = false, o
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-2">
-        {viewingChildNodeId && onExitChildSession && <Button onClick={onExitChildSession}><Icon name="arrow_back" size={16} /><span className="hidden sm:inline">返回父会话</span><span className="sm:hidden">返回</span></Button>}
-        {!viewingChildNodeId && isGenerating && onCancel && <Button loading={isCancelling} onClick={onCancel}><Icon name="cancel" size={16} />取消</Button>}
-        {!viewingChildNodeId && !isGenerating && onReset && <Button aria-label="重置对话" onClick={onReset} title="重置对话"><Icon name="refresh" size={16} /></Button>}
+        {viewingChildNodeId && onExitChildSession && <Button tone="quiet" onClick={onExitChildSession}><Icon name="arrow_back" size={16} /><span className="hidden sm:inline">返回父会话</span><span className="sm:hidden">返回</span></Button>}
+        {!viewingChildNodeId && isGenerating && onCancel && <Button tone="quiet" loading={isCancelling} onClick={onCancel}><Icon name="cancel" size={16} />取消</Button>}
+        {!viewingChildNodeId && !isGenerating && onReset && <Button tone="quiet" aria-label="重置对话" onClick={onReset} title="重置对话"><Icon name="refresh" size={16} /></Button>}
       </div>
     </header>
     <Modal open={configModalFocus === 'title'} title="编辑对话标题" onClose={closeConfig} maxWidth="max-w-sm">
       <div className="space-y-4 p-4">
         <label className="block text-sm" htmlFor="conversation-title">对话标题</label>
         <input id="conversation-title" data-autofocus="true" className="app-input w-full" value={draftTitle} maxLength={200} onChange={event => setDraftTitle(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.nativeEvent.isComposing) saveTitle(); }} />
-        <div className="flex justify-end gap-2"><Button onClick={closeConfig}>取消</Button><Button variant="primary" disabled={!draftTitle.trim()} onClick={saveTitle}>保存</Button></div>
+        <div className="flex justify-end gap-2"><Button tone="quiet" onClick={closeConfig}>取消</Button><Button disabled={!draftTitle.trim()} onClick={saveTitle}>保存</Button></div>
       </div>
     </Modal>
     {(configModalFocus === 'node' || configModalFocus === 'model') && <SessionConfigModal focus={configModalFocus} onClose={closeConfig} sessionId={sessionId} />}

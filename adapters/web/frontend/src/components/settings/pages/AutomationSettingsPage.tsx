@@ -8,9 +8,8 @@ import { useEffect, useRef, useState } from 'react';
 import { getSchedulesRaw, updateSchedulesRaw } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
-import { Button } from '../../common';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
-import { Block, Field, Input, PageShell, StatusText } from './settingsControls';
+import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
 import { parseSchedules, serializeSchedules, type ScheduleFormState } from '../settingsStructuredConfig';
 
 function emptySchedule(id: string): ScheduleFormState {
@@ -108,8 +107,8 @@ export const AutomationSettingsPage = () => {
     <PageShell authed={isAuthenticated} description="查看 data/schedules.yaml 中的定时任务。cron 时间按 UTC 解释，选择任务后在右栏编辑字段。" title="自动化">
       <Block frame="boxed" title="定时任务列表" hint="每项显示 ID、cron、类型、启用状态和 text 预览。字段表单与 Raw YAML fallback 位于右栏。">
         <div className="mb-3 flex flex-wrap gap-2">
-          <Button disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新'}</Button>
-          <Button disabled={loading || busy || !selectedScheduleId} onClick={remove} variant="danger">删除选中任务</Button>
+          <Button tone="quiet" disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新'}</Button>
+          <Button tone="danger" disabled={loading || busy || !selectedScheduleId} onClick={remove}>删除选中任务</Button>
         </div>
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">
           {schedules.length === 0 ? <p className="text-sm text-[var(--duties-secondary)]">暂无定时任务。</p> : schedules.map((schedule) => (
@@ -123,7 +122,7 @@ export const AutomationSettingsPage = () => {
         <div className="mt-4 border-t border-[var(--duties-border)] pt-3">
           <Field htmlFor="new-schedule-id" label="创建定时任务" layout="stacked">
             <Input width="wide" disabled={busy} id="new-schedule-id" onChange={(event) => setNewId(event.target.value)} placeholder="任务 ID" value={newId} />
-            <Button className="mt-2" disabled={busy || loading || !newId.trim()} onClick={create} variant="primary">创建任务</Button>
+            <Button className="mt-2" disabled={busy || loading || !newId.trim()} onClick={create}>创建任务</Button>
           </Field>
         </div>
         <StatusText message={message} />

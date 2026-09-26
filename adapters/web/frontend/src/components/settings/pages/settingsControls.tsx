@@ -380,13 +380,24 @@ const SIZE: Record<ButtonSize, string> = {
 const buttonSkin = (tone: ButtonTone, size: ButtonSize, className: string) =>
   `app-button inline-flex min-h-[var(--duties-control-size)] items-center justify-center gap-2 border text-sm font-medium ${SIZE[size]} ${TONE[tone]} ${className}`;
 
-export const Button = ({ tone = 'solid', size = 'default', className = '', ...props }:
-  React.ButtonHTMLAttributes<HTMLButtonElement> & { tone?: ButtonTone; size?: ButtonSize }) => (
+export const Button = ({
+  children, className = '', disabled, loading = false, size = 'default', tone = 'solid', ...props
+}: React.ButtonHTMLAttributes<HTMLButtonElement> & {
+  /** 请求在飞时转圈并自锁。文字不换，换了会让人以为点错了按钮。 */
+  loading?: boolean;
+  size?: ButtonSize;
+  tone?: ButtonTone;
+}) => (
   <button
     {...props}
+    aria-busy={loading || undefined}
     className={buttonSkin(tone, size, `disabled:cursor-not-allowed disabled:opacity-40 ${className}`)}
+    disabled={disabled || loading}
     type={props.type || 'button'}
-  />
+  >
+    {loading && <span aria-hidden="true" className="app-button-spinner" />}
+    {children}
+  </button>
 );
 
 /** 长得像按钮的链接。跨实例跳转要能中键开新页，那是 <a> 才有的行为。 */

@@ -111,15 +111,15 @@ describe('local aliases', () => {
   });
 
   it('remembers a note for an id', () => {
-    writeAlias(700, '测试群');
+    writeAlias('qq', 700, '测试群');
 
-    expect(readAliases()['700']).toBe('测试群');
+    expect(readAliases()['qq:700']).toBe('测试群');
   });
 
   it('drops the entry when the note is cleared', () => {
-    writeAlias(700, '测试群');
+    writeAlias('qq', 700, '测试群');
 
-    writeAlias(700, '   ');
+    writeAlias('qq', 700, '   ');
 
     expect(readAliases()).toEqual({});
   });
@@ -144,12 +144,12 @@ describe('local aliases', () => {
   it('ignores non-string values that got in somehow', () => {
     localStorage.setItem('qq_console_aliases', JSON.stringify({ 700: 42, 800: 'ok' }));
 
-    expect(readAliases()).toEqual({ 800: 'ok' });
+    expect(readAliases()).toEqual({ 'qq:800': 'ok' });
   });
 
   it('never reaches the yaml that gets saved', () => {
     // 备注只活在浏览器里。它要是能进 qq.yaml，群名就会跟着进模型的上下文。
-    writeAlias(700, '公司内部群');
+    writeAlias('qq', 700, '公司内部群');
     useConsoleStore.setState({
       live: {
         published: true,
