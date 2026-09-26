@@ -1538,6 +1538,34 @@ export interface PlatformDryRunMessage {
   at_sec?: number;
 }
 
+/** 平台驱动能发什么、有什么限制。字段对着 platforms/descriptor.py 的 PlatformCapabilities.public_dict()。 */
+export interface PlatformCapabilitiesSummary {
+  max_text_length: number;
+  markdown: boolean;
+  max_split_parts: number;
+  reply_quotas: Record<string, { limit: number; window_sec: number }>;
+  mention: 'none' | 'native' | 'text';
+  mention_everyone: boolean;
+  quote: boolean;
+  reactions: boolean;
+  images: {
+    formats: string[];
+    max_bytes: number;
+    animated: boolean;
+    inline_with_text: boolean;
+    upload_first: boolean;
+  } | null;
+  native_emoji: boolean;
+  merged_forward: boolean;
+  proactive: boolean;
+  proactive_daily_limit: number;
+  typing: string[];
+  progress_edit: boolean;
+  recall: boolean;
+  edit: boolean;
+  links: boolean;
+}
+
 /** 平台注册表公布的一份平台描述。字段对着 platforms/descriptor.py 的 public_dict()。 */
 export interface PlatformSummary {
   id: string;
@@ -1547,6 +1575,8 @@ export interface PlatformSummary {
   channels: { name: string; kind: string; hashed: boolean }[];
   has_config: boolean;
   hooks: string[];
+  /** 旧版后端没有这一项。 */
+  capabilities?: PlatformCapabilitiesSummary;
 }
 
 export async function getPlatforms(token: string): Promise<PlatformSummary[]> {

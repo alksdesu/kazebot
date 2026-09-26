@@ -8,11 +8,14 @@ from .descriptor import (
     CHANNEL_PRIVATE,
     HOOK_TRIGGER_POLICY,
     ID_NUMERIC,
+    MENTION_NATIVE,
     STATE_ACTIVE_ACCOUNT,
     STATE_ALIASES,
     STATE_LIVE,
     STATE_ROUTES,
     ChannelDescriptor,
+    ImageSupport,
+    PlatformCapabilities,
     PlatformDescriptor,
 )
 
@@ -38,6 +41,18 @@ QQ_NAPCAT = PlatformDescriptor(
         STATE_ACTIVE_ACCOUNT: "onebot_active_bot.json",
     },
     hooks={HOOK_TRIGGER_POLICY: "adapters._shared.trigger_policy"},
+    # 按驱动现在做得到的填：NapCat 能撤回消息，但驱动没接，就不声明。
+    # 字数上限不写死，由 output.message_limit 截断。
+    capabilities=PlatformCapabilities(
+        mention=MENTION_NATIVE,
+        mention_everyone=True,
+        quote=True,
+        reactions=True,
+        images=ImageSupport(formats=frozenset({"png", "jpeg", "gif", "webp", "bmp"})),
+        native_emoji=True,
+        merged_forward=True,
+        typing=frozenset({CHANNEL_PRIVATE}),
+    ),
 )
 
 BUILTIN_PLATFORMS: tuple[PlatformDescriptor, ...] = (QQ_NAPCAT,)

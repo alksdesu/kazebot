@@ -23,6 +23,12 @@ STATE_ACTIVE_ACCOUNT = "active_account"
 
 HOOK_TRIGGER_POLICY = "trigger_policy"
 
+# native 由驱动按平台 ID 渲染成真正的提及，text 只能写成「@名字」的文字。
+MENTION_NONE = "none"
+MENTION_NATIVE = "native"
+MENTION_TEXT = "text"
+MENTION_FORMS: frozenset[str] = frozenset({MENTION_NONE, MENTION_NATIVE, MENTION_TEXT})
+
 
 def normalize_name(value: Any) -> str:
     return str(value or "").strip().lower()
@@ -39,6 +45,115 @@ class ChannelDescriptor:
     def __post_init__(self) -> None:
         if self.kind not in CHANNEL_KINDS:
             raise ValueError(f"unknown channel kind: {self.kind!r}")
+
+
+@dataclass(frozen=True)
+class ReplyQuota:
+    # 收到一条消息后 window_sec 秒内最多回 limit 条，超出的平台直接拒收。
+    limit: int
+    window_sec: float
+
+    def __post_init__(self) -> None:
+        if self.limit <= 0 or self.window_sec <= 0:
+            raise ValueError("a reply quota needs a positive limit and window")
+
+    def public_dict(self) -> dict[str, Any]:
+        return {"limit": self.limit, "window_sec": self.window_sec}
+
+
+@dataclass(frozen=True)
+class ImageSupport:
+    formats: frozenset[str]
+    # 0 表示没有已知上限。
+    max_bytes: int = 0
+    animated: bool = True
+    inline_with_text: bool = True
+    # 要先上传换凭据才能发，不能直接给路径或 base64。
+    upload_first: bool = False
+
+    def __post_init__(self) -> None:
+        formats = frozenset(name for name in (normalize_name(fmt) for fmt in self.formats) if name)
+        if not formats:
+            raise ValueError("image support needs at least one format")
+        if self.max_bytes < 0:
+            raise ValueError("max_bytes cannot be negative")
+        object.__setattr__(self, "formats", formats)
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "formats": sorted(self.formats),
+            "max_bytes": self.max_bytes,
+            "animated": self.animated,
+            "inline_with_text": self.inline_with_text,
+            "upload_first": self.upload_first,
+        }
+
+
+@dataclass(frozen=True)
+class PlatformCapabilities:
+    """平台驱动能发什么、有什么限制。默认值按纯文本平台取，富媒体和互动能力没声明就当不支持。"""
+
+    # 单条消息的字数上限；0 表示没有已知上限，只按配置截断。
+    max_text_length: int = 0
+    markdown: bool = False
+    # 一次回复最多分几条；0 表示不限。
+    max_split_parts: int = 0
+    # 被动回复额度，按会话种类给，没列出的种类不限。
+    reply_quotas: Mapping[str, ReplyQuota] = field(default_factory=dict)
+    mention: str = MENTION_NONE
+    mention_everyone: bool = False
+    quote: bool = False
+    # 能否在别人的消息上贴表态；可用的表态由驱动运行时给出。
+    reactions: bool = False
+    images: ImageSupport | None = None
+    # 平台自己的表情，比如 QQ 收藏表情、Discord 服务器表情；目录由驱动运行时给出。
+    native_emoji: bool = False
+    merged_forward: bool = False
+    proactive: bool = True
+    # 主动消息每天的额度；0 表示不限。
+    proactive_daily_limit: int = 0
+    # 能显示「输入中」的会话种类。
+    typing: frozenset[str] = frozenset()
+    progress_edit: bool = False
+    recall: bool = False
+    edit: bool = False
+    links: bool = True
+
+    def __post_init__(self) -> None:
+        if self.mention not in MENTION_FORMS:
+            raise ValueError(f"unknown mention form: {self.mention!r}")
+        if self.mention_everyone and self.mention == MENTION_NONE:
+            raise ValueError("mention_everyone needs a mention form")
+        for name in ("max_text_length", "max_split_parts", "proactive_daily_limit"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} cannot be negative")
+        kinds = {*self.reply_quotas, *self.typing}
+        if not kinds <= CONVERSATION_KINDS:
+            raise ValueError(f"capabilities only apply to conversation kinds, got {sorted(kinds - CONVERSATION_KINDS)}")
+        object.__setattr__(self, "reply_quotas", MappingProxyType(dict(self.reply_quotas)))
+        object.__setattr__(self, "typing", frozenset(self.typing))
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "max_text_length": self.max_text_length,
+            "markdown": self.markdown,
+            "max_split_parts": self.max_split_parts,
+            "reply_quotas": {kind: quota.public_dict() for kind, quota in sorted(self.reply_quotas.items())},
+            "mention": self.mention,
+            "mention_everyone": self.mention_everyone,
+            "quote": self.quote,
+            "reactions": self.reactions,
+            "images": None if self.images is None else self.images.public_dict(),
+            "native_emoji": self.native_emoji,
+            "merged_forward": self.merged_forward,
+            "proactive": self.proactive,
+            "proactive_daily_limit": self.proactive_daily_limit,
+            "typing": sorted(self.typing),
+            "progress_edit": self.progress_edit,
+            "recall": self.recall,
+            "edit": self.edit,
+            "links": self.links,
+        }
 
 
 @dataclass(frozen=True)
@@ -61,6 +176,7 @@ class PlatformDescriptor:
     state_files: Mapping[str, str] = field(default_factory=dict)
     # 核心层需要调用的平台策略：名字 → 模块路径，按需导入。
     hooks: Mapping[str, str] = field(default_factory=dict)
+    capabilities: PlatformCapabilities = field(default_factory=PlatformCapabilities)
 
     def __post_init__(self) -> None:
         if self.id_shape not in {ID_NUMERIC, ID_STRING}:
@@ -68,6 +184,10 @@ class PlatformDescriptor:
         names = [channel.name for channel in self.channels]
         if len(names) != len(set(names)):
             raise ValueError(f"duplicate channel names in platform {self.id!r}")
+        declared = {*self.capabilities.reply_quotas, *self.capabilities.typing}
+        missing = declared - {channel.kind for channel in self.channels}
+        if missing:
+            raise ValueError(f"platform {self.id!r} declares capabilities for kinds it has no channel for: {sorted(missing)}")
         object.__setattr__(self, "state_files", MappingProxyType(dict(self.state_files)))
         object.__setattr__(self, "hooks", MappingProxyType(dict(self.hooks)))
 
@@ -91,4 +211,5 @@ class PlatformDescriptor:
             ],
             "has_config": bool(self.config_path),
             "hooks": sorted(self.hooks),
+            "capabilities": self.capabilities.public_dict(),
         }
