@@ -21,6 +21,7 @@ from .config import (
     RECENT_FILE_MAX_ITEMS,
     RECENT_IMAGE_MAX_ITEMS,
 )
+from .emoji_handler import EmojiRenderer
 from .send_contract import TwoPhaseIdempotencyStore
 from .trigger_policy import CooldownState, TriggerDecision
 
@@ -33,12 +34,12 @@ if TYPE_CHECKING:
     from .echo_policy import EchoEntry
     from .feature_gateway import FeatureGateway
     from .live_config import _Live
-    from .onebot_plugin import (
+    from .napcat.callbacks import TangQiuCallbacks
+    from .napcat.models import (
         GroupContentRecord,
         GroupHistoryLine,
         QueuedInbound,
         QueueReplyWaiter,
-        TangQiuCallbacks,
         _ApprovalCard,
         _AttachmentSendLock,
     )
@@ -239,6 +240,8 @@ class OneBotAdapter:
         self.sticker_delivery_locks: Dict[str, tuple[asyncio.Lock, int]] = {}
         self.sticker_receipt_task: Optional[asyncio.Task] = None
         self.sticker_combat = CombatTracker()
+        # 出站 [表情:]/[at:] 渲染；resolver 在启动时注入，收藏表情缓存按账号分。
+        self.emoji = EmojiRenderer()
 
         # ---- 热载状态发布 ----
         self.live_state_signature: str = ""

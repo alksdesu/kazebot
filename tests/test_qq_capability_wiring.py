@@ -54,34 +54,34 @@ def in_private(user_id: int, *, role: str = "") -> SimpleNamespace:
 
 def clear_memory(runtime: Any, event: Any, text: str) -> str | None:
     return asyncio.run(
-        runtime._maybe_handle_clear_group_memory_command(bot=None, event=event, user_text=text)
+        runtime.commands._maybe_handle_clear_group_memory_command(bot=None, event=event, user_text=text)
     )
 
 
 def switch_model(runtime: Any, event: Any) -> str | None:
-    return asyncio.run(runtime._maybe_handle_model_command(event=event, user_text="/切换模型 gpt-4o"))
+    return asyncio.run(runtime.commands._maybe_handle_model_command(event=event, user_text="/切换模型 gpt-4o"))
 
 
 def dead_letter(runtime: Any, event: Any, text: str = "/发送死信") -> str | None:
-    return asyncio.run(runtime._maybe_handle_dead_letter_command(event=event, user_text=text))
+    return asyncio.run(runtime.commands._maybe_handle_dead_letter_command(event=event, user_text=text))
 
 
 def dispatch_family(runtime: Any, family: str, event: Any, text: str) -> str | None:
     """把一条命令送进它所属的 handler。off 档下每个 handler 都该对非名单静默。"""
     if family == "draw_preset":
-        return asyncio.run(runtime._maybe_handle_drawtools_command(event=event, user_text=text))
+        return asyncio.run(runtime.commands._maybe_handle_drawtools_command(event=event, user_text=text))
     if family == "model":
-        return asyncio.run(runtime._maybe_handle_model_command(event=event, user_text=text))
+        return asyncio.run(runtime.commands._maybe_handle_model_command(event=event, user_text=text))
     if family == "custom_face":
-        return asyncio.run(runtime._maybe_handle_custom_face_command(
+        return asyncio.run(runtime.commands._maybe_handle_custom_face_command(
             bot=None, event=event, user_text=text, conversation_key="k", current_attachments=[],
         ))
     if family == "proactive":
-        return asyncio.run(runtime._maybe_handle_proactive_command(
+        return asyncio.run(runtime.proactive._maybe_handle_proactive_command(
             bot=None, event=event, user_text=text, conversation_key="k", current_attachments=[],
         ))
     if family == "clear_memory":
-        return asyncio.run(runtime._maybe_handle_clear_group_memory_command(
+        return asyncio.run(runtime.commands._maybe_handle_clear_group_memory_command(
             bot=None, event=event, user_text=text,
         ))
     raise AssertionError(f"unknown family: {family}")
@@ -171,7 +171,7 @@ class TestTheOwnerCannotReachPastHisGroup:
     ) -> None:
         """这道门必须是作用域判定的调用方，不能自己再抄一遍名单判断。"""
         monkeypatch.setattr(
-            runtime.capability, "scope_deny_reason",
+            runtime.permissions.capability, "scope_deny_reason",
             lambda cap, requester, target: "SCOPE-STOP",
         )
 
@@ -196,14 +196,14 @@ class TestGlobalCapabilitiesStayWithTheRoster:
     ) -> None:
         """手改 yaml 写 owner 会在读配置时被夹回 admin，判定端看到的已经是 admin。"""
         # 未初始化的提示排在鉴权之前，不接上就测不到门。
-        monkeypatch.setattr(runtime._adapter, "client", SimpleNamespace(), raising=False)
+        monkeypatch.setattr(runtime.state._adapter, "client", SimpleNamespace(), raising=False)
         set_live_config(runtime, grant_model="owner")
 
-        assert runtime.live.grant_model == "admin"
+        assert runtime.state.live.grant_model == "admin"
         assert switch_model(runtime, in_group(OWNER_QQ, role="owner")) == "模型命令仅限 Clonoth 管理员使用。"
 
     def test_the_roster_can_still_switch_models(self, runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(runtime._adapter, "client", SimpleNamespace(), raising=False)
+        monkeypatch.setattr(runtime.state._adapter, "client", SimpleNamespace(), raising=False)
 
         reply = switch_model(runtime, in_private(LISTED_QQ))
 
@@ -215,7 +215,7 @@ class TestGlobalCapabilitiesStayWithTheRoster:
     def test_every_global_capability_clamps_the_same_way(self, runtime: Any, key: str) -> None:
         set_live_config(runtime, **{f"grant_{key}": "group_admin"})
 
-        assert getattr(runtime.live, f"grant_{key}") == "admin"
+        assert getattr(runtime.state.live, f"grant_{key}") == "admin"
 
 
 class TestTheYamlIsReadTheWayItWasWritten:
@@ -235,25 +235,25 @@ class TestTheYamlIsReadTheWayItWasWritten:
     def test_a_bare_off_still_means_off(self, runtime: Any) -> None:
         self._write(runtime, "permissions:\n  capabilities:\n    draw_preset: off\n")
 
-        assert runtime.live.grant_draw_preset == "off"
+        assert runtime.state.live.grant_draw_preset == "off"
 
     @pytest.mark.parametrize("written", ["no", "NO", "false", "Off"])
     def test_the_other_spellings_of_off_mean_off_too(self, runtime: Any, written: str) -> None:
         self._write(runtime, f"permissions:\n  capabilities:\n    draw_preset: {written}\n")
 
-        assert runtime.live.grant_draw_preset == "off"
+        assert runtime.state.live.grant_draw_preset == "off"
 
     def test_a_quoted_off_reads_the_same(self, runtime: Any) -> None:
         self._write(runtime, 'permissions:\n  capabilities:\n    draw_preset: "off"\n')
 
-        assert runtime.live.grant_draw_preset == "off"
+        assert runtime.state.live.grant_draw_preset == "off"
 
     @pytest.mark.parametrize("written", ["on", "yes", "true"])
     def test_a_truthy_word_is_not_guessed_into_a_grant(self, runtime: Any, written: str) -> None:
         """它们对应哪一档没有答案，只能回落默认，不能猜成「最宽」。"""
         self._write(runtime, f"permissions:\n  capabilities:\n    clear_memory: {written}\n")
 
-        assert runtime.live.grant_clear_memory == "admin"
+        assert runtime.state.live.grant_clear_memory == "admin"
 
 
 class TestOffShutsTheDoorOnEveryone:
@@ -268,7 +268,7 @@ class TestOffShutsTheDoorOnEveryone:
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """名单里的人看到「仅限管理员使用」只会以为是 bug。"""
-        monkeypatch.setattr(runtime._adapter, "client", SimpleNamespace(), raising=False)
+        monkeypatch.setattr(runtime.state._adapter, "client", SimpleNamespace(), raising=False)
         set_live_config(runtime, grant_model="off")
 
         assert switch_model(runtime, in_private(LISTED_QQ)) == "「切换模型」已在配置里关闭。"
@@ -280,17 +280,17 @@ class TestOffShutsTheDoorOnEveryone:
         set_live_config(runtime, grant_approval="off")
         decisions: list[tuple[str, str]] = []
         monkeypatch.setattr(
-            runtime._adapter, "client",
+            runtime.state._adapter, "client",
             SimpleNamespace(
                 approve=lambda aid, decision, comment: _record(decisions, aid, decision, comment),
             ),
             raising=False,
         )
 
-        asyncio.run(runtime.TangQiuCallbacks().show_approval_ui("ap-1", "read_file", {}))
+        asyncio.run(runtime.callbacks.TangQiuCallbacks().show_approval_ui("ap-1", "read_file", {}))
 
         assert decisions and decisions[0][1] == "deny"
-        assert not runtime._adapter.pending_approvals
+        assert not runtime.state._adapter.pending_approvals
 
     def test_a_member_is_not_told_the_capability_exists(self, runtime: Any) -> None:
         """对名单之外的人说「这项能力关了」等于把这项能力的存在念给他听。"""
@@ -319,7 +319,7 @@ class TestOffShutsTheDoorOnEveryone:
     ) -> None:
         """漏改任何一个调用点，那一档就会把能力名念给非名单用户。"""
         # 未初始化提示排在鉴权之前，model 分支不接 _client 会先撞上它。
-        monkeypatch.setattr(runtime._adapter, "client", SimpleNamespace(), raising=False)
+        monkeypatch.setattr(runtime.state._adapter, "client", SimpleNamespace(), raising=False)
         set_live_config(runtime, **{f"grant_{family}": "off"})
 
         assert dispatch_family(runtime, family, in_group(MEMBER_QQ), text) is None
@@ -337,13 +337,13 @@ class TestProactiveTargetsAreClamped:
         async def capture(bot: Any, target: Any, body: Any, attachments: Any, **kwargs: Any) -> None:
             box.append({"target": target, "body": body})
 
-        monkeypatch.setattr(runtime, "_send_text_and_attachments", capture)
+        monkeypatch.setattr(runtime.outbound_attachments, "_send_text_and_attachments", capture)
         return box
 
     def test_the_owner_can_speak_in_his_own_group(self, runtime: Any, sent: list[Any]) -> None:
         set_live_config(runtime, grant_proactive="owner")
 
-        reply = asyncio.run(runtime._maybe_handle_proactive_command(
+        reply = asyncio.run(runtime.proactive._maybe_handle_proactive_command(
             bot=None, event=in_group(OWNER_QQ, role="owner"),
             user_text=f"/群发 {HOME_GROUP} 晚上八点开会",
             conversation_key="k", current_attachments=[],
@@ -355,7 +355,7 @@ class TestProactiveTargetsAreClamped:
     def test_the_owner_cannot_speak_in_another_group(self, runtime: Any, sent: list[Any]) -> None:
         set_live_config(runtime, grant_proactive="owner")
 
-        reply = asyncio.run(runtime._maybe_handle_proactive_command(
+        reply = asyncio.run(runtime.proactive._maybe_handle_proactive_command(
             bot=None, event=in_group(OWNER_QQ, role="owner"),
             user_text=f"/群发 {OTHER_GROUP} 晚上八点开会",
             conversation_key="k", current_attachments=[],
@@ -370,11 +370,11 @@ class TestProactiveTargetsAreClamped:
         """私聊目标不属于任何群，群主在那边没有可主张的作用域。"""
         set_live_config(runtime, grant_proactive="group_admin")
         monkeypatch.setattr(
-            runtime, "_private_target_candidates",
-            _async_returning([runtime.ProactiveTarget("private", MEMBER_QQ, "someone")]),
+            runtime.proactive, "_private_target_candidates",
+            _async_returning([runtime.models.ProactiveTarget("private", MEMBER_QQ, "someone")]),
         )
 
-        reply = asyncio.run(runtime._maybe_handle_proactive_command(
+        reply = asyncio.run(runtime.proactive._maybe_handle_proactive_command(
             bot=None, event=in_group(OWNER_QQ, role="owner"),
             user_text=f"/私信 {MEMBER_QQ} 你好",
             conversation_key="k", current_attachments=[],
@@ -390,11 +390,11 @@ class TestProactiveTargetsAreClamped:
         群主就能借 bot 私信到那个恰好同号的人头上。"""
         set_live_config(runtime, grant_proactive="group_admin")
         monkeypatch.setattr(
-            runtime, "_private_target_candidates",
-            _async_returning([runtime.ProactiveTarget("private", HOME_GROUP, "someone")]),
+            runtime.proactive, "_private_target_candidates",
+            _async_returning([runtime.models.ProactiveTarget("private", HOME_GROUP, "someone")]),
         )
 
-        reply = asyncio.run(runtime._maybe_handle_proactive_command(
+        reply = asyncio.run(runtime.proactive._maybe_handle_proactive_command(
             bot=None, event=in_group(OWNER_QQ, role="owner"),
             user_text=f"/私信 {HOME_GROUP} 你好",
             conversation_key="k", current_attachments=[],
@@ -406,7 +406,7 @@ class TestProactiveTargetsAreClamped:
     def test_the_owner_is_not_shown_the_target_listing(self, runtime: Any) -> None:
         set_live_config(runtime, grant_proactive="owner")
 
-        reply = asyncio.run(runtime._maybe_handle_proactive_command(
+        reply = asyncio.run(runtime.proactive._maybe_handle_proactive_command(
             bot=None, event=in_group(OWNER_QQ, role="owner"), user_text="/主动目标",
             conversation_key="k", current_attachments=[],
         ))
@@ -416,7 +416,7 @@ class TestProactiveTargetsAreClamped:
     def test_a_member_learns_nothing_about_the_command(self, runtime: Any) -> None:
         set_live_config(runtime, grant_proactive="owner")
 
-        reply = asyncio.run(runtime._maybe_handle_proactive_command(
+        reply = asyncio.run(runtime.proactive._maybe_handle_proactive_command(
             bot=None, event=in_group(MEMBER_QQ), user_text=f"/群发 {HOME_GROUP} 你好",
             conversation_key="k", current_attachments=[],
         ))
@@ -436,18 +436,18 @@ class TestTheRosterKeepsItsNonCapabilityRoles:
         群主拿到清群记忆的权限，不该顺带拿到 bot 所在机器的文件。"""
         set_live_config(runtime, grant_clear_memory="group_admin", grant_proactive="group_admin")
 
-        assert not runtime._is_admin_user(OWNER_QQ)
+        assert not runtime.permissions._is_admin_user(OWNER_QQ)
 
     def test_a_granted_owner_does_not_become_a_private_chat_allowee(self, runtime: Any) -> None:
         set_live_config(runtime, grant_proactive="group_admin", allow_private_friends=False)
 
-        assert not runtime._is_private_allowed(in_private(OWNER_QQ, role="owner"))
+        assert not runtime.permissions._is_private_allowed(in_private(OWNER_QQ, role="owner"))
 
     def test_turning_a_capability_off_does_not_empty_the_roster(self, runtime: Any) -> None:
         """名单还兼着审批收件人和私聊白名单，档位关的是能力，不是身份。"""
         set_live_config(runtime, grant_approval="off")
 
-        assert runtime._is_admin_user(LISTED_QQ)
+        assert runtime.permissions._is_admin_user(LISTED_QQ)
 
 
 class TestDeadLetterCommandIsRosterOnly:
@@ -478,9 +478,9 @@ class TestNameLookupIsNotAProbe:
 
     @pytest.fixture()
     def two_groups(self, runtime: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
-        monkeypatch.setattr(runtime, "_group_target_candidates", _async_returning([
-            runtime.ProactiveTarget("group", HOME_GROUP, "家里"),
-            runtime.ProactiveTarget("group", OTHER_GROUP, "公司群"),
+        monkeypatch.setattr(runtime.proactive, "_group_target_candidates", _async_returning([
+            runtime.models.ProactiveTarget("group", HOME_GROUP, "家里"),
+            runtime.models.ProactiveTarget("group", OTHER_GROUP, "公司群"),
         ]))
         return runtime
 
@@ -506,9 +506,9 @@ class TestNameLookupIsNotAProbe:
     def test_the_roster_still_sees_which_names_collided(
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(runtime, "_group_target_candidates", _async_returning([
-            runtime.ProactiveTarget("group", HOME_GROUP, "同名群"),
-            runtime.ProactiveTarget("group", OTHER_GROUP, "同名群"),
+        monkeypatch.setattr(runtime.proactive, "_group_target_candidates", _async_returning([
+            runtime.models.ProactiveTarget("group", HOME_GROUP, "同名群"),
+            runtime.models.ProactiveTarget("group", OTHER_GROUP, "同名群"),
         ]))
 
         reply = clear_memory(runtime, in_group(LISTED_QQ), "/清除群记忆 同名群")

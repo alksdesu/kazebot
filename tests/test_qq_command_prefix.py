@@ -20,7 +20,7 @@ _TESTS = Path(__file__).resolve().parent
 if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
-from _onebot_harness import load_runtime, set_live_config  # noqa: E402
+from _onebot_harness import body_attr, load_runtime, set_live_config  # noqa: E402
 
 ADMIN_QQ = 10001
 MEMBER_QQ = 10002
@@ -69,21 +69,21 @@ _COMMANDS = [
 class TestSlashIsRequired:
     @pytest.mark.parametrize("attr,body", _COMMANDS)
     def test_the_slash_form_matches(self, runtime: Any, attr: str, body: str) -> None:
-        assert getattr(runtime, attr).match(f"/{body}") is not None
+        assert body_attr(runtime, attr).match(f"/{body}") is not None
 
     @pytest.mark.parametrize("attr,body", _COMMANDS)
     def test_the_fullwidth_slash_matches_too(self, runtime: Any, attr: str, body: str) -> None:
         # 中文输入法打出来的是另一个码位，用户看不出区别。
-        assert getattr(runtime, attr).match(f"／{body}") is not None
+        assert body_attr(runtime, attr).match(f"／{body}") is not None
 
     @pytest.mark.parametrize("attr,body", _COMMANDS)
     def test_the_bare_word_is_ordinary_chat(self, runtime: Any, attr: str, body: str) -> None:
-        assert getattr(runtime, attr).match(body) is None
+        assert body_attr(runtime, attr).match(body) is None
 
     @pytest.mark.parametrize("attr,body", _COMMANDS)
     def test_the_bang_prefix_is_not_a_command(self, runtime: Any, attr: str, body: str) -> None:
         # ! 仍然可以是触发前缀，但剥掉之后剩的是裸词，不再是命令。
-        assert getattr(runtime, attr).match(f"!{body}") is None
+        assert body_attr(runtime, attr).match(f"!{body}") is None
 
 
 class TestEverydayPhrasesSurvive:
@@ -99,7 +99,7 @@ class TestEverydayPhrasesSurvive:
     ])
     def test_no_command_claims_it(self, runtime: Any, text: str) -> None:
         for attr, _body in _COMMANDS:
-            assert getattr(runtime, attr).match(text) is None, attr
+            assert body_attr(runtime, attr).match(text) is None, attr
 
 
 class TestPathsAreNotCommands:
@@ -111,15 +111,15 @@ class TestPathsAreNotCommands:
         "/www/wwwroot/site/index.html",
     ])
     def test_a_path_is_left_to_the_model(self, runtime: Any, text: str) -> None:
-        assert runtime._strip_command_prefix(text) == ""
-        assert runtime._parse_proactive_command(text) is None
+        assert runtime.common._strip_command_prefix(text) == ""
+        assert runtime.proactive._parse_proactive_command(text) is None
 
     def test_a_single_segment_still_parses(self, runtime: Any) -> None:
-        assert runtime._strip_command_prefix("/群发 项目组 你好") == "群发 项目组 你好"
+        assert runtime.common._strip_command_prefix("/群发 项目组 你好") == "群发 项目组 你好"
 
     def test_an_argument_may_contain_slashes(self, runtime: Any) -> None:
         # 只看首段：/发文件 的路径参数里当然有斜杠。
-        parsed = runtime._parse_proactive_command("/发文件 群 项目组 data/attachments/x.zip")
+        parsed = runtime.proactive._parse_proactive_command("/发文件 群 项目组 data/attachments/x.zip")
         assert parsed is not None
         assert parsed["action"] == "file"
         assert parsed["body"] == "data/attachments/x.zip"
@@ -132,21 +132,21 @@ class TestForwardAliasesShareOneBranch:
         "合并转发", "转发", "转发到", "转发给", "合并转发到", "合并转发给", "forward",
     ])
     def test_every_alias_lands_on_forward(self, runtime: Any, head: str) -> None:
-        parsed = runtime._parse_proactive_command(f"/{head} 群 项目组 内容")
+        parsed = runtime.proactive._parse_proactive_command(f"/{head} 群 项目组 内容")
         assert parsed is not None
         assert parsed["action"] == "forward"
         assert parsed["target_type"] == "group"
         assert parsed["target_ref"] == "项目组"
 
     def test_send_english_alias_matches_the_chinese_one(self, runtime: Any) -> None:
-        english = runtime._parse_proactive_command("/send 群 项目组 内容")
-        chinese = runtime._parse_proactive_command("/发送 群 项目组 内容")
+        english = runtime.proactive._parse_proactive_command("/send 群 项目组 内容")
+        chinese = runtime.proactive._parse_proactive_command("/发送 群 项目组 内容")
         assert english == chinese
 
 
 class TestHelpListsOnlyWhatYouCanRun:
     def test_an_admin_sees_the_gated_entries(self, runtime: Any) -> None:
-        text = asyncio.run(runtime._maybe_handle_help_command(
+        text = asyncio.run(runtime.commands._maybe_handle_help_command(
             event=in_group(ADMIN_QQ), user_text="/帮助",
         ))
         assert text is not None
@@ -154,7 +154,7 @@ class TestHelpListsOnlyWhatYouCanRun:
         assert "/清除群记忆" in text
 
     def test_a_member_sees_only_the_open_ones(self, runtime: Any) -> None:
-        text = asyncio.run(runtime._maybe_handle_help_command(
+        text = asyncio.run(runtime.commands._maybe_handle_help_command(
             event=in_group(MEMBER_QQ), user_text="/帮助",
         ))
         assert text is not None
@@ -163,10 +163,10 @@ class TestHelpListsOnlyWhatYouCanRun:
         assert "/清除群记忆" not in text
 
     def test_a_bare_word_is_not_the_help_command(self, runtime: Any) -> None:
-        assert asyncio.run(runtime._maybe_handle_help_command(
+        assert asyncio.run(runtime.commands._maybe_handle_help_command(
             event=in_group(ADMIN_QQ), user_text="帮助",
         )) is None
 
     def test_every_catalog_entry_is_written_with_a_slash(self, runtime: Any) -> None:
-        for _cap, usage, _desc in runtime._COMMAND_CATALOG:
+        for _cap, usage, _desc in runtime.commands._COMMAND_CATALOG:
             assert usage.startswith("/"), usage

@@ -53,12 +53,12 @@ def capture(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> _Bot:
         bot.sent.append(str(message))
         return len(bot.sent)
 
-    monkeypatch.setattr(runtime, "_send_qq_message", _send)
+    monkeypatch.setattr(runtime.sending, "_send_qq_message", _send)
     return bot
 
 
 async def _notice(runtime: Any, bot: _Bot, platform_data: dict[str, Any], *, at: float) -> None:
-    await runtime._maybe_send_search_progress_notice(
+    await runtime.outbound_attachments._maybe_send_search_progress_notice(
         bot, {"type": "group", "group_id": 1, "conversation_key": "qq_group:x"}, platform_data,
     )
 
@@ -67,18 +67,18 @@ async def _notice(runtime: Any, bot: _Bot, platform_data: dict[str, Any], *, at:
 def clock(runtime: Any, monkeypatch: pytest.MonkeyPatch):
     """可控时钟。真等 20 秒会把测试拖成秒级。"""
     state = {"now": 1000.0}
-    monkeypatch.setattr(runtime.time, "time", lambda: state["now"])
+    monkeypatch.setattr(runtime.message_text.time, "time", lambda: state["now"])
     return state
 
 
 class TestMentionsSearch:
     @pytest.mark.parametrize("record", _SEARCH_RECORDS)
     def test_搜索记录认得出来(self, runtime: Any, record: str) -> None:
-        assert runtime._progress_mentions_search(record) is True
+        assert runtime.outbound_attachments._progress_mentions_search(record) is True
 
     @pytest.mark.parametrize("record", _COMMAND_RECORDS)
     def test_跑命令的记录不算搜索(self, runtime: Any, record: str) -> None:
-        assert runtime._progress_mentions_search(record) is False
+        assert runtime.outbound_attachments._progress_mentions_search(record) is False
 
 
 @pytest.mark.asyncio
@@ -87,7 +87,7 @@ class TestNotice:
         data: dict[str, Any] = {}
         await _notice(runtime, capture, data, at=clock["now"])
 
-        assert capture.sent == [runtime._SEARCH_PROGRESS_FIRST_NOTICE]
+        assert capture.sent == [runtime.common._SEARCH_PROGRESS_FIRST_NOTICE]
 
     async def test_二十秒内不追第二条(self, runtime: Any, capture: _Bot, clock: dict) -> None:
         data: dict[str, Any] = {}
@@ -136,15 +136,15 @@ class TestCurrentStageOnly:
         async def _spy(*_args: Any, **_kwargs: Any) -> None:
             calls.append(1)
 
-        monkeypatch.setattr(runtime, "_maybe_send_search_progress_notice", _spy)
-        monkeypatch.setattr(runtime, "_target_from_platform_data", lambda _data: {"type": "group", "group_id": 1})
+        monkeypatch.setattr(runtime.outbound_attachments, "_maybe_send_search_progress_notice", _spy)
+        monkeypatch.setattr(runtime.queueing, "_target_from_platform_data", lambda _data: {"type": "group", "group_id": 1})
 
         event = SimpleNamespace(message_id=1)
         trigger = SimpleNamespace(
             platform_data={"event": event, "bot": object()},
             conversation_key="qq_group:x",
         )
-        await runtime.TangQiuCallbacks().update_progress(
+        await runtime.callbacks.TangQiuCallbacks().update_progress(
             trigger, SimpleNamespace(progress_records=list(records), stream_parts=[]),
         )
         return bool(calls)

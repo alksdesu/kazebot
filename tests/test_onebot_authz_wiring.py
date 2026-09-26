@@ -20,10 +20,9 @@ _TESTS = Path(__file__).resolve().parent
 if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
-from _onebot_harness import load_runtime, set_live_config  # noqa: E402
+from _onebot_harness import adapter_source, load_runtime, set_live_config  # noqa: E402
 
-_PLUGIN = _ROOT / "adapters" / "onebot" / "onebot_plugin.py"
-_SOURCE = _PLUGIN.read_text(encoding="utf-8")
+_SOURCE = adapter_source()
 _TREE = ast.parse(_SOURCE)
 
 _SEND_CALLS = ("_send_text_and_attachments", "_send_attachments", "_send_forward_nodes")
@@ -123,7 +122,7 @@ def _drawtools_reply(
         return {"id": "cute", "name": "可爱风"}
 
     monkeypatch.setattr(
-        runtime, "_load_drawtools_preset_manager",
+        runtime.commands, "_load_drawtools_preset_manager",
         lambda: (
             lambda: [{"id": "cute", "name": "可爱风", "model": "nai", "scale": 5, "steps": 28}],
             _switch,
@@ -131,7 +130,7 @@ def _drawtools_reply(
         ),
     )
     reply = asyncio.run(
-        runtime._maybe_handle_drawtools_command(
+        runtime.commands._maybe_handle_drawtools_command(
             event=SimpleNamespace(user_id=user_id), user_text=text,
         )
     )

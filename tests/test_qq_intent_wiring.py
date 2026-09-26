@@ -23,7 +23,7 @@ _TESTS = Path(__file__).resolve().parent
 if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
-from _onebot_harness import load_runtime, set_live_config  # noqa: E402
+from _onebot_harness import load_runtime, set_live_config, patch_imported, adapter_source  # noqa: E402
 
 
 class _Sender:
@@ -54,7 +54,7 @@ class _Event:
 @pytest.fixture()
 def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     module = load_runtime(monkeypatch, tmp_path)
-    monkeypatch.setattr(module, "GroupMessageEvent", _Event, raising=False)
+    patch_imported(monkeypatch, module, "GroupMessageEvent", _Event, raising=False)
     set_live_config(
         module,
         allowed_groups=[7],
@@ -78,24 +78,24 @@ def _verdict(runtime: Any, **kwargs: Any):
 class TestWhenTheModelIsAsked:
     def test_the_event_stub_really_carries_text(self, runtime) -> None:
         # 文本提取不出来的话，下面每条 rule 测试都会因为「空消息谁都不命中」而假绿。
-        assert runtime._message_to_text(
+        assert runtime.message_text._message_to_text(
             _Event(runtime, "那这样行吗").get_message(), "900001",
         ) == "那这样行吗"
 
     def test_a_plain_message_reaches_the_rule(self, runtime) -> None:
-        assert asyncio.run(runtime._intent_group_rule(_bot(), _Event(runtime, "那这样行吗"))) is True
+        assert asyncio.run(runtime.permissions._intent_group_rule(_bot(), _Event(runtime, "那这样行吗"))) is True
 
     def test_an_at_mention_never_reaches_the_rule(self, runtime) -> None:
         # 被 @ 是显式信号，p10 已经接走了。再问一次模型是白花一次调用。
         event = _Event(runtime, "在吗")
         event.to_me = True
 
-        assert asyncio.run(runtime._intent_group_rule(_bot(), event)) is False
+        assert asyncio.run(runtime.permissions._intent_group_rule(_bot(), event)) is False
 
     def test_the_switch_gates_the_rule(self, runtime) -> None:
         set_live_config(runtime, llm_intent_enabled=False)
 
-        assert asyncio.run(runtime._intent_group_rule(_bot(), _Event(runtime, "那这样行吗"))) is False
+        assert asyncio.run(runtime.permissions._intent_group_rule(_bot(), _Event(runtime, "那这样行吗"))) is False
 
     def test_the_switch_short_circuits_before_the_text_is_parsed(
         self, runtime, monkeypatch: pytest.MonkeyPatch,
@@ -105,22 +105,22 @@ class TestWhenTheModelIsAsked:
         set_live_config(runtime, llm_intent_enabled=False)
         parsed: list[Any] = []
         monkeypatch.setattr(
-            runtime, "_message_to_text", lambda *a, **k: parsed.append(a) or "",
+            runtime.message_text, "_message_to_text", lambda *a, **k: parsed.append(a) or "",
         )
 
-        asyncio.run(runtime._intent_group_rule(_bot(), _Event(runtime, "那这样行吗")))
+        asyncio.run(runtime.permissions._intent_group_rule(_bot(), _Event(runtime, "那这样行吗")))
 
         assert parsed == []
 
     def test_a_group_outside_the_allowlist_never_reaches_the_rule(self, runtime) -> None:
         assert asyncio.run(
-            runtime._intent_group_rule(_bot(), _Event(runtime, "那这样行吗", group_id=999)),
+            runtime.permissions._intent_group_rule(_bot(), _Event(runtime, "那这样行吗", group_id=999)),
         ) is False
 
     def test_a_keyword_hit_never_reaches_the_rule(self, runtime) -> None:
         set_live_config(runtime, signal_keyword=True, keyword_words=["报错"])
 
-        assert asyncio.run(runtime._intent_group_rule(_bot(), _Event(runtime, "又报错了"))) is False
+        assert asyncio.run(runtime.permissions._intent_group_rule(_bot(), _Event(runtime, "又报错了"))) is False
 
     def test_the_rule_does_not_call_the_model(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
         # rule 里等一次几秒的往返，会把这条消息后面的 matcher 连同群历史记录一起卡住。
@@ -130,8 +130,8 @@ class TestWhenTheModelIsAsked:
             called.append("judged")
             return _verdict(runtime, agreed=True, decided=True)
 
-        monkeypatch.setattr(runtime, "_judge_llm_intent", _judge)
-        asyncio.run(runtime._intent_group_rule(_bot(), _Event(runtime, "那这样行吗")))
+        monkeypatch.setattr(runtime.inbound, "_judge_llm_intent", _judge)
+        asyncio.run(runtime.permissions._intent_group_rule(_bot(), _Event(runtime, "那这样行吗")))
 
         assert called == []
 
@@ -139,16 +139,16 @@ class TestWhenTheModelIsAsked:
         # 冷却期内问完只会把答案丢掉：每条不命中消息白花一次调用，还占满 max_inflight。
         set_live_config(runtime, cooldown_group_sec=60)
         event = _Event(runtime, "那这样行吗")
-        runtime._adapter.trigger_cooldown.record(runtime._trigger_input(event, _bot(), "上一句"))
+        runtime.state._adapter.trigger_cooldown.record(runtime.inbound._trigger_input(event, _bot(), "上一句"))
 
-        assert asyncio.run(runtime._intent_group_rule(_bot(), event)) is False
+        assert asyncio.run(runtime.permissions._intent_group_rule(_bot(), event)) is False
 
     def test_the_rule_still_asks_when_the_window_expires_before_the_answer(self, runtime) -> None:
         set_live_config(runtime, cooldown_group_sec=5, llm_intent_timeout_sec=8)
         event = _Event(runtime, "那这样行吗")
-        runtime._adapter.trigger_cooldown.record(runtime._trigger_input(event, _bot(), "上一句"))
+        runtime.state._adapter.trigger_cooldown.record(runtime.inbound._trigger_input(event, _bot(), "上一句"))
 
-        assert asyncio.run(runtime._intent_group_rule(_bot(), event)) is True
+        assert asyncio.run(runtime.permissions._intent_group_rule(_bot(), event)) is True
 
 
 class TestAfterTheModelAnswers:
@@ -164,10 +164,10 @@ class TestAfterTheModelAnswers:
         async def _record(bot, evt):
             seen["recorded"].append(evt)
 
-        monkeypatch.setattr(runtime, "_judge_llm_intent", _judge)
-        monkeypatch.setattr(runtime, "_process_group_message", _process)
-        monkeypatch.setattr(runtime, "_record_non_trigger_message", _record)
-        asyncio.run(runtime._handle_intent(_bot(), event or _Event(runtime, "那这样行吗")))
+        monkeypatch.setattr(runtime.inbound, "_judge_llm_intent", _judge)
+        monkeypatch.setattr(runtime.handlers, "_process_group_message", _process)
+        monkeypatch.setattr(runtime.handlers, "_record_non_trigger_message", _record)
+        asyncio.run(runtime.handlers._handle_intent(_bot(), event or _Event(runtime, "那这样行吗")))
         return seen
 
     def test_a_yes_runs_the_normal_pipeline(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -193,7 +193,7 @@ class TestAfterTheModelAnswers:
         # 意愿判断这条路必须过冷却，否则「开了意愿判断」等于把冷却整层关掉。
         set_live_config(runtime, cooldown_group_sec=60)
         event = _Event(runtime, "那这样行吗")
-        runtime._adapter.trigger_cooldown.record(runtime._trigger_input(event, _bot(), "上一句"))
+        runtime.state._adapter.trigger_cooldown.record(runtime.inbound._trigger_input(event, _bot(), "上一句"))
 
         seen = self._handle(runtime, monkeypatch, _verdict(runtime, agreed=True, decided=True), event=event)
 
@@ -202,28 +202,28 @@ class TestAfterTheModelAnswers:
 
     def test_a_yes_records_the_cooldown(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
         set_live_config(runtime, cooldown_group_sec=60)
-        runtime._adapter.trigger_cooldown.forget_group(7)
+        runtime.state._adapter.trigger_cooldown.forget_group(7)
 
         self._handle(runtime, monkeypatch, _verdict(runtime, agreed=True, decided=True))
 
         event = _Event(runtime, "再来一句")
-        decision = runtime._group_trigger_decision(event, _bot(), "再来一句")
-        assert runtime._adapter.trigger_cooldown.remaining(
-            runtime._trigger_input(event, _bot(), "再来一句"),
-            runtime.TriggerConfig.from_live(runtime.live),
+        decision = runtime.inbound._group_trigger_decision(event, _bot(), "再来一句")
+        assert runtime.state._adapter.trigger_cooldown.remaining(
+            runtime.inbound._trigger_input(event, _bot(), "再来一句"),
+            runtime.permissions.TriggerConfig.from_live(runtime.state.live),
         )[0] > 0
         assert decision.signal  # 判定链路仍然可用，只是被冷却挡住
 
     def test_a_no_does_not_record_the_cooldown(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
         set_live_config(runtime, cooldown_group_sec=60)
-        runtime._adapter.trigger_cooldown.forget_group(7)
+        runtime.state._adapter.trigger_cooldown.forget_group(7)
 
         self._handle(runtime, monkeypatch, _verdict(runtime, agreed=False, decided=True))
 
         event = _Event(runtime, "再来一句")
-        assert runtime._adapter.trigger_cooldown.remaining(
-            runtime._trigger_input(event, _bot(), "再来一句"),
-            runtime.TriggerConfig.from_live(runtime.live),
+        assert runtime.state._adapter.trigger_cooldown.remaining(
+            runtime.inbound._trigger_input(event, _bot(), "再来一句"),
+            runtime.permissions.TriggerConfig.from_live(runtime.state.live),
         )[0] == 0
 
 
@@ -236,10 +236,10 @@ class TestWhatIsSentToTheModel:
             return _verdict(runtime, agreed=False, decided=True)
 
         monkeypatch.setattr(
-            runtime._adapter, "client", SimpleNamespace(judge_reply_intent=_judge_reply_intent), raising=False,
+            runtime.state._adapter, "client", SimpleNamespace(judge_reply_intent=_judge_reply_intent), raising=False,
         )
         event = _Event(runtime, overrides.pop("text", "那这样行吗"))
-        asyncio.run(runtime._judge_llm_intent(_bot(), event, "那这样行吗"))
+        asyncio.run(runtime.inbound._judge_llm_intent(_bot(), event, "那这样行吗"))
         return captured
 
     def test_the_real_group_number_is_never_sent(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -272,7 +272,7 @@ class TestWhatIsSentToTheModel:
     def test_the_context_window_is_capped_by_the_live_key(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
         set_live_config(runtime, llm_intent_context_messages=2)
         for index in range(5):
-            runtime._append_group_history(7, f"[12:0{index}] 某人(user_a1): 第{index}句")
+            runtime.history._append_group_history(7, f"[12:0{index}] 某人(user_a1): 第{index}句")
 
         sent = self._sent(runtime, monkeypatch)
 
@@ -281,16 +281,16 @@ class TestWhatIsSentToTheModel:
 
     def test_zero_context_sends_only_the_current_line(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
         set_live_config(runtime, llm_intent_context_messages=0)
-        runtime._append_group_history(7, "[12:00] 某人(user_a1): 在吗")
+        runtime.history._append_group_history(7, "[12:00] 某人(user_a1): 在吗")
 
         sent = self._sent(runtime, monkeypatch)
 
         assert sent["context_lines"] == []
 
     def test_a_missing_client_answers_undecided(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(runtime._adapter, "client", None, raising=False)
+        monkeypatch.setattr(runtime.state._adapter, "client", None, raising=False)
 
-        verdict = asyncio.run(runtime._judge_llm_intent(_bot(), _Event(runtime, "在吗"), "在吗"))
+        verdict = asyncio.run(runtime.inbound._judge_llm_intent(_bot(), _Event(runtime, "在吗"), "在吗"))
 
         assert verdict.agreed is False
         assert verdict.decided is False
@@ -311,7 +311,7 @@ class TestTheDiceIsRolledOncePerMessage:
     def test_the_same_message_always_gets_the_same_roll(self, runtime) -> None:
         event = _Event(runtime, "随便聊聊")
 
-        rolls = {runtime._trigger_input(event, _bot(), "随便聊聊").roll for _ in range(20)}
+        rolls = {runtime.inbound._trigger_input(event, _bot(), "随便聊聊").roll for _ in range(20)}
 
         assert len(rolls) == 1
 
@@ -324,14 +324,14 @@ class TestTheDiceIsRolledOncePerMessage:
 
         for index in range(200):
             event = self._event(runtime, index)
-            took = asyncio.run(runtime._agent_group_rule(_bot(), event))
-            asked = asyncio.run(runtime._intent_group_rule(_bot(), event))
+            took = asyncio.run(runtime.permissions._agent_group_rule(_bot(), event))
+            asked = asyncio.run(runtime.permissions._intent_group_rule(_bot(), event))
 
             assert took != asked, f"message {index}: agent={took} intent={asked}"
 
     def test_different_messages_get_different_rolls(self, runtime) -> None:
         # 全常量的骰子会让「恰好一条路接手」假绿：两条路的分工照样成立，但概率没了。
-        rolls = [runtime._trigger_roll(self._event(runtime, index)) for index in range(500)]
+        rolls = [runtime.inbound._trigger_roll(self._event(runtime, index)) for index in range(500)]
 
         hit_rate = len([roll for roll in rolls if roll < 0.5]) / len(rolls)
         assert 0.3 < hit_rate < 0.7
@@ -342,18 +342,18 @@ class TestTheDiceIsRolledOncePerMessage:
         first = _Event(runtime, "随便聊聊", user_id=10001)
         second = _Event(runtime, "随便聊聊", user_id=10002)
 
-        assert runtime._trigger_roll(first) != runtime._trigger_roll(second)
+        assert runtime.inbound._trigger_roll(first) != runtime.inbound._trigger_roll(second)
 
     def test_the_salt_keeps_the_dice_unpredictable(
         self, runtime, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # 盐是常量的话，外人能按 message_id 算出哪条消息会触发随机插话。
         event = _Event(runtime, "随便聊聊")
-        before = runtime._trigger_roll(event)
+        before = runtime.inbound._trigger_roll(event)
 
-        monkeypatch.setattr(runtime, "_TRIGGER_ROLL_SALT", b"\x00" * 16)
+        monkeypatch.setattr(runtime.inbound, "_TRIGGER_ROLL_SALT", b"\x00" * 16)
 
-        assert runtime._trigger_roll(event) != before
+        assert runtime.inbound._trigger_roll(event) != before
 
 
 class TestOneMessageIsJudgedOnce:
@@ -361,32 +361,32 @@ class TestOneMessageIsJudgedOnce:
         self, runtime, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         judged: list[str] = []
-        original = runtime._group_trigger_decision
+        original = runtime.inbound._group_trigger_decision
 
         def _decide(event: Any, bot: Any, text: str):
             judged.append(text)
             return original(event, bot, text)
 
-        monkeypatch.setattr(runtime, "_group_trigger_decision", _decide)
+        monkeypatch.setattr(runtime.inbound, "_group_trigger_decision", _decide)
         event = _Event(runtime, "那这样行吗")
 
-        assert asyncio.run(runtime._agent_group_rule(_bot(), event)) is False
-        assert asyncio.run(runtime._intent_group_rule(_bot(), event)) is True
+        assert asyncio.run(runtime.permissions._agent_group_rule(_bot(), event)) is False
+        assert asyncio.run(runtime.permissions._intent_group_rule(_bot(), event)) is True
         assert judged == ["那这样行吗"]
 
     def test_the_cache_does_not_grow_without_bound(self, runtime) -> None:
-        for index in range(runtime._TRIGGER_DECISION_CACHE_MAX + 50):
+        for index in range(runtime.inbound._TRIGGER_DECISION_CACHE_MAX + 50):
             event = _Event(runtime, "随便聊聊")
             event.message_id = f"m-{index}"
-            asyncio.run(runtime._intent_group_rule(_bot(), event))
+            asyncio.run(runtime.permissions._intent_group_rule(_bot(), event))
 
-        assert len(runtime._adapter.trigger_decisions) == runtime._TRIGGER_DECISION_CACHE_MAX
+        assert len(runtime.state._adapter.trigger_decisions) == runtime.inbound._TRIGGER_DECISION_CACHE_MAX
 
 
 class TestTheMatcherTopology:
     def _matcher_calls(self) -> dict[str, dict[str, Any]]:
         """从源码里读回每个 matcher 的注册参数。运行期 stub 把它们吃掉了。"""
-        tree = ast.parse((_ROOT / "adapters/onebot/onebot_plugin.py").read_text(encoding="utf-8"))
+        tree = ast.parse(adapter_source())
         found: dict[str, dict[str, Any]] = {}
         for node in ast.walk(tree):
             if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):

@@ -21,7 +21,7 @@ _TESTS = Path(__file__).resolve().parent
 if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
-from _onebot_harness import load_live_config, write_live_config  # noqa: E402
+from _onebot_harness import load_live_config, write_live_config, adapter_source  # noqa: E402
 
 _ADAPTER_ROOT = _ROOT / "adapters" / "onebot"
 _ALL_QQ_ENV = (
@@ -885,7 +885,7 @@ class TestNoStaleConstantsLeftBehind:
         assert sorted(defined & set(self._MIGRATED)) == []
 
     def test_the_plugin_no_longer_imports_them(self) -> None:
-        tree = ast.parse((_ADAPTER_ROOT / "onebot_plugin.py").read_text(encoding="utf-8"))
+        tree = ast.parse(adapter_source())
         imported = {
             alias.name
             for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
@@ -902,14 +902,13 @@ class TestNoStaleConstantsLeftBehind:
 class TestTheAdapterImportsOnlyWhatItUses:
     """未使用的 import 会让读代码的人以为某条通路还接着。"""
 
-    # 看着没用但有消费方，删了就红：
-    _RE_EXPORTED = {
-        # tests/test_onebot_send_contract.py 通过 runtime 模块属性拿它。
-        "OneBotAmbiguousAckError",
-    }
+    # 看着没用但有消费方的导入名登记在这里，删了就红。
+    _RE_EXPORTED: frozenset[str] = frozenset()
 
-    def test_no_module_level_import_is_unused(self) -> None:
-        tree = ast.parse((_ADAPTER_ROOT / "onebot_plugin.py").read_text(encoding="utf-8"))
+    @pytest.mark.parametrize("path", sorted((_ADAPTER_ROOT / "napcat").glob("*.py")), ids=lambda p: p.stem)
+    def test_no_module_level_import_is_unused(self, path: Path) -> None:
+        # 逐个模块查：入口 onebot_plugin 的职责就是加载本体各模块，不在此列。
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         bound = set()
         for node in tree.body:
             if isinstance(node, ast.Import):

@@ -56,11 +56,11 @@ class SplitBot:
 @pytest.fixture()
 def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     module = load_runtime(monkeypatch, tmp_path)
-    assert not module._adapter.features.available
-    assert Path(module._adapter.outbound_idempotency.path).is_relative_to(tmp_path)
+    assert not module.state._adapter.features.available
+    assert Path(module.state._adapter.outbound_idempotency.path).is_relative_to(tmp_path)
     set_live_config(module, reply_to_trigger=True)
     yield module
-    module._adapter.outbound_idempotency.close()
+    module.state._adapter.outbound_idempotency.close()
 
 
 def _event(kind: str) -> SimpleNamespace:
@@ -83,7 +83,7 @@ def _target(kind: str) -> dict[str, Any]:
 
 
 def _context(runtime: Any, target: dict[str, Any]) -> Any:
-    return runtime.OutboundSendContext(
+    return runtime.state.OutboundSendContext(
         event_id="split-reply", idempotency_key="delivery:split-reply",
         source_inbound_seq=INBOUND_SEQ, conversation_key=target["conversation_key"],
         reply_message_id=str(MESSAGE_ID),
@@ -112,44 +112,44 @@ def test_every_inbound_injects_one_shared_split_prompt(runtime: Any, entry: str)
 
     async def build() -> str:
         if entry.startswith("draw_"):
-            return await runtime._build_draw_direct_inbound_text(event, "画一片云", kind == "private")
+            return await runtime.inbound._build_draw_direct_inbound_text(event, "画一片云", kind == "private")
         if kind == "group":
-            text, _ = await runtime._build_inbound_text(
+            text, _ = await runtime.inbound._build_inbound_text(
                 event, SplitBot(), "在吗", target["conversation_key"], [],
             )
             return text
-        return await runtime._build_private_inbound_text(
+        return await runtime.inbound._build_private_inbound_text(
             event, SplitBot(), "在吗", target["conversation_key"], [],
         )
 
     text = asyncio.run(build())
-    block = runtime._reply_format_prompt_block()
+    block = runtime.emotes._reply_format_prompt_block()
     assert text.count(block) == 1
     assert text.count("【QQ回复分条】") == 1
-    assert runtime._SPLIT_SIGNAL in block
+    assert runtime.common._SPLIT_SIGNAL in block
 
 
 def test_split_prompt_preserves_single_reply_and_formatted_content(runtime: Any) -> None:
-    block = runtime._reply_format_prompt_block()
+    block = runtime.emotes._reply_format_prompt_block()
     for required in (
         "普通换行", "一个消息气泡", "finish.text", "reply.text", "标记不会显示",
         "通常一条", "2–3 条", "不要逐句刷屏", "代码、列表、引用", "保留普通换行",
         "简短接话", "只回一句", "只发一条",
     ):
         assert required in block
-    assert f"不使用 {runtime._SPLIT_SIGNAL}" in block
+    assert f"不使用 {runtime.common._SPLIT_SIGNAL}" in block
 
 
 def test_prompt_and_sender_use_the_same_split_signal(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     signal = "[QQ_TEST_SPLIT]"
-    monkeypatch.setattr(runtime, "_SPLIT_SIGNAL", signal)
-    block = runtime._reply_format_prompt_block()
+    monkeypatch.setattr(runtime.common, "_SPLIT_SIGNAL", signal)
+    block = runtime.emotes._reply_format_prompt_block()
     assert signal in block
     assert "[SPLIT]" not in block
     bot = SplitBot()
     target = _target("private")
 
-    asyncio.run(runtime._send_split_text(
+    asyncio.run(runtime.sending._send_split_text(
         bot, target, f"收到{signal}我看看", send_context=_context(runtime, target),
     ))
 
@@ -174,7 +174,7 @@ def test_sender_splits_only_explicit_markers(runtime: Any, kind: str, text: str,
     bot = SplitBot()
     target = _target(kind)
 
-    sent = asyncio.run(runtime._send_split_text(
+    sent = asyncio.run(runtime.sending._send_split_text(
         bot, target, text, send_context=_context(runtime, target),
     ))
 
@@ -192,7 +192,7 @@ def test_only_first_nonempty_part_can_quote_trigger(runtime: Any, kind: str, ena
     bot = SplitBot()
     target = _target(kind)
 
-    asyncio.run(runtime._send_split_text(
+    asyncio.run(runtime.sending._send_split_text(
         bot, target, "[SPLIT] \n [SPLIT]第一句[SPLIT]第二句",
         send_context=_context(runtime, target),
     ))
@@ -204,12 +204,12 @@ def test_only_first_nonempty_part_can_quote_trigger(runtime: Any, kind: str, ena
 async def _deliver(runtime: Any, bot: SplitBot, kind: str, callback: str, text: str) -> None:
     target = _target(kind)
     context = _context(runtime, target)
-    callbacks = runtime.TangQiuCallbacks()
+    callbacks = runtime.callbacks.TangQiuCallbacks()
     if callback == "send_to_channel":
-        runtime._adapter.last_bot = bot
+        runtime.state._adapter.last_bot = bot
         await callbacks.send_to_channel(target["conversation_key"], text, [], delivery_context=context)
         return
-    trigger = runtime.TriggerInfo(
+    trigger = runtime.queueing.TriggerInfo(
         INBOUND_SEQ, target["conversation_key"], "split-session", kind == "private",
         platform_data={**target, "bot": bot, "event": _event(kind)},
     )
@@ -245,14 +245,14 @@ def test_callbacks_preserve_split_and_deduplicate_delivery(
 def test_retry_sends_only_failed_part_and_final_waiter_tracks_completion(
     runtime: Any, kind: str, callback: str,
 ) -> None:
-    failure = runtime.classify_send_exception(RuntimeError("ENOENT: no such file or directory"))
+    failure = runtime.sending.classify_send_exception(RuntimeError("ENOENT: no such file or directory"))
     assert failure.definitely_not_sent
     bot = SplitBot(failure)
     target = _target(kind)
-    waiter = runtime.QueueReplyWaiter(asyncio.Event(), INBOUND_SEQ)
-    other_waiter = runtime.QueueReplyWaiter(asyncio.Event(), INBOUND_SEQ + 1)
-    runtime._adapter.qq_waiting_replies[target["conversation_key"]] = waiter
-    runtime._adapter.qq_waiting_replies["unrelated-session"] = other_waiter
+    waiter = runtime.models.QueueReplyWaiter(asyncio.Event(), INBOUND_SEQ)
+    other_waiter = runtime.models.QueueReplyWaiter(asyncio.Event(), INBOUND_SEQ + 1)
+    runtime.state._adapter.qq_waiting_replies[target["conversation_key"]] = waiter
+    runtime.state._adapter.qq_waiting_replies["unrelated-session"] = other_waiter
 
     async def exercise() -> None:
         with pytest.raises(type(failure), match="ENOENT"):
@@ -260,7 +260,7 @@ def test_retry_sends_only_failed_part_and_final_waiter_tracks_completion(
         assert _texts(bot.sent) == ["第一句"]
         assert _texts(bot.attempts) == ["第一句", "第二句"]
         assert not waiter.event.is_set()
-        assert INBOUND_SEQ not in runtime._adapter.qq_completed_replies
+        assert INBOUND_SEQ not in runtime.state._adapter.qq_completed_replies
 
         await _deliver(runtime, bot, kind, callback, "第一句[SPLIT]第二句")
         assert _texts(bot.sent) == ["第一句", "第二句"]

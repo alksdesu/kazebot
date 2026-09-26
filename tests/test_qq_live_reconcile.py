@@ -23,7 +23,7 @@ _TESTS = Path(__file__).resolve().parent
 if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
-from _onebot_harness import load_runtime, set_live_config  # noqa: E402
+from _onebot_harness import load_runtime, set_live_config, adapter_source  # noqa: E402
 
 _ADAPTER = _ROOT / "adapters" / "onebot"
 
@@ -40,34 +40,34 @@ def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 class TestGroupHistoryCapacity:
     def _seed(self, runtime: Any, group_id: int, count: int) -> None:
         for index in range(count):
-            runtime._append_group_history(group_id, f"line-{index}")
+            runtime.history._append_group_history(group_id, f"line-{index}")
 
     def test_growing_the_cap_rebuilds_the_deque(self, runtime: Any) -> None:
         self._seed(runtime, 1, 5)
-        assert runtime._adapter.group_history[1].maxlen == 20
+        assert runtime.state._adapter.group_history[1].maxlen == 20
 
         set_live_config(runtime, group_history_max=50)
-        assert runtime._reconcile_group_history_capacity() is True
+        assert runtime.lifecycle._reconcile_group_history_capacity() is True
 
-        assert runtime._adapter.group_history[1].maxlen == 50
+        assert runtime.state._adapter.group_history[1].maxlen == 50
 
     def test_growing_keeps_every_cached_line(self, runtime: Any) -> None:
         self._seed(runtime, 1, 5)
-        before = [entry.text for entry in runtime._adapter.group_history[1]]
+        before = [entry.text for entry in runtime.state._adapter.group_history[1]]
 
         set_live_config(runtime, group_history_max=50)
-        runtime._reconcile_group_history_capacity()
+        runtime.lifecycle._reconcile_group_history_capacity()
 
-        assert [entry.text for entry in runtime._adapter.group_history[1]] == before
+        assert [entry.text for entry in runtime.state._adapter.group_history[1]] == before
 
     def test_shrinking_drops_the_oldest_lines(self, runtime: Any) -> None:
         self._seed(runtime, 1, 10)
 
         set_live_config(runtime, group_history_max=3)
-        runtime._reconcile_group_history_capacity()
+        runtime.lifecycle._reconcile_group_history_capacity()
 
-        assert [entry.text for entry in runtime._adapter.group_history[1]] == ["line-7", "line-8", "line-9"]
-        assert runtime._adapter.group_history[1].maxlen == 3
+        assert [entry.text for entry in runtime.state._adapter.group_history[1]] == ["line-7", "line-8", "line-9"]
+        assert runtime.state._adapter.group_history[1].maxlen == 3
 
     def test_shrinking_never_replays_history_the_engine_already_saw(self, runtime: Any) -> None:
         """序号水位和缓存是两份状态，重建 deque 不能把水位一起丢掉。
@@ -76,50 +76,50 @@ class TestGroupHistoryCapacity:
         durable history 里就多出一份重复。
         """
         self._seed(runtime, 1, 10)
-        runtime._adapter.session_state = _StubSessionState()
-        runtime._adapter.session_state.advance_watermark(1, 6)
+        runtime.state._adapter.session_state = _StubSessionState()
+        runtime.state._adapter.session_state.advance_watermark(1, 6)
 
         set_live_config(runtime, group_history_max=3)
-        runtime._reconcile_group_history_capacity()
+        runtime.lifecycle._reconcile_group_history_capacity()
 
-        assert runtime._adapter.group_history_seq[1] == 10
-        assert runtime._group_history_watermark(1) == 6
-        fresh = [e.text for e in runtime._adapter.group_history[1] if e.seq > 6]
+        assert runtime.state._adapter.group_history_seq[1] == 10
+        assert runtime.history._group_history_watermark(1) == 6
+        fresh = [e.text for e in runtime.state._adapter.group_history[1] if e.seq > 6]
         assert fresh == ["line-7", "line-8", "line-9"]
 
     def test_the_content_record_cache_keeps_a_floor_of_twenty(self, runtime: Any) -> None:
         """转发挑选要看更长的上文，比群历史条数低时也不能跌破 20。"""
-        runtime._adapter.group_content_records[1].append(object())
+        runtime.state._adapter.group_content_records[1].append(object())
 
         set_live_config(runtime, group_history_max=3)
-        runtime._reconcile_group_history_capacity()
+        runtime.lifecycle._reconcile_group_history_capacity()
 
-        assert runtime._adapter.group_content_records[1].maxlen == 20
+        assert runtime.state._adapter.group_content_records[1].maxlen == 20
 
     def test_an_unchanged_cap_is_a_no_op(self, runtime: Any) -> None:
         self._seed(runtime, 1, 5)
-        before = runtime._adapter.group_history[1]
+        before = runtime.state._adapter.group_history[1]
 
-        assert runtime._reconcile_group_history_capacity() is False
-        assert runtime._adapter.group_history[1] is before
+        assert runtime.lifecycle._reconcile_group_history_capacity() is False
+        assert runtime.state._adapter.group_history[1] is before
 
     def test_a_group_seen_after_the_change_needs_no_reconcile(self, runtime: Any) -> None:
         """defaultdict 的工厂每次都读当前配置，新群自动是新容量。"""
         set_live_config(runtime, group_history_max=7)
 
-        runtime._append_group_history(99, "hi")
+        runtime.history._append_group_history(99, "hi")
 
-        assert runtime._adapter.group_history[99].maxlen == 7
+        assert runtime.state._adapter.group_history[99].maxlen == 7
 
     def test_every_group_is_rebuilt_not_just_the_first(self, runtime: Any) -> None:
         self._seed(runtime, 1, 3)
         self._seed(runtime, 2, 3)
 
         set_live_config(runtime, group_history_max=4)
-        runtime._reconcile_group_history_capacity()
+        runtime.lifecycle._reconcile_group_history_capacity()
 
-        assert runtime._adapter.group_history[1].maxlen == 4
-        assert runtime._adapter.group_history[2].maxlen == 4
+        assert runtime.state._adapter.group_history[1].maxlen == 4
+        assert runtime.state._adapter.group_history[2].maxlen == 4
 
 
 class _StubSessionState:
@@ -140,7 +140,7 @@ class _StubSessionState:
 # ── 队列 worker ───────────────────────────────────
 
 def _queued(runtime: Any, key: str) -> Any:
-    return runtime.QueuedInbound(
+    return runtime.models.QueuedInbound(
         matcher=None, bot=None, event=None, channel="qq_group",
         real_conversation_key=f"qq_group:{key}", stable_conversation_key=key,
         text="hi", attachments=[], is_dm=False, platform_updates={}, user_text="hi",
@@ -155,7 +155,7 @@ class TestQueueWorkers:
             done.append(kwargs["stable_conversation_key"])
             return True
 
-        monkeypatch.setattr(runtime, "_submit_or_preempt_inbound", submit)
+        monkeypatch.setattr(runtime.queueing, "_submit_or_preempt_inbound", submit)
         return done
 
     def test_enabling_the_queue_starts_the_declared_number_of_workers(
@@ -165,17 +165,17 @@ class TestQueueWorkers:
         set_live_config(runtime, enable_queue=True, queue_workers=3, queue_interval=0)
 
         async def exercise() -> None:
-            assert await runtime._reconcile_queue_workers() is True
+            assert await runtime.lifecycle._reconcile_queue_workers() is True
             await asyncio.sleep(0)
-            assert sorted(runtime._adapter.qq_queue_tasks) == [0, 1, 2]
+            assert sorted(runtime.state._adapter.qq_queue_tasks) == [0, 1, 2]
             await _stop_workers(runtime)
 
         asyncio.run(exercise())
 
     def test_a_disabled_queue_starts_nothing(self, runtime: Any) -> None:
         async def exercise() -> None:
-            assert await runtime._reconcile_queue_workers() is False
-            assert runtime._adapter.qq_queue_tasks == {}
+            assert await runtime.lifecycle._reconcile_queue_workers() is False
+            assert runtime.state._adapter.qq_queue_tasks == {}
 
         asyncio.run(exercise())
 
@@ -184,10 +184,10 @@ class TestQueueWorkers:
         set_live_config(runtime, enable_queue=True, queue_workers=2, queue_interval=0)
 
         async def exercise() -> None:
-            await runtime._reconcile_queue_workers()
+            await runtime.lifecycle._reconcile_queue_workers()
             await asyncio.sleep(0)
 
-            assert await runtime._reconcile_queue_workers() is False
+            assert await runtime.lifecycle._reconcile_queue_workers() is False
             await _stop_workers(runtime)
 
         asyncio.run(exercise())
@@ -199,17 +199,17 @@ class TestQueueWorkers:
         set_live_config(runtime, enable_queue=True, queue_workers=2, queue_interval=0)
 
         async def exercise() -> None:
-            await runtime._reconcile_queue_workers()
+            await runtime.lifecycle._reconcile_queue_workers()
             await asyncio.sleep(0)
-            kept = dict(runtime._adapter.qq_queue_tasks)
+            kept = dict(runtime.state._adapter.qq_queue_tasks)
 
             set_live_config(runtime, queue_workers=4)
-            await runtime._reconcile_queue_workers()
+            await runtime.lifecycle._reconcile_queue_workers()
             await asyncio.sleep(0)
 
-            assert sorted(runtime._adapter.qq_queue_tasks) == [0, 1, 2, 3]
-            assert runtime._adapter.qq_queue_tasks[0] is kept[0]
-            assert runtime._adapter.qq_queue_tasks[1] is kept[1]
+            assert sorted(runtime.state._adapter.qq_queue_tasks) == [0, 1, 2, 3]
+            assert runtime.state._adapter.qq_queue_tasks[0] is kept[0]
+            assert runtime.state._adapter.qq_queue_tasks[1] is kept[1]
             await _stop_workers(runtime)
 
         asyncio.run(exercise())
@@ -221,15 +221,15 @@ class TestQueueWorkers:
         set_live_config(runtime, enable_queue=True, queue_workers=4, queue_interval=0)
 
         async def exercise() -> None:
-            await runtime._reconcile_queue_workers()
+            await runtime.lifecycle._reconcile_queue_workers()
             await asyncio.sleep(0)
 
             set_live_config(runtime, queue_workers=1)
-            await runtime._reconcile_queue_workers()
+            await runtime.lifecycle._reconcile_queue_workers()
             await _settle()
 
-            assert await runtime._reconcile_queue_workers() is False
-            assert sorted(runtime._adapter.qq_queue_tasks) == [0]
+            assert await runtime.lifecycle._reconcile_queue_workers() is False
+            assert sorted(runtime.state._adapter.qq_queue_tasks) == [0]
             await _stop_workers(runtime)
 
         asyncio.run(exercise())
@@ -248,16 +248,16 @@ class TestQueueWorkers:
             finished.append(kwargs["stable_conversation_key"])
             return True
 
-        monkeypatch.setattr(runtime, "_submit_or_preempt_inbound", submit)
+        monkeypatch.setattr(runtime.queueing, "_submit_or_preempt_inbound", submit)
         set_live_config(runtime, enable_queue=True, queue_workers=2, queue_interval=0)
 
         async def exercise() -> None:
-            await runtime._reconcile_queue_workers()
-            await runtime._enqueue_or_submit_inbound(_queued(runtime, "conv-a"))
+            await runtime.lifecycle._reconcile_queue_workers()
+            await runtime.queueing._enqueue_or_submit_inbound(_queued(runtime, "conv-a"))
             await started.wait()
 
             set_live_config(runtime, enable_queue=False)
-            await runtime._reconcile_queue_workers()
+            await runtime.lifecycle._reconcile_queue_workers()
             release.set()
             await _settle()
 
@@ -274,19 +274,19 @@ class TestQueueWorkers:
         set_live_config(runtime, enable_queue=True, queue_workers=1, queue_interval=0)
 
         async def exercise() -> None:
-            await runtime._reconcile_queue_workers()
+            await runtime.lifecycle._reconcile_queue_workers()
             for key in ("conv-a", "conv-b", "conv-c"):
-                await runtime._enqueue_or_submit_inbound(_queued(runtime, key))
+                await runtime.queueing._enqueue_or_submit_inbound(_queued(runtime, key))
 
             set_live_config(runtime, enable_queue=False)
-            await runtime._reconcile_queue_workers()
+            await runtime.lifecycle._reconcile_queue_workers()
             await _settle()
 
             assert sorted(done) == ["conv-a", "conv-b", "conv-c"]
-            assert list(runtime._adapter.qq_queue) == []
+            assert list(runtime.state._adapter.qq_queue) == []
             # 退出后的 task 留在字典里到下一个 tick 才被摘掉，摘干净也是 reconcile 的活。
-            await runtime._reconcile_queue_workers()
-            assert runtime._adapter.qq_queue_tasks == {}
+            await runtime.lifecycle._reconcile_queue_workers()
+            assert runtime.state._adapter.qq_queue_tasks == {}
 
         asyncio.run(exercise())
 
@@ -298,22 +298,22 @@ class TestQueueWorkers:
         set_live_config(runtime, enable_queue=True, queue_workers=3, queue_interval=0)
 
         async def exercise() -> None:
-            await runtime._reconcile_queue_workers()
+            await runtime.lifecycle._reconcile_queue_workers()
             await asyncio.sleep(0)
-            runtime._adapter.qq_queue_tasks[1].cancel()
+            runtime.state._adapter.qq_queue_tasks[1].cancel()
             await _settle()
 
-            await runtime._reconcile_queue_workers()
+            await runtime.lifecycle._reconcile_queue_workers()
             await asyncio.sleep(0)
 
-            assert sorted(runtime._adapter.qq_queue_tasks) == [0, 1, 2]
+            assert sorted(runtime.state._adapter.qq_queue_tasks) == [0, 1, 2]
             await _stop_workers(runtime)
 
         asyncio.run(exercise())
 
     def test_a_worker_reads_its_exit_decision_from_the_live_value(self) -> None:
         """退出判定不能读钉住的快照：这个 task 活得比任何一条消息都长。"""
-        source = (_ADAPTER / "onebot_plugin.py").read_text(encoding="utf-8")
+        source = adapter_source()
         function = next(
             node for node in ast.walk(ast.parse(source))
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_qq_queue_worker_forever"
@@ -334,12 +334,12 @@ async def _settle(rounds: int = 12) -> None:
 
 
 async def _stop_workers(runtime: Any) -> None:
-    for task in runtime._adapter.qq_queue_tasks.values():
+    for task in runtime.state._adapter.qq_queue_tasks.values():
         task.cancel()
-    for task in runtime._adapter.qq_queue_tasks.values():
+    for task in runtime.state._adapter.qq_queue_tasks.values():
         with contextlib.suppress(asyncio.CancelledError):
             await task
-    runtime._adapter.qq_queue_tasks.clear()
+    runtime.state._adapter.qq_queue_tasks.clear()
 
 
 # ── 转发 Bridge ───────────────────────────────────
@@ -350,73 +350,73 @@ class TestForwardBridge:
 
         async def start() -> None:
             calls.append("start")
-            runtime._adapter.forward_bridge_started = True
+            runtime.state._adapter.forward_bridge_started = True
 
         async def stop() -> None:
             calls.append("stop")
-            runtime._adapter.forward_bridge_started = False
+            runtime.state._adapter.forward_bridge_started = False
 
-        monkeypatch.setattr(runtime, "_start_forward_bridge", start)
-        monkeypatch.setattr(runtime, "_stop_forward_bridge", stop)
+        monkeypatch.setattr(runtime.forward_bridge, "_start_forward_bridge", start)
+        monkeypatch.setattr(runtime.forward_bridge, "_stop_forward_bridge", stop)
         return calls
 
     def test_enabling_starts_the_server(self, runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         calls = self._spy(runtime, monkeypatch)
         set_live_config(runtime, enable_forward_bridge=True)
 
-        assert asyncio.run(runtime._reconcile_forward_bridge()) is True
+        assert asyncio.run(runtime.lifecycle._reconcile_forward_bridge()) is True
         assert calls == ["start"]
 
     def test_disabling_stops_a_running_server(self, runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         calls = self._spy(runtime, monkeypatch)
-        runtime._adapter.forward_bridge_started = True
+        runtime.state._adapter.forward_bridge_started = True
         set_live_config(runtime, enable_forward_bridge=False)
 
-        assert asyncio.run(runtime._reconcile_forward_bridge()) is True
+        assert asyncio.run(runtime.lifecycle._reconcile_forward_bridge()) is True
         assert calls == ["stop"]
 
     def test_an_already_running_server_is_left_alone(self, runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         calls = self._spy(runtime, monkeypatch)
-        runtime._adapter.forward_bridge_started = True
+        runtime.state._adapter.forward_bridge_started = True
         set_live_config(runtime, enable_forward_bridge=True)
 
-        assert asyncio.run(runtime._reconcile_forward_bridge()) is False
+        assert asyncio.run(runtime.lifecycle._reconcile_forward_bridge()) is False
         assert calls == []
 
     def test_a_stopped_server_stays_stopped(self, runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         calls = self._spy(runtime, monkeypatch)
         set_live_config(runtime, enable_forward_bridge=False)
 
-        assert asyncio.run(runtime._reconcile_forward_bridge()) is False
+        assert asyncio.run(runtime.lifecycle._reconcile_forward_bridge()) is False
         assert calls == []
 
     def test_the_starter_itself_still_honours_the_flag(self, runtime: Any) -> None:
         set_live_config(runtime, enable_forward_bridge=False)
 
-        asyncio.run(runtime._start_forward_bridge())
+        asyncio.run(runtime.forward_bridge._start_forward_bridge())
 
-        assert runtime._adapter.forward_bridge_started is False
+        assert runtime.state._adapter.forward_bridge_started is False
 
 
 # ── 生效快照公布 ───────────────────────────────────
 
 class TestPublishedState:
     def _read(self, runtime: Any) -> dict[str, Any]:
-        return json.loads(runtime._live_state_file().read_text(encoding="utf-8"))
+        return json.loads(runtime.lifecycle._live_state_file().read_text(encoding="utf-8"))
 
     def test_it_writes_the_effective_values(self, runtime: Any) -> None:
         set_live_config(runtime, allowed_groups=[111], enable_reactions=False)
 
-        runtime._publish_live_state(force=True)
+        runtime.lifecycle._publish_live_state(force=True)
 
         state = self._read(runtime)
         assert state["values"]["allowed_groups"] == [111]
         assert state["values"]["enable_reactions"] is False
 
     def test_it_reports_runtime_facts_the_file_cannot_tell(self, runtime: Any) -> None:
-        runtime._append_group_history(1, "hi")
+        runtime.history._append_group_history(1, "hi")
 
-        runtime._publish_live_state(force=True)
+        runtime.lifecycle._publish_live_state(force=True)
 
         runtime_facts = self._read(runtime)["runtime"]
         assert runtime_facts["queue_workers_running"] == 0
@@ -425,7 +425,7 @@ class TestPublishedState:
         assert runtime_facts["volatile"]["cached_groups"] == 1
 
     def test_it_stamps_when_it_was_published(self, runtime: Any) -> None:
-        runtime._publish_live_state(force=True)
+        runtime.lifecycle._publish_live_state(force=True)
 
         assert self._read(runtime)["published_at"] > 0
 
@@ -436,22 +436,22 @@ class TestPublishedState:
         写盘看起来完全一样，这类断言会时红时绿。
         """
         writes: list[Any] = []
-        real_replace = runtime.os.replace
+        real_replace = runtime.models.os.replace
 
         def spy(src: Any, dst: Any) -> Any:
             writes.append(dst)
             return real_replace(src, dst)
 
-        monkeypatch.setattr(runtime.os, "replace", spy)
+        monkeypatch.setattr(runtime.models.os, "replace", spy)
         return writes
 
     def test_an_unchanged_snapshot_is_not_rewritten(
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        runtime._publish_live_state(force=True)
+        runtime.lifecycle._publish_live_state(force=True)
         writes = self._count_writes(runtime, monkeypatch)
 
-        runtime._publish_live_state()
+        runtime.lifecycle._publish_live_state()
 
         assert writes == []
 
@@ -459,21 +459,21 @@ class TestPublishedState:
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """队列长度每时每刻都在动，拿它当写盘条件等于每个 tick 都写一次。"""
-        runtime._append_group_history(7, "hi")
-        runtime._publish_live_state(force=True)
+        runtime.history._append_group_history(7, "hi")
+        runtime.lifecycle._publish_live_state(force=True)
         writes = self._count_writes(runtime, monkeypatch)
 
-        runtime._adapter.qq_queue.append(_queued(runtime, "conv-a"))
-        runtime._append_group_history(7, "again")
-        runtime._publish_live_state()
+        runtime.state._adapter.qq_queue.append(_queued(runtime, "conv-a"))
+        runtime.history._append_group_history(7, "again")
+        runtime.lifecycle._publish_live_state()
 
         assert writes == []
 
     def test_a_config_change_triggers_a_rewrite(self, runtime: Any) -> None:
-        runtime._publish_live_state(force=True)
+        runtime.lifecycle._publish_live_state(force=True)
 
         set_live_config(runtime, allowed_groups=[222])
-        runtime._publish_live_state()
+        runtime.lifecycle._publish_live_state()
 
         assert self._read(runtime)["values"]["allowed_groups"] == [222]
 
@@ -481,18 +481,18 @@ class TestPublishedState:
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """supervisor 靠这个时间戳判断 bot 进程还活着，不能因为配置没变就一直不写。"""
-        runtime._publish_live_state(force=True)
+        runtime.lifecycle._publish_live_state(force=True)
         writes = self._count_writes(runtime, monkeypatch)
-        monkeypatch.setattr(runtime._adapter, "live_state_published_at", 0.0)
+        monkeypatch.setattr(runtime.state._adapter, "live_state_published_at", 0.0)
 
-        runtime._publish_live_state()
+        runtime.lifecycle._publish_live_state()
 
         assert len(writes) == 1
 
     def test_it_leaves_no_temp_file_behind(self, runtime: Any) -> None:
-        runtime._publish_live_state(force=True)
+        runtime.lifecycle._publish_live_state(force=True)
 
-        path = runtime._live_state_file()
+        path = runtime.lifecycle._live_state_file()
         assert list(path.parent.glob(f"{path.name}.*")) == []
 
     def test_a_parse_error_is_visible_in_the_published_state(self, runtime: Any) -> None:
@@ -502,7 +502,7 @@ class TestPublishedState:
         module.config_path().write_text("channels: [oops\n", encoding="utf-8")
         module.invalidate()
 
-        runtime._publish_live_state(force=True)
+        runtime.lifecycle._publish_live_state(force=True)
 
         state = self._read(runtime)
         assert "ParserError" in state["parse_error"]
@@ -521,19 +521,19 @@ class TestTheLoopActuallyPicksUpChanges:
     def test_a_yaml_edit_reaches_the_deques_and_the_state_file(
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(runtime, "_LIVE_RECONCILE_INTERVAL_SEC", 0.01)
-        runtime._append_group_history(1, "hi")
-        assert runtime._adapter.group_history[1].maxlen == 20
+        monkeypatch.setattr(runtime.lifecycle, "_LIVE_RECONCILE_INTERVAL_SEC", 0.01)
+        runtime.history._append_group_history(1, "hi")
+        assert runtime.state._adapter.group_history[1].maxlen == 20
 
         async def exercise() -> None:
-            loop_task = asyncio.create_task(runtime._live_config_reconcile_forever())
+            loop_task = asyncio.create_task(runtime.lifecycle._live_config_reconcile_forever())
             try:
-                await _until(lambda: runtime._live_state_file().exists())
+                await _until(lambda: runtime.lifecycle._live_state_file().exists())
                 set_live_config(runtime, group_history_max=6)
 
-                await _until(lambda: runtime._adapter.group_history[1].maxlen == 6)
+                await _until(lambda: runtime.state._adapter.group_history[1].maxlen == 6)
                 await _until(
-                    lambda: json.loads(runtime._live_state_file().read_text(encoding="utf-8"))
+                    lambda: json.loads(runtime.lifecycle._live_state_file().read_text(encoding="utf-8"))
                     ["values"]["group_history_max"] == 6
                 )
             finally:
@@ -551,10 +551,10 @@ class TestTheLoopActuallyPicksUpChanges:
         死了以后所有热载键都停在那一刻，而且没有任何征兆 —— 文件改得动、`/qq/state`
         照旧有内容（只是不再更新），运营者会以为配置生效了。
         """
-        monkeypatch.setattr(runtime, "_LIVE_RECONCILE_INTERVAL_SEC", 0.01)
-        runtime._append_group_history(1, "hi")
+        monkeypatch.setattr(runtime.lifecycle, "_LIVE_RECONCILE_INTERVAL_SEC", 0.01)
+        runtime.history._append_group_history(1, "hi")
         calls: list[int] = []
-        real = runtime._reconcile_live_config
+        real = runtime.lifecycle._reconcile_live_config
 
         async def flaky() -> bool:
             calls.append(1)
@@ -562,16 +562,16 @@ class TestTheLoopActuallyPicksUpChanges:
                 raise RuntimeError("对齐这一轮炸了")
             return await real()
 
-        monkeypatch.setattr(runtime, "_reconcile_live_config", flaky)
+        monkeypatch.setattr(runtime.lifecycle, "_reconcile_live_config", flaky)
 
         async def exercise() -> None:
-            loop_task = asyncio.create_task(runtime._live_config_reconcile_forever())
+            loop_task = asyncio.create_task(runtime.lifecycle._live_config_reconcile_forever())
             try:
                 await _until(lambda: len(calls) >= 1)
                 assert not loop_task.done()
 
                 set_live_config(runtime, group_history_max=4)
-                await _until(lambda: runtime._adapter.group_history[1].maxlen == 4)
+                await _until(lambda: runtime.state._adapter.group_history[1].maxlen == 4)
             finally:
                 loop_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -583,15 +583,15 @@ class TestTheLoopActuallyPicksUpChanges:
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """写坏 yaml 不能让对齐循环死掉 —— 死了以后修好文件也不会再生效。"""
-        monkeypatch.setattr(runtime, "_LIVE_RECONCILE_INTERVAL_SEC", 0.01)
+        monkeypatch.setattr(runtime.lifecycle, "_LIVE_RECONCILE_INTERVAL_SEC", 0.01)
         module = sys.modules[f"{runtime.__name__}.live_config"]
         set_live_config(runtime, group_history_max=6)
-        runtime._append_group_history(1, "hi")
+        runtime.history._append_group_history(1, "hi")
 
         async def exercise() -> None:
-            loop_task = asyncio.create_task(runtime._live_config_reconcile_forever())
+            loop_task = asyncio.create_task(runtime.lifecycle._live_config_reconcile_forever())
             try:
-                await _until(lambda: runtime._adapter.group_history[1].maxlen == 6)
+                await _until(lambda: runtime.state._adapter.group_history[1].maxlen == 6)
 
                 module.config_path().write_text("queue: [oops\n", encoding="utf-8")
                 module.invalidate()
@@ -599,7 +599,7 @@ class TestTheLoopActuallyPicksUpChanges:
                 assert not loop_task.done()
 
                 set_live_config(runtime, group_history_max=9)
-                await _until(lambda: runtime._adapter.group_history[1].maxlen == 9)
+                await _until(lambda: runtime.state._adapter.group_history[1].maxlen == 9)
             finally:
                 loop_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -622,10 +622,7 @@ async def _until(predicate: Any, *, timeout: float = 3.0) -> None:
 
 class TestWiring:
     def _source(self) -> str:
-        # 运行期状态和容量计算收在 adapter.py 的 OneBotAdapter 里，接线要连它一起看。
-        return "\n".join(
-            (_ADAPTER / name).read_text(encoding="utf-8") for name in ("onebot_plugin.py", "adapter.py")
-        )
+        return adapter_source()
 
     def _function(self, name: str) -> ast.AST:
         return next(
@@ -661,7 +658,7 @@ class TestWiring:
                 "_reconcile_forward_bridge",
             )
         )
-        missing = [name for name in runtime.RECONCILED_KEYS if f"live.{name}" not in body]
+        missing = [name for name in runtime.lifecycle.RECONCILED_KEYS if f"live.{name}" not in body]
 
         assert missing == []
 

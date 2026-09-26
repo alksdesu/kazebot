@@ -56,21 +56,21 @@ def _private_event(user_id: Any, *, sub_type: str = "") -> SimpleNamespace:
 def _wire_agent_path(runtime: Any, monkeypatch: pytest.MonkeyPatch, text: str) -> _FakeMatcher:
     """接好闸门之后那条链需要的桩，让命令分支可达。"""
     matcher = _FakeMatcher()
-    monkeypatch.setattr(runtime, "_private_matcher", matcher)
-    monkeypatch.setattr(runtime._adapter, "client", SimpleNamespace(), raising=False)
-    monkeypatch.setattr(runtime._adapter, "session_state", SimpleNamespace(), raising=False)
-    monkeypatch.setattr(runtime, "_remember_message_for_reply_context", lambda event: None)
+    monkeypatch.setattr(runtime.handlers, "_private_matcher", matcher)
+    monkeypatch.setattr(runtime.state._adapter, "client", SimpleNamespace(), raising=False)
+    monkeypatch.setattr(runtime.state._adapter, "session_state", SimpleNamespace(), raising=False)
+    monkeypatch.setattr(runtime.message_text, "_remember_message_for_reply_context", lambda event: None)
 
     async def fake_text(_bot: Any, _event: Any) -> str:
         return text
 
-    monkeypatch.setattr(runtime, "_event_text_with_forward", fake_text)
+    monkeypatch.setattr(runtime.message_text, "_event_text_with_forward", fake_text)
     return matcher
 
 
 def _run(runtime: Any, event: Any) -> None:
     try:
-        asyncio.run(runtime._handle_private_agent(None, event))
+        asyncio.run(runtime.handlers._handle_private_agent(None, event))
     except _Finished:
         pass
 
@@ -88,7 +88,7 @@ def test_a_stranger_never_reaches_the_command_branches(
         calls.append(user_text)
         return "CLEARED"
 
-    monkeypatch.setattr(runtime, "_maybe_handle_clear_group_memory_command", fake_clear)
+    monkeypatch.setattr(runtime.commands, "_maybe_handle_clear_group_memory_command", fake_clear)
 
     _run(runtime, _private_event(STRANGER_QQ))
 
@@ -105,7 +105,7 @@ def test_the_roster_still_gets_the_command_in_a_private_chat(
         calls.append(user_text)
         return "CLEARED"
 
-    monkeypatch.setattr(runtime, "_maybe_handle_clear_group_memory_command", fake_clear)
+    monkeypatch.setattr(runtime.commands, "_maybe_handle_clear_group_memory_command", fake_clear)
 
     _run(runtime, _private_event(LISTED_QQ))
 
@@ -118,7 +118,7 @@ def test_the_roster_still_gets_the_command_in_a_private_chat(
 
 def test_a_stranger_gets_no_reply_at_all(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     matcher = _FakeMatcher()
-    monkeypatch.setattr(runtime, "_private_matcher", matcher)
+    monkeypatch.setattr(runtime.handlers, "_private_matcher", matcher)
 
     _run(runtime, _private_event(STRANGER_QQ))
 
@@ -128,7 +128,7 @@ def test_a_stranger_gets_no_reply_at_all(runtime: Any, monkeypatch: pytest.Monke
 def test_the_operator_can_put_a_notice_back(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     set_live_config(runtime, private_denied_reply="别找我")
     matcher = _FakeMatcher()
-    monkeypatch.setattr(runtime, "_private_matcher", matcher)
+    monkeypatch.setattr(runtime.handlers, "_private_matcher", matcher)
 
     _run(runtime, _private_event(STRANGER_QQ))
 
@@ -136,16 +136,16 @@ def test_the_operator_can_put_a_notice_back(runtime: Any, monkeypatch: pytest.Mo
 
 
 def test_the_default_notice_is_empty(runtime: Any) -> None:
-    assert runtime.live.private_denied_reply == ""
+    assert runtime.state.live.private_denied_reply == ""
 
 
 def test_an_unparsable_user_id_is_not_let_in(runtime: Any) -> None:
-    assert runtime._is_private_allowed(_private_event("abc")) is False
+    assert runtime.permissions._is_private_allowed(_private_event("abc")) is False
 
 
 def test_a_friend_still_gets_through(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     matcher = _FakeMatcher()
-    monkeypatch.setattr(runtime, "_private_matcher", matcher)
+    monkeypatch.setattr(runtime.handlers, "_private_matcher", matcher)
 
     # 闸门放行后紧接着的是「尚未初始化」检查（_client 默认为 None）。
     _run(runtime, _private_event(STRANGER_QQ, sub_type="friend"))

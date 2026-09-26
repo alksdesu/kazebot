@@ -469,54 +469,54 @@ class TestClearGroupMemoryCommand:
     def test_namespace_matches_what_the_engine_writes(self, runtime) -> None:
         # engine 收到的是 _stable_conversation_key 换过的 key，不是真实群号。
         group_id = 123456789
-        stable_key = runtime._stable_conversation_key(f"qq_group:{group_id}")
+        stable_key = runtime.routing._stable_conversation_key(f"qq_group:{group_id}")
 
-        assert runtime._conversation_memory_namespace_for_group(group_id) == _conversation_memory_namespace(stable_key)
+        assert runtime.commands._conversation_memory_namespace_for_group(group_id) == _conversation_memory_namespace(stable_key)
 
     def test_namespace_is_not_the_raw_group_digest(self, runtime) -> None:
-        assert runtime._conversation_memory_namespace_for_group(123456789) != _conversation_memory_namespace(
+        assert runtime.commands._conversation_memory_namespace_for_group(123456789) != _conversation_memory_namespace(
             "qq_group:123456789"
         )
 
     def test_clearing_removes_the_directory_the_engine_wrote(self, runtime, tmp_path: Path) -> None:
         group_id = 123456789
-        namespace = _conversation_memory_namespace(runtime._stable_conversation_key(f"qq_group:{group_id}"))
+        namespace = _conversation_memory_namespace(runtime.routing._stable_conversation_key(f"qq_group:{group_id}"))
         _write_memory(tmp_path, namespace, "群本", [_entry("m1", ["a"])])
 
-        existed, count = runtime._clear_group_memory_namespace(group_id)
+        existed, count = runtime.commands._clear_group_memory_namespace(group_id)
 
         assert (existed, count) == (True, 1)
         assert not (tmp_path / "data" / "memory" / namespace).exists()
 
     def test_clearing_one_group_keeps_the_others(self, runtime, tmp_path: Path) -> None:
-        keep = _conversation_memory_namespace(runtime._stable_conversation_key("qq_group:999"))
+        keep = _conversation_memory_namespace(runtime.routing._stable_conversation_key("qq_group:999"))
         _write_memory(tmp_path, keep, "别的群", [_entry("m1", ["a"])])
         _write_memory(
             tmp_path,
-            _conversation_memory_namespace(runtime._stable_conversation_key("qq_group:123456789")),
+            _conversation_memory_namespace(runtime.routing._stable_conversation_key("qq_group:123456789")),
             "本群",
             [_entry("m2", ["b"])],
         )
 
-        runtime._clear_group_memory_namespace(123456789)
+        runtime.commands._clear_group_memory_namespace(123456789)
 
         assert (tmp_path / "data" / "memory" / keep / "别的群.yaml").exists()
 
     def test_missing_namespace_reports_nothing_cleared(self, runtime) -> None:
-        assert runtime._clear_group_memory_namespace(555) == (False, 0)
+        assert runtime.commands._clear_group_memory_namespace(555) == (False, 0)
 
     def test_computing_the_namespace_does_not_mint_an_alias(self, runtime) -> None:
         # _stable_conversation_key 会顺带分配匿名别名；清记忆不该有这个副作用。
-        before = dict(runtime._adapter.anon_groups)
+        before = dict(runtime.state._adapter.anon_groups)
 
-        runtime._conversation_memory_namespace_for_group(20260816)
+        runtime.commands._conversation_memory_namespace_for_group(20260816)
 
-        assert runtime._adapter.anon_groups == before
+        assert runtime.state._adapter.anon_groups == before
 
     def test_clearing_one_group_keeps_another_groups_hit_stamps(self, runtime, tmp_path: Path) -> None:
         # 清一个群不能整份删 .hit_cache.json，否则其他群的「最近命中」全被抹平。
-        ns_a = runtime._conversation_memory_namespace_for_group(123456789)
-        ns_b = runtime._conversation_memory_namespace_for_group(999)
+        ns_a = runtime.commands._conversation_memory_namespace_for_group(123456789)
+        ns_b = runtime.commands._conversation_memory_namespace_for_group(999)
         _write_memory(tmp_path, ns_a, "本群", [_entry("m1", ["a"])])
         _write_memory(tmp_path, ns_b, "别的群", [_entry("m1", ["b"])])
         cache = tmp_path / "data" / "memory" / ".hit_cache.json"
@@ -525,18 +525,18 @@ class TestClearGroupMemoryCommand:
             encoding="utf-8",
         )
 
-        runtime._clear_group_memory_namespace(123456789)
+        runtime.commands._clear_group_memory_namespace(123456789)
 
         left = json.loads(cache.read_text(encoding="utf-8"))
         assert left == {f"{ns_b}/m1": _NOW.isoformat()}
         assert cache.exists()
 
     def test_clearing_a_group_keeps_the_legacy_flat_hit_keys(self, runtime, tmp_path: Path) -> None:
-        ns_a = runtime._conversation_memory_namespace_for_group(123456789)
+        ns_a = runtime.commands._conversation_memory_namespace_for_group(123456789)
         _write_memory(tmp_path, ns_a, "本群", [_entry("m1", ["a"])])
         cache = tmp_path / "data" / "memory" / ".hit_cache.json"
         cache.write_text(json.dumps({"m1": _NOW.isoformat()}), encoding="utf-8")
 
-        runtime._clear_group_memory_namespace(123456789)
+        runtime.commands._clear_group_memory_namespace(123456789)
 
         assert json.loads(cache.read_text(encoding="utf-8")) == {"m1": _NOW.isoformat()}

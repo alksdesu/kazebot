@@ -38,7 +38,7 @@ class TestTheTtlHasAFloor:
         monkeypatch.setenv("ONEBOT_IMAGE_CACHE_TTL_SECONDS", "0")
         runtime = load_runtime(monkeypatch, tmp_path)
 
-        assert runtime.IMAGE_CACHE_TTL_SECONDS == 60
+        assert runtime.routing.IMAGE_CACHE_TTL_SECONDS == 60
 
 
 class TestCleanupRespectsTheFloor:
@@ -52,8 +52,8 @@ class TestCleanupRespectsTheFloor:
         fresh = time.time() - 5
         os.utime(path, (fresh, fresh))
 
-        runtime._adapter.last_attachment_cleanup_at = 0.0
-        runtime._cleanup_old_qq_attachments()
+        runtime.state._adapter.last_attachment_cleanup_at = 0.0
+        runtime.media._cleanup_old_qq_attachments()
 
         assert path.exists()
 
@@ -67,7 +67,7 @@ class TestCleanupRespectsTheFloor:
         stale = time.time() - 120
         os.utime(path, (stale, stale))
 
-        runtime._adapter.last_attachment_cleanup_at = 0.0
-        runtime._cleanup_old_qq_attachments()
+        runtime.state._adapter.last_attachment_cleanup_at = 0.0
+        runtime.media._cleanup_old_qq_attachments()
 
         assert not path.exists()

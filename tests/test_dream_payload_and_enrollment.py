@@ -27,7 +27,7 @@ from engine.builtin.dream import (
     _days_since,
 )
 from engine.builtin.knowledge_inject import _conversation_memory_namespace
-from tests._onebot_harness import load_runtime, set_live_config
+from tests._onebot_harness import load_runtime, set_live_config, adapter_source
 
 _NOW = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
 _KEY = "qq_group:700001"
@@ -243,9 +243,9 @@ class TestEnrollmentGate:
         return SimpleNamespace(user_id=user_id, message_id=1, get_message=lambda: [])
 
     def test_a_direct_interaction_enrolls(self, runtime, tmp_path: Path) -> None:
-        runtime._collect_memory_subjects(self._event(runtime), "你好", "qq_group:t", True)
+        runtime.anonymize._collect_memory_subjects(self._event(runtime), "你好", "qq_group:t", True)
 
-        assert memory_subjects.is_enrolled(tmp_path, runtime._anonymize_user_id(10001))
+        assert memory_subjects.is_enrolled(tmp_path, runtime.anonymize._anonymize_user_id(10001))
 
     def test_just_talking_in_the_group_does_not_enroll(self, runtime, tmp_path: Path) -> None:
         """ONEBOT_GROUP_TRIGGER=all 下每条群消息都会被处理。
@@ -253,16 +253,16 @@ class TestEnrollmentGate:
         「在群里说了句话」不是「主动找 bot」—— 照后者建档，群一活跃全员都有跨会话
         档案，注入预算被一堆无关的人占满。
         """
-        runtime._collect_memory_subjects(self._event(runtime), "今天天气不错", "qq_group:t", False)
+        runtime.anonymize._collect_memory_subjects(self._event(runtime), "今天天气不错", "qq_group:t", False)
 
-        assert not memory_subjects.is_enrolled(tmp_path, runtime._anonymize_user_id(10001))
+        assert not memory_subjects.is_enrolled(tmp_path, runtime.anonymize._anonymize_user_id(10001))
 
     def test_an_already_enrolled_speaker_still_loads_their_memory(self, runtime, tmp_path: Path) -> None:
         # 不建档不等于不加载：他早先主动找过 bot，这轮仍该调出他的档案。
-        alias = runtime._anonymize_user_id(10001)
+        alias = runtime.anonymize._anonymize_user_id(10001)
         memory_subjects.record_interaction(tmp_path, alias)
 
-        subjects = runtime._collect_memory_subjects(self._event(runtime), "随便说说", "qq_group:t", False)
+        subjects = runtime.anonymize._collect_memory_subjects(self._event(runtime), "随便说说", "qq_group:t", False)
 
         assert alias in subjects
 
@@ -274,7 +274,7 @@ class TestEnrollmentGate:
         """
         import ast
 
-        source = (_ROOT / "adapters/onebot/onebot_plugin.py").read_text(encoding="utf-8")
+        source = adapter_source()
         tree = ast.parse(source)
         gate = next(
             node for node in ast.walk(tree)
@@ -301,7 +301,7 @@ class TestEnrollmentGate:
         import asyncio
 
         def _item(direct: bool):
-            return runtime.QueuedInbound(
+            return runtime.models.QueuedInbound(
                 matcher=None, bot=None, event=SimpleNamespace(user_id=10001), channel="qq_group",
                 real_conversation_key="qq_group:1", stable_conversation_key="conv_merge",
                 text="正文", attachments=[], is_dm=False, platform_updates={},
@@ -309,17 +309,17 @@ class TestEnrollmentGate:
             )
 
         first = _item(True)
-        asyncio.run(runtime._enqueue_or_submit_inbound(first))
-        asyncio.run(runtime._enqueue_or_submit_inbound(_item(False)))
+        asyncio.run(runtime.queueing._enqueue_or_submit_inbound(first))
+        asyncio.run(runtime.queueing._enqueue_or_submit_inbound(_item(False)))
 
-        assert len(runtime._adapter.qq_queue) == 1
+        assert len(runtime.state._adapter.qq_queue) == 1
         assert first.direct_interaction is True
 
     def test_the_prefix_check_runs_before_the_prefix_is_stripped(self, runtime) -> None:
         # 先剥前缀再判定，all 模式下所有人都会被算成主动找 bot。
         import ast
 
-        tree = ast.parse((_ROOT / "adapters/onebot/onebot_plugin.py").read_text(encoding="utf-8"))
+        tree = ast.parse(adapter_source())
         handler = next(
             node for node in ast.walk(tree)
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_process_group_message"

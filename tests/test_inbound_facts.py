@@ -30,7 +30,7 @@ def runtime(monkeypatch, tmp_path):
     module = load_runtime(monkeypatch, tmp_path)
     set_live_config(module, allowed_groups=[12345], admin_users=[10001])
     yield module
-    module._adapter.outbound_idempotency.close()
+    module.state._adapter.outbound_idempotency.close()
 
 
 def _event(segments=None, *, user_id=10001, group_id=12345, role="admin", **extra):
@@ -79,13 +79,13 @@ class TestTheStructure:
 
 class TestTheOneBotTranslation:
     def test_a_group_message(self, runtime) -> None:
-        facts = runtime._inbound_facts(_BOT, _event([
+        facts = runtime.inbound._inbound_facts(_BOT, _event([
             {"type": "at", "data": {"qq": "90000"}},
             {"type": "text", "data": {"text": " 在吗"}},
         ]))
         assert facts.conversation.is_group
         assert facts.conversation.real_conversation_key == "qq_group:12345"
-        assert facts.conversation.conversation_key == runtime._stable_conversation_key("qq_group:12345")
+        assert facts.conversation.conversation_key == runtime.routing._stable_conversation_key("qq_group:12345")
         assert facts.sender.platform_id == "10001" and facts.sender.listed_admin
         assert facts.sender.group_role == "admin" and facts.sender.display_name
         assert facts.mentions == ("90000",) and facts.mentions_self
@@ -93,41 +93,41 @@ class TestTheOneBotTranslation:
         assert facts.sent_at == 1000.0 and facts.message_id == "7"
 
     def test_the_given_text_wins(self, runtime) -> None:
-        assert runtime._inbound_facts(_BOT, _event(), text="原文").text == "原文"
+        assert runtime.inbound._inbound_facts(_BOT, _event(), text="原文").text == "原文"
 
     def test_a_private_message_has_no_group_role(self, runtime) -> None:
-        facts = runtime._inbound_facts(_BOT, _event(group_id=None, role="owner"))
+        facts = runtime.inbound._inbound_facts(_BOT, _event(group_id=None, role="owner"))
         assert facts.conversation.is_private
         assert facts.conversation.real_conversation_key == "qq_private:10001"
         assert facts.sender.group_role == "" and not facts.mentions_self
 
     def test_an_anonymous_sender_has_no_platform_id(self, runtime) -> None:
-        facts = runtime._inbound_facts(_BOT, _event(user_id=80000000, anonymous={"id": 5, "name": "x"}))
+        facts = runtime.inbound._inbound_facts(_BOT, _event(user_id=80000000, anonymous={"id": 5, "name": "x"}))
         assert facts.sender.anonymous and facts.sender.platform_id == ""
         assert not facts.sender.listed_admin and facts.sender.group_role == ""
 
     def test_a_marked_sticker(self, runtime) -> None:
-        facts = runtime._inbound_facts(_BOT, _event([{"type": "mface", "data": {"emoji_id": "1"}}]))
+        facts = runtime.inbound._inbound_facts(_BOT, _event([{"type": "mface", "data": {"emoji_id": "1"}}]))
         assert facts.marked_sticker
 
     def test_trigger_input_comes_from_the_facts(self, runtime) -> None:
         event = _event([{"type": "at", "data": {"qq": "90000"}}])
-        inp = runtime._trigger_input(event, _BOT, "在吗")
+        inp = runtime.inbound._trigger_input(event, _BOT, "在吗")
         assert (inp.group_id, inp.user_id, inp.at_me, inp.text) == ("12345", "10001", True, "在吗")
 
     def test_the_actor_is_built_from_the_facts(self, runtime) -> None:
-        actor = runtime._adapter.features.actor(_BOT, _event())
-        assert actor == runtime._adapter.features.actor(_BOT, runtime._inbound_facts(_BOT, _event()))
+        actor = runtime.state._adapter.features.actor(_BOT, _event())
+        assert actor == runtime.state._adapter.features.actor(_BOT, runtime.inbound._inbound_facts(_BOT, _event()))
         assert actor["user_id"] == "10001" and actor["role"] == "admin" and actor["is_admin"] is True
 
 
 class TestStagedBursts:
     def test_a_new_row_carries_its_facts(self, runtime) -> None:
         facts = _facts()
-        assert runtime._adapter.features.staged_facts({"facts": facts.to_dict()}) == facts
+        assert runtime.state._adapter.features.staged_facts({"facts": facts.to_dict()}) == facts
 
     def test_a_legacy_row_is_rebuilt_from_the_actor(self, runtime) -> None:
-        facts = runtime._adapter.features.staged_facts({
+        facts = runtime.state._adapter.features.staged_facts({
             "actor": {"user_id": "10001", "message_id": "7", "display_name": "Alice", "bot_scope": "90000"},
             "group_id": 12345, "channel": "qq_group", "scope": "qq_group:abc", "real_key": "qq_group:12345",
             "user_text": "hi", "event_time": 1000,
@@ -141,12 +141,12 @@ class TestStagedBursts:
             return {"role": "owner"}
 
         bot = SimpleNamespace(self_id="90000", call_api=call_api)
-        event = asyncio.run(runtime._replay_event(bot, _facts()))
+        event = asyncio.run(runtime.inbound._replay_event(bot, _facts()))
         assert (event.user_id, event.group_id, event.message_id, event.sender.role) == (10001, 12345, 7, "owner")
         assert list(event.get_message())[0]["data"]["text"] == "hi @bot"
 
     def test_an_anonymous_staged_row_does_not_block_recovery(self, runtime, monkeypatch) -> None:
-        features = runtime._adapter.features
+        features = runtime.state._adapter.features
         anonymous = _facts(sender=InboundSender(anonymous=True, display_name="匿名成员"))
         rows = [{"facts": anonymous.to_dict(), "scope": "s", "user_text": "x"}]
         monkeypatch.setattr(features.burst_store, "recover", lambda account, started: rows)

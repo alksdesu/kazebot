@@ -50,7 +50,7 @@ def _event() -> SimpleNamespace:
 
 
 def _trigger(runtime: Any, bot: Any, event: Any) -> Any:
-    return runtime.TriggerInfo(
+    return runtime.queueing.TriggerInfo(
         inbound_seq=1, conversation_key="k", session_id="s", is_dm=False,
         platform_data={"bot": bot, "event": event},
     )
@@ -58,7 +58,7 @@ def _trigger(runtime: Any, bot: Any, event: Any) -> Any:
 
 def _run_add(runtime: Any, bot: Any, reactions: list[str]) -> None:
     trigger = _trigger(runtime, bot, _event())
-    asyncio.run(runtime.TangQiuCallbacks().add_reactions(trigger, reactions))
+    asyncio.run(runtime.callbacks.TangQiuCallbacks().add_reactions(trigger, reactions))
 
 
 # ---- #26: add_reactions 开关 + 白名单收口 ----
@@ -100,17 +100,17 @@ def test_reactions_drop_ids_outside_the_whitelist(runtime: Any) -> None:
 def test_reaction_prompt_lists_whole_whitelist_when_enabled(runtime: Any) -> None:
     set_live_config(runtime, enable_reactions=True)
 
-    block = runtime._reaction_prompt_block()
+    block = runtime.emotes._reaction_prompt_block()
 
     assert "[REACT:" in block
-    for eid in runtime._REACT_MODEL_EMOJIS:
+    for eid in runtime.common._REACT_MODEL_EMOJIS:
         assert eid in block
 
 
 def test_reaction_prompt_is_empty_when_disabled(runtime: Any) -> None:
     set_live_config(runtime, enable_reactions=False)
 
-    assert runtime._reaction_prompt_block() == ""
+    assert runtime.emotes._reaction_prompt_block() == ""
 
 
 def _group_event() -> SimpleNamespace:
@@ -125,7 +125,7 @@ def test_group_inbound_injects_reaction_prompt(runtime: Any) -> None:
     set_live_config(runtime, enable_reactions=True)
     bot = ReactBot()
 
-    text, _ = asyncio.run(runtime._build_inbound_text(
+    text, _ = asyncio.run(runtime.inbound._build_inbound_text(
         _group_event(), bot, "在吗", "conv_abc", [],
     ))
 
@@ -141,7 +141,7 @@ def test_private_inbound_omits_reaction_prompt(runtime: Any) -> None:
         get_message=lambda: [],
     )
 
-    text = asyncio.run(runtime._build_private_inbound_text(event, bot, "在吗", "conv_dm", []))
+    text = asyncio.run(runtime.inbound._build_private_inbound_text(event, bot, "在吗", "conv_dm", []))
 
     assert "【QQ表情表态】" not in text
 
@@ -162,8 +162,8 @@ def _react_probe(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, An
         stuck.append(emoji_id)
         return True
 
-    monkeypatch.setattr(runtime, "_set_message_react", record)
-    callbacks = runtime.TangQiuCallbacks()
+    monkeypatch.setattr(runtime.outbound_attachments, "_set_message_react", record)
+    callbacks = runtime.callbacks.TangQiuCallbacks()
     trigger = SimpleNamespace(platform_data={"bot": ReactBot(), "event": _group_event()})
     return callbacks, trigger, stuck
 

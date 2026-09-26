@@ -18,7 +18,7 @@ from engine import memory_subjects
 from engine.builtin.knowledge_inject import _conversation_memory_namespace, save_memory
 from toolbox.context import ToolContext
 
-from tests._onebot_harness import load_runtime
+from tests._onebot_harness import load_runtime, adapter_source
 
 _CONV_KEY = "qq_group:bc3f12b0621298e191a49fa7"
 
@@ -117,12 +117,12 @@ class TestAdapterCollection:
         )
 
     def _collect(self, runtime, event, text: str, key: str = "qq_group:t") -> list[str]:
-        return runtime._collect_memory_subjects(event, text, key)
+        return runtime.anonymize._collect_memory_subjects(event, text, key)
 
     def test_a_direct_interaction_enrolls_the_sender(self, runtime, tmp_path: Path) -> None:
         subjects = self._collect(runtime, self._event(10001), "你好")
 
-        alias = runtime._anonymize_user_id(10001)
+        alias = runtime.anonymize._anonymize_user_id(10001)
         assert subjects == [alias]
         assert memory_subjects.is_enrolled(tmp_path, alias)
 
@@ -131,17 +131,17 @@ class TestAdapterCollection:
 
         subjects = self._collect(runtime, self._event(10001, message), "看看")
 
-        assert subjects == [runtime._anonymize_user_id(10001), runtime._anonymize_user_id(10002)]
+        assert subjects == [runtime.anonymize._anonymize_user_id(10001), runtime.anonymize._anonymize_user_id(10002)]
 
     def test_being_at_ed_does_not_enroll_the_target(self, runtime, tmp_path: Path) -> None:
         # 只有主动找 bot 才建档；被别人 @ 到不算。
         message = [{"type": "at", "data": {"qq": "10002"}}]
         self._collect(runtime, self._event(10001, message), "看看")
 
-        assert not memory_subjects.is_enrolled(tmp_path, runtime._anonymize_user_id(10002))
+        assert not memory_subjects.is_enrolled(tmp_path, runtime.anonymize._anonymize_user_id(10002))
 
     def test_aliases_written_in_the_text_are_picked_up(self, runtime, tmp_path: Path) -> None:
-        other = runtime._anonymize_user_id(10005)
+        other = runtime.anonymize._anonymize_user_id(10005)
 
         subjects = self._collect(runtime, self._event(10001), f"他说{other}很靠谱")
 
@@ -152,11 +152,11 @@ class TestAdapterCollection:
 
         subjects = self._collect(runtime, self._event(10001, message), "都来看")
 
-        assert subjects == [runtime._anonymize_user_id(10001)]
+        assert subjects == [runtime.anonymize._anonymize_user_id(10001)]
 
     def test_display_names_only_resolve_for_enrolled_people(self, runtime, tmp_path: Path, monkeypatch) -> None:
-        alias = runtime._anonymize_user_id(10007)
-        monkeypatch.setitem(runtime._adapter.qq_user_profiles, "10007", {"display_name": "张三"})
+        alias = runtime.anonymize._anonymize_user_id(10007)
+        monkeypatch.setitem(runtime.state._adapter.qq_user_profiles, "10007", {"display_name": "张三"})
 
         # 未建档：名字命中也不算涉及
         assert alias not in self._collect(runtime, self._event(10001), "张三昨天说要请客")
@@ -170,7 +170,7 @@ class TestAdapterCollection:
         群历史每行形如 `名字(UserX): ...`，别名就在行首括号里 —— 拿整块历史去扫，
         近 20 行里说过话的人全部会被当成「本轮涉及」，每人一整份档案挤满预算。
         """
-        speaker = runtime._anonymize_user_id(10009)
+        speaker = runtime.anonymize._anonymize_user_id(10009)
         memory_subjects.record_interaction(tmp_path, speaker)
         history_block = f"[12:00] 某人({speaker}): 昨天那事怎么样了\n\n---\n\n在吗"
 
@@ -180,17 +180,17 @@ class TestAdapterCollection:
     def test_profile_overrides_cannot_resolve_ambiguous_names(self, runtime, tmp_path: Path, monkeypatch) -> None:
         aliases = []
         for user_id in (10007, 10008):
-            alias = runtime._anonymize_user_id(user_id)
+            alias = runtime.anonymize._anonymize_user_id(user_id)
             aliases.append(alias)
             memory_subjects.record_interaction(tmp_path, alias, display_name=str(user_id))
-            monkeypatch.setitem(runtime._adapter.qq_user_profiles, str(user_id), {"display_name": "张三"})
+            monkeypatch.setitem(runtime.state._adapter.qq_user_profiles, str(user_id), {"display_name": "张三"})
 
         subjects = self._collect(runtime, self._event(10001), "张三昨天说要请客")
         assert not set(aliases).intersection(subjects)
 
     def test_last_round_subjects_stay_loaded_this_round(self, runtime, tmp_path: Path) -> None:
         # 「@张三」的下一句通常是「他电话多少」，那句里没有任何别名。
-        other = runtime._anonymize_user_id(10011)
+        other = runtime.anonymize._anonymize_user_id(10011)
         memory_subjects.record_interaction(tmp_path, other)
         message = [{"type": "at", "data": {"qq": "10011"}}]
 
@@ -199,7 +199,7 @@ class TestAdapterCollection:
 
     def test_stickiness_does_not_accumulate_forever(self, runtime, tmp_path: Path) -> None:
         # 存回去的是本轮实际出现的人，不含继承来的：否则谁进来一次就永久驻留。
-        other = runtime._anonymize_user_id(10011)
+        other = runtime.anonymize._anonymize_user_id(10011)
         memory_subjects.record_interaction(tmp_path, other)
         message = [{"type": "at", "data": {"qq": "10011"}}]
 
@@ -209,18 +209,18 @@ class TestAdapterCollection:
         assert other not in self._collect(runtime, self._event(10001), "算了不问了")
 
     def test_stickiness_expires(self, runtime, tmp_path: Path, monkeypatch) -> None:
-        other = runtime._anonymize_user_id(10011)
+        other = runtime.anonymize._anonymize_user_id(10011)
         memory_subjects.record_interaction(tmp_path, other)
         message = [{"type": "at", "data": {"qq": "10011"}}]
 
         self._collect(runtime, self._event(10001, message), "你认识他吗")
-        clock = runtime.time.monotonic() + runtime._SUBJECT_STICKY_TTL_SEC + 1
-        monkeypatch.setattr(runtime.time, "monotonic", lambda: clock)
+        clock = runtime.message_text.time.monotonic() + runtime.anonymize._SUBJECT_STICKY_TTL_SEC + 1
+        monkeypatch.setattr(runtime.message_text.time, "monotonic", lambda: clock)
 
         assert other not in self._collect(runtime, self._event(10001), "他电话多少")
 
     def test_sticky_window_is_per_conversation(self, runtime, tmp_path: Path) -> None:
-        other = runtime._anonymize_user_id(10011)
+        other = runtime.anonymize._anonymize_user_id(10011)
         memory_subjects.record_interaction(tmp_path, other)
         message = [{"type": "at", "data": {"qq": "10011"}}]
 
@@ -230,14 +230,14 @@ class TestAdapterCollection:
 
     def test_the_sender_stays_first_after_inheriting(self, runtime, tmp_path: Path) -> None:
         # 预算裁剪时发起人的档案最该留下，继承来的人必须排在他后面。
-        other = runtime._anonymize_user_id(10011)
+        other = runtime.anonymize._anonymize_user_id(10011)
         memory_subjects.record_interaction(tmp_path, other)
         message = [{"type": "at", "data": {"qq": "10011"}}]
 
         self._collect(runtime, self._event(10001, message), "你认识他吗")
         merged = self._collect(runtime, self._event(10001), "他电话多少")
 
-        assert merged[0] == runtime._anonymize_user_id(10001)
+        assert merged[0] == runtime.anonymize._anonymize_user_id(10001)
 
 
 class TestEndToEndInjection:
@@ -336,7 +336,7 @@ class TestHintPlumbing:
         from tests._onebot_harness import set_live_config
 
         runtime = load_runtime(monkeypatch, tmp_path)
-        runtime._adapter.session_state = SessionState()
+        runtime.state._adapter.session_state = SessionState()
         set_live_config(runtime, enable_preempt=False)
         captured = []
 
@@ -344,14 +344,14 @@ class TestHintPlumbing:
             captured.append(kwargs)
             return SimpleNamespace(session_id="", accepted=False, inbound_seq=0)
 
-        runtime._adapter.client = SimpleNamespace(submit_inbound=submit)
+        runtime.state._adapter.client = SimpleNamespace(submit_inbound=submit)
         event = SimpleNamespace(user_id=10001, message_id=1, get_message=lambda: [])
-        asyncio.run(runtime._submit_or_preempt_inbound(
+        asyncio.run(runtime.queueing._submit_or_preempt_inbound(
             bot=None, event=event, channel="qq_group", real_conversation_key="qq_group:1",
             stable_conversation_key="group-1", inbound_text="hello", user_text="hello",
             attachments=[], is_dm=False, platform_updates={"type": "group", "group_id": 1},
         ))
-        assert captured[0]["memory_hints"] == {"subjects": [runtime._anonymize_user_id(10001)]}
+        assert captured[0]["memory_hints"] == {"subjects": [runtime.anonymize._anonymize_user_id(10001)]}
 
     def test_the_sdk_forwards_memory_hints(self) -> None:
         source = Path("clonoth_sdk/client.py").read_text(encoding="utf-8")
@@ -373,7 +373,7 @@ class TestHintPlumbing:
 
     def test_memory_hints_stay_out_of_platform_auth(self) -> None:
         # platform_auth 参与鉴权判定，混入非鉴权字段会让 is_admin 的判断面变大。
-        source = Path("adapters/onebot/onebot_plugin.py").read_text(encoding="utf-8")
+        source = adapter_source()
         auth_block = source.split("platform_auth={", 1)[1].split("}", 1)[0]
 
         assert "subjects" not in auth_block

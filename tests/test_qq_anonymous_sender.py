@@ -51,28 +51,28 @@ def real_event(*, user_id: int = MEMBER_QQ, group_id: int = HOME_GROUP, card: st
 
 
 def test_distinct_anonymous_members_get_distinct_aliases(runtime: Any) -> None:
-    a1 = runtime._event_user_alias(anon_event(11))
-    a2 = runtime._event_user_alias(anon_event(22, name="匿名乙", flag="f2"))
+    a1 = runtime.identity._event_user_alias(anon_event(11))
+    a2 = runtime.identity._event_user_alias(anon_event(22, name="匿名乙", flag="f2"))
 
     assert a1 != a2
     assert a1.startswith("Anon") and a2.startswith("Anon")
 
 
 def test_same_anonymous_id_is_stable(runtime: Any) -> None:
-    assert runtime._event_user_alias(anon_event(11)) == runtime._event_user_alias(anon_event(11))
+    assert runtime.identity._event_user_alias(anon_event(11)) == runtime.identity._event_user_alias(anon_event(11))
 
 
 def test_placeholder_never_registers_as_real_user(runtime: Any) -> None:
-    runtime._event_user_alias(anon_event(11))
+    runtime.identity._event_user_alias(anon_event(11))
 
-    assert "80000000" not in runtime._adapter.anon_users
-    assert runtime._anonymize_user_id("80000000") == "AnonUnknown"
+    assert "80000000" not in runtime.state._adapter.anon_users
+    assert runtime.anonymize._anonymize_user_id("80000000") == "AnonUnknown"
 
 
 def test_history_line_keeps_anonymous_members_distinct(runtime: Any) -> None:
     bot = SimpleNamespace(self_id="90000")
-    line1 = runtime._history_line(runtime._inbound_facts(bot, anon_event(11), text="a"))
-    line2 = runtime._history_line(runtime._inbound_facts(bot, anon_event(22, flag="f2"), text="b"))
+    line1 = runtime.history._history_line(runtime.inbound._inbound_facts(bot, anon_event(11), text="a"))
+    line2 = runtime.history._history_line(runtime.inbound._inbound_facts(bot, anon_event(22, flag="f2"), text="b"))
 
     assert "匿名成员" in line1 and "匿名成员" in line2
     ident1 = line1[line1.index("(") + 1:line1.index(")")]
@@ -84,16 +84,16 @@ def test_history_line_keeps_anonymous_members_distinct(runtime: Any) -> None:
 def test_anonymous_sender_is_never_enrolled(runtime: Any, tmp_path: Path) -> None:
     from engine import memory_subjects
 
-    runtime._record_memory_subject_interaction(anon_event(11), True)
+    runtime.anonymize._record_memory_subject_interaction(anon_event(11), True)
 
     assert memory_subjects.enrolled_subjects(tmp_path) == set()
 
 
 def test_target_omits_reply_sender_for_anonymous(runtime: Any) -> None:
-    anon_target = runtime._target_from_platform_data({
+    anon_target = runtime.queueing._target_from_platform_data({
         "type": "group", "group_id": HOME_GROUP, "event": anon_event(11), "conversation_key": "k",
     })
-    real_target = runtime._target_from_platform_data({
+    real_target = runtime.queueing._target_from_platform_data({
         "type": "group", "group_id": HOME_GROUP, "event": real_event(), "conversation_key": "k",
     })
 
@@ -104,15 +104,15 @@ def test_target_omits_reply_sender_for_anonymous(runtime: Any) -> None:
 def test_anonymous_never_gets_admin_even_when_placeholder_is_listed(runtime: Any) -> None:
     set_live_config(runtime, admin_users=frozenset({PLACEHOLDER_QQ}))
 
-    assert runtime._requester(anon_event(11)).listed_admin is False
+    assert runtime.permissions._requester(anon_event(11)).listed_admin is False
 
 
 def test_real_sender_regression(runtime: Any) -> None:
     event = real_event(card="张三")
 
-    assert re.match(r"^User[A-Z]+$", runtime._event_user_alias(event))
-    assert runtime._event_display_name(event) == "张三"
+    assert re.match(r"^User[A-Z]+$", runtime.identity._event_user_alias(event))
+    assert runtime.identity._event_display_name(event) == "张三"
 
 
 def test_sender_key_distinguishes_anonymous_members(runtime: Any) -> None:
-    assert runtime._event_sender_key(anon_event(11)) != runtime._event_sender_key(anon_event(22, flag="f2"))
+    assert runtime.identity._event_sender_key(anon_event(11)) != runtime.identity._event_sender_key(anon_event(22, flag="f2"))

@@ -65,20 +65,20 @@ def _cq_message() -> str:
 
 def _all_shapes(runtime: Any) -> list[str]:
     return [
-        runtime._message_to_text(_object_segments(), _BOT_ID),
-        runtime._message_to_text_generic(_dict_segments(), _BOT_ID),
-        runtime._message_to_text_generic(_cq_message(), _BOT_ID),
+        runtime.message_text._message_to_text(_object_segments(), _BOT_ID),
+        runtime.message_text._message_to_text_generic(_dict_segments(), _BOT_ID),
+        runtime.message_text._message_to_text_generic(_cq_message(), _BOT_ID),
     ]
 
 
 class TestThreeShapesOneRenderer:
     def test_three_shapes_agree(self, runtime) -> None:
-        alias = runtime._anonymize_user_id(_OTHER_ID)
+        alias = runtime.anonymize._anonymize_user_id(_OTHER_ID)
         expected = (
             f"你好@{alias}"
-            f"{runtime.IMAGE_PLACEHOLDER}"
-            f"{runtime.FACE_PLACEHOLDER}"
-            f"{runtime.VIDEO_PLACEHOLDER}"
+            f"{runtime.message_text.IMAGE_PLACEHOLDER}"
+            f"{runtime.message_text.FACE_PLACEHOLDER}"
+            f"{runtime.message_text.VIDEO_PLACEHOLDER}"
             "[json]"
         )
 
@@ -93,9 +93,9 @@ class TestThreeShapesOneRenderer:
         dicts = [{"type": seg.type, "data": dict(seg.data)} for seg in objects]
 
         rendered = [
-            runtime._message_to_text(objects, _BOT_ID),
-            runtime._message_to_text_generic(dicts, _BOT_ID),
-            runtime._message_to_text_generic(f"在吗[CQ:at,qq={_BOT_ID}]", _BOT_ID),
+            runtime.message_text._message_to_text(objects, _BOT_ID),
+            runtime.message_text._message_to_text_generic(dicts, _BOT_ID),
+            runtime.message_text._message_to_text_generic(f"在吗[CQ:at,qq={_BOT_ID}]", _BOT_ID),
         ]
 
         assert rendered == ["在吗", "在吗", "在吗"]
@@ -110,7 +110,7 @@ class TestThreeShapesOneRenderer:
             assert "42" not in text
 
     def test_unknown_cq_segment_never_leaks_its_params(self, runtime) -> None:
-        rendered = runtime._message_to_text_generic('[CQ:json,data={"url":"http://leak"}]', _BOT_ID)
+        rendered = runtime.message_text._message_to_text_generic('[CQ:json,data={"url":"http://leak"}]', _BOT_ID)
 
         assert rendered == "[json]"
         assert "http://leak" not in rendered
@@ -118,13 +118,13 @@ class TestThreeShapesOneRenderer:
 
 class TestSegmentShapes:
     def test_text_none_is_not_the_literal_none(self, runtime) -> None:
-        assert runtime._message_to_text_generic([{"type": "text", "data": {"text": None}}]) == ""
+        assert runtime.message_text._message_to_text_generic([{"type": "text", "data": {"text": None}}]) == ""
 
     def test_object_segments_in_a_plain_list_are_read(self, runtime) -> None:
         # Message 是 list 子类，但普通 list 装 MessageSegment 对象也是真实到达形态。
         message = [SimpleNamespace(type="text", data={"text": "在吗"})]
 
-        assert runtime._message_to_text_generic(message, _BOT_ID) == "在吗"
+        assert runtime.message_text._message_to_text_generic(message, _BOT_ID) == "在吗"
 
 
 class TestImagePlaceholder:
@@ -132,18 +132,18 @@ class TestImagePlaceholder:
         # mface 走图片下载通道，占位符和 image 不一致就会让附件路径回填不到正文。
         message = [{"type": "mface", "data": {"url": "http://x/b.gif"}}]
 
-        assert runtime._message_to_text_generic(message, _BOT_ID) == runtime.IMAGE_PLACEHOLDER
-        assert runtime._iter_qq_image_sources(message) == [runtime.ImageSource("http://x/b.gif", sticker=True)]
+        assert runtime.message_text._message_to_text_generic(message, _BOT_ID) == runtime.message_text.IMAGE_PLACEHOLDER
+        assert runtime.media._iter_qq_image_sources(message) == [runtime.models.ImageSource("http://x/b.gif", sticker=True)]
 
     def test_a_cq_mface_uses_the_image_placeholder(self, runtime) -> None:
-        assert runtime._message_to_text_generic(
+        assert runtime.message_text._message_to_text_generic(
             "[CQ:mface,url=http://x/b.gif]", _BOT_ID,
-        ) == runtime.IMAGE_PLACEHOLDER
+        ) == runtime.message_text.IMAGE_PLACEHOLDER
 
     def test_an_attachment_path_is_backfilled_over_an_mface(self, runtime) -> None:
-        text = runtime._message_to_text_generic([{"type": "mface", "data": {"url": "http://x/b.gif"}}], _BOT_ID)
+        text = runtime.message_text._message_to_text_generic([{"type": "mface", "data": {"url": "http://x/b.gif"}}], _BOT_ID)
 
-        assert text.replace(runtime.IMAGE_PLACEHOLDER, "[图片: out/b.gif]", 1) == "[图片: out/b.gif]"
+        assert text.replace(runtime.message_text.IMAGE_PLACEHOLDER, "[图片: out/b.gif]", 1) == "[图片: out/b.gif]"
 
     def test_forward_media_text_strips_the_image_placeholder(self, runtime) -> None:
         message = [
@@ -152,8 +152,8 @@ class TestImagePlaceholder:
             {"type": "mface", "data": {"url": "http://x/b.gif"}},
         ]
 
-        text = runtime._forward_media_text(message, _BOT_ID)
+        text = runtime.proactive._forward_media_text(message, _BOT_ID)
 
         assert text == "看这个"
-        assert runtime.IMAGE_PLACEHOLDER not in text
+        assert runtime.message_text.IMAGE_PLACEHOLDER not in text
         assert "[mface]" not in text

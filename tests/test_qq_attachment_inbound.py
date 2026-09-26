@@ -100,7 +100,7 @@ def _patch_no_get_msg(runtime, monkeypatch: pytest.MonkeyPatch) -> None:
     async def _none(bot: Any, reply_message_id: Any):
         return None
 
-    monkeypatch.setattr(runtime, "_get_reply_message", _none)
+    monkeypatch.setattr(runtime.message_text, "_get_reply_message", _none)
 
 
 class TestReplyPayloadFallback:
@@ -114,7 +114,7 @@ class TestReplyPayloadFallback:
         )
         event = types.SimpleNamespace(reply=reply_obj, raw_message="[CQ:reply,id=777]")
 
-        text, _atts = asyncio.run(runtime._build_reply_context(event, bot, "qq_group:1"))
+        text, _atts = asyncio.run(runtime.history._build_reply_context(event, bot, "qq_group:1"))
 
         assert "被引用的原话" in text
         assert "无法获取引用消息内容" not in text
@@ -123,7 +123,7 @@ class TestReplyPayloadFallback:
         self, runtime, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _patch_no_get_msg(runtime, monkeypatch)
-        runtime._adapter.reply_message_cache["555"] = {
+        runtime.state._adapter.reply_message_cache["555"] = {
             "message": None,
             "raw_message": "缓存里的原话",
             "sender": {"user_id": 12345, "nickname": "甲", "card": "甲"},
@@ -133,7 +133,7 @@ class TestReplyPayloadFallback:
         bot = types.SimpleNamespace(self_id="90000")
         event = types.SimpleNamespace(reply=None, raw_message="[CQ:reply,id=555]")
 
-        text, _atts = asyncio.run(runtime._build_reply_context(event, bot, "qq_group:1"))
+        text, _atts = asyncio.run(runtime.history._build_reply_context(event, bot, "qq_group:1"))
 
         assert "缓存里的原话" in text
         assert text.startswith("[")
@@ -150,7 +150,7 @@ class TestReplyPayloadFallback:
         )
         event = types.SimpleNamespace(reply=reply_obj, raw_message="[CQ:reply,id=888]")
 
-        nodes = asyncio.run(runtime._forward_nodes_from_reply(bot, event, "qq_group:1"))
+        nodes = asyncio.run(runtime.proactive._forward_nodes_from_reply(bot, event, "qq_group:1"))
 
         assert nodes
         assert any("转发的原话" in str(n) for n in nodes)
@@ -172,7 +172,7 @@ class TestReplyPayloadFallback:
         )
         event = types.SimpleNamespace(reply=reply_obj, raw_message="[CQ:reply,id=888]")
 
-        nodes = asyncio.run(runtime._forward_nodes_from_reply(bot, event, "qq_group:1"))
+        nodes = asyncio.run(runtime.proactive._forward_nodes_from_reply(bot, event, "qq_group:1"))
 
         assert any("内嵌里的原话" in str(n) for n in nodes)
 
@@ -199,7 +199,7 @@ class TestImageHeaderSniffing:
         fake.write_bytes(_PDF)
 
         result, errors = asyncio.run(
-            runtime._image_sources_to_attachments([runtime.ImageSource(f"file://{fake.as_posix()}")], "qq_group_x")
+            runtime.media._image_sources_to_attachments([runtime.models.ImageSource(f"file://{fake.as_posix()}")], "qq_group_x")
         )
 
         assert result == []
@@ -216,7 +216,7 @@ class TestImageHeaderSniffing:
         source_file.write_bytes(_GIF)
 
         result, errors = asyncio.run(
-            runtime._image_sources_to_attachments([runtime.ImageSource(f"file://{source_file.as_posix()}")], "qq_group_y")
+            runtime.media._image_sources_to_attachments([runtime.models.ImageSource(f"file://{source_file.as_posix()}")], "qq_group_y")
         )
 
         assert errors == []
@@ -233,10 +233,10 @@ class TestDownloadSizeLimits:
     ) -> None:
         set_live_config(runtime, image_max_bytes=4096)
         fake = _make_fake_httpx([b"\x00" * 1024] * 1024, {})
-        monkeypatch.setattr(runtime, "httpx", fake)
+        monkeypatch.setattr(runtime.media, "httpx", fake)
 
         result, errors = asyncio.run(
-            runtime._image_sources_to_attachments([runtime.ImageSource("https://cdn.example/big.png")], "qq_group:1")
+            runtime.media._image_sources_to_attachments([runtime.models.ImageSource("https://cdn.example/big.png")], "qq_group:1")
         )
 
         assert result == []
@@ -250,10 +250,10 @@ class TestDownloadSizeLimits:
     ) -> None:
         set_live_config(runtime, image_max_bytes=4096)
         fake = _make_fake_httpx([], {"content-length": "99999999"}, fail_on_iter=True)
-        monkeypatch.setattr(runtime, "httpx", fake)
+        monkeypatch.setattr(runtime.media, "httpx", fake)
 
         result, errors = asyncio.run(
-            runtime._image_sources_to_attachments([runtime.ImageSource("https://cdn.example/huge.png")], "qq_group:1")
+            runtime.media._image_sources_to_attachments([runtime.models.ImageSource("https://cdn.example/huge.png")], "qq_group:1")
         )
 
         assert result == []
@@ -264,10 +264,10 @@ class TestDownloadSizeLimits:
         self, runtime, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         fake = _make_fake_httpx([_PNG], {"content-type": "image/png"})
-        monkeypatch.setattr(runtime, "httpx", fake)
+        monkeypatch.setattr(runtime.media, "httpx", fake)
 
         result, errors = asyncio.run(
-            runtime._image_sources_to_attachments([runtime.ImageSource("https://cdn.example/small.png")], "qq_group:2")
+            runtime.media._image_sources_to_attachments([runtime.models.ImageSource("https://cdn.example/small.png")], "qq_group:2")
         )
 
         assert errors == []
@@ -280,10 +280,10 @@ class TestDownloadSizeLimits:
     ) -> None:
         set_live_config(runtime, file_max_bytes=4096)
         fake = _make_fake_httpx([b"\x00" * 1024] * 64, {})
-        monkeypatch.setattr(runtime, "httpx", fake)
+        monkeypatch.setattr(runtime.media, "httpx", fake)
 
         result, errors = asyncio.run(
-            runtime._file_sources_to_attachments(
+            runtime.media._file_sources_to_attachments(
                 [{"source": "https://cdn.example/big.zip", "name": "big.zip", "size": 0}],
                 "qq_group:3",
             )
@@ -307,7 +307,7 @@ class TestAttachmentCleanup:
         self._write_old(qq_file, 2)
         self._write_old(engine_file, 2)
 
-        runtime._cleanup_old_qq_attachments(now=time.time())
+        runtime.media._cleanup_old_qq_attachments(now=time.time())
 
         assert not qq_file.exists()
         assert engine_file.exists()
@@ -317,9 +317,9 @@ class TestAttachmentCleanup:
         self._write_old(f, 2)
         rel = f.relative_to(tmp_path).as_posix()
 
-        runtime._remember_reply_attachments("m1", "qq_group:1", "1", [{"type": "image", "path": rel}])
+        runtime.media._remember_reply_attachments("m1", "qq_group:1", "1", [{"type": "image", "path": rel}])
 
-        cutoff = time.time() - runtime.IMAGE_CACHE_TTL_SECONDS
+        cutoff = time.time() - runtime.routing.IMAGE_CACHE_TTL_SECONDS
         assert f.stat().st_mtime > cutoff
 
     def test_periodic_cleanup_runs_without_downloads(
@@ -332,30 +332,30 @@ class TestAttachmentCleanup:
         async def _cancel(*args: Any, **kwargs: Any) -> None:
             raise asyncio.CancelledError
 
-        monkeypatch.setattr(runtime.asyncio, "sleep", _cancel)
+        monkeypatch.setattr(runtime.models.asyncio, "sleep", _cancel)
 
         async def _run_once() -> None:
             with contextlib.suppress(asyncio.CancelledError):
-                await runtime._attachment_cleanup_forever()
+                await runtime.lifecycle._attachment_cleanup_forever()
 
         asyncio.run(_run_once())
 
         assert not f.exists()
 
     def test_dead_path_not_returned(self, runtime) -> None:
-        runtime._adapter.reply_attachment_cache["m9"] = {
+        runtime.state._adapter.reply_attachment_cache["m9"] = {
             "conversation_key": "qq_group:1",
             "sender_id": "1",
             "created_at": time.time(),
             "attachments": [{"type": "image", "path": "data/attachments/qq_group_1/missing.png"}],
         }
 
-        assert runtime._cached_reply_image_attachments("m9", "qq_group:1") == []
+        assert runtime.media._cached_reply_image_attachments("m9", "qq_group:1") == []
 
 
 class TestInboundFilePolicy:
     def test_pure_policy_rules(self, runtime) -> None:
-        reject = runtime.inbound_file_reject_reason
+        reject = runtime.media.inbound_file_reject_reason
         assert reject("a.exe") == "unsupported_type"
         assert reject("a.pdf", b"MZ\x90\x00") == "executable_content"
         assert reject("a.pdf", b"%PDF-1.7") == ""
@@ -372,7 +372,7 @@ class TestInboundFilePolicy:
         bad.write_bytes(b"MZ" + b"\x00" * 64)
 
         result, errors = asyncio.run(
-            runtime._file_sources_to_attachments(
+            runtime.media._file_sources_to_attachments(
                 [{"source": f"file://{bad.as_posix()}", "name": "x.exe", "size": 0}],
                 "qq_group:e",
             )
@@ -389,7 +389,7 @@ class TestInboundFilePolicy:
         bad.write_bytes(b"MZ\x90\x00" + b"\x00" * 64)
 
         result, errors = asyncio.run(
-            runtime._file_sources_to_attachments(
+            runtime.media._file_sources_to_attachments(
                 [{"source": f"file://{bad.as_posix()}", "name": "report.pdf", "size": 0}],
                 "qq_group:d",
             )
@@ -406,7 +406,7 @@ class TestInboundFilePolicy:
         note.write_text("hello", encoding="utf-8")
 
         result, errors = asyncio.run(
-            runtime._file_sources_to_attachments(
+            runtime.media._file_sources_to_attachments(
                 [{"source": f"file://{note.as_posix()}", "name": "note.txt", "size": 0}],
                 "qq_group:ok",
             )
@@ -424,7 +424,7 @@ class TestInboundFilePolicy:
         secret.write_text("top secret", encoding="utf-8")
 
         result, errors = asyncio.run(
-            runtime._file_sources_to_attachments(
+            runtime.media._file_sources_to_attachments(
                 [{"source": f"file://{secret.as_posix()}", "name": "secret.txt", "size": 0}],
                 "qq_group:x",
             )
@@ -442,7 +442,7 @@ class TestInboundFilePolicy:
         real.write_bytes(_PNG)
 
         result, errors = asyncio.run(
-            runtime._image_sources_to_attachments([runtime.ImageSource(f"file://{real.as_posix()}")], "qq_group:xi")
+            runtime.media._image_sources_to_attachments([runtime.models.ImageSource(f"file://{real.as_posix()}")], "qq_group:xi")
         )
 
         assert result == []
@@ -460,7 +460,7 @@ class TestInboundFilePolicy:
         rt = load_runtime(monkeypatch, workspace)
 
         result, errors = asyncio.run(
-            rt._file_sources_to_attachments(
+            rt.media._file_sources_to_attachments(
                 [{"source": f"file://{note.as_posix()}", "name": "note.txt", "size": 0}],
                 "qq_group:root",
             )

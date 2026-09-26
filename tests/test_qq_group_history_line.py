@@ -23,7 +23,7 @@ if str(_TESTS) not in sys.path:
 
 from clonoth_sdk.state import SessionState  # noqa: E402
 
-from _onebot_harness import load_runtime, set_live_config  # noqa: E402
+from _onebot_harness import load_runtime, set_live_config, adapter_source  # noqa: E402
 
 _GROUP_ID = 7
 _USER_ID = 10001
@@ -78,10 +78,10 @@ class _Matcher:
 @pytest.fixture()
 def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     module = load_runtime(monkeypatch, tmp_path)
-    monkeypatch.setattr(module, "GroupUploadNoticeEvent", _UploadEvent, raising=False)
+    monkeypatch.setattr(module.handlers, "GroupUploadNoticeEvent", _UploadEvent, raising=False)
     # 真下载会去访问 source，这里只关心历史行拼装。
     monkeypatch.setattr(
-        module, "_file_sources_to_attachments",
+        module.media, "_file_sources_to_attachments",
         lambda sources, conversation_key: _immediately([]),
         raising=True,
     )
@@ -92,10 +92,10 @@ def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 @pytest.fixture()
 def local_command(runtime: Any, monkeypatch: pytest.MonkeyPatch):
     """在群里发一条本地命令，走完整条 _process_group_message，返回收到回复的 matcher。"""
-    runtime._adapter.client = SimpleNamespace()
-    runtime._adapter.session_state = SessionState()
+    runtime.state._adapter.client = SimpleNamespace()
+    runtime.state._adapter.session_state = SessionState()
     monkeypatch.setattr(
-        runtime, "_collect_qq_attachments",
+        runtime.media, "_collect_qq_attachments",
         lambda bot, event, conversation_key: _immediately([]),
         raising=True,
     )
@@ -103,7 +103,7 @@ def local_command(runtime: Any, monkeypatch: pytest.MonkeyPatch):
     def _run(text: str) -> _Matcher:
         matcher = _Matcher()
         with pytest.raises(_Finished):
-            asyncio.run(runtime._process_group_message(
+            asyncio.run(runtime.handlers._process_group_message(
                 SimpleNamespace(self_id="900001"),
                 _MessageEvent([{"type": "text", "data": {"text": text}}]),
                 matcher,
@@ -114,19 +114,19 @@ def local_command(runtime: Any, monkeypatch: pytest.MonkeyPatch):
 
 
 def _upload(runtime: Any, file_info: dict[str, Any]) -> None:
-    asyncio.run(runtime._handle_group_upload_notice(SimpleNamespace(self_id="900001"), _UploadEvent(file_info)))
+    asyncio.run(runtime.handlers._handle_group_upload_notice(SimpleNamespace(self_id="900001"), _UploadEvent(file_info)))
 
 
 def _history(runtime: Any) -> list[str]:
-    return [entry.text for entry in runtime._adapter.group_history[_GROUP_ID]]
+    return [entry.text for entry in runtime.state._adapter.group_history[_GROUP_ID]]
 
 
 class TestOneAssembler:
     def test_a_group_upload_line_matches_a_message_line(self, runtime) -> None:
         # 文件名同时踩上结构符号和已登记 QQ 号：两条路径任何一处不共享，等式立刻不成立。
-        runtime._anonymize_user_id("1234567890")
+        runtime.anonymize._anonymize_user_id("1234567890")
         name = "[图片]1234567890.pdf"
-        runtime._record_group_message(runtime._inbound_facts(
+        runtime.history._record_group_message(runtime.inbound._inbound_facts(
             SimpleNamespace(self_id="900001"), _MessageEvent([{"type": "file", "data": {"name": name}}]),
         ))
         _upload(runtime, {"name": name, "url": "http://x/a.pdf", "size": 12})
@@ -136,7 +136,7 @@ class TestOneAssembler:
         assert len(lines) == 2
         assert lines[0] == lines[1]
         assert "1234567890" not in lines[1]
-        assert runtime.IMAGE_PLACEHOLDER not in lines[1]
+        assert runtime.message_text.IMAGE_PLACEHOLDER not in lines[1]
 
     def test_a_file_name_cannot_forge_an_image_placeholder(self, runtime) -> None:
         # 群成员用文件名伪造 [图片]，就能吃掉一次附件路径回填。
@@ -144,11 +144,11 @@ class TestOneAssembler:
 
         line = _history(runtime)[0]
 
-        assert runtime.IMAGE_PLACEHOLDER not in line
+        assert runtime.message_text.IMAGE_PLACEHOLDER not in line
         assert "(图片).txt" in line
 
     def test_a_known_qq_number_in_a_file_name_is_anonymized(self, runtime) -> None:
-        alias = runtime._anonymize_user_id("1234567890")
+        alias = runtime.anonymize._anonymize_user_id("1234567890")
         _upload(runtime, {"name": "1234567890.txt", "url": "http://x/a.txt"})
 
         line = _history(runtime)[0]
@@ -164,7 +164,7 @@ class TestOneAssembler:
         body = line.split(": ", 1)[1]
 
         # _safe_attachment_name 放行 120 字符，不压缩的话 notice 行会比任何消息行都长。
-        assert len(body) == runtime.live.history_text_limit + 1
+        assert len(body) == runtime.state.live.history_text_limit + 1
         assert body.endswith("…")
 
 
@@ -172,7 +172,7 @@ class TestBothCachesGetTheLine:
     def test_a_group_upload_writes_both_caches(self, runtime) -> None:
         _upload(runtime, {"name": "报告.pdf", "url": "http://x/报告.pdf"})
 
-        records = list(runtime._adapter.group_content_records[_GROUP_ID])
+        records = list(runtime.state._adapter.group_content_records[_GROUP_ID])
 
         assert len(_history(runtime)) == 1
         assert len(records) == 1
@@ -180,9 +180,9 @@ class TestBothCachesGetTheLine:
         assert records[0].timestamp == float(_EVENT_TIME)
 
     def test_a_bot_reply_writes_both_caches(self, runtime) -> None:
-        runtime._record_bot_reply(_GROUP_ID, "好的")
+        runtime.history._record_bot_reply(_GROUP_ID, "好的")
 
-        records = list(runtime._adapter.group_content_records[_GROUP_ID])
+        records = list(runtime.state._adapter.group_content_records[_GROUP_ID])
 
         assert len(records) == 1
         assert records[0].sender_name == "Bot"
@@ -192,7 +192,7 @@ class TestBothCachesGetTheLine:
     def test_a_local_command_reply_writes_both_caches(self, runtime, local_command) -> None:
         local_command("/绘图帮助")
 
-        records = list(runtime._adapter.group_content_records[_GROUP_ID])
+        records = list(runtime.state._adapter.group_content_records[_GROUP_ID])
 
         assert [record.sender_name for record in records][-1] == "Bot"
         assert [record.formatted_line for record in records] == _history(runtime)
@@ -200,14 +200,14 @@ class TestBothCachesGetTheLine:
     def test_attachments_are_copied_not_shared(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
         shared = [{"path": "out/a.txt", "name": "a.txt"}]
         monkeypatch.setattr(
-            runtime, "_file_sources_to_attachments",
+            runtime.media, "_file_sources_to_attachments",
             lambda sources, conversation_key: _immediately(shared),
             raising=True,
         )
         _upload(runtime, {"name": "a.txt", "url": "http://x/a.txt"})
 
         shared[0]["path"] = "out/tampered.txt"
-        records = list(runtime._adapter.group_content_records[_GROUP_ID])
+        records = list(runtime.state._adapter.group_content_records[_GROUP_ID])
 
         assert records[0].attachments == [{"path": "out/a.txt", "name": "a.txt"}]
 
@@ -239,7 +239,7 @@ class TestLocalCommandsStayInHistory:
         """新分支直接 matcher.finish(reply) 就又把这段交互从群历史里抹掉了。"""
         import ast
 
-        tree = ast.parse((_ROOT / "adapters/onebot/onebot_plugin.py").read_text(encoding="utf-8"))
+        tree = ast.parse(adapter_source())
         handler = next(
             node for node in ast.walk(tree)
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_process_group_message"

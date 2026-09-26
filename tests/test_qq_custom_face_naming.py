@@ -63,7 +63,7 @@ def in_group(user_id: int) -> SimpleNamespace:
 
 
 def custom_face(runtime: Any, bot: Any, event: Any, text: str) -> str | None:
-    return asyncio.run(runtime._maybe_handle_custom_face_command(
+    return asyncio.run(runtime.commands._maybe_handle_custom_face_command(
         bot=bot, event=event, user_text=text, conversation_key="k", current_attachments=[],
     ))
 
@@ -71,7 +71,7 @@ def custom_face(runtime: Any, bot: Any, event: Any, text: str) -> str | None:
 def test_details_keep_every_face_at_its_real_index(runtime: Any) -> None:
     bot = FaceBot(FACES)
 
-    items = asyncio.run(runtime.list_custom_face_details(bot, []))
+    items = asyncio.run(runtime.state._adapter.emoji.list_custom_face_details(bot, []))
 
     assert len(items) == 3
     assert [it["index"] for it in items] == [1, 2, 3]
@@ -80,9 +80,9 @@ def test_details_keep_every_face_at_its_real_index(runtime: Any) -> None:
 def test_index_round_trips_to_the_same_face(runtime: Any) -> None:
     bot = FaceBot(FACES)
 
-    items = asyncio.run(runtime.list_custom_face_details(bot, []))
+    items = asyncio.run(runtime.state._adapter.emoji.list_custom_face_details(bot, []))
     for item in items:
-        resolved = asyncio.run(runtime.resolve_custom_face(bot, str(item["index"]), []))
+        resolved = asyncio.run(runtime.state._adapter.emoji.resolve_custom_face(bot, str(item["index"]), []))
         assert resolved is FACES[item["index"] - 1]
         # 屏幕序号必须解析回它标注的那张脸；md5 是稳定身份，去重错位会让二者不一致。
         assert isinstance(resolved, dict) and resolved.get("md5") == item["md5"]
@@ -91,9 +91,9 @@ def test_index_round_trips_to_the_same_face(runtime: Any) -> None:
 def test_duplicate_names_carry_md5_and_unnamed_does_not(runtime: Any) -> None:
     bot = FaceBot(FACES)
 
-    items = asyncio.run(runtime.list_custom_face_details(bot, []))
-    dups = runtime.duplicated_detail_names(items)
-    lines = [runtime.format_custom_face_detail_line(it, dups) for it in items]
+    items = asyncio.run(runtime.state._adapter.emoji.list_custom_face_details(bot, []))
+    dups = runtime.commands.duplicated_detail_names(items)
+    lines = [runtime.commands.format_custom_face_detail_line(it, dups) for it in items]
 
     assert "md5:" in lines[0] and "md5:" in lines[1]
     assert "md5:" not in lines[2]
@@ -111,7 +111,7 @@ def test_detail_command_prints_true_index(runtime: Any) -> None:
 
 def test_name_list_command_has_no_locator_numbers(runtime: Any) -> None:
     bot = FaceBot(FACES)
-    runtime.write_custom_face_names(runtime.CUSTOM_FACE_NAMES_PATH, ["开心", "点赞", "微笑"])
+    runtime.emotes.write_custom_face_names(runtime.emotes.CUSTOM_FACE_NAMES_PATH, ["开心", "点赞", "微笑"])
 
     reply = custom_face(runtime, bot, in_group(ADMIN_QQ), "/表情列表")
 

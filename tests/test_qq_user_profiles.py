@@ -29,7 +29,7 @@ def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 def _profiles(runtime: Any, tmp_path: Path, text: str, suffix: str = ".yaml") -> dict[str, Any]:
     path = tmp_path / f"qq_user_profiles{suffix}"
     path.write_text(text, encoding="utf-8")
-    return runtime._load_qq_user_profiles(str(path))
+    return runtime.identity._load_qq_user_profiles(str(path))
 
 
 class TestBooleanLiteralsStayText:
@@ -66,7 +66,7 @@ class TestTheRestOfTheContractHolds:
         assert profiles == {"10001": {"display_name": "张三"}}
 
     def test_a_missing_file_is_not_an_error(self, runtime: Any, tmp_path: Path) -> None:
-        assert runtime._load_qq_user_profiles(str(tmp_path / "nope.yaml")) == {}
+        assert runtime.identity._load_qq_user_profiles(str(tmp_path / "nope.yaml")) == {}
 
     def test_a_broken_file_yields_nothing(self, runtime: Any, tmp_path: Path) -> None:
         assert _profiles(runtime, tmp_path, "users: [oops\n") == {}

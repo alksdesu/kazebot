@@ -17,6 +17,12 @@ import yaml
 _ADAPTER_ROOT = Path(__file__).resolve().parents[1] / "adapters" / "onebot"
 
 
+def adapter_source() -> str:
+    """插件入口、状态类和 napcat 本体的全部源码，给静态接线检查用。"""
+    paths = [_ADAPTER_ROOT / "onebot_plugin.py", _ADAPTER_ROOT / "adapter.py", *sorted((_ADAPTER_ROOT / "napcat").glob("*.py"))]
+    return "\n".join(path.read_text(encoding="utf-8") for path in paths)
+
+
 def install_nonebot_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     class Matcher:
         def handle(self, *args: Any, **kwargs: Any):
@@ -119,6 +125,40 @@ def load_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
     return module
+
+
+def napcat_modules(runtime: Any) -> list[types.ModuleType]:
+    """这份插件实例下已加载的全部适配器本体模块。"""
+    package = sys.modules[f"{runtime.__name__}.napcat"]
+    return [value for value in vars(package).values() if isinstance(value, types.ModuleType)]
+
+
+def body_attr(runtime: Any, name: str) -> Any:
+    """按名字取本体里定义的对象，调用方不必知道它落在哪个模块。"""
+    for module in napcat_modules(runtime):
+        if name in vars(module):
+            return vars(module)[name]
+    raise AttributeError(name)
+
+
+def patch_body(monkeypatch: pytest.MonkeyPatch, runtime: Any, name: str, value: Any) -> None:
+    """替换本体里定义 name 的那个模块上的对象，同模块和跨模块的调用方都会看到替身。"""
+    for module in napcat_modules(runtime):
+        if name in vars(module):
+            monkeypatch.setattr(module, name, value)
+            return
+    raise AttributeError(name)
+
+
+def patch_imported(monkeypatch: pytest.MonkeyPatch, runtime: Any, name: str, value: Any, *, raising: bool = True) -> None:
+    """替换所有导入了 name 的本体模块：同一个导入名分散在好几个模块里，只换一处等于没换。"""
+    hit = False
+    for module in napcat_modules(runtime):
+        if hasattr(module, name):
+            monkeypatch.setattr(module, name, value)
+            hit = True
+    if raising and not hit:
+        raise AttributeError(name)
 
 
 def load_live_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **env: str):

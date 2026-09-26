@@ -20,9 +20,9 @@ _TESTS = Path(__file__).resolve().parent
 if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
-from _onebot_harness import load_runtime  # noqa: E402
+from _onebot_harness import load_runtime, adapter_source  # noqa: E402
 
-_ADAPTER_SOURCE = _ROOT / "adapters" / "onebot" / "onebot_plugin.py"
+
 _HINT_MARK = "不得从聊天历史猜测图片内容"
 
 
@@ -37,13 +37,13 @@ def _attachment(path: str, **extra: Any) -> dict[str, Any]:
 
 class TestTheNoGuessingHint:
     def test_a_bare_image_question_gets_the_no_guessing_hint(self, runtime) -> None:
-        result = runtime._apply_attachment_hints("【当前用户指令】这张图里是啥", "这张图里是啥", [], [])
+        result = runtime.inbound._apply_attachment_hints("【当前用户指令】这张图里是啥", "这张图里是啥", [], [])
 
         assert _HINT_MARK in result
 
     def test_an_image_question_with_an_attachment_gets_no_hint(self, runtime) -> None:
-        result = runtime._apply_attachment_hints(
-            f"【当前用户指令】这张图里是啥{runtime.IMAGE_PLACEHOLDER}",
+        result = runtime.inbound._apply_attachment_hints(
+            f"【当前用户指令】这张图里是啥{runtime.message_text.IMAGE_PLACEHOLDER}",
             "这张图里是啥",
             [_attachment("out/a.jpg")],
             [],
@@ -52,17 +52,17 @@ class TestTheNoGuessingHint:
         assert "【图片处理提示】" not in result
 
     def test_a_plain_question_gets_no_hint(self, runtime) -> None:
-        result = runtime._apply_attachment_hints("【当前用户指令】今天天气如何", "今天天气如何", [], [])
+        result = runtime.inbound._apply_attachment_hints("【当前用户指令】今天天气如何", "今天天气如何", [], [])
 
         assert result == "【当前用户指令】今天天气如何"
 
     def test_errors_are_deduplicated(self, runtime) -> None:
-        result = runtime._apply_attachment_hints("正文", "你好", [], ["下载失败", "下载失败"])
+        result = runtime.inbound._apply_attachment_hints("正文", "你好", [], ["下载失败", "下载失败"])
 
         assert result.count("下载失败") == 1
 
     def test_a_download_error_still_reaches_the_model_without_an_image_question(self, runtime) -> None:
-        result = runtime._apply_attachment_hints("正文", "你好", [], ["下载失败"])
+        result = runtime.inbound._apply_attachment_hints("正文", "你好", [], ["下载失败"])
 
         assert "【图片处理提示】" in result
         assert _HINT_MARK not in result
@@ -70,8 +70,8 @@ class TestTheNoGuessingHint:
 
 class TestPlaceholderBackfill:
     def test_each_attachment_consumes_one_placeholder(self, runtime) -> None:
-        placeholder = runtime.IMAGE_PLACEHOLDER
-        result = runtime._apply_attachment_hints(
+        placeholder = runtime.message_text.IMAGE_PLACEHOLDER
+        result = runtime.inbound._apply_attachment_hints(
             f"看这两张{placeholder}和{placeholder}",
             "看这两张图片",
             [_attachment("out/a.jpg"), _attachment("out/b.png")],
@@ -82,8 +82,8 @@ class TestPlaceholderBackfill:
         assert placeholder not in result.replace("[图片: ", "")
 
     def test_a_spare_attachment_leaves_the_text_alone(self, runtime) -> None:
-        result = runtime._apply_attachment_hints(
-            f"只有一个{runtime.IMAGE_PLACEHOLDER}",
+        result = runtime.inbound._apply_attachment_hints(
+            f"只有一个{runtime.message_text.IMAGE_PLACEHOLDER}",
             "看图",
             [_attachment("out/a.jpg"), _attachment("out/b.png")],
             [],
@@ -92,11 +92,17 @@ class TestPlaceholderBackfill:
         assert result == "只有一个[图片: out/a.jpg]"
 
 
+
+def _callee(call: ast.Call) -> str:
+    """被调函数名；跨模块调用写成 模块.函数，同样算数。"""
+    func = call.func
+    return func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+
 class TestOnlyOneImplementation:
     """ast 静态断言：提示文案和回填只能有一份实现，群聊/私聊各调一次。"""
 
     def _module(self) -> ast.Module:
-        return ast.parse(_ADAPTER_SOURCE.read_text(encoding="utf-8"))
+        return ast.parse(adapter_source())
 
     def test_the_hint_text_appears_exactly_once_in_the_module(self) -> None:
         literals = [
@@ -116,8 +122,7 @@ class TestOnlyOneImplementation:
         calls = [
             node for node in ast.walk(module)
             if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_apply_attachment_hints"
+            and _callee(node) == "_apply_attachment_hints"
         ]
 
         assert len(definitions) == 1
@@ -142,8 +147,7 @@ class TestOnlyOneImplementation:
             count = sum(
                 1 for node in ast.walk(top_level)
                 if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "_attachment_label"
+                and _callee(node) == "_attachment_label"
             )
             if count:
                 owners[top_level.name] = count

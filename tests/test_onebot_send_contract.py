@@ -27,7 +27,7 @@ _TESTS = Path(__file__).resolve().parent
 if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
-from _onebot_harness import load_live_config, load_runtime as _load_runtime, set_live_config, write_live_config  # noqa: E402
+from _onebot_harness import load_live_config, load_runtime as _load_runtime, set_live_config, write_live_config, patch_imported  # noqa: E402
 from clonoth_sdk.types import DeliveryContext  # noqa: E402
 
 _MODULE_PATH = Path(__file__).resolve().parents[1] / "adapters" / "onebot" / "send_contract.py"
@@ -45,7 +45,7 @@ sys.modules[_EMOJI_SPEC.name] = _EMOJI_MODULE
 _EMOJI_SPEC.loader.exec_module(_EMOJI_MODULE)
 
 from _onebot_emoji_handler import (  # type: ignore[import-not-found]  # noqa: E402
-    process_emojis,
+    EmojiRenderer,
     strip_output_markers,
 )
 from _onebot_send_contract import (  # type: ignore[import-not-found]  # noqa: E402
@@ -101,7 +101,7 @@ def test_default_markdown_policy_strips_stars_but_preserves_underscores() -> Non
 
     assert strip_output_markers(source) == expected
 
-    segments = asyncio.run(process_emojis(source, _Bot(), []))
+    segments = asyncio.run(EmojiRenderer().process_emojis(source, _Bot(), []))
     assert "".join(str(item.get("content") or "") for item in segments) == expected
 
 
@@ -785,55 +785,55 @@ class _AtGroupBot:
 
 
 def _at_message(runtime: Any) -> Any:
-    return runtime.MessageSegment.at(111) + runtime.MessageSegment.text("hi")
+    return runtime.state.MessageSegment.at(111) + runtime.state.MessageSegment.text("hi")
 
 
 def test_group_at_message_is_not_resent_after_ambiguous_timeout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     runtime = _load_runtime(monkeypatch, tmp_path)
-    bot = _AtGroupBot([runtime.ActionFailed("Timeout: NTEvent ... sendMsg")])
+    bot = _AtGroupBot([runtime.sending.ActionFailed("Timeout: NTEvent ... sendMsg")])
 
-    with pytest.raises(runtime.OneBotAmbiguousAckError):
-        asyncio.run(runtime._send_qq_message(
+    with pytest.raises(runtime.sending.OneBotAmbiguousAckError):
+        asyncio.run(runtime.sending._send_qq_message(
             bot, {"type": "group", "group_id": 5}, _at_message(runtime),
             idempotency_key="k-timeout",
         ))
 
     assert len(bot.sends) == 1
-    assert asyncio.run(runtime._adapter.outbound_idempotency.state("k-timeout")) == "ambiguous"
+    assert asyncio.run(runtime.state._adapter.outbound_idempotency.state("k-timeout")) == "ambiguous"
 
 
 def test_group_unknown_failure_is_not_resent_as_at_text(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     runtime = _load_runtime(monkeypatch, tmp_path)
-    bot = _AtGroupBot([runtime.ActionFailed("rich media transfer failed")])
+    bot = _AtGroupBot([runtime.sending.ActionFailed("rich media transfer failed")])
 
-    with pytest.raises(runtime.OneBotAmbiguousAckError):
-        asyncio.run(runtime._send_qq_message(
+    with pytest.raises(runtime.sending.OneBotAmbiguousAckError):
+        asyncio.run(runtime.sending._send_qq_message(
             bot, {"type": "group", "group_id": 5}, _at_message(runtime),
             idempotency_key="k-unknown",
         ))
 
     assert len(bot.sends) == 1
-    assert asyncio.run(runtime._adapter.outbound_idempotency.state("k-unknown")) == "ambiguous"
+    assert asyncio.run(runtime.state._adapter.outbound_idempotency.state("k-unknown")) == "ambiguous"
 
 
 def test_group_at_uid_failure_degrades_to_text_once(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     runtime = _load_runtime(monkeypatch, tmp_path)
-    bot = _AtGroupBot([runtime.ActionFailed("Get Uid Error"), {"message_id": 77}])
+    bot = _AtGroupBot([runtime.sending.ActionFailed("Get Uid Error"), {"message_id": 77}])
 
-    result = asyncio.run(runtime._send_qq_message(
+    result = asyncio.run(runtime.sending._send_qq_message(
         bot, {"type": "group", "group_id": 5}, _at_message(runtime),
         idempotency_key="k-uid",
     ))
 
     assert result == "77"
     assert len(bot.sends) == 2
-    assert asyncio.run(runtime._adapter.outbound_idempotency.state("k-uid")) == "sent"
+    assert asyncio.run(runtime.state._adapter.outbound_idempotency.state("k-uid")) == "sent"
     second = bot.sends[1]
     assert all(seg.get("type") != "at" for seg in second)
     assert any("@群友" in str(seg.get("data", {}).get("text", "")) for seg in second)
@@ -844,11 +844,11 @@ def test_temp_file_missing_resend_keeps_at_segment(
 ) -> None:
     runtime = _load_runtime(monkeypatch, tmp_path)
     bot = _AtGroupBot([
-        runtime.ActionFailed("ENOENT: no such file or directory"),
+        runtime.sending.ActionFailed("ENOENT: no such file or directory"),
         {"message_id": 88},
     ])
 
-    result = asyncio.run(runtime._send_qq_message(
+    result = asyncio.run(runtime.sending._send_qq_message(
         bot, {"type": "group", "group_id": 5}, _at_message(runtime),
         idempotency_key="k-enoent",
     ))
@@ -862,8 +862,8 @@ def test_send_once_has_no_dead_dedupe_parameter(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     runtime = _load_runtime(monkeypatch, tmp_path)
-    once_params = inspect.signature(runtime._send_qq_message_once).parameters
-    send_params = inspect.signature(runtime._send_qq_message).parameters
+    once_params = inspect.signature(runtime.sending._send_qq_message_once).parameters
+    send_params = inspect.signature(runtime.sending._send_qq_message).parameters
 
     assert "dedupe" not in once_params
     assert "dedupe" not in send_params
@@ -932,10 +932,10 @@ def test_real_attachment_stack_awaits_all_and_aggregates_failure(
             raise ConnectionError("connection reset")
         return "message-2"
 
-    monkeypatch.setattr(runtime, "_send_attachment_path", send_path)
+    monkeypatch.setattr(runtime.outbound_attachments, "_send_attachment_path", send_path)
 
     async def exercise() -> None:
-        task = asyncio.create_task(runtime._send_text_and_attachments(
+        task = asyncio.create_task(runtime.outbound_attachments._send_text_and_attachments(
             object(), {"type": "group", "group_id": 1}, "",
             [{"path": str(tmp_path / "first.png")}, {"path": str(tmp_path / "second.png")}],
             send_context=DeliveryContext(event_id="evt-batch", idempotency_key="id:evt-batch"),
@@ -943,7 +943,7 @@ def test_real_attachment_stack_awaits_all_and_aggregates_failure(
         await asyncio.sleep(0)
         assert not task.done()
         release.set()
-        with pytest.raises(runtime.OneBotAttachmentBatchError):
+        with pytest.raises(runtime.outbound_attachments.OneBotAttachmentBatchError):
             await task
 
     asyncio.run(exercise())
@@ -970,19 +970,19 @@ def test_real_image_timeout_is_ambiguous_and_does_not_auto_resend(
 
     bot = Bot()
     context = DeliveryContext(event_id="evt-image", attempt=3, idempotency_key="id:evt-image")
-    with pytest.raises(runtime.OneBotAmbiguousAckError):
-        asyncio.run(runtime._send_attachment_path(
+    with pytest.raises(runtime.sending.OneBotAmbiguousAckError):
+        asyncio.run(runtime.outbound_attachments._send_attachment_path(
             bot, {"type": "group", "group_id": 1}, image, send_context=context,
         ))
     assert len(bot.files) == 1
     assert not bot.files[0].startswith("base64://")
-    identity = runtime.image_content_identity(image.read_bytes())
+    identity = runtime.outbound_attachments.image_content_identity(image.read_bytes())
     child = context.child(identity)
-    key = runtime.make_idempotency_key(
+    key = runtime.sending.make_idempotency_key(
         {"type": "group", "group_id": 1}, identity,
         event_id=child.idempotency_key or child.event_id,
     )
-    assert asyncio.run(runtime._adapter.outbound_idempotency.state(key)) == "ambiguous"
+    assert asyncio.run(runtime.state._adapter.outbound_idempotency.state(key)) == "ambiguous"
 
 
 def test_real_pending_owner_waits_and_forward_batch_is_claimed(
@@ -1009,11 +1009,11 @@ def test_real_pending_owner_waits_and_forward_batch_is_claimed(
     context = DeliveryContext(event_id="evt-owner")
 
     async def owner_conflict() -> None:
-        first = asyncio.create_task(runtime._send_qq_message(
+        first = asyncio.create_task(runtime.sending._send_qq_message(
             bot, target, "same", send_context=context, content_identity="same",
         ))
         await asyncio.sleep(0.05)
-        second = asyncio.create_task(runtime._send_qq_message(
+        second = asyncio.create_task(runtime.sending._send_qq_message(
             bot, target, "same", send_context=context, content_identity="same",
         ))
         await asyncio.sleep(0.05)
@@ -1030,7 +1030,7 @@ def test_real_pending_owner_waits_and_forward_batch_is_claimed(
     first_image.write_bytes(b"a")
     second_image.write_bytes(b"b")
     set_live_config(runtime, enable_image_forward_merge=True, image_forward_merge_threshold=2)
-    asyncio.run(runtime._send_attachments(
+    asyncio.run(runtime.outbound_attachments._send_attachments(
         bot, target, [{"path": str(first_image)}, {"path": str(second_image)}],
         send_context=DeliveryContext(event_id="evt-forward", idempotency_key="id:evt-forward"),
     ))
@@ -1061,7 +1061,7 @@ def test_image_all_fallback_failures_are_aggregated_under_same_owner(
     image = tmp_path / "failure.png"
     image.write_bytes(b"failure image")
     begin_owners: list[str] = []
-    original_begin = runtime._adapter.outbound_idempotency.begin
+    original_begin = runtime.state._adapter.outbound_idempotency.begin
 
     async def recording_begin(key: str):
         claim = await original_begin(key)
@@ -1069,14 +1069,14 @@ def test_image_all_fallback_failures_are_aggregated_under_same_owner(
             begin_owners.append(claim.owner)
         return claim
 
-    monkeypatch.setattr(runtime._adapter.outbound_idempotency, "begin", recording_begin)
+    monkeypatch.setattr(runtime.state._adapter.outbound_idempotency, "begin", recording_begin)
 
     class Bot:
         async def send_group_msg(self, **kwargs: Any):
             raise ConnectionError("connection reset")
 
-    with pytest.raises(runtime.OneBotAttachmentBatchError) as raised:
-        asyncio.run(runtime._send_attachment_path(
+    with pytest.raises(runtime.outbound_attachments.OneBotAttachmentBatchError) as raised:
+        asyncio.run(runtime.outbound_attachments._send_attachment_path(
             Bot(), {"type": "group", "group_id": 3}, image,
             send_context=DeliveryContext(event_id="all-fail", idempotency_key="id:all-fail"),
         ))
@@ -1088,7 +1088,7 @@ def test_long_forward_heartbeat_prevents_cross_instance_takeover(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     runtime = _load_runtime(monkeypatch, tmp_path)
-    runtime._adapter.outbound_idempotency.lease_seconds = 0.15
+    runtime.state._adapter.outbound_idempotency.lease_seconds = 0.15
     first_image, second_image = tmp_path / "one.png", tmp_path / "two.png"
     first_image.write_bytes(b"one")
     second_image.write_bytes(b"two")
@@ -1100,17 +1100,17 @@ def test_long_forward_heartbeat_prevents_cross_instance_takeover(
             return {"message_id": 99}
 
     async def exercise() -> None:
-        task = asyncio.create_task(runtime._try_send_images_as_forward(
+        task = asyncio.create_task(runtime.outbound_attachments._try_send_images_as_forward(
             Bot(), {"type": "group", "group_id": 5},
             [{"path": str(first_image)}, {"path": str(second_image)}],
             send_context=DeliveryContext(event_id="long-forward", idempotency_key="id:long-forward"),
         ))
         await asyncio.sleep(0.25)
-        row = runtime._adapter.outbound_idempotency._db.execute(
+        row = runtime.state._adapter.outbound_idempotency._db.execute(
             "SELECT key,lease_until FROM claims WHERE state='pending'"
         ).fetchone()
         assert row is not None and row[1] > time.time()
-        contender = TwoPhaseIdempotencyStore(runtime._adapter.outbound_idempotency.path)
+        contender = TwoPhaseIdempotencyStore(runtime.state._adapter.outbound_idempotency.path)
         contender.lease_seconds = 0.15
         conflict = await contender.begin(row[0])
         assert conflict.acquired is False and conflict.state == "pending"
@@ -1144,7 +1144,7 @@ def test_forward_merge_falls_back_to_one_by_one_on_permanent_failure(
             return {"message_id": len(self.group_sends)}
 
     bot = Bot()
-    asyncio.run(runtime._send_attachments(
+    asyncio.run(runtime.outbound_attachments._send_attachments(
         bot, {"type": "group", "group_id": 7},
         [{"path": str(first_image)}, {"path": str(second_image)}],
         send_context=DeliveryContext(event_id="evt-fallback", idempotency_key="id:evt-fallback"),
@@ -1170,8 +1170,8 @@ def test_forward_merge_ambiguous_ack_does_not_resend_one_by_one(
             return {"message_id": 1}
 
     bot = Bot()
-    with pytest.raises(runtime.OneBotAmbiguousAckError):
-        asyncio.run(runtime._send_attachments(
+    with pytest.raises(runtime.sending.OneBotAmbiguousAckError):
+        asyncio.run(runtime.outbound_attachments._send_attachments(
             bot, {"type": "group", "group_id": 7},
             [{"path": str(first_image)}, {"path": str(second_image)}],
             send_context=DeliveryContext(event_id="evt-amb", idempotency_key="id:evt-amb"),
@@ -1191,12 +1191,12 @@ def test_forward_card_message_id_maps_to_every_merged_image(
         async def call_api(self, name: str, **kwargs: Any):
             return {"message_id": 4242}
 
-    asyncio.run(runtime._send_attachments(
+    asyncio.run(runtime.outbound_attachments._send_attachments(
         Bot(), {"type": "group", "group_id": 7},
         [{"path": str(first_image)}, {"path": str(second_image)}],
         send_context=DeliveryContext(event_id="evt-map", idempotency_key="id:evt-map"),
     ))
-    records = runtime._message_attachment_records("4242", only_images=True)
+    records = runtime.outbound_attachments._message_attachment_records("4242", only_images=True)
     assert len(records) == 2
     assert {Path(r["path"]).name for r in records} == {"a.png", "b.png"}
 
@@ -1225,7 +1225,7 @@ def test_non_image_attachments_survive_a_failed_merge(
             return {"message_id": 1}
 
     bot = Bot()
-    asyncio.run(runtime._send_attachments(
+    asyncio.run(runtime.outbound_attachments._send_attachments(
         bot, {"type": "group", "group_id": 7},
         [
             {"path": str(first_image)},
@@ -1246,16 +1246,16 @@ def test_file_upload_crash_lease_replays_and_commits_content_claim(
     attachment.write_bytes(b"artifact bytes")
     target = {"type": "group", "group_id": 8}
     context = DeliveryContext(event_id="file-event", idempotency_key="id:file-event")
-    identity = f"file:sha256:{runtime.hashlib.sha256(attachment.read_bytes()).hexdigest()}"
+    identity = f"file:sha256:{runtime.emotes.hashlib.sha256(attachment.read_bytes()).hexdigest()}"
     child = context.child(identity)
-    key = runtime.make_idempotency_key(
+    key = runtime.sending.make_idempotency_key(
         target, identity, event_id=child.idempotency_key or child.event_id,
     )
 
     async def abandoned_claim() -> None:
-        claim = await runtime._adapter.outbound_idempotency.begin(key)
+        claim = await runtime.state._adapter.outbound_idempotency.begin(key)
         assert claim.acquired
-        runtime._adapter.outbound_idempotency._db.execute(
+        runtime.state._adapter.outbound_idempotency._db.execute(
             "UPDATE claims SET lease_until=0 WHERE key=?", (key,),
         )
 
@@ -1271,11 +1271,11 @@ def test_file_upload_crash_lease_replays_and_commits_content_claim(
             return {"message_id": 123}
 
     bot = Bot()
-    assert asyncio.run(runtime._send_attachment_path(
+    assert asyncio.run(runtime.outbound_attachments._send_attachment_path(
         bot, target, attachment, send_context=context,
     )) == "123"
     assert bot.calls == 1
-    assert asyncio.run(runtime._adapter.outbound_idempotency.state(key)) == "sent"
+    assert asyncio.run(runtime.state._adapter.outbound_idempotency.state(key)) == "sent"
 
 
 
@@ -1300,14 +1300,14 @@ def test_force_replay_context_bypasses_previous_onebot_sent_claim(
         event_id="force-platform", idempotency_key="id:force-platform:replay:1",
         replay_generation=1, force_replay=True,
     )
-    assert asyncio.run(runtime._send_qq_message(
+    assert asyncio.run(runtime.sending._send_qq_message(
         bot, target, "body", send_context=first, content_identity="body",
     )) == "1"
-    assert asyncio.run(runtime._send_qq_message(
+    assert asyncio.run(runtime.sending._send_qq_message(
         bot, target, "body", send_context=replay, content_identity="body",
     )) == "2"
     assert bot.calls == 2
-    assert runtime._adapter.outbound_idempotency.pending_ttl > 240
+    assert runtime.state._adapter.outbound_idempotency.pending_ttl > 240
 
 
 def test_bridge_independent_identical_text_and_file_requests_are_not_permanently_deduped(
@@ -1331,50 +1331,50 @@ def test_bridge_independent_identical_text_and_file_requests_are_not_permanently
             return {"message_id": 100 + self.file_calls}
 
     bot = Bot()
-    monkeypatch.setattr(runtime, "get_bot", lambda: bot)
+    patch_imported(monkeypatch, runtime, "get_bot", lambda: bot)
 
     # Delivering to another group and sending workspace files both require an admin
     # origin, so register the session the bridge resolves the requester from.
     set_live_config(runtime, admin_users=frozenset({10001}))
     monkeypatch.setitem(
-        runtime._adapter.session_targets, "sess-authz",
+        runtime.state._adapter.session_targets, "sess-authz",
         {"type": "group", "group_id": 99, "user_id": 10001},
     )
 
     async def resolve(*args: Any, **kwargs: Any):
-        return runtime.ProactiveTarget("group", 99, "Group99"), ""
+        return runtime.models.ProactiveTarget("group", 99, "Group99"), ""
 
     async def emojis(text: str, *args: Any, **kwargs: Any):
-        return [runtime.MessageSegment.text(text)]
+        return [runtime.state.MessageSegment.text(text)]
 
-    monkeypatch.setattr(runtime, "_forward_bridge_resolve_target", resolve)
-    monkeypatch.setattr(runtime, "process_emojis", emojis)
+    monkeypatch.setattr(runtime.forward_bridge, "_forward_bridge_resolve_target", resolve)
+    monkeypatch.setattr(runtime.state._adapter.emoji, "process_emojis", emojis)
     monkeypatch.setattr(
-        runtime, "_forward_bridge_resolve_files",
+        runtime.forward_bridge, "_forward_bridge_resolve_files",
         lambda *a, **k: ([{"path": str(artifact), "name": artifact.name}], []),
     )
 
     async def exercise() -> None:
         first_text = {"action": "remind", "target_type": "group", "target_ref": "x", "text": "same",
                         "session_id": "sess-authz"}
-        await runtime._forward_bridge_execute(first_text)
-        await runtime._forward_bridge_execute(first_text)  # same request retry
+        await runtime.forward_bridge._forward_bridge_execute(first_text)
+        await runtime.forward_bridge._forward_bridge_execute(first_text)  # same request retry
         second_text = {"action": "remind", "target_type": "group", "target_ref": "x", "text": "same",
                         "session_id": "sess-authz"}
-        await runtime._forward_bridge_execute(second_text)
+        await runtime.forward_bridge._forward_bridge_execute(second_text)
         assert first_text["_request_identity"] != second_text["_request_identity"]
 
         first_file = {
             "action": "file", "target_type": "group", "target_ref": "x",
             "file_paths": [str(artifact)], "session_id": "sess-authz",
         }
-        await runtime._forward_bridge_execute(first_file)
-        await runtime._forward_bridge_execute(first_file)  # same request retry
+        await runtime.forward_bridge._forward_bridge_execute(first_file)
+        await runtime.forward_bridge._forward_bridge_execute(first_file)  # same request retry
         second_file = {
             "action": "file", "target_type": "group", "target_ref": "x",
             "file_paths": [str(artifact)], "session_id": "sess-authz",
         }
-        await runtime._forward_bridge_execute(second_file)
+        await runtime.forward_bridge._forward_bridge_execute(second_file)
         assert first_file["_request_identity"] != second_file["_request_identity"]
 
     asyncio.run(exercise())
@@ -1413,8 +1413,8 @@ def test_context_free_fallback_uses_short_sent_retention(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     runtime = _load_runtime(monkeypatch, tmp_path)
-    assert runtime._sent_ttl_for_context(DeliveryContext()) == runtime.ONEBOT_IDEMPOTENCY_FALLBACK_SENT_TTL_SECONDS
-    assert runtime._sent_ttl_for_context(
+    assert runtime.sending._sent_ttl_for_context(DeliveryContext()) == runtime.sending.ONEBOT_IDEMPOTENCY_FALLBACK_SENT_TTL_SECONDS
+    assert runtime.sending._sent_ttl_for_context(
         DeliveryContext(idempotency_key="id:durable")
     ) is None
 
@@ -1429,7 +1429,7 @@ def test_bridge_http_handler_uses_public_request_identity(
         captured.append(dict(payload))
         return {"ok": True, "result": "sent"}
 
-    monkeypatch.setattr(runtime, "_forward_bridge_execute", execute)
+    monkeypatch.setattr(runtime.forward_bridge, "_forward_bridge_execute", execute)
 
     class Request:
         def __init__(self, payload: dict[str, Any], headers: dict[str, str]):
@@ -1440,8 +1440,8 @@ def test_bridge_http_handler_uses_public_request_identity(
             return dict(self._payload)
 
     async def exercise() -> None:
-        token = runtime._forward_bridge_token()
-        response = await runtime._forward_bridge_http_handler(Request(
+        token = runtime.forward_bridge._forward_bridge_token()
+        response = await runtime.forward_bridge._forward_bridge_http_handler(Request(
             {
                 "op": "remind",
                 "request_id": "json-logical-request",
@@ -1451,7 +1451,7 @@ def test_bridge_http_handler_uses_public_request_identity(
         ))
         assert response.status == 200
 
-        response = await runtime._forward_bridge_http_handler(Request(
+        response = await runtime.forward_bridge._forward_bridge_http_handler(Request(
             {"op": "remind"},
             {"Idempotency-Key": "header-only-request", "X-Forward-Token": token},
         ))
@@ -1795,8 +1795,8 @@ def test_the_ops_command_lists_and_releases(monkeypatch: Any, tmp_path: Path) ->
     admin = _ops_admin()
 
     async def exercise() -> None:
-        store = runtime._adapter.outbound_idempotency
-        assert await runtime._maybe_handle_dead_letter_command(
+        store = runtime.state._adapter.outbound_idempotency
+        assert await runtime.commands._maybe_handle_dead_letter_command(
             event=admin, user_text="/发送死信",
         ) == "当前没有卡住的投递记录。"
 
@@ -1804,19 +1804,19 @@ def test_the_ops_command_lists_and_releases(monkeypatch: Any, tmp_path: Path) ->
             await _dead_letter(store, key)
 
         by_key = {c.key: c.handle for c in await store.ambiguous_claims(limit=0)}
-        listing = await runtime._maybe_handle_dead_letter_command(event=admin, user_text="/发送死信")
+        listing = await runtime.commands._maybe_handle_dead_letter_command(event=admin, user_text="/发送死信")
         assert by_key["content:group:10:aaa"] in listing
         assert by_key["content:group:20:bbb"] in listing
         assert "可能已经收到过" in listing
 
-        released = await runtime._maybe_handle_dead_letter_command(
+        released = await runtime.commands._maybe_handle_dead_letter_command(
             event=admin, user_text=f"/发送死信 清理 {by_key['content:group:10:aaa']}",
         )
         assert "已放行" in released
         assert await store.state("content:group:10:aaa") is None
         assert await store.state("content:group:20:bbb") == "ambiguous"
 
-        cleared_all = await runtime._maybe_handle_dead_letter_command(
+        cleared_all = await runtime.commands._maybe_handle_dead_letter_command(
             event=admin, user_text="/发送死信 清理 全部",
         )
         assert "已放行" in cleared_all
@@ -1831,7 +1831,7 @@ def test_the_ops_command_rejects_a_nonunique_handle_prefix(monkeypatch: Any, tmp
     admin = _ops_admin()
 
     async def exercise() -> None:
-        store = runtime._adapter.outbound_idempotency
+        store = runtime.state._adapter.outbound_idempotency
         # 确定性搜索两个首字符相同的 handle，用 1 位前缀触发歧义。
         seen: dict[str, str] = {}
         collision: str | None = None
@@ -1845,7 +1845,7 @@ def test_the_ops_command_rejects_a_nonunique_handle_prefix(monkeypatch: Any, tmp
                 break
             seen[head] = key
         assert collision is not None
-        reply = await runtime._maybe_handle_dead_letter_command(
+        reply = await runtime.commands._maybe_handle_dead_letter_command(
             event=admin, user_text=f"/发送死信 清理 {collision}",
         )
         assert reply == "编号不唯一，请多输几位。"
@@ -1858,7 +1858,7 @@ def test_the_ops_command_shows_usage_for_a_trailing_word(monkeypatch: Any, tmp_p
     set_live_config(runtime, admin_users=frozenset({777}))
 
     reply = asyncio.run(
-        runtime._maybe_handle_dead_letter_command(event=_ops_admin(), user_text="/发送死信吧")
+        runtime.commands._maybe_handle_dead_letter_command(event=_ops_admin(), user_text="/发送死信吧")
     )
     assert reply is not None
     assert "用法" in reply
@@ -1874,13 +1874,13 @@ def test_attachment_send_locks_are_bounded_and_keep_a_busy_bucket(
     release = asyncio.Event()
 
     async def hold_busy() -> None:
-        async with runtime._attachment_send_order({"type": "group", "group_id": 1}):
+        async with runtime.outbound_attachments._attachment_send_order({"type": "group", "group_id": 1}):
             order.append("holder")
             holder_entered.set()
             await release.wait()
 
     async def waiter() -> None:
-        async with runtime._attachment_send_order({"type": "group", "group_id": 1}):
+        async with runtime.outbound_attachments._attachment_send_order({"type": "group", "group_id": 1}):
             order.append("waiter")
 
     async def exercise() -> None:
@@ -1888,12 +1888,12 @@ def test_attachment_send_locks_are_bounded_and_keep_a_busy_bucket(
         await holder_entered.wait()
         follower = asyncio.create_task(waiter())
         await asyncio.sleep(0)
-        for i in range(runtime._ATTACHMENT_SEND_LOCK_MAX_KEYS + 20):
-            async with runtime._attachment_send_order({"type": "group", "group_id": 1000 + i}):
+        for i in range(runtime.outbound_attachments._ATTACHMENT_SEND_LOCK_MAX_KEYS + 20):
+            async with runtime.outbound_attachments._attachment_send_order({"type": "group", "group_id": 1000 + i}):
                 pass
         assert not follower.done()
-        assert "group:1" in runtime._adapter.attachment_send_locks
-        assert len(runtime._adapter.attachment_send_locks) <= runtime._ATTACHMENT_SEND_LOCK_MAX_KEYS + 1
+        assert "group:1" in runtime.state._adapter.attachment_send_locks
+        assert len(runtime.state._adapter.attachment_send_locks) <= runtime.outbound_attachments._ATTACHMENT_SEND_LOCK_MAX_KEYS + 1
         release.set()
         await holder
         await follower
@@ -1902,10 +1902,8 @@ def test_attachment_send_locks_are_bounded_and_keep_a_busy_bucket(
     assert order == ["holder", "waiter"]
 
 
-def test_custom_face_cache_is_keyed_by_account_and_drops_expired_entries(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    _EMOJI_MODULE._custom_face_cache.clear()
+def test_custom_face_cache_is_keyed_by_account_and_drops_expired_entries() -> None:
+    renderer = _EMOJI_MODULE.EmojiRenderer()
 
     class Bot:
         def __init__(self, self_id: str) -> None:
@@ -1920,21 +1918,21 @@ def test_custom_face_cache_is_keyed_by_account_and_drops_expired_entries(
     bot_b = Bot("10001")
 
     async def exercise() -> None:
-        await _EMOJI_MODULE.fetch_custom_face_details(bot_a)
-        await _EMOJI_MODULE.fetch_custom_face_details(bot_b)
+        await renderer.fetch_custom_face_details(bot_a)
+        await renderer.fetch_custom_face_details(bot_b)
         assert bot_a.calls == 1
         assert bot_b.calls == 0
 
-        _EMOJI_MODULE.invalidate_custom_face_cache(bot_b)
-        await _EMOJI_MODULE.fetch_custom_face_details(bot_a)
+        renderer.invalidate_custom_face_cache(bot_b)
+        await renderer.fetch_custom_face_details(bot_a)
         assert bot_a.calls == 2
 
-        _EMOJI_MODULE._custom_face_cache["10001"] = (0.0, [])
-        monkeypatch.setattr(_EMOJI_MODULE, "_CUSTOM_FACE_CACHE_TTL", 0)
+        renderer.custom_face_cache["10001"] = (0.0, [])
+        renderer.custom_face_cache_ttl = 0
         bot_c = Bot("10002")
-        await _EMOJI_MODULE.fetch_custom_face_details(bot_c)
-        assert "10001" not in _EMOJI_MODULE._custom_face_cache
-        assert len(_EMOJI_MODULE._custom_face_cache) == 1
+        await renderer.fetch_custom_face_details(bot_c)
+        assert "10001" not in renderer.custom_face_cache
+        assert len(renderer.custom_face_cache) == 1
 
     asyncio.run(exercise())
 
@@ -1943,7 +1941,7 @@ def test_group_member_cache_drops_expired_groups(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     runtime = _load_runtime(monkeypatch, tmp_path)
-    monkeypatch.setattr(runtime, "_GROUP_MEMBER_CACHE_TTL", 0)
+    monkeypatch.setattr(runtime.sending, "_GROUP_MEMBER_CACHE_TTL", 0)
 
     class Bot:
         async def call_api(self, name: str, **kwargs: Any) -> Any:
@@ -1952,11 +1950,11 @@ def test_group_member_cache_drops_expired_groups(
     bot = Bot()
 
     async def exercise() -> None:
-        await runtime._load_group_members(bot, 1)
-        await runtime._load_group_members(bot, 2)
+        await runtime.sending._load_group_members(bot, 1)
+        await runtime.sending._load_group_members(bot, 2)
 
     asyncio.run(exercise())
-    assert len(runtime._adapter.group_member_cache) == 1
+    assert len(runtime.state._adapter.group_member_cache) == 1
 
 
 def test_conversation_buckets_are_bounded(
@@ -1967,10 +1965,10 @@ def test_conversation_buckets_are_bounded(
     event = types.SimpleNamespace(user_id=1)
 
     for i in range(max_keys + 5):
-        runtime._remember_recent_images(
+        runtime.media._remember_recent_images(
             f"conv:{i}", event, [{"type": "image", "path": f"/tmp/x{i}.png"}],
         )
 
-    assert len(runtime._adapter.recent_images) == max_keys
-    assert f"conv:{max_keys + 4}" in runtime._adapter.recent_images
-    assert "conv:0" not in runtime._adapter.recent_images
+    assert len(runtime.state._adapter.recent_images) == max_keys
+    assert f"conv:{max_keys + 4}" in runtime.state._adapter.recent_images
+    assert "conv:0" not in runtime.state._adapter.recent_images

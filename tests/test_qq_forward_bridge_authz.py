@@ -21,7 +21,7 @@ _TESTS = Path(__file__).resolve().parent
 if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
-from _onebot_harness import load_runtime, set_live_config  # noqa: E402
+from _onebot_harness import load_runtime, set_live_config, patch_imported  # noqa: E402
 
 _SESSION = "sess-1"
 _ADMIN_QQ = 10001
@@ -66,28 +66,28 @@ def _harness(
     """加载插件并把会话登记成 requester 在 _HOME_GROUP 群里发起的请求。"""
     runtime = load_runtime(monkeypatch, tmp_path)
     bot = _Bot()
-    monkeypatch.setattr(runtime, "get_bot", lambda: bot)
+    patch_imported(monkeypatch, runtime, "get_bot", lambda: bot)
     set_live_config(runtime, admin_users=frozenset({_ADMIN_QQ}))
 
     if origin is None:
         origin = {"type": "group", "group_id": _HOME_GROUP, "user_id": requester}
     if origin:
-        monkeypatch.setitem(runtime._adapter.session_targets, _SESSION, origin)
+        monkeypatch.setitem(runtime.state._adapter.session_targets, _SESSION, origin)
 
     async def resolve(*args: Any, **kwargs: Any):
-        return runtime.ProactiveTarget(resolved[0], resolved[1], "Target"), ""
+        return runtime.models.ProactiveTarget(resolved[0], resolved[1], "Target"), ""
 
     async def emojis(text: str, *args: Any, **kwargs: Any):
-        return [runtime.MessageSegment.text(text)]
+        return [runtime.state.MessageSegment.text(text)]
 
-    monkeypatch.setattr(runtime, "_forward_bridge_resolve_target", resolve)
-    monkeypatch.setattr(runtime, "process_emojis", emojis)
+    monkeypatch.setattr(runtime.forward_bridge, "_forward_bridge_resolve_target", resolve)
+    monkeypatch.setattr(runtime.state._adapter.emoji, "process_emojis", emojis)
     return runtime, bot
 
 
 def _run(runtime, payload: dict[str, Any]) -> dict[str, Any]:
     payload.setdefault("session_id", _SESSION)
-    return asyncio.run(runtime._forward_bridge_execute(payload))
+    return asyncio.run(runtime.forward_bridge._forward_bridge_execute(payload))
 
 
 # --- 跨会话投递 ---
@@ -259,7 +259,7 @@ def test_member_can_send_recent_generated_image(monkeypatch: pytest.MonkeyPatch,
     rel = _workspace_file(tmp_path, "data/attachments/naidiff_1.png", "fake-png")
     runtime, bot = _harness(monkeypatch, tmp_path, requester=_MEMBER_QQ)
     monkeypatch.setattr(
-        runtime, "_forward_bridge_pick_recent_attachments",
+        runtime.forward_bridge, "_forward_bridge_pick_recent_attachments",
         lambda *a, **k: [{"type": "image", "path": rel, "name": "naidiff_1.png"}],
     )
 
@@ -286,7 +286,7 @@ def _bridge_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     # env 令牌必须在 import 前清掉，否则 config 会把它固化成常量，令牌来源测不准。
     monkeypatch.delenv("ONEBOT_FORWARD_BRIDGE_TOKEN", raising=False)
     runtime = load_runtime(monkeypatch, tmp_path)
-    monkeypatch.setattr(runtime, "get_bot", lambda: _Bot())
+    patch_imported(monkeypatch, runtime, "get_bot", lambda: _Bot())
     return runtime
 
 
@@ -295,21 +295,21 @@ def _handle(runtime, payload: dict[str, Any], *, token: Any = "__signed__", head
     body.setdefault("session_id", _SESSION)
     hdrs = dict(headers or {})
     if token == "__signed__":
-        token = runtime._forward_bridge_token()
+        token = runtime.forward_bridge._forward_bridge_token()
     if token is not None:
         hdrs["X-Forward-Token"] = token
-    return asyncio.run(runtime._forward_bridge_http_handler(_Request(body, hdrs)))
+    return asyncio.run(runtime.forward_bridge._forward_bridge_http_handler(_Request(body, hdrs)))
 
 
 def _register_group(runtime, monkeypatch: pytest.MonkeyPatch, *, group_id: int = _HOME_GROUP, user_id: int = _MEMBER_QQ) -> None:
     monkeypatch.setitem(
-        runtime._adapter.session_targets, _SESSION,
+        runtime.state._adapter.session_targets, _SESSION,
         {"type": "group", "group_id": group_id, "user_id": user_id},
     )
 
 
 def _push_record(runtime, group_id: int, text: str) -> int:
-    return runtime._append_group_record(
+    return runtime.history._append_group_record(
         group_id,
         f"[00:00] jia({group_id}): {text}",
         text=text, sender_name="jia", sender_id="1001", timestamp=1_700_000_000.0,
@@ -350,36 +350,36 @@ def test_the_self_signed_token_lets_the_tool_through(monkeypatch: pytest.MonkeyP
 def test_the_token_file_is_created_once_and_reused(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = _bridge_runtime(monkeypatch, tmp_path)
 
-    first = runtime._forward_bridge_token()
+    first = runtime.forward_bridge._forward_bridge_token()
     assert first
-    assert runtime._forward_bridge_token() == first
-    token_file = Path(runtime.FORWARD_BRIDGE_TOKEN_FILE)
+    assert runtime.forward_bridge._forward_bridge_token() == first
+    token_file = Path(runtime.inbound.FORWARD_BRIDGE_TOKEN_FILE)
     assert token_file.read_text(encoding="utf-8").strip() == first
 
-    runtime._adapter.forward_bridge_token_cache = ""
-    assert runtime._forward_bridge_token() == first
+    runtime.state._adapter.forward_bridge_token_cache = ""
+    assert runtime.forward_bridge._forward_bridge_token() == first
 
 
 def test_an_unavailable_token_file_keeps_the_bridge_down(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = _bridge_runtime(monkeypatch, tmp_path)
     blocker = tmp_path / "blocker"
     blocker.write_text("x", encoding="utf-8")
-    monkeypatch.setattr(runtime, "FORWARD_BRIDGE_TOKEN_FILE", str(blocker / "nested" / "token"))
-    runtime._adapter.forward_bridge_token_cache = ""
+    patch_imported(monkeypatch, runtime, "FORWARD_BRIDGE_TOKEN_FILE", str(blocker / "nested" / "token"))
+    runtime.state._adapter.forward_bridge_token_cache = ""
 
-    assert runtime._forward_bridge_token() == ""
-    assert runtime._forward_bridge_check_token(_Request({}, {})) is False
+    assert runtime.forward_bridge._forward_bridge_token() == ""
+    assert runtime.forward_bridge._forward_bridge_check_token(_Request({}, {})) is False
 
-    runtime.refresh_live_config()
-    asyncio.run(runtime._start_forward_bridge())
-    assert runtime._adapter.forward_bridge_started is False
+    runtime.permissions.refresh_live_config()
+    asyncio.run(runtime.forward_bridge._start_forward_bridge())
+    assert runtime.state._adapter.forward_bridge_started is False
 
 
 def test_the_token_never_appears_in_runtime_facts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = _bridge_runtime(monkeypatch, tmp_path)
 
-    token = runtime._forward_bridge_token()
-    facts = runtime._live_runtime_facts()
+    token = runtime.forward_bridge._forward_bridge_token()
+    facts = runtime.lifecycle._live_runtime_facts()
 
     assert facts["forward_bridge_token_set"] is True
     assert token not in repr(facts)
@@ -435,7 +435,7 @@ def test_recent_uses_the_same_gate(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
 def test_a_private_origin_outside_the_allowlist_is_refused(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = _bridge_runtime(monkeypatch, tmp_path)
     monkeypatch.setitem(
-        runtime._adapter.session_targets, _SESSION,
+        runtime.state._adapter.session_targets, _SESSION,
         {"type": "private", "user_id": _MEMBER_QQ},
     )
     set_live_config(
@@ -454,9 +454,9 @@ def test_self_send_is_refused_when_origin_left_the_private_allowlist(monkeypatch
     """写侧同款：被移出私聊白名单后不应还能让 bot 私发给自己（不 mock resolve）。"""
     runtime = _bridge_runtime(monkeypatch, tmp_path)
     bot = _Bot()
-    monkeypatch.setattr(runtime, "get_bot", lambda: bot)
+    patch_imported(monkeypatch, runtime, "get_bot", lambda: bot)
     monkeypatch.setitem(
-        runtime._adapter.session_targets, _SESSION,
+        runtime.state._adapter.session_targets, _SESSION,
         {"type": "private", "user_id": _MEMBER_QQ},
     )
     set_live_config(
@@ -466,7 +466,7 @@ def test_self_send_is_refused_when_origin_left_the_private_allowlist(monkeypatch
         allow_private_friends=False,
     )
 
-    result = asyncio.run(runtime._forward_bridge_execute({
+    result = asyncio.run(runtime.forward_bridge._forward_bridge_execute({
         "session_id": _SESSION, "action": "remind", "target_type": "self", "text": "hi",
     }))
 
@@ -479,7 +479,7 @@ def test_the_friends_switch_does_not_open_the_bridge(monkeypatch: pytest.MonkeyP
     """好友总开关只放宽入站。出站没有 sub_type 可查，拿它顶替等于对任何人放行。"""
     runtime = _bridge_runtime(monkeypatch, tmp_path)
     monkeypatch.setitem(
-        runtime._adapter.session_targets, _SESSION,
+        runtime.state._adapter.session_targets, _SESSION,
         {"type": "private", "user_id": _MEMBER_QQ},
     )
     set_live_config(
@@ -497,9 +497,9 @@ def test_self_send_needs_the_allowlist_not_just_the_friends_switch(
 ) -> None:
     runtime = _bridge_runtime(monkeypatch, tmp_path)
     bot = _Bot()
-    monkeypatch.setattr(runtime, "get_bot", lambda: bot)
+    patch_imported(monkeypatch, runtime, "get_bot", lambda: bot)
     monkeypatch.setitem(
-        runtime._adapter.session_targets, _SESSION,
+        runtime.state._adapter.session_targets, _SESSION,
         {"type": "private", "user_id": _MEMBER_QQ},
     )
     set_live_config(
@@ -509,7 +509,7 @@ def test_self_send_needs_the_allowlist_not_just_the_friends_switch(
         allow_private_friends=True,
     )
 
-    result = asyncio.run(runtime._forward_bridge_execute({
+    result = asyncio.run(runtime.forward_bridge._forward_bridge_execute({
         "session_id": _SESSION, "action": "remind", "target_type": "self", "text": "hi",
     }))
 
@@ -523,7 +523,7 @@ def test_the_allowlist_still_lets_its_own_members_through(
     """收紧的是好友那一档，名单本身不能跟着失效。"""
     runtime = _bridge_runtime(monkeypatch, tmp_path)
     monkeypatch.setitem(
-        runtime._adapter.session_targets, _SESSION,
+        runtime.state._adapter.session_targets, _SESSION,
         {"type": "private", "user_id": _MEMBER_QQ},
     )
     set_live_config(
@@ -541,30 +541,30 @@ def test_the_allowlist_still_lets_its_own_members_through(
 
 def _two_contacts_named(runtime, monkeypatch: pytest.MonkeyPatch) -> None:
     """两个联系人都能用「老板」叫到，只有 label（张总/李总）会泄露真实身份。"""
-    monkeypatch.setitem(runtime._adapter.qq_user_profiles, "70001", {"address_as": "老板"})
-    monkeypatch.setitem(runtime._adapter.qq_user_profiles, "70002", {"address_as": "老板"})
+    monkeypatch.setitem(runtime.state._adapter.qq_user_profiles, "70001", {"address_as": "老板"})
+    monkeypatch.setitem(runtime.state._adapter.qq_user_profiles, "70002", {"address_as": "老板"})
 
     async def candidates(_bot: Any) -> list[Any]:
         return [
-            runtime.ProactiveTarget("private", 70001, "张总"),
-            runtime.ProactiveTarget("private", 70002, "李总"),
+            runtime.models.ProactiveTarget("private", 70001, "张总"),
+            runtime.models.ProactiveTarget("private", 70002, "李总"),
         ]
 
-    monkeypatch.setattr(runtime, "_private_target_candidates", candidates)
+    monkeypatch.setattr(runtime.proactive, "_private_target_candidates", candidates)
 
 
 def test_a_member_is_not_shown_which_contacts_matched(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = load_runtime(monkeypatch, tmp_path)
     bot = _Bot()
-    monkeypatch.setattr(runtime, "get_bot", lambda: bot)
+    patch_imported(monkeypatch, runtime, "get_bot", lambda: bot)
     set_live_config(runtime, admin_users=frozenset({_ADMIN_QQ}))
     monkeypatch.setitem(
-        runtime._adapter.session_targets, _SESSION,
+        runtime.state._adapter.session_targets, _SESSION,
         {"type": "group", "group_id": _HOME_GROUP, "user_id": _MEMBER_QQ},
     )
     _two_contacts_named(runtime, monkeypatch)
 
-    target, err = asyncio.run(runtime._forward_bridge_resolve_target(bot, _SESSION, "private", "老板"))
+    target, err = asyncio.run(runtime.forward_bridge._forward_bridge_resolve_target(bot, _SESSION, "private", "老板"))
 
     assert target is None
     assert "张总" not in err and "李总" not in err
@@ -573,15 +573,15 @@ def test_a_member_is_not_shown_which_contacts_matched(monkeypatch: pytest.Monkey
 def test_the_roster_still_sees_the_collision(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = load_runtime(monkeypatch, tmp_path)
     bot = _Bot()
-    monkeypatch.setattr(runtime, "get_bot", lambda: bot)
+    patch_imported(monkeypatch, runtime, "get_bot", lambda: bot)
     set_live_config(runtime, admin_users=frozenset({_ADMIN_QQ}))
     monkeypatch.setitem(
-        runtime._adapter.session_targets, _SESSION,
+        runtime.state._adapter.session_targets, _SESSION,
         {"type": "private", "user_id": _ADMIN_QQ},
     )
     _two_contacts_named(runtime, monkeypatch)
 
-    target, err = asyncio.run(runtime._forward_bridge_resolve_target(bot, _SESSION, "private", "老板"))
+    target, err = asyncio.run(runtime.forward_bridge._forward_bridge_resolve_target(bot, _SESSION, "private", "老板"))
 
     assert target is None
     assert "不唯一" in err

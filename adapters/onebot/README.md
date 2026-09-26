@@ -6,13 +6,55 @@ NoneBot2 插件，通过 OneBot 11 协议（NapCat / go-cqhttp 等实现）将 Q
 
 ```
 adapters/onebot/
-├── __init__.py       # 包说明，不导入 NoneBot
-├── onebot_plugin.py  # NoneBot 插件入口：消息处理、附件收集、EventRouter 回调
-├── config.py         # 环境变量配置
-└── emoji_handler.py  # QQ 自定义表情处理（表情包名称索引）
+├── __init__.py                  # 包说明，不导入 NoneBot
+├── onebot_plugin.py             # NoneBot 插件入口：插入工作区路径后加载 napcat/ 各模块
+├── napcat/                      # 适配器本体，唯一依赖 NoneBot 的地方
+│   ├── common.py                # 共用常量、命令正则、logger
+│   ├── models.py                # 内部流转的数据结构（QueuedInbound、GroupHistoryLine 等）
+│   ├── state.py                 # 唯一的 OneBotAdapter 实例与 FeatureGateway 需要的插件能力
+│   ├── routing.py               # 账号作用域、会话键摘要、路由状态落盘
+│   ├── identity.py              # 发送者 Profile、显示名、匿名成员
+│   ├── anonymize.py             # 匿名别名映射、记忆主体、送模型文本脱敏
+│   ├── permissions.py           # 群 / 私聊 / 管理员准入与 NoneBot Rule
+│   ├── approval.py              # 审批卡片、引用快捷审批、审批命令
+│   ├── message_text.py          # 消息段转文本、合并转发展开、引用解析
+│   ├── media.py                 # 入站图片与文件解析、下载、近期缓存
+│   ├── emotes.py                # 表情包库与收藏表情
+│   ├── history.py               # 群历史窗口、水位、清空门槛
+│   ├── inbound.py               # 入站判定、InboundFacts 翻译、触发与 inbound 文本
+│   ├── queueing.py              # 排队、抢占、连发合并
+│   ├── sending.py               # 文本发送、分条、@ 校验、发送防重
+│   ├── outbound_attachments.py  # 附件发送与已发附件记账
+│   ├── proactive.py             # 主动发送与合并转发
+│   ├── commands.py              # 本地命令目录与处理
+│   ├── callbacks.py             # AdapterCallbacks 的 QQ 实现
+│   ├── forward_bridge.py        # qq_forward 工具用的本地 HTTP 转发桥
+│   ├── lifecycle.py             # 热载对齐、live state 发布、启动与关闭
+│   └── handlers.py              # matcher 与背后的处理函数
+├── adapter.py                   # OneBotAdapter：全部进程内状态
+├── feature_gateway.py           # 社区功能网关，经 FeatureHost 接口调用插件能力
+├── config.py                    # 环境变量配置
+├── live_config.py               # config/qq.yaml 热载配置
+├── trigger_policy.py            # 群消息该不该回
+├── capability.py                # 管理能力授权判定
+├── send_contract.py             # 出站发送契约与防重
+├── forward_authz.py             # qq_forward 投递鉴权
+├── bot_scope.py                 # 当前登录账号的落盘记录
+├── conversation_hash.py         # 会话键摘要的盐
+├── echo_policy.py               # 复读判定
+├── attachment_policy.py         # 附件挑选策略
+├── memory_hints.py              # 识别一轮消息涉及哪些人
+├── emoji_handler.py             # QQ 表情与输出文本清理
+├── faces.py                     # 内置表情 id → 名字
+├── yaml_loader.py               # 手写 yaml 解析
+└── *_commands.py、burst_store.py、conversation_coordinator.py  # 社区功能的命令与连发存储
 ```
 
-插件入口单独成模块，包本身没有导入副作用：supervisor、迁移脚本可以直接 `import adapters.onebot.<兄弟模块>`。
+包本身没有导入副作用，根目录下的兄弟模块也不导入 NoneBot：supervisor、迁移脚本可以直接 `import adapters.onebot.<兄弟模块>`。
+NoneBot 只出现在 `napcat/` 里，由插件入口加载。
+
+`napcat/` 各模块之间互相引用一律写成 `模块.名字`（例如 `sending._send_qq_message`），不做 `from .x import y`：
+测试 monkeypatch 定义处就能影响所有调用方。进程内状态统一挂在 `state._adapter` 上。
 
 ## 前置依赖
 

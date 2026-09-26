@@ -37,7 +37,7 @@ def _load_with_retention(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, days: 
 
 
 def _write_map(runtime: Any, payload: dict[str, Any]) -> Path:
-    path = Path(runtime.ANON_MAP_FILE)
+    path = Path(runtime.anonymize.ANON_MAP_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return path
@@ -46,34 +46,34 @@ def _write_map(runtime: Any, payload: dict[str, Any]) -> Path:
 # ---- A: 单次备选正则 ----
 
 def test_empty_map_leaves_text_untouched(runtime: Any) -> None:
-    assert runtime._anonymize_text_for_ai("12345 元") == "12345 元"
+    assert runtime.anonymize._anonymize_text_for_ai("12345 元") == "12345 元"
 
 
 def test_all_known_ids_replaced_and_cache_invalidates(runtime: Any) -> None:
-    u1 = runtime._anonymize_user_id("100001")
-    u2 = runtime._anonymize_user_id("100002")
-    u3 = runtime._anonymize_user_id("100003")
-    g1 = runtime._anonymize_group_id("900001")
+    u1 = runtime.anonymize._anonymize_user_id("100001")
+    u2 = runtime.anonymize._anonymize_user_id("100002")
+    u3 = runtime.anonymize._anonymize_user_id("100003")
+    g1 = runtime.anonymize._anonymize_group_id("900001")
 
-    out = runtime._anonymize_text_for_ai("100001 100002 100003 群900001")
+    out = runtime.anonymize._anonymize_text_for_ai("100001 100002 100003 群900001")
     assert {u1, u2, u3, g1} <= set(out.split()) or all(a in out for a in (u1, u2, u3, g1))
     assert "100001" not in out and "900001" not in out
 
     # 登记第 5 个后立刻能被替换 —— 缓存失效被钉死。
-    u5 = runtime._anonymize_user_id("100005")
-    assert runtime._anonymize_text_for_ai("100005") == u5
+    u5 = runtime.anonymize._anonymize_user_id("100005")
+    assert runtime.anonymize._anonymize_text_for_ai("100005") == u5
 
 
 def test_longest_key_wins(runtime: Any) -> None:
-    runtime._anonymize_user_id("12345")
-    long = runtime._anonymize_user_id("123456")
-    assert runtime._anonymize_text_for_ai("123456") == long
+    runtime.anonymize._anonymize_user_id("12345")
+    long = runtime.anonymize._anonymize_user_id("123456")
+    assert runtime.anonymize._anonymize_text_for_ai("123456") == long
 
 
 def test_group_wins_over_user_on_identical_id(runtime: Any) -> None:
-    runtime._anonymize_user_id("555555")
-    group_alias = runtime._anonymize_group_id("555555")
-    assert runtime._anonymize_text_for_ai("555555") == group_alias
+    runtime.anonymize._anonymize_user_id("555555")
+    group_alias = runtime.anonymize._anonymize_group_id("555555")
+    assert runtime.anonymize._anonymize_text_for_ai("555555") == group_alias
 
 
 # ---- B: TTL 回收 ----
@@ -86,9 +86,9 @@ def test_ttl_disabled_keeps_stale_entries(runtime: Any) -> None:
         "groups": {},
     })
 
-    runtime._load_anon_map()
+    runtime.anonymize._load_anon_map()
 
-    assert runtime._adapter.anon_users.get("123456") == "UserA"
+    assert runtime.state._adapter.anon_users.get("123456") == "UserA"
 
 
 def test_ttl_prunes_stale_without_rewinding_counter(
@@ -107,13 +107,13 @@ def test_ttl_prunes_stale_without_rewinding_counter(
         "groups": {},
     })
 
-    runtime._load_anon_map()
+    runtime.anonymize._load_anon_map()
 
-    assert "222222" not in runtime._adapter.anon_users  # 陈旧条目被清
-    assert runtime._adapter.anon_users.get("111111") == "UserA"  # 新鲜条目保留
+    assert "222222" not in runtime.state._adapter.anon_users  # 陈旧条目被清
+    assert runtime.state._adapter.anon_users.get("111111") == "UserA"  # 新鲜条目保留
     # 计数器不能因剪枝回退到 UserA+1，否则新人会复用被清掉的 UserE。
-    assert runtime._adapter.anon_user_next == 5
-    assert runtime._anonymize_user_id("333333") == "UserF"
+    assert runtime.state._adapter.anon_user_next == 5
+    assert runtime.anonymize._anonymize_user_id("333333") == "UserF"
 
 
 def test_ttl_preserves_enrolled_subject(
@@ -130,19 +130,19 @@ def test_ttl_preserves_enrolled_subject(
         "groups": {},
     })
 
-    runtime._load_anon_map()
+    runtime.anonymize._load_anon_map()
 
-    assert runtime._adapter.anon_users.get("123456") == "UserA"
-    assert runtime._resolve_at_alias_to_real("UserA") == "123456"
+    assert runtime.state._adapter.anon_users.get("123456") == "UserA"
+    assert runtime.anonymize._resolve_at_alias_to_real("UserA") == "123456"
 
 
 def test_save_persists_real_last_seen_not_write_time(runtime: Any) -> None:
-    runtime._anonymize_user_id("123456")
+    runtime.anonymize._anonymize_user_id("123456")
     old = time.time() - 400 * 86400
-    runtime._adapter.anon_user_last_seen["123456"] = old
-    runtime._adapter.anon_map_dirty = True
+    runtime.state._adapter.anon_user_last_seen["123456"] = old
+    runtime.state._adapter.anon_map_dirty = True
 
-    asyncio.run(runtime._save_anon_map())
+    asyncio.run(runtime.anonymize._save_anon_map())
 
-    data = json.loads(Path(runtime.ANON_MAP_FILE).read_text(encoding="utf-8"))
+    data = json.loads(Path(runtime.anonymize.ANON_MAP_FILE).read_text(encoding="utf-8"))
     assert data["users"]["123456"]["last_seen"] == pytest.approx(old)

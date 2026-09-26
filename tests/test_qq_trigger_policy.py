@@ -524,20 +524,20 @@ class TestSourceSeparation:
             {"type": "at", "data": {"qq": _BOT_QQ}},
         ])
 
-        assert runtime._event_at_mentions_bot(event, self._bot()) is True
+        assert runtime.inbound._event_at_mentions_bot(event, self._bot()) is True
 
     def test_a_stripped_leading_at_is_recovered_from_to_me(self, runtime: Any) -> None:
         """_check_at_me 命中首尾 @ 时会把那一段删掉，只剩 to_me。"""
         event = _event(to_me=True)
 
-        assert runtime._event_at_mentions_bot(event, self._bot()) is True
+        assert runtime.inbound._event_at_mentions_bot(event, self._bot()) is True
 
     def test_a_reply_to_the_bot_is_not_counted_as_an_at(self, runtime: Any) -> None:
         """_check_reply 也置 to_me。不扣掉它，「被回复」就永远关不掉。"""
         event = _event(to_me=True, reply=_reply_from(_BOT_QQ))
 
-        assert runtime._event_replies_to_bot(event, self._bot()) is True
-        assert runtime._event_at_mentions_bot(event, self._bot()) is False
+        assert runtime.inbound._event_replies_to_bot(event, self._bot()) is True
+        assert runtime.inbound._event_at_mentions_bot(event, self._bot()) is False
 
     def test_a_reply_plus_a_real_at_still_counts_as_an_at(self, runtime: Any) -> None:
         event = _event(
@@ -545,28 +545,28 @@ class TestSourceSeparation:
             get_message=lambda: [{"type": "at", "data": {"qq": _BOT_QQ}}],
         )
 
-        assert runtime._event_at_mentions_bot(event, self._bot()) is True
+        assert runtime.inbound._event_at_mentions_bot(event, self._bot()) is True
 
     def test_a_reply_to_someone_else_is_not_a_bot_reply(self, runtime: Any) -> None:
         event = _event(reply=_reply_from("55555"))
 
-        assert runtime._event_replies_to_bot(event, self._bot()) is False
+        assert runtime.inbound._event_replies_to_bot(event, self._bot()) is False
 
     def test_a_missing_reply_object_is_not_a_bot_reply(self, runtime: Any) -> None:
         """get_msg 失败时 _check_reply 提前返回，reply 为 None。保守判为不是。"""
         event = _event(reply=None)
 
-        assert runtime._event_replies_to_bot(event, self._bot()) is False
+        assert runtime.inbound._event_replies_to_bot(event, self._bot()) is False
 
     def test_an_at_in_the_raw_message_is_recognised(self, runtime: Any) -> None:
         event = _event(raw_message=f"[CQ:at,qq={_BOT_QQ}] 在吗")
 
-        assert runtime._event_at_mentions_bot(event, self._bot()) is True
+        assert runtime.inbound._event_at_mentions_bot(event, self._bot()) is True
 
     def test_an_at_to_someone_else_is_not_an_at_to_the_bot(self, runtime: Any) -> None:
         event = _event(get_message=lambda: [{"type": "at", "data": {"qq": "55555"}}])
 
-        assert runtime._event_at_mentions_bot(event, self._bot()) is False
+        assert runtime.inbound._event_at_mentions_bot(event, self._bot()) is False
 
 
 class TestTheAdapterHonoursTheSwitches:
@@ -575,7 +575,7 @@ class TestTheAdapterHonoursTheSwitches:
         return load_runtime(monkeypatch, tmp_path)
 
     def _decide(self, runtime: Any, event: SimpleNamespace, text: str = "在吗"):
-        return runtime._group_trigger_decision(event, SimpleNamespace(self_id=_BOT_QQ), text)
+        return runtime.inbound._group_trigger_decision(event, SimpleNamespace(self_id=_BOT_QQ), text)
 
     def test_turning_off_reply_actually_stops_a_reply_turn(self, runtime: Any) -> None:
         """P2 的头条：这在改造前做不到。"""
@@ -604,7 +604,7 @@ class TestTheAdapterHonoursTheSwitches:
     def test_cooldown_state_is_shared_by_the_whole_process(self, runtime: Any) -> None:
         set_live_config(runtime, cooldown_group_sec=30, cooldown_exempt_at=False)
         event = _event(to_me=True, reply=_reply_from(_BOT_QQ))
-        runtime._adapter.trigger_cooldown.record(runtime._trigger_input(event, SimpleNamespace(self_id=_BOT_QQ), "在吗"))
+        runtime.state._adapter.trigger_cooldown.record(runtime.inbound._trigger_input(event, SimpleNamespace(self_id=_BOT_QQ), "在吗"))
 
         decision = self._decide(runtime, event)
 
@@ -616,11 +616,11 @@ class TestTheAdapterHonoursTheSwitches:
 
         set_live_config(runtime, cooldown_group_sec=30, cooldown_exempt_at=False)
         event = _event(to_me=True, reply=_reply_from(_BOT_QQ))
-        runtime._adapter.trigger_cooldown.record(runtime._trigger_input(event, SimpleNamespace(self_id=_BOT_QQ), "在吗"))
-        runtime._adapter.real_conversation_keys["conv_x"] = "qq_group:1"
-        runtime._adapter.session_targets["s1"] = {"type": "group", "group_id": 1}
+        runtime.state._adapter.trigger_cooldown.record(runtime.inbound._trigger_input(event, SimpleNamespace(self_id=_BOT_QQ), "在吗"))
+        runtime.state._adapter.real_conversation_keys["conv_x"] = "qq_group:1"
+        runtime.state._adapter.session_targets["s1"] = {"type": "group", "group_id": 1}
 
-        asyncio.run(runtime.TangQiuCallbacks().on_context_reset("conv_x", "clear", []))
+        asyncio.run(runtime.callbacks.TangQiuCallbacks().on_context_reset("conv_x", "clear", []))
 
         assert self._decide(runtime, event).triggered is True
 
@@ -630,11 +630,11 @@ class TestTheAdapterHonoursTheSwitches:
 
         set_live_config(runtime, cooldown_group_sec=30, cooldown_exempt_at=False)
         event = _event(to_me=True, reply=_reply_from(_BOT_QQ))
-        runtime._adapter.trigger_cooldown.record(runtime._trigger_input(event, SimpleNamespace(self_id=_BOT_QQ), "在吗"))
-        runtime._adapter.real_conversation_keys["conv_x"] = "qq_group:1"
-        runtime._adapter.session_targets["s1"] = {"type": "group", "group_id": 1}
+        runtime.state._adapter.trigger_cooldown.record(runtime.inbound._trigger_input(event, SimpleNamespace(self_id=_BOT_QQ), "在吗"))
+        runtime.state._adapter.real_conversation_keys["conv_x"] = "qq_group:1"
+        runtime.state._adapter.session_targets["s1"] = {"type": "group", "group_id": 1}
 
-        asyncio.run(runtime.TangQiuCallbacks().on_context_reset("conv_x", "compact", []))
+        asyncio.run(runtime.callbacks.TangQiuCallbacks().on_context_reset("conv_x", "compact", []))
 
         assert self._decide(runtime, event).triggered is False
 
@@ -648,7 +648,7 @@ class TestTheAdapterHonoursTheSwitches:
         module = sys.modules[f"{runtime.__name__}.live_config"]
         published = module.state_payload()["values"]
 
-        from_live = tp.TriggerConfig.from_live(runtime.live)
+        from_live = tp.TriggerConfig.from_live(runtime.state.live)
         from_published = tp.TriggerConfig.from_live(SimpleNamespace(**published))
 
         assert from_published == from_live
@@ -659,10 +659,10 @@ class TestTheAdapterHonoursTheSwitches:
         set_live_config(runtime, cooldown_group_sec=30, cooldown_exempt_at=False, allowed_groups=[1])
         quiet = _event(user_id=20002)
 
-        asyncio.run(runtime._agent_group_rule(SimpleNamespace(self_id=_BOT_QQ), quiet))
+        asyncio.run(runtime.permissions._agent_group_rule(SimpleNamespace(self_id=_BOT_QQ), quiet))
 
-        assert runtime._adapter.trigger_cooldown.remaining(
-            runtime._trigger_input(quiet, SimpleNamespace(self_id=_BOT_QQ), ""),
+        assert runtime.state._adapter.trigger_cooldown.remaining(
+            runtime.inbound._trigger_input(quiet, SimpleNamespace(self_id=_BOT_QQ), ""),
             tp.TriggerConfig(cooldown_group_sec=30.0),
         ) == (0.0, "")
 
@@ -879,7 +879,7 @@ class TestDryRunSharesTheDecision:
             reply=_reply_from(_BOT_QQ) if reply_to_bot else None,
             get_message=lambda: [{"type": "at", "data": {"qq": _BOT_QQ}}] if at_me else [],
         )
-        live_decision = runtime._group_trigger_decision(event, SimpleNamespace(self_id=_BOT_QQ), text)
+        live_decision = runtime.inbound._group_trigger_decision(event, SimpleNamespace(self_id=_BOT_QQ), text)
 
         preview = platform_trigger.dry_run(
             QQ_NAPCAT,

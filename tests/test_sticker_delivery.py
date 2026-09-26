@@ -46,22 +46,22 @@ def runtime(monkeypatch, tmp_path):
     module = load_runtime(monkeypatch, tmp_path)
     set_live_config(module, sticker_send_probability=1.0, sticker_repeat_window_sec=600,
                     reply_to_trigger=False)
-    module.set_sticker_resolver(module._resolve_sticker)
-    module._adopt_bot_scope(SimpleNamespace(self_id=Bot.self_id))
+    module.state._adapter.emoji.sticker_resolver = module.emotes._resolve_sticker
+    module.routing._adopt_bot_scope(SimpleNamespace(self_id=Bot.self_id))
     yield module
-    if module._adapter.sticker_store is not None:
-        module._adapter.sticker_store.close()
-    module._adapter.outbound_idempotency.close()
+    if module.state._adapter.sticker_store is not None:
+        module.state._adapter.sticker_store.close()
+    module.state._adapter.outbound_idempotency.close()
 
 
 def add_image(runtime, name="甲", tags=("开心",), *, size=None):
     raw = (f"synthetic-image-{name}".encode() if size is None else b"x" * size)
     digest = hashlib.sha256(raw).hexdigest()
     rel = f"data/stickers/library/{digest}.png"
-    path = Path(runtime.CLONOTH_WORKSPACE) / rel
+    path = Path(runtime.state.CLONOTH_WORKSPACE) / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(raw)
-    store = runtime._sticker_store_handle()
+    store = runtime.emotes._sticker_store_handle()
     store.add(sha256=digest, name=name, rel_path=rel, source="test", state=STATE_LIBRARY)
     store.set_auto_tags(digest, list(tags), version=1)
     store.mark_caption(digest, CAPTION_DONE)
@@ -73,7 +73,7 @@ def target(kind="group", value=42):
 
 
 def context(runtime, event="event-1", generation=0):
-    return runtime.OutboundSendContext(event_id=event, idempotency_key=f"{event}:{generation}",
+    return runtime.state.OutboundSendContext(event_id=event, idempotency_key=f"{event}:{generation}",
                                        replay_generation=generation)
 
 
@@ -86,7 +86,7 @@ def images(bot):
 def test_collection_failure_still_sends_local_image_and_text(runtime, kind):
     store, digest, _ = add_image(runtime)
     bot = Bot(runtime)
-    assert asyncio.run(runtime._send_split_text(
+    assert asyncio.run(runtime.sending._send_split_text(
         bot, target(kind), "正文[表情:甲]", send_context=context(runtime),
     ))
     assert len(images(bot)) == 1
@@ -97,19 +97,19 @@ def test_collection_failure_still_sends_local_image_and_text(runtime, kind):
 
 def test_resolution_does_not_count_and_name_and_tag_share_cooldown(runtime):
     store, digest, _ = add_image(runtime)
-    key = runtime._sticker_conversation_key(target())
+    key = runtime.emotes._sticker_conversation_key(target())
 
     async def run():
-        token = runtime._adapter.sticker_send_conversation.set(key)
+        token = runtime.state._adapter.sticker_send_conversation.set(key)
         try:
-            assert await runtime._resolve_sticker("甲")
-            assert await runtime._resolve_sticker("开心")
+            assert await runtime.emotes._resolve_sticker("甲")
+            assert await runtime.emotes._resolve_sticker("开心")
             assert store.get(digest).sent_count == 0
             store.record_sent(key, digest)
-            assert not await runtime._resolve_sticker("甲")
-            assert not await runtime._resolve_sticker("开心")
+            assert not await runtime.emotes._resolve_sticker("甲")
+            assert not await runtime.emotes._resolve_sticker("开心")
         finally:
-            runtime._adapter.sticker_send_conversation.reset(token)
+            runtime.state._adapter.sticker_send_conversation.reset(token)
     asyncio.run(run())
 
 
@@ -121,7 +121,7 @@ def test_bad_tag_candidate_falls_back_to_next(runtime, failure):
     else:
         path.write_bytes(b"" if failure == "empty" else b"x" * (3 * 1024 * 1024 + 1))
     _, good, _ = add_image(runtime, "乙")
-    result = asyncio.run(runtime._resolve_sticker("开心"))
+    result = asyncio.run(runtime.emotes._resolve_sticker("开心"))
     assert result.sha256 == good
     assert store.get(bad).sent_count == store.get(good).sent_count == 0
 
@@ -130,7 +130,7 @@ def test_bad_tag_candidate_falls_back_to_next(runtime, failure):
                                           (3 * 1024 * 1024 + 1, False)])
 def test_resolver_checks_actual_file_size(runtime, size, allowed):
     add_image(runtime, size=size)
-    assert bool(asyncio.run(runtime._resolve_sticker("甲"))) is allowed
+    assert bool(asyncio.run(runtime.emotes._resolve_sticker("甲"))) is allowed
 
 
 def test_definitely_failed_send_does_not_count_and_retry_reuses_image(runtime):
@@ -139,12 +139,12 @@ def test_definitely_failed_send_does_not_count_and_retry_reuses_image(runtime):
     bot.fail_at.add(1)
 
     async def run():
-        with pytest.raises(runtime.classify_send_exception(ConnectionRefusedError()).__class__):
-            await runtime._send_split_text(bot, target(), "[表情:开心]", send_context=context(runtime))
+        with pytest.raises(runtime.sending.classify_send_exception(ConnectionRefusedError()).__class__):
+            await runtime.sending._send_split_text(bot, target(), "[表情:开心]", send_context=context(runtime))
         assert store.get(digest).sent_count == 0
-        other = runtime._sticker_conversation_key(target(value=43))
+        other = runtime.emotes._sticker_conversation_key(target(value=43))
         store.record_sent(other, digest)
-        assert await runtime._send_split_text(bot, target(), "[表情:开心]", send_context=context(runtime))
+        assert await runtime.sending._send_split_text(bot, target(), "[表情:开心]", send_context=context(runtime))
     asyncio.run(run())
     assert len(images(bot)) == 1
     assert store.get(digest).sent_count == 2
@@ -155,12 +155,12 @@ def test_successful_retry_after_restart_does_not_reread_deleted_image(runtime):
     bot = Bot(runtime)
 
     async def run():
-        await runtime._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
-        state = runtime._adapter.outbound_idempotency
+        await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
+        state = runtime.state._adapter.outbound_idempotency
         state.close()
-        runtime._adapter.outbound_idempotency = type(state)(state.path)
+        runtime.state._adapter.outbound_idempotency = type(state)(state.path)
         path.unlink()
-        await runtime._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
+        await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
     asyncio.run(run())
     assert len(images(bot)) == 1
     assert store.get(digest).sent_count == 1
@@ -177,10 +177,10 @@ def test_partially_sent_reply_only_retries_failed_part(runtime):
 
     async def run():
         with pytest.raises(Exception):
-            await runtime._send_split_text(bot, destination, text, send_context=context(runtime))
+            await runtime.sending._send_split_text(bot, destination, text, send_context=context(runtime))
         assert store.get(first).sent_count == 1
         assert store.get(second).sent_count == 0
-        await runtime._send_split_text(bot, destination, text, send_context=context(runtime))
+        await runtime.sending._send_split_text(bot, destination, text, send_context=context(runtime))
     asyncio.run(run())
     assert len(bot.sent) == len(images(bot)) == 2
     assert sum(item["type"] == "reply" for message in bot.sent for item in message) == 1
@@ -192,13 +192,13 @@ def test_multiple_markers_and_concurrent_retries_do_not_repeat_one_image(runtime
     bot = Bot(runtime)
 
     async def run():
-        await asyncio.gather(*(runtime._send_split_text(
+        await asyncio.gather(*(runtime.sending._send_split_text(
             bot, target(), "[表情:甲][表情:开心]", send_context=context(runtime),
         ) for _ in range(2)))
     asyncio.run(run())
     assert len(images(bot)) == 1
     assert store.get(digest).sent_count == 1
-    assert not runtime._adapter.sticker_delivery_locks
+    assert not runtime.state._adapter.sticker_delivery_locks
 
 
 def test_ambiguous_ack_is_not_counted_or_retried(runtime):
@@ -208,9 +208,9 @@ def test_ambiguous_ack_is_not_counted_or_retried(runtime):
 
     async def run():
         for _ in range(2):
-            with pytest.raises(runtime.OneBotAmbiguousAckError):
-                await runtime._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
-        assert not await runtime._adapter.outbound_idempotency.pending_message_receipts()
+            with pytest.raises(runtime.sending.OneBotAmbiguousAckError):
+                await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
+        assert not await runtime.state._adapter.outbound_idempotency.pending_message_receipts()
     asyncio.run(run())
     assert bot.attempts == 1
     assert store.get(digest).sent_count == 0
@@ -226,19 +226,19 @@ def test_confirmed_delivery_is_reconciled_after_count_failure(runtime, monkeypat
 
     async def run():
         monkeypatch.setattr(store, "record_sent", fail)
-        await runtime._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
+        await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
         assert store.get(digest).sent_count == 0
-        assert len(await runtime._adapter.outbound_idempotency.pending_message_receipts()) == 1
+        assert len(await runtime.state._adapter.outbound_idempotency.pending_message_receipts()) == 1
         monkeypatch.setattr(store, "record_sent", original)
-        assert await runtime._reconcile_sticker_receipts()
-        await runtime._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
+        assert await runtime.emotes._reconcile_sticker_receipts()
+        await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
     asyncio.run(run())
     assert len(images(bot)) == store.get(digest).sent_count == 1
 
 
 def test_confirmed_delivery_is_not_counted_twice_when_receipt_ack_fails(runtime, monkeypatch):
     store, digest, _ = add_image(runtime)
-    outbound = runtime._adapter.outbound_idempotency
+    outbound = runtime.state._adapter.outbound_idempotency
     original = outbound.ack_message_receipt
     bot = Bot(runtime)
 
@@ -247,10 +247,10 @@ def test_confirmed_delivery_is_not_counted_twice_when_receipt_ack_fails(runtime,
 
     async def run():
         monkeypatch.setattr(outbound, "ack_message_receipt", fail)
-        await runtime._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
+        await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
         assert store.get(digest).sent_count == 1
         monkeypatch.setattr(outbound, "ack_message_receipt", original)
-        assert await runtime._reconcile_sticker_receipts()
+        assert await runtime.emotes._reconcile_sticker_receipts()
     asyncio.run(run())
     assert store.get(digest).sent_count == 1
 
@@ -260,10 +260,10 @@ def test_different_conversations_and_new_events_are_independent(runtime):
     bot = Bot(runtime)
 
     async def run():
-        await runtime._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
-        await runtime._send_split_text(bot, target(value=43), "[表情:甲]", send_context=context(runtime))
+        await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
+        await runtime.sending._send_split_text(bot, target(value=43), "[表情:甲]", send_context=context(runtime))
         set_live_config(runtime, sticker_repeat_window_sec=0)
-        await runtime._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime, generation=1))
+        await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime, generation=1))
     asyncio.run(run())
     assert store.get(digest).sent_count == len(images(bot)) == 3
 
@@ -275,10 +275,10 @@ def test_frozen_selection_refuses_changed_file_before_send(runtime):
 
     async def run():
         with pytest.raises(Exception):
-            await runtime._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
+            await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
         path.write_bytes(b"changed image")
-        with pytest.raises(runtime.OneBotSendContractError):
-            await runtime._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
+        with pytest.raises(runtime.sending.OneBotSendContractError):
+            await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
     asyncio.run(run())
     assert bot.attempts == 1
     assert store.get(digest).sent_count == 0
@@ -289,15 +289,15 @@ def test_combat_and_burst_count_only_confirmed_images(runtime):
     _, second, _ = add_image(runtime, "乙", ("开心", "大笑"))
     bot = Bot(runtime)
     destination = dict(target(), _response_purpose="ambient")
-    ctx = runtime.OutboundSendContext(event_id="combat:1", purpose="ambient",
-                                      conversation_key=runtime._sticker_conversation_key(target()))
+    ctx = runtime.state.OutboundSendContext(event_id="combat:1", purpose="ambient",
+                                      conversation_key=runtime.emotes._sticker_conversation_key(target()))
 
     async def run():
-        assert await runtime._send_combat_sticker(bot, destination, "开心大笑", ctx, 0)
+        assert await runtime.emotes._send_combat_sticker(bot, destination, "开心大笑", ctx, 0)
         bot.fail_at.add(2)
-        assert not await runtime._send_combat_sticker(bot, destination, "开心大笑", ctx, 1)
+        assert not await runtime.emotes._send_combat_sticker(bot, destination, "开心大笑", ctx, 1)
         assert sum(store.get(digest).sent_count for digest in (first, second)) == 1
-        assert await runtime._send_combat_sticker(bot, destination, "开心大笑", ctx, 1)
+        assert await runtime.emotes._send_combat_sticker(bot, destination, "开心大笑", ctx, 1)
     asyncio.run(run())
     assert len(images(bot)) == 2
     assert store.get(first).sent_count == store.get(second).sent_count == 1
@@ -308,10 +308,10 @@ def test_cooldown_and_zero_cooldown_for_following_event(runtime):
     bot = Bot(runtime)
 
     async def run():
-        await runtime._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
-        assert await runtime._send_split_text(bot, target(), "正文[表情:甲]", send_context=context(runtime, "event-2"))
+        await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
+        assert await runtime.sending._send_split_text(bot, target(), "正文[表情:甲]", send_context=context(runtime, "event-2"))
         set_live_config(runtime, sticker_repeat_window_sec=0)
-        await runtime._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime, "event-3"))
+        await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime, "event-3"))
     asyncio.run(run())
     assert len(bot.sent) == 3
     assert len(images(bot)) == store.get(digest).sent_count == 2
@@ -320,10 +320,10 @@ def test_cooldown_and_zero_cooldown_for_following_event(runtime):
 def test_favorite_metadata_still_sends_without_local_count(runtime, monkeypatch):
     store, digest, _ = add_image(runtime)
     bot = Bot(runtime)
-    monkeypatch.setattr(runtime, "_current_custom_face_metadata", lambda: [
+    monkeypatch.setattr(runtime.emotes, "_current_custom_face_metadata", lambda: [
         {"name": "甲", "url": "https://example.invalid/favorite.png"},
     ])
-    asyncio.run(runtime._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime)))
+    asyncio.run(runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime)))
     assert images(bot) == ["https://example.invalid/favorite.png"]
     assert store.get(digest).sent_count == 0
 
@@ -331,10 +331,10 @@ def test_favorite_metadata_still_sends_without_local_count(runtime, monkeypatch)
 def test_mixed_favorites_and_local_images_preserve_their_accounting(runtime, monkeypatch):
     store, digest, _ = add_image(runtime)
     bot = Bot(runtime)
-    monkeypatch.setattr(runtime, "_current_custom_face_metadata", lambda: [
+    monkeypatch.setattr(runtime.emotes, "_current_custom_face_metadata", lambda: [
         {"name": "收藏", "url": "https://example.invalid/favorite.png"},
     ])
-    asyncio.run(runtime._send_split_text(
+    asyncio.run(runtime.sending._send_split_text(
         bot, target(), "[表情:收藏][表情:甲]", send_context=context(runtime),
     ))
     assert len(images(bot)) == 2
@@ -349,15 +349,15 @@ def test_missing_platform_message_id_is_ambiguous_not_success(runtime, monkeypat
         return {}
 
     monkeypatch.setattr(bot, "send_group_msg", send)
-    with pytest.raises(runtime.OneBotAmbiguousAckError):
-        asyncio.run(runtime._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime)))
+    with pytest.raises(runtime.sending.OneBotAmbiguousAckError):
+        asyncio.run(runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime)))
     assert store.get(digest).sent_count == 0
 
 
 def test_plain_first_part_does_not_trigger_legacy_quarantine(runtime):
     store, digest, _ = add_image(runtime)
     bot = Bot(runtime)
-    asyncio.run(runtime._send_split_text(
+    asyncio.run(runtime.sending._send_split_text(
         bot, target(), "正文[SPLIT][表情:甲]", send_context=context(runtime),
     ))
     assert len(bot.sent) == 2
@@ -367,7 +367,7 @@ def test_plain_first_part_does_not_trigger_legacy_quarantine(runtime):
 def test_old_delivery_claim_is_quarantined_before_new_selection(runtime):
     store, digest, _ = add_image(runtime)
     bot = Bot(runtime)
-    outbound = runtime._adapter.outbound_idempotency
+    outbound = runtime.state._adapter.outbound_idempotency
     ctx = context(runtime)
 
     async def run():
@@ -375,8 +375,8 @@ def test_old_delivery_claim_is_quarantined_before_new_selection(runtime):
         claim = await outbound.begin(key)
         await outbound.commit(claim, platform_message_id="old-1")
         outbound._db.execute("UPDATE claims SET updated=? WHERE key=?", (outbound.protocol_started_at - 1, key))
-        with pytest.raises(runtime.OneBotAmbiguousAckError):
-            await runtime._send_split_text(bot, target(), "[表情:甲]", send_context=ctx)
+        with pytest.raises(runtime.sending.OneBotAmbiguousAckError):
+            await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=ctx)
     asyncio.run(run())
     assert bot.attempts == store.get(digest).sent_count == 0
 
@@ -385,16 +385,16 @@ def test_context_free_delivery_can_send_again_after_short_retention(runtime):
     store, digest, _ = add_image(runtime)
     bot = Bot(runtime)
     set_live_config(runtime, sticker_repeat_window_sec=0)
-    outbound = runtime._adapter.outbound_idempotency
+    outbound = runtime.state._adapter.outbound_idempotency
     now = [outbound._clock()]
     outbound._clock = lambda: now[0]
 
     async def run():
-        await runtime._send_split_text(bot, target(), "[表情:甲]")
-        await runtime._send_split_text(bot, target(), "[表情:甲]")
+        await runtime.sending._send_split_text(bot, target(), "[表情:甲]")
+        await runtime.sending._send_split_text(bot, target(), "[表情:甲]")
         assert len(images(bot)) == 1
-        now[0] += runtime.ONEBOT_IDEMPOTENCY_FALLBACK_SENT_TTL_SECONDS + 1
-        await runtime._send_split_text(bot, target(), "[表情:甲]")
+        now[0] += runtime.sending.ONEBOT_IDEMPOTENCY_FALLBACK_SENT_TTL_SECONDS + 1
+        await runtime.sending._send_split_text(bot, target(), "[表情:甲]")
     asyncio.run(run())
     assert len(images(bot)) == store.get(digest).sent_count == 2
 
@@ -402,20 +402,20 @@ def test_context_free_delivery_can_send_again_after_short_retention(runtime):
 def test_combat_retry_uses_event_identity_not_changed_history(runtime):
     store, digest, _ = add_image(runtime, tags=("开心", "大笑"))
     bot = Bot(runtime)
-    ctx = runtime.OutboundSendContext(event_id="combat:stable", purpose="ambient",
-                                      conversation_key=runtime._sticker_conversation_key(target()))
+    ctx = runtime.state.OutboundSendContext(event_id="combat:stable", purpose="ambient",
+                                      conversation_key=runtime.emotes._sticker_conversation_key(target()))
 
     async def run():
-        assert await runtime._send_combat_sticker(bot, target(), "开心", ctx, 0)
-        assert await runtime._send_combat_sticker(bot, target(), "后来大家又大笑了", ctx, 0)
+        assert await runtime.emotes._send_combat_sticker(bot, target(), "开心", ctx, 0)
+        assert await runtime.emotes._send_combat_sticker(bot, target(), "后来大家又大笑了", ctx, 0)
     asyncio.run(run())
     assert len(images(bot)) == store.get(digest).sent_count == 1
 
 
 def test_receipt_backlog_never_allows_selection_with_stale_cooldown(runtime):
     store, digest, _ = add_image(runtime)
-    outbound = runtime._adapter.outbound_idempotency
-    key = runtime._sticker_conversation_key(target())
+    outbound = runtime.state._adapter.outbound_idempotency
+    key = runtime.emotes._sticker_conversation_key(target())
 
     async def run():
         for index in range(101):
@@ -426,13 +426,13 @@ def test_receipt_backlog_never_allows_selection_with_stale_cooldown(runtime):
             plan = await outbound.get_or_create_message_plan(f"pending:{index}", target(), prepare)
             claim = await outbound.begin(plan.claim_key)
             await outbound.commit(claim, platform_message_id=f"p{index}")
-        token = runtime._adapter.sticker_send_conversation.set(key)
+        token = runtime.state._adapter.sticker_send_conversation.set(key)
         try:
-            assert not await runtime._resolve_sticker("甲")
-            assert await runtime._reconcile_sticker_receipts()
-            assert not await runtime._resolve_sticker("甲")
+            assert not await runtime.emotes._resolve_sticker("甲")
+            assert await runtime.emotes._reconcile_sticker_receipts()
+            assert not await runtime.emotes._resolve_sticker("甲")
         finally:
-            runtime._adapter.sticker_send_conversation.reset(token)
+            runtime.state._adapter.sticker_send_conversation.reset(token)
     asyncio.run(run())
     assert store.get(digest).sent_count == 1
 
@@ -440,11 +440,11 @@ def test_receipt_backlog_never_allows_selection_with_stale_cooldown(runtime):
 def test_inflight_old_account_uses_its_own_cooldown_after_account_switch(runtime):
     store, digest, _ = add_image(runtime)
     old_bot = Bot(runtime)
-    old_key = runtime._sticker_conversation_key(target(), old_bot)
-    runtime._adopt_bot_scope(SimpleNamespace(self_id="20000"))
-    new_key = runtime._sticker_conversation_key(target())
+    old_key = runtime.emotes._sticker_conversation_key(target(), old_bot)
+    runtime.routing._adopt_bot_scope(SimpleNamespace(self_id="20000"))
+    new_key = runtime.emotes._sticker_conversation_key(target())
     assert old_key != new_key
-    asyncio.run(runtime._send_split_text(
+    asyncio.run(runtime.sending._send_split_text(
         old_bot, target(), "[表情:甲]", send_context=context(runtime),
     ))
     assert digest in store.recently_sent(old_key, within_sec=600)

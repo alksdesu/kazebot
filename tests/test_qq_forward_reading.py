@@ -85,20 +85,20 @@ def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 
 
 def _expand(runtime: Any, bot: FakeBot, message: Any) -> str:
-    return asyncio.run(runtime._message_to_text_with_forward(bot, message, _BOT_ID))
+    return asyncio.run(runtime.message_text._message_to_text_with_forward(bot, message, _BOT_ID))
 
 
 class TestSourceExtraction:
     @pytest.mark.parametrize("key", ["id", "res_id", "resId", "forward_id", "forwardId"])
     def test_every_spelling_of_the_id_is_recognised(self, runtime, key: str) -> None:
-        sources = runtime._extract_forward_sources([{"type": "forward", "data": {key: "abc"}}])
+        sources = runtime.message_text._extract_forward_sources([{"type": "forward", "data": {key: "abc"}}])
 
         assert [s.forward_id for s in sources] == ["abc"]
 
     def test_an_inline_card_is_recognised(self, runtime) -> None:
         # 有些实现把嵌套层直接内嵌成 node 列表而不给 res_id，不认这形态那层就只剩占位符。
         nodes = [_node("张三", [_text("里面")])]
-        sources = runtime._extract_forward_sources([_inline_card(nodes)])
+        sources = runtime.message_text._extract_forward_sources([_inline_card(nodes)])
 
         assert len(sources) == 1
         assert sources[0].forward_id == ""
@@ -107,7 +107,7 @@ class TestSourceExtraction:
     def test_an_id_is_preferred_but_inline_content_is_kept_as_backup(self, runtime) -> None:
         # 接口拿到的是全量、内嵌的可能只是摘要，所以先拉接口；但丢掉内嵌就没有兜底了。
         nodes = [_node("张三", [])]
-        source = runtime._extract_forward_sources(
+        source = runtime.message_text._extract_forward_sources(
             [{"type": "forward", "data": {"id": "abc", "content": nodes}}],
         )[0]
 
@@ -115,15 +115,15 @@ class TestSourceExtraction:
         assert source.inline == tuple(nodes)
 
     def test_a_cq_forward_is_recognised(self, runtime) -> None:
-        assert [s.forward_id for s in runtime._extract_forward_sources("[CQ:forward,id=abc]")] == ["abc"]
+        assert [s.forward_id for s in runtime.message_text._extract_forward_sources("[CQ:forward,id=abc]")] == ["abc"]
 
     def test_order_is_preserved_so_placeholders_line_up(self, runtime) -> None:
-        sources = runtime._extract_forward_sources([_card("a"), _text("中间"), _card("b")])
+        sources = runtime.message_text._extract_forward_sources([_card("a"), _text("中间"), _card("b")])
 
         assert [s.forward_id for s in sources] == ["a", "b"]
 
     def test_a_card_with_neither_id_nor_content_is_dropped(self, runtime) -> None:
-        assert runtime._extract_forward_sources([{"type": "forward", "data": {}}]) == []
+        assert runtime.message_text._extract_forward_sources([{"type": "forward", "data": {}}]) == []
 
 
 class TestTextExpansion:
@@ -133,7 +133,7 @@ class TestTextExpansion:
 
         text = _expand(runtime, bot, [_text("看这个"), _card("a"), _text("怎么样")])
 
-        assert runtime.FORWARD_PLACEHOLDER not in text
+        assert runtime.message_text.FORWARD_PLACEHOLDER not in text
         assert text.index("看这个") < text.index("里面说的话") < text.index("怎么样")
 
     def test_nested_cards_expand_too(self, runtime) -> None:
@@ -223,20 +223,20 @@ class TestTextExpansion:
 
         text = _expand(runtime, bot, [_card("a")])
 
-        assert text == runtime.FORWARD_PLACEHOLDER
+        assert text == runtime.message_text.FORWARD_PLACEHOLDER
         assert bot.calls == []
 
 
 class TestMediaInsideCards:
     def _media(self, runtime: Any, bot: FakeBot, message: Any) -> tuple[list[str], list[dict[str, Any]]]:
-        sources, files = asyncio.run(runtime._collect_message_media(bot, message))
+        sources, files = asyncio.run(runtime.media._collect_message_media(bot, message))
         return [source.url for source in sources], files
 
     def _media_without_forward(
         self, runtime: Any, bot: FakeBot, message: Any,
     ) -> tuple[list[str], list[dict[str, Any]]]:
         sources, files = asyncio.run(
-            runtime._collect_message_media(bot, message, expand_forward=False),
+            runtime.media._collect_message_media(bot, message, expand_forward=False),
         )
         return [source.url for source in sources], files
 
@@ -310,7 +310,7 @@ class TestMediaInsideCards:
 
 class TestTriggerSeesTheContent:
     def _trigger_text(self, runtime: Any, bot: FakeBot, message: Any) -> str:
-        return asyncio.run(runtime._group_trigger_text(bot, _event(message)))
+        return asyncio.run(runtime.permissions._group_trigger_text(bot, _event(message)))
 
     def test_a_keyword_inside_a_card_reaches_the_trigger_check(self, runtime) -> None:
         # 判定那一步只看到 [合并转发] 的话，不 @ bot 就永远不会理这条消息。
@@ -324,7 +324,7 @@ class TestTriggerSeesTheContent:
 
         text = self._trigger_text(runtime, bot, [_card("a")])
 
-        assert text == runtime.FORWARD_PLACEHOLDER
+        assert text == runtime.message_text.FORWARD_PLACEHOLDER
         assert bot.calls == []
 
     def test_one_event_expands_once_no_matter_how_many_readers(self, runtime) -> None:
@@ -332,9 +332,9 @@ class TestTriggerSeesTheContent:
         bot = FakeBot({"a": [_node("张三", [_text("hi")])]})
         event = _event([_card("a")])
 
-        first = asyncio.run(runtime._event_text_with_forward(bot, event))
-        runtime._adapter.forward_msg_cache.clear()
-        second = asyncio.run(runtime._event_text_with_forward(bot, event))
+        first = asyncio.run(runtime.message_text._event_text_with_forward(bot, event))
+        runtime.state._adapter.forward_msg_cache.clear()
+        second = asyncio.run(runtime.message_text._event_text_with_forward(bot, event))
 
         assert first == second
         assert bot.calls == ["a"]
@@ -349,19 +349,19 @@ class TestTriggerSeesTheContent:
             seen.update(kwargs)
             return [], []
 
-        monkeypatch.setattr(runtime, "_collect_qq_attachments", spy)
-        monkeypatch.setattr(runtime, "_remember_message_for_reply_context", lambda event: None)
-        monkeypatch.setattr(runtime, "_record_group_message", lambda *a, **k: 0)
+        monkeypatch.setattr(runtime.media, "_collect_qq_attachments", spy)
+        monkeypatch.setattr(runtime.message_text, "_remember_message_for_reply_context", lambda event: None)
+        monkeypatch.setattr(runtime.history, "_record_group_message", lambda *a, **k: 0)
         bot = FakeBot({"a": [_node("张三", [_image("http://x/in.jpg")])]})
 
-        asyncio.run(runtime._record_non_trigger_message(bot, _event([_card("a")])))
+        asyncio.run(runtime.handlers._record_non_trigger_message(bot, _event([_card("a")])))
 
         assert seen == {"expand_forward": False}
 
     def test_a_plain_message_never_touches_the_cache(self, runtime) -> None:
         bot = FakeBot()
 
-        text = asyncio.run(runtime._event_text_with_forward(bot, _event([_text("普通消息")])))
+        text = asyncio.run(runtime.message_text._event_text_with_forward(bot, _event([_text("普通消息")])))
 
         assert text == "普通消息"
-        assert runtime._adapter.event_text_cache == {}
+        assert runtime.state._adapter.event_text_cache == {}

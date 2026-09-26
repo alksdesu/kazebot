@@ -47,8 +47,8 @@ def _ask(
     text: str,
     client: Any,
 ) -> str | None:
-    monkeypatch.setattr(runtime._adapter, "client", client)
-    return asyncio.run(runtime._maybe_handle_dream_command(
+    monkeypatch.setattr(runtime.state._adapter, "client", client)
+    return asyncio.run(runtime.commands._maybe_handle_dream_command(
         event=SimpleNamespace(user_id=user_id), user_text=text, conversation_key=_CONV,
     ))
 
@@ -149,11 +149,11 @@ class TestReplies:
 class TestCatalog:
     def test_the_command_is_listed_for_the_admin(self, admin_runtime) -> None:
         # 命令表是 /帮助 的唯一数据源，漏了它用户就永远不知道这条命令存在。
-        text = admin_runtime._help_text(SimpleNamespace(user_id=_ADMIN_QQ))
+        text = admin_runtime.commands._help_text(SimpleNamespace(user_id=_ADMIN_QQ))
 
         assert "/整理记忆" in text
 
     def test_it_stays_hidden_from_members(self, monkeypatch, tmp_path) -> None:
         runtime = load_runtime(monkeypatch, tmp_path)
 
-        assert "/整理记忆" not in runtime._help_text(SimpleNamespace(user_id=_MEMBER_QQ))
+        assert "/整理记忆" not in runtime.commands._help_text(SimpleNamespace(user_id=_MEMBER_QQ))

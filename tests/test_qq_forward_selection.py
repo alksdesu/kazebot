@@ -20,7 +20,7 @@ _TESTS = Path(__file__).resolve().parent
 if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
-from _onebot_harness import load_runtime, set_live_config  # noqa: E402
+from _onebot_harness import load_runtime, set_live_config, patch_imported  # noqa: E402
 
 _SESSION = "sess-1"
 _GROUP_ID = 998877
@@ -54,14 +54,14 @@ class _Bot:
 
 def _register(runtime, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(
-        runtime._adapter.session_targets, _SESSION,
+        runtime.state._adapter.session_targets, _SESSION,
         {"type": "group", "group_id": _GROUP_ID, "user_id": _ADMIN_QQ},
     )
 
 
 def _push(runtime, text: str, group_id: int = _GROUP_ID) -> int:
     """走单一写入点记一条群消息，返回它的 seq。"""
-    return runtime._append_group_record(
+    return runtime.history._append_group_record(
         group_id,
         f"[00:00] jia({group_id}): {text}",
         text=text,
@@ -74,24 +74,24 @@ def _push(runtime, text: str, group_id: int = _GROUP_ID) -> int:
 def _harness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     runtime = load_runtime(monkeypatch, tmp_path)
     bot = _Bot()
-    monkeypatch.setattr(runtime, "get_bot", lambda: bot)
+    patch_imported(monkeypatch, runtime, "get_bot", lambda: bot)
     set_live_config(runtime, admin_users=frozenset({_ADMIN_QQ}))
     _register(runtime, monkeypatch)
 
     async def resolve(*args: Any, **kwargs: Any):
-        return runtime.ProactiveTarget("group", _GROUP_ID, "当前群"), ""
+        return runtime.models.ProactiveTarget("group", _GROUP_ID, "当前群"), ""
 
     async def emojis(text: str, *args: Any, **kwargs: Any):
-        return [runtime.MessageSegment.text(text)]
+        return [runtime.state.MessageSegment.text(text)]
 
-    monkeypatch.setattr(runtime, "_forward_bridge_resolve_target", resolve)
-    monkeypatch.setattr(runtime, "process_emojis", emojis)
+    monkeypatch.setattr(runtime.forward_bridge, "_forward_bridge_resolve_target", resolve)
+    monkeypatch.setattr(runtime.state._adapter.emoji, "process_emojis", emojis)
     return runtime, bot
 
 
 def _run(runtime, payload: dict[str, Any]) -> dict[str, Any]:
     payload.setdefault("session_id", _SESSION)
-    return asyncio.run(runtime._forward_bridge_execute(payload))
+    return asyncio.run(runtime.forward_bridge._forward_bridge_execute(payload))
 
 
 def _mkfile(tmp_path: Path, rel: str) -> str:
@@ -109,15 +109,15 @@ def test_a_ref_still_points_at_the_same_message_after_the_deque_overflows(
     for i in range(1, 21):
         _push(runtime, f"msg{i}")
 
-    listed = runtime._forward_bridge_list_messages(_SESSION)
+    listed = runtime.forward_bridge._forward_bridge_list_messages(_SESSION)
     ref = next(item["ref"] for item in listed if "msg20" in item["preview"])
 
     # 灌满并整体左移：content_records maxlen=20，再来 5 条 → 位置下标全变。
     for i in range(21, 26):
         _push(runtime, f"msg{i}")
 
-    selection = runtime._forward_bridge_pick_records(
-        _SESSION, refs=runtime._forward_bridge_parse_record_refs([ref]), query="",
+    selection = runtime.forward_bridge._forward_bridge_pick_records(
+        _SESSION, refs=runtime.forward_bridge._forward_bridge_parse_record_refs([ref]), query="",
     )
 
     assert [r.text for r in selection.records] == ["msg20"]
@@ -188,29 +188,29 @@ def test_recent_attachment_refs_survive_new_sends(
     a1 = _mkfile(tmp_path, "data/attachments/a1.png")
     a2 = _mkfile(tmp_path, "data/attachments/a2.png")
     filler = _mkfile(tmp_path, "data/attachments/filler.png")
-    runtime._record_sent_attachments(target, [{"path": a1, "name": "a1.png"}])
-    runtime._record_sent_attachments(target, [{"path": a2, "name": "a2.png"}])
+    runtime.outbound_attachments._record_sent_attachments(target, [{"path": a1, "name": "a1.png"}])
+    runtime.outbound_attachments._record_sent_attachments(target, [{"path": a2, "name": "a2.png"}])
 
-    listed = runtime._forward_bridge_list_recent(_SESSION)
+    listed = runtime.forward_bridge._forward_bridge_list_recent(_SESSION)
     assert [item["ref"] for item in listed] == ["a1", "a2"]
 
     # 同 bucket 内新老 ref 各命中正确文件。
-    picked_a1 = runtime._forward_bridge_pick_recent_attachments(
-        _SESSION, refs=runtime._forward_bridge_parse_attachment_refs(["a1"]),
+    picked_a1 = runtime.forward_bridge._forward_bridge_pick_recent_attachments(
+        _SESSION, refs=runtime.forward_bridge._forward_bridge_parse_attachment_refs(["a1"]),
     )
     assert [Path(p["path"]).name for p in picked_a1] == ["a1.png"]
 
     # 再记 20 张把 bucket（maxlen=20）挤满，a1/a2 被淘汰。
     for _ in range(20):
-        runtime._record_sent_attachments(target, [{"path": filler, "name": "filler.png"}])
+        runtime.outbound_attachments._record_sent_attachments(target, [{"path": filler, "name": "filler.png"}])
 
-    gone = runtime._forward_bridge_pick_recent_attachments(
-        _SESSION, refs=runtime._forward_bridge_parse_attachment_refs(["a1"]),
+    gone = runtime.forward_bridge._forward_bridge_pick_recent_attachments(
+        _SESSION, refs=runtime.forward_bridge._forward_bridge_parse_attachment_refs(["a1"]),
     )
     assert gone == []  # 过期 ref 不得回退成最新那张
 
-    survivors = [item["ref"] for item in runtime._forward_bridge_list_recent(_SESSION)]
-    latest = runtime._forward_bridge_pick_recent_attachments(
-        _SESSION, refs=runtime._forward_bridge_parse_attachment_refs([survivors[-1]]),
+    survivors = [item["ref"] for item in runtime.forward_bridge._forward_bridge_list_recent(_SESSION)]
+    latest = runtime.forward_bridge._forward_bridge_pick_recent_attachments(
+        _SESSION, refs=runtime.forward_bridge._forward_bridge_parse_attachment_refs([survivors[-1]]),
     )
     assert [Path(p["path"]).name for p in latest] == ["filler.png"]

@@ -37,7 +37,7 @@ def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 @pytest.fixture()
 def store(runtime: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> StickerStore:
     handle = StickerStore(tmp_path / "stickers.sqlite3")
-    monkeypatch.setattr(runtime, "_sticker_store_handle", lambda: handle)
+    monkeypatch.setattr(runtime.emotes, "_sticker_store_handle", lambda: handle)
     return handle
 
 
@@ -65,7 +65,7 @@ def _add(
 
 def _always(runtime: Any, monkeypatch: pytest.MonkeyPatch, hit: bool) -> None:
     """把概率骰子钉死。0.0 必中，0.99 必不中（判定是 random() >= p）。"""
-    monkeypatch.setattr(runtime.random, "random", lambda: 0.0 if hit else 0.99)
+    monkeypatch.setattr(runtime.emotes.random, "random", lambda: 0.0 if hit else 0.99)
 
 
 class TestRoster:
@@ -75,10 +75,10 @@ class TestRoster:
     ) -> None:
         _add(store, "甲", ["大笑"])
         set_live_config(runtime, sticker_send_probability=0.4)
-        monkeypatch.setattr(runtime.random, "random", lambda: roll)
+        monkeypatch.setattr(runtime.emotes.random, "random", lambda: roll)
 
-        assert bool(runtime._sticker_prompt_entries(_CONV)) is listed
-        assert runtime.live.sticker_send_probability == 0.4
+        assert bool(runtime.emotes._sticker_prompt_entries(_CONV)) is listed
+        assert runtime.state.live.sticker_send_probability == 0.4
 
     @pytest.mark.parametrize("size,listed", [(0, False), (1, True), (3 * 1024 * 1024, True), (3 * 1024 * 1024 + 1, False)])
     def test_可发送文件大小边界(
@@ -88,7 +88,7 @@ class TestRoster:
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
 
-        assert bool(runtime._sticker_prompt_entries(_CONV)) is listed
+        assert bool(runtime.emotes._sticker_prompt_entries(_CONV)) is listed
 
     @pytest.mark.parametrize("replacement", ["missing", "directory"])
     def test_不存在或不是文件的候选不列出(
@@ -103,7 +103,7 @@ class TestRoster:
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
 
-        assert runtime._sticker_prompt_entries(_CONV) == ["正常（无语）"]
+        assert runtime.emotes._sticker_prompt_entries(_CONV) == ["正常（无语）"]
 
     @pytest.mark.parametrize("state,caption", [
         (STATE_PENDING, CAPTION_DONE), (STATE_DISCARDED, CAPTION_DONE),
@@ -118,7 +118,7 @@ class TestRoster:
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
 
-        assert runtime._sticker_prompt_entries(_CONV) == ["正常（无语）"]
+        assert runtime.emotes._sticker_prompt_entries(_CONV) == ["正常（无语）"]
 
     def test_抽中时整份摊开_不按语境筛(
         self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch,
@@ -129,7 +129,7 @@ class TestRoster:
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
 
-        lines = runtime._sticker_prompt_entries(_CONV)
+        lines = runtime.emotes._sticker_prompt_entries(_CONV)
 
         # 三张标签互不相干，换成旧的关键词预筛这里最多出一张。
         assert len(lines) == 3
@@ -142,7 +142,7 @@ class TestRoster:
         set_live_config(runtime, sticker_send_probability=0.5)
         _always(runtime, monkeypatch, False)
 
-        assert runtime._sticker_prompt_entries(_CONV) == []
+        assert runtime.emotes._sticker_prompt_entries(_CONV) == []
 
     def test_概率为零就是彻底关掉(
         self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch,
@@ -152,7 +152,7 @@ class TestRoster:
         # 骰子掷出 0.0 —— 概率为 0 时连这个都不该放行。
         _always(runtime, monkeypatch, True)
 
-        assert runtime._sticker_prompt_entries(_CONV) == []
+        assert runtime.emotes._sticker_prompt_entries(_CONV) == []
 
     def test_装不下时发得最少的先上(
         self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch,
@@ -163,7 +163,7 @@ class TestRoster:
         set_live_config(runtime, sticker_send_probability=1.0, sticker_prompt_limit=2)
         _always(runtime, monkeypatch, True)
 
-        lines = runtime._sticker_prompt_entries(_CONV)
+        lines = runtime.emotes._sticker_prompt_entries(_CONV)
 
         # 按名字排的话「中」会挤掉「新」，冷门图永远没机会露面。
         assert [line.split("（")[0] for line in lines] == ["新", "中"]
@@ -179,7 +179,7 @@ class TestRoster:
         )
         _always(runtime, monkeypatch, True)
 
-        lines = runtime._sticker_prompt_entries(_CONV)
+        lines = runtime.emotes._sticker_prompt_entries(_CONV)
 
         assert [line.split("（")[0] for line in lines] == ["没发过"]
 
@@ -191,17 +191,17 @@ class TestRoster:
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
 
-        assert runtime._sticker_prompt_entries(_CONV) == ["甲（无标签）"]
+        assert runtime.emotes._sticker_prompt_entries(_CONV) == ["甲（无标签）"]
 
 
 class TestPromptBlock:
     def test_只有收藏时不声明本地情绪词回退(
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(runtime, "_current_custom_face_names", lambda: ["收藏甲"])
+        monkeypatch.setattr(runtime.emotes, "_current_custom_face_names", lambda: ["收藏甲"])
         set_live_config(runtime, sticker_send_probability=0.0)
 
-        block = runtime._custom_face_prompt_block(_CONV)
+        block = runtime.emotes._custom_face_prompt_block(_CONV)
 
         assert "收藏表情（只能用这些名字）：收藏甲" in block
         assert "[表情:无语]" not in block
@@ -211,11 +211,11 @@ class TestPromptBlock:
         self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _add(store, "本地甲", ["大笑"])
-        monkeypatch.setattr(runtime, "_current_custom_face_names", lambda: ["收藏甲"])
+        monkeypatch.setattr(runtime.emotes, "_current_custom_face_names", lambda: ["收藏甲"])
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
 
-        block = runtime._custom_face_prompt_block(_CONV)
+        block = runtime.emotes._custom_face_prompt_block(_CONV)
 
         assert "收藏表情（只能用这些名字）：收藏甲" in block
         assert "本地甲（大笑）" in block
@@ -229,7 +229,7 @@ class TestPromptBlock:
         _add(store, "甲", ["大笑"])
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
-        block = runtime._custom_face_prompt_block(_CONV)
+        block = runtime.emotes._custom_face_prompt_block(_CONV)
         node = yaml.safe_load((_ROOT / "config/nodes" / filename).read_text(encoding="utf-8"))
         prompt = node["prompt"]
 
@@ -248,7 +248,7 @@ class TestPromptBlock:
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
 
-        block = runtime._custom_face_prompt_block(_CONV)
+        block = runtime.emotes._custom_face_prompt_block(_CONV)
 
         assert "甲（大笑）" in block
         assert "只想甩一张图不说话" in block
@@ -261,7 +261,7 @@ class TestPromptBlock:
         _always(runtime, monkeypatch, False)
 
         # 没有收藏表情、这轮又没抽中，就不该白占一段提示词。
-        assert runtime._custom_face_prompt_block(_CONV) == ""
+        assert runtime.emotes._custom_face_prompt_block(_CONV) == ""
 
     def test_不再限制模型只能用名单里的名字(
         self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch,
@@ -270,7 +270,7 @@ class TestPromptBlock:
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
 
-        block = runtime._custom_face_prompt_block(_CONV)
+        block = runtime.emotes._custom_face_prompt_block(_CONV)
 
         # 这句话曾经把描述式那条路堵死。
         assert "不要臆造未列出的" not in block
@@ -281,7 +281,7 @@ class TestAutoTag:
     """自动打标是花钱的那一步，得能单独关掉。"""
 
     def test_默认开着(self, runtime: Any) -> None:
-        assert runtime.live.sticker_auto_tag is True
+        assert runtime.state.live.sticker_auto_tag is True
 
     def test_关掉之后打标循环不再干活(
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
@@ -289,11 +289,11 @@ class TestAutoTag:
         set_live_config(runtime, sticker_auto_tag=False)
         seen: list[bool] = []
         monkeypatch.setattr(
-            runtime, "StickerTagger",
+            runtime.emotes, "StickerTagger",
             lambda *a, **kw: seen.append(kw["config"]().enabled) or _Stub(),
         )
-        runtime._adapter.sticker_tagger = None
-        runtime._start_sticker_tagger()
+        runtime.state._adapter.sticker_tagger = None
+        runtime.emotes._start_sticker_tagger()
 
         assert seen == [False]
 
@@ -302,11 +302,11 @@ class TestAutoTag:
     ) -> None:
         holder: list[Any] = []
         monkeypatch.setattr(
-            runtime, "StickerTagger",
+            runtime.emotes, "StickerTagger",
             lambda *a, **kw: holder.append(kw["config"]) or _Stub(),
         )
-        runtime._adapter.sticker_tagger = None
-        runtime._start_sticker_tagger()
+        runtime.state._adapter.sticker_tagger = None
+        runtime.emotes._start_sticker_tagger()
         read = holder[0]
 
         assert read().enabled is True
@@ -331,7 +331,7 @@ class TestRosterLayout:
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
 
-        block = runtime._custom_face_prompt_block(_CONV)
+        block = runtime.emotes._custom_face_prompt_block(_CONV)
         rows = [line.strip() for line in block.splitlines() if line.startswith("  ")]
 
         # 顺序另有规则（发得少的在前），这里只认「一张一行、标签不串行」。
@@ -346,7 +346,7 @@ class TestRosterLayout:
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
 
-        block = runtime._custom_face_prompt_block(_CONV)
+        block = runtime.emotes._custom_face_prompt_block(_CONV)
 
         assert "  甲（开心、快乐）" in block
         assert "  乙（无语）" in block

@@ -49,14 +49,14 @@ def _runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, groups: frozenset[
 def test_inbound_rejects_when_allowlist_empty(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = _runtime(monkeypatch, tmp_path, frozenset())
 
-    assert runtime._is_group_allowed(_IN_LIST) is False
+    assert runtime.permissions._is_group_allowed(_IN_LIST) is False
 
 
 def test_inbound_accepts_listed_group(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = _runtime(monkeypatch, tmp_path, frozenset({_IN_LIST}))
 
-    assert runtime._is_group_allowed(_IN_LIST) is True
-    assert runtime._is_group_allowed(_NOT_IN_LIST) is False
+    assert runtime.permissions._is_group_allowed(_IN_LIST) is True
+    assert runtime.permissions._is_group_allowed(_NOT_IN_LIST) is False
 
 
 @pytest.mark.parametrize('gid', ['111', 111.0])
@@ -64,14 +64,14 @@ def test_inbound_coerces_numeric_forms(monkeypatch: pytest.MonkeyPatch, tmp_path
     """OneBot 事件里 group_id 有时是字符串，不能因此判成不允许。"""
     runtime = _runtime(monkeypatch, tmp_path, frozenset({_IN_LIST}))
 
-    assert runtime._is_group_allowed(gid) is True
+    assert runtime.permissions._is_group_allowed(gid) is True
 
 
 @pytest.mark.parametrize('gid', [None, '', 'abc'])
 def test_inbound_rejects_unparsable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, gid: Any) -> None:
     runtime = _runtime(monkeypatch, tmp_path, frozenset({_IN_LIST}))
 
-    assert runtime._is_group_allowed(gid) is False
+    assert runtime.permissions._is_group_allowed(gid) is False
 
 
 # --- 出站：修复前空名单会放行任意群 ---
@@ -81,7 +81,7 @@ def test_outbound_candidates_empty_when_allowlist_empty(monkeypatch: pytest.Monk
     """空名单时主动群聊候选必须为空，而不是 Bot 加入的所有群。"""
     runtime = _runtime(monkeypatch, tmp_path, frozenset())
 
-    candidates = asyncio.run(runtime._group_target_candidates(_Bot()))
+    candidates = asyncio.run(runtime.proactive._group_target_candidates(_Bot()))
 
     assert candidates == []
 
@@ -89,7 +89,7 @@ def test_outbound_candidates_empty_when_allowlist_empty(monkeypatch: pytest.Monk
 def test_outbound_candidates_only_listed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = _runtime(monkeypatch, tmp_path, frozenset({_IN_LIST}))
 
-    candidates = asyncio.run(runtime._group_target_candidates(_Bot()))
+    candidates = asyncio.run(runtime.proactive._group_target_candidates(_Bot()))
 
     assert [c.target_id for c in candidates] == [_IN_LIST]
 
@@ -101,8 +101,8 @@ def test_outbound_explicit_group_id_denied_when_allowlist_empty(
     runtime = _runtime(monkeypatch, tmp_path, frozenset())
 
     target, err = asyncio.run(
-        runtime._resolve_proactive_target(
-            _Bot(), runtime.capability.Requester(user_id=_ADMIN, listed_admin=True),
+        runtime.proactive._resolve_proactive_target(
+            _Bot(), runtime.permissions.capability.Requester(user_id=_ADMIN, listed_admin=True),
             'group', f'群:{_NOT_IN_LIST}', capability_key="proactive",
         )
     )
@@ -117,8 +117,8 @@ def test_outbound_explicit_group_id_allowed_when_listed(
     runtime = _runtime(monkeypatch, tmp_path, frozenset({_IN_LIST}))
 
     target, err = asyncio.run(
-        runtime._resolve_proactive_target(
-            _Bot(), runtime.capability.Requester(user_id=_ADMIN, listed_admin=True),
+        runtime.proactive._resolve_proactive_target(
+            _Bot(), runtime.permissions.capability.Requester(user_id=_ADMIN, listed_admin=True),
             'group', f'群:{_IN_LIST}', capability_key="proactive",
         )
     )
@@ -131,8 +131,8 @@ def test_outbound_unlisted_group_denied(monkeypatch: pytest.MonkeyPatch, tmp_pat
     runtime = _runtime(monkeypatch, tmp_path, frozenset({_IN_LIST}))
 
     target, err = asyncio.run(
-        runtime._resolve_proactive_target(
-            _Bot(), runtime.capability.Requester(user_id=_ADMIN, listed_admin=True),
+        runtime.proactive._resolve_proactive_target(
+            _Bot(), runtime.permissions.capability.Requester(user_id=_ADMIN, listed_admin=True),
             'group', f'群:{_NOT_IN_LIST}', capability_key="proactive",
         )
     )
@@ -147,12 +147,12 @@ def test_forward_bridge_current_group_denied_when_allowlist_empty(
     """qq_forward 的「发到本群」分支同样不能在空名单时放行。"""
     runtime = _runtime(monkeypatch, tmp_path, frozenset())
     monkeypatch.setitem(
-        runtime._adapter.session_targets, _SESSION,
+        runtime.state._adapter.session_targets, _SESSION,
         {'type': 'group', 'group_id': _NOT_IN_LIST, 'user_id': _ADMIN},
     )
 
     target, err = asyncio.run(
-        runtime._forward_bridge_resolve_target(_Bot(), _SESSION, 'current', '')
+        runtime.forward_bridge._forward_bridge_resolve_target(_Bot(), _SESSION, 'current', '')
     )
 
     assert target is None
@@ -167,10 +167,10 @@ def test_inbound_and_outbound_agree(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     runtime = _runtime(monkeypatch, tmp_path, groups)
 
     for gid in (_IN_LIST, _NOT_IN_LIST):
-        inbound = runtime._is_group_allowed(gid)
+        inbound = runtime.permissions._is_group_allowed(gid)
         target, _err = asyncio.run(
-            runtime._resolve_proactive_target(
-                _Bot(), runtime.capability.Requester(user_id=_ADMIN, listed_admin=True),
+            runtime.proactive._resolve_proactive_target(
+                _Bot(), runtime.permissions.capability.Requester(user_id=_ADMIN, listed_admin=True),
                 'group', f'群:{gid}', capability_key="proactive",
             )
         )
