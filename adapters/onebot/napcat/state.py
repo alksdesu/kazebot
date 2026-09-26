@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Mapping, Optional
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
+from platforms.builtin import QQ_NAPCAT
 from platforms.inbound import InboundFacts
 from ..adapter import OneBotAdapter
-from ..feature_gateway import FeatureGateway
-from ..config import CLONOTH_WORKSPACE
+from adapters._shared.feature_gateway import FeatureGateway, TargetConversation
+from ..config import BURST_STORE_FILE, CLONOTH_WORKSPACE
 from adapters._shared.trigger_policy import TriggerDecision
 from ..live_config import live
 from adapters._shared.send_guard import OutboundSendContext
@@ -18,12 +19,6 @@ from . import anonymize, inbound, message_text, models, permissions, proactive, 
 
 class _OneBotFeatureHost:
     """FeatureGateway 对插件的全部依赖。函数在调用时按模块名解析，替换模块属性照样生效。"""
-
-    Message = Message
-    MessageSegment = MessageSegment
-    QueuedInbound = models.QueuedInbound
-    live = live
-    workspace = Path(CLONOTH_WORKSPACE)
 
     @property
     def client(self) -> Optional[ClonothClient]:
@@ -48,8 +43,8 @@ class _OneBotFeatureHost:
     def message_to_text(self, message: Any, bot_self_id: Any = None) -> str:
         return message_text._message_to_text(message, bot_self_id)
 
-    def is_group_allowed(self, group_id: int) -> bool:
-        return permissions._is_group_allowed(group_id)
+    def is_group_allowed(self, group_id: Any) -> bool:
+        return permissions._is_group_allowed(int(group_id))
 
     def is_private_allowed(self, event: Any) -> bool:
         return permissions._is_private_allowed(event)
@@ -75,12 +70,27 @@ class _OneBotFeatureHost:
     async def queue_or_submit_ready(self, item: models.QueuedInbound) -> bool:
         return await queueing._queue_or_submit_ready(item)
 
-    async def send_qq_message(
-        self, bot: Any, target: Dict[str, Any], message: Any, *, send_context: OutboundSendContext | None = None,
+    def describe_target(self, target: Mapping[str, Any]) -> TargetConversation:
+        return queueing._feature_target(target)
+
+    def community_targets(self) -> Iterator[Dict[str, Any]]:
+        return queueing._community_targets()
+
+    def staged_event_fields(self, event: Any) -> Dict[str, Any]:
+        return queueing._staged_event_fields(event)
+
+    def restore_inbound(
+        self, bot: Any, event: Any, data: Mapping[str, Any], facts: InboundFacts, actor: Dict[str, Any],
+    ) -> models.QueuedInbound:
+        return queueing._restore_staged_inbound(bot, event, data, facts, actor)
+
+    async def send_text(
+        self, bot: Any, target: Dict[str, Any], text: str, *, send_context: OutboundSendContext | None = None,
     ) -> Any:
-        return await sending._send_qq_message(bot, target, message, send_context=send_context)
+        return await sending._send_qq_message(bot, target, Message(MessageSegment.text(text)), send_context=send_context)
 
 
 _adapter = OneBotAdapter(
-    workspace=Path(CLONOTH_WORKSPACE), live=live, features=FeatureGateway(_OneBotFeatureHost()),
+    workspace=Path(CLONOTH_WORKSPACE), live=live,
+    features=FeatureGateway(_OneBotFeatureHost(), platform=QQ_NAPCAT, burst_path=Path(BURST_STORE_FILE)),
 )

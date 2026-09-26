@@ -1,12 +1,14 @@
+"""计划与批处理命令：建计划、确认、修改、取消、只重试失败步骤，转给 supervisor 的执行服务处理。"""
 from __future__ import annotations
 
 import re
+from types import MappingProxyType
 from typing import Any
 
 COMMANDS = frozenset({"计划", "批处理", "任务", "计划确认", "计划修改", "计划取消", "失败重试", "步骤核对"})
 CONTROL_COMMANDS = frozenset({"任务", "计划取消"})
 
-STATUS = {"draft": "待确认", "queued": "排队中", "running": "执行中", "awaiting_approval": "等待审批", "completed": "完成", "succeeded": "完成", "failed": "失败", "partial": "部分完成", "blocked": "等待依赖", "cancelled": "已取消", "cancelling": "正在停止", "outcome_unknown": "需核对实际结果", "pending": "待执行"}
+STATUS = MappingProxyType({"draft": "待确认", "queued": "排队中", "running": "执行中", "awaiting_approval": "等待审批", "completed": "完成", "succeeded": "完成", "failed": "失败", "partial": "部分完成", "blocked": "等待依赖", "cancelled": "已取消", "cancelling": "正在停止", "outcome_unknown": "需核对实际结果", "pending": "待执行"})
 
 
 def render(plan: dict) -> str:

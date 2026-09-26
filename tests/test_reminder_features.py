@@ -53,8 +53,8 @@ def fire(state, reminder):
     return state.reminders.get(FeatureActor(is_admin=True), reminder["id"])
 
 
-def adapter_module(name):
-    spec = importlib.util.spec_from_file_location(f"_reminder_test_{name}", Path(__file__).resolve().parents[1] / "adapters/onebot" / f"{name}.py")
+def adapter_module(name, package="onebot"):
+    spec = importlib.util.spec_from_file_location(f"_reminder_test_{name}", Path(__file__).resolve().parents[1] / "adapters" / package / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -187,7 +187,7 @@ async def test_qq_command_service_sdk_receipt_and_completion_roundtrip(state):
     app.include_router(create_router(state))
     client = ClonothClient("http://test", admin_token="reminder-test")
     client._client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), headers={"Authorization": "Bearer reminder-test"})
-    commands = adapter_module("reminder_commands")
+    commands = adapter_module("reminder_commands", package="_shared")
     actor = {"scope": "qq_private:42", "user_id": "42", "channel": "qq_private", "bot_scope": "bot", "message_id": "100"}
     sent = []
     async def send(scope, text, attachments, **kwargs):

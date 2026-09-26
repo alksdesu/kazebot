@@ -1,3 +1,4 @@
+"""社区协作命令：群规、群资料、活动、投票、安静期，转给 supervisor 的社区服务处理。"""
 from __future__ import annotations
 
 from clonoth_sdk.command_text import canonicalize_quiet_command as canonicalize

@@ -263,7 +263,7 @@ def test_quiet_deferral_is_not_wrapped_as_attachment_failure(runtime, monkeypatc
     import time
     from importlib import import_module
 
-    deferred = import_module(runtime.__name__ + '.feature_gateway').QuietDeliveryDeferred(time.time() + 60)
+    deferred = import_module('adapters._shared.feature_gateway').QuietDeliveryDeferred(time.time() + 60)
     image = tmp_path / "test.png"
     image.write_bytes(b"placeholder")
     monkeypatch.setattr(runtime.outbound_attachments, "_send_attachment_path", AsyncMock(side_effect=deferred))

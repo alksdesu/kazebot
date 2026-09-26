@@ -32,7 +32,6 @@ adapters/onebot/
 │   ├── lifecycle.py             # 热载对齐、live state 发布、启动与关闭
 │   └── handlers.py              # matcher 与背后的处理函数
 ├── adapter.py                   # OneBotAdapter：全部进程内状态
-├── feature_gateway.py           # 社区功能网关，经 FeatureHost 接口调用插件能力
 ├── config.py                    # 环境变量配置
 ├── live_config.py               # config/qq.yaml 热载配置
 ├── send_contract.py             # QQ 目标身份与 NapCat 错误指纹，绑定共享的发送防重
@@ -41,8 +40,7 @@ adapters/onebot/
 ├── segments.py                  # OneBot 消息段与消息 id 的纯解析
 ├── attachment_policy.py         # 附件挑选策略
 ├── emoji_handler.py             # QQ 表情与输出文本清理
-├── faces.py                     # 内置表情 id → 名字
-└── *_commands.py                # 社区功能的命令
+└── faces.py                     # 内置表情 id → 名字
 ```
 
 包本身没有导入副作用，根目录下的兄弟模块也不导入 NoneBot：supervisor、迁移脚本可以直接 `import adapters.onebot.<兄弟模块>`。
@@ -51,7 +49,8 @@ NoneBot 只出现在 `napcat/` 里，由插件入口加载。
 不分平台的逻辑在 `adapters/_shared/`：触发判定、管理能力档位、复读判定、会话键摘要（盐、稳定键、当前账号记录）、记忆提示，
 以及热载配置引擎（`live_config.py`）、环境变量读取（`env.py`）、手写 yaml 解析（`yaml_loader.py`）、
 出站发送防重（`send_guard.py`）、匿名别名表（`aliases.py`）、群历史窗口与清空门槛（`history_window.py`），
-会话排队（`conversation_queue.py`）、连发合并与暂存（`conversation_coordinator.py`、`burst_store.py`）、抢占候选判定（`preemption.py`）和审批状态机（`approvals.py`）。
+会话排队（`conversation_queue.py`）、连发合并与暂存（`conversation_coordinator.py`、`burst_store.py`）、抢占候选判定（`preemption.py`）、审批状态机（`approvals.py`），
+以及社区功能网关（`feature_gateway.py`）和功能命令（`*_commands.py`）。网关只经 `FeatureHost` 认识平台，QQ 的实现在 `napcat/state.py`。
 `live_config.py` 这边只声明 QQ 的键和配置文件位置，缓存与快照在它持有的 `LiveConfig` 实例上。
 那边不认识 QQ，平台专属的部分（群角色映射、CQ 码边界、消息段解析）留在这里，调用时传进去。
 

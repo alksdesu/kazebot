@@ -1,20 +1,24 @@
+"""社区功能网关：功能策略、消息流水与素材登记、连发暂存与恢复、功能命令、安静期的发送核验。
+
+只经 FeatureHost 认识平台：发送目标落在哪个会话、事件怎么还原、消息怎么发，都问宿主。
+"""
 from __future__ import annotations
 
 import asyncio
 import importlib
 import logging
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Iterable, Mapping, Protocol
+from urllib.parse import quote
 
-from platforms.builtin import QQ_NAPCAT
-from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE
+from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE, PlatformDescriptor
 from platforms.inbound import InboundConversation, InboundFacts, InboundSender
 
-from . import community_commands
+from adapters._shared import community_commands
 from adapters._shared.burst_store import BurstStore
-from adapters._shared.conversation_coordinator import ConversationCoordinator
+from adapters._shared.conversation_coordinator import BurstItem, ConversationCoordinator
 from adapters._shared.send_guard import SendError
 
 logger = logging.getLogger(__name__)
@@ -27,14 +31,36 @@ class QuietDeliveryDeferred(SendError):
         self.deferred = True
 
 
-class FeatureHost(Protocol):
-    """FeatureGateway 对插件的全部依赖，插件入口按这份接口实现。"""
+@dataclass(frozen=True)
+class TargetConversation:
+    """一个发送目标落在哪个会话上。identity 原样拼进真实会话键，reply_ref 是这次投递引用的消息。"""
 
-    workspace: Path
-    live: Any
-    Message: Any
-    MessageSegment: Any
-    QueuedInbound: Any
+    kind: str
+    identity: Any
+    reply_ref: str = ""
+
+
+class StageableInbound(BurstItem, Protocol):
+    """能暂存进连发库的待提交消息。bot、event 是平台对象，网关只交还给宿主，不看里面。"""
+
+    bot: Any
+    event: Any
+    facts: InboundFacts | None
+    real_conversation_key: str
+    text: str
+    attachments: list[dict[str, Any]]
+    is_dm: bool
+    channel: str
+    history_watermark: int
+    direct_interaction: bool
+    memory_user_ids: tuple[str, ...]
+
+
+class FeatureHost(Protocol):
+    """FeatureGateway 对平台适配器的全部依赖，适配器按这份接口实现。
+
+    发送目标是 Mapping：平台自己的键由 describe_target 解读，下划线开头的键是功能层自己的标注。
+    """
 
     @property
     def client(self) -> Any: ...
@@ -52,7 +78,7 @@ class FeatureHost(Protocol):
 
     def message_to_text(self, message: Any, bot_self_id: Any = None) -> str: ...
 
-    def is_group_allowed(self, group_id: int) -> bool: ...
+    def is_group_allowed(self, group_id: Any) -> bool: ...
 
     def is_private_allowed(self, event: Any) -> bool: ...
 
@@ -70,19 +96,32 @@ class FeatureHost(Protocol):
 
     async def queue_or_submit_ready(self, item: Any) -> bool: ...
 
-    async def send_qq_message(
-        self, bot: Any, target: dict[str, Any], message: Any, *, send_context: Any = None,
-    ) -> Any: ...
+    def describe_target(self, target: Mapping[str, Any]) -> TargetConversation: ...
+
+    def community_targets(self) -> Iterable[Mapping[str, Any]]:
+        """要轮询安静期和社区通知的会话。"""
+
+    def staged_event_fields(self, event: Any) -> Mapping[str, Any]:
+        """暂存行里跟着平台事件走的字段，恢复时连同整行交还给 restore_inbound。"""
+
+    def restore_inbound(
+        self, bot: Any, event: Any, data: Mapping[str, Any], facts: InboundFacts, actor: dict[str, Any],
+    ) -> Any:
+        """按暂存行和重放出来的事件重建待提交消息。"""
+
+    async def send_text(self, bot: Any, target: Mapping[str, Any], text: str, *, send_context: Any = None) -> Any:
+        """发一条纯文本，返回平台消息编号；没发出去返回空。"""
 
 
 class FeatureGateway:
-    def __init__(self, host: FeatureHost):
+    def __init__(self, host: FeatureHost, *, platform: PlatformDescriptor, burst_path: Path):
         self.host = host
+        self.platform = platform
         self.coordinator = ConversationCoordinator()
         self.poll_task: asyncio.Task | None = None
         self.started_at = time.time()
         self.recovered_accounts: set[str] = set()
-        self.burst_store = BurstStore(Path(host.workspace) / "data" / "onebot_bursts.sqlite3")
+        self.burst_store = BurstStore(Path(burst_path))
 
     def facts_of(self, bot, source) -> InboundFacts:
         return source if isinstance(source, InboundFacts) else self.host.inbound_facts(bot, source)
@@ -101,12 +140,19 @@ class FeatureGateway:
             "display_name": facts.sender.display_name,
         }
 
+    def channel_name(self, kind: str) -> str:
+        """平台里这类会话的通道名，也就是真实会话键的前缀。"""
+        for channel in self.platform.channels:
+            if channel.kind == kind:
+                return channel.name
+        raise LookupError(f"platform {self.platform.id!r} declares no {kind!r} channel")
+
     def target_actor(self, bot, target) -> dict:
-        kind = "qq_group" if target.get("type") == "group" else "qq_private"
-        identity = target.get("group_id") if kind == "qq_group" else target.get("user_id")
-        return {"scope": self.host.stable_conversation_key(f"{kind}:{identity}"),
+        conversation = self.host.describe_target(target)
+        channel = self.channel_name(conversation.kind)
+        return {"scope": self.host.stable_conversation_key(f"{channel}:{conversation.identity}"),
                 "user_id": str(getattr(bot, "self_id", "") or "bot"), "is_admin": True,
-                "role": "admin", "channel": kind, "bot_scope": str(getattr(bot, "self_id", "") or "")}
+                "role": "admin", "channel": channel, "bot_scope": str(getattr(bot, "self_id", "") or "")}
 
     @property
     def available(self):
@@ -219,13 +265,14 @@ class FeatureGateway:
         actor["message_id"] = str(message_id)
         text = self.host.message_to_text(message, getattr(bot, "self_id", None))
         try:
+            reply_ref = self.host.describe_target(target).reply_ref
             module = importlib.import_module(f"{__package__}.material_commands")
             await module.record_message(self.host.client, actor, message_id=str(message_id), text=text,
                                         timestamp=time.time(), sender_name="Bot", direction="outbound",
-                                        reply_ref=str(target.get("reply_message_id") or ""))
+                                        reply_ref=reply_ref)
             await self.host.client.request_feature("POST", "/v1/community/messages", actor=actor, body={
                 "message_id": str(message_id), "text": self.host.anonymize_text_for_ai(text),
-                "reply_ref": str(target.get("reply_message_id") or ""), "sender_name": "Bot",
+                "reply_ref": reply_ref, "sender_name": "Bot",
                 "topic_id": str(target.get("_topic_id") or ""),
             })
         except (ModuleNotFoundError, AttributeError):
@@ -272,7 +319,7 @@ class FeatureGateway:
         except Exception:
             logger.warning("sent attachment registration failed", exc_info=True)
 
-    def stage_burst(self, item):
+    def stage_burst(self, item: StageableInbound):
         event = item.event
         facts = replace(item.facts or self.host.inbound_facts(item.bot, event), text=item.user_text)
         actor = self.actor(item.bot, facts)
@@ -284,7 +331,7 @@ class FeatureGateway:
                 "memory_user_ids": item.memory_user_ids, "actor": actor, "refs": refs,
                 "route_hints": item.platform_updates.get("_route_hints", {}),
                 "response_purpose": item.platform_updates.get("_response_purpose", "direct"),
-                "event_time": getattr(event, "time", time.time()), "group_id": getattr(event, "group_id", None),
+                **self.host.staged_event_fields(event),
                 "facts": facts.to_dict()}
         self.burst_store.save(item.stable_conversation_key, actor["message_id"], actor["bot_scope"], data)
 
@@ -298,29 +345,18 @@ class FeatureGateway:
                 # 匿名消息没有能回放的真实身份，丢掉这一条，不能让它卡住整批恢复。
                 logger.warning("skip staged burst without a replayable sender: scope=%s", data.get("scope"))
                 continue
-            if staged.conversation.is_group and not self.host.is_group_allowed(int(staged.conversation.raw_id)):
+            if staged.conversation.is_group and not self.host.is_group_allowed(staged.conversation.raw_id):
                 continue
             event = await self.host.replay_event(bot, staged)
             if staged.conversation.is_private and not self.host.is_private_allowed(event):
                 continue
             facts = replace(self.host.inbound_facts(bot, event), text=data["user_text"])
-            platform = {"bot": bot, "event": event, "type": "private" if data["is_dm"] else "group", "user_id": event.user_id,
-                        "conversation_key": data["scope"], "_route_hints": data.get("route_hints") or {"source_message_refs": data["refs"]},
-                        "_response_purpose": data.get("response_purpose", "direct"), "_feature_actor": self.actor(bot, facts),
-                        "_source_attachments": data["attachments"]}
-            if data["group_id"] is not None:
-                platform["group_id"] = data["group_id"]
-            item = self.host.QueuedInbound(None, bot, event, data["channel"], data["real_key"], data["scope"],
-                                               data["text"], data["attachments"], data["is_dm"], platform, data["user_text"],
-                                               entry_node_id=data["entry_node_id"], history_watermark=-1,
-                                               direct_interaction=data["direct_interaction"], memory_user_ids=tuple(data["memory_user_ids"]),
-                                               facts=facts)
+            item = self.host.restore_inbound(bot, event, data, facts, self.actor(bot, facts))
             if not await self.host.queue_or_submit_ready(item):
                 return
         self.recovered_accounts.add(account)
 
-    @staticmethod
-    def staged_facts(data: Mapping[str, Any]) -> InboundFacts:
+    def staged_facts(self, data: Mapping[str, Any]) -> InboundFacts:
         """暂存行里的入站事实。只有 actor 字段的旧行按当时的写法拼回来。"""
         if isinstance(data.get("facts"), Mapping):
             return InboundFacts.from_dict(data["facts"])
@@ -329,7 +365,7 @@ class FeatureGateway:
         return InboundFacts(
             sender=InboundSender(platform_id=actor.get("user_id", ""), display_name=str(actor.get("display_name") or "")),
             conversation=InboundConversation(
-                platform=QQ_NAPCAT.id, channel=str(data.get("channel") or ""),
+                platform=self.platform.id, channel=str(data.get("channel") or ""),
                 kind=CHANNEL_GROUP if group_id is not None else CHANNEL_PRIVATE,
                 raw_id=group_id if group_id is not None else actor.get("user_id", ""),
                 conversation_key=str(data.get("scope") or ""), real_conversation_key=str(data.get("real_key") or ""),
@@ -381,7 +417,7 @@ class FeatureGateway:
         return self.coordinator.quiet_blocks(metadata.get("policy", {}), direct=metadata.get("direct", False) if direct is None else direct)
 
     async def check_send(self, bot, target):
-        if not self.available or target.get("type") != "group" or target.get("_quiet_control"):
+        if not self.available or self.host.describe_target(target).kind != CHANNEL_GROUP or target.get("_quiet_control"):
             return
         actor = self.target_actor(bot, target)
         try:
@@ -412,8 +448,7 @@ class FeatureGateway:
                 bot = self.host.get_fallback_bot()
                 if bot is not None and self.available:
                     await self.recover_bursts(bot)
-                    for group_id in self.host.live.allowed_groups:
-                        target = {"type": "group", "group_id": int(group_id), "_response_purpose": "ambient"}
+                    for target in self.host.community_targets():
                         actor = self.target_actor(bot, target)
                         previous = self.coordinator.policies.get(actor["scope"], (0, {}))[1].get("quiet")
                         current = await self.coordinator.policy(self.host.client, actor, refresh=True)
@@ -424,10 +459,8 @@ class FeatureGateway:
                         pending = await self.host.client.request_feature("GET", "/v1/community/notifications", actor=actor)
                         for notification in pending.get("items", []):
                             context = self.host.request_send_context("community", notification["id"], actor["scope"])
-                            message_id = await self.host.send_qq_message(bot, target,
-                                self.host.Message(self.host.MessageSegment.text(notification["text"])), send_context=context)
+                            message_id = await self.host.send_text(bot, target, notification["text"], send_context=context)
                             if message_id:
-                                from urllib.parse import quote
                                 await self.host.client.request_feature("POST", f"/v1/community/notifications/{quote(notification['id'], safe='')}/ack",
                                                                           actor=actor, body={"message_id": message_id})
             except asyncio.CancelledError:

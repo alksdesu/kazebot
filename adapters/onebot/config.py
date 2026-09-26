@@ -183,6 +183,9 @@ ONEBOT_IDEMPOTENCY_AMBIGUOUS_TTL_SECONDS = env_float(
     "ONEBOT_IDEMPOTENCY_AMBIGUOUS_TTL_SECONDS", 24 * 3600.0, min_value=0.0,
 )
 
+# 连发窗口里还没提交的消息，进程重启后按账号取回来重放。
+BURST_STORE_FILE = os.path.join(CLONOTH_WORKSPACE, "data", "onebot_bursts.sqlite3")
+
 # 引用消息附件索引缓存：保存 message_id -> 已落盘图片附件路径，用于 get_msg 失败时兜底转发。
 # 与路由状态分离，避免 onebot_plugin_state.json 被临时缓存污染。
 REPLY_ATTACHMENT_CACHE_FILE = env_first(

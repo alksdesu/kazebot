@@ -5,16 +5,19 @@ import logging
 import asyncio
 import re
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional
 from nonebot import get_bot
 from nonebot.adapters.onebot.v11 import Bot, Event
 from ..config import ENTRY_NODE_ID
 from adapters._shared import capability
+from adapters._shared.feature_gateway import TargetConversation
 from adapters._shared.preemption import preempt_candidates
 from ..live_config import live, pinned as pinned_live_config
 from ..attachment_policy import source_attachments_from_merged
 from ..segments import at_segment_user_ids
 from clonoth_sdk import TriggerInfo
+from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE
+from platforms.inbound import InboundFacts
 
 from . import anonymize, common, history, identity, inbound, models, permissions, routing, sending, state
 
@@ -497,6 +500,44 @@ def _target_from_platform_data(platform_data: Dict[str, Any]) -> Optional[Dict[s
             t["reply_sender_id"] = int(sender_id)
         return t
     return None
+
+
+def _feature_target(target: Mapping[str, Any]) -> TargetConversation:
+    """QQ 发送目标落在哪个会话上，给社区功能网关算会话键和引用。"""
+    is_group = target.get("type") == "group"
+    return TargetConversation(
+        kind=CHANNEL_GROUP if is_group else CHANNEL_PRIVATE,
+        identity=target.get("group_id") if is_group else target.get("user_id"),
+        reply_ref=str(target.get("reply_message_id") or ""),
+    )
+
+
+def _community_targets() -> Iterator[Dict[str, Any]]:
+    """社区功能轮询安静期和通知的会话：放行名单里的每个群。"""
+    for group_id in live.allowed_groups:
+        yield {"type": "group", "group_id": int(group_id), "_response_purpose": "ambient"}
+
+
+def _staged_event_fields(event: Any) -> Dict[str, Any]:
+    """连发暂存行里跟着 QQ 事件走的字段。群号按事件里的 int 存，恢复时原样回填进发送目标。"""
+    return {"event_time": getattr(event, "time", time.time()), "group_id": getattr(event, "group_id", None)}
+
+
+def _restore_staged_inbound(
+    bot: Bot, event: Event, data: Mapping[str, Any], facts: InboundFacts, actor: Dict[str, Any],
+) -> models.QueuedInbound:
+    """按连发暂存行和重放出来的事件重建排队项。"""
+    platform = {"bot": bot, "event": event, "type": "private" if data["is_dm"] else "group", "user_id": event.user_id,
+                "conversation_key": data["scope"], "_route_hints": data.get("route_hints") or {"source_message_refs": data["refs"]},
+                "_response_purpose": data.get("response_purpose", "direct"), "_feature_actor": actor,
+                "_source_attachments": data["attachments"]}
+    if data["group_id"] is not None:
+        platform["group_id"] = data["group_id"]
+    return models.QueuedInbound(None, bot, event, data["channel"], data["real_key"], data["scope"],
+                                data["text"], data["attachments"], data["is_dm"], platform, data["user_text"],
+                                entry_node_id=data["entry_node_id"], history_watermark=-1,
+                                direct_interaction=data["direct_interaction"], memory_user_ids=tuple(data["memory_user_ids"]),
+                                facts=facts)
 
 
 def _get_fallback_bot() -> Optional[Bot]:

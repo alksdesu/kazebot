@@ -1,3 +1,4 @@
+"""提醒命令，以及引用提醒消息回复完成、延后、取消，转给 supervisor 的提醒服务处理。"""
 from __future__ import annotations
 
 import re

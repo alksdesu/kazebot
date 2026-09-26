@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from stickers.store import StickerStore
     from stickers.tagger import StickerTagger
 
-    from .feature_gateway import FeatureGateway
+    from adapters._shared.feature_gateway import FeatureGateway
     from .napcat.callbacks import TangQiuCallbacks
     from .napcat.models import (
         GroupContentRecord,

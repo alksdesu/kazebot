@@ -1,3 +1,4 @@
+"""资料命令，以及消息流水和素材登记，转给 supervisor 的资料服务处理。"""
 from __future__ import annotations
 
 import datetime as dt
@@ -5,8 +6,8 @@ import re
 from typing import Any
 from urllib.parse import quote
 
-COMMANDS = {"资料"}
-CONTROL_COMMANDS: set[str] = set()
+COMMANDS = frozenset({"资料"})
+CONTROL_COMMANDS: frozenset[str] = frozenset()
 
 
 async def record_message(

@@ -51,7 +51,7 @@ def test_there_is_exactly_one_adapter_instance() -> None:
 
 
 def test_the_feature_gateway_only_talks_to_its_host_interface() -> None:
-    source = (_ADAPTER_DIR / "feature_gateway.py").read_text(encoding="utf-8")
+    source = (_ADAPTER_DIR.parent / "_shared" / "feature_gateway.py").read_text(encoding="utf-8")
     assert "runtime" not in source
     assert "sys.modules" not in _source()
 
@@ -61,7 +61,7 @@ def test_every_host_member_is_implemented(monkeypatch, tmp_path) -> None:
 
     runtime = load_runtime(monkeypatch, tmp_path)
     try:
-        protocol = __import__(f"{runtime.__name__}.feature_gateway", fromlist=["FeatureHost"]).FeatureHost
+        from adapters._shared.feature_gateway import FeatureHost as protocol
         wanted = {
             name for name in (*vars(protocol), *getattr(protocol, "__annotations__", {}))
             if not name.startswith("_")
