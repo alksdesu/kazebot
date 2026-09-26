@@ -16,7 +16,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-_SKIP_DIRS = {".venv", "__pycache__", "_research", "tests", "node_modules", ".git"}
+# .claude/worktrees 下是整仓副本，扫进来会把副本里的代码也算一遍。
+_SKIP_DIRS = {".venv", "__pycache__", "_research", "tests", "node_modules", ".git", ".claude"}
 
 # 例外必须写清「为什么它不是洞」，而不是单纯登记文件名。
 # 空集 = 全仓不允许 exec。要加就先在这里写清「为什么它不是洞」。

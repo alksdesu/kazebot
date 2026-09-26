@@ -27,7 +27,8 @@ _DOCS = (
     "adapters/onebot/README.md",
     "config/qq.example.yaml",
 )
-_SKIP_DIRS = {".venv", "__pycache__", "node_modules", ".git", "tests", "_research"}
+# .claude/worktrees 下是整仓副本，扫进来会把副本里的代码也算一遍。
+_SKIP_DIRS = {".venv", "__pycache__", "node_modules", ".git", "tests", "_research", ".claude"}
 _ENV_RE = re.compile(r"\b(?:ONEBOT|CLONOTH)_[A-Z0-9_]+")
 # nonebot-adapter-onebot 自己读这两个，本仓库代码里不会出现。
 _EXTERNAL_ENV = frozenset({"ONEBOT_ACCESS_TOKEN", "ONEBOT_SECRET"})
