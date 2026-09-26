@@ -10,7 +10,7 @@ adapters/onebot/
 ├── onebot_plugin.py             # NoneBot 插件入口：插入工作区路径后加载 napcat/ 各模块
 ├── napcat/                      # 适配器本体，唯一依赖 NoneBot 的地方
 │   ├── common.py                # 共用常量、命令正则、logger
-│   ├── models.py                # 内部流转的数据结构（QueuedInbound、GroupHistoryLine 等）
+│   ├── models.py                # 内部流转的数据结构（QueuedInbound、GroupContentRecord 等）
 │   ├── state.py                 # 唯一的 OneBotAdapter 实例与 FeatureGateway 需要的插件能力
 │   ├── routing.py               # 账号作用域、会话键摘要、路由状态落盘
 │   ├── identity.py              # 发送者 Profile、显示名、匿名成员
