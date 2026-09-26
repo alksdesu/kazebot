@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from nonebot.adapters.onebot.v11 import Bot, Event
 from engine.memory_hit_cache import prune_namespace_hits
 from ..config import CLONOTH_WORKSPACE, CUSTOM_FACE_METADATA_PATH, CUSTOM_FACE_NAMES_PATH
-from .. import capability
+from adapters._shared import capability
 from ..send_contract import AmbiguousClaim, target_from_idempotency_key
 from ..emoji_handler import (
     count_duplicate_face_names,

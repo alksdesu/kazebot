@@ -14,7 +14,7 @@ from ..config import (
     REPLY_ATTACHMENT_CACHE_FILE,
 )
 from .. import bot_scope as _bot_scope
-from ..conversation_hash import digest as _digest_conversation_key
+from adapters._shared.conversation_hash import digest as _digest_conversation_key
 
 from . import anonymize, common, media, state
 

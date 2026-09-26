@@ -3,16 +3,28 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
+from types import MappingProxyType
 from typing import Any
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, PrivateMessageEvent
 from platforms.ids import normalize_id
-from .. import capability
-from ..trigger_policy import TriggerConfig, evaluate as trigger_evaluate
+from adapters._shared import capability
+from adapters._shared.trigger_policy import TriggerConfig, evaluate as trigger_evaluate
 from ..live_config import live, refresh as refresh_live_config
 
 from . import common, identity, inbound, message_text, state
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
+
+# NapCat 的 sender.role 恰好就是共享词表里那三个；别的写法认不出，留空按普通成员判。
+_QQ_GROUP_ROLES = MappingProxyType({
+    "owner": capability.ROLE_OWNER,
+    "admin": capability.ROLE_ADMIN,
+    "member": capability.ROLE_MEMBER,
+})
+
+
+def _group_role(native_role: Any) -> str:
+    return _QQ_GROUP_ROLES.get(str(native_role or "").strip().lower(), "")
 
 
 def _is_group_allowed(group_id: int) -> bool:
@@ -54,7 +66,7 @@ def _requester(event: Any) -> capability.Requester:
         user_id=normalize_id(user_id),
         listed_admin=(not anonymous) and _is_admin_user(user_id),
         group_id=normalize_id(getattr(event, "group_id", None)),
-        group_role="" if anonymous else str(getattr(getattr(event, "sender", None), "role", "") or ""),
+        group_role="" if anonymous else _group_role(getattr(getattr(event, "sender", None), "role", "")),
     )
 
 

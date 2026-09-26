@@ -15,7 +15,7 @@ from platforms.ids import normalize_id
 from platforms.inbound import InboundFacts
 from ..config import CLONOTH_WORKSPACE, CUSTOM_FACE_METADATA_PATH, CUSTOM_FACE_NAMES_PATH
 from .. import bot_scope as _bot_scope
-from ..conversation_hash import digest as _digest_conversation_key
+from adapters._shared.conversation_hash import digest as _digest_conversation_key
 from ..live_config import live
 from ..send_contract import OutboundSendContext
 from ..emoji_handler import (

@@ -14,9 +14,9 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 
-def _load(name: str):
+def _load(name: str, package: str = "onebot"):
     spec = importlib.util.spec_from_file_location(
-        f"_test_{name}", _ROOT / "adapters" / "onebot" / f"{name}.py",
+        f"_test_{name}", _ROOT / "adapters" / package / f"{name}.py",
     )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -25,7 +25,7 @@ def _load(name: str):
     return module
 
 
-ch = _load("conversation_hash")
+ch = _load("conversation_hash", "_shared")
 bot_scope = _load("bot_scope")
 
 _migrate_spec = importlib.util.spec_from_file_location(

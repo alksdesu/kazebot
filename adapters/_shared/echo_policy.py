@@ -10,10 +10,16 @@ from typing import Iterable
 
 # 命令必须以 / 开头，跟着复读等于替别人把命令又发一遍。
 _COMMAND_PREFIXES = ("/", "／")
-# @ 谁、回复谁、卡片分享都带明确指向，复读出去指向就错人了。
-_UNSAFE_MARKERS = ("[CQ:at", "[CQ:reply", "[CQ:json", "[CQ:xml", "[CQ:file", "[CQ:forward")
-# 占位符本身不是内容：三个人各发一张不同的图，正文都是 [图片]，光比文本会判成复读。
-_PLACEHOLDER_RE = re.compile(r"^\[(图片|表情包|QQ表情|语音|视频|合并转发|文件)\]$")
+
+
+@dataclass(frozen=True)
+class EchoRules:
+    """平台给的复读边界。正文里怎么写 @、回复、卡片，怎么渲染图片占位，每个平台都不一样。"""
+
+    # @ 谁、回复谁、卡片分享都带明确指向，复读出去指向就错人了。
+    unsafe_markers: tuple[str, ...] = ()
+    # 占位符本身不是内容：三个人各发一张不同的图，正文都是同一个占位符，光比文本会判成复读。
+    placeholder: re.Pattern[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -25,17 +31,17 @@ class EchoEntry:
     created_at: float
 
 
-def is_echoable_text(text: str, *, max_length: int) -> bool:
+def is_echoable_text(text: str, *, max_length: int, rules: EchoRules = EchoRules()) -> bool:
     """这句话本身能不能被跟。"""
     value = str(text or "").strip()
     if not value or len(value) > max_length:
         return False
     if value.startswith(_COMMAND_PREFIXES):
         return False
-    if _PLACEHOLDER_RE.match(value):
+    if rules.placeholder is not None and rules.placeholder.match(value):
         return False
     upper = value.upper()
-    return not any(marker.upper() in upper for marker in _UNSAFE_MARKERS)
+    return not any(marker.upper() in upper for marker in rules.unsafe_markers)
 
 
 def detect_echo(

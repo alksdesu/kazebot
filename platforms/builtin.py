@@ -35,7 +35,7 @@ QQ_NAPCAT = PlatformDescriptor(
         STATE_ROUTES: "onebot_plugin_state.json",
         STATE_ALIASES: "onebot_anon_map.json",
     },
-    hooks={HOOK_TRIGGER_POLICY: "adapters.onebot.trigger_policy"},
+    hooks={HOOK_TRIGGER_POLICY: "adapters._shared.trigger_policy"},
 )
 
 BUILTIN_PLATFORMS: tuple[PlatformDescriptor, ...] = (QQ_NAPCAT,)

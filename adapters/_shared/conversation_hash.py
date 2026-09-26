@@ -1,6 +1,6 @@
 """会话键摘要的盐：显式环境变量优先，否则用工作区里自动生成并钉住的密钥。
 
-无盐 SHA256 的输入只有「前缀 + 十位数字」，枚举一遍就能反推真实群号/QQ 号。
+无盐 SHA256 的输入只有「前缀 + 一串数字」，枚举一遍就能反推真实群号和账号。
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def scoped_key(conversation_key: str, bot_scope: str) -> str:
 def digest(conversation_key: str, secret: str, *, bot_scope: str = "") -> str:
     """会话键的 24 位摘要；secret 为空时退化成可枚举的裸 SHA256。
 
-    bot_scope 是当前登录的 QQ 号：拌进摘要输入，同一个群在不同 bot 号下就落到
+    bot_scope 是当前登录的 bot 账号：拌进摘要输入，同一个群在不同 bot 号下就落到
     不同的会话键与记忆目录，换号自动隔离、换回来自动复原。
     """
     raw = scoped_key(conversation_key, bot_scope).encode("utf-8")
@@ -53,7 +53,7 @@ def has_digest_derived_state(workspace: Path, route_state_file: Path) -> bool:
 
 
 def resolve_secret(
-    *, env_secret: str, secret_file: Path, workspace: Path, route_state_file: Path,
+    *, env_secret: str, secret_file: Path, workspace: Path, route_state_file: Path, legacy_hint: str = "",
 ) -> tuple[str, bool]:
     """返回 (secret, salted)。首次启动时决定并钉住模式，之后只读文件。"""
     if env_secret:
@@ -68,7 +68,7 @@ def resolve_secret(
         # 存量部署：钉在无盐上让摘要保持不变，加盐迁移交离线脚本。
         logger.warning(
             "existing conversation state found without a hash secret; pinning legacy "
-            "unsalted digests. Run deploy/migrate_qq_conversation_hash.py to salt them.",
+            "unsalted digests.%s", f" {legacy_hint}" if legacy_hint else "",
         )
         result = _pin_mode(secret_file, LEGACY_MARKER)
     else:

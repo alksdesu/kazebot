@@ -158,7 +158,7 @@ class TestRegistration:
     def test_the_public_view_leaves_out_deployment_details(self) -> None:
         public = QQ_NAPCAT.public_dict()
         assert public["id"] == "qq" and public["has_config"] is True
-        assert "config_env" not in public and "adapters.onebot.trigger_policy" not in json.dumps(public)
+        assert "config_env" not in public and "adapters._shared.trigger_policy" not in json.dumps(public)
 
 
 class TestFilesAndHooks:
@@ -179,8 +179,8 @@ class TestFilesAndHooks:
         assert platform_state_path(QQ_NAPCAT, STATE_LIVE, tmp_path) == tmp_path / "data" / "qq_live_state.json"
         assert platform_state_path(QQ_NAPCAT, "nothing", tmp_path) is None
 
-    def test_the_trigger_hook_is_the_adapter_module(self) -> None:
-        from adapters.onebot import trigger_policy
+    def test_the_trigger_hook_is_the_shared_module(self) -> None:
+        from adapters._shared import trigger_policy
 
         assert platform_hook(QQ_NAPCAT, HOOK_TRIGGER_POLICY) is trigger_policy
 

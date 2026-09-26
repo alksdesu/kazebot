@@ -10,6 +10,7 @@ from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, DefaultDict, Deque, Dict, List, Optional
 
+from adapters._shared.trigger_policy import CooldownState, TriggerDecision
 from stickers.combat import CombatTracker
 
 from . import bot_scope
@@ -23,15 +24,14 @@ from .config import (
 )
 from .emoji_handler import EmojiRenderer
 from .send_contract import TwoPhaseIdempotencyStore
-from .trigger_policy import CooldownState, TriggerDecision
 
 if TYPE_CHECKING:
+    from adapters._shared.echo_policy import EchoEntry
     from clonoth_sdk import ClonothClient, EventRouter, SessionState
     from stickers.collect import StickerCollector
     from stickers.store import StickerStore
     from stickers.tagger import StickerTagger
 
-    from .echo_policy import EchoEntry
     from .feature_gateway import FeatureGateway
     from .live_config import _Live
     from .napcat.callbacks import TangQiuCallbacks

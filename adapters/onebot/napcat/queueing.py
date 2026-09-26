@@ -9,10 +9,10 @@ from typing import Any, Callable, Dict, List, Optional
 from nonebot import get_bot
 from nonebot.adapters.onebot.v11 import Bot, Event
 from ..config import ENTRY_NODE_ID
-from .. import capability
+from adapters._shared import capability
 from ..live_config import live, pinned as pinned_live_config
 from ..attachment_policy import source_attachments_from_merged
-from ..memory_hints import at_segment_user_ids
+from ..segments import at_segment_user_ids
 from clonoth_sdk import TriggerInfo
 
 from . import anonymize, common, history, identity, inbound, models, permissions, routing, sending, state

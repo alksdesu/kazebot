@@ -5,7 +5,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from .. import capability
+from adapters._shared import capability
 from ..live_config import live
 from ..send_contract import OneBotSendContractError, OutboundSendContext, context_from_sources
 from clonoth_sdk import ChildTaskState, MainTaskState, TriggerInfo

@@ -35,15 +35,12 @@ adapters/onebot/
 ├── feature_gateway.py           # 社区功能网关，经 FeatureHost 接口调用插件能力
 ├── config.py                    # 环境变量配置
 ├── live_config.py               # config/qq.yaml 热载配置
-├── trigger_policy.py            # 群消息该不该回
-├── capability.py                # 管理能力授权判定
 ├── send_contract.py             # 出站发送契约与防重
 ├── forward_authz.py             # qq_forward 投递鉴权
 ├── bot_scope.py                 # 当前登录账号的落盘记录
-├── conversation_hash.py         # 会话键摘要的盐
-├── echo_policy.py               # 复读判定
+├── echo_rules.py                # 复读判定里 QQ 这一侧的边界：CQ 码、渲染占位符
+├── segments.py                  # OneBot 消息段的纯解析
 ├── attachment_policy.py         # 附件挑选策略
-├── memory_hints.py              # 识别一轮消息涉及哪些人
 ├── emoji_handler.py             # QQ 表情与输出文本清理
 ├── faces.py                     # 内置表情 id → 名字
 ├── yaml_loader.py               # 手写 yaml 解析
@@ -52,6 +49,9 @@ adapters/onebot/
 
 包本身没有导入副作用，根目录下的兄弟模块也不导入 NoneBot：supervisor、迁移脚本可以直接 `import adapters.onebot.<兄弟模块>`。
 NoneBot 只出现在 `napcat/` 里，由插件入口加载。
+
+不分平台的判定逻辑在 `adapters/_shared/`：触发判定、管理能力档位、复读判定、会话键摘要的盐、记忆提示。
+那边不认识 QQ，平台专属的部分（群角色映射、CQ 码边界、消息段解析）留在这里，调用时传进去。
 
 `napcat/` 各模块之间互相引用一律写成 `模块.名字`（例如 `sending._send_qq_message`），不做 `from .x import y`：
 测试 monkeypatch 定义处就能影响所有调用方。进程内状态统一挂在 `state._adapter` 上。
@@ -164,7 +164,7 @@ nb run
 ### 消息处理
 
 - 群聊默认 @Bot 或被回复时触发，同时携带最近群聊历史作为上下文；只有 `CLONOTH_ALLOWED_GROUPS` 中的群会接入。
-- 群聊触发一共七个信号（全量 / @ / 回复 / 名字 / 前缀 / 关键词 / 随机）加双层冷却，另有 LLM 意愿判定兜底，全部是 `config/qq.yaml` 的热载键。判定逻辑集中在 `trigger_policy.py`，配置与坑位见 `docs/TRIGGER-GUIDE.md`。
+- 群聊触发一共七个信号（全量 / @ / 回复 / 名字 / 前缀 / 关键词 / 随机）加双层冷却，另有 LLM 意愿判定兜底，全部是 `config/qq.yaml` 的热载键。判定逻辑集中在 `adapters/_shared/trigger_policy.py`，配置与坑位见 `docs/TRIGGER-GUIDE.md`。
 - 私聊消息直接触发回复，无需 @；默认只允许好友私聊，或通过 `CLONOTH_ALLOWED_PRIVATE_USERS` 指定用户。未放行的人默认得不到任何回应。
 - 管理员 QQ 号通过 `CLONOTH_ADMIN_QQ_USERS` 配置；管理员始终允许私聊，用于处理审批命令。每项管理能力还能单独调档（见下）。
 - 支持引用消息解析。

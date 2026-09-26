@@ -8,7 +8,7 @@ from platforms.inbound import InboundFacts
 from ..adapter import OneBotAdapter
 from ..feature_gateway import FeatureGateway
 from ..config import CLONOTH_WORKSPACE
-from ..trigger_policy import TriggerDecision
+from adapters._shared.trigger_policy import TriggerDecision
 from ..live_config import live
 from ..send_contract import OutboundSendContext
 from clonoth_sdk import ClonothClient, EventRouter

@@ -14,7 +14,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from adapters.onebot import capability  # noqa: E402
+from adapters._shared import capability  # noqa: E402
 
 LISTED_QQ = 10001
 OWNER_QQ = 20002

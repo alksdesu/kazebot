@@ -19,7 +19,7 @@ from ..config import (
     FORWARD_BRIDGE_TOKEN,
     FORWARD_BRIDGE_TOKEN_FILE,
 )
-from .. import capability
+from adapters._shared import capability
 from ..live_config import live, refresh as refresh_live_config
 from ..forward_authz import (
     delivery_deny_reason as forward_delivery_deny_reason,

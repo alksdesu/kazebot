@@ -20,8 +20,9 @@ from ..config import (
     ANON_MAP_FILE,
     ANON_MAP_RETENTION_DAYS,
 )
-from ..conversation_hash import resolve_secret
-from ..memory_hints import at_segment_user_ids, collect_subjects as collect_memory_subjects
+from adapters._shared.conversation_hash import resolve_secret
+from adapters._shared.memory_hints import collect_subjects as collect_memory_subjects
+from ..segments import at_segment_user_ids
 
 from . import common, identity, proactive, state
 
@@ -484,4 +485,5 @@ _CONVERSATION_SECRET, CONVERSATION_DIGEST_SALTED = resolve_secret(
     secret_file=Path(CONVERSATION_HASH_SECRET_FILE),
     workspace=Path(CLONOTH_WORKSPACE),
     route_state_file=Path(ONEBOT_STATE_FILE),
+    legacy_hint="Run deploy/migrate_qq_conversation_hash.py to salt them.",
 )

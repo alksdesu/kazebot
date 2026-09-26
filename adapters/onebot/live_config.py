@@ -18,7 +18,7 @@ from typing import Any, Callable, Iterator, Mapping
 
 import yaml
 
-from . import capability
+from adapters._shared import capability
 from .config import (
     CLONOTH_WORKSPACE,
     GROUP_TRIGGER_MODES,

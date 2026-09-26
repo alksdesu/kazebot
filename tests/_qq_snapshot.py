@@ -28,6 +28,8 @@ EVENT_TIME = 1_700_000_000
 HASH_SECRET = "5" * 64
 ROLL_SALT = b"qq-behavior-snapshot"
 CLOCK_START = 1_800_000_000.0
+# 已部署实例的密钥文件里写的就是这串；照字面录，常量被改了快照才会报。
+LEGACY_SECRET_MARKER = "legacy-unsalted"
 FACES: tuple[dict[str, Any], ...] = (
     {"desc": "开心", "md5": "aaaaaaaa1111", "resId": "r1", "url": "http://faces.invalid/1"},
     {"desc": "无语", "md5": "bbbbbbbb2222", "resId": "r2", "url": "http://faces.invalid/2"},
@@ -197,12 +199,10 @@ def open_runtime(
     if salted:
         monkeypatch.setenv("ONEBOT_CONVERSATION_HASH_SECRET", HASH_SECRET)
     else:
-        from adapters.onebot.conversation_hash import LEGACY_MARKER
-
         monkeypatch.delenv("ONEBOT_CONVERSATION_HASH_SECRET", raising=False)
         secret_file = workspace / "data" / "onebot_conversation_hash_secret"
         secret_file.parent.mkdir(parents=True, exist_ok=True)
-        secret_file.write_text(LEGACY_MARKER, encoding="utf-8")
+        secret_file.write_text(LEGACY_SECRET_MARKER, encoding="utf-8")
     return layout_factory(load_runtime(monkeypatch, workspace))
 
 
@@ -382,7 +382,8 @@ def _requester_events() -> dict[str, SimpleNamespace]:
 def record_permissions(monkeypatch: pytest.MonkeyPatch, root: Path, layout_factory: LayoutFactory) -> dict[str, Any]:
     layout = open_runtime(monkeypatch, root / "permissions", layout_factory)
     fn = layout.fn
-    capability = sys.modules[f"{layout.runtime.__name__}.capability"]
+    # 取判定函数实际引用的那一份，不假设能力模块落在哪个包里。
+    capability = fn("_can").__globals__["capability"]
     try:
         set_live_config(
             layout.runtime,

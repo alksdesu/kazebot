@@ -16,8 +16,9 @@ from nonebot.adapters.onebot.v11 import (
     PrivateMessageEvent,
 )
 from nonebot.rule import Rule
-from ..echo_policy import EchoEntry, detect_echo, is_echoable_text
-from ..trigger_policy import TriggerConfig, resolve_llm_intent
+from adapters._shared.echo_policy import EchoEntry, detect_echo, is_echoable_text
+from adapters._shared.trigger_policy import TriggerConfig, resolve_llm_intent
+from ..echo_rules import QQ_ECHO_RULES
 from ..live_config import live, refresh as refresh_live_config
 from clonoth_sdk import IntentVerdict
 
@@ -187,7 +188,7 @@ async def _maybe_echo_group_message(bot: Bot, event: GroupMessageEvent, text: st
     if not key:
         return
     # 校验正文本身而不是 key[4:]：指纹尾部还挂着表情 id，会把长度算多。
-    if key.startswith("txt:") and not is_echoable_text(text, max_length=live.echo_max_length):
+    if key.startswith("txt:") and not is_echoable_text(text, max_length=live.echo_max_length, rules=QQ_ECHO_RULES):
         return
 
     now = time.time()

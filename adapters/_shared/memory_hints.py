@@ -1,6 +1,6 @@
 """识别一轮消息里涉及哪些人，供按人加载长期记忆使用。
 
-纯逻辑，不 import NoneBot：别名反查和名册判定都靠调用方注入，便于单测。
+@ 了谁由适配器从平台消息里取出来传进来；别名反查和名册判定也靠调用方注入。
 """
 from __future__ import annotations
 
@@ -28,21 +28,6 @@ def aliases_in_text(text: str) -> list[str]:
         if alias not in seen:
             seen.add(alias)
             result.append(alias)
-    return result
-
-
-def at_segment_user_ids(message: Iterable[Any] | None) -> list[str]:
-    """Return the raw user ids of every `at` segment, skipping @全体成员."""
-    result: list[str] = []
-    for segment in message or []:
-        seg_type = segment.get("type") if isinstance(segment, dict) else getattr(segment, "type", "")
-        if str(seg_type) != "at":
-            continue
-        data = segment.get("data") if isinstance(segment, dict) else getattr(segment, "data", {})
-        raw = str((data or {}).get("qq") or "").strip()
-        # qq=all 是 @全体成员，不对应任何一个人。
-        if raw and raw.lower() != "all" and raw not in result:
-            result.append(raw)
     return result
 
 

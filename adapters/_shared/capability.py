@@ -1,11 +1,12 @@
-"""QQ 管理能力的授权判定。
+"""管理能力的授权判定。
 
-八个管理命令门共用这一份档位表：每项能力授予到哪一档、群主拿到之后管得着哪个群。
-不 import NoneBot，规则可在没有平台依赖的环境下回归测试。
+各平台的管理命令门共用这一份档位表：每项能力授予到哪一档、群主拿到之后管得着哪个群。
+群角色按这里的词表判，平台自己的角色名由适配器先映射过来。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from platforms.ids import normalize_id, same_id
@@ -26,17 +27,22 @@ RANK_LISTED = 3
 
 # 档位 → 放行所需的最低身份档。off 用一个谁都够不着的数，名单里的人也一样被挡住 ——
 # 「这项能力我不想要」是运营者的合法选择，留后门反而让开关不可信。
-_MIN_RANK: Mapping[str, int] = {
+_MIN_RANK: Mapping[str, int] = MappingProxyType({
     OFF: RANK_LISTED + 1,
     LISTED: RANK_LISTED,
     OWNER: RANK_OWNER,
     GROUP_ADMIN: RANK_GROUP_ADMIN,
-}
+})
 
-_ROLE_RANK: Mapping[str, int] = {
-    "owner": RANK_OWNER,
-    "admin": RANK_GROUP_ADMIN,
-}
+# 群角色词表。平台原生叫法各不相同，适配器映射成这三个之一，认不出的留空。
+ROLE_OWNER = "owner"
+ROLE_ADMIN = "admin"
+ROLE_MEMBER = "member"
+
+_ROLE_RANK: Mapping[str, int] = MappingProxyType({
+    ROLE_OWNER: RANK_OWNER,
+    ROLE_ADMIN: RANK_GROUP_ADMIN,
+})
 
 CROSS_GROUP_DENIED = "你的权限只在本群有效，不能对其他群或私聊执行这个操作。"
 
@@ -47,7 +53,7 @@ _OFF_WORDS = frozenset({"no", "false"})
 
 @dataclass(frozen=True)
 class Capability:
-    """一项管理能力。key 同时是 qq.yaml 的键名和控制台的字段名。"""
+    """一项管理能力。key 同时是平台配置文件的键名和控制台的字段名。"""
 
     key: str
     name: str
@@ -102,12 +108,12 @@ CAPABILITIES: tuple[Capability, ...] = (
     ),
     Capability(
         "send_dead_letter", "发送死信",
-        "查看和放行卡住的投递记录。清单里带真实群号/QQ 号，只能给管理员名单。",
+        "查看和放行卡住的投递记录。清单里带真实群号和账号，只能给管理员名单。",
         widest=LISTED,
     ),
 )
 
-BY_KEY: Mapping[str, Capability] = {cap.key: cap for cap in CAPABILITIES}
+BY_KEY: Mapping[str, Capability] = MappingProxyType({cap.key: cap for cap in CAPABILITIES})
 
 
 def clamp(capability_key: str, grant: Any) -> str:

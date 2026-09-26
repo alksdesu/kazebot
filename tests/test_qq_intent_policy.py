@@ -22,7 +22,7 @@ if str(_ROOT) not in sys.path:
 from supervisor import reply_intent  # noqa: E402
 
 
-from adapters.onebot import trigger_policy as tp  # noqa: E402
+from adapters._shared import trigger_policy as tp  # noqa: E402
 
 
 def _input(**overrides: Any):

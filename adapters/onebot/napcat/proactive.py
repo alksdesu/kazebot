@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 from nonebot.adapters.onebot.v11 import Bot, Event
 from ..config import CLONOTH_WORKSPACE
-from .. import capability
+from adapters._shared import capability
 from ..live_config import live
 from ..send_contract import IdempotencyClaim, OutboundSendContext, make_idempotency_key, protected_claim_send
 

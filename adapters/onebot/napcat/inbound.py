@@ -13,8 +13,8 @@ from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE
 from platforms.ids import normalize_id
 from platforms.inbound import InboundConversation, InboundFacts, InboundSender
 from ..config import FORWARD_BRIDGE_TOKEN, FORWARD_BRIDGE_TOKEN_FILE, GROUP_TRIGGER_MODES
-from .. import capability
-from ..trigger_policy import (
+from adapters._shared import capability
+from adapters._shared.trigger_policy import (
     TriggerConfig,
     TriggerDecision,
     TriggerInput,
@@ -161,7 +161,7 @@ def _event_segments(event: Any) -> List[tuple[str, Dict[str, Any]]]:
 def _event_sender_role(event: Any) -> str:
     sender = getattr(event, "sender", None)
     role = sender.get("role", "") if isinstance(sender, dict) else getattr(sender, "role", "")
-    return str(role or "")
+    return permissions._group_role(role)
 
 
 def _inbound_facts(

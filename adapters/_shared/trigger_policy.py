@@ -1,12 +1,13 @@
-"""QQ 群消息该不该回的判定。
+"""群消息该不该回的判定。
 
 七个信号各自独立开关，命中任一即触发；冷却是最后一层，管的是「命中也不说」。
-纯逻辑不依赖 NoneBot：适配层从事件里提取事实，dry-run 端点从 JSON 构造同一份输入。
+纯逻辑不依赖平台库：适配层从事件里提取事实，dry-run 端点从 JSON 构造同一份输入。
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from platforms.ids import normalize_id
@@ -31,7 +32,7 @@ BLOCKED_BY_COOLDOWN = "cooldown"
 
 # 冷却维度的内部标识 → 说法。reason 会被控制台的试听整句显示出来，中文句子里不该夹
 # per_group 这种标识。
-_COOLDOWN_SCOPE_NAMES = {"per_group": "本群", "per_user": "这个人"}
+_COOLDOWN_SCOPE_NAMES = MappingProxyType({"per_group": "本群", "per_user": "这个人"})
 
 # 旧的单选枚举。新配置没写信号开关时用它反推，行为逐位不变。
 _LEGACY_ALL_MODES = frozenset({"all", "always"})
@@ -111,9 +112,8 @@ def _tri(value: Any, legacy: bool) -> bool:
 class TriggerInput:
     """判定需要的全部事实。
 
-    text 是原文 —— 未剥前缀、未删名字。NoneBot 的三个 to_me preprocessor 都会就地改
-    正文（删 reply 段、删首尾 @、删昵称），拿改过的文本判定会让「用户点名了」这个
-    信号在进模型前就丢掉。
+    text 是原文 —— 未剥前缀、未删名字。平台框架的预处理常会就地改正文（删回复段、
+    删首尾 @、删昵称），拿改过的文本判定会让「用户点名了」这个信号在进模型前就丢掉。
     """
 
     text: str = ""

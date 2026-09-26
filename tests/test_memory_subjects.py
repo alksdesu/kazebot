@@ -17,10 +17,10 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from adapters.onebot import memory_hints as _MODULE  # noqa: E402
+from adapters._shared import memory_hints as _MODULE  # noqa: E402
+from adapters.onebot.segments import at_segment_user_ids  # noqa: E402
 
 aliases_in_text = _MODULE.aliases_in_text
-at_segment_user_ids = _MODULE.at_segment_user_ids
 collect_subjects = _MODULE.collect_subjects
 display_name_mentions = _MODULE.display_name_mentions
 

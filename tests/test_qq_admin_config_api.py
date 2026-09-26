@@ -409,14 +409,6 @@ class TestBotAndSupervisorAgreeOnTheContract:
         assert response.json()["warnings"] == []
 
 
-def _seed_trigger_policy(tmp_path: Path) -> None:
-    """把判定模块放进这个 tmp 工作区，dry-run 按 workspace_root 找它。"""
-    target = tmp_path / "adapters" / "onebot" / "trigger_policy.py"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    source = Path(__file__).resolve().parents[1] / "adapters" / "onebot" / "trigger_policy.py"
-    target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
-
-
 _DRY_RUN_CONFIG = {
     "group_trigger": "mention_only",
     "signal_all": None, "signal_at": None, "signal_reply": None, "signal_prefix": None,
@@ -435,8 +427,6 @@ class TestTriggerDryRun:
         assert response.status_code == 401
 
     def test_messages_must_be_an_array(self, client: Any, tmp_path: Path) -> None:
-        _seed_trigger_policy(tmp_path)
-
         response = client(
             "POST", f"{_BASE}/trigger/dry-run", headers=_AUTH,
             json={"messages": "咪啪在吗", "config": _DRY_RUN_CONFIG},
@@ -445,8 +435,6 @@ class TestTriggerDryRun:
         assert response.status_code == 400
 
     def test_a_huge_batch_is_refused(self, client: Any, tmp_path: Path) -> None:
-        _seed_trigger_policy(tmp_path)
-
         response = client(
             "POST", f"{_BASE}/trigger/dry-run", headers=_AUTH,
             json={"messages": [{"text": "x"}] * 201, "config": _DRY_RUN_CONFIG},
@@ -455,8 +443,6 @@ class TestTriggerDryRun:
         assert response.status_code == 400
 
     def test_it_judges_a_batch(self, client: Any, tmp_path: Path) -> None:
-        _seed_trigger_policy(tmp_path)
-
         response = client(
             "POST", f"{_BASE}/trigger/dry-run", headers=_AUTH,
             json={
@@ -477,7 +463,6 @@ class TestTriggerDryRun:
         self, client: Any, tmp_path: Path,
     ) -> None:
         """「试听当前配置」不该要求调用方自己拼一份 —— 拼错了就等于试听骗人。"""
-        _seed_trigger_policy(tmp_path)
         _publish_state(tmp_path, values=_DRY_RUN_CONFIG)
 
         response = client(
@@ -491,8 +476,6 @@ class TestTriggerDryRun:
     def test_without_a_config_and_without_a_published_snapshot_it_says_so(
         self, client: Any, tmp_path: Path,
     ) -> None:
-        _seed_trigger_policy(tmp_path)
-
         response = client(
             "POST", f"{_BASE}/trigger/dry-run", headers=_AUTH,
             json={"messages": [{"text": "咪啪在吗"}]},
@@ -502,8 +485,6 @@ class TestTriggerDryRun:
 
     def test_an_incomplete_config_is_a_client_error(self, client: Any, tmp_path: Path) -> None:
         """自拼 config 少了键是调用方的问题，不该报成 500。"""
-        _seed_trigger_policy(tmp_path)
-
         response = client(
             "POST", f"{_BASE}/trigger/dry-run", headers=_AUTH,
             json={"messages": [{"text": "x"}], "config": {"group_trigger": "all"}},
@@ -512,7 +493,6 @@ class TestTriggerDryRun:
         assert response.status_code == 400
 
     def test_cooldown_can_be_switched_off_for_the_preview(self, client: Any, tmp_path: Path) -> None:
-        _seed_trigger_policy(tmp_path)
         config = dict(_DRY_RUN_CONFIG, cooldown_group_sec=30.0)
 
         response = client(

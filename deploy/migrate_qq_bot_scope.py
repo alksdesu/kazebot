@@ -17,7 +17,7 @@ if str(_ROOT) not in sys.path:
 
 # 摘要算法与账号作用域必须与运行时同一份，所以直接用适配器的模块。
 from adapters.onebot import bot_scope as _bot_scope  # noqa: E402
-from adapters.onebot import conversation_hash as _conversation_hash  # noqa: E402
+from adapters._shared import conversation_hash as _conversation_hash  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 
 digest = _conversation_hash.digest

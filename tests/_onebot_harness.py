@@ -171,7 +171,7 @@ def load_live_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **env: str
     package = types.ModuleType(pkg_name)
     package.__path__ = [str(_ADAPTER_ROOT)]  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, pkg_name, package)
-    for name in ("config", "capability", "live_config"):
+    for name in ("config", "live_config"):
         spec = importlib.util.spec_from_file_location(f"{pkg_name}.{name}", _ADAPTER_ROOT / f"{name}.py")
         assert spec and spec.loader
         module = importlib.util.module_from_spec(spec)

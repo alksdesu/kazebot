@@ -25,7 +25,7 @@ from _onebot_harness import load_live_config, load_runtime, set_live_config  # n
 _ADAPTER_ROOT = _ROOT / "adapters" / "onebot"
 
 
-from adapters.onebot import trigger_policy as tp  # noqa: E402
+from adapters._shared import trigger_policy as tp  # noqa: E402
 
 
 def _config(**overrides: Any):
@@ -676,7 +676,7 @@ class TestDryRunSharesTheDecision:
         """supervisor 进程也导入它；相对导入会牵出 config，而 config 在导入时就读适配器的环境变量。"""
         import ast
 
-        tree = ast.parse((_ADAPTER_ROOT / "trigger_policy.py").read_text(encoding="utf-8"))
+        tree = ast.parse((_ROOT / "adapters" / "_shared" / "trigger_policy.py").read_text(encoding="utf-8"))
         relative = [
             node for node in ast.walk(tree)
             if isinstance(node, ast.ImportFrom) and (node.level or 0) > 0

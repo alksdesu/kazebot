@@ -14,7 +14,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from adapters.onebot import bot_scope, capability, forward_authz, trigger_policy  # noqa: E402
+from adapters._shared import capability, trigger_policy  # noqa: E402
+from adapters.onebot import bot_scope, forward_authz  # noqa: E402
 from adapters.onebot.send_contract import (  # noqa: E402
     OneBotSendContractError,
     make_idempotency_key,
