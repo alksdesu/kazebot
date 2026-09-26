@@ -274,7 +274,7 @@ class TestEnrollmentGate:
         """
         import ast
 
-        source = (_ROOT / "adapters/onebot/__init__.py").read_text(encoding="utf-8")
+        source = (_ROOT / "adapters/onebot/onebot_plugin.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         gate = next(
             node for node in ast.walk(tree)
@@ -319,7 +319,7 @@ class TestEnrollmentGate:
         # 先剥前缀再判定，all 模式下所有人都会被算成主动找 bot。
         import ast
 
-        tree = ast.parse((_ROOT / "adapters/onebot/__init__.py").read_text(encoding="utf-8"))
+        tree = ast.parse((_ROOT / "adapters/onebot/onebot_plugin.py").read_text(encoding="utf-8"))
         handler = next(
             node for node in ast.walk(tree)
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_process_group_message"

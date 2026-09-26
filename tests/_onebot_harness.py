@@ -110,8 +110,9 @@ def load_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("CLONOTH_WORKSPACE", str(tmp_path))
     monkeypatch.delenv("CLONOTH_QQ_CONFIG_PATH", raising=False)
     name = f"_onebot_runtime_{tmp_path.name}"
+    # 插件模块当成包来加载：兄弟模块跟着落在这份实例名下，每次都是全新的模块级状态。
     spec = importlib.util.spec_from_file_location(
-        name, _ADAPTER_ROOT / "__init__.py", submodule_search_locations=[str(_ADAPTER_ROOT)],
+        name, _ADAPTER_ROOT / "onebot_plugin.py", submodule_search_locations=[str(_ADAPTER_ROOT)],
     )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)

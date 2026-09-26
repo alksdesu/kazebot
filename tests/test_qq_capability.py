@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import importlib.util
 import sys
 from pathlib import Path
 
@@ -15,15 +14,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-# 直接按文件加载：这个包的 __init__ 会 get_driver()，测试进程里没有 NoneBot 驱动。
-_spec = importlib.util.spec_from_file_location(
-    "_qq_capability", _ROOT / "adapters" / "onebot" / "capability.py",
-)
-assert _spec and _spec.loader
-capability = importlib.util.module_from_spec(_spec)
-# dataclass 装饰器要回查自己所在的模块，先登记再执行。
-sys.modules["_qq_capability"] = capability
-_spec.loader.exec_module(capability)
+from adapters.onebot import capability  # noqa: E402
 
 LISTED_QQ = 10001
 OWNER_QQ = 20002

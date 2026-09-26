@@ -240,7 +240,7 @@ class TestLocalCommandsStayInHistory:
         """新分支直接 matcher.finish(reply) 就又把这段交互从群历史里抹掉了。"""
         import ast
 
-        tree = ast.parse((_ROOT / "adapters/onebot/__init__.py").read_text(encoding="utf-8"))
+        tree = ast.parse((_ROOT / "adapters/onebot/onebot_plugin.py").read_text(encoding="utf-8"))
         handler = next(
             node for node in ast.walk(tree)
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_process_group_message"

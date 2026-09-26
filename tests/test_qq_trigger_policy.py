@@ -25,21 +25,7 @@ from _onebot_harness import load_live_config, load_runtime, set_live_config  # n
 _ADAPTER_ROOT = _ROOT / "adapters" / "onebot"
 
 
-def _policy():
-    """trigger_policy 不依赖 NoneBot，直接按文件加载。"""
-    import importlib.util
-
-    name = "_trigger_policy_under_test"
-    spec = importlib.util.spec_from_file_location(name, _ADAPTER_ROOT / "trigger_policy.py")
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    # dataclass 装饰器会按 cls.__module__ 回查 sys.modules，先注册再执行。
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-tp = _policy()
+from adapters.onebot import trigger_policy as tp  # noqa: E402
 
 
 def _config(**overrides: Any):
@@ -687,7 +673,7 @@ class TestDryRunSharesTheDecision:
     """判定逻辑只有一份。前端不重写，supervisor 也不重写。"""
 
     def test_the_policy_module_has_no_relative_imports(self) -> None:
-        """supervisor 按文件路径单独加载它，一旦出现相对导入就会加载失败。"""
+        """supervisor 进程也导入它；相对导入会牵出 config，而 config 在导入时就读适配器的环境变量。"""
         import ast
 
         tree = ast.parse((_ADAPTER_ROOT / "trigger_policy.py").read_text(encoding="utf-8"))
@@ -696,7 +682,7 @@ class TestDryRunSharesTheDecision:
             if isinstance(node, ast.ImportFrom) and (node.level or 0) > 0
         ]
 
-        assert relative == [], "trigger_policy 不能有相对导入，否则 supervisor 侧加载不了"
+        assert relative == [], "trigger_policy 必须保持零依赖，supervisor 侧才能放心导入"
 
     def test_the_legacy_mode_sets_match_the_declared_ones(self) -> None:
         """两份枚举是同一套字面量的副本（这个模块不能有相对导入），漂了 group_mode 校验就和判定不一致。"""
@@ -715,15 +701,15 @@ class TestDryRunSharesTheDecision:
     def test_supervisor_loads_the_same_module_the_adapter_uses(self) -> None:
         from supervisor import qq_trigger
 
-        policy = qq_trigger.load_policy(_ROOT)
+        policy = qq_trigger.load_policy()
 
         assert policy.SIGNAL_ORDER == tp.SIGNAL_ORDER
         assert policy.TriggerConfig().at is tp.TriggerConfig().at
 
-    def test_the_module_is_loaded_once_per_workspace(self) -> None:
+    def test_the_supervisor_and_the_adapter_share_one_module(self) -> None:
         from supervisor import qq_trigger
 
-        assert qq_trigger.load_policy(_ROOT) is qq_trigger.load_policy(_ROOT)
+        assert qq_trigger.load_policy() is tp
 
     def _values(self, **overrides: Any) -> dict[str, Any]:
         base = {
@@ -742,7 +728,6 @@ class TestDryRunSharesTheDecision:
         from supervisor import qq_trigger
 
         out = qq_trigger.dry_run(
-            _ROOT,
             [
                 {"text": "咪啪在吗", "user_id": 1, "group_id": 9},
                 {"text": "咪啪你看", "user_id": 2, "group_id": 9},
@@ -758,7 +743,6 @@ class TestDryRunSharesTheDecision:
         from supervisor import qq_trigger
 
         out = qq_trigger.dry_run(
-            _ROOT,
             [{"text": "咪啪", "user_id": 1, "group_id": 9}] * 3,
             self._values(signal_name=True, name_words=["咪啪"], cooldown_group_sec=30),
             apply_cooldown=False,
@@ -770,7 +754,6 @@ class TestDryRunSharesTheDecision:
         from supervisor import qq_trigger
 
         out = qq_trigger.dry_run(
-            _ROOT,
             [
                 {"text": "咪啪在吗", "user_id": 1, "group_id": 9},
                 {"text": "帮我查", "user_id": 2, "group_id": 9, "at_me": True},
@@ -784,7 +767,6 @@ class TestDryRunSharesTheDecision:
         from supervisor import qq_trigger
 
         out = qq_trigger.dry_run(
-            _ROOT,
             [{"text": "随便聊聊", "user_id": 1, "group_id": 9}],
             self._values(signal_at=False, signal_reply=False, signal_random=True, random_probability=1.0),
         )
@@ -797,7 +779,6 @@ class TestDryRunSharesTheDecision:
         from supervisor import qq_trigger
 
         out = qq_trigger.dry_run(
-            _ROOT,
             [{"text": "随便聊聊", "user_id": 1, "group_id": 9}],
             self._values(signal_at=False, signal_reply=False, llm_intent_enabled=True),
         )
@@ -810,7 +791,6 @@ class TestDryRunSharesTheDecision:
         from supervisor import qq_trigger
 
         out = qq_trigger.dry_run(
-            _ROOT,
             [
                 {"text": "咪啪在吗", "user_id": 1, "group_id": 9, "at_sec": 0},
                 {"text": "随便聊聊", "user_id": 2, "group_id": 9, "at_sec": 1},
@@ -829,7 +809,7 @@ class TestDryRunSharesTheDecision:
     def test_it_reports_which_signals_are_on(self) -> None:
         from supervisor import qq_trigger
 
-        out = qq_trigger.dry_run(_ROOT, [], self._values(group_trigger="prefix"))
+        out = qq_trigger.dry_run([], self._values(group_trigger="prefix"))
 
         assert out["enabled_signals"] == ["at", "reply", "prefix"]
 
@@ -837,7 +817,6 @@ class TestDryRunSharesTheDecision:
         from supervisor import qq_trigger
 
         out = qq_trigger.dry_run(
-            _ROOT,
             [
                 {"text": "咪啪", "user_id": 1, "group_id": 9, "at_sec": 0},
                 {"text": "咪啪", "user_id": 1, "group_id": 9, "at_sec": 100},
@@ -885,7 +864,6 @@ class TestDryRunSharesTheDecision:
         live_decision = runtime._group_trigger_decision(event, SimpleNamespace(self_id=_BOT_QQ), text)
 
         preview = qq_trigger.dry_run(
-            _ROOT,
             [{"text": text, "user_id": 10001, "group_id": 1, "at_me": at_me, "reply_to_bot": reply_to_bot}],
             module.state_payload()["values"],
         )["results"][0]

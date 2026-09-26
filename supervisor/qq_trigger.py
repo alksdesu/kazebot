@@ -5,34 +5,14 @@
 """
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
-# 按文件路径加载而不是 import adapters.onebot.trigger_policy：那个包的 __init__ 会
-# get_driver()，在没有 NoneBot 的 supervisor 进程里直接抛。trigger_policy 自己零相对
-# 导入，所以单独加载是安全的 —— 有测试盯着这个前提。
-_MODULE_NAME = "_clonoth_qq_trigger_policy"
-_cache: dict[str, ModuleType] = {}
+from adapters.onebot import trigger_policy as _trigger_policy
 
 
-def load_policy(workspace_root: Path) -> ModuleType:
-    path = (workspace_root / "adapters" / "onebot" / "trigger_policy.py").resolve()
-    key = str(path)
-    cached = _cache.get(key)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(f"{_MODULE_NAME}_{abs(hash(key))}", path)
-    if spec is None or spec.loader is None:
-        raise FileNotFoundError(f"trigger policy not found at {path}")
-    module = importlib.util.module_from_spec(spec)
-    # dataclass 装饰器会按 cls.__module__ 回查 sys.modules，先注册再执行。
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    _cache[key] = module
-    return module
+def load_policy() -> ModuleType:
+    return _trigger_policy
 
 
 def config_from_values(policy: ModuleType, values: dict[str, Any]) -> Any:
@@ -53,7 +33,6 @@ def _as_bool(raw: Any, default: bool = False) -> bool:
 
 
 def dry_run(
-    workspace_root: Path,
     messages: list[dict[str, Any]],
     values: dict[str, Any],
     *,
@@ -64,7 +43,7 @@ def dry_run(
     冷却按顺序累积：第一条命中之后，后面几条才可能被冷却挡住 —— 试听要能看出这个因果，
     所以不是每条独立判定。
     """
-    policy = load_policy(workspace_root)
+    policy = load_policy()
     config = config_from_values(policy, values)
     cooldown = policy.CooldownState() if apply_cooldown else None
 

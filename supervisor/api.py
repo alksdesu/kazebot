@@ -73,26 +73,10 @@ from .napcat import NapCatClient, NapCatError, NapCatUnreachable
 
 log = logging.getLogger(__name__)
 
-_attachment_policy_cache: dict[str, Any] = {}
-
-
 def _load_attachment_policy() -> Any:
-    """按文件路径加载纯策略模块：import adapters.onebot 会触发 NoneBot，supervisor 进程里没有。"""
-    import importlib.util
+    from adapters.onebot import attachment_policy
 
-    path = (Path(__file__).resolve().parents[1] / "adapters" / "onebot" / "attachment_policy.py")
-    key = str(path)
-    cached = _attachment_policy_cache.get(key)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(f"_clonoth_attachment_policy_{abs(hash(key))}", path)
-    if spec is None or spec.loader is None:
-        raise FileNotFoundError(f"attachment policy not found at {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    _attachment_policy_cache[key] = module
-    return module
+    return attachment_policy
 
 
 def _now() -> datetime:
@@ -1520,8 +1504,7 @@ def create_app(
         return _reset_conversation(st, conv_key)
 
     def _scope_migration():
-        """按文件加载迁移脚本：它绕开了 adapters.onebot 的 nonebot 依赖，
-        而摘要算法必须和 bot 跑的是同一份。"""
+        """按文件加载迁移脚本：deploy/ 不是包；摘要算法和 bot 跑的是同一份。"""
         import importlib.util
         import sys
 

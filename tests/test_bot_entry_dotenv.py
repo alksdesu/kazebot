@@ -167,9 +167,8 @@ _MAIN_HARNESS = textwrap.dedent(
 def test_main_runs_end_to_end_with_nonebot_stubbed(tmp_path: Path) -> None:
     """把 main() 真跑一遍。
 
-    只做静态检查挡不住这一类：曾经在 init() 之前 import adapters.onebot.config，
-    而导入子模块会先执行包的 __init__.py —— 那是插件，第一行 get_driver() 就抛
-    NoneBot has not been initialized，进程直接起不来，而源码里看不出任何异常。
+    只做静态检查挡不住这一类：插件模块第一行 get_driver() 就要求 NoneBot 已初始化，
+    在 init() 之前被导入的话进程直接起不来，而源码里看不出任何异常。
     """
     home = tmp_path / "deploy"
     home.mkdir()
@@ -189,12 +188,12 @@ def test_main_runs_end_to_end_with_nonebot_stubbed(tmp_path: Path) -> None:
     # 等待必须发生在 init 之前：init 之后再等，NoneBot 已经开始收消息了。
     assert seen.index("waited") < seen.index("init")
     # 适配器插件只能由 load_plugin 加载，且必须在 init 之后。
-    assert seen.index("init") < seen.index("plugin:adapters.onebot")
+    assert seen.index("init") < seen.index("plugin:adapters.onebot.onebot_plugin")
     assert seen[-1] == "run"
 
 
 def test_dotenv_runs_before_the_plugin_is_imported() -> None:
-    # adapters.onebot 在 import 期就读 os.environ，晚一步加载等于没加载。
+    # adapters.onebot.config 在 import 期就读 os.environ，晚一步加载等于没加载。
     source = BOT_ENTRY.read_text(encoding="utf-8")
     assert source.index("load_dotenv(") < source.index("import nonebot")
     assert source.index("load_dotenv(") < source.index("load_plugin")

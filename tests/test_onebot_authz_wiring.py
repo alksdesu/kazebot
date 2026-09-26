@@ -22,7 +22,7 @@ if str(_TESTS) not in sys.path:
 
 from _onebot_harness import load_runtime, set_live_config  # noqa: E402
 
-_PLUGIN = _ROOT / "adapters" / "onebot" / "__init__.py"
+_PLUGIN = _ROOT / "adapters" / "onebot" / "onebot_plugin.py"
 _SOURCE = _PLUGIN.read_text(encoding="utf-8")
 _TREE = ast.parse(_SOURCE)
 

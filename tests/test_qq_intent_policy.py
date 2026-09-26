@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,20 +21,8 @@ if str(_ROOT) not in sys.path:
 
 from supervisor import qq_intent  # noqa: E402
 
-_ADAPTER_ROOT = _ROOT / "adapters" / "onebot"
 
-
-def _policy():
-    name = "_trigger_policy_intent_under_test"
-    spec = importlib.util.spec_from_file_location(name, _ADAPTER_ROOT / "trigger_policy.py")
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-tp = _policy()
+from adapters.onebot import trigger_policy as tp  # noqa: E402
 
 
 def _input(**overrides: Any):

@@ -6,10 +6,13 @@ NoneBot2 插件，通过 OneBot 11 协议（NapCat / go-cqhttp 等实现）将 Q
 
 ```
 adapters/onebot/
-├── __init__.py       # 插件主体：消息处理、附件收集、EventRouter 回调
+├── __init__.py       # 包说明，不导入 NoneBot
+├── onebot_plugin.py  # NoneBot 插件入口：消息处理、附件收集、EventRouter 回调
 ├── config.py         # 环境变量配置
 └── emoji_handler.py  # QQ 自定义表情处理（表情包名称索引）
 ```
+
+插件入口单独成模块，包本身没有导入副作用：supervisor、迁移脚本可以直接 `import adapters.onebot.<兄弟模块>`。
 
 ## 前置依赖
 
@@ -80,14 +83,12 @@ pip install nonebot2 nonebot-adapter-onebot httpx
 
 ### 2. 配置 NoneBot2 项目
 
-在 NoneBot2 项目中加载本插件。将 `adapters/onebot/` 目录作为 NoneBot2 插件加载：
+在 NoneBot2 项目中加载本插件的入口模块：
 
 ```python
 # bot.py 或 pyproject.toml
-nonebot.load_plugin("adapters.onebot")
+nonebot.load_plugin("adapters.onebot.onebot_plugin")
 ```
-
-或将目录放入 NoneBot2 插件目录，使其自动发现。
 
 ### 3. 配置环境变量
 

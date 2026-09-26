@@ -373,7 +373,7 @@ class TestHintPlumbing:
 
     def test_memory_hints_stay_out_of_platform_auth(self) -> None:
         # platform_auth 参与鉴权判定，混入非鉴权字段会让 is_admin 的判断面变大。
-        source = Path("adapters/onebot/__init__.py").read_text(encoding="utf-8")
+        source = Path("adapters/onebot/onebot_plugin.py").read_text(encoding="utf-8")
         auth_block = source.split("platform_auth={", 1)[1].split("}", 1)[0]
 
         assert "subjects" not in auth_block

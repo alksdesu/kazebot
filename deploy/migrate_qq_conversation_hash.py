@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import os
 import secrets
 import sys
@@ -17,15 +16,9 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-# 直接按文件加载 conversation_hash：adapters.onebot 的包 __init__ 会 import nonebot，
-# 迁移脚本跑在没有 NoneBot 驱动的环境里。摘要算法必须与运行时同一份。
-_spec = importlib.util.spec_from_file_location(
-    "_migrate_conversation_hash", _ROOT / "adapters" / "onebot" / "conversation_hash.py",
-)
-assert _spec and _spec.loader
-_conversation_hash = importlib.util.module_from_spec(_spec)
-sys.modules["_migrate_conversation_hash"] = _conversation_hash
-_spec.loader.exec_module(_conversation_hash)
+# 摘要算法必须与运行时同一份，所以直接用适配器的模块。
+from adapters.onebot import conversation_hash as _conversation_hash  # noqa: E402
+
 digest = _conversation_hash.digest
 LEGACY_MARKER = _conversation_hash.LEGACY_MARKER
 _SECRET_RE = _conversation_hash._SECRET_RE

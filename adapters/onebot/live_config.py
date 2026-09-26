@@ -927,7 +927,7 @@ def state_payload() -> dict[str, Any]:
         "reload": {key.name: key.reload for key in LIVE_KEYS},
         "notes": {key.name: key.note for key in LIVE_KEYS if key.note},
         # 点分路径一起公布：supervisor 校验 PUT 上来的 yaml 时要认得哪些路径有人消费，
-        # 而它跑在另一个进程里，import 不到这张表（这个包的 __init__ 会拉起 nonebot）。
+        # 以正在运行的 bot 实际加载的这张表为准；自己导入会牵出读适配器环境变量的 config。
         "paths": {key.name: key.path for key in LIVE_KEYS},
         # 能力清单由 bot 公布而不是前端写死：加一项能力只该改这一处，
         # 漏掉的那项在界面上无声消失，运营者以为没有这回事。

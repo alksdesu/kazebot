@@ -30,7 +30,7 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **env: str):
 
 
 def _strip_trigger_prefix(module: Any, text: str) -> str:
-    """复刻 __init__.py 的剥离逻辑，避免为此拉起 nonebot 依赖。"""
+    """复刻 onebot_plugin 的剥离逻辑，避免为此拉起 nonebot 依赖。"""
     value = (text or "").strip()
     for prefix in module.live.trigger_prefixes_strippable:
         if value.startswith(prefix):

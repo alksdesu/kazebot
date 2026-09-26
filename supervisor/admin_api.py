@@ -632,7 +632,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
             )
         try:
             return qq_trigger.dry_run(
-                workspace_root, messages, values,
+                messages, values,
                 apply_cooldown=payload.get("cooldown", True) is not False,
             )
         except (AttributeError, KeyError, TypeError, ValueError) as exc:

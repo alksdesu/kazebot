@@ -5,7 +5,6 @@ data/.admin_token、data/onebot_anon_map.json 私发出去，或借 Bot 身份�
 """
 from __future__ import annotations
 
-import importlib.util
 import sys
 from pathlib import Path
 
@@ -15,15 +14,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-# NoneBot 不是核心测试环境的依赖，因此单文件加载纯逻辑模块而不 import 整个插件。
-_MODULE_PATH = _ROOT / "adapters" / "onebot" / "forward_authz.py"
-_SPEC = importlib.util.spec_from_file_location("_onebot_forward_authz", _MODULE_PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-_MODULE = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = _MODULE
-_SPEC.loader.exec_module(_MODULE)
-
-from _onebot_forward_authz import (  # type: ignore[import-not-found]  # noqa: E402
+from adapters.onebot.forward_authz import (  # noqa: E402
     CROSS_SESSION_DENIED,
     FILE_PATHS_DENIED,
     delivery_deny_reason,

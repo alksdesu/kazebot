@@ -22,7 +22,7 @@ if str(_TESTS) not in sys.path:
 
 from _onebot_harness import load_runtime  # noqa: E402
 
-_ADAPTER_SOURCE = _ROOT / "adapters" / "onebot" / "__init__.py"
+_ADAPTER_SOURCE = _ROOT / "adapters" / "onebot" / "onebot_plugin.py"
 _HINT_MARK = "不得从聊天历史猜测图片内容"
 
 

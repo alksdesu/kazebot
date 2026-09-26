@@ -16,7 +16,7 @@ _REPO_ROOT = Path(__file__).resolve().parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-# nonebot 的 .env 只进它自己的 Config 对象，而 adapters.onebot 在 import 期读 os.environ，
+# nonebot 的 .env 只进它自己的 Config 对象，而 adapters.onebot.config 在 import 期读 os.environ，
 # 不先灌进来白名单会静默为空。cwd 优先：多实例共用一份代码，端口与工作区只能靠各自那份
 # .env 区分；找不到才回落代码目录，单实例照旧。
 _LOCAL_ENV = Path.cwd() / ".env"
@@ -27,9 +27,8 @@ from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 
 # supervisor 冷启动约需半分钟，留足余量；等不到也照常起，卡死更难查。
 _SUPERVISOR_WAIT_SEC = 180.0
-# 与 adapters/onebot/config.py 认同一组变量名。这里不 import 那个模块：导入子模块
-# 会先执行包的 __init__.py，而它是 nonebot 插件，在 nonebot.init() 之前跑必然抛
-# NoneBot has not been initialized。
+# 与 adapters/onebot/config.py 认同一组变量名。这里不 import 那个模块：本文件会被单独
+# 复制出去做入口冒烟，import 期要求整个仓库在位就跑不起来。
 _SUPERVISOR_URL = (
     os.environ.get("CLONOTH_BASE_URL")
     or os.environ.get("CLONOTH_SUPERVISOR_URL")
@@ -67,7 +66,7 @@ def main() -> None:
     _bridge_stdlib_logging()
     driver = nonebot.get_driver()
     driver.register_adapter(OneBotV11Adapter)
-    nonebot.load_plugin("adapters.onebot")
+    nonebot.load_plugin("adapters.onebot.onebot_plugin")
     nonebot.run()
 
 

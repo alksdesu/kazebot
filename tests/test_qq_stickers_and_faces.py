@@ -6,7 +6,6 @@ QQ 里「表情」是两种完全不同的东西：内置表情只有一个数�
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,12 +21,7 @@ if str(_TESTS) not in sys.path:
 
 from _onebot_harness import load_runtime  # noqa: E402
 
-# 直接加载文件：走包导入会先执行 adapters/onebot/__init__.py，那需要整套 nonebot。
-_spec = importlib.util.spec_from_file_location(
-    "onebot_faces", _ROOT / "adapters" / "onebot" / "faces.py",
-)
-_faces = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_faces)
+from adapters.onebot import faces as _faces  # noqa: E402
 FACE_NAMES = _faces.FACE_NAMES
 face_display_name = _faces.face_display_name
 

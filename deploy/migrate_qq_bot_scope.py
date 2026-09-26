@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,21 +15,10 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 
-def _load_adapter_module(name: str):
-    """按文件加载 adapters.onebot 下的纯模块：包 __init__ 会 import nonebot，
-    而迁移脚本跑在没有 NoneBot 驱动的环境里。算法必须与运行时同一份。"""
-    spec = importlib.util.spec_from_file_location(
-        f"_migrate_{name}", _ROOT / "adapters" / "onebot" / f"{name}.py",
-    )
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[f"_migrate_{name}"] = module
-    spec.loader.exec_module(module)
-    return module
+# 摘要算法与账号作用域必须与运行时同一份，所以直接用适配器的模块。
+from adapters.onebot import bot_scope as _bot_scope  # noqa: E402
+from adapters.onebot import conversation_hash as _conversation_hash  # noqa: E402
 
-
-_conversation_hash = _load_adapter_module("conversation_hash")
-_bot_scope = _load_adapter_module("bot_scope")
 digest = _conversation_hash.digest
 LEGACY_MARKER = _conversation_hash.LEGACY_MARKER
 

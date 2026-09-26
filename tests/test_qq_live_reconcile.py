@@ -313,7 +313,7 @@ class TestQueueWorkers:
 
     def test_a_worker_reads_its_exit_decision_from_the_live_value(self) -> None:
         """退出判定不能读钉住的快照：这个 task 活得比任何一条消息都长。"""
-        source = (_ADAPTER / "__init__.py").read_text(encoding="utf-8")
+        source = (_ADAPTER / "onebot_plugin.py").read_text(encoding="utf-8")
         function = next(
             node for node in ast.walk(ast.parse(source))
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_qq_queue_worker_forever"
@@ -622,7 +622,7 @@ async def _until(predicate: Any, *, timeout: float = 3.0) -> None:
 
 class TestWiring:
     def _source(self) -> str:
-        return (_ADAPTER / "__init__.py").read_text(encoding="utf-8")
+        return (_ADAPTER / "onebot_plugin.py").read_text(encoding="utf-8")
 
     def _function(self, name: str) -> ast.AST:
         return next(

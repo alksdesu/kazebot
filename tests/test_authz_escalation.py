@@ -143,7 +143,7 @@ class TestConfigWritesNeedApproval:
         "config/qq.yaml",
         "config/nodes/qq.orchestrator.yaml",
         "bot.py",
-        "adapters/onebot/__init__.py",
+        "adapters/onebot/onebot_plugin.py",
         "clonoth_sdk/client.py",
         "plugins/anything.py",
         "deploy/systemd/clonoth.service",

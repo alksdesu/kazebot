@@ -386,7 +386,7 @@ class TestOneMessageIsJudgedOnce:
 class TestTheMatcherTopology:
     def _matcher_calls(self) -> dict[str, dict[str, Any]]:
         """从源码里读回每个 matcher 的注册参数。运行期 stub 把它们吃掉了。"""
-        tree = ast.parse((_ROOT / "adapters/onebot/__init__.py").read_text(encoding="utf-8"))
+        tree = ast.parse((_ROOT / "adapters/onebot/onebot_plugin.py").read_text(encoding="utf-8"))
         found: dict[str, dict[str, Any]] = {}
         for node in ast.walk(tree):
             if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):

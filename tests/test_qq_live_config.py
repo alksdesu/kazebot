@@ -885,7 +885,7 @@ class TestNoStaleConstantsLeftBehind:
         assert sorted(defined & set(self._MIGRATED)) == []
 
     def test_the_plugin_no_longer_imports_them(self) -> None:
-        tree = ast.parse((_ADAPTER_ROOT / "__init__.py").read_text(encoding="utf-8"))
+        tree = ast.parse((_ADAPTER_ROOT / "onebot_plugin.py").read_text(encoding="utf-8"))
         imported = {
             alias.name
             for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
@@ -909,7 +909,7 @@ class TestTheAdapterImportsOnlyWhatItUses:
     }
 
     def test_no_module_level_import_is_unused(self) -> None:
-        tree = ast.parse((_ADAPTER_ROOT / "__init__.py").read_text(encoding="utf-8"))
+        tree = ast.parse((_ADAPTER_ROOT / "onebot_plugin.py").read_text(encoding="utf-8"))
         bound = set()
         for node in tree.body:
             if isinstance(node, ast.Import):

@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -18,13 +17,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-# NoneBot 不是核心测试环境的依赖，因此单文件加载纯逻辑模块而不 import 整个插件。
-_MODULE_PATH = _ROOT / "adapters" / "onebot" / "memory_hints.py"
-_SPEC = importlib.util.spec_from_file_location("_onebot_memory_hints", _MODULE_PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-_MODULE = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = _MODULE
-_SPEC.loader.exec_module(_MODULE)
+from adapters.onebot import memory_hints as _MODULE  # noqa: E402
 
 aliases_in_text = _MODULE.aliases_in_text
 at_segment_user_ids = _MODULE.at_segment_user_ids
