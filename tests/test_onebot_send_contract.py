@@ -1091,7 +1091,7 @@ def test_long_forward_heartbeat_prevents_cross_instance_takeover(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     runtime = _load_runtime(monkeypatch, tmp_path)
-    runtime.state._adapter.outbound_idempotency.lease_seconds = 0.15
+    runtime.state._adapter.outbound_idempotency.lease_seconds = 0.6
     first_image, second_image = tmp_path / "one.png", tmp_path / "two.png"
     first_image.write_bytes(b"one")
     second_image.write_bytes(b"two")
@@ -1099,7 +1099,7 @@ def test_long_forward_heartbeat_prevents_cross_instance_takeover(
     class Bot:
         self_id = "1"
         async def call_api(self, name: str, **kwargs: Any):
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(1.6)
             return {"message_id": 99}
 
     async def exercise() -> None:
@@ -1108,13 +1108,14 @@ def test_long_forward_heartbeat_prevents_cross_instance_takeover(
             [{"path": str(first_image)}, {"path": str(second_image)}],
             send_context=DeliveryContext(event_id="long-forward", idempotency_key="id:long-forward"),
         ))
-        await asyncio.sleep(0.25)
+        # 检查点落在原租约到期之后；心跳每 lease/3 续一次，余量要盖过全量跑时 SQLite 落盘带来的事件循环卡顿。
+        await asyncio.sleep(1.0)
         row = runtime.state._adapter.outbound_idempotency._db.execute(
             "SELECT key,lease_until FROM claims WHERE state='pending'"
         ).fetchone()
         assert row is not None and row[1] > time.time()
         contender = OneBotIdempotencyStore(runtime.state._adapter.outbound_idempotency.path)
-        contender.lease_seconds = 0.15
+        contender.lease_seconds = 0.6
         conflict = await contender.begin(row[0])
         assert conflict.acquired is False and conflict.state == "pending"
         assert await task is True
