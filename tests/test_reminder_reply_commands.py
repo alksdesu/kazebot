@@ -70,23 +70,23 @@ async def context(tmp_path, monkeypatch):
     runtime = load_runtime(monkeypatch, tmp_path)
     set_live_config(runtime, allowed_groups=[12345, 23456], admin_users=[])
     monkeypatch.setattr(runtime, "refresh_live_config", lambda: None)
-    runtime._client = client
-    runtime._features.record_inbound = AsyncMock(return_value={"recorded": False})
-    runtime._features.record_outbound = AsyncMock()
+    runtime._adapter.client = client
+    runtime._adapter.features.record_inbound = AsyncMock(return_value={"recorded": False})
+    runtime._adapter.features.record_outbound = AsyncMock()
     runtime._feature_matcher.finish = AsyncMock()
     bot = Platform()
     monkeypatch.setattr(runtime, "_get_fallback_bot", lambda: bot)
-    actor = runtime._features.actor(bot, incoming())
-    runtime._conversation_bots[actor["scope"]] = bot
+    actor = runtime._adapter.features.actor(bot, incoming())
+    runtime._adapter.conversation_bots[actor["scope"]] = bot
     config = BotConfig(base_url="http://test", workspace_root=tmp_path, conversation_key_prefix="qq_group", outbound_retry_initial=0.05)
     router = EventRouter(client, SessionState(), runtime.TangQiuCallbacks(), config)
-    runtime._event_router = router
+    runtime._adapter.event_router = router
     context.__dict__.update(client=client, runtime=runtime, actor=actor, bot=bot, router=router, config=config)
     try:
         yield context
     finally:
         context.router._outbound_store.close()
-        runtime._outbound_idempotency.close()
+        runtime._adapter.outbound_idempotency.close()
         await client.close()
 
 
@@ -114,7 +114,7 @@ async def test_real_sender_binding_and_natural_reference_action(context, text, s
     current = await reminder(context, created["id"])
     assert current["delivery_status"] == "delivered" and current["status"] == "open"
     message_id = context.bot.sent[0]["message_id"]
-    row = context.runtime._outbound_idempotency._db.execute("SELECT state,platform_message_id FROM claims").fetchone()
+    row = context.runtime._adapter.outbound_idempotency._db.execute("SELECT state,platform_message_id FROM claims").fetchone()
     assert tuple(row) == ("sent", message_id)
     metadata = await context.client.request_feature("GET", "/v1/reminders/reply-context", actor=context.actor, params={"message_id": message_id})
     assert metadata["matched"] and metadata["authorized"] and metadata["revision"] == 1
@@ -138,20 +138,20 @@ async def test_natural_snooze_binds_original_revision_and_keeps_duplicates_idemp
     event = incoming(text, message_id=2, reply_ref=message_id)
     before = datetime.now(timezone.utc)
     assert await context.runtime._feature_command_rule(context.bot, event)
-    response = await context.runtime._features.handle_command(context.bot, event, text)
+    response = await context.runtime._adapter.features.handle_command(context.bot, event, text)
     assert response["control"] is True
     changed = await reminder(context, created["id"])
     assert changed["revision"] == 2 and changed["delivery_status"] == "scheduled"
     assert abs((datetime.fromisoformat(changed["due_at"]) - before).total_seconds() - minutes * 60) < 3
-    await context.runtime._features.handle_command(context.bot, event, text)
+    await context.runtime._adapter.features.handle_command(context.bot, event, text)
     assert (await reminder(context, created["id"]))["revision"] == 2
     stale = incoming("已完成", message_id=3, reply_ref=message_id)
-    response = await context.runtime._features.handle_command(context.bot, stale, "已完成")
+    response = await context.runtime._adapter.features.handle_command(context.bot, stale, "已完成")
     assert "已更新" in response["text"]
     assert (await reminder(context, created["id"]))["status"] == "open"
     await deliver(context, changed)
     latest_message = context.bot.sent[-1]["message_id"]
-    response = await context.runtime._features.handle_command(context.bot, incoming("已完成", message_id=4, reply_ref=latest_message), "已完成")
+    response = await context.runtime._adapter.features.handle_command(context.bot, incoming("已完成", message_id=4, reply_ref=latest_message), "已完成")
     assert "已完成" in response["text"]
     assert (await reminder(context, created["id"]))["status"] == "completed"
 
@@ -164,14 +164,14 @@ async def test_binding_failure_restarts_only_registration_without_resending_plat
     assert len(context.bot.sent) == 1
     assert (await reminder(context, created["id"]))["delivery_status"] != "delivered"
     assert len(context.router._outbound_store.pending()) == 1
-    store = context.runtime._outbound_idempotency
+    store = context.runtime._adapter.outbound_idempotency
     path = store.path
     store.close()
-    context.runtime._outbound_idempotency = type(store)(path)
+    context.runtime._adapter.outbound_idempotency = type(store)(path)
     context.state.reminders = ReminderService(context.state)
     context.router._outbound_store.close()
     context.router = EventRouter(context.client, SessionState(), context.runtime.TangQiuCallbacks(), context.config)
-    context.runtime._event_router = context.router
+    context.runtime._adapter.event_router = context.router
     await asyncio.sleep(0.06)
     assert await context.router._deliver_outbound_record(context.router._outbound_store.pending()[0])
     assert len(context.bot.sent) == 1
@@ -203,7 +203,7 @@ async def test_every_real_split_message_keeps_the_same_reminder_binding(context,
     assert len(context.bot.sent) == 2
     event = incoming("已完成", message_id=2, reply_ref=context.bot.sent[part]["message_id"])
     assert await context.runtime._feature_command_rule(context.bot, event)
-    response = await context.runtime._features.handle_command(context.bot, event, "已完成")
+    response = await context.runtime._adapter.features.handle_command(context.bot, event, "已完成")
     assert "已完成" in response["text"]
     assert (await reminder(context, created["id"]))["status"] == "completed"
 
@@ -219,7 +219,7 @@ async def test_natural_reference_scope_bot_owner_and_missing_target_are_not_gues
         assert failure.value.response.status_code == expected
     for text, reply_ref in [("已完成", ""), ("十分钟后", ""), ("已完成", "999999"), ("我刚才已完成了一半", ref)]:
         event = incoming(text, message_id=50, reply_ref=reply_ref)
-        context.runtime._features.coordinator.messages.clear()
+        context.runtime._adapter.features.coordinator.messages.clear()
         assert not await context.runtime._feature_command_rule(context.bot, event)
     assert (await reminder(context, created["id"]))["status"] == "open"
 
@@ -233,7 +233,7 @@ async def test_multiple_open_reminders_use_the_quoted_message_not_the_latest(con
     await deliver(context, second)
     event = incoming("已完成", message_id=3, reply_ref=first_ref)
     assert await context.runtime._feature_command_rule(context.bot, event)
-    await context.runtime._features.handle_command(context.bot, event, "已完成")
+    await context.runtime._adapter.features.handle_command(context.bot, event, "已完成")
     assert (await reminder(context, first["id"]))["status"] == "completed"
     assert (await reminder(context, second["id"]))["status"] == "open"
 
@@ -282,16 +282,16 @@ async def test_natural_quiet_restore_uses_same_canonical_command_and_authorizati
     manager = {**context.actor, "role": "admin"}
     await context.client.request_feature("POST", "/v1/community/quiet", actor=manager, body={"mode": "silent", "duration_sec": 600})
     resume = Mock()
-    context.runtime._event_router = SimpleNamespace(resume_deferred=resume)
+    context.runtime._adapter.event_router = SimpleNamespace(resume_deferred=resume)
     member = incoming("恢复", message_id=2)
     assert await context.runtime._feature_command_rule(context.bot, member)
-    denied = await context.runtime._features.handle_command(context.bot, member, "恢复")
+    denied = await context.runtime._adapter.features.handle_command(context.bot, member, "恢复")
     assert "管理" in denied["text"]
     assert (await context.client.request_feature("GET", "/v1/community/state", actor=manager))["quiet"]
     resume.assert_not_called()
     event = incoming("恢复", message_id=3, role="admin")
     assert await context.runtime._feature_command_rule(context.bot, event)
-    allowed = await context.runtime._features.handle_command(context.bot, event, "恢复")
+    allowed = await context.runtime._adapter.features.handle_command(context.bot, event, "恢复")
     assert allowed["control"] is True
     assert not (await context.client.request_feature("GET", "/v1/community/state", actor=manager))["quiet"]
     resume.assert_called_once_with(context.actor["scope"])

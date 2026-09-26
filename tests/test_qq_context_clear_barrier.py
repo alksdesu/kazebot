@@ -19,8 +19,8 @@ _GROUP = 778899
 @pytest.fixture()
 def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     module = load_runtime(monkeypatch, tmp_path)
-    module._context_clear_barrier.clear()
-    module._last_inbound_seq = 0
+    module._adapter.context_clear_barrier.clear()
+    module._adapter.last_inbound_seq = 0
     return module
 
 
@@ -34,14 +34,14 @@ class TestBarrier:
         runtime._note_inbound_seq(12)
         runtime._raise_context_clear_barrier(_GROUP)
 
-        assert runtime._context_clear_barrier[_GROUP] == 40
+        assert runtime._adapter.context_clear_barrier[_GROUP] == 40
 
     def test_triggers_still_in_flight_raise_it_further(self, runtime) -> None:
         # 被清掉的 trigger 可能比 adapter 记下的最大序号还新。
         runtime._note_inbound_seq(40)
         runtime._raise_context_clear_barrier(_GROUP, [SimpleNamespace(inbound_seq=57)])
 
-        assert runtime._context_clear_barrier[_GROUP] == 57
+        assert runtime._adapter.context_clear_barrier[_GROUP] == 57
 
     def test_a_seq_at_or_below_the_barrier_is_stale(self, runtime) -> None:
         runtime._note_inbound_seq(40)
@@ -105,21 +105,21 @@ class TestWriteBack:
         runtime._raise_context_clear_barrier(_GROUP)
         self._send(runtime, monkeypatch, 40)
 
-        assert len(runtime._group_history[_GROUP]) == 0
-        assert len(runtime._group_content_records[_GROUP]) == 0
+        assert len(runtime._adapter.group_history[_GROUP]) == 0
+        assert len(runtime._adapter.group_content_records[_GROUP]) == 0
 
     def test_a_fresh_reply_is_recorded_as_usual(self, runtime, monkeypatch) -> None:
         runtime._note_inbound_seq(40)
         runtime._raise_context_clear_barrier(_GROUP)
         self._send(runtime, monkeypatch, 41)
 
-        assert len(runtime._group_history[_GROUP]) == 1
-        assert len(runtime._group_content_records[_GROUP]) == 1
+        assert len(runtime._adapter.group_history[_GROUP]) == 1
+        assert len(runtime._adapter.group_content_records[_GROUP]) == 1
 
     def test_no_barrier_means_business_as_usual(self, runtime, monkeypatch) -> None:
         self._send(runtime, monkeypatch, 7)
 
-        assert len(runtime._group_history[_GROUP]) == 1
+        assert len(runtime._adapter.group_history[_GROUP]) == 1
 
 
 class TestEngineRestart:
@@ -128,8 +128,8 @@ class TestEngineRestart:
         # 每一条正常回复都判成过期。
         runtime._note_inbound_seq(40)
         runtime._raise_context_clear_barrier(_GROUP)
-        runtime._group_history[_GROUP]
+        runtime._adapter.group_history[_GROUP]
 
         asyncio.run(runtime.TangQiuCallbacks().on_engine_restarted({}))
 
-        assert runtime._context_clear_barrier == {}
+        assert runtime._adapter.context_clear_barrier == {}

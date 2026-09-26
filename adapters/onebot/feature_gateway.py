@@ -6,7 +6,7 @@ import logging
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Protocol
 
 from . import community_commands
 from .conversation_coordinator import ConversationCoordinator
@@ -23,39 +23,91 @@ class QuietDeliveryDeferred(OneBotSendError):
         self.deferred = True
 
 
+class FeatureHost(Protocol):
+    """FeatureGateway 对插件的全部依赖，插件入口按这份接口实现。"""
+
+    workspace: Path
+    live: Any
+    Message: Any
+    MessageSegment: Any
+    QueuedInbound: Any
+
+    @property
+    def client(self) -> Any: ...
+
+    @property
+    def event_router(self) -> Any: ...
+
+    def requester(self, event: Any) -> Any: ...
+
+    def stable_conversation_key(self, real_conversation_key: str) -> str: ...
+
+    def anonymous_identity(self, event: Any) -> str: ...
+
+    def event_display_name(self, event: Any) -> str: ...
+
+    def extract_reply_message_id(self, message: Any, raw_message: Any = None) -> Any | None: ...
+
+    def anonymize_text_for_ai(self, text: str) -> str: ...
+
+    def message_to_text(self, message: Any, bot_self_id: Any = None) -> str: ...
+
+    def is_group_allowed(self, group_id: int) -> bool: ...
+
+    def is_private_allowed(self, event: Any) -> bool: ...
+
+    def is_direct_bot_interaction(self, event: Any, bot: Any, text: str) -> bool: ...
+
+    def group_trigger_decision_once(self, event: Any, bot: Any, text: str) -> Any: ...
+
+    def get_fallback_bot(self) -> Any: ...
+
+    def request_send_context(self, scope: str, request_identity: str, conversation_key: str = "") -> Any: ...
+
+    async def group_trigger_text(self, bot: Any, event: Any) -> str: ...
+
+    async def event_text_with_forward(self, bot: Any, event: Any) -> str: ...
+
+    async def queue_or_submit_ready(self, item: Any) -> bool: ...
+
+    async def send_qq_message(
+        self, bot: Any, target: dict[str, Any], message: Any, *, send_context: Any = None,
+    ) -> Any: ...
+
+
 class FeatureGateway:
-    def __init__(self, runtime):
-        self.runtime = runtime
+    def __init__(self, host: FeatureHost):
+        self.host = host
         self.coordinator = ConversationCoordinator()
         self.poll_task: asyncio.Task | None = None
         self.started_at = time.time()
         self.recovered_accounts: set[str] = set()
-        self.burst_store = BurstStore(Path(runtime.CLONOTH_WORKSPACE) / "data" / "onebot_bursts.sqlite3")
+        self.burst_store = BurstStore(Path(host.workspace) / "data" / "onebot_bursts.sqlite3")
 
     def actor(self, bot, event) -> dict:
         group_id = getattr(event, "group_id", None)
-        requester = self.runtime._requester(event)
+        requester = self.host.requester(event)
         real_key = f"qq_group:{group_id}" if group_id is not None else f"qq_private:{getattr(event, 'user_id', '')}"
         return {
-            "scope": self.runtime._stable_conversation_key(real_key),
-            "user_id": "" if self.runtime._anonymous_identity(event) else str(getattr(event, "user_id", "") or ""),
+            "scope": self.host.stable_conversation_key(real_key),
+            "user_id": "" if self.host.anonymous_identity(event) else str(getattr(event, "user_id", "") or ""),
             "is_admin": requester.listed_admin, "role": (requester.group_role or "member") if group_id is not None else "member",
             "channel": "qq_group" if group_id is not None else "qq_private",
             "bot_scope": str(getattr(bot, "self_id", "") or ""),
             "message_id": str(getattr(event, "message_id", "") or ""),
-            "display_name": self.runtime._event_display_name(event),
+            "display_name": self.host.event_display_name(event),
         }
 
     def target_actor(self, bot, target) -> dict:
         kind = "qq_group" if target.get("type") == "group" else "qq_private"
         identity = target.get("group_id") if kind == "qq_group" else target.get("user_id")
-        return {"scope": self.runtime._stable_conversation_key(f"{kind}:{identity}"),
+        return {"scope": self.host.stable_conversation_key(f"{kind}:{identity}"),
                 "user_id": str(getattr(bot, "self_id", "") or "bot"), "is_admin": True,
                 "role": "admin", "channel": kind, "bot_scope": str(getattr(bot, "self_id", "") or "")}
 
     @property
     def available(self):
-        return callable(getattr(self.runtime._client, "request_feature", None))
+        return callable(getattr(self.host.client, "request_feature", None))
 
     def modules(self):
         yield community_commands
@@ -97,7 +149,7 @@ class FeatureGateway:
             if not actor["user_id"] or not self.available:
                 return False
             try:
-                return await reference(self.runtime._client, actor, reply_ref)
+                return await reference(self.host.client, actor, reply_ref)
             except Exception:
                 return True
         return True
@@ -112,7 +164,7 @@ class FeatureGateway:
             raise OneBotSendError("提醒已发送，消息引用绑定等待服务恢复", retryable=True)
         scope = str(getattr(context, "conversation_key", "") or self.target_actor(bot, target)["scope"])
         try:
-            await self.runtime._client.request_feature("POST", "/v1/reminders/delivery-messages", body={
+            await self.host.client.request_feature("POST", "/v1/reminders/delivery-messages", body={
                 "delivery_id": delivery_id, "scope": scope,
                 "bot_scope": str(getattr(bot, "self_id", "") or ""), "message_id": str(message_id),
             })
@@ -125,18 +177,18 @@ class FeatureGateway:
         actor = self.actor(bot, event)
         if not actor["user_id"]:
             return {}
-        text = await self.runtime._group_trigger_text(bot, event) if getattr(event, "group_id", None) is not None else await self.runtime._event_text_with_forward(bot, event)
-        reply_ref = str(self.runtime._extract_reply_message_id(event.get_message(), getattr(event, "raw_message", None)) or "")
+        text = await self.host.group_trigger_text(bot, event) if getattr(event, "group_id", None) is not None else await self.host.event_text_with_forward(bot, event)
+        reply_ref = str(self.host.extract_reply_message_id(event.get_message(), getattr(event, "raw_message", None)) or "")
         existing = self.coordinator.metadata(actor)
         if existing:
             return existing
         try:
-            result = await self.coordinator.prepare(self.runtime._client, actor, self.runtime._anonymize_text_for_ai(text),
-                                                    reply_ref=reply_ref, sender_name=self.runtime._event_display_name(event))
+            result = await self.coordinator.prepare(self.host.client, actor, self.host.anonymize_text_for_ai(text),
+                                                    reply_ref=reply_ref, sender_name=self.host.event_display_name(event))
             result["raw_text"] = text
             result["actor"] = actor
-            result["direct"] = bool(getattr(event, "group_id", None) is None or self.runtime._is_direct_bot_interaction(event, bot, text)
-                                    or self.runtime._group_trigger_decision_once(event, bot, text).signal in {"name", "reply", "at", "prefix"})
+            result["direct"] = bool(getattr(event, "group_id", None) is None or self.host.is_direct_bot_interaction(event, bot, text)
+                                    or self.host.group_trigger_decision_once(event, bot, text).signal in {"name", "reply", "at", "prefix"})
             journal = await self.record_inbound(bot, event, actor, text, reply_ref)
             result["journal_recorded"] = bool((journal or {}).get("recorded"))
             return result
@@ -147,9 +199,9 @@ class FeatureGateway:
     async def record_inbound(self, bot, event, actor, text, reply_ref):
         try:
             module = importlib.import_module(f"{__package__}.material_commands")
-            return await module.record_message(self.runtime._client, actor, message_id=actor["message_id"], text=text,
+            return await module.record_message(self.host.client, actor, message_id=actor["message_id"], text=text,
                                         timestamp=float(getattr(event, "time", None) or time.time()),
-                                        sender_name=self.runtime._event_display_name(event), reply_ref=reply_ref)
+                                        sender_name=self.host.event_display_name(event), reply_ref=reply_ref)
         except (ModuleNotFoundError, AttributeError):
             return
         except Exception:
@@ -160,14 +212,14 @@ class FeatureGateway:
             return
         actor = self.target_actor(bot, target)
         actor["message_id"] = str(message_id)
-        text = self.runtime._message_to_text(message, getattr(bot, "self_id", None))
+        text = self.host.message_to_text(message, getattr(bot, "self_id", None))
         try:
             module = importlib.import_module(f"{__package__}.material_commands")
-            await module.record_message(self.runtime._client, actor, message_id=str(message_id), text=text,
+            await module.record_message(self.host.client, actor, message_id=str(message_id), text=text,
                                         timestamp=time.time(), sender_name="Bot", direction="outbound",
                                         reply_ref=str(target.get("reply_message_id") or ""))
-            await self.runtime._client.request_feature("POST", "/v1/community/messages", actor=actor, body={
-                "message_id": str(message_id), "text": self.runtime._anonymize_text_for_ai(text),
+            await self.host.client.request_feature("POST", "/v1/community/messages", actor=actor, body={
+                "message_id": str(message_id), "text": self.host.anonymize_text_for_ai(text),
                 "reply_ref": str(target.get("reply_message_id") or ""), "sender_name": "Bot",
                 "topic_id": str(target.get("_topic_id") or ""),
             })
@@ -189,12 +241,12 @@ class FeatureGateway:
             for attachment in attachments:
                 if not attachment.get("path"):
                     continue
-                source = await module.register_attachment(self.runtime._client, actor, attachment,
+                source = await module.register_attachment(self.host.client, actor, attachment,
                                                          message_id=actor["message_id"], source_time=getattr(event, "time", None))
                 attachment["material_source_id"] = source["id"]
                 ids.append(source["id"])
             if metadata.get("journal_recorded"):
-                await module.record_message(self.runtime._client, actor, message_id=actor["message_id"],
+                await module.record_message(self.host.client, actor, message_id=actor["message_id"],
                                             text=metadata.get("raw_text", ""), timestamp=float(getattr(event, "time", None) or time.time()),
                                             sender_name=actor.get("display_name", ""), attachments=ids,
                                             reply_ref=metadata.get("reply_ref", ""))
@@ -210,7 +262,7 @@ class FeatureGateway:
             for attachment in attachments:
                 if not isinstance(attachment, dict) or not attachment.get("path"):
                     continue
-                source = await module.register_attachment(self.runtime._client, actor, attachment)
+                source = await module.register_attachment(self.host.client, actor, attachment)
         except Exception:
             logger.warning("sent attachment registration failed", exc_info=True)
 
@@ -233,12 +285,12 @@ class FeatureGateway:
         if account in self.recovered_accounts:
             return
         for data in self.burst_store.recover(account, self.started_at):
-            if data["group_id"] is not None and not self.runtime._is_group_allowed(int(data["group_id"])):
+            if data["group_id"] is not None and not self.host.is_group_allowed(int(data["group_id"])):
                 continue
             actor = data["actor"]
             event = SimpleNamespace(user_id=int(actor["user_id"]), message_id=int(actor["message_id"]),
                                     time=data["event_time"], sender=SimpleNamespace(role="member", card="", nickname=actor.get("display_name", "")),
-                                    get_message=lambda body=data["user_text"]: self.runtime.Message(self.runtime.MessageSegment.text(body)))
+                                    get_message=lambda body=data["user_text"]: self.host.Message(self.host.MessageSegment.text(body)))
             if data["group_id"] is not None:
                 event.group_id = int(data["group_id"])
                 try:
@@ -246,7 +298,7 @@ class FeatureGateway:
                     event.sender.role = str(member.get("role", "member"))
                 except Exception:
                     pass
-            elif not self.runtime._is_private_allowed(event):
+            elif not self.host.is_private_allowed(event):
                 continue
             platform = {"bot": bot, "event": event, "type": "private" if data["is_dm"] else "group", "user_id": event.user_id,
                         "conversation_key": data["scope"], "_route_hints": data.get("route_hints") or {"source_message_refs": data["refs"]},
@@ -254,22 +306,22 @@ class FeatureGateway:
                         "_source_attachments": data["attachments"]}
             if data["group_id"] is not None:
                 platform["group_id"] = data["group_id"]
-            item = self.runtime.QueuedInbound(None, bot, event, data["channel"], data["real_key"], data["scope"],
+            item = self.host.QueuedInbound(None, bot, event, data["channel"], data["real_key"], data["scope"],
                                                data["text"], data["attachments"], data["is_dm"], platform, data["user_text"],
                                                entry_node_id=data["entry_node_id"], history_watermark=-1,
                                                direct_interaction=data["direct_interaction"], memory_user_ids=tuple(data["memory_user_ids"]))
-            if not await self.runtime._queue_or_submit_ready(item):
+            if not await self.host.queue_or_submit_ready(item):
                 return
         self.recovered_accounts.add(account)
 
     async def handle_command(self, bot, event, text):
         actor = self.actor(bot, event)
-        reply_ref = str(self.runtime._extract_reply_message_id(event.get_message(), getattr(event, "raw_message", None)) or "")
+        reply_ref = str(self.host.extract_reply_message_id(event.get_message(), getattr(event, "raw_message", None)) or "")
         module = self.command_module(text, reply_ref)
         if module is None or not self.available or not actor["user_id"]:
             return None
         text = self.command_text(module, text)
-        state = await self.coordinator.policy(self.runtime._client, actor, refresh=True)
+        state = await self.coordinator.policy(self.host.client, actor, refresh=True)
         head = text.split(maxsplit=1)[0]
         controls = getattr(module, "CONTROL_COMMANDS", ())
         control = head in controls or head.lstrip("/") in controls
@@ -278,12 +330,12 @@ class FeatureGateway:
         if self.coordinator.quiet_blocks(state, direct=True, control=control):
             return {"text": "", "attachments": [], "control": False}
         try:
-            result = await module.handle(self.runtime._client, actor, text, reply_ref)
+            result = await module.handle(self.host.client, actor, text, reply_ref)
             if result is not None:
                 result["control"] = control
             self.coordinator.invalidate(actor["scope"])
             if head == "/恢复":
-                resume = getattr(self.runtime._event_router, "resume_deferred", None)
+                resume = getattr(self.host.event_router, "resume_deferred", None)
                 if resume is not None:
                     resume(actor["scope"])
             return result
@@ -306,7 +358,7 @@ class FeatureGateway:
             return
         actor = self.target_actor(bot, target)
         try:
-            policy = await self.coordinator.policy(self.runtime._client, actor, refresh=True)
+            policy = await self.coordinator.policy(self.host.client, actor, refresh=True)
         except Exception as error:
             raise OneBotSendError("无法核验当前群的发送策略，等待重试", retryable=True, definitely_not_sent=True, cause=error) from error
         direct = target.get("_response_purpose", "direct") == "direct"
@@ -321,7 +373,7 @@ class FeatureGateway:
         metadata["action"] = action
         metadata["classified"] = True
         try:
-            await self.runtime._client.request_feature("POST", "/v1/community/decisions", actor=actor, body={
+            await self.host.client.request_feature("POST", "/v1/community/decisions", actor=actor, body={
                 "action": action, "reason": reason, "topic_id": metadata.get("topic", {}).get("topic_id", ""),
             })
         except Exception:
@@ -330,26 +382,26 @@ class FeatureGateway:
     async def poll(self):
         while True:
             try:
-                bot = self.runtime._get_fallback_bot()
+                bot = self.host.get_fallback_bot()
                 if bot is not None and self.available:
                     await self.recover_bursts(bot)
-                    for group_id in self.runtime.live.allowed_groups:
+                    for group_id in self.host.live.allowed_groups:
                         target = {"type": "group", "group_id": int(group_id), "_response_purpose": "ambient"}
                         actor = self.target_actor(bot, target)
                         previous = self.coordinator.policies.get(actor["scope"], (0, {}))[1].get("quiet")
-                        current = await self.coordinator.policy(self.runtime._client, actor, refresh=True)
+                        current = await self.coordinator.policy(self.host.client, actor, refresh=True)
                         if previous and not current.get("quiet"):
-                            resume = getattr(self.runtime._event_router, "resume_deferred", None)
+                            resume = getattr(self.host.event_router, "resume_deferred", None)
                             if resume is not None:
                                 resume(actor["scope"])
-                        pending = await self.runtime._client.request_feature("GET", "/v1/community/notifications", actor=actor)
+                        pending = await self.host.client.request_feature("GET", "/v1/community/notifications", actor=actor)
                         for notification in pending.get("items", []):
-                            context = self.runtime._request_send_context("community", notification["id"], actor["scope"])
-                            message_id = await self.runtime._send_qq_message(bot, target,
-                                self.runtime.Message(self.runtime.MessageSegment.text(notification["text"])), send_context=context)
+                            context = self.host.request_send_context("community", notification["id"], actor["scope"])
+                            message_id = await self.host.send_qq_message(bot, target,
+                                self.host.Message(self.host.MessageSegment.text(notification["text"])), send_context=context)
                             if message_id:
                                 from urllib.parse import quote
-                                await self.runtime._client.request_feature("POST", f"/v1/community/notifications/{quote(notification['id'], safe='')}/ack",
+                                await self.host.client.request_feature("POST", f"/v1/community/notifications/{quote(notification['id'], safe='')}/ack",
                                                                           actor=actor, body={"message_id": message_id})
             except asyncio.CancelledError:
                 raise

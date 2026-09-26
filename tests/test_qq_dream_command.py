@@ -47,7 +47,7 @@ def _ask(
     text: str,
     client: Any,
 ) -> str | None:
-    monkeypatch.setattr(runtime, "_client", client)
+    monkeypatch.setattr(runtime._adapter, "client", client)
     return asyncio.run(runtime._maybe_handle_dream_command(
         event=SimpleNamespace(user_id=user_id), user_text=text, conversation_key=_CONV,
     ))

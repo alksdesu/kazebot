@@ -156,7 +156,7 @@ class TestAdapterCollection:
 
     def test_display_names_only_resolve_for_enrolled_people(self, runtime, tmp_path: Path, monkeypatch) -> None:
         alias = runtime._anonymize_user_id(10007)
-        monkeypatch.setitem(runtime._QQ_USER_PROFILES, "10007", {"display_name": "张三"})
+        monkeypatch.setitem(runtime._adapter.qq_user_profiles, "10007", {"display_name": "张三"})
 
         # 未建档：名字命中也不算涉及
         assert alias not in self._collect(runtime, self._event(10001), "张三昨天说要请客")
@@ -183,7 +183,7 @@ class TestAdapterCollection:
             alias = runtime._anonymize_user_id(user_id)
             aliases.append(alias)
             memory_subjects.record_interaction(tmp_path, alias, display_name=str(user_id))
-            monkeypatch.setitem(runtime._QQ_USER_PROFILES, str(user_id), {"display_name": "张三"})
+            monkeypatch.setitem(runtime._adapter.qq_user_profiles, str(user_id), {"display_name": "张三"})
 
         subjects = self._collect(runtime, self._event(10001), "张三昨天说要请客")
         assert not set(aliases).intersection(subjects)
@@ -336,7 +336,7 @@ class TestHintPlumbing:
         from tests._onebot_harness import set_live_config
 
         runtime = load_runtime(monkeypatch, tmp_path)
-        runtime._session_state = SessionState()
+        runtime._adapter.session_state = SessionState()
         set_live_config(runtime, enable_preempt=False)
         captured = []
 
@@ -344,7 +344,7 @@ class TestHintPlumbing:
             captured.append(kwargs)
             return SimpleNamespace(session_id="", accepted=False, inbound_seq=0)
 
-        runtime._client = SimpleNamespace(submit_inbound=submit)
+        runtime._adapter.client = SimpleNamespace(submit_inbound=submit)
         event = SimpleNamespace(user_id=10001, message_id=1, get_message=lambda: [])
         asyncio.run(runtime._submit_or_preempt_inbound(
             bot=None, event=event, channel="qq_group", real_conversation_key="qq_group:1",

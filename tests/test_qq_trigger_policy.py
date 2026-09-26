@@ -604,7 +604,7 @@ class TestTheAdapterHonoursTheSwitches:
     def test_cooldown_state_is_shared_by_the_whole_process(self, runtime: Any) -> None:
         set_live_config(runtime, cooldown_group_sec=30, cooldown_exempt_at=False)
         event = _event(to_me=True, reply=_reply_from(_BOT_QQ))
-        runtime._trigger_cooldown.record(runtime._trigger_input(event, SimpleNamespace(self_id=_BOT_QQ), "在吗"))
+        runtime._adapter.trigger_cooldown.record(runtime._trigger_input(event, SimpleNamespace(self_id=_BOT_QQ), "在吗"))
 
         decision = self._decide(runtime, event)
 
@@ -616,9 +616,9 @@ class TestTheAdapterHonoursTheSwitches:
 
         set_live_config(runtime, cooldown_group_sec=30, cooldown_exempt_at=False)
         event = _event(to_me=True, reply=_reply_from(_BOT_QQ))
-        runtime._trigger_cooldown.record(runtime._trigger_input(event, SimpleNamespace(self_id=_BOT_QQ), "在吗"))
-        runtime._real_conversation_keys["conv_x"] = "qq_group:1"
-        runtime._session_targets["s1"] = {"type": "group", "group_id": 1}
+        runtime._adapter.trigger_cooldown.record(runtime._trigger_input(event, SimpleNamespace(self_id=_BOT_QQ), "在吗"))
+        runtime._adapter.real_conversation_keys["conv_x"] = "qq_group:1"
+        runtime._adapter.session_targets["s1"] = {"type": "group", "group_id": 1}
 
         asyncio.run(runtime.TangQiuCallbacks().on_context_reset("conv_x", "clear", []))
 
@@ -630,9 +630,9 @@ class TestTheAdapterHonoursTheSwitches:
 
         set_live_config(runtime, cooldown_group_sec=30, cooldown_exempt_at=False)
         event = _event(to_me=True, reply=_reply_from(_BOT_QQ))
-        runtime._trigger_cooldown.record(runtime._trigger_input(event, SimpleNamespace(self_id=_BOT_QQ), "在吗"))
-        runtime._real_conversation_keys["conv_x"] = "qq_group:1"
-        runtime._session_targets["s1"] = {"type": "group", "group_id": 1}
+        runtime._adapter.trigger_cooldown.record(runtime._trigger_input(event, SimpleNamespace(self_id=_BOT_QQ), "在吗"))
+        runtime._adapter.real_conversation_keys["conv_x"] = "qq_group:1"
+        runtime._adapter.session_targets["s1"] = {"type": "group", "group_id": 1}
 
         asyncio.run(runtime.TangQiuCallbacks().on_context_reset("conv_x", "compact", []))
 
@@ -661,7 +661,7 @@ class TestTheAdapterHonoursTheSwitches:
 
         asyncio.run(runtime._agent_group_rule(SimpleNamespace(self_id=_BOT_QQ), quiet))
 
-        assert runtime._trigger_cooldown.remaining(
+        assert runtime._adapter.trigger_cooldown.remaining(
             runtime._trigger_input(quiet, SimpleNamespace(self_id=_BOT_QQ), ""),
             tp.TriggerConfig(cooldown_group_sec=30.0),
         ) == (0.0, "")

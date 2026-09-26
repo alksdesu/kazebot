@@ -333,7 +333,7 @@ class TestTriggerSeesTheContent:
         event = _event([_card("a")])
 
         first = asyncio.run(runtime._event_text_with_forward(bot, event))
-        runtime._forward_msg_cache.clear()
+        runtime._adapter.forward_msg_cache.clear()
         second = asyncio.run(runtime._event_text_with_forward(bot, event))
 
         assert first == second
@@ -364,4 +364,4 @@ class TestTriggerSeesTheContent:
         text = asyncio.run(runtime._event_text_with_forward(bot, _event([_text("普通消息")])))
 
         assert text == "普通消息"
-        assert runtime._event_text_cache == {}
+        assert runtime._adapter.event_text_cache == {}

@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-import contextvars
 import datetime as dt
 import hashlib
 import hmac
@@ -22,10 +21,11 @@ import secrets
 import sys
 import time
 import uuid
-from collections import OrderedDict, defaultdict, deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, DefaultDict, Deque, Dict, Iterable, List, Mapping, Optional
+from types import MappingProxyType
+from typing import Any, AsyncIterator, Awaitable, Callable, Deque, Dict, Iterable, List, Mapping, Optional
 
 import httpx
 from nonebot import get_bot, get_driver, on_message, on_notice
@@ -38,6 +38,7 @@ from engine import memory_subjects
 from engine.attachments import sniff_image_mime
 from platforms.ids import normalize_id
 
+from .adapter import OneBotAdapter
 from .faces import face_display_name
 from .feature_gateway import FeatureGateway
 from engine.memory_hit_cache import prune_namespace_hits
@@ -61,16 +62,10 @@ from .config import (
     LOCAL_SOURCE_ROOTS,
     IMAGE_FORWARD_MERGE_NICKNAME,
     RECENT_FILE_MAX_AGE_SECONDS,
-    RECENT_FILE_MAX_ITEMS,
     RECENT_IMAGE_MAX_AGE_SECONDS,
-    RECENT_IMAGE_MAX_ITEMS,
     USER_PROFILES_PATH,
     ONEBOT_STATE_FILE,
-    ONEBOT_IDEMPOTENCY_STORE_FILE,
-    ONEBOT_IDEMPOTENCY_SENT_TTL_SECONDS,
     ONEBOT_IDEMPOTENCY_FALLBACK_SENT_TTL_SECONDS,
-    ONEBOT_IDEMPOTENCY_MAX_ITEMS,
-    ONEBOT_IDEMPOTENCY_AMBIGUOUS_TTL_SECONDS,
     REPLY_ATTACHMENT_CACHE_FILE,
     ANON_MAP_FILE,
     ANON_MAP_RETENTION_DAYS,
@@ -82,7 +77,6 @@ from . import bot_scope as _bot_scope
 from .conversation_hash import digest as _digest_conversation_key, resolve_secret
 from .yaml_loader import load_yaml
 from .trigger_policy import (
-    CooldownState,
     TriggerConfig,
     TriggerDecision,
     TriggerInput,
@@ -122,7 +116,6 @@ from .send_contract import (
     OneBotAttachmentBatchError,
     OneBotSendContractError,
     OutboundSendContext,
-    TwoPhaseIdempotencyStore,
     classify_send_exception,
     context_from_sources,
     image_content_identity,
@@ -158,7 +151,7 @@ from .emoji_handler import (
     write_custom_face_names,
 )
 from stickers.collect import CollectConfig, StickerCollector, any_marked_segment
-from stickers.combat import CombatConfig, CombatTracker
+from stickers.combat import CombatConfig
 from stickers.collect import sticker_root, store_path as sticker_store_path
 from stickers.rank import rank
 from stickers.store import STATE_LIBRARY, STATE_PENDING, Sticker, StickerStore
@@ -184,7 +177,7 @@ driver = get_driver()
 
 _CST = dt.timezone(dt.timedelta(hours=8))
 _SPLIT_SIGNAL = "[SPLIT]"
-_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
 _QQ_EMOJI_MARK_RE = re.compile(r"\[QQ_EMOJI:(.+?)\]")
 _CQ_RE = re.compile(r"\[CQ:([^,\]]+)(?:,([^\]]*))?\]")
 _AT_QQ_RE = re.compile(r"\[(?:CQ:)?at[,:][^\]]*?qq=([^,\]\s]+)", re.IGNORECASE)
@@ -258,42 +251,14 @@ _REACT_MODEL_EMOJI_IDS = (
     "4", "5", "9", "14", "63", "66", "76", "79", "99", "182", "201", "264", "271", "319",
 )
 # 名字只在 faces 表里写一份：这里和收到表情时显示的必须是同一个词。
-_REACT_MODEL_EMOJIS: Dict[str, str] = {
+_REACT_MODEL_EMOJIS: Mapping[str, str] = MappingProxyType({
     eid: face_display_name(eid) for eid in _REACT_MODEL_EMOJI_IDS
-}
+})
 assert all(_REACT_MODEL_EMOJIS.values())
 _SEARCH_PROGRESS_FIRST_NOTICE = "已收到联网搜索请求，正在检索网页资料，可能需要几秒钟……"
 _SEARCH_PROGRESS_STILL_RUNNING_NOTICE = "还在联网搜索中（已等 {waited} 秒），我会拿到结果后马上整理回复。"
 _SEARCH_PROGRESS_STILL_RUNNING_DELAY_SEC = 20.0
 _SEARCH_PROGRESS_KEYWORDS = ("web_search", "exa_search", "x_search")
-
-
-def _group_history_capacity() -> int:
-    """群历史 deque 的硬上限：软上限之上的位置只租给还没送到 engine 的行。"""
-    return int(max(live.group_history_max, 0) * live.group_history_undelivered_ratio)
-
-
-# 群聊上下文只保留最近 N 条。这样可以给入口节点提供社交语境，
-# 同时避免每次 inbound 发送过长历史。
-_group_history: DefaultDict[int, Deque["GroupHistoryLine"]] = defaultdict(lambda: deque(maxlen=_group_history_capacity()))
-# 每行的序号来源。engine 侧确认收下某轮 inbound 后，水位推进到那轮带过的最大序号，
-# 之后只补新行 —— 否则每条群消息都会被 20 轮 inbound 各带一次，在 durable history 里存 20 份。
-_group_history_seq: DefaultDict[int, int] = defaultdict(int)
-# 被缓存上限吃掉、且当时还没送到 engine 的最高序号。seq 逐 1 递增，缺了几行由它和水位算出来。
-_group_history_gap: Dict[int, int] = {}
-# 群号 → 清空上下文那一刻的 inbound 序号。清空时还在飞的任务照样会回来投递，
-# 它带的是上一段上下文的产物，落回刚清空的缓存就等于没清。
-_context_clear_barrier: Dict[int, int] = {}
-# 至今见过的最大 inbound 序号，用来给上面那道门槛定位。
-_last_inbound_seq: int = 0
-
-# EventRouter 回调只拿到 session/trigger，因此这里保存发送最终回复所需的平台对象。
-_session_targets: Dict[str, Dict[str, Any]] = {}
-_conversation_bots: Dict[str, Bot] = {}
-_real_conversation_keys: Dict[str, str] = {}
-_stable_conversation_keys: Dict[str, str] = {}
-_persisted_session_targets: Dict[str, Dict[str, Any]] = {}
-_last_bot: Optional[Bot] = None
 
 
 @dataclass
@@ -342,63 +307,14 @@ class ForwardSelection:
     error: str = ""
 
 
-_CONVERSATION_BUCKET_MAX_KEYS = 512
-
-
-class _BucketMap(OrderedDict):
-    """按会话分桶的进程内缓存：写入即刷新为最新，桶数超上限时淘汰最久未写入的会话。"""
-
-    def __init__(self, factory: Callable[[], Any], max_keys: int) -> None:
-        super().__init__()
-        self._factory = factory
-        self._max_keys = max_keys
-
-    def __missing__(self, key: Any) -> Any:
-        value = self._factory()
-        self[key] = value
-        return value
-
-    def touch(self, key: Any) -> None:
-        # 桶可能因写入前提前 return 而没被创建，move_to_end 对不存在的键会抛 KeyError。
-        if key not in self:
-            return
-        self.move_to_end(key)
-        while len(self) > self._max_keys:
-            self.popitem(last=False)
-
-
-_recent_images: "_BucketMap" = _BucketMap(lambda: deque(maxlen=RECENT_IMAGE_MAX_ITEMS), _CONVERSATION_BUCKET_MAX_KEYS)
-# QQ 群文件是独立一条消息、带不了 @，那条永远不会触发 bot。不在这里留一手，
-# 下一条「读一下上面那个文件」就再也拿不到它了。
-_recent_files: "_BucketMap" = _BucketMap(lambda: deque(maxlen=RECENT_FILE_MAX_ITEMS), _CONVERSATION_BUCKET_MAX_KEYS)
-# 复读判定只看内容指纹和发言人，不用整条历史：判完就丢，不参与任何送达账本。
-_echo_recent: DefaultDict[int, Deque[EchoEntry]] = defaultdict(lambda: deque(maxlen=12))
-# 每个群最近跟过的那句，防止人再补一条又凑够数、Bot 一路接力。
-_echo_last: Dict[int, tuple[str, float]] = {}
-# 借 group_history_max 定容量，但语义不同：这份副本只供 qq_forward 挑选转发候选，没有送达账本，
-# 因此不参与缺口记账、也不吃未送达倍数。调小群历史条数会顺带缩小可转发范围，至少 20 条。
-_group_content_records: DefaultDict[int, Deque[GroupContentRecord]] = defaultdict(lambda: deque(maxlen=max(live.group_history_max, 20)))
-# [2026-07-07] 按会话记录 Bot 最近发出/生成的附件（如生图插件产出的图片），
-# 供 qq_forward “把刚才生成的那张图发给 xx”等自然语言请求检索。
-# 只保存工作区内本地路径与显示名，不涉及真实 QQ 号。
-_recent_sent_attachments: "_BucketMap" = _BucketMap(lambda: deque(maxlen=max(RECENT_IMAGE_MAX_ITEMS, 20)), _CONVERSATION_BUCKET_MAX_KEYS)
-# 每个桶单调递增的附件序号：下标会随新附件入队和缺文件过滤而漂移，挑选只能按这个号。
-_sent_attachment_seq: DefaultDict[str, int] = defaultdict(int)
-_last_attachment_cleanup_at = 0.0
 # 清理频率不是运营期要调的旋钮（保留期才是），所以是代码常量。
 _ATTACHMENT_CLEANUP_INTERVAL_SEC = 3600.0
 # data/attachments 同时住着 engine 产物和其他适配器的附件，只清 QQ 自己的会话目录。
 # 前缀 = _stable_conversation_key 的三种 prefix 把 ":" 换成 "_"。
 _QQ_ATTACHMENT_DIR_PREFIXES = ("qq_group_", "qq_private_", "qq_unknown_")
 
-# [2026-07-17] Bot 已发出附件消息的 message_id -> 本地附件路径列表 映射。
-# Why: Bot 发出的图片（如绘图产物）在上下文里被替换成占位符/表情包，用户引用
-# 这条消息要求“基于这张图继续改”时，AI 看不到原图。How: 发图时接住 send_*_msg
-# 返回的 message_id，登记它对应的本地附件路径；用户引用命中时把该图当附件送给 AI。
-# Purpose: 让“引用 Bot 生成的图 + 追加要求”能真正带上原图，而普通表情包（无此
-# 映射）仍保持屏蔽，不会重新触发识图。
+# Bot 已发出附件消息的 message_id 映射表上限，超出淘汰最旧的。
 _MESSAGE_ATTACHMENT_MAX_ITEMS = int(os.environ.get("ONEBOT_MSG_ATTACHMENT_CACHE_ITEMS", "512") or "512")
-_sent_message_attachments: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
 
 
 @dataclass
@@ -429,53 +345,89 @@ class QueueReplyWaiter:
     inbound_seq: int = 0
 
 
-_qq_queue: Deque[QueuedInbound] = deque()
-_qq_queue_by_key: Dict[str, QueuedInbound] = {}
-_qq_queue_condition = asyncio.Condition()
-_qq_waiting_replies: Dict[str, QueueReplyWaiter] = {}
-_qq_active_conversations: set[str] = set()
-_qq_completed_replies: OrderedDict[int, None] = OrderedDict()
-_features = FeatureGateway(sys.modules[__name__])
-_auto_like_today: Dict[int, str] = {}
-_reply_message_cache: Dict[str, Dict[str, Any]] = {}
-_reply_message_cache_order: Deque[str] = deque()
-# 持久化的“message_id -> 本地附件”索引。用于 NapCat get_msg 取不到引用消息时，
-# 仍能转发此前已经下载到 Clonoth 的图片/表情包。只保存路径和少量路由元数据。
-_reply_attachment_cache: Dict[str, Dict[str, Any]] = {}
-# Outbound replay protection uses pending/sent phases: failed sends release pending,
-# while only acknowledged sends become sent.
-_outbound_idempotency = TwoPhaseIdempotencyStore(
-    ONEBOT_IDEMPOTENCY_STORE_FILE,
-    sent_ttl=ONEBOT_IDEMPOTENCY_SENT_TTL_SECONDS,
-    max_items=ONEBOT_IDEMPOTENCY_MAX_ITEMS,
-    ambiguous_ttl=ONEBOT_IDEMPOTENCY_AMBIGUOUS_TTL_SECONDS,
+class _OneBotFeatureHost:
+    """FeatureGateway 对插件的全部依赖。函数在调用时按模块名解析，替换模块属性照样生效。"""
+
+    Message = Message
+    MessageSegment = MessageSegment
+    QueuedInbound = QueuedInbound
+    live = live
+    workspace = Path(CLONOTH_WORKSPACE)
+
+    @property
+    def client(self) -> Optional[ClonothClient]:
+        return _adapter.client
+
+    @property
+    def event_router(self) -> Optional[EventRouter]:
+        return _adapter.event_router
+
+    def requester(self, event: Any) -> capability.Requester:
+        return _requester(event)
+
+    def stable_conversation_key(self, real_conversation_key: str) -> str:
+        return _stable_conversation_key(real_conversation_key)
+
+    def anonymous_identity(self, event: Any) -> str:
+        return _anonymous_identity(event)
+
+    def event_display_name(self, event: Any) -> str:
+        return _event_display_name(event)
+
+    def extract_reply_message_id(self, message: Any, raw_message: Any = None) -> Any | None:
+        return _extract_reply_message_id(message, raw_message)
+
+    def anonymize_text_for_ai(self, text: str) -> str:
+        return _anonymize_text_for_ai(text)
+
+    def message_to_text(self, message: Any, bot_self_id: Any = None) -> str:
+        return _message_to_text(message, bot_self_id)
+
+    def is_group_allowed(self, group_id: int) -> bool:
+        return _is_group_allowed(group_id)
+
+    def is_private_allowed(self, event: Any) -> bool:
+        return _is_private_allowed(event)
+
+    def is_direct_bot_interaction(self, event: Any, bot: Any, text: str) -> bool:
+        return _is_direct_bot_interaction(event, bot, text)
+
+    def group_trigger_decision_once(self, event: Any, bot: Any, text: str) -> TriggerDecision:
+        return _group_trigger_decision_once(event, bot, text)
+
+    def get_fallback_bot(self) -> Optional[Bot]:
+        return _get_fallback_bot()
+
+    def request_send_context(self, scope: str, request_identity: str, conversation_key: str = "") -> OutboundSendContext:
+        return _request_send_context(scope, request_identity, conversation_key)
+
+    async def group_trigger_text(self, bot: Any, event: Any) -> str:
+        return await _group_trigger_text(bot, event)
+
+    async def event_text_with_forward(self, bot: Any, event: Any) -> str:
+        return await _event_text_with_forward(bot, event)
+
+    async def queue_or_submit_ready(self, item: QueuedInbound) -> bool:
+        return await _queue_or_submit_ready(item)
+
+    async def send_qq_message(
+        self, bot: Any, target: Dict[str, Any], message: Any, *, send_context: OutboundSendContext | None = None,
+    ) -> Any:
+        return await _send_qq_message(bot, target, message, send_context=send_context)
+
+
+_adapter = OneBotAdapter(
+    workspace=Path(CLONOTH_WORKSPACE), live=live, features=FeatureGateway(_OneBotFeatureHost()),
 )
-_route_state_lock = asyncio.Lock()
-# 映射表的 key 必须是纯数字：_anonymize_text_for_ai 的 (?<!\d)/(?!\d) 边界只对数字成立。
-_anon_users: Dict[str, str] = {}
-_anon_groups: Dict[str, str] = {}
-_anon_user_reverse: Dict[str, str] = {}
-_anon_group_reverse: Dict[str, str] = {}
-# 每条别名的真实最后出现时间，供 TTL 回收判定；只在进程内维护，落盘时写进 last_seen 字段。
-_anon_user_last_seen: Dict[str, float] = {}
-_anon_group_last_seen: Dict[str, float] = {}
+
+
 # 每次命中都写盘会把节流窗口打满，同一小时内只记一次就够 TTL 判定用。
 _ANON_MAP_TOUCH_MIN_INTERVAL = 3600.0
 # 条目数超过此值时提示可以开保留期回收。
 _ANON_MAP_LARGE_WARN = 20000
-# 显式维护“下一个编号”计数器。不再用 len(_anon_users) 推断，避免持久化恢复/
-# TTL 回收后长度与实际已用编号不一致导致别名冲突。加载时以文件为准恢复。
-_anon_user_next: int = 0
-_anon_group_next: int = 0
-_anon_map_dirty: bool = False
-# 匿名映射写盘节流：新登记不再每次都立即写盘，而是合并到至少间隔 5s 后写一次。
-# _anon_map_save_task 保存待触发的延迟 flush task；_anon_map_last_saved_at 记录上次落盘时间。
+# 匿名映射写盘节流：新登记合并到至少间隔 5s 后写一次，不再每次立即写盘。
 _ANON_MAP_SAVE_MIN_INTERVAL = max(0.0, float(os.environ.get("ONEBOT_ANON_MAP_SAVE_MIN_INTERVAL", "5.0")))
-_anon_map_save_task: Optional["asyncio.Task[Any]"] = None
-_anon_map_last_saved_at: float = 0.0
 
-# 待管理员审批的 Clonoth 操作。key 为 approval_id，value 保存操作、详情和来源会话。
-_pending_approvals: Dict[str, Dict[str, Any]] = {}
 
 # 卡片标题同时是“这条消息确实是审批卡片”的唯一证据，改文案要连反查一起改。
 _APPROVAL_SUMMARY_HEADER = "【Clonoth 审批请求】"
@@ -511,17 +463,9 @@ class _ApprovalReplyTarget:
         return bool(self.approval_id or self.settled_id or self.from_card)
 
 
-# 发给管理员的审批消息 message_id -> 卡片锚点映射，支持“引用卡片回同意/拒绝”快捷审批。
-# 记录收件人是为了反查时校验“引用者就是这张卡片的收件人”。有界，超限清理最旧条目。
-_approval_message_ids: "OrderedDict[str, _ApprovalCard]" = OrderedDict()
 _APPROVAL_MSG_MAP_MAX = 500
 
-# 已决策/已失效的审批登记：重复决策或引用已处理卡片时回一句“已被处理”，而非误批另一条。
-_settled_approvals: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _SETTLED_APPROVAL_MAX = 200
-
-# 决策领取锁：多个管理员同时决策同一条时，只有抢到的人能提交。
-_approval_decision_lock = asyncio.Lock()
 
 
 def _normalize_msg_id(message_id: Any) -> str:
@@ -555,10 +499,10 @@ def _remember_approval_message(message_id: Any, approval_id: str, admin_id: int)
         admin = int(admin_id)
     except (TypeError, ValueError):
         return
-    _approval_message_ids[key] = _ApprovalCard(approval_id=approval_id, admin_id=admin)
-    _approval_message_ids.move_to_end(key)
-    while len(_approval_message_ids) > _APPROVAL_MSG_MAP_MAX:
-        _approval_message_ids.popitem(last=False)
+    _adapter.approval_message_ids[key] = _ApprovalCard(approval_id=approval_id, admin_id=admin)
+    _adapter.approval_message_ids.move_to_end(key)
+    while len(_adapter.approval_message_ids) > _APPROVAL_MSG_MAP_MAX:
+        _adapter.approval_message_ids.popitem(last=False)
 
 
 def _approval_card_recipients(approval_id: str) -> set[int]:
@@ -567,7 +511,7 @@ def _approval_card_recipients(approval_id: str) -> set[int]:
         return set()
     return {
         card.admin_id
-        for card in _approval_message_ids.values()
+        for card in _adapter.approval_message_ids.values()
         if card.approval_id == approval_id
     }
 
@@ -578,20 +522,20 @@ def _record_settled_approval(
     """登记一条已决策/已失效的审批，供重复决策与引用已处理卡片时告知而非误批。"""
     if not approval_id:
         return
-    _settled_approvals[approval_id] = {
+    _adapter.settled_approvals[approval_id] = {
         "decision": decision,
         "admin_id": admin_id,
         "at": time.time(),
         "operation": operation,
     }
-    _settled_approvals.move_to_end(approval_id)
-    while len(_settled_approvals) > _SETTLED_APPROVAL_MAX:
-        _settled_approvals.popitem(last=False)
+    _adapter.settled_approvals.move_to_end(approval_id)
+    while len(_adapter.settled_approvals) > _SETTLED_APPROVAL_MAX:
+        _adapter.settled_approvals.popitem(last=False)
 
 
 def _settled_approval_notice(approval_id: str) -> str:
     """引用/决策一条已处理审批时的回执文案。"""
-    info = _settled_approvals.get(approval_id) or {}
+    info = _adapter.settled_approvals.get(approval_id) or {}
     decision = str(info.get("decision") or "")
     label = {"allow": "已同意", "deny": "已拒绝", "expired": "已超时失效"}.get(decision, "已处理")
     admin_id = info.get("admin_id")
@@ -601,16 +545,16 @@ def _settled_approval_notice(approval_id: str) -> str:
 
 def _prune_expired_approvals() -> None:
     """把超过 TTL 的待审批移出 pending 并登记为已失效；engine 侧已 auto-deny，这里同步收尾。"""
-    if not _pending_approvals:
+    if not _adapter.pending_approvals:
         return
     now = time.time()
     expired: List[str] = []
-    for aid, info in _pending_approvals.items():
+    for aid, info in _adapter.pending_approvals.items():
         created = float(info.get("created_at") or 0) or now
         if now - created > PENDING_APPROVAL_TTL_SECONDS:
             expired.append(aid)
     for aid in expired:
-        info = _pending_approvals.pop(aid, {})
+        info = _adapter.pending_approvals.pop(aid, {})
         _record_settled_approval(
             aid, admin_id=0, decision="expired", operation=str(info.get("operation") or ""),
         )
@@ -621,7 +565,7 @@ def _resolve_approval_target_by_reply(reply_message_id: Any, user_id: int) -> _A
     key = _normalize_msg_id(reply_message_id)
     if not key:
         return _ApprovalReplyTarget()
-    card = _approval_message_ids.get(key)
+    card = _adapter.approval_message_ids.get(key)
     if card is None:
         return _ApprovalReplyTarget()
     try:
@@ -630,9 +574,9 @@ def _resolve_approval_target_by_reply(reply_message_id: Any, user_id: int) -> _A
         return _ApprovalReplyTarget()
     if card.admin_id != uid:
         return _ApprovalReplyTarget()
-    if card.approval_id in _pending_approvals:
+    if card.approval_id in _adapter.pending_approvals:
         return _ApprovalReplyTarget(approval_id=card.approval_id, from_card=True)
-    if card.approval_id in _settled_approvals:
+    if card.approval_id in _adapter.settled_approvals:
         return _ApprovalReplyTarget(settled_id=card.approval_id, from_card=True)
     return _ApprovalReplyTarget(from_card=True)
 
@@ -647,7 +591,7 @@ def _extract_approval_id_from_text(text: str) -> str:
     m = _APPROVAL_UUID_RE.search(text)
     if m:
         return m.group(0)
-    for aid in list(_pending_approvals) + list(_settled_approvals):
+    for aid in list(_adapter.pending_approvals) + list(_adapter.settled_approvals):
         if aid and aid in text:
             return aid
     return ""
@@ -683,9 +627,9 @@ async def _resolve_approval_target_by_quoted_text(bot: Bot, reply_message_id: An
     if sender_id is None or _normalize_msg_id(sender_id) != _normalize_msg_id(getattr(bot, "self_id", None)):
         return _ApprovalReplyTarget()
     aid = _extract_approval_id_from_text(text)
-    if aid and aid in _pending_approvals:
+    if aid and aid in _adapter.pending_approvals:
         return _ApprovalReplyTarget(approval_id=aid, from_card=True)
-    if aid and aid in _settled_approvals:
+    if aid and aid in _adapter.settled_approvals:
         return _ApprovalReplyTarget(settled_id=aid, from_card=True)
     return _ApprovalReplyTarget(from_card=True)
 
@@ -706,44 +650,22 @@ async def _resolve_approval_reply_target(bot: Bot, event: Event) -> _ApprovalRep
         target = await _resolve_approval_target_by_quoted_text(bot, reply_message_id)
         if target.matched():
             return target
-        if live.approval_reply_unique_fallback and len(_pending_approvals) == 1:
-            only_id = next(iter(_pending_approvals))
+        if live.approval_reply_unique_fallback and len(_adapter.pending_approvals) == 1:
+            only_id = next(iter(_adapter.pending_approvals))
             uid = _as_qq_id(user_id)
             if uid is not None and uid in _approval_card_recipients(only_id):
                 return _ApprovalReplyTarget(approval_id=only_id, from_card=True)
     return _ApprovalReplyTarget()
 
 
-# QQ 用户身份/称呼 Profile。只影响模型可见的称呼和身份说明，不授予任何权限。
-# 权限仍只由管理员名单与能力档位判定，见 _can。
-_QQ_USER_PROFILES: Dict[str, Dict[str, Any]] = {}
-
-_client: Optional[ClonothClient] = None
-_session_state: Optional[SessionState] = None
-_event_router: Optional[EventRouter] = None
-_router_task: Optional[asyncio.Task] = None
-# 按 worker 下标存而不是列表：下标决定缩容时谁该退，某个 worker 意外退出后
-# 补位也要补回它原来那个空位，否则会出现两个同下标的 worker。
-_qq_queue_tasks: Dict[int, asyncio.Task] = {}
-_live_reconcile_task: Optional[asyncio.Task] = None
-_attachment_cleanup_task: Optional[asyncio.Task] = None
 # 热载键落到运行期对象上的对齐周期。停等一次 stat 的代价换「改完两秒内生效」。
 _LIVE_RECONCILE_INTERVAL_SEC = 2.0
 # 快照没变也定期重写一次，supervisor 靠这个时间戳判断 bot 进程是不是还活着。
 _LIVE_STATE_HEARTBEAT_SEC = 30.0
-# 触发冷却。进程内内存：重启之后继续静默毫无道理，窗口本来就是秒级的。
-_trigger_cooldown = CooldownState()
 # 随机插话骰子的盐。每次启动换一份：常量盐会让外人按 message_id 算出哪条消息能触发插话。
 _TRIGGER_ROLL_SALT = os.urandom(16)
 # 按消息身份缓存的触发判定。只为「一条消息在同一次派发里被判两遍」而存在，所以很小。
 _TRIGGER_DECISION_CACHE_MAX = 256
-_trigger_decisions: "OrderedDict[tuple[str, ...], TriggerDecision]" = OrderedDict()
-_live_state_signature: str = ""
-_live_state_published_at: float = 0.0
-_callbacks: Optional["TangQiuCallbacks"] = None
-_bqbs: List[str] = []
-_custom_face_names: List[str] = []
-_custom_face_metadata: List[Dict[str, Any]] = []
 
 
 def _is_group_allowed(group_id: int) -> bool:
@@ -871,10 +793,10 @@ async def _agent_group_rule(bot: Bot, event: Event) -> bool:
     refresh_live_config()
     if not _is_group_allowed(int(event.group_id)):
         return False
-    metadata = await _features.prepare(bot, event)
-    if _features.blocked(metadata):
+    metadata = await _adapter.features.prepare(bot, event)
+    if _adapter.features.blocked(metadata):
         return False
-    if metadata and _features.coordinator.can_continue(metadata["actor"], metadata.get("reply_ref", "")):
+    if metadata and _adapter.features.coordinator.can_continue(metadata["actor"], metadata.get("reply_ref", "")):
         return True
     text = await _group_trigger_text(bot, event)
     decision = _group_trigger_decision_once(event, bot, text)
@@ -887,7 +809,7 @@ async def _agent_group_rule(bot: Bot, event: Event) -> bool:
         # 在这里记冷却而不是等真的发出去：rule 返回 True 就意味着这条消息会被当成一轮
         # bot 发言处理（本地命令拦截也会产出回复）。handler 中途异常时会多冷却一轮，
         # 而「多等一会儿」是这两个方向里安全的那一个。
-        _trigger_cooldown.record(_trigger_input(event, bot, text))
+        _adapter.trigger_cooldown.record(_trigger_input(event, bot, text))
     return decision.triggered
 
 
@@ -902,8 +824,8 @@ async def _intent_group_rule(bot: Bot, event: Event) -> bool:
     refresh_live_config()
     if not _is_group_allowed(int(event.group_id)):
         return False
-    metadata = await _features.prepare(bot, event)
-    if _features.blocked(metadata):
+    metadata = await _adapter.features.prepare(bot, event)
+    if _adapter.features.blocked(metadata):
         return False
     coordinated = metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled", False)
     if not live.llm_intent_enabled and not coordinated:
@@ -911,7 +833,7 @@ async def _intent_group_rule(bot: Bot, event: Event) -> bool:
     text = await _group_trigger_text(bot, event)
     if coordinated:
         config = replace(TriggerConfig.from_live(live), llm_intent=True)
-        return trigger_evaluate(_trigger_input(event, bot, text), config, _trigger_cooldown).awaits_llm_intent()
+        return trigger_evaluate(_trigger_input(event, bot, text), config, _adapter.trigger_cooldown).awaits_llm_intent()
     return _group_trigger_decision_once(event, bot, text).awaits_llm_intent()
 
 
@@ -1014,9 +936,9 @@ def _parse_approval_reply_verb(text: str) -> Optional[str]:
 def _unique_pending_approval_for(user_id: Any) -> str:
     """恰好一条待审批、且那张卡片确实发给本人时返回它的 id，否则空串。"""
     _prune_expired_approvals()
-    if len(_pending_approvals) != 1:
+    if len(_adapter.pending_approvals) != 1:
         return ""
-    only_id = next(iter(_pending_approvals))
+    only_id = next(iter(_adapter.pending_approvals))
     uid = _as_qq_id(user_id)
     if uid is None or uid not in _approval_card_recipients(only_id):
         return ""
@@ -1028,7 +950,7 @@ def _pending_approvals_for(user_id: Any) -> int:
     uid = _as_qq_id(user_id)
     if uid is None:
         return 0
-    return sum(1 for aid in _pending_approvals if uid in _approval_card_recipients(aid))
+    return sum(1 for aid in _adapter.pending_approvals if uid in _approval_card_recipients(aid))
 
 
 def _resolve_pending_approval_id(token: str) -> tuple[Optional[str], str]:
@@ -1037,14 +959,14 @@ def _resolve_pending_approval_id(token: str) -> tuple[Optional[str], str]:
     token = (token or "").strip()
     if not token:
         return None, "缺少审批 ID。"
-    if token in _pending_approvals:
+    if token in _adapter.pending_approvals:
         return token, ""
-    matches = [aid for aid in _pending_approvals if aid.startswith(token)]
+    matches = [aid for aid in _adapter.pending_approvals if aid.startswith(token)]
     if len(matches) == 1:
         return matches[0], ""
     if len(matches) > 1:
         return None, f"审批 ID 前缀不唯一：{token}"
-    settled = [aid for aid in _settled_approvals if aid == token or aid.startswith(token)]
+    settled = [aid for aid in _adapter.settled_approvals if aid == token or aid.startswith(token)]
     if len(settled) == 1:
         return None, _settled_approval_notice(settled[0])
     return None, f"没有找到待审批 ID：{token}"
@@ -1093,7 +1015,7 @@ def _load_qq_user_profiles(path_text: str) -> Dict[str, Dict[str, Any]]:
 
 def _qq_user_profile(user_id: Any) -> Dict[str, Any]:
     raw = str(user_id or "").strip()
-    return dict(_QQ_USER_PROFILES.get(raw) or {})
+    return dict(_adapter.qq_user_profiles.get(raw) or {})
 
 
 def _qq_profile_display_name(user_id: Any) -> str:
@@ -1124,8 +1046,6 @@ _ANONYMOUS_UNKNOWN_ALIAS = "AnonUnknown"
 _ANONYMOUS_DISPLAY_NAME = "匿名成员"
 # 匿名 id 由平台按天轮换，落盘只会撑大映射表且反解无意义，因此这份表只存在于进程内。
 _ANON_SENDER_MAX_ENTRIES = 4096
-_anon_senders: "OrderedDict[str, str]" = OrderedDict()
-_anon_sender_next: int = 0
 
 
 def _anonymous_field(anonymous: Any, key: str) -> str:
@@ -1150,19 +1070,18 @@ def _anonymous_identity(event: Any) -> str:
 
 def _anonymize_anonymous_sender(event: Any) -> str:
     """给匿名发送者分配进程内别名；不同匿名成员必须拿到不同别名。"""
-    global _anon_sender_next
     key = _anonymous_identity(event)
     if not key:
         return ""
-    alias = _anon_senders.get(key)
+    alias = _adapter.anon_senders.get(key)
     if alias is None:
-        alias = _alias_from_index("Anon", _anon_sender_next)
-        _anon_sender_next += 1
-        _anon_senders[key] = alias
-        while len(_anon_senders) > _ANON_SENDER_MAX_ENTRIES:
-            _anon_senders.popitem(last=False)
+        alias = _alias_from_index("Anon", _adapter.anon_sender_next)
+        _adapter.anon_sender_next += 1
+        _adapter.anon_senders[key] = alias
+        while len(_adapter.anon_senders) > _ANON_SENDER_MAX_ENTRIES:
+            _adapter.anon_senders.popitem(last=False)
     else:
-        _anon_senders.move_to_end(key)
+        _adapter.anon_senders.move_to_end(key)
     return alias
 
 
@@ -1390,7 +1309,6 @@ def _extract_forward_sources(message: Any) -> List[ForwardSource]:
 
 _FORWARD_CACHE_TTL_SEC = 120.0
 _FORWARD_CACHE_MAX = 64
-_forward_msg_cache: "OrderedDict[str, tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
 
 
 def _normalize_forward_messages(data: Any) -> List[Dict[str, Any]] | None:
@@ -1415,12 +1333,12 @@ async def _get_forward_messages(bot: Bot, forward_id: str) -> List[Dict[str, Any
     if not forward_id:
         return None
     now = time.time()
-    cached = _forward_msg_cache.get(forward_id)
+    cached = _adapter.forward_msg_cache.get(forward_id)
     if cached is not None:
         if now - cached[0] <= _FORWARD_CACHE_TTL_SEC:
-            _forward_msg_cache.move_to_end(forward_id)
+            _adapter.forward_msg_cache.move_to_end(forward_id)
             return cached[1]
-        _forward_msg_cache.pop(forward_id, None)
+        _adapter.forward_msg_cache.pop(forward_id, None)
     try:
         data = await bot.call_api("get_forward_msg", id=forward_id)
     except Exception:
@@ -1429,9 +1347,9 @@ async def _get_forward_messages(bot: Bot, forward_id: str) -> List[Dict[str, Any
     messages = _normalize_forward_messages(data)
     if messages is None:
         return None
-    _forward_msg_cache[forward_id] = (now, messages)
-    while len(_forward_msg_cache) > _FORWARD_CACHE_MAX:
-        _forward_msg_cache.popitem(last=False)
+    _adapter.forward_msg_cache[forward_id] = (now, messages)
+    while len(_adapter.forward_msg_cache) > _FORWARD_CACHE_MAX:
+        _adapter.forward_msg_cache.popitem(last=False)
     return messages
 
 
@@ -1573,7 +1491,6 @@ async def _message_to_text_with_forward(
 
 
 _EVENT_TEXT_CACHE_MAX = 128
-_event_text_cache: "OrderedDict[tuple[str, ...], str]" = OrderedDict()
 
 
 async def _event_text_with_forward(bot: Bot, event: Event) -> str:
@@ -1586,14 +1503,14 @@ async def _event_text_with_forward(bot: Bot, event: Event) -> str:
     if not _extract_forward_sources(message):
         return _message_to_text_generic(message, getattr(bot, "self_id", None))
     key = _event_identity(event)
-    cached = _event_text_cache.get(key)
+    cached = _adapter.event_text_cache.get(key)
     if cached is not None:
-        _event_text_cache.move_to_end(key)
+        _adapter.event_text_cache.move_to_end(key)
         return cached
     text = await _message_to_text_with_forward(bot, message, getattr(bot, "self_id", None))
-    _event_text_cache[key] = text
-    while len(_event_text_cache) > _EVENT_TEXT_CACHE_MAX:
-        _event_text_cache.popitem(last=False)
+    _adapter.event_text_cache[key] = text
+    while len(_adapter.event_text_cache) > _EVENT_TEXT_CACHE_MAX:
+        _adapter.event_text_cache.popitem(last=False)
     return text
 
 
@@ -1660,18 +1577,18 @@ def _remember_message_for_reply_context(event: Event) -> None:
     if message_id is None or not str(message_id).strip():
         return
     sender = getattr(event, "sender", None)
-    _reply_message_cache[str(message_id)] = {
+    _adapter.reply_message_cache[str(message_id)] = {
         "message": event.get_message() if hasattr(event, "get_message") else None,
         "raw_message": getattr(event, "raw_message", None),
         "sender": sender,
         "user_id": getattr(event, "user_id", None),
         "time": getattr(event, "time", None),
     }
-    if str(message_id) not in _reply_message_cache_order:
-        _reply_message_cache_order.append(str(message_id))
-    while len(_reply_message_cache_order) > 1000:
-        old_id = _reply_message_cache_order.popleft()
-        _reply_message_cache.pop(old_id, None)
+    if str(message_id) not in _adapter.reply_message_cache_order:
+        _adapter.reply_message_cache_order.append(str(message_id))
+    while len(_adapter.reply_message_cache_order) > 1000:
+        old_id = _adapter.reply_message_cache_order.popleft()
+        _adapter.reply_message_cache.pop(old_id, None)
 
 
 async def _get_reply_message(bot: Bot, reply_message_id: Any) -> Dict[str, Any] | None:
@@ -1719,19 +1636,19 @@ async def _resolve_reply_payload(bot: Bot, event: Event, reply_message_id: Any) 
     """
     payload = _reply_payload_from_source(getattr(event, "reply", None))
     if not _reply_payload_has_content(payload) and reply_message_id is not None:
-        _fill_reply_payload(payload, _reply_payload_from_source(_reply_message_cache.get(str(reply_message_id))))
+        _fill_reply_payload(payload, _reply_payload_from_source(_adapter.reply_message_cache.get(str(reply_message_id))))
     if not _reply_payload_has_content(payload) and reply_message_id is not None:
         _fill_reply_payload(payload, _reply_payload_from_source(await _get_reply_message(bot, reply_message_id)))
     return payload if any(value is not None for value in payload.values()) else None
 
 
-_IMAGE_EXT_BY_MIME = {
+_IMAGE_EXT_BY_MIME = MappingProxyType({
     "image/png": ".png",
     "image/jpeg": ".jpg",
     "image/gif": ".gif",
     "image/webp": ".webp",
     "image/bmp": ".bmp",
-}
+})
 
 
 def _attachment_error_text(error: str) -> str:
@@ -1761,11 +1678,10 @@ def _touch_attachment_files(attachments: Iterable[Any]) -> None:
 
 def _cleanup_old_qq_attachments(now: float | None = None) -> None:
     """清理 QQ 会话附件目录中的过期文件；默认保留 IMAGE_CACHE_TTL_SECONDS。"""
-    global _last_attachment_cleanup_at
     now = time.time() if now is None else now
-    if now - _last_attachment_cleanup_at < _ATTACHMENT_CLEANUP_INTERVAL_SEC:
+    if now - _adapter.last_attachment_cleanup_at < _ATTACHMENT_CLEANUP_INTERVAL_SEC:
         return
-    _last_attachment_cleanup_at = now
+    _adapter.last_attachment_cleanup_at = now
     root = Path(CLONOTH_WORKSPACE) / "data" / "attachments"
     if not root.exists():
         return
@@ -1806,8 +1722,8 @@ def _remember_recent_images(conversation_key: str, event: Event, attachments: Li
     sender_qq = "" if _anonymous_identity(event) else str(getattr(event, "user_id", "") or "")
     message_id = str(getattr(event, "message_id", "") or "")
     now = time.time()
-    q = _recent_images[conversation_key]
-    fq = _recent_files[conversation_key]
+    q = _adapter.recent_images[conversation_key]
+    fq = _adapter.recent_files[conversation_key]
     image_atts: list[dict[str, Any]] = []
     kept: list[dict[str, Any]] = []
     for att in attachments:
@@ -1823,8 +1739,8 @@ def _remember_recent_images(conversation_key: str, event: Event, attachments: Li
         else:
             continue
         kept.append(att_copy)
-    _recent_images.touch(conversation_key)
-    _recent_files.touch(conversation_key)
+    _adapter.recent_images.touch(conversation_key)
+    _adapter.recent_files.touch(conversation_key)
     # 引用索引收全部类型：引用一条文件消息再问，和引用图片一样是明确的指向。
     if kept and message_id:
         _remember_reply_attachments(message_id, conversation_key, sender_qq, kept, created_at=now)
@@ -1850,7 +1766,7 @@ def _remember_reply_attachments(
     _touch_attachment_files(kept)
     images = [att for att in kept if str(att.get("type") or "") != "file"]
     files = [att for att in kept if str(att.get("type") or "") == "file"]
-    _reply_attachment_cache[mid] = {
+    _adapter.reply_attachment_cache[mid] = {
         "conversation_key": str(conversation_key or ""),
         "sender_id": str(sender_id or ""),
         "created_at": now,
@@ -1866,30 +1782,30 @@ def _remember_reply_attachments(
 
 
 def _trim_reply_attachment_cache() -> None:
-    if not _reply_attachment_cache:
+    if not _adapter.reply_attachment_cache:
         return
     now = time.time()
     cutoff = now - IMAGE_CACHE_TTL_SECONDS
-    for mid, item in list(_reply_attachment_cache.items()):
+    for mid, item in list(_adapter.reply_attachment_cache.items()):
         try:
             created_at = float(item.get("created_at") or 0.0)
         except Exception:
             created_at = 0.0
         if created_at and created_at < cutoff:
-            _reply_attachment_cache.pop(mid, None)
-    while len(_reply_attachment_cache) > 1000:
+            _adapter.reply_attachment_cache.pop(mid, None)
+    while len(_adapter.reply_attachment_cache) > 1000:
         oldest = min(
-            _reply_attachment_cache,
-            key=lambda key: float(_reply_attachment_cache.get(key, {}).get("created_at") or 0.0),
+            _adapter.reply_attachment_cache,
+            key=lambda key: float(_adapter.reply_attachment_cache.get(key, {}).get("created_at") or 0.0),
         )
-        _reply_attachment_cache.pop(oldest, None)
+        _adapter.reply_attachment_cache.pop(oldest, None)
 
 
 def _forward_nodes_from_cached_reply(bot: Bot, reply_message_id: Any) -> list[dict[str, Any]]:
     mid = str(reply_message_id or "").strip()
     if not mid:
         return []
-    item = _reply_attachment_cache.get(mid)
+    item = _adapter.reply_attachment_cache.get(mid)
     if not isinstance(item, dict):
         return []
     attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else []
@@ -1910,7 +1826,7 @@ def _cached_reply_image_attachments(message_id: Any, conversation_key: str = "")
     mid = str(message_id or "").strip()
     if not mid:
         return []
-    item = _reply_attachment_cache.get(mid)
+    item = _adapter.reply_attachment_cache.get(mid)
     if not isinstance(item, dict):
         return []
     cached_conversation = str(item.get("conversation_key") or "")
@@ -1933,7 +1849,7 @@ def _cached_reply_image_attachments(message_id: Any, conversation_key: str = "")
 def _recent_images_for_text(conversation_key: str, event: Event) -> List[Dict[str, Any]]:
     """Return one unambiguous recent image batch from the current sender only."""
     return select_recent_attachment_entries(
-        _recent_images.get(conversation_key, ()),
+        _adapter.recent_images.get(conversation_key, ()),
         sender_id=_event_sender_key(event),
         now=time.time(),
         max_age_seconds=RECENT_IMAGE_MAX_AGE_SECONDS,
@@ -1944,7 +1860,7 @@ def _recent_images_for_text(conversation_key: str, event: Event) -> List[Dict[st
 def _recent_files_for_text(conversation_key: str, event: Event) -> List[Dict[str, Any]]:
     """Return one unambiguous recent file batch from the current sender only."""
     return select_recent_attachment_entries(
-        _recent_files.get(conversation_key, ()),
+        _adapter.recent_files.get(conversation_key, ()),
         sender_id=_event_sender_key(event),
         now=time.time(),
         max_age_seconds=RECENT_FILE_MAX_AGE_SECONDS,
@@ -2441,33 +2357,25 @@ def _load_custom_face_metadata_file() -> List[Dict[str, Any]]:
 
 def _current_custom_face_names() -> List[str]:
     """读取当前 AI 可见表情名，并同步进内存缓存。手动编辑文件后无需重启。"""
-    global _custom_face_names
-    _custom_face_names = _load_custom_face_names_file()
-    return list(_custom_face_names)
+    _adapter.custom_face_names = _load_custom_face_names_file()
+    return list(_adapter.custom_face_names)
 
 
 def _current_custom_face_metadata() -> List[Dict[str, Any]]:
     """读取当前收藏表情内部元数据，并同步进内存缓存。"""
-    global _custom_face_metadata
-    _custom_face_metadata = _load_custom_face_metadata_file()
-    return list(_custom_face_metadata)
-
-
-_sticker_store: Optional[StickerStore] = None
-_sticker_collector: Optional[StickerCollector] = None
-_sticker_tagger: Optional[StickerTagger] = None
+    _adapter.custom_face_metadata = _load_custom_face_metadata_file()
+    return list(_adapter.custom_face_metadata)
 
 
 def _sticker_store_handle() -> Optional[StickerStore]:
     """惰性开库。开不了就当没这个功能，不能连累消息处理。"""
-    global _sticker_store
-    if _sticker_store is None:
+    if _adapter.sticker_store is None:
         try:
-            _sticker_store = StickerStore(sticker_store_path(Path(CLONOTH_WORKSPACE)))
+            _adapter.sticker_store = StickerStore(sticker_store_path(Path(CLONOTH_WORKSPACE)))
         except Exception:
             logger.warning("表情包库打不开，相关功能停用", exc_info=True)
             return None
-    return _sticker_store
+    return _adapter.sticker_store
 
 
 def _sticker_collect_config() -> CollectConfig:
@@ -2484,14 +2392,13 @@ def _sticker_collect_config() -> CollectConfig:
 
 
 def _sticker_collector_handle() -> Optional[StickerCollector]:
-    global _sticker_collector
-    if _sticker_collector is None:
-        _sticker_collector = StickerCollector(
+    if _adapter.sticker_collector is None:
+        _adapter.sticker_collector = StickerCollector(
             Path(CLONOTH_WORKSPACE),
             config=_sticker_collect_config,
             open_store=_sticker_store_handle,
         )
-    return _sticker_collector
+    return _adapter.sticker_collector
 
 
 def _collect_stickers_from_event(
@@ -2516,15 +2423,6 @@ def _collect_stickers_from_event(
         logger.debug("表情包入队失败", exc_info=True)
 
 
-# 发图时要记"这个会话刚发过这张"，而 process_emojis 的签名里没有会话键。
-_sticker_send_conversation: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "sticker_send_conversation", default="",
-)
-_sticker_selected: contextvars.ContextVar[set[str] | None] = contextvars.ContextVar(
-    "sticker_selected", default=None,
-)
-_sticker_delivery_locks: Dict[str, tuple[asyncio.Lock, int]] = {}
-_sticker_receipt_task: asyncio.Task | None = None
 # 超过这个大小就不发了：base64 会再胀三分之一，而表情包本来就该是小图。
 _STICKER_SEND_MAX_BYTES = 3 * 1024 * 1024
 
@@ -2570,22 +2468,22 @@ def _read_sticker(row: Sticker) -> bytes:
 
 @contextlib.asynccontextmanager
 async def _serialize_sticker_delivery(conversation_key: str) -> AsyncIterator[None]:
-    lock, users = _sticker_delivery_locks.get(conversation_key, (asyncio.Lock(), 0))
-    _sticker_delivery_locks[conversation_key] = (lock, users + 1)
+    lock, users = _adapter.sticker_delivery_locks.get(conversation_key, (asyncio.Lock(), 0))
+    _adapter.sticker_delivery_locks[conversation_key] = (lock, users + 1)
     try:
         async with lock:
             yield
     finally:
-        _, users = _sticker_delivery_locks[conversation_key]
+        _, users = _adapter.sticker_delivery_locks[conversation_key]
         if users == 1:
-            del _sticker_delivery_locks[conversation_key]
+            del _adapter.sticker_delivery_locks[conversation_key]
         else:
-            _sticker_delivery_locks[conversation_key] = (lock, users - 1)
+            _adapter.sticker_delivery_locks[conversation_key] = (lock, users - 1)
 
 
 async def _reconcile_sticker_receipts(delivery_id: str = "") -> bool:
     try:
-        receipts = await _outbound_idempotency.pending_message_receipts(
+        receipts = await _adapter.outbound_idempotency.pending_message_receipts(
             limit=100, delivery_id=delivery_id,
         )
         if not receipts:
@@ -2599,8 +2497,8 @@ async def _reconcile_sticker_receipts(delivery_id: str = "") -> bool:
                     store.record_sent, receipt.conversation_key, digest,
                     delivery_id=receipt.delivery_id, sent_at=int(receipt.confirmed_at),
                 )
-            await _outbound_idempotency.ack_message_receipt(receipt.delivery_id)
-        return not await _outbound_idempotency.pending_message_receipts(
+            await _adapter.outbound_idempotency.ack_message_receipt(receipt.delivery_id)
+        return not await _adapter.outbound_idempotency.pending_message_receipts(
             limit=1, delivery_id=delivery_id,
         )
     except Exception:
@@ -2621,11 +2519,11 @@ async def _resolve_sticker(name: str) -> ResolvedSticker | str:
     try:
         if not await _reconcile_sticker_receipts():
             return ""
-        key = _sticker_send_conversation.get("")
+        key = _adapter.sticker_send_conversation.get("")
         skip = store.recently_sent(
             key, within_sec=int(live.sticker_repeat_window_sec),
         ) if key else set()
-        selected = _sticker_selected.get()
+        selected = _adapter.sticker_selected.get()
         if selected is not None:
             skip.update(selected)
         row = store.by_name(name)
@@ -2645,9 +2543,6 @@ async def _resolve_sticker(name: str) -> ResolvedSticker | str:
     except Exception:
         logger.warning("表情包取图失败: %s", name, exc_info=True)
         return ""
-
-
-_sticker_combat = CombatTracker()
 
 
 def _sticker_combat_config() -> CombatConfig:
@@ -2671,19 +2566,19 @@ async def _maybe_join_sticker_combat(
     group = str(event.group_id)
     now = time.monotonic()
     if has_image:
-        _sticker_combat.on_image(group, user=str(event.user_id), now=now, config=config)
+        _adapter.sticker_combat.on_image(group, user=str(event.user_id), now=now, config=config)
     else:
         if text.strip():
-            _sticker_combat.on_text(group, now=now)
+            _adapter.sticker_combat.on_text(group, now=now)
         return
-    if not _sticker_combat.should_battle(group, now=now, config=config):
+    if not _adapter.sticker_combat.should_battle(group, now=now, config=config):
         return
 
     conversation_key = _sticker_conversation_key({"type": "group", "group_id": int(event.group_id)}, bot)
     async with _serialize_sticker_delivery(conversation_key):
-        if not _sticker_combat.should_battle(group, now=time.monotonic(), config=config):
+        if not _adapter.sticker_combat.should_battle(group, now=time.monotonic(), config=config):
             return
-        history = list(_group_history[int(event.group_id)])[-6:]
+        history = list(_adapter.group_history[int(event.group_id)])[-6:]
         context_text = " ".join(entry.text for entry in history if entry.text)
         target = {"type": "group", "group_id": int(event.group_id), "_response_purpose": "ambient"}
         message_id = str(getattr(event, "message_id", "") or "")
@@ -2691,22 +2586,22 @@ async def _maybe_join_sticker_combat(
             event_id=f"combat:{message_id}" if message_id else "",
             conversation_key=conversation_key, purpose="ambient",
         )
-        selected_token = _sticker_selected.set(set())
+        selected_token = _adapter.sticker_selected.set(set())
         try:
             if not await _send_combat_sticker(bot, target, context_text, context, 0):
                 return
             sent_at = time.monotonic()
-            _sticker_combat.mark_battled(group, now=sent_at)
-            _sticker_combat.on_self_send(group, now=sent_at)
-            if not _sticker_combat.should_burst(
+            _adapter.sticker_combat.mark_battled(group, now=sent_at)
+            _adapter.sticker_combat.on_self_send(group, now=sent_at)
+            if not _adapter.sticker_combat.should_burst(
                 group, now=sent_at, config=config, roll=random.random(),
             ):
                 return
             await asyncio.sleep(0.9)
             if await _send_combat_sticker(bot, target, context_text, context, 1):
-                _sticker_combat.mark_burst(group, now=time.monotonic())
+                _adapter.sticker_combat.mark_burst(group, now=time.monotonic())
         finally:
-            _sticker_selected.reset(selected_token)
+            _adapter.sticker_selected.reset(selected_token)
 
 
 async def _send_combat_sticker(
@@ -2748,12 +2643,12 @@ async def _pick_combat_sticker(context_text: str, conversation_key: str) -> Reso
         recent = store.recently_sent(
             conversation_key, within_sec=int(live.sticker_repeat_window_sec),
         )
-        recent.update(_sticker_selected.get() or ())
+        recent.update(_adapter.sticker_selected.get() or ())
         result = rank(context_text, usable, recently_sent=recent, limit=len(usable))
         # generic 是闲聊闸门：语境不明确时宁可不发。
         if result.generic or result.best is None:
             return ""
-        token = _sticker_send_conversation.set(conversation_key)
+        token = _adapter.sticker_send_conversation.set(conversation_key)
         try:
             for candidate in result.items:
                 sticker = await _resolve_sticker(candidate.name)
@@ -2761,7 +2656,7 @@ async def _pick_combat_sticker(context_text: str, conversation_key: str) -> Reso
                     return sticker
             return ""
         finally:
-            _sticker_send_conversation.reset(token)
+            _adapter.sticker_send_conversation.reset(token)
     except Exception:
         logger.debug("表情包接梗选图失败", exc_info=True)
         return ""
@@ -2772,27 +2667,25 @@ def _start_sticker_tagger() -> None:
 
     每轮循环都重新读一次开关，所以关掉之后正在跑的这一批做完就停，不用重启。
     """
-    global _sticker_tagger
-    if _sticker_tagger is None:
-        _sticker_tagger = StickerTagger(
+    if _adapter.sticker_tagger is None:
+        _adapter.sticker_tagger = StickerTagger(
             Path(CLONOTH_WORKSPACE),
             config=lambda: TaggerConfig(enabled=bool(live.sticker_auto_tag)),
             open_store=_sticker_store_handle,
         )
-    _sticker_tagger.start()
+    _adapter.sticker_tagger.start()
 
 
 async def _stop_stickers() -> None:
-    global _sticker_store, _sticker_collector, _sticker_tagger
-    if _sticker_tagger is not None:
-        await _sticker_tagger.stop()
-        _sticker_tagger = None
-    if _sticker_collector is not None:
-        await _sticker_collector.stop()
-        _sticker_collector = None
-    if _sticker_store is not None:
-        _sticker_store.close()
-        _sticker_store = None
+    if _adapter.sticker_tagger is not None:
+        await _adapter.sticker_tagger.stop()
+        _adapter.sticker_tagger = None
+    if _adapter.sticker_collector is not None:
+        await _adapter.sticker_collector.stop()
+        _adapter.sticker_collector = None
+    if _adapter.sticker_store is not None:
+        _adapter.sticker_store.close()
+        _adapter.sticker_store = None
 
 
 def _sticker_prompt_entries(conversation_key: str) -> list[str]:
@@ -2887,14 +2780,13 @@ async def _sync_custom_face_names_file(bot: Bot) -> List[str]:
 
     AI 名称文件只写去重后的基础名；内部元数据保留全部同名项（带 (1)/(2) 后缀）。
     """
-    global _custom_face_names, _custom_face_metadata
     faces = await fetch_custom_face_details(bot, force=True)
-    metadata = extract_named_custom_face_metadata(faces, _bqbs)
-    names = extract_named_custom_face_names(faces, _bqbs)
+    metadata = extract_named_custom_face_metadata(faces, _adapter.bqbs)
+    names = extract_named_custom_face_names(faces, _adapter.bqbs)
     write_custom_face_names(CUSTOM_FACE_NAMES_PATH, names)
     write_custom_face_metadata(CUSTOM_FACE_METADATA_PATH, metadata)
-    _custom_face_names = names
-    _custom_face_metadata = metadata
+    _adapter.custom_face_names = names
+    _adapter.custom_face_metadata = metadata
     return names
 
 
@@ -3141,7 +3033,7 @@ async def _maybe_handle_model_command(
     if not text:
         return None
 
-    if _client is None:
+    if _adapter.client is None:
         # 不是本命令时返回 None；确实是本命令但客户端未就绪时才提示。
         if _MODEL_SWITCH_RE.match(text) or _MODEL_SHOW_RE.match(text):
             return "Clonoth Agent 尚未初始化，请稍后重试。"
@@ -3154,7 +3046,7 @@ async def _maybe_handle_model_command(
         if not allowed:
             return _capability_denial("model", event, "模型命令仅限 Clonoth 管理员使用。")
         try:
-            cfg = await _client.get_openai_config()
+            cfg = await _adapter.client.get_openai_config()
         except Exception as exc:
             logger.warning("get openai config failed: %s", exc, exc_info=True)
             return f"❌ 获取当前模型失败：{exc}"
@@ -3174,7 +3066,7 @@ async def _maybe_handle_model_command(
         if not model_name:
             return "用法：/切换模型 <模型名>"
         try:
-            out = await _client.update_openai_config(model=model_name)
+            out = await _adapter.client.update_openai_config(model=model_name)
         except Exception as exc:
             logger.warning("switch global model failed: %s", exc, exc_info=True)
             return f"❌ 切换失败：{exc}"
@@ -3372,8 +3264,8 @@ async def _maybe_handle_custom_face_command(
             return "同步表情列表失败：当前 OneBot 实现可能不支持 fetch_custom_face_detail。"
         if not names:
             return f"已同步，但没有发现已命名收藏表情。未命名表情不会写入 AI 表情列表文件：{CUSTOM_FACE_NAMES_PATH}"
-        duplicates = count_duplicate_face_names(_custom_face_metadata)
-        total = len(_custom_face_metadata)
+        duplicates = count_duplicate_face_names(_adapter.custom_face_metadata)
+        total = len(_adapter.custom_face_metadata)
         dup_note = ""
         if duplicates:
             dup_desc = "、".join(f"{name}(x{count})" for name, count in list(duplicates.items())[:20])
@@ -3410,7 +3302,7 @@ async def _maybe_handle_custom_face_command(
         limit = int(detail_match.group(1) or "50")
         limit = max(1, min(100, limit))
         try:
-            items = await list_custom_face_details(bot, _bqbs, count=max(limit, 48))
+            items = await list_custom_face_details(bot, _adapter.bqbs, count=max(limit, 48))
         except Exception as exc:
             logger.warning("list custom face details failed: %s", exc, exc_info=True)
             return "获取收藏表情详情失败：当前 OneBot 实现可能不支持 fetch_custom_face_detail。"
@@ -3432,7 +3324,7 @@ async def _maybe_handle_custom_face_command(
             return "请指定要命名的表情和新名字，例如：命名表情 3 开心"
         # 若定位词是纯基础名且存在多个同名，不直接改，列序号让管理员指定具体一个。
         try:
-            siblings = await find_custom_faces_by_base_name(bot, target, _bqbs)
+            siblings = await find_custom_faces_by_base_name(bot, target, _adapter.bqbs)
         except Exception as exc:
             logger.warning("find custom faces (rename) failed: %s", exc, exc_info=True)
             return "命名表情失败：当前 OneBot/NapCat 可能不支持 fetch_custom_face_detail。请确认 NapCat 版本支持该详情接口。"
@@ -3449,7 +3341,7 @@ async def _maybe_handle_custom_face_command(
                 + "\n也可用 md5 或 resId 精确定位。"
             )
         try:
-            face = await resolve_custom_face(bot, target, _bqbs)
+            face = await resolve_custom_face(bot, target, _adapter.bqbs)
         except Exception as exc:
             logger.warning("resolve custom face (rename) failed: %s", exc, exc_info=True)
             return "命名表情失败：当前 OneBot/NapCat 可能不支持 fetch_custom_face_detail。请确认 NapCat 版本支持该详情接口。"
@@ -3473,7 +3365,7 @@ async def _maybe_handle_custom_face_command(
         # 若输入是纯基础名（不是序号/md5/resId 这类唯一定位），且存在多个同名，
         # 则不直接删除，改为列出同名项的序号，让管理员明确指定删哪个。
         try:
-            siblings = await find_custom_faces_by_base_name(bot, name, _bqbs)
+            siblings = await find_custom_faces_by_base_name(bot, name, _adapter.bqbs)
         except Exception as exc:
             logger.warning("find custom faces (delete) failed: %s", exc, exc_info=True)
             return "删除表情失败：当前 OneBot/NapCat 可能不支持 fetch_custom_face_detail。请确认 NapCat 版本支持该详情接口。"
@@ -3490,7 +3382,7 @@ async def _maybe_handle_custom_face_command(
                 + "\n也可用 md5 或 resId 精确删除。"
             )
         try:
-            face = await resolve_custom_face(bot, name, _bqbs)
+            face = await resolve_custom_face(bot, name, _adapter.bqbs)
         except Exception as exc:
             logger.warning("resolve custom face (delete) failed: %s", exc, exc_info=True)
             return "删除表情失败：当前 OneBot/NapCat 可能不支持 fetch_custom_face_detail。请确认 NapCat 版本支持该详情接口。"
@@ -3541,18 +3433,18 @@ async def _maybe_handle_custom_face_command(
 # 管理员主动发送 / 合并转发命令
 # ---------------------------------------------------------------------------
 
-_PROACTIVE_PRIVATE_KINDS = {"私聊", "好友", "private", "pm", "user"}
-_PROACTIVE_GROUP_KINDS = {"群聊", "群", "group"}
+_PROACTIVE_PRIVATE_KINDS = frozenset({"私聊", "好友", "private", "pm", "user"})
+_PROACTIVE_GROUP_KINDS = frozenset({"群聊", "群", "group"})
 
-_PROACTIVE_HELP_WORDS = {"主动发送帮助", "主动转发帮助", "通知帮助", "转发帮助"}
-_PROACTIVE_LIST_WORDS = {"主动目标", "通知目标", "转发目标", "目标列表"}
-_PROACTIVE_PRIVATE_WORDS = {"私信", "私聊通知"}
-_PROACTIVE_GROUP_WORDS = {"群发", "群通知"}
-_PROACTIVE_FILE_WORDS = {"发文件", "发送文件"}
+_PROACTIVE_HELP_WORDS = frozenset({"主动发送帮助", "主动转发帮助", "通知帮助", "转发帮助"})
+_PROACTIVE_LIST_WORDS = frozenset({"主动目标", "通知目标", "转发目标", "目标列表"})
+_PROACTIVE_PRIVATE_WORDS = frozenset({"私信", "私聊通知"})
+_PROACTIVE_GROUP_WORDS = frozenset({"群发", "群通知"})
+_PROACTIVE_FILE_WORDS = frozenset({"发文件", "发送文件"})
 # 英文别名并进同一个集合。加了斜杠之后中英已经对等，再单开 startswith 分支
 # 就是第三份逐字相同的代码。
-_PROACTIVE_SEND_WORDS = {"发送", "通知", "主动发送", "send"}
-_PROACTIVE_FORWARD_WORDS = {"合并转发", "转发", "转发到", "转发给", "合并转发到", "合并转发给", "forward"}
+_PROACTIVE_SEND_WORDS = frozenset({"发送", "通知", "主动发送", "send"})
+_PROACTIVE_FORWARD_WORDS = frozenset({"合并转发", "转发", "转发到", "转发给", "合并转发到", "合并转发给", "forward"})
 
 
 def _normalize_target_ref(text: str) -> str:
@@ -3678,7 +3570,7 @@ async def _private_target_candidates(bot: Bot) -> list[ProactiveTarget]:
                 names_by_id[uid].append(name)
     allowed_ids = set(live.admin_users) | set(live.allowed_private_users) | friend_ids
     # 只把 profile 作为别名来源；是否允许发送仍由 allowed_ids/friend list 决定。
-    for raw_uid in _QQ_USER_PROFILES:
+    for raw_uid in _adapter.qq_user_profiles:
         try:
             uid = int(raw_uid)
         except Exception:
@@ -3990,7 +3882,7 @@ async def _send_forward_nodes(
     image_attachments: list[Any] | None = None,
 ) -> None:
     target_dict = _target_to_send_dict(target)
-    await _features.check_send(bot, target_dict)
+    await _adapter.features.check_send(bot, target_dict)
     identity = "forward-nodes:" + hashlib.sha256(
         json.dumps(nodes, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
@@ -3998,11 +3890,11 @@ async def _send_forward_nodes(
     key = make_idempotency_key(
         target_dict, identity, event_id=context.idempotency_key or context.event_id,
     )
-    claim = await _outbound_idempotency.begin(key)
+    claim = await _adapter.outbound_idempotency.begin(key)
     if not claim.acquired and claim.state == "pending":
-        resolved = await _outbound_idempotency.wait_for_resolution(key)
+        resolved = await _adapter.outbound_idempotency.wait_for_resolution(key)
         claim = (
-            await _outbound_idempotency.begin(key)
+            await _adapter.outbound_idempotency.begin(key)
             if resolved is None else IdempotencyClaim(key, False, resolved)
         )
     if not claim.acquired:
@@ -4010,7 +3902,7 @@ async def _send_forward_nodes(
     heartbeat = asyncio.create_task(_heartbeat_idempotency_claim(claim))
     try:
         async def send_forward() -> Any:
-            await _features.check_send(bot, target_dict)
+            await _adapter.features.check_send(bot, target_dict)
             if target.target_type == "group":
                 return await bot.call_api(
                     "send_group_forward_msg", group_id=int(target.target_id), messages=nodes,
@@ -4020,7 +3912,7 @@ async def _send_forward_nodes(
             )
 
         result = await protected_claim_send(
-            _outbound_idempotency,
+            _adapter.outbound_idempotency,
             claim,
             send_forward,
             sent_ttl=_sent_ttl_for_context(context),
@@ -4162,7 +4054,6 @@ async def _maybe_handle_proactive_command(
         return f"已向{label}发送合并转发（{len(nodes)} 条 node）。"
 
     return None
-
 
 
 # ---------------------------------------------------------------------------
@@ -4339,11 +4230,11 @@ async def _maybe_handle_dream_command(
         return None
     if not _can("dream", event):
         return _capability_denial("dream", event, "该请求不可用。")
-    if _client is None:
+    if _adapter.client is None:
         return "Clonoth Agent 尚未初始化，请稍后重试。"
 
     try:
-        out = await _client.run_dream_now(notify_conversation_key=conversation_key)
+        out = await _adapter.client.run_dream_now(notify_conversation_key=conversation_key)
     except Exception as exc:
         logger.warning("trigger dream failed: %s", exc, exc_info=True)
         return f"❌ 触发整理失败：{exc}"
@@ -4416,8 +4307,8 @@ async def _maybe_handle_dead_letter_command(*, event: Event, user_text: str) -> 
     if action == "unknown":
         return "用法：/发送死信 查看卡住的投递；/发送死信 清理 <编号> 放行一条；/发送死信 清理 全部。"
     if action == "list":
-        claims = await _outbound_idempotency.ambiguous_claims(limit=_DEAD_LETTER_LIST_LIMIT)
-        total = await _outbound_idempotency.ambiguous_count()
+        claims = await _adapter.outbound_idempotency.ambiguous_claims(limit=_DEAD_LETTER_LIST_LIMIT)
+        total = await _adapter.outbound_idempotency.ambiguous_count()
         if not claims:
             return "当前没有卡住的投递记录。"
         header = f"【卡住的投递（共 {total} 条，显示前 {_DEAD_LETTER_LIST_LIMIT} 条）】"
@@ -4427,14 +4318,14 @@ async def _maybe_handle_dead_letter_command(*, event: Event, user_text: str) -> 
         )
         return f"{header}\n{_format_dead_letter_lines(claims)}\n\n{usage}"
     if action == "clear_all":
-        count = await _outbound_idempotency.clear_all_ambiguous()
+        count = await _adapter.outbound_idempotency.clear_all_ambiguous()
         logger.warning(
             "onebot_dead_letter_cleared",
             extra={"idempotency_key": "*", "operator": str(getattr(event, "user_id", "")), "count": count},
         )
         return f"已放行 {count} 条。其中任意一条都可能已经送到过，重发会重复。"
     candidates = [
-        claim for claim in await _outbound_idempotency.ambiguous_claims(limit=0)
+        claim for claim in await _adapter.outbound_idempotency.ambiguous_claims(limit=0)
         if claim.handle.startswith(arg)
     ]
     if not candidates:
@@ -4442,7 +4333,7 @@ async def _maybe_handle_dead_letter_command(*, event: Event, user_text: str) -> 
     if len(candidates) > 1:
         return "编号不唯一，请多输几位。"
     claim = candidates[0]
-    if not await _outbound_idempotency.clear_ambiguous(claim.key):
+    if not await _adapter.outbound_idempotency.clear_ambiguous(claim.key):
         return "没有这个编号的记录，可能已到期自动放行。"
     logger.warning(
         "onebot_dead_letter_cleared",
@@ -4455,9 +4346,9 @@ async def _maybe_handle_dead_letter_command(*, event: Event, user_text: str) -> 
 def _append_group_history(group_id: int, line: str) -> int:
     """把一行写入群历史缓存并返回它的序号。所有写入点都必须走这里。"""
     gid = int(group_id)
-    seq = _group_history_seq[gid] + 1
-    _group_history_seq[gid] = seq
-    lines = _group_history[gid]
+    seq = _adapter.group_history_seq[gid] + 1
+    _adapter.group_history_seq[gid] = seq
+    lines = _adapter.group_history[gid]
     _evict_delivered_history(gid, lines)
     if lines.maxlen and len(lines) == lines.maxlen:
         # group_history_max 允许配 0（关掉群历史），那不是缺口，所以先看 maxlen。
@@ -4479,9 +4370,9 @@ def _note_history_gap(group_id: int, dropped_seq: int) -> None:
     gid = int(group_id)
     if int(dropped_seq) <= _group_history_watermark(gid):
         return
-    if gid not in _group_history_gap:
+    if gid not in _adapter.group_history_gap:
         logger.warning("QQ group history overflow: group=%s dropped undelivered seq=%s", gid, dropped_seq)
-    _group_history_gap[gid] = max(_group_history_gap.get(gid, 0), int(dropped_seq))
+    _adapter.group_history_gap[gid] = max(_adapter.group_history_gap.get(gid, 0), int(dropped_seq))
 
 
 def _group_history_lost(group_id: int, watermark: int) -> int:
@@ -4490,14 +4381,14 @@ def _group_history_lost(group_id: int, watermark: int) -> int:
     seq 从 1 开始逐 1 递增，缺的是 (watermark, gap] 这一段；水位 -1（什么都没送出去）
     要按 0 算，否则第一行会被多数一条。
     """
-    return max(0, _group_history_gap.get(int(group_id), 0) - max(int(watermark), 0))
+    return max(0, _adapter.group_history_gap.get(int(group_id), 0) - max(int(watermark), 0))
 
 
 def _group_history_watermark(group_id: int) -> int:
     """engine 侧已确认收到的最大群历史序号；-1 表示这一轮要带完整历史。"""
-    if _session_state is None:
+    if _adapter.session_state is None:
         return -1
-    return _session_state.get_high_watermark(int(group_id))
+    return _adapter.session_state.get_high_watermark(int(group_id))
 
 
 def _reset_group_history_watermark(group_id: int) -> None:
@@ -4505,18 +4396,17 @@ def _reset_group_history_watermark(group_id: int) -> None:
 
     会话键对 SDK 不透明，SDK 不碰水位；上下文重置时只有这里知道对应哪个群。
     """
-    if _session_state is not None:
-        _session_state.reset_channel_watermark(int(group_id))
+    if _adapter.session_state is not None:
+        _adapter.session_state.reset_channel_watermark(int(group_id))
     # 缺口是按旧水位算出来的差值，水位一被重定义它就不再成立。
-    _group_history_gap.pop(int(group_id), None)
+    _adapter.group_history_gap.pop(int(group_id), None)
 
 
 def _note_inbound_seq(seq: Any) -> None:
     """记下见过的最大 inbound 序号。清空上下文时拿它划界。"""
-    global _last_inbound_seq
     value = int(seq or 0)
-    if value > _last_inbound_seq:
-        _last_inbound_seq = value
+    if value > _adapter.last_inbound_seq:
+        _adapter.last_inbound_seq = value
 
 
 def _raise_context_clear_barrier(group_id: int, cleaned_triggers: Any = None) -> None:
@@ -4525,14 +4415,14 @@ def _raise_context_clear_barrier(group_id: int, cleaned_triggers: Any = None) ->
         int(getattr(trigger, "inbound_seq", 0) or 0)
         for trigger in (cleaned_triggers or [])
     ]
-    _context_clear_barrier[int(group_id)] = max([_last_inbound_seq, *seqs])
+    _adapter.context_clear_barrier[int(group_id)] = max([_adapter.last_inbound_seq, *seqs])
 
 
 def _is_stale_delivery(group_id: Any, send_context: Any) -> bool:
     """这次投递是不是清空之前那段上下文的产物。"""
     if group_id is None:
         return False
-    barrier = _context_clear_barrier.get(int(group_id), 0)
+    barrier = _adapter.context_clear_barrier.get(int(group_id), 0)
     if not barrier:
         return False
     seq = int(getattr(send_context, "source_inbound_seq", 0) or 0)
@@ -4545,21 +4435,21 @@ def _purge_conversation_side_state(conversation_key: str, target: Dict[str, Any]
 
     只在 clear 语义下调用 —— 漏掉任何一份，重置后它都会把旧上下文重新喂回模型。
     """
-    _recent_images.pop(conversation_key, None)
-    _recent_files.pop(conversation_key, None)
-    _sticky_subjects.pop(conversation_key, None)
+    _adapter.recent_images.pop(conversation_key, None)
+    _adapter.recent_files.pop(conversation_key, None)
+    _adapter.sticky_subjects.pop(conversation_key, None)
     bucket = _sent_attachment_bucket_key(target) or f"conv:{conversation_key}"
-    _recent_sent_attachments.pop(bucket, None)
-    _sent_attachment_seq.pop(bucket, None)
-    _features.coordinator.clear_context(conversation_key)
-    _features.burst_store.clear_scope(conversation_key)
+    _adapter.recent_sent_attachments.pop(bucket, None)
+    _adapter.sent_attachment_seq.pop(bucket, None)
+    _adapter.features.coordinator.clear_context(conversation_key)
+    _adapter.features.burst_store.clear_scope(conversation_key)
     group_id = target.get("group_id")
     if target.get("type") == "group" and group_id is not None:
-        _group_history.pop(int(group_id), None)
+        _adapter.group_history.pop(int(group_id), None)
         # qq_forward 的转发候选是群历史的第二份副本，只清前者等于没清。
-        _group_content_records.pop(int(group_id), None)
+        _adapter.group_content_records.pop(int(group_id), None)
         # 清了会话还让它继续静默没有道理：运营者刚说「重新开始」，下一句就该有人应。
-        _trigger_cooldown.forget_group(group_id)
+        _adapter.trigger_cooldown.forget_group(group_id)
     _remove_conversation_attachment_dir(conversation_key)
 
 
@@ -4627,7 +4517,7 @@ def _append_group_record(
     """
     gid = int(group_id)
     seq = _append_group_history(gid, line)
-    _group_content_records[gid].append(GroupContentRecord(
+    _adapter.group_content_records[gid].append(GroupContentRecord(
         formatted_line=line,
         text=text,
         sender_name=sender_name,
@@ -4811,17 +4701,16 @@ def _mark_anon_map_dirty() -> None:
     时，只调度一个延迟 flush task（已存在则复用），把这段时间内的多次登记合并成一次写盘。
     关闭时的显式 flush 仍会强制写入最新别名。
     """
-    global _anon_map_dirty, _anon_map_save_task
-    _anon_map_dirty = True
+    _adapter.anon_map_dirty = True
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         # 没有运行中的事件循环（如同步测试上下文），保持 dirty，由下次显式保存处理。
         return
     # 已有等待中的 flush task 时直接复用，避免重复调度。
-    if _anon_map_save_task is not None and not _anon_map_save_task.done():
+    if _adapter.anon_map_save_task is not None and not _adapter.anon_map_save_task.done():
         return
-    _anon_map_save_task = loop.create_task(_anon_map_save_throttled())
+    _adapter.anon_map_save_task = loop.create_task(_anon_map_save_throttled())
 
 
 async def _anon_map_save_throttled() -> None:
@@ -4830,13 +4719,12 @@ async def _anon_map_save_throttled() -> None:
     为何固定等待而不是“距上次写盘”计算：后者在首次/间隔已满足时会立即写，
     导致高频场景下每隔一个间隔就写一次；固定等待一个窗口能保证“窗口内只写一次”。
     """
-    global _anon_map_save_task
     try:
         if _ANON_MAP_SAVE_MIN_INTERVAL > 0:
             await asyncio.sleep(_ANON_MAP_SAVE_MIN_INTERVAL)
         await _save_anon_map()
     finally:
-        _anon_map_save_task = None
+        _adapter.anon_map_save_task = None
 
 
 def _coerce_last_seen(value: Any) -> float:
@@ -4848,12 +4736,11 @@ def _coerce_last_seen(value: Any) -> float:
 
 
 def _load_anon_map() -> None:
-    """以文件为准恢复 _anon_users/_anon_groups、反向表及“下一个编号”计数器。
+    """以文件为准恢复 anon_users/anon_groups、反向表及“下一个编号”计数器。
 
     2026-07-09 新增：匿名别名映射持久化，保障跨重启同一人/群别名一致与可反解。
     加载优先从持久化的 next 计数器恢复；若旧文件无该字段，则根据已有别名推断。
     """
-    global _anon_user_next, _anon_group_next
     path = Path(ANON_MAP_FILE)
     if not path.exists():
         return
@@ -4881,9 +4768,9 @@ def _load_anon_map() -> None:
             if real in _ANONYMOUS_PLACEHOLDER_QQ_IDS or (real.isdigit() and not _is_plausible_qq_id(real)):
                 skipped_dirty += 1
                 continue
-            _anon_users[real] = alias
-            _anon_user_reverse[alias] = real
-            _anon_user_last_seen[real] = _coerce_last_seen(item.get("last_seen"))
+            _adapter.anon_users[real] = alias
+            _adapter.anon_user_reverse[alias] = real
+            _adapter.anon_user_last_seen[real] = _coerce_last_seen(item.get("last_seen"))
             max_user_idx = max(max_user_idx, _alias_to_index("User", alias))
     if skipped_dirty:
         _mark_anon_map_dirty()
@@ -4899,33 +4786,33 @@ def _load_anon_map() -> None:
             alias = str(item.get("alias") or "").strip()
             if not alias:
                 continue
-            _anon_groups[real] = alias
-            _anon_group_reverse[alias] = real
-            _anon_group_last_seen[real] = _coerce_last_seen(item.get("last_seen"))
+            _adapter.anon_groups[real] = alias
+            _adapter.anon_group_reverse[alias] = real
+            _adapter.anon_group_last_seen[real] = _coerce_last_seen(item.get("last_seen"))
             max_group_idx = max(max_group_idx, _alias_to_index("Group", alias))
 
     # 下一个编号：优先用文件里显式保存的 next；否则用“最大已用 index + 1”兼容旧文件。
     try:
-        _anon_user_next = max(int(data.get("user_next", 0) or 0), max_user_idx + 1)
+        _adapter.anon_user_next = max(int(data.get("user_next", 0) or 0), max_user_idx + 1)
     except Exception:
-        _anon_user_next = max_user_idx + 1
+        _adapter.anon_user_next = max_user_idx + 1
     try:
-        _anon_group_next = max(int(data.get("group_next", 0) or 0), max_group_idx + 1)
+        _adapter.anon_group_next = max(int(data.get("group_next", 0) or 0), max_group_idx + 1)
     except Exception:
-        _anon_group_next = max_group_idx + 1
-    _anon_user_next = max(0, _anon_user_next)
-    _anon_group_next = max(0, _anon_group_next)
+        _adapter.anon_group_next = max_group_idx + 1
+    _adapter.anon_user_next = max(0, _adapter.anon_user_next)
+    _adapter.anon_group_next = max(0, _adapter.anon_group_next)
     # 剪枝必须在 next 计数器恢复之后：先剪会让 max_*_idx 变小，旧文件恢复的 next 回退，别名被复用。
     pruned = _prune_anon_map()
     _invalidate_anon_text_pattern()
     logger.info(
         "loaded OneBot anon map from %s (users=%d groups=%d pruned=%d)",
-        path, len(_anon_users), len(_anon_groups), pruned,
+        path, len(_adapter.anon_users), len(_adapter.anon_groups), pruned,
     )
-    if len(_anon_users) + len(_anon_groups) > _ANON_MAP_LARGE_WARN:
+    if len(_adapter.anon_users) + len(_adapter.anon_groups) > _ANON_MAP_LARGE_WARN:
         logger.warning(
             "OneBot anon map has %d entries; consider setting ONEBOT_ANON_MAP_RETENTION_DAYS to enable pruning",
-            len(_anon_users) + len(_anon_groups),
+            len(_adapter.anon_users) + len(_adapter.anon_groups),
         )
 
 
@@ -4941,8 +4828,8 @@ def _prune_anon_map() -> int:
     protected = set(memory_subjects.enrolled_subjects(Path(CLONOTH_WORKSPACE)))
     removed = 0
     for store, last_seen, reverse in (
-        (_anon_users, _anon_user_last_seen, _anon_user_reverse),
-        (_anon_groups, _anon_group_last_seen, _anon_group_reverse),
+        (_adapter.anon_users, _adapter.anon_user_last_seen, _adapter.anon_user_reverse),
+        (_adapter.anon_groups, _adapter.anon_group_last_seen, _adapter.anon_group_reverse),
     ):
         stale = [
             real for real, alias in store.items()
@@ -4961,10 +4848,9 @@ def _prune_anon_map() -> int:
 
 
 async def _save_anon_map() -> None:
-    """把匿名别名映射原子写入单独文件；复用 _route_state_lock + tmp→replace。"""
-    global _anon_map_dirty, _anon_map_last_saved_at
-    async with _route_state_lock:
-        if not _anon_map_dirty:
+    """把匿名别名映射原子写入单独文件；复用 route_state_lock + tmp→replace。"""
+    async with _adapter.route_state_lock:
+        if not _adapter.anon_map_dirty:
             return
         path = Path(ANON_MAP_FILE)
         now = time.time()
@@ -4973,22 +4859,22 @@ async def _save_anon_map() -> None:
             data = {
                 "version": 1,
                 "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                "user_next": _anon_user_next,
-                "group_next": _anon_group_next,
+                "user_next": _adapter.anon_user_next,
+                "group_next": _adapter.anon_group_next,
                 "users": {
-                    real: {"alias": alias, "last_seen": _anon_user_last_seen.get(real, now)}
-                    for real, alias in _anon_users.items()
+                    real: {"alias": alias, "last_seen": _adapter.anon_user_last_seen.get(real, now)}
+                    for real, alias in _adapter.anon_users.items()
                 },
                 "groups": {
-                    real: {"alias": alias, "last_seen": _anon_group_last_seen.get(real, now)}
-                    for real, alias in _anon_groups.items()
+                    real: {"alias": alias, "last_seen": _adapter.anon_group_last_seen.get(real, now)}
+                    for real, alias in _adapter.anon_groups.items()
                 },
             }
             tmp = path.with_suffix(path.suffix + ".tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             tmp.replace(path)
-            _anon_map_dirty = False
-            _anon_map_last_saved_at = time.time()
+            _adapter.anon_map_dirty = False
+            _adapter.anon_map_last_saved_at = time.time()
         except Exception:
             logger.warning("failed to save OneBot anon map: %s", path, exc_info=True)
 
@@ -5026,7 +4912,6 @@ def _touch_anon_seen(store: Dict[str, float], real: str) -> None:
 
 
 def _anonymize_user_id(user_id: Any) -> str:
-    global _anon_user_next
     real = str(user_id or "").strip()
     if not real:
         return "UserUnknown"
@@ -5036,32 +4921,31 @@ def _anonymize_user_id(user_id: Any) -> str:
     # 不把明显非法的短数字（如 qq=1）登记进永存匿名表，避免脏号占用稳定别名并回流到群里。
     if real.isdigit() and not _is_plausible_qq_id(real):
         return "UserUnknown"
-    alias = _anon_users.get(real)
+    alias = _adapter.anon_users.get(real)
     if alias is None:
-        alias = _alias_from_index("User", _anon_user_next)
-        _anon_user_next += 1
-        _anon_users[real] = alias
-        _anon_user_reverse[alias] = real
+        alias = _alias_from_index("User", _adapter.anon_user_next)
+        _adapter.anon_user_next += 1
+        _adapter.anon_users[real] = alias
+        _adapter.anon_user_reverse[alias] = real
         _invalidate_anon_text_pattern()
         _mark_anon_map_dirty()
-    _touch_anon_seen(_anon_user_last_seen, real)
+    _touch_anon_seen(_adapter.anon_user_last_seen, real)
     return alias
 
 
 def _anonymize_group_id(group_id: Any) -> str:
-    global _anon_group_next
     real = str(group_id or "").strip()
     if not real:
         return "GroupUnknown"
-    alias = _anon_groups.get(real)
+    alias = _adapter.anon_groups.get(real)
     if alias is None:
-        alias = _alias_from_index("Group", _anon_group_next)
-        _anon_group_next += 1
-        _anon_groups[real] = alias
-        _anon_group_reverse[alias] = real
+        alias = _alias_from_index("Group", _adapter.anon_group_next)
+        _adapter.anon_group_next += 1
+        _adapter.anon_groups[real] = alias
+        _adapter.anon_group_reverse[alias] = real
         _invalidate_anon_text_pattern()
         _mark_anon_map_dirty()
-    _touch_anon_seen(_anon_group_last_seen, real)
+    _touch_anon_seen(_adapter.anon_group_last_seen, real)
     return alias
 
 
@@ -5075,7 +4959,7 @@ def _enrolled_subject_display_names() -> Dict[str, str]:
     workspace = Path(CLONOTH_WORKSPACE)
     names = dict(memory_subjects.subject_display_names(workspace))
     for alias in memory_subjects.enrolled_subjects(workspace):
-        real = _anon_user_reverse.get(alias)
+        real = _adapter.anon_user_reverse.get(alias)
         if not real:
             continue
         display = _qq_profile_display_name(real)
@@ -5104,7 +4988,6 @@ def _record_memory_subject_interaction(event: Event, direct: bool = True) -> str
 
 _SUBJECT_STICKY_TTL_SEC = 300.0
 _SUBJECT_STICKY_MAX_KEYS = 512
-_sticky_subjects: "OrderedDict[str, tuple[float, List[str]]]" = OrderedDict()
 
 
 def _sticky_memory_subjects(conversation_key: str, subjects: List[str]) -> List[str]:
@@ -5114,11 +4997,11 @@ def _sticky_memory_subjects(conversation_key: str, subjects: List[str]) -> List[
     召回不到。存回去的始终是本轮实际出现的人，不含继承来的 —— 否则谁进来一次就永久驻留。
     """
     now = time.monotonic()
-    prev_at, prev = _sticky_subjects.get(conversation_key, (0.0, []))
-    _sticky_subjects[conversation_key] = (now, list(subjects))
-    _sticky_subjects.move_to_end(conversation_key)
-    while len(_sticky_subjects) > _SUBJECT_STICKY_MAX_KEYS:
-        _sticky_subjects.popitem(last=False)
+    prev_at, prev = _adapter.sticky_subjects.get(conversation_key, (0.0, []))
+    _adapter.sticky_subjects[conversation_key] = (now, list(subjects))
+    _adapter.sticky_subjects.move_to_end(conversation_key)
+    while len(_adapter.sticky_subjects) > _SUBJECT_STICKY_MAX_KEYS:
+        _adapter.sticky_subjects.popitem(last=False)
     if now - prev_at > _SUBJECT_STICKY_TTL_SEC:
         return list(subjects)
     merged = list(subjects)
@@ -5157,7 +5040,7 @@ def _resolve_at_alias_to_real(token: str) -> str:
     2026-07-14 新增：模型看到的是匿名别名（UserA/UserAF）或群昵称/显示名，
     会输出 [at:UserAF] 而非真实 QQ 号。emoji_handler 在遇到非数字 token 时
     回调本函数：
-      1. 先按匿名反向表 _anon_user_reverse 精确匹配别名 -> 真实 QQ 号；
+      1. 先按匿名反向表 anon_user_reverse 精确匹配别名 -> 真实 QQ 号；
       2. 再按已知用户 profile 的显示名/群名片/别名尝试匹配。
     解析不到时返回空串，由 emoji_handler 回退为可读文本。
     """
@@ -5172,13 +5055,13 @@ def _resolve_at_alias_to_real(token: str) -> str:
     if raw.isdigit():
         return raw
     # 1) 匿名别名精确反查（UserA/UserAF 等）。
-    real = _anon_user_reverse.get(raw)
+    real = _adapter.anon_user_reverse.get(raw)
     if real:
         return str(real)
     # 2) 按已知用户 profile 的显示名/别名匹配（忽略大小写与首尾空白）。
     norm = raw.casefold()
     try:
-        for uid in list(_QQ_USER_PROFILES.keys()):
+        for uid in list(_adapter.qq_user_profiles.keys()):
             names = [_qq_profile_display_name(uid) or ""]
             names.extend(_profile_aliases_for_user(uid))
             for name in names:
@@ -5189,13 +5072,8 @@ def _resolve_at_alias_to_real(token: str) -> str:
     return ""
 
 
-_anon_text_pattern: Optional["re.Pattern[str]"] = None
-_anon_text_replacements: Dict[str, str] = {}
-
-
 def _invalidate_anon_text_pattern() -> None:
-    global _anon_text_pattern
-    _anon_text_pattern = None
+    _adapter.anon_text_pattern = None
 
 
 def _anon_text_pattern_and_map() -> tuple[Optional["re.Pattern[str]"], Dict[str, str]]:
@@ -5204,20 +5082,19 @@ def _anon_text_pattern_and_map() -> tuple[Optional["re.Pattern[str]"], Dict[str,
     逐条 re.sub 在映射表超过 re 模块 512 条编译缓存后每次调用都要重新编译，
     而本函数在每条入站消息上会被调用多次。
     """
-    global _anon_text_pattern, _anon_text_replacements
-    if _anon_text_pattern is not None:
-        return _anon_text_pattern, _anon_text_replacements
-    mapping: Dict[str, str] = dict(_anon_users)
+    if _adapter.anon_text_pattern is not None:
+        return _adapter.anon_text_pattern, _adapter.anon_text_replacements
+    mapping: Dict[str, str] = dict(_adapter.anon_users)
     # 群号与 QQ 号字面相同时按群号替换，与旧的"先群后人"两趟顺序保持一致。
-    mapping.update(_anon_groups)
+    mapping.update(_adapter.anon_groups)
     if not mapping:
         return None, {}
     keys = sorted(mapping, key=len, reverse=True)
-    _anon_text_replacements = mapping
-    _anon_text_pattern = re.compile(
+    _adapter.anon_text_replacements = mapping
+    _adapter.anon_text_pattern = re.compile(
         rf"(?<!\d)(?:{'|'.join(re.escape(key) for key in keys)})(?!\d)"
     )
-    return _anon_text_pattern, _anon_text_replacements
+    return _adapter.anon_text_pattern, _adapter.anon_text_replacements
 
 
 def _anonymize_text_for_ai(text: str) -> str:
@@ -5225,7 +5102,7 @@ def _anonymize_text_for_ai(text: str) -> str:
 
     2026-07-09 修改原因：原实现用 `_SENSITIVE_ID_RE`（5~12 位数字）兜底匿名化，
     会把金额、验证码、订单号、日期等普通数字误伤成 UserX，导致模型收到失真内容。
-    做法改为"已知 ID 精确替换"：只替换 `_anon_groups` / `_anon_users` 映射表里
+    做法改为"已知 ID 精确替换"：只替换 `anon_groups` / `anon_users` 映射表里
     真实出现过、并已在采集入口登记的群号/QQ 号；不再对任意数字串做泛匹配。
     目的是在保证"上下文里真实存在的隐私标识仍被匿名"的同时，避免误伤日常数字。
     注意：真正需要匿名的 QQ 号/群号必须在采集入口（发送者、@某人、引用消息、
@@ -5249,13 +5126,8 @@ _CONVERSATION_SECRET, CONVERSATION_DIGEST_SALTED = resolve_secret(
 )
 
 
-# 当前登录的 QQ 号，参与会话键摘要。进程启动时从盘上读回来：等第一条消息才知道
-# 账号的话，那之前算出的键会落在空作用域里，记忆静默分叉成两份。
-_ACTIVE_BOT_SCOPE: str = _bot_scope.load_scope(Path(CLONOTH_WORKSPACE))
-
-
 def _active_bot_scope() -> str:
-    return _ACTIVE_BOT_SCOPE
+    return _adapter.active_bot_scope
 
 
 def _purge_account_scoped_caches() -> None:
@@ -5264,33 +5136,32 @@ def _purge_account_scoped_caches() -> None:
     群历史会直接进新号第一条 inbound 的上下文；成员名片、复读判定、冷却窗口也都是
     旧号看见的样子。按会话键分桶的那些换号后自然另起，不在此列。
     """
-    _group_history.clear()
-    _group_history_seq.clear()
-    _group_history_gap.clear()
-    _context_clear_barrier.clear()
+    _adapter.group_history.clear()
+    _adapter.group_history_seq.clear()
+    _adapter.group_history_gap.clear()
+    _adapter.context_clear_barrier.clear()
     # qq_forward 的转发候选是群历史的第二份副本，只清前者等于没清。
-    _group_content_records.clear()
-    _echo_recent.clear()
-    _echo_last.clear()
-    _group_member_cache.clear()
-    _trigger_cooldown.forget_all()
+    _adapter.group_content_records.clear()
+    _adapter.echo_recent.clear()
+    _adapter.echo_last.clear()
+    _adapter.group_member_cache.clear()
+    _adapter.trigger_cooldown.forget_all()
 
 
 def _adopt_bot_scope(bot: Any) -> None:
     """记住当前账号；换号时丢掉按旧账号算出的键缓存，让它们按新作用域重算。"""
-    global _ACTIVE_BOT_SCOPE
     raw_self_id = getattr(bot, "self_id", None)
     scope = _bot_scope.normalize(raw_self_id)
     if not scope:
         _warn_unscoped_self_id(raw_self_id)
         return
-    if scope == _ACTIVE_BOT_SCOPE:
+    if scope == _adapter.active_bot_scope:
         return
-    previous = _ACTIVE_BOT_SCOPE
-    _ACTIVE_BOT_SCOPE = scope
+    previous = _adapter.active_bot_scope
+    _adapter.active_bot_scope = scope
     _bot_scope.save_scope(Path(CLONOTH_WORKSPACE), scope)
     # real→stable 必须重算。反向表留着：旧键的在途回调还要靠它找回真实会话。
-    _stable_conversation_keys.clear()
+    _adapter.stable_conversation_keys.clear()
     _purge_account_scoped_caches()
     logger.warning(
         "QQ account changed (%s -> %s): conversations and memory now use a separate namespace",
@@ -5298,18 +5169,15 @@ def _adopt_bot_scope(bot: Any) -> None:
     )
 
 
-_REFUSED_SELF_IDS: set[str] = set()
-
-
 def _warn_unscoped_self_id(raw_self_id: Any) -> None:
     """账号 ID 不合法时不加作用域，但必须说出来：多账号隔离被关掉不能是静默的。"""
     text = str(raw_self_id if raw_self_id is not None else "").strip()
-    if not text or text in _REFUSED_SELF_IDS:
+    if not text or text in _adapter.refused_self_ids:
         return
-    _REFUSED_SELF_IDS.add(text)
+    _adapter.refused_self_ids.add(text)
     logger.warning(
         "QQ self_id %r is not a valid account id; conversations stay in scope %s",
-        text[:64], _ACTIVE_BOT_SCOPE or "<none>",
+        text[:64], _adapter.active_bot_scope or "<none>",
     )
 
 
@@ -5338,7 +5206,7 @@ def _current_scope_keys() -> List[str]:
     它拿集合做归类就行，不必知道密钥。
     """
     keys: set[str] = set()
-    for real in set(_real_conversation_keys.values()):
+    for real in set(_adapter.real_conversation_keys.values()):
         try:
             keys.add(_scoped_stable_key(str(real)))
         except Exception:
@@ -5357,13 +5225,13 @@ def _stable_conversation_key(real_conversation_key: str) -> str:
     else:
         prefix = "qq_unknown"
     stable = f"{prefix}:{_conversation_digest(real_conversation_key)}"
-    _real_conversation_keys[stable] = real_conversation_key
-    _stable_conversation_keys[real_conversation_key] = stable
+    _adapter.real_conversation_keys[stable] = real_conversation_key
+    _adapter.stable_conversation_keys[real_conversation_key] = stable
     return stable
 
 
 def _real_conversation_key(conversation_key: str) -> str:
-    return _real_conversation_keys.get(conversation_key, conversation_key)
+    return _adapter.real_conversation_keys.get(conversation_key, conversation_key)
 
 
 def _serializable_target(target: Dict[str, Any]) -> Dict[str, Any]:
@@ -5387,30 +5255,30 @@ def _load_route_state() -> None:
 
     real_map = data.get("real_conversation_keys")
     if isinstance(real_map, dict):
-        _real_conversation_keys.update({str(k): str(v) for k, v in real_map.items() if str(k) and str(v)})
-        _stable_conversation_keys.update({str(v): str(k) for k, v in _real_conversation_keys.items() if str(k) and str(v)})
+        _adapter.real_conversation_keys.update({str(k): str(v) for k, v in real_map.items() if str(k) and str(v)})
+        _adapter.stable_conversation_keys.update({str(v): str(k) for k, v in _adapter.real_conversation_keys.items() if str(k) and str(v)})
 
     targets = data.get("session_targets")
     if isinstance(targets, dict):
         for sid, target in targets.items():
             if isinstance(target, dict):
-                _persisted_session_targets[str(sid)] = _serializable_target(target)
+                _adapter.persisted_session_targets[str(sid)] = _serializable_target(target)
 
     logger.info("loaded OneBot route state from %s", path)
 
 
 async def _save_route_state() -> None:
     """保存本地路由状态，保障 bot.py 重启后能把 stable key 映射回真实 QQ 目标。"""
-    async with _route_state_lock:
+    async with _adapter.route_state_lock:
         path = Path(ONEBOT_STATE_FILE)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             data = {
                 "version": 1,
-                "real_conversation_keys": dict(_real_conversation_keys),
+                "real_conversation_keys": dict(_adapter.real_conversation_keys),
                 "session_targets": {
                     sid: _serializable_target(target)
-                    for sid, target in {**_persisted_session_targets, **_session_targets}.items()
+                    for sid, target in {**_adapter.persisted_session_targets, **_adapter.session_targets}.items()
                     if isinstance(target, dict)
                 },
             }
@@ -5463,7 +5331,7 @@ def _load_reply_attachment_cache() -> None:
         attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else []
         if not attachments or (created_at and created_at < cutoff):
             continue
-        _reply_attachment_cache[str(mid)] = {
+        _adapter.reply_attachment_cache[str(mid)] = {
             "conversation_key": str(item.get("conversation_key") or ""),
             "sender_id": str(item.get("sender_id") or ""),
             "created_at": created_at or now,
@@ -5477,7 +5345,7 @@ def _load_reply_attachment_cache() -> None:
 
 async def _save_reply_attachment_cache() -> None:
     """保存引用消息附件索引到独立缓存文件。"""
-    async with _route_state_lock:
+    async with _adapter.route_state_lock:
         _trim_reply_attachment_cache()
         path = Path(REPLY_ATTACHMENT_CACHE_FILE)
         try:
@@ -5486,7 +5354,7 @@ async def _save_reply_attachment_cache() -> None:
                 "version": 1,
                 "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "ttl_seconds": IMAGE_CACHE_TTL_SECONDS,
-                "reply_attachments": dict(_reply_attachment_cache),
+                "reply_attachments": dict(_adapter.reply_attachment_cache),
             }
             tmp = path.with_suffix(path.suffix + ".tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -5503,10 +5371,10 @@ async def _remember_route_state(
     target: Optional[Dict[str, Any]] = None,
 ) -> None:
     if stable_conversation_key and real_conversation_key:
-        _real_conversation_keys[stable_conversation_key] = real_conversation_key
-        _stable_conversation_keys[real_conversation_key] = stable_conversation_key
+        _adapter.real_conversation_keys[stable_conversation_key] = real_conversation_key
+        _adapter.stable_conversation_keys[real_conversation_key] = stable_conversation_key
     if session_id and target:
-        _persisted_session_targets[session_id] = _serializable_target(target)
+        _adapter.persisted_session_targets[session_id] = _serializable_target(target)
     await _save_route_state()
 
 
@@ -5641,7 +5509,7 @@ def _group_trigger_decision(event: GroupMessageEvent, bot: Bot, text: str) -> Tr
     return trigger_evaluate(
         _trigger_input(event, bot, text),
         TriggerConfig.from_live(live),
-        _trigger_cooldown,
+        _adapter.trigger_cooldown,
     )
 
 
@@ -5652,18 +5520,18 @@ def _group_trigger_decision_once(event: GroupMessageEvent, bot: Bot, text: str) 
     配置快照、结算一次随机骰子 —— 判第二遍是纯重复，而且结论必须逐字相同。
     """
     key = _event_identity(event) + (text or "",)
-    cached = _trigger_decisions.get(key)
+    cached = _adapter.trigger_decisions.get(key)
     if cached is not None:
-        _trigger_decisions.move_to_end(key)
+        _adapter.trigger_decisions.move_to_end(key)
         return cached
     decision = _group_trigger_decision(event, bot, text)
     if decision.triggered:
         # 接手了就没人会再判它（后面的 matcher 都被 block 掉）。这种结论存下来只会让重复
         # 投递的同一个事件绕过刚记下的冷却。
         return decision
-    _trigger_decisions[key] = decision
-    while len(_trigger_decisions) > _TRIGGER_DECISION_CACHE_MAX:
-        _trigger_decisions.popitem(last=False)
+    _adapter.trigger_decisions[key] = decision
+    while len(_adapter.trigger_decisions) > _TRIGGER_DECISION_CACHE_MAX:
+        _adapter.trigger_decisions.popitem(last=False)
     return decision
 
 
@@ -5677,19 +5545,19 @@ async def _judge_llm_intent(bot: Bot, event: GroupMessageEvent, text: str) -> In
     送过去的全是匿名化之后的文本 —— 群号和 QQ 号本来就不该进模型上下文，判定这条
     新链路没有理由成为例外。
     """
-    if _client is None:
+    if _adapter.client is None:
         return IntentVerdict(error="client not ready")
     group_id = int(event.group_id)
     limit = int(live.llm_intent_context_messages)
-    context_lines = [entry.text for entry in list(_group_history[group_id])[-limit:]] if limit > 0 else []
-    metadata = _features.coordinator.metadata(_features.actor(bot, event)) if _features.available else {}
+    context_lines = [entry.text for entry in list(_adapter.group_history[group_id])[-limit:]] if limit > 0 else []
+    metadata = _adapter.features.coordinator.metadata(_adapter.features.actor(bot, event)) if _adapter.features.available else {}
     topic = metadata.get("topic", {})
     if topic.get("context"):
         context_lines = [f"{line['label']}: {line['text']}" for line in topic["context"]]
     if metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled"):
         context_lines.append(_reaction_prompt_block())
     speaker = _anonymize_text_for_ai(_event_display_name(event))
-    return await _client.judge_reply_intent(
+    return await _adapter.client.judge_reply_intent(
         conversation_key=_stable_conversation_key(f"qq_group:{group_id}"),
         text=_anonymize_text_for_ai(text),
         channel="qq_group",
@@ -5810,11 +5678,11 @@ async def _auto_like_user(bot: Bot, user_id: int) -> None:
     if not live.enable_auto_like:
         return
     today = dt.datetime.now(_CST).strftime("%Y-%m-%d")
-    if _auto_like_today.get(user_id) == today:
+    if _adapter.auto_like_today.get(user_id) == today:
         return
     try:
         await bot.call_api("send_like", user_id=int(user_id), times=int(live.auto_like_times))
-        _auto_like_today[user_id] = today
+        _adapter.auto_like_today[user_id] = today
     except Exception:
         logger.debug("send_like failed for user=%s", user_id, exc_info=True)
 
@@ -5835,7 +5703,7 @@ async def _build_inbound_text(
     """
     group_id = int(event.group_id)
     watermark = _group_history_watermark(group_id)
-    pending = [entry for entry in _group_history[group_id] if entry.seq > watermark]
+    pending = [entry for entry in _adapter.group_history[group_id] if entry.seq > watermark]
     # 水位仍然盖过被排除那一行：它已随指令块进了 durable history，下一轮不该再当历史重发。
     covered_seq = max((entry.seq for entry in pending), default=watermark)
     fresh = [entry for entry in pending if entry.seq != exclude_seq]
@@ -5845,7 +5713,7 @@ async def _build_inbound_text(
     now = dt.datetime.now(_CST).strftime("%Y-%m-%d %H:%M CST")
 
     parts: List[str] = ["【群聊上下文记录】"]
-    metadata = _features.coordinator.metadata(_features.actor(bot, event)) if _features.available else {}
+    metadata = _adapter.features.coordinator.metadata(_adapter.features.actor(bot, event)) if _adapter.features.available else {}
     topic = metadata.get("topic", {})
     if topic.get("topic_id"):
         parts.extend(f"[{line['ref']}] {line['label']}: {line['text']}" for line in topic.get("context", [])
@@ -6002,15 +5870,15 @@ async def _try_preempt_running_task(
     """尝试把 QQ 新消息注入当前会话正在运行的入口任务。"""
     # 先查询当前 session 的入口任务，再用 preempt_task 注入新消息：让同一会话的
     # 新指令打断并接续旧任务，而不是在已有入口任务运行时并发开新任务。
-    if _client is None or _session_state is None:
+    if _adapter.client is None or _adapter.session_state is None:
         return False
 
-    existing_sid = _session_state.get_session_id(conversation_key)
+    existing_sid = _adapter.session_state.get_session_id(conversation_key)
     if not existing_sid:
         return False
 
     try:
-        running_tasks = await _client.get_running_tasks(existing_sid)
+        running_tasks = await _adapter.client.get_running_tasks(existing_sid)
     except Exception:
         logger.exception("preempt_v2: get running tasks failed")
         return False
@@ -6020,9 +5888,9 @@ async def _try_preempt_running_task(
             continue
 
         rt_src_seq = rt.source_inbound_seq or 0
-        rt_trigger = _session_state.get_trigger(rt_src_seq) if rt_src_seq else None
+        rt_trigger = _adapter.session_state.get_trigger(rt_src_seq) if rt_src_seq else None
         if not rt_trigger:
-            result = _session_state.find_trigger_by_session(existing_sid)
+            result = _adapter.session_state.find_trigger_by_session(existing_sid)
             rt_trigger = result[1] if result else None
 
         if not is_dm:
@@ -6047,7 +5915,7 @@ async def _try_preempt_running_task(
             preempt_args: Dict[str, Any] = {"message": inbound_text, "attachments": attachments}
             if get_memory_hints is not None:
                 preempt_args["memory_hints"] = get_memory_hints()
-            ok = await _client.preempt_task(
+            ok = await _adapter.client.preempt_task(
                 rt.task_id,
                 **preempt_args,
             )
@@ -6068,7 +5936,7 @@ async def _try_preempt_running_task(
         if rt_trigger:
             rt_trigger.platform_data.update(fresh_platform)
         elif rt_src_seq:
-            _session_state.register_trigger(
+            _adapter.session_state.register_trigger(
                 TriggerInfo(
                     inbound_seq=rt_src_seq,
                     conversation_key=conversation_key,
@@ -6078,8 +5946,8 @@ async def _try_preempt_running_task(
                 )
             )
 
-        _session_targets[existing_sid] = dict(fresh_platform)
-        _conversation_bots[conversation_key] = bot
+        _adapter.session_targets[existing_sid] = dict(fresh_platform)
+        _adapter.conversation_bots[conversation_key] = bot
         await _remember_route_state(
             stable_conversation_key=conversation_key,
             real_conversation_key=_real_conversation_key(conversation_key),
@@ -6110,11 +5978,11 @@ async def _submit_or_preempt_inbound(
     memory_user_ids: tuple[str, ...] = (),
 ) -> bool:
     """提交或打断 QQ 入站消息；对外使用稳定哈希 conversation_key，对内保留真实路由。"""
-    if _client is None or _session_state is None:
+    if _adapter.client is None or _adapter.session_state is None:
         return False
 
     group_id = platform_updates.get("group_id") if platform_updates.get("type") == "group" else None
-    watermark_generation = _session_state.watermark_generation(int(group_id)) if group_id is not None else None
+    watermark_generation = _adapter.session_state.watermark_generation(int(group_id)) if group_id is not None else None
     memory_hints: Dict[str, Any] | None = None
 
     def get_memory_hints() -> Dict[str, Any]:
@@ -6143,14 +6011,14 @@ async def _submit_or_preempt_inbound(
             # 但不产生新的 inbound_seq，没有 inbound_accepted 可等，只能就地推进。
             if (
                 group_id is not None and history_watermark >= 0
-                and watermark_generation == _session_state.watermark_generation(int(group_id))
+                and watermark_generation == _adapter.session_state.watermark_generation(int(group_id))
             ):
-                _session_state.advance_watermark(int(group_id), history_watermark)
-            if _features.available:
-                _features.burst_store.remove(stable_conversation_key, platform_updates.get("_route_hints", {}).get("source_message_refs", []))
+                _adapter.session_state.advance_watermark(int(group_id), history_watermark)
+            if _adapter.features.available:
+                _adapter.features.burst_store.remove(stable_conversation_key, platform_updates.get("_route_hints", {}).get("source_message_refs", []))
             return True
 
-    result = await _client.submit_inbound(
+    result = await _adapter.client.submit_inbound(
         channel=channel,
         conversation_key=stable_conversation_key,
         text=inbound_text,
@@ -6186,20 +6054,20 @@ async def _submit_or_preempt_inbound(
     if group_id is not None and history_watermark >= 0:
         if result.inbound_seq:
             # 等 inbound_accepted 再推进：supervisor 没真正收下就推，那几行历史就没人再发了。
-            _session_state.register_watermark(
+            _adapter.session_state.register_watermark(
                 int(result.inbound_seq), int(group_id), history_watermark,
                 generation=watermark_generation,
             )
         else:
-            if watermark_generation == _session_state.watermark_generation(int(group_id)):
-                _session_state.advance_watermark(int(group_id), history_watermark)
+            if watermark_generation == _adapter.session_state.watermark_generation(int(group_id)):
+                _adapter.session_state.advance_watermark(int(group_id), history_watermark)
 
-    _real_conversation_keys[stable_conversation_key] = real_conversation_key
-    _session_state.register_session(stable_conversation_key, result.session_id)
+    _adapter.real_conversation_keys[stable_conversation_key] = real_conversation_key
+    _adapter.session_state.register_session(stable_conversation_key, result.session_id)
     target = dict(platform_updates)
     target["conversation_key"] = stable_conversation_key
-    _session_targets[result.session_id] = target
-    _conversation_bots[stable_conversation_key] = bot
+    _adapter.session_targets[result.session_id] = target
+    _adapter.conversation_bots[stable_conversation_key] = bot
     await _remember_route_state(
         stable_conversation_key=stable_conversation_key,
         real_conversation_key=real_conversation_key,
@@ -6220,9 +6088,9 @@ async def _submit_or_preempt_inbound(
                 **react_meta,
             },
         )
-        _session_state.register_trigger(trigger)
-    if _features.available:
-        _features.burst_store.remove(stable_conversation_key, platform_updates.get("_route_hints", {}).get("source_message_refs", []))
+        _adapter.session_state.register_trigger(trigger)
+    if _adapter.features.available:
+        _adapter.features.burst_store.remove(stable_conversation_key, platform_updates.get("_route_hints", {}).get("source_message_refs", []))
     return True
 
 
@@ -6265,14 +6133,14 @@ def _merge_queued_inbound(existing: QueuedInbound, item: QueuedInbound) -> None:
     existing.platform_updates["_response_purpose"] = "direct" if direct_response else "ambient"
     hints["delivery_purpose"] = existing.platform_updates["_response_purpose"]
     existing.user_text = f"{existing.user_text}\n{item.user_text}"
-    if _features.available and source_refs:
-        _features.stage_burst(existing)
+    if _adapter.features.available and source_refs:
+        _adapter.features.stage_burst(existing)
 
 
 async def _enqueue_or_submit_inbound(item: QueuedInbound) -> bool:
-    if not _features.available:
+    if not _adapter.features.available:
         return await _queue_or_submit_ready(item)
-    metadata = await _features.prepare(item.bot, item.event)
+    metadata = await _adapter.features.prepare(item.bot, item.event)
     if not metadata:
         return await _queue_or_submit_ready(item)
     topic = metadata.get("topic", {})
@@ -6294,8 +6162,8 @@ async def _enqueue_or_submit_inbound(item: QueuedInbound) -> bool:
     if identity:
         identity += (topic_id,)
     if metadata["policy"].get("settings", {}).get("merge_window_sec", 0) > 0:
-        _features.stage_burst(item)
-    return await _features.coordinator.submit(item, metadata["policy"].get("settings", {}), identity,
+        _adapter.features.stage_burst(item)
+    return await _adapter.features.coordinator.submit(item, metadata["policy"].get("settings", {}), identity,
                                                _queue_or_submit_ready, _merge_queued_inbound)
 
 
@@ -6318,17 +6186,17 @@ async def _queue_or_submit_ready(item: QueuedInbound) -> bool:
             memory_user_ids=item.memory_user_ids,
         )
 
-    async with _qq_queue_condition:
+    async with _adapter.qq_queue_condition:
         item.merge_identity = _queue_merge_identity(item)
         message = item.event.get_message() if hasattr(item.event, "get_message") else []
         item.memory_user_ids = tuple(dict.fromkeys((*item.memory_user_ids, *at_segment_user_ids(message))))
-        existing = _qq_queue_by_key.get(item.stable_conversation_key)
+        existing = _adapter.qq_queue_by_key.get(item.stable_conversation_key)
         if existing is not None and item.merge_identity is not None and existing.merge_identity == item.merge_identity:
             _merge_queued_inbound(existing, item)
         else:
-            _qq_queue.append(item)
-            _qq_queue_by_key[item.stable_conversation_key] = item
-        _qq_queue_condition.notify()
+            _adapter.qq_queue.append(item)
+            _adapter.qq_queue_by_key[item.stable_conversation_key] = item
+        _adapter.qq_queue_condition.notify()
     return True
 
 
@@ -6342,7 +6210,7 @@ def _queue_worker_should_exit(worker_index: int) -> bool:
     target = live.queue_workers if live.enable_queue else 0
     if worker_index < target:
         return False
-    return target > 0 or not _qq_queue
+    return target > 0 or not _adapter.qq_queue
 
 
 async def _qq_queue_worker_forever(worker_index: int) -> None:
@@ -6352,30 +6220,30 @@ async def _qq_queue_worker_forever(worker_index: int) -> None:
     看不到运营者刚改的 workers 数量。取到件之后才钉住，处理这一条期间配置不再变。
     """
     while True:
-        async with _qq_queue_condition:
+        async with _adapter.qq_queue_condition:
             while True:
                 if _queue_worker_should_exit(worker_index):
                     return
                 index = next(
-                    (index for index, queued in enumerate(_qq_queue)
-                     if queued.stable_conversation_key not in _qq_active_conversations),
+                    (index for index, queued in enumerate(_adapter.qq_queue)
+                     if queued.stable_conversation_key not in _adapter.qq_active_conversations),
                     None,
                 )
                 if index is not None:
                     break
-                await _qq_queue_condition.wait()
-            item = _qq_queue[index]
-            del _qq_queue[index]
-            _qq_active_conversations.add(item.stable_conversation_key)
+                await _adapter.qq_queue_condition.wait()
+            item = _adapter.qq_queue[index]
+            del _adapter.qq_queue[index]
+            _adapter.qq_active_conversations.add(item.stable_conversation_key)
             # 只删指向本件的合并槽：同会话已允许存在多件时，别把指向后来那件的槽误删。
-            if _qq_queue_by_key.get(item.stable_conversation_key) is item:
-                _qq_queue_by_key.pop(item.stable_conversation_key, None)
+            if _adapter.qq_queue_by_key.get(item.stable_conversation_key) is item:
+                _adapter.qq_queue_by_key.pop(item.stable_conversation_key, None)
 
         with pinned_live_config():
             reply_waiter: QueueReplyWaiter | None = None
             if live.queue_wait_for_reply:
                 reply_waiter = QueueReplyWaiter(asyncio.Event())
-                _qq_waiting_replies[item.stable_conversation_key] = reply_waiter
+                _adapter.qq_waiting_replies[item.stable_conversation_key] = reply_waiter
             try:
                 accepted = await _submit_or_preempt_inbound(
                     bot=item.bot,
@@ -6403,15 +6271,14 @@ async def _qq_queue_worker_forever(worker_index: int) -> None:
             except Exception:
                 logger.exception("failed to process QQ queue item conversation=%s", item.real_conversation_key)
             finally:
-                async with _qq_queue_condition:
-                    if _qq_waiting_replies.get(item.stable_conversation_key) is reply_waiter:
-                        _qq_waiting_replies.pop(item.stable_conversation_key, None)
-                    _qq_active_conversations.discard(item.stable_conversation_key)
-                    _qq_queue_condition.notify_all()
+                async with _adapter.qq_queue_condition:
+                    if _adapter.qq_waiting_replies.get(item.stable_conversation_key) is reply_waiter:
+                        _adapter.qq_waiting_replies.pop(item.stable_conversation_key, None)
+                    _adapter.qq_active_conversations.discard(item.stable_conversation_key)
+                    _adapter.qq_queue_condition.notify_all()
             interval = live.queue_interval
         if interval > 0:
             await asyncio.sleep(interval)
-
 
 
 def _group_id_from_conversation_key(conversation_key: str) -> Optional[int]:
@@ -6499,8 +6366,8 @@ def _target_from_platform_data(platform_data: Dict[str, Any]) -> Optional[Dict[s
 
 def _get_fallback_bot() -> Optional[Bot]:
     """获取 fallback 发送用 Bot；EventRouter 可能在 matcher 外触发回调。"""
-    if _last_bot is not None:
-        return _last_bot
+    if _adapter.last_bot is not None:
+        return _adapter.last_bot
     try:
         return get_bot()
     except Exception:
@@ -6548,21 +6415,21 @@ def _message_from_processed_segments(segments: List[Dict[str, Any]]) -> Message:
 
 
 def _bind_qq_reply_waiter(conversation_key: str, inbound_seq: int) -> None:
-    waiter = _qq_waiting_replies.get(conversation_key)
+    waiter = _adapter.qq_waiting_replies.get(conversation_key)
     if waiter is not None and inbound_seq > 0:
         waiter.inbound_seq = inbound_seq
-        if inbound_seq in _qq_completed_replies:
+        if inbound_seq in _adapter.qq_completed_replies:
             waiter.event.set()
 
 
 def _mark_qq_reply_finished(inbound_seq: int) -> None:
     if inbound_seq <= 0:
         return
-    _qq_completed_replies[inbound_seq] = None
-    _qq_completed_replies.move_to_end(inbound_seq)
-    while len(_qq_completed_replies) > 512:
-        _qq_completed_replies.popitem(last=False)
-    for waiter in _qq_waiting_replies.values():
+    _adapter.qq_completed_replies[inbound_seq] = None
+    _adapter.qq_completed_replies.move_to_end(inbound_seq)
+    while len(_adapter.qq_completed_replies) > 512:
+        _adapter.qq_completed_replies.popitem(last=False)
+    for waiter in _adapter.qq_waiting_replies.values():
         if waiter.inbound_seq == inbound_seq:
             waiter.event.set()
 
@@ -6577,14 +6444,6 @@ def _message_dedup_text(message: Any) -> str:
     return str(message or "")
 
 
-# 群成员缓存：group_id -> (过期时间, {user_id 集合}, {名片/昵称小写 -> user_id},
-#                         {user_id -> (card, nickname)})。
-# 用于（1）发送前校验 at 目标是否本群成员，避免 NapCat 对无法解析的 uid
-# 抛 Get Uid Error 使整条消息失败；（2）按当前群名片/昵称实时反查真实 QQ 号，
-# 让 [at:昵称] 能命中只存在于本群、未录入 profile/匿名表的成员（包括昵称叫 all 的人）；
-# （3）2026-07-17 新增 uid -> (card, nickname) 正向映射，让 @ 群友时的显示名
-# 优先取“本群群名片(card)”，其次“QQ 昵称(nickname)”，避免直接用 QQ 昵称。
-_group_member_cache: Dict[int, tuple[float, set[str], Dict[str, str], Dict[str, tuple[str, str]]]] = {}
 _GROUP_MEMBER_CACHE_TTL = float(os.environ.get("ONEBOT_GROUP_MEMBER_CACHE_TTL", "300") or "300")
 
 
@@ -6601,7 +6460,7 @@ async def _load_group_members(
     except Exception:
         return None
     now = time.time()
-    cached = _group_member_cache.get(gid)
+    cached = _adapter.group_member_cache.get(gid)
     if cached and cached[0] > now:
         return cached[1], cached[2], cached[3]
     try:
@@ -6628,9 +6487,9 @@ async def _load_group_members(
                     name_map.setdefault(name.casefold(), uid)
     if not members:
         return None
-    for stale_gid in [g for g, item in _group_member_cache.items() if item[0] <= now]:
-        _group_member_cache.pop(stale_gid, None)
-    _group_member_cache[gid] = (now + _GROUP_MEMBER_CACHE_TTL, members, name_map, card_map)
+    for stale_gid in [g for g, item in _adapter.group_member_cache.items() if item[0] <= now]:
+        _adapter.group_member_cache.pop(stale_gid, None)
+    _adapter.group_member_cache[gid] = (now + _GROUP_MEMBER_CACHE_TTL, members, name_map, card_map)
     return members, name_map, card_map
 
 
@@ -6653,7 +6512,7 @@ def _group_member_display_name(group_id: Any, user_id: Any) -> str:
         gid = int(group_id)
     except Exception:
         return ""
-    cached = _group_member_cache.get(gid)
+    cached = _adapter.group_member_cache.get(gid)
     if not cached:
         return ""
     card, nickname = cached[3].get(uid, ("", ""))
@@ -6677,7 +6536,7 @@ def _resolve_at_alias_in_group(group_id: Any, token: str) -> str:
         gid = int(group_id)
     except Exception:
         return ""
-    cached = _group_member_cache.get(gid)
+    cached = _adapter.group_member_cache.get(gid)
     if not cached:
         return ""
     return cached[2].get(raw.casefold(), "")
@@ -6792,7 +6651,7 @@ async def _send_qq_message_once(
     bot: Bot, target: Dict[str, Any], message: Any, *, idempotency_key: str = "",
 ) -> str:
     """执行一次 OneBot 发送；失败后最多再物理发一次，且只在确认没发出时才发。"""
-    await _features.check_send(bot, target)
+    await _adapter.features.check_send(bot, target)
     sender: Callable[[Any], Awaitable[Any]]
     if target.get("type") == "private":
         user_id = target.get("user_id")
@@ -6817,7 +6676,7 @@ async def _send_qq_message_once(
         raise OneBotSendContractError(f"unknown QQ target type: {target!r}")
     try:
         message_id = _extract_sent_message_id(await sender(outbound))
-        await _features.record_outbound(bot, target, outbound, message_id)
+        await _adapter.features.record_outbound(bot, target, outbound, message_id)
         return message_id
     except ActionFailed as exc:
         at_as_text = (
@@ -6838,7 +6697,7 @@ async def _send_qq_message_once(
             },
         )
         message_id = _extract_sent_message_id(await sender(resend_message))
-        await _features.record_outbound(bot, target, resend_message, message_id)
+        await _adapter.features.record_outbound(bot, target, resend_message, message_id)
         return message_id
 
 
@@ -6870,11 +6729,11 @@ def _sent_ttl_for_context(context: OutboundSendContext) -> float | None:
 
 async def _heartbeat_idempotency_claim(claim: IdempotencyClaim) -> None:
     """Renew one logical-send owner until its platform operation finishes."""
-    interval = max(0.05, min(30.0, _outbound_idempotency.lease_seconds / 3))
+    interval = max(0.05, min(30.0, _adapter.outbound_idempotency.lease_seconds / 3))
     while True:
         await asyncio.sleep(interval)
         try:
-            await _outbound_idempotency.heartbeat(claim)
+            await _adapter.outbound_idempotency.heartbeat(claim)
         except IdempotencyOwnershipError:
             # The protected send commits pending -> sent/ambiguous atomically. A
             # heartbeat already queued at that boundary will then observe that its
@@ -6905,11 +6764,11 @@ async def _send_qq_message(
     key = idempotency_key or make_idempotency_key(
         target, identity, event_id=context.idempotency_key or context.event_id,
     )
-    claim = await _outbound_idempotency.begin(key)
+    claim = await _adapter.outbound_idempotency.begin(key)
     if not claim.acquired and claim.state == "pending":
-        resolved = await _outbound_idempotency.wait_for_resolution(key)
+        resolved = await _adapter.outbound_idempotency.wait_for_resolution(key)
         if resolved is None:
-            claim = await _outbound_idempotency.begin(key)
+            claim = await _adapter.outbound_idempotency.begin(key)
         else:
             claim = IdempotencyClaim(key=key, acquired=False, state=resolved)
     fields = _send_audit_fields(
@@ -6920,10 +6779,10 @@ async def _send_qq_message(
     )
     if not claim.acquired:
         logger.info("onebot_send_duplicate", extra={**fields, "claim_state": claim.state})
-        platform_message_id = await _outbound_idempotency.sent_message_id(key)
+        platform_message_id = await _adapter.outbound_idempotency.sent_message_id(key)
         if sticker_delivery_id:
             await _reconcile_sticker_receipts(sticker_delivery_id)
-        await _features.bind_reminder_message(bot, target, context, platform_message_id)
+        await _adapter.features.bind_reminder_message(bot, target, context, platform_message_id)
         return platform_message_id or f"idempotent:{key}"
     logger.info("onebot_send_started", extra=fields)
     heartbeat = asyncio.create_task(_heartbeat_idempotency_claim(claim))
@@ -6936,7 +6795,7 @@ async def _send_qq_message(
             return result
 
         platform_message_id = await protected_claim_send(
-            _outbound_idempotency,
+            _adapter.outbound_idempotency,
             claim,
             send_once,
             sent_ttl=_sent_ttl_for_context(context),
@@ -6951,7 +6810,7 @@ async def _send_qq_message(
         )
         if sticker_delivery_id:
             await _reconcile_sticker_receipts(sticker_delivery_id)
-        await _features.bind_reminder_message(bot, target, context, platform_message_id)
+        await _adapter.features.bind_reminder_message(bot, target, context, platform_message_id)
         return platform_message_id
     finally:
         heartbeat.cancel()
@@ -6970,12 +6829,12 @@ async def _send_split_text(
     """按 [SPLIT] 拆分文本，并把每段回复绑定到本轮来源图片。"""
     # 2026-05-01 修改原因：文本拆分逻辑对群聊和私聊相同，实际发送交给
     # _send_qq_message 处理，确保私聊也能复用表情替换和分段发送能力。
-    await _features.check_send(bot, target)
+    await _adapter.features.check_send(bot, target)
     sent_any = False
     parts = text.split(_SPLIT_SIGNAL) if text else []
     conversation_key = _sticker_conversation_key(target, bot)
-    conversation_token = _sticker_send_conversation.set(conversation_key)
-    selected_token = _sticker_selected.set(set())
+    conversation_token = _adapter.sticker_send_conversation.set(conversation_key)
+    selected_token = _adapter.sticker_selected.set(set())
     try:
         async with _serialize_sticker_delivery(conversation_key):
             sent_any = await _send_split_parts(
@@ -6983,8 +6842,8 @@ async def _send_split_text(
                 source_attachments=source_attachments, send_context=send_context,
             )
     finally:
-        _sticker_selected.reset(selected_token)
-        _sticker_send_conversation.reset(conversation_token)
+        _adapter.sticker_selected.reset(selected_token)
+        _adapter.sticker_send_conversation.reset(conversation_token)
     return sent_any
 
 
@@ -7026,15 +6885,15 @@ async def _send_planned_sticker_message(
     identity = f"sticker:v1:{getattr(bot, 'self_id', '')}:{identity}"
     context = send_context.child(identity) if send_context else OutboundSendContext()
     parent_id = (send_context.idempotency_key or send_context.event_id) if send_context else ""
-    if parent_id and await _outbound_idempotency.has_legacy_message_claims(parent_id, target):
+    if parent_id and await _adapter.outbound_idempotency.has_legacy_message_claims(parent_id, target):
         raise OneBotAmbiguousAckError("旧版消息存在投递记录，无法安全恢复选图，需要人工确认")
     key = make_idempotency_key(
         target, identity, event_id=context.idempotency_key or context.event_id,
     )
-    plan = await _outbound_idempotency.get_or_create_message_plan(
+    plan = await _adapter.outbound_idempotency.get_or_create_message_plan(
         key, target, builder, sent_ttl=_sent_ttl_for_context(context),
     )
-    selected = _sticker_selected.get()
+    selected = _adapter.sticker_selected.get()
     if selected is not None:
         selected.update(plan.selected_images)
     if not plan.processed_segments:
@@ -7065,7 +6924,7 @@ async def _send_split_parts(
             continue
         async def prepare() -> List[Dict[str, Any]]:
             segments = await process_emojis(
-                part, bot, _bqbs, _current_custom_face_names(), _current_custom_face_metadata(),
+                part, bot, _adapter.bqbs, _current_custom_face_names(), _current_custom_face_metadata(),
                 strip_asterisk_styles=live.strip_asterisk_styles,
                 strip_underscore_styles=live.strip_underscore_styles,
             )
@@ -7088,7 +6947,7 @@ async def _send_split_parts(
                     "selected_images": list(dict.fromkeys(
                         str(item["sticker_sha256"]) for item in segments if item.get("sticker_sha256")
                     )),
-                    "conversation_key": _sticker_send_conversation.get(""),
+                    "conversation_key": _adapter.sticker_send_conversation.get(""),
                 }
 
             sent_message_id = await _send_planned_sticker_message(
@@ -7173,7 +7032,7 @@ async def _send_attachment_path(
     send_context: OutboundSendContext | None = None,
 ) -> str:
     """Send one attachment under one persistent logical owner claim."""
-    await _features.check_send(bot, target)
+    await _adapter.features.check_send(bot, target)
     display_name = filename or path.name
     if not path.exists():
         raise OneBotSendContractError(f"attachment does not exist: {path}")
@@ -7188,11 +7047,11 @@ async def _send_attachment_path(
         key = make_idempotency_key(
             target, identity, event_id=context.idempotency_key or context.event_id,
         )
-        claim = await _outbound_idempotency.begin(key)
+        claim = await _adapter.outbound_idempotency.begin(key)
         if not claim.acquired and claim.state == "pending":
-            resolved = await _outbound_idempotency.wait_for_resolution(key)
+            resolved = await _adapter.outbound_idempotency.wait_for_resolution(key)
             claim = (
-                await _outbound_idempotency.begin(key)
+                await _adapter.outbound_idempotency.begin(key)
                 if resolved is None else IdempotencyClaim(key, False, resolved)
             )
         if not claim.acquired:
@@ -7232,7 +7091,7 @@ async def _send_attachment_path(
                 raise failure
 
             message_id = await protected_claim_send(
-                _outbound_idempotency,
+                _adapter.outbound_idempotency,
                 claim,
                 send_image,
                 sent_ttl=_sent_ttl_for_context(context),
@@ -7256,11 +7115,11 @@ async def _send_attachment_path(
     key = make_idempotency_key(
         target, identity, event_id=context.idempotency_key or context.event_id,
     )
-    claim = await _outbound_idempotency.begin(key)
+    claim = await _adapter.outbound_idempotency.begin(key)
     if not claim.acquired and claim.state == "pending":
-        resolved = await _outbound_idempotency.wait_for_resolution(key)
+        resolved = await _adapter.outbound_idempotency.wait_for_resolution(key)
         claim = (
-            await _outbound_idempotency.begin(key)
+            await _adapter.outbound_idempotency.begin(key)
             if resolved is None else IdempotencyClaim(key, False, resolved)
         )
     if not claim.acquired:
@@ -7274,7 +7133,7 @@ async def _send_attachment_path(
         file_str = "base64://" + base64.b64encode(raw_bytes).decode("ascii")
 
         async def upload_file() -> Any:
-            await _features.check_send(bot, target)
+            await _adapter.features.check_send(bot, target)
             if target.get("type") == "group" and target.get("group_id") is not None:
                 return await bot.call_api(
                     "upload_group_file", group_id=target["group_id"],
@@ -7288,7 +7147,7 @@ async def _send_attachment_path(
             raise OneBotSendContractError(f"attachment target is invalid: {target!r}")
 
         result = await protected_claim_send(
-            _outbound_idempotency,
+            _adapter.outbound_idempotency,
             claim,
             upload_file,
             sent_ttl=_sent_ttl_for_context(context),
@@ -7307,7 +7166,6 @@ async def _send_attachment_path(
         heartbeat.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await heartbeat
-
 
 
 def _target_forward_kind(target: Dict[str, Any]) -> tuple[str, int] | None:
@@ -7378,11 +7236,11 @@ async def _try_send_images_as_forward(
     key = make_idempotency_key(
         target, batch_identity, event_id=context.idempotency_key or context.event_id,
     )
-    claim = await _outbound_idempotency.begin(key)
+    claim = await _adapter.outbound_idempotency.begin(key)
     if not claim.acquired and claim.state == "pending":
-        resolved = await _outbound_idempotency.wait_for_resolution(key)
+        resolved = await _adapter.outbound_idempotency.wait_for_resolution(key)
         if resolved is None:
-            claim = await _outbound_idempotency.begin(key)
+            claim = await _adapter.outbound_idempotency.begin(key)
         else:
             claim = IdempotencyClaim(key, False, resolved)
     if not claim.acquired:
@@ -7392,7 +7250,7 @@ async def _try_send_images_as_forward(
         call_timeout = min(240.0, max(60.0, len(nodes) * 45.0))
 
         async def send_forward() -> Any:
-            await _features.check_send(bot, target)
+            await _adapter.features.check_send(bot, target)
             if forward_type == "group":
                 return await bot.call_api(
                     "send_group_forward_msg", group_id=forward_id, messages=nodes, _timeout=call_timeout,
@@ -7402,7 +7260,7 @@ async def _try_send_images_as_forward(
             )
 
         result = await protected_claim_send(
-            _outbound_idempotency,
+            _adapter.outbound_idempotency,
             claim,
             send_forward,
             sent_ttl=_sent_ttl_for_context(context),
@@ -7575,16 +7433,16 @@ def _record_sent_attachments(target: Dict[str, Any], attachments: List[Any]) -> 
             resolved = str(path)
         name = _attachment_filename(attachment) or path.name
         is_image = path.suffix.lower() in _IMAGE_SUFFIXES
-        seq = _sent_attachment_seq[bucket] + 1
-        _sent_attachment_seq[bucket] = seq
-        _recent_sent_attachments[bucket].append({
+        seq = _adapter.sent_attachment_seq[bucket] + 1
+        _adapter.sent_attachment_seq[bucket] = seq
+        _adapter.recent_sent_attachments[bucket].append({
             "path": resolved,
             "name": name,
             "type": "image" if is_image else "file",
             "timestamp": now,
             "seq": seq,
         })
-    _recent_sent_attachments.touch(bucket)
+    _adapter.recent_sent_attachments.touch(bucket)
 
 
 def _remember_message_attachments(message_id: Any, attachments: List[Any]) -> None:
@@ -7613,10 +7471,10 @@ def _remember_message_attachments(message_id: Any, attachments: List[Any]) -> No
         })
     if not records:
         return
-    _sent_message_attachments[mid] = records
-    _sent_message_attachments.move_to_end(mid)
-    while len(_sent_message_attachments) > _MESSAGE_ATTACHMENT_MAX_ITEMS:
-        _sent_message_attachments.popitem(last=False)
+    _adapter.sent_message_attachments[mid] = records
+    _adapter.sent_message_attachments.move_to_end(mid)
+    while len(_adapter.sent_message_attachments) > _MESSAGE_ATTACHMENT_MAX_ITEMS:
+        _adapter.sent_message_attachments.popitem(last=False)
 
 
 def _message_attachment_records(message_id: Any, *, only_images: bool = False) -> list[dict[str, Any]]:
@@ -7625,7 +7483,7 @@ def _message_attachment_records(message_id: Any, *, only_images: bool = False) -
     if not mid:
         return []
     records: list[dict[str, Any]] = []
-    for item in _sent_message_attachments.get(mid, ()):  # type: ignore[arg-type]
+    for item in _adapter.sent_message_attachments.get(mid, ()):  # type: ignore[arg-type]
         if not isinstance(item, dict):
             continue
         if only_images and str(item.get("type") or "") != "image":
@@ -7644,7 +7502,7 @@ def _recent_sent_attachment_records(bucket_key: str, *, only_images: bool = Fals
     if not bucket:
         return []
     records: list[dict[str, Any]] = []
-    for item in _recent_sent_attachments.get(bucket, ()):  # type: ignore[arg-type]
+    for item in _adapter.recent_sent_attachments.get(bucket, ()):  # type: ignore[arg-type]
         if not isinstance(item, dict):
             continue
         if only_images and str(item.get("type") or "") != "image":
@@ -7667,18 +7525,15 @@ class _AttachmentSendLock:
     users: int = 0
 
 
-_attachment_send_locks: "OrderedDict[str, _AttachmentSendLock]" = OrderedDict()
-
-
 @contextlib.asynccontextmanager
 async def _attachment_send_order(target: Dict[str, Any]) -> AsyncIterator[None]:
     """按会话桶串行化附件发送，退出时回收空闲锁。"""
     key = _sent_attachment_bucket_key(target) or str(target.get("conversation_key") or "default")
-    entry = _attachment_send_locks.get(key)
+    entry = _adapter.attachment_send_locks.get(key)
     if entry is None:
         entry = _AttachmentSendLock(asyncio.Lock())
-        _attachment_send_locks[key] = entry
-    _attachment_send_locks.move_to_end(key)
+        _adapter.attachment_send_locks[key] = entry
+    _adapter.attachment_send_locks.move_to_end(key)
     entry.users += 1
     try:
         async with entry.lock:
@@ -7690,13 +7545,13 @@ async def _attachment_send_order(target: Dict[str, Any]) -> AsyncIterator[None]:
 
 def _prune_attachment_send_locks() -> None:
     """只淘汰没人持有/等待的锁：丢掉在用的锁会让后来者拿到新锁，同会话串行就断了。"""
-    overflow = len(_attachment_send_locks) - _ATTACHMENT_SEND_LOCK_MAX_KEYS
-    for stale_key, entry in list(_attachment_send_locks.items()):
+    overflow = len(_adapter.attachment_send_locks) - _ATTACHMENT_SEND_LOCK_MAX_KEYS
+    for stale_key, entry in list(_adapter.attachment_send_locks.items()):
         if overflow <= 0:
             break
         if entry.users:
             continue
-        del _attachment_send_locks[stale_key]
+        del _adapter.attachment_send_locks[stale_key]
         overflow -= 1
 
 
@@ -7740,7 +7595,7 @@ async def _send_attachments_confirmed(
             # 清空上下文之前派出去的那轮除外：图照发，但索引不该留在刚清空的会话里。
             if not _is_stale_delivery(target.get("group_id"), send_context):
                 _record_sent_attachments(_ensure_bucket_target(dict(target)), attachments)
-            await _features.register_sent_attachments(bot, target, attachments, send_context)
+            await _adapter.features.register_sent_attachments(bot, target, attachments, send_context)
     except Exception:
         logger.warning("onebot_attachment_batch_failed", exc_info=True)
         raise
@@ -7756,7 +7611,7 @@ async def _send_text_and_attachments(
     send_context: OutboundSendContext | None = None,
 ) -> None:
     """统一发送最终文本/附件，并持久绑定回复所依据的来源图片。"""
-    await _features.check_send(bot, target)
+    await _adapter.features.check_send(bot, target)
     # 上下文被清空时这一轮还在飞，回复照发（群友问了总得有个答复），但一律不落缓存 ——
     # 它是上一段上下文的产物，落回去下一轮又会被带给模型，等于那次清空没生效。
     stale = target.get("type") == "group" and _is_stale_delivery(target.get("group_id"), send_context)
@@ -7794,8 +7649,8 @@ async def _set_message_react(bot: Bot, event: Any, emoji_id: str, enabled: bool)
         return False
     try:
         if enabled and getattr(event, "group_id", None) is not None:
-            metadata = await _features.prepare(bot, event)
-            await _features.check_send(bot, {"type": "group", "group_id": event.group_id,
+            metadata = await _adapter.features.prepare(bot, event)
+            await _adapter.features.check_send(bot, {"type": "group", "group_id": event.group_id,
                                             "_response_purpose": "direct" if metadata.get("direct") else "ambient"})
         await bot.call_api(
             "set_msg_emoji_like",
@@ -7906,7 +7761,7 @@ class TangQiuCallbacks:
             platform_data=callback_data.get("platform_data"),
         )
         _apply_delivery_context(target, send_context)
-        await _features.check_send(bot, target)
+        await _adapter.features.check_send(bot, target)
         # 提取 [REACT:ID] 标记
         final_text = text or ""
         if final_text:
@@ -7929,7 +7784,7 @@ class TangQiuCallbacks:
 
     async def send_reply_attachment(self, session_id: str, path: str, *args: Any, **kwargs: Any) -> None:
         """兼容旧式 session_id 附件回调；当前 SDK 通常把附件放在 send_reply 中。"""
-        target = _session_targets.get(session_id) or _persisted_session_targets.get(session_id)
+        target = _adapter.session_targets.get(session_id) or _adapter.persisted_session_targets.get(session_id)
         if not target:
             raise OneBotSendContractError(
                 f"send_reply_attachment missing target for session={session_id}"
@@ -7968,7 +7823,7 @@ class TangQiuCallbacks:
             platform_data=callback_data.get("platform_data"),
         )
         _apply_delivery_context(target, send_context)
-        await _features.check_send(bot, target)
+        await _adapter.features.check_send(bot, target)
         # 提取 [REACT:ID] 标记
         from .emoji_handler import _extract_reactions
         text, reactions = _extract_reactions(text)
@@ -8010,7 +7865,7 @@ class TangQiuCallbacks:
         # qq_forward op=recent 的查询 bucket 保持一致。
         if not target.get("conversation_key"):
             target["conversation_key"] = _real_conversation_key(conversation_key)
-        bot = _conversation_bots.get(conversation_key) or _get_fallback_bot()
+        bot = _adapter.conversation_bots.get(conversation_key) or _get_fallback_bot()
         if not bot:
             raise OneBotSendContractError(
                 f"send_to_channel missing bot for conversation={conversation_key}"
@@ -8096,7 +7951,7 @@ class TangQiuCallbacks:
         session_id: str = "",
     ) -> None:
         """QQ 端审批必须由管理员私聊确认；不再自动放行。"""
-        if _client is None:
+        if _adapter.client is None:
             logger.warning(
                 "approval review skipped on QQ: client unavailable id=%s operation=%s",
                 approval_id,
@@ -8105,7 +7960,7 @@ class TangQiuCallbacks:
             return
 
         _prune_expired_approvals()
-        _pending_approvals[approval_id] = {
+        _adapter.pending_approvals[approval_id] = {
             "operation": operation,
             "details": dict(details or {}),
             "conversation_key": conversation_key,
@@ -8122,14 +7977,14 @@ class TangQiuCallbacks:
                 else "CLONOTH_ADMIN_QQ_USERS is not configured"
             )
             try:
-                await _client.approve(
+                await _adapter.client.approve(
                     approval_id,
                     decision="deny",
                     comment=f"QQ adapter denied because {why}.",
                 )
             except Exception:
                 logger.exception("approval deny failed on QQ: id=%s operation=%s", approval_id, operation)
-            _pending_approvals.pop(approval_id, None)
+            _adapter.pending_approvals.pop(approval_id, None)
             _record_settled_approval(approval_id, admin_id=0, decision="deny", operation=operation)
             logger.warning("approval denied on QQ: %s id=%s operation=%s", why, approval_id, operation)
             return
@@ -8225,11 +8080,11 @@ class TangQiuCallbacks:
         """Engine 重启后无法确认各群历史是否还在 engine 侧，全部重置以重发一次完整历史。"""
         # 序号由 supervisor 分配，重启后不保证还在原来那条线上；留着旧门槛会把之后
         # 每一条正常回复都判成过期。此时在飞的任务也已经全没了，门槛没有意义。
-        # 放在 _session_state 守卫之前：这件事跟水位存不存在无关。
-        _context_clear_barrier.clear()
-        if _session_state is None:
+        # 放在 session_state 守卫之前：这件事跟水位存不存在无关。
+        _adapter.context_clear_barrier.clear()
+        if _adapter.session_state is None:
             return
-        for group_id in list(_group_history.keys()):
+        for group_id in list(_adapter.group_history.keys()):
             _reset_group_history_watermark(int(group_id))
 
     async def on_task_complete(self, *args: Any, **kwargs: Any) -> None:
@@ -8250,19 +8105,13 @@ class TangQiuCallbacks:
 #  匿名下标/关键词，避免把副作用能力和真实目标暴露给普通模型。
 # ---------------------------------------------------------------------------
 
-_forward_bridge_runner: Any = None
-_forward_bridge_site: Any = None
-_forward_bridge_started: bool = False
-_forward_bridge_token_cache: str = ""
-
 
 def _forward_bridge_token() -> str:
     """返回 Bridge 令牌：env 优先，否则读/自签令牌文件；都拿不到返回空串，Bridge 不启动。"""
-    global _forward_bridge_token_cache
     if FORWARD_BRIDGE_TOKEN:
         return FORWARD_BRIDGE_TOKEN
-    if _forward_bridge_token_cache:
-        return _forward_bridge_token_cache
+    if _adapter.forward_bridge_token_cache:
+        return _adapter.forward_bridge_token_cache
     path = Path(FORWARD_BRIDGE_TOKEN_FILE)
     try:
         existing = path.read_text(encoding="utf-8").strip()
@@ -8272,7 +8121,7 @@ def _forward_bridge_token() -> str:
         logger.error("qq_forward bridge token 文件不可读：%s", FORWARD_BRIDGE_TOKEN_FILE)
         return ""
     if existing:
-        _forward_bridge_token_cache = existing
+        _adapter.forward_bridge_token_cache = existing
         return existing
     try:
         token = secrets.token_urlsafe(32)
@@ -8285,7 +8134,7 @@ def _forward_bridge_token() -> str:
     except Exception:
         logger.error("qq_forward bridge token 文件不可写：%s", FORWARD_BRIDGE_TOKEN_FILE)
         return ""
-    _forward_bridge_token_cache = token
+    _adapter.forward_bridge_token_cache = token
     return token
 
 
@@ -8294,7 +8143,7 @@ def _forward_bridge_lookup_target(session_id: str) -> Dict[str, Any] | None:
     sid = str(session_id or "").strip()
     if not sid:
         return None
-    for source in (_session_targets, _persisted_session_targets):
+    for source in (_adapter.session_targets, _adapter.persisted_session_targets):
         target = source.get(sid)
         if isinstance(target, dict) and target:
             return dict(target)
@@ -8310,7 +8159,7 @@ def _forward_bridge_session_target(
     """根据 Engine 传来的 session_id 找回该会话对应的真实 QQ 目标。
 
     2026-07-14 修复原因：入口任务实际运行在 entry branch session（branch_xxx），
-    ctx.session_id 为 branch，而 _session_targets / _persisted_session_targets 只按
+    ctx.session_id 为 branch，而 session_targets / persisted_session_targets 只按
     用户可见的 parent session 登记。若直接拿 branch 去查会 miss，导致
     op=remind + target_type=current 在群聊中误报“当前会话不是群聊”。
     做法：依次尝试 parent_session_id -> 传入 session_id -> runtime_session_id，
@@ -8505,7 +8354,7 @@ def _forward_bridge_list_messages(
     )
     if group_id is None:
         return []
-    records = list(_group_content_records.get(int(group_id), ()))
+    records = list(_adapter.group_content_records.get(int(group_id), ()))
     if not records:
         return []
     query_norm = str(query or "").strip().lower()
@@ -8638,7 +8487,7 @@ def _forward_bridge_pick_records(
     )
     if group_id is None:
         return ForwardSelection([])
-    records = list(_group_content_records.get(int(group_id), ()))
+    records = list(_adapter.group_content_records.get(int(group_id), ()))
     if refs:
         by_seq = {r.seq: r for r in records if r.seq}
         picked: list[GroupContentRecord] = []
@@ -9107,8 +8956,7 @@ async def _forward_bridge_http_handler(request: "Any") -> "Any":
 
 async def _start_forward_bridge() -> None:
     """在 QQ Bot 进程内启动 qq_forward Bridge Server。"""
-    global _forward_bridge_runner, _forward_bridge_site, _forward_bridge_started
-    if _forward_bridge_started or not live.enable_forward_bridge:
+    if _adapter.forward_bridge_started or not live.enable_forward_bridge:
         return
     try:
         from aiohttp import web
@@ -9127,9 +8975,9 @@ async def _start_forward_bridge() -> None:
     await runner.setup()
     site = web.TCPSite(runner, FORWARD_BRIDGE_HOST, FORWARD_BRIDGE_PORT)
     await site.start()
-    _forward_bridge_runner = runner
-    _forward_bridge_site = site
-    _forward_bridge_started = True
+    _adapter.forward_bridge_runner = runner
+    _adapter.forward_bridge_site = site
+    _adapter.forward_bridge_started = True
     logger.info(
         "qq_forward bridge server started: http://%s:%s/qq_forward (token source=%s)",
         FORWARD_BRIDGE_HOST,
@@ -9139,33 +8987,32 @@ async def _start_forward_bridge() -> None:
 
 
 async def _stop_forward_bridge() -> None:
-    global _forward_bridge_runner, _forward_bridge_site, _forward_bridge_started
-    if _forward_bridge_runner is not None:
+    if _adapter.forward_bridge_runner is not None:
         with contextlib.suppress(Exception):
-            await _forward_bridge_runner.cleanup()
-    _forward_bridge_runner = None
-    _forward_bridge_site = None
-    _forward_bridge_started = False
+            await _adapter.forward_bridge_runner.cleanup()
+    _adapter.forward_bridge_runner = None
+    _adapter.forward_bridge_site = None
+    _adapter.forward_bridge_started = False
 
 
 def _reconcile_group_history_capacity() -> bool:
     """群历史条数改了就按新上限重建每个群的 deque。
 
-    maxlen 不可变，只能重建。序号水位在 _group_history_seq 里不受影响，但调小容量丢的
+    maxlen 不可变，只能重建。序号水位在 group_history_seq 里不受影响，但调小容量丢的
     最旧几行里可能有还没送到 engine 的，那几条要记进缺口，否则 prompt 里悄悄少一段。
     """
-    target = _group_history_capacity()
-    records_target = max(live.group_history_max, 20)
+    target = _adapter.group_history_capacity()
+    records_target = _adapter.group_content_capacity()
     changed = False
-    for group_id, lines in list(_group_history.items()):
+    for group_id, lines in list(_adapter.group_history.items()):
         if lines.maxlen != target:
             for entry in list(lines)[:max(0, len(lines) - target)]:
                 _note_history_gap(group_id, entry.seq)
-            _group_history[group_id] = deque(lines, maxlen=target)
+            _adapter.group_history[group_id] = deque(lines, maxlen=target)
             changed = True
-    for group_id, records in list(_group_content_records.items()):
+    for group_id, records in list(_adapter.group_content_records.items()):
         if records.maxlen != records_target:
-            _group_content_records[group_id] = deque(records, maxlen=records_target)
+            _adapter.group_content_records[group_id] = deque(records, maxlen=records_target)
             changed = True
     return changed
 
@@ -9176,33 +9023,33 @@ async def _reconcile_queue_workers() -> bool:
     扩容立刻建 task；缩容只叫醒它们，让每个 worker 在自己的安全点退出 —— 直接 cancel
     会打断正在提交的那一条消息。
     """
-    for index, task in list(_qq_queue_tasks.items()):
+    for index, task in list(_adapter.qq_queue_tasks.items()):
         if task.done():
-            _qq_queue_tasks.pop(index, None)
+            _adapter.qq_queue_tasks.pop(index, None)
     target = live.queue_workers if live.enable_queue else 0
-    running = len(_qq_queue_tasks)
+    running = len(_adapter.qq_queue_tasks)
     if running == target:
         return False
     if running < target:
         for index in range(target):
-            if index not in _qq_queue_tasks:
-                _qq_queue_tasks[index] = asyncio.create_task(_qq_queue_worker_forever(index))
+            if index not in _adapter.qq_queue_tasks:
+                _adapter.qq_queue_tasks[index] = asyncio.create_task(_qq_queue_worker_forever(index))
     else:
-        async with _qq_queue_condition:
-            _qq_queue_condition.notify_all()
+        async with _adapter.qq_queue_condition:
+            _adapter.qq_queue_condition.notify_all()
     logger.info(
         "QQ queue reconciled: workers %d -> %d (enabled=%s pending=%d)",
-        running, target, live.enable_queue, len(_qq_queue),
+        running, target, live.enable_queue, len(_adapter.qq_queue),
     )
     return True
 
 
 async def _reconcile_forward_bridge() -> bool:
     """按开关起停本地转发 Bridge。监听地址仍在启动时绑定，改地址要重启。"""
-    if live.enable_forward_bridge and not _forward_bridge_started:
+    if live.enable_forward_bridge and not _adapter.forward_bridge_started:
         await _start_forward_bridge()
-        return _forward_bridge_started
-    if not live.enable_forward_bridge and _forward_bridge_started:
+        return _adapter.forward_bridge_started
+    if not live.enable_forward_bridge and _adapter.forward_bridge_started:
         await _stop_forward_bridge()
         logger.info("qq_forward bridge server stopped: disabled in qq.yaml")
         return True
@@ -9227,11 +9074,11 @@ def _live_runtime_facts() -> Dict[str, Any]:
     return {
         "pid": os.getpid(),
         "onebot_connected": onebot_connected,
-        "queue_workers_running": len([t for t in _qq_queue_tasks.values() if not t.done()]),
-        "forward_bridge_running": bool(_forward_bridge_started),
+        "queue_workers_running": len([t for t in _adapter.qq_queue_tasks.values() if not t.done()]),
+        "forward_bridge_running": bool(_adapter.forward_bridge_started),
         "forward_bridge_endpoint": f"http://{FORWARD_BRIDGE_HOST}:{FORWARD_BRIDGE_PORT}/qq_forward",
         "forward_bridge_token_set": bool(_forward_bridge_token()),
-        "group_history_capacities": sorted({int(d.maxlen or 0) for d in _group_history.values()}),
+        "group_history_capacities": sorted({int(d.maxlen or 0) for d in _adapter.group_history.values()}),
         # 改一次就要重启的那几个键，控制台只读展示。密钥一律只报「设没设」——
         # 回传值等于把它摊在任何能打开控制台的人面前。
         "environment": {
@@ -9243,19 +9090,16 @@ def _live_runtime_facts() -> Dict[str, Any]:
         # 迁移功能靠它认「当前号」。空串 = 还没连上过任何账号，此时全部会话键都没作用域。
         "bot_scope": _active_bot_scope(),
         "volatile": {
-            "queue_pending": len(_qq_queue),
-            "cached_groups": len(_group_history),
+            "queue_pending": len(_adapter.qq_queue),
+            "cached_groups": len(_adapter.group_history),
             "history_gap_groups": len([
-                gid for gid in _group_history_gap
+                gid for gid in _adapter.group_history_gap
                 if _group_history_lost(gid, _group_history_watermark(gid)) > 0
             ]),
         },
     }
 
 
-_group_names: Dict[str, str] = {}
-_group_names_at = 0.0
-_group_names_seeded = False
 # 群名极少变，而 reconcile 每 2 秒转一圈，跟着它调 API 纯属浪费。
 _GROUP_NAME_REFRESH_SEC = 300.0
 
@@ -9267,10 +9111,9 @@ def _seed_group_names() -> None:
     号看得见的群，进程重启或换号后直接整体覆盖，历史会话的群名就没了，控制台上
     只剩 GroupA 这种脱敏别名。已经见过的群名是既成事实，退群或换号都不该抹掉。
     """
-    global _group_names_seeded
-    if _group_names_seeded:
+    if _adapter.group_names_seeded:
         return
-    _group_names_seeded = True
+    _adapter.group_names_seeded = True
     try:
         known = json.loads(_live_state_file().read_text(encoding="utf-8")).get("group_names")
     except Exception:
@@ -9280,8 +9123,8 @@ def _seed_group_names() -> None:
     for gid, name in known.items():
         text = str(name or "").strip()
         # 内存里已有的更新，不要被磁盘上的旧值盖回去。
-        if text and str(gid) not in _group_names:
-            _group_names[str(gid)] = text
+        if text and str(gid) not in _adapter.group_names:
+            _adapter.group_names[str(gid)] = text
 
 
 async def _refresh_group_names() -> None:
@@ -9290,14 +9133,13 @@ async def _refresh_group_names() -> None:
     只有 bot 进程连着 OneBot，supervisor 自己拿不到群名；不给的话控制台上
     只能显示 GroupA 这种脱敏别名，管理员分不清是哪个群。
     """
-    global _group_names_at
     now = time.time()
-    if now - _group_names_at < _GROUP_NAME_REFRESH_SEC:
+    if now - _adapter.group_names_at < _GROUP_NAME_REFRESH_SEC:
         return
     bot = _get_fallback_bot()
     if bot is None:
         return
-    _group_names_at = now
+    _adapter.group_names_at = now
     for row in await _safe_call_onebot_list(bot, "get_group_list"):
         try:
             gid = int(row.get("group_id"))
@@ -9305,7 +9147,7 @@ async def _refresh_group_names() -> None:
             continue
         name = str(row.get("group_name") or row.get("group_remark") or "").strip()
         if name:
-            _group_names[str(gid)] = _sanitize_name(name, max_len=40)
+            _adapter.group_names[str(gid)] = _sanitize_name(name, max_len=40)
 
 
 def _publish_live_state(*, force: bool = False) -> None:
@@ -9314,11 +9156,10 @@ def _publish_live_state(*, force: bool = False) -> None:
     不走转发 Bridge：Bridge 自己的开关就是一个热载键，关掉之后状态就瞎了，而
     「界面显示已生效、进程其实没读到」正是热重载最需要防的那种假象。
     """
-    global _live_state_published_at, _live_state_signature
     payload: Dict[str, Any] = live_config_state_payload()
     payload["runtime"] = _live_runtime_facts()
     _seed_group_names()
-    payload["group_names"] = dict(_group_names)
+    payload["group_names"] = dict(_adapter.group_names)
     payload["scope_conversation_keys"] = _current_scope_keys()
     signature = json.dumps(
         {k: v for k, v in payload.items() if k != "runtime"}
@@ -9326,7 +9167,7 @@ def _publish_live_state(*, force: bool = False) -> None:
         ensure_ascii=False, sort_keys=True,
     )
     now = time.time()
-    if not force and signature == _live_state_signature and now - _live_state_published_at < _LIVE_STATE_HEARTBEAT_SEC:
+    if not force and signature == _adapter.live_state_signature and now - _adapter.live_state_published_at < _LIVE_STATE_HEARTBEAT_SEC:
         return
     payload["published_at"] = now
     path = _live_state_file()
@@ -9339,8 +9180,8 @@ def _publish_live_state(*, force: bool = False) -> None:
     except OSError:
         logger.warning("failed to publish QQ live state to %s", path, exc_info=True)
         return
-    _live_state_signature = signature
-    _live_state_published_at = now
+    _adapter.live_state_signature = signature
+    _adapter.live_state_published_at = now
 
 
 async def _reconcile_live_config() -> bool:
@@ -9392,28 +9233,24 @@ async def _attachment_cleanup_forever() -> None:
 @driver.on_startup
 async def _startup() -> None:
     """NoneBot 启动时初始化 Clonoth SDK 与事件路由。"""
-    global _client, _session_state, _event_router, _router_task, _callbacks, _bqbs, _custom_face_names, _custom_face_metadata
-    global _live_reconcile_task, _attachment_cleanup_task
-    global _sticker_receipt_task
-    if _router_task is not None and not _router_task.done():
+    if _adapter.router_task is not None and not _adapter.router_task.done():
         return
 
     _warn_startup_config()
     _warn_trigger_config()
 
-    global _QQ_USER_PROFILES
-    _bqbs = load_bqbs(BQBS_PATH) if BQBS_PATH else []
-    _custom_face_names = _load_custom_face_names_file()
-    _custom_face_metadata = _load_custom_face_metadata_file()
-    _QQ_USER_PROFILES = _load_qq_user_profiles(USER_PROFILES_PATH)
-    if _QQ_USER_PROFILES:
-        logger.info("loaded %d QQ user profiles", len(_QQ_USER_PROFILES))
+    _adapter.bqbs = load_bqbs(BQBS_PATH) if BQBS_PATH else []
+    _adapter.custom_face_names = _load_custom_face_names_file()
+    _adapter.custom_face_metadata = _load_custom_face_metadata_file()
+    _adapter.qq_user_profiles = _load_qq_user_profiles(USER_PROFILES_PATH)
+    if _adapter.qq_user_profiles:
+        logger.info("loaded %d QQ user profiles", len(_adapter.qq_user_profiles))
     _load_route_state()
     _load_reply_attachment_cache()
     _start_sticker_tagger()
     _load_anon_map()
     await _reconcile_sticker_receipts()
-    _sticker_receipt_task = asyncio.create_task(_sticker_receipts_forever())
+    _adapter.sticker_receipt_task = asyncio.create_task(_sticker_receipts_forever())
     # [2026-07-14] 注入 at 别名反查，让 emoji_handler 在处理 [at:UserAF]/[at:显示名]
     # 时能把匿名别名/群昵称回解为真实 QQ 号，避免直接把代号当纯文本 @ 出去。
     set_at_alias_resolver(_resolve_at_alias_to_real)
@@ -9421,17 +9258,17 @@ async def _startup() -> None:
     # [AutoC] QQ 管理员 /切换模型 命令需要调用受 admin_token 保护的
     # POST /v1/config/openai，因此这里把 Supervisor 写出的 data/.admin_token
     # 传给 ClonothClient（每次请求实时读取，token 轮换也能跟上）。
-    _client = ClonothClient(
+    _adapter.client = ClonothClient(
         CLONOTH_BASE_URL,
         admin_token=os.environ.get("CLONOTH_ADMIN_TOKEN", "").strip(),
         admin_token_path=str(Path(CLONOTH_WORKSPACE) / "data" / ".admin_token"),
     )
-    _session_state = SessionState()
-    for sid, target in list(_persisted_session_targets.items()):
+    _adapter.session_state = SessionState()
+    for sid, target in list(_adapter.persisted_session_targets.items()):
         conv_key = str(target.get("conversation_key") or "")
         if conv_key:
-            _session_state.register_session(conv_key, sid)
-    _callbacks = TangQiuCallbacks()
+            _adapter.session_state.register_session(conv_key, sid)
+    _adapter.callbacks = TangQiuCallbacks()
 
     bot_config = BotConfig(
         base_url=CLONOTH_BASE_URL,
@@ -9446,15 +9283,15 @@ async def _startup() -> None:
         # 管理员名单里的人私聊明确同意后才会放行。
         auto_approve_internal=False,
     )
-    _event_router = EventRouter(
-        _client,
-        _session_state,
-        _callbacks,
+    _adapter.event_router = EventRouter(
+        _adapter.client,
+        _adapter.session_state,
+        _adapter.callbacks,
         bot_config,
         entry_node_id=ENTRY_NODE_ID,
         poll_interval=1.0,
     )
-    _router_task = asyncio.create_task(_event_router.run())
+    _adapter.router_task = asyncio.create_task(_adapter.event_router.run())
     if live.enable_queue:
         logger.info(
             "QQ queue enabled: workers=%s interval=%ss wait_for_reply=%s reply_timeout=%ss preempt=%s",
@@ -9469,9 +9306,9 @@ async def _startup() -> None:
     with contextlib.suppress(Exception):
         await _reconcile_live_config()
     _publish_live_state(force=True)
-    _live_reconcile_task = asyncio.create_task(_live_config_reconcile_forever())
-    _attachment_cleanup_task = asyncio.create_task(_attachment_cleanup_forever())
-    _features.poll_task = asyncio.create_task(_features.poll())
+    _adapter.live_reconcile_task = asyncio.create_task(_live_config_reconcile_forever())
+    _adapter.attachment_cleanup_task = asyncio.create_task(_attachment_cleanup_forever())
+    _adapter.features.poll_task = asyncio.create_task(_adapter.features.poll())
     logger.info("Clonoth Agent QQ adapter started: %s", CLONOTH_BASE_URL)
 
 
@@ -9485,57 +9322,55 @@ async def _on_bot_connect(bot: Bot) -> None:
 @driver.on_shutdown
 async def _shutdown() -> None:
     """NoneBot 关闭时停止事件路由并释放 HTTP 连接。"""
-    global _client, _event_router, _router_task, _callbacks, _anon_map_save_task, _live_reconcile_task, _attachment_cleanup_task
-    global _sticker_receipt_task
-    if _features.poll_task is not None:
-        _features.poll_task.cancel()
+    if _adapter.features.poll_task is not None:
+        _adapter.features.poll_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await _features.poll_task
-        _features.poll_task = None
-    if _event_router is not None:
-        _event_router.stop()
-    if _router_task is not None:
-        _router_task.cancel()
+            await _adapter.features.poll_task
+        _adapter.features.poll_task = None
+    if _adapter.event_router is not None:
+        _adapter.event_router.stop()
+    if _adapter.router_task is not None:
+        _adapter.router_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await _router_task
-        _router_task = None
-    if _live_reconcile_task is not None:
-        _live_reconcile_task.cancel()
+            await _adapter.router_task
+        _adapter.router_task = None
+    if _adapter.live_reconcile_task is not None:
+        _adapter.live_reconcile_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await _live_reconcile_task
-        _live_reconcile_task = None
-    if _attachment_cleanup_task is not None:
-        _attachment_cleanup_task.cancel()
+            await _adapter.live_reconcile_task
+        _adapter.live_reconcile_task = None
+    if _adapter.attachment_cleanup_task is not None:
+        _adapter.attachment_cleanup_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await _attachment_cleanup_task
-        _attachment_cleanup_task = None
-    if _sticker_receipt_task is not None:
-        _sticker_receipt_task.cancel()
+            await _adapter.attachment_cleanup_task
+        _adapter.attachment_cleanup_task = None
+    if _adapter.sticker_receipt_task is not None:
+        _adapter.sticker_receipt_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await _sticker_receipt_task
-        _sticker_receipt_task = None
-    if _qq_queue_tasks:
-        for task in _qq_queue_tasks.values():
+            await _adapter.sticker_receipt_task
+        _adapter.sticker_receipt_task = None
+    if _adapter.qq_queue_tasks:
+        for task in _adapter.qq_queue_tasks.values():
             task.cancel()
-        for task in _qq_queue_tasks.values():
+        for task in _adapter.qq_queue_tasks.values():
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-        _qq_queue_tasks.clear()
+        _adapter.qq_queue_tasks.clear()
     await _reconcile_sticker_receipts()
     await _stop_stickers()
-    if _client is not None:
-        await _client.close()
-        _client = None
-    _event_router = None
-    _callbacks = None
+    if _adapter.client is not None:
+        await _adapter.client.close()
+        _adapter.client = None
+    _adapter.event_router = None
+    _adapter.callbacks = None
     await _stop_forward_bridge()
     # 关闭前先取消可能在睡等间隔的节流 flush task，再同步 flush 一次，
     # 避免延迟写盘 task 未到点就退出导致最新别名丢失。
-    if _anon_map_save_task is not None and not _anon_map_save_task.done():
-        _anon_map_save_task.cancel()
+    if _adapter.anon_map_save_task is not None and not _adapter.anon_map_save_task.done():
+        _adapter.anon_map_save_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await _anon_map_save_task
-    _anon_map_save_task = None
+            await _adapter.anon_map_save_task
+    _adapter.anon_map_save_task = None
     with contextlib.suppress(Exception):
         await _save_anon_map()
     logger.info("Clonoth Agent QQ adapter stopped")
@@ -9551,11 +9386,11 @@ async def _feature_command_rule(bot: Bot, event: Event) -> bool:
             return False
     elif not _is_private_allowed(event):
         return False
-    metadata = await _features.prepare(bot, event)
+    metadata = await _adapter.features.prepare(bot, event)
     text = metadata.get("raw_text") or _message_to_text(event.get_message(), getattr(bot, "self_id", None))
     head = text.strip().replace("／", "/", 1).split(maxsplit=1)
     reply_ref = str(_extract_reply_message_id(event.get_message(), getattr(event, "raw_message", None)) or "")
-    return bool(await _features.matches_command(bot, event, text, reply_ref) or (head and head[0] in {"/帮助", "/help"}))
+    return bool(await _adapter.features.matches_command(bot, event, text, reply_ref) or (head and head[0] in {"/帮助", "/help"}))
 
 
 _feature_matcher = on_message(rule=Rule(_feature_command_rule), priority=5, block=True)
@@ -9564,10 +9399,10 @@ _feature_matcher = on_message(rule=Rule(_feature_command_rule), priority=5, bloc
 @_feature_matcher.handle()
 async def _handle_feature_command(bot: Bot, event: Event) -> None:
     text = (await _event_text_with_forward(bot, event)).strip()
-    result = await _features.handle_command(bot, event, text)
+    result = await _adapter.features.handle_command(bot, event, text)
     if result is None:
         result = {"text": _help_text(event), "attachments": []}
-    actor = _features.actor(bot, event)
+    actor = _adapter.features.actor(bot, event)
     if getattr(event, "group_id", None) is not None:
         _record_group_message(event, bot, override_text=text)
         target = {"type": "group", "group_id": event.group_id, "conversation_key": actor["scope"], "reply_message_id": event.message_id}
@@ -9590,13 +9425,13 @@ _community_notice_matcher = on_notice(priority=90, block=False)
 
 @_community_notice_matcher.handle()
 async def _handle_community_notice(bot: Bot, event: Event) -> None:
-    if getattr(event, "notice_type", "") != "group_increase" or not _features.available:
+    if getattr(event, "notice_type", "") != "group_increase" or not _adapter.features.available:
         return
     group_id = int(getattr(event, "group_id", 0) or 0)
     if not _is_group_allowed(group_id):
         return
-    actor = _features.target_actor(bot, {"type": "group", "group_id": group_id})
-    await _client.request_feature("POST", "/v1/community/notices", actor=actor, body={
+    actor = _adapter.features.target_actor(bot, {"type": "group", "group_id": group_id})
+    await _adapter.client.request_feature("POST", "/v1/community/notices", actor=actor, body={
         "notice_type": "group_increase", "member_id": str(getattr(event, "user_id", "")),
         "timestamp": getattr(event, "time", time.time()), "display_name": _event_display_name(event),
     })
@@ -9633,11 +9468,11 @@ async def _record_non_trigger_message(bot: Bot, event: GroupMessageEvent) -> Non
             bot, event, stable_conversation_key, expand_forward=False,
         )
         _remember_recent_images(stable_conversation_key, event, attachments)
-        await _features.register_attachments(bot, event, attachments)
+        await _adapter.features.register_attachments(bot, event, attachments)
         _collect_stickers_from_event(event, attachments)
         _record_group_message(event, bot, override_text=expanded_text, attachments=attachments)
-        metadata = await _features.prepare(bot, event)
-        if _features.blocked(metadata) or metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled"):
+        metadata = await _adapter.features.prepare(bot, event)
+        if _adapter.features.blocked(metadata) or metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled"):
             return
         await _maybe_echo_group_message(bot, event, expanded_text)
         await _maybe_join_sticker_combat(
@@ -9705,12 +9540,12 @@ async def _maybe_echo_group_message(bot: Bot, event: GroupMessageEvent, text: st
         return
 
     now = time.time()
-    _echo_recent[group_id].append(EchoEntry(key, str(event.user_id), now))
-    last_key, last_at = _echo_last.get(group_id, ("", 0.0))
+    _adapter.echo_recent[group_id].append(EchoEntry(key, str(event.user_id), now))
+    last_key, last_at = _adapter.echo_last.get(group_id, ("", 0.0))
     if now - last_at < live.echo_cooldown_sec:
         return
     hit = detect_echo(
-        _echo_recent[group_id],
+        _adapter.echo_recent[group_id],
         threshold=live.echo_threshold,
         now=now,
         max_age_seconds=live.echo_window_sec,
@@ -9728,7 +9563,7 @@ async def _maybe_echo_group_message(bot: Bot, event: GroupMessageEvent, text: st
         # 跟读失败无所谓，不值得惊动用户，更不该把异常抛回 matcher 链。
         logger.debug("echo send failed for group %s", group_id, exc_info=True)
         return
-    _echo_last[group_id] = (hit, now)
+    _adapter.echo_last[group_id] = (hit, now)
 
 
 # 群文件上传通知记录器。部分 OneBot 实现把普通文件作为 notice 上报，而不是 message file 段。
@@ -9809,8 +9644,8 @@ async def _finish_local_command(
 
 
 async def _check_local_group_send(bot: Bot, event: GroupMessageEvent) -> None:
-    metadata = await _features.prepare(bot, event)
-    await _features.check_send(bot, {"type": "group", "group_id": event.group_id,
+    metadata = await _adapter.features.prepare(bot, event)
+    await _adapter.features.check_send(bot, {"type": "group", "group_id": event.group_id,
                                     "_response_purpose": "direct" if metadata.get("direct", True) else "ambient"})
 
 
@@ -9831,12 +9666,11 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
     matcher 由调用方传进来：显式信号和意愿判断走两个不同优先级的 matcher，
     但从本地命令到 inbound 提交的整条链路必须是同一份，否则两条路会各自长歪。
     """
-    global _last_bot
-    _last_bot = bot
+    _adapter.last_bot = bot
     # on_bot_connect 已经认过一次，这里是兜底：漏认一次就是记忆分叉，代价不对等。
     _adopt_bot_scope(bot)
 
-    if _client is None or _session_state is None:
+    if _adapter.client is None or _adapter.session_state is None:
         await _check_local_group_send(bot, event)
         await matcher.finish("Clonoth Agent 尚未初始化，请稍后重试。")
 
@@ -9848,22 +9682,22 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
     # 前缀判定必须在剥前缀之前做，否则 all 模式下所有人都会被当成主动找 bot。
     direct_interaction = _is_direct_bot_interaction(event, bot, raw_user_text)
     user_text = _strip_trigger_prefix(raw_user_text)
-    metadata = await _features.prepare(bot, event)
-    if metadata and _features.coordinator.can_continue(metadata["actor"], metadata.get("reply_ref", "")):
-        pending = _features.coordinator.bursts[metadata["actor"]["scope"]].item
+    metadata = await _adapter.features.prepare(bot, event)
+    if metadata and _adapter.features.coordinator.can_continue(metadata["actor"], metadata.get("reply_ref", "")):
+        pending = _adapter.features.coordinator.bursts[metadata["actor"]["scope"]].item
         metadata["direct"] = metadata.get("direct", False) or pending.platform_updates.get("_response_purpose") == "direct"
-        await _features.decision(bot, event, pending.platform_updates.get("_route_hints", {}).get("response_action", "task"), "同一用户正在补充当前请求")
+        await _adapter.features.decision(bot, event, pending.platform_updates.get("_route_hints", {}).get("response_action", "task"), "同一用户正在补充当前请求")
     if metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled") and not metadata.get("classified") and not user_text.startswith(("/", "／")):
         verdict = await _judge_llm_intent(bot, event, user_text)
         action = _coordinated_response_action(verdict, metadata)
-        if action != "ignore" and not _features.coordinator.allow_response(metadata["actor"]["scope"], metadata["policy"]["settings"], direct=metadata.get("direct", False)):
+        if action != "ignore" and not _adapter.features.coordinator.allow_response(metadata["actor"]["scope"], metadata["policy"]["settings"], direct=metadata.get("direct", False)):
             action = "ignore"
-        await _features.decision(bot, event, action, verdict.reason)
+        await _adapter.features.decision(bot, event, action, verdict.reason)
         if action == "react" and getattr(verdict, "reaction_id", "") in _REACT_MODEL_EMOJIS:
             if await _set_message_react(bot, event, verdict.reaction_id, True):
                 _record_group_message(event, bot, override_text=user_text)
                 await matcher.finish()
-            await _features.decision(bot, event, "short_reply", "表态未送达，改为短答")
+            await _adapter.features.decision(bot, event, "short_reply", "表态未送达，改为短答")
         if action == "ignore":
             await _record_non_trigger_message(bot, event)
             await matcher.finish()
@@ -9872,7 +9706,7 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
 
     attachments, attachment_errors = await _collect_qq_attachments(bot, event, stable_conversation_key)
     _remember_recent_images(stable_conversation_key, event, attachments)
-    await _features.register_attachments(bot, event, attachments)
+    await _adapter.features.register_attachments(bot, event, attachments)
     help_reply = await _maybe_handle_help_command(event=event, user_text=user_text)
     if help_reply is not None:
         await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=help_reply)
@@ -9988,24 +9822,24 @@ async def _handle_intent(bot: Bot, event: GroupMessageEvent) -> None:
     """问一次模型再决定这条群消息要不要接。"""
     text = await _group_trigger_text(bot, event)
     verdict = await _judge_llm_intent(bot, event, text)
-    metadata = await _features.prepare(bot, event)
+    metadata = await _adapter.features.prepare(bot, event)
     settings = metadata.get("policy", {}).get("settings", {})
     if settings.get("response_policy_enabled"):
         action = _coordinated_response_action(verdict, metadata)
-        if action != "ignore" and not _features.coordinator.allow_response(metadata["actor"]["scope"], settings, direct=metadata.get("direct", False)):
+        if action != "ignore" and not _adapter.features.coordinator.allow_response(metadata["actor"]["scope"], settings, direct=metadata.get("direct", False)):
             action = "ignore"
-        await _features.decision(bot, event, action, verdict.reason)
+        await _adapter.features.decision(bot, event, action, verdict.reason)
         if action == "react":
             if await _set_message_react(bot, event, verdict.reaction_id, True):
                 await _record_non_trigger_message(bot, event)
                 return
-            await _features.decision(bot, event, "short_reply", "表态未送达，改为短答")
+            await _adapter.features.decision(bot, event, "short_reply", "表态未送达，改为短答")
         if action == "ignore":
             await _record_non_trigger_message(bot, event)
             return
     inp = _trigger_input(event, bot, text)
     decision = resolve_llm_intent(
-        inp, TriggerConfig.from_live(live), _trigger_cooldown,
+        inp, TriggerConfig.from_live(live), _adapter.trigger_cooldown,
         agreed=verdict.agreed, reason=verdict.reason,
     )
     if not decision.triggered:
@@ -10016,7 +9850,7 @@ async def _handle_intent(bot: Bot, event: GroupMessageEvent) -> None:
         )
         await _record_non_trigger_message(bot, event)
         return
-    _trigger_cooldown.record(inp)
+    _adapter.trigger_cooldown.record(inp)
     logger.info(
         "QQ intent accepted group=%s reason=%s",
         getattr(event, "group_id", None), decision.reason,
@@ -10030,9 +9864,9 @@ _private_matcher = on_message(rule=Rule(_private_message_rule), priority=10, blo
 
 async def _claim_pending_approval(approval_id: str, admin_id: int, decision: str) -> Optional[Dict[str, Any]]:
     """原子领取待审批：抢到才返回 info，其余返回 None。领取即登记 settled。"""
-    async with _approval_decision_lock:
+    async with _adapter.approval_decision_lock:
         _prune_expired_approvals()
-        info = _pending_approvals.pop(approval_id, None)
+        info = _adapter.pending_approvals.pop(approval_id, None)
         if info is None:
             return None
         # 领取后进程崩溃则这条在 QQ 侧变 settled、无法再批，engine 侧超时 auto-deny，属 fail-closed。
@@ -10044,10 +9878,10 @@ async def _claim_pending_approval(approval_id: str, admin_id: int, decision: str
 
 
 async def _release_approval_claim(approval_id: str, info: Dict[str, Any]) -> None:
-    async with _approval_decision_lock:
+    async with _adapter.approval_decision_lock:
         # 一次网络错误不该把审批永久吞掉，放回待审批让人重试。
-        _settled_approvals.pop(approval_id, None)
-        _pending_approvals[approval_id] = info
+        _adapter.settled_approvals.pop(approval_id, None)
+        _adapter.pending_approvals[approval_id] = info
 
 
 async def _finish_approval_decision(user_id: int, approval_id: str, decision: str) -> None:
@@ -10060,7 +9894,7 @@ async def _finish_approval_decision(user_id: int, approval_id: str, decision: st
     if info is None:
         await _private_matcher.finish(_settled_approval_notice(approval_id))
     try:
-        ok = await _client.approve(
+        ok = await _adapter.client.approve(
             approval_id,
             decision=decision,
             comment=f"QQ admin {user_id} {decision}ed via private message.",
@@ -10084,8 +9918,7 @@ async def _finish_approval_decision(user_id: int, approval_id: str, decision: st
 @_private_matcher.handle()
 async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     """把当前 QQ 私聊请求提交给 ClonothZX。"""
-    global _last_bot
-    _last_bot = bot
+    _adapter.last_bot = bot
     # on_bot_connect 已经认过一次，这里是兜底：漏认一次就是记忆分叉，代价不对等。
     _adopt_bot_scope(bot)
 
@@ -10097,7 +9930,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
             await _private_matcher.finish(notice)
         await _private_matcher.finish()
 
-    if _client is None or _session_state is None:
+    if _adapter.client is None or _adapter.session_state is None:
         await _private_matcher.finish("Clonoth Agent 尚未初始化，请稍后重试。")
 
     _remember_message_for_reply_context(event)
@@ -10176,7 +10009,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     stable_conversation_key = _stable_conversation_key(real_conversation_key)
     attachments, attachment_errors = await _collect_qq_attachments(bot, event, stable_conversation_key)
     _remember_recent_images(stable_conversation_key, event, attachments)
-    await _features.register_attachments(bot, event, attachments)
+    await _adapter.features.register_attachments(bot, event, attachments)
     dream_reply = await _maybe_handle_dream_command(
         event=event, user_text=user_text, conversation_key=stable_conversation_key,
     )

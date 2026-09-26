@@ -292,7 +292,7 @@ class TestAutoTag:
             runtime, "StickerTagger",
             lambda *a, **kw: seen.append(kw["config"]().enabled) or _Stub(),
         )
-        runtime._sticker_tagger = None
+        runtime._adapter.sticker_tagger = None
         runtime._start_sticker_tagger()
 
         assert seen == [False]
@@ -305,7 +305,7 @@ class TestAutoTag:
             runtime, "StickerTagger",
             lambda *a, **kw: holder.append(kw["config"]) or _Stub(),
         )
-        runtime._sticker_tagger = None
+        runtime._adapter.sticker_tagger = None
         runtime._start_sticker_tagger()
         read = holder[0]
 

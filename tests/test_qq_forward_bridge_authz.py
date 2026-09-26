@@ -72,7 +72,7 @@ def _harness(
     if origin is None:
         origin = {"type": "group", "group_id": _HOME_GROUP, "user_id": requester}
     if origin:
-        monkeypatch.setitem(runtime._session_targets, _SESSION, origin)
+        monkeypatch.setitem(runtime._adapter.session_targets, _SESSION, origin)
 
     async def resolve(*args: Any, **kwargs: Any):
         return runtime.ProactiveTarget(resolved[0], resolved[1], "Target"), ""
@@ -303,7 +303,7 @@ def _handle(runtime, payload: dict[str, Any], *, token: Any = "__signed__", head
 
 def _register_group(runtime, monkeypatch: pytest.MonkeyPatch, *, group_id: int = _HOME_GROUP, user_id: int = _MEMBER_QQ) -> None:
     monkeypatch.setitem(
-        runtime._session_targets, _SESSION,
+        runtime._adapter.session_targets, _SESSION,
         {"type": "group", "group_id": group_id, "user_id": user_id},
     )
 
@@ -356,7 +356,7 @@ def test_the_token_file_is_created_once_and_reused(monkeypatch: pytest.MonkeyPat
     token_file = Path(runtime.FORWARD_BRIDGE_TOKEN_FILE)
     assert token_file.read_text(encoding="utf-8").strip() == first
 
-    runtime._forward_bridge_token_cache = ""
+    runtime._adapter.forward_bridge_token_cache = ""
     assert runtime._forward_bridge_token() == first
 
 
@@ -365,14 +365,14 @@ def test_an_unavailable_token_file_keeps_the_bridge_down(monkeypatch: pytest.Mon
     blocker = tmp_path / "blocker"
     blocker.write_text("x", encoding="utf-8")
     monkeypatch.setattr(runtime, "FORWARD_BRIDGE_TOKEN_FILE", str(blocker / "nested" / "token"))
-    runtime._forward_bridge_token_cache = ""
+    runtime._adapter.forward_bridge_token_cache = ""
 
     assert runtime._forward_bridge_token() == ""
     assert runtime._forward_bridge_check_token(_Request({}, {})) is False
 
     runtime.refresh_live_config()
     asyncio.run(runtime._start_forward_bridge())
-    assert runtime._forward_bridge_started is False
+    assert runtime._adapter.forward_bridge_started is False
 
 
 def test_the_token_never_appears_in_runtime_facts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -435,7 +435,7 @@ def test_recent_uses_the_same_gate(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
 def test_a_private_origin_outside_the_allowlist_is_refused(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = _bridge_runtime(monkeypatch, tmp_path)
     monkeypatch.setitem(
-        runtime._session_targets, _SESSION,
+        runtime._adapter.session_targets, _SESSION,
         {"type": "private", "user_id": _MEMBER_QQ},
     )
     set_live_config(
@@ -456,7 +456,7 @@ def test_self_send_is_refused_when_origin_left_the_private_allowlist(monkeypatch
     bot = _Bot()
     monkeypatch.setattr(runtime, "get_bot", lambda: bot)
     monkeypatch.setitem(
-        runtime._session_targets, _SESSION,
+        runtime._adapter.session_targets, _SESSION,
         {"type": "private", "user_id": _MEMBER_QQ},
     )
     set_live_config(
@@ -479,7 +479,7 @@ def test_the_friends_switch_does_not_open_the_bridge(monkeypatch: pytest.MonkeyP
     """好友总开关只放宽入站。出站没有 sub_type 可查，拿它顶替等于对任何人放行。"""
     runtime = _bridge_runtime(monkeypatch, tmp_path)
     monkeypatch.setitem(
-        runtime._session_targets, _SESSION,
+        runtime._adapter.session_targets, _SESSION,
         {"type": "private", "user_id": _MEMBER_QQ},
     )
     set_live_config(
@@ -499,7 +499,7 @@ def test_self_send_needs_the_allowlist_not_just_the_friends_switch(
     bot = _Bot()
     monkeypatch.setattr(runtime, "get_bot", lambda: bot)
     monkeypatch.setitem(
-        runtime._session_targets, _SESSION,
+        runtime._adapter.session_targets, _SESSION,
         {"type": "private", "user_id": _MEMBER_QQ},
     )
     set_live_config(
@@ -523,7 +523,7 @@ def test_the_allowlist_still_lets_its_own_members_through(
     """收紧的是好友那一档，名单本身不能跟着失效。"""
     runtime = _bridge_runtime(monkeypatch, tmp_path)
     monkeypatch.setitem(
-        runtime._session_targets, _SESSION,
+        runtime._adapter.session_targets, _SESSION,
         {"type": "private", "user_id": _MEMBER_QQ},
     )
     set_live_config(
@@ -541,8 +541,8 @@ def test_the_allowlist_still_lets_its_own_members_through(
 
 def _two_contacts_named(runtime, monkeypatch: pytest.MonkeyPatch) -> None:
     """两个联系人都能用「老板」叫到，只有 label（张总/李总）会泄露真实身份。"""
-    monkeypatch.setitem(runtime._QQ_USER_PROFILES, "70001", {"address_as": "老板"})
-    monkeypatch.setitem(runtime._QQ_USER_PROFILES, "70002", {"address_as": "老板"})
+    monkeypatch.setitem(runtime._adapter.qq_user_profiles, "70001", {"address_as": "老板"})
+    monkeypatch.setitem(runtime._adapter.qq_user_profiles, "70002", {"address_as": "老板"})
 
     async def candidates(_bot: Any) -> list[Any]:
         return [
@@ -559,7 +559,7 @@ def test_a_member_is_not_shown_which_contacts_matched(monkeypatch: pytest.Monkey
     monkeypatch.setattr(runtime, "get_bot", lambda: bot)
     set_live_config(runtime, admin_users=frozenset({_ADMIN_QQ}))
     monkeypatch.setitem(
-        runtime._session_targets, _SESSION,
+        runtime._adapter.session_targets, _SESSION,
         {"type": "group", "group_id": _HOME_GROUP, "user_id": _MEMBER_QQ},
     )
     _two_contacts_named(runtime, monkeypatch)
@@ -576,7 +576,7 @@ def test_the_roster_still_sees_the_collision(monkeypatch: pytest.MonkeyPatch, tm
     monkeypatch.setattr(runtime, "get_bot", lambda: bot)
     set_live_config(runtime, admin_users=frozenset({_ADMIN_QQ}))
     monkeypatch.setitem(
-        runtime._session_targets, _SESSION,
+        runtime._adapter.session_targets, _SESSION,
         {"type": "private", "user_id": _ADMIN_QQ},
     )
     _two_contacts_named(runtime, monkeypatch)

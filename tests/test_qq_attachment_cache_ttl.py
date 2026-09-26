@@ -52,7 +52,7 @@ class TestCleanupRespectsTheFloor:
         fresh = time.time() - 5
         os.utime(path, (fresh, fresh))
 
-        runtime._last_attachment_cleanup_at = 0.0
+        runtime._adapter.last_attachment_cleanup_at = 0.0
         runtime._cleanup_old_qq_attachments()
 
         assert path.exists()
@@ -67,7 +67,7 @@ class TestCleanupRespectsTheFloor:
         stale = time.time() - 120
         os.utime(path, (stale, stale))
 
-        runtime._last_attachment_cleanup_at = 0.0
+        runtime._adapter.last_attachment_cleanup_at = 0.0
         runtime._cleanup_old_qq_attachments()
 
         assert not path.exists()

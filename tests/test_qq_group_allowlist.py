@@ -147,7 +147,7 @@ def test_forward_bridge_current_group_denied_when_allowlist_empty(
     """qq_forward 的「发到本群」分支同样不能在空名单时放行。"""
     runtime = _runtime(monkeypatch, tmp_path, frozenset())
     monkeypatch.setitem(
-        runtime._session_targets, _SESSION,
+        runtime._adapter.session_targets, _SESSION,
         {'type': 'group', 'group_id': _NOT_IN_LIST, 'user_id': _ADMIN},
     )
 

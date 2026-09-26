@@ -123,7 +123,7 @@ class TestReplyPayloadFallback:
         self, runtime, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _patch_no_get_msg(runtime, monkeypatch)
-        runtime._reply_message_cache["555"] = {
+        runtime._adapter.reply_message_cache["555"] = {
             "message": None,
             "raw_message": "缓存里的原话",
             "sender": {"user_id": 12345, "nickname": "甲", "card": "甲"},
@@ -343,7 +343,7 @@ class TestAttachmentCleanup:
         assert not f.exists()
 
     def test_dead_path_not_returned(self, runtime) -> None:
-        runtime._reply_attachment_cache["m9"] = {
+        runtime._adapter.reply_attachment_cache["m9"] = {
             "conversation_key": "qq_group:1",
             "sender_id": "1",
             "created_at": time.time(),

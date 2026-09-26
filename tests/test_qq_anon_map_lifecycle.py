@@ -88,7 +88,7 @@ def test_ttl_disabled_keeps_stale_entries(runtime: Any) -> None:
 
     runtime._load_anon_map()
 
-    assert runtime._anon_users.get("123456") == "UserA"
+    assert runtime._adapter.anon_users.get("123456") == "UserA"
 
 
 def test_ttl_prunes_stale_without_rewinding_counter(
@@ -109,10 +109,10 @@ def test_ttl_prunes_stale_without_rewinding_counter(
 
     runtime._load_anon_map()
 
-    assert "222222" not in runtime._anon_users  # 陈旧条目被清
-    assert runtime._anon_users.get("111111") == "UserA"  # 新鲜条目保留
+    assert "222222" not in runtime._adapter.anon_users  # 陈旧条目被清
+    assert runtime._adapter.anon_users.get("111111") == "UserA"  # 新鲜条目保留
     # 计数器不能因剪枝回退到 UserA+1，否则新人会复用被清掉的 UserE。
-    assert runtime._anon_user_next == 5
+    assert runtime._adapter.anon_user_next == 5
     assert runtime._anonymize_user_id("333333") == "UserF"
 
 
@@ -132,15 +132,15 @@ def test_ttl_preserves_enrolled_subject(
 
     runtime._load_anon_map()
 
-    assert runtime._anon_users.get("123456") == "UserA"
+    assert runtime._adapter.anon_users.get("123456") == "UserA"
     assert runtime._resolve_at_alias_to_real("UserA") == "123456"
 
 
 def test_save_persists_real_last_seen_not_write_time(runtime: Any) -> None:
     runtime._anonymize_user_id("123456")
     old = time.time() - 400 * 86400
-    runtime._anon_user_last_seen["123456"] = old
-    runtime._anon_map_dirty = True
+    runtime._adapter.anon_user_last_seen["123456"] = old
+    runtime._adapter.anon_map_dirty = True
 
     asyncio.run(runtime._save_anon_map())
 

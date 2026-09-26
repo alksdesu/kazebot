@@ -57,8 +57,8 @@ def _wire_agent_path(runtime: Any, monkeypatch: pytest.MonkeyPatch, text: str) -
     """接好闸门之后那条链需要的桩，让命令分支可达。"""
     matcher = _FakeMatcher()
     monkeypatch.setattr(runtime, "_private_matcher", matcher)
-    monkeypatch.setattr(runtime, "_client", SimpleNamespace(), raising=False)
-    monkeypatch.setattr(runtime, "_session_state", SimpleNamespace(), raising=False)
+    monkeypatch.setattr(runtime._adapter, "client", SimpleNamespace(), raising=False)
+    monkeypatch.setattr(runtime._adapter, "session_state", SimpleNamespace(), raising=False)
     monkeypatch.setattr(runtime, "_remember_message_for_reply_context", lambda event: None)
 
     async def fake_text(_bot: Any, _event: Any) -> str:

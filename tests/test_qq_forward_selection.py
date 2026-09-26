@@ -54,7 +54,7 @@ class _Bot:
 
 def _register(runtime, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(
-        runtime._session_targets, _SESSION,
+        runtime._adapter.session_targets, _SESSION,
         {"type": "group", "group_id": _GROUP_ID, "user_id": _ADMIN_QQ},
     )
 

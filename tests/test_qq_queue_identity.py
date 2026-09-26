@@ -15,7 +15,7 @@ from tests._onebot_harness import load_runtime, set_live_config
 @pytest.fixture()
 def runtime(monkeypatch, tmp_path):
     module = load_runtime(monkeypatch, tmp_path)
-    module._session_state = SessionState()
+    module._adapter.session_state = SessionState()
     set_live_config(module, enable_queue=True, queue_workers=2, queue_interval=0, enable_preempt=False)
     monkeypatch.setattr(module, "_remember_route_state", AsyncMock())
     return module
@@ -57,7 +57,7 @@ def test_other_senders_never_supply_permissions_for_queued_text(runtime, monkeyp
         submitted.append(kwargs)
         return SimpleNamespace(session_id="session", accepted=True, inbound_seq=len(submitted))
 
-    runtime._client = SimpleNamespace(submit_inbound=submit)
+    runtime._adapter.client = SimpleNamespace(submit_inbound=submit)
 
     async def exercise():
         await runtime._enqueue_or_submit_inbound(item(runtime, 10001, text="first request"))
@@ -84,7 +84,7 @@ def test_sender_switch_preserves_arrival_order(runtime):
             await runtime._enqueue_or_submit_inbound(item(runtime, user_id, text=text))
 
     asyncio.run(exercise())
-    assert [queued.user_text for queued in runtime._qq_queue] == ["a1", "b", "a2"]
+    assert [queued.user_text for queued in runtime._adapter.qq_queue] == ["a1", "b", "a2"]
 
 
 def test_same_sender_keeps_all_memory_mentions_when_merged(runtime):
@@ -93,8 +93,8 @@ def test_same_sender_keeps_all_memory_mentions_when_merged(runtime):
         await runtime._enqueue_or_submit_inbound(item(runtime, text="second"))
 
     asyncio.run(exercise())
-    assert len(runtime._qq_queue) == 1
-    merged = runtime._qq_queue[0]
+    assert len(runtime._adapter.qq_queue) == 1
+    merged = runtime._adapter.qq_queue[0]
     assert merged.user_text == "first\nsecond"
     subjects = runtime._collect_memory_subjects(
         merged.event, merged.user_text, merged.stable_conversation_key,
@@ -123,7 +123,7 @@ def test_changed_or_unverified_identity_cannot_merge(runtime, change):
         await runtime._enqueue_or_submit_inbound(second)
 
     asyncio.run(exercise())
-    assert len(runtime._qq_queue) == 2
+    assert len(runtime._adapter.qq_queue) == 2
 
 
 def test_waiters_serialize_each_group_without_blocking_other_groups(runtime, monkeypatch):
@@ -157,12 +157,12 @@ def test_waiters_serialize_each_group_without_blocking_other_groups(runtime, mon
             await settle()
             assert submitted == [11, 21, 12]
             runtime._mark_qq_reply_finished(11)
-            assert not runtime._qq_waiting_replies["group-1"].event.is_set()
+            assert not runtime._adapter.qq_waiting_replies["group-1"].event.is_set()
             runtime._mark_qq_reply_finished(12)
             runtime._mark_qq_reply_finished(21)
             await settle()
-            assert not runtime._qq_waiting_replies
-            assert not runtime._qq_active_conversations
+            assert not runtime._adapter.qq_waiting_replies
+            assert not runtime._adapter.qq_active_conversations
         finally:
             await stop(tasks)
 
@@ -191,7 +191,7 @@ def test_early_final_reply_and_rejected_submit_release_workers(runtime, monkeypa
         try:
             await settle()
             assert submitted == [1, 2, 3]
-            assert not runtime._qq_waiting_replies
+            assert not runtime._adapter.qq_waiting_replies
         finally:
             await stop([worker])
 
@@ -202,7 +202,7 @@ def test_final_delivery_failure_does_not_finish_waiter(runtime, monkeypatch):
     queued = item(runtime)
     trigger = TriggerInfo(7, "group-1", "session", False, platform_data={**queued.platform_updates, "bot": queued.bot})
     waiter = runtime.QueueReplyWaiter(asyncio.Event(), 7)
-    runtime._qq_waiting_replies["group-1"] = waiter
+    runtime._adapter.qq_waiting_replies["group-1"] = waiter
     monkeypatch.setattr(runtime, "_send_text_and_attachments", AsyncMock(side_effect=OSError("send failed")))
     with pytest.raises(OSError):
         asyncio.run(runtime.TangQiuCallbacks().send_reply(trigger, "done", []))
@@ -213,7 +213,7 @@ def test_fallback_final_reply_wakes_only_its_request(runtime, monkeypatch):
     monkeypatch.setattr(runtime, "_get_fallback_bot", lambda: object())
     monkeypatch.setattr(runtime, "_send_text_and_attachments", AsyncMock())
     waiter = runtime.QueueReplyWaiter(asyncio.Event(), 8)
-    runtime._qq_waiting_replies["group-1"] = waiter
+    runtime._adapter.qq_waiting_replies["group-1"] = waiter
 
     async def exercise():
         callbacks = runtime.TangQiuCallbacks()
@@ -235,13 +235,13 @@ def test_router_intermediate_deliveries_never_release_waiter(runtime, monkeypatc
     monkeypatch.setattr(runtime, "_send_split_text", AsyncMock(return_value=True))
     queued = item(runtime)
     if has_trigger:
-        runtime._session_state.register_trigger(TriggerInfo(
+        runtime._adapter.session_state.register_trigger(TriggerInfo(
             7, "qq_group:1", "session", False, platform_data={**queued.platform_updates, "bot": queued.bot},
         ))
     waiter = runtime.QueueReplyWaiter(asyncio.Event(), 7)
-    runtime._qq_waiting_replies["group-1"] = waiter
+    runtime._adapter.qq_waiting_replies["group-1"] = waiter
     router = runtime.EventRouter(
-        SimpleNamespace(), runtime._session_state, runtime.TangQiuCallbacks(),
+        SimpleNamespace(), runtime._adapter.session_state, runtime.TangQiuCallbacks(),
         runtime.BotConfig(base_url="http://localhost:0", entry_node_id="qq.orchestrator",
                           conversation_key_prefix="qq_group", workspace_root=tmp_path),
     )
@@ -268,8 +268,8 @@ def test_router_intermediate_deliveries_never_release_waiter(runtime, monkeypatc
 def test_preempt_collects_hints_once_after_sender_verification(runtime, monkeypatch, preempt_accepted):
     set_live_config(runtime, enable_preempt=True)
     queued = item(runtime, 111)
-    runtime._session_state.register_session("group-1", "session")
-    runtime._session_state.register_trigger(TriggerInfo(10, "group-1", "session", False, platform_data=queued.platform_updates))
+    runtime._adapter.session_state.register_session("group-1", "session")
+    runtime._adapter.session_state.register_trigger(TriggerInfo(10, "group-1", "session", False, platform_data=queued.platform_updates))
     hints = {"subjects": ["UserA", "UserB"]}
     collector = Mock(return_value=hints["subjects"])
     monkeypatch.setattr(runtime, "_collect_memory_subjects", collector)
@@ -286,7 +286,7 @@ def test_preempt_collects_hints_once_after_sender_verification(runtime, monkeypa
         inbound_calls.append(kwargs)
         return SimpleNamespace(session_id="session", accepted=True, inbound_seq=11)
 
-    runtime._client = SimpleNamespace(get_running_tasks=running, preempt_task=preempt, submit_inbound=submit)
+    runtime._adapter.client = SimpleNamespace(get_running_tasks=running, preempt_task=preempt, submit_inbound=submit)
     set_live_config(runtime, enable_queue=False)
     asyncio.run(runtime._enqueue_or_submit_inbound(queued))
     assert preempt_calls[0]["memory_hints"] == hints
@@ -300,11 +300,11 @@ def test_preempt_collects_hints_once_after_sender_verification(runtime, monkeypa
 def test_different_sender_is_checked_before_preempt_memory_collection(runtime):
     queued = item(runtime, 111)
     previous = item(runtime, 222)
-    runtime._session_state.register_session("group-1", "session")
-    runtime._session_state.register_trigger(TriggerInfo(10, "group-1", "session", False, platform_data=previous.platform_updates))
+    runtime._adapter.session_state.register_session("group-1", "session")
+    runtime._adapter.session_state.register_trigger(TriggerInfo(10, "group-1", "session", False, platform_data=previous.platform_updates))
     collector = Mock(return_value={"subjects": ["UserA"]})
     preempt = AsyncMock(return_value=True)
-    runtime._client = SimpleNamespace(
+    runtime._adapter.client = SimpleNamespace(
         get_running_tasks=AsyncMock(return_value=[SimpleNamespace(task_id="task", is_user_entry=True, source_inbound_seq=10)]),
         preempt_task=preempt,
     )
@@ -337,10 +337,10 @@ def test_timed_out_reply_cannot_release_the_next_request(runtime, monkeypatch):
         try:
             await asyncio.wait_for(second_started.wait(), timeout=2)
             runtime._mark_qq_reply_finished(11)
-            assert not runtime._qq_waiting_replies["group-1"].event.is_set()
+            assert not runtime._adapter.qq_waiting_replies["group-1"].event.is_set()
             runtime._mark_qq_reply_finished(12)
             await settle()
-            assert not runtime._qq_waiting_replies
+            assert not runtime._adapter.qq_waiting_replies
         finally:
             await stop([worker])
 

@@ -154,8 +154,8 @@ def test_real_adapter_command_dispatch_uses_trusted_actor(runtime, monkeypatch):
             return {"settings": {}, "quiet": {}}
         return {"result": {"text": "joined", "attachments": []}}
 
-    runtime._client = SimpleNamespace(request_feature=request)
-    result = asyncio.run(runtime._features.handle_command(SimpleNamespace(self_id="90000"), event(text="/报名 A1"), "/报名 A1"))
+    runtime._adapter.client = SimpleNamespace(request_feature=request)
+    result = asyncio.run(runtime._adapter.features.handle_command(SimpleNamespace(self_id="90000"), event(text="/报名 A1"), "/报名 A1"))
     assert result["text"] == "joined"
     actor = calls[-1][1]["actor"]
     assert actor["user_id"] == "10001" and actor["role"] == "admin"
@@ -165,7 +165,7 @@ def test_real_adapter_command_dispatch_uses_trusted_actor(runtime, monkeypatch):
 def test_quiet_defers_final_output_before_onebot_send(runtime, monkeypatch):
     import time
     policy = {"quiet": {"mode": "silent", "expires_at": time.time() + 100}, "settings": {}}
-    runtime._client = SimpleNamespace(request_feature=AsyncMock(return_value=policy))
+    runtime._adapter.client = SimpleNamespace(request_feature=AsyncMock(return_value=policy))
     bot = SimpleNamespace(self_id="90000", send_group_msg=AsyncMock(return_value={"message_id": 8}))
     from clonoth_sdk.state import TriggerInfo
     trigger = TriggerInfo(1, "qq_group:test", "session", False, platform_data={"bot": bot, "type": "group", "group_id": 12345})
@@ -176,7 +176,7 @@ def test_quiet_defers_final_output_before_onebot_send(runtime, monkeypatch):
 
 
 def test_short_message_aggregation_keeps_identity_and_order(runtime):
-    coordinator = runtime._features.coordinator
+    coordinator = runtime._adapter.features.coordinator
     sent = []
     settings = {"merge_window_sec": 0.03, "merge_max_wait_sec": 0.1}
 
@@ -227,11 +227,11 @@ def test_resuming_quiet_wakes_sdk_deferred_delivery(runtime):
             return {"quiet": {"mode": "silent", "expires_at": 9999999999}, "settings": {}}
         return {"result": {"text": "已恢复", "attachments": []}}
 
-    runtime._client = SimpleNamespace(request_feature=request)
-    runtime._event_router = SimpleNamespace(resume_deferred=lambda scope: calls.append(scope) or 1)
-    result = asyncio.run(runtime._features.handle_command(SimpleNamespace(self_id="90000"), event(text="/恢复"), "/恢复"))
+    runtime._adapter.client = SimpleNamespace(request_feature=request)
+    runtime._adapter.event_router = SimpleNamespace(resume_deferred=lambda scope: calls.append(scope) or 1)
+    result = asyncio.run(runtime._adapter.features.handle_command(SimpleNamespace(self_id="90000"), event(text="/恢复"), "/恢复"))
     assert result["text"] == "已恢复"
-    assert calls == [runtime._features.actor(SimpleNamespace(self_id="90000"), event())["scope"]]
+    assert calls == [runtime._adapter.features.actor(SimpleNamespace(self_id="90000"), event())["scope"]]
 
 
 def test_short_message_stage_survives_restart_and_keeps_topic(runtime, monkeypatch):
@@ -239,12 +239,12 @@ def test_short_message_stage_survives_restart_and_keeps_topic(runtime, monkeypat
 
     bot = SimpleNamespace(self_id="90000", call_api=AsyncMock(return_value={"role": "member"}))
     original = event(message_id=7, text="pending")
-    scope = runtime._features.actor(bot, original)["scope"]
+    scope = runtime._adapter.features.actor(bot, original)["scope"]
     queued = runtime.QueuedInbound(None, bot, original, "qq_group", "qq_group:12345", scope,
                                    "pending", [{"type": "image", "path": "data/attachments/example.png"}], False,
                                    {"_route_hints": {"topic_id": "topic-1", "source_message_refs": ["7"]}}, "pending")
-    runtime._features.stage_burst(queued)
-    runtime._features.started_at = time.time() + 1
+    runtime._adapter.features.stage_burst(queued)
+    runtime._adapter.features.started_at = time.time() + 1
     recovered = []
 
     async def submit(item):
@@ -252,11 +252,11 @@ def test_short_message_stage_survives_restart_and_keeps_topic(runtime, monkeypat
         return True
 
     monkeypatch.setattr(runtime, "_queue_or_submit_ready", submit)
-    asyncio.run(runtime._features.recover_bursts(bot))
+    asyncio.run(runtime._adapter.features.recover_bursts(bot))
     assert len(recovered) == 1
     assert recovered[0].platform_updates["_route_hints"]["topic_id"] == "topic-1"
     assert recovered[0].platform_updates["_source_attachments"] == queued.attachments
-    assert runtime._features.burst_store.recover("another-bot", time.time() + 2) == []
+    assert runtime._adapter.features.burst_store.recover("another-bot", time.time() + 2) == []
 
 
 def test_quiet_deferral_is_not_wrapped_as_attachment_failure(runtime, monkeypatch, tmp_path):
@@ -276,7 +276,7 @@ def test_private_metadata_never_grants_group_role(runtime):
     private = event()
     del private.group_id
     private.sender.role = "owner"
-    actor = runtime._features.actor(SimpleNamespace(self_id="90000"), private)
+    actor = runtime._adapter.features.actor(SimpleNamespace(self_id="90000"), private)
     assert actor["channel"] == "qq_private" and actor["role"] == "member"
 
 
@@ -326,9 +326,9 @@ def test_activity_inputs_do_not_silently_coerce_invalid_types(service, manager, 
 def test_current_inbound_never_embeds_foreign_topic_as_user_content(runtime, monkeypatch):
     bot = SimpleNamespace(self_id="90000")
     current = event(message_id=9, text="follow up")
-    runtime._client = SimpleNamespace(request_feature=AsyncMock())
-    actor = runtime._features.actor(bot, current)
-    runtime._features.coordinator.messages[(actor["scope"], "9")] = {
+    runtime._adapter.client = SimpleNamespace(request_feature=AsyncMock())
+    actor = runtime._adapter.features.actor(bot, current)
+    runtime._adapter.features.coordinator.messages[(actor["scope"], "9")] = {
         "topic": {"topic_id": "books", "context": [{"ref": "8", "label": "Alice", "text": "book original"}]},
     }
     runtime._append_group_history(12345, "foreign unrelated question")
@@ -343,11 +343,11 @@ def test_reaction_rechecks_quiet_instead_of_using_cached_event_policy(runtime):
     set_live_config(runtime, enable_reactions=True)
     bot = SimpleNamespace(self_id="90000", call_api=AsyncMock())
     current = event()
-    actor = runtime._features.actor(bot, current)
-    runtime._features.coordinator.messages[(actor["scope"], actor["message_id"])] = {
+    actor = runtime._adapter.features.actor(bot, current)
+    runtime._adapter.features.coordinator.messages[(actor["scope"], actor["message_id"])] = {
         "actor": actor, "direct": True, "policy": {"quiet": {}},
     }
-    runtime._client = SimpleNamespace(request_feature=AsyncMock(return_value={"quiet": {"mode": "silent", "expires_at": time.time() + 100}}))
+    runtime._adapter.client = SimpleNamespace(request_feature=AsyncMock(return_value={"quiet": {"mode": "silent", "expires_at": time.time() + 100}}))
     assert not asyncio.run(runtime._set_message_react(bot, current, "1", True))
     bot.call_api.assert_not_called()
 
@@ -355,41 +355,41 @@ def test_reaction_rechecks_quiet_instead_of_using_cached_event_policy(runtime):
 def test_group_local_responses_and_ordinary_commands_respect_silent(runtime, monkeypatch):
     import time
     policy = {"quiet": {"mode": "silent", "expires_at": time.time() + 100}, "settings": {}}
-    runtime._client = SimpleNamespace(request_feature=AsyncMock(return_value=policy))
+    runtime._adapter.client = SimpleNamespace(request_feature=AsyncMock(return_value=policy))
     bot = SimpleNamespace(self_id="90000")
     matcher = SimpleNamespace(finish=AsyncMock())
     with pytest.raises(Exception) as caught:
         asyncio.run(runtime._finish_local_command(matcher, bot, event(), user_text="/命令", attachments=[], reply="ordinary"))
     assert caught.value.deferred
     matcher.finish.assert_not_called()
-    result = asyncio.run(runtime._features.handle_command(bot, event(text="/活动创建 test | 2"), "/活动创建 test | 2"))
+    result = asyncio.run(runtime._adapter.features.handle_command(bot, event(text="/活动创建 test | 2"), "/活动创建 test | 2"))
     assert not result["text"] and not result["control"]
-    assert not any(call.args[1] == "/v1/community/commands" for call in runtime._client.request_feature.call_args_list)
+    assert not any(call.args[1] == "/v1/community/commands" for call in runtime._adapter.client.request_feature.call_args_list)
 
 
 def test_merged_burst_recovers_as_one_request_with_all_refs(runtime, monkeypatch):
     import time
     bot = SimpleNamespace(self_id="90000", call_api=AsyncMock(return_value={"role": "member"}))
-    runtime._client = SimpleNamespace(request_feature=AsyncMock())
+    runtime._adapter.client = SimpleNamespace(request_feature=AsyncMock())
     def queued(ref, text):
         current = event(message_id=ref, text=text)
-        scope = runtime._features.actor(bot, current)["scope"]
+        scope = runtime._adapter.features.actor(bot, current)["scope"]
         return runtime.QueuedInbound(None, bot, current, "qq_group", "qq_group:12345", scope, text,
             [{"type": "image", "path": f"data/attachments/{ref}.png"}], False,
             {"_route_hints": {"topic_id": "books", "source_message_refs": [str(ref)]}}, text)
     first, second = queued(7, "one"), queued(8, "更正 two")
-    runtime._features.stage_burst(first)
-    runtime._features.stage_burst(second)
+    runtime._adapter.features.stage_burst(first)
+    runtime._adapter.features.stage_burst(second)
     runtime._merge_queued_inbound(first, second)
-    staged = runtime._features.burst_store.recover("90000", time.time() + 1)
+    staged = runtime._adapter.features.burst_store.recover("90000", time.time() + 1)
     assert len(staged) == 1 and staged[0]["refs"] == ["7", "8"]
-    runtime._features.started_at = time.time() + 1
+    runtime._adapter.features.started_at = time.time() + 1
     recovered = []
     async def submit(item):
         recovered.append(item)
         return True
     monkeypatch.setattr(runtime, "_queue_or_submit_ready", submit)
-    asyncio.run(runtime._features.recover_bursts(bot))
+    asyncio.run(runtime._adapter.features.recover_bursts(bot))
     assert len(recovered) == 1 and recovered[0].user_text == "one\n更正 two"
     assert len(recovered[0].attachments) == 2
     assert "以这条更正为准" in recovered[0].text
@@ -399,16 +399,16 @@ def test_burst_recovery_retries_after_unaccepted_submission(runtime, monkeypatch
     import time
     bot = SimpleNamespace(self_id="90000", call_api=AsyncMock(return_value={"role": "member"}))
     original = event(message_id=7)
-    scope = runtime._features.actor(bot, original)["scope"]
-    runtime._features.stage_burst(runtime.QueuedInbound(None, bot, original, "qq_group", "qq_group:12345", scope,
+    scope = runtime._adapter.features.actor(bot, original)["scope"]
+    runtime._adapter.features.stage_burst(runtime.QueuedInbound(None, bot, original, "qq_group", "qq_group:12345", scope,
         "pending", [], False, {"_route_hints": {"source_message_refs": ["7"]}}, "pending"))
-    runtime._features.started_at = time.time() + 1
+    runtime._adapter.features.started_at = time.time() + 1
     submit = AsyncMock(side_effect=[False, True])
     monkeypatch.setattr(runtime, "_queue_or_submit_ready", submit)
-    asyncio.run(runtime._features.recover_bursts(bot))
-    assert "90000" not in runtime._features.recovered_accounts
-    asyncio.run(runtime._features.recover_bursts(bot))
-    assert submit.await_count == 2 and "90000" in runtime._features.recovered_accounts
+    asyncio.run(runtime._adapter.features.recover_bursts(bot))
+    assert "90000" not in runtime._adapter.features.recovered_accounts
+    asyncio.run(runtime._adapter.features.recover_bursts(bot))
+    assert submit.await_count == 2 and "90000" in runtime._adapter.features.recovered_accounts
 
 
 def test_legacy_intent_decline_and_failed_decision_never_turn_into_task(runtime):
@@ -432,7 +432,7 @@ def test_burst_merge_retains_task_authority_and_direct_delivery(runtime):
 
 
 def test_control_command_does_not_wait_for_pending_burst(runtime):
-    coordinator = runtime._features.coordinator
+    coordinator = runtime._adapter.features.coordinator
     sent = []
     settings = {"merge_window_sec": 0.08, "merge_max_wait_sec": 0.1}
     def queued(text, ref):
@@ -455,7 +455,7 @@ def test_control_command_does_not_wait_for_pending_burst(runtime):
 @pytest.mark.parametrize("path", ["text", "file", "forward"])
 def test_silent_blocks_actual_platform_send_families(runtime, tmp_path, path):
     import time
-    runtime._client = SimpleNamespace(request_feature=AsyncMock(return_value={"quiet": {"mode": "silent", "expires_at": time.time() + 60}}))
+    runtime._adapter.client = SimpleNamespace(request_feature=AsyncMock(return_value={"quiet": {"mode": "silent", "expires_at": time.time() + 60}}))
     bot = SimpleNamespace(self_id="90000", send_group_msg=AsyncMock(), call_api=AsyncMock())
     target = {"type": "group", "group_id": 12345}
     sample = tmp_path / "file.txt"
@@ -477,7 +477,7 @@ def test_restart_fallback_preserves_platform_reference_and_topic(runtime, tmp_pa
     from clonoth_sdk.types import DeliveryContext
     service = CommunityService(tmp_path)
     bot = SimpleNamespace(self_id="90000", send_group_msg=AsyncMock(return_value={"message_id": 501}), call_api=AsyncMock(return_value=[]))
-    scope = runtime._features.actor(bot, event())["scope"]
+    scope = runtime._adapter.features.actor(bot, event())["scope"]
     admin = FeatureActor(scope=scope, owner="bot", is_admin=True, role="admin", channel="qq_group")
     service.update_settings(admin, {"topic_enabled": True})
     service.ingest(admin, {"message_id": "400", "text": "unrelated bot reply", "topic_id": "other"})
@@ -489,9 +489,9 @@ def test_restart_fallback_preserves_platform_reference_and_topic(runtime, tmp_pa
         if path == "/v1/community/messages":
             return service.ingest(admin, kwargs["body"])
         return {"recorded": True}
-    runtime._client = SimpleNamespace(request_feature=request)
-    runtime._last_bot = bot
-    runtime._real_conversation_keys[scope] = "qq_group:12345"
+    runtime._adapter.client = SimpleNamespace(request_feature=request)
+    runtime._adapter.last_bot = bot
+    runtime._adapter.real_conversation_keys[scope] = "qq_group:12345"
     context = DeliveryContext(event_id="final-recovered", conversation_key=scope, topic_id="books", reply_message_id="99", purpose="direct")
     asyncio.run(runtime.TangQiuCallbacks().send_to_channel(scope, "restored answer", [], delivery_context=context))
     bot.send_group_msg.assert_awaited_once()
@@ -529,19 +529,19 @@ def test_adapter_clear_discards_unsubmitted_burst_and_durable_copy(runtime):
     import time
     bot = SimpleNamespace(self_id="90000")
     original = event(message_id=7)
-    scope = runtime._features.actor(bot, original)["scope"]
+    scope = runtime._adapter.features.actor(bot, original)["scope"]
     item = runtime.QueuedInbound(None, bot, original, "qq_group", "qq_group:12345", scope, "old context", [], False,
         {"_route_hints": {"source_message_refs": ["7"]}}, "old context")
-    runtime._features.stage_burst(item)
-    runtime._features.coordinator.messages[(scope, "7")] = {"topic": {"topic_id": "old"}}
+    runtime._adapter.features.stage_burst(item)
+    runtime._adapter.features.coordinator.messages[(scope, "7")] = {"topic": {"topic_id": "old"}}
     sent = AsyncMock(return_value=True)
     async def exercise():
-        pending = asyncio.create_task(runtime._features.coordinator.submit(item, {"merge_window_sec": 0.1}, (10001,), sent, runtime._merge_queued_inbound))
+        pending = asyncio.create_task(runtime._adapter.features.coordinator.submit(item, {"merge_window_sec": 0.1}, (10001,), sent, runtime._merge_queued_inbound))
         await asyncio.sleep(0.005)
         runtime._purge_conversation_side_state(scope, {"type": "group", "group_id": 12345})
         assert await pending is False
         await asyncio.sleep(0.01)
     asyncio.run(exercise())
     sent.assert_not_called()
-    assert (scope, "7") not in runtime._features.coordinator.messages
-    assert runtime._features.burst_store.recover("90000", time.time() + 1) == []
+    assert (scope, "7") not in runtime._adapter.features.coordinator.messages
+    assert runtime._adapter.features.burst_store.recover("90000", time.time() + 1) == []

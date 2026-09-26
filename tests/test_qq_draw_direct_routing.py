@@ -44,14 +44,14 @@ async def _noop_async(*args: Any, **kwargs: Any) -> None:
 
 
 def _submit_capture(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> dict:
-    runtime._session_state = SessionState()
+    runtime._adapter.session_state = SessionState()
     captured: dict[str, Any] = {}
 
     async def _submit(**kwargs: Any):
         captured.update(kwargs)
         return SimpleNamespace(session_id="sess-1", accepted=True, inbound_seq=1)
 
-    monkeypatch.setattr(runtime, "_client", SimpleNamespace(submit_inbound=_submit))
+    monkeypatch.setattr(runtime._adapter, "client", SimpleNamespace(submit_inbound=_submit))
     monkeypatch.setattr(runtime, "_remember_route_state", _noop_async)
     return captured
 
@@ -136,16 +136,16 @@ def test_queue_does_not_merge_across_entry_nodes(runtime: Any) -> None:
     asyncio.run(runtime._enqueue_or_submit_inbound(first))
     asyncio.run(runtime._enqueue_or_submit_inbound(second))
 
-    assert len(runtime._qq_queue) == 2
+    assert len(runtime._adapter.qq_queue) == 2
     assert first.entry_node_id == ""
-    assert runtime._qq_queue_by_key["conv_draw"] is second
+    assert runtime._adapter.qq_queue_by_key["conv_draw"] is second
 
 
 def test_draw_command_does_not_absorb_recent_history_images(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     set_live_config(runtime, enable_reactions=False, enable_image_input=True)
     set_live_config(runtime, image_wait_after_text_sec=0)
-    runtime._client = SimpleNamespace()
-    runtime._session_state = SessionState()
+    runtime._adapter.client = SimpleNamespace()
+    runtime._adapter.session_state = SessionState()
 
     monkeypatch.setattr(runtime, "_remember_message_for_reply_context", lambda *a, **k: None)
     monkeypatch.setattr(runtime, "_event_text_with_forward", _resolved("/生图 画一张图片"))

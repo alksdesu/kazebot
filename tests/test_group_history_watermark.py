@@ -24,7 +24,7 @@ _REAL_KEY = f"qq_group:{_GROUP_ID}"
 @pytest.fixture()
 def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     module = load_runtime(monkeypatch, tmp_path)
-    module._session_state = SessionState()
+    module._adapter.session_state = SessionState()
     return module
 
 
@@ -87,12 +87,12 @@ class TestSequenceAllocation:
         # Bot 的回复行留在历史块里：compact 重置水位后重发的 20 行需要完整时序。
         runtime._record_bot_reply(_GROUP_ID, "好的")
 
-        assert [entry.seq for entry in runtime._group_history[_GROUP_ID]] == [1]
+        assert [entry.seq for entry in runtime._adapter.group_history[_GROUP_ID]] == [1]
 
     def test_sequences_survive_a_cache_reset(self, runtime) -> None:
         # 计数器不跟着缓存清零：万一水位没能一起重置，重开的小序号会被旧水位吞掉。
         runtime._append_group_history(_GROUP_ID, "a")
-        runtime._group_history.pop(_GROUP_ID, None)
+        runtime._adapter.group_history.pop(_GROUP_ID, None)
 
         assert runtime._append_group_history(_GROUP_ID, "b") == 2
 
@@ -106,14 +106,14 @@ class TestSequenceAllocation:
             _event(runtime), SimpleNamespace(self_id="90000"), override_text="hi",
         )
         assert (
-            runtime._group_content_records[_GROUP_ID][-1].seq
-            == runtime._group_history[_GROUP_ID][-1].seq
+            runtime._adapter.group_content_records[_GROUP_ID][-1].seq
+            == runtime._adapter.group_history[_GROUP_ID][-1].seq
         )
 
         runtime._record_bot_reply(_GROUP_ID, "好的")
         assert (
-            runtime._group_content_records[_GROUP_ID][-1].seq
-            == runtime._group_history[_GROUP_ID][-1].seq
+            runtime._adapter.group_content_records[_GROUP_ID][-1].seq
+            == runtime._adapter.group_history[_GROUP_ID][-1].seq
         )
 
         async def _no_files(*args, **kwargs):
@@ -128,8 +128,8 @@ class TestSequenceAllocation:
         )
         asyncio.run(runtime._handle_group_upload_notice(SimpleNamespace(self_id="90000"), upload))
         assert (
-            runtime._group_content_records[_GROUP_ID][-1].seq
-            == runtime._group_history[_GROUP_ID][-1].seq
+            runtime._adapter.group_content_records[_GROUP_ID][-1].seq
+            == runtime._adapter.group_history[_GROUP_ID][-1].seq
         )
 
 
@@ -152,7 +152,7 @@ class TestHistoryFiltering:
     def test_only_lines_past_the_watermark_are_carried(self, runtime) -> None:
         for line in ("a", "b", "c"):
             runtime._append_group_history(_GROUP_ID, line)
-        runtime._session_state.advance_watermark(_GROUP_ID, 2)
+        runtime._adapter.session_state.advance_watermark(_GROUP_ID, 2)
 
         text, covered = _build(runtime)
 
@@ -161,7 +161,7 @@ class TestHistoryFiltering:
 
     def test_no_new_lines_reads_differently_from_never_spoke(self, runtime) -> None:
         runtime._append_group_history(_GROUP_ID, "a")
-        runtime._session_state.advance_watermark(_GROUP_ID, 1)
+        runtime._adapter.session_state.advance_watermark(_GROUP_ID, 1)
 
         text, covered = _build(runtime)
 
@@ -171,21 +171,21 @@ class TestHistoryFiltering:
     def test_a_line_is_never_carried_twice(self, runtime) -> None:
         runtime._append_group_history(_GROUP_ID, "只说一次")
         _text, covered = _build(runtime)
-        runtime._session_state.advance_watermark(_GROUP_ID, covered)
+        runtime._adapter.session_state.advance_watermark(_GROUP_ID, covered)
 
         assert "只说一次" not in _history_block(_build(runtime)[0])
 
     def test_one_group_watermark_does_not_hide_another_group(self, runtime) -> None:
         runtime._append_group_history(_GROUP_ID, "a")
         runtime._append_group_history(_GROUP_ID + 1, "b")
-        runtime._session_state.advance_watermark(_GROUP_ID, 1)
+        runtime._adapter.session_state.advance_watermark(_GROUP_ID, 1)
 
         assert _history_block(_build(runtime, group_id=_GROUP_ID + 1)[0]) == ["b"]
 
     def test_a_missing_session_state_carries_full_history(self, runtime) -> None:
         # 插件还没启动完时读不到水位，宁可重复也不能漏。
         runtime._append_group_history(_GROUP_ID, "a")
-        runtime._session_state = None
+        runtime._adapter.session_state = None
 
         assert _history_block(_build(runtime)[0]) == ["a"]
 
@@ -210,7 +210,7 @@ class TestHistoryFiltering:
     def test_a_recorded_message_reports_its_sequence(self, runtime) -> None:
         seq = _record(runtime)
 
-        assert seq == runtime._group_history[_GROUP_ID][-1].seq
+        assert seq == runtime._adapter.group_history[_GROUP_ID][-1].seq
 
     def test_an_empty_message_reports_no_sequence(self, runtime) -> None:
         assert _record(runtime, text=" ") == 0
@@ -235,7 +235,7 @@ class TestOverflowIsNotSilent:
     def test_a_delivered_line_falling_out_is_not_reported(self, runtime) -> None:
         set_live_config(runtime, group_history_max=3)
         self._fill(runtime, 3)
-        runtime._session_state.advance_watermark(_GROUP_ID, 3)
+        runtime._adapter.session_state.advance_watermark(_GROUP_ID, 3)
         self._fill(runtime, 2, first=3)
 
         block = _history_block(_build(runtime)[0])
@@ -246,7 +246,7 @@ class TestOverflowIsNotSilent:
         set_live_config(runtime, group_history_max=3)
         self._fill(runtime, 5)
         _text, covered = _build(runtime)
-        runtime._session_state.advance_watermark(_GROUP_ID, covered)
+        runtime._adapter.session_state.advance_watermark(_GROUP_ID, covered)
 
         assert _history_block(_build(runtime)[0]) == ["（无新消息）"]
 
@@ -266,7 +266,7 @@ class TestOverflowIsNotSilent:
 
         runtime._reset_group_history_watermark(_GROUP_ID)
 
-        assert runtime._group_history_gap.get(_GROUP_ID, 0) == 0
+        assert runtime._adapter.group_history_gap.get(_GROUP_ID, 0) == 0
         assert not _history_block(_build(runtime)[0])[0].startswith("（此前")
 
     def test_history_is_off_when_the_cap_is_zero(self, runtime) -> None:
@@ -274,7 +274,7 @@ class TestOverflowIsNotSilent:
         set_live_config(runtime, group_history_max=0)
         self._fill(runtime, 2)
 
-        assert not runtime._group_history[_GROUP_ID]
+        assert not runtime._adapter.group_history[_GROUP_ID]
         assert _history_block(_build(runtime)[0]) == ["（暂无）"]
 
 
@@ -297,10 +297,10 @@ class TestUndeliveredLinesCanOverflowTheSoftCap:
     def test_delivered_lines_do_not_get_the_extra_room(self, doubled) -> None:
         for index in range(6):
             doubled._append_group_history(_GROUP_ID, f"line{index}")
-        doubled._session_state.advance_watermark(_GROUP_ID, 6)
+        doubled._adapter.session_state.advance_watermark(_GROUP_ID, 6)
         doubled._append_group_history(_GROUP_ID, "line6")
 
-        assert [entry.text for entry in doubled._group_history[_GROUP_ID]] == ["line4", "line5", "line6"]
+        assert [entry.text for entry in doubled._adapter.group_history[_GROUP_ID]] == ["line4", "line5", "line6"]
 
     def test_the_hard_cap_still_reports_its_gap(self, doubled) -> None:
         for index in range(8):
@@ -318,7 +318,7 @@ class TestWatermarkAdvance:
         async def _submit(**kwargs: Any):
             return outcome
 
-        monkeypatch.setattr(runtime, "_client", SimpleNamespace(submit_inbound=_submit))
+        monkeypatch.setattr(runtime._adapter, "client", SimpleNamespace(submit_inbound=_submit))
         set_live_config(runtime, enable_preempt=False, enable_reactions=False)
 
         async def _noop(**kwargs: Any) -> None:
@@ -351,47 +351,47 @@ class TestWatermarkAdvance:
     def test_a_submit_only_registers_a_pending_watermark(self, runtime, submitted) -> None:
         assert submitted.run(3) is True
 
-        assert runtime._session_state.get_high_watermark(_GROUP_ID) == -1
-        assert runtime._session_state.pending_watermarks[77] == (str(_GROUP_ID), 3)
+        assert runtime._adapter.session_state.get_high_watermark(_GROUP_ID) == -1
+        assert runtime._adapter.session_state.pending_watermarks[77] == (str(_GROUP_ID), 3)
 
     def test_the_watermark_advances_once_the_inbound_is_accepted(self, runtime, submitted) -> None:
         submitted.run(3)
 
-        runtime._session_state.accept_watermark(77)
+        runtime._adapter.session_state.accept_watermark(77)
 
-        assert runtime._session_state.get_high_watermark(_GROUP_ID) == 3
+        assert runtime._adapter.session_state.get_high_watermark(_GROUP_ID) == 3
 
     def test_a_rejected_submit_leaves_the_watermark_alone(self, runtime, submitted) -> None:
         submitted.outcome.accepted = False
 
         assert submitted.run(3) is False
-        assert runtime._session_state.get_high_watermark(_GROUP_ID) == -1
-        assert runtime._session_state.pending_watermarks == {}
+        assert runtime._adapter.session_state.get_high_watermark(_GROUP_ID) == -1
+        assert runtime._adapter.session_state.pending_watermarks == {}
 
     def test_acceptance_before_submit_returns_still_advances(self, runtime, submitted, monkeypatch) -> None:
-        original_submit = runtime._client.submit_inbound
+        original_submit = runtime._adapter.client.submit_inbound
 
         async def submit(**kwargs):
-            runtime._session_state.accept_watermark(77)
+            runtime._adapter.session_state.accept_watermark(77)
             return await original_submit(**kwargs)
 
-        monkeypatch.setattr(runtime._client, "submit_inbound", submit)
+        monkeypatch.setattr(runtime._adapter.client, "submit_inbound", submit)
         assert submitted.run(9)
-        assert runtime._session_state.get_high_watermark(_GROUP_ID) == 9
-        assert not runtime._session_state.pending_watermarks
+        assert runtime._adapter.session_state.get_high_watermark(_GROUP_ID) == 9
+        assert not runtime._adapter.session_state.pending_watermarks
 
     def test_reset_during_submit_rejects_its_old_watermark(self, runtime, submitted, monkeypatch) -> None:
-        original_submit = runtime._client.submit_inbound
+        original_submit = runtime._adapter.client.submit_inbound
 
         async def submit(**kwargs):
-            runtime._session_state.accept_watermark(77)
-            runtime._session_state.reset_channel_watermark(_GROUP_ID)
+            runtime._adapter.session_state.accept_watermark(77)
+            runtime._adapter.session_state.reset_channel_watermark(_GROUP_ID)
             return await original_submit(**kwargs)
 
-        monkeypatch.setattr(runtime._client, "submit_inbound", submit)
+        monkeypatch.setattr(runtime._adapter.client, "submit_inbound", submit)
         assert submitted.run(9)
-        assert runtime._session_state.get_high_watermark(_GROUP_ID) == -1
-        assert not runtime._session_state.pending_watermarks
+        assert runtime._adapter.session_state.get_high_watermark(_GROUP_ID) == -1
+        assert not runtime._adapter.session_state.pending_watermarks
 
     def test_a_submit_without_an_inbound_seq_advances_immediately(self, runtime, submitted) -> None:
         # 没有 seq 就等不到 inbound_accepted，只能就地推进。
@@ -399,27 +399,27 @@ class TestWatermarkAdvance:
 
         submitted.run(3)
 
-        assert runtime._session_state.get_high_watermark(_GROUP_ID) == 3
+        assert runtime._adapter.session_state.get_high_watermark(_GROUP_ID) == 3
 
     def test_a_private_message_never_touches_a_group_watermark(self, runtime, submitted) -> None:
         submitted.run(3, is_dm=True)
 
-        assert runtime._session_state.pending_watermarks == {}
-        assert runtime._session_state.get_high_watermark(_GROUP_ID) == -1
+        assert runtime._adapter.session_state.pending_watermarks == {}
+        assert runtime._adapter.session_state.get_high_watermark(_GROUP_ID) == -1
 
     def test_a_round_that_carried_no_history_does_not_advance(self, runtime, submitted) -> None:
         # /生图 直达命令不带历史块，那些行要留给下一条正常消息。
         submitted.run(-1)
 
-        assert runtime._session_state.pending_watermarks == {}
-        assert runtime._session_state.get_high_watermark(_GROUP_ID) == -1
+        assert runtime._adapter.session_state.pending_watermarks == {}
+        assert runtime._adapter.session_state.get_high_watermark(_GROUP_ID) == -1
 
     def test_out_of_order_confirmations_never_pull_the_watermark_back(self, runtime, submitted) -> None:
         """两条 inbound 同时在飞时，inbound_accepted 的到达顺序不受保证。
 
         先确认较小的那个就会把水位拉回去，那批已经带过的历史会被第二次带出。
         """
-        state = runtime._session_state
+        state = runtime._adapter.session_state
         state.register_watermark(101, _GROUP_ID, 9)
         state.register_watermark(102, _GROUP_ID, 4)
 
@@ -433,7 +433,7 @@ class TestWatermarkAdvance:
         async def _preempt(**kwargs: Any) -> bool:
             return True
 
-        monkeypatch.setattr(runtime, "_client", SimpleNamespace())
+        monkeypatch.setattr(runtime._adapter, "client", SimpleNamespace())
         set_live_config(runtime, enable_preempt=True)
         monkeypatch.setattr(runtime, "_try_preempt_running_task", _preempt)
 
@@ -452,7 +452,7 @@ class TestWatermarkAdvance:
         ))
 
         assert ok is True
-        assert runtime._session_state.get_high_watermark(_GROUP_ID) == 5
+        assert runtime._adapter.session_state.get_high_watermark(_GROUP_ID) == 5
 
 
 class TestQueueMerge:
@@ -523,10 +523,10 @@ class TestEarlyWatermarkAcceptance:
 class TestResetPaths:
     @pytest.fixture()
     def carried_history(self, runtime):
-        runtime._real_conversation_keys["conv_abc"] = _REAL_KEY
+        runtime._adapter.real_conversation_keys["conv_abc"] = _REAL_KEY
         for line in ("a", "b"):
             runtime._append_group_history(_GROUP_ID, line)
-        runtime._session_state.advance_watermark(_GROUP_ID, 2)
+        runtime._adapter.session_state.advance_watermark(_GROUP_ID, 2)
 
     def _reset(self, runtime, reason: str) -> None:
         asyncio.run(runtime.TangQiuCallbacks().on_context_reset("conv_abc", reason, []))
@@ -534,34 +534,34 @@ class TestResetPaths:
     def test_clear_drops_both_the_cache_and_the_watermark(self, runtime, carried_history) -> None:
         self._reset(runtime, "clear")
 
-        assert _GROUP_ID not in runtime._group_history
-        assert runtime._session_state.get_high_watermark(_GROUP_ID) == -1
+        assert _GROUP_ID not in runtime._adapter.group_history
+        assert runtime._adapter.session_state.get_high_watermark(_GROUP_ID) == -1
 
     def test_compact_keeps_the_cache_and_resends_it(self, runtime, carried_history) -> None:
         # compact 把早期原文换成摘要，重发这 20 行是把丢掉的近期细节补回来最便宜的办法。
         self._reset(runtime, "compact")
 
-        assert runtime._session_state.get_high_watermark(_GROUP_ID) == -1
+        assert runtime._adapter.session_state.get_high_watermark(_GROUP_ID) == -1
         assert _history_block(_build(runtime)[0]) == ["a", "b"]
 
     def test_a_private_conversation_reset_is_a_no_op(self, runtime) -> None:
-        runtime._real_conversation_keys["conv_dm"] = "qq_private:10001"
+        runtime._adapter.real_conversation_keys["conv_dm"] = "qq_private:10001"
         runtime._append_group_history(_GROUP_ID, "a")
-        runtime._session_state.advance_watermark(_GROUP_ID, 1)
+        runtime._adapter.session_state.advance_watermark(_GROUP_ID, 1)
 
         asyncio.run(runtime.TangQiuCallbacks().on_context_reset("conv_dm", "clear", []))
 
-        assert runtime._session_state.get_high_watermark(_GROUP_ID) == 1
+        assert runtime._adapter.session_state.get_high_watermark(_GROUP_ID) == 1
 
     def test_an_engine_restart_resets_every_group(self, runtime) -> None:
         for gid in (_GROUP_ID, _GROUP_ID + 1):
             runtime._append_group_history(gid, "a")
-            runtime._session_state.advance_watermark(gid, 1)
+            runtime._adapter.session_state.advance_watermark(gid, 1)
 
         asyncio.run(runtime.TangQiuCallbacks().on_engine_restarted({}))
 
-        assert runtime._session_state.get_high_watermark(_GROUP_ID) == -1
-        assert runtime._session_state.get_high_watermark(_GROUP_ID + 1) == -1
+        assert runtime._adapter.session_state.get_high_watermark(_GROUP_ID) == -1
+        assert runtime._adapter.session_state.get_high_watermark(_GROUP_ID + 1) == -1
 
 
 class TestSdkLeavesWatermarksToTheAdapter:

@@ -801,7 +801,7 @@ def test_group_at_message_is_not_resent_after_ambiguous_timeout(
         ))
 
     assert len(bot.sends) == 1
-    assert asyncio.run(runtime._outbound_idempotency.state("k-timeout")) == "ambiguous"
+    assert asyncio.run(runtime._adapter.outbound_idempotency.state("k-timeout")) == "ambiguous"
 
 
 def test_group_unknown_failure_is_not_resent_as_at_text(
@@ -817,7 +817,7 @@ def test_group_unknown_failure_is_not_resent_as_at_text(
         ))
 
     assert len(bot.sends) == 1
-    assert asyncio.run(runtime._outbound_idempotency.state("k-unknown")) == "ambiguous"
+    assert asyncio.run(runtime._adapter.outbound_idempotency.state("k-unknown")) == "ambiguous"
 
 
 def test_group_at_uid_failure_degrades_to_text_once(
@@ -833,7 +833,7 @@ def test_group_at_uid_failure_degrades_to_text_once(
 
     assert result == "77"
     assert len(bot.sends) == 2
-    assert asyncio.run(runtime._outbound_idempotency.state("k-uid")) == "sent"
+    assert asyncio.run(runtime._adapter.outbound_idempotency.state("k-uid")) == "sent"
     second = bot.sends[1]
     assert all(seg.get("type") != "at" for seg in second)
     assert any("@群友" in str(seg.get("data", {}).get("text", "")) for seg in second)
@@ -982,7 +982,7 @@ def test_real_image_timeout_is_ambiguous_and_does_not_auto_resend(
         {"type": "group", "group_id": 1}, identity,
         event_id=child.idempotency_key or child.event_id,
     )
-    assert asyncio.run(runtime._outbound_idempotency.state(key)) == "ambiguous"
+    assert asyncio.run(runtime._adapter.outbound_idempotency.state(key)) == "ambiguous"
 
 
 def test_real_pending_owner_waits_and_forward_batch_is_claimed(
@@ -1061,7 +1061,7 @@ def test_image_all_fallback_failures_are_aggregated_under_same_owner(
     image = tmp_path / "failure.png"
     image.write_bytes(b"failure image")
     begin_owners: list[str] = []
-    original_begin = runtime._outbound_idempotency.begin
+    original_begin = runtime._adapter.outbound_idempotency.begin
 
     async def recording_begin(key: str):
         claim = await original_begin(key)
@@ -1069,7 +1069,7 @@ def test_image_all_fallback_failures_are_aggregated_under_same_owner(
             begin_owners.append(claim.owner)
         return claim
 
-    monkeypatch.setattr(runtime._outbound_idempotency, "begin", recording_begin)
+    monkeypatch.setattr(runtime._adapter.outbound_idempotency, "begin", recording_begin)
 
     class Bot:
         async def send_group_msg(self, **kwargs: Any):
@@ -1088,7 +1088,7 @@ def test_long_forward_heartbeat_prevents_cross_instance_takeover(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     runtime = _load_runtime(monkeypatch, tmp_path)
-    runtime._outbound_idempotency.lease_seconds = 0.15
+    runtime._adapter.outbound_idempotency.lease_seconds = 0.15
     first_image, second_image = tmp_path / "one.png", tmp_path / "two.png"
     first_image.write_bytes(b"one")
     second_image.write_bytes(b"two")
@@ -1106,11 +1106,11 @@ def test_long_forward_heartbeat_prevents_cross_instance_takeover(
             send_context=DeliveryContext(event_id="long-forward", idempotency_key="id:long-forward"),
         ))
         await asyncio.sleep(0.25)
-        row = runtime._outbound_idempotency._db.execute(
+        row = runtime._adapter.outbound_idempotency._db.execute(
             "SELECT key,lease_until FROM claims WHERE state='pending'"
         ).fetchone()
         assert row is not None and row[1] > time.time()
-        contender = TwoPhaseIdempotencyStore(runtime._outbound_idempotency.path)
+        contender = TwoPhaseIdempotencyStore(runtime._adapter.outbound_idempotency.path)
         contender.lease_seconds = 0.15
         conflict = await contender.begin(row[0])
         assert conflict.acquired is False and conflict.state == "pending"
@@ -1253,9 +1253,9 @@ def test_file_upload_crash_lease_replays_and_commits_content_claim(
     )
 
     async def abandoned_claim() -> None:
-        claim = await runtime._outbound_idempotency.begin(key)
+        claim = await runtime._adapter.outbound_idempotency.begin(key)
         assert claim.acquired
-        runtime._outbound_idempotency._db.execute(
+        runtime._adapter.outbound_idempotency._db.execute(
             "UPDATE claims SET lease_until=0 WHERE key=?", (key,),
         )
 
@@ -1275,7 +1275,7 @@ def test_file_upload_crash_lease_replays_and_commits_content_claim(
         bot, target, attachment, send_context=context,
     )) == "123"
     assert bot.calls == 1
-    assert asyncio.run(runtime._outbound_idempotency.state(key)) == "sent"
+    assert asyncio.run(runtime._adapter.outbound_idempotency.state(key)) == "sent"
 
 
 
@@ -1307,7 +1307,7 @@ def test_force_replay_context_bypasses_previous_onebot_sent_claim(
         bot, target, "body", send_context=replay, content_identity="body",
     )) == "2"
     assert bot.calls == 2
-    assert runtime._outbound_idempotency.pending_ttl > 240
+    assert runtime._adapter.outbound_idempotency.pending_ttl > 240
 
 
 def test_bridge_independent_identical_text_and_file_requests_are_not_permanently_deduped(
@@ -1337,7 +1337,7 @@ def test_bridge_independent_identical_text_and_file_requests_are_not_permanently
     # origin, so register the session the bridge resolves the requester from.
     set_live_config(runtime, admin_users=frozenset({10001}))
     monkeypatch.setitem(
-        runtime._session_targets, "sess-authz",
+        runtime._adapter.session_targets, "sess-authz",
         {"type": "group", "group_id": 99, "user_id": 10001},
     )
 
@@ -1795,7 +1795,7 @@ def test_the_ops_command_lists_and_releases(monkeypatch: Any, tmp_path: Path) ->
     admin = _ops_admin()
 
     async def exercise() -> None:
-        store = runtime._outbound_idempotency
+        store = runtime._adapter.outbound_idempotency
         assert await runtime._maybe_handle_dead_letter_command(
             event=admin, user_text="/发送死信",
         ) == "当前没有卡住的投递记录。"
@@ -1831,7 +1831,7 @@ def test_the_ops_command_rejects_a_nonunique_handle_prefix(monkeypatch: Any, tmp
     admin = _ops_admin()
 
     async def exercise() -> None:
-        store = runtime._outbound_idempotency
+        store = runtime._adapter.outbound_idempotency
         # 确定性搜索两个首字符相同的 handle，用 1 位前缀触发歧义。
         seen: dict[str, str] = {}
         collision: str | None = None
@@ -1892,8 +1892,8 @@ def test_attachment_send_locks_are_bounded_and_keep_a_busy_bucket(
             async with runtime._attachment_send_order({"type": "group", "group_id": 1000 + i}):
                 pass
         assert not follower.done()
-        assert "group:1" in runtime._attachment_send_locks
-        assert len(runtime._attachment_send_locks) <= runtime._ATTACHMENT_SEND_LOCK_MAX_KEYS + 1
+        assert "group:1" in runtime._adapter.attachment_send_locks
+        assert len(runtime._adapter.attachment_send_locks) <= runtime._ATTACHMENT_SEND_LOCK_MAX_KEYS + 1
         release.set()
         await holder
         await follower
@@ -1956,14 +1956,14 @@ def test_group_member_cache_drops_expired_groups(
         await runtime._load_group_members(bot, 2)
 
     asyncio.run(exercise())
-    assert len(runtime._group_member_cache) == 1
+    assert len(runtime._adapter.group_member_cache) == 1
 
 
 def test_conversation_buckets_are_bounded(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     runtime = _load_runtime(monkeypatch, tmp_path)
-    max_keys = runtime._CONVERSATION_BUCKET_MAX_KEYS
+    max_keys = importlib.import_module(f"{runtime.__name__}.adapter").CONVERSATION_BUCKET_MAX_KEYS
     event = types.SimpleNamespace(user_id=1)
 
     for i in range(max_keys + 5):
@@ -1971,6 +1971,6 @@ def test_conversation_buckets_are_bounded(
             f"conv:{i}", event, [{"type": "image", "path": f"/tmp/x{i}.png"}],
         )
 
-    assert len(runtime._recent_images) == max_keys
-    assert f"conv:{max_keys + 4}" in runtime._recent_images
-    assert "conv:0" not in runtime._recent_images
+    assert len(runtime._adapter.recent_images) == max_keys
+    assert f"conv:{max_keys + 4}" in runtime._adapter.recent_images
+    assert "conv:0" not in runtime._adapter.recent_images

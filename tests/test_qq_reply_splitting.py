@@ -56,11 +56,11 @@ class SplitBot:
 @pytest.fixture()
 def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     module = load_runtime(monkeypatch, tmp_path)
-    assert not module._features.available
-    assert Path(module._outbound_idempotency.path).is_relative_to(tmp_path)
+    assert not module._adapter.features.available
+    assert Path(module._adapter.outbound_idempotency.path).is_relative_to(tmp_path)
     set_live_config(module, reply_to_trigger=True)
     yield module
-    module._outbound_idempotency.close()
+    module._adapter.outbound_idempotency.close()
 
 
 def _event(kind: str) -> SimpleNamespace:
@@ -206,7 +206,7 @@ async def _deliver(runtime: Any, bot: SplitBot, kind: str, callback: str, text: 
     context = _context(runtime, target)
     callbacks = runtime.TangQiuCallbacks()
     if callback == "send_to_channel":
-        runtime._last_bot = bot
+        runtime._adapter.last_bot = bot
         await callbacks.send_to_channel(target["conversation_key"], text, [], delivery_context=context)
         return
     trigger = runtime.TriggerInfo(
@@ -251,8 +251,8 @@ def test_retry_sends_only_failed_part_and_final_waiter_tracks_completion(
     target = _target(kind)
     waiter = runtime.QueueReplyWaiter(asyncio.Event(), INBOUND_SEQ)
     other_waiter = runtime.QueueReplyWaiter(asyncio.Event(), INBOUND_SEQ + 1)
-    runtime._qq_waiting_replies[target["conversation_key"]] = waiter
-    runtime._qq_waiting_replies["unrelated-session"] = other_waiter
+    runtime._adapter.qq_waiting_replies[target["conversation_key"]] = waiter
+    runtime._adapter.qq_waiting_replies["unrelated-session"] = other_waiter
 
     async def exercise() -> None:
         with pytest.raises(type(failure), match="ENOENT"):
@@ -260,7 +260,7 @@ def test_retry_sends_only_failed_part_and_final_waiter_tracks_completion(
         assert _texts(bot.sent) == ["第一句"]
         assert _texts(bot.attempts) == ["第一句", "第二句"]
         assert not waiter.event.is_set()
-        assert INBOUND_SEQ not in runtime._qq_completed_replies
+        assert INBOUND_SEQ not in runtime._adapter.qq_completed_replies
 
         await _deliver(runtime, bot, kind, callback, "第一句[SPLIT]第二句")
         assert _texts(bot.sent) == ["第一句", "第二句"]

@@ -312,7 +312,7 @@ class TestEnrollmentGate:
         asyncio.run(runtime._enqueue_or_submit_inbound(first))
         asyncio.run(runtime._enqueue_or_submit_inbound(_item(False)))
 
-        assert len(runtime._qq_queue) == 1
+        assert len(runtime._adapter.qq_queue) == 1
         assert first.direct_interaction is True
 
     def test_the_prefix_check_runs_before_the_prefix_is_stripped(self, runtime) -> None:

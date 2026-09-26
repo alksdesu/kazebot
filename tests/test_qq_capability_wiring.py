@@ -196,14 +196,14 @@ class TestGlobalCapabilitiesStayWithTheRoster:
     ) -> None:
         """手改 yaml 写 owner 会在读配置时被夹回 admin，判定端看到的已经是 admin。"""
         # 未初始化的提示排在鉴权之前，不接上就测不到门。
-        monkeypatch.setattr(runtime, "_client", SimpleNamespace(), raising=False)
+        monkeypatch.setattr(runtime._adapter, "client", SimpleNamespace(), raising=False)
         set_live_config(runtime, grant_model="owner")
 
         assert runtime.live.grant_model == "admin"
         assert switch_model(runtime, in_group(OWNER_QQ, role="owner")) == "模型命令仅限 Clonoth 管理员使用。"
 
     def test_the_roster_can_still_switch_models(self, runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(runtime, "_client", SimpleNamespace(), raising=False)
+        monkeypatch.setattr(runtime._adapter, "client", SimpleNamespace(), raising=False)
 
         reply = switch_model(runtime, in_private(LISTED_QQ))
 
@@ -268,7 +268,7 @@ class TestOffShutsTheDoorOnEveryone:
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """名单里的人看到「仅限管理员使用」只会以为是 bug。"""
-        monkeypatch.setattr(runtime, "_client", SimpleNamespace(), raising=False)
+        monkeypatch.setattr(runtime._adapter, "client", SimpleNamespace(), raising=False)
         set_live_config(runtime, grant_model="off")
 
         assert switch_model(runtime, in_private(LISTED_QQ)) == "「切换模型」已在配置里关闭。"
@@ -280,7 +280,7 @@ class TestOffShutsTheDoorOnEveryone:
         set_live_config(runtime, grant_approval="off")
         decisions: list[tuple[str, str]] = []
         monkeypatch.setattr(
-            runtime, "_client",
+            runtime._adapter, "client",
             SimpleNamespace(
                 approve=lambda aid, decision, comment: _record(decisions, aid, decision, comment),
             ),
@@ -290,7 +290,7 @@ class TestOffShutsTheDoorOnEveryone:
         asyncio.run(runtime.TangQiuCallbacks().show_approval_ui("ap-1", "read_file", {}))
 
         assert decisions and decisions[0][1] == "deny"
-        assert not runtime._pending_approvals
+        assert not runtime._adapter.pending_approvals
 
     def test_a_member_is_not_told_the_capability_exists(self, runtime: Any) -> None:
         """对名单之外的人说「这项能力关了」等于把这项能力的存在念给他听。"""
@@ -319,7 +319,7 @@ class TestOffShutsTheDoorOnEveryone:
     ) -> None:
         """漏改任何一个调用点，那一档就会把能力名念给非名单用户。"""
         # 未初始化提示排在鉴权之前，model 分支不接 _client 会先撞上它。
-        monkeypatch.setattr(runtime, "_client", SimpleNamespace(), raising=False)
+        monkeypatch.setattr(runtime._adapter, "client", SimpleNamespace(), raising=False)
         set_live_config(runtime, **{f"grant_{family}": "off"})
 
         assert dispatch_family(runtime, family, in_group(MEMBER_QQ), text) is None

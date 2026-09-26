@@ -92,8 +92,8 @@ def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 @pytest.fixture()
 def local_command(runtime: Any, monkeypatch: pytest.MonkeyPatch):
     """在群里发一条本地命令，走完整条 _process_group_message，返回收到回复的 matcher。"""
-    runtime._client = SimpleNamespace()
-    runtime._session_state = SessionState()
+    runtime._adapter.client = SimpleNamespace()
+    runtime._adapter.session_state = SessionState()
     monkeypatch.setattr(
         runtime, "_collect_qq_attachments",
         lambda bot, event, conversation_key: _immediately([]),
@@ -118,7 +118,7 @@ def _upload(runtime: Any, file_info: dict[str, Any]) -> None:
 
 
 def _history(runtime: Any) -> list[str]:
-    return [entry.text for entry in runtime._group_history[_GROUP_ID]]
+    return [entry.text for entry in runtime._adapter.group_history[_GROUP_ID]]
 
 
 class TestOneAssembler:
@@ -173,7 +173,7 @@ class TestBothCachesGetTheLine:
     def test_a_group_upload_writes_both_caches(self, runtime) -> None:
         _upload(runtime, {"name": "报告.pdf", "url": "http://x/报告.pdf"})
 
-        records = list(runtime._group_content_records[_GROUP_ID])
+        records = list(runtime._adapter.group_content_records[_GROUP_ID])
 
         assert len(_history(runtime)) == 1
         assert len(records) == 1
@@ -183,7 +183,7 @@ class TestBothCachesGetTheLine:
     def test_a_bot_reply_writes_both_caches(self, runtime) -> None:
         runtime._record_bot_reply(_GROUP_ID, "好的")
 
-        records = list(runtime._group_content_records[_GROUP_ID])
+        records = list(runtime._adapter.group_content_records[_GROUP_ID])
 
         assert len(records) == 1
         assert records[0].sender_name == "Bot"
@@ -193,7 +193,7 @@ class TestBothCachesGetTheLine:
     def test_a_local_command_reply_writes_both_caches(self, runtime, local_command) -> None:
         local_command("/绘图帮助")
 
-        records = list(runtime._group_content_records[_GROUP_ID])
+        records = list(runtime._adapter.group_content_records[_GROUP_ID])
 
         assert [record.sender_name for record in records][-1] == "Bot"
         assert [record.formatted_line for record in records] == _history(runtime)
@@ -208,7 +208,7 @@ class TestBothCachesGetTheLine:
         _upload(runtime, {"name": "a.txt", "url": "http://x/a.txt"})
 
         shared[0]["path"] = "out/tampered.txt"
-        records = list(runtime._group_content_records[_GROUP_ID])
+        records = list(runtime._adapter.group_content_records[_GROUP_ID])
 
         assert records[0].attachments == [{"path": "out/a.txt", "name": "a.txt"}]
 

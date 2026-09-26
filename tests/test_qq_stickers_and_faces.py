@@ -120,7 +120,7 @@ class TestTheInboundFaceFormatDoesNotEscape:
         # 历史会回喂给模型，留在里面等于教它下次接着写。
         runtime._record_bot_reply(123, "好的[QQ表情:微笑]")
 
-        assert "QQ表情" not in str(list(runtime._group_history[123]))
+        assert "QQ表情" not in str(list(runtime._adapter.group_history[123]))
 
 
 class TestStickerSegments:

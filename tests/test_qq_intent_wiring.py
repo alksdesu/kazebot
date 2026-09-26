@@ -139,14 +139,14 @@ class TestWhenTheModelIsAsked:
         # 冷却期内问完只会把答案丢掉：每条不命中消息白花一次调用，还占满 max_inflight。
         set_live_config(runtime, cooldown_group_sec=60)
         event = _Event(runtime, "那这样行吗")
-        runtime._trigger_cooldown.record(runtime._trigger_input(event, _bot(), "上一句"))
+        runtime._adapter.trigger_cooldown.record(runtime._trigger_input(event, _bot(), "上一句"))
 
         assert asyncio.run(runtime._intent_group_rule(_bot(), event)) is False
 
     def test_the_rule_still_asks_when_the_window_expires_before_the_answer(self, runtime) -> None:
         set_live_config(runtime, cooldown_group_sec=5, llm_intent_timeout_sec=8)
         event = _Event(runtime, "那这样行吗")
-        runtime._trigger_cooldown.record(runtime._trigger_input(event, _bot(), "上一句"))
+        runtime._adapter.trigger_cooldown.record(runtime._trigger_input(event, _bot(), "上一句"))
 
         assert asyncio.run(runtime._intent_group_rule(_bot(), event)) is True
 
@@ -193,7 +193,7 @@ class TestAfterTheModelAnswers:
         # 意愿判断这条路必须过冷却，否则「开了意愿判断」等于把冷却整层关掉。
         set_live_config(runtime, cooldown_group_sec=60)
         event = _Event(runtime, "那这样行吗")
-        runtime._trigger_cooldown.record(runtime._trigger_input(event, _bot(), "上一句"))
+        runtime._adapter.trigger_cooldown.record(runtime._trigger_input(event, _bot(), "上一句"))
 
         seen = self._handle(runtime, monkeypatch, _verdict(runtime, agreed=True, decided=True), event=event)
 
@@ -202,13 +202,13 @@ class TestAfterTheModelAnswers:
 
     def test_a_yes_records_the_cooldown(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
         set_live_config(runtime, cooldown_group_sec=60)
-        runtime._trigger_cooldown.forget_group(7)
+        runtime._adapter.trigger_cooldown.forget_group(7)
 
         self._handle(runtime, monkeypatch, _verdict(runtime, agreed=True, decided=True))
 
         event = _Event(runtime, "再来一句")
         decision = runtime._group_trigger_decision(event, _bot(), "再来一句")
-        assert runtime._trigger_cooldown.remaining(
+        assert runtime._adapter.trigger_cooldown.remaining(
             runtime._trigger_input(event, _bot(), "再来一句"),
             runtime.TriggerConfig.from_live(runtime.live),
         )[0] > 0
@@ -216,12 +216,12 @@ class TestAfterTheModelAnswers:
 
     def test_a_no_does_not_record_the_cooldown(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
         set_live_config(runtime, cooldown_group_sec=60)
-        runtime._trigger_cooldown.forget_group(7)
+        runtime._adapter.trigger_cooldown.forget_group(7)
 
         self._handle(runtime, monkeypatch, _verdict(runtime, agreed=False, decided=True))
 
         event = _Event(runtime, "再来一句")
-        assert runtime._trigger_cooldown.remaining(
+        assert runtime._adapter.trigger_cooldown.remaining(
             runtime._trigger_input(event, _bot(), "再来一句"),
             runtime.TriggerConfig.from_live(runtime.live),
         )[0] == 0
@@ -236,7 +236,7 @@ class TestWhatIsSentToTheModel:
             return _verdict(runtime, agreed=False, decided=True)
 
         monkeypatch.setattr(
-            runtime, "_client", SimpleNamespace(judge_reply_intent=_judge_reply_intent), raising=False,
+            runtime._adapter, "client", SimpleNamespace(judge_reply_intent=_judge_reply_intent), raising=False,
         )
         event = _Event(runtime, overrides.pop("text", "那这样行吗"))
         asyncio.run(runtime._judge_llm_intent(_bot(), event, "那这样行吗"))
@@ -288,7 +288,7 @@ class TestWhatIsSentToTheModel:
         assert sent["context_lines"] == []
 
     def test_a_missing_client_answers_undecided(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(runtime, "_client", None, raising=False)
+        monkeypatch.setattr(runtime._adapter, "client", None, raising=False)
 
         verdict = asyncio.run(runtime._judge_llm_intent(_bot(), _Event(runtime, "在吗"), "在吗"))
 
@@ -380,7 +380,7 @@ class TestOneMessageIsJudgedOnce:
             event.message_id = f"m-{index}"
             asyncio.run(runtime._intent_group_rule(_bot(), event))
 
-        assert len(runtime._trigger_decisions) == runtime._TRIGGER_DECISION_CACHE_MAX
+        assert len(runtime._adapter.trigger_decisions) == runtime._TRIGGER_DECISION_CACHE_MAX
 
 
 class TestTheMatcherTopology:
