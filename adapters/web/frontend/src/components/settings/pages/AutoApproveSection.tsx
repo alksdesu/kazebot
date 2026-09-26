@@ -10,8 +10,7 @@ import {
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskClassName, riskLabel, type RiskLevel } from '../../../utils/toolRisk';
-import { Button, Chip, Chips, Empty, Facts, Input, Tag } from './settingsControls';
-import { Card } from './settingsPagePrimitives';
+import { Block, Button, Chip, Chips, Empty, Facts, Input, Tag } from './settingsControls';
 
 interface ToolRule {
   toolName: string;
@@ -41,7 +40,7 @@ const CoveredOperations = ({ toolName }: { toolName: string }) => {
   if (!operations) return null;
   // 工具名和它送审时报的 policy operation 常常不同名，不写出来用户没法判断勾了到底放行什么。
   return (
-    <span className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[0.65rem] text-[var(--duties-secondary)]">
+    <span className="mt-1.5 flex flex-wrap items-center gap-1.5 text-mini text-[var(--duties-secondary)]">
       <span>覆盖操作</span>
       {operations.map((operation) => <Tag key={operation}>{operation}</Tag>)}
     </span>
@@ -55,7 +54,7 @@ const ToolRuleToggle = ({ rule, checked, onChange }: {
     <span className="min-w-0">
       <span className="flex flex-wrap items-center gap-2">
         <span className="font-mono text-xs font-semibold text-[var(--duties-text)]">{rule.label}</span>
-        <span className={`rounded-sm border px-1.5 py-0.5 font-mono text-[0.55rem] uppercase tracking-[0.12em] ${riskClassName(rule.risk)}`}>
+        <span className={`rounded-sm border px-1.5 py-0.5 font-mono text-nano uppercase tracking-caps ${riskClassName(rule.risk)}`}>
           {riskLabel(rule.risk)}
         </span>
       </span>
@@ -144,8 +143,8 @@ export const AutoApproveSection = () => {
   };
 
   return (
-    <Card
-      description="勾中的工具在这台浏览器的聊天页免审批，存在浏览器本地。QQ 和定时任务不看这里，它们只认上面那份服务端策略。"
+    <Block frame="boxed"
+      hint="勾中的工具在这台浏览器的聊天页免审批，存在浏览器本地。QQ 和定时任务不看这里，它们只认上面那份服务端策略。"
       scope="this-browser"
       title="自动审批"
     >
@@ -226,6 +225,6 @@ export const AutoApproveSection = () => {
           </div>
         )}
       </div>
-    </Card>
+    </Block>
   );
 };

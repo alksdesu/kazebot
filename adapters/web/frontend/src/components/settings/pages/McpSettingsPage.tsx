@@ -10,7 +10,7 @@ import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore
 import { useSettingsStore } from '../../../store/settingsStore';
 import { Button } from '../../common';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
-import { AuthRequired, Card, FieldLabel, PageHeader, PageShell, StatusText, TextInput } from './settingsPagePrimitives';
+import { Block, Field, Input, PageShell, StatusText } from './settingsControls';
 import { parseMcpClients, serializeMcpClients, type McpClientFormState } from '../settingsStructuredConfig';
 
 function emptyMcpClient(id: string): McpClientFormState {
@@ -111,30 +111,28 @@ export const McpSettingsPage = () => {
   };
 
   return (
-    <PageShell>
-      <PageHeader description="查看 MCP Client 列表，选择后在右栏编辑连接字段和保存。" title="MCP" />
-      {!isAuthenticated ? <AuthRequired /> : (
-        <Card title="Client 列表" description="展示 ID、传输方式、启用状态和连接预览。编辑表单位于右栏。">
-          <div className="mb-3 flex flex-wrap gap-2">
-            <Button disabled={loading || busy} onClick={load}>{loading ? '刷新中...' : '刷新 MCP'}</Button>
-            <Button disabled={loading || busy || !selectedMcpClient} onClick={remove} variant="danger">删除选中 Client</Button>
-          </div>
-          <div className="max-h-[34rem] space-y-2 overflow-y-auto">
-            {clients.length === 0 ? <p className="text-sm text-[var(--duties-secondary)]">暂无 MCP Client。</p> : clients.map((client) => (
-              <button className={`w-full border p-3 text-left ${selectedMcpClient?.id === client.id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={client.id} disabled={busy} onClick={() => { setSelectedMcpClient(client); setMessage(''); setRightPanelOpen(true); }} type="button">
-                <div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs font-semibold">{client.id}</span><span className={`border px-1.5 py-0.5 text-xs ${client.enabled === false ? 'border-[var(--duties-border)] text-[var(--duties-secondary)]' : 'border-[var(--duties-border)] text-[var(--duties-success)]'}`}>{client.enabled === false ? '禁用' : '启用'}</span><span className="font-mono text-xs text-[var(--duties-tertiary)]">{client.transport || '未知传输'}</span></div>
-                <p className="mt-1 truncate text-xs text-[var(--duties-secondary)]">{preview(client)}</p>
-              </button>
-            ))}
-          </div>
-          <div className="mt-4 border-t border-[var(--duties-border)] pt-3">
-            <FieldLabel htmlFor="new-mcp-id">创建 MCP Client</FieldLabel>
-            <TextInput disabled={busy} id="new-mcp-id" onChange={(event) => setNewId(event.target.value)} placeholder="Client ID" value={newId} />
+    <PageShell authed={isAuthenticated} description="查看 MCP Client 列表，选择后在右栏编辑连接字段和保存。" title="MCP">
+      <Block frame="boxed" title="Client 列表" hint="展示 ID、传输方式、启用状态和连接预览。编辑表单位于右栏。">
+        <div className="mb-3 flex flex-wrap gap-2">
+          <Button disabled={loading || busy} onClick={load}>{loading ? '刷新中...' : '刷新 MCP'}</Button>
+          <Button disabled={loading || busy || !selectedMcpClient} onClick={remove} variant="danger">删除选中 Client</Button>
+        </div>
+        <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">
+          {clients.length === 0 ? <p className="text-sm text-[var(--duties-secondary)]">暂无 MCP Client。</p> : clients.map((client) => (
+            <button className={`w-full border p-3 text-left ${selectedMcpClient?.id === client.id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={client.id} disabled={busy} onClick={() => { setSelectedMcpClient(client); setMessage(''); setRightPanelOpen(true); }} type="button">
+              <div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs font-semibold">{client.id}</span><span className={`border px-1.5 py-0.5 text-xs ${client.enabled === false ? 'border-[var(--duties-border)] text-[var(--duties-secondary)]' : 'border-[var(--duties-border)] text-[var(--duties-success)]'}`}>{client.enabled === false ? '禁用' : '启用'}</span><span className="font-mono text-xs text-[var(--duties-tertiary)]">{client.transport || '未知传输'}</span></div>
+              <p className="mt-1 truncate text-xs text-[var(--duties-secondary)]">{preview(client)}</p>
+            </button>
+          ))}
+        </div>
+        <div className="mt-4 border-t border-[var(--duties-border)] pt-3">
+          <Field htmlFor="new-mcp-id" label="创建 MCP Client" layout="stacked">
+            <Input width="wide" disabled={busy} id="new-mcp-id" onChange={(event) => setNewId(event.target.value)} placeholder="Client ID" value={newId} />
             <Button className="mt-2" disabled={busy || loading || !newId.trim()} onClick={create} variant="primary">创建 Client</Button>
-          </div>
-          <StatusText message={message} />
-        </Card>
-      )}
+          </Field>
+        </div>
+        <StatusText message={message} />
+      </Block>
     </PageShell>
   );
 };

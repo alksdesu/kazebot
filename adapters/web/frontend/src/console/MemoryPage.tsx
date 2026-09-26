@@ -39,18 +39,18 @@ const lastOffset = (count: number, size: number) =>
 
 const ENTRY = 'mt-1.5 border border-[var(--duties-border)] bg-[var(--duties-panel)] px-2.5 py-2';
 // 常驻条目每轮都进 prompt、一直占着注入预算，扫一眼就该看出是哪几条。
-const ENTRY_CONST = 'border-l-[3px] border-l-[var(--duties-live)]';
+const ENTRY_CONST = 'border-l-[length:var(--duties-marker-width)] border-l-[var(--duties-live)]';
 const HEAD = 'flex flex-wrap items-center gap-1.5';
 const ID = 'font-mono text-xs';
-const META = 'font-mono text-[0.65rem] text-[var(--duties-tertiary)]';
+const META = 'font-mono text-mini text-[var(--duties-tertiary)]';
 const TEXT = 'mt-1.5 break-words text-xs leading-relaxed';
-const KW = 'mt-1 break-words font-mono text-[0.65rem] text-[var(--duties-secondary)]';
+const KW = 'mt-1 break-words font-mono text-mini text-[var(--duties-secondary)]';
 // 上下文预览可能上百条，给个高度上限，不然整页被它撑开。
 const LOG = 'mt-1.5 max-h-80 overflow-auto border-t border-[var(--duties-border)] pt-1.5';
 const ADD = 'flex flex-col gap-1.5 border-t border-[var(--duties-border)] pt-2.5';
 const FIELD = 'flex items-center gap-2';
 const LABEL = 'w-14 flex-none text-xs text-[var(--duties-secondary)]';
-const BUCKET = 'font-mono text-[0.65rem] text-[var(--duties-secondary)]';
+const BUCKET = 'font-mono text-mini text-[var(--duties-secondary)]';
 // 会话按登录账号分组时的小标题。只在换过号之后才出现。
 const GROUP = 'mb-1.5 mt-3.5 text-xs text-[var(--duties-secondary)]';
 
@@ -186,7 +186,7 @@ const MemoryBlock = () => {
   return (
     <Block hint="模型聊天时自己攒下来的。手动加的不会被自动清理" title="长期记忆">
       {overviewLoading ? <Empty>正在读取记忆来源…</Empty> : namespaces.length === 0 && <Empty>{note || '还没有任何记忆。'}</Empty>}
-      <div className="grid grid-cols-1 items-start gap-3.5 md:grid-cols-[15rem_1fr]">
+      <div className="grid grid-cols-1 items-start gap-3.5 md:grid-cols-[var(--duties-split-columns)]">
         <div className="flex flex-col gap-1">
           <Input
             aria-label="按名字筛选来源"

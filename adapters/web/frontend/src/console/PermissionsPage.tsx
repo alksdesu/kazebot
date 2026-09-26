@@ -35,7 +35,7 @@ const CapabilityRow = ({ cap }: { cap: QqCapability }) => {
       <div className="flex items-center gap-2">
         <ItemTitle>{cap.name}</ItemTitle>
         {scoped && (
-          <span className="border border-[var(--duties-live)] px-1.5 text-[0.65rem] text-[var(--duties-live)]">
+          <span className="border border-[var(--duties-live)] px-1.5 text-mini text-[var(--duties-live)]">
             只在本群
           </span>
         )}

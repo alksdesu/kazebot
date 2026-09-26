@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { PageHeader } from '../components/settings/pages/settingsPagePrimitives';
+import { PageHeader } from '../components/settings/pages/settingsControls';
 
 export const controlClass = 'block w-full min-w-0 max-w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 text-sm text-[var(--duties-text)] disabled:cursor-not-allowed disabled:opacity-50';
 export const actionClass = 'inline-flex min-h-10 max-w-full items-center justify-center border border-[var(--duties-border)] px-3 py-2 text-sm transition-colors hover:bg-[var(--duties-muted)] disabled:cursor-not-allowed disabled:opacity-50';

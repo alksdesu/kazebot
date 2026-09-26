@@ -12,7 +12,7 @@ import {
 } from './fields';
 import { WordList } from './WordList';
 
-const CODE = 'bg-[var(--duties-muted)] px-1 py-px font-mono text-[0.65rem]';
+const CODE = 'bg-[var(--duties-muted)] px-1 py-px font-mono text-mini';
 
 export const TimingPage = () => {
   const legacyMode = useLiveValue<string>('group_trigger', 'mention_only').toLowerCase();

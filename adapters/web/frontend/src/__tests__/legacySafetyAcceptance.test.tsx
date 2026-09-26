@@ -6,7 +6,7 @@ import { ApprovalCard } from '../components/chat/ApprovalCard';
 import { ChatInput } from '../components/chat/ChatInput';
 import { NodeFilesSettingsPage } from '../components/settings/pages/NodeFilesSettingsPage';
 import { AgentsSettingsRightPanel, AutomationSettingsRightPanel } from '../components/settings/panels/SettingsContextPanels';
-import { hasLikelyYamlSyntaxIssue } from '../components/settings/pages/settingsPagePrimitives';
+import { hasLikelyYamlSyntaxIssue } from '../components/settings/settingsStructuredConfig';
 import { parseMcpClients, parseNodeConfig, parseSchedules, serializeMcpClients, serializeNodeConfig, serializeSchedules } from '../components/settings/settingsStructuredConfig';
 import { useConsoleStore } from '../console/consoleStore';
 import { useSettingsSelectionStore } from '../store/settingsSelectionStore';

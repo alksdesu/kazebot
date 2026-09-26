@@ -14,6 +14,15 @@
 @theme {
   --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
     'Liberation Mono', 'Courier New', monospace;
+  /* 正文 text-sm 之下的三档小字：标签、元信息、角标。差一档就是 0.03rem，再细分肉眼分不出。 */
+  --text-mini: 0.65rem;
+  --text-micro: 0.62rem;
+  --text-nano: 0.58rem;
+  /* 全大写的小标签撑开字距才读得出词界；大号数字反过来要收紧。 */
+  --tracking-caps: 0.16em;
+  --tracking-figure: -0.04em;
+  --tracking-ident: -0.01em;
+  --animate-verdict-flip: verdict-flip 120ms ease-out;
 }
 
 :root {
@@ -56,6 +65,25 @@
   --duties-input-width: 7rem;
   --duties-input-tiny-width: 5rem;
   --duties-input-alias-width: 10rem;
+  --duties-label-min-width: 9em;
+  --duties-id-min-width: 10ch;
+  --duties-count-width: 3em;
+  --duties-prose-max-width: 62ch;
+  /* 列表与编辑器面板两档高度。超过这个高度改为内部滚动，页面本身不被撑长。 */
+  --duties-pane-height: 28rem;
+  --duties-pane-height-tall: 34rem;
+  --duties-pane-min-height: 12rem;
+  --duties-thumb-height: 7.25rem;
+  --duties-marker-width: 3px;
+  /* 试听的判定行缩进到发言人标签之后，和上一行的正文对齐。 */
+  --duties-audition-indent: 2.125rem;
+  --duties-split-columns: 15rem 1fr;
+  --duties-split-columns-narrow: 12rem 1fr;
+  --duties-entry-columns: 1fr auto auto;
+  --duties-thumb-grid: repeat(auto-fill, minmax(11rem, 1fr));
+  --duties-app-height: 100dvh;
+  --duties-right-main-height: 60%;
+  --duties-right-log-height: 40%;
   /* Why: browser default scrollbars are visually heavy against the minimal Duties shell.
      How: expose scrollbar-specific tokens derived from the existing theme palette.
      Purpose: let Firefox and WebKit/Blink share one low-contrast, maintainable scrollbar design. */

@@ -14,7 +14,7 @@ import {
 } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { Button } from '../../common';
-import { AuthRequired, Card, FieldLabel, PageHeader, PageShell, SelectInput, StatusText, TextInput } from './settingsPagePrimitives';
+import { Block, Field, Input, PageShell, Select, StatusText } from './settingsControls';
 
 const presetTextAreaClass = 'w-full resize-y overflow-hidden border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-sm leading-5 text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]';
 
@@ -444,157 +444,171 @@ export const DrawtoolsSettingsPage = () => {
   };
 
   return (
-    <PageShell>
-      <PageHeader
-        description="管理 NovelAI 绘图配置、画师串预设、角色标签库和提示词模板。默认只维护 .example，点击初始化后才创建用户配置文件。"
-        title="NovelAI 绘图"
-      />
-      {!isAuthenticated ? <AuthRequired /> : (
-        <>
-          <Card title="运行期配置" description="用户配置写入 settings.yaml / character_tags.yaml / prompt .md；仓库更新只维护 .example。">
-            <div className="flex flex-wrap gap-2">
-              <Button disabled={loading} onClick={load}>{loading ? '加载中...' : '刷新'}</Button>
-              <Button onClick={initConfigs} variant="primary">从 Example 初始化用户配置</Button>
-            </div>
-            <StatusText message={message} />
-          </Card>
+    <PageShell authed={isAuthenticated} description="管理 NovelAI 绘图配置、画师串预设、角色标签库和提示词模板。默认只维护 .example，点击初始化后才创建用户配置文件。" title="NovelAI 绘图">
+      <>
+        <Block frame="boxed" title="运行期配置" hint="用户配置写入 settings.yaml / character_tags.yaml / prompt .md；仓库更新只维护 .example。">
+          <div className="flex flex-wrap gap-2">
+            <Button disabled={loading} onClick={load}>{loading ? '加载中...' : '刷新'}</Button>
+            <Button onClick={initConfigs} variant="primary">从 Example 初始化用户配置</Button>
+          </div>
+          <StatusText message={message} />
+        </Block>
 
-          <Card title="API 配置" description="API Key 推荐使用环境变量 NOVELAI_API_KEY；如必须写入文件，可在下方保存。">
-            <div className="grid gap-3 md:grid-cols-2">
-              <div>
-                <FieldLabel>NovelAI / 兼容站点 Base URL</FieldLabel>
-                <TextInput defaultValue={String(api.base_url || '')} onBlur={(event) => updateApiField('base_url', event.currentTarget.value)} placeholder="https://image.novelai.net" />
-              </div>
-              <div>
-                <FieldLabel>API Key 环境变量名</FieldLabel>
-                <TextInput defaultValue={String(api.api_key_env || 'NOVELAI_API_KEY')} onBlur={(event) => updateApiField('api_key_env', event.currentTarget.value)} />
-              </div>
-              <div className="md:col-span-2">
-                <FieldLabel>API Key（可选，不推荐提交到仓库）</FieldLabel>
-                <TextInput defaultValue={String(api.api_key || '')} onBlur={(event) => updateApiField('api_key', event.currentTarget.value)} placeholder="留空则使用环境变量" type="password" />
-              </div>
+        <Block frame="boxed" title="API 配置" hint="API Key 推荐使用环境变量 NOVELAI_API_KEY；如必须写入文件，可在下方保存。">
+          <div className="grid gap-3 md:grid-cols-2">
+            <div>
+              <Field label="NovelAI / 兼容站点 Base URL" layout="stacked">
+                <Input width="wide" defaultValue={String(api.base_url || '')} onBlur={(event) => updateApiField('base_url', event.currentTarget.value)} placeholder="https://image.novelai.net" />
+              </Field>
             </div>
-          </Card>
-
-          <Card title="生成队列 / 重试" description="NovelAI 请求会通过全局队列串行执行；429/5xx/连接失败会自动重试。">
-            <div className="grid gap-3 md:grid-cols-3">
-              <div>
-                <FieldLabel>生成间隔（秒）</FieldLabel>
-                <TextInput defaultValue={String(generation.request_delay_sec ?? 0)} onBlur={(event) => updateGenerationField('request_delay_sec', event.currentTarget.value)} type="number" />
-              </div>
-              <div>
-                <FieldLabel>重试等待（秒）</FieldLabel>
-                <TextInput defaultValue={String(generation.retry_wait_sec ?? 3)} onBlur={(event) => updateGenerationField('retry_wait_sec', event.currentTarget.value)} type="number" />
-              </div>
-              <div>
-                <FieldLabel>重试次数</FieldLabel>
-                <TextInput defaultValue={String(generation.retry_max_attempts ?? 5)} onBlur={(event) => updateGenerationField('retry_max_attempts', event.currentTarget.value)} type="number" />
-              </div>
+            <div>
+              <Field label="API Key 环境变量名" layout="stacked">
+                <Input width="wide" defaultValue={String(api.api_key_env || 'NOVELAI_API_KEY')} onBlur={(event) => updateApiField('api_key_env', event.currentTarget.value)} />
+              </Field>
             </div>
-          </Card>
-
-          <Card title="附件清理" description="自动清理 data/attachments/novelai：先删除过期文件，若仍超过容量上限再删除最旧文件。">
-            <div className="grid gap-3 md:grid-cols-4">
-              <label className="flex items-center gap-2 text-xs text-[var(--duties-secondary)]">
-                <input checked={Boolean(storage.cleanup_enabled ?? true)} onChange={(event) => updateStorageField('cleanup_enabled', event.currentTarget.checked)} type="checkbox" />
-                启用自动清理
-              </label>
-              <div>
-                <FieldLabel>保留天数</FieldLabel>
-                <TextInput defaultValue={String(storage.retention_days ?? 7)} onBlur={(event) => updateStorageField('retention_days', event.currentTarget.value)} type="number" />
-              </div>
-              <div>
-                <FieldLabel>最大容量 MB</FieldLabel>
-                <TextInput defaultValue={String(storage.max_total_mb ?? 2048)} onBlur={(event) => updateStorageField('max_total_mb', event.currentTarget.value)} type="number" />
-              </div>
-              <div>
-                <FieldLabel>清理检查间隔 秒</FieldLabel>
-                <TextInput defaultValue={String(storage.cleanup_interval_sec ?? 3600)} onBlur={(event) => updateStorageField('cleanup_interval_sec', event.currentTarget.value)} type="number" />
-              </div>
+            <div className="md:col-span-2">
+              <Field label="API Key（可选，不推荐提交到仓库）" layout="stacked">
+                <Input width="wide" defaultValue={String(api.api_key || '')} onBlur={(event) => updateApiField('api_key', event.currentTarget.value)} placeholder="留空则使用环境变量" type="password" />
+              </Field>
             </div>
-            <Button className="mt-3" onClick={runCleanup}>立即清理</Button>
-          </Card>
+          </div>
+        </Block>
 
-          <Card title="画师串 / 预设" description="绘图节点只看见预设名称，具体参数由工具层自动拼接。">
-            <div className="mb-3 max-w-xs">
-              <FieldLabel>当前默认预设</FieldLabel>
-              <SelectInput onChange={(event) => switchPreset(event.currentTarget.value)} value={effectiveSelectedPresetId}>
+        <Block frame="boxed" title="生成队列 / 重试" hint="NovelAI 请求会通过全局队列串行执行；429/5xx/连接失败会自动重试。">
+          <div className="grid gap-3 md:grid-cols-3">
+            <div>
+              <Field label="生成间隔（秒）" layout="stacked">
+                <Input width="wide" defaultValue={String(generation.request_delay_sec ?? 0)} onBlur={(event) => updateGenerationField('request_delay_sec', event.currentTarget.value)} type="number" />
+              </Field>
+            </div>
+            <div>
+              <Field label="重试等待（秒）" layout="stacked">
+                <Input width="wide" defaultValue={String(generation.retry_wait_sec ?? 3)} onBlur={(event) => updateGenerationField('retry_wait_sec', event.currentTarget.value)} type="number" />
+              </Field>
+            </div>
+            <div>
+              <Field label="重试次数" layout="stacked">
+                <Input width="wide" defaultValue={String(generation.retry_max_attempts ?? 5)} onBlur={(event) => updateGenerationField('retry_max_attempts', event.currentTarget.value)} type="number" />
+              </Field>
+            </div>
+          </div>
+        </Block>
+
+        <Block frame="boxed" title="附件清理" hint="自动清理 data/attachments/novelai：先删除过期文件，若仍超过容量上限再删除最旧文件。">
+          <div className="grid gap-3 md:grid-cols-4">
+            <label className="flex items-center gap-2 text-xs text-[var(--duties-secondary)]">
+              <input checked={Boolean(storage.cleanup_enabled ?? true)} onChange={(event) => updateStorageField('cleanup_enabled', event.currentTarget.checked)} type="checkbox" />
+              启用自动清理
+            </label>
+            <div>
+              <Field label="保留天数" layout="stacked">
+                <Input width="wide" defaultValue={String(storage.retention_days ?? 7)} onBlur={(event) => updateStorageField('retention_days', event.currentTarget.value)} type="number" />
+              </Field>
+            </div>
+            <div>
+              <Field label="最大容量 MB" layout="stacked">
+                <Input width="wide" defaultValue={String(storage.max_total_mb ?? 2048)} onBlur={(event) => updateStorageField('max_total_mb', event.currentTarget.value)} type="number" />
+              </Field>
+            </div>
+            <div>
+              <Field label="清理检查间隔 秒" layout="stacked">
+                <Input width="wide" defaultValue={String(storage.cleanup_interval_sec ?? 3600)} onBlur={(event) => updateStorageField('cleanup_interval_sec', event.currentTarget.value)} type="number" />
+              </Field>
+            </div>
+          </div>
+          <Button className="mt-3" onClick={runCleanup}>立即清理</Button>
+        </Block>
+
+        <Block frame="boxed" title="画师串 / 预设" hint="绘图节点只看见预设名称，具体参数由工具层自动拼接。">
+          <div className="mb-3 max-w-xs">
+            <Field label="当前默认预设" layout="stacked">
+              <Select width="wide" onChange={(event) => switchPreset(event.currentTarget.value)} value={effectiveSelectedPresetId}>
                 {presets.map((preset: any) => <option key={preset.id} value={preset.id}>{preset.name || preset.id}</option>)}
-              </SelectInput>
-            </div>
-            <div className="mb-3 flex flex-wrap gap-2">
-              <Button onClick={addPreset} variant="primary">+ 新增预设</Button>
-              <Button disabled={!selectedPreset?.id} onClick={renameSelectedPreset}>重命名当前预设</Button>
-              <Button disabled={!selectedPreset?.id} onClick={deleteSelectedPreset} variant="danger">删除当前预设</Button>
-            </div>
-            {selectedPreset?.id && (
-              <div className="mb-4 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3">
-                <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
-                  <h3 className="font-mono text-xs font-semibold">当前预设快捷编辑：{selectedPreset.name || selectedPreset.id}</h3>
-                  <span className="font-mono text-[0.65rem] text-[var(--duties-tertiary)]">id: {selectedPreset.id}</span>
+              </Select>
+            </Field>
+          </div>
+          <div className="mb-3 flex flex-wrap gap-2">
+            <Button onClick={addPreset} variant="primary">+ 新增预设</Button>
+            <Button disabled={!selectedPreset?.id} onClick={renameSelectedPreset}>重命名当前预设</Button>
+            <Button disabled={!selectedPreset?.id} onClick={deleteSelectedPreset} variant="danger">删除当前预设</Button>
+          </div>
+          {selectedPreset?.id && (
+            <div className="mb-4 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3">
+              <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+                <h3 className="font-mono text-xs font-semibold">当前预设快捷编辑：{selectedPreset.name || selectedPreset.id}</h3>
+                <span className="font-mono text-mini text-[var(--duties-tertiary)]">id: {selectedPreset.id}</span>
+              </div>
+              <div className="grid gap-3 md:grid-cols-3">
+                <div>
+                  <Field label="预设名称" layout="stacked">
+                    <Input width="wide" key={`preset-name-${selectedPreset.id}`} defaultValue={String(selectedPreset.name || '')} onBlur={(event) => updateSelectedPresetField('name', event.currentTarget.value)} placeholder="显示给绘图节点和用户看的名称" />
+                  </Field>
                 </div>
-                <div className="grid gap-3 md:grid-cols-3">
-                  <div>
-                    <FieldLabel>预设名称</FieldLabel>
-                    <TextInput key={`preset-name-${selectedPreset.id}`} defaultValue={String(selectedPreset.name || '')} onBlur={(event) => updateSelectedPresetField('name', event.currentTarget.value)} placeholder="显示给绘图节点和用户看的名称" />
-                  </div>
-                  <div>
-                    <FieldLabel>别名（逗号分隔）</FieldLabel>
-                    <TextInput key={`preset-aliases-${selectedPreset.id}`} defaultValue={Array.isArray(selectedPreset.aliases) ? selectedPreset.aliases.join(', ') : ''} onBlur={(event) => updateSelectedPresetField('aliases', event.currentTarget.value.split(',').map((item) => item.trim()).filter(Boolean))} placeholder="可选：中文名、短名" />
-                  </div>
-                  <div>
-                    <FieldLabel>绘图模型</FieldLabel>
-                    <SelectInput onChange={(event) => updateSelectedPresetParam('model', event.currentTarget.value)} value={String(selectedPreset.params?.model || 'nai-diffusion-4-5-full')}>
+                <div>
+                  <Field label="别名（逗号分隔）" layout="stacked">
+                    <Input width="wide" key={`preset-aliases-${selectedPreset.id}`} defaultValue={Array.isArray(selectedPreset.aliases) ? selectedPreset.aliases.join(', ') : ''} onBlur={(event) => updateSelectedPresetField('aliases', event.currentTarget.value.split(',').map((item) => item.trim()).filter(Boolean))} placeholder="可选：中文名、短名" />
+                  </Field>
+                </div>
+                <div>
+                  <Field label="绘图模型" layout="stacked">
+                    <Select width="wide" onChange={(event) => updateSelectedPresetParam('model', event.currentTarget.value)} value={String(selectedPreset.params?.model || 'nai-diffusion-4-5-full')}>
                       {NAI_MODELS.map((model) => <option key={model.value} value={model.value}>{model.label}</option>)}
-                    </SelectInput>
-                  </div>
-                  <div>
-                    <FieldLabel>采样器</FieldLabel>
-                    <SelectInput onChange={(event) => updateSelectedPresetParam('sampler', event.currentTarget.value)} value={String(selectedPreset.params?.sampler || 'k_euler_ancestral')}>
+                    </Select>
+                  </Field>
+                </div>
+                <div>
+                  <Field label="采样器" layout="stacked">
+                    <Select width="wide" onChange={(event) => updateSelectedPresetParam('sampler', event.currentTarget.value)} value={String(selectedPreset.params?.sampler || 'k_euler_ancestral')}>
                       {NAI_SAMPLERS.map((sampler) => <option key={sampler} value={sampler}>{sampler}</option>)}
-                    </SelectInput>
-                  </div>
-                  <div>
-                    <FieldLabel>噪声调度</FieldLabel>
-                    <SelectInput onChange={(event) => updateSelectedPresetParam('scheduler', event.currentTarget.value)} value={String(selectedPreset.params?.scheduler || 'karras')}>
+                    </Select>
+                  </Field>
+                </div>
+                <div>
+                  <Field label="噪声调度" layout="stacked">
+                    <Select width="wide" onChange={(event) => updateSelectedPresetParam('scheduler', event.currentTarget.value)} value={String(selectedPreset.params?.scheduler || 'karras')}>
                       {NAI_SCHEDULERS.map((scheduler) => <option key={scheduler} value={scheduler}>{scheduler}</option>)}
-                    </SelectInput>
-                  </div>
-                  <div>
-                    <FieldLabel>Steps</FieldLabel>
-                    <TextInput key={`steps-${selectedPreset.id}`} defaultValue={String(selectedPreset.params?.steps ?? 28)} onBlur={(event) => updateSelectedPresetParam('steps', event.currentTarget.value)} type="number" />
-                  </div>
-                  <div>
-                    <FieldLabel>CFG / Scale</FieldLabel>
-                    <TextInput key={`scale-${selectedPreset.id}`} defaultValue={String(selectedPreset.params?.scale ?? 6)} onBlur={(event) => updateSelectedPresetParam('scale', event.currentTarget.value)} type="number" />
-                  </div>
-                  <div>
-                    <FieldLabel>负面预设</FieldLabel>
-                    <SelectInput onChange={(event) => updateSelectedPresetParam('ucPreset', event.currentTarget.value)} value={String(selectedPreset.params?.ucPreset ?? 0)}>
+                    </Select>
+                  </Field>
+                </div>
+                <div>
+                  <Field label="Steps" layout="stacked">
+                    <Input width="wide" key={`steps-${selectedPreset.id}`} defaultValue={String(selectedPreset.params?.steps ?? 28)} onBlur={(event) => updateSelectedPresetParam('steps', event.currentTarget.value)} type="number" />
+                  </Field>
+                </div>
+                <div>
+                  <Field label="CFG / Scale" layout="stacked">
+                    <Input width="wide" key={`scale-${selectedPreset.id}`} defaultValue={String(selectedPreset.params?.scale ?? 6)} onBlur={(event) => updateSelectedPresetParam('scale', event.currentTarget.value)} type="number" />
+                  </Field>
+                </div>
+                <div>
+                  <Field label="负面预设" layout="stacked">
+                    <Select width="wide" onChange={(event) => updateSelectedPresetParam('ucPreset', event.currentTarget.value)} value={String(selectedPreset.params?.ucPreset ?? 0)}>
                       <option value="0">Heavy</option>
                       <option value="1">Light</option>
                       <option value="2">Human Focus</option>
                       <option value="3">None</option>
-                    </SelectInput>
-                  </div>
-                  <label className="flex items-center gap-2 text-xs text-[var(--duties-secondary)]">
-                    <input checked={Boolean(selectedPreset.params?.qualityToggle ?? true)} onChange={(event) => updateSelectedPresetParam('qualityToggle', event.currentTarget.checked)} type="checkbox" />
-                    质量增强
-                  </label>
-                  <label className="flex items-center gap-2 text-xs text-[var(--duties-secondary)]">
-                    <input checked={Boolean(selectedPreset.params?.autoSmea ?? false)} onChange={(event) => updateSelectedPresetParam('autoSmea', event.currentTarget.checked)} type="checkbox" />
-                    自动 SMEA
-                  </label>
-                  <label className="flex items-center gap-2 text-xs text-[var(--duties-secondary)]">
-                    <input checked={Boolean(selectedPreset.params?.variety_boost ?? false)} onChange={(event) => updateSelectedPresetParam('variety_boost', event.currentTarget.checked)} type="checkbox" />
-                    多样性增强 (V4.5)
-                  </label>
-                  <div>
-                    <FieldLabel>CFG 重缩放</FieldLabel>
-                    <TextInput key={`cfg-rescale-${selectedPreset.id}`} defaultValue={String(selectedPreset.params?.cfg_rescale ?? 0)} onBlur={(event) => updateSelectedPresetParam('cfg_rescale', event.currentTarget.value)} step="0.05" type="number" />
-                  </div>
-                  <div className="md:col-span-3">
-                    <FieldLabel>正面前缀</FieldLabel>
+                    </Select>
+                  </Field>
+                </div>
+                <label className="flex items-center gap-2 text-xs text-[var(--duties-secondary)]">
+                  <input checked={Boolean(selectedPreset.params?.qualityToggle ?? true)} onChange={(event) => updateSelectedPresetParam('qualityToggle', event.currentTarget.checked)} type="checkbox" />
+                  质量增强
+                </label>
+                <label className="flex items-center gap-2 text-xs text-[var(--duties-secondary)]">
+                  <input checked={Boolean(selectedPreset.params?.autoSmea ?? false)} onChange={(event) => updateSelectedPresetParam('autoSmea', event.currentTarget.checked)} type="checkbox" />
+                  自动 SMEA
+                </label>
+                <label className="flex items-center gap-2 text-xs text-[var(--duties-secondary)]">
+                  <input checked={Boolean(selectedPreset.params?.variety_boost ?? false)} onChange={(event) => updateSelectedPresetParam('variety_boost', event.currentTarget.checked)} type="checkbox" />
+                  多样性增强 (V4.5)
+                </label>
+                <div>
+                  <Field label="CFG 重缩放" layout="stacked">
+                    <Input width="wide" key={`cfg-rescale-${selectedPreset.id}`} defaultValue={String(selectedPreset.params?.cfg_rescale ?? 0)} onBlur={(event) => updateSelectedPresetParam('cfg_rescale', event.currentTarget.value)} step="0.05" type="number" />
+                  </Field>
+                </div>
+                <div className="md:col-span-3">
+                  <Field label="正面前缀" layout="stacked">
                     <AutoResizeTextarea
                       defaultValue={String(selectedPreset.positive_prefix || '')}
                       key={`positive-prefix-${selectedPreset.id}`}
@@ -602,9 +616,10 @@ export const DrawtoolsSettingsPage = () => {
                       placeholder="会自动拼接到正面提示词前方；支持多行编辑"
                       rows={3}
                     />
-                  </div>
-                  <div className="md:col-span-3">
-                    <FieldLabel>负面前缀</FieldLabel>
+                  </Field>
+                </div>
+                <div className="md:col-span-3">
+                  <Field label="负面前缀" layout="stacked">
                     <AutoResizeTextarea
                       defaultValue={String(selectedPreset.negative_prefix || '')}
                       key={`negative-prefix-${selectedPreset.id}`}
@@ -612,158 +627,167 @@ export const DrawtoolsSettingsPage = () => {
                       placeholder="会自动拼接到负面提示词前方；支持多行编辑"
                       rows={3}
                     />
-                  </div>
+                  </Field>
                 </div>
               </div>
+            </div>
+          )}
+          <div>
+            <button
+              className="mb-2 flex w-full items-center justify-between border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 text-left font-mono text-xs font-semibold text-[var(--duties-text)] hover:border-[var(--duties-text)]"
+              onClick={() => setPresetsExpanded((value) => !value)}
+              type="button"
+            >
+              <span>预设列表（{presets.length} 个）</span>
+              <span>{presetsExpanded ? '收起 ▲' : '展开 ▼'}</span>
+            </button>
+            {presetsExpanded && (
+              <div className="max-h-80 space-y-2 overflow-y-auto pr-1">
+                {presets.map((preset: any) => (
+                  <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3" key={preset.id}>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="font-mono text-xs font-semibold">{preset.name || preset.id} {String(preset.id) === effectiveSelectedPresetId ? '· 当前默认' : ''}</div>
+                      <Button onClick={() => switchPreset(String(preset.id))}>设为默认/编辑</Button>
+                    </div>
+                    <p className="mt-1 text-xs text-[var(--duties-secondary)]">id: {preset.id} · model: {preset.params?.model} · sampler: {preset.params?.sampler} · scheduler: {preset.params?.scheduler} · CFG: {preset.params?.scale} · steps: {preset.params?.steps}</p>
+                  </div>
+                ))}
+              </div>
             )}
-            <div>
-              <button
-                className="mb-2 flex w-full items-center justify-between border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 text-left font-mono text-xs font-semibold text-[var(--duties-text)] hover:border-[var(--duties-text)]"
-                onClick={() => setPresetsExpanded((value) => !value)}
-                type="button"
-              >
-                <span>预设列表（{presets.length} 个）</span>
-                <span>{presetsExpanded ? '收起 ▲' : '展开 ▼'}</span>
-              </button>
-              {presetsExpanded && (
-                <div className="max-h-80 space-y-2 overflow-y-auto pr-1">
-                  {presets.map((preset: any) => (
-                    <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3" key={preset.id}>
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="font-mono text-xs font-semibold">{preset.name || preset.id} {String(preset.id) === effectiveSelectedPresetId ? '· 当前默认' : ''}</div>
-                        <Button onClick={() => switchPreset(String(preset.id))}>设为默认/编辑</Button>
-                      </div>
-                      <p className="mt-1 text-xs text-[var(--duties-secondary)]">id: {preset.id} · model: {preset.params?.model} · sampler: {preset.params?.sampler} · scheduler: {preset.params?.scheduler} · CFG: {preset.params?.scale} · steps: {preset.params?.steps}</p>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </Card>
+          </div>
+        </Block>
 
-          <Card title="角色标签库" description="管理绘图分析节点可参考的固定角色外貌、别名、Danbooru tag 和服装标签。保存后写入 character_tags.yaml。">
-            <div className="mb-3 grid gap-2 md:grid-cols-[1fr_auto_auto]">
-              <TextInput onChange={(event) => setCharacterQuery(event.currentTarget.value)} placeholder="搜索角色名称、别名、Danbooru、外貌、服装..." value={characterQuery} />
-              <Button onClick={() => setCharacterQuery('')}>清空搜索</Button>
-              <Button onClick={addCharacter} variant="primary">+ 新增角色</Button>
-            </div>
-            <div className="mb-3 grid gap-2 text-xs text-[var(--duties-secondary)] md:grid-cols-4">
-              <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">总角色：{characters.length}</div>
-              <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">搜索结果：{filteredCharacters.length}</div>
-              <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">已填外貌：{characters.filter((character: any) => String(character?.appearance || '').trim()).length}</div>
-              <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">含服装：{characters.filter((character: any) => normalizeCharacterOutfits(character?.outfits).length).length}</div>
-            </div>
-            {!characters.length && <p className="text-sm text-[var(--duties-secondary)]">暂无角色配置，点击“新增角色”开始建立标签库。</p>}
-            {!!characters.length && !filteredCharacters.length && <p className="text-sm text-[var(--duties-secondary)]">没有匹配的角色，试试调整搜索关键词。</p>}
-            <div className="space-y-3">
-              {filteredCharacters.map(({ character, index }: CharacterListItem) => {
-                const isEditing = editingCharacterIndex === index;
-                const outfits = normalizeCharacterOutfits(character?.outfits);
-                const aliases = Array.isArray(character?.aliases) ? character.aliases : [];
-                return (
-                  <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3" key={`${character?.name || 'character'}-${index}`}>
-                    <div className="flex flex-wrap items-start justify-between gap-2">
-                      <div>
-                        <div className="font-mono text-sm font-semibold">{character?.name || `未命名角色 ${index + 1}`}</div>
-                        <p className="mt-1 text-xs text-[var(--duties-secondary)]">
-                          type: {character?.type || 'girl'} · aliases: {aliases.length || 0} · danbooru: {character?.danbooru || '—'} · outfits: {outfits.length}
-                        </p>
-                      </div>
-                      <div className="flex flex-wrap gap-2">
-                        <Button onClick={() => setEditingCharacterIndex(isEditing ? null : index)}>{isEditing ? '收起编辑' : '编辑'}</Button>
-                        <Button onClick={() => renameCharacter(index)}>重命名</Button>
-                        <Button onClick={() => deleteCharacter(index)} variant="danger">删除</Button>
-                      </div>
+        <Block frame="boxed" title="角色标签库" hint="管理绘图分析节点可参考的固定角色外貌、别名、Danbooru tag 和服装标签。保存后写入 character_tags.yaml。">
+          <div className="mb-3 grid gap-2 md:grid-cols-[var(--duties-entry-columns)]">
+            <Input width="wide" onChange={(event) => setCharacterQuery(event.currentTarget.value)} placeholder="搜索角色名称、别名、Danbooru、外貌、服装..." value={characterQuery} />
+            <Button onClick={() => setCharacterQuery('')}>清空搜索</Button>
+            <Button onClick={addCharacter} variant="primary">+ 新增角色</Button>
+          </div>
+          <div className="mb-3 grid gap-2 text-xs text-[var(--duties-secondary)] md:grid-cols-4">
+            <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">总角色：{characters.length}</div>
+            <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">搜索结果：{filteredCharacters.length}</div>
+            <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">已填外貌：{characters.filter((character: any) => String(character?.appearance || '').trim()).length}</div>
+            <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">含服装：{characters.filter((character: any) => normalizeCharacterOutfits(character?.outfits).length).length}</div>
+          </div>
+          {!characters.length && <p className="text-sm text-[var(--duties-secondary)]">暂无角色配置，点击“新增角色”开始建立标签库。</p>}
+          {!!characters.length && !filteredCharacters.length && <p className="text-sm text-[var(--duties-secondary)]">没有匹配的角色，试试调整搜索关键词。</p>}
+          <div className="space-y-3">
+            {filteredCharacters.map(({ character, index }: CharacterListItem) => {
+              const isEditing = editingCharacterIndex === index;
+              const outfits = normalizeCharacterOutfits(character?.outfits);
+              const aliases = Array.isArray(character?.aliases) ? character.aliases : [];
+              return (
+                <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3" key={`${character?.name || 'character'}-${index}`}>
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <div className="font-mono text-sm font-semibold">{character?.name || `未命名角色 ${index + 1}`}</div>
+                      <p className="mt-1 text-xs text-[var(--duties-secondary)]">
+                        type: {character?.type || 'girl'} · aliases: {aliases.length || 0} · danbooru: {character?.danbooru || '—'} · outfits: {outfits.length}
+                      </p>
                     </div>
-                    {!isEditing && (
-                      <div className="mt-3 space-y-2 text-xs text-[var(--duties-secondary)]">
-                        {character?.appearance ? <p><span className="font-semibold text-[var(--duties-text)]">外貌：</span>{character.appearance}</p> : <p>⚠️ 尚未填写外貌标签</p>}
-                        {!!outfits.length && <p><span className="font-semibold text-[var(--duties-text)]">服装：</span>{outfits.map((outfit) => outfit.name || '未命名服装').join('、')}</p>}
+                    <div className="flex flex-wrap gap-2">
+                      <Button onClick={() => setEditingCharacterIndex(isEditing ? null : index)}>{isEditing ? '收起编辑' : '编辑'}</Button>
+                      <Button onClick={() => renameCharacter(index)}>重命名</Button>
+                      <Button onClick={() => deleteCharacter(index)} variant="danger">删除</Button>
+                    </div>
+                  </div>
+                  {!isEditing && (
+                    <div className="mt-3 space-y-2 text-xs text-[var(--duties-secondary)]">
+                      {character?.appearance ? <p><span className="font-semibold text-[var(--duties-text)]">外貌：</span>{character.appearance}</p> : <p>⚠️ 尚未填写外貌标签</p>}
+                      {!!outfits.length && <p><span className="font-semibold text-[var(--duties-text)]">服装：</span>{outfits.map((outfit) => outfit.name || '未命名服装').join('、')}</p>}
+                    </div>
+                  )}
+                  {isEditing && (
+                    <div className="mt-4 grid gap-3 md:grid-cols-2">
+                      <div>
+                        <Field label="角色名称" layout="stacked">
+                          <Input width="wide" key={`char-name-${index}`} defaultValue={String(character?.name || '')} onBlur={(event) => updateCharacterField(index, 'name', event.currentTarget.value)} />
+                        </Field>
                       </div>
-                    )}
-                    {isEditing && (
-                      <div className="mt-4 grid gap-3 md:grid-cols-2">
-                        <div>
-                          <FieldLabel>角色名称</FieldLabel>
-                          <TextInput key={`char-name-${index}`} defaultValue={String(character?.name || '')} onBlur={(event) => updateCharacterField(index, 'name', event.currentTarget.value)} />
-                        </div>
-                        <div>
-                          <FieldLabel>类型</FieldLabel>
-                          <SelectInput onChange={(event) => updateCharacterField(index, 'type', event.currentTarget.value)} value={String(character?.type || 'girl')}>
+                      <div>
+                        <Field label="类型" layout="stacked">
+                          <Select width="wide" onChange={(event) => updateCharacterField(index, 'type', event.currentTarget.value)} value={String(character?.type || 'girl')}>
                             {CHARACTER_TYPES.map((type) => <option key={type.value} value={type.value}>{type.label}</option>)}
-                          </SelectInput>
-                        </div>
-                        <div>
-                          <FieldLabel>别名（逗号分隔）</FieldLabel>
-                          <TextInput key={`char-aliases-${index}`} defaultValue={aliases.join(', ')} onBlur={(event) => updateCharacterField(index, 'aliases', event.currentTarget.value.split(/[,，]/).map((item) => item.trim()).filter(Boolean))} placeholder="小名、英文名、昵称..." />
-                        </div>
-                        <div>
-                          <FieldLabel>Danbooru Tag</FieldLabel>
-                          <TextInput key={`char-danbooru-${index}`} defaultValue={String(character?.danbooru || '')} onBlur={(event) => updateCharacterField(index, 'danbooru', event.currentTarget.value)} placeholder="hatsune_miku" />
-                        </div>
-                        <div className="md:col-span-2">
-                          <FieldLabel>外貌标签 appearance</FieldLabel>
+                          </Select>
+                        </Field>
+                      </div>
+                      <div>
+                        <Field label="别名（逗号分隔）" layout="stacked">
+                          <Input width="wide" key={`char-aliases-${index}`} defaultValue={aliases.join(', ')} onBlur={(event) => updateCharacterField(index, 'aliases', event.currentTarget.value.split(/[,，]/).map((item) => item.trim()).filter(Boolean))} placeholder="小名、英文名、昵称..." />
+                        </Field>
+                      </div>
+                      <div>
+                        <Field label="Danbooru Tag" layout="stacked">
+                          <Input width="wide" key={`char-danbooru-${index}`} defaultValue={String(character?.danbooru || '')} onBlur={(event) => updateCharacterField(index, 'danbooru', event.currentTarget.value)} placeholder="hatsune_miku" />
+                        </Field>
+                      </div>
+                      <div className="md:col-span-2">
+                        <Field label="外貌标签 appearance" layout="stacked">
                           <AutoResizeTextarea key={`char-appearance-${index}`} defaultValue={String(character?.appearance || '')} onBlur={(event) => updateCharacterField(index, 'appearance', event.currentTarget.value)} placeholder="long hair, blue eyes, white dress..." rows={3} />
-                        </div>
-                        <div className="md:col-span-2">
-                          <FieldLabel>负向标签（可选）</FieldLabel>
+                        </Field>
+                      </div>
+                      <div className="md:col-span-2">
+                        <Field label="负向标签（可选）" layout="stacked">
                           <AutoResizeTextarea key={`char-negative-${index}`} defaultValue={String(character?.negative_tags || character?.negativeTags || '')} onBlur={(event) => updateCharacterField(index, 'negative_tags', event.currentTarget.value)} placeholder="需要避免的角色特征..." rows={2} />
+                        </Field>
+                      </div>
+                      <div className="md:col-span-2">
+                        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                          <Field label="角色服装" layout="stacked" />
+                          <Button onClick={() => addCharacterOutfit(index)}>+ 添加服装</Button>
                         </div>
-                        <div className="md:col-span-2">
-                          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                            <FieldLabel>角色服装</FieldLabel>
-                            <Button onClick={() => addCharacterOutfit(index)}>+ 添加服装</Button>
-                          </div>
-                          {!outfits.length && <p className="mb-2 text-xs text-[var(--duties-secondary)]">未配置服装时可留空；添加后会在生图规划时作为服装参考发送给 AI。</p>}
-                          <div className="space-y-2">
-                            {outfits.map((outfit, outfitIndex) => (
-                              <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-3" key={`${outfit.name || 'outfit'}-${outfitIndex}`}>
-                                <div className="mb-2 flex items-center justify-between gap-2">
-                                  <div className="font-mono text-xs font-semibold">服装 {outfitIndex + 1}</div>
-                                  <Button onClick={() => deleteCharacterOutfit(index, outfitIndex)} variant="danger">删除服装</Button>
+                        {!outfits.length && <p className="mb-2 text-xs text-[var(--duties-secondary)]">未配置服装时可留空；添加后会在生图规划时作为服装参考发送给 AI。</p>}
+                        <div className="space-y-2">
+                          {outfits.map((outfit, outfitIndex) => (
+                            <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-3" key={`${outfit.name || 'outfit'}-${outfitIndex}`}>
+                              <div className="mb-2 flex items-center justify-between gap-2">
+                                <div className="font-mono text-xs font-semibold">服装 {outfitIndex + 1}</div>
+                                <Button onClick={() => deleteCharacterOutfit(index, outfitIndex)} variant="danger">删除服装</Button>
+                              </div>
+                              <div className="grid gap-2 md:grid-cols-3">
+                                <div>
+                                  <Field label="服装名称" layout="stacked">
+                                    <Input width="wide" key={`outfit-name-${index}-${outfitIndex}`} defaultValue={outfit.name} onBlur={(event) => updateCharacterOutfit(index, outfitIndex, 'name', event.currentTarget.value)} placeholder="常服、礼服、战斗服..." />
+                                  </Field>
                                 </div>
-                                <div className="grid gap-2 md:grid-cols-3">
-                                  <div>
-                                    <FieldLabel>服装名称</FieldLabel>
-                                    <TextInput key={`outfit-name-${index}-${outfitIndex}`} defaultValue={outfit.name} onBlur={(event) => updateCharacterOutfit(index, outfitIndex, 'name', event.currentTarget.value)} placeholder="常服、礼服、战斗服..." />
-                                  </div>
-                                  <div className="md:col-span-2">
-                                    <FieldLabel>服装 TAG</FieldLabel>
+                                <div className="md:col-span-2">
+                                  <Field label="服装 TAG" layout="stacked">
                                     <AutoResizeTextarea key={`outfit-tags-${index}-${outfitIndex}`} defaultValue={outfit.tags} onBlur={(event) => updateCharacterOutfit(index, outfitIndex, 'tags', event.currentTarget.value)} placeholder="white shirt, pleated skirt, ribbon..." rows={2} />
-                                  </div>
+                                  </Field>
                                 </div>
                               </div>
-                            ))}
-                          </div>
+                            </div>
+                          ))}
                         </div>
                       </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </Card>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </Block>
 
-          <Card title="原始配置编辑器" description={fileMeta(bundle, section)}>
-            <div className="mb-3 grid gap-2 md:grid-cols-2">
-              <FieldLabel>编辑对象</FieldLabel>
-              <SelectInput onChange={(event) => setSection(event.currentTarget.value as SectionKey)} value={section}>
+        <Block frame="boxed" title="原始配置编辑器" hint={fileMeta(bundle, section)}>
+          <div className="mb-3 grid gap-2 md:grid-cols-2">
+            <Field label="编辑对象" layout="stacked">
+              <Select width="wide" onChange={(event) => setSection(event.currentTarget.value as SectionKey)} value={section}>
                 {(Object.keys(sectionLabels) as SectionKey[]).map((key) => <option key={key} value={key}>{sectionLabels[key]}</option>)}
-              </SelectInput>
-            </div>
-            <textarea
-              className="h-[32rem] w-full resize-y border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 font-mono text-xs leading-5 text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-              onChange={(event) => setEditor(event.currentTarget.value)}
-              spellCheck={false}
-              value={editor}
-            />
-            <div className="mt-3 flex flex-wrap gap-2">
-              <Button onClick={saveCurrent} variant="primary">保存当前文件</Button>
-              <Button onClick={() => setEditor(section === 'node' ? nodeRaw : getSectionContent(bundle, section))}>撤销未保存修改</Button>
-            </div>
-          </Card>
-        </>
-      )}
+              </Select>
+            </Field>
+          </div>
+          <textarea
+            className="h-[var(--duties-pane-height-tall)] w-full resize-y border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 font-mono text-xs leading-5 text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            onChange={(event) => setEditor(event.currentTarget.value)}
+            spellCheck={false}
+            value={editor}
+          />
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button onClick={saveCurrent} variant="primary">保存当前文件</Button>
+            <Button onClick={() => setEditor(section === 'node' ? nodeRaw : getSectionContent(bundle, section))}>撤销未保存修改</Button>
+          </div>
+        </Block>
+      </>
     </PageShell>
   );
 };

@@ -13,8 +13,7 @@ import {
   type WorkerHealth,
 } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
-import { Block, Button, Empty, Facts, Footnote, Pip } from './settingsControls';
-import { AuthRequired, PageHeader, PageShell, StatusText } from './settingsPagePrimitives';
+import { Block, Button, Empty, Facts, Footnote, PageShell, Pip, StatusText } from './settingsControls';
 
 const POLL_MS = 5000;
 const TAIL_LINES = 500;
@@ -51,15 +50,15 @@ const WorkerRow = ({ name, health }: { name: string; health: WorkerHealth }) => 
       <span className="font-mono text-xs text-[var(--duties-secondary)]">{state}</span>
       <span className="flex-1" />
       {health.pid !== null && (
-        <span className="font-mono text-[0.6rem] text-[var(--duties-tertiary)]">pid {health.pid}</span>
+        <span className="font-mono text-micro text-[var(--duties-tertiary)]">pid {health.pid}</span>
       )}
       {health.generation && (
-        <span className="font-mono text-[0.6rem] text-[var(--duties-tertiary)]">
+        <span className="font-mono text-micro text-[var(--duties-tertiary)]">
           gen {health.generation.slice(0, 8)}
         </span>
       )}
       {health.respawns > 0 && (
-        <span className="font-mono text-[0.6rem] text-[var(--duties-tertiary)]">
+        <span className="font-mono text-micro text-[var(--duties-tertiary)]">
           重拉过 {health.respawns} 次
         </span>
       )}
@@ -87,7 +86,7 @@ const GaveUpNotice = ({ workers, busy, onRetry }: {
           {health.last_exit_code !== null && `，退出码 ${health.last_exit_code}`}
         </p>
         {health.last_log && (
-          <pre className="mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-all border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 font-mono text-[0.6rem] leading-5">
+          <pre className="mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-all border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 font-mono text-micro leading-5">
             {health.last_log}
           </pre>
         )}
@@ -141,8 +140,8 @@ const LogViewer = ({ token }: { token: string }) => {
   return (
     <Block hint={`最多 ${TAIL_LINES} 行，密钥已在服务端打码`} title="日志">
       {files.length === 0 ? <Empty>还没有日志文件。</Empty> : (
-        <div className="grid gap-3 md:grid-cols-[16rem_1fr]">
-          <ul className="max-h-[28rem] overflow-y-auto border border-[var(--duties-border)]">
+        <div className="grid gap-3 md:grid-cols-[var(--duties-split-columns)]">
+          <ul className="max-h-[var(--duties-pane-height)] overflow-y-auto border border-[var(--duties-border)]">
             {files.map((file) => (
               <li key={file.name}>
                 <button
@@ -154,8 +153,8 @@ const LogViewer = ({ token }: { token: string }) => {
                   onClick={() => setPicked(file.name)}
                   type="button"
                 >
-                  <span className="w-full truncate font-mono text-[0.65rem]">{file.name}</span>
-                  <span className="font-mono text-[0.55rem] opacity-70">{sizeText(file.size)}</span>
+                  <span className="w-full truncate font-mono text-mini">{file.name}</span>
+                  <span className="font-mono text-nano opacity-70">{sizeText(file.size)}</span>
                 </button>
               </li>
             ))}
@@ -169,7 +168,7 @@ const LogViewer = ({ token }: { token: string }) => {
               </Button>
             </div>
             <pre
-              className="max-h-[28rem] min-h-[12rem] overflow-auto whitespace-pre-wrap break-all border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 font-mono text-[0.6rem] leading-5"
+              className="max-h-[var(--duties-pane-height)] min-h-[var(--duties-pane-min-height)] overflow-auto whitespace-pre-wrap break-all border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 font-mono text-micro leading-5"
               ref={box}
             >
               {text || '（空）'}
@@ -223,47 +222,41 @@ export const RuntimeSettingsPage = () => {
   const gaveUp = workers.filter(([, health]) => health.given_up);
 
   return (
-    <PageShell>
-      <PageHeader
-        description="worker 的死活、任务队列和日志。engine 崩了 supervisor 照样活着，这一页是唯一看得出来的地方。"
-        title="运行"
-      />
-      {!isAuthenticated ? <AuthRequired /> : (
-        <>
-          {gaveUp.length > 0 && (
-            <GaveUpNotice busy={retrying} onRetry={() => void onRetry()} workers={gaveUp} />
-          )}
+    <PageShell authed={isAuthenticated} description="worker 的死活、任务队列和日志。engine 崩了 supervisor 照样活着，这一页是唯一看得出来的地方。" title="运行">
+      <>
+        {gaveUp.length > 0 && (
+          <GaveUpNotice busy={retrying} onRetry={() => void onRetry()} workers={gaveUp} />
+        )}
 
-          <Block
-            hint={status ? `supervisor 已运行 ${duration(status.uptime_sec)}` : ''}
-            title="Engine Worker"
-          >
-            {!status ? <Empty>正在读取…</Empty>
-              : !status.supervised ? (
-                <Empty>这个部署的 engine 不由 supervisor 拉起，这里测不到它的状态。</Empty>
-              ) : workers.length === 0 ? <Empty>没有配置 worker。</Empty> : (
-                <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)]">
-                  {workers.map(([name, health]) => (
-                    <WorkerRow health={health} key={name} name={name} />
-                  ))}
-                </div>
-              )}
-            {status && (
-              <Facts>
-                任务队列：等待 {status.tasks.queued} 个，执行中 {status.tasks.running} 个。
-              </Facts>
+        <Block
+          hint={status ? `supervisor 已运行 ${duration(status.uptime_sec)}` : ''}
+          title="Engine Worker"
+        >
+          {!status ? <Empty>正在读取…</Empty>
+            : !status.supervised ? (
+              <Empty>这个部署的 engine 不由 supervisor 拉起，这里测不到它的状态。</Empty>
+            ) : workers.length === 0 ? <Empty>没有配置 worker。</Empty> : (
+              <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)]">
+                {workers.map(([name, health]) => (
+                  <WorkerRow health={health} key={name} name={name} />
+                ))}
+              </div>
             )}
-            <StatusText message={note} />
-          </Block>
+          {status && (
+            <Facts>
+              任务队列：等待 {status.tasks.queued} 个，执行中 {status.tasks.running} 个。
+            </Facts>
+          )}
+          <StatusText message={note} />
+        </Block>
 
-          {adminToken && <LogViewer token={adminToken} />}
+        {adminToken && <LogViewer token={adminToken} />}
 
-          <Footnote>
-            worker 掉了会自动重拉，头一次立刻拉，之后按 1/2/4/8 秒退避；连续 5 次起不来就停手，
-            等你看过原因再手动重试。这一页每 5 秒刷新一次。
-          </Footnote>
-        </>
-      )}
+        <Footnote>
+          worker 掉了会自动重拉，头一次立刻拉，之后按 1/2/4/8 秒退避；连续 5 次起不来就停手，
+          等你看过原因再手动重试。这一页每 5 秒刷新一次。
+        </Footnote>
+      </>
     </PageShell>
   );
 };

@@ -39,12 +39,12 @@ import { VisionChannelBlock } from './VisionChannelBlock';
 
 const PAGE_SIZE = 60;
 
-const META = 'text-[0.65rem] text-[var(--duties-tertiary)]';
+const META = 'text-mini text-[var(--duties-tertiary)]';
 
 const ACTS = 'flex flex-wrap gap-1';
 
 const CHAN_ROW = 'mt-1.5 flex items-center gap-2.5';
-const CHAN_LABEL = 'flex-none basis-[3em] text-xs text-[var(--duties-secondary)]';
+const CHAN_LABEL = 'flex-none basis-[var(--duties-count-width)] text-xs text-[var(--duties-secondary)]';
 const CHAN_BODY = 'flex min-w-0 flex-1 items-center gap-2';
 
 // 文件选择框拿 ref 清值，函数组件的 Input 传不进 ref，只能自己披皮。
@@ -219,7 +219,7 @@ const LibraryBlock = () => {
       {/* 表情包长宽参差，定高加 contain 才对得成网格；底色衬出透明图的边界。 */}
       <img
         alt={row.name || row.sha256.slice(0, 8)}
-        className="h-[7.25rem] w-full bg-[var(--duties-muted)] object-contain"
+        className="h-[var(--duties-thumb-height)] w-full bg-[var(--duties-muted)] object-contain"
         loading="lazy"
         src={stickerImageHref(row.sha256, adminToken)}
       />
@@ -231,7 +231,7 @@ const LibraryBlock = () => {
           {row.sent_count > 0 && ` · 发过 ${row.sent_count} 次`}
         </span>
         <span
-          className={`self-start border px-1.5 text-[0.65rem] ${
+          className={`self-start border px-1.5 text-mini ${
             row.caption_state === 'failed'
               ? 'border-[var(--duties-danger)] text-[var(--duties-danger)]'
               : 'border-[var(--duties-border)] text-[var(--duties-secondary)]'
@@ -332,7 +332,7 @@ const LibraryBlock = () => {
         {items.length === 0 ? (
           <Empty>{search ? '没有匹配的图。' : '这一档还是空的。'}</Empty>
         ) : (
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(11rem,1fr))] gap-2.5">
+          <div className="grid grid-cols-[var(--duties-thumb-grid)] gap-2.5">
             {items.map(card)}
           </div>
         )}

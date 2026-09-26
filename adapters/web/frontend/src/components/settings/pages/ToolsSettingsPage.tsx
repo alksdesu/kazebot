@@ -12,7 +12,7 @@ import { Button } from '../../common';
 import { AutoApproveSection } from './AutoApproveSection';
 import { NodeGrantsSection } from './NodeGrantsSection';
 import { PolicyRulesSection } from './PolicyRulesSection';
-import { AuthRequired, Card, FieldLabel, PageHeader, PageShell, StatusText, TextInput } from './settingsPagePrimitives';
+import { Block, Field, Input, PageShell, StatusText } from './settingsControls';
 
 function defaultToolScript(name: string): string {
   // [2026-06-02] Provide a safe external-tool starter file. Why: Supervisor expects
@@ -134,8 +134,8 @@ const ToolInventorySection = () => {
   ));
 
   return (
-    <Card
-      description="模型能调的全部工具都在这里。外部脚本工具可以增删改，内置和插件工具只能看；风险等级根据工具名前缀推断，脚本编辑器在右栏。"
+    <Block frame="boxed"
+      hint="模型能调的全部工具都在这里。外部脚本工具可以增删改，内置和插件工具只能看；风险等级根据工具名前缀推断，脚本编辑器在右栏。"
       scope="all-channels"
       title={`工具清单 · 共 ${tools.length}`}
     >
@@ -146,7 +146,7 @@ const ToolInventorySection = () => {
             <Button disabled={busy || !selectedTool?.editable} onClick={remove} variant="danger">删除选中工具</Button>
           </div>
           <div className="mb-3 flex flex-wrap items-center gap-2">
-            <TextInput
+            <Input width="wide"
               aria-label="筛选工具"
               className="min-w-0 flex-1"
               onChange={(event) => setQuery(event.target.value)}
@@ -157,7 +157,7 @@ const ToolInventorySection = () => {
               {SOURCE_FILTERS.map((item) => (
                 <button
                   aria-pressed={sourceFilter === item.key}
-                  className={`border px-2 py-1 font-mono text-[0.65rem] transition-colors ${
+                  className={`border px-2 py-1 font-mono text-mini transition-colors ${
                     sourceFilter === item.key
                       ? 'border-[var(--duties-text)] bg-[var(--duties-text)] text-[var(--duties-bg)]'
                       : 'border-[var(--duties-border)] text-[var(--duties-secondary)] hover:border-[var(--duties-text)] hover:text-[var(--duties-text)]'
@@ -171,7 +171,7 @@ const ToolInventorySection = () => {
               ))}
             </div>
           </div>
-          <ul className="m-0 max-h-[34rem] list-none space-y-2 overflow-y-auto p-0">
+          <ul className="m-0 max-h-[var(--duties-pane-height-tall)] list-none space-y-2 overflow-y-auto p-0">
             {visible.map((tool) => {
               const risk = inferToolRisk(tool.name);
               return (
@@ -179,9 +179,9 @@ const ToolInventorySection = () => {
                   <button className={`w-full border p-3 text-left ${selectedTool?.name === tool.name ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} disabled={busy} onClick={() => { setSelectedTool(tool); setMessage(''); setRightPanelOpen(true); }} type="button">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="font-mono text-xs font-semibold">{tool.name}</span>
-                      <span className={`border px-1.5 py-0.5 font-mono text-[0.55rem] ${riskClassName(risk)}`}>{riskLabel(risk)}</span>
-                      <span className="border border-[var(--duties-border)] px-1.5 py-0.5 font-mono text-[0.55rem] text-[var(--duties-secondary)]">{SOURCE_LABEL[tool.source]}</span>
-                      {!tool.editable && <span className="font-mono text-[0.55rem] text-[var(--duties-tertiary)]">只读</span>}
+                      <span className={`border px-1.5 py-0.5 font-mono text-nano ${riskClassName(risk)}`}>{riskLabel(risk)}</span>
+                      <span className="border border-[var(--duties-border)] px-1.5 py-0.5 font-mono text-nano text-[var(--duties-secondary)]">{SOURCE_LABEL[tool.source]}</span>
+                      {!tool.editable && <span className="font-mono text-nano text-[var(--duties-tertiary)]">只读</span>}
                     </div>
                     <p className="mt-1 text-xs text-[var(--duties-secondary)]">
                       {tool.description || '无描述'}
@@ -198,32 +198,27 @@ const ToolInventorySection = () => {
             )}
           </ul>
           <div className="mt-4 border-t border-[var(--duties-border)] pt-3">
-            <FieldLabel htmlFor="new-tool-name">创建工具</FieldLabel>
-            <TextInput disabled={busy} id="new-tool-name" onChange={(event) => setNewName(event.target.value)} placeholder="工具名称" value={newName} />
-            <Button className="mt-2" disabled={busy} onClick={create} variant="primary">创建工具</Button>
+            <Field htmlFor="new-tool-name" label="创建工具" layout="stacked">
+              <Input width="wide" disabled={busy} id="new-tool-name" onChange={(event) => setNewName(event.target.value)} placeholder="工具名称" value={newName} />
+              <Button className="mt-2" disabled={busy} onClick={create} variant="primary">创建工具</Button>
+            </Field>
           </div>
           <StatusText message={message} />
       </>
-    </Card>
+    </Block>
   );
 };
 
 export const ToolsSettingsPage = () => {
   const { isAuthenticated } = useSettingsStore();
   return (
-    <PageShell>
-      <PageHeader
-        description="有哪些工具、哪个节点能调、调了要不要审批。每块都标了生效范围：标「所有渠道」的连 QQ 和定时任务一起管，标「仅此浏览器」的只管你眼前这个页面。"
-        title="工具与权限"
-      />
-      {!isAuthenticated ? <AuthRequired /> : (
-        <>
-          <ToolInventorySection />
-          <NodeGrantsSection />
-          <PolicyRulesSection />
-          <AutoApproveSection />
-        </>
-      )}
+    <PageShell authed={isAuthenticated} description="有哪些工具、哪个节点能调、调了要不要审批。每块都标了生效范围：标「所有渠道」的连 QQ 和定时任务一起管，标「仅此浏览器」的只管你眼前这个页面。" title="工具与权限">
+      <>
+        <ToolInventorySection />
+        <NodeGrantsSection />
+        <PolicyRulesSection />
+        <AutoApproveSection />
+      </>
     </PageShell>
   );
 };

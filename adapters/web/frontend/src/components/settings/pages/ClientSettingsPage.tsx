@@ -5,6 +5,7 @@ import { getConfig, getNodes } from '../../../api/supervisorClient';
 import { type TitleGenerationMode, useClientPrefsStore } from '../../../store/clientPrefsStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import type { NodeDef } from '../../../types';
+import { Block, Field, PageShell, Select } from './settingsControls';
 
 export function parseNodeList(nodes: NodeDef[]): NodeDef[] {
   // [2026-06-02] Parse real Supervisor nodes into selectable entry nodes.
@@ -87,90 +88,78 @@ export const ClientSettingsPage = () => {
   }, [adminToken, setEntryNodeId]);
 
   return (
-    <section className="h-full min-h-0 overflow-y-auto p-4 sm:p-6">
-      <div className="mx-auto max-w-3xl space-y-6">
-        <header>
-          <p className="font-mono text-[0.6rem] uppercase tracking-[0.22em] text-[var(--duties-tertiary)]">前端本地</p>
-          <h1 className="mt-2 font-mono text-xl font-semibold tracking-[-0.04em]">客户端设置</h1>
-          <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--duties-secondary)]">
-            这些偏好只保存在当前浏览器中，不会修改后端策略、共享会话状态或服务器配置。
-            自动审批挪到了「工具与权限」页，好跟服务端策略摆在一起对照。
-          </p>
-        </header>
+    <PageShell
+      description="这些偏好只保存在当前浏览器中，不会修改后端策略、共享会话状态或服务器配置。自动审批挪到了「工具与权限」页，好跟服务端策略摆在一起对照。"
+      eyebrow="前端本地"
+      title="客户端设置"
+    >
+      <Block frame="boxed" hint="新对话消息默认由此节点处理。仅显示根入口节点，不包含子节点。" scope="this-browser" title="入口节点">
+        <Select
+          aria-label="入口节点"
+          className="font-mono text-xs"
+          onChange={(e) => setEntryNodeId(e.target.value)}
+          value={entryNodeId}
+          width="wide"
+        >
+          {entryNodes.length === 0 && <option value={entryNodeId}>{entryNodeId || '正在加载…'}</option>}
+          {entryNodes.map((n) => (
+            <option key={n.id} value={n.id}>{n.name || n.id}{n.description ? ` — ${n.description}` : ''}</option>
+          ))}
+        </Select>
+        <p className="mt-2 font-mono text-micro text-[var(--duties-tertiary)]">当前值：{entryNodeId || '（未设置）'}</p>
+      </Block>
 
-        <section className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
-          <h2 className="font-mono text-sm font-semibold">入口节点</h2>
-          <p className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]">
-            新对话消息默认由此节点处理。仅显示根入口节点，不包含子节点。
-          </p>
-          <select
-            aria-label="入口节点"
-            className="mt-3 w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-            onChange={(e) => setEntryNodeId(e.target.value)}
-            value={entryNodeId}
-          >
-            {entryNodes.length === 0 && <option value={entryNodeId}>{entryNodeId || '加载中...'}</option>}
-            {entryNodes.map((n) => (
-              <option key={n.id} value={n.id}>{n.name || n.id}{n.description ? ` — ${n.description}` : ''}</option>
-            ))}
-          </select>
-          <p className="mt-2 font-mono text-[0.6rem] text-[var(--duties-tertiary)]">当前值：{entryNodeId || '（未设置）'}</p>
-        </section>
-
-        <section className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
-          <h2 className="font-mono text-sm font-semibold">对话标题</h2>
-          <label className="mt-3 block text-xs font-semibold text-[var(--duties-secondary)]" htmlFor="client-title-generation">
-            生成方式
-          </label>
-          <select
+      <Block frame="boxed" scope="this-browser" title="对话标题">
+        <Field htmlFor="client-title-generation" label="生成方式" layout="stacked">
+          <Select
             aria-label="对话标题生成方式"
-            className="mt-1 w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            className="font-mono text-xs"
             id="client-title-generation"
             onChange={(event) => setTitleGeneration(event.target.value as TitleGenerationMode)}
             value={titleGeneration}
+            width="wide"
           >
             {TITLE_OPTIONS.map((option) => (
               <option key={option.value} value={option.value}>{option.label}</option>
             ))}
-          </select>
-          <p className="mt-2 text-xs leading-5 text-[var(--duties-secondary)]">
-            {TITLE_OPTIONS.find((option) => option.value === titleGeneration)?.description}
-          </p>
-        </section>
+          </Select>
+        </Field>
+        <p className="mt-2 text-xs leading-5 text-[var(--duties-secondary)]">
+          {TITLE_OPTIONS.find((option) => option.value === titleGeneration)?.description}
+        </p>
+      </Block>
 
-        <section className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
-          <h2 className="font-mono text-sm font-semibold">消息显示</h2>
-          <div className="mt-3 space-y-3">
-            <label className="flex items-start justify-between gap-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3">
-              <span>
-                <span className="block font-mono text-xs font-semibold">默认折叠思考内容</span>
-                <span className="mt-1 block text-xs leading-5 text-[var(--duties-secondary)]">启用后，新的思考内容块会默认折叠。</span>
-              </span>
-              <input
-                aria-label="默认折叠思考内容"
-                checked={thinkingDefaultCollapsed}
-                className="mt-1 h-4 w-4 flex-shrink-0 accent-[var(--duties-text)]"
-                onChange={(event) => setThinkingDefaultCollapsed(event.target.checked)}
-                type="checkbox"
-              />
-            </label>
+      <Block frame="boxed" scope="this-browser" title="消息显示">
+        <div className="space-y-3">
+          <label className="flex items-start justify-between gap-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3">
+            <span>
+              <span className="block font-mono text-xs font-semibold">默认折叠思考内容</span>
+              <span className="mt-1 block text-xs leading-5 text-[var(--duties-secondary)]">启用后，新的思考内容块会默认折叠。</span>
+            </span>
+            <input
+              aria-label="默认折叠思考内容"
+              checked={thinkingDefaultCollapsed}
+              className="mt-1 h-4 w-4 flex-shrink-0 accent-[var(--duties-text)]"
+              onChange={(event) => setThinkingDefaultCollapsed(event.target.checked)}
+              type="checkbox"
+            />
+          </label>
 
-            <label className="flex items-start justify-between gap-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3">
-              <span>
-                <span className="block font-mono text-xs font-semibold">默认折叠工具结果</span>
-                <span className="mt-1 block text-xs leading-5 text-[var(--duties-secondary)]">启用后，工具参数和结果详情会默认折叠。</span>
-              </span>
-              <input
-                aria-label="默认折叠工具结果"
-                checked={toolResultsDefaultCollapsed}
-                className="mt-1 h-4 w-4 flex-shrink-0 accent-[var(--duties-text)]"
-                onChange={(event) => setToolResultsDefaultCollapsed(event.target.checked)}
-                type="checkbox"
-              />
-            </label>
-          </div>
-        </section>
-      </div>
-    </section>
+          <label className="flex items-start justify-between gap-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3">
+            <span>
+              <span className="block font-mono text-xs font-semibold">默认折叠工具结果</span>
+              <span className="mt-1 block text-xs leading-5 text-[var(--duties-secondary)]">启用后，工具参数和结果详情会默认折叠。</span>
+            </span>
+            <input
+              aria-label="默认折叠工具结果"
+              checked={toolResultsDefaultCollapsed}
+              className="mt-1 h-4 w-4 flex-shrink-0 accent-[var(--duties-text)]"
+              onChange={(event) => setToolResultsDefaultCollapsed(event.target.checked)}
+              type="checkbox"
+            />
+          </label>
+        </div>
+      </Block>
+    </PageShell>
   );
 };

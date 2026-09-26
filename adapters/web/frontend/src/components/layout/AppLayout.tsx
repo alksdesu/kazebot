@@ -118,7 +118,7 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, nav
     else if (hasRightPanel && start.x >= metrics.width - 48) { setSidebarOpen(false); setRightPanelOpen(true); }
   };
 
-  return <div className="app-shell flex h-[100dvh] min-h-0 overflow-hidden bg-[var(--duties-bg)] text-[var(--duties-text)]" data-testid="app-layout-root"
+  return <div className="app-shell flex h-[var(--duties-app-height)] min-h-0 overflow-hidden bg-[var(--duties-bg)] text-[var(--duties-text)]" data-testid="app-layout-root"
     onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd}
     style={{ '--duties-right-w': `${panelWidth}px` } as React.CSSProperties}>
     {(leftOverlay || rightOverlay) && <div data-overlay-backdrop="true" data-testid="panel-backdrop" className="app-modal-overlay fixed inset-0 z-30" onClick={leftOverlay ? closeLeft : closeRight} />}
@@ -141,7 +141,7 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, nav
     {hasRightPanel && <aside ref={rightRef} id="app-right-panel" aria-label="右侧面板" role={rightOverlay ? 'dialog' : undefined} aria-modal={rightOverlay || undefined} tabIndex={-1} hidden={!rightVisible}
       className={`app-right-panel shrink-0 flex-col overflow-hidden border-l border-[var(--duties-border)] bg-[var(--duties-surface)] ${metrics.rail ? 'relative w-[var(--duties-right-w)]' : 'app-drawer fixed inset-y-0 right-0 z-40'} ${rightVisible ? 'flex translate-x-0' : 'translate-x-full'}`}>
       {!metrics.rail && <div className="flex shrink-0 items-center justify-between border-b border-[var(--duties-border)] px-4 py-1"><span className="text-sm font-semibold">详情与操作</span><button className="app-icon-button" type="button" aria-label="关闭右侧面板" onClick={closeRight}><Icon name="close" /></button></div>}
-      {logPanel ? <><div className="flex h-[60%] min-h-0 shrink-0 flex-col overflow-hidden border-b border-[var(--duties-border)]">{rightPanel}</div><div aria-label="事件日志面板" className="flex h-[40%] min-h-0 shrink-0 flex-col overflow-hidden">{logPanel}</div></> : <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">{rightPanel}</div>}
+      {logPanel ? <><div className="flex h-[var(--duties-right-main-height)] min-h-0 shrink-0 flex-col overflow-hidden border-b border-[var(--duties-border)]">{rightPanel}</div><div aria-label="事件日志面板" className="flex h-[var(--duties-right-log-height)] min-h-0 shrink-0 flex-col overflow-hidden">{logPanel}</div></> : <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">{rightPanel}</div>}
     </aside>}
   </div>;
 };

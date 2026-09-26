@@ -436,3 +436,8 @@ export function serializeSkillMarkdown(form: SkillFormState): string {
   const frontmatter = yaml.dump(meta, DUMP_OPTS);
   return `---\n${frontmatter}---\n\n${form.body.replace(/^\n+/, '')}`;
 }
+
+/** 原文编辑器的语法自检。返回空串表示能解析，否则是解析器给出的报错。 */
+export function hasLikelyYamlSyntaxIssue(value: string): string {
+  try { yaml.load(value); return ''; } catch (error) { return error instanceof Error ? error.message : 'YAML 语法错误'; }
+}

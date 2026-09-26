@@ -19,22 +19,7 @@ import {
 } from '../../../console/nodeYaml';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskLabel } from '../../../utils/toolRisk';
-import {
-  Button,
-  Check,
-  Empty,
-  ErrorText,
-  Facts,
-  Footnote,
-  Input,
-  Item,
-  ItemTitle,
-  List,
-  SaveBar,
-  Segmented,
-  Tag,
-} from './settingsControls';
-import { Card, StatusText } from './settingsPagePrimitives';
+import { Block, Button, Check, Empty, ErrorText, Facts, Footnote, Input, Item, ItemTitle, List, SaveBar, Segmented, StatusText, Tag } from './settingsControls';
 
 type Mode = 'none' | 'all' | 'allowlist';
 
@@ -104,7 +89,7 @@ const Mark = ({ children, title, tone }: {
   tone: keyof typeof MARK_TONE;
 }) => (
   <span
-    className={`flex-none border px-1.5 py-0.5 font-mono text-[0.6rem] ${MARK_TONE[tone]}`}
+    className={`flex-none border px-1.5 py-0.5 font-mono text-micro ${MARK_TONE[tone]}`}
     title={title}
   >
     {children}
@@ -175,7 +160,7 @@ const ToolCell = ({ effective, enabled, missing, missingTitle, name, onToggle }:
     <div className={`border border-[var(--duties-border)] px-2 py-1 ${enabled ? 'bg-[var(--duties-bg)]' : 'bg-[var(--duties-muted)]'}`}>
       <Check checked={enabled} onChange={onToggle}>
         <span className="flex flex-wrap items-center gap-1.5">
-          <span className={`break-all font-mono text-[0.7rem] ${enabled ? 'text-[var(--duties-text)]' : 'text-[var(--duties-tertiary)] line-through'}`}>{name}</span>
+          <span className={`break-all font-mono text-mini ${enabled ? 'text-[var(--duties-text)]' : 'text-[var(--duties-tertiary)] line-through'}`}>{name}</span>
           {missing && <Mark title={missingTitle} tone="danger">未注册</Mark>}
           {!!effective?.gated && <Mark title={effective.gated} tone="danger">不可用</Mark>}
           {effective?.guarded === false && (
@@ -340,7 +325,7 @@ const NodeRow = ({ node, tools, onSaved }: {
                   {filtered ? `这 ${candidates.length} 个禁止` : '全部禁止'}
                 </Button>
               </div>
-              <p className="mb-2 font-mono text-[0.65rem] text-[var(--duties-secondary)]">
+              <p className="mb-2 font-mono text-mini text-[var(--duties-secondary)]">
                 勾中的能调用，划掉的调不了。{everyTool.length} 个工具里{' '}
                 <span className="text-[var(--duties-text)]">{enabledCount} 个可调用</span>
                 {filtered && `，当前筛出 ${candidates.length} 个`}
@@ -408,8 +393,8 @@ export const NodeGrantsSection = () => {
   useEffect(() => { void load(); }, [adminToken, isAuthenticated]);
 
   return (
-    <Card
-      description="白名单管的是这个节点自己能调哪些工具。没授权的工具不会出现在给模型的清单里，模型不知道它存在。"
+    <Block frame="boxed"
+      hint="白名单管的是这个节点自己能调哪些工具。没授权的工具不会出现在给模型的清单里，模型不知道它存在。"
       scope="all-channels"
       title="节点授权"
     >
@@ -427,6 +412,6 @@ export const NodeGrantsSection = () => {
         由下游按下游自己那份 tool_access 去执行。想堵死这条路，得把下游一起收紧。
       </Footnote>
       <StatusText message={nodes.length ? message : ''} />
-    </Card>
+    </Block>
   );
 };

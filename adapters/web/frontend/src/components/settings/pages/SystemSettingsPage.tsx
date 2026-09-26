@@ -13,13 +13,13 @@ import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore
 import { useSettingsStore } from '../../../store/settingsStore';
 import { Button } from '../../common';
 import { countActiveTasks, formatUptime } from '../../../utils/systemStatus';
-import { AuthRequired, Card, PageHeader, PageShell, StatusText } from './settingsPagePrimitives';
+import { Block, PageShell, StatusText } from './settingsControls';
 
 const Stat = ({ label, value, detail, onClick }: { label: string; value: string | number; detail?: string; onClick?: () => void }) => {
   const content = (
     <>
-      <p className="font-mono text-[0.6rem] uppercase tracking-[0.16em] text-[var(--duties-tertiary)]">{label}</p>
-      <p className="mt-1 font-mono text-lg font-semibold tracking-[-0.04em]">{value}</p>
+      <p className="font-mono text-micro uppercase tracking-caps text-[var(--duties-tertiary)]">{label}</p>
+      <p className="mt-1 font-mono text-lg font-semibold tracking-figure">{value}</p>
       {detail && <p className="mt-1 text-xs text-[var(--duties-secondary)]">{detail}</p>}
     </>
   );
@@ -107,36 +107,33 @@ export const SystemSettingsPage = () => {
     }
   });
   return (
-    <PageShell>
-      <PageHeader description="查看 Supervisor 运行状态，并执行配置重载或引擎重启。" title="系统" />
-      {!isAuthenticated ? <AuthRequired /> : (
-        <>
-          <Card title="系统状态" description="数据来自管理员状态接口和健康检查接口，每 15 秒自动刷新。">
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-              <Stat label="会话数" value={adminState?.sessions ?? (loading ? '…' : '无数据')} />
-              <Stat label="待审批数" value={adminState?.approvals?.pending ?? adminState?.pending_approvals?.length ?? 0} />
-              <Stat label="运行中任务数" value={countActiveTasks(adminState?.tasks)} detail="运行中、等待中、已挂起" onClick={() => setActiveTasksOpen(true)} />
-              <Stat label="运行时间" value={formatUptime(health?.uptime_seconds)} />
-            </div>
-            <div className="mt-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 text-xs leading-5">
-              <p><span className="text-[var(--duties-tertiary)]">Engine worker：</span><span className="font-mono">{engineInfo}</span></p>
-            </div>
-            <div className="mt-3 flex flex-wrap gap-2">
-              <Button disabled={loading || busy} onClick={() => load()}>{loading ? '刷新中...' : '刷新状态'}</Button>
-            </div>
-          </Card>
+    <PageShell authed={isAuthenticated} description="查看 Supervisor 运行状态，并执行配置重载或引擎重启。" title="系统">
+      <>
+        <Block frame="boxed" title="系统状态" hint="数据来自管理员状态接口和健康检查接口，每 15 秒自动刷新。">
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <Stat label="会话数" value={adminState?.sessions ?? (loading ? '…' : '无数据')} />
+            <Stat label="待审批数" value={adminState?.approvals?.pending ?? adminState?.pending_approvals?.length ?? 0} />
+            <Stat label="运行中任务数" value={countActiveTasks(adminState?.tasks)} detail="运行中、等待中、已挂起" onClick={() => setActiveTasksOpen(true)} />
+            <Stat label="运行时间" value={formatUptime(health?.uptime_seconds)} />
+          </div>
+          <div className="mt-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 text-xs leading-5">
+            <p><span className="text-[var(--duties-tertiary)]">Engine worker：</span><span className="font-mono">{engineInfo}</span></p>
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button disabled={loading || busy} onClick={() => load()}>{loading ? '刷新中...' : '刷新状态'}</Button>
+          </div>
+        </Block>
 
-          <ActiveTasksModal open={activeTasksOpen} onClose={() => setActiveTasksOpen(false)} />
+        <ActiveTasksModal open={activeTasksOpen} onClose={() => setActiveTasksOpen(false)} />
 
-          <Card title="运行控制" description="配置重载会重新读取配置；引擎重启需要二次确认。">
-            <div className="flex flex-wrap gap-2">
-              <Button disabled={busy} onClick={handleReload} variant="primary">重载配置</Button>
-              <Button disabled={busy} onClick={handleRestart} variant="danger">重启引擎</Button>
-            </div>
-            <StatusText message={message} />
-          </Card>
-        </>
-      )}
+        <Block frame="boxed" title="运行控制" hint="配置重载会重新读取配置；引擎重启需要二次确认。">
+          <div className="flex flex-wrap gap-2">
+            <Button disabled={busy} onClick={handleReload} variant="primary">重载配置</Button>
+            <Button disabled={busy} onClick={handleRestart} variant="danger">重启引擎</Button>
+          </div>
+          <StatusText message={message} />
+        </Block>
+      </>
     </PageShell>
   );
 };

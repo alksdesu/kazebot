@@ -16,10 +16,10 @@ import { useConsoleStore } from './consoleStore';
 import { blockerLabel, showSignalTag, signalLabel } from './signals';
 
 const VERDICT =
-  'mt-1.5 ml-[34px] flex flex-wrap items-baseline gap-1.5 text-xs max-md:ml-0'
-  + ' motion-safe:animate-[verdict-flip_120ms_ease-out]';
+  'mt-1.5 ml-[var(--duties-audition-indent)] flex flex-wrap items-baseline gap-1.5 text-xs max-md:ml-0'
+  + ' motion-safe:animate-verdict-flip';
 
-const SIG = 'bg-[var(--duties-muted)] px-1.5 font-mono text-[0.65rem]';
+const SIG = 'bg-[var(--duties-muted)] px-1.5 font-mono text-mini';
 
 const FLAG =
   'w-6 flex-none border border-[var(--duties-border)] bg-[var(--duties-panel)] py-0.5'
@@ -84,7 +84,7 @@ export const Audition = () => {
         </span>
         <span className="flex-1" />
         {loading && (
-          <span className="font-mono text-[0.65rem] text-[var(--duties-secondary)]">重算中…</span>
+          <span className="font-mono text-mini text-[var(--duties-secondary)]">重算中…</span>
         )}
         <Check checked={cooldown} onChange={setCooldown}>算上冷却</Check>
         <label className="flex items-center gap-1.5 text-xs">
@@ -168,7 +168,7 @@ export const Audition = () => {
           加一条
         </Button>
         <Button onClick={reset} tone="quiet">恢复样例</Button>
-        <span className="font-mono text-[0.65rem] text-[var(--duties-secondary)]">
+        <span className="font-mono text-mini text-[var(--duties-secondary)]">
           {messages.length >= MAX_MESSAGES ? `已到 ${MAX_MESSAGES} 条上限` : `${messages.length} 条`}
         </span>
       </div>

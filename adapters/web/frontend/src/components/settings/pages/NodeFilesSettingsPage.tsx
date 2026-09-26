@@ -4,7 +4,7 @@ import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { getNodeFileRaw, getNodeFiles, makeNodeFileExample, updateNodeFileRaw, type NodeFileInfo } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { Button } from '../../common';
-import { AuthRequired, Card, FieldLabel, PageHeader, PageShell, SelectInput, StatusText } from './settingsPagePrimitives';
+import { Block, Field, PageShell, Select, StatusText } from './settingsControls';
 
 export const NodeFilesSettingsPage = () => {
   const token = useSettingsStore(state => state.adminToken);
@@ -106,50 +106,46 @@ const NodeFilesSettingsPageEditor = () => {
   const current = files.find(file => file.name === selected);
 
   return (
-    <PageShell>
-      <PageHeader
-        description="管理 config/nodes 下的 YAML 节点与 Markdown 片段，包括 _persona.example.md、_persona.md、qq.orchestrator.yaml 等。"
-        title="节点文件"
-      />
-      {!isAuthenticated ? <AuthRequired /> : (
-        <Card title="config/nodes 文件编辑器" description="可编辑 .yaml/.yml/.md。建议长期自定义内容放入非 example 文件；example 文件可作为模板同步。">
-          <div className="mb-3 grid gap-3 md:grid-cols-[12rem_1fr]">
-            <div>
-              <FieldLabel>过滤</FieldLabel>
-              <SelectInput aria-label="文件类型过滤" onChange={(event) => setFilter(event.currentTarget.value as any)} value={filter}>
+    <PageShell authed={isAuthenticated} description="管理 config/nodes 下的 YAML 节点与 Markdown 片段，包括 _persona.example.md、_persona.md、qq.orchestrator.yaml 等。" title="节点文件">
+      <Block frame="boxed" title="config/nodes 文件编辑器" hint="可编辑 .yaml/.yml/.md。建议长期自定义内容放入非 example 文件；example 文件可作为模板同步。">
+        <div className="mb-3 grid gap-3 md:grid-cols-[var(--duties-split-columns-narrow)]">
+          <div>
+            <Field label="过滤" layout="stacked">
+              <Select width="wide" aria-label="文件类型过滤" onChange={(event) => setFilter(event.currentTarget.value as any)} value={filter}>
                 <option value="all">全部</option>
                 <option value="node">节点 YAML</option>
                 <option value="fragment">片段 MD</option>
                 <option value="example">Example 模板</option>
-              </SelectInput>
-            </div>
-            <div>
-              <FieldLabel>文件</FieldLabel>
-              <SelectInput aria-label="当前文件" disabled={saving} onChange={(event) => void selectFile(event.currentTarget.value)} value={selected}>
+              </Select>
+            </Field>
+          </div>
+          <div>
+            <Field label="文件" layout="stacked">
+              <Select width="wide" aria-label="当前文件" disabled={saving} onChange={(event) => void selectFile(event.currentTarget.value)} value={selected}>
                 {selected && !visibleFiles.some(file => file.name === selected) && <option value={selected}>{selected} · 当前编辑</option>}
                 {visibleFiles.map(file => (
                   <option key={file.name} value={file.name}>{file.name}{file.is_example ? ' · example' : ''}</option>
                 ))}
-              </SelectInput>
-            </div>
+              </Select>
+            </Field>
           </div>
-          {current && <p className="mb-3 font-mono text-[0.65rem] text-[var(--duties-tertiary)]">{current.path} · {current.kind === 'fragment' ? 'Markdown 片段' : '节点 YAML'} · {current.size} bytes</p>}
-          <textarea
-            aria-label="文件内容"
-            disabled={loading || saving || !selected || !loaded}
-            className="h-[36rem] w-full resize-y border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 font-mono text-xs leading-5 text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-            onChange={(event) => setContent(event.currentTarget.value)}
-            spellCheck={false}
-            value={content}
-          />
-          <div className="mt-3 flex flex-wrap gap-2">
-            <Button disabled={loading || saving} onClick={() => void loadFiles()}>{loading ? '刷新中...' : '刷新列表'}</Button>
-            <Button disabled={!selected || !loaded || loading || saving || content === saved} onClick={save} variant="primary">{saving ? '保存中…' : '保存当前文件'}</Button>
-            <Button disabled={!selected || loading || saving || current?.is_example} onClick={createExample}>从已保存文件创建 Example</Button>
-          </div>
-          <StatusText message={message} />
-        </Card>
-      )}
+        </div>
+        {current && <p className="mb-3 font-mono text-mini text-[var(--duties-tertiary)]">{current.path} · {current.kind === 'fragment' ? 'Markdown 片段' : '节点 YAML'} · {current.size} bytes</p>}
+        <textarea
+          aria-label="文件内容"
+          disabled={loading || saving || !selected || !loaded}
+          className="h-[var(--duties-pane-height-tall)] w-full resize-y border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 font-mono text-xs leading-5 text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+          onChange={(event) => setContent(event.currentTarget.value)}
+          spellCheck={false}
+          value={content}
+        />
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Button disabled={loading || saving} onClick={() => void loadFiles()}>{loading ? '刷新中...' : '刷新列表'}</Button>
+          <Button disabled={!selected || !loaded || loading || saving || content === saved} onClick={save} variant="primary">{saving ? '保存中…' : '保存当前文件'}</Button>
+          <Button disabled={!selected || loading || saving || current?.is_example} onClick={createExample}>从已保存文件创建 Example</Button>
+        </div>
+        <StatusText message={message} />
+      </Block>
     </PageShell>
   );
 };

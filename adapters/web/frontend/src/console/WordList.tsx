@@ -8,7 +8,7 @@ import { addWord, useConsoleStore, useInputRule, useWordList } from './consoleSt
 export type ListSpacing = 'option' | 'loose' | 'panel';
 
 export const LIST_SPACING: Record<ListSpacing, string> = {
-  option: 'ml-[25px] mt-3',
+  option: 'ml-[var(--duties-option-indent)] mt-3',
   loose: 'mt-3',
   panel: '',
 };

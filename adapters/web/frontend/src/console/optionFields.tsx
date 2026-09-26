@@ -97,7 +97,7 @@ export const OptionRow = ({
   <div className="min-w-0 space-y-1">
     <div className="flex min-w-0 flex-wrap items-center gap-2">
       <span className="font-medium">{spec.label}</span>
-      <code className="border border-[var(--duties-live)] px-1.5 text-[0.65rem] text-[var(--duties-live)]">
+      <code className="border border-[var(--duties-live)] px-1.5 text-mini text-[var(--duties-live)]">
         {spec.key}
       </code>
       <span className="flex-1" />

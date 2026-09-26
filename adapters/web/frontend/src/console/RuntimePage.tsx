@@ -23,9 +23,9 @@ import { BoolOption, NumberField } from './fields';
 
 const Link = ({ name, state, detail }: { name: string; state: string; detail: string }) => (
   <div className="flex flex-wrap items-baseline gap-2.5">
-    <span className="min-w-[9em] font-mono text-xs font-medium">{name}</span>
+    <span className="min-w-[var(--duties-label-min-width)] font-mono text-xs font-medium">{name}</span>
     <span className="font-mono text-xs">{state}</span>
-    <span className="font-mono text-[0.65rem] text-[var(--duties-tertiary)]">{detail}</span>
+    <span className="font-mono text-mini text-[var(--duties-tertiary)]">{detail}</span>
   </div>
 );
 
@@ -109,7 +109,7 @@ const BridgeFacts = () => {
     <Facts>
       {runtime.forward_bridge_running ? '正在监听' : '尚未启动'}
       {runtime.forward_bridge_endpoint && (
-        <> <code className="font-mono text-[0.65rem]">{runtime.forward_bridge_endpoint}</code></>
+        <> <code className="font-mono text-mini">{runtime.forward_bridge_endpoint}</code></>
       )}
       ，令牌{runtime.forward_bridge_token_set ? '已设置' : '未设置'}。
     </Facts>

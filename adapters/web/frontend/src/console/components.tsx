@@ -2,15 +2,7 @@
 // 顶部那条 qq.yaml 生效状态条，和把它与加载/未发布态串起来的页壳。
 import { useEffect, type ReactNode } from 'react';
 
-import {
-  Button,
-  Empty,
-  ErrorText,
-  Facts,
-  StatusBar,
-  type PipTone,
-} from '../components/settings/pages/settingsControls';
-import { AuthRequired, PageHeader } from '../components/settings/pages/settingsPagePrimitives';
+import { Button, Empty, ErrorText, PageShell, StatusBar, type PipTone } from '../components/settings/pages/settingsControls';
 import { useSettingsStore } from '../store/settingsStore';
 import { useConsoleStore } from './consoleStore';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
@@ -101,9 +93,7 @@ interface QqPageProps {
   title: string;
 }
 
-/** QQ 域页面的共同外壳：生效状态条、错误提示，以及「bot 还没上报」时的空态。
- *
- * 状态条不进滚动区：改完页尾的开关要能直接点应用，滚回顶部才找得到等于没有。 */
+/** QQ 域页面的共同外壳：在统一页壳上加生效状态条、解析错误提示和「bot 还没上报」的空态。 */
 export const QqPage = ({ children, alwaysContent, standalone = false, note, title }: QqPageProps) => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const { live, loading, error, notice, refresh, draft } = useConsoleStore();
@@ -124,29 +114,23 @@ export const QqPage = ({ children, alwaysContent, standalone = false, note, titl
       ) : children;
 
   return (
-    <section className="flex h-full min-h-0 flex-col">
-      {isAuthenticated && !standalone && <QqStatusBar confirmDiscard={confirmDiscard} />}
-      <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
-        {/* 基准字号。控制台自带的那条 13px 随 console.css 一起没了，不接住的话
-            所有靠继承的文本会跳到浏览器默认的 16px，比旁边显式写死的小字大一整档。 */}
-        <div className="mx-auto max-w-4xl space-y-5 text-sm">
-          <PageHeader description={note} eyebrow="QQ 机器人" title={title} />
-          {!isAuthenticated ? <AuthRequired /> : (
-            <>
-              {error && <ErrorText>{error}</ErrorText>}
-              {notice && <Facts>{notice}</Facts>}
-              {parseError && (
-                <ErrorText>
-                  qq.yaml 解析失败：{parseError}。bot 仍在用上一份有效配置。请先修复原文件语法；本页不会覆盖损坏文件。
-                </ErrorText>
-              )}
-              {alwaysContent}
-              {body}
-            </>
-          )}
-        </div>
-      </div>
-    </section>
+    <PageShell
+      authed={isAuthenticated}
+      bar={isAuthenticated && !standalone ? <QqStatusBar confirmDiscard={confirmDiscard} /> : undefined}
+      description={note}
+      error={error}
+      eyebrow="QQ 机器人"
+      notice={notice}
+      title={title}
+    >
+      {parseError && (
+        <ErrorText>
+          qq.yaml 解析失败：{parseError}。bot 仍在用上一份有效配置。请先修复原文件语法；本页不会覆盖损坏文件。
+        </ErrorText>
+      )}
+      {alwaysContent}
+      {body}
+    </PageShell>
   );
 };
 

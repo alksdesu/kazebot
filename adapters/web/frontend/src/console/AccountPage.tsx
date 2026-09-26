@@ -362,8 +362,8 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
       <Block hint="supervisor 拿不到 NapCat 的 WebUI token" title="机器人账号">
         <Panel>
           <Facts>
-            请把 NapCat 容器里 <code className="text-[0.65rem]">/app/napcat/config/webui.json</code> 的 token 写进工作区
-            <code className="text-[0.65rem]">.env</code> 的 <code className="text-[0.65rem]">NAPCAT_WEBUI_TOKEN</code>，或让模型用 manage_secret 设置。
+            请把 NapCat 容器里 <code className="text-mini">/app/napcat/config/webui.json</code> 的 token 写进工作区
+            <code className="text-mini">.env</code> 的 <code className="text-mini">NAPCAT_WEBUI_TOKEN</code>，或让模型用 manage_secret 设置。
           </Facts>
           <Button disabled={loading} onClick={() => void refresh()} tone="quiet">刷新账号状态</Button>
         </Panel>

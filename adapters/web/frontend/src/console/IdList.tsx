@@ -41,7 +41,7 @@ export const IdList = ({ configKey, empty, label, placeholder, spacing = 'option
         {ids.length === 0 && <span className="text-xs text-[var(--duties-secondary)]">{empty}</span>}
         {ids.map((id) => (
           <span className="flex items-center gap-2" key={id}>
-            <code className="min-w-[10ch] text-xs">{id}</code>
+            <code className="min-w-[var(--duties-id-min-width)] text-xs">{id}</code>
             {editing === id ? (
               <Input
                 autoFocus
@@ -54,7 +54,7 @@ export const IdList = ({ configKey, empty, label, placeholder, spacing = 'option
               />
             ) : (
               <button
-                className="border border-dashed border-[var(--duties-border)] px-1.5 py-0.5 text-[0.65rem] text-[var(--duties-secondary)] transition-colors hover:border-[var(--duties-secondary)] hover:text-[var(--duties-text)]"
+                className="border border-dashed border-[var(--duties-border)] px-1.5 py-0.5 text-mini text-[var(--duties-secondary)] transition-colors hover:border-[var(--duties-secondary)] hover:text-[var(--duties-text)]"
                 onClick={() => setEditing(id)}
                 type="button"
               >

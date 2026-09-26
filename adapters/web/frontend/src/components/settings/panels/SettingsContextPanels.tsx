@@ -375,7 +375,7 @@ const AgentsEditor = () => {
                 <label className="block">
                   <span className={STRUCTURED_LABEL_CLASS}>系统提示词</span>
                   {nodeConfigForm.promptIsStructured && <span className="block text-xs text-[var(--duties-secondary)]">此提示词使用结构化块，请保留 JSON 数组格式。</span>}
-                  <textarea className={`${STRUCTURED_INPUT_CLASS} min-h-[12rem]`} onChange={(event) => updateNodeConfigForm({ prompt: event.target.value })} rows={12} value={nodeConfigForm.prompt} />
+                  <textarea className={`${STRUCTURED_INPUT_CLASS} min-h-[var(--duties-pane-min-height)]`} onChange={(event) => updateNodeConfigForm({ prompt: event.target.value })} rows={12} value={nodeConfigForm.prompt} />
                 </label>
                 <label className="block">
                   <span className={STRUCTURED_LABEL_CLASS}>委派目标，使用英文逗号分隔</span>

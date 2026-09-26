@@ -10,7 +10,7 @@ import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore
 import { useSettingsStore } from '../../../store/settingsStore';
 import { Button, Icon } from '../../common';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
-import { AuthRequired, Card, PageHeader, PageShell, StatusText } from './settingsPagePrimitives';
+import { Block, PageShell, StatusText } from './settingsControls';
 
 function detailString(approval: AdminApproval, key: string): string {
   // [2026-06-02] Read common approval detail fields from arbitrary backend payloads.
@@ -87,62 +87,59 @@ export const ApprovalsSettingsPage = () => {
   };
 
   return (
-    <PageShell>
-      <PageHeader description="查看所有会话的待审批项，并对工具或操作请求执行允许或拒绝。" title="审批" />
-      {!isAuthenticated ? <AuthRequired /> : (
-        <Card title="全局待审批列表" description="列表来自 /v1/admin/state 的 pending_approvals 字段。">
-          <div className="mb-3 flex flex-wrap gap-2">
-            <Button disabled={loading} onClick={() => load()}>{loading ? '刷新中...' : '刷新列表'}</Button>
+    <PageShell authed={isAuthenticated} description="查看所有会话的待审批项，并对工具或操作请求执行允许或拒绝。" title="审批">
+      <Block frame="boxed" title="全局待审批列表" hint="列表来自 /v1/admin/state 的 pending_approvals 字段。">
+        <div className="mb-3 flex flex-wrap gap-2">
+          <Button disabled={loading} onClick={() => load()}>{loading ? '刷新中...' : '刷新列表'}</Button>
+        </div>
+        {approvals.length === 0 ? (
+          <div className="flex items-center gap-2 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-4 text-sm text-[var(--duties-secondary)]">
+            {/* [2026-06-02] Add a muted icon to the empty approvals state. Why: the
+                requested empty state includes both text and a gray visual marker.
+                How: use the shared Material Symbol icon with tertiary color.
+                Purpose: the empty queue is clear without looking like an alert. */}
+            <Icon className="text-[var(--duties-tertiary)]" name="inbox" size={18} />
+            <span>暂无待审批项</span>
           </div>
-          {approvals.length === 0 ? (
-            <div className="flex items-center gap-2 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-4 text-sm text-[var(--duties-secondary)]">
-              {/* [2026-06-02] Add a muted icon to the empty approvals state. Why: the
-                  requested empty state includes both text and a gray visual marker.
-                  How: use the shared Material Symbol icon with tertiary color.
-                  Purpose: the empty queue is clear without looking like an alert. */}
-              <Icon className="text-[var(--duties-tertiary)]" name="inbox" size={18} />
-              <span>暂无待审批项</span>
-            </div>
-          ) : (
-            <div className="space-y-2">
-              {approvals.map((approval) => (
-                <article
-                  className={`border p-3 ${selectedApproval?.approval_id === approval.approval_id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`}
-                  key={approval.approval_id}
-                >
-                  <button className="block w-full text-left" onClick={() => setSelectedApproval(approval)} type="button">
-                    <div className="flex flex-wrap items-center gap-2">
-                      {(() => {
-                        const toolName = approvalToolName(approval);
-                        const risk = inferToolRisk(toolName);
-                        return (
-                          <>
-                            <span className="font-mono text-xs font-semibold">{toolName}</span>
-                            <span className={`border px-1.5 py-0.5 font-mono text-[0.55rem] ${riskClassName(risk)}`}>{riskLabel(risk)}</span>
-                          </>
-                        );
-                      })()}
-                      <span className="font-mono text-[0.65rem] text-[var(--duties-tertiary)]">{approval.tool_call_id || approval.approval_id}</span>
-                    </div>
-                    <div className="mt-2 grid gap-1 text-xs leading-5 text-[var(--duties-secondary)] sm:grid-cols-2">
-                      <p>节点：<span className="font-mono">{approval.node_id || '未提供'}</span></p>
-                      <p>任务：<span className="font-mono">{approval.task_id || '未提供'}</span></p>
-                      <p>操作：<span className="font-mono">{approval.operation || '未提供'}</span></p>
-                      <p>路径：<span className="font-mono">{approvalPath(approval) || '未提供'}</span></p>
-                      <p className="sm:col-span-2">原因：<span>{approvalReason(approval)}</span></p>
-                    </div>
-                  </button>
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    <Button disabled={deciding.includes(approval.approval_id)} onClick={() => decide(approval, 'allow')} variant="primary">允许</Button>
-                    <Button disabled={deciding.includes(approval.approval_id)} onClick={() => decide(approval, 'deny')} variant="danger">拒绝</Button>
+        ) : (
+          <div className="space-y-2">
+            {approvals.map((approval) => (
+              <article
+                className={`border p-3 ${selectedApproval?.approval_id === approval.approval_id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`}
+                key={approval.approval_id}
+              >
+                <button className="block w-full text-left" onClick={() => setSelectedApproval(approval)} type="button">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {(() => {
+                      const toolName = approvalToolName(approval);
+                      const risk = inferToolRisk(toolName);
+                      return (
+                        <>
+                          <span className="font-mono text-xs font-semibold">{toolName}</span>
+                          <span className={`border px-1.5 py-0.5 font-mono text-nano ${riskClassName(risk)}`}>{riskLabel(risk)}</span>
+                        </>
+                      );
+                    })()}
+                    <span className="font-mono text-mini text-[var(--duties-tertiary)]">{approval.tool_call_id || approval.approval_id}</span>
                   </div>
-                </article>
-              ))}
-            </div>
-          )}
-          <StatusText message={message} />
-        </Card>
-      )}
+                  <div className="mt-2 grid gap-1 text-xs leading-5 text-[var(--duties-secondary)] sm:grid-cols-2">
+                    <p>节点：<span className="font-mono">{approval.node_id || '未提供'}</span></p>
+                    <p>任务：<span className="font-mono">{approval.task_id || '未提供'}</span></p>
+                    <p>操作：<span className="font-mono">{approval.operation || '未提供'}</span></p>
+                    <p>路径：<span className="font-mono">{approvalPath(approval) || '未提供'}</span></p>
+                    <p className="sm:col-span-2">原因：<span>{approvalReason(approval)}</span></p>
+                  </div>
+                </button>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button disabled={deciding.includes(approval.approval_id)} onClick={() => decide(approval, 'allow')} variant="primary">允许</Button>
+                  <Button disabled={deciding.includes(approval.approval_id)} onClick={() => decide(approval, 'deny')} variant="danger">拒绝</Button>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+        <StatusText message={message} />
+      </Block>
     </PageShell>
   );
 };

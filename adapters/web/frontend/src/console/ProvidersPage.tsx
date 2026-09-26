@@ -87,7 +87,7 @@ const HEAD = 'flex items-center gap-2';
 
 /** 名字旁边那枚绿标：块名、以及「在用」。 */
 const Scope = ({ children }: { children: ReactNode }) => (
-  <span className="flex-none border border-[var(--duties-live)] px-1.5 text-[0.65rem] text-[var(--duties-live)]">
+  <span className="flex-none border border-[var(--duties-live)] px-1.5 text-mini text-[var(--duties-live)]">
     {children}
   </span>
 );

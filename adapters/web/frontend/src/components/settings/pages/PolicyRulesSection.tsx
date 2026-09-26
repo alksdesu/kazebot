@@ -10,7 +10,7 @@ import {
 } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { firstMatchIndex } from '../../../utils/globMatch';
-import { ScopeBadge } from './settingsPagePrimitives';
+import { ScopeBadge } from './settingsControls';
 
 type RuleSectionKey = 'read_file' | 'write_file';
 type TabKey = RuleSectionKey | 'execute_command' | 'restart';
@@ -77,20 +77,20 @@ const COMMAND_LISTS: Array<{ key: CommandListKey; title: string; hint: string; p
 const EMPTY_SECTION: RuleSection = { default: 'auto', rules: [] };
 
 const INPUT_CLASS =
-  'min-w-0 flex-1 border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-[0.7rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]';
+  'min-w-0 flex-1 border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-mini text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]';
 const GHOST_BUTTON_CLASS =
-  'border border-[var(--duties-border)] px-2 py-1 font-mono text-[0.65rem] text-[var(--duties-secondary)] transition-colors hover:border-[var(--duties-text)] hover:text-[var(--duties-text)] disabled:opacity-40';
+  'border border-[var(--duties-border)] px-2 py-1 font-mono text-mini text-[var(--duties-secondary)] transition-colors hover:border-[var(--duties-text)] hover:text-[var(--duties-text)] disabled:opacity-40';
 const ICON_BUTTON_CLASS =
-  'px-1 font-mono text-[0.7rem] leading-none text-[var(--duties-tertiary)] transition-colors hover:text-[var(--duties-text)] disabled:opacity-30';
+  'px-1 font-mono text-mini leading-none text-[var(--duties-tertiary)] transition-colors hover:text-[var(--duties-text)] disabled:opacity-30';
 const REASON_CLASS =
-  'w-full bg-transparent font-mono text-[0.6rem] text-[var(--duties-tertiary)] outline-none focus:text-[var(--duties-text)]';
+  'w-full bg-transparent font-mono text-micro text-[var(--duties-tertiary)] outline-none focus:text-[var(--duties-text)]';
 
 const DecisionSelect = ({
   value, onChange, label,
 }: { value: PolicyDecision; onChange: (next: PolicyDecision) => void; label: string }) => (
   <select
     aria-label={label}
-    className="border border-[var(--duties-border)] bg-[var(--duties-panel)] px-1.5 py-0.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+    className="border border-[var(--duties-border)] bg-[var(--duties-panel)] px-1.5 py-0.5 font-mono text-mini text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
     onChange={(event) => onChange(event.target.value as PolicyDecision)}
     value={value}
   >
@@ -120,7 +120,7 @@ const RuleProbe = ({ section }: { section: RuleSection }) => {
         />
       </div>
       {probe && (
-        <p className="mt-1 font-mono text-[0.65rem] text-[var(--duties-secondary)]">
+        <p className="mt-1 font-mono text-mini text-[var(--duties-secondary)]">
           {rule ? (
             <>
               第 {hit + 1} 条 <code className="text-[var(--duties-text)]">{rule.pattern}</code>
@@ -135,7 +135,7 @@ const RuleProbe = ({ section }: { section: RuleSection }) => {
           )}
         </p>
       )}
-      <p className="mt-1 text-[0.6rem] text-[var(--duties-tertiary)]">
+      <p className="mt-1 text-micro text-[var(--duties-tertiary)]">
         只看规则命中。工作区之外的路径服务端会先一步拒掉，不走这些规则。
       </p>
     </div>
@@ -190,11 +190,11 @@ const RuleRows = ({
   return (
     <div>
       <div className="mb-2 flex flex-wrap items-center gap-2">
-        <label className="font-mono text-[0.65rem] text-[var(--duties-secondary)]" htmlFor={`${sectionKey}-default`}>
+        <label className="font-mono text-mini text-[var(--duties-secondary)]" htmlFor={`${sectionKey}-default`}>
           兜底档位
         </label>
         <select
-          className="border border-[var(--duties-border)] bg-[var(--duties-panel)] px-1.5 py-0.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+          className="border border-[var(--duties-border)] bg-[var(--duties-panel)] px-1.5 py-0.5 font-mono text-mini text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
           id={`${sectionKey}-default`}
           onChange={(event) => onChange({ ...section, default: event.target.value as PolicyDecision })}
           value={section.default}
@@ -203,7 +203,7 @@ const RuleRows = ({
             <option key={item.value} value={item.value}>{item.label}</option>
           ))}
         </select>
-        <span className="text-[0.6rem] text-[var(--duties-tertiary)]">{meta.hint}</span>
+        <span className="text-micro text-[var(--duties-tertiary)]">{meta.hint}</span>
       </div>
 
       <div className="mb-2 flex flex-wrap items-center gap-2">
@@ -218,7 +218,7 @@ const RuleRows = ({
           {DECISION_FILTERS.map((item) => (
             <button
               aria-pressed={decisionFilter === item.value}
-              className={`border px-1.5 py-1 font-mono text-[0.6rem] transition-colors ${
+              className={`border px-1.5 py-1 font-mono text-micro transition-colors ${
                 decisionFilter === item.value
                   ? 'border-[var(--duties-text)] bg-[var(--duties-text)] text-[var(--duties-bg)]'
                   : 'border-[var(--duties-border)] text-[var(--duties-secondary)] hover:border-[var(--duties-text)] hover:text-[var(--duties-text)]'
@@ -233,7 +233,7 @@ const RuleRows = ({
         </div>
       </div>
 
-      <ul className="m-0 max-h-[26rem] list-none space-y-1 overflow-y-auto p-0">
+      <ul className="m-0 max-h-[var(--duties-pane-height)] list-none space-y-1 overflow-y-auto p-0">
         {visible.map(({ rule, index }) => (
           <li
             className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1"
@@ -260,10 +260,10 @@ const RuleRows = ({
                   ⌄
                 </button>
               </span>
-              <span className="w-6 shrink-0 text-right font-mono text-[0.6rem] text-[var(--duties-tertiary)]">
+              <span className="w-6 shrink-0 text-right font-mono text-micro text-[var(--duties-tertiary)]">
                 {index + 1}
               </span>
-              <code className="min-w-0 flex-1 truncate font-mono text-[0.7rem] text-[var(--duties-text)]">
+              <code className="min-w-0 flex-1 truncate font-mono text-mini text-[var(--duties-text)]">
                 {rule.pattern}
               </code>
               <DecisionSelect
@@ -290,12 +290,12 @@ const RuleRows = ({
           </li>
         ))}
         {section.rules.length > 0 && visible.length === 0 && (
-          <li className="border border-dashed border-[var(--duties-border)] p-2 text-[0.65rem] text-[var(--duties-tertiary)]">
+          <li className="border border-dashed border-[var(--duties-border)] p-2 text-mini text-[var(--duties-tertiary)]">
             没有符合条件的规则。
           </li>
         )}
         {section.rules.length === 0 && (
-          <li className="border border-dashed border-[var(--duties-border)] p-2 text-[0.65rem] text-[var(--duties-tertiary)]">
+          <li className="border border-dashed border-[var(--duties-border)] p-2 text-mini text-[var(--duties-tertiary)]">
             一条规则都没有，所有路径按兜底档位处理。
           </li>
         )}
@@ -312,7 +312,7 @@ const RuleRows = ({
         />
         <button className={GHOST_BUTTON_CLASS} onClick={addRule} type="button">插到最前</button>
       </div>
-      <p className="mt-1 text-[0.6rem] text-[var(--duties-tertiary)]">
+      <p className="mt-1 text-micro text-[var(--duties-tertiary)]">
         自上而下第一条命中的生效。新规则插在最前面，要让它给谁让路就往下移。
       </p>
 
@@ -343,12 +343,12 @@ const PatternList = ({
     <div>
       <div className="mb-2 flex flex-wrap items-baseline gap-x-2">
         <h3 className="font-mono text-xs font-semibold text-[var(--duties-secondary)]">{label}</h3>
-        <span className="text-[0.6rem] text-[var(--duties-tertiary)]">{hint}</span>
+        <span className="text-micro text-[var(--duties-tertiary)]">{hint}</span>
       </div>
       <div className="flex flex-wrap gap-1.5">
         {items.map((item) => (
           <span
-            className="inline-flex items-center gap-1 border border-[var(--duties-border)] bg-[var(--duties-bg)] px-1.5 py-0.5 font-mono text-[0.65rem] text-[var(--duties-text)]"
+            className="inline-flex items-center gap-1 border border-[var(--duties-border)] bg-[var(--duties-bg)] px-1.5 py-0.5 font-mono text-mini text-[var(--duties-text)]"
             key={item}
           >
             {item}
@@ -363,7 +363,7 @@ const PatternList = ({
           </span>
         ))}
         {items.length === 0 && (
-          <span className="text-[0.65rem] text-[var(--duties-tertiary)]">这一组是空的。</span>
+          <span className="text-mini text-[var(--duties-tertiary)]">这一组是空的。</span>
         )}
       </div>
       <div className="mt-2 flex items-center gap-2">
@@ -389,11 +389,11 @@ const CommandPanel = ({
 }) => (
   <div className="space-y-4">
     <div className="flex flex-wrap items-center gap-2">
-      <label className="font-mono text-[0.65rem] text-[var(--duties-secondary)]" htmlFor="command-default">
+      <label className="font-mono text-mini text-[var(--duties-secondary)]" htmlFor="command-default">
         兜底档位
       </label>
       <select
-        className="border border-[var(--duties-border)] bg-[var(--duties-panel)] px-1.5 py-0.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+        className="border border-[var(--duties-border)] bg-[var(--duties-panel)] px-1.5 py-0.5 font-mono text-mini text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
         id="command-default"
         onChange={(event) => onChange({ ...section, default: event.target.value as PolicyDecision })}
         value={section.default}
@@ -402,7 +402,7 @@ const CommandPanel = ({
           <option key={item.value} value={item.value}>{item.label}</option>
         ))}
       </select>
-      <span className="text-[0.6rem] text-[var(--duties-tertiary)]">{TAB_META.execute_command.hint}</span>
+      <span className="text-micro text-[var(--duties-tertiary)]">{TAB_META.execute_command.hint}</span>
     </div>
 
     {COMMAND_LISTS.map((list) => (
@@ -504,7 +504,7 @@ export const PolicyRulesSection = () => {
             {(Object.keys(TAB_META) as TabKey[]).map((key) => (
               <button
                 aria-pressed={tab === key}
-                className={`border px-2 py-1 font-mono text-[0.65rem] transition-colors ${
+                className={`border px-2 py-1 font-mono text-mini transition-colors ${
                   tab === key
                     ? 'border-[var(--duties-text)] bg-[var(--duties-text)] text-[var(--duties-bg)]'
                     : 'border-[var(--duties-border)] text-[var(--duties-secondary)] hover:border-[var(--duties-text)] hover:text-[var(--duties-text)]'
@@ -536,11 +536,11 @@ export const PolicyRulesSection = () => {
 
           {tab === 'restart' && (
             <div className="flex flex-wrap items-center gap-2">
-              <label className="font-mono text-[0.65rem] text-[var(--duties-secondary)]" htmlFor="restart-default">
+              <label className="font-mono text-mini text-[var(--duties-secondary)]" htmlFor="restart-default">
                 档位
               </label>
               <select
-                className="border border-[var(--duties-border)] bg-[var(--duties-panel)] px-1.5 py-0.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+                className="border border-[var(--duties-border)] bg-[var(--duties-panel)] px-1.5 py-0.5 font-mono text-mini text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
                 id="restart-default"
                 onChange={(event) => setDoc({ ...doc, restart: { default: event.target.value as PolicyDecision } })}
                 value={doc.restart?.default || 'approval_required'}
@@ -549,12 +549,12 @@ export const PolicyRulesSection = () => {
                   <option key={item.value} value={item.value}>{item.label}</option>
                 ))}
               </select>
-              <span className="text-[0.6rem] text-[var(--duties-tertiary)]">{TAB_META.restart.hint}</span>
+              <span className="text-micro text-[var(--duties-tertiary)]">{TAB_META.restart.hint}</span>
             </div>
           )}
 
           <div className="flex items-center gap-2 border-t border-[var(--duties-border)] pt-3">
-            <span className="min-w-0 flex-1 truncate text-[0.65rem] text-[var(--duties-tertiary)]">
+            <span className="min-w-0 flex-1 truncate text-mini text-[var(--duties-tertiary)]">
               {message || (dirty ? '有未保存的改动' : '与服务器一致')}
             </span>
             <button
@@ -566,7 +566,7 @@ export const PolicyRulesSection = () => {
               还原
             </button>
             <button
-              className="border border-[var(--duties-text)] bg-[var(--duties-text)] px-2.5 py-1 font-mono text-[0.65rem] text-[var(--duties-bg)] transition-opacity hover:opacity-80 disabled:opacity-40"
+              className="border border-[var(--duties-text)] bg-[var(--duties-text)] px-2.5 py-1 font-mono text-mini text-[var(--duties-bg)] transition-opacity hover:opacity-80 disabled:opacity-40"
               disabled={!dirty || busy}
               onClick={() => void save()}
               type="button"

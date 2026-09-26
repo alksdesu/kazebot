@@ -135,7 +135,7 @@ export const VisionChannelBlock = () => {
           </FieldRow>
           <Facts>
             决定按谁的格式发请求。地址填到哪一级也看它：OpenAI 系要带{' '}
-            <code className="font-mono text-[0.65rem]">/v1</code>，Claude 与 Gemini 不带。
+            <code className="font-mono text-mini">/v1</code>，Claude 与 Gemini 不带。
           </Facts>
           {wireUnstated && (
             <ErrorText>

@@ -12,7 +12,7 @@ import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore
 import { useSettingsStore } from '../../../store/settingsStore';
 import { describeEnvRef } from '../../../utils/envRef';
 import { Button } from '../../common';
-import { AuthRequired, Card, FieldLabel, PageHeader, PageShell, SelectInput, StatusText, TextInput } from './settingsPagePrimitives';
+import { Block, Field, Input, PageShell, Select, StatusText } from './settingsControls';
 
 function nodeTemplate(id: string, template: string): string {
   // [2026-06-02] Build a minimal node YAML from the selected template type. Why: the
@@ -94,48 +94,46 @@ export const AgentsSettingsPage = () => {
     }
   });
   return (
-    <PageShell>
-      <PageHeader description="查看、创建和删除节点配置文件。选择节点后，请在右侧面板编辑对应 YAML。" title="节点管理" />
-      {!isAuthenticated ? <AuthRequired /> : (
-        <Card title="节点列表" description="中间区域只负责列表和操作，节点 YAML 编辑器显示在右栏。">
-          <div className="mb-3 flex flex-wrap gap-2">
-            <Button disabled={loading || busy} onClick={loadNodes}>{loading ? '刷新中...' : '刷新节点'}</Button>
-            <Button disabled={busy || !selectedNode} onClick={remove} variant="danger">删除选中节点</Button>
-          </div>
-          <div className="max-h-[34rem] space-y-2 overflow-y-auto">
-            {nodes.map((node) => (
-              <button className={`w-full border p-3 text-left ${selectedNode?.id === node.id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={node.id} disabled={busy} onClick={() => { setSelectedNode(node); setMessage(''); setRightPanelOpen(true); }} type="button">
-                <p className="flex flex-wrap items-center gap-1.5 font-mono text-xs font-semibold">
-                  {node.id}
-                  {node.active === false && (
-                    <span className="border border-[var(--duties-border)] px-1.5 py-0.5 text-[0.55rem] font-normal text-[var(--duties-secondary)]">
-                      模板，派发不到
-                    </span>
-                  )}
-                </p>
-                {node.declared_id && (
-                  // engine 拿 node_id 直接拼文件名找文件，yaml 里这个 id 它不读。
-                  <p className="mt-1 text-xs text-[var(--duties-danger)]">
-                    文件里写着 id: {node.declared_id}，但节点认的是文件名，改那一行不会换节点
-                  </p>
+    <PageShell authed={isAuthenticated} description="查看、创建和删除节点配置文件。选择节点后，请在右侧面板编辑对应 YAML。" title="节点管理">
+      <Block frame="boxed" title="节点列表" hint="中间区域只负责列表和操作，节点 YAML 编辑器显示在右栏。">
+        <div className="mb-3 flex flex-wrap gap-2">
+          <Button disabled={loading || busy} onClick={loadNodes}>{loading ? '刷新中...' : '刷新节点'}</Button>
+          <Button disabled={busy || !selectedNode} onClick={remove} variant="danger">删除选中节点</Button>
+        </div>
+        <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">
+          {nodes.map((node) => (
+            <button className={`w-full border p-3 text-left ${selectedNode?.id === node.id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={node.id} disabled={busy} onClick={() => { setSelectedNode(node); setMessage(''); setRightPanelOpen(true); }} type="button">
+              <p className="flex flex-wrap items-center gap-1.5 font-mono text-xs font-semibold">
+                {node.id}
+                {node.active === false && (
+                  <span className="border border-[var(--duties-border)] px-1.5 py-0.5 text-nano font-normal text-[var(--duties-secondary)]">
+                    模板，派发不到
+                  </span>
                 )}
-                <p className="mt-1 text-xs text-[var(--duties-secondary)]">{node.name || '未命名'} · {node.type || '未知类型'} · {describeEnvRef(node.model || '') || '未设置模型'}</p>
-                {node.description && <p className="mt-1 line-clamp-2 text-xs leading-5 text-[var(--duties-secondary)]">{node.description}</p>}
-              </button>
-            ))}
-          </div>
-          <div className="mt-4 border-t border-[var(--duties-border)] pt-3">
-            <FieldLabel htmlFor="new-node-id">创建节点</FieldLabel>
-            <TextInput disabled={busy} id="new-node-id" onChange={(event) => setNewId(event.target.value)} placeholder="节点 ID" value={newId} />
-            <SelectInput aria-label="新节点模板" disabled={busy} className="mt-2" onChange={(event) => setTemplate(event.target.value)} value={template}>
+              </p>
+              {node.declared_id && (
+                // engine 拿 node_id 直接拼文件名找文件，yaml 里这个 id 它不读。
+                <p className="mt-1 text-xs text-[var(--duties-danger)]">
+                  文件里写着 id: {node.declared_id}，但节点认的是文件名，改那一行不会换节点
+                </p>
+              )}
+              <p className="mt-1 text-xs text-[var(--duties-secondary)]">{node.name || '未命名'} · {node.type || '未知类型'} · {describeEnvRef(node.model || '') || '未设置模型'}</p>
+              {node.description && <p className="mt-1 line-clamp-2 text-xs leading-5 text-[var(--duties-secondary)]">{node.description}</p>}
+            </button>
+          ))}
+        </div>
+        <div className="mt-4 border-t border-[var(--duties-border)] pt-3">
+          <Field htmlFor="new-node-id" label="创建节点" layout="stacked">
+            <Input width="wide" disabled={busy} id="new-node-id" onChange={(event) => setNewId(event.target.value)} placeholder="节点 ID" value={newId} />
+            <Select width="wide" aria-label="新节点模板" disabled={busy} className="mt-2" onChange={(event) => setTemplate(event.target.value)} value={template}>
               <option value="ai">AI 节点模板</option>
               <option value="tool">工具节点模板</option>
-            </SelectInput>
+            </Select>
             <Button className="mt-2" disabled={busy} onClick={create} variant="primary">创建节点</Button>
-          </div>
-          <StatusText message={message} />
-        </Card>
-      )}
+          </Field>
+        </div>
+        <StatusText message={message} />
+      </Block>
     </PageShell>
   );
 };

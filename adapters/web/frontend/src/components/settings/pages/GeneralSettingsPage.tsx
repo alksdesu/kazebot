@@ -5,7 +5,7 @@ import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { LoginPage } from '../../auth/LoginPage';
 import { Button } from '../../common';
-import { Card, PageHeader, PageShell } from './settingsPagePrimitives';
+import { Block, PageShell } from './settingsControls';
 
 export const GeneralSettingsPage = () => {
   const { adminToken, isAuthenticated, isConnected, storageWarning, setConnected, setModelConfig } = useSettingsStore();
@@ -72,22 +72,21 @@ export const GeneralSettingsPage = () => {
     settings.setGlobalConfig('', '');
   };
 
-  return <PageShell>
-    <PageHeader title="通用" description="查看控制台连接，管理当前浏览器的管理员登录。退出登录不会停止机器人或后台任务。" />
-    <Card title="调度器连接">
+  return <PageShell title="通用" description="查看控制台连接，管理当前浏览器的管理员登录。退出登录不会停止机器人或后台任务。">
+    <Block frame="boxed" title="调度器连接">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p role="status" className="flex items-center gap-2 text-sm"><span aria-hidden="true" className={`h-2 w-2 rounded-full ${isConnected ? 'bg-[var(--duties-live)]' : 'bg-[var(--duties-danger)]'}`} />{checking ? '正在检查连接…' : isConnected ? '调度器已连接' : '调度器未连接'}</p>
         <Button loading={checking} onClick={() => void refreshHealth()}>刷新连接</Button>
       </div>
       {error && <p role="alert" className="mt-3 text-sm text-[var(--duties-danger)]">{error}</p>}
       <p className="mt-3 text-sm text-[var(--duties-secondary)]">此状态表示控制台与调度器的连接。QQ 适配器和模型工作进程的状态请在“链路”和“运行”页面查看。</p>
-    </Card>
-    <Card title="管理员访问">
+    </Block>
+    <Block frame="boxed" title="管理员访问">
       {isAuthenticated ? <div className="space-y-4">
         <p className="text-sm">已认证。令牌不会在此页面显示。</p>
         <Button onClick={handleLogout}>退出登录</Button>
       </div> : <LoginPage embedded />}
       {storageWarning && <p role="status" className="mt-3 text-sm text-[var(--duties-secondary)]">{storageWarning}</p>}
-    </Card>
+    </Block>
   </PageShell>;
 };

@@ -1,6 +1,6 @@
 import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
-import { PageHeader } from '../components/settings/pages/settingsPagePrimitives';
+import { PageHeader } from '../components/settings/pages/settingsControls';
 import { FeaturePage } from '../features/ui';
 
 afterEach(() => cleanup());

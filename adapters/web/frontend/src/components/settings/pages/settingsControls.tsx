@@ -1,21 +1,63 @@
-// 带草稿态的设置页共用件：分节、开关格、存盘栏。
-// 与 settingsPagePrimitives 的分工：那边是即时生效的静态版式，这边是「改了要存」的那套。
+// 设置页与控制台共用的一套组件：页壳、区块、面板、表单控件、按钮与状态条。
 import { forwardRef, type ReactNode } from 'react';
 
 const MUTED = 'text-[var(--duties-secondary)]';
 
-export const Block = ({ children, hint, title }: {
+// 一条规则管到哪些渠道。写错过一次：QQ 的权限被当成浏览器设置，没人敢动。
+export type SettingScope = 'all-channels' | 'this-browser';
+
+const SCOPE_TEXT: Record<SettingScope, string> = {
+  'all-channels': '所有渠道',
+  'this-browser': '仅此浏览器',
+};
+
+export const ScopeBadge = ({ scope }: { scope: SettingScope }) => (
+  <span
+    className={`flex-shrink-0 rounded border px-2 py-0.5 text-xs ${
+      scope === 'all-channels'
+        ? 'border-[var(--duties-text)] bg-[var(--duties-text)] text-[var(--duties-bg)]'
+        : 'border-[var(--duties-border)] text-[var(--duties-secondary)]'
+    }`}
+  >
+    {SCOPE_TEXT[scope]}
+  </span>
+);
+
+export type BlockFrame = 'ruled' | 'boxed';
+
+/** 区块：一段带标题的设置。ruled 标题下压一条线，boxed 整段套框，选哪种看它要不要从页面里凸出来。 */
+export const Block = ({ children, frame = 'ruled', hint, scope, title }: {
   children: ReactNode;
+  frame?: BlockFrame;
   hint?: string;
-  title: string;
+  scope?: SettingScope;
+  title?: string;
 }) => (
-  <section className="mb-8">
-    <div className="mb-4 flex flex-wrap items-baseline gap-x-2.5 gap-y-1 border-b border-[var(--duties-border)] pb-2">
-      <h2 className="m-0 text-base font-semibold">{title}</h2>
-      {hint && <span className={`text-xs ${MUTED}`}>{hint}</span>}
-    </div>
-    {children}
-  </section>
+  frame === 'boxed' ? (
+    <section className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
+      {(title || hint) && (
+        <div className="mb-3">
+          {title && (
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-base font-semibold">{title}</h2>
+              {scope && <ScopeBadge scope={scope} />}
+            </div>
+          )}
+          {hint && <p className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]">{hint}</p>}
+        </div>
+      )}
+      {children}
+    </section>
+  ) : (
+    <section className="mb-8">
+      <div className="mb-4 flex flex-wrap items-baseline gap-x-2.5 gap-y-1 border-b border-[var(--duties-border)] pb-2">
+        {title && <h2 className="m-0 text-base font-semibold">{title}</h2>}
+        {hint && <span className={`text-xs ${MUTED}`}>{hint}</span>}
+        {scope && <ScopeBadge scope={scope} />}
+      </div>
+      {children}
+    </section>
+  )
 );
 
 /** 开关格。1px 间隙靠容器底色透出来当分隔线，省掉每格各画一条边。 */
@@ -70,7 +112,11 @@ export const ErrorText = ({ children }: { children: ReactNode }) => (
 );
 
 export const Footnote = ({ children }: { children: ReactNode }) => (
-  <p className={`mt-3 max-w-[62ch] text-xs leading-5 ${MUTED}`}>{children}</p>
+  <p className={`mt-3 max-w-[var(--duties-prose-max-width)] text-xs leading-5 ${MUTED}`}>{children}</p>
+);
+
+export const StatusText = ({ message }: { message: string }) => (
+  message ? <p role="status" aria-live="polite" className="mt-2 text-sm leading-6 text-[var(--duties-secondary)]">{message}</p> : null
 );
 
 export const Facts = ({ children, className = '' }: { children: ReactNode; className?: string }) => (
@@ -155,11 +201,24 @@ export const Sub = ({ checked, label, onChange }: {
   </label>
 );
 
-export const Field = ({ children, label }: { children: ReactNode; label: string }) => (
-  <span className="ml-[var(--duties-option-indent)] mt-2.5 flex min-w-0 flex-wrap items-center gap-2.5 text-sm">
-    <label className={MUTED}>{label}</label>
-    {children}
-  </span>
+/** 带标签的字段。inline 是跟在开关下面的一行，stacked 是标签压在控件上方的表单式。 */
+export const Field = ({ children, htmlFor, label, layout = 'inline' }: {
+  children?: ReactNode;
+  htmlFor?: string;
+  label: ReactNode;
+  layout?: 'inline' | 'stacked';
+}) => (
+  layout === 'stacked' ? (
+    <>
+      <label className="mb-1 block text-sm font-medium text-[var(--duties-secondary)]" htmlFor={htmlFor}>{label}</label>
+      {children}
+    </>
+  ) : (
+    <span className="ml-[var(--duties-option-indent)] mt-2.5 flex min-w-0 flex-wrap items-center gap-2.5 text-sm">
+      <label className={MUTED} htmlFor={htmlFor}>{label}</label>
+      {children}
+    </span>
+  )
 );
 
 // 变体走 prop 不走 className 追加：align-items 与 font-size 都是同属性覆盖，
@@ -255,7 +314,7 @@ export const Tag = ({ children, className = '', tone = 'neutral' }: {
   tone?: TagTone;
 }) => (
   <span
-    className={`flex-none border px-1.5 py-0.5 font-mono text-xs tracking-[-0.01em] ${TAG_TONE[tone]} ${className}`}
+    className={`flex-none border px-1.5 py-0.5 font-mono text-xs tracking-ident ${TAG_TONE[tone]} ${className}`}
   >
     {children}
   </span>
@@ -292,7 +351,7 @@ export const Chip = ({ children, onRemove, removeLabel }: {
 /** 只读展示：改动需要重启进程的那几个值。 */
 export const ReadOnlyRow = ({ hint, name, value }: { hint?: string; name: string; value: string }) => (
   <div className="flex flex-wrap items-baseline gap-2.5 py-1.5">
-    <span className={`min-w-[9em] text-sm ${MUTED}`}>{name}</span>
+    <span className={`min-w-[var(--duties-label-min-width)] text-sm ${MUTED}`}>{name}</span>
     <code className="break-all text-xs">{value || '未设置'}</code>
     {hint && <span className={`text-xs ${MUTED}`}>{hint}</span>}
   </div>
@@ -432,4 +491,57 @@ export const StatusBar = ({ children, tone }: { children: ReactNode; tone: PipTo
     <Pip tone={tone} />
     {children}
   </div>
+);
+
+export const PageHeader = ({ eyebrow, title, description, level = 1 }: {
+  description: string;
+  eyebrow?: string;
+  level?: 1 | 2;
+  title: string;
+}) => {
+  const Heading = level === 1 ? 'h1' : 'h2';
+  return (
+    <header aria-label={eyebrow ? `${eyebrow}：${title}` : undefined}>
+      <Heading className={`${level === 1 ? 'text-2xl' : 'text-xl'} font-semibold tracking-tight`}>{title}</Heading>
+      <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--duties-secondary)]">{description}</p>
+    </header>
+  );
+};
+
+interface PageShellProps {
+  /** 未登录时正文整块不渲染，只留登录指引 —— 这些页读的都是要鉴权的接口。 */
+  authed?: boolean;
+  /** 状态栏不进滚动区：改完页尾的开关要能直接点应用，滚回顶部才找得到等于没有。 */
+  bar?: ReactNode;
+  children: ReactNode;
+  description: string;
+  error?: string;
+  eyebrow?: string;
+  notice?: string;
+  title: string;
+}
+
+/** 设置页统一的壳：标题、说明、登录提示、错误区，平台页在顶上再挂一条状态栏。 */
+export const PageShell = ({
+  authed = true, bar, children, description, error, eyebrow, notice, title,
+}: PageShellProps) => (
+  <section className="flex h-full min-h-0 flex-col">
+    {bar}
+    <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
+      <div className="mx-auto max-w-4xl space-y-5 text-sm">
+        <PageHeader description={description} eyebrow={eyebrow} title={title} />
+        {authed ? (
+          <>
+            {error && <ErrorText>{error}</ErrorText>}
+            {notice && <Facts>{notice}</Facts>}
+            {children}
+          </>
+        ) : (
+          <Block frame="boxed">
+            <p className="text-sm leading-6 text-[var(--duties-secondary)]">请先在通用页面登录 Admin Token</p>
+          </Block>
+        )}
+      </div>
+    </div>
+  </section>
 );

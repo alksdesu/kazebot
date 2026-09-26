@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Button } from '../../components/common';
-import { Card, StatusText } from '../../components/settings/pages/settingsPagePrimitives';
+import { Block, StatusText } from '../../components/settings/pages/settingsControls';
 import { downloadFeature, featureRequest } from '../client';
 
 interface Check { name: string; status: string; detail: string; action: string; latency_ms?: number }
@@ -25,7 +25,7 @@ export function DiagnosticsPanel() {
     } catch (failure) { setError(String(failure)); }
     finally { setBusy(false); }
   }
-  return <Card title="一键诊断" description="检查连接、工作进程、队列、存储和文档处理能力，导出报告供排查。">
+  return <Block frame="boxed" title="一键诊断" hint="检查连接、工作进程、队列、存储和文档处理能力，导出报告供排查。">
     <div className="flex flex-wrap gap-3 text-sm">
       <label><input type="checkbox" disabled={busy} checked={testModel} onChange={event => setTestModel(event.target.checked)} /> 发起一次最小模型请求（可能计费）</label>
       <label><input type="checkbox" disabled={busy} checked={includeLogs} onChange={event => setIncludeLogs(event.target.checked)} /> 附带脱敏日志</label>
@@ -45,5 +45,5 @@ export function DiagnosticsPanel() {
         {check.status !== 'passed' && check.action && <p className="text-[var(--duties-secondary)]">{check.action}</p>}
       </div>)}
     </div>}
-  </Card>;
+  </Block>;
 }

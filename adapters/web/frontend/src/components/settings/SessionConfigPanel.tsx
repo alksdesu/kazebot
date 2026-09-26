@@ -380,10 +380,10 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
   return (
     <section aria-label="会话配置面板" className="flex h-full min-h-0 flex-col overflow-y-auto p-3">
       <div className="mb-3 flex items-center justify-between">
-        <h2 className="font-mono text-[0.65rem] font-semibold uppercase tracking-[0.16em] text-[var(--duties-tertiary)]">会话配置</h2>
+        <h2 className="font-mono text-mini font-semibold uppercase tracking-caps text-[var(--duties-tertiary)]">会话配置</h2>
         {focus !== 'default' && (
           <button
-            className="text-[0.65rem] text-[var(--duties-tertiary)] hover:text-[var(--duties-text)]"
+            className="text-mini text-[var(--duties-tertiary)] hover:text-[var(--duties-text)]"
             onClick={() => {
               // [2026-06-01] Focused session panels can appear inside settings or
               // the modal overlay. Why: earlier right-rail routing has been removed.
@@ -401,19 +401,19 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
 
       {(focus === 'default' || focus === 'node') && (
         <details className="mb-3 group">
-          <summary className="flex cursor-pointer list-none items-center justify-between gap-2 border border-[var(--duties-border)] px-2.5 py-1.5 text-[0.68rem] text-[var(--duties-secondary)] hover:border-[var(--duties-text)] [&::-webkit-details-marker]:hidden">
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-2 border border-[var(--duties-border)] px-2.5 py-1.5 text-mini text-[var(--duties-secondary)] hover:border-[var(--duties-text)] [&::-webkit-details-marker]:hidden">
             <span className="min-w-0 truncate font-mono">
               会话：{shortSessionId(sid)}
             </span>
-            <span className="flex flex-shrink-0 items-center gap-1.5 text-[0.62rem]">
+            <span className="flex flex-shrink-0 items-center gap-1.5 text-micro">
               <span aria-label={connectionAriaLabel(connectionStatus, connectionStatusLabel)} className={`inline-block h-1.5 w-1.5 rounded-full ${connectionDotClass(connectionStatus)}`} />
               {connectionStatusLabel && <span>{connectionStatusLabel}</span>}
             </span>
           </summary>
           <div className="border-x border-b border-[var(--duties-border)] p-2.5">
-            <p className="mb-1 font-mono text-[0.58rem] uppercase tracking-[0.18em] text-[var(--duties-tertiary)]">完整会话 ID</p>
+            <p className="mb-1 font-mono text-nano uppercase tracking-caps text-[var(--duties-tertiary)]">完整会话 ID</p>
             <button
-              className="w-full truncate border border-[var(--duties-border)] px-2 py-1.5 text-left font-mono text-[0.62rem] text-[var(--duties-secondary)] hover:border-[var(--duties-text)]"
+              className="w-full truncate border border-[var(--duties-border)] px-2 py-1.5 text-left font-mono text-micro text-[var(--duties-secondary)] hover:border-[var(--duties-text)]"
               disabled={!sid}
               onClick={handleCopySessionId}
               title={sid || '没有活动会话'}
@@ -421,7 +421,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
             >
               {sid || '没有活动会话'}
             </button>
-            {copyMsg && <p className="mt-1 text-[0.62rem] text-[var(--duties-tertiary)]">{copyMsg}</p>}
+            {copyMsg && <p className="mt-1 text-micro text-[var(--duties-tertiary)]">{copyMsg}</p>}
           </div>
         </details>
       )}
@@ -430,16 +430,16 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
         <div className={`mb-3 border p-2.5 ${focus === 'node' ? 'border-[var(--duties-text)]' : 'border-[var(--duties-border)]'}`}>
           <div className="mb-2 flex items-start justify-between gap-2">
             <div className="min-w-0">
-              <p className="font-mono text-[0.58rem] uppercase tracking-[0.18em] text-[var(--duties-tertiary)]">活动节点</p>
+              <p className="font-mono text-nano uppercase tracking-caps text-[var(--duties-tertiary)]">活动节点</p>
               <p className="mt-1 truncate text-xs font-semibold">{activeNode?.name || displayNodeId || '默认节点'}</p>
-              <p className="mt-0.5 truncate font-mono text-[0.6rem] text-[var(--duties-tertiary)]">{displayNodeId || '（未设置）'}</p>
+              <p className="mt-0.5 truncate font-mono text-micro text-[var(--duties-tertiary)]">{displayNodeId || '（未设置）'}</p>
             </div>
-            <span className="flex-shrink-0 font-mono text-[0.55rem] uppercase tracking-[0.12em] text-[var(--duties-tertiary)]">
+            <span className="flex-shrink-0 font-mono text-nano uppercase tracking-caps text-[var(--duties-tertiary)]">
               {activeNodeIsOverride ? '覆盖' : '默认'}
             </span>
           </div>
           <select
-            className="app-input mb-2 w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            className="app-input mb-2 w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1.5 font-mono text-mini text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
             disabled={nodeSaving}
             onChange={e => handleSwitchNode(e.target.value)}
             value={activeNodeIsOverride ? activeNodeId : ''}
@@ -449,7 +449,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
               <option key={n.id} value={n.id}>{n.name || n.id}</option>
             ))}
           </select>
-          {nodeMsg && <p className="text-[0.62rem] text-[var(--duties-tertiary)]">{nodeMsg}</p>}
+          {nodeMsg && <p className="text-micro text-[var(--duties-tertiary)]">{nodeMsg}</p>}
         </div>
       )}
 
@@ -457,23 +457,23 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
         <div className={`border p-2.5 ${focus === 'model' ? 'border-[var(--duties-text)]' : 'border-[var(--duties-border)]'}`}>
           <div className="mb-2 flex items-start justify-between gap-2">
             <div className="min-w-0">
-              <p className="font-mono text-[0.58rem] uppercase tracking-[0.18em] text-[var(--duties-tertiary)]">会话模型</p>
+              <p className="font-mono text-nano uppercase tracking-caps text-[var(--duties-tertiary)]">会话模型</p>
               <p className="mt-1 truncate text-xs font-semibold">
-                {effectiveModel} <span className="font-normal text-[0.62rem] text-[var(--duties-tertiary)]">{effectiveModelSourceLabel}</span>
+                {effectiveModel} <span className="font-normal text-micro text-[var(--duties-tertiary)]">{effectiveModelSourceLabel}</span>
               </p>
-              <p className="mt-0.5 truncate font-mono text-[0.6rem] text-[var(--duties-tertiary)]">
+              <p className="mt-0.5 truncate font-mono text-micro text-[var(--duties-tertiary)]">
                 {effectiveBaseUrl} <span>{effectiveBaseUrlSourceLabel}</span>
               </p>
             </div>
-            <span className="flex-shrink-0 font-mono text-[0.55rem] uppercase tracking-[0.12em] text-[var(--duties-tertiary)]">
+            <span className="flex-shrink-0 font-mono text-nano uppercase tracking-caps text-[var(--duties-tertiary)]">
               {hasSessionOverride ? '会话' : '继承'}
             </span>
           </div>
 
-          <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">供应商</label>
+          <label className="mb-1 block text-micro text-[var(--duties-secondary)]">供应商</label>
           <input
             aria-label="供应商"
-            className="app-input mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            className="app-input mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-mini text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
             list={providerChoices.length ? providerListId : undefined}
             disabled={modelSaving || !modelLoaded} onChange={e => setEdit(p => ({ ...p, provider: e.target.value }))}
             placeholder={stringField(sessionProviderOverride, 'provider')
@@ -486,9 +486,9 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
             </datalist>
           )}
 
-          <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">模型</label>
+          <label className="mb-1 block text-micro text-[var(--duties-secondary)]">模型</label>
           <input
-            className="app-input mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            className="app-input mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-mini text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
             list={modelChoices.length ? modelListId : undefined}
             disabled={modelSaving || !modelLoaded} aria-label="模型" onChange={e => setEdit(p => ({ ...p, model: e.target.value }))}
             placeholder={inheritedPlaceholder(nodeModel || globalModel, '继承的模型')}
@@ -500,33 +500,33 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
             </datalist>
           )}
 
-          <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">基础 URL</label>
+          <label className="mb-1 block text-micro text-[var(--duties-secondary)]">基础 URL</label>
           <input
-            className="app-input mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            className="app-input mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-mini text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
             disabled={modelSaving || !modelLoaded} aria-label="基础 URL" onChange={e => setEdit(p => ({ ...p, base_url: e.target.value }))}
             placeholder={inheritedPlaceholder(nodeBaseUrl || globalBaseUrl, '继承的基础 URL')}
             value={edit.base_url}
           />
 
-          <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">API 密钥 {apiKeyPresent ? '（已设置）' : '（可选）'}</label>
+          <label className="mb-1 block text-micro text-[var(--duties-secondary)]">API 密钥 {apiKeyPresent ? '（已设置）' : '（可选）'}</label>
           <input
-            className="app-input mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            className="app-input mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-mini text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
             disabled={modelSaving || !modelLoaded} aria-label="API 密钥" onChange={e => setEdit(p => ({ ...p, api_key: e.target.value }))}
             placeholder="留空以保留当前值"
             type="password"
             value={edit.api_key}
           />
 
-          {modelMsg && <p className="mb-2 text-[0.62rem] text-[var(--duties-tertiary)]">{modelMsg}</p>}
+          {modelMsg && <p className="mb-2 text-micro text-[var(--duties-tertiary)]">{modelMsg}</p>}
 
           {/* Save/Clear only visible when user has modified something */}
           {(edit.provider.trim() !== '' || edit.model.trim() !== '' || edit.base_url.trim() !== '' || edit.api_key.trim() !== '' || hasSessionOverride) && (
             <div className="flex gap-2">
-              <Button className="h-8 flex-1 px-2 text-[0.55rem]" disabled={modelSaving || !modelLoaded || (!edit.provider.trim() && !edit.model.trim() && !edit.base_url.trim() && !edit.api_key.trim())} onClick={handleSaveModel} variant="primary">
+              <Button className="h-8 flex-1 px-2 text-nano" disabled={modelSaving || !modelLoaded || (!edit.provider.trim() && !edit.model.trim() && !edit.base_url.trim() && !edit.api_key.trim())} onClick={handleSaveModel} variant="primary">
                 {modelSaving ? '保存中…' : '保存'}
               </Button>
               {hasSessionOverride && (
-                <Button className="h-8 flex-1 px-2 text-[0.55rem]" disabled={modelSaving || !modelLoaded} onClick={handleClearModel} variant="ghost">
+                <Button className="h-8 flex-1 px-2 text-nano" disabled={modelSaving || !modelLoaded} onClick={handleClearModel} variant="ghost">
                   清除
                 </Button>
               )}

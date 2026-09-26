@@ -63,7 +63,7 @@ const Row = ({
     <Item>
       <div className="flex items-center gap-2">
         <ItemTitle>{slot.label}</ItemTitle>
-        <code className="border border-[var(--duties-live)] px-1.5 text-[0.65rem] text-[var(--duties-live)]">
+        <code className="border border-[var(--duties-live)] px-1.5 text-mini text-[var(--duties-live)]">
           {slot.key}
         </code>
       </div>
