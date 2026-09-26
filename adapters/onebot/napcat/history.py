@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 from nonebot.adapters.onebot.v11 import Bot, Event
+from adapters._shared import outbound
 from platforms.inbound import InboundFacts
 from ..config import CLONOTH_WORKSPACE
 from ..live_config import live
@@ -181,7 +182,7 @@ def _record_bot_reply(group_id: int, text: str) -> None:
         text,
         strip_asterisk_styles=live.strip_asterisk_styles,
         strip_underscore_styles=live.strip_underscore_styles,
-    ).replace(common._SPLIT_SIGNAL, " ")
+    ).replace(outbound.SPLIT_MARKER, " ")
     text = common._QQ_EMOJI_MARK_RE.sub(lambda m: f"[表情:{m.group(1)}]", text)
     text = anonymize._anonymize_text_for_ai(message_text._compact_text(text))
     if text:

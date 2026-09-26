@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Iterable, Mapping
 
+from adapters._shared import outbound
 from adapters._shared.aliases import AliasBook
 from adapters._shared.approvals import (
     DECISION_ALLOW,
@@ -27,6 +29,21 @@ from adapters._shared.conversation_hash import ConversationKeys
 from adapters._shared.feature_gateway import FeatureGateway, TargetConversation
 from adapters._shared.history_window import ClearBarriers, HistoryWindows
 from adapters._shared.memory_hints import collect_subjects
+from adapters._shared.outbound import (
+    EVERYONE,
+    MarkerGrammar,
+    MentionPiece,
+    Piece,
+    Rendered,
+    TextPiece,
+    join_rendered,
+    limit_parts,
+    mention_as_text,
+    resolve_mention,
+    split_reply,
+    strip_markup,
+    tokenize,
+)
 from adapters._shared.send_guard import (
     AmbiguousAckError,
     IdempotencyClaim,
@@ -47,7 +64,9 @@ from platforms.descriptor import (
     CHANNEL_PRIVATE,
     HOOK_TRIGGER_POLICY,
     ID_STRING,
+    MENTION_NATIVE,
     ChannelDescriptor,
+    PlatformCapabilities,
     PlatformDescriptor,
 )
 from platforms.ids import normalize_id
@@ -64,7 +83,16 @@ FAKE_CHAT = PlatformDescriptor(
     ),
     id_shape=ID_STRING,
     hooks={HOOK_TRIGGER_POLICY: "adapters._shared.trigger_policy"},
+    capabilities=PlatformCapabilities(
+        max_text_length=2000, markdown=True, max_split_parts=3, mention=MENTION_NATIVE, quote=True,
+    ),
 )
+
+# 平台自己的提及写法：服务端从正文里认出它，模型直接写出来驱动也认。
+MENTION_SYNTAX = r"<@([\w-]+)>"
+FAKE_MARKERS = MarkerGrammar(native_mentions=(MENTION_SYNTAX,))
+TRUNCATED_NOTICE = " …(truncated)"
+_MENTION_RE = re.compile(MENTION_SYNTAX)
 
 ROOM_TARGET = "room"
 DM_TARGET = "dm"
@@ -83,6 +111,10 @@ APPROVAL_PENDING_NOTICE = "This operation is waiting for an admin to approve it.
 
 def channel_name(kind: str) -> str:
     return next(channel.name for channel in FAKE_CHAT.channels if channel.kind == kind)
+
+
+def mention_syntax(user_id: str) -> str:
+    return f"<@{user_id}>"
 
 
 @dataclass(frozen=True)
@@ -114,6 +146,7 @@ class Posted:
     user: str
     text: str
     reply_to: str = ""
+    mentions: tuple[str, ...] = ()
 
 
 class ChatTimeout(TimeoutError):
@@ -142,7 +175,8 @@ class ChatServer:
         if fault == FAULT_REFUSED:
             raise ChatRefused("connection refused")
         message_id = f"p{len(self.posted) + 1}"
-        self.posted.append(Posted(message_id, room, user, text, reply_to))
+        mentions = tuple(dict.fromkeys(_MENTION_RE.findall(text)))
+        self.posted.append(Posted(message_id, room, user, text, reply_to, mentions))
         if fault == FAULT_LOST_ACK:
             raise ChatTimeout(f"acknowledgement lost after {message_id}")
         if fault == FAULT_HANG:
@@ -170,7 +204,7 @@ def classify_send_failure(exc: BaseException) -> SendError:
 
 
 class FakeChatAdapter:
-    """fakechat 适配器：进程内状态、入站翻译与提交、受防重保护的发送、审批与上下文重置。"""
+    """fakechat 适配器：进程内状态、入站翻译与提交、按能力声明渲染出站、受防重保护的发送、审批与上下文重置。"""
 
     def __init__(
         self,
@@ -371,11 +405,18 @@ class FakeChatAdapter:
         return True
 
     async def send(self, target: Mapping[str, Any], text: str, *, context: OutboundSendContext | None = None) -> str:
-        """发一条纯文本。同一投递身份只会真正发出一次，回执不明时不重发。"""
+        """发一条纯文本：先过群里的发送策略，再受防重保护地发出去。"""
+        await self.features.check_send(self.bot, target)
+        return await self.post(target, text, context=context)
+
+    async def post(
+        self, target: Mapping[str, Any], text: str, *, context: OutboundSendContext | None = None,
+        content_identity: str = "",
+    ) -> str:
+        """发一条，发送策略由调用方核验过。同一投递身份只会真正发出一次，回执不明时不重发。"""
         identity = target_identity(target)
         context = context or OutboundSendContext(conversation_key=str(target.get("conversation_key") or ""))
-        await self.features.check_send(self.bot, target)
-        key = idempotency_key(identity, text, event_id=context.idempotency_key or context.event_id)
+        key = idempotency_key(identity, content_identity or text, event_id=context.idempotency_key or context.event_id)
         claim = await self.outbound.begin(key)
         if not claim.acquired and claim.state == "pending":
             resolved = await self.outbound.wait_for_resolution(key)
@@ -397,17 +438,72 @@ class FakeChatAdapter:
         await self.features.bind_reminder_message(self.bot, target, context, message_id)
         return message_id
 
-    async def deliver(self, target: dict[str, Any], text: str, *, context: OutboundSendContext, record: bool) -> str:
+    def render(self, text: str) -> list[str]:
+        """按能力声明把一条模型回复渲染成要发的几条消息；渲染完是空的不算一条。"""
+        capabilities = FAKE_CHAT.capabilities
+        messages: list[str] = []
+        for part in limit_parts(split_reply(text), capabilities.max_split_parts):
+            body = strip_markup(part, FAKE_MARKERS, keep_markdown=capabilities.markdown)
+            chunks = [chunk for piece in tokenize(body, FAKE_MARKERS) for chunk in self.render_piece(piece)]
+            message = join_rendered(chunks, capabilities.max_text_length, suffix=TRUNCATED_NOTICE).strip()
+            if message:
+                messages.append(message)
+        return messages
+
+    def render_piece(self, piece: Piece) -> list[Rendered]:
+        if isinstance(piece, TextPiece):
+            return [Rendered(piece.text)]
+        if isinstance(piece, MentionPiece):
+            return self.render_mention(piece)
+        # 没有自定义表情，也没有表情包库，表情标记整个丢掉。
+        return []
+
+    def render_mention(self, piece: MentionPiece) -> list[Rendered]:
+        """提及渲染成平台语法，几个之间补空格。没声明全体提及，全体成员和认不出的名字一样退回文字。"""
+        if not piece.tokens:
+            user = normalize_id(piece.platform_id, FAKE_CHAT.id_shape)
+            return [Rendered(mention_syntax(user), atomic=True)] if user else []
+        chunks: list[Rendered] = []
+        for index, token in enumerate(piece.tokens):
+            if index:
+                chunks.append(Rendered(" "))
+            user = resolve_mention(token, self.aliases.users.real_of, id_shape=FAKE_CHAT.id_shape)
+            if user and user != EVERYONE:
+                chunks.append(Rendered(mention_syntax(user), atomic=True))
+            else:
+                chunks.append(Rendered(mention_as_text(token)))
+        return chunks
+
+    def reply_history_line(self, text: str) -> str:
+        """bot 的回复按模型写的样子记进窗口：下一轮它照自己的写法接话，不该看到平台语法。"""
+        body = strip_markup(text, FAKE_MARKERS, keep_markdown=FAKE_CHAT.capabilities.markdown)
+        return f"Bot: {self.anonymize(body.replace(outbound.SPLIT_MARKER, ' '))}"
+
+    async def deliver(
+        self, target: dict[str, Any], text: str, *, context: OutboundSendContext, record: bool,
+    ) -> list[str]:
+        """发一条模型回复，返回发出去的每条消息的 ID。"""
         purpose = getattr(context, "purpose", "direct")
         if purpose == "ambient" or "_response_purpose" not in target:
             target["_response_purpose"] = purpose
+        messages = self.render(text)
+        if not messages:
+            return []
+        await self.features.check_send(self.bot, target)
         in_room = target["kind"] == ROOM_TARGET
         # 清空上下文时还在飞的回复照发，但它是上一段上下文的产物，不能落回刚清空的窗口。
         stale = in_room and self.barriers.is_stale(target["id"], int(context.source_inbound_seq or 0))
-        message_id = await self.send(target, text, context=context)
+        sent: list[str] = []
+        for index, message in enumerate(messages):
+            # 引用只挂在第一条上，条条都引用同一句就成了刷屏。
+            quoted = index == 0 and FAKE_CHAT.capabilities.quote
+            sent.append(await self.post(
+                target if quoted else {**target, "reply_to": ""}, message,
+                context=context.child(f"part:{index}"), content_identity=f"part:{index}:{message}",
+            ))
         if record and in_room and not stale:
-            self.history.append(target["id"], f"Bot: {self.anonymize(text)}")
-        return message_id
+            self.history.append(target["id"], self.reply_history_line(text))
+        return sent
 
     def target_for(self, conversation_key: str, platform_data: Mapping[str, Any] | None = None) -> dict[str, Any]:
         stored = (platform_data or {}).get("target") or self.routes.get(conversation_key)

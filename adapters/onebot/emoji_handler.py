@@ -1,8 +1,7 @@
-"""QQ 表情和输出文本清理工具。
+"""QQ 的出站标记写法、收藏表情与输出文本清理。
 
-Clonoth 后端可能输出 QQ 表情标记、`<:name:id>` 自定义表情标记、Reaction 标记或 Markdown。
-本模块在发往 QQ 前统一处理这些内容，目的是让 QQ 群只看到可渲染的纯文本
-和可发送的自定义/收藏表情图片。
+标记解析在 adapters/_shared/outbound.py；这里补 QQ 自己的写法，把解析出的段渲染成 OneBot 消息段描述，
+收藏表情走 NapCat 的私有接口。
 """
 from __future__ import annotations
 
@@ -16,29 +15,34 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
+from adapters._shared.outbound import (
+    FOREIGN_CUSTOM_EMOJI,
+    REACT_MARKER,
+    MarkerGrammar,
+    MentionPiece,
+    TextPiece,
+    mention_as_text,
+    resolve_mention,
+    split_mention_tokens,
+    strip_markup,
+    tokenize,
+)
+from platforms.builtin import QQ_NAPCAT
+
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
-# 模型易写的收藏表情标记。兼容旧格式 [QQ_EMOJI:名称]，并新增：
-# [表情: 开心] / [emoji: 开心] / [收藏表情: 开心]
-_QQ_EMOJI_RE = re.compile(r"\[(?:QQ_EMOJI|表情|emoji|收藏表情)\s*[:：]\s*(.+?)\]", re.IGNORECASE)
+QQ_MARKERS = MarkerGrammar(
+    # QQ_EMOJI 和收藏表情是旧提示词里的写法，历史消息里还留着，模型会照抄。
+    emoji_tags=("QQ_EMOJI", "表情", "emoji", "收藏表情"),
+    # OneBot 的 CQ 码，里面已经是真实 QQ 号。
+    native_mentions=(r"\[CQ:at,qq=(\d+)\]",),
+    # 入站把内置表情渲染成 [QQ表情:微笑] 给模型看，模型会照抄回来；出站没有这个语义，漏出去就是一行裸标记。
+    strip=(FOREIGN_CUSTOM_EMOJI, REACT_MARKER, r"\[QQ表情(?:\s*[:：]\s*[^\]]*)?\]"),
+)
 
 
 def has_emoji_markers(text: str) -> bool:
-    return bool(_QQ_EMOJI_RE.search(text))
-
-# 入站把内置表情渲染成 [QQ表情:微笑] 给模型看，模型会照抄回来；出站没有这个语义，漏出去就是一行裸标记。
-_INBOUND_FACE_RE = re.compile(r"\[QQ表情(?:\s*[:：]\s*[^\]]*)?\]")
-
-# Clonoth 模型输出 [at:QQ号] 格式的 at 标记。QQ 端需要将其
-# 转换为 OneBot MessageSegment.at()，否则只会被当作纯文本发送。
-# 同时兼容旧的 [CQ:at,qq=xxx] 格式。
-#
-# 2026-07-14 扩展：模型看到的是匿名别名（UserA/UserAF 等），很容易输出
-# [at:UserAF] 而不是真实 QQ 号。旧正则只匹配纯数字，导致这类 @ 标记
-# 被当成纯文本原样发出（群里看到 "@UserAF"）。这里允许方括号内为
-# 数字或非数字别名/显示名，非数字部分在 process_emojis 里通过
-# EmojiRenderer.at_alias_resolver 反查为真实 QQ 号（后续由 NapCat 渲染为群昵称）。
-_AT_RE = re.compile(r"\[at:([^\]]+)\]|\[CQ:at,qq=(\d+)\]")
+    return QQ_MARKERS.has_emoji(text)
 
 
 @dataclass(frozen=True)
@@ -53,23 +57,6 @@ AtAliasResolver = Callable[[str], Optional[str]]
 StickerResolver = Callable[[str], Awaitable[Union[ResolvedSticker, str, None]]]
 
 
-# 一个 [at:...] 标记内多个目标的分隔符：英文逗号、中文逗号、顿号、分号、或连续空白。
-# 例如 [at:UserA,UserB、木] 会拆成 ["UserA", "UserB", "张三"]。
-_AT_TOKEN_SPLIT_RE = re.compile(r"[,\uFF0C\u3001;\uFF1B]+|\s{2,}")
-
-
-# 可能表示“@全体成员”的关键字（小写比较）。注意：这些词也可能恰好是某个
-# 群友的昵称/别名（如有人就叫 "all"），因此不能直接当全体成员，
-# 而是先走用户反查，反查不到时才视为 @全体成员。
-_AT_ALL_KEYWORDS = frozenset({"all", "at_all", "atall", "全体成员", "@全体成员"})
-
-
-# `<:name:id>` 这种自定义表情标记在 QQ 无法渲染，直接剥离，避免群内出现平台私有格式。
-_CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
-
-# [REACT:...] 反应标记。QQ 端现在支持 reaction，由 _extract_reactions 提取后执行。
-_REACT_RE = re.compile(r"\[REACT:[^\]]+\]")
-
 # fetch_custom_face_detail 在 NapCat 中会返回 QQ 收藏表情详情。该列表一般不会在一轮
 # 回复内频繁变化，因此做一个短 TTL 缓存，避免模型连续输出多个 [表情:...] 时重复拉取。
 _CUSTOM_FACE_CACHE_TTL = float(os.environ.get("ONEBOT_CUSTOM_FACE_CACHE_TTL", "60") or "60")
@@ -78,31 +65,6 @@ _CUSTOM_FACE_CACHE_TTL = float(os.environ.get("ONEBOT_CUSTOM_FACE_CACHE_TTL", "6
 def _custom_face_cache_key(bot: Any) -> str:
     # 断线重连会换 Bot 实例，id(bot) 既会泄漏条目又会被复用命中别人的缓存。
     return str(getattr(bot, "self_id", "") or id(bot))
-
-
-def _extract_reactions(text: str) -> tuple[str, List[str]]:
-    """从文本中提取 [REACT:emoji_id] 标记，返回 (清理后文本, emoji_id列表)。"""
-    reactions: List[str] = []
-
-    def _repl(m: re.Match) -> str:
-        inner = m.group(0)[7:-1].strip()  # 去掉 [REACT: 和 ]
-        if inner:
-            reactions.append(inner)
-        return ""
-
-    cleaned = _REACT_RE.sub(_repl, text).strip()
-    return cleaned, reactions
-
-
-# Markdown 在 QQ 中不会按预期渲染。以下规则只做轻量剥离，保留正文内容。
-_CODE_BLOCK_RE = re.compile(r"```(?:\w+)?\n?(.*?)```", re.DOTALL)
-_INLINE_CODE_RE = re.compile(r"`([^`]*)`")
-_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-_BOLD_RE = re.compile(r"\*\*(.*?)\*\*", re.DOTALL)
-_UNDERLINE_BOLD_RE = re.compile(r"__(.*?)__", re.DOTALL)
-_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", re.DOTALL)
-_UNDERLINE_ITALIC_RE = re.compile(r"(?<!_)_(?!_)(.*?)(?<!_)_(?!_)", re.DOTALL)
-_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*", re.MULTILINE)
 
 
 def _load_name_lines(path: str) -> List[str]:
@@ -219,33 +181,20 @@ def strip_output_markers(
     strip_underscore_styles: bool = False,
     strip_markdown_styles: bool | None = None,
 ) -> str:
-    """清理平台专用标记，并按配置选择是否剥离 Markdown 样式。
+    """清理 QQ 渲染不了的标记，并按配置摊平 Markdown 样式。
 
-    默认清理 ``*斜体*`` / ``**粗体**`` 的外层星号，但完整保留下划线。
-    单下划线常用于 PUB_CACHE、user_id 等标识符；解析它可能跨越多处标识符
-    并误删内容。``strip_markdown_styles`` 仅作为旧调用方的兼容总开关。
+    默认只去掉星号样式、完整保留下划线；``strip_markdown_styles`` 是旧调用方的总开关，给了就两者一起定。
     """
-    if not text:
-        return ""
-
     if strip_markdown_styles is not None:
         strip_asterisk_styles = strip_markdown_styles
         strip_underscore_styles = strip_markdown_styles
-
-    text = _CUSTOM_EMOJI_RE.sub("", text)
-    text = _REACT_RE.sub("", text)
-    text = _INBOUND_FACE_RE.sub("", text)
-    text = _CODE_BLOCK_RE.sub(lambda m: m.group(1), text)
-    text = _INLINE_CODE_RE.sub(lambda m: m.group(1), text)
-    text = _LINK_RE.sub(lambda m: f"{m.group(1)}（{m.group(2)}）", text)
-    if strip_asterisk_styles:
-        text = _BOLD_RE.sub(lambda m: m.group(1), text)
-        text = _ITALIC_RE.sub(lambda m: m.group(1), text)
-    if strip_underscore_styles:
-        text = _UNDERLINE_BOLD_RE.sub(lambda m: m.group(1), text)
-        text = _UNDERLINE_ITALIC_RE.sub(lambda m: m.group(1), text)
-    text = _HEADING_RE.sub("", text)
-    return text.strip()
+    return strip_markup(
+        text,
+        QQ_MARKERS,
+        keep_markdown=QQ_NAPCAT.capabilities.markdown,
+        asterisk_styles=strip_asterisk_styles,
+        underscore_styles=strip_underscore_styles,
+    )
 
 
 def _normalize_name(value: Any) -> str:
@@ -564,56 +513,27 @@ class EmojiRenderer:
         self.sticker_resolver = sticker_resolver
 
     def resolve_at_token(self, token: str) -> str:
-        """把 [at:xxx] 里的单个 token 解析为真实 QQ 号字符串。
-
-        解析优先级（2026-07-14 调整）：
-        - 纯数字：直接返回（视为真实 QQ 号）。
-        - 其余（含 all/全体成员 等关键字）：**先**调用 resolver 按别名/显示名/群昵称
-          反查真实用户；命中就 @ 那个人（避免昵称叫 all 的群友被误伤）。
-        - 反查不到且 token 是 @全体关键字：返回 "all"，交由上层生成 @全体成员。
-        - 其余反查失败：返回空串。
-        """
-        raw = str(token or "").strip()
-        if not raw:
-            return ""
-        # 兼容模型可能写成 [at:@UserA] 的情况。
-        if raw.startswith("@"):
-            raw = raw[1:].strip()
-        if not raw:
-            return ""
-        if raw.isdigit():
-            return raw
-        # 先按用户反查（包括昵称恰好叫 all 的情况）。
-        if self.at_alias_resolver is not None:
-            try:
-                resolved = self.at_alias_resolver(raw)
-            except Exception:
-                resolved = None
-            if resolved:
-                resolved = str(resolved).strip()
-                if resolved:
-                    return resolved
-        # 用户反查不到，且确实是 @全体关键字时，才视为 @全体成员。
-        if raw.lower() in _AT_ALL_KEYWORDS:
-            return "all"
-        return ""
+        """把 [at:] 里的一个名字解析成真实 QQ 号；全体成员返回 "all"，认不出返回空串。"""
+        return resolve_mention(token, self.at_alias_resolver, id_shape=QQ_NAPCAT.id_shape)
 
     def resolve_at_tokens(self, raw_token: str) -> List[Dict[str, str]]:
-        """把一个 [at:...] 标记内容拆成多个目标并逐个解析。
+        """一个 [at:] 里可以写几个名字，逐个解析；元素是 {"raw": 原名, "qq": QQ 号或空串}。"""
+        return [{"raw": part, "qq": self.resolve_at_token(part)} for part in split_mention_tokens(raw_token)]
 
-        2026-07-14 新增：支持“一条消息 @ 多个用户”。一个标记里可写多个
-        名字（逗号/顿号/分号分隔），每个名字独立反查真实 QQ 号。
-
-        返回每个子 token 的结果列表，元素为 {"raw": 原始子串, "qq": 解析后 QQ 号或空串}。
-        若整个标记不含分隔符，则列表只有一项（完全兼容单个 @）。
-        """
-        raw = str(raw_token or "").strip()
-        if not raw:
-            return []
-        parts = [p.strip() for p in _AT_TOKEN_SPLIT_RE.split(raw) if p.strip()]
-        if not parts:
-            parts = [raw]
-        return [{"raw": part, "qq": self.resolve_at_token(part)} for part in parts]
+    def mention_segments(self, piece: MentionPiece) -> List[Dict[str, str]]:
+        """一个提及标记渲染成的 at 段；认不出的名字留成「@名字」，几个 @ 之间补空格免得粘连。"""
+        if not piece.tokens:
+            return [{"type": "at", "qq": piece.platform_id}] if piece.platform_id else []
+        segments: List[Dict[str, str]] = []
+        for index, token in enumerate(piece.tokens):
+            qq_id = self.resolve_at_token(token)
+            if qq_id:
+                segments.append({"type": "at", "qq": qq_id})
+            else:
+                segments.append({"type": "text", "content": mention_as_text(token)})
+            if index < len(piece.tokens) - 1:
+                segments.append({"type": "text", "content": " "})
+        return segments
 
     def invalidate_custom_face_cache(self, bot: Any | None = None) -> None:
         """清空收藏表情详情缓存；添加/删除/改名收藏表情后调用。"""
@@ -732,15 +652,9 @@ class EmojiRenderer:
         strip_underscore_styles: bool = False,
         strip_markdown_styles: bool | None = None,
     ) -> List[Dict[str, Any]]:
-        """处理文本中的 QQ 收藏表情标记，返回可发送的消息段描述。
+        """把一条回复渲染成 OneBot 消息段描述：先剥掉渲染不了的写法，再按共享解析切出的段逐个渲染。
 
-        处理方式如下：
-        1. 先移除自定义表情标记、Reaction 标记和 Markdown 标记。
-        2. 遇到 [表情:name] / [emoji:name] / [QQ_EMOJI:name] 时拆分文本。
-        3. 通过 NapCat fetch_custom_face_detail 获取收藏表情详情，并按别名索引取图。
-
-        返回 dict 而不是直接返回 MessageSegment，是为了让该模块保持轻量，避免
-        在工具层直接依赖 NoneBot2 的消息段实现。
+        表情名先查收藏表情，查不到才问表情包库。返回 dict 而不是 MessageSegment，这个模块才不用依赖 NoneBot。
         """
         text = strip_output_markers(
             text,
@@ -749,94 +663,57 @@ class EmojiRenderer:
             strip_markdown_styles=strip_markdown_styles,
         )
         segments: List[Dict[str, Any]] = []
-        last_end = 0
         # 优先用持久化元数据里的 URL 直接发送，避免每条消息都拉 NapCat 详情。
         face_index: Dict[str, Any] | None = build_metadata_face_index(metadata) if metadata else None
         live_loaded = False
 
-        # 合并 QQ 收藏表情和 at 标记，按位置排序统一处理。
-        emoji_matches = [(m.start(), m.end(), "emoji", m) for m in _QQ_EMOJI_RE.finditer(text)]
-        at_matches = [(m.start(), m.end(), "at", m) for m in _AT_RE.finditer(text)]
-        all_matches = sorted(emoji_matches + at_matches, key=lambda x: x[0])
-
-        for start, end, match_type, match in all_matches:
-            before = text[last_end:start]
-            if before.strip():
-                segments.append({"type": "text", "content": before})
-
-            if match_type == "at":
-                # group(1) 匹配 [at:xxx]（xxx 可能是 QQ 号/别名/显示名，也可以是多个
-                # 名字用逗号/顿号/分号分隔）；group(2) 匹配旧格式 [CQ:at,qq=xxx]（仅数字）。
-                raw_token = match.group(1)
-                if raw_token is not None:
-                    # 支持一个标记 @ 多人：逐个拆分、解析、生成多个 at 段。
-                    resolved_list = self.resolve_at_tokens(raw_token)
-                    for idx, item in enumerate(resolved_list):
-                        qq_id = item.get("qq") or ""
-                        if qq_id:
-                            segments.append({"type": "at", "qq": qq_id})
-                        else:
-                            # 单个名字无法解析时保留可读文本，避免静默丢失。
-                            fallback = str(item.get("raw") or "").strip()
-                            if fallback:
-                                segments.append({"type": "text", "content": f"@{fallback}"})
-                        # 多个 @ 之间补一个空格，避免在部分客户端粘连成一块。
-                        if idx < len(resolved_list) - 1:
-                            segments.append({"type": "text", "content": " "})
-                else:
-                    qq_id = str(match.group(2) or "").strip()
-                    if qq_id:
-                        segments.append({"type": "at", "qq": qq_id})
-                last_end = end
+        for piece in tokenize(text, QQ_MARKERS):
+            if isinstance(piece, TextPiece):
+                segments.append({"type": "text", "content": piece.text})
+                continue
+            if isinstance(piece, MentionPiece):
+                segments.extend(self.mention_segments(piece))
                 continue
 
-            name = match.group(1).strip()
-            if name:
-                key = _normalize_name(name)
-                sticker_sha256 = ""
-                if face_index is None:
-                    face_index = await self._reply_face_index(bot, bqbs, preferred_names, metadata)
-                    live_loaded = True
+            name = piece.name
+            key = _normalize_name(name)
+            sticker_sha256 = ""
+            if face_index is None:
+                face_index = await self._reply_face_index(bot, bqbs, preferred_names, metadata)
+                live_loaded = True
+            entry = face_index.get(key)
+            # 元数据候选组：同名随机选一个 URL 直接发送。
+            url = _metadata_pick_url(entry) if isinstance(entry, dict) and "__group__" in entry else ""
+            face = None if (isinstance(entry, dict) and "__group__" in entry) else entry
+            if not url and face is None and not live_loaded:
+                # 元数据未命中时回退实时详情，兼容名称文件与收藏列表短暂不一致。
+                live_index = await self._reply_face_index(bot, bqbs, preferred_names, metadata)
+                face_index.update(live_index)
+                live_loaded = True
                 entry = face_index.get(key)
-                # 元数据候选组：同名随机选一个 URL 直接发送。
                 url = _metadata_pick_url(entry) if isinstance(entry, dict) and "__group__" in entry else ""
                 face = None if (isinstance(entry, dict) and "__group__" in entry) else entry
-                if not url and face is None and not live_loaded:
-                    # 元数据未命中时回退实时详情，兼容名称文件与收藏列表短暂不一致。
-                    live_index = await self._reply_face_index(bot, bqbs, preferred_names, metadata)
-                    face_index.update(live_index)
-                    live_loaded = True
-                    entry = face_index.get(key)
-                    url = _metadata_pick_url(entry) if isinstance(entry, dict) and "__group__" in entry else ""
-                    face = None if (isinstance(entry, dict) and "__group__" in entry) else entry
-                if not url:
-                    url = _custom_face_url(face) if face is not None else ""
-                if not url and self.sticker_resolver is not None:
-                    try:
-                        resolved = await self.sticker_resolver(name)
-                        if isinstance(resolved, ResolvedSticker):
-                            url = resolved.url
-                            sticker_sha256 = resolved.sha256
-                        elif isinstance(resolved, str):
-                            url = resolved
-                    except Exception:
-                        logger.warning("sticker resolve failed: %s", name, exc_info=True)
-                if url:
-                    # 标记 emoji=True：这是 QQ 收藏表情，发送时走 image 表情子类型
-                    # （sub_type=1），让客户端按小图/贴纸渲染，而不是普通大图。
-                    segment = {"type": "image", "url": url, "emoji": True}
-                    if sticker_sha256:
-                        segment["sticker_sha256"] = sticker_sha256
-                    segments.append(segment)
-                else:
-                    # 名字对不上说明是模型臆造的，留占位等于把内部格式发给用户，而提示词
-                    # 里正要求不要暴露它。丢掉标记只丢一个编出来的名字，留日志便于发现。
-                    logger.info("custom face not found, marker dropped: %s", name)
-
-            last_end = end
-
-        after = text[last_end:]
-        if after.strip():
-            segments.append({"type": "text", "content": after})
+            if not url:
+                url = _custom_face_url(face) if face is not None else ""
+            if not url and self.sticker_resolver is not None:
+                try:
+                    resolved = await self.sticker_resolver(name)
+                    if isinstance(resolved, ResolvedSticker):
+                        url = resolved.url
+                        sticker_sha256 = resolved.sha256
+                    elif isinstance(resolved, str):
+                        url = resolved
+                except Exception:
+                    logger.warning("sticker resolve failed: %s", name, exc_info=True)
+            if url:
+                # emoji=True 发送时变成 image 的 sub_type=1，客户端按表情小图渲染，不当普通大图。
+                segment = {"type": "image", "url": url, "emoji": True}
+                if sticker_sha256:
+                    segment["sticker_sha256"] = sticker_sha256
+                segments.append(segment)
+            else:
+                # 名字对不上说明是模型臆造的，留占位等于把内部格式发给用户，而提示词
+                # 里正要求不要暴露它。丢掉标记只丢一个编出来的名字，留日志便于发现。
+                logger.info("custom face not found, marker dropped: %s", name)
 
         return segments

@@ -18,6 +18,8 @@ if str(_TESTS) not in sys.path:
 
 from _onebot_harness import load_runtime, set_live_config  # noqa: E402
 
+from adapters._shared import outbound  # noqa: E402
+
 GROUP_ID = 700001
 USER_ID = 30003
 MESSAGE_ID = 99
@@ -126,7 +128,7 @@ def test_every_inbound_injects_one_shared_split_prompt(runtime: Any, entry: str)
     block = runtime.emotes._reply_format_prompt_block()
     assert text.count(block) == 1
     assert text.count("【QQ回复分条】") == 1
-    assert runtime.common._SPLIT_SIGNAL in block
+    assert outbound.SPLIT_MARKER in block
 
 
 def test_split_prompt_preserves_single_reply_and_formatted_content(runtime: Any) -> None:
@@ -137,12 +139,12 @@ def test_split_prompt_preserves_single_reply_and_formatted_content(runtime: Any)
         "简短接话", "只回一句", "只发一条",
     ):
         assert required in block
-    assert f"不使用 {runtime.common._SPLIT_SIGNAL}" in block
+    assert f"不使用 {outbound.SPLIT_MARKER}" in block
 
 
 def test_prompt_and_sender_use_the_same_split_signal(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     signal = "[QQ_TEST_SPLIT]"
-    monkeypatch.setattr(runtime.common, "_SPLIT_SIGNAL", signal)
+    monkeypatch.setattr(outbound, "SPLIT_MARKER", signal)
     block = runtime.emotes._reply_format_prompt_block()
     assert signal in block
     assert "[SPLIT]" not in block

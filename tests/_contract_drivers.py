@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Awaitable, Iterator
+from typing import Any, Awaitable, Iterator, Mapping
 
 import pytest
 
@@ -25,7 +25,8 @@ from _fake_platform import (
     ChatUser,
     FakeChatAdapter,
 )
-from _onebot_harness import load_runtime, set_live_config
+from _onebot_harness import live_config_module, load_runtime, set_live_config
+from adapters._shared.aliases import AliasBook
 from clonoth_sdk.state import SessionState
 from clonoth_sdk.types import InboundResult
 from platforms.builtin import QQ_NAPCAT
@@ -41,6 +42,10 @@ class Delivery:
     target: str
     text: str
     message_id: str
+    # 平台上真正提及了谁；写成文字的「@名字」不算。
+    mentions: tuple[str, ...] = ()
+    # 引用的消息 ID，没引用是空串。
+    reply_to: str = ""
 
 
 class FakeClonoth:
@@ -114,11 +119,21 @@ def _plain_text(message: Any) -> str:
     )
 
 
-class _NapCat:
-    """记录发送的 NapCat：每条发送记成 Delivery，可以预约下一次发送出错。"""
+def _segment_values(message: Any, kind: str, key: str) -> tuple[str, ...]:
+    if isinstance(message, str):
+        return ()
+    return tuple(
+        str(segment.get("data", {}).get(key, ""))
+        for segment in message if isinstance(segment, dict) and segment.get("type") == kind
+    )
 
-    def __init__(self, self_id: str) -> None:
+
+class _NapCat:
+    """记录发送的 NapCat：每条发送记成 Delivery，可以预约下一次发送出错；群成员列表按 members 回答。"""
+
+    def __init__(self, self_id: str, members: Mapping[str, str]) -> None:
         self.self_id = self_id
+        self.members = dict(members)
         self.sent: list[Delivery] = []
         self._faults: list[str] = []
 
@@ -129,7 +144,7 @@ class _NapCat:
 
     async def call_api(self, api: str, **kwargs: Any) -> Any:
         if api == "get_group_member_list":
-            return []
+            return [{"user_id": int(user), "nickname": name, "card": ""} for user, name in self.members.items()]
         return {}
 
     async def send_group_msg(self, *, group_id: Any, message: Any) -> dict[str, str]:
@@ -143,7 +158,11 @@ class _NapCat:
         if fault == FAULT_REFUSED:
             raise ConnectionRefusedError("connection refused")
         message_id = str(901 + len(self.sent))
-        self.sent.append(Delivery(kind, str(target), _plain_text(message), message_id))
+        self.sent.append(Delivery(
+            kind, str(target), _plain_text(message), message_id,
+            mentions=_segment_values(message, "at", "qq"),
+            reply_to=next(iter(_segment_values(message, "reply", "id")), ""),
+        ))
         if fault == FAULT_LOST_ACK:
             # NapCat 回执超时的原文：消息可能已经发出去了。
             raise RuntimeError("sendMsg timeout: network error")
@@ -187,8 +206,21 @@ class ContractDriver:
     def feature_host(self) -> Any:
         raise NotImplementedError
 
+    @property
+    def aliases(self) -> AliasBook:
+        raise NotImplementedError
+
+    @property
+    def text_limit(self) -> int:
+        """一条消息最多发多少字，0 表示不限。"""
+        return self.platform.capabilities.max_text_length
+
     def close(self) -> None:
         return None
+
+    def alias_of(self, user: str) -> str | None:
+        """模型认识这个人用的别名，还没分配过是 None。"""
+        return self.aliases.users.alias_of(user)
 
     @property
     def private_ids(self) -> frozenset[str]:
@@ -217,17 +249,29 @@ class QQDriver(ContractDriver):
             admin_users=[int(self.admin)],
             allowed_groups=[int(self.room), int(self.other_room)],
             enable_reactions=False,
+            reply_to_trigger=True,
         )
         self.client = FakeClonoth()
         self.session_state = SessionState()
         self.runtime.state._adapter.client = self.client
         self.runtime.state._adapter.session_state = self.session_state
-        self.bot = _NapCat(self.bot_account)
+        # 线上在启动钩子里注入这两个反查；驱动不跑启动钩子，它还会连 Clonoth、拉起表情包打标。
+        self.runtime.state._adapter.emoji.bind(
+            at_alias_resolver=self.runtime.anonymize._resolve_at_alias_to_real,
+            sticker_resolver=self.runtime.emotes._resolve_sticker,
+        )
+        self.bot = _NapCat(
+            self.bot_account, {user: self._nickname(user) for user in (self.bot_account, self.admin, self.member)},
+        )
         self.callbacks = self.runtime.callbacks.TangQiuCallbacks()
         self._private_matcher = _Matcher()
         monkeypatch.setattr(self.runtime.handlers, "_private_matcher", self._private_matcher)
         # 线上是连上 NapCat 就认账号；等第一条触发消息再认，会把认号前记下的群历史当成换号清掉。
         asyncio.run(self.runtime.lifecycle._on_bot_connect(self.bot))
+
+    @staticmethod
+    def _nickname(user: str) -> str:
+        return f"member-{user}"
 
     def _message(self, segments: list[Any]) -> Any:
         return self.runtime.state.Message(segments)
@@ -241,7 +285,7 @@ class QQDriver(ContractDriver):
             group_id=int(room or self.room), user_id=int(sender), message_id=int(message_id), time=int(time.time()),
             self_id=int(self.bot_account), message_type="group", sub_type="normal", raw_message=text,
             to_me=mention_bot, reply=None, anonymous=None,
-            sender=SimpleNamespace(user_id=int(sender), nickname=f"member-{sender}", card="", role="member"),
+            sender=SimpleNamespace(user_id=int(sender), nickname=self._nickname(sender), card="", role="member"),
             get_message=lambda: message,
         )
         permissions, handlers = self.runtime.permissions, self.runtime.handlers
@@ -282,6 +326,15 @@ class QQDriver(ContractDriver):
     def feature_host(self) -> Any:
         return self.runtime.state._adapter.features.host
 
+    @property
+    def aliases(self) -> AliasBook:
+        return self.runtime.state._adapter.aliases
+
+    @property
+    def text_limit(self) -> int:
+        # QQ 不在能力声明里写死字数，上限是 output.message_limit。
+        return live_config_module(self.runtime).live.message_limit
+
 
 class FakeChatDriver(ContractDriver):
     platform = FAKE_CHAT
@@ -317,7 +370,10 @@ class FakeChatDriver(ContractDriver):
 
     def delivered(self) -> list[Delivery]:
         return [
-            Delivery(CHANNEL_GROUP if posted.room else CHANNEL_PRIVATE, posted.room or posted.user, posted.text, posted.id)
+            Delivery(
+                CHANNEL_GROUP if posted.room else CHANNEL_PRIVATE, posted.room or posted.user, posted.text, posted.id,
+                mentions=posted.mentions, reply_to=posted.reply_to,
+            )
             for posted in self.server.posted
         ]
 
@@ -330,6 +386,10 @@ class FakeChatDriver(ContractDriver):
     @property
     def feature_host(self) -> Any:
         return self.adapter.features.host
+
+    @property
+    def aliases(self) -> AliasBook:
+        return self.adapter.aliases
 
     def close(self) -> None:
         self.adapter.close()

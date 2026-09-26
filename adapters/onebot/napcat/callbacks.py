@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from adapters._shared import capability
+from adapters._shared import capability, outbound
 from adapters._shared.approvals import DECISION_DENY
 from ..live_config import live
 from adapters._shared.send_guard import OutboundSendContext, SendContractError, context_from_sources
@@ -55,8 +55,7 @@ class TangQiuCallbacks:
         # 提取 [REACT:ID] 标记
         final_text = text or ""
         if final_text:
-            from ..emoji_handler import _extract_reactions
-            final_text, reactions = _extract_reactions(final_text)
+            final_text, reactions = outbound.extract_reactions(final_text)
             if reactions:
                 await self.add_reactions(trigger, reactions)
         source_attachments = platform_data.get("_source_attachments")
@@ -115,8 +114,7 @@ class TangQiuCallbacks:
         outbound_attachments._apply_delivery_context(target, send_context)
         await state._adapter.features.check_send(bot, target)
         # 提取 [REACT:ID] 标记
-        from ..emoji_handler import _extract_reactions
-        text, reactions = _extract_reactions(text)
+        text, reactions = outbound.extract_reactions(text)
         if reactions:
             await self.add_reactions(trigger, reactions)
         if text:
@@ -329,13 +327,9 @@ class TangQiuCallbacks:
         # 最终回复还会各解析一次。按触发消息记账，贴上一个就不再贴。
         if platform_data.get("_react_done"):
             return
-        for emoji_id in reactions:
-            eid = str(emoji_id or "").strip()
-            if eid not in common._REACT_MODEL_EMOJIS:
-                continue
-            if await outbound_attachments._set_message_react(bot, event, eid, True):
-                platform_data["_react_done"] = True
-            break
+        emoji_id = outbound.pick_reaction(reactions, common._REACT_MODEL_EMOJIS)
+        if emoji_id and await outbound_attachments._set_message_react(bot, event, emoji_id, True):
+            platform_data["_react_done"] = True
 
     async def on_task_created(self, trigger: TriggerInfo, task_id: str) -> None:
         return None

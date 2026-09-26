@@ -11,6 +11,7 @@ import time
 from typing import Any, Awaitable, Callable, Dict, List
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
 from nonebot.adapters.onebot.v11.exception import ActionFailed
+from adapters._shared import outbound
 from ..config import ONEBOT_IDEMPOTENCY_FALLBACK_SENT_TTL_SECONDS
 from ..live_config import live
 from adapters._shared.send_guard import (
@@ -36,12 +37,12 @@ from . import common, emotes, identity, media, state
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
 
+_TRUNCATED_NOTICE = "\n（内容过长，已截断）"
+
+
 def _truncate_qq_text(text: str) -> str:
     """限制单条 QQ 消息长度，避免超过 OneBot 实现的消息上限。"""
-    if len(text) <= live.message_limit:
-        return text
-    suffix = "\n（内容过长，已截断）"
-    return text[: live.message_limit - len(suffix)] + suffix
+    return outbound.truncate_text(text, live.message_limit, suffix=_TRUNCATED_NOTICE)
 
 
 def _message_from_processed_segments(segments: List[Dict[str, Any]]) -> Message:
@@ -493,7 +494,7 @@ async def _send_split_text(
     # _send_qq_message 处理，确保私聊也能复用表情替换和分段发送能力。
     await state._adapter.features.check_send(bot, target)
     sent_any = False
-    parts = text.split(common._SPLIT_SIGNAL) if text else []
+    parts = outbound.split_reply(text)
     conversation_key = emotes._sticker_conversation_key(target, bot)
     conversation_token = state._adapter.sticker_send_conversation.set(conversation_key)
     selected_token = state._adapter.sticker_selected.set(set())

@@ -19,9 +19,6 @@ driver = get_driver()
 _CST = dt.timezone(dt.timedelta(hours=8))
 
 
-_SPLIT_SIGNAL = "[SPLIT]"
-
-
 _IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
 
 

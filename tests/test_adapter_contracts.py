@@ -1,6 +1,6 @@
 """适配器契约：任何平台都要过的一组断言，QQ 与只在测试里存在的 fakechat 各跑一遍。
 
-只断言平台无关的事：提交字段与身份、外部平台硬规则、发送防重、审批、上下文重置、提醒回执。文案与协议细节归各平台自己的测试。
+只断言平台无关的事：提交字段与身份、外部平台硬规则、发送防重、出站渲染与降级、审批、上下文重置、提醒回执。文案与协议细节归各平台自己的测试。
 """
 from __future__ import annotations
 
@@ -20,9 +20,10 @@ _TESTS = Path(__file__).resolve().parent
 if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
-from _contract_drivers import DRIVERS, ContractDriver, open_driver, registered_fake_platform  # noqa: E402
+from _contract_drivers import DRIVERS, ContractDriver, Delivery, open_driver, registered_fake_platform  # noqa: E402
 from _fake_platform import FAULT_HANG, FAULT_LOST_ACK, FAULT_REFUSED  # noqa: E402
 from adapters._shared.feature_gateway import FeatureHost, QuietDeliveryDeferred  # noqa: E402
+from adapters._shared.outbound import EVERYONE  # noqa: E402
 from adapters._shared.send_guard import SendError  # noqa: E402
 from clonoth_sdk.callbacks import AdapterCallbacks  # noqa: E402
 from clonoth_sdk.state import TriggerInfo  # noqa: E402
@@ -309,6 +310,104 @@ class TestSendGuard:
         asyncio.run(scenario())
 
         assert _texts(driver, CHANNEL_GROUP, driver.room) == ["ok", "ok"]
+
+
+class TestOutboundRendering:
+    """模型回复里的标记按能力声明渲染；平台做不到的退回可读文字或者丢掉，标记本身不会漏到聊天里。"""
+
+    @staticmethod
+    async def _reply(driver: ContractDriver, trigger: TriggerInfo, text: str, key: str) -> list[Delivery]:
+        before = len(driver.delivered_to(CHANNEL_GROUP, driver.room))
+        context = DeliveryContext(
+            idempotency_key=key, conversation_key=trigger.conversation_key, source_inbound_seq=trigger.inbound_seq,
+        )
+        await driver.callbacks.send_reply(trigger, text, [], delivery_context=context)
+        return driver.delivered_to(CHANNEL_GROUP, driver.room)[before:]
+
+    def _mention_pair(self, driver: ContractDriver, text: str) -> tuple[Delivery, Delivery]:
+        """同一个触发下先发一条普通回复再发 text：有的平台引用时顺带提及原作者，比的是多出来的提及。"""
+        async def scenario() -> tuple[Delivery, Delivery]:
+            trigger = await _group_trigger(driver)
+            [plain] = await self._reply(driver, trigger, "noted", "plain")
+            [marked] = await self._reply(driver, trigger, text, "marked")
+            return plain, marked
+
+        return asyncio.run(scenario())
+
+    def _single(self, driver: ContractDriver, text: str) -> Delivery:
+        async def scenario() -> list[Delivery]:
+            return await self._reply(driver, await _group_trigger(driver), text, "single")
+
+        [sent] = asyncio.run(scenario())
+        return sent
+
+    def test_split_markers_become_separate_messages_within_the_platform_limit(self, driver: ContractDriver) -> None:
+        async def scenario() -> list[Delivery]:
+            return await self._reply(driver, await _group_trigger(driver), "one[SPLIT]two[SPLIT]three[SPLIT]four", "split")
+
+        texts = [delivery.text.strip() for delivery in asyncio.run(scenario())]
+
+        most = driver.platform.capabilities.max_split_parts
+        assert len(texts) == (min(4, most) if most else 4)
+        assert not any("[SPLIT]" in text for text in texts)
+        assert " ".join(texts).split() == ["one", "two", "three", "four"]
+
+    def test_only_the_first_message_quotes_the_trigger(self, driver: ContractDriver) -> None:
+        async def scenario() -> list[Delivery]:
+            return await self._reply(driver, await _group_trigger(driver, message_id="101"), "first[SPLIT]second", "quote")
+
+        quotes = [delivery.reply_to for delivery in asyncio.run(scenario())]
+
+        assert quotes == (["101", ""] if driver.platform.capabilities.quote else ["", ""])
+
+    def test_markdown_is_kept_only_where_the_platform_renders_it(self, driver: ContractDriver) -> None:
+        text = "**bold** and `code`"
+
+        sent = self._single(driver, text)
+
+        assert sent.text.strip() == (text if driver.platform.capabilities.markdown else "bold and code")
+
+    def test_a_mention_by_alias_reaches_the_real_account(self, driver: ContractDriver) -> None:
+        asyncio.run(driver.group_message("I will handle it", sender=driver.admin, message_id="100"))
+        alias = driver.alias_of(driver.admin)
+        assert alias, "someone who spoke in the room has an alias the model can use"
+
+        plain, marked = self._mention_pair(driver, f"[at:{alias}] please take a look")
+
+        assert set(marked.mentions) - set(plain.mentions) == {driver.admin}
+        assert alias not in marked.text and "please take a look" in marked.text
+
+    def test_an_unknown_name_stays_readable_and_mentions_no_one(self, driver: ContractDriver) -> None:
+        plain, marked = self._mention_pair(driver, "[at:NoSuchPerson] hello")
+
+        assert set(marked.mentions) == set(plain.mentions)
+        assert "@NoSuchPerson" in marked.text
+
+    def test_everyone_is_mentioned_only_where_the_platform_allows_it(self, driver: ContractDriver) -> None:
+        plain, marked = self._mention_pair(driver, "[at:all] meeting now")
+
+        added = set(marked.mentions) - set(plain.mentions)
+        if driver.platform.capabilities.mention_everyone:
+            assert added == {EVERYONE}
+        else:
+            assert added == set() and "@all" in marked.text
+
+    def test_a_reaction_marker_never_reaches_the_chat(self, driver: ContractDriver) -> None:
+        assert self._single(driver, "fine[REACT:76]").text.strip() == "fine"
+
+    def test_an_emoji_the_platform_cannot_find_is_dropped(self, driver: ContractDriver) -> None:
+        assert self._single(driver, "look[表情:no-such-face]").text.strip() == "look"
+
+    def test_an_overlong_message_is_cut_to_the_platform_limit(self, driver: ContractDriver) -> None:
+        limit = driver.text_limit
+        text = "x" * ((limit or 4000) + 100)
+
+        body = self._single(driver, text).text.strip()
+
+        if limit:
+            assert len(body) <= limit and body.startswith("x" * (limit // 2))
+        else:
+            assert body == text
 
 
 class TestApprovalFlow:
