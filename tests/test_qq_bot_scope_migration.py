@@ -1,32 +1,29 @@
 """按 bot 账号隔离会话与记忆的契约，以及整体搬迁到另一个号的行为。"""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
 import json
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-
-def _load(name: str, package: str = "onebot"):
-    spec = importlib.util.spec_from_file_location(
-        f"_test_{name}", _ROOT / "adapters" / package / f"{name}.py",
-    )
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[f"_test_{name}"] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-ch = _load("conversation_hash", "_shared")
-bot_scope = _load("bot_scope")
+from adapters._shared import conversation_hash as ch  # noqa: E402
+from adapters._shared.active_account import ActiveAccountStore, normalize_account  # noqa: E402
+from platforms.builtin import QQ_NAPCAT  # noqa: E402
+import supervisor.admin_api as admin_api  # noqa: E402
+from supervisor.api import create_app  # noqa: E402
+from supervisor.config_store import ConfigStore  # noqa: E402
+from supervisor.eventlog import EventLog  # noqa: E402
+from supervisor.policy import PolicyEngine  # noqa: E402
+from supervisor.state import SupervisorState  # noqa: E402
 
 _migrate_spec = importlib.util.spec_from_file_location(
     "_test_migrate_scope", _ROOT / "deploy" / "migrate_qq_bot_scope.py",
@@ -40,6 +37,10 @@ _SECRET = "a" * 64
 _REAL = "qq_group:123456789"
 _OLD_BOT = "10000001"
 _NEW_BOT = "10000002"
+
+
+def _store(workspace: Path) -> ActiveAccountStore:
+    return ActiveAccountStore(QQ_NAPCAT, workspace)
 
 
 def _ns(stable: str) -> str:
@@ -74,7 +75,7 @@ def _seed(tmp_path: Path, *, scope: str = "") -> dict:
     (data / "attachments" / stable.replace(":", "_")).mkdir(parents=True)
     (data / "attachments" / stable.replace(":", "_") / "a.png").write_bytes(b"x")
     if scope:
-        bot_scope.save_scope(tmp_path, scope)
+        _store(tmp_path).save(scope)
     return {"stable": stable, "ns": ns}
 
 
@@ -97,30 +98,30 @@ class TestScopedDigest:
 
     def test_a_non_numeric_self_id_is_refused_rather_than_hashed(self) -> None:
         # 拿到脏 self_id 就加作用域，等于把记忆分叉进一个再也算不回来的命名空间。
-        assert bot_scope.normalize("not-a-qq") == ""
-        assert bot_scope.normalize(None) == ""
-        assert bot_scope.normalize(" 12345 ") == "12345"
+        assert normalize_account("not-a-qq", QQ_NAPCAT) == ""
+        assert normalize_account(None, QQ_NAPCAT) == ""
+        assert normalize_account(" 12345 ", QQ_NAPCAT) == "12345"
 
 
 class TestScopeFile:
     def test_a_missing_file_reads_as_no_scope(self, tmp_path: Path) -> None:
-        assert bot_scope.load_scope(tmp_path) == ""
+        assert _store(tmp_path).load() == ""
 
     def test_a_corrupt_file_degrades_instead_of_guessing(self, tmp_path: Path) -> None:
         (tmp_path / "data").mkdir()
-        bot_scope.scope_file(tmp_path).write_text("{not json", encoding="utf-8")
-        assert bot_scope.load_scope(tmp_path) == ""
+        _store(tmp_path).path.write_text("{not json", encoding="utf-8")
+        assert _store(tmp_path).load() == ""
 
     def test_saving_reports_whether_the_account_actually_changed(self, tmp_path: Path) -> None:
-        assert bot_scope.save_scope(tmp_path, _OLD_BOT) is True
-        assert bot_scope.save_scope(tmp_path, _OLD_BOT) is False
-        assert bot_scope.save_scope(tmp_path, _NEW_BOT) is True
-        assert bot_scope.load_scope(tmp_path) == _NEW_BOT
+        assert _store(tmp_path).save(_OLD_BOT) is True
+        assert _store(tmp_path).save(_OLD_BOT) is False
+        assert _store(tmp_path).save(_NEW_BOT) is True
+        assert _store(tmp_path).load() == _NEW_BOT
 
     def test_an_empty_self_id_never_erases_a_known_scope(self, tmp_path: Path) -> None:
-        bot_scope.save_scope(tmp_path, _OLD_BOT)
-        assert bot_scope.save_scope(tmp_path, "") is False
-        assert bot_scope.load_scope(tmp_path) == _OLD_BOT
+        _store(tmp_path).save(_OLD_BOT)
+        assert _store(tmp_path).save("") is False
+        assert _store(tmp_path).load() == _OLD_BOT
 
 
 class TestScopeMigration:
@@ -131,7 +132,7 @@ class TestScopeMigration:
         )
         assert report.changed_renames
         assert (tmp_path / "data" / "memory" / seed["ns"]).is_dir()
-        assert bot_scope.load_scope(tmp_path) == ""
+        assert _store(tmp_path).load() == ""
 
     def test_apply_moves_memory_hitcache_route_sessions_and_attachments(self, tmp_path: Path) -> None:
         seed = _seed(tmp_path)
@@ -154,7 +155,7 @@ class TestScopeMigration:
         sessions = json.loads((data / "sessions.json").read_text(encoding="utf-8"))
         assert sessions["sessions"]["sid-1"]["conversation_key"] == new_stable
         assert (data / "attachments" / new_stable.replace(":", "_") / "a.png").is_file()
-        assert bot_scope.load_scope(tmp_path) == _NEW_BOT
+        assert _store(tmp_path).load() == _NEW_BOT
         assert report.backup_dir is not None and report.backup_dir.is_dir()
 
     def test_the_backup_holds_the_pre_migration_memory(self, tmp_path: Path) -> None:
@@ -168,7 +169,7 @@ class TestScopeMigration:
     def test_the_source_is_detected_when_the_recorded_account_disagrees(self, tmp_path: Path) -> None:
         # 存量数据没有作用域，而 bot 一登录就把当前号记下了，两者天然对不上。
         seed = _seed(tmp_path)
-        bot_scope.save_scope(tmp_path, _OLD_BOT)
+        _store(tmp_path).save(_OLD_BOT)
         assert migrate.detect_source_scope(tmp_path, _SECRET) == ""
 
         report = migrate.run_scope_migration(
@@ -180,7 +181,7 @@ class TestScopeMigration:
 
     def test_an_unrecognisable_source_refuses_to_guess(self, tmp_path: Path) -> None:
         _seed(tmp_path, scope="70000009")
-        bot_scope.save_scope(tmp_path, _OLD_BOT)
+        _store(tmp_path).save(_OLD_BOT)
         assert migrate.detect_source_scope(tmp_path, _SECRET) is None
         with pytest.raises(migrate.ScopeMismatch):
             migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=True)
@@ -192,7 +193,7 @@ class TestScopeMigration:
                 workspace=tmp_path, target_scope=_NEW_BOT, source_scope="999", apply=True,
             )
         assert (tmp_path / "data" / "memory" / seed["ns"]).is_dir()
-        assert bot_scope.load_scope(tmp_path) == _OLD_BOT
+        assert _store(tmp_path).load() == _OLD_BOT
 
     def test_a_second_run_is_idempotent(self, tmp_path: Path) -> None:
         _seed(tmp_path)
@@ -214,7 +215,7 @@ class TestScopeMigration:
             )
         memory = tmp_path / "data" / "memory"
         assert (memory / seed["ns"] / "book.yaml").is_file()
-        assert bot_scope.load_scope(tmp_path) == _OLD_BOT
+        assert _store(tmp_path).load() == _OLD_BOT
         assert sorted(p.name for p in memory.glob("conv_*")) == [seed["ns"]]
 
     def test_an_unmapped_namespace_dir_is_left_alone_and_reported(self, tmp_path: Path) -> None:
@@ -233,3 +234,40 @@ class TestScopeMigration:
             migrate.run_scope_migration(
                 workspace=tmp_path, target_scope="not-a-qq", source_scope="", apply=True,
             )
+
+
+class TestSupervisorScopeQuery:
+    _TOKEN = "scope-admin-token"
+
+    def _get(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, url: str) -> httpx.Response:
+        monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", self._TOKEN)
+        monkeypatch.setattr(admin_api, "_admin_token", "")
+        app = create_app(
+            state=SupervisorState(
+                workspace_root=tmp_path,
+                eventlog=EventLog(tmp_path / "data" / "events.jsonl", run_id="run-qq-scope"),
+                policy=PolicyEngine(workspace_root=tmp_path),
+            ),
+            process_manager=None,
+            config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"),
+        )
+
+        async def go() -> httpx.Response:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as http:
+                return await http.get(url, headers={"Authorization": f"Bearer {self._TOKEN}"})
+
+        return asyncio.run(go())
+
+    def test_the_script_reads_the_account_the_bot_recorded(self, tmp_path: Path) -> None:
+        assert migrate.recorded_scope(tmp_path) == ""
+        _store(tmp_path).save(_OLD_BOT)
+        assert migrate.recorded_scope(tmp_path) == _OLD_BOT
+
+    def test_the_console_sees_the_recorded_account(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _store(tmp_path).save(_OLD_BOT)
+
+        response = self._get(tmp_path, monkeypatch, "/v1/admin/qq/scope")
+
+        assert response.status_code == 200
+        assert response.json() == {"current_scope": _OLD_BOT, "live_scope": "", "bot_alive": False, "preview": None}

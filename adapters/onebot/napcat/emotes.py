@@ -14,8 +14,6 @@ from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 from platforms.ids import normalize_id
 from platforms.inbound import InboundFacts
 from ..config import CLONOTH_WORKSPACE, CUSTOM_FACE_METADATA_PATH, CUSTOM_FACE_NAMES_PATH
-from .. import bot_scope as _bot_scope
-from adapters._shared.conversation_hash import digest as _digest_conversation_key
 from ..live_config import live
 from adapters._shared.send_guard import OutboundSendContext
 from ..emoji_handler import (
@@ -123,12 +121,9 @@ def _sticker_conversation_key(target: Dict[str, Any], bot: Bot | None = None) ->
     if kind is None:
         return ""
     prefix = "qq_group" if kind[0] == "group" else "qq_private"
-    scope = _bot_scope.normalize(getattr(bot, "self_id", None))
+    scope = state._adapter.active_account_store.normalize(getattr(bot, "self_id", None))
     if scope:
-        digest = _digest_conversation_key(
-            f"{prefix}:{kind[1]}", anonymize._CONVERSATION_SECRET, bot_scope=scope,
-        )
-        return f"{prefix}:{digest}"
+        return anonymize.CONVERSATION_KEYS.stable_key(f"{prefix}:{kind[1]}", bot_scope=scope)
     return routing._stable_conversation_key(f"{prefix}:{kind[1]}")
 
 

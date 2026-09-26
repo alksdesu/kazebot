@@ -4,12 +4,12 @@ from __future__ import annotations
 import logging
 import asyncio
 import datetime as dt
-import hashlib
 import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from nonebot.adapters.onebot.v11 import Bot, Event
+from engine.conversation_migration import namespace_dir
 from engine.memory_hit_cache import prune_namespace_hits
 from ..config import CLONOTH_WORKSPACE, CUSTOM_FACE_METADATA_PATH, CUSTOM_FACE_NAMES_PATH
 from adapters._shared import capability
@@ -586,12 +586,10 @@ def _conversation_memory_namespace_for_group(group_id: int) -> str:
     落盘用的是稳定哈希 key 的摘要，不是真实群号的摘要：engine 侧收到的
     conversation_key 已经被 _stable_conversation_key 换成 qq_group:<digest>，
     knowledge_inject 再对它做一次 SHA256。少算这一层就会去删一个从不存在的目录。
-    这里直接调 _conversation_digest 而非 _stable_conversation_key，后者会顺带
+    这里用 _scoped_stable_key 而非 _stable_conversation_key，后者会顺带
     给群分配匿名别名。
     """
-    stable_key = f"qq_group:{routing._conversation_digest(f'qq_group:{int(group_id)}')}"
-    digest = hashlib.sha256(stable_key.encode("utf-8")).hexdigest()[:24]
-    return f"conv_{digest}"
+    return namespace_dir(routing._scoped_stable_key(f"qq_group:{int(group_id)}"))
 
 
 def _clear_group_memory_namespace(group_id: int) -> tuple[bool, int]:

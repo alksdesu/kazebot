@@ -6,6 +6,7 @@ SDK 水位、发送身份都要认得它们，而 QQ 的数字 ID 走哪条路�
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,8 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from adapters._shared import capability, trigger_policy  # noqa: E402
-from adapters.onebot import bot_scope, forward_authz  # noqa: E402
+from adapters._shared.active_account import ActiveAccountStore, normalize_account  # noqa: E402
+from adapters.onebot import forward_authz  # noqa: E402
 from adapters._shared.send_guard import SendContractError  # noqa: E402
 from adapters.onebot.send_contract import (  # noqa: E402
     make_idempotency_key,
@@ -23,7 +25,8 @@ from adapters.onebot.send_contract import (  # noqa: E402
     target_identity,
 )
 from clonoth_sdk.state import SessionState, TriggerInfo, channel_key  # noqa: E402
-from platforms.descriptor import ID_NUMERIC, ID_STRING  # noqa: E402
+from platforms.builtin import QQ_NAPCAT  # noqa: E402
+from platforms.descriptor import ID_NUMERIC, ID_STRING, STATE_ACTIVE_ACCOUNT, PlatformDescriptor  # noqa: E402
 from platforms.ids import normalize_id, same_id  # noqa: E402
 from stickers.collect import CollectConfig  # noqa: E402
 
@@ -69,20 +72,35 @@ class TestNormalize:
         assert not same_id("0123", 123)
 
 
-class TestBotScope:
+_STRING_PLATFORM = PlatformDescriptor(
+    id="probe", display_name="Probe", short_name="Probe", id_shape=ID_STRING,
+    state_files={STATE_ACTIVE_ACCOUNT: "probe_active_account.json"},
+)
+
+
+class TestActiveAccountStore:
     def test_qq_accounts_stay_numeric(self) -> None:
         # NapCat 的账号恒为纯数字：脏值宁可不加作用域，也不能分叉进算不回来的命名空间。
-        assert bot_scope.normalize("12345") == "12345"
-        assert bot_scope.normalize("not-a-qq") == ""
+        assert normalize_account("12345", QQ_NAPCAT) == "12345"
+        assert normalize_account("not-a-qq", QQ_NAPCAT) == ""
 
     def test_string_accounts_are_kept_when_the_platform_says_so(self) -> None:
-        assert bot_scope.normalize(_OPENID, shape=ID_STRING) == _OPENID
+        assert normalize_account(_OPENID, _STRING_PLATFORM) == _OPENID
 
     def test_a_string_account_round_trips_through_the_scope_file(self, tmp_path: Path) -> None:
-        assert bot_scope.save_scope(tmp_path, _OPENID, shape=ID_STRING) is True
-        assert bot_scope.load_scope(tmp_path, shape=ID_STRING) == _OPENID
+        store = ActiveAccountStore(_STRING_PLATFORM, tmp_path)
+        assert store.save(_OPENID) is True
+        assert store.load() == _OPENID
         # 同一份文件按数字形状读，读不出合法账号就退化成不加作用域。
-        assert bot_scope.load_scope(tmp_path) == ""
+        assert ActiveAccountStore(replace(_STRING_PLATFORM, id_shape=ID_NUMERIC), tmp_path).load() == ""
+
+    def test_the_file_name_comes_from_the_platform(self, tmp_path: Path) -> None:
+        # 旧文件名不动：换了名字，已登记的账号读不回来，会话键就落回空作用域。
+        assert ActiveAccountStore(QQ_NAPCAT, tmp_path).path == tmp_path / "data" / "onebot_active_bot.json"
+
+    def test_a_platform_without_an_account_file_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(LookupError):
+            ActiveAccountStore(replace(_STRING_PLATFORM, state_files={}), tmp_path)
 
 
 class TestRequester:

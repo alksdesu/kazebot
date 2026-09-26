@@ -12,6 +12,8 @@ import re
 import secrets
 from pathlib import Path
 
+from platforms.descriptor import CHANNEL_OTHER, ChannelDescriptor, PlatformDescriptor
+
 logger = logging.getLogger(__name__)
 
 # 已有历史状态的部署里，密钥文件写这个标记，把它钉在无盐摘要上。
@@ -39,6 +41,35 @@ def digest(conversation_key: str, secret: str, *, bot_scope: str = "") -> str:
     if key:
         return hmac.new(key, raw, hashlib.sha256).hexdigest()[:24]
     return hashlib.sha256(raw).hexdigest()[:24]
+
+
+class ConversationKeys:
+    """真实会话键 → 交给核心的稳定键：渠道前缀取平台声明，摘要拌进密钥和账号作用域。"""
+
+    __slots__ = ("_hashed", "_fallback", "_secret")
+
+    def __init__(self, platform: PlatformDescriptor, secret: str) -> None:
+        hashed = tuple(channel for channel in platform.channels if channel.hashed)
+        fallback = next((channel for channel in hashed if channel.kind == CHANNEL_OTHER), None)
+        if fallback is None:
+            raise ValueError(f"platform {platform.id!r} declares no hashed channel for unrecognized conversations")
+        self._hashed = hashed
+        self._fallback = fallback
+        self._secret = secret
+
+    def channel_of(self, real_key: str) -> ChannelDescriptor:
+        """真实会话键落在哪个渠道。不做摘要的渠道和认不出的前缀都归兜底渠道。"""
+        return next(
+            (channel for channel in self._hashed if real_key.startswith(f"{channel.name}:")), self._fallback,
+        )
+
+    def stable_key(self, real_key: str, *, bot_scope: str = "") -> str:
+        return f"{self.channel_of(real_key).name}:{digest(real_key, self._secret, bot_scope=bot_scope)}"
+
+
+def rekey(old_stable: str, real_key: str, secret: str, *, bot_scope: str = "") -> str:
+    """离线迁移用：保留旧稳定键的渠道前缀，只按新的密钥或作用域重算摘要。"""
+    return f"{old_stable.split(':', 1)[0]}:{digest(real_key, secret, bot_scope=bot_scope)}"
 
 
 def has_digest_derived_state(workspace: Path, route_state_file: Path) -> bool:

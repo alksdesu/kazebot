@@ -1547,7 +1547,7 @@ def create_app(
         st: SupervisorState = app.state.state
         migration = _scope_migration()
         bot_alive, live_scope = _bot_liveness(st)
-        current = migration._bot_scope.load_scope(st.workspace_root)
+        current = migration.recorded_scope(st.workspace_root)
         payload: dict[str, Any] = {
             "current_scope": current,
             "live_scope": live_scope,

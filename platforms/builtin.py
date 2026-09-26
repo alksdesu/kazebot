@@ -8,6 +8,7 @@ from .descriptor import (
     CHANNEL_PRIVATE,
     HOOK_TRIGGER_POLICY,
     ID_NUMERIC,
+    STATE_ACTIVE_ACCOUNT,
     STATE_ALIASES,
     STATE_LIVE,
     STATE_ROUTES,
@@ -34,6 +35,7 @@ QQ_NAPCAT = PlatformDescriptor(
         STATE_LIVE: "qq_live_state.json",
         STATE_ROUTES: "onebot_plugin_state.json",
         STATE_ALIASES: "onebot_anon_map.json",
+        STATE_ACTIVE_ACCOUNT: "onebot_active_bot.json",
     },
     hooks={HOOK_TRIGGER_POLICY: "adapters._shared.trigger_policy"},
 )

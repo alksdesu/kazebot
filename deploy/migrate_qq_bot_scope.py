@@ -15,12 +15,12 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 
-# 摘要算法与账号作用域必须与运行时同一份，所以直接用适配器的模块。
-from adapters.onebot import bot_scope as _bot_scope  # noqa: E402
+# 摘要算法与账号作用域必须与运行时同一份，所以直接用共享层的模块。
 from adapters._shared import conversation_hash as _conversation_hash  # noqa: E402
+from adapters._shared.active_account import ActiveAccountStore, normalize_account  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 
-digest = _conversation_hash.digest
+rekey = _conversation_hash.rekey
 LEGACY_MARKER = _conversation_hash.LEGACY_MARKER
 
 from engine.conversation_migration import (  # noqa: E402
@@ -65,12 +65,17 @@ def read_secret(workspace: Path) -> str:
     return "" if content == LEGACY_MARKER else content
 
 
+def recorded_scope(workspace: Path) -> str:
+    """bot 上次记下的当前账号。supervisor 的归属查询读的也是这一份。"""
+    return ActiveAccountStore(QQ_NAPCAT, Path(workspace)).load()
+
+
 def scope_matches(workspace: Path, secret: str, scope: str) -> bool:
     """盘上的会话键是不是按这个账号算出来的。路由表为空时无从判断，一律算匹配。"""
     return not [
         old_stable
         for old_stable, real in load_route_map(route_state_file(workspace, QQ_NAPCAT)).items()
-        if old_stable != f"{old_stable.split(':', 1)[0]}:{digest(real, secret, bot_scope=scope)}"
+        if old_stable != rekey(old_stable, real, secret, bot_scope=scope)
     ]
 
 
@@ -80,7 +85,7 @@ def detect_source_scope(workspace: Path, secret: str) -> str | None:
     记录的当前账号未必就是数据的归属：加账号隔离之前攒的数据没有作用域，而 bot
     一登录就把当前号记下来了，两者天然对不上。
     """
-    recorded = _bot_scope.load_scope(workspace)
+    recorded = recorded_scope(workspace)
     seen: list[str] = []
     for candidate in (recorded, "", *_known_accounts(workspace)):
         if candidate in seen:
@@ -110,7 +115,7 @@ def verify_source_scope(workspace: Path, secret: str, source_scope: str) -> None
     mismatched = [
         old_stable
         for old_stable, real in load_route_map(route_state_file(workspace, QQ_NAPCAT)).items()
-        if old_stable != f"{old_stable.split(':', 1)[0]}:{digest(real, secret, bot_scope=source_scope)}"
+        if old_stable != rekey(old_stable, real, secret, bot_scope=source_scope)
     ]
     if mismatched:
         raise ScopeMismatch(
@@ -132,8 +137,8 @@ def run_scope_migration(
             raise ScopeMismatch("认不出盘上这批会话键属于哪个账号，用 --from 显式指定")
         source = detected
     else:
-        source = _bot_scope.normalize(source_scope)
-    target = _bot_scope.normalize(target_scope)
+        source = normalize_account(source_scope, QQ_NAPCAT)
+    target = normalize_account(target_scope, QQ_NAPCAT)
     if not target:
         raise ValueError("--to 必须是目标 bot 的 QQ 号（纯数字）")
 
@@ -145,9 +150,7 @@ def run_scope_migration(
     plan = plan_migration(
         workspace=workspace,
         platform=QQ_NAPCAT,
-        restable=lambda old_stable, real: (
-            f"{old_stable.split(':', 1)[0]}:{digest(real, secret, bot_scope=target)}"
-        ),
+        restable=lambda old_stable, real: rekey(old_stable, real, secret, bot_scope=target),
     )
     report.renames = plan.renames
     report.missing_source_dirs = plan.missing_source_dirs
@@ -171,7 +174,7 @@ def run_scope_migration(
 
     # 作用域写在最后：前面抛异常就不会到这里，bot 仍按旧作用域启动，脚本可重跑。
     if adopt:
-        report.scope_written = _bot_scope.save_scope(workspace, target)
+        report.scope_written = ActiveAccountStore(QQ_NAPCAT, workspace).save(target)
     return report
 
 

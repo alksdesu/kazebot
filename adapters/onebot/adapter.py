@@ -10,10 +10,11 @@ from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, DefaultDict, Deque, Dict, List, Optional
 
+from adapters._shared.active_account import ActiveAccountStore
 from adapters._shared.trigger_policy import CooldownState, TriggerDecision
+from platforms.builtin import QQ_NAPCAT
 from stickers.combat import CombatTracker
 
-from . import bot_scope
 from .config import (
     ONEBOT_IDEMPOTENCY_AMBIGUOUS_TTL_SECONDS,
     ONEBOT_IDEMPOTENCY_MAX_ITEMS,
@@ -125,7 +126,8 @@ class OneBotAdapter:
         self.route_state_lock = asyncio.Lock()
         # 当前登录的 QQ 号，参与会话键摘要。进程启动时从盘上读回来：等第一条消息才知道
         # 账号的话，那之前算出的键会落在空作用域里，记忆静默分叉成两份。
-        self.active_bot_scope: str = bot_scope.load_scope(self.workspace)
+        self.active_account_store = ActiveAccountStore(QQ_NAPCAT, self.workspace)
+        self.active_bot_scope: str = self.active_account_store.load()
         self.refused_self_ids: set[str] = set()
 
         # ---- 附件 ----

@@ -8,13 +8,11 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from ..config import (
-    CLONOTH_WORKSPACE,
     IMAGE_CACHE_TTL_SECONDS,
     ONEBOT_STATE_FILE,
     REPLY_ATTACHMENT_CACHE_FILE,
 )
-from .. import bot_scope as _bot_scope
-from adapters._shared.conversation_hash import digest as _digest_conversation_key
+from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE
 
 from . import anonymize, common, media, state
 
@@ -46,7 +44,7 @@ def _purge_account_scoped_caches() -> None:
 def _adopt_bot_scope(bot: Any) -> None:
     """记住当前账号；换号时丢掉按旧账号算出的键缓存，让它们按新作用域重算。"""
     raw_self_id = getattr(bot, "self_id", None)
-    scope = _bot_scope.normalize(raw_self_id)
+    scope = state._adapter.active_account_store.normalize(raw_self_id)
     if not scope:
         _warn_unscoped_self_id(raw_self_id)
         return
@@ -54,7 +52,7 @@ def _adopt_bot_scope(bot: Any) -> None:
         return
     previous = state._adapter.active_bot_scope
     state._adapter.active_bot_scope = scope
-    _bot_scope.save_scope(Path(CLONOTH_WORKSPACE), scope)
+    state._adapter.active_account_store.save(scope)
     # real→stable 必须重算。反向表留着：旧键的在途回调还要靠它找回真实会话。
     state._adapter.stable_conversation_keys.clear()
     _purge_account_scoped_caches()
@@ -76,21 +74,9 @@ def _warn_unscoped_self_id(raw_self_id: Any) -> None:
     )
 
 
-def _conversation_digest(conversation_key: str) -> str:
-    return _digest_conversation_key(
-        conversation_key, anonymize._CONVERSATION_SECRET, bot_scope=_active_bot_scope(),
-    )
-
-
 def _scoped_stable_key(real_conversation_key: str) -> str:
     """按当前作用域算稳定键。纯计算，不登记映射也不分配别名。"""
-    if real_conversation_key.startswith("qq_group:"):
-        prefix = "qq_group"
-    elif real_conversation_key.startswith("qq_private:"):
-        prefix = "qq_private"
-    else:
-        prefix = "qq_unknown"
-    return f"{prefix}:{_conversation_digest(real_conversation_key)}"
+    return anonymize.CONVERSATION_KEYS.stable_key(real_conversation_key, bot_scope=_active_bot_scope())
 
 
 def _current_scope_keys() -> List[str]:
@@ -111,15 +97,12 @@ def _current_scope_keys() -> List[str]:
 
 def _stable_conversation_key(real_conversation_key: str) -> str:
     """把真实 QQ 会话键转换为可持久化的稳定哈希键，避免 Supervisor 泄漏群号/QQ号。"""
-    if real_conversation_key.startswith("qq_group:"):
-        prefix = "qq_group"
+    kind = anonymize.CONVERSATION_KEYS.channel_of(real_conversation_key).kind
+    if kind == CHANNEL_GROUP:
         anonymize._anonymize_group_id(real_conversation_key.split(":", 1)[1])
-    elif real_conversation_key.startswith("qq_private:"):
-        prefix = "qq_private"
+    elif kind == CHANNEL_PRIVATE:
         anonymize._anonymize_user_id(real_conversation_key.split(":", 1)[1])
-    else:
-        prefix = "qq_unknown"
-    stable = f"{prefix}:{_conversation_digest(real_conversation_key)}"
+    stable = _scoped_stable_key(real_conversation_key)
     state._adapter.real_conversation_keys[stable] = real_conversation_key
     state._adapter.stable_conversation_keys[real_conversation_key] = stable
     return stable

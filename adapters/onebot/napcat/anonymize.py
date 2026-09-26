@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from nonebot.adapters.onebot.v11 import Event
 from engine import memory_subjects
+from platforms.builtin import QQ_NAPCAT
 from ..config import (
     CLONOTH_WORKSPACE,
     CONVERSATION_HASH_SECRET,
@@ -20,7 +21,7 @@ from ..config import (
     ANON_MAP_FILE,
     ANON_MAP_RETENTION_DAYS,
 )
-from adapters._shared.conversation_hash import resolve_secret
+from adapters._shared.conversation_hash import ConversationKeys, resolve_secret
 from adapters._shared.memory_hints import collect_subjects as collect_memory_subjects
 from ..segments import at_segment_user_ids
 
@@ -487,3 +488,4 @@ _CONVERSATION_SECRET, CONVERSATION_DIGEST_SALTED = resolve_secret(
     route_state_file=Path(ONEBOT_STATE_FILE),
     legacy_hint="Run deploy/migrate_qq_conversation_hash.py to salt them.",
 )
+CONVERSATION_KEYS = ConversationKeys(QQ_NAPCAT, _CONVERSATION_SECRET)

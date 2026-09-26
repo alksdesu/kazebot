@@ -19,6 +19,7 @@ ID_STRING = "string"
 STATE_LIVE = "live"
 STATE_ROUTES = "routes"
 STATE_ALIASES = "aliases"
+STATE_ACTIVE_ACCOUNT = "active_account"
 
 HOOK_TRIGGER_POLICY = "trigger_policy"
 
@@ -55,7 +56,8 @@ class PlatformDescriptor:
     # 覆盖配置路径的环境变量。只给已经在用它的平台，新平台不加。
     config_env: str = ""
     # data/ 下由适配器写、核心只读的状态文件：live 公布生效配置与运行事实，
-    # routes 是稳定会话键到真实会话键，aliases 是匿名别名表。
+    # routes 是稳定会话键到真实会话键，aliases 是匿名别名表，
+    # active_account 是当前登录账号，会话键摘要按它分作用域。
     state_files: Mapping[str, str] = field(default_factory=dict)
     # 核心层需要调用的平台策略：名字 → 模块路径，按需导入。
     hooks: Mapping[str, str] = field(default_factory=dict)

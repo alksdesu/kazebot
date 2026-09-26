@@ -16,11 +16,11 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-# 摘要算法必须与运行时同一份，所以直接用适配器的模块。
+# 摘要算法必须与运行时同一份，所以直接用共享层的模块。
 from adapters._shared import conversation_hash as _conversation_hash  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 
-digest = _conversation_hash.digest
+rekey = _conversation_hash.rekey
 LEGACY_MARKER = _conversation_hash.LEGACY_MARKER
 _SECRET_RE = _conversation_hash._SECRET_RE
 
@@ -93,9 +93,7 @@ def run_migration(
     plan = plan_migration(
         workspace=workspace,
         platform=QQ_NAPCAT,
-        restable=lambda old_stable, real: (
-            f"{old_stable.split(':', 1)[0]}:{digest(real, report.target_secret)}"
-        ),
+        restable=lambda old_stable, real: rekey(old_stable, real, report.target_secret),
     )
     report.renames = plan.renames
     report.missing_source_dirs = plan.missing_source_dirs
