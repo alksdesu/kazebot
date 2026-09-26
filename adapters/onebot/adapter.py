@@ -23,7 +23,7 @@ from .config import (
     RECENT_IMAGE_MAX_ITEMS,
 )
 from .emoji_handler import EmojiRenderer
-from .send_contract import TwoPhaseIdempotencyStore
+from .send_contract import OneBotIdempotencyStore
 
 if TYPE_CHECKING:
     from adapters._shared.echo_policy import EchoEntry
@@ -167,7 +167,7 @@ class OneBotAdapter:
         # 补位也要补回它原来那个空位，否则会出现两个同下标的 worker。
         self.qq_queue_tasks: Dict[int, asyncio.Task] = {}
         # 出站防重放分 pending / sent 两段：发送失败释放 pending，只有确认送达的才记成 sent。
-        self.outbound_idempotency = TwoPhaseIdempotencyStore(
+        self.outbound_idempotency = OneBotIdempotencyStore(
             ONEBOT_IDEMPOTENCY_STORE_FILE,
             sent_ttl=ONEBOT_IDEMPOTENCY_SENT_TTL_SECONDS,
             max_items=ONEBOT_IDEMPOTENCY_MAX_ITEMS,

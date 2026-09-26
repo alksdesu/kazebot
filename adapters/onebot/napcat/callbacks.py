@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from adapters._shared import capability
 from ..live_config import live
-from ..send_contract import OneBotSendContractError, OutboundSendContext, context_from_sources
+from adapters._shared.send_guard import OutboundSendContext, SendContractError, context_from_sources
 from clonoth_sdk import ChildTaskState, MainTaskState, TriggerInfo
 
 from . import approval, common, history, outbound_attachments, permissions, proactive, queueing, routing, sending, state
@@ -36,11 +36,11 @@ class TangQiuCallbacks:
         bot = platform_data.get("bot") or queueing._get_fallback_bot()
         target = queueing._target_from_platform_data(platform_data) or queueing._target_from_conversation_key(trigger.conversation_key)
         if not bot:
-            raise OneBotSendContractError(
+            raise SendContractError(
                 f"send_reply missing bot for session={trigger.session_id}"
             )
         if not target:
-            raise OneBotSendContractError(
+            raise SendContractError(
                 f"send_reply missing target for session={trigger.session_id}"
             )
         # 进度提示靠这个标记闭嘴。设在校验之后：发不出去的回复不该顺带把提示也堵掉。
@@ -76,12 +76,12 @@ class TangQiuCallbacks:
         """兼容旧式 session_id 附件回调；当前 SDK 通常把附件放在 send_reply 中。"""
         target = state._adapter.session_targets.get(session_id) or state._adapter.persisted_session_targets.get(session_id)
         if not target:
-            raise OneBotSendContractError(
+            raise SendContractError(
                 f"send_reply_attachment missing target for session={session_id}"
             )
         bot = target.get("bot") or queueing._get_fallback_bot()
         if not bot:
-            raise OneBotSendContractError(
+            raise SendContractError(
                 f"send_reply_attachment missing bot for session={session_id}"
             )
         await outbound_attachments._send_attachment_path(bot, target, Path(path))
@@ -101,11 +101,11 @@ class TangQiuCallbacks:
         bot = platform_data.get("bot") or queueing._get_fallback_bot()
         target = queueing._target_from_platform_data(platform_data) or queueing._target_from_conversation_key(trigger.conversation_key)
         if not bot:
-            raise OneBotSendContractError(
+            raise SendContractError(
                 f"send_intermediate_reply missing bot for session={trigger.session_id}"
             )
         if not target:
-            raise OneBotSendContractError(
+            raise SendContractError(
                 f"send_intermediate_reply missing target for session={trigger.session_id}"
             )
         send_context = delivery_context or context_from_sources(
@@ -145,7 +145,7 @@ class TangQiuCallbacks:
         """发送按会话路由的输出。"""
         target = queueing._target_from_conversation_key(conversation_key)
         if target is None:
-            raise OneBotSendContractError(
+            raise SendContractError(
                 f"send_to_channel missing target for conversation={conversation_key}"
             )
         # [2026-07-19] 修复生图 op=recent 查不到图：_target_from_conversation_key
@@ -157,7 +157,7 @@ class TangQiuCallbacks:
             target["conversation_key"] = routing._real_conversation_key(conversation_key)
         bot = state._adapter.conversation_bots.get(conversation_key) or queueing._get_fallback_bot()
         if not bot:
-            raise OneBotSendContractError(
+            raise SendContractError(
                 f"send_to_channel missing bot for conversation={conversation_key}"
             )
         send_context = delivery_context or context_from_sources(

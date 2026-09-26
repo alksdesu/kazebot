@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests._onebot_harness import load_runtime, set_live_config
+from adapters._shared.send_guard import AmbiguousAckError
 from stickers.store import CAPTION_DONE, STATE_LIBRARY
 
 
@@ -33,7 +34,7 @@ class Bot:
         if self.attempts in self.fail_at:
             raise ConnectionRefusedError("synthetic send not started")
         if self.ambiguous:
-            raise self.runtime.OneBotAmbiguousAckError("synthetic unknown acknowledgement")
+            raise AmbiguousAckError("synthetic unknown acknowledgement")
         self.sent.append(list(message))
         return {"message_id": str(self.attempts)}
 
@@ -208,7 +209,7 @@ def test_ambiguous_ack_is_not_counted_or_retried(runtime):
 
     async def run():
         for _ in range(2):
-            with pytest.raises(runtime.sending.OneBotAmbiguousAckError):
+            with pytest.raises(runtime.sending.AmbiguousAckError):
                 await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
         assert not await runtime.state._adapter.outbound_idempotency.pending_message_receipts()
     asyncio.run(run())
@@ -277,7 +278,7 @@ def test_frozen_selection_refuses_changed_file_before_send(runtime):
         with pytest.raises(Exception):
             await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
         path.write_bytes(b"changed image")
-        with pytest.raises(runtime.sending.OneBotSendContractError):
+        with pytest.raises(runtime.sending.SendContractError):
             await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime))
     asyncio.run(run())
     assert bot.attempts == 1
@@ -349,7 +350,7 @@ def test_missing_platform_message_id_is_ambiguous_not_success(runtime, monkeypat
         return {}
 
     monkeypatch.setattr(bot, "send_group_msg", send)
-    with pytest.raises(runtime.sending.OneBotAmbiguousAckError):
+    with pytest.raises(runtime.sending.AmbiguousAckError):
         asyncio.run(runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime)))
     assert store.get(digest).sent_count == 0
 
@@ -375,7 +376,7 @@ def test_old_delivery_claim_is_quarantined_before_new_selection(runtime):
         claim = await outbound.begin(key)
         await outbound.commit(claim, platform_message_id="old-1")
         outbound._db.execute("UPDATE claims SET updated=? WHERE key=?", (outbound.protocol_started_at - 1, key))
-        with pytest.raises(runtime.sending.OneBotAmbiguousAckError):
+        with pytest.raises(runtime.sending.AmbiguousAckError):
             await runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=ctx)
     asyncio.run(run())
     assert bot.attempts == store.get(digest).sent_count == 0

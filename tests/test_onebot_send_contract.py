@@ -49,20 +49,23 @@ from _onebot_emoji_handler import (  # type: ignore[import-not-found]  # noqa: E
     strip_output_markers,
 )
 from _onebot_send_contract import (  # type: ignore[import-not-found]  # noqa: E402
-    IdempotencyOwnershipError,
-    OneBotAmbiguousAckError,
-    OneBotSendContractError,
-    OneBotSendInProgress,
-    OneBotSendNotStartedError,
-    OutboundSendContext,
-    TwoPhaseIdempotencyStore,
+    OneBotIdempotencyStore,
     classify_send_exception,
-    context_from_sources,
-    image_content_identity,
     make_idempotency_key,
     protected_claim_send,
     target_from_idempotency_key,
     validate_send_request,
+)
+from adapters._shared import send_guard  # noqa: E402
+from adapters._shared.send_guard import (  # noqa: E402
+    AmbiguousAckError,
+    IdempotencyOwnershipError,
+    OutboundSendContext,
+    SendContractError,
+    SendInProgress,
+    SendNotStartedError,
+    context_from_sources,
+    image_content_identity,
 )
 
 
@@ -153,17 +156,17 @@ def test_markdown_style_yaml_overrides_the_legacy_env(
 
 
 def test_missing_bot_and_target_are_explicit_contract_errors() -> None:
-    with pytest.raises(OneBotSendContractError, match="missing bot"):
+    with pytest.raises(SendContractError, match="missing bot"):
         validate_send_request(None, {"type": "group", "group_id": 1})
-    with pytest.raises(OneBotSendContractError, match="missing target"):
+    with pytest.raises(SendContractError, match="missing target"):
         validate_send_request(_Bot(), None)
-    with pytest.raises(OneBotSendContractError, match="missing group_id"):
+    with pytest.raises(SendContractError, match="missing group_id"):
         validate_send_request(_Bot(), {"type": "group"})
 
 
 def test_two_phase_failure_releases_pending_and_success_commits_sent(tmp_path: Path) -> None:
     async def exercise() -> None:
-        store = TwoPhaseIdempotencyStore(tmp_path / "claims.sqlite3")
+        store = OneBotIdempotencyStore(tmp_path / "claims.sqlite3")
 
         first = await store.begin("event-1")
         assert first.acquired is True
@@ -191,7 +194,7 @@ def test_two_phase_failure_releases_pending_and_success_commits_sent(tmp_path: P
 def test_message_plan_freezes_selection_across_concurrent_connections_and_restart(tmp_path: Path) -> None:
     async def exercise() -> None:
         path = tmp_path / "plans.sqlite3"
-        first, second = TwoPhaseIdempotencyStore(path), TwoPhaseIdempotencyStore(path)
+        first, second = OneBotIdempotencyStore(path), OneBotIdempotencyStore(path)
         target = {"type": "group", "group_id": 123}
         key = _sticker_plan_key(target, DeliveryContext(idempotency_key="event:stable:replay:0"))
         selected: list[int] = []
@@ -209,7 +212,7 @@ def test_message_plan_freezes_selection_across_concurrent_connections_and_restar
         assert target_from_idempotency_key(a.claim_key) == "group:123"
         first.close()
         second.close()
-        restarted = TwoPhaseIdempotencyStore(path)
+        restarted = OneBotIdempotencyStore(path)
         assert await restarted.get_or_create_message_plan(key, target, build) == a
         assert len(selected) == 1
         stored = restarted._db.execute("SELECT payload FROM message_plans").fetchone()[0]
@@ -228,7 +231,7 @@ def test_message_plan_serializes_builders_across_threads(tmp_path: Path, round_i
 
     def worker() -> str:
         async def run() -> str:
-            store = TwoPhaseIdempotencyStore(path)
+            store = OneBotIdempotencyStore(path)
             try:
                 async def build() -> dict[str, Any]:
                     selected.append(1)
@@ -272,8 +275,8 @@ def test_message_plan_wal_bootstrap_retries_only_busy_or_locked_and_restores_tim
         def close(self) -> None:
             self.db.close()
 
-    monkeypatch.setattr(_MODULE.sqlite3, "connect", lambda *args, **kwargs: ConnectionProxy(connect(*args, **kwargs)))
-    store = TwoPhaseIdempotencyStore(tmp_path / "wal-retry.sqlite3")
+    monkeypatch.setattr(sqlite3, "connect", lambda *args, **kwargs: ConnectionProxy(connect(*args, **kwargs)))
+    store = OneBotIdempotencyStore(tmp_path / "wal-retry.sqlite3")
     assert len(attempts) == 3
     assert store._db.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
     assert store._db.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
@@ -316,17 +319,17 @@ def test_message_plan_wal_bootstrap_failure_is_bounded_and_closes_connection(tmp
         return proxy
 
     ticks = iter([0.0, 0.0, 16.0])
-    monkeypatch.setattr(_MODULE, "time", types.SimpleNamespace(monotonic=lambda: next(ticks), sleep=lambda _: pytest.fail("retry exceeded its deadline")))
-    monkeypatch.setattr(_MODULE.sqlite3, "connect", wrapped_connect)
+    monkeypatch.setattr(send_guard, "time", types.SimpleNamespace(monotonic=lambda: next(ticks), sleep=lambda _: pytest.fail("retry exceeded its deadline")))
+    monkeypatch.setattr(sqlite3, "connect", wrapped_connect)
     with pytest.raises(sqlite3.OperationalError, match="synthetic WAL failure"):
-        TwoPhaseIdempotencyStore(tmp_path / "wal-failed.sqlite3")
+        OneBotIdempotencyStore(tmp_path / "wal-failed.sqlite3")
     assert opened[0].closed and opened[0].restored
     assert opened[0].attempts == 1
 
 
 def test_message_plan_keys_bind_raw_body_index_target_and_replay_generation(tmp_path: Path) -> None:
     async def exercise() -> None:
-        store = TwoPhaseIdempotencyStore(tmp_path / "keys.sqlite3")
+        store = OneBotIdempotencyStore(tmp_path / "keys.sqlite3")
         target = {"type": "group", "group_id": 123}
         original = DeliveryContext(event_id="event-1", idempotency_key="sdk:event-1:replay:0")
         replay = DeliveryContext(event_id="event-1", idempotency_key="sdk:event-1:replay:1", replay_generation=1)
@@ -341,7 +344,7 @@ def test_message_plan_keys_bind_raw_body_index_target_and_replay_generation(tmp_
         plan = await store.get_or_create_message_plan(
             _sticker_plan_key(target, original), target, lambda: asyncio.sleep(0, result=_prepared_sticker_plan()),
         )
-        with pytest.raises(OneBotSendContractError, match="target mismatch"):
+        with pytest.raises(SendContractError, match="target mismatch"):
             await store.get_or_create_message_plan(plan.key, {"type": "group", "group_id": 999}, lambda: asyncio.sleep(0))
         store.close()
 
@@ -357,9 +360,9 @@ def test_message_plan_keys_bind_raw_body_index_target_and_replay_generation(tmp_
 ])
 def test_message_plan_rejects_inline_images_or_invalid_references(tmp_path: Path, image: dict[str, Any]) -> None:
     async def exercise() -> None:
-        store = TwoPhaseIdempotencyStore(tmp_path / "invalid.sqlite3")
+        store = OneBotIdempotencyStore(tmp_path / "invalid.sqlite3")
         prepared = {**_prepared_sticker_plan(), "processed_segments": [image]}
-        with pytest.raises(OneBotSendContractError):
+        with pytest.raises(SendContractError):
             await store.get_or_create_message_plan("invalid-key", {"type": "group", "group_id": 1}, lambda: asyncio.sleep(0, result=prepared))
         assert store._db.execute("SELECT COUNT(*) FROM message_plans").fetchone()[0] == 0
         store.close()
@@ -371,7 +374,7 @@ def test_message_plan_commit_receipt_is_atomic_and_replays_without_sending(tmp_p
     async def exercise() -> None:
         path = tmp_path / "receipt.sqlite3"
         clock = _Clock()
-        store = TwoPhaseIdempotencyStore(path, clock=clock)
+        store = OneBotIdempotencyStore(path, clock=clock)
         target = {"type": "group", "group_id": 123}
         plan = await store.get_or_create_message_plan("receipt-key", target, lambda: asyncio.sleep(0, result=_prepared_sticker_plan()))
         assert await store.pending_message_receipts() == []
@@ -390,7 +393,7 @@ def test_message_plan_commit_receipt_is_atomic_and_replays_without_sending(tmp_p
         assert pending[0].conversation_key == "synthetic-conversation"
         assert pending[0].selected_images == ["a" * 64]
         store.close()
-        restarted = TwoPhaseIdempotencyStore(path, clock=clock)
+        restarted = OneBotIdempotencyStore(path, clock=clock)
         replay = await restarted.begin(plan.claim_key)
         assert not replay.acquired and replay.state == "sent"
         assert await restarted.sent_message_id(plan.claim_key) == "platform-101"
@@ -407,17 +410,17 @@ def test_message_plan_commit_receipt_is_atomic_and_replays_without_sending(tmp_p
 
 def test_message_plan_receipt_fault_rolls_back_claim_commit_and_quarantines_platform_success(tmp_path: Path) -> None:
     async def exercise() -> None:
-        store = TwoPhaseIdempotencyStore(tmp_path / "fault.sqlite3")
+        store = OneBotIdempotencyStore(tmp_path / "fault.sqlite3")
         plan = await store.get_or_create_message_plan("fault-key", {"type": "group", "group_id": 1}, lambda: asyncio.sleep(0, result=_prepared_sticker_plan()))
         claim = await store.begin(plan.claim_key)
         store._db.execute("""CREATE TRIGGER fail_receipt BEFORE UPDATE ON message_plans
             WHEN NEW.receipt_state='pending' BEGIN SELECT RAISE(ABORT,'synthetic receipt commit failure'); END""")
-        with pytest.raises(OneBotAmbiguousAckError):
+        with pytest.raises(AmbiguousAckError):
             await protected_claim_send(store, claim, lambda: asyncio.sleep(0, result="platform-sent"))
         assert await store.state(plan.claim_key) == "ambiguous"
         assert await store.pending_message_receipts() == []
         assert store._db.execute("SELECT state,platform_message_id FROM message_plans").fetchone() == ("ambiguous", "platform-sent")
-        with pytest.raises(OneBotAmbiguousAckError):
+        with pytest.raises(AmbiguousAckError):
             await store.begin(plan.claim_key)
         store.close()
 
@@ -426,7 +429,7 @@ def test_message_plan_receipt_fault_rolls_back_claim_commit_and_quarantines_plat
 
 def test_message_plan_definite_failure_retains_choice_while_unknown_ack_never_counts(tmp_path: Path) -> None:
     async def exercise() -> None:
-        store = TwoPhaseIdempotencyStore(tmp_path / "failures.sqlite3")
+        store = OneBotIdempotencyStore(tmp_path / "failures.sqlite3")
         target = {"type": "group", "group_id": 1}
         count: list[int] = []
 
@@ -438,22 +441,22 @@ def test_message_plan_definite_failure_retains_choice_while_unknown_ack_never_co
         claim = await store.begin(plan.claim_key)
 
         async def fail() -> str:
-            raise OneBotSendNotStartedError("synthetic preflight failure")
+            raise SendNotStartedError("synthetic preflight failure")
 
-        with pytest.raises(OneBotSendNotStartedError):
+        with pytest.raises(SendNotStartedError):
             await protected_claim_send(store, claim, fail)
         assert await store.state(plan.claim_key) is None
         assert await store.get_or_create_message_plan("stable-key", target, build) == plan
         retry = await store.begin(plan.claim_key)
 
         async def timeout() -> str:
-            raise OneBotAmbiguousAckError("synthetic timeout")
+            raise AmbiguousAckError("synthetic timeout")
 
-        with pytest.raises(OneBotAmbiguousAckError):
+        with pytest.raises(AmbiguousAckError):
             await protected_claim_send(store, retry, timeout)
         assert await store.pending_message_receipts() == []
         assert not await store.ack_message_receipt(plan.delivery_id)
-        with pytest.raises(OneBotAmbiguousAckError):
+        with pytest.raises(AmbiguousAckError):
             await store.get_or_create_message_plan("stable-key", target, build)
         assert len(count) == 1
         store.close()
@@ -464,7 +467,7 @@ def test_message_plan_definite_failure_retains_choice_while_unknown_ack_never_co
 def test_message_plan_short_content_ttl_creates_new_delivery_without_losing_pending_receipt(tmp_path: Path) -> None:
     async def exercise() -> None:
         clock = _Clock()
-        store = TwoPhaseIdempotencyStore(tmp_path / "ttl.sqlite3", sent_ttl=100, clock=clock)
+        store = OneBotIdempotencyStore(tmp_path / "ttl.sqlite3", sent_ttl=100, clock=clock)
         target = {"type": "group", "group_id": 1}
         key = _sticker_plan_key(target, DeliveryContext())
         build = lambda: asyncio.sleep(0, result=_prepared_sticker_plan())
@@ -491,15 +494,15 @@ def test_message_plan_pending_crash_is_ambiguous_not_a_resend_license(tmp_path: 
     async def exercise() -> None:
         path = tmp_path / "crash.sqlite3"
         clock = _Clock()
-        store = TwoPhaseIdempotencyStore(path, clock=clock)
+        store = OneBotIdempotencyStore(path, clock=clock)
         target = {"type": "private", "user_id": 456}
         build = lambda: asyncio.sleep(0, result=_prepared_sticker_plan())
         plan = await store.get_or_create_message_plan("crash-key", target, build)
         await store.begin(plan.claim_key)
         store.close()
         clock.now += 901
-        restarted = TwoPhaseIdempotencyStore(path, clock=clock)
-        with pytest.raises(OneBotAmbiguousAckError):
+        restarted = OneBotIdempotencyStore(path, clock=clock)
+        with pytest.raises(AmbiguousAckError):
             await restarted.get_or_create_message_plan("crash-key", target, build)
         assert restarted._db.execute("SELECT state FROM message_plans").fetchone()[0] == "ambiguous"
         assert await restarted.state(plan.claim_key) == "ambiguous"
@@ -521,7 +524,7 @@ def test_message_plan_legacy_detection_uses_persisted_protocol_boundary_and_exac
         db.commit()
         db.close()
         clock = _Clock()
-        store = TwoPhaseIdempotencyStore(path, clock=clock)
+        store = OneBotIdempotencyStore(path, clock=clock)
         assert store.protocol_started_at == 1000
         assert await store.has_legacy_message_claims("sdk:parent", {"type": "group", "group_id": 1})
         assert not await store.has_legacy_message_claims("sdk:parent", {"type": "group", "group_id": 2})
@@ -531,7 +534,7 @@ def test_message_plan_legacy_detection_uses_persisted_protocol_boundary_and_exac
         await store.commit(fresh)
         clock.now += 10
         store.close()
-        restarted = TwoPhaseIdempotencyStore(path, clock=clock)
+        restarted = OneBotIdempotencyStore(path, clock=clock)
         assert restarted.protocol_started_at == 1000
         assert not await restarted.has_legacy_message_claims("sdk:new-parent", {"type": "group", "group_id": 1})
         assert await restarted.has_legacy_message_claims("sdk:parent", {"type": "group", "group_id": 1})
@@ -543,7 +546,7 @@ def test_message_plan_legacy_detection_uses_persisted_protocol_boundary_and_exac
 @pytest.mark.parametrize("mixed", [False, True])
 def test_message_plan_freezes_favorite_url_and_mixed_library_images(tmp_path: Path, mixed: bool) -> None:
     async def exercise() -> None:
-        store = TwoPhaseIdempotencyStore(tmp_path / "favorites.sqlite3")
+        store = OneBotIdempotencyStore(tmp_path / "favorites.sqlite3")
         prepared = _prepared_sticker_plan()
         favorite = {"type": "image", "url": "https://synthetic.invalid/favorite.png"}
         prepared["processed_segments"] = [favorite, *prepared["processed_segments"]] if mixed else [favorite]
@@ -559,7 +562,7 @@ def test_message_plan_freezes_favorite_url_and_mixed_library_images(tmp_path: Pa
 def test_message_plan_expired_receipts_warn_without_logging_message_content(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     async def exercise() -> None:
         clock = _Clock()
-        store = TwoPhaseIdempotencyStore(tmp_path / "expiry.sqlite3", sent_ttl=10, clock=clock)
+        store = OneBotIdempotencyStore(tmp_path / "expiry.sqlite3", sent_ttl=10, clock=clock)
         plan = await store.get_or_create_message_plan("receipt-key", {"type": "group", "group_id": 1}, lambda: asyncio.sleep(0, result=_prepared_sticker_plan()))
         await protected_claim_send(store, await store.begin(plan.claim_key), lambda: asyncio.sleep(0, result="platform-id"))
         clock.now += 11
@@ -575,7 +578,7 @@ def test_message_plan_expired_receipts_warn_without_logging_message_content(tmp_
 def test_message_plan_empty_result_uses_short_no_event_retention(tmp_path: Path) -> None:
     async def exercise() -> None:
         clock = _Clock()
-        store = TwoPhaseIdempotencyStore(tmp_path / "empty.sqlite3", clock=clock)
+        store = OneBotIdempotencyStore(tmp_path / "empty.sqlite3", clock=clock)
         prepared = {**_prepared_sticker_plan(), "processed_segments": [], "selected_images": []}
         build = lambda: asyncio.sleep(0, result=prepared)
         target = {"type": "group", "group_id": 1}
@@ -595,7 +598,7 @@ def test_message_plan_empty_result_uses_short_no_event_retention(tmp_path: Path)
 def test_message_plan_operator_release_unblocks_frozen_selection_without_counting_ambiguous(tmp_path: Path, clear_all: bool) -> None:
     async def exercise() -> None:
         clock = _Clock()
-        store = TwoPhaseIdempotencyStore(tmp_path / "operator.sqlite3", sent_ttl=100, ambiguous_ttl=5, clock=clock)
+        store = OneBotIdempotencyStore(tmp_path / "operator.sqlite3", sent_ttl=100, ambiguous_ttl=5, clock=clock)
         target = {"type": "group", "group_id": 1}
         plan = await store.get_or_create_message_plan("operator-key", target, lambda: asyncio.sleep(0, result=_prepared_sticker_plan()))
         await store.mark_ambiguous(await store.begin(plan.claim_key), error="synthetic unknown")
@@ -619,7 +622,7 @@ def test_message_plan_operator_release_unblocks_frozen_selection_without_countin
 def test_message_plan_live_claim_survives_plan_retention_and_sent_bound(tmp_path: Path) -> None:
     async def exercise() -> None:
         clock = _Clock()
-        store = TwoPhaseIdempotencyStore(tmp_path / "active.sqlite3", sent_ttl=10, max_items=1, clock=clock)
+        store = OneBotIdempotencyStore(tmp_path / "active.sqlite3", sent_ttl=10, max_items=1, clock=clock)
         target = {"type": "group", "group_id": 1}
         build = lambda: asyncio.sleep(0, result=_prepared_sticker_plan())
         plan = await store.get_or_create_message_plan("active-key", target, build, sent_ttl=5)
@@ -643,7 +646,7 @@ def test_message_plan_background_receipts_never_expire_or_mutate_legacy_claims(t
     async def exercise() -> None:
         clock = _Clock()
         path = tmp_path / "legacy-isolation.sqlite3"
-        store = TwoPhaseIdempotencyStore(path, sent_ttl=10, ambiguous_ttl=5, clock=clock)
+        store = OneBotIdempotencyStore(path, sent_ttl=10, ambiguous_ttl=5, clock=clock)
         plan = await store.get_or_create_message_plan("confirmed", {"type": "group", "group_id": 1}, lambda: asyncio.sleep(0, result=_prepared_sticker_plan()))
         await protected_claim_send(store, await store.begin(plan.claim_key), lambda: asyncio.sleep(0, result="new-id"))
         legacy = await store.begin("legacy-unknown")
@@ -653,7 +656,7 @@ def test_message_plan_background_receipts_never_expire_or_mutate_legacy_claims(t
         assert await store.pending_message_receipts() == []
         assert store._db.execute("SELECT * FROM claims ORDER BY key").fetchall() == before
         store.close()
-        restarted = TwoPhaseIdempotencyStore(path, sent_ttl=10, ambiguous_ttl=5, clock=clock)
+        restarted = OneBotIdempotencyStore(path, sent_ttl=10, ambiguous_ttl=5, clock=clock)
         assert await restarted.pending_message_receipts() == []
         assert restarted._db.execute("SELECT * FROM claims ORDER BY key").fetchall() == before
         restarted.close()
@@ -664,7 +667,7 @@ def test_message_plan_background_receipts_never_expire_or_mutate_legacy_claims(t
 def test_message_plan_capacity_backpressures_new_keys_but_preserves_existing_retries(tmp_path: Path) -> None:
     async def exercise() -> None:
         clock = _Clock()
-        store = TwoPhaseIdempotencyStore(tmp_path / "capacity.sqlite3", max_items=1, clock=clock)
+        store = OneBotIdempotencyStore(tmp_path / "capacity.sqlite3", max_items=1, clock=clock)
         target = {"type": "group", "group_id": 1}
         calls: list[int] = []
 
@@ -673,14 +676,14 @@ def test_message_plan_capacity_backpressures_new_keys_but_preserves_existing_ret
             return _prepared_sticker_plan()
 
         plan = await store.get_or_create_message_plan("existing", target, build)
-        with pytest.raises(OneBotSendInProgress):
+        with pytest.raises(SendInProgress):
             await store.get_or_create_message_plan("new-key", target, build)
         assert await store.get_or_create_message_plan("existing", target, build) == plan
         assert len(calls) == 1
         assert store._db.execute("SELECT COUNT(*) FROM message_plans").fetchone()[0] == 1
         claim = await store.begin(plan.claim_key)
         await store.mark_ambiguous(claim, error="synthetic unknown")
-        with pytest.raises(OneBotSendInProgress):
+        with pytest.raises(SendInProgress):
             await store.get_or_create_message_plan("another-key", target, build)
         assert await store.state(plan.claim_key) == "ambiguous"
         store.close()
@@ -691,7 +694,7 @@ def test_message_plan_capacity_backpressures_new_keys_but_preserves_existing_ret
 def test_message_plan_capacity_prunes_expired_empty_plan_before_reserving_new_key(tmp_path: Path) -> None:
     async def exercise() -> None:
         clock = _Clock()
-        store = TwoPhaseIdempotencyStore(tmp_path / "capacity-expiry.sqlite3", max_items=1, clock=clock)
+        store = OneBotIdempotencyStore(tmp_path / "capacity-expiry.sqlite3", max_items=1, clock=clock)
         target = {"type": "group", "group_id": 1}
         prepared = {**_prepared_sticker_plan(), "processed_segments": [], "selected_images": []}
         build = lambda: asyncio.sleep(0, result=prepared)
@@ -708,11 +711,11 @@ def test_message_plan_capacity_prunes_expired_empty_plan_before_reserving_new_ke
 def test_sent_state_survives_restart(tmp_path: Path) -> None:
     async def exercise() -> None:
         path = tmp_path / "claims.sqlite3"
-        first = TwoPhaseIdempotencyStore(path)
+        first = OneBotIdempotencyStore(path)
         claim = await first.begin("restart-key")
         await first.commit(claim)
         first.close()
-        restarted = TwoPhaseIdempotencyStore(path)
+        restarted = OneBotIdempotencyStore(path)
         assert await restarted.state("restart-key") == "sent"
         duplicate = await restarted.begin("restart-key")
         assert duplicate.acquired is False and duplicate.state == "sent"
@@ -743,7 +746,7 @@ def test_image_identity_uses_file_content_not_path_or_transport() -> None:
 def test_send_exception_classification_distinguishes_retry_safety() -> None:
     retryable = classify_send_exception(RuntimeError("ENOENT: no such file or directory"))
     assert retryable.retryable is True
-    assert isinstance(retryable, OneBotSendNotStartedError)
+    assert isinstance(retryable, SendNotStartedError)
     assert retryable.definitely_not_sent is True
     assert retryable.ambiguous_ack is False
 
@@ -759,7 +762,7 @@ def test_send_exception_classification_distinguishes_retry_safety() -> None:
     assert forward_timeout.ambiguous_ack is True
 
     at_uid = classify_send_exception(RuntimeError("Get Uid Error"))
-    assert isinstance(at_uid, OneBotSendNotStartedError)
+    assert isinstance(at_uid, SendNotStartedError)
 
 
 class _AtGroupBot:
@@ -794,7 +797,7 @@ def test_group_at_message_is_not_resent_after_ambiguous_timeout(
     runtime = _load_runtime(monkeypatch, tmp_path)
     bot = _AtGroupBot([runtime.sending.ActionFailed("Timeout: NTEvent ... sendMsg")])
 
-    with pytest.raises(runtime.sending.OneBotAmbiguousAckError):
+    with pytest.raises(runtime.sending.AmbiguousAckError):
         asyncio.run(runtime.sending._send_qq_message(
             bot, {"type": "group", "group_id": 5}, _at_message(runtime),
             idempotency_key="k-timeout",
@@ -810,7 +813,7 @@ def test_group_unknown_failure_is_not_resent_as_at_text(
     runtime = _load_runtime(monkeypatch, tmp_path)
     bot = _AtGroupBot([runtime.sending.ActionFailed("rich media transfer failed")])
 
-    with pytest.raises(runtime.sending.OneBotAmbiguousAckError):
+    with pytest.raises(runtime.sending.AmbiguousAckError):
         asyncio.run(runtime.sending._send_qq_message(
             bot, {"type": "group", "group_id": 5}, _at_message(runtime),
             idempotency_key="k-unknown",
@@ -943,7 +946,7 @@ def test_real_attachment_stack_awaits_all_and_aggregates_failure(
         await asyncio.sleep(0)
         assert not task.done()
         release.set()
-        with pytest.raises(runtime.outbound_attachments.OneBotAttachmentBatchError):
+        with pytest.raises(runtime.outbound_attachments.AttachmentBatchError):
             await task
 
     asyncio.run(exercise())
@@ -970,7 +973,7 @@ def test_real_image_timeout_is_ambiguous_and_does_not_auto_resend(
 
     bot = Bot()
     context = DeliveryContext(event_id="evt-image", attempt=3, idempotency_key="id:evt-image")
-    with pytest.raises(runtime.sending.OneBotAmbiguousAckError):
+    with pytest.raises(runtime.sending.AmbiguousAckError):
         asyncio.run(runtime.outbound_attachments._send_attachment_path(
             bot, {"type": "group", "group_id": 1}, image, send_context=context,
         ))
@@ -1040,8 +1043,8 @@ def test_real_pending_owner_waits_and_forward_batch_is_claimed(
 def test_stale_idempotency_owner_cannot_commit_after_takeover(tmp_path: Path) -> None:
     async def exercise() -> None:
         path = tmp_path / "owners.sqlite3"
-        first = TwoPhaseIdempotencyStore(path)
-        second = TwoPhaseIdempotencyStore(path)
+        first = OneBotIdempotencyStore(path)
+        second = OneBotIdempotencyStore(path)
         stale = await first.begin("logical")
         first._db.execute("UPDATE claims SET lease_until=0 WHERE key='logical'")
         winner = await second.begin("logical")
@@ -1075,7 +1078,7 @@ def test_image_all_fallback_failures_are_aggregated_under_same_owner(
         async def send_group_msg(self, **kwargs: Any):
             raise ConnectionError("connection reset")
 
-    with pytest.raises(runtime.outbound_attachments.OneBotAttachmentBatchError) as raised:
+    with pytest.raises(runtime.outbound_attachments.AttachmentBatchError) as raised:
         asyncio.run(runtime.outbound_attachments._send_attachment_path(
             Bot(), {"type": "group", "group_id": 3}, image,
             send_context=DeliveryContext(event_id="all-fail", idempotency_key="id:all-fail"),
@@ -1110,7 +1113,7 @@ def test_long_forward_heartbeat_prevents_cross_instance_takeover(
             "SELECT key,lease_until FROM claims WHERE state='pending'"
         ).fetchone()
         assert row is not None and row[1] > time.time()
-        contender = TwoPhaseIdempotencyStore(runtime.state._adapter.outbound_idempotency.path)
+        contender = OneBotIdempotencyStore(runtime.state._adapter.outbound_idempotency.path)
         contender.lease_seconds = 0.15
         conflict = await contender.begin(row[0])
         assert conflict.acquired is False and conflict.state == "pending"
@@ -1170,7 +1173,7 @@ def test_forward_merge_ambiguous_ack_does_not_resend_one_by_one(
             return {"message_id": 1}
 
     bot = Bot()
-    with pytest.raises(runtime.sending.OneBotAmbiguousAckError):
+    with pytest.raises(runtime.sending.AmbiguousAckError):
         asyncio.run(runtime.outbound_attachments._send_attachments(
             bot, {"type": "group", "group_id": 7},
             [{"path": str(first_image)}, {"path": str(second_image)}],
@@ -1384,7 +1387,7 @@ def test_bridge_independent_identical_text_and_file_requests_are_not_permanently
 
 def test_sent_retention_and_bound_never_delete_valid_pending(tmp_path: Path) -> None:
     now = [1_000.0]
-    store = TwoPhaseIdempotencyStore(
+    store = OneBotIdempotencyStore(
         tmp_path / "retention.sqlite3", sent_ttl=10.0, max_items=3,
         clock=lambda: now[0],
     )
@@ -1552,7 +1555,7 @@ def test_qq_forward_http_retry_reuses_identity_and_new_call_is_distinct() -> Non
 
 def test_protected_send_waits_through_outer_cancellation_and_commits(tmp_path: Path) -> None:
     async def exercise() -> None:
-        store = TwoPhaseIdempotencyStore(tmp_path / "shield.sqlite3")
+        store = OneBotIdempotencyStore(tmp_path / "shield.sqlite3")
         claim = await store.begin("event:shield")
         started, finish = asyncio.Event(), asyncio.Event()
 
@@ -1576,7 +1579,7 @@ def test_protected_send_waits_through_outer_cancellation_and_commits(tmp_path: P
 
 def test_protected_send_cancel_during_commit_still_commits(tmp_path: Path) -> None:
     async def exercise() -> None:
-        store = TwoPhaseIdempotencyStore(tmp_path / "commit-shield.sqlite3")
+        store = OneBotIdempotencyStore(tmp_path / "commit-shield.sqlite3")
         claim = await store.begin("event:commit-shield")
         started, finish = asyncio.Event(), asyncio.Event()
         original_commit = store.commit
@@ -1602,13 +1605,13 @@ def test_protected_send_cancel_during_commit_still_commits(tmp_path: Path) -> No
 
 def test_onebot_explicit_not_started_failure_releases_claim(tmp_path: Path) -> None:
     async def exercise() -> None:
-        store = TwoPhaseIdempotencyStore(tmp_path / "not-started.sqlite3")
+        store = OneBotIdempotencyStore(tmp_path / "not-started.sqlite3")
         claim = await store.begin("event:not-started")
 
         async def platform_send():
-            raise OneBotSendNotStartedError("cancelled before API call")
+            raise SendNotStartedError("cancelled before API call")
 
-        with pytest.raises(OneBotSendNotStartedError):
+        with pytest.raises(SendNotStartedError):
             await protected_claim_send(store, claim, platform_send)
         assert await store.state("event:not-started") is None
 
@@ -1618,19 +1621,19 @@ def test_onebot_explicit_not_started_failure_releases_claim(tmp_path: Path) -> N
 def test_onebot_internal_cancel_is_ambiguous_restart_and_force_generation(tmp_path: Path) -> None:
     async def exercise() -> None:
         path = tmp_path / "ambiguous.sqlite3"
-        store = TwoPhaseIdempotencyStore(path)
+        store = OneBotIdempotencyStore(path)
         claim = await store.begin("event:cancel")
 
         async def platform_send():
             raise asyncio.CancelledError()
 
-        with pytest.raises(OneBotAmbiguousAckError):
+        with pytest.raises(AmbiguousAckError):
             await protected_claim_send(store, claim, platform_send)
         assert await store.state("event:cancel") == "ambiguous"
         store.close()
 
-        restarted = TwoPhaseIdempotencyStore(path)
-        with pytest.raises(OneBotAmbiguousAckError):
+        restarted = OneBotIdempotencyStore(path)
+        with pytest.raises(AmbiguousAckError):
             await restarted.begin("event:cancel")
         replay = await restarted.begin("event:cancel:replay:1")
         assert await protected_claim_send(
@@ -1643,14 +1646,14 @@ def test_onebot_internal_cancel_is_ambiguous_restart_and_force_generation(tmp_pa
 
 def test_onebot_commit_cancel_fault_marks_message_id_ambiguous(tmp_path: Path) -> None:
     async def exercise() -> None:
-        store = TwoPhaseIdempotencyStore(tmp_path / "commit-cancel.sqlite3")
+        store = OneBotIdempotencyStore(tmp_path / "commit-cancel.sqlite3")
         claim = await store.begin("event:commit-cancel")
 
         async def cancelled_commit(*args, **kwargs):
             raise asyncio.CancelledError()
 
         store.commit = cancelled_commit  # type: ignore[method-assign]
-        with pytest.raises(OneBotAmbiguousAckError):
+        with pytest.raises(AmbiguousAckError):
             await protected_claim_send(
                 store, claim, lambda: asyncio.sleep(0, result={"message_id": 93}),
                 message_id_getter=lambda result: str(result["message_id"]),
@@ -1682,10 +1685,10 @@ async def _dead_letter(store: Any, key: str, error: str = "timeout waiting for a
 def test_a_dead_letter_survives_inside_its_ttl(tmp_path: Path) -> None:
     async def exercise() -> None:
         clock = _Clock()
-        store = TwoPhaseIdempotencyStore(tmp_path / "c.sqlite3", ambiguous_ttl=60, clock=clock)
+        store = OneBotIdempotencyStore(tmp_path / "c.sqlite3", ambiguous_ttl=60, clock=clock)
         await _dead_letter(store, "content:group:1:d")
         clock.advance(59)
-        with pytest.raises(OneBotAmbiguousAckError):
+        with pytest.raises(AmbiguousAckError):
             await store.begin("content:group:1:d")
 
     asyncio.run(exercise())
@@ -1694,7 +1697,7 @@ def test_a_dead_letter_survives_inside_its_ttl(tmp_path: Path) -> None:
 def test_a_dead_letter_is_released_after_its_ttl(tmp_path: Path) -> None:
     async def exercise() -> None:
         clock = _Clock()
-        store = TwoPhaseIdempotencyStore(tmp_path / "c.sqlite3", ambiguous_ttl=60, clock=clock)
+        store = OneBotIdempotencyStore(tmp_path / "c.sqlite3", ambiguous_ttl=60, clock=clock)
         await _dead_letter(store, "content:group:1:d")
         clock.advance(61)
         released = await store.begin("content:group:1:d")
@@ -1707,10 +1710,10 @@ def test_a_dead_letter_is_released_after_its_ttl(tmp_path: Path) -> None:
 def test_a_zero_ttl_keeps_a_dead_letter_forever(tmp_path: Path) -> None:
     async def exercise() -> None:
         clock = _Clock()
-        store = TwoPhaseIdempotencyStore(tmp_path / "c.sqlite3", ambiguous_ttl=0, clock=clock)
+        store = OneBotIdempotencyStore(tmp_path / "c.sqlite3", ambiguous_ttl=0, clock=clock)
         await _dead_letter(store, "content:group:1:d")
         clock.advance(10 * 365 * 24 * 3600)
-        with pytest.raises(OneBotAmbiguousAckError):
+        with pytest.raises(AmbiguousAckError):
             await store.begin("content:group:1:d")
 
     asyncio.run(exercise())
@@ -1718,7 +1721,7 @@ def test_a_zero_ttl_keeps_a_dead_letter_forever(tmp_path: Path) -> None:
 
 def test_clearing_a_dead_letter_unblocks_the_key(tmp_path: Path) -> None:
     async def exercise() -> None:
-        store = TwoPhaseIdempotencyStore(tmp_path / "c.sqlite3", ambiguous_ttl=0)
+        store = OneBotIdempotencyStore(tmp_path / "c.sqlite3", ambiguous_ttl=0)
         await _dead_letter(store, "content:group:1:d")
         assert await store.clear_ambiguous("content:group:1:d") is True
         reclaimed = await store.begin("content:group:1:d")
@@ -1729,7 +1732,7 @@ def test_clearing_a_dead_letter_unblocks_the_key(tmp_path: Path) -> None:
 
 def test_clearing_refuses_a_sent_claim(tmp_path: Path) -> None:
     async def exercise() -> None:
-        store = TwoPhaseIdempotencyStore(tmp_path / "c.sqlite3")
+        store = OneBotIdempotencyStore(tmp_path / "c.sqlite3")
         claim = await store.begin("event:sent-key")
         await store.commit(claim)
         assert await store.clear_ambiguous("event:sent-key") is False
@@ -1740,7 +1743,7 @@ def test_clearing_refuses_a_sent_claim(tmp_path: Path) -> None:
 
 def test_clearing_all_reports_how_many_were_released(tmp_path: Path) -> None:
     async def exercise() -> None:
-        store = TwoPhaseIdempotencyStore(tmp_path / "c.sqlite3", ambiguous_ttl=0)
+        store = OneBotIdempotencyStore(tmp_path / "c.sqlite3", ambiguous_ttl=0)
         for i in range(3):
             await _dead_letter(store, f"content:group:1:{i}")
         sent = await store.begin("event:ok")
@@ -1753,7 +1756,7 @@ def test_clearing_all_reports_how_many_were_released(tmp_path: Path) -> None:
 
 def test_the_dead_letter_list_carries_handle_target_and_error(tmp_path: Path) -> None:
     async def exercise() -> None:
-        store = TwoPhaseIdempotencyStore(tmp_path / "c.sqlite3", ambiguous_ttl=0)
+        store = OneBotIdempotencyStore(tmp_path / "c.sqlite3", ambiguous_ttl=0)
         await _dead_letter(store, "content:group:12:deadbeef", error="boom detail")
         claims = await store.ambiguous_claims()
         assert len(claims) == 1
@@ -1776,7 +1779,7 @@ def test_the_target_is_recovered_from_content_and_event_keys() -> None:
 def test_an_expired_dead_letter_is_not_listed(tmp_path: Path) -> None:
     async def exercise() -> None:
         clock = _Clock()
-        store = TwoPhaseIdempotencyStore(tmp_path / "c.sqlite3", ambiguous_ttl=60, clock=clock)
+        store = OneBotIdempotencyStore(tmp_path / "c.sqlite3", ambiguous_ttl=60, clock=clock)
         await _dead_letter(store, "content:group:1:d")
         clock.advance(61)
         assert await store.ambiguous_claims() == []

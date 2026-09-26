@@ -13,16 +13,14 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from nonebot.adapters.onebot.v11 import Bot, MessageSegment
 from ..config import CLONOTH_WORKSPACE, IMAGE_FORWARD_MERGE_NICKNAME
 from ..live_config import live
-from ..send_contract import (
+from adapters._shared.send_guard import (
+    AttachmentBatchError,
     IdempotencyClaim,
-    OneBotAttachmentBatchError,
-    OneBotSendContractError,
     OutboundSendContext,
-    classify_send_exception,
+    SendContractError,
     image_content_identity,
-    make_idempotency_key,
-    protected_claim_send,
 )
+from ..send_contract import classify_send_exception, make_idempotency_key, protected_claim_send
 
 from . import common, history, identity, media, models, proactive, queueing, routing, sending, state
 
@@ -86,7 +84,7 @@ async def _send_attachment_path(
     await state._adapter.features.check_send(bot, target)
     display_name = filename or path.name
     if not path.exists():
-        raise OneBotSendContractError(f"attachment does not exist: {path}")
+        raise SendContractError(f"attachment does not exist: {path}")
     raw_bytes = path.read_bytes()
     context = send_context or OutboundSendContext(
         conversation_key=str(target.get("conversation_key") or "")
@@ -134,7 +132,7 @@ async def _send_attachment_path(
                         if classified.ambiguous_ack:
                             raise classified from exc
                         errors.append(classified)
-                failure = OneBotAttachmentBatchError(errors)
+                failure = AttachmentBatchError(errors)
                 common.logger.warning(
                     "onebot_send_failed",
                     extra={**fields, "retryable": failure.retryable, "send_error": str(failure)},
@@ -195,7 +193,7 @@ async def _send_attachment_path(
                     "upload_private_file", user_id=target["user_id"],
                     file=file_str, name=display_name,
                 )
-            raise OneBotSendContractError(f"attachment target is invalid: {target!r}")
+            raise SendContractError(f"attachment target is invalid: {target!r}")
 
         result = await protected_claim_send(
             state._adapter.outbound_idempotency,
@@ -445,7 +443,7 @@ async def _send_attachments_one_by_one(
         if message_id:
             _remember_message_attachments(message_id, [attachment])
     if failures:
-        raise OneBotAttachmentBatchError(failures)
+        raise AttachmentBatchError(failures)
 
 
 def _sent_attachment_bucket_key(target: Dict[str, Any]) -> str:

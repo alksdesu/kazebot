@@ -10,7 +10,7 @@ from ..feature_gateway import FeatureGateway
 from ..config import CLONOTH_WORKSPACE
 from adapters._shared.trigger_policy import TriggerDecision
 from ..live_config import live
-from ..send_contract import OutboundSendContext
+from adapters._shared.send_guard import OutboundSendContext
 from clonoth_sdk import ClonothClient, EventRouter
 
 from . import anonymize, inbound, message_text, models, permissions, proactive, queueing, routing, sending

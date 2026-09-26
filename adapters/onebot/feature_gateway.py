@@ -15,12 +15,12 @@ from platforms.inbound import InboundConversation, InboundFacts, InboundSender
 from . import community_commands
 from .conversation_coordinator import ConversationCoordinator
 from .burst_store import BurstStore
-from .send_contract import OneBotSendError
+from adapters._shared.send_guard import SendError
 
 logger = logging.getLogger(__name__)
 
 
-class QuietDeliveryDeferred(OneBotSendError):
+class QuietDeliveryDeferred(SendError):
     def __init__(self, until: float):
         super().__init__("本群暂时安静，投递等待恢复", retryable=True, definitely_not_sent=True)
         self.retry_after = max(1.0, until - time.time())
@@ -162,9 +162,9 @@ class FeatureGateway:
         if not delivery_id.startswith("reminder:"):
             return
         if not message_id or str(message_id).startswith(("idempotent:", "uploaded:")):
-            raise OneBotSendError("提醒已发送，但缺少真实平台消息编号；请使用提醒编号操作", retryable=False)
+            raise SendError("提醒已发送，但缺少真实平台消息编号；请使用提醒编号操作", retryable=False)
         if not self.available:
-            raise OneBotSendError("提醒已发送，消息引用绑定等待服务恢复", retryable=True)
+            raise SendError("提醒已发送，消息引用绑定等待服务恢复", retryable=True)
         scope = str(getattr(context, "conversation_key", "") or self.target_actor(bot, target)["scope"])
         try:
             await self.host.client.request_feature("POST", "/v1/reminders/delivery-messages", body={
@@ -172,7 +172,7 @@ class FeatureGateway:
                 "bot_scope": str(getattr(bot, "self_id", "") or ""), "message_id": str(message_id),
             })
         except Exception as error:
-            raise OneBotSendError("提醒已发送，消息引用绑定等待重试", retryable=True, cause=error) from error
+            raise SendError("提醒已发送，消息引用绑定等待重试", retryable=True, cause=error) from error
 
     async def prepare(self, bot, event):
         if not self.available:
@@ -387,7 +387,7 @@ class FeatureGateway:
         try:
             policy = await self.coordinator.policy(self.host.client, actor, refresh=True)
         except Exception as error:
-            raise OneBotSendError("无法核验当前群的发送策略，等待重试", retryable=True, definitely_not_sent=True, cause=error) from error
+            raise SendError("无法核验当前群的发送策略，等待重试", retryable=True, definitely_not_sent=True, cause=error) from error
         direct = target.get("_response_purpose", "direct") == "direct"
         if self.coordinator.quiet_blocks(policy, direct=direct):
             raise QuietDeliveryDeferred(float(policy["quiet"]["expires_at"]))

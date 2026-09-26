@@ -13,12 +13,14 @@ from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 from ..config import ONEBOT_IDEMPOTENCY_FALLBACK_SENT_TTL_SECONDS
 from ..live_config import live
-from ..send_contract import (
+from adapters._shared.send_guard import (
+    AmbiguousAckError,
     IdempotencyClaim,
     IdempotencyOwnershipError,
-    OneBotAmbiguousAckError,
-    OneBotSendContractError,
     OutboundSendContext,
+    SendContractError,
+)
+from ..send_contract import (
     classify_send_exception,
     is_at_uid_failure,
     is_temp_file_missing,
@@ -333,7 +335,7 @@ async def _send_qq_message_once(
         # 非本群/无法解析的 at 会让 NapCat 整条失败，发送前先清洗。
         sender, outbound = send_group, await _sanitize_group_at_segments(bot, group_id, message)
     else:
-        raise OneBotSendContractError(f"unknown QQ target type: {target!r}")
+        raise SendContractError(f"unknown QQ target type: {target!r}")
     try:
         message_id = _extract_sent_message_id(await sender(outbound))
         await state._adapter.features.record_outbound(bot, target, outbound, message_id)
@@ -451,7 +453,7 @@ async def _send_qq_message(
             payload = await message_factory() if message_factory is not None else message
             result = await _send_qq_message_once(bot, target, payload, idempotency_key=key)
             if sticker_delivery_id and not result:
-                raise OneBotAmbiguousAckError("平台未返回消息编号，表情包投递状态待确认")
+                raise AmbiguousAckError("平台未返回消息编号，表情包投递状态待确认")
             return result
 
         platform_message_id = await protected_claim_send(
@@ -528,7 +530,7 @@ async def _materialize_sticker_segments(segments: List[Dict[str, Any]]) -> Messa
             row = store.get(digest) if store is not None else None
             raw = await asyncio.to_thread(emotes._read_sticker, row) if row is not None else b""
             if not raw or hashlib.sha256(raw).hexdigest() != item.get("content_sha256"):
-                raise OneBotSendContractError("已选表情包不可用，保持原投递内容且不自动换图")
+                raise SendContractError("已选表情包不可用，保持原投递内容且不自动换图")
             item["url"] = "base64://" + base64.b64encode(raw).decode("ascii")
         materialized.append(item)
     return _message_from_processed_segments(materialized)
@@ -546,7 +548,7 @@ async def _send_planned_sticker_message(
     context = send_context.child(identity) if send_context else OutboundSendContext()
     parent_id = (send_context.idempotency_key or send_context.event_id) if send_context else ""
     if parent_id and await state._adapter.outbound_idempotency.has_legacy_message_claims(parent_id, target):
-        raise OneBotAmbiguousAckError("旧版消息存在投递记录，无法安全恢复选图，需要人工确认")
+        raise AmbiguousAckError("旧版消息存在投递记录，无法安全恢复选图，需要人工确认")
     key = make_idempotency_key(
         target, identity, event_id=context.idempotency_key or context.event_id,
     )

@@ -16,8 +16,8 @@ if str(_ROOT) not in sys.path:
 
 from adapters._shared import capability, trigger_policy  # noqa: E402
 from adapters.onebot import bot_scope, forward_authz  # noqa: E402
+from adapters._shared.send_guard import SendContractError  # noqa: E402
 from adapters.onebot.send_contract import (  # noqa: E402
-    OneBotSendContractError,
     make_idempotency_key,
     target_from_idempotency_key,
     target_identity,
@@ -210,7 +210,7 @@ class TestSendIdentity:
         assert target_from_idempotency_key(f"content:group:-100777:{'0' * 64}") == "group:-100777"
 
     def test_a_malformed_target_id_is_a_contract_error(self) -> None:
-        with pytest.raises(OneBotSendContractError):
+        with pytest.raises(SendContractError):
             target_identity({"type": "group", "group_id": "a:b"})
 
 

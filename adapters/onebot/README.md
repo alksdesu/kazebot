@@ -35,7 +35,7 @@ adapters/onebot/
 ├── feature_gateway.py           # 社区功能网关，经 FeatureHost 接口调用插件能力
 ├── config.py                    # 环境变量配置
 ├── live_config.py               # config/qq.yaml 热载配置
-├── send_contract.py             # 出站发送契约与防重
+├── send_contract.py             # QQ 目标身份与 NapCat 错误指纹，绑定共享的发送防重
 ├── forward_authz.py             # qq_forward 投递鉴权
 ├── bot_scope.py                 # 当前登录账号的落盘记录
 ├── echo_rules.py                # 复读判定里 QQ 这一侧的边界：CQ 码、渲染占位符
@@ -50,7 +50,8 @@ adapters/onebot/
 NoneBot 只出现在 `napcat/` 里，由插件入口加载。
 
 不分平台的逻辑在 `adapters/_shared/`：触发判定、管理能力档位、复读判定、会话键摘要的盐、记忆提示，
-以及热载配置引擎（`live_config.py`）、环境变量读取（`env.py`）和手写 yaml 解析（`yaml_loader.py`）。
+以及热载配置引擎（`live_config.py`）、环境变量读取（`env.py`）、手写 yaml 解析（`yaml_loader.py`）
+和出站发送防重（`send_guard.py`）。
 `live_config.py` 这边只声明 QQ 的键和配置文件位置，缓存与快照在它持有的 `LiveConfig` 实例上。
 那边不认识 QQ，平台专属的部分（群角色映射、CQ 码边界、消息段解析）留在这里，调用时传进去。
 

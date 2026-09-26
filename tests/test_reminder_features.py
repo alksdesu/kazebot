@@ -229,7 +229,7 @@ async def test_failed_receipt_and_restart_reuse_durable_onebot_send_claim(state,
 
     module = adapter_module("send_contract")
     claims_path = state.workspace_root / "adapter-claims.sqlite3"
-    claims = module.TwoPhaseIdempotencyStore(claims_path)
+    claims = module.OneBotIdempotencyStore(claims_path)
     client = ClonothClient("http://test", admin_token="reminder-test")
     client._client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), headers={"Authorization": "Bearer reminder-test"})
     sends = []
@@ -252,7 +252,7 @@ async def test_failed_receipt_and_restart_reuse_durable_onebot_send_claim(state,
         router._outbound_store.close()
         claims.close()
         state.reminders = ReminderService(state)
-        claims = module.TwoPhaseIdempotencyStore(claims_path)
+        claims = module.OneBotIdempotencyStore(claims_path)
         router = EventRouter(client, SessionState(), SimpleNamespace(send_to_channel=send), config)
         pending = router._outbound_store.pending()[0]
         await asyncio.sleep(0.06)

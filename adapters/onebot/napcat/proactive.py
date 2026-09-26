@@ -15,7 +15,8 @@ from nonebot.adapters.onebot.v11 import Bot, Event
 from ..config import CLONOTH_WORKSPACE
 from adapters._shared import capability
 from ..live_config import live
-from ..send_contract import IdempotencyClaim, OutboundSendContext, make_idempotency_key, protected_claim_send
+from adapters._shared.send_guard import IdempotencyClaim, OutboundSendContext
+from ..send_contract import make_idempotency_key, protected_claim_send
 
 from . import anonymize, common, identity, media, message_text, models, outbound_attachments, permissions, sending, state
 
