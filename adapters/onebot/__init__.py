@@ -2751,6 +2751,18 @@ def _custom_face_prompt_block(conversation_key: str = "") -> str:
     return "\n".join(lines)
 
 
+def _reply_format_prompt_block() -> str:
+    return (
+        "【QQ回复分条】\n"
+        "普通换行只在一个消息气泡内排版。想分成独立消息时，"
+        f"用 {_SPLIT_SIGNAL} 分隔直接发给用户的回复正文（包括 finish.text、reply.text）；平台会分条发送，标记不会显示。\n"
+        f"例如“收到{_SPLIT_SIGNAL}我看看”会发成两条。按语气和信息量决定，通常一条就够，"
+        "确需分条时以 2–3 条为宜，不要逐句刷屏。\n"
+        "代码、列表、引用等需要连续阅读的内容不要拆散，保留普通换行。\n"
+        f"当前任务要求简短接话或只回一句时，只发一条，不使用 {_SPLIT_SIGNAL}。"
+    )
+
+
 def _reaction_prompt_block() -> str:
     """构造模型可见的 QQ 表态说明；白名单外的 ID 会被丢弃，所以只列白名单。"""
     if not live.enable_reactions:
@@ -5739,6 +5751,8 @@ async def _build_inbound_text(
 
     parts.extend([
         "",
+        _reply_format_prompt_block(),
+        "",
         f"当前时间: {now}",
         "【当前用户身份】",
         *_user_identity_lines(event, current_name),
@@ -5774,6 +5788,9 @@ async def _build_draw_direct_inbound_text(event: Event, user_text: str, is_dm: b
     return "\n".join([
         f"当前时间: {now}",
         f"来源: QQ{target} / /生图 直达命令",
+        "",
+        _reply_format_prompt_block(),
+        "",
         "【当前用户身份】",
         *_user_identity_lines(event, name),
         "",
@@ -5801,6 +5818,8 @@ async def _build_private_inbound_text(event: PrivateMessageEvent, bot: Bot, user
     if custom_face_prompt:
         parts.extend(["", custom_face_prompt])
     parts.extend([
+        "",
+        _reply_format_prompt_block(),
         "",
         "【当前用户身份】",
         *_user_identity_lines(event, name),
