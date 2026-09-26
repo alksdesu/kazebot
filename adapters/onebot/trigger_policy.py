@@ -9,6 +9,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from platforms.ids import normalize_id
+
 # 信号名。命中哪个要报给试听，所以是稳定字面量而不是随手写的字符串。
 SIGNAL_ALL = "all"
 SIGNAL_AT = "at"
@@ -114,13 +116,17 @@ class TriggerInput:
     """
 
     text: str = ""
-    group_id: int = 0
-    user_id: int = 0
+    group_id: str = ""
+    user_id: str = ""
     at_me: bool = False
     reply_to_bot: bool = False
     now: float = 0.0
     # 随机插话的骰子，[0,1)。由外部注入而不是就地 random()：dry-run 要可复现。
     roll: float = 1.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "group_id", normalize_id(self.group_id))
+        object.__setattr__(self, "user_id", normalize_id(self.user_id))
 
 
 @dataclass(frozen=True)
@@ -159,14 +165,14 @@ class CooldownState:
     __slots__ = ("_by_group", "_by_user")
 
     def __init__(self) -> None:
-        self._by_group: dict[int, float] = {}
-        self._by_user: dict[tuple[int, int], float] = {}
+        self._by_group: dict[str, float] = {}
+        self._by_user: dict[tuple[str, str], float] = {}
 
     def remaining(self, inp: TriggerInput, config: TriggerConfig) -> tuple[float, str]:
         """还要等多久，以及是被哪一维挡住的。返回 (0.0, "") 表示可以说话。"""
         checks = (
-            (config.cooldown_group_sec, self._by_group.get(int(inp.group_id)), "per_group"),
-            (config.cooldown_user_sec, self._by_user.get((int(inp.group_id), int(inp.user_id))), "per_user"),
+            (config.cooldown_group_sec, self._by_group.get(inp.group_id), "per_group"),
+            (config.cooldown_user_sec, self._by_user.get((inp.group_id, inp.user_id)), "per_user"),
         )
         worst = 0.0
         scope = ""
@@ -180,12 +186,12 @@ class CooldownState:
 
     def record(self, inp: TriggerInput) -> None:
         """记下这一次真的开口了。只有实际触发才调，被冷却挡住的不算。"""
-        self._by_group[int(inp.group_id)] = inp.now
-        self._by_user[(int(inp.group_id), int(inp.user_id))] = inp.now
+        self._by_group[inp.group_id] = inp.now
+        self._by_user[(inp.group_id, inp.user_id)] = inp.now
 
-    def forget_group(self, group_id: int) -> None:
+    def forget_group(self, group_id: Any) -> None:
         """清掉一个群的冷却。会话被重置时用，否则重置完还要干等一轮。"""
-        gid = int(group_id)
+        gid = normalize_id(group_id)
         self._by_group.pop(gid, None)
         for key in [k for k in self._by_user if k[0] == gid]:
             self._by_user.pop(key, None)

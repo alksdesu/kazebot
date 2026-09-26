@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
 from clonoth_sdk.types import DeliveryContext as OutboundSendContext
+from platforms.ids import ID_BODY, normalize_id
 
 logger = logging.getLogger(__name__)
 
@@ -895,6 +896,9 @@ def classify_send_exception(exc: BaseException) -> OneBotSendError:
     return OneBotAmbiguousAckError(f"OneBot send ack is unknown: {exc}", cause=exc)
 
 
+_TARGET_IDENTITY_RE = re.compile(rf"(group|private):{ID_BODY}")
+
+
 def target_identity(target: Mapping[str, Any]) -> str:
     target_type = str(target.get("type") or "").strip()
     if target_type == "group":
@@ -903,9 +907,13 @@ def target_identity(target: Mapping[str, Any]) -> str:
         target_id = target.get("user_id")
     else:
         raise OneBotSendContractError(f"unknown QQ target type: {dict(target)!r}")
+    field = "group_id" if target_type == "group" else "user_id"
     if target_id is None or str(target_id).strip() == "":
-        raise OneBotSendContractError(f"{target_type} target missing {'group_id' if target_type == 'group' else 'user_id'}")
-    return f"{target_type}:{target_id}"
+        raise OneBotSendContractError(f"{target_type} target missing {field}")
+    identity = normalize_id(target_id)
+    if not identity:
+        raise OneBotSendContractError(f"{target_type} target has a malformed {field}: {target_id!r}")
+    return f"{target_type}:{identity}"
 
 
 def target_from_idempotency_key(key: str) -> str:
@@ -916,7 +924,7 @@ def target_from_idempotency_key(key: str) -> str:
     else:
         parts = key.rsplit(":", 2)
         value = ":".join(parts[-2:]) if len(parts) >= 2 else ""
-    return value if re.fullmatch(r"(group|private):\d+", value) else ""
+    return value if _TARGET_IDENTITY_RE.fullmatch(value) else ""
 
 
 def make_idempotency_key(

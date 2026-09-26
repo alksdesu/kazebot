@@ -40,6 +40,13 @@ from typing import Any
 # 均属 Bot 展示层逻辑，不属于协议 SDK，已迁至 Bot 适配器层。
 
 
+def channel_key(channel_id: Any) -> str:
+    """频道 ID 统一成字符串键：同一个频道不管传 int 还是 str，都落到同一个键上。"""
+    if channel_id is None or isinstance(channel_id, bool):
+        return ""
+    return str(channel_id).strip()
+
+
 @dataclass
 class TriggerInfo:
     """触发消息信息 — 跟踪 inbound 请求与平台消息的映射。
@@ -58,7 +65,7 @@ class TriggerInfo:
       status_msg — 平台消息对象 | None（⏳处理中 的状态消息）
       cancel_view — CancelView（取消按钮 UI 组件）
       last_typing_time — float（上次触发 typing 的时间）
-      channel_id — int（冗余存储供平台快速定位频道）
+      channel_id — str（冗余存储供平台快速定位频道；传 int 也按字符串登记）
     """
     inbound_seq: int
     conversation_key: str
@@ -147,7 +154,7 @@ class SessionState:
         trigger = TriggerInfo(
             inbound_seq=42, conversation_key="qq_group:123",
             session_id="sid-abc", is_dm=False,
-            platform_data={"message": platform_msg, "channel_id": 123},
+            platform_data={"message": platform_msg, "channel_id": "123"},
         )
         state.register_trigger(trigger)
 
@@ -181,16 +188,16 @@ class SessionState:
 
         # ---- watermark 管理 ----
         # 对应 _pending_watermarks: dict[int, tuple[int, int]]  (inbound_seq → (channel_id, wm_seq), L251)
-        self.pending_watermarks: dict[int, tuple[int, int]] = {}
+        self.pending_watermarks: dict[int, tuple[str, int]] = {}
         # 对应 _last_ctx_seq: dict[int, int]  (channel_id → high watermark seq, L250)
-        self.last_ctx_seq: dict[int, int] = {}
+        self.last_ctx_seq: dict[str, int] = {}
         self._accepted_watermarks: OrderedDict[int, float] = OrderedDict()
-        self._watermark_generations: dict[int, int] = {}
+        self._watermark_generations: dict[str, int] = {}
 
         # ---- DM 频道映射 ----
         # trigger 消费后子节点仍能找到 DM 频道
         # 对应 _session_dm_channels: dict[str, int]  (session_id → channel_id, L133)
-        self.session_dm_channels: dict[str, int] = {}
+        self.session_dm_channels: dict[str, str] = {}
 
     # ================================================================
     #  Session 映射
@@ -247,9 +254,9 @@ class SessionState:
         # DM 场景：自动注册 session → channel 映射，
         # 使 trigger 被消费后子节点仍能找到发送目标
         if trigger.is_dm:
-            channel_id = trigger.platform_data.get("channel_id")
-            if channel_id is not None:
-                self.session_dm_channels[trigger.session_id] = channel_id
+            channel = channel_key(trigger.platform_data.get("channel_id"))
+            if channel:
+                self.session_dm_channels[trigger.session_id] = channel
 
     def consume_trigger(self, inbound_seq: int) -> TriggerInfo | None:
         """消费（pop）指定 inbound_seq 的 trigger 并返回。不存在时返回 None。
@@ -452,7 +459,7 @@ class SessionState:
     # ================================================================
 
     def register_watermark(
-        self, inbound_seq: int, channel_id: int, watermark_seq: int,
+        self, inbound_seq: int, channel_id: str | int, watermark_seq: int,
         *, generation: int | None = None,
     ) -> None:
         """注册待确认的水位标记。
@@ -463,16 +470,17 @@ class SessionState:
         水位在 inbound_accepted 事件到达后才正式推进，防止 engine 未接受
         消息时错误地认为历史已发送。
         """
+        channel = channel_key(channel_id)
         self._prune_accepted_watermarks()
-        if generation is not None and generation != self.watermark_generation(channel_id):
+        if generation is not None and generation != self.watermark_generation(channel):
             return
         if inbound_seq in self._accepted_watermarks:
-            self.advance_watermark(channel_id, watermark_seq)
+            self.advance_watermark(channel, watermark_seq)
         else:
-            self.pending_watermarks[inbound_seq] = (channel_id, watermark_seq)
+            self.pending_watermarks[inbound_seq] = (channel, watermark_seq)
 
-    def watermark_generation(self, channel_id: int) -> int:
-        return self._watermark_generations.get(channel_id, 0)
+    def watermark_generation(self, channel_id: str | int) -> int:
+        return self._watermark_generations.get(channel_key(channel_id), 0)
 
     def _prune_accepted_watermarks(self) -> None:
         cutoff = time.monotonic() - self._EARLY_WATERMARK_TTL
@@ -482,18 +490,19 @@ class SessionState:
                     break
             self._accepted_watermarks.popitem(last=False)
 
-    def advance_watermark(self, channel_id: int, watermark_seq: int) -> int:
+    def advance_watermark(self, channel_id: str | int, watermark_seq: int) -> int:
         """直接推进频道高水位，返回推进后的值。
 
         preempt 注入不产生新的 inbound_seq，没有可等待的 inbound_accepted，
         因此这条路径只能在 preempt 成功后立即推进。
         """
-        self.last_ctx_seq[channel_id] = max(
-            self.last_ctx_seq.get(channel_id, -1), watermark_seq,
+        channel = channel_key(channel_id)
+        self.last_ctx_seq[channel] = max(
+            self.last_ctx_seq.get(channel, -1), watermark_seq,
         )
-        return self.last_ctx_seq[channel_id]
+        return self.last_ctx_seq[channel]
 
-    def accept_watermark(self, inbound_seq: int) -> tuple[int, int] | None:
+    def accept_watermark(self, inbound_seq: int) -> tuple[str, int] | None:
         """确认水位标记并推进 last_ctx_seq 高水位。
 
         对应 bot_adapter.py L1984-1989 inbound_accepted 事件处理：
@@ -514,28 +523,29 @@ class SessionState:
         channel_id, watermark_seq = wm
         return channel_id, self.advance_watermark(channel_id, watermark_seq)
 
-    def reset_channel_watermark(self, channel_id: int) -> None:
+    def reset_channel_watermark(self, channel_id: str | int) -> None:
         """重置频道的高水位（context_reset 时调用）。
 
         对应 bot_adapter.py L1956：
           _last_ctx_seq.pop(_cr_ch_id, None)
         重置后下一轮 inbound 会带完整频道历史。
         """
-        self.last_ctx_seq.pop(channel_id, None)
-        self._watermark_generations[channel_id] = self.watermark_generation(channel_id) + 1
+        channel = channel_key(channel_id)
+        self.last_ctx_seq.pop(channel, None)
+        self._watermark_generations[channel] = self.watermark_generation(channel) + 1
         for seq, (pending_channel, _) in list(self.pending_watermarks.items()):
-            if pending_channel == channel_id:
+            if pending_channel == channel:
                 self.pending_watermarks.pop(seq, None)
 
-    def get_high_watermark(self, channel_id: int) -> int:
+    def get_high_watermark(self, channel_id: str | int) -> int:
         """获取频道的当前高水位序号。默认 -1（表示无历史发送记录）。"""
-        return self.last_ctx_seq.get(channel_id, -1)
+        return self.last_ctx_seq.get(channel_key(channel_id), -1)
 
     # ================================================================
     #  DM Channel 管理
     # ================================================================
 
-    def register_dm_channel(self, session_id: str, channel_id: int) -> None:
+    def register_dm_channel(self, session_id: str, channel_id: str | int) -> None:
         """注册 DM 频道映射。
 
         对应 bot_adapter.py L901-902：
@@ -544,9 +554,11 @@ class SessionState:
         通常由 register_trigger 内部自动调用。
         也可在 preempt V2 重新注册 trigger 时显式调用。
         """
-        self.session_dm_channels[session_id] = channel_id
+        channel = channel_key(channel_id)
+        if channel:
+            self.session_dm_channels[session_id] = channel
 
-    def get_dm_channel(self, session_id: str) -> int | None:
+    def get_dm_channel(self, session_id: str) -> str | None:
         """查找 session 对应的 DM 频道 ID。
 
         trigger 被消费后，子节点仍可通过此方法找到 DM 发送目标。
@@ -554,16 +566,17 @@ class SessionState:
         """
         return self.session_dm_channels.get(session_id)
 
-    def cleanup_dm_channels_for(self, channel_id: int) -> None:
+    def cleanup_dm_channels_for(self, channel_id: str | int) -> None:
         """清理指定频道的所有 DM 映射。
 
         对应 bot_adapter.py L1978-1980 context_reset(clear)：
           _cr_stale_sdc = [sid for sid, ch in _session_dm_channels.items() if ch == _cr_ch_id]
           for sid in _cr_stale_sdc: _session_dm_channels.pop(sid, None)
         """
+        channel = channel_key(channel_id)
         stale_sids = [
             sid for sid, ch in self.session_dm_channels.items()
-            if ch == channel_id
+            if ch == channel
         ]
         for sid in stale_sids:
             del self.session_dm_channels[sid]

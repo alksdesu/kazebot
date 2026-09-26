@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from platforms.ids import normalize_id, same_id
+
 # 授权档位，由窄到宽。值是「这项能力最宽给到谁」，不是「谁在用」。
 OFF = "off"
 LISTED = "admin"
@@ -131,19 +133,27 @@ def clamp(capability_key: str, grant: Any) -> str:
 
 @dataclass(frozen=True)
 class Requester:
-    """一次命令请求的身份。group_role 只在群消息里有，私聊恒为空串。"""
+    """一次命令请求的身份。ID 一律是字符串；group_id 为空串表示私聊，group_role 私聊恒为空串。"""
 
-    user_id: int | None
+    user_id: str
     listed_admin: bool
-    group_id: int | None = None
+    group_id: str = ""
     group_role: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "user_id", normalize_id(self.user_id))
+        object.__setattr__(self, "group_id", normalize_id(self.group_id))
+
+    @property
+    def in_group(self) -> bool:
+        return bool(self.group_id)
 
     @property
     def rank(self) -> int:
         if self.listed_admin:
             return RANK_LISTED
         # 群角色只在群里成立：私聊没有「本群」，群主在私聊里就是个普通用户。
-        if self.group_id is None:
+        if not self.in_group:
             return RANK_MEMBER
         return _ROLE_RANK.get(str(self.group_role or "").strip().lower(), RANK_MEMBER)
 
@@ -164,13 +174,9 @@ def scope_deny_reason(capability_key: str, requester: Requester, target_group_id
     cap = BY_KEY.get(capability_key)
     if cap is None or not cap.group_scoped:
         return ""
-    if requester.group_id is None:
+    if not requester.in_group:
         return CROSS_GROUP_DENIED
-    try:
-        target = int(target_group_id)
-    except (TypeError, ValueError):
-        return CROSS_GROUP_DENIED
-    return "" if target == requester.group_id else CROSS_GROUP_DENIED
+    return "" if same_id(target_group_id, requester.group_id) else CROSS_GROUP_DENIED
 
 
 def may_see_target_roster(requester: Requester) -> bool:

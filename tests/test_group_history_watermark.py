@@ -352,7 +352,7 @@ class TestWatermarkAdvance:
         assert submitted.run(3) is True
 
         assert runtime._session_state.get_high_watermark(_GROUP_ID) == -1
-        assert runtime._session_state.pending_watermarks[77] == (_GROUP_ID, 3)
+        assert runtime._session_state.pending_watermarks[77] == (str(_GROUP_ID), 3)
 
     def test_the_watermark_advances_once_the_inbound_is_accepted(self, runtime, submitted) -> None:
         submitted.run(3)

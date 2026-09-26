@@ -9,6 +9,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 from platforms.descriptor import HOOK_TRIGGER_POLICY, PlatformDescriptor
+from platforms.ids import normalize_id
 from platforms.registry import platform_hook
 
 
@@ -54,8 +55,8 @@ def dry_run(
         item = raw if isinstance(raw, dict) else {}
         inp = policy.TriggerInput(
             text=str(item.get("text") or ""),
-            group_id=int(item.get("group_id") or 0),
-            user_id=int(item.get("user_id") or 0),
+            group_id=normalize_id(item.get("group_id")),
+            user_id=normalize_id(item.get("user_id")),
             at_me=_as_bool(item.get("at_me")),
             reply_to_bot=_as_bool(item.get("reply_to_bot")),
             # 默认「每条间隔一秒依次到达」，冷却窗口的效果才看得出来。

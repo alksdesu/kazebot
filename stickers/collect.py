@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from platforms.ids import normalize_id
+
 from .filter import decide, marked_as_sticker, normalize_strategy, read_shape
 from .store import (
     SOURCE_GROUP,
@@ -41,7 +43,7 @@ _EXT_BY_FMT = {
 class CollectConfig:
     enabled: bool = False
     strategy: str = "loose"
-    groups: tuple[int, ...] = ()
+    groups: tuple[str, ...] = ()
     auto_accept: bool = False
     pending_limit: int = 200
     library_limit: int = 1000
@@ -49,14 +51,16 @@ class CollectConfig:
     pending_ttl_sec: int = 7 * 86400
     max_bytes: int = 4 * 1024 * 1024
 
+    def __post_init__(self) -> None:
+        groups = tuple(dict.fromkeys(g for g in (normalize_id(item) for item in self.groups) if g))
+        object.__setattr__(self, "groups", groups)
+
     def covers(self, group_id: Any) -> bool:
         """留空表示所有已授权的群，不是一个都不收。"""
         if not self.groups:
             return True
-        try:
-            return int(group_id) in self.groups
-        except (TypeError, ValueError):
-            return False
+        gid = normalize_id(group_id)
+        return bool(gid) and gid in self.groups
 
 
 @dataclass(frozen=True)
@@ -190,7 +194,7 @@ class StickerCollector:
                 path=self.workspace_root / rel,
                 # 附件层已经认出商城表情了，段级判定再补收藏表情那一类。
                 marked=bool(item.get("sticker")) or marked,
-                from_group=str(group_id or ""),
+                from_group=normalize_id(group_id),
                 from_user=str(user_key or ""),
             )
             try:

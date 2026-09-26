@@ -7,6 +7,8 @@ from __future__ import annotations
 import fnmatch
 from typing import Any
 
+from platforms.ids import same_id
+
 # 经 QQ 外传即离开本机、过腾讯服务器且不可撤回，所以这批路径对管理员也拒绝：
 # 需要时走 read_file 审批流，顺带挡住管理员在群里被提示词注入骗走密钥。
 FILE_DENY_GLOBS: tuple[str, ...] = (
@@ -75,17 +77,11 @@ def target_is_origin(
     按解析后的真实 id 比对而非 target_type 字面值：用户写“发到群 12345”而 12345
     正是本群时应放行，反之写 target_type=self 也不能绕过。
     """
-    try:
-        tid = int(target_id)
-    except (TypeError, ValueError):
-        return False
     kind = str(target_type or "").strip().lower()
     if kind == "private":
-        origin = _as_int(origin_user_id)
-        return origin is not None and tid == origin
+        return same_id(target_id, origin_user_id)
     if kind == "group":
-        origin = _as_int(origin_group_id)
-        return origin is not None and tid == origin
+        return same_id(target_id, origin_group_id)
     return False
 
 
@@ -123,10 +119,3 @@ def file_paths_deny_reason(*, is_admin: bool, raw_file_paths: Any) -> str:
     if is_admin or not has_explicit_file_paths(raw_file_paths):
         return ""
     return FILE_PATHS_DENIED
-
-
-def _as_int(value: Any) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None

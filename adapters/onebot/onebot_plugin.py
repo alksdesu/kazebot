@@ -36,6 +36,7 @@ from nonebot.rule import Rule
 # 按人记忆的建档名册由适配层写、engine worker 读，两侧共用这一份判定。
 from engine import memory_subjects
 from engine.attachments import sniff_image_mime
+from platforms.ids import normalize_id
 
 from .faces import face_display_name
 from .feature_gateway import FeatureGateway
@@ -781,9 +782,9 @@ def _requester(event: Any) -> capability.Requester:
     # 匿名消息的身份不可核验，一律按普通群员判定。
     anonymous = bool(_anonymous_identity(event))
     return capability.Requester(
-        user_id=_as_qq_id(user_id),
+        user_id=normalize_id(user_id),
         listed_admin=(not anonymous) and _is_admin_user(user_id),
-        group_id=_as_qq_id(getattr(event, "group_id", None)),
+        group_id=normalize_id(getattr(event, "group_id", None)),
         group_role="" if anonymous else str(getattr(getattr(event, "sender", None), "role", "") or ""),
     )
 
@@ -2473,7 +2474,7 @@ def _sticker_collect_config() -> CollectConfig:
     return CollectConfig(
         enabled=bool(live.sticker_collect),
         strategy=str(live.sticker_strategy),
-        groups=tuple(live.sticker_groups),
+        groups=tuple(normalize_id(group_id) for group_id in live.sticker_groups),
         auto_accept=bool(live.sticker_auto_accept),
         pending_limit=int(live.sticker_pending_limit),
         library_limit=int(live.sticker_library_limit),
@@ -3777,8 +3778,9 @@ async def _resolve_proactive_target(
             return None, "该私聊目标不在好友/管理员/允许私聊白名单中。"
         return ProactiveTarget("private", target_id, _qq_profile_display_name(target_id) or _anonymize_user_id(target_id)), ""
 
-    if target_type == "group" and ref_norm in {_normalize_target_ref("当前群"), _normalize_target_ref("本群")} and requester.group_id is not None:
-        gid = int(requester.group_id)
+    current_gid = _as_qq_id(requester.group_id) if requester.in_group else None
+    if target_type == "group" and ref_norm in {_normalize_target_ref("当前群"), _normalize_target_ref("本群")} and current_gid is not None:
+        gid = current_gid
         if not _is_group_allowed(gid):
             return None, "当前群不在允许的主动群聊目标中。"
         return ProactiveTarget("group", gid, "当前群"), ""
@@ -4557,7 +4559,7 @@ def _purge_conversation_side_state(conversation_key: str, target: Dict[str, Any]
         # qq_forward 的转发候选是群历史的第二份副本，只清前者等于没清。
         _group_content_records.pop(int(group_id), None)
         # 清了会话还让它继续静默没有道理：运营者刚说「重新开始」，下一句就该有人应。
-        _trigger_cooldown.forget_group(int(group_id))
+        _trigger_cooldown.forget_group(group_id)
     _remove_conversation_attachment_dir(conversation_key)
 
 
@@ -5277,8 +5279,12 @@ def _purge_account_scoped_caches() -> None:
 def _adopt_bot_scope(bot: Any) -> None:
     """记住当前账号；换号时丢掉按旧账号算出的键缓存，让它们按新作用域重算。"""
     global _ACTIVE_BOT_SCOPE
-    scope = _bot_scope.normalize(getattr(bot, "self_id", None))
-    if not scope or scope == _ACTIVE_BOT_SCOPE:
+    raw_self_id = getattr(bot, "self_id", None)
+    scope = _bot_scope.normalize(raw_self_id)
+    if not scope:
+        _warn_unscoped_self_id(raw_self_id)
+        return
+    if scope == _ACTIVE_BOT_SCOPE:
         return
     previous = _ACTIVE_BOT_SCOPE
     _ACTIVE_BOT_SCOPE = scope
@@ -5289,6 +5295,21 @@ def _adopt_bot_scope(bot: Any) -> None:
     logger.warning(
         "QQ account changed (%s -> %s): conversations and memory now use a separate namespace",
         previous or "<none>", scope,
+    )
+
+
+_REFUSED_SELF_IDS: set[str] = set()
+
+
+def _warn_unscoped_self_id(raw_self_id: Any) -> None:
+    """账号 ID 不合法时不加作用域，但必须说出来：多账号隔离被关掉不能是静默的。"""
+    text = str(raw_self_id if raw_self_id is not None else "").strip()
+    if not text or text in _REFUSED_SELF_IDS:
+        return
+    _REFUSED_SELF_IDS.add(text)
+    logger.warning(
+        "QQ self_id %r is not a valid account id; conversations stay in scope %s",
+        text[:64], _ACTIVE_BOT_SCOPE or "<none>",
     )
 
 
@@ -5606,8 +5627,8 @@ def _trigger_input(event: GroupMessageEvent, bot: Bot, text: str) -> TriggerInpu
     """把 NoneBot 事件摊成纯判定要的事实。dry-run 从 JSON 构造同一个结构。"""
     return TriggerInput(
         text=text or "",
-        group_id=int(getattr(event, "group_id", 0) or 0),
-        user_id=int(getattr(event, "user_id", 0) or 0),
+        group_id=normalize_id(getattr(event, "group_id", None)),
+        user_id=normalize_id(getattr(event, "user_id", None)),
         at_me=_event_at_mentions_bot(event, bot),
         reply_to_bot=_event_replies_to_bot(event, bot),
         now=time.time(),
@@ -8360,11 +8381,11 @@ def _forward_bridge_requester(
         session_id, parent_session_id=parent_session_id, runtime_session_id=runtime_session_id,
     )
     return capability.Requester(
-        user_id=uid,
+        user_id=normalize_id(uid),
         listed_admin=uid is not None and _is_admin_user(uid),
-        group_id=_forward_bridge_origin_group_id(
+        group_id=normalize_id(_forward_bridge_origin_group_id(
             session_id, parent_session_id=parent_session_id, runtime_session_id=runtime_session_id,
-        ),
+        )),
     )
 
 

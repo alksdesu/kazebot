@@ -10,6 +10,9 @@ import logging
 import os
 from pathlib import Path
 
+from platforms.builtin import QQ_NAPCAT
+from platforms.ids import normalize_id
+
 logger = logging.getLogger(__name__)
 
 STATE_FILENAME = "onebot_active_bot.json"
@@ -19,13 +22,16 @@ def scope_file(workspace: Path) -> Path:
     return Path(workspace) / "data" / STATE_FILENAME
 
 
-def normalize(self_id: object) -> str:
-    """QQ 号规范化成纯数字串。取不到或不合法一律返回空串（= 不加作用域）。"""
-    raw = str(self_id or "").strip()
-    return raw if raw.isdigit() else ""
+def normalize(self_id: object, *, shape: str = QQ_NAPCAT.id_shape) -> str:
+    """账号规范化成字符串 ID，形状跟平台描述走。取不到或不合法一律返回空串（= 不加作用域）。
+
+    NapCat 的账号恒为纯数字，脏值宁可不加作用域，也不能把记忆分叉进算不回来的命名空间；
+    账号是字符串的平台（如 QQ 官方的 openid）传 ID_STRING。
+    """
+    return normalize_id(self_id, shape)
 
 
-def load_scope(workspace: Path) -> str:
+def load_scope(workspace: Path, *, shape: str = QQ_NAPCAT.id_shape) -> str:
     """读上次记住的账号。文件缺失或损坏都返回空串，退化成加隔离前的摘要。"""
     path = scope_file(workspace)
     try:
@@ -35,13 +41,13 @@ def load_scope(workspace: Path) -> str:
     except (OSError, ValueError):
         logger.error("cannot read active bot scope %s; running unscoped", path)
         return ""
-    return normalize(payload.get("self_id") if isinstance(payload, dict) else "")
+    return normalize(payload.get("self_id") if isinstance(payload, dict) else "", shape=shape)
 
 
-def save_scope(workspace: Path, self_id: object) -> bool:
+def save_scope(workspace: Path, self_id: object, *, shape: str = QQ_NAPCAT.id_shape) -> bool:
     """记住当前账号，返回是否真的换了号。空 self_id 不落盘，避免抹掉已知作用域。"""
-    scope = normalize(self_id)
-    if not scope or scope == load_scope(workspace):
+    scope = normalize(self_id, shape=shape)
+    if not scope or scope == load_scope(workspace, shape=shape):
         return False
     path = scope_file(workspace)
     payload = {"self_id": scope}
