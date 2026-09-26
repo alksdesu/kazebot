@@ -6,7 +6,9 @@ unit-tested in the core development environment.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
+import json
 import logging
 import os
 import re
@@ -122,6 +124,77 @@ class AmbiguousClaim:
         return hashlib.sha256(self.key.encode("utf-8")).hexdigest()[:8]
 
 
+@dataclass(frozen=True)
+class MessagePlan:
+    key: str
+    delivery_id: str
+    claim_key: str
+    target: str
+    processed_segments: list[dict[str, Any]]
+    send_identity: str
+    selected_images: list[str]
+    conversation_key: str
+    quoted: bool = False
+    confirmed_at: float = 0.0
+    platform_message_id: str = ""
+
+
+def _plan_payload(prepared: Mapping[str, Any]) -> str:
+    if not isinstance(prepared, Mapping):
+        raise OneBotSendContractError("message plan builder must return an object")
+    segments = prepared.get("processed_segments")
+    digests = prepared.get("selected_images", [])
+    identity = prepared.get("send_identity")
+    conversation = prepared.get("conversation_key", "")
+    quoted = prepared.get("quoted", False)
+    if not isinstance(segments, list) or any(not isinstance(item, dict) for item in segments):
+        raise OneBotSendContractError("message plan requires processed segment objects")
+    if not isinstance(digests, list) or any(
+        not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{64}", item) for item in digests
+    ):
+        raise OneBotSendContractError("message plan requires SHA-256 image references")
+    if not isinstance(identity, str) or not identity or not isinstance(conversation, str):
+        raise OneBotSendContractError("message plan requires a send identity and conversation key")
+    if not isinstance(quoted, bool):
+        raise OneBotSendContractError("message plan quoted flag must be boolean")
+    for item in segments:
+        if str(item.get("type") or "") != "image":
+            continue
+        remaining: list[Any] = [item]
+        visited: set[int] = set()
+        while remaining:
+            value = remaining.pop()
+            if isinstance(value, (dict, list)):
+                if id(value) in visited:
+                    continue
+                visited.add(id(value))
+            if isinstance(value, dict):
+                remaining.extend(value.values())
+            elif isinstance(value, list):
+                remaining.extend(value)
+            elif isinstance(value, str) and value.lower().startswith(("base64://", "data:image/")):
+                raise OneBotSendContractError("message plans cannot persist inline image data")
+        content = str(item.get("url") or item.get("content") or "")
+        if content and not content.lower().startswith(("https://", "http://")):
+            raise OneBotSendContractError("local plan images must use SHA-256 references, not inline data or paths")
+        if not content and not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sticker_sha256") or "")):
+            raise OneBotSendContractError("local plan image is missing its SHA-256 reference")
+        for name in ("sticker_sha256", "content_sha256"):
+            if name in item and not re.fullmatch(r"[0-9a-f]{64}", str(item[name])):
+                raise OneBotSendContractError("invalid message plan image digest")
+    payload = {
+        "processed_segments": segments, "send_identity": identity,
+        "selected_images": digests, "conversation_key": conversation, "quoted": quoted,
+    }
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise OneBotSendContractError("message plan must contain JSON-compatible data") from exc
+    if len(encoded.encode("utf-8")) > 1_048_576:
+        raise OneBotSendContractError("message plan exceeds the persistence size limit")
+    return encoded
+
+
 class TwoPhaseIdempotencyStore:
     """SQLite/WAL pending→sent idempotency store spanning callback and restarts."""
 
@@ -149,11 +222,11 @@ class TwoPhaseIdempotencyStore:
         self._clock = clock
         self._lock = asyncio.Lock()
         self._db = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=FULL")
-        self._db.execute("PRAGMA busy_timeout=30000")
-        self._db.execute("BEGIN IMMEDIATE")
         try:
+            self._enable_wal(self._db)
+            self._db.execute("PRAGMA synchronous=FULL")
+            self._db.execute("PRAGMA busy_timeout=30000")
+            self._db.execute("BEGIN IMMEDIATE")
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS claims (key TEXT PRIMARY KEY,state TEXT NOT NULL,updated REAL NOT NULL,owner TEXT NOT NULL,lease_until REAL NOT NULL DEFAULT 0,retention_until REAL NOT NULL DEFAULT 0,platform_message_id TEXT NOT NULL DEFAULT '',last_error TEXT NOT NULL DEFAULT '')"
             )
@@ -166,15 +239,101 @@ class TwoPhaseIdempotencyStore:
                 self._db.execute("ALTER TABLE claims ADD COLUMN platform_message_id TEXT NOT NULL DEFAULT ''")
             if "last_error" not in columns:
                 self._db.execute("ALTER TABLE claims ADD COLUMN last_error TEXT NOT NULL DEFAULT ''")
+            self._db.execute(
+                """CREATE TABLE IF NOT EXISTS message_plans (
+                delivery_id TEXT PRIMARY KEY,plan_key TEXT NOT NULL,claim_key TEXT NOT NULL UNIQUE,
+                target TEXT NOT NULL,state TEXT NOT NULL,owner TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,lease_until REAL NOT NULL DEFAULT 0,
+                updated REAL NOT NULL,expires REAL NOT NULL,cleanup_after REAL NOT NULL,
+                delivery_ttl REAL NOT NULL,payload TEXT NOT NULL DEFAULT '',
+                receipt_state TEXT NOT NULL DEFAULT '',confirmed_at REAL NOT NULL DEFAULT 0,
+                platform_message_id TEXT NOT NULL DEFAULT '')"""
+            )
+            self._db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS message_plan_active_key ON message_plans(plan_key) WHERE active=1"
+            )
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS message_plan_receipts ON message_plans(receipt_state,confirmed_at)"
+            )
+            self._db.execute("CREATE TABLE IF NOT EXISTS outbound_metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+            self._db.execute(
+                "INSERT OR IGNORE INTO outbound_metadata(key,value) VALUES('message_plan_protocol_started_at',?)",
+                (str(self._clock()),),
+            )
+            self.protocol_started_at = float(self._db.execute(
+                "SELECT value FROM outbound_metadata WHERE key='message_plan_protocol_started_at'"
+            ).fetchone()[0])
             self._db.execute("COMMIT")
-        except Exception:
-            self._db.execute("ROLLBACK")
+        except BaseException:
+            try:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+            finally:
+                self._db.close()
             raise
+
+    @staticmethod
+    def _enable_wal(db: sqlite3.Connection) -> None:
+        timeout = int(db.execute("PRAGMA busy_timeout").fetchone()[0])
+        deadline = time.monotonic() + 15.0
+        delay = 0.01
+        try:
+            while True:
+                remaining = max(0.0, deadline - time.monotonic())
+                db.execute(f"PRAGMA busy_timeout={min(250, int(remaining * 1000))}")
+                try:
+                    mode = db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                    if str(mode).lower() != "wal":
+                        raise sqlite3.OperationalError("OneBot outbound store could not enable WAL")
+                    return
+                except sqlite3.OperationalError as error:
+                    if (getattr(error, "sqlite_errorcode", 0) & 0xff) not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    time.sleep(min(delay, remaining))
+                    delay = min(delay * 2, 0.1)
+        finally:
+            db.execute(f"PRAGMA busy_timeout={timeout}")
 
     def close(self) -> None:
         self._db.close()
 
+    def _expire_sent_plans_locked(self, now: float) -> None:
+        expired_receipts = int(self._db.execute(
+            "SELECT COUNT(*) FROM message_plans WHERE state='sent' AND receipt_state='pending' AND cleanup_after<=?",
+            (now,),
+        ).fetchone()[0])
+        self._db.execute("DELETE FROM message_plans WHERE state='sent' AND cleanup_after<=?", (now,))
+        if expired_receipts:
+            logger.warning("onebot_message_receipt_repair_expired count=%d", expired_receipts)
+
     def _prune_locked(self, now: float) -> None:
+        quarantine = max(self.sent_ttl, self.ambiguous_ttl)
+        self._db.execute(
+            """UPDATE message_plans SET state='ambiguous',updated=?,expires=?,cleanup_after=?
+            WHERE state='ready' AND claim_key IN
+            (SELECT key FROM claims WHERE state='pending' AND lease_until<=?)""",
+            (now, now + quarantine, now + quarantine, now),
+        )
+        self._db.execute(
+            """UPDATE claims SET state='ambiguous',updated=?,owner='',lease_until=0,
+            last_error='platform acknowledgement unknown after delivery lease expired'
+            WHERE state='pending' AND lease_until<=? AND key IN
+            (SELECT claim_key FROM message_plans WHERE state='ambiguous')""",
+            (now, now),
+        )
+        self._db.execute("DELETE FROM message_plans WHERE state='building' AND lease_until<=?", (now,))
+        self._db.execute(
+            """UPDATE message_plans SET active=0 WHERE state!='building' AND expires<=?
+            AND claim_key NOT IN (SELECT key FROM claims WHERE state='pending')""", (now,),
+        )
+        self._expire_sent_plans_locked(now)
+        self._db.execute(
+            """DELETE FROM message_plans WHERE state!='building' AND cleanup_after<=?
+            AND claim_key NOT IN (SELECT key FROM claims WHERE state='pending')""", (now,),
+        )
         self._db.execute(
             "DELETE FROM claims WHERE state='pending' AND lease_until<=?",
             (now,),
@@ -185,7 +344,8 @@ class TwoPhaseIdempotencyStore:
         )
         if self.ambiguous_ttl > 0:
             cursor = self._db.execute(
-                "DELETE FROM claims WHERE state='ambiguous' AND updated<=?",
+                """DELETE FROM claims WHERE state='ambiguous' AND updated<=?
+                AND key NOT IN (SELECT claim_key FROM message_plans WHERE state='ambiguous')""",
                 (now - self.ambiguous_ttl,),
             )
             if cursor.rowcount:
@@ -197,9 +357,165 @@ class TwoPhaseIdempotencyStore:
             # Never prune a valid pending owner merely to satisfy the bound. Remove
             # oldest sent tombstones only; pending rows may temporarily exceed it.
             self._db.execute(
-                "DELETE FROM claims WHERE key IN (SELECT key FROM claims WHERE state='sent' ORDER BY updated LIMIT ?)",
+                """DELETE FROM claims WHERE key IN (SELECT key FROM claims WHERE state='sent'
+                AND key NOT IN (SELECT claim_key FROM message_plans) ORDER BY updated LIMIT ?)""",
                 (count - self.max_items,),
             )
+
+    @staticmethod
+    def _message_plan(row: tuple[Any, ...]) -> MessagePlan:
+        payload = json.loads(row[4])
+        return MessagePlan(
+            key=str(row[0]), delivery_id=str(row[1]), claim_key=str(row[2]), target=str(row[3]),
+            processed_segments=payload["processed_segments"], send_identity=payload["send_identity"],
+            selected_images=payload["selected_images"], conversation_key=payload["conversation_key"],
+            quoted=payload.get("quoted", False), confirmed_at=float(row[5]), platform_message_id=str(row[6]),
+        )
+
+    def _read_message_plan_locked(self, delivery_id: str) -> MessagePlan:
+        row = self._db.execute(
+            """SELECT plan_key,delivery_id,claim_key,target,payload,confirmed_at,platform_message_id
+            FROM message_plans WHERE delivery_id=?""", (delivery_id,),
+        ).fetchone()
+        if row is None or not row[4]:
+            raise OneBotSendContractError("message plan is missing or incomplete")
+        return self._message_plan(row)
+
+    async def _heartbeat_message_plan(self, delivery_id: str, owner: str) -> None:
+        while True:
+            await asyncio.sleep(max(0.05, min(30.0, self.lease_seconds / 3)))
+            async with self._lock:
+                cursor = self._db.execute(
+                    "UPDATE message_plans SET lease_until=? WHERE delivery_id=? AND state='building' AND owner=?",
+                    (self._clock() + self.lease_seconds, delivery_id, owner),
+                )
+                if cursor.rowcount != 1:
+                    return
+
+    async def get_or_create_message_plan(
+        self, key: str, target: Mapping[str, Any],
+        builder: Callable[[], Awaitable[Mapping[str, Any]]], *,
+        sent_ttl: float | None = None, wait_timeout: float = 30.0,
+    ) -> MessagePlan:
+        """Freeze a preparation-only builder once; it must never call the platform."""
+        if not key:
+            raise OneBotSendContractError("message plan key must not be empty")
+        target_key = target_identity(target)
+        deadline = time.monotonic() + max(0.0, wait_timeout)
+        while True:
+            async with self._lock:
+                self._db.execute("BEGIN IMMEDIATE")
+                try:
+                    now = self._clock()
+                    self._prune_locked(now)
+                    row = self._db.execute(
+                        "SELECT delivery_id,state,target FROM message_plans WHERE plan_key=? AND active=1", (key,),
+                    ).fetchone()
+                    if row and row[2] != target_key:
+                        raise OneBotSendContractError("message plan target mismatch")
+                    if row and row[1] == "ambiguous":
+                        self._db.execute("COMMIT")
+                        raise OneBotAmbiguousAckError("message plan has an unknown platform acknowledgement")
+                    if row and row[1] != "building":
+                        plan = self._read_message_plan_locked(str(row[0]))
+                        self._db.execute("COMMIT")
+                        return plan
+                    if row is None:
+                        count = int(self._db.execute("SELECT COUNT(*) FROM message_plans").fetchone()[0])
+                        if self.max_items > 0 and count >= self.max_items:
+                            raise OneBotSendInProgress(key)
+                        delivery_id, owner = uuid.uuid4().hex, uuid.uuid4().hex
+                        claim_key = f"event:message-plan:{delivery_id}:{target_key}"
+                        ttl = self.sent_ttl if sent_ttl is None else max(1.0, float(sent_ttl))
+                        retention = max(self.sent_ttl, ttl, self.lease_seconds)
+                        self._db.execute(
+                            """INSERT INTO message_plans(delivery_id,plan_key,claim_key,target,state,owner,
+                            lease_until,updated,expires,cleanup_after,delivery_ttl)
+                            VALUES(?,?,?,?,'building',?,?,?,?,?,?)""",
+                            (delivery_id, key, claim_key, target_key, owner, now + self.lease_seconds,
+                             now, now + retention, now + retention, ttl),
+                        )
+                    self._db.execute("COMMIT")
+                except BaseException:
+                    if self._db.in_transaction:
+                        self._db.execute("ROLLBACK")
+                    raise
+            if row is None:
+                break
+            if time.monotonic() >= deadline:
+                raise OneBotSendInProgress(key)
+            await asyncio.sleep(0.02)
+
+        heartbeat = asyncio.create_task(self._heartbeat_message_plan(delivery_id, owner))
+        try:
+            encoded = _plan_payload(await builder())
+            empty = not json.loads(encoded)["processed_segments"]
+            async with self._lock:
+                now = self._clock()
+                ready_retention = ttl if empty else retention
+                cursor = self._db.execute(
+                    """UPDATE message_plans SET state='ready',owner='',lease_until=0,payload=?,updated=?,
+                    expires=?,cleanup_after=?
+                    WHERE delivery_id=? AND state='building' AND owner=?""",
+                    (encoded, now, now + ready_retention, now + ready_retention, delivery_id, owner),
+                )
+                if cursor.rowcount != 1:
+                    raise IdempotencyOwnershipError(key)
+                return self._read_message_plan_locked(delivery_id)
+        except BaseException:
+            async with self._lock:
+                self._db.execute(
+                    "DELETE FROM message_plans WHERE delivery_id=? AND state='building' AND owner=?",
+                    (delivery_id, owner),
+                )
+            raise
+        finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
+
+    async def pending_message_receipts(
+        self, *, limit: int = 100, delivery_id: str = "",
+    ) -> list[MessagePlan]:
+        async with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._expire_sent_plans_locked(self._clock())
+                query = """SELECT plan_key,delivery_id,claim_key,target,payload,confirmed_at,platform_message_id
+                FROM message_plans WHERE state='sent' AND receipt_state='pending'"""
+                params: list[Any] = []
+                if delivery_id:
+                    query += " AND delivery_id=?"
+                    params.append(delivery_id)
+                query += " ORDER BY confirmed_at,delivery_id LIMIT ?"
+                params.append(max(1, min(1000, int(limit))))
+                rows = self._db.execute(query, params).fetchall()
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+        return [self._message_plan(row) for row in rows]
+
+    async def ack_message_receipt(self, delivery_id: str) -> bool:
+        async with self._lock:
+            cursor = self._db.execute(
+                "UPDATE message_plans SET receipt_state='acked' WHERE delivery_id=? AND state='sent'",
+                (delivery_id,),
+            )
+            return cursor.rowcount == 1
+
+    async def has_legacy_message_claims(self, event_prefix: str, target: Mapping[str, Any]) -> bool:
+        if not event_prefix:
+            return False
+        prefix = f"event:{event_prefix}:"
+        suffix = f":{target_identity(target)}"
+        async with self._lock:
+            row = self._db.execute(
+                """SELECT 1 FROM claims WHERE updated<? AND substr(key,1,?)=? AND substr(key,-?)=?
+                AND key NOT IN (SELECT claim_key FROM message_plans) LIMIT 1""",
+                (self.protocol_started_at, len(prefix), prefix, len(suffix), suffix),
+            ).fetchone()
+            return row is not None
 
     async def begin(self, key: str) -> IdempotencyClaim:
         if not key:
@@ -210,6 +526,15 @@ class TwoPhaseIdempotencyStore:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 self._prune_locked(now)
+                planned = self._db.execute(
+                    "SELECT state FROM message_plans WHERE claim_key=?", (key,),
+                ).fetchone()
+                if planned and planned[0] == "ambiguous":
+                    self._db.execute("COMMIT")
+                    raise OneBotAmbiguousAckError("message plan has an unknown platform acknowledgement")
+                if planned and planned[0] == "sent":
+                    self._db.execute("COMMIT")
+                    return IdempotencyClaim(key=key, acquired=False, state="sent")
                 row = self._db.execute(
                     "SELECT state,last_error FROM claims WHERE key=?", (key,)
                 ).fetchone()
@@ -227,7 +552,8 @@ class TwoPhaseIdempotencyStore:
                 self._db.execute("COMMIT")
                 return IdempotencyClaim(key=key, acquired=True, state="pending", owner=owner)
             except Exception:
-                self._db.execute("ROLLBACK")
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
                 raise
 
     async def heartbeat(self, claim: IdempotencyClaim) -> float:
@@ -260,13 +586,25 @@ class TwoPhaseIdempotencyStore:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 now = self._clock()
-                ttl = self.sent_ttl if sent_ttl is None else max(1.0, sent_ttl)
+                planned = self._db.execute(
+                    "SELECT state,delivery_ttl FROM message_plans WHERE claim_key=?", (claim.key,),
+                ).fetchone()
+                if planned and planned[0] != "ready":
+                    raise OneBotSendContractError("only a prepared message plan can be committed")
+                ttl = float(planned[1]) if planned else self.sent_ttl if sent_ttl is None else max(1.0, sent_ttl)
                 cursor = self._db.execute(
                     "UPDATE claims SET state='sent',updated=?,owner='',lease_until=0,retention_until=?,platform_message_id=? WHERE key=? AND state='pending' AND owner=?",
                     (now, now + ttl, str(platform_message_id or ""), claim.key, claim.owner),
                 )
                 if cursor.rowcount != 1:
                     raise IdempotencyOwnershipError(claim.key)
+                if planned:
+                    self._db.execute(
+                        """UPDATE message_plans SET state='sent',updated=?,expires=?,cleanup_after=?,
+                        receipt_state='pending',confirmed_at=?,platform_message_id=? WHERE claim_key=?""",
+                        (now, now + ttl, now + max(ttl, self.sent_ttl), now,
+                         str(platform_message_id or ""), claim.key),
+                    )
                 self._prune_locked(now)
                 self._db.execute("COMMIT")
             except Exception:
@@ -276,6 +614,11 @@ class TwoPhaseIdempotencyStore:
     async def sent_message_id(self, key: str) -> str:
         async with self._lock:
             row = self._db.execute("SELECT platform_message_id FROM claims WHERE key=? AND state='sent'", (key,)).fetchone()
+            if row is None:
+                row = self._db.execute(
+                    "SELECT platform_message_id FROM message_plans WHERE claim_key=? AND state='sent' AND cleanup_after>?",
+                    (key, self._clock()),
+                ).fetchone()
             return str(row[0] or "") if row else ""
 
     async def mark_ambiguous(
@@ -299,6 +642,13 @@ class TwoPhaseIdempotencyStore:
                 )
                 if cursor.rowcount != 1:
                     raise IdempotencyOwnershipError(claim.key)
+                now = self._clock()
+                quarantine = max(self.sent_ttl, self.ambiguous_ttl)
+                self._db.execute(
+                    """UPDATE message_plans SET state='ambiguous',updated=?,expires=?,cleanup_after=?,
+                    platform_message_id=? WHERE claim_key=? AND state='ready'""",
+                    (now, now + quarantine, now + quarantine, str(platform_message_id or ""), claim.key),
+                )
                 self._db.execute("COMMIT")
             except BaseException:
                 self._db.execute("ROLLBACK")
@@ -327,6 +677,11 @@ class TwoPhaseIdempotencyStore:
             try:
                 self._prune_locked(self._clock())
                 row = self._db.execute("SELECT state FROM claims WHERE key=?", (key,)).fetchone()
+                if row is None:
+                    row = self._db.execute(
+                        "SELECT state FROM message_plans WHERE claim_key=? AND state IN ('sent','ambiguous')",
+                        (key,),
+                    ).fetchone()
                 self._db.execute("COMMIT")
             except Exception:
                 self._db.execute("ROLLBACK")
@@ -383,6 +738,14 @@ class TwoPhaseIdempotencyStore:
         async with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
+                now = self._clock()
+                self._db.execute(
+                    """UPDATE message_plans SET state='ready',updated=?,expires=?,cleanup_after=?,
+                    receipt_state='',confirmed_at=0,platform_message_id=''
+                    WHERE claim_key=? AND state='ambiguous' AND claim_key IN
+                    (SELECT key FROM claims WHERE state='ambiguous')""",
+                    (now, now + self.sent_ttl, now + self.sent_ttl, key),
+                )
                 # Restricted to ambiguous: deleting a sent row would license a real duplicate.
                 cursor = self._db.execute(
                     "DELETE FROM claims WHERE key=? AND state='ambiguous'", (key,),
@@ -397,6 +760,13 @@ class TwoPhaseIdempotencyStore:
         async with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
+                now = self._clock()
+                self._db.execute(
+                    """UPDATE message_plans SET state='ready',updated=?,expires=?,cleanup_after=?,
+                    receipt_state='',confirmed_at=0,platform_message_id=''
+                    WHERE state='ambiguous' AND claim_key IN (SELECT key FROM claims WHERE state='ambiguous')""",
+                    (now, now + self.sent_ttl, now + self.sent_ttl),
+                )
                 cursor = self._db.execute("DELETE FROM claims WHERE state='ambiguous'")
                 self._db.execute("COMMIT")
             except Exception:

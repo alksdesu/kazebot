@@ -12,6 +12,7 @@ import os
 import random
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -20,6 +21,10 @@ logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 # 模型易写的收藏表情标记。兼容旧格式 [QQ_EMOJI:名称]，并新增：
 # [表情: 开心] / [emoji: 开心] / [收藏表情: 开心]
 _QQ_EMOJI_RE = re.compile(r"\[(?:QQ_EMOJI|表情|emoji|收藏表情)\s*[:：]\s*(.+?)\]", re.IGNORECASE)
+
+
+def has_emoji_markers(text: str) -> bool:
+    return bool(_QQ_EMOJI_RE.search(text))
 
 # 入站把内置表情渲染成 [QQ表情:微笑] 给模型看，模型会照抄回来；出站没有这个语义，漏出去就是一行裸标记。
 _INBOUND_FACE_RE = re.compile(r"\[QQ表情(?:\s*[:：]\s*[^\]]*)?\]")
@@ -51,8 +56,14 @@ def set_at_alias_resolver(resolver: Any) -> None:
 _sticker_resolver: Any = None
 
 
+@dataclass(frozen=True)
+class ResolvedSticker:
+    url: str
+    sha256: str
+
+
 def set_sticker_resolver(resolver: Any) -> None:
-    """注入表情包名 -> 可发送地址（base64:// 或 http）的解析回调。"""
+    """注入返回地址字符串或 ResolvedSticker 的表情包解析回调。"""
     global _sticker_resolver
     _sticker_resolver = resolver
 
@@ -695,6 +706,20 @@ async def find_custom_faces_by_base_name(
     return matches
 
 
+async def _reply_face_index(
+    bot: Any,
+    bqbs: List[str],
+    preferred_names: List[str] | None,
+    metadata: List[Dict[str, Any]] | None,
+) -> Dict[str, Any]:
+    try:
+        faces = await fetch_custom_face_details(bot)
+    except Exception:
+        logger.warning("收藏表情列表读取失败，尝试本地图库", exc_info=True)
+        return {}
+    return build_custom_face_index(faces, bqbs, preferred_names, metadata)
+
+
 async def process_emojis(
     text: str,
     bot: Any,
@@ -767,9 +792,9 @@ async def process_emojis(
         name = match.group(1).strip()
         if name:
             key = _normalize_name(name)
+            sticker_sha256 = ""
             if face_index is None:
-                faces = await fetch_custom_face_details(bot)
-                face_index = build_custom_face_index(faces, bqbs, preferred_names, metadata)
+                face_index = await _reply_face_index(bot, bqbs, preferred_names, metadata)
                 live_loaded = True
             entry = face_index.get(key)
             # 元数据候选组：同名随机选一个 URL 直接发送。
@@ -777,8 +802,7 @@ async def process_emojis(
             face = None if (isinstance(entry, dict) and "__group__" in entry) else entry
             if not url and face is None and not live_loaded:
                 # 元数据未命中时回退实时详情，兼容名称文件与收藏列表短暂不一致。
-                faces = await fetch_custom_face_details(bot)
-                live_index = build_custom_face_index(faces, bqbs, preferred_names, metadata)
+                live_index = await _reply_face_index(bot, bqbs, preferred_names, metadata)
                 face_index.update(live_index)
                 live_loaded = True
                 entry = face_index.get(key)
@@ -788,13 +812,21 @@ async def process_emojis(
                 url = _custom_face_url(face) if face is not None else ""
             if not url and _sticker_resolver is not None:
                 try:
-                    url = await _sticker_resolver(name) or ""
+                    resolved = await _sticker_resolver(name)
+                    if isinstance(resolved, ResolvedSticker):
+                        url = resolved.url
+                        sticker_sha256 = resolved.sha256
+                    elif isinstance(resolved, str):
+                        url = resolved
                 except Exception:
                     logger.warning("sticker resolve failed: %s", name, exc_info=True)
             if url:
                 # 标记 emoji=True：这是 QQ 收藏表情，发送时走 image 表情子类型
                 # （sub_type=1），让客户端按小图/贴纸渲染，而不是普通大图。
-                segments.append({"type": "image", "url": url, "emoji": True})
+                segment = {"type": "image", "url": url, "emoji": True}
+                if sticker_sha256:
+                    segment["sticker_sha256"] = sticker_sha256
+                segments.append(segment)
             else:
                 # 名字对不上说明是模型臆造的，留占位等于把内部格式发给用户，而提示词
                 # 里正要求不要暴露它。丢掉标记只丢一个编出来的名字，留日志便于发现。

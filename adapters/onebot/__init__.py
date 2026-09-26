@@ -134,11 +134,13 @@ from .send_contract import (
     validate_send_request,
 )
 from .emoji_handler import (
+    ResolvedSticker,
     count_duplicate_face_names,
     duplicated_detail_names,
     extract_named_custom_face_metadata,
     extract_named_custom_face_names,
     fetch_custom_face_details,
+    has_emoji_markers,
     find_custom_faces_by_base_name,
     format_custom_face_detail_line,
     invalidate_custom_face_cache,
@@ -156,9 +158,9 @@ from .emoji_handler import (
 )
 from stickers.collect import CollectConfig, StickerCollector, any_marked_segment
 from stickers.combat import CombatConfig, CombatTracker
-from stickers.collect import store_path as sticker_store_path
+from stickers.collect import sticker_root, store_path as sticker_store_path
 from stickers.rank import rank
-from stickers.store import STATE_LIBRARY, STATE_PENDING, StickerStore
+from stickers.store import STATE_LIBRARY, STATE_PENDING, Sticker, StickerStore
 from stickers.tagger import StickerTagger, TaggerConfig
 
 # clonoth_sdk 随工作区分发而非 pip 安装，插件加载时先把工作区加进 sys.path。
@@ -2517,47 +2519,128 @@ def _collect_stickers_from_event(
 _sticker_send_conversation: contextvars.ContextVar[str] = contextvars.ContextVar(
     "sticker_send_conversation", default="",
 )
+_sticker_selected: contextvars.ContextVar[set[str] | None] = contextvars.ContextVar(
+    "sticker_selected", default=None,
+)
+_sticker_delivery_locks: Dict[str, tuple[asyncio.Lock, int]] = {}
+_sticker_receipt_task: asyncio.Task | None = None
 # 超过这个大小就不发了：base64 会再胀三分之一，而表情包本来就该是小图。
 _STICKER_SEND_MAX_BYTES = 3 * 1024 * 1024
 
 
-def _sticker_conversation_key(target: Dict[str, Any]) -> str:
+def _sticker_conversation_key(target: Dict[str, Any], bot: Bot | None = None) -> str:
     kind = _target_forward_kind(target)
     if kind is None:
         return ""
     prefix = "qq_group" if kind[0] == "group" else "qq_private"
+    scope = _bot_scope.normalize(getattr(bot, "self_id", None))
+    if scope:
+        digest = _digest_conversation_key(
+            f"{prefix}:{kind[1]}", _CONVERSATION_SECRET, bot_scope=scope,
+        )
+        return f"{prefix}:{digest}"
     return _stable_conversation_key(f"{prefix}:{kind[1]}")
 
 
-async def _resolve_sticker(name: str) -> str:
-    """按名字取图库里的表情包，返回可直接塞进 image 段的地址。
+def _sticker_file_path(row: Sticker) -> Path | None:
+    if not row.usable or not row.rel_path:
+        return None
+    try:
+        root = sticker_root(Path(CLONOTH_WORKSPACE)).resolve()
+        path = (Path(CLONOTH_WORKSPACE) / row.rel_path).resolve()
+        if not path.is_relative_to(root) or not path.is_file():
+            return None
+        return path if 0 < path.stat().st_size <= _STICKER_SEND_MAX_BYTES else None
+    except (OSError, RuntimeError, ValueError):
+        return None
 
-    走 base64 而不是本地路径：图库是几个实例共享的，NapCat 容器里没有那个挂载。
-    """
+
+def _read_sticker(row: Sticker) -> bytes:
+    path = _sticker_file_path(row)
+    if path is None:
+        return b""
+    try:
+        with path.open("rb") as source:
+            raw = source.read(_STICKER_SEND_MAX_BYTES + 1)
+        return raw if 0 < len(raw) <= _STICKER_SEND_MAX_BYTES else b""
+    except OSError:
+        return b""
+
+
+@contextlib.asynccontextmanager
+async def _serialize_sticker_delivery(conversation_key: str) -> AsyncIterator[None]:
+    lock, users = _sticker_delivery_locks.get(conversation_key, (asyncio.Lock(), 0))
+    _sticker_delivery_locks[conversation_key] = (lock, users + 1)
+    try:
+        async with lock:
+            yield
+    finally:
+        _, users = _sticker_delivery_locks[conversation_key]
+        if users == 1:
+            del _sticker_delivery_locks[conversation_key]
+        else:
+            _sticker_delivery_locks[conversation_key] = (lock, users - 1)
+
+
+async def _reconcile_sticker_receipts(delivery_id: str = "") -> bool:
+    try:
+        receipts = await _outbound_idempotency.pending_message_receipts(
+            limit=100, delivery_id=delivery_id,
+        )
+        if not receipts:
+            return True
+        for receipt in receipts:
+            store = _sticker_store_handle() if receipt.selected_images else None
+            if receipt.selected_images and store is None:
+                return False
+            for digest in receipt.selected_images:
+                await asyncio.to_thread(
+                    store.record_sent, receipt.conversation_key, digest,
+                    delivery_id=receipt.delivery_id, sent_at=int(receipt.confirmed_at),
+                )
+            await _outbound_idempotency.ack_message_receipt(receipt.delivery_id)
+        return not await _outbound_idempotency.pending_message_receipts(
+            limit=1, delivery_id=delivery_id,
+        )
+    except Exception:
+        logger.warning("表情包发送回执记账失败，将稍后重试", exc_info=True)
+        return False
+
+
+async def _sticker_receipts_forever() -> None:
+    while True:
+        await _reconcile_sticker_receipts()
+        await asyncio.sleep(10)
+
+
+async def _resolve_sticker(name: str) -> ResolvedSticker | str:
     store = _sticker_store_handle()
     if store is None:
         return ""
     try:
-        row = store.by_name(name)
-        if row is None:
-            # 名单里没有中意的时，模型会直接写想表达的情绪。拿这个词去标签里找 ——
-            # 这一跳的检索词是它自己挑的，比拿群友那句话去猜要准。
-            key = _sticker_send_conversation.get("")
-            skip = store.recently_sent(
-                key, within_sec=int(live.sticker_repeat_window_sec),
-            ) if key else set()
-            row = store.by_tag(name, exclude=skip)
-        if row is None or not row.usable or not row.rel_path:
-            return ""
-        raw = await asyncio.to_thread((Path(CLONOTH_WORKSPACE) / row.rel_path).read_bytes)
-        if not raw or len(raw) > _STICKER_SEND_MAX_BYTES:
+        if not await _reconcile_sticker_receipts():
             return ""
         key = _sticker_send_conversation.get("")
-        if key:
-            await asyncio.to_thread(store.record_sent, key, row.sha256)
-        return "base64://" + base64.b64encode(raw).decode("ascii")
-    except OSError:
-        return ""
+        skip = store.recently_sent(
+            key, within_sec=int(live.sticker_repeat_window_sec),
+        ) if key else set()
+        selected = _sticker_selected.get()
+        if selected is not None:
+            skip.update(selected)
+        row = store.by_name(name)
+        while True:
+            if row is not None and row.sha256 not in skip:
+                skip.add(row.sha256)
+                raw = await asyncio.to_thread(_read_sticker, row)
+                if raw:
+                    if selected is not None:
+                        selected.add(row.sha256)
+                    return ResolvedSticker(
+                        "base64://" + base64.b64encode(raw).decode("ascii"), row.sha256,
+                    )
+            row = store.by_tag(name, exclude=skip)
+            if row is None:
+                return ""
     except Exception:
         logger.warning("表情包取图失败: %s", name, exc_info=True)
         return ""
@@ -2595,68 +2678,87 @@ async def _maybe_join_sticker_combat(
     if not _sticker_combat.should_battle(group, now=now, config=config):
         return
 
-    conversation_key = _stable_conversation_key(f"qq_group:{int(event.group_id)}")
-    history = list(_group_history[int(event.group_id)])[-6:]
-    context_text = " ".join(entry.text for entry in history if entry.text)
-    payload = await _pick_combat_sticker(context_text, conversation_key)
-    if not payload:
-        return
+    conversation_key = _sticker_conversation_key({"type": "group", "group_id": int(event.group_id)}, bot)
+    async with _serialize_sticker_delivery(conversation_key):
+        if not _sticker_combat.should_battle(group, now=time.monotonic(), config=config):
+            return
+        history = list(_group_history[int(event.group_id)])[-6:]
+        context_text = " ".join(entry.text for entry in history if entry.text)
+        target = {"type": "group", "group_id": int(event.group_id), "_response_purpose": "ambient"}
+        message_id = str(getattr(event, "message_id", "") or "")
+        context = OutboundSendContext(
+            event_id=f"combat:{message_id}" if message_id else "",
+            conversation_key=conversation_key, purpose="ambient",
+        )
+        selected_token = _sticker_selected.set(set())
+        try:
+            if not await _send_combat_sticker(bot, target, context_text, context, 0):
+                return
+            sent_at = time.monotonic()
+            _sticker_combat.mark_battled(group, now=sent_at)
+            _sticker_combat.on_self_send(group, now=sent_at)
+            if not _sticker_combat.should_burst(
+                group, now=sent_at, config=config, roll=random.random(),
+            ):
+                return
+            await asyncio.sleep(0.9)
+            if await _send_combat_sticker(bot, target, context_text, context, 1):
+                _sticker_combat.mark_burst(group, now=time.monotonic())
+        finally:
+            _sticker_selected.reset(selected_token)
+
+
+async def _send_combat_sticker(
+    bot: Bot, target: Dict[str, Any], context_text: str,
+    context: OutboundSendContext, index: int,
+) -> str:
+    async def build_plan() -> Dict[str, Any]:
+        sticker = await _pick_combat_sticker(context_text, context.conversation_key)
+        segments = [{
+            "type": "image", "url": sticker.url, "emoji": True,
+            "sticker_sha256": sticker.sha256,
+        }] if isinstance(sticker, ResolvedSticker) else []
+        return {
+            "processed_segments": _freeze_sticker_segments(segments),
+            "send_identity": f"combat:{index}",
+            "selected_images": [sticker.sha256] if segments else [],
+            "conversation_key": context.conversation_key,
+        }
+
     try:
-        await _send_qq_message(
-            bot, {"type": "group", "group_id": int(event.group_id), "_response_purpose": "ambient"},
-            _message_from_processed_segments(
-                [{"type": "image", "url": payload, "emoji": True}],
-            ),
+        return await _send_planned_sticker_message(
+            bot, target, f"combat:{index}" if context.event_id else f"combat:{index}:{context_text}",
+            build_plan, send_context=context,
         )
     except Exception:
         logger.warning("表情包接梗发送失败", exc_info=True)
-        return
-    # 自己发完必须清 streak，否则这张图会算进下一轮，自己跟自己斗下去。
-    sent_at = time.monotonic()
-    _sticker_combat.mark_battled(group, now=sent_at)
-    _sticker_combat.on_self_send(group, now=sent_at)
-
-    if not _sticker_combat.should_burst(
-        group, now=sent_at, config=config, roll=random.random(),
-    ):
-        return
-    # 刚发那张已经记进 sent_log，检索时会自动排除，补的一定是另一张。
-    extra = await _pick_combat_sticker(context_text, conversation_key)
-    if not extra:
-        return
-    await asyncio.sleep(0.9)
-    try:
-        await _send_qq_message(
-            bot, {"type": "group", "group_id": int(event.group_id), "_response_purpose": "ambient"},
-            _message_from_processed_segments(
-                [{"type": "image", "url": extra, "emoji": True}],
-            ),
-        )
-    except Exception:
-        logger.warning("表情包连发失败", exc_info=True)
-        return
-    _sticker_combat.mark_burst(group, now=time.monotonic())
+        return ""
 
 
-async def _pick_combat_sticker(context_text: str, conversation_key: str) -> str:
+async def _pick_combat_sticker(context_text: str, conversation_key: str) -> ResolvedSticker | str:
     """按语境挑一张，挑不出就返回空串。"""
     store = _sticker_store_handle()
     if store is None or not context_text.strip():
         return ""
     try:
-        usable = store.all_usable()
+        usable = [row for row in store.all_usable() if _sticker_file_path(row) is not None]
         if not usable:
             return ""
         recent = store.recently_sent(
             conversation_key, within_sec=int(live.sticker_repeat_window_sec),
         )
-        result = rank(context_text, usable, recently_sent=recent, limit=1)
+        recent.update(_sticker_selected.get() or ())
+        result = rank(context_text, usable, recently_sent=recent, limit=len(usable))
         # generic 是闲聊闸门：语境不明确时宁可不发。
         if result.generic or result.best is None:
             return ""
         token = _sticker_send_conversation.set(conversation_key)
         try:
-            return await _resolve_sticker(result.best.name)
+            for candidate in result.items:
+                sticker = await _resolve_sticker(candidate.name)
+                if sticker:
+                    return sticker
+            return ""
         finally:
             _sticker_send_conversation.reset(token)
     except Exception:
@@ -2709,7 +2811,10 @@ def _sticker_prompt_entries(conversation_key: str) -> list[str]:
         recent = store.recently_sent(
             conversation_key, within_sec=int(live.sticker_repeat_window_sec),
         )
-        usable = [row for row in store.all_usable() if row.sha256 not in recent]
+        usable = [
+            row for row in store.all_usable()
+            if row.sha256 not in recent and _sticker_file_path(row) is not None
+        ]
         # 装不下就让发得最少的先上，轮着来；否则冷门图永远排在字典序后面没人见过。
         usable.sort(key=lambda row: (row.sent_count, row.name))
         return [
@@ -6415,6 +6520,10 @@ def _message_from_processed_segments(segments: List[Dict[str, Any]]) -> Message:
             qq_id = segment.get("qq")
             if qq_id:
                 message_segments.append(MessageSegment.at(qq_id))
+        elif segment.get("type") == "reply":
+            message_id = segment.get("message_id")
+            if message_id:
+                message_segments.append(MessageSegment.reply(message_id))
     return Message(message_segments)
 
 
@@ -6764,6 +6873,8 @@ async def _send_qq_message(
     content_identity: str = "",
     idempotency_key: str = "",
     attempt: int = 1,
+    message_factory: Callable[[], Awaitable[Any]] | None = None,
+    sticker_delivery_id: str = "",
 ) -> str:
     """Send with an explicit contract and pending/sent two-phase idempotency."""
     validate_send_request(bot, target)
@@ -6790,13 +6901,19 @@ async def _send_qq_message(
     if not claim.acquired:
         logger.info("onebot_send_duplicate", extra={**fields, "claim_state": claim.state})
         platform_message_id = await _outbound_idempotency.sent_message_id(key)
+        if sticker_delivery_id:
+            await _reconcile_sticker_receipts(sticker_delivery_id)
         await _features.bind_reminder_message(bot, target, context, platform_message_id)
         return platform_message_id or f"idempotent:{key}"
     logger.info("onebot_send_started", extra=fields)
     heartbeat = asyncio.create_task(_heartbeat_idempotency_claim(claim))
     try:
         async def send_once() -> str:
-            return await _send_qq_message_once(bot, target, message, idempotency_key=key)
+            payload = await message_factory() if message_factory is not None else message
+            result = await _send_qq_message_once(bot, target, payload, idempotency_key=key)
+            if sticker_delivery_id and not result:
+                raise OneBotAmbiguousAckError("平台未返回消息编号，表情包投递状态待确认")
+            return result
 
         platform_message_id = await protected_claim_send(
             _outbound_idempotency,
@@ -6812,6 +6929,8 @@ async def _send_qq_message(
                 attempt=attempt, idempotency_key=key,
             ),
         )
+        if sticker_delivery_id:
+            await _reconcile_sticker_receipts(sticker_delivery_id)
         await _features.bind_reminder_message(bot, target, context, platform_message_id)
         return platform_message_id
     finally:
@@ -6834,15 +6953,81 @@ async def _send_split_text(
     await _features.check_send(bot, target)
     sent_any = False
     parts = text.split(_SPLIT_SIGNAL) if text else []
-    conversation_token = _sticker_send_conversation.set(_sticker_conversation_key(target))
+    conversation_key = _sticker_conversation_key(target, bot)
+    conversation_token = _sticker_send_conversation.set(conversation_key)
+    selected_token = _sticker_selected.set(set())
     try:
-        sent_any = await _send_split_parts(
-            bot, target, parts,
-            source_attachments=source_attachments, send_context=send_context,
-        )
+        async with _serialize_sticker_delivery(conversation_key):
+            sent_any = await _send_split_parts(
+                bot, target, parts,
+                source_attachments=source_attachments, send_context=send_context,
+            )
     finally:
+        _sticker_selected.reset(selected_token)
         _sticker_send_conversation.reset(conversation_token)
     return sent_any
+
+
+def _freeze_sticker_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    frozen = []
+    for segment in segments:
+        item = dict(segment)
+        if item.get("sticker_sha256"):
+            encoded = str(item.pop("url", "")).removeprefix("base64://")
+            item["content_sha256"] = hashlib.sha256(base64.b64decode(encoded)).hexdigest()
+        frozen.append(item)
+    return frozen
+
+
+async def _materialize_sticker_segments(segments: List[Dict[str, Any]]) -> Message:
+    materialized = []
+    for segment in segments:
+        item = dict(segment)
+        digest = str(item.get("sticker_sha256") or "")
+        if digest:
+            store = _sticker_store_handle()
+            row = store.get(digest) if store is not None else None
+            raw = await asyncio.to_thread(_read_sticker, row) if row is not None else b""
+            if not raw or hashlib.sha256(raw).hexdigest() != item.get("content_sha256"):
+                raise OneBotSendContractError("已选表情包不可用，保持原投递内容且不自动换图")
+            item["url"] = "base64://" + base64.b64encode(raw).decode("ascii")
+        materialized.append(item)
+    return _message_from_processed_segments(materialized)
+
+
+async def _send_planned_sticker_message(
+    bot: Bot,
+    target: Dict[str, Any],
+    identity: str,
+    builder: Callable[[], Awaitable[Dict[str, Any]]],
+    *,
+    send_context: OutboundSendContext | None = None,
+) -> str:
+    identity = f"sticker:v1:{getattr(bot, 'self_id', '')}:{identity}"
+    context = send_context.child(identity) if send_context else OutboundSendContext()
+    parent_id = (send_context.idempotency_key or send_context.event_id) if send_context else ""
+    if parent_id and await _outbound_idempotency.has_legacy_message_claims(parent_id, target):
+        raise OneBotAmbiguousAckError("旧版消息存在投递记录，无法安全恢复选图，需要人工确认")
+    key = make_idempotency_key(
+        target, identity, event_id=context.idempotency_key or context.event_id,
+    )
+    plan = await _outbound_idempotency.get_or_create_message_plan(
+        key, target, builder, sent_ttl=_sent_ttl_for_context(context),
+    )
+    selected = _sticker_selected.get()
+    if selected is not None:
+        selected.update(plan.selected_images)
+    if not plan.processed_segments:
+        return ""
+
+    async def materialize() -> Message:
+        return await _materialize_sticker_segments(plan.processed_segments)
+
+    return await _send_qq_message(
+        bot, target, None, send_context=context, content_identity=plan.send_identity,
+        idempotency_key=plan.claim_key, message_factory=materialize,
+        sticker_delivery_id=plan.delivery_id,
+    )
 
 
 async def _send_split_parts(
@@ -6858,33 +7043,49 @@ async def _send_split_parts(
         part = _truncate_qq_text(raw_part.strip())
         if not part:
             continue
-        segments = await process_emojis(
-            part,
-            bot,
-            _bqbs,
-            _current_custom_face_names(),
-            _current_custom_face_metadata(),
-            strip_asterisk_styles=live.strip_asterisk_styles,
-            strip_underscore_styles=live.strip_underscore_styles,
-        )
-        if not segments:
-            continue
-        msg = _message_from_processed_segments(segments)
-        # 第一条消息带引用回复 + @发送者
-        if live.reply_to_trigger and not sent_any and target.get("reply_message_id"):
-            prefix = MessageSegment.reply(target["reply_message_id"])
-            if target.get("reply_sender_id"):
-                prefix = prefix + MessageSegment.at(target["reply_sender_id"]) + MessageSegment.text(" ")
-            msg = prefix + msg
-        segment_identity = f"text:{index}:{_message_dedup_text(msg).strip()}"
-        segment_context = send_context.child(segment_identity) if send_context else None
-        sent_message_id = await _send_qq_message(
-            bot,
-            target,
-            msg,
-            send_context=segment_context,
-            content_identity=segment_identity,
-        )
+        async def prepare() -> List[Dict[str, Any]]:
+            segments = await process_emojis(
+                part, bot, _bqbs, _current_custom_face_names(), _current_custom_face_metadata(),
+                strip_asterisk_styles=live.strip_asterisk_styles,
+                strip_underscore_styles=live.strip_underscore_styles,
+            )
+            if segments and live.reply_to_trigger and not sent_any and target.get("reply_message_id"):
+                prefix = [{"type": "reply", "message_id": target["reply_message_id"]}]
+                if target.get("reply_sender_id"):
+                    prefix.extend([
+                        {"type": "at", "qq": target["reply_sender_id"]},
+                        {"type": "text", "content": " "},
+                    ])
+                segments = prefix + segments
+            return segments
+
+        if has_emoji_markers(part):
+            async def build_plan() -> Dict[str, Any]:
+                segments = await prepare()
+                return {
+                    "processed_segments": _freeze_sticker_segments(segments),
+                    "send_identity": hashlib.sha256(part.encode("utf-8")).hexdigest(),
+                    "selected_images": list(dict.fromkeys(
+                        str(item["sticker_sha256"]) for item in segments if item.get("sticker_sha256")
+                    )),
+                    "conversation_key": _sticker_send_conversation.get(""),
+                }
+
+            sent_message_id = await _send_planned_sticker_message(
+                bot, target, f"text:{index}:{part}", build_plan, send_context=send_context,
+            )
+            if not sent_message_id:
+                continue
+        else:
+            segments = await prepare()
+            if not segments:
+                continue
+            msg = _message_from_processed_segments(segments)
+            segment_identity = f"text:{index}:{_message_dedup_text(msg).strip()}"
+            segment_context = send_context.child(segment_identity) if send_context else None
+            sent_message_id = await _send_qq_message(
+                bot, target, msg, send_context=segment_context, content_identity=segment_identity,
+            )
         if sent_message_id and source_attachments:
             _remember_reply_attachments(
                 sent_message_id,
@@ -9173,6 +9374,7 @@ async def _startup() -> None:
     """NoneBot 启动时初始化 Clonoth SDK 与事件路由。"""
     global _client, _session_state, _event_router, _router_task, _callbacks, _bqbs, _custom_face_names, _custom_face_metadata
     global _live_reconcile_task, _attachment_cleanup_task
+    global _sticker_receipt_task
     if _router_task is not None and not _router_task.done():
         return
 
@@ -9190,6 +9392,8 @@ async def _startup() -> None:
     _load_reply_attachment_cache()
     _start_sticker_tagger()
     _load_anon_map()
+    await _reconcile_sticker_receipts()
+    _sticker_receipt_task = asyncio.create_task(_sticker_receipts_forever())
     # [2026-07-14] 注入 at 别名反查，让 emoji_handler 在处理 [at:UserAF]/[at:显示名]
     # 时能把匿名别名/群昵称回解为真实 QQ 号，避免直接把代号当纯文本 @ 出去。
     set_at_alias_resolver(_resolve_at_alias_to_real)
@@ -9262,6 +9466,7 @@ async def _on_bot_connect(bot: Bot) -> None:
 async def _shutdown() -> None:
     """NoneBot 关闭时停止事件路由并释放 HTTP 连接。"""
     global _client, _event_router, _router_task, _callbacks, _anon_map_save_task, _live_reconcile_task, _attachment_cleanup_task
+    global _sticker_receipt_task
     if _features.poll_task is not None:
         _features.poll_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -9284,7 +9489,11 @@ async def _shutdown() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await _attachment_cleanup_task
         _attachment_cleanup_task = None
-    await _stop_stickers()
+    if _sticker_receipt_task is not None:
+        _sticker_receipt_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _sticker_receipt_task
+        _sticker_receipt_task = None
     if _qq_queue_tasks:
         for task in _qq_queue_tasks.values():
             task.cancel()
@@ -9292,6 +9501,8 @@ async def _shutdown() -> None:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         _qq_queue_tasks.clear()
+    await _reconcile_sticker_receipts()
+    await _stop_stickers()
     if _client is not None:
         await _client.close()
         _client = None

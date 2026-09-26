@@ -128,6 +128,18 @@ def merge_tags(auto: Sequence[str], manual: Sequence[str], *, override: bool) ->
     return merged
 
 
+def ensure_receipt_schema(db: sqlite3.Connection) -> None:
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS send_receipts (
+            delivery_id TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            conversation_key TEXT NOT NULL,
+            sent_at INTEGER NOT NULL,
+            PRIMARY KEY (delivery_id, sha256)
+        )"""
+    )
+
+
 class StickerStore:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -139,17 +151,42 @@ class StickerStore:
             self.path, timeout=30.0, isolation_level=None, check_same_thread=False,
         )
         self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA busy_timeout=30000")
-        self._db.execute("PRAGMA synchronous=FULL")
-        # 多个实例共读共写这一个文件，WAL 让读不阻塞写。
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA foreign_keys=ON")
         try:
+            self._db.execute("PRAGMA busy_timeout=30000")
+            self._db.execute("PRAGMA synchronous=FULL")
+            self._enable_wal(self._db)
+            self._db.execute("PRAGMA foreign_keys=ON")
             self._verify()
             self._create_schema()
         except Exception:
             self._db.close()
+            logger.warning("表情包库初始化失败", exc_info=True)
             raise
+
+    @staticmethod
+    def _enable_wal(db: sqlite3.Connection) -> None:
+        timeout = db.execute("PRAGMA busy_timeout").fetchone()[0]
+        deadline = time.monotonic() + 15.0
+        delay = 0.01
+        try:
+            while True:
+                remaining = max(0.0, deadline - time.monotonic())
+                db.execute(f"PRAGMA busy_timeout={min(250, int(remaining * 1000))}")
+                try:
+                    mode = db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                    if str(mode).lower() != "wal":
+                        raise sqlite3.OperationalError("无法为表情包库启用 WAL")
+                    return
+                except sqlite3.OperationalError as error:
+                    if getattr(error, "sqlite_errorcode", 0) & 0xff not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    time.sleep(min(delay, remaining))
+                    delay = min(delay * 2, 0.1)
+        finally:
+            db.execute(f"PRAGMA busy_timeout={timeout}")
 
     def close(self) -> None:
         with self._lock:
@@ -181,14 +218,9 @@ class StickerStore:
             return self._db.execute(sql, tuple(params)).fetchone()
 
     def _create_schema(self) -> None:
-        exists = self._one(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='stickers'"
-        )
-        if exists:
-            return
         with self._tx() as db:
             db.execute(
-                f"""CREATE TABLE stickers (
+                f"""CREATE TABLE IF NOT EXISTS stickers (
                     sha256 TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     rel_path TEXT NOT NULL,
@@ -217,20 +249,21 @@ class StickerStore:
                 )"""
             )
             # 模型靠名字点图，重名就会点歪。
-            db.execute("CREATE UNIQUE INDEX stickers_name ON stickers(name) WHERE state='library'")
-            db.execute("CREATE INDEX stickers_state ON stickers(state,caption_state)")
-            db.execute("CREATE INDEX stickers_created ON stickers(state,created_at)")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS stickers_name ON stickers(name) WHERE state='library'")
+            db.execute("CREATE INDEX IF NOT EXISTS stickers_state ON stickers(state,caption_state)")
+            db.execute("CREATE INDEX IF NOT EXISTS stickers_created ON stickers(state,created_at)")
             db.execute(
-                """CREATE TABLE sent_log (
+                """CREATE TABLE IF NOT EXISTS sent_log (
                     conversation_key TEXT NOT NULL,
                     sha256 TEXT NOT NULL,
                     sent_at INTEGER NOT NULL,
                     PRIMARY KEY (conversation_key, sha256)
                 )"""
             )
-            db.execute("CREATE INDEX sent_log_at ON sent_log(conversation_key,sent_at)")
-            db.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            db.execute("INSERT INTO meta(key,value) VALUES('schema','1')")
+            db.execute("CREATE INDEX IF NOT EXISTS sent_log_at ON sent_log(conversation_key,sent_at)")
+            db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('schema','1')")
+            ensure_receipt_schema(db)
 
     # ── 去重 ──
 
@@ -361,6 +394,7 @@ class StickerStore:
     def forget(self, sha256: str) -> bool:
         """彻底删记录。之后这张图可以重新被收。"""
         with self._tx() as db:
+            # 回执留作去重墓碑，旧投递不能给重新入库的图再次计数。
             db.execute("DELETE FROM sent_log WHERE sha256=?", (sha256,))
             return db.execute("DELETE FROM stickers WHERE sha256=?", (sha256,)).rowcount > 0
 
@@ -490,25 +524,45 @@ class StickerStore:
 
     # ── 已发历史 ──
 
-    def record_sent(self, conversation_key: str, sha256: str) -> None:
-        now = int(time.time())
+    def record_sent(
+        self, conversation_key: str, sha256: str, *,
+        delivery_id: str = "", sent_at: int | None = None,
+    ) -> bool:
+        """按确认回执记账；没有投递编号时保留逐次累加行为。"""
+        now = int(time.time()) if sent_at is None else int(sent_at)
+        key, digest, receipt = str(conversation_key), str(sha256), str(delivery_id or "")
+        if not 0 <= now < 2 ** 63 or (receipt and (not receipt.strip() or not key.strip())):
+            raise ValueError("发送回执的编号、会话或时间无效")
         with self._tx() as db:
+            if receipt:
+                inserted = db.execute(
+                    "INSERT INTO send_receipts(delivery_id,sha256,conversation_key,sent_at)"
+                    " VALUES(?,?,?,?) ON CONFLICT(delivery_id,sha256) DO NOTHING",
+                    (receipt, digest, key, now),
+                )
+                if inserted.rowcount == 0:
+                    return False
+                if not db.execute("SELECT 1 FROM stickers WHERE sha256=?", (digest,)).fetchone():
+                    return True
             db.execute(
                 """INSERT INTO sent_log(conversation_key,sha256,sent_at) VALUES(?,?,?)
-                   ON CONFLICT(conversation_key,sha256) DO UPDATE SET sent_at=excluded.sent_at""",
-                (str(conversation_key), str(sha256), now),
+                   ON CONFLICT(conversation_key,sha256) DO UPDATE SET sent_at=MAX(sent_log.sent_at,excluded.sent_at)""",
+                (key, digest, now),
             )
             db.execute(
-                "UPDATE stickers SET sent_count=sent_count+1,last_sent_at=? WHERE sha256=?",
-                (now, str(sha256)),
+                "UPDATE stickers SET sent_count=sent_count+1,last_sent_at=MAX(last_sent_at,?) WHERE sha256=?",
+                (now, digest),
             )
+        return True
 
     def recently_sent(self, conversation_key: str, *, within_sec: int) -> set[str]:
         """这个会话最近发过哪些。同一张图连着刷是最容易被看出是机器的行为。"""
-        # 严格大于：窗口传 0 就该是"什么都不算最近"，而不是把刚发的那条也算进来。
+        window = int(within_sec)
+        if window <= 0:
+            return set()
         rows = self._all(
             "SELECT sha256 FROM sent_log WHERE conversation_key=? AND sent_at>?",
-            (str(conversation_key), int(time.time()) - max(int(within_sec), 0)),
+            (str(conversation_key), int(time.time()) - window),
         )
         return {str(row[0]) for row in rows}
 

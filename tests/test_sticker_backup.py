@@ -471,3 +471,176 @@ def test_unknown_mode_is_refused(source: Library, target: Library) -> None:
     archive = source.export().path
     with pytest.raises(sb.BackupError):
         target.restore(archive, mode="bogus")
+
+
+def test_confirmed_receipts_survive_backup_without_replaying_counts(source: Library, target: Library) -> None:
+    digest = _seed(source, b"confirmed", name="已发")
+    source.store.record_sent("conv1", digest, delivery_id="instance-a:bot-1:delivery", sent_at=100)
+    archive = source.export().path
+    manifest = _manifest_of(archive)
+    assert manifest["schema"] == 1 and manifest["library_schema"] == "1"
+    assert manifest["send_receipts"] == [{
+        "delivery_id": "instance-a:bot-1:delivery", "sha256": digest,
+        "conversation_key": "conv1", "sent_at": 100,
+    }]
+    target.restore(archive)
+    assert target.store.get(digest).sent_count == 1
+    assert not target.store.record_sent("conv1", digest, delivery_id="instance-a:bot-1:delivery")
+    assert target.store.get(digest).sent_count == 1
+
+
+@pytest.mark.parametrize("mode", [sb.MODE_MERGE, sb.MODE_REPLACE])
+def test_old_schema_one_backups_without_receipts_remain_readable(
+    source: Library, target: Library, tmp_path: Path, mode: str,
+) -> None:
+    digests = _populate(source)
+    exported = source.export().path
+    manifest = _manifest_of(exported)
+    manifest.pop("send_receipts")
+    old = _rebuild(exported, tmp_path / "old-schema-one.zip", manifest=manifest)
+    target.restore(old, mode=mode)
+    assert target.store.get(digests["kept"]) == source.store.get(digests["kept"])
+    assert target.store._one("SELECT COUNT(*) FROM send_receipts")[0] == 0
+
+
+def test_exporting_an_old_library_does_not_require_or_create_receipts(source: Library) -> None:
+    _populate(source)
+    source.store._db.execute("DROP TABLE send_receipts")
+    manifest = _manifest_of(source.export().path)
+    assert manifest["send_receipts"] == []
+    assert not source.store._one("SELECT 1 FROM sqlite_master WHERE name='send_receipts'")
+
+
+def test_importing_into_an_old_library_creates_the_receipt_table(source: Library, target: Library) -> None:
+    digest = _seed(source, b"confirmed", name="已发")
+    source.store.record_sent("conv1", digest, delivery_id="delivery")
+    target.store._db.execute("DROP TABLE send_receipts")
+    target.restore(source.export().path)
+    assert not target.store.record_sent("conv1", digest, delivery_id="delivery")
+    assert target.store.get(digest).sent_count == 1
+
+
+def test_merge_unions_receipts_without_changing_existing_counts_or_newer_cooldowns(
+    source: Library, target: Library,
+) -> None:
+    digest = _seed(source, b"same-image", name="来源")
+    source.store.record_sent("conv1", digest, delivery_id="source-delivery", sent_at=100)
+    _seed(target, b"same-image", name="本地")
+    target.store.record_sent("conv1", digest, delivery_id="target-delivery", sent_at=200)
+    target.store.record_sent("conv1", digest, sent_at=200)
+    before = target.store.get(digest)
+    archive = source.export().path
+    target.restore(archive)
+    target.restore(archive)
+    assert target.store.get(digest) == before
+    assert target.store._one("SELECT sent_at FROM sent_log")[0] == 200
+    assert target.store._one("SELECT COUNT(*) FROM send_receipts")[0] == 2
+    for identity in ("source-delivery", "target-delivery"):
+        assert not target.store.record_sent("conv1", digest, delivery_id=identity)
+    assert target.store.get(digest).sent_count == 2
+
+
+def test_replace_keeps_local_receipt_tombstones_while_restoring_backup_counts(
+    source: Library, target: Library,
+) -> None:
+    digest = _seed(source, b"same-image", name="来源")
+    source.store.record_sent("conv1", digest, delivery_id="source-delivery", sent_at=100)
+    _seed(target, b"same-image", name="本地")
+    target.store.record_sent("conv1", digest, delivery_id="target-delivery", sent_at=200)
+    target.store.record_sent("conv1", digest, sent_at=200)
+    removed = _seed(target, b"removed-image", name="移除")
+    target.store.record_sent("conv2", removed, delivery_id="removed-delivery")
+    archive = source.export().path
+    target.restore(archive, mode=sb.MODE_REPLACE)
+    assert target.store.get(digest) == source.store.get(digest)
+    assert not target.store.known(removed)
+    assert target.store._one("SELECT COUNT(*) FROM send_receipts")[0] == 3
+    for identity in ("source-delivery", "target-delivery"):
+        assert not target.store.record_sent("conv1", digest, delivery_id=identity)
+    _seed(target, b"removed-image", name="重新入库")
+    assert not target.store.record_sent("conv2", removed, delivery_id="removed-delivery")
+    assert target.store.get(digest).sent_count == 1
+    assert target.store.get(removed).sent_count == 0
+
+
+def test_replacing_with_an_old_backup_does_not_erase_local_receipts(
+    source: Library, target: Library, tmp_path: Path,
+) -> None:
+    digest = _seed(source, b"same-image", name="来源")
+    exported = source.export().path
+    manifest = _manifest_of(exported)
+    manifest.pop("send_receipts")
+    old = _rebuild(exported, tmp_path / "old.zip", manifest=manifest)
+    _seed(target, b"same-image", name="本地")
+    target.store.record_sent("conv1", digest, delivery_id="already-confirmed")
+    target.restore(old, mode=sb.MODE_REPLACE)
+    assert target.store.get(digest).sent_count == 0
+    assert not target.store.record_sent("conv1", digest, delivery_id="already-confirmed")
+    assert target.store.get(digest).sent_count == 0
+
+
+def test_forgotten_image_receipts_round_trip_without_restoring_the_image(
+    source: Library, target: Library,
+) -> None:
+    digest = _seed(source, b"forgotten", name="旧图")
+    source.store.record_sent("conv1", digest, delivery_id="old")
+    source.store.forget(digest)
+    archive = source.export().path
+    assert len(_manifest_of(archive)["send_receipts"]) == 1
+    target.restore(archive)
+    assert not target.store.known(digest)
+    _seed(target, b"forgotten", name="重新入库")
+    assert not target.store.record_sent("conv1", digest, delivery_id="old")
+    assert target.store.get(digest).sent_count == 0
+
+
+@pytest.mark.parametrize("change", [
+    {"delivery_id": ""}, {"sha256": "invalid"}, {"conversation_key": ""},
+    {"sent_at": -1}, {"sent_at": 2 ** 63}, {"sent_at": True}, {"sent_at": "100"}, {"unexpected": 1},
+])
+def test_invalid_receipts_are_rejected_before_any_library_changes(
+    source: Library, target: Library, tmp_path: Path, change: dict,
+) -> None:
+    digest = _seed(source, b"confirmed", name="已发")
+    source.store.record_sent("conv1", digest, delivery_id="delivery", sent_at=100)
+    exported = source.export().path
+    manifest = _manifest_of(exported)
+    manifest["send_receipts"][0].update(change)
+    _refuses(target, _rebuild(exported, tmp_path / "invalid-receipt.zip", manifest=manifest))
+    assert target.store._one("SELECT COUNT(*) FROM send_receipts")[0] == 0
+
+
+def test_conflicting_receipts_are_rejected(source: Library, target: Library, tmp_path: Path) -> None:
+    digest = _seed(source, b"confirmed", name="已发")
+    source.store.record_sent("conv1", digest, delivery_id="delivery", sent_at=100)
+    exported = source.export().path
+    manifest = _manifest_of(exported)
+    manifest["send_receipts"].append({**manifest["send_receipts"][0], "sent_at": 200})
+    _refuses(target, _rebuild(exported, tmp_path / "conflicting.zip", manifest=manifest))
+
+
+def test_receipt_import_failure_rolls_back_rows_receipts_and_new_files(source: Library, target: Library) -> None:
+    digest = _seed(source, b"confirmed", name="已发")
+    source.store.record_sent("conv1", digest, delivery_id="delivery")
+    local = _seed(target, b"local", name="本地")
+    target.store.record_sent("conv2", local, delivery_id="local-delivery")
+    before, files = target.store.get(local), target.files()
+    target.store._db.execute(
+        "CREATE TRIGGER synthetic_receipt_failure BEFORE INSERT ON send_receipts"
+        " BEGIN SELECT RAISE(ABORT, 'synthetic receipt import failure'); END"
+    )
+    with pytest.raises(sb.BackupError, match="synthetic receipt import failure"):
+        target.restore(source.export().path)
+    assert target.store.get(local) == before
+    assert not target.store.known(digest)
+    assert target.files() == files
+    assert target.store._one("SELECT COUNT(*) FROM send_receipts")[0] == 1
+
+
+def test_receipt_extension_does_not_export_runtime_plan_tables(source: Library) -> None:
+    source.store._db.execute("CREATE TABLE synthetic_delivery_plans (payload TEXT)")
+    source.store._db.execute("INSERT INTO synthetic_delivery_plans VALUES ('private-runtime-plan')")
+    archive = source.export().path
+    with zipfile.ZipFile(archive) as zf:
+        assert zf.namelist() == [sb.MANIFEST_NAME]
+        assert b"private-runtime-plan" not in zf.read(sb.MANIFEST_NAME)

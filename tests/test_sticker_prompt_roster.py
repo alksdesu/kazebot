@@ -5,11 +5,13 @@
 """
 from __future__ import annotations
 
+import hashlib
 import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -19,7 +21,10 @@ if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
 from _onebot_harness import load_runtime, set_live_config  # noqa: E402
-from stickers.store import CAPTION_DONE, STATE_LIBRARY, StickerStore  # noqa: E402
+from stickers.store import (  # noqa: E402
+    CAPTION_DONE, CAPTION_FAILED, CAPTION_PENDING, CAPTION_RUNNING,
+    STATE_DISCARDED, STATE_LIBRARY, STATE_PENDING, StickerStore,
+)
 
 _CONV = "qq_group:t"
 
@@ -36,14 +41,22 @@ def store(runtime: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Stic
     return handle
 
 
-def _add(store: StickerStore, name: str, tags: list[str], *, sent: int = 0) -> str:
-    digest = f"sha-{name}"
+def _add(
+    store: StickerStore, name: str, tags: list[str], *, sent: int = 0,
+    content: bytes | None = None, state: str = STATE_LIBRARY, caption: str = CAPTION_DONE,
+) -> str:
+    payload = content if content is not None else b"GIF89a" + name.encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    rel_path = f"data/stickers/library/{digest}.gif"
+    path = store.path.parent / rel_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
     store.add(
-        sha256=digest, rel_path=f"data/stickers/library/{name}.gif",
-        source="test", state=STATE_LIBRARY, name=name,
+        sha256=digest, rel_path=rel_path, size=len(payload),
+        source="test", state=state, name=name,
     )
     store.set_auto_tags(digest, tags, version=1)
-    store.mark_caption(digest, CAPTION_DONE)
+    store.mark_caption(digest, caption)
     for _ in range(sent):
         # 记在别的会话上：sent_count 是全局的，落在 _CONV 会顺带算成「刚发过」。
         store.record_sent("qq_group:seed", digest)
@@ -56,6 +69,57 @@ def _always(runtime: Any, monkeypatch: pytest.MonkeyPatch, hit: bool) -> None:
 
 
 class TestRoster:
+    @pytest.mark.parametrize("roll,listed", [(0.0, True), (0.399999, True), (0.4, False), (0.999999, False)])
+    def test_每轮零点四概率边界不变(
+        self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch, roll: float, listed: bool,
+    ) -> None:
+        _add(store, "甲", ["大笑"])
+        set_live_config(runtime, sticker_send_probability=0.4)
+        monkeypatch.setattr(runtime.random, "random", lambda: roll)
+
+        assert bool(runtime._sticker_prompt_entries(_CONV)) is listed
+        assert runtime.live.sticker_send_probability == 0.4
+
+    @pytest.mark.parametrize("size,listed", [(0, False), (1, True), (3 * 1024 * 1024, True), (3 * 1024 * 1024 + 1, False)])
+    def test_可发送文件大小边界(
+        self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch, size: int, listed: bool,
+    ) -> None:
+        _add(store, "边界图", ["大笑"], content=b"x" * size)
+        set_live_config(runtime, sticker_send_probability=1.0)
+        _always(runtime, monkeypatch, True)
+
+        assert bool(runtime._sticker_prompt_entries(_CONV)) is listed
+
+    @pytest.mark.parametrize("replacement", ["missing", "directory"])
+    def test_不存在或不是文件的候选不列出(
+        self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch, replacement: str,
+    ) -> None:
+        digest = _add(store, "不可读", ["大笑"])
+        path = store.path.parent / store.get(digest).rel_path
+        path.unlink()
+        if replacement == "directory":
+            path.mkdir()
+        _add(store, "正常", ["无语"])
+        set_live_config(runtime, sticker_send_probability=1.0)
+        _always(runtime, monkeypatch, True)
+
+        assert runtime._sticker_prompt_entries(_CONV) == ["正常（无语）"]
+
+    @pytest.mark.parametrize("state,caption", [
+        (STATE_PENDING, CAPTION_DONE), (STATE_DISCARDED, CAPTION_DONE),
+        (STATE_LIBRARY, CAPTION_PENDING), (STATE_LIBRARY, CAPTION_RUNNING),
+        (STATE_LIBRARY, CAPTION_FAILED),
+    ])
+    def test_未入库或未完成打标的状态不列出(
+        self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch, state: str, caption: str,
+    ) -> None:
+        _add(store, "不可用", ["大笑"], state=state, caption=caption)
+        _add(store, "正常", ["无语"])
+        set_live_config(runtime, sticker_send_probability=1.0)
+        _always(runtime, monkeypatch, True)
+
+        assert runtime._sticker_prompt_entries(_CONV) == ["正常（无语）"]
+
     def test_抽中时整份摊开_不按语境筛(
         self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -131,6 +195,52 @@ class TestRoster:
 
 
 class TestPromptBlock:
+    def test_只有收藏时不声明本地情绪词回退(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(runtime, "_current_custom_face_names", lambda: ["收藏甲"])
+        set_live_config(runtime, sticker_send_probability=0.0)
+
+        block = runtime._custom_face_prompt_block(_CONV)
+
+        assert "收藏表情（只能用这些名字）：收藏甲" in block
+        assert "[表情:无语]" not in block
+        assert "会去标签里找" not in block
+
+    def test_本地与收藏同时存在时保留各自使用说明(
+        self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _add(store, "本地甲", ["大笑"])
+        monkeypatch.setattr(runtime, "_current_custom_face_names", lambda: ["收藏甲"])
+        set_live_config(runtime, sticker_send_probability=1.0)
+        _always(runtime, monkeypatch, True)
+
+        block = runtime._custom_face_prompt_block(_CONV)
+
+        assert "收藏表情（只能用这些名字）：收藏甲" in block
+        assert "本地甲（大笑）" in block
+        assert "[表情:无语]" in block
+        assert "会去标签里找" in block
+
+    @pytest.mark.parametrize("filename", ["qq.orchestrator.yaml", "qq.orchestrator.example.yaml"])
+    def test_节点规则接受动态清单并区分收藏与本地标签(
+        self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch, filename: str,
+    ) -> None:
+        _add(store, "甲", ["大笑"])
+        set_live_config(runtime, sticker_send_probability=1.0)
+        _always(runtime, monkeypatch, True)
+        block = runtime._custom_face_prompt_block(_CONV)
+        node = yaml.safe_load((_ROOT / "config/nodes" / filename).read_text(encoding="utf-8"))
+        prompt = node["prompt"]
+
+        assert block.splitlines()[0] == "【可用表情】"
+        assert "【可用表情】" in prompt
+        assert "兼容旧标题【QQ可用收藏表情】" in prompt
+        assert "收藏表情只能使用本轮收藏清单列出的名称" in prompt
+        assert "只有该说明提供了本地表情包时" in prompt
+        assert "[表情:无语]" in prompt
+        assert "不要沿用历史清单" in prompt
+
     def test_抽中时才出现表情包那几行(
         self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -51,6 +52,7 @@ from _onebot_send_contract import (  # type: ignore[import-not-found]  # noqa: E
     IdempotencyOwnershipError,
     OneBotAmbiguousAckError,
     OneBotSendContractError,
+    OneBotSendInProgress,
     OneBotSendNotStartedError,
     OutboundSendContext,
     TwoPhaseIdempotencyStore,
@@ -62,6 +64,23 @@ from _onebot_send_contract import (  # type: ignore[import-not-found]  # noqa: E
     target_from_idempotency_key,
     validate_send_request,
 )
+
+
+def _prepared_sticker_plan(digest: str = "a" * 64) -> dict[str, Any]:
+    return {
+        "processed_segments": [
+            {"type": "text", "content": "synthetic test body"},
+            {"type": "image", "sticker_sha256": digest, "content_sha256": "b" * 64},
+        ],
+        "send_identity": "frozen-send-digest", "selected_images": [digest],
+        "conversation_key": "synthetic-conversation", "quoted": True,
+    }
+
+
+def _sticker_plan_key(target: dict[str, Any], context: DeliveryContext, text: str = "[sticker:test]", index: int = 0) -> str:
+    identity = f"sticker:v1:text:{index}:{text}"
+    child = context.child(identity)
+    return make_idempotency_key(target, identity, event_id=child.idempotency_key or child.event_id)
 
 
 class _Bot:
@@ -165,6 +184,523 @@ def test_two_phase_failure_releases_pending_and_success_commits_sent(tmp_path: P
         replay = await store.begin("event-1")
         assert replay.acquired is False
         assert replay.state == "sent"
+
+    asyncio.run(exercise())
+
+
+def test_message_plan_freezes_selection_across_concurrent_connections_and_restart(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        path = tmp_path / "plans.sqlite3"
+        first, second = TwoPhaseIdempotencyStore(path), TwoPhaseIdempotencyStore(path)
+        target = {"type": "group", "group_id": 123}
+        key = _sticker_plan_key(target, DeliveryContext(idempotency_key="event:stable:replay:0"))
+        selected: list[int] = []
+
+        async def build() -> dict[str, Any]:
+            selected.append(1)
+            await asyncio.sleep(0.03)
+            return _prepared_sticker_plan()
+
+        a, b = await asyncio.gather(
+            first.get_or_create_message_plan(key, target, build),
+            second.get_or_create_message_plan(key, target, build),
+        )
+        assert a == b and len(selected) == 1
+        assert target_from_idempotency_key(a.claim_key) == "group:123"
+        first.close()
+        second.close()
+        restarted = TwoPhaseIdempotencyStore(path)
+        assert await restarted.get_or_create_message_plan(key, target, build) == a
+        assert len(selected) == 1
+        stored = restarted._db.execute("SELECT payload FROM message_plans").fetchone()[0]
+        assert "base64" not in stored
+        assert json.loads(stored)["selected_images"] == ["a" * 64]
+        restarted.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("round_index", range(8))
+def test_message_plan_serializes_builders_across_threads(tmp_path: Path, round_index: int) -> None:
+    path = tmp_path / f"thread-plans-{round_index}.sqlite3"
+    selected: list[int] = []
+    target = {"type": "private", "user_id": 456}
+
+    def worker() -> str:
+        async def run() -> str:
+            store = TwoPhaseIdempotencyStore(path)
+            try:
+                async def build() -> dict[str, Any]:
+                    selected.append(1)
+                    await asyncio.sleep(0.04)
+                    return _prepared_sticker_plan()
+                plan = await store.get_or_create_message_plan("thread-key", target, build)
+                return plan.delivery_id
+            finally:
+                store.close()
+        return asyncio.run(run())
+
+    async def exercise() -> None:
+        results = await asyncio.gather(asyncio.to_thread(worker), asyncio.to_thread(worker))
+        assert results[0] == results[1]
+
+    asyncio.run(exercise())
+    assert len(selected) == 1
+
+
+def test_message_plan_wal_bootstrap_retries_only_busy_or_locked_and_restores_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    connect = sqlite3.connect
+    attempts: list[int] = []
+
+    class ConnectionProxy:
+        def __init__(self, db: sqlite3.Connection) -> None:
+            self.db = db
+
+        def execute(self, sql: str, *args: Any) -> Any:
+            if sql == "PRAGMA journal_mode=WAL":
+                attempts.append(1)
+                if len(attempts) <= 2:
+                    error = sqlite3.OperationalError("synthetic database is locked")
+                    error.sqlite_errorcode = sqlite3.SQLITE_BUSY if len(attempts) == 1 else sqlite3.SQLITE_LOCKED
+                    raise error
+            return self.db.execute(sql, *args)
+
+        @property
+        def in_transaction(self) -> bool:
+            return self.db.in_transaction
+
+        def close(self) -> None:
+            self.db.close()
+
+    monkeypatch.setattr(_MODULE.sqlite3, "connect", lambda *args, **kwargs: ConnectionProxy(connect(*args, **kwargs)))
+    store = TwoPhaseIdempotencyStore(tmp_path / "wal-retry.sqlite3")
+    assert len(attempts) == 3
+    assert store._db.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+    assert store._db.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    store.close()
+
+
+@pytest.mark.parametrize("error_code", [sqlite3.SQLITE_BUSY, sqlite3.SQLITE_IOERR])
+def test_message_plan_wal_bootstrap_failure_is_bounded_and_closes_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_code: int) -> None:
+    connect = sqlite3.connect
+    opened: list[Any] = []
+
+    class FailingConnection:
+        def __init__(self, db: sqlite3.Connection) -> None:
+            self.db = db
+            self.closed = False
+            self.restored = False
+            self.attempts = 0
+
+        def execute(self, sql: str, *args: Any) -> Any:
+            if sql == "PRAGMA journal_mode=WAL":
+                self.attempts += 1
+                error = sqlite3.OperationalError("synthetic WAL failure")
+                error.sqlite_errorcode = error_code
+                raise error
+            if sql == "PRAGMA busy_timeout=30000":
+                self.restored = True
+            return self.db.execute(sql, *args)
+
+        @property
+        def in_transaction(self) -> bool:
+            return self.db.in_transaction
+
+        def close(self) -> None:
+            self.closed = True
+            self.db.close()
+
+    def wrapped_connect(*args: Any, **kwargs: Any) -> FailingConnection:
+        proxy = FailingConnection(connect(*args, **kwargs))
+        opened.append(proxy)
+        return proxy
+
+    ticks = iter([0.0, 0.0, 16.0])
+    monkeypatch.setattr(_MODULE, "time", types.SimpleNamespace(monotonic=lambda: next(ticks), sleep=lambda _: pytest.fail("retry exceeded its deadline")))
+    monkeypatch.setattr(_MODULE.sqlite3, "connect", wrapped_connect)
+    with pytest.raises(sqlite3.OperationalError, match="synthetic WAL failure"):
+        TwoPhaseIdempotencyStore(tmp_path / "wal-failed.sqlite3")
+    assert opened[0].closed and opened[0].restored
+    assert opened[0].attempts == 1
+
+
+def test_message_plan_keys_bind_raw_body_index_target_and_replay_generation(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        store = TwoPhaseIdempotencyStore(tmp_path / "keys.sqlite3")
+        target = {"type": "group", "group_id": 123}
+        original = DeliveryContext(event_id="event-1", idempotency_key="sdk:event-1:replay:0")
+        replay = DeliveryContext(event_id="event-1", idempotency_key="sdk:event-1:replay:1", replay_generation=1)
+        keys = {
+            _sticker_plan_key(target, original),
+            _sticker_plan_key(target, original, text="different original body"),
+            _sticker_plan_key(target, original, index=1),
+            _sticker_plan_key({"type": "group", "group_id": 124}, original),
+            _sticker_plan_key(target, replay),
+        }
+        assert len(keys) == 5
+        plan = await store.get_or_create_message_plan(
+            _sticker_plan_key(target, original), target, lambda: asyncio.sleep(0, result=_prepared_sticker_plan()),
+        )
+        with pytest.raises(OneBotSendContractError, match="target mismatch"):
+            await store.get_or_create_message_plan(plan.key, {"type": "group", "group_id": 999}, lambda: asyncio.sleep(0))
+        store.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("image", [
+    {"type": "image", "content": "base64://c2VjcmV0"},
+    {"type": "image", "content": "data:image/png;base64,c2VjcmV0"},
+    {"type": "image", "content": "C:/synthetic.png"},
+    {"type": "image", "sticker_sha256": "a" * 64, "data": {"file": "base64://c2VjcmV0"}},
+    {"type": "image", "sticker_sha256": "not-a-sha"},
+])
+def test_message_plan_rejects_inline_images_or_invalid_references(tmp_path: Path, image: dict[str, Any]) -> None:
+    async def exercise() -> None:
+        store = TwoPhaseIdempotencyStore(tmp_path / "invalid.sqlite3")
+        prepared = {**_prepared_sticker_plan(), "processed_segments": [image]}
+        with pytest.raises(OneBotSendContractError):
+            await store.get_or_create_message_plan("invalid-key", {"type": "group", "group_id": 1}, lambda: asyncio.sleep(0, result=prepared))
+        assert store._db.execute("SELECT COUNT(*) FROM message_plans").fetchone()[0] == 0
+        store.close()
+
+    asyncio.run(exercise())
+
+
+def test_message_plan_commit_receipt_is_atomic_and_replays_without_sending(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        path = tmp_path / "receipt.sqlite3"
+        clock = _Clock()
+        store = TwoPhaseIdempotencyStore(path, clock=clock)
+        target = {"type": "group", "group_id": 123}
+        plan = await store.get_or_create_message_plan("receipt-key", target, lambda: asyncio.sleep(0, result=_prepared_sticker_plan()))
+        assert await store.pending_message_receipts() == []
+        claim = await store.begin(plan.claim_key)
+        calls: list[int] = []
+
+        async def send() -> str:
+            calls.append(1)
+            return "platform-101"
+
+        assert await protected_claim_send(store, claim, send) == "platform-101"
+        pending = await store.pending_message_receipts(delivery_id=plan.delivery_id)
+        assert len(pending) == 1
+        assert pending[0].confirmed_at == clock.now
+        assert pending[0].platform_message_id == "platform-101"
+        assert pending[0].conversation_key == "synthetic-conversation"
+        assert pending[0].selected_images == ["a" * 64]
+        store.close()
+        restarted = TwoPhaseIdempotencyStore(path, clock=clock)
+        replay = await restarted.begin(plan.claim_key)
+        assert not replay.acquired and replay.state == "sent"
+        assert await restarted.sent_message_id(plan.claim_key) == "platform-101"
+        assert len(await restarted.pending_message_receipts()) == 1
+        assert await restarted.ack_message_receipt(plan.delivery_id)
+        assert await restarted.ack_message_receipt(plan.delivery_id)
+        assert not await restarted.ack_message_receipt("nonexistent")
+        assert await restarted.pending_message_receipts() == []
+        assert len(calls) == 1
+        restarted.close()
+
+    asyncio.run(exercise())
+
+
+def test_message_plan_receipt_fault_rolls_back_claim_commit_and_quarantines_platform_success(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        store = TwoPhaseIdempotencyStore(tmp_path / "fault.sqlite3")
+        plan = await store.get_or_create_message_plan("fault-key", {"type": "group", "group_id": 1}, lambda: asyncio.sleep(0, result=_prepared_sticker_plan()))
+        claim = await store.begin(plan.claim_key)
+        store._db.execute("""CREATE TRIGGER fail_receipt BEFORE UPDATE ON message_plans
+            WHEN NEW.receipt_state='pending' BEGIN SELECT RAISE(ABORT,'synthetic receipt commit failure'); END""")
+        with pytest.raises(OneBotAmbiguousAckError):
+            await protected_claim_send(store, claim, lambda: asyncio.sleep(0, result="platform-sent"))
+        assert await store.state(plan.claim_key) == "ambiguous"
+        assert await store.pending_message_receipts() == []
+        assert store._db.execute("SELECT state,platform_message_id FROM message_plans").fetchone() == ("ambiguous", "platform-sent")
+        with pytest.raises(OneBotAmbiguousAckError):
+            await store.begin(plan.claim_key)
+        store.close()
+
+    asyncio.run(exercise())
+
+
+def test_message_plan_definite_failure_retains_choice_while_unknown_ack_never_counts(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        store = TwoPhaseIdempotencyStore(tmp_path / "failures.sqlite3")
+        target = {"type": "group", "group_id": 1}
+        count: list[int] = []
+
+        async def build() -> dict[str, Any]:
+            count.append(1)
+            return _prepared_sticker_plan()
+
+        plan = await store.get_or_create_message_plan("stable-key", target, build)
+        claim = await store.begin(plan.claim_key)
+
+        async def fail() -> str:
+            raise OneBotSendNotStartedError("synthetic preflight failure")
+
+        with pytest.raises(OneBotSendNotStartedError):
+            await protected_claim_send(store, claim, fail)
+        assert await store.state(plan.claim_key) is None
+        assert await store.get_or_create_message_plan("stable-key", target, build) == plan
+        retry = await store.begin(plan.claim_key)
+
+        async def timeout() -> str:
+            raise OneBotAmbiguousAckError("synthetic timeout")
+
+        with pytest.raises(OneBotAmbiguousAckError):
+            await protected_claim_send(store, retry, timeout)
+        assert await store.pending_message_receipts() == []
+        assert not await store.ack_message_receipt(plan.delivery_id)
+        with pytest.raises(OneBotAmbiguousAckError):
+            await store.get_or_create_message_plan("stable-key", target, build)
+        assert len(count) == 1
+        store.close()
+
+    asyncio.run(exercise())
+
+
+def test_message_plan_short_content_ttl_creates_new_delivery_without_losing_pending_receipt(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        clock = _Clock()
+        store = TwoPhaseIdempotencyStore(tmp_path / "ttl.sqlite3", sent_ttl=100, clock=clock)
+        target = {"type": "group", "group_id": 1}
+        key = _sticker_plan_key(target, DeliveryContext())
+        build = lambda: asyncio.sleep(0, result=_prepared_sticker_plan())
+        old = await store.get_or_create_message_plan(key, target, build, sent_ttl=5)
+        await protected_claim_send(store, await store.begin(old.claim_key), lambda: asyncio.sleep(0, result="old-message"))
+        clock.now += 6
+        new = await store.get_or_create_message_plan(key, target, build, sent_ttl=5)
+        assert old.delivery_id != new.delivery_id and old.claim_key != new.claim_key
+        receipts = await store.pending_message_receipts()
+        assert [receipt.delivery_id for receipt in receipts] == [old.delivery_id]
+        assert not (await store.begin(old.claim_key)).acquired
+        assert await store.sent_message_id(old.claim_key) == "old-message"
+        await protected_claim_send(store, await store.begin(new.claim_key), lambda: asyncio.sleep(0, result="new-message"))
+        assert len(await store.pending_message_receipts()) == 2
+        clock.now += 101
+        assert await store.pending_message_receipts() == []
+        assert store._db.execute("SELECT COUNT(*) FROM message_plans").fetchone()[0] == 0
+        store.close()
+
+    asyncio.run(exercise())
+
+
+def test_message_plan_pending_crash_is_ambiguous_not_a_resend_license(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        path = tmp_path / "crash.sqlite3"
+        clock = _Clock()
+        store = TwoPhaseIdempotencyStore(path, clock=clock)
+        target = {"type": "private", "user_id": 456}
+        build = lambda: asyncio.sleep(0, result=_prepared_sticker_plan())
+        plan = await store.get_or_create_message_plan("crash-key", target, build)
+        await store.begin(plan.claim_key)
+        store.close()
+        clock.now += 901
+        restarted = TwoPhaseIdempotencyStore(path, clock=clock)
+        with pytest.raises(OneBotAmbiguousAckError):
+            await restarted.get_or_create_message_plan("crash-key", target, build)
+        assert restarted._db.execute("SELECT state FROM message_plans").fetchone()[0] == "ambiguous"
+        assert await restarted.state(plan.claim_key) == "ambiguous"
+        assert await restarted.pending_message_receipts() == []
+        restarted.close()
+
+    asyncio.run(exercise())
+
+
+def test_message_plan_legacy_detection_uses_persisted_protocol_boundary_and_exact_target(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        path = tmp_path / "legacy.sqlite3"
+        db = sqlite3.connect(path)
+        db.execute("CREATE TABLE claims (key TEXT PRIMARY KEY,state TEXT NOT NULL,updated REAL NOT NULL,owner TEXT NOT NULL)")
+        db.executemany("INSERT INTO claims VALUES(?,?,?,?)", [
+            ("event:sdk:parent:old-digest:group:1", "sent", 900, ""),
+            ("event:sdk:parent-extra:old-digest:group:2", "sent", 900, ""),
+        ])
+        db.commit()
+        db.close()
+        clock = _Clock()
+        store = TwoPhaseIdempotencyStore(path, clock=clock)
+        assert store.protocol_started_at == 1000
+        assert await store.has_legacy_message_claims("sdk:parent", {"type": "group", "group_id": 1})
+        assert not await store.has_legacy_message_claims("sdk:parent", {"type": "group", "group_id": 2})
+        assert not await store.has_legacy_message_claims("sdk:par%", {"type": "group", "group_id": 1})
+        assert not await store.has_legacy_message_claims("", {"type": "group", "group_id": 1})
+        fresh = await store.begin("event:sdk:new-parent:text-digest:group:1")
+        await store.commit(fresh)
+        clock.now += 10
+        store.close()
+        restarted = TwoPhaseIdempotencyStore(path, clock=clock)
+        assert restarted.protocol_started_at == 1000
+        assert not await restarted.has_legacy_message_claims("sdk:new-parent", {"type": "group", "group_id": 1})
+        assert await restarted.has_legacy_message_claims("sdk:parent", {"type": "group", "group_id": 1})
+        restarted.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_message_plan_freezes_favorite_url_and_mixed_library_images(tmp_path: Path, mixed: bool) -> None:
+    async def exercise() -> None:
+        store = TwoPhaseIdempotencyStore(tmp_path / "favorites.sqlite3")
+        prepared = _prepared_sticker_plan()
+        favorite = {"type": "image", "url": "https://synthetic.invalid/favorite.png"}
+        prepared["processed_segments"] = [favorite, *prepared["processed_segments"]] if mixed else [favorite]
+        prepared["selected_images"] = prepared["selected_images"] if mixed else []
+        plan = await store.get_or_create_message_plan("favorite-key", {"type": "group", "group_id": 1}, lambda: asyncio.sleep(0, result=prepared))
+        assert plan.processed_segments[0] == favorite
+        assert plan.selected_images == (["a" * 64] if mixed else [])
+        store.close()
+
+    asyncio.run(exercise())
+
+
+def test_message_plan_expired_receipts_warn_without_logging_message_content(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    async def exercise() -> None:
+        clock = _Clock()
+        store = TwoPhaseIdempotencyStore(tmp_path / "expiry.sqlite3", sent_ttl=10, clock=clock)
+        plan = await store.get_or_create_message_plan("receipt-key", {"type": "group", "group_id": 1}, lambda: asyncio.sleep(0, result=_prepared_sticker_plan()))
+        await protected_claim_send(store, await store.begin(plan.claim_key), lambda: asyncio.sleep(0, result="platform-id"))
+        clock.now += 11
+        assert await store.pending_message_receipts() == []
+        assert "onebot_message_receipt_repair_expired count=1" in caplog.text
+        assert "synthetic test body" not in caplog.text
+        assert "synthetic-conversation" not in caplog.text
+        store.close()
+
+    asyncio.run(exercise())
+
+
+def test_message_plan_empty_result_uses_short_no_event_retention(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        clock = _Clock()
+        store = TwoPhaseIdempotencyStore(tmp_path / "empty.sqlite3", clock=clock)
+        prepared = {**_prepared_sticker_plan(), "processed_segments": [], "selected_images": []}
+        build = lambda: asyncio.sleep(0, result=prepared)
+        target = {"type": "group", "group_id": 1}
+        first = await store.get_or_create_message_plan("empty-key", target, build, sent_ttl=5)
+        assert await store.get_or_create_message_plan("empty-key", target, build, sent_ttl=5) == first
+        clock.now += 6
+        next_plan = await store.get_or_create_message_plan("empty-key", target, build, sent_ttl=5)
+        assert next_plan.delivery_id != first.delivery_id
+        assert store._db.execute("SELECT COUNT(*) FROM message_plans").fetchone()[0] == 1
+        assert await store.pending_message_receipts() == []
+        store.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("clear_all", [False, True])
+def test_message_plan_operator_release_unblocks_frozen_selection_without_counting_ambiguous(tmp_path: Path, clear_all: bool) -> None:
+    async def exercise() -> None:
+        clock = _Clock()
+        store = TwoPhaseIdempotencyStore(tmp_path / "operator.sqlite3", sent_ttl=100, ambiguous_ttl=5, clock=clock)
+        target = {"type": "group", "group_id": 1}
+        plan = await store.get_or_create_message_plan("operator-key", target, lambda: asyncio.sleep(0, result=_prepared_sticker_plan()))
+        await store.mark_ambiguous(await store.begin(plan.claim_key), error="synthetic unknown")
+        clock.now += 6
+        assert await store.ambiguous_count() == 1
+        assert await store.pending_message_receipts() == []
+        if clear_all:
+            assert await store.clear_all_ambiguous() == 1
+        else:
+            assert await store.clear_ambiguous(plan.claim_key)
+        assert await store.ambiguous_count() == 0
+        again = await store.get_or_create_message_plan("operator-key", target, lambda: asyncio.sleep(0, result=_prepared_sticker_plan("c" * 64)))
+        assert again.delivery_id == plan.delivery_id and again.selected_images == ["a" * 64]
+        assert await store.pending_message_receipts() == []
+        assert (await store.begin(plan.claim_key)).acquired
+        store.close()
+
+    asyncio.run(exercise())
+
+
+def test_message_plan_live_claim_survives_plan_retention_and_sent_bound(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        clock = _Clock()
+        store = TwoPhaseIdempotencyStore(tmp_path / "active.sqlite3", sent_ttl=10, max_items=1, clock=clock)
+        target = {"type": "group", "group_id": 1}
+        build = lambda: asyncio.sleep(0, result=_prepared_sticker_plan())
+        plan = await store.get_or_create_message_plan("active-key", target, build, sent_ttl=5)
+        claim = await store.begin(plan.claim_key)
+        clock.now += 800
+        await store.heartbeat(claim)
+        clock.now += 101
+        assert await store.get_or_create_message_plan("active-key", target, build, sent_ttl=5) == plan
+        await protected_claim_send(store, claim, lambda: asyncio.sleep(0, result="sent-id"))
+        another = await store.begin("unrelated")
+        await store.commit(another)
+        assert not (await store.begin(plan.claim_key)).acquired
+        assert await store.sent_message_id(plan.claim_key) == "sent-id"
+        assert len(await store.pending_message_receipts()) == 1
+        store.close()
+
+    asyncio.run(exercise())
+
+
+def test_message_plan_background_receipts_never_expire_or_mutate_legacy_claims(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        clock = _Clock()
+        path = tmp_path / "legacy-isolation.sqlite3"
+        store = TwoPhaseIdempotencyStore(path, sent_ttl=10, ambiguous_ttl=5, clock=clock)
+        plan = await store.get_or_create_message_plan("confirmed", {"type": "group", "group_id": 1}, lambda: asyncio.sleep(0, result=_prepared_sticker_plan()))
+        await protected_claim_send(store, await store.begin(plan.claim_key), lambda: asyncio.sleep(0, result="new-id"))
+        legacy = await store.begin("legacy-unknown")
+        await store.mark_ambiguous(legacy, error="existing isolated history")
+        before = store._db.execute("SELECT * FROM claims ORDER BY key").fetchall()
+        clock.now += 1000
+        assert await store.pending_message_receipts() == []
+        assert store._db.execute("SELECT * FROM claims ORDER BY key").fetchall() == before
+        store.close()
+        restarted = TwoPhaseIdempotencyStore(path, sent_ttl=10, ambiguous_ttl=5, clock=clock)
+        assert await restarted.pending_message_receipts() == []
+        assert restarted._db.execute("SELECT * FROM claims ORDER BY key").fetchall() == before
+        restarted.close()
+
+    asyncio.run(exercise())
+
+
+def test_message_plan_capacity_backpressures_new_keys_but_preserves_existing_retries(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        clock = _Clock()
+        store = TwoPhaseIdempotencyStore(tmp_path / "capacity.sqlite3", max_items=1, clock=clock)
+        target = {"type": "group", "group_id": 1}
+        calls: list[int] = []
+
+        async def build() -> dict[str, Any]:
+            calls.append(1)
+            return _prepared_sticker_plan()
+
+        plan = await store.get_or_create_message_plan("existing", target, build)
+        with pytest.raises(OneBotSendInProgress):
+            await store.get_or_create_message_plan("new-key", target, build)
+        assert await store.get_or_create_message_plan("existing", target, build) == plan
+        assert len(calls) == 1
+        assert store._db.execute("SELECT COUNT(*) FROM message_plans").fetchone()[0] == 1
+        claim = await store.begin(plan.claim_key)
+        await store.mark_ambiguous(claim, error="synthetic unknown")
+        with pytest.raises(OneBotSendInProgress):
+            await store.get_or_create_message_plan("another-key", target, build)
+        assert await store.state(plan.claim_key) == "ambiguous"
+        store.close()
+
+    asyncio.run(exercise())
+
+
+def test_message_plan_capacity_prunes_expired_empty_plan_before_reserving_new_key(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        clock = _Clock()
+        store = TwoPhaseIdempotencyStore(tmp_path / "capacity-expiry.sqlite3", max_items=1, clock=clock)
+        target = {"type": "group", "group_id": 1}
+        prepared = {**_prepared_sticker_plan(), "processed_segments": [], "selected_images": []}
+        build = lambda: asyncio.sleep(0, result=prepared)
+        await store.get_or_create_message_plan("old-key", target, build, sent_ttl=5)
+        clock.now += 6
+        next_plan = await store.get_or_create_message_plan("next-key", target, build, sent_ttl=5)
+        assert next_plan.key == "next-key"
+        assert store._db.execute("SELECT COUNT(*) FROM message_plans").fetchone()[0] == 1
+        store.close()
 
     asyncio.run(exercise())
 

@@ -5,8 +5,12 @@
 """
 from __future__ import annotations
 
+import sqlite3
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -268,6 +272,14 @@ def test_old_sends_fall_out_of_the_window(store) -> None:
     assert store.recently_sent("conv1", within_sec=0) == set()
 
 
+@pytest.mark.parametrize("window,blocked", [(0, False), (-1, False), (3600, True)])
+def test_disabled_cooldown_ignores_future_confirmation_timestamps(store, window, blocked) -> None:
+    digest = "a" * 64
+    _promote(store, digest)
+    store.record_sent("conv1", digest, delivery_id="future", sent_at=int(ss.time.time()) + 10000)
+    assert store.recently_sent("conv1", within_sec=window) == ({digest} if blocked else set())
+
+
 def test_pruning_the_send_log(store) -> None:
     _promote(store, "a" * 64)
     store.record_sent("conv1", "a" * 64)
@@ -366,3 +378,281 @@ def test_reopening_keeps_everything(tmp_path: Path) -> None:
         assert row is not None and row.usable
     finally:
         second.close()
+
+
+def test_one_receipt_counts_once_and_keeps_the_confirmed_time(store) -> None:
+    digest = "a" * 64
+    _promote(store, digest)
+    assert store.record_sent("conv1", digest, delivery_id="instance-a:bot-1:delivery", sent_at=100)
+    assert not store.record_sent("conv1", digest, delivery_id="instance-a:bot-1:delivery", sent_at=200)
+    row = store.get(digest)
+    assert (row.sent_count, row.last_sent_at) == (1, 100)
+    receipt = store._one("SELECT * FROM send_receipts")
+    assert (receipt["conversation_key"], receipt["sent_at"]) == ("conv1", 100)
+
+
+def test_receipts_are_scoped_by_delivery_and_image(store) -> None:
+    first, second = "a" * 64, "b" * 64
+    _promote(store, first)
+    _promote(store, second)
+    assert store.record_sent("conv1", first, delivery_id="instance-a:bot-1:delivery")
+    assert store.record_sent("conv1", second, delivery_id="instance-a:bot-1:delivery")
+    assert store.record_sent("conv1", first, delivery_id="instance-b:bot-2:delivery")
+    assert (store.get(first).sent_count, store.get(second).sent_count) == (2, 1)
+
+
+def test_an_older_receipt_does_not_move_the_latest_send_backwards(store) -> None:
+    digest = "a" * 64
+    _promote(store, digest)
+    store.record_sent("conv1", digest, delivery_id="newer", sent_at=200)
+    store.record_sent("conv1", digest, delivery_id="older", sent_at=100)
+    row = store.get(digest)
+    assert (row.sent_count, row.last_sent_at) == (2, 200)
+    assert store._one("SELECT sent_at FROM sent_log")[0] == 200
+
+
+def test_a_zero_confirmation_timestamp_is_preserved(store) -> None:
+    digest = "a" * 64
+    _promote(store, digest)
+    store.record_sent("conv1", digest, delivery_id="at-zero", sent_at=0)
+    assert store.get(digest).last_sent_at == 0
+    assert store._one("SELECT sent_at FROM send_receipts")[0] == 0
+
+
+@pytest.mark.parametrize("key,identity,sent_at", [
+    ("conv1", "delivery", -1), ("conv1", "delivery", 2 ** 63),
+    ("", "delivery", 1), ("conv1", " ", 1),
+])
+def test_invalid_receipt_metadata_does_not_change_history(store, key, identity, sent_at) -> None:
+    _promote(store, "a" * 64)
+    with pytest.raises(ValueError, match="发送回执"):
+        store.record_sent(key, "a" * 64, delivery_id=identity, sent_at=sent_at)
+    assert store.get("a" * 64).sent_count == 0
+    assert store._one("SELECT COUNT(*) FROM send_receipts")[0] == 0
+
+
+@pytest.mark.parametrize("table,event", [("send_receipts", "INSERT"), ("sent_log", "INSERT"), ("stickers", "UPDATE")])
+def test_a_failed_receipt_write_rolls_back_every_change(store, table: str, event: str) -> None:
+    digest = "a" * 64
+    _promote(store, digest)
+    store._db.execute(
+        f"CREATE TRIGGER synthetic_failure BEFORE {event} ON {table}"
+        " BEGIN SELECT RAISE(ABORT, 'synthetic receipt failure'); END"
+    )
+    with pytest.raises(sqlite3.DatabaseError, match="synthetic receipt failure"):
+        store.record_sent("conv1", digest, delivery_id="retryable")
+    assert store.get(digest).sent_count == 0
+    assert store._one("SELECT COUNT(*) FROM send_receipts")[0] == 0
+    assert store._one("SELECT COUNT(*) FROM sent_log")[0] == 0
+    store._db.execute("DROP TRIGGER synthetic_failure")
+    assert store.record_sent("conv1", digest, delivery_id="retryable")
+    assert store.get(digest).sent_count == 1
+
+
+def test_an_existing_schema_one_library_gains_receipts_without_recounting(tmp_path: Path) -> None:
+    path = tmp_path / "stickers.sqlite3"
+    first = ss.StickerStore(path)
+    _promote(first, "a" * 64)
+    first.record_sent("conv1", "a" * 64)
+    before = first.get("a" * 64)
+    first._db.execute("DROP TABLE send_receipts")
+    first.close()
+    reopened = ss.StickerStore(path)
+    try:
+        assert reopened.get("a" * 64) == before
+        assert reopened._one("SELECT value FROM meta WHERE key='schema'")[0] == "1"
+        assert reopened._one("SELECT COUNT(*) FROM send_receipts")[0] == 0
+        assert reopened.record_sent("conv1", "a" * 64, delivery_id="new")
+        assert reopened.get("a" * 64).sent_count == 2
+    finally:
+        reopened.close()
+
+
+def test_two_handles_confirming_the_same_receipt_count_once(tmp_path: Path) -> None:
+    path = tmp_path / "stickers.sqlite3"
+    first, second = ss.StickerStore(path), ss.StickerStore(path)
+    _promote(first, "a" * 64)
+    barrier = threading.Barrier(2)
+
+    def confirm(handle: ss.StickerStore) -> bool:
+        barrier.wait(timeout=5)
+        return handle.record_sent("conv1", "a" * 64, delivery_id="same-delivery", sent_at=100)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(confirm, [first, second]))
+        assert sorted(results) == [False, True]
+        assert first.get("a" * 64).sent_count == 1
+    finally:
+        first.close()
+        second.close()
+    reopened = ss.StickerStore(path)
+    try:
+        assert not reopened.record_sent("conv1", "a" * 64, delivery_id="same-delivery")
+        assert reopened.get("a" * 64).sent_count == 1
+    finally:
+        reopened.close()
+
+
+def test_two_handles_can_upgrade_the_same_old_library(tmp_path: Path) -> None:
+    path = tmp_path / "stickers.sqlite3"
+    old = ss.StickerStore(path)
+    old._db.execute("DROP TABLE send_receipts")
+    old.close()
+    barrier = threading.Barrier(2)
+
+    def reopen(_: int) -> str:
+        barrier.wait(timeout=5)
+        handle = ss.StickerStore(path)
+        try:
+            assert handle._one("SELECT COUNT(*) FROM send_receipts")[0] == 0
+            return handle._one("SELECT value FROM meta WHERE key='schema'")[0]
+        finally:
+            handle.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(reopen, range(2))) == ["1", "1"]
+
+
+def test_forgetting_and_readding_does_not_recount_an_old_receipt(store) -> None:
+    digest = "a" * 64
+    _promote(store, digest)
+    store.record_sent("conv1", digest, delivery_id="old")
+    assert store.forget(digest)
+    _promote(store, digest)
+    assert not store.record_sent("conv1", digest, delivery_id="old")
+    assert store.get(digest).sent_count == 0
+    assert store.recently_sent("conv1", within_sec=3600) == set()
+    assert store.record_sent("conv1", digest, delivery_id="new")
+    assert store.get(digest).sent_count == 1
+
+
+def test_discard_and_cooldown_cleanup_keep_receipt_deduplication(store) -> None:
+    digest = "a" * 64
+    _promote(store, digest)
+    store.record_sent("conv1", digest, delivery_id="old")
+    store.discard(digest)
+    assert store.prune_sent_log(older_than_sec=0) == 1
+    assert not store.record_sent("conv1", digest, delivery_id="old")
+    assert store.get(digest).sent_count == 1
+    assert store._one("SELECT COUNT(*) FROM send_receipts")[0] == 1
+
+
+def test_a_receipt_for_a_removed_image_prevents_later_recounting(store) -> None:
+    digest = "a" * 64
+    assert store.record_sent("conv1", digest, delivery_id="late")
+    assert store._one("SELECT COUNT(*) FROM sent_log")[0] == 0
+    _promote(store, digest)
+    assert not store.record_sent("conv1", digest, delivery_id="late")
+    assert store.get(digest).sent_count == 0
+
+
+class _WalClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, delay: float) -> None:
+        self.sleeps.append(delay)
+        self.now += delay
+
+
+class _WalConnection:
+    def __init__(self, outcomes: list) -> None:
+        self.outcomes = outcomes
+        self.timeout = 30000
+        self.calls = 0
+
+    def execute(self, sql: str):
+        if sql == "PRAGMA busy_timeout":
+            return SimpleNamespace(fetchone=lambda: (self.timeout,))
+        if sql.startswith("PRAGMA busy_timeout="):
+            self.timeout = int(sql.partition("=")[2])
+            return None
+        assert sql == "PRAGMA journal_mode=WAL"
+        outcome = self.outcomes[min(self.calls, len(self.outcomes) - 1)]
+        self.calls += 1
+        if isinstance(outcome, Exception):
+            raise outcome
+        return SimpleNamespace(fetchone=lambda: (outcome,))
+
+
+def _sqlite_error(code: int) -> sqlite3.OperationalError:
+    error = sqlite3.OperationalError("synthetic WAL error")
+    error.sqlite_errorcode = code
+    return error
+
+
+@pytest.mark.parametrize("code", [sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_BUSY | 256])
+def test_wal_startup_retries_only_lock_conflicts_and_restores_timeout(monkeypatch, code: int) -> None:
+    clock = _WalClock()
+    monkeypatch.setattr(ss.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(ss.time, "sleep", clock.sleep)
+    db = _WalConnection([_sqlite_error(code), "wal"])
+    ss.StickerStore._enable_wal(db)
+    assert db.calls == 2 and db.timeout == 30000
+    assert clock.sleeps == [0.01]
+
+
+def test_wal_startup_lock_retries_have_a_deadline(monkeypatch) -> None:
+    clock = _WalClock()
+    monkeypatch.setattr(ss.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(ss.time, "sleep", clock.sleep)
+    db = _WalConnection([_sqlite_error(sqlite3.SQLITE_BUSY)])
+    with pytest.raises(sqlite3.OperationalError, match="synthetic WAL error"):
+        ss.StickerStore._enable_wal(db)
+    assert db.calls > 1 and db.timeout == 30000
+    assert clock.now == pytest.approx(15.0)
+
+
+@pytest.mark.parametrize("outcome", [_sqlite_error(sqlite3.SQLITE_IOERR), "delete"])
+def test_wal_startup_does_not_hide_other_errors_or_accept_another_mode(monkeypatch, outcome) -> None:
+    clock = _WalClock()
+    monkeypatch.setattr(ss.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(ss.time, "sleep", clock.sleep)
+    db = _WalConnection([outcome])
+    with pytest.raises(sqlite3.OperationalError):
+        ss.StickerStore._enable_wal(db)
+    assert db.calls == 1 and db.timeout == 30000
+    assert clock.sleeps == []
+
+
+def test_startup_failure_closes_the_connection_and_keeps_the_error_log(tmp_path, monkeypatch, caplog) -> None:
+    connect = sqlite3.connect
+    connections = []
+
+    def observed_connect(*args, **kwargs):
+        db = connect(*args, **kwargs)
+        connections.append(db)
+        return db
+
+    def fail_wal(db) -> None:
+        raise _sqlite_error(sqlite3.SQLITE_IOERR)
+
+    monkeypatch.setattr(ss.sqlite3, "connect", observed_connect)
+    monkeypatch.setattr(ss.StickerStore, "_enable_wal", staticmethod(fail_wal))
+    with pytest.raises(sqlite3.OperationalError, match="synthetic WAL error"):
+        ss.StickerStore(tmp_path / "stickers.sqlite3")
+    assert "表情包库初始化失败" in caplog.text and "synthetic WAL error" in caplog.text
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connections[0].execute("SELECT 1")
+
+
+def test_two_handles_can_initialize_a_new_library_together(tmp_path: Path) -> None:
+    path = tmp_path / "stickers.sqlite3"
+    barrier = threading.Barrier(2)
+
+    def open_library(_: int) -> str:
+        barrier.wait(timeout=5)
+        handle = ss.StickerStore(path)
+        try:
+            assert handle._one("SELECT COUNT(*) FROM send_receipts")[0] == 0
+            return handle._one("PRAGMA journal_mode")[0]
+        finally:
+            handle.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(open_library, range(2))) == ["wal", "wal"]

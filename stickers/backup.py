@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .collect import LIBRARY_DIR, PENDING_DIR, sticker_root, store_path
-from .store import normalize_name
+from .store import ensure_receipt_schema, normalize_name
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
@@ -85,6 +85,7 @@ class _Plan:
     members: dict[str, zipfile.ZipInfo] = field(default_factory=dict)
     entries: list[_Entry] = field(default_factory=list)
     sent_log: list[tuple[str, str, int]] = field(default_factory=list)
+    send_receipts: list[tuple[str, str, str, int]] = field(default_factory=list)
     exported_at: int = 0
 
 
@@ -224,7 +225,7 @@ def export_library(
     with _connect(store_path(root)) as db:
         columns = _columns(db)
         library_schema = _library_schema(db)
-        # 两条 SELECT 取同一个快照，否则导出期间的发送会让计数和日志对不上。
+        # 计数、冷却日志和回执必须取同一个快照。
         db.execute("BEGIN")
         try:
             rows = db.execute("SELECT * FROM stickers ORDER BY created_at,sha256").fetchall()
@@ -232,6 +233,13 @@ def export_library(
                 "SELECT conversation_key,sha256,sent_at FROM sent_log"
                 " ORDER BY conversation_key,sha256"
             ).fetchall()
+            has_receipts = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='send_receipts'"
+            ).fetchone()
+            receipts = db.execute(
+                "SELECT delivery_id,sha256,conversation_key,sent_at FROM send_receipts"
+                " ORDER BY delivery_id,sha256"
+            ).fetchall() if has_receipts else []
         finally:
             db.execute("COMMIT")
 
@@ -276,6 +284,15 @@ def export_library(
                             "sent_at": _as_int(item["sent_at"]),
                         }
                         for item in sent
+                    ],
+                    "send_receipts": [
+                        {
+                            "delivery_id": str(item["delivery_id"]),
+                            "sha256": str(item["sha256"]),
+                            "conversation_key": str(item["conversation_key"]),
+                            "sent_at": _as_int(item["sent_at"]),
+                        }
+                        for item in receipts
                     ],
                 },
                 ensure_ascii=False,
@@ -390,10 +407,33 @@ def _plan(
         if key and _SHA256.match(digest):
             sent_log.append((key, digest, _as_int(item.get("sent_at"))))
 
+    raw_receipts = manifest.get("send_receipts", [])
+    if not isinstance(raw_receipts, list):
+        raise BackupError("备份的发送回执不是列表")
+    send_receipts: dict[tuple[str, str], tuple[str, str, str, int]] = {}
+    for item in raw_receipts:
+        if not isinstance(item, dict) or set(item) != {"delivery_id", "sha256", "conversation_key", "sent_at"}:
+            raise BackupError("备份的发送回执字段无效")
+        delivery_id, digest, key = item["delivery_id"], item["sha256"], item["conversation_key"]
+        sent_at = item["sent_at"]
+        if (
+            not isinstance(delivery_id, str) or not delivery_id.strip()
+            or not isinstance(digest, str) or not _SHA256.fullmatch(digest)
+            or not isinstance(key, str) or not key.strip()
+            or type(sent_at) is not int or not 0 <= sent_at < 2 ** 63
+        ):
+            raise BackupError("备份的发送回执内容无效")
+        identity = (delivery_id, digest)
+        receipt = (delivery_id, digest, key, sent_at)
+        if identity in send_receipts and send_receipts[identity] != receipt:
+            raise BackupError("备份的发送回执相互冲突")
+        send_receipts[identity] = receipt
+
     return _Plan(
         members=members,
         entries=entries,
         sent_log=sent_log,
+        send_receipts=list(send_receipts.values()),
         exported_at=_as_int(manifest.get("exported_at")),
     )
 
@@ -470,6 +510,12 @@ def _apply(
 
     db.execute("BEGIN IMMEDIATE")
     try:
+        ensure_receipt_schema(db)
+        db.executemany(
+            "INSERT INTO send_receipts(delivery_id,sha256,conversation_key,sent_at) VALUES(?,?,?,?)"
+            " ON CONFLICT(delivery_id,sha256) DO NOTHING",
+            plan.send_receipts,
+        )
         if mode == MODE_REPLACE:
             keeping = {
                 _resolve(roots, workspace_root, entry.rel_path)
@@ -481,6 +527,7 @@ def _apply(
                 old = _within(roots, workspace_root, rel) if rel else None
                 if old is not None and old not in keeping:
                     stale.add(old)
+            # 恢复旧库不能抹掉本机已确认投递的去重回执。
             db.execute("DELETE FROM sent_log")
             db.execute("DELETE FROM stickers")
 
@@ -518,7 +565,7 @@ def _apply(
             if digest in known:
                 db.execute(
                     "INSERT INTO sent_log(conversation_key,sha256,sent_at) VALUES(?,?,?)"
-                    " ON CONFLICT(conversation_key,sha256) DO UPDATE SET sent_at=excluded.sent_at",
+                    " ON CONFLICT(conversation_key,sha256) DO UPDATE SET sent_at=MAX(sent_log.sent_at,excluded.sent_at)",
                     (key, digest, sent_at),
                 )
         db.execute("COMMIT")
