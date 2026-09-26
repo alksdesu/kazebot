@@ -509,7 +509,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         return _write_text(p, payload.content)
 
     # ----- 旧的 QQ 热载配置路由 -----
-    # 控制台和运维脚本还在调这几条，行为与 /v1/platforms/qq/... 完全一致。
+    # 没刷新的旧控制台和照文档写的运维脚本还在调这几条，行为与 /v1/platforms/qq/... 完全一致。
     from . import platform_api
     from platforms.builtin import QQ_NAPCAT
 

@@ -1,6 +1,6 @@
 """/v1/platforms：平台清单与各平台的热载配置、试听端点。
 
-旧的 /v1/admin/config/qq/* 仍在被控制台调用，必须和新路径给出同一份结果。
+旧的 /v1/admin/config/qq/* 留给没刷新的旧控制台和运维脚本，必须和新路径给出同一份结果。
 """
 from __future__ import annotations
 

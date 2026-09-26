@@ -115,13 +115,25 @@ def test_workspace_default_is_derived_from_the_repo(
             )
 
 
+_CONSOLE_ROOT = _ROOT / "adapters/web/frontend/src/console"
+
+
 @pytest.fixture(scope="module")
 def console_blob() -> str:
-    root = _ROOT / "adapters/web/frontend/src/console"
     return "\n".join(
         path.read_text(encoding="utf-8")
-        for path in sorted(root.rglob("*.ts*"))
+        for path in sorted(_CONSOLE_ROOT.rglob("*.ts*"))
     )
+
+
+@pytest.fixture(scope="module")
+def console_controls(console_blob: str) -> set[str]:
+    # 控件种类以 FieldSpec 联合类型为准：带 key 的成员才绑定配置键，新加一种控件这里自动认得。
+    schema = (_CONSOLE_ROOT / "fieldSchema.ts").read_text(encoding="utf-8")
+    kinds = re.findall(r"\|\s*\{\s*kind:\s*'(\w+)';\s*key:\s*string\b", schema)
+    assert kinds, "fieldSchema.ts 里认不出带 key 的控件种类，扫描规则得跟着改"
+    declared = re.compile(r"kind:\s*'(?:%s)',\s*key:\s*'([a-z_]+)'" % "|".join(map(re.escape, kinds)))
+    return set(declared.findall(console_blob))
 
 
 # 被七个信号开关取代的旧枚举。控制台只读它推导「这项没配时当前行为是什么」的提示，
@@ -130,11 +142,11 @@ _CONSOLE_READ_ONLY_KEYS = frozenset({"group_trigger"})
 
 
 def test_every_live_key_has_a_console_control(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, console_blob: str,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, console_controls: set[str],
 ) -> None:
     live_config = load_live_config(monkeypatch, tmp_path)
-    # 只认 configKey=：useLiveValue('x') 那种只读消费不是控件，按文本搜会漏报成已覆盖。
-    wired = set(re.findall(r'configKey="([a-z_]+)"', console_blob))
+    # 只认字段声明里的控件：useLiveValue('x') 那种只读消费不是控件，按文本搜会漏报成已覆盖。
+    wired = console_controls
     missing = [
         key.name
         for key in live_config.LIVE_KEYS
@@ -147,13 +159,12 @@ def test_every_live_key_has_a_console_control(
 
 
 def test_read_only_console_keys_really_have_no_control(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, console_blob: str,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, console_controls: set[str],
 ) -> None:
     live_config = load_live_config(monkeypatch, tmp_path)
     known = {key.name for key in live_config.LIVE_KEYS}
     assert _CONSOLE_READ_ONLY_KEYS <= known, "豁免名单里有已经不存在的键"
-    wired = set(re.findall(r'configKey="([a-z_]+)"', console_blob))
-    leaked = sorted(_CONSOLE_READ_ONLY_KEYS & wired)
+    leaked = sorted(_CONSOLE_READ_ONLY_KEYS & console_controls)
     assert not leaked, f"这些键被当成 deprecated 豁免了，却又给了控件：{leaked}"
 
 
