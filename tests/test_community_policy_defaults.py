@@ -59,13 +59,13 @@ def test_defaults_resource_is_independent_from_console_scope(tmp_path, monkeypat
         response = client.get("/v1/community/settings/defaults")
         assert response.status_code == 200
         assert response.json()["values"] == {}
-        assert response.json()["settings"]["topic_enabled"] is False
+        assert response.json()["settings"]["topic_enabled"] is True
 
 
 def test_state_describes_inheritance_without_migrating_console(service, admin, group):
-    service.update_settings(replace(admin, scope="web:console"), {"topic_enabled": True})
+    service.update_settings(replace(admin, scope="web:console"), {"topic_enabled": False})
     state = service.state(group)
-    assert state["defaults"]["topic_enabled"] is False
+    assert state["defaults"]["topic_enabled"] is True
     assert state["overrides"] == {}
     assert "topic_enabled" in state["inherited_fields"]
 
@@ -83,10 +83,11 @@ def test_instance_default_applies_until_false_override_is_cleared(service, admin
 
 
 def test_global_merge_pair_checks_existing_partial_override(service, admin, group):
+    service.update_defaults(admin, {"values": {"merge_window_sec": 0, "merge_max_wait_sec": 4}, "expected_revision": 0})
     service.update_settings(group, {"merge_max_wait_sec": 1})
     with pytest.raises(ValueError, match="覆盖"):
-        service.update_defaults(admin, {"values": {"merge_window_sec": 2}, "expected_revision": 0})
-    assert service.defaults(admin)["revision"] == 0
+        service.update_defaults(admin, {"values": {"merge_window_sec": 2}, "expected_revision": 1})
+    assert service.defaults(admin)["revision"] == 1
 
 
 def test_group_features_reject_console_but_private_quiet_remains(service, admin):
@@ -116,10 +117,10 @@ def test_private_conversation_inherits_same_instance_defaults(service, admin):
 
 def test_instances_and_restart_have_independent_persistent_defaults(tmp_path, admin, group):
     first, second = CommunityService(tmp_path / "a"), CommunityService(tmp_path / "b")
-    first.update_defaults(admin, {"values": {"topic_enabled": True}, "expected_revision": 0})
-    assert second.defaults(admin)["settings"]["topic_enabled"] is False
-    assert CommunityService(tmp_path / "a").state(group)["settings"]["topic_enabled"] is True
-    assert CommunityService(tmp_path / "b").state(group)["settings"]["topic_enabled"] is False
+    first.update_defaults(admin, {"values": {"topic_enabled": False}, "expected_revision": 0})
+    assert second.defaults(admin)["settings"]["topic_enabled"] is True
+    assert CommunityService(tmp_path / "a").state(group)["settings"]["topic_enabled"] is False
+    assert CommunityService(tmp_path / "b").state(group)["settings"]["topic_enabled"] is True
 
 
 def test_old_database_keeps_all_explicit_values_and_does_not_lower_future_version(tmp_path, admin, group):
@@ -139,7 +140,7 @@ def test_old_database_keeps_all_explicit_values_and_does_not_lower_future_versio
     assert "welcome_enabled" not in state["defaults"]
     with sqlite3.connect(path) as db:
         assert json.loads(db.execute("SELECT settings FROM groups WHERE scope=?", (group.scope,)).fetchone()[0]) == stored
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
         db.execute("PRAGMA user_version=99")
     CommunityService(tmp_path)
     with sqlite3.connect(path) as db:
@@ -187,7 +188,7 @@ def test_global_pair_conflict_rolls_back_all_values_without_clamping(service, ad
     service.update_settings(group, {"merge_window_sec": 3})
     before = snapshot(service)
     with pytest.raises(ValueError, match="覆盖冲突"):
-        service.update_defaults(admin, {"values": {"merge_max_wait_sec": 2, "topic_enabled": True}, "expected_revision": 0})
+        service.update_defaults(admin, {"values": {"merge_window_sec": 1, "merge_max_wait_sec": 2, "topic_enabled": False}, "expected_revision": 0})
     assert snapshot(service) == before
     assert service.state(group)["settings"]["merge_window_sec"] == 3
 
@@ -273,13 +274,13 @@ def test_state_uses_one_read_snapshot_for_defaults_and_local_revision(service, t
     original = service._defaults_in
     def read_and_write(db):
         result = original(db)
-        writer.update_defaults(admin, {"values": {"topic_enabled": True}, "expected_revision": 0})
+        writer.update_defaults(admin, {"values": {"topic_enabled": False}, "expected_revision": 0})
         writer.update_overrides(group, {"values": {"reply_budget_per_minute": 2}, "expected_revision": 0, "expected_defaults_revision": 1})
         return result
     monkeypatch.setattr(service, "_defaults_in", read_and_write)
     state = service.state(group)
     assert state["defaults_revision"] == 0 and state["revision"] == 0
-    assert state["settings"]["topic_enabled"] is False
+    assert state["settings"]["topic_enabled"] is True
     assert state["settings"]["reply_budget_per_minute"] == 6
     assert state["overrides"] == {}
 
@@ -426,6 +427,7 @@ def test_orphaned_policy_scope_remains_discoverable_after_conversation_removal(c
     client, state = client
     scope = "qq_group:synthetic-orphan"
     actor = FeatureActor(scope=scope, owner="console:admin", is_admin=True, role="admin", channel="web")
+    state.community.update_defaults(actor, {"values": {"merge_window_sec": 0, "merge_max_wait_sec": 4}, "expected_revision": 0})
     state.community.update_settings(actor, {"merge_max_wait_sec": 1})
     directory = state.workspace_root / "data" / "conversations"
     directory.mkdir()
@@ -437,13 +439,13 @@ def test_orphaned_policy_scope_remains_discoverable_after_conversation_removal(c
     response = client.get("/v1/community/settings/scopes")
     assert response.status_code == 200
     assert [item["scope"] for item in response.json()["items"]] == [scope]
-    blocked = client.patch("/v1/community/settings/defaults", json={"values": {"merge_window_sec": 2}, "expected_revision": 0})
+    blocked = client.patch("/v1/community/settings/defaults", json={"values": {"merge_window_sec": 2}, "expected_revision": 1})
     assert blocked.status_code == 422
     local = client.get("/v1/community/state", params={"scope": scope}).json()
     reset = client.patch("/v1/community/settings/overrides", params={"scope": scope}, json={"reset_fields": ["merge_max_wait_sec"], "expected_revision": local["revision"], "expected_defaults_revision": local["defaults_revision"]})
     assert reset.status_code == 200
     assert client.get("/v1/community/settings/scopes").json()["items"] == []
-    assert client.patch("/v1/community/settings/defaults", json={"values": {"merge_window_sec": 2}, "expected_revision": 0}).status_code == 200
+    assert client.patch("/v1/community/settings/defaults", json={"values": {"merge_window_sec": 2}, "expected_revision": 1}).status_code == 200
 
 
 def test_policy_scope_directory_lists_only_explicit_qq_policy_keys(service, admin):

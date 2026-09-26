@@ -12,15 +12,21 @@ from typing import Any
 from fastapi import HTTPException
 
 
-POLICY_DEFAULTS = {
+LEGACY_POLICY_DEFAULTS = {
     "response_policy_enabled": False,
     "topic_enabled": False,
     "merge_window_sec": 0.0,
     "merge_max_wait_sec": 4.0,
     "reply_budget_per_minute": 6,
 }
+POLICY_DEFAULTS = {
+    **LEGACY_POLICY_DEFAULTS,
+    "topic_enabled": True,
+    "merge_window_sec": 8.0,
+    "merge_max_wait_sec": 10.0,
+}
 POLICY_FIELDS = tuple(POLICY_DEFAULTS)
-DEFAULT_SETTINGS = {**POLICY_DEFAULTS, "welcome_enabled": False}
+DEFAULT_SETTINGS = {**LEGACY_POLICY_DEFAULTS, "welcome_enabled": False}
 
 
 class SettingsConflict(ValueError):
@@ -32,43 +38,93 @@ class CommunityService:
         self.path = Path(workspace_root) / "data" / "community.sqlite3"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.executescript("""
+            self._enable_wal(db)
+            db.execute("BEGIN IMMEDIATE")
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            existing = version in {1, 2} or bool(tables & {
+                "groups", "conversation_defaults", "activities", "operations", "notifications", "messages", "decisions",
+            })
+            statements = (
+                """
                 CREATE TABLE IF NOT EXISTS groups (
                     scope TEXT PRIMARY KEY, settings TEXT NOT NULL DEFAULT '{}',
                     guide TEXT NOT NULL DEFAULT '{}', quiet TEXT NOT NULL DEFAULT '{}', revision INTEGER NOT NULL DEFAULT 0
-                );
+                )
+                """,
+                """
                 CREATE TABLE IF NOT EXISTS conversation_defaults (
                     id INTEGER PRIMARY KEY CHECK (id=1), settings TEXT NOT NULL DEFAULT '{}',
                     revision INTEGER NOT NULL DEFAULT 0
-                );
+                )
+                """,
+                """
                 CREATE TABLE IF NOT EXISTS activities (
                     id TEXT PRIMARY KEY, scope TEXT NOT NULL, data TEXT NOT NULL, updated REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS activities_scope ON activities(scope, updated);
+                )
+                """,
+                "CREATE INDEX IF NOT EXISTS activities_scope ON activities(scope, updated)",
+                """
                 CREATE TABLE IF NOT EXISTS operations (
                     scope TEXT NOT NULL, key TEXT NOT NULL, result TEXT NOT NULL, created REAL NOT NULL,
                     PRIMARY KEY(scope, key)
-                );
+                )
+                """,
+                """
                 CREATE TABLE IF NOT EXISTS notifications (
                     id TEXT PRIMARY KEY, scope TEXT NOT NULL, activity_id TEXT NOT NULL DEFAULT '',
                     text TEXT NOT NULL, due REAL NOT NULL, expires REAL NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending', message_id TEXT NOT NULL DEFAULT ''
-                );
+                )
+                """,
+                """
                 CREATE TABLE IF NOT EXISTS messages (
                     scope TEXT NOT NULL, ref TEXT NOT NULL, owner TEXT NOT NULL, label TEXT NOT NULL,
                     text TEXT NOT NULL, reply_ref TEXT NOT NULL, topic TEXT NOT NULL, created REAL NOT NULL,
                     PRIMARY KEY(scope, ref)
-                );
-                CREATE INDEX IF NOT EXISTS messages_topic ON messages(scope, topic, created);
+                )
+                """,
+                "CREATE INDEX IF NOT EXISTS messages_topic ON messages(scope, topic, created)",
+                """
                 CREATE TABLE IF NOT EXISTS decisions (
                     scope TEXT NOT NULL, ref TEXT NOT NULL, data TEXT NOT NULL, created REAL NOT NULL,
                     PRIMARY KEY(scope, ref)
-                );
-            """)
-            db.execute("INSERT OR IGNORE INTO conversation_defaults(id) VALUES (1)")
-            if db.execute("PRAGMA user_version").fetchone()[0] in {0, 1}:
-                db.execute("PRAGMA user_version=2")
+                )
+                """,
+            )
+            for statement in statements:
+                db.execute(statement)
+            if version in {0, 1, 2} and existing:
+                self._migrate_defaults(db)
+            else:
+                db.execute("INSERT OR IGNORE INTO conversation_defaults(id) VALUES (1)")
+            if version in {0, 1, 2}:
+                db.execute("PRAGMA user_version=3")
+
+    @staticmethod
+    def _enable_wal(db) -> None:
+        timeout = db.execute("PRAGMA busy_timeout").fetchone()[0]
+        deadline = time.monotonic() + 15.0
+        delay = 0.01
+        try:
+            while True:
+                remaining = max(0.0, deadline - time.monotonic())
+                db.execute(f"PRAGMA busy_timeout={min(250, int(remaining * 1000))}")
+                try:
+                    mode = db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                    if str(mode).lower() != "wal":
+                        raise sqlite3.OperationalError("无法为群会话数据库启用 WAL")
+                    return
+                except sqlite3.OperationalError as error:
+                    if getattr(error, "sqlite_errorcode", 0) & 0xff not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    time.sleep(min(delay, remaining))
+                    delay = min(delay * 2, 0.1)
+        finally:
+            db.execute(f"PRAGMA busy_timeout={timeout}")
 
     @contextmanager
     def _db(self, write: bool = False):
@@ -187,9 +243,20 @@ class CommunityService:
     def _defaults_in(cls, db) -> dict:
         row = db.execute("SELECT settings,revision FROM conversation_defaults WHERE id=1").fetchone()
         values = cls._parse_values(cls._stored_settings(row["settings"]))
-        settings = {key: values.get(key, DEFAULT_SETTINGS[key]) for key in POLICY_FIELDS}
+        settings = {**POLICY_DEFAULTS, **values}
         cls._validate_pair(settings)
         return {"settings": settings, "values": values, "revision": row["revision"]}
+
+    @classmethod
+    def _migrate_defaults(cls, db) -> None:
+        row = db.execute("SELECT settings,revision FROM conversation_defaults WHERE id=1").fetchone()
+        values = cls._parse_values(cls._stored_settings(row["settings"])) if row else {}
+        settings = {**LEGACY_POLICY_DEFAULTS, **values}
+        cls._validate_pair(settings)
+        if row is None:
+            db.execute("INSERT INTO conversation_defaults(id,settings) VALUES (1,?)", (cls._dump(settings),))
+        elif values != settings:
+            db.execute("UPDATE conversation_defaults SET settings=?,revision=revision+1 WHERE id=1", (cls._dump(settings),))
 
     def _defaults_for_scope(self, db, scope: str) -> dict:
         if self._inherits_defaults(scope):
@@ -255,7 +322,7 @@ class CommunityService:
                 raise SettingsConflict("实例默认已被修改，请刷新后重试，当前草稿尚未保存")
             updated = {key: value for key, value in previous["values"].items() if key not in reset}
             updated.update(values)
-            effective = {key: updated.get(key, DEFAULT_SETTINGS[key]) for key in POLICY_FIELDS}
+            effective = {**POLICY_DEFAULTS, **updated}
             self._validate_pair(effective)
             conflicts = 0
             for row in db.execute("SELECT scope,settings FROM groups"):

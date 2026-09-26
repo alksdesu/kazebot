@@ -181,6 +181,20 @@ On first start, supervisor logs a console URL with a token in it — open that a
 
 Breaking the QQ config won't take the bot down — on a parse failure it keeps running the last good copy and logs the error. To see what's actually in effect inside the process, check `GET /qq/state`.
 
+Fresh installations and new instances start with these **QQ → Conversation and replies** settings:
+
+| Policy | Default |
+|---|---|
+| Unified choice between ignoring, reacting, brief replies and tasks | Off |
+| Continue topics using quoted messages and participants | On |
+| Wait for short messages from the same person | 8 seconds |
+| Maximum wait while more messages arrive | 10 seconds |
+| Autonomous reply limit per minute | 6 |
+
+The 8/10-second windows wait for more input from the same person and combine it into one request; they do not control the delay between outgoing messages. The autonomous reply limit applies when the unified response policy is enabled.
+
+Upgrading preserves each existing instance's effective defaults and per-conversation overrides rather than forcing the new defaults onto it. Instances store their settings independently; restoring inheritance for a conversation uses that instance's defaults.
+
 ## Deployment
 
 ### Before you start
