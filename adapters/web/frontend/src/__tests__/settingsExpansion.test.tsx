@@ -66,16 +66,8 @@ describe('expanded settings registry', () => {
       // 模型与渠道从 QQ 页表里移出来，自成一组。
       'providers',
       'models',
-      // 平台组：QQ · NapCat 的各个分区。
-      'qq-account',
-      'qq-channels',
-      'qq-trigger',
-      'qq-permissions',
-      'qq-input',
-      'qq-output',
-      'qq-interaction',
-      'qq-sticker',
-      'qq-link',
+      // 平台组：一个平台一页，分区在页内折叠。
+      'platform-qq',
     ]);
     expect(settingsTabs.find((tab) => tab.id === 'system')).toMatchObject({ label: '系统', icon: 'settings_power', order: 4 });
     expect(settingsTabs.find((tab) => tab.id === 'tools')).toMatchObject({ label: '工具与权限', icon: 'build', order: 8 });

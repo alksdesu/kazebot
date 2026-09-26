@@ -68,15 +68,7 @@ describe('Material Symbols SVG icon system', () => {
       'notifications_active',
       'hub',
       'model_training',
-      'account_circle',
       'inbox',
-      'timer',
-      'verified_user',
-      'attach_file',
-      'format_align_left',
-      'chat',
-      'mood',
-      'lan',
     ]);
 
     // 注册了却没 import 过 —— ICON_MAP 落空，回退件会把名字塞进 16px 的格子里，

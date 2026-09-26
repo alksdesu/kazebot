@@ -11,7 +11,7 @@ import { settingsTabs } from '../components/settings/settingsTabs';
 import { useChatStore, type ConversationMeta } from '../store/chatStore';
 import { useSettingsSelectionStore } from '../store/settingsSelectionStore';
 import { useSettingsStore } from '../store/settingsStore';
-import { tabForLegacyDomain, useViewStore } from '../store/viewStore';
+import { locationForLegacyDomain, tabForLegacyDomain, useViewStore } from '../store/viewStore';
 import type { AdminApproval } from '../api/supervisorClient';
 
 const conversation: ConversationMeta = {
@@ -49,12 +49,22 @@ describe('QQ 分区入口', () => {
     vi.restoreAllMocks();
   });
 
-  it('QQ 那十页和别的设置分区平铺在同一栏里，点一下就到', () => {
+  it('平台页和别的设置分区平铺在同一栏里，点一下就到', () => {
     render(<SettingsSidebar />);
 
-    fireEvent.click(screen.getByRole('button', { name: '权限' }));
+    fireEvent.click(screen.getByRole('button', { name: 'QQ · NapCat' }));
 
-    expect(useViewStore.getState().activeSettingsTab).toBe('qq-permissions');
+    expect(useViewStore.getState().activeSettingsTab).toBe('platform-qq');
+  });
+
+  it('搜索索引到折叠起来的分区，点一下直接展开那一块', () => {
+    render(<SettingsSidebar />);
+
+    fireEvent.change(screen.getByLabelText('搜索设置'), { target: { value: '权限' } });
+    fireEvent.click(screen.getByRole('button', { name: 'QQ · NapCat：权限' }));
+
+    expect(useViewStore.getState().activeSettingsTab).toBe('platform-qq');
+    expect(useViewStore.getState().activeSettingsSection).toBe('permissions');
   });
 
   it('分组标题把机器人、模型、引擎和平台分开', () => {
@@ -65,14 +75,16 @@ describe('QQ 分区入口', () => {
     }
   });
 
-  it('两个「运行」不再撞：诊断页和链路页各是各的', () => {
+  it('两个「运行」不再撞：诊断页是页签，链路是平台页里的分区', () => {
     render(<SettingsSidebar />);
 
     fireEvent.click(screen.getByRole('button', { name: '运行' }));
     expect(useViewStore.getState().activeSettingsTab).toBe('runtime');
 
-    fireEvent.click(screen.getByRole('button', { name: '链路' }));
-    expect(useViewStore.getState().activeSettingsTab).toBe('qq-link');
+    fireEvent.change(screen.getByLabelText('搜索设置'), { target: { value: '链路' } });
+    fireEvent.click(screen.getByRole('button', { name: 'QQ · NapCat：链路' }));
+    expect(useViewStore.getState().activeSettingsTab).toBe('platform-qq');
+    expect(useViewStore.getState().activeSettingsSection).toBe('link');
   });
 
   it('聊天侧栏只留设置入口', () => {
@@ -114,11 +126,12 @@ describe('视图与地址栏同步', () => {
     expect(new URLSearchParams(window.location.search).get('tab')).toBe('skills');
   });
 
-  it('QQ 分区跟别的分区一样写 tab，没有第二套参数', () => {
+  it('平台分区跟别的分区一样写 tab 与 section，没有第二套参数', () => {
     useViewStore.getState().openSettings('qq-permissions');
 
     const params = new URLSearchParams(window.location.search);
-    expect(params.get('tab')).toBe('qq-permissions');
+    expect(params.get('tab')).toBe('platform-qq');
+    expect(params.get('section')).toBe('permissions');
     expect(params.get('domain')).toBeNull();
   });
 
@@ -137,14 +150,14 @@ describe('视图与地址栏同步', () => {
 // 书签和聊天记录里还躺着 ?view=console&domain=x 的老链接。
 describe('老控制台链接', () => {
   it('域名换算成对应的设置分区，改过名的走别名', () => {
-    expect(tabForLegacyDomain('channels')).toBe('qq-channels');
-    expect(tabForLegacyDomain('timing')).toBe('qq-trigger');
+    expect(locationForLegacyDomain('channels')).toEqual({ tab: 'platform-qq', section: 'channels' });
+    expect(locationForLegacyDomain('timing')).toEqual({ tab: 'platform-qq', section: 'trigger' });
     expect(tabForLegacyDomain('stickers')).toBe('stickers');
     expect(tabForLegacyDomain('providers')).toBe('providers');
   });
 
   it('「运行」不能直译：设置页已经有一个 runtime 了', () => {
-    expect(tabForLegacyDomain('runtime')).toBe('qq-link');
+    expect(locationForLegacyDomain('runtime')).toEqual({ tab: 'platform-qq', section: 'link' });
     expect(settingsTabs.filter(tab => tab.id === 'runtime')).toHaveLength(1);
   });
 

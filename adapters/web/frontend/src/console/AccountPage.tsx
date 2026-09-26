@@ -23,7 +23,6 @@ import {
 import { useSettingsStore } from '../store/settingsStore';
 import { AccountScope } from './AccountScope';
 import { Block, Button, Empty, Facts, Input, Panel, Pre } from './components';
-import { ConnectionCard } from './ConnectionCard';
 import { InstanceLink, InstanceSwitch } from './InstanceSwitch';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useRequestScope } from '../features/asyncState';
@@ -67,7 +66,6 @@ const AccountWorkspace = ({ token }: { token: string }) => {
   }, [token]);
   useEffect(() => { void refresh(); return () => { sequence.current++; }; }, [refresh]);
   return <>
-    <ConnectionCard />
     <InstanceManagement token={token} instances={instances} loading={loading} error={error} refresh={refresh} />
     <AccountConnectionPage token={token} instances={instances} ownershipReady={!loading && !error} />
     <AccountScope />

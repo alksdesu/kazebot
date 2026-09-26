@@ -3,7 +3,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import type { QqInputRule } from '../api/supervisorClient';
-import { barState } from '../console/components';
+import { barState } from '../console/PlatformPage';
 import {
   addWord,
   asWordList,

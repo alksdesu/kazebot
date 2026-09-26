@@ -215,6 +215,38 @@ export function effectiveValues(state: ConsoleState): Record<string, unknown> {
   return { ...(state.live?.state?.values || {}), ...state.draft };
 }
 
+/** 只读 bot 公布的生效值，不看草稿。分区摘要要的是「现在实际在跑什么」。 */
+export function useAppliedValue<T>(name: string, fallback: T): T {
+  return useConsoleStore((state) => {
+    const value = state.live?.state?.values?.[name];
+    return (value === undefined || value === null ? fallback : value) as T;
+  });
+}
+
+/** 生效值里某个列表有几项。摘要只用得上个数，返回数字才不会让订阅方空转。 */
+export function useAppliedCount(name: string): number {
+  return useConsoleStore((state) => {
+    const value = state.live?.state?.values?.[name];
+    return Array.isArray(value) ? value.length : 0;
+  });
+}
+
+/** 这个配置路径归不归某个分区管。按段比，`extensions.reactions` 不能吃掉 `extensions.reactions_x`。 */
+export function pathBelongs(path: string, prefixes: readonly string[]): boolean {
+  return prefixes.some((prefix) => path === prefix || path.startsWith(`${prefix}.`));
+}
+
+/** 某个分区名下有几项待应用。键名 → 路径由 bot 公布，改了配置段归属这里自动跟着走。 */
+export function countDraftIn(state: ConsoleState, prefixes: readonly string[]): number {
+  const paths = state.live?.state?.paths || {};
+  return Object.keys(state.draft)
+    .filter((name) => pathBelongs(String(paths[name] || ''), prefixes)).length;
+}
+
+export function useSectionPending(prefixes: readonly string[]): number {
+  return useConsoleStore((state) => countDraftIn(state, prefixes));
+}
+
 /** 读一个键当前该显示的值：草稿优先，其次 bot 公布的生效值。
  *
  * fallback 只能是标量。传字面量数组或对象的话每次渲染都是新引用，

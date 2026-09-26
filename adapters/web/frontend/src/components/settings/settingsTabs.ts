@@ -11,9 +11,9 @@ import { RemindersPage } from '../../features/execution/RemindersPage';
 import {
   BOT_PAGES,
   MODEL_PAGES,
-  QQ_SECTIONS,
+  PLATFORM_PAGES,
   wrapConsolePage,
-  wrapPlatformSection,
+  wrapPlatformPage,
 } from '../../console/pages';
 import { resolveSettingsTabId } from './settingsTabAliases';
 import { ClientSettingsPage } from './pages/ClientSettingsPage';
@@ -54,9 +54,16 @@ export const SETTINGS_GROUP_LABELS: Record<SettingsGroup, string> = {
 
 export const SETTINGS_GROUP_ORDER: SettingsGroup[] = ['basics', 'bot', 'models', 'engine', 'platform'];
 
+/** 平台页里的折叠分区。侧栏搜索要索引到它们，否则折叠之后「冷却」之类的字段就找不着了。 */
+export interface SettingsTabSection {
+  id: string;
+  label: string;
+}
+
 export interface SettingsTabDefinition {
   id: string;
   label: string;
+  sections?: SettingsTabSection[];
   group?: SettingsGroup;
   // [2026-06-01] Why: settings icon values used to be literal Unicode glyphs.
   // How: keep the field as a string but store Material Symbol names instead.
@@ -115,13 +122,14 @@ const MODEL_TABS: SettingsTabDefinition[] = MODEL_PAGES.map((page, index) => ({
   Page: wrapConsolePage(SETTINGS_GROUP_LABELS.models, page),
 }));
 
-const PLATFORM_TABS: SettingsTabDefinition[] = QQ_SECTIONS.map((section, index) => ({
-  id: section.id,
-  label: section.label,
-  icon: section.icon,
+const PLATFORM_TABS: SettingsTabDefinition[] = PLATFORM_PAGES.map((page, index) => ({
+  id: page.id,
+  label: page.label,
+  icon: page.icon,
   group: 'platform',
   order: 40 + index,
-  Page: wrapPlatformSection(section),
+  sections: page.sections.map((section) => ({ id: section.id, label: section.label })),
+  Page: wrapPlatformPage(page),
 }));
 
 export const settingsTabs: SettingsTabDefinition[] = [...CORE_TABS, ...BOT_TABS, ...MODEL_TABS, ...PLATFORM_TABS]

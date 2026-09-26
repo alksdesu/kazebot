@@ -1,0 +1,55 @@
+// 平台页的折叠分区：收起时一行摘要，展开才渲染正文。
+import { useId, type ReactNode } from 'react';
+
+import { Icon } from '../components/common';
+import { ErrorText } from './components';
+
+interface SectionProps {
+  children: ReactNode;
+  /** 深链锚点，同时是记住展开状态的键。 */
+  id: string;
+  error?: string;
+  icon?: string;
+  onToggle: () => void;
+  open: boolean;
+  /** 有几项改动落在这个分区里。0 不显示，省得每个头上都挂一个「0 项」。 */
+  pending?: number;
+  /** 收起时那一行。来自 bot 公布的生效状态，不是浏览器里的草稿。 */
+  summary: ReactNode;
+  title: string;
+}
+
+export const Section = ({
+  children, error, icon, id, onToggle, open, pending = 0, summary, title,
+}: SectionProps) => {
+  const bodyId = useId();
+
+  return (
+    <section className="border-b border-[var(--duties-border)] last:border-b-0" id={`section-${id}`}>
+      <h2 className="m-0">
+        <button
+          aria-controls={bodyId}
+          aria-expanded={open}
+          className="app-button flex w-full min-w-0 flex-wrap items-center gap-2.5 px-1 py-3 text-left"
+          onClick={onToggle}
+          type="button"
+        >
+          <Icon className="flex-none text-[var(--duties-secondary)]" name={open ? 'keyboard_arrow_down' : 'chevron_right'} size={18} />
+          {icon && <Icon className="flex-none text-[var(--duties-secondary)]" name={icon} size={18} />}
+          <span className="flex-none text-base font-semibold">{title}</span>
+          <span className="min-w-0 flex-1 truncate text-xs text-[var(--duties-secondary)]">{summary}</span>
+          {error && <span className="flex-none text-xs text-[var(--duties-danger)]">配置有误</span>}
+          {pending > 0 && (
+            <span className="flex-none text-xs font-medium text-[var(--duties-danger)]">{pending} 项待应用</span>
+          )}
+        </button>
+      </h2>
+      {open && (
+        <div className="settings-section-body pb-5" id={bodyId}>
+          {error && <ErrorText>{error}</ErrorText>}
+          {children}
+        </div>
+      )}
+    </section>
+  );
+};

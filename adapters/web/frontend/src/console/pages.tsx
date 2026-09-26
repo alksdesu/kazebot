@@ -1,9 +1,10 @@
 // 控制台各页在设置侧栏里的登记项。页面本体只写内容，外壳由这里统一套：
-// 平台页走 QqPage（带生效状态条），机器人页与模型页不碰平台配置，走通用页壳。
+// 平台页走 PlatformPage（状态栏 + 连接卡 + 折叠分区），机器人页与模型页走通用素壳。
 import { AccountPage } from './AccountPage';
 import { DiagnosticsPanel } from '../features/operations/DiagnosticsPanel';
 import { ChannelsPage } from './ChannelsPage';
-import { PlainPage, QqPage } from './components';
+import { PlainPage } from './components';
+import { ConnectionCard } from './ConnectionCard';
 import { InputPage } from './InputPage';
 import { InteractionPage } from './InteractionPage';
 import { MemoryPage } from './MemoryPage';
@@ -11,11 +12,24 @@ import { ModelsPage } from './ModelsPage';
 import { OutputPage } from './OutputPage';
 import { PermissionsPage } from './PermissionsPage';
 import { PersonaPage } from './PersonaPage';
+import { PlatformPage, type PlatformSection } from './PlatformPage';
 import { ProvidersPage } from './ProvidersPage';
 import { RuntimePage } from './RuntimePage';
 import { StickerCollectPage } from './StickerCollectPage';
 import { StickersPage } from './StickersPage';
 import { TimingPage } from './TimingPage';
+import { QQ_NAPCAT, type PlatformDescriptor } from '../platforms/registry';
+import {
+  AccountSummary,
+  ChannelsSummary,
+  InputSummary,
+  InteractionSummary,
+  LinkSummary,
+  OutputSummary,
+  PermissionsSummary,
+  StickerSummary,
+  TriggerSummary,
+} from './sectionSummaries';
 
 export interface ConsolePageDefinition {
   /** 设置页 tab id。改名要在 settingsTabAliases 里留一条别名，老书签才不会失效。 */
@@ -24,12 +38,6 @@ export interface ConsolePageDefinition {
   icon: string;
   note: string;
   Page: () => JSX.Element;
-  AlwaysPanel?: () => JSX.Element;
-}
-
-export interface PlatformSectionDefinition extends ConsolePageDefinition {
-  /** 写的不是平台配置文件。bot 没跑也该能改，不等它公布生效配置。 */
-  standalone?: boolean;
 }
 
 /** 全平台共用的那几页：它是谁、记得什么、图库里有什么。 */
@@ -75,83 +83,123 @@ export const MODEL_PAGES: ConsolePageDefinition[] = [
   },
 ];
 
-/** QQ · NapCat 的分区。顺序即界面顺序，与 qq.yaml 的配置段一一对应。 */
-export const QQ_SECTIONS: PlatformSectionDefinition[] = [
+/** QQ · NapCat 的分区。paths 对着 bot 公布的键路径，决定「N 项待应用」算在谁头上。 */
+export const QQ_SECTIONS: PlatformSection[] = [
   {
-    id: 'qq-account',
+    id: 'account',
     label: '账号与连接',
     icon: 'account_circle',
-    Page: AccountPage,
-    standalone: true,
-    note: '这一个实例用哪个号在说话、链路通没通，以及多开与记忆归属。换号会重启 NapCat，期间 bot 不可用。',
+    paths: [],
+    Summary: AccountSummary,
+    Body: AccountPage,
+    note: '这一个实例用哪个号在说话，以及多开与记忆归属。换号会重启 NapCat，期间 bot 不可用。',
   },
   {
-    id: 'qq-channels',
+    id: 'channels',
     label: '信道',
     icon: 'inbox',
-    Page: ChannelsPage,
+    paths: ['channels'],
+    Summary: ChannelsSummary,
+    Body: ChannelsPage,
     note: 'bot 只在名单里的群和私聊里出现。两份名单都是白名单，不在名单里的消息连处理都不会处理。',
   },
   {
-    id: 'qq-trigger',
+    id: 'trigger',
     label: '触发时机',
     icon: 'timer',
-    Page: TimingPage,
+    paths: ['trigger'],
+    Summary: TriggerSummary,
+    Body: TimingPage,
     note: '决定 bot 在群里什么时候说话。多个条件之间是「或」——命中任意一条就会回应，再由冷却决定是否真的开口。',
   },
   {
-    id: 'qq-permissions',
+    id: 'permissions',
     label: '权限',
     icon: 'verified_user',
-    Page: PermissionsPage,
+    paths: ['permissions', 'approval'],
+    Summary: PermissionsSummary,
+    Body: PermissionsPage,
     note: '谁能对 bot 下管理命令。管理员权限跨所有群和私聊生效，不区分场景。',
   },
   {
-    id: 'qq-input',
+    id: 'input',
     label: '输入处理',
     icon: 'attach_file',
-    Page: InputPage,
+    paths: ['input'],
+    Summary: InputSummary,
+    Body: InputPage,
     note: '群友发来的图片、文件和合并转发，哪些收、收多少。',
   },
   {
-    id: 'qq-output',
+    id: 'output',
     label: '输出格式',
     icon: 'format_align_left',
-    Page: OutputPage,
+    paths: ['output', 'extensions.reactions'],
+    Summary: OutputSummary,
+    Body: OutputPage,
     note: '消息发出去之前的处理：分条、去掉 Markdown 标记、长度上限、表态。',
   },
   {
-    id: 'qq-interaction',
+    id: 'interaction',
     label: '群互动',
     icon: 'chat',
-    Page: InteractionPage,
+    // auto_like_times 和 auto_like 是同级键，不是它的子路径，得各列一条。
+    paths: ['extensions.echo', 'extensions.preempt', 'extensions.auto_like', 'extensions.auto_like_times'],
+    Summary: InteractionSummary,
+    Body: InteractionPage,
     note: '除了说话之外还能做什么：跟复读、抢答、给资料卡点赞。',
   },
   {
-    id: 'qq-sticker',
+    id: 'sticker',
     label: '表情包',
     icon: 'mood',
-    Page: StickerCollectPage,
+    paths: ['extensions.sticker'],
+    Summary: StickerSummary,
+    Body: StickerCollectPage,
     note: '在 QQ 这一侧怎么收表情包、怎么发。图库本身在「机器人 › 表情包图库」里管。',
   },
   {
-    id: 'qq-link',
+    id: 'link',
     label: '链路',
     icon: 'lan',
-    Page: RuntimePage,
-    AlwaysPanel: DiagnosticsPanel,
+    paths: ['queue', 'history', 'forward_bridge'],
+    Summary: LinkSummary,
+    Body: RuntimePage,
     note: '队列、群历史、转发桥这几个改完立刻重建运行期对象的参数，以及固定配置与危险操作。',
   },
 ];
 
-/** 把平台分区包进 QQ 页壳。settingsTabs 注册的是包装后的组件。 */
-export function wrapPlatformSection({ label, note, Page, AlwaysPanel, standalone }: PlatformSectionDefinition): () => JSX.Element {
+export interface PlatformPageDefinition {
+  id: string;
+  label: string;
+  icon: string;
+  note: string;
+  platform: PlatformDescriptor;
+  sections: PlatformSection[];
+}
+
+export const PLATFORM_PAGES: PlatformPageDefinition[] = [
+  {
+    id: 'platform-qq',
+    label: QQ_NAPCAT.displayName,
+    icon: 'inbox',
+    platform: QQ_NAPCAT,
+    sections: QQ_SECTIONS,
+    note: 'bot 在 QQ 上怎么收发消息。改完点顶部的「应用」写进配置文件，状态条会显示 bot 有没有读到这一份。',
+  },
+];
+
+/** 一个平台一页。分区在页内折叠，深链靠 ?section= 定位。 */
+export function wrapPlatformPage({ note, platform, sections }: PlatformPageDefinition): () => JSX.Element {
   const Wrapped = () => (
-    <QqPage note={note} standalone={standalone} title={label} alwaysContent={AlwaysPanel ? <AlwaysPanel /> : undefined}>
-      <Page />
-    </QqPage>
+    <PlatformPage
+      connection={<><ConnectionCard /><DiagnosticsPanel /></>}
+      note={note}
+      platform={platform}
+      sections={sections}
+    />
   );
-  Wrapped.displayName = `QqPage(${label})`;
+  Wrapped.displayName = `PlatformPage(${platform.displayName})`;
   return Wrapped;
 }
 

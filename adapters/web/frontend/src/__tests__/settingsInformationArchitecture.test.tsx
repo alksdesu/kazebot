@@ -6,8 +6,8 @@ import { PersonaPage } from '../console/PersonaPage';
 import { RuntimePage } from '../console/RuntimePage';
 import { StickerCollectPage } from '../console/StickerCollectPage';
 import { StickersPage } from '../console/StickersPage';
-import { BOT_PAGES, MODEL_PAGES, QQ_SECTIONS } from '../console/pages';
-import { resolveSettingsTabId, TAB_ALIASES } from '../components/settings/settingsTabAliases';
+import { BOT_PAGES, MODEL_PAGES, PLATFORM_PAGES, QQ_SECTIONS } from '../console/pages';
+import { resolveSettingsLocation, TAB_ALIASES } from '../components/settings/settingsTabAliases';
 import { getSettingsTab, settingsTabs, type SettingsGroup } from '../components/settings/settingsTabs';
 import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
@@ -24,16 +24,19 @@ describe('设置分组归属', () => {
 
   it('渠道和模型不再登记在 QQ 页表里', () => {
     expect(idsInGroup('models')).toEqual(['providers', 'models']);
-    expect(QQ_SECTIONS.map(section => section.id)).not.toContain('providers');
-    expect(QQ_SECTIONS.map(section => section.id)).not.toContain('models');
-    expect([...BOT_PAGES, ...MODEL_PAGES].map(page => page.id)).not.toContain('qq-account');
+    const sectionIds = QQ_SECTIONS.map(section => section.id);
+    expect(sectionIds).not.toContain('providers');
+    expect(sectionIds).not.toContain('models');
+    expect([...BOT_PAGES, ...MODEL_PAGES].map(page => page.id)).not.toContain('account');
   });
 
-  it('平台组只剩 QQ · NapCat 的分区', () => {
-    expect(idsInGroup('platform')).toEqual([
-      'qq-account', 'qq-channels', 'qq-trigger', 'qq-permissions',
-      'qq-input', 'qq-output', 'qq-interaction', 'qq-sticker', 'qq-link',
+  it('平台组一个平台一页，分区按 14.4 的清单折在页里', () => {
+    expect(idsInGroup('platform')).toEqual(['platform-qq']);
+    expect(QQ_SECTIONS.map(section => section.id)).toEqual([
+      'account', 'channels', 'trigger', 'permissions',
+      'input', 'output', 'interaction', 'sticker', 'link',
     ]);
+    expect(PLATFORM_PAGES[0].platform.id).toBe('qq');
   });
 
   it('提醒从自动化里搬出来，自己一页', () => {
@@ -42,23 +45,30 @@ describe('设置分组归属', () => {
 });
 
 describe('旧 id 别名', () => {
-  it('每条别名都指向注册过的页，且自己不再占用 id', () => {
+  it('每条别名都指向注册过的页与分区，且自己不再占用 id', () => {
     const ids = new Set(settingsTabs.map(tab => tab.id));
-    for (const [legacy, current] of Object.entries(TAB_ALIASES)) {
-      expect(ids.has(current)).toBe(true);
+    for (const [legacy, target] of Object.entries(TAB_ALIASES)) {
+      expect(ids.has(target.tab)).toBe(true);
       expect(ids.has(legacy)).toBe(false);
+      if (!target.section) continue;
+      const sections = settingsTabs.find(tab => tab.id === target.tab)!.sections || [];
+      expect(sections.map(section => section.id)).toContain(target.section);
     }
   });
 
   it('没改名的 id 原样返回', () => {
-    expect(resolveSettingsTabId('qq-channels')).toBe('qq-channels');
-    expect(resolveSettingsTabId('general')).toBe('general');
+    expect(resolveSettingsLocation('general')).toEqual({ tab: 'general', section: '' });
+  });
+
+  it('显式指定的分区压过别名自带的', () => {
+    expect(resolveSettingsLocation('qq-timing')).toEqual({ tab: 'platform-qq', section: 'trigger' });
+    expect(resolveSettingsLocation('qq-timing', 'link')).toEqual({ tab: 'platform-qq', section: 'link' });
   });
 
   it('getSettingsTab 认旧 id，不再落到「通用」', () => {
     expect(getSettingsTab('qq-persona').id).toBe('persona');
     expect(getSettingsTab('qq-models').id).toBe('models');
-    expect(getSettingsTab('qq-timing').id).toBe('qq-trigger');
+    expect(getSettingsTab('qq-timing').id).toBe('platform-qq');
   });
 });
 
@@ -75,6 +85,25 @@ describe('旧深链', () => {
 
     expect(useViewStore.getState().activeSettingsTab).toBe('stickers');
     expect(new URLSearchParams(window.location.search).get('tab')).toBe('stickers');
+    expect(new URLSearchParams(window.location.search).get('section')).toBeNull();
+  });
+
+  it('旧的分区页签落到平台页的对应分区上', () => {
+    useViewStore.getState().setSettingsTab('qq-timing');
+
+    expect(useViewStore.getState().activeSettingsTab).toBe('platform-qq');
+    expect(useViewStore.getState().activeSettingsSection).toBe('trigger');
+    const params = new URLSearchParams(window.location.search);
+    expect(params.get('tab')).toBe('platform-qq');
+    expect(params.get('section')).toBe('trigger');
+  });
+
+  it('换到别的页时不留下上一页的分区参数', () => {
+    useViewStore.getState().setSettingsTab('qq-link');
+    useViewStore.getState().setSettingsTab('memory');
+
+    expect(useViewStore.getState().activeSettingsSection).toBe('');
+    expect(new URLSearchParams(window.location.search).get('section')).toBeNull();
   });
 
   it('openSettings 同样认旧 id', () => {

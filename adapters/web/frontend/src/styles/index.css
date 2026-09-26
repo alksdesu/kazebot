@@ -12,6 +12,7 @@
    Plex 之后必须原样接回 Tailwind 那条默认栈：中文在 Plex 里没有字形，会逐字回退到
    后面去，少一个 Consolas 就落到泛型 monospace，字号字形全交给浏览器默认值。 */
 @theme {
+  --animate-section-open: section-open 120ms ease-out;
   --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
     'Liberation Mono', 'Courier New', monospace;
   /* 正文 text-sm 之下的三档小字：标签、元信息、角标。差一档就是 0.03rem，再细分肉眼分不出。 */
@@ -185,6 +186,10 @@
 @layer components {
   .settings-control-grid {
     grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--duties-control-column-min)), 1fr));
+  }
+
+  .settings-section-body {
+    animation: var(--animate-section-open);
   }
 
   .settings-segment {
@@ -369,12 +374,30 @@
   to { transform: rotate(360deg); }
 }
 
+/* 折叠分区展开。位移只是交代「它从头下面长出来」，reduced-motion 下由下面那段压掉。 */
+@keyframes section-open {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms;
     animation-iteration-count: 1;
     transition-duration: 0.01ms;
     scroll-behavior: auto;
+  }
+
+  /* 只留透明度。位移在 0.01ms 里跳一下比不动更晃眼。 */
+  .settings-section-body {
+    animation: none;
   }
 }
 
