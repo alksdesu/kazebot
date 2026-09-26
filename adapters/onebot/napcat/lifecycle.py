@@ -410,13 +410,6 @@ async def _shutdown() -> None:
     state._adapter.event_router = None
     state._adapter.callbacks = None
     await forward_bridge._stop_forward_bridge()
-    # 关闭前先取消可能在睡等间隔的节流 flush task，再同步 flush 一次，
-    # 避免延迟写盘 task 未到点就退出导致最新别名丢失。
-    if state._adapter.anon_map_save_task is not None and not state._adapter.anon_map_save_task.done():
-        state._adapter.anon_map_save_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await state._adapter.anon_map_save_task
-    state._adapter.anon_map_save_task = None
     with contextlib.suppress(Exception):
-        await anonymize._save_anon_map()
+        await state._adapter.aliases.flush()
     common.logger.info("Clonoth Agent QQ adapter stopped")

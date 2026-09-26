@@ -507,11 +507,11 @@ class TestClearGroupMemoryCommand:
 
     def test_computing_the_namespace_does_not_mint_an_alias(self, runtime) -> None:
         # _stable_conversation_key 会顺带分配匿名别名；清记忆不该有这个副作用。
-        before = dict(runtime.state._adapter.anon_groups)
+        before = dict(runtime.state._adapter.aliases.groups.items())
 
         runtime.commands._conversation_memory_namespace_for_group(20260816)
 
-        assert runtime.state._adapter.anon_groups == before
+        assert dict(runtime.state._adapter.aliases.groups.items()) == before
 
     def test_clearing_one_group_keeps_another_groups_hit_stamps(self, runtime, tmp_path: Path) -> None:
         # 清一个群不能整份删 .hit_cache.json，否则其他群的「最近命中」全被抹平。

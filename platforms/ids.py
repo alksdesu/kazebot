@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Iterable
 
 from .descriptor import ID_NUMERIC, ID_STRING
 
@@ -35,3 +35,23 @@ def same_id(left: Any, right: Any) -> bool:
     """两个 ID 是否指向同一个对象。任一方不合法都不算相同。"""
     a = normalize_id(left)
     return bool(a) and a == normalize_id(right)
+
+
+# 在文本里认已知 ID 时，两侧紧挨着的字符不能像是 ID 还没完，否则 12345 会命中 123456 的前半截。
+# 字符串 ID 只看 ASCII 字母数字和下划线：@ 不算，「@某人」是聊天里的常见写法。
+_TEXT_NEIGHBOURS: dict[str, str] = {
+    ID_STRING: r"[A-Za-z0-9_]",
+    ID_NUMERIC: r"\d",
+}
+
+
+def id_text_pattern(ids: Iterable[str], shape: str = ID_STRING) -> re.Pattern[str]:
+    """匹配文本里任一已知 ID 的正则。长的排在前面，12345 与 123456 同在时先认长的。"""
+    try:
+        neighbour = _TEXT_NEIGHBOURS[shape]
+    except KeyError:
+        raise ValueError(f"unknown id shape: {shape!r}") from None
+    keys = sorted(ids, key=len, reverse=True)
+    if not keys:
+        raise ValueError("id_text_pattern needs at least one id")
+    return re.compile(rf"(?<!{neighbour})(?:{'|'.join(re.escape(key) for key in keys)})(?!{neighbour})")

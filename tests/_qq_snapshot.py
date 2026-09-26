@@ -47,6 +47,8 @@ class Layout(Protocol):
 
     def fn(self, name: str) -> Any: ...
 
+    def alias_numbering(self) -> tuple[Callable[[str, int], str], Callable[[str, str], int]]: ...
+
     async def render_emojis(self, text: str, bot: Any, bqbs: list[str]) -> list[dict[str, Any]]: ...
 
     def bind_at_alias(self, resolver: Callable[[str], str]) -> None: ...
@@ -62,6 +64,12 @@ class NapcatLayout:
 
     def fn(self, name: str) -> Any:
         return body_attr(self.runtime, name)
+
+    def alias_numbering(self) -> tuple[Callable[[str, int], str], Callable[[str, str], int]]:
+        # 函数内导入：录制逻辑也要在改造前的树上跑，那边没有这个模块。
+        from adapters._shared.aliases import alias_from_index, alias_to_index
+
+        return alias_from_index, alias_to_index
 
     @property
     def _adapter(self) -> Any:
@@ -265,12 +273,13 @@ def record_aliases(monkeypatch: pytest.MonkeyPatch, root: Path, layout_factory: 
     try:
         users = [MEMBER, FRIEND, ADMIN, MEMBER, STRANGER, str(FRIEND), " 30005 "]
         groups = [GROUP, OTHER_GROUP, GROUP, str(OTHER_GROUP)]
-        index_to_alias = {str(index): fn("_alias_from_index")("User", index) for index in _ALIAS_INDEXES}
+        alias_from_index, alias_to_index = layout.alias_numbering()
+        index_to_alias = {str(index): alias_from_index("User", index) for index in _ALIAS_INDEXES}
         result: dict[str, Any] = {
             "users": [outcome(lambda u=u: fn("_anonymize_user_id")(u)) for u in users],
             "groups": [outcome(lambda g=g: fn("_anonymize_group_id")(g)) for g in groups],
             "index_to_alias": index_to_alias,
-            "alias_to_index": {alias: fn("_alias_to_index")("User", alias) for alias in index_to_alias.values()},
+            "alias_to_index": {alias: alias_to_index("User", alias) for alias in index_to_alias.values()},
             "anonymized_text": [fn("_anonymize_text_for_ai")(text) for text in _ANONYMIZE_TEXTS],
             "at_resolution": {token: outcome(lambda t=token: fn("_resolve_at_alias_to_real")(t)) for token in _AT_TOKENS},
         }

@@ -27,7 +27,7 @@ from adapters.onebot.send_contract import (  # noqa: E402
 from clonoth_sdk.state import SessionState, TriggerInfo, channel_key  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 from platforms.descriptor import ID_NUMERIC, ID_STRING, STATE_ACTIVE_ACCOUNT, PlatformDescriptor  # noqa: E402
-from platforms.ids import normalize_id, same_id  # noqa: E402
+from platforms.ids import id_text_pattern, normalize_id, same_id  # noqa: E402
 from stickers.collect import CollectConfig  # noqa: E402
 
 _OPENID = "E2B7C1A09F3D4E5B8A6C7D8E9F0A1B2C"
@@ -76,6 +76,28 @@ _STRING_PLATFORM = PlatformDescriptor(
     id="probe", display_name="Probe", short_name="Probe", id_shape=ID_STRING,
     state_files={STATE_ACTIVE_ACCOUNT: "probe_active_account.json"},
 )
+
+
+class TestIdTextPattern:
+    def test_numeric_ids_keep_the_digit_boundaries(self) -> None:
+        pattern = id_text_pattern(["12345", "123456"], ID_NUMERIC)
+
+        assert pattern.pattern == r"(?<!\d)(?:123456|12345)(?!\d)"
+        assert pattern.findall("12345 1234567 123456") == ["12345", "123456"]
+
+    def test_string_ids_stop_at_word_characters_but_not_at_at_signs(self) -> None:
+        pattern = id_text_pattern([_OPENID])
+
+        assert pattern.findall(f"@{_OPENID} x{_OPENID} {_OPENID}_") == [_OPENID]
+
+    def test_an_unknown_shape_is_a_programming_error(self) -> None:
+        with pytest.raises(ValueError):
+            id_text_pattern(["1"], "hex")
+
+    def test_an_empty_id_list_is_refused(self) -> None:
+        # 空的备选在每个位置都匹配空串，拿去替换等于在每两个字符之间插一个别名。
+        with pytest.raises(ValueError):
+            id_text_pattern([], ID_NUMERIC)
 
 
 class TestActiveAccountStore:

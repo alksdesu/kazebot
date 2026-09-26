@@ -11,11 +11,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, DefaultDict, Deque, Dict, List, Optional
 
 from adapters._shared.active_account import ActiveAccountStore
+from adapters._shared.aliases import AliasBook
 from adapters._shared.trigger_policy import CooldownState, TriggerDecision
 from platforms.builtin import QQ_NAPCAT
 from stickers.combat import CombatTracker
 
 from .config import (
+    ANON_MAP_FILE,
+    ANON_MAP_RETENTION_DAYS,
+    ANON_MAP_SAVE_MIN_INTERVAL,
     ONEBOT_IDEMPOTENCY_AMBIGUOUS_TTL_SECONDS,
     ONEBOT_IDEMPOTENCY_MAX_ITEMS,
     ONEBOT_IDEMPOTENCY_SENT_TTL_SECONDS,
@@ -193,24 +197,15 @@ class OneBotAdapter:
         self.sticky_subjects: "OrderedDict[str, tuple[float, List[str]]]" = OrderedDict()
 
         # ---- 匿名映射 ----
-        # 映射表的 key 必须是纯数字：_anonymize_text_for_ai 的 (?<!\d)/(?!\d) 边界只对数字成立。
-        self.anon_users: Dict[str, str] = {}
-        self.anon_groups: Dict[str, str] = {}
-        self.anon_user_reverse: Dict[str, str] = {}
-        self.anon_group_reverse: Dict[str, str] = {}
-        # 每条别名的真实最后出现时间，供 TTL 回收判定；只在进程内维护，落盘时写进 last_seen 字段。
-        self.anon_user_last_seen: Dict[str, float] = {}
-        self.anon_group_last_seen: Dict[str, float] = {}
-        # 显式维护「下一个编号」：持久化恢复或 TTL 回收后长度与已用编号不一致，按长度推断会撞别名。
-        self.anon_user_next: int = 0
-        self.anon_group_next: int = 0
-        self.anon_map_dirty: bool = False
-        self.anon_map_save_task: Optional["asyncio.Task[Any]"] = None
-        self.anon_map_last_saved_at: float = 0.0
+        self.aliases = AliasBook(
+            ANON_MAP_FILE,
+            workspace=self.workspace,
+            id_shape=QQ_NAPCAT.id_shape,
+            retention_days=ANON_MAP_RETENTION_DAYS,
+            save_min_interval=ANON_MAP_SAVE_MIN_INTERVAL,
+        )
         self.anon_senders: "OrderedDict[str, str]" = OrderedDict()
         self.anon_sender_next: int = 0
-        self.anon_text_pattern: Any = None
-        self.anon_text_replacements: Dict[str, str] = {}
         # QQ 用户身份/称呼 Profile。只影响模型可见的称呼和身份说明，不授予任何权限。
         self.qq_user_profiles: Dict[str, Dict[str, Any]] = {}
 

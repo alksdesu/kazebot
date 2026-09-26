@@ -5,6 +5,7 @@ import logging
 import json
 from pathlib import Path
 from typing import Any, Dict, List
+from adapters._shared.aliases import alias_from_index
 from adapters._shared.yaml_loader import load_yaml
 from ..config import CLONOTH_WORKSPACE
 
@@ -122,7 +123,7 @@ def _anonymize_anonymous_sender(event: Any) -> str:
         return ""
     alias = state._adapter.anon_senders.get(key)
     if alias is None:
-        alias = anonymize._alias_from_index("Anon", state._adapter.anon_sender_next)
+        alias = alias_from_index("Anon", state._adapter.anon_sender_next)
         state._adapter.anon_sender_next += 1
         state._adapter.anon_senders[key] = alias
         while len(state._adapter.anon_senders) > _ANON_SENDER_MAX_ENTRIES:

@@ -37,7 +37,7 @@ def _load_with_retention(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, days: 
 
 
 def _write_map(runtime: Any, payload: dict[str, Any]) -> Path:
-    path = Path(runtime.anonymize.ANON_MAP_FILE)
+    path = runtime.state._adapter.aliases.path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return path
@@ -88,7 +88,7 @@ def test_ttl_disabled_keeps_stale_entries(runtime: Any) -> None:
 
     runtime.anonymize._load_anon_map()
 
-    assert runtime.state._adapter.anon_users.get("123456") == "UserA"
+    assert runtime.state._adapter.aliases.users.alias_of("123456") == "UserA"
 
 
 def test_ttl_prunes_stale_without_rewinding_counter(
@@ -109,10 +109,10 @@ def test_ttl_prunes_stale_without_rewinding_counter(
 
     runtime.anonymize._load_anon_map()
 
-    assert "222222" not in runtime.state._adapter.anon_users  # 陈旧条目被清
-    assert runtime.state._adapter.anon_users.get("111111") == "UserA"  # 新鲜条目保留
+    assert "222222" not in runtime.state._adapter.aliases.users  # 陈旧条目被清
+    assert runtime.state._adapter.aliases.users.alias_of("111111") == "UserA"  # 新鲜条目保留
     # 计数器不能因剪枝回退到 UserA+1，否则新人会复用被清掉的 UserE。
-    assert runtime.state._adapter.anon_user_next == 5
+    assert runtime.state._adapter.aliases.users.next_index == 5
     assert runtime.anonymize._anonymize_user_id("333333") == "UserF"
 
 
@@ -132,17 +132,18 @@ def test_ttl_preserves_enrolled_subject(
 
     runtime.anonymize._load_anon_map()
 
-    assert runtime.state._adapter.anon_users.get("123456") == "UserA"
+    assert runtime.state._adapter.aliases.users.alias_of("123456") == "UserA"
     assert runtime.anonymize._resolve_at_alias_to_real("UserA") == "123456"
 
 
 def test_save_persists_real_last_seen_not_write_time(runtime: Any) -> None:
-    runtime.anonymize._anonymize_user_id("123456")
+    aliases = runtime.state._adapter.aliases
+    alias = runtime.anonymize._anonymize_user_id("123456")
     old = time.time() - 400 * 86400
-    runtime.state._adapter.anon_user_last_seen["123456"] = old
-    runtime.state._adapter.anon_map_dirty = True
+    aliases.users.restore("123456", alias, old)
+    aliases.dirty = True
 
-    asyncio.run(runtime.anonymize._save_anon_map())
+    asyncio.run(aliases.save())
 
-    data = json.loads(Path(runtime.anonymize.ANON_MAP_FILE).read_text(encoding="utf-8"))
+    data = json.loads(aliases.path.read_text(encoding="utf-8"))
     assert data["users"]["123456"]["last_seen"] == pytest.approx(old)

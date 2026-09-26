@@ -1,0 +1,319 @@
+"""共享层的匿名别名表：编号、落盘格式、保留期回收、文本替换、写盘节流。"""
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from adapters._shared import aliases as alias_module  # noqa: E402
+from adapters._shared.aliases import AliasBook, AliasLoad, AliasTable, alias_from_index, alias_to_index  # noqa: E402
+from engine import memory_subjects  # noqa: E402
+from platforms.descriptor import ID_NUMERIC, ID_STRING  # noqa: E402
+
+_NOW = 1_800_000_000.0
+_DAY = 86400.0
+
+
+class _Clock:
+    def __init__(self, now: float = _NOW) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _book(tmp_path: Path, *, shape: str = ID_NUMERIC, **options: Any) -> AliasBook:
+    options.setdefault("clock", _Clock())
+    return AliasBook(tmp_path / "data" / "aliases.json", workspace=tmp_path, id_shape=shape, **options)
+
+
+def _write(tmp_path: Path, payload: Any) -> None:
+    path = tmp_path / "data" / "aliases.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8")
+
+
+class TestNumbering:
+    @pytest.mark.parametrize(
+        ("index", "alias"),
+        [(0, "UserA"), (25, "UserZ"), (26, "UserAA"), (51, "UserAZ"), (52, "UserBA"), (701, "UserZZ"), (702, "UserAAA")],
+    )
+    def test_letters_run_like_spreadsheet_columns(self, index: int, alias: str) -> None:
+        assert alias_from_index("User", index) == alias
+        assert alias_to_index("User", alias) == index
+
+    @pytest.mark.parametrize("alias", ["User", "Userab", "User1", "UserA1", "GroupA"])
+    def test_anything_else_is_not_an_index(self, alias: str) -> None:
+        assert alias_to_index("User", alias) == -1
+
+    def test_negative_indexes_clamp_to_the_first_alias(self) -> None:
+        assert alias_from_index("Group", -5) == "GroupA"
+
+
+class TestTable:
+    def test_aliases_are_minted_once_and_resolve_back(self) -> None:
+        table = AliasTable("User")
+
+        assert table.assign("10001") == ("UserA", True)
+        assert table.assign("10002") == ("UserB", True)
+        assert table.assign("10001") == ("UserA", False)
+        assert table.real_of("UserB") == "10002"
+        assert "10001" in table and len(table) == 2
+
+    def test_touching_is_throttled(self) -> None:
+        table = AliasTable("User")
+        table.assign("10001")
+
+        assert table.touch("10001", _NOW) is True
+        assert table.touch("10001", _NOW + 60) is False
+        assert table.touch("10001", _NOW + alias_module.TOUCH_MIN_INTERVAL + 1) is True
+
+    @pytest.mark.parametrize(
+        ("persisted", "expected"),
+        [(None, 5), (3, 5), (9, 9), ("7", 7), ("junk", 5), (-4, 5), (float("inf"), 5)],
+    )
+    def test_numbering_resumes_past_every_used_alias(self, persisted: Any, expected: int) -> None:
+        table = AliasTable("User")
+        table.restore("10001", "UserA", _NOW)
+        table.restore("10002", "UserE", _NOW)
+
+        table.resume_numbering(persisted)
+
+        assert table.next_index == expected
+
+    def test_a_pruned_alias_is_never_handed_out_again(self) -> None:
+        table = AliasTable("User")
+        table.restore("10001", "UserA", _NOW)
+        table.restore("10002", "UserB", _NOW - 40 * _DAY)
+        table.resume_numbering(None)
+
+        assert table.prune(_NOW - 30 * _DAY, frozenset()) == 1
+        assert table.real_of("UserB") is None
+        assert table.assign("10003") == ("UserC", True)
+
+    def test_protected_aliases_survive_pruning(self) -> None:
+        table = AliasTable("User")
+        table.restore("10001", "UserA", _NOW - 40 * _DAY)
+
+        assert table.prune(_NOW - 30 * _DAY, frozenset({"UserA"})) == 0
+        assert table.real_of("UserA") == "10001"
+
+
+class TestBook:
+    def test_empty_ids_get_the_unknown_alias_without_touching_the_file(self, tmp_path: Path) -> None:
+        book = _book(tmp_path)
+
+        assert book.user_alias("  ") == "UserUnknown"
+        assert book.group_alias("") == "GroupUnknown"
+        assert not book.dirty
+
+    def test_a_new_alias_marks_the_book_dirty(self, tmp_path: Path) -> None:
+        book = _book(tmp_path)
+
+        assert book.user_alias(" 10001 ") == "UserA"
+        assert book.dirty
+
+    def test_the_file_format_is_unchanged(self, tmp_path: Path) -> None:
+        # supervisor 的会话标注直接读这份文件，字段名和嵌套都不能动。
+        book = _book(tmp_path)
+        book.user_alias("10001")
+        book.group_alias("20001")
+
+        asyncio.run(book.save())
+
+        data = json.loads(book.path.read_text(encoding="utf-8"))
+        assert set(data) == {"version", "updated_at", "user_next", "group_next", "users", "groups"}
+        assert data["version"] == 1
+        assert (data["user_next"], data["group_next"]) == (1, 1)
+        assert data["users"] == {"10001": {"alias": "UserA", "last_seen": _NOW}}
+        assert data["groups"] == {"20001": {"alias": "GroupA", "last_seen": _NOW}}
+        assert not book.dirty
+
+    def test_a_clean_book_does_not_write(self, tmp_path: Path) -> None:
+        book = _book(tmp_path)
+
+        asyncio.run(book.save())
+
+        assert not book.path.exists()
+
+    def test_a_round_trip_restores_aliases_and_numbering(self, tmp_path: Path) -> None:
+        first = _book(tmp_path)
+        first.user_alias("10001")
+        first.user_alias("10002")
+        first.group_alias("20001")
+        asyncio.run(first.save())
+
+        second = _book(tmp_path)
+
+        assert second.load() == AliasLoad(users=2, groups=1, pruned=0, rejected=0)
+        assert second.users.real_of("UserB") == "10002"
+        assert second.user_alias("10003") == "UserC"
+        assert second.substitute("10002") == "UserB"
+
+    def test_rejected_users_are_dropped_and_the_file_is_rewritten(self, tmp_path: Path) -> None:
+        _write(tmp_path, {"users": {"1": {"alias": "UserA"}, "10002": {"alias": "UserB"}}, "groups": {}})
+        book = _book(tmp_path)
+
+        loaded = book.load(accept_user=lambda real: len(real) >= 5)
+
+        assert loaded is not None and loaded.rejected == 1
+        assert "1" not in book.users and book.users.real_of("UserB") == "10002"
+        assert book.dirty
+
+    def test_a_missing_file_loads_nothing(self, tmp_path: Path) -> None:
+        assert _book(tmp_path).load() is None
+
+    @pytest.mark.parametrize("content", ["{not json", "[1, 2]"])
+    def test_an_unreadable_file_loads_nothing(self, tmp_path: Path, content: str) -> None:
+        _write(tmp_path, content)
+        book = _book(tmp_path)
+
+        assert book.load() is None
+        assert len(book.users) == 0
+
+    def test_malformed_entries_are_skipped(self, tmp_path: Path) -> None:
+        _write(tmp_path, {
+            "users": {
+                "": {"alias": "UserA"},
+                "10001": "UserB",
+                "10002": {"alias": ""},
+                "10003": {"alias": "UserD", "last_seen": "junk"},
+            },
+            "groups": [],
+        })
+        book = _book(tmp_path)
+
+        loaded = book.load()
+
+        assert loaded == AliasLoad(users=1, groups=0, pruned=0, rejected=0)
+        # 读不出的最后出现时间按当前时间算，否则刚加载就会被保留期判成过期。
+        assert book.users.last_seen("10003") == _NOW
+        assert book.users.next_index == 4
+
+    def test_retention_prunes_only_after_numbering_is_restored(self, tmp_path: Path) -> None:
+        # 旧文件没有 user_next：先回收再恢复编号的话，新人会拿到被回收的 UserE。
+        _write(tmp_path, {
+            "users": {
+                "10001": {"alias": "UserA", "last_seen": _NOW},
+                "10002": {"alias": "UserE", "last_seen": _NOW - 400 * _DAY},
+            },
+            "groups": {},
+        })
+        book = _book(tmp_path, retention_days=30)
+
+        loaded = book.load()
+
+        assert loaded is not None and loaded.pruned == 1
+        assert book.user_alias("10003") == "UserF"
+
+    def test_enrolled_subjects_are_never_pruned(self, tmp_path: Path) -> None:
+        memory_subjects.record_interaction(tmp_path, "UserA")
+        _write(tmp_path, {"users": {"10001": {"alias": "UserA", "last_seen": _NOW - 400 * _DAY}}, "groups": {}})
+        book = _book(tmp_path, retention_days=30)
+
+        loaded = book.load()
+
+        assert loaded is not None and loaded.pruned == 0
+        assert book.users.real_of("UserA") == "10001"
+
+
+class TestSubstitution:
+    def test_known_numeric_ids_are_replaced_on_digit_boundaries(self, tmp_path: Path) -> None:
+        book = _book(tmp_path)
+        book.user_alias("123456")
+        book.user_alias("12345")
+
+        assert book.substitute("123456 和 12345，还有 1234567，金额 12345元") == "UserA 和 UserB，还有 1234567，金额 UserB元"
+
+    def test_groups_win_when_a_user_and_a_group_share_an_id(self, tmp_path: Path) -> None:
+        book = _book(tmp_path)
+        book.user_alias("555555")
+        book.group_alias("555555")
+
+        assert book.substitute("555555") == "GroupA"
+
+    def test_the_cached_pattern_follows_new_aliases(self, tmp_path: Path) -> None:
+        book = _book(tmp_path)
+        book.user_alias("100001")
+        assert book.substitute("100002") == "100002"
+
+        book.user_alias("100002")
+
+        assert book.substitute("100002") == "UserB"
+
+    def test_string_ids_stop_at_word_characters_but_not_at_at_signs(self, tmp_path: Path) -> None:
+        book = _book(tmp_path, shape=ID_STRING)
+        book.user_alias("E2B7C1A0")
+
+        assert book.substitute("@E2B7C1A0 说") == "@UserA 说"
+        assert book.substitute("xE2B7C1A0 E2B7C1A0x") == "xE2B7C1A0 E2B7C1A0x"
+
+    def test_nothing_known_leaves_text_alone(self, tmp_path: Path) -> None:
+        book = _book(tmp_path)
+
+        assert book.substitute("") == ""
+        assert book.substitute("12345") == "12345"
+
+
+class TestWriteBehind:
+    def test_changes_inside_one_window_are_written_once(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        book = _book(tmp_path, save_min_interval=0.05)
+        writes: list[int] = []
+        save = AliasBook.save
+
+        async def counting_save(self: AliasBook) -> None:
+            writes.append(1)
+            await save(self)
+
+        monkeypatch.setattr(AliasBook, "save", counting_save)
+
+        async def scenario() -> None:
+            book.user_alias("10001")
+            book.user_alias("10002")
+            book.group_alias("20001")
+            assert book.save_pending
+            await asyncio.sleep(0.3)
+
+        asyncio.run(scenario())
+
+        assert writes == [1]
+        assert json.loads(book.path.read_text(encoding="utf-8"))["user_next"] == 2
+        assert not book.save_pending
+
+    def test_flush_writes_at_once_and_cancels_the_waiting_write(self, tmp_path: Path) -> None:
+        book = _book(tmp_path, save_min_interval=3600)
+
+        async def scenario() -> None:
+            book.user_alias("10001")
+            assert book.save_pending
+            await book.flush()
+            assert not book.save_pending
+
+        asyncio.run(scenario())
+
+        assert json.loads(book.path.read_text(encoding="utf-8"))["users"]["10001"]["alias"] == "UserA"
+
+    def test_without_an_event_loop_the_book_waits_for_an_explicit_save(self, tmp_path: Path) -> None:
+        book = _book(tmp_path)
+
+        book.user_alias("10001")
+
+        assert book.dirty and not book.save_pending
+
+    def test_a_failed_write_keeps_the_book_dirty(self, tmp_path: Path) -> None:
+        target = tmp_path / "data" / "aliases.json"
+        target.mkdir(parents=True)
+        book = _book(tmp_path)
+        book.user_alias("10001")
+
+        asyncio.run(book.save())
+
+        assert book.dirty

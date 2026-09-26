@@ -65,7 +65,7 @@ def test_same_anonymous_id_is_stable(runtime: Any) -> None:
 def test_placeholder_never_registers_as_real_user(runtime: Any) -> None:
     runtime.identity._event_user_alias(anon_event(11))
 
-    assert "80000000" not in runtime.state._adapter.anon_users
+    assert "80000000" not in runtime.state._adapter.aliases.users
     assert runtime.anonymize._anonymize_user_id("80000000") == "AnonUnknown"
 
 

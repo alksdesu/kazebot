@@ -203,5 +203,8 @@ ANON_MAP_FILE = env_first(
 # 回收会让久未出现的人的真实号在文本里不再被替换。
 ANON_MAP_RETENTION_DAYS = env_float("ONEBOT_ANON_MAP_RETENTION_DAYS", 0.0, min_value=0.0)
 
+# 匿名映射写盘节流（秒）：窗口内的新登记合并成一次写盘，关闭时另有一次强制写入。
+ANON_MAP_SAVE_MIN_INTERVAL = env_float("ONEBOT_ANON_MAP_SAVE_MIN_INTERVAL", 5.0, min_value=0.0)
+
 # 适配器侧待审批保留时长，与 CLONOTH_APPROVAL_TIMEOUT_SECONDS 同量级；超时的不再可批。
 PENDING_APPROVAL_TTL_SECONDS = env_float("ONEBOT_PENDING_APPROVAL_TTL_SECONDS", 3600.0, min_value=60.0)
