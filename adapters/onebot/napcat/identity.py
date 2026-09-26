@@ -5,8 +5,8 @@ import logging
 import json
 from pathlib import Path
 from typing import Any, Dict, List
+from adapters._shared.yaml_loader import load_yaml
 from ..config import CLONOTH_WORKSPACE
-from ..yaml_loader import load_yaml
 
 from . import anonymize, common, permissions, state
 

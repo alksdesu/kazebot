@@ -14,15 +14,14 @@ _BOOL_TAG = "tag:yaml.org,2002:bool"
 
 
 class _Loader(yaml.SafeLoader):
-    pass
+    # 表必须先于 add_implicit_resolver 建好：它发现子类自己没有这张表，会从父类整份
+    # 复制一份带 on/off 的，把这里摘掉的布尔别名又带回来。
+    yaml_implicit_resolvers = {
+        ch: [(tag, pattern) for tag, pattern in pairs if tag != _BOOL_TAG]
+        for ch, pairs in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
 
 
-# 顺序不能反：add_implicit_resolver 发现子类自己没有这张表，会从父类整份复制一份带
-# on/off 的，把这里挂上去的过滤结果盖掉。
-_Loader.yaml_implicit_resolvers = {
-    ch: [(tag, pattern) for tag, pattern in pairs if tag != _BOOL_TAG]
-    for ch, pairs in yaml.SafeLoader.yaml_implicit_resolvers.items()
-}
 _Loader.add_implicit_resolver(
     _BOOL_TAG,
     re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),

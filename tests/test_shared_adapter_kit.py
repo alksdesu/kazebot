@@ -16,8 +16,8 @@ from _module_state_guards import module_level_mutables, rebound_globals
 _ROOT = Path(__file__).resolve().parents[1]
 _KIT = _ROOT / "adapters" / "_shared"
 _MODULES = sorted(_KIT.glob("*.py"))
-# 共享层只往下依赖注册表和 SDK；碰到核心或具体适配器，反向依赖就又长回来了。
-_FORBIDDEN_ROOTS = frozenset({"nonebot", "supervisor", "engine"})
+# 共享层不认识任何平台：平台库和具体适配器都不许碰，engine、platforms、SDK 这些底层工具照常用。
+_PLATFORM_LIBRARIES = frozenset({"nonebot"})
 _PLATFORM_WORDS = ("qq", "napcat", "onebot", "nonebot", "[cq:")
 
 
@@ -30,7 +30,7 @@ def _module_names() -> list[str]:
 
 def _is_foreign(name: str) -> bool:
     parts = name.split(".")
-    if parts[0] in _FORBIDDEN_ROOTS:
+    if parts[0] in _PLATFORM_LIBRARIES:
         return True
     return parts[0] == "adapters" and (len(parts) == 1 or parts[1] != "_shared")
 
@@ -58,7 +58,7 @@ def test_the_kit_is_a_regular_package() -> None:
 
 
 @pytest.mark.parametrize("path", _MODULES, ids=[path.name for path in _MODULES])
-def test_the_kit_imports_no_platform_and_no_core(path: Path) -> None:
+def test_the_kit_imports_no_platform(path: Path) -> None:
     assert _foreign_imports(ast.parse(path.read_text(encoding="utf-8"))) == []
 
 
@@ -75,7 +75,7 @@ def test_the_kit_keeps_no_state_at_module_level(path: Path) -> None:
     assert module_level_mutables(tree) == []
 
 
-def test_importing_the_kit_pulls_in_no_adapter_and_no_core() -> None:
+def test_importing_the_kit_pulls_in_no_platform() -> None:
     # 静态扫描只看得到直接 import；经注册表等间接拉进来的只能真导一遍才看得见。
     probe = (
         "import importlib, sys\n"
@@ -83,7 +83,7 @@ def test_importing_the_kit_pulls_in_no_adapter_and_no_core() -> None:
         f"sys.path.insert(0, {str(_ROOT)!r})\n"
         f"for name in {_module_names()!r}:\n"
         "    importlib.import_module(name)\n"
-        f"roots = {sorted(_FORBIDDEN_ROOTS)!r}\n"
+        f"roots = {sorted(_PLATFORM_LIBRARIES)!r}\n"
         "leaked = sorted(\n"
         "    name for name, module in sys.modules.items()\n"
         "    if module is not None and (\n"

@@ -27,13 +27,13 @@ from .send_contract import TwoPhaseIdempotencyStore
 
 if TYPE_CHECKING:
     from adapters._shared.echo_policy import EchoEntry
+    from adapters._shared.live_config import LiveReader
     from clonoth_sdk import ClonothClient, EventRouter, SessionState
     from stickers.collect import StickerCollector
     from stickers.store import StickerStore
     from stickers.tagger import StickerTagger
 
     from .feature_gateway import FeatureGateway
-    from .live_config import _Live
     from .napcat.callbacks import TangQiuCallbacks
     from .napcat.models import (
         GroupContentRecord,
@@ -72,7 +72,7 @@ class BucketMap(OrderedDict):
 class OneBotAdapter:
     """一个 NapCat 连接对应的全部可变状态。容量类参数读热载配置，改了由 reconcile 重建。"""
 
-    def __init__(self, *, workspace: Path, live: "_Live", features: "FeatureGateway") -> None:
+    def __init__(self, *, workspace: Path, live: "LiveReader", features: "FeatureGateway") -> None:
         self.workspace = Path(workspace)
         self.live = live
         self.features = features

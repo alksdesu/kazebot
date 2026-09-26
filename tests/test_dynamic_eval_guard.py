@@ -30,7 +30,7 @@ _ALLOWED_SHELL_TRUE = {
 _ALLOWED_YAML_LOAD = {
     # 传的 Loader 是 SafeLoader 子类，只从隐式 resolver 表里摘掉 YAML 1.1 的布尔别名
     # （on/off/yes/no），构造器一个没加，仍然构造不出任意 Python 对象。
-    "adapters/onebot/yaml_loader.py",
+    "adapters/_shared/yaml_loader.py",
 }
 
 

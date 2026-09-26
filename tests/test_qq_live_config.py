@@ -22,6 +22,8 @@ if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
 from _onebot_harness import load_live_config, write_live_config, adapter_source  # noqa: E402
+from adapters._shared import live_config as live_engine  # noqa: E402
+from adapters._shared.live_config import RELOAD_LIVE, RELOAD_RECONCILED  # noqa: E402
 
 _ADAPTER_ROOT = _ROOT / "adapters" / "onebot"
 _ALL_QQ_ENV = (
@@ -101,7 +103,7 @@ class TestPrecedence:
     def test_an_empty_bool_env_means_off_not_default(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """_env_bool 的老语义：设成空串就是关。列表键相反，空串等于没配。"""
+        """布尔 env 的老语义：设成空串就是关。列表键相反，空串等于没配。"""
         for key in _ALL_QQ_ENV:
             monkeypatch.delenv(key, raising=False)
         module = load_live_config(monkeypatch, tmp_path, ONEBOT_ENABLE_REACTIONS="")
@@ -546,9 +548,16 @@ class TestCacheAndPinning:
         def explode(*args: Any, **kwargs: Any):
             raise AssertionError("re-parsed an unchanged file")
 
-        monkeypatch.setattr(live, "load_yaml", explode)
+        monkeypatch.setattr(live_engine, "load_yaml", explode)
 
         assert live.live.allowed_groups == (111,)
+
+    def test_pinning_the_legacy_mode_rederives_whether_it_is_known(self, live: Any) -> None:
+        """派生值跟着钉住的输入走：只在改前缀时重算的话，钉 group_trigger 会留下旧的判定。"""
+        assert live.live.group_trigger_is_known is True
+
+        with live.pinned(group_trigger="bogus"):
+            assert live.live.group_trigger_is_known is False
 
     def test_a_pin_survives_another_writer(self, live: Any) -> None:
         """处理中的消息用进入时的快照，不中途换标准。
@@ -712,7 +721,7 @@ class TestExampleFileStaysInSync:
     def _example(self, live: Any) -> dict[str, Any]:
         """校验和生效解析必须是同一个 loader，否则文档按一套语义、bot 按另一套。"""
         text = (_ROOT / "config" / "qq.example.yaml").read_text(encoding="utf-8")
-        loaded = live.load_yaml(text)
+        loaded = live_engine.load_yaml(text)
         assert isinstance(loaded, dict)
         return loaded
 
@@ -780,8 +789,8 @@ class TestStatePayload:
     def test_it_marks_which_keys_need_reconciling(self, live: Any) -> None:
         reload_modes = live.state_payload()["reload"]
 
-        assert reload_modes["queue_workers"] == live.RELOAD_RECONCILED
-        assert reload_modes["enable_reactions"] == live.RELOAD_LIVE
+        assert reload_modes["queue_workers"] == RELOAD_RECONCILED
+        assert reload_modes["enable_reactions"] == RELOAD_LIVE
 
     def test_it_reflects_the_effective_value_not_the_file(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,

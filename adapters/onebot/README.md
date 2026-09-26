@@ -43,14 +43,15 @@ adapters/onebot/
 ├── attachment_policy.py         # 附件挑选策略
 ├── emoji_handler.py             # QQ 表情与输出文本清理
 ├── faces.py                     # 内置表情 id → 名字
-├── yaml_loader.py               # 手写 yaml 解析
 └── *_commands.py、burst_store.py、conversation_coordinator.py  # 社区功能的命令与连发存储
 ```
 
 包本身没有导入副作用，根目录下的兄弟模块也不导入 NoneBot：supervisor、迁移脚本可以直接 `import adapters.onebot.<兄弟模块>`。
 NoneBot 只出现在 `napcat/` 里，由插件入口加载。
 
-不分平台的判定逻辑在 `adapters/_shared/`：触发判定、管理能力档位、复读判定、会话键摘要的盐、记忆提示。
+不分平台的逻辑在 `adapters/_shared/`：触发判定、管理能力档位、复读判定、会话键摘要的盐、记忆提示，
+以及热载配置引擎（`live_config.py`）、环境变量读取（`env.py`）和手写 yaml 解析（`yaml_loader.py`）。
+`live_config.py` 这边只声明 QQ 的键和配置文件位置，缓存与快照在它持有的 `LiveConfig` 实例上。
 那边不认识 QQ，平台专属的部分（群角色映射、CQ 码边界、消息段解析）留在这里，调用时传进去。
 
 `napcat/` 各模块之间互相引用一律写成 `模块.名字`（例如 `sending._send_qq_message`），不做 `from .x import y`：

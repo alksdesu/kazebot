@@ -37,15 +37,16 @@ _SUPERVISOR_URL = (
 
 
 def _bridge_stdlib_logging() -> None:
-    """把插件与 SDK 的标准 logging 接到 loguru。
+    """把插件、共享适配器层与 SDK 的标准 logging 接到 loguru。
 
-    两边都用 logging.getLogger 打日志，而 NoneBot 只配置 loguru：这些 logger 没有
+    几处都用 logging.getLogger 打日志，而 NoneBot 只配置 loguru：这些 logger 没有
     handler，propagate 到 root 后由 lastResort 兜底，等于 INFO 全部消失、只有 WARNING
     以上漏得出来。审批归属、路由决策这类关键线索都打在 INFO 上，丢了就没法排障。
     """
     from nonebot.log import LoguruHandler
 
-    for name in ("nonebot.plugin.clonoth_agent", "clonoth_sdk"):
+    # adapters 兜住按模块名取 logger 的那批：共享层和适配器根目录的兄弟模块。
+    for name in ("nonebot.plugin.clonoth_agent", "adapters", "clonoth_sdk"):
         target = logging.getLogger(name)
         target.handlers = [LoguruHandler()]
         target.setLevel(logging.INFO)
