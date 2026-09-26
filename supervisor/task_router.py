@@ -19,7 +19,7 @@ from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
 
 from ._helpers import _now
 from .branch_finalize_store import BranchClaim
-from .qq_intent import result_from_task as qq_intent_result_from_task
+from .reply_intent import result_from_task as reply_intent_result_from_task
 from .types import RouteStatus, Task, TaskKind, TaskStatus
 
 
@@ -272,7 +272,7 @@ class TaskRouterMixin:
             return False
         # 意愿判定每条不命中的群消息跑一次。记忆提取和轮摘要各自都会因 _system_task
         # 自行短路，但 phase 本身要写两条 eventlog —— 活跃群一天几千条就全是这个。
-        if task.input.get("_qq_intent"):
+        if task.input.get("_reply_intent"):
             return False
         act = str((task.result or {}).get("action") or "").strip()
         return act not in {"preempted", "dispatch"}
@@ -1224,9 +1224,9 @@ class TaskRouterMixin:
             self._apply_async_compact_result_locked(task)
             return
 
-        # ---- QQ 接话意愿判定：结果交回 HTTP 里等着的那个请求，不产生任何用户可见输出 ----
-        if task.input.get("_qq_intent"):
-            self.qq_intent.settle(task.task_id, qq_intent_result_from_task(task))
+        # ---- 接话意愿判定：结果交回 HTTP 里等着的那个请求，不产生任何用户可见输出 ----
+        if task.input.get("_reply_intent"):
+            self.reply_intent.settle(task.task_id, reply_intent_result_from_task(task))
             return
 
         # ---- 压缩 dispatch 结果：compactor 子 task 完成 ----

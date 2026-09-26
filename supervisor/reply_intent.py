@@ -1,4 +1,4 @@
-"""QQ 接话意愿判断的同步 RPC。
+"""群聊接话意愿判断的同步 RPC。
 
 supervisor 从不直接调模型，所以判定要建一个 node task 交给 engine worker，再等它回来。
 在飞数量必须封顶：worker 只有两三个，判定占满了真实对话就得排队。
@@ -127,7 +127,7 @@ def parse_intent_text(raw: str) -> IntentResult:
         return IntentResult(agreed=True, reason=reason, raw=text)
     if lowered.startswith("no"):
         return IntentResult(agreed=False, reason=reason, raw=text)
-    logger.info("qq intent verdict unparsable, treating as no: %r", text[:200])
+    logger.info("reply intent verdict unparsable, treating as no: %r", text[:200])
     return IntentResult(agreed=False, reason="判定结果无法解析", error="unparsable", raw=text)
 
 

@@ -281,7 +281,7 @@ def test_private_metadata_never_grants_group_role(runtime):
 
 
 def test_topic_intent_json_keeps_old_yes_no_contract():
-    from supervisor.qq_intent import parse_intent_text
+    from supervisor.reply_intent import parse_intent_text
 
     assert parse_intent_text('yes|followup').agreed
     assert not parse_intent_text('no|other people').agreed

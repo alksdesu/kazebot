@@ -8,6 +8,7 @@ from datetime import timedelta
 from typing import Any
 
 from clonoth_runtime import get_str, load_runtime_config
+from platforms.registry import find_platform
 
 from ._helpers import _now
 from .types import RouteStatus, Task, TaskKind, TaskStatus
@@ -140,7 +141,8 @@ class TaskStoreMixin:
         routing = cfg.get("routing") if isinstance(cfg.get("routing"), dict) else {}
         vision = routing.get("vision") if isinstance(routing.get("vision"), dict) else {}
         channel = str(payload.get("channel") or hints.get("channel") or "").strip()
-        platform = str(hints.get("platform") or channel.split("_", 1)[0] or "").strip()
+        registered = find_platform(channel)
+        platform = str(hints.get("platform") or "").strip() or (registered.id if registered is not None else "")
         channels = vision.get("channels") if isinstance(vision.get("channels"), dict) else {}
         channel_cfg = channels.get(channel) if isinstance(channels.get(channel), dict) else {}
         platform_cfg = channels.get(platform) if isinstance(channels.get(platform), dict) else {}

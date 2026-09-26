@@ -5668,7 +5668,7 @@ async def _judge_llm_intent(bot: Bot, event: GroupMessageEvent, text: str) -> In
     if metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled"):
         context_lines.append(_reaction_prompt_block())
     speaker = _anonymize_text_for_ai(_event_display_name(event))
-    return await _client.judge_qq_intent(
+    return await _client.judge_reply_intent(
         conversation_key=_stable_conversation_key(f"qq_group:{group_id}"),
         text=_anonymize_text_for_ai(text),
         channel="qq_group",

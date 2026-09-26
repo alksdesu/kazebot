@@ -27,7 +27,9 @@ from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
 from supervisor.types import TaskStatus  # noqa: E402
 
-_URL = "/v1/qq/intent/judge"
+_URL = "/v1/intent/judge"
+# 旧路径留给还没换新 SDK 的调用方，行为必须和新路径一致。
+_LEGACY_URL = "/v1/qq/intent/judge"
 _TOKEN = "test-admin-token"
 _AUTH = {"Authorization": f"Bearer {_TOKEN}"}
 
@@ -40,7 +42,7 @@ def _admin_token(monkeypatch: pytest.MonkeyPatch):
 
 
 def _make_state(workspace: Path) -> SupervisorState:
-    eventlog = EventLog(workspace / "data" / "events.jsonl", run_id="run-qq-intent")
+    eventlog = EventLog(workspace / "data" / "events.jsonl", run_id="run-reply-intent")
     return SupervisorState(
         workspace_root=workspace,
         eventlog=eventlog,
@@ -73,20 +75,20 @@ def _pending_intent_tasks(state: SupervisorState) -> list[Any]:
     """还没被做掉的判定任务。已完成的留在 tasks 里，按标记捞会捞到上一轮那个。"""
     return [
         t for t in state.tasks.values()
-        if t.input.get("_qq_intent") and t.status not in {
+        if t.input.get("_reply_intent") and t.status not in {
             TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled,
         }
     ]
 
 
 def _judge(app, state: SupervisorState, body: dict[str, Any], *, answer: str | None = "yes|在追问",
-           action: str = "finish") -> httpx.Response:
+           action: str = "finish", url: str = _URL) -> httpx.Response:
     """发一次判定请求，并在任务出现后立刻替 engine worker 把它做完。"""
 
     async def _run() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-            request = asyncio.create_task(client.post(_URL, json=body, headers=_AUTH))
+            request = asyncio.create_task(client.post(url, json=body, headers=_AUTH))
             if answer is not None or action != "finish":
                 for _ in range(400):
                     await asyncio.sleep(0.005)
@@ -136,7 +138,7 @@ class TestTheHappyPath:
         state = _make_state(tmp_path)
         _judge(_app(state, tmp_path), state, _body(node_id="qq.custom_intent"))
 
-        task = next(t for t in state.tasks.values() if t.input.get("_qq_intent"))
+        task = next(t for t in state.tasks.values() if t.input.get("_reply_intent"))
         assert task.node_id == "qq.custom_intent"
         assert "那这样行吗" in task.input["instruction"]
         assert "咪啪" in task.input["instruction"]
@@ -147,7 +149,7 @@ class TestTheHappyPath:
         state = _make_state(tmp_path)
         _judge(_app(state, tmp_path), state, _body())
 
-        task = next(t for t in state.tasks.values() if t.input.get("_qq_intent"))
+        task = next(t for t in state.tasks.values() if t.input.get("_reply_intent"))
         assert task.input["_system_task"] is True
         assert task.input["use_context"] is False
         assert task.input["context_mode"] == "fresh"
@@ -159,7 +161,7 @@ class TestTheHappyPath:
 
         _judge(_app(state, tmp_path), state, _body())
 
-        task = next(t for t in state.tasks.values() if t.input.get("_qq_intent"))
+        task = next(t for t in state.tasks.values() if t.input.get("_reply_intent"))
         assert task.session_id == existing
 
     def test_a_missing_conversation_key_is_rejected(self, tmp_path: Path) -> None:
@@ -200,14 +202,14 @@ class TestAuth:
         response = self._post(_app(state, tmp_path), _body(), None)
 
         assert response.status_code == 401
-        assert [t for t in state.tasks.values() if t.input.get("_qq_intent")] == []
+        assert [t for t in state.tasks.values() if t.input.get("_reply_intent")] == []
 
     def test_a_wrong_token_is_rejected(self, tmp_path: Path) -> None:
         state = _make_state(tmp_path)
         response = self._post(_app(state, tmp_path), _body(), {"Authorization": "Bearer nope"})
 
         assert response.status_code == 401
-        assert [t for t in state.tasks.values() if t.input.get("_qq_intent")] == []
+        assert [t for t in state.tasks.values() if t.input.get("_reply_intent")] == []
 
     def test_the_query_token_also_works(self, tmp_path: Path) -> None:
         # verify_admin_token 同时认 ?token=，bot 侧走 Bearer，这里只确认没被收窄。
@@ -239,7 +241,7 @@ class TestTheJudgementNeverReachesTheUser:
         state = _make_state(tmp_path)
         _judge(_app(state, tmp_path), state, _body())
 
-        session_id = next(t for t in state.tasks.values() if t.input.get("_qq_intent")).session_id
+        session_id = next(t for t in state.tasks.values() if t.input.get("_reply_intent")).session_id
         outbound = [
             e for e in state.eventlog.list_all_events()
             if str(e.get("type") or "") == "outbound_message" and e.get("session_id") == session_id
@@ -252,7 +254,7 @@ class TestTheJudgementNeverReachesTheUser:
         state = _make_state(tmp_path)
         _judge(_app(state, tmp_path), state, _body())
 
-        task = next(t for t in state.tasks.values() if t.input.get("_qq_intent"))
+        task = next(t for t in state.tasks.values() if t.input.get("_reply_intent"))
         assert [p for p in (task.post_work_phases or []) if p.get("kind") in {"hook", "turn_summary"}] == []
 
 
@@ -280,14 +282,14 @@ class TestTimeout:
         # 留着不管，模型慢的时候判定任务会一直堆积，把 engine worker 全占住。
         state, _response = self._timed_out(tmp_path)
 
-        task = next(t for t in state.tasks.values() if t.input.get("_qq_intent"))
+        task = next(t for t in state.tasks.values() if t.input.get("_reply_intent"))
         assert task.status == TaskStatus.cancelled or task.cancel_requested
 
     def test_a_timeout_frees_the_conversation_slot(self, tmp_path: Path) -> None:
         state, _response = self._timed_out(tmp_path)
 
-        assert state.qq_intent.inflight() == 0
-        assert state.qq_intent.has_conversation("qq_group:hash-abc") is False
+        assert state.reply_intent.inflight() == 0
+        assert state.reply_intent.has_conversation("qq_group:hash-abc") is False
 
 
 class TestTheInflightGate:
@@ -317,7 +319,7 @@ class TestTheInflightGate:
         assert payload["error"] == "conversation_busy"
         assert payload["agreed"] is False
         # 被挡住的那次不该留下任务，否则闸门本身就成了任务源。
-        assert len([t for t in state.tasks.values() if t.input.get("_qq_intent")]) == 1
+        assert len([t for t in state.tasks.values() if t.input.get("_reply_intent")]) == 1
 
     def test_a_different_group_is_refused_once_the_global_cap_is_reached(self, tmp_path: Path) -> None:
         state = _make_state(tmp_path)
@@ -384,7 +386,30 @@ class TestTheInflightGate:
         app = _app(state, tmp_path)
 
         _judge(app, state, _body())
-        assert state.qq_intent.inflight() == 0
+        assert state.reply_intent.inflight() == 0
 
         second = _judge(app, state, _body(), answer="no")
         assert second.json()["decided"] is True
+
+
+class TestNamingAndChannel:
+    def test_the_legacy_path_still_judges(self, tmp_path: Path) -> None:
+        state = _make_state(tmp_path)
+        response = _judge(_app(state, tmp_path), state, _body(), url=_LEGACY_URL)
+
+        assert response.status_code == 200
+        assert response.json()["agreed"] is True
+
+    def test_the_channel_is_inferred_from_the_conversation_key(self, tmp_path: Path) -> None:
+        state = _make_state(tmp_path)
+        _judge(_app(state, tmp_path), state, _body())
+
+        session_id = state.conversation_map["qq_group:hash-abc"]
+        assert state.sessions[session_id].channel == "qq_group"
+
+    def test_an_explicit_channel_wins(self, tmp_path: Path) -> None:
+        state = _make_state(tmp_path)
+        _judge(_app(state, tmp_path), state, _body(conversation_key="tg_group:abc", channel="tg_group"))
+
+        session_id = state.conversation_map["tg_group:abc"]
+        assert state.sessions[session_id].channel == "tg_group"

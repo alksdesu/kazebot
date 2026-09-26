@@ -5,8 +5,9 @@ when optional platform dependencies are not installed in the core test environme
 """
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Iterable
+
+from engine.attachments import blocked_file_reject_reason, normalize_extension
 
 
 # Inbound files are relayed back out by qq_forward and inlined into prompts, so the gate is a
@@ -22,48 +23,6 @@ INBOUND_FILE_ALLOWED_EXTENSIONS: frozenset[str] = frozenset({
     "py", "c", "h", "cpp", "hpp", "cs", "java", "go", "rs", "rb", "php", "lua", "kt",
     "swift", "patch", "diff",
 })
-
-# Never unlocked by operator config: forwarding one of these turns the bot into a malware relay.
-INBOUND_FILE_BLOCKED_EXTENSIONS: frozenset[str] = frozenset({
-    "exe", "com", "scr", "bat", "cmd", "pif", "ps1", "psm1", "psd1", "vbs", "vbe",
-    "js", "jse", "wsf", "wsh", "hta", "msi", "msp", "mst", "cpl", "reg", "lnk", "url",
-    "dll", "sys", "ocx", "drv", "apk", "jar", "iso", "img", "vhd", "vhdx", "efi",
-    "elf", "so", "dylib",
-})
-
-# Magic numbers of native executables. OLE2 (d0cf11e0) is deliberately absent: legacy
-# .doc/.xls share it.
-_EXECUTABLE_MAGIC: tuple[bytes, ...] = (
-    b"MZ", b"\x7fELF", b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",
-    b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe",
-    b"L\x00\x00\x00\x01\x14\x02\x00",
-)
-
-
-def normalize_extension(name: str) -> str:
-    """Trailing extension of a file name, lowercase and without the dot."""
-    return Path(str(name or "")).suffix.lower().lstrip(".")
-
-
-def looks_like_executable(content: bytes) -> bool:
-    """True when the header is a native executable or a Windows shortcut."""
-    head = bytes(content[:8])
-    return any(head.startswith(magic) for magic in _EXECUTABLE_MAGIC)
-
-
-def blocked_file_reject_reason(name: str, content: bytes = b"") -> str:
-    """The always-refused half of the inbound gate: blocked extension or executable header.
-
-    Safe to apply at any layer, unlike the allow-whitelist which is QQ-inbound-specific;
-    the generic Supervisor upload endpoint enforces only this half.
-    Codes: "unsupported_type", "executable_content".
-    """
-    if normalize_extension(name) in INBOUND_FILE_BLOCKED_EXTENSIONS:
-        return "unsupported_type"
-    if looks_like_executable(content):
-        return "executable_content"
-    return ""
-
 
 def inbound_file_reject_reason(name: str, content: bytes = b"", *, extra_allowed: Iterable[str] = ()) -> str:
     """Return an error code for a refused inbound file, or "" when it is accepted.

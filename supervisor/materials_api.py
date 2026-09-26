@@ -13,7 +13,7 @@ from engine.materials import MaterialError, MaterialService
 from engine.materials.storage import MAX_FILE_BYTES, identity
 from .feature_auth import resolve_actor
 from .admin_api import verify_admin_token
-from .conversation_labels import describe_namespaces, memory_namespace, scoped_conversation_keys
+from .conversation_labels import account_scope, describe_namespaces, memory_namespace
 
 logger = logging.getLogger(__name__)
 
@@ -105,14 +105,11 @@ def create_router(state) -> APIRouter:
         if current.channel != "web" or not current.interactive:
             return [dict(row) for row in rows]
         labels = describe_namespaces(state.workspace_root, conversation_keys={row["scope"] for row in rows})
-        current_keys = scoped_conversation_keys(state.workspace_root)
+        accounts = account_scope(state.workspace_root)
         return [{
             **dict(row),
             "owner": labels.get(memory_namespace(row["scope"])),
-            "current_account": (
-                current_keys is None or not row["scope"].startswith(("qq_group:", "qq_private:"))
-                or row["scope"] in current_keys
-            ),
+            "current_account": accounts.is_current(row["scope"]),
         } for row in rows]
 
     @router.get("/settings")

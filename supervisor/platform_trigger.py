@@ -1,18 +1,19 @@
-"""在 supervisor 侧复用 QQ 触发判定，供控制台的「试听」调用。
+"""在 supervisor 侧复用平台的触发判定，供控制台的「试听」调用。
 
-判定逻辑只有 adapters/onebot/trigger_policy.py 一份 —— 前端不重写、supervisor 也不重写，
-否则试听说会回、实际不回，比没有试听更糟。
+判定逻辑只有平台适配器里那一份，由平台描述的 trigger_policy 钩子指过来 ——
+前端不重写、supervisor 也不重写，否则试听说会回、实际不回，比没有试听更糟。
 """
 from __future__ import annotations
 
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
-from adapters.onebot import trigger_policy as _trigger_policy
+from platforms.descriptor import HOOK_TRIGGER_POLICY, PlatformDescriptor
+from platforms.registry import platform_hook
 
 
-def load_policy() -> ModuleType:
-    return _trigger_policy
+def load_policy(platform: PlatformDescriptor) -> ModuleType:
+    return platform_hook(platform, HOOK_TRIGGER_POLICY)
 
 
 def config_from_values(policy: ModuleType, values: dict[str, Any]) -> Any:
@@ -33,6 +34,7 @@ def _as_bool(raw: Any, default: bool = False) -> bool:
 
 
 def dry_run(
+    platform: PlatformDescriptor,
     messages: list[dict[str, Any]],
     values: dict[str, Any],
     *,
@@ -43,7 +45,7 @@ def dry_run(
     冷却按顺序累积：第一条命中之后，后面几条才可能被冷却挡住 —— 试听要能看出这个因果，
     所以不是每条独立判定。
     """
-    policy = load_policy()
+    policy = load_policy(platform)
     config = config_from_values(policy, values)
     cooldown = policy.CooldownState() if apply_cooldown else None
 

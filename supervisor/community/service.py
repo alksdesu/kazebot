@@ -11,6 +11,9 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from platforms.descriptor import CHANNEL_GROUP
+from platforms.registry import is_platform_conversation
+
 
 LEGACY_POLICY_DEFAULTS = {
     "response_policy_enabled": False,
@@ -152,14 +155,13 @@ class CommunityService:
     @classmethod
     def _group_scope(cls, actor) -> str:
         scope = cls._scope(actor)
-        if not scope.startswith("qq_group:") or not scope.removeprefix("qq_group:"):
-            raise ValueError("这项群协作功能只能用于 QQ 群，请先选择一个群")
+        if not is_platform_conversation(scope, kinds={CHANNEL_GROUP}):
+            raise ValueError("这项群协作功能只能用于群聊，请先选择一个群")
         return scope
 
     @staticmethod
     def _inherits_defaults(scope: str) -> bool:
-        prefix, _, identity = scope.partition(":")
-        return prefix in {"qq_group", "qq_private"} and bool(identity.strip())
+        return is_platform_conversation(scope)
 
     @staticmethod
     def _require_defaults_actor(actor) -> None:
@@ -366,7 +368,7 @@ class CommunityService:
         scope = self._scope(actor)
         actor.require_manager(scope)
         parsed = self._parse_values(changes, policy_only=False, legacy=True)
-        ignore_welcome = "welcome_enabled" in parsed and (not scope.startswith("qq_group:") or not scope.removeprefix("qq_group:").strip())
+        ignore_welcome = "welcome_enabled" in parsed and not is_platform_conversation(scope, kinds={CHANNEL_GROUP})
         if ignore_welcome:
             if parsed["welcome_enabled"]:
                 self._group_scope(actor)

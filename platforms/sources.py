@@ -10,7 +10,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
-from .registry import find_platform, normalize_name
+from .descriptor import normalize_name
+from .registry import conversation_key_prefix, find_platform
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +31,6 @@ class OperationSource:
     # 外部平台是平台 id，内部入口是入口名；拒绝文案用它称呼发起方。
     label: str
     declared: bool
-
-
-def conversation_key_prefix(conversation_key: Any) -> str:
-    head, sep, _ = str(conversation_key or "").strip().partition(":")
-    return normalize_name(head) if sep else ""
 
 
 def classify_source_name(name: Any) -> OperationSource | None:

@@ -1,0 +1,197 @@
+"""平台清单与各平台的热载配置、试听端点。
+
+supervisor 只管文件；「实际生效值」由各平台的 bot 进程写进 live 状态文件公布。
+supervisor 不自己算生效值 —— bot 是独立进程，env 可能和这里不一样，算出来的会是另一份配置。
+"""
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import time
+from pathlib import Path
+from typing import Any
+
+import yaml
+from fastapi import APIRouter, Body, Depends, HTTPException
+from pydantic import BaseModel
+
+from engine.eventlog_rotation import eventlog_file_lock
+from platforms.descriptor import HOOK_TRIGGER_POLICY, STATE_LIVE, PlatformDescriptor
+from platforms.registry import all_platforms, get_platform, platform_config_path, platform_state_path
+
+from . import platform_trigger
+from .admin_api import verify_admin_token
+
+# bot 至少每 30 秒重写一次 live 状态，留三倍余量再判定失联。
+_STALE_AFTER_SEC = 90.0
+_DRY_RUN_LIMIT = 200
+
+
+class RawConfig(BaseModel):
+    content: str
+
+
+def resolve_platform(platform_id: str) -> PlatformDescriptor:
+    try:
+        return get_platform(platform_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"未知平台：{platform_id}") from None
+
+
+def config_file(workspace_root: Path, platform: PlatformDescriptor) -> Path:
+    path = platform_config_path(platform, workspace_root)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"{platform.display_name} 没有热载配置")
+    return path
+
+
+def live_state(workspace_root: Path, platform: PlatformDescriptor) -> dict[str, Any]:
+    path = platform_state_path(platform, STATE_LIVE, workspace_root)
+    if path is None:
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def leaf_paths(document: Any, prefix: str = "") -> list[str]:
+    if isinstance(document, dict):
+        leaves: list[str] = []
+        for key, value in document.items():
+            leaves.extend(leaf_paths(value, f"{prefix}.{key}" if prefix else str(key)))
+        return leaves
+    if document is None:
+        # 只写了段名没写值（`channels:`）不是配置项，别报成拼错的键。
+        # 显式 null 同理，语义是「这个键交回 .env」。
+        return []
+    return [prefix] if prefix else []
+
+
+def read_config_raw(workspace_root: Path, platform: PlatformDescriptor) -> dict[str, Any]:
+    path = config_file(workspace_root, platform)
+    if not path.exists():
+        # 「还没接管」是正常状态，不是错误。刻意不回落到示例文件：
+        # 那份是默认值，被当成当前配置保存下去就等于悄悄覆盖 .env 里的设置。
+        return {"content": "", "exists": False}
+    return {"content": path.read_text(encoding="utf-8"), "exists": True}
+
+
+def write_config_raw(workspace_root: Path, platform: PlatformDescriptor, content: str) -> dict[str, Any]:
+    try:
+        document = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
+        raise HTTPException(status_code=400, detail=f"YAML 解析失败：{exc}") from exc
+    if document is not None and not isinstance(document, dict):
+        raise HTTPException(status_code=400, detail="顶层必须是映射（key: value）")
+
+    warnings: list[str] = []
+    known = live_state(workspace_root, platform).get("paths")
+    if isinstance(known, dict) and known:
+        unknown = sorted(set(leaf_paths(document or {})) - set(known.values()) - {"version"})
+        if unknown:
+            # 无人消费的键改了不会有任何效果，而界面只会显示保存成功。
+            raise HTTPException(status_code=400, detail=f"无人消费的配置项：{unknown}")
+    else:
+        warnings.append("bot 进程未公布配置结构，本次只校验了 YAML 语法")
+
+    path = config_file(workspace_root, platform)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 同目录 tmp + replace：bot 进程随时在读，读到半截 yaml 等于整份配置塌掉。
+    with eventlog_file_lock(path):
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+        try:
+            tmp.write_text(content, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+    return {"ok": True, "warnings": warnings}
+
+
+def config_state(workspace_root: Path, platform: PlatformDescriptor) -> dict[str, Any]:
+    state = live_state(workspace_root, platform)
+    path = config_file(workspace_root, platform)
+    try:
+        stat = path.stat()
+        fingerprint = {"exists": True, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+    except OSError:
+        fingerprint = {"exists": False, "mtime_ns": 0, "size": 0}
+    if not state:
+        return {
+            "published": False,
+            "reason": "bot 进程尚未公布生效配置（未启动，或还没跑完第一轮对齐）",
+            "file": fingerprint,
+        }
+    age_sec = max(0.0, time.time() - float(state.get("published_at") or 0.0))
+    return {
+        "published": True,
+        "age_sec": round(age_sec, 3),
+        "stale": age_sec > _STALE_AFTER_SEC,
+        # 「已生效」的判据是 bot 跑着的那份值确实来自当前这个文件版本。
+        # 不能拿 state["file"] 比 —— 那是 bot 看到的文件指纹，文件写坏时它照样等于
+        # 当前文件，而 bot 用的还是上一份配置。
+        "applied": state.get("loaded") == fingerprint,
+        "file": fingerprint,
+        "state": state,
+    }
+
+
+def trigger_dry_run(workspace_root: Path, platform: PlatformDescriptor, payload: dict[str, Any]) -> dict[str, Any]:
+    """把一批模拟消息过一遍真实判定。
+
+    config 省略时用 bot 公布的生效值 —— 「试听当前配置」不该要求调用方自己拼一份，
+    拼出来的那份和 bot 跑着的不一样就等于试听骗人。
+    """
+    if HOOK_TRIGGER_POLICY not in platform.hooks:
+        raise HTTPException(status_code=404, detail=f"{platform.display_name} 没有触发判定")
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="messages 必须是数组")
+    if len(messages) > _DRY_RUN_LIMIT:
+        raise HTTPException(status_code=400, detail=f"一次最多 {_DRY_RUN_LIMIT} 条")
+
+    values = payload.get("config")
+    if not isinstance(values, dict):
+        values = live_state(workspace_root, platform).get("values")
+    if not isinstance(values, dict) or not values:
+        raise HTTPException(status_code=409, detail="bot 进程尚未公布生效配置，请显式传 config 后再试听")
+    try:
+        return platform_trigger.dry_run(
+            platform, messages, values,
+            apply_cooldown=payload.get("cooldown", True) is not False,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        # 缺键/类型不对最可能来自调用方自拼的 config，这是 400 不是 500。
+        raise HTTPException(status_code=400, detail=f"配置不完整或类型不对：{exc}") from exc
+
+
+def create_platform_router(workspace_root: Path) -> APIRouter:
+    router = APIRouter(dependencies=[Depends(verify_admin_token)])
+
+    @router.get("")
+    def list_platforms() -> dict[str, Any]:
+        return {"platforms": [platform.public_dict() for platform in all_platforms()]}
+
+    @router.get("/{platform_id}")
+    def get_one(platform_id: str) -> dict[str, Any]:
+        return resolve_platform(platform_id).public_dict()
+
+    @router.get("/{platform_id}/config/raw")
+    def get_raw(platform_id: str) -> dict[str, Any]:
+        return read_config_raw(workspace_root, resolve_platform(platform_id))
+
+    @router.put("/{platform_id}/config/raw")
+    def put_raw(platform_id: str, payload: RawConfig) -> dict[str, Any]:
+        return write_config_raw(workspace_root, resolve_platform(platform_id), payload.content)
+
+    @router.get("/{platform_id}/config/state")
+    def get_state(platform_id: str) -> dict[str, Any]:
+        return config_state(workspace_root, resolve_platform(platform_id))
+
+    @router.post("/{platform_id}/trigger/dry-run")
+    def dry_run(platform_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return trigger_dry_run(workspace_root, resolve_platform(platform_id), payload)
+
+    return router

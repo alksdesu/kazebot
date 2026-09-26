@@ -699,17 +699,19 @@ class TestDryRunSharesTheDecision:
         assert tp._LEGACY_PREFIX_MODES == cfg.GROUP_TRIGGER_PREFIX_MODES
 
     def test_supervisor_loads_the_same_module_the_adapter_uses(self) -> None:
-        from supervisor import qq_trigger
+        from platforms.builtin import QQ_NAPCAT
+        from supervisor import platform_trigger
 
-        policy = qq_trigger.load_policy()
+        policy = platform_trigger.load_policy(QQ_NAPCAT)
 
         assert policy.SIGNAL_ORDER == tp.SIGNAL_ORDER
         assert policy.TriggerConfig().at is tp.TriggerConfig().at
 
     def test_the_supervisor_and_the_adapter_share_one_module(self) -> None:
-        from supervisor import qq_trigger
+        from platforms.builtin import QQ_NAPCAT
+        from supervisor import platform_trigger
 
-        assert qq_trigger.load_policy() is tp
+        assert platform_trigger.load_policy(QQ_NAPCAT) is tp
 
     def _values(self, **overrides: Any) -> dict[str, Any]:
         base = {
@@ -725,9 +727,11 @@ class TestDryRunSharesTheDecision:
         return base
 
     def test_a_batch_is_judged_in_order_so_cooldown_shows_up(self) -> None:
-        from supervisor import qq_trigger
+        from platforms.builtin import QQ_NAPCAT
+        from supervisor import platform_trigger
 
-        out = qq_trigger.dry_run(
+        out = platform_trigger.dry_run(
+            QQ_NAPCAT,
             [
                 {"text": "咪啪在吗", "user_id": 1, "group_id": 9},
                 {"text": "咪啪你看", "user_id": 2, "group_id": 9},
@@ -740,9 +744,11 @@ class TestDryRunSharesTheDecision:
         assert out["results"][1]["blocked_by"] == "cooldown"
 
     def test_cooldown_can_be_left_out_of_the_preview(self) -> None:
-        from supervisor import qq_trigger
+        from platforms.builtin import QQ_NAPCAT
+        from supervisor import platform_trigger
 
-        out = qq_trigger.dry_run(
+        out = platform_trigger.dry_run(
+            QQ_NAPCAT,
             [{"text": "咪啪", "user_id": 1, "group_id": 9}] * 3,
             self._values(signal_name=True, name_words=["咪啪"], cooldown_group_sec=30),
             apply_cooldown=False,
@@ -751,9 +757,11 @@ class TestDryRunSharesTheDecision:
         assert [r["triggered"] for r in out["results"]] == [True, True, True]
 
     def test_being_at_ed_still_bypasses_the_cooldown(self) -> None:
-        from supervisor import qq_trigger
+        from platforms.builtin import QQ_NAPCAT
+        from supervisor import platform_trigger
 
-        out = qq_trigger.dry_run(
+        out = platform_trigger.dry_run(
+            QQ_NAPCAT,
             [
                 {"text": "咪啪在吗", "user_id": 1, "group_id": 9},
                 {"text": "帮我查", "user_id": 2, "group_id": 9, "at_me": True},
@@ -764,9 +772,11 @@ class TestDryRunSharesTheDecision:
         assert [r["triggered"] for r in out["results"]] == [True, True]
 
     def test_random_is_never_a_fabricated_answer(self) -> None:
-        from supervisor import qq_trigger
+        from platforms.builtin import QQ_NAPCAT
+        from supervisor import platform_trigger
 
-        out = qq_trigger.dry_run(
+        out = platform_trigger.dry_run(
+            QQ_NAPCAT,
             [{"text": "随便聊聊", "user_id": 1, "group_id": 9}],
             self._values(signal_at=False, signal_reply=False, signal_random=True, random_probability=1.0),
         )
@@ -776,9 +786,11 @@ class TestDryRunSharesTheDecision:
         assert result["signal"] == "random"
 
     def test_llm_intent_is_reported_as_runtime_dependent(self) -> None:
-        from supervisor import qq_trigger
+        from platforms.builtin import QQ_NAPCAT
+        from supervisor import platform_trigger
 
-        out = qq_trigger.dry_run(
+        out = platform_trigger.dry_run(
+            QQ_NAPCAT,
             [{"text": "随便聊聊", "user_id": 1, "group_id": 9}],
             self._values(signal_at=False, signal_reply=False, llm_intent_enabled=True),
         )
@@ -788,9 +800,11 @@ class TestDryRunSharesTheDecision:
 
     def test_the_preview_shows_the_cooldown_holding_back_the_handover(self) -> None:
         """真实判定在冷却期内不去问模型，试听必须照样显示成被冷却挡住。"""
-        from supervisor import qq_trigger
+        from platforms.builtin import QQ_NAPCAT
+        from supervisor import platform_trigger
 
-        out = qq_trigger.dry_run(
+        out = platform_trigger.dry_run(
+            QQ_NAPCAT,
             [
                 {"text": "咪啪在吗", "user_id": 1, "group_id": 9, "at_sec": 0},
                 {"text": "随便聊聊", "user_id": 2, "group_id": 9, "at_sec": 1},
@@ -807,16 +821,19 @@ class TestDryRunSharesTheDecision:
         assert second["undetermined"] is False
 
     def test_it_reports_which_signals_are_on(self) -> None:
-        from supervisor import qq_trigger
+        from platforms.builtin import QQ_NAPCAT
+        from supervisor import platform_trigger
 
-        out = qq_trigger.dry_run([], self._values(group_trigger="prefix"))
+        out = platform_trigger.dry_run(QQ_NAPCAT, [], self._values(group_trigger="prefix"))
 
         assert out["enabled_signals"] == ["at", "reply", "prefix"]
 
     def test_explicit_timestamps_are_honoured(self) -> None:
-        from supervisor import qq_trigger
+        from platforms.builtin import QQ_NAPCAT
+        from supervisor import platform_trigger
 
-        out = qq_trigger.dry_run(
+        out = platform_trigger.dry_run(
+            QQ_NAPCAT,
             [
                 {"text": "咪啪", "user_id": 1, "group_id": 9, "at_sec": 0},
                 {"text": "咪啪", "user_id": 1, "group_id": 9, "at_sec": 100},
@@ -846,7 +863,8 @@ class TestDryRunSharesTheDecision:
         这是「试听与后端同源」的实测：两边各走自己那条路（适配层从事件提取事实，
         dry-run 从 JSON 构造），结论不许有差别。
         """
-        from supervisor import qq_trigger
+        from platforms.builtin import QQ_NAPCAT
+        from supervisor import platform_trigger
 
         runtime = load_runtime(monkeypatch, tmp_path)
         set_live_config(
@@ -863,7 +881,8 @@ class TestDryRunSharesTheDecision:
         )
         live_decision = runtime._group_trigger_decision(event, SimpleNamespace(self_id=_BOT_QQ), text)
 
-        preview = qq_trigger.dry_run(
+        preview = platform_trigger.dry_run(
+            QQ_NAPCAT,
             [{"text": text, "user_id": 10001, "group_id": 1, "at_me": at_me, "reply_to_bot": reply_to_bot}],
             module.state_payload()["values"],
         )["results"][0]

@@ -1,32 +1,46 @@
 """把 conv_<摘要> 这类目录名还原成「哪个群 / 谁的私聊」。
 
-摘要是 HMAC，反不回去，只能拿已知会话正推一遍再比对。适配器落的那两份
-映射文件就是已知会话的全部来源，supervisor 只读不写。
+摘要是 HMAC，反不回去，只能拿已知会话正推一遍再比对。各平台适配器落的映射文件
+就是已知会话的全部来源，文件名由平台描述声明，supervisor 只读不写。
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from platforms.descriptor import (
+    CHANNEL_GROUP,
+    CONVERSATION_KINDS,
+    STATE_ALIASES,
+    STATE_LIVE,
+    STATE_ROUTES,
+    PlatformDescriptor,
+)
+from platforms.registry import (
+    all_platforms,
+    conversation_channel,
+    platform_state_path,
+    stable_key_pattern,
+)
 
 # 两种 memory namespace 形态：会话记忆按摘要建目录，人物档案按别名
 # （别名规则见 engine.memory_subjects.SUBJECT_RE）。
 _CONV_NAMESPACE = r"conv_[0-9a-f]{24}"
 _SUBJECT_NAMESPACE = r"user_[A-Za-z][A-Za-z0-9_]{0,63}"
 _NAMESPACE_RE = re.compile(rf"^{_CONV_NAMESPACE}$")
-_STABLE_KEY_RE = re.compile(r"qq_(?:group|private):[0-9a-f]{24}")
 _TASK_KEY_RE = re.compile(rf"^(?:{_CONV_NAMESPACE}|{_SUBJECT_NAMESPACE})$")
-_ROUTE_STATE = "onebot_plugin_state.json"
-_ANON_MAP = "onebot_anon_map.json"
 _SESSIONS = "sessions.json"
-_LIVE_STATE = "qq_live_state.json"
 _ROSTER = "memory_subjects.json"
 
 
-def _read_json(path: Path) -> dict[str, Any]:
+def _read_json(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
@@ -49,7 +63,7 @@ def is_internal_task_key(conversation_key: str) -> bool:
 
     dream 拿 namespace 当 conversation_key 建整理任务（save_memory 靠它推目录），
     supervisor 于是给它开一条 session。会话整理用 conv_<摘要>，人物档案整理用
-    user_<别名>；真人会话键永远带 qq_group: / qq_private: 这类前缀，两种都长不成。
+    user_<别名>；真人会话键永远带平台通道前缀，两种都长不成。
     """
     return bool(_TASK_KEY_RE.match(str(conversation_key or "").strip()))
 
@@ -64,51 +78,42 @@ def is_runtime_copy_session(session_id: str) -> bool:
     return str(session_id or "").strip().startswith(("branch_", "child_"))
 
 
-def scoped_conversation_keys(workspace_root: Path) -> set[str] | None:
-    """当前登录号名下的会话键。适配器没发布过就返回 None，表示无从判断。
+@dataclass(frozen=True)
+class AccountScope:
+    """各平台当前登录账号名下的会话键。
 
-    摘要带 bot 作用域，换号后同一个群另起一条，两个号的会话会并排堆在列表里。
-    密钥只有 bot 进程有，这里只消费它算好的集合。
+    摘要带账号作用域，换号后同一个群另起一条，两个号的会话会并排堆在列表里。
+    密钥只有 bot 进程有，这里只消费它算好的集合；平台没公布过时无从判断，一律算当前。
     """
-    live = _read_json(Path(workspace_root) / "data" / _LIVE_STATE)
-    keys = live.get("scope_conversation_keys")
-    if not isinstance(keys, list):
-        return None
-    return {str(key) for key in keys if str(key or "").strip()}
+
+    keys: Mapping[str, frozenset[str] | None]
+
+    def is_current(self, conversation_key: str) -> bool:
+        found = conversation_channel(conversation_key)
+        if found is None or found[1].kind not in CONVERSATION_KINDS:
+            return True
+        keys = self.keys.get(found[0].id)
+        return keys is None or conversation_key in keys
 
 
-def _label_for_stable(
-    stable: str, real_map: dict[str, Any], anon: dict[str, Any], names: "_DisplayNames",
-) -> dict[str, Any]:
-    raw_key = real_map.get(stable)
-    real_key = raw_key if isinstance(raw_key, str) else ""
-    kind = "group" if stable.startswith("qq_group:") else "private"
-    real_id = real_key.split(":", 1)[1] if ":" in real_key else ""
-    bucket = anon.get("groups" if kind == "group" else "users") or {}
-    entry = bucket.get(real_id) if isinstance(bucket, dict) else None
-    alias = str(entry.get("alias") or "") if isinstance(entry, dict) else ""
-    # 别名是给模型脱敏用的，管理员看的应该是真名；拿不到真名才退回别名。
-    display = names.group(real_id) if kind == "group" else names.user(alias)
-    fallback = alias or (
-        (f"群 {real_id}" if kind == "group" else f"私聊 {real_id}") if real_id
-        else ("群聊（名称暂不可用）" if kind == "group" else "私聊（名称暂不可用）")
-    )
-    return {
-        "kind": kind,
-        "conversation_key": stable,
-        "real_id": real_id,
-        "alias": alias,
-        "label": display or fallback,
-        "name_available": bool(display),
-    }
+def account_scope(workspace_root: Path) -> AccountScope:
+    keys: dict[str, frozenset[str] | None] = {}
+    for platform in all_platforms():
+        live = _read_json(platform_state_path(platform, STATE_LIVE, workspace_root))
+        published = live.get("scope_conversation_keys")
+        keys[platform.id] = (
+            frozenset(str(key) for key in published if str(key or "").strip())
+            if isinstance(published, list) else None
+        )
+    return AccountScope(keys=keys)
 
 
 class _DisplayNames:
     """真实群名与昵称。群名只有 bot 进程拿得到，靠它公布的 live state 转交。"""
 
-    def __init__(self, workspace_root: Path) -> None:
+    def __init__(self, workspace_root: Path, platform: PlatformDescriptor) -> None:
         root = Path(workspace_root)
-        live = _read_json(root / "data" / _LIVE_STATE)
+        live = _read_json(platform_state_path(platform, STATE_LIVE, root))
         groups = live.get("group_names")
         self._groups = groups if isinstance(groups, dict) else {}
         roster = _read_json(root / "data" / _ROSTER).get("subjects")
@@ -124,9 +129,54 @@ class _DisplayNames:
         return name.strip() if isinstance(name, str) else ""
 
 
+@dataclass
+class _PlatformLabels:
+    platform: PlatformDescriptor
+    real_map: dict[str, Any]
+    anon: dict[str, Any]
+    names: _DisplayNames
+
+    @classmethod
+    def load(cls, workspace_root: Path, platform: PlatformDescriptor) -> "_PlatformLabels":
+        real_map = _read_json(platform_state_path(platform, STATE_ROUTES, workspace_root)).get("real_conversation_keys")
+        return cls(
+            platform=platform,
+            real_map=real_map if isinstance(real_map, dict) else {},
+            anon=_read_json(platform_state_path(platform, STATE_ALIASES, workspace_root)),
+            names=_DisplayNames(workspace_root, platform),
+        )
+
+    def label(self, stable: str) -> dict[str, Any]:
+        found = conversation_channel(stable)
+        kind = "group" if found is not None and found[1].kind == CHANNEL_GROUP else "private"
+        raw_key = self.real_map.get(stable)
+        real_key = raw_key if isinstance(raw_key, str) else ""
+        real_id = real_key.split(":", 1)[1] if ":" in real_key else ""
+        bucket = self.anon.get("groups" if kind == "group" else "users") or {}
+        entry = bucket.get(real_id) if isinstance(bucket, dict) else None
+        alias = str(entry.get("alias") or "") if isinstance(entry, dict) else ""
+        # 别名是给模型脱敏用的，管理员看的应该是真名；拿不到真名才退回别名。
+        display = self.names.group(real_id) if kind == "group" else self.names.user(alias)
+        fallback = alias or (
+            (f"群 {real_id}" if kind == "group" else f"私聊 {real_id}") if real_id
+            else ("群聊（名称暂不可用）" if kind == "group" else "私聊（名称暂不可用）")
+        )
+        return {
+            "kind": kind,
+            "conversation_key": stable,
+            "real_id": real_id,
+            "alias": alias,
+            "label": display or fallback,
+            "name_available": bool(display),
+        }
+
+
 def subject_label(workspace_root: Path, alias: str) -> str:
     """人物档案该显示的名字。没记下昵称就退回别名。"""
-    return _DisplayNames(workspace_root).user(alias) or str(alias or "")
+    roster = _read_json(Path(workspace_root) / "data" / _ROSTER).get("subjects")
+    entry = roster.get(str(alias)) if isinstance(roster, dict) and alias else None
+    name = entry.get("display_name") if isinstance(entry, dict) else None
+    return (name.strip() if isinstance(name, str) else "") or str(alias or "")
 
 
 def load_sessions(workspace_root: Path) -> dict[str, dict[str, Any]]:
@@ -135,13 +185,13 @@ def load_sessions(workspace_root: Path) -> dict[str, dict[str, Any]]:
     return {str(key): value for key, value in raw.items() if isinstance(value, dict)}
 
 
-def _candidate_keys(workspace_root: Path, real_map: dict[str, Any]) -> set[str]:
+def _candidate_keys(workspace_root: Path, platforms: Iterable[_PlatformLabels]) -> set[str]:
     """所有可能算出过记忆目录的会话键。
 
     child / 入口分支不进 conversation_map，但它们照样会写记忆目录，所以从
     sessions.json 全量取，而不是只看适配器那份映射。
     """
-    keys: set[str] = {str(key) for key in real_map}
+    keys: set[str] = {str(key) for labels in platforms for key in labels.real_map}
     for row in load_sessions(workspace_root).values():
         key = str(row.get("conversation_key") or "").strip()
         if key:
@@ -154,26 +204,28 @@ def describe_namespaces(
 ) -> dict[str, dict[str, Any]]:
     """namespace -> 归属描述。认不出来的目录不会出现在结果里。"""
     root = Path(workspace_root)
-    real_map = _read_json(root / "data" / _ROUTE_STATE).get("real_conversation_keys") or {}
-    real_map = real_map if isinstance(real_map, dict) else {}
-    anon = _read_json(root / "data" / _ANON_MAP)
-    names = _DisplayNames(root)
+    loaded = {platform.id: _PlatformLabels.load(root, platform) for platform in all_platforms()}
+    stable_re = stable_key_pattern()
 
     described: dict[str, dict[str, Any]] = {}
-    keys = _candidate_keys(root, real_map) | {key for key in conversation_keys if isinstance(key, str) and key}
+    keys = _candidate_keys(root, loaded.values()) | {
+        key for key in conversation_keys if isinstance(key, str) and key
+    }
     for key in keys:
         namespace = memory_namespace(key)
         if not namespace:
             continue
-        if key.startswith(("qq_group:", "qq_private:")):
-            described[namespace] = _label_for_stable(key, real_map, anon, names)
+        found = conversation_channel(key)
+        if found is not None and found[1].kind in CONVERSATION_KINDS:
+            described[namespace] = loaded[found[0].id].label(key)
             continue
-        # 子代理的 key 形如 agent:<节点>:qq_group:<摘要>:<uuid>，把中间那段捞出来，
+        # 子代理的 key 形如 agent:<节点>:<通道>:<摘要>:<uuid>，把中间那段捞出来，
         # 它写的记忆才不至于在页面上变成一个无主目录。
-        found = _STABLE_KEY_RE.search(key)
-        if not found:
+        match = stable_re.search(key) if stable_re is not None else None
+        parent_found = conversation_channel(match.group(0)) if match else None
+        if parent_found is None:
             continue
-        parent = _label_for_stable(found.group(0), real_map, anon, names)
+        parent = loaded[parent_found[0].id].label(match.group(0))
         described[namespace] = {
             **parent,
             "kind": "agent",

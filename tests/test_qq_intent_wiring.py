@@ -231,12 +231,12 @@ class TestWhatIsSentToTheModel:
     def _sent(self, runtime, monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> dict[str, Any]:
         captured: dict[str, Any] = {}
 
-        async def _judge_qq_intent(**kwargs: Any):
+        async def _judge_reply_intent(**kwargs: Any):
             captured.update(kwargs)
             return _verdict(runtime, agreed=False, decided=True)
 
         monkeypatch.setattr(
-            runtime, "_client", SimpleNamespace(judge_qq_intent=_judge_qq_intent), raising=False,
+            runtime, "_client", SimpleNamespace(judge_reply_intent=_judge_reply_intent), raising=False,
         )
         event = _Event(runtime, overrides.pop("text", "那这样行吗"))
         asyncio.run(runtime._judge_llm_intent(_bot(), event, "那这样行吗"))

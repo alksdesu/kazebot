@@ -25,7 +25,7 @@ class InboundResult:
 
 @dataclass(frozen=True)
 class IntentVerdict:
-    """POST /v1/qq/intent/judge 的返回结果。
+    """POST /v1/intent/judge 的返回结果。
 
     decided=False 表示没拿到模型答案（超时 / 被在飞上限挡住），此时 agreed 恒为
     False —— 判定层不可用时插话，是这两个方向里错得更难看的那个。

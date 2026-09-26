@@ -194,12 +194,12 @@ class ClonothClient:
     #  Intent — QQ 接话意愿判断
     # ================================================================
 
-    async def judge_qq_intent(
+    async def judge_reply_intent(
         self,
         *,
         conversation_key: str,
         text: str,
-        channel: str = "qq_group",
+        channel: str = "",
         context_lines: list[str] | None = None,
         bot_names: list[str] | None = None,
         speaker: str = "",
@@ -209,10 +209,11 @@ class ClonothClient:
     ) -> IntentVerdict:
         """问一次模型：这条群消息是不是在跟 bot 说话。
 
-        对应 POST /v1/qq/intent/judge。任何失败都返回 decided=False / agreed=False，
+        对应 POST /v1/intent/judge。任何失败都返回 decided=False / agreed=False，
         不抛异常 —— 判定层出问题时群消息必须照常放行，不能反过来拖住 bot。
 
         Args:
+            channel: 会话通道；留空时服务端按 conversation_key 的前缀推断。
             context_lines: 最近几条群聊，必须是已匿名化的文本行。
             bot_names: bot 在群里被叫的名字，判定「有没有在点名」要用。
             timeout_sec: 等模型的上限。HTTP 侧多给 2 秒，让服务端先超时并取消任务。
@@ -220,10 +221,11 @@ class ClonothClient:
         payload: dict[str, Any] = {
             "conversation_key": conversation_key,
             "text": text,
-            "channel": channel,
             "timeout_sec": float(timeout_sec),
             "max_inflight": int(max_inflight),
         }
+        if channel:
+            payload["channel"] = channel
         if context_lines:
             payload["context_lines"] = list(context_lines)
         if bot_names:
@@ -235,7 +237,7 @@ class ClonothClient:
 
         try:
             resp = await self._http().post(
-                f"{self._base_url}/v1/qq/intent/judge",
+                f"{self._base_url}/v1/intent/judge",
                 json=payload,
                 timeout=float(timeout_sec) + 2.0,
             )
@@ -255,6 +257,10 @@ class ClonothClient:
             reaction_id=str(data.get("reaction_id") or ""),
             topic_ref=str(data.get("topic_ref") or ""),
         )
+
+    async def judge_qq_intent(self, **kwargs: Any) -> IntentVerdict:
+        """judge_reply_intent 的旧名，保留给已经按旧名写好的外部调用方。"""
+        return await self.judge_reply_intent(**kwargs)
 
     # ================================================================
     #  Events — 事件流轮询

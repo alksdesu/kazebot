@@ -16,7 +16,9 @@ import httpx
 import yaml
 
 from providers import registry
-from clonoth_runtime import qq_config_path, resolve_env_ref
+from clonoth_runtime import resolve_env_ref
+from platforms.builtin import QQ_NAPCAT
+from platforms.registry import required_config_path
 from supervisor.config_store import ConfigStore
 from supervisor.instances import load_instances, url_prefix
 from supervisor.log_access import LogReader, redact
@@ -48,7 +50,7 @@ class OperationsService:
         self.state = state
         self.root = Path(state.workspace_root)
         self.reports = self.root / "data" / "diagnostics"
-        self.qq_file = qq_config_path(self.root)
+        self.qq_file = required_config_path(QQ_NAPCAT, self.root)
         self._probe_lock = asyncio.Lock()
 
     def _configured_secrets(self) -> tuple[str, ...]:

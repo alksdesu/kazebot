@@ -19,7 +19,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from supervisor import qq_intent  # noqa: E402
+from supervisor import reply_intent  # noqa: E402
 
 
 from adapters.onebot import trigger_policy as tp  # noqa: E402
@@ -123,28 +123,28 @@ class TestEvaluateStillHandsOffToTheModel:
 class TestParsingTheVerdict:
     @pytest.mark.parametrize("raw", ["yes", "YES", "yes|在追问上一条", " yes ", "是", "y"])
     def test_an_affirmative_is_agreed(self, raw: str) -> None:
-        result = qq_intent.parse_intent_text(raw)
+        result = reply_intent.parse_intent_text(raw)
 
         assert result.agreed is True
         assert result.error == ""
 
     @pytest.mark.parametrize("raw", ["no", "NO", "no|群友之间在对话", "否", "不要"])
     def test_a_negative_is_not_agreed(self, raw: str) -> None:
-        result = qq_intent.parse_intent_text(raw)
+        result = reply_intent.parse_intent_text(raw)
 
         assert result.agreed is False
         assert result.error == ""
 
     def test_the_reason_after_the_pipe_survives(self) -> None:
-        assert qq_intent.parse_intent_text("no|群友之间在对话").reason == "群友之间在对话"
+        assert reply_intent.parse_intent_text("no|群友之间在对话").reason == "群友之间在对话"
 
     def test_a_full_sentence_starting_with_yes_still_parses(self) -> None:
-        result = qq_intent.parse_intent_text("yes, 这句话是在问 bot")
+        result = reply_intent.parse_intent_text("yes, 这句话是在问 bot")
 
         assert result.agreed is True
 
     def test_an_empty_verdict_is_an_error_and_not_agreed(self) -> None:
-        result = qq_intent.parse_intent_text("   ")
+        result = reply_intent.parse_intent_text("   ")
 
         assert result.agreed is False
         assert result.error == "empty"
@@ -152,13 +152,13 @@ class TestParsingTheVerdict:
 
     def test_an_unparsable_verdict_falls_back_to_not_agreed(self) -> None:
         # 模型答成一段散文时不能猜。猜错的方向是 bot 在群里插话。
-        result = qq_intent.parse_intent_text("这个嘛，看情况吧")
+        result = reply_intent.parse_intent_text("这个嘛，看情况吧")
 
         assert result.agreed is False
         assert result.error == "unparsable"
 
     def test_a_no_prefixed_sentence_is_not_agreed(self) -> None:
-        assert qq_intent.parse_intent_text("no because 群友在聊别的").agreed is False
+        assert reply_intent.parse_intent_text("no because 群友在聊别的").agreed is False
 
 
 class TestReadingTheFinishedTask:
@@ -166,7 +166,7 @@ class TestReadingTheFinishedTask:
         return SimpleNamespace(result=result, task_id="t-1")
 
     def test_a_finish_text_becomes_the_verdict(self) -> None:
-        result = qq_intent.result_from_task(self._task({
+        result = reply_intent.result_from_task(self._task({
             "action": "finish", "result": {"text": "yes|在追问"},
         }))
 
@@ -174,30 +174,30 @@ class TestReadingTheFinishedTask:
         assert result.reason == "在追问"
 
     def test_a_failed_task_is_not_agreed(self) -> None:
-        result = qq_intent.result_from_task(self._task({"action": "fail", "error": "provider down"}))
+        result = reply_intent.result_from_task(self._task({"action": "fail", "error": "provider down"}))
 
         assert result.agreed is False
         assert result.error == "fail"
         assert result.as_dict()["decided"] is False
 
     def test_a_cancelled_task_is_not_agreed(self) -> None:
-        result = qq_intent.result_from_task(self._task({"action": "cancelled"}))
+        result = reply_intent.result_from_task(self._task({"action": "cancelled"}))
 
         assert result.agreed is False
         assert result.error == "cancelled"
 
     def test_a_missing_result_is_not_agreed(self) -> None:
-        assert qq_intent.result_from_task(self._task({})).agreed is False
+        assert reply_intent.result_from_task(self._task({})).agreed is False
 
     def test_a_non_dict_result_does_not_explode(self) -> None:
-        assert qq_intent.result_from_task(SimpleNamespace(result=None)).agreed is False
+        assert reply_intent.result_from_task(SimpleNamespace(result=None)).agreed is False
 
 
 # ── instruction 组装：真实号码一个都不能进 ──────────────────────────
 
 class TestTheInstructionCarriesNoRealIdentifiers:
     def test_the_group_and_user_numbers_never_appear(self) -> None:
-        instruction = qq_intent.build_instruction(
+        instruction = reply_intent.build_instruction(
             text="那这样行吗",
             context_lines=["[12:00] 小明(user_a1): 在吗"],
             bot_names=["咪啪"],
@@ -210,7 +210,7 @@ class TestTheInstructionCarriesNoRealIdentifiers:
         assert "987654321" not in instruction
 
     def test_the_bot_names_line_is_dropped_when_unset(self) -> None:
-        instruction = qq_intent.build_instruction(
+        instruction = reply_intent.build_instruction(
             text="行吗", context_lines=[], bot_names=[], speaker="",
         )
 
@@ -218,14 +218,14 @@ class TestTheInstructionCarriesNoRealIdentifiers:
         assert "最近的群聊" not in instruction
 
     def test_an_empty_message_still_produces_a_judgeable_instruction(self) -> None:
-        instruction = qq_intent.build_instruction(
+        instruction = reply_intent.build_instruction(
             text="   ", context_lines=[], bot_names=[], speaker="",
         )
 
         assert "（空消息）" in instruction
 
     def test_blank_context_lines_are_filtered_out(self) -> None:
-        instruction = qq_intent.build_instruction(
+        instruction = reply_intent.build_instruction(
             text="行吗", context_lines=["真的一行"], bot_names=[], speaker="",
         )
 
@@ -238,7 +238,7 @@ class TestTheInstructionCarriesNoRealIdentifiers:
 class TestTheInflightRegistry:
     def test_a_registered_task_is_counted_and_keyed_by_conversation(self) -> None:
         async def _run() -> None:
-            registry = qq_intent.IntentRegistry()
+            registry = reply_intent.IntentRegistry()
             registry.register("t-1", "qq_group:abc")
 
             assert registry.inflight() == 1
@@ -249,10 +249,10 @@ class TestTheInflightRegistry:
 
     def test_settling_delivers_the_result_and_frees_the_slot(self) -> None:
         async def _run() -> None:
-            registry = qq_intent.IntentRegistry()
+            registry = reply_intent.IntentRegistry()
             future = registry.register("t-1", "qq_group:abc")
 
-            assert registry.settle("t-1", qq_intent.IntentResult(agreed=True)) is True
+            assert registry.settle("t-1", reply_intent.IntentResult(agreed=True)) is True
             result = await asyncio.wait_for(future, timeout=1.0)
 
             assert result.agreed is True
@@ -263,22 +263,22 @@ class TestTheInflightRegistry:
 
     def test_discarding_frees_the_conversation_slot(self) -> None:
         async def _run() -> None:
-            registry = qq_intent.IntentRegistry()
+            registry = reply_intent.IntentRegistry()
             registry.register("t-1", "qq_group:abc")
             registry.discard("t-1")
 
             assert registry.inflight() == 0
             assert registry.has_conversation("qq_group:abc") is False
             # 已经放弃等待之后，迟到的结果不该再找到人交付。
-            assert registry.settle("t-1", qq_intent.IntentResult(agreed=True)) is False
+            assert registry.settle("t-1", reply_intent.IntentResult(agreed=True)) is False
 
         asyncio.run(_run())
 
     def test_settling_an_unknown_task_is_a_no_op(self) -> None:
         async def _run() -> None:
-            registry = qq_intent.IntentRegistry()
+            registry = reply_intent.IntentRegistry()
 
-            assert registry.settle("nope", qq_intent.IntentResult()) is False
+            assert registry.settle("nope", reply_intent.IntentResult()) is False
 
         asyncio.run(_run())
 
@@ -287,14 +287,14 @@ class TestTheInflightRegistry:
         # selector，loop 要等到下一次醒来才发现，短超时下恰好赶上。真实负载里就是
         # 判定卡满整个超时窗口。所以这里盯的是路径本身。
         async def _run() -> None:
-            registry = qq_intent.IntentRegistry()
+            registry = reply_intent.IntentRegistry()
             registry.register("t-1", "qq_group:abc")
             hops: list[tuple] = []
             registry._pending["t-1"].loop = SimpleNamespace(
                 call_soon_threadsafe=lambda fn, *args: hops.append((fn, args)),
             )
 
-            registry.settle("t-1", qq_intent.IntentResult(agreed=True))
+            registry.settle("t-1", reply_intent.IntentResult(agreed=True))
 
             assert len(hops) == 1
 
@@ -306,11 +306,11 @@ class TestTheInflightRegistry:
         import threading
 
         async def _run() -> None:
-            registry = qq_intent.IntentRegistry()
+            registry = reply_intent.IntentRegistry()
             future = registry.register("t-1", "qq_group:abc")
             threading.Thread(
                 target=registry.settle,
-                args=("t-1", qq_intent.IntentResult(agreed=True, reason="跨线程")),
+                args=("t-1", reply_intent.IntentResult(agreed=True, reason="跨线程")),
                 daemon=True,
             ).start()
 

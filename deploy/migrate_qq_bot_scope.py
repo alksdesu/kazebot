@@ -18,6 +18,7 @@ if str(_ROOT) not in sys.path:
 # 摘要算法与账号作用域必须与运行时同一份，所以直接用适配器的模块。
 from adapters.onebot import bot_scope as _bot_scope  # noqa: E402
 from adapters.onebot import conversation_hash as _conversation_hash  # noqa: E402
+from platforms.builtin import QQ_NAPCAT  # noqa: E402
 
 digest = _conversation_hash.digest
 LEGACY_MARKER = _conversation_hash.LEGACY_MARKER
@@ -68,7 +69,7 @@ def scope_matches(workspace: Path, secret: str, scope: str) -> bool:
     """盘上的会话键是不是按这个账号算出来的。路由表为空时无从判断，一律算匹配。"""
     return not [
         old_stable
-        for old_stable, real in load_route_map(route_state_file(workspace)).items()
+        for old_stable, real in load_route_map(route_state_file(workspace, QQ_NAPCAT)).items()
         if old_stable != f"{old_stable.split(':', 1)[0]}:{digest(real, secret, bot_scope=scope)}"
     ]
 
@@ -108,7 +109,7 @@ def verify_source_scope(workspace: Path, secret: str, source_scope: str) -> None
     """
     mismatched = [
         old_stable
-        for old_stable, real in load_route_map(route_state_file(workspace)).items()
+        for old_stable, real in load_route_map(route_state_file(workspace, QQ_NAPCAT)).items()
         if old_stable != f"{old_stable.split(':', 1)[0]}:{digest(real, secret, bot_scope=source_scope)}"
     ]
     if mismatched:
@@ -143,6 +144,7 @@ def run_scope_migration(
     )
     plan = plan_migration(
         workspace=workspace,
+        platform=QQ_NAPCAT,
         restable=lambda old_stable, real: (
             f"{old_stable.split(':', 1)[0]}:{digest(real, secret, bot_scope=target)}"
         ),
@@ -156,7 +158,8 @@ def run_scope_migration(
 
     # 会话历史与长期记忆共用一个会话键，两边一起搬才不会一半跟着走一半留在旧号。
     outcome = apply_migration(
-        workspace=workspace, plan=plan, move_attachments=True, rewrite_sessions=True,
+        workspace=workspace, platform=QQ_NAPCAT, plan=plan,
+        move_attachments=True, rewrite_sessions=True,
     )
     report.moved_dirs = outcome.moved_dirs
     report.moved_attachment_dirs = outcome.moved_attachment_dirs

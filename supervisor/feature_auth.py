@@ -7,6 +7,9 @@ from typing import Any
 
 from fastapi import HTTPException, Request
 
+from platforms.descriptor import CHANNEL_GROUP
+from platforms.registry import conversation_channel, conversation_key_prefix
+
 from .admin_api import verify_admin_token
 
 
@@ -46,6 +49,12 @@ def _text(value: Any, limit: int = 512) -> str:
     return str(value or "").strip()[:limit]
 
 
+def _is_group_scope(channel: str, scope: str) -> bool:
+    """群角色只在群会话里有意义，而且会话要属于发请求的这个通道。"""
+    found = conversation_channel(scope)
+    return found is not None and found[1].kind == CHANNEL_GROUP and found[1].name == channel
+
+
 def _owner(instance: str, user_id: str, fallback: str) -> str:
     if not user_id:
         return fallback
@@ -83,7 +92,7 @@ def resolve_actor(request: Request, state: Any, scope: str = "") -> FeatureActor
                 is_admin=auth.get("is_admin") is True,
                 role=(
                     _text(auth.get("group_role") or "member")
-                    if channel == "qq_group" and task_scope.startswith("qq_group:") and auth.get("group_scope") == task_scope else "member"
+                    if _is_group_scope(channel, task_scope) and auth.get("group_scope") == task_scope else "member"
                 ), channel=channel,
                 bot_scope=_text(auth.get("bot_scope") or instance), task_id=task_id,
                 message_id=_text(context.get("message_id")), interactive=False,
@@ -105,14 +114,12 @@ def resolve_actor(request: Request, state: Any, scope: str = "") -> FeatureActor
         user_id = _text(raw.get("user_id"))
         if not actor_scope or not user_id:
             raise HTTPException(status_code=403, detail="缺少已核验的会话或发送者")
+        channel = _text(raw.get("channel")) or conversation_key_prefix(actor_scope)
         actor = FeatureActor(
             scope=actor_scope, owner=_owner(instance, user_id, ""),
             is_admin=raw.get("is_admin") is True,
-            role=(
-                _text(raw.get("role") or "member")
-                if raw.get("channel", "qq_group") == "qq_group" and actor_scope.startswith("qq_group:") else "member"
-            ),
-            channel=_text(raw.get("channel") or "qq_group"),
+            role=_text(raw.get("role") or "member") if _is_group_scope(channel, actor_scope) else "member",
+            channel=channel,
             bot_scope=_text(raw.get("bot_scope") or instance),
             message_id=_text(raw.get("message_id")),
             user_id=user_id,

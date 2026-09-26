@@ -14,9 +14,19 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from platforms.registry import find_platform
+from platforms.sources import is_external_platform
 from supervisor.feature_auth import FeatureActor
 
 log = logging.getLogger(__name__)
+
+
+def _owner_label(actor: FeatureActor) -> str:
+    """提醒列表里的署名：平台用户写「平台简称 + 账号」，控制台写管理员。"""
+    if actor.user_id:
+        platform = find_platform(actor.channel)
+        return f"{platform.short_name if platform is not None else actor.channel} {actor.user_id}"
+    return "控制台管理员" if actor.is_admin else actor.owner
 
 
 def utcnow() -> datetime:
@@ -144,7 +154,7 @@ class ReminderService:
         record = {
             "id": "R" + uuid.uuid4().hex[:12], "scope": actor.scope, "owner": actor.owner,
             "bot_scope": actor.bot_scope, "channel": actor.channel, "text": text.strip(),
-            "owner_label": f"QQ {actor.user_id}" if actor.user_id else "控制台管理员" if actor.is_admin else actor.owner,
+            "owner_label": _owner_label(actor),
             "timezone": timezone_name, "due_at": due.isoformat(), "revision": 1,
             "status": "open", "delivery_status": "scheduled", "delivery_id": "",
             "created_at": utcnow().isoformat(), "history": [],
@@ -232,7 +242,8 @@ class ReminderService:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             record = self._load(db, parts[1])
-            if record["scope"] != scope or (record["channel"].startswith("qq_") and record["bot_scope"] != bot_scope):
+            # 外部平台多账号共用一个库，投递回执必须来自建这条提醒的那个号。
+            if record["scope"] != scope or (is_external_platform(record["channel"]) and record["bot_scope"] != bot_scope):
                 raise PermissionError("提醒投递目标不匹配")
             if record["status"] != "open" or record["delivery_id"] != delivery_id or record["revision"] != int(parts[2]):
                 return {"accepted": False, "reason": "superseded"}

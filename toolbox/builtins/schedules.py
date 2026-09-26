@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from platforms.registry import is_platform_conversation
 from platforms.sources import classify_source_name, is_external_platform
 
 from ..context import ToolContext
@@ -57,7 +58,7 @@ def _creator_platform(ctx: ToolContext) -> str:
 
 
 def _originating_conversation_key(ctx: ToolContext) -> str:
-    """真正发起这一轮的 QQ 会话 key，取不到返回空串。
+    """真正发起这一轮的外部平台会话 key（群聊或私聊），取不到返回空串。
 
     dispatch 子节点运行期的 conversation_key 是 agent:...，只看它就等于让模型绕一层
     委派便能自己指定投递目标；route/parent 才是发起会话，与记忆工具的寻址口径一致。
@@ -68,7 +69,7 @@ def _originating_conversation_key(ctx: ToolContext) -> str:
         getattr(ctx, "conversation_key", ""),
     ):
         text = str(candidate or "").strip()
-        if text.startswith(("qq_private:", "qq_group:")):
+        if is_platform_conversation(text):
             return text
     return ""
 
@@ -88,14 +89,10 @@ def _minute_field_is_too_frequent(cron_expr: str) -> bool:
 
 
 def _resolve_schedule_conversation_key(args: dict[str, Any], ctx: ToolContext, sid: str) -> str:
-    """Resolve the conversation key a schedule should fire back to.
+    """定时任务到点投递回哪个会话。
 
-    [QQ schedule 2026-06-21] Why: models may pass conversation_key="scheduler:*"
-    while executing inside a QQ chat. That creates a schedule that fires into an
-    internal scheduler channel and cannot be delivered back to QQ. How: when the
-    current ToolContext is already a QQ conversation, prefer it over model-provided
-    scheduler/empty keys. Purpose: reminders created from QQ reliably return to
-    the originating QQ private/group chat.
+    模型在平台会话里也可能传 scheduler:* 或留空，那样到点只会注入内部通道、回不到原会话；
+    所以发起会话是外部平台的群聊或私聊时，优先用它。
     """
     origin = _originating_conversation_key(ctx)
     if origin:
@@ -147,9 +144,9 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     creator = _creator_id(ctx)
     existing = {str(s.get("id") or "").strip(): s for s in load_schedules(ctx.workspace_root)}
     if not is_admin and origin:
-        # QQ 普通群友：放开定时提醒，但投递目标与入口节点必须由服务端钉死。
+        # 外部平台普通用户：放开定时提醒，但投递目标与入口节点必须由服务端钉死。
         # 到点注入的 inbound 直接走 entry_node，指定成 cmd_reviewer 之类就绕开了
-        # qq.orchestrator 的白名单 —— 这一条不设限等于给群友一条命令执行通道。
+        # 入口节点的工具白名单 —— 这一条不设限等于给群友一条命令执行通道。
         if entry_node_id or workflow_id:
             return _err("only Clonoth admins may pin an entry node or workflow on a schedule")
         if stype == "script":
@@ -165,7 +162,7 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         if prior is None and owned >= _MAX_SCHEDULES_PER_USER:
             return _err(f"you already have {_MAX_SCHEDULES_PER_USER} schedules; delete one first")
     elif not is_admin:
-        # 非 QQ 渠道解析不出发起会话，维持原样交给 policy 与人工审批。
+        # 内部入口解析不出平台发起会话，维持原样交给 policy 与人工审批。
         _op, err = await request_guard(ctx, "write_file", {"path": "data/schedules.yaml", "schedule_id": sid})
         if err is not None:
             return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))

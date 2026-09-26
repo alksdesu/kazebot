@@ -17,13 +17,16 @@ from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFi
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, Response
 
+from engine.attachments import blocked_file_reject_reason
+from platforms.registry import conversation_key_prefix
+
 from . import provisioning
 from .config_store import ConfigStore
 from .sticker_api import create_sticker_router
 from .instances import load_instances, url_prefix
 from .log_access import LogReader
 from .process_manager import ProcessManager
-from .qq_intent import IntentResult as QQIntentResult, build_instruction as qq_intent_instruction
+from .reply_intent import IntentResult, build_instruction as reply_intent_instruction
 from .state import SupervisorState
 from .types import (
     AdminStateOut,
@@ -67,16 +70,12 @@ from .types import (
     TaskStatus,
 )
 from .admin_api import create_admin_router
+from .platform_api import create_platform_router
 from .admin_api import init_admin_token, verify_admin_token
 from .napcat import NapCatClient, NapCatError, NapCatUnreachable
 
 
 log = logging.getLogger(__name__)
-
-def _load_attachment_policy() -> Any:
-    from adapters.onebot import attachment_policy
-
-    return attachment_policy
 
 
 def _now() -> datetime:
@@ -595,9 +594,8 @@ def create_app(
         content = await file.read()
         if len(content) > 50 * 1024 * 1024:
             raise HTTPException(status_code=413, detail="File too large (max 50MB)")
-        # 只挡「永远不该收」的可执行/脚本宿主：通用上传端点不套 QQ 入站白名单，否则会误拒 Web 的正当上传。
-        policy = _load_attachment_policy()
-        reject = policy.blocked_file_reject_reason(file.filename or unique_name, content)
+        # 只挡「永远不该收」的可执行/脚本宿主：通用上传端点不套平台入站白名单，否则会误拒 Web 的正当上传。
+        reject = blocked_file_reject_reason(file.filename or unique_name, content)
         if reject:
             raise HTTPException(status_code=415, detail=f"Rejected attachment: {reject}")
         save_path.write_bytes(content)
@@ -1433,14 +1431,13 @@ def create_app(
         verify_admin_token(request)
         st: SupervisorState = app.state.state
         from .conversation_labels import (
-            describe_namespaces, is_internal_task_key, is_runtime_copy_session,
-            load_sessions, memory_namespace, scoped_conversation_keys,
+            account_scope, describe_namespaces, is_internal_task_key, is_runtime_copy_session,
+            load_sessions, memory_namespace,
         )
 
         labels = describe_namespaces(st.workspace_root)
         sessions = load_sessions(st.workspace_root)
-        # 适配器没发布过归属就全部按当前号算，不凭空把人分成两组。
-        scoped_keys = scoped_conversation_keys(st.workspace_root)
+        accounts = account_scope(st.workspace_root)
         conv_dir = st.workspace_root / "data" / "conversations"
         rows: list[dict[str, Any]] = []
         for path in sorted(conv_dir.glob("*.jsonl")) if conv_dir.is_dir() else []:
@@ -1463,11 +1460,8 @@ def create_app(
                 "conversation_key": conv_key,
                 # session 已被清掉但 jsonl 还在的孤儿也要列出来，否则永远没人删。
                 "owner": labels.get(memory_namespace(conv_key)) if conv_key else None,
-                # 非 QQ 会话（web / cli）不参与账号归属，始终算当前。
-                "current_account": (
-                    True if scoped_keys is None or not conv_key.startswith(("qq_group:", "qq_private:"))
-                    else conv_key in scoped_keys
-                ),
+                # 内部入口的会话（web / cli）不参与账号归属，始终算当前。
+                "current_account": accounts.is_current(conv_key),
                 "channel": str(info.get("channel") or ""),
                 "bytes": stat.st_size,
                 "updated_at": stat.st_mtime,
@@ -2172,8 +2166,10 @@ def create_app(
 
         return {"ok": True, "task_id": task.task_id}
 
+    # 旧路径留给还没换新 SDK 的调用方。
     @app.post("/v1/qq/intent/judge")
-    async def qq_intent_judge(request: Request) -> dict[str, Any]:
+    @app.post("/v1/intent/judge")
+    async def reply_intent_judge(request: Request) -> dict[str, Any]:
         """判断一条群消息是不是在跟 bot 说话，等模型答完再返回。
 
         supervisor 不直接调模型，所以这里建一个 node task 交给 engine worker，
@@ -2189,7 +2185,7 @@ def create_app(
         text = str(body.get("text") or "")
         if not conversation_key or not text.strip():
             raise HTTPException(status_code=400, detail="conversation_key and text required")
-        channel = str(body.get("channel") or "qq_group").strip() or "qq_group"
+        channel = str(body.get("channel") or "").strip() or conversation_key_prefix(conversation_key) or "internal"
         node_id = str(body.get("node_id") or "qq.intent").strip() or "qq.intent"
         try:
             timeout_sec = min(60.0, max(1.0, float(body.get("timeout_sec") or 8.0)))
@@ -2202,15 +2198,15 @@ def create_app(
         context_lines = [str(x) for x in (body.get("context_lines") or []) if str(x).strip()]
         bot_names = [str(x) for x in (body.get("bot_names") or []) if str(x).strip()]
 
-        registry = st.qq_intent
+        registry = st.reply_intent
         # 闸门在建 task 之前：排队等 worker 的判定任务毫无价值 —— 等它轮到的时候，
         # 那条群消息早就翻页了，而它占的还是真实对话要用的那个 worker。
         if registry.has_conversation(conversation_key):
-            return {"task_id": "", **QQIntentResult(error="conversation_busy").as_dict()}
+            return {"task_id": "", **IntentResult(error="conversation_busy").as_dict()}
         if registry.inflight() >= max_inflight:
-            return {"task_id": "", **QQIntentResult(error="max_inflight").as_dict()}
+            return {"task_id": "", **IntentResult(error="max_inflight").as_dict()}
 
-        instruction = qq_intent_instruction(
+        instruction = reply_intent_instruction(
             text=text,
             context_lines=context_lines,
             bot_names=bot_names,
@@ -2235,7 +2231,7 @@ def create_app(
                     "child_session_id": child_sid,
                     "use_context": False,
                     "_system_task": True,
-                    "_qq_intent": True,
+                    "_reply_intent": True,
                 },
                 continuation={},
                 source_inbound_seq=None,
@@ -2249,12 +2245,12 @@ def create_app(
             registry.discard(task.task_id)
             # 超时了还留着任务，模型慢的时候判定会一直堆积，把 worker 全占住。
             st.cancel_single_task(task.task_id)
-            return {"task_id": task.task_id, **QQIntentResult(error="timeout").as_dict()}
+            return {"task_id": task.task_id, **IntentResult(error="timeout").as_dict()}
         except Exception as exc:
             registry.discard(task.task_id)
             st.cancel_single_task(task.task_id)
             log.exception("qq intent judge failed")
-            return {"task_id": task.task_id, **QQIntentResult(error=str(exc)[:200]).as_dict()}
+            return {"task_id": task.task_id, **IntentResult(error=str(exc)[:200]).as_dict()}
         return {"task_id": task.task_id, **result.as_dict()}
 
     @app.post("/v1/tasks/compact-async")
@@ -2330,6 +2326,7 @@ def create_app(
 
     admin_router = create_admin_router(workspace_root=state.workspace_root)
     app.include_router(admin_router, prefix="/v1/admin/config")
+    app.include_router(create_platform_router(workspace_root=state.workspace_root), prefix="/v1/platforms")
     app.include_router(
         create_sticker_router(workspace_root=state.workspace_root), prefix="/v1/stickers",
     )

@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, HTTPException, Request
 
 from supervisor.feature_auth import resolve_actor
-from supervisor.conversation_labels import describe_namespaces, memory_namespace, scoped_conversation_keys
+from supervisor.conversation_labels import account_scope, describe_namespaces, memory_namespace
 
 from .commands import command
 from .service import CommunityService, SettingsConflict
@@ -34,9 +34,9 @@ def create_router(state) -> APIRouter:
     def settings_scopes(request: Request):
         scopes = call(request, service.settings_scopes, defaults=True)
         labels = describe_namespaces(state.workspace_root, conversation_keys=scopes)
-        current_keys = scoped_conversation_keys(state.workspace_root)
+        accounts = account_scope(state.workspace_root)
         return {"items": [{"scope": scope, "owner": labels.get(memory_namespace(scope)),
-                           "current_account": current_keys is None or scope in current_keys} for scope in scopes]}
+                           "current_account": accounts.is_current(scope)} for scope in scopes]}
 
     @router.get("/settings/defaults")
     def defaults(request: Request):

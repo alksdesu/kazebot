@@ -92,7 +92,7 @@ def test_global_merge_pair_checks_existing_partial_override(service, admin, grou
 
 def test_group_features_reject_console_but_private_quiet_remains(service, admin):
     console = replace(admin, scope="web:console")
-    with pytest.raises(ValueError, match="QQ 群"):
+    with pytest.raises(ValueError, match="群聊"):
         service.create_activity(console, {"title": "synthetic"})
     private = replace(admin, scope="qq_private:synthetic")
     assert service.set_quiet(private, "listen", 60)["quiet"]["mode"] == "listen"
@@ -207,7 +207,7 @@ def test_legacy_false_welcome_is_noop_outside_groups_but_true_is_rejected(servic
     before = snapshot(service)
     assert service.update_settings(actor, {"welcome_enabled": False})["settings"]["welcome_enabled"] is False
     assert snapshot(service) == before
-    with pytest.raises(ValueError, match="QQ 群"):
+    with pytest.raises(ValueError, match="群聊"):
         service.update_settings(actor, {"welcome_enabled": True})
     assert snapshot(service) == before
 
@@ -388,10 +388,10 @@ def test_all_group_only_service_paths_reject_non_groups(service, admin, scope):
         lambda: service.notifications(actor), lambda: service.acknowledge_notification(actor, "synthetic", "1"),
     ]
     for action in actions:
-        with pytest.raises(ValueError, match="QQ 群"):
+        with pytest.raises(ValueError, match="群聊"):
             action()
     for text in ("/群规", "/群资料", "/常见问题", "/活动列表", "/投票创建 x | a | b"):
-        with pytest.raises(ValueError, match="QQ 群"):
+        with pytest.raises(ValueError, match="群聊"):
             command(service, actor, {"text": text})
 
 

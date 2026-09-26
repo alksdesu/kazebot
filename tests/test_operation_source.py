@@ -14,7 +14,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from platforms.registry import QQ_NAPCAT, find_platform  # noqa: E402
+from platforms.builtin import QQ_NAPCAT  # noqa: E402
+from platforms.registry import find_platform  # noqa: E402
 from platforms.sources import (  # noqa: E402
     INTERNAL_SOURCES,
     classify_operation_source,

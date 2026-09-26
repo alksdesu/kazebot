@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import shutil
 import secrets
@@ -14,10 +13,7 @@ import yaml
 from fastapi import APIRouter, Depends, HTTPException, Body, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from engine.eventlog_rotation import eventlog_file_lock
-from clonoth_runtime import qq_config_path
 
-from . import qq_trigger
 from .tool_catalog import ToolEntry, tool_catalog, tool_names
 
 class RawContent(BaseModel):
@@ -512,132 +508,26 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         p = workspace_root / "config" / "runtime.yaml"
         return _write_text(p, payload.content)
 
-    # ----- QQ 热载配置 -----
-    # 只管文件；「实际生效值」由 bot 进程写 data/qq_live_state.json 公布。supervisor 不
-    # 自己算生效值 —— bot 是独立进程，env 可能和这里不一样，算出来的会是另一份配置。
-    def _qq_config_path() -> Path:
-        return qq_config_path(workspace_root)
-
-    def _qq_live_state() -> dict[str, Any]:
-        p = workspace_root / "data" / "qq_live_state.json"
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
-        return data if isinstance(data, dict) else {}
-
-    def _qq_leaf_paths(document: Any, prefix: str = "") -> list[str]:
-        if isinstance(document, dict):
-            leaves: list[str] = []
-            for key, value in document.items():
-                leaves.extend(_qq_leaf_paths(value, f"{prefix}.{key}" if prefix else str(key)))
-            return leaves
-        if document is None:
-            # 只写了段名没写值（`channels:`）不是配置项，别报成拼错的键。
-            # 显式 null 同理，语义是「这个键交回 .env」。
-            return []
-        return [prefix] if prefix else []
+    # ----- 旧的 QQ 热载配置路由 -----
+    # 控制台和运维脚本还在调这几条，行为与 /v1/platforms/qq/... 完全一致。
+    from . import platform_api
+    from platforms.builtin import QQ_NAPCAT
 
     @router.get("/qq/raw")
     def get_qq_raw() -> dict[str, Any]:
-        p = _qq_config_path()
-        if not p.exists():
-            # 「还没接管」是正常状态，不是错误。刻意不回落到 qq.example.yaml：
-            # 那份是默认值，被当成当前配置保存下去就等于悄悄覆盖 .env 里的设置。
-            return {"content": "", "exists": False}
-        return {"content": p.read_text(encoding="utf-8"), "exists": True}
+        return platform_api.read_config_raw(workspace_root, QQ_NAPCAT)
 
     @router.put("/qq/raw")
     def update_qq_raw(payload: RawContent) -> dict[str, Any]:
-        try:
-            document = yaml.safe_load(payload.content)
-        except yaml.YAMLError as exc:
-            raise HTTPException(status_code=400, detail=f"YAML 解析失败：{exc}") from exc
-        if document is not None and not isinstance(document, dict):
-            raise HTTPException(status_code=400, detail="顶层必须是映射（key: value）")
-
-        warnings: list[str] = []
-        known = _qq_live_state().get("paths")
-        if isinstance(known, dict) and known:
-            unknown = sorted(
-                set(_qq_leaf_paths(document or {})) - set(known.values()) - {"version"}
-            )
-            if unknown:
-                # 无人消费的键改了不会有任何效果，而界面只会显示保存成功。
-                raise HTTPException(status_code=400, detail=f"无人消费的配置项：{unknown}")
-        else:
-            warnings.append("bot 进程未公布配置结构，本次只校验了 YAML 语法")
-
-        p = _qq_config_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        # 同目录 tmp + replace：bot 进程随时在读，读到半截 yaml 等于整份配置塌掉。
-        with eventlog_file_lock(p):
-            tmp = p.with_name(f"{p.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
-            try:
-                tmp.write_text(payload.content, encoding="utf-8")
-                os.replace(tmp, p)
-            finally:
-                tmp.unlink(missing_ok=True)
-        return {"ok": True, "warnings": warnings}
+        return platform_api.write_config_raw(workspace_root, QQ_NAPCAT, payload.content)
 
     @router.get("/qq/state")
     def get_qq_state() -> dict[str, Any]:
-        state = _qq_live_state()
-        p = _qq_config_path()
-        try:
-            st = p.stat()
-            fingerprint = {"exists": True, "mtime_ns": st.st_mtime_ns, "size": st.st_size}
-        except OSError:
-            fingerprint = {"exists": False, "mtime_ns": 0, "size": 0}
-        if not state:
-            return {
-                "published": False,
-                "reason": "bot 进程尚未公布生效配置（未启动，或还没跑完第一轮对齐）",
-                "file": fingerprint,
-            }
-        age_sec = max(0.0, time.time() - float(state.get("published_at") or 0.0))
-        return {
-            "published": True,
-            "age_sec": round(age_sec, 3),
-            # bot 至少每 30s 重写一次，这里留三倍余量再判定失联。
-            "stale": age_sec > 90.0,
-            # 「已生效」的判据是 bot 跑着的那份值确实来自当前这个文件版本。
-            # 不能拿 state["file"] 比 —— 那是 bot 看到的文件指纹，文件写坏时它照样等于
-            # 当前文件，而 bot 用的还是上一份配置。
-            "applied": state.get("loaded") == fingerprint,
-            "file": fingerprint,
-            "state": state,
-        }
+        return platform_api.config_state(workspace_root, QQ_NAPCAT)
 
     @router.post("/qq/trigger/dry-run")
     def qq_trigger_dry_run(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        """把一批模拟消息过一遍真实判定。
-
-        config 省略时用 bot 公布的生效值 —— 「试听当前配置」不该要求调用方自己拼一份，
-        拼出来的那份和 bot 跑着的不一样就等于试听骗人。
-        """
-        messages = payload.get("messages")
-        if not isinstance(messages, list):
-            raise HTTPException(status_code=400, detail="messages 必须是数组")
-        if len(messages) > 200:
-            raise HTTPException(status_code=400, detail="一次最多 200 条")
-
-        values = payload.get("config")
-        if not isinstance(values, dict):
-            values = _qq_live_state().get("values")
-        if not isinstance(values, dict) or not values:
-            raise HTTPException(
-                status_code=409,
-                detail="bot 进程尚未公布生效配置，请显式传 config 后再试听",
-            )
-        try:
-            return qq_trigger.dry_run(
-                messages, values,
-                apply_cooldown=payload.get("cooldown", True) is not False,
-            )
-        except (AttributeError, KeyError, TypeError, ValueError) as exc:
-            # 缺键/类型不对最可能来自调用方自拼的 config，这是 400 不是 500。
-            raise HTTPException(status_code=400, detail=f"配置不完整或类型不对：{exc}") from exc
+        return platform_api.trigger_dry_run(workspace_root, QQ_NAPCAT, payload)
 
     # ----- Policy -----
     @router.get("/policy/raw")

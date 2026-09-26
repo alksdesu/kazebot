@@ -675,9 +675,11 @@ DERIVED_NAMES: tuple[str, ...] = ("trigger_prefixes_strippable", "group_trigger_
 # ── 加载 ───────────────────────────────────
 
 def config_path() -> Path:
-    """config/qq.yaml 的位置。env 覆盖只为测试与非常规部署留口子。"""
-    from clonoth_runtime import qq_config_path
-    return qq_config_path(Path(CLONOTH_WORKSPACE))
+    """平台配置文件的位置，由平台描述声明。env 覆盖只为测试与非常规部署留口子。"""
+    from platforms.builtin import QQ_NAPCAT
+    from platforms.registry import required_config_path
+
+    return required_config_path(QQ_NAPCAT, Path(CLONOTH_WORKSPACE))
 
 
 @dataclass

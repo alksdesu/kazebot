@@ -2,6 +2,7 @@
 
 换盐（deploy/migrate_qq_conversation_hash.py）和换 bot 账号共用这一套：摘要怎么算由
 调用方给的 restable 决定，本模块只负责「算出新旧对照，然后一样不落地搬过去」。
+路由状态文件和附件目录前缀由平台描述给出。
 """
 from __future__ import annotations
 
@@ -16,10 +17,15 @@ from typing import Callable
 
 import engine.memory_hit_cache as hit_cache
 from engine.eventlog_rotation import eventlog_file_lock
+from platforms.descriptor import STATE_ROUTES, PlatformDescriptor
+from platforms.registry import platform_state_path
 
 HIT_KEY_SEP = "/"
-# _stable_conversation_key 的三种 prefix 把 ":" 换成 "_" 就是附件目录名。
-ATTACHMENT_DIR_PREFIXES = ("qq_group_", "qq_private_", "qq_unknown_")
+
+
+def attachment_dir_prefixes(platform: PlatformDescriptor) -> tuple[str, ...]:
+    """摘要型会话键把 ":" 换成 "_" 就是附件目录名。"""
+    return tuple(f"{channel.name}_" for channel in platform.channels if channel.hashed)
 
 
 def namespace_dir(stable_key: str) -> str:
@@ -64,8 +70,11 @@ class MigrationOutcome:
     backup_dir: Path | None = None
 
 
-def route_state_file(workspace: Path) -> Path:
-    return Path(workspace) / "data" / "onebot_plugin_state.json"
+def route_state_file(workspace: Path, platform: PlatformDescriptor) -> Path:
+    path = platform_state_path(platform, STATE_ROUTES, workspace)
+    if path is None:
+        raise LookupError(f"platform {platform.id!r} keeps no route state")
+    return path
 
 
 def memory_root(workspace: Path) -> Path:
@@ -86,14 +95,16 @@ def load_route_map(route_state: Path) -> dict[str, str]:
     return {str(k): str(v) for k, v in real_map.items() if str(k) and str(v)}
 
 
-def plan_migration(*, workspace: Path, restable: Callable[[str, str], str]) -> MigrationPlan:
+def plan_migration(
+    *, workspace: Path, platform: PlatformDescriptor, restable: Callable[[str, str], str],
+) -> MigrationPlan:
     """算出新旧对照。restable 收 (old_stable, real) 返回新的 stable key。"""
     workspace = Path(workspace)
     root = memory_root(workspace)
     plan = MigrationPlan()
     known: set[str] = set()
 
-    for old_stable, real in load_route_map(route_state_file(workspace)).items():
+    for old_stable, real in load_route_map(route_state_file(workspace, platform)).items():
         new_stable = restable(old_stable, real)
         old_ns = namespace_dir(old_stable)
         new_ns = namespace_dir(new_stable)
@@ -127,11 +138,11 @@ def fresh_backup_dir(workspace: Path) -> Path:
     return candidate
 
 
-def backup(*, workspace: Path, backup_dir: Path, plan: MigrationPlan) -> None:
+def backup(*, workspace: Path, platform: PlatformDescriptor, backup_dir: Path, plan: MigrationPlan) -> None:
     """备份要被改名的记忆目录，以及会被原地重写的几个状态文件。"""
     workspace = Path(workspace)
     backup_dir.mkdir(parents=True, exist_ok=False)
-    for path in (route_state_file(workspace), hit_cache.hit_cache_path(workspace),
+    for path in (route_state_file(workspace, platform), hit_cache.hit_cache_path(workspace),
                  workspace / "data" / "sessions.json"):
         if path.exists():
             shutil.copy2(path, backup_dir / path.name)
@@ -143,7 +154,7 @@ def backup(*, workspace: Path, backup_dir: Path, plan: MigrationPlan) -> None:
 
 
 def apply_migration(
-    *, workspace: Path, plan: MigrationPlan,
+    *, workspace: Path, platform: PlatformDescriptor, plan: MigrationPlan,
     move_attachments: bool = False, rewrite_sessions: bool = False,
     make_backup: bool = True,
 ) -> MigrationOutcome:
@@ -155,7 +166,7 @@ def apply_migration(
 
     if make_backup:
         outcome.backup_dir = fresh_backup_dir(workspace)
-        backup(workspace=workspace, backup_dir=outcome.backup_dir, plan=plan)
+        backup(workspace=workspace, platform=platform, backup_dir=outcome.backup_dir, plan=plan)
 
     root = memory_root(workspace)
     ns_renames: dict[str, str] = {}
@@ -172,9 +183,9 @@ def apply_migration(
 
     outcome.hit_keys_rewritten = _rewrite_hit_cache(workspace, ns_renames)
     remap = {r.old_stable: r.new_stable for r in plan.changed}
-    outcome.route_keys_changed = _rewrite_route_state(route_state_file(workspace), remap)
+    outcome.route_keys_changed = _rewrite_route_state(route_state_file(workspace, platform), remap)
     if move_attachments:
-        outcome.moved_attachment_dirs = _move_attachment_dirs(workspace, remap)
+        outcome.moved_attachment_dirs = _move_attachment_dirs(workspace, remap, attachment_dir_prefixes(platform))
     if rewrite_sessions:
         outcome.sessions_changed = _rewrite_sessions(workspace, remap)
     return outcome
@@ -270,7 +281,9 @@ def _rewrite_sessions(workspace: Path, remap: dict[str, str]) -> int:
     return changed
 
 
-def _move_attachment_dirs(workspace: Path, remap: dict[str, str]) -> list[tuple[str, str]]:
+def _move_attachment_dirs(
+    workspace: Path, remap: dict[str, str], prefixes: tuple[str, ...],
+) -> list[tuple[str, str]]:
     """会话附件目录按 stable key 命名，不搬的话历史里的图片路径全部指空。"""
     root = Path(workspace) / "data" / "attachments"
     if not root.is_dir():
@@ -279,7 +292,7 @@ def _move_attachment_dirs(workspace: Path, remap: dict[str, str]) -> list[tuple[
     for old_key, new_key in remap.items():
         old_name = old_key.replace(":", "_")
         new_name = new_key.replace(":", "_")
-        if not old_name.startswith(ATTACHMENT_DIR_PREFIXES):
+        if not old_name.startswith(prefixes):
             continue
         src, dst = root / old_name, root / new_name
         if not src.is_dir() or dst.exists():

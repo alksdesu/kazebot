@@ -18,6 +18,7 @@ if str(_ROOT) not in sys.path:
 
 # 摘要算法必须与运行时同一份，所以直接用适配器的模块。
 from adapters.onebot import conversation_hash as _conversation_hash  # noqa: E402
+from platforms.builtin import QQ_NAPCAT  # noqa: E402
 
 digest = _conversation_hash.digest
 LEGACY_MARKER = _conversation_hash.LEGACY_MARKER
@@ -91,6 +92,7 @@ def run_migration(
 
     plan = plan_migration(
         workspace=workspace,
+        platform=QQ_NAPCAT,
         restable=lambda old_stable, real: (
             f"{old_stable.split(':', 1)[0]}:{digest(real, report.target_secret)}"
         ),
@@ -102,7 +104,7 @@ def run_migration(
     if not apply:
         return report
 
-    outcome = apply_migration(workspace=workspace, plan=plan)
+    outcome = apply_migration(workspace=workspace, platform=QQ_NAPCAT, plan=plan)
     report.moved_dirs = outcome.moved_dirs
     report.skipped_target_exists = outcome.skipped_target_exists
     report.hit_keys_rewritten = outcome.hit_keys_rewritten

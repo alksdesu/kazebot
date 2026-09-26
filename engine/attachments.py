@@ -81,6 +81,47 @@ def _guess_mime_from_path(path: str) -> str:
     return _MIME_MAP.get(ext, "image/png")
 
 
+# 任何配置都解不开这些：转发出去就是在给恶意软件当中转站。
+BLOCKED_FILE_EXTENSIONS: frozenset[str] = frozenset({
+    "exe", "com", "scr", "bat", "cmd", "pif", "ps1", "psm1", "psd1", "vbs", "vbe",
+    "js", "jse", "wsf", "wsh", "hta", "msi", "msp", "mst", "cpl", "reg", "lnk", "url",
+    "dll", "sys", "ocx", "drv", "apk", "jar", "iso", "img", "vhd", "vhdx", "efi",
+    "elf", "so", "dylib",
+})
+
+# 原生可执行文件的文件头。OLE2（d0cf11e0）故意不在里面：老式 .doc/.xls 也用它。
+_EXECUTABLE_MAGIC: tuple[bytes, ...] = (
+    b"MZ", b"\x7fELF", b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",
+    b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe",
+    b"L\x00\x00\x00\x01\x14\x02\x00",
+)
+
+
+def normalize_extension(name: str) -> str:
+    """Trailing extension of a file name, lowercase and without the dot."""
+    return Path(str(name or "")).suffix.lower().lstrip(".")
+
+
+def looks_like_executable(content: bytes) -> bool:
+    """True when the header is a native executable or a Windows shortcut."""
+    head = bytes(content[:8])
+    return any(head.startswith(magic) for magic in _EXECUTABLE_MAGIC)
+
+
+def blocked_file_reject_reason(name: str, content: bytes = b"") -> str:
+    """The always-refused half of every upload gate: blocked extension or executable header.
+
+    Any layer may apply it. The Supervisor's generic upload endpoint enforces only this half;
+    platform inbound gates add their own allow-list on top.
+    Codes: "unsupported_type", "executable_content".
+    """
+    if normalize_extension(name) in BLOCKED_FILE_EXTENSIONS:
+        return "unsupported_type"
+    if looks_like_executable(content):
+        return "executable_content"
+    return ""
+
+
 def sniff_image_mime(content: bytes) -> str:
     """Return the image MIME implied by the file header, or "" when it is not a supported image."""
     # Magic numbers only: a mislabeled upload (PDF sent as an image segment) must not reach

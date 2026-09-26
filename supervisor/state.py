@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 from ._helpers import SessionInfo, _now
 from .branch_finalize_store import BranchFinalizeClaimStore
 from .compact_breaker import CompactBreaker
-from .qq_intent import IntentRegistry
+from .reply_intent import IntentRegistry
 from .eventlog import EventLog, SYSTEM_SESSION_ID
 from engine.builtin.loader import auto_discover_and_register
 from engine.hooks import HookRegistry
@@ -105,7 +105,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self.session_last_entry_node: dict[str, str] = {}  # session_id -> last used entry node
         self._session_context_usage: dict[str, dict[str, Any]] = {}  # session_id -> latest usage
         self.compact_breaker = CompactBreaker()
-        self.qq_intent = IntentRegistry()
+        self.reply_intent = IntentRegistry()
         self._engine_generations: dict[str, str] = {}  # worker_id -> generation_id (Direction 2)
         self._pending_restart_notify: str | None = None  # session_id to notify after engine registers
 
