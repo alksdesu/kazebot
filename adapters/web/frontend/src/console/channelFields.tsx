@@ -124,7 +124,7 @@ export const FieldRow = ({ label, children }: { label: string; children: ReactNo
 /**
  * 模型名一行：手填 + 从上游拉真实列表。
  *
- * 拉取用的是页面上当前的地址和密钥，不是存盘的那份 —— 改完还没保存时也要能试。
+ * 拉取用的是页面上当前的地址和密钥，不是已保存的那份 —— 改完还没保存时也要能试。
  * 密钥留空表示沿用已存的，后端自己去取，明文不用往回传。
  */
 export const ModelField = ({
@@ -194,7 +194,7 @@ export const ModelField = ({
           title="用当前填的地址和密钥问上游要模型列表"
           tone="quiet"
         >
-          {busy ? '拉取中' : '拉取'}
+          {busy ? '正在拉取…' : '拉取'}
         </Button>
       </FieldRow>
       {note && <ChanNote>{note}</ChanNote>}

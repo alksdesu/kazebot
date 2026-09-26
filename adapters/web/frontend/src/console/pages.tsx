@@ -59,7 +59,7 @@ export const QQ_PAGES: QqPageDefinition[] = [
     label: '人格',
     icon: 'draft',
     Page: PersonaPage,
-    note: 'bot 是谁、能做什么。上半页写的是节点文件，各自存盘；下半页走 qq.yaml，改完点顶部的应用。',
+    note: 'bot 是谁、能做什么。上半页写的是节点文件，每块自己保存；下半页走 qq.yaml，改完点顶部的应用。',
   },
   {
     id: 'qq-memory',
@@ -67,14 +67,14 @@ export const QQ_PAGES: QqPageDefinition[] = [
     icon: 'psychology',
     Page: MemoryPage,
     standalone: true,
-    note: 'bot 记住了什么、每个会话攒了多少上下文。改动直接落盘，不用点应用。',
+    note: 'bot 记住了什么、每个会话攒了多少上下文。改动立即写入，不用点应用。',
   },
   {
     id: 'qq-stickers',
     label: '表情包',
     icon: 'photo_library',
     Page: StickersPage,
-    note: 'bot 能发哪些表情包。群里收来的先进待审，人工转正之后才进候选。看图渠道决定图能不能被打上标签，这一块自己存盘；底部的收集设置走 qq.yaml，改完点应用。',
+    note: 'bot 能发哪些表情包。群里收来的先进待审，人工转正之后才进候选。图库的改动每块自己保存；底部的收集设置走 qq.yaml，改完点顶部的应用。',
   },
   {
     id: 'qq-link',

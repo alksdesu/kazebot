@@ -1,5 +1,5 @@
-// 人格。这一页有两套保存路径：人设和模型各自就地存盘，
-// 下半页的开关走 qq.yaml，由顶部那个「应用」统一提交。
+// 人格。这一页有两套写入路径：人设和模型各自就地保存，
+// 下半页的开关走 qq.yaml，由顶部那个「应用」统一写入。
 import { useEffect, useId, useState } from 'react';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
@@ -39,7 +39,7 @@ const PERSONA_FILE = '_persona.md';
 
 const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');
 
-/** 一块独立存盘的区域共用的底栏。草稿在这一块自己手里，不进顶部的「N 项待应用」。 */
+/** 一块独立保存的区域共用的底栏。草稿在这一块自己手里，不进顶部的「N 项待应用」。 */
 const Persona = () => {
   const token = useSettingsStore(state => state.adminToken);
   return <PersonaEditor key={token || ""} />;
@@ -54,7 +54,7 @@ const PersonaEditor = () => {
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [note, setNote] = useState('正在读取…');
-  const confirmDiscard = useUnsavedChanges(text !== saved, '人设有未保存修改，确定离开或还原吗？');
+  const confirmDiscard = useUnsavedChanges(text !== saved, '人设有未保存修改，确定离开或丢弃吗？');
 
   useEffect(() => {
     if (!token) return;
@@ -113,6 +113,7 @@ const PersonaEditor = () => {
       <SaveBar
         busy={busy}
         dirty={loaded && text !== saved}
+        label="保存人设"
         note={note}
         onReset={() => { if (confirmDiscard()) setText(saved); }}
         onSave={() => void save()}
@@ -163,7 +164,7 @@ const ModelChoiceEditor = () => {
   }, [token]);
 
   const dirty = model !== (raw ? readYamlScalar(raw, ['model']) : '');
-  const confirmDiscard = useUnsavedChanges(dirty, '节点模型还有未保存修改，确定离开或还原吗？');
+  const confirmDiscard = useUnsavedChanges(dirty, '节点模型还有未保存修改，确定离开或丢弃吗？');
 
   const save = async () => {
     if (!token || !raw || busy) return;
@@ -203,7 +204,7 @@ const ModelChoiceEditor = () => {
         任意模型 id 都能填；也可以写 <code>$ENV{'{VAR}'}</code>，从环境变量取。
       </Facts>
 
-      <SaveBar busy={busy} dirty={dirty && Boolean(raw)} note={note} onReset={() => { if (confirmDiscard()) adopt(raw); }} onSave={() => void save()} />
+      <SaveBar busy={busy} dirty={dirty && Boolean(raw)} label="保存模型" note={note} onReset={() => { if (confirmDiscard()) adopt(raw); }} onSave={() => void save()} />
     </>
   );
 };
@@ -334,7 +335,7 @@ export const PersonaPage = () => (
     </Block>
 
     <Footnote>
-      上面两块各自存盘，和顶部的「应用」无关 —— 它们写的是节点文件，不是 qq.yaml。
+      上面两块各自保存，和顶部的「应用」无关 —— 它们写的是节点文件，不是 qq.yaml。
       下面三块才走 qq.yaml，改完要点顶部的「应用」。
     </Footnote>
   </>

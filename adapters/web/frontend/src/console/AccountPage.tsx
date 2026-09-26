@@ -91,7 +91,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
   const isCurrent = () => identity.isCurrent() && useSettingsStore.getState().adminToken === token;
   const running = job !== null && !job.finished;
   const locked = busy || running || loading || Boolean(error);
-  useUnsavedChanges(Boolean(newUin || newLabel), '新实例信息尚未提交，切换或离开会丢失这些内容，确定继续吗？');
+  useUnsavedChanges(Boolean(newUin || newLabel), '新实例还没建立，切换或离开会丢失填好的信息，确定继续吗？');
 
   useEffect(() => {
     if (!job || job.finished) return;
@@ -123,7 +123,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
       const plan = await createInstance(token, uin, newLabel.trim());
       if (!isCurrent()) return;
       setNewUin(''); setNewLabel(''); setJobAction('create');
-      setJob({ uin: plan.uin, lines: ['已提交，等 root 侧接手…'], finished: false, ok: false, detail: '' });
+      setJob({ uin: plan.uin, lines: ['已请求建实例，等 root 侧接手…'], finished: false, ok: false, detail: '' });
     } catch (failure) { if (isCurrent()) setNote(say(failure)); }
     finally { mutation.current = false; if (isCurrent()) setBusy(false); }
   };
@@ -139,7 +139,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
       await deleteInstance(token, row.uin);
       if (!isCurrent()) return;
       setJobAction('remove');
-      setJob({ uin: row.uin, lines: ['已提交停服与归档…'], finished: false, ok: false, detail: '' });
+      setJob({ uin: row.uin, lines: ['已请求停服与归档…'], finished: false, ok: false, detail: '' });
     } catch (failure) { if (isCurrent()) setNote(say(failure)); }
     finally { mutation.current = false; if (isCurrent()) setBusy(false); }
   };
@@ -440,7 +440,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
                   className="flex-none"
                   disabled={busy}
                   onClick={() => { setStage('idle'); setQrImage(''); setNote(''); }}
-                  tone="quiet"
+                  tone="halt"
                 >
                   停止等待
                 </Button>

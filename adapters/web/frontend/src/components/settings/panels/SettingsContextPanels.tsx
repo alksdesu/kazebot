@@ -23,6 +23,7 @@ import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore
 import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
 import { YamlEditor } from '../../common';
+import { Button } from '../pages/settingsControls';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import yaml from 'js-yaml';
 
@@ -228,7 +229,7 @@ const AgentsEditor = () => {
   const saveNodeConfig = async () => {
     if (!adminToken || !node || !nodeYamlEditable || nodeYamlSaving) return;
     setNodeYamlSaving(true);
-    setNodeMessage('保存中。');
+    setNodeMessage('正在保存…');
     try {
       // [2026-06-02] Serialize the structured node form into YAML before saving.
       // Why: raw YAML is only an advanced fallback and must not be the primary save
@@ -252,7 +253,7 @@ const AgentsEditor = () => {
   const saveNodeYaml = async () => {
     if (!adminToken || !node || !nodeYamlEditable || nodeYamlSaving) return;
     setNodeYamlSaving(true);
-    setNodeMessage('保存中。');
+    setNodeMessage('正在保存…');
     try {
       // [2026-06-02] Keep a raw YAML fallback inside the advanced details section.
       // Why: uncommon node fields may not have dedicated form controls yet. How: save
@@ -345,15 +346,16 @@ const AgentsEditor = () => {
                       onChange={(event) => updateNodeConfigForm({ model: event.target.value })}
                       value={nodeConfigForm.model}
                     />
-                    <button
-                      className="flex-shrink-0 border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-xs hover:border-[var(--duties-text)] disabled:opacity-50"
+                    <Button
+                      className="flex-shrink-0"
                       disabled={!nodeConfigForm.provider.trim() || fetchingModels}
                       onClick={() => void fetchModels()}
+                      size="sm"
                       title={nodeConfigForm.provider.trim() ? '问这个渠道有哪些模型' : '先选一个渠道'}
-                      type="button"
+                      tone="quiet"
                     >
-                      {fetchingModels ? '拉取中' : '拉取模型'}
-                    </button>
+                      {fetchingModels ? '正在拉取…' : '拉取模型'}
+                    </Button>
                   </div>
                   {modelOptions.length > 0 && (
                     <datalist id={modelListId}>
@@ -385,7 +387,7 @@ const AgentsEditor = () => {
                   工具权限（tool_access）要在下面的高级 YAML 编辑里改。保存这里会重排 YAML
                   并丢掉注释，想保留注释也走那边。
                 </p>
-                <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs hover:border-[var(--duties-text)] disabled:opacity-50" disabled={nodeYamlSaving} onClick={saveNodeConfig} type="button">保存节点配置</button>
+                <Button disabled={nodeYamlSaving} onClick={saveNodeConfig} size="sm">保存节点配置</Button>
                 {nodeMessage && <p className="text-[var(--duties-tertiary)]">{nodeMessage}</p>}
               </div>
               <details className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
@@ -398,7 +400,7 @@ const AgentsEditor = () => {
                       users can recover unsupported fields without reverting the panel
                       to a raw YAML editor. */}
                   <YamlEditor aria-label="节点 YAML 编辑器" height="16rem" onChange={setNodeYaml} value={nodeYaml} />
-                  <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs hover:border-[var(--duties-text)] disabled:opacity-50" disabled={nodeYamlSaving} onClick={saveNodeYaml} type="button">保存 YAML</button>
+                  <Button disabled={nodeYamlSaving} onClick={saveNodeYaml} size="sm">保存 YAML</Button>
                 </div>
               </details>
             </>
@@ -466,7 +468,7 @@ const ToolsEditor = () => {
   const saveToolScript = async () => {
     if (!adminToken || !tool || !toolScriptLoaded || toolScriptSaving || toolReloading) return;
     setToolScriptSaving(true);
-    setToolMessage('保存中。');
+    setToolMessage('正在保存…');
     try {
       // [2026-06-02] Persist edited tool code and notify settings lists.
       // Why: saving from the right rail should update the selected tool file and let
@@ -487,7 +489,7 @@ const ToolsEditor = () => {
   const reloadToolRegistry = async () => {
     if (!adminToken || toolScriptSaving || toolReloading || !confirmToolDiscard()) return;
     setToolReloading(true);
-    setToolMessage('正在重载工具。');
+    setToolMessage('正在重载工具…');
     try {
       // [2026-06-02] Expose tool reload beside the raw script editor.
       // Why: edited Python tools usually need the backend registry to reload before
@@ -539,8 +541,8 @@ const ToolsEditor = () => {
                 value={toolScriptLoading ? '正在加载工具脚本。' : toolScript}
               />
               <div className="flex flex-wrap gap-2">
-                <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs hover:border-[var(--duties-text)] disabled:opacity-50" disabled={!toolScriptLoaded || toolScriptLoading || toolScriptSaving} onClick={saveToolScript} type="button">保存</button>
-                <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs hover:border-[var(--duties-text)] disabled:opacity-50" disabled={!adminToken || toolReloading} onClick={reloadToolRegistry} type="button">重载工具</button>
+                <Button disabled={!toolScriptLoaded || toolScriptLoading || toolScriptSaving} onClick={saveToolScript} size="sm">保存</Button>
+                <Button disabled={!adminToken || toolReloading} onClick={reloadToolRegistry} size="sm" tone="quiet">重载工具</Button>
               </div>
               {toolMessage && <p className="text-[var(--duties-tertiary)]">{toolMessage}</p>}
             </div>
@@ -673,7 +675,7 @@ const SkillsEditor = () => {
   const saveRawMarkdown = async () => {
     if (!adminToken || !skill || !rawMarkdownLoaded || rawMarkdownSaving) return;
     setRawMarkdownSaving(true);
-    setMessage('保存中。');
+    setMessage('正在保存…');
     try {
       // [2026-06-02] Save the complete SKILL.md content from the advanced editor.
       // Why: some skill changes affect body text or complex frontmatter that the quick
@@ -724,7 +726,7 @@ const SkillsEditor = () => {
               </label>
             ))}
           </div>
-          <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs hover:border-[var(--duties-text)]" onClick={save} type="button">保存快捷字段</button>
+          <Button onClick={save} size="sm">保存快捷字段</Button>
           <details className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
             <summary className="cursor-pointer font-mono text-xs font-semibold text-[var(--duties-tertiary)]">Raw Markdown 编辑（高级）</summary>
             <div className="mt-3 space-y-2">
@@ -747,7 +749,7 @@ const SkillsEditor = () => {
                   value={rawMarkdown}
                 />
               )}
-              <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs hover:border-[var(--duties-text)] disabled:opacity-50" disabled={!rawMarkdownLoaded || rawMarkdownLoading || rawMarkdownSaving} onClick={saveRawMarkdown} type="button">保存 Raw Markdown</button>
+              <Button disabled={!rawMarkdownLoaded || rawMarkdownLoading || rawMarkdownSaving} onClick={saveRawMarkdown} size="sm">保存 Raw Markdown</Button>
             </div>
           </details>
           {message && <p className="text-[var(--duties-tertiary)]">{message}</p>}
@@ -759,7 +761,6 @@ const SkillsEditor = () => {
 
 const fieldClass = 'w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-xs';
 const labelClass = 'block mb-1 text-[var(--duties-tertiary)] text-xs';
-const buttonClass = 'border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-xs hover:border-[var(--duties-text)] disabled:opacity-50';
 
 function displayEnvText(envText: string): string {
   // [2026-06-02] Convert parsed MCP env rows from object style to KEY=VALUE rows.
@@ -847,7 +848,7 @@ const McpEditor = () => {
   const save = async () => {
     if (!adminToken || !client || !form || saving) return;
     setSaving(true);
-    setMessage('保存中。');
+    setMessage('正在保存…');
     try {
       // [2026-06-02] Save one MCP client by replacing it inside the parsed raw list.
       // Why: the backend stores one YAML file, so saving a single form must preserve
@@ -926,7 +927,7 @@ const McpEditor = () => {
               </label>
             </div>
           )}
-          <button className={buttonClass} disabled={saving} onClick={save} type="button">保存</button>
+          <Button disabled={saving} onClick={save} size="sm">保存</Button>
           {message && <p className="text-[var(--duties-tertiary)]">{message}</p>}
         </div>
       )}
@@ -986,7 +987,7 @@ const AutomationEditor = () => {
   const save = async () => {
     if (!adminToken || !selectedScheduleId || !form || saving) return;
     setSaving(true);
-    setMessage('保存中。');
+    setMessage('正在保存…');
     try {
       // [2026-06-02] Save one automation schedule inside the raw YAML list.
       // Why: schedules.yaml contains multiple tasks and the selected form should not
@@ -1071,7 +1072,7 @@ const AutomationEditor = () => {
               ))}
             </div>
           </details>
-          <button className={buttonClass} disabled={saving} onClick={save} type="button">保存</button>
+          <Button disabled={saving} onClick={save} size="sm">保存</Button>
           {message && <p className="text-[var(--duties-tertiary)]">{message}</p>}
         </div>
       )}

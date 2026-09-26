@@ -12,6 +12,7 @@ import {
   updateNodeRaw,
   type DrawtoolsBundle,
 } from '../../../api/supervisorClient';
+import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { Button } from '../../common';
 import { Block, Field, Input, PageShell, Select, StatusText } from './settingsControls';
@@ -201,6 +202,10 @@ export const DrawtoolsSettingsPage = () => {
 
   useEffect(() => { void load(); }, [adminToken, isAuthenticated]);
 
+  const sourceText = section === 'node' ? nodeRaw : getSectionContent(bundle, section);
+  const editorDirty = bundle !== null && editor !== sourceText;
+  const confirmDiscard = useUnsavedChanges(editorDirty, '绘图的「原始配置编辑器」还有未保存修改，确定离开或丢弃吗？');
+
   useEffect(() => {
     setEditor(section === 'node' ? nodeRaw : getSectionContent(bundle, section));
   }, [bundle, nodeRaw, section]);
@@ -230,8 +235,9 @@ export const DrawtoolsSettingsPage = () => {
     }
   };
 
+  // 结构化字段是 onBlur 直写，写完 load() 会把原始编辑器重置掉 —— 有草稿时先问一声。
   const saveSettingsObject = async (next: any, okText: string) => {
-    if (!adminToken) return;
+    if (!adminToken || !confirmDiscard()) return;
     try {
       await updateDrawtoolsSettingsRaw(adminToken, stringifyYaml(next));
       setMessage(okText);
@@ -242,7 +248,7 @@ export const DrawtoolsSettingsPage = () => {
   };
 
   const saveCharacterObject = async (next: any, okText: string) => {
-    if (!adminToken) return;
+    if (!adminToken || !confirmDiscard()) return;
     try {
       await updateDrawtoolsCharactersRaw(adminToken, stringifyYaml(next));
       setMessage(okText);
@@ -274,6 +280,7 @@ export const DrawtoolsSettingsPage = () => {
 
   const runCleanup = async () => {
     if (!adminToken) return;
+    if (!window.confirm('立即清理 data/attachments/novelai？过期文件会被删除，超出容量上限时还会删掉最旧的那些。')) return;
     try {
       const result = await cleanupDrawtoolsAttachments(adminToken);
       setMessage(`清理完成：删除 ${result.deleted_count ?? 0} 个文件，释放 ${result.deleted_mb ?? 0} MB；剩余 ${result.remaining_count ?? 0} 个文件 / ${result.remaining_mb ?? 0} MB`);
@@ -425,6 +432,7 @@ export const DrawtoolsSettingsPage = () => {
   };
 
   const deleteCharacterOutfit = (characterIndex: number, outfitIndex: number) => {
+    if (!window.confirm('删除这套服装？角色的其它标签不受影响。')) return;
     const next = makeCharacterObject();
     if (!next.characters[characterIndex]) return;
     const outfits = normalizeCharacterOutfits(next.characters[characterIndex].outfits);
@@ -448,7 +456,7 @@ export const DrawtoolsSettingsPage = () => {
       <>
         <Block frame="boxed" title="运行期配置" hint="用户配置写入 settings.yaml / character_tags.yaml / prompt .md；仓库更新只维护 .example。">
           <div className="flex flex-wrap gap-2">
-            <Button disabled={loading} onClick={load}>{loading ? '加载中...' : '刷新'}</Button>
+            <Button disabled={loading} onClick={load}>{loading ? '正在刷新…' : '刷新'}</Button>
             <Button onClick={initConfigs} variant="primary">从 Example 初始化用户配置</Button>
           </div>
           <StatusText message={message} />
@@ -467,7 +475,7 @@ export const DrawtoolsSettingsPage = () => {
               </Field>
             </div>
             <div className="md:col-span-2">
-              <Field label="API Key（可选，不推荐提交到仓库）" layout="stacked">
+              <Field label="API Key（可选，不建议写进仓库）" layout="stacked">
                 <Input width="wide" defaultValue={String(api.api_key || '')} onBlur={(event) => updateApiField('api_key', event.currentTarget.value)} placeholder="留空则使用环境变量" type="password" />
               </Field>
             </div>
@@ -516,7 +524,7 @@ export const DrawtoolsSettingsPage = () => {
               </Field>
             </div>
           </div>
-          <Button className="mt-3" onClick={runCleanup}>立即清理</Button>
+          <Button className="mt-3" onClick={runCleanup} variant="danger">立即清理</Button>
         </Block>
 
         <Block frame="boxed" title="画师串 / 预设" hint="绘图节点只看见预设名称，具体参数由工具层自动拼接。">
@@ -783,8 +791,8 @@ export const DrawtoolsSettingsPage = () => {
             value={editor}
           />
           <div className="mt-3 flex flex-wrap gap-2">
-            <Button onClick={saveCurrent} variant="primary">保存当前文件</Button>
-            <Button onClick={() => setEditor(section === 'node' ? nodeRaw : getSectionContent(bundle, section))}>撤销未保存修改</Button>
+            <Button disabled={!editorDirty} onClick={saveCurrent} variant="primary">保存当前文件</Button>
+            <Button disabled={!editorDirty} onClick={() => setEditor(sourceText)}>丢弃</Button>
           </div>
         </Block>
       </>

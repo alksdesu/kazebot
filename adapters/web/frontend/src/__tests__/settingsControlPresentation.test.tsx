@@ -25,7 +25,7 @@ describe('设置共享控件的可读与交互样式合同', () => {
   });
   it('保存忙态与禁用分段继续阻止操作，复选框保持原有事件语义', () => {
     const action = vi.fn(); render(<><SaveBar busy dirty note="正在提交" onSave={action} onReset={action} /><Segmented disabled choices={[[ 'one', '一档' ]]} value="one" onPick={action} /><Check checked={false} onChange={action}>使用默认值</Check></>);
-    fireEvent.click(screen.getByRole('button', { name: '保存中…' })); fireEvent.click(screen.getByRole('button', { name: '还原' })); fireEvent.click(screen.getByRole('button', { name: '一档' })); expect(action).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '正在保存…' })); fireEvent.click(screen.getByRole('button', { name: '丢弃' })); fireEvent.click(screen.getByRole('button', { name: '一档' })); expect(action).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('checkbox', { name: '使用默认值' })); expect(action).toHaveBeenCalledWith(true);
   });
   it('栅格最小宽度不超过容器，分段按完整词换行而不是缩字', () => {

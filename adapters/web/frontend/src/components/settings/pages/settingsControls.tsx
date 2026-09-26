@@ -26,15 +26,17 @@ export const ScopeBadge = ({ scope }: { scope: SettingScope }) => (
 export type BlockFrame = 'ruled' | 'boxed';
 
 /** 区块：一段带标题的设置。ruled 标题下压一条线，boxed 整段套框，选哪种看它要不要从页面里凸出来。 */
-export const Block = ({ children, frame = 'ruled', hint, scope, title }: {
+export const Block = ({ children, frame = 'ruled', hint, id, scope, title }: {
   children: ReactNode;
   frame?: BlockFrame;
   hint?: string;
+  /** 深链锚点。别处链过来要能直接滚到这一块。 */
+  id?: string;
   scope?: SettingScope;
   title?: string;
 }) => (
   frame === 'boxed' ? (
-    <section className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
+    <section className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4" id={id}>
       {(title || hint) && (
         <div className="mb-3">
           {title && (
@@ -49,7 +51,7 @@ export const Block = ({ children, frame = 'ruled', hint, scope, title }: {
       {children}
     </section>
   ) : (
-    <section className="mb-8">
+    <section className="mb-8" id={id}>
       <div className="mb-4 flex flex-wrap items-baseline gap-x-2.5 gap-y-1 border-b border-[var(--duties-border)] pb-2">
         {title && <h2 className="m-0 text-base font-semibold">{title}</h2>}
         {hint && <span className={`text-xs ${MUTED}`}>{hint}</span>}
@@ -360,11 +362,12 @@ export const ReadOnlyRow = ({ hint, name, value }: { hint?: string; name: string
 export type ButtonTone = 'solid' | 'quiet' | 'halt' | 'danger';
 export type ButtonSize = 'default' | 'sm';
 
+// 一个保存范围只给一个 solid；丢弃、取消用 quiet；删除、清空、重启用 danger 并二次确认；
+// halt 只留给「停掉正在进行的事」。强调色不做按钮色，它只表示判定为真或已生效。
 const TONE: Record<ButtonTone, string> = {
   solid: 'border-[var(--duties-text)] bg-[var(--duties-text)] text-[var(--duties-bg)]',
   quiet: 'border-[var(--duties-border)] bg-transparent text-[var(--duties-text)] hover:border-[var(--duties-text)]',
   halt: 'border-[var(--duties-danger)] bg-[var(--duties-danger)] text-[var(--duties-bg)]',
-  // 描边红：破坏性但还没确认的那一步。确认之后才换成实心的 halt。
   danger: 'border-[var(--duties-danger-border)] bg-[var(--duties-danger-bg)] text-[var(--duties-danger)] hover:bg-[var(--duties-danger-hover)]',
 };
 
@@ -427,11 +430,11 @@ export const DangerPanel = ({ children }: { children: ReactNode }) => (
   </div>
 );
 
-/** 自管存盘的页面用：写的是节点文件或 runtime.yaml，不走顶部那条 qq.yaml 状态条。 */
+/** 区块自己保存时用：写的是节点文件或 runtime.yaml，改完立即生效，不走顶部那条 qq.yaml 状态条。 */
 export const SaveBar = ({ busy, dirty, label = '保存', note, onReset, onSave }: {
   busy: boolean;
   dirty: boolean;
-  // 一页上有两块各自存盘时，两个都叫「保存」就分不清存的是哪一块。
+  // 一页上有两块各自保存时，两个都叫「保存」就分不清写的是哪一块。
   label?: string;
   note: string;
   onReset: () => void;
@@ -440,8 +443,8 @@ export const SaveBar = ({ busy, dirty, label = '保存', note, onReset, onSave }
   <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-[var(--duties-border)] pt-3">
     <span className={`text-xs ${MUTED}`}>{note}</span>
     <span className="flex-1" />
-    <Button disabled={!dirty || busy} onClick={onReset} tone="quiet">还原</Button>
-    <Button disabled={!dirty || busy} onClick={onSave}>{busy ? '保存中…' : label}</Button>
+    <Button disabled={!dirty || busy} onClick={onReset} tone="quiet">丢弃</Button>
+    <Button disabled={!dirty || busy} onClick={onSave}>{busy ? '正在保存…' : label}</Button>
   </div>
 );
 

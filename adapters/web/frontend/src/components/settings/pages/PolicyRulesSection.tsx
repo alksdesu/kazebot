@@ -8,9 +8,10 @@ import {
   type PolicyDoc,
   type PolicyRule,
 } from '../../../api/supervisorClient';
+import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { firstMatchIndex } from '../../../utils/globMatch';
-import { ScopeBadge } from './settingsControls';
+import { SaveBar, ScopeBadge } from './settingsControls';
 
 type RuleSectionKey = 'read_file' | 'write_file';
 type TabKey = RuleSectionKey | 'execute_command' | 'restart';
@@ -444,6 +445,7 @@ export const PolicyRulesSection = () => {
   }, [adminToken, isAuthenticated]);
 
   const dirty = Boolean(doc) && JSON.stringify(doc) !== saved;
+  const confirmDiscard = useUnsavedChanges(dirty, '「服务端策略」还有未保存修改，确定离开或丢弃吗？');
 
   const save = async () => {
     if (!doc || !adminToken) return;
@@ -553,27 +555,14 @@ export const PolicyRulesSection = () => {
             </div>
           )}
 
-          <div className="flex items-center gap-2 border-t border-[var(--duties-border)] pt-3">
-            <span className="min-w-0 flex-1 truncate text-mini text-[var(--duties-tertiary)]">
-              {message || (dirty ? '有未保存的改动' : '与服务器一致')}
-            </span>
-            <button
-              className={GHOST_BUTTON_CLASS}
-              disabled={!dirty || busy}
-              onClick={() => { if (saved) { setDoc(JSON.parse(saved) as PolicyDoc); setMessage(''); } }}
-              type="button"
-            >
-              还原
-            </button>
-            <button
-              className="border border-[var(--duties-text)] bg-[var(--duties-text)] px-2.5 py-1 font-mono text-mini text-[var(--duties-bg)] transition-opacity hover:opacity-80 disabled:opacity-40"
-              disabled={!dirty || busy}
-              onClick={() => void save()}
-              type="button"
-            >
-              {busy ? '保存中' : '保存策略'}
-            </button>
-          </div>
+          <SaveBar
+            busy={busy}
+            dirty={dirty}
+            label="保存策略"
+            note={message || (dirty ? '有未保存的改动' : '与服务器一致')}
+            onReset={() => { if (saved && confirmDiscard()) { setDoc(JSON.parse(saved) as PolicyDoc); setMessage(''); } }}
+            onSave={() => void save()}
+          />
         </div>
       )}
     </section>

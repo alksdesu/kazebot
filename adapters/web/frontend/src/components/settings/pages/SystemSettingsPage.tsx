@@ -101,7 +101,7 @@ export const SystemSettingsPage = () => {
     try {
       const result = await restartEngine(adminToken);
       // scheduled=false 表示 supervisor 手上没有 engine 进程可重启，报成功会让人白等。
-      report(result?.scheduled === false ? '未能重启：调度器没有在管理引擎进程' : '已提交重启请求');
+      report(result?.scheduled === false ? '未能重启：调度器没有在管理引擎进程' : '已请求重启引擎');
     } catch (error) {
       report(error instanceof Error ? error.message : '重启失败');
     }
@@ -120,7 +120,7 @@ export const SystemSettingsPage = () => {
             <p><span className="text-[var(--duties-tertiary)]">Engine worker：</span><span className="font-mono">{engineInfo}</span></p>
           </div>
           <div className="mt-3 flex flex-wrap gap-2">
-            <Button disabled={loading || busy} onClick={() => load()}>{loading ? '刷新中...' : '刷新状态'}</Button>
+            <Button disabled={loading || busy} onClick={() => load()}>{loading ? '正在刷新…' : '刷新状态'}</Button>
           </div>
         </Block>
 

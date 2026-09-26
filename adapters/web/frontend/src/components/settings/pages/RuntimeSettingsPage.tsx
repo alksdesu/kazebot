@@ -77,7 +77,7 @@ const GaveUpNotice = ({ workers, busy, onRetry }: {
         {workers.map(([name]) => name).join('、')} 起不来，已停止重试
       </h2>
       <span className="flex-1" />
-      <Button disabled={busy} onClick={onRetry} tone="halt">{busy ? '重试中…' : '手动重试'}</Button>
+      <Button disabled={busy} onClick={onRetry} tone="quiet">{busy ? '正在重试…' : '手动重试'}</Button>
     </div>
     {workers.map(([name, health]) => (
       <div key={name} className="mt-3">
@@ -164,7 +164,7 @@ const LogViewer = ({ token }: { token: string }) => {
               <span className="truncate font-mono text-xs">{picked}</span>
               <span className="flex-1" />
               <Button disabled={busy} onClick={() => void loadTail(picked)} tone="quiet">
-                {busy ? '读取中…' : '刷新'}
+                {busy ? '正在刷新…' : '刷新'}
               </Button>
             </div>
             <pre

@@ -140,8 +140,8 @@ const NodeFilesSettingsPageEditor = () => {
           value={content}
         />
         <div className="mt-3 flex flex-wrap gap-2">
-          <Button disabled={loading || saving} onClick={() => void loadFiles()}>{loading ? '刷新中...' : '刷新列表'}</Button>
-          <Button disabled={!selected || !loaded || loading || saving || content === saved} onClick={save} variant="primary">{saving ? '保存中…' : '保存当前文件'}</Button>
+          <Button disabled={loading || saving} onClick={() => void loadFiles()}>{loading ? '正在刷新…' : '刷新列表'}</Button>
+          <Button disabled={!selected || !loaded || loading || saving || content === saved} onClick={save} variant="primary">{saving ? '正在保存…' : '保存当前文件'}</Button>
           <Button disabled={!selected || loading || saving || current?.is_example} onClick={createExample}>从已保存文件创建 Example</Button>
         </div>
         <StatusText message={message} />

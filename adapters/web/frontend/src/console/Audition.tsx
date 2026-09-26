@@ -84,7 +84,7 @@ export const Audition = () => {
         </span>
         <span className="flex-1" />
         {loading && (
-          <span className="font-mono text-mini text-[var(--duties-secondary)]">重算中…</span>
+          <span className="font-mono text-mini text-[var(--duties-secondary)]">正在重算…</span>
         )}
         <Check checked={cooldown} onChange={setCooldown}>算上冷却</Check>
         <label className="flex items-center gap-1.5 text-xs">

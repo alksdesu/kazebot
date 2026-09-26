@@ -39,7 +39,7 @@ export const VisionRouting = () => {
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
   const [error, setError] = useState('');
-  const confirmDiscard = useUnsavedChanges(mode !== saved, '带图路由尚未保存，确定离开或还原吗？');
+  const confirmDiscard = useUnsavedChanges(mode !== saved, '带图路由尚未保存，确定离开或丢弃吗？');
 
   useEffect(() => {
     if (!token) return;

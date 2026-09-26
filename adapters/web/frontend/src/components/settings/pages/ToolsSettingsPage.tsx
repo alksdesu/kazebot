@@ -141,7 +141,7 @@ const ToolInventorySection = () => {
     >
       <>
           <div className="mb-3 flex flex-wrap gap-2">
-            <Button disabled={loading || busy} onClick={load}>{loading ? '刷新中...' : '刷新工具'}</Button>
+            <Button disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新工具'}</Button>
             <Button disabled={busy} onClick={reload} variant="primary">重载工具</Button>
             <Button disabled={busy || !selectedTool?.editable} onClick={remove} variant="danger">删除选中工具</Button>
           </div>

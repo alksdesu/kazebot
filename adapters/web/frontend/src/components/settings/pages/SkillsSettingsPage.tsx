@@ -93,7 +93,7 @@ export const SkillsSettingsPage = () => {
     <PageShell authed={isAuthenticated} description="管理 skills 目录下的 SKILL.md 文件。选择技能后，请在右栏编辑 frontmatter 和 Markdown 正文。" title="技能管理">
       <Block frame="boxed" title="技能列表" hint="列表展示技能名称、启用状态、策略和关键词预览。编辑器位于右栏。">
         <div className="mb-3 flex flex-wrap gap-2">
-          <Button disabled={loading || busy} onClick={load}>{loading ? '刷新中...' : '刷新技能'}</Button>
+          <Button disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新技能'}</Button>
           <Button disabled={busy || !selectedSkill} onClick={remove} variant="danger">删除选中技能</Button>
         </div>
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">

@@ -523,10 +523,10 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
           {(edit.provider.trim() !== '' || edit.model.trim() !== '' || edit.base_url.trim() !== '' || edit.api_key.trim() !== '' || hasSessionOverride) && (
             <div className="flex gap-2">
               <Button className="h-8 flex-1 px-2 text-nano" disabled={modelSaving || !modelLoaded || (!edit.provider.trim() && !edit.model.trim() && !edit.base_url.trim() && !edit.api_key.trim())} onClick={handleSaveModel} variant="primary">
-                {modelSaving ? '保存中…' : '保存'}
+                {modelSaving ? '正在保存…' : '保存'}
               </Button>
               {hasSessionOverride && (
-                <Button className="h-8 flex-1 px-2 text-nano" disabled={modelSaving || !modelLoaded} onClick={handleClearModel} variant="ghost">
+                <Button className="h-8 flex-1 px-2 text-nano" disabled={modelSaving || !modelLoaded} onClick={handleClearModel} variant="danger">
                   清除
                 </Button>
               )}

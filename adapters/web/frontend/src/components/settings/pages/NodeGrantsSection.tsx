@@ -17,6 +17,7 @@ import {
   upsertYamlList,
   upsertYamlNested,
 } from '../../../console/nodeYaml';
+import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskLabel } from '../../../utils/toolRisk';
 import { Block, Button, Check, Empty, ErrorText, Facts, Footnote, Input, Item, ItemTitle, List, SaveBar, Segmented, StatusText, Tag } from './settingsControls';
@@ -211,6 +212,7 @@ const NodeRow = ({ node, tools, onSaved }: {
   }, [open, adminToken, node.id, saved]);
 
   const dirty = mode !== saved.mode || !sameList(allow, saved.allow) || !sameList(deny, saved.deny);
+  const confirmDiscard = useUnsavedChanges(dirty, `节点「${node.id}」的授权还有未保存修改，确定离开或丢弃吗？`);
 
   // all 模式存的是禁用名单，勾中即「不在名单里」。这里翻一次，界面上就只有一种含义。
   const isEnabled = (name: string) => (mode === 'all' ? !deny.includes(name) : allow.includes(name));
@@ -355,6 +357,7 @@ const NodeRow = ({ node, tools, onSaved }: {
             label="保存授权"
             note={message || (dirty ? '有未保存的改动' : '与服务器一致')}
             onReset={() => {
+              if (!confirmDiscard()) return;
               setMode(saved.mode);
               setAllow(saved.allow);
               setDeny(saved.deny);

@@ -164,7 +164,7 @@ const RestartEngine = () => {
       {armed ? (
         <span className="inline-flex gap-2">
           <Button onClick={() => setArmed(false)} tone="quiet">算了</Button>
-          <Button onClick={() => void fire()} tone="halt">确认重启</Button>
+          <Button onClick={() => void fire()} tone="danger">确认重启</Button>
         </span>
       ) : (
         <Button onClick={() => setArmed(true)} tone="danger">重启</Button>

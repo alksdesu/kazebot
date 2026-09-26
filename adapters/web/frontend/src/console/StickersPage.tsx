@@ -15,6 +15,7 @@ import {
   type StickerCounts,
   type StickerState,
 } from '../api/supervisorClient';
+import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
 import {
   Block,
@@ -92,6 +93,7 @@ const LibraryBlock = () => {
   const [counts, setCounts] = useState<StickerCounts>(EMPTY_COUNTS);
   const [editing, setEditing] = useState('');
   const [draft, setDraft] = useState(EMPTY_DRAFT);
+  const [editBaseline, setEditBaseline] = useState('');
   const [onlyFailed, setOnlyFailed] = useState(false);
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
@@ -102,6 +104,11 @@ const LibraryBlock = () => {
   const [importPath, setImportPath] = useState('');
   const [importAccept, setImportAccept] = useState(false);
   const filePicker = useRef<HTMLInputElement>(null);
+
+  const confirmDiscard = useUnsavedChanges(
+    editing !== '' && JSON.stringify(draft) !== editBaseline,
+    '「图库」里有一张图的名字或标签还没保存，确定离开或丢弃吗？',
+  );
 
   const load = async () => {
     if (!adminToken) return;
@@ -143,13 +150,16 @@ const LibraryBlock = () => {
   };
 
   const openEditor = (row: Sticker) => {
-    if (editing === row.sha256) { setEditing(''); return; }
-    setEditing(row.sha256);
-    setDraft({
+    if (editing === row.sha256) { if (confirmDiscard()) setEditing(''); return; }
+    if (!confirmDiscard()) return;
+    const opened = {
       name: row.name,
       tags: row.manual_tags.join('，'),
       override: row.manual_override,
-    });
+    };
+    setEditing(row.sha256);
+    setDraft(opened);
+    setEditBaseline(JSON.stringify(opened));
   };
 
   const saveEdit = (row: Sticker) => run(async (token) => {
@@ -164,7 +174,7 @@ const LibraryBlock = () => {
 
   const accept = (row: Sticker) => run(async (token) => {
     await acceptSticker(token, row.sha256);
-    return '已转入库';
+    return '已转正，进候选了';
   });
 
   const discard = (row: Sticker) => {
@@ -190,7 +200,7 @@ const LibraryBlock = () => {
     if (!window.confirm(`把${scope}重新排进打标队列？打标要走视觉模型，量大时会占一阵子。`)) return;
     void run(async (token) => {
       const queued = await recaptionStickers(token, onlyFailed);
-      return `已排队 ${queued} 张`;
+      return `已排队 ${queued} 张，打标在后台跑`;
     });
   };
 
@@ -265,8 +275,8 @@ const LibraryBlock = () => {
               <Button disabled={busy} onClick={() => void saveEdit(row)} size="sm">
                 保存
               </Button>
-              <Button onClick={() => setEditing('')} size="sm" tone="quiet">
-                取消
+              <Button onClick={() => { if (confirmDiscard()) setEditing(''); }} size="sm" tone="quiet">
+                丢弃
               </Button>
             </div>
           </div>
@@ -330,7 +340,7 @@ const LibraryBlock = () => {
         </div>
 
         {items.length === 0 ? (
-          <Empty>{search ? '没有匹配的图。' : '这一档还是空的。'}</Empty>
+          <Empty>{search ? '没有名字或标签含「' + search + '」的图。' : '这一档还没有图。'}</Empty>
         ) : (
           <div className="grid grid-cols-[var(--duties-thumb-grid)] gap-2.5">
             {items.map(card)}
@@ -341,7 +351,7 @@ const LibraryBlock = () => {
         {note && <Footnote>{note}</Footnote>}
       </Block>
 
-      <Block hint="上传与导入立刻落盘，不用点顶部的应用" title="添加">
+      <Block hint="上传和导入都是立刻写入，不用点顶部的应用" title="添加">
         <Panel>
           <div className={CHAN_ROW}>
             <span className={CHAN_LABEL}>文件</span>
@@ -374,7 +384,9 @@ const LibraryBlock = () => {
               <Check checked={uploadAccept} onChange={setUploadAccept}>直接入库</Check>
             </div>
           </div>
+        </Panel>
 
+        <Panel className="mt-2.5">
           <div className={CHAN_ROW}>
             <span className={CHAN_LABEL}>目录</span>
             <div className={CHAN_BODY}>
@@ -478,7 +490,7 @@ export const StickersPage = () => (
     <CollectBlock />
     <Footnote>
       只有在库且打过标的图才会进候选 —— 没打标的图对模型来说是不可描述的，给了也挑不出来。
-      打标走上面那条看图渠道，跟着 bot 进程慢慢跑，刚收进来的图要等一会儿才可用；
+      打标走上面显示的那条看图渠道，跟着 bot 进程慢慢跑，刚收进来的图要等一会儿才可用；
       渠道没配好时打标会整个停用，「还有多少没打标」就一直降不下去。
     </Footnote>
   </>

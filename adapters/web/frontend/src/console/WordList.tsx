@@ -1,4 +1,4 @@
-// 词表编辑：名字、关键词、触发前缀共用。空格与全角符号都算词的一部分，所以只按回车提交。
+// 词表编辑：名字、关键词、触发前缀共用。空格与全角符号都算词的一部分，所以只按回车确认。
 import { useState } from 'react';
 
 import { Chip, Chips, Input } from './components';

@@ -48,7 +48,7 @@ interface BarState {
   text: string;
 }
 
-/** pip 反映 bot 那边的生效状态，「N 项待应用」反映浏览器里还没提交的改动 —— 两个不同维度。 */
+/** pip 反映 bot 那边的生效状态，「N 项待应用」反映浏览器里还没应用的改动 —— 两个不同维度。 */
 function barState(
   live: { published: boolean; stale?: boolean; applied?: boolean } | null,
   parseError: string,
@@ -109,7 +109,7 @@ export const QqPage = ({ children, alwaysContent, standalone = false, note, titl
     : loading && !live ? <Empty>正在读取配置…</Empty>
       : !live?.published ? (
         <Empty>
-          {live?.reason || 'bot 进程还没公布生效配置。启动 bot 之后这里会显示它实际在用的值。'}
+          {live?.reason || 'bot 还没上报生效配置。在服务器上启动 QQ 适配器进程（bot.py）之后，这里会显示它实际在用的值。'}
         </Empty>
       ) : children;
 

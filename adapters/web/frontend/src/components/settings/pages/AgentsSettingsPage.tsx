@@ -97,7 +97,7 @@ export const AgentsSettingsPage = () => {
     <PageShell authed={isAuthenticated} description="查看、创建和删除节点配置文件。选择节点后，请在右侧面板编辑对应 YAML。" title="节点管理">
       <Block frame="boxed" title="节点列表" hint="中间区域只负责列表和操作，节点 YAML 编辑器显示在右栏。">
         <div className="mb-3 flex flex-wrap gap-2">
-          <Button disabled={loading || busy} onClick={loadNodes}>{loading ? '刷新中...' : '刷新节点'}</Button>
+          <Button disabled={loading || busy} onClick={loadNodes}>{loading ? '正在刷新…' : '刷新节点'}</Button>
           <Button disabled={busy || !selectedNode} onClick={remove} variant="danger">删除选中节点</Button>
         </div>
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">

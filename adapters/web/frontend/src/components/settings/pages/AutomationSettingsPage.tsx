@@ -110,7 +110,7 @@ export const AutomationSettingsPage = () => {
       <RemindersPage embedded />
       <Block frame="boxed" title="定时任务列表" hint="每项显示 ID、cron、类型、启用状态和 text 预览。字段表单与 Raw YAML fallback 位于右栏。">
         <div className="mb-3 flex flex-wrap gap-2">
-          <Button disabled={loading || busy} onClick={load}>{loading ? '刷新中...' : '刷新'}</Button>
+          <Button disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新'}</Button>
           <Button disabled={loading || busy || !selectedScheduleId} onClick={remove} variant="danger">删除选中任务</Button>
         </div>
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">

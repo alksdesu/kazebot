@@ -90,7 +90,7 @@ export const ApprovalsSettingsPage = () => {
     <PageShell authed={isAuthenticated} description="查看所有会话的待审批项，并对工具或操作请求执行允许或拒绝。" title="审批">
       <Block frame="boxed" title="全局待审批列表" hint="列表来自 /v1/admin/state 的 pending_approvals 字段。">
         <div className="mb-3 flex flex-wrap gap-2">
-          <Button disabled={loading} onClick={() => load()}>{loading ? '刷新中...' : '刷新列表'}</Button>
+          <Button disabled={loading} onClick={() => load()}>{loading ? '正在刷新…' : '刷新列表'}</Button>
         </div>
         {approvals.length === 0 ? (
           <div className="flex items-center gap-2 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-4 text-sm text-[var(--duties-secondary)]">

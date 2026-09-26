@@ -1,7 +1,7 @@
 // 渠道：bot 实际调用哪一家。key/地址/模型都在这里，参数和备选链在「模型」页。
 //
 // 读到的是脱敏视图，密钥只回来一个星号串，所以留空表示不改而不是清空。
-// 新建的渠道先留在本地，存盘时才建块 —— 后端认不出空块，先建会让它从列表里消失。
+// 新建的渠道先留在本地，保存时才建块 —— 后端认不出空块，先建会让它从列表里消失。
 import { useEffect, useId, useMemo, useState, type ReactNode } from 'react';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
@@ -131,7 +131,7 @@ const Row = ({
         disabled={busy || active}
         onClick={onRemove}
         title={active ? '正在用的渠道不能删' : undefined}
-        tone="halt"
+        tone="danger"
       >
         删除
       </Button>

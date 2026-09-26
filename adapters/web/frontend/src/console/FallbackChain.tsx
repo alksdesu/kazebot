@@ -121,7 +121,7 @@ const Row = ({
         <span className="flex-1" />
         <Button disabled={index === 0} onClick={() => onMove(-1)} tone="quiet">上移</Button>
         <Button disabled={index === total - 1} onClick={() => onMove(1)} tone="quiet">下移</Button>
-        <Button onClick={onRemove} tone="halt">删除</Button>
+        <Button onClick={onRemove} tone="danger">删除</Button>
       </div>
 
       <div className={HEAD}>

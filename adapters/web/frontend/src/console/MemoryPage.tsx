@@ -234,7 +234,7 @@ const MemoryBlock = () => {
                     <Tag className="ml-2" tone="live">其中 {constantCount} 条常驻</Tag>
                   )}
                 </span>
-                <Button disabled={busy || loading || entriesScope !== selected} onClick={clearAll}>清空</Button>
+                <Button disabled={busy || loading || entriesScope !== selected} onClick={clearAll} tone="danger">清空</Button>
               </div>
               {loading && <Empty>正在读取该来源的记忆…</Empty>}
               {pageEntries.map((entry) => (
@@ -247,7 +247,7 @@ const MemoryBlock = () => {
                     {entry.constant && <Tag tone="live">常驻 · 每轮都注入</Tag>}
                     {entry.source === 'manual' && <Tag>手动</Tag>}
                     <span className="flex-1" />
-                    <Button disabled={busy || loading} onClick={() => void remove(entry)}>删除</Button>
+                    <Button disabled={busy || loading} onClick={() => void remove(entry)} tone="danger">删除</Button>
                   </div>
                   <p className={TEXT}>{entry.content}</p>
                   {!!entry.keywords?.length && (
@@ -304,7 +304,7 @@ const MemoryBlock = () => {
                   disabled={busy || !draft.id.trim() || !draft.content.trim()}
                   onClick={submit}
                 >
-                  {busy ? '保存中' : '添加'}
+                  {busy ? '正在添加…' : '添加'}
                 </Button>
               </fieldset>
             </>
@@ -367,13 +367,14 @@ const ContextBlock = () => {
       <div className={HEAD}>
         <span className="min-w-0 flex-1 truncate text-xs">{labelFor(row)}</span>
         <span className={META}>{sizeText(row.bytes)}</span>
-        <Button disabled={busy} onClick={() => void open(row)}>
+        <Button disabled={busy} onClick={() => void open(row)} tone="quiet">
           {preview?.id === row.session_id ? '收起' : '查看'}
         </Button>
         <Button
           disabled={busy || !row.conversation_key}
           onClick={() => void drop(row)}
           title={row.conversation_key ? '' : '这条会话已经没有归属，只能在服务器上删'}
+          tone="danger"
         >
           删除
         </Button>
@@ -415,7 +416,7 @@ const ContextBlock = () => {
     <Block hint="删除会连带清掉 bot 侧的消息缓存与附件；长期记忆另算" title="会话上下文">
       {loading && <Footnote>正在读取会话…</Footnote>}
       {directoryLoading && <Footnote>正在读取会话名称…</Footnote>}
-      {directoryError && <Footnote>{directoryError} <Button onClick={() => void load()}>重试会话列表</Button></Footnote>}
+      {directoryError && <Footnote>{directoryError} <Button onClick={() => void load()} tone="quiet">重试会话列表</Button></Footnote>}
       {!directoryLoading && !directoryError && rows.length === 0 && <Empty>还没有任何会话。</Empty>}
       {/* 空的那一段拍平后不留痕迹，可「这个号一条都没有」正是要说的话，所以单拎出来。 */}
       {stale.length > 0 && mine.length === 0 && (
@@ -505,7 +506,7 @@ const ScopeBlock = () => {
             width="flex"
           />
         </label>
-        <Button className="self-start" disabled={busy || !target.trim()} onClick={() => void preview()}>
+        <Button className="self-start" disabled={busy || !target.trim()} onClick={() => void preview()} tone="quiet">
           预览
         </Button>
       </div>
@@ -536,7 +537,7 @@ const ScopeBlock = () => {
             <Footnote>bot 还在跑。它内存里存着按旧账号算的会话键，先停掉 bot 再搬。</Footnote>
           ) : (
             <Button disabled={busy || movable.length === 0} onClick={() => void migrate()}>
-              {busy ? '搬迁中…' : '执行搬迁'}
+              {busy ? '正在搬迁…' : '执行搬迁'}
             </Button>
           )}
         </div>

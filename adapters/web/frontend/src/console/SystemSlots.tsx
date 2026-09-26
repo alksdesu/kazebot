@@ -19,6 +19,9 @@ import { useSettingsStore } from '../store/settingsStore';
 import { ChannelOptions, EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields';
 import { Block, Empty, ErrorText, Facts, Input, Item, ItemTitle, List, SaveBar, Select } from './components';
 
+/** 深链锚点。看图渠道等槽位在别的页面只回显，改要回到这里。 */
+export const SYSTEM_SLOTS_ANCHOR = 'system-slots';
+
 interface Draft {
   slot: SystemModelSlot;
   model: string;
@@ -210,7 +213,7 @@ export const SystemSlots = ({ channels, wires, profiles, activeProvider }: {
     [drafts, imageDefault, savedImageDefault],
   );
 
-  const confirmDiscard = useUnsavedChanges(dirty, '系统槽位还有未保存修改，确定离开或还原吗？');
+  const confirmDiscard = useUnsavedChanges(dirty, '系统槽位还有未保存修改，确定离开或丢弃吗？');
 
   const save = async () => {
     if (!token || busy || !loaded) return;
@@ -243,10 +246,16 @@ export const SystemSlots = ({ channels, wires, profiles, activeProvider }: {
     setBusy(false);
   };
 
+  // 表情包页的看图渠道只回显不可改，链过来时要能直接滚到这一块。
+  useEffect(() => {
+    if (!loaded || window.location.hash !== `#${SYSTEM_SLOTS_ANCHOR}`) return;
+    document.getElementById(SYSTEM_SLOTS_ANCHOR)?.scrollIntoView({ block: 'start' });
+  }, [loaded]);
+
   if (!loaded) return <Empty>正在读取系统槽位…</Empty>;
 
   return (
-    <Block hint="压缩、摘要、读图这些内部用途各自可以走独立渠道，留空则跟随主渠道" title="系统槽位">
+    <Block hint="压缩、摘要、读图这些内部用途各自可以走独立渠道，留空则跟随主渠道" id={SYSTEM_SLOTS_ANCHOR} title="系统槽位">
       <fieldset disabled={busy} className="min-w-0">
       {/* 各家的版本段位置不同，填错了一律静默 404，光看输入框看不出来。 */}
       <Facts>

@@ -46,7 +46,7 @@ describe('高级配置加载与提交边界', () => {
     expect(rawEditor()).toHaveAttribute('readonly');
     fireEvent.click(area.getByRole('button', { name: '加载' }));
     expect(screen.getByLabelText('工具调用格式')).toBeDisabled(); expect(rawEditor()).toBeDisabled();
-    fireEvent.click(area.getByRole('button', { name: '处理中...' })); expect(api.getRuntimeRaw).toHaveBeenCalledTimes(1);
+    fireEvent.click(area.getByRole('button', { name: '正在加载…' })); expect(api.getRuntimeRaw).toHaveBeenCalledTimes(1);
     await act(async () => read.resolve(runtime));
     expect(screen.getByLabelText('入口节点 ID')).toBeEnabled(); expect(rawEditor()).not.toHaveAttribute('readonly');
   });

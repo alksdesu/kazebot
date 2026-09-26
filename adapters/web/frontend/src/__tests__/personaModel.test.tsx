@@ -116,9 +116,8 @@ describe('模型输入', () => {
     fireEvent.change(modelBox(), { target: { value: '$ENV{MY_RELAY_MODEL}' } });
     expect(modelBox()).toHaveValue('$ENV{MY_RELAY_MODEL}');
 
-    // 两块各自存盘，只有改过的那块的保存键是活的。
-    const save = screen.getAllByRole('button', { name: '保存' }).find((button) => !(button as HTMLButtonElement).disabled);
-    fireEvent.click(save!);
+    // 两块各自保存，按钮名字不同，点的必须是模型这一块的。
+    fireEvent.click(screen.getByRole('button', { name: '保存模型' }));
 
     await waitFor(() => expect(updateNodeRaw).toHaveBeenCalled());
     expect(vi.mocked(updateNodeRaw).mock.calls[0][2]).toContain('model: $ENV{MY_RELAY_MODEL}');

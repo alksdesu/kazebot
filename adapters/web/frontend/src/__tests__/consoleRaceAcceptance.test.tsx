@@ -143,9 +143,9 @@ describe('渠道响应与未保存配置', () => {
     expect(screen.getByLabelText('current 模型')).toHaveValue('current-draft');
     expect(screen.queryByLabelText('relay 模型')).not.toBeInTheDocument(); expect(screen.queryByText('旧身份不可用')).not.toBeInTheDocument();
   });
-  it('拒绝还原时保留渠道草稿', async () => {
+  it('拒绝丢弃时保留渠道草稿', async () => {
     render(<ProvidersPage />); fireEvent.change(await screen.findByLabelText('relay 模型'), { target: { value: 'keep-me' } });
-    vi.mocked(window.confirm).mockReturnValue(false); fireEvent.click(screen.getByRole('button', { name: '还原' }));
+    vi.mocked(window.confirm).mockReturnValue(false); fireEvent.click(screen.getByRole('button', { name: '丢弃' }));
     expect(screen.getByLabelText('relay 模型')).toHaveValue('keep-me'); expect(api.upsertProvider).not.toHaveBeenCalled();
   });
 });

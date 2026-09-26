@@ -114,7 +114,7 @@ export const McpSettingsPage = () => {
     <PageShell authed={isAuthenticated} description="查看 MCP Client 列表，选择后在右栏编辑连接字段和保存。" title="MCP">
       <Block frame="boxed" title="Client 列表" hint="展示 ID、传输方式、启用状态和连接预览。编辑表单位于右栏。">
         <div className="mb-3 flex flex-wrap gap-2">
-          <Button disabled={loading || busy} onClick={load}>{loading ? '刷新中...' : '刷新 MCP'}</Button>
+          <Button disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新 MCP'}</Button>
           <Button disabled={loading || busy || !selectedMcpClient} onClick={remove} variant="danger">删除选中 Client</Button>
         </div>
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">

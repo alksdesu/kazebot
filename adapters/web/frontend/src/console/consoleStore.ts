@@ -120,7 +120,7 @@ const settle = async (
     try {
       const [state, file] = await Promise.all([getQqState(token), getQqRaw(token)]);
       if (file.content !== savedRaw) {
-        set({ notice: '配置文件在保存后又发生变更，请刷新核对当前内容。' });
+        set({ notice: '配置文件在应用之后又被改过，请刷新核对当前内容。' });
         return;
       }
       if (state.applied) {
@@ -128,12 +128,12 @@ const settle = async (
         return;
       }
     } catch {
-      set({ notice: '配置已写入，但暂时无法确认 bot 是否生效，请稍后刷新。' });
+      set({ notice: '已应用，但暂时读不到 bot 的状态，无法确认是否生效，请稍后刷新。' });
       return;
     }
   }
   if (!get().error) {
-    set({ notice: '已写入配置文件，但 bot 没在 3 秒内确认生效' });
+    set({ notice: '已应用，但 bot 没在 3 秒内确认生效。它可能没在跑，去服务器上看 QQ 适配器进程（bot.py）。' });
   }
 };
 
@@ -198,7 +198,7 @@ export const useConsoleStore = create<ConsoleState>((set, get) => ({
       });
       await settle(token, set, get, raw);
     } catch (error) {
-      set({ error: error instanceof Error ? error.message : '保存失败' });
+      set({ error: error instanceof Error ? error.message : '应用失败' });
     } finally {
       set({ saving: false });
     }

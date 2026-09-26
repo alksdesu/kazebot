@@ -11,8 +11,9 @@ interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 }
 
 const variantClassName: Record<ButtonVariant, string> = {
-  primary: 'border-[var(--duties-text)] bg-[var(--duties-text)] text-[var(--duties-bg)] hover:bg-[var(--duties-accent)] hover:text-[var(--duties-text)]',
-  ghost: 'border-[var(--duties-border)] bg-transparent text-[var(--duties-text)] hover:border-[var(--duties-text)] hover:bg-[var(--duties-accent)]',
+  // 强调色只表示「判定为真 / 已生效」，不做按钮色，hover 也不行。
+  primary: 'border-[var(--duties-text)] bg-[var(--duties-text)] text-[var(--duties-bg)] hover:bg-[var(--duties-secondary)]',
+  ghost: 'border-[var(--duties-border)] bg-transparent text-[var(--duties-text)] hover:border-[var(--duties-text)] hover:bg-[var(--duties-muted)]',
   // [2026-06-02] Add an explicit dangerous action style for Settings controls.
   // Why: engine restart and approval denial can interrupt work or reject a pending
   // operation, so they should not look like neutral ghost buttons. How: expose a red

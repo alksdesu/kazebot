@@ -1,204 +1,69 @@
-// 看图渠道。存在 data/config.yaml 的 system_models.image，不是 qq.yaml，所以自己存盘。
+// 看图渠道的回显。它写的是 data/config.yaml 的 system_models.image，
+// 入口只留在渠道页的系统槽位一处，这里不再放第二套表单。
 import { useEffect, useState } from 'react';
 
-import {
-  channelChoices,
-  getProviderProfiles,
-  getProviders,
-  getSystemModels,
-  updateSystemModel,
-  type ChannelChoice,
-  type ProviderProfiles,
-  type SystemModelSlot,
-  type SystemModelsResponse,
-} from '../api/supervisorClient';
+import { getSystemModels, type SystemModelSlot } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
-import { ChannelOptions, EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields';
-import {
-  Block, Button, Empty, ErrorText, Facts, Input, Panel, SaveBar, Select,
-} from './components';
+import { useViewStore } from '../store/viewStore';
+import { Block, Empty, ErrorText, Facts, LinkButton, Panel, ReadOnlyRow } from './components';
+import { SYSTEM_SLOTS_ANCHOR } from './SystemSlots';
+
+const CHANNELS_TAB = 'qq-providers';
+const SLOT_HREF = `?view=settings&tab=${CHANNELS_TAB}#${SYSTEM_SLOTS_ANCHOR}`;
 
 const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');
 
 export const VisionChannelBlock = () => {
   const adminToken = useSettingsStore((state) => state.adminToken);
+  const setSettingsTab = useViewStore((state) => state.setSettingsTab);
   const [slot, setSlot] = useState<SystemModelSlot | null>(null);
-  const [baseUrl, setBaseUrl] = useState('');
-  const [model, setModel] = useState('');
-  const [apiKey, setApiKey] = useState('');
-  const [provider, setProvider] = useState('');
-  const [channels, setChannels] = useState<ChannelChoice[]>([]);
-  const [wires, setWires] = useState<string[]>([]);
-  const [profiles, setProfiles] = useState<ProviderProfiles | null>(null);
-  const [mainProvider, setMainProvider] = useState('');
   const [loaded, setLoaded] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState('');
   const [error, setError] = useState('');
-
-  const absorb = (data: SystemModelsResponse) => {
-    const found = data.slots.find((item) => item.key === 'image') || null;
-    setSlot(found);
-    // 回填展开前的原文，否则保存一次就把变量引用烧成了当时的展开值。
-    setBaseUrl(found?.base_url_raw || '');
-    setModel(found?.model_raw || '');
-    setProvider(found?.provider || '');
-    setApiKey('');
-  };
 
   useEffect(() => {
     if (!adminToken) return;
     void (async () => {
       try {
-        absorb(await getSystemModels(adminToken));
+        const data = await getSystemModels(adminToken);
+        setSlot(data.slots.find((item) => item.key === 'image') || null);
       } catch (caught) { setError(say(caught)); }
-      try {
-        const [providers, catalog] = await Promise.all([
-          getProviders(adminToken), getProviderProfiles(adminToken),
-        ]);
-        setMainProvider(providers.active_provider);
-        const choices = channelChoices(providers);
-        setChannels(choices.channels);
-        setWires(choices.wires);
-        setProfiles(catalog);
-      } catch {
-        // 这两份只用来渲染渠道下拉和对不上的提示，取不到不该挡住保存。
-      }
       setLoaded(true);
     })();
   }, [adminToken]);
 
-  const run = async (job: (token: string) => Promise<string>) => {
-    if (!adminToken || busy) return;
-    setBusy(true);
-    setError('');
-    setNote('');
-    try { setNote(await job(adminToken)); } catch (caught) { setError(say(caught)); }
-    setBusy(false);
+  // 自己指了地址却没说是哪家，后端就按 OpenAI 格式发。
+  const channel = slot?.provider
+    || (slot?.base_url_raw ? 'openai（没选渠道，按 OpenAI 格式发）' : '跟随主渠道');
+
+  // 先落 hash 再切页签：切换会 replaceState 重写地址，hash 原样带过去，渠道页据此滚到槽位。
+  const openSlot = () => {
+    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${SYSTEM_SLOTS_ANCHOR}`);
+    setSettingsTab(CHANNELS_TAB);
   };
-
-  const dirty = slot !== null && (
-    baseUrl !== slot.base_url_raw || model !== slot.model_raw
-    || provider !== slot.provider || apiKey.trim() !== ''
-  );
-
-  const save = () => void run(async (token) => {
-    const key = apiKey.trim();
-    absorb(await updateSystemModel(token, 'image', {
-      base_url: baseUrl.trim(),
-      model: model.trim(),
-      provider,
-      // 只在真敲了东西时才带上 api_key：空串是「删掉这一项」的信号，不是「不动」。
-      ...(key ? { api_key: key } : {}),
-    }));
-    return '已保存。下一轮打标就用新配置。';
-  });
-
-  const clearKey = () => {
-    if (!window.confirm('清除看图渠道的密钥？清掉之后这一项回到跟随主渠道，存的那把密钥找不回来。')) return;
-    void run(async (token) => {
-      absorb(await updateSystemModel(token, 'image', { api_key: '' }));
-      return '已清除密钥';
-    });
-  };
-
-  const reset = () => {
-    setBaseUrl(slot?.base_url_raw || '');
-    setModel(slot?.model_raw || '');
-    setProvider(slot?.provider || '');
-    setApiKey('');
-  };
-
-  // 自己指了地址却没说是哪家，就按 OpenAI 格式发。中转站多半没问题，换家必挂。
-  const wireUnstated = !!baseUrl.trim() && !provider;
-  const effective = provider || (baseUrl.trim() ? 'openai' : mainProvider);
 
   return (
-    <Block hint="打标和 read_image 工具共用这一条，改完点这一块自己的保存" title="看图渠道">
+    <Block hint="打标和 read_image 工具共用这一条。它在渠道页的系统槽位里改，这里只显示当前值" title="看图渠道">
       {!loaded ? <Empty>正在读取看图渠道…</Empty> : (
         <Panel>
-          <Facts>
-            {slot?.desc || '给看不了图的模型描述图片内容。'}
-            全部留空则整条跟随主渠道，连请求格式一起跟。
-          </Facts>
-
-          <FieldRow label="渠道">
-            <Select
-              aria-label="看图渠道类型"
-              onChange={(event) => setProvider(event.target.value)}
-              value={provider}
-              width="flex"
-            >
-              <option value="">跟随主渠道{mainProvider ? `（${mainProvider}）` : ''}</option>
-              <ChannelOptions channels={channels} current={provider} wires={wires} />
-            </Select>
-          </FieldRow>
-          <Facts>
-            决定按谁的格式发请求。地址填到哪一级也看它：OpenAI 系要带{' '}
-            <code className="font-mono text-mini">/v1</code>，Claude 与 Gemini 不带。
-          </Facts>
-          {wireUnstated && (
-            <ErrorText>
-              填了地址却没选渠道，请求按 OpenAI 格式发。中转站一般没问题，
-              直连 Claude 或 Gemini 的话这里要一起选。
-            </ErrorText>
-          )}
-
-          <FieldRow label="地址">
-            <Input
-              aria-label="看图渠道地址"
-              onChange={(event) => setBaseUrl(event.target.value)}
-              placeholder="留空 = 跟随主渠道的地址"
-              value={baseUrl}
-              width="flex"
-            />
-          </FieldRow>
-          <EnvHint raw={baseUrl} resolved={slot?.base_url || ''} savedRaw={slot?.base_url_raw || ''} />
-          <HostMismatchHint baseUrl={baseUrl} profiles={profiles} provider={provider} />
-
-          <ModelField
-            apiKey={apiKey}
-            ariaLabel="看图渠道模型"
-            baseUrl={baseUrl}
-            choices={[]}
-            listId="sticker-vision-models"
-            provider={effective}
-            slot="image"
-            value={model}
-            onChange={setModel}
-          />
-          <EnvHint raw={model} resolved={slot?.model || ''} savedRaw={slot?.model_raw || ''} />
-          <Facts>模型名不跟随主渠道 —— 主渠道那个多半正是看不了图的纯文本模型。</Facts>
-
-          <FieldRow label="密钥">
-            <Input
-              aria-label="看图渠道密钥"
-              onChange={(event) => setApiKey(event.target.value)}
-              placeholder={slot?.api_key_present
-                ? `已设置 ${slot.api_key_redacted}，留空不改`
-                : '留空 = 跟随主渠道的密钥'}
-              type="password"
-              value={apiKey}
-              width="flex"
-            />
-            {slot?.api_key_present && (
-              <Button className="flex-none" disabled={busy} onClick={clearKey} tone="danger">
-                清除
-              </Button>
-            )}
-          </FieldRow>
-          <Facts>
-            密钥只存不回显。
-            {slot?.api_key_present
-              ? '这里留空表示沿用已存的那一把，不会清掉；真要清就点上面的「清除」。'
-              : '这一项还没配。'}
-          </Facts>
-
           {error && <ErrorText>{error}</ErrorText>}
-          <SaveBar busy={busy} dirty={dirty} label="保存渠道" note={note} onReset={reset} onSave={save} />
+          <ReadOnlyRow name="渠道" value={channel} />
+          <ReadOnlyRow hint={slot?.base_url_raw && slot.base_url !== slot.base_url_raw ? `解析为 ${slot.base_url}` : undefined} name="地址" value={slot?.base_url_raw || '跟随主渠道'} />
+          <ReadOnlyRow hint={slot?.model_raw && slot.model !== slot.model_raw ? `解析为 ${slot.model}` : undefined} name="模型" value={slot?.model_raw || '未设置'} />
+          <ReadOnlyRow name="密钥" value={slot?.api_key_present ? slot.api_key_redacted : '跟随主渠道'} />
+          <Facts>
+            模型名不跟随主渠道 —— 主渠道那个多半正是看不了图的纯文本模型。没配模型时整库都打不上标。
+          </Facts>
+          <div className="mt-3">
+            <LinkButton
+              href={SLOT_HREF}
+              onClick={(event) => { event.preventDefault(); openSlot(); }}
+              tone="quiet"
+            >
+              去渠道页改读图槽位
+            </LinkButton>
+          </div>
         </Panel>
       )}
     </Block>
   );
 };
-
