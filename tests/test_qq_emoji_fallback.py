@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import sys
 from pathlib import Path
 from typing import Any
@@ -10,21 +9,14 @@ from typing import Any
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from adapters.onebot import emoji_handler as emoji  # noqa: E402
+
 _DIGEST = "a" * 64
 _LOCAL_URL = "base64://c3RpY2tlcg=="
 _FACE_URL = "https://example.invalid/face.gif"
-
-
-@pytest.fixture()
-def emoji(monkeypatch: pytest.MonkeyPatch):
-    spec = importlib.util.spec_from_file_location(
-        "_qq_emoji_fallback_test", _ROOT / "adapters/onebot/emoji_handler.py",
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
-    return module
 
 
 class FaceBot:
@@ -50,18 +42,18 @@ def text_of(segments: list[dict[str, Any]]) -> str:
     "[表情:开心]", "[表情： 开心]", "前文[emoji:开心]后文", "[EMOJI:开心]",
     "[收藏表情:开心]", "[QQ_EMOJI:开心]", "[qq_emoji : 开心]",
 ])
-def test_emoji_marker_detection_preserves_aliases(emoji, text: str) -> None:
+def test_emoji_marker_detection_preserves_aliases(text: str) -> None:
     assert emoji.has_emoji_markers(text)
 
 
 @pytest.mark.parametrize("text", ["", "普通文字", "哈哈😂", "[QQ表情:微笑]", "[表情:]", "[表情:未闭合"])
-def test_emoji_marker_detection_ignores_plain_text(emoji, text: str) -> None:
+def test_emoji_marker_detection_ignores_plain_text(text: str) -> None:
     assert not emoji.has_emoji_markers(text)
 
 
 @pytest.mark.parametrize("metadata", [None, [{"name": "其他收藏", "url": _FACE_URL}]])
 @pytest.mark.parametrize("typed", [False, True])
-def test_collection_failure_falls_back_to_local_sticker(emoji, metadata, typed: bool) -> None:
+def test_collection_failure_falls_back_to_local_sticker(metadata, typed: bool) -> None:
     bot = FaceBot(error=RuntimeError("synthetic collection failure"))
     selected: list[str] = []
 
@@ -81,7 +73,7 @@ def test_collection_failure_falls_back_to_local_sticker(emoji, metadata, typed: 
 
 
 @pytest.mark.parametrize("metadata", [None, [{"name": "其他收藏", "url": _FACE_URL}]])
-def test_collection_failure_is_not_retried_for_every_marker(emoji, metadata) -> None:
+def test_collection_failure_is_not_retried_for_every_marker(metadata) -> None:
     bot = FaceBot(error=RuntimeError("synthetic collection failure"))
 
     async def resolve(name: str):
@@ -96,7 +88,7 @@ def test_collection_failure_is_not_retried_for_every_marker(emoji, metadata) -> 
 
 
 @pytest.mark.parametrize("resolved", ["", None, 42])
-def test_unresolved_marker_does_not_remove_surrounding_text(emoji, resolved) -> None:
+def test_unresolved_marker_does_not_remove_surrounding_text(resolved) -> None:
     bot = FaceBot(error=RuntimeError("synthetic collection failure"))
 
     async def resolve(name: str):
@@ -109,7 +101,7 @@ def test_unresolved_marker_does_not_remove_surrounding_text(emoji, resolved) -> 
     assert all(segment["type"] == "text" for segment in segments)
 
 
-def test_local_failure_preserves_text(emoji) -> None:
+def test_local_failure_preserves_text() -> None:
     async def resolve(name: str):
         raise RuntimeError("synthetic local failure")
 
@@ -120,7 +112,7 @@ def test_local_failure_preserves_text(emoji) -> None:
 
 
 @pytest.mark.parametrize("metadata", [None, [{"name": "其他收藏", "url": _FACE_URL}]])
-def test_collection_cancellation_propagates_without_resolving(emoji, metadata) -> None:
+def test_collection_cancellation_propagates_without_resolving(metadata) -> None:
     bot = FaceBot(error=asyncio.CancelledError())
 
     async def resolve(name: str):
@@ -131,7 +123,7 @@ def test_collection_cancellation_propagates_without_resolving(emoji, metadata) -
         asyncio.run(renderer.process_emojis("前文[表情:无语]", bot, [], metadata=metadata))
 
 
-def test_local_cancellation_propagates(emoji) -> None:
+def test_local_cancellation_propagates() -> None:
     async def resolve(name: str):
         raise asyncio.CancelledError()
 
@@ -141,7 +133,7 @@ def test_local_cancellation_propagates(emoji) -> None:
 
 
 @pytest.mark.parametrize("from_metadata", [False, True])
-def test_collection_match_has_priority_and_no_local_digest(emoji, from_metadata: bool) -> None:
+def test_collection_match_has_priority_and_no_local_digest(from_metadata: bool) -> None:
     metadata = [{"name": "开心", "url": _FACE_URL}] if from_metadata else None
     bot = FaceBot(faces=[{"name": "开心", "url": _FACE_URL}])
 
@@ -155,7 +147,7 @@ def test_collection_match_has_priority_and_no_local_digest(emoji, from_metadata:
     assert len(bot.calls) == (0 if from_metadata else 1)
 
 
-def test_digest_does_not_leak_from_local_to_next_collection(emoji) -> None:
+def test_digest_does_not_leak_from_local_to_next_collection() -> None:
     async def resolve(name: str):
         return emoji.ResolvedSticker(_LOCAL_URL, _DIGEST)
 
@@ -169,7 +161,7 @@ def test_digest_does_not_leak_from_local_to_next_collection(emoji) -> None:
     ]
 
 
-def test_empty_typed_result_does_not_emit_image_or_receipt(emoji) -> None:
+def test_empty_typed_result_does_not_emit_image_or_receipt() -> None:
     async def resolve(name: str):
         return emoji.ResolvedSticker("", _DIGEST)
 
@@ -177,7 +169,7 @@ def test_empty_typed_result_does_not_emit_image_or_receipt(emoji) -> None:
     assert asyncio.run(renderer.process_emojis("[表情:本地]", FaceBot(), [])) == []
 
 
-def test_management_lookup_still_reports_collection_api_failure(emoji) -> None:
+def test_management_lookup_still_reports_collection_api_failure() -> None:
     bot = FaceBot(error=RuntimeError("synthetic collection failure"))
 
     with pytest.raises(RuntimeError, match="synthetic collection failure"):

@@ -1,7 +1,6 @@
 """群文件要能被读到：QQ 的文件消息带不了 @，只能靠引用或接住最近那一批。"""
 from __future__ import annotations
 
-import importlib.util
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,14 +11,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-_spec = importlib.util.spec_from_file_location(
-    "_test_attachment_policy", _ROOT / "adapters" / "onebot" / "attachment_policy.py",
-)
-assert _spec and _spec.loader
-policy = importlib.util.module_from_spec(_spec)
-sys.modules["_test_attachment_policy"] = policy
-_spec.loader.exec_module(policy)
-
+from adapters.onebot import attachment_policy as policy  # noqa: E402
 from engine.attachments import _decode_text_file, attachments_to_content_parts  # noqa: E402
 
 

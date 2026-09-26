@@ -10,7 +10,6 @@ runner.
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +19,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from adapters.onebot import attachment_policy  # noqa: E402
 from engine.conversation_store import ConversationStore, Message, MessageType  # noqa: E402
 from engine.inference.ai_step import _shadow_write  # noqa: E402
 from engine.runner import _message_to_history_dict, _strip_images_from_content  # noqa: E402
@@ -33,12 +33,6 @@ from engine.inference.ai_step import (  # noqa: E402
     _run_async_deliver,
 )
 from tools.read_image import SPEC as READ_IMAGE_SPEC  # noqa: E402
-
-_POLICY_PATH = Path(__file__).resolve().parents[1] / "adapters" / "onebot" / "attachment_policy.py"
-_POLICY_SPEC = importlib.util.spec_from_file_location("clonoth_onebot_attachment_policy", _POLICY_PATH)
-assert _POLICY_SPEC is not None and _POLICY_SPEC.loader is not None
-_ATTACHMENT_POLICY = importlib.util.module_from_spec(_POLICY_SPEC)
-_POLICY_SPEC.loader.exec_module(_ATTACHMENT_POLICY)
 
 
 def _image_content() -> list[dict[str, object]]:
@@ -149,16 +143,16 @@ class _RecentEntry:
 
 
 def test_plain_text_request_is_not_misclassified_as_image_query() -> None:
-    assert not _ATTACHMENT_POLICY.looks_like_image_query("帮我润色这段文字")
-    assert not _ATTACHMENT_POLICY.looks_like_image_query("识别一下这个概念")
-    assert not _ATTACHMENT_POLICY.looks_like_image_query("帮我解释这个意图")
-    assert not _ATTACHMENT_POLICY.looks_like_image_query("今天去图书馆吗")
-    assert not _ATTACHMENT_POLICY.looks_like_image_query("解释绘图算法和地图数据")
-    assert _ATTACHMENT_POLICY.looks_like_image_query("再仔细看看图里的日文")
+    assert not attachment_policy.looks_like_image_query("帮我润色这段文字")
+    assert not attachment_policy.looks_like_image_query("识别一下这个概念")
+    assert not attachment_policy.looks_like_image_query("帮我解释这个意图")
+    assert not attachment_policy.looks_like_image_query("今天去图书馆吗")
+    assert not attachment_policy.looks_like_image_query("解释绘图算法和地图数据")
+    assert attachment_policy.looks_like_image_query("再仔细看看图里的日文")
 
 
 def test_reply_image_query_never_uses_unrelated_recent_image() -> None:
-    assert not _ATTACHMENT_POLICY.should_fallback_to_recent_attachments(
+    assert not attachment_policy.should_fallback_to_recent_attachments(
         has_attachments=False,
         input_enabled=True,
         looks_like_query=True,
@@ -173,7 +167,7 @@ def test_recent_image_policy_keeps_latest_same_sender_message_batch() -> None:
         _RecentEntry({"type": "image", "path": "new-1.png"}, 99.0, "user-a", "msg-new"),
         _RecentEntry({"type": "image", "path": "new-2.png"}, 99.0, "user-a", "msg-new"),
     ]
-    selected = _ATTACHMENT_POLICY.select_recent_attachment_entries(
+    selected = attachment_policy.select_recent_attachment_entries(
         entries,
         sender_id="user-a",
         now=100.0,
@@ -184,7 +178,7 @@ def test_recent_image_policy_keeps_latest_same_sender_message_batch() -> None:
 
 
 def test_queue_source_attachment_binding_keeps_all_merged_images() -> None:
-    merged = _ATTACHMENT_POLICY.source_attachments_from_merged([
+    merged = attachment_policy.source_attachments_from_merged([
         {"type": "image", "path": "first.png"},
         {"type": "image", "path": "second.png"},
         {"type": "image", "path": "first.png"},
@@ -193,7 +187,7 @@ def test_queue_source_attachment_binding_keeps_all_merged_images() -> None:
 
 
 def test_recent_image_policy_never_crosses_sender() -> None:
-    selected = _ATTACHMENT_POLICY.select_recent_attachment_entries(
+    selected = attachment_policy.select_recent_attachment_entries(
         [_RecentEntry({"type": "image", "path": "other.gif"}, 99.0, "user-b", "msg")],
         sender_id="user-a",
         now=100.0,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import dataclass, field
-import importlib.util
+import importlib
 import inspect
 import json
 import os
@@ -28,34 +28,6 @@ if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
 from _onebot_harness import load_live_config, load_runtime as _load_runtime, set_live_config, write_live_config, patch_imported  # noqa: E402
-from clonoth_sdk.types import DeliveryContext  # noqa: E402
-
-_MODULE_PATH = Path(__file__).resolve().parents[1] / "adapters" / "onebot" / "send_contract.py"
-_SPEC = importlib.util.spec_from_file_location("_onebot_send_contract", _MODULE_PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-_MODULE = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = _MODULE
-_SPEC.loader.exec_module(_MODULE)
-
-_EMOJI_MODULE_PATH = Path(__file__).resolve().parents[1] / "adapters" / "onebot" / "emoji_handler.py"
-_EMOJI_SPEC = importlib.util.spec_from_file_location("_onebot_emoji_handler", _EMOJI_MODULE_PATH)
-assert _EMOJI_SPEC is not None and _EMOJI_SPEC.loader is not None
-_EMOJI_MODULE = importlib.util.module_from_spec(_EMOJI_SPEC)
-sys.modules[_EMOJI_SPEC.name] = _EMOJI_MODULE
-_EMOJI_SPEC.loader.exec_module(_EMOJI_MODULE)
-
-from _onebot_emoji_handler import (  # type: ignore[import-not-found]  # noqa: E402
-    EmojiRenderer,
-    strip_output_markers,
-)
-from _onebot_send_contract import (  # type: ignore[import-not-found]  # noqa: E402
-    OneBotIdempotencyStore,
-    classify_send_exception,
-    make_idempotency_key,
-    protected_claim_send,
-    target_from_idempotency_key,
-    validate_send_request,
-)
 from adapters._shared import send_guard  # noqa: E402
 from adapters._shared.send_guard import (  # noqa: E402
     AmbiguousAckError,
@@ -67,6 +39,16 @@ from adapters._shared.send_guard import (  # noqa: E402
     context_from_sources,
     image_content_identity,
 )
+from adapters.onebot.emoji_handler import EmojiRenderer, strip_output_markers  # noqa: E402
+from adapters.onebot.send_contract import (  # noqa: E402
+    OneBotIdempotencyStore,
+    classify_send_exception,
+    make_idempotency_key,
+    protected_claim_send,
+    target_from_idempotency_key,
+    validate_send_request,
+)
+from clonoth_sdk.types import DeliveryContext  # noqa: E402
 
 
 def _prepared_sticker_plan(digest: str = "a" * 64) -> dict[str, Any]:
@@ -1907,7 +1889,7 @@ def test_attachment_send_locks_are_bounded_and_keep_a_busy_bucket(
 
 
 def test_custom_face_cache_is_keyed_by_account_and_drops_expired_entries() -> None:
-    renderer = _EMOJI_MODULE.EmojiRenderer()
+    renderer = EmojiRenderer()
 
     class Bot:
         def __init__(self, self_id: str) -> None:

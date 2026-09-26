@@ -11,11 +11,11 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+from adapters._shared import conversation_hash as ch  # noqa: E402
 
 
 def _load(name: str, relpath: str):
@@ -27,7 +27,6 @@ def _load(name: str, relpath: str):
     return module
 
 
-ch = _load("_qq_conversation_hash", "adapters/_shared/conversation_hash.py")
 migrate = _load("_qq_migrate_conversation_hash", "deploy/migrate_qq_conversation_hash.py")
 
 _SECRET = "0123456789abcdef" * 4  # 64 hex chars

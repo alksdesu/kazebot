@@ -21,10 +21,6 @@ if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
 from _onebot_harness import load_live_config, load_runtime, set_live_config  # noqa: E402
-
-_ADAPTER_ROOT = _ROOT / "adapters" / "onebot"
-
-
 from adapters._shared import trigger_policy as tp  # noqa: E402
 
 
@@ -686,17 +682,10 @@ class TestDryRunSharesTheDecision:
 
     def test_the_legacy_mode_sets_match_the_declared_ones(self) -> None:
         """两份枚举是同一套字面量的副本（这个模块不能有相对导入），漂了 group_mode 校验就和判定不一致。"""
-        import importlib.util
+        from adapters.onebot import config as onebot_config
 
-        name = "_onebot_config_under_test"
-        spec = importlib.util.spec_from_file_location(name, _ADAPTER_ROOT / "config.py")
-        assert spec and spec.loader
-        cfg = importlib.util.module_from_spec(spec)
-        sys.modules[name] = cfg
-        spec.loader.exec_module(cfg)
-
-        assert tp._LEGACY_ALL_MODES == cfg.GROUP_TRIGGER_ALL_MODES
-        assert tp._LEGACY_PREFIX_MODES == cfg.GROUP_TRIGGER_PREFIX_MODES
+        assert tp._LEGACY_ALL_MODES == onebot_config.GROUP_TRIGGER_ALL_MODES
+        assert tp._LEGACY_PREFIX_MODES == onebot_config.GROUP_TRIGGER_PREFIX_MODES
 
     def test_supervisor_loads_the_same_module_the_adapter_uses(self) -> None:
         from platforms.builtin import QQ_NAPCAT
