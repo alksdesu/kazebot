@@ -1,0 +1,2191 @@
+{
+ "aliases": {
+  "alias_to_index": {
+   "UserA": 0,
+   "UserAA": 26,
+   "UserAAA": 702,
+   "UserAAAA": 18278,
+   "UserAB": 27,
+   "UserAZ": 51,
+   "UserB": 1,
+   "UserBA": 52,
+   "UserZ": 25,
+   "UserZZ": 701,
+   "UserZZZ": 18277
+  },
+  "anonymized_text": [
+   "UserA 在群 GroupA 里 @UserC，还有陌生号 1234567 和 300030",
+   "[at:UserB] 回复 GroupB",
+   "没有号码的一句话"
+  ],
+  "at_resolution": {
+   "30003": "30003",
+   "@UserC": "10001",
+   "UserA": "30003",
+   "UserZZ": "",
+   "all": "",
+   "userb": "",
+   "测试用户": ""
+  },
+  "event_aliases": [
+   "AnonA",
+   "AnonB",
+   "AnonA",
+   "UserB"
+  ],
+  "groups": [
+   "GroupA",
+   "GroupB",
+   "GroupA",
+   "GroupB"
+  ],
+  "index_to_alias": {
+   "0": "UserA",
+   "1": "UserB",
+   "18277": "UserZZZ",
+   "18278": "UserAAAA",
+   "25": "UserZ",
+   "26": "UserAA",
+   "27": "UserAB",
+   "51": "UserAZ",
+   "52": "UserBA",
+   "701": "UserZZ",
+   "702": "UserAAA"
+  },
+  "memory_subjects": {
+   "direct_group": [
+    "UserB",
+    "UserA"
+   ],
+   "indirect": [
+    "UserD",
+    "UserB",
+    "UserA"
+   ],
+   "private": [
+    "UserA"
+   ],
+   "sticky_followup": [
+    "UserB",
+    "UserD"
+   ]
+  },
+  "users": [
+   "UserA",
+   "UserB",
+   "UserC",
+   "UserA",
+   "UserD",
+   "UserB",
+   "UserE"
+  ]
+ },
+ "conversation_keys": {
+  "legacy": {
+   "10000": {
+    "memory_namespace": "conv_f143f0f28e9558bff2d0db74",
+    "qq_group:700001": {
+     "real": "qq_group:700001",
+     "stable": "qq_group:62111449e6519735dc28df9a"
+    },
+    "qq_group:700002": {
+     "real": "qq_group:700002",
+     "stable": "qq_group:97aa0b9223bc0bac969631ed"
+    },
+    "qq_private:30003": {
+     "real": "qq_private:30003",
+     "stable": "qq_private:8aa5081f1b8f62e2caa80cff"
+    },
+    "sticker_group": "qq_group:62111449e6519735dc28df9a",
+    "sticker_private": "qq_private:8aa5081f1b8f62e2caa80cff"
+   },
+   "20000": {
+    "memory_namespace": "conv_d6ecc5177ba539104459df13",
+    "qq_group:700001": {
+     "real": "qq_group:700001",
+     "stable": "qq_group:26f0548fe6b3c983395c36c1"
+    },
+    "qq_group:700002": {
+     "real": "qq_group:700002",
+     "stable": "qq_group:c4e2c941aa4ccc7ead659b04"
+    },
+    "qq_private:30003": {
+     "real": "qq_private:30003",
+     "stable": "qq_private:db1354519c7959a22110f474"
+    },
+    "sticker_group": "qq_group:26f0548fe6b3c983395c36c1",
+    "sticker_private": "qq_private:db1354519c7959a22110f474"
+   },
+   "unscoped": {
+    "memory_namespace": "conv_12ea907f5e15edccd4ef2eec",
+    "qq_group:700001": {
+     "real": "qq_group:700001",
+     "stable": "qq_group:ea4065ff4172f2dc03109655"
+    },
+    "qq_group:700002": {
+     "real": "qq_group:700002",
+     "stable": "qq_group:477cb278cd1a7fefbd1068f1"
+    },
+    "qq_private:30003": {
+     "real": "qq_private:30003",
+     "stable": "qq_private:562fcf391942009a53646e3a"
+    },
+    "sticker_group": "qq_group:ea4065ff4172f2dc03109655",
+    "sticker_private": "qq_private:562fcf391942009a53646e3a"
+   }
+  },
+  "salted": {
+   "10000": {
+    "memory_namespace": "conv_e295a2c9e971f1b6433fa0b8",
+    "qq_group:700001": {
+     "real": "qq_group:700001",
+     "stable": "qq_group:707c191a1109d6ac5b677dbd"
+    },
+    "qq_group:700002": {
+     "real": "qq_group:700002",
+     "stable": "qq_group:cd9bfb57ca26b44e97d78784"
+    },
+    "qq_private:30003": {
+     "real": "qq_private:30003",
+     "stable": "qq_private:228da22a4e385b6339a6e570"
+    },
+    "sticker_group": "qq_group:707c191a1109d6ac5b677dbd",
+    "sticker_private": "qq_private:228da22a4e385b6339a6e570"
+   },
+   "20000": {
+    "memory_namespace": "conv_b48b858ea9f04643447a0840",
+    "qq_group:700001": {
+     "real": "qq_group:700001",
+     "stable": "qq_group:404101b96a272873464582ca"
+    },
+    "qq_group:700002": {
+     "real": "qq_group:700002",
+     "stable": "qq_group:c44fd4f3b1097466b0466a8d"
+    },
+    "qq_private:30003": {
+     "real": "qq_private:30003",
+     "stable": "qq_private:adcd64f7a6e113f846aad29a"
+    },
+    "sticker_group": "qq_group:404101b96a272873464582ca",
+    "sticker_private": "qq_private:adcd64f7a6e113f846aad29a"
+   },
+   "unscoped": {
+    "memory_namespace": "conv_6d22714fde404542ccdc2153",
+    "qq_group:700001": {
+     "real": "qq_group:700001",
+     "stable": "qq_group:f5c56a0bd13ecf1bf860720f"
+    },
+    "qq_group:700002": {
+     "real": "qq_group:700002",
+     "stable": "qq_group:c5d8eea1f7a2330b45e62aad"
+    },
+    "qq_private:30003": {
+     "real": "qq_private:30003",
+     "stable": "qq_private:16d9ec94ae938386ae21c9fa"
+    },
+    "sticker_group": "qq_group:f5c56a0bd13ecf1bf860720f",
+    "sticker_private": "qq_private:16d9ec94ae938386ae21c9fa"
+   }
+  }
+ },
+ "emoji_order": {
+  "api_calls": [
+   "fetch_custom_face_detail"
+  ],
+  "at_all": [
+   {
+    "qq": "all",
+    "type": "at"
+   },
+   {
+    "qq": "all",
+    "type": "at"
+   },
+   {
+    "qq": "30003",
+    "type": "at"
+   },
+   {
+    "content": "@谁也不是",
+    "type": "text"
+   }
+  ],
+  "empty": [],
+  "faces": [
+   {
+    "emoji": true,
+    "type": "image",
+    "url": "http://faces.invalid/2"
+   },
+   {
+    "emoji": true,
+    "type": "image",
+    "url": "http://faces.invalid/1"
+   },
+   {
+    "emoji": true,
+    "type": "image",
+    "url": "http://faces.invalid/1"
+   },
+   {
+    "emoji": true,
+    "type": "image",
+    "url": "http://faces.invalid/1"
+   }
+  ],
+  "markdown": [
+   {
+    "emoji": true,
+    "type": "image",
+    "url": "http://faces.invalid/1"
+   },
+   {
+    "content": " 代码 链接（https://example.invalid） ## 标题 _保留_",
+    "type": "text"
+   }
+  ],
+  "mixed": [
+   {
+    "content": "开头",
+    "type": "text"
+   },
+   {
+    "emoji": true,
+    "type": "image",
+    "url": "http://faces.invalid/1"
+   },
+   {
+    "content": "中间",
+    "type": "text"
+   },
+   {
+    "qq": "30003",
+    "type": "at"
+   },
+   {
+    "content": "、",
+    "type": "text"
+   },
+   {
+    "qq": "30003",
+    "type": "at"
+   },
+   {
+    "content": " ",
+    "type": "text"
+   },
+   {
+    "qq": "30004",
+    "type": "at"
+   },
+   {
+    "content": "结尾",
+    "type": "text"
+   },
+   {
+    "qq": "10001",
+    "type": "at"
+   }
+  ],
+  "platform_markers": [
+   {
+    "content": "表态剩下的字",
+    "type": "text"
+   }
+  ]
+ },
+ "permissions": {
+  "channels": {
+   "admin_user": {
+    "'10001'": true,
+    "'abc'": false,
+    "10001": true,
+    "30003": false,
+    "None": false
+   },
+   "group_allowed": {
+    "'700001'": true,
+    "0": false,
+    "700001": true,
+    "700002": false
+   },
+   "private_allowed": {
+    "'abc'/friend": false,
+    "10001/group": true,
+    "30003/friend": true,
+    "30004/group": true,
+    "40004/group": false,
+    "None/friend": false
+   },
+   "private_allowed_friends_off": {
+    "10001/friend": true,
+    "30003/friend": false,
+    "30004/friend": true
+   },
+   "private_origin_allowed": {
+    "10001": true,
+    "30003": false,
+    "30004": true,
+    "40004": false
+   }
+  },
+  "grants": {
+   "clear_memory": {
+    "False": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": false,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": false,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "off"
+    },
+    "None": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": true,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": true,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "admin"
+    },
+    "True": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": true,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": true,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "admin"
+    },
+    "admin": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": true,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": true,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "admin"
+    },
+    "bogus": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": true,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": true,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "admin"
+    },
+    "group_admin": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": true,
+      "listed_admin_in_group": true,
+      "member": false,
+      "other_group_owner": true,
+      "owner": true,
+      "private_admin": true,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "group_admin"
+    },
+    "no": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": false,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": false,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "off"
+    },
+    "off": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": false,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": false,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "off"
+    },
+    "owner": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": true,
+      "member": false,
+      "other_group_owner": true,
+      "owner": true,
+      "private_admin": true,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "owner"
+    }
+   },
+   "model": {
+    "False": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": false,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": false,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "off"
+    },
+    "None": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": true,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": true,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "admin"
+    },
+    "True": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": true,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": true,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "admin"
+    },
+    "admin": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": true,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": true,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "admin"
+    },
+    "bogus": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": true,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": true,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "admin"
+    },
+    "group_admin": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": true,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": true,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "admin"
+    },
+    "no": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": false,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": false,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "off"
+    },
+    "off": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": false,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": false,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "off"
+    },
+    "owner": {
+     "allows": {
+      "anonymous_owner": false,
+      "group_admin": false,
+      "listed_admin_in_group": true,
+      "member": false,
+      "other_group_owner": false,
+      "owner": false,
+      "private_admin": true,
+      "private_member": false,
+      "unparsable_user": false
+     },
+     "clamped": "admin"
+    }
+   }
+  },
+  "requesters": {
+   "anonymous_owner": {
+    "can": {
+     "approval": false,
+     "clear_memory": false,
+     "cross_session": false,
+     "custom_face": false,
+     "draw_preset": false,
+     "dream": false,
+     "model": false,
+     "proactive": false,
+     "send_dead_letter": false
+    },
+    "denial": {
+     "approval": "fallback",
+     "clear_memory": "fallback",
+     "cross_session": "fallback",
+     "custom_face": "fallback",
+     "draw_preset": "fallback",
+     "dream": null,
+     "model": "fallback",
+     "proactive": "fallback",
+     "send_dead_letter": "fallback"
+    },
+    "group_role": "",
+    "listed_admin": false,
+    "rank": 0,
+    "scope": {
+     "clear_memory": {
+      "700001": "",
+      "700002": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "None": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。"
+     },
+     "proactive": {
+      "700001": "",
+      "700002": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "None": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。"
+     }
+    }
+   },
+   "group_admin": {
+    "can": {
+     "approval": false,
+     "clear_memory": true,
+     "cross_session": false,
+     "custom_face": false,
+     "draw_preset": false,
+     "dream": false,
+     "model": false,
+     "proactive": false,
+     "send_dead_letter": false
+    },
+    "denial": {
+     "approval": "fallback",
+     "clear_memory": "fallback",
+     "cross_session": "fallback",
+     "custom_face": "fallback",
+     "draw_preset": "fallback",
+     "dream": null,
+     "model": "fallback",
+     "proactive": "fallback",
+     "send_dead_letter": "fallback"
+    },
+    "group_role": "admin",
+    "listed_admin": false,
+    "rank": 1,
+    "scope": {
+     "clear_memory": {
+      "700001": "",
+      "700002": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "None": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。"
+     },
+     "proactive": {
+      "700001": "",
+      "700002": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "None": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。"
+     }
+    }
+   },
+   "listed_admin_in_group": {
+    "can": {
+     "approval": true,
+     "clear_memory": true,
+     "cross_session": true,
+     "custom_face": true,
+     "draw_preset": true,
+     "dream": false,
+     "model": true,
+     "proactive": true,
+     "send_dead_letter": true
+    },
+    "denial": {
+     "approval": "fallback",
+     "clear_memory": "fallback",
+     "cross_session": "fallback",
+     "custom_face": "fallback",
+     "draw_preset": "fallback",
+     "dream": "「整理记忆」已在配置里关闭。",
+     "model": "fallback",
+     "proactive": "fallback",
+     "send_dead_letter": "fallback"
+    },
+    "group_role": "member",
+    "listed_admin": true,
+    "rank": 3,
+    "scope": {
+     "clear_memory": {
+      "700001": "",
+      "700002": "",
+      "None": ""
+     },
+     "proactive": {
+      "700001": "",
+      "700002": "",
+      "None": ""
+     }
+    }
+   },
+   "member": {
+    "can": {
+     "approval": false,
+     "clear_memory": false,
+     "cross_session": false,
+     "custom_face": false,
+     "draw_preset": false,
+     "dream": false,
+     "model": false,
+     "proactive": false,
+     "send_dead_letter": false
+    },
+    "denial": {
+     "approval": "fallback",
+     "clear_memory": "fallback",
+     "cross_session": "fallback",
+     "custom_face": "fallback",
+     "draw_preset": "fallback",
+     "dream": null,
+     "model": "fallback",
+     "proactive": "fallback",
+     "send_dead_letter": "fallback"
+    },
+    "group_role": "member",
+    "listed_admin": false,
+    "rank": 0,
+    "scope": {
+     "clear_memory": {
+      "700001": "",
+      "700002": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "None": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。"
+     },
+     "proactive": {
+      "700001": "",
+      "700002": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "None": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。"
+     }
+    }
+   },
+   "other_group_owner": {
+    "can": {
+     "approval": false,
+     "clear_memory": true,
+     "cross_session": false,
+     "custom_face": false,
+     "draw_preset": false,
+     "dream": false,
+     "model": false,
+     "proactive": true,
+     "send_dead_letter": false
+    },
+    "denial": {
+     "approval": "fallback",
+     "clear_memory": "fallback",
+     "cross_session": "fallback",
+     "custom_face": "fallback",
+     "draw_preset": "fallback",
+     "dream": null,
+     "model": "fallback",
+     "proactive": "fallback",
+     "send_dead_letter": "fallback"
+    },
+    "group_role": "owner",
+    "listed_admin": false,
+    "rank": 2,
+    "scope": {
+     "clear_memory": {
+      "700001": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "700002": "",
+      "None": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。"
+     },
+     "proactive": {
+      "700001": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "700002": "",
+      "None": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。"
+     }
+    }
+   },
+   "owner": {
+    "can": {
+     "approval": false,
+     "clear_memory": true,
+     "cross_session": false,
+     "custom_face": false,
+     "draw_preset": false,
+     "dream": false,
+     "model": false,
+     "proactive": true,
+     "send_dead_letter": false
+    },
+    "denial": {
+     "approval": "fallback",
+     "clear_memory": "fallback",
+     "cross_session": "fallback",
+     "custom_face": "fallback",
+     "draw_preset": "fallback",
+     "dream": null,
+     "model": "fallback",
+     "proactive": "fallback",
+     "send_dead_letter": "fallback"
+    },
+    "group_role": "owner",
+    "listed_admin": false,
+    "rank": 2,
+    "scope": {
+     "clear_memory": {
+      "700001": "",
+      "700002": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "None": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。"
+     },
+     "proactive": {
+      "700001": "",
+      "700002": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "None": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。"
+     }
+    }
+   },
+   "private_admin": {
+    "can": {
+     "approval": true,
+     "clear_memory": true,
+     "cross_session": true,
+     "custom_face": true,
+     "draw_preset": true,
+     "dream": false,
+     "model": true,
+     "proactive": true,
+     "send_dead_letter": true
+    },
+    "denial": {
+     "approval": "fallback",
+     "clear_memory": "fallback",
+     "cross_session": "fallback",
+     "custom_face": "fallback",
+     "draw_preset": "fallback",
+     "dream": "「整理记忆」已在配置里关闭。",
+     "model": "fallback",
+     "proactive": "fallback",
+     "send_dead_letter": "fallback"
+    },
+    "group_role": "",
+    "listed_admin": true,
+    "rank": 3,
+    "scope": {
+     "clear_memory": {
+      "700001": "",
+      "700002": "",
+      "None": ""
+     },
+     "proactive": {
+      "700001": "",
+      "700002": "",
+      "None": ""
+     }
+    }
+   },
+   "private_member": {
+    "can": {
+     "approval": false,
+     "clear_memory": false,
+     "cross_session": false,
+     "custom_face": false,
+     "draw_preset": false,
+     "dream": false,
+     "model": false,
+     "proactive": false,
+     "send_dead_letter": false
+    },
+    "denial": {
+     "approval": "fallback",
+     "clear_memory": "fallback",
+     "cross_session": "fallback",
+     "custom_face": "fallback",
+     "draw_preset": "fallback",
+     "dream": null,
+     "model": "fallback",
+     "proactive": "fallback",
+     "send_dead_letter": "fallback"
+    },
+    "group_role": "",
+    "listed_admin": false,
+    "rank": 0,
+    "scope": {
+     "clear_memory": {
+      "700001": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "700002": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "None": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。"
+     },
+     "proactive": {
+      "700001": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "700002": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "None": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。"
+     }
+    }
+   },
+   "unparsable_user": {
+    "can": {
+     "approval": false,
+     "clear_memory": false,
+     "cross_session": false,
+     "custom_face": false,
+     "draw_preset": false,
+     "dream": false,
+     "model": false,
+     "proactive": false,
+     "send_dead_letter": false
+    },
+    "denial": {
+     "approval": "fallback",
+     "clear_memory": "fallback",
+     "cross_session": "fallback",
+     "custom_face": "fallback",
+     "draw_preset": "fallback",
+     "dream": null,
+     "model": "fallback",
+     "proactive": "fallback",
+     "send_dead_letter": "fallback"
+    },
+    "group_role": "member",
+    "listed_admin": false,
+    "rank": 0,
+    "scope": {
+     "clear_memory": {
+      "700001": "",
+      "700002": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "None": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。"
+     },
+     "proactive": {
+      "700001": "",
+      "700002": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。",
+      "None": "你的权限只在本群有效，不能对其他群或私聊执行这个操作。"
+     }
+    }
+   }
+  }
+ },
+ "reply_split": {
+  "empty": {
+   "api_calls": [],
+   "messages": [],
+   "sent_any": false
+  },
+  "faces": {
+   "api_calls": [
+    "fetch_custom_face_detail"
+   ],
+   "messages": [
+    {
+     "kind": "group",
+     "segments": [
+      {
+       "data": {
+        "id": 99
+       },
+       "type": "reply"
+      },
+      {
+       "data": {
+        "qq": 30003
+       },
+       "type": "at"
+      },
+      {
+       "data": {
+        "text": " "
+       },
+       "type": "text"
+      },
+      {
+       "data": {
+        "text": "看这个"
+       },
+       "type": "text"
+      },
+      {
+       "data": {
+        "file": "http://faces.invalid/1",
+        "sub_type": 1,
+        "summary": "[表情]"
+       },
+       "type": "image"
+      }
+     ],
+     "target": 700001
+    },
+    {
+     "kind": "group",
+     "segments": [
+      {
+       "data": {
+        "text": "再来一个"
+       },
+       "type": "text"
+      }
+     ],
+     "target": 700001
+    }
+   ],
+   "sent_any": true
+  },
+  "long": {
+   "api_calls": [],
+   "messages": [
+    {
+     "kind": "group",
+     "segments": [
+      {
+       "data": {
+        "id": 99
+       },
+       "type": "reply"
+      },
+      {
+       "data": {
+        "qq": 30003
+       },
+       "type": "at"
+      },
+      {
+       "data": {
+        "text": " "
+       },
+       "type": "text"
+      },
+      {
+       "data": {
+        "text": "长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长长\n（内容过长，已截断）"
+       },
+       "type": "text"
+      }
+     ],
+     "target": 700001
+    }
+   ],
+   "sent_any": true
+  },
+  "markdown": {
+   "api_calls": [],
+   "messages": [
+    {
+     "kind": "private",
+     "segments": [
+      {
+       "data": {
+        "id": 98
+       },
+       "type": "reply"
+      },
+      {
+       "data": {
+        "text": "粗体 斜体 代码 链接（https://example.invalid）\n标题"
+       },
+       "type": "text"
+      }
+     ],
+     "target": 30003
+    }
+   ],
+   "sent_any": true
+  },
+  "mentions": {
+   "api_calls": [],
+   "messages": [
+    {
+     "kind": "group",
+     "segments": [
+      {
+       "data": {
+        "id": 99
+       },
+       "type": "reply"
+      },
+      {
+       "data": {
+        "qq": 30003
+       },
+       "type": "at"
+      },
+      {
+       "data": {
+        "text": " "
+       },
+       "type": "text"
+      },
+      {
+       "data": {
+        "qq": "30003"
+       },
+       "type": "at"
+      },
+      {
+       "data": {
+        "text": " 你好"
+       },
+       "type": "text"
+      }
+     ],
+     "target": 700001
+    },
+    {
+     "kind": "group",
+     "segments": [
+      {
+       "data": {
+        "qq": "30003"
+       },
+       "type": "at"
+      },
+      {
+       "data": {
+        "text": " "
+       },
+       "type": "text"
+      },
+      {
+       "data": {
+        "qq": "30004"
+       },
+       "type": "at"
+      },
+      {
+       "data": {
+        "text": "、"
+       },
+       "type": "text"
+      },
+      {
+       "data": {
+        "qq": "10001"
+       },
+       "type": "at"
+      },
+      {
+       "data": {
+        "text": " 都来"
+       },
+       "type": "text"
+      }
+     ],
+     "target": 700001
+    }
+   ],
+   "sent_any": true
+  },
+  "newlines": {
+   "api_calls": [],
+   "messages": [
+    {
+     "kind": "group",
+     "segments": [
+      {
+       "data": {
+        "id": 99
+       },
+       "type": "reply"
+      },
+      {
+       "data": {
+        "qq": 30003
+       },
+       "type": "at"
+      },
+      {
+       "data": {
+        "text": " "
+       },
+       "type": "text"
+      },
+      {
+       "data": {
+        "text": "普通换行\n保留排版\n\n段落二"
+       },
+       "type": "text"
+      }
+     ],
+     "target": 700001
+    }
+   ],
+   "sent_any": true
+  },
+  "only_split": {
+   "api_calls": [],
+   "messages": [],
+   "sent_any": false
+  },
+  "platform_markers": {
+   "api_calls": [],
+   "messages": [
+    {
+     "kind": "private",
+     "segments": [
+      {
+       "data": {
+        "id": 98
+       },
+       "type": "reply"
+      },
+      {
+       "data": {
+        "text": "带表态"
+       },
+       "type": "text"
+      }
+     ],
+     "target": 30003
+    }
+   ],
+   "sent_any": true
+  },
+  "split_marker": {
+   "api_calls": [
+    "get_group_member_list"
+   ],
+   "messages": [
+    {
+     "kind": "group",
+     "segments": [
+      {
+       "data": {
+        "id": 99
+       },
+       "type": "reply"
+      },
+      {
+       "data": {
+        "qq": 30003
+       },
+       "type": "at"
+      },
+      {
+       "data": {
+        "text": " "
+       },
+       "type": "text"
+      },
+      {
+       "data": {
+        "text": "第一段"
+       },
+       "type": "text"
+      }
+     ],
+     "target": 700001
+    },
+    {
+     "kind": "group",
+     "segments": [
+      {
+       "data": {
+        "text": "第二段"
+       },
+       "type": "text"
+      }
+     ],
+     "target": 700001
+    },
+    {
+     "kind": "group",
+     "segments": [
+      {
+       "data": {
+        "text": "第三段"
+       },
+       "type": "text"
+      }
+     ],
+     "target": 700001
+    }
+   ],
+   "sent_any": true
+  }
+ },
+ "triggers": {
+  "all_signal": {
+   "at": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "全量模式：群内任意消息都回",
+     "signal": "all",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.553523,
+    "rule": true,
+    "stripped": "@一下",
+    "text": "@一下"
+   },
+   "empty": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "全量模式：群内任意消息都回",
+     "signal": "all",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.967786,
+    "rule": true,
+    "stripped": "",
+    "text": ""
+   },
+   "plain": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "全量模式：群内任意消息都回",
+     "signal": "all",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.749366,
+    "rule": true,
+    "stripped": "随便一句",
+    "text": "随便一句"
+   }
+  },
+  "allowlist": {
+   "home_group": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "被 @",
+     "signal": "at",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.749366,
+    "rule": true,
+    "stripped": "本群",
+    "text": "本群"
+   },
+   "other_group": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "被 @",
+     "signal": "at",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.870413,
+    "rule": false,
+    "stripped": "外群",
+    "text": "外群"
+   }
+  },
+  "at_off": {
+   "at_segment": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.749366,
+    "rule": false,
+    "stripped": "at 关了",
+    "text": "at 关了"
+   },
+   "reply": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "被回复",
+     "signal": "reply",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.553523,
+    "rule": true,
+    "stripped": "回复还开着",
+    "text": "回复还开着"
+   },
+   "to_me": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.967786,
+    "rule": false,
+    "stripped": "to_me 关了",
+    "text": "to_me 关了"
+   }
+  },
+  "default": {
+   "anonymous_at": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "被 @",
+     "signal": "at",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.963414,
+    "rule": true,
+    "stripped": "匿名来问",
+    "text": "匿名来问"
+   },
+   "at_segment": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "被 @",
+     "signal": "at",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.967786,
+    "rule": true,
+    "stripped": "帮我看看",
+    "text": "帮我看看"
+   },
+   "at_stripped_to_me": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "被 @",
+     "signal": "at",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.553523,
+    "rule": true,
+    "stripped": "帮我看看呀",
+    "text": "帮我看看呀"
+   },
+   "default_prefix": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.303803,
+    "rule": false,
+    "stripped": "/问 今天",
+    "text": "/问 今天"
+   },
+   "name_off": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.143795,
+    "rule": false,
+    "stripped": "咪啪在吗",
+    "text": "咪啪在吗"
+   },
+   "other_group_at": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "被 @",
+     "signal": "at",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.447538,
+    "rule": true,
+    "stripped": "别的群",
+    "text": "别的群"
+   },
+   "plain": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.749366,
+    "rule": false,
+    "stripped": "在吗",
+    "text": "在吗"
+   },
+   "reply_and_to_me": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "被回复",
+     "signal": "reply",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.969342,
+    "rule": true,
+    "stripped": "接着说呀",
+    "text": "接着说呀"
+   },
+   "reply_bot": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "被回复",
+     "signal": "reply",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.629325,
+    "rule": true,
+    "stripped": "接着说",
+    "text": "接着说"
+   }
+  },
+  "group_cooldown": {
+   "after_window": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "命中关键词「天气」",
+     "signal": "keyword",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.969342,
+    "rule": true,
+    "stripped": "天气5",
+    "text": "天气5"
+   },
+   "at_exempt": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "被 @",
+     "signal": "at",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.553523,
+    "rule": true,
+    "stripped": "天气3",
+    "text": "天气3"
+   },
+   "first": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "命中关键词「天气」",
+     "signal": "keyword",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.749366,
+    "rule": true,
+    "stripped": "天气1",
+    "text": "天气1"
+   },
+   "other_group": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "命中关键词「天气」",
+     "signal": "keyword",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.972627,
+    "rule": true,
+    "stripped": "天气4",
+    "text": "天气4"
+   },
+   "other_user_blocked": {
+    "decision": {
+     "blocked_by": "cooldown",
+     "cooldown_remaining": 599.0,
+     "reason": "命中命中关键词「天气」，但本群的冷却还剩 599.0s",
+     "signal": "keyword",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.468273,
+    "rule": false,
+    "stripped": "天气2",
+    "text": "天气2"
+   }
+  },
+  "legacy_all": {
+   "plain": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "全量模式：群内任意消息都回",
+     "signal": "all",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.749366,
+    "rule": true,
+    "stripped": "随便一句",
+    "text": "随便一句"
+   }
+  },
+  "legacy_prefix": {
+   "bang": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "命中前缀「!」",
+     "signal": "prefix",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.749366,
+    "rule": true,
+    "stripped": "你好",
+    "text": "!你好"
+   },
+   "fullwidth_slash": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "命中前缀「／」",
+     "signal": "prefix",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.553523,
+    "rule": true,
+    "stripped": "／问",
+    "text": "／问"
+   },
+   "plain": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.967786,
+    "rule": false,
+    "stripped": "你好",
+    "text": "你好"
+   }
+  },
+  "llm_intent": {
+   "at_records_cooldown": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "被 @",
+     "signal": "at",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.967786,
+    "rule": true,
+    "stripped": "at 一下",
+    "text": "at 一下"
+   },
+   "intent_after_window": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "其他规则都不命中，交给模型判断要不要接话",
+     "signal": "llm_intent",
+     "triggered": false,
+     "undetermined": true
+    },
+    "intent_rule": true,
+    "roll": 0.629325,
+    "rule": false,
+    "stripped": "无关的话3",
+    "text": "无关的话3"
+   },
+   "intent_in_cooldown": {
+    "decision": {
+     "blocked_by": "cooldown",
+     "cooldown_remaining": 29.0,
+     "reason": "其他规则都不命中，本来要交给模型判断，但本群的冷却还剩 29.0s",
+     "signal": "llm_intent",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.553523,
+    "rule": false,
+    "stripped": "无关的话2",
+    "text": "无关的话2"
+   },
+   "undetermined": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "其他规则都不命中，交给模型判断要不要接话",
+     "signal": "llm_intent",
+     "triggered": false,
+     "undetermined": true
+    },
+    "intent_rule": true,
+    "roll": 0.749366,
+    "rule": false,
+    "stripped": "无关的话",
+    "text": "无关的话"
+   }
+  },
+  "name_at_start_only": {
+   "comma": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "出现名字「咪啪」",
+     "signal": "name",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.967786,
+    "rule": true,
+    "stripped": "咪啪，你好",
+    "text": "咪啪，你好"
+   },
+   "glued": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "出现名字「咪啪」",
+     "signal": "name",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.553523,
+    "rule": true,
+    "stripped": "咪啪你好",
+    "text": "咪啪你好"
+   },
+   "middle": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.749366,
+    "rule": false,
+    "stripped": "我觉得咪啪很可爱",
+    "text": "我觉得咪啪很可爱"
+   }
+  },
+  "named": {
+   "alt_name": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "出现名字「小咪」",
+     "signal": "name",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.553523,
+    "rule": true,
+    "stripped": "小咪，出来",
+    "text": "小咪，出来"
+   },
+   "keyword": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "命中关键词「天气」",
+     "signal": "keyword",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.143795,
+    "rule": true,
+    "stripped": "明天天气如何",
+    "text": "明天天气如何"
+   },
+   "keyword_other": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "命中关键词「下雨」",
+     "signal": "keyword",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.607836,
+    "rule": true,
+    "stripped": "外面下雨了",
+    "text": "外面下雨了"
+   },
+   "name_middle": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "出现名字「咪啪」",
+     "signal": "name",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.967786,
+    "rule": true,
+    "stripped": "我觉得咪啪很可爱",
+    "text": "我觉得咪啪很可爱"
+   },
+   "name_start": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "出现名字「咪啪」",
+     "signal": "name",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.749366,
+    "rule": true,
+    "stripped": "咪啪在吗",
+    "text": "咪啪在吗"
+   },
+   "nothing": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.963414,
+    "rule": false,
+    "stripped": "无关的话",
+    "text": "无关的话"
+   },
+   "prefix": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "命中前缀「/问」",
+     "signal": "prefix",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.629325,
+    "rule": true,
+    "stripped": "今天几号",
+    "text": "/问 今天几号"
+   },
+   "prefix_hash": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "命中前缀「#」",
+     "signal": "prefix",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.969342,
+    "rule": true,
+    "stripped": "查一下",
+    "text": "#查一下"
+   },
+   "prefix_leading_space": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "命中前缀「/问」",
+     "signal": "prefix",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.303803,
+    "rule": true,
+    "stripped": "带空格",
+    "text": "/问 带空格"
+   }
+  },
+  "random": {
+   "roll_0": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.749366,
+    "rule": false,
+    "stripped": "随机第0句",
+    "text": "随机第0句"
+   },
+   "roll_1": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.967786,
+    "rule": false,
+    "stripped": "随机第1句",
+    "text": "随机第1句"
+   },
+   "roll_10": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.748118,
+    "rule": false,
+    "stripped": "随机第10句",
+    "text": "随机第10句"
+   },
+   "roll_11": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "随机插话（概率 50%）",
+     "signal": "random",
+     "triggered": true,
+     "undetermined": true
+    },
+    "intent_rule": null,
+    "roll": 0.089533,
+    "rule": true,
+    "stripped": "随机第11句",
+    "text": "随机第11句"
+   },
+   "roll_2": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.553523,
+    "rule": false,
+    "stripped": "随机第2句",
+    "text": "随机第2句"
+   },
+   "roll_3": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.629325,
+    "rule": false,
+    "stripped": "随机第3句",
+    "text": "随机第3句"
+   },
+   "roll_4": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.969342,
+    "rule": false,
+    "stripped": "随机第4句",
+    "text": "随机第4句"
+   },
+   "roll_5": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "随机插话（概率 50%）",
+     "signal": "random",
+     "triggered": true,
+     "undetermined": true
+    },
+    "intent_rule": null,
+    "roll": 0.303803,
+    "rule": true,
+    "stripped": "随机第5句",
+    "text": "随机第5句"
+   },
+   "roll_6": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "随机插话（概率 50%）",
+     "signal": "random",
+     "triggered": true,
+     "undetermined": true
+    },
+    "intent_rule": null,
+    "roll": 0.143795,
+    "rule": true,
+    "stripped": "随机第6句",
+    "text": "随机第6句"
+   },
+   "roll_7": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.607836,
+    "rule": false,
+    "stripped": "随机第7句",
+    "text": "随机第7句"
+   },
+   "roll_8": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.963414,
+    "rule": false,
+    "stripped": "随机第8句",
+    "text": "随机第8句"
+   },
+   "roll_9": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "没有命中任何开着的信号",
+     "signal": "",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.887316,
+    "rule": false,
+    "stripped": "随机第9句",
+    "text": "随机第9句"
+   }
+  },
+  "user_cooldown": {
+   "after_window": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "命中关键词「天气」",
+     "signal": "keyword",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.969342,
+    "rule": true,
+    "stripped": "天气5",
+    "text": "天气5"
+   },
+   "at_not_exempt": {
+    "decision": {
+     "blocked_by": "cooldown",
+     "cooldown_remaining": 280.0,
+     "reason": "命中被 @，但这个人的冷却还剩 280.0s",
+     "signal": "at",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.629325,
+    "rule": false,
+    "stripped": "天气4",
+    "text": "天气4"
+   },
+   "first": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "命中关键词「天气」",
+     "signal": "keyword",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.749366,
+    "rule": true,
+    "stripped": "天气1",
+    "text": "天气1"
+   },
+   "other_user": {
+    "decision": {
+     "blocked_by": "",
+     "cooldown_remaining": 0.0,
+     "reason": "命中关键词「天气」",
+     "signal": "keyword",
+     "triggered": true,
+     "undetermined": false
+    },
+    "intent_rule": null,
+    "roll": 0.931378,
+    "rule": true,
+    "stripped": "天气3",
+    "text": "天气3"
+   },
+   "same_user_blocked": {
+    "decision": {
+     "blocked_by": "cooldown",
+     "cooldown_remaining": 290.0,
+     "reason": "命中命中关键词「天气」，但这个人的冷却还剩 290.0s",
+     "signal": "keyword",
+     "triggered": false,
+     "undetermined": false
+    },
+    "intent_rule": false,
+    "roll": 0.967786,
+    "rule": false,
+    "stripped": "天气2",
+    "text": "天气2"
+   }
+  }
+ }
+}
