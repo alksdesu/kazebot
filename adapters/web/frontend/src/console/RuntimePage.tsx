@@ -2,21 +2,21 @@
 import { useState } from 'react';
 
 import { restartEngine } from '../api/supervisorClient';
+import { QQ_NAPCAT } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
 import {
-  Block,
   Button,
   DangerPanel,
   Desc,
   Facts,
-  Fixed,
-  Footnote,
-  Grid,
   Panel,
   ReadOnlyRow,
 } from './components';
 import { useLiveValue, useRuntime } from './consoleStore';
-import { BoolOption, NumberField } from './fields';
+import { SchemaFields } from './FieldRenderer';
+import { registerSectionComponents, type FieldSpec } from './fieldSchema';
+
+const SECTION = 'link';
 
 const QueueFacts = () => {
   const runtime = useRuntime();
@@ -120,70 +120,115 @@ const RestartEngine = () => {
   );
 };
 
+registerSectionComponents(QQ_NAPCAT.id, SECTION, {
+  queueFacts: QueueFacts,
+  historyFacts: HistoryFacts,
+  bridgeFacts: BridgeFacts,
+  environment: Environment,
+  restartEngine: RestartEngine,
+});
+
+const SCHEMA: FieldSpec[] = [
+  {
+    kind: 'block',
+    title: '消息队列',
+    hint: '开着的时候群消息排队处理，不再并发',
+    children: [
+      {
+        kind: 'grid',
+        children: [
+          {
+            kind: 'bool',
+            key: 'enable_queue',
+            label: '启用队列',
+            desc: '按顺序一条条处理，避免同时开好几个对话。',
+            children: [
+              { kind: 'number', key: 'queue_workers', label: 'worker', unit: '个' },
+              { kind: 'number', key: 'queue_interval', label: '间隔', step: 0.5, unit: '秒' },
+            ],
+          },
+          {
+            kind: 'bool',
+            key: 'queue_wait_for_reply',
+            label: '等回复',
+            desc: '等上一条真的回完再取下一条，而不是发出去就算完。',
+            children: [{ kind: 'number', key: 'queue_reply_timeout', label: '超时', step: 10, unit: '秒' }],
+          },
+        ],
+      },
+      { kind: 'custom', name: 'queueFacts' },
+    ],
+  },
+  {
+    kind: 'block',
+    title: '群历史',
+    hint: '给模型看的上下文，不是 QQ 的聊天记录',
+    children: [
+      {
+        kind: 'grid',
+        children: [
+          {
+            kind: 'fixed',
+            label: '缓存条数',
+            children: [
+              { kind: 'desc', text: '每个群留多少条最近消息。0 表示不缓存。' },
+              { kind: 'number', key: 'group_history_max', label: '每群', unit: '条' },
+            ],
+          },
+          {
+            kind: 'fixed',
+            label: '未送达余量',
+            children: [
+              {
+                kind: 'desc',
+                text: '还没送到 Engine 的行可以多占几倍位置，硬上限 = 缓存条数 × 本值。1.0 表示不给余量，满了就丢。',
+              },
+              { kind: 'number', key: 'group_history_undelivered_ratio', label: '上限倍数', step: 0.5, unit: '倍' },
+            ],
+          },
+        ],
+      },
+      { kind: 'custom', name: 'historyFacts' },
+    ],
+  },
+  {
+    kind: 'block',
+    title: '转发桥',
+    hint: '本地 HTTP 口子，供别的进程借 bot 发消息',
+    children: [
+      {
+        kind: 'grid',
+        children: [{
+          kind: 'bool',
+          key: 'enable_forward_bridge',
+          label: '启用转发桥',
+          desc: '关掉会立刻停掉这个本地端口。',
+          fallback: true,
+          children: [{ kind: 'number', key: 'forward_bridge_max_messages', label: '单次最多', unit: '条' }],
+        }],
+      },
+      { kind: 'custom', name: 'bridgeFacts' },
+    ],
+  },
+  {
+    kind: 'block',
+    title: '固定配置',
+    hint: '改这些要重启进程，控制台只读',
+    children: [{ kind: 'custom', name: 'environment' }],
+  },
+  {
+    kind: 'block',
+    title: '危险操作',
+    hint: '唯一会中断正在进行的工作的操作',
+    children: [{ kind: 'custom', name: 'restartEngine' }],
+  },
+  {
+    kind: 'note',
+    text: '队列、群历史、转发桥这几项改完同样是热生效 —— bot 会在两秒内重建 worker、deque 与'
+      + '监听端口，不需要重启。上面那个重启按钮是给 engine worker 卡住时用的。',
+  },
+];
+
 export const RuntimePage = () => (
-  <>
-    <Block hint="开着的时候群消息排队处理，不再并发" title="消息队列">
-      <Grid>
-        <BoolOption
-          configKey="enable_queue"
-          desc="按顺序一条条处理，避免同时开好几个对话。"
-          label="启用队列"
-        >
-          <NumberField configKey="queue_workers" label="worker" unit="个" />
-          <NumberField configKey="queue_interval" label="间隔" step={0.5} unit="秒" />
-        </BoolOption>
-        <BoolOption
-          configKey="queue_wait_for_reply"
-          desc="等上一条真的回完再取下一条，而不是发出去就算完。"
-          label="等回复"
-        >
-          <NumberField configKey="queue_reply_timeout" label="超时" step={10} unit="秒" />
-        </BoolOption>
-      </Grid>
-      <QueueFacts />
-    </Block>
-
-    <Block hint="给模型看的上下文，不是 QQ 的聊天记录" title="群历史">
-      <Grid>
-        <Fixed name="缓存条数">
-          <Desc>每个群留多少条最近消息。0 表示不缓存。</Desc>
-          <NumberField configKey="group_history_max" label="每群" unit="条" />
-        </Fixed>
-        <Fixed name="未送达余量">
-          <Desc>
-            还没送到 Engine 的行可以多占几倍位置，硬上限 = 缓存条数 × 本值。1.0 表示不给余量，满了就丢。
-          </Desc>
-          <NumberField configKey="group_history_undelivered_ratio" label="上限倍数" step={0.5} unit="倍" />
-        </Fixed>
-      </Grid>
-      <HistoryFacts />
-    </Block>
-
-    <Block hint="本地 HTTP 口子，供别的进程借 bot 发消息" title="转发桥">
-      <Grid>
-        <BoolOption
-          configKey="enable_forward_bridge"
-          desc="关掉会立刻停掉这个本地端口。"
-          fallback
-          label="启用转发桥"
-        >
-          <NumberField configKey="forward_bridge_max_messages" label="单次最多" unit="条" />
-        </BoolOption>
-      </Grid>
-      <BridgeFacts />
-    </Block>
-
-    <Block hint="改这些要重启进程，控制台只读" title="固定配置">
-      <Environment />
-    </Block>
-
-    <Block hint="唯一会中断正在进行的工作的操作" title="危险操作">
-      <RestartEngine />
-    </Block>
-
-    <Footnote>
-      队列、群历史、转发桥这几项改完同样是热生效 —— bot 会在两秒内重建 worker、deque 与
-      监听端口，不需要重启。上面那个重启按钮是给 engine worker 卡住时用的。
-    </Footnote>
-  </>
+  <SchemaFields platformId={QQ_NAPCAT.id} sectionId={SECTION} spec={SCHEMA} />
 );

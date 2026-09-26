@@ -15,7 +15,7 @@ import {
 } from '../api/supervisorClient';
 import { SettingsPageHost } from '../components/settings/SettingsPageHost';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
-import { useConsoleStore } from '../console/consoleStore';
+import { platformConsoleStore } from '../console/consoleStore';
 import { ModelsPage } from '../console/ModelsPage';
 import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
@@ -176,7 +176,7 @@ describe('模型参数页', () => {
 
 describe('设置页外壳里的模型页', () => {
   beforeEach(() => {
-    useConsoleStore.setState({ live: null, loading: false, draft: {} });
+    platformConsoleStore('qq').setState({ live: null, loading: false, draft: {} });
     useViewStore.setState({ viewMode: 'settings', activeSettingsTab: 'qq-models' });
     useSettingsStore.setState({ adminToken: 'admin-token', isAuthenticated: true });
   });

@@ -1,8 +1,8 @@
 // 试听：一段模拟群消息流，每条旁边显示 bot 会不会回、命中哪条规则。
-// 判定全部来自后端 /qq/trigger/dry-run，前端不重写一份布尔组合。
+// 判定全部来自后端的 trigger/dry-run，前端不重写一份布尔组合。
 import { useEffect } from 'react';
 
-import type { QqDryRunVerdict } from '../api/supervisorClient';
+import type { PlatformDryRunVerdict } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import {
   alignVerdicts,
@@ -13,6 +13,7 @@ import {
 } from './auditionStore';
 import { Button, Check, ErrorText, Input, Tag } from './components';
 import { useConsoleStore } from './consoleStore';
+import { usePlatform } from './platformContext';
 import { blockerLabel, showSignalTag, signalLabel } from './signals';
 
 const VERDICT =
@@ -31,13 +32,13 @@ const FLAG_TOGGLE =
   + ' aria-pressed:text-[var(--duties-bg)] aria-pressed:hover:text-[var(--duties-bg)]';
 
 /** 三种结局各有各的读法：会回 / 不会回 / 要到运行时才知道。 */
-const verdictOf = (v: QqDryRunVerdict) => {
+const verdictOf = (v: PlatformDryRunVerdict) => {
   if (v.undetermined) return { mark: '看运行时', tone: 'text-[var(--duties-text)]' };
   if (v.triggered) return { mark: '会回应', tone: 'text-[var(--duties-live)]' };
   return { mark: '不回应', tone: 'text-[var(--duties-secondary)]' };
 };
 
-const Verdict = ({ verdict }: { verdict: QqDryRunVerdict | undefined }) => {
+const Verdict = ({ verdict }: { verdict: PlatformDryRunVerdict | undefined }) => {
   if (!verdict) return <p className={`${VERDICT} text-[var(--duties-secondary)]`}>↳ 等待判定</p>;
   const { mark, tone } = verdictOf(verdict);
   const blocked = verdict.blocked_by ? `${blockerLabel(verdict.blocked_by)}拦下` : '';
@@ -56,6 +57,7 @@ const Verdict = ({ verdict }: { verdict: QqDryRunVerdict | undefined }) => {
 };
 
 export const Audition = () => {
+  const platform = usePlatform();
   const token = useSettingsStore((state) => state.adminToken);
   const draft = useConsoleStore((state) => state.draft);
   const live = useConsoleStore((state) => state.live);
@@ -66,8 +68,8 @@ export const Audition = () => {
 
   // draft / live 也是依赖：改开关必须让整列判定跟着重算，否则试听显示的是上一份配置。
   useEffect(() => {
-    if (token) schedule(token);
-  }, [token, messages, intervalSec, cooldown, draft, live, schedule]);
+    if (token) schedule(token, platform.id);
+  }, [token, platform.id, messages, intervalSec, cooldown, draft, live, schedule]);
 
   const byId = alignVerdicts(resultIds, result?.results);
   const listening = result?.enabled_signals || [];

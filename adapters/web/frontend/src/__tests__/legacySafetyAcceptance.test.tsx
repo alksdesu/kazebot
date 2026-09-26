@@ -8,14 +8,14 @@ import { NodeFilesSettingsPage } from '../components/settings/pages/NodeFilesSet
 import { AgentsSettingsRightPanel, AutomationSettingsRightPanel } from '../components/settings/panels/SettingsContextPanels';
 import { hasLikelyYamlSyntaxIssue } from '../components/settings/settingsStructuredConfig';
 import { parseMcpClients, parseNodeConfig, parseSchedules, serializeMcpClients, serializeNodeConfig, serializeSchedules } from '../components/settings/settingsStructuredConfig';
-import { useConsoleStore } from '../console/consoleStore';
+import { platformConsoleStore } from '../console/consoleStore';
 import { useSettingsSelectionStore } from '../store/settingsSelectionStore';
 import { useSettingsStore } from '../store/settingsStore';
 
 vi.mock('../api/supervisorClient', async importOriginal => ({
   ...await importOriginal<typeof import('../api/supervisorClient')>(),
   decideApproval: vi.fn(), getNodeFiles: vi.fn(), getNodeFileRaw: vi.fn(), updateNodeFileRaw: vi.fn(),
-  getQqRaw: vi.fn(), getQqState: vi.fn(), updateQqRaw: vi.fn(),
+  getPlatformRaw: vi.fn(), getPlatformState: vi.fn(), updatePlatformRaw: vi.fn(),
   getNodeRaw: vi.fn(), updateNodeRaw: vi.fn(), getNodes: vi.fn(), getProviders: vi.fn(),
   getSchedulesRaw: vi.fn(), updateSchedulesRaw: vi.fn(),
 }));
@@ -32,7 +32,7 @@ beforeEach(() => {
   vi.spyOn(window, 'confirm').mockReturnValue(true);
   useSettingsStore.setState({ adminToken: 'synthetic-token', isAuthenticated: true });
   useSettingsSelectionStore.setState({ selectedNode: null, selectedScheduleId: null });
-  useConsoleStore.setState({ draft: {}, raw: '', live: null, saving: false, loading: false, error: '', notice: '' });
+  platformConsoleStore('qq').setState({ draft: {}, raw: '', live: null, saving: false, loading: false, error: '', notice: '' });
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
@@ -182,33 +182,33 @@ describe('editor identity and draft protection', () => {
 });
 
 describe('shared QQ apply transaction', () => {
-  const seed = () => useConsoleStore.setState({ live: { published: true, applied: true, file: { exists: true, size: 1, mtime_ns: 1 }, state: { values: { a: true, b: true }, paths: { a: 'signals.a', b: 'signals.b' } } } });
+  const seed = () => platformConsoleStore('qq').setState({ live: { published: true, applied: true, file: { exists: true, size: 1, mtime_ns: 1 }, state: { values: { a: true, b: true }, paths: { a: 'signals.a', b: 'signals.b' } } } });
   it('preserves edits made while saving, including a revert to the formerly applied value', async () => {
     seed();
     const request = deferred<{ ok: boolean; warnings: string[] }>();
     let content = 'other: latest\n';
-    vi.mocked(api.getQqRaw).mockImplementation(async () => ({ content, exists: true }));
-    vi.mocked(api.updateQqRaw).mockImplementation(async (_, raw) => { content = raw; return request.promise; });
-    vi.mocked(api.getQqState).mockRejectedValue(new Error('heartbeat unavailable'));
-    useConsoleStore.getState().setDraft('a', false);
-    const operation = useConsoleStore.getState().apply('synthetic');
-    await waitFor(() => expect(api.updateQqRaw).toHaveBeenCalledOnce());
-    useConsoleStore.getState().setDraft('a', true);
-    useConsoleStore.getState().setDraft('b', false);
+    vi.mocked(api.getPlatformRaw).mockImplementation(async () => ({ content, exists: true }));
+    vi.mocked(api.updatePlatformRaw).mockImplementation(async (_token, _platform, raw) => { content = raw; return request.promise; });
+    vi.mocked(api.getPlatformState).mockRejectedValue(new Error('heartbeat unavailable'));
+    platformConsoleStore('qq').getState().setDraft('a', false);
+    const operation = platformConsoleStore('qq').getState().apply('synthetic');
+    await waitFor(() => expect(api.updatePlatformRaw).toHaveBeenCalledOnce());
+    platformConsoleStore('qq').getState().setDraft('a', true);
+    platformConsoleStore('qq').getState().setDraft('b', false);
     request.resolve({ ok: true, warnings: [] });
     await operation;
-    expect(useConsoleStore.getState().draft).toEqual({ a: true, b: false });
-    expect(useConsoleStore.getState().raw).toContain('other: latest');
-    expect(useConsoleStore.getState().live?.applied).toBe(false);
-    expect(useConsoleStore.getState().notice).toContain('无法确认');
+    expect(platformConsoleStore('qq').getState().draft).toEqual({ a: true, b: false });
+    expect(platformConsoleStore('qq').getState().raw).toContain('other: latest');
+    expect(platformConsoleStore('qq').getState().live?.applied).toBe(false);
+    expect(platformConsoleStore('qq').getState().notice).toContain('无法确认');
   });
   it('never PUTs over malformed YAML and keeps the draft for repair', async () => {
     seed();
-    vi.mocked(api.getQqRaw).mockResolvedValue({ content: 'signals: [', exists: true });
-    useConsoleStore.getState().setDraft('a', false);
-    await useConsoleStore.getState().apply('synthetic');
-    expect(api.updateQqRaw).not.toHaveBeenCalled();
-    expect(useConsoleStore.getState().draft).toEqual({ a: false });
-    expect(useConsoleStore.getState().error).not.toBe('');
+    vi.mocked(api.getPlatformRaw).mockResolvedValue({ content: 'signals: [', exists: true });
+    platformConsoleStore('qq').getState().setDraft('a', false);
+    await platformConsoleStore('qq').getState().apply('synthetic');
+    expect(api.updatePlatformRaw).not.toHaveBeenCalled();
+    expect(platformConsoleStore('qq').getState().draft).toEqual({ a: false });
+    expect(platformConsoleStore('qq').getState().error).not.toBe('');
   });
 });

@@ -1,9 +1,12 @@
 // 权限：谁是管理员，以及每项能力放到哪一档。能力清单由 bot 公布，这一页只负责显示和写回。
-import type { QqCapability } from '../api/supervisorClient';
-import { Block, Desc, ErrorText, Facts, Footnote, Grid, Item, ItemTitle, List, Panel, Segmented } from './components';
+import type { PlatformCapability } from '../api/supervisorClient';
+import { QQ_NAPCAT } from '../platforms/registry';
+import { Desc, ErrorText, Facts, Item, ItemTitle, List, Segmented } from './components';
 import { useCapabilities, useConsoleStore, useIdList, useLiveValue, useNote } from './consoleStore';
-import { BoolOption } from './fields';
-import { IdList } from './IdList';
+import { SchemaFields } from './FieldRenderer';
+import { registerSectionComponents, type FieldSpec } from './fieldSchema';
+
+const SECTION = 'permissions';
 
 // 档位是固定的四个枚举，不像能力那样会增长，所以说法留在前端。
 // 「加」表示在前一档基础上累加 —— 选了群主，名单里的人一样还能用。
@@ -23,7 +26,7 @@ const EmptyWarning = () => {
   return <ErrorText>{note || '名单为空，管理命令全部不可用。'}</ErrorText>;
 };
 
-const CapabilityRow = ({ cap }: { cap: QqCapability }) => {
+const CapabilityRow = ({ cap }: { cap: PlatformCapability }) => {
   const setDraft = useConsoleStore((state) => state.setDraft);
   const configKey = `grant_${cap.key}`;
   const grant = useLiveValue<string>(configKey, cap.default);
@@ -65,53 +68,73 @@ const Capabilities = () => {
   );
 };
 
+registerSectionComponents(QQ_NAPCAT.id, SECTION, { adminWarning: EmptyWarning, capabilities: Capabilities });
+
+const SCHEMA: FieldSpec[] = [
+  {
+    kind: 'block',
+    title: '管理员',
+    hint: '名单里的 QQ 号在所有会话里都算管理员',
+    children: [{
+      kind: 'panel',
+      children: [
+        {
+          kind: 'ids',
+          key: 'admin_users',
+          label: '管理员 QQ',
+          empty: '名单为空',
+          placeholder: '输入 QQ 号，回车添加',
+          spacing: 'panel',
+        },
+        { kind: 'custom', name: 'adminWarning' },
+      ],
+    }],
+  },
+  {
+    kind: 'block',
+    title: '这些人能做什么',
+    hint: '每项各自决定放到哪一档',
+    children: [{ kind: 'custom', name: 'capabilities' }],
+  },
+  {
+    kind: 'block',
+    title: '审批',
+    hint: '审批卡片怎么认回来',
+    children: [{
+      kind: 'grid',
+      children: [
+        {
+          kind: 'bool',
+          key: 'approval_reply_unique_fallback',
+          label: '唯一待审批兜底',
+          desc: '引用了审批卡片却取不到编号时，按「当前唯一待审批」处理。',
+          children: [{
+            kind: 'desc',
+            text: '默认关：这条兜底分不清引用的是它、还是另一张已经处理过的卡片，是误批的直接成因。开了也仍然要求只剩一条待审批、且那张卡片确实发给了本人。',
+          }],
+        },
+        {
+          kind: 'bool',
+          key: 'approval_bare_verb_unique',
+          label: '直接回同意',
+          desc: '不引用卡片、整句只发「同意」时，按当前唯一待审批处理。',
+          children: [{
+            kind: 'desc',
+            text: '默认开：收到卡片后直接回「同意」就能批。只在你名下恰好剩一条待审批、且那张卡片确实发给你时成立；有多条会让你指定，一条都没有时就当普通聊天。',
+          }],
+        },
+      ],
+    }],
+  },
+  {
+    kind: 'note',
+    text: '群主与群管理员的身份由 QQ 上报，只在群消息里成立 —— 同一个人在私聊里就是普通用户。'
+      + '影响面超出单个群的那几项（改全局配置、借 bot 的身份发给任意人）只能给名单里的人，'
+      + '它们的档位里没有群主可选；标了「只在本群」的项给出去之后，目标会被夹在他自己那个群里。'
+      + '名单还兼着私聊放通和审批收件人，把能力调成「不开放」不会把人从名单里去掉。',
+  },
+];
+
 export const PermissionsPage = () => (
-  <>
-    <Block hint="名单里的 QQ 号在所有会话里都算管理员" title="管理员">
-      <Panel>
-        <IdList
-          configKey="admin_users"
-          empty="名单为空"
-          label="管理员 QQ"
-          placeholder="输入 QQ 号，回车添加"
-          spacing="panel"
-        />
-        <EmptyWarning />
-      </Panel>
-    </Block>
-
-    <Block hint="每项各自决定放到哪一档" title="这些人能做什么">
-      <Capabilities />
-    </Block>
-
-    <Block hint="审批卡片怎么认回来" title="审批">
-      <Grid>
-        <BoolOption
-          configKey="approval_reply_unique_fallback"
-          desc="引用了审批卡片却取不到编号时，按「当前唯一待审批」处理。"
-          label="唯一待审批兜底"
-        >
-          <Desc>
-            默认关：这条兜底分不清引用的是它、还是另一张已经处理过的卡片，是误批的直接成因。开了也仍然要求只剩一条待审批、且那张卡片确实发给了本人。
-          </Desc>
-        </BoolOption>
-        <BoolOption
-          configKey="approval_bare_verb_unique"
-          desc="不引用卡片、整句只发「同意」时，按当前唯一待审批处理。"
-          label="直接回同意"
-        >
-          <Desc>
-            默认开：收到卡片后直接回「同意」就能批。只在你名下恰好剩一条待审批、且那张卡片确实发给你时成立；有多条会让你指定，一条都没有时就当普通聊天。
-          </Desc>
-        </BoolOption>
-      </Grid>
-    </Block>
-
-    <Footnote>
-      群主与群管理员的身份由 QQ 上报，只在群消息里成立 —— 同一个人在私聊里就是普通用户。
-      影响面超出单个群的那几项（改全局配置、借 bot 的身份发给任意人）只能给名单里的人，
-      它们的档位里没有群主可选；标了「只在本群」的项给出去之后，目标会被夹在他自己那个群里。
-      名单还兼着私聊放通和审批收件人，把能力调成「不开放」不会把人从名单里去掉。
-    </Footnote>
-  </>
+  <SchemaFields platformId={QQ_NAPCAT.id} sectionId={SECTION} spec={SCHEMA} />
 );

@@ -3,9 +3,9 @@
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import type { QqCapability, QqInputRule } from '../api/supervisorClient';
+import type { PlatformCapability, PlatformInputRule } from '../api/supervisorClient';
 import { PermissionsPage } from '../console/PermissionsPage';
-import { useConsoleStore } from '../console/consoleStore';
+import { platformConsoleStore } from '../console/consoleStore';
 
 const PATHS: Record<string, string> = {
   admin_users: 'permissions.admin_users',
@@ -13,7 +13,7 @@ const PATHS: Record<string, string> = {
   grant_clear_memory: 'permissions.capabilities.clear_memory',
 };
 
-const GLOBAL_CAP: QqCapability = {
+const GLOBAL_CAP: PlatformCapability = {
   key: 'model',
   name: '切换模型',
   desc: '查看和切换当前对话模型。',
@@ -22,7 +22,7 @@ const GLOBAL_CAP: QqCapability = {
   grants: ['off', 'admin'],
 };
 
-const SCOPED_CAP: QqCapability = {
+const SCOPED_CAP: PlatformCapability = {
   key: 'clear_memory',
   name: '清空群记忆',
   desc: '清掉某个群的对话记忆。',
@@ -32,15 +32,15 @@ const SCOPED_CAP: QqCapability = {
 };
 
 // bot 公布的号码规则，逐字照抄 live_config 的 ID_INPUT_RULE。
-const ID_RULE: QqInputRule = { kind: 'id', pattern: '^[0-9]+$', min: 1, max: 9007199254740991 };
+const ID_RULE: PlatformInputRule = { kind: 'id', pattern: '^[0-9]+$', min: 1, max: 9007199254740991 };
 
 // inputRules 传 null = 旧 bot，整个 input_rules 字段都不在响应里。
 const seed = (
-  capabilities: QqCapability[] | undefined,
+  capabilities: PlatformCapability[] | undefined,
   values: Record<string, unknown> = { admin_users: [10001] },
-  inputRules: Record<string, QqInputRule> | null = { admin_users: ID_RULE },
+  inputRules: Record<string, PlatformInputRule> | null = { admin_users: ID_RULE },
 ) => {
-  useConsoleStore.setState({
+  platformConsoleStore('qq').setState({
     live: {
       published: true,
       applied: true,
@@ -54,7 +54,7 @@ const seed = (
 const rowFor = (name: string) => screen.getByText(name).closest('li') as HTMLElement;
 
 beforeEach(() => {
-  useConsoleStore.setState({ draft: {} });
+  platformConsoleStore('qq').setState({ draft: {} });
 });
 
 describe('the capability list comes from the bot', () => {
@@ -139,7 +139,7 @@ describe('the current grant', () => {
 
     fireEvent.click(within(rowFor('清空群记忆')).getByRole('button', { name: '加群管' }));
 
-    expect(useConsoleStore.getState().draft).toEqual({ grant_clear_memory: 'group_admin' });
+    expect(platformConsoleStore('qq').getState().draft).toEqual({ grant_clear_memory: 'group_admin' });
   });
 
   it('reflects the draft rather than the published value after a click', () => {
@@ -184,7 +184,7 @@ describe('the scope marker', () => {
 
 describe('the empty roster warning', () => {
   it('uses the note the bot published rather than a copy of it', () => {
-    useConsoleStore.setState({
+    platformConsoleStore('qq').setState({
       live: {
         published: true,
         applied: true,
@@ -223,7 +223,7 @@ describe('the roster input waits for the rule the bot publishes', () => {
     fireEvent.change(rosterInput(), { target: { value: '10002' } });
     fireEvent.keyDown(rosterInput(), { key: 'Enter' });
 
-    expect(useConsoleStore.getState().draft).toEqual({ admin_users: [10001, 10002] });
+    expect(platformConsoleStore('qq').getState().draft).toEqual({ admin_users: [10001, 10002] });
   });
 
   it('refuses a number the published rule rejects and says so', () => {
@@ -233,7 +233,7 @@ describe('the roster input waits for the rule the bot publishes', () => {
     fireEvent.change(rosterInput(), { target: { value: '-500' } });
     fireEvent.keyDown(rosterInput(), { key: 'Enter' });
 
-    expect(useConsoleStore.getState().draft).toEqual({});
+    expect(platformConsoleStore('qq').getState().draft).toEqual({});
     expect(screen.getByText('只能填数字号码')).toBeInTheDocument();
   });
 
@@ -264,6 +264,6 @@ describe('the roster input waits for the rule the bot publishes', () => {
 
     fireEvent.click(screen.getByLabelText('移出名单 10001'));
 
-    expect(useConsoleStore.getState().draft).toEqual({ admin_users: [] });
+    expect(platformConsoleStore('qq').getState().draft).toEqual({ admin_users: [] });
   });
 });

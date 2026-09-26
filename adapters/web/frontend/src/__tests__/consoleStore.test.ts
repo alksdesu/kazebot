@@ -2,18 +2,9 @@
 // 写 yaml 时才用 /qq/state 公布的 paths 转成点分路径。
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import type { QqInputRule } from '../api/supervisorClient';
+import type { PlatformInputRule } from '../api/supervisorClient';
 import { barState } from '../console/PlatformPage';
-import {
-  addWord,
-  asWordList,
-  effectiveValues,
-  mergeDraft,
-  readInputRule,
-  readTristate,
-  setByPath,
-  useConsoleStore,
-} from '../console/consoleStore';
+import { addWord, asWordList, effectiveValues, mergeDraft, platformConsoleStore, readInputRule, readTristate, setByPath, useConsoleStore } from '../console/consoleStore';
 
 const PATHS: Record<string, string> = {
   signal_at: 'trigger.signals.at',
@@ -24,7 +15,7 @@ const PATHS: Record<string, string> = {
 };
 
 // bot 公布的那份词表规则，逐字照抄 live_config 的 WORD_INPUT_RULE。
-const WORD_RULE: QqInputRule = { kind: 'word', trim: true };
+const WORD_RULE: PlatformInputRule = { kind: 'word', trim: true };
 
 const dumpedWords = (words: string[]): string[] =>
   mergeDraft('', { keyword_words: words }, PATHS)
@@ -34,7 +25,7 @@ const dumpedWords = (words: string[]): string[] =>
     .map((line) => line.slice(2));
 
 const seedLive = (values: Record<string, unknown>) => {
-  useConsoleStore.setState({
+  platformConsoleStore('qq').setState({
     live: {
       published: true,
       applied: true,
@@ -142,52 +133,52 @@ describe('mergeDraft', () => {
 
 describe('readTristate', () => {
   beforeEach(() => {
-    useConsoleStore.setState({ draft: {}, live: null });
+    platformConsoleStore('qq').setState({ draft: {}, live: null });
   });
 
   it('reports null when the key is absent', () => {
     // null 表示「没配」，由 bot 按旧的 group_mode 推导；被压成 false 就等于悄悄接管。
     seedLive({});
 
-    expect(readTristate(useConsoleStore.getState(), 'signal_at')).toBeNull();
+    expect(readTristate(platformConsoleStore('qq').getState(), 'signal_at')).toBeNull();
   });
 
   it('reports null when the published value is null', () => {
     seedLive({ signal_at: null });
 
-    expect(readTristate(useConsoleStore.getState(), 'signal_at')).toBeNull();
+    expect(readTristate(platformConsoleStore('qq').getState(), 'signal_at')).toBeNull();
   });
 
   it('distinguishes an explicit false from an absent key', () => {
     seedLive({ signal_at: false });
 
-    expect(readTristate(useConsoleStore.getState(), 'signal_at')).toBe(false);
+    expect(readTristate(platformConsoleStore('qq').getState(), 'signal_at')).toBe(false);
   });
 
   it('reads true', () => {
     seedLive({ signal_at: true });
 
-    expect(readTristate(useConsoleStore.getState(), 'signal_at')).toBe(true);
+    expect(readTristate(platformConsoleStore('qq').getState(), 'signal_at')).toBe(true);
   });
 
   it('lets the draft win over the published value', () => {
     seedLive({ signal_at: true });
-    useConsoleStore.getState().setDraft('signal_at', false);
+    platformConsoleStore('qq').getState().setDraft('signal_at', false);
 
-    expect(readTristate(useConsoleStore.getState(), 'signal_at')).toBe(false);
+    expect(readTristate(platformConsoleStore('qq').getState(), 'signal_at')).toBe(false);
   });
 });
 
 describe('effectiveValues', () => {
   beforeEach(() => {
-    useConsoleStore.setState({ draft: {}, live: null });
+    platformConsoleStore('qq').setState({ draft: {}, live: null });
   });
 
   it('lays the draft over the published values', () => {
     seedLive({ signal_at: true, signal_name: false });
-    useConsoleStore.getState().setDraft('signal_name', true);
+    platformConsoleStore('qq').getState().setDraft('signal_name', true);
 
-    expect(effectiveValues(useConsoleStore.getState())).toMatchObject({
+    expect(effectiveValues(platformConsoleStore('qq').getState())).toMatchObject({
       signal_at: true,
       signal_name: true,
     });
@@ -197,7 +188,7 @@ describe('effectiveValues', () => {
     // 按当前页过滤就等于试听和真实判定跑在两份配置上。
     seedLive({ signal_at: true, cooldown_group_sec: 30, name_words: ['咪啪'] });
 
-    expect(Object.keys(effectiveValues(useConsoleStore.getState())).sort()).toEqual([
+    expect(Object.keys(effectiveValues(platformConsoleStore('qq').getState())).sort()).toEqual([
       'cooldown_group_sec', 'name_words', 'signal_at',
     ]);
   });
@@ -205,11 +196,11 @@ describe('effectiveValues', () => {
   it('keeps a tri-state null as null', () => {
     seedLive({ signal_at: null });
 
-    expect(effectiveValues(useConsoleStore.getState())).toHaveProperty('signal_at', null);
+    expect(effectiveValues(platformConsoleStore('qq').getState())).toHaveProperty('signal_at', null);
   });
 
   it('is an empty object before the bot has published anything', () => {
-    expect(effectiveValues(useConsoleStore.getState())).toEqual({});
+    expect(effectiveValues(platformConsoleStore('qq').getState())).toEqual({});
   });
 });
 
@@ -268,11 +259,11 @@ describe('asWordList', () => {
 
 describe('useInputRule', () => {
   beforeEach(() => {
-    useConsoleStore.setState({ draft: {}, live: null });
+    platformConsoleStore('qq').setState({ draft: {}, live: null });
   });
 
   it('reads the rule the bot published for that key', () => {
-    useConsoleStore.setState({
+    platformConsoleStore('qq').setState({
       live: {
         published: true,
         applied: true,
@@ -281,61 +272,61 @@ describe('useInputRule', () => {
       },
     });
 
-    expect(readInputRule(useConsoleStore.getState(), 'keyword_words')).toEqual(WORD_RULE);
+    expect(readInputRule(platformConsoleStore('qq').getState(), 'keyword_words')).toEqual(WORD_RULE);
   });
 
   it('is null for a key the bot published no rule for', () => {
-    expect(readInputRule(useConsoleStore.getState(), 'keyword_words')).toBeNull();
+    expect(readInputRule(platformConsoleStore('qq').getState(), 'keyword_words')).toBeNull();
   });
 });
 
 describe('the draft counter', () => {
   beforeEach(() => {
-    useConsoleStore.setState({ draft: {}, live: null, raw: '', notice: '', error: '' });
+    platformConsoleStore('qq').setState({ draft: {}, live: null, raw: '', notice: '', error: '' });
   });
 
   it('counts a change away from the applied value', () => {
     seedLive({ signal_name: false });
 
-    useConsoleStore.getState().setDraft('signal_name', true);
+    platformConsoleStore('qq').getState().setDraft('signal_name', true);
 
-    expect(Object.keys(useConsoleStore.getState().draft)).toEqual(['signal_name']);
+    expect(Object.keys(platformConsoleStore('qq').getState().draft)).toEqual(['signal_name']);
   });
 
   it('drops the entry when the value returns to what is applied', () => {
     // 否则「3 项待应用」里会混进已经被改回来的项。
     seedLive({ signal_name: false });
 
-    useConsoleStore.getState().setDraft('signal_name', true);
-    useConsoleStore.getState().setDraft('signal_name', false);
+    platformConsoleStore('qq').getState().setDraft('signal_name', true);
+    platformConsoleStore('qq').getState().setDraft('signal_name', false);
 
-    expect(useConsoleStore.getState().draft).toEqual({});
+    expect(platformConsoleStore('qq').getState().draft).toEqual({});
   });
 
   it('compares structurally, not by reference', () => {
     seedLive({ name_words: ['咪啪'] });
 
-    useConsoleStore.getState().setDraft('name_words', ['咪啪']);
+    platformConsoleStore('qq').getState().setDraft('name_words', ['咪啪']);
 
-    expect(useConsoleStore.getState().draft).toEqual({});
+    expect(platformConsoleStore('qq').getState().draft).toEqual({});
   });
 
   it('treats a tri-state null as different from false', () => {
     // signals.at 留空表示跟随旧的 group_mode，显式 false 是接管并关掉。
     seedLive({ signal_at: null });
 
-    useConsoleStore.getState().setDraft('signal_at', false);
+    platformConsoleStore('qq').getState().setDraft('signal_at', false);
 
-    expect(useConsoleStore.getState().draft).toEqual({ signal_at: false });
+    expect(platformConsoleStore('qq').getState().draft).toEqual({ signal_at: false });
   });
 
   it('discard clears everything staged', () => {
     seedLive({ signal_name: false });
-    useConsoleStore.getState().setDraft('signal_name', true);
+    platformConsoleStore('qq').getState().setDraft('signal_name', true);
 
-    useConsoleStore.getState().discard();
+    platformConsoleStore('qq').getState().discard();
 
-    expect(useConsoleStore.getState().draft).toEqual({});
+    expect(platformConsoleStore('qq').getState().draft).toEqual({});
   });
 
   it('apply is a no-op with nothing staged', async () => {
@@ -348,7 +339,7 @@ describe('the draft counter', () => {
     }) as typeof fetch;
 
     try {
-      await useConsoleStore.getState().apply('token');
+      await platformConsoleStore('qq').getState().apply('token');
     } finally {
       globalThis.fetch = original;
     }
@@ -359,13 +350,13 @@ describe('the draft counter', () => {
 
 describe('apply', () => {
   beforeEach(() => {
-    useConsoleStore.setState({ draft: {}, live: null, raw: '', notice: '', error: '' });
+    platformConsoleStore('qq').setState({ draft: {}, live: null, raw: '', notice: '', error: '' });
   });
 
   it('sends the merged document and clears the draft', async () => {
     seedLive({ signal_name: false });
-    useConsoleStore.setState({ raw: 'version: 1\n' });
-    useConsoleStore.getState().setDraft('signal_name', true);
+    platformConsoleStore('qq').setState({ raw: 'version: 1\n' });
+    platformConsoleStore('qq').getState().setDraft('signal_name', true);
     const sent: string[] = [];
     const original = globalThis.fetch;
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -387,7 +378,7 @@ describe('apply', () => {
     }) as typeof fetch;
 
     try {
-      await useConsoleStore.getState().apply('token');
+      await platformConsoleStore('qq').getState().apply('token');
     } finally {
       globalThis.fetch = original;
     }
@@ -395,13 +386,13 @@ describe('apply', () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]).toContain('version: 1');
     expect(sent[0]).toContain('    name: true');
-    expect(useConsoleStore.getState().draft).toEqual({});
+    expect(platformConsoleStore('qq').getState().draft).toEqual({});
   });
 
   it('keeps the draft when the save fails', async () => {
     // 丢掉草稿等于把运营者刚做的改动静默吞掉。
     seedLive({ signal_name: false });
-    useConsoleStore.getState().setDraft('signal_name', true);
+    platformConsoleStore('qq').getState().setDraft('signal_name', true);
     const original = globalThis.fetch;
     globalThis.fetch = (async () => new Response(JSON.stringify({ detail: '无人消费的配置项' }), {
       status: 400,
@@ -409,12 +400,12 @@ describe('apply', () => {
     })) as typeof fetch;
 
     try {
-      await useConsoleStore.getState().apply('token');
+      await platformConsoleStore('qq').getState().apply('token');
     } finally {
       globalThis.fetch = original;
     }
 
-    const state = useConsoleStore.getState();
+    const state = platformConsoleStore('qq').getState();
     expect(state.draft).toEqual({ signal_name: true });
     expect(state.error).toContain('无人消费的配置项');
     expect(state.saving).toBe(false);

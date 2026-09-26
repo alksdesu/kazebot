@@ -1,25 +1,26 @@
-// QQ 控制台的域切换与草稿态。「几项待应用」直接取草稿的大小。
+// 平台配置的草稿态。每个平台一份，几个平台可以同时攒着未应用的改动。
 import yaml from 'js-yaml';
-import { create } from 'zustand';
+import { create, type StoreApi, type UseBoundStore } from 'zustand';
 
 import {
-  getQqRaw,
-  getQqState,
-  updateQqRaw,
-  type QqCapability,
-  type QqInputRule,
-  type QqLiveState,
-  type QqRuntimeFacts,
+  getPlatformRaw,
+  getPlatformState,
+  updatePlatformRaw,
+  type PlatformCapability,
+  type PlatformInputRule,
+  type PlatformLiveState,
+  type PlatformRuntimeFacts,
 } from '../api/supervisorClient';
+import { usePlatform } from './platformContext';
 
 /** 草稿按 live_config 的键名存（如 signal_at），不是 yaml 的点分路径。
  *
- * /qq/state 的 values 就是按键名给的，paths 负责键名 → 点分路径。写 yaml 时才转换，
+ * state 端点的 values 就是按键名给的，paths 负责键名 → 点分路径。写 yaml 时才转换，
  * 于是「界面读到的值」和「bot 公布的值」永远是同一个键空间。 */
 export type Draft = Record<string, unknown>;
 
 export interface ConsoleState {
-  live: QqLiveState | null;
+  live: PlatformLiveState | null;
   /** 磁盘上那份 yaml 的原文，应用时作为合并基底。 */
   raw: string;
   rawExists: boolean;
@@ -92,8 +93,8 @@ export function mergeDraft(raw: string, draft: Draft, paths: Record<string, stri
 
 const sleep = (ms: number) => new Promise((done) => { setTimeout(done, ms); });
 
-/** 把刚写进去的值叠到 live 上。键空间与 /qq/state 的 values 一致，可以直接铺。 */
-const withApplied = (live: QqLiveState | null, draft: Draft): QqLiveState | null => {
+/** 把刚写进去的值叠到 live 上。键空间与 state 端点的 values 一致，可以直接铺。 */
+const withApplied = (live: PlatformLiveState | null, draft: Draft): PlatformLiveState | null => {
   if (!live?.state) return live;
   return {
     ...live,
@@ -111,6 +112,7 @@ const withApplied = (live: QqLiveState | null, draft: Draft): QqLiveState | null
  */
 const settle = async (
   token: string,
+  platformId: string,
   set: (partial: Partial<ConsoleState>) => void,
   get: () => ConsoleState,
   savedRaw: string,
@@ -118,7 +120,7 @@ const settle = async (
   for (let round = 0; round < 12; round += 1) {
     await sleep(250);
     try {
-      const [state, file] = await Promise.all([getQqState(token), getQqRaw(token)]);
+      const [state, file] = await Promise.all([getPlatformState(token, platformId), getPlatformRaw(token, platformId)]);
       if (file.content !== savedRaw) {
         set({ notice: '配置文件在应用之后又被改过，请刷新核对当前内容。' });
         return;
@@ -133,13 +135,17 @@ const settle = async (
     }
   }
   if (!get().error) {
-    set({ notice: '已应用，但 bot 没在 3 秒内确认生效。它可能没在跑，去服务器上看 QQ 适配器进程（bot.py）。' });
+    set({ notice: '已应用，但 bot 没在 3 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程（bot.py）。' });
   }
 };
 
-let refreshVersion = 0;
+/** 每个平台一份请求代次。一个平台的刷新不该作废另一个平台在飞的请求。 */
+const refreshVersions = new Map<string, number>();
 
-export const useConsoleStore = create<ConsoleState>((set, get) => ({
+const createConsoleState = (platformId: string) => (
+  set: (partial: Partial<ConsoleState>) => void,
+  get: () => ConsoleState,
+): ConsoleState => ({
   live: null,
   raw: '',
   rawExists: false,
@@ -151,14 +157,15 @@ export const useConsoleStore = create<ConsoleState>((set, get) => ({
 
   refresh: async (token) => {
     if (get().saving) return;
-    const version = ++refreshVersion;
+    const version = (refreshVersions.get(platformId) || 0) + 1;
+    refreshVersions.set(platformId, version);
     set({ loading: true, error: '' });
     try {
-      const [state, file] = await Promise.all([getQqState(token), getQqRaw(token)]);
-      if (version !== refreshVersion) return;
+      const [state, file] = await Promise.all([getPlatformState(token, platformId), getPlatformRaw(token, platformId)]);
+      if (version !== refreshVersions.get(platformId)) return;
       set({ live: state, raw: file.content, rawExists: file.exists, loading: false });
     } catch (error) {
-      if (version !== refreshVersion) return;
+      if (version !== refreshVersions.get(platformId)) return;
       set({ loading: false, error: error instanceof Error ? error.message : '读取配置失败' });
     }
   },
@@ -177,13 +184,13 @@ export const useConsoleStore = create<ConsoleState>((set, get) => ({
   apply: async (token) => {
     const { draft, live, saving } = get();
     if (saving || !Object.keys(draft).length) return;
-    ++refreshVersion;
+    refreshVersions.set(platformId, (refreshVersions.get(platformId) || 0) + 1);
     set({ saving: true, loading: false, error: '', notice: '' });
     try {
       const paths = live?.state?.paths || {};
-      const latest = await getQqRaw(token);
+      const latest = await getPlatformRaw(token, platformId);
       const raw = mergeDraft(latest.content, draft, paths);
-      const result = await updateQqRaw(token, raw);
+      const result = await updatePlatformRaw(token, platformId, raw);
       // bot 每 2s 才重读一次配置并公布生效值。这里先按刚写进去的值显示：
       // 草稿一清、live 又还是旧快照的话，界面会退回保存前的样子，看着像没存上。
       const pending = { ...get().draft };
@@ -196,7 +203,7 @@ export const useConsoleStore = create<ConsoleState>((set, get) => ({
         notice: result.warnings.join('；'),
         live: withApplied(live, draft),
       });
-      await settle(token, set, get, raw);
+      await settle(token, platformId, set, get, raw);
     } catch (error) {
       set({ error: error instanceof Error ? error.message : '应用失败' });
     } finally {
@@ -205,7 +212,30 @@ export const useConsoleStore = create<ConsoleState>((set, get) => ({
   },
 
   dismissNotice: () => set({ notice: '' }),
-}));
+});
+
+export type PlatformConsoleStore = UseBoundStore<StoreApi<ConsoleState>>;
+
+const stores = new Map<string, PlatformConsoleStore>();
+
+/** 取某个平台的草稿态 store。按需建，建过就一直在 —— 换回去要看得到之前攒的改动。 */
+export function platformConsoleStore(platformId: string): PlatformConsoleStore {
+  let store = stores.get(platformId);
+  if (!store) {
+    store = create<ConsoleState>((set, get) => createConsoleState(platformId)(set, get));
+    stores.set(platformId, store);
+  }
+  return store;
+}
+
+/** 当前平台的草稿态。分区里的控件都经它读写，不必知道自己挂在哪个平台上。 */
+export function useConsoleStore(): ConsoleState;
+export function useConsoleStore<T>(selector: (state: ConsoleState) => T): T;
+export function useConsoleStore<T>(selector?: (state: ConsoleState) => T): T | ConsoleState {
+  const platform = usePlatform();
+  const store = platformConsoleStore(platform.id);
+  return store(selector as (state: ConsoleState) => T);
+}
 
 /** 编辑中的完整配置：bot 公布的生效值叠上草稿。试听要拿它当判定输入。
  *
@@ -288,11 +318,11 @@ export function useWordList(name: string): readonly string[] {
 /** 读一个列表键的单项规则。bot 没公布就是 null —— 编不出来的规则不如不放行。
  *
  * 抽成纯函数才测得到：hook 里那一层只是 store 订阅。 */
-export function readInputRule(state: ConsoleState, name: string): QqInputRule | null {
+export function readInputRule(state: ConsoleState, name: string): PlatformInputRule | null {
   return state.live?.state?.input_rules?.[name] || null;
 }
 
-export function useInputRule(name: string): QqInputRule | null {
+export function useInputRule(name: string): PlatformInputRule | null {
   return useConsoleStore((state) => readInputRule(state, name));
 }
 
@@ -300,7 +330,7 @@ export function useInputRule(name: string): QqInputRule | null {
 export function addWord(
   words: readonly string[],
   raw: string,
-  rule: QqInputRule | null,
+  rule: PlatformInputRule | null,
 ): readonly string[] {
   if (rule?.kind !== 'word') return words;
   const token = rule.trim === false ? raw : raw.trim();
@@ -320,7 +350,7 @@ export function useIdList(name: string): readonly number[] {
 }
 
 /** 判一个号码合不合规。IdList 要用它区分「不合规」和「已存在」两种拒绝文案。 */
-export function idIsValid(raw: string, rule: QqInputRule | null): boolean {
+export function idIsValid(raw: string, rule: PlatformInputRule | null): boolean {
   if (rule?.kind !== 'id' || !rule.pattern) return false;
   const token = raw.trim();
   if (!new RegExp(rule.pattern).test(token)) return false;
@@ -336,7 +366,7 @@ export function idIsValid(raw: string, rule: QqInputRule | null): boolean {
 export function addId(
   ids: readonly number[],
   raw: string,
-  rule: QqInputRule | null,
+  rule: PlatformInputRule | null,
 ): readonly number[] {
   if (!idIsValid(raw, rule)) return ids;
   const value = Number(raw.trim());
@@ -348,17 +378,17 @@ export function useNote(name: string): string {
   return useConsoleStore((state) => state.live?.state?.notes?.[name] || '');
 }
 
-const NO_CAPABILITIES: readonly QqCapability[] = [];
+const NO_CAPABILITIES: readonly PlatformCapability[] = [];
 
 /** bot 公布的能力清单。拿不到就是空 —— 编不出来的清单不如不显示。 */
-export function useCapabilities(): readonly QqCapability[] {
+export function useCapabilities(): readonly PlatformCapability[] {
   return useConsoleStore((state) => state.live?.state?.capabilities || NO_CAPABILITIES);
 }
 
-const NO_RUNTIME: QqRuntimeFacts = {};
+const NO_RUNTIME: PlatformRuntimeFacts = {};
 
 /** bot 公布的运行期事实。没上报时给同一个空对象，别每次造新的。 */
-export function useRuntime(): QqRuntimeFacts {
+export function useRuntime(): PlatformRuntimeFacts {
   return useConsoleStore((state) => state.live?.state?.runtime || NO_RUNTIME);
 }
 

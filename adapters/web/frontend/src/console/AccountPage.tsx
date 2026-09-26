@@ -20,9 +20,12 @@ import {
   type QqAccount,
   type QqQuickLoginTarget,
 } from '../api/supervisorClient';
+import { QQ_NAPCAT } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
 import { AccountScope } from './AccountScope';
 import { Block, Button, Empty, Facts, Input, Panel, Pre } from './components';
+import { SchemaFields } from './FieldRenderer';
+import { registerSectionComponents, type FieldSpec } from './fieldSchema';
 import { InstanceLink, InstanceSwitch } from './InstanceSwitch';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useRequestScope } from '../features/asyncState';
@@ -40,10 +43,21 @@ const DESC = 'text-xs text-[var(--duties-secondary)]';
 
 const say = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-export const AccountPage = () => {
+const SECTION = 'account';
+
+// 扫码登录、多开、记忆归属都得盯着 NapCat 的 WebUI 一路轮询，编不成 schema 字段。
+const AccountWorkspaceSlot = () => {
   const token = useSettingsStore(state => state.adminToken);
   return token ? <AccountWorkspace key={token} token={token} /> : <Empty>需要管理员令牌。</Empty>;
 };
+
+registerSectionComponents(QQ_NAPCAT.id, SECTION, { workspace: AccountWorkspaceSlot });
+
+const SCHEMA: FieldSpec[] = [{ kind: 'custom', name: 'workspace' }];
+
+export const AccountPage = () => (
+  <SchemaFields platformId={QQ_NAPCAT.id} sectionId={SECTION} spec={SCHEMA} />
+);
 
 const AccountWorkspace = ({ token }: { token: string }) => {
   const [instances, setInstances] = useState<ConsoleInstance[]>([]);

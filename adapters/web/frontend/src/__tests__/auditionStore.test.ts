@@ -1,7 +1,7 @@
 // 试听的正确性只有一个判据：喂给后端的必须是「编辑中的配置」，判定必须挂回对的那条消息。
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { QqDryRunVerdict } from '../api/supervisorClient';
+import type { PlatformDryRunVerdict } from '../api/supervisorClient';
 import {
   alignVerdicts,
   AUDITION_GROUP,
@@ -11,7 +11,7 @@ import {
   toRequest,
   useAuditionStore,
 } from '../console/auditionStore';
-import { useConsoleStore } from '../console/consoleStore';
+import { platformConsoleStore } from '../console/consoleStore';
 
 const PATHS: Record<string, string> = {
   signal_at: 'trigger.signals.at',
@@ -20,7 +20,7 @@ const PATHS: Record<string, string> = {
 };
 
 const seedLive = (values: Record<string, unknown>) => {
-  useConsoleStore.setState({
+  platformConsoleStore('qq').setState({
     live: {
       published: true,
       applied: true,
@@ -31,7 +31,7 @@ const seedLive = (values: Record<string, unknown>) => {
   });
 };
 
-const verdict = (index: number, extra: Partial<QqDryRunVerdict> = {}): QqDryRunVerdict => ({
+const verdict = (index: number, extra: Partial<PlatformDryRunVerdict> = {}): PlatformDryRunVerdict => ({
   index,
   text: '',
   triggered: false,
@@ -149,7 +149,7 @@ describe('the message list', () => {
 
 describe('run', () => {
   beforeEach(() => {
-    useConsoleStore.setState({ draft: {}, live: null });
+    platformConsoleStore('qq').setState({ draft: {}, live: null });
     useAuditionStore.setState({
       messages: [newMessage({ text: '咪啪在吗' })],
       result: null,
@@ -175,12 +175,12 @@ describe('run', () => {
   it('sends the draft on top of the published values', async () => {
     // 只发 live 的值就成了「试听旧配置」—— 改开关看不到判定翻转，试听也就没用了。
     seedLive({ signal_at: true, signal_name: false });
-    useConsoleStore.getState().setDraft('signal_name', true);
+    platformConsoleStore('qq').getState().setDraft('signal_name', true);
     const capture: { body?: any } = {};
     const restore = stubFetch(capture);
 
     try {
-      await useAuditionStore.getState().run('token');
+      await useAuditionStore.getState().run('token', 'qq');
     } finally {
       restore();
     }
@@ -195,7 +195,7 @@ describe('run', () => {
     const restore = stubFetch(capture);
 
     try {
-      await useAuditionStore.getState().run('token');
+      await useAuditionStore.getState().run('token', 'qq');
     } finally {
       restore();
     }
@@ -209,7 +209,7 @@ describe('run', () => {
     const restore = stubFetch({});
 
     try {
-      await useAuditionStore.getState().run('token');
+      await useAuditionStore.getState().run('token', 'qq');
     } finally {
       restore();
     }
@@ -237,8 +237,8 @@ describe('run', () => {
     }) as typeof fetch;
 
     try {
-      const slow = useAuditionStore.getState().run('token');
-      const fast = useAuditionStore.getState().run('token');
+      const slow = useAuditionStore.getState().run('token', 'qq');
+      const fast = useAuditionStore.getState().run('token', 'qq');
       await Promise.all([slow, fast]);
     } finally {
       globalThis.fetch = original;
@@ -256,7 +256,7 @@ describe('run', () => {
     })) as typeof fetch;
 
     try {
-      await useAuditionStore.getState().run('token');
+      await useAuditionStore.getState().run('token', 'qq');
     } finally {
       globalThis.fetch = original;
     }
@@ -274,7 +274,7 @@ describe('run', () => {
     globalThis.fetch = (async () => { spy(); return new Response('{}'); }) as typeof fetch;
 
     try {
-      await useAuditionStore.getState().run('token');
+      await useAuditionStore.getState().run('token', 'qq');
     } finally {
       globalThis.fetch = original;
     }

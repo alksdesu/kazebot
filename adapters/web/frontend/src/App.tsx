@@ -6,6 +6,7 @@ import { Icon, Modal } from './components/common';
 import { PageBoundary } from './components/common/PageBoundary';
 import { AppLayout } from './components/layout';
 import { useChat } from './hooks/useChat';
+import { usePlatformRegistry } from './platforms/usePlatformRegistry';
 import { useChatStore } from './store/chatStore';
 import { useClientPrefsStore } from './store/clientPrefsStore';
 import { useSettingsStore } from './store/settingsStore';
@@ -141,6 +142,7 @@ const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
 const App = () => {
   const isAuthenticated = useSettingsStore(state => state.isAuthenticated);
   const viewMode = useViewStore(state => state.viewMode);
+  usePlatformRegistry();
   return isAuthenticated ? <MainApp viewMode={viewMode} /> : <LoginPage />;
 };
 

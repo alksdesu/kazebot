@@ -2,15 +2,15 @@
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { QqLiveState } from '../api/supervisorClient';
+import type { PlatformLiveState } from '../api/supervisorClient';
 import { getSettingsTab } from '../components/settings/settingsTabs';
-import { useConsoleStore } from '../console/consoleStore';
+import { platformConsoleStore } from '../console/consoleStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
 
 const SECTION_STORE_KEY = 'console_sections_qq';
 
-const live = (values: Record<string, unknown> = {}): QqLiveState => ({
+const live = (values: Record<string, unknown> = {}): PlatformLiveState => ({
   published: true,
   applied: true,
   file: { exists: true, mtime_ns: 1, size: 1 },
@@ -59,7 +59,7 @@ beforeEach(() => {
   window.history.replaceState(null, '', '/');
   useSettingsStore.setState({ adminToken: '', isAuthenticated: true });
   useViewStore.setState({ viewMode: 'settings', activeSettingsTab: 'platform-qq', activeSettingsSection: '' });
-  useConsoleStore.setState({ live: live(), draft: {}, raw: '', loading: false, saving: false, error: '', notice: '' });
+  platformConsoleStore('qq').setState({ live: live(), draft: {}, raw: '', loading: false, saving: false, error: '', notice: '' });
   // jsdom 没有 confirm，不打桩的话「丢弃」的二次确认永远拿到 undefined。
   vi.spyOn(window, 'confirm').mockReturnValue(true);
 });
@@ -68,7 +68,7 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 describe('折叠分区', () => {
   it('收起时给一行摘要，读的是生效值不是草稿', () => {
-    useConsoleStore.setState({ draft: { allowed_groups: [101, 102, 103, 104] } });
+    platformConsoleStore('qq').setState({ draft: { allowed_groups: [101, 102, 103, 104] } });
     render(<PlatformTab />);
 
     expect(header('信道')).toHaveTextContent('2 个群');
@@ -115,7 +115,7 @@ describe('折叠分区', () => {
 
 describe('待应用归位', () => {
   it('按 bot 公布的配置段算在对应分区头上，总数仍由状态栏给', () => {
-    useConsoleStore.setState({
+    platformConsoleStore('qq').setState({
       draft: { allowed_groups: [101], signal_at: false, cooldown_group_sec: 60, enable_queue: false },
     });
     render(<PlatformTab />);
@@ -127,7 +127,7 @@ describe('待应用归位', () => {
   });
 
   it('同级键不会被邻居的前缀吃掉', () => {
-    useConsoleStore.setState({ draft: { enable_reactions: false, auto_like_times: 3 } });
+    platformConsoleStore('qq').setState({ draft: { enable_reactions: false, auto_like_times: 3 } });
     render(<PlatformTab />);
 
     expect(header('输出格式')).toHaveTextContent('1 项待应用');
@@ -135,14 +135,14 @@ describe('待应用归位', () => {
   });
 
   it('权限段和审批段都算权限分区的', () => {
-    useConsoleStore.setState({ draft: { grant_restart: 'admin', approval_bare_verb_unique: false } });
+    platformConsoleStore('qq').setState({ draft: { grant_restart: 'admin', approval_bare_verb_unique: false } });
     render(<PlatformTab />);
 
     expect(header('权限')).toHaveTextContent('2 项待应用');
   });
 
   it('认不出配置段的改动不算进任何分区，但状态栏不会漏掉它', () => {
-    useConsoleStore.setState({ draft: { brand_new_key: 1 } });
+    platformConsoleStore('qq').setState({ draft: { brand_new_key: 1 } });
     render(<PlatformTab />);
 
     expect(header('信道')).not.toHaveTextContent('待应用');
@@ -161,7 +161,7 @@ describe('分区深链', () => {
   });
 
   it('bot 没上报时其余分区不出现，账号与连接照样能用', () => {
-    useConsoleStore.setState({ live: { published: false, file: { exists: false, mtime_ns: 0, size: 0 } } });
+    platformConsoleStore('qq').setState({ live: { published: false, file: { exists: false, mtime_ns: 0, size: 0 } } });
     render(<PlatformTab />);
 
     expect(screen.getByRole('button', { name: /^账号与连接/ })).toBeInTheDocument();
@@ -179,12 +179,12 @@ describe('顶部状态栏', () => {
   });
 
   it('丢弃清掉全部草稿，各分区的计数一起归零', () => {
-    useConsoleStore.setState({ draft: { allowed_groups: [101] } });
+    platformConsoleStore('qq').setState({ draft: { allowed_groups: [101] } });
     render(<PlatformTab />);
 
     fireEvent.click(screen.getByRole('button', { name: '丢弃' }));
 
-    expect(useConsoleStore.getState().draft).toEqual({});
+    expect(platformConsoleStore('qq').getState().draft).toEqual({});
     expect(header('信道')).not.toHaveTextContent('待应用');
   });
 });

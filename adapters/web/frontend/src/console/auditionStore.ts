@@ -2,12 +2,12 @@
 import { create } from 'zustand';
 
 import {
-  dryRunQqTrigger,
-  type QqDryRunMessage,
-  type QqDryRunResult,
-  type QqDryRunVerdict,
+  dryRunPlatformTrigger,
+  type PlatformDryRunMessage,
+  type PlatformDryRunResult,
+  type PlatformDryRunVerdict,
 } from '../api/supervisorClient';
-import { effectiveValues, useConsoleStore } from './consoleStore';
+import { effectiveValues, platformConsoleStore } from './consoleStore';
 
 /** 两个发送者，因为「每人冷却」按 (群, 人) 分组 —— 只有一个人时它和「每群冷却」看不出区别。 */
 export const SENDERS = {
@@ -48,7 +48,7 @@ export function defaultMessages(): AuditionMessage[] {
 }
 
 /** 摊成 dry-run 的入参。at_sec 显式给：默认「每条隔一秒依次到达」看不出长冷却窗口的效果。 */
-export function toRequest(messages: AuditionMessage[], intervalSec: number): QqDryRunMessage[] {
+export function toRequest(messages: AuditionMessage[], intervalSec: number): PlatformDryRunMessage[] {
   const step = Number.isFinite(intervalSec) && intervalSec > 0 ? intervalSec : 0;
   return messages.map((message, index) => ({
     text: message.text,
@@ -63,9 +63,9 @@ export function toRequest(messages: AuditionMessage[], intervalSec: number): QqD
 /** 判定按消息 id 归位。对不上的消息没有判定可显示，好过显示上一轮别人的结果。 */
 export function alignVerdicts(
   resultIds: string[],
-  verdicts: QqDryRunVerdict[] | undefined,
-): Map<string, QqDryRunVerdict> {
-  const out = new Map<string, QqDryRunVerdict>();
+  verdicts: PlatformDryRunVerdict[] | undefined,
+): Map<string, PlatformDryRunVerdict> {
+  const out = new Map<string, PlatformDryRunVerdict>();
   (verdicts || []).forEach((verdict) => {
     const id = resultIds[verdict.index];
     if (id !== undefined) out.set(id, verdict);
@@ -77,7 +77,7 @@ interface AuditionState {
   messages: AuditionMessage[];
   intervalSec: number;
   cooldown: boolean;
-  result: QqDryRunResult | null;
+  result: PlatformDryRunResult | null;
   /** 这份结果是问哪几条消息得来的。删掉一条之后 index 会整体错位，
    *  按 id 对齐才不会把判定挂到别人身上。 */
   resultIds: string[];
@@ -91,8 +91,8 @@ interface AuditionState {
   reset: () => void;
   setInterval: (seconds: number) => void;
   setCooldown: (on: boolean) => void;
-  schedule: (token: string) => void;
-  run: (token: string) => Promise<void>;
+  schedule: (token: string, platformId: string) => void;
+  run: (token: string, platformId: string) => Promise<void>;
 }
 
 // 只接受最新一次请求的回包。debounce 挡不住乱序：先发的请求可能后到，
@@ -138,12 +138,12 @@ export const useAuditionStore = create<AuditionState>((set, get) => ({
 
   setCooldown: (on) => set({ cooldown: on }),
 
-  schedule: (token) => {
+  schedule: (token, platformId) => {
     if (timer !== undefined) clearTimeout(timer);
-    timer = setTimeout(() => { timer = undefined; void get().run(token); }, DEBOUNCE_MS);
+    timer = setTimeout(() => { timer = undefined; void get().run(token, platformId); }, DEBOUNCE_MS);
   },
 
-  run: async (token) => {
+  run: async (token, platformId) => {
     const { messages, intervalSec, cooldown } = get();
     if (!messages.length) {
       set({ result: null, resultIds: [], error: '', loading: false });
@@ -153,8 +153,8 @@ export const useAuditionStore = create<AuditionState>((set, get) => ({
     const asked = messages.map((m) => m.id);
     set({ loading: true, error: '' });
     try {
-      const result = await dryRunQqTrigger(token, toRequest(messages, intervalSec), {
-        config: effectiveValues(useConsoleStore.getState()),
+      const result = await dryRunPlatformTrigger(token, platformId, toRequest(messages, intervalSec), {
+        config: effectiveValues(platformConsoleStore(platformId).getState()),
         cooldown,
       });
       if (mine !== issued) return;

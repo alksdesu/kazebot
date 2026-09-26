@@ -1,12 +1,12 @@
 // 号码表与本地备注。备注绝不能混进 qq.yaml —— 群名往往带真实身份。
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import type { QqInputRule } from '../api/supervisorClient';
+import type { PlatformInputRule } from '../api/supervisorClient';
 import { readAliases, writeAlias } from '../console/aliases';
-import { addId, addWord, idIsValid, mergeDraft, useConsoleStore } from '../console/consoleStore';
+import { addId, addWord, idIsValid, mergeDraft, platformConsoleStore } from '../console/consoleStore';
 
 // bot 公布的那份规则，逐字照抄 live_config 的 ID_INPUT_RULE。
-const ID_RULE: QqInputRule = { kind: 'id', pattern: '^[0-9]+$', min: 1, max: 9007199254740991 };
+const ID_RULE: PlatformInputRule = { kind: 'id', pattern: '^[0-9]+$', min: 1, max: 9007199254740991 };
 
 describe('addId', () => {
   it('appends a numeric id', () => {
@@ -66,21 +66,21 @@ describe('the published rule is the only rule', () => {
   });
 
   it('honours the max the bot published', () => {
-    const rule: QqInputRule = { ...ID_RULE, max: 999 };
+    const rule: PlatformInputRule = { ...ID_RULE, max: 999 };
 
     expect(addId([], '999', rule)).toEqual([999]);
     expect(addId([], '1000', rule)).toEqual([]);
   });
 
   it('honours the min the bot published', () => {
-    const rule: QqInputRule = { ...ID_RULE, min: 5 };
+    const rule: PlatformInputRule = { ...ID_RULE, min: 5 };
 
     expect(addId([], '4', rule)).toEqual([]);
     expect(addId([], '5', rule)).toEqual([5]);
   });
 
   it('honours the pattern the bot published', () => {
-    const rule: QqInputRule = { kind: 'id', pattern: '^1[0-9]+$', min: 1, max: 999 };
+    const rule: PlatformInputRule = { kind: 'id', pattern: '^1[0-9]+$', min: 1, max: 999 };
 
     expect(addId([], '222', rule)).toEqual([]);
     expect(addId([], '123', rule)).toEqual([123]);
@@ -99,7 +99,7 @@ describe('the published rule is the only rule', () => {
   });
 
   it('still refuses a number that cannot survive JSON even if the bot allows it', () => {
-    const rule: QqInputRule = { ...ID_RULE, max: Number.MAX_VALUE };
+    const rule: PlatformInputRule = { ...ID_RULE, max: Number.MAX_VALUE };
 
     expect(addId([], '99999999999999999999', rule)).toEqual([]);
   });
@@ -150,7 +150,7 @@ describe('local aliases', () => {
   it('never reaches the yaml that gets saved', () => {
     // 备注只活在浏览器里。它要是能进 qq.yaml，群名就会跟着进模型的上下文。
     writeAlias('qq', 700, '公司内部群');
-    useConsoleStore.setState({
+    platformConsoleStore('qq').setState({
       live: {
         published: true,
         applied: true,
@@ -159,9 +159,9 @@ describe('local aliases', () => {
       },
       draft: {},
     });
-    useConsoleStore.getState().setDraft('allowed_groups', [700]);
+    platformConsoleStore('qq').getState().setDraft('allowed_groups', [700]);
 
-    const out = mergeDraft('', useConsoleStore.getState().draft, { allowed_groups: 'channels.allowed_groups' });
+    const out = mergeDraft('', platformConsoleStore('qq').getState().draft, { allowed_groups: 'channels.allowed_groups' });
 
     expect(out).toContain('700');
     expect(out).not.toContain('公司内部群');

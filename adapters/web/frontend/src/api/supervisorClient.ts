@@ -1430,23 +1430,23 @@ export async function restartEngine(
 }
 
 // ================================================================
-//  QQ 控制台
+//  平台配置与平台清单
 // ================================================================
 
-export interface QqRawFile {
+export interface PlatformRawFile {
   content: string;
   /** false = 还没接管，控制台该显示「跟随 .env」而不是一份空配置。 */
   exists: boolean;
 }
 
-export interface QqSaveResult {
+export interface PlatformSaveResult {
   ok: boolean;
   /** bot 没在跑时后端只能校验 YAML 语法，会在这里说明。 */
   warnings: string[];
 }
 
 /** bot 公布的生效快照。published=false 时其余字段都不该读。 */
-export interface QqLiveState {
+export interface PlatformLiveState {
   published: boolean;
   reason?: string;
   age_sec?: number;
@@ -1462,15 +1462,15 @@ export interface QqLiveState {
     paths?: Record<string, string>;
     reload?: Record<string, string>;
     notes?: Record<string, string>;
-    runtime?: QqRuntimeFacts;
-    capabilities?: QqCapability[];
+    runtime?: PlatformRuntimeFacts;
+    capabilities?: PlatformCapability[];
     /** 列表项规则。由 bot 公布 —— 前端重写一遍就会和后端 coercer 漂移。 */
-    input_rules?: Record<string, QqInputRule>;
+    input_rules?: Record<string, PlatformInputRule>;
   };
 }
 
 /** 一个列表键的单项规则。kind 决定用哪个校验器，其余字段是该校验器的参数。 */
-export interface QqInputRule {
+export interface PlatformInputRule {
   kind: 'id' | 'word';
   pattern?: string;
   min?: number;
@@ -1479,7 +1479,7 @@ export interface QqInputRule {
 }
 
 /** 一项管理能力。清单由 bot 公布 —— 前端写死的话，新加的能力会在界面上无声缺席。 */
-export interface QqCapability {
+export interface PlatformCapability {
   key: string;
   name: string;
   desc: string;
@@ -1491,7 +1491,7 @@ export interface QqCapability {
 }
 
 /** 配置之外、只有 bot 进程知道的事。密钥只报「设没设」，永不回传值。 */
-export interface QqRuntimeFacts {
+export interface PlatformRuntimeFacts {
   pid?: number;
   onebot_connected?: boolean;
   queue_workers_running?: number;
@@ -1511,7 +1511,7 @@ export interface QqRuntimeFacts {
   };
 }
 
-export interface QqDryRunVerdict {
+export interface PlatformDryRunVerdict {
   index: number;
   text: string;
   triggered: boolean;
@@ -1523,13 +1523,13 @@ export interface QqDryRunVerdict {
   cooldown_remaining: number;
 }
 
-export interface QqDryRunResult {
+export interface PlatformDryRunResult {
   enabled_signals: string[];
   cooldown_applied: boolean;
-  results: QqDryRunVerdict[];
+  results: PlatformDryRunVerdict[];
 }
 
-export interface QqDryRunMessage {
+export interface PlatformDryRunMessage {
   text: string;
   group_id?: number;
   user_id?: number;
@@ -1538,10 +1538,27 @@ export interface QqDryRunMessage {
   at_sec?: number;
 }
 
+/** 平台注册表公布的一份平台描述。字段对着 platforms/descriptor.py 的 public_dict()。 */
+export interface PlatformSummary {
+  id: string;
+  display_name: string;
+  short_name: string;
+  id_shape: string;
+  channels: { name: string; kind: string; hashed: boolean }[];
+  has_config: boolean;
+  hooks: string[];
+}
+
+export async function getPlatforms(token: string): Promise<PlatformSummary[]> {
+  const resp = await apiFetch('/platforms', { headers: authHeaders(token) });
+  const json = await resp.json();
+  return Array.isArray(json.platforms) ? json.platforms : [];
+}
+
 // 不复用 readRawConfig：那个 helper 只留 content，会把 exists 一起丢掉，
 // 于是「还没接管」和「接管了但是空的」在界面上长得一样。
-export async function getQqRaw(token: string): Promise<QqRawFile> {
-  const resp = await apiFetch('/admin/config/qq/raw', { headers: authHeaders(token) });
+export async function getPlatformRaw(token: string, platformId: string): Promise<PlatformRawFile> {
+  const resp = await apiFetch(`/platforms/${encodeURIComponent(platformId)}/config/raw`, { headers: authHeaders(token) });
   const json = await resp.json();
   return {
     content: typeof json.content === 'string' ? json.content : '',
@@ -1550,8 +1567,8 @@ export async function getQqRaw(token: string): Promise<QqRawFile> {
 }
 
 /** 整份写回。后端拒绝无人消费的键（400），错误会带着那批键名抛出来。 */
-export async function updateQqRaw(token: string, content: string): Promise<QqSaveResult> {
-  const resp = await apiFetch('/admin/config/qq/raw', {
+export async function updatePlatformRaw(token: string, platformId: string, content: string): Promise<PlatformSaveResult> {
+  const resp = await apiFetch(`/platforms/${encodeURIComponent(platformId)}/config/raw`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
     body: JSON.stringify({ content }),
@@ -1560,21 +1577,22 @@ export async function updateQqRaw(token: string, content: string): Promise<QqSav
   return { ok: Boolean(json.ok), warnings: Array.isArray(json.warnings) ? json.warnings : [] };
 }
 
-export async function getQqState(token: string): Promise<QqLiveState> {
-  const resp = await apiFetch('/admin/config/qq/state', { headers: authHeaders(token) });
+export async function getPlatformState(token: string, platformId: string): Promise<PlatformLiveState> {
+  const resp = await apiFetch(`/platforms/${encodeURIComponent(platformId)}/config/state`, { headers: authHeaders(token) });
   return resp.json();
 }
 
 /** 试听。config 省略时用 bot 公布的生效值，省得调用方自己拼一份不一样的。 */
-export async function dryRunQqTrigger(
+export async function dryRunPlatformTrigger(
   token: string,
-  messages: QqDryRunMessage[],
+  platformId: string,
+  messages: PlatformDryRunMessage[],
   options: { config?: Record<string, unknown>; cooldown?: boolean } = {},
-): Promise<QqDryRunResult> {
+): Promise<PlatformDryRunResult> {
   const body: Record<string, unknown> = { messages };
   if (options.config) body.config = options.config;
   if (options.cooldown === false) body.cooldown = false;
-  const resp = await apiFetch('/admin/config/qq/trigger/dry-run', {
+  const resp = await apiFetch(`/platforms/${encodeURIComponent(platformId)}/trigger/dry-run`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
     body: JSON.stringify(body),
