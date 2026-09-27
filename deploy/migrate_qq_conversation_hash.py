@@ -1,7 +1,7 @@
 """把存量部署的会话键摘要从无盐迁移到加盐：离线、可 dry-run、失败可中止。
 
-记忆目录名、.hit_cache.json 前缀、路由状态键按 real_conversation_keys 逐条重算；定时任务、提醒这些
-按会话键存的功能数据跟着换键；supervisor 的 sessions.json 不动，那几个会话下次说话各自新开。
+记忆目录名、.hit_cache.json 前缀、路由状态键按 real_conversation_keys 逐条重算，每个键保留它原来的账号作用域；
+定时任务、提醒这些按会话键存的功能数据跟着换键；supervisor 的 sessions.json 不动，那几个会话下次说话各自新开。
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import secrets
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -18,15 +19,17 @@ if str(_ROOT) not in sys.path:
 
 # 摘要算法必须与运行时同一份，所以直接用共享层的模块。
 from adapters._shared import conversation_hash as _conversation_hash  # noqa: E402
+from adapters._shared.active_account import account_candidates, normalize_account  # noqa: E402
 from clonoth_runtime import offline_workspace  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 from supervisor.conversation_stores import format_store_counts, rekey_conversation_stores  # noqa: E402
 
 rekey = _conversation_hash.rekey
+key_origin = _conversation_hash.key_origin
 _SECRET_RE = _conversation_hash._SECRET_RE
 
 from engine.conversation_migration import (  # noqa: E402
-    ConversationRekey, RekeyCount, Rename, apply_migration, plan_migration,
+    ConversationRekey, RekeyCount, Rename, Unresolved, apply_migration, plan_migration,
 )
 
 _SECRET_BYTES = 32
@@ -45,8 +48,11 @@ class MigrationReport:
     # bot 用的是 data/config.yaml 或环境变量里配的密钥：迁到它，不写密钥文件。
     explicit_secret: bool = False
     renames: list[Rename] = field(default_factory=list)
+    # 认键时试过的账号作用域：认不出的键多半出自不在这里的旧号。
+    accounts: tuple[str, ...] = ()
     moved_dirs: list[tuple[str, str]] = field(default_factory=list)
-    skipped_target_exists: list[tuple[str, str]] = field(default_factory=list)
+    blocked: list[Rename] = field(default_factory=list)
+    unresolved: list[Unresolved] = field(default_factory=list)
     missing_source_dirs: list[str] = field(default_factory=list)
     unknown_conv_dirs: list[str] = field(default_factory=list)
     route_keys_changed: int = 0
@@ -90,8 +96,9 @@ def _write_secret(secret_file: Path, secret: str) -> None:
 
 
 def run_migration(
-    *, workspace: Path, apply: bool, secret: str | None = None,
+    *, workspace: Path, apply: bool, secret: str | None = None, accounts: Iterable[str] = (),
 ) -> MigrationReport:
+    """accounts 是另外要试的 bot 账号：换过号、旧号已经不在记录里的时候由人补上。"""
     workspace = Path(workspace)
     secret_file = _conversation_hash.secret_file(QQ_NAPCAT, workspace)
     current = _conversation_hash.current_secret(QQ_NAPCAT, workspace)
@@ -99,13 +106,20 @@ def run_migration(
     report = MigrationReport(workspace=workspace, apply=apply)
     report.explicit_secret = current.source == _conversation_hash.SECRET_EXPLICIT
     report.target_secret, report.already_salted = _resolve_target_secret(current, secret)
+    report.accounts = account_candidates(QQ_NAPCAT, workspace, extra=accounts)
+    # 盘上的键可能出自 bot 现在这把、加盐前的无盐，或上次跑到一半已经换上的目标密钥。
+    tried_secrets = (current.value, "", report.target_secret)
 
-    plan = plan_migration(
-        workspace=workspace,
-        platform=QQ_NAPCAT,
-        restable=lambda old_stable, real: rekey(old_stable, real, report.target_secret),
-    )
+    def restable(old_stable: str, real: str) -> str | None:
+        origin = key_origin(old_stable, real, candidate_secrets=tried_secrets, candidate_scopes=report.accounts)
+        if origin is None:
+            return None
+        return rekey(old_stable, real, report.target_secret, bot_scope=origin.bot_scope)
+
+    plan = plan_migration(workspace=workspace, platform=QQ_NAPCAT, restable=restable)
     report.renames = plan.renames
+    report.blocked = plan.blocked
+    report.unresolved = plan.unresolved
     report.missing_source_dirs = plan.missing_source_dirs
     report.unknown_conv_dirs = plan.unknown_conv_dirs
 
@@ -118,7 +132,6 @@ def run_migration(
 
     outcome = apply_migration(workspace=workspace, platform=QQ_NAPCAT, plan=plan)
     report.moved_dirs = outcome.moved_dirs
-    report.skipped_target_exists = outcome.skipped_target_exists
     report.hit_keys_rewritten = outcome.hit_keys_rewritten
     report.route_keys_changed = outcome.route_keys_changed
     report.backup_dir = outcome.backup_dir
@@ -154,17 +167,22 @@ def _print_report(report: MigrationReport) -> None:
     print(f"待重算会话数: {len(changed)}")
     for rename in changed:
         state = "moved" if (rename.old_ns, rename.new_ns) in report.moved_dirs else (
-            "target-exists" if rename.target_exists else (
+            "blocked" if rename.blocked else (
                 "missing-dir" if not rename.dir_exists else "planned"))
         print(f"  {rename.real}: {rename.old_ns} -> {rename.new_ns} [{state}]")
     if report.unknown_conv_dirs:
         print("路由状态里查不到、保持原样的记忆目录（无法重算，请勿手工改名）:")
         for name in report.unknown_conv_dirs:
             print(f"  {name}")
-    if report.skipped_target_exists:
-        print("目标目录已存在、跳过改名:")
-        for old_ns, new_ns in report.skipped_target_exists:
-            print(f"  {old_ns} -> {new_ns}")
+    if report.blocked:
+        print("两边都有长期记忆、或几个旧键撞到同一个新键，整段会话原样留着（处理掉一边再重跑）:")
+        for rename in report.blocked:
+            print(f"  {rename.real}: {rename.old_ns} -> {rename.new_ns}")
+    if report.unresolved:
+        print("认不出按哪把密钥、哪个账号算出来的会话键，原样留着（出自换掉的旧号的话，用 --account 补上再跑）:")
+        for item in report.unresolved:
+            print(f"  {item.real}: {item.old_ns}")
+    print(f"认键时试过的账号: {'、'.join(account or '<无作用域>' for account in report.accounts)}")
     print(f"{'已改写' if report.apply else '将改写'}的按会话键存的功能数据: {format_store_counts(report.stores)}")
     if report.apply:
         print(f"备份目录: {report.backup_dir}")
@@ -193,8 +211,16 @@ def main(argv: list[str] | None = None) -> int:
         "--secret", default=None,
         help="迁移到的目标密钥（≥64 位 hex）；不给则复用已有密钥或随机生成。",
     )
+    parser.add_argument(
+        "--account", dest="accounts", action="append", default=[],
+        help="另外按这个 bot QQ 号认会话键，可以给多次；换过号、旧号已经不在记录里的时候用。",
+    )
     args = parser.parse_args(argv)
     workspace = offline_workspace(args.workspace)
+
+    for account in args.accounts:
+        if not normalize_account(account, QQ_NAPCAT):
+            parser.error(f"--account 必须是 bot 的 QQ 号（纯数字），收到 {account!r}")
 
     secret = args.secret
     if secret is not None:
@@ -203,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--secret 必须是 ≥64 位十六进制字符串")
 
     try:
-        report = run_migration(workspace=workspace, apply=args.apply, secret=secret)
+        report = run_migration(workspace=workspace, apply=args.apply, secret=secret, accounts=args.accounts)
     except SecretConflict as error:
         print(f"密钥冲突，未改动任何文件: {error}", file=sys.stderr)
         return 2

@@ -1550,20 +1550,25 @@ def create_app(
         alive = (time.time() - float(state.get("published_at") or 0.0)) <= 90.0
         return alive, str(runtime.get("bot_scope") or "")
 
+    def _scope_count_rows(scopes: dict[str, int]) -> list[dict[str, Any]]:
+        return [{"scope": scope, "conversations": count} for scope, count in scopes.items()]
+
     def _scope_plan_rows(report: Any) -> list[dict[str, Any]]:
         return [
             {
                 "old_namespace": rename.old_ns,
                 "new_namespace": rename.new_ns,
                 "has_memory": rename.dir_exists,
-                "blocked": rename.target_exists,
+                "blocked": rename.blocked,
             }
             for rename in report.changed_renames
         ]
 
     @app.get("/v1/admin/qq/scope")
-    async def admin_qq_scope(request: Request, target: str = Query("")) -> dict[str, Any]:
-        """当前账号归属，以及搬到 target 名下会动哪些东西的预览。"""
+    async def admin_qq_scope(
+        request: Request, target: str = Query(""), source: str | None = Query(None),
+    ) -> dict[str, Any]:
+        """当前账号归属，以及把 source（不给就自动认）名下的数据搬到 target 会动哪些东西的预览。"""
         verify_admin_token(request)
         st: SupervisorState = app.state.state
         migration = _scope_migration()
@@ -1574,14 +1579,19 @@ def create_app(
             "live_scope": live_scope,
             "bot_alive": bot_alive,
             "preview": None,
+            "ambiguous_sources": [],
         }
         if not target.strip():
             return payload
         try:
             report = migration.run_scope_migration(
-                workspace=st.workspace_root, target_scope=target, apply=False,
+                workspace=st.workspace_root, target_scope=target, source_scope=source, apply=False,
                 live_sessions=st.rekey_session_registry,
             )
+        except migration.AmbiguousSource as exc:
+            # 让人从盘上实际有的几个账号里挑一个，再带着 source 重新预览。
+            payload["ambiguous_sources"] = _scope_count_rows(exc.scopes)
+            return payload
         except (migration.ScopeMismatch, RekeyConflict) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ConversationStoreError as exc:
@@ -1593,6 +1603,8 @@ def create_app(
             "target_scope": report.target_scope,
             "conversations": _scope_plan_rows(report),
             "unknown_namespaces": report.unknown_conv_dirs,
+            "unresolved_namespaces": [item.old_ns for item in report.unresolved],
+            "other_scopes": _scope_count_rows(report.other_scopes),
             "stores": store_counts_payload(report.stores),
         }
         return payload
@@ -1643,10 +1655,11 @@ def create_app(
             "sessions_reloaded": reloaded,
             "stores": store_counts_payload(report.stores),
             "skipped": [
-                {"old_namespace": old, "new_namespace": new}
-                for old, new in report.skipped_target_exists
+                {"old_namespace": rename.old_ns, "new_namespace": rename.new_ns}
+                for rename in report.blocked
             ],
             "unknown_namespaces": report.unknown_conv_dirs,
+            "unresolved_namespaces": [item.old_ns for item in report.unresolved],
             "backup_dir": str(report.backup_dir) if report.backup_dir else "",
         }
 

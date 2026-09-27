@@ -22,6 +22,7 @@ from platforms.descriptor import (  # noqa: E402
     CHANNEL_GROUP,
     CHANNEL_PRIVATE,
     HOOK_CONSOLE_SCHEMA,
+    HOOK_KNOWN_ACCOUNTS,
     HOOK_TRIGGER_POLICY,
     STATE_ALIASES,
     STATE_KINDS,
@@ -307,6 +308,18 @@ class TestFilesAndHooks:
         from adapters.onebot import console_layout
 
         assert platform_hook(QQ_NAPCAT, HOOK_CONSOLE_SCHEMA) is console_layout
+
+    def test_the_account_hook_reads_the_napcat_config_names(self, tmp_path: Path) -> None:
+        from adapters.onebot import accounts
+
+        config = tmp_path / "napcat" / "config"
+        config.mkdir(parents=True)
+        for name in ("onebot11_20002.json", "onebot11_10001.json", "onebot11_webui.json", "webui.json"):
+            (config / name).write_text("{}", encoding="utf-8")
+
+        assert platform_hook(QQ_NAPCAT, HOOK_KNOWN_ACCOUNTS) is accounts
+        assert accounts.known_accounts(tmp_path) == ["10001", "20002"]
+        assert accounts.known_accounts(tmp_path / "elsewhere") == []
 
     def test_the_shared_features_load_through_the_registry(self) -> None:
         from adapters._shared import features

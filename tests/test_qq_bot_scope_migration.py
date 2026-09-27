@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -45,6 +46,7 @@ _migrate_spec.loader.exec_module(migrate)
 
 _SECRET = "a" * 64
 _REAL = "qq_group:123456789"
+_OTHER_REAL = "qq_group:987654321"
 _OLD_BOT = "10000001"
 _NEW_BOT = "10000002"
 _QQ_ENVS = ("ONEBOT_CONVERSATION_HASH_SECRET", "ONEBOT_CONVERSATION_HASH_SECRET_FILE", "ONEBOT_STATE_FILE")
@@ -100,6 +102,24 @@ def _seed(tmp_path: Path, *, scope: str = "") -> dict:
     if scope:
         _store(tmp_path).save(scope)
     return {"stable": stable, "ns": ns}
+
+
+def _add_route(tmp_path: Path, real: str, scope: str, *, memory: bool = True) -> dict:
+    """往路由表里再添一个会话：换号之后旧号的键留着给在途回调用，新号一说话又添上新号的键。"""
+    stable = f"{real.split(':', 1)[0]}:{ch.digest(real, _SECRET, bot_scope=scope)}"
+    path = tmp_path / "data" / "onebot_plugin_state.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["real_conversation_keys"][stable] = real
+    path.write_text(json.dumps(state), encoding="utf-8")
+    ns = _ns(stable)
+    if memory:
+        (tmp_path / "data" / "memory" / ns).mkdir(parents=True)
+        (tmp_path / "data" / "memory" / ns / f"{scope or 'unscoped'}.yaml").write_text("x: 1\n", encoding="utf-8")
+    return {"stable": stable, "ns": ns}
+
+
+def _routes(tmp_path: Path) -> dict:
+    return json.loads((tmp_path / "data" / "onebot_plugin_state.json").read_text(encoding="utf-8"))["real_conversation_keys"]
 
 
 def _reminder(workspace: Path, scope: str, bot_scope: str) -> dict:
@@ -276,7 +296,7 @@ class TestScopeMigration:
         # 存量数据没有作用域，而 bot 一登录就把当前号记下了，两者天然对不上。
         seed = _seed(tmp_path)
         _store(tmp_path).save(_OLD_BOT)
-        assert migrate.detect_source_scope(tmp_path, _SECRET) == ""
+        assert migrate.detect_source_scope(tmp_path, _SECRET, target_scope=_NEW_BOT) == ""
 
         report = migrate.run_scope_migration(
             workspace=tmp_path, target_scope=_NEW_BOT, apply=True,
@@ -287,8 +307,8 @@ class TestScopeMigration:
 
     def test_an_unrecognisable_source_refuses_to_guess(self, tmp_path: Path) -> None:
         _seed(tmp_path, scope="70000009")
-        _store(tmp_path).save(_OLD_BOT)
-        assert migrate.detect_source_scope(tmp_path, _SECRET) is None
+        _store(tmp_path).path.write_text(json.dumps({"self_id": _OLD_BOT}), encoding="utf-8")
+        assert migrate.detect_source_scope(tmp_path, _SECRET, target_scope=_NEW_BOT) is None
         with pytest.raises(migrate.ScopeMismatch):
             migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=True)
 
@@ -340,6 +360,171 @@ class TestScopeMigration:
             migrate.run_scope_migration(
                 workspace=tmp_path, target_scope="not-a-qq", source_scope="", apply=True,
             )
+
+    def test_a_misspelt_source_is_not_taken_for_the_unscoped_data(self, tmp_path: Path) -> None:
+        seed = _seed(tmp_path)
+        with pytest.raises(ValueError):
+            migrate.run_scope_migration(
+                workspace=tmp_path, target_scope=_NEW_BOT, source_scope="1000O001", apply=True,
+            )
+        assert (tmp_path / "data" / "memory" / seed["ns"]).is_dir()
+
+
+class TestMixedAccounts:
+    def test_the_new_accounts_own_keys_do_not_block_the_move(self, tmp_path: Path) -> None:
+        # 升级到账号隔离后 bot 一说话就按新号记键，路由表于是混着两种键；原来要求整表同源，这时一律拒绝。
+        seed = _seed(tmp_path)
+        _store(tmp_path).save(_NEW_BOT)
+        theirs = _add_route(tmp_path, _OTHER_REAL, _NEW_BOT)
+
+        report = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=True)
+
+        new_stable = f"qq_group:{ch.digest(_REAL, _SECRET, bot_scope=_NEW_BOT)}"
+        memory = tmp_path / "data" / "memory"
+        assert report.source_scope == "" and report.other_scopes == {}
+        assert _routes(tmp_path) == {new_stable: _REAL, theirs["stable"]: _OTHER_REAL}
+        assert (memory / _ns(new_stable) / "book.yaml").is_file() and (memory / theirs["ns"]).is_dir()
+        assert not (memory / seed["ns"]).exists()
+
+    def test_a_third_accounts_conversations_stay_behind(self, tmp_path: Path) -> None:
+        seed = _seed(tmp_path)
+        other = _add_route(tmp_path, _OTHER_REAL, _OLD_BOT)
+        _store(tmp_path).save(_OLD_BOT)
+        _store(tmp_path).save(_NEW_BOT)
+        save_schedules(tmp_path, [{"id": "theirs", "cron": "0 9 * * *", "text": "早", "conversation_key": other["stable"]}])
+
+        report = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, source_scope="", apply=True)
+
+        assert report.other_scopes == {_OLD_BOT: 1}
+        assert _routes(tmp_path)[other["stable"]] == _OTHER_REAL
+        assert (tmp_path / "data" / "memory" / other["ns"]).is_dir()
+        assert load_schedules(tmp_path)[0]["conversation_key"] == other["stable"]
+        assert not (tmp_path / "data" / "memory" / seed["ns"]).exists()
+
+    def test_several_candidate_sources_are_not_guessed(self, tmp_path: Path) -> None:
+        seed = _seed(tmp_path)
+        other = _add_route(tmp_path, _OTHER_REAL, _OLD_BOT)
+        _store(tmp_path).save(_OLD_BOT)
+
+        with pytest.raises(migrate.AmbiguousSource) as caught:
+            migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=True)
+
+        assert caught.value.scopes == {"": 1, _OLD_BOT: 1}
+        assert "<无作用域>" in str(caught.value) and _OLD_BOT in str(caught.value)
+        assert (tmp_path / "data" / "memory" / seed["ns"]).is_dir()
+        assert (tmp_path / "data" / "memory" / other["ns"]).is_dir()
+
+    def test_a_group_both_accounts_remember_is_left_alone(self, tmp_path: Path) -> None:
+        # 只跳过记忆目录、照样改路由的话，旧目录在路由表里再也查不到，以后哪次迁移都认领不回来。
+        seed = _seed(tmp_path)
+        theirs = _add_route(tmp_path, _REAL, _NEW_BOT)
+        _store(tmp_path).save(_NEW_BOT)
+
+        report = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=True)
+
+        memory = tmp_path / "data" / "memory"
+        assert [rename.old_stable for rename in report.blocked] == [seed["stable"]]
+        assert report.moved_dirs == [] and report.sessions_changed == 0
+        assert _routes(tmp_path) == {seed["stable"]: _REAL, theirs["stable"]: _REAL}
+        assert (memory / seed["ns"] / "book.yaml").is_file()
+        assert sorted(path.name for path in (memory / theirs["ns"]).iterdir()) == [f"{_NEW_BOT}.yaml"]
+        sessions = json.loads((tmp_path / "data" / "sessions.json").read_text(encoding="utf-8"))
+        assert sessions["sid-1"]["conversation_key"] == seed["stable"]
+
+    def test_a_group_only_the_target_knows_by_key_takes_the_sources_memory(self, tmp_path: Path) -> None:
+        seed = _seed(tmp_path)
+        theirs = _add_route(tmp_path, _REAL, _NEW_BOT, memory=False)
+        _store(tmp_path).save(_NEW_BOT)
+
+        report = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=True)
+
+        assert report.blocked == []
+        assert _routes(tmp_path) == {theirs["stable"]: _REAL}
+        assert (tmp_path / "data" / "memory" / theirs["ns"] / "book.yaml").is_file()
+
+    def test_a_source_without_memory_still_moves_onto_a_target_that_remembers(self, tmp_path: Path) -> None:
+        # 只有目标那边有记忆就没什么要合并的：会话和功能数据照样过去，目标的记忆原样不动。
+        seed = _seed(tmp_path)
+        shutil.rmtree(tmp_path / "data" / "memory" / seed["ns"])
+        theirs = _add_route(tmp_path, _REAL, _NEW_BOT)
+        _store(tmp_path).save(_NEW_BOT)
+
+        report = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=True)
+
+        assert report.blocked == [] and report.sessions_changed == 1
+        assert _routes(tmp_path) == {theirs["stable"]: _REAL}
+        assert sorted(path.name for path in (tmp_path / "data" / "memory" / theirs["ns"]).iterdir()) == [f"{_NEW_BOT}.yaml"]
+
+    def test_running_again_without_a_source_finds_nothing_to_move(self, tmp_path: Path) -> None:
+        _seed(tmp_path)
+        migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=True)
+
+        again = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=True)
+
+        assert again.source_scope == _NEW_BOT
+        assert again.moved_dirs == [] and again.route_keys_changed == 0
+
+    def test_a_workspace_without_conversations_has_nothing_to_move(self, tmp_path: Path) -> None:
+        _store(tmp_path).save(_OLD_BOT)
+
+        report = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=True)
+
+        assert report.source_scope == _OLD_BOT and report.renames == []
+        assert _store(tmp_path).load() == _NEW_BOT
+
+    def test_keys_already_under_an_unrecorded_target_count_as_the_targets(self, tmp_path: Path) -> None:
+        # 迁给一个还没登录过的号（--no-adopt 那种），它名下的键也得认得出来，不然全算成认不出。
+        seed = _seed(tmp_path)
+        theirs = _add_route(tmp_path, _OTHER_REAL, _NEW_BOT)
+
+        report = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=True)
+
+        assert report.source_scope == "" and report.unresolved == []
+        assert _routes(tmp_path)[theirs["stable"]] == _OTHER_REAL
+        assert not (tmp_path / "data" / "memory" / seed["ns"]).exists()
+
+    def test_the_previous_account_is_recognised_after_a_switch(self, tmp_path: Path) -> None:
+        seed = _seed(tmp_path, scope=_OLD_BOT)
+        _store(tmp_path).save(_NEW_BOT)
+
+        assert migrate.detect_source_scope(tmp_path, _SECRET, target_scope=_NEW_BOT) == _OLD_BOT
+
+        report = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=True)
+        assert report.source_scope == _OLD_BOT
+        assert not (tmp_path / "data" / "memory" / seed["ns"]).exists()
+
+    def test_an_account_napcat_remembers_is_recognised(self, tmp_path: Path) -> None:
+        _seed(tmp_path, scope=_OLD_BOT)
+        _store(tmp_path).path.write_text(json.dumps({"self_id": _NEW_BOT}), encoding="utf-8")
+        assert migrate.detect_source_scope(tmp_path, _SECRET, target_scope=_NEW_BOT) is None
+
+        config = tmp_path / "napcat" / "config"
+        config.mkdir(parents=True)
+        (config / f"onebot11_{_OLD_BOT}.json").write_text("{}", encoding="utf-8")
+
+        assert migrate.detect_source_scope(tmp_path, _SECRET, target_scope=_NEW_BOT) == _OLD_BOT
+
+    def test_an_explicit_source_outside_every_record_is_still_recognised(self, tmp_path: Path) -> None:
+        seed = _seed(tmp_path, scope="70000009")
+        _store(tmp_path).path.write_text(json.dumps({"self_id": _NEW_BOT}), encoding="utf-8")
+
+        report = migrate.run_scope_migration(
+            workspace=tmp_path, target_scope=_NEW_BOT, source_scope="70000009", apply=True,
+        )
+
+        assert len(report.moved_dirs) == 1 and report.unresolved == []
+        assert not (tmp_path / "data" / "memory" / seed["ns"]).exists()
+
+    def test_keys_it_cannot_place_are_reported_and_left_alone(self, tmp_path: Path) -> None:
+        _seed(tmp_path)
+        stray = _add_route(tmp_path, _OTHER_REAL, "70000009")
+
+        report = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, source_scope="", apply=True)
+
+        assert [item.old_stable for item in report.unresolved] == [stray["stable"]]
+        assert stray["ns"] not in report.unknown_conv_dirs
+        assert _routes(tmp_path)[stray["stable"]] == _OTHER_REAL
+        assert (tmp_path / "data" / "memory" / stray["ns"]).is_dir()
 
 
 class TestDeploymentsThatMoveThings:
@@ -458,7 +643,9 @@ class TestSupervisorScopeQuery:
         response = self._get(tmp_path, monkeypatch, "/v1/admin/qq/scope")
 
         assert response.status_code == 200
-        assert response.json() == {"current_scope": _OLD_BOT, "live_scope": "", "bot_alive": False, "preview": None}
+        assert response.json() == {
+            "current_scope": _OLD_BOT, "live_scope": "", "bot_alive": False, "preview": None, "ambiguous_sources": [],
+        }
 
     def test_the_console_preview_works_when_the_secret_is_in_the_environment(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -506,4 +693,80 @@ class TestSupervisorScopeQuery:
         )
 
         assert response.status_code == 500 and "定时任务" in response.json()["detail"]
+        assert (tmp_path / "data" / "memory" / seed["ns"]).is_dir()
+
+    def test_ambiguous_sources_are_listed_for_the_console_to_pick(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _seed(tmp_path)
+        stray = _add_route(tmp_path, _OTHER_REAL, "70000009")
+        _add_route(tmp_path, _OTHER_REAL, _OLD_BOT)
+        _store(tmp_path).save(_OLD_BOT)
+
+        listed = self._get(tmp_path, monkeypatch, f"/v1/admin/qq/scope?target={_NEW_BOT}")
+
+        assert listed.status_code == 200, listed.text
+        assert listed.json()["preview"] is None
+        assert sorted(listed.json()["ambiguous_sources"], key=lambda row: row["scope"]) == [
+            {"scope": "", "conversations": 1}, {"scope": _OLD_BOT, "conversations": 1},
+        ]
+
+        picked = self._get(tmp_path, monkeypatch, f"/v1/admin/qq/scope?target={_NEW_BOT}&source=")
+
+        assert picked.status_code == 200, picked.text
+        preview = picked.json()["preview"]
+        assert preview["source_scope"] == "" and picked.json()["ambiguous_sources"] == []
+        assert preview["other_scopes"] == [{"scope": _OLD_BOT, "conversations": 1}]
+        assert preview["unresolved_namespaces"] == [stray["ns"]]
+        assert len(preview["conversations"]) == 1
+
+    def test_a_group_both_accounts_remember_is_shown_and_left_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        seed = _seed(tmp_path)
+        theirs = _add_route(tmp_path, _REAL, _NEW_BOT)
+        _store(tmp_path).save(_NEW_BOT)
+
+        preview = self._get(tmp_path, monkeypatch, f"/v1/admin/qq/scope?target={_NEW_BOT}").json()["preview"]
+        migrated = self._call(
+            tmp_path, monkeypatch, "POST", "/v1/admin/qq/scope/migrate", body={"target": _NEW_BOT, "source": ""},
+        )
+
+        assert preview["conversations"] == [{
+            "old_namespace": seed["ns"], "new_namespace": theirs["ns"], "has_memory": True, "blocked": True,
+        }]
+        assert migrated.status_code == 200, migrated.text
+        assert migrated.json()["skipped"] == [{"old_namespace": seed["ns"], "new_namespace": theirs["ns"]}]
+        assert migrated.json()["moved_memory_dirs"] == 0
+        assert (tmp_path / "data" / "memory" / seed["ns"]).is_dir()
+
+    def test_a_conversation_without_memory_is_not_blocked_by_the_target(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        seed = _seed(tmp_path)
+        shutil.rmtree(tmp_path / "data" / "memory" / seed["ns"])
+        theirs = _add_route(tmp_path, _REAL, _NEW_BOT)
+        _store(tmp_path).save(_NEW_BOT)
+
+        preview = self._get(tmp_path, monkeypatch, f"/v1/admin/qq/scope?target={_NEW_BOT}").json()["preview"]
+
+        assert preview["conversations"] == [{
+            "old_namespace": seed["ns"], "new_namespace": theirs["ns"], "has_memory": False, "blocked": False,
+        }]
+
+    def test_the_console_migration_passes_the_source_it_previewed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        seed = _seed(tmp_path)
+        _add_route(tmp_path, _OTHER_REAL, _OLD_BOT)
+        _store(tmp_path).save(_OLD_BOT)
+
+        refused = self._call(tmp_path, monkeypatch, "POST", "/v1/admin/qq/scope/migrate", body={"target": _NEW_BOT})
+        migrated = self._call(
+            tmp_path, monkeypatch, "POST", "/v1/admin/qq/scope/migrate", body={"target": _NEW_BOT, "source": _OLD_BOT},
+        )
+
+        assert refused.status_code == 409
+        assert migrated.status_code == 200, migrated.text
+        assert migrated.json()["source_scope"] == _OLD_BOT and migrated.json()["moved_memory_dirs"] == 1
         assert (tmp_path / "data" / "memory" / seed["ns"]).is_dir()

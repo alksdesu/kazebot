@@ -12,7 +12,7 @@ import re
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from clonoth_runtime import platform_secret
 from platforms.descriptor import CHANNEL_OTHER, STATE_ROUTES, ChannelDescriptor, PlatformDescriptor
@@ -87,6 +87,29 @@ class ConversationKeys:
 def rekey(old_stable: str, real_key: str, secret: str, *, bot_scope: str = "") -> str:
     """离线迁移用：保留旧稳定键的渠道前缀，只按新的密钥或作用域重算摘要。"""
     return f"{old_stable.split(':', 1)[0]}:{digest(real_key, secret, bot_scope=bot_scope)}"
+
+
+@dataclass(frozen=True)
+class KeyOrigin:
+    """一个稳定键当初是用哪把密钥、在哪个账号下算出来的。"""
+
+    secret: str
+    bot_scope: str
+
+
+def key_origin(
+    old_stable: str, real_key: str, *, candidate_secrets: Iterable[str], candidate_scopes: Iterable[str],
+) -> KeyOrigin | None:
+    """逐个候选重算，认出旧稳定键的来历；都对不上返回 None。
+
+    换号后旧号的键还留在路由表里给在途回调用，同一个群因此可能在几个账号下各有一个键，不能整表按一个账号重算。
+    """
+    scopes = tuple(dict.fromkeys(str(scope or "").strip() for scope in candidate_scopes))
+    for secret in dict.fromkeys(str(value or "") for value in candidate_secrets):
+        for scope in scopes:
+            if rekey(old_stable, real_key, secret, bot_scope=scope) == old_stable:
+                return KeyOrigin(secret, scope)
+    return None
 
 
 def has_digest_derived_state(workspace: Path, route_state_file: Path) -> bool:

@@ -18,6 +18,8 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from adapters._shared import conversation_hash as ch  # noqa: E402
+from adapters._shared.active_account import ActiveAccountStore  # noqa: E402
+from engine.conversation_migration import apply_migration, plan_migration  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 from platforms.descriptor import (  # noqa: E402
     CHANNEL_GROUP,
@@ -258,6 +260,28 @@ def _seed_legacy_workspace(tmp_path: Path, real: str = "qq_group:123456789") -> 
     return {"real": real, "old_stable": old_stable, "old_ns": old_ns}
 
 
+def _add_legacy_route(tmp_path: Path, real: str, *, scope: str, secret: str = "", memory: bool = True) -> dict:
+    """往存量路由表里再添一个键：账号隔离之后算的键带着作用域，换号前的旧键也还留着。"""
+    stable = f"{real.split(':', 1)[0]}:{ch.digest(real, secret, bot_scope=scope)}"
+    path = tmp_path / "data" / "onebot_plugin_state.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["real_conversation_keys"][stable] = real
+    path.write_text(json.dumps(state), encoding="utf-8")
+    ns = _ns(stable)
+    if memory:
+        (tmp_path / "data" / "memory" / ns).mkdir(parents=True)
+        (tmp_path / "data" / "memory" / ns / f"{scope or 'unscoped'}.yaml").write_text("x: 1\n", encoding="utf-8")
+    return {"stable": stable, "ns": ns}
+
+
+def _ns(stable: str) -> str:
+    return "conv_" + hashlib.sha256(stable.encode("utf-8")).hexdigest()[:24]
+
+
+def _routes(tmp_path: Path) -> dict:
+    return json.loads((tmp_path / "data" / "onebot_plugin_state.json").read_text(encoding="utf-8"))["real_conversation_keys"]
+
+
 class TestMigration:
     def test_dry_run_touches_nothing(self, tmp_path: Path) -> None:
         seed = _seed_legacy_workspace(tmp_path)
@@ -402,3 +426,118 @@ class TestMigration:
 
         assert report.moved_dirs == []
         assert report.route_keys_changed == 0
+
+
+class TestKeysUnderSeveralAccounts:
+    def test_a_scoped_key_keeps_its_account(self, tmp_path: Path) -> None:
+        # 重算时丢掉作用域，bot 登录后按账号算出来的键对不上，记忆照样成了孤儿。
+        _seed_legacy_workspace(tmp_path)
+        scoped = _add_legacy_route(tmp_path, "qq_group:987654321", scope="10001")
+        ActiveAccountStore(QQ_NAPCAT, tmp_path).save("10001")
+
+        migrate.run_migration(workspace=tmp_path, apply=True, secret=_SECRET)
+
+        new_stable = f"qq_group:{ch.digest('qq_group:987654321', _SECRET, bot_scope='10001')}"
+        assert _routes(tmp_path)[new_stable] == "qq_group:987654321"
+        assert (tmp_path / "data" / "memory" / _ns(new_stable) / "10001.yaml").is_file()
+        assert not (tmp_path / "data" / "memory" / scoped["ns"]).exists()
+
+    def test_one_group_under_two_accounts_moves_as_two_conversations(self, tmp_path: Path) -> None:
+        # 两个键都按无作用域重算会撞进同一个目录，后搬的那份被塞进先搬的里面。
+        seed = _seed_legacy_workspace(tmp_path)
+        _add_legacy_route(tmp_path, seed["real"], scope="10001")
+        ActiveAccountStore(QQ_NAPCAT, tmp_path).save("10001")
+
+        report = migrate.run_migration(workspace=tmp_path, apply=True, secret=_SECRET)
+
+        unscoped = f"qq_group:{ch.digest(seed['real'], _SECRET)}"
+        scoped = f"qq_group:{ch.digest(seed['real'], _SECRET, bot_scope='10001')}"
+        memory = tmp_path / "data" / "memory"
+        assert _routes(tmp_path) == {unscoped: seed["real"], scoped: seed["real"]}
+        assert sorted(path.name for path in (memory / _ns(unscoped)).iterdir()) == ["book.yaml"]
+        assert sorted(path.name for path in (memory / _ns(scoped)).iterdir()) == ["10001.yaml"]
+        assert len(report.moved_dirs) == 2 and report.blocked == []
+
+    def test_a_key_from_a_forgotten_account_waits_until_it_is_named(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _seed_legacy_workspace(tmp_path)
+        stray = _add_legacy_route(tmp_path, "qq_group:555", scope="10009")
+
+        report = migrate.run_migration(workspace=tmp_path, apply=True, secret=_SECRET)
+
+        assert [item.old_stable for item in report.unresolved] == [stray["stable"]]
+        assert stray["ns"] not in report.unknown_conv_dirs
+        assert _routes(tmp_path)[stray["stable"]] == "qq_group:555"
+        assert (tmp_path / "data" / "memory" / stray["ns"]).is_dir()
+
+        assert migrate.main(["--workspace", str(tmp_path), "--apply", "--account", "10009"]) == 0
+
+        new_stable = f"qq_group:{ch.digest('qq_group:555', _SECRET, bot_scope='10009')}"
+        assert _routes(tmp_path).get(new_stable) == "qq_group:555"
+        assert (tmp_path / "data" / "memory" / _ns(new_stable) / "10009.yaml").is_file()
+        assert "10009" in capsys.readouterr().out
+
+    def test_a_run_interrupted_before_the_secret_was_written_can_be_repeated(self, tmp_path: Path) -> None:
+        # 密钥最后才写：前面都改完了、密钥没写上，重跑时盘上的键已经是目标密钥算的，得认得出来。
+        seed = _seed_legacy_workspace(tmp_path)
+        migrate.run_migration(workspace=tmp_path, apply=True, secret=_SECRET)
+        (tmp_path / "data" / "onebot_conversation_hash_secret").write_text(ch.LEGACY_MARKER, encoding="utf-8")
+
+        again = migrate.run_migration(workspace=tmp_path, apply=True, secret=_SECRET)
+
+        assert again.unresolved == [] and again.changed_renames == []
+        assert again.secret_written is True
+        assert _routes(tmp_path) == {f"qq_group:{ch.digest(seed['real'], _SECRET)}": seed["real"]}
+
+    def test_an_account_argument_must_be_a_qq_number(self, tmp_path: Path) -> None:
+        _seed_legacy_workspace(tmp_path)
+
+        with pytest.raises(SystemExit) as caught:
+            migrate.main(["--workspace", str(tmp_path), "--apply", "--account", "1000l"])
+
+        assert caught.value.code == 2
+
+    def test_both_sides_with_memory_leave_the_conversation_alone(self, tmp_path: Path) -> None:
+        from supervisor.scheduler import load_schedules, save_schedules
+
+        seed = _seed_legacy_workspace(tmp_path)
+        new_stable = f"qq_group:{ch.digest(seed['real'], _SECRET)}"
+        (tmp_path / "data" / "memory" / _ns(new_stable)).mkdir()
+        save_schedules(tmp_path, [{"id": "m", "cron": "0 9 * * *", "text": "早", "conversation_key": seed["old_stable"]}])
+
+        report = migrate.run_migration(workspace=tmp_path, apply=True, secret=_SECRET)
+
+        assert [rename.old_stable for rename in report.blocked] == [seed["old_stable"]]
+        assert _routes(tmp_path) == {seed["old_stable"]: seed["real"]}
+        assert (tmp_path / "data" / "memory" / seed["old_ns"] / "book.yaml").is_file()
+        assert load_schedules(tmp_path)[0]["conversation_key"] == seed["old_stable"]
+
+    def test_keys_that_would_collide_are_all_left_alone(self, tmp_path: Path) -> None:
+        # 同一个群在无盐和旧密钥下各有一个键，换成第三把密钥就撞到一起，分不出该留谁。
+        seed = _seed_legacy_workspace(tmp_path)
+        previous = "1" * 64
+        (tmp_path / "data" / "onebot_conversation_hash_secret").write_text(previous, encoding="utf-8")
+        salted = _add_legacy_route(tmp_path, seed["real"], scope="", secret=previous)
+
+        report = migrate.run_migration(workspace=tmp_path, apply=True, secret=_SECRET)
+
+        assert sorted(rename.old_stable for rename in report.blocked) == sorted([seed["old_stable"], salted["stable"]])
+        assert all(rename.collides for rename in report.blocked)
+        assert _routes(tmp_path) == {seed["old_stable"]: seed["real"], salted["stable"]: seed["real"]}
+        assert (tmp_path / "data" / "memory" / seed["old_ns"]).is_dir()
+        assert (tmp_path / "data" / "memory" / salted["ns"]).is_dir()
+
+    def test_a_target_that_appears_after_the_preview_stops_the_move(self, tmp_path: Path) -> None:
+        seed = _seed_legacy_workspace(tmp_path)
+        plan = plan_migration(
+            workspace=tmp_path, platform=QQ_NAPCAT, restable=lambda old, real: ch.rekey(old, real, _SECRET),
+        )
+        (tmp_path / "data" / "memory" / plan.changed[0].new_ns).mkdir()
+
+        with pytest.raises(RuntimeError):
+            apply_migration(workspace=tmp_path, platform=QQ_NAPCAT, plan=plan)
+
+        assert (tmp_path / "data" / "memory" / seed["old_ns"] / "book.yaml").is_file()
+        assert _routes(tmp_path) == {seed["old_stable"]: seed["real"]}
+        assert not list((tmp_path / "data").glob("migration_backup_*"))

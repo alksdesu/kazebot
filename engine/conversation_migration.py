@@ -10,6 +10,7 @@ import os
 import shutil
 import sqlite3
 import time
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -215,10 +216,29 @@ class Rename:
     new_ns: str
     dir_exists: bool
     target_exists: bool
+    # 还有别的旧键重算到同一个新键。
+    collides: bool = False
 
     @property
     def changed(self) -> bool:
         return self.old_stable != self.new_stable
+
+    @property
+    def blocked(self) -> bool:
+        """两边都有长期记忆，或者和别的旧键撞到同一个新键：合并语义不明，整段会话原样留着让人判断。
+
+        只跳过记忆目录、照样改路由的话，旧目录在路由表里再也查不到，以后哪次迁移都认领不回来。
+        """
+        return self.changed and ((self.dir_exists and self.target_exists) or self.collides)
+
+
+@dataclass(frozen=True)
+class Unresolved:
+    """路由表里有、但按哪个候选都重算不出原样的会话键。"""
+
+    real: str
+    old_stable: str
+    old_ns: str
 
 
 @dataclass
@@ -226,16 +246,21 @@ class MigrationPlan:
     renames: list[Rename] = field(default_factory=list)
     unknown_conv_dirs: list[str] = field(default_factory=list)
     missing_source_dirs: list[str] = field(default_factory=list)
+    unresolved: list[Unresolved] = field(default_factory=list)
 
     @property
     def changed(self) -> list[Rename]:
-        return [r for r in self.renames if r.changed]
+        """真正要搬的：键变了，也没被挡下。"""
+        return [r for r in self.renames if r.changed and not r.blocked]
+
+    @property
+    def blocked(self) -> list[Rename]:
+        return [r for r in self.renames if r.blocked]
 
 
 @dataclass
 class MigrationOutcome:
     moved_dirs: list[tuple[str, str]] = field(default_factory=list)
-    skipped_target_exists: list[tuple[str, str]] = field(default_factory=list)
     moved_attachment_dirs: list[tuple[str, str]] = field(default_factory=list)
     hit_keys_rewritten: int = 0
     route_keys_changed: int = 0
@@ -265,24 +290,33 @@ def load_route_map(route_state: Path) -> dict[str, str]:
 
 
 def plan_migration(
-    *, workspace: Path, platform: PlatformDescriptor, restable: Callable[[str, str], str],
+    *, workspace: Path, platform: PlatformDescriptor, restable: Callable[[str, str], str | None],
 ) -> MigrationPlan:
-    """算出新旧对照。restable 收 (old_stable, real) 返回新的 stable key。"""
+    """算出新旧对照。restable 收 (old_stable, real) 返回新的 stable key，认不出这个键的来历就返回 None。"""
     workspace = Path(workspace)
     root = memory_root(workspace)
     plan = MigrationPlan()
     known: set[str] = set()
+    pairs: list[tuple[str, str, str]] = []
 
     for old_stable, real in load_route_map(route_state_file(workspace, platform)).items():
         new_stable = restable(old_stable, real)
+        known.add(namespace_dir(old_stable))
+        if new_stable is None:
+            plan.unresolved.append(Unresolved(real, old_stable, namespace_dir(old_stable)))
+            continue
+        known.add(namespace_dir(new_stable))
+        pairs.append((old_stable, real, new_stable))
+
+    targets = Counter(new_stable for old_stable, _real, new_stable in pairs if old_stable != new_stable)
+    for old_stable, real, new_stable in pairs:
         old_ns = namespace_dir(old_stable)
         new_ns = namespace_dir(new_stable)
-        known.add(old_ns)
-        known.add(new_ns)
         dir_exists = (root / old_ns).is_dir()
         rename = Rename(
             real, old_stable, new_stable, old_ns, new_ns,
             dir_exists, old_ns != new_ns and (root / new_ns).exists(),
+            collides=old_stable != new_stable and targets[new_stable] > 1,
         )
         plan.renames.append(rename)
         if rename.changed and not dir_exists:
@@ -334,19 +368,19 @@ def apply_migration(
     if not plan.changed:
         return outcome
 
+    root = memory_root(workspace)
+    moves = [rename for rename in plan.changed if rename.dir_exists]
+    appeared = [rename.new_ns for rename in moves if (root / rename.new_ns).exists()]
+    if appeared:
+        # 目标目录是预演之后才冒出来的，说明 bot 还在跑；这时候 move 会把旧目录塞进新目录里面。
+        raise RuntimeError(f"预演之后又出现了 {len(appeared)} 个目标记忆目录，确认 bot 已经停下再重跑")
+
     if make_backup:
         outcome.backup_dir = fresh_backup_dir(workspace)
         backup(workspace=workspace, platform=platform, backup_dir=outcome.backup_dir, plan=plan)
 
-    root = memory_root(workspace)
     ns_renames: dict[str, str] = {}
-    for rename in plan.changed:
-        if not rename.dir_exists:
-            continue
-        if rename.target_exists:
-            # 两个源会话撞进同一个目标：合并语义不明确，宁可原样留着让人来判。
-            outcome.skipped_target_exists.append((rename.old_ns, rename.new_ns))
-            continue
+    for rename in moves:
         shutil.move(str(root / rename.old_ns), str(root / rename.new_ns))
         outcome.moved_dirs.append((rename.old_ns, rename.new_ns))
         ns_renames[rename.old_ns] = rename.new_ns

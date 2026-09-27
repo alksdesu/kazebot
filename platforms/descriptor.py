@@ -29,6 +29,8 @@ STATE_KINDS: frozenset[str] = frozenset({STATE_LIVE, STATE_ROUTES, STATE_ALIASES
 
 HOOK_TRIGGER_POLICY = "trigger_policy"
 HOOK_CONSOLE_SCHEMA = "console_schema"
+# 模块提供 known_accounts(workspace)：平台自己留下的、登录过的账号，离线迁移认会话键时拿来当候选。
+HOOK_KNOWN_ACCOUNTS = "known_accounts"
 
 # native 由驱动按平台 ID 渲染成真正的提及，text 只能写成「@名字」的文字。
 MENTION_NONE = "none"

@@ -5,6 +5,7 @@ SDK 水位、发送身份都要认得它们，而 QQ 的数字 ID 走哪条路�
 """
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -16,7 +17,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from adapters._shared import capability, trigger_policy  # noqa: E402
-from adapters._shared.active_account import ActiveAccountStore, normalize_account  # noqa: E402
+from adapters._shared.active_account import ActiveAccountStore, account_candidates, normalize_account  # noqa: E402
 from adapters.onebot import forward_authz  # noqa: E402
 from adapters._shared.send_guard import SendContractError  # noqa: E402
 from adapters.onebot.send_contract import (  # noqa: E402
@@ -174,6 +175,66 @@ class TestActiveAccountStore:
 
         assert store.path == tmp_path / "data" / "platforms" / "probe" / "active_account.json"
         assert store.save(_OPENID) is True and store.load() == _OPENID
+
+    def test_every_account_that_logged_in_is_remembered(self, tmp_path: Path) -> None:
+        # 换号后旧号的会话键还留在路由表里，离线迁移要靠这份名单认出它们是谁的。
+        store = ActiveAccountStore(QQ_NAPCAT, tmp_path)
+
+        assert store.save("10001") is True and store.save("10002") is True
+        assert store.save("10002") is False
+        assert store.save("10001") is True
+
+        assert store.load() == "10001"
+        assert store.accounts() == ("10001", "10002")
+
+    def test_an_old_file_keeps_its_account_when_the_next_one_logs_in(self, tmp_path: Path) -> None:
+        store = ActiveAccountStore(QQ_NAPCAT, tmp_path)
+        store.path.parent.mkdir(parents=True)
+        store.path.write_text(json.dumps({"self_id": "10001"}), encoding="utf-8")
+        assert store.accounts() == ("10001",)
+
+        store.save("10002")
+
+        assert json.loads(store.path.read_text(encoding="utf-8")) == {"self_id": "10002", "accounts": ["10001", "10002"]}
+
+    def test_dirty_history_entries_are_dropped(self, tmp_path: Path) -> None:
+        store = ActiveAccountStore(QQ_NAPCAT, tmp_path)
+        store.path.parent.mkdir(parents=True)
+        store.path.write_text(
+            json.dumps({"self_id": "10002", "accounts": ["not-a-qq", 10001, "10001", None]}), encoding="utf-8",
+        )
+
+        assert store.accounts() == ("10001", "10002")
+
+    def test_an_unreadable_file_remembers_nothing_and_is_replaced(self, tmp_path: Path) -> None:
+        store = ActiveAccountStore(QQ_NAPCAT, tmp_path)
+        store.path.parent.mkdir(parents=True)
+        store.path.write_text("{not json", encoding="utf-8")
+        assert (store.load(), store.accounts()) == ("", ())
+
+        assert store.save("10001") is True
+        assert store.accounts() == ("10001",)
+
+
+class TestAccountCandidates:
+    def test_qq_tries_its_history_napcat_the_named_ones_and_the_unscoped_digest(self, tmp_path: Path) -> None:
+        store = ActiveAccountStore(QQ_NAPCAT, tmp_path)
+        store.save("10001")
+        store.save("10002")
+        config = tmp_path / "napcat" / "config"
+        config.mkdir(parents=True)
+        for name in ("onebot11_10003.json", "onebot11_10001.json", "onebot11_webui.json", "onebot11.json"):
+            (config / name).write_text("{}", encoding="utf-8")
+
+        candidates = account_candidates(QQ_NAPCAT, tmp_path, extra=("10004", "not-a-qq", "10002", ""))
+
+        assert candidates == ("10001", "10002", "10003", "10004", "")
+
+    def test_a_new_platform_never_tries_the_unscoped_digest(self, tmp_path: Path) -> None:
+        # 新平台的键从来都带账号，试空作用域只会把别的平台的键错认成自己的。
+        ActiveAccountStore(_STRING_PLATFORM, tmp_path).save(_OPENID)
+
+        assert account_candidates(_STRING_PLATFORM, tmp_path, extra=("",)) == (_OPENID,)
 
 
 class TestRequester:

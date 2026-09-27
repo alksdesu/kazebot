@@ -1,14 +1,16 @@
-"""把会话与长期记忆整体搬到另一个 bot QQ 号名下：离线、可 dry-run、自动备份。
+"""把一个 bot QQ 号名下的会话与长期记忆整体搬到另一个号名下：离线、可 dry-run、自动备份。
 
 会话键摘要按 bot 账号分作用域，换号即换命名空间。存量数据是在没有作用域时攒的，
-用 --from "" --to <当前号> 把它们一次性划给当前账号。
+用 --from "" --to <当前号> 把它们一次性划给当前账号；别的账号名下的会话原样留着。
 """
 from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable, Mapping
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -17,21 +19,32 @@ if str(_ROOT) not in sys.path:
 
 # 摘要算法与账号作用域必须与运行时同一份，所以直接用共享层的模块。
 from adapters._shared import conversation_hash as _conversation_hash  # noqa: E402
-from adapters._shared.active_account import ActiveAccountStore, normalize_account  # noqa: E402
+from adapters._shared.active_account import ActiveAccountStore, account_candidates, normalize_account  # noqa: E402
 from clonoth_runtime import offline_workspace  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 from supervisor.conversation_stores import LiveRekey, format_store_counts, rekey_conversation_stores  # noqa: E402
 from workspace import workspace_instance  # noqa: E402
 
 rekey = _conversation_hash.rekey
+key_origin = _conversation_hash.key_origin
 
 from engine.conversation_migration import (  # noqa: E402
-    ConversationRekey, RekeyCount, Rename, apply_migration, load_route_map, plan_migration, route_state_file,
+    ConversationRekey, RekeyCount, Rename, Unresolved, apply_migration, load_route_map, plan_migration,
+    route_state_file,
 )
 
 
 class ScopeMismatch(RuntimeError):
     """--from 与盘上实际的会话键对不上，继续搬只会把数据搬进错误的命名空间。"""
+
+
+class AmbiguousSource(ScopeMismatch):
+    """目标以外还有几个账号名下有会话，不点名就不知道该搬哪一批。"""
+
+    def __init__(self, scopes: Mapping[str, int]) -> None:
+        self.scopes = dict(scopes)
+        names = "、".join(scope_label(scope) for scope in self.scopes)
+        super().__init__(f"盘上的会话键分属几个账号（{names}），用 --from 指定搬哪一个")
 
 
 @dataclass
@@ -43,7 +56,10 @@ class ScopeReport:
     renames: list[Rename] = field(default_factory=list)
     moved_dirs: list[tuple[str, str]] = field(default_factory=list)
     moved_attachment_dirs: list[tuple[str, str]] = field(default_factory=list)
-    skipped_target_exists: list[tuple[str, str]] = field(default_factory=list)
+    blocked: list[Rename] = field(default_factory=list)
+    unresolved: list[Unresolved] = field(default_factory=list)
+    # 源和目标以外的账号名下各有几个会话：不归这次搬，原样留着。
+    other_scopes: dict[str, int] = field(default_factory=dict)
     missing_source_dirs: list[str] = field(default_factory=list)
     unknown_conv_dirs: list[str] = field(default_factory=list)
     hit_keys_rewritten: int = 0
@@ -72,90 +88,97 @@ def recorded_scope(workspace: Path) -> str:
     return ActiveAccountStore(QQ_NAPCAT, Path(workspace)).load()
 
 
-def scope_matches(workspace: Path, secret: str, scope: str) -> bool:
-    """盘上的会话键是不是按这个账号算出来的。路由表为空时无从判断，一律算匹配。"""
-    return not [
-        old_stable
-        for old_stable, real in load_route_map(route_state_file(workspace, QQ_NAPCAT)).items()
-        if old_stable != rekey(old_stable, real, secret, bot_scope=scope)
-    ]
+def scope_label(scope: str) -> str:
+    return scope or "<无作用域>"
 
 
-def detect_source_scope(workspace: Path, secret: str) -> str | None:
-    """认出盘上这批数据实际属于哪个账号，认不出返回 None。
+def route_key_scopes(workspace: Path, secret: str, candidates: Iterable[str]) -> dict[str, str | None]:
+    """路由表里每个会话键是在哪个账号下算出来的，认不出的记 None。"""
+    tried = tuple(candidates)
+    scopes: dict[str, str | None] = {}
+    for old_stable, real in load_route_map(route_state_file(workspace, QQ_NAPCAT)).items():
+        origin = key_origin(old_stable, real, candidate_secrets=(secret,), candidate_scopes=tried)
+        scopes[old_stable] = origin.bot_scope if origin else None
+    return scopes
 
-    记录的当前账号未必就是数据的归属：加账号隔离之前攒的数据没有作用域，而 bot
-    一登录就把当前号记下来了，两者天然对不上。
+
+def scope_counts(key_scopes: Mapping[str, str | None]) -> dict[str, int]:
+    return dict(Counter(scope for scope in key_scopes.values() if scope is not None))
+
+
+def pick_source_scope(key_scopes: Mapping[str, str | None], *, target: str, recorded: str) -> str | None:
+    """不点名时该搬哪个账号名下的数据；认不出返回 None，目标以外还有几个账号时抛 AmbiguousSource。
+
+    记录的当前账号未必就是数据的归属：加账号隔离之前攒的数据没有作用域，而 bot 一登录就把当前号记下来了。
+    换号之后旧号的键还留在路由表里，新号一说话又添上新号的键，所以只看目标以外的账号。
     """
-    recorded = recorded_scope(workspace)
-    seen: list[str] = []
-    for candidate in (recorded, "", *_known_accounts(workspace)):
-        if candidate in seen:
-            continue
-        seen.append(candidate)
-        if scope_matches(workspace, secret, candidate):
-            return candidate
-    return None
+    if not key_scopes:
+        return recorded
+    counts = scope_counts(key_scopes)
+    others = {scope: count for scope, count in counts.items() if scope != target}
+    if len(others) > 1:
+        raise AmbiguousSource(others)
+    if others:
+        return next(iter(others))
+    # 认得出的都已经在目标名下：没有要搬的。
+    return target if counts else None
 
 
-def _known_accounts(workspace: Path) -> list[str]:
-    """NapCat 留下的账号配置文件名里带 QQ 号，用作探测候选。"""
-    config_dir = Path(workspace) / "napcat" / "config"
-    try:
-        names = [path.stem.rsplit("_", 1)[-1] for path in config_dir.glob("onebot11_*.json")]
-    except OSError:
-        return []
-    return [name for name in names if name.isdigit()]
-
-
-def verify_source_scope(workspace: Path, secret: str, source_scope: str) -> None:
-    """用 --from 重算一遍，对不上就中止。
-
-    搬迁本身只认盘上的 key，不需要 --from；但认错源等于认错了「现在这批数据属于谁」，
-    搬完既找不回旧号也进不了新号。
-    """
-    mismatched = [
-        old_stable
-        for old_stable, real in load_route_map(route_state_file(workspace, QQ_NAPCAT)).items()
-        if old_stable != rekey(old_stable, real, secret, bot_scope=source_scope)
-    ]
-    if mismatched:
-        raise ScopeMismatch(
-            f"{len(mismatched)} 个会话键不是按 --from={source_scope or '<无作用域>'} 算出来的，"
-            "确认源账号后重跑",
-        )
+def detect_source_scope(workspace: Path, secret: str, *, target_scope: str) -> str | None:
+    """按盘上的会话键认出这次该搬哪个账号名下的数据，规则见 pick_source_scope。"""
+    workspace = Path(workspace)
+    target = normalize_account(target_scope, QQ_NAPCAT)
+    key_scopes = route_key_scopes(workspace, secret, account_candidates(QQ_NAPCAT, workspace, extra=(target,)))
+    return pick_source_scope(key_scopes, target=target, recorded=recorded_scope(workspace))
 
 
 def run_scope_migration(
     *, workspace: Path, target_scope: str, source_scope: str | None = None,
     apply: bool = False, adopt: bool = True, live_sessions: LiveRekey | None = None,
 ) -> ScopeReport:
-    """live_sessions 给在线迁移用：supervisor 自己持有的会话注册表，直接改内存再落盘。"""
+    """只搬 source 名下的会话键，别的账号的原样留着。
+
+    live_sessions 给在线迁移用：supervisor 自己持有的会话注册表，直接改内存再落盘。
+    """
     workspace = Path(workspace)
     secret = read_secret(workspace)
-    if source_scope is None:
-        # 不指定源就自己认：记录的当前账号未必是这批数据的归属。
-        detected = detect_source_scope(workspace, secret)
-        if detected is None:
-            raise ScopeMismatch("认不出盘上这批会话键属于哪个账号，用 --from 显式指定")
-        source = detected
-    else:
-        source = normalize_account(source_scope, QQ_NAPCAT)
     target = normalize_account(target_scope, QQ_NAPCAT)
     if not target:
         raise ValueError("--to 必须是目标 bot 的 QQ 号（纯数字）")
+    named = None if source_scope is None else normalize_account(source_scope, QQ_NAPCAT)
+    if named == "" and str(source_scope).strip():
+        # 写错的号规范化出来是空串，会被当成「无作用域」去搬存量数据。
+        raise ValueError("--from 必须是源 bot 的 QQ 号（纯数字）；存量无作用域的数据传空串")
+    candidates = account_candidates(QQ_NAPCAT, workspace, extra=(target,) if named is None else (named, target))
+    key_scopes = route_key_scopes(workspace, secret, candidates)
 
-    verify_source_scope(workspace, secret, source)
+    if named is None:
+        source = pick_source_scope(key_scopes, target=target, recorded=recorded_scope(workspace))
+        if source is None:
+            raise ScopeMismatch("认不出盘上这批会话键属于哪个账号，用 --from 显式指定")
+    elif key_scopes and named not in key_scopes.values():
+        # 认错源等于认错了「现在这批数据属于谁」：什么都不会搬，人却以为搬完了。
+        raise ScopeMismatch(f"没有一个会话键是按 --from={scope_label(named)} 算出来的，确认源账号后重跑")
+    else:
+        source = named
 
     report = ScopeReport(
         workspace=workspace, apply=apply, source_scope=source, target_scope=target,
     )
-    plan = plan_migration(
-        workspace=workspace,
-        platform=QQ_NAPCAT,
-        restable=lambda old_stable, real: rekey(old_stable, real, secret, bot_scope=target),
-    )
+    report.other_scopes = {
+        scope: count for scope, count in scope_counts(key_scopes).items() if scope not in (source, target)
+    }
+
+    def restable(old_stable: str, real: str) -> str | None:
+        scope = key_scopes.get(old_stable)
+        if scope is None:
+            return None
+        return rekey(old_stable, real, secret, bot_scope=target) if scope == source else old_stable
+
+    plan = plan_migration(workspace=workspace, platform=QQ_NAPCAT, restable=restable)
     report.renames = plan.renames
+    report.blocked = plan.blocked
+    report.unresolved = plan.unresolved
     report.missing_source_dirs = plan.missing_source_dirs
     report.unknown_conv_dirs = plan.unknown_conv_dirs
 
@@ -177,7 +200,6 @@ def run_scope_migration(
     )
     report.moved_dirs = outcome.moved_dirs
     report.moved_attachment_dirs = outcome.moved_attachment_dirs
-    report.skipped_target_exists = outcome.skipped_target_exists
     report.hit_keys_rewritten = outcome.hit_keys_rewritten
     report.route_keys_changed = outcome.route_keys_changed
     report.backup_dir = outcome.backup_dir
@@ -193,24 +215,29 @@ def run_scope_migration(
 
 def _print_report(report: ScopeReport) -> None:
     mode = "APPLY" if report.apply else "DRY-RUN"
-    src = report.source_scope or "<无作用域>"
     print(f"[{mode}] workspace: {report.workspace}")
-    print(f"源账号: {src}  ->  目标账号: {report.target_scope}")
+    print(f"源账号: {scope_label(report.source_scope)}  ->  目标账号: {report.target_scope}")
     changed = report.changed_renames
     print(f"待搬迁会话数: {len(changed)}")
     for rename in changed:
         state = "moved" if (rename.old_ns, rename.new_ns) in report.moved_dirs else (
-            "target-exists" if rename.target_exists else (
+            "blocked" if rename.blocked else (
                 "no-memory-dir" if not rename.dir_exists else "planned"))
         print(f"  {rename.real}: {rename.old_ns} -> {rename.new_ns} [{state}]")
     if report.unknown_conv_dirs:
         print("路由状态里查不到真实会话、无法重算的记忆目录（保持原样）:")
         for name in report.unknown_conv_dirs:
             print(f"  {name}")
-    if report.skipped_target_exists:
-        print("目标目录已存在、跳过搬迁:")
-        for old_ns, new_ns in report.skipped_target_exists:
-            print(f"  {old_ns} -> {new_ns}")
+    if report.blocked:
+        print("两边都有长期记忆，整段会话原样留着（在控制台处理掉一边再重跑）:")
+        for rename in report.blocked:
+            print(f"  {rename.real}: {rename.old_ns} -> {rename.new_ns}")
+    if report.unresolved:
+        print("认不出在哪个账号下算出来的会话键，原样留着（出自别的旧号的话，用 --from 点名那个号单独搬）:")
+        for item in report.unresolved:
+            print(f"  {item.real}: {item.old_ns}")
+    for scope, count in report.other_scopes.items():
+        print(f"账号 {scope_label(scope)} 名下另有 {count} 个会话，不在这次搬迁里。")
     print(f"{'已改写' if report.apply else '将改写'}的按会话键存的数据: {format_store_counts(report.stores)}")
     if report.apply:
         print(f"备份目录: {report.backup_dir}")
