@@ -3,9 +3,6 @@ from __future__ import annotations
 import argparse
 import logging
 import socket
-import atexit
-import io
-import signal
 import sys
 import threading
 import time
@@ -18,6 +15,7 @@ from clonoth_runtime import process_workspace
 
 from .api import create_app
 from .instances import url_prefix
+from .logging_setup import configure_supervisor_logging
 from .config_store import ConfigStore
 from .eventlog import EventLog, SYSTEM_SESSION_ID
 from .policy import PolicyEngine
@@ -28,6 +26,9 @@ from .types import TaskStatus
 
 
 PORT_IN_USE_EXIT_CODE = 98
+
+# -m 跑时 __name__ 是 __main__，看不出来源。
+_logger = logging.getLogger("supervisor.main")
 
 
 def main() -> None:
@@ -52,18 +53,8 @@ def main() -> None:
     log_dir = data_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- 把 supervisor 自身的所有输出重定向到日志文件 ----
-    # 这样 TUI 可以在同一终端前台运行，不会被 uvicorn 日志覆盖。
-    _supervisor_log_path = log_dir / "supervisor.log"
-    _supervisor_log_f = open(_supervisor_log_path, "a", encoding="utf-8", buffering=1)
-
-    def _log(msg: str) -> None:
-        """写 supervisor 日志（不写终端）。"""
-        try:
-            _supervisor_log_f.write(msg + "\n")
-            _supervisor_log_f.flush()
-        except Exception:
-            pass
+    # 整个进程的日志都进这份文件，终端留给前台的 TUI。
+    log_level = configure_supervisor_logging(log_dir / "supervisor.log", args.log_level)
 
     # 在做任何状态变更之前，先检查端口是否可用
     # 如果端口被占用就立即退出，不会误删 restart_pending.json 或取消任务
@@ -72,7 +63,7 @@ def main() -> None:
             _s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             _s.bind((args.host, args.port))
     except OSError as e:
-        _log(
+        _logger.error(
             f"[supervisor] 端口 {args.host}:{args.port} 已被占用: {e}; "
             f"退出码={PORT_IN_USE_EXIT_CODE}，请先停止已有实例或改用 systemd 管理的唯一实例"
         )
@@ -119,11 +110,11 @@ def main() -> None:
                     },
                 )
                 state.record_inbound_message_event(_evt)
-                _log(f"[supervisor] Injected restart completion inbound for session {_sid}")
+                _logger.info(f"[supervisor] Injected restart completion inbound for session {_sid}")
             else:
-                _log(f"[supervisor] restart_pending.json missing conversation_key/channel, skipped")
+                _logger.warning(f"[supervisor] restart_pending.json missing conversation_key/channel, skipped")
         except Exception as e:
-            _log(f"[supervisor] Failed to process restart_pending.json: {e}")
+            _logger.exception(f"[supervisor] Failed to process restart_pending.json: {e}")
         finally:
             try:
                 _restart_pending_path.unlink()
@@ -138,7 +129,6 @@ def main() -> None:
             supervisor_url=base_url,
             workspace_root=workspace_root,
             log_dir=data_dir / "logs",
-            log_func=_log,
         )
         if not args.no_kernel:
             process_manager.start_engine()
@@ -242,7 +232,7 @@ def main() -> None:
                         # after recording the task snapshot. Purpose: background
                         # zombie reaping follows the same terminal path as API reaping.
                         state._route_completed_task_locked(task)
-                        _log(f"[zombie-reaper] reaped task {task.task_id[:12]} node={task.node_id} reason={reason}")
+                        _logger.info(f"[zombie-reaper] reaped task {task.task_id[:12]} node={task.node_id} reason={reason}")
                     # [AutoC 2026-05-30] Why: branch 和 fresh/fork child session
                     # 历史上只标记 reset，不物理删除，sessions.json 会持续膨胀。
                     # How: 复用后台 zombie reaper 的定时锁内循环，每分钟执行一次
@@ -250,7 +240,7 @@ def main() -> None:
                     # fresh/fork child 会话会被自动移除，accumulate 会话保留。
                     state._cleanup_stale_sessions_locked()
             except Exception as e:
-                _log(f"[zombie-reaper] error: {e}")
+                _logger.exception(f"[zombie-reaper] error: {e}")
 
     threading.Thread(target=_reap_zombie_tasks, daemon=True, name="zombie-reaper").start()
 
@@ -285,9 +275,9 @@ def main() -> None:
             restart = _pm._restart_pending
 
             if restart:
-                _log("[supervisor] TUI 已退出，正在重启...")
+                _logger.info("[supervisor] TUI 已退出，正在重启...")
             else:
-                _log("[supervisor] TUI 已退出，正在关闭...")
+                _logger.info("[supervisor] TUI 已退出，正在关闭...")
 
             try:
                 _pm.stop_engine()
@@ -296,34 +286,15 @@ def main() -> None:
 
             # 退出码 75 = 请求重启（由 main.py 外层循环检测）
             _code = 75 if restart else 0
-            _log(f"[supervisor] exit code={_code}")
+            _logger.info(f"[supervisor] exit code={_code}")
             import traceback as _tb
-            _log(f'[DIAG] _watch_shell os._exit({_code}) stack:\n{"" .join(_tb.format_stack())}')
+            _logger.info(f'[DIAG] _watch_shell os._exit({_code}) stack:\n{"" .join(_tb.format_stack())}')
             import time as _t; _t.sleep(0.5)  # 确保日志写出
             os._exit(_code)
 
         threading.Thread(target=_watch_shell, daemon=True, name="shell-watcher").start()
 
-    # uvicorn 日志全部写到文件，不输出到终端（终端留给 TUI）
-    _uvi_log_cfg = {
-        "version": 1,
-        "disable_existing_loggers": False,
-        "handlers": {
-            "file": {
-                "class": "logging.FileHandler",
-                "filename": str(_supervisor_log_path),
-                "mode": "a",
-                "encoding": "utf-8",
-            },
-        },
-        "loggers": {
-            "uvicorn": {"handlers": ["file"], "level": "INFO", "propagate": False},
-            "uvicorn.error": {"handlers": ["file"], "level": "INFO", "propagate": False},
-            "uvicorn.access": {"handlers": ["file"], "level": "INFO", "propagate": False},
-        },
-    }
-
-    _log(f"[supervisor] starting uvicorn on {args.host}:{args.port}")
+    _logger.info(f"[supervisor] starting uvicorn on {args.host}:{args.port}")
     # 用 Server API 替代 uvicorn.run()，禁用 uvicorn 的信号捕获。
     # uvicorn.run() 会安装自己的 SIGTERM/SIGINT handler 并在收到信号时
     # 调用 sys.exit(0)，导致 restart engine 时 supervisor 被意外杀死。
@@ -332,9 +303,10 @@ def main() -> None:
         app,
         host=args.host,
         port=args.port,
-        log_level=args.log_level,
+        log_level=log_level,
         access_log=access_log,
-        log_config=_uvi_log_cfg,
+        # 不让 uvicorn 自己配日志：它的 logger 往上传到进程那个 handler，格式和轮转都一样。
+        log_config=None,
     )
     _uvi_server = uvicorn.Server(_uvi_config)
     _uvi_server.install_signal_handlers = lambda: None  # 禁用 uvicorn 信号捕获
@@ -346,7 +318,7 @@ def main() -> None:
         _loop.run_until_complete(_uvi_server.serve())
     finally:
         _loop.close()
-    _log("[DIAG] uvicorn server exited! supervisor about to exit")
+    _logger.info("[DIAG] uvicorn server exited! supervisor about to exit")
 
 
 if __name__ == "__main__":

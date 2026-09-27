@@ -1840,7 +1840,7 @@ def create_app(
                         pass
             import traceback as _tb
             _msg = f'[DIAG] os._exit(75) called from api.py! stack:\n{"" .join(_tb.format_stack())}'
-            print(_msg, flush=True)
+            log.info(_msg)
             import sys as _sys; _sys.stdout.flush(); _sys.stderr.flush()
             import time as _t; _t.sleep(0.5)  # 确保日志写出
             os._exit(75)  # main.py 外层循环检测到 75 会重启

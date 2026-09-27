@@ -81,9 +81,12 @@ NODE_CONTEXTS_MAX_AGE = 48 * 3600     # 48 h
 TRANSCRIPTS_MAX_AGE = float(os.getenv("CLONOTH_TRANSCRIPTS_MAX_AGE_SECONDS", str(14 * 24 * 3600)))  # 14 d
 
 # engine/supervisor 进程日志 data/logs/*.log。重启/重连会产生大量空日志文件
-# 按龄清理，保留 cleanup.log。
+# 按龄清理。cleanup.log 是本脚本自己的；supervisor.log 由 supervisor 按大小轮转，
+# 开着的文件删掉后进程会一直往已删的文件里写。
 LOG_MAX_AGE = float(os.getenv("CLONOTH_LOG_MAX_AGE_SECONDS", str(3 * 24 * 3600)))  # 3 d
-LOG_KEEP_NAMES = {"cleanup.log"}
+LOG_KEEP_NAMES = {"cleanup.log", "supervisor.log"}
+# ProcessManager 每拉起一次子进程就新开一份 <名字>-<年月日>-<时分秒>.log，最新那份可能还开着。
+_SPAWN_LOG = re.compile(r"^(?P<series>.+)-\d{8}-\d{6}\.log$")
 
 # LLM 错误快照 data/llm_error_snapshots/：调试用，保留 3 天。
 LLM_ERROR_SNAPSHOT_MAX_AGE = float(os.getenv("CLONOTH_LLM_ERROR_SNAPSHOT_MAX_AGE_SECONDS", str(3 * 24 * 3600)))
@@ -505,11 +508,25 @@ def purge_expired_transcripts():
 
 
 # ── logs cleanup ─────────────────────
+def _newest_spawn_logs(log_dir: Path) -> set[str]:
+    """每个子进程系列里最新的那份：进程可能还开着它写，删了输出就进了已删的文件。"""
+    newest: dict[str, str] = {}
+    for path in log_dir.iterdir():
+        match = _SPAWN_LOG.match(path.name)
+        if match is None or not path.is_file():
+            continue
+        series = match.group("series")
+        # 时间戳定长，同一系列按名字比就是按时间比。
+        if path.name > newest.get(series, ""):
+            newest[series] = path.name
+    return set(newest.values())
+
+
 def purge_old_logs():
     """清理 data/logs/ 下过期的进程日志。
 
     engine/supervisor 每次重启/重连都会新建日志文件，其中大量为 0 字节空文件，
-    长期不清会堆积成千上万个小文件。保留 cleanup.log（本脚本自身日志）。
+    长期不清会堆积成千上万个小文件。保留 cleanup.log、supervisor.log 和每个子进程最新的那份。
     """
     if LOG_MAX_AGE <= 0:
         logging.info("[logs] cleanup disabled")
@@ -518,10 +535,11 @@ def purge_old_logs():
     if not log_dir.exists():
         return
     cutoff = time.time() - LOG_MAX_AGE
+    in_use = _newest_spawn_logs(log_dir)
     deleted = 0
     for p in log_dir.iterdir():
         try:
-            if not p.is_file() or p.name in LOG_KEEP_NAMES:
+            if not p.is_file() or p.name in LOG_KEEP_NAMES or p.name in in_use:
                 continue
             if p.stat().st_mtime < cutoff:
                 _unlink(p)

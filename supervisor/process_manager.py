@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import logging
 import os
 import signal
 import subprocess
@@ -72,8 +73,8 @@ class ProcessManager:
         self._watchdog: threading.Thread | None = None
         self._on_event = None
 
-        # 日志函数：写日志文件而不是终端（终端留给 TUI）
-        self._log = log_func or (lambda msg: print(msg))
+        # 默认走本模块的 logger 进 supervisor.log，终端留给 TUI。
+        self._log = log_func or logging.getLogger(__name__).info
 
         runtime_cfg = load_runtime_config(workspace_root)
 
