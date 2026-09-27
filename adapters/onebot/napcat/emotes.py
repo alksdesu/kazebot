@@ -74,7 +74,6 @@ def _sticker_collect_config() -> CollectConfig:
     return CollectConfig(
         enabled=bool(live.sticker_collect),
         strategy=str(live.sticker_strategy),
-        groups=tuple(normalize_id(group_id) for group_id in live.sticker_groups),
         auto_accept=bool(live.sticker_auto_accept),
         pending_limit=int(live.sticker_pending_limit),
         library_limit=int(live.sticker_library_limit),
@@ -93,9 +92,15 @@ def _sticker_collector_handle() -> Optional[StickerCollector]:
     return state._adapter.sticker_collector
 
 
+def _sticker_group_covered(facts: InboundFacts) -> bool:
+    """群白名单留空表示所有已授权的群，不是一个都不收。"""
+    groups = {normalize_id(group_id) for group_id in live.sticker_groups} - {""}
+    return not groups or facts.conversation.raw_id in groups
+
+
 def _collect_stickers(facts: InboundFacts) -> None:
     """把这条消息里的图丢进收集队列。只入队，落盘和查库都在后台。"""
-    if not facts.attachments or not live.sticker_collect:
+    if not facts.attachments or not live.sticker_collect or not _sticker_group_covered(facts):
         return
     collector = _sticker_collector_handle()
     if collector is None:
@@ -103,9 +108,8 @@ def _collect_stickers(facts: InboundFacts) -> None:
     try:
         collector.submit(
             facts.attachments,
-            group_id=facts.conversation.raw_id,
-            # 存化名而非真实 QQ 号：这张图会长期留在共享库里。
-            user_key=facts.sender.alias,
+            source=facts.conversation.conversation_key,
+            contributor=facts.sender.alias,
             marked=facts.marked_sticker,
         )
     except Exception:

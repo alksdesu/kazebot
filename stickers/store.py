@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Collection, Iterator, Sequence
 
-logger = logging.getLogger("nonebot.plugin.clonoth_agent")
+logger = logging.getLogger(__name__)
 
 STATE_PENDING = "pending"
 STATE_LIBRARY = "library"
@@ -76,6 +76,7 @@ class Sticker:
     animated: bool = False
     fmt: str = ""
     size: int = 0
+    # 来源会话键（带平台前缀）和发图人化名；库里较早的行存的是平台原始群号。
     from_group: str = ""
     from_user: str = ""
     origin: str = ""

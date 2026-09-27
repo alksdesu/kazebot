@@ -14,7 +14,7 @@ from typing import Any, Callable, Sequence
 
 from .store import CAPTION_PROMPT_VERSION, CaptionClaim, StickerStore
 
-logger = logging.getLogger("nonebot.plugin.clonoth_agent")
+logger = logging.getLogger(__name__)
 
 # 一次给多少张。打标是纯等待，但每张都是一次计费请求，慢慢来。
 _BATCH = 5

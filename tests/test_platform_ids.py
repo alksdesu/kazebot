@@ -28,7 +28,6 @@ from clonoth_sdk.state import SessionState, TriggerInfo, channel_key  # noqa: E4
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 from platforms.descriptor import ID_NUMERIC, ID_STRING, STATE_ACTIVE_ACCOUNT, PlatformDescriptor  # noqa: E402
 from platforms.ids import id_text_pattern, normalize_id, same_id  # noqa: E402
-from stickers.collect import CollectConfig  # noqa: E402
 
 _OPENID = "E2B7C1A09F3D4E5B8A6C7D8E9F0A1B2C"
 
@@ -171,22 +170,6 @@ class TestCooldown:
     def test_trigger_input_holds_strings(self) -> None:
         inp = trigger_policy.TriggerInput(group_id=9, user_id=None)
         assert (inp.group_id, inp.user_id) == ("9", "")
-
-
-class TestStickerCollect:
-    def test_numeric_and_string_whitelists_cover_the_same_group(self) -> None:
-        assert CollectConfig(enabled=True, groups=(42,)).covers("42")
-        assert CollectConfig(enabled=True, groups=("42",)).covers(42)
-        assert not CollectConfig(enabled=True, groups=(42,)).covers(43)
-
-    def test_string_groups_are_collected(self) -> None:
-        config = CollectConfig(enabled=True, groups=("-100777", "bad id", 42, "42"))
-        assert config.groups == ("-100777", "42")
-        assert config.covers("-100777")
-        assert not config.covers(None)
-
-    def test_an_empty_whitelist_still_means_every_group(self) -> None:
-        assert CollectConfig(enabled=True).covers("anything")
 
 
 class TestSdkWatermarks:

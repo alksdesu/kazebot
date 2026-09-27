@@ -45,8 +45,8 @@ def _bridge_stdlib_logging() -> None:
     """
     from nonebot.log import LoguruHandler
 
-    # adapters 兜住按模块名取 logger 的那批：共享层和适配器根目录的兄弟模块。
-    for name in ("nonebot.plugin.clonoth_agent", "adapters", "clonoth_sdk"):
+    # adapters 兜住按模块名取 logger 的那批：共享层和适配器根目录的兄弟模块；stickers 是表情包库。
+    for name in ("nonebot.plugin.clonoth_agent", "adapters", "clonoth_sdk", "stickers"):
         target = logging.getLogger(name)
         target.handlers = [LoguruHandler()]
         target.setLevel(logging.INFO)

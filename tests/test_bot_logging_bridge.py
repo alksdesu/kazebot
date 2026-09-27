@@ -12,8 +12,8 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 _BOT = _ROOT / "bot.py"
-# 这几棵树只在 bot 进程里跑；engine、supervisor 的模块各有自己进程的日志配置。
-_BOT_PROCESS_TREES = ("adapters/onebot", "adapters/_shared")
+# 这几棵树在 bot 进程里跑；engine、supervisor 的模块各有自己进程的日志配置。stickers 两边都用，bot 这边也得接上。
+_BOT_PROCESS_TREES = ("adapters/onebot", "adapters/_shared", "stickers")
 
 
 def _bridged() -> tuple[str, ...]:

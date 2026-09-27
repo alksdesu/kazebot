@@ -26,7 +26,7 @@ from typing import Any, Callable, Iterator
 from .collect import LIBRARY_DIR, PENDING_DIR, sticker_root, store_path
 from .store import TRANSIENT_COLUMNS, ensure_receipt_schema, normalize_name
 
-logger = logging.getLogger("nonebot.plugin.clonoth_agent")
+logger = logging.getLogger(__name__)
 
 KIND = "clonoth-sticker-library"
 SCHEMA_VERSION = 1

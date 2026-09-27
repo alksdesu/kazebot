@@ -26,7 +26,7 @@ from clonoth_runtime import resolve_env_ref
 from .filter import read_shape
 from .store import SOURCE_IMAGEBED, STATE_PENDING, StickerStore
 
-logger = logging.getLogger("nonebot.plugin.clonoth_agent")
+logger = logging.getLogger(__name__)
 
 ALGORITHM = "AWS4-HMAC-SHA256"
 SERVICE = "s3"

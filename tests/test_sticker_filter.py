@@ -16,13 +16,11 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 
-from stickers import filter as sf
 from stickers.filter import (
     DEFAULT_STRATEGY,
     ImageShape,
     decide,
     looks_like_screenshot,
-    marked_as_sticker,
     normalize_strategy,
     read_shape,
 )
@@ -105,32 +103,6 @@ def test_truncated_header_does_not_raise() -> None:
     data = _encode("JPEG", (500, 500))
     for cut in range(10, 200, 7):
         read_shape(data[:cut])
-
-
-# ── QQ 自己的表情标记 ──
-
-@pytest.mark.parametrize("seg_type", ["mface", "marketface", "MFace"])
-def test_sticker_segment_types_are_marked(seg_type: str) -> None:
-    assert marked_as_sticker(seg_type, {})
-
-
-def test_sub_type_one_is_marked() -> None:
-    # 群友发收藏表情时段类型仍是 image，只有 sub_type 能区分。
-    assert marked_as_sticker("image", {"sub_type": 1})
-    assert marked_as_sticker("image", {"subType": "1"})
-
-
-def test_plain_image_is_not_marked() -> None:
-    assert not marked_as_sticker("image", {})
-    assert not marked_as_sticker("image", {"sub_type": 0})
-    assert not marked_as_sticker("image", {"sub_type": "not a number"})
-
-
-def test_summary_and_emoji_id_are_marked() -> None:
-    assert marked_as_sticker("image", {"summary": "[表情]"})
-    assert marked_as_sticker("image", {"summary": "[Sticker]"})
-    assert marked_as_sticker("image", {"emoji_id": "abc123"})
-    assert not marked_as_sticker("image", {"emoji_id": "   "})
 
 
 # ── 截图判定 ──

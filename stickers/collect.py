@@ -2,6 +2,7 @@
 
 判定跑在每条群消息上，所以热路径只入队，落盘和查库全在后台单 worker 里做。
 队列满了直接丢：少收一张图，好过把消息处理拖慢。
+收哪些会话、平台有没有把图标成表情包，都由平台判断后交进来。
 """
 from __future__ import annotations
 
@@ -14,9 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from platforms.ids import normalize_id
-
-from .filter import decide, marked_as_sticker, normalize_strategy, read_shape
+from .filter import decide, read_shape
 from .store import (
     SOURCE_GROUP,
     STATE_LIBRARY,
@@ -25,7 +24,7 @@ from .store import (
     StickerStore,
 )
 
-logger = logging.getLogger("nonebot.plugin.clonoth_agent")
+logger = logging.getLogger(__name__)
 
 PENDING_DIR = "pending"
 LIBRARY_DIR = "library"
@@ -43,7 +42,6 @@ _EXT_BY_FMT = {
 class CollectConfig:
     enabled: bool = False
     strategy: str = "loose"
-    groups: tuple[str, ...] = ()
     auto_accept: bool = False
     pending_limit: int = 200
     library_limit: int = 1000
@@ -51,24 +49,13 @@ class CollectConfig:
     pending_ttl_sec: int = 7 * 86400
     max_bytes: int = 4 * 1024 * 1024
 
-    def __post_init__(self) -> None:
-        groups = tuple(dict.fromkeys(g for g in (normalize_id(item) for item in self.groups) if g))
-        object.__setattr__(self, "groups", groups)
-
-    def covers(self, group_id: Any) -> bool:
-        """留空表示所有已授权的群，不是一个都不收。"""
-        if not self.groups:
-            return True
-        gid = normalize_id(group_id)
-        return bool(gid) and gid in self.groups
-
 
 @dataclass(frozen=True)
 class _Job:
     path: Path
     marked: bool
-    from_group: str
-    from_user: str
+    source: str
+    contributor: str
 
 
 def accept_pending(workspace_root: Path, store: StickerStore, sha256: str) -> bool:
@@ -109,11 +96,6 @@ def store_path(workspace_root: Path) -> Path:
 
 def digest_of(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def any_marked_segment(segments: Sequence[tuple[str, Mapping[str, Any]]]) -> bool:
-    """这条消息里有没有被 QQ 标成表情包的段。附件层只认商城表情，收藏表情要看段。"""
-    return any(marked_as_sticker(seg_type, data) for seg_type, data in segments)
 
 
 class StickerCollector:
@@ -175,13 +157,17 @@ class StickerCollector:
         self,
         attachments: Sequence[Mapping[str, Any]],
         *,
-        group_id: Any,
-        user_key: str,
+        source: str,
+        contributor: str,
         marked: bool,
     ) -> int:
-        """热路径入口。只做入队，不碰磁盘也不查库。"""
+        """热路径入口。只做入队，不碰磁盘也不查库。
+
+        source 是带平台前缀的会话键，contributor 是发图人的化名：图会长期留在共享库里，两样都不存真实号。
+        marked 是平台自己的判断，这条消息里有没有被标成表情包的段。
+        """
         config = self._config()
-        if not config.enabled or not config.covers(group_id):
+        if not config.enabled:
             return 0
         queued = 0
         for item in attachments:
@@ -192,10 +178,10 @@ class StickerCollector:
                 continue
             job = _Job(
                 path=self.workspace_root / rel,
-                # 附件层已经认出商城表情了，段级判定再补收藏表情那一类。
+                # 附件自带的标记是逐张的，消息级的 marked 补上附件层认不出的那类。
                 marked=bool(item.get("sticker")) or marked,
-                from_group=normalize_id(group_id),
-                from_user=str(user_key or ""),
+                source=str(source or ""),
+                contributor=str(contributor or ""),
             )
             try:
                 self._queue.put_nowait(job)
@@ -266,8 +252,8 @@ class StickerCollector:
             animated=bool(shape and shape.animated),
             fmt=fmt,
             size=len(raw),
-            from_group=job.from_group,
-            from_user=job.from_user,
+            from_group=job.source,
+            from_user=job.contributor,
         )
         if row is None:
             # 抢先一步的并发写已经登记过了，刚复制的副本没人认领。

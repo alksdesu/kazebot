@@ -22,7 +22,7 @@ from adapters._shared.trigger_policy import (
     matched_prefix,
 )
 from ..live_config import live
-from stickers.collect import any_marked_segment
+from ..segments import any_marked_segment
 from clonoth_sdk import IntentVerdict
 
 from . import anonymize, common, forward_bridge, history, identity, media, message_text, models, output_guide, permissions, routing, state

@@ -55,8 +55,11 @@ def bench(tmp_path: Path):
     store.close()
 
 
-async def _drain(bench, attachments, *, group_id: int = 1, marked: bool = False) -> None:
-    bench.collector.submit(attachments, group_id=group_id, user_key="u1", marked=marked)
+_SOURCE = "chat_room:5f3c2a108d4e4b7a9c210e6f"
+
+
+async def _drain(bench, attachments, *, marked: bool = False) -> None:
+    bench.collector.submit(attachments, source=_SOURCE, contributor="UserA", marked=marked)
     await bench.collector._queue.join()
 
 
@@ -66,46 +69,33 @@ def test_submit_does_not_touch_disk(bench) -> None:
     # 入队之外的任何 IO 都会摊到每条群消息上。
     item = bench.drop(_png())
     (bench.root / item["path"]).unlink()
-    assert bench.collector.submit([item], group_id=1, user_key="u", marked=False) == 1
+    assert bench.collector.submit([item], source=_SOURCE, contributor="UserA", marked=False) == 1
 
 
 def test_submit_ignores_non_images(bench) -> None:
     assert bench.collector.submit(
-        [{"type": "file", "path": "data/x.zip"}], group_id=1, user_key="u", marked=False,
+        [{"type": "file", "path": "data/x.zip"}], source=_SOURCE, contributor="UserA", marked=False,
     ) == 0
 
 
 def test_submit_ignores_pathless_entries(bench) -> None:
     assert bench.collector.submit(
-        [{"type": "image", "path": ""}], group_id=1, user_key="u", marked=False,
+        [{"type": "image", "path": ""}], source=_SOURCE, contributor="UserA", marked=False,
     ) == 0
 
 
 def test_disabled_collector_takes_nothing(bench) -> None:
     bench.holder["config"] = sc.CollectConfig(enabled=False)
     assert bench.collector.submit(
-        [bench.drop(_png())], group_id=1, user_key="u", marked=False,
+        [bench.drop(_png())], source=_SOURCE, contributor="UserA", marked=False,
     ) == 0
-
-
-def test_group_allowlist_is_honoured(bench) -> None:
-    bench.holder["config"] = sc.CollectConfig(enabled=True, groups=(42,))
-    item = bench.drop(_png())
-    assert bench.collector.submit([item], group_id=1, user_key="u", marked=False) == 0
-    assert bench.collector.submit([item], group_id=42, user_key="u", marked=False) == 1
-
-
-def test_empty_allowlist_means_every_group(bench) -> None:
-    assert bench.collector.submit(
-        [bench.drop(_png())], group_id=999, user_key="u", marked=False,
-    ) == 1
 
 
 def test_full_queue_drops_instead_of_blocking(bench) -> None:
     # 队列满了必须立刻返回，堆积说明 worker 跟不上，等待只会连累消息处理。
     item = bench.drop(_png())
     for _ in range(sc._QUEUE_MAX + 10):
-        bench.collector.submit([item], group_id=1, user_key="u", marked=False)
+        bench.collector.submit([item], source=_SOURCE, contributor="UserA", marked=False)
     assert bench.collector.dropped > 0
 
 
@@ -123,6 +113,13 @@ async def test_stored_file_is_copied_into_the_library_tree(bench) -> None:
     row = bench.store.browse()[0]
     assert row.rel_path.startswith("data/stickers/pending/")
     assert (bench.root / row.rel_path).is_file()
+
+
+@pytest.mark.asyncio
+async def test_the_source_is_the_conversation_key_and_the_contributor_an_alias(bench) -> None:
+    await _drain(bench, [bench.drop(_png())], marked=True)
+    row = bench.store.browse()[0]
+    assert (row.from_group, row.from_user) == (_SOURCE, "UserA")
 
 
 @pytest.mark.asyncio
