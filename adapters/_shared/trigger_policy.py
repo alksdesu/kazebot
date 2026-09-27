@@ -372,7 +372,7 @@ def _apply_cooldown(
     runtime_dependent: bool,
 ) -> TriggerDecision:
     """信号已经命中，再过一遍冷却。冷却是「即使命中也不说」，和信号是不同维度。"""
-    blocked = _cooldown_block(inp, config, cooldown, signal, f"命中{reason}")
+    blocked = _cooldown_block(inp, config, cooldown, signal, reason)
     if blocked is not None:
         return blocked
 

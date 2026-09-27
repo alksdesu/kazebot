@@ -1606,7 +1606,7 @@
     "decision": {
      "blocked_by": "cooldown",
      "cooldown_remaining": 599.0,
-     "reason": "命中命中关键词「天气」，但本群的冷却还剩 599.0s",
+     "reason": "命中关键词「天气」，但本群的冷却还剩 599.0s",
      "signal": "keyword",
      "triggered": false,
      "undetermined": false
@@ -2130,7 +2130,7 @@
     "decision": {
      "blocked_by": "cooldown",
      "cooldown_remaining": 280.0,
-     "reason": "命中被 @，但这个人的冷却还剩 280.0s",
+     "reason": "被 @，但这个人的冷却还剩 280.0s",
      "signal": "at",
      "triggered": false,
      "undetermined": false
@@ -2175,7 +2175,7 @@
     "decision": {
      "blocked_by": "cooldown",
      "cooldown_remaining": 290.0,
-     "reason": "命中命中关键词「天气」，但这个人的冷却还剩 290.0s",
+     "reason": "命中关键词「天气」，但这个人的冷却还剩 290.0s",
      "signal": "keyword",
      "triggered": false,
      "undetermined": false

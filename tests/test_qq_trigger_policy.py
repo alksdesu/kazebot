@@ -381,6 +381,47 @@ class TestCooldown:
         assert "per_user" not in decision.reason
 
 
+# (信号, 信号自己的说法, 在冷却期内判一次)。意愿判断走 resolve_llm_intent —— 模型答完才轮到冷却。
+_BLOCKED_BY_COOLDOWN_CASES = (
+    (tp.SIGNAL_AT, "被 @", lambda cd: tp.evaluate(
+        _input(at_me=True, now=1001.0), _config(cooldown_group_sec=30.0, cooldown_exempt_at=False), cd)),
+    (tp.SIGNAL_REPLY, "被回复", lambda cd: tp.evaluate(
+        _input(reply_to_bot=True, now=1001.0), _config(cooldown_group_sec=30.0), cd)),
+    (tp.SIGNAL_PREFIX, "命中前缀「!」", lambda cd: tp.evaluate(
+        _input(text="!生图 猫", now=1001.0),
+        _config(cooldown_group_sec=30.0, prefix=True, prefix_words=("!",)), cd)),
+    (tp.SIGNAL_KEYWORD, "命中关键词「天气」", lambda cd: tp.evaluate(
+        _input(text="今天天气怎么样", now=1001.0),
+        _config(cooldown_group_sec=30.0, keyword=True, keyword_words=("天气",)), cd)),
+    (tp.SIGNAL_RANDOM, "随机插话（概率 100%）", lambda cd: tp.evaluate(
+        _input(roll=0.0, now=1001.0),
+        _config(cooldown_group_sec=30.0, random=True, random_probability=1.0), cd)),
+    (tp.SIGNAL_LLM_INTENT, "模型判断这句话是在跟 bot 说话", lambda cd: tp.resolve_llm_intent(
+        _input(now=1001.0), _config(cooldown_group_sec=30.0), cd, agreed=True)),
+)
+
+
+class TestTheBlockedReasonReadsAsOneSentence:
+    """被挡下的说明 = 信号自己的说法 + 「但…还剩 Xs」。冷却层不替信号改口。"""
+
+    @pytest.mark.parametrize(
+        "signal,hit_phrase,decide", _BLOCKED_BY_COOLDOWN_CASES,
+        ids=[case[0] for case in _BLOCKED_BY_COOLDOWN_CASES],
+    )
+    def test_every_signal_keeps_its_own_wording(self, signal: str, hit_phrase: str, decide: Any) -> None:
+        cooldown = tp.CooldownState()
+        cooldown.record(_input(now=1000.0))
+
+        decision = decide(cooldown)
+
+        assert decision.blocked_by == tp.BLOCKED_BY_COOLDOWN
+        assert decision.signal == signal
+        assert decision.reason == f"{hit_phrase}，但本群的冷却还剩 29.0s"
+        assert "命中命中" not in decision.reason
+        # 只有前缀和关键词的说法本身带「命中」，其余信号的说明里不该冒出这两个字。
+        assert ("命中" in decision.reason) is (signal in {tp.SIGNAL_PREFIX, tp.SIGNAL_KEYWORD})
+
+
 # ── LLM 意愿判断的位置 ───────────────────────────────────
 
 class TestLlmIntentIsTheLastResort:
@@ -479,7 +520,7 @@ class TestLlmIntentIsTheLastResort:
             _input(reply_to_bot=True, now=1001.0), _config(cooldown_group_sec=30.0), cooldown,
         )
 
-        assert decision.reason == "命中被回复，但本群的冷却还剩 29.0s"
+        assert decision.reason == "被回复，但本群的冷却还剩 29.0s"
 
 
 # ── 适配层：把 to_me 的三个来源拆开 ───────────────────────────────────

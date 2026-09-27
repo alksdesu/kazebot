@@ -30,7 +30,7 @@ describe('showSignalTag', () => {
     // 否则读起来是「会回应 被 @ 被 @」。
     expect(showSignalTag('at', '被 @')).toBe(false);
     expect(showSignalTag('name', '出现名字「咪啪」')).toBe(false);
-    expect(showSignalTag('reply', '命中被回复，但本群的冷却还剩 29.0s')).toBe(false);
+    expect(showSignalTag('reply', '被回复，但本群的冷却还剩 29.0s')).toBe(false);
   });
 
   it('keeps the tag when the reason words it differently', () => {
