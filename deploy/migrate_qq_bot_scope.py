@@ -55,7 +55,6 @@ class ScopeReport:
     target_scope: str
     renames: list[Rename] = field(default_factory=list)
     moved_dirs: list[tuple[str, str]] = field(default_factory=list)
-    moved_attachment_dirs: list[tuple[str, str]] = field(default_factory=list)
     blocked: list[Rename] = field(default_factory=list)
     unresolved: list[Unresolved] = field(default_factory=list)
     # 源和目标以外的账号名下各有几个会话：不归这次搬，原样留着。
@@ -195,11 +194,8 @@ def run_scope_migration(
         return report
 
     # 会话历史、长期记忆和各项功能数据共用一个会话键，一起搬才不会一半跟着走一半留在旧号。
-    outcome = apply_migration(
-        workspace=workspace, platform=QQ_NAPCAT, plan=plan, move_attachments=True,
-    )
+    outcome = apply_migration(workspace=workspace, platform=QQ_NAPCAT, plan=plan)
     report.moved_dirs = outcome.moved_dirs
-    report.moved_attachment_dirs = outcome.moved_attachment_dirs
     report.hit_keys_rewritten = outcome.hit_keys_rewritten
     report.route_keys_changed = outcome.route_keys_changed
     report.backup_dir = outcome.backup_dir
@@ -242,7 +238,6 @@ def _print_report(report: ScopeReport) -> None:
     if report.apply:
         print(f"备份目录: {report.backup_dir}")
         print(f"搬迁记忆目录: {len(report.moved_dirs)}；"
-              f"附件目录: {len(report.moved_attachment_dirs)}；"
               f"命中缓存 key: {report.hit_keys_rewritten}；"
               f"路由状态 key: {report.route_keys_changed}；"
               f"当前账号已写入: {report.scope_written}")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import importlib.util
 import json
@@ -202,7 +203,7 @@ class TestScopeMigration:
         assert (tmp_path / "data" / "memory" / seed["ns"]).is_dir()
         assert _store(tmp_path).load() == ""
 
-    def test_apply_moves_memory_hitcache_route_sessions_and_attachments(self, tmp_path: Path) -> None:
+    def test_apply_moves_memory_hitcache_route_and_sessions(self, tmp_path: Path) -> None:
         seed = _seed(tmp_path)
         new_stable = f"qq_group:{ch.digest(_REAL, _SECRET, bot_scope=_NEW_BOT)}"
         new_ns = _ns(new_stable)
@@ -223,9 +224,28 @@ class TestScopeMigration:
         sessions = json.loads((data / "sessions.json").read_text(encoding="utf-8"))
         assert sessions["sid-1"]["conversation_key"] == new_stable
         assert report.sessions_changed == 1
-        assert (data / "attachments" / new_stable.replace(":", "_") / "a.png").is_file()
         assert _store(tmp_path).load() == _NEW_BOT
         assert report.backup_dir is not None and report.backup_dir.is_dir()
+
+    def test_attachments_stay_where_the_history_points(self, tmp_path: Path) -> None:
+        # 消息里记的是带目录名的 file:// 路径，会话跟着搬过去以后还得读得到原来的图。
+        from engine.attachments import prepare_messages_for_llm
+
+        seed = _seed(tmp_path)
+        old_dir = seed["stable"].replace(":", "_")
+        png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
+        (tmp_path / "data" / "attachments" / old_dir / "a.png").write_bytes(png)
+        history = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"file://data/attachments/{old_dir}/a.png"}},
+        ]}]
+
+        migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, source_scope="", apply=True)
+
+        new_stable = f"qq_group:{ch.digest(_REAL, _SECRET, bot_scope=_NEW_BOT)}"
+        assert (tmp_path / "data" / "attachments" / old_dir / "a.png").read_bytes() == png
+        assert not (tmp_path / "data" / "attachments" / new_stable.replace(":", "_")).exists()
+        resolved = prepare_messages_for_llm(history, tmp_path)[0]["content"][0]["image_url"]["url"]
+        assert resolved.startswith("data:image/")
 
     def test_the_backup_holds_the_pre_migration_memory(self, tmp_path: Path) -> None:
         seed = _seed(tmp_path)

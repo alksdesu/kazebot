@@ -1648,7 +1648,6 @@ def create_app(
             "source_scope": report.source_scope,
             "target_scope": report.target_scope,
             "moved_memory_dirs": len(report.moved_dirs),
-            "moved_attachment_dirs": len(report.moved_attachment_dirs),
             "hit_keys_rewritten": report.hit_keys_rewritten,
             "route_keys_changed": report.route_keys_changed,
             "sessions_changed": report.sessions_changed,

@@ -1,7 +1,7 @@
 """按新的会话键摘要搬迁记忆目录、命中缓存与路由状态，并给出各个按会话键存数据的库共用的新旧对照。
 
 换盐、换 bot 账号和跨平台绑定共用这一套：摘要怎么算由调用方决定，本模块只负责「算出新旧对照，
-然后一样不落地搬过去」。路由状态文件和附件目录前缀由平台描述给出。
+然后一样不落地搬过去」。路由状态文件由平台描述给出。
 """
 from __future__ import annotations
 
@@ -197,11 +197,6 @@ def _rekey_sqlite_group(
     return RekeyCount(moved, replaced)
 
 
-def attachment_dir_prefixes(platform: PlatformDescriptor) -> tuple[str, ...]:
-    """摘要型会话键把 ":" 换成 "_" 就是附件目录名。"""
-    return tuple(f"{channel.name}_" for channel in platform.channels if channel.hashed)
-
-
 def namespace_dir(stable_key: str) -> str:
     """stable conversation_key 对应的记忆目录名，与 knowledge_inject 同一个算法。"""
     return "conv_" + sha256(stable_key.encode("utf-8")).hexdigest()[:24]
@@ -261,7 +256,6 @@ class MigrationPlan:
 @dataclass
 class MigrationOutcome:
     moved_dirs: list[tuple[str, str]] = field(default_factory=list)
-    moved_attachment_dirs: list[tuple[str, str]] = field(default_factory=list)
     hit_keys_rewritten: int = 0
     route_keys_changed: int = 0
     backup_dir: Path | None = None
@@ -357,11 +351,12 @@ def backup(*, workspace: Path, platform: PlatformDescriptor, backup_dir: Path, p
 
 def apply_migration(
     *, workspace: Path, platform: PlatformDescriptor, plan: MigrationPlan,
-    move_attachments: bool = False, make_backup: bool = True,
+    make_backup: bool = True,
 ) -> MigrationOutcome:
     """执行搬迁。没有要改的东西就整个跳过，重复运行是幂等的空操作。
 
     只动 bot 和引擎这一侧的东西；会话注册表、定时任务这些按会话键存数据的库由调用方按同一份对照另外改写。
+    附件目录不搬：消息里记的是带目录名的 file:// 路径，搬了历史里的图片全部指空；它们按保留期自己过期。
     """
     workspace = Path(workspace)
     outcome = MigrationOutcome()
@@ -388,8 +383,6 @@ def apply_migration(
     outcome.hit_keys_rewritten = _rewrite_hit_cache(workspace, ns_renames)
     remap = {r.old_stable: r.new_stable for r in plan.changed}
     outcome.route_keys_changed = _rewrite_route_state(route_state_file(workspace, platform), remap)
-    if move_attachments:
-        outcome.moved_attachment_dirs = _move_attachment_dirs(workspace, remap, attachment_dir_prefixes(platform))
     return outcome
 
 
@@ -454,30 +447,6 @@ def _rewrite_route_state(route_state: Path, remap: dict[str, str]) -> int:
         return 0
     _atomic_write_json(route_state, data)
     return changed
-
-
-def _move_attachment_dirs(
-    workspace: Path, remap: dict[str, str], prefixes: tuple[str, ...],
-) -> list[tuple[str, str]]:
-    """会话附件目录按 stable key 命名，不搬的话历史里的图片路径全部指空。"""
-    root = Path(workspace) / "data" / "attachments"
-    if not root.is_dir():
-        return []
-    moved: list[tuple[str, str]] = []
-    for old_key, new_key in remap.items():
-        old_name = old_key.replace(":", "_")
-        new_name = new_key.replace(":", "_")
-        if not old_name.startswith(prefixes):
-            continue
-        src, dst = root / old_name, root / new_name
-        if not src.is_dir() or dst.exists():
-            continue
-        try:
-            shutil.move(str(src), str(dst))
-        except OSError:
-            continue
-        moved.append((old_name, new_name))
-    return moved
 
 
 def _atomic_write_json(path: Path, payload: object, indent: int | None = 2) -> None:
