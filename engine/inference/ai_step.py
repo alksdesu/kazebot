@@ -1094,9 +1094,6 @@ async def _execute_real_tools(
     ls: _LoopState, real_tool_calls: list[dict[str, Any]], step: int,
 ) -> TaskAction | None:
     """批量执行真实工具调用，将结果追加到 messages。"""
-    # [2026-04-17] 移除 _max_inline / _rt_cfg：截断机制已废弃，不再需要读取 runtime config 中的
-    # engine.tool_trace.max_inline_chars 配置项。
-
     tool_names = [str(call.get("name") or call.get("tool_name") or "").strip() for call in real_tool_calls]
     tool_names = [name for name in tool_names if name]
     tool_names_text = "、".join(tool_names[:5])

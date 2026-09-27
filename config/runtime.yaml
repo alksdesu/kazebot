@@ -8,7 +8,6 @@ version: 1
 engine:
   max_steps: 64
   streaming: true
-  history_limit: 80
   poll_interval_sec: 1.0
   max_workers: 4               # 并发 task 处理数（默认 4）
 
@@ -35,18 +34,8 @@ engine:
     backoff_multiplier: 2.0    # 指数退避倍数
     # 可重试的 HTTP 状态码：429(限流) 500 502 503 504(服务端错误)
 
-  approval_poll_interval_sec: 0.5
-
   http:
     client_timeout_sec: 60.0
-
-  supervisor:
-    health_timeout_sec: 2.0
-    wait_poll_interval_sec: 0.5
-
-  tool_trace:
-    max_inline_chars: 100000
-    max_progress_arg_chars: 320
 
   # Phase 0/1 Signal System：轻量级进程内信号总线配置。
   # bus 在 _run_node_task 中初始化，bridge 将信号写入 data/signals.jsonl。
@@ -60,9 +49,15 @@ engine:
       - tool_call_delta
       - tool_call_end
 
-  model: ""
+  # 长工具链跑完后，supervisor 另起一个摘要节点给这一轮写摘要
+  turn_summary:
+    enabled: true
+    min_tool_calls: 3                 # 这一轮的工具调用达到此次数才写
+    node_id: "system.turn_summarizer"
 
   tool_mode: json                   # 全局默认工具模式，节点 yaml 可覆盖 (native | json | fake_native)
+  output_mode: tool_only            # tool_only = 纯文本回复打回重试；hybrid = 纯文本直接投递给用户。节点 yaml 可覆盖
+  plaintext_retry_max: 3            # tool_only 下模型回纯文本时最多重试几次（0-10），用完按隐式 finish 投递
 
 # 每个渠道发给模型的请求参数。options 下的键名由 provider 类自己声明，
 # 控制台「模型」页照那份清单渲染；节点 yaml 的 provider_options 会盖掉这里。
@@ -109,14 +104,18 @@ meta:
 
   search:
     max_file_size_bytes: 3000000
-    max_matches: 100
 
 tools:
-  command:
-    default_timeout_sec: 60.0
+  script:
+    default_timeout_sec: 60.0   # tools/ 下的脚本工具没写 TIMEOUT_SEC 时的超时（1-3600 秒）
 
 skills:
   max_budget_chars: 0       # 0 = no limit; max total chars of skill body to inject
+
+knowledge:
+  # 大于 0 时 Skill 和记忆共用这一个预算池按 priority 竞争，skills / memory 各自的
+  # max_budget_chars 都不再生效。0 = 各算各的。
+  max_budget_chars: 0
 
 memory:
   # 注入记忆的总字数上限。按人加载会一次调出某人的全部档案，不设上限则随档案增长
@@ -149,7 +148,6 @@ maintenance:
     dry_run: false
 
 shell:
-  default_conversation_key: "cli:default"
   mode: tui   # tui | cli
   # 以下各项在 TUI 启动时读取，改完重开 TUI 生效
   tui:
@@ -175,3 +173,4 @@ supervisor:
     stop_wait_timeout_sec: 5.0
     shell_new_console: false
     engine_workers: 2
+    spawn_shell_cli: false    # supervisor 启动时顺带拉起 shell；环境变量 CLONOTH_SPAWN_SHELL_CLI 优先

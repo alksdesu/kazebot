@@ -79,7 +79,7 @@ def _git_snapshot(ctx: ToolContext) -> dict[str, Any]:
     root = ctx.workspace_root
 
     runtime_cfg = load_runtime_config(root)
-    diff_max_chars = get_int(runtime_cfg, "meta.git.diff_max_chars", 400_000, min_value=10_000, max_value=2_000_000)
+    diff_max_chars = get_int(runtime_cfg, "meta.git.diff_max_chars", 600_000, min_value=10_000, max_value=2_000_000)
 
     rc, inside = _run_capture(args=["git", "rev-parse", "--is-inside-work-tree"], cwd=root)
     if rc != 0 or inside.strip().lower() != "true":

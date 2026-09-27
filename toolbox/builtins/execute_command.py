@@ -32,14 +32,14 @@ async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     default_timeout_sec = get_float(
         runtime_cfg,
         "meta.execute_command.default_timeout_sec",
-        60.0,
+        90.0,
         min_value=1.0,
         max_value=3600.0,
     )
     max_output_chars = get_int(
         runtime_cfg,
         "meta.execute_command.max_output_chars",
-        8000,
+        12000,
         min_value=1000,
         max_value=200_000,
     )

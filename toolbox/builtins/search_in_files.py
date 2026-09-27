@@ -316,7 +316,7 @@ async def search_in_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     max_file_size_bytes = get_int(
         runtime_cfg,
         "meta.search.max_file_size_bytes",
-        2_000_000,
+        3_000_000,
         min_value=100_000,
         max_value=50_000_000,
     )

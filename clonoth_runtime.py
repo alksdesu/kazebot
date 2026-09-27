@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import logging
 import os
 import time
 from collections.abc import Mapping
@@ -19,25 +20,17 @@ if TYPE_CHECKING:
     from platforms.descriptor import PlatformDescriptor
 
 
+_log = logging.getLogger(__name__)
+
+
 DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "version": 1,
     "engine": {
         "max_steps": 32,
         "streaming": True,
-        "history_limit": 80,
         "poll_interval_sec": 1.0,
-        "approval_poll_interval_sec": 0.5,
         "http": {"client_timeout_sec": 60.0},
-        "supervisor": {
-            "health_timeout_sec": 2.0,
-            "wait_poll_interval_sec": 0.5,
-        },
-        "tool_trace": {
-            "max_inline_chars": 8000,
-            "max_progress_arg_chars": 320,
-        },
         "compact": {
-            "threshold_chars": 800000,
             "keep_recent": 6,
         },
         "retry": {
@@ -46,7 +39,6 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
             "max_delay_sec": 30.0,
             "backoff_multiplier": 2.0,
         },
-        "model": "",
     },
     "providers": {
         "openai": {
@@ -72,10 +64,10 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
             },
         },
         "git": {"diff_max_chars": 600000},
-        "search": {"max_file_size_bytes": 3000000, "max_matches": 100},
+        "search": {"max_file_size_bytes": 3000000},
     },
     "tools": {
-        "command": {
+        "script": {
             "default_timeout_sec": 60.0,
         }
     },
@@ -83,7 +75,6 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
         "max_budget_chars": 0,
     },
     "shell": {
-        "default_conversation_key": "cli:default",
         "entry_node_id": "bootstrap.shell_orchestrator",
         "http": {"client_timeout_sec": 10.0},
         "supervisor": {
@@ -103,6 +94,48 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
 
 
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+# 键 → 去处，空串表示没有替代项。旧工作区的 runtime.yaml 里可能还留着它们。
+RETIRED_RUNTIME_KEYS: dict[str, str] = {
+    "engine.history_limit": "对话历史不按条数截断，长度交给 engine.compact 控制",
+    "engine.model": "模型写在 data/config.yaml 的渠道块或节点 yaml 里",
+    "engine.approval_poll_interval_sec": "",
+    "engine.supervisor": "",
+    "engine.tool_trace": "",
+    "engine.compact.threshold_chars": "改用 engine.compact.threshold_tokens",
+    "engine.child_session.max_per_parent": "",
+    "memory.auto_extract.min_messages": "",
+    "memory.dream.min_sessions": "",
+    "meta.search.max_matches": "匹配上限由 search_in_files 的 maxResults 参数决定",
+    "shell.default_conversation_key": "会话键由 --conversation-key 或 CLONOTH_CONVERSATION_KEY 决定",
+    "tools.command": "已改名为 tools.script",
+}
+
+_WARNED_RETIRED: set[tuple[str, str]] = set()
+
+
+def _has_dotted(data: Mapping[str, Any], dotted_key: str) -> bool:
+    cur: Any = data
+    for part in dotted_key.split("."):
+        if not isinstance(cur, Mapping) or part not in cur:
+            return False
+        cur = cur[part]
+    return True
+
+
+def retired_runtime_keys(cfg: Mapping[str, Any]) -> list[str]:
+    """cfg 里还写着的退役键，顺序同 RETIRED_RUNTIME_KEYS。"""
+    return [key for key in RETIRED_RUNTIME_KEYS if _has_dotted(cfg, key)]
+
+
+def _warn_retired_keys(path: Path, user_cfg: Mapping[str, Any]) -> None:
+    for key in retired_runtime_keys(user_cfg):
+        marker = (str(path), key)
+        if marker in _WARNED_RETIRED:
+            continue
+        _WARNED_RETIRED.add(marker)
+        _log.warning("%s 里的 %s 已经没有代码读取，%s", path, key, RETIRED_RUNTIME_KEYS[key] or "可以删掉")
 
 
 def runtime_config_path(workspace_root: Path) -> Path:
@@ -140,6 +173,7 @@ def load_runtime_config(workspace_root: Path) -> dict[str, Any]:
         except Exception:
             user_cfg = {}
 
+    _warn_retired_keys(path, user_cfg)
     merged = _deep_merge(DEFAULT_RUNTIME_CONFIG, user_cfg)
     _CACHE[key] = (mtime, merged)
     return copy.deepcopy(merged)
