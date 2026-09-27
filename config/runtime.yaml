@@ -151,13 +151,13 @@ maintenance:
 shell:
   default_conversation_key: "cli:default"
   mode: tui   # tui | cli
-  # shell/tui 目前不读 runtime.yaml，以下五项是待接线的意图声明，改了不生效。
+  # 以下各项在 TUI 启动时读取，改完重开 TUI 生效
   tui:
-    theme: dark
-    show_thinking: true
-    auto_scroll: true
-    node_panel: false
-    max_message_height: 50
+    theme: dark               # dark | light，或任一 Textual 内置主题名（如 nord、gruvbox）
+    show_thinking: true       # 显示模型的思考过程
+    auto_scroll: true         # 新内容到来时滚到底部
+    node_panel: false         # 右侧显示节点执行面板
+    max_message_height: 50    # 单条消息最多占几行，超出的在消息内部滚动；0 = 不限
   # inbound 未显式带 entry_node_id 时的兜底入口。QQ / TUI 每条 inbound 都自带入口，不受此值影响。
   entry_node_id: "bootstrap.shell_orchestrator"
 

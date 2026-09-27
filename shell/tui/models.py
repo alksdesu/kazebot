@@ -65,11 +65,12 @@ class NodeStarted(Message):
 
 
 class NodeCompleted(Message):
-    def __init__(self, name: str, outcome: str, summary: str) -> None:
+    def __init__(self, name: str, outcome: str, summary: str, node_id: str = "") -> None:
         super().__init__()
         self.name = name
         self.outcome = outcome
         self.summary = summary
+        self.node_id = node_id
 
 
 class ApprovalRequested(Message):

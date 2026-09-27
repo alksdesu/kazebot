@@ -11,17 +11,19 @@ from typing import Any
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll, Center
+from textual.containers import Horizontal, Vertical, VerticalScroll, Center
 from textual.widgets import Static, Button, Label
 
 from clonoth_runtime import read_admin_token
 from workspace import resolve_workspace_root
 
 from .styles import DEFAULT_CSS
+from .settings import TuiSettings, load_tui_settings
 from .services.supervisor_client import SupervisorClient
 from .services.event_poller import EventPoller
 from .services.node_scanner import scan_nodes, find_root_nodes, NodeInfo
-from .widgets.message_list import MessageList
+from .widgets.message_list import CAPPED_CSS, MAX_HEIGHT_VARIABLE, MessageList
+from .widgets.node_panel import NodePanel
 from .widgets.input_box import InputBox
 from .widgets.status_bar import StatusBar
 from .widgets.thinking import ThinkingIndicator
@@ -45,7 +47,7 @@ from .models import (
 class ClonothApp(App):
 
     TITLE = "Clonoth"
-    CSS = DEFAULT_CSS + """
+    CSS = DEFAULT_CSS + CAPPED_CSS + """
     #welcome-overlay {
         align: center middle;
         width: 100%;
@@ -105,10 +107,13 @@ class ClonothApp(App):
         supervisor_url: str = "http://127.0.0.1:8765",
         conversation_key: str | None = None,
         workspace_root: Path | None = None,
+        settings: TuiSettings | None = None,
     ) -> None:
+        self.workspace_root = workspace_root or resolve_workspace_root(Path(__file__).resolve().parents[2])
+        # App.__init__ 建样式表时就会调 get_theme_variable_defaults，设置必须先就位
+        self.tui_settings = settings or load_tui_settings(self.workspace_root)
         super().__init__()
         self._supervisor_url = supervisor_url
-        self.workspace_root = workspace_root or resolve_workspace_root(Path(__file__).resolve().parents[2])
         self.conversation_key = conversation_key or f"cli:{uuid.uuid4()}"
         self.session_id: str | None = None
         self.approval_mode: str = "normal"
@@ -125,6 +130,11 @@ class ClonothApp(App):
         )
         self.poller = EventPoller(self.supervisor, self)
 
+    def get_theme_variable_defaults(self) -> dict[str, str]:
+        # 不限高时没有消息会挂上限高 class，变量只需是个合法值
+        max_height = max(1, self.tui_settings.max_message_height)
+        return {**super().get_theme_variable_defaults(), MAX_HEIGHT_VARIABLE: str(max_height)}
+
     # ---- compose ----
 
     def compose(self) -> ComposeResult:
@@ -132,7 +142,12 @@ class ClonothApp(App):
         self._root_nodes = find_root_nodes(all_nodes)
 
         yield SearchBar()
-        yield MessageList()
+        if self.tui_settings.node_panel:
+            with Horizontal(id="chat-row"):
+                yield self._build_message_list()
+                yield NodePanel()
+        else:
+            yield self._build_message_list()
         yield ThinkingIndicator()
         yield InputBox()
         yield StatusBar()
@@ -160,9 +175,28 @@ class ClonothApp(App):
                 yield Button("允许 (Y)", variant="warning", id="btn-allow")
                 yield Button("拒绝 (N)", variant="error", id="btn-deny")
 
+    def _build_message_list(self) -> MessageList:
+        return MessageList(
+            auto_scroll=self.tui_settings.auto_scroll,
+            cap_height=self.tui_settings.caps_message_height,
+        )
+
+    def _node_panel(self) -> NodePanel | None:
+        if not self.tui_settings.node_panel:
+            return None
+        return self.query_one(NodePanel)
+
     # ---- 启动 ----
 
+    def _apply_theme(self) -> None:
+        theme = self.tui_settings.theme
+        if theme in self.available_themes:
+            self.theme = theme
+            return
+        self.notify(f"没有名为 {theme} 的主题，沿用默认主题", severity="warning", timeout=10)
+
     async def on_mount(self) -> None:
+        self._apply_theme()
         try:
             await self.supervisor.wait_ready(timeout=15.0)
         except TimeoutError:
@@ -294,11 +328,7 @@ class ClonothApp(App):
         cmd = event.command
 
         if cmd == "/clear":
-            self.conversation_key = f"cli:{uuid.uuid4()}"
-            self.session_id = None
-            self.poller.stop_session()
-            for child in list(ml.children):
-                child.remove()
+            self._start_new_conversation()
             await ml.add_system_message("上下文已清空")
             sb.update_status(waiting=False)
         elif cmd == "/cancel":
@@ -365,7 +395,7 @@ class ClonothApp(App):
         ml.append_stream(event.content)
 
     async def on_stream_thinking(self, event: StreamThinking) -> None:
-        if not self._chat_ready:
+        if not self._chat_ready or not self.tui_settings.show_thinking:
             return
         self._thinking_buf += event.content
         self.query_one(ThinkingIndicator).show_thinking(event.content)
@@ -401,6 +431,9 @@ class ClonothApp(App):
         if not self._chat_ready:
             return
         self.query_one(StatusBar).update_status(waiting=True, node_name=event.name)
+        panel = self._node_panel()
+        if panel is not None:
+            panel.mark_started(event.name, event.node_id)
         # 如果不是入口节点，在聊天区显示委派信息
         if event.node_id != self.entry_node_id:
             ml = self.query_one(MessageList)
@@ -409,6 +442,9 @@ class ClonothApp(App):
     async def on_node_completed(self, event: NodeCompleted) -> None:
         if not self._chat_ready:
             return
+        panel = self._node_panel()
+        if panel is not None:
+            panel.mark_completed(event.name, event.node_id, event.outcome, event.summary)
         # 恢复入口节点名
         self.query_one(StatusBar).update_status(node_name=self._entry_node_name)
 
@@ -480,17 +516,19 @@ class ClonothApp(App):
             await self.supervisor.cancel_session(self.session_id)
 
     async def action_clear_chat(self) -> None:
+        self._start_new_conversation()
+
+    def _start_new_conversation(self) -> None:
         self.conversation_key = f"cli:{uuid.uuid4()}"
         self.session_id = None
         self.poller.stop_session()
         if not self._chat_ready:
             return
-        try:
-            ml = self.query_one(MessageList)
-            for c in list(ml.children):
-                c.remove()
-        except Exception:
-            pass
+        for child in list(self.query_one(MessageList).children):
+            child.remove()
+        panel = self._node_panel()
+        if panel is not None:
+            panel.clear_all()
 
     async def action_toggle_approval_mode(self) -> None:
         self.approval_mode = "auto" if self.approval_mode == "normal" else "normal"

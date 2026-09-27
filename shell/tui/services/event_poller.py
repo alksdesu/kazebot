@@ -170,10 +170,12 @@ class EventPoller:
             return NodeStarted(name, nid)
 
         if et == "node_completed":
-            name = payload.get("node_name") or payload.get("node_id", "")
-            outcome = payload.get("outcome", "")
+            nid = payload.get("node_id", "")
+            name = payload.get("node_name") or nid
+            # engine 在 action 字段里报这一步的去向（finish / fail / ask ...）
+            outcome = payload.get("action", "")
             summary = payload.get("summary", "")
-            return NodeCompleted(name, outcome, summary)
+            return NodeCompleted(name, outcome, summary, node_id=nid)
 
         if et == "handoff_progress":
             message = str(payload.get("message") or "").strip()

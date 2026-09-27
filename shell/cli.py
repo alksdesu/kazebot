@@ -365,7 +365,7 @@ def main() -> None:
 
                         elif et == "node_completed":
                             label = payload.get("node_name") or payload.get("node_id", "")
-                            oc = payload.get("outcome", "")
+                            oc = payload.get("action", "")
                             sm = payload.get("summary", "")
                             print(f"[node] ✓ {label} → {oc}: {sm[:120]}", flush=True)
 

@@ -9,6 +9,14 @@ Screen {
     height: 1fr;
 }
 
+#chat-row {
+    height: 1fr;
+}
+
+#chat-row #message-list {
+    width: 1fr;
+}
+
 #input-box {
     height: auto;
     min-height: 3;

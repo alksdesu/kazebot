@@ -4,6 +4,16 @@ from __future__ import annotations
 from textual.containers import ScrollableContainer
 from textual.widgets import Static, Markdown
 
+CAPPED_CLASS = "message-capped"
+MAX_HEIGHT_VARIABLE = "message-max-height"
+# 变量值由宿主 App 按配置提供，所以这段不进 DEFAULT_CSS：别的 App 挂这个组件不会因为缺变量而样式解析失败
+CAPPED_CSS = f"""
+MessageList .{CAPPED_CLASS} {{
+    max-height: ${MAX_HEIGHT_VARIABLE};
+    overflow-y: auto;
+}}
+"""
+
 
 class MessageList(ScrollableContainer):
     """可滚动的消息列表。"""
@@ -20,7 +30,7 @@ class MessageList(ScrollableContainer):
         padding: 0 1;
     }
     .user-prefix {
-        color: dodgerblue;
+        color: $accent;
         text-style: bold;
         margin: 1 8 0 2;
         height: 1;
@@ -35,7 +45,7 @@ class MessageList(ScrollableContainer):
         padding: 0 1;
     }
     .assistant-prefix {
-        color: green;
+        color: $success;
         text-style: bold;
         margin: 1 2 0 2;
         height: 1;
@@ -73,11 +83,15 @@ class MessageList(ScrollableContainer):
     }
     """
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, *, auto_scroll: bool = True, cap_height: bool = False, **kwargs) -> None:
         super().__init__(id="message-list", **kwargs)
         self._streaming_widget: Static | None = None
         self._stream_text: str = ""
-        self._auto_scroll: bool = True
+        self._auto_scroll = auto_scroll
+        self._cap_height = cap_height
+
+    def _body_classes(self, base: str) -> str:
+        return f"{base} {CAPPED_CLASS}" if self._cap_height else base
 
     # ---- 判断内容是否含 Markdown 格式 ----
 
@@ -101,15 +115,15 @@ class MessageList(ScrollableContainer):
 
     async def add_user_message(self, text: str) -> None:
         await self.mount(Static("You", classes="user-prefix"))
-        await self.mount(Static(text, classes="user-msg"))
+        await self.mount(Static(text, classes=self._body_classes("user-msg")))
         self._scroll_to_end()
 
     async def add_assistant_message(self, text: str) -> None:
         await self.mount(Static("Assistant", classes="assistant-prefix"))
         if self._has_markdown(text):
-            await self.mount(Markdown(text, classes="assistant-md"))
+            await self.mount(Markdown(text, classes=self._body_classes("assistant-md")))
         else:
-            await self.mount(Static(text, classes="assistant-msg"))
+            await self.mount(Static(text, classes=self._body_classes("assistant-msg")))
         await self.mount(Static("─" * 40, classes="divider"))
         self._scroll_to_end()
 
@@ -144,7 +158,7 @@ class MessageList(ScrollableContainer):
         self._stream_text = ""
         await self.mount(Static("Assistant", classes="assistant-prefix"))
         # 流式期间用 Static（Markdown 高频 update 会闪烁）
-        self._streaming_widget = Static("", classes="assistant-msg")
+        self._streaming_widget = Static("", classes=self._body_classes("assistant-msg"))
         await self.mount(self._streaming_widget)
         self._scroll_to_end()
 
@@ -153,6 +167,9 @@ class MessageList(ScrollableContainer):
             return
         self._stream_text += text
         self._streaming_widget.update(self._stream_text)
+        # 限高后新内容落在消息框底部看不见的地方，框内也得跟着滚
+        if self._cap_height and self._auto_scroll:
+            self._streaming_widget.scroll_end(animate=False)
         self._scroll_to_end()
 
     async def end_streaming(self) -> None:
@@ -161,7 +178,7 @@ class MessageList(ScrollableContainer):
             final_text = self._stream_text.strip()
             if final_text and self._has_markdown(final_text):
                 # 替换 Static 为 Markdown
-                md_widget = Markdown(final_text, classes="assistant-md")
+                md_widget = Markdown(final_text, classes=self._body_classes("assistant-md"))
                 await self.mount(md_widget, after=self._streaming_widget)
                 self._streaming_widget.remove()
             await self.mount(Static("─" * 40, classes="divider"))
