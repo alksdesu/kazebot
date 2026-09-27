@@ -49,7 +49,11 @@ def _rekey_plan_body(raw: str, rekey: ConversationRekey, old: str, new: str) -> 
         )
         auth = context.get("platform_auth")
         if isinstance(auth, dict):
-            rekey.rewrite(auth, old, new, keys=("group_scope",), channels=("platform",), bot_scopes=("bot_scope",))
+            # 任务里建的计划抄的是适配器报的平台 id，没有任务时记的是渠道名，两条规则都得过。
+            rekey.rewrite(
+                auth, old, new,
+                keys=("group_scope",), channels=("platform",), platforms=("platform",), bot_scopes=("bot_scope",),
+            )
     return json.dumps(plan, ensure_ascii=False)
 
 

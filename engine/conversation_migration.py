@@ -20,8 +20,8 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 
 import engine.memory_hit_cache as hit_cache
 from engine.eventlog_rotation import eventlog_file_lock
-from platforms.descriptor import STATE_ROUTES, PlatformDescriptor
-from platforms.registry import conversation_key_prefix, platform_state_path
+from platforms.descriptor import STATE_ROUTES, PlatformDescriptor, normalize_name
+from platforms.registry import conversation_channel, conversation_key_prefix, platform_state_path
 
 HIT_KEY_SEP = "/"
 
@@ -49,7 +49,7 @@ class ConversationRekey:
     """一次迁移里会话键的新旧对照，连同跟着换的机器人账号。
 
     只改会话键落在对照里的记录：渠道名原来就是旧键的前缀才跟着换（web 这类发起渠道不动），
-    账号按 bot_scopes 换。
+    平台 id 原来写的是旧键所在的平台、新键又落在另一个平台才跟着换，账号按 bot_scopes 换。
     """
 
     keys: Mapping[str, str]
@@ -80,14 +80,22 @@ class ConversationRekey:
         text = str(value or "").strip()
         return conversation_key_prefix(new_key) if text and text == conversation_key_prefix(old_key) else value
 
+    def platform(self, old_key: str, new_key: str, value: Any) -> Any:
+        """跨平台绑定时，写着旧平台 id 或它历史别名的换成新平台 id；同平台迁移、认不出平台的键都原样。"""
+        old_platform, new_platform = _key_platform(old_key), _key_platform(new_key)
+        if old_platform is None or new_platform is None or old_platform.id == new_platform.id:
+            return value
+        return new_platform.id if normalize_name(value) in {old_platform.id, *old_platform.aliases} else value
+
     def bot_scope(self, value: Any) -> Any:
         return self.bot_scopes.get(str(value or "").strip(), value)
 
     def rewrite(
         self, document: dict[str, Any], old_key: str, new_key: str, *,
-        keys: Iterable[str] = (), channels: Iterable[str] = (), bot_scopes: Iterable[str] = (),
+        keys: Iterable[str] = (), channels: Iterable[str] = (), platforms: Iterable[str] = (),
+        bot_scopes: Iterable[str] = (),
     ) -> None:
-        """改一条记录里列出的字段：keys 按对照换键，channels 按渠道规则换，bot_scopes 按对照换号。"""
+        """改一条记录里列出的字段：keys 按对照换键，channels、platforms 按渠道和平台规则换，bot_scopes 按对照换号。"""
         for name in keys:
             mapped = self.key(document.get(name)) if name in document else None
             if mapped is not None:
@@ -95,9 +103,17 @@ class ConversationRekey:
         for name in channels:
             if name in document:
                 document[name] = self.channel(old_key, new_key, document[name])
+        for name in platforms:
+            if name in document:
+                document[name] = self.platform(old_key, new_key, document[name])
         for name in bot_scopes:
             if name in document:
                 document[name] = self.bot_scope(document[name])
+
+
+def _key_platform(conversation_key: str) -> PlatformDescriptor | None:
+    found = conversation_channel(conversation_key)
+    return found[0] if found is not None else None
 
 
 @contextmanager
@@ -353,9 +369,25 @@ def apply_migration(
     *, workspace: Path, platform: PlatformDescriptor, plan: MigrationPlan,
     make_backup: bool = True,
 ) -> MigrationOutcome:
-    """执行搬迁。没有要改的东西就整个跳过，重复运行是幂等的空操作。
+    """同一个平台里换盐、换号：搬记忆目录和命中缓存，再把路由状态里原来的键改成新键。
 
-    只动 bot 和引擎这一侧的东西；会话注册表、定时任务这些按会话键存数据的库由调用方按同一份对照另外改写。
+    没有要改的东西就整个跳过，重复运行是幂等的空操作。只动 bot 和引擎这一侧的东西；
+    会话注册表、定时任务这些按会话键存数据的库由调用方按同一份对照另外改写。
+    """
+    workspace = Path(workspace)
+    outcome = move_memory(workspace=workspace, platform=platform, plan=plan, make_backup=make_backup)
+    remap = {r.old_stable: r.new_stable for r in plan.changed}
+    outcome.route_keys_changed = _rewrite_route_state(route_state_file(workspace, platform), remap)
+    return outcome
+
+
+def move_memory(
+    *, workspace: Path, platform: PlatformDescriptor, plan: MigrationPlan,
+    make_backup: bool = True,
+) -> MigrationOutcome:
+    """先备份，再把记忆目录搬到新键名下，命中缓存跟着改名；没有要改的东西就整个跳过。
+
+    路由状态留给调用方：同平台迁移改写原来的键，跨平台绑定在目标平台补一条，所以备份带上 platform 的路由状态。
     附件目录不搬：消息里记的是带目录名的 file:// 路径，搬了历史里的图片全部指空；它们按保留期自己过期。
     """
     workspace = Path(workspace)
@@ -381,8 +413,6 @@ def apply_migration(
         ns_renames[rename.old_ns] = rename.new_ns
 
     outcome.hit_keys_rewritten = _rewrite_hit_cache(workspace, ns_renames)
-    remap = {r.old_stable: r.new_stable for r in plan.changed}
-    outcome.route_keys_changed = _rewrite_route_state(route_state_file(workspace, platform), remap)
     return outcome
 
 
@@ -447,6 +477,37 @@ def _rewrite_route_state(route_state: Path, remap: dict[str, str]) -> int:
         return 0
     _atomic_write_json(route_state, data)
     return changed
+
+
+def record_route(route_state: Path, stable: str, real: str, *, apply: bool) -> bool:
+    """在路由状态里补一条稳定键到真实会话的对照；已经有同样一条就不动，返回要不要写。
+
+    跨平台绑定时目标 bot 可能还没在那个会话里说过话：没有这一条，它投不出提醒，控制台也叫不出会话名。
+    读不懂的文件、已经指向别的会话的键都直接抛，预览和执行走同一段检查。
+    """
+    stable, real = str(stable or "").strip(), str(real or "").strip()
+    if not stable or not real:
+        raise ValueError("a route needs both a stable and a real conversation key")
+    path = Path(route_state)
+    data: Any = {"version": 1, "real_conversation_keys": {}, "session_targets": {}}
+    if path.exists():
+        data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"route state is not an object: {path}")
+    real_map = data.setdefault("real_conversation_keys", {})
+    if not isinstance(real_map, dict):
+        raise ValueError(f"real_conversation_keys is not an object: {path}")
+    # 空值读的时候本来就被丢掉，等于没有这一条。
+    current = str(real_map.get(stable) or "")
+    if current == real:
+        return False
+    if current:
+        raise ValueError(f"{stable} already points at another conversation in {path}")
+    if apply:
+        real_map[stable] = real
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(path, data)
+    return True
 
 
 def _atomic_write_json(path: Path, payload: object, indent: int | None = 2) -> None:

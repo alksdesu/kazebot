@@ -99,6 +99,10 @@ def rekey_materials(path: Path, rekey: ConversationRekey, *, apply: bool) -> Rek
 def _rekey_material_document(raw: str, rekey: ConversationRekey, old: str, new: str) -> str:
     record = json.loads(raw)
     rekey.rewrite(record, old, new, keys=("scope",), bot_scopes=("bot_scope",))
+    bound = record.get("bound_actor")
+    if isinstance(bound, dict):
+        # 生图操作完成时照发起时存下的身份写回资料库，不跟着换，生成的图就落回旧会话。
+        rekey.rewrite(bound, old, new, keys=("scope",), channels=("channel",), bot_scopes=("bot_scope",))
     return dump(record)
 
 

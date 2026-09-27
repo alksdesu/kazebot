@@ -26,6 +26,8 @@ import supervisor.scheduler as scheduler  # noqa: E402
 from engine.conversation_migration import ConversationRekey, RekeyConflict, RekeyCount  # noqa: E402
 from engine.materials.service import MaterialService  # noqa: E402
 from engine.materials.storage import materials_index_path, rekey_materials  # noqa: E402
+from platforms.descriptor import CHANNEL_GROUP, ChannelDescriptor, PlatformDescriptor  # noqa: E402
+from platforms.registry import register_platform, unregister_platform  # noqa: E402
 from supervisor._helpers import SessionInfo, _now  # noqa: E402
 from supervisor.community.service import CommunityService, community_path, rekey_community  # noqa: E402
 from supervisor.conversation_stores import (  # noqa: E402
@@ -62,6 +64,20 @@ MOVED = "qqbot_group:" + "c" * 24
 OTHER = "qq_group:" + "d" * 24
 OLD_BOT = "10001"
 NEW_BOT = "20002"
+# 登记过的另一个平台：绑定过去时平台 id 也跟着换。
+MATRIX = PlatformDescriptor(
+    id="matrix", display_name="Matrix", short_name="MX", channels=(ChannelDescriptor("mx_room", CHANNEL_GROUP),),
+)
+BOUND = "mx_room:" + "e" * 24
+
+
+@pytest.fixture
+def matrix():
+    register_platform(MATRIX)
+    try:
+        yield MATRIX
+    finally:
+        unregister_platform(MATRIX.id)
 
 
 @pytest.fixture
@@ -134,6 +150,20 @@ class TestConversationRekey:
         assert rekey.channel(OLD, MOVED, "web") == "web"
         assert rekey.channel(OLD, MOVED, None) is None
 
+    def test_a_platform_id_follows_only_into_another_platform(self, matrix: PlatformDescriptor) -> None:
+        rekey = ConversationRekey({OLD: BOUND})
+        assert rekey.platform(OLD, BOUND, "qq") == "matrix"
+        # 历史别名也是旧平台。
+        assert rekey.platform(OLD, BOUND, " OneBot ") == "matrix"
+        assert rekey.platform(OLD, BOUND, "qq_group") == "qq_group"
+        assert rekey.platform(OLD, BOUND, "web") == "web"
+        assert rekey.platform(OLD, BOUND, None) is None
+
+    def test_a_platform_id_stays_inside_one_platform_and_beside_unknown_keys(self, matrix: PlatformDescriptor) -> None:
+        assert ConversationRekey({OLD: NEW}).platform(OLD, NEW, "onebot") == "onebot"
+        assert ConversationRekey({OLD: MOVED}).platform(OLD, MOVED, "qq") == "qq"
+        assert ConversationRekey({MOVED: BOUND}).platform(MOVED, BOUND, "qqbot") == "qqbot"
+
     def test_only_the_listed_accounts_are_renamed(self) -> None:
         rekey = ConversationRekey({OLD: NEW}, bot_scopes={OLD_BOT: NEW_BOT, "same": "same"})
         assert rekey.bot_scope(OLD_BOT) == NEW_BOT
@@ -147,6 +177,11 @@ class TestConversationRekey:
         assert record == {
             "scope": MOVED, "route": NEW, "untouched": OLD, "channel": "qqbot_group", "bot_scope": NEW_BOT,
         }
+
+    def test_rewrite_runs_the_platform_rule_only_on_the_listed_fields(self, matrix: PlatformDescriptor) -> None:
+        record = {"platform": "qq", "created_platform": "qq"}
+        ConversationRekey({OLD: BOUND}).rewrite(record, OLD, BOUND, platforms=("platform",))
+        assert record == {"platform": "matrix", "created_platform": "qq"}
 
 
 class TestSessionRegistry:
@@ -528,6 +563,35 @@ class TestMaterials:
         finally:
             service.close()
 
+    def test_a_pending_image_operation_lands_in_the_new_conversation(self, tmp_path: Path) -> None:
+        from PIL import Image
+
+        service = MaterialService(tmp_path)
+        try:
+            origin = {**self._actor(), "channel": "qq_group", "task_id": "origin"}
+            operation = service.begin_image_operation(origin, {"tool_name": "gpt_image_2", "tool_call_id": "call1"})
+
+            rekey_materials(
+                materials_index_path(tmp_path), ConversationRekey({OLD: MOVED}, bot_scopes={OLD_BOT: NEW_BOT}), apply=True,
+            )
+
+            image = tmp_path / "data" / "attachments" / "gpt_image" / "generated.png"
+            image.parent.mkdir(parents=True)
+            Image.new("RGB", (64, 48), "red").save(image)
+            result = service.complete_image_operation(operation["id"], "origin", {
+                "tool_name": "gpt_image_2", "tool_call_id": "call1",
+                "attachments": [{"type": "image", "path": image.relative_to(tmp_path).as_posix(), "name": image.name}],
+            })
+
+            moved = self._actor(MOVED, NEW_BOT)
+            [version] = result["versions"]
+            assert service.store.get(version["id"], moved, kind="version")["scope"] == MOVED
+            assert service.store.list("version", self._actor()) == []
+            bound = service.store.get(operation["id"], moved, kind="image_operation")["bound_actor"]
+            assert (bound["scope"], bound["channel"], bound["bot_scope"]) == (MOVED, "qqbot_group", NEW_BOT)
+        finally:
+            service.close()
+
     def test_the_same_generated_version_on_both_sides_stops_everything(self, tmp_path: Path) -> None:
         service = MaterialService(tmp_path)
         try:
@@ -594,8 +658,27 @@ class TestExecutionPlans:
 
         context = plan["task_context"]
         assert (context["route_conversation_key"], context["parent_conversation_key"]) == (MOVED, MOVED)
-        # 平台 id 不是渠道名，不跟着换；群管理身份认的会话键要换。
+        # 新键认不出是哪个平台，平台 id 原样；群管理身份认的会话键要换。
         assert context["platform_auth"] == {"platform": "qq", "group_scope": MOVED, "bot_scope": NEW_BOT, "user_id": "30003"}
+
+    @pytest.mark.parametrize("recorded, expected", [("qq", "matrix"), ("onebot", "matrix"), ("qq_group", "mx_room")])
+    def test_the_platform_follows_a_binding_into_another_platform(
+        self, matrix: PlatformDescriptor, recorded: str, expected: str,
+    ) -> None:
+        # 任务里建的计划抄的是适配器报的平台 id，没有任务时记的是渠道名。
+        from supervisor.execution.store import _rekey_plan_body
+
+        body = json.dumps({
+            "scope": OLD, "channel": "qq_group",
+            "task_context": {
+                "conversation_key": OLD, "channel": "qq_group", "platform_auth": {"platform": recorded, "group_scope": OLD},
+            },
+        })
+
+        plan = json.loads(_rekey_plan_body(body, ConversationRekey({OLD: BOUND}), OLD, BOUND))
+
+        assert (plan["scope"], plan["channel"], plan["task_context"]["channel"]) == (BOUND, "mx_room", "mx_room")
+        assert plan["task_context"]["platform_auth"] == {"platform": expected, "group_scope": BOUND}
 
     def test_a_missing_database_is_not_created(self, tmp_path: Path) -> None:
         path = plans_path(tmp_path)
