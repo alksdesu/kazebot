@@ -393,7 +393,7 @@ class ToolRegistry:
         self._builtin_funcs = dict(self._tool_funcs)
 
         # 只想读内置工具元数据的调用方（管理接口）跳过这一步：reload 会 mkdir、
-        # touch tools/__init__.py 并改 sys.path，一个 GET 不该留下这些痕迹。
+        # touch tools/__init__.py，一个 GET 不该留下这些痕迹。
         if load_external:
             self.reload()
 
@@ -752,9 +752,7 @@ class ToolRegistry:
 
         self.tools_dir.mkdir(parents=True, exist_ok=True)
         (self.tools_dir / "__init__.py").touch(exist_ok=True)
-
-        if str(self.workspace_root) not in sys.path:
-            sys.path.insert(0, str(self.workspace_root))
+        # 工具在子进程里以脚本跑，本进程不 import 它们；把工作区插进 sys.path 反倒让它的 tools 盖住代码目录那份。
 
         builtin_names = set(self._tool_specs.keys())
 
