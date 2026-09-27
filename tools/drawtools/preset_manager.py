@@ -1,21 +1,25 @@
+"""Drawtools preset management utility for QQ command routing."""
 from __future__ import annotations
 
-"""Drawtools preset management utility for QQ command routing."""
-
-import sys
-from pathlib import Path
 from typing import Any
 
-if str(Path(__file__).resolve().parent) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from common import (  # noqa: E402
-    PresetNotFoundError,
-    is_selected_preset,
-    iter_presets,
-    load_settings,
-    set_selected_preset,
-)
+# The QQ adapter imports this as tools.drawtools.preset_manager; scripts and tests load it from its own directory.
+if __package__:
+    from .common import (
+        PresetNotFoundError,
+        is_selected_preset,
+        iter_presets,
+        load_settings,
+        set_selected_preset,
+    )
+else:
+    from common import (
+        PresetNotFoundError,
+        is_selected_preset,
+        iter_presets,
+        load_settings,
+        set_selected_preset,
+    )
 
 __all__ = ["PresetNotFoundError", "list_presets", "switch_preset"]
 

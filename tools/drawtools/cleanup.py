@@ -1,17 +1,20 @@
-from __future__ import annotations
-
 """Cleanup generated NovelAI attachment files.
 
 Policy inspired by LittleWhiteBox gallery cache cleanup, adapted to filesystem
 storage: delete expired files first, then trim oldest files until total size is
 below the configured capacity limit.
 """
+from __future__ import annotations
 
 import time
 from pathlib import Path
 from typing import Any
 
-from common import WORKSPACE_ROOT, load_settings
+# The supervisor imports this as tools.drawtools.cleanup; the drawtools scripts load it from their own directory.
+if __package__:
+    from .common import WORKSPACE_ROOT, load_settings
+else:
+    from common import WORKSPACE_ROOT, load_settings
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 

@@ -488,11 +488,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     @router.post("/drawtools/cleanup")
     def cleanup_drawtools_attachments() -> dict[str, Any]:
-        import sys as _sys
-        drawtools = _drawtools_dir()
-        if str(drawtools) not in _sys.path:
-            _sys.path.insert(0, str(drawtools))
-        from cleanup import cleanup_novelai_attachments  # type: ignore
+        # 按包导入，不往 sys.path 插 drawtools 目录：插了它的 common、cleanup 会盖住 supervisor 里的同名模块。
+        from tools.drawtools.cleanup import cleanup_novelai_attachments
         return cleanup_novelai_attachments(force=True)
 
     # ----- Runtime config -----

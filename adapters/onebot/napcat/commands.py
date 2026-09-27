@@ -5,7 +5,6 @@ import logging
 import asyncio
 import datetime as dt
 import re
-import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from nonebot.adapters.onebot.v11 import Bot, Event
@@ -93,10 +92,8 @@ def _drawtools_help_text() -> str:
 
 
 def _load_drawtools_preset_manager():
-    drawtools_dir = Path(CLONOTH_WORKSPACE) / "tools" / "drawtools"
-    if str(drawtools_dir) not in sys.path:
-        sys.path.insert(0, str(drawtools_dir))
-    from preset_manager import PresetNotFoundError, list_presets, switch_preset  # type: ignore
+    # 按包导入，不往 sys.path 插 drawtools 目录：插了它的 common、cleanup 会盖住 bot 进程里的同名模块。
+    from tools.drawtools.preset_manager import PresetNotFoundError, list_presets, switch_preset
     return list_presets, switch_preset, PresetNotFoundError
 
 
