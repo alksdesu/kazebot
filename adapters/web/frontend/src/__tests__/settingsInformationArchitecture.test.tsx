@@ -3,14 +3,13 @@ import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { PersonaPage } from '../console/PersonaPage';
-import { RuntimePage } from '../console/RuntimePage';
-import { StickerCollectPage } from '../console/StickerCollectPage';
 import { StickersPage } from '../console/StickersPage';
-import { BOT_PAGES, MODEL_PAGES, PLATFORM_PAGES, QQ_SECTIONS } from '../console/pages';
+import { BOT_PAGES, MODEL_PAGES, PLATFORM_PAGES } from '../console/pages';
 import { resolveSettingsLocation, TAB_ALIASES } from '../components/settings/settingsTabAliases';
 import { getSettingsTab, settingsTabs, type SettingsGroup } from '../components/settings/settingsTabs';
 import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
+import { QQ_SCHEMA, QqSectionBody, snapshotFor } from './consoleSchemaFixture';
 
 const idsInGroup = (group: SettingsGroup) =>
   settingsTabs.filter(tab => tab.group === group).map(tab => tab.id);
@@ -24,7 +23,7 @@ describe('设置分组归属', () => {
 
   it('渠道和模型不再登记在 QQ 页表里', () => {
     expect(idsInGroup('models')).toEqual(['providers', 'models']);
-    const sectionIds = QQ_SECTIONS.map(section => section.id);
+    const sectionIds = QQ_SCHEMA.sections.map(section => section.id);
     expect(sectionIds).not.toContain('providers');
     expect(sectionIds).not.toContain('models');
     expect([...BOT_PAGES, ...MODEL_PAGES].map(page => page.id)).not.toContain('account');
@@ -32,7 +31,7 @@ describe('设置分组归属', () => {
 
   it('平台组一个平台一页，分区按 14.4 的清单折在页里', () => {
     expect(idsInGroup('platform')).toEqual(['platform-qq']);
-    expect(QQ_SECTIONS.map(section => section.id)).toEqual([
+    expect(QQ_SCHEMA.sections.map(section => section.id)).toEqual([
       'account', 'channels', 'trigger', 'permissions',
       'input', 'output', 'interaction', 'sticker', 'link',
     ]);
@@ -51,7 +50,8 @@ describe('旧 id 别名', () => {
       expect(ids.has(target.tab)).toBe(true);
       expect(ids.has(legacy)).toBe(false);
       if (!target.section) continue;
-      const sections = settingsTabs.find(tab => tab.id === target.tab)!.sections || [];
+      const scope = settingsTabs.find(tab => tab.id === target.tab)!.configScope;
+      const sections = scope ? snapshotFor(scope)?.sections || [] : [];
       expect(sections.map(section => section.id)).toContain(target.section);
     }
   });
@@ -137,12 +137,12 @@ describe('混合保存拆开', () => {
     expect(screen.queryByText('收集表情包')).toBeNull();
 
     cleanup();
-    render(<StickerCollectPage />);
+    render(<QqSectionBody id="sticker" />);
     expect(screen.getByText('收集表情包')).toBeInTheDocument();
   });
 
   it('链路页不再重复 supervisor 状态，那一行归引擎的运行页', () => {
-    render(<RuntimePage />);
+    render(<QqSectionBody id="link" />);
 
     expect(screen.getByText('消息队列')).toBeInTheDocument();
     expect(screen.queryByText('Supervisor')).toBeNull();

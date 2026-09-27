@@ -1430,47 +1430,70 @@ export async function restartEngine(
 }
 
 // ================================================================
-//  平台配置与平台清单
+//  热载配置（各平台的配置文件与全局默认 config/features.yaml）与平台清单
 // ================================================================
 
-export interface PlatformRawFile {
+export interface ConfigRawFile {
   content: string;
   /** false = 还没接管，控制台该显示「跟随 .env」而不是一份空配置。 */
   exists: boolean;
 }
 
-export interface PlatformSaveResult {
+export interface ConfigSaveResult {
   ok: boolean;
   /** bot 没在跑时后端只能校验 YAML 语法，会在这里说明。 */
   warnings: string[];
 }
 
-/** bot 公布的生效快照。published=false 时其余字段都不该读。 */
-export interface PlatformLiveState {
+export interface ConfigFileFingerprint {
+  exists: boolean;
+  mtime_ns: number;
+  size: number;
+}
+
+/** 一个键的值从哪一层来。legacy 是只准写在全局的键还留在平台文件老位置上。 */
+export type ConfigSource = 'platform' | 'global' | 'legacy' | 'env' | 'default';
+
+/** bot 看到的全局文件。和控制台读到的不一致，说明全局那层改完还没被这个进程采纳。 */
+export interface ConfigLayerFile {
+  config_path: string;
+  file: ConfigFileFingerprint;
+  loaded: ConfigFileFingerprint;
+  parse_error: string;
+}
+
+/** 生效快照。平台的由 bot 公布，全局的由 supervisor 当场算；published=false 时其余字段都不该读。 */
+export interface ConfigLiveState {
   published: boolean;
   reason?: string;
   age_sec?: number;
   /** 心跳超过 90s 没更新，bot 大概失联了。 */
   stale?: boolean;
-  /** bot 跑着的那份值确实来自磁盘上的当前文件版本。 */
+  /** 跑着的那份值确实来自磁盘上的当前文件版本。 */
   applied?: boolean;
-  file: { exists: boolean; mtime_ns: number; size: number };
+  file: ConfigFileFingerprint;
   state?: {
     config_path?: string;
     parse_error?: string;
+    /** 这份快照是哪一层：global 或 platform。 */
+    layer?: string;
     values?: Record<string, unknown>;
+    sources?: Record<string, ConfigSource>;
+    /** 每个键能写在哪几层。 */
+    layers?: Record<string, string[]>;
+    defaults?: ConfigLayerFile;
     paths?: Record<string, string>;
     reload?: Record<string, string>;
     notes?: Record<string, string>;
     runtime?: PlatformRuntimeFacts;
     capabilities?: PlatformCapability[];
     /** 列表项规则。由 bot 公布 —— 前端重写一遍就会和后端 coercer 漂移。 */
-    input_rules?: Record<string, PlatformInputRule>;
+    input_rules?: Record<string, ConfigInputRule>;
   };
 }
 
 /** 一个列表键的单项规则。kind 决定用哪个校验器，其余字段是该校验器的参数。 */
-export interface PlatformInputRule {
+export interface ConfigInputRule {
   kind: 'id' | 'word';
   pattern?: string;
   min?: number;
@@ -1509,6 +1532,77 @@ export interface PlatformRuntimeFacts {
     cached_groups?: number;
     history_gap_groups?: number;
   };
+}
+
+/** 某个平台的 bot 有没有换上当前这份全局文件。 */
+export interface FeatureAdoption {
+  id: string;
+  display_name: string;
+  published: boolean;
+  stale?: boolean;
+  age_sec?: number;
+  applied: boolean;
+  reason?: string;
+}
+
+/** 全局默认的生效快照。applied 要求文件解析得了、每个在跑的 bot 都换上了它。 */
+export interface FeaturesLiveState extends ConfigLiveState {
+  platforms: FeatureAdoption[];
+}
+
+export type ConsoleControlKind = 'bool' | 'tristate' | 'number' | 'percent' | 'text' | 'choice' | 'words' | 'ids';
+
+/** 一个键在控制台上的样子，外加它的路径、能写在哪几层、内置默认值。字段对着 console_schema.py 的 Control.payload()。 */
+export interface ConsoleFieldSchema {
+  kind: ConsoleControlKind;
+  label: string;
+  desc?: string;
+  unit?: string;
+  step?: number;
+  max?: number;
+  /** 界面单位和配置单位的倍数：配置按字节存、界面按 MB 填时是 1048576。 */
+  scale?: number;
+  choices?: [string, string][];
+  empty?: string;
+  placeholder?: string;
+  /** 三态没配时跟着这个键推导：它取 follows_when 里的值时算开。 */
+  follows?: string;
+  follows_when?: string[];
+  /** 三态没配、也不跟任何键时算开还是关。 */
+  unset?: boolean;
+  path: string;
+  layers: string[];
+  default: unknown;
+}
+
+export type ConsoleSpacing = 'panel' | 'loose';
+export type ConsoleFrame = 'ruled' | 'boxed';
+
+/** 布局树的节点。说明文字里用反引号标代码片段。 */
+export type ConsoleNode =
+  | { kind: 'block'; title: string; hint?: string; frame?: ConsoleFrame; children?: ConsoleNode[] }
+  | { kind: 'grid' | 'panel' | 'loose'; children: ConsoleNode[] }
+  | { kind: 'fixed'; label: string; desc?: string; children?: ConsoleNode[] }
+  | { kind: 'field'; key: string; sub?: boolean; spacing?: ConsoleSpacing; children?: ConsoleNode[] }
+  | { kind: 'desc'; text: string; indent?: boolean }
+  | { kind: 'note'; text: string }
+  | { kind: 'custom'; name: string };
+
+export interface ConsoleSectionSchema {
+  id: string;
+  label: string;
+  icon: string;
+  note: string;
+  /** 归这个分区管的配置段。空表示这一块不写配置。 */
+  paths: string[];
+  nodes: ConsoleNode[];
+}
+
+/** 一页的控制台 schema：分区布局树，加上布局里用到的每个键的控件说明。 */
+export interface ConsoleSchema {
+  version: number;
+  sections: ConsoleSectionSchema[];
+  fields: Record<string, ConsoleFieldSchema>;
 }
 
 export interface PlatformDryRunVerdict {
@@ -1585,10 +1679,14 @@ export async function getPlatforms(token: string): Promise<PlatformSummary[]> {
   return Array.isArray(json.platforms) ? json.platforms : [];
 }
 
+const platformConfigPath = (platformId: string, leaf: string): string =>
+  `/platforms/${encodeURIComponent(platformId)}/config/${leaf}`;
+const featuresConfigPath = (leaf: string): string => `/features/config/${leaf}`;
+
 // 不复用 readRawConfig：那个 helper 只留 content，会把 exists 一起丢掉，
 // 于是「还没接管」和「接管了但是空的」在界面上长得一样。
-export async function getPlatformRaw(token: string, platformId: string): Promise<PlatformRawFile> {
-  const resp = await apiFetch(`/platforms/${encodeURIComponent(platformId)}/config/raw`, { headers: authHeaders(token) });
+async function readConfigFile(path: string, token: string): Promise<ConfigRawFile> {
+  const resp = await apiFetch(path, { headers: authHeaders(token) });
   const json = await resp.json();
   return {
     content: typeof json.content === 'string' ? json.content : '',
@@ -1597,8 +1695,8 @@ export async function getPlatformRaw(token: string, platformId: string): Promise
 }
 
 /** 整份写回。后端拒绝无人消费的键（400），错误会带着那批键名抛出来。 */
-export async function updatePlatformRaw(token: string, platformId: string, content: string): Promise<PlatformSaveResult> {
-  const resp = await apiFetch(`/platforms/${encodeURIComponent(platformId)}/config/raw`, {
+async function writeConfigFile(path: string, token: string, content: string): Promise<ConfigSaveResult> {
+  const resp = await apiFetch(path, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
     body: JSON.stringify({ content }),
@@ -1607,9 +1705,42 @@ export async function updatePlatformRaw(token: string, platformId: string, conte
   return { ok: Boolean(json.ok), warnings: Array.isArray(json.warnings) ? json.warnings : [] };
 }
 
-export async function getPlatformState(token: string, platformId: string): Promise<PlatformLiveState> {
-  const resp = await apiFetch(`/platforms/${encodeURIComponent(platformId)}/config/state`, { headers: authHeaders(token) });
+async function readJson<T>(path: string, token: string): Promise<T> {
+  const resp = await apiFetch(path, { headers: authHeaders(token) });
   return resp.json();
+}
+
+export function getPlatformRaw(token: string, platformId: string): Promise<ConfigRawFile> {
+  return readConfigFile(platformConfigPath(platformId, 'raw'), token);
+}
+
+export function updatePlatformRaw(token: string, platformId: string, content: string): Promise<ConfigSaveResult> {
+  return writeConfigFile(platformConfigPath(platformId, 'raw'), token, content);
+}
+
+export function getPlatformState(token: string, platformId: string): Promise<ConfigLiveState> {
+  return readJson(platformConfigPath(platformId, 'state'), token);
+}
+
+/** 平台页的分区布局与控件说明。取自平台代码里的声明，bot 没起来也拿得到。 */
+export function getPlatformSchema(token: string, platformId: string): Promise<ConsoleSchema> {
+  return readJson(platformConfigPath(platformId, 'schema'), token);
+}
+
+export function getFeaturesRaw(token: string): Promise<ConfigRawFile> {
+  return readConfigFile(featuresConfigPath('raw'), token);
+}
+
+export function updateFeaturesRaw(token: string, content: string): Promise<ConfigSaveResult> {
+  return writeConfigFile(featuresConfigPath('raw'), token, content);
+}
+
+export function getFeaturesState(token: string): Promise<FeaturesLiveState> {
+  return readJson(featuresConfigPath('state'), token);
+}
+
+export function getFeaturesSchema(token: string): Promise<ConsoleSchema> {
+  return readJson(featuresConfigPath('schema'), token);
 }
 
 /** 试听。config 省略时用 bot 公布的生效值，省得调用方自己拼一份不一样的。 */

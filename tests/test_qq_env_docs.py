@@ -16,7 +16,9 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import _console_fixture  # noqa: E402
 from _onebot_harness import load_live_config  # noqa: E402
+from platforms.builtin import QQ_NAPCAT  # noqa: E402
 
 _DOCS = (
     "docs/TRIGGER-GUIDE.md",
@@ -116,25 +118,12 @@ def test_workspace_default_is_derived_from_the_repo(
             )
 
 
-_CONSOLE_ROOT = _ROOT / "adapters/web/frontend/src/console"
-
-
 @pytest.fixture(scope="module")
-def console_blob() -> str:
-    return "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in sorted(_CONSOLE_ROOT.rglob("*.ts*"))
-    )
-
-
-@pytest.fixture(scope="module")
-def console_controls(console_blob: str) -> set[str]:
-    # 控件种类以 FieldSpec 联合类型为准：带 key 的成员才绑定配置键，新加一种控件这里自动认得。
-    schema = (_CONSOLE_ROOT / "fieldSchema.ts").read_text(encoding="utf-8")
-    kinds = re.findall(r"\|\s*\{\s*kind:\s*'(\w+)';\s*key:\s*string\b", schema)
-    assert kinds, "fieldSchema.ts 里认不出带 key 的控件种类，扫描规则得跟着改"
-    declared = re.compile(r"kind:\s*'(?:%s)',\s*key:\s*'([a-z_]+)'" % "|".join(map(re.escape, kinds)))
-    return set(declared.findall(console_blob))
+def console_controls() -> set[str]:
+    # 控制台只按后端 schema 画字段：QQ 页和全局页摆出来的键才有控件，前端源码里读到哪个键不算数。
+    schemas = _console_fixture.current()
+    pages = (schemas["features"], schemas["platforms"][QQ_NAPCAT.id])
+    return {name for page in pages for name in page["fields"]}
 
 
 # 被七个信号开关取代的旧枚举。控制台只读它推导「这项没配时当前行为是什么」的提示，
@@ -146,15 +135,13 @@ def test_every_live_key_has_a_console_control(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, console_controls: set[str],
 ) -> None:
     live_config = load_live_config(monkeypatch, tmp_path)
-    # 只认字段声明里的控件：useLiveValue('x') 那种只读消费不是控件，按文本搜会漏报成已覆盖。
-    wired = console_controls
     missing = [
         key.name
         for key in live_config.LIVE_KEYS
-        # 能力档位的控件是 `grant_${cap.key}` 拼出来的，没有字面量；下一条断言盯它。
+        # 能力档位由权限分区按 bot 公布的清单整块画，不是字段；最后一条断言盯它。
         if not key.name.startswith("grant_")
         and key.name not in _CONSOLE_READ_ONLY_KEYS
-        and key.name not in wired
+        and key.name not in console_controls
     ]
     assert not missing, f"这些热载键在控制台上没有控件，只能手改 yaml：{missing}"
 

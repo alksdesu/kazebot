@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AccountPage } from '../console/AccountPage';
+import { AccountWorkspaceSlot } from '../console/AccountWorkspace';
 import * as api from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
@@ -41,7 +41,7 @@ describe('实例管理入口', () => {
     ['NapCat 离线', { configured: true, reachable: false }],
   ])('%s 时仍可进入其他实例，不再显示模板', async (_label, state) => {
     vi.mocked(api.getQqAccount).mockResolvedValue(state);
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     expect(await screen.findByRole('heading', { name: '多开实例' })).toBeInTheDocument();
     expect(await screen.findByRole('combobox', { name: '切换实例' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '去它的控制台' })).toHaveAttribute('href', '/i/1000002/web/?view=settings&tab=qq-account');
@@ -53,7 +53,7 @@ describe('实例管理入口', () => {
 
   it('账号读取失败不阻塞实例列表，错误保留并可重试', async () => {
     vi.mocked(api.getQqAccount).mockRejectedValueOnce(new Error('账号状态读取失败')).mockResolvedValue(account);
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     expect(await screen.findByText('账号状态读取失败')).toBeInTheDocument();
     expect(screen.getByRole('combobox', { name: '切换实例' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '刷新账号状态' }));
@@ -62,7 +62,7 @@ describe('实例管理入口', () => {
 
   it('列表读取失败不冒充未启用多开，重试后恢复', async () => {
     vi.mocked(api.getInstances).mockRejectedValueOnce(new Error('实例读取失败')).mockResolvedValue(rows);
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     expect(await screen.findByText('实例读取失败')).toBeInTheDocument();
     expect(screen.queryByText(/还没启用多开/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '刷新实例列表' }));
@@ -75,7 +75,7 @@ describe('实例管理入口', () => {
     const oldRows = deferred<api.ConsoleInstance[]>();
     vi.mocked(api.getQqAccount).mockReturnValueOnce(oldAccount.promise).mockResolvedValue({ ...account, nick: '新凭据机器人' });
     vi.mocked(api.getInstances).mockReturnValueOnce(oldRows.promise).mockResolvedValue([{ ...rows[0], label: '新凭据实例' }]);
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     act(() => useSettingsStore.setState({ adminToken: 'new-token' }));
     expect(await screen.findByText('新凭据机器人')).toBeInTheDocument();
     await act(async () => { oldAccount.resolve({ ...account, nick: '旧凭据机器人' }); oldRows.resolve(rows); });
@@ -89,7 +89,7 @@ describe('实例管理入口', () => {
     const oldRows = deferred<api.ConsoleInstance[]>();
     vi.mocked(api.getQqAccount).mockReturnValueOnce(oldAccount.promise).mockResolvedValue({ ...account, nick: '最新机器人' });
     vi.mocked(api.getInstances).mockReturnValueOnce(oldRows.promise).mockResolvedValue([{ ...rows[0], label: '最新实例' }]);
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     act(() => useSettingsStore.setState({ adminToken: 'other-token' }));
     await screen.findByText('最新机器人');
     act(() => useSettingsStore.setState({ adminToken: 'current-token' }));
@@ -102,7 +102,7 @@ describe('实例管理入口', () => {
 
   it('共享一份实例清单，归属别的实例的 QQ 只能进入其控制台', async () => {
     vi.mocked(api.getQqAccount).mockResolvedValue({ ...account, quick_login: [{ uin: '1000002', nick: '另一个QQ' }] });
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     const quick = (await screen.findByRole('heading', { name: '快速切换' })).closest('section')!;
     expect(within(quick).getByRole('link', { name: '去它的控制台' })).toHaveAttribute('href', '/i/1000002/web/?view=settings&tab=qq-account');
     expect(within(quick).queryByRole('button', { name: '切到这个号' })).not.toBeInTheDocument();
@@ -112,7 +112,7 @@ describe('实例管理入口', () => {
   it('实例清单读取失败时不能绕过账号归属检查进行快速登录', async () => {
     vi.mocked(api.getInstances).mockRejectedValue(new Error('归属未知'));
     vi.mocked(api.getQqAccount).mockResolvedValue({ ...account, quick_login: [{ uin: '1000002', nick: '另一个QQ' }] });
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     await screen.findByText('归属未知');
     expect(screen.getByRole('button', { name: '切到这个号' })).toBeDisabled();
     expect(screen.getByText(/实例归属尚未确认/)).toBeInTheDocument();
@@ -121,7 +121,7 @@ describe('实例管理入口', () => {
 
   it('实例整页跳转沿用原生离开保护，未放行时保留实例与草稿', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     const select = await screen.findByRole('combobox', { name: '切换实例' });
     fireEvent.change(screen.getByRole('textbox', { name: '新实例 QQ 号' }), { target: { value: '1000003' } });
     const link = screen.getByRole('link', { name: '去它的控制台' });
@@ -137,7 +137,7 @@ describe('实例管理入口', () => {
   it('实例链接保留另开标签能力，不提示丢弃当前页草稿', async () => {
     function Draft() { useUnsavedChanges(true); return null; }
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
-    render(<><Draft /><AccountPage /></>);
+    render(<><Draft /><AccountWorkspaceSlot /></>);
     const link = await screen.findByRole('link', { name: '去它的控制台' });
     const click = new MouseEvent('click', { bubbles: true, cancelable: true, ctrlKey: true, button: 0 });
     let preventedByComponent = true;
@@ -156,7 +156,7 @@ describe('实例创建与归档', () => {
     const pending = deferred<api.InstancePlan>();
     vi.mocked(api.createInstance).mockReturnValue(pending.promise);
     vi.spyOn(window, 'confirm').mockReturnValue(true);
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     await screen.findByRole('combobox', { name: '切换实例' });
     const number = screen.getByRole('textbox', { name: '新实例 QQ 号' });
     const label = screen.getByRole('textbox', { name: '实例备注' });
@@ -174,7 +174,7 @@ describe('实例创建与归档', () => {
 
   it.each(['0', '100', '123456789012', 'not-a-number', '1000002'])('拒绝无效或已存在的 QQ 号 %s', async value => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     await screen.findByRole('combobox', { name: '切换实例' });
     fireEvent.change(screen.getByRole('textbox', { name: '新实例 QQ 号' }), { target: { value } });
     fireEvent.click(screen.getByRole('button', { name: '建实例' }));
@@ -185,7 +185,7 @@ describe('实例创建与归档', () => {
 
   it('创建确认取消后没有写请求或清空草稿', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(false);
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     await screen.findByRole('combobox', { name: '切换实例' });
     const number = screen.getByRole('textbox', { name: '新实例 QQ 号' });
     fireEvent.change(number, { target: { value: '1000003' } });
@@ -196,7 +196,7 @@ describe('实例创建与归档', () => {
 
   it('归档要求准确输入号码，当前实例和主实例不能被删除', async () => {
     const prompt = vi.spyOn(window, 'prompt').mockReturnValue('1000099');
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     const remove = await screen.findByRole('button', { name: '停用并归档' });
     expect(screen.getAllByRole('button', { name: '停用并归档' })).toHaveLength(1);
     fireEvent.click(remove);
@@ -210,7 +210,7 @@ describe('实例创建与归档', () => {
     vi.spyOn(window, 'prompt').mockReturnValue('1000002');
     vi.mocked(api.deleteInstance).mockResolvedValue();
     vi.mocked(api.getInstanceProgress).mockResolvedValue({ uin: '1000002', lines: ['已归档'], finished: true, ok: true, detail: '' });
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     const remove = await screen.findByRole('button', { name: '停用并归档' });
     vi.useFakeTimers();
     await act(async () => fireEvent.click(remove));
@@ -227,7 +227,7 @@ describe('实例创建与归档', () => {
     const pending = deferred<api.InstancePlan>();
     vi.mocked(api.createInstance).mockReturnValue(pending.promise);
     vi.spyOn(window, 'confirm').mockReturnValue(true);
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     await screen.findByRole('combobox', { name: '切换实例' });
     fireEvent.change(screen.getByRole('textbox', { name: '新实例 QQ 号' }), { target: { value: '1000003' } });
     fireEvent.click(screen.getByRole('button', { name: '建实例' }));
@@ -244,7 +244,7 @@ describe('实例创建与归档', () => {
     vi.spyOn(window, 'prompt').mockReturnValue('1000002');
     vi.mocked(api.deleteInstance).mockResolvedValue();
     vi.mocked(api.getInstanceProgress).mockRejectedValueOnce(new Error('暂时断线')).mockResolvedValue({ uin: '1000002', lines: ['完成'], finished: true, ok: true, detail: '' });
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     const remove = await screen.findByRole('button', { name: '停用并归档' });
     vi.useFakeTimers();
     await act(async () => fireEvent.click(remove));
@@ -266,7 +266,7 @@ describe('账号操作请求归属', () => {
       ? Promise.resolve({ ...account, nick: '新机器人' })
       : oldReads++ ? pending.promise : Promise.resolve({ ...account, is_login: false }));
     vi.useFakeTimers();
-    await act(async () => render(<AccountPage />));
+    await act(async () => render(<AccountWorkspaceSlot />));
     expect(screen.getByText('未登录')).toBeInTheDocument();
     await act(async () => vi.advanceTimersByTimeAsync(3000));
     expect(api.getQqAccount).toHaveBeenCalledTimes(2);
@@ -281,7 +281,7 @@ describe('账号操作请求归属', () => {
     const pending = deferred<void>();
     vi.mocked(api.qqEnterLoginMode).mockReturnValue(pending.promise);
     vi.spyOn(window, 'confirm').mockReturnValue(true);
-    render(<AccountPage />);
+    render(<AccountWorkspaceSlot />);
     await screen.findByText('当前机器人');
     fireEvent.click(screen.getByRole('button', { name: '换个号登录' }));
     act(() => useSettingsStore.setState({ adminToken: 'new-token' }));

@@ -7,7 +7,7 @@ import { useConsoleStore, useLiveValue, useNote, useTristate } from './consoleSt
 interface BoolOptionProps {
   children?: ReactNode;
   configKey: string;
-  desc?: string;
+  desc?: ReactNode;
   fallback?: boolean;
   label: string;
 }
@@ -28,7 +28,7 @@ export const BoolOption = ({ children, configKey, desc, fallback = false, label 
   );
 };
 
-/** 三态开关：null = 没配，由 bot 按旧的 group_mode 枚举推导。界面显示当前推导值。 */
+/** 三态开关：null = 哪一层都没配，由 bot 按旧的 group_mode 枚举推导。界面显示当前推导值。 */
 export const TristateOption = ({
   configKey,
   desc,
@@ -36,7 +36,7 @@ export const TristateOption = ({
   label,
 }: {
   configKey: string;
-  desc: string;
+  desc: ReactNode;
   fallback: boolean;
   label: string;
 }) => {
@@ -46,7 +46,7 @@ export const TristateOption = ({
   return (
     <Option
       checked={effective}
-      desc={value === null ? `${desc}（当前跟随旧的触发模式）` : desc}
+      desc={value === null ? <>{desc}（当前跟随旧的触发模式）</> : desc}
       name={label}
       onChange={(checked) => setDraft(configKey, checked)}
     />
@@ -69,6 +69,7 @@ export const SubOption = ({
 
 export const NumberField = ({
   configKey,
+  fallback = 0,
   label,
   max,
   step = 1,
@@ -76,6 +77,8 @@ export const NumberField = ({
   scale = 1,
 }: {
   configKey: string;
+  /** 生效值里没有这一项时显示的数，取 schema 里的内置默认。 */
+  fallback?: number;
   label: string;
   // 后端也会夹范围，但界面上放行再被悄悄改回去，用的人会以为没保存成功。
   max?: number;
@@ -85,7 +88,7 @@ export const NumberField = ({
   scale?: number;
 }) => {
   const setDraft = useConsoleStore((state) => state.setDraft);
-  const stored = useLiveValue<number>(configKey, 0);
+  const stored = useLiveValue<number>(configKey, fallback);
   return (
     <Field label={label}>
       <Input

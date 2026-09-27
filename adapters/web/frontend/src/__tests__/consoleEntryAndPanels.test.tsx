@@ -13,6 +13,7 @@ import { useSettingsSelectionStore } from '../store/settingsSelectionStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { locationForLegacyDomain, tabForLegacyDomain, useViewStore } from '../store/viewStore';
 import type { AdminApproval } from '../api/supervisorClient';
+import { clearConsoleSchemas, seedConsoleSchemas } from './consoleSchemaFixture';
 
 const conversation: ConversationMeta = {
   id: 'conv-1',
@@ -41,10 +42,12 @@ describe('QQ 分区入口', () => {
   beforeEach(() => {
     window.history.replaceState(null, '', '/');
     useViewStore.setState({ viewMode: 'chat', activeSettingsTab: 'general' });
+    seedConsoleSchemas();
   });
 
   afterEach(() => {
     cleanup();
+    clearConsoleSchemas();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
@@ -65,6 +68,25 @@ describe('QQ 分区入口', () => {
 
     expect(useViewStore.getState().activeSettingsTab).toBe('platform-qq');
     expect(useViewStore.getState().activeSettingsSection).toBe('permissions');
+  });
+
+  it('折叠分区里的块标题和字段名也搜得到，只列装着它的那一块', () => {
+    render(<SettingsSidebar />);
+
+    fireEvent.change(screen.getByLabelText('搜索设置'), { target: { value: '冷却' } });
+
+    expect(screen.getByRole('button', { name: 'QQ · NapCat：触发时机' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'QQ · NapCat：信道' })).toBeNull();
+  });
+
+  it('布局还没拉到时平台页本身照样搜得到，只是列不出分区', () => {
+    clearConsoleSchemas();
+    render(<SettingsSidebar />);
+
+    fireEvent.change(screen.getByLabelText('搜索设置'), { target: { value: 'napcat' } });
+
+    expect(screen.getByRole('button', { name: 'QQ · NapCat' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^QQ · NapCat：/ })).toBeNull();
   });
 
   it('分组标题把机器人、模型、引擎和平台分开', () => {

@@ -140,7 +140,7 @@ const CHECKBOX = 'h-[var(--duties-checkbox-size)] w-[var(--duties-checkbox-size)
 interface OptionProps {
   checked: boolean;
   children?: ReactNode;
-  desc?: string;
+  desc?: ReactNode;
   name: string;
   onChange: (checked: boolean) => void;
 }
@@ -169,7 +169,7 @@ export const Option = ({ checked, children, desc, name, onChange }: OptionProps)
  *  别拿勾不动的复选框冒充：整块会淡成灰的，看着不可用，其实里面的输入框改得动。 */
 export const Fixed = ({ children, desc, name }: {
   children?: ReactNode;
-  desc?: string;
+  desc?: ReactNode;
   name: string;
 }) => (
   <div className="bg-[var(--duties-surface)] px-4 py-3.5">

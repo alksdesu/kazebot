@@ -11,7 +11,11 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+_TESTS = Path(__file__).resolve().parent
+if str(_TESTS) not in sys.path:
+    sys.path.insert(0, str(_TESTS))
 
+import _console_fixture  # noqa: E402
 from adapters._shared import capability, features, trigger_policy  # noqa: E402
 from adapters._shared import console_schema as cs  # noqa: E402
 from adapters._shared.features_layout import (  # noqa: E402
@@ -399,3 +403,17 @@ class TestQQPage:
             "workspace", "groupWarning", "audition", "adminWarning", "capabilities",
             "queueFacts", "historyFacts", "bridgeFacts", "environment", "restartEngine",
         }
+
+
+class TestFrontendSnapshot:
+    def test_the_frontend_snapshot_matches_the_declarations(self) -> None:
+        """前端测试按这份快照画页面，对不上的话前端测的是一个已经不存在的界面。"""
+        stored = json.loads(_console_fixture.FIXTURE.read_text(encoding="utf-8"))
+
+        if stored != _console_fixture.current():
+            pytest.fail("控制台 schema 变了：跑 python tests/_console_fixture.py 重新生成前端快照")
+
+    def test_the_snapshot_covers_every_platform_with_a_console(self) -> None:
+        stored = json.loads(_console_fixture.FIXTURE.read_text(encoding="utf-8"))
+
+        assert set(stored["platforms"]) == {QQ_NAPCAT.id}

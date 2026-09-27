@@ -1,6 +1,7 @@
-// 平台页：固定状态栏 + 连接卡 + 折叠分区。分区展开状态只存在这台浏览器里。
+// 平台页：固定状态栏 + 连接卡 + 折叠分区。分区和字段来自后端 schema，展开状态只存在这台浏览器里。
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 
+import type { ConsoleSchema, ConsoleSectionSchema } from '../api/supervisorClient';
 import {
   Button,
   Empty,
@@ -13,23 +14,14 @@ import { useSettingsStore } from '../store/settingsStore';
 import { scopedKey } from '../store/storageKey';
 import { useViewStore } from '../store/viewStore';
 import type { PlatformDescriptor } from '../platforms/registry';
+import { platformScope } from './configScope';
 import { useConsoleStore, useSectionPending } from './consoleStore';
+import { SchemaFields } from './FieldRenderer';
 import { PlatformProvider } from './platformContext';
+import { useConsoleSchema, useSchemaStore } from './schemaStore';
 import { Section } from './Section';
+import { PartsProvider, useSectionParts, type PageParts } from './sectionParts';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
-
-export interface PlatformSection {
-  /** 分区 id，同时是 ?section= 的取值和记住展开状态的键。 */
-  id: string;
-  label: string;
-  icon: string;
-  /** 这一块讲的是什么。展开后摆在分区正文顶上。 */
-  note: string;
-  /** 归这个分区管的配置段，对着 bot 公布的 paths 比。空表示不写平台配置。 */
-  paths: readonly string[];
-  Summary: () => JSX.Element;
-  Body: () => JSX.Element;
-}
 
 interface BarState {
   tone: PipTone;
@@ -95,13 +87,15 @@ function writeOpenMap(storeKey: string, value: OpenMap): void {
   }
 }
 
-const SectionEntry = ({ deepLinked, onToggle, open, section }: {
+const SectionEntry = ({ deepLinked, fields, onToggle, open, section }: {
   deepLinked: boolean;
+  fields: ConsoleSchema['fields'];
   onToggle: (id: string) => void;
   open: boolean;
-  section: PlatformSection;
+  section: ConsoleSectionSchema;
 }) => {
   const pending = useSectionPending(section.paths);
+  const Summary = useSectionParts(section.id)?.Summary;
   const anchor = useRef<HTMLDivElement>(null);
 
   // 深链进来要滚到这一块。等展开渲染完再滚，否则量到的是收起时的位置。
@@ -119,13 +113,13 @@ const SectionEntry = ({ deepLinked, onToggle, open, section }: {
         onToggle={() => onToggle(section.id)}
         open={open}
         pending={pending}
-        summary={<section.Summary />}
+        summary={Summary ? <Summary /> : null}
         title={section.label}
       >
         <p className="mb-4 max-w-[var(--duties-prose-max-width)] text-xs leading-5 text-[var(--duties-secondary)]">
           {section.note}
         </p>
-        <section.Body />
+        <SchemaFields fields={fields} nodes={section.nodes} sectionId={section.id} />
       </Section>
     </div>
   );
@@ -135,13 +129,17 @@ interface PlatformPageProps {
   /** 状态栏之下、分区之上那一张卡。连接是每个平台都有的一件事，不进折叠。 */
   connection: ReactNode;
   note: string;
+  /** 分区里前端自己画的部分：摘要和编不成字段的块。 */
+  parts: PageParts;
   platform: PlatformDescriptor;
-  sections: readonly PlatformSection[];
 }
 
-export const PlatformPage = ({ connection, note, platform, sections }: PlatformPageProps) => {
+const PlatformPageBody = ({ connection, note, platform }: Omit<PlatformPageProps, 'parts'>) => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const { live, loading, error, notice, refresh, draft } = useConsoleStore();
+  const scope = platformScope(platform.id);
+  const { schema, error: schemaError } = useConsoleSchema(scope);
+  const loadSchema = useSchemaStore((state) => state.load);
   const requestedSection = useViewStore((state) => state.activeSettingsSection);
   const confirmDiscard = useUnsavedChanges(
     Object.keys(draft).length > 0,
@@ -168,8 +166,10 @@ export const PlatformPage = ({ connection, note, platform, sections }: PlatformP
 
   // 各设置页之间没有共同的父组件替它们拉，只能每页各自拉一次。
   useEffect(() => {
-    if (adminToken) void refresh(adminToken);
-  }, [adminToken, refresh]);
+    if (!adminToken) return;
+    void refresh(adminToken);
+    void loadSchema(adminToken, scope);
+  }, [adminToken, loadSchema, refresh, scope]);
 
   const published = Boolean(live?.published);
   const body = loading && !live ? <Empty>正在读取配置…</Empty>
@@ -178,6 +178,9 @@ export const PlatformPage = ({ connection, note, platform, sections }: PlatformP
         {live?.reason || `bot 还没上报生效配置。在服务器上启动 ${platform.displayName} 的适配器进程（bot.py）之后，这里会显示它实际在用的值。`}
       </Empty>
     ) : null;
+  const layout = schemaError ? <ErrorText>{schemaError}</ErrorText>
+    : !schema && adminToken ? <Empty>正在读取控制台布局…</Empty>
+      : null;
 
   return (
     <PageShell
@@ -194,15 +197,17 @@ export const PlatformPage = ({ connection, note, platform, sections }: PlatformP
           平台配置解析失败：{parseError}。bot 仍在用上一份有效配置。请先修复原文件语法；本页不会覆盖损坏文件。
         </ErrorText>
       )}
-      <PlatformProvider platform={platform}>
-        {connection}
-        {body}
+      {connection}
+      {body}
+      {layout}
+      {schema && (
         <div className="border-t border-[var(--duties-border)]">
-          {sections.map((section) => (
+          {schema.sections.map((section) => (
             // 不写平台配置的分区（账号与连接）在 bot 没上报时照样能用。
             (published || !section.paths.length) && (
               <SectionEntry
                 deepLinked={requestedSection === section.id}
+                fields={schema.fields}
                 key={section.id}
                 onToggle={toggle}
                 open={Boolean(openMap[section.id])}
@@ -211,9 +216,18 @@ export const PlatformPage = ({ connection, note, platform, sections }: PlatformP
             )
           ))}
         </div>
-      </PlatformProvider>
+      )}
     </PageShell>
   );
 };
+
+// 平台和配置作用域套在最外层：状态栏、应用按钮读的草稿必须和分区里写的是同一份。
+export const PlatformPage = ({ parts, platform, ...rest }: PlatformPageProps) => (
+  <PlatformProvider platform={platform}>
+    <PartsProvider parts={parts}>
+      <PlatformPageBody platform={platform} {...rest} />
+    </PartsProvider>
+  </PlatformProvider>
+);
 
 export { barState, PlatformStatusBar };

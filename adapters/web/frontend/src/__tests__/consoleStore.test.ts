@@ -1,10 +1,23 @@
-// QQ 控制台草稿态。两个键空间必须对得上：界面按 live_config 的键名读写，
-// 写 yaml 时才用 /qq/state 公布的 paths 转成点分路径。
-import { beforeEach, describe, expect, it } from 'vitest';
+// 控制台草稿态。两个键空间必须对得上：界面按 live_config 的键名读写，
+// 写 yaml 时才用 state 接口公布的 paths 转成点分路径。
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { PlatformInputRule } from '../api/supervisorClient';
+import type { ConfigInputRule } from '../api/supervisorClient';
+import { FEATURES_SCOPE } from '../console/configScope';
 import { barState } from '../console/PlatformPage';
-import { addWord, asWordList, effectiveValues, mergeDraft, platformConsoleStore, readInputRule, readTristate, setByPath, useConsoleStore } from '../console/consoleStore';
+import {
+  addWord,
+  asWordList,
+  configStore,
+  countDraftFor,
+  effectiveValues,
+  mergeDraft,
+  platformConsoleStore,
+  readInputRule,
+  readTristate,
+  setByPath,
+  useConsoleStore,
+} from '../console/consoleStore';
 
 const PATHS: Record<string, string> = {
   signal_at: 'trigger.signals.at',
@@ -15,7 +28,7 @@ const PATHS: Record<string, string> = {
 };
 
 // bot 公布的那份词表规则，逐字照抄 live_config 的 WORD_INPUT_RULE。
-const WORD_RULE: PlatformInputRule = { kind: 'word', trim: true };
+const WORD_RULE: ConfigInputRule = { kind: 'word', trim: true };
 
 const dumpedWords = (words: string[]): string[] =>
   mergeDraft('', { keyword_words: words }, PATHS)
@@ -36,6 +49,27 @@ const seedLive = (values: Record<string, unknown>) => {
   });
 };
 
+const json = (body: unknown, status = 200): Response =>
+  new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+
+/** 假的配置接口：记下每次 PUT 的原文，读原文时还回最近写进去的那份，状态按 applied 回。 */
+const serveConfig = (values: Record<string, unknown>, { applied = true, raw = 'version: 1\n' } = {}): string[] => {
+  const sent: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.method === 'PUT') {
+      sent.push(String(JSON.parse(String(init.body)).content));
+      return json({ ok: true, warnings: [] });
+    }
+    if (String(input).endsWith('/config/state')) {
+      return json({ published: true, applied, file: {}, state: { values, paths: PATHS }, platforms: [] });
+    }
+    return json({ content: sent.length ? sent[sent.length - 1] : raw, exists: true });
+  }));
+  return sent;
+};
+
+afterEach(() => { vi.unstubAllGlobals(); });
+
 describe('setByPath', () => {
   it('creates the intermediate levels', () => {
     const doc: Record<string, unknown> = {};
@@ -53,13 +87,30 @@ describe('setByPath', () => {
     expect(doc).toEqual({ trigger: { signals: { at: true, name: true }, group_mode: 'all' } });
   });
 
-  it('deletes the key when the value is undefined', () => {
-    // 删键 = 回落默认值，和写 false 是两种意思。
+  it('deletes the key when the value is undefined and folds the sections it emptied', () => {
+    // 删键 = 交给下一层，和写 false 是两种意思。键路径互不嵌套，删空的段只是容器，收掉不改任何值。
     const doc: Record<string, unknown> = { trigger: { signals: { at: false } } };
 
     setByPath(doc, 'trigger.signals.at', undefined);
 
-    expect(doc).toEqual({ trigger: { signals: {} } });
+    expect(doc).toEqual({});
+  });
+
+  it('stops folding at the first section that still holds something', () => {
+    const doc: Record<string, unknown> = { version: 1, trigger: { signals: { at: false }, group_mode: 'all' } };
+
+    setByPath(doc, 'trigger.signals.at', undefined);
+
+    expect(doc).toEqual({ version: 1, trigger: { group_mode: 'all' } });
+  });
+
+  it('deleting a key the file never had changes nothing', () => {
+    const doc: Record<string, unknown> = { trigger: 'nonsense', channels: {} };
+
+    setByPath(doc, 'trigger.signals.at', undefined);
+    setByPath(doc, 'channels.allowed_groups', undefined);
+
+    expect(doc).toEqual({ trigger: 'nonsense', channels: {} });
   });
 
   it('refuses to overwrite a non-object on the way down', () => {
@@ -128,6 +179,15 @@ describe('mergeDraft', () => {
     expect(dumpedWords(['早安', 'hello', '咪啪', 'gpt-4'])).toEqual([
       '早安', 'hello', '咪啪', 'gpt-4',
     ]);
+  });
+
+  it('a null deletes the line so the next layer takes over', () => {
+    const raw = ['version: 1', 'trigger:', '  signals:', '    at: false', '    name: true', ''].join('\n');
+
+    const out = mergeDraft(raw, { signal_at: null }, PATHS);
+
+    expect(out).not.toContain('at:');
+    expect(out).toContain('    name: true');
   });
 });
 
@@ -329,22 +389,33 @@ describe('the draft counter', () => {
     expect(platformConsoleStore('qq').getState().draft).toEqual({});
   });
 
+  it('discard with names drops only those keys', () => {
+    seedLive({ signal_name: false, signal_at: true });
+    platformConsoleStore('qq').getState().setDraft('signal_name', true);
+    platformConsoleStore('qq').getState().setDraft('signal_at', false);
+
+    platformConsoleStore('qq').getState().discard(['signal_at']);
+
+    expect(platformConsoleStore('qq').getState().draft).toEqual({ signal_name: true });
+  });
+
+  it('counts only the staged keys among those a block owns', () => {
+    seedLive({ signal_name: false, signal_at: true });
+    platformConsoleStore('qq').getState().setDraft('signal_name', true);
+    platformConsoleStore('qq').getState().setDraft('signal_at', false);
+
+    const state = platformConsoleStore('qq').getState();
+    expect(countDraftFor(state, ['signal_at', 'cooldown_group_sec'])).toBe(1);
+    expect(countDraftFor(state, ['cooldown_group_sec'])).toBe(0);
+  });
+
   it('apply is a no-op with nothing staged', async () => {
     seedLive({ signal_name: false });
-    let fetched = false;
-    const original = globalThis.fetch;
-    globalThis.fetch = (async () => {
-      fetched = true;
-      return new Response('{}');
-    }) as typeof fetch;
+    serveConfig({});
 
-    try {
-      await platformConsoleStore('qq').getState().apply('token');
-    } finally {
-      globalThis.fetch = original;
-    }
+    await platformConsoleStore('qq').getState().apply('token');
 
-    expect(fetched).toBe(false);
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
 
@@ -353,62 +424,106 @@ describe('apply', () => {
     platformConsoleStore('qq').setState({ draft: {}, live: null, raw: '', notice: '', error: '' });
   });
 
-  it('sends the merged document and clears the draft', async () => {
+  it('sends the merged document, clears the draft and waits for the bot to confirm', async () => {
     seedLive({ signal_name: false });
-    platformConsoleStore('qq').setState({ raw: 'version: 1\n' });
     platformConsoleStore('qq').getState().setDraft('signal_name', true);
-    const sent: string[] = [];
-    const original = globalThis.fetch;
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input);
-      if (init?.method === 'PUT') {
-        sent.push(String(JSON.parse(String(init.body)).content));
-        return new Response(JSON.stringify({ ok: true, warnings: [] }), {
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-      if (url.includes('/qq/state')) {
-        return new Response(JSON.stringify({ published: true, applied: true, file: {}, state: { values: { signal_name: true }, paths: PATHS } }), {
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-      return new Response(JSON.stringify({ content: sent[0] || 'version: 1\n', exists: true }), {
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }) as typeof fetch;
+    const sent = serveConfig({ signal_name: true });
 
-    try {
-      await platformConsoleStore('qq').getState().apply('token');
-    } finally {
-      globalThis.fetch = original;
-    }
+    await platformConsoleStore('qq').getState().apply('token');
 
     expect(sent).toHaveLength(1);
     expect(sent[0]).toContain('version: 1');
     expect(sent[0]).toContain('    name: true');
-    expect(platformConsoleStore('qq').getState().draft).toEqual({});
+    const state = platformConsoleStore('qq').getState();
+    expect(state.draft).toEqual({});
+    // bot 第一轮就认账，不该冒出「没在 3 秒内确认」。
+    expect(state.notice).toBe('');
+    expect(state.live?.applied).toBe(true);
   });
 
   it('keeps the draft when the save fails', async () => {
     // 丢掉草稿等于把运营者刚做的改动静默吞掉。
     seedLive({ signal_name: false });
     platformConsoleStore('qq').getState().setDraft('signal_name', true);
-    const original = globalThis.fetch;
-    globalThis.fetch = (async () => new Response(JSON.stringify({ detail: '无人消费的配置项' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    })) as typeof fetch;
+    vi.stubGlobal('fetch', vi.fn(async () => json({ detail: '无人消费的配置项' }, 400)));
 
-    try {
-      await platformConsoleStore('qq').getState().apply('token');
-    } finally {
-      globalThis.fetch = original;
-    }
+    await platformConsoleStore('qq').getState().apply('token');
 
     const state = platformConsoleStore('qq').getState();
     expect(state.draft).toEqual({ signal_name: true });
     expect(state.error).toContain('无人消费的配置项');
     expect(state.saving).toBe(false);
+  });
+});
+
+describe('save', () => {
+  beforeEach(() => {
+    platformConsoleStore('qq').setState({ draft: {}, live: null, raw: '', notice: '', error: '' });
+    configStore(FEATURES_SCOPE).setState({ draft: {}, live: null, raw: '', notice: '', error: '' });
+  });
+
+  it('writes only the keys it was given and leaves the rest staged', async () => {
+    seedLive({ signal_name: false, signal_at: true });
+    platformConsoleStore('qq').getState().setDraft('signal_name', true);
+    platformConsoleStore('qq').getState().setDraft('signal_at', false);
+    const sent = serveConfig({ signal_name: true, signal_at: true });
+
+    const outcome = await platformConsoleStore('qq').getState().save('token', ['signal_name']);
+
+    expect(outcome).toEqual({ ok: true, message: '' });
+    expect(sent[0]).toContain('    name: true');
+    expect(sent[0]).not.toContain('at:');
+    const state = platformConsoleStore('qq').getState();
+    expect(state.draft).toEqual({ signal_at: false });
+    // 结果留给区块自己显示，页面级的提示不动。
+    expect(state.notice).toBe('');
+    expect(state.error).toBe('');
+  });
+
+  it('does not touch the server when none of its keys is staged', async () => {
+    seedLive({ signal_name: false });
+    platformConsoleStore('qq').getState().setDraft('signal_name', true);
+    serveConfig({});
+
+    expect(await platformConsoleStore('qq').getState().save('token', ['signal_at'])).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('hands a failure back to the caller and keeps the draft', async () => {
+    seedLive({ signal_name: false });
+    platformConsoleStore('qq').getState().setDraft('signal_name', true);
+    vi.stubGlobal('fetch', vi.fn(async () => json({ detail: '只能写在平台配置里：trigger.signals.name' }, 400)));
+
+    const outcome = await platformConsoleStore('qq').getState().save('token', ['signal_name']);
+
+    expect(outcome?.ok).toBe(false);
+    expect(outcome?.message).toContain('只能写在平台配置里');
+    expect(platformConsoleStore('qq').getState().draft).toEqual({ signal_name: true });
+    expect(platformConsoleStore('qq').getState().error).toBe('');
+  });
+
+  it('the global file goes through /features and reports in its own words', async () => {
+    configStore(FEATURES_SCOPE).setState({
+      live: { published: true, applied: true, file: { exists: true, mtime_ns: 1, size: 1 }, state: { values: { signal_name: false }, paths: PATHS } },
+      draft: {},
+    });
+    configStore(FEATURES_SCOPE).getState().setDraft('signal_name', true);
+    const requests: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(`${init?.method || 'GET'} ${String(input)}`);
+      if (init?.method === 'PUT') return json({ ok: true, warnings: [] });
+      if (String(input).endsWith('/config/state')) {
+        return json({ published: true, applied: true, file: {}, state: { values: {}, paths: PATHS }, platforms: [] });
+      }
+      // 别人刚改过全局文件：写回之后读到的不是自己写的那份。
+      return json({ content: 'version: 2\n', exists: true });
+    }));
+
+    const outcome = await configStore(FEATURES_SCOPE).getState().save('token', ['signal_name']);
+
+    expect(outcome).toEqual({ ok: true, message: '全局文件在保存之后又被改过，请刷新核对当前内容。' });
+    expect(requests.some((line) => line.startsWith('PUT ') && line.endsWith('/features/config/raw'))).toBe(true);
+    expect(requests.filter((line) => line.includes('/platforms/'))).toEqual([]);
   });
 });
 

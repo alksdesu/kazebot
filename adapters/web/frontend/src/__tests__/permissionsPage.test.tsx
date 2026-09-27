@@ -3,8 +3,8 @@
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import type { PlatformCapability, PlatformInputRule } from '../api/supervisorClient';
-import { PermissionsPage } from '../console/PermissionsPage';
+import type { PlatformCapability, ConfigInputRule } from '../api/supervisorClient';
+import { QqSectionBody } from './consoleSchemaFixture';
 import { platformConsoleStore } from '../console/consoleStore';
 
 const PATHS: Record<string, string> = {
@@ -32,13 +32,13 @@ const SCOPED_CAP: PlatformCapability = {
 };
 
 // bot 公布的号码规则，逐字照抄 live_config 的 ID_INPUT_RULE。
-const ID_RULE: PlatformInputRule = { kind: 'id', pattern: '^[0-9]+$', min: 1, max: 9007199254740991 };
+const ID_RULE: ConfigInputRule = { kind: 'id', pattern: '^[0-9]+$', min: 1, max: 9007199254740991 };
 
 // inputRules 传 null = 旧 bot，整个 input_rules 字段都不在响应里。
 const seed = (
   capabilities: PlatformCapability[] | undefined,
   values: Record<string, unknown> = { admin_users: [10001] },
-  inputRules: Record<string, PlatformInputRule> | null = { admin_users: ID_RULE },
+  inputRules: Record<string, ConfigInputRule> | null = { admin_users: ID_RULE },
 ) => {
   platformConsoleStore('qq').setState({
     live: {
@@ -52,6 +52,9 @@ const seed = (
 };
 
 const rowFor = (name: string) => screen.getByText(name).closest('li') as HTMLElement;
+
+// 平台页里展开「权限」分区看到的那一块：布局来自后端 schema，管理员警告和能力清单是 QQ 页自己画的。
+const PermissionsPage = () => <QqSectionBody id="permissions" />;
 
 beforeEach(() => {
   platformConsoleStore('qq').setState({ draft: {} });

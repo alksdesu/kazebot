@@ -1,32 +1,45 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
+import { searchableSections, type SearchableSection } from '../../console/schemaSearch';
+import { useSchemaStore } from '../../console/schemaStore';
 import { useSettingsStore } from '../../store/settingsStore';
 import { WorkspaceNav } from '../../features/WorkspaceNav';
 import { useViewStore } from '../../store/viewStore';
 import { Icon } from '../common';
-import { getSettingsTab, SETTINGS_GROUP_LABELS, SETTINGS_GROUP_ORDER, settingsTabs, type SettingsTabDefinition, type SettingsTabSection } from './settingsTabs';
+import { getSettingsTab, SETTINGS_GROUP_LABELS, SETTINGS_GROUP_ORDER, settingsTabs, type SettingsTabDefinition } from './settingsTabs';
 
 interface VisibleTab {
   tab: SettingsTabDefinition;
   /** 搜索命中的分区。不搜索时为空 —— 平铺九个分区会把侧栏挤满。 */
-  sections: SettingsTabSection[];
+  sections: readonly SearchableSection[];
 }
 
 export const SettingsSidebar = () => {
   const isConnected = useSettingsStore(state => state.isConnected);
+  const token = useSettingsStore(state => state.adminToken);
+  const schemas = useSchemaStore(state => state.schemas);
+  const loadSchema = useSchemaStore(state => state.load);
   const { activeSettingsTab, closeSettings, setSettingsTab, viewMode } = useViewStore();
   const [search, setSearch] = useState('');
   const selectedTab = getSettingsTab(activeSettingsTab).id;
+  // 分区和字段名只在 schema 里，一登录就把各页的拉下来，没打开过的页也搜得到。
+  useEffect(() => {
+    if (!token) return;
+    for (const tab of settingsTabs) {
+      if (tab.configScope) void loadSchema(token, tab.configScope);
+    }
+  }, [loadSchema, token]);
   const visible = useMemo<VisibleTab[]>(() => {
     const query = search.trim().toLocaleLowerCase();
     return settingsTabs.flatMap(tab => {
-      const sections = query
-        ? (tab.sections || []).filter(section => `${section.label} ${section.id}`.toLocaleLowerCase().includes(query))
+      const schema = tab.configScope ? schemas[tab.configScope.id] : undefined;
+      const sections = query && schema
+        ? searchableSections(schema).filter(section => section.text.includes(query))
         : [];
       const tabHit = `${tab.label} ${SETTINGS_GROUP_LABELS[tab.group || 'basics']} ${tab.id}`.toLocaleLowerCase().includes(query);
       return tabHit || sections.length ? [{ tab, sections }] : [];
     });
-  }, [search]);
+  }, [schemas, search]);
   return <div className="flex h-full min-h-0 flex-col">
     <div className="border-b border-[var(--duties-border)] p-4">
       <button className="mb-3 inline-flex min-h-10 items-center gap-2 text-sm text-[var(--duties-secondary)] hover:text-[var(--duties-text)]" onClick={closeSettings} type="button"><Icon name="arrow_back" size={18} />返回聊天</button>

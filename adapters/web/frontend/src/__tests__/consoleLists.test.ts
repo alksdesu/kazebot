@@ -1,12 +1,12 @@
 // 号码表与本地备注。备注绝不能混进 qq.yaml —— 群名往往带真实身份。
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import type { PlatformInputRule } from '../api/supervisorClient';
+import type { ConfigInputRule } from '../api/supervisorClient';
 import { readAliases, writeAlias } from '../console/aliases';
 import { addId, addWord, idIsValid, mergeDraft, platformConsoleStore } from '../console/consoleStore';
 
 // bot 公布的那份规则，逐字照抄 live_config 的 ID_INPUT_RULE。
-const ID_RULE: PlatformInputRule = { kind: 'id', pattern: '^[0-9]+$', min: 1, max: 9007199254740991 };
+const ID_RULE: ConfigInputRule = { kind: 'id', pattern: '^[0-9]+$', min: 1, max: 9007199254740991 };
 
 describe('addId', () => {
   it('appends a numeric id', () => {
@@ -66,21 +66,21 @@ describe('the published rule is the only rule', () => {
   });
 
   it('honours the max the bot published', () => {
-    const rule: PlatformInputRule = { ...ID_RULE, max: 999 };
+    const rule: ConfigInputRule = { ...ID_RULE, max: 999 };
 
     expect(addId([], '999', rule)).toEqual([999]);
     expect(addId([], '1000', rule)).toEqual([]);
   });
 
   it('honours the min the bot published', () => {
-    const rule: PlatformInputRule = { ...ID_RULE, min: 5 };
+    const rule: ConfigInputRule = { ...ID_RULE, min: 5 };
 
     expect(addId([], '4', rule)).toEqual([]);
     expect(addId([], '5', rule)).toEqual([5]);
   });
 
   it('honours the pattern the bot published', () => {
-    const rule: PlatformInputRule = { kind: 'id', pattern: '^1[0-9]+$', min: 1, max: 999 };
+    const rule: ConfigInputRule = { kind: 'id', pattern: '^1[0-9]+$', min: 1, max: 999 };
 
     expect(addId([], '222', rule)).toEqual([]);
     expect(addId([], '123', rule)).toEqual([123]);
@@ -99,7 +99,7 @@ describe('the published rule is the only rule', () => {
   });
 
   it('still refuses a number that cannot survive JSON even if the bot allows it', () => {
-    const rule: PlatformInputRule = { ...ID_RULE, max: Number.MAX_VALUE };
+    const rule: ConfigInputRule = { ...ID_RULE, max: Number.MAX_VALUE };
 
     expect(addId([], '99999999999999999999', rule)).toEqual([]);
   });

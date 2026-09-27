@@ -993,13 +993,13 @@ class TestPublishedInputRules:
         source = (
             _ROOT / "adapters" / "web" / "frontend" / "src" / "api" / "supervisorClient.ts"
         ).read_text(encoding="utf-8")
-        body = re.search(r"export interface PlatformInputRule \{(.*?)\n\}", source, re.S)
-        assert body is not None, "supervisorClient.ts 里找不到 PlatformInputRule 接口"
+        body = re.search(r"export interface ConfigInputRule \{(.*?)\n\}", source, re.S)
+        assert body is not None, "supervisorClient.ts 里找不到 ConfigInputRule 接口"
         declared = set(re.findall(r"^\s*(\w+)\??:", body.group(1), re.M))
 
         published = {field for rule in live.state_payload()["input_rules"].values() for field in rule}
 
-        assert published <= declared, f"前端 PlatformInputRule 没声明这些字段: {sorted(published - declared)}"
+        assert published <= declared, f"前端 ConfigInputRule 没声明这些字段: {sorted(published - declared)}"
 
 
 class TestNoStaleConstantsLeftBehind:

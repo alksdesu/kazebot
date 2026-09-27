@@ -1,13 +1,15 @@
 // 没有开关的一组配置，曾经拿勾不动的复选框当标题：整块淡成灰的，
 // 看着像被禁用，其实里面的输入框改得动 —— 于是没人去改。
 import { cleanup, render, screen, within } from '@testing-library/react';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { Fixed, Option } from '../components/settings/pages/settingsControls';
 
-const CONSOLE_PAGES = ['PersonaPage', 'RuntimePage', 'StickersPage', 'TimingPage'];
+const CONSOLE_DIR = join(__dirname, '..', 'console');
+// 按目录扫：分区的字段来自后端 schema，前端文件会拆会并，写死的名单跟不上。
+const CONSOLE_SOURCES = readdirSync(CONSOLE_DIR).filter((name) => name.endsWith('.tsx'));
 
 afterEach(cleanup);
 
@@ -56,8 +58,12 @@ describe('普通开关', () => {
 });
 
 describe('控制台各页', () => {
-  it.each(CONSOLE_PAGES)('%s 里不再有勾不动的伪开关', (page) => {
-    const source = readFileSync(join(__dirname, '..', 'console', `${page}.tsx`), 'utf-8');
+  it('扫的确实是控制台的源码', () => {
+    expect(CONSOLE_SOURCES).toEqual(expect.arrayContaining(['FieldRenderer.tsx', 'fields.tsx', 'PersonaPage.tsx']));
+  });
+
+  it.each(CONSOLE_SOURCES)('%s 里不再有勾不动的伪开关', (file) => {
+    const source = readFileSync(join(CONSOLE_DIR, file), 'utf-8');
 
     expect(source).not.toContain('checked disabled');
     expect(source).not.toContain('onChange={() => undefined}');

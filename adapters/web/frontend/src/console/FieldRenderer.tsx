@@ -1,72 +1,77 @@
-// 按声明渲染分区正文。每个节点对着一个既有控件，这里只做分派，不藏任何业务规则。
-import { Fragment } from 'react';
+// 按后端 schema 渲染分区正文。每个节点对着一个既有控件，这里只做分派，不藏任何业务规则。
+import { Fragment, type ReactNode } from 'react';
 
+import type { ConsoleFieldSchema, ConsoleNode } from '../api/supervisorClient';
 import { Block, Desc, Fixed, Footnote, Grid, Loose, Panel } from './components';
 import { useLiveValue } from './consoleStore';
-import { sectionComponent, type FieldSpec } from './fieldSchema';
 import { BoolOption, ChoiceField, NumberField, PercentField, SubOption, TextField, TristateOption } from './fields';
 import { IdList } from './IdList';
+import { RichText } from './RichText';
+import { useSectionParts } from './sectionParts';
 import { WordList } from './WordList';
 
+export type SchemaFieldMap = Readonly<Record<string, ConsoleFieldSchema>>;
+
 interface Context {
-  platformId: string;
+  fields: SchemaFieldMap;
   sectionId: string;
 }
 
-const Children = ({ context, specs }: { context: Context; specs?: FieldSpec[] }) => (
-  <>{(specs || []).map((spec, index) => <FieldNode context={context} key={index} spec={spec} />)}</>
+type FieldNodeSpec = Extract<ConsoleNode, { kind: 'field' }>;
+
+const rich = (text: string | undefined): ReactNode => (text ? <RichText text={text} /> : undefined);
+
+const Children = ({ context, nodes }: { context: Context; nodes?: readonly ConsoleNode[] }) => (
+  <>{(nodes || []).map((node, index) => <SchemaNode context={context} key={index} node={node} />)}</>
 );
 
-/** 默认值跟着另一个键走的三态。读那个键要占一次 hook，所以单独一层组件。 */
-const DerivedTristate = ({ from, spec, when }: {
-  from: string;
-  spec: Extract<FieldSpec, { kind: 'tristate' }>;
-  when: (value: unknown) => boolean;
-}) => (
-  <TristateOption
-    configKey={spec.key}
-    desc={spec.desc}
-    fallback={when(useLiveValue<unknown>(from, ''))}
-    label={spec.label}
-  />
-);
+/** 没配时跟着另一个键推导的三态。读那个键要占一次 hook，所以单独一层组件。 */
+const DerivedTristate = ({ configKey, follows, spec }: {
+  configKey: string;
+  follows: string;
+  spec: ConsoleFieldSchema;
+}) => {
+  const source = useLiveValue<unknown>(follows, '');
+  const when = spec.follows_when || [];
+  return (
+    <TristateOption
+      configKey={configKey}
+      desc={rich(spec.desc)}
+      fallback={when.includes(String(source).toLowerCase())}
+      label={spec.label}
+    />
+  );
+};
 
 const CustomNode = ({ context, name }: { context: Context; name: string }) => {
-  const Component = sectionComponent(context.platformId, context.sectionId, name);
+  const Component = useSectionParts(context.sectionId)?.components?.[name];
   // 没登记就什么也不画：少一块内容，好过整页崩在一个拼错的名字上。
   return Component ? <Component /> : null;
 };
 
-const FieldNode = ({ context, spec }: { context: Context; spec: FieldSpec }) => {
+const FieldControl = ({ context, node }: { context: Context; node: FieldNodeSpec }) => {
+  const spec = context.fields[node.key];
+  // 后端建 schema 时校验过摆出来的键都有说明；缺了只可能是前后端版本错开，少画一格比崩掉整页好。
+  if (!spec) return null;
+  const children = node.children?.length ? <Children context={context} nodes={node.children} /> : undefined;
   switch (spec.kind) {
-    case 'block':
-      return (
-        <Block frame={spec.frame} hint={spec.hint} title={spec.title}>
-          <Children context={context} specs={spec.children} />
-        </Block>
-      );
-    case 'grid':
-      return <Grid><Children context={context} specs={spec.children} /></Grid>;
-    case 'panel':
-      return <Panel className={spec.className}><Children context={context} specs={spec.children} /></Panel>;
-    case 'loose':
-      return <Loose><Children context={context} specs={spec.children} /></Loose>;
     case 'bool':
-      return (
-        <BoolOption configKey={spec.key} desc={spec.desc} fallback={spec.fallback} label={spec.label}>
-          {spec.children?.length ? <Children context={context} specs={spec.children} /> : undefined}
-        </BoolOption>
-      );
+      return node.sub
+        ? <SubOption configKey={node.key} fallback={spec.default === true} label={spec.label} />
+        : (
+          <BoolOption configKey={node.key} desc={rich(spec.desc)} fallback={spec.default === true} label={spec.label}>
+            {children}
+          </BoolOption>
+        );
     case 'tristate':
-      return typeof spec.fallback === 'boolean'
-        ? <TristateOption configKey={spec.key} desc={spec.desc} fallback={spec.fallback} label={spec.label} />
-        : <DerivedTristate from={spec.fallback.from} spec={spec} when={spec.fallback.when} />;
-    case 'sub':
-      return <SubOption configKey={spec.key} fallback={spec.fallback} label={spec.label} />;
+      return spec.follows
+        ? <DerivedTristate configKey={node.key} follows={spec.follows} spec={spec} />
+        : <TristateOption configKey={node.key} desc={rich(spec.desc)} fallback={spec.unset === true} label={spec.label} />;
     case 'number':
       return (
         <NumberField
-          configKey={spec.key}
+          configKey={node.key}
+          fallback={typeof spec.default === 'number' ? spec.default : 0}
           label={spec.label}
           max={spec.max}
           scale={spec.scale}
@@ -75,52 +80,83 @@ const FieldNode = ({ context, spec }: { context: Context; spec: FieldSpec }) => 
         />
       );
     case 'percent':
-      return <PercentField configKey={spec.key} label={spec.label} />;
+      return <PercentField configKey={node.key} label={spec.label} />;
     case 'text':
-      return <TextField configKey={spec.key} label={spec.label} />;
+      return <TextField configKey={node.key} label={spec.label} />;
     case 'choice':
-      return <ChoiceField choices={spec.choices} configKey={spec.key} fallback={spec.fallback} label={spec.label} />;
+      return (
+        <ChoiceField
+          choices={spec.choices || []}
+          configKey={node.key}
+          fallback={typeof spec.default === 'string' ? spec.default : ''}
+          label={spec.label}
+        />
+      );
     case 'words':
       return (
         <WordList
-          configKey={spec.key}
-          empty={spec.empty}
+          configKey={node.key}
+          empty={spec.empty || ''}
           label={spec.label}
-          placeholder={spec.placeholder}
-          spacing={spec.spacing}
+          placeholder={spec.placeholder || ''}
+          spacing={node.spacing}
         />
       );
     case 'ids':
       return (
         <IdList
-          configKey={spec.key}
-          empty={spec.empty}
+          configKey={node.key}
+          empty={spec.empty || ''}
           label={spec.label}
-          placeholder={spec.placeholder}
-          spacing={spec.spacing}
+          placeholder={spec.placeholder || ''}
+          spacing={node.spacing}
         />
       );
-    case 'fixed':
-      return (
-        <Fixed desc={spec.desc} name={spec.label}>
-          {spec.children?.length ? <Children context={context} specs={spec.children} /> : undefined}
-        </Fixed>
-      );
-    case 'desc':
-      return <Desc indent={spec.indent}>{spec.text}</Desc>;
-    case 'note':
-      return <Footnote>{spec.text}</Footnote>;
-    case 'custom':
-      return <CustomNode context={context} name={spec.name} />;
+    default:
+      return null;
   }
 };
 
-export const SchemaFields = ({ platformId, sectionId, spec }: {
-  platformId: string;
+const SchemaNode = ({ context, node }: { context: Context; node: ConsoleNode }) => {
+  switch (node.kind) {
+    case 'block':
+      return (
+        <Block frame={node.frame} hint={node.hint} title={node.title}>
+          <Children context={context} nodes={node.children} />
+        </Block>
+      );
+    case 'grid':
+      return <Grid><Children context={context} nodes={node.children} /></Grid>;
+    case 'panel':
+      return <Panel><Children context={context} nodes={node.children} /></Panel>;
+    case 'loose':
+      return <Loose><Children context={context} nodes={node.children} /></Loose>;
+    case 'fixed':
+      return (
+        <Fixed desc={rich(node.desc)} name={node.label}>
+          {node.children?.length ? <Children context={context} nodes={node.children} /> : undefined}
+        </Fixed>
+      );
+    case 'field':
+      return <FieldControl context={context} node={node} />;
+    case 'desc':
+      return <Desc indent={node.indent}><RichText text={node.text} /></Desc>;
+    case 'note':
+      return <Footnote><RichText text={node.text} /></Footnote>;
+    case 'custom':
+      return <CustomNode context={context} name={node.name} />;
+    default:
+      return null;
+  }
+};
+
+/** 一个分区的正文。fields 是整页 schema 的控件说明，按键名查。 */
+export const SchemaFields = ({ fields, nodes, sectionId }: {
+  fields: SchemaFieldMap;
+  nodes: readonly ConsoleNode[];
   sectionId: string;
-  spec: readonly FieldSpec[];
 }) => (
   <Fragment>
-    {spec.map((node, index) => <FieldNode context={{ platformId, sectionId }} key={index} spec={node} />)}
+    {nodes.map((node, index) => <SchemaNode context={{ fields, sectionId }} key={index} node={node} />)}
   </Fragment>
 );

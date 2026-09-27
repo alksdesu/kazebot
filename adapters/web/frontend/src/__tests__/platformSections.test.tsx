@@ -2,15 +2,18 @@
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { PlatformLiveState } from '../api/supervisorClient';
+import type { ConfigLiveState } from '../api/supervisorClient';
 import { getSettingsTab } from '../components/settings/settingsTabs';
+import { platformScope } from '../console/configScope';
 import { platformConsoleStore } from '../console/consoleStore';
+import { useSchemaStore } from '../console/schemaStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
+import { clearConsoleSchemas, seedConsoleSchemas } from './consoleSchemaFixture';
 
 const SECTION_STORE_KEY = 'console_sections_qq';
 
-const live = (values: Record<string, unknown> = {}): PlatformLiveState => ({
+const live = (values: Record<string, unknown> = {}): ConfigLiveState => ({
   published: true,
   applied: true,
   file: { exists: true, mtime_ns: 1, size: 1 },
@@ -60,11 +63,17 @@ beforeEach(() => {
   useSettingsStore.setState({ adminToken: '', isAuthenticated: true });
   useViewStore.setState({ viewMode: 'settings', activeSettingsTab: 'platform-qq', activeSettingsSection: '' });
   platformConsoleStore('qq').setState({ live: live(), draft: {}, raw: '', loading: false, saving: false, error: '', notice: '' });
+  seedConsoleSchemas();
   // jsdom 没有 confirm，不打桩的话「丢弃」的二次确认永远拿到 undefined。
   vi.spyOn(window, 'confirm').mockReturnValue(true);
 });
 
-afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+afterEach(() => {
+  cleanup();
+  clearConsoleSchemas();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 
 describe('折叠分区', () => {
   it('收起时给一行摘要，读的是生效值不是草稿', () => {
@@ -165,6 +174,30 @@ describe('分区深链', () => {
     render(<PlatformTab />);
 
     expect(screen.getByRole('button', { name: /^账号与连接/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^信道/ })).toBeNull();
+  });
+});
+
+describe('控制台布局', () => {
+  it('布局还在路上时说一声，不拿空白冒充没有分区', () => {
+    clearConsoleSchemas();
+    useSettingsStore.setState({ adminToken: 'fixture-token' });
+    // 请求永远不回，页面停在读取中。
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => undefined)));
+    render(<PlatformTab />);
+
+    expect(screen.getByText('正在读取控制台布局…')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^信道/ })).toBeNull();
+  });
+
+  it('布局拉不到时把原因摆出来', () => {
+    useSchemaStore.setState({
+      schemas: {},
+      errors: { [platformScope('qq').id]: '读不到控制台布局（404 Not Found）。supervisor 可能还没更新到当前版本，重启 supervisor 之后再试。' },
+    });
+    render(<PlatformTab />);
+
+    expect(screen.getByText(/重启 supervisor 之后再试/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /^信道/ })).toBeNull();
   });
 });

@@ -1,0 +1,2978 @@
+{
+  "features": {
+    "version": 1,
+    "sections": [
+      {
+        "id": "trigger",
+        "label": "触发时机",
+        "icon": "timer",
+        "note": "所有平台默认的开口规则。平台页的「触发时机」可以单独改其中任意一项，试听也在那里。",
+        "paths": [
+          "trigger"
+        ],
+        "nodes": [
+          {
+            "kind": "block",
+            "title": "触发条件",
+            "hint": "命中任意一条即回应",
+            "children": [
+              {
+                "kind": "grid",
+                "children": [
+                  {
+                    "kind": "field",
+                    "key": "signal_all"
+                  },
+                  {
+                    "kind": "field",
+                    "key": "signal_at"
+                  },
+                  {
+                    "kind": "field",
+                    "key": "signal_reply"
+                  },
+                  {
+                    "kind": "field",
+                    "key": "signal_name",
+                    "children": [
+                      {
+                        "kind": "field",
+                        "key": "name_words"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "name_anywhere",
+                        "sub": true
+                      }
+                    ]
+                  },
+                  {
+                    "kind": "field",
+                    "key": "signal_prefix"
+                  },
+                  {
+                    "kind": "field",
+                    "key": "signal_keyword",
+                    "children": [
+                      {
+                        "kind": "field",
+                        "key": "keyword_words"
+                      }
+                    ]
+                  },
+                  {
+                    "kind": "field",
+                    "key": "signal_random",
+                    "children": [
+                      {
+                        "kind": "field",
+                        "key": "random_probability"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "kind": "loose",
+                "children": [
+                  {
+                    "kind": "field",
+                    "key": "trigger_prefixes",
+                    "spacing": "loose"
+                  },
+                  {
+                    "kind": "note",
+                    "text": "前缀同时用于剥离正文，但 `/` 与 `／` 例外 —— `/draw` 这类命令要求字面斜杠，剥掉会失配。"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "kind": "block",
+            "title": "接话意愿判断",
+            "hint": "前面全不命中时才问模型",
+            "children": [
+              {
+                "kind": "grid",
+                "children": [
+                  {
+                    "kind": "field",
+                    "key": "llm_intent_enabled",
+                    "children": [
+                      {
+                        "kind": "field",
+                        "key": "llm_intent_node_id"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "llm_intent_context_messages"
+                      }
+                    ]
+                  },
+                  {
+                    "kind": "fixed",
+                    "label": "并发上限",
+                    "children": [
+                      {
+                        "kind": "desc",
+                        "text": "判定会占住 engine worker，占满了真实对话就得排队。"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "llm_intent_max_inflight"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "llm_intent_timeout_sec"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "kind": "block",
+            "title": "冷却",
+            "hint": "命中之后仍可能不说话",
+            "children": [
+              {
+                "kind": "grid",
+                "children": [
+                  {
+                    "kind": "fixed",
+                    "label": "发言间隔",
+                    "children": [
+                      {
+                        "kind": "desc",
+                        "text": "刚说过话的群里先歇一会儿。0 表示不限制。"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "cooldown_group_sec"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "cooldown_user_sec"
+                      }
+                    ]
+                  },
+                  {
+                    "kind": "field",
+                    "key": "cooldown_exempt_at"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "approval",
+        "label": "审批",
+        "icon": "verified_user",
+        "note": "审批卡片发出去之后，怎么认出回复的是哪一张。",
+        "paths": [
+          "approval"
+        ],
+        "nodes": [
+          {
+            "kind": "block",
+            "title": "审批",
+            "hint": "审批卡片怎么认回来",
+            "children": [
+              {
+                "kind": "grid",
+                "children": [
+                  {
+                    "kind": "field",
+                    "key": "approval_reply_unique_fallback",
+                    "children": [
+                      {
+                        "kind": "desc",
+                        "text": "默认关：这条兜底分不清引用的是它、还是另一张已经处理过的卡片，是误批的直接成因。开了也仍然要求只剩一条待审批、且那张卡片确实发给了本人。"
+                      }
+                    ]
+                  },
+                  {
+                    "kind": "field",
+                    "key": "approval_bare_verb_unique",
+                    "children": [
+                      {
+                        "kind": "desc",
+                        "text": "默认开：收到卡片后直接回「同意」就能批。只在你名下恰好剩一条待审批、且那张卡片确实发给你时成立；有多条会让你指定，一条都没有时就当普通聊天。"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "reply",
+        "label": "回复",
+        "icon": "format_align_left",
+        "note": "回复时引不引用原消息，以及群历史里每条留多长。",
+        "paths": [
+          "output.reply_to_trigger",
+          "output.history_text_limit"
+        ],
+        "nodes": [
+          {
+            "kind": "block",
+            "title": "回复格式",
+            "hint": "消息发出去之前的处理",
+            "children": [
+              {
+                "kind": "grid",
+                "children": [
+                  {
+                    "kind": "field",
+                    "key": "reply_to_trigger"
+                  },
+                  {
+                    "kind": "fixed",
+                    "label": "历史长度",
+                    "children": [
+                      {
+                        "kind": "desc",
+                        "text": "群历史里每条消息压成一行，最多留这么多字，超出的截掉。"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "history_text_limit"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "interaction",
+        "label": "群互动",
+        "icon": "chat",
+        "note": "跟复读、抢答这些说话之外的动作。",
+        "paths": [
+          "extensions.preempt",
+          "extensions.echo"
+        ],
+        "nodes": [
+          {
+            "kind": "block",
+            "title": "群内互动",
+            "hint": "除了说话之外还能做什么",
+            "children": [
+              {
+                "kind": "grid",
+                "children": [
+                  {
+                    "kind": "field",
+                    "key": "enable_preempt"
+                  },
+                  {
+                    "kind": "field",
+                    "key": "enable_echo",
+                    "children": [
+                      {
+                        "kind": "field",
+                        "key": "echo_threshold"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "echo_max_length"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "echo_window_sec"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "echo_cooldown_sec"
+                      },
+                      {
+                        "kind": "desc",
+                        "text": "必须是不同的人发的，同一个人连刷不算。命令、@、回复和长文本一律不跟；表情包按图片本身比对，三个人发三张不同的图不会被当成复读。"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "kind": "note",
+            "text": "这几项只在群里成立，私聊不受影响。"
+          }
+        ]
+      },
+      {
+        "id": "input",
+        "label": "输入处理",
+        "icon": "attach_file",
+        "note": "发来的图片和文件哪些收、收多少。",
+        "paths": [
+          "input"
+        ],
+        "nodes": [
+          {
+            "kind": "block",
+            "title": "能接收什么",
+            "hint": "发来的东西里，哪些交给模型看",
+            "children": [
+              {
+                "kind": "grid",
+                "children": [
+                  {
+                    "kind": "field",
+                    "key": "enable_image_input",
+                    "children": [
+                      {
+                        "kind": "field",
+                        "key": "max_images_per_turn"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "image_max_bytes"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "image_wait_after_text_sec"
+                      },
+                      {
+                        "kind": "desc",
+                        "text": "有的平台会把「文字＋图」拆成两条发过来，收到纯文本后等这么久看有没有图跟上。"
+                      }
+                    ]
+                  },
+                  {
+                    "kind": "field",
+                    "key": "enable_file_input",
+                    "children": [
+                      {
+                        "kind": "field",
+                        "key": "max_files_per_turn"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "file_max_bytes"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "file_extra_allowed_extensions"
+                      },
+                      {
+                        "kind": "desc",
+                        "text": "可执行文件与脚本类型不受这里影响，填了也不会收。"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sticker",
+        "label": "表情包挑选",
+        "icon": "mood",
+        "note": "什么时候把表情包清单摊给模型、怎么挑。收不收、从哪收在各平台页里设。",
+        "paths": [
+          "extensions.sticker.send_probability",
+          "extensions.sticker.prompt_limit",
+          "extensions.sticker.repeat_window_sec",
+          "extensions.sticker.combat",
+          "extensions.sticker.burst_probability"
+        ],
+        "nodes": [
+          {
+            "kind": "block",
+            "title": "发送",
+            "hint": "什么时候把表情包摊给模型挑",
+            "children": [
+              {
+                "kind": "grid",
+                "children": [
+                  {
+                    "kind": "fixed",
+                    "label": "发图",
+                    "children": [
+                      {
+                        "kind": "desc",
+                        "text": "清单按概率整份摊给模型，发不发、发哪张由它自己定。库比上限大就先给发得最少的。"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "sticker_send_probability"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "sticker_prompt_limit"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "sticker_repeat_window_sec"
+                      }
+                    ]
+                  },
+                  {
+                    "kind": "field",
+                    "key": "sticker_combat",
+                    "children": [
+                      {
+                        "kind": "field",
+                        "key": "sticker_burst_probability"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "kind": "note",
+            "text": "只有在库且打过标的图才会进候选 —— 没打标的图对模型来说是不可描述的，给了也挑不出来。打标走「机器人 › 表情包图库」里显示的那条看图渠道，刚收进来的图要等一会儿才可用。"
+          }
+        ]
+      },
+      {
+        "id": "link",
+        "label": "队列与群历史",
+        "icon": "lan",
+        "note": "消息排不排队、每个群缓存多少条历史。改完两秒内对齐，不用重启。",
+        "paths": [
+          "queue",
+          "history"
+        ],
+        "nodes": [
+          {
+            "kind": "block",
+            "title": "消息队列",
+            "hint": "开着的时候群消息排队处理，不再并发",
+            "children": [
+              {
+                "kind": "grid",
+                "children": [
+                  {
+                    "kind": "field",
+                    "key": "enable_queue",
+                    "children": [
+                      {
+                        "kind": "field",
+                        "key": "queue_workers"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "queue_interval"
+                      }
+                    ]
+                  },
+                  {
+                    "kind": "field",
+                    "key": "queue_wait_for_reply",
+                    "children": [
+                      {
+                        "kind": "field",
+                        "key": "queue_reply_timeout"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "kind": "block",
+            "title": "群历史",
+            "hint": "给模型看的上下文，不是平台上的聊天记录",
+            "children": [
+              {
+                "kind": "grid",
+                "children": [
+                  {
+                    "kind": "fixed",
+                    "label": "缓存条数",
+                    "children": [
+                      {
+                        "kind": "desc",
+                        "text": "每个群留多少条最近消息。0 表示不缓存。"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "group_history_max"
+                      }
+                    ]
+                  },
+                  {
+                    "kind": "fixed",
+                    "label": "未送达余量",
+                    "children": [
+                      {
+                        "kind": "desc",
+                        "text": "还没送到 Engine 的行可以多占几倍位置，硬上限 = 缓存条数 × 本值。1.0 表示不给余量，满了就丢。"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "group_history_undelivered_ratio"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sticker_library",
+        "label": "表情包图库",
+        "icon": "photo_library",
+        "note": "全平台共用一份图库，这几项只在这里设，平台页里改不了。",
+        "paths": [
+          "extensions.sticker.auto_accept",
+          "extensions.sticker.auto_tag",
+          "extensions.sticker.pending_limit",
+          "extensions.sticker.library_limit",
+          "extensions.sticker.pending_ttl_days"
+        ],
+        "nodes": [
+          {
+            "kind": "block",
+            "title": "入库",
+            "hint": "收进来的图怎么进图库、存多少",
+            "children": [
+              {
+                "kind": "grid",
+                "children": [
+                  {
+                    "kind": "field",
+                    "key": "sticker_auto_accept"
+                  },
+                  {
+                    "kind": "field",
+                    "key": "sticker_auto_tag"
+                  },
+                  {
+                    "kind": "fixed",
+                    "label": "容量",
+                    "children": [
+                      {
+                        "kind": "desc",
+                        "text": "待审池满了就不再收新的；图库超出上限时最旧的先出局。"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "sticker_pending_limit"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "sticker_library_limit"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "sticker_pending_ttl_days"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "fields": {
+      "signal_all": {
+        "kind": "tristate",
+        "label": "全量回应",
+        "desc": "群里任何人说任何话都回。开着的时候下面几条都不再影响判定。",
+        "follows": "group_trigger",
+        "follows_when": [
+          "all",
+          "always"
+        ],
+        "path": "trigger.signals.all",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": null
+      },
+      "signal_at": {
+        "kind": "tristate",
+        "label": "被 @",
+        "desc": "消息里任何位置 @ 到 bot，不限句首。",
+        "unset": true,
+        "path": "trigger.signals.at",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": null
+      },
+      "signal_reply": {
+        "kind": "tristate",
+        "label": "被回复",
+        "desc": "有人引用 bot 说过的话。",
+        "unset": true,
+        "path": "trigger.signals.reply",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": null
+      },
+      "signal_name": {
+        "kind": "bool",
+        "label": "出现名字",
+        "desc": "消息里提到 bot 的名字。原文会完整交给模型，不会被剥掉。",
+        "path": "trigger.signals.name",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": false
+      },
+      "name_words": {
+        "kind": "words",
+        "label": "认这些名字",
+        "empty": "还没有名字，这一条不会命中",
+        "placeholder": "输入一个名字，回车添加",
+        "path": "trigger.name.words",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": ""
+      },
+      "name_anywhere": {
+        "kind": "bool",
+        "label": "不限句首，句中提到也算",
+        "path": "trigger.name.anywhere",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": true
+      },
+      "signal_prefix": {
+        "kind": "tristate",
+        "label": "前缀触发",
+        "desc": "以配置的前缀开头。",
+        "follows": "group_trigger",
+        "follows_when": [
+          "mention_or_prefix",
+          "prefix",
+          "prefix_or_mention"
+        ],
+        "path": "trigger.signals.prefix",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": null
+      },
+      "signal_keyword": {
+        "kind": "bool",
+        "label": "关键词插话",
+        "desc": "聊到特定话题时主动接话。",
+        "path": "trigger.signals.keyword",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": false
+      },
+      "keyword_words": {
+        "kind": "words",
+        "label": "听这些词",
+        "empty": "还没有关键词，这一条不会命中",
+        "placeholder": "输入一个关键词，回车添加",
+        "path": "trigger.keyword.words",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": ""
+      },
+      "signal_random": {
+        "kind": "bool",
+        "label": "随机插话",
+        "desc": "按概率随便说两句。骰子在运行时才掷，试听里只标注为「看运行时」。",
+        "path": "trigger.signals.random",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": false
+      },
+      "random_probability": {
+        "kind": "percent",
+        "label": "每条消息",
+        "path": "trigger.random.probability",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 0.02
+      },
+      "trigger_prefixes": {
+        "kind": "words",
+        "label": "触发前缀",
+        "empty": "没有前缀，前缀触发不会命中",
+        "placeholder": "输入一个前缀，回车添加",
+        "path": "trigger.prefixes",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": "!,！,/,／"
+      },
+      "llm_intent_enabled": {
+        "kind": "bool",
+        "label": "让模型判断",
+        "desc": "问一次轻量模型「这句话需要你接话吗」。每条不命中的群消息都会产生一次模型往返，务必配独立的便宜渠道。",
+        "path": "trigger.llm_intent.enabled",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": false
+      },
+      "llm_intent_node_id": {
+        "kind": "text",
+        "label": "判定节点",
+        "path": "trigger.llm_intent.node_id",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": "chat.intent"
+      },
+      "llm_intent_context_messages": {
+        "kind": "number",
+        "label": "带上最近",
+        "unit": "条",
+        "path": "trigger.llm_intent.context_messages",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 8
+      },
+      "llm_intent_max_inflight": {
+        "kind": "number",
+        "label": "同时最多",
+        "unit": "个",
+        "path": "trigger.llm_intent.max_inflight",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 1
+      },
+      "llm_intent_timeout_sec": {
+        "kind": "number",
+        "label": "超时",
+        "unit": "秒",
+        "step": 0.5,
+        "path": "trigger.llm_intent.timeout_sec",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 8.0
+      },
+      "cooldown_group_sec": {
+        "kind": "number",
+        "label": "每群",
+        "unit": "秒",
+        "path": "trigger.cooldown.per_group_sec",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 0.0
+      },
+      "cooldown_user_sec": {
+        "kind": "number",
+        "label": "每人",
+        "unit": "秒",
+        "path": "trigger.cooldown.per_user_sec",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 0.0
+      },
+      "cooldown_exempt_at": {
+        "kind": "bool",
+        "label": "被 @ 时无视冷却",
+        "desc": "有人直接叫 bot，就不该被静默忽略。",
+        "path": "trigger.cooldown.exempt_at",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": true
+      },
+      "approval_reply_unique_fallback": {
+        "kind": "bool",
+        "label": "唯一待审批兜底",
+        "desc": "引用了审批卡片却取不到编号时，按「当前唯一待审批」处理。",
+        "path": "approval.reply_unique_fallback",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": false
+      },
+      "approval_bare_verb_unique": {
+        "kind": "bool",
+        "label": "直接回同意",
+        "desc": "不引用卡片、整句只发「同意」时，按当前唯一待审批处理。",
+        "path": "approval.bare_verb_unique",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": true
+      },
+      "reply_to_trigger": {
+        "kind": "bool",
+        "label": "引用原消息",
+        "desc": "回复时引用触发它的那条消息，群里热闹时能看清在回谁。",
+        "path": "output.reply_to_trigger",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": true
+      },
+      "history_text_limit": {
+        "kind": "number",
+        "label": "历史里每条",
+        "unit": "字",
+        "step": 50,
+        "path": "output.history_text_limit",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 400
+      },
+      "enable_preempt": {
+        "kind": "bool",
+        "label": "抢答",
+        "desc": "上一条还没答完就来了新消息时，放弃旧的去答新的。",
+        "path": "extensions.preempt",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": false
+      },
+      "enable_echo": {
+        "kind": "bool",
+        "label": "跟复读",
+        "desc": "连着几个人刷同一句时，也跟一条。",
+        "path": "extensions.echo.enabled",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": false
+      },
+      "echo_threshold": {
+        "kind": "number",
+        "label": "连续",
+        "unit": "条才跟",
+        "path": "extensions.echo.threshold",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 3
+      },
+      "echo_max_length": {
+        "kind": "number",
+        "label": "最长",
+        "unit": "字",
+        "path": "extensions.echo.max_text_length",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 30
+      },
+      "echo_window_sec": {
+        "kind": "number",
+        "label": "时间窗",
+        "unit": "秒",
+        "path": "extensions.echo.window_sec",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 120.0
+      },
+      "echo_cooldown_sec": {
+        "kind": "number",
+        "label": "跟完歇",
+        "unit": "秒",
+        "path": "extensions.echo.cooldown_sec",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 90.0
+      },
+      "enable_image_input": {
+        "kind": "bool",
+        "label": "看图片",
+        "desc": "把图片交给视觉节点识别。",
+        "path": "input.image",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": true
+      },
+      "max_images_per_turn": {
+        "kind": "number",
+        "label": "每轮最多",
+        "unit": "张",
+        "path": "input.max_images_per_turn",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 4
+      },
+      "image_max_bytes": {
+        "kind": "number",
+        "label": "单图上限",
+        "unit": "MB",
+        "step": 1,
+        "scale": 1048576,
+        "path": "input.image_max_bytes",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 10485760
+      },
+      "image_wait_after_text_sec": {
+        "kind": "number",
+        "label": "等图窗口",
+        "unit": "秒",
+        "step": 0.5,
+        "path": "input.image_wait_after_text_sec",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 2.5
+      },
+      "enable_file_input": {
+        "kind": "bool",
+        "label": "读文件",
+        "desc": "读取对方发来的文件内容。",
+        "path": "input.file",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": true
+      },
+      "max_files_per_turn": {
+        "kind": "number",
+        "label": "每轮最多",
+        "unit": "个",
+        "path": "input.max_files_per_turn",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 3
+      },
+      "file_max_bytes": {
+        "kind": "number",
+        "label": "单文件上限",
+        "unit": "MB",
+        "step": 1,
+        "scale": 1048576,
+        "path": "input.file_max_bytes",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 52428800
+      },
+      "file_extra_allowed_extensions": {
+        "kind": "words",
+        "label": "额外放行",
+        "empty": "只收内置白名单里的类型",
+        "placeholder": "输入一个扩展名，回车添加",
+        "path": "input.file_extra_allowed_extensions",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": ""
+      },
+      "sticker_send_probability": {
+        "kind": "number",
+        "label": "每轮出现概率",
+        "step": 0.05,
+        "max": 1,
+        "path": "extensions.sticker.send_probability",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 0.2
+      },
+      "sticker_prompt_limit": {
+        "kind": "number",
+        "label": "最多列出",
+        "unit": "张",
+        "path": "extensions.sticker.prompt_limit",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 60
+      },
+      "sticker_repeat_window_sec": {
+        "kind": "number",
+        "label": "同图间隔",
+        "unit": "秒",
+        "step": 60,
+        "path": "extensions.sticker.repeat_window_sec",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 1800
+      },
+      "sticker_combat": {
+        "kind": "bool",
+        "label": "接梗",
+        "desc": "群里连着刷图时跟着接一张。要求连图来自至少两个人，中间夹了纯文本就不算。",
+        "path": "extensions.sticker.combat",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": false
+      },
+      "sticker_burst_probability": {
+        "kind": "number",
+        "label": "发完再补一张的概率",
+        "step": 0.05,
+        "max": 1,
+        "path": "extensions.sticker.burst_probability",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 0.0
+      },
+      "enable_queue": {
+        "kind": "bool",
+        "label": "启用队列",
+        "desc": "按顺序一条条处理，避免同时开好几个对话。",
+        "path": "queue.enabled",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": false
+      },
+      "queue_workers": {
+        "kind": "number",
+        "label": "worker",
+        "unit": "个",
+        "path": "queue.workers",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 4
+      },
+      "queue_interval": {
+        "kind": "number",
+        "label": "间隔",
+        "unit": "秒",
+        "step": 0.5,
+        "path": "queue.interval_sec",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 2.0
+      },
+      "queue_wait_for_reply": {
+        "kind": "bool",
+        "label": "等回复",
+        "desc": "等上一条真的回完再取下一条，而不是发出去就算完。",
+        "path": "queue.wait_for_reply",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": false
+      },
+      "queue_reply_timeout": {
+        "kind": "number",
+        "label": "超时",
+        "unit": "秒",
+        "step": 10,
+        "path": "queue.reply_timeout_sec",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 120.0
+      },
+      "group_history_max": {
+        "kind": "number",
+        "label": "每群",
+        "unit": "条",
+        "path": "history.group_max",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 20
+      },
+      "group_history_undelivered_ratio": {
+        "kind": "number",
+        "label": "上限倍数",
+        "unit": "倍",
+        "step": 0.5,
+        "path": "history.undelivered_ratio",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 1.0
+      },
+      "sticker_auto_accept": {
+        "kind": "bool",
+        "label": "跳过人工筛选",
+        "desc": "收到就直接入库，不进待审池。",
+        "path": "extensions.sticker.auto_accept",
+        "layers": [
+          "global"
+        ],
+        "default": false
+      },
+      "sticker_auto_tag": {
+        "kind": "bool",
+        "label": "自动打标签",
+        "desc": "收进来的图自动送去看图渠道打标签。关掉就不再产生这笔开销，但没标签的图检索不到，也就发不出去。",
+        "path": "extensions.sticker.auto_tag",
+        "layers": [
+          "global"
+        ],
+        "default": true
+      },
+      "sticker_pending_limit": {
+        "kind": "number",
+        "label": "待审池",
+        "unit": "张",
+        "step": 10,
+        "path": "extensions.sticker.pending_limit",
+        "layers": [
+          "global"
+        ],
+        "default": 200
+      },
+      "sticker_library_limit": {
+        "kind": "number",
+        "label": "图库",
+        "unit": "张",
+        "step": 50,
+        "path": "extensions.sticker.library_limit",
+        "layers": [
+          "global"
+        ],
+        "default": 1000
+      },
+      "sticker_pending_ttl_days": {
+        "kind": "number",
+        "label": "待审保留",
+        "unit": "天",
+        "path": "extensions.sticker.pending_ttl_days",
+        "layers": [
+          "global"
+        ],
+        "default": 7
+      }
+    }
+  },
+  "platforms": {
+    "qq": {
+      "version": 1,
+      "sections": [
+        {
+          "id": "account",
+          "label": "账号与连接",
+          "icon": "account_circle",
+          "note": "这一个实例用哪个号在说话，以及多开与记忆归属。换号会重启 NapCat，期间 bot 不可用。",
+          "paths": [],
+          "nodes": [
+            {
+              "kind": "custom",
+              "name": "workspace"
+            }
+          ]
+        },
+        {
+          "id": "channels",
+          "label": "信道",
+          "icon": "inbox",
+          "note": "bot 只在名单里的群和私聊里出现。两份名单都是白名单，不在名单里的消息连处理都不会处理。",
+          "paths": [
+            "channels"
+          ],
+          "nodes": [
+            {
+              "kind": "block",
+              "title": "群",
+              "hint": "不在名单里的群，消息一律不处理",
+              "children": [
+                {
+                  "kind": "panel",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "allowed_groups",
+                      "spacing": "panel"
+                    },
+                    {
+                      "kind": "custom",
+                      "name": "groupWarning"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "kind": "block",
+              "title": "私聊",
+              "hint": "私聊按名单与好友关系两条独立放行",
+              "children": [
+                {
+                  "kind": "panel",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "allowed_private_users",
+                      "spacing": "panel"
+                    }
+                  ]
+                },
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "allow_private_friends"
+                    },
+                    {
+                      "kind": "field",
+                      "key": "private_denied_reply"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "kind": "note",
+              "text": "备注只存在这台浏览器里，不写进平台配置、也不会进模型的上下文 —— 群名往往带真实身份。换个浏览器或清掉站点数据，备注就没了，名单本身不受影响。"
+            }
+          ]
+        },
+        {
+          "id": "trigger",
+          "label": "触发时机",
+          "icon": "timer",
+          "note": "决定 bot 在群里什么时候说话。多个条件之间是「或」——命中任意一条就会回应，再由冷却决定是否真的开口。",
+          "paths": [
+            "trigger"
+          ],
+          "nodes": [
+            {
+              "kind": "block",
+              "title": "触发条件",
+              "hint": "命中任意一条即回应",
+              "children": [
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "signal_all"
+                    },
+                    {
+                      "kind": "field",
+                      "key": "signal_at"
+                    },
+                    {
+                      "kind": "field",
+                      "key": "signal_reply"
+                    },
+                    {
+                      "kind": "field",
+                      "key": "signal_name",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "name_words"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "name_anywhere",
+                          "sub": true
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "field",
+                      "key": "signal_prefix"
+                    },
+                    {
+                      "kind": "field",
+                      "key": "signal_keyword",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "keyword_words"
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "field",
+                      "key": "signal_random",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "random_probability"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "kind": "loose",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "trigger_prefixes",
+                      "spacing": "loose"
+                    },
+                    {
+                      "kind": "note",
+                      "text": "前缀同时用于剥离正文，但 `/` 与 `／` 例外 —— `/draw` 这类命令要求字面斜杠，剥掉会失配。"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "kind": "block",
+              "title": "接话意愿判断",
+              "hint": "前面全不命中时才问模型",
+              "children": [
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "llm_intent_enabled",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "llm_intent_node_id"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "llm_intent_context_messages"
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "fixed",
+                      "label": "并发上限",
+                      "children": [
+                        {
+                          "kind": "desc",
+                          "text": "判定会占住 engine worker，占满了真实对话就得排队。"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "llm_intent_max_inflight"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "llm_intent_timeout_sec"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "kind": "block",
+              "title": "冷却",
+              "hint": "命中之后仍可能不说话",
+              "children": [
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "fixed",
+                      "label": "发言间隔",
+                      "children": [
+                        {
+                          "kind": "desc",
+                          "text": "刚说过话的群里先歇一会儿。0 表示不限制。"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "cooldown_group_sec"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "cooldown_user_sec"
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "field",
+                      "key": "cooldown_exempt_at"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "kind": "block",
+              "title": "试听",
+              "hint": "判定由 bot 那份代码算，不是界面自己猜的",
+              "children": [
+                {
+                  "kind": "custom",
+                  "name": "audition"
+                }
+              ]
+            },
+            {
+              "kind": "note",
+              "text": "真实判定由 bot 进程执行。改动要点「应用」写入配置文件之后才生效，顶部状态条会显示 bot 是否已经读到这一份。试听用的是编辑中的配置，所以它显示的是「应用之后会怎样」。"
+            }
+          ]
+        },
+        {
+          "id": "permissions",
+          "label": "权限",
+          "icon": "verified_user",
+          "note": "谁能对 bot 下管理命令。管理员权限跨所有群和私聊生效，不区分场景。",
+          "paths": [
+            "permissions",
+            "approval"
+          ],
+          "nodes": [
+            {
+              "kind": "block",
+              "title": "管理员",
+              "hint": "名单里的 QQ 号在所有会话里都算管理员",
+              "children": [
+                {
+                  "kind": "panel",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "admin_users",
+                      "spacing": "panel"
+                    },
+                    {
+                      "kind": "custom",
+                      "name": "adminWarning"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "kind": "block",
+              "title": "这些人能做什么",
+              "hint": "每项各自决定放到哪一档",
+              "children": [
+                {
+                  "kind": "custom",
+                  "name": "capabilities"
+                }
+              ]
+            },
+            {
+              "kind": "block",
+              "title": "审批",
+              "hint": "审批卡片怎么认回来",
+              "children": [
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "approval_reply_unique_fallback",
+                      "children": [
+                        {
+                          "kind": "desc",
+                          "text": "默认关：这条兜底分不清引用的是它、还是另一张已经处理过的卡片，是误批的直接成因。开了也仍然要求只剩一条待审批、且那张卡片确实发给了本人。"
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "field",
+                      "key": "approval_bare_verb_unique",
+                      "children": [
+                        {
+                          "kind": "desc",
+                          "text": "默认开：收到卡片后直接回「同意」就能批。只在你名下恰好剩一条待审批、且那张卡片确实发给你时成立；有多条会让你指定，一条都没有时就当普通聊天。"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "kind": "note",
+              "text": "群主与群管理员的身份由 QQ 上报，只在群消息里成立 —— 同一个人在私聊里就是普通用户。影响面超出单个群的那几项（改全局配置、借 bot 的身份发给任意人）只能给名单里的人，它们的档位里没有群主可选；标了「只在本群」的项给出去之后，目标会被夹在他自己那个群里。名单还兼着私聊放通和审批收件人，把能力调成「不开放」不会把人从名单里去掉。"
+            }
+          ]
+        },
+        {
+          "id": "input",
+          "label": "输入处理",
+          "icon": "attach_file",
+          "note": "群友发来的图片、文件和合并转发，哪些收、收多少。",
+          "paths": [
+            "input"
+          ],
+          "nodes": [
+            {
+              "kind": "block",
+              "title": "能接收什么",
+              "hint": "群友发来的东西里，哪些交给模型看",
+              "children": [
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "enable_image_input",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "max_images_per_turn"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "image_max_bytes"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "image_wait_after_text_sec"
+                        },
+                        {
+                          "kind": "desc",
+                          "text": "有的平台会把「文字＋图」拆成两条发过来，收到纯文本后等这么久看有没有图跟上。"
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "field",
+                      "key": "enable_file_input",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "max_files_per_turn"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "file_max_bytes"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "file_extra_allowed_extensions"
+                        },
+                        {
+                          "kind": "desc",
+                          "text": "可执行文件与脚本类型不受这里影响，填了也不会收。"
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "field",
+                      "key": "enable_forward_msg_input",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "forward_msg_max_depth"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "forward_msg_max_messages"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "forward_msg_text_limit"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "forward_msg_timeout_sec"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "enable_forward_msg_media",
+                          "sub": true
+                        },
+                        {
+                          "kind": "field",
+                          "key": "forward_msg_expand_for_trigger",
+                          "sub": true
+                        },
+                        {
+                          "kind": "desc",
+                          "text": "后一项关掉，转发消息就只有 @ 或回复才理。"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "kind": "note",
+              "text": "看图走的是「渠道」页系统槽位里的读图渠道，没配模型时图片收得到也看不了。改完点顶部的「应用」。"
+            }
+          ]
+        },
+        {
+          "id": "output",
+          "label": "输出格式",
+          "icon": "format_align_left",
+          "note": "消息发出去之前的处理：分条、去掉 Markdown 标记、长度上限、表态。",
+          "paths": [
+            "output",
+            "extensions.reactions"
+          ],
+          "nodes": [
+            {
+              "kind": "block",
+              "title": "回复格式",
+              "hint": "消息发出去之前的处理",
+              "children": [
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "reply_to_trigger"
+                    },
+                    {
+                      "kind": "field",
+                      "key": "strip_asterisk_styles"
+                    },
+                    {
+                      "kind": "field",
+                      "key": "strip_underscore_styles"
+                    },
+                    {
+                      "kind": "fixed",
+                      "label": "长度上限",
+                      "children": [
+                        {
+                          "kind": "desc",
+                          "text": "超长的回复会被截断，避免被 QQ 拒收。"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "message_limit"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "history_text_limit"
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "field",
+                      "key": "enable_image_forward_merge",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "image_forward_merge_threshold"
+                        },
+                        {
+                          "kind": "desc",
+                          "text": "默认关是有原因的：合并转发会长时间占住那条唯一的反向 WS，期间发消息、贴表情全部排队。发现卡顿就关掉，即时生效。"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "kind": "block",
+              "title": "表态",
+              "hint": "告诉模型有哪些收藏表情可用",
+              "children": [
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "enable_reactions"
+                    },
+                    {
+                      "kind": "fixed",
+                      "label": "表情提示",
+                      "children": [
+                        {
+                          "kind": "desc",
+                          "text": "告诉模型有哪些收藏表情可用。0 表示不告诉它。"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "face_prompt_limit"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "kind": "note",
+              "text": "这些是 QQ 这一侧的发送处理，改完点顶部的「应用」。bot 是谁、说话什么风格在「机器人 › 人格」里改。"
+            }
+          ]
+        },
+        {
+          "id": "interaction",
+          "label": "群互动",
+          "icon": "chat",
+          "note": "除了说话之外还能做什么：跟复读、抢答、给资料卡点赞。",
+          "paths": [
+            "extensions.echo",
+            "extensions.preempt",
+            "extensions.auto_like",
+            "extensions.auto_like_times"
+          ],
+          "nodes": [
+            {
+              "kind": "block",
+              "title": "群内互动",
+              "hint": "除了说话之外还能做什么",
+              "children": [
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "enable_auto_like",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "auto_like_times"
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "field",
+                      "key": "enable_preempt"
+                    },
+                    {
+                      "kind": "field",
+                      "key": "enable_echo",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "echo_threshold"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "echo_max_length"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "echo_window_sec"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "echo_cooldown_sec"
+                        },
+                        {
+                          "kind": "desc",
+                          "text": "必须是不同的人发的，同一个人连刷不算。命令、@、回复和长文本一律不跟；表情包按图片本身比对，三个人发三张不同的图不会被当成复读。"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "kind": "note",
+              "text": "这几项只在群里成立，私聊不受影响。改完点顶部的「应用」。"
+            }
+          ]
+        },
+        {
+          "id": "sticker",
+          "label": "表情包",
+          "icon": "mood",
+          "note": "在 QQ 这一侧怎么收表情包、怎么发。图库本身在「机器人 › 表情包图库」里管。",
+          "paths": [
+            "extensions.sticker.collect",
+            "extensions.sticker.strategy",
+            "extensions.sticker.groups",
+            "extensions.sticker.lookup_order",
+            "extensions.sticker.send_probability",
+            "extensions.sticker.prompt_limit",
+            "extensions.sticker.repeat_window_sec",
+            "extensions.sticker.combat",
+            "extensions.sticker.burst_probability"
+          ],
+          "nodes": [
+            {
+              "kind": "block",
+              "title": "收集",
+              "hint": "群里刷过的表情包攒进图库的规则",
+              "children": [
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "sticker_collect",
+                      "children": [
+                        {
+                          "kind": "desc",
+                          "text": "严格只收 QQ 标了表情包的，宽松再放行看着不像截图的，全收连群友随手发的照片都要。"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "sticker_strategy"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "sticker_groups"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "kind": "block",
+              "title": "发送",
+              "hint": "什么时候把表情包摊给模型挑",
+              "children": [
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "fixed",
+                      "label": "发图",
+                      "children": [
+                        {
+                          "kind": "desc",
+                          "text": "清单按概率整份摊给模型，发不发、发哪张由它自己定。库比上限大就先给发得最少的。"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "sticker_send_probability"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "sticker_prompt_limit"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "sticker_repeat_window_sec"
+                        },
+                        {
+                          "kind": "desc",
+                          "text": "模型写的表情名同时对得上收藏表情和图库里的图时，先发哪一边的。"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "sticker_lookup_order"
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "field",
+                      "key": "sticker_combat",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "sticker_burst_probability"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "kind": "note",
+              "text": "只有在库且打过标的图才会进候选 —— 没打标的图对模型来说是不可描述的，给了也挑不出来。打标走「机器人 › 表情包图库」里显示的那条看图渠道，刚收进来的图要等一会儿才可用。"
+            }
+          ]
+        },
+        {
+          "id": "link",
+          "label": "链路",
+          "icon": "lan",
+          "note": "队列、群历史、转发桥这几个改完立刻重建运行期对象的参数，以及固定配置与危险操作。",
+          "paths": [
+            "queue",
+            "history",
+            "forward_bridge"
+          ],
+          "nodes": [
+            {
+              "kind": "block",
+              "title": "消息队列",
+              "hint": "开着的时候群消息排队处理，不再并发",
+              "children": [
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "enable_queue",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "queue_workers"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "queue_interval"
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "field",
+                      "key": "queue_wait_for_reply",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "queue_reply_timeout"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "kind": "custom",
+                  "name": "queueFacts"
+                }
+              ]
+            },
+            {
+              "kind": "block",
+              "title": "群历史",
+              "hint": "给模型看的上下文，不是平台上的聊天记录",
+              "children": [
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "fixed",
+                      "label": "缓存条数",
+                      "children": [
+                        {
+                          "kind": "desc",
+                          "text": "每个群留多少条最近消息。0 表示不缓存。"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "group_history_max"
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "fixed",
+                      "label": "未送达余量",
+                      "children": [
+                        {
+                          "kind": "desc",
+                          "text": "还没送到 Engine 的行可以多占几倍位置，硬上限 = 缓存条数 × 本值。1.0 表示不给余量，满了就丢。"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "group_history_undelivered_ratio"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "kind": "custom",
+                  "name": "historyFacts"
+                }
+              ]
+            },
+            {
+              "kind": "block",
+              "title": "转发桥",
+              "hint": "本地 HTTP 口子，供别的进程借 bot 发消息",
+              "children": [
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "enable_forward_bridge",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "forward_bridge_max_messages"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "kind": "custom",
+                  "name": "bridgeFacts"
+                }
+              ]
+            },
+            {
+              "kind": "block",
+              "title": "固定配置",
+              "hint": "改这些要重启进程，控制台只读",
+              "children": [
+                {
+                  "kind": "custom",
+                  "name": "environment"
+                }
+              ]
+            },
+            {
+              "kind": "block",
+              "title": "危险操作",
+              "hint": "唯一会中断正在进行的工作的操作",
+              "children": [
+                {
+                  "kind": "custom",
+                  "name": "restartEngine"
+                }
+              ]
+            },
+            {
+              "kind": "note",
+              "text": "队列、群历史、转发桥这几项改完同样是热生效 —— bot 会在两秒内重建 worker、deque 与监听端口，不需要重启。上面那个重启按钮是给 engine worker 卡住时用的。"
+            }
+          ]
+        }
+      ],
+      "fields": {
+        "allowed_groups": {
+          "kind": "ids",
+          "label": "允许说话的群",
+          "empty": "名单为空",
+          "placeholder": "输入群号，回车添加",
+          "path": "channels.allowed_groups",
+          "layers": [
+            "platform"
+          ],
+          "default": []
+        },
+        "allowed_private_users": {
+          "kind": "ids",
+          "label": "允许私聊的 QQ",
+          "empty": "名单为空，只按下面的好友规则放行",
+          "placeholder": "输入 QQ 号，回车添加",
+          "path": "channels.allowed_private_users",
+          "layers": [
+            "platform"
+          ],
+          "default": []
+        },
+        "allow_private_friends": {
+          "kind": "bool",
+          "label": "好友自动放行",
+          "desc": "已经通过好友请求的人不必再进名单。关掉之后只有上面名单里的人能私聊。",
+          "path": "channels.allow_private_friends",
+          "layers": [
+            "platform"
+          ],
+          "default": true
+        },
+        "private_denied_reply": {
+          "kind": "text",
+          "label": "拒绝时回复",
+          "path": "channels.private_denied_reply",
+          "layers": [
+            "platform"
+          ],
+          "default": ""
+        },
+        "signal_all": {
+          "kind": "tristate",
+          "label": "全量回应",
+          "desc": "群里任何人说任何话都回。开着的时候下面几条都不再影响判定。",
+          "follows": "group_trigger",
+          "follows_when": [
+            "all",
+            "always"
+          ],
+          "path": "trigger.signals.all",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": null
+        },
+        "signal_at": {
+          "kind": "tristate",
+          "label": "被 @",
+          "desc": "消息里任何位置 @ 到 bot，不限句首。",
+          "unset": true,
+          "path": "trigger.signals.at",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": null
+        },
+        "signal_reply": {
+          "kind": "tristate",
+          "label": "被回复",
+          "desc": "有人引用 bot 说过的话。",
+          "unset": true,
+          "path": "trigger.signals.reply",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": null
+        },
+        "signal_name": {
+          "kind": "bool",
+          "label": "出现名字",
+          "desc": "消息里提到 bot 的名字。原文会完整交给模型，不会被剥掉。",
+          "path": "trigger.signals.name",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": false
+        },
+        "name_words": {
+          "kind": "words",
+          "label": "认这些名字",
+          "empty": "还没有名字，这一条不会命中",
+          "placeholder": "输入一个名字，回车添加",
+          "path": "trigger.name.words",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": ""
+        },
+        "name_anywhere": {
+          "kind": "bool",
+          "label": "不限句首，句中提到也算",
+          "path": "trigger.name.anywhere",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": true
+        },
+        "signal_prefix": {
+          "kind": "tristate",
+          "label": "前缀触发",
+          "desc": "以配置的前缀开头。",
+          "follows": "group_trigger",
+          "follows_when": [
+            "mention_or_prefix",
+            "prefix",
+            "prefix_or_mention"
+          ],
+          "path": "trigger.signals.prefix",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": null
+        },
+        "signal_keyword": {
+          "kind": "bool",
+          "label": "关键词插话",
+          "desc": "聊到特定话题时主动接话。",
+          "path": "trigger.signals.keyword",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": false
+        },
+        "keyword_words": {
+          "kind": "words",
+          "label": "听这些词",
+          "empty": "还没有关键词，这一条不会命中",
+          "placeholder": "输入一个关键词，回车添加",
+          "path": "trigger.keyword.words",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": ""
+        },
+        "signal_random": {
+          "kind": "bool",
+          "label": "随机插话",
+          "desc": "按概率随便说两句。骰子在运行时才掷，试听里只标注为「看运行时」。",
+          "path": "trigger.signals.random",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": false
+        },
+        "random_probability": {
+          "kind": "percent",
+          "label": "每条消息",
+          "path": "trigger.random.probability",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 0.02
+        },
+        "trigger_prefixes": {
+          "kind": "words",
+          "label": "触发前缀",
+          "empty": "没有前缀，前缀触发不会命中",
+          "placeholder": "输入一个前缀，回车添加",
+          "path": "trigger.prefixes",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": "!,！,/,／"
+        },
+        "llm_intent_enabled": {
+          "kind": "bool",
+          "label": "让模型判断",
+          "desc": "问一次轻量模型「这句话需要你接话吗」。每条不命中的群消息都会产生一次模型往返，务必配独立的便宜渠道。",
+          "path": "trigger.llm_intent.enabled",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": false
+        },
+        "llm_intent_node_id": {
+          "kind": "text",
+          "label": "判定节点",
+          "path": "trigger.llm_intent.node_id",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": "chat.intent"
+        },
+        "llm_intent_context_messages": {
+          "kind": "number",
+          "label": "带上最近",
+          "unit": "条",
+          "path": "trigger.llm_intent.context_messages",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 8
+        },
+        "llm_intent_max_inflight": {
+          "kind": "number",
+          "label": "同时最多",
+          "unit": "个",
+          "path": "trigger.llm_intent.max_inflight",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 1
+        },
+        "llm_intent_timeout_sec": {
+          "kind": "number",
+          "label": "超时",
+          "unit": "秒",
+          "step": 0.5,
+          "path": "trigger.llm_intent.timeout_sec",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 8.0
+        },
+        "cooldown_group_sec": {
+          "kind": "number",
+          "label": "每群",
+          "unit": "秒",
+          "path": "trigger.cooldown.per_group_sec",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 0.0
+        },
+        "cooldown_user_sec": {
+          "kind": "number",
+          "label": "每人",
+          "unit": "秒",
+          "path": "trigger.cooldown.per_user_sec",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 0.0
+        },
+        "cooldown_exempt_at": {
+          "kind": "bool",
+          "label": "被 @ 时无视冷却",
+          "desc": "有人直接叫 bot，就不该被静默忽略。",
+          "path": "trigger.cooldown.exempt_at",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": true
+        },
+        "admin_users": {
+          "kind": "ids",
+          "label": "管理员 QQ",
+          "empty": "名单为空",
+          "placeholder": "输入 QQ 号，回车添加",
+          "path": "permissions.admin_users",
+          "layers": [
+            "platform"
+          ],
+          "default": []
+        },
+        "approval_reply_unique_fallback": {
+          "kind": "bool",
+          "label": "唯一待审批兜底",
+          "desc": "引用了审批卡片却取不到编号时，按「当前唯一待审批」处理。",
+          "path": "approval.reply_unique_fallback",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": false
+        },
+        "approval_bare_verb_unique": {
+          "kind": "bool",
+          "label": "直接回同意",
+          "desc": "不引用卡片、整句只发「同意」时，按当前唯一待审批处理。",
+          "path": "approval.bare_verb_unique",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": true
+        },
+        "enable_image_input": {
+          "kind": "bool",
+          "label": "看图片",
+          "desc": "把图片交给视觉节点识别。",
+          "path": "input.image",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": true
+        },
+        "max_images_per_turn": {
+          "kind": "number",
+          "label": "每轮最多",
+          "unit": "张",
+          "path": "input.max_images_per_turn",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 4
+        },
+        "image_max_bytes": {
+          "kind": "number",
+          "label": "单图上限",
+          "unit": "MB",
+          "step": 1,
+          "scale": 1048576,
+          "path": "input.image_max_bytes",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 10485760
+        },
+        "image_wait_after_text_sec": {
+          "kind": "number",
+          "label": "等图窗口",
+          "unit": "秒",
+          "step": 0.5,
+          "path": "input.image_wait_after_text_sec",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 2.5
+        },
+        "enable_file_input": {
+          "kind": "bool",
+          "label": "读文件",
+          "desc": "读取对方发来的文件内容。",
+          "path": "input.file",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": true
+        },
+        "max_files_per_turn": {
+          "kind": "number",
+          "label": "每轮最多",
+          "unit": "个",
+          "path": "input.max_files_per_turn",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 3
+        },
+        "file_max_bytes": {
+          "kind": "number",
+          "label": "单文件上限",
+          "unit": "MB",
+          "step": 1,
+          "scale": 1048576,
+          "path": "input.file_max_bytes",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 52428800
+        },
+        "file_extra_allowed_extensions": {
+          "kind": "words",
+          "label": "额外放行",
+          "empty": "只收内置白名单里的类型",
+          "placeholder": "输入一个扩展名，回车添加",
+          "path": "input.file_extra_allowed_extensions",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": ""
+        },
+        "enable_forward_msg_input": {
+          "kind": "bool",
+          "label": "读合并转发",
+          "desc": "展开合并转发的聊天记录。",
+          "path": "input.forward_msg",
+          "layers": [
+            "platform"
+          ],
+          "default": true
+        },
+        "forward_msg_max_depth": {
+          "kind": "number",
+          "label": "嵌套深度",
+          "unit": "层",
+          "path": "input.forward_msg_max_depth",
+          "layers": [
+            "platform"
+          ],
+          "default": 3
+        },
+        "forward_msg_max_messages": {
+          "kind": "number",
+          "label": "最多",
+          "unit": "条",
+          "step": 10,
+          "path": "input.forward_msg_max_messages",
+          "layers": [
+            "platform"
+          ],
+          "default": 80
+        },
+        "forward_msg_text_limit": {
+          "kind": "number",
+          "label": "总字数",
+          "unit": "字",
+          "step": 1000,
+          "path": "input.forward_msg_text_limit",
+          "layers": [
+            "platform"
+          ],
+          "default": 12000
+        },
+        "forward_msg_timeout_sec": {
+          "kind": "number",
+          "label": "展开超时",
+          "unit": "秒",
+          "step": 0.5,
+          "path": "input.forward_msg_timeout_sec",
+          "layers": [
+            "platform"
+          ],
+          "default": 8.0
+        },
+        "enable_forward_msg_media": {
+          "kind": "bool",
+          "label": "里面的图片和文件也收",
+          "path": "input.forward_msg_media",
+          "layers": [
+            "platform"
+          ],
+          "default": true
+        },
+        "forward_msg_expand_for_trigger": {
+          "kind": "bool",
+          "label": "群里靠关键词也能触发",
+          "path": "input.forward_msg_expand_for_trigger",
+          "layers": [
+            "platform"
+          ],
+          "default": true
+        },
+        "reply_to_trigger": {
+          "kind": "bool",
+          "label": "引用原消息",
+          "desc": "回复时引用触发它的那条消息，群里热闹时能看清在回谁。",
+          "path": "output.reply_to_trigger",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": true
+        },
+        "strip_asterisk_styles": {
+          "kind": "bool",
+          "label": "去掉星号强调",
+          "desc": "QQ 不渲染 Markdown，*强调* 会原样显示成星号。",
+          "path": "output.strip_asterisk_styles",
+          "layers": [
+            "platform"
+          ],
+          "default": true
+        },
+        "strip_underscore_styles": {
+          "kind": "bool",
+          "label": "去掉下划线强调",
+          "desc": "下划线同理。但代码和文件名里常有下划线，默认不动。",
+          "path": "output.strip_underscore_styles",
+          "layers": [
+            "platform"
+          ],
+          "default": false
+        },
+        "message_limit": {
+          "kind": "number",
+          "label": "单条消息",
+          "unit": "字",
+          "step": 100,
+          "path": "output.message_limit",
+          "layers": [
+            "platform"
+          ],
+          "default": 4300
+        },
+        "history_text_limit": {
+          "kind": "number",
+          "label": "历史里每条",
+          "unit": "字",
+          "step": 50,
+          "path": "output.history_text_limit",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 400
+        },
+        "enable_image_forward_merge": {
+          "kind": "bool",
+          "label": "合并发图",
+          "desc": "多张图合并成一条转发发出，而不是一张张发。",
+          "path": "output.image_forward_merge",
+          "layers": [
+            "platform"
+          ],
+          "default": false
+        },
+        "image_forward_merge_threshold": {
+          "kind": "number",
+          "label": "至少",
+          "unit": "张才合并",
+          "path": "output.image_forward_merge_threshold",
+          "layers": [
+            "platform"
+          ],
+          "default": 2
+        },
+        "enable_reactions": {
+          "kind": "bool",
+          "label": "表情回应",
+          "desc": "给群消息贴表情回应。",
+          "path": "extensions.reactions",
+          "layers": [
+            "platform"
+          ],
+          "default": true
+        },
+        "face_prompt_limit": {
+          "kind": "number",
+          "label": "最多列出",
+          "unit": "个",
+          "path": "output.face_prompt_limit",
+          "layers": [
+            "platform"
+          ],
+          "default": 50
+        },
+        "enable_auto_like": {
+          "kind": "bool",
+          "label": "自动点赞",
+          "desc": "给群友的资料卡点赞。",
+          "path": "extensions.auto_like",
+          "layers": [
+            "platform"
+          ],
+          "default": false
+        },
+        "auto_like_times": {
+          "kind": "number",
+          "label": "每人每天",
+          "unit": "次",
+          "path": "extensions.auto_like_times",
+          "layers": [
+            "platform"
+          ],
+          "default": 10
+        },
+        "enable_preempt": {
+          "kind": "bool",
+          "label": "抢答",
+          "desc": "上一条还没答完就来了新消息时，放弃旧的去答新的。",
+          "path": "extensions.preempt",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": false
+        },
+        "enable_echo": {
+          "kind": "bool",
+          "label": "跟复读",
+          "desc": "连着几个人刷同一句时，也跟一条。",
+          "path": "extensions.echo.enabled",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": false
+        },
+        "echo_threshold": {
+          "kind": "number",
+          "label": "连续",
+          "unit": "条才跟",
+          "path": "extensions.echo.threshold",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 3
+        },
+        "echo_max_length": {
+          "kind": "number",
+          "label": "最长",
+          "unit": "字",
+          "path": "extensions.echo.max_text_length",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 30
+        },
+        "echo_window_sec": {
+          "kind": "number",
+          "label": "时间窗",
+          "unit": "秒",
+          "path": "extensions.echo.window_sec",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 120.0
+        },
+        "echo_cooldown_sec": {
+          "kind": "number",
+          "label": "跟完歇",
+          "unit": "秒",
+          "path": "extensions.echo.cooldown_sec",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 90.0
+        },
+        "sticker_collect": {
+          "kind": "bool",
+          "label": "收集表情包",
+          "desc": "把群里刷过的表情包攒进图库。",
+          "path": "extensions.sticker.collect",
+          "layers": [
+            "platform"
+          ],
+          "default": false
+        },
+        "sticker_strategy": {
+          "kind": "choice",
+          "label": "收多严",
+          "choices": [
+            [
+              "strict",
+              "严格"
+            ],
+            [
+              "loose",
+              "宽松"
+            ],
+            [
+              "none",
+              "全收"
+            ]
+          ],
+          "path": "extensions.sticker.strategy",
+          "layers": [
+            "platform"
+          ],
+          "default": "loose"
+        },
+        "sticker_groups": {
+          "kind": "ids",
+          "label": "只从这些群收",
+          "empty": "所有已授权的群都收",
+          "placeholder": "输入群号，回车添加",
+          "path": "extensions.sticker.groups",
+          "layers": [
+            "platform"
+          ],
+          "default": []
+        },
+        "sticker_send_probability": {
+          "kind": "number",
+          "label": "每轮出现概率",
+          "step": 0.05,
+          "max": 1,
+          "path": "extensions.sticker.send_probability",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 0.2
+        },
+        "sticker_prompt_limit": {
+          "kind": "number",
+          "label": "最多列出",
+          "unit": "张",
+          "path": "extensions.sticker.prompt_limit",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 60
+        },
+        "sticker_repeat_window_sec": {
+          "kind": "number",
+          "label": "同图间隔",
+          "unit": "秒",
+          "step": 60,
+          "path": "extensions.sticker.repeat_window_sec",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 1800
+        },
+        "sticker_lookup_order": {
+          "kind": "choice",
+          "label": "重名时先用",
+          "choices": [
+            [
+              "native_first",
+              "收藏表情"
+            ],
+            [
+              "library_first",
+              "图库"
+            ]
+          ],
+          "path": "extensions.sticker.lookup_order",
+          "layers": [
+            "platform"
+          ],
+          "default": "native_first"
+        },
+        "sticker_combat": {
+          "kind": "bool",
+          "label": "接梗",
+          "desc": "群里连着刷图时跟着接一张。要求连图来自至少两个人，中间夹了纯文本就不算。",
+          "path": "extensions.sticker.combat",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": false
+        },
+        "sticker_burst_probability": {
+          "kind": "number",
+          "label": "发完再补一张的概率",
+          "step": 0.05,
+          "max": 1,
+          "path": "extensions.sticker.burst_probability",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 0.0
+        },
+        "enable_queue": {
+          "kind": "bool",
+          "label": "启用队列",
+          "desc": "按顺序一条条处理，避免同时开好几个对话。",
+          "path": "queue.enabled",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": false
+        },
+        "queue_workers": {
+          "kind": "number",
+          "label": "worker",
+          "unit": "个",
+          "path": "queue.workers",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 4
+        },
+        "queue_interval": {
+          "kind": "number",
+          "label": "间隔",
+          "unit": "秒",
+          "step": 0.5,
+          "path": "queue.interval_sec",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 2.0
+        },
+        "queue_wait_for_reply": {
+          "kind": "bool",
+          "label": "等回复",
+          "desc": "等上一条真的回完再取下一条，而不是发出去就算完。",
+          "path": "queue.wait_for_reply",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": false
+        },
+        "queue_reply_timeout": {
+          "kind": "number",
+          "label": "超时",
+          "unit": "秒",
+          "step": 10,
+          "path": "queue.reply_timeout_sec",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 120.0
+        },
+        "group_history_max": {
+          "kind": "number",
+          "label": "每群",
+          "unit": "条",
+          "path": "history.group_max",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 20
+        },
+        "group_history_undelivered_ratio": {
+          "kind": "number",
+          "label": "上限倍数",
+          "unit": "倍",
+          "step": 0.5,
+          "path": "history.undelivered_ratio",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 1.0
+        },
+        "enable_forward_bridge": {
+          "kind": "bool",
+          "label": "启用转发桥",
+          "desc": "关掉会立刻停掉这个本地端口。",
+          "path": "forward_bridge.enabled",
+          "layers": [
+            "platform"
+          ],
+          "default": true
+        },
+        "forward_bridge_max_messages": {
+          "kind": "number",
+          "label": "单次最多",
+          "unit": "条",
+          "path": "forward_bridge.max_messages",
+          "layers": [
+            "platform"
+          ],
+          "default": 30
+        }
+      }
+    }
+  }
+}
