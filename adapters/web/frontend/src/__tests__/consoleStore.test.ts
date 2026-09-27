@@ -2,7 +2,7 @@
 // 写 yaml 时才用 state 接口公布的 paths 转成点分路径。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ConfigInputRule } from '../api/supervisorClient';
+import type { ConfigInputRule, ConfigSource } from '../api/supervisorClient';
 import { FEATURES_SCOPE } from '../console/configScope';
 import { barState } from '../console/PlatformPage';
 import {
@@ -10,13 +10,14 @@ import {
   asWordList,
   configStore,
   countDraftFor,
+  displayedValue,
   effectiveValues,
   mergeDraft,
   platformConsoleStore,
   readInputRule,
   readTristate,
   setByPath,
-  useConsoleStore,
+  type ConfigConsoleStore,
 } from '../console/consoleStore';
 
 const PATHS: Record<string, string> = {
@@ -44,6 +45,23 @@ const seedLive = (values: Record<string, unknown>) => {
       applied: true,
       file: { exists: true, mtime_ns: 1, size: 1 },
       state: { values, paths: PATHS },
+    },
+    draft: {},
+  });
+};
+
+/** 带来源的生效快照。不给 sources 就是不公布来源的旧版生效方。 */
+const seedSourced = (
+  store: ConfigConsoleStore,
+  values: Record<string, unknown>,
+  sources?: Record<string, ConfigSource>,
+) => {
+  store.setState({
+    live: {
+      published: true,
+      applied: true,
+      file: { exists: true, mtime_ns: 1, size: 1 },
+      state: { values, paths: PATHS, ...(sources ? { sources } : {}) },
     },
     draft: {},
   });
@@ -262,6 +280,53 @@ describe('effectiveValues', () => {
   it('is an empty object before the bot has published anything', () => {
     expect(effectiveValues(platformConsoleStore('qq').getState())).toEqual({});
   });
+
+  it('resolves a key staged for deletion to the next layer', () => {
+    // 试听要按写回之后真正会跑的值判：平台文件删掉这一行，落到的是全局那份。
+    seedSourced(platformConsoleStore('qq'), { signal_name: true, signal_at: true }, { signal_name: 'platform', signal_at: 'platform' });
+    platformConsoleStore('qq').getState().inherit('signal_name');
+
+    expect(effectiveValues(platformConsoleStore('qq').getState(), { signal_name: false })).toMatchObject({
+      signal_name: false,
+      signal_at: true,
+    });
+  });
+
+  it('keeps the running value for a deleted key until the next layer arrives', () => {
+    seedSourced(platformConsoleStore('qq'), { signal_name: true }, { signal_name: 'platform' });
+    platformConsoleStore('qq').getState().inherit('signal_name');
+
+    expect(effectiveValues(platformConsoleStore('qq').getState())).toHaveProperty('signal_name', true);
+  });
+});
+
+describe('displayedValue', () => {
+  beforeEach(() => {
+    platformConsoleStore('qq').setState({ draft: {}, live: null });
+  });
+
+  it('shows the next layer for a key staged for deletion', () => {
+    seedSourced(platformConsoleStore('qq'), { signal_name: true }, { signal_name: 'platform' });
+    platformConsoleStore('qq').getState().inherit('signal_name');
+    const state = platformConsoleStore('qq').getState();
+
+    expect(displayedValue(state, 'signal_name', { signal_name: false })).toBe(false);
+    expect(readTristate(state, 'signal_name', { signal_name: false })).toBe(false);
+  });
+
+  it('leaves a deleted key without a value until the next layer arrives', () => {
+    // 交给控件自己的 fallback。拿现值顶上的话，选了「跟随全局」看着像没反应。
+    seedSourced(platformConsoleStore('qq'), { signal_name: true }, { signal_name: 'platform' });
+    platformConsoleStore('qq').getState().inherit('signal_name');
+
+    expect(displayedValue(platformConsoleStore('qq').getState(), 'signal_name')).toBeUndefined();
+  });
+
+  it('ignores the next layer while nothing is staged', () => {
+    seedSourced(platformConsoleStore('qq'), { signal_name: true }, { signal_name: 'platform' });
+
+    expect(displayedValue(platformConsoleStore('qq').getState(), 'signal_name', { signal_name: false })).toBe(true);
+  });
 });
 
 describe('addWord', () => {
@@ -416,6 +481,121 @@ describe('the draft counter', () => {
     await platformConsoleStore('qq').getState().apply('token');
 
     expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('inherit and pin', () => {
+  const qq = () => platformConsoleStore('qq');
+  const global = () => configStore(FEATURES_SCOPE);
+
+  beforeEach(() => {
+    qq().setState({ draft: {}, live: null, notice: '' });
+    global().setState({ draft: {}, live: null, notice: '' });
+  });
+
+  it('inherit stages a line deletion for a key the platform file sets', () => {
+    seedSourced(qq(), { cooldown_group_sec: 30 }, { cooldown_group_sec: 'platform' });
+
+    qq().getState().inherit('cooldown_group_sec');
+
+    expect(qq().getState().draft).toEqual({ cooldown_group_sec: null });
+  });
+
+  it('inherit on a key already following the global file only drops the pending edit', () => {
+    // 文件里本来就没这一行：记成删行什么也不改，头上却多挂一个「1 项待应用」。
+    seedSourced(qq(), { cooldown_group_sec: 30 }, { cooldown_group_sec: 'global' });
+    qq().getState().setDraft('cooldown_group_sec', 60);
+
+    qq().getState().inherit('cooldown_group_sec');
+
+    expect(qq().getState().draft).toEqual({});
+  });
+
+  it('inherit never stages a deletion when the bot does not publish sources', () => {
+    // 看不出这一行在不在文件里，删错了就是悄悄丢掉运营者写的值。
+    seedSourced(qq(), { cooldown_group_sec: 30 });
+
+    qq().getState().inherit('cooldown_group_sec');
+
+    expect(qq().getState().draft).toEqual({});
+  });
+
+  it('pin stages the running value even when it equals what is applied', () => {
+    // 按值比较会当成没改。写进平台文件之后全局再怎么改这个平台都不跟，这正是选「本平台」的意思。
+    seedSourced(qq(), { cooldown_group_sec: 30 }, { cooldown_group_sec: 'global' });
+
+    qq().getState().pin('cooldown_group_sec');
+
+    expect(qq().getState().draft).toEqual({ cooldown_group_sec: 30 });
+  });
+
+  it('pin writes the env fallback into the file', () => {
+    seedSourced(qq(), { cooldown_group_sec: 12 }, { cooldown_group_sec: 'env' });
+
+    qq().getState().pin('cooldown_group_sec');
+
+    expect(qq().getState().draft).toEqual({ cooldown_group_sec: 12 });
+  });
+
+  it('pin keeps an edit already in progress', () => {
+    seedSourced(qq(), { cooldown_group_sec: 30 }, { cooldown_group_sec: 'global' });
+    qq().getState().setDraft('cooldown_group_sec', 60);
+
+    qq().getState().pin('cooldown_group_sec');
+
+    expect(qq().getState().draft).toEqual({ cooldown_group_sec: 60 });
+  });
+
+  it('pin after inherit on a key the file sets just takes the deletion back', () => {
+    seedSourced(qq(), { cooldown_group_sec: 30 }, { cooldown_group_sec: 'platform' });
+    qq().getState().inherit('cooldown_group_sec');
+
+    qq().getState().pin('cooldown_group_sec');
+
+    expect(qq().getState().draft).toEqual({});
+  });
+
+  it('pin swaps a stale deletion for the running value once the line is gone', () => {
+    // 删行草稿还挂着，这一行却已经在别处删掉了：再钉得写回现值，否则写回去什么也不留。
+    seedSourced(qq(), { cooldown_group_sec: 30 }, { cooldown_group_sec: 'platform' });
+    qq().getState().inherit('cooldown_group_sec');
+    const { draft } = qq().getState();
+    seedSourced(qq(), { cooldown_group_sec: 45 }, { cooldown_group_sec: 'global' });
+    qq().setState({ draft });
+
+    qq().getState().pin('cooldown_group_sec');
+
+    expect(qq().getState().draft).toEqual({ cooldown_group_sec: 45 });
+  });
+
+  it('pin does nothing for a key whose value is not published', () => {
+    // undefined 进了草稿，写回时就成了删行。
+    seedSourced(qq(), {}, {});
+
+    qq().getState().pin('cooldown_group_sec');
+
+    expect(qq().getState().draft).toEqual({});
+  });
+
+  it('editing back to the applied value after a pin counts as undoing it', () => {
+    // 隐式改值一律按值比较；要钉同样的值得再点一次「本平台」。
+    seedSourced(qq(), { cooldown_group_sec: 30 }, { cooldown_group_sec: 'global' });
+    qq().getState().pin('cooldown_group_sec');
+    qq().getState().setDraft('cooldown_group_sec', 60);
+
+    qq().getState().setDraft('cooldown_group_sec', 30);
+
+    expect(qq().getState().draft).toEqual({});
+  });
+
+  it('on the global file the own layer is global and the next one is the built-in default', () => {
+    seedSourced(global(), { cooldown_group_sec: 30, signal_name: true }, { cooldown_group_sec: 'global', signal_name: 'default' });
+
+    global().getState().inherit('cooldown_group_sec');
+    global().getState().inherit('signal_name');
+    global().getState().pin('signal_name');
+
+    expect(global().getState().draft).toEqual({ cooldown_group_sec: null, signal_name: true });
   });
 });
 

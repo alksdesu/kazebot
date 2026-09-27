@@ -2,7 +2,10 @@
 // 平台页走 PlatformPage（状态栏 + 连接卡 + 折叠分区，分区来自后端 schema），机器人页与模型页走通用素壳。
 import { DiagnosticsPanel } from '../features/operations/DiagnosticsPanel';
 import { PlainPage } from './components';
+import { FEATURES_SCOPE, type ConfigScope } from './configScope';
 import { ConnectionCard } from './ConnectionCard';
+import { DEFAULTS_PAGE_SECTIONS, STICKERS_PAGE_SECTIONS } from './FeatureSection';
+import { FeaturesPage } from './FeaturesPage';
 import { MemoryPage } from './MemoryPage';
 import { ModelsPage } from './ModelsPage';
 import { PersonaPage } from './PersonaPage';
@@ -10,6 +13,7 @@ import { PlatformPage } from './PlatformPage';
 import { ProvidersPage } from './ProvidersPage';
 import { QQ_PARTS } from './qqParts';
 import type { PageParts } from './sectionParts';
+import type { SectionPick } from './sectionPick';
 import { StickersPage } from './StickersPage';
 import { QQ_NAPCAT, type PlatformDescriptor } from '../platforms/registry';
 
@@ -20,6 +24,10 @@ export interface ConsolePageDefinition {
   icon: string;
   note: string;
   Page: () => JSX.Element;
+  /** 这页摆的配置区块来自哪份控制台 schema。侧栏搜索按它索引分区名和字段标签。 */
+  configScope?: ConfigScope;
+  /** 这页摆那份 schema 里的哪几块。不给就是整份。 */
+  sections?: SectionPick;
 }
 
 /** 全平台共用的那几页：它是谁、记得什么、图库里有什么。 */
@@ -30,6 +38,15 @@ export const BOT_PAGES: ConsolePageDefinition[] = [
     icon: 'draft',
     Page: PersonaPage,
     note: 'bot 是谁、用哪个模型。两块各自保存，写的是节点文件，所有平台共用同一份。',
+  },
+  {
+    id: 'defaults',
+    label: '全局默认',
+    icon: 'public',
+    Page: FeaturesPage,
+    configScope: FEATURES_SCOPE,
+    sections: DEFAULTS_PAGE_SECTIONS,
+    note: '各平台没单独设置时用的值。每块各自保存，写进全局设置，不用重启；平台页里选了「本平台」的项不跟着变。',
   },
   {
     id: 'memory',
@@ -43,6 +60,8 @@ export const BOT_PAGES: ConsolePageDefinition[] = [
     label: '表情包图库',
     icon: 'photo_library',
     Page: StickersPage,
+    configScope: FEATURES_SCOPE,
+    sections: STICKERS_PAGE_SECTIONS,
     note: '全平台共用一份图库。群里收来的先进待审，人工转正之后才进候选；每块自己保存。',
   },
 ];

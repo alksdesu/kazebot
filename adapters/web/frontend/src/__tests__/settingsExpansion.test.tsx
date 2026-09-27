@@ -58,6 +58,7 @@ describe('expanded settings registry', () => {
       'advanced',
       // 机器人组：全平台共用的那几页。
       'persona',
+      'defaults',
       'memory',
       'stickers',
       'community',
@@ -80,6 +81,11 @@ describe('expanded settings registry', () => {
   it('id 不重复 —— 撞了的那个会被 getSettingsTab 永久遮住', () => {
     const ids = settingsTabs.map((tab) => tab.id);
     expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('order 不重复 —— 同号时谁排前面全看数组顺序，哪一组加一页就可能悄悄换位', () => {
+    const orders = settingsTabs.map((tab) => tab.order);
+    expect(new Set(orders).size).toBe(orders.length);
   });
 
   it('label 也不重复 —— 侧栏两行同名没法选', () => {

@@ -1,4 +1,4 @@
-// 表情包图库。全平台共用一份，改动立即写入；各平台自己的收集与发送规则在平台页里。
+// 表情包图库。全平台共用一份：图的增删改立即写入，入库规则按块保存进全局设置；各平台自己的收集与发送规则在平台页里。
 import { useEffect, useRef, useState } from 'react';
 
 import {
@@ -30,6 +30,7 @@ import {
   Panel,
   Segmented,
 } from './components';
+import { StandaloneFeatureSection, STICKER_LIBRARY_SECTION } from './FeatureSection';
 import { sizeText } from './format';
 import { VisionChannelBlock } from './VisionChannelBlock';
 
@@ -407,6 +408,8 @@ const LibraryBlock = () => {
 export const StickersPage = () => (
   <>
     <LibraryBlock />
+    {/* 入库规则写的是全局设置文件，和上面立刻执行的操作不同，改完要点这一块自己的保存。 */}
+    <StandaloneFeatureSection leaveMessage="「入库」里还有没保存的修改，确定离开吗？" sectionId={STICKER_LIBRARY_SECTION} />
     <VisionChannelBlock />
     <Footnote>
       只有在库且打过标的图才会进候选 —— 没打标的图对模型来说是不可描述的，给了也挑不出来。

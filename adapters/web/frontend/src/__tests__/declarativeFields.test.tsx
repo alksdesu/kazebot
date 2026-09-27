@@ -1,11 +1,11 @@
 // 声明驱动：字段按后端 schema 渲染、复杂件按分区交给页面、草稿与 API 按配置作用域分家。
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ReactNode } from 'react';
 
 import * as api from '../api/supervisorClient';
-import type { ConfigLiveState, ConsoleFieldSchema, ConsoleNode } from '../api/supervisorClient';
-import { ConfigScopeProvider, FEATURES_SCOPE, platformScope } from '../console/configScope';
+import type { ConfigLiveState, ConfigSource, ConsoleFieldSchema, ConsoleNode } from '../api/supervisorClient';
+import { ConfigScopeProvider, FEATURES_SCOPE, platformScope, type ConfigScope } from '../console/configScope';
 import { configStore, platformConsoleStore } from '../console/consoleStore';
 import { SchemaFields } from '../console/FieldRenderer';
 import { PlatformProvider } from '../console/platformContext';
@@ -158,6 +158,133 @@ describe('按 schema 渲染字段', () => {
     renderNodes([{ kind: 'field', key: 'ghost' }, { kind: 'desc', text: '后面照常' }]);
 
     expect(screen.getByText('后面照常')).toBeInTheDocument();
+  });
+});
+
+// 共享键两层都写得进；图库那项只认全局；好友私聊只认平台文件。
+const LAYERED: Record<string, ConsoleFieldSchema> = {
+  enable_echo: field({ kind: 'bool', label: '跟复读', layers: ['global', 'platform'], default: false }),
+  name_words: field({ kind: 'words', label: '认这些名字', layers: ['global', 'platform'], empty: '没有名字', placeholder: '输入一个名字' }),
+  sticker_auto_accept: field({ kind: 'bool', label: '跳过人工筛选', layers: ['global'], default: false }),
+  allow_private_friends: field({ kind: 'bool', label: '好友私聊', layers: ['platform'], default: true }),
+};
+
+/** 不给 sources 就是不公布来源的旧版生效方。 */
+const sourced = (values: Record<string, unknown>, sources?: Record<string, ConfigSource>): ConfigLiveState => ({
+  published: true,
+  applied: true,
+  file: { exists: true, mtime_ns: 1, size: 1 },
+  state: { values, paths: {}, ...(sources ? { sources } : {}) },
+});
+
+const renderLayered = (keys: readonly string[], scope: ConfigScope = platformScope('qq')) => render(
+  <PlatformProvider platform={QQ_NAPCAT}>
+    <ConfigScopeProvider scope={scope}>
+      <SchemaFields fields={LAYERED} nodes={keys.map((key): ConsoleNode => ({ kind: 'field', key }))} sectionId="demo" />
+    </ConfigScopeProvider>
+  </PlatformProvider>,
+);
+
+const sourceSwitch = (label: string) => screen.getByRole('group', { name: `${label}的来源` });
+
+/** 来源切换里按下去的那一项。 */
+const pickedSource = (label: string): string => within(sourceSwitch(label))
+  .getAllByRole('button')
+  .filter((button) => button.getAttribute('aria-pressed') === 'true')
+  .map((button) => button.textContent || '')
+  .join('|');
+
+describe('来源切换', () => {
+  it('平台文件写着的共享键按下「本平台」，没写的按下「跟随全局」', () => {
+    platformConsoleStore('qq').setState({
+      live: sourced({ enable_echo: true, name_words: ['咪啪'] }, { enable_echo: 'platform', name_words: 'global' }),
+      draft: {},
+    });
+    renderLayered(['enable_echo', 'name_words']);
+
+    expect(pickedSource('跟复读')).toBe('本平台');
+    expect(pickedSource('认这些名字')).toBe('跟随全局');
+  });
+
+  it('选「跟随全局」记成删行，没应用之前就显示全局那边的值', () => {
+    // 全局写的和内置默认（关）不同，才分得出显示的是全局那份还是控件的 fallback。
+    platformConsoleStore('qq').setState({ live: sourced({ enable_echo: false }, { enable_echo: 'platform' }), draft: {} });
+    configStore(FEATURES_SCOPE).setState({ live: sourced({ enable_echo: true }), draft: {} });
+    renderLayered(['enable_echo']);
+    expect(screen.getByRole('checkbox', { name: /跟复读/ })).not.toBeChecked();
+
+    fireEvent.click(within(sourceSwitch('跟复读')).getByRole('button', { name: '跟随全局' }));
+
+    expect(platformConsoleStore('qq').getState().draft).toEqual({ enable_echo: null });
+    expect(screen.getByRole('checkbox', { name: /跟复读/ })).toBeChecked();
+    expect(pickedSource('跟复读')).toBe('跟随全局');
+  });
+
+  it('选「本平台」把眼下的值钉进草稿，词表照旧显示', () => {
+    platformConsoleStore('qq').setState({ live: sourced({ name_words: ['咪啪'] }, { name_words: 'global' }), draft: {} });
+    renderLayered(['name_words']);
+
+    fireEvent.click(within(sourceSwitch('认这些名字')).getByRole('button', { name: '本平台' }));
+
+    expect(platformConsoleStore('qq').getState().draft).toEqual({ name_words: ['咪啪'] });
+    expect(pickedSource('认这些名字')).toBe('本平台');
+    expect(screen.getByText('咪啪')).toBeInTheDocument();
+  });
+
+  it('跟随着的时候改值，就算写进本平台', () => {
+    platformConsoleStore('qq').setState({ live: sourced({ enable_echo: false }, { enable_echo: 'global' }), draft: {} });
+    renderLayered(['enable_echo']);
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /跟复读/ }));
+
+    expect(platformConsoleStore('qq').getState().draft).toEqual({ enable_echo: true });
+    expect(pickedSource('跟复读')).toBe('本平台');
+  });
+
+  it('只能写在平台文件的键不给切换', () => {
+    platformConsoleStore('qq').setState({
+      live: sourced({ allow_private_friends: true }, { allow_private_friends: 'platform' }),
+      draft: {},
+    });
+    renderLayered(['allow_private_friends']);
+
+    expect(screen.getByRole('checkbox', { name: /好友私聊/ })).toBeChecked();
+    expect(screen.queryByRole('group', { name: '好友私聊的来源' })).toBeNull();
+  });
+
+  it('bot 没公布来源时不给切换，免得删错行', () => {
+    platformConsoleStore('qq').setState({ live: sourced({ enable_echo: true }), draft: {} });
+    renderLayered(['enable_echo']);
+
+    expect(screen.queryByRole('group', { name: '跟复读的来源' })).toBeNull();
+  });
+
+  it('全局没写、眼下用的是平台的环境变量时说一声，钉住之后不再提', () => {
+    platformConsoleStore('qq').setState({ live: sourced({ enable_echo: true }, { enable_echo: 'env' }), draft: {} });
+    renderLayered(['enable_echo']);
+    expect(pickedSource('跟复读')).toBe('跟随全局');
+    expect(screen.getByText('眼下用的是环境变量')).toBeInTheDocument();
+
+    fireEvent.click(within(sourceSwitch('跟复读')).getByRole('button', { name: '本平台' }));
+
+    expect(platformConsoleStore('qq').getState().draft).toEqual({ enable_echo: true });
+    expect(screen.queryByText('眼下用的是环境变量')).toBeNull();
+  });
+
+  it('全局页上是「默认 / 自定义」，只认全局的键也能回到默认', () => {
+    configStore(FEATURES_SCOPE).setState({
+      live: sourced({ sticker_auto_accept: true, enable_echo: false }, { sticker_auto_accept: 'global', enable_echo: 'default' }),
+      draft: {},
+    });
+    renderLayered(['sticker_auto_accept', 'enable_echo'], FEATURES_SCOPE);
+    expect(pickedSource('跳过人工筛选')).toBe('自定义');
+    expect(pickedSource('跟复读')).toBe('默认');
+
+    fireEvent.click(within(sourceSwitch('跳过人工筛选')).getByRole('button', { name: '默认' }));
+
+    expect(configStore(FEATURES_SCOPE).getState().draft).toEqual({ sticker_auto_accept: null });
+    // 全局下面只剩内置默认，控件按 schema 的 default 显示。
+    expect(screen.getByRole('checkbox', { name: /跳过人工筛选/ })).not.toBeChecked();
   });
 });
 

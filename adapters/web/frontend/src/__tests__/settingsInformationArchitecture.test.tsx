@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { PersonaPage } from '../console/PersonaPage';
 import { StickersPage } from '../console/StickersPage';
 import { BOT_PAGES, MODEL_PAGES, PLATFORM_PAGES } from '../console/pages';
+import { picksSection } from '../console/sectionPick';
 import { resolveSettingsLocation, TAB_ALIASES } from '../components/settings/settingsTabAliases';
 import { getSettingsTab, settingsTabs, type SettingsGroup } from '../components/settings/settingsTabs';
 import { useSettingsStore } from '../store/settingsStore';
@@ -17,7 +18,7 @@ const idsInGroup = (group: SettingsGroup) =>
 describe('设置分组归属', () => {
   it('机器人组放全平台共用的那几页', () => {
     expect(idsInGroup('bot')).toEqual([
-      'persona', 'memory', 'stickers', 'community', 'conversation', 'reminders',
+      'persona', 'defaults', 'memory', 'stickers', 'community', 'conversation', 'reminders',
     ]);
   });
 
@@ -50,9 +51,11 @@ describe('旧 id 别名', () => {
       expect(ids.has(target.tab)).toBe(true);
       expect(ids.has(legacy)).toBe(false);
       if (!target.section) continue;
-      const scope = settingsTabs.find(tab => tab.id === target.tab)!.configScope;
-      const sections = scope ? snapshotFor(scope)?.sections || [] : [];
-      expect(sections.map(section => section.id)).toContain(target.section);
+      // 一份 schema 分摆几页时，别名只能指到这页真摆着的那块。
+      const tab = settingsTabs.find(entry => entry.id === target.tab)!;
+      const sections = tab.configScope ? snapshotFor(tab.configScope)?.sections || [] : [];
+      const shown = sections.filter(section => picksSection(tab.sections, section.id));
+      expect(shown.map(section => section.id)).toContain(target.section);
     }
   });
 

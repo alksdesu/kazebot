@@ -1,13 +1,14 @@
 // 号码表：群白名单、私聊白名单、管理员名单共用。备注只存本地，见 aliases.ts。
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 
 import { aliasKey, readAliases, writeAlias, type AliasMap } from './aliases';
 import { ErrorText, Input } from './components';
 import { addId, idIsValid, useConsoleStore, useIdList, useInputRule } from './consoleStore';
 import { usePlatform } from './platformContext';
-import { LIST_SPACING, type ListSpacing } from './WordList';
+import { LIST_SPACING, ListLabel, type ListSpacing } from './WordList';
 
 interface IdListProps {
+  aside?: ReactNode;
   configKey: string;
   empty: string;
   label: string;
@@ -15,7 +16,7 @@ interface IdListProps {
   spacing?: ListSpacing;
 }
 
-export const IdList = ({ configKey, empty, label, placeholder, spacing = 'option' }: IdListProps) => {
+export const IdList = ({ aside, configKey, empty, label, placeholder, spacing = 'option' }: IdListProps) => {
   const platform = usePlatform();
   const setDraft = useConsoleStore((state) => state.setDraft);
   const ids = useIdList(configKey);
@@ -38,7 +39,7 @@ export const IdList = ({ configKey, empty, label, placeholder, spacing = 'option
 
   return (
     <div className={LIST_SPACING[spacing]}>
-      <span className="mb-1.5 block text-xs text-[var(--duties-secondary)]">{label}</span>
+      <ListLabel aside={aside} label={label} />
       <div className="mb-2 flex flex-col gap-1">
         {ids.length === 0 && <span className="text-xs text-[var(--duties-secondary)]">{empty}</span>}
         {ids.map((id) => (

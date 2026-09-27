@@ -11,7 +11,8 @@ import {
   toRequest,
   useAuditionStore,
 } from '../console/auditionStore';
-import { platformConsoleStore } from '../console/consoleStore';
+import { FEATURES_SCOPE } from '../console/configScope';
+import { configStore, platformConsoleStore } from '../console/consoleStore';
 
 const PATHS: Record<string, string> = {
   signal_at: 'trigger.signals.at',
@@ -150,6 +151,7 @@ describe('the message list', () => {
 describe('run', () => {
   beforeEach(() => {
     platformConsoleStore('qq').setState({ draft: {}, live: null });
+    configStore(FEATURES_SCOPE).setState({ draft: {}, live: null });
     useAuditionStore.setState({
       messages: [newMessage({ text: '咪啪在吗' })],
       result: null,
@@ -201,6 +203,38 @@ describe('run', () => {
     }
 
     expect(capture.body.config).toHaveProperty('signal_at', null);
+  });
+
+  it('judges a key set back to follow the global file by the global value', async () => {
+    // 平台页选了「跟随全局」还没应用：写回之后跑的是全局那份，试听不能还拿平台文件里要删掉的那行。
+    platformConsoleStore('qq').setState({
+      live: {
+        published: true,
+        applied: true,
+        file: { exists: true, mtime_ns: 1, size: 1 },
+        state: { values: { signal_name: true }, paths: PATHS, sources: { signal_name: 'platform' } },
+      },
+      draft: {},
+    });
+    platformConsoleStore('qq').getState().inherit('signal_name');
+    configStore(FEATURES_SCOPE).setState({
+      live: {
+        published: true,
+        applied: true,
+        file: { exists: true, mtime_ns: 1, size: 1 },
+        state: { values: { signal_name: false }, paths: PATHS },
+      },
+    });
+    const capture: { body?: any } = {};
+    const restore = stubFetch(capture);
+
+    try {
+      await useAuditionStore.getState().run('token', 'qq');
+    } finally {
+      restore();
+    }
+
+    expect(capture.body.config).toHaveProperty('signal_name', false);
   });
 
   it('records which messages the answer belongs to', async () => {

@@ -61,6 +61,7 @@ describe('Material Symbols SVG icon system', () => {
       'schedule',
       'code',
       'draft',
+      'public',
       'psychology',
       'photo_library',
       'groups',

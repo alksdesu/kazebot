@@ -6,6 +6,7 @@ import { Block, Desc, Fixed, Footnote, Grid, Loose, Panel } from './components';
 import { useLiveValue } from './consoleStore';
 import { BoolOption, ChoiceField, NumberField, PercentField, SubOption, TextField, TristateOption } from './fields';
 import { IdList } from './IdList';
+import { LayerSwitch } from './LayerSwitch';
 import { RichText } from './RichText';
 import { useSectionParts } from './sectionParts';
 import { WordList } from './WordList';
@@ -26,7 +27,8 @@ const Children = ({ context, nodes }: { context: Context; nodes?: readonly Conso
 );
 
 /** 没配时跟着另一个键推导的三态。读那个键要占一次 hook，所以单独一层组件。 */
-const DerivedTristate = ({ configKey, follows, spec }: {
+const DerivedTristate = ({ aside, configKey, follows, spec }: {
+  aside?: ReactNode;
   configKey: string;
   follows: string;
   spec: ConsoleFieldSchema;
@@ -35,6 +37,7 @@ const DerivedTristate = ({ configKey, follows, spec }: {
   const when = spec.follows_when || [];
   return (
     <TristateOption
+      aside={aside}
       configKey={configKey}
       desc={rich(spec.desc)}
       fallback={when.includes(String(source).toLowerCase())}
@@ -54,22 +57,33 @@ const FieldControl = ({ context, node }: { context: Context; node: FieldNodeSpec
   // 后端建 schema 时校验过摆出来的键都有说明；缺了只可能是前后端版本错开，少画一格比崩掉整页好。
   if (!spec) return null;
   const children = node.children?.length ? <Children context={context} nodes={node.children} /> : undefined;
+  // 全局那层写得进的键才谈得上跟随：平台页上是「跟随全局 / 本平台」，全局页上每一项都能回到默认。
+  const aside = spec.layers.includes('global') ? <LayerSwitch configKey={node.key} label={spec.label} /> : undefined;
   switch (spec.kind) {
     case 'bool':
       return node.sub
-        ? <SubOption configKey={node.key} fallback={spec.default === true} label={spec.label} />
+        ? <SubOption aside={aside} configKey={node.key} fallback={spec.default === true} label={spec.label} />
         : (
-          <BoolOption configKey={node.key} desc={rich(spec.desc)} fallback={spec.default === true} label={spec.label}>
+          <BoolOption aside={aside} configKey={node.key} desc={rich(spec.desc)} fallback={spec.default === true} label={spec.label}>
             {children}
           </BoolOption>
         );
     case 'tristate':
       return spec.follows
-        ? <DerivedTristate configKey={node.key} follows={spec.follows} spec={spec} />
-        : <TristateOption configKey={node.key} desc={rich(spec.desc)} fallback={spec.unset === true} label={spec.label} />;
+        ? <DerivedTristate aside={aside} configKey={node.key} follows={spec.follows} spec={spec} />
+        : (
+          <TristateOption
+            aside={aside}
+            configKey={node.key}
+            desc={rich(spec.desc)}
+            fallback={spec.unset === true}
+            label={spec.label}
+          />
+        );
     case 'number':
       return (
         <NumberField
+          aside={aside}
           configKey={node.key}
           fallback={typeof spec.default === 'number' ? spec.default : 0}
           label={spec.label}
@@ -80,12 +94,13 @@ const FieldControl = ({ context, node }: { context: Context; node: FieldNodeSpec
         />
       );
     case 'percent':
-      return <PercentField configKey={node.key} label={spec.label} />;
+      return <PercentField aside={aside} configKey={node.key} label={spec.label} />;
     case 'text':
-      return <TextField configKey={node.key} label={spec.label} />;
+      return <TextField aside={aside} configKey={node.key} label={spec.label} />;
     case 'choice':
       return (
         <ChoiceField
+          aside={aside}
           choices={spec.choices || []}
           configKey={node.key}
           fallback={typeof spec.default === 'string' ? spec.default : ''}
@@ -95,6 +110,7 @@ const FieldControl = ({ context, node }: { context: Context; node: FieldNodeSpec
     case 'words':
       return (
         <WordList
+          aside={aside}
           configKey={node.key}
           empty={spec.empty || ''}
           label={spec.label}
@@ -105,6 +121,7 @@ const FieldControl = ({ context, node }: { context: Context; node: FieldNodeSpec
     case 'ids':
       return (
         <IdList
+          aside={aside}
           configKey={node.key}
           empty={spec.empty || ''}
           label={spec.label}

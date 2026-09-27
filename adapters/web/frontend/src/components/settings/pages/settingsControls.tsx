@@ -138,6 +138,8 @@ export const Loose = ({ children }: { children: ReactNode }) => (
 const CHECKBOX = 'h-[var(--duties-checkbox-size)] w-[var(--duties-checkbox-size)] flex-none accent-[var(--duties-text)]';
 
 interface OptionProps {
+  /** 开关名右边的东西，比如来源切换。 */
+  aside?: ReactNode;
   checked: boolean;
   children?: ReactNode;
   desc?: ReactNode;
@@ -145,22 +147,25 @@ interface OptionProps {
   onChange: (checked: boolean) => void;
 }
 
-// children 刻意留在 label 外面：词表和数字框都在这一层，包进 label 之后点它们旁边的
-// 空白会连带翻转开关。
-export const Option = ({ checked, children, desc, name, onChange }: OptionProps) => (
+// children 和 aside 刻意留在 label 外面：词表、数字框、来源切换包进 label 之后，
+// 点它们或旁边的空白会连带翻转开关。
+export const Option = ({ aside, checked, children, desc, name, onChange }: OptionProps) => (
   <div className="bg-[var(--duties-surface)] px-4 py-3.5">
-    <label className="block cursor-pointer text-sm">
-      <span className="flex min-h-[var(--duties-control-size)] items-center gap-2.5">
-        <input
-          checked={checked}
-          className={CHECKBOX}
-          onChange={(event) => onChange(event.target.checked)}
-          type="checkbox"
-        />
-        <span className="font-medium">{name}</span>
-      </span>
-      {desc && <p className={`ml-[var(--duties-option-indent)] mt-1.5 text-xs leading-5 ${MUTED}`}>{desc}</p>}
-    </label>
+    <div className="flex items-start gap-2.5">
+      <label className="block min-w-0 flex-1 cursor-pointer text-sm">
+        <span className="flex min-h-[var(--duties-control-size)] items-center gap-2.5">
+          <input
+            checked={checked}
+            className={CHECKBOX}
+            onChange={(event) => onChange(event.target.checked)}
+            type="checkbox"
+          />
+          <span className="font-medium">{name}</span>
+        </span>
+        {desc && <p className={`ml-[var(--duties-option-indent)] mt-1.5 text-xs leading-5 ${MUTED}`}>{desc}</p>}
+      </label>
+      {aside && <span className="flex min-h-[var(--duties-control-size)] flex-none items-center">{aside}</span>}
+    </div>
     {children}
   </div>
 );
@@ -187,29 +192,39 @@ export const Fixed = ({ children, desc, name }: {
 );
 
 /** 附属于某个开关的次级选项。层级靠缩进表达。 */
-export const Sub = ({ checked, label, onChange }: {
+export const Sub = ({ aside, checked, label, onChange }: {
+  /** 跟在选项后面的东西。放在 label 外面，点它不会连带勾选。 */
+  aside?: ReactNode;
   checked: boolean;
   label: string;
   onChange: (checked: boolean) => void;
 }) => (
-  <label className={`ml-[var(--duties-option-indent)] mt-2.5 flex min-h-[var(--duties-control-size)] cursor-pointer items-center gap-2.5 text-sm ${MUTED}`}>
-    <input
-      checked={checked}
-      className={CHECKBOX}
-      onChange={(event) => onChange(event.target.checked)}
-      type="checkbox"
-    />
-    <span>{label}</span>
-  </label>
+  <div className="ml-[var(--duties-option-indent)] mt-2.5 flex min-h-[var(--duties-control-size)] flex-wrap items-center gap-2.5">
+    <label className={`flex cursor-pointer items-center gap-2.5 text-sm ${MUTED}`}>
+      <input
+        checked={checked}
+        className={CHECKBOX}
+        onChange={(event) => onChange(event.target.checked)}
+        type="checkbox"
+      />
+      <span>{label}</span>
+    </label>
+    {aside}
+  </div>
 );
 
-/** 带标签的字段。inline 是跟在开关下面的一行，stacked 是标签压在控件上方的表单式。 */
-export const Field = ({ children, htmlFor, label, layout = 'inline' }: {
+type FieldProps = {
   children?: ReactNode;
   htmlFor?: string;
   label: ReactNode;
-  layout?: 'inline' | 'stacked';
-}) => (
+} & (
+  // aside 只有 inline 一行里放得下：跟在控件后面，比如来源切换。
+  | { aside?: ReactNode; layout?: 'inline' }
+  | { aside?: never; layout: 'stacked' }
+);
+
+/** 带标签的字段。inline 是跟在开关下面的一行，stacked 是标签压在控件上方的表单式。 */
+export const Field = ({ aside, children, htmlFor, label, layout = 'inline' }: FieldProps) => (
   layout === 'stacked' ? (
     <>
       <label className="mb-1 block text-sm font-medium text-[var(--duties-secondary)]" htmlFor={htmlFor}>{label}</label>
@@ -219,6 +234,7 @@ export const Field = ({ children, htmlFor, label, layout = 'inline' }: {
     <span className="ml-[var(--duties-option-indent)] mt-2.5 flex min-w-0 flex-wrap items-center gap-2.5 text-sm">
       <label className={MUTED} htmlFor={htmlFor}>{label}</label>
       {children}
+      {aside}
     </span>
   )
 );
@@ -407,19 +423,28 @@ export const LinkButton = ({ tone = 'quiet', size = 'default', className = '', .
 );
 
 /** 横排档位。三四个选项摊开比点开下拉更快，边框合并成一条。 */
-export const Segmented = <T extends string>({ choices, onPick, value, label, disabled = false }: {
+export type SegmentedSize = 'regular' | 'compact';
+
+const SEGMENT_SIZE: Record<SegmentedSize, string> = {
+  regular: 'settings-segment px-3 py-2 text-sm',
+  compact: 'settings-segment-compact px-2 py-0.5 text-xs',
+};
+
+export const Segmented = <T extends string>({ choices, onPick, value, label, disabled = false, size = 'regular' }: {
   choices: ReadonlyArray<readonly [T, string]>;
   onPick: (value: T) => void;
   value: T;
   label?: string;
   disabled?: boolean;
+  /** compact 给挂在字段标题旁的小切换用，和控件本身的分段按钮一眼分得开。 */
+  size?: SegmentedSize;
 }) => (
   <div className="flex min-w-0 max-w-full flex-wrap border border-[var(--duties-border)]" role="group" aria-label={label}>
     {choices.map(([option, text]) => (
       <button
         disabled={disabled}
         aria-pressed={option === value}
-        className={`app-button settings-segment border-l border-[var(--duties-border)] px-3 py-2 text-sm first:border-l-0 ${
+        className={`app-button border-l border-[var(--duties-border)] ${SEGMENT_SIZE[size]} first:border-l-0 ${
           option === value
             ? 'bg-[var(--duties-text)] text-[var(--duties-bg)]'
             : `bg-[var(--duties-panel)] ${MUTED} hover:bg-[var(--duties-muted)] hover:text-[var(--duties-text)]`

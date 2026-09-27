@@ -1,5 +1,5 @@
 // 平台页：固定状态栏 + 连接卡 + 折叠分区。分区和字段来自后端 schema，展开状态只存在这台浏览器里。
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, type ReactNode } from 'react';
 
 import type { ConsoleSchema, ConsoleSectionSchema } from '../api/supervisorClient';
 import {
@@ -12,14 +12,14 @@ import {
 } from '../components/settings/pages/settingsControls';
 import { useSettingsStore } from '../store/settingsStore';
 import { scopedKey } from '../store/storageKey';
-import { useViewStore } from '../store/viewStore';
 import type { PlatformDescriptor } from '../platforms/registry';
-import { platformScope } from './configScope';
-import { useConsoleStore, useSectionPending } from './consoleStore';
+import { FEATURES_SCOPE, platformScope } from './configScope';
+import { configStore, useConsoleStore, useSectionPending } from './consoleStore';
 import { SchemaFields } from './FieldRenderer';
 import { PlatformProvider } from './platformContext';
 import { useConsoleSchema, useSchemaStore } from './schemaStore';
-import { Section } from './Section';
+import { Section, SectionNote } from './Section';
+import { SectionAnchor, useSectionOpenState } from './sectionOpen';
 import { PartsProvider, useSectionParts, type PageParts } from './sectionParts';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
@@ -64,29 +64,6 @@ const PlatformStatusBar = ({ confirmDiscard }: { confirmDiscard: () => boolean }
   );
 };
 
-type OpenMap = Record<string, boolean>;
-
-function readOpenMap(storeKey: string): OpenMap {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(storeKey) || '{}');
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    return Object.fromEntries(
-      Object.entries(parsed).filter(([, open]) => typeof open === 'boolean'),
-    ) as OpenMap;
-  } catch {
-    // 存坏了就按默认展开状态来，不该把整页拖垮。
-    return {};
-  }
-}
-
-function writeOpenMap(storeKey: string, value: OpenMap): void {
-  try {
-    localStorage.setItem(storeKey, JSON.stringify(value));
-  } catch {
-    // 隐私模式下 localStorage 会抛，记不住展开状态不影响配置本身。
-  }
-}
-
 const SectionEntry = ({ deepLinked, fields, onToggle, open, section }: {
   deepLinked: boolean;
   fields: ConsoleSchema['fields'];
@@ -96,17 +73,9 @@ const SectionEntry = ({ deepLinked, fields, onToggle, open, section }: {
 }) => {
   const pending = useSectionPending(section.paths);
   const Summary = useSectionParts(section.id)?.Summary;
-  const anchor = useRef<HTMLDivElement>(null);
-
-  // 深链进来要滚到这一块。等展开渲染完再滚，否则量到的是收起时的位置。
-  useEffect(() => {
-    if (!deepLinked || !open) return;
-    // 可选调用：jsdom 和一些内嵌浏览器没有这个方法，缺它不该把整页打挂。
-    anchor.current?.scrollIntoView?.({ block: 'start' });
-  }, [deepLinked, open]);
 
   return (
-    <div ref={anchor}>
+    <SectionAnchor deepLinked={deepLinked} open={open}>
       <Section
         icon={section.icon}
         id={section.id}
@@ -116,12 +85,10 @@ const SectionEntry = ({ deepLinked, fields, onToggle, open, section }: {
         summary={Summary ? <Summary /> : null}
         title={section.label}
       >
-        <p className="mb-4 max-w-[var(--duties-prose-max-width)] text-xs leading-5 text-[var(--duties-secondary)]">
-          {section.note}
-        </p>
+        <SectionNote>{section.note}</SectionNote>
         <SchemaFields fields={fields} nodes={section.nodes} sectionId={section.id} />
       </Section>
-    </div>
+    </SectionAnchor>
   );
 };
 
@@ -140,36 +107,23 @@ const PlatformPageBody = ({ connection, note, platform }: Omit<PlatformPageProps
   const scope = platformScope(platform.id);
   const { schema, error: schemaError } = useConsoleSchema(scope);
   const loadSchema = useSchemaStore((state) => state.load);
-  const requestedSection = useViewStore((state) => state.activeSettingsSection);
+  const refreshInherited = configStore(FEATURES_SCOPE)((state) => state.refresh);
   const confirmDiscard = useUnsavedChanges(
     Object.keys(draft).length > 0,
     `${platform.displayName} 配置还有未应用修改，确定离开或丢弃吗？`,
   );
   const parseError = String(live?.state?.parse_error || '');
 
-  const storeKey = scopedKey(`console_sections_${platform.id}`);
-  const [openMap, setOpenMap] = useState<OpenMap>(() => readOpenMap(storeKey));
-
-  const toggle = useCallback((id: string) => {
-    setOpenMap((current) => {
-      const next = { ...current, [id]: !current[id] };
-      writeOpenMap(storeKey, next);
-      return next;
-    });
-  }, [storeKey]);
-
-  // 深链指名的那一块无条件展开，记住的收起状态不该挡住它。
-  useEffect(() => {
-    if (!requestedSection) return;
-    setOpenMap((current) => (current[requestedSection] ? current : { ...current, [requestedSection]: true }));
-  }, [requestedSection]);
+  const { isOpen, requested, toggle } = useSectionOpenState(scopedKey(`console_sections_${platform.id}`));
 
   // 各设置页之间没有共同的父组件替它们拉，只能每页各自拉一次。
+  // 全局那份也拉：共享键选「跟随全局」之后，没应用之前要显示全局那边的值。
   useEffect(() => {
     if (!adminToken) return;
     void refresh(adminToken);
+    void refreshInherited(adminToken);
     void loadSchema(adminToken, scope);
-  }, [adminToken, loadSchema, refresh, scope]);
+  }, [adminToken, loadSchema, refresh, refreshInherited, scope]);
 
   const published = Boolean(live?.published);
   const body = loading && !live ? <Empty>正在读取配置…</Empty>
@@ -206,11 +160,11 @@ const PlatformPageBody = ({ connection, note, platform }: Omit<PlatformPageProps
             // 不写平台配置的分区（账号与连接）在 bot 没上报时照样能用。
             (published || !section.paths.length) && (
               <SectionEntry
-                deepLinked={requestedSection === section.id}
+                deepLinked={requested === section.id}
                 fields={schema.fields}
                 key={section.id}
                 onToggle={toggle}
-                open={Boolean(openMap[section.id])}
+                open={isOpen(section.id)}
                 section={section}
               />
             )

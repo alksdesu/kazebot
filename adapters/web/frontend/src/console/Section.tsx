@@ -1,4 +1,4 @@
-// 平台页的折叠分区：收起时一行摘要，展开才渲染正文。
+// 折叠分区：收起时一行摘要，展开才渲染正文。平台页和全局默认页共用。
 import { useId, type ReactNode } from 'react';
 
 import { Icon } from '../components/common';
@@ -6,6 +6,8 @@ import { ErrorText } from './components';
 
 interface SectionProps {
   children: ReactNode;
+  /** 待写回的改动叫什么：平台页攒着一起「应用」，全局设置按区块「保存」。 */
+  commitVerb?: '应用' | '保存';
   /** 深链锚点，同时是记住展开状态的键。 */
   id: string;
   error?: string;
@@ -20,7 +22,7 @@ interface SectionProps {
 }
 
 export const Section = ({
-  children, error, icon, id, onToggle, open, pending = 0, summary, title,
+  children, commitVerb = '应用', error, icon, id, onToggle, open, pending = 0, summary, title,
 }: SectionProps) => {
   const bodyId = useId();
 
@@ -40,7 +42,7 @@ export const Section = ({
           <span className="min-w-0 flex-1 truncate text-xs text-[var(--duties-secondary)]">{summary}</span>
           {error && <span className="flex-none text-xs text-[var(--duties-danger)]">配置有误</span>}
           {pending > 0 && (
-            <span className="flex-none text-xs font-medium text-[var(--duties-danger)]">{pending} 项待应用</span>
+            <span className="flex-none text-xs font-medium text-[var(--duties-danger)]">{pending} 项待{commitVerb}</span>
           )}
         </button>
       </h2>
@@ -53,3 +55,10 @@ export const Section = ({
     </section>
   );
 };
+
+/** 分区展开后第一段：这一块管什么。后端 schema 里分区的 note。 */
+export const SectionNote = ({ children }: { children: ReactNode }) => (
+  <p className="mb-4 max-w-[var(--duties-prose-max-width)] text-xs leading-5 text-[var(--duties-secondary)]">
+    {children}
+  </p>
+);

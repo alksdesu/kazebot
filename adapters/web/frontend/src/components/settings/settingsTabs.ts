@@ -16,6 +16,7 @@ import {
   wrapConsolePage,
   wrapPlatformPage,
 } from '../../console/pages';
+import type { SectionPick } from '../../console/sectionPick';
 import { resolveSettingsTabId } from './settingsTabAliases';
 import { ClientSettingsPage } from './pages/ClientSettingsPage';
 import { GeneralSettingsPage } from './pages/GeneralSettingsPage';
@@ -58,8 +59,10 @@ export const SETTINGS_GROUP_ORDER: SettingsGroup[] = ['basics', 'bot', 'models',
 export interface SettingsTabDefinition {
   id: string;
   label: string;
-  /** 这页的折叠分区来自哪份控制台 schema。侧栏搜索按它索引分区名和字段标签，否则折叠之后「冷却」就找不着了。 */
+  /** 这页摆的配置区块来自哪份控制台 schema。侧栏搜索按它索引分区名和字段标签，否则折叠之后「冷却」就找不着了。 */
   configScope?: ConfigScope;
+  /** 这页摆那份 schema 里的哪几块。一份 schema 分摆在几页上时，搜索结果只挂在真正摆着它的那页下面。 */
+  sections?: SectionPick;
   group?: SettingsGroup;
   // [2026-06-01] Why: settings icon values used to be literal Unicode glyphs.
   // How: keep the field as a string but store Material Symbol names instead.
@@ -69,6 +72,9 @@ export interface SettingsTabDefinition {
   Page: ComponentType;
   RightPanel?: ComponentType;
 }
+
+// 机器人组先排 BOT_PAGES，这几页接在后面。写死数字的话 BOT_PAGES 一加页就撞号，同号时谁在前全看数组顺序。
+const BOT_TAIL = 20 + BOT_PAGES.length;
 
 const CORE_TABS = [
   { id: 'general', label: '通用', icon: 'tune', group: 'basics', order: 0, Page: GeneralSettingsPage },
@@ -95,9 +101,9 @@ const CORE_TABS = [
   // 出过一次事：engine 崩了三个半小时没人发现，因为界面上没有任何地方看得到它。
   { id: 'runtime', label: '运行', icon: 'monitor_heart', group: 'engine', order: 3, Page: RuntimeSettingsPage },
   // 提醒是人在聊天里建的，和 cron 定时任务两回事，不该藏在自动化里。
-  { id: 'reminders', label: '提醒', icon: 'notifications_active', group: 'bot', order: 25, Page: RemindersPage },
-  { id: 'community', label: '群协作', icon: 'groups', group: 'bot', order: 23, Page: CommunityPage },
-  { id: 'conversation', label: '会话与接话', icon: 'forum', group: 'bot', order: 24, Page: ConversationSettings },
+  { id: 'reminders', label: '提醒', icon: 'notifications_active', group: 'bot', order: BOT_TAIL + 2, Page: RemindersPage },
+  { id: 'community', label: '群协作', icon: 'groups', group: 'bot', order: BOT_TAIL, Page: CommunityPage },
+  { id: 'conversation', label: '会话与接话', icon: 'forum', group: 'bot', order: BOT_TAIL + 1, Page: ConversationSettings },
 ] satisfies SettingsTabDefinition[];
 
 const BOT_TABS: SettingsTabDefinition[] = BOT_PAGES.map((page, index) => ({
@@ -106,6 +112,8 @@ const BOT_TABS: SettingsTabDefinition[] = BOT_PAGES.map((page, index) => ({
   icon: page.icon,
   group: 'bot',
   order: 20 + index,
+  configScope: page.configScope,
+  sections: page.sections,
   Page: wrapConsolePage(SETTINGS_GROUP_LABELS.bot, page),
 }));
 
@@ -115,6 +123,8 @@ const MODEL_TABS: SettingsTabDefinition[] = MODEL_PAGES.map((page, index) => ({
   icon: page.icon,
   group: 'models',
   order: 30 + index,
+  configScope: page.configScope,
+  sections: page.sections,
   Page: wrapConsolePage(SETTINGS_GROUP_LABELS.models, page),
 }));
 

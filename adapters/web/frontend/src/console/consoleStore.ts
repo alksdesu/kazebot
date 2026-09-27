@@ -13,10 +13,11 @@ import {
   type ConfigLiveState,
   type ConfigRawFile,
   type ConfigSaveResult,
+  type ConfigSource,
   type PlatformCapability,
   type PlatformRuntimeFacts,
 } from '../api/supervisorClient';
-import { platformScope, useConfigScope, type ConfigScope } from './configScope';
+import { FEATURES_SCOPE, platformScope, useConfigScope, type ConfigScope } from './configScope';
 
 /** 草稿按 live_config 的键名存（如 signal_at），不是 yaml 的点分路径。
  *
@@ -44,6 +45,10 @@ export interface ConsoleState {
 
   refresh: (token: string) => Promise<void>;
   setDraft: (name: string, value: unknown) => void;
+  /** 删掉本层这一行，交给下一层。本层本来就没写这个键时，只是撤掉它的草稿。 */
+  inherit: (name: string) => void;
+  /** 把当前生效值写进本层，下一层以后怎么改都不再跟。本层本来就写着时，只是撤掉「删行」。 */
+  pin: (name: string) => void;
   /** 不给 names 就丢掉全部草稿；给了只丢这几项，区块自己的「丢弃」用。 */
   discard: (names?: readonly string[]) => void;
   /** 平台的「应用」：全部草稿一起写回，结果挂在 notice / error 上给状态栏看。 */
@@ -227,6 +232,14 @@ const pick = (draft: Draft, names: readonly string[]): Draft => (
   Object.fromEntries(Object.entries(draft).filter(([name]) => names.includes(name)))
 );
 
+/** 每个作用域那份文件在分层里是哪一层。 */
+const OWN_LAYER: Record<ConfigScope['kind'], ConfigSource> = { platform: 'platform', features: 'global' };
+
+/** 生效方公布的来源。旧版生效方不公布，是 undefined。 */
+const sourceOf = (live: ConfigLiveState | null, name: string): ConfigSource | undefined => (
+  live?.state?.sources?.[name]
+);
+
 const createConsoleState = (scope: ConfigScope) => (
   set: (partial: Partial<ConsoleState>) => void,
   get: () => ConsoleState,
@@ -285,11 +298,35 @@ const createConsoleState = (scope: ConfigScope) => (
     },
 
     setDraft: (name, value) => {
-      const draft = { ...get().draft };
-      const applied = get().live?.state?.values?.[name];
-      // 改回生效值就不该继续算成待写回，否则「3 项待应用」里会混进已经撤销的改动。
-      if (!get().saving && sameValue(value, applied)) delete draft[name];
-      else draft[name] = value;
+      const { draft: current, live, saving } = get();
+      const draft = { ...current };
+      if (value === null) {
+        // 删行只在本层确实写着这一行时才算改动；没写着就是本来就在跟随下一层。
+        if (sourceOf(live, name) === OWN_LAYER[scope.kind]) draft[name] = null;
+        else delete draft[name];
+      } else if (!saving && sameValue(value, live?.state?.values?.[name])) {
+        // 改回生效值就不该继续算成待写回，否则「3 项待应用」里会混进已经撤销的改动。
+        delete draft[name];
+      } else {
+        draft[name] = value;
+      }
+      set({ draft, notice: '' });
+    },
+
+    inherit: (name) => get().setDraft(name, null),
+
+    // 和 setDraft 分开：钉的值和生效值一样也得写进本层，按值比较会把它当成没改。
+    pin: (name) => {
+      const { draft: current, live } = get();
+      const draft = { ...current };
+      if (sourceOf(live, name) === OWN_LAYER[scope.kind]) {
+        if (draft[name] === null) delete draft[name];
+      } else if (!(name in draft) || draft[name] === null) {
+        const applied = live?.state?.values?.[name];
+        // 没公布这个值就钉不了：undefined 写进去等于删行。
+        if (applied === undefined) return;
+        draft[name] = applied;
+      }
       set({ draft, notice: '' });
     },
 
@@ -341,12 +378,38 @@ export function useConsoleStore<T>(selector?: (state: ConsoleState) => T): T | C
   return store(selector as (state: ConsoleState) => T);
 }
 
-/** 编辑中的完整配置：生效值叠上草稿。试听要拿它当判定输入。
+/** 这个键现在该显示的值：有草稿看草稿，草稿是删行时看下一层，没草稿看生效值。哪儿都没有是 undefined。 */
+export function displayedValue(
+  state: ConsoleState,
+  name: string,
+  inherited?: Readonly<Record<string, unknown>>,
+): unknown {
+  if (!(name in state.draft)) return state.live?.state?.values?.[name];
+  const value = state.draft[name];
+  return value === null ? inherited?.[name] : value;
+}
+
+/** 删掉本层这一行之后落到的值。平台页落到全局那份；全局页落到内置默认，由各控件的 fallback 给。 */
+function useInheritedValues(): Readonly<Record<string, unknown>> | undefined {
+  const scope = useConfigScope();
+  const values = configStore(FEATURES_SCOPE)((state) => state.live?.state?.values);
+  return scope.kind === 'platform' ? values : undefined;
+}
+
+/** 编辑中的完整配置：生效值叠上草稿，删行的键换成下一层的值。试听要拿它当判定输入。
  *
  * 无条件全量叠加，不按当前页过滤 —— 漏掉一个键就等于试听和真实判定跑在两份配置上，
- * 而「试听说会回、实际不回」比没有试听更糟。 */
-export function effectiveValues(state: ConsoleState): Record<string, unknown> {
-  return { ...(state.live?.state?.values || {}), ...state.draft };
+ * 而「试听说会回、实际不回」比没有试听更糟。下一层还没拉到时，删行的键先按现值算。 */
+export function effectiveValues(
+  state: ConsoleState,
+  inherited?: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const values: Record<string, unknown> = { ...(state.live?.state?.values || {}) };
+  for (const name of Object.keys(state.draft)) {
+    const value = displayedValue(state, name, inherited);
+    if (value !== undefined) values[name] = value;
+  }
+  return values;
 }
 
 /** 只读公布的生效值，不看草稿。分区摘要要的是「现在实际在跑什么」。 */
@@ -390,13 +453,29 @@ export function useDraftCount(names: readonly string[]): number {
   return useConsoleStore((state) => countDraftFor(state, names));
 }
 
+export interface LayerState {
+  /** 生效方公布了这个键的来源。旧版不公布时界面不给切换，免得删错行。 */
+  known: boolean;
+  /** 写回之后这一项落在本层：草稿里有值，或者没有草稿而文件里本来就写着。 */
+  own: boolean;
+  source: ConfigSource | undefined;
+}
+
+export function useLayerState(name: string): LayerState {
+  const scope = useConfigScope();
+  const source = useConsoleStore((state) => sourceOf(state.live, name));
+  const drafted = useConsoleStore((state) => (name in state.draft ? state.draft[name] !== null : undefined));
+  return { known: source !== undefined, own: drafted ?? source === OWN_LAYER[scope.kind], source };
+}
+
 /** 读一个键当前该显示的值：草稿优先，其次公布的生效值。
  *
  * fallback 只能是标量。传字面量数组或对象的话每次渲染都是新引用，
  * useSyncExternalStore 会当成 store 变了而空转 —— 列表类的值走 useWordList。 */
 export function useLiveValue<T>(name: string, fallback: T): T {
+  const inherited = useInheritedValues();
   return useConsoleStore((state) => {
-    const value = name in state.draft ? state.draft[name] : state.live?.state?.values?.[name];
+    const value = displayedValue(state, name, inherited);
     return (value === undefined || value === null ? fallback : value) as T;
   });
 }
@@ -422,9 +501,8 @@ export function asWordList(value: unknown): readonly string[] {
 
 /** 读词表类的值（名字、关键词、前缀）。非数组一律落到同一个空表。 */
 export function useWordList(name: string): readonly string[] {
-  return useConsoleStore((state) =>
-    asWordList(name in state.draft ? state.draft[name] : state.live?.state?.values?.[name]),
-  );
+  const inherited = useInheritedValues();
+  return useConsoleStore((state) => asWordList(displayedValue(state, name, inherited)));
 }
 
 /** 读一个列表键的单项规则。没公布就是 null —— 编不出来的规则不如不放行。
@@ -455,8 +533,9 @@ const EMPTY_IDS: readonly number[] = [];
 
 /** 读号码表（群号、QQ 号）。 */
 export function useIdList(name: string): readonly number[] {
+  const inherited = useInheritedValues();
   return useConsoleStore((state) => {
-    const value = name in state.draft ? state.draft[name] : state.live?.state?.values?.[name];
+    const value = displayedValue(state, name, inherited);
     return Array.isArray(value) ? (value as number[]) : EMPTY_IDS;
   });
 }
@@ -507,11 +586,16 @@ export function useRuntime(): PlatformRuntimeFacts {
 /** 三态开关要能区分「没配」和「配成 false」，所以 null 不能被 fallback 吃掉。
  *
  * 抽成纯函数才测得到：hook 里那一层只是 store 订阅。 */
-export function readTristate(state: ConsoleState, name: string): boolean | null {
-  const value = name in state.draft ? state.draft[name] : state.live?.state?.values?.[name];
+export function readTristate(
+  state: ConsoleState,
+  name: string,
+  inherited?: Readonly<Record<string, unknown>>,
+): boolean | null {
+  const value = displayedValue(state, name, inherited);
   return value === undefined || value === null ? null : Boolean(value);
 }
 
 export function useTristate(name: string): boolean | null {
-  return useConsoleStore((state) => readTristate(state, name));
+  const inherited = useInheritedValues();
+  return useConsoleStore((state) => readTristate(state, name, inherited));
 }

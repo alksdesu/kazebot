@@ -1,5 +1,5 @@
 // 词表编辑：名字、关键词、触发前缀共用。空格与全角符号都算词的一部分，所以只按回车确认。
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 
 import { Chip, Chips, Input } from './components';
 import { addWord, useConsoleStore, useInputRule, useWordList } from './consoleStore';
@@ -13,7 +13,16 @@ export const LIST_SPACING: Record<ListSpacing, string> = {
   panel: '',
 };
 
+/** 列表控件的标题行。aside 跟在标题右边，比如来源切换。 */
+export const ListLabel = ({ aside, label }: { aside?: ReactNode; label: string }) => (
+  <div className="mb-1.5 flex flex-wrap items-center gap-2">
+    <span className="text-xs text-[var(--duties-secondary)]">{label}</span>
+    {aside}
+  </div>
+);
+
 interface WordListProps {
+  aside?: ReactNode;
   configKey: string;
   label: string;
   placeholder: string;
@@ -21,7 +30,7 @@ interface WordListProps {
   spacing?: ListSpacing;
 }
 
-export const WordList = ({ configKey, label, placeholder, empty, spacing = 'option' }: WordListProps) => {
+export const WordList = ({ aside, configKey, label, placeholder, empty, spacing = 'option' }: WordListProps) => {
   const setDraft = useConsoleStore((state) => state.setDraft);
   const words = useWordList(configKey);
   const rule = useInputRule(configKey);
@@ -35,7 +44,7 @@ export const WordList = ({ configKey, label, placeholder, empty, spacing = 'opti
 
   return (
     <div className={LIST_SPACING[spacing]}>
-      <span className="mb-1.5 block text-xs text-[var(--duties-secondary)]">{label}</span>
+      <ListLabel aside={aside} label={label} />
       <Chips>
         {words.length === 0 && <span className="text-xs text-[var(--duties-secondary)]">{empty}</span>}
         {words.map((word) => (

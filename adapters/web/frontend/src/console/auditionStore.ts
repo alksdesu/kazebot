@@ -7,7 +7,8 @@ import {
   type PlatformDryRunResult,
   type PlatformDryRunVerdict,
 } from '../api/supervisorClient';
-import { effectiveValues, platformConsoleStore } from './consoleStore';
+import { FEATURES_SCOPE } from './configScope';
+import { configStore, effectiveValues, platformConsoleStore } from './consoleStore';
 
 /** 两个发送者，因为「每人冷却」按 (群, 人) 分组 —— 只有一个人时它和「每群冷却」看不出区别。 */
 export const SENDERS = {
@@ -154,7 +155,10 @@ export const useAuditionStore = create<AuditionState>((set, get) => ({
     set({ loading: true, error: '' });
     try {
       const result = await dryRunPlatformTrigger(token, platformId, toRequest(messages, intervalSec), {
-        config: effectiveValues(platformConsoleStore(platformId).getState()),
+        config: effectiveValues(
+          platformConsoleStore(platformId).getState(),
+          configStore(FEATURES_SCOPE).getState().live?.state?.values,
+        ),
         cooldown,
       });
       if (mine !== issued) return;

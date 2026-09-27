@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 
 import { searchableSections, type SearchableSection } from '../../console/schemaSearch';
+import { picksSection } from '../../console/sectionPick';
 import { useSchemaStore } from '../../console/schemaStore';
 import { useSettingsStore } from '../../store/settingsStore';
 import { WorkspaceNav } from '../../features/WorkspaceNav';
@@ -34,7 +35,7 @@ export const SettingsSidebar = () => {
     return settingsTabs.flatMap(tab => {
       const schema = tab.configScope ? schemas[tab.configScope.id] : undefined;
       const sections = query && schema
-        ? searchableSections(schema).filter(section => section.text.includes(query))
+        ? searchableSections(schema).filter(section => picksSection(tab.sections, section.id) && section.text.includes(query))
         : [];
       const tabHit = `${tab.label} ${SETTINGS_GROUP_LABELS[tab.group || 'basics']} ${tab.id}`.toLocaleLowerCase().includes(query);
       return tabHit || sections.length ? [{ tab, sections }] : [];

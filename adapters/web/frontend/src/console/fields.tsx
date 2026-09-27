@@ -5,6 +5,8 @@ import { Field, Input, Option, Segmented, Sub } from './components';
 import { useConsoleStore, useLiveValue, useNote, useTristate } from './consoleStore';
 
 interface BoolOptionProps {
+  /** 跟在控件标题旁边的东西，比如来源切换。 */
+  aside?: ReactNode;
   children?: ReactNode;
   configKey: string;
   desc?: ReactNode;
@@ -12,12 +14,13 @@ interface BoolOptionProps {
   label: string;
 }
 
-export const BoolOption = ({ children, configKey, desc, fallback = false, label }: BoolOptionProps) => {
+export const BoolOption = ({ aside, children, configKey, desc, fallback = false, label }: BoolOptionProps) => {
   const setDraft = useConsoleStore((state) => state.setDraft);
   const checked = useLiveValue<boolean>(configKey, fallback);
   const note = useNote(configKey);
   return (
     <Option
+      aside={aside}
       checked={checked}
       desc={desc || note}
       name={label}
@@ -30,11 +33,13 @@ export const BoolOption = ({ children, configKey, desc, fallback = false, label 
 
 /** 三态开关：null = 哪一层都没配，由 bot 按旧的 group_mode 枚举推导。界面显示当前推导值。 */
 export const TristateOption = ({
+  aside,
   configKey,
   desc,
   fallback,
   label,
 }: {
+  aside?: ReactNode;
   configKey: string;
   desc: ReactNode;
   fallback: boolean;
@@ -45,6 +50,7 @@ export const TristateOption = ({
   const effective = value === null ? fallback : value;
   return (
     <Option
+      aside={aside}
       checked={effective}
       desc={value === null ? <>{desc}（当前跟随旧的触发模式）</> : desc}
       name={label}
@@ -54,20 +60,23 @@ export const TristateOption = ({
 };
 
 export const SubOption = ({
+  aside,
   configKey,
   fallback = false,
   label,
 }: {
+  aside?: ReactNode;
   configKey: string;
   fallback?: boolean;
   label: string;
 }) => {
   const setDraft = useConsoleStore((state) => state.setDraft);
   const checked = useLiveValue<boolean>(configKey, fallback);
-  return <Sub checked={checked} label={label} onChange={(next) => setDraft(configKey, next)} />;
+  return <Sub aside={aside} checked={checked} label={label} onChange={(next) => setDraft(configKey, next)} />;
 };
 
 export const NumberField = ({
+  aside,
   configKey,
   fallback = 0,
   label,
@@ -76,6 +85,7 @@ export const NumberField = ({
   unit,
   scale = 1,
 }: {
+  aside?: ReactNode;
   configKey: string;
   /** 生效值里没有这一项时显示的数，取 schema 里的内置默认。 */
   fallback?: number;
@@ -90,7 +100,7 @@ export const NumberField = ({
   const setDraft = useConsoleStore((state) => state.setDraft);
   const stored = useLiveValue<number>(configKey, fallback);
   return (
-    <Field label={label}>
+    <Field aside={aside} label={label}>
       <Input
         aria-label={label}
         onChange={(event) => {
@@ -108,22 +118,22 @@ export const NumberField = ({
   );
 };
 
-export const TextField = ({ configKey, label }: { configKey: string; label: string }) => {
+export const TextField = ({ aside, configKey, label }: { aside?: ReactNode; configKey: string; label: string }) => {
   const setDraft = useConsoleStore((state) => state.setDraft);
   const value = useLiveValue<string>(configKey, '');
   return (
-    <Field label={label}>
+    <Field aside={aside} label={label}>
       <Input aria-label={label} onChange={(event) => setDraft(configKey, event.target.value)} value={value} width="wide" />
     </Field>
   );
 };
 
 /** 概率键存的是 0–1，界面按百分比给 —— 「0.02」要在脑子里换算，「2%」不用。 */
-export const PercentField = ({ configKey, label }: { configKey: string; label: string }) => {
+export const PercentField = ({ aside, configKey, label }: { aside?: ReactNode; configKey: string; label: string }) => {
   const setDraft = useConsoleStore((state) => state.setDraft);
   const value = useLiveValue<number>(configKey, 0);
   return (
-    <Field label={label}>
+    <Field aside={aside} label={label}>
       <Input
         aria-label={label}
         max={100}
@@ -145,11 +155,13 @@ export const PercentField = ({ configKey, label }: { configKey: string; label: s
 
 /** 固定枚举的键。 */
 export const ChoiceField = ({
+  aside,
   choices,
   configKey,
   fallback,
   label,
 }: {
+  aside?: ReactNode;
   choices: ReadonlyArray<readonly [string, string]>;
   configKey: string;
   fallback: string;
@@ -158,7 +170,7 @@ export const ChoiceField = ({
   const setDraft = useConsoleStore((state) => state.setDraft);
   const value = useLiveValue<string>(configKey, fallback);
   return (
-    <Field label={label}>
+    <Field aside={aside} label={label}>
       <Segmented label={label} choices={choices} onPick={(next) => setDraft(configKey, next)} value={value} />
     </Field>
   );

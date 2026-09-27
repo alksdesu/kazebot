@@ -55,6 +55,7 @@
   --duties-font-size-body: 0.875rem;
   --duties-font-size-caption: 0.75rem;
   --duties-control-size: 2.5rem;
+  --duties-compact-control-size: 1.75rem;
   --duties-sidebar-breakpoint: 48rem;
   --duties-rail-breakpoint: 80rem;
   --duties-main-min-width: 30rem;
@@ -199,6 +200,13 @@
     white-space: normal;
     word-break: keep-all;
     overflow-wrap: anywhere;
+  }
+
+  /* 挂在字段标题旁的小切换：比控件本身矮一档，也不跟着撑满一行。 */
+  .settings-segment-compact {
+    min-height: var(--duties-compact-control-size);
+    flex: none;
+    white-space: nowrap;
   }
 
   .app-sidebar {
