@@ -216,6 +216,23 @@ async def request_restart(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     )
     if r.status_code >= 400:
         return _err(r.text, git=git_info, git_commit=commit_res)
+    try:
+        outcome = r.json()
+    except ValueError:
+        outcome = None
+    if not isinstance(outcome, dict) or not outcome.get("scheduled"):
+        # 200 也可能没排上（上一次重启还没收尾）：照实告诉模型，别让它跟用户说已经在重启了。
+        details = outcome if isinstance(outcome, dict) else {}
+        refusal = details.get("reason") or "unknown"
+        blocker = details.get("in_progress")
+        if not isinstance(blocker, dict):
+            return _err(f"restart not scheduled: {refusal}", git=git_info, git_commit=commit_res)
+        return _err(
+            f"restart not scheduled: {refusal} ({blocker.get('target')} restart since {blocker.get('since')})",
+            in_progress=blocker,
+            git=git_info,
+            git_commit=commit_res,
+        )
 
     return _ok(
         f"Restart requested: {target}",

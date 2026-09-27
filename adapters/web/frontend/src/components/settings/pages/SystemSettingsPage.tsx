@@ -11,7 +11,7 @@ import { ActiveTasksModal } from '../../dashboard/ActiveTasksModal';
 import { checkHealth, getAdminState, reloadConfig, restartEngine, type AdminState, type HealthState } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
-import { countActiveTasks, formatUptime } from '../../../utils/systemStatus';
+import { countActiveTasks, formatUptime, restartRefusal } from '../../../utils/systemStatus';
 import { Block, Button, PageShell, StatusText } from './settingsControls';
 
 const Stat = ({ label, value, detail, onClick }: { label: string; value: string | number; detail?: string; onClick?: () => void }) => {
@@ -99,8 +99,8 @@ export const SystemSettingsPage = () => {
     if (!window.confirm('确认要重启引擎吗？运行中的任务会全部中断，调度器与本页面的连接不受影响。')) return;
     try {
       const result = await restartEngine(adminToken);
-      // scheduled=false 表示 supervisor 手上没有 engine 进程可重启，报成功会让人白等。
-      report(result?.scheduled === false ? '未能重启：调度器没有在管理引擎进程' : '已请求重启引擎');
+      // 没说排上就当没排上：报成功会让人白等。
+      report(result?.scheduled ? '已请求重启引擎' : `未能重启：${restartRefusal(result)}`);
     } catch (error) {
       report(error instanceof Error ? error.message : '重启失败');
     }

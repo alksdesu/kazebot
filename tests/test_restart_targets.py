@@ -7,11 +7,13 @@ web 连接和 TUI 一起死，而 os._exit(75) 只在外层 launcher 下才是�
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,7 @@ from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.process_manager import ManagedProcess, ProcessManager, WorkerHealth  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
+from supervisor.types import RESTART_IN_PROGRESS, RESTART_NO_PROCESS_MANAGER  # noqa: E402
 
 _URL = "/v1/admin/restart"
 _TOKEN = "test-admin-token"
@@ -82,7 +85,6 @@ class _FakeProcessManager:
         self.engines = [_Proc()]
         self._restarting_engine = False
         self._restart_pending = False
-        self.engine_restart_lock = threading.Lock()
         self.calls: list[str] = []
 
     def stop_engine(self) -> None:
@@ -178,6 +180,20 @@ class _BrokenProcessManager(_FakeProcessManager):
         raise OSError("旧 engine 停不掉")
 
 
+class _DeadThread:
+    """线程起不来：拿了锁的那一侧得自己放。"""
+
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    def start(self) -> None:
+        raise RuntimeError("can't start new thread")
+
+
+class _FakeThreading:
+    Thread = _DeadThread
+
+
 class _BlockingProcessManager(_FakeProcessManager):
     """第一次重启卡在 stop_engine 上，直到测试放行。"""
 
@@ -200,6 +216,17 @@ def _break_orphan_sweep(state: SupervisorState) -> None:
     state.cancel_orphaned_tasks = _boom
 
 
+def _break_announcement(state: SupervisorState) -> None:
+    real_append = state.eventlog.append
+
+    def _append(*args: Any, **kwargs: Any):
+        if kwargs.get("type_") == "outbound_message":
+            raise RuntimeError("事件写不进去")
+        return real_append(*args, **kwargs)
+
+    state.eventlog.append = _append
+
+
 class TestEngineOnlyRestart:
     def test_it_reports_the_engine_target_and_not_all(self, tmp_path: Path) -> None:
         pm = _FakeProcessManager()
@@ -211,6 +238,7 @@ class TestEngineOnlyRestart:
         body = response.json()
         assert body["scheduled"] is True
         assert body["target"] == "engine"
+        assert body["reason"] is None
 
     def test_it_cycles_only_the_engine_processes(self, tmp_path: Path) -> None:
         pm = _FakeProcessManager()
@@ -289,7 +317,8 @@ class TestEngineOnlyRestart:
 
         assert response.status_code == 200, response.text
         assert response.json()["scheduled"] is False
-        assert "restart_failed" in _event_types(state)
+        assert response.json()["reason"] == RESTART_NO_PROCESS_MANAGER
+        assert _restart_failures(state) == [RESTART_NO_PROCESS_MANAGER]
 
 
 class TestTheSuppressionFlagIsAlwaysReleased:
@@ -320,7 +349,7 @@ class TestTheSuppressionFlagIsAlwaysReleased:
         _until(lambda: marker in _event_blob(state))
         assert marker in _event_blob(state), "这条路径没有留下任何交代"
 
-        _until(lambda: not pm.engine_restart_lock.locked())
+        _until(lambda: app.state.restart_gate.current is None)
         assert pm._restarting_engine is False
 
     @pytest.mark.parametrize(("factory", "marker", "prepare"), _PATHS)
@@ -334,11 +363,11 @@ class TestTheSuppressionFlagIsAlwaysReleased:
             prepare(state)
         _post(app, {"target": "engine", "reason": "first"})
         _until(lambda: marker in _event_blob(state))
-        _until(lambda: not pm.engine_restart_lock.locked())
+        _until(lambda: app.state.restart_gate.current is None)
 
-        assert not pm.engine_restart_lock.locked()
+        assert app.state.restart_gate.current is None
         assert _post(app, {"target": "engine", "reason": "second"}).json()["scheduled"] is True
-        _until(lambda: not pm.engine_restart_lock.locked())
+        _until(lambda: app.state.restart_gate.current is None)
 
     def test_a_failed_orphan_sweep_does_not_sink_the_restart(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
@@ -354,9 +383,9 @@ class TestTheSuppressionFlagIsAlwaysReleased:
 
         assert "restart_completed" in _event_types(state)
         assert any("清理孤儿 task 失败" in record.getMessage() for record in caplog.records)
-        _until(lambda: not pm.engine_restart_lock.locked())
+        _until(lambda: app.state.restart_gate.current is None)
         assert pm._restarting_engine is False
-        assert not pm.engine_restart_lock.locked()
+        assert app.state.restart_gate.current is None
 
     def test_the_failed_sweep_is_recorded_with_its_traceback(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
@@ -401,24 +430,36 @@ def _announcements(state: SupervisorState) -> list[str]:
     ]
 
 
+@pytest.fixture
+def stuck(tmp_path: Path):
+    """一次 engine 重启卡在 stop_engine 上，锁一直被它攥着。"""
+    pm = _BlockingProcessManager()
+    state, app = _make(tmp_path, pm)
+    assert _post(app, {"target": "engine", "reason": "first"}).json()["scheduled"] is True
+    pm.entered.wait(10)
+
+    yield pm, state, app
+
+    pm.let_go.set()
+    # 那个线程还要往 tmp_path 下的事件日志里写，别让它活过这个用例。
+    _until(lambda: app.state.restart_gate.current is None)
+
+
+@pytest.fixture
+def exits(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """全量那条路真的会 os._exit，测试进程里只能换成记一笔。"""
+    import supervisor.api as api_module
+
+    recorded: list[int] = []
+    monkeypatch.setattr(api_module.os, "_exit", lambda code: recorded.append(code))
+    return recorded
+
+
 class TestOnlyOneEngineRestartAtATime:
     """两个重启撞在一起，先收尾的那个会在另一个停起到一半时放开信号抑制。
 
     那一刻 engine 已经停了、新的还没起，SIGTERM 不再被吞 —— supervisor 跟着一起走。
     """
-
-    @pytest.fixture
-    def stuck(self, tmp_path: Path):
-        pm = _BlockingProcessManager()
-        state, app = _make(tmp_path, pm)
-        assert _post(app, {"target": "engine", "reason": "first"}).json()["scheduled"] is True
-        pm.entered.wait(10)
-
-        yield pm, state, app
-
-        pm.let_go.set()
-        # 那个线程还要往 tmp_path 下的事件日志里写，别让它活过这个用例。
-        _until(lambda: not pm.engine_restart_lock.locked())
 
     def test_the_second_request_is_turned_away(self, stuck: Any) -> None:
         _pm, _state, app = stuck
@@ -427,13 +468,14 @@ class TestOnlyOneEngineRestartAtATime:
 
         assert response.json()["scheduled"] is False
         assert response.json()["target"] == "engine"
+        assert response.json()["reason"] == RESTART_IN_PROGRESS
 
     def test_the_refusal_says_why(self, stuck: Any) -> None:
         _pm, state, app = stuck
 
         _post(app, {"target": "engine", "reason": "second", "session_id": "s-2"})
 
-        assert _restart_failures(state) == ["engine restart already in progress"]
+        assert _restart_failures(state) == [RESTART_IN_PROGRESS]
 
     def test_the_refused_request_announces_nothing(self, stuck: Any) -> None:
         # 报了「已触发」又没触发，对面那条会话就在等一个永远不来的结果。
@@ -465,10 +507,81 @@ class TestOnlyOneEngineRestartAtATime:
         _post(app, {"target": "engine", "reason": "second"})
         pm.let_go.set()
         _until(lambda: "restart_completed" in _event_types(state))
-        _until(lambda: not pm.engine_restart_lock.locked())
+        _until(lambda: app.state.restart_gate.current is None)
 
         assert _post(app, {"target": "engine", "reason": "third"}).json()["scheduled"] is True
-        _until(lambda: not pm.engine_restart_lock.locked())
+        _until(lambda: app.state.restart_gate.current is None)
+
+
+def _restart_failure_payloads(state: SupervisorState) -> list[dict[str, Any]]:
+    return [
+        dict(event.get("payload") or {})
+        for event in state.eventlog.list_all_events()
+        if event.get("type") == "restart_failed"
+    ]
+
+
+class TestTheRefusalSaysWhichRestartIsHoldingIt:
+    """只回一句「已在进行中」，运营者既不知道卡住的是哪种重启，也不知道该等多久。"""
+
+    def test_it_names_the_engine_restart_in_flight(self, stuck: Any) -> None:
+        _pm, _state, app = stuck
+
+        body = _post(app, {"target": "engine", "reason": "second"}).json()
+
+        assert body["scheduled"] is False
+        assert body["reason"] == RESTART_IN_PROGRESS
+        assert body["in_progress"]["target"] == "engine"
+
+    def test_the_start_time_can_be_read_back_as_a_moment(self, stuck: Any) -> None:
+        # 前端拿它换算成几点开始，解析不了就只能退回那句没有时间的旧文案。
+        _pm, _state, app = stuck
+        before = datetime.now(timezone.utc)
+
+        body = _post(app, {"target": "engine", "reason": "second"}).json()
+
+        since = datetime.fromisoformat(body["in_progress"]["since"])
+        assert since.tzinfo is not None
+        assert since <= before
+
+    def test_it_names_the_full_restart_in_flight(self, tmp_path: Path, exits: list[int]) -> None:
+        pm = _FakeProcessManager()
+        _state, app = _make(tmp_path, pm)
+        _post(app, {"target": "all", "reason": "first"})
+        _until(lambda: bool(exits))
+
+        body = _post(app, {"target": "engine", "reason": "second"}).json()
+
+        assert body["in_progress"]["target"] == "all"
+
+    def test_the_event_records_the_same_one(self, stuck: Any) -> None:
+        # 事后查这次拒绝是被谁挡的，只能靠事件日志。
+        _pm, state, app = stuck
+
+        body = _post(app, {"target": "engine", "reason": "second"}).json()
+
+        assert [payload["in_progress"] for payload in _restart_failure_payloads(state)] == [body["in_progress"]]
+
+    def test_without_a_process_manager_there_is_nothing_to_point_at(self, tmp_path: Path) -> None:
+        # 这条路没有人在跑重启，硬塞一个 in_progress 就是在指一次不存在的重启。
+        state, app = _make(tmp_path, None)
+
+        body = _post(app, {"target": "engine", "reason": "test"}).json()
+
+        assert body["reason"] == RESTART_NO_PROCESS_MANAGER
+        assert body["in_progress"] is None
+        assert [("in_progress" in payload) for payload in _restart_failure_payloads(state)] == [False]
+
+    def test_the_gate_opens_again_once_the_engine_is_back(self, tmp_path: Path) -> None:
+        pm = _FakeProcessManager()
+        state, app = _make(tmp_path, pm)
+
+        assert _post(app, {"target": "engine", "reason": "test"}).json()["scheduled"] is True
+        _until(lambda: "restart_completed" in _event_types(state))
+        _until(lambda: app.state.restart_gate.current is None)
+
+        assert "restart_completed" in _event_types(state)
+        assert app.state.restart_gate.current is None
 
 
 class TestTheLockIsFreedWhenTheRestartNeverStarts:
@@ -477,31 +590,17 @@ class TestTheLockIsFreedWhenTheRestartNeverStarts:
     def test_a_failed_announcement_frees_it(self, tmp_path: Path) -> None:
         pm = _FakeProcessManager()
         state, app = _make(tmp_path, pm)
-        real_append = state.eventlog.append
-
-        def _append(*args: Any, **kwargs: Any):
-            if kwargs.get("type_") == "outbound_message":
-                raise RuntimeError("事件写不进去")
-            return real_append(*args, **kwargs)
-
-        state.eventlog.append = _append
+        _break_announcement(state)
 
         with pytest.raises(RuntimeError):
             _post(app, {"target": "engine", "reason": "test", "session_id": "s-1"})
 
-        assert not pm.engine_restart_lock.locked()
+        assert app.state.restart_gate.current is None
 
     def test_a_failed_announcement_starts_nothing(self, tmp_path: Path) -> None:
         pm = _FakeProcessManager()
         state, app = _make(tmp_path, pm)
-        real_append = state.eventlog.append
-
-        def _append(*args: Any, **kwargs: Any):
-            if kwargs.get("type_") == "outbound_message":
-                raise RuntimeError("事件写不进去")
-            return real_append(*args, **kwargs)
-
-        state.eventlog.append = _append
+        _break_announcement(state)
 
         with pytest.raises(RuntimeError):
             _post(app, {"target": "engine", "reason": "test", "session_id": "s-1"})
@@ -517,23 +616,12 @@ class TestTheLockIsFreedWhenTheRestartNeverStarts:
 
         pm = _FakeProcessManager()
         _state, app = _make(tmp_path, pm)
-
-        class _DeadThread:
-            def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-                pass
-
-            def start(self) -> None:
-                raise RuntimeError("can't start new thread")
-
-        class _FakeThreading:
-            Thread = _DeadThread
-
         monkeypatch.setattr(api_module, "threading", _FakeThreading)
 
         with pytest.raises(RuntimeError):
             _post(app, {"target": "engine", "reason": "test"})
 
-        assert not pm.engine_restart_lock.locked()
+        assert app.state.restart_gate.current is None
         assert pm._restarting_engine is False
 
 
@@ -669,14 +757,10 @@ class TestEngineRestartReloadsTheWorkspaceEnv:
 
 class TestFullRestartStillWorks:
     def test_it_stops_everything_and_exits_with_the_relaunch_code(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self, tmp_path: Path, exits: list[int],
     ) -> None:
         pm = _FakeProcessManager()
         _state, app = _make(tmp_path, pm)
-        exits: list[int] = []
-        import supervisor.api as api_module
-
-        monkeypatch.setattr(api_module.os, "_exit", lambda code: exits.append(code))
 
         response = _post(app, {"target": "all", "reason": "test"})
         _settle(pm, "stop_all")
@@ -688,14 +772,10 @@ class TestFullRestartStillWorks:
         assert exits == [75]
 
     def test_the_engine_target_no_longer_escalates(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self, tmp_path: Path, exits: list[int],
     ) -> None:
         pm = _FakeProcessManager()
         _state, app = _make(tmp_path, pm)
-        exits: list[int] = []
-        import supervisor.api as api_module
-
-        monkeypatch.setattr(api_module.os, "_exit", lambda code: exits.append(code))
 
         _post(app, {"target": "engine", "reason": "test"})
         _settle(pm, "start_engine")
@@ -705,3 +785,222 @@ class TestFullRestartStillWorks:
 
         assert exits == []
         assert "stop_all" not in pm.calls
+
+
+def _pending_marker(state: SupervisorState) -> Path:
+    return Path(state.workspace_root) / "data" / "restart_pending.json"
+
+
+class TestAFullRestartTakesTheSameLock:
+    """全量的 stop_all 夹进 engine 重启的停和起之间，新起的 engine 没人停，supervisor
+    退出后它成了孤儿 —— 两种重启抢的因此是同一把锁。
+    """
+
+    def test_it_announces_itself_and_arms_the_marker(self, tmp_path: Path, exits: list[int]) -> None:
+        pm = _FakeProcessManager()
+        state, app = _make(tmp_path, pm)
+
+        response = _post(app, {"target": "all", "reason": "test", "session_id": "s-1"})
+        _until(lambda: bool(exits))
+
+        assert response.json()["scheduled"] is True
+        assert response.json()["reason"] is None
+        assert json.loads(_pending_marker(state).read_text(encoding="utf-8"))["target"] == "all"
+        assert _announcements(state) == ["✅ 已触发全量重启，系统即将重启..."]
+        assert pm._restart_pending is True
+
+    def test_an_engine_restart_in_flight_turns_it_away(self, stuck: Any, exits: list[int]) -> None:
+        _pm, _state, app = stuck
+
+        body = _post(app, {"target": "all", "reason": "second", "session_id": "s-2"}).json()
+
+        assert body["scheduled"] is False
+        assert body["target"] == "all"
+        assert body["reason"] == RESTART_IN_PROGRESS
+
+    def test_the_turned_away_one_arms_nothing(self, stuck: Any, exits: list[int]) -> None:
+        # 报了「已触发」又没触发，对面那条会话在等一个永远不来的结果；标记文件留下来的话，
+        # 下次正常启动会把它当成上一次重启的收尾。
+        pm, state, app = stuck
+
+        _post(app, {"target": "all", "reason": "second", "session_id": "s-2"})
+
+        assert not _pending_marker(state).exists()
+        assert _announcements(state) == []
+        assert pm._restart_pending is False
+        assert "stop_all" not in pm.calls
+        assert exits == []
+
+    def test_the_refusal_is_recorded(self, stuck: Any, exits: list[int]) -> None:
+        _pm, state, app = stuck
+
+        _post(app, {"target": "all", "reason": "second"})
+
+        assert _restart_failures(state) == [RESTART_IN_PROGRESS]
+
+    def test_it_keeps_the_lock_all_the_way_to_the_exit(self, tmp_path: Path, exits: list[int]) -> None:
+        # 放开等于让一次 engine 重启赶在进程退出前插进来，那个新 engine 没人停。
+        pm = _FakeProcessManager()
+        _state, app = _make(tmp_path, pm)
+
+        _post(app, {"target": "all", "reason": "first"})
+        _until(lambda: bool(exits))
+
+        assert app.state.restart_gate.current is not None
+
+    def test_an_engine_restart_after_it_is_turned_away(self, tmp_path: Path, exits: list[int]) -> None:
+        pm = _FakeProcessManager()
+        state, app = _make(tmp_path, pm)
+        _post(app, {"target": "all", "reason": "first"})
+        _until(lambda: bool(exits))
+
+        body = _post(app, {"target": "engine", "reason": "second"}).json()
+
+        assert body["scheduled"] is False
+        assert body["reason"] == RESTART_IN_PROGRESS
+        assert _restart_failures(state) == [RESTART_IN_PROGRESS]
+        assert "stop_engine" not in pm.calls
+
+    def test_a_second_full_restart_is_turned_away(self, tmp_path: Path, exits: list[int]) -> None:
+        pm = _FakeProcessManager()
+        _state, app = _make(tmp_path, pm)
+        _post(app, {"target": "all", "reason": "first"})
+        _until(lambda: bool(exits))
+
+        body = _post(app, {"target": "all", "reason": "second", "session_id": "s-2"}).json()
+
+        assert body["scheduled"] is False
+        assert body["reason"] == RESTART_IN_PROGRESS
+        assert exits == [75]
+
+    def test_without_a_process_manager_it_is_still_scheduled(self, tmp_path: Path, exits: list[int]) -> None:
+        # 没有 engine 可停也照样排上：这条路靠 os._exit(75) 让外层 launcher 把整个进程拉起来。
+        _state, app = _make(tmp_path, None)
+
+        body = _post(app, {"target": "all", "reason": "test"}).json()
+        _until(lambda: bool(exits))
+
+        assert body["scheduled"] is True
+        assert body["reason"] is None
+        assert exits == [75]
+
+    def test_without_a_process_manager_the_second_one_is_still_turned_away(
+        self, tmp_path: Path, exits: list[int],
+    ) -> None:
+        # 锁挂在 app 上而不是 pm 上，正是为了这一条：两个 all 都排上就有两个线程抢着退进程。
+        _state, app = _make(tmp_path, None)
+        assert _post(app, {"target": "all", "reason": "first"}).json()["scheduled"] is True
+        _until(lambda: bool(exits))
+
+        body = _post(app, {"target": "all", "reason": "second"}).json()
+
+        assert body["scheduled"] is False
+        assert body["reason"] == RESTART_IN_PROGRESS
+        assert exits == [75]
+
+    def test_without_a_process_manager_an_engine_restart_is_still_refused_after_it(
+        self, tmp_path: Path, exits: list[int],
+    ) -> None:
+        # 这个部署下 engine 请求本来就报「没有 process manager」，排队中的全量不该把它改写成别的理由。
+        _state, app = _make(tmp_path, None)
+        _post(app, {"target": "all", "reason": "first"})
+        _until(lambda: bool(exits))
+
+        body = _post(app, {"target": "engine", "reason": "second"}).json()
+
+        assert body["scheduled"] is False
+        assert body["reason"] == RESTART_NO_PROCESS_MANAGER
+
+
+class TestTheFullRestartLockIsFreedWhenNothingStarts:
+    """锁在请求线程里拿，本来由进程退出那一刻带走 —— 退不成就得当场还回去。"""
+
+    def test_a_failed_announcement_frees_it(self, tmp_path: Path, exits: list[int]) -> None:
+        pm = _FakeProcessManager()
+        state, app = _make(tmp_path, pm)
+        _break_announcement(state)
+
+        with pytest.raises(RuntimeError):
+            _post(app, {"target": "all", "reason": "test", "session_id": "s-1"})
+
+        assert app.state.restart_gate.current is None
+        assert pm._restart_pending is False
+        assert exits == []
+
+    def test_the_next_restart_can_get_in_after_it(self, tmp_path: Path, exits: list[int]) -> None:
+        pm = _FakeProcessManager()
+        state, app = _make(tmp_path, pm)
+        _break_announcement(state)
+        with pytest.raises(RuntimeError):
+            _post(app, {"target": "all", "reason": "test", "session_id": "s-1"})
+
+        assert _post(app, {"target": "engine", "reason": "next"}).json()["scheduled"] is True
+        _until(lambda: app.state.restart_gate.current is None)
+
+    def test_a_thread_that_will_not_start_frees_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exits: list[int],
+    ) -> None:
+        import supervisor.api as api_module
+
+        pm = _FakeProcessManager()
+        _state, app = _make(tmp_path, pm)
+        monkeypatch.setattr(api_module, "threading", _FakeThreading)
+
+        with pytest.raises(RuntimeError):
+            _post(app, {"target": "all", "reason": "test"})
+
+        assert app.state.restart_gate.current is None
+        assert pm._restart_pending is False
+        assert exits == []
+
+    def test_it_is_freed_without_a_process_manager_too(self, tmp_path: Path, exits: list[int]) -> None:
+        # 放锁不能跟着 pm 走：没有 pm 的部署照样拿了这把锁。
+        state, app = _make(tmp_path, None)
+        _break_announcement(state)
+
+        with pytest.raises(RuntimeError):
+            _post(app, {"target": "all", "reason": "test", "session_id": "s-1"})
+
+        assert app.state.restart_gate.current is None
+        assert exits == []
+        assert _post(app, {"target": "all", "reason": "next"}).json()["scheduled"] is True
+
+
+# 真的 os._exit 会把这个异常一起带走，只有替身放行它才冒到线程外。
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+class TestTheProcessLeavesEvenWhenTheExitPathTrips:
+    """锁拿了不放、挂起标志也已置上：退出线程半路死掉而进程还活着，之后的重启全被挡住。"""
+
+    @staticmethod
+    def _boom(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("退出前那几步炸了")
+
+    def test_a_failure_after_the_processes_are_stopped_still_exits(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exits: list[int],
+    ) -> None:
+        import supervisor.api as api_module
+
+        pm = _FakeProcessManager()
+        _state, app = _make(tmp_path, pm)
+        monkeypatch.setattr(api_module.log, "info", self._boom)
+
+        _post(app, {"target": "all", "reason": "test"})
+        _until(lambda: bool(exits))
+
+        assert exits == [75]
+        assert "stop_all" in pm.calls
+
+    def test_a_failure_before_anything_ran_still_exits(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exits: list[int],
+    ) -> None:
+        import supervisor.api as api_module
+
+        pm = _FakeProcessManager()
+        _state, app = _make(tmp_path, pm)
+        monkeypatch.setattr(api_module.time, "sleep", self._boom)
+
+        _post(app, {"target": "all", "reason": "test"})
+        _until(lambda: bool(exits))
+
+        assert exits == [75]
+        assert pm.calls == []

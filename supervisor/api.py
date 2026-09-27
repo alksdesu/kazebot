@@ -63,7 +63,10 @@ from .types import (
     OpRequestOut,
     OutboundMessageIn,
     OutboundMessageOut,
+    RESTART_IN_PROGRESS,
+    RESTART_NO_PROCESS_MANAGER,
     RestartIn,
+    RestartInProgress,
     RestartOut,
     Task,
     TaskCompleteIn,
@@ -74,6 +77,7 @@ from .admin_api import create_admin_router
 from .feature_config_api import create_feature_config_router
 from .platform_accounts import PlatformAccounts, create_legacy_qq_account_router, create_platform_account_router
 from .platform_api import create_platform_router
+from .restart_gate import RestartGate
 from .admin_api import init_admin_token, verify_admin_token
 
 
@@ -213,6 +217,9 @@ def create_app(
     app = FastAPI(title="Clonoth Supervisor", version="0.1.0", lifespan=feature_lifespan)
     app.state.state = state
     app.state.process_manager = process_manager
+    # 管理接口的重启同一时刻只跑一个：两个 engine 重启一起跑，先收尾的会在另一个停起中途放开 _restarting_engine；
+    # 全量重启的 stop_all 夹进 engine 重启的停和起之间，新起的 engine 没人停，supervisor 退出后成了孤儿。
+    app.state.restart_gate = RestartGate()
     app.state.config_store = config_store
     app.state.platform_accounts = PlatformAccounts(state.workspace_root)
 
@@ -1692,6 +1699,20 @@ def create_app(
             },
         )
 
+        def _refuse(reason: str, blocker: RestartInProgress | None = None) -> RestartOut:
+            payload: dict[str, Any] = {"target": inp.target, "reason": reason, "ts": _now().isoformat()}
+            if blocker is not None:
+                payload["in_progress"] = blocker.model_dump(mode="json")
+            st.eventlog.append(
+                session_id="__system__",
+                component="supervisor",
+                type_="restart_failed",
+                payload=payload,
+            )
+            return RestartOut(scheduled=False, target=inp.target, reason=reason, in_progress=blocker)
+
+        restart_gate: RestartGate = app.state.restart_gate
+
         # 只重启 engine 依赖两处隔离，缺一处就会把 supervisor 一起带走：
         # process_manager._spawn 的 start_new_session（engine 独立进程组）、以及
         # main.py 关掉 uvicorn 的信号捕获 + _restarting_engine 抑制标志。
@@ -1699,22 +1720,10 @@ def create_app(
             if pm is None:
                 # 没有 process manager 就没有 engine 可停。这里必须报失败而不是假装排上了：
                 # 全量重启那条路靠 os._exit(75) 让外层 launcher 拉起，和这里不是一回事。
-                st.eventlog.append(
-                    session_id="__system__",
-                    component="supervisor",
-                    type_="restart_failed",
-                    payload={"target": inp.target, "reason": "no process manager", "ts": _now().isoformat()},
-                )
-                return RestartOut(scheduled=False, target=inp.target)
-            if not pm.engine_restart_lock.acquire(blocking=False):
-                # 上一次还没收尾：再起一个会在它停起中途放开信号抑制。
-                st.eventlog.append(
-                    session_id="__system__",
-                    component="supervisor",
-                    type_="restart_failed",
-                    payload={"target": inp.target, "reason": "engine restart already in progress", "ts": _now().isoformat()},
-                )
-                return RestartOut(scheduled=False, target=inp.target)
+                return _refuse(RESTART_NO_PROCESS_MANAGER)
+            blocker = restart_gate.claim(inp.target)
+            if blocker is not None:
+                return _refuse(RESTART_IN_PROGRESS, blocker)
             # Deferred engine restart: return HTTP 200 first, then kill+restart.
             # This ensures the tool call in the dying engine receives its response
             # and can shadow_write the tool_result before being terminated.
@@ -1809,75 +1818,92 @@ def create_app(
                     pm._restarting_engine = True  # 抑制信号 handler 退出
                     _restart_and_report()
                 finally:
-                    # 每条退出路径都得放开：抑制留着的话看门狗一直停摆、SIGTERM 一直被吞，锁留着下一次重启进不来。
+                    # 每条退出路径都得放开：抑制留着的话看门狗一直停摆、SIGTERM 一直被吞，这次重启不放下一次就进不来。
                     pm._restarting_engine = False
-                    pm.engine_restart_lock.release()
+                    restart_gate.release()
 
             try:
                 _announce_engine_restart()
                 threading.Thread(target=_deferred_engine_restart, daemon=True, name="restart-engine").start()
             except BaseException:
-                # 线程没起来就没人放锁。
-                pm.engine_restart_lock.release()
+                # 线程没起来就没人放开这次重启。
+                restart_gate.release()
                 raise
             return RestartOut(scheduled=True, target=_restart_target)
 
-        # --no-shell 模式下没有 _watch_shell 线程，需要直接退出
-        # 先停 engine，再延迟退出让 HTTP 响应发出去
-        if inp.session_id:
-            _pending_path = Path(st.workspace_root) / "data" / "restart_pending.json"
-            _si = st.sessions.get(inp.session_id)
-            try:
-                _pending_path.write_text(json.dumps({
-                    "session_id": inp.session_id,
-                    "target": "all",
-                    "conversation_key": _si.conversation_key if _si else "",
-                    "channel": _si.channel if _si else "",
-                    "ts": _now().isoformat(),
-                }), encoding="utf-8")
-            except Exception:
-                pass
-            # 找 source_inbound_seq
-            _all_restart_src_seq = None
-            for _art in st.tasks.values():
-                if (_art.session_id == inp.session_id
-                        and _art.status in (TaskStatus.running, TaskStatus.pending)
-                        and _art.source_inbound_seq):
-                    _all_restart_src_seq = _art.source_inbound_seq
-                    break
-            _all_restart_payload: dict[str, Any] = {"text": "✅ 已触发全量重启，系统即将重启..."}
-            if _all_restart_src_seq:
-                _all_restart_payload["source_inbound_seq"] = _all_restart_src_seq
-            st.eventlog.append(
-                session_id=inp.session_id,
-                component="supervisor",
-                type_="outbound_message",
-                payload=_all_restart_payload,
-            )
+        # 全量重启占下就不放：进程马上要退，放了反倒让 engine 重启赶在退出前插进来。
+        blocker = restart_gate.claim(inp.target)
+        if blocker is not None:
+            return _refuse(RESTART_IN_PROGRESS, blocker)
 
-        def _deferred_exit() -> None:
-            time.sleep(1)
-            if pm is not None:
+        def _announce_full_restart() -> None:
+            if inp.session_id:
+                _pending_path = Path(st.workspace_root) / "data" / "restart_pending.json"
+                _si = st.sessions.get(inp.session_id)
                 try:
-                    pm.stop_all()  # stop engine + shell, with wait
+                    _pending_path.write_text(json.dumps({
+                        "session_id": inp.session_id,
+                        "target": "all",
+                        "conversation_key": _si.conversation_key if _si else "",
+                        "channel": _si.channel if _si else "",
+                        "ts": _now().isoformat(),
+                    }), encoding="utf-8")
                 except Exception:
                     pass
-                # Double-check: wait for all engine processes to be reaped
-                for _eng in getattr(pm, 'engines', []):
+                # 找 source_inbound_seq
+                _all_restart_src_seq = None
+                for _art in st.tasks.values():
+                    if (_art.session_id == inp.session_id
+                            and _art.status in (TaskStatus.running, TaskStatus.pending)
+                            and _art.source_inbound_seq):
+                        _all_restart_src_seq = _art.source_inbound_seq
+                        break
+                _all_restart_payload: dict[str, Any] = {"text": "✅ 已触发全量重启，系统即将重启..."}
+                if _all_restart_src_seq:
+                    _all_restart_payload["source_inbound_seq"] = _all_restart_src_seq
+                st.eventlog.append(
+                    session_id=inp.session_id,
+                    component="supervisor",
+                    type_="outbound_message",
+                    payload=_all_restart_payload,
+                )
+
+        # --no-shell 模式下没有 _watch_shell 线程，需要直接退出
+        # 先停 engine，再延迟退出让 HTTP 响应发出去
+        def _deferred_exit() -> None:
+            try:
+                time.sleep(1)
+                if pm is not None:
                     try:
-                        _eng.popen.wait(timeout=5)
+                        pm.stop_all()  # stop engine + shell, with wait
                     except Exception:
                         pass
-            import traceback as _tb
-            _msg = f'[DIAG] os._exit(75) called from api.py! stack:\n{"" .join(_tb.format_stack())}'
-            log.info(_msg)
-            import sys as _sys; _sys.stdout.flush(); _sys.stderr.flush()
-            import time as _t; _t.sleep(0.5)  # 确保日志写出
-            os._exit(75)  # main.py 外层循环检测到 75 会重启
+                    # Double-check: wait for all engine processes to be reaped
+                    for _eng in getattr(pm, 'engines', []):
+                        try:
+                            _eng.popen.wait(timeout=5)
+                        except Exception:
+                            pass
+                import traceback as _tb
+                _msg = f'[DIAG] os._exit(75) called from api.py! stack:\n{"" .join(_tb.format_stack())}'
+                log.info(_msg)
+                import sys as _sys; _sys.stdout.flush(); _sys.stderr.flush()
+                import time as _t; _t.sleep(0.5)  # 确保日志写出
+            finally:
+                # 重启占着不放、挂起标志也已置上：半路抛异常而进程不退，之后的重启全被挡住。
+                os._exit(75)  # main.py 外层循环检测到 75 会重启
 
-        if pm is not None:
-            pm._restart_pending = True
-        threading.Thread(target=_deferred_exit, daemon=True, name="restart-all").start()
+        try:
+            _announce_full_restart()
+            if pm is not None:
+                pm._restart_pending = True
+            threading.Thread(target=_deferred_exit, daemon=True, name="restart-all").start()
+        except BaseException:
+            # 线程没起来就没人退出进程：挂起标志和占下的重启都得放开，否则之后的重启全被挡住。
+            if pm is not None:
+                pm._restart_pending = False
+            restart_gate.release()
+            raise
         return RestartOut(scheduled=True, target="all")
 
     # ---- 异步委派 API ----

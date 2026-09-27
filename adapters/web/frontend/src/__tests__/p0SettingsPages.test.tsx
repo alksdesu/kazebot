@@ -87,7 +87,7 @@ describe('P0 settings pages', () => {
       }
       if (url.endsWith('/v1/health')) return jsonResponse({ status: 'ok', uptime_seconds: 3723 });
       if (url.endsWith('/v1/config/reload')) return jsonResponse({ ok: true, reloaded: true });
-      if (url.endsWith('/v1/admin/restart')) return jsonResponse({ ok: true, target: 'engine', method: init?.method });
+      if (url.endsWith('/v1/admin/restart')) return jsonResponse({ scheduled: true, target: 'engine', method: init?.method });
       return jsonResponse({});
     });
     vi.stubGlobal('fetch', fetchMock);

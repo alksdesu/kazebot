@@ -323,9 +323,22 @@ class RestartIn(BaseModel):
     session_id: str | None = None
 
 
+# 重启没排上的原因。restart_failed 事件和 RestartOut.reason 用的是同一组，控制台按它换成中文。
+RESTART_NO_PROCESS_MANAGER = "no process manager"
+RESTART_IN_PROGRESS = "restart already in progress"
+
+
+class RestartInProgress(BaseModel):
+    target: str
+    since: datetime
+
+
 class RestartOut(BaseModel):
     scheduled: bool
     target: str
+    reason: str | None = None
+    # 因为已有一次在跑而没排上时，给出是哪一次、几点开始的。
+    in_progress: RestartInProgress | None = None
 
 
 class HealthOut(BaseModel):

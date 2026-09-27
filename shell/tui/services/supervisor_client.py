@@ -135,6 +135,7 @@ class SupervisorClient:
                 "/v1/admin/restart",
                 json={"target": target, "reason": reason or "via TUI /restart"},
             )
-            return r.status_code == 200
+            # 200 也可能没排上；当成排上了 TUI 就会退出，supervisor 会把它当成正常关闭。
+            return r.status_code == 200 and bool(r.json().get("scheduled"))
         except Exception:
             return False

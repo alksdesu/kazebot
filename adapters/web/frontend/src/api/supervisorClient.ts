@@ -1472,9 +1472,16 @@ export function updateMcpClientsRaw(token: string, yaml: string): Promise<any> {
   return writeRawConfig('/admin/config/mcp-clients/raw', token, yaml);
 }
 
+export interface RestartInProgress {
+  target: string;
+  since: string;
+}
+
 export interface RestartResult {
   scheduled: boolean;
   target: string;
+  reason?: string | null;
+  in_progress?: RestartInProgress | null;
 }
 
 export async function restartEngine(

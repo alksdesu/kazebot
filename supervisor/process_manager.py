@@ -68,8 +68,6 @@ class ProcessManager:
         self._stopped = False
         self._restart_pending = False
         self._restarting_engine = False  # restart engine 期间抑制信号退出
-        # 管理接口的 engine 重启同一时刻只跑一个：两个一起跑，先收尾的会在另一个停起中途放开上面的抑制。
-        self.engine_restart_lock = threading.Lock()
         self._health: dict[str, WorkerHealth] = {}
         self._health_lock = threading.RLock()
         self._watchdog: threading.Thread | None = None
@@ -216,8 +214,8 @@ class ProcessManager:
     def engine_names(self) -> list[str]:
         return [f"engine-{i}" for i in range(1, self.engine_workers + 1)]
 
-    # 下面四个都跟看门狗抢 self.engines：主动停的那一刻它正好巡检，会把停掉的
-    # 当成崩溃补回来。共用一把锁，让整个停/起过程对它不可分割。
+    # 下面三个都跟看门狗抢 self.engines：主动停的那一刻它正好巡检，会把停掉的
+    # 当成崩溃补回来。共用一把锁，每一次停或起对它都不可分割。
     def start_engine(self) -> None:
         with self._health_lock:
             self._start_engine_locked()
@@ -267,13 +265,6 @@ class ProcessManager:
         if self.shell_cli:
             self._stop(self.shell_cli)
             self.shell_cli = None
-
-    def restart_engine(self) -> None:
-        with self._health_lock:
-            self._stop_engine_locked()
-            # 人工重启：把上一轮的退避和停手状态一并清掉，否则刚重启就被退避挡住。
-            self._reset_backoff_locked()
-            self._start_engine_locked()
 
     def stop_all(self) -> None:
         with self._health_lock:
@@ -329,13 +320,10 @@ class ProcessManager:
     def clear_given_up(self) -> None:
         """人工重试：把停手状态和退避一起清掉，下一轮巡检立刻重拉。"""
         with self._health_lock:
-            self._reset_backoff_locked()
-
-    def _reset_backoff_locked(self) -> None:
-        for health in self._health.values():
-            health.given_up = False
-            health.failures = 0
-            health.next_retry_at = 0.0
+            for health in self._health.values():
+                health.given_up = False
+                health.failures = 0
+                health.next_retry_at = 0.0
 
     def _tail_log(self, proc: ManagedProcess) -> str:
         if proc.log_path is None or not proc.log_path.exists():
