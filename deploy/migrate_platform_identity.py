@@ -1,15 +1,18 @@
-"""把一个会话的长期记忆、短期上下文和功能数据绑到另一个平台的会话上：离线、默认 dry-run、自动备份。
+"""跨平台绑定：会话的长期记忆、短期上下文和功能数据接到另一个平台的会话上，人和群在新平台上沿用原来的别名。
 
-新平台的会话键和原来的对不上（QQ 官方的 openid 推不出 QQ 号），只能由管理员按真实会话手动对照。
-先用 conversations 看两边各有哪些会话，再用 conversation --from --to 绑定。
+新平台的会话键和 ID 都和原来的对不上（QQ 官方的 openid 推不出 QQ 号），只能由管理员按真实会话、真实 ID 手动对照。
+离线跑、默认 dry-run、执行前自动备份；先用 conversations 看两边各有哪些会话。
 """
 from __future__ import annotations
 
 import argparse
+import json
+import shutil
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -17,6 +20,7 @@ if str(_ROOT) not in sys.path:
 
 # 会话键怎么算必须和两边的 bot 同一份，所以直接用共享层的模块。
 from adapters._shared.active_account import ActiveAccountStore, account_candidates, normalize_account  # noqa: E402
+from adapters._shared.aliases import GROUP_BUCKET, USER_BUCKET, AliasTaken, rebind_alias, write_alias_file  # noqa: E402
 from adapters._shared.conversation_hash import (  # noqa: E402
     SECRET_EXPLICIT,
     SECRET_LEGACY,
@@ -27,12 +31,15 @@ from adapters._shared.conversation_hash import (  # noqa: E402
     current_secret,
     key_origin,
 )
+from adapters._shared.user_profiles import load_profiles  # noqa: E402
 from clonoth_runtime import offline_workspace  # noqa: E402
+from engine import memory_subjects  # noqa: E402
 from engine.conversation_migration import (  # noqa: E402
     ConversationRekey,
     MigrationPlan,
     RekeyCount,
     Rename,
+    fresh_backup_dir,
     load_route_map,
     memory_root,
     move_memory,
@@ -40,8 +47,25 @@ from engine.conversation_migration import (  # noqa: E402
     record_route,
     route_state_file,
 )
-from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE, CONVERSATION_KINDS, PlatformDescriptor  # noqa: E402
-from platforms.registry import all_platforms, conversation_channel, conversation_key_prefix, find_platform  # noqa: E402
+from platforms.descriptor import (  # noqa: E402
+    CHANNEL_GROUP,
+    CHANNEL_PRIVATE,
+    CONVERSATION_KINDS,
+    ID_SCOPE_ACCOUNT,
+    STATE_ALIASES,
+    PlatformDescriptor,
+    normalize_name,
+)
+from platforms.ids import identity_key, normalize_id  # noqa: E402
+from platforms.registry import (  # noqa: E402
+    all_platforms,
+    conversation_channel,
+    conversation_key_prefix,
+    find_platform,
+    platform_profiles_path,
+    platform_state_path,
+    split_conversation_key,
+)
 from supervisor.conversation_stores import (  # noqa: E402
     ConversationStoreError,
     format_store_counts,
@@ -56,6 +80,9 @@ SECRET_LABELS = {
     SECRET_LEGACY: "无盐（首次启动会钉在无盐上）",
     SECRET_UNSETTLED: "还没定下来",
 }
+IDENTITY_COMMANDS = {"person": USER_BUCKET, "group": GROUP_BUCKET}
+BUCKET_NOUNS = {USER_BUCKET: "人", GROUP_BUCKET: "群"}
+PROFILE_FIELD_LABELS = {"display_name": "显示名", "address_as": "称呼", "title": "头衔", "note": "备注"}
 
 
 class BindingRefused(RuntimeError):
@@ -111,6 +138,42 @@ class PlatformConversations:
     rows: list[ConversationRow]
     # 这个平台算不出会话键时的原因，rows 这时是空的。
     problem: str = ""
+
+
+@dataclass(frozen=True)
+class Identity:
+    """身份绑定的一头：哪个平台上的哪个原始 ID，以及别名表里认它用的键。"""
+
+    platform: PlatformDescriptor
+    raw: str
+    # ID 整个平台唯一时是空串。
+    account: str
+    key: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.platform.id}:{self.raw}"
+
+
+@dataclass
+class IdentityReport:
+    workspace: Path
+    apply: bool
+    bucket: str
+    source: Identity
+    target: Identity
+    alias: str
+    # 目标身份原来的别名，换掉以后不再指向谁。
+    replaced: str = ""
+    # 同一个平台里换号：原来的身份让出别名。
+    released: bool = False
+    changed: bool = False
+    # 被换掉的别名建过档，档案并进沿用的别名。
+    roster_merged: bool = False
+    # 源平台的按人资料里给这个人写了哪几项；资料在 config/ 里归人管，只提醒不代改。
+    profile_fields: tuple[str, ...] = ()
+    target_profiles: Path | None = None
+    backup_dir: Path | None = None
 
 
 def account_label(account: str) -> str:
@@ -252,6 +315,124 @@ def run_binding(
     return report
 
 
+def resolve_identity(workspace: Path, spec: str, account: str | None, *, flag: str, account_flag: str) -> Identity:
+    """「平台 id:原始 ID」认成别名表里的键。按账号分 ID 的平台，账号不点名就用记下的当前账号。"""
+    name, separator, raw_text = str(spec or "").strip().partition(":")
+    platform = find_platform(name) if separator else None
+    if platform is None or normalize_name(name) not in {platform.id, *platform.aliases}:
+        raise BindingRefused(f"{flag} {spec!r}：写成「平台 id:原始 ID」，比如 qq:12345")
+    raw = normalize_id(raw_text, platform.id_shape)
+    if not raw:
+        raise BindingRefused(f"{flag} {spec!r}：{raw_text.strip()!r} 不是 {platform.display_name} 的 ID")
+    if platform.id_scope != ID_SCOPE_ACCOUNT:
+        return Identity(platform, raw, "", identity_key(platform, raw))
+    named = _named_account(account, platform, account_flag)
+    chosen = ActiveAccountStore(platform, Path(workspace)).load() if named is None else named
+    if not chosen:
+        raise BindingRefused(f"{platform.display_name} 的 ID 按机器人账号分，用 {account_flag} 指定是哪个账号名下的")
+    return Identity(platform, raw, chosen, identity_key(platform, raw, account=chosen))
+
+
+def run_identity_binding(
+    *, workspace: Path, bucket: str, source: str, target: str,
+    source_account: str | None = None, target_account: str | None = None,
+    apply: bool = False, now: float | None = None,
+) -> IdentityReport:
+    """让目标身份沿用源身份的别名：人的长期记忆和建档按别名认，群的别名写在记忆和提示词里。
+
+    同一个平台里换号时原来的身份让出别名。目标原来的别名换掉以后不再指向谁：人要是已经在那个别名下攒了记忆就拒绝。
+    """
+    workspace = Path(workspace)
+    noun = BUCKET_NOUNS[bucket]
+    src = resolve_identity(workspace, source, source_account, flag="--from", account_flag="--from-account")
+    dst = resolve_identity(workspace, target, target_account, flag="--to", account_flag="--to-account")
+    if (src.platform.id, src.key) == (dst.platform.id, dst.key):
+        raise BindingRefused("--from 和 --to 是同一个身份")
+    source_path = platform_state_path(src.platform, STATE_ALIASES, workspace)
+    target_path = platform_state_path(dst.platform, STATE_ALIASES, workspace)
+    source_doc = _read_alias_document(source_path)
+    entries = source_doc.get(bucket)
+    entry = entries.get(src.key) if isinstance(entries, dict) else None
+    alias = str(entry.get("alias") or "").strip() if isinstance(entry, dict) else ""
+    if not alias:
+        raise BindingRefused(f"{src.platform.display_name} 的别名表里没有这个{noun}（{src.label}）")
+    released = source_path == target_path
+    if released:
+        # 同一个平台里换号：原来的身份让出别名，一个别名只能反查回一个身份。
+        target_doc = {**source_doc, bucket: {key: item for key, item in entries.items() if key != src.key}}
+    else:
+        target_doc = _read_alias_document(target_path)
+    try:
+        rebind = rebind_alias(target_doc, bucket, dst.key, alias, now=time.time() if now is None else now)
+    except AliasTaken as taken:
+        raise BindingRefused(
+            f"{dst.platform.display_name} 的别名表里 {alias} 已经是另一个{noun}（{taken.holder}）",
+        ) from taken
+    except ValueError as error:
+        raise BindingRefused(f"{target_path} 读不懂，先修好再绑：{error}") from error
+    report = IdentityReport(
+        workspace=workspace, apply=apply, bucket=bucket, source=src, target=dst, alias=alias,
+        replaced=rebind.replaced, released=released, changed=rebind.changed or released,
+    )
+    if bucket == USER_BUCKET:
+        _check_person(workspace, report)
+    if not apply or not report.changed:
+        return report
+
+    roster = memory_subjects.roster_path(workspace)
+    report.backup_dir = _backup_files(workspace, [target_path, *([roster] if report.roster_merged else [])])
+    write_alias_file(target_path, rebind.document)
+    if report.roster_merged:
+        memory_subjects.merge_subject(workspace, report.replaced, alias)
+    return report
+
+
+def _check_person(workspace: Path, report: IdentityReport) -> None:
+    """人的别名连着长期记忆和建档：被换掉的别名已经攒下记忆就拒绝，建过档就并进沿用的别名。"""
+    if report.replaced:
+        namespace = memory_subjects.subject_namespace(report.replaced)
+        if namespace and (memory_root(workspace) / namespace).is_dir():
+            raise BindingRefused(
+                f"{report.target.label} 在 {report.target.platform.display_name} 上已经有自己的长期记忆（{namespace}），"
+                "两个人的记忆不能合并",
+            )
+        report.roster_merged = memory_subjects.is_enrolled(workspace, report.replaced)
+    profiles = platform_profiles_path(report.source.platform, workspace)
+    profile = load_profiles(profiles).get(report.source.key, {}) if profiles is not None else {}
+    report.profile_fields = tuple(label for name, label in PROFILE_FIELD_LABELS.items() if profile.get(name))
+    report.target_profiles = platform_profiles_path(report.target.platform, workspace)
+
+
+def _read_alias_document(path: Path) -> dict[str, Any]:
+    """别名文件读不懂就拒绝：当成空表写回去，别人的别名就全没了。"""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise BindingRefused(f"{path} 读不懂，先修好再绑：{error}") from error
+    if not isinstance(data, dict):
+        raise BindingRefused(f"{path} 读不懂，先修好再绑：顶层不是对象")
+    return data
+
+
+def _backup_files(workspace: Path, paths: Iterable[Path]) -> Path | None:
+    """改之前把这几份文件按工作区里的相对位置拷进新的备份目录；一份都不在就不建目录。"""
+    existing = [path for path in paths if path.exists()]
+    if not existing:
+        return None
+    backup_dir = fresh_backup_dir(workspace)
+    for path in existing:
+        try:
+            relative = path.resolve().relative_to(workspace.resolve())
+        except ValueError:
+            relative = Path(path.name)
+        saved = backup_dir / relative
+        saved.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, saved)
+    return backup_dir
+
+
 def _conversation_of(real: str, flag: str) -> tuple[PlatformDescriptor, str]:
     found = conversation_channel(real)
     if found is None:
@@ -320,7 +501,52 @@ def _print_binding(report: BindingReport, *, target_account_named: bool) -> None
         print("这是 dry-run，未改动任何文件。加 --apply 真正执行。")
     if target_account_named:
         print("目标 bot 登录的账号要和 --to-account 一致，不然它算出来的会话键对不上。")
+    command, noun = ("group", "这个群") if source.kind == CHANNEL_GROUP else ("person", "这个人")
+    print(f"要让{noun}在新平台上沿用原来的别名，再跑: {command} {_identity_flags(source, '--from')} {_identity_flags(target, '--to')}")
     print("在 bot 与 supervisor 都停止的状态下运行本脚本。")
+
+
+def _identity_flags(side: Side, flag: str) -> str:
+    """会话那一头对应的身份参数：真实会话键冒号后面就是平台上的群号或用户 ID。"""
+    text = f"{flag} {side.platform.id}:{split_conversation_key(side.real)[1]}"
+    return f"{text} {flag}-account {side.account}" if side.platform.id_scope == ID_SCOPE_ACCOUNT else text
+
+
+def _print_identity(report: IdentityReport) -> None:
+    noun = BUCKET_NOUNS[report.bucket]
+    source, target = report.source, report.target
+    done = "已" if report.apply else "将"
+    print(f"[{'APPLY' if report.apply else 'DRY-RUN'}] workspace: {report.workspace}")
+    print(f"源{noun}: {source.label}（{source.platform.display_name}{_account_note(source)}），别名 {report.alias}")
+    print(f"目标{noun}: {target.label}（{target.platform.display_name}{_account_note(target)}）")
+    if not report.changed:
+        print(f"目标{noun}已经是 {report.alias}，不用改。")
+    elif report.replaced:
+        print(f"目标原来的别名 {report.replaced} {done}换成 {report.alias}，{report.replaced} 以后不再指向任何{noun}。")
+    else:
+        print(f"目标{noun}{done}用上别名 {report.alias}。")
+    if report.released:
+        print(f"同一个平台里换号：{source.label} 让出 {report.alias}，它再出现时会领新的别名。")
+    if report.roster_merged:
+        print(f"建档名册: {report.replaced} 的档案{done}并进 {report.alias}。")
+    if report.profile_fields:
+        fields = "、".join(report.profile_fields)
+        if report.target_profiles is not None:
+            print(f"按人资料: 源平台给这个人写了{fields}，不会自动带过去；要沿用就抄进 {report.target_profiles} 的 {target.key} 下。")
+        else:
+            print(f"按人资料: 源平台给这个人写了{fields}，{target.platform.display_name} 没有按人资料文件，带不过去。")
+    if report.bucket == USER_BUCKET:
+        # 功能数据按人的归属跟着原平台的 ID 走，换过去等于把两个身份合成一个人，决策上先不合并。
+        print("他在原平台建的提醒、定时任务、资料和执行计划仍记在原来的身份名下：新平台上的他改不了，管理员照常能管。")
+    if report.backup_dir is not None:
+        print(f"备份目录: {report.backup_dir}")
+    if not report.apply:
+        print("这是 dry-run，未改动任何文件。加 --apply 真正执行。")
+    print("在 bot 与 supervisor 都停止的状态下运行本脚本。")
+
+
+def _account_note(identity: Identity) -> str:
+    return f"，账号 {identity.account}" if identity.account else ""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -344,6 +570,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     binding.add_argument("--to-account", default=None, help="目标平台的机器人账号；不给就用目标 bot 记下的当前账号。")
     binding.add_argument("--apply", action="store_true", help="真正执行；不加则只 dry-run。")
+    for command, bucket in IDENTITY_COMMANDS.items():
+        noun = BUCKET_NOUNS[bucket]
+        identity = commands.add_parser(command, parents=[common], help=f"让新平台上的同一个{noun}沿用原来的别名。")
+        identity.add_argument("--from", dest="source", required=True, help=f"原来的{noun}，写成「平台 id:原始 ID」，比如 qq:12345。")
+        identity.add_argument("--to", dest="target", required=True, help=f"新平台上的{noun}，写法同 --from。")
+        identity.add_argument(
+            "--from-account", default=None, help="源平台的 ID 按机器人账号分时，是哪个账号名下的；不给就用记下的当前账号。",
+        )
+        identity.add_argument(
+            "--to-account", default=None, help="目标平台的 ID 按机器人账号分时，是哪个账号名下的；不给就用记下的当前账号。",
+        )
+        identity.add_argument("--apply", action="store_true", help="真正执行；不加则只 dry-run。")
     args = parser.parse_args(argv)
     workspace = offline_workspace(args.workspace)
 
@@ -360,17 +598,26 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        report = run_binding(
-            workspace=workspace, source_real=args.source, target_real=args.target,
-            source_account=args.from_account, target_account=args.to_account, apply=args.apply,
-        )
+        if args.command == "conversation":
+            report: BindingReport | IdentityReport = run_binding(
+                workspace=workspace, source_real=args.source, target_real=args.target,
+                source_account=args.from_account, target_account=args.to_account, apply=args.apply,
+            )
+        else:
+            report = run_identity_binding(
+                workspace=workspace, bucket=IDENTITY_COMMANDS[args.command], source=args.source, target=args.target,
+                source_account=args.from_account, target_account=args.to_account, apply=args.apply,
+            )
     except BindingRefused as refused:
         print(f"没有绑定，未改动任何文件: {refused}", file=sys.stderr)
         return 2
     except Exception as error:
         print(f"绑定中止（如已部分改动请从备份恢复）: {error}", file=sys.stderr)
         return 1
-    _print_binding(report, target_account_named=args.to_account is not None)
+    if isinstance(report, BindingReport):
+        _print_binding(report, target_account_named=args.to_account is not None)
+    else:
+        _print_identity(report)
     return 0
 
 

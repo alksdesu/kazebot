@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import subprocess
 import sys
@@ -16,12 +17,17 @@ if str(_ROOT) not in sys.path:
 
 from adapters._shared import aliases as alias_module  # noqa: E402
 from adapters._shared.aliases import (  # noqa: E402
+    GROUP_BUCKET,
+    USER_BUCKET,
     AliasBook,
     AliasLoad,
     AliasNumbering,
     AliasTable,
+    AliasTaken,
     alias_from_index,
     alias_to_index,
+    rebind_alias,
+    write_alias_file,
 )
 from engine import memory_subjects  # noqa: E402
 from platforms.descriptor import (  # noqa: E402
@@ -280,6 +286,98 @@ class TestBook:
 
         assert loaded is not None and loaded.pruned == 0
         assert book.users.real_of("UserA") == "10001"
+
+
+class TestRebind:
+    def _document(self, **users: str) -> dict[str, Any]:
+        return {
+            "version": 1, "updated_at": "2026-01-01T00:00:00+00:00", "user_next": 2, "group_next": 1,
+            "users": {key: {"alias": alias, "last_seen": 1.0} for key, alias in users.items()},
+            "groups": {"20001": {"alias": "GroupA", "last_seen": 1.0}},
+        }
+
+    def test_an_identity_takes_over_an_alias_and_its_old_one_is_reported(self) -> None:
+        document = self._document(k1="UserB")
+
+        rebind = rebind_alias(document, USER_BUCKET, "k1", "UserA", now=_NOW)
+
+        assert (rebind.replaced, rebind.changed) == ("UserB", True)
+        assert rebind.document["users"] == {"k1": {"alias": "UserA", "last_seen": _NOW}}
+        assert (rebind.document["groups"], rebind.document["user_next"]) == (document["groups"], 2)
+        # 传进来的那份原样不动，改返回的那份也碰不到它。
+        assert document["users"]["k1"]["alias"] == "UserB"
+        rebind.document["groups"]["20001"]["alias"] = "GroupZ"
+        assert document["groups"]["20001"]["alias"] == "GroupA"
+
+    def test_a_first_alias_file_comes_out_the_way_the_book_writes_it(self, tmp_path: Path) -> None:
+        rebind = rebind_alias({}, GROUP_BUCKET, "20009", "GroupC", now=_NOW)
+
+        assert set(rebind.document) == {"version", "updated_at", "user_next", "group_next", "users", "groups"}
+        assert (rebind.document["version"], rebind.document["user_next"], rebind.document["group_next"]) == (1, 0, 3)
+        assert rebind.document["updated_at"] == dt.datetime.fromtimestamp(_NOW, dt.timezone.utc).isoformat()
+        write_alias_file(tmp_path / "data" / "aliases.json", rebind.document)
+        book = _book(tmp_path)
+        assert book.load() == AliasLoad(users=0, groups=1, pruned=0, rejected=0)
+        assert book.group_real_of("GroupC") == "20009"
+
+    def test_an_alias_held_by_another_identity_is_refused(self) -> None:
+        with pytest.raises(AliasTaken) as taken:
+            rebind_alias(self._document(k2="UserA"), USER_BUCKET, "k1", "UserA", now=_NOW)
+
+        assert (taken.value.alias, taken.value.holder) == ("UserA", "k2")
+
+    def test_the_alias_it_already_has_changes_nothing(self) -> None:
+        document = self._document(k1="UserA")
+
+        rebind = rebind_alias(document, USER_BUCKET, "k1", "UserA", now=_NOW)
+
+        assert (rebind.replaced, rebind.changed, rebind.document) == ("", False, document)
+
+    def test_the_next_number_moves_past_the_alias(self) -> None:
+        rebind = rebind_alias(self._document(), USER_BUCKET, " k1 ", "UserE", now=_NOW)
+
+        assert (rebind.replaced, rebind.document["user_next"]) == ("", 5)
+        assert list(rebind.document["users"]) == ["k1"]
+
+    @pytest.mark.parametrize("bucket, key, alias", [
+        ("people", "k1", "UserA"),
+        (USER_BUCKET, "k1", "GroupA"),
+        (USER_BUCKET, "k1", "UserUnknown"),
+        (USER_BUCKET, " ", "UserA"),
+    ])
+    def test_nonsense_is_refused(self, bucket: str, key: str, alias: str) -> None:
+        with pytest.raises(ValueError):
+            rebind_alias(self._document(), bucket, key, alias, now=_NOW)
+
+    def test_a_bucket_that_is_not_an_object_is_refused(self) -> None:
+        with pytest.raises(ValueError):
+            rebind_alias({"users": []}, USER_BUCKET, "k1", "UserA", now=_NOW)
+
+    def test_the_file_is_written_readably(self, tmp_path: Path) -> None:
+        path = tmp_path / "data" / "aliases.json"
+        document = self._document(k1="UserA")
+
+        write_alias_file(path, document)
+
+        assert path.read_text(encoding="utf-8") == json.dumps(document, ensure_ascii=False, indent=2)
+
+    def test_a_write_that_dies_halfway_leaves_the_old_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # bot 和 supervisor 随时会读这份文件，读到半份就当成没有别名。
+        path = tmp_path / "data" / "aliases.json"
+        write_alias_file(path, self._document(k1="UserA"))
+        before = path.read_text(encoding="utf-8")
+        real_write = Path.write_text
+
+        def dying_write(self: Path, text: str, *args: Any, **kwargs: Any) -> int:
+            real_write(self, text[: len(text) // 2], *args, **kwargs)
+            raise OSError("disk full")
+
+        monkeypatch.setattr(Path, "write_text", dying_write)
+        with pytest.raises(OSError):
+            write_alias_file(path, self._document(k1="UserB"))
+        monkeypatch.undo()
+
+        assert path.read_text(encoding="utf-8") == before
 
 
 class TestSharedNumbering:

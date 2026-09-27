@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import datetime as dt
 import json
 import logging
@@ -32,12 +33,14 @@ logger = logging.getLogger(__name__)
 
 USER_PREFIX = "User"
 GROUP_PREFIX = "Group"
+USER_BUCKET = "users"
+GROUP_BUCKET = "groups"
 # 每次命中都写盘会把节流窗口打满，同一小时内只记一次就够保留期判定用。
 TOUCH_MIN_INTERVAL = 3600.0
 FORMAT_VERSION = 1
 NUMBERING_FORMAT_VERSION = 1
 # 别名文件里每张表的前缀、桶名和「下一个编号」字段。
-_TABLE_FIELDS = ((USER_PREFIX, "users", "user_next"), (GROUP_PREFIX, "groups", "group_next"))
+_TABLE_FIELDS = ((USER_PREFIX, USER_BUCKET, "user_next"), (GROUP_PREFIX, GROUP_BUCKET, "group_next"))
 
 ClaimAlias = Callable[[str, Container[str]], str]
 
@@ -95,6 +98,76 @@ def _next_index_in(data: Mapping[str, Any], prefix: str, bucket: str, next_field
         if isinstance(item, dict)
     ]
     return max(_coerce_index(data.get(next_field)), max(used, default=-1) + 1)
+
+
+def write_alias_file(path: Path, document: Mapping[str, Any]) -> None:
+    """原子写别名文件：bot 和 supervisor 随时会读它，不能读到半份。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+class AliasTaken(ValueError):
+    """别名已经记在别的身份名下：一个别名只能反查回一个人。"""
+
+    def __init__(self, alias: str, holder: str) -> None:
+        super().__init__(f"alias {alias!r} already belongs to {holder!r}")
+        self.alias = alias
+        self.holder = holder
+
+
+@dataclass(frozen=True)
+class AliasRebind:
+    document: dict[str, Any]
+    # 这个身份原来的别名，换掉以后不再指向谁；原来没有、或者本来就是这个别名时是空串。
+    replaced: str
+    changed: bool
+
+
+def rebind_alias(document: Mapping[str, Any], bucket: str, key: str, alias: str, *, now: float) -> AliasRebind:
+    """别名文件里把 key 这个身份接到 alias 上，返回改好的一份，传进来的不动。
+
+    跨平台绑定用：另一个平台上的同一个人、同一个群沿用原来的别名，记忆和建档名册都按别名认人。
+    alias 已经记在别的身份名下时抛 AliasTaken。
+    """
+    prefix, next_field = _bucket_fields(bucket)
+    index = alias_to_index(prefix, alias)
+    if index < 0:
+        raise ValueError(f"{alias!r} is not a {prefix} alias")
+    key = str(key or "").strip()
+    if not key:
+        raise ValueError("an alias needs an identity key")
+    data = copy.deepcopy(dict(document))
+    entries = data.get(bucket, {})
+    if not isinstance(entries, dict):
+        raise ValueError(f"{bucket} in the alias file is not an object")
+    holder = next((
+        other for other, item in entries.items()
+        if other != key and isinstance(item, dict) and str(item.get("alias") or "").strip() == alias
+    ), None)
+    if holder is not None:
+        raise AliasTaken(alias, holder)
+    current = entries.get(key)
+    previous = str(current.get("alias") or "").strip() if isinstance(current, dict) else ""
+    if previous == alias:
+        return AliasRebind(data, "", changed=False)
+    # 补齐成 AliasBook 写出来的形状：目标平台还没有别名表时，这就是它的第一份。
+    for _, table_bucket, table_next in _TABLE_FIELDS:
+        data.setdefault(table_bucket, {})
+        data.setdefault(table_next, 0)
+    data.setdefault("version", FORMAT_VERSION)
+    data["updated_at"] = dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat()
+    data[bucket] = {**entries, key: {"alias": alias, "last_seen": now}}
+    data[next_field] = max(_coerce_index(data.get(next_field)), index + 1)
+    return AliasRebind(data, previous, changed=True)
+
+
+def _bucket_fields(bucket: str) -> tuple[str, str]:
+    for prefix, name, next_field in _TABLE_FIELDS:
+        if name == bucket:
+            return prefix, next_field
+    raise ValueError(f"unknown alias bucket: {bucket!r}")
 
 
 class AliasNumbering:
@@ -439,10 +512,10 @@ class AliasBook:
             return None
         if not isinstance(data, dict):
             return None
-        rejected = self._restore(self.users, data.get("users"), accept_user)
+        rejected = self._restore(self.users, data.get(USER_BUCKET), accept_user)
         if rejected:
             self.mark_dirty()
-        self._restore(self.groups, data.get("groups"), _accept_all)
+        self._restore(self.groups, data.get(GROUP_BUCKET), _accept_all)
         self.users.resume_numbering(data.get("user_next"))
         self.groups.resume_numbering(data.get("group_next"))
         # 本平台用过的编号记进全平台编号：编号文件丢过，或者别的进程重建时没看见这份文件，都靠这一步补齐。
@@ -517,18 +590,14 @@ class AliasBook:
                 return
             now = self._clock()
             try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                data = {
+                write_alias_file(self.path, {
                     "version": FORMAT_VERSION,
                     "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                     "user_next": self.users.next_index,
                     "group_next": self.groups.next_index,
-                    "users": self.users.payload(now),
-                    "groups": self.groups.payload(now),
-                }
-                tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-                tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-                tmp.replace(self.path)
+                    USER_BUCKET: self.users.payload(now),
+                    GROUP_BUCKET: self.groups.payload(now),
+                })
                 self.dirty = False
                 self.last_saved_at = self._clock()
             except Exception:

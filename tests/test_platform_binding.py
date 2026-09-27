@@ -13,8 +13,10 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from adapters._shared.active_account import ActiveAccountStore  # noqa: E402
+from adapters._shared.aliases import GROUP_BUCKET, USER_BUCKET, AliasBook  # noqa: E402
 from adapters._shared.conversation_hash import ConversationKeys  # noqa: E402
 from engine.conversation_migration import load_route_map, memory_root, namespace_dir, route_state_file  # noqa: E402
+from engine import memory_subjects  # noqa: E402
 from engine.materials.service import MaterialService  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 from platforms.descriptor import (  # noqa: E402
@@ -22,10 +24,11 @@ from platforms.descriptor import (  # noqa: E402
     CHANNEL_OTHER,
     CHANNEL_PRIVATE,
     ChannelDescriptor,
+    STATE_ALIASES,
     PlatformDescriptor,
     SecretField,
 )
-from platforms.registry import register_platform, unregister_platform  # noqa: E402
+from platforms.registry import platform_state_path, register_platform, unregister_platform  # noqa: E402
 from supervisor.session_store import session_registry_path  # noqa: E402
 from workspace import workspace_instance  # noqa: E402
 
@@ -55,7 +58,12 @@ MX_REAL = "mx_room:room123"
 QQ_BOT = "10001"
 QQ_OTHER_BOT = "10002"
 MX_BOT = "mxbot"
-_QQ_ENVS = ("ONEBOT_CONVERSATION_HASH_SECRET", "ONEBOT_CONVERSATION_HASH_SECRET_FILE", "ONEBOT_STATE_FILE")
+QQ_USER = "12345"
+MX_USER = "alice"
+_QQ_ENVS = (
+    "ONEBOT_CONVERSATION_HASH_SECRET", "ONEBOT_CONVERSATION_HASH_SECRET_FILE", "ONEBOT_STATE_FILE",
+    "ONEBOT_ANON_MAP_FILE", "CLONOTH_QQ_USER_PROFILES_PATH",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -90,21 +98,23 @@ def _actor(scope: str, bot: str) -> dict:
     return {"scope": scope, "owner": "user:alice", "bot_scope": bot, "is_admin": True, "role": "admin"}
 
 
-def _seed(tmp_path: Path, *, account: str = QQ_BOT, memory: bool = True, features: bool = True) -> str:
-    """QQ 那边一个群：路由表里有它，按 account 算的键下有长期记忆、会话和资料设置。返回它的稳定键。"""
+def _seed(
+    tmp_path: Path, *, account: str = QQ_BOT, memory: bool = True, features: bool = True, real: str = QQ_REAL,
+) -> str:
+    """QQ 那边一个会话：路由表里有它，按 account 算的键下有长期记忆、会话和资料设置。返回它的稳定键。"""
     data = tmp_path / "data"
     data.mkdir(parents=True, exist_ok=True)
     (data / "onebot_conversation_hash_secret").write_text(QQ_SECRET, encoding="utf-8")
     if account:
         ActiveAccountStore(QQ_NAPCAT, tmp_path).save(account)
-    stable = _qq_stable(account=account)
-    _add_route(route_state_file(tmp_path, QQ_NAPCAT), stable, QQ_REAL)
+    stable = _qq_stable(real, account=account)
+    _add_route(route_state_file(tmp_path, QQ_NAPCAT), stable, real)
     if memory:
         (memory_root(tmp_path) / namespace_dir(stable)).mkdir(parents=True)
         (memory_root(tmp_path) / namespace_dir(stable) / "book.yaml").write_text("entries: []\n", encoding="utf-8")
     if features:
         session_registry_path(tmp_path).write_text(json.dumps({"sid-1": {
-            "session_id": "sid-1", "conversation_key": stable, "channel": "qq_group",
+            "session_id": "sid-1", "conversation_key": stable, "channel": real.split(":", 1)[0],
             "created_at": "2026-01-01T00:00:00+00:00", "reset": False,
         }}), encoding="utf-8")
         service = MaterialService(tmp_path)
@@ -132,6 +142,39 @@ def _journal_enabled(tmp_path: Path, scope: str, bot: str) -> bool:
         return service.store.settings(_actor(scope, bot)).get("journal_enabled") is True
     finally:
         service.close()
+
+
+def _alias_file(tmp_path: Path, platform: PlatformDescriptor) -> Path:
+    return platform_state_path(platform, STATE_ALIASES, tmp_path)
+
+
+def _write_aliases(
+    tmp_path: Path, platform: PlatformDescriptor, *, users: dict[str, str] | None = None,
+    groups: dict[str, str] | None = None,
+) -> str:
+    path = _alias_file(tmp_path, platform)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "version": 1, "updated_at": "2026-01-01T00:00:00+00:00", "user_next": 2, "group_next": 2,
+        "users": {key: {"alias": alias, "last_seen": 1.0} for key, alias in (users or {}).items()},
+        "groups": {key: {"alias": alias, "last_seen": 1.0} for key, alias in (groups or {}).items()},
+    }), encoding="utf-8")
+    return path.read_text(encoding="utf-8")
+
+
+def _aliases(tmp_path: Path, platform: PlatformDescriptor, bucket: str = USER_BUCKET) -> dict[str, str]:
+    data = json.loads(_alias_file(tmp_path, platform).read_text(encoding="utf-8"))
+    return {key: item["alias"] for key, item in data[bucket].items()}
+
+
+def _qq_aliases(tmp_path: Path) -> str:
+    return _write_aliases(tmp_path, QQ_NAPCAT, users={QQ_USER: "UserA"}, groups={"123456789": "GroupA"})
+
+
+def _bind_person(tmp_path: Path, *, apply: bool = True, **options: str) -> object:
+    options.setdefault("source", f"qq:{QQ_USER}")
+    options.setdefault("target", f"matrix:{MX_USER}")
+    return bind.run_identity_binding(workspace=tmp_path, bucket=USER_BUCKET, apply=apply, now=1_800_000_000.0, **options)
 
 
 def _session(tmp_path: Path) -> dict:
@@ -440,6 +483,18 @@ class TestCommandLine:
         assert code == 0
         assert "[DRY-RUN]" in out and "将补上" in out and "在 bot 与 supervisor 都停止的状态下运行本脚本" in out
         assert "--to-account 一致" not in out
+        assert f"再跑: group --from qq:123456789 --to matrix:room123 --to-account {MX_BOT}" in out
+
+    def test_a_private_chat_points_at_the_person_binding(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        _seed(tmp_path, real=f"qq_private:{QQ_USER}")
+        _target_ready(tmp_path)
+
+        code = bind.main([
+            "conversation", "--from", f"qq_private:{QQ_USER}", "--to", f"mx_dm:{MX_USER}", "--workspace", str(tmp_path),
+        ])
+
+        assert code == 0
+        assert f"再跑: person --from qq:{QQ_USER} --to matrix:{MX_USER} --to-account {MX_BOT}" in capsys.readouterr().out
 
     def test_a_named_target_account_comes_with_a_warning(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
         _seed(tmp_path)
@@ -479,3 +534,226 @@ class TestCommandLine:
         assert code == 2
         assert "未改动任何文件" in capsys.readouterr().err
         assert (memory_root(tmp_path) / namespace_dir(stable)).is_dir()
+
+
+class TestIdentityBinding:
+    def test_a_person_on_the_new_platform_takes_the_old_alias(self, tmp_path: Path) -> None:
+        qq_before = _qq_aliases(tmp_path)
+        _target_ready(tmp_path)
+
+        report = _bind_person(tmp_path)
+
+        assert (report.alias, report.replaced, report.changed, report.backup_dir) == ("UserA", "", True, None)
+        assert _aliases(tmp_path, MATRIX) == {f"{MX_BOT}/{MX_USER}": "UserA"}
+        assert _alias_file(tmp_path, QQ_NAPCAT).read_text(encoding="utf-8") == qq_before
+        # 目标 bot 自己的别名表读得回去，反查也认。
+        book = AliasBook(_alias_file(tmp_path, MATRIX), platform=MATRIX, workspace=tmp_path)
+        book.load()
+        book.bind_account(MX_BOT)
+        assert (book.user_alias_of(MX_USER), book.user_real_of("UserA")) == ("UserA", MX_USER)
+
+    def test_the_alias_the_new_platform_handed_out_is_retired_into_the_old_one(self, tmp_path: Path) -> None:
+        _qq_aliases(tmp_path)
+        _target_ready(tmp_path)
+        mx_before = _write_aliases(tmp_path, MATRIX, users={f"{MX_BOT}/{MX_USER}": "UserB", f"{MX_BOT}/bob": "UserC"})
+        memory_subjects.record_interaction(tmp_path, "UserA", now="2026-01-01T00:00:00+00:00")
+        memory_subjects.record_interaction(tmp_path, "UserB", now="2026-02-01T00:00:00+00:00", display_name=MX_USER)
+        roster_before = memory_subjects.roster_path(tmp_path).read_text(encoding="utf-8")
+
+        report = _bind_person(tmp_path)
+
+        assert (report.replaced, report.roster_merged) == ("UserB", True)
+        assert _aliases(tmp_path, MATRIX) == {f"{MX_BOT}/{MX_USER}": "UserA", f"{MX_BOT}/bob": "UserC"}
+        roster = memory_subjects.load_roster(tmp_path)
+        assert (set(roster), roster["UserA"]["interactions"]) == ({"UserA"}, 2)
+        assert (report.backup_dir / _alias_file(tmp_path, MATRIX).relative_to(tmp_path)).read_text(encoding="utf-8") == mx_before
+        assert (report.backup_dir / "data" / "memory_subjects.json").read_text(encoding="utf-8") == roster_before
+
+    def test_a_preview_changes_nothing(self, tmp_path: Path) -> None:
+        _qq_aliases(tmp_path)
+        _target_ready(tmp_path)
+        mx_before = _write_aliases(tmp_path, MATRIX, users={f"{MX_BOT}/{MX_USER}": "UserB"})
+        memory_subjects.record_interaction(tmp_path, "UserB")
+        roster_before = memory_subjects.roster_path(tmp_path).read_text(encoding="utf-8")
+
+        report = _bind_person(tmp_path, apply=False)
+
+        assert (report.replaced, report.roster_merged, report.backup_dir) == ("UserB", True, None)
+        assert _alias_file(tmp_path, MATRIX).read_text(encoding="utf-8") == mx_before
+        assert memory_subjects.roster_path(tmp_path).read_text(encoding="utf-8") == roster_before
+        assert not list(tmp_path.glob("data/migration_backup_*"))
+
+    def test_a_retired_alias_with_memory_of_its_own_is_refused(self, tmp_path: Path) -> None:
+        _qq_aliases(tmp_path)
+        _target_ready(tmp_path)
+        mx_before = _write_aliases(tmp_path, MATRIX, users={f"{MX_BOT}/{MX_USER}": "UserB"})
+        (memory_root(tmp_path) / "user_UserB").mkdir(parents=True)
+
+        with pytest.raises(bind.BindingRefused, match="user_UserB"):
+            _bind_person(tmp_path)
+
+        assert _alias_file(tmp_path, MATRIX).read_text(encoding="utf-8") == mx_before
+
+    def test_an_alias_somebody_else_holds_on_the_new_platform_is_refused(self, tmp_path: Path) -> None:
+        _qq_aliases(tmp_path)
+        _target_ready(tmp_path)
+        mx_before = _write_aliases(tmp_path, MATRIX, users={f"{MX_BOT}/bob": "UserA"})
+
+        with pytest.raises(bind.BindingRefused, match=f"UserA 已经是另一个人（{MX_BOT}/bob）"):
+            _bind_person(tmp_path)
+
+        assert _alias_file(tmp_path, MATRIX).read_text(encoding="utf-8") == mx_before
+
+    def test_a_group_takes_the_old_group_alias(self, tmp_path: Path) -> None:
+        _qq_aliases(tmp_path)
+        _target_ready(tmp_path)
+        _write_aliases(tmp_path, MATRIX, groups={f"{MX_BOT}/room123": "GroupB"})
+        # 群的别名不连着按人记忆，同名目录也不挡。
+        (memory_root(tmp_path) / "user_GroupB").mkdir(parents=True)
+
+        report = bind.run_identity_binding(
+            workspace=tmp_path, bucket=GROUP_BUCKET, source="qq:123456789", target="matrix:room123", apply=True,
+        )
+
+        assert (report.alias, report.replaced, report.roster_merged) == ("GroupA", "GroupB", False)
+        assert _aliases(tmp_path, MATRIX, GROUP_BUCKET) == {f"{MX_BOT}/room123": "GroupA"}
+
+    def test_a_new_number_on_the_same_platform_takes_the_alias_over(self, tmp_path: Path) -> None:
+        _qq_aliases(tmp_path)
+
+        report = _bind_person(tmp_path, target="qq:67890")
+
+        assert report.released
+        assert _aliases(tmp_path, QQ_NAPCAT) == {"67890": "UserA"}
+        assert _aliases(tmp_path, QQ_NAPCAT, GROUP_BUCKET) == {"123456789": "GroupA"}
+
+    def test_an_alias_already_in_place_writes_nothing(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        _qq_aliases(tmp_path)
+        _target_ready(tmp_path)
+        mx_before = _write_aliases(tmp_path, MATRIX, users={f"{MX_BOT}/{MX_USER}": "UserA"})
+
+        code = bind.main([
+            "person", "--from", f"qq:{QQ_USER}", "--to", f"matrix:{MX_USER}", "--apply", "--workspace", str(tmp_path),
+        ])
+
+        assert code == 0
+        assert "已经是 UserA，不用改" in capsys.readouterr().out
+        assert _alias_file(tmp_path, MATRIX).read_text(encoding="utf-8") == mx_before
+        assert not list(tmp_path.glob("data/migration_backup_*"))
+
+    @pytest.mark.parametrize("source, target, message", [
+        ("12345", f"matrix:{MX_USER}", "平台 id:原始 ID"),
+        ("qq", f"matrix:{MX_USER}", "平台 id:原始 ID"),
+        ("tg:12345", f"matrix:{MX_USER}", "平台 id:原始 ID"),
+        (f"qq_private:{QQ_USER}", f"matrix:{MX_USER}", "平台 id:原始 ID"),
+        ("qq:abc", f"matrix:{MX_USER}", "不是 QQ · NapCat 的 ID"),
+        (f"onebot:{QQ_USER}", "matrix:bad id", "不是 Matrix 的 ID"),
+        (f"qq:{QQ_USER}", f"qq:{QQ_USER}", "同一个身份"),
+        ("qq:99999", f"matrix:{MX_USER}", "没有这个人"),
+    ])
+    def test_identities_it_cannot_pin_down_are_refused(self, tmp_path: Path, source: str, target: str, message: str) -> None:
+        qq_before = _qq_aliases(tmp_path)
+        _target_ready(tmp_path)
+
+        with pytest.raises(bind.BindingRefused, match=message):
+            _bind_person(tmp_path, source=source, target=target)
+
+        assert not _alias_file(tmp_path, MATRIX).exists()
+        assert _alias_file(tmp_path, QQ_NAPCAT).read_text(encoding="utf-8") == qq_before
+
+    def test_a_platform_keying_ids_by_account_needs_the_account(self, tmp_path: Path) -> None:
+        _qq_aliases(tmp_path)
+        _target_ready(tmp_path, account="")
+
+        with pytest.raises(bind.BindingRefused, match="--to-account"):
+            _bind_person(tmp_path)
+
+        report = _bind_person(tmp_path, target_account="mxbot2")
+        assert (report.target.account, report.target.key) == ("mxbot2", f"mxbot2/{MX_USER}")
+
+    def test_a_named_account_beats_the_recorded_one(self, tmp_path: Path) -> None:
+        _qq_aliases(tmp_path)
+        _target_ready(tmp_path)
+
+        report = _bind_person(tmp_path, target_account="mxbot2")
+
+        assert _aliases(tmp_path, MATRIX) == {f"mxbot2/{MX_USER}": "UserA"}
+        assert report.target.account == "mxbot2"
+
+    @pytest.mark.parametrize("platform_id, content", [
+        ("matrix", "{broken"), ("matrix", "[]"), ("matrix", json.dumps({"users": []})), ("qq", "{broken"),
+    ])
+    def test_an_alias_file_it_cannot_read_is_refused_not_replaced(self, tmp_path: Path, platform_id: str, content: str) -> None:
+        _qq_aliases(tmp_path)
+        _target_ready(tmp_path)
+        path = _alias_file(tmp_path, MATRIX if platform_id == "matrix" else QQ_NAPCAT)
+        path.write_text(content, encoding="utf-8")
+
+        with pytest.raises(bind.BindingRefused, match="读不懂"):
+            _bind_person(tmp_path)
+
+        assert path.read_text(encoding="utf-8") == content
+
+    def test_a_preview_spells_out_what_happens_to_the_old_alias(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        _qq_aliases(tmp_path)
+        _target_ready(tmp_path)
+        _write_aliases(tmp_path, MATRIX, users={f"{MX_BOT}/{MX_USER}": "UserB"})
+        memory_subjects.record_interaction(tmp_path, "UserB")
+
+        code = bind.main(["person", "--from", f"qq:{QQ_USER}", "--to", f"matrix:{MX_USER}", "--workspace", str(tmp_path)])
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert f"目标人: matrix:{MX_USER}（Matrix，账号 {MX_BOT}）" in out
+        assert "目标原来的别名 UserB 将换成 UserA，UserB 以后不再指向任何人" in out
+        assert "UserB 的档案将并进 UserA" in out and "[DRY-RUN]" in out and "未改动任何文件" in out
+        assert "仍记在原来的身份名下" in out
+
+    def test_a_group_preview_says_nothing_about_personal_data(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        _qq_aliases(tmp_path)
+        _target_ready(tmp_path)
+
+        code = bind.main(["group", "--from", "qq:123456789", "--to", "matrix:room123", "--workspace", str(tmp_path)])
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "源群: qq:123456789（QQ · NapCat），别名 GroupA" in out and "目标群将用上别名 GroupA" in out
+        assert "仍记在原来的身份名下" not in out
+
+    def test_profile_fields_are_named_but_their_values_stay_put(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        _qq_aliases(tmp_path)
+        _target_ready(tmp_path)
+        profiles = tmp_path / "config" / "qq_user_profiles.yaml"
+        profiles.parent.mkdir(parents=True)
+        profiles.write_text(f"users:\n  \"{QQ_USER}\":\n    address_as: 老大\n    title: 群主\n", encoding="utf-8")
+
+        code = bind.main(["person", "--from", f"qq:{QQ_USER}", "--to", f"matrix:{MX_USER}", "--workspace", str(tmp_path)])
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "源平台给这个人写了称呼、头衔" in out and "Matrix 没有按人资料文件" in out
+        assert "老大" not in out and "群主" not in out
+        assert not _alias_file(tmp_path, MATRIX).exists()
+
+    def test_moving_within_qq_points_at_the_profile_entry_to_copy(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        _qq_aliases(tmp_path)
+        profiles = tmp_path / "config" / "qq_user_profiles.yaml"
+        profiles.parent.mkdir(parents=True)
+        profiles.write_text(f"users:\n  \"{QQ_USER}\":\n    address_as: 老大\n", encoding="utf-8")
+
+        code = bind.main(["person", "--from", f"qq:{QQ_USER}", "--to", "qq:67890", "--apply", "--workspace", str(tmp_path)])
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "[APPLY]" in out and "目标人已用上别名 UserA" in out and "qq:12345 让出 UserA" in out
+        assert f"抄进 {profiles} 的 67890 下" in out and "备份目录" in out
+
+    def test_a_refused_identity_binding_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        _qq_aliases(tmp_path)
+        _target_ready(tmp_path)
+
+        code = bind.main(["group", "--from", "qq:1", "--to", "matrix:room123", "--apply", "--workspace", str(tmp_path)])
+
+        assert code == 2
+        assert "没有这个群" in capsys.readouterr().err
+        assert not _alias_file(tmp_path, MATRIX).exists()

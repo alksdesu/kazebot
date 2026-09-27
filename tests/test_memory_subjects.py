@@ -170,6 +170,60 @@ class TestRoster:
         assert memory_subjects.enrolled_subjects(tmp_path) == {"UserA", "UserB"}
         assert not list(roster.parent.glob("*.tmp"))
 
+    def test_merging_folds_one_record_into_another(self, tmp_path: Path) -> None:
+        memory_subjects.record_interaction(tmp_path, "UserA", now="2026-01-01T00:00:00+00:00", display_name="旧名字")
+        for stamp in ("2026-02-01T00:00:00+00:00", "2026-03-01T00:00:00+00:00"):
+            memory_subjects.record_interaction(tmp_path, "UserB", now=stamp, display_name="新名字")
+
+        assert memory_subjects.merge_subject(tmp_path, "UserB", "UserA") is True
+
+        assert memory_subjects.load_roster(tmp_path) == {"UserA": {
+            "first_seen": "2026-01-01T00:00:00+00:00", "last_seen": "2026-03-01T00:00:00+00:00",
+            "interactions": 3, "display_name": "新名字",
+        }}
+
+    def test_a_newer_record_without_a_name_borrows_the_other_one(self, tmp_path: Path) -> None:
+        memory_subjects.record_interaction(tmp_path, "UserB", now="2026-01-01T00:00:00+00:00", display_name="旧名字")
+        memory_subjects.record_interaction(tmp_path, "UserA", now="2026-02-01T00:00:00+00:00")
+
+        memory_subjects.merge_subject(tmp_path, "UserB", "UserA")
+
+        entry = memory_subjects.load_roster(tmp_path)["UserA"]
+        assert (entry["first_seen"], entry["last_seen"], entry["display_name"]) == (
+            "2026-01-01T00:00:00+00:00", "2026-02-01T00:00:00+00:00", "旧名字",
+        )
+
+    def test_merging_into_somebody_not_enrolled_hands_the_record_over(self, tmp_path: Path) -> None:
+        memory_subjects.record_interaction(tmp_path, "UserB", now="2026-01-01T00:00:00+00:00", display_name="小明")
+        record = memory_subjects.load_roster(tmp_path)["UserB"]
+
+        assert memory_subjects.merge_subject(tmp_path, "UserB", "UserA") is True
+
+        assert memory_subjects.load_roster(tmp_path) == {"UserA": record}
+
+    def test_merging_somebody_never_enrolled_changes_nothing(self, tmp_path: Path) -> None:
+        assert memory_subjects.merge_subject(tmp_path, "UserB", "UserA") is False
+        assert not memory_subjects.roster_path(tmp_path).exists()
+
+    @pytest.mark.parametrize("retired, into", [("UserA", "UserA"), ("../x", "UserA"), ("UserB", "")])
+    def test_merging_nonsense_is_refused(self, tmp_path: Path, retired: str, into: str) -> None:
+        with pytest.raises(ValueError):
+            memory_subjects.merge_subject(tmp_path, retired, into)
+
+    def test_counts_it_cannot_read_merge_as_zero(self, tmp_path: Path) -> None:
+        path = memory_subjects.roster_path(tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"subjects": {
+            "UserA": {"interactions": "many", "first_seen": "", "last_seen": ""},
+            "UserB": {"interactions": 2},
+            "UserC": {"interactions": float("inf")},
+        }}), encoding="utf-8")
+
+        memory_subjects.merge_subject(tmp_path, "UserB", "UserA")
+        memory_subjects.merge_subject(tmp_path, "UserC", "UserA")
+
+        assert memory_subjects.load_roster(tmp_path) == {"UserA": {"interactions": 2, "first_seen": "", "last_seen": ""}}
+
     def test_a_roster_with_the_wrong_shape_is_ignored(self, tmp_path: Path) -> None:
         path = memory_subjects.roster_path(tmp_path)
         path.parent.mkdir(parents=True, exist_ok=True)

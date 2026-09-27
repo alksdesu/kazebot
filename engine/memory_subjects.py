@@ -138,6 +138,50 @@ def record_interaction(
     return True
 
 
+def merge_subject(workspace_root: Path, retired: str, into: str) -> bool:
+    """把 retired 的建档并进 into，再删掉 retired，返回名册变了没有。
+
+    绑定身份时用：一个人在新平台上先被发了新别名，改接回原来的别名以后，新别名不再指向任何人。
+    次数相加，第一次见面取早的，最近一次和显示名取晚的那份。
+    """
+    retired, into = str(retired or "").strip(), str(into or "").strip()
+    if not is_valid_subject(retired) or not is_valid_subject(into) or retired == into:
+        raise ValueError(f"cannot merge subject {retired!r} into {into!r}")
+    with exclusive_lock(_roster_lock_path(workspace_root)):
+        roster = load_roster(workspace_root)
+        entry = roster.pop(retired, None)
+        if entry is None:
+            return False
+        kept = roster.get(into)
+        roster[into] = entry if kept is None else _merged_entry(kept, entry)
+        _write_roster(roster_path(workspace_root), roster)
+    return True
+
+
+def _merged_entry(kept: dict[str, Any], other: dict[str, Any]) -> dict[str, Any]:
+    merged = {**kept, "interactions": _count(kept.get("interactions")) + _count(other.get("interactions"))}
+    firsts = [str(stamp) for stamp in (kept.get("first_seen"), other.get("first_seen")) if stamp]
+    if firsts:
+        merged["first_seen"] = min(firsts)
+    # 时间戳都是 UTC 的 isoformat，按字符串比就是按时间比。
+    latest = other if str(other.get("last_seen") or "") > str(kept.get("last_seen") or "") else kept
+    if latest.get("last_seen"):
+        merged["last_seen"] = latest["last_seen"]
+    display = next((
+        name for name in (_clean_display_name(entry.get("display_name")) for entry in (latest, kept, other)) if name
+    ), "")
+    if display:
+        merged["display_name"] = display
+    return merged
+
+
+def _count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _write_roster(path: Path, roster: dict[str, dict[str, Any]]) -> None:
     # 读的一方不拿锁，写到一半被读到会当成没人建档，这一轮谁的记忆都不加载。
     path.parent.mkdir(parents=True, exist_ok=True)
