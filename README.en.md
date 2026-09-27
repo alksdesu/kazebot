@@ -174,12 +174,15 @@ On first start, supervisor logs a console URL with a token in it — open that a
 |---|---|---|
 | `data/config.yaml` | Which provider, fallback chains, which channel handles vision and compaction | Immediately |
 | `data/policy.yaml` | Permission policy | Immediately |
-| `config/qq.yaml` | The sixty-odd QQ switches | Within two seconds |
+| `config/features.yaml` | Switches every platform shares: triggers, approvals, echo, image and file input, queue, stickers | Within two seconds |
+| `config/qq.yaml` | The thirty-odd QQ-only switches; a shared switch written here applies to QQ alone | Within two seconds |
 | `config/runtime.yaml` | Engine tuning, compaction thresholds, memory budget, cleanup | Immediately |
 | `config/nodes/*.yaml` | Node definitions | Immediately |
 | `.env` | Ports, secrets, workspace location | **Needs a restart** |
 
-Breaking the QQ config won't take the bot down — on a parse failure it keeps running the last good copy and logs the error. To see what's actually in effect inside the process, check `GET /qq/state`.
+Don't copy `config/features.example.yaml` wholesale into `config/features.yaml` — take only the lines you want to change. It outranks `.env`, so a full copy silently overrides every matching setting there.
+
+Breaking either file won't take the bot down — on a parse failure it keeps running the last good copy and logs the error. To see what's actually in effect inside the process, and which file each value came from, check `GET /qq/state`.
 
 Fresh installations and new instances start with these **QQ → Conversation and replies** settings:
 

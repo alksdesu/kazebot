@@ -26,6 +26,7 @@ _DOCS = (
     "deploy/INSTALL.md",
     "adapters/onebot/README.md",
     "config/qq.example.yaml",
+    "config/features.example.yaml",
 )
 # .claude/worktrees 下是整仓副本，扫进来会把副本里的代码也算一遍。
 _SKIP_DIRS = {".venv", "__pycache__", "node_modules", ".git", "tests", "_research", ".claude"}

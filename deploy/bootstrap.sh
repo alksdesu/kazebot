@@ -130,7 +130,7 @@ write_env() {
   hash_secret="$(openssl rand -hex 32)"
 
   # 这份只放「机器相关」的东西。模型渠道、管理员、群白名单都归控制台管，
-  # 写在这里反而会跟控制台写的那份打架（config/qq.yaml 的优先级比 env 高）。
+  # 写在这里反而会跟控制台写的那份打架（config/qq.yaml、config/features.yaml 的优先级都比 env 高）。
   # systemd 的 EnvironmentFile 不支持 export 前缀，别加。
   cat >"$REPO/.env" <<EOF
 # 由 deploy/bootstrap.sh 生成。业务配置请在控制台里改，不要往这里加。
@@ -197,6 +197,7 @@ write_configs() {
   # 白名单和管理员留空是 fail-closed 的默认状态，控制台填完即时生效
   copy_template "$REPO/config/qq.example.yaml" "$REPO/config/qq.yaml" \
     "config/qq.yaml —— 白名单为空，等控制台「信道」「权限」页填"
+  # features.example.yaml 刻意不铺：全局文件比 .env 优先，整份铺下去 .env 里的同名设置就全失效了。
 }
 
 build_frontend() {

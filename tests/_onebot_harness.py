@@ -14,7 +14,15 @@ from typing import Any
 import pytest
 import yaml
 
-_ADAPTER_ROOT = Path(__file__).resolve().parents[1] / "adapters" / "onebot"
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from adapters._shared.live_config import LAYER_PLATFORM  # noqa: E402
+
+_ADAPTER_ROOT = _ROOT / "adapters" / "onebot"
+# 开发机上可能设着这两个覆盖，不清掉的话测试会去读写那边的真文件。
+_CONFIG_PATH_OVERRIDES = ("CLONOTH_QQ_CONFIG_PATH", "CLONOTH_FEATURES_CONFIG_PATH")
 
 
 def adapter_source() -> str:
@@ -110,11 +118,16 @@ def install_nonebot_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setitem(sys.modules, name, module)
 
 
+def _use_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CLONOTH_WORKSPACE", str(tmp_path))
+    for name in _CONFIG_PATH_OVERRIDES:
+        monkeypatch.delenv(name, raising=False)
+
+
 def load_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """加载一份独立的插件实例，工作区指向 tmp_path。"""
     install_nonebot_stubs(monkeypatch)
-    monkeypatch.setenv("CLONOTH_WORKSPACE", str(tmp_path))
-    monkeypatch.delenv("CLONOTH_QQ_CONFIG_PATH", raising=False)
+    _use_workspace(monkeypatch, tmp_path)
     name = f"_onebot_runtime_{tmp_path.name}"
     # 插件模块当成包来加载：兄弟模块跟着落在这份实例名下，每次都是全新的模块级状态。
     spec = importlib.util.spec_from_file_location(
@@ -163,8 +176,7 @@ def patch_imported(monkeypatch: pytest.MonkeyPatch, runtime: Any, name: str, val
 
 def load_live_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **env: str):
     """只加载 config + live_config 两个模块，不拉起插件本体，也不需要 nonebot stub。"""
-    monkeypatch.setenv("CLONOTH_WORKSPACE", str(tmp_path))
-    monkeypatch.delenv("CLONOTH_QQ_CONFIG_PATH", raising=False)
+    _use_workspace(monkeypatch, tmp_path)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     pkg_name = f"_onebot_live_{tmp_path.name}"
@@ -186,12 +198,25 @@ def live_config_module(runtime: Any):
 
 
 def write_live_config(module: Any, **values: Any) -> None:
-    """把热载键写进这个 live_config 实例读的 qq.yaml 并让它立刻生效。
+    """把热载键写进这个 live_config 实例读的配置文件并让它立刻生效。
 
     走真实文件与真实写入路径，而不是直接改内存快照：键名写错、值类型不合法、点分路径
     漂移这几类问题会在测试里当场暴露，而改快照会把它们全部绕过。多次调用累加。
+    只准写在全局的键（表情包图库那几项）写进 config/features.yaml，其余写进 qq.yaml。
     """
-    module.save(module.document_from(values, base=module.raw_document()))
+    keys = module.LIVE_KEYS_BY_NAME
+    global_only = {
+        name: values.pop(name)
+        for name in list(values)
+        if name in keys and LAYER_PLATFORM not in keys[name].layers
+    }
+    if global_only:
+        features = module.features
+        features.save(features.document_from(global_only, base=features.raw_document()))
+        # 全局那层保存时只重载它自己，这一层钉住的快照得另外解开。
+        module.reload()
+    if values:
+        module.save(module.document_from(values, base=module.raw_document()))
 
 
 def set_live_config(runtime: Any, **values: Any) -> None:

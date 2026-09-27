@@ -1,7 +1,7 @@
 """Clonoth OneBot 11 适配器配置。
 
 敏感/实例特定的参数通过环境变量注入，避免硬编码。改一次就要重启进程的键留在这里；
-运营期要频繁调的键在 live_config.py，读 config/qq.yaml 并即时生效。
+运营期要频繁调的键在 live_config.py，读 config/qq.yaml 和 config/features.yaml 并即时生效。
 """
 from __future__ import annotations
 

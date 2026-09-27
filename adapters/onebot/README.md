@@ -34,7 +34,7 @@ adapters/onebot/
 │   └── handlers.py              # matcher 与背后的处理函数
 ├── adapter.py                   # OneBotAdapter：全部进程内状态
 ├── config.py                    # 环境变量配置
-├── live_config.py               # config/qq.yaml 热载配置
+├── live_config.py               # config/qq.yaml 热载配置，通用键落到 config/features.yaml
 ├── send_contract.py             # QQ 目标身份与 NapCat 错误指纹，绑定共享的发送防重
 ├── forward_authz.py             # qq_forward 投递鉴权
 ├── echo_rules.py                # 复读判定里 QQ 这一侧的边界：CQ 码、渲染占位符
@@ -74,8 +74,11 @@ pip install nonebot2 nonebot-adapter-onebot httpx
 ## 环境变量
 
 运营期配置已经搬到 `config/qq.yaml`（声明表在 `live_config.py` 的 `LIVE_KEYS`），改完即时生效。
-取值优先级 **`qq.yaml` > env > 内置默认**：下表标了热载键的四项，只要 yaml 里写了就不看 env。
-完整清单见 `config/qq.example.yaml`。
+触发、审批、复读、收图收文件、队列、群历史、表情包这些各平台共用的键另有一份全局默认
+`config/features.yaml`（声明在 `adapters/_shared/features.py`），`qq.yaml` 写了同一路径就只对 QQ 生效；
+表情包图库那五项全平台只有一份，只认 `features.yaml`，`qq.yaml` 里的老写法只在那边没写时兜底。
+取值优先级 **`qq.yaml` > `features.yaml` > env > 内置默认**：下表标了热载键的四项，只要 yaml 里写了就不看 env。
+完整清单见 `config/qq.example.yaml` 和 `config/features.example.yaml`。
 
 | 变量名 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
@@ -83,6 +86,7 @@ pip install nonebot2 nonebot-adapter-onebot httpx
 | `CLONOTH_WORKSPACE` | 否 | 仓库根（由 `config.py` 位置推导） | 工作区路径，用于 SDK 导入和附件存储。只有适配器与工作区不在同一仓库时才要显式配 |
 | `CLONOTH_ENTRY_NODE` | 否 | `qq.orchestrator` | QQ 入口节点 ID。默认使用综合入口，支持联网搜索、调度、重启、取消任务，并可委派项目/命令相关任务；如需搜索-only 安全窄入口，可显式设置为 `chat.web_search`（旧 id `qq.web_search` 仍然认）。 |
 | `CLONOTH_QQ_CONFIG_PATH` | 否 | `${CLONOTH_WORKSPACE}/config/qq.yaml` | 热载配置文件位置。文件不存在时全部热载键回落 env / 内置默认 |
+| `CLONOTH_FEATURES_CONFIG_PATH` | 否 | `${CLONOTH_WORKSPACE}/config/features.yaml` | 各平台共用的那份热载配置的位置。文件不存在时共用键只看 `qq.yaml`、env 和内置默认 |
 | `CLONOTH_QQ_CUSTOM_FACES_PATH` | 否 | `${CLONOTH_WORKSPACE}/config/qq_custom_faces.txt` | AI 可见的 QQ 收藏表情名称文件；一行一个名称，空行和 `#` 注释忽略。 |
 | `CLONOTH_QQ_CUSTOM_FACES_METADATA_PATH` | 否 | `${CLONOTH_WORKSPACE}/config/qq_custom_faces.json` | 内部元数据文件（name/md5/resId/emojiId/fileName/url）。AI 不读取，用于稳定匹配与直接发送。 |
 | `ONEBOT_CUSTOM_FACE_PROMPT_LIMIT` | 否 | `50` | 每轮注入给 AI 的表情名称上限；设为 `0` 可禁用注入。热载键 `output.face_prompt_limit` |
@@ -166,7 +170,7 @@ nb run
 ### 消息处理
 
 - 群聊默认 @Bot 或被回复时触发，同时携带最近群聊历史作为上下文；只有 `CLONOTH_ALLOWED_GROUPS` 中的群会接入。
-- 群聊触发一共七个信号（全量 / @ / 回复 / 名字 / 前缀 / 关键词 / 随机）加双层冷却，另有 LLM 意愿判定兜底，全部是 `config/qq.yaml` 的热载键。判定逻辑集中在 `adapters/_shared/trigger_policy.py`，配置与坑位见 `docs/TRIGGER-GUIDE.md`。
+- 群聊触发一共七个信号（全量 / @ / 回复 / 名字 / 前缀 / 关键词 / 随机）加双层冷却，另有 LLM 意愿判定兜底，全部是热载键：写在 `config/features.yaml` 对所有平台生效，写在 `config/qq.yaml` 只对 QQ 生效。判定逻辑集中在 `adapters/_shared/trigger_policy.py`，配置与坑位见 `docs/TRIGGER-GUIDE.md`。
 - 私聊消息直接触发回复，无需 @；默认只允许好友私聊，或通过 `CLONOTH_ALLOWED_PRIVATE_USERS` 指定用户。未放行的人默认得不到任何回应。
 - 管理员 QQ 号通过 `CLONOTH_ADMIN_QQ_USERS` 配置；管理员始终允许私聊，用于处理审批命令。每项管理能力还能单独调档（见下）。
 - 支持引用消息解析。

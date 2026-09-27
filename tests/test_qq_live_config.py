@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ast
+import logging
 import re
 import sys
 from pathlib import Path
@@ -22,6 +23,8 @@ if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
 from _onebot_harness import load_live_config, write_live_config, adapter_source  # noqa: E402
+from _yaml_paths import leaf_paths  # noqa: E402
+from adapters._shared import features as shared_features  # noqa: E402
 from adapters._shared import live_config as live_engine  # noqa: E402
 from adapters._shared.live_config import RELOAD_LIVE, RELOAD_RECONCILED  # noqa: E402
 
@@ -55,6 +58,14 @@ def _write_yaml_text(module: Any, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     module.invalidate()
+
+
+def _write_features_text(module: Any, text: str) -> None:
+    """把全局文件原文落盘并让它立刻生效。qq.yaml 一个字节都不动，看的就是只改全局那层。"""
+    path = module.features.path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    module.features.invalidate()
 
 
 class TestPrecedence:
@@ -115,12 +126,12 @@ class TestPrecedence:
     ) -> None:
         """空串对布尔是「关」，对三态只能是「没配」—— 否则升级时会静默关掉 @ 触发。"""
         monkeypatch.setenv("ONEBOT_PROBE_SIGNAL", "")
-        probe = live.LiveKey(
-            "probe_signal", "trigger.signals.probe", live.TRISTATE_BOOL, None,
+        probe = live_engine.LiveKey(
+            "probe_signal", "trigger.signals.probe", live_engine.TRISTATE_BOOL, None,
             env=("ONEBOT_PROBE_SIGNAL",),
         )
 
-        assert probe.resolve({}) is None
+        assert probe.resolve({live_engine.LAYER_PLATFORM: {}}) == (None, live_engine.SOURCE_DEFAULT)
 
     def test_yaml_beats_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         for key in _ALL_QQ_ENV:
@@ -148,6 +159,132 @@ class TestPrecedence:
         write_live_config(live, allowed_groups=[])
 
         assert live.live.allowed_groups == ()
+
+
+class TestGlobalDefaults:
+    """通用键 qq.yaml 没写时落到 config/features.yaml；qq.yaml 写了同一路径就是 QQ 单独覆盖。"""
+
+    def test_the_global_file_sits_next_to_qq_yaml(self, live: Any) -> None:
+        assert live.features.path() == live.config_path().with_name("features.yaml")
+
+    def test_a_global_value_applies_when_qq_yaml_is_silent(self, live: Any) -> None:
+        assert live.live.enable_echo is False
+
+        _write_features_text(live, "extensions:\n  echo:\n    enabled: true\n")
+
+        assert live.live.enable_echo is True
+        assert live.state_payload()["sources"]["enable_echo"] == live_engine.SOURCE_GLOBAL
+
+    def test_qq_yaml_overrides_the_global_value(self, live: Any) -> None:
+        _write_features_text(live, "extensions:\n  echo:\n    enabled: true\n")
+
+        write_live_config(live, enable_echo=False)
+
+        assert live.live.enable_echo is False
+        assert live.state_payload()["sources"]["enable_echo"] == live_engine.SOURCE_PLATFORM
+
+    def test_the_global_value_beats_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """控制台改了全局值，不该被一行早就忘了的 env 顶掉。"""
+        for key in _ALL_QQ_ENV:
+            monkeypatch.delenv(key, raising=False)
+        module = load_live_config(monkeypatch, tmp_path, ONEBOT_GROUP_TRIGGER="all")
+        assert module.live.group_trigger == "all"
+        assert module.state_payload()["sources"]["group_trigger"] == live_engine.SOURCE_ENV
+
+        _write_features_text(module, "trigger:\n  group_mode: prefix\n")
+
+        assert module.live.group_trigger == "prefix"
+        assert module.state_payload()["sources"]["group_trigger"] == live_engine.SOURCE_GLOBAL
+
+    def test_platform_only_keys_are_not_read_from_the_global_file(self, live: Any) -> None:
+        """群号、管理员名单只对一个平台有意义，写进全局文件也不能漏到 QQ。"""
+        _write_features_text(live, "channels:\n  allowed_groups: [123456]\n")
+
+        assert live.live.allowed_groups == ()
+
+    def test_a_broken_global_file_keeps_the_previous_global_values(self, live: Any) -> None:
+        _write_features_text(live, "extensions:\n  echo:\n    enabled: true\n")
+        assert live.live.enable_echo is True
+
+        _write_features_text(live, "extensions: [oops\n")
+
+        assert live.live.enable_echo is True
+        assert "ParserError" in live.state_payload()["defaults"]["parse_error"]
+
+    def test_the_state_names_the_global_file_the_bot_reads(self, live: Any) -> None:
+        defaults = live.state_payload()["defaults"]
+
+        assert defaults["config_path"] == str(live.features.path())
+        assert defaults["file"]["exists"] is False
+
+    def test_the_state_reports_which_layers_each_key_accepts(self, live: Any) -> None:
+        layers = live.state_payload()["layers"]
+
+        assert layers["allowed_groups"] == [live_engine.LAYER_PLATFORM]
+        assert layers["enable_echo"] == [live_engine.LAYER_GLOBAL, live_engine.LAYER_PLATFORM]
+        assert layers["sticker_auto_tag"] == [live_engine.LAYER_GLOBAL]
+
+    def test_qq_adopts_every_shared_key(self, live: Any) -> None:
+        """新加的通用键 QQ 没接上的话，全局文件里那一项对 QQ 不起作用。"""
+        adopted = {key.name for key in live.LIVE_KEYS if live_engine.LAYER_GLOBAL in key.layers}
+
+        assert adopted == set(shared_features.FEATURE_KEYS_BY_NAME)
+
+
+class TestGlobalOnlyKeys:
+    """表情包图库那几项全平台只有一份：只认全局文件，qq.yaml 里的老写法只在全局没写时兜底。"""
+
+    _OLD_LINE = "extensions:\n  sticker:\n    auto_tag: false\n"
+
+    def test_an_old_line_in_qq_yaml_still_works(self, live: Any, caplog: pytest.LogCaptureFixture) -> None:
+        _write_yaml_text(live, self._OLD_LINE)
+
+        with caplog.at_level(logging.WARNING, logger=live_engine.logger.name):
+            assert live.live.sticker_auto_tag is False
+
+        assert live.state_payload()["sources"]["sticker_auto_tag"] == live_engine.SOURCE_LEGACY
+        assert "qq.yaml still sets extensions.sticker.auto_tag; it belongs in features.yaml" in caplog.text
+
+    def test_the_global_file_wins_over_the_old_line(self, live: Any, caplog: pytest.LogCaptureFixture) -> None:
+        _write_yaml_text(live, self._OLD_LINE)
+        _write_features_text(live, "extensions:\n  sticker:\n    auto_tag: true\n")
+
+        with caplog.at_level(logging.WARNING, logger=live_engine.logger.name):
+            assert live.live.sticker_auto_tag is True
+
+        assert live.state_payload()["sources"]["sticker_auto_tag"] == live_engine.SOURCE_GLOBAL
+        assert "the line in qq.yaml has no effect" in caplog.text
+
+    def test_the_reminder_is_logged_once_per_state(self, live: Any, caplog: pytest.LogCaptureFixture) -> None:
+        """每两秒一次的对齐都会重读配置，同一句提醒不能跟着刷满日志。"""
+        _write_yaml_text(live, self._OLD_LINE)
+
+        with caplog.at_level(logging.WARNING, logger=live_engine.logger.name):
+            for _ in range(3):
+                live.invalidate()
+                assert live.live.sticker_auto_tag is False
+
+        assert caplog.text.count("still sets extensions.sticker.auto_tag") == 1
+
+    def test_the_old_line_still_beats_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """升级前 qq.yaml 就压着 env，挪到兜底位置以后这一点不能变。"""
+        module = load_live_config(monkeypatch, tmp_path, ONEBOT_STICKER_AUTO_TAG="0")
+        assert module.live.sticker_auto_tag is False
+
+        _write_yaml_text(module, "extensions:\n  sticker:\n    auto_tag: true\n")
+
+        assert module.live.sticker_auto_tag is True
+
+    def test_qq_cannot_write_them(self, live: Any) -> None:
+        with pytest.raises(KeyError, match="not settable in qq.yaml"):
+            live.document_from({"sticker_auto_tag": False})
+
+    def test_the_harness_writes_them_to_the_global_file(self, live: Any) -> None:
+        write_live_config(live, sticker_auto_tag=False, sticker_collect=True)
+
+        assert live.features.raw_document() == {"extensions": {"sticker": {"auto_tag": False}}}
+        assert live.raw_document() == {"extensions": {"sticker": {"collect": True}}}
+        assert (live.live.sticker_auto_tag, live.live.sticker_collect) == (False, True)
 
 
 class TestCorruptFileNeverOpensOrClosesTheGate:
@@ -682,7 +819,7 @@ class TestDeclarationTable:
 
     def test_every_reconciled_key_explains_why(self, live: Any) -> None:
         """标成 reconciled 就意味着有人得去重建运行期对象，说明必须写下来。"""
-        missing = [k.name for k in live.LIVE_KEYS if k.reload == live.RELOAD_RECONCILED and not k.note]
+        missing = [k.name for k in live.LIVE_KEYS if k.reload == RELOAD_RECONCILED and not k.note]
 
         assert missing == []
 
@@ -716,7 +853,10 @@ class TestDeclarationTable:
 
 
 class TestExampleFileStaysInSync:
-    """qq.example.yaml 是运营者唯一的键位说明，和声明表脱钩就等于文档骗人。"""
+    """qq.example.yaml 是 QQ 独有键的键位说明，和声明表脱钩就等于文档骗人。
+
+    通用键的说明只在 features.example.yaml 写一份，两边都写迟早各说各的。
+    """
 
     def _example(self, live: Any) -> dict[str, Any]:
         """校验和生效解析必须是同一个 loader，否则文档按一套语义、bot 按另一套。"""
@@ -725,34 +865,30 @@ class TestExampleFileStaysInSync:
         assert isinstance(loaded, dict)
         return loaded
 
-    def _leaf_paths(self, document: Any, prefix: str = "") -> list[str]:
-        """文档里存在的点分路径。
-
-        按「键在不在」算而不是「值是不是 None」：三态开关的示例值就是 null，
-        拿 _dig 的返回值判断会把它们全当成没写。
-        """
-        if isinstance(document, dict) and document:
-            leaves: list[str] = []
-            for key, value in document.items():
-                leaves.extend(self._leaf_paths(value, f"{prefix}.{key}" if prefix else str(key)))
-            return leaves
-        return [prefix] if prefix else []
-
     def test_the_example_parses_as_a_mapping(self, live: Any) -> None:
         assert self._example(live)
 
-    def test_every_declared_key_appears_in_the_example(self, live: Any) -> None:
-        present = set(self._leaf_paths(self._example(live)))
-        missing = [k.name for k in live.LIVE_KEYS if k.path not in present]
+    def test_every_qq_only_key_appears_in_the_example(self, live: Any) -> None:
+        present = set(leaf_paths(self._example(live)))
+        missing = [
+            k.name for k in live.LIVE_KEYS if live_engine.LAYER_GLOBAL not in k.layers and k.path not in present
+        ]
 
-        assert missing == [], f"这些键在 qq.example.yaml 里没有说明: {missing}"
+        assert missing == [], f"这些 QQ 独有的键在 qq.example.yaml 里没有说明: {missing}"
 
     def test_the_example_declares_no_key_that_the_table_does_not_know(self, live: Any) -> None:
         known = {k.path for k in live.LIVE_KEYS} | {"version"}
 
-        unknown = [leaf for leaf in self._leaf_paths(self._example(live)) if leaf not in known]
+        unknown = [leaf for leaf in leaf_paths(self._example(live)) if leaf not in known]
 
         assert unknown == []
+
+    def test_shared_keys_are_left_to_the_global_template(self, live: Any) -> None:
+        shared = {k.path for k in live.LIVE_KEYS if live_engine.LAYER_GLOBAL in k.layers}
+
+        duplicated = [leaf for leaf in leaf_paths(self._example(live)) if leaf in shared]
+
+        assert duplicated == [], f"这些通用键该写在 features.example.yaml: {duplicated}"
 
     def test_the_example_values_match_the_declared_defaults(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -820,7 +956,7 @@ class TestPublishedInputRules:
 
     def test_no_list_coercer_is_left_without_a_rule(self, live: Any) -> None:
         """将来新增一个名单键忘了挂规则，控制台会直接禁用那个输入框。"""
-        listish = {live.ID_LIST, live.PREFIX_LIST, live.WORD_LIST}
+        listish = {live.ID_LIST, live_engine.PREFIX_LIST, live_engine.WORD_LIST}
         rules = live.state_payload()["input_rules"]
 
         missing = [key.name for key in live.LIVE_KEYS if key.coerce in listish and key.name not in rules]

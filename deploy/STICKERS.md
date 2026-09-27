@@ -24,7 +24,7 @@
 
 ## 开始收图
 
-控制台「表情包 → 收集设置」，或 `config/qq.yaml`：
+控制台「表情包 → 收集设置」，或者手改配置文件。从 QQ 收不收、收多严、从哪些群收写 `config/qq.yaml`：
 
 ```yaml
 extensions:
@@ -32,6 +32,13 @@ extensions:
     collect: true
     strategy: loose         # strict 只收 QQ 标了表情包的；loose 再放行看着不像截图的；none 全收
     groups: []              # 只从这些群收，留空表示所有已授权的群
+```
+
+图库本身怎么管写 `config/features.yaml`，全平台只有一份。以前写在 `qq.yaml` 里的这几行还认，但只在 `features.yaml` 没写时兜底，日志会提醒挪过去：
+
+```yaml
+extensions:
+  sticker:
     auto_accept: false      # false 时先进待审池，人工筛过才入库
     auto_tag: true          # 关掉就不再花看图渠道的钱，但没标签的图检索不到
 ```
@@ -93,6 +100,8 @@ data/stickers/
 - 发图走 base64 而不是本地路径：库是几个号共用的，NapCat 容器里没有那个挂载。
 
 `send_probability` 设 0 就是彻底不发。想让它多发，调高这个数，别去动标签。
+
+这一节和下一节的键写在 `config/features.yaml` 对所有平台生效；只想让 QQ 不一样，就在 `config/qq.yaml` 写同样的路径。
 
 ## 接梗（默认关）
 

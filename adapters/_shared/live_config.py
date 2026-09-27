@@ -1,4 +1,4 @@
-"""热载配置引擎：键声明、类型转换、按文件指纹重载、按上下文钉住快照、写回与公布。
+"""热载配置引擎：键声明、类型转换、按文件指纹重载、全局默认与平台两层叠加、按上下文钉住快照、写回与公布。
 
 平台只声明自己有哪些键、配置文件在哪；缓存、锁和上下文快照都在 LiveConfig 实例上。
 """
@@ -28,6 +28,21 @@ logger = logging.getLogger(__name__)
 # （deque、worker task、HTTP server），由适配器自己的对齐逻辑负责。
 RELOAD_LIVE = "live"
 RELOAD_RECONCILED = "reconciled"
+
+# 配置能写在哪一层，由宽到窄：全局默认 → 平台。窄层写了就盖住宽层。
+LAYER_GLOBAL = "global"
+LAYER_PLATFORM = "platform"
+LAYERS: tuple[str, ...] = (LAYER_GLOBAL, LAYER_PLATFORM)
+PLATFORM_ONLY: frozenset[str] = frozenset({LAYER_PLATFORM})
+GLOBAL_ONLY: frozenset[str] = frozenset({LAYER_GLOBAL})
+GLOBAL_AND_PLATFORM: frozenset[str] = frozenset(LAYERS)
+
+# 生效值从哪来。两层各自就是来源；legacy 是只准写在全局的键，在平台文件的老位置上被读到。
+SOURCE_GLOBAL = LAYER_GLOBAL
+SOURCE_PLATFORM = LAYER_PLATFORM
+SOURCE_LEGACY = "legacy"
+SOURCE_ENV = "env"
+SOURCE_DEFAULT = "default"
 
 
 @dataclass(frozen=True)
@@ -177,7 +192,7 @@ def grant_for(capability_key: str) -> Coercer:
 
 @dataclass(frozen=True)
 class LiveKey:
-    """一个热载键。name 是 call site 用的属性名，path 是配置文件里的点分路径。"""
+    """一个热载键。name 是 call site 用的属性名，path 是配置文件里的点分路径，layers 是它能写在哪几层。"""
 
     name: str
     path: str
@@ -188,21 +203,36 @@ class LiveKey:
     # env 也没配时的兜底。只给那几个「默认值本身要从别的 env 推导」的键用。
     derive_default: Callable[[], Any] | None = None
     note: str = ""
+    layers: frozenset[str] = PLATFORM_ONLY
 
-    def resolve(self, document: Mapping[str, Any]) -> Any:
-        raw = _dig(document, self.path)
-        if raw is not None:
-            return self.coerce(raw, self.default)
+    def resolve(self, documents: Mapping[str, Mapping[str, Any]]) -> tuple[Any, str]:
+        """生效值和它的来源。documents 是层名到那一层文档的映射，没有的层不给。
+
+        窄层盖宽层；只准写在全局的键，平台文件老位置上的写法排在全局之后兜底。
+        env 排在两层文件之后：控制台改了全局值，不该被一行早就忘了的 env 顶掉。
+        """
+        for layer in reversed(LAYERS):
+            document = documents.get(layer)
+            if document is None or layer not in self.layers:
+                continue
+            raw = _dig(document, self.path)
+            if raw is not None:
+                return self.coerce(raw, self.default), layer
+        platform = documents.get(LAYER_PLATFORM)
+        if platform is not None and LAYER_PLATFORM not in self.layers:
+            raw = _dig(platform, self.path)
+            if raw is not None:
+                return self.coerce(raw, self.default), SOURCE_LEGACY
         for env_name in self.env:
             value = os.environ.get(env_name)
             if value is None:
                 continue
             if not value.strip() and not self.coerce.empty_env_is_value:
                 continue
-            return self.coerce(value, self.default)
+            return self.coerce(value, self.default), SOURCE_ENV
         if self.derive_default is not None:
-            return self.coerce(self.derive_default(), self.default)
-        return self.coerce(self.default, self.default)
+            return self.coerce(self.derive_default(), self.default), SOURCE_DEFAULT
+        return self.coerce(self.default, self.default), SOURCE_DEFAULT
 
 
 def _dig(document: Mapping[str, Any], dotted: str) -> Any:
@@ -228,6 +258,12 @@ def _check_declarations(keys: tuple[LiveKey, ...], derived_names: tuple[str, ...
         *(f"duplicate key name {name!r}" for name, count in sorted(Counter(names).items()) if count > 1),
         *(f"duplicate path {path!r}" for path, count in sorted(Counter(paths).items()) if count > 1),
         *(f"derived name {name!r} shadows a declared key" for name in sorted(set(derived_names) & set(names))),
+        *(f"key {key.name!r} declares no layer" for key in keys if not key.layers),
+        *(
+            f"key {key.name!r} declares unknown layers {sorted(set(key.layers) - set(LAYERS))}"
+            for key in keys
+            if not set(key.layers) <= set(LAYERS)
+        ),
         *(
             f"path {prefix!r} is a prefix of {path!r}"
             for path in sorted(declared_paths)
@@ -237,6 +273,37 @@ def _check_declarations(keys: tuple[LiveKey, ...], derived_names: tuple[str, ...
     ]
     if problems:
         raise ValueError("invalid live config declarations: " + "; ".join(problems))
+
+
+def _check_layering(keys: tuple[LiveKey, ...], layer: str, defaults: "LiveConfig | None") -> None:
+    """层写错在构造时报：全局文件不认 env，平台键表里引用的全局键得和全局声明逐项一致。"""
+    problems: list[str] = []
+    if layer == LAYER_GLOBAL:
+        if defaults is not None:
+            problems.append("the global layer has nothing wider to fall back on")
+        problems.extend(f"key {key.name!r} cannot be set globally" for key in keys if LAYER_GLOBAL not in key.layers)
+        # env 兜底只留给平台已有的键：全局层再读 env，就分不清是哪个平台的旧设置。
+        problems.extend(
+            f"global key {key.name!r} reads env" for key in keys if key.env or key.derive_default is not None
+        )
+    elif layer == LAYER_PLATFORM:
+        if defaults is not None and defaults.layer != LAYER_GLOBAL:
+            problems.append("defaults must come from the global layer")
+        for key in keys:
+            if LAYER_GLOBAL not in key.layers:
+                continue
+            declared = defaults.keys_by_name.get(key.name) if defaults is not None else None
+            if declared is None:
+                problems.append(f"key {key.name!r} has a global layer that nobody declares")
+            elif (declared.path, declared.coerce, declared.default, declared.layers) != (
+                key.path, key.coerce, key.default, key.layers,
+            ):
+                # 两边各写一份迟早会漂移：同一个键在全局文件里是一套值域，在平台文件里是另一套。
+                problems.append(f"key {key.name!r} drifted from its global declaration")
+    else:
+        problems.append(f"unknown layer {layer!r}")
+    if problems:
+        raise ValueError("invalid live config layering: " + "; ".join(problems))
 
 
 def _file_stamp(path: Path) -> tuple[int, int]:
@@ -256,6 +323,21 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _parse_document(path: Path, stamp: tuple[int, int]) -> tuple[Mapping[str, Any] | None, str]:
+    """文件解析成文档。文件不存在是空文档；解析不了返回 None 和原因。"""
+    if stamp == (0, 0):
+        return {}, ""
+    try:
+        loaded = load_yaml(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    if loaded is None:
+        return {}, ""
+    if isinstance(loaded, Mapping):
+        return loaded, ""
+    return None, f"expected a mapping at the top level, got {type(loaded).__name__}"
+
+
 @dataclass
 class _Cache:
     path: str = ""
@@ -266,13 +348,22 @@ class _Cache:
     # values 还是旧的那份 —— 外部要靠这个才能区分「已生效」和「还在用旧配置」。
     values_stamp: tuple[int, int] = (0, 0)
     document: Mapping[str, Any] = field(default_factory=dict)
+    # 采纳过几次文档。拿这一层当默认值的配置按它判断要不要重算：同一秒内改两次、
+    # 大小又没变时指纹认不出来。
+    generation: int = 0
     values: Mapping[str, Any] = field(default_factory=dict)
+    sources: Mapping[str, str] = field(default_factory=dict)
+    # values 是按全局那层的第几次采纳算的；没有全局层时恒为 None。
+    defaults_generation: int | None = None
     error: str = ""
     valid: bool = False
 
 
 class LiveConfig:
-    """一个平台的热载配置：键表和配置文件位置，外加按文件指纹缓存的生效值、按上下文钉住的快照。"""
+    """一层热载配置：键表和配置文件位置，外加按文件指纹缓存的生效值、按上下文钉住的快照。
+
+    平台那层挂上全局那层当 defaults：平台文件没写的键落到全局文件，两份文件哪份变了都重算。
+    """
 
     def __init__(
         self,
@@ -281,11 +372,16 @@ class LiveConfig:
         path: Callable[[], Path],
         derive: Callable[[dict[str, Any]], None] | None = None,
         derived_names: Iterable[str] = (),
+        layer: str = LAYER_PLATFORM,
+        defaults: "LiveConfig | None" = None,
     ) -> None:
         self.keys: tuple[LiveKey, ...] = tuple(keys)
         self.derived_names: tuple[str, ...] = tuple(derived_names)
         _check_declarations(self.keys, self.derived_names)
         self.keys_by_name: Mapping[str, LiveKey] = MappingProxyType({key.name: key for key in self.keys})
+        _check_layering(self.keys, layer, defaults)
+        self.layer = layer
+        self.defaults = defaults
         self.reconciled_keys: tuple[str, ...] = tuple(
             key.name for key in self.keys if key.reload == RELOAD_RECONCILED
         )
@@ -294,69 +390,103 @@ class LiveConfig:
         self._cache = _Cache()
         self._cache_lock = threading.Lock()
         self._snapshot: ContextVar[Mapping[str, Any] | None] = ContextVar("live_config_snapshot", default=None)
+        # 只准写在全局的键还留在平台文件里时报过的状态，同一种情况只报一次。
+        self._misplaced_reported: dict[str, str] = {}
         self.live = LiveReader(self)
 
     def path(self) -> Path:
         return self._path()
 
-    def _build(self, document: Mapping[str, Any]) -> Mapping[str, Any]:
-        values: dict[str, Any] = {key.name: key.resolve(document) for key in self.keys}
+    def _build(
+        self, document: Mapping[str, Any], defaults_document: Mapping[str, Any] | None,
+    ) -> tuple[Mapping[str, Any], Mapping[str, str]]:
+        documents: dict[str, Mapping[str, Any]] = {self.layer: document}
+        if defaults_document is not None:
+            documents[LAYER_GLOBAL] = defaults_document
+        values: dict[str, Any] = {}
+        sources: dict[str, str] = {}
+        for key in self.keys:
+            values[key.name], sources[key.name] = key.resolve(documents)
         if self._derive is not None:
             self._derive(values)
-        return MappingProxyType(values)
+        self._report_misplaced(document, sources)
+        return MappingProxyType(values), MappingProxyType(sources)
+
+    def _report_misplaced(self, document: Mapping[str, Any], sources: Mapping[str, str]) -> None:
+        """只准写在全局的键还写在平台文件里：还在兜底的提醒挪走，已被全局盖住的提醒删掉。"""
+        if self.defaults is None:
+            return
+        for key in self.keys:
+            if LAYER_PLATFORM in key.layers or _dig(document, key.path) is None:
+                self._misplaced_reported.pop(key.name, None)
+                continue
+            source = sources[key.name]
+            if self._misplaced_reported.get(key.name) == source:
+                continue
+            self._misplaced_reported[key.name] = source
+            here, there = self._path().name, self.defaults.path().name
+            if source == SOURCE_LEGACY:
+                logger.warning(
+                    "%s still sets %s; it belongs in %s and is only read here as a fallback", here, key.path, there,
+                )
+            else:
+                logger.warning(
+                    "%s sets %s, but %s sets it too and wins; the line in %s has no effect", here, key.path, there, here,
+                )
+
+    def _adopt_file_locked(self, path: Path, key: str, stamp: tuple[int, int]) -> None:
+        """重解析这一层的文件并采纳。持有 _cache_lock 时调。"""
+        cache = self._cache
+        document, error = _parse_document(path, stamp)
+        if document is None:
+            # 保留上一份有效配置而不是回落到默认值：群白名单空 = 全群静默，
+            # 管理员名单空 = 审批全拒 —— 写坏一个字符不该等于把 bot 关掉。
+            # stamp 照旧记下，否则每次读都重试解析同一个坏文件、刷满日志。
+            logger.error("%s is unusable (%s); keeping the previous configuration", path.name, error)
+            had_valid = cache.valid and cache.path == key
+            cache.path = key
+            cache.stamp = stamp
+            cache.error = error
+            if not had_valid:
+                # 从没读到过有效内容（进程起来时文件就是坏的），只能用 env + 默认值兜。
+                cache.document = {}
+                cache.values_stamp = (0, 0)
+                cache.generation += 1
+                cache.valid = True
+            return
+        cache.path = key
+        cache.stamp = stamp
+        cache.values_stamp = stamp
+        cache.document = document
+        cache.generation += 1
+        cache.error = ""
+        cache.valid = True
 
     def _reload_if_changed(self) -> Mapping[str, Any]:
-        """按 mtime+size 判断要不要重解析；解析失败保留上一份有效配置。"""
+        """按 mtime+size 判断要不要重解析；解析失败保留上一份有效配置。全局那层换了文档也要重算。"""
+        # 先在锁外拿全局那层：两把锁不嵌套，谁先谁后都不会死锁。
+        defaults_document, defaults_generation = (
+            self.defaults.adopted_document() if self.defaults is not None else (None, None)
+        )
         path = self._path()
         stamp = _file_stamp(path)
         key = str(path)
         cache = self._cache
         with self._cache_lock:
-            if cache.valid and cache.path == key and cache.stamp == stamp:
+            current = cache.valid and cache.path == key and cache.stamp == stamp
+            if current and cache.defaults_generation == defaults_generation:
                 return cache.values
-
-            document: Mapping[str, Any] | None = {}
-            error = ""
-            if stamp != (0, 0):
-                try:
-                    loaded = load_yaml(path.read_text(encoding="utf-8"))
-                except Exception as exc:
-                    document = None
-                    error = f"{type(exc).__name__}: {exc}"
-                else:
-                    if loaded is None:
-                        document = {}
-                    elif isinstance(loaded, Mapping):
-                        document = loaded
-                    else:
-                        document = None
-                        error = f"expected a mapping at the top level, got {type(loaded).__name__}"
-
-            if document is None:
-                # 保留上一份有效配置而不是回落到默认值：群白名单空 = 全群静默，
-                # 管理员名单空 = 审批全拒 —— 写坏一个字符不该等于把 bot 关掉。
-                # stamp 照旧记下，否则每次读都重试解析同一个坏文件、刷满日志。
-                logger.error("%s is unusable (%s); keeping the previous configuration", path.name, error)
-                had_valid = cache.valid and cache.path == key
-                cache.path = key
-                cache.stamp = stamp
-                cache.error = error
-                if not had_valid:
-                    # 从没读到过有效内容（进程起来时文件就是坏的），只能用 env + 默认值兜。
-                    cache.document = {}
-                    cache.values = self._build({})
-                    cache.values_stamp = (0, 0)
-                    cache.valid = True
-                return cache.values
-
-            cache.path = key
-            cache.stamp = stamp
-            cache.values_stamp = stamp
-            cache.document = document
-            cache.values = self._build(document)
-            cache.error = ""
-            cache.valid = True
+            if not current:
+                self._adopt_file_locked(path, key, stamp)
+            cache.defaults_generation = defaults_generation
+            cache.values, cache.sources = self._build(cache.document, defaults_document)
             return cache.values
+
+    def adopted_document(self) -> tuple[Mapping[str, Any], int]:
+        """当前采纳的文档和第几次采纳。别的层拿它当默认值；文件写坏时给的是上一份有效的。"""
+        self._reload_if_changed()
+        with self._cache_lock:
+            return self._cache.document, self._cache.generation
 
     def refresh(self) -> Mapping[str, Any]:
         """重读配置并钉进当前上下文。
@@ -405,6 +535,12 @@ class LiveConfig:
         with self._cache_lock:
             self._cache.stamp = None
 
+    def reload(self) -> Mapping[str, Any]:
+        """缓存过期、解开当前上下文钉住的快照，再读一遍。改完配置要当场看到新值时调。"""
+        self.invalidate()
+        self._snapshot.set(None)
+        return self._reload_if_changed()
+
     def save(self, document: Mapping[str, Any]) -> Mapping[str, Any]:
         """在本进程内写回配置文件并立刻重载，返回新的生效快照。
 
@@ -424,10 +560,8 @@ class LiveConfig:
                 os.replace(tmp, path)
             finally:
                 tmp.unlink(missing_ok=True)
-        self.invalidate()
-        # 解开调用方自己钉住的快照：保存完立刻读到旧值会被当成「没生效」。
-        self._snapshot.set(None)
-        return self._reload_if_changed()
+        # 连调用方自己钉住的快照一起解开：保存完立刻读到旧值会被当成「没生效」。
+        return self.reload()
 
     def raw_document(self) -> dict[str, Any]:
         """配置文件的原始内容（已解析成 dict）。给 save() 的合并基底用。"""
@@ -443,6 +577,9 @@ class LiveConfig:
         unknown = sorted(set(values) - set(self.keys_by_name))
         if unknown:
             raise KeyError(f"unknown live config keys: {unknown}")
+        misplaced = sorted(name for name in values if self.layer not in self.keys_by_name[name].layers)
+        if misplaced:
+            raise KeyError(f"not settable in {self._path().name}: {misplaced}")
         document: dict[str, Any] = copy.deepcopy(dict(base or {}))
         for name, value in values.items():
             cursor = document
@@ -456,9 +593,9 @@ class LiveConfig:
             cursor[parts[-1]] = _jsonable(value)
         return document
 
-    def state_payload(self) -> dict[str, Any]:
-        """进程实际生效的配置快照 + 文件指纹，由适配器公布给控制台。"""
-        values = self.current()
+    def file_state(self) -> dict[str, Any]:
+        """这一层的文件：位置、磁盘上的指纹、生效值来自哪个版本、解析错误。"""
+        self._reload_if_changed()
         path = self._path()
         stamp = _file_stamp(path)
         with self._cache_lock:
@@ -478,7 +615,20 @@ class LiveConfig:
                 "size": values_stamp[1],
             },
             "parse_error": error,
+        }
+
+    def state_payload(self) -> dict[str, Any]:
+        """进程实际生效的配置快照 + 文件指纹，由适配器公布给控制台。"""
+        values = self.current()
+        payload = self.file_state()
+        with self._cache_lock:
+            sources = dict(self._cache.sources)
+        payload.update({
+            "layer": self.layer,
             "values": {name: _jsonable(values[name]) for name in sorted(values)},
+            # 每个键的值从哪来。控制台据此标「全局 / 本平台 / 旧位置 / .env / 默认」。
+            "sources": {key.name: sources.get(key.name, SOURCE_DEFAULT) for key in self.keys},
+            "layers": {key.name: sorted(key.layers) for key in self.keys},
             "reload": {key.name: key.reload for key in self.keys},
             "notes": {key.name: key.note for key in self.keys if key.note},
             # 点分路径一起公布：supervisor 校验 PUT 上来的 yaml 时要认得哪些路径有人消费，
@@ -491,7 +641,11 @@ class LiveConfig:
                 for key in self.keys
                 if key.coerce.input_rule is not None
             },
-        }
+        })
+        if self.defaults is not None:
+            # bot 看到的全局文件。和控制台读到的不一致，说明全局那层改完还没被这个进程采纳。
+            payload["defaults"] = self.defaults.file_state()
+        return payload
 
 
 class LiveReader:

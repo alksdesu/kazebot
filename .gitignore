@@ -38,6 +38,8 @@ secret_skills/
 
 # QQ 热载配置：装的是真实群号与管理员 QQ 号，和 .env 同级敏感（模板见 qq.example.yaml）
 /config/qq.yaml
+# 全平台共用的功能设置：各部署自己的开关，和 qq.yaml 一样不进仓库（模板见 features.example.yaml）
+/config/features.yaml
 
 # 配置端点覆盖写入前留的备份，内容等同原文件（data/config.yaml.bak 含明文 api_key）
 *.bak

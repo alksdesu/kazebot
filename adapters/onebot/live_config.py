@@ -1,7 +1,7 @@
-"""QQ 适配层热载配置。
+"""QQ 适配层热载配置：config/qq.yaml 改完即生效，没写的通用键落到 config/features.yaml。
 
-config/qq.yaml 改完即生效，不重启进程。每个键的 yaml 路径、env 兜底、解析器和生效方式
-集中声明在 LIVE_KEYS，live 读取 / /qq/state 快照 / 接线测试共用这一份声明。
+每个键的 yaml 路径、env 兜底、解析器和生效方式集中声明在 LIVE_KEYS，通用键取共享的那份声明；
+live 读取 / /qq/state 快照 / 接线测试共用这一份声明。
 """
 from __future__ import annotations
 
@@ -12,14 +12,11 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from adapters._shared import capability
+from adapters._shared.features import adopt, new_features_config
 from adapters._shared.live_config import (
     BOOL,
     PLAIN_STR,
-    PREFIX_LIST,
     RELOAD_RECONCILED,
-    TRIGGER_MODE,
-    TRISTATE_BOOL,
-    WORD_LIST,
     Coercer,
     LiveConfig,
     LiveKey,
@@ -146,56 +143,27 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         for cap in capability.CAPABILITIES
     ),
     # 触发
-    LiveKey(
-        "group_trigger", "trigger.group_mode", TRIGGER_MODE, "mention_only",
-        env=("ONEBOT_GROUP_TRIGGER",),
-    ),
-    # ／ 必须在列：命令正则认全角斜杠，但它不在触发前缀里的话，群里发 ／帮助 连
-    # 触发都触发不了，用户只会看到 bot 对半角斜杠有反应、对全角没有。
-    LiveKey(
-        "trigger_prefixes", "trigger.prefixes", PREFIX_LIST, "!,！,/,／",
-        env=("ONEBOT_TRIGGER_PREFIXES",),
-    ),
-    # 七个信号开关。前四个是三态：没配就跟随 group_mode 的旧语义（见 trigger_policy）。
-    LiveKey("signal_all", "trigger.signals.all", TRISTATE_BOOL, None),
-    LiveKey("signal_at", "trigger.signals.at", TRISTATE_BOOL, None),
-    LiveKey("signal_reply", "trigger.signals.reply", TRISTATE_BOOL, None),
-    LiveKey("signal_prefix", "trigger.signals.prefix", TRISTATE_BOOL, None),
-    LiveKey("signal_name", "trigger.signals.name", BOOL, False),
-    LiveKey("signal_keyword", "trigger.signals.keyword", BOOL, False),
-    LiveKey("signal_random", "trigger.signals.random", BOOL, False),
-    LiveKey("name_words", "trigger.name.words", WORD_LIST, ""),
-    LiveKey(
-        "name_anywhere", "trigger.name.anywhere", BOOL, True,
-        note="关掉就只认句首",
-    ),
-    LiveKey("keyword_words", "trigger.keyword.words", WORD_LIST, ""),
-    LiveKey(
-        "random_probability", "trigger.random.probability", float_in(min_value=0.0, max_value=1.0), 0.02,
-    ),
-    LiveKey("llm_intent_enabled", "trigger.llm_intent.enabled", BOOL, False),
-    LiveKey("llm_intent_node_id", "trigger.llm_intent.node_id", PLAIN_STR, "chat.intent"),
-    LiveKey(
-        "llm_intent_timeout_sec", "trigger.llm_intent.timeout_sec", float_in(min_value=1.0, max_value=60.0), 8.0,
-    ),
-    LiveKey(
-        "llm_intent_max_inflight", "trigger.llm_intent.max_inflight", int_in(min_value=1, max_value=16), 1,
-        note="同时在跑的意愿判断上限。engine worker 只有两三个，占满了真实对话就得排队",
-    ),
-    LiveKey(
-        "llm_intent_context_messages", "trigger.llm_intent.context_messages",
-        int_in(min_value=0, max_value=50), 8,
-        note="带给判定模型的最近几条群聊。0 = 只看当前这一条",
-    ),
-    LiveKey(
-        "cooldown_group_sec", "trigger.cooldown.per_group_sec", float_in(min_value=0.0), 0.0,
-        note="0 = 不限。冷却管的是「命中也不说」",
-    ),
-    LiveKey("cooldown_user_sec", "trigger.cooldown.per_user_sec", float_in(min_value=0.0), 0.0),
-    LiveKey(
-        "cooldown_exempt_at", "trigger.cooldown.exempt_at", BOOL, True,
-        note="被 @ 时无视冷却；关掉会让用户直接叫 bot 却被静默忽略",
-    ),
+    adopt("group_trigger", env=("ONEBOT_GROUP_TRIGGER",)),
+    adopt("trigger_prefixes", env=("ONEBOT_TRIGGER_PREFIXES",)),
+    adopt("signal_all"),
+    adopt("signal_at"),
+    adopt("signal_reply"),
+    adopt("signal_prefix"),
+    adopt("signal_name"),
+    adopt("signal_keyword"),
+    adopt("signal_random"),
+    adopt("name_words"),
+    adopt("name_anywhere"),
+    adopt("keyword_words"),
+    adopt("random_probability"),
+    adopt("llm_intent_enabled"),
+    adopt("llm_intent_node_id"),
+    adopt("llm_intent_timeout_sec"),
+    adopt("llm_intent_max_inflight"),
+    adopt("llm_intent_context_messages"),
+    adopt("cooldown_group_sec"),
+    adopt("cooldown_user_sec"),
+    adopt("cooldown_exempt_at"),
     # 输出格式
     LiveKey(
         "strip_asterisk_styles", "output.strip_asterisk_styles", BOOL, True,
@@ -207,18 +175,12 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         env=("ONEBOT_STRIP_MARKDOWN_UNDERSCORE_STYLES",),
         derive_default=_legacy_strip_markdown_default(False),
     ),
-    LiveKey(
-        "reply_to_trigger", "output.reply_to_trigger", BOOL, True,
-        env=("ONEBOT_REPLY_TO_TRIGGER",),
-    ),
+    adopt("reply_to_trigger", env=("ONEBOT_REPLY_TO_TRIGGER",)),
     LiveKey(
         "message_limit", "output.message_limit", int_in(min_value=500), 4300,
         env=("ONEBOT_QQ_MESSAGE_LIMIT",),
     ),
-    LiveKey(
-        "history_text_limit", "output.history_text_limit", int_in(min_value=50), 400,
-        env=("ONEBOT_HISTORY_TEXT_LIMIT",),
-    ),
+    adopt("history_text_limit", env=("ONEBOT_HISTORY_TEXT_LIMIT",)),
     LiveKey(
         "face_prompt_limit", "output.face_prompt_limit", int_in(min_value=0, max_value=200), 50,
         env=("ONEBOT_CUSTOM_FACE_PROMPT_LIMIT",),
@@ -248,45 +210,18 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         "auto_like_times", "extensions.auto_like_times", int_in(min_value=1, max_value=20), 10,
         env=("ONEBOT_AUTO_LIKE_TIMES",),
     ),
-    LiveKey(
-        "enable_preempt", "extensions.preempt", BOOL, False,
-        env=("ONEBOT_ENABLE_PREEMPT",),
-    ),
-    LiveKey(
-        "enable_echo", "extensions.echo.enabled", BOOL, False,
-        env=("ONEBOT_ECHO_ENABLED",),
-        note="连着几个人刷同一句时 Bot 也跟一条",
-    ),
-    LiveKey(
-        "echo_threshold", "extensions.echo.threshold", int_in(min_value=2, max_value=10), 3,
-        env=("ONEBOT_ECHO_THRESHOLD",),
-        note="几条相同消息才跟，且必须来自不同的人",
-    ),
-    LiveKey(
-        "echo_max_length", "extensions.echo.max_text_length", int_in(min_value=1, max_value=500), 30,
-        env=("ONEBOT_ECHO_MAX_TEXT_LENGTH",),
-        note="超过这个长度不跟：长文本复读是刷屏，不是接龙",
-    ),
-    LiveKey(
-        "echo_window_sec", "extensions.echo.window_sec", float_in(min_value=1.0, max_value=3600.0), 120.0,
-        env=("ONEBOT_ECHO_WINDOW_SEC",),
-        note="复读要在这个时间窗内连续发生才算数",
-    ),
-    LiveKey(
-        "echo_cooldown_sec", "extensions.echo.cooldown_sec", float_in(min_value=0.0, max_value=86400.0), 90.0,
-        env=("ONEBOT_ECHO_COOLDOWN_SEC",),
-        note="同一个群两次跟读之间至少隔这么久",
-    ),
+    adopt("enable_preempt", env=("ONEBOT_ENABLE_PREEMPT",)),
+    adopt("enable_echo", env=("ONEBOT_ECHO_ENABLED",)),
+    adopt("echo_threshold", env=("ONEBOT_ECHO_THRESHOLD",)),
+    adopt("echo_max_length", env=("ONEBOT_ECHO_MAX_TEXT_LENGTH",)),
+    adopt("echo_window_sec", env=("ONEBOT_ECHO_WINDOW_SEC",)),
+    adopt("echo_cooldown_sec", env=("ONEBOT_ECHO_COOLDOWN_SEC",)),
     LiveKey(
         "sticker_collect", "extensions.sticker.collect", BOOL, False,
         env=("ONEBOT_STICKER_COLLECT",),
         note="把群里的表情包攒进图库",
     ),
-    LiveKey(
-        "sticker_auto_tag", "extensions.sticker.auto_tag", BOOL, True,
-        env=("ONEBOT_STICKER_AUTO_TAG",),
-        note="收进来的图自动打标签。关掉就不再花看图渠道的钱，但没标签的图检索不到",
-    ),
+    adopt("sticker_auto_tag", env=("ONEBOT_STICKER_AUTO_TAG",)),
     LiveKey(
         "sticker_strategy", "extensions.sticker.strategy", PLAIN_STR, "loose",
         env=("ONEBOT_STICKER_STRATEGY",),
@@ -297,92 +232,28 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         env=("ONEBOT_STICKER_GROUPS",),
         note="只从这些群收，留空表示所有已授权的群",
     ),
-    LiveKey(
-        "sticker_auto_accept", "extensions.sticker.auto_accept", BOOL, False,
-        env=("ONEBOT_STICKER_AUTO_ACCEPT",),
-        note="收到就直接入库，跳过人工筛选",
-    ),
-    LiveKey(
-        "sticker_pending_limit", "extensions.sticker.pending_limit", int_in(min_value=0, max_value=5000), 200,
-        env=("ONEBOT_STICKER_PENDING_LIMIT",),
-        note="待审池上限，满了不再收新的",
-    ),
-    LiveKey(
-        "sticker_library_limit", "extensions.sticker.library_limit", int_in(min_value=0, max_value=20000), 1000,
-        env=("ONEBOT_STICKER_LIBRARY_LIMIT",),
-        note="图库上限，超出时最旧的先出局",
-    ),
-    LiveKey(
-        "sticker_pending_ttl_days", "extensions.sticker.pending_ttl_days", int_in(min_value=0, max_value=365), 7,
-        env=("ONEBOT_STICKER_PENDING_TTL_DAYS",),
-        note="待审池里放这么多天还没人管就丢掉",
-    ),
-    LiveKey(
-        "sticker_send_probability", "extensions.sticker.send_probability",
-        float_in(min_value=0.0, max_value=1.0), 0.2,
-        env=("ONEBOT_STICKER_SEND_PROBABILITY",),
-        note="每轮多大概率把表情包清单给模型看。0 表示从不发；给了它也可以不发",
-    ),
-    LiveKey(
-        "sticker_prompt_limit", "extensions.sticker.prompt_limit", int_in(min_value=0, max_value=200), 60,
-        env=("ONEBOT_STICKER_PROMPT_LIMIT",),
-        note="清单最多列几张。库比这个大就只列发得最少的那些，轮着上",
-    ),
-    LiveKey(
-        "sticker_repeat_window_sec", "extensions.sticker.repeat_window_sec",
-        int_in(min_value=0, max_value=86400), 1800,
-        env=("ONEBOT_STICKER_REPEAT_WINDOW_SEC",),
-        note="同一个会话里这段时间内发过的图不再发",
-    ),
+    adopt("sticker_auto_accept", env=("ONEBOT_STICKER_AUTO_ACCEPT",)),
+    adopt("sticker_pending_limit", env=("ONEBOT_STICKER_PENDING_LIMIT",)),
+    adopt("sticker_library_limit", env=("ONEBOT_STICKER_LIBRARY_LIMIT",)),
+    adopt("sticker_pending_ttl_days", env=("ONEBOT_STICKER_PENDING_TTL_DAYS",)),
+    adopt("sticker_send_probability", env=("ONEBOT_STICKER_SEND_PROBABILITY",)),
+    adopt("sticker_prompt_limit", env=("ONEBOT_STICKER_PROMPT_LIMIT",)),
+    adopt("sticker_repeat_window_sec", env=("ONEBOT_STICKER_REPEAT_WINDOW_SEC",)),
     LiveKey(
         "sticker_lookup_order", "extensions.sticker.lookup_order", PLAIN_STR, "native_first",
         note="表情名同时对得上收藏表情和图库时先用哪个：native_first 收藏表情，library_first 图库",
     ),
-    LiveKey(
-        "sticker_combat", "extensions.sticker.combat", BOOL, False,
-        env=("ONEBOT_STICKER_COMBAT",),
-        note="群里连着刷图时跟着接一张；阈值和冷却用内置默认值",
-    ),
-    LiveKey(
-        "sticker_burst_probability", "extensions.sticker.burst_probability",
-        float_in(min_value=0.0, max_value=1.0), 0.0,
-        env=("ONEBOT_STICKER_BURST_PROBABILITY",),
-        note="自己发完图后再补一张的概率，0 表示不补",
-    ),
+    adopt("sticker_combat", env=("ONEBOT_STICKER_COMBAT",)),
+    adopt("sticker_burst_probability", env=("ONEBOT_STICKER_BURST_PROBABILITY",)),
     # 输入能力
-    LiveKey(
-        "enable_image_input", "input.image", BOOL, True,
-        env=("ONEBOT_ENABLE_IMAGE_INPUT",),
-    ),
-    LiveKey(
-        "max_images_per_turn", "input.max_images_per_turn", int_in(min_value=1, max_value=16), 4,
-        env=("ONEBOT_MAX_IMAGES_PER_TURN",),
-    ),
-    LiveKey(
-        "image_max_bytes", "input.image_max_bytes", int_in(min_value=1024), 10 * 1024 * 1024,
-        env=("ONEBOT_IMAGE_MAX_BYTES",),
-    ),
-    LiveKey(
-        "image_wait_after_text_sec", "input.image_wait_after_text_sec", float_in(min_value=0.0, max_value=10.0), 2.5,
-        env=("ONEBOT_IMAGE_WAIT_AFTER_TEXT_SECONDS",),
-    ),
-    LiveKey(
-        "enable_file_input", "input.file", BOOL, True,
-        env=("ONEBOT_ENABLE_FILE_INPUT",),
-    ),
-    LiveKey(
-        "max_files_per_turn", "input.max_files_per_turn", int_in(min_value=1, max_value=16), 3,
-        env=("ONEBOT_MAX_FILES_PER_TURN",),
-    ),
-    LiveKey(
-        "file_max_bytes", "input.file_max_bytes", int_in(min_value=1024), 50 * 1024 * 1024,
-        env=("ONEBOT_FILE_MAX_BYTES",),
-    ),
-    LiveKey(
-        "file_extra_allowed_extensions", "input.file_extra_allowed_extensions", WORD_LIST, "",
-        env=("ONEBOT_FILE_EXTRA_ALLOWED_EXTENSIONS",),
-        note="在内置白名单之外额外放行的入站文件扩展名；可执行/脚本宿主类型不受此项影响",
-    ),
+    adopt("enable_image_input", env=("ONEBOT_ENABLE_IMAGE_INPUT",)),
+    adopt("max_images_per_turn", env=("ONEBOT_MAX_IMAGES_PER_TURN",)),
+    adopt("image_max_bytes", env=("ONEBOT_IMAGE_MAX_BYTES",)),
+    adopt("image_wait_after_text_sec", env=("ONEBOT_IMAGE_WAIT_AFTER_TEXT_SECONDS",)),
+    adopt("enable_file_input", env=("ONEBOT_ENABLE_FILE_INPUT",)),
+    adopt("max_files_per_turn", env=("ONEBOT_MAX_FILES_PER_TURN",)),
+    adopt("file_max_bytes", env=("ONEBOT_FILE_MAX_BYTES",)),
+    adopt("file_extra_allowed_extensions", env=("ONEBOT_FILE_EXTRA_ALLOWED_EXTENSIONS",)),
     LiveKey(
         "enable_forward_msg_input", "input.forward_msg", BOOL, True,
         env=("ONEBOT_ENABLE_FORWARD_MSG_INPUT",),
@@ -415,50 +286,17 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         note="转发卡片里的图片和文件是否一并采集；条数仍受 max_images_per_turn / max_files_per_turn 限制",
     ),
     # 队列
-    LiveKey(
-        "enable_queue", "queue.enabled", BOOL, False,
-        env=("ONEBOT_ENABLE_QQ_QUEUE",), reload=RELOAD_RECONCILED,
-        note="开关翻转要增删 worker task",
-    ),
-    LiveKey(
-        "queue_workers", "queue.workers", int_in(min_value=1, max_value=32), 4,
-        env=("ONEBOT_QQ_QUEUE_WORKERS",), reload=RELOAD_RECONCILED,
-        note="改数量要增删 worker task",
-    ),
-    LiveKey(
-        "queue_interval", "queue.interval_sec", float_in(min_value=0.0), 2.0,
-        env=("ONEBOT_QQ_QUEUE_INTERVAL",),
-    ),
-    LiveKey(
-        "queue_wait_for_reply", "queue.wait_for_reply", BOOL, False,
-        env=("ONEBOT_QQ_QUEUE_WAIT_FOR_REPLY",),
-    ),
-    LiveKey(
-        "queue_reply_timeout", "queue.reply_timeout_sec", float_in(min_value=1.0), 120.0,
-        env=("ONEBOT_QQ_QUEUE_REPLY_TIMEOUT",),
-    ),
+    adopt("enable_queue", env=("ONEBOT_ENABLE_QQ_QUEUE",)),
+    adopt("queue_workers", env=("ONEBOT_QQ_QUEUE_WORKERS",)),
+    adopt("queue_interval", env=("ONEBOT_QQ_QUEUE_INTERVAL",)),
+    adopt("queue_wait_for_reply", env=("ONEBOT_QQ_QUEUE_WAIT_FOR_REPLY",)),
+    adopt("queue_reply_timeout", env=("ONEBOT_QQ_QUEUE_REPLY_TIMEOUT",)),
     # 审批
-    LiveKey(
-        "approval_reply_unique_fallback", "approval.reply_unique_fallback", BOOL, False,
-        env=("ONEBOT_APPROVAL_REPLY_UNIQUE_FALLBACK",),
-        note="引用审批卡片但取不到 approval_id 时，回退到「当前唯一待审批」；开着更好用，也更容易误批",
-    ),
-    LiveKey(
-        "approval_bare_verb_unique", "approval.bare_verb_unique", BOOL, True,
-        env=("ONEBOT_APPROVAL_BARE_VERB_UNIQUE",),
-        note="不引用卡片、整句只发「同意」时按当前唯一待审批处理；要求那张卡片确实发给本人",
-    ),
+    adopt("approval_reply_unique_fallback", env=("ONEBOT_APPROVAL_REPLY_UNIQUE_FALLBACK",)),
+    adopt("approval_bare_verb_unique", env=("ONEBOT_APPROVAL_BARE_VERB_UNIQUE",)),
     # 群历史
-    LiveKey(
-        "group_history_max", "history.group_max", int_in(min_value=0), 20,
-        env=("ONEBOT_GROUP_HISTORY_MAX",), reload=RELOAD_RECONCILED,
-        note="改条数要重建每个群的 deque",
-    ),
-    LiveKey(
-        "group_history_undelivered_ratio", "history.undelivered_ratio", float_in(min_value=1.0, max_value=10.0), 1.0,
-        env=("ONEBOT_GROUP_HISTORY_UNDELIVERED_RATIO",), reload=RELOAD_RECONCILED,
-        note="改倍数会改变 deque 硬上限，同样要重建",
-    ),
+    adopt("group_history_max", env=("ONEBOT_GROUP_HISTORY_MAX",)),
+    adopt("group_history_undelivered_ratio", env=("ONEBOT_GROUP_HISTORY_UNDELIVERED_RATIO",)),
     # 转发 Bridge
     LiveKey(
         "enable_forward_bridge", "forward_bridge.enabled", BOOL, True,
@@ -496,7 +334,10 @@ def config_path() -> Path:
 
 
 # 实例跟着本模块走：共享层整个进程只有一份，缓存和上下文快照放那边会被几次加载共用。
-_config = LiveConfig(LIVE_KEYS, path=config_path, derive=_derived, derived_names=DERIVED_NAMES)
+features = new_features_config(Path(CLONOTH_WORKSPACE))
+_config = LiveConfig(
+    LIVE_KEYS, path=config_path, derive=_derived, derived_names=DERIVED_NAMES, defaults=features,
+)
 
 LIVE_KEYS_BY_NAME: Mapping[str, LiveKey] = _config.keys_by_name
 RECONCILED_KEYS: tuple[str, ...] = _config.reconciled_keys
@@ -505,6 +346,7 @@ refresh = _config.refresh
 current = _config.current
 pinned = _config.pinned
 invalidate = _config.invalidate
+reload = _config.reload
 save = _config.save
 raw_document = _config.raw_document
 document_from = _config.document_from

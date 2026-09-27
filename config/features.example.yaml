@@ -1,0 +1,152 @@
+# 全平台共用的功能设置。复制成 config/features.yaml 后改哪一项都不用重启 bot 进程。
+#
+# 取值优先级：平台文件（QQ 是 config/qq.yaml）> 本文件 > 环境变量 > 内置默认。
+# 平台文件里写了同一路径，那个平台就单独用自己的值；表情包图库那五项全平台只有一份，只认本文件。
+# 写在这里的键会盖掉 .env 里的同名设置，所以只保留你真的要改的键，其余整行删掉或注释掉，
+# 让 .env 继续生效。
+#
+# 每个键的解析规则和生效方式都声明在 adapters/_shared/features.py 的 FEATURE_KEYS 里。
+
+version: 1
+
+# ── 审批 ──────────────────────────────────────
+approval:
+  # 引用了审批卡片、却取不到 approval_id 时，是否回退到「当前唯一待审批」。
+  # 默认关：这条回退分不清引用的是它、还是另一张已经处理过的卡片，是误批的直接成因。
+  # 开启后仍要求有 reply 段、只剩一条待审批、且那张卡片确实是发给本人的。
+  reply_unique_fallback: false
+
+  # 不引用卡片、整句只发「同意」时，是否按「当前唯一待审批」处理。
+  # 默认开：收到卡片后直接回一句是最自然的动作。仍要求名下恰好只剩一条待审批、
+  # 且那张卡片确实是发给本人的；有多条会让你指定，一条都没有时就当普通聊天。
+  bare_verb_unique: true
+
+# ── 开口时机 ──────────────────────────────────
+trigger:
+  # 旧的单选枚举。signals 下面留空的那几项跟着它推导，行为和升级前逐位一致。
+  # mention_only（只 @Bot）/ prefix（@Bot 或前缀）/ all（所有消息）
+  group_mode: mention_only
+  # / 与 ／ 只参与触发判定，不会从正文里剥掉 —— /draw 这类命令要保留字面斜杠。
+  # true / false 要当前缀用就得加引号，裸写是布尔，会被丢掉。
+  prefixes:
+    - "!"
+    - "！"
+    - "/"
+    - "／"
+
+  # 七个信号各自独立，命中任一就回。
+  # 前四个是三态：留 null 表示「跟随上面的 group_mode」，写 true/false 才算接管。
+  signals:
+    all: null           # 群内任意消息都回
+    at: null            # 被 @（含句中）
+    reply: null         # 被回复（回复 bot 自己的消息）
+    # 本地命令一律 / 开头。这一项没开的话，群里得先 @Bot 再写命令；
+    # 想直接发 /帮助 就把它改成 true。私聊不受影响。
+    prefix: null        # 命中 prefixes 里的前缀
+    name: false         # 出现名字
+    keyword: false      # 命中关键词
+    random: false       # 随机插话
+
+  name:
+    # on、off、yes、no 读成字符串，true、false 要当名字用得加引号写成 "true"。
+    words: []
+    #   - 咪啪
+    # 关掉就只认句首。英文名按词边界匹配，中文按子串。
+    anywhere: true
+
+  keyword:
+    # 同上：true、false 当关键词要加引号，其余词照写。
+    words: []
+
+  random:
+    probability: 0.02
+
+  llm_intent:
+    # 其他规则全不命中时，问一次轻量模型「这句话需要你接话吗」。
+    # 每条不命中的群消息都会产生一次模型往返，务必配独立的便宜渠道。
+    # 冷却剩得比 timeout_sec 还久时不去问：答案到手也只会被冷却丢掉。
+    enabled: false
+    node_id: chat.intent
+    timeout_sec: 8.0
+    # 同时在跑的判定上限。engine worker 只有两三个，占满了真实对话就得排队。
+    max_inflight: 1
+    # 带给判定模型的最近几条群聊。0 = 只看当前这一条。
+    context_messages: 8
+
+  cooldown:
+    # 「命中也不说」，和触发信号是不同维度，所以放在最后一层。0 = 不限。
+    per_group_sec: 0
+    per_user_sec: 0
+    # 被 @ 时无视冷却。关掉会让用户直接叫 bot 却被静默忽略，体验最差。
+    exempt_at: true
+
+# ── 回复 ──────────────────────────────────────
+output:
+  # 回复时引用触发那条消息。
+  reply_to_trigger: true
+  # 群历史里每条消息压成一行，最多留这么多字，超出的截掉。
+  history_text_limit: 400
+
+# ── 扩展能力 ──────────────────────────────────
+extensions:
+  # 开启后新消息会打断同会话正在进行的那轮，而不是并行开一轮。
+  preempt: false
+  # 连着几个不同的人刷同一句时，bot 也跟一条。纯规则判定，不走模型。
+  # 同一个人连刷不算；命令、@、回复、长文本一律不跟；表情包按图片本身比对，
+  # 三个人发三张不同的图不会被当成复读。
+  echo:
+    enabled: false
+    threshold: 3          # 连续几条相同才跟，必须来自不同的人
+    max_text_length: 30   # 超过这个长度不跟
+    window_sec: 120.0     # 复读要在这个时间窗内连续发生
+    cooldown_sec: 90.0    # 同群两次跟读之间至少隔这么久
+  # 表情包。收不收、从哪收、收多严是各平台自己的设置，写在平台文件里。
+  sticker:
+    # 这五项管图库本身。图库是几个实例共用的一份，只认本文件，平台文件里的老写法只在这里没写时兜底。
+    # 收进来的图先进待审池，打标后才参与检索；丢弃过的会记住哈希，不会再收第二次。
+    auto_accept: false      # 收到就直接入库，跳过人工筛选
+    auto_tag: true          # 自动打标签。关掉不再花看图渠道的钱，但没标签的图检索不到
+    pending_limit: 200      # 待审池上限，满了不再收新的
+    library_limit: 1000     # 图库上限，超出时最旧的先出局
+    pending_ttl_days: 7     # 待审池里放这么多天没人管就丢掉
+    # 下面管挑图发图，平台文件里可以单独改。
+    send_probability: 0.2   # 每轮多大概率把清单摊给模型，0 表示从不发
+    prompt_limit: 60        # 清单最多列几张，库更大就先给发得最少的
+    repeat_window_sec: 1800 # 同一会话这段时间内发过的图不再发
+    # 群里连着刷图时跟着接一张。要求连图来自至少两个人，中间夹了纯文本就不算。
+    combat: false
+    burst_probability: 0.0  # 自己发完图后再补一张的概率，0 表示不补
+
+# ── 输入能力 ──────────────────────────────────
+input:
+  image: true
+  max_images_per_turn: 4
+  # 单图下载上限（字节）。超限会回一句「图片太大，已超过当前限制 XMB」。
+  image_max_bytes: 10485760
+  # 有的平台会把「文字＋图」拆成两条消息发过来（QQ 就是），收到纯文本后等这么久看有没有图跟上。
+  image_wait_after_text_sec: 2.5
+  file: true
+  max_files_per_turn: 3
+  # 单文件下载上限（字节）。
+  file_max_bytes: 52428800
+  # 内置白名单之外额外放行的入站文件扩展名；可执行/脚本宿主类型不受此项影响，
+  # 内容为可执行文件的伪装上传也照样拒绝。
+  file_extra_allowed_extensions: []
+
+# ── 串行队列 ──────────────────────────────────
+queue:
+  # 关掉就是每条消息各开一轮并行处理。
+  enabled: false
+  workers: 4
+  interval_sec: 2.0
+  wait_for_reply: false
+  reply_timeout_sec: 120.0
+
+# ── 群历史缓存 ────────────────────────────────
+history:
+  # 每个群保留多少行原文随 inbound 带给模型。改小会丢掉超出的旧行。
+  # 丢掉的行如果还没送到 Engine，下一轮 inbound 会写明少了几条。
+  group_max: 20
+  # 还没送到 Engine 的行可以额外多占几倍位置，硬上限 = group_max × 本值。
+  # 1.0 = 不给额外空间，满了就丢。已送达的行永远只占 group_max 之内。
+  undelivered_ratio: 1.0
