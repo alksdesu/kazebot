@@ -31,6 +31,7 @@ const providerBlock = (name: string): api.ProviderConfigPublic => ({
 const providers = (): api.ProvidersResponse => ({
   active_provider: 'relay', registered: ['openai', 'anthropic'],
   providers: { relay: providerBlock('relay'), spare: providerBlock('spare') }, fallbacks: [], node_fallbacks: {},
+  reserved_names: [],
 });
 const profiles: api.ProviderProfiles = {
   options: {

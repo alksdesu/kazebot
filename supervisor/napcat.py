@@ -18,10 +18,11 @@ from typing import Any
 
 import httpx
 
-from clonoth_runtime import read_admin_token
+from clonoth_runtime import platform_secret, read_admin_token
+from platforms.builtin import QQ_NAPCAT
 
 _BASE_URL = "http://127.0.0.1:6099"
-_TOKEN_KEY = "NAPCAT_WEBUI_TOKEN"
+_TOKEN = QQ_NAPCAT.secret("napcat_webui_token")
 _URL_KEY = "NAPCAT_WEBUI_URL"
 # NapCat 的凭证一小时作废，留足余量提前换。
 _CREDENTIAL_TTL_SEC = 2400.0
@@ -49,22 +50,26 @@ class NapCatUnreachable(NapCatError):
     """WebUI 还没应答。换号重启和首次部署都会经过这里，不是故障。"""
 
 
-def _read_env_value(env_path: Path, key: str) -> str:
+def _read_env_file(env_path: Path) -> dict[str, str]:
     # NapCat 的 webui.json 是 root 0600，supervisor 以普通用户跑，只能从 .env 拿。
     if not env_path.is_file():
-        return ""
+        return {}
     try:
         lines = env_path.read_text(encoding="utf-8").splitlines()
     except OSError:
-        return ""
+        return {}
+    pairs: dict[str, str] = {}
     for line in lines:
         text = line.strip()
         if not text or text.startswith("#") or "=" not in text:
             continue
         name, value = text.split("=", 1)
-        if name.strip() == key:
-            return value.strip().strip("'\"")
-    return ""
+        pairs.setdefault(name.strip(), value.strip().strip("'\""))
+    return pairs
+
+
+def _read_env_value(env_path: Path, key: str) -> str:
+    return _read_env_file(env_path).get(key, "")
 
 
 def _now_iso() -> str:
@@ -109,16 +114,22 @@ class NapCatClient:
         self._credential = ""
         self._issued_at = 0.0
 
+    def _webui_token(self) -> str:
+        # 两份文件每次都重读：令牌是容器首启后才回填进 .env 的，supervisor 不重启也得认得出。
+        return platform_secret(
+            self._env_path.parent, QQ_NAPCAT, _TOKEN.name, environ=_read_env_file(self._env_path),
+        ).value
+
     @property
     def configured(self) -> bool:
-        return bool(_read_env_value(self._env_path, _TOKEN_KEY))
+        return bool(self._webui_token())
 
     async def _authenticate(self, http: httpx.AsyncClient) -> str:
-        token = _read_env_value(self._env_path, _TOKEN_KEY)
+        token = self._webui_token()
         if not token:
             raise NapCatError(
-                _TOKEN_KEY + " 未配置。它在 NapCat 容器的 /app/napcat/config/webui.json 里，"
-                "用 manage_secret 或直接写进 .env。"
+                _TOKEN.env + " 未配置。它在 NapCat 容器的 /app/napcat/config/webui.json 里，"
+                "用 manage_secret 写进 .env，或写在 data/config.yaml 的 platforms.qq." + _TOKEN.name + "。"
             )
         # NapCat 校验 sha256(token + ".napcat")，明文 token 不离开本机。
         digest = hashlib.sha256((token + ".napcat").encode("utf-8")).hexdigest()
@@ -164,7 +175,7 @@ class NapCatClient:
                 credential = await self._authenticate(http)
                 result = await self._post(http, endpoint, args, credential)
             if result is _UNAUTHORIZED:
-                raise NapCatError("NapCat 鉴权失败，请确认 " + _TOKEN_KEY + " 是当前的 WebUI token")
+                raise NapCatError("NapCat 鉴权失败，请确认 " + _TOKEN.env + " 是当前的 WebUI token")
             return result
 
     async def _helper(self, action: str, uin: str = "") -> None:

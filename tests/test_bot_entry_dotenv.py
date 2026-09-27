@@ -7,6 +7,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -129,9 +130,10 @@ _MAIN_HARNESS = textwrap.dedent(
     sys.path.insert(0, repo)
 
     seen = []
+    init_kwargs = []
 
     nonebot = types.ModuleType("nonebot")
-    nonebot.init = lambda *a, **k: seen.append("init")
+    nonebot.init = lambda *a, **k: seen.append("init") or init_kwargs.append(k)
     nonebot.run = lambda *a, **k: seen.append("run")
     nonebot.get_driver = lambda: types.SimpleNamespace(
         register_adapter=lambda *a: seen.append("adapter")
@@ -159,9 +161,35 @@ _MAIN_HARNESS = textwrap.dedent(
     spec.loader.exec_module(module)
     module.main()
 
-    open(dumped, "w", encoding="utf-8").write(json.dumps(seen))
+    open(dumped, "w", encoding="utf-8").write(json.dumps({"calls": seen, "init": init_kwargs}))
     """
 )
+
+
+def _run_main(
+    tmp_path: Path, *, config: str | None = None, extra_env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """把 bot.py 复制到临时目录后真跑 main()，读出调用顺序和交给 nonebot.init 的参数。"""
+    home = tmp_path / "deploy"
+    home.mkdir()
+    (home / "bot.py").write_bytes(BOT_ENTRY.read_bytes())
+    if config is not None:
+        (home / "data").mkdir()
+        (home / "data" / "config.yaml").write_text(config, encoding="utf-8")
+    harness = tmp_path / "main_harness.py"
+    harness.write_text(_MAIN_HARNESS, encoding="utf-8")
+    dumped = tmp_path / "seen.json"
+
+    # 工作区不设就落在复制出去的那个目录，data/config.yaml 才是这里写的那份。
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLONOTH_", "ONEBOT_"))}
+    env.update(extra_env or {})
+    env["PYTHONIOENCODING"] = "utf-8"
+    done = subprocess.run(
+        [sys.executable, str(harness), str(home / "bot.py"), str(REPO_ROOT), str(dumped)],
+        cwd=str(home), env=env, capture_output=True, text=True, encoding="utf-8", timeout=120,
+    )
+    assert done.returncode == 0, done.stderr
+    return json.loads(dumped.read_text(encoding="utf-8"))
 
 
 def test_main_runs_end_to_end_with_nonebot_stubbed(tmp_path: Path) -> None:
@@ -170,26 +198,30 @@ def test_main_runs_end_to_end_with_nonebot_stubbed(tmp_path: Path) -> None:
     只做静态检查挡不住这一类：插件模块第一行 get_driver() 就要求 NoneBot 已初始化，
     在 init() 之前被导入的话进程直接起不来，而源码里看不出任何异常。
     """
-    home = tmp_path / "deploy"
-    home.mkdir()
-    (home / "bot.py").write_bytes(BOT_ENTRY.read_bytes())
-    harness = tmp_path / "main_harness.py"
-    harness.write_text(_MAIN_HARNESS, encoding="utf-8")
-    dumped = tmp_path / "seen.json"
-
-    done = subprocess.run(
-        [sys.executable, str(harness), str(home / "bot.py"), str(REPO_ROOT), str(dumped)],
-        cwd=str(home), env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-        capture_output=True, text=True, encoding="utf-8", timeout=120,
-    )
-    assert done.returncode == 0, done.stderr
-
-    seen = json.loads(dumped.read_text(encoding="utf-8"))
+    seen = _run_main(tmp_path)["calls"]
     # 等待必须发生在 init 之前：init 之后再等，NoneBot 已经开始收消息了。
     assert seen.index("waited") < seen.index("init")
     # 适配器插件只能由 load_plugin 加载，且必须在 init 之后。
     assert seen.index("init") < seen.index("plugin:adapters.onebot.onebot_plugin")
     assert seen[-1] == "run"
+
+
+def test_a_configured_access_token_is_handed_to_nonebot(tmp_path: Path) -> None:
+    # NoneBot 只从环境变量读它；data/config.yaml 那份不递过去，NapCat 连上来就被拒。
+    result = _run_main(
+        tmp_path,
+        config="platforms:\n  qq:\n    access_token: from-config\n",
+        extra_env={"ONEBOT_ACCESS_TOKEN": "from-env"},
+    )
+
+    assert result["init"] == [{"onebot_access_token": "from-config"}]
+
+
+def test_an_environment_access_token_is_left_to_nonebot(tmp_path: Path) -> None:
+    # 环境变量那份 NoneBot 自己会读，再递一遍只是多一处要对齐的地方。
+    result = _run_main(tmp_path, extra_env={"ONEBOT_ACCESS_TOKEN": "from-env"})
+
+    assert result["init"] == [{}]
 
 
 def test_dotenv_runs_before_the_plugin_is_imported() -> None:

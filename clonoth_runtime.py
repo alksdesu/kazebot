@@ -7,10 +7,13 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import yaml
+
+if TYPE_CHECKING:
+    from platforms.descriptor import PlatformDescriptor
 
 
 DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
@@ -424,9 +427,13 @@ def _load_config_yaml(workspace_root: Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 #  命名渠道解析
 # ---------------------------------------------------------------------------
+# 各平台的密钥写在这一段下：platforms.<平台 id>.<密钥名>。
+PLATFORMS_CONFIG_KEY = "platforms"
+
 # config.yaml 顶层的渠道块由用户自己命名，只能靠排除法认出来。
 CONFIG_META_KEYS = frozenset({
     "version", "provider", "fallbacks", "node_fallbacks", "system_models", "image_gen",
+    PLATFORMS_CONFIG_KEY,
 })
 
 _CHANNEL_BLOCK_KEYS = ("base_url", "api_key", "model", "type")
@@ -485,6 +492,72 @@ def resolve_channel(
         options=dict(raw_options) if isinstance(raw_options, dict) else {},
         known=True,
     )
+
+
+# 平台密钥是从哪一处读到的，写进 PlatformSecret.source。
+SECRET_FROM_CONFIG = "config"
+SECRET_FROM_ENV = "env"
+
+
+@dataclass(frozen=True)
+class PlatformSecret:
+    """平台显式配的一项密钥。source 为空表示两处都没配，由平台自己决定怎么办，比如自动生成。"""
+
+    value: str = ""
+    source: str = ""
+    # data/config.yaml 那份盖住了一个不同的 env 值。改了 .env 不见效时，这是唯一的线索。
+    env_shadowed: bool = False
+
+
+def _platform_section(config: Mapping[str, Any], platform_id: str) -> Mapping[str, Any]:
+    section = config.get(PLATFORMS_CONFIG_KEY)
+    block = section.get(platform_id) if isinstance(section, dict) else None
+    return block if isinstance(block, dict) else {}
+
+
+def _secret_text(raw: Any, extra: Mapping[str, str] | None = None) -> str:
+    # YAML 会把纯数字的令牌读成 int；布尔、列表、映射当成没配，免得 True 被当成令牌 "True"。
+    if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+        return ""
+    return resolve_env_ref(str(raw).strip(), extra)
+
+
+def platform_secret(
+    workspace_root: Path | str,
+    platform: PlatformDescriptor,
+    name: str,
+    *,
+    config: Mapping[str, Any] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> PlatformSecret:
+    """平台显式配的密钥：data/config.yaml 的 platforms.<id>.<name> 优先，其次声明的环境变量。
+
+    和系统槽位一样文件优先：运维改的是文件，一行早就忘了的 env 不该顶掉它。config 里可以写
+    ${VAR} 引用 .env。自动生成的密钥文件由平台自己管，不在这里读。environ 给了就拿它代替进程环境，
+    供要每次重读 .env 文件的调用方用。
+    """
+    spec = platform.secret(name)
+    data = _load_config_yaml(Path(workspace_root)) if config is None else config
+    from_config = _secret_text(_platform_section(data, platform.id).get(name), environ)
+    source = os.environ if environ is None else environ
+    from_env = str(source.get(spec.env, "") or "").strip() if spec.env else ""
+    if from_config:
+        return PlatformSecret(from_config, SECRET_FROM_CONFIG, env_shadowed=bool(from_env) and from_env != from_config)
+    if from_env:
+        return PlatformSecret(from_env, SECRET_FROM_ENV)
+    return PlatformSecret()
+
+
+def undeclared_platform_secrets(
+    workspace_root: Path | str,
+    platform: PlatformDescriptor,
+    *,
+    config: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """platforms.<id> 下平台没声明的键。拼错的键会被静默无视，运营者还以为配上了。"""
+    data = _load_config_yaml(Path(workspace_root)) if config is None else config
+    declared = {secret.name for secret in platform.secrets}
+    return sorted(str(key) for key in _platform_section(data, platform.id) if str(key) not in declared)
 
 
 @dataclass(frozen=True)

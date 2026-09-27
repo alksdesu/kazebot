@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 import yaml
 
 from clonoth_runtime import classify_path, load_yaml_dict, parse_extra_roots
+from platforms.protection import policy_floor
 
 from .types import SafetyLevel
 
@@ -52,8 +53,6 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "**/.env", "decision": "deny", "reason": "do not allow reading dotenv secrets"},
                 # manage_secret 的虚拟路径，不是真目录；list 只回键名与是否已配，不回值。
                 {"pattern": ".secret", "decision": "auto", "reason": "listing secret names exposes no values"},
-                # 排队中的账号操作请求里带着 admin token。
-                {"pattern": "data/napcat-account.*", "decision": "deny", "reason": "queued account actions carry the admin token"},
                 {"pattern": "config/nodes/**", "decision": "deny", "reason": "node prompts are internal"},
                 {"pattern": "engine/system_nodes/**", "decision": "deny", "reason": "system prompts are internal"},
                 # data/ 下有 config.yaml、.admin_token、会话与事件流。落到 default:auto
@@ -99,10 +98,6 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "**/.env", "decision": "deny", "reason": "do not allow writing dotenv secrets"},
                 # 同上，虚拟路径。写的是 .env 里的单个键，值不经过 supervisor。
                 {"pattern": ".secret/**", "decision": "auto", "reason": "admins may set api keys via manage_secret"},
-                # 这个文件名会被 root 侧 runner 执行，只有 supervisor 该往里写。
-                {"pattern": "data/napcat-account.*", "decision": "deny", "reason": "account actions are executed as root"},
-                # 决定账号页哪个号能点，改了只会让界面撒谎。
-                {"pattern": "data/qq_dead_logins.json", "decision": "deny", "reason": "quick-login state is derived from real switch results"},
             ],
         },
         "execute_command": {
@@ -491,6 +486,12 @@ class PolicyEngine:
             self._write_default, self._write_rules = self._compile_rules(write_sec)
         else:
             self._write_default, self._write_rules = SafetyLevel.auto, []
+
+        # 平台声明的密钥文件和自有文件排在最前：第一个命中的规则赢，老部署的 policy.yaml 没写它们也照样护住。
+        # 命令里的敏感路径由读规则推导，所以要在下面编译 sensitive_path_patterns 之前并进去。
+        read_floor, write_floor = policy_floor(workspace=self._root)
+        self._read_rules = [(rule.pattern, SafetyLevel.deny, rule.reason) for rule in read_floor] + self._read_rules
+        self._write_rules = [(rule.pattern, SafetyLevel.deny, rule.reason) for rule in write_floor] + self._write_rules
 
         cmd_sec = self._cfg.get("execute_command")
         if isinstance(cmd_sec, dict):

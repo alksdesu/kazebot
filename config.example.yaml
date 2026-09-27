@@ -15,7 +15,7 @@
 #
 #   1) config.yaml 的 system_models.<slot>.<字段>   （最高优先）
 #   2) slot 专属环境变量 CLONOTH_<SLOT>_<字段>
-#   3) 主渠道对应字段（上方 openai 块）              （兵底）
+#   3) 主渠道对应字段（上方 openai 块）              （兜底）
 #
 # 关键点：
 #   - config.yaml 比同名环境变量优先；两处都设时以 config.yaml 为准。
@@ -230,3 +230,17 @@ fallbacks:
 #   system.turn_summarizer:
 #     - provider: deepseek
 #       model: deepseek-v4-flash
+
+# ---------------------------------------------------------------------------
+# 平台密钥（platforms，可选）
+# ---------------------------------------------------------------------------
+# 各聊天平台的连接令牌和密钥写在 platforms.<平台 id> 下，比 .env 里对应的变量优先；
+# 两处都写且不一样时，启动日志会提醒 .env 那个没生效。支持 ${VAR} 引用 .env。
+# 平台不认识的键同样会在启动时报出来，免得拼错了还以为配上了。
+#
+# platforms:
+#   qq:
+#     access_token: "${ONEBOT_ACCESS_TOKEN}"   # NapCat 连接令牌，NapCat 侧配了就填同一个值
+#     forward_bridge_token: "..."              # 转发 Bridge 令牌；都没配时 bot 自签到 data/onebot_forward_bridge_token
+#     conversation_hash_secret: "..."          # 会话键摘要密钥；改动会让已有会话映射全部失配
+#     napcat_webui_token: "..."                # NapCat WebUI 令牌，控制台扫码和切号用；部署脚本会回填进 .env

@@ -12,7 +12,13 @@ from platforms.builtin import QQ_NAPCAT
 from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE
 from platforms.ids import normalize_id
 from platforms.inbound import InboundConversation, InboundFacts, InboundSender
-from ..config import FORWARD_BRIDGE_TOKEN, FORWARD_BRIDGE_TOKEN_FILE, GROUP_TRIGGER_MODES
+from ..config import (
+    FORWARD_BRIDGE_TOKEN,
+    FORWARD_BRIDGE_TOKEN_FILE,
+    FORWARD_BRIDGE_TOKEN_TOOLS_WARNING,
+    GROUP_TRIGGER_MODES,
+    SECRET_CONFIG_WARNINGS,
+)
 from adapters._shared import capability
 from adapters._shared.trigger_policy import (
     TriggerConfig,
@@ -357,10 +363,15 @@ def _warn_startup_config() -> None:
             common.logger.warning("permissions.capabilities.%s is off: nobody can use it", cap.key)
     if not live.allowed_groups:
         common.logger.warning("channels.allowed_groups is empty: the bot will not respond in any group")
+    for message in SECRET_CONFIG_WARNINGS:
+        common.logger.warning(message)
+    if live.enable_forward_bridge and FORWARD_BRIDGE_TOKEN_TOOLS_WARNING:
+        common.logger.warning(FORWARD_BRIDGE_TOKEN_TOOLS_WARNING)
     if live.enable_forward_bridge and not FORWARD_BRIDGE_TOKEN:
         if forward_bridge._forward_bridge_token():
             common.logger.info(
-                "ONEBOT_FORWARD_BRIDGE_TOKEN is empty: using self-signed bridge token file %s",
+                "forward bridge token is not configured (data/config.yaml platforms.qq.forward_bridge_token "
+                "or ONEBOT_FORWARD_BRIDGE_TOKEN): using self-signed bridge token file %s",
                 FORWARD_BRIDGE_TOKEN_FILE,
             )
         else:

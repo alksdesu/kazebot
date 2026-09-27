@@ -293,6 +293,7 @@ const ProvidersEditor = () => {
   // 名字留空就拿格式名当名字：同一家只开一个时，这和以前的行为一模一样。
   const pendingName = addName.trim() || addType;
   const nameTaken = drafts.some((draft) => draft.name === pendingName);
+  const nameReserved = (data?.reserved_names ?? []).includes(pendingName);
 
   const absorb = (next: ProvidersResponse, done: string, preserveDrafts = false) => {
     const received = fromResponse(next);
@@ -410,7 +411,7 @@ const ProvidersEditor = () => {
                 {families.map((name) => <option key={name} value={name}>{name}</option>)}
               </Select>
               <Button
-                disabled={busy || !addType || nameTaken}
+                disabled={busy || !addType || nameTaken || nameReserved}
                 onClick={() => {
                   setDrafts([...drafts, {
                     name: pendingName,
@@ -436,6 +437,7 @@ const ProvidersEditor = () => {
               </Button>
             </div>
             {nameTaken && <Facts>已经有一个叫 {pendingName} 的渠道了，换个名字。</Facts>}
+            {nameReserved && <Facts>{pendingName} 是 data/config.yaml 里的保留段名，换个名字。</Facts>}
           </>
         )}
 

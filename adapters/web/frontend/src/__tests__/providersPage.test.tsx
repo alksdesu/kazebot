@@ -49,6 +49,7 @@ const PROVIDERS = {
   },
   fallbacks: [],
   node_fallbacks: {},
+  reserved_names: ['fallbacks', 'image_gen', 'node_fallbacks', 'platforms', 'provider', 'system_models', 'version'],
 };
 
 const PROFILES = {
@@ -220,6 +221,27 @@ describe('新增与删除', () => {
 
     expect((screen.getByRole('button', { name: '添加' }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText(/已经有一个叫 openai 的渠道/)).toBeTruthy();
+  });
+
+  it('配置文件的保留段名不能当渠道名', async () => {
+    // 渠道块和这些段同在 data/config.yaml 顶层，起这种名字一保存就把那一段改坏了。
+    render(<ProvidersPage />);
+    await ready();
+    fireEvent.change(screen.getByLabelText('新渠道名'), { target: { value: 'platforms' } });
+    fireEvent.change(screen.getByLabelText('新渠道格式'), { target: { value: 'openai' } });
+
+    expect((screen.getByRole('button', { name: '添加' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/platforms 是 data\/config\.yaml 里的保留段名/)).toBeTruthy();
+  });
+
+  it('名字只是含着保留字的照样能加', async () => {
+    render(<ProvidersPage />);
+    await ready();
+    fireEvent.change(screen.getByLabelText('新渠道名'), { target: { value: 'platforms-relay' } });
+    fireEvent.change(screen.getByLabelText('新渠道格式'), { target: { value: 'openai' } });
+
+    expect((screen.getByRole('button', { name: '添加' }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByText(/保留段名/)).toBeNull();
   });
 
   it('还没保存的渠道不能设为活跃', async () => {

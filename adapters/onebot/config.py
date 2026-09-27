@@ -10,7 +10,17 @@ import re
 from pathlib import Path
 from typing import Any, Callable
 
+from dotenv import dotenv_values
+
 from adapters._shared.env import env_first, env_float, env_int, split_list
+from clonoth_runtime import (
+    SECRET_FROM_ENV,
+    PlatformSecret,
+    load_yaml_dict,
+    platform_secret,
+    undeclared_platform_secrets,
+)
+from platforms.builtin import QQ_NAPCAT
 from workspace import resolve_workspace_root
 
 
@@ -136,25 +146,65 @@ LOCAL_SOURCE_ROOTS = split_list(env_first("ONEBOT_LOCAL_SOURCE_ROOTS", default="
 # 监听地址在启动时绑定，改了要重启；开关与条数上限在 live_config。
 FORWARD_BRIDGE_HOST = env_first("ONEBOT_FORWARD_BRIDGE_HOST", default="127.0.0.1")
 FORWARD_BRIDGE_PORT = env_int("ONEBOT_FORWARD_BRIDGE_PORT", 8769, min_value=1, max_value=65535)
-# Bridge 共享令牌，防止本机其他进程随意调用转发能力。工具通过环境变量拿到同一令牌。
-FORWARD_BRIDGE_TOKEN = env_first("ONEBOT_FORWARD_BRIDGE_TOKEN")
-# 令牌为空时 bot 自签一份写到这里，工具进程按同一路径读；data/onebot_* 已在
-# forward_authz.FILE_DENY_GLOBS 里，这份文件天然不能被 op=file 外传。
-FORWARD_BRIDGE_TOKEN_FILE = env_first(
-    "ONEBOT_FORWARD_BRIDGE_TOKEN_FILE",
-    default=os.path.join(CLONOTH_WORKSPACE, "data", "onebot_forward_bridge_token"),
-)
+# 平台密钥按 QQ 描述里的声明读：data/config.yaml 的 platforms.qq 优先，其次 env。
+_WORKSPACE_CONFIG: dict[str, Any] = load_yaml_dict(Path(CLONOTH_WORKSPACE) / "data" / "config.yaml") or {}
+
+
+def _secret(name: str) -> PlatformSecret:
+    return platform_secret(CLONOTH_WORKSPACE, QQ_NAPCAT, name, config=_WORKSPACE_CONFIG)
+
+
+def _secret_file(name: str) -> str:
+    """两处都没配时自动生成的密钥文件。位置能用声明里的 env 改。"""
+    spec = QQ_NAPCAT.secret(name)
+    return env_first(spec.file_env, default=os.path.join(CLONOTH_WORKSPACE, *spec.file.split("/")))
+
+
+def _secret_config_warnings() -> tuple[str, ...]:
+    """platforms.qq 段里拼错被无视的键、被它盖住的 env。不在启动时说出来，改了不见效还查不出原因。"""
+    section = f"data/config.yaml platforms.{QQ_NAPCAT.id}"
+    warnings: list[str] = []
+    unknown = undeclared_platform_secrets(CLONOTH_WORKSPACE, QQ_NAPCAT, config=_WORKSPACE_CONFIG)
+    if unknown:
+        warnings.append(f"{section} has keys QQ does not read: {', '.join(unknown)}")
+    for spec in QQ_NAPCAT.secrets:
+        if _secret(spec.name).env_shadowed:
+            warnings.append(f"{spec.env} is ignored: {section}.{spec.name} takes precedence")
+    return tuple(warnings)
+
+
+SECRET_CONFIG_WARNINGS = _secret_config_warnings()
+
+
+def _unseen_by_tools(name: str) -> str:
+    """这项密钥只在进程环境里时返回提示。工具子进程的环境剥掉了平台密钥，只读 data/config.yaml 和工作区 .env。"""
+    spec = QQ_NAPCAT.secret(name)
+    if _secret(name).source != SECRET_FROM_ENV:
+        return ""
+    dotenv_path = Path(CLONOTH_WORKSPACE) / ".env"
+    if str(dotenv_values(dotenv_path).get(spec.env) or "").strip():
+        return ""
+    return (
+        f"{spec.env} is set only in the process environment and tool subprocesses have it stripped: "
+        f"put it in data/config.yaml platforms.{QQ_NAPCAT.id}.{spec.name} or {dotenv_path}"
+    )
+
+
+# Bridge 共享令牌，防止本机其他进程随意调用转发能力。工具子进程的环境里剥掉了它，按同样的顺序读文件。
+FORWARD_BRIDGE_TOKEN = _secret("forward_bridge_token").value
+# 令牌没配时 bot 自签一份写到这里，工具进程按同一路径读。QQ 描述把它声明成密钥文件，
+# 经聊天外传、agent 读写都被自动挡住。
+FORWARD_BRIDGE_TOKEN_FILE = _secret_file("forward_bridge_token")
+# 非空时 qq_forward 读不到令牌，转发会全部被 Bridge 拒掉。只在 Bridge 开着时才值得报。
+FORWARD_BRIDGE_TOKEN_TOOLS_WARNING = _unseen_by_tools("forward_bridge_token")
 
 # 提交给 Supervisor 的 QQ conversation_key 使用稳定哈希，真实群号/QQ 号只保留在插件本地路由里。
 # 显式配置的密钥，优先于自动密钥文件；为空时由 conversation_hash 决定加盐还是钉在无盐。
-CONVERSATION_HASH_SECRET = os.environ.get("ONEBOT_CONVERSATION_HASH_SECRET", "").strip()
+CONVERSATION_HASH_SECRET = _secret("conversation_hash_secret").value
 
 # 没显式配 secret 时用的自动密钥文件。内容是随机密钥或 legacy-unsalted 标记；
 # 与 onebot_anon_map.json 同级敏感，不得进版本库。
-CONVERSATION_HASH_SECRET_FILE = env_first(
-    "ONEBOT_CONVERSATION_HASH_SECRET_FILE",
-    default=os.path.join(CLONOTH_WORKSPACE, "data", "onebot_conversation_hash_secret"),
-)
+CONVERSATION_HASH_SECRET_FILE = _secret_file("conversation_hash_secret")
 
 # 本地路由状态文件：保存 stable conversation_key/session_id 到真实 QQ 群/用户目标的映射。
 ONEBOT_STATE_FILE = env_first(

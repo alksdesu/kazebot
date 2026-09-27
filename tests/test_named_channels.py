@@ -14,6 +14,7 @@ import pytest
 import yaml
 
 import supervisor.admin_api as admin_api
+from clonoth_runtime import CONFIG_META_KEYS
 from supervisor.api import create_app
 from supervisor.config_store import ConfigStore
 from supervisor.eventlog import EventLog
@@ -230,3 +231,102 @@ class TestTheAdminApiValidatesTheWireNotTheName:
 
         assert response.status_code == 400
         assert "my-relay" in response.text
+
+
+RESERVED_SECTIONS = """\
+fallbacks:
+  - provider: gemini-official
+node_fallbacks:
+  qq.orchestrator:
+    - provider: gemini-official
+system_models:
+  compact:
+    model: gemini-3-flash
+image_gen:
+  default_channel: gemini-official
+platforms:
+  qq:
+    forward_bridge_token: keep-me
+"""
+
+
+class TestReservedSectionNamesAreNotChannels:
+    """渠道块和这几段同在 data/config.yaml 顶层：拿它们当渠道名，保存就改坏那一段，删除就整段没了。"""
+
+    @pytest.mark.parametrize("name", sorted(CONFIG_META_KEYS))
+    def test_the_store_refuses_every_write_under_one(self, tmp_path, name):
+        path = tmp_path / "config.yaml"
+        path.write_text(CONFIG + RESERVED_SECTIONS, encoding="utf-8")
+        store = ConfigStore(path=path)
+        before = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+        with pytest.raises(ValueError, match="保留段名"):
+            store.upsert_provider(name, base_url="https://relay-x.example", wire="openai")
+        with pytest.raises(ValueError, match="保留段名"):
+            store.delete_provider(name)
+        with pytest.raises(ValueError, match="保留段名"):
+            store.set_active_provider(name)
+
+        assert yaml.safe_load(path.read_text(encoding="utf-8")) == before
+
+    def test_the_listing_hands_them_to_the_console(self, store):
+        assert store.get_providers_public()["reserved_names"] == sorted(CONFIG_META_KEYS)
+
+    def test_the_platforms_section_is_never_listed_as_a_channel(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text(CONFIG + RESERVED_SECTIONS, encoding="utf-8")
+        store = ConfigStore(path=path)
+
+        assert "platforms" not in store.get_providers_public()["providers"]
+        assert "platforms" not in store.channel_names()
+
+    def test_saving_a_channel_keeps_the_platforms_section(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text(CONFIG + RESERVED_SECTIONS, encoding="utf-8")
+        store = ConfigStore(path=path)
+
+        store.upsert_provider("gemini-official", model="gemini-3.5-flash")
+        store.set_active_provider("gemini-official")
+
+        saved = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert saved["platforms"] == {"qq": {"forward_bridge_token": "keep-me"}}
+
+    def test_the_api_answers_400_and_leaves_the_section_alone(self, api, tmp_path):
+        path = tmp_path / "data" / "config.yaml"
+        path.write_text(CONFIG + RESERVED_SECTIONS, encoding="utf-8")
+
+        written = api("PUT", "/v1/config/providers/platforms", headers=_AUTH, json={
+            "type": "openai", "base_url": "https://relay-x.example",
+        })
+        removed = api("DELETE", "/v1/config/providers/platforms", headers=_AUTH)
+        activated = api("PUT", "/v1/config/active-provider", headers=_AUTH, json={"provider": "platforms"})
+
+        assert (written.status_code, removed.status_code, activated.status_code) == (400, 400, 400)
+        assert "保留段名" in written.text
+        saved = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert saved["platforms"] == {"qq": {"forward_bridge_token": "keep-me"}}
+
+
+class TestEveryProvidersResponseIsComplete:
+    """控制台拿写接口的返回整份替换本地数据：少了 registered，添加渠道那一栏保存一次就消失了。"""
+
+    @pytest.mark.parametrize("method,url,body", [
+        ("GET", "/v1/config/providers", None),
+        ("PUT", "/v1/config/providers/gemini-official", {"model": "gemini-3.5-flash"}),
+        ("DELETE", "/v1/config/providers/openai", None),
+        ("PUT", "/v1/config/active-provider", {"provider": "gemini-official"}),
+        ("PUT", "/v1/config/fallbacks", {"fallbacks": [{"provider": "gemini-official"}]}),
+        ("PUT", "/v1/config/node-fallbacks/qq.orchestrator", {"fallbacks": [{"provider": "gemini-official"}]}),
+        ("DELETE", "/v1/config/node-fallbacks/qq.orchestrator", None),
+    ])
+    def test_it_carries_the_wires_and_the_reserved_names(self, api, method, url, body):
+        kwargs: dict[str, Any] = {"headers": _AUTH}
+        if body is not None:
+            kwargs["json"] = body
+
+        response = api(method, url, **kwargs)
+
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert "gemini" in payload["registered"]
+        assert payload["reserved_names"] == sorted(CONFIG_META_KEYS)

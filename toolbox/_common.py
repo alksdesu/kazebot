@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     import asyncio
 
 from clonoth_runtime import classify_path, load_policy_config, parse_extra_roots
+from platforms.protection import secret_env_names
 
 from .context import ToolContext
 
@@ -42,6 +43,8 @@ def kill_process_group(proc: "asyncio.subprocess.Process") -> None:
 # ---------------------------------------------------------------------------
 
 _SENSITIVE_ENV_KEYS_UPPER = {
+    # Bearer for the whole admin API, policy included: a tool holding it could approve itself.
+    "CLONOTH_ADMIN_TOKEN",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "ANTHROPIC_API_KEY",
@@ -61,6 +64,7 @@ def safe_subprocess_env() -> dict[str, str]:
     accidental leakage from command execution.
     """
     env = os.environ.copy()
+    platform_secrets = secret_env_names()
     for k in list(env.keys()):
         ku = k.upper()
 
@@ -70,6 +74,10 @@ def safe_subprocess_env() -> dict[str, str]:
             env.pop(k, None)
             continue
         if ku.endswith("_API_KEY"):
+            env.pop(k, None)
+            continue
+        # Declared by platforms/; a tool that needs one reads data/config.yaml or .env itself.
+        if ku in platform_secrets:
             env.pop(k, None)
             continue
     return env

@@ -135,6 +135,7 @@ if __name__ == "__main__":
     import urllib.error
     import urllib.request
     import uuid
+    from pathlib import Path
 
     def _read_input():
         raw = (sys.stdin.read() or "{}").lstrip("\ufeff")
@@ -166,18 +167,34 @@ if __name__ == "__main__":
         return default
 
     def _resolve_bridge_token():
-        """env 令牌优先，否则读令牌文件（env 指定 / 工作区 / 当前目录）；都读不到返回空串。"""
-        direct = _env_first("ONEBOT_FORWARD_BRIDGE_TOKEN", default="")
-        if direct:
-            return direct
-        candidates = []
-        env_file = _env_first("ONEBOT_FORWARD_BRIDGE_TOKEN_FILE", default="")
-        if env_file:
-            candidates.append(env_file)
+        """和 bot 同一个顺序：显式配置（data/config.yaml 的 platforms.qq > env > .env 文件），
+        否则读 bot 自签的令牌文件（env 指定 / 工作区 / 当前目录）；都读不到返回空串。
+
+        令牌名、env 名和文件位置都按 QQ 描述里的声明，不在这里另抄一份。
+        """
+        here = Path(__file__).resolve().parent
+        if str(here) not in sys.path:
+            sys.path.insert(0, str(here))
+        # 追加而不是插到最前：代码根下的顶层模块不该盖住标准库的同名模块。
+        if str(here.parent) not in sys.path:
+            sys.path.append(str(here.parent))
+        from _channel import platform_secret
+        from platforms.builtin import QQ_NAPCAT
+
+        spec = QQ_NAPCAT.secret("forward_bridge_token")
         workspace = _env_first("CLONOTH_WORKSPACE", "ONEBOT_WORKSPACE_ROOT", default="")
+        configured = platform_secret(
+            QQ_NAPCAT.id, spec.name, spec.env, root=Path(workspace) if workspace else None,
+        )
+        if configured:
+            return configured
+        candidates = []
+        moved = _env_first(spec.file_env, default="")
+        if moved:
+            candidates.append(moved)
         if workspace:
-            candidates.append(os.path.join(workspace, "data", "onebot_forward_bridge_token"))
-        candidates.append(os.path.join("data", "onebot_forward_bridge_token"))
+            candidates.append(os.path.join(workspace, *spec.file.split("/")))
+        candidates.append(os.path.join(*spec.file.split("/")))
         for candidate in candidates:
             try:
                 with open(candidate, "r", encoding="utf-8") as handle:
@@ -276,9 +293,9 @@ if __name__ == "__main__":
         message_refs = []
         if isinstance(raw_refs, list):
             for item in raw_refs:
-                token = str(item).strip()
-                if token:
-                    message_refs.append(token)
+                ref = str(item).strip()
+                if ref:
+                    message_refs.append(ref)
         payload["message_refs"] = message_refs
 
         # “最近生成/发出的图片”选择（如生图插件产出的图）。
@@ -287,9 +304,9 @@ if __name__ == "__main__":
         raw_recent = args.get("recent_refs")
         if isinstance(raw_recent, list):
             for item in raw_recent:
-                token = str(item).strip()
-                if token:
-                    recent_refs.append(token)
+                ref = str(item).strip()
+                if ref:
+                    recent_refs.append(ref)
         if recent_refs:
             use_recent = True
         payload["use_recent"] = use_recent

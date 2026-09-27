@@ -15,6 +15,7 @@ const resp = (providers: Record<string, unknown>, registered: string[]): Provide
   fallbacks: [],
   node_fallbacks: {},
   registered,
+  reserved_names: [],
 });
 
 describe('渠道选项', () => {

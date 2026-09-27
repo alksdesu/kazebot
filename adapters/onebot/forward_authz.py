@@ -4,40 +4,14 @@
 """
 from __future__ import annotations
 
-import fnmatch
+from pathlib import Path
 from typing import Any
 
+from platforms.builtin import QQ_NAPCAT
 from platforms.ids import same_id
+from platforms.protection import outbound_deny_reason
 
-# 经 QQ 外传即离开本机、过腾讯服务器且不可撤回，所以这批路径对管理员也拒绝：
-# 需要时走 read_file 审批流，顺带挡住管理员在群里被提示词注入骗走密钥。
-FILE_DENY_GLOBS: tuple[str, ...] = (
-    ".env",
-    ".env.*",
-    "*/.env",
-    "*/.env.*",
-    "data/config.yaml",
-    "data/.admin_token",
-    "data/policy.yaml",
-    # 整套匿名化就是为了不让真实群号/QQ 号进模型上下文，这几类文件里全是明文号码 ——
-    # 外传等于把去匿名化字典本身发出去。写成前缀通配而不是逐个文件名：
-    # onebot_anon_map（别名双向表）、onebot_plugin_state（conv 哈希 → 真实群号 +
-    # 每个 session 的 group_id/user_id）、onebot_reply_attachments（真实 sender_id），
-    # 以后再加一份 onebot_* 状态文件也默认被挡住。
-    "data/onebot_*",
-    "data/cache/onebot_*",
-    "config/qq.yaml",
-    "data/qq_live_state.json",
-    # 配置端点覆盖写入前会留 .bak，副本的敏感度等于原文件（data/config.yaml.bak 里就是
-    # 明文 api_key），而按原文件名匹配的规则一个都盖不住多出来的后缀。
-    "*.bak",
-    "id_rsa*",
-    "*/id_rsa*",
-    "*.key",
-    "*.pem",
-    "*.p12",
-    "*.pfx",
-)
+from .config import CLONOTH_WORKSPACE
 
 CROSS_SESSION_DENIED = (
     "只有 Clonoth 管理员可以把内容发送给其他 QQ 用户或群。可以改为发给自己或发到本群。"
@@ -46,16 +20,12 @@ FILE_PATHS_DENIED = "只有 Clonoth 管理员可以把工作区里的文件发�
 
 
 def file_deny_reason(rel_path: str) -> str:
-    """命中外传黑名单时返回拒绝原因，空串表示允许。"""
-    rel = str(rel_path or "").replace("\\", "/").strip()
-    while rel.startswith("./"):
-        rel = rel[2:]
-    if not rel:
-        return ""
-    for pattern in FILE_DENY_GLOBS:
-        if fnmatch.fnmatchcase(rel, pattern):
-            return f"{rel}：密钥/凭据类文件禁止通过 QQ 发送。"
-    return ""
+    """命中外传黑名单时返回拒绝原因，空串表示允许。
+
+    黑名单由各平台声明的密钥与私密文件推导。经 QQ 外传即离开本机、过腾讯服务器且不可撤回，
+    所以对管理员也拒绝：需要时走 read_file 审批流，顺带挡住管理员在群里被提示词注入骗走密钥。
+    """
+    return outbound_deny_reason(rel_path, via=QQ_NAPCAT.short_name, workspace=Path(CLONOTH_WORKSPACE))
 
 
 def has_explicit_file_paths(raw_file_paths: Any) -> bool:

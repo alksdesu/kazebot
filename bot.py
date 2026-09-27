@@ -56,14 +56,18 @@ def _bridge_stdlib_logging() -> None:
 def main() -> None:
     # 延迟到这里再取：本文件会被单独复制出去做入口冒烟，import 期要求整个仓库在位
     # 就跑不起来。
-    from clonoth_runtime import wait_supervisor
+    from clonoth_runtime import SECRET_FROM_CONFIG, platform_secret, wait_supervisor
+    from platforms.builtin import QQ_NAPCAT
+    from workspace import resolve_workspace_root
 
     # 先等 supervisor。systemd 的 After/BindsTo 只排启动顺序，不等它 ready，而
     # NoneBot 一 run 起来就开始收 QQ 消息 —— 那十几秒里的 submit inbound 全部失败，
     # 每次重启都静默吞掉几条群消息。
     wait_supervisor(_SUPERVISOR_URL, label="qq", max_wait_sec=_SUPERVISOR_WAIT_SEC)
 
-    nonebot.init()
+    # NoneBot 只从环境变量读连接令牌，写在 data/config.yaml 的那份得显式交给它。
+    access = platform_secret(resolve_workspace_root(_REPO_ROOT), QQ_NAPCAT, "access_token")
+    nonebot.init(**({"onebot_access_token": access.value} if access.source == SECRET_FROM_CONFIG else {}))
     _bridge_stdlib_logging()
     driver = nonebot.get_driver()
     driver.register_adapter(OneBotV11Adapter)

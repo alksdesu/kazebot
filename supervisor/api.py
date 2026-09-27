@@ -282,14 +282,17 @@ def create_app(
     #  Multi-provider config API
     # ================================================================
 
+    def _providers_payload(result: dict[str, Any]) -> dict[str, Any]:
+        """控制台拿写接口的返回整份替换本地数据，回渠道形状的接口都得带上注册的线格式，缺了添加渠道那一栏就没了。"""
+        from providers import registry as provider_registry
+        result["registered"] = provider_registry.list()
+        return result
+
     @app.get("/v1/config/providers")
     async def get_providers(request: Request) -> dict[str, Any]:
         verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
-        from providers import registry as provider_registry
-        result = cs.get_providers_public()
-        result["registered"] = provider_registry.list()
-        return result
+        return _providers_payload(cs.get_providers_public())
 
     @app.get("/v1/config/policy")
     async def get_policy(request: Request) -> dict[str, Any]:
@@ -474,10 +477,13 @@ def create_app(
                 status_code=400,
                 detail=f"不认识的线格式 '{wire}'。可选：{provider_registry.list()}",
             )
-        return cs.upsert_provider(
-            name, base_url=body.base_url, api_key=body.api_key, model=body.model,
-            supports_vision=body.supports_vision, wire=body.type, label=body.label,
-        )
+        try:
+            return _providers_payload(cs.upsert_provider(
+                name, base_url=body.base_url, api_key=body.api_key, model=body.model,
+                supports_vision=body.supports_vision, wire=body.type, label=body.label,
+            ))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     @app.post("/v1/config/providers/{name}/models")
     async def list_provider_models(
@@ -533,7 +539,7 @@ def create_app(
         verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
         try:
-            return cs.delete_provider(name)
+            return _providers_payload(cs.delete_provider(name))
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -542,7 +548,7 @@ def create_app(
         verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
         try:
-            return cs.set_active_provider(body.provider)
+            return _providers_payload(cs.set_active_provider(body.provider))
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -550,7 +556,7 @@ def create_app(
     async def update_fallbacks(body: FallbacksUpdateIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
-        return cs.update_fallbacks(body.fallbacks)
+        return _providers_payload(cs.update_fallbacks(body.fallbacks))
 
     @app.put("/v1/config/node-fallbacks/{node_id}")
     async def update_node_fallbacks(
@@ -559,7 +565,7 @@ def create_app(
         verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
         try:
-            return cs.update_node_fallbacks(node_id, body.fallbacks)
+            return _providers_payload(cs.update_node_fallbacks(node_id, body.fallbacks))
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -569,7 +575,7 @@ def create_app(
         verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
         try:
-            return cs.update_node_fallbacks(node_id, None)
+            return _providers_payload(cs.update_node_fallbacks(node_id, None))
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 

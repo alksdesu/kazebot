@@ -1,7 +1,7 @@
-"""工具子进程共用的渠道解析。
+"""工具子进程共用的渠道与平台密钥解析。
 
 工具是独立子进程、只吃标准库，导不了 clonoth_runtime，所以在这里放一份而不是各抄一遍。
-密钥只能从 .env 文件读：safe_subprocess_env() 会把所有 *_API_KEY 从环境里剥掉。
+密钥只能从 .env 文件读：safe_subprocess_env() 会把 *_API_KEY 和平台声明的密钥变量从环境里剥掉。
 """
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from typing import NamedTuple
 
 # 这几家收 OpenAI 格式的 /chat/completions；anthropic 与 gemini 原生走自己的端点和请求体。
 OPENAI_COMPATIBLE = frozenset({"openai", "deepseek"})
+# data/config.yaml 里平台密钥那一段，和 clonoth_runtime.PLATFORMS_CONFIG_KEY 同值。
+_PLATFORMS_KEY = "platforms"
 
 
 class MainChannel(NamedTuple):
@@ -55,19 +57,15 @@ def _is_provider_block(value: object) -> bool:
     return isinstance(value, dict) and any(k in value for k in ("base_url", "api_key", "model", "type"))
 
 
-class Channel:
-    """一个 system_models 槽位的配置视图。"""
+class _ConfigView:
+    """工作区的 .env 与 data/config.yaml。"""
 
-    def __init__(self, slot: str, *, root: Path | None = None) -> None:
+    def __init__(self, *, root: Path | None = None) -> None:
         # root 默认 cwd：工具是以工作区为 cwd 拉起的子进程。主进程里的调用方
         # （提示词注入）cwd 不一定在工作区，得把 root 显式传进来。
         base = Path(root) if root is not None else Path.cwd()
-        self.slot = (slot or "").strip().lower()
         self._dotenv = _read_dotenv(base)
         self._config = _read_config(base)
-        block = (self._config.get("system_models") or {}) if isinstance(self._config, dict) else {}
-        block = block.get(self.slot) if isinstance(block, dict) else None
-        self._block = block if isinstance(block, dict) else {}
 
     def env(self, key: str) -> str:
         return (os.environ.get(key, "") or self._dotenv.get(key, "")).strip()
@@ -86,6 +84,37 @@ class Channel:
             if text.startswith(head) and text.endswith("}") and len(text) > len(head) + 1:
                 return self.first_env(text[len(head):-1].strip())
         return text
+
+    def platform_secret(self, platform_id: str, name: str, env: str = "") -> str:
+        """和主进程同一个顺序：data/config.yaml 的 platforms.<id>.<name> > 环境变量 > .env 文件。"""
+        section = self._config.get(_PLATFORMS_KEY) if isinstance(self._config, dict) else None
+        block = section.get(platform_id) if isinstance(section, dict) else None
+        raw = block.get(name) if isinstance(block, dict) else None
+        # YAML 会把纯数字的令牌读成 int；布尔、列表、映射当成没配，和主进程判得一样。
+        if isinstance(raw, (str, int)) and not isinstance(raw, bool):
+            value = self._deref(str(raw))
+            if value:
+                return value
+        return self.env(env) if env else ""
+
+
+def platform_secret(platform_id: str, name: str, env: str = "", *, root: Path | None = None) -> str:
+    """平台显式配的一项密钥，都没配返回空串，由调用方去读平台自动生成的密钥文件。
+
+    子进程的环境里剥掉了平台密钥，env 那一档通常是空的，实际落到 data/config.yaml 或 .env 文件。
+    """
+    return _ConfigView(root=root).platform_secret(platform_id, name, env)
+
+
+class Channel(_ConfigView):
+    """一个 system_models 槽位的配置视图。"""
+
+    def __init__(self, slot: str, *, root: Path | None = None) -> None:
+        super().__init__(root=root)
+        self.slot = (slot or "").strip().lower()
+        block = (self._config.get("system_models") or {}) if isinstance(self._config, dict) else {}
+        block = block.get(self.slot) if isinstance(block, dict) else None
+        self._block = block if isinstance(block, dict) else {}
 
     def own(self, field: str, env_suffix: str) -> str:
         """只看这一槽自己配了什么：config.yaml 的槽位块 > 槽位专属环境变量。"""

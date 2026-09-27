@@ -6,9 +6,11 @@ from typing import Any
 
 import yaml
 from clonoth_runtime import (
+    CONFIG_META_KEYS,
     IMAGE_TOOL_SLOTS,
     SYSTEM_MODEL_SLOTS,
     image_tool_available,
+    is_channel_block,
     resolve_env_ref,
 )
 from engine.node import canonical_node_id, known_node_ids
@@ -154,7 +156,7 @@ class ConfigStore:
         却给 openai 的地址，engine 会拿错的请求格式去打。
         """
         name = (self._config.provider or "").strip() or "openai"
-        if name != "openai" and self._is_provider_block(self._load_raw().get(name)):
+        if name != "openai" and is_channel_block(self._load_raw().get(name)):
             return name
         return "openai"
 
@@ -220,12 +222,6 @@ class ConfigStore:
     #  Multi-provider CRUD (operates on raw YAML dict)
     # ================================================================
 
-    # [2026-07-16] node_fallbacks / system_models 是可选配置块，不是 provider
-    # 块，列为 meta key 避免被当成 provider 展示/删除。
-    _META_KEYS = frozenset({
-        "version", "provider", "fallbacks", "node_fallbacks", "system_models", "image_gen",
-    })
-
     def _load_raw(self) -> dict[str, Any]:
         """Load raw YAML dict from disk."""
         return self._load_yaml_dict() or {"version": 1, "provider": "openai"}
@@ -234,9 +230,6 @@ class ConfigStore:
         """Write raw dict to YAML file."""
         text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
         self.path.write_text(text, encoding="utf-8")
-
-    def _is_provider_block(self, val: Any) -> bool:
-        return isinstance(val, dict) and any(k in val for k in ("base_url", "api_key", "model", "type"))
 
     def _type_of(self, name: str, data: dict[str, Any] | None = None) -> str:
         """这个渠道说哪种线格式。
@@ -309,6 +302,12 @@ class ConfigStore:
         public["options"] = self._public_options(self._type_of(provider_name), entry.get("options"))
         return public
 
+    @staticmethod
+    def _check_channel_name(name: str) -> None:
+        # 渠道块和这几段配置同在 data/config.yaml 顶层，重名就会把那一段当成渠道块改写或整段删掉。
+        if name in CONFIG_META_KEYS:
+            raise ValueError(f"'{name}' 是 data/config.yaml 里的保留段名，不能当渠道名")
+
     def get_providers_public(self) -> dict[str, Any]:
         """Return all providers with redacted api_keys, plus active_provider and fallbacks."""
         with self._lock:
@@ -318,9 +317,9 @@ class ConfigStore:
 
             providers: dict[str, dict[str, Any]] = {}
             for key, val in data.items():
-                if key in self._META_KEYS:
+                if key in CONFIG_META_KEYS:
                     continue
-                if self._is_provider_block(val):
+                if is_channel_block(val):
                     providers[key] = self._public_block(val, key)
 
             raw_chains = data.get("node_fallbacks")
@@ -340,6 +339,8 @@ class ConfigStore:
                 "providers": providers,
                 "fallbacks": [self._public_fallback(fb) for fb in fallbacks],
                 "node_fallbacks": node_chains,
+                # 新渠道起名时要避开的名字，控制台拿它提前拦下，不用等保存被拒。
+                "reserved_names": sorted(CONFIG_META_KEYS),
             }
 
     def wire_of(self, name: str) -> str:
@@ -353,7 +354,7 @@ class ConfigStore:
             data = self._load_raw()
         return [
             key for key, val in data.items()
-            if key not in self._META_KEYS and self._is_provider_block(val)
+            if key not in CONFIG_META_KEYS and is_channel_block(val)
         ]
 
     def resolve_provider_credentials(self, name: str) -> tuple[str, str]:
@@ -411,6 +412,7 @@ class ConfigStore:
                         supports_vision: str | None = None,
                         wire: str | None = None, label: str | None = None) -> dict[str, Any]:
         """Create or update a provider entry."""
+        self._check_channel_name(name)
         with self._lock:
             data = self._load_raw()
             if name not in data or not isinstance(data.get(name), dict):
@@ -558,9 +560,10 @@ class ConfigStore:
 
     def set_active_provider(self, name: str) -> dict[str, Any]:
         """Switch the active provider."""
+        self._check_channel_name(name)
         with self._lock:
             data = self._load_raw()
-            if name not in data or not self._is_provider_block(data.get(name)):
+            if name not in data or not is_channel_block(data.get(name)):
                 raise ValueError(f"Provider '{name}' not found in config")
             data["provider"] = name
             self._save_raw(data)
@@ -671,6 +674,7 @@ class ConfigStore:
 
     def delete_provider(self, name: str) -> dict[str, Any]:
         """Delete a provider entry."""
+        self._check_channel_name(name)
         with self._lock:
             data = self._load_raw()
             if name not in data:

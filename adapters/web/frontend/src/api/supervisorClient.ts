@@ -453,6 +453,8 @@ export interface ProvidersResponse {
   // 按节点的专属链。空数组表示这个节点禁用 fallback，键不存在才是跟随全局。
   node_fallbacks: Record<string, FallbackEntryPublic[]>;
   registered: string[];
+  /** data/config.yaml 顶层的保留段名。渠道块和它们同层，起这些名字保存时会被拒。 */
+  reserved_names: string[];
 }
 
 export interface ChannelChoice {

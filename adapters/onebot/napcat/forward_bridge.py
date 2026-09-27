@@ -33,7 +33,8 @@ logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
 
 def _forward_bridge_token() -> str:
-    """返回 Bridge 令牌：env 优先，否则读/自签令牌文件；都拿不到返回空串，Bridge 不启动。"""
+    """返回 Bridge 令牌：显式配置优先（data/config.yaml 的 platforms.qq，其次 env），否则读/自签令牌文件；
+    都拿不到返回空串，Bridge 不启动。"""
     if FORWARD_BRIDGE_TOKEN:
         return FORWARD_BRIDGE_TOKEN
     if state._adapter.forward_bridge_token_cache:
@@ -809,8 +810,9 @@ async def _forward_bridge_http_handler(request: "Any") -> "Any":
         return web.json_response(
             {
                 "ok": False,
-                "error": "Bridge 令牌不匹配：请确认 ONEBOT_FORWARD_BRIDGE_TOKEN 两侧一致，"
-                "或 data/onebot_forward_bridge_token 对工具进程可读。",
+                "error": "Bridge 令牌不匹配：qq_forward 工具只从 data/config.yaml 的 "
+                "platforms.qq.forward_bridge_token、工作区 .env 或 data/onebot_forward_bridge_token "
+                "读令牌，请确认它和 bot 用的是同一个。",
             },
             status=403,
         )

@@ -16,9 +16,9 @@ import httpx
 import yaml
 
 from providers import registry
-from clonoth_runtime import resolve_env_ref
+from clonoth_runtime import load_yaml_dict, platform_secret, resolve_env_ref
 from platforms.builtin import QQ_NAPCAT
-from platforms.registry import required_config_path
+from platforms.registry import all_platforms, platform_config_path, required_config_path
 from supervisor.config_store import ConfigStore
 from supervisor.instances import load_instances, url_prefix
 from supervisor.log_access import LogReader, redact
@@ -68,14 +68,29 @@ class OperationsService:
                 if resolved:
                     values.add(resolved)
 
-        for path in (self.root / "data/config.yaml", self.qq_file):
+        workspace_config = self.root / "data/config.yaml"
+        config_files = [workspace_config]
+        for platform in all_platforms():
+            path = platform_config_path(platform, self.root)
+            if path is not None and path not in config_files:
+                config_files.append(path)
+        for path in config_files:
             try:
                 collect(yaml.safe_load(path.read_text(encoding="utf-8")))
             except (OSError, yaml.YAMLError):
                 continue
+        # 平台声明的密钥不一定叫 token/secret，按声明再收一遍；被 config 盖住的那个 env 值也收。
+        # 自动生成的密钥文件不收：代码从不打印它们，里面也可能只是模式标记，抹掉反而丢排障线索。
+        config = load_yaml_dict(workspace_config) or {}
+        for platform in all_platforms():
+            for spec in platform.secrets:
+                values.add(platform_secret(self.root, platform, spec.name, config=config).value)
+                if spec.env:
+                    values.add(os.environ.get(spec.env, "").strip())
         for key, value in os.environ.items():
             if re.search(r"(?:TOKEN|SECRET|PASSWORD|API_?KEY)$", key, re.I) and value:
                 values.add(value)
+        values.discard("")
         return tuple(sorted(values, key=len, reverse=True))
 
     def _clean(self, value: Any, secrets: tuple[str, ...] = ()) -> Any:

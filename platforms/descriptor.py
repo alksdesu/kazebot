@@ -1,6 +1,7 @@
 """平台描述的数据结构。只有数据，不导入任何平台库。"""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -30,9 +31,27 @@ MENTION_NATIVE = "native"
 MENTION_TEXT = "text"
 MENTION_FORMS: frozenset[str] = frozenset({MENTION_NONE, MENTION_NATIVE, MENTION_TEXT})
 
+# data/config.yaml 里 platforms.<平台 id>.<密钥名> 的那个键名。
+_SECRET_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+# config/ 下的文件控制台和 agent 在审批下就能改，还常被整份贴出去问问题，密钥不放那里。
+_CONFIG_DIR = "config/"
+
 
 def normalize_name(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+def check_workspace_glob(pattern: str, *, what: str) -> str:
+    """工作区相对的 glob：正斜杠分段、不以 / 或盘符开头、没有空段和 . / .. 段。"""
+    text = str(pattern or "")
+    if not text or text != text.strip():
+        raise ValueError(f"{what} must be a non-empty path without surrounding spaces: {pattern!r}")
+    if "\\" in text or text.startswith("/") or text[1:2] == ":":
+        raise ValueError(f"{what} must be a workspace-relative posix path: {pattern!r}")
+    if any(part in {"", ".", ".."} for part in text.split("/")):
+        raise ValueError(f"{what} must not contain empty, '.' or '..' segments: {pattern!r}")
+    return text
 
 
 @dataclass(frozen=True)
@@ -159,6 +178,35 @@ class PlatformCapabilities:
 
 
 @dataclass(frozen=True)
+class SecretField:
+    """平台的一项密钥。值写在 data/config.yaml 的 platforms.<平台 id> 段或环境变量里，不进 config/。"""
+
+    name: str
+    label: str
+    # 部署时惯用的环境变量。data/config.yaml 没写这一项时才读它。
+    env: str = ""
+    # 两处都没配时平台自己生成、写进这里的文件，相对工作区。空串表示不自动生成。
+    file: str = ""
+    # 改那份自动文件位置的环境变量。只给已经在用它的平台，新平台不加。
+    file_env: str = ""
+
+    def __post_init__(self) -> None:
+        if not _SECRET_NAME.match(self.name):
+            raise ValueError(f"secret name must be lower_snake_case: {self.name!r}")
+        if not self.label.strip():
+            raise ValueError(f"secret {self.name!r} needs a label")
+        for env in (self.env, self.file_env):
+            if env and not _ENV_NAME.match(env):
+                raise ValueError(f"secret {self.name!r} env name must be UPPER_SNAKE_CASE: {env!r}")
+        if self.file_env and not self.file:
+            raise ValueError(f"secret {self.name!r} declares file_env without a default file")
+        if self.file:
+            check_workspace_glob(self.file, what=f"secret {self.name!r} file")
+            if self.file.startswith(_CONFIG_DIR):
+                raise ValueError(f"secret {self.name!r} file must not live under config/: {self.file!r}")
+
+
+@dataclass(frozen=True)
 class PlatformDescriptor:
     id: str
     display_name: str
@@ -179,6 +227,15 @@ class PlatformDescriptor:
     # 核心层需要调用的平台策略：名字 → 模块路径，按需导入。
     hooks: Mapping[str, str] = field(default_factory=dict)
     capabilities: PlatformCapabilities = field(default_factory=PlatformCapabilities)
+    # 平台自己的密钥：连接令牌、AppSecret 这类。读取顺序是 data/config.yaml 的 platforms 段 > env > 自动生成的文件。
+    secrets: tuple[SecretField, ...] = ()
+    # 其他夹着凭据的文件（glob，相对工作区），比如排队的账号操作里带着管理员令牌。
+    # 和自动生成的密钥文件一样，agent 读、写、经聊天外传都拒绝。
+    secret_files: tuple[str, ...] = ()
+    # 只由平台自己的代码写的文件（glob）：agent 改写一律拒绝，也不能外传。state_files 自动算在内。
+    owned_files: tuple[str, ...] = ()
+    # 记着真实号码、审批下允许修改的文件（glob）：只是不能经聊天外传。配置文件自动算在内。
+    private_files: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.id_shape not in {ID_NUMERIC, ID_STRING}:
@@ -190,8 +247,26 @@ class PlatformDescriptor:
         missing = declared - {channel.kind for channel in self.channels}
         if missing:
             raise ValueError(f"platform {self.id!r} declares capabilities for kinds it has no channel for: {sorted(missing)}")
+        secret_names = [secret.name for secret in self.secrets]
+        if len(secret_names) != len(set(secret_names)):
+            raise ValueError(f"duplicate secret names in platform {self.id!r}")
+        secret_envs = [secret.env for secret in self.secrets if secret.env]
+        if len(secret_envs) != len(set(secret_envs)):
+            raise ValueError(f"duplicate secret env names in platform {self.id!r}")
+        for kind, patterns in (
+            ("secret_files", self.secret_files),
+            ("owned_files", self.owned_files),
+            ("private_files", self.private_files),
+        ):
+            for pattern in patterns:
+                check_workspace_glob(pattern, what=f"platform {self.id!r} {kind} entry")
+        misplaced = [pattern for pattern in self.secret_files if pattern.startswith(_CONFIG_DIR)]
+        if misplaced:
+            raise ValueError(f"platform {self.id!r} keeps secret files under config/: {misplaced}")
         object.__setattr__(self, "state_files", MappingProxyType(dict(self.state_files)))
         object.__setattr__(self, "hooks", MappingProxyType(dict(self.hooks)))
+        for name in ("secrets", "secret_files", "owned_files", "private_files"):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
 
     def names(self) -> frozenset[str]:
         return frozenset({self.id, *self.aliases, *(channel.name for channel in self.channels)})
@@ -199,6 +274,13 @@ class PlatformDescriptor:
     def channel(self, name: Any) -> ChannelDescriptor | None:
         key = normalize_name(name)
         return next((channel for channel in self.channels if channel.name == key), None)
+
+    def secret(self, name: str) -> SecretField:
+        """按名字取一项密钥的声明。没声明就是调用方写错了，直接抛。"""
+        for secret in self.secrets:
+            if secret.name == name:
+                return secret
+        raise KeyError(f"platform {self.id!r} declares no secret {name!r}")
 
     def public_dict(self) -> dict[str, Any]:
         """给控制台看的那一份：不含模块路径、环境变量名这类部署细节。"""

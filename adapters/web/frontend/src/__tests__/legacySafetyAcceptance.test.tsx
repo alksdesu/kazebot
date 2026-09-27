@@ -154,7 +154,7 @@ describe('editor identity and draft protection', () => {
   it('keeps the later selected node untouched by the previous node save', async () => {
     const request = deferred<void>();
     vi.mocked(api.getNodes).mockResolvedValue([]);
-    vi.mocked(api.getProviders).mockResolvedValue({ registered: [], providers: {}, active_provider: '', fallbacks: [], node_fallbacks: {} });
+    vi.mocked(api.getProviders).mockResolvedValue({ registered: [], providers: {}, active_provider: '', fallbacks: [], node_fallbacks: {}, reserved_names: [] });
     vi.mocked(api.getNodeRaw).mockImplementation(async (_, id) => `id: ${id}\nname: ${id}`);
     vi.mocked(api.updateNodeRaw).mockReturnValue(request.promise);
     useSettingsSelectionStore.setState({ selectedNode: { id: 'a', type: 'ai' } });
