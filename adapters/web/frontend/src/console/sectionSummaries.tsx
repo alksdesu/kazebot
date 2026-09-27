@@ -1,6 +1,9 @@
 // 折叠分区收起时那一行。一律读 bot 公布的生效值，不掺草稿 ——
 // 摘要回答的是「现在实际在跑什么」，待应用的改动由头上那个计数表达。
+import { connectionPeerName } from '../platforms/registry';
 import { useAppliedCount, useAppliedValue, useCapabilities, useConsoleStore, useLinkFacts } from './consoleStore';
+import { nameWith } from './format';
+import { usePlatform } from './platformContext';
 
 const GROUP_ROLE_GRANTS = new Set(['owner', 'group_admin']);
 
@@ -8,11 +11,12 @@ const joinFacts = (parts: (string | false | null | undefined)[]): string =>
   parts.filter(Boolean).join(' · ');
 
 export const AccountSummary = () => {
+  const peer = connectionPeerName(usePlatform());
   const live = useConsoleStore((state) => state.live);
   const link = useLinkFacts();
   const botAlive = Boolean(live?.published && !live.stale);
   if (!botAlive) return <>{live?.published ? '适配进程心跳中断' : '适配进程没在跑'}</>;
-  return <>{joinFacts(['适配进程在线', link.connected ? 'NapCat 已连接' : 'NapCat 未连接'])}</>;
+  return <>{joinFacts(['适配进程在线', nameWith(peer, link.connected ? '已连接' : '未连接')])}</>;
 };
 
 export const ChannelsSummary = () => {

@@ -19,6 +19,7 @@ import {
   setByPath,
   type ConfigConsoleStore,
 } from '../console/consoleStore';
+import { adoptPlatforms, QQ_NAPCAT, resetPlatforms, type PlatformDescriptor } from '../platforms/registry';
 
 const PATHS: Record<string, string> = {
   signal_at: 'trigger.signals.at',
@@ -704,6 +705,83 @@ describe('save', () => {
     expect(outcome).toEqual({ ok: true, message: '全局文件在保存之后又被改过，请刷新核对当前内容。' });
     expect(requests.some((line) => line.startsWith('PUT ') && line.endsWith('/features/config/raw'))).toBe(true);
     expect(requests.filter((line) => line.includes('/platforms/'))).toEqual([]);
+  });
+});
+
+// 应用了但 bot 一直不认账时，要告诉人去服务器上看哪个进程。哪个进程按平台清单说。
+describe('没确认生效的提示', () => {
+  const OTHERCHAT: PlatformDescriptor = {
+    id: 'otherchat',
+    displayName: 'OtherChat',
+    shortName: 'Other',
+    channels: [{ name: 'other_group', kind: 'group', hashed: true }],
+    hasConfig: true,
+    entrypoints: ['otherchat_bot.py'],
+    connectionPeer: 'OtherChat 网关',
+    connectionHint: '检查网关地址',
+  };
+
+  /** 应用一次，让 bot 十二轮都不认账，返回状态条上那句话。 */
+  const applyUnconfirmed = async (store: ConfigConsoleStore): Promise<string> => {
+    store.setState({
+      live: {
+        published: true,
+        applied: false,
+        file: { exists: true, mtime_ns: 1, size: 1 },
+        state: { values: { signal_name: false }, paths: PATHS },
+      },
+      draft: {},
+      notice: '',
+      error: '',
+    });
+    store.getState().setDraft('signal_name', true);
+    serveConfig({ signal_name: false }, { applied: false });
+
+    vi.useFakeTimers();
+    try {
+      const applying = store.getState().apply('token');
+      await vi.advanceTimersByTimeAsync(250 * 12 + 250);
+      await applying;
+    } finally {
+      vi.useRealTimers();
+    }
+    return store.getState().notice;
+  };
+
+  afterEach(resetPlatforms);
+
+  it('内置的 QQ 报它的入口脚本', async () => {
+    expect(await applyUnconfirmed(platformConsoleStore('qq'))).toBe(
+      '已应用，但 bot 没在 3 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程（bot.py）。',
+    );
+  });
+
+  it('后端新出的平台报它自己声明的入口脚本', async () => {
+    adoptPlatforms([QQ_NAPCAT, OTHERCHAT]);
+
+    expect(await applyUnconfirmed(platformConsoleStore('otherchat'))).toBe(
+      '已应用，但 bot 没在 3 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程（otherchat_bot.py）。',
+    );
+  });
+
+  it('没声明入口的平台不留空括号', async () => {
+    adoptPlatforms([QQ_NAPCAT, { ...OTHERCHAT, entrypoints: [] }]);
+
+    expect(await applyUnconfirmed(platformConsoleStore('otherchat'))).toBe(
+      '已应用，但 bot 没在 3 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程。',
+    );
+  });
+
+  it('清单里根本没有这个平台时也不留空括号', async () => {
+    expect(await applyUnconfirmed(platformConsoleStore('ghost'))).toBe(
+      '已应用，但 bot 没在 3 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程。',
+    );
+  });
+
+  it('全局设置那套话不跟着平台走', async () => {
+    expect(await applyUnconfirmed(configStore(FEATURES_SCOPE))).toBe(
+      '已保存，但有在跑的 bot 没在 3 秒内换上新文件，页面顶部列着是哪一个。',
+    );
   });
 });
 

@@ -1,6 +1,9 @@
-// 平台链路的实况：适配进程活没活、它和 NapCat 通没通。断一段 bot 就不说话。
+// 平台链路的实况：适配进程活没活、它和平台那头通没通。断一段 bot 就不说话。
+import { connectionPeerName } from '../platforms/registry';
 import { Block, List, Pip, Row } from './components';
 import { useConsoleStore, useLinkFacts, useRuntime } from './consoleStore';
+import { nameWith } from './format';
+import { usePlatform } from './platformContext';
 
 const Link = ({ name, state, detail }: { name: string; state: string; detail: string }) => (
   <div className="flex flex-wrap items-baseline gap-2.5">
@@ -11,12 +14,13 @@ const Link = ({ name, state, detail }: { name: string; state: string; detail: st
 );
 
 export const ConnectionCard = () => {
+  const platform = usePlatform();
   const live = useConsoleStore((state) => state.live);
   const runtime = useRuntime();
   const link = useLinkFacts();
 
   const botAlive = Boolean(live?.published && !live.stale);
-  const napcat = link.connected;
+  const linked = link.connected;
 
   return (
     <Block hint="两段链路，断一段 bot 就不说话" title="连接">
@@ -25,16 +29,16 @@ export const ConnectionCard = () => {
           <Pip tone={botAlive ? 'live' : 'halt'} />
           <Link
             detail={runtime.pid ? `pid ${runtime.pid}` : ''}
-            name="QQ 适配进程"
+            name={nameWith(platform.shortName, '适配进程')}
             state={botAlive ? '在线' : live?.published ? '心跳中断' : '没在跑'}
           />
         </Row>
         <Row>
-          <Pip tone={napcat ? 'live' : botAlive ? 'halt' : 'idle'} />
+          <Pip tone={linked ? 'live' : botAlive ? 'halt' : 'idle'} />
           <Link
-            detail={botAlive ? '' : '适配进程没在跑，这一项无从判断'}
-            name="NapCat"
-            state={!botAlive ? '未知' : napcat ? '已连接' : '未连接'}
+            detail={!botAlive ? '适配进程没在跑，这一项无从判断' : linked ? '' : platform.connectionHint}
+            name={connectionPeerName(platform)}
+            state={!botAlive ? '未知' : linked ? '已连接' : '未连接'}
           />
         </Row>
       </List>

@@ -33,6 +33,7 @@ QQ_NAPCAT = PlatformDescriptor(
     display_name="QQ · NapCat",
     short_name="QQ",
     connection_hint="检查 NapCat 登录与反向 WebSocket 地址",
+    connection_peer="NapCat",
     aliases=frozenset({"onebot", "onebot11"}),
     channels=(
         ChannelDescriptor("qq_group", CHANNEL_GROUP),

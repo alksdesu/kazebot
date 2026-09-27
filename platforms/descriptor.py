@@ -245,6 +245,8 @@ class PlatformDescriptor:
     short_name: str
     # 诊断里「连接」这一项没通过时让人先查什么；空串用通用的说法。
     connection_hint: str = ""
+    # 适配进程要连上的那一端怎么称呼，控制台的连接卡片上这么写；空串写「平台」。
+    connection_peer: str = ""
     # platform_auth.platform 的历史取值，读到它们都算这个平台。
     aliases: frozenset[str] = frozenset()
     channels: tuple[ChannelDescriptor, ...] = ()
@@ -378,4 +380,8 @@ class PlatformDescriptor:
             "has_config": bool(self.config_path),
             "hooks": sorted(self.hooks),
             "capabilities": self.capabilities.public_dict(),
+            # 控制台提示人去服务器上查哪个进程、它该连着谁时要用。
+            "entrypoints": list(self.entrypoints),
+            "connection_peer": self.connection_peer,
+            "connection_hint": self.connection_hint,
         }

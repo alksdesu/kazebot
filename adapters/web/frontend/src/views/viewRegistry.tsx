@@ -17,7 +17,7 @@ import { SettingsHeader } from '../components/settings/SettingsHeader';
 import { SettingsPageHost } from '../components/settings/SettingsPageHost';
 import { SettingsRightPanel } from '../components/settings/SettingsRightPanel';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
-import { getSettingsTab } from '../components/settings/settingsTabs';
+import { resolveSettingsTab } from '../components/settings/settingsTabs';
 import type { ConversationMeta } from '../store/chatStore';
 import type { ViewMode } from '../store/viewStore';
 import type { Attachment } from '../types';
@@ -135,7 +135,11 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
     header: () => <SettingsHeader />,
     main: () => <SettingsPageHost />,
     rightTop: () => <SettingsRightPanel />,
-    hasRightPanel: (ctx) => Boolean(getSettingsTab(ctx.activeSettingsTab || 'general').RightPanel),
+    hasRightPanel: (ctx) => {
+      // 和 SettingsRightPanel 同一个判法：平台清单没到时不留右栏。
+      const { tab, pending } = resolveSettingsTab(ctx.activeSettingsTab || 'general');
+      return !pending && Boolean(tab.RightPanel);
+    },
     // [2026-06-02] Settings no longer reserves a lower EventLog slot. Why: contextual
     // settings editors need the full right rail, especially on narrow screens. How:
     // leave rightBottom undefined for settings while chat keeps EventLogPanel. Purpose:

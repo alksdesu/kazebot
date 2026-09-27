@@ -30,7 +30,7 @@ import {
   updateSkillRaw,
   updateToolRaw,
 } from '../api/supervisorClient';
-import { settingsTabs } from '../components/settings/settingsTabs';
+import { currentSettingsTabs } from '../components/settings/settingsTabs';
 import { inferToolRisk } from '../utils/toolRisk';
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -42,7 +42,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 describe('expanded settings registry', () => {
   it('registers all P0 and P1 settings tabs in order', () => {
-    expect(settingsTabs.map((tab) => tab.id)).toEqual([
+    expect(currentSettingsTabs().map((tab) => tab.id)).toEqual([
       'general',
       'client',
       'runtime',
@@ -70,26 +70,26 @@ describe('expanded settings registry', () => {
       // 平台组：一个平台一页，分区在页内折叠。
       'platform-qq',
     ]);
-    expect(settingsTabs.find((tab) => tab.id === 'system')).toMatchObject({ label: '系统', icon: 'settings_power', order: 4 });
-    expect(settingsTabs.find((tab) => tab.id === 'tools')).toMatchObject({ label: '工具与权限', icon: 'build', order: 8 });
+    expect(currentSettingsTabs().find((tab) => tab.id === 'system')).toMatchObject({ label: '系统', icon: 'settings_power', order: 4 });
+    expect(currentSettingsTabs().find((tab) => tab.id === 'tools')).toMatchObject({ label: '工具与权限', icon: 'build', order: 8 });
   });
 
   it('每个 tab 都归了组，侧栏才摆得下二十多项', () => {
-    expect(settingsTabs.every((tab) => tab.group)).toBe(true);
+    expect(currentSettingsTabs().every((tab) => tab.group)).toBe(true);
   });
 
   it('id 不重复 —— 撞了的那个会被 getSettingsTab 永久遮住', () => {
-    const ids = settingsTabs.map((tab) => tab.id);
+    const ids = currentSettingsTabs().map((tab) => tab.id);
     expect(new Set(ids).size).toBe(ids.length);
   });
 
   it('order 不重复 —— 同号时谁排前面全看数组顺序，哪一组加一页就可能悄悄换位', () => {
-    const orders = settingsTabs.map((tab) => tab.order);
+    const orders = currentSettingsTabs().map((tab) => tab.order);
     expect(new Set(orders).size).toBe(orders.length);
   });
 
   it('label 也不重复 —— 侧栏两行同名没法选', () => {
-    const labels = settingsTabs.map((tab) => tab.label);
+    const labels = currentSettingsTabs().map((tab) => tab.label);
     expect(new Set(labels).size).toBe(labels.length);
   });
 });

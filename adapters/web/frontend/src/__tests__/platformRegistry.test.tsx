@@ -1,6 +1,6 @@
 // 通用组件不再写死 QQ：会话种类、本地备注和按钮色调都要认注册表。
 import { cleanup, render, screen } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import * as common from '../components/common';
 import { Button } from '../components/settings/pages/settingsControls';
@@ -8,11 +8,16 @@ import { aliasKey, readAliases, writeAlias } from '../console/aliases';
 import { conversationNames } from '../features/conversationNames';
 import {
   adoptPlatforms,
+  connectionPeerName,
   conversationKindForScope,
+  entrypointNote,
   isConversationScope,
   looksLikeScopeKey,
   platformForScope,
+  platformRegistryState,
   resetPlatforms,
+  settlePlatforms,
+  subscribePlatforms,
   QQ_NAPCAT,
   type PlatformDescriptor,
 } from '../platforms/registry';
@@ -26,6 +31,9 @@ const TELEGRAM: PlatformDescriptor = {
     { name: 'tg_private', kind: 'private', hashed: true },
   ],
   hasConfig: true,
+  entrypoints: ['telegram_bot.py'],
+  connectionPeer: 'Telegram Bot API',
+  connectionHint: '检查 bot token 与出网代理',
 };
 
 describe('平台注册表', () => {
@@ -53,6 +61,108 @@ describe('平台注册表', () => {
 
     adoptPlatforms([]);
     expect(conversationKindForScope('tg_group:abc')).toBe('group');
+  });
+});
+
+describe('平台清单的订阅', () => {
+  const watchers: (() => void)[] = [];
+
+  const watch = () => {
+    const seen = vi.fn();
+    watchers.push(subscribePlatforms(seen));
+    return seen;
+  };
+
+  afterEach(() => {
+    while (watchers.length) watchers.pop()!();
+    resetPlatforms();
+  });
+
+  it('清单没到之前给的是内置那份', () => {
+    expect(platformRegistryState().platforms).toEqual([QQ_NAPCAT]);
+    expect(platformRegistryState().settled).toBe(false);
+  });
+
+  it('换清单时整份换掉：订阅方按引用比，引用没变就是没变', () => {
+    const before = platformRegistryState();
+    const seen = watch();
+
+    adoptPlatforms([QQ_NAPCAT, TELEGRAM]);
+
+    const after = platformRegistryState();
+    expect(seen).toHaveBeenCalledTimes(1);
+    expect(after).not.toBe(before);
+    expect(after.platforms).not.toBe(before.platforms);
+    expect(after.settled).toBe(true);
+  });
+
+  it('退订之后不再收到通知', () => {
+    const seen = vi.fn();
+    const stop = subscribePlatforms(seen);
+
+    adoptPlatforms([QQ_NAPCAT, TELEGRAM]);
+    stop();
+    resetPlatforms();
+
+    expect(seen).toHaveBeenCalledTimes(1);
+  });
+
+  it('空清单不换内置那份，但不用再等了', () => {
+    const seen = watch();
+
+    adoptPlatforms([]);
+
+    expect(platformRegistryState().platforms).toEqual([QQ_NAPCAT]);
+    expect(platformRegistryState().settled).toBe(true);
+    expect(seen).toHaveBeenCalledTimes(1);
+  });
+
+  it('settle 幂等：到过一次就不再惊动订阅方', () => {
+    settlePlatforms();
+    const seen = watch();
+
+    settlePlatforms();
+    settlePlatforms();
+
+    expect(seen).not.toHaveBeenCalled();
+  });
+
+  it('adopt 过之后再 settle 也不重复通知，清单也不退回内置的', () => {
+    adoptPlatforms([QQ_NAPCAT, TELEGRAM]);
+    const seen = watch();
+
+    settlePlatforms();
+
+    expect(seen).not.toHaveBeenCalled();
+    expect(platformRegistryState().platforms).toEqual([QQ_NAPCAT, TELEGRAM]);
+  });
+
+  it('reset 回到内置那份，并且重新开始等清单', () => {
+    adoptPlatforms([QQ_NAPCAT, TELEGRAM]);
+    const seen = watch();
+
+    resetPlatforms();
+
+    expect(seen).toHaveBeenCalledTimes(1);
+    expect(platformRegistryState().platforms).toEqual([QQ_NAPCAT]);
+    expect(platformRegistryState().settled).toBe(false);
+  });
+});
+
+describe('平台文案零件', () => {
+  it('入口脚本写成一段括号，多个用顿号连', () => {
+    expect(entrypointNote(QQ_NAPCAT)).toBe('（bot.py）');
+    expect(entrypointNote({ ...TELEGRAM, entrypoints: ['bot.py', 'tg.py'] })).toBe('（bot.py、tg.py）');
+  });
+
+  it('没声明入口就整段不出现，不留一个空括号', () => {
+    expect(entrypointNote({ ...TELEGRAM, entrypoints: [] })).toBe('');
+  });
+
+  it('没说连的是谁就叫「平台」', () => {
+    expect(connectionPeerName(QQ_NAPCAT)).toBe('NapCat');
+    expect(connectionPeerName(TELEGRAM)).toBe('Telegram Bot API');
+    expect(connectionPeerName({ ...TELEGRAM, connectionPeer: '' })).toBe('平台');
   });
 });
 

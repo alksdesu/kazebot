@@ -1,5 +1,6 @@
 // 控制台各页在设置侧栏里的登记项。页面本体只写内容，外壳由这里统一套：
-// 平台页走 PlatformPage（状态栏 + 连接卡 + 折叠分区，分区来自后端 schema），机器人页与模型页走通用素壳。
+// 平台页按平台清单生成，走 PlatformPage（状态栏 + 连接卡 + 折叠分区，分区来自后端 schema），机器人页与模型页走通用素壳。
+import { Empty } from '../components/settings/pages/settingsControls';
 import { DiagnosticsPanel } from '../features/operations/DiagnosticsPanel';
 import { PlainPage } from './components';
 import { FEATURES_SCOPE, type ConfigScope } from './configScope';
@@ -12,10 +13,11 @@ import { PersonaPage } from './PersonaPage';
 import { PlatformPage } from './PlatformPage';
 import { ProvidersPage } from './ProvidersPage';
 import { QQ_PARTS } from './qqParts';
-import type { PageParts } from './sectionParts';
+import { NO_PARTS, type PageParts } from './sectionParts';
 import type { SectionPick } from './sectionPick';
 import { StickersPage } from './StickersPage';
 import { QQ_NAPCAT, type PlatformDescriptor } from '../platforms/registry';
+import { usePlatformRegistryState } from '../platforms/usePlatformRegistry';
 
 export interface ConsolePageDefinition {
   /** 设置页 tab id。改名要在 settingsTabAliases 里留一条别名，老书签才不会失效。 */
@@ -89,33 +91,72 @@ export interface PlatformPageDefinition {
   label: string;
   icon: string;
   note: string;
-  platform: PlatformDescriptor;
-  /** 分区里前端自己画的部分。分区、字段和说明本身来自后端 schema。 */
-  parts: PageParts;
+  platformId: string;
 }
 
-export const PLATFORM_PAGES: PlatformPageDefinition[] = [
-  {
-    id: 'platform-qq',
-    label: QQ_NAPCAT.displayName,
-    icon: 'inbox',
-    platform: QQ_NAPCAT,
-    parts: QQ_PARTS,
-    note: 'bot 在 QQ 上怎么收发消息。改完点顶部的「应用」写进配置文件，状态条会显示 bot 有没有读到这一份。',
-  },
-];
+const PLATFORM_PAGE_PREFIX = 'platform-';
 
-/** 一个平台一页。分区在页内折叠，深链靠 ?section= 定位。 */
-export function wrapPlatformPage({ note, parts, platform }: PlatformPageDefinition): () => JSX.Element {
-  const Wrapped = () => (
+export const DEFAULT_PLATFORM_ICON = 'inbox';
+
+export const platformPageId = (platformId: string): string => `${PLATFORM_PAGE_PREFIX}${platformId}`;
+
+export const isPlatformPageId = (tabId: string): boolean => tabId.startsWith(PLATFORM_PAGE_PREFIX);
+
+/** 前端给个别平台补的东西。没登记的平台照样有页，分区和字段全按后端 schema 画。 */
+interface PlatformPageExtras {
+  icon?: string;
+  /** 分区里前端自己画的部分：摘要和编不成字段的块。 */
+  parts?: PageParts;
+}
+
+const PLATFORM_PAGE_EXTRAS: Readonly<Record<string, PlatformPageExtras>> = {
+  [QQ_NAPCAT.id]: { parts: QQ_PARTS },
+};
+
+const platformNote = (platform: PlatformDescriptor): string =>
+  `bot 在 ${platform.shortName} 上怎么收发消息。改完点顶部的「应用」写进配置文件，状态条会显示 bot 有没有读到这一份。`;
+
+/** 平台组：有配置文件的平台一个一页，跟着平台清单走。 */
+export function platformPages(platforms: readonly PlatformDescriptor[]): PlatformPageDefinition[] {
+  return platforms
+    .filter((platform) => platform.hasConfig)
+    .map((platform) => ({
+      id: platformPageId(platform.id),
+      label: platform.displayName,
+      icon: PLATFORM_PAGE_EXTRAS[platform.id]?.icon || DEFAULT_PLATFORM_ICON,
+      note: platformNote(platform),
+      platformId: platform.id,
+    }));
+}
+
+const PlatformPageById = ({ platformId }: { platformId: string }) => {
+  const platform = usePlatformRegistryState().platforms.find((row) => row.id === platformId);
+  if (!platform) {
+    return (
+      <PlainPage eyebrow="平台" note="后端公布的平台清单里没有这个平台。" title={platformId}>
+        <Empty>平台清单里已经没有「{platformId}」了，可能是后端换了版本。从侧栏重新进一个平台页。</Empty>
+      </PlainPage>
+    );
+  }
+  return (
     <PlatformPage
       connection={<><ConnectionCard /><DiagnosticsPanel /></>}
-      note={note}
-      parts={parts}
+      note={platformNote(platform)}
+      parts={PLATFORM_PAGE_EXTRAS[platform.id]?.parts || NO_PARTS}
       platform={platform}
     />
   );
-  Wrapped.displayName = `PlatformPage(${platform.displayName})`;
+};
+
+const platformPageComponents = new Map<string, () => JSX.Element>();
+
+/** 一个平台一页，组件按平台 id 缓存：清单换一份时同一个平台还是同一个组件，页面不会重新挂载。 */
+export function platformPageComponent(platformId: string): () => JSX.Element {
+  const cached = platformPageComponents.get(platformId);
+  if (cached) return cached;
+  const Wrapped = () => <PlatformPageById platformId={platformId} />;
+  Wrapped.displayName = `PlatformPage(${platformId})`;
+  platformPageComponents.set(platformId, Wrapped);
   return Wrapped;
 }
 

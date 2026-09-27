@@ -1,8 +1,9 @@
 import { useViewStore } from '../../store/viewStore';
-import { getSettingsTab } from './settingsTabs';
+import { useResolvedSettingsTab } from './settingsTabs';
 
 export const SettingsRightPanel = () => {
   const activeSettingsTab = useViewStore(state => state.activeSettingsTab);
-  const RightPanel = getSettingsTab(activeSettingsTab).RightPanel;
+  const { tab, pending } = useResolvedSettingsTab(activeSettingsTab);
+  const RightPanel = pending ? undefined : tab.RightPanel;
   return RightPanel ? <RightPanel /> : null;
 };

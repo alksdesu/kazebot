@@ -7,7 +7,7 @@ import { Header, Sidebar } from '../components/layout';
 import { SettingsRightPanel } from '../components/settings/SettingsRightPanel';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
 import { SystemSettingsPage } from '../components/settings/pages/SystemSettingsPage';
-import { settingsTabs } from '../components/settings/settingsTabs';
+import { currentSettingsTabs } from '../components/settings/settingsTabs';
 import { useChatStore, type ConversationMeta } from '../store/chatStore';
 import { useSettingsSelectionStore } from '../store/settingsSelectionStore';
 import { useSettingsStore } from '../store/settingsStore';
@@ -180,11 +180,11 @@ describe('老控制台链接', () => {
 
   it('「运行」不能直译：设置页已经有一个 runtime 了', () => {
     expect(locationForLegacyDomain('runtime')).toEqual({ tab: 'platform-qq', section: 'link' });
-    expect(settingsTabs.filter(tab => tab.id === 'runtime')).toHaveLength(1);
+    expect(currentSettingsTabs().filter(tab => tab.id === 'runtime')).toHaveLength(1);
   });
 
   it('换算出来的每个 id 都真的注册过', () => {
-    const ids = new Set(settingsTabs.map(tab => tab.id));
+    const ids = new Set(currentSettingsTabs().map(tab => tab.id));
     for (const domain of ['account', 'channels', 'timing', 'permissions', 'persona',
       'providers', 'models', 'runtime', 'memory', 'stickers']) {
       expect(ids.has(tabForLegacyDomain(domain))).toBe(true);

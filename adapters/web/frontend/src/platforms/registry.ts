@@ -20,6 +20,12 @@ export interface PlatformDescriptor {
   shortName: string;
   channels: ChannelDescriptor[];
   hasConfig: boolean;
+  /** 平台进程的入口脚本（相对工作区），提示人去服务器上找哪个进程时用。 */
+  entrypoints: string[];
+  /** 适配进程要连上的那一端，连接卡片上这么称呼它；空串时叫「平台」。 */
+  connectionPeer: string;
+  /** 连不上时让人先查什么；空串就不提示。 */
+  connectionHint: string;
 }
 
 export const QQ_NAPCAT: PlatformDescriptor = {
@@ -33,12 +39,29 @@ export const QQ_NAPCAT: PlatformDescriptor = {
     { name: 'qq_unknown', kind: 'other', hashed: true },
   ],
   hasConfig: true,
+  entrypoints: ['bot.py'],
+  connectionPeer: 'NapCat',
+  connectionHint: '检查 NapCat 登录与反向 WebSocket 地址',
 };
 
 const BUILTIN_PLATFORMS: readonly PlatformDescriptor[] = [QQ_NAPCAT];
 
-let platforms: readonly PlatformDescriptor[] = BUILTIN_PLATFORMS;
-let channelIndex = buildIndex(platforms);
+export interface PlatformRegistryState {
+  platforms: readonly PlatformDescriptor[];
+  /** 后端的清单到了，或者确定拿不到了。到之前认不出的平台页，可能只是清单还在路上。 */
+  settled: boolean;
+}
+
+let state: PlatformRegistryState = { platforms: BUILTIN_PLATFORMS, settled: false };
+let channelIndex = buildIndex(state.platforms);
+const listeners = new Set<() => void>();
+
+// 每次整份换掉：订阅方按引用比，引用没变就是没变。
+function publish(next: PlatformRegistryState): void {
+  state = next;
+  channelIndex = buildIndex(next.platforms);
+  for (const listener of listeners) listener();
+}
 
 function buildIndex(rows: readonly PlatformDescriptor[]): Map<string, { platform: PlatformDescriptor; channel: ChannelDescriptor }> {
   const index = new Map<string, { platform: PlatformDescriptor; channel: ChannelDescriptor }>();
@@ -49,23 +72,49 @@ function buildIndex(rows: readonly PlatformDescriptor[]): Map<string, { platform
 }
 
 export function allPlatforms(): readonly PlatformDescriptor[] {
-  return platforms;
+  return state.platforms;
 }
 
 export function getPlatform(id: string): PlatformDescriptor | null {
-  return platforms.find((platform) => platform.id === id) || null;
+  return state.platforms.find((platform) => platform.id === id) || null;
+}
+
+export function platformRegistryState(): PlatformRegistryState {
+  return state;
+}
+
+export function subscribePlatforms(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
 }
 
 /** 换上后端公布的清单。空清单一律忽略：认不出通道会让整张会话列表退化成「会话」。 */
 export function adoptPlatforms(rows: readonly PlatformDescriptor[]): void {
-  if (!rows.length) return;
-  platforms = rows;
-  channelIndex = buildIndex(platforms);
+  if (!rows.length) {
+    settlePlatforms();
+    return;
+  }
+  publish({ platforms: rows, settled: true });
+}
+
+/** 清单拿不到：接着用内置的那份，但不用再等了。 */
+export function settlePlatforms(): void {
+  if (!state.settled) publish({ ...state, settled: true });
 }
 
 export function resetPlatforms(): void {
-  platforms = BUILTIN_PLATFORMS;
-  channelIndex = buildIndex(platforms);
+  publish({ platforms: BUILTIN_PLATFORMS, settled: false });
+}
+
+/** 接在「适配器进程」后面的入口脚本，写成「（bot.py）」；平台没声明时是空串。 */
+export function entrypointNote(platform: PlatformDescriptor): string {
+  return platform.entrypoints.length ? `（${platform.entrypoints.join('、')}）` : '';
+}
+
+export function connectionPeerName(platform: PlatformDescriptor): string {
+  return platform.connectionPeer || '平台';
 }
 
 /** 会话键前缀 → 平台与通道。认不出返回 null，调用方据此退到 owner 上报的种类。

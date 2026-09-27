@@ -7,7 +7,7 @@ import { useSettingsStore } from '../../store/settingsStore';
 import { WorkspaceNav } from '../../features/WorkspaceNav';
 import { useViewStore } from '../../store/viewStore';
 import { Icon } from '../common';
-import { getSettingsTab, SETTINGS_GROUP_LABELS, SETTINGS_GROUP_ORDER, settingsTabs, type SettingsTabDefinition } from './settingsTabs';
+import { SETTINGS_GROUP_LABELS, SETTINGS_GROUP_ORDER, useResolvedSettingsTab, useSettingsTabs, type SettingsTabDefinition } from './settingsTabs';
 
 interface VisibleTab {
   tab: SettingsTabDefinition;
@@ -22,17 +22,19 @@ export const SettingsSidebar = () => {
   const loadSchema = useSchemaStore(state => state.load);
   const { activeSettingsTab, closeSettings, setSettingsTab, viewMode } = useViewStore();
   const [search, setSearch] = useState('');
-  const selectedTab = getSettingsTab(activeSettingsTab).id;
+  const tabs = useSettingsTabs();
+  const resolved = useResolvedSettingsTab(activeSettingsTab);
+  const selectedTab = resolved.pending ? '' : resolved.tab.id;
   // 分区和字段名只在 schema 里，一登录就把各页的拉下来，没打开过的页也搜得到。
   useEffect(() => {
     if (!token) return;
-    for (const tab of settingsTabs) {
+    for (const tab of tabs) {
       if (tab.configScope) void loadSchema(token, tab.configScope);
     }
-  }, [loadSchema, token]);
+  }, [loadSchema, tabs, token]);
   const visible = useMemo<VisibleTab[]>(() => {
     const query = search.trim().toLocaleLowerCase();
-    return settingsTabs.flatMap(tab => {
+    return tabs.flatMap(tab => {
       const schema = tab.configScope ? schemas[tab.configScope.id] : undefined;
       const sections = query && schema
         ? searchableSections(schema).filter(section => picksSection(tab.sections, section.id) && section.text.includes(query))
@@ -40,7 +42,7 @@ export const SettingsSidebar = () => {
       const tabHit = `${tab.label} ${SETTINGS_GROUP_LABELS[tab.group || 'basics']} ${tab.id}`.toLocaleLowerCase().includes(query);
       return tabHit || sections.length ? [{ tab, sections }] : [];
     });
-  }, [schemas, search]);
+  }, [schemas, search, tabs]);
   return <div className="flex h-full min-h-0 flex-col">
     <div className="border-b border-[var(--duties-border)] p-4">
       <button className="mb-3 inline-flex min-h-10 items-center gap-2 text-sm text-[var(--duties-secondary)] hover:text-[var(--duties-text)]" onClick={closeSettings} type="button"><Icon name="arrow_back" size={18} />返回聊天</button>

@@ -14,7 +14,7 @@ export interface SectionParts {
 /** 分区 id → 这个分区的前端部分。 */
 export type PageParts = Readonly<Record<string, SectionParts>>;
 
-const NO_PARTS: PageParts = Object.freeze({});
+export const NO_PARTS: PageParts = Object.freeze({});
 
 const PartsContext = createContext<PageParts>(NO_PARTS);
 

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ReactNode } from 'react';
 
 import * as api from '../api/supervisorClient';
-import type { ConfigLiveState, ConfigSource, ConsoleFieldSchema, ConsoleNode } from '../api/supervisorClient';
+import type { ConfigLiveState, ConfigSource, ConsoleFieldSchema, ConsoleNode, PlatformSummary } from '../api/supervisorClient';
 import { ConfigScopeProvider, FEATURES_SCOPE, platformScope, type ConfigScope } from '../console/configScope';
 import { configStore, platformConsoleStore } from '../console/consoleStore';
 import { SchemaFields } from '../console/FieldRenderer';
@@ -28,6 +28,9 @@ const TELEGRAM: PlatformDescriptor = {
   shortName: 'TG',
   channels: [{ name: 'tg_group', kind: 'group', hashed: true }],
   hasConfig: true,
+  entrypoints: ['telegram_bot.py'],
+  connectionPeer: 'Telegram Bot API',
+  connectionHint: '检查 bot token 与出网代理',
 };
 
 const live = (values: Record<string, unknown>, paths: Record<string, string>): ConfigLiveState => ({
@@ -445,19 +448,25 @@ describe('schema 缓存', () => {
   });
 });
 
+// 旧后端公布的一行：没有 entrypoints / connection_peer / connection_hint。
+const TG_ROW: PlatformSummary = {
+  id: 'telegram',
+  display_name: 'Telegram',
+  short_name: 'TG',
+  id_shape: 'string',
+  channels: [{ name: 'tg_group', kind: 'group', hashed: true }],
+  has_config: true,
+  hooks: [],
+};
+
 describe('平台清单', () => {
   it('后端公布的描述换掉内置那份，认不出的通道种类丢掉', () => {
     const descriptor = toDescriptor({
-      id: 'telegram',
-      display_name: 'Telegram',
-      short_name: 'TG',
-      id_shape: 'string',
+      ...TG_ROW,
       channels: [
         { name: 'tg_group', kind: 'group', hashed: true },
         { name: 'tg_weird', kind: 'nonsense', hashed: true },
       ],
-      has_config: true,
-      hooks: [],
     });
 
     expect(descriptor).toMatchObject({ id: 'telegram', displayName: 'Telegram', shortName: 'TG' });
@@ -466,5 +475,50 @@ describe('平台清单', () => {
 
   it('缺 id 的行直接丢掉，不会拿一个空前缀去认会话键', () => {
     expect(toDescriptor({ id: '' } as never)).toBeNull();
+  });
+
+  it('入口脚本、连的是谁、连不上先查什么，都按后端公布的收', () => {
+    const descriptor = toDescriptor({
+      ...TG_ROW,
+      entrypoints: ['telegram_bot.py', 'tg_worker.py'],
+      connection_peer: 'Telegram Bot API',
+      connection_hint: '检查 bot token 与出网代理',
+    });
+
+    expect(descriptor).toMatchObject({
+      entrypoints: ['telegram_bot.py', 'tg_worker.py'],
+      connectionPeer: 'Telegram Bot API',
+      connectionHint: '检查 bot token 与出网代理',
+    });
+  });
+
+  it('旧后端没这三项，取空值 —— 界面少画一段，不是画出 undefined', () => {
+    const descriptor = toDescriptor(TG_ROW);
+
+    expect(descriptor!.entrypoints).toEqual([]);
+    expect(descriptor!.connectionPeer).toBe('');
+    expect(descriptor!.connectionHint).toBe('');
+  });
+
+  it('入口清单里的空串和非字符串丢掉，提示里不会冒出空的一项', () => {
+    const descriptor = toDescriptor({
+      ...TG_ROW,
+      entrypoints: ['telegram_bot.py', '', null, 7, { path: 'x' }] as never,
+    });
+
+    expect(descriptor!.entrypoints).toEqual(['telegram_bot.py']);
+  });
+
+  it('对端和提示不是字符串就当没给', () => {
+    const descriptor = toDescriptor({
+      ...TG_ROW,
+      entrypoints: 'telegram_bot.py' as never,
+      connection_peer: 42 as never,
+      connection_hint: { text: '查 token' } as never,
+    });
+
+    expect(descriptor!.entrypoints).toEqual([]);
+    expect(descriptor!.connectionPeer).toBe('');
+    expect(descriptor!.connectionHint).toBe('');
   });
 });

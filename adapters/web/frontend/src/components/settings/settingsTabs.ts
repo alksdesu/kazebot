@@ -12,11 +12,19 @@ import { platformScope, type ConfigScope } from '../../console/configScope';
 import {
   BOT_PAGES,
   MODEL_PAGES,
-  PLATFORM_PAGES,
+  isPlatformPageId,
+  platformPageComponent,
+  platformPages,
   wrapConsolePage,
-  wrapPlatformPage,
 } from '../../console/pages';
 import type { SectionPick } from '../../console/sectionPick';
+import {
+  allPlatforms,
+  platformRegistryState,
+  type PlatformDescriptor,
+  type PlatformRegistryState,
+} from '../../platforms/registry';
+import { usePlatformRegistryState } from '../../platforms/usePlatformRegistry';
 import { resolveSettingsTabId } from './settingsTabAliases';
 import { ClientSettingsPage } from './pages/ClientSettingsPage';
 import { GeneralSettingsPage } from './pages/GeneralSettingsPage';
@@ -128,24 +136,67 @@ const MODEL_TABS: SettingsTabDefinition[] = MODEL_PAGES.map((page, index) => ({
   Page: wrapConsolePage(SETTINGS_GROUP_LABELS.models, page),
 }));
 
-const PLATFORM_TABS: SettingsTabDefinition[] = PLATFORM_PAGES.map((page, index) => ({
-  id: page.id,
-  label: page.label,
-  icon: page.icon,
-  group: 'platform',
-  order: 40 + index,
-  configScope: platformScope(page.platform.id),
-  Page: wrapPlatformPage(page),
-}));
+function platformTabs(platforms: readonly PlatformDescriptor[]): SettingsTabDefinition[] {
+  return platformPages(platforms).map((page, index) => ({
+    id: page.id,
+    label: page.label,
+    icon: page.icon,
+    group: 'platform',
+    order: 40 + index,
+    configScope: platformScope(page.platformId),
+    Page: platformPageComponent(page.platformId),
+  }));
+}
 
-export const settingsTabs: SettingsTabDefinition[] = [...CORE_TABS, ...BOT_TABS, ...MODEL_TABS, ...PLATFORM_TABS]
-  .sort((a, b) => a.order - b.order);
+const FIXED_TABS: SettingsTabDefinition[] = [...CORE_TABS, ...BOT_TABS, ...MODEL_TABS];
 
-export function getSettingsTab(tabId: string): SettingsTabDefinition {
+let built: { platforms: readonly PlatformDescriptor[]; tabs: SettingsTabDefinition[] } | null = null;
+
+/** 侧栏、页面宿主、右侧面板共用的页签表。平台组跟着平台清单生成，清单没换就还是同一个数组。 */
+export function settingsTabsFor(platforms: readonly PlatformDescriptor[]): SettingsTabDefinition[] {
+  if (built?.platforms !== platforms) {
+    built = { platforms, tabs: [...FIXED_TABS, ...platformTabs(platforms)].sort((a, b) => a.order - b.order) };
+  }
+  return built.tabs;
+}
+
+/** 组件外按眼下的平台清单取。组件里用 useSettingsTabs，清单换了才跟着重画。 */
+export function currentSettingsTabs(): SettingsTabDefinition[] {
+  return settingsTabsFor(allPlatforms());
+}
+
+export function useSettingsTabs(): SettingsTabDefinition[] {
+  return settingsTabsFor(usePlatformRegistryState().platforms);
+}
+
+export function getSettingsTab(
+  tabId: string,
+  tabs: readonly SettingsTabDefinition[] = currentSettingsTabs(),
+): SettingsTabDefinition {
   // [2026-06-01] Unknown tab ids fall back to the first registered settings page.
   // Why: stale links or future removed tabs should not blank the settings view. How:
-  // resolve through the registry and return settingsTabs[0] as a safe default.
+  // resolve through the registry and return the first tab as a safe default.
   // Purpose: the host and right panel share identical fallback behavior.
   const resolved = resolveSettingsTabId(tabId);
-  return settingsTabs.find(tab => tab.id === resolved) || settingsTabs[0];
+  return tabs.find(tab => tab.id === resolved) || tabs[0];
+}
+
+export interface ResolvedSettingsTab {
+  tab: SettingsTabDefinition;
+  /** 要的是个平台页而平台清单还没到：认不出不代表没有，先别退回第一页。 */
+  pending: boolean;
+}
+
+/** 组件外按眼下的平台清单解析；组件里用 useResolvedSettingsTab，两边同一个判法。 */
+export function resolveSettingsTab(
+  tabId: string,
+  registry: PlatformRegistryState = platformRegistryState(),
+): ResolvedSettingsTab {
+  const tab = getSettingsTab(tabId, settingsTabsFor(registry.platforms));
+  const resolved = resolveSettingsTabId(tabId);
+  return { tab, pending: !registry.settled && tab.id !== resolved && isPlatformPageId(resolved) };
+}
+
+export function useResolvedSettingsTab(tabId: string): ResolvedSettingsTab {
+  return resolveSettingsTab(tabId, usePlatformRegistryState());
 }

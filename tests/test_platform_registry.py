@@ -210,9 +210,34 @@ class TestRegistration:
         assert public["id"] == "qq" and public["has_config"] is True
         assert "config_env" not in public and "adapters._shared.trigger_policy" not in json.dumps(public)
         assert "state_env" not in public and "ONEBOT_STATE_FILE" not in json.dumps(public)
-        # 端口和入口脚本都是部署细节，控制台按不上用场，露出去只是多告诉人一件事。
+        # 端口是部署细节，控制台按不上用场，露出去只是多告诉人一件事。
         assert "instance_ports" not in public and "8080" not in json.dumps(public)
-        assert "entrypoints" not in public and "bot.py" not in json.dumps(public)
+
+    def test_a_platform_names_the_process_it_connects_to(self) -> None:
+        assert QQ_NAPCAT.connection_peer == "NapCat"
+        assert PlatformDescriptor(id="plain", display_name="Plain", short_name="P").connection_peer == ""
+
+    def test_the_public_view_carries_the_connection_card(self) -> None:
+        # 控制台照这三项提示人去服务器上查哪个进程、它该连着谁，原先 bot.py 是写死在文案里的。
+        public = json.loads(json.dumps(QQ_NAPCAT.public_dict()))
+
+        assert public["entrypoints"] == ["bot.py"]
+        assert public["connection_peer"] == "NapCat"
+        assert public["connection_hint"] == "检查 NapCat 登录与反向 WebSocket 地址"
+        assert isinstance(QQ_NAPCAT.public_dict()["entrypoints"], list)
+
+    def test_the_public_view_hands_out_its_own_list(self) -> None:
+        # 接口每次调用都拿它去序列化，共用一份的话谁改了都写回声明里。
+        public = QQ_NAPCAT.public_dict()
+        public["entrypoints"].append("evil.py")
+
+        assert QQ_NAPCAT.public_dict()["entrypoints"] == ["bot.py"]
+        assert QQ_NAPCAT.entrypoints == ("bot.py",)
+
+    def test_a_platform_that_declares_no_connection_card_says_so(self) -> None:
+        public = PlatformDescriptor(id="plain", display_name="Plain", short_name="P").public_dict()
+
+        assert (public["entrypoints"], public["connection_peer"], public["connection_hint"]) == ([], "", "")
 
 
 class TestInstancePorts:

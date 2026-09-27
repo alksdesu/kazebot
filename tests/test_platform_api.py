@@ -95,6 +95,23 @@ def test_the_listing_includes_qq(call) -> None:
     assert qq["capabilities"]["mention"] == "native" and qq["capabilities"]["markdown"] is False
 
 
+def test_the_listing_says_which_process_connects_to_what(call) -> None:
+    # 控制台的连接卡片照这三项写，不再把 bot.py、NapCat 写死在前端文案里。
+    body = call("GET", "/v1/platforms").json()
+    qq = next(item for item in body["platforms"] if item["id"] == "qq")
+
+    assert qq["entrypoints"] == ["bot.py"]
+    assert qq["connection_peer"] == "NapCat"
+    assert qq["connection_hint"] == "检查 NapCat 登录与反向 WebSocket 地址"
+    assert call("GET", "/v1/platforms/qq").json()["entrypoints"] == ["bot.py"]
+
+
+def test_a_platform_without_a_connection_card_answers_with_blanks(call, chatless) -> None:
+    body = call("GET", "/v1/platforms/chatless").json()
+
+    assert (body["entrypoints"], body["connection_peer"], body["connection_hint"]) == ([], "", "")
+
+
 def test_an_unknown_platform_is_404(call) -> None:
     assert call("GET", "/v1/platforms/telegram").status_code == 404
     assert call("GET", "/v1/platforms/telegram/config/raw").status_code == 404

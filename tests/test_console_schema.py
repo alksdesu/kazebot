@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -37,7 +39,7 @@ from adapters.onebot import console_layout  # noqa: E402
 from adapters.onebot.live_config import LIVE_KEYS  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 from platforms.descriptor import HOOK_CONSOLE_SCHEMA  # noqa: E402
-from platforms.registry import platform_hook  # noqa: E402
+from platforms.registry import all_platforms, platform_hook  # noqa: E402
 
 _SWITCH = LiveKey("switch", "demo.switch", BOOL, True, ui=cs.toggle("开关", "说明"))
 _WORDS = LiveKey(
@@ -66,6 +68,36 @@ def _placed(sections: tuple[cs.Section, ...]) -> list[str]:
 
 def _custom_names(sections: tuple[cs.Section, ...]) -> set[str]:
     return {node.name for part in sections for node in cs.walk(part.nodes) if isinstance(node, cs.Custom)}
+
+
+_ICON_SOURCE = _ROOT / "adapters" / "web" / "frontend" / "src" / "components" / "common" / "Icon.tsx"
+
+
+def _schema_icons(node: Any) -> set[str]:
+    """schema 里每一层的 icon 名：分区、块，以后新加的节点也按同一条规则收。"""
+    if isinstance(node, dict):
+        found = {value for key, value in node.items() if key == "icon" and isinstance(value, str) and value}
+        return found.union(*(_schema_icons(value) for key, value in node.items() if key != "icon"), set())
+    if isinstance(node, list):
+        return set().union(*(_schema_icons(item) for item in node), set())
+    return set()
+
+
+def _console_icons() -> set[str]:
+    """控制台会画的全部图标名：全局页一份，每个有控制台界面的平台各一份。"""
+    schemas = [features.schema()] + [
+        platform_hook(platform, HOOK_CONSOLE_SCHEMA).schema()
+        for platform in all_platforms()
+        if HOOK_CONSOLE_SCHEMA in platform.hooks
+    ]
+    return set().union(*(_schema_icons(document) for document in schemas))
+
+
+def _icon_map_keys() -> set[str]:
+    source = _ICON_SOURCE.read_text(encoding="utf-8")
+    body = re.search(r"const ICON_MAP[^{]*\{(.*?)\n\};", source, re.S)
+    assert body is not None, "Icon.tsx 里找不到 ICON_MAP"
+    return set(re.findall(r"^\s*([A-Za-z0-9_]+)\s*:", body.group(1), re.M))
 
 
 class TestControls:
@@ -417,3 +449,17 @@ class TestFrontendSnapshot:
         stored = json.loads(_console_fixture.FIXTURE.read_text(encoding="utf-8"))
 
         assert set(stored["platforms"]) == {QQ_NAPCAT.id}
+
+
+class TestFrontendIcons:
+    """图标名由 schema 给，前端那张映射表是手工维护的：漏一个，分区头上就是两个字母的回退件。"""
+
+    def test_every_icon_the_console_asks_for_is_drawable(self) -> None:
+        missing = sorted(_console_icons() - _icon_map_keys())
+
+        assert missing == [], f"Icon.tsx 的 ICON_MAP 缺这些图标：{missing}"
+
+    def test_neither_side_reads_as_empty(self) -> None:
+        # 正则或 schema 取法哪天失手，上面那条会因为两边都空而永远通过。
+        assert _icon_map_keys()
+        assert _console_icons()

@@ -15,7 +15,7 @@ import {
   ApprovalsSettingsRightPanel,
   SystemSettingsRightPanel,
 } from '../components/settings/panels/SettingsContextPanels';
-import { settingsTabs } from '../components/settings/settingsTabs';
+import { currentSettingsTabs } from '../components/settings/settingsTabs';
 import { useSettingsSelectionStore } from '../store/settingsSelectionStore';
 import { useSettingsStore } from '../store/settingsStore';
 
@@ -55,12 +55,12 @@ describe('P0 settings pages', () => {
   });
 
   it('registers the three P0 tabs with the requested labels, icons, and orders', () => {
-    expect(settingsTabs.find((tab) => tab.id === 'system')).toMatchObject({ label: '系统', icon: 'settings_power', order: 4, Page: SystemSettingsPage });
-    expect(settingsTabs.find((tab) => tab.id === 'approvals')).toMatchObject({ label: '审批', icon: 'approval', order: 5, Page: ApprovalsSettingsPage });
-    expect(settingsTabs.find((tab) => tab.id === 'advanced')).toMatchObject({ label: '高级', icon: 'code', order: 13, Page: AdvancedSettingsPage });
-    expect(settingsTabs.find((tab) => tab.id === 'system')?.RightPanel).toBe(SystemSettingsRightPanel);
-    expect(settingsTabs.find((tab) => tab.id === 'approvals')?.RightPanel).toBe(ApprovalsSettingsRightPanel);
-    expect(settingsTabs.find((tab) => tab.id === 'advanced')?.RightPanel).toBe(AdvancedSettingsRightPanel);
+    expect(currentSettingsTabs().find((tab) => tab.id === 'system')).toMatchObject({ label: '系统', icon: 'settings_power', order: 4, Page: SystemSettingsPage });
+    expect(currentSettingsTabs().find((tab) => tab.id === 'approvals')).toMatchObject({ label: '审批', icon: 'approval', order: 5, Page: ApprovalsSettingsPage });
+    expect(currentSettingsTabs().find((tab) => tab.id === 'advanced')).toMatchObject({ label: '高级', icon: 'code', order: 13, Page: AdvancedSettingsPage });
+    expect(currentSettingsTabs().find((tab) => tab.id === 'system')?.RightPanel).toBe(SystemSettingsRightPanel);
+    expect(currentSettingsTabs().find((tab) => tab.id === 'approvals')?.RightPanel).toBe(ApprovalsSettingsRightPanel);
+    expect(currentSettingsTabs().find((tab) => tab.id === 'advanced')?.RightPanel).toBe(AdvancedSettingsRightPanel);
   });
 
   it('shows the shared Admin Token login notice before authentication', () => {

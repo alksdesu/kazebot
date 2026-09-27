@@ -1740,6 +1740,12 @@ export interface PlatformSummary {
   hooks: string[];
   /** 旧版后端没有这一项。 */
   capabilities?: PlatformCapabilitiesSummary;
+  /** 平台进程的入口脚本，提示人去服务器上找哪个进程。旧版后端没有。 */
+  entrypoints?: string[];
+  /** 适配进程要连上的那一端。旧版后端没有。 */
+  connection_peer?: string;
+  /** 连不上时让人先查什么。旧版后端没有。 */
+  connection_hint?: string;
 }
 
 export async function getPlatforms(token: string): Promise<PlatformSummary[]> {

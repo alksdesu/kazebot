@@ -7,7 +7,7 @@ import { render } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
 import { Icon } from '../components/common/Icon';
-import { settingsTabs } from '../components/settings/settingsTabs';
+import { currentSettingsTabs } from '../components/settings/settingsTabs';
 
 describe('Material Symbols SVG icon system', () => {
   it('renders Material Symbols through the shared SVG Icon component', () => {
@@ -46,7 +46,7 @@ describe('Material Symbols SVG icon system', () => {
     // How: assert every registered Material Symbol name in order instead of the old
     // four-tab subset. Purpose: icon migration coverage grows with the full settings
     // surface and catches any future literal glyph regression.
-    expect(settingsTabs.map(tab => tab.icon)).toEqual([
+    expect(currentSettingsTabs().map(tab => tab.icon)).toEqual([
       'tune',
       'display_settings',
       'monitor_heart',
@@ -74,7 +74,7 @@ describe('Material Symbols SVG icon system', () => {
 
     // 注册了却没 import 过 —— ICON_MAP 落空，回退件会把名字塞进 16px 的格子里，
     // 跟旁边的导航文字叠在一起。出过一次。
-    for (const tab of settingsTabs) {
+    for (const tab of currentSettingsTabs()) {
       const { container } = render(<Icon name={tab.icon!} />);
       expect(container.querySelector('svg')).not.toBeNull();
     }
@@ -84,6 +84,6 @@ describe('Material Symbols SVG icon system', () => {
     // of literal symbols. Purpose: the repository can prove UI code has no leftover
     // emoji or Unicode icon glyphs while this regression assertion stays meaningful.
     const legacyIconNames = ['\u25cf', '\u2b21', '\u{1f4e1}'];
-    expect(settingsTabs.map(tab => tab.icon)).not.toEqual(expect.arrayContaining(legacyIconNames));
+    expect(currentSettingsTabs().map(tab => tab.icon)).not.toEqual(expect.arrayContaining(legacyIconNames));
   });
 });

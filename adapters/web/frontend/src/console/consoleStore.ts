@@ -17,6 +17,7 @@ import {
   type PlatformCapability,
   type PlatformRuntimeFacts,
 } from '../api/supervisorClient';
+import { entrypointNote, getPlatform } from '../platforms/registry';
 import { FEATURES_SCOPE, platformScope, useConfigScope, type ConfigScope } from './configScope';
 
 /** 草稿按 live_config 的键名存（如 signal_at），不是 yaml 的点分路径。
@@ -176,17 +177,21 @@ interface SettleWording {
   unconfirmed: string;
 }
 
-const WORDING: Record<ConfigScope['kind'], SettleWording> = {
-  platform: {
+const FEATURES_WORDING: SettleWording = {
+  changed: '全局文件在保存之后又被改过，请刷新核对当前内容。',
+  unreadable: '已保存，但暂时读不到全局设置的状态，请稍后刷新。',
+  unconfirmed: '已保存，但有在跑的 bot 没在 3 秒内换上新文件，页面顶部列着是哪一个。',
+};
+
+/** 平台页没确认生效时，按平台声明的入口脚本告诉人去看哪个进程。 */
+const settleWording = (scope: ConfigScope): SettleWording => {
+  if (scope.kind === 'features') return FEATURES_WORDING;
+  const platform = getPlatform(scope.platformId);
+  return {
     changed: '配置文件在应用之后又被改过，请刷新核对当前内容。',
     unreadable: '已应用，但暂时读不到 bot 的状态，无法确认是否生效，请稍后刷新。',
-    unconfirmed: '已应用，但 bot 没在 3 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程（bot.py）。',
-  },
-  features: {
-    changed: '全局文件在保存之后又被改过，请刷新核对当前内容。',
-    unreadable: '已保存，但暂时读不到全局设置的状态，请稍后刷新。',
-    unconfirmed: '已保存，但有在跑的 bot 没在 3 秒内换上新文件，页面顶部列着是哪一个。',
-  },
+    unconfirmed: `已应用，但 bot 没在 3 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程${platform ? entrypointNote(platform) : ''}。`,
+  };
 };
 
 /**
@@ -264,7 +269,7 @@ const createConsoleState = (scope: ConfigScope) => (
         if (sameValue(pending[name], value)) delete pending[name];
       }
       set({ draft: pending, raw, rawExists: true, live: withApplied(live, subset) });
-      const settled = await settle(token, api, WORDING[scope.kind], set, raw);
+      const settled = await settle(token, api, settleWording(scope), set, raw);
       return { ok: true, message: [...result.warnings, settled].filter(Boolean).join('；') };
     } catch (error) {
       return { ok: false, message: error instanceof Error ? error.message : '写入失败' };

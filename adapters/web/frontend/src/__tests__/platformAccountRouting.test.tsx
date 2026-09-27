@@ -16,6 +16,9 @@ const TELEGRAM: PlatformDescriptor = {
   shortName: 'TG',
   channels: [{ name: 'tg_group', kind: 'group', hashed: true }],
   hasConfig: true,
+  entrypoints: ['telegram_bot.py'],
+  connectionPeer: 'Telegram Bot API',
+  connectionHint: '检查 bot token 与出网代理',
 };
 
 const main: ConsoleInstance = { id: 'main', label: '主实例', path: '', current: true, idx: 0, accounts: { qq: '1000001' } };

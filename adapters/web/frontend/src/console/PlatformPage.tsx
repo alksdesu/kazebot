@@ -12,7 +12,7 @@ import {
 } from '../components/settings/pages/settingsControls';
 import { useSettingsStore } from '../store/settingsStore';
 import { scopedKey } from '../store/storageKey';
-import type { PlatformDescriptor } from '../platforms/registry';
+import { entrypointNote, type PlatformDescriptor } from '../platforms/registry';
 import { FEATURES_SCOPE, platformScope } from './configScope';
 import { configStore, useConsoleStore, useSectionPending } from './consoleStore';
 import { SchemaFields } from './FieldRenderer';
@@ -129,7 +129,7 @@ const PlatformPageBody = ({ connection, note, platform }: Omit<PlatformPageProps
   const body = loading && !live ? <Empty>正在读取配置…</Empty>
     : !published ? (
       <Empty>
-        {live?.reason || `bot 还没上报生效配置。在服务器上启动 ${platform.displayName} 的适配器进程（bot.py）之后，这里会显示它实际在用的值。`}
+        {live?.reason || `bot 还没上报生效配置。在服务器上启动 ${platform.displayName} 的适配器进程${entrypointNote(platform)}之后，这里会显示它实际在用的值。`}
       </Empty>
     ) : null;
   const layout = schemaError ? <ErrorText>{schemaError}</ErrorText>

@@ -4,16 +4,17 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { PersonaPage } from '../console/PersonaPage';
 import { StickersPage } from '../console/StickersPage';
-import { BOT_PAGES, MODEL_PAGES, PLATFORM_PAGES } from '../console/pages';
+import { BOT_PAGES, MODEL_PAGES, platformPages } from '../console/pages';
 import { picksSection } from '../console/sectionPick';
 import { resolveSettingsLocation, TAB_ALIASES } from '../components/settings/settingsTabAliases';
-import { getSettingsTab, settingsTabs, type SettingsGroup } from '../components/settings/settingsTabs';
+import { currentSettingsTabs, getSettingsTab, type SettingsGroup } from '../components/settings/settingsTabs';
+import { allPlatforms } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
 import { QQ_SCHEMA, QqSectionBody, snapshotFor } from './consoleSchemaFixture';
 
 const idsInGroup = (group: SettingsGroup) =>
-  settingsTabs.filter(tab => tab.group === group).map(tab => tab.id);
+  currentSettingsTabs().filter(tab => tab.group === group).map(tab => tab.id);
 
 describe('设置分组归属', () => {
   it('机器人组放全平台共用的那几页', () => {
@@ -36,23 +37,24 @@ describe('设置分组归属', () => {
       'account', 'channels', 'trigger', 'permissions',
       'input', 'output', 'interaction', 'sticker', 'link',
     ]);
-    expect(PLATFORM_PAGES[0].platform.id).toBe('qq');
+    expect(platformPages(allPlatforms())[0].platformId).toBe('qq');
   });
 
   it('提醒从自动化里搬出来，自己一页', () => {
-    expect(settingsTabs.find(tab => tab.id === 'reminders')).toMatchObject({ label: '提醒', group: 'bot' });
+    expect(currentSettingsTabs().find(tab => tab.id === 'reminders')).toMatchObject({ label: '提醒', group: 'bot' });
   });
 });
 
 describe('旧 id 别名', () => {
   it('每条别名都指向注册过的页与分区，且自己不再占用 id', () => {
-    const ids = new Set(settingsTabs.map(tab => tab.id));
+    const tabs = currentSettingsTabs();
+    const ids = new Set(tabs.map(tab => tab.id));
     for (const [legacy, target] of Object.entries(TAB_ALIASES)) {
       expect(ids.has(target.tab)).toBe(true);
       expect(ids.has(legacy)).toBe(false);
       if (!target.section) continue;
       // 一份 schema 分摆几页时，别名只能指到这页真摆着的那块。
-      const tab = settingsTabs.find(entry => entry.id === target.tab)!;
+      const tab = tabs.find(entry => entry.id === target.tab)!;
       const sections = tab.configScope ? snapshotFor(tab.configScope)?.sections || [] : [];
       const shown = sections.filter(section => picksSection(tab.sections, section.id));
       expect(shown.map(section => section.id)).toContain(target.section);
