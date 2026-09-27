@@ -270,7 +270,7 @@ class ContractDriver:
 
     def alias_of(self, user: str) -> str | None:
         """模型认识这个人用的别名，还没分配过是 None。"""
-        return self.aliases.users.alias_of(user)
+        return self.aliases.user_alias_of(user)
 
     @property
     def private_ids(self) -> frozenset[str]:

@@ -195,8 +195,8 @@ class OneBotAdapter:
         # ---- 匿名映射 ----
         self.aliases = AliasBook(
             ANON_MAP_FILE,
+            platform=QQ_NAPCAT,
             workspace=self.workspace,
-            id_shape=QQ_NAPCAT.id_shape,
             retention_days=ANON_MAP_RETENTION_DAYS,
             save_min_interval=ANON_MAP_SAVE_MIN_INTERVAL,
         )

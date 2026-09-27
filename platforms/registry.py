@@ -36,6 +36,8 @@ STANDARD_STATE_FILES: Mapping[str, str] = MappingProxyType({
     STATE_ALIASES: "aliases.json",
     STATE_ACTIVE_ACCOUNT: "active_account.json",
 })
+# 全平台共用的别名编号：记忆跨平台共享，UserA 在哪个平台都只能是同一个人。平台 id 不带点，不会和它撞名。
+ALIAS_NUMBERING_FILE = "alias_numbering.json"
 
 _lock = threading.Lock()
 _platforms: dict[str, PlatformDescriptor] = {}
@@ -198,6 +200,24 @@ def platform_state_path(
         return platform_data_dir(platform, workspace_root) / STANDARD_STATE_FILES[name]
     except KeyError:
         raise LookupError(f"unknown platform state file: {name!r}") from None
+
+
+def platform_profiles_path(
+    platform: PlatformDescriptor, workspace_root: Path, *, environ: Mapping[str, str] | None = None,
+) -> Path | None:
+    """按人资料文件的位置，能用声明里的 env 改；平台没有资料文件返回 None。"""
+    if not platform.profiles_path:
+        return None
+    override = env_override(platform.profiles_env, environ)
+    return workspace_path(override, workspace_root) if override else Path(workspace_root) / platform.profiles_path
+
+
+def alias_numbering_relpath() -> str:
+    return f"{PLATFORM_DATA_ROOT}/{ALIAS_NUMBERING_FILE}"
+
+
+def alias_numbering_path(workspace_root: Path) -> Path:
+    return Path(workspace_root) / alias_numbering_relpath()
 
 
 def platform_secret_file(

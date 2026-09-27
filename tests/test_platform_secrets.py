@@ -446,6 +446,21 @@ class TestAdapterStartup:
         assert Path(config.ONEBOT_STATE_FILE) == workspace / "private" / "routes.json"
         assert Path(config.ANON_MAP_FILE) == aliases
 
+    def test_the_user_profiles_are_read_where_the_env_moved_them(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        workspace = _workspace(tmp_path)
+        moved = workspace / "private" / "people.yaml"
+        moved.parent.mkdir()
+        moved.write_text('users:\n  "10001":\n    display_name: 张三\n', encoding="utf-8")
+        runtime = _adapter(monkeypatch, workspace, CLONOTH_QQ_USER_PROFILES_PATH="private/people.yaml")
+
+        body_attr(runtime, "_load_user_profiles")()
+
+        # 相对写法按工作区算，外传黑名单认的也是这个位置。
+        assert Path(_config_module(runtime).USER_PROFILES_PATH) == moved
+        assert runtime.state._adapter.qq_user_profiles == {"10001": {"display_name": "张三"}}
+
     def test_a_misspelled_key_is_reported(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         workspace = _workspace(tmp_path, config=_qq(forward_bridge_tokn="typo"))
 

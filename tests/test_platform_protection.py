@@ -25,6 +25,7 @@ from platforms.descriptor import (  # noqa: E402
 )
 from platforms.protection import (  # noqa: E402
     CORE_OUTBOUND_DENY,
+    CORE_WRITE_FLOOR,
     normalize_relative,
     outbound_deny_patterns,
     outbound_deny_reason,
@@ -54,6 +55,8 @@ VAULT = PlatformDescriptor(
     secret_files=("data/vault-session.*",),
     owned_files=("data/vault_cache/*",),
     private_files=("config/vault_people.yaml",),
+    profiles_path="config/vault_profiles.yaml",
+    profiles_env="VAULT_PROFILES_PATH",
 )
 
 QQ_SECRET_ENVS = {
@@ -236,6 +239,25 @@ class TestOutboundDeny:
 
         assert outbound_deny_reason("etc/vault.yaml", via="Vault", platforms=[VAULT], environ=moved, workspace=tmp_path)
 
+    def test_a_profiles_file_is_private_without_being_listed(self) -> None:
+        # 按人资料里是明文 ID，外传等于把去匿名化字典发出去；平台声明了位置就自动护住。
+        assert outbound_deny_reason("config/vault_profiles.yaml", via="Vault", platforms=[VAULT], environ={})
+
+    def test_a_profiles_file_moved_by_env_is_blocked_where_it_now_lives(self, tmp_path: Path) -> None:
+        moved = {"VAULT_PROFILES_PATH": "people/vault.yaml"}
+
+        assert outbound_deny_reason("people/vault.yaml", via="Vault", platforms=[VAULT], environ=moved, workspace=tmp_path)
+        assert outbound_deny_reason(
+            "people/vault.yaml", via="Vault", platforms=[VAULT], environ={}, workspace=tmp_path,
+        ) == ""
+
+    def test_qq_profiles_moved_by_env_are_blocked_where_they_now_live(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("CLONOTH_QQ_USER_PROFILES_PATH", "private/people.yaml")
+
+        assert outbound_deny_reason("private/people.yaml", via="QQ", workspace=tmp_path)
+
     def test_a_file_moved_outside_the_workspace_is_listed_by_its_absolute_path(self, tmp_path: Path) -> None:
         workspace = tmp_path / "ws"
         workspace.mkdir()
@@ -266,6 +288,17 @@ class TestPolicyFloor:
         assert QQ_SECRET_FILES <= patterns
         assert {f"data/{name}" for name in QQ_NAPCAT.state_files.values()} <= patterns
         assert {"data/onebot_*", "data/cache/onebot_*", "data/qq_dead_logins.json"} <= patterns
+
+    def test_the_shared_alias_numbering_is_floored_for_writes(self, tmp_path: Path) -> None:
+        # 编号被改小，新发的别名就会撞上旧记忆里的人；它不属于哪个平台，排在所有平台前面。
+        _read, write = policy_floor(platforms=[], environ={})
+        engine = _engine(tmp_path)
+
+        assert write == CORE_WRITE_FLOOR
+        for path in ("data/platforms/alias_numbering.json", "data/platforms/alias_numbering.json.lock"):
+            assert engine.evaluate_write_file(path=path).safety_level == SafetyLevel.deny
+        # 里面只有计数，读、外传都不拦。
+        assert engine.evaluate_read_file(path="data/platforms/alias_numbering.json").safety_level == SafetyLevel.auto
 
     def test_the_config_file_stays_editable_under_approval(self) -> None:
         _read, write = policy_floor(platforms=[QQ_NAPCAT], environ={})
@@ -380,6 +413,7 @@ class TestPolicyFloor:
         assert engine.evaluate_write_file(path="data/vault_live.json").safety_level == SafetyLevel.deny
         assert engine.evaluate_write_file(path="data/vault_cache/avatars.json").safety_level == SafetyLevel.deny
         assert engine.evaluate_write_file(path="config/vault_people.yaml").safety_level == SafetyLevel.auto
+        assert engine.evaluate_write_file(path="config/vault_profiles.yaml").safety_level == SafetyLevel.auto
 
 
 class TestSubprocessEnvironment:

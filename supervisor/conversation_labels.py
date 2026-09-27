@@ -21,6 +21,7 @@ from platforms.descriptor import (
     STATE_ROUTES,
     PlatformDescriptor,
 )
+from platforms.ids import split_identity_key
 from platforms.registry import (
     all_platforms,
     conversation_channel,
@@ -127,20 +128,38 @@ class _DisplayNames:
         return name.strip() if isinstance(name, str) else ""
 
 
+def _alias_index(platform: PlatformDescriptor, bucket: Any) -> dict[str, str]:
+    """别名表一个桶里原始 ID → 别名。
+
+    按账号分 ID 的平台，键前面带着机器人账号；同一串 ID 在几个号名下各有别名时认不出是哪个，干脆不给。
+    """
+    if not isinstance(bucket, dict):
+        return {}
+    found: dict[str, set[str]] = {}
+    for key, entry in bucket.items():
+        alias = str(entry.get("alias") or "").strip() if isinstance(entry, dict) else ""
+        if alias:
+            found.setdefault(split_identity_key(platform, str(key))[1], set()).add(alias)
+    return {raw: next(iter(aliases)) for raw, aliases in found.items() if len(aliases) == 1}
+
+
 @dataclass
 class _PlatformLabels:
     platform: PlatformDescriptor
     real_map: dict[str, Any]
-    anon: dict[str, Any]
+    user_aliases: dict[str, str]
+    group_aliases: dict[str, str]
     names: _DisplayNames
 
     @classmethod
     def load(cls, workspace_root: Path, platform: PlatformDescriptor) -> "_PlatformLabels":
         real_map = _read_json(platform_state_path(platform, STATE_ROUTES, workspace_root)).get("real_conversation_keys")
+        anon = _read_json(platform_state_path(platform, STATE_ALIASES, workspace_root))
         return cls(
             platform=platform,
             real_map=real_map if isinstance(real_map, dict) else {},
-            anon=_read_json(platform_state_path(platform, STATE_ALIASES, workspace_root)),
+            user_aliases=_alias_index(platform, anon.get("users")),
+            group_aliases=_alias_index(platform, anon.get("groups")),
             names=_DisplayNames(workspace_root, platform),
         )
 
@@ -150,9 +169,7 @@ class _PlatformLabels:
         raw_key = self.real_map.get(stable)
         real_key = raw_key if isinstance(raw_key, str) else ""
         real_id = real_key.split(":", 1)[1] if ":" in real_key else ""
-        bucket = self.anon.get("groups" if kind == "group" else "users") or {}
-        entry = bucket.get(real_id) if isinstance(bucket, dict) else None
-        alias = str(entry.get("alias") or "") if isinstance(entry, dict) else ""
+        alias = (self.group_aliases if kind == "group" else self.user_aliases).get(real_id, "")
         # 别名是给模型脱敏用的，管理员看的应该是真名；拿不到真名才退回别名。
         display = self.names.group(real_id) if kind == "group" else self.names.user(alias)
         fallback = alias or (

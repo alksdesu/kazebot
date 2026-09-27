@@ -1,8 +1,9 @@
-"""共享层的匿名别名表：编号、落盘格式、保留期回收、文本替换、写盘节流。"""
+"""共享层的匿名别名表：编号、全平台共用的编号、按账号分的 ID、落盘格式、保留期回收、文本替换、写盘节流。"""
 from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -14,12 +15,47 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from adapters._shared import aliases as alias_module  # noqa: E402
-from adapters._shared.aliases import AliasBook, AliasLoad, AliasTable, alias_from_index, alias_to_index  # noqa: E402
+from adapters._shared.aliases import (  # noqa: E402
+    AliasBook,
+    AliasLoad,
+    AliasNumbering,
+    AliasTable,
+    alias_from_index,
+    alias_to_index,
+)
 from engine import memory_subjects  # noqa: E402
-from platforms.descriptor import ID_NUMERIC, ID_STRING  # noqa: E402
+from platforms.descriptor import (  # noqa: E402
+    ID_NUMERIC,
+    ID_SCOPE_PLATFORM,
+    ID_STRING,
+    STATE_ALIASES,
+    PlatformDescriptor,
+)
+from platforms.registry import alias_numbering_path, all_platforms, platform_state_path  # noqa: E402
 
 _NOW = 1_800_000_000.0
 _DAY = 86400.0
+# 这两个 ID 全平台唯一，键不带账号；按账号分的那个用平台描述的默认值。
+_NUMERIC = PlatformDescriptor(
+    id="numchat", display_name="Num Chat", short_name="Num", id_shape=ID_NUMERIC, id_scope=ID_SCOPE_PLATFORM,
+)
+_STRING = PlatformDescriptor(
+    id="strchat", display_name="Str Chat", short_name="Str", id_shape=ID_STRING, id_scope=ID_SCOPE_PLATFORM,
+)
+_APP = PlatformDescriptor(id="appchat", display_name="App Chat", short_name="App", id_shape=ID_STRING)
+# 一份老文件名的状态文件：编号丢了重建时，得连它一起认。
+_LEGACY = PlatformDescriptor(
+    id="oldchat", display_name="Old Chat", short_name="Old", id_scope=ID_SCOPE_PLATFORM,
+    state_files={STATE_ALIASES: "oldchat_aliases.json"},
+)
+_CLAIM_MANY = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from adapters._shared.aliases import AliasNumbering\n"
+    "numbering = AliasNumbering(Path(sys.argv[2]), platforms=tuple)\n"
+    "print(' '.join(numbering.claim('User') for _ in range(int(sys.argv[3]))))\n"
+)
 
 
 class _Clock:
@@ -30,9 +66,30 @@ class _Clock:
         return self.now
 
 
-def _book(tmp_path: Path, *, shape: str = ID_NUMERIC, **options: Any) -> AliasBook:
+@pytest.fixture(autouse=True)
+def _no_moved_alias_maps(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 编号丢了重建时会读各平台的别名表，开发机上设着的 env 会把它指到真文件上。
+    for platform in all_platforms():
+        for env in platform.state_env.values():
+            monkeypatch.delenv(env, raising=False)
+
+
+def _book(
+    tmp_path: Path, *, shape: str = ID_NUMERIC, platform: PlatformDescriptor | None = None, **options: Any,
+) -> AliasBook:
     options.setdefault("clock", _Clock())
-    return AliasBook(tmp_path / "data" / "aliases.json", workspace=tmp_path, id_shape=shape, **options)
+    platform = platform or (_NUMERIC if shape == ID_NUMERIC else _STRING)
+    return AliasBook(tmp_path / "data" / "aliases.json", platform=platform, workspace=tmp_path, **options)
+
+
+def _platform_book(tmp_path: Path, platform: PlatformDescriptor, **options: Any) -> AliasBook:
+    """放在平台自己的状态文件位置上的别名表，和适配器里的一样。"""
+    options.setdefault("clock", _Clock())
+    return AliasBook(platform_state_path(platform, STATE_ALIASES, tmp_path), platform=platform, workspace=tmp_path, **options)
+
+
+def _numbering_file(tmp_path: Path) -> dict[str, Any]:
+    return json.loads(alias_numbering_path(tmp_path).read_text(encoding="utf-8"))
 
 
 def _write(tmp_path: Path, payload: Any) -> None:
@@ -223,6 +280,199 @@ class TestBook:
 
         assert loaded is not None and loaded.pruned == 0
         assert book.users.real_of("UserA") == "10001"
+
+
+class TestSharedNumbering:
+    def test_two_platforms_never_hand_out_the_same_alias(self, tmp_path: Path) -> None:
+        # 记忆按别名建目录、跨平台共享：两个平台各发一个 UserA，就是两个人共用一份记忆。
+        numeric, string = _platform_book(tmp_path, _NUMERIC), _platform_book(tmp_path, _STRING)
+
+        issued = [numeric.user_alias("10001"), string.user_alias("E2B7C1A0"), numeric.user_alias("10002")]
+
+        assert issued == ["UserA", "UserB", "UserC"]
+        assert numeric.group_alias("20001") == "GroupA" and string.group_alias("room-1") == "GroupB"
+        assert _numbering_file(tmp_path)["next"] == {"Group": 2, "User": 3}
+        # 文件里存的下一个编号跟着领到的走：重建编号、老版本回退都靠它。
+        assert (numeric.users.next_index, string.users.next_index) == (3, 2)
+
+    def test_loading_reserves_what_the_file_already_uses(self, tmp_path: Path) -> None:
+        # 编号文件落后于某份别名表（从备份恢复过、或别的进程重建时没看见它）：加载那一刻就补齐。
+        alias_numbering_path(tmp_path).parent.mkdir(parents=True)
+        alias_numbering_path(tmp_path).write_text(json.dumps({"next": {"User": 0}}), encoding="utf-8")
+        numeric = _platform_book(tmp_path, _NUMERIC)
+        numeric.path.parent.mkdir(parents=True, exist_ok=True)
+        numeric.path.write_text(
+            json.dumps({"user_next": 5, "users": {"10001": {"alias": "UserC", "last_seen": _NOW}}}), encoding="utf-8",
+        )
+
+        numeric.load()
+
+        assert _platform_book(tmp_path, _STRING).user_alias("E2B7C1A0") == "UserF"
+
+    def test_a_missing_numbering_counts_alias_maps_kept_under_legacy_names(self, tmp_path: Path) -> None:
+        legacy = platform_state_path(_LEGACY, STATE_ALIASES, tmp_path)
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text(json.dumps({"users": {"1": {"alias": "UserD"}}, "group_next": 4}), encoding="utf-8")
+        numbering = AliasNumbering(tmp_path, platforms=lambda: (_LEGACY,))
+
+        assert (numbering.claim("User"), numbering.claim("Group")) == ("UserE", "GroupE")
+        assert _numbering_file(tmp_path)["next"] == {"Group": 5, "User": 5}
+
+    def test_a_missing_numbering_counts_platforms_that_are_not_registered_now(self, tmp_path: Path) -> None:
+        # 这个平台这次没起，数据目录里的标准文件照样要认，它的人还在记忆里。
+        unlisted = tmp_path / "data" / "platforms" / "gonechat" / "aliases.json"
+        unlisted.parent.mkdir(parents=True)
+        unlisted.write_text(json.dumps({"user_next": 7, "groups": {"g": {"alias": "GroupH"}}}), encoding="utf-8")
+        numbering = AliasNumbering(tmp_path, platforms=tuple)
+
+        assert (numbering.claim("User"), numbering.claim("Group")) == ("UserH", "GroupI")
+
+    def test_a_missing_numbering_counts_the_enrolled_people(self, tmp_path: Path) -> None:
+        # 别名表丢了，建档的人记忆还在，他的别名不能再发给别人。
+        memory_subjects.record_interaction(tmp_path, "UserK")
+
+        assert AliasNumbering(tmp_path, platforms=tuple).claim("User") == "UserL"
+
+    def test_a_rebuilt_numbering_is_written_down_at_once(self, tmp_path: Path) -> None:
+        # 不落盘的话，之后每次领编号都得把所有别名文件重扫一遍。
+        memory_subjects.record_interaction(tmp_path, "UserK")
+
+        AliasNumbering(tmp_path, platforms=tuple).reserve("User", 1)
+
+        assert _numbering_file(tmp_path)["next"] == {"User": 11}
+
+    @pytest.mark.parametrize("content", ["{not json", "[1, 2]", '{"next": [3]}'])
+    def test_a_broken_numbering_is_rebuilt(self, tmp_path: Path, content: str) -> None:
+        numeric = _platform_book(tmp_path, _NUMERIC)
+        numeric.path.parent.mkdir(parents=True, exist_ok=True)
+        numeric.path.write_text(json.dumps({"users": {"10001": {"alias": "UserC"}}}), encoding="utf-8")
+        alias_numbering_path(tmp_path).write_text(content, encoding="utf-8")
+
+        assert AliasNumbering(tmp_path, platforms=lambda: (_NUMERIC,)).claim("User") == "UserD"
+        assert _numbering_file(tmp_path)["next"]["User"] == 4
+
+    def test_a_table_skips_aliases_it_already_holds(self, tmp_path: Path) -> None:
+        # 编号文件被删掉重建时，本进程还没落盘的新别名不在任何一份文件里。
+        book = _platform_book(tmp_path, _NUMERIC)
+        book.users.restore("10001", "UserA", _NOW)
+
+        assert book.user_alias("10002") == "UserB"
+
+    def test_reserving_never_moves_the_numbering_back(self, tmp_path: Path) -> None:
+        numbering = AliasNumbering(tmp_path, platforms=tuple)
+        numbering.reserve("User", 6)
+        numbering.reserve("User", 2)
+        numbering.reserve("User", 0)
+
+        assert numbering.claim("User") == "UserG"
+
+    def test_platforms_claiming_at_once_never_collide(self, tmp_path: Path) -> None:
+        # 每个平台各一个进程：读改写不跨进程加锁，两个进程会领到同一个编号。
+        workers = [
+            subprocess.Popen(
+                [sys.executable, "-c", _CLAIM_MANY, str(_ROOT), str(tmp_path), "20"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            )
+            for _ in range(4)
+        ]
+        claimed: list[str] = []
+        for worker in workers:
+            out, err = worker.communicate(timeout=120)
+            assert worker.returncode == 0, err
+            claimed.extend(out.split())
+
+        assert sorted(claimed, key=lambda alias: alias_to_index("User", alias)) == [
+            alias_from_index("User", index) for index in range(80)
+        ]
+
+
+class TestAccountScopedIds:
+    def test_keys_carry_the_bot_account(self, tmp_path: Path) -> None:
+        book = _platform_book(tmp_path, _APP)
+        book.bind_account("app-1")
+        book.user_alias("u1")
+        book.group_alias("g1")
+
+        asyncio.run(book.save())
+
+        data = json.loads(book.path.read_text(encoding="utf-8"))
+        assert data["users"] == {"app-1/u1": {"alias": "UserA", "last_seen": _NOW}}
+        assert data["groups"] == {"app-1/g1": {"alias": "GroupA", "last_seen": _NOW}}
+        assert book.identity("u1") == "app-1/u1"
+
+    def test_a_book_that_never_learned_its_account_refuses_to_key_ids(self, tmp_path: Path) -> None:
+        book = _platform_book(tmp_path, _APP)
+
+        with pytest.raises(ValueError, match="bot account"):
+            book.user_alias("u1")
+        assert book.user_alias("") == "UserUnknown"
+
+    def test_the_same_id_under_two_accounts_is_two_people(self, tmp_path: Path) -> None:
+        book = _platform_book(tmp_path, _APP)
+        book.bind_account("app-1")
+        first = book.user_alias("u1")
+        book.bind_account("app-2")
+
+        assert (first, book.user_alias("u1")) == ("UserA", "UserB")
+
+    def test_text_and_reverse_lookups_only_see_the_current_account(self, tmp_path: Path) -> None:
+        book = _platform_book(tmp_path, _APP)
+        book.bind_account("app-1")
+        book.user_alias("u1")
+        book.substitute("warm the cache")
+        book.bind_account("app-2")
+
+        # 另一个号名下的 ID 在这个号上不会出现，反查出来也 @ 不到人。
+        assert book.substitute("u1 说好") == "u1 说好"
+        assert book.user_real_of("UserA") is None
+        assert book.user_alias_of("u1") is None
+
+        book.bind_account("app-1")
+
+        assert book.substitute("u1 说好") == "UserA 说好"
+        assert book.user_real_of("UserA") == "u1"
+        assert book.user_alias_of("u1") == "UserA"
+
+    def test_a_key_without_an_account_belongs_to_nobody(self, tmp_path: Path) -> None:
+        book = _platform_book(tmp_path, _APP)
+        book.path.parent.mkdir(parents=True)
+        book.path.write_text(json.dumps({"users": {"u1": {"alias": "UserA"}}}), encoding="utf-8")
+
+        book.load()
+
+        assert book.user_real_of("UserA") is None
+        book.bind_account("app-1")
+        assert book.user_real_of("UserA") is None and book.substitute("u1") == "u1"
+
+    def test_the_user_filter_judges_the_raw_id(self, tmp_path: Path) -> None:
+        book = _platform_book(tmp_path, _APP)
+        book.path.parent.mkdir(parents=True)
+        book.path.write_text(
+            json.dumps({"users": {"app-1/12": {"alias": "UserA"}, "app-1/u2": {"alias": "UserB"}}}), encoding="utf-8",
+        )
+        seen: list[str] = []
+
+        loaded = book.load(accept_user=lambda raw: seen.append(raw) or raw != "12")
+
+        assert loaded is not None and loaded.rejected == 1
+        assert sorted(seen) == ["12", "u2"]
+
+    def test_platform_wide_ids_ignore_the_account(self, tmp_path: Path) -> None:
+        book = _platform_book(tmp_path, _NUMERIC)
+        book.bind_account("90001")
+        first = book.user_alias("10001")
+        book.bind_account("90002")
+
+        assert book.user_alias("10001") == first
+        assert book.user_real_of(first) == "10001" and book.identity("10001") == "10001"
+
+    def test_looking_up_an_alias_does_not_hand_one_out(self, tmp_path: Path) -> None:
+        book = _book(tmp_path)
+
+        assert book.user_alias_of("10001") is None and book.group_alias_of("20001") is None
+        assert book.user_alias_of("") is None
+        assert not book.dirty and len(book.users) == 0
+        assert book.user_real_of("UserZ") is None and book.group_real_of("GroupZ") is None
 
 
 class TestSubstitution:

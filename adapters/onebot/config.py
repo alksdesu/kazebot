@@ -22,7 +22,7 @@ from clonoth_runtime import (
 )
 from platforms.builtin import QQ_NAPCAT
 from platforms.descriptor import STATE_ALIASES, STATE_ROUTES
-from platforms.registry import platform_secret_file, platform_state_path
+from platforms.registry import platform_profiles_path, platform_secret_file, platform_state_path
 from workspace import resolve_workspace_root
 
 
@@ -103,12 +103,17 @@ CUSTOM_FACE_METADATA_PATH = env_first(
 # 旧 bqbs.txt 顺序别名文件路径（可选）。默认不使用；仅配置 env 时参与兼容匹配/同步。
 BQBS_PATH = env_first("ONEBOT_CUSTOM_EMOJI_INDEX_PATH", "CLONOTH_BQBS_PATH", default="")
 
-# QQ 用户身份/称呼配置文件路径（可选，支持 JSON/YAML）。只用于模型可见称呼，不授予权限。
-# 默认读取 Clonoth 工作区 config/qq_user_profiles.yaml；文件不存在时静默跳过。
-USER_PROFILES_PATH = env_first(
-    "CLONOTH_QQ_USER_PROFILES_PATH",
-    default=os.path.join(CLONOTH_WORKSPACE, "config", "qq_user_profiles.yaml"),
-)
+
+def _profiles_file() -> str:
+    path = platform_profiles_path(QQ_NAPCAT, Path(CLONOTH_WORKSPACE))
+    if path is None:
+        raise LookupError("the QQ descriptor declares no user profiles file")
+    return str(path)
+
+
+# QQ 用户身份/称呼配置文件路径（可选，支持 JSON/YAML）。只用于模型可见称呼，不授予权限；文件不存在时静默跳过。
+# 位置和改位置的 CLONOTH_QQ_USER_PROFILES_PATH 都在 QQ 描述里，外传黑名单按同一份声明护住它。
+USER_PROFILES_PATH = _profiles_file()
 
 # 群聊触发模式：mention_only（默认，只 @Bot）、prefix（@Bot 或前缀）、all（所有消息）。
 # 选哪一种在 live_config，这里只是取值域。

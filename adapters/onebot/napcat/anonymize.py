@@ -87,7 +87,7 @@ def _enrolled_subject_display_names() -> Dict[str, str]:
     workspace = Path(CLONOTH_WORKSPACE)
     names = dict(memory_subjects.subject_display_names(workspace))
     for alias in memory_subjects.enrolled_subjects(workspace):
-        real = state._adapter.aliases.users.real_of(alias)
+        real = state._adapter.aliases.user_real_of(alias)
         if not real:
             continue
         display = identity._qq_profile_display_name(real)
@@ -182,7 +182,7 @@ def _resolve_at_alias_to_real(token: str) -> str:
     if raw.isdigit():
         return raw
     # 1) 匿名别名精确反查（UserA/UserAF 等）。
-    real = state._adapter.aliases.users.real_of(raw)
+    real = state._adapter.aliases.user_real_of(raw)
     if real:
         return str(real)
     # 2) 按已知用户 profile 的显示名/别名匹配（忽略大小写与首尾空白）。

@@ -9,6 +9,7 @@ from .descriptor import (
     HOOK_CONSOLE_SCHEMA,
     HOOK_TRIGGER_POLICY,
     ID_NUMERIC,
+    ID_SCOPE_PLATFORM,
     MENTION_NATIVE,
     STATE_ACTIVE_ACCOUNT,
     STATE_ALIASES,
@@ -34,9 +35,14 @@ QQ_NAPCAT = PlatformDescriptor(
         ChannelDescriptor("qq_unknown", CHANNEL_OTHER),
     ),
     id_shape=ID_NUMERIC,
+    # QQ 号换了机器人账号也是同一个人，别名表的键不带账号，文件格式和改造前一样。
+    id_scope=ID_SCOPE_PLATFORM,
     legacy_conversation_keys=True,
     config_path="config/qq.yaml",
     config_env="CLONOTH_QQ_CONFIG_PATH",
+    # 里面全是明文 QQ 号，外传等于把去匿名化字典发出去；改它照常走审批。
+    profiles_path="config/qq_user_profiles.yaml",
+    profiles_env="CLONOTH_QQ_USER_PROFILES_PATH",
     state_files={
         STATE_LIVE: "qq_live_state.json",
         STATE_ROUTES: "onebot_plugin_state.json",
@@ -90,8 +96,6 @@ QQ_NAPCAT = PlatformDescriptor(
     # 别名双向表、会话哈希到真实群号的路由、真实 sender_id 的附件索引都在 onebot_* 里，
     # 写成前缀通配，以后再加一份状态文件也默认护住。快捷登录状态由真实的切号结果推出来，只有 supervisor 该写。
     owned_files=("data/onebot_*", "data/cache/onebot_*", "data/qq_dead_logins.json"),
-    # 按人的资料里全是明文 QQ 号，外传等于把去匿名化字典发出去；改它照常走审批。
-    private_files=("config/qq_user_profiles.yaml",),
 )
 
 BUILTIN_PLATFORMS: tuple[PlatformDescriptor, ...] = (QQ_NAPCAT,)

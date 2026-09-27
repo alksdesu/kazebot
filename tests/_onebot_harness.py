@@ -26,6 +26,7 @@ _ADAPTER_ROOT = _ROOT / "adapters" / "onebot"
 # 开发机上可能设着这些改文件位置的变量，不清掉的话测试会去读写那边的真文件。
 _PATH_OVERRIDES = (
     QQ_NAPCAT.config_env,
+    QQ_NAPCAT.profiles_env,
     FEATURES_CONFIG_ENV,
     *QQ_NAPCAT.state_env.values(),
     *(secret.file_env for secret in QQ_NAPCAT.secrets if secret.file_env),

@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from .descriptor import PlatformDescriptor
-from .registry import all_platforms, env_override, platform_data_relpath, workspace_path
+from .registry import (
+    alias_numbering_relpath,
+    all_platforms,
+    env_override,
+    platform_data_relpath,
+    workspace_path,
+)
 
 # 和平台无关的凭据位置：dotenv、模型渠道密钥、管理令牌、policy 本身、私钥与证书。
 CORE_OUTBOUND_DENY: tuple[str, ...] = (
@@ -39,6 +45,12 @@ class FloorRule:
 
     pattern: str
     reason: str
+
+
+# 不属于哪个平台、由核心代码维护的文件。编号被改小，新发的别名就会撞上旧记忆里的人。
+CORE_WRITE_FLOOR: tuple[FloorRule, ...] = (
+    FloorRule(f"{alias_numbering_relpath()}*", "alias numbering shared by every platform"),
+)
 
 
 def _platforms(platforms: Iterable[PlatformDescriptor] | None) -> tuple[PlatformDescriptor, ...]:
@@ -105,15 +117,17 @@ def private_file_patterns(
     environ: Mapping[str, str] | None = None,
     workspace: Path | None = None,
 ) -> tuple[str, ...]:
-    """不能经聊天外传的文件：配置文件（含 env 改到的位置）、声明的 private_files，以及上面两类。"""
-    config: list[str] = []
-    if platform.config_path:
-        config.append(platform.config_path)
-        moved = env_override(platform.config_env, environ)
+    """不能经聊天外传的文件：配置文件和按人资料（含 env 改到的位置）、声明的 private_files，以及上面两类。"""
+    declared: list[str] = []
+    for path, env in ((platform.config_path, platform.config_env), (platform.profiles_path, platform.profiles_env)):
+        if not path:
+            continue
+        declared.append(path)
+        moved = env_override(env, environ)
         if moved:
-            config.append(_moved_to(moved, workspace))
+            declared.append(_moved_to(moved, workspace))
     owned = owned_file_patterns(platform, environ=environ, workspace=workspace)
-    return _unique([*config, *platform.private_files, *owned])
+    return _unique([*declared, *platform.private_files, *owned])
 
 
 def outbound_deny_patterns(
@@ -170,7 +184,7 @@ def policy_floor(
     配置文件不在其中，审批下改 qq.yaml 这类照常可以。
     """
     read: list[FloorRule] = []
-    write: list[FloorRule] = []
+    write: list[FloorRule] = list(CORE_WRITE_FLOOR)
     for platform in _platforms(platforms):
         for pattern in secret_file_patterns(platform, environ=environ, workspace=workspace):
             read.append(FloorRule(pattern, f"secret file declared by platform {platform.id}"))

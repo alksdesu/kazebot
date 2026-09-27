@@ -32,6 +32,7 @@ from platforms.descriptor import (  # noqa: E402
 )
 from platforms.registry import (  # noqa: E402
     STANDARD_STATE_FILES,
+    alias_numbering_path,
     all_platforms,
     conversation_channel,
     features_module,
@@ -41,6 +42,7 @@ from platforms.registry import (  # noqa: E402
     platform_config_path,
     platform_data_dir,
     platform_hook,
+    platform_profiles_path,
     platform_secret_file,
     platform_state_path,
     register_platform,
@@ -173,6 +175,19 @@ class TestRegistration:
         with pytest.raises(ValueError, match="UPPER_SNAKE_CASE"):
             PlatformDescriptor(**base, state_files={STATE_LIVE: "x_live.json"}, state_env={STATE_LIVE: "x_live"})
 
+    @pytest.mark.parametrize("what", ["config", "profiles"])
+    def test_descriptors_reject_malformed_movable_files(self, what: str) -> None:
+        # 保护规则把这两个路径原样当 glob 用，写歪了等于没护住。
+        base = {"id": "x", "display_name": "X", "short_name": "X"}
+        with pytest.raises(ValueError):
+            PlatformDescriptor(**base, **{f"{what}_path": "../x.yaml"})
+        with pytest.raises(ValueError):
+            PlatformDescriptor(**base, **{f"{what}_path": "/etc/x.yaml"})
+        with pytest.raises(ValueError, match="does not have"):
+            PlatformDescriptor(**base, **{f"{what}_env": "X_PATH"})
+        with pytest.raises(ValueError, match="UPPER_SNAKE_CASE"):
+            PlatformDescriptor(**base, **{f"{what}_path": "config/x.yaml", f"{what}_env": "x_path"})
+
     def test_the_public_view_leaves_out_deployment_details(self) -> None:
         public = QQ_NAPCAT.public_dict()
         assert public["id"] == "qq" and public["has_config"] is True
@@ -200,6 +215,27 @@ class TestFilesAndHooks:
         assert platform_config_path(telegram, tmp_path) is None
         with pytest.raises(LookupError):
             required_config_path(telegram, tmp_path)
+
+    def test_qq_profiles_follow_the_descriptor_and_its_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("CLONOTH_QQ_USER_PROFILES_PATH", raising=False)
+        assert platform_profiles_path(QQ_NAPCAT, tmp_path) == tmp_path / "config" / "qq_user_profiles.yaml"
+
+        monkeypatch.setenv("CLONOTH_QQ_USER_PROFILES_PATH", "private/people.yaml")
+        assert platform_profiles_path(QQ_NAPCAT, tmp_path) == tmp_path / "private" / "people.yaml"
+        assert platform_profiles_path(QQ_NAPCAT, tmp_path, environ={}) == tmp_path / "config" / "qq_user_profiles.yaml"
+
+    def test_a_platform_without_profiles_says_so(self, tmp_path: Path, telegram: PlatformDescriptor) -> None:
+        assert platform_profiles_path(telegram, tmp_path) is None
+
+    def test_the_alias_numbering_sits_beside_the_platform_directories(self, tmp_path: Path) -> None:
+        path = alias_numbering_path(tmp_path)
+
+        assert path == tmp_path / "data" / "platforms" / "alias_numbering.json"
+        # 平台 id 不带点，不会有哪个平台的数据目录叫这个名字。
+        with pytest.raises(ValueError):
+            PlatformDescriptor(id=path.name, display_name="X", short_name="X")
 
     def test_qq_keeps_its_legacy_state_file_names(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("ONEBOT_STATE_FILE", raising=False)
@@ -338,3 +374,42 @@ class TestCoreRecognisesANewPlatform:
 
         assert labels[memory_namespace(_TG_GROUP)]["label"] == "猫猫群"
         assert labels[memory_namespace(_TG_GROUP)]["kind"] == "group"
+
+    def test_aliases_keyed_by_bot_account_still_name_its_private_chats(
+        self, tmp_path: Path, telegram: PlatformDescriptor,
+    ) -> None:
+        from supervisor.conversation_labels import describe_namespaces, memory_namespace
+
+        platform_data_dir(telegram, tmp_path).mkdir(parents=True)
+        platform_state_path(telegram, STATE_ROUTES, tmp_path).write_text(
+            json.dumps({"real_conversation_keys": {_TG_PRIVATE: "tg_private:555"}}), encoding="utf-8",
+        )
+        platform_state_path(telegram, STATE_ALIASES, tmp_path).write_text(
+            json.dumps({"users": {"bot1/555": {"alias": "UserC", "last_seen": 1}}}), encoding="utf-8",
+        )
+
+        label = describe_namespaces(tmp_path)[memory_namespace(_TG_PRIVATE)]
+
+        assert label["alias"] == "UserC" and label["label"] == "UserC"
+
+    def test_an_id_aliased_under_two_bot_accounts_gets_no_alias(
+        self, tmp_path: Path, telegram: PlatformDescriptor,
+    ) -> None:
+        # 会话键里看不出是哪个号，挑一个就可能把别人的名字安到这段私聊上。
+        from supervisor.conversation_labels import describe_namespaces, memory_namespace
+
+        platform_data_dir(telegram, tmp_path).mkdir(parents=True)
+        platform_state_path(telegram, STATE_ROUTES, tmp_path).write_text(
+            json.dumps({"real_conversation_keys": {_TG_PRIVATE: "tg_private:555"}}), encoding="utf-8",
+        )
+        platform_state_path(telegram, STATE_ALIASES, tmp_path).write_text(
+            json.dumps({"users": {
+                "bot1/555": {"alias": "UserC", "last_seen": 1},
+                "bot2/555": {"alias": "UserD", "last_seen": 1},
+            }}),
+            encoding="utf-8",
+        )
+
+        label = describe_namespaces(tmp_path)[memory_namespace(_TG_PRIVATE)]
+
+        assert label["alias"] == "" and label["label"] == "私聊 555"

@@ -16,6 +16,10 @@ CONVERSATION_KINDS: frozenset[str] = frozenset({CHANNEL_GROUP, CHANNEL_PRIVATE})
 
 ID_NUMERIC = "numeric"
 ID_STRING = "string"
+# 平台侧 ID 在多大范围里唯一：整个平台（QQ 号），或各个机器人账号各一套（按应用发的 openid）。
+ID_SCOPE_PLATFORM = "platform"
+ID_SCOPE_ACCOUNT = "account"
+ID_SCOPES: frozenset[str] = frozenset({ID_SCOPE_PLATFORM, ID_SCOPE_ACCOUNT})
 
 STATE_LIVE = "live"
 STATE_ROUTES = "routes"
@@ -217,6 +221,8 @@ class PlatformDescriptor:
     aliases: frozenset[str] = frozenset()
     channels: tuple[ChannelDescriptor, ...] = ()
     id_shape: str = ID_STRING
+    # 按账号分的 ID 在别名表里带上账号记，两个号各自的同一串 ID 不会被当成同一个人。拿不准就按账号分。
+    id_scope: str = ID_SCOPE_ACCOUNT
     # 加盐、加账号隔离之前就攒下会话数据的平台：会话键允许不带账号作用域，首次启动发现存量数据就钉在无盐上。
     # 只给已经在用它的平台，新平台不加。
     legacy_conversation_keys: bool = False
@@ -224,6 +230,10 @@ class PlatformDescriptor:
     config_path: str = ""
     # 覆盖配置路径的环境变量。只给已经在用它的平台，新平台不加。
     config_env: str = ""
+    # 按人的资料（称呼、头衔），相对工作区，键和别名表一样；空串表示没有。里面是明文 ID，自动算作私密文件。
+    profiles_path: str = ""
+    # 覆盖资料文件路径的环境变量。只给已经在用它的平台，新平台不加。
+    profiles_env: str = ""
     # 由适配器写、核心只读的状态文件：live 公布生效配置与运行事实，routes 是稳定会话键到真实会话键，
     # aliases 是匿名别名表，active_account 是当前登录账号，会话键摘要按它分作用域。
     # 默认在 data/platforms/<id>/ 下用标准文件名；这里只给升级前就在用老文件名的平台，写 data/ 下的相对路径。
@@ -248,6 +258,8 @@ class PlatformDescriptor:
             raise ValueError(f"platform id must be lower_snake_case: {self.id!r}")
         if self.id_shape not in {ID_NUMERIC, ID_STRING}:
             raise ValueError(f"unknown id shape: {self.id_shape!r}")
+        if self.id_scope not in ID_SCOPES:
+            raise ValueError(f"unknown id scope: {self.id_scope!r}")
         names = [channel.name for channel in self.channels]
         if len(names) != len(set(names)):
             raise ValueError(f"duplicate channel names in platform {self.id!r}")
@@ -271,12 +283,23 @@ class PlatformDescriptor:
         misplaced = [pattern for pattern in self.secret_files if pattern.startswith(_CONFIG_DIR)]
         if misplaced:
             raise ValueError(f"platform {self.id!r} keeps secret files under config/: {misplaced}")
+        self._check_movable_file("config", self.config_path, self.config_env)
+        self._check_movable_file("profiles", self.profiles_path, self.profiles_env)
         self._check_state_files()
         object.__setattr__(self, "state_files", MappingProxyType(dict(self.state_files)))
         object.__setattr__(self, "state_env", MappingProxyType(dict(self.state_env)))
         object.__setattr__(self, "hooks", MappingProxyType(dict(self.hooks)))
         for name in ("secrets", "secret_files", "owned_files", "private_files"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
+
+    def _check_movable_file(self, what: str, path: str, env: str) -> None:
+        # 保护规则把这个路径原样当 glob 用，写歪了等于没护住。
+        if path:
+            check_workspace_glob(path, what=f"platform {self.id!r} {what} file")
+        if env and not path:
+            raise ValueError(f"platform {self.id!r} moves a {what} file it does not have")
+        if env and not _ENV_NAME.match(env):
+            raise ValueError(f"platform {self.id!r} {what} env name must be UPPER_SNAKE_CASE: {env!r}")
 
     def _check_state_files(self) -> None:
         unknown = sorted(set(self.state_files) - STATE_KINDS)

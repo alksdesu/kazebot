@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from file_lock import exclusive_lock
 
 log = logging.getLogger(__name__)
 
@@ -22,11 +24,14 @@ _ROSTER_FILENAME = "memory_subjects.json"
 SUBJECT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 _MEMORY_NAMESPACE_PREFIX = "user_"
 
-_write_lock = threading.Lock()
-
 
 def roster_path(workspace_root: Path) -> Path:
     return Path(workspace_root) / "data" / _ROSTER_FILENAME
+
+
+def _roster_lock_path(workspace_root: Path) -> Path:
+    path = roster_path(workspace_root)
+    return path.with_name(f"{path.name}.lock")
 
 
 def is_valid_subject(subject: Any) -> bool:
@@ -112,29 +117,33 @@ def record_interaction(
         return False
     stamp = now or datetime.now(timezone.utc).isoformat()
     display = _clean_display_name(display_name)
-    path = roster_path(workspace_root)
-    with _write_lock:
-        roster = load_roster(workspace_root)
-        entry = roster.get(text)
-        if entry is None:
-            roster[text] = {"first_seen": stamp, "last_seen": stamp, "interactions": 1}
-            entry = roster[text]
-        else:
-            entry["last_seen"] = stamp
-            entry["interactions"] = int(entry.get("interactions") or 0) + 1
-        # 改了名就跟着改：认人靠的是他现在用的名字，不是第一次见到的那个。
-        if display:
-            entry["display_name"] = display
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps({"subjects": roster}, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except Exception as write_error:
-            log.warning("memory subject roster write failed: %s", write_error)
-            return False
+    try:
+        # 各平台各一个进程往这一份名册里登记，进程内的锁管不到别的进程，会冲掉别人刚登记的人。
+        with exclusive_lock(_roster_lock_path(workspace_root)):
+            roster = load_roster(workspace_root)
+            entry = roster.get(text)
+            if entry is None:
+                roster[text] = {"first_seen": stamp, "last_seen": stamp, "interactions": 1}
+                entry = roster[text]
+            else:
+                entry["last_seen"] = stamp
+                entry["interactions"] = int(entry.get("interactions") or 0) + 1
+            # 改了名就跟着改：认人靠的是他现在用的名字，不是第一次见到的那个。
+            if display:
+                entry["display_name"] = display
+            _write_roster(roster_path(workspace_root), roster)
+    except Exception as write_error:
+        log.warning("memory subject roster write failed: %s", write_error)
+        return False
     return True
+
+
+def _write_roster(path: Path, roster: dict[str, dict[str, Any]]) -> None:
+    # 读的一方不拿锁，写到一半被读到会当成没人建档，这一轮谁的记忆都不加载。
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"subjects": roster}, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def resolve_load_subjects(workspace_root: Path, requested: Any) -> list[str]:

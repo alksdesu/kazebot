@@ -269,8 +269,10 @@ class FakeChatAdapter:
         self.rooms = frozenset(filter(None, (normalize_id(value, shape) for value in rooms)))
         self.keys = ConversationKeys(FAKE_CHAT, secret)
         self.aliases = AliasBook(
-            platform_state_path(FAKE_CHAT, STATE_ALIASES, workspace), workspace=Path(workspace), id_shape=shape,
+            platform_state_path(FAKE_CHAT, STATE_ALIASES, workspace), platform=FAKE_CHAT, workspace=Path(workspace),
         )
+        # fakechat 的 ID 按账号分：别名表的键带着这个号，换号后的同一串 ID 不会被认成同一个人。
+        self.aliases.bind_account(self.account)
         self.session_state = SessionState()
         self.history = HistoryWindows(
             capacity=lambda: HISTORY_LINES,
@@ -614,7 +616,7 @@ class FakeChatAdapter:
         for index, token in enumerate(piece.tokens):
             if index:
                 chunks.append(Rendered(" "))
-            user = resolve_mention(token, self.aliases.users.real_of, id_shape=FAKE_CHAT.id_shape)
+            user = resolve_mention(token, self.aliases.user_real_of, id_shape=FAKE_CHAT.id_shape)
             if user and user != EVERYONE:
                 chunks.append(Rendered(mention_syntax(user), atomic=True))
             else:

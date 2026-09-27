@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,17 @@ from engine.builtin.knowledge_inject import (  # noqa: E402
 def _enroll(tmp_path: Path, *aliases: str) -> None:
     for alias in aliases:
         memory_subjects.record_interaction(tmp_path, alias)
+
+
+_ENROLL_MANY = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from engine import memory_subjects\n"
+    "workspace, prefix, count = Path(sys.argv[2]), sys.argv[3], int(sys.argv[4])\n"
+    "for index in range(count):\n"
+    "    assert memory_subjects.record_interaction(workspace, f'{prefix}{index}')\n"
+)
 
 
 def _write_subject_memory(tmp_path: Path, alias: str, entries: list[dict[str, Any]]) -> Path:
@@ -125,6 +137,38 @@ class TestRoster:
         path.write_text("{ not json", encoding="utf-8")
 
         assert memory_subjects.enrolled_subjects(tmp_path) == set()
+
+    def test_platforms_enrolling_at_once_lose_nobody(self, tmp_path: Path) -> None:
+        # 每个平台各一个进程往同一份名册里登记；读改写不跨进程加锁，会冲掉别人刚登记的人。
+        prefixes = ("UserP", "UserQ", "UserR", "UserS")
+        workers = [
+            subprocess.Popen(
+                [sys.executable, "-c", _ENROLL_MANY, str(_ROOT), str(tmp_path), prefix, "25"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            for prefix in prefixes
+        ]
+        for worker in workers:
+            _out, err = worker.communicate(timeout=120)
+            assert worker.returncode == 0, err.decode("utf-8", "replace")
+
+        assert memory_subjects.enrolled_subjects(tmp_path) == {f"{p}{i}" for p in prefixes for i in range(25)}
+
+    def test_the_roster_is_never_rewritten_in_place(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 读的一方不拿锁：原地重写时读到半份文件，会当成没人建档。
+        _enroll(tmp_path, "UserA")
+        roster = memory_subjects.roster_path(tmp_path)
+        write_text = Path.write_text
+
+        def refuse_in_place(path: Path, *args: Any, **kwargs: Any) -> int:
+            assert path != roster, "roster rewritten in place"
+            return write_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", refuse_in_place)
+
+        assert memory_subjects.record_interaction(tmp_path, "UserB")
+        assert memory_subjects.enrolled_subjects(tmp_path) == {"UserA", "UserB"}
+        assert not list(roster.parent.glob("*.tmp"))
 
     def test_a_roster_with_the_wrong_shape_is_ignored(self, tmp_path: Path) -> None:
         path = memory_subjects.roster_path(tmp_path)

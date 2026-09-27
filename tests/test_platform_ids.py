@@ -26,8 +26,22 @@ from adapters.onebot.send_contract import (  # noqa: E402
 )
 from clonoth_sdk.state import SessionState, TriggerInfo, channel_key  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
-from platforms.descriptor import ID_NUMERIC, ID_STRING, STATE_ACTIVE_ACCOUNT, PlatformDescriptor  # noqa: E402
-from platforms.ids import id_text_pattern, normalize_id, same_id  # noqa: E402
+from platforms.descriptor import (  # noqa: E402
+    ID_NUMERIC,
+    ID_SCOPE_ACCOUNT,
+    ID_SCOPE_PLATFORM,
+    ID_STRING,
+    STATE_ACTIVE_ACCOUNT,
+    PlatformDescriptor,
+)
+from platforms.ids import (  # noqa: E402
+    IDENTITY_SEPARATOR,
+    id_text_pattern,
+    identity_key,
+    normalize_id,
+    same_id,
+    split_identity_key,
+)
 
 _OPENID = "E2B7C1A09F3D4E5B8A6C7D8E9F0A1B2C"
 
@@ -97,6 +111,42 @@ class TestIdTextPattern:
         # 空的备选在每个位置都匹配空串，拿去替换等于在每两个字符之间插一个别名。
         with pytest.raises(ValueError):
             id_text_pattern([], ID_NUMERIC)
+
+
+class TestIdentityKey:
+    _APP = PlatformDescriptor(id="appchat", display_name="App Chat", short_name="App")
+
+    def test_new_platforms_scope_ids_by_account_unless_they_say_otherwise(self) -> None:
+        assert self._APP.id_scope == ID_SCOPE_ACCOUNT
+        assert QQ_NAPCAT.id_scope == ID_SCOPE_PLATFORM
+
+    def test_qq_numbers_are_keyed_as_they_are(self) -> None:
+        # QQ 别名表的键和改造前逐字节一致，换机器人账号也还是同一个人。
+        assert identity_key(QQ_NAPCAT, "10001", account="20002") == "10001"
+        assert identity_key(QQ_NAPCAT, "10001") == "10001"
+        assert split_identity_key(QQ_NAPCAT, "10001") == ("", "10001")
+
+    def test_account_scoped_ids_carry_the_bot_account(self) -> None:
+        key = identity_key(self._APP, _OPENID, account="app-1")
+
+        assert key == f"app-1{IDENTITY_SEPARATOR}{_OPENID}"
+        assert split_identity_key(self._APP, key) == ("app-1", _OPENID)
+
+    def test_the_separator_never_occurs_inside_an_id(self) -> None:
+        assert normalize_id(f"a{IDENTITY_SEPARATOR}b") == ""
+
+    @pytest.mark.parametrize("account", ["", "   "])
+    def test_an_account_scoped_id_without_the_account_is_refused(self, account: str) -> None:
+        # 漏传账号的话两个号各自的同一串 ID 会被记成同一个人，共用一份记忆。
+        with pytest.raises(ValueError, match="bot account"):
+            identity_key(self._APP, _OPENID, account=account)
+
+    def test_a_key_without_an_account_reads_as_belonging_to_none(self) -> None:
+        assert split_identity_key(self._APP, _OPENID) == ("", _OPENID)
+
+    def test_an_unknown_scope_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="unknown id scope"):
+            PlatformDescriptor(id="oddchat", display_name="Odd", short_name="O", id_scope="global")
 
 
 class TestActiveAccountStore:

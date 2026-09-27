@@ -2,14 +2,10 @@
 from __future__ import annotations
 
 import logging
-import json
-from pathlib import Path
 from typing import Any, Dict, List
 from adapters._shared.aliases import alias_from_index
-from adapters._shared.yaml_loader import load_yaml
-from ..config import CLONOTH_WORKSPACE
 
-from . import anonymize, common, permissions, state
+from . import anonymize, permissions, state
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
@@ -19,40 +15,6 @@ def _sanitize_name(name: str, max_len: int = 32) -> str:
     name = (name or "").replace("\n", " ").replace("\r", " ")
     name = name.replace("[", "(").replace("]", ")").strip()
     return (name[:max_len] + "…") if len(name) > max_len else (name or "未知成员")
-
-
-def _load_qq_user_profiles(path_text: str) -> Dict[str, Dict[str, Any]]:
-    """从 JSON/YAML 加载 QQ 用户称呼 Profile；仅用于展示和提示，不授予权限。"""
-    path_text = str(path_text or "").strip()
-    if not path_text:
-        return {}
-    path = Path(path_text).expanduser()
-    if not path.is_absolute():
-        path = (Path(CLONOTH_WORKSPACE) / path).resolve()
-    try:
-        raw = path.read_text(encoding="utf-8")
-        data = json.loads(raw) if path.suffix.lower() == ".json" else load_yaml(raw)
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        common.logger.warning("failed to load QQ user profiles: %s", path, exc_info=True)
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    users = data.get("users") if isinstance(data.get("users"), dict) else data
-    profiles: Dict[str, Dict[str, Any]] = {}
-    for raw_uid, raw_profile in users.items():
-        uid = str(raw_uid or "").strip()
-        if not uid or not isinstance(raw_profile, dict):
-            continue
-        profile = {
-            "display_name": str(raw_profile.get("display_name") or raw_profile.get("name") or "").strip(),
-            "address_as": str(raw_profile.get("address_as") or raw_profile.get("call_as") or "").strip(),
-            "title": str(raw_profile.get("title") or raw_profile.get("role") or "").strip(),
-            "note": str(raw_profile.get("note") or raw_profile.get("style_note") or "").strip(),
-        }
-        profiles[uid] = {k: v for k, v in profile.items() if v}
-    return profiles
 
 
 def _qq_user_profile(user_id: Any) -> Dict[str, Any]:

@@ -24,6 +24,7 @@ from ..config import (
 )
 from ..live_config import RECONCILED_KEYS, live, state_payload as live_config_state_payload
 from ..emoji_handler import load_bqbs
+from adapters._shared.user_profiles import load_profiles
 from clonoth_sdk import BotConfig, ClonothClient, EventRouter, SessionState
 from platforms.builtin import QQ_NAPCAT
 from platforms.descriptor import STATE_LIVE
@@ -267,6 +268,13 @@ async def _attachment_cleanup_forever() -> None:
 
 
 @common.driver.on_startup
+def _load_user_profiles() -> None:
+    """按 QQ 描述声明的位置读按人资料；位置能用 CLONOTH_QQ_USER_PROFILES_PATH 改。"""
+    state._adapter.qq_user_profiles = load_profiles(Path(USER_PROFILES_PATH))
+    if state._adapter.qq_user_profiles:
+        common.logger.info("loaded %d QQ user profiles", len(state._adapter.qq_user_profiles))
+
+
 async def _startup() -> None:
     """NoneBot 启动时初始化 Clonoth SDK 与事件路由。"""
     if state._adapter.router_task is not None and not state._adapter.router_task.done():
@@ -278,9 +286,7 @@ async def _startup() -> None:
     state._adapter.bqbs = load_bqbs(BQBS_PATH) if BQBS_PATH else []
     state._adapter.custom_face_names = emotes._load_custom_face_names_file()
     state._adapter.custom_face_metadata = emotes._load_custom_face_metadata_file()
-    state._adapter.qq_user_profiles = identity._load_qq_user_profiles(USER_PROFILES_PATH)
-    if state._adapter.qq_user_profiles:
-        common.logger.info("loaded %d QQ user profiles", len(state._adapter.qq_user_profiles))
+    _load_user_profiles()
     routing._load_route_state()
     routing._load_reply_attachment_cache()
     anonymize._load_anon_map()

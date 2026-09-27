@@ -4,10 +4,12 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable
 
-from .descriptor import ID_NUMERIC, ID_STRING
+from .descriptor import ID_NUMERIC, ID_SCOPE_PLATFORM, ID_STRING, PlatformDescriptor
 
 # 不收冒号和斜杠：ID 会拼进 `group:<id>` 这类身份串和落盘路径。
 ID_BODY = r"-?[A-Za-z0-9][A-Za-z0-9_.@\-]{0,127}"
+# 按账号分的 ID 在别名表里写成「账号/原始 ID」。ID 里不会有斜杠，拆得开。
+IDENTITY_SEPARATOR = "/"
 _SHAPES: dict[str, re.Pattern[str]] = {
     ID_STRING: re.compile(ID_BODY),
     ID_NUMERIC: re.compile(r"[0-9]{1,128}"),
@@ -29,6 +31,24 @@ def normalize_id(value: Any, shape: str = ID_STRING) -> str:
     except KeyError:
         raise ValueError(f"unknown id shape: {shape!r}") from None
     return raw if pattern.fullmatch(raw) else ""
+
+
+def identity_key(platform: PlatformDescriptor, raw: str, *, account: str = "") -> str:
+    """别名表里认人认群用的键：整个平台唯一的 ID 原样用，按账号分的前面带上机器人账号。"""
+    if platform.id_scope == ID_SCOPE_PLATFORM:
+        return raw
+    scope = str(account or "").strip()
+    if not scope:
+        raise ValueError(f"platform {platform.id!r} needs the bot account to key its ids")
+    return f"{scope}{IDENTITY_SEPARATOR}{raw}"
+
+
+def split_identity_key(platform: PlatformDescriptor, key: str) -> tuple[str, str]:
+    """identity_key 的反过程：(账号, 原始 ID)。整个平台唯一的 ID 和没带账号的键，账号是空串。"""
+    if platform.id_scope == ID_SCOPE_PLATFORM:
+        return "", key
+    account, separator, raw = key.partition(IDENTITY_SEPARATOR)
+    return (account, raw) if separator else ("", key)
 
 
 def same_id(left: Any, right: Any) -> bool:
