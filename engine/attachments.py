@@ -11,17 +11,16 @@ import io
 import logging
 import mimetypes
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
 _logger = logging.getLogger(__name__)
 
 _FILE_SCHEME = "file://"
-# [2026-04-22] 放宽为 data/ 前缀，使 data/ 下的非 attachments 文件（如 data/news_raw_*.md、
-# data/chat_messages_*.json）也能作为附件传递。安全风险可控——仍限制在 workspace 的 data/ 内，
-# 不会暴露源码或配置文件。
-_ALLOWED_PREFIX = "data/"
+# 放宽到整个 data/，而不只是 data/attachments/：工具产出的 data/news_raw_*.md、
+# data/chat_messages_*.json 也要能当附件传递。
+_ALLOWED_DIR = "data"
 
 _MIME_MAP = {
     ".png": "image/png",
@@ -162,10 +161,13 @@ def _decode_text_file(raw: bytes) -> str | None:
         return None
 
 
-def _is_allowed_attachment_path(rel_path: str) -> bool:
-    """Only allow paths under data/attachments/."""
-    normalized = rel_path.replace("\\", "/").lstrip("/")
-    return normalized.startswith(_ALLOWED_PREFIX)
+def is_allowed_attachment_path(rel_path: str) -> bool:
+    """附件只能是工作区 data/ 下的相对路径。
+
+    带 .. 段的一律拒绝：只看前缀的话 data/../ 能绕到工作区任何地方，多实例部署下连别的实例都够得着。
+    """
+    parts = PurePosixPath(rel_path.replace("\\", "/").lstrip("/")).parts
+    return len(parts) > 1 and parts[0] == _ALLOWED_DIR and ".." not in parts
 
 
 def save_attachment(
@@ -223,7 +225,7 @@ def attachments_to_content_parts(
         path = str(att.get("path") or "").strip()
         if not path:
             continue
-        if not _is_allowed_attachment_path(path):
+        if not is_allowed_attachment_path(path):
             continue
 
         att_type = str(att.get("type") or "").strip()
@@ -499,8 +501,7 @@ def _resolve_file_url(url: str, workspace_root: Path) -> str | None:
     """
     rel_path = url[len(_FILE_SCHEME):]
 
-    # Only allow paths under data/attachments/
-    if not _is_allowed_attachment_path(rel_path):
+    if not is_allowed_attachment_path(rel_path):
         return None
 
     p = (workspace_root / rel_path).resolve()

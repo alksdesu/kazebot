@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .resume_builder import _select_attachments
+from ..attachments import is_allowed_attachment_path
 from ..compact import _format_messages_for_summary
 from ..protocol import TaskAction, ACTION_ASK, ACTION_DISPATCH, ACTION_FINISH
 from .loop_state import _LoopState, _persist_ctx, _short, compact_target_session_id
@@ -37,7 +38,8 @@ def _paths_to_attachments(paths: list, workspace_root: Path) -> list[dict]:
     result = []
     for p in paths:
         p_str = str(p).strip()
-        if not p_str:
+        # 路径是模型填的，和子节点读附件时用同一道门
+        if not p_str or not is_allowed_attachment_path(p_str):
             continue
         full = workspace_root / p_str
         if not full.exists():
