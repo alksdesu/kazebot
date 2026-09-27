@@ -15,6 +15,7 @@ from adapters._shared.aliases import AliasBook
 from adapters._shared.approvals import ApprovalBook
 from adapters._shared.conversation_queue import ConversationQueue
 from adapters._shared.history_window import ClearBarriers, HistoryWindows
+from adapters._shared.sticker_delivery import ConversationLocks
 from adapters._shared.trigger_policy import CooldownState, TriggerDecision
 from platforms.builtin import QQ_NAPCAT
 from stickers.combat import CombatTracker
@@ -226,7 +227,7 @@ class OneBotAdapter:
         self.sticker_selected: contextvars.ContextVar[set[str] | None] = contextvars.ContextVar(
             "sticker_selected", default=None,
         )
-        self.sticker_delivery_locks: Dict[str, tuple[asyncio.Lock, int]] = {}
+        self.sticker_delivery_locks = ConversationLocks()
         self.sticker_receipt_task: Optional[asyncio.Task] = None
         self.sticker_combat = CombatTracker()
         # 出站 [表情:]/[at:] 渲染；resolver 在启动时注入，收藏表情缓存按账号分。

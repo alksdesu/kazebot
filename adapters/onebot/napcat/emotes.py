@@ -3,12 +3,11 @@ from __future__ import annotations
 
 import logging
 import asyncio
-import contextlib
 import hashlib
 import random
 import time
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 from platforms.ids import normalize_id
 from platforms.inbound import InboundFacts
@@ -16,6 +15,7 @@ from ..config import CLONOTH_WORKSPACE, CUSTOM_FACE_METADATA_PATH, CUSTOM_FACE_N
 from ..live_config import live
 from adapters._shared.outbound import ResolvedSticker, planned_stickers, sticker_segment
 from adapters._shared.send_guard import OutboundSendContext
+from adapters._shared.sticker_delivery import StickerDelivery
 from ..emoji_handler import (
     extract_named_custom_face_metadata,
     extract_named_custom_face_names,
@@ -28,7 +28,7 @@ from stickers.collect import CollectConfig, StickerCollector
 from stickers.combat import CombatConfig
 from stickers.collect import sticker_root, store_path as sticker_store_path
 from stickers.rank import rank
-from stickers.roster import RosterRules, candidates, offered, prompt_roster, roster_entry
+from stickers.roster import RosterRules, offered, prompt_roster, roster_entry
 from stickers.store import Sticker, StickerStore
 from stickers.tagger import StickerTagger, TaggerConfig
 
@@ -156,44 +156,14 @@ def _read_sticker(row: Sticker) -> bytes:
         return b""
 
 
-@contextlib.asynccontextmanager
-async def _serialize_sticker_delivery(conversation_key: str) -> AsyncIterator[None]:
-    lock, users = state._adapter.sticker_delivery_locks.get(conversation_key, (asyncio.Lock(), 0))
-    state._adapter.sticker_delivery_locks[conversation_key] = (lock, users + 1)
-    try:
-        async with lock:
-            yield
-    finally:
-        _, users = state._adapter.sticker_delivery_locks[conversation_key]
-        if users == 1:
-            del state._adapter.sticker_delivery_locks[conversation_key]
-        else:
-            state._adapter.sticker_delivery_locks[conversation_key] = (lock, users - 1)
+def _sticker_delivery() -> StickerDelivery:
+    return StickerDelivery(
+        plans=state._adapter.outbound_idempotency, open_store=_sticker_store_handle, read=_read_sticker,
+    )
 
 
 async def _reconcile_sticker_receipts(delivery_id: str = "") -> bool:
-    try:
-        receipts = await state._adapter.outbound_idempotency.pending_message_receipts(
-            limit=100, delivery_id=delivery_id,
-        )
-        if not receipts:
-            return True
-        for receipt in receipts:
-            store = _sticker_store_handle() if receipt.selected_images else None
-            if receipt.selected_images and store is None:
-                return False
-            for digest in receipt.selected_images:
-                await asyncio.to_thread(
-                    store.record_sent, receipt.conversation_key, digest,
-                    delivery_id=receipt.delivery_id, sent_at=int(receipt.confirmed_at),
-                )
-            await state._adapter.outbound_idempotency.ack_message_receipt(receipt.delivery_id)
-        return not await state._adapter.outbound_idempotency.pending_message_receipts(
-            limit=1, delivery_id=delivery_id,
-        )
-    except Exception:
-        common.logger.warning("表情包发送回执记账失败，将稍后重试", exc_info=True)
-        return False
+    return await _sticker_delivery().settle(delivery_id)
 
 
 async def _sticker_receipts_forever() -> None:
@@ -203,30 +173,13 @@ async def _sticker_receipts_forever() -> None:
 
 
 async def _resolve_sticker(name: str) -> ResolvedSticker | None:
-    """按名字、再按标签挑一张；读一遍文件只为确认发得出去，并记下这一刻的内容哈希。"""
-    store = _sticker_store_handle()
-    if store is None:
-        return None
-    try:
-        if not await _reconcile_sticker_receipts():
-            return None
-        key = state._adapter.sticker_send_conversation.get("")
-        skip = store.recently_sent(
-            key, within_sec=int(live.sticker_repeat_window_sec),
-        ) if key else set()
-        selected = state._adapter.sticker_selected.get()
-        if selected is not None:
-            skip.update(selected)
-        for row in candidates(store, name, skip=skip):
-            raw = await asyncio.to_thread(_read_sticker, row)
-            if raw:
-                if selected is not None:
-                    selected.add(row.sha256)
-                return ResolvedSticker(row.sha256, hashlib.sha256(raw).hexdigest())
-        return None
-    except Exception:
-        common.logger.warning("表情包取图失败: %s", name, exc_info=True)
-        return None
+    """挑图规则在共享内核里；这里给出当前会话、这条回复已经挑过的图和 QQ 的去重窗口。"""
+    return await _sticker_delivery().pick(
+        name,
+        conversation_key=state._adapter.sticker_send_conversation.get(""),
+        repeat_window_sec=int(live.sticker_repeat_window_sec),
+        selected=state._adapter.sticker_selected.get(),
+    )
 
 
 def _sticker_combat_config() -> CombatConfig:
@@ -259,7 +212,7 @@ async def _maybe_join_sticker_combat(
         return
 
     conversation_key = _sticker_conversation_key({"type": "group", "group_id": int(event.group_id)}, bot)
-    async with _serialize_sticker_delivery(conversation_key):
+    async with state._adapter.sticker_delivery_locks.hold(conversation_key):
         if not state._adapter.sticker_combat.should_battle(group, now=time.monotonic(), config=config):
             return
         history = list(state._adapter.group_history[int(event.group_id)])[-6:]

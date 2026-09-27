@@ -512,7 +512,7 @@ async def _send_split_text(
     conversation_token = state._adapter.sticker_send_conversation.set(conversation_key)
     selected_token = state._adapter.sticker_selected.set(set())
     try:
-        async with emotes._serialize_sticker_delivery(conversation_key):
+        async with state._adapter.sticker_delivery_locks.hold(conversation_key):
             sent_any = await _send_split_parts(
                 bot, target, parts,
                 source_attachments=source_attachments, send_context=send_context,
@@ -533,11 +533,7 @@ def _planned_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _read_planned_sticker(segment: Dict[str, Any]) -> str:
-    store = emotes._sticker_store_handle()
-    row = store.get(str(segment.get("sha256") or "")) if store is not None else None
-    raw = await asyncio.to_thread(emotes._read_sticker, row) if row is not None else b""
-    if not raw or hashlib.sha256(raw).hexdigest() != segment.get("content_sha256"):
-        raise SendContractError("已选表情包不可用，保持原投递内容且不自动换图")
+    raw = await emotes._sticker_delivery().load(segment)
     # 图库是几个号共用的，NapCat 容器里没有它的挂载，只能把图内容直接发过去。
     return "base64://" + base64.b64encode(raw).decode("ascii")
 

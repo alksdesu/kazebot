@@ -5,6 +5,8 @@ QQ 走真实的 rule → handler → 排队 → 发送链路，只替换网络�
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -32,6 +34,8 @@ from clonoth_sdk.types import InboundResult
 from platforms.builtin import QQ_NAPCAT
 from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE, PlatformDescriptor
 from platforms.registry import register_platform, unregister_platform
+from stickers.collect import LIBRARY_DIR, sticker_root
+from stickers.store import CAPTION_DONE, STATE_LIBRARY, StickerStore
 
 
 @dataclass(frozen=True)
@@ -46,6 +50,8 @@ class Delivery:
     mentions: tuple[str, ...] = ()
     # 引用的消息 ID，没引用是空串。
     reply_to: str = ""
+    # 随这条发出的图：内容哈希；只给了地址的图记地址。
+    images: tuple[str, ...] = ()
 
 
 class FakeClonoth:
@@ -128,6 +134,29 @@ def _segment_values(message: Any, kind: str, key: str) -> tuple[str, ...]:
     )
 
 
+def _image_contents(message: Any) -> tuple[str, ...]:
+    return tuple(
+        hashlib.sha256(base64.b64decode(file.removeprefix("base64://"))).hexdigest()
+        if file.startswith("base64://") else file
+        for file in _segment_values(message, "image", "file")
+    )
+
+
+def _put_sticker(store: StickerStore, workspace: Path, name: str, tags: tuple[str, ...]) -> str:
+    """按图库的规矩放一张：文件在库目录里，名字、标签、描述都齐了，挑图和清单才看得到它。"""
+    raw = f"synthetic-sticker-{name}".encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
+    path = sticker_root(workspace) / LIBRARY_DIR / f"{digest}.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+    store.add(
+        sha256=digest, name=name, rel_path=path.relative_to(workspace).as_posix(), source="test", state=STATE_LIBRARY,
+    )
+    store.set_auto_tags(digest, list(tags), version=1)
+    store.mark_caption(digest, CAPTION_DONE)
+    return digest
+
+
 class _NapCat:
     """记录发送的 NapCat：每条发送记成 Delivery，可以预约下一次发送出错；群成员列表按 members 回答。"""
 
@@ -162,6 +191,7 @@ class _NapCat:
             kind, str(target), _plain_text(message), message_id,
             mentions=_segment_values(message, "at", "qq"),
             reply_to=next(iter(_segment_values(message, "reply", "id")), ""),
+            images=_image_contents(message),
         ))
         if fault == FAULT_LOST_ACK:
             # NapCat 回执超时的原文：消息可能已经发出去了。
@@ -205,6 +235,18 @@ class ContractDriver:
     def offer_reactions(self) -> None:
         """打开驱动能给的表态目录；平台没有表态就什么也不做。"""
         return None
+
+    def offer_stickers(self) -> None:
+        """让每一轮都摊表情包清单；平台本来就每轮都给时什么也不做。"""
+        return None
+
+    def add_sticker(self, name: str, tags: tuple[str, ...]) -> str:
+        """往这个平台用的图库里放一张图，返回它的哈希。"""
+        raise NotImplementedError
+
+    def sticker_sent_count(self, digest: str) -> int:
+        """图库给这张图记下的发送次数。"""
+        raise NotImplementedError
 
     @property
     def feature_host(self) -> Any:
@@ -329,6 +371,16 @@ class QQDriver(ContractDriver):
     def offer_reactions(self) -> None:
         set_live_config(self.runtime, enable_reactions=True)
 
+    def offer_stickers(self) -> None:
+        set_live_config(self.runtime, sticker_send_probability=1.0)
+
+    def add_sticker(self, name: str, tags: tuple[str, ...]) -> str:
+        workspace = Path(self.runtime.state.CLONOTH_WORKSPACE)
+        return _put_sticker(self.runtime.emotes._sticker_store_handle(), workspace, name, tags)
+
+    def sticker_sent_count(self, digest: str) -> int:
+        return self.runtime.emotes._sticker_store_handle().get(digest).sent_count
+
     @property
     def feature_host(self) -> Any:
         return self.runtime.state._adapter.features.host
@@ -341,6 +393,12 @@ class QQDriver(ContractDriver):
     def text_limit(self) -> int:
         # QQ 不在能力声明里写死字数，上限是 output.message_limit。
         return live_config_module(self.runtime).live.message_limit
+
+    def close(self) -> None:
+        adapter = self.runtime.state._adapter
+        if adapter.sticker_store is not None:
+            adapter.sticker_store.close()
+        adapter.outbound_idempotency.close()
 
 
 class FakeChatDriver(ContractDriver):
@@ -379,7 +437,7 @@ class FakeChatDriver(ContractDriver):
         return [
             Delivery(
                 CHANNEL_GROUP if posted.room else CHANNEL_PRIVATE, posted.room or posted.user, posted.text, posted.id,
-                mentions=posted.mentions, reply_to=posted.reply_to,
+                mentions=posted.mentions, reply_to=posted.reply_to, images=posted.images,
             )
             for posted in self.server.posted
         ]
@@ -389,6 +447,12 @@ class FakeChatDriver(ContractDriver):
 
     def remove_admins(self) -> None:
         self.adapter.admins = frozenset()
+
+    def add_sticker(self, name: str, tags: tuple[str, ...]) -> str:
+        return _put_sticker(self.adapter.sticker_store, self.adapter.workspace, name, tags)
+
+    def sticker_sent_count(self, digest: str) -> int:
+        return self.adapter.sticker_store.get(digest).sent_count
 
     @property
     def feature_host(self) -> Any:

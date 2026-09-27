@@ -1,10 +1,13 @@
-"""只在测试里存在的聊天平台 fakechat：平台描述、收发、SDK 回调全用 platforms/、adapters/_shared/ 和 SDK 拼成。
+"""只在测试里存在的聊天平台 fakechat：平台描述、收发、SDK 回调全用 platforms/、adapters/_shared/、stickers/ 和 SDK 拼成。
 
 不导入任何 QQ 代码。契约测试拿它和 QQ 跑同一套断言，共享层缺了什么，这里最先拼不起来。
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -31,6 +34,8 @@ from adapters._shared.history_window import ClearBarriers, HistoryWindows
 from adapters._shared.memory_hints import collect_subjects
 from adapters._shared.outbound import (
     EVERYONE,
+    SEGMENT_STICKER,
+    EmojiPiece,
     MarkerGrammar,
     MentionPiece,
     Piece,
@@ -39,15 +44,18 @@ from adapters._shared.outbound import (
     join_rendered,
     limit_parts,
     mention_as_text,
+    planned_stickers,
     resolve_mention,
     split_reply,
+    sticker_segment,
     strip_markup,
     tokenize,
 )
-from adapters._shared.output_guide import OutputGuide, split_section
+from adapters._shared.output_guide import OutputGuide, emoji_section, split_section
 from adapters._shared.send_guard import (
     AmbiguousAckError,
     IdempotencyClaim,
+    MessagePlan,
     OutboundSendContext,
     SendContractError,
     SendError,
@@ -57,6 +65,7 @@ from adapters._shared.send_guard import (
     idempotency_key,
     protected_claim_send,
 )
+from adapters._shared.sticker_delivery import ConversationLocks, StickerDelivery
 from adapters._shared.trigger_policy import CooldownState, TriggerConfig, TriggerInput, evaluate
 from clonoth_sdk.state import SessionState, TriggerInfo
 from platforms.descriptor import (
@@ -67,11 +76,17 @@ from platforms.descriptor import (
     ID_STRING,
     MENTION_NATIVE,
     ChannelDescriptor,
+    ImageSupport,
     PlatformCapabilities,
     PlatformDescriptor,
 )
 from platforms.ids import normalize_id
 from platforms.inbound import InboundConversation, InboundFacts, InboundSender
+from stickers.collect import sticker_root, store_path
+from stickers.roster import RosterRules, offered, prompt_roster, roster_entry
+from stickers.store import Sticker, StickerStore
+
+IMAGE_MAX_BYTES = 1024 * 1024
 
 FAKE_CHAT = PlatformDescriptor(
     id="fakechat",
@@ -86,6 +101,7 @@ FAKE_CHAT = PlatformDescriptor(
     hooks={HOOK_TRIGGER_POLICY: "adapters._shared.trigger_policy"},
     capabilities=PlatformCapabilities(
         max_text_length=2000, markdown=True, max_split_parts=3, mention=MENTION_NATIVE, quote=True,
+        images=ImageSupport(formats=frozenset({"png", "gif", "jpeg", "webp"}), max_bytes=IMAGE_MAX_BYTES),
     ),
 )
 
@@ -148,6 +164,8 @@ class Posted:
     text: str
     reply_to: str = ""
     mentions: tuple[str, ...] = ()
+    # 随这条发出的图，记内容哈希。
+    images: tuple[str, ...] = ()
 
 
 class ChatTimeout(TimeoutError):
@@ -171,13 +189,16 @@ class ChatServer:
             raise ValueError(f"unknown fault: {fault!r}")
         self._faults.append(fault)
 
-    async def post(self, *, room: str = "", user: str = "", text: str, reply_to: str = "") -> str:
+    async def post(
+        self, *, room: str = "", user: str = "", text: str, reply_to: str = "", images: tuple[bytes, ...] = (),
+    ) -> str:
         fault = self._faults.pop(0) if self._faults else ""
         if fault == FAULT_REFUSED:
             raise ChatRefused("connection refused")
         message_id = f"p{len(self.posted) + 1}"
         mentions = tuple(dict.fromkeys(_MENTION_RE.findall(text)))
-        self.posted.append(Posted(message_id, room, user, text, reply_to, mentions))
+        digests = tuple(hashlib.sha256(image).hexdigest() for image in images)
+        self.posted.append(Posted(message_id, room, user, text, reply_to, mentions, digests))
         if fault == FAULT_LOST_ACK:
             raise ChatTimeout(f"acknowledgement lost after {message_id}")
         if fault == FAULT_HANG:
@@ -204,8 +225,25 @@ def classify_send_failure(exc: BaseException) -> SendError:
     return AmbiguousAckError(f"fakechat post acknowledgement is unknown: {exc}", cause=exc)
 
 
+def _image_fits(size: int) -> bool:
+    limit = FAKE_CHAT.capabilities.images.max_bytes
+    return size > 0 and (not limit or size <= limit)
+
+
+@dataclass(frozen=True)
+class RenderedPart:
+    """要发的一条：渲染好的正文，和模型点名要发的表情。表情到发送时才去图库挑，挑中的冻结进发送计划。"""
+
+    text: str
+    emoji: tuple[str, ...] = ()
+
+    @property
+    def identity(self) -> str:
+        return json.dumps([self.text, list(self.emoji)], ensure_ascii=False)
+
+
 class FakeChatAdapter:
-    """fakechat 适配器：进程内状态、入站翻译与提交、按能力声明渲染出站、受防重保护的发送、审批与上下文重置。"""
+    """fakechat 适配器：进程内状态、入站翻译与提交、按能力声明渲染出站、受防重保护的发送、表情包选图与记账、审批与上下文重置。"""
 
     def __init__(
         self,
@@ -239,6 +277,14 @@ class FakeChatAdapter:
         self.outbound = TwoPhaseIdempotencyStore(
             data / "fakechat_outbound.sqlite3", target_identity=target_identity, log_namespace="fakechat",
         )
+        self.workspace = Path(workspace)
+        self.sticker_store = StickerStore(store_path(self.workspace))
+        # 库里有发得出去的图就每轮都摊清单，测试里不掷骰子。
+        self.sticker_rules = RosterRules(probability=1.0)
+        self.stickers = StickerDelivery(
+            plans=self.outbound, open_store=lambda: self.sticker_store, read=self.read_sticker,
+        )
+        self.sticker_locks = ConversationLocks()
         self.trigger = TriggerConfig()
         self.cooldown = CooldownState()
         self.routes: dict[str, dict[str, Any]] = {}
@@ -249,6 +295,7 @@ class FakeChatAdapter:
 
     def close(self) -> None:
         self.outbound.close()
+        self.sticker_store.close()
 
     def stable_key(self, real_key: str) -> str:
         return self.keys.stable_key(real_key, bot_scope=self.account)
@@ -364,9 +411,40 @@ class FakeChatAdapter:
             alias_of_user_id=self.aliases.user_alias,
         )}
 
-    def output_guide(self) -> OutputGuide:
-        """按能力声明给：表态和表情 fakechat 都没有，只剩分条。"""
-        return OutputGuide.of(split_section(FAKE_CHAT))
+    def output_guide(self, conversation_key: str) -> OutputGuide:
+        """按能力声明给：分条，库里有发得出去的图时加上表情包清单；表态和平台自己的表情 fakechat 都没有。"""
+        return OutputGuide.of(
+            split_section(FAKE_CHAT),
+            emoji_section(FAKE_CHAT, stickers=self.sticker_roster(conversation_key)),
+        )
+
+    def sticker_roster(self, conversation_key: str) -> list[str]:
+        if not offered(self.sticker_rules, random.random()):
+            return []
+        rows = prompt_roster(
+            self.sticker_store, conversation_key, self.sticker_rules,
+            sendable=lambda row: self.sticker_file(row) is not None,
+        )
+        return [roster_entry(row) for row in rows]
+
+    def sticker_file(self, row: Sticker) -> Path | None:
+        """按图片声明判断发不发得出去：落在库外的路径、空文件、超过大小上限的都不发。"""
+        root = sticker_root(self.workspace).resolve()
+        path = (self.workspace / row.rel_path).resolve()
+        try:
+            return path if path.is_relative_to(root) and _image_fits(path.stat().st_size) else None
+        except OSError:
+            return None
+
+    def read_sticker(self, row: Sticker) -> bytes:
+        path = self.sticker_file(row)
+        if path is None:
+            return b""
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return b""
+        return raw if _image_fits(len(raw)) else b""
 
     async def submit(self, facts: InboundFacts, *, exclude_seq: int = 0) -> bool:
         conversation = facts.conversation
@@ -387,7 +465,7 @@ class FakeChatAdapter:
                 "target_type": conversation.kind,
             },
             memory_hints=self.memory_hints(facts),
-            output_guide=self.output_guide().payload(),
+            output_guide=self.output_guide(conversation.conversation_key).payload(),
         )
         if not result.session_id or not result.accepted:
             return False
@@ -423,6 +501,48 @@ class FakeChatAdapter:
         identity = target_identity(target)
         context = context or OutboundSendContext(conversation_key=str(target.get("conversation_key") or ""))
         key = idempotency_key(identity, content_identity or text, event_id=context.idempotency_key or context.event_id)
+        return await self.send_claimed(target, key, text, context=context)
+
+    async def post_planned(
+        self, target: Mapping[str, Any], part: RenderedPart, *, context: OutboundSendContext, selected: set[str],
+    ) -> str:
+        """带表情的一条：挑图的结果先冻结进发送计划，重试照原样发、不重新挑；一张都挑不出就只发正文。"""
+        conversation_key = str(target.get("conversation_key") or "")
+        planned = context.child("stickers")
+
+        async def build() -> dict[str, Any]:
+            segments: list[dict[str, Any]] = [{"type": "text", "content": part.text}] if part.text else []
+            for name in part.emoji:
+                sticker = await self.stickers.pick(
+                    name, conversation_key=conversation_key,
+                    repeat_window_sec=self.sticker_rules.repeat_window_sec, selected=selected,
+                )
+                if sticker is not None:
+                    segments.append(sticker_segment(sticker.sha256, sticker.content_sha256))
+            return {
+                "processed_segments": segments,
+                "send_identity": hashlib.sha256(part.identity.encode("utf-8")).hexdigest(),
+                "selected_images": planned_stickers(segments),
+                "conversation_key": conversation_key,
+            }
+
+        key = idempotency_key(
+            target_identity(target), part.identity, event_id=planned.idempotency_key or planned.event_id,
+        )
+        plan = await self.outbound.get_or_create_message_plan(key, target, build)
+        selected.update(plan.selected_images)
+        if not plan.processed_segments:
+            return ""
+        text = "".join(
+            str(segment.get("content") or "") for segment in plan.processed_segments if segment.get("type") == "text"
+        )
+        return await self.send_claimed(target, plan.claim_key, text, context=planned, plan=plan)
+
+    async def send_claimed(
+        self, target: Mapping[str, Any], key: str, text: str, *, context: OutboundSendContext,
+        plan: MessagePlan | None = None,
+    ) -> str:
+        """按防重键发一条，同一个键只真正发出一次。带发送计划的，发之前按计划读图，确认送达后按回执记账。"""
         claim = await self.outbound.begin(key)
         if not claim.acquired and claim.state == "pending":
             resolved = await self.outbound.wait_for_resolution(key)
@@ -431,37 +551,53 @@ class FakeChatAdapter:
             )
         if not claim.acquired:
             message_id = await self.outbound.sent_message_id(key)
+            if plan is not None:
+                await self.stickers.settle(plan.delivery_id)
             await self.features.bind_reminder_message(self.bot, target, context, message_id)
             return message_id or f"idempotent:{key}"
         room = str(target["id"]) if target["kind"] == ROOM_TARGET else ""
         user = str(target["id"]) if target["kind"] == DM_TARGET else ""
-        message_id = await protected_claim_send(
-            self.outbound, claim,
-            lambda: self.server.post(room=room, user=user, text=text, reply_to=str(target.get("reply_to") or "")),
-            classify=classify_send_failure,
-        )
+
+        async def send() -> str:
+            return await self.server.post(
+                room=room, user=user, text=text, reply_to=str(target.get("reply_to") or ""),
+                images=await self.planned_images(plan),
+            )
+
+        message_id = await protected_claim_send(self.outbound, claim, send, classify=classify_send_failure)
+        if plan is not None:
+            await self.stickers.settle(plan.delivery_id)
         await self.features.record_outbound(self.bot, target, text, message_id)
         await self.features.bind_reminder_message(self.bot, target, context, message_id)
         return message_id
 
-    def render(self, text: str) -> list[str]:
-        """按能力声明把一条模型回复渲染成要发的几条消息；渲染完是空的不算一条。"""
+    async def planned_images(self, plan: MessagePlan | None) -> tuple[bytes, ...]:
+        if plan is None:
+            return ()
+        segments = [segment for segment in plan.processed_segments if segment.get("type") == SEGMENT_STICKER]
+        return tuple([await self.stickers.load(segment) for segment in segments])
+
+    def render(self, text: str) -> list[RenderedPart]:
+        """按能力声明把一条模型回复渲染成要发的几条；正文和表情都没有的不算一条。"""
         capabilities = FAKE_CHAT.capabilities
-        messages: list[str] = []
+        parts: list[RenderedPart] = []
         for part in limit_parts(split_reply(text), capabilities.max_split_parts):
             body = strip_markup(part, FAKE_MARKERS, keep_markdown=capabilities.markdown)
-            chunks = [chunk for piece in tokenize(body, FAKE_MARKERS) for chunk in self.render_piece(piece)]
+            pieces = tokenize(body, FAKE_MARKERS)
+            chunks = [chunk for piece in pieces for chunk in self.render_piece(piece)]
             message = join_rendered(chunks, capabilities.max_text_length, suffix=TRUNCATED_NOTICE).strip()
-            if message:
-                messages.append(message)
-        return messages
+            # 发不了图就没有图库可找，表情标记整个丢掉。
+            emoji = tuple(piece.name for piece in pieces if isinstance(piece, EmojiPiece)) if capabilities.images else ()
+            if message or emoji:
+                parts.append(RenderedPart(message, emoji))
+        return parts
 
     def render_piece(self, piece: Piece) -> list[Rendered]:
         if isinstance(piece, TextPiece):
             return [Rendered(piece.text)]
         if isinstance(piece, MentionPiece):
             return self.render_mention(piece)
-        # 没有自定义表情，也没有表情包库，表情标记整个丢掉。
+        # 表情不进正文：图库里挑中的图随这一条一起发。
         return []
 
     def render_mention(self, piece: MentionPiece) -> list[Rendered]:
@@ -492,21 +628,30 @@ class FakeChatAdapter:
         purpose = getattr(context, "purpose", "direct")
         if purpose == "ambient" or "_response_purpose" not in target:
             target["_response_purpose"] = purpose
-        messages = self.render(text)
-        if not messages:
+        parts = self.render(text)
+        if not parts:
             return []
         await self.features.check_send(self.bot, target)
         in_room = target["kind"] == ROOM_TARGET
         # 清空上下文时还在飞的回复照发，但它是上一段上下文的产物，不能落回刚清空的窗口。
         stale = in_room and self.barriers.is_stale(target["id"], int(context.source_inbound_seq or 0))
         sent: list[str] = []
-        for index, message in enumerate(messages):
-            # 引用只挂在第一条上，条条都引用同一句就成了刷屏。
-            quoted = index == 0 and FAKE_CHAT.capabilities.quote
-            sent.append(await self.post(
-                target if quoted else {**target, "reply_to": ""}, message,
-                context=context.child(f"part:{index}"), content_identity=f"part:{index}:{message}",
-            ))
+        # 这条回复里挑过的图，后面几条不再挑。
+        selected: set[str] = set()
+        async with self.sticker_locks.hold(str(target.get("conversation_key") or "")):
+            for index, part in enumerate(parts):
+                # 引用只挂在第一条上，条条都引用同一句就成了刷屏。
+                quoted = index == 0 and FAKE_CHAT.capabilities.quote
+                destination = target if quoted else {**target, "reply_to": ""}
+                child = context.child(f"part:{index}")
+                if part.emoji:
+                    message_id = await self.post_planned(destination, part, context=child, selected=selected)
+                else:
+                    message_id = await self.post(
+                        destination, part.text, context=child, content_identity=f"part:{index}:{part.text}",
+                    )
+                if message_id:
+                    sent.append(message_id)
         if record and in_room and not stale:
             self.history.append(target["id"], self.reply_history_line(text))
         return sent

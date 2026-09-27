@@ -1,6 +1,6 @@
 """适配器契约：任何平台都要过的一组断言，QQ 与只在测试里存在的 fakechat 各跑一遍。
 
-只断言平台无关的事：提交字段与身份、输出说明、外部平台硬规则、发送防重、出站渲染与降级、审批、上下文重置、提醒回执。文案与协议细节归各平台自己的测试。
+只断言平台无关的事：提交字段与身份、输出说明、外部平台硬规则、发送防重、出站渲染与降级、表情包选图与记账、审批、上下文重置、提醒回执。文案与协议细节归各平台自己的测试。
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from _contract_drivers import DRIVERS, ContractDriver, Delivery, open_driver, re
 from _fake_platform import FAULT_HANG, FAULT_LOST_ACK, FAULT_REFUSED  # noqa: E402
 from adapters._shared.feature_gateway import FeatureHost, QuietDeliveryDeferred  # noqa: E402
 from adapters._shared.outbound import EVERYONE, SPLIT_MARKER  # noqa: E402
-from adapters._shared.output_guide import SECTION_REACTIONS, SECTION_SPLIT  # noqa: E402
+from adapters._shared.output_guide import SECTION_EMOJI, SECTION_REACTIONS, SECTION_SPLIT  # noqa: E402
 from adapters._shared.send_guard import SendError  # noqa: E402
 from clonoth_sdk.callbacks import AdapterCallbacks  # noqa: E402
 from clonoth_sdk.state import TriggerInfo  # noqa: E402
@@ -74,6 +74,24 @@ async def _group_trigger(driver: ContractDriver, text: str = "a question", *, me
     trigger = driver.session_state.get_trigger(len(driver.client.submissions))
     assert trigger is not None, "a submitted group message registers its trigger"
     return trigger
+
+
+async def _room_reply(driver: ContractDriver, trigger: TriggerInfo, text: str, key: str) -> list[Delivery]:
+    """按触发回一条模型回复，返回这次在房间里新发出的消息。"""
+    before = len(driver.delivered_to(CHANNEL_GROUP, driver.room))
+    context = DeliveryContext(
+        idempotency_key=key, conversation_key=trigger.conversation_key, source_inbound_seq=trigger.inbound_seq,
+    )
+    await driver.callbacks.send_reply(trigger, text, [], delivery_context=context)
+    return driver.delivered_to(CHANNEL_GROUP, driver.room)[before:]
+
+
+def _single_room_reply(driver: ContractDriver, text: str) -> Delivery:
+    async def scenario() -> list[Delivery]:
+        return await _room_reply(driver, await _group_trigger(driver), text, "single")
+
+    [sent] = asyncio.run(scenario())
+    return sent
 
 
 class TestShape:
@@ -226,6 +244,18 @@ class TestOutputGuide:
             assert [title for title in titles if title in call["text"]] == []
             assert SPLIT_MARKER not in call["text"] and "[REACT:" not in call["text"]
 
+    def test_library_stickers_are_offered_outside_the_text(self, driver: ContractDriver) -> None:
+        driver.add_sticker("wave", ("hello",))
+        driver.offer_stickers()
+
+        asyncio.run(driver.group_message("hello there", sender=driver.member, message_id="101", mention_bot=True))
+
+        [call] = driver.client.submissions
+        emoji = _guide_sections(call).get(SECTION_EMOJI)
+        # 清单每轮在变，放动态区；写进正文就会一轮轮堆在对话历史里。
+        assert emoji is not None and emoji["volatile"] and "wave" in emoji["text"]
+        assert "wave" not in call["text"]
+
 
 class TestExternalPlatformRules:
     @staticmethod
@@ -366,35 +396,19 @@ class TestSendGuard:
 class TestOutboundRendering:
     """模型回复里的标记按能力声明渲染；平台做不到的退回可读文字或者丢掉，标记本身不会漏到聊天里。"""
 
-    @staticmethod
-    async def _reply(driver: ContractDriver, trigger: TriggerInfo, text: str, key: str) -> list[Delivery]:
-        before = len(driver.delivered_to(CHANNEL_GROUP, driver.room))
-        context = DeliveryContext(
-            idempotency_key=key, conversation_key=trigger.conversation_key, source_inbound_seq=trigger.inbound_seq,
-        )
-        await driver.callbacks.send_reply(trigger, text, [], delivery_context=context)
-        return driver.delivered_to(CHANNEL_GROUP, driver.room)[before:]
-
     def _mention_pair(self, driver: ContractDriver, text: str) -> tuple[Delivery, Delivery]:
         """同一个触发下先发一条普通回复再发 text：有的平台引用时顺带提及原作者，比的是多出来的提及。"""
         async def scenario() -> tuple[Delivery, Delivery]:
             trigger = await _group_trigger(driver)
-            [plain] = await self._reply(driver, trigger, "noted", "plain")
-            [marked] = await self._reply(driver, trigger, text, "marked")
+            [plain] = await _room_reply(driver, trigger, "noted", "plain")
+            [marked] = await _room_reply(driver, trigger, text, "marked")
             return plain, marked
 
         return asyncio.run(scenario())
 
-    def _single(self, driver: ContractDriver, text: str) -> Delivery:
-        async def scenario() -> list[Delivery]:
-            return await self._reply(driver, await _group_trigger(driver), text, "single")
-
-        [sent] = asyncio.run(scenario())
-        return sent
-
     def test_split_markers_become_separate_messages_within_the_platform_limit(self, driver: ContractDriver) -> None:
         async def scenario() -> list[Delivery]:
-            return await self._reply(driver, await _group_trigger(driver), "one[SPLIT]two[SPLIT]three[SPLIT]four", "split")
+            return await _room_reply(driver, await _group_trigger(driver), "one[SPLIT]two[SPLIT]three[SPLIT]four", "split")
 
         texts = [delivery.text.strip() for delivery in asyncio.run(scenario())]
 
@@ -405,7 +419,7 @@ class TestOutboundRendering:
 
     def test_only_the_first_message_quotes_the_trigger(self, driver: ContractDriver) -> None:
         async def scenario() -> list[Delivery]:
-            return await self._reply(driver, await _group_trigger(driver, message_id="101"), "first[SPLIT]second", "quote")
+            return await _room_reply(driver, await _group_trigger(driver, message_id="101"), "first[SPLIT]second", "quote")
 
         quotes = [delivery.reply_to for delivery in asyncio.run(scenario())]
 
@@ -414,7 +428,7 @@ class TestOutboundRendering:
     def test_markdown_is_kept_only_where_the_platform_renders_it(self, driver: ContractDriver) -> None:
         text = "**bold** and `code`"
 
-        sent = self._single(driver, text)
+        sent = _single_room_reply(driver, text)
 
         assert sent.text.strip() == (text if driver.platform.capabilities.markdown else "bold and code")
 
@@ -444,21 +458,99 @@ class TestOutboundRendering:
             assert added == set() and "@all" in marked.text
 
     def test_a_reaction_marker_never_reaches_the_chat(self, driver: ContractDriver) -> None:
-        assert self._single(driver, "fine[REACT:76]").text.strip() == "fine"
+        assert _single_room_reply(driver, "fine[REACT:76]").text.strip() == "fine"
 
     def test_an_emoji_the_platform_cannot_find_is_dropped(self, driver: ContractDriver) -> None:
-        assert self._single(driver, "look[表情:no-such-face]").text.strip() == "look"
+        assert _single_room_reply(driver, "look[表情:no-such-face]").text.strip() == "look"
 
     def test_an_overlong_message_is_cut_to_the_platform_limit(self, driver: ContractDriver) -> None:
         limit = driver.text_limit
         text = "x" * ((limit or 4000) + 100)
 
-        body = self._single(driver, text).text.strip()
+        body = _single_room_reply(driver, text).text.strip()
 
         if limit:
             assert len(body) <= limit and body.startswith("x" * (limit // 2))
         else:
             assert body == text
+
+
+class TestStickers:
+    """[表情:名称] 落到共享图库：挑中的图只发一次、只记一次账，而且只认确认送达的；同一会话刚发过的不再挑；名字对不上按标签找，都不沾边就只发正文。"""
+
+    def test_a_picked_sticker_goes_out_once_and_is_counted_once(self, driver: ContractDriver) -> None:
+        digest = driver.add_sticker("wave", ("hello",))
+
+        async def scenario() -> tuple[list[Delivery], list[Delivery]]:
+            trigger = await _group_trigger(driver)
+            first = await _room_reply(driver, trigger, "hi[表情:wave]", "sticker")
+            replay = await _room_reply(driver, trigger, "hi[表情:wave]", "sticker")
+            return first, replay
+
+        first, replay = asyncio.run(scenario())
+
+        assert [delivery.images for delivery in first] == [(digest,)]
+        assert "hi" in first[0].text and "[表情" not in first[0].text
+        assert replay == []
+        assert driver.sticker_sent_count(digest) == 1
+
+    def test_a_sticker_just_sent_in_the_room_is_not_picked_again(self, driver: ContractDriver) -> None:
+        digest = driver.add_sticker("wave", ("hello",))
+
+        async def scenario() -> list[Delivery]:
+            trigger = await _group_trigger(driver)
+            await _room_reply(driver, trigger, "[表情:wave]", "first")
+            return await _room_reply(driver, trigger, "again[表情:wave]", "second")
+
+        [second] = asyncio.run(scenario())
+
+        assert second.images == () and second.text.strip() == "again"
+        assert driver.sticker_sent_count(digest) == 1
+
+    def test_a_word_off_the_list_falls_back_to_a_tag(self, driver: ContractDriver) -> None:
+        digest = driver.add_sticker("wave", ("hello",))
+
+        assert _single_room_reply(driver, "[表情:hello]").images == (digest,)
+
+    def test_a_word_matching_nothing_sends_the_text_alone(self, driver: ContractDriver) -> None:
+        driver.add_sticker("wave", ("hello",))
+
+        sent = _single_room_reply(driver, "look[表情:nothing-like-it]")
+
+        assert sent.images == () and sent.text.strip() == "look"
+
+    def test_a_refused_send_counts_nothing_until_the_retry_goes_out(self, driver: ContractDriver) -> None:
+        wave, nod = driver.add_sticker("wave", ("hello",)), driver.add_sticker("nod", ("hello",))
+
+        async def scenario() -> tuple[int, list[Delivery]]:
+            trigger = await _group_trigger(driver)
+            driver.fail_next_send(FAULT_REFUSED)
+            with pytest.raises(SendError):
+                await _room_reply(driver, trigger, "[表情:hello]", "refused")
+            counted = driver.sticker_sent_count(wave) + driver.sticker_sent_count(nod)
+            return counted, await _room_reply(driver, trigger, "[表情:hello]", "refused")
+
+        counted, [sent] = asyncio.run(scenario())
+
+        assert counted == 0
+        [digest] = sent.images
+        assert digest in {wave, nod} and driver.sticker_sent_count(digest) == 1
+        assert driver.sticker_sent_count(wave) + driver.sticker_sent_count(nod) == 1
+
+    def test_a_lost_acknowledgement_is_never_counted(self, driver: ContractDriver) -> None:
+        digest = driver.add_sticker("wave", ("hello",))
+
+        async def scenario() -> None:
+            trigger = await _group_trigger(driver)
+            driver.fail_next_send(FAULT_LOST_ACK)
+            with pytest.raises(SendError):
+                await _room_reply(driver, trigger, "[表情:wave]", "lost")
+
+        asyncio.run(scenario())
+
+        # 平台可能已经收下了，但没有回执不算送达：宁可少记一次，也不记没确认的图。
+        assert [delivery.images for delivery in driver.delivered_to(CHANNEL_GROUP, driver.room)] == [(digest,)]
+        assert driver.sticker_sent_count(digest) == 0
 
 
 class TestApprovalFlow:
