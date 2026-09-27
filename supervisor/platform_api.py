@@ -13,6 +13,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from platforms.descriptor import HOOK_CONSOLE_SCHEMA, HOOK_TRIGGER_POLICY, PlatformDescriptor
 from platforms.live import file_fingerprint, live_status, read_live_state, same_file
 from platforms.registry import (
+    MissingPlatformHook,
     all_platforms,
     features_module,
     get_platform,
@@ -149,7 +150,7 @@ def config_schema(platform: PlatformDescriptor) -> dict[str, Any]:
     """控制台的分区布局和控件说明，取自平台代码里的声明，bot 没起来也给得出。"""
     try:
         layout = platform_hook(platform, HOOK_CONSOLE_SCHEMA)
-    except LookupError:
+    except MissingPlatformHook:
         raise HTTPException(status_code=404, detail=f"{platform.display_name} 没有控制台配置界面") from None
     return layout.schema()
 

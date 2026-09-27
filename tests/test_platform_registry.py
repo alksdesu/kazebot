@@ -24,6 +24,7 @@ from platforms.descriptor import (  # noqa: E402
     HOOK_ACCOUNT_OPS,
     HOOK_CONSOLE_SCHEMA,
     HOOK_KNOWN_ACCOUNTS,
+    HOOK_MAINTENANCE,
     HOOK_TRIGGER_POLICY,
     STATE_ALIASES,
     STATE_KINDS,
@@ -35,6 +36,7 @@ from platforms.descriptor import (  # noqa: E402
 )
 from platforms.registry import (  # noqa: E402
     STANDARD_STATE_FILES,
+    MissingPlatformHook,
     alias_numbering_path,
     all_platforms,
     conversation_channel,
@@ -76,6 +78,18 @@ def telegram():
         yield TELEGRAM
     finally:
         unregister_platform(TELEGRAM.id)
+
+
+@pytest.fixture
+def broken_hook(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """一个导入就抛 KeyError 的钩子模块，模拟钩子自己读配置读炸了。"""
+    name = "clonoth_broken_hook_probe"
+    (tmp_path / f"{name}.py").write_text("raise KeyError('napcat config')\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    try:
+        yield name
+    finally:
+        sys.modules.pop(name, None)
 
 
 class TestLookups:
@@ -342,8 +356,29 @@ class TestFilesAndHooks:
         assert platform_hook(QQ_NAPCAT, HOOK_TRIGGER_POLICY) is trigger_policy
 
     def test_a_missing_hook_is_a_lookup_error(self, telegram: PlatformDescriptor) -> None:
+        # 独立的类型，但仍是 LookupError：照着老写法接的调用方不用跟着改。
+        assert issubclass(MissingPlatformHook, LookupError)
+        with pytest.raises(MissingPlatformHook):
+            platform_hook(telegram, HOOK_TRIGGER_POLICY)
         with pytest.raises(LookupError):
             platform_hook(telegram, HOOK_TRIGGER_POLICY)
+
+    def test_a_hook_module_that_breaks_on_import_is_not_a_missing_hook(self, broken_hook: str) -> None:
+        """钩子模块自己抛的 KeyError 也是 LookupError，笼统地接住就把坏模块当成了没声明。"""
+        platform = PlatformDescriptor(
+            id="brokenhook", display_name="坏钩子", short_name="BH",
+            channels=(ChannelDescriptor("bh_group", CHANNEL_GROUP),),
+            hooks={HOOK_TRIGGER_POLICY: broken_hook},
+        )
+
+        with pytest.raises(KeyError) as caught:
+            platform_hook(platform, HOOK_TRIGGER_POLICY)
+        assert not isinstance(caught.value, MissingPlatformHook)
+
+    def test_the_maintenance_hook_is_the_qq_module(self) -> None:
+        from adapters.onebot import maintenance
+
+        assert platform_hook(QQ_NAPCAT, HOOK_MAINTENANCE) is maintenance
 
     def test_the_console_hook_is_the_qq_layout(self) -> None:
         from adapters.onebot import console_layout

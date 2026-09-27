@@ -17,6 +17,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import supervisor.admin_api as admin_api  # noqa: E402
+import supervisor.platform_api as platform_api  # noqa: E402
+from platforms.builtin import QQ_NAPCAT  # noqa: E402
 from platforms.descriptor import CHANNEL_GROUP, ChannelDescriptor, PlatformDescriptor  # noqa: E402
 from platforms.registry import register_platform, unregister_platform  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
@@ -87,7 +89,9 @@ def test_the_listing_includes_qq(call) -> None:
     qq = next(item for item in body["platforms"] if item["id"] == "qq")
     assert qq["display_name"] == "QQ · NapCat"
     assert {channel["name"] for channel in qq["channels"]} >= {"qq_group", "qq_private"}
-    assert qq["hooks"] == ["account_ops", "console_schema", "instance_env", "known_accounts", "trigger_policy"]
+    assert qq["hooks"] == [
+        "account_ops", "console_schema", "instance_env", "known_accounts", "maintenance", "trigger_policy",
+    ]
     assert qq["capabilities"]["mention"] == "native" and qq["capabilities"]["markdown"] is False
 
 
@@ -123,6 +127,17 @@ def test_a_platform_without_a_console_layout_has_no_schema(call, chatless) -> No
     assert response.status_code == 404
     assert response.json()["detail"] == "无配置平台 没有控制台配置界面"
     assert call("GET", "/v1/platforms/telegram/config/schema").status_code == 404
+
+
+def test_a_console_layout_that_breaks_on_import_is_not_a_missing_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    """布局模块自己抛的 KeyError 翻成 404，控制台会说这个平台没有配置界面 —— 它有，是坏了。"""
+    def lookup(platform: PlatformDescriptor, name: str) -> Any:
+        raise KeyError("layout section")
+
+    monkeypatch.setattr(platform_api, "platform_hook", lookup)
+
+    with pytest.raises(KeyError):
+        platform_api.config_schema(QQ_NAPCAT)
 
 
 def test_writing_and_reading_the_qq_config(call, tmp_path: Path) -> None:

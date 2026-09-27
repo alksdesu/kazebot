@@ -15,7 +15,7 @@ from typing import Any, Mapping
 
 from platforms.descriptor import HOOK_INSTANCE_ENV
 from platforms.ids import normalize_id
-from platforms.registry import all_platforms, get_platform, platform_hook
+from platforms.registry import MissingPlatformHook, all_platforms, get_platform, platform_hook
 
 from .instances import (
     MAX_INDEX,
@@ -168,7 +168,7 @@ def _platform_env(plan: Plan) -> list[str]:
     for platform in all_platforms():
         try:
             module = platform_hook(platform, HOOK_INSTANCE_ENV)
-        except LookupError:
+        except MissingPlatformHook:
             continue
         ports = {port.name: plan.ports[port.name] for port in platform.instance_ports}
         lines.extend(module.instance_env(plan.idx, ports))

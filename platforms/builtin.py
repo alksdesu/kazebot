@@ -9,6 +9,7 @@ from .descriptor import (
     HOOK_ACCOUNT_OPS,
     HOOK_CONSOLE_SCHEMA,
     HOOK_INSTANCE_ENV,
+    HOOK_MAINTENANCE,
     HOOK_KNOWN_ACCOUNTS,
     HOOK_TRIGGER_POLICY,
     ID_NUMERIC,
@@ -64,6 +65,7 @@ QQ_NAPCAT = PlatformDescriptor(
         HOOK_KNOWN_ACCOUNTS: "adapters.onebot.accounts",
         HOOK_ACCOUNT_OPS: "adapters.onebot.account_ops",
         HOOK_INSTANCE_ENV: "adapters.onebot.provisioning",
+        HOOK_MAINTENANCE: "adapters.onebot.maintenance",
     },
     # 按驱动现在做得到的填：NapCat 能撤回消息，但驱动没接，就不声明。
     # 字数上限不写死，由 output.message_limit 截断。

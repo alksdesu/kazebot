@@ -231,11 +231,15 @@ def platform_secret_file(
     return workspace_path(override, workspace_root) if override else Path(workspace_root) / secret.file
 
 
+class MissingPlatformHook(LookupError):
+    """平台描述没声明这个钩子。钩子模块导入时自己抛的 KeyError 也是 LookupError，调用方只认这个才不会把坏模块当成没声明。"""
+
+
 def platform_hook(platform: PlatformDescriptor, name: str) -> ModuleType:
     """按需导入平台策略模块。适配器包导入没有副作用，这里才能直接 import。"""
     module_path = platform.hooks.get(name)
     if not module_path:
-        raise LookupError(f"platform {platform.id!r} has no {name!r} hook")
+        raise MissingPlatformHook(f"platform {platform.id!r} has no {name!r} hook")
     return importlib.import_module(module_path)
 
 

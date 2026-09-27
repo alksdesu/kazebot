@@ -3,8 +3,9 @@
 
 Run by ``clonoth-data-cleanup.timer`` every hour by default. Pure Python, with no
 LLM calls. The jobs include event/signal log rotation, expiration of temporary
-artifacts and child-session state, conservative QQ cache cleanup, and stale
-non-constant memory entry cleanup.
+artifacts and child-session state, stale non-constant memory entry cleanup,
+and each platform's own maintenance (adapter and client caches) through the
+platform's maintenance hook.
 """
 
 import json
@@ -13,6 +14,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,6 +29,8 @@ except ModuleNotFoundError:  # pragma: no cover - direct ``python engine/data_cl
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:  # 直接 ``python engine/data_cleanup.py`` 时项目根不在路径上
     sys.path.insert(0, str(_REPO_ROOT))
+from platforms.descriptor import HOOK_MAINTENANCE  # noqa: E402
+from platforms.registry import MissingPlatformHook, all_platforms, platform_hook  # noqa: E402
 from workspace import resolve_workspace_root  # noqa: E402
 
 # ── Paths ──────────────────────────────────────
@@ -46,28 +50,6 @@ EVENTS_BACKUPS = int(os.getenv("CLONOTH_EVENTS_BACKUPS", "3"))
 TEMP_MAX_AGE = 24 * 3600              # 24 h
 ARTIFACT_MAX_AGE = 24 * 3600          # 24 h
 ATTACH_MAX_AGE = 24 * 3600            # 24 h
-
-# QQ/NapCat 内部缓存保守清理阈值。QQ Electron 运行时可能在独立 mount
-# namespace 中使用 /app/.config/QQ；systemd timer 在宿主 namespace 运行时
-# 需要通过 /proc/<qq-pid>/root/... 访问这些路径。
-#
-# NTQQ 常见缓存还包括账号目录下的 Image/Video，例如：
-#   /app/.config/QQ/<qq号>/Image
-#   /app/.config/QQ/<qq号>/Video
-# 这些目录里的文件不一定都有标准扩展名，所以清理逻辑除扩展名外，
-# 也会按父目录名 image/video/cache/tmp/download 等识别旧缓存文件。
-QQ_CACHE_MAX_AGE = float(os.getenv("CLONOTH_QQ_CACHE_MAX_AGE_SECONDS", str(7 * 24 * 3600)))
-QQ_CACHE_ROOTS_RAW = os.getenv("CLONOTH_QQ_CACHE_ROOTS", "")
-QQ_CACHE_MEDIA_EXTENSIONS = {
-    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
-    ".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv", ".m4v",
-}
-QQ_CACHE_DIR_KEYWORDS = {
-    "cache", "cache_data", "code cache", "gpucache", "blob_storage",
-    "tmp", "temp", "download", "downloads", "thumb", "thumbnail", "thumbnails",
-    # Explicitly cover NTQQ account media cache directories: <qq号>/Image and <qq号>/Video.
-    "image", "images", "pic", "pics", "video", "videos", "emoji", "face", "record",
-}
 
 # Persistent memory entry cleanup. Entries with constant=true are protected.
 # For ordinary entries, use last_hit_at first, then updated_at, then created_at.
@@ -108,11 +90,6 @@ LLM_ERROR_SNAPSHOT_MAX_AGE = float(os.getenv("CLONOTH_LLM_ERROR_SNAPSHOT_MAX_AGE
 
 # stocktool 行情缓存 data/stocktool/cache/：行情/解析缓存，过期可重拉，保留 1 天。
 STOCKTOOL_CACHE_MAX_AGE = float(os.getenv("CLONOTH_STOCKTOOL_CACHE_MAX_AGE_SECONDS", str(1 * 24 * 3600)))
-
-# OneBot 引用消息附件索引缓存 data/cache/onebot_reply_attachments.json：
-# 指向已落盘附件的路径索引；附件本体由 attachments 清理，这里按文件龄保守清（与 attachments 同龄期）。
-ONEBOT_CACHE_MAX_AGE = float(os.getenv("CLONOTH_ONEBOT_CACHE_MAX_AGE_SECONDS", str(24 * 3600)))
-
 
 
 def _log_init():
@@ -223,168 +200,45 @@ def purge_dir(directory: Path, max_age: float, label: str, recursive=False):
     logging.info("[%s] deleted %d files", label, deleted)
 
 
-# ── QQ/NapCat internal cache cleanup ───────────
-def _split_configured_roots(raw: str) -> list[Path]:
-    roots: list[Path] = []
-    for item in str(raw or "").replace("\n", ",").split(","):
-        value = item.strip()
-        if value:
-            roots.append(Path(value))
-    return roots
+# ── platform maintenance ──────────────────────
+@dataclass(frozen=True)
+class _CleanupContext:
+    """交给平台 maintenance 钩子的上下文：删文件都走这里，演练模式才管得住。"""
+
+    workspace_root: Path
+    data_dir: Path
+
+    @property
+    def dry_run(self) -> bool:
+        return DRY_RUN
+
+    def remove_file(self, path: Path) -> None:
+        _unlink(path)
+
+    def remove_empty_dir(self, path: Path) -> None:
+        _rmdir(path)
+
+    def purge_dir(self, directory: Path, max_age: float, label: str, *, recursive: bool = False) -> None:
+        purge_dir(directory, max_age, label, recursive=recursive)
 
 
-def _read_proc_strings(path: Path) -> list[str]:
-    try:
-        data = path.read_bytes()
-    except Exception:
-        return []
-    return [x.decode("utf-8", "replace") for x in data.split(b"\0") if x]
-
-
-def _append_unique_path(paths: list[Path], path: Path) -> None:
-    key = str(path)
-    if not key or key == ".":
-        return
-    if all(str(x) != key for x in paths):
-        paths.append(path)
-
-
-def _discover_qq_cache_roots() -> list[Path]:
-    """Return conservative candidate roots for NTQQ/NapCat cache cleanup.
-
-    On the Debian server QQ is launched from /opt/QQ/qq but runs with HOME=/app and
-    Chromium child processes use --user-data-dir=/app/.config/QQ.  When /app lives
-    only in QQ's mount namespace, the host-side timer can still access it through
-    /proc/<pid>/root/app/....
-    """
-    roots: list[Path] = []
-    for p in _split_configured_roots(QQ_CACHE_ROOTS_RAW):
-        _append_unique_path(roots, p)
-
-    for p in (Path("/app/.config/QQ"), Path("/app/napcat"), Path("/root/.config/QQ")):
-        _append_unique_path(roots, p)
-
-    proc = Path("/proc")
-    if not proc.exists():
-        return roots
-
-    for pid_dir in proc.iterdir():
-        if not pid_dir.name.isdigit():
-            continue
-        cmdline = _read_proc_strings(pid_dir / "cmdline")
-        environ = _read_proc_strings(pid_dir / "environ")
-        haystack = "\n".join(cmdline + environ)
-        if "/opt/QQ/qq" not in haystack and "--user-data-dir=" not in haystack and "napcat" not in haystack.lower():
-            continue
-
-        proc_root = pid_dir / "root"
-        for index, arg in enumerate(cmdline):
-            user_data_dir = ""
-            if arg.startswith("--user-data-dir="):
-                user_data_dir = arg.split("=", 1)[1]
-            elif arg == "--user-data-dir" and index + 1 < len(cmdline):
-                user_data_dir = cmdline[index + 1]
-            if user_data_dir.startswith("/"):
-                _append_unique_path(roots, proc_root / user_data_dir.lstrip("/"))
-
-        home = ""
-        for item in environ:
-            if item.startswith("HOME="):
-                home = item.split("=", 1)[1].strip()
-                break
-        if home.startswith("/"):
-            _append_unique_path(roots, proc_root / home.lstrip("/") / ".config" / "QQ")
-            _append_unique_path(roots, proc_root / home.lstrip("/") / "napcat")
-
-    return roots
-
-
-def _is_safe_qq_cache_root(root: Path) -> bool:
-    text = str(root)
-    if not text or text in {"/", "/app", "/root", "/proc"}:
-        return False
-    lowered = text.lower()
-    return "qq" in lowered or "napcat" in lowered
-
-
-def _is_cache_like_relative_path(rel: Path) -> bool:
-    for part in rel.parts[:-1]:
-        lowered = part.lower()
-        compact = lowered.replace(" ", "")
-        if any(keyword in lowered or keyword.replace(" ", "") in compact for keyword in QQ_CACHE_DIR_KEYWORDS):
-            return True
-    return False
-
-
-def purge_qq_internal_cache():
-    """Clean stale NTQQ/NapCat image/video/cache files.
-
-    This deliberately does not wipe whole QQ data directories. It only removes old
-    media files or files inside cache-like directories, including NTQQ account
-    media caches such as <qq号>/Image and <qq号>/Video. This avoids deleting login
-    state, account databases, and other durable QQ configuration.
-    """
-    if QQ_CACHE_MAX_AGE <= 0:
-        logging.info("[qq_cache] disabled")
-        return
-
-    cutoff = time.time() - QQ_CACHE_MAX_AGE
-    deleted = 0
-    deleted_bytes = 0
-    scanned_roots = 0
-    roots = _discover_qq_cache_roots()
-
-    for root in roots:
+def run_platform_maintenance():
+    """各平台自己的定期维护，比如清适配器和平台客户端攒的缓存，由平台描述的 maintenance 钩子给出。"""
+    context = _CleanupContext(workspace_root=DATA_DIR.parent, data_dir=DATA_DIR)
+    for platform in all_platforms():
         try:
-            if not _is_safe_qq_cache_root(root) or not root.exists() or not root.is_dir():
-                continue
-            scanned_roots += 1
-            for p in root.rglob("*"):
-                try:
-                    if not p.is_file():
-                        continue
-                    st = p.stat()
-                    if st.st_mtime >= cutoff:
-                        continue
-                    rel = p.relative_to(root)
-                    is_media = p.suffix.lower() in QQ_CACHE_MEDIA_EXTENSIONS
-                    is_cache_file = _is_cache_like_relative_path(rel)
-                    if not (is_media or is_cache_file):
-                        continue
-                    size = st.st_size
-                    _unlink(p)
-                    deleted += 1
-                    deleted_bytes += size
-                except Exception:
-                    continue
-
-            # Remove empty cache/media subdirectories, but never the root itself.
-            for dirpath, _, _ in os.walk(str(root), topdown=False):
-                dp = Path(dirpath)
-                if dp == root:
-                    continue
-                try:
-                    rel = dp.relative_to(root)
-                    if not _is_cache_like_relative_path(rel / "placeholder"):
-                        continue
-                    next(dp.iterdir())
-                except StopIteration:
-                    try:
-                        _rmdir(dp)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+            tasks = platform_hook(platform, HOOK_MAINTENANCE).maintenance_tasks()
+        except MissingPlatformHook:
+            continue
         except Exception as exc:
-            logging.info("[qq_cache] skipped %s: %s", root, exc)
-
-    logging.info(
-        "[qq_cache] scanned_roots=%d deleted=%d freed=%dKB max_age_hours=%.1f",
-        scanned_roots,
-        deleted,
-        deleted_bytes // 1024,
-        QQ_CACHE_MAX_AGE / 3600,
-    )
+            # 一个平台的模块导不进来，别的平台照样清。
+            logging.error("[%s] maintenance hook unavailable: %s", platform.id, exc)
+            continue
+        for task in tasks:
+            try:
+                task.run(context)
+            except Exception as exc:
+                logging.error("[%s.%s] %s", platform.id, task.name, exc)
 
 
 # ── persistent memory entry cleanup ───────────
@@ -714,10 +568,8 @@ def main(argv: list[str] | None = None):
                          max_age=ARTIFACT_MAX_AGE, label="artifacts")),
         (purge_dir, dict(directory=DATA_DIR / "attachments",
                          max_age=ATTACH_MAX_AGE, label="attachments", recursive=True)),
-        # OneBot 引用附件索引缓存（与 attachments 同龄期，避免指向已删附件的旧索引堆积）。
-        (purge_dir, dict(directory=DATA_DIR / "cache",
-                         max_age=ONEBOT_CACHE_MAX_AGE, label="onebot_cache", recursive=True)),
-        (purge_qq_internal_cache, {}),
+        # 平台自己的缓存由各平台声明的维护钩子清。
+        (run_platform_maintenance, {}),
         (purge_expired_memory_entries, {}),
         # 新增：之前未覆盖的目录
         (purge_expired_transcripts, {}),

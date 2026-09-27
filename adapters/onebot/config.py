@@ -13,6 +13,7 @@ from typing import Any, Callable
 from dotenv import dotenv_values
 
 from adapters._shared.env import env_first, env_float, env_int, split_list
+from adapters.onebot.maintenance import reply_attachment_cache_file
 from clonoth_runtime import (
     SECRET_FROM_ENV,
     PlatformSecret,
@@ -242,10 +243,8 @@ BURST_STORE_FILE = os.path.join(CLONOTH_WORKSPACE, "data", "onebot_bursts.sqlite
 
 # 引用消息附件索引缓存：保存 message_id -> 已落盘图片附件路径，用于 get_msg 失败时兜底转发。
 # 与路由状态分离，避免 onebot_plugin_state.json 被临时缓存污染。
-REPLY_ATTACHMENT_CACHE_FILE = env_first(
-    "ONEBOT_REPLY_ATTACHMENT_CACHE_FILE",
-    default=os.path.join(CLONOTH_WORKSPACE, "data", "cache", "onebot_reply_attachments.json"),
-)
+# 改位置用 ONEBOT_REPLY_ATTACHMENT_CACHE_FILE。
+REPLY_ATTACHMENT_CACHE_FILE = str(reply_attachment_cache_file(Path(CLONOTH_WORKSPACE)))
 
 # 匿名别名映射持久化文件：保存 真实 QQ 号/群号 <-> UserX/GroupX 别名 的双向映射。
 # 目的：跨重启保持别名一致，避免历史/记忆里同一人出现不同别名，并支持别名反解。

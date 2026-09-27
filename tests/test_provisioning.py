@@ -460,6 +460,20 @@ def test_a_platform_only_sees_the_ports_it_declared(workspace: Path, monkeypatch
     assert "NOISY_INDEX=1" in body and "NOISY_PORT=9310" in body
 
 
+def test_a_hook_module_that_breaks_on_import_is_not_a_missing_hook(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """跳过等于悄悄开出一个缺了这个平台配置的实例，起来才发现连不上。"""
+    def lookup(platform: PlatformDescriptor, name: str) -> Any:
+        raise KeyError("napcat ports")
+
+    monkeypatch.setattr(provisioning, "platform_hook", lookup)
+    plan = _plan(workspace, monkeypatch, 1)
+
+    with pytest.raises(KeyError):
+        provisioning._platform_env(plan)
+
+
 # ── QQ 侧写进 .env 的那几行 ──
 
 def test_the_primary_qq_instance_listens_on_loopback_without_a_token() -> None:

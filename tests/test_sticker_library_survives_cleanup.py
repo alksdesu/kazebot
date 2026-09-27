@@ -53,7 +53,7 @@ def test_temp_globs_cannot_reach_the_library() -> None:
 
 def test_qq_cache_keywords_do_not_match_the_library() -> None:
     """QQ 内部缓存那条按目录名关键词匹配，命中就按 7 天删。"""
-    from engine.data_cleanup import QQ_CACHE_DIR_KEYWORDS
+    from adapters.onebot.maintenance import QQ_CACHE_DIR_KEYWORDS
 
     assert not any(word in "stickers" for word in QQ_CACHE_DIR_KEYWORDS)
 

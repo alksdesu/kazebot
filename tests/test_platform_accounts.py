@@ -243,6 +243,18 @@ class TestOpsPerPlatform:
         assert response.status_code == 404
         assert response.json()["detail"] == "别的平台 没有账号运维"
 
+    def test_a_hook_module_that_breaks_on_import_is_not_a_missing_hook(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """钩子模块读配置读炸了会抛 KeyError，翻成 404「没有账号运维」就等于说这个平台压根没做。"""
+        def lookup(platform: PlatformDescriptor, name: str) -> Any:
+            raise KeyError("napcat config")
+
+        monkeypatch.setattr(platform_accounts, "platform_hook", lookup)
+
+        with pytest.raises(KeyError):
+            PlatformAccounts(tmp_path).ops(QQ_NAPCAT)
+
     def test_each_platform_keeps_its_own_ops(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, otherchat: PlatformDescriptor,
     ) -> None:

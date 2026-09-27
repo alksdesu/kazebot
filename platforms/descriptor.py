@@ -35,6 +35,8 @@ HOOK_KNOWN_ACCOUNTS = "known_accounts"
 HOOK_ACCOUNT_OPS = "account_ops"
 # 模块提供 instance_env(index, ports)：多开建新实例时，这个平台的进程要写进 .env 的那几行。
 HOOK_INSTANCE_ENV = "instance_env"
+# 模块提供 maintenance_tasks()，约定见 platforms/maintenance.py；定期数据清理时平台自己要清的缓存走它。
+HOOK_MAINTENANCE = "maintenance"
 
 # native 由驱动按平台 ID 渲染成真正的提及，text 只能写成「@名字」的文字。
 MENTION_NONE = "none"
