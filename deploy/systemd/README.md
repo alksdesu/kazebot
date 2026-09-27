@@ -33,6 +33,19 @@ sudo systemctl edit kazebot-host-cleanup.service
 # Environment=CLONOTH_QQ_CACHE_ROOTS=/srv/qq-extra
 ```
 
+Machines set up before this timer existed get it by re-running `install_provision.sh` if they run several instances. A single-instance machine installs it by hand, as root, right after updating with `deploy.sh` so the copy matches what was just pulled:
+
+```bash
+install -d -m 0755 -o root -g root /usr/local/lib/kazebot
+install -m 0644 -o root -g root /opt/kazebot/adapters/onebot/qq_cache.py /usr/local/lib/kazebot/qq_cache.py
+install -m 0644 -o root -g root /opt/kazebot/deploy/systemd/kazebot-host-cleanup.service \
+  /opt/kazebot/deploy/systemd/kazebot-host-cleanup.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now kazebot-host-cleanup.timer
+```
+
+The main instance's own cleanup keeps running the task until `kazebot.service` carries `CLONOTH_MAINTENANCE_SCOPE=workspace` (`systemctl edit kazebot.service`, then restart it). That run is harmless, since it cannot delete the containers' files, but its log keeps reporting `deleted=0`.
+
 Dry run, schedule and logs:
 
 ```bash
