@@ -40,6 +40,9 @@ class TestDeclarations:
     def test_only_the_sticker_library_is_global_only(self) -> None:
         assert {key.name for key in features.FEATURE_KEYS if key.layers == GLOBAL_ONLY} == _STICKER_LIBRARY
 
+    def test_the_global_only_paths_follow_the_declarations(self) -> None:
+        assert features.GLOBAL_ONLY_PATHS == {features.FEATURE_KEYS_BY_NAME[name].path for name in _STICKER_LIBRARY}
+
     def test_adopting_keeps_everything_but_env(self) -> None:
         adopted = features.adopt("enable_echo", env=("SOME_PLATFORM_ECHO",))
 

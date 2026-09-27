@@ -33,6 +33,16 @@ def leaf_paths(document: Any, prefix: str = "") -> list[str]:
     return [prefix] if prefix else []
 
 
+def value_at(document: Any, path: str) -> Any:
+    """点分路径上的值。中途不是映射、或者键不存在，都是 None。"""
+    cursor = document
+    for part in path.split("."):
+        if not isinstance(cursor, dict) or part not in cursor:
+            return None
+        cursor = cursor[part]
+    return cursor
+
+
 def read_raw(path: Path) -> dict[str, Any]:
     if not path.exists():
         # 「还没接管」是正常状态，不是错误。刻意不回落到示例文件：

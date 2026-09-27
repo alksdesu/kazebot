@@ -15,6 +15,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from platforms.descriptor import HOOK_CONSOLE_SCHEMA, HOOK_TRIGGER_POLICY, STATE_LIVE, PlatformDescriptor
 from platforms.registry import (
     all_platforms,
+    features_module,
     get_platform,
     platform_config_path,
     platform_hook,
@@ -65,9 +66,39 @@ def read_config_raw(workspace_root: Path, platform: PlatformDescriptor) -> dict[
     return config_files.read_raw(config_file(workspace_root, platform))
 
 
+def _current_document(path: Path) -> dict[str, Any]:
+    try:
+        return config_files.parse_mapping(config_files.read_raw(path)["content"])
+    except (HTTPException, OSError, UnicodeDecodeError):
+        # 读不了或写坏了就当它是空的：新内容里的每一处都算新写。
+        return {}
+
+
+def _global_only_writes(path: Path, document: dict[str, Any]) -> list[str]:
+    """新写或改了值的只认全局的键。升级前就有、原样留着的老写法照收：全局没写时 bot 还靠它兜底。"""
+    current = _current_document(path)
+    return sorted(
+        key_path
+        for key_path in features_module().GLOBAL_ONLY_PATHS
+        if (value := config_files.value_at(document, key_path)) is not None
+        and value != config_files.value_at(current, key_path)
+    )
+
+
+def _shown_path(path: Path, workspace_root: Path) -> str:
+    try:
+        return path.relative_to(workspace_root).as_posix()
+    except ValueError:
+        return str(path)
+
+
 def write_config_raw(workspace_root: Path, platform: PlatformDescriptor, content: str) -> dict[str, Any]:
     path = config_file(workspace_root, platform)
     document = config_files.parse_mapping(content)
+    misplaced = _global_only_writes(path, document)
+    if misplaced:
+        features = _shown_path(features_module().features_config_path(workspace_root), workspace_root)
+        raise HTTPException(status_code=400, detail=f"只能写在全局设置 {features} 里：{misplaced}")
     warnings: list[str] = []
     known = live_state(workspace_root, platform).get("paths")
     if isinstance(known, dict) and known:

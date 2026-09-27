@@ -324,6 +324,9 @@ FEATURE_KEYS: tuple[LiveKey, ...] = (
 
 FEATURE_KEYS_BY_NAME: Mapping[str, LiveKey] = MappingProxyType({key.name: key for key in FEATURE_KEYS})
 
+# 平台文件老位置上的写法只作升级前的兜底，平台配置的写入接口拿它拒收新写法。
+GLOBAL_ONLY_PATHS: frozenset[str] = frozenset(key.path for key in FEATURE_KEYS if key.layers == GLOBAL_ONLY)
+
 
 def features_config_path(workspace_root: Path) -> Path:
     override = os.environ.get(FEATURES_CONFIG_ENV, "").strip()

@@ -323,7 +323,7 @@ class TestGlobalPage:
         global_only = {key.name for key in features.FEATURE_KEYS if LAYER_PLATFORM not in key.layers}
 
         assert set(_placed((library,))) == global_only
-        assert set(STICKER_LIBRARY_PATHS) == {features.FEATURE_KEYS_BY_NAME[name].path for name in global_only}
+        assert set(STICKER_LIBRARY_PATHS) == features.GLOBAL_ONLY_PATHS
 
     def test_the_sending_paths_match_the_sending_keys(self) -> None:
         picking = next(part for part in FEATURE_SECTIONS if part.id == "sticker")

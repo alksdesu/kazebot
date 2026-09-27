@@ -152,6 +152,75 @@ def test_the_legacy_routes_answer_the_same(call, tmp_path: Path) -> None:
     )
 
 
+_LIBRARY_LINE = "extensions:\n  sticker:\n    auto_accept: true\n"
+
+
+def _seed_qq_file(tmp_path: Path, content: str) -> Path:
+    path = tmp_path / "config" / "qq.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def test_a_platform_file_refuses_a_new_global_only_setting(call, tmp_path: Path) -> None:
+    refused = call("PUT", "/v1/platforms/qq/config/raw", json={"content": _LIBRARY_LINE})
+
+    assert refused.status_code == 400
+    detail = refused.json()["detail"]
+    assert "config/features.yaml" in detail
+    assert "extensions.sticker.auto_accept" in detail
+    assert not (tmp_path / "config" / "qq.yaml").exists()
+
+
+def test_a_line_kept_from_before_the_split_still_saves(call, tmp_path: Path) -> None:
+    # 控制台合并草稿时会把升级前那一行原样带回来，不能因此什么都存不进去。
+    path = _seed_qq_file(tmp_path, _LIBRARY_LINE)
+
+    kept = call("PUT", "/v1/platforms/qq/config/raw", json={"content": _LIBRARY_LINE + "channels:\n  allowed_groups: [1]\n"})
+
+    assert kept.status_code == 200
+    assert "allowed_groups" in path.read_text(encoding="utf-8")
+
+
+def test_changing_an_old_line_or_adding_beside_it_is_refused(call, tmp_path: Path) -> None:
+    _seed_qq_file(tmp_path, _LIBRARY_LINE)
+
+    changed = call("PUT", "/v1/platforms/qq/config/raw", json={"content": _LIBRARY_LINE.replace("true", "false")})
+    added = call("PUT", "/v1/platforms/qq/config/raw", json={"content": _LIBRARY_LINE + "    library_limit: 500\n"})
+
+    assert changed.status_code == 400
+    assert "extensions.sticker.auto_accept" in changed.json()["detail"]
+    assert added.status_code == 400
+    assert "extensions.sticker.library_limit" in added.json()["detail"]
+    assert "auto_accept" not in added.json()["detail"]
+
+
+def test_dropping_an_old_line_is_always_allowed(call, tmp_path: Path) -> None:
+    _seed_qq_file(tmp_path, _LIBRARY_LINE)
+
+    nulled = call("PUT", "/v1/platforms/qq/config/raw", json={"content": _LIBRARY_LINE.replace("true", "null")})
+    removed = call("PUT", "/v1/platforms/qq/config/raw", json={"content": "channels: {}\n"})
+
+    assert nulled.status_code == 200
+    assert removed.status_code == 200
+
+
+def test_a_broken_file_on_disk_counts_as_empty(call, tmp_path: Path) -> None:
+    _seed_qq_file(tmp_path, "extensions: [\n" + _LIBRARY_LINE)
+
+    refused = call("PUT", "/v1/platforms/qq/config/raw", json={"content": _LIBRARY_LINE})
+
+    assert refused.status_code == 400
+    assert "extensions.sticker.auto_accept" in refused.json()["detail"]
+
+
+def test_the_legacy_route_refuses_the_same(call, tmp_path: Path) -> None:
+    refused = call("PUT", "/v1/admin/config/qq/raw", json={"content": _LIBRARY_LINE})
+
+    assert refused.status_code == 400
+    assert "extensions.sticker.auto_accept" in refused.json()["detail"]
+
+
 def test_the_dry_run_uses_the_published_values(call, tmp_path: Path) -> None:
     live = tmp_path / "data" / "qq_live_state.json"
     live.parent.mkdir(parents=True, exist_ok=True)
