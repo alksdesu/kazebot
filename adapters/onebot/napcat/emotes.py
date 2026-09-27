@@ -29,6 +29,7 @@ from stickers.collect import CollectConfig, StickerCollector
 from stickers.combat import CombatConfig
 from stickers.collect import sticker_root, store_path as sticker_store_path
 from stickers.rank import rank
+from stickers.roster import RosterRules, candidates, offered, prompt_roster, roster_entry
 from stickers.store import Sticker, StickerStore
 from stickers.tagger import StickerTagger, TaggerConfig
 
@@ -216,20 +217,15 @@ async def _resolve_sticker(name: str) -> ResolvedSticker | str:
         selected = state._adapter.sticker_selected.get()
         if selected is not None:
             skip.update(selected)
-        row = store.by_name(name)
-        while True:
-            if row is not None and row.sha256 not in skip:
-                skip.add(row.sha256)
-                raw = await asyncio.to_thread(_read_sticker, row)
-                if raw:
-                    if selected is not None:
-                        selected.add(row.sha256)
-                    return ResolvedSticker(
-                        "base64://" + base64.b64encode(raw).decode("ascii"), row.sha256,
-                    )
-            row = store.by_tag(name, exclude=skip)
-            if row is None:
-                return ""
+        for row in candidates(store, name, skip=skip):
+            raw = await asyncio.to_thread(_read_sticker, row)
+            if raw:
+                if selected is not None:
+                    selected.add(row.sha256)
+                return ResolvedSticker(
+                    "base64://" + base64.b64encode(raw).decode("ascii"), row.sha256,
+                )
+        return ""
     except Exception:
         common.logger.warning("表情包取图失败: %s", name, exc_info=True)
         return ""
@@ -378,33 +374,29 @@ async def _stop_stickers() -> None:
         state._adapter.sticker_store = None
 
 
-def _sticker_prompt_entries(conversation_key: str) -> list[str]:
-    """这一轮摆给模型看的表情包清单。
+def _sticker_roster_rules() -> RosterRules:
+    return RosterRules(
+        limit=int(live.sticker_prompt_limit),
+        probability=float(live.sticker_send_probability),
+        repeat_window_sec=int(live.sticker_repeat_window_sec),
+    )
 
-    不按群友那句话预筛。表情包配的是 bot 自己要回的语气，而候选是在模型开口之前
-    就得定下来的 —— 拿对方说的话去筛，筛出来的情绪往往正好是反的。清单直接摊开，
-    让唯一同时知道「对方说了什么」和「我要回什么」的角色去挑。
-    """
-    limit = int(live.sticker_prompt_limit)
-    if limit <= 0 or random.random() >= float(live.sticker_send_probability):
+
+def _sticker_sendable(row: Sticker) -> bool:
+    return _sticker_file_path(row) is not None
+
+
+def _sticker_prompt_entries(conversation_key: str) -> list[str]:
+    """这一轮摆给模型看的表情包清单；给不给、给哪些照 stickers.roster 的规则，这里只管发不发得出去。"""
+    rules = _sticker_roster_rules()
+    if not offered(rules, random.random()):
         return []
     store = _sticker_store_handle()
     if store is None:
         return []
     try:
-        recent = store.recently_sent(
-            conversation_key, within_sec=int(live.sticker_repeat_window_sec),
-        )
-        usable = [
-            row for row in store.all_usable()
-            if row.sha256 not in recent and _sticker_file_path(row) is not None
-        ]
-        # 装不下就让发得最少的先上，轮着来；否则冷门图永远排在字典序后面没人见过。
-        usable.sort(key=lambda row: (row.sent_count, row.name))
-        return [
-            f"{row.name}（{'、'.join(row.tags[:8]) or '无标签'}）"
-            for row in usable[:limit]
-        ]
+        rows = prompt_roster(store, conversation_key, rules, sendable=_sticker_sendable)
+        return [roster_entry(row) for row in rows]
     except Exception:
         common.logger.debug("表情包清单读取失败", exc_info=True)
         return []

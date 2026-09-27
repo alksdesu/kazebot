@@ -13,9 +13,11 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Union
 
 from adapters._shared.outbound import (
+    EMOJI_LIBRARY,
+    EMOJI_NATIVE,
     FOREIGN_CUSTOM_EMOJI,
     REACT_MARKER,
     MarkerGrammar,
@@ -53,7 +55,7 @@ class ResolvedSticker:
 
 # 输入别名/显示名，返回真实 QQ 号字符串；解析不到返回 None。
 AtAliasResolver = Callable[[str], Optional[str]]
-# 表情包名 -> 可发送地址。收藏表情查不到时才问它，所以同名的收藏表情优先级更高。
+# 表情包名 -> 可发送地址。和收藏表情谁先问由查找顺序定。
 StickerResolver = Callable[[str], Awaitable[Union[ResolvedSticker, str, None]]]
 
 
@@ -651,10 +653,11 @@ class EmojiRenderer:
         strip_asterisk_styles: bool = True,
         strip_underscore_styles: bool = False,
         strip_markdown_styles: bool | None = None,
+        lookup: Sequence[str] = (EMOJI_NATIVE, EMOJI_LIBRARY),
     ) -> List[Dict[str, Any]]:
         """把一条回复渲染成 OneBot 消息段描述：先剥掉渲染不了的写法，再按共享解析切出的段逐个渲染。
 
-        表情名先查收藏表情，查不到才问表情包库。返回 dict 而不是 MessageSegment，这个模块才不用依赖 NoneBot。
+        表情名按 lookup 的先后去收藏表情和表情包库里找。返回 dict 而不是 MessageSegment，这个模块才不用依赖 NoneBot。
         """
         text = strip_output_markers(
             text,
@@ -663,9 +666,7 @@ class EmojiRenderer:
             strip_markdown_styles=strip_markdown_styles,
         )
         segments: List[Dict[str, Any]] = []
-        # 优先用持久化元数据里的 URL 直接发送，避免每条消息都拉 NapCat 详情。
-        face_index: Dict[str, Any] | None = build_metadata_face_index(metadata) if metadata else None
-        live_loaded = False
+        faces = _FaceLookup(self, bot, bqbs, preferred_names, metadata)
 
         for piece in tokenize(text, QQ_MARKERS):
             if isinstance(piece, TextPiece):
@@ -676,35 +677,7 @@ class EmojiRenderer:
                 continue
 
             name = piece.name
-            key = _normalize_name(name)
-            sticker_sha256 = ""
-            if face_index is None:
-                face_index = await self._reply_face_index(bot, bqbs, preferred_names, metadata)
-                live_loaded = True
-            entry = face_index.get(key)
-            # 元数据候选组：同名随机选一个 URL 直接发送。
-            url = _metadata_pick_url(entry) if isinstance(entry, dict) and "__group__" in entry else ""
-            face = None if (isinstance(entry, dict) and "__group__" in entry) else entry
-            if not url and face is None and not live_loaded:
-                # 元数据未命中时回退实时详情，兼容名称文件与收藏列表短暂不一致。
-                live_index = await self._reply_face_index(bot, bqbs, preferred_names, metadata)
-                face_index.update(live_index)
-                live_loaded = True
-                entry = face_index.get(key)
-                url = _metadata_pick_url(entry) if isinstance(entry, dict) and "__group__" in entry else ""
-                face = None if (isinstance(entry, dict) and "__group__" in entry) else entry
-            if not url:
-                url = _custom_face_url(face) if face is not None else ""
-            if not url and self.sticker_resolver is not None:
-                try:
-                    resolved = await self.sticker_resolver(name)
-                    if isinstance(resolved, ResolvedSticker):
-                        url = resolved.url
-                        sticker_sha256 = resolved.sha256
-                    elif isinstance(resolved, str):
-                        url = resolved
-                except Exception:
-                    logger.warning("sticker resolve failed: %s", name, exc_info=True)
+            url, sticker_sha256 = await self._resolve_emoji(name, faces, lookup)
             if url:
                 # emoji=True 发送时变成 image 的 sub_type=1，客户端按表情小图渲染，不当普通大图。
                 segment = {"type": "image", "url": url, "emoji": True}
@@ -717,3 +690,75 @@ class EmojiRenderer:
                 logger.info("custom face not found, marker dropped: %s", name)
 
         return segments
+
+    async def _resolve_emoji(self, name: str, faces: "_FaceLookup", lookup: Sequence[str]) -> tuple[str, str]:
+        """按查找顺序找一个表情名，返回（地址, 表情包库里的哈希）；收藏表情没有哈希。"""
+        for source in lookup:
+            if source == EMOJI_NATIVE:
+                url = await faces.url(name)
+                if url:
+                    return url, ""
+            elif source == EMOJI_LIBRARY:
+                url, digest = await self._library_sticker(name)
+                if url:
+                    return url, digest
+        return "", ""
+
+    async def _library_sticker(self, name: str) -> tuple[str, str]:
+        if self.sticker_resolver is None:
+            return "", ""
+        try:
+            resolved = await self.sticker_resolver(name)
+        except Exception:
+            logger.warning("sticker resolve failed: %s", name, exc_info=True)
+            return "", ""
+        if isinstance(resolved, ResolvedSticker):
+            return resolved.url, resolved.sha256
+        if isinstance(resolved, str):
+            return resolved, ""
+        return "", ""
+
+
+class _FaceLookup:
+    """一条回复里查收藏表情：先用落盘的元数据，查不到再拉实时列表，整条回复最多拉一次。"""
+
+    def __init__(
+        self,
+        renderer: EmojiRenderer,
+        bot: Any,
+        bqbs: List[str],
+        preferred_names: List[str] | None,
+        metadata: List[Dict[str, Any]] | None,
+    ) -> None:
+        self._renderer = renderer
+        self._bot = bot
+        self._bqbs = bqbs
+        self._preferred_names = preferred_names
+        self._metadata = metadata
+        # 优先用持久化元数据里的 URL 直接发送，避免每条消息都拉 NapCat 详情。
+        self._index: Dict[str, Any] | None = build_metadata_face_index(metadata) if metadata else None
+        self._live_loaded = False
+
+    async def url(self, name: str) -> str:
+        key = _normalize_name(name)
+        if self._index is None:
+            self._index = await self._live_index()
+        url, face = _face_hit(self._index.get(key))
+        if not url and face is None and not self._live_loaded:
+            # 元数据未命中时回退实时详情，兼容名称文件与收藏列表短暂不一致。
+            self._index.update(await self._live_index())
+            url, face = _face_hit(self._index.get(key))
+        if not url and face is not None:
+            url = _custom_face_url(face)
+        return url
+
+    async def _live_index(self) -> Dict[str, Any]:
+        self._live_loaded = True
+        return await self._renderer._reply_face_index(self._bot, self._bqbs, self._preferred_names, self._metadata)
+
+
+def _face_hit(entry: Any) -> tuple[str, Any]:
+    """元数据候选组同名随机选一个 URL；实时详情原样交回，由调用方取地址。"""
+    if isinstance(entry, dict) and "__group__" in entry:
+        return _metadata_pick_url(entry), None
+    return "", entry

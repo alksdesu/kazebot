@@ -174,3 +174,33 @@ def test_management_lookup_still_reports_collection_api_failure() -> None:
 
     with pytest.raises(RuntimeError, match="synthetic collection failure"):
         asyncio.run(emoji.EmojiRenderer().fetch_custom_face_details(bot))
+
+
+def test_the_library_can_come_before_a_favourite_of_the_same_name() -> None:
+    bot = FaceBot(faces=[{"name": "开心", "url": _FACE_URL}])
+
+    async def resolve(name: str):
+        return emoji.ResolvedSticker(_LOCAL_URL, _DIGEST)
+
+    renderer = emoji.EmojiRenderer(sticker_resolver=resolve)
+    segments = asyncio.run(renderer.process_emojis(
+        "[表情:开心]", bot, [], lookup=(emoji.EMOJI_LIBRARY, emoji.EMOJI_NATIVE),
+    ))
+
+    assert segments == [{"type": "image", "url": _LOCAL_URL, "emoji": True, "sticker_sha256": _DIGEST}]
+    # 图库先命中，就不必再去拉收藏列表。
+    assert bot.calls == []
+
+
+def test_a_library_miss_still_falls_back_to_the_favourite() -> None:
+    bot = FaceBot(faces=[{"name": "开心", "url": _FACE_URL}])
+
+    async def resolve(name: str):
+        return ""
+
+    renderer = emoji.EmojiRenderer(sticker_resolver=resolve)
+    segments = asyncio.run(renderer.process_emojis(
+        "[表情:开心]", bot, [], lookup=(emoji.EMOJI_LIBRARY, emoji.EMOJI_NATIVE),
+    ))
+
+    assert segments == [{"type": "image", "url": _FACE_URL, "emoji": True}]

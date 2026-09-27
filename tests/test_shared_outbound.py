@@ -8,6 +8,8 @@ import pytest
 
 from adapters._shared import outbound
 from adapters._shared.outbound import (
+    EMOJI_LIBRARY,
+    EMOJI_NATIVE,
     EVERYONE,
     FOREIGN_CUSTOM_EMOJI,
     REACT_MARKER,
@@ -16,6 +18,7 @@ from adapters._shared.outbound import (
     MentionPiece,
     Rendered,
     TextPiece,
+    emoji_lookup,
     extract_reactions,
     join_rendered,
     limit_parts,
@@ -224,3 +227,15 @@ class TestGrammar:
         grammar = MarkerGrammar(emoji_tags=("e.x",))
 
         assert tokenize("[e.x:猫][eax:狗]", grammar) == [EmojiPiece("猫"), TextPiece("[eax:狗]")]
+
+
+class TestEmojiLookup:
+    def test_the_platform_emoji_comes_first_by_default(self) -> None:
+        assert emoji_lookup("native_first") == (EMOJI_NATIVE, EMOJI_LIBRARY)
+
+    def test_the_library_can_be_put_first(self) -> None:
+        assert emoji_lookup(" Library_First ") == (EMOJI_LIBRARY, EMOJI_NATIVE)
+
+    @pytest.mark.parametrize("raw", ["", None, "whatever"])
+    def test_an_unknown_order_falls_back_to_the_platform_emoji(self, raw: object) -> None:
+        assert emoji_lookup(raw) == (EMOJI_NATIVE, EMOJI_LIBRARY)  # type: ignore[arg-type]

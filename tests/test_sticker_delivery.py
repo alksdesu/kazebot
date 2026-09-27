@@ -450,3 +450,20 @@ def test_inflight_old_account_uses_its_own_cooldown_after_account_switch(runtime
     ))
     assert digest in store.recently_sent(old_key, within_sec=600)
     assert digest not in store.recently_sent(new_key, within_sec=600)
+
+
+@pytest.mark.parametrize("order,from_library", [("native_first", False), ("library_first", True)])
+def test_the_lookup_order_setting_picks_between_a_favourite_and_a_library_sticker(
+    runtime, monkeypatch, order, from_library,
+):
+    store, digest, _ = add_image(runtime, name="甲")
+    favourite = "https://example.invalid/favourite.gif"
+    monkeypatch.setattr(runtime.emotes, "_current_custom_face_metadata", lambda: [{"name": "甲", "url": favourite}])
+    set_live_config(runtime, sticker_lookup_order=order)
+    bot = Bot(runtime)
+
+    assert asyncio.run(runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime)))
+
+    [sent] = images(bot)
+    assert sent.startswith("base64://") is from_library and (sent == favourite) is not from_library
+    assert store.get(digest).sent_count == (1 if from_library else 0)

@@ -590,6 +590,7 @@ async def _send_split_parts(
                 part, bot, state._adapter.bqbs, emotes._current_custom_face_names(), emotes._current_custom_face_metadata(),
                 strip_asterisk_styles=live.strip_asterisk_styles,
                 strip_underscore_styles=live.strip_underscore_styles,
+                lookup=outbound.emoji_lookup(live.sticker_lookup_order),
             )
             if segments and live.reply_to_trigger and not sent_any and target.get("reply_message_id"):
                 prefix = [{"type": "reply", "message_id": target["reply_message_id"]}]

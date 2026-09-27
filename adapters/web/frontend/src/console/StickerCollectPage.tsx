@@ -11,6 +11,11 @@ const STRATEGY_CHOICES: ReadonlyArray<readonly [string, string]> = [
   ['none', '全收'],
 ];
 
+const LOOKUP_CHOICES: ReadonlyArray<readonly [string, string]> = [
+  ['native_first', '收藏表情'],
+  ['library_first', '图库'],
+];
+
 const SCHEMA: FieldSpec[] = [
   {
     kind: 'block',
@@ -72,6 +77,8 @@ const SCHEMA: FieldSpec[] = [
             { kind: 'number', key: 'sticker_send_probability', label: '每轮出现概率', max: 1, step: 0.05 },
             { kind: 'number', key: 'sticker_prompt_limit', label: '最多列出', unit: '张' },
             { kind: 'number', key: 'sticker_repeat_window_sec', label: '同图间隔', step: 60, unit: '秒' },
+            { kind: 'desc', text: '模型写的表情名同时对得上收藏表情和图库里的图时，先发哪一边的。' },
+            { kind: 'choice', key: 'sticker_lookup_order', label: '重名时先用', choices: LOOKUP_CHOICES, fallback: 'native_first' },
           ],
         },
         {

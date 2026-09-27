@@ -169,6 +169,8 @@ extensions:
     send_probability: 0.2   # 每轮多大概率把清单摊给模型，0 表示从不发
     prompt_limit: 60        # 清单最多列几张，库更大就先给发得最少的
     repeat_window_sec: 1800 # 同一会话这段时间内发过的图不再发
+    # 表情名同时对得上收藏表情和图库时先用哪个：native_first 收藏表情，library_first 图库
+    lookup_order: native_first
     # 群里连着刷图时跟着接一张。要求连图来自至少两个人，中间夹了纯文本就不算。
     combat: false
     burst_probability: 0.0  # 自己发完图后再补一张的概率，0 表示不补

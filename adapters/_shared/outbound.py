@@ -19,6 +19,13 @@ REACT_MARKER = r"\[REACT:[^\]]+\]"
 # `<:name:id>` 这种自定义表情写法，模型常从语料里带出来，只有个别平台渲染得了。
 FOREIGN_CUSTOM_EMOJI = r"<a?:\w+:\d+>"
 
+# [表情:名称] 去哪找：平台自己的表情（收藏表情、服务器表情），还是各平台共用的表情包库。
+EMOJI_NATIVE = "native"
+EMOJI_LIBRARY = "library"
+# 两边都有同名的时候先用谁，是平台配置。
+EMOJI_NATIVE_FIRST = "native_first"
+EMOJI_LIBRARY_FIRST = "library_first"
+
 _REACT_RE = re.compile(REACT_MARKER)
 _MENTION_MARKER = r"\[at:([^\]]+)\]"
 # 一个 [at:] 里写多个名字时的分隔：中英文逗号、顿号、分号，或者连续空白。
@@ -87,6 +94,13 @@ class EmojiPiece:
 
 
 Piece = Union[TextPiece, MentionPiece, EmojiPiece]
+
+
+def emoji_lookup(order: str) -> tuple[str, str]:
+    """配置里的查找顺序换成先后两处；认不出的按平台表情优先。"""
+    if str(order or "").strip().lower() == EMOJI_LIBRARY_FIRST:
+        return EMOJI_LIBRARY, EMOJI_NATIVE
+    return EMOJI_NATIVE, EMOJI_LIBRARY
 
 
 def split_reply(text: str) -> list[str]:

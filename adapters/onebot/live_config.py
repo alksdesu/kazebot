@@ -335,6 +335,10 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         note="同一个会话里这段时间内发过的图不再发",
     ),
     LiveKey(
+        "sticker_lookup_order", "extensions.sticker.lookup_order", PLAIN_STR, "native_first",
+        note="表情名同时对得上收藏表情和图库时先用哪个：native_first 收藏表情，library_first 图库",
+    ),
+    LiveKey(
         "sticker_combat", "extensions.sticker.combat", BOOL, False,
         env=("ONEBOT_STICKER_COMBAT",),
         note="群里连着刷图时跟着接一张；阈值和冷却用内置默认值",
