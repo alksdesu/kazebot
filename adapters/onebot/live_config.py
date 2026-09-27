@@ -174,7 +174,7 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         "random_probability", "trigger.random.probability", float_in(min_value=0.0, max_value=1.0), 0.02,
     ),
     LiveKey("llm_intent_enabled", "trigger.llm_intent.enabled", BOOL, False),
-    LiveKey("llm_intent_node_id", "trigger.llm_intent.node_id", PLAIN_STR, "qq.intent"),
+    LiveKey("llm_intent_node_id", "trigger.llm_intent.node_id", PLAIN_STR, "chat.intent"),
     LiveKey(
         "llm_intent_timeout_sec", "trigger.llm_intent.timeout_sec", float_in(min_value=1.0, max_value=60.0), 8.0,
     ),

@@ -143,6 +143,14 @@ class TestTheHappyPath:
         assert "那这样行吗" in task.input["instruction"]
         assert "咪啪" in task.input["instruction"]
 
+    def test_without_a_node_id_the_generic_intent_node_judges(self, tmp_path: Path) -> None:
+        # 不传 node_id 的调用方（旧版 SDK、别的平台）落到通用判定节点；写着旧 id 的配置靠别名找到它。
+        state = _make_state(tmp_path)
+        _judge(_app(state, tmp_path), state, _body())
+
+        task = next(t for t in state.tasks.values() if t.input.get("_reply_intent"))
+        assert task.node_id == "chat.intent"
+
     def test_the_task_is_a_system_task_on_a_fresh_child_session(self, tmp_path: Path) -> None:
         # use_context 必须是 False：判定要看的是群聊原文，不是这个会话的推理历史，
         # 带上历史等于每条群消息都按整段上下文计费。

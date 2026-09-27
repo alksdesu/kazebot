@@ -345,13 +345,22 @@ class TestConsoleFallbackChains:
 
 
 class TestShippedRenames:
-    @pytest.mark.parametrize(("old", "new"), [("qq.vision", "chat.vision"), ("qq.web_search", "chat.web_search")])
+    @pytest.mark.parametrize(("old", "new"), [
+        ("qq.vision", "chat.vision"), ("qq.web_search", "chat.web_search"), ("qq.intent", "chat.intent"),
+    ])
     def test_the_old_id_reaches_the_renamed_node(self, old: str, new: str) -> None:
         node = load_node(_ROOT, old)
 
         assert node is not None
         assert (node.id, node.aliases) == (new, [old])
         assert "QQ" not in f"{node.name}{node.description}{node.prompt}"
+
+    def test_the_intent_node_keeps_its_slot_and_stays_internal(self) -> None:
+        # 丢了 internal 会进 switch_node 枚举；丢了槽位声明会失去独立渠道、回落主渠道模型。
+        node = load_node(_ROOT, "qq.intent")
+
+        assert node.extra.get("internal") is True
+        assert node.extra.get("system_model_slot") == "intent"
 
     def test_vision_routing_points_at_the_new_id(self) -> None:
         runtime = yaml.safe_load((_ROOT / "config" / "runtime.yaml").read_text(encoding="utf-8"))

@@ -1,7 +1,10 @@
-id: qq.intent
+id: chat.intent
 type: ai
-name: "QQ 接话意愿判断"
+name: "接话意愿判断"
 description: "群消息不命中任何显式触发规则时，判断这句话是不是在跟 bot 说话。内部节点，对用户不可见。"
+# 改名前的 id：平台配置 trigger.llm_intent.node_id 里还写着它的照样找得到这个节点
+aliases:
+  - qq.intent
 
 # 模型/渠道优先级由 runner 按 system_model_slot 统一解析：
 #   1) data/config.yaml 的 system_models.intent.{model,base_url,api_key}
@@ -26,7 +29,8 @@ memories:
   mode: none
 
 prompt: |
-  你在判断一条 QQ 群消息是不是在跟群里的 bot 说话，只输出判定结果。
+  你在判断一条群聊消息是不是在跟群里的 bot 说话，只输出判定结果。
+  各平台的差别（bot 在群里被叫的名字、能用的表态 ID）会写在输入里，没写的就当没有。
 
   判 yes 的情况：
   - 明确在叫 bot、问 bot、要 bot 做事，只是没打 @ 也没喊名字
@@ -47,7 +51,7 @@ prompt: |
   task 表示需要解释、查询或完成真实请求。感谢、附和、结束语可以只表态，不必反问。
   只有上下文明确给出可用表态 ID 时才选择 react，否则选 short_reply 或 ignore。
   引用了别人的话不等于在问 bot；明确的任务请求不要用表态敷衍。
-  不输出真实群号或 QQ 号；不替用户执行群管理动作。
+  不输出真实的群号或账号；不替用户执行群管理动作。
 
   禁止调用 reply 工具——你是内部节点，不与用户直接交互。
 

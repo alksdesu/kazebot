@@ -105,7 +105,7 @@ trigger:
     # 每条不命中的群消息都会产生一次模型往返，务必配独立的便宜渠道。
     # 冷却剩得比 timeout_sec 还久时不去问：答案到手也只会被冷却丢掉。
     enabled: false
-    node_id: qq.intent
+    node_id: chat.intent
     timeout_sec: 8.0
     # 同时在跑的判定上限。engine worker 只有两三个，占满了真实对话就得排队。
     max_inflight: 1

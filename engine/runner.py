@@ -785,7 +785,7 @@ _LEGACY_SYSTEM_MODEL_SLOTS = {
 def _resolve_system_model_slot(node: Any) -> str:
     """节点用哪个 system_models 槽位。
 
-    优先读节点 yaml 的 system_model_slot：意愿判断节点的 id 由 qq.yaml 配置，写死
+    优先读节点 yaml 的 system_model_slot：意愿判断节点的 id 由平台配置决定，写死
     id→slot 映射的话，运营者改个节点名就静默丢掉独立渠道、回落主渠道模型。
     """
     declared = str((getattr(node, "extra", None) or {}).get("system_model_slot") or "").strip().lower()

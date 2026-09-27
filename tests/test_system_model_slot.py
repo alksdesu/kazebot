@@ -26,7 +26,7 @@ def _node(node_id: str, **extra):
 
 class TestSlotResolution:
     def test_a_declared_slot_wins(self) -> None:
-        assert _resolve_system_model_slot(_node("qq.intent", system_model_slot="intent")) == "intent"
+        assert _resolve_system_model_slot(_node("chat.intent", system_model_slot="intent")) == "intent"
 
     def test_a_renamed_node_keeps_its_slot(self) -> None:
         assert _resolve_system_model_slot(_node("qq.my_gate", system_model_slot="intent")) == "intent"
@@ -54,14 +54,14 @@ class TestSlotResolution:
 
 class TestTheIntentNodeShipsWired:
     def test_the_shipped_node_declares_the_intent_slot(self) -> None:
-        node = load_node(_ROOT, "qq.intent")
+        node = load_node(_ROOT, "chat.intent")
 
         assert node is not None
         assert _resolve_system_model_slot(node) == "intent"
 
     def test_the_shipped_node_calls_no_tools(self) -> None:
         # 判定节点拿到工具就可能真的去干活。它只该回一个 yes/no。
-        node = load_node(_ROOT, "qq.intent")
+        node = load_node(_ROOT, "chat.intent")
 
         assert node.tool_access.mode == "none"
 
@@ -72,7 +72,7 @@ class TestTheIntentNodeShipsWired:
 
         listed = {n["id"] for n in _discover_switchable_nodes(_ROOT, "qq.orchestrator")}
 
-        assert "qq.intent" not in listed
+        assert "chat.intent" not in listed and "qq.intent" not in listed
 
     def test_ordinary_nodes_are_still_switchable(self) -> None:
         from engine.runner import _discover_switchable_nodes
@@ -82,7 +82,7 @@ class TestTheIntentNodeShipsWired:
         assert "chat.vision" in listed
 
     def test_the_shipped_node_asks_for_finish(self) -> None:
-        node = load_node(_ROOT, "qq.intent")
+        node = load_node(_ROOT, "chat.intent")
 
         assert "finish" in node.prompt
         assert "yes" in node.prompt and "no" in node.prompt

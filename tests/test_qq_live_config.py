@@ -439,7 +439,7 @@ class TestARealBooleanIsDroppedNotStringified:
             _write_yaml_text(live, "trigger:\n  llm_intent:\n    node_id: true\n")
             node_id = live.live.llm_intent_node_id
 
-        assert node_id == "qq.intent"
+        assert node_id == "chat.intent"
         assert any("quote it" in r.getMessage() for r in caplog.records)
 
     def test_a_boolean_trigger_mode_falls_back_to_the_default(

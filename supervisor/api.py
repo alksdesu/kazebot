@@ -2198,7 +2198,7 @@ def create_app(
         if not conversation_key or not text.strip():
             raise HTTPException(status_code=400, detail="conversation_key and text required")
         channel = str(body.get("channel") or "").strip() or conversation_key_prefix(conversation_key) or "internal"
-        node_id = str(body.get("node_id") or "qq.intent").strip() or "qq.intent"
+        node_id = str(body.get("node_id") or "chat.intent").strip() or "chat.intent"
         try:
             timeout_sec = min(60.0, max(1.0, float(body.get("timeout_sec") or 8.0)))
         except (TypeError, ValueError):
@@ -2261,7 +2261,7 @@ def create_app(
         except Exception as exc:
             registry.discard(task.task_id)
             st.cancel_single_task(task.task_id)
-            log.exception("qq intent judge failed")
+            log.exception("reply intent judge failed")
             return {"task_id": task.task_id, **IntentResult(error=str(exc)[:200]).as_dict()}
         return {"task_id": task.task_id, **result.as_dict()}
 
