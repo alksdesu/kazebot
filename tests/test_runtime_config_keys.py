@@ -106,10 +106,9 @@ def test_removed_dead_keys_stay_removed(config: dict, dotted: str) -> None:
 
 
 def test_the_docs_do_not_advertise_removed_keys() -> None:
-    for rel in ("docs/configuration.md", "docs/docs/configuration.md"):
-        path = _ROOT / rel
-        if not path.exists():
-            continue
-        text = path.read_text(encoding="utf-8")
-        for gone in ("max_per_parent", "min_messages", "min_sessions"):
-            assert gone not in text, f"{rel} 仍在宣传已删除的 {gone}"
+    path = _ROOT / "docs" / "configuration.md"
+    if not path.exists():
+        pytest.skip("docs/ 不进公开仓库，本地没有这份说明")
+    text = path.read_text(encoding="utf-8")
+    for gone in ("max_per_parent", "min_messages", "min_sessions"):
+        assert gone not in text, f"docs/configuration.md 仍在宣传已删除的 {gone}"

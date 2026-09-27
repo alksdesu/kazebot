@@ -27,5 +27,3 @@
 同一个 hook point 下的 handler 按 `priority` 从高到低运行。注册时按 `handler.name` 去重，同名 handler 会被替换，因此重复注册是安全的。
 
 handler 返回 `None` 表示不介入；返回 `HookResult(modified=True)` 表示修改了上下文但继续执行；返回 `block`、`skip_step` 或 `action` 会停止当前 hook 链。
-
-更多说明见 `docs/plugin-system.md`。

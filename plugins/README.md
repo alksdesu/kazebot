@@ -41,5 +41,3 @@ PLUGIN_META = {
 ```
 
 加载器会补齐缺失的元数据字段。没有 `register()` 的文件会被跳过；加载失败只会记录日志，不会阻止引擎启动。重复扫描时，handler 按名称替换，因此注册应使用稳定的 `handler.name`。
-
-完整开发说明见 `docs/plugin-system.md`。

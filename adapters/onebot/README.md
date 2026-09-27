@@ -176,7 +176,7 @@ nb run
 ### 消息处理
 
 - 群聊默认 @Bot 或被回复时触发，同时携带最近群聊历史作为上下文；只有 `CLONOTH_ALLOWED_GROUPS` 中的群会接入。
-- 群聊触发一共七个信号（全量 / @ / 回复 / 名字 / 前缀 / 关键词 / 随机）加双层冷却，另有 LLM 意愿判定兜底，全部是热载键：写在 `config/features.yaml` 对所有平台生效，写在 `config/qq.yaml` 只对 QQ 生效。判定逻辑集中在 `adapters/_shared/trigger_policy.py`，配置与坑位见 `docs/TRIGGER-GUIDE.md`。
+- 群聊触发一共七个信号（全量 / @ / 回复 / 名字 / 前缀 / 关键词 / 随机）加双层冷却，另有 LLM 意愿判定兜底，全部是热载键：写在 `config/features.yaml` 对所有平台生效，写在 `config/qq.yaml` 只对 QQ 生效。判定逻辑集中在 `adapters/_shared/trigger_policy.py`。
 - 私聊消息直接触发回复，无需 @；默认只允许好友私聊，或通过 `CLONOTH_ALLOWED_PRIVATE_USERS` 指定用户。未放行的人默认得不到任何回应。
 - 管理员 QQ 号通过 `CLONOTH_ADMIN_QQ_USERS` 配置；管理员始终允许私聊，用于处理审批命令。每项管理能力还能单独调档（见下）。
 - 支持引用消息解析。
