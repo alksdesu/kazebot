@@ -282,6 +282,8 @@ class PlatformDescriptor:
     private_files: tuple[str, ...] = ()
     # 多开时这个平台的进程在每个实例里要占的端口。序号 0 必须等于单实例部署原有的那组，已有部署才不用改端口。
     instance_ports: tuple[InstancePort, ...] = ()
+    # 平台进程的入口脚本（相对工作区）。和 engine/** 一样是重启即执行的代码，policy 默认要审批才能改。
+    entrypoints: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not _KEY_NAME.match(self.id):
@@ -310,6 +312,7 @@ class PlatformDescriptor:
             ("secret_files", self.secret_files),
             ("owned_files", self.owned_files),
             ("private_files", self.private_files),
+            ("entrypoints", self.entrypoints),
         ):
             for pattern in patterns:
                 check_workspace_glob(pattern, what=f"platform {self.id!r} {kind} entry")
@@ -322,7 +325,7 @@ class PlatformDescriptor:
         object.__setattr__(self, "state_files", MappingProxyType(dict(self.state_files)))
         object.__setattr__(self, "state_env", MappingProxyType(dict(self.state_env)))
         object.__setattr__(self, "hooks", MappingProxyType(dict(self.hooks)))
-        for name in ("secrets", "secret_files", "owned_files", "private_files", "instance_ports"):
+        for name in ("secrets", "secret_files", "owned_files", "private_files", "instance_ports", "entrypoints"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
 
     def _check_movable_file(self, what: str, path: str, env: str) -> None:

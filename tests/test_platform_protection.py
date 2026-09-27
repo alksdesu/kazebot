@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -34,7 +35,7 @@ from platforms.protection import (  # noqa: E402
     secret_file_patterns,
 )
 from platforms.registry import register_platform, unregister_platform  # noqa: E402
-from supervisor.policy import PolicyEngine  # noqa: E402
+from supervisor.policy import PolicyEngine, _default_policy_dict, _entrypoint_write_rules  # noqa: E402
 from supervisor.types import SafetyLevel  # noqa: E402
 from toolbox._common import safe_subprocess_env  # noqa: E402
 
@@ -57,6 +58,14 @@ VAULT = PlatformDescriptor(
     private_files=("config/vault_people.yaml",),
     profiles_path="config/vault_profiles.yaml",
     profiles_env="VAULT_PROFILES_PATH",
+)
+
+OTHERCHAT = PlatformDescriptor(
+    id="otherchat",
+    display_name="Other Chat",
+    short_name="OC",
+    channels=(ChannelDescriptor("otherchat_room", CHANNEL_GROUP),),
+    entrypoints=("otherchat_bot.py",),
 )
 
 QQ_SECRET_ENVS = {
@@ -85,6 +94,15 @@ def vault():
         yield VAULT
     finally:
         unregister_platform(VAULT.id)
+
+
+@pytest.fixture
+def otherchat():
+    register_platform(OTHERCHAT)
+    try:
+        yield OTHERCHAT
+    finally:
+        unregister_platform(OTHERCHAT.id)
 
 
 def _engine(workspace: Path, policy: str | None = PERMISSIVE_POLICY) -> PolicyEngine:
@@ -120,10 +138,20 @@ class TestDeclarationsAreChecked:
         {"owned_files": ("data/../escape",)},
         {"private_files": ("/etc/vault_people.yaml",)},
         {"private_files": (" config/vault_people.yaml",)},
+        {"entrypoints": ("../bot.py",)},
+        {"entrypoints": ("/opt/bot.py",)},
+        {"entrypoints": ("adapters\\bot.py",)},
+        {"entrypoints": (" bot.py",)},
+        {"entrypoints": ("",)},
     ])
     def test_a_malformed_platform_declaration_is_refused(self, extra: dict) -> None:
         with pytest.raises(ValueError):
             PlatformDescriptor(id="broken", display_name="Broken", short_name="B", **extra)
+
+    def test_a_malformed_entrypoint_says_which_field_it_came_from(self) -> None:
+        # 四类文件声明共用一个报错，不点名的话只能挨个试是哪一项写歪了。
+        with pytest.raises(ValueError, match="entrypoints"):
+            PlatformDescriptor(id="broken", display_name="Broken", short_name="B", entrypoints=("../bot.py",))
 
     def test_asking_for_an_undeclared_secret_is_a_caller_bug(self) -> None:
         with pytest.raises(KeyError):
@@ -136,11 +164,15 @@ class TestDeclarationsAreChecked:
     def test_declarations_are_frozen_into_tuples(self) -> None:
         platform = PlatformDescriptor(
             id="listy", display_name="Listy", short_name="L",
-            secrets=[SecretField("token", "t")], secret_files=["data/listy.*"],
+            secrets=[SecretField("token", "t")], secret_files=["data/listy.*"], entrypoints=["listy_bot.py"],
         )
 
         assert isinstance(platform.secrets, tuple)
         assert isinstance(platform.secret_files, tuple)
+        assert platform.entrypoints == ("listy_bot.py",)
+
+    def test_a_platform_declares_no_entrypoint_unless_it_says_so(self) -> None:
+        assert PlatformDescriptor(id="plain", display_name="Plain", short_name="P").entrypoints == ()
 
 
 class TestQqDeclarations:
@@ -150,6 +182,9 @@ class TestQqDeclarations:
 
     def test_the_auto_files_are_the_ones_the_adapter_already_writes(self) -> None:
         assert set(secret_file_patterns(QQ_NAPCAT, environ={})) == QQ_SECRET_FILES
+
+    def test_the_entrypoint_is_the_nonebot_host_script(self) -> None:
+        assert QQ_NAPCAT.entrypoints == ("bot.py",)
 
     def test_file_env_names_are_not_treated_as_secrets(self) -> None:
         # 它们只是路径，工具进程要靠它们找到自签的令牌文件。
@@ -414,6 +449,78 @@ class TestPolicyFloor:
         assert engine.evaluate_write_file(path="data/vault_cache/avatars.json").safety_level == SafetyLevel.deny
         assert engine.evaluate_write_file(path="config/vault_people.yaml").safety_level == SafetyLevel.auto
         assert engine.evaluate_write_file(path="config/vault_profiles.yaml").safety_level == SafetyLevel.auto
+
+
+class TestEntrypointWriteRules:
+    """入口脚本的默认写规则：不是兜底，管理员能在 policy.yaml 里放宽，但内置默认必须挡住。"""
+
+    def test_the_qq_rule_is_word_for_word_the_hand_written_one(self) -> None:
+        # 存量部署的 policy.yaml 不重写，措辞一改就是新旧两份默认对不上。
+        assert _entrypoint_write_rules() == [{
+            "pattern": "bot.py",
+            "decision": "approval_required",
+            "reason": "qq adapter entrypoint changes require approval",
+        }]
+
+    def test_the_rules_sit_between_the_config_catch_all_and_the_adapter_sources(self) -> None:
+        # 第一个命中的规则赢，挪位置就是另一套判定。
+        rules = _default_policy_dict()["write_file"]["rules"]
+        block = _entrypoint_write_rules()
+        start = [rule["pattern"] for rule in rules].index("config/**") + 1
+
+        assert rules[start:start + len(block)] == block
+        assert rules[start + len(block)]["pattern"] == "adapters/**"
+
+    def test_a_newly_registered_platform_brings_its_own_rule(self, otherchat) -> None:
+        assert {
+            "pattern": "otherchat_bot.py",
+            "decision": "approval_required",
+            "reason": "otherchat adapter entrypoint changes require approval",
+        } in _entrypoint_write_rules()
+        patterns = [rule["pattern"] for rule in _default_policy_dict()["write_file"]["rules"]]
+        assert patterns.index("bot.py") < patterns.index("otherchat_bot.py") < patterns.index("adapters/**")
+
+    def test_without_any_declaration_the_section_is_empty_and_the_rest_keeps_its_order(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        declared = {rule["pattern"] for rule in _entrypoint_write_rules()}
+        rules = _default_policy_dict()["write_file"]["rules"]
+        monkeypatch.setattr("supervisor.policy.all_platforms", lambda: ())
+
+        assert declared and _entrypoint_write_rules() == []
+        assert _default_policy_dict()["write_file"]["rules"] == [
+            rule for rule in rules if rule["pattern"] not in declared
+        ]
+
+    def test_the_built_in_default_sends_entrypoint_writes_to_approval(self, otherchat, tmp_path: Path) -> None:
+        engine = _engine(tmp_path, policy=None)
+        decisions = [engine.evaluate_write_file(path=path) for path in ("bot.py", "otherchat_bot.py")]
+
+        assert [decision.safety_level for decision in decisions] == [SafetyLevel.approval_required] * 2
+        # 管理员任务对普通写操作免审批，敏感标记是这条规则真正起作用的地方。
+        assert all(decision.sensitive for decision in decisions)
+
+    def test_an_already_written_policy_file_is_left_alone(self, tmp_path: Path) -> None:
+        # 默认只在文件不存在时落盘；重写会把管理员放宽过的判定悄悄改回去。
+        engine = _engine(tmp_path)
+
+        assert (tmp_path / "data" / "policy.yaml").read_text(encoding="utf-8") == PERMISSIVE_POLICY
+        assert engine.evaluate_write_file(path="bot.py").safety_level == SafetyLevel.auto
+
+    @pytest.mark.parametrize("section", ["read_file", "write_file"])
+    def test_the_example_file_copies_the_built_in_default_rule_for_rule(self, section: str) -> None:
+        # 样例是手抄的，入口脚本那条尤其容易漏：照它起的部署会少一层判定，而且看不出少了。
+        example = yaml.safe_load((_ROOT / "policy.example.yaml").read_text(encoding="utf-8"))
+
+        assert example[section]["rules"] == _default_policy_dict()[section]["rules"]
+
+    def test_the_example_file_is_what_the_engine_actually_enforces(self) -> None:
+        # data/policy.yaml 落盘前控制台回的是这份样例，判定却走内置默认：差一处，界面显示的就不是生效的策略。
+        example = yaml.safe_load((_ROOT / "policy.example.yaml").read_text(encoding="utf-8"))
+        default = _default_policy_dict()
+
+        drifted = sorted(key for key in {*example, *default} if example.get(key) != default.get(key))
+        assert not drifted, f"policy.example.yaml drifted from the built-in default: {drifted}"
 
 
 class TestSubprocessEnvironment:

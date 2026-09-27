@@ -16,6 +16,7 @@ import yaml
 
 from clonoth_runtime import classify_path, load_yaml_dict, parse_extra_roots
 from platforms.protection import policy_floor
+from platforms.registry import all_platforms
 
 from .types import SafetyLevel
 
@@ -28,6 +29,19 @@ class PolicyDecision:
     # 重启、动 config/nodes、data 等敏感操作仍需人工确认。sensitive=True 表示
     # 本决策命中了显式敏感规则(而非默认放行或普通命令)，即使是管理员也不免审批。
     sensitive: bool = False
+
+
+def _entrypoint_write_rules() -> list[dict[str, str]]:
+    """平台进程的入口脚本，由各平台描述声明：新平台不用来这里加一行。"""
+    return [
+        {
+            "pattern": pattern,
+            "decision": "approval_required",
+            "reason": f"{platform.id} adapter entrypoint changes require approval",
+        }
+        for platform in all_platforms()
+        for pattern in platform.entrypoints
+    ]
 
 
 def _default_policy_dict() -> dict[str, Any]:
@@ -71,7 +85,7 @@ def _default_policy_dict() -> dict[str, Any]:
                 # 文件都参与决定 engine 怎么跑，落到 default:auto 等于免审批改行为。
                 {"pattern": "config/**", "decision": "approval_required", "reason": "config changes affect execution"},
                 # 下面这些以前落在 default:auto 上，而它们和 engine/** 一样是重启即执行的代码。
-                {"pattern": "bot.py", "decision": "approval_required", "reason": "qq adapter entrypoint changes require approval"},
+                *_entrypoint_write_rules(),
                 {"pattern": "adapters/**", "decision": "approval_required", "reason": "adapter source changes require approval"},
                 {"pattern": "clonoth_sdk/**", "decision": "approval_required", "reason": "sdk source changes require approval"},
                 {"pattern": "plugins/**", "decision": "approval_required", "reason": "plugin source changes require approval"},

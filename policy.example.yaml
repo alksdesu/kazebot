@@ -57,6 +57,7 @@ write_file:
     - pattern: "config/**"
       decision: approval_required
       reason: "config changes affect execution"
+    # 平台进程的入口脚本。内置默认按各平台描述的 entrypoints 生成，这里照抄 QQ 那条；新平台声明了入口要在这里补上。
     - pattern: "bot.py"
       decision: approval_required
       reason: "qq adapter entrypoint changes require approval"

@@ -112,6 +112,8 @@ QQ_NAPCAT = PlatformDescriptor(
         InstancePort("bridge", 8769, 10),
         InstancePort("napcat", 6099, 100),
     ),
+    # NoneBot 宿主，注册 OneBot V11 适配器后加载 adapters.onebot。
+    entrypoints=("bot.py",),
 )
 
 BUILTIN_PLATFORMS: tuple[PlatformDescriptor, ...] = (QQ_NAPCAT,)

@@ -210,8 +210,9 @@ class TestRegistration:
         assert public["id"] == "qq" and public["has_config"] is True
         assert "config_env" not in public and "adapters._shared.trigger_policy" not in json.dumps(public)
         assert "state_env" not in public and "ONEBOT_STATE_FILE" not in json.dumps(public)
-        # 端口是部署细节，控制台按不上用场，露出去只是多告诉人一件事。
+        # 端口和入口脚本都是部署细节，控制台按不上用场，露出去只是多告诉人一件事。
         assert "instance_ports" not in public and "8080" not in json.dumps(public)
+        assert "entrypoints" not in public and "bot.py" not in json.dumps(public)
 
 
 class TestInstancePorts:
