@@ -44,9 +44,17 @@ const nodeRaw = (id: string, temperature: number) => `id: ${id}\nprovider: relay
 const memoryNamespace = (key: string, label: string): api.MemoryNamespace => ({ key, namespace: key, kind: 'conversation', subject: '', entry_count: 1, books: [], updated_at: '', owner: { kind: 'group', label } });
 const memoryEntry = (content: string): api.MemoryEntry => ({ id: `id-${content}`, book: 'main', content, keywords: [], constant: false, source: 'manual' });
 const scopeStatus = (target = ''): api.ScopeStatus => ({
-  current_scope: '10001', live_scope: '', bot_alive: false,
-  preview: target ? { source_scope: '10001', target_scope: target, conversations: [{ old_namespace: 'old-namespace', new_namespace: `${target}-namespace`, has_memory: true, blocked: false }], unknown_namespaces: [] } : null,
+  current_scope: '10001', live_scope: '', bot_alive: false, ambiguous_sources: [],
+  preview: target ? {
+    source_scope: '10001', target_scope: target,
+    conversations: [{ old_namespace: 'old-namespace', new_namespace: `${target}-namespace`, has_memory: true, blocked: false }],
+    unknown_namespaces: [], unresolved_namespaces: [], other_scopes: [], stores: {},
+  } : null,
 });
+const scopePreview = (target: string, patch: Partial<NonNullable<api.ScopeStatus['preview']>>): api.ScopeStatus => {
+  const status = scopeStatus(target);
+  return { ...status, preview: { ...status.preview!, ...patch } };
+};
 const conversation = (id: string): api.ConversationRow => ({ session_id: id, conversation_key: `qq_group:${id}`, channel: 'qq', bytes: 128, updated_at: 0, owner: { kind: 'group', label: `会话${id}` }, current_account: true });
 
 beforeEach(() => {
@@ -224,7 +232,7 @@ describe('迁移预览目标绑定', () => {
     fireEvent.change(screen.getByLabelText('搬到'), { target: { value: '30003' } });
     expect(screen.queryByRole('button', { name: '执行搬迁' })).not.toBeInTheDocument(); expect(api.migrateQqScope).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: '预览' })); fireEvent.click(await screen.findByRole('button', { name: '执行搬迁' }));
-    await waitFor(() => expect(api.migrateQqScope).toHaveBeenCalledWith('fixture-auth', '30003'));
+    await waitFor(() => expect(api.migrateQqScope).toHaveBeenCalledWith('fixture-auth', '30003', '10001'));
     expect(api.migrateQqScope).toHaveBeenCalledTimes(1);
   });
   it('预览和迁移期间禁用目标输入，失败保留受绑定的目标供重试', async () => {
@@ -236,9 +244,59 @@ describe('迁移预览目标绑定', () => {
     expect(screen.getByLabelText('搬到')).toBeDisabled();
     await act(async () => preview.resolve(scopeStatus('20002')));
     fireEvent.click(screen.getByRole('button', { name: '执行搬迁' })); expect(screen.getByLabelText('搬到')).toBeDisabled();
-    expect(api.migrateQqScope).toHaveBeenCalledWith('fixture-auth', '20002');
+    expect(api.migrateQqScope).toHaveBeenCalledWith('fixture-auth', '20002', '10001');
     await act(async () => write.reject(Error('迁移失败'))); await screen.findByText('迁移失败');
     expect(screen.getByLabelText('搬到')).toHaveValue(' 20002 '); expect(screen.getByLabelText('搬到')).toBeEnabled();
     expect(screen.getByRole('button', { name: '执行搬迁' })).toBeEnabled();
+  });
+});
+
+describe('迁移源账号与预览内容', () => {
+  const openPreview = async (target: string) => {
+    render(<AccountScope />); await screen.findByText('10001');
+    fireEvent.change(screen.getByLabelText('搬到'), { target: { value: target } }); fireEvent.click(screen.getByRole('button', { name: '预览' }));
+  };
+  it('分属几个账号时先挑源账号，执行时带着它', async () => {
+    vi.mocked(api.getQqScope).mockImplementation(async (_auth, target, source) => {
+      if (!target) return scopeStatus();
+      if (source === undefined) return { ...scopeStatus(), ambiguous_sources: [{ scope: '', conversations: 2 }, { scope: '10001', conversations: 1 }] };
+      return scopePreview(target, { source_scope: source, other_scopes: [{ scope: '10001', conversations: 1 }] });
+    });
+    await openPreview('20002');
+    expect(await screen.findByRole('button', { name: '「10001」名下的 1 个会话' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: '执行搬迁' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '「无归属」名下的 2 个会话' }));
+    await screen.findByRole('button', { name: '执行搬迁' });
+    expect(api.getQqScope).toHaveBeenLastCalledWith('fixture-auth', '20002', '');
+    expect(screen.getByText('「10001」名下还有 1 个会话，不在这次搬迁里。')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '「无归属」名下的 2 个会话' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '执行搬迁' }));
+    await waitFor(() => expect(api.migrateQqScope).toHaveBeenCalledWith('fixture-auth', '20002', ''));
+  });
+  it('预览列出要改写的功能数据、查不到归属的记忆和两边都有记忆的会话', async () => {
+    vi.mocked(api.getQqScope).mockImplementation(async (_auth, target) => target ? scopePreview(target, {
+      conversations: [
+        { old_namespace: 'old-a', new_namespace: 'new-a', has_memory: true, blocked: false },
+        { old_namespace: 'old-b', new_namespace: 'new-b', has_memory: true, blocked: true },
+      ],
+      unknown_namespaces: ['stray-a'], unresolved_namespaces: ['stray-b', 'stray-c'],
+      stores: {
+        sessions: { label: '会话注册表', moved: 1, replaced: 1 }, schedules: { label: '定时任务', moved: 2, replaced: 0 },
+        reminders: { label: '提醒', moved: 0, replaced: 0 },
+      },
+    }) : scopeStatus());
+    await openPreview('20002');
+    await screen.findByText('功能数据跟着改写：会话注册表 1 行（顶掉目标 1 行）；定时任务 2 行');
+    expect(screen.getByText(/2 个会话待搬，其中 1 个可以直接搬/)).toBeInTheDocument();
+    expect(screen.getAllByText(/两边都有记忆，跳过/)).toHaveLength(1);
+    expect(screen.getByText('另有 3 份记忆查不到归属，搬不了，会原样留着。')).toBeInTheDocument();
+  });
+  it('没有能搬的会话时不提功能数据，也不给执行', async () => {
+    vi.mocked(api.getQqScope).mockImplementation(async (_auth, target) => target ? scopePreview(target, {
+      conversations: [{ old_namespace: 'old-b', new_namespace: 'new-b', has_memory: true, blocked: true }],
+    }) : scopeStatus());
+    await openPreview('20002');
+    expect(await screen.findByRole('button', { name: '执行搬迁' })).toBeDisabled();
+    expect(screen.queryByText(/功能数据跟着改写/)).not.toBeInTheDocument();
   });
 });

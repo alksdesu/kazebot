@@ -29,7 +29,9 @@ beforeEach(() => {
   useSettingsStore.setState({ adminToken: 'current-token', isAuthenticated: true });
   vi.mocked(api.getInstances).mockResolvedValue(rows);
   vi.mocked(api.getQqAccount).mockResolvedValue(account);
-  vi.mocked(api.getQqScope).mockResolvedValue({ current_scope: '1000001', live_scope: '1000001', bot_alive: false, preview: null });
+  vi.mocked(api.getQqScope).mockResolvedValue({
+    current_scope: '1000001', live_scope: '1000001', bot_alive: false, preview: null, ambiguous_sources: [],
+  });
   vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('unexpected request')));
   window.history.replaceState(null, '', '/web/?view=settings&tab=qq-account');
 });

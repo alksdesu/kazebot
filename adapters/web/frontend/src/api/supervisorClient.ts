@@ -1043,7 +1043,21 @@ export interface ScopePlanRow {
   old_namespace: string;
   new_namespace: string;
   has_memory: boolean;
+  /** 两边都有长期记忆：整段会话原样留着，不搬。 */
   blocked: boolean;
+}
+
+/** 一个账号名下有几个会话。scope 为空串是加账号隔离之前、没有归属的存量。 */
+export interface ScopeCount {
+  scope: string;
+  conversations: number;
+}
+
+/** 一个按会话键存数据的库会改写几行；replaced 是撞上目标已有数据、被顶掉的行。 */
+export interface ScopeStoreCount {
+  label: string;
+  moved: number;
+  replaced: number;
 }
 
 export interface ScopeStatus {
@@ -1055,12 +1069,23 @@ export interface ScopeStatus {
     target_scope: string;
     conversations: ScopePlanRow[];
     unknown_namespaces: string[];
+    /** 路由表里有、但认不出是在哪个账号下算的会话。 */
+    unresolved_namespaces: string[];
+    /** 源和目标以外的账号名下的会话，不在这次搬迁里。 */
+    other_scopes: ScopeCount[];
+    stores: Record<string, ScopeStoreCount>;
   } | null;
+  /** 目标以外有几个账号名下都有会话、认不出该搬哪批时列出来，挑一个带着 source 重新预览。 */
+  ambiguous_sources: ScopeCount[];
 }
 
-export async function getQqScope(token: string, target = ''): Promise<ScopeStatus> {
-  const query = target ? `?target=${encodeURIComponent(target)}` : '';
-  const resp = await apiFetch(`/admin/qq/scope${query}`, { headers: authHeaders(token) });
+export async function getQqScope(token: string, target = '', source?: string): Promise<ScopeStatus> {
+  const params = new URLSearchParams();
+  if (target) params.set('target', target);
+  // 空串是「没有归属的存量」，和不传是两回事。
+  if (source !== undefined) params.set('source', source);
+  const query = params.toString();
+  const resp = await apiFetch(`/admin/qq/scope${query ? `?${query}` : ''}`, { headers: authHeaders(token) });
   return resp.json();
 }
 

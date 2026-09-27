@@ -1,7 +1,7 @@
 // [2026-05-16] Updated: tests for real Supervisor API client signatures.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, decideApproval, getAllToolNames, fetchActiveTasks, cancelTask } from '../api/supervisorClient';
+import { postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, decideApproval, getAllToolNames, fetchActiveTasks, cancelTask, getQqScope } from '../api/supervisorClient';
 
 describe('Supervisor API client', () => {
   afterEach(() => {
@@ -51,6 +51,22 @@ describe('Supervisor API client', () => {
     // button. How: assert the client wrapper exists before wiring the modal. Purpose:
     // UI code can call one typed helper instead of constructing endpoint strings.
     expect(typeof cancelTask).toBe('function');
+  });
+
+  it('sends the picked migration source, an empty one included', async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({}), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await getQqScope('secret-token');
+    await getQqScope('secret-token', '20002');
+    await getQqScope('secret-token', '20002', '');
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      '/v1/admin/qq/scope', '/v1/admin/qq/scope?target=20002', '/v1/admin/qq/scope?target=20002&source=',
+    ]);
   });
 
   it('fetches active task summaries with the admin bearer token', async () => {
