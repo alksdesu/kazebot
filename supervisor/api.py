@@ -1706,43 +1706,54 @@ def create_app(
                     payload={"target": inp.target, "reason": "no process manager", "ts": _now().isoformat()},
                 )
                 return RestartOut(scheduled=False, target=inp.target)
-            # 重新灌本实例的 .env，改过的密钥才会被新的 engine 继承。
-            try:
-                load_workspace_env(st.workspace_root, override=True)
-            except Exception:
-                pass
-            # 先注入 outbound 让 handle_agent 正常闭合（log embed 有终态）
-            if inp.session_id:
-                # 找到当前 session 活跃任务的 source_inbound_seq，
-                # 确保 Bot 端 poller 能匹配到 trigger 并正确关闭 status_msg
-                _restart_src_seq = None
-                for _rt in st.tasks.values():
-                    if (_rt.session_id == inp.session_id
-                            and _rt.status in (TaskStatus.running, TaskStatus.pending)
-                            and _rt.source_inbound_seq):
-                        _restart_src_seq = _rt.source_inbound_seq
-                        break
-                _restart_outbound_payload: dict[str, Any] = {"text": "✅ 已触发 Engine 重启，正在执行..."}
-                if _restart_src_seq:
-                    _restart_outbound_payload["source_inbound_seq"] = _restart_src_seq
+            if not pm.engine_restart_lock.acquire(blocking=False):
+                # 上一次还没收尾：再起一个会在它停起中途放开信号抑制。
                 st.eventlog.append(
-                    session_id=inp.session_id,
+                    session_id="__system__",
                     component="supervisor",
-                    type_="outbound_message",
-                    payload=_restart_outbound_payload,
+                    type_="restart_failed",
+                    payload={"target": inp.target, "reason": "engine restart already in progress", "ts": _now().isoformat()},
                 )
+                return RestartOut(scheduled=False, target=inp.target)
             # Deferred engine restart: return HTTP 200 first, then kill+restart.
             # This ensures the tool call in the dying engine receives its response
             # and can shadow_write the tool_result before being terminated.
             _restart_session_id = inp.session_id
             _restart_target = inp.target
 
-            def _deferred_engine_restart() -> None:
-                time.sleep(1)  # let HTTP response reach engine first
-                pm._restarting_engine = True  # 抑制信号 handler 退出
+            def _announce_engine_restart() -> None:
+                # 重新灌本实例的 .env，改过的密钥才会被新的 engine 继承。
+                try:
+                    load_workspace_env(st.workspace_root, override=True)
+                except Exception:
+                    pass
+                # 先注入 outbound 让 handle_agent 正常闭合（log embed 有终态）
+                if inp.session_id:
+                    # 找到当前 session 活跃任务的 source_inbound_seq，
+                    # 确保 Bot 端 poller 能匹配到 trigger 并正确关闭 status_msg
+                    _restart_src_seq = None
+                    for _rt in st.tasks.values():
+                        if (_rt.session_id == inp.session_id
+                                and _rt.status in (TaskStatus.running, TaskStatus.pending)
+                                and _rt.source_inbound_seq):
+                            _restart_src_seq = _rt.source_inbound_seq
+                            break
+                    _restart_outbound_payload: dict[str, Any] = {"text": "✅ 已触发 Engine 重启，正在执行..."}
+                    if _restart_src_seq:
+                        _restart_outbound_payload["source_inbound_seq"] = _restart_src_seq
+                    st.eventlog.append(
+                        session_id=inp.session_id,
+                        component="supervisor",
+                        type_="outbound_message",
+                        payload=_restart_outbound_payload,
+                    )
+
+            def _restart_and_report() -> None:
                 try:
                     pm.stop_engine()
                     time.sleep(1)  # 等待延迟信号消散
+                    # 人工重启：看门狗上一轮的退避和停手一并清掉，否则新起的 engine 再崩时不会被拉起。
+                    pm.clear_given_up()
                     pm.start_engine()
                     # Brief health check: verify engine process is alive
                     time.sleep(0.5)
@@ -1756,7 +1767,6 @@ def create_app(
                         )
                         return
                 except Exception as exc:
-                    pm._restarting_engine = False
                     st.eventlog.append(
                         session_id=_restart_session_id or "__system__",
                         component="supervisor",
@@ -1765,7 +1775,12 @@ def create_app(
                     )
                     return
                 # ---- 清理旧 engine 遗留的孤儿 task ----
-                _orphan_count = st.cancel_orphaned_tasks()
+                try:
+                    _orphan_count = st.cancel_orphaned_tasks()
+                except Exception:
+                    # engine 已经起来了，清理出错不算重启失败：记进日志，照常报完成。
+                    log.exception("engine 重启后清理孤儿 task 失败")
+                    _orphan_count = 0
                 if _orphan_count:
                     st.eventlog.append(
                         session_id="__system__",
@@ -1787,9 +1802,24 @@ def create_app(
                 # after orphan cleanup, so the task won't be reaped.
                 if _restart_session_id:
                     st._pending_restart_notify = _restart_session_id
-                pm._restarting_engine = False  # 清除信号抑制
 
-            threading.Thread(target=_deferred_engine_restart, daemon=True, name="restart-engine").start()
+            def _deferred_engine_restart() -> None:
+                try:
+                    time.sleep(1)  # let HTTP response reach engine first
+                    pm._restarting_engine = True  # 抑制信号 handler 退出
+                    _restart_and_report()
+                finally:
+                    # 每条退出路径都得放开：抑制留着的话看门狗一直停摆、SIGTERM 一直被吞，锁留着下一次重启进不来。
+                    pm._restarting_engine = False
+                    pm.engine_restart_lock.release()
+
+            try:
+                _announce_engine_restart()
+                threading.Thread(target=_deferred_engine_restart, daemon=True, name="restart-engine").start()
+            except BaseException:
+                # 线程没起来就没人放锁。
+                pm.engine_restart_lock.release()
+                raise
             return RestartOut(scheduled=True, target=_restart_target)
 
         # --no-shell 模式下没有 _watch_shell 线程，需要直接退出

@@ -5,8 +5,10 @@ engine 崩了 supervisor 照样活着、systemd 照样 active running —— 生
 """
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -262,6 +264,80 @@ class TestNotFightingWithDeliberateStops:
 
         assert pm.worker_health()["engine-1"]["given_up"] is False
         assert pm.worker_health()["engine-1"]["failures"] == 0
+
+
+class _LockProbe(dict):
+    """遍历记账那一刻锁在不在手里，记一笔。"""
+
+    def __init__(self, lock: Any, source: dict) -> None:
+        super().__init__(source)
+        self._lock = lock
+        self.owned: list[bool] = []
+
+    def values(self):
+        self.owned.append(self._lock._is_owned())
+        return super().values()
+
+
+class TestTheTwoManualResetEntries:
+    """人工重启和人工重试都得把退避清干净，而它们清的必须是同一组字段。"""
+
+    _ENTRIES = ["restart_engine", "clear_given_up"]
+
+    def _stuck(self, pm: ProcessManager) -> None:
+        pm._health["engine-1"] = WorkerHealth(
+            failures=9, given_up=True, next_retry_at=1e12,
+            respawns=3, last_exit_code=13, last_log="PermissionError",
+        )
+
+    @pytest.mark.parametrize("entry", _ENTRIES)
+    def test_it_clears_the_backoff_bookkeeping(self, pm: ProcessManager, entry: str) -> None:
+        pm.start_engine()
+        self._stuck(pm)
+
+        getattr(pm, entry)()
+
+        health = pm._health["engine-1"]
+        assert (health.given_up, health.failures, health.next_retry_at) == (False, 0, 0.0)
+
+    @pytest.mark.parametrize("entry", _ENTRIES)
+    def test_it_keeps_what_the_runtime_page_shows(self, pm: ProcessManager, entry: str) -> None:
+        # 重试次数、上次退出码和日志尾巴是「刚才到底出了什么事」的唯一记录。
+        pm.start_engine()
+        self._stuck(pm)
+
+        getattr(pm, entry)()
+
+        health = pm._health["engine-1"]
+        assert (health.respawns, health.last_exit_code, health.last_log) == (3, 13, "PermissionError")
+
+    @pytest.mark.parametrize("entry", _ENTRIES)
+    def test_it_only_writes_while_holding_the_lock(self, pm: ProcessManager, entry: str) -> None:
+        # 巡检和这两个入口抢同一份记账：不持锁改，清到一半就会被 _reap 覆盖回去。
+        probe = _LockProbe(pm._health_lock, {"engine-1": WorkerHealth(failures=9, given_up=True)})
+        pm._health = probe
+
+        getattr(pm, entry)()
+
+        assert probe.owned == [True]
+
+    def test_neither_entry_resets_by_hand(self) -> None:
+        # 一边清三个字段、另一边清另外两个，是两份拷贝迟早会走到的地方。
+        watchdog_bookkeeping = {"_reset_backoff_locked", "_reap", "_respawn", "_watchdog_tick"}
+        fields = {"given_up", "failures", "next_retry_at"}
+        tree = ast.parse((_ROOT / "supervisor" / "process_manager.py").read_text(encoding="utf-8"))
+
+        offenders = [
+            f"{node.name}: {ast.unparse(assign)}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name not in watchdog_bookkeeping
+            for assign in ast.walk(node)
+            if isinstance(assign, ast.Assign)
+            for target in assign.targets
+            if isinstance(target, ast.Attribute) and target.attr in fields
+        ]
+
+        assert offenders == [], f"退避状态只能由 _reset_backoff_locked 清: {offenders}"
 
 
 class TestHealthReport:
