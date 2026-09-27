@@ -21,6 +21,7 @@ STATE_LIVE = "live"
 STATE_ROUTES = "routes"
 STATE_ALIASES = "aliases"
 STATE_ACTIVE_ACCOUNT = "active_account"
+STATE_KINDS: frozenset[str] = frozenset({STATE_LIVE, STATE_ROUTES, STATE_ALIASES, STATE_ACTIVE_ACCOUNT})
 
 HOOK_TRIGGER_POLICY = "trigger_policy"
 HOOK_CONSOLE_SCHEMA = "console_schema"
@@ -31,8 +32,8 @@ MENTION_NATIVE = "native"
 MENTION_TEXT = "text"
 MENTION_FORMS: frozenset[str] = frozenset({MENTION_NONE, MENTION_NATIVE, MENTION_TEXT})
 
-# data/config.yaml 里 platforms.<平台 id>.<密钥名> 的那个键名。
-_SECRET_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+# data/config.yaml 里 platforms.<平台 id>.<密钥名> 这两级键名；平台 id 还是 data/platforms/ 下的目录名。
+_KEY_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 # config/ 下的文件控制台和 agent 在审批下就能改，还常被整份贴出去问问题，密钥不放那里。
 _CONFIG_DIR = "config/"
@@ -191,7 +192,7 @@ class SecretField:
     file_env: str = ""
 
     def __post_init__(self) -> None:
-        if not _SECRET_NAME.match(self.name):
+        if not _KEY_NAME.match(self.name):
             raise ValueError(f"secret name must be lower_snake_case: {self.name!r}")
         if not self.label.strip():
             raise ValueError(f"secret {self.name!r} needs a label")
@@ -220,10 +221,12 @@ class PlatformDescriptor:
     config_path: str = ""
     # 覆盖配置路径的环境变量。只给已经在用它的平台，新平台不加。
     config_env: str = ""
-    # data/ 下由适配器写、核心只读的状态文件：live 公布生效配置与运行事实，
-    # routes 是稳定会话键到真实会话键，aliases 是匿名别名表，
-    # active_account 是当前登录账号，会话键摘要按它分作用域。
+    # 由适配器写、核心只读的状态文件：live 公布生效配置与运行事实，routes 是稳定会话键到真实会话键，
+    # aliases 是匿名别名表，active_account 是当前登录账号，会话键摘要按它分作用域。
+    # 默认在 data/platforms/<id>/ 下用标准文件名；这里只给升级前就在用老文件名的平台，写 data/ 下的相对路径。
     state_files: Mapping[str, str] = field(default_factory=dict)
+    # 改老状态文件位置的环境变量，按状态项。只给已经在用它的平台，新平台不加。
+    state_env: Mapping[str, str] = field(default_factory=dict)
     # 核心层需要调用的平台策略：名字 → 模块路径，按需导入。
     hooks: Mapping[str, str] = field(default_factory=dict)
     capabilities: PlatformCapabilities = field(default_factory=PlatformCapabilities)
@@ -238,6 +241,8 @@ class PlatformDescriptor:
     private_files: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if not _KEY_NAME.match(self.id):
+            raise ValueError(f"platform id must be lower_snake_case: {self.id!r}")
         if self.id_shape not in {ID_NUMERIC, ID_STRING}:
             raise ValueError(f"unknown id shape: {self.id_shape!r}")
         names = [channel.name for channel in self.channels]
@@ -263,10 +268,25 @@ class PlatformDescriptor:
         misplaced = [pattern for pattern in self.secret_files if pattern.startswith(_CONFIG_DIR)]
         if misplaced:
             raise ValueError(f"platform {self.id!r} keeps secret files under config/: {misplaced}")
+        self._check_state_files()
         object.__setattr__(self, "state_files", MappingProxyType(dict(self.state_files)))
+        object.__setattr__(self, "state_env", MappingProxyType(dict(self.state_env)))
         object.__setattr__(self, "hooks", MappingProxyType(dict(self.hooks)))
         for name in ("secrets", "secret_files", "owned_files", "private_files"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
+
+    def _check_state_files(self) -> None:
+        unknown = sorted(set(self.state_files) - STATE_KINDS)
+        if unknown:
+            raise ValueError(f"platform {self.id!r} declares unknown state files: {unknown}")
+        for name in self.state_files.values():
+            check_workspace_glob(f"data/{name}", what=f"platform {self.id!r} state file")
+        standard = sorted(set(self.state_env) - set(self.state_files))
+        if standard:
+            raise ValueError(f"platform {self.id!r} moves state files it keeps in the standard place: {standard}")
+        for env in self.state_env.values():
+            if not _ENV_NAME.match(env):
+                raise ValueError(f"platform {self.id!r} state env name must be UPPER_SNAKE_CASE: {env!r}")
 
     def names(self) -> frozenset[str]:
         return frozenset({self.id, *self.aliases, *(channel.name for channel in self.channels)})

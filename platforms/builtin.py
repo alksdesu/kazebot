@@ -42,6 +42,10 @@ QQ_NAPCAT = PlatformDescriptor(
         STATE_ALIASES: "onebot_anon_map.json",
         STATE_ACTIVE_ACCOUNT: "onebot_active_bot.json",
     },
+    state_env={
+        STATE_ROUTES: "ONEBOT_STATE_FILE",
+        STATE_ALIASES: "ONEBOT_ANON_MAP_FILE",
+    },
     hooks={
         HOOK_TRIGGER_POLICY: "adapters._shared.trigger_policy",
         HOOK_CONSOLE_SCHEMA: "adapters.onebot.console_layout",

@@ -89,6 +89,18 @@ def test_malformed_name_metadata_uses_known_aliases(tmp_path: Path):
     assert owners[memory_namespace(PRIVATE)]["name_available"] is False
 
 
+def test_a_route_state_moved_by_env_is_still_read(tmp_path: Path, monkeypatch):
+    # bot 按 ONEBOT_STATE_FILE 写路由；supervisor 不认的话，这类部署的记忆目录全成无主的。
+    seed_names(tmp_path)
+    (tmp_path / "data" / "onebot_plugin_state.json").unlink()
+    moved = tmp_path / "private" / "routes.json"
+    moved.parent.mkdir()
+    moved.write_text(json.dumps({"real_conversation_keys": {GROUP: "qq_group:101"}}), encoding="utf-8")
+    monkeypatch.setenv("ONEBOT_STATE_FILE", "private/routes.json")
+
+    assert describe_namespaces(tmp_path)[memory_namespace(GROUP)]["label"] == "测试群"
+
+
 @pytest.fixture
 def material_apps(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(admin_api, "_admin_token", TOKEN)

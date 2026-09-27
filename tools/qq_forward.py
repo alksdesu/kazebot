@@ -180,6 +180,7 @@ if __name__ == "__main__":
             sys.path.append(str(here.parent))
         from _channel import platform_secret
         from platforms.builtin import QQ_NAPCAT
+        from platforms.registry import platform_secret_file
 
         spec = QQ_NAPCAT.secret("forward_bridge_token")
         workspace = _env_first("CLONOTH_WORKSPACE", "ONEBOT_WORKSPACE_ROOT", default="")
@@ -189,11 +190,14 @@ if __name__ == "__main__":
         if configured:
             return configured
         candidates = []
-        moved = _env_first(spec.file_env, default="")
-        if moved:
-            candidates.append(moved)
         if workspace:
+            # 和 bot 按同一份声明算位置，env 改过的相对写法也一样按工作区算。
+            candidates.append(str(platform_secret_file(QQ_NAPCAT, spec.name, Path(workspace))))
             candidates.append(os.path.join(workspace, *spec.file.split("/")))
+        else:
+            moved = _env_first(spec.file_env, default="")
+            if moved:
+                candidates.append(moved)
         candidates.append(os.path.join(*spec.file.split("/")))
         for candidate in candidates:
             try:

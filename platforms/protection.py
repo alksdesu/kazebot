@@ -5,13 +5,12 @@
 from __future__ import annotations
 
 import fnmatch
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
 from .descriptor import PlatformDescriptor
-from .registry import all_platforms
+from .registry import all_platforms, env_override, platform_data_relpath, workspace_path
 
 # 和平台无关的凭据位置：dotenv、模型渠道密钥、管理令牌、policy 本身、私钥与证书。
 CORE_OUTBOUND_DENY: tuple[str, ...] = (
@@ -46,10 +45,6 @@ def _platforms(platforms: Iterable[PlatformDescriptor] | None) -> tuple[Platform
     return all_platforms() if platforms is None else tuple(platforms)
 
 
-def _environ(environ: Mapping[str, str] | None) -> Mapping[str, str]:
-    return os.environ if environ is None else environ
-
-
 def _unique(patterns: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(pattern for pattern in patterns if pattern))
 
@@ -57,21 +52,16 @@ def _unique(patterns: Iterable[str]) -> tuple[str, ...]:
 def _moved_to(raw: str, workspace: Path | None) -> str:
     """env 改到的文件位置换成判定用的写法：工作区里是相对路径，工作区外是绝对路径。
 
-    和 policy 的 classify_path 一样先 resolve，两边才比得上。相对写法按工作区算：bot 和工具都以它为 cwd。
+    和 policy 的 classify_path 一样先 resolve，两边才比得上。
     """
-    path = Path(raw).expanduser()
     if workspace is None:
-        return path.as_posix()
+        return Path(raw).expanduser().as_posix()
     root = Path(workspace).resolve()
-    resolved = (path if path.is_absolute() else root / path).resolve()
+    resolved = workspace_path(raw, root).resolve()
     try:
         return resolved.relative_to(root).as_posix()
     except ValueError:
         return resolved.as_posix()
-
-
-def _override(environ: Mapping[str, str], name: str) -> str:
-    return str(environ.get(name, "") or "").strip() if name else ""
 
 
 def secret_file_patterns(
@@ -81,13 +71,12 @@ def secret_file_patterns(
     workspace: Path | None = None,
 ) -> tuple[str, ...]:
     """带着凭据的文件：声明的 secret_files、自动生成的密钥文件，以及 env 把它挪到的位置。"""
-    env = _environ(environ)
     patterns = list(platform.secret_files)
     for secret in platform.secrets:
         if not secret.file:
             continue
         patterns.append(secret.file)
-        moved = _override(env, secret.file_env)
+        moved = env_override(secret.file_env, environ)
         if moved:
             patterns.append(_moved_to(moved, workspace))
     return _unique(patterns)
@@ -99,8 +88,13 @@ def owned_file_patterns(
     environ: Mapping[str, str] | None = None,
     workspace: Path | None = None,
 ) -> tuple[str, ...]:
-    """只由平台自己的代码写的文件：状态文件、声明的 owned_files，以及带凭据的文件。"""
-    state = (f"data/{name}" for name in platform.state_files.values())
+    """只由平台自己的代码写的文件：平台数据目录、老文件名的状态文件（含 env 改到的位置）、声明的 owned_files，以及带凭据的文件。"""
+    state = [f"{platform_data_relpath(platform)}/*"]
+    for kind, name in platform.state_files.items():
+        state.append(f"data/{name}")
+        moved = env_override(platform.state_env.get(kind, ""), environ)
+        if moved:
+            state.append(_moved_to(moved, workspace))
     secrets = secret_file_patterns(platform, environ=environ, workspace=workspace)
     return _unique([*state, *platform.owned_files, *secrets])
 
@@ -115,7 +109,7 @@ def private_file_patterns(
     config: list[str] = []
     if platform.config_path:
         config.append(platform.config_path)
-        moved = _override(_environ(environ), platform.config_env)
+        moved = env_override(platform.config_env, environ)
         if moved:
             config.append(_moved_to(moved, workspace))
     owned = owned_file_patterns(platform, environ=environ, workspace=workspace)

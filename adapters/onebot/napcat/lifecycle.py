@@ -25,6 +25,9 @@ from ..config import (
 from ..live_config import RECONCILED_KEYS, live, state_payload as live_config_state_payload
 from ..emoji_handler import load_bqbs
 from clonoth_sdk import BotConfig, ClonothClient, EventRouter, SessionState
+from platforms.builtin import QQ_NAPCAT
+from platforms.descriptor import STATE_LIVE
+from platforms.registry import platform_state_path
 
 from . import anonymize, callbacks, common, emotes, forward_bridge, identity, inbound, media, models, proactive, queueing, routing, state
 
@@ -93,7 +96,7 @@ async def _reconcile_forward_bridge() -> bool:
 
 
 def _live_state_file() -> Path:
-    return Path(CLONOTH_WORKSPACE) / "data" / "qq_live_state.json"
+    return platform_state_path(QQ_NAPCAT, STATE_LIVE, Path(CLONOTH_WORKSPACE))
 
 
 def _live_runtime_facts() -> Dict[str, Any]:

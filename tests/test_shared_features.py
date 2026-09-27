@@ -205,6 +205,13 @@ class TestLocation:
 
         assert config.path() == tmp_path / "elsewhere.yaml"
 
+    def test_a_relative_override_is_resolved_against_the_workspace(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv(features.FEATURES_CONFIG_ENV, "config/alt-features.yaml")
+
+        assert features.features_config_path(tmp_path) == tmp_path / "config" / "alt-features.yaml"
+
 
 class TestExampleFileStaysInSync:
     """features.example.yaml 是通用键唯一的键位说明，和声明表脱钩就等于文档骗人。"""

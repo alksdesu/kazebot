@@ -407,9 +407,7 @@ class TestDiagnosticsRedaction:
 
 
 def _adapter(monkeypatch: pytest.MonkeyPatch, workspace: Path, **env: str) -> Any:
-    for key, value in env.items():
-        monkeypatch.setenv(key, value)
-    return load_runtime(monkeypatch, workspace)
+    return load_runtime(monkeypatch, workspace, **env)
 
 
 def _config_module(runtime: Any) -> Any:
@@ -432,6 +430,20 @@ class TestAdapterStartup:
 
         assert Path(config.FORWARD_BRIDGE_TOKEN_FILE) == tmp_path / "data" / "onebot_forward_bridge_token"
         assert Path(config.CONVERSATION_HASH_SECRET_FILE) == tmp_path / "data" / "onebot_conversation_hash_secret"
+
+    def test_the_state_files_follow_the_declared_env_overrides(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        workspace = _workspace(tmp_path)
+        aliases = tmp_path / "elsewhere" / "aliases.json"
+
+        config = _config_module(_adapter(
+            monkeypatch, workspace, ONEBOT_STATE_FILE="private/routes.json", ONEBOT_ANON_MAP_FILE=str(aliases),
+        ))
+
+        # 相对写法按工作区算，和 supervisor、迁移脚本认的是同一个文件。
+        assert Path(config.ONEBOT_STATE_FILE) == workspace / "private" / "routes.json"
+        assert Path(config.ANON_MAP_FILE) == aliases
 
     def test_a_misspelled_key_is_reported(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         workspace = _workspace(tmp_path, config=_qq(forward_bridge_tokn="typo"))

@@ -352,6 +352,26 @@ class TestPolicyFloor:
         assert engine.evaluate_read_file(path="private/bridge").safety_level == SafetyLevel.deny
         assert engine.evaluate_write_file(path="private/bridge").safety_level == SafetyLevel.deny
 
+    def test_a_state_file_moved_by_env_is_guarded_where_it_now_lives(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("ONEBOT_STATE_FILE", "private/routes.json")
+        monkeypatch.setenv("ONEBOT_ANON_MAP_FILE", str(tmp_path / "private" / "aliases.json"))
+        engine = _engine(tmp_path)
+
+        assert engine.evaluate_write_file(path="private/routes.json").safety_level == SafetyLevel.deny
+        assert engine.evaluate_write_file(path="private/aliases.json").safety_level == SafetyLevel.deny
+        assert outbound_deny_reason("private/aliases.json", via="QQ", workspace=tmp_path)
+
+    def test_a_platforms_own_data_directory_is_floored(self, vault, tmp_path: Path) -> None:
+        engine = _engine(tmp_path)
+
+        assert engine.evaluate_write_file(path="data/platforms/vault/aliases.json").safety_level == SafetyLevel.deny
+        assert engine.evaluate_write_file(path="data/platforms/vault/cache/x.json").safety_level == SafetyLevel.deny
+        # 别名表、路由这些记着真实 ID，经聊天发出去一样是泄露。
+        assert outbound_deny_reason("data/platforms/vault/routes.json", via="Vault")
+        assert outbound_deny_reason("data/platforms/qq/anything.json", via="QQ")
+
     def test_a_newly_registered_platform_is_floored_without_touching_policy(self, vault, tmp_path: Path) -> None:
         engine = _engine(tmp_path)
 

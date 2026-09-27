@@ -24,12 +24,14 @@ from platforms.descriptor import (  # noqa: E402
     HOOK_CONSOLE_SCHEMA,
     HOOK_TRIGGER_POLICY,
     STATE_ALIASES,
+    STATE_KINDS,
     STATE_LIVE,
     STATE_ROUTES,
     ChannelDescriptor,
     PlatformDescriptor,
 )
 from platforms.registry import (  # noqa: E402
+    STANDARD_STATE_FILES,
     all_platforms,
     conversation_channel,
     features_module,
@@ -37,7 +39,9 @@ from platforms.registry import (  # noqa: E402
     get_platform,
     is_platform_conversation,
     platform_config_path,
+    platform_data_dir,
     platform_hook,
+    platform_secret_file,
     platform_state_path,
     register_platform,
     required_config_path,
@@ -54,11 +58,6 @@ TELEGRAM = PlatformDescriptor(
         ChannelDescriptor("tg_group", CHANNEL_GROUP),
         ChannelDescriptor("tg_private", CHANNEL_PRIVATE),
     ),
-    state_files={
-        STATE_LIVE: "tg_live_state.json",
-        STATE_ROUTES: "tg_routes.json",
-        STATE_ALIASES: "tg_aliases.json",
-    },
 )
 _TG_GROUP = "tg_group:" + "a" * 24
 _TG_PRIVATE = "tg_private:" + "b" * 24
@@ -157,10 +156,28 @@ class TestRegistration:
                 channels=(ChannelDescriptor("x", CHANNEL_GROUP), ChannelDescriptor("x", CHANNEL_PRIVATE)),
             )
 
+    @pytest.mark.parametrize("platform_id", ["QQ", "qq-official", "../qq", "", "1qq"])
+    def test_platform_ids_are_lower_snake_case(self, platform_id: str) -> None:
+        # id 是 data/platforms/ 下的目录名，也是 data/config.yaml 里的键。
+        with pytest.raises(ValueError):
+            PlatformDescriptor(id=platform_id, display_name="X", short_name="X")
+
+    def test_descriptors_reject_malformed_state_declarations(self) -> None:
+        base = {"id": "x", "display_name": "X", "short_name": "X"}
+        with pytest.raises(ValueError, match="unknown state"):
+            PlatformDescriptor(**base, state_files={"cache": "x_cache.json"})
+        with pytest.raises(ValueError):
+            PlatformDescriptor(**base, state_files={STATE_LIVE: "../x_live.json"})
+        with pytest.raises(ValueError, match="standard place"):
+            PlatformDescriptor(**base, state_env={STATE_LIVE: "X_LIVE_FILE"})
+        with pytest.raises(ValueError, match="UPPER_SNAKE_CASE"):
+            PlatformDescriptor(**base, state_files={STATE_LIVE: "x_live.json"}, state_env={STATE_LIVE: "x_live"})
+
     def test_the_public_view_leaves_out_deployment_details(self) -> None:
         public = QQ_NAPCAT.public_dict()
         assert public["id"] == "qq" and public["has_config"] is True
         assert "config_env" not in public and "adapters._shared.trigger_policy" not in json.dumps(public)
+        assert "state_env" not in public and "ONEBOT_STATE_FILE" not in json.dumps(public)
 
 
 class TestFilesAndHooks:
@@ -172,14 +189,74 @@ class TestFilesAndHooks:
         monkeypatch.setenv("CLONOTH_QQ_CONFIG_PATH", str(tmp_path / "elsewhere.yaml"))
         assert platform_config_path(QQ_NAPCAT, tmp_path) == tmp_path / "elsewhere.yaml"
 
+    def test_a_relative_override_is_resolved_against_the_workspace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 离线脚本不一定在工作区里跑，按 cwd 算会读到另一份。
+        monkeypatch.setenv("CLONOTH_QQ_CONFIG_PATH", "config/alt.yaml")
+        assert platform_config_path(QQ_NAPCAT, tmp_path) == tmp_path / "config" / "alt.yaml"
+
     def test_a_platform_without_config_says_so(self, tmp_path: Path, telegram: PlatformDescriptor) -> None:
         assert platform_config_path(telegram, tmp_path) is None
         with pytest.raises(LookupError):
             required_config_path(telegram, tmp_path)
 
-    def test_state_files_live_under_data(self, tmp_path: Path) -> None:
+    def test_qq_keeps_its_legacy_state_file_names(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("ONEBOT_STATE_FILE", raising=False)
         assert platform_state_path(QQ_NAPCAT, STATE_LIVE, tmp_path) == tmp_path / "data" / "qq_live_state.json"
-        assert platform_state_path(QQ_NAPCAT, "nothing", tmp_path) is None
+        assert platform_state_path(QQ_NAPCAT, STATE_ROUTES, tmp_path) == tmp_path / "data" / "onebot_plugin_state.json"
+
+    def test_a_new_platform_keeps_its_state_in_its_own_directory(
+        self, tmp_path: Path, telegram: PlatformDescriptor,
+    ) -> None:
+        home = tmp_path / "data" / "platforms" / "telegram"
+
+        assert platform_data_dir(telegram, tmp_path) == home
+        assert {kind: platform_state_path(telegram, kind, tmp_path) for kind in STATE_KINDS} == {
+            kind: home / name for kind, name in STANDARD_STATE_FILES.items()
+        }
+
+    def test_every_state_kind_has_its_own_standard_file_name(self) -> None:
+        assert set(STANDARD_STATE_FILES) == STATE_KINDS
+        assert len(set(STANDARD_STATE_FILES.values())) == len(STANDARD_STATE_FILES)
+
+    def test_an_unknown_state_kind_is_a_programming_error(self, tmp_path: Path) -> None:
+        with pytest.raises(LookupError):
+            platform_state_path(QQ_NAPCAT, "nothing", tmp_path)
+
+    def test_legacy_state_env_overrides_move_the_files(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # bot 认这两个变量；supervisor 和迁移脚本不认的话，设过它们的部署会读错文件。
+        moved = tmp_path / "elsewhere" / "routes.json"
+        monkeypatch.setenv("ONEBOT_STATE_FILE", str(moved))
+        monkeypatch.setenv("ONEBOT_ANON_MAP_FILE", "private/aliases.json")
+
+        assert platform_state_path(QQ_NAPCAT, STATE_ROUTES, tmp_path) == moved
+        assert platform_state_path(QQ_NAPCAT, STATE_ALIASES, tmp_path) == tmp_path / "private" / "aliases.json"
+
+    def test_an_explicit_environ_stands_in_for_the_process_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("ONEBOT_STATE_FILE", str(tmp_path / "process.json"))
+        default = tmp_path / "data" / "onebot_plugin_state.json"
+
+        assert platform_state_path(QQ_NAPCAT, STATE_ROUTES, tmp_path, environ={}) == default
+        assert platform_state_path(
+            QQ_NAPCAT, STATE_ROUTES, tmp_path, environ={"ONEBOT_STATE_FILE": "x.json"},
+        ) == tmp_path / "x.json"
+
+    def test_generated_secret_files_follow_the_declaration(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("ONEBOT_CONVERSATION_HASH_SECRET_FILE", raising=False)
+        default = tmp_path / "data" / "onebot_conversation_hash_secret"
+        assert platform_secret_file(QQ_NAPCAT, "conversation_hash_secret", tmp_path) == default
+
+        monkeypatch.setenv("ONEBOT_CONVERSATION_HASH_SECRET_FILE", "secrets/hash")
+        assert platform_secret_file(QQ_NAPCAT, "conversation_hash_secret", tmp_path) == tmp_path / "secrets" / "hash"
+        # 不自动生成的密钥给 None，不猜一个位置。
+        assert platform_secret_file(QQ_NAPCAT, "access_token", tmp_path) is None
+        with pytest.raises(KeyError):
+            platform_secret_file(QQ_NAPCAT, "nothing", tmp_path)
 
     def test_the_trigger_hook_is_the_shared_module(self) -> None:
         from adapters._shared import trigger_policy
@@ -235,9 +312,9 @@ class TestCoreRecognisesANewPlatform:
     def test_account_scope_is_tracked_per_platform(self, tmp_path: Path, telegram: PlatformDescriptor) -> None:
         from supervisor.conversation_labels import account_scope
 
-        data = tmp_path / "data"
-        data.mkdir()
-        (data / "tg_live_state.json").write_text(json.dumps({"scope_conversation_keys": [_TG_GROUP]}), encoding="utf-8")
+        live = platform_state_path(telegram, STATE_LIVE, tmp_path)
+        live.parent.mkdir(parents=True)
+        live.write_text(json.dumps({"scope_conversation_keys": [_TG_GROUP]}), encoding="utf-8")
         accounts = account_scope(tmp_path)
 
         assert accounts.is_current(_TG_GROUP) is True
@@ -249,12 +326,13 @@ class TestCoreRecognisesANewPlatform:
     def test_memory_directories_are_labelled_from_its_own_state(self, tmp_path: Path, telegram: PlatformDescriptor) -> None:
         from supervisor.conversation_labels import describe_namespaces, memory_namespace
 
-        data = tmp_path / "data"
-        data.mkdir()
-        (data / "tg_routes.json").write_text(
+        platform_data_dir(telegram, tmp_path).mkdir(parents=True)
+        platform_state_path(telegram, STATE_ROUTES, tmp_path).write_text(
             json.dumps({"real_conversation_keys": {_TG_GROUP: "tg_group:-100123"}}), encoding="utf-8",
         )
-        (data / "tg_live_state.json").write_text(json.dumps({"group_names": {"-100123": "猫猫群"}}), encoding="utf-8")
+        platform_state_path(telegram, STATE_LIVE, tmp_path).write_text(
+            json.dumps({"group_names": {"-100123": "猫猫群"}}), encoding="utf-8",
+        )
 
         labels = describe_namespaces(tmp_path)
 

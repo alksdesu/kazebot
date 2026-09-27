@@ -18,11 +18,18 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from adapters._shared.features import FEATURES_CONFIG_ENV  # noqa: E402
 from adapters._shared.live_config import LAYER_PLATFORM  # noqa: E402
+from platforms.builtin import QQ_NAPCAT  # noqa: E402
 
 _ADAPTER_ROOT = _ROOT / "adapters" / "onebot"
-# 开发机上可能设着这两个覆盖，不清掉的话测试会去读写那边的真文件。
-_CONFIG_PATH_OVERRIDES = ("CLONOTH_QQ_CONFIG_PATH", "CLONOTH_FEATURES_CONFIG_PATH")
+# 开发机上可能设着这些改文件位置的变量，不清掉的话测试会去读写那边的真文件。
+_PATH_OVERRIDES = (
+    QQ_NAPCAT.config_env,
+    FEATURES_CONFIG_ENV,
+    *QQ_NAPCAT.state_env.values(),
+    *(secret.file_env for secret in QQ_NAPCAT.secrets if secret.file_env),
+)
 
 
 def adapter_source() -> str:
@@ -120,14 +127,16 @@ def install_nonebot_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _use_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("CLONOTH_WORKSPACE", str(tmp_path))
-    for name in _CONFIG_PATH_OVERRIDES:
+    for name in _PATH_OVERRIDES:
         monkeypatch.delenv(name, raising=False)
 
 
-def load_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """加载一份独立的插件实例，工作区指向 tmp_path。"""
+def load_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **env: str):
+    """加载一份独立的插件实例，工作区指向 tmp_path。env 在清掉开发机上的覆盖之后再设。"""
     install_nonebot_stubs(monkeypatch)
     _use_workspace(monkeypatch, tmp_path)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
     name = f"_onebot_runtime_{tmp_path.name}"
     # 插件模块当成包来加载：兄弟模块跟着落在这份实例名下，每次都是全新的模块级状态。
     spec = importlib.util.spec_from_file_location(

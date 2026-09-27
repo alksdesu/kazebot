@@ -29,11 +29,8 @@ class ActiveAccountStore:
     """一个平台在一个工作区里记住的当前账号。文件名和账号 ID 的形状都取平台描述。"""
 
     def __init__(self, platform: PlatformDescriptor, workspace: Path) -> None:
-        path = platform_state_path(platform, STATE_ACTIVE_ACCOUNT, workspace)
-        if path is None:
-            raise LookupError(f"platform {platform.id!r} declares no active account file")
         self.platform = platform
-        self.path = path
+        self.path = platform_state_path(platform, STATE_ACTIVE_ACCOUNT, workspace)
 
     def normalize(self, self_id: object) -> str:
         return normalize_account(self_id, self.platform)

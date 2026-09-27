@@ -75,6 +75,7 @@ from platforms.descriptor import (
     HOOK_TRIGGER_POLICY,
     ID_STRING,
     MENTION_NATIVE,
+    STATE_ALIASES,
     ChannelDescriptor,
     ImageSupport,
     PlatformCapabilities,
@@ -82,6 +83,7 @@ from platforms.descriptor import (
 )
 from platforms.ids import normalize_id
 from platforms.inbound import InboundConversation, InboundFacts, InboundSender
+from platforms.registry import platform_data_dir, platform_state_path
 from stickers.collect import sticker_root, store_path
 from stickers.roster import RosterRules, offered, prompt_roster, roster_entry
 from stickers.store import Sticker, StickerStore
@@ -256,7 +258,8 @@ class FakeChatAdapter:
         secret: str = "fakechat-test-secret",
     ) -> None:
         shape = FAKE_CHAT.id_shape
-        data = Path(workspace) / "data"
+        # 新平台的落盘文件都在自己的数据目录里，文件名不带平台前缀。
+        data = platform_data_dir(FAKE_CHAT, workspace)
         self.server = server
         self.client = client
         self.event_router = None
@@ -265,7 +268,9 @@ class FakeChatAdapter:
         self.admins = frozenset(filter(None, (normalize_id(value, shape) for value in admins)))
         self.rooms = frozenset(filter(None, (normalize_id(value, shape) for value in rooms)))
         self.keys = ConversationKeys(FAKE_CHAT, secret)
-        self.aliases = AliasBook(data / "fakechat_aliases.json", workspace=Path(workspace), id_shape=shape)
+        self.aliases = AliasBook(
+            platform_state_path(FAKE_CHAT, STATE_ALIASES, workspace), workspace=Path(workspace), id_shape=shape,
+        )
         self.session_state = SessionState()
         self.history = HistoryWindows(
             capacity=lambda: HISTORY_LINES,
@@ -275,7 +280,7 @@ class FakeChatAdapter:
         self.barriers = ClearBarriers()
         self.approvals = ApprovalBook(id_shape=shape, normalize_ref=str, ttl_seconds=APPROVAL_TTL_SECONDS)
         self.outbound = TwoPhaseIdempotencyStore(
-            data / "fakechat_outbound.sqlite3", target_identity=target_identity, log_namespace="fakechat",
+            data / "outbound.sqlite3", target_identity=target_identity, log_namespace="fakechat",
         )
         self.workspace = Path(workspace)
         self.sticker_store = StickerStore(store_path(self.workspace))
@@ -289,7 +294,7 @@ class FakeChatAdapter:
         self.cooldown = CooldownState()
         self.routes: dict[str, dict[str, Any]] = {}
         self.features = FeatureGateway(
-            FakeChatFeatureHost(self), platform=FAKE_CHAT, burst_path=data / "fakechat_bursts.sqlite3",
+            FakeChatFeatureHost(self), platform=FAKE_CHAT, burst_path=data / "bursts.sqlite3",
         )
         self.callbacks = FakeChatCallbacks(self)
 

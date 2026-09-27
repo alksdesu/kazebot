@@ -11,8 +11,8 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from platforms.descriptor import STATE_LIVE, PlatformDescriptor
-from platforms.registry import all_platforms, features_module, platform_state_path
+from platforms.descriptor import PlatformDescriptor
+from platforms.registry import all_platforms, features_module
 
 from . import config_files
 from .admin_api import verify_admin_token
@@ -87,11 +87,7 @@ def features_state(workspace_root: Path, config: Any) -> dict[str, Any]:
     path = features_file(workspace_root)
     state = config.state_payload()
     current = state["file"]
-    platforms = [
-        platform_adoption(workspace_root, platform, path, current)
-        for platform in all_platforms()
-        if platform_state_path(platform, STATE_LIVE, workspace_root) is not None
-    ]
+    platforms = [platform_adoption(workspace_root, platform, path, current) for platform in all_platforms()]
     running = [entry for entry in platforms if entry["published"] and not entry["stale"]]
     return {
         # 生效值由 supervisor 当场算，不存在「还没公布」；外形和平台的 state 端点一致，控制台共用一套草稿逻辑。

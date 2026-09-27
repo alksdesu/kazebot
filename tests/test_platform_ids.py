@@ -119,9 +119,11 @@ class TestActiveAccountStore:
         # 旧文件名不动：换了名字，已登记的账号读不回来，会话键就落回空作用域。
         assert ActiveAccountStore(QQ_NAPCAT, tmp_path).path == tmp_path / "data" / "onebot_active_bot.json"
 
-    def test_a_platform_without_an_account_file_is_refused(self, tmp_path: Path) -> None:
-        with pytest.raises(LookupError):
-            ActiveAccountStore(replace(_STRING_PLATFORM, state_files={}), tmp_path)
+    def test_a_platform_without_a_legacy_file_keeps_it_in_its_own_directory(self, tmp_path: Path) -> None:
+        store = ActiveAccountStore(replace(_STRING_PLATFORM, state_files={}), tmp_path)
+
+        assert store.path == tmp_path / "data" / "platforms" / "probe" / "active_account.json"
+        assert store.save(_OPENID) is True and store.load() == _OPENID
 
 
 class TestRequester:

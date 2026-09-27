@@ -38,9 +38,7 @@ _SESSIONS = "sessions.json"
 _ROSTER = "memory_subjects.json"
 
 
-def _read_json(path: Path | None) -> dict[str, Any]:
-    if path is None:
-        return {}
+def _read_json(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:

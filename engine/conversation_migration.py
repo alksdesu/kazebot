@@ -71,10 +71,7 @@ class MigrationOutcome:
 
 
 def route_state_file(workspace: Path, platform: PlatformDescriptor) -> Path:
-    path = platform_state_path(platform, STATE_ROUTES, workspace)
-    if path is None:
-        raise LookupError(f"platform {platform.id!r} keeps no route state")
-    return path
+    return platform_state_path(platform, STATE_ROUTES, workspace)
 
 
 def memory_root(workspace: Path) -> Path:

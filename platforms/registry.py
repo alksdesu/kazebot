@@ -9,12 +9,16 @@ import os
 import re
 import threading
 from pathlib import Path
-from types import ModuleType
-from typing import Any, Collection
+from types import MappingProxyType, ModuleType
+from typing import Any, Collection, Mapping
 
 from .builtin import BUILTIN_PLATFORMS
 from .descriptor import (
     CONVERSATION_KINDS,
+    STATE_ACTIVE_ACCOUNT,
+    STATE_ALIASES,
+    STATE_LIVE,
+    STATE_ROUTES,
     ChannelDescriptor,
     PlatformDescriptor,
     normalize_name,
@@ -24,6 +28,14 @@ from .descriptor import (
 DIGEST_PATTERN = r"[0-9a-f]{24}"
 # 全平台共用的功能设置。核心层和取平台钩子一样经这里按需导入，不直接 import 适配器包。
 FEATURES_MODULE = "adapters._shared.features"
+# 平台自己的数据按平台 id 分子目录放在这下面，文件名不用再带平台前缀。
+PLATFORM_DATA_ROOT = "data/platforms"
+STANDARD_STATE_FILES: Mapping[str, str] = MappingProxyType({
+    STATE_LIVE: "live.json",
+    STATE_ROUTES: "routes.json",
+    STATE_ALIASES: "aliases.json",
+    STATE_ACTIVE_ACCOUNT: "active_account.json",
+})
 
 _lock = threading.Lock()
 _platforms: dict[str, PlatformDescriptor] = {}
@@ -134,11 +146,27 @@ def stable_key_pattern(*, kinds: Collection[str] = CONVERSATION_KINDS) -> re.Pat
     return re.compile(rf"(?:{'|'.join(re.escape(name) for name in names)}):{DIGEST_PATTERN}")
 
 
-def platform_config_path(platform: PlatformDescriptor, workspace_root: Path) -> Path | None:
+def workspace_path(raw: str, workspace_root: Path) -> Path:
+    """env 里写的路径。相对写法按工作区算：bot 和 supervisor 都以工作区为 cwd，离线工具不一定。"""
+    path = Path(raw).expanduser()
+    return path if path.is_absolute() else Path(workspace_root) / path
+
+
+def env_override(name: str, environ: Mapping[str, str] | None = None) -> str:
+    """平台声明的某个改位置的环境变量眼下的值，没声明或没设都是空串。environ 不给就读进程环境。"""
+    if not name:
+        return ""
+    source = os.environ if environ is None else environ
+    return str(source.get(name, "") or "").strip()
+
+
+def platform_config_path(
+    platform: PlatformDescriptor, workspace_root: Path, *, environ: Mapping[str, str] | None = None,
+) -> Path | None:
     if not platform.config_path:
         return None
-    override = os.environ.get(platform.config_env, "").strip() if platform.config_env else ""
-    return Path(override) if override else Path(workspace_root) / platform.config_path
+    override = env_override(platform.config_env, environ)
+    return workspace_path(override, workspace_root) if override else Path(workspace_root) / platform.config_path
 
 
 def required_config_path(platform: PlatformDescriptor, workspace_root: Path) -> Path:
@@ -148,9 +176,39 @@ def required_config_path(platform: PlatformDescriptor, workspace_root: Path) -> 
     return path
 
 
-def platform_state_path(platform: PlatformDescriptor, name: str, workspace_root: Path) -> Path | None:
-    file_name = platform.state_files.get(name)
-    return Path(workspace_root) / "data" / file_name if file_name else None
+def platform_data_relpath(platform: PlatformDescriptor) -> str:
+    """平台数据目录相对工作区的写法。"""
+    return f"{PLATFORM_DATA_ROOT}/{platform.id}"
+
+
+def platform_data_dir(platform: PlatformDescriptor, workspace_root: Path) -> Path:
+    """平台自己的数据目录：新平台的状态文件在这里，发送防重库、缓存这些落盘文件也放这里。"""
+    return Path(workspace_root) / platform_data_relpath(platform)
+
+
+def platform_state_path(
+    platform: PlatformDescriptor, name: str, workspace_root: Path, *, environ: Mapping[str, str] | None = None,
+) -> Path:
+    """一项状态文件的位置：升级前就在用的老文件名照旧，其余在平台数据目录下用标准文件名。"""
+    legacy = platform.state_files.get(name)
+    if legacy:
+        override = env_override(platform.state_env.get(name, ""), environ)
+        return workspace_path(override, workspace_root) if override else Path(workspace_root) / "data" / legacy
+    try:
+        return platform_data_dir(platform, workspace_root) / STANDARD_STATE_FILES[name]
+    except KeyError:
+        raise LookupError(f"unknown platform state file: {name!r}") from None
+
+
+def platform_secret_file(
+    platform: PlatformDescriptor, name: str, workspace_root: Path, *, environ: Mapping[str, str] | None = None,
+) -> Path | None:
+    """一项密钥两处都没配时平台自己生成的那份文件，位置能用声明里的 env 改；这项密钥不自动生成返回 None。"""
+    secret = platform.secret(name)
+    if not secret.file:
+        return None
+    override = env_override(secret.file_env, environ)
+    return workspace_path(override, workspace_root) if override else Path(workspace_root) / secret.file
 
 
 def platform_hook(platform: PlatformDescriptor, name: str) -> ModuleType:

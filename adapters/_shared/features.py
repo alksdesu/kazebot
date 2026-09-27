@@ -10,6 +10,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from platforms.registry import workspace_path
+
 from .console_schema import build_schema, number, percent, text_input, toggle, tristate, word_list
 from .features_layout import FEATURE_SECTIONS
 from .live_config import (
@@ -333,7 +335,7 @@ GLOBAL_ONLY_PATHS: frozenset[str] = frozenset(key.path for key in FEATURE_KEYS i
 
 def features_config_path(workspace_root: Path) -> Path:
     override = os.environ.get(FEATURES_CONFIG_ENV, "").strip()
-    return Path(override) if override else Path(workspace_root) / FEATURES_CONFIG_PATH
+    return workspace_path(override, workspace_root) if override else Path(workspace_root) / FEATURES_CONFIG_PATH
 
 
 def new_features_config(workspace_root: Path) -> LiveConfig:

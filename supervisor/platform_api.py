@@ -46,11 +46,8 @@ def config_file(workspace_root: Path, platform: PlatformDescriptor) -> Path:
 
 
 def live_state(workspace_root: Path, platform: PlatformDescriptor) -> dict[str, Any]:
-    path = platform_state_path(platform, STATE_LIVE, workspace_root)
-    if path is None:
-        return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(platform_state_path(platform, STATE_LIVE, workspace_root).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}

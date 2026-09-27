@@ -21,6 +21,8 @@ from clonoth_runtime import (
     undeclared_platform_secrets,
 )
 from platforms.builtin import QQ_NAPCAT
+from platforms.descriptor import STATE_ALIASES, STATE_ROUTES
+from platforms.registry import platform_secret_file, platform_state_path
 from workspace import resolve_workspace_root
 
 
@@ -155,9 +157,11 @@ def _secret(name: str) -> PlatformSecret:
 
 
 def _secret_file(name: str) -> str:
-    """两处都没配时自动生成的密钥文件。位置能用声明里的 env 改。"""
-    spec = QQ_NAPCAT.secret(name)
-    return env_first(spec.file_env, default=os.path.join(CLONOTH_WORKSPACE, *spec.file.split("/")))
+    """两处都没配时自动生成的密钥文件。位置能用声明里的 env 改，和离线脚本、保护规则认的是同一个。"""
+    path = platform_secret_file(QQ_NAPCAT, name, Path(CLONOTH_WORKSPACE))
+    if path is None:
+        raise LookupError(f"{name} has no generated file in the QQ descriptor")
+    return str(path)
 
 
 def _secret_config_warnings() -> tuple[str, ...]:
@@ -207,10 +211,8 @@ CONVERSATION_HASH_SECRET = _secret("conversation_hash_secret").value
 CONVERSATION_HASH_SECRET_FILE = _secret_file("conversation_hash_secret")
 
 # 本地路由状态文件：保存 stable conversation_key/session_id 到真实 QQ 群/用户目标的映射。
-ONEBOT_STATE_FILE = env_first(
-    "ONEBOT_STATE_FILE",
-    default=os.path.join(CLONOTH_WORKSPACE, "data", "onebot_plugin_state.json"),
-)
+# 位置和改位置的 ONEBOT_STATE_FILE 都在 QQ 描述里，supervisor 和迁移脚本按同一份声明找它。
+ONEBOT_STATE_FILE = str(platform_state_path(QQ_NAPCAT, STATE_ROUTES, Path(CLONOTH_WORKSPACE)))
 # Durable pending/sent claims must survive SDK outbox replay and adapter restart.
 ONEBOT_IDEMPOTENCY_STORE_FILE = env_first(
     "ONEBOT_IDEMPOTENCY_STORE_FILE",
@@ -247,10 +249,8 @@ REPLY_ATTACHMENT_CACHE_FILE = env_first(
 # 目的：跨重启保持别名一致，避免历史/记忆里同一人出现不同别名，并支持别名反解。
 # 注意：这是一份“去匿名化字典”（明文对照真实号 <-> 别名），属于敏感文件，
 # 必须与 data/config.yaml 同级别保护、不得提交到版本库。与路由状态分离存放。
-ANON_MAP_FILE = env_first(
-    "ONEBOT_ANON_MAP_FILE",
-    default=os.path.join(CLONOTH_WORKSPACE, "data", "onebot_anon_map.json"),
-)
+# 改位置用 ONEBOT_ANON_MAP_FILE，同样声明在 QQ 描述里。
+ANON_MAP_FILE = str(platform_state_path(QQ_NAPCAT, STATE_ALIASES, Path(CLONOTH_WORKSPACE)))
 
 # 匿名别名保留期（天）。0 = 不回收：反解 [at:UserX] 与文本掩码都依赖全量映射，
 # 回收会让久未出现的人的真实号在文本里不再被替换。
