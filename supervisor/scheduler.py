@@ -16,7 +16,7 @@ import subprocess
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 
@@ -395,43 +395,6 @@ class SchedulerThread:
                         tid for tid in self._state._task_order if tid in self._state.tasks
                     ]
                     log.info(f"[scheduler] pruned {len(to_remove)} old tasks from memory")
-
-                # 回收超时的 running 状态 task（安全网，防止 worker 崩溃后 task 永久孤立）
-                _now_ts = datetime.now(timezone.utc)
-                _stale_cutoff = _now_ts - timedelta(minutes=10)
-                try:
-                    # [AutoC] 默认任务硬上限统一为 1 小时（3600s），与审批超时对齐；
-                    # 可由 CLONOTH_TASK_MAX_RUNNING_SECONDS 覆盖。
-                    _max_running_sec = max(300.0, float(os.getenv("CLONOTH_TASK_MAX_RUNNING_SECONDS", "3600")))
-                except Exception:
-                    _max_running_sec = 3600.0
-                _stale_ids: list[tuple[str, str]] = []
-                for tid, t in self._state.tasks.items():
-                    if t.status != TaskStatus.running:
-                        continue
-                    if t.updated_at < _stale_cutoff:
-                        _stale_min = int((_now_ts - t.updated_at).total_seconds() / 60)
-                        _stale_ids.append((tid, f"任务运行超时（{_stale_min} 分钟无响应，疑似 worker 崩溃）"))
-                        continue
-                    _age_sec = (_now_ts - t.created_at).total_seconds()
-                    if _age_sec > _max_running_sec:
-                        _stale_ids.append((tid, f"任务运行过久（{int(_age_sec)} 秒），已自动终止以防止僵死阻塞聊天"))
-                for tid, _reason in _stale_ids:
-                    task = self._state.tasks.get(tid)
-                    if task is None or task.status != TaskStatus.running:
-                        continue
-                    task.status = TaskStatus.failed
-                    task.result = {
-                        "action": "fail",
-                        "node_id": task.node_id or "",
-                        "error": _reason,
-                    }
-                    task.updated_at = _now_ts
-                    task.lease_expires_at = None
-                    self._state._reset_task_route_state_locked(task)
-                    self._state._event_task_snapshot("task_completed", task, component="supervisor")
-                    self._state._route_completed_task_locked(task)
-                    log.warning(f"[scheduler] reaped stale running task {tid} (node={task.node_id}, reason={_reason})")
         except Exception as e:
             log.warning(f"[scheduler] cleanup error: {e}")
 

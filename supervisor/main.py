@@ -11,7 +11,7 @@ import os
 import uvicorn
 from fastapi import FastAPI
 
-from clonoth_runtime import process_workspace
+from clonoth_runtime import TASK_REAP_INTERVAL_SECONDS, process_workspace
 
 from .api import create_app
 from .instances import url_prefix
@@ -22,7 +22,7 @@ from .policy import PolicyEngine
 from .process_manager import ProcessManager
 from .scheduler import SchedulerThread
 from .state import SupervisorState
-from .types import TaskStatus
+from .task_reaper import reap_stuck_tasks_locked
 
 
 PORT_IN_USE_EXIT_CODE = 98
@@ -150,99 +150,18 @@ def main() -> None:
     scheduler = SchedulerThread(state=state, workspace_root=workspace_root)
     scheduler.start()
 
-    # ---- 后台僵尸 task 回收线程 ----
-    def _reap_zombie_tasks() -> None:
-        """定期回收 lease 过期超过 grace period 的僵尸 task。
-
-        跳过 session 中存在 pending approval 的 task，因为
-        等审批期间 agent 是合法阻塞状态，不应被当作僵尸回收。
-        """
-        from datetime import datetime, timedelta, timezone
-        from .types import ApprovalStatus
-        _REAP_INTERVAL = 60.0
-        _GRACE = timedelta(seconds=60)
-        # [Zombie reap 2026-06-21] Why: a live heartbeat can keep a task in
-        # running forever while it is logically stuck in a tool call (e.g.
-        # create_schedule), causing QQ preempt/queue paths to target that old
-        # task. How: cap absolute running wall-clock duration as a final safety
-        # net. Purpose: over-old tasks are failed and routed normally.
-        try:
-            _MAX_RUNNING_SEC = max(300.0, float(os.getenv("CLONOTH_TASK_MAX_RUNNING_SECONDS", "21600")))
-        except Exception:
-            _MAX_RUNNING_SEC = 21600.0
+    def _housekeeping_loop() -> None:
         while True:
-            time.sleep(_REAP_INTERVAL)
+            time.sleep(TASK_REAP_INTERVAL_SECONDS)
             try:
-                now = datetime.now(timezone.utc)
                 with state._lock:
-                    # 预先收集有 pending approval 的 session 集合
-                    _sessions_with_pending_approval: set[str] = set()
-                    for a in state.approvals.values():
-                        if a.status == ApprovalStatus.pending:
-                            _sessions_with_pending_approval.add(a.session_id)
-
-                    # [fix 2026-08-04] Why: 循环体内会调用 _route_completed_task_locked
-                    # 与 _cleanup_stale_sessions_locked，它们可能增删 state.tasks，
-                    # 直接遍历 state.tasks.values() 会抛
-                    # "dictionary changed size during iteration"，导致本轮 reaping
-                    # 提前中断、僵尸任务清不干净。How: 先对当前任务集合
-                    # 做快照（list(...)）再遍历。Purpose: reaping 在锁内安全修改任务。
-                    for task in list(state.tasks.values()):
-                        if task.status != TaskStatus.running:
-                            continue
-                        # [Fork/Merge 2026-05-17] Why: approvals and user-visible
-                        # events may now be attached to the parent route session
-                        # while the running task itself is on a branch. How: check
-                        # both runtime and route session before reaping. Purpose:
-                        # approval waits are not killed because of branch routing.
-                        route_session_id = state._route_session_id_for_task_locked(task)
-                        if task.session_id in _sessions_with_pending_approval or route_session_id in _sessions_with_pending_approval:
-                            continue
-
-                        should_reap = False
-                        reason = ""
-                        if not task.lease_expires_at:
-                            # [AutoC 2026-05-31] 兜底：running 且无 lease 超过 5 分钟视为僵尸。
-                            # [Zombie reap 2026-06-21] Fix: do not fall through into
-                            # `None + timedelta`; explicitly mark the reaping reason.
-                            if task.updated_at + timedelta(minutes=5) < now:
-                                should_reap = True
-                                reason = "missing lease (zombie reaped by background)"
-                        elif task.lease_expires_at + _GRACE < now:
-                            should_reap = True
-                            reason = "lease expired (zombie reaped by background)"
-
-                        age_sec = (now - task.created_at).total_seconds()
-                        if age_sec > _MAX_RUNNING_SEC:
-                            should_reap = True
-                            reason = f"max running age exceeded ({int(age_sec)}s > {int(_MAX_RUNNING_SEC)}s)"
-
-                        if not should_reap:
-                            continue
-
-                        task.status = TaskStatus.failed
-                        task.updated_at = now
-                        task.lease_expires_at = None
-                        task.result = {"action": "fail", "error": reason}
-                        state._reset_task_route_state_locked(task)
-                        state._event_task_snapshot("task_completed", task)
-                        # [Fork/Merge 2026-05-17] Why: failing a branch task must
-                        # still merge/cleanup the branch and emit a parent-routed
-                        # error response. How: reuse the normal completion router
-                        # after recording the task snapshot. Purpose: background
-                        # zombie reaping follows the same terminal path as API reaping.
-                        state._route_completed_task_locked(task)
-                        _logger.info(f"[zombie-reaper] reaped task {task.task_id[:12]} node={task.node_id} reason={reason}")
-                    # [AutoC 2026-05-30] Why: branch 和 fresh/fork child session
-                    # 历史上只标记 reset，不物理删除，sessions.json 会持续膨胀。
-                    # How: 复用后台 zombie reaper 的定时锁内循环，每分钟执行一次
-                    # stale registry 清理。Purpose: 旧遗留 reset 行和 24h 无活动的
-                    # fresh/fork child 会话会被自动移除，accumulate 会话保留。
+                    reap_stuck_tasks_locked(state)
+                    # 分支和 fresh/fork 子会话只标 reset 不删，不清的话 sessions.json 会一直涨
                     state._cleanup_stale_sessions_locked()
-            except Exception as e:
-                _logger.exception(f"[zombie-reaper] error: {e}")
+            except Exception:
+                _logger.exception("[housekeeping] tick failed")
 
-    threading.Thread(target=_reap_zombie_tasks, daemon=True, name="zombie-reaper").start()
+    threading.Thread(target=_housekeeping_loop, daemon=True, name="supervisor-housekeeping").start()
 
     app = create_app(
         state=state, process_manager=process_manager, config_store=config_store,

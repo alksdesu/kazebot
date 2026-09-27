@@ -187,6 +187,22 @@ def get_bool(data: dict[str, Any], dotted_key: str, default: bool = False) -> bo
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+DEFAULT_TASK_MAX_RUNNING_SECONDS = 3600.0
+_MIN_TASK_MAX_RUNNING_SECONDS = 300.0
+# supervisor 每隔这么久检查一次卡死的 running 任务；dream 要据此留足等待余量，所以放在两边都能导入的地方
+TASK_REAP_INTERVAL_SECONDS = 60.0
+
+
+def task_max_running_seconds() -> float:
+    """running 任务的运行时长硬上限：CLONOTH_TASK_MAX_RUNNING_SECONDS，默认 3600 秒，最低 300 秒。"""
+    raw = os.getenv("CLONOTH_TASK_MAX_RUNNING_SECONDS", "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_TASK_MAX_RUNNING_SECONDS
+    except ValueError:
+        value = DEFAULT_TASK_MAX_RUNNING_SECONDS
+    return max(_MIN_TASK_MAX_RUNNING_SECONDS, value)
+
+
 def load_yaml_dict(path: Path) -> dict[str, Any] | None:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))

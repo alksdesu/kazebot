@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,7 +10,13 @@ from typing import Any
 
 import yaml
 
-from clonoth_runtime import get_bool, get_str, load_runtime_config
+from clonoth_runtime import (
+    TASK_REAP_INTERVAL_SECONDS,
+    get_bool,
+    get_str,
+    load_runtime_config,
+    task_max_running_seconds,
+)
 from engine.builtin.knowledge_inject import memory_dir
 from engine.cron import cron_match
 from engine.builtin.memory_extract import _format_transcript_for_extract
@@ -1016,13 +1021,10 @@ class DreamHandler:
             return False
         if started.tzinfo is None:
             started = started.replace(tzinfo=now.tzinfo or timezone.utc)
-        # 上限跟着 supervisor 回收 running 任务的硬上限走，再留一个回收周期的余量，
-        # 免得这里比 supervisor 先放手、把一个还在跑的整理任务判成卡死。
-        try:
-            max_running = max(300.0, float(os.getenv("CLONOTH_TASK_MAX_RUNNING_SECONDS", "3600")))
-        except (TypeError, ValueError):
-            max_running = 3600.0
-        return now - started > timedelta(seconds=max_running + 1800)
+        # 跑过硬上限的任务，supervisor 最迟一个回收周期内就会判失败；这里再多等一个周期
+        # 给轮询和锁竞争，免得抢先放手、把一个还在跑的整理任务判成卡死。
+        deadline_sec = task_max_running_seconds() + 2 * TASK_REAP_INTERVAL_SECONDS
+        return now - started > timedelta(seconds=deadline_sec)
 
     def _maintenance_candidates(
         self,

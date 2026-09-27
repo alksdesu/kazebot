@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,13 +29,13 @@ from .log_access import LogReader
 from .process_manager import ProcessManager
 from .reply_intent import IntentResult, build_instruction as reply_intent_instruction
 from .state import SupervisorState
+from .task_reaper import reap_stuck_tasks_locked
 from .types import (
     AdminStateOut,
     AppConfigPublic,
     Approval,
     ApprovalDecisionIn,
     ApprovalRequestIn,
-    ApprovalStatus,
     ConfigReloadOut,
     Event,
     HandoffEventIn,
@@ -685,14 +685,14 @@ def create_app(
 
     @app.get("/v1/sessions/{session_id}/running_tasks")
     async def session_running_tasks(session_id: str) -> dict[str, Any]:
-        """Bot 查询当前 session 中 running/pending 状态的 task 列表。
-        自动收割 lease 过期超过 grace period 的僵尸 task。
-        跳过 session 中存在 pending approval 的 task（等审批不算僵尸）。"""
+        """Bot 查询当前 session（含入口分支）中 running/pending 状态的 task 列表。
+
+        列之前先按后台回收线程的同一套规则收掉卡死的 running 任务，适配器据此决定抢占还是排队，
+        不能拿一个已经死掉的任务当目标。
+        """
         st: SupervisorState = app.state.state
         if session_id not in st.sessions:
             raise HTTPException(status_code=404, detail="session not found")
-        now = _now()
-        _GRACE = timedelta(seconds=180)
         tasks: list[dict[str, Any]] = []
         with st._lock:
             # [Fork/Merge 2026-05-12] running_tasks 查询主 session 时也返回入口分支任务。
@@ -700,38 +700,11 @@ def create_app(
             # 做法：把主 session 与 parent→branches 索引合并为查询集合。
             # 目的：端点仍以主 session_id 调用，但能观察所有活跃分支。
             session_ids = {session_id, *st._entry_branch_ids_for_parent_locked(session_id)}
-            # 检查该 session 或任一分支是否有 pending approval
-            _has_pending_approval = any(
-                a.status == ApprovalStatus.pending and a.session_id in session_ids
-                for a in st.approvals.values()
-            )
+            reap_stuck_tasks_locked(st, session_ids=session_ids)
             for task in st.tasks.values():
                 if task.session_id not in session_ids:
                     continue
                 if task.status not in (TaskStatus.running, TaskStatus.pending):
-                    continue
-                # 收割僵尸：running + lease 过期超过 grace period
-                # 但如果 session 有 pending approval，跳过回收（等审批是合法阻塞）
-                # fix: lease_expires_at 为 None 时也视为僵尸，避免无 lease 的 running 任务永远无法被收割
-                if (task.status == TaskStatus.running
-                        and (not task.lease_expires_at or task.lease_expires_at + _GRACE < now)
-                        and not _has_pending_approval):
-                    task.status = TaskStatus.failed
-                    task.updated_at = now
-                    task.lease_expires_at = None
-                    task.result = {"action": "fail", "error": "lease expired (zombie reaped)"}
-                    st._reset_task_route_state_locked(task)
-                    # 写事件，使 events.jsonl 与内存状态一致
-                    st.eventlog.append(
-                        session_id=task.session_id,
-                        component="supervisor",
-                        type_="task_completed",
-                        payload=task.model_dump(mode="json"),
-                    )
-                    # [Fork/Merge 2026-05-12] 僵尸回收是 fail 终态，也必须走统一路由。
-                    # 原因：入口分支被回收时需要 merge 回主 session，并输出错误事件。
-                    # 做法：复用 task_router 的 fail 路由。目的：避免 reaped branch 永久悬挂。
-                    st._route_completed_task_locked(task)
                     continue
                 _is_async = bool(task.input.get("_async_dispatch"))
                 _is_system = bool(task.input.get("_system_task"))
