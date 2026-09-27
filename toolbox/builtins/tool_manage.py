@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 from ..context import ToolContext
-from . import TOOL_NAME_RE, RESERVED_TOOL_NAMES
+from ..tool_names import TOOL_NAME_RE
 
 
 def _ok(result_text: str, **fields: Any) -> dict[str, Any]:
@@ -87,8 +87,9 @@ async def create_or_update_tool(args: dict[str, Any], ctx: ToolContext) -> dict[
         return _err("empty tool name")
     if not TOOL_NAME_RE.fullmatch(name):
         return _err("invalid tool name: only [A-Za-z_][A-Za-z0-9_]{0,63} is allowed")
-    if name in RESERVED_TOOL_NAMES:
-        return _err(f"reserved tool name: {name}")
+    reserved = ctx.registry.reserved_name_reason(name)
+    if reserved:
+        return _err(f"reserved tool name: {name} ({reserved})")
     if not isinstance(script, str) or not script.strip():
         return _err("'script' is required")
     if not isinstance(input_schema, dict):

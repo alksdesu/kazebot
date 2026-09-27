@@ -68,4 +68,4 @@ class PlanDraft(BaseModel):
 
 
 TERMINAL_STEPS = {"succeeded", "failed", "cancelled", "outcome_unknown", "blocked"}
-READ_ONLY_TOOLS = frozenset({"read_file", "list_dir", "search_in_files", "get_context_window", "list_active_tasks"})
+READ_ONLY_TOOLS = frozenset({"read_file", "list_dir", "search_in_files", "get_context_window"})

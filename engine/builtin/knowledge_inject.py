@@ -19,7 +19,6 @@ from engine.memory_subjects import (
 )
 from engine.node import Node
 from toolbox._common import request_guard, resolve_under_allowed_roots
-from toolbox.builtins import SKILL_NAME_RE
 from toolbox.context import ToolContext
 
 # Why: engine.builtin handlers must not depend on the hook package after relocation.
@@ -30,6 +29,9 @@ from engine.eventlog_rotation import eventlog_file_lock
 from engine.memory_hit_cache import record_hits
 
 logger = logging.getLogger(__name__)
+
+# Skill 名同时是 skills/<name>/ 目录名
+SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 # Why: skill and memory injection now share one before_prompt_build handler.

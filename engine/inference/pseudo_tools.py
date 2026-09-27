@@ -1,47 +1,16 @@
 """伪工具 spec 构建器和工具列表 helpers。
 
-从 ai_step.py 中拆出，这些函数零外部依赖，纯数据结构构建。
+从 ai_step.py 中拆出，纯数据结构构建。伪工具叫什么名字由 toolbox/tool_names.py 统一声明，
+注册表拒收同名外部工具也看那一份。
 """
 from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
 
+from toolbox.tool_names import DISPATCH_TOOL_PREFIX
+
 if TYPE_CHECKING:
     from ..node import Node
-
-
-# ---------------------------------------------------------------------------
-#  v3 伪工具名称
-# ---------------------------------------------------------------------------
-
-# [AutoC 2026-05-31] Why: ask is introduced as a terminal pseudo tool so
-# nodes can explicitly request upstream clarification before workflow topology
-# routing exists. How: include ask in the static pseudo-tool set next to finish.
-# Purpose: route ask through pseudo_handlers instead of rejecting it as an
-# unauthorized real tool.
-_PSEUDO_TOOL_NAMES = frozenset({"finish", "ask", "reply", "switch_node", "compact_context", "preempt_task"})
-
-# [2026-05-04] Dynamic delegate dispatch tools use a stable prefix plus target id.
-# Why: the removed aggregate dispatch tools hid delegate choices behind one
-# schema. How: keep only static pseudo-tool names in _PSEUDO_TOOL_NAMES and
-# recognize dispatch:{target_id} through this prefix. Purpose: route dynamic tools
-# through the existing pseudo-tool execution path without hard-coding node ids or
-# reintroducing removed aggregate tools.
-DISPATCH_TOOL_PREFIX = "dispatch_to_"
-
-
-def _is_pseudo_tool_name(name: str) -> bool:
-    """Return whether ``name`` is handled by the engine pseudo-tool layer."""
-    tool_name = str(name or "").strip()
-    # [2026-05-04] The dynamic dispatch pattern requires a concrete target id.
-    # Why: dispatch: without a suffix cannot be executed by pseudo_handlers.
-    # How: keep exact static-name matching and accept only dispatch:{target_id}
-    # with a non-empty suffix. Purpose: avoid treating malformed dynamic names as
-    # pseudo tools while preserving all valid per-target dispatch tools.
-    return tool_name in _PSEUDO_TOOL_NAMES or (
-        tool_name.startswith(DISPATCH_TOOL_PREFIX)
-        and bool(tool_name[len(DISPATCH_TOOL_PREFIX):].strip())
-    )
 
 
 import re as _re

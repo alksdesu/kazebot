@@ -15,7 +15,10 @@ from ._common import kill_process_group as _kill_process_group
 from ._common import request_guard as _request_guard
 from ._common import safe_subprocess_env as _safe_subprocess_env
 from . import mcp_runtime
+from .tool_names import is_engine_owned_name
 
+
+log = logging.getLogger(__name__)
 
 ToolFunc = Callable[[dict[str, Any], Any], Awaitable[dict[str, Any]]]
 
@@ -754,8 +757,6 @@ class ToolRegistry:
         (self.tools_dir / "__init__.py").touch(exist_ok=True)
         # 工具在子进程里以脚本跑，本进程不 import 它们；把工作区插进 sys.path 反倒让它的 tools 盖住代码目录那份。
 
-        builtin_names = set(self._tool_specs.keys())
-
         for py in iter_external_tool_files(self.tools_dir):
             spec, timeout_sec = _extract_tool_spec(py)
             if spec is None:
@@ -766,7 +767,9 @@ class ToolRegistry:
                 continue
             name = name.strip()
 
-            if name in builtin_names:
+            reserved = self.reserved_name_reason(name)
+            if reserved:
+                log.warning("skipping external tool %s: name %r is %s", py.name, name, reserved)
                 continue
 
             description = str(spec.get("description", ""))
@@ -805,6 +808,18 @@ class ToolRegistry:
     def builtin_specs(self) -> list[dict[str, Any]]:
         """内置工具的 spec 快照。外部脚本工具不在内，reload 也冲不掉。"""
         return list(self._builtin_specs.values())
+
+    def reserved_name_reason(self, name: str) -> str | None:
+        """外部工具不能用这个名字时返回原因，能用返回 None。
+
+        内置工具以注册表快照为准，插件在启动时注册的工具也在里面；引擎伪工具不进注册表，另外判断。
+        """
+        clean_name = str(name or "").strip()
+        if clean_name in self._builtin_specs:
+            return "taken by a builtin tool"
+        if is_engine_owned_name(clean_name):
+            return "taken by an engine pseudo tool"
+        return None
 
     def get_spec(self, name: str) -> dict[str, Any] | None:
         """按名称获取单个工具的 spec，不存在返回 None。"""
@@ -857,7 +872,7 @@ class ToolRegistry:
                 if not isinstance(tools, list):
                     continue
             except Exception:
-                logging.warning(f"[registry] MCP client '{cid}' tool list unavailable, skipping")
+                log.warning("[registry] MCP client '%s' tool list unavailable, skipping", cid)
                 continue
 
             for tool in tools:

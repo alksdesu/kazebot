@@ -1,4 +1,4 @@
-"""Task management: cancel_active_tasks, list_active_tasks."""
+"""Task management: cancel_active_tasks, get_context_window."""
 from __future__ import annotations
 
 from typing import Any
@@ -47,15 +47,6 @@ async def cancel_active_tasks(args: dict[str, Any], ctx: ToolContext) -> dict[st
         return _ok("Active tasks cancelled", response=payload)
     except Exception as e:
         return _err(e)
-
-
-async def list_active_tasks(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """List active tasks in the current session."""
-    note = "活跃任务信息已在系统上下文中注入，无需额外查询。"
-    # [AutoC 2026-05-31] Why: list_active_tasks is a lightweight informational
-    # tool but must still provide data.result. How: return the note as both result
-    # and structured note. Purpose: keep the response schema uniform.
-    return _ok(note, note=note)
 
 
 async def get_context_window(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:

@@ -44,7 +44,7 @@ class AgentManageHandler:
 # ---------------------------------------------------------------------------
 #  Validation
 # ---------------------------------------------------------------------------
-# [2026-05-28] 节点 ID 校验：与 toolbox.builtins.SKILL_NAME_RE 对齐，
+# [2026-05-28] 节点 ID 校验：与 knowledge_inject.SKILL_NAME_RE 对齐，
 # 但节点 ID 允许点号（如 bootstrap.coder），所以单独定义。
 _NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$")
 

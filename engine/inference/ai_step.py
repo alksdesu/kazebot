@@ -10,10 +10,10 @@ from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
 from toolbox.registry import ToolRegistry
+from toolbox.tool_names import is_pseudo_tool_name
 
 from .pseudo_tools import (
     _dispatch_delegate_specs,
-    _is_pseudo_tool_name,
     _finish_spec,
     _ask_spec,
     _reply_spec,
@@ -381,7 +381,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         # and must bypass real-tool authorization. How: use the prefix-aware helper
         # instead of a fixed name-only set. Purpose: route fixed-target dispatches
         # to pseudo_handlers without accepting removed aggregate dispatch tools.
-        if _is_pseudo_tool_name(tc.name):
+        if is_pseudo_tool_name(tc.name):
             pseudo_calls.append(tc)
         else:
             # 【Fix】真工具权限校验：工具必须在节点的授权列表内才能执行
