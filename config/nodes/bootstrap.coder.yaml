@@ -30,7 +30,7 @@ prompt: |
   - If the task is simple and doesn't require tools, just respond directly without calling any tools.
   - Always maintain code readability and maintainability.
   - Do not omit any code.
-  - **When generating a file that is meant to be sent/delivered to the user (e.g. QQ needs to send it back), write it into the `data/attachments/` directory by default (relative to the workspace root), e.g. `data/attachments/<name>.txt`. Do NOT put such deliverable files directly under `data/`. This is required because only `data/attachments/` is accessible to the QQ send pipeline. Normal source-code edits are unaffected and keep their original paths.**
+  - **When generating a file that is meant to be sent/delivered to the user (e.g. the chat platform needs to send it back), write it into the `data/attachments/` directory by default (relative to the workspace root), e.g. `data/attachments/<name>.txt`. Do NOT put such deliverable files directly under `data/`. This is required because only `data/attachments/` is accessible to the send pipeline. Normal source-code edits are unaffected and keep their original paths.**
 
   ====
 

@@ -13,7 +13,8 @@ from platforms.descriptor import PlatformDescriptor
 GUIDE_VERSION = 1
 SECTION_SPLIT = "split"
 SECTION_REACTIONS = "reactions"
-SECTION_EMOJI = "emoji"
+SECTION_NATIVE_EMOJI = "native_emoji"
+SECTION_STICKERS = "stickers"
 
 
 @dataclass(frozen=True)
@@ -78,35 +79,30 @@ def reaction_section(platform: PlatformDescriptor, kind: str, catalog: Mapping[s
     ]))
 
 
-def emoji_section(
-    platform: PlatformDescriptor,
-    *,
-    native_label: str = "",
-    native_names: Sequence[str] = (),
-    native_hidden: int = 0,
-    stickers: Sequence[str] = (),
+def native_emoji_section(
+    platform: PlatformDescriptor, *, label: str, names: Sequence[str], hidden: int = 0,
 ) -> Optional[GuideSection]:
-    """表情说明：平台原生表情按名单给全，表情包这一轮抽中了才给。
-
-    表情包清单每轮按概率抽，整段放动态区；按有没有抽中切换位置的话，两头的缓存都会被打穿。
-    """
-    capabilities = platform.capabilities
-    names = list(native_names) if capabilities.native_emoji else []
-    entries = list(stickers) if capabilities.images is not None else []
-    if not names and not entries:
+    """平台自带的表情。名单不随轮次变，放缓存前缀。"""
+    if not platform.capabilities.native_emoji or not names:
         return None
-    lines = ["【可用表情】", "在回复里写 [表情:名称] 就能发。"]
-    if names:
-        more = f"（另有 {native_hidden} 个未展示）" if native_hidden > 0 else ""
-        lines.append(f"{native_label}（只能用这些名字）：{'、'.join(names)}{more}")
-    if entries:
-        lines.append("表情包，一行一张，括号里是它的标签：")
+    more = f"（另有 {hidden} 个未展示）" if hidden > 0 else ""
+    return GuideSection(SECTION_NATIVE_EMOJI, "\n".join([
+        f"【可用{label}】",
+        f"在回复里写 [表情:名称] 就能发{label}，只能用这些名字：{'、'.join(names)}{more}",
+    ]))
+
+
+def sticker_section(platform: PlatformDescriptor, entries: Sequence[str]) -> Optional[GuideSection]:
+    """这一轮抽中的表情包。清单每轮按概率抽，放动态区，不牵动缓存前缀。"""
+    if platform.capabilities.images is None or not entries:
+        return None
+    return GuideSection(SECTION_STICKERS, "\n".join([
+        "【可用表情包】",
+        "在回复里写 [表情:名称] 就能发表情包，一行一张，括号里是它的标签：",
         # 一行一张：挤成一行靠顿号分隔的话，标签自带顿号或名字带括号时就分不清归属了。
-        lines.extend(f"  {entry}" for entry in entries)
-        lines.extend([
-            "配不配表情包你自己定，不合适就别写 —— 每句话都配图很烦人。",
-            "只想甩一张图不说话时，整条回复就写一个 [表情:名称]，别硬凑话。",
-            # 名单外的词也能用：想表达的情绪未必对得上某张图的名字，但多半对得上它的某个标签。
-            "名单里挑不出想要的，也可以直接写想表达的情绪，比如 [表情:无语]，会去标签里找。",
-        ])
-    return GuideSection(SECTION_EMOJI, "\n".join(lines), volatile=True)
+        *(f"  {entry}" for entry in entries),
+        "配不配表情包你自己定，不合适就别写 —— 每句话都配图很烦人。",
+        "只想甩一张图不说话时，整条回复就写一个 [表情:名称]，别硬凑话。",
+        # 名单外的词也能用：想表达的情绪未必对得上某张图的名字，但多半对得上它的某个标签。
+        "名单里挑不出想要的，也可以直接写想表达的情绪，比如 [表情:无语]，会去标签里找。",
+    ]), volatile=True)

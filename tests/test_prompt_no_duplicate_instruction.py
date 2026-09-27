@@ -21,7 +21,7 @@ if str(_ROOT) not in sys.path:
 
 from engine.inference.message_assembly import assemble_messages_with_injections  # noqa: E402
 from engine.node import Node  # noqa: E402
-from engine.prompt import assemble_prompt  # noqa: E402
+from engine.prompt import _expand_includes, assemble_prompt  # noqa: E402
 
 MARKER = "# %%DYNAMIC%%"
 _NODE_DIRS = ("config/nodes", "engine/system_nodes")
@@ -35,9 +35,10 @@ def _node_files() -> list[Path]:
 
 
 def _prompt_of(path: Path) -> str:
+    """渲染变量之前的提示词模板，include 已按引擎的方式展开：规则大多写在片段里。"""
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     prompt = data.get("prompt")
-    return prompt if isinstance(prompt, str) else ""
+    return _expand_includes(prompt, _ROOT / "config" / "nodes") if isinstance(prompt, str) else ""
 
 
 def _rel(path: Path) -> str:

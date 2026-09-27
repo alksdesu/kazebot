@@ -18,7 +18,12 @@ if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
 from _onebot_harness import load_runtime, set_live_config  # noqa: E402
-from adapters._shared.output_guide import SECTION_EMOJI, SECTION_REACTIONS, SECTION_SPLIT  # noqa: E402
+from adapters._shared.output_guide import (  # noqa: E402
+    SECTION_NATIVE_EMOJI,
+    SECTION_REACTIONS,
+    SECTION_SPLIT,
+    SECTION_STICKERS,
+)
 from clonoth_sdk.state import SessionState, TriggerInfo  # noqa: E402
 
 _GROUP_ID = 700001
@@ -122,19 +127,22 @@ class TestSubmission:
         [call] = core.submitted
         sections = _sections(call["output_guide"])
 
-        assert list(sections) == [SECTION_SPLIT, SECTION_REACTIONS, SECTION_EMOJI]
-        assert "收藏表情（只能用这些名字）：收藏甲" in sections[SECTION_EMOJI]["text"]
+        assert list(sections) == [SECTION_SPLIT, SECTION_REACTIONS, SECTION_NATIVE_EMOJI]
+        assert sections[SECTION_NATIVE_EMOJI]["text"].endswith("就能发收藏表情，只能用这些名字：收藏甲")
         assert call["text"] == "正文"
 
-    def test_the_catalogs_are_stable_and_the_emoji_roster_changes_every_turn(self, runtime: Any) -> None:
+    def test_the_catalogs_are_stable_and_the_sticker_roster_changes_every_turn(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(runtime.emotes, "_sticker_prompt_entries", lambda key: ["甲（大笑）"])
         core = _Core()
 
         _submit(runtime, core)
         sections = _sections(core.submitted[0]["output_guide"])
 
-        # 稳定的进缓存前缀；表情清单每轮按概率抽，放动态区。
+        # 收藏表情名单不随轮次变，跟表态目录一起进缓存前缀；表情包清单每轮按概率抽，放动态区。
         assert {key: section["volatile"] for key, section in sections.items()} == {
-            SECTION_SPLIT: False, SECTION_REACTIONS: False, SECTION_EMOJI: True,
+            SECTION_SPLIT: False, SECTION_REACTIONS: False, SECTION_NATIVE_EMOJI: False, SECTION_STICKERS: True,
         }
 
     def test_a_private_turn_carries_no_reactions(self, runtime: Any) -> None:
@@ -142,7 +150,7 @@ class TestSubmission:
 
         _submit(runtime, core, private=True)
 
-        assert list(_sections(core.submitted[0]["output_guide"])) == [SECTION_SPLIT, SECTION_EMOJI]
+        assert list(_sections(core.submitted[0]["output_guide"])) == [SECTION_SPLIT, SECTION_NATIVE_EMOJI]
 
     def test_a_draw_turn_only_teaches_splitting_and_rolls_no_stickers(
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
@@ -183,7 +191,7 @@ class TestPreempt:
 
         [preempt] = core.preempted
         assert preempt["task_id"] == "task-1" and core.submitted == []
-        assert list(_sections(preempt["output_guide"])) == [SECTION_SPLIT, SECTION_REACTIONS, SECTION_EMOJI]
+        assert list(_sections(preempt["output_guide"])) == [SECTION_SPLIT, SECTION_REACTIONS, SECTION_NATIVE_EMOJI]
 
     def test_a_refused_preempt_submits_the_same_guide_without_rolling_again(
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch,

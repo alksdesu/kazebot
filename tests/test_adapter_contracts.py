@@ -24,7 +24,12 @@ from _contract_drivers import DRIVERS, ContractDriver, Delivery, open_driver, re
 from _fake_platform import FAULT_HANG, FAULT_LOST_ACK, FAULT_REFUSED  # noqa: E402
 from adapters._shared.feature_gateway import FeatureHost, QuietDeliveryDeferred  # noqa: E402
 from adapters._shared.outbound import EVERYONE, SPLIT_MARKER  # noqa: E402
-from adapters._shared.output_guide import SECTION_EMOJI, SECTION_REACTIONS, SECTION_SPLIT  # noqa: E402
+from adapters._shared.output_guide import (  # noqa: E402
+    SECTION_NATIVE_EMOJI,
+    SECTION_REACTIONS,
+    SECTION_SPLIT,
+    SECTION_STICKERS,
+)
 from adapters._shared.send_guard import SendError  # noqa: E402
 from clonoth_sdk.callbacks import AdapterCallbacks  # noqa: E402
 from clonoth_sdk.state import TriggerInfo  # noqa: E402
@@ -251,10 +256,25 @@ class TestOutputGuide:
         asyncio.run(driver.group_message("hello there", sender=driver.member, message_id="101", mention_bot=True))
 
         [call] = driver.client.submissions
-        emoji = _guide_sections(call).get(SECTION_EMOJI)
+        stickers = _guide_sections(call).get(SECTION_STICKERS)
         # 清单每轮在变，放动态区；写进正文就会一轮轮堆在对话历史里。
-        assert emoji is not None and emoji["volatile"] and "wave" in emoji["text"]
+        assert stickers is not None and stickers["volatile"] and "wave" in stickers["text"]
         assert "wave" not in call["text"]
+
+    def test_native_emoji_are_offered_in_the_cached_prefix_where_the_platform_has_them(
+        self, driver: ContractDriver,
+    ) -> None:
+        driver.offer_native_emoji(("wave",))
+
+        asyncio.run(driver.group_message("hello there", sender=driver.member, message_id="101", mention_bot=True))
+
+        [call] = driver.client.submissions
+        native = _guide_sections(call).get(SECTION_NATIVE_EMOJI)
+        assert (native is not None) == driver.platform.capabilities.native_emoji
+        if native is not None:
+            # 名单不随轮次变；跟着表情包清单进动态区的话，每轮都白付一遍这段的钱。
+            assert not native["volatile"] and "wave" in native["text"]
+            assert "wave" not in call["text"]
 
 
 class TestExternalPlatformRules:

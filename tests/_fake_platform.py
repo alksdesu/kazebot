@@ -51,7 +51,7 @@ from adapters._shared.outbound import (
     strip_markup,
     tokenize,
 )
-from adapters._shared.output_guide import OutputGuide, emoji_section, split_section
+from adapters._shared.output_guide import OutputGuide, split_section, sticker_section
 from adapters._shared.send_guard import (
     AmbiguousAckError,
     IdempotencyClaim,
@@ -415,7 +415,7 @@ class FakeChatAdapter:
         """按能力声明给：分条，库里有发得出去的图时加上表情包清单；表态和平台自己的表情 fakechat 都没有。"""
         return OutputGuide.of(
             split_section(FAKE_CHAT),
-            emoji_section(FAKE_CHAT, stickers=self.sticker_roster(conversation_key)),
+            sticker_section(FAKE_CHAT, self.sticker_roster(conversation_key)),
         )
 
     def sticker_roster(self, conversation_key: str) -> list[str]:

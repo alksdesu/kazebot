@@ -20,7 +20,7 @@ adapters/onebot/
 │   ├── message_text.py          # 消息段转文本、合并转发展开、引用解析
 │   ├── media.py                 # 入站图片与文件解析、下载、近期缓存
 │   ├── emotes.py                # 表情包库与收藏表情
-│   ├── output_guide.py          # 这一轮交给引擎的输出说明：分条、群表态、可用表情
+│   ├── output_guide.py          # 这一轮交给引擎的输出说明：分条、群表态、收藏表情、表情包
 │   ├── history.py               # 群历史窗口、水位、清空门槛
 │   ├── inbound.py               # 入站判定、InboundFacts 翻译、触发与 inbound 文本
 │   ├── queueing.py              # 排队 worker、合并规则、抢占注入

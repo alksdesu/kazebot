@@ -1,9 +1,16 @@
-"""这一轮随入站交给引擎的输出说明：分条、群里的表态、可用表情。"""
+"""这一轮随入站交给引擎的输出说明：分条、群里的表态、收藏表情、表情包。"""
 from __future__ import annotations
 
 from typing import Dict, Optional
 
-from adapters._shared.output_guide import GuideSection, OutputGuide, emoji_section, reaction_section, split_section
+from adapters._shared.output_guide import (
+    GuideSection,
+    OutputGuide,
+    native_emoji_section,
+    reaction_section,
+    split_section,
+    sticker_section,
+)
 from platforms.builtin import QQ_NAPCAT
 from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE
 
@@ -23,18 +30,17 @@ def _reaction_section(kind: str) -> Optional[GuideSection]:
     return reaction_section(QQ_NAPCAT, kind, catalog)
 
 
-def _emoji_section(conversation_key: str) -> Optional[GuideSection]:
-    """收藏表情按名单给，最多 face_prompt_limit 个；表情包这一轮抽中了才给。"""
+def _native_emoji_section() -> Optional[GuideSection]:
+    """收藏表情按名单给，最多 face_prompt_limit 个。"""
     names = emotes._current_custom_face_names()
     limit = int(live.face_prompt_limit)
     shown = names[:limit] if limit > 0 else []
-    return emoji_section(
-        QQ_NAPCAT,
-        native_label=_NATIVE_FACE_LABEL,
-        native_names=shown,
-        native_hidden=len(names) - len(shown) if shown else 0,
-        stickers=emotes._sticker_prompt_entries(conversation_key),
-    )
+    return native_emoji_section(QQ_NAPCAT, label=_NATIVE_FACE_LABEL, names=shown, hidden=len(names) - len(shown))
+
+
+def _sticker_section(conversation_key: str) -> Optional[GuideSection]:
+    """表情包这一轮抽中了才给。"""
+    return sticker_section(QQ_NAPCAT, emotes._sticker_prompt_entries(conversation_key))
 
 
 def _turn_output_guide(conversation_key: str, *, is_dm: bool, entry_node_id: str = "") -> OutputGuide:
@@ -42,4 +48,6 @@ def _turn_output_guide(conversation_key: str, *, is_dm: bool, entry_node_id: str
         # 绘图节点只出图或提示词，表情和表态用不上。
         return OutputGuide.of(_split_section())
     kind = CHANNEL_PRIVATE if is_dm else CHANNEL_GROUP
-    return OutputGuide.of(_split_section(), _reaction_section(kind), _emoji_section(conversation_key))
+    return OutputGuide.of(
+        _split_section(), _reaction_section(kind), _native_emoji_section(), _sticker_section(conversation_key),
+    )

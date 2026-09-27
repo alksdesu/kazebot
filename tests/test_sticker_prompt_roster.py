@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -20,6 +19,7 @@ _TESTS = Path(__file__).resolve().parent
 if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
+from _node_prompts import assembled_prompt  # noqa: E402
 from _onebot_harness import load_runtime, set_live_config  # noqa: E402
 from stickers.store import (  # noqa: E402
     CAPTION_DONE, CAPTION_FAILED, CAPTION_PENDING, CAPTION_RUNNING,
@@ -63,9 +63,15 @@ def _add(
     return digest
 
 
-def _emoji_block(runtime: Any) -> str:
-    """这一轮的【可用表情】说明；这一轮不给时是空串。"""
-    section = runtime.output_guide._emoji_section(_CONV)
+def _native_block(runtime: Any) -> str:
+    """这一轮的收藏表情说明；不给时是空串。"""
+    section = runtime.output_guide._native_emoji_section()
+    return "" if section is None else section.text
+
+
+def _sticker_block(runtime: Any) -> str:
+    """这一轮的表情包说明；没抽中时是空串。"""
+    section = runtime.output_guide._sticker_section(_CONV)
     return "" if section is None else section.text
 
 
@@ -207,13 +213,14 @@ class TestPromptBlock:
         monkeypatch.setattr(runtime.emotes, "_current_custom_face_names", lambda: ["收藏甲"])
         set_live_config(runtime, sticker_send_probability=0.0)
 
-        block = _emoji_block(runtime)
+        native = _native_block(runtime)
 
-        assert "收藏表情（只能用这些名字）：收藏甲" in block
-        assert "[表情:无语]" not in block
-        assert "会去标签里找" not in block
+        assert native.endswith("只能用这些名字：收藏甲")
+        assert _sticker_block(runtime) == ""
+        assert "[表情:无语]" not in native
+        assert "会去标签里找" not in native
 
-    def test_本地与收藏同时存在时保留各自使用说明(
+    def test_收藏和表情包各占一段_各带各的用法(
         self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _add(store, "本地甲", ["大笑"])
@@ -221,31 +228,32 @@ class TestPromptBlock:
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
 
-        block = _emoji_block(runtime)
+        native, stickers = _native_block(runtime), _sticker_block(runtime)
 
-        assert "收藏表情（只能用这些名字）：收藏甲" in block
-        assert "本地甲（大笑）" in block
-        assert "[表情:无语]" in block
-        assert "会去标签里找" in block
+        assert native.endswith("只能用这些名字：收藏甲") and "本地甲" not in native
+        assert "本地甲（大笑）" in stickers and "收藏甲" not in stickers
+        assert "[表情:无语]" in stickers and "[表情:无语]" not in native
+        assert "会去标签里找" in stickers
 
-    @pytest.mark.parametrize("filename", ["qq.orchestrator.yaml", "qq.orchestrator.example.yaml"])
-    def test_节点规则接受动态清单并区分收藏与本地标签(
-        self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch, filename: str,
+    @pytest.mark.parametrize("node_id", ["qq.orchestrator", "qq.orchestrator.example"])
+    def test_节点规则按输出说明认表情_不认段落标题(
+        self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch, node_id: str,
     ) -> None:
         _add(store, "甲", ["大笑"])
+        monkeypatch.setattr(runtime.emotes, "_current_custom_face_names", lambda: ["收藏甲"])
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
-        block = _emoji_block(runtime)
-        node = yaml.safe_load((_ROOT / "config/nodes" / filename).read_text(encoding="utf-8"))
-        prompt = node["prompt"]
+        prompt = assembled_prompt(node_id)
 
-        assert block.splitlines()[0] == "【可用表情】"
-        assert "【可用表情】" in prompt
-        assert "兼容旧标题【QQ可用收藏表情】" in prompt
-        assert "收藏表情只能使用本轮收藏清单列出的名称" in prompt
-        assert "只有该说明提供了本地表情包时" in prompt
-        assert "[表情:无语]" in prompt
-        assert "不要沿用历史清单" in prompt
+        assert _native_block(runtime).splitlines()[0] == "【可用收藏表情】"
+        assert _sticker_block(runtime).splitlines()[0] == "【可用表情包】"
+        # 标题随平台变，规则认的是输出说明的包裹标记。
+        assert "[OUTPUT_GUIDE:CONSTANT]" in prompt and "[OUTPUT_GUIDE:ACTIVE]" in prompt
+        assert "【可用表情】" not in prompt and "【QQ可用收藏表情】" not in prompt and "【QQ表情表态】" not in prompt
+        assert "平台自带的表情只能用说明里列出的名字" in prompt
+        assert "只有给了表情包清单时" in prompt and "[表情:无语]" in prompt
+        # 说明不写进对话历史，没有旧清单可沿用。
+        assert "不要沿用历史清单" not in prompt
 
     def test_抽中时才出现表情包那几行(
         self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch,
@@ -254,7 +262,7 @@ class TestPromptBlock:
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
 
-        block = _emoji_block(runtime)
+        block = _sticker_block(runtime)
 
         assert "甲（大笑）" in block
         assert "只想甩一张图不说话" in block
@@ -267,9 +275,9 @@ class TestPromptBlock:
         _always(runtime, monkeypatch, False)
 
         # 没有收藏表情、这轮又没抽中，就不该白占一段提示词。
-        assert _emoji_block(runtime) == ""
+        assert _native_block(runtime) == "" and _sticker_block(runtime) == ""
 
-    def test_收藏和表情包都在时逐字沿用原来的写法(
+    def test_收藏和表情包都在时的逐字写法(
         self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _add(store, "本地甲", ["大笑"])
@@ -277,25 +285,30 @@ class TestPromptBlock:
         set_live_config(runtime, sticker_send_probability=1.0, face_prompt_limit=1)
         _always(runtime, monkeypatch, True)
 
-        assert _emoji_block(runtime) == "\n".join([
-            "【可用表情】",
-            "在回复里写 [表情:名称] 就能发。",
-            "收藏表情（只能用这些名字）：收藏甲（另有 1 个未展示）",
-            "表情包，一行一张，括号里是它的标签：",
+        assert _native_block(runtime) == "\n".join([
+            "【可用收藏表情】",
+            "在回复里写 [表情:名称] 就能发收藏表情，只能用这些名字：收藏甲（另有 1 个未展示）",
+        ])
+        assert _sticker_block(runtime) == "\n".join([
+            "【可用表情包】",
+            "在回复里写 [表情:名称] 就能发表情包，一行一张，括号里是它的标签：",
             "  本地甲（大笑）",
             "配不配表情包你自己定，不合适就别写 —— 每句话都配图很烦人。",
             "只想甩一张图不说话时，整条回复就写一个 [表情:名称]，别硬凑话。",
             "名单里挑不出想要的，也可以直接写想表达的情绪，比如 [表情:无语]，会去标签里找。",
         ])
 
-    def test_清单每轮都在变_整段放动态区(
-        self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
+    def test_收藏名单进缓存前缀_表情包清单进动态区(
+        self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        _add(store, "甲", ["大笑"])
         monkeypatch.setattr(runtime.emotes, "_current_custom_face_names", lambda: ["收藏甲"])
-        set_live_config(runtime, sticker_send_probability=0.0)
+        set_live_config(runtime, sticker_send_probability=1.0)
+        _always(runtime, monkeypatch, True)
 
-        # 按有没有抽中表情包切换位置的话，缓存前缀和动态区两头都会被打穿。
-        assert runtime.output_guide._emoji_section(_CONV).volatile is True
+        # 表情包每轮按概率抽；收藏名单跟着它进动态区的话，每轮都白付一遍这段的钱。
+        assert runtime.output_guide._native_emoji_section().volatile is False
+        assert runtime.output_guide._sticker_section(_CONV).volatile is True
 
     def test_不再限制模型只能用名单里的名字(
         self, runtime: Any, store: StickerStore, monkeypatch: pytest.MonkeyPatch,
@@ -304,7 +317,7 @@ class TestPromptBlock:
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
 
-        block = _emoji_block(runtime)
+        block = _sticker_block(runtime)
 
         # 这句话曾经把描述式那条路堵死。
         assert "不要臆造未列出的" not in block
@@ -365,7 +378,7 @@ class TestRosterLayout:
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
 
-        block = _emoji_block(runtime)
+        block = _sticker_block(runtime)
         rows = [line.strip() for line in block.splitlines() if line.startswith("  ")]
 
         # 顺序另有规则（发得少的在前），这里只认「一张一行、标签不串行」。
@@ -380,7 +393,7 @@ class TestRosterLayout:
         set_live_config(runtime, sticker_send_probability=1.0)
         _always(runtime, monkeypatch, True)
 
-        block = _emoji_block(runtime)
+        block = _sticker_block(runtime)
 
         assert "  甲（开心、快乐）" in block
         assert "  乙（无语）" in block

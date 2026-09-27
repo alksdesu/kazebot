@@ -6,14 +6,16 @@ import pytest
 from adapters._shared import outbound
 from adapters._shared.output_guide import (
     GUIDE_VERSION,
-    SECTION_EMOJI,
+    SECTION_NATIVE_EMOJI,
     SECTION_REACTIONS,
     SECTION_SPLIT,
+    SECTION_STICKERS,
     GuideSection,
     OutputGuide,
-    emoji_section,
+    native_emoji_section,
     reaction_section,
     split_section,
+    sticker_section,
 )
 from platforms.descriptor import (
     CHANNEL_GROUP,
@@ -84,45 +86,51 @@ class TestReactions:
         assert reaction_section(_platform(reactions=frozenset({CHANNEL_GROUP})), CHANNEL_GROUP, {}) is None
 
 
-class TestEmoji:
-    def test_native_emoji_are_listed_with_the_platform_label(self) -> None:
-        section = emoji_section(
-            _platform(native_emoji=True), native_label="服务器表情", native_names=["甲", "乙"], native_hidden=3,
-        )
+class TestNativeEmoji:
+    def test_the_names_are_listed_under_the_platform_label(self) -> None:
+        section = native_emoji_section(_platform(native_emoji=True), label="服务器表情", names=["甲", "乙"], hidden=3)
 
-        assert section is not None and section.key == SECTION_EMOJI
+        assert section is not None and section.key == SECTION_NATIVE_EMOJI
         assert section.text.splitlines() == [
-            "【可用表情】", "在回复里写 [表情:名称] 就能发。", "服务器表情（只能用这些名字）：甲、乙（另有 3 个未展示）",
+            "【可用服务器表情】", "在回复里写 [表情:名称] 就能发服务器表情，只能用这些名字：甲、乙（另有 3 个未展示）",
         ]
 
     def test_the_hidden_count_is_left_out_when_everything_is_shown(self) -> None:
-        section = emoji_section(_platform(native_emoji=True), native_label="服务器表情", native_names=["甲"])
+        section = native_emoji_section(_platform(native_emoji=True), label="服务器表情", names=["甲"])
 
-        assert section.text.splitlines()[-1] == "服务器表情（只能用这些名字）：甲"
+        assert section.text.splitlines()[-1].endswith("只能用这些名字：甲")
 
+    def test_the_list_sits_in_the_cached_prefix(self) -> None:
+        # 名单只随配置变；跟着表情包清单进动态区的话，每轮都白付一遍这段的钱。
+        assert native_emoji_section(_platform(native_emoji=True), label="收藏", names=["甲"]).volatile is False
+
+    @pytest.mark.parametrize("native_emoji, names", [
+        pytest.param(False, ["甲"], id="names_without_native_support"),
+        pytest.param(True, [], id="nothing_to_offer"),
+    ])
+    def test_nothing_the_platform_can_send_means_no_section(self, native_emoji: bool, names: list[str]) -> None:
+        assert native_emoji_section(_platform(native_emoji=native_emoji), label="收藏", names=names) is None
+
+
+class TestStickers:
     def test_stickers_go_one_per_line_with_the_fallback_advice(self) -> None:
-        section = emoji_section(_platform(images=_PNG), stickers=["甲（大笑、猫）", "乙（无语）"])
+        section = sticker_section(_platform(images=_PNG), ["甲（大笑、猫）", "乙（无语）"])
 
+        assert section is not None and section.key == SECTION_STICKERS
         lines = section.text.splitlines()
+        assert lines[0] == "【可用表情包】"
         assert [line for line in lines if line.startswith("  ")] == ["  甲（大笑、猫）", "  乙（无语）"]
         assert "会去标签里找" in section.text
 
-    def test_the_section_is_always_volatile(self) -> None:
-        native_only = emoji_section(_platform(native_emoji=True, images=_PNG), native_label="收藏", native_names=["甲"])
-        with_stickers = emoji_section(_platform(native_emoji=True, images=_PNG), stickers=["乙（无语）"])
+    def test_the_roster_changes_every_turn_so_it_stays_out_of_the_prefix(self) -> None:
+        assert sticker_section(_platform(images=_PNG), ["乙（无语）"]).volatile is True
 
-        # 有没有抽中表情包每轮都在变；跟着切换位置的话，缓存前缀和动态区两头都会失效。
-        assert native_only.volatile and with_stickers.volatile
-
-    @pytest.mark.parametrize("capabilities, names, stickers", [
-        pytest.param({}, ["甲"], ["乙（无语）"], id="no_native_emoji_no_images"),
-        pytest.param({"native_emoji": True}, [], [], id="nothing_to_offer"),
-        pytest.param({"images": _PNG}, ["甲"], [], id="native_names_without_native_support"),
+    @pytest.mark.parametrize("images, entries", [
+        pytest.param(None, ["乙（无语）"], id="platform_cannot_send_images"),
+        pytest.param(_PNG, [], id="nothing_rolled_this_turn"),
     ])
-    def test_nothing_the_platform_can_send_means_no_section(
-        self, capabilities: dict, names: list[str], stickers: list[str],
-    ) -> None:
-        assert emoji_section(_platform(**capabilities), native_label="收藏", native_names=names, stickers=stickers) is None
+    def test_nothing_the_platform_can_send_means_no_section(self, images: object, entries: list[str]) -> None:
+        assert sticker_section(_platform(images=images), entries) is None
 
 
 class TestGuide:
@@ -130,16 +138,16 @@ class TestGuide:
         guide = OutputGuide.of(None, GuideSection("blank", "  \n"), GuideSection(SECTION_SPLIT, "分条"))
 
         assert [section.key for section in guide.sections] == [SECTION_SPLIT]
-        assert guide.section(SECTION_SPLIT).text == "分条" and guide.section(SECTION_EMOJI) is None
+        assert guide.section(SECTION_SPLIT).text == "分条" and guide.section(SECTION_STICKERS) is None
 
     def test_the_payload_keeps_order_and_placement(self) -> None:
-        guide = OutputGuide.of(GuideSection(SECTION_SPLIT, "分条"), GuideSection(SECTION_EMOJI, "表情", volatile=True))
+        guide = OutputGuide.of(GuideSection(SECTION_SPLIT, "分条"), GuideSection(SECTION_STICKERS, "表情", volatile=True))
 
         assert guide.payload() == {
             "version": GUIDE_VERSION,
             "sections": [
                 {"key": SECTION_SPLIT, "text": "分条", "volatile": False},
-                {"key": SECTION_EMOJI, "text": "表情", "volatile": True},
+                {"key": SECTION_STICKERS, "text": "表情", "volatile": True},
             ],
         }
 

@@ -240,6 +240,10 @@ class ContractDriver:
         """让每一轮都摊表情包清单；平台本来就每轮都给时什么也不做。"""
         return None
 
+    def offer_native_emoji(self, names: tuple[str, ...]) -> None:
+        """给平台自带的表情一份名单；平台没有自带表情就什么也不做。"""
+        return None
+
     def add_sticker(self, name: str, tags: tuple[str, ...]) -> str:
         """往这个平台用的图库里放一张图，返回它的哈希。"""
         raise NotImplementedError
@@ -289,6 +293,7 @@ class QQDriver(ContractDriver):
     other_room = "14142135"
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
+        self._monkeypatch = monkeypatch
         self.runtime = load_runtime(monkeypatch, workspace)
         set_live_config(
             self.runtime,
@@ -373,6 +378,10 @@ class QQDriver(ContractDriver):
 
     def offer_stickers(self) -> None:
         set_live_config(self.runtime, sticker_send_probability=1.0)
+
+    def offer_native_emoji(self, names: tuple[str, ...]) -> None:
+        # 线上读的是 AI 可见名称文件，这里直接给名单。
+        self._monkeypatch.setattr(self.runtime.emotes, "_current_custom_face_names", lambda: list(names))
 
     def add_sticker(self, name: str, tags: tuple[str, ...]) -> str:
         workspace = Path(self.runtime.state.CLONOTH_WORKSPACE)

@@ -18,6 +18,7 @@ from engine import memory_subjects
 from engine.builtin.knowledge_inject import _conversation_memory_namespace, save_memory
 from toolbox.context import ToolContext
 
+from tests._node_prompts import assembled_prompt
 from tests._onebot_harness import load_runtime, adapter_source
 
 _CONV_KEY = "qq_group:bc3f12b0621298e191a49fa7"
@@ -385,8 +386,7 @@ class TestHintPlumbing:
         assert '"subject"' in prompt
         assert '"scan_depth"' in prompt
 
-    def test_the_orchestrator_is_told_not_to_reveal_where_a_memory_came_from(self) -> None:
+    @pytest.mark.parametrize("node_id", ["qq.orchestrator", "qq.orchestrator.example"])
+    def test_the_orchestrator_is_told_not_to_reveal_where_a_memory_came_from(self, node_id: str) -> None:
         # 跨会话共享意味着 bot 可能说漏「你在别的群说过」，代码层拦不住。
-        prompt = Path("config/nodes/qq.orchestrator.yaml").read_text(encoding="utf-8")
-
-        assert "不得转述来源" in prompt
+        assert "不得转述来源" in assembled_prompt(node_id)

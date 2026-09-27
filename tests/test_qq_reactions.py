@@ -20,6 +20,7 @@ _TESTS = Path(__file__).resolve().parent
 if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
+from _node_prompts import assembled_prompt  # noqa: E402
 from _onebot_harness import load_runtime, set_live_config  # noqa: E402
 from adapters._shared.output_guide import SECTION_REACTIONS  # noqa: E402
 from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE  # noqa: E402
@@ -163,10 +164,9 @@ def test_private_turn_offers_no_reactions(runtime: Any) -> None:
     assert guide.section(SECTION_REACTIONS) is None and runtime.output_guide._reaction_section(CHANNEL_PRIVATE) is None
 
 
-def test_orchestrator_nodes_teach_react(runtime: Any) -> None:
-    base = _ROOT / "config" / "nodes"
-    for name in ("qq.orchestrator.yaml", "qq.orchestrator.example.yaml"):
-        assert "[REACT:" in (base / name).read_text(encoding="utf-8")
+@pytest.mark.parametrize("node_id", ["qq.orchestrator", "qq.orchestrator.example"])
+def test_orchestrator_nodes_teach_react(node_id: str) -> None:
+    assert "[REACT:" in assembled_prompt(node_id)
 
 
 # ---- 模型表态的数量硬约束 ----
