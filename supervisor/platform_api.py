@@ -1,4 +1,4 @@
-"""平台清单与各平台的热载配置、试听端点。
+"""平台清单与各平台的热载配置、控制台 schema、试听端点。
 
 supervisor 只管文件；「实际生效值」由各平台的 bot 进程写进 live 状态文件公布。
 supervisor 不自己算生效值 —— bot 是独立进程，env 可能和这里不一样，算出来的会是另一份配置。
@@ -6,30 +6,28 @@ supervisor 不自己算生效值 —— bot 是独立进程，env 可能和这�
 from __future__ import annotations
 
 import json
-import os
-import secrets
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
-import yaml
 from fastapi import APIRouter, Body, Depends, HTTPException
-from pydantic import BaseModel
 
-from engine.eventlog_rotation import eventlog_file_lock
-from platforms.descriptor import HOOK_TRIGGER_POLICY, STATE_LIVE, PlatformDescriptor
-from platforms.registry import all_platforms, get_platform, platform_config_path, platform_state_path
+from platforms.descriptor import HOOK_CONSOLE_SCHEMA, HOOK_TRIGGER_POLICY, STATE_LIVE, PlatformDescriptor
+from platforms.registry import (
+    all_platforms,
+    get_platform,
+    platform_config_path,
+    platform_hook,
+    platform_state_path,
+)
 
-from . import platform_trigger
+from . import config_files, platform_trigger
 from .admin_api import verify_admin_token
+from .config_files import RawConfig
 
 # bot 至少每 30 秒重写一次 live 状态，留三倍余量再判定失联。
 _STALE_AFTER_SEC = 90.0
 _DRY_RUN_LIMIT = 200
-
-
-class RawConfig(BaseModel):
-    content: str
 
 
 def resolve_platform(platform_id: str) -> PlatformDescriptor:
@@ -57,78 +55,45 @@ def live_state(workspace_root: Path, platform: PlatformDescriptor) -> dict[str, 
     return data if isinstance(data, dict) else {}
 
 
-def leaf_paths(document: Any, prefix: str = "") -> list[str]:
-    if isinstance(document, dict):
-        leaves: list[str] = []
-        for key, value in document.items():
-            leaves.extend(leaf_paths(value, f"{prefix}.{key}" if prefix else str(key)))
-        return leaves
-    if document is None:
-        # 只写了段名没写值（`channels:`）不是配置项，别报成拼错的键。
-        # 显式 null 同理，语义是「这个键交回 .env」。
-        return []
-    return [prefix] if prefix else []
+def publication_age(state: Mapping[str, Any]) -> tuple[float, bool]:
+    """live 状态公布了多久，以及是否久到该当 bot 失联。"""
+    age_sec = max(0.0, time.time() - float(state.get("published_at") or 0.0))
+    return round(age_sec, 3), age_sec > _STALE_AFTER_SEC
 
 
 def read_config_raw(workspace_root: Path, platform: PlatformDescriptor) -> dict[str, Any]:
-    path = config_file(workspace_root, platform)
-    if not path.exists():
-        # 「还没接管」是正常状态，不是错误。刻意不回落到示例文件：
-        # 那份是默认值，被当成当前配置保存下去就等于悄悄覆盖 .env 里的设置。
-        return {"content": "", "exists": False}
-    return {"content": path.read_text(encoding="utf-8"), "exists": True}
+    return config_files.read_raw(config_file(workspace_root, platform))
 
 
 def write_config_raw(workspace_root: Path, platform: PlatformDescriptor, content: str) -> dict[str, Any]:
-    try:
-        document = yaml.safe_load(content)
-    except yaml.YAMLError as exc:
-        raise HTTPException(status_code=400, detail=f"YAML 解析失败：{exc}") from exc
-    if document is not None and not isinstance(document, dict):
-        raise HTTPException(status_code=400, detail="顶层必须是映射（key: value）")
-
+    path = config_file(workspace_root, platform)
+    document = config_files.parse_mapping(content)
     warnings: list[str] = []
     known = live_state(workspace_root, platform).get("paths")
     if isinstance(known, dict) and known:
-        unknown = sorted(set(leaf_paths(document or {})) - set(known.values()) - {"version"})
+        unknown = config_files.unknown_paths(document, known.values())
         if unknown:
-            # 无人消费的键改了不会有任何效果，而界面只会显示保存成功。
             raise HTTPException(status_code=400, detail=f"无人消费的配置项：{unknown}")
     else:
         warnings.append("bot 进程未公布配置结构，本次只校验了 YAML 语法")
-
-    path = config_file(workspace_root, platform)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # 同目录 tmp + replace：bot 进程随时在读，读到半截 yaml 等于整份配置塌掉。
-    with eventlog_file_lock(path):
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
-        try:
-            tmp.write_text(content, encoding="utf-8")
-            os.replace(tmp, path)
-        finally:
-            tmp.unlink(missing_ok=True)
+    config_files.write_raw(path, content)
     return {"ok": True, "warnings": warnings}
 
 
 def config_state(workspace_root: Path, platform: PlatformDescriptor) -> dict[str, Any]:
     state = live_state(workspace_root, platform)
-    path = config_file(workspace_root, platform)
-    try:
-        stat = path.stat()
-        fingerprint = {"exists": True, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
-    except OSError:
-        fingerprint = {"exists": False, "mtime_ns": 0, "size": 0}
+    fingerprint = config_files.fingerprint(config_file(workspace_root, platform))
     if not state:
         return {
             "published": False,
             "reason": "bot 进程尚未公布生效配置（未启动，或还没跑完第一轮对齐）",
             "file": fingerprint,
         }
-    age_sec = max(0.0, time.time() - float(state.get("published_at") or 0.0))
+    age_sec, stale = publication_age(state)
     return {
         "published": True,
-        "age_sec": round(age_sec, 3),
-        "stale": age_sec > _STALE_AFTER_SEC,
+        "age_sec": age_sec,
+        "stale": stale,
         # 「已生效」的判据是 bot 跑着的那份值确实来自当前这个文件版本。
         # 不能拿 state["file"] 比 —— 那是 bot 看到的文件指纹，文件写坏时它照样等于
         # 当前文件，而 bot 用的还是上一份配置。
@@ -136,6 +101,15 @@ def config_state(workspace_root: Path, platform: PlatformDescriptor) -> dict[str
         "file": fingerprint,
         "state": state,
     }
+
+
+def config_schema(platform: PlatformDescriptor) -> dict[str, Any]:
+    """控制台的分区布局和控件说明，取自平台代码里的声明，bot 没起来也给得出。"""
+    try:
+        layout = platform_hook(platform, HOOK_CONSOLE_SCHEMA)
+    except LookupError:
+        raise HTTPException(status_code=404, detail=f"{platform.display_name} 没有控制台配置界面") from None
+    return layout.schema()
 
 
 def trigger_dry_run(workspace_root: Path, platform: PlatformDescriptor, payload: dict[str, Any]) -> dict[str, Any]:
@@ -189,6 +163,10 @@ def create_platform_router(workspace_root: Path) -> APIRouter:
     @router.get("/{platform_id}/config/state")
     def get_state(platform_id: str) -> dict[str, Any]:
         return config_state(workspace_root, resolve_platform(platform_id))
+
+    @router.get("/{platform_id}/config/schema")
+    def get_schema(platform_id: str) -> dict[str, Any]:
+        return config_schema(resolve_platform(platform_id))
 
     @router.post("/{platform_id}/trigger/dry-run")
     def dry_run(platform_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:

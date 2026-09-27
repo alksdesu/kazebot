@@ -1,4 +1,4 @@
-"""/v1/platforms：平台清单与各平台的热载配置、试听端点。
+"""/v1/platforms：平台清单与各平台的热载配置、控制台 schema、试听端点。
 
 旧的 /v1/admin/config/qq/* 留给没刷新的旧控制台和运维脚本，必须和新路径给出同一份结果。
 """
@@ -42,6 +42,7 @@ def call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", _TOKEN)
     monkeypatch.delenv("CLONOTH_QQ_CONFIG_PATH", raising=False)
     monkeypatch.setattr(admin_api, "_admin_token", "")
+    monkeypatch.setattr(admin_api, "_auth_failures", type(admin_api._auth_failures)())
     app = create_app(
         state=SupervisorState(
             workspace_root=tmp_path,
@@ -85,7 +86,7 @@ def test_the_listing_includes_qq(call) -> None:
     qq = next(item for item in body["platforms"] if item["id"] == "qq")
     assert qq["display_name"] == "QQ · NapCat"
     assert {channel["name"] for channel in qq["channels"]} >= {"qq_group", "qq_private"}
-    assert qq["hooks"] == ["trigger_policy"]
+    assert qq["hooks"] == ["console_schema", "trigger_policy"]
     assert qq["capabilities"]["mention"] == "native" and qq["capabilities"]["markdown"] is False
 
 
@@ -99,6 +100,28 @@ def test_a_platform_without_config_is_404(call, chatless) -> None:
     assert call("GET", "/v1/platforms/chatless/config/raw").status_code == 404
     response = call("POST", "/v1/platforms/chatless/trigger/dry-run", json={"messages": [], "config": _TRIGGER_VALUES})
     assert response.status_code == 404
+
+
+def test_the_qq_console_schema_needs_no_running_bot(call, tmp_path: Path) -> None:
+    from adapters.onebot import console_layout
+
+    response = call("GET", "/v1/platforms/qq/config/schema")
+
+    assert not (tmp_path / "data" / "qq_live_state.json").exists()
+    assert response.status_code == 200
+    assert response.json() == console_layout.schema()
+
+
+def test_the_schema_needs_the_admin_token(call) -> None:
+    assert call("GET", "/v1/platforms/qq/config/schema", headers={}).status_code == 401
+
+
+def test_a_platform_without_a_console_layout_has_no_schema(call, chatless) -> None:
+    response = call("GET", "/v1/platforms/chatless/config/schema")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "无配置平台 没有控制台配置界面"
+    assert call("GET", "/v1/platforms/telegram/config/schema").status_code == 404
 
 
 def test_writing_and_reading_the_qq_config(call, tmp_path: Path) -> None:

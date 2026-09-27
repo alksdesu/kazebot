@@ -34,9 +34,9 @@ BLOCKED_BY_COOLDOWN = "cooldown"
 # per_group 这种标识。
 _COOLDOWN_SCOPE_NAMES = MappingProxyType({"per_group": "本群", "per_user": "这个人"})
 
-# 旧的单选枚举。新配置没写信号开关时用它反推，行为逐位不变。
-_LEGACY_ALL_MODES = frozenset({"all", "always"})
-_LEGACY_PREFIX_MODES = frozenset({"prefix", "prefix_or_mention", "mention_or_prefix"})
+# 旧的单选枚举。新配置没写信号开关时用它反推，行为逐位不变；控制台显示推导值也认这两份。
+LEGACY_ALL_MODES = frozenset({"all", "always"})
+LEGACY_PREFIX_MODES = frozenset({"prefix", "prefix_or_mention", "mention_or_prefix"})
 
 
 @dataclass(frozen=True)
@@ -70,8 +70,8 @@ class TriggerConfig:
     def from_live(cls, live: Any) -> "TriggerConfig":
         """按热载配置装配。三态信号开关为 None 时回落旧的 group_mode 语义。"""
         mode = str(live.group_trigger or "mention_only").lower()
-        legacy_all = mode in _LEGACY_ALL_MODES
-        legacy_prefix = mode in _LEGACY_PREFIX_MODES
+        legacy_all = mode in LEGACY_ALL_MODES
+        legacy_prefix = mode in LEGACY_PREFIX_MODES
         return cls(
             all_messages=_tri(live.signal_all, legacy_all),
             # @ 与被回复在旧实现里共用 event.to_me，两者当时都是开着的。

@@ -22,6 +22,8 @@ from .descriptor import (
 
 # 稳定会话键的摘要部分，与适配器侧 conversation_hash.digest 的输出同形。
 DIGEST_PATTERN = r"[0-9a-f]{24}"
+# 全平台共用的功能设置。核心层和取平台钩子一样经这里按需导入，不直接 import 适配器包。
+FEATURES_MODULE = "adapters._shared.features"
 
 _lock = threading.Lock()
 _platforms: dict[str, PlatformDescriptor] = {}
@@ -157,3 +159,7 @@ def platform_hook(platform: PlatformDescriptor, name: str) -> ModuleType:
     if not module_path:
         raise LookupError(f"platform {platform.id!r} has no {name!r} hook")
     return importlib.import_module(module_path)
+
+
+def features_module() -> ModuleType:
+    return importlib.import_module(FEATURES_MODULE)

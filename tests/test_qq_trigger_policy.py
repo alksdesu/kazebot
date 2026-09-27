@@ -684,8 +684,8 @@ class TestDryRunSharesTheDecision:
         """两份枚举是同一套字面量的副本（这个模块不能有相对导入），漂了 group_mode 校验就和判定不一致。"""
         from adapters.onebot import config as onebot_config
 
-        assert tp._LEGACY_ALL_MODES == onebot_config.GROUP_TRIGGER_ALL_MODES
-        assert tp._LEGACY_PREFIX_MODES == onebot_config.GROUP_TRIGGER_PREFIX_MODES
+        assert tp.LEGACY_ALL_MODES == onebot_config.GROUP_TRIGGER_ALL_MODES
+        assert tp.LEGACY_PREFIX_MODES == onebot_config.GROUP_TRIGGER_PREFIX_MODES
 
     def test_supervisor_loads_the_same_module_the_adapter_uses(self) -> None:
         from platforms.builtin import QQ_NAPCAT

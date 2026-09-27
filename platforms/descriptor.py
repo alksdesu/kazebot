@@ -22,6 +22,7 @@ STATE_ALIASES = "aliases"
 STATE_ACTIVE_ACCOUNT = "active_account"
 
 HOOK_TRIGGER_POLICY = "trigger_policy"
+HOOK_CONSOLE_SCHEMA = "console_schema"
 
 # native 由驱动按平台 ID 渲染成真正的提及，text 只能写成「@名字」的文字。
 MENTION_NONE = "none"

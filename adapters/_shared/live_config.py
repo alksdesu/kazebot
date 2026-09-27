@@ -14,13 +14,16 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping
 
 import yaml
 
 from . import capability
 from .env import split_list
 from .yaml_loader import load_yaml
+
+if TYPE_CHECKING:
+    from .console_schema import Control
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +195,9 @@ def grant_for(capability_key: str) -> Coercer:
 
 @dataclass(frozen=True)
 class LiveKey:
-    """一个热载键。name 是 call site 用的属性名，path 是配置文件里的点分路径，layers 是它能写在哪几层。"""
+    """一个热载键。name 是 call site 用的属性名，path 是配置文件里的点分路径，layers 是它能写在哪几层，
+    ui 是控制台上怎么画它；没有 ui 的键控制台上没有控件，要么只读，要么由专门的组件管。
+    """
 
     name: str
     path: str
@@ -204,6 +209,7 @@ class LiveKey:
     derive_default: Callable[[], Any] | None = None
     note: str = ""
     layers: frozenset[str] = PLATFORM_ONLY
+    ui: Control | None = None
 
     def resolve(self, documents: Mapping[str, Mapping[str, Any]]) -> tuple[Any, str]:
         """生效值和它的来源。documents 是层名到那一层文档的映射，没有的层不给。
@@ -295,10 +301,10 @@ def _check_layering(keys: tuple[LiveKey, ...], layer: str, defaults: "LiveConfig
             declared = defaults.keys_by_name.get(key.name) if defaults is not None else None
             if declared is None:
                 problems.append(f"key {key.name!r} has a global layer that nobody declares")
-            elif (declared.path, declared.coerce, declared.default, declared.layers) != (
-                key.path, key.coerce, key.default, key.layers,
+            elif (declared.path, declared.coerce, declared.default, declared.layers, declared.ui) != (
+                key.path, key.coerce, key.default, key.layers, key.ui,
             ):
-                # 两边各写一份迟早会漂移：同一个键在全局文件里是一套值域，在平台文件里是另一套。
+                # 两边各写一份迟早会漂移：同一个键在全局文件里是一套值域、一套说法，在平台文件里是另一套。
                 problems.append(f"key {key.name!r} drifted from its global declaration")
     else:
         problems.append(f"unknown layer {layer!r}")
@@ -314,7 +320,7 @@ def _file_stamp(path: Path) -> tuple[int, int]:
     return (st.st_mtime_ns, st.st_size)
 
 
-def _jsonable(value: Any) -> Any:
+def jsonable(value: Any) -> Any:
     if isinstance(value, (set, frozenset)):
         # 集合没有顺序，落盘前定序，否则每次写出的 yaml 都不一样。
         return sorted(value)
@@ -590,7 +596,7 @@ class LiveConfig:
                     nested = {}
                     cursor[part] = nested
                 cursor = nested
-            cursor[parts[-1]] = _jsonable(value)
+            cursor[parts[-1]] = jsonable(value)
         return document
 
     def file_state(self) -> dict[str, Any]:
@@ -625,7 +631,7 @@ class LiveConfig:
             sources = dict(self._cache.sources)
         payload.update({
             "layer": self.layer,
-            "values": {name: _jsonable(values[name]) for name in sorted(values)},
+            "values": {name: jsonable(values[name]) for name in sorted(values)},
             # 每个键的值从哪来。控制台据此标「全局 / 本平台 / 旧位置 / .env / 默认」。
             "sources": {key.name: sources.get(key.name, SOURCE_DEFAULT) for key in self.keys},
             "layers": {key.name: sorted(key.layers) for key in self.keys},

@@ -72,6 +72,7 @@ from .types import (
     TaskStatus,
 )
 from .admin_api import create_admin_router
+from .feature_config_api import create_feature_config_router
 from .platform_api import create_platform_router
 from .admin_api import init_admin_token, verify_admin_token
 from .napcat import NapCatClient, NapCatError, NapCatUnreachable
@@ -2339,6 +2340,9 @@ def create_app(
     admin_router = create_admin_router(workspace_root=state.workspace_root)
     app.include_router(admin_router, prefix="/v1/admin/config")
     app.include_router(create_platform_router(workspace_root=state.workspace_root), prefix="/v1/platforms")
+    app.include_router(
+        create_feature_config_router(workspace_root=state.workspace_root), prefix="/v1/features",
+    )
     app.include_router(
         create_sticker_router(workspace_root=state.workspace_root), prefix="/v1/stickers",
     )

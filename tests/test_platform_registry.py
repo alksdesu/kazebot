@@ -21,6 +21,7 @@ from platforms.descriptor import (  # noqa: E402
     CHANNEL_BRIDGE,
     CHANNEL_GROUP,
     CHANNEL_PRIVATE,
+    HOOK_CONSOLE_SCHEMA,
     HOOK_TRIGGER_POLICY,
     STATE_ALIASES,
     STATE_LIVE,
@@ -31,6 +32,7 @@ from platforms.descriptor import (  # noqa: E402
 from platforms.registry import (  # noqa: E402
     all_platforms,
     conversation_channel,
+    features_module,
     find_platform,
     get_platform,
     is_platform_conversation,
@@ -187,6 +189,16 @@ class TestFilesAndHooks:
     def test_a_missing_hook_is_a_lookup_error(self, telegram: PlatformDescriptor) -> None:
         with pytest.raises(LookupError):
             platform_hook(telegram, HOOK_TRIGGER_POLICY)
+
+    def test_the_console_hook_is_the_qq_layout(self) -> None:
+        from adapters.onebot import console_layout
+
+        assert platform_hook(QQ_NAPCAT, HOOK_CONSOLE_SCHEMA) is console_layout
+
+    def test_the_shared_features_load_through_the_registry(self) -> None:
+        from adapters._shared import features
+
+        assert features_module() is features
 
 
 class TestCoreRecognisesANewPlatform:

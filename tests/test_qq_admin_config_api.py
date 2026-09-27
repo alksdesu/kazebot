@@ -245,7 +245,7 @@ class TestWriteRaw:
 
         assert response.status_code == 200
 
-    def test_an_explicit_null_hands_the_key_back_to_env(self, client: Any, tmp_path: Path) -> None:
+    def test_an_explicit_null_hands_the_key_to_the_next_layer(self, client: Any, tmp_path: Path) -> None:
         _publish_state(tmp_path)
 
         response = client(
