@@ -34,7 +34,7 @@ from .context_store import load_context_snapshot
 from .inference.pseudo_tools import tool_allowed
 from .inference.tool_format import sanitize_control_tool_history
 
-from .node import Node, load_node
+from .node import Node, load_node, node_file, node_files
 # [2026-04-17] write_artifact 移除：截断机制已废弃
 from .tool_step import result_to_raw, summarize_result
 # Phase 1 (Session Conversation Store): 导入 ConversationStore 用于影子写入，
@@ -206,28 +206,15 @@ def _fallback_node_info(node_id: str) -> dict[str, str]:
 
 
 def _node_info_path_and_mtime(workspace_root: Path, node_id: str) -> tuple[Path | None, int]:
-    """Resolve the node YAML path and return its mtime using os.stat."""
-    # [2026-05-04] Keep the same lookup order as load_node while avoiding a full
-    # load_node parse on every task. Why: delegate metadata is needed for tool
-    # descriptions, but parsing all target YAML files at task startup is wasteful.
-    # How: stat the system-node path first, then the user-node path, returning the
-    # first existing YAML file and its mtime. Purpose: unchanged YAML files can be
-    # served from the module cache, while hot edits still take effect immediately.
-    candidates = [
-        workspace_root / "engine" / "system_nodes" / f"{node_id}.yaml",
-        workspace_root / "config" / "nodes" / f"{node_id}.yaml",
-    ]
-    for path in candidates:
-        try:
-            stat_result = os.stat(path)
-        except OSError:
-            continue
-        # [2026-05-04] Store nanosecond mtime from os.stat. Why: YAML edits can
-        # happen close together during development. How: use st_mtime_ns instead
-        # of the rounded float mtime. Purpose: make hot edits invalidate the cache
-        # as soon as the filesystem reports a change.
-        return path, int(stat_result.st_mtime_ns)
-    return None, -1
+    """Resolve the node YAML the way load_node does and return its mtime, without parsing it."""
+    path = node_file(workspace_root, node_id)
+    if path is None:
+        return None, -1
+    try:
+        # Nanosecond mtime: edits made close together must still invalidate the cache.
+        return path, int(os.stat(path).st_mtime_ns)
+    except OSError:
+        return None, -1
 
 
 def _load_cached_node_info(workspace_root: Path, node_id: str) -> dict[str, str]:
@@ -250,7 +237,9 @@ def _load_cached_node_info(workspace_root: Path, node_id: str) -> dict[str, str]
         # avoid yaml.safe_load and Node construction until the YAML file changes.
         return cached[1]
 
-    info = _fallback_node_info(node_id)
+    # The cache is keyed by file, and an old id reaches the same file: fall back to its name, not the id asked for.
+    stem = path.stem
+    info = _fallback_node_info(stem)
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
     except Exception:
@@ -259,10 +248,10 @@ def _load_cached_node_info(workspace_root: Path, node_id: str) -> dict[str, str]
         kind = str(data.get("kind") or "node").strip()
         node_type = str(data.get("type") or "ai").strip().lower()
         if kind == "node" and node_type in {"ai", "tool"}:
-            name = str(data.get("name") or node_id).strip() or node_id
+            name = str(data.get("name") or stem).strip() or stem
             description = str(data.get("description") or "").strip() or name
             info = {
-                "id": str(data.get("id") or node_id).strip() or node_id,
+                "id": str(data.get("id") or stem).strip() or stem,
                 "name": name,
                 "description": description,
             }
@@ -283,31 +272,22 @@ def _collect_node_info(workspace_root: Path, node_ids: list[str]) -> list[dict[s
 
 def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> list[dict[str, str]]:
     """发现可切换的根节点（不被任何其他节点 delegate_targets 引用的节点），排除当前节点。"""
-    # 系统节点目录分离：扫描 engine/system_nodes/ 和 config/nodes/ 两个目录，
-    # 合并结果，engine 内建目录优先（同 id 跳过后扫到的）。
-    nodes_dirs = [
-        workspace_root / "engine" / "system_nodes",
-        workspace_root / "config" / "nodes",
-    ]
+    # 示例文件和它对应的真节点常写同一个 id，按文件名排在前面会顶掉真节点的名字和描述，
+    # 所以只看能派发到的节点文件。
     all_nodes: list[dict[str, Any]] = []
     all_targets: set[str] = set()
     seen_ids: set[str] = set()
-    for nodes_dir in nodes_dirs:
-        if not nodes_dir.is_dir():
+    for path in node_files(workspace_root):
+        n = load_node(workspace_root, path.stem)
+        if n is None or n.type != "ai" or n.id in seen_ids:
             continue
-        for f in sorted(nodes_dir.iterdir()):
-            if f.suffix not in (".yaml", ".yml") or f.name.startswith("_"):
-                continue
-            n = load_node(workspace_root, f.stem)
-            if n is None or n.type != "ai" or n.id in seen_ids:
-                continue
-            # internal 节点不进枚举：它们回的是给程序看的判定值，被 AI switch 过去
-            # 就会有人在群里收到一句 "no|群友之间在对话"。
-            if bool((n.extra or {}).get("internal")):
-                continue
-            seen_ids.add(n.id)
-            all_nodes.append({"id": n.id, "name": n.name, "description": n.description or n.name})
-            all_targets.update(n.delegate_targets)
+        # internal 节点不进枚举：它们回的是给程序看的判定值，被 AI switch 过去
+        # 就会有人在群里收到一句 "no|群友之间在对话"。
+        if bool((n.extra or {}).get("internal")):
+            continue
+        seen_ids.add(n.id)
+        all_nodes.append({"id": n.id, "name": n.name, "description": n.description or n.name})
+        all_targets.update(n.delegate_targets)
     # 根节点 = 不被任何节点 delegate 引用的节点
     roots = [n for n in all_nodes if n["id"] not in all_targets]
     if not roots:

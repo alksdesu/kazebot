@@ -20,6 +20,7 @@ from .tool_format import ParsedToolCall
 from .pseudo_tools import _dispatch_target_from_tool_name
 from .message_model import MessageMeta, set_message_meta
 from ..conversation_store import MessageType
+from ..node import canonical_node_id
 
 logger = logging.getLogger(__name__)
 
@@ -455,7 +456,8 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     怎么改：构造 inbound payload（含 dispatch_origin 回调信息），POST /v1/inbound。
     目的：统一生命周期管理，为 persistent node 支持铺路。
     """
-    target = str(args.get("target") or "").strip()
+    # 委派清单加载时已换成现在的 id；模型照着旧历史写出旧 id，也换过来再比
+    target = canonical_node_id(Path(ls.rctx.workspace_root), str(args.get("target") or ""))
     instr = str(args.get("instruction") or "").strip()
 
     # 目标是从工具名反查出来的，而反查表 _DISPATCH_TOOL_REVERSE 是进程内全局的，

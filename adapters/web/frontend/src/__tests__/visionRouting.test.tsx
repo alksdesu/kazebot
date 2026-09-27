@@ -125,14 +125,14 @@ describe('保存', () => {
 });
 
 describe('说明文字', () => {
-  it('自动档才提 QQ_VISION 变量', async () => {
+  it('自动档才提视觉节点的环境变量', async () => {
     // 只有这一档才可能真的绕过去，其它两档说它没意义。
     render(<VisionRouting />);
     await ready();
-    expect(screen.getByText(/QQ_VISION_MODEL/)).toBeTruthy();
+    expect(screen.getByText(/CLONOTH_VISION_MODEL/)).toBeTruthy();
 
     fireEvent.change(picker(), { target: { value: 'false' } });
-    expect(screen.queryByText(/QQ_VISION_MODEL/)).toBeNull();
+    expect(screen.queryByText(/CLONOTH_VISION_MODEL/)).toBeNull();
   });
 
   it('每一档都说清楚会发生什么', async () => {

@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import yaml
 
@@ -159,8 +159,13 @@ def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) ->
     }
 
 
-def _select_fallbacks_for_node(full_cfg: dict[str, Any], node_id: str) -> list[Any]:
+def _select_fallbacks_for_node(
+    full_cfg: dict[str, Any], node_id: str, aliases: Iterable[str] = (),
+) -> list[Any]:
     """Return the fallback chain that applies to *node_id*.
+
+    Chains written under a node's old ids (*aliases*) keep applying after a rename,
+    the current id first.
 
     [2026-07-16] Why: system nodes (system.compactor / system.turn_summarizer /
     read_image 等) may want a cheaper/different backup chain than the main
@@ -184,12 +189,13 @@ def _select_fallbacks_for_node(full_cfg: dict[str, Any], node_id: str) -> list[A
     """
     node_map = full_cfg.get("node_fallbacks")
     if node_id and isinstance(node_map, dict):
-        entry = node_map.get(node_id)
-        # An explicit empty list disables fallback for this node. This is
-        # particularly important for vision nodes: silently falling through to
-        # the global text-only chain would remove the image and invite guesses.
-        if isinstance(entry, list):
-            return entry
+        for key in (node_id, *aliases):
+            entry = node_map.get(key)
+            # An explicit empty list disables fallback for this node. This is
+            # particularly important for vision nodes: silently falling through to
+            # the global text-only chain would remove the image and invite guesses.
+            if isinstance(entry, list):
+                return entry
     return full_cfg.get("fallbacks", []) or []
 
 
@@ -352,7 +358,7 @@ class FallbackProviderHandler:
         # 的前提下，让系统节点能单独指定备选渠道。
         _node = getattr(ctx, "node", None)
         _node_id = str(getattr(_node, "id", "") or "").strip()
-        fallbacks_raw = _select_fallbacks_for_node(full_cfg, _node_id)
+        fallbacks_raw = _select_fallbacks_for_node(full_cfg, _node_id, getattr(_node, "aliases", ()) or ())
         if not isinstance(fallbacks_raw, list) or not fallbacks_raw:
             return None
 

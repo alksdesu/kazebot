@@ -13,6 +13,7 @@ from typing import Any
 
 import yaml
 
+from engine.node import node_file
 from toolbox._common import request_guard
 from toolbox.context import ToolContext
 
@@ -81,7 +82,7 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     """Create a new persistent sub-node from an existing node yaml template.
 
     [2026-05-28] 工作流程：
-    1. 读取模板节点 yaml（先 config/nodes/，再 engine/system_nodes/）
+    1. 按节点 id 找模板 yaml（和 load_node 同一个查法：先系统目录，再 config/nodes/，也认旧 id）
     2. 替换 id / name / description / persistent / memory_book / provider 字段
     3. 写入 config/nodes/{name}.yaml
     4. 可选：追加到 caller_node_id 的 delegate_targets
@@ -107,18 +108,17 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
 
     workspace_root = ctx.workspace_root
 
-    # Step 1: 检查目标节点配置是否已存在，避免误覆盖
+    # Step 1: 检查节点 id 是否已被占用，避免误覆盖。同名系统节点、把它声明成旧 id 的节点
+    # 都会让新文件永远加载不到；后者还会把写着旧 id 的会话和配置悄悄引到新节点上。
     target_path = workspace_root / "config" / "nodes" / f"{name}.yaml"
-    if target_path.exists():
-        return _err(f"node config already exists: config/nodes/{name}.yaml")
+    taken_by = node_file(workspace_root, name)
+    if taken_by is not None:
+        return _err(f"node id already taken: {name} resolves to {taken_by.relative_to(workspace_root).as_posix()}")
 
-    # Step 2: 查找模板 yaml（先 config/nodes/，再 engine/system_nodes/）
-    # 与 engine/node.py load_node 的搜索顺序一致
-    tmpl_path = workspace_root / "config" / "nodes" / f"{template}.yaml"
-    if not tmpl_path.exists():
-        tmpl_path = workspace_root / "engine" / "system_nodes" / f"{template}.yaml"
-    if not tmpl_path.exists():
-        return _err(f"template not found: {template} (checked config/nodes/ and engine/system_nodes/)")
+    # Step 2: 查找模板 yaml。模板名是模型给的参数，只认节点目录里能按 id 找到的文件。
+    tmpl_path = node_file(workspace_root, template)
+    if tmpl_path is None:
+        return _err(f"template not found: {template} (checked engine/system_nodes/ and config/nodes/)")
 
     # Step 3: 解析模板 yaml
     try:
@@ -166,43 +166,41 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     # 追加新节点到调用者的委派列表，使调用者可以 dispatch 到新节点
     caller_updated = False
     caller_denied = ""
-    if caller_node_id:
-        caller_path = workspace_root / "config" / "nodes" / f"{caller_node_id}.yaml"
-        if not caller_path.exists():
-            caller_path = workspace_root / "engine" / "system_nodes" / f"{caller_node_id}.yaml"
-        if caller_path.exists():
-            try:
-                caller_data = yaml.safe_load(caller_path.read_text(encoding="utf-8"))
-                if isinstance(caller_data, dict):
-                    targets = caller_data.get("delegate_targets", [])
-                    if not isinstance(targets, list):
-                        targets = []
-                    if name not in targets:
-                        targets.append(name)
-                        caller_data["delegate_targets"] = targets
-                        # 改的是别人的委派清单，等于给调用者开一条新的下派路径，
-                        # 和上面写节点定义一样送策略，不能因为「只加一行」就免检。
-                        _caller_rel = caller_path.relative_to(workspace_root).as_posix()
-                        _caller_yaml = yaml.safe_dump(
-                            caller_data, default_flow_style=False, allow_unicode=True,
-                        )
-                        _op, err = await request_guard(
-                            ctx,
-                            "write_file",
-                            {
-                                "path": _caller_rel,
-                                "content_preview": _caller_yaml[:200],
-                                "content_len": len(_caller_yaml),
-                                "delegate_target_added": name,
-                            },
-                        )
-                        if err is None:
-                            caller_path.write_text(_caller_yaml, encoding="utf-8")
-                            caller_updated = True
-                        else:
-                            caller_denied = str(err.get("error", "denied")) if isinstance(err, dict) else str(err)
-            except Exception:
-                pass  # 非致命：节点已创建但调用者更新失败
+    # 改的是调用者实际加载的那份文件：被系统节点顶掉的同名用户文件改了也不生效
+    caller_path = node_file(workspace_root, caller_node_id) if caller_node_id else None
+    if caller_path is not None:
+        try:
+            caller_data = yaml.safe_load(caller_path.read_text(encoding="utf-8"))
+            if isinstance(caller_data, dict):
+                targets = caller_data.get("delegate_targets", [])
+                if not isinstance(targets, list):
+                    targets = []
+                if name not in targets:
+                    targets.append(name)
+                    caller_data["delegate_targets"] = targets
+                    # 改的是别人的委派清单，等于给调用者开一条新的下派路径，
+                    # 和上面写节点定义一样送策略，不能因为「只加一行」就免检。
+                    _caller_rel = caller_path.relative_to(workspace_root).as_posix()
+                    _caller_yaml = yaml.safe_dump(
+                        caller_data, default_flow_style=False, allow_unicode=True,
+                    )
+                    _op, err = await request_guard(
+                        ctx,
+                        "write_file",
+                        {
+                            "path": _caller_rel,
+                            "content_preview": _caller_yaml[:200],
+                            "content_len": len(_caller_yaml),
+                            "delegate_target_added": name,
+                        },
+                    )
+                    if err is None:
+                        caller_path.write_text(_caller_yaml, encoding="utf-8")
+                        caller_updated = True
+                    else:
+                        caller_denied = str(err.get("error", "denied")) if isinstance(err, dict) else str(err)
+        except Exception:
+            pass  # 非致命：节点已创建但调用者更新失败
 
     # Step 7: 创建记忆 namespace 目录（mkdir -p）
     mem_dir = workspace_root / "data" / "memory" / memory_book

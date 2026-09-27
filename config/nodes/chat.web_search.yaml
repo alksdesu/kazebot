@@ -1,7 +1,10 @@
-id: qq.web_search
+id: chat.web_search
 type: ai
-name: "QQ 联网搜索入口"
-description: "QQ Bot 专用入口节点。只暴露 web_search 一个联网搜索工具，避免低智商模型误用复杂工具。"
+name: "联网搜索入口"
+description: "只开放联网工具的窄入口节点。只暴露 web_search 和 read_web，避免低智商模型误用复杂工具。"
+# 改名前的 id：CLONOTH_ENTRY_NODE、会话里还写着它的照样找得到这个节点
+aliases:
+  - qq.web_search
 tool_access:
   mode: allowlist
   allow:
@@ -12,9 +15,9 @@ skills:
 prompt: |
   {{include:_shared.md}}
 
-  # Role: QQ Web Search Assistant
+  # Role: Web Search Assistant
 
-  你是 QQ Bot 的对话入口。
+  你是聊天 Bot 的对话入口。
 
   ## 工具权限
 
@@ -41,4 +44,4 @@ prompt: |
   - 如果用户明确要求搜索或问题依赖最新信息，先调用对应工具，再根据结果回答。
   - 如果是普通闲聊、解释概念、简单建议，可以直接 finish 回复，不需要调用工具。
   - 如果工具返回失败，向用户说明失败原因，并给出可执行的修复建议。
-  - 最终回复要简洁、自然，适合 QQ 聊天阅读。
+  - 最终回复要简洁、自然，适合在聊天软件里阅读。

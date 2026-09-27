@@ -72,11 +72,11 @@ class TestNodePromptsDoNotEchoTheInstruction:
 
     @pytest.mark.parametrize("rel", [
         "config/nodes/qq.orchestrator.yaml",
-        "config/nodes/qq.vision.yaml",
-        "config/nodes/qq.web_search.yaml",
+        "config/nodes/chat.vision.yaml",
+        "config/nodes/chat.web_search.yaml",
     ])
-    def test_qq_prompts_carry_no_turn_varying_variable_at_all(self, rel: str) -> None:
-        """QQ 三条 inbound 路径都自带「当前时间: ... CST」，所以这些节点连 now 都不需要。
+    def test_entry_prompts_carry_no_turn_varying_variable_at_all(self, rel: str) -> None:
+        """当前时间由平台写进入站消息（QQ 三条入站路径都带「当前时间: ... CST」），入口节点连 now 都不需要。
 
         提示词里没有任何每轮变化的变量 → 整条系统消息字节稳定 → 工具定义进缓存前缀。
         """

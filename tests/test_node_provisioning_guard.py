@@ -148,3 +148,59 @@ async def test_caller_update_is_a_separate_guarded_write(tmp_path: Path) -> None
     assert ctx.requested[1][1]["delegate_target_added"] == "helper"
     boss = yaml.safe_load((tmp_path / "config" / "nodes" / "boss.yaml").read_text(encoding="utf-8"))
     assert boss["delegate_targets"] == ["existing.node", "helper"]
+
+
+def _write(root: Path, folder: str, filename: str, data: dict[str, Any]) -> Path:
+    path = root / folder / f"{filename}.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("folder", "filename", "aliases"), [
+    ("engine/system_nodes", "helper", []),
+    ("config/nodes", "helper.v2", ["helper"]),
+])
+async def test_a_name_that_already_resolves_to_a_node_is_refused(
+    tmp_path: Path, folder: str, filename: str, aliases: list[str],
+) -> None:
+    # 同名系统节点会顶掉新文件；被别的节点声明成旧 id 的名字，建了还会把写着旧 id 的会话引过来。
+    _seed(tmp_path)
+    _write(tmp_path, folder, filename, {"id": filename, "type": "ai", "aliases": aliases})
+    ctx = _Ctx(tmp_path, safety="auto")
+
+    result = await create_agent({"name": "helper", "template": "tmpl"}, ctx)
+
+    assert result["ok"] is False
+    assert f"{folder}/{filename}.yaml" in result["error"]
+    assert not (tmp_path / "config" / "nodes" / "helper.yaml").exists()
+    assert ctx.requested == []
+
+
+@pytest.mark.asyncio
+async def test_a_template_outside_the_node_folders_is_never_read(tmp_path: Path) -> None:
+    # 模板名是模型给的参数：拼路径时不能借 ../ 把附件里的 yaml 当模板抄进新节点。
+    _seed(tmp_path)
+    _write(tmp_path, "data/attachments", "evil", {"type": "ai", "tool_access": {"mode": "all"}})
+    ctx = _Ctx(tmp_path, safety="auto")
+
+    result = await create_agent({"name": "helper", "template": "../../data/attachments/evil"}, ctx)
+
+    assert result["ok"] is False
+    assert "template not found" in result["error"]
+    assert ctx.requested == []
+
+
+@pytest.mark.asyncio
+async def test_the_caller_named_by_its_old_id_is_updated_in_the_file_that_defines_it(tmp_path: Path) -> None:
+    _seed(tmp_path)
+    boss = _write(tmp_path, "config/nodes", "boss.v2", {"id": "boss.v2", "type": "ai", "aliases": ["boss"]})
+    ctx = _Ctx(tmp_path, safety="auto")
+
+    result = await create_agent({"name": "helper", "template": "tmpl", "caller_node_id": "boss"}, ctx)
+
+    assert result["data"]["caller_updated"] is True
+    assert ctx.requested[1][1]["path"] == "config/nodes/boss.v2.yaml"
+    assert yaml.safe_load(boss.read_text(encoding="utf-8"))["delegate_targets"] == ["helper"]
+    assert not (tmp_path / "config" / "nodes" / "boss.yaml").exists()

@@ -8,7 +8,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import yaml
 
@@ -775,6 +775,7 @@ def _filter_entries(
     entries: list[dict[str, Any]],
     *,
     node_id: str = "",
+    node_aliases: Iterable[str] = (),
     skill_mode: str = "all",
     skill_allow: list[str] | None = None,
     memory_mode: str = "all",
@@ -792,10 +793,12 @@ def _filter_entries(
     filtered: list[dict[str, Any]] = []
     skill_allow_set = _allow_set(skill_allow)
     memory_allow_set = _allow_set(memory_allow)
+    # 节点改名前写下的 node_ids 还记着旧 id
+    visible_to = (node_id, *node_aliases)
 
     for entry in entries:
         node_ids = entry.get("node_ids") or []
-        if node_id and node_ids and node_id not in node_ids:
+        if node_id and node_ids and not any(known in node_ids for known in visible_to):
             continue
 
         if entry.get("kind") == "skill":
@@ -1158,6 +1161,7 @@ def build_knowledge_messages(
     entries: list[dict[str, Any]],
     *,
     node_id: str = "",
+    node_aliases: Iterable[str] = (),
     instruction_text: str = "",
     history: list[dict[str, Any]] | None = None,
     skill_mode: str = "all",
@@ -1176,6 +1180,7 @@ def build_knowledge_messages(
     filtered_entries = _filter_entries(
         entries,
         node_id=node_id,
+        node_aliases=node_aliases,
         skill_mode=skill_mode,
         skill_allow=skill_allow,
         memory_mode=memory_mode,
@@ -1305,6 +1310,7 @@ def build_knowledge_context(
         workspace_root,
         entries,
         node_id=node.id,
+        node_aliases=getattr(node, "aliases", ()) or (),
         instruction_text=instruction_text,
         history=history,
         skill_mode=node.skill_access.mode,

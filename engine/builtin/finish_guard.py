@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 # Why: engine.builtin handlers must not depend on the hook package after relocation.
@@ -8,6 +9,7 @@ from typing import Any
 # cycles while keeping the existing hook registry duck-typed.
 from .result import hook_result
 from engine.inference.resume_builder import resume_outcome
+from engine.node import known_node_ids
 
 logger = logging.getLogger(__name__)
 
@@ -241,8 +243,11 @@ def _finish_required_tools(node: Any) -> set[str]:
     return {str(n).strip() for n in names if str(n).strip()}
 
 
-def vision_node_ids(runtime_cfg: Any) -> frozenset[str]:
-    """routing.vision 里配置的视觉入口节点，含按通道覆盖的那几个。"""
+def vision_node_ids(runtime_cfg: Any, workspace_root: Path | None = None) -> frozenset[str]:
+    """routing.vision 里配置的视觉入口节点，含按通道覆盖的那几个。
+
+    给了工作区就连同节点的新旧 id 一起算：配置里写旧 id、下游结果报新 id 时照样对得上。
+    """
     routing = runtime_cfg.get("routing") if isinstance(runtime_cfg, dict) else None
     vision = routing.get("vision") if isinstance(routing, dict) else None
     if not isinstance(vision, dict):
@@ -251,7 +256,10 @@ def vision_node_ids(runtime_cfg: Any) -> frozenset[str]:
     channels = vision.get("channels")
     if isinstance(channels, dict):
         candidates.extend(cfg.get("entry_node_id") for cfg in channels.values() if isinstance(cfg, dict))
-    return frozenset(str(item).strip() for item in candidates if str(item or "").strip())
+    configured = {str(item).strip() for item in candidates if str(item or "").strip()}
+    if workspace_root is None:
+        return frozenset(configured)
+    return frozenset(known for node_id in configured for known in known_node_ids(workspace_root, node_id))
 
 
 def _has_unresolved_vision_failure_for_context(ctx: Any) -> bool:
@@ -267,9 +275,13 @@ def _has_unresolved_vision_failure_for_context(ctx: Any) -> bool:
         return True
     # Both sets are cumulative. When retries produced both outcomes, use the
     # ordered message history to determine which result happened last.
+    workspace_root = getattr(getattr(loop_state, "rctx", None), "workspace_root", None)
     return _has_unresolved_vision_failure(
         getattr(ctx, "messages", None),
-        vision_nodes=vision_node_ids(getattr(loop_state, "runtime_cfg", None)),
+        vision_nodes=vision_node_ids(
+            getattr(loop_state, "runtime_cfg", None),
+            Path(workspace_root) if workspace_root else None,
+        ),
     )
 
 

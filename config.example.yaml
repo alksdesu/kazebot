@@ -204,7 +204,8 @@ fallbacks:
 #   1) 节点调用失败时，先看 node_fallbacks 里有没有以该节点 id 为 key 的条目；
 #      命中则用这个专属备选链。
 #   2) 未命中则回退到上方全局 fallbacks。
-#   3) 显式配置空列表（如 `qq.vision: []`）可禁用该节点的全部 fallback。
+#   3) 显式配置空列表（如 `chat.vision: []`）可禁用该节点的全部 fallback。
+#   节点改过名的，写在旧 id 下的条目照样生效；在控制台保存一次就会挪到新 id 下。
 # 每个条目的写法与 fallbacks 完全一致（provider 名 + 可选覆盖 base_url/api_key/model，
 # 支持 ${VAR} 展开，可继承同名 provider 块）。
 #
@@ -213,7 +214,7 @@ fallbacks:
 # 常用节点 id：
 #   system.compactor        上下文压缩节点
 #   system.turn_summarizer  轮摘要节点
-#   qq.vision               QQ 原生视觉入口（备选必须 supports_vision: true；
+#   chat.vision             视觉入口（备选必须 supports_vision: true；
 #                           只有主渠道收不下图时才会路由到它，见 runtime.yaml 的 routing.vision）
 # （read_image 是工具而非 AI 节点，不走 fallback；它的模型由 CLONOTH_IMAGE_MODEL 控制。）
 #

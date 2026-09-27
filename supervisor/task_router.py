@@ -2006,7 +2006,7 @@ class TaskRouterMixin:
         }
         # [2026-07-15] Why: 异步 dispatch 结果回调以新 inbound 注入时，若不指定
         # entry_node_id，_create_entry_task_for_inbound_locked 会回退到 session 最后绑定
-        # 的入口节点（如上一次被 dispatch 目标写入的 qq.web_search），导致回调被错误
+        # 的入口节点（如上一次被 dispatch 目标写入的 chat.web_search），导致回调被错误
         # 路由到不具备推送能力的节点，异步结果无法发出。How: 回调明确指定
         # entry_node_id 为发起 dispatch 的 caller 节点（orchestrator）。Purpose: 异步
         # 结果回到原编排节点，由它决定如何向用户推送。

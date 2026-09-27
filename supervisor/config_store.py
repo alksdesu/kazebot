@@ -11,6 +11,7 @@ from clonoth_runtime import (
     image_tool_available,
     resolve_env_ref,
 )
+from engine.node import canonical_node_id, known_node_ids
 
 from .types import (
     ActiveProviderSecret,
@@ -325,11 +326,14 @@ class ConfigStore:
             raw_chains = data.get("node_fallbacks")
             node_chains: dict[str, list[dict[str, Any]]] = {}
             if isinstance(raw_chains, dict):
-                for node_id, chain in raw_chains.items():
+                for node_id in raw_chains:
+                    # 旧 id 下的链挂到节点现在的名下，控制台看到的就是实际生效的那条。
+                    current = canonical_node_id(self._workspace_root, str(node_id))
+                    owner = self._node_chain_key(raw_chains, current)
                     # 空列表要原样保留：它表示「这个节点禁用 fallback」，
                     # 和「没配过」是两个意思。
-                    if isinstance(chain, list):
-                        node_chains[str(node_id)] = [self._public_fallback(fb) for fb in chain]
+                    if owner is not None and current not in node_chains:
+                        node_chains[current] = [self._public_fallback(fb) for fb in raw_chains[owner]]
 
             return {
                 "active_provider": active,
@@ -640,11 +644,14 @@ class ConfigStore:
             chains = data.get("node_fallbacks")
             if not isinstance(chains, dict):
                 chains = {}
-            if fallbacks is None:
-                chains.pop(node, None)
-            else:
-                previous = chains.get(node)
-                chains[node] = self._merge_chain(
+            current = canonical_node_id(self._workspace_root, node)
+            owner = self._node_chain_key(chains, current)
+            previous = chains.get(owner) if owner is not None else None
+            # 旧 id 下的链一并收掉：只删新键的话，旧的那条会接着生效。
+            for key in known_node_ids(self._workspace_root, current):
+                chains.pop(key, None)
+            if fallbacks is not None:
+                chains[current] = self._merge_chain(
                     fallbacks, previous if isinstance(previous, list) else [],
                 )
             if chains:
@@ -654,6 +661,13 @@ class ConfigStore:
             self._save_raw(data)
             self.reload()
             return self.get_providers_public()
+
+    def _node_chain_key(self, chains: dict[str, Any], node_id: str) -> str | None:
+        """节点实际生效的链记在哪个键下：先认现在的 id，再按声明顺序认旧 id，和引擎查的顺序一样。"""
+        for key in known_node_ids(self._workspace_root, node_id):
+            if isinstance(chains.get(key), list):
+                return key
+        return None
 
     def delete_provider(self, name: str) -> dict[str, Any]:
         """Delete a provider entry."""

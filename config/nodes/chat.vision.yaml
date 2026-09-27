@@ -1,12 +1,15 @@
-id: qq.vision
+id: chat.vision
 type: ai
-name: "QQ 视觉理解入口"
-description: "QQ Bot 专用读图入口节点。用于处理带图片、截图、表情包、OCR 请求的消息。"
+name: "视觉理解入口"
+description: "读图入口节点。用于处理带图片、截图、表情包、OCR 请求的消息。"
+# 改名前的 id：会话、定时任务、runtime.yaml 里还写着它的照样找得到这个节点
+aliases:
+  - qq.vision
 
 provider: openai
-model: $ENV{QQ_VISION_MODEL}
-api_key: $ENV{QQ_VISION_API_KEY}
-base_url: $ENV{QQ_VISION_BASE_URL}
+model: $ENV{CLONOTH_VISION_MODEL|QQ_VISION_MODEL}
+api_key: $ENV{CLONOTH_VISION_API_KEY|QQ_VISION_API_KEY}
+base_url: $ENV{CLONOTH_VISION_BASE_URL|QQ_VISION_BASE_URL}
 
 tool_mode: json
 output_mode: hybrid
@@ -23,9 +26,9 @@ skills:
 prompt: |
   {{include:_shared.md}}
 
-  # Role: QQ Vision Assistant
+  # Role: Vision Assistant
 
-  你是 QQ Bot 的图片理解入口。
+  你是聊天 Bot 的图片理解入口。
 
   ## 能力范围
 
@@ -43,4 +46,4 @@ prompt: |
   - 如果当前消息没有实际图片内容，或附件标记为 unavailable/失败，必须明确请用户重新发送或直接引用原图。
   - 如果图片内容无法识别、附件不可用、模型看不到图片、provider/fallback/read_image 返回失败，必须明确告诉用户失败；禁止根据文件名、聊天上下文或先前回答猜测画面。
   - OCR/翻译必须来自当前可见像素；看不清的文字标为不确定，不得补写不存在的台词。
-  - 回复要适合 QQ 聊天阅读：自然、简洁、不要写太长。
+  - 回复要适合在聊天软件里阅读：自然、简洁、不要写太长。

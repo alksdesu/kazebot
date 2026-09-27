@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+
+from engine.node import load_node, node_files
 
 
 @dataclass
@@ -17,51 +18,21 @@ class NodeInfo:
 
 
 def scan_nodes(workspace_root: Path) -> list[NodeInfo]:
-    """扫描 engine/system_nodes/ 和 config/nodes/ 下所有 yaml 文件，返回节点列表。
-
-    系统节点目录分离：engine 内建目录优先，同 id 节点只保留首次出现的。
-    """
-    # 两个扫描目录：内建系统节点优先于用户配置节点
-    dirs = [
-        workspace_root / "engine" / "system_nodes",
-        workspace_root / "config" / "nodes",
-    ]
+    """列出能派发到的节点，和 engine 加载节点同一套规则：系统节点优先，模板和示例不算，委派目标用现在的 id。"""
     result: list[NodeInfo] = []
-    try:
-        import yaml
-    except ImportError:
-        return []
-
     seen_ids: set[str] = set()
-    for nodes_dir in dirs:
-        if not nodes_dir.is_dir():
+    for path in node_files(workspace_root):
+        node = load_node(workspace_root, path.stem)
+        if node is None or node.id in seen_ids:
             continue
-        for f in sorted(nodes_dir.iterdir()):
-            if f.suffix not in (".yaml", ".yml") or f.name.startswith("_"):
-                continue
-            try:
-                data = yaml.safe_load(f.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if not isinstance(data, dict):
-                continue
-            nid = str(data.get("id") or f.stem).strip()
-            if nid in seen_ids:
-                continue
-            seen_ids.add(nid)
-            ntype = str(data.get("type") or "ai").strip().lower()
-            if ntype not in ("ai", "tool"):
-                continue
-            name = str(data.get("name") or nid).strip()
-            desc = str(data.get("description") or "").strip()
-            dt_raw = data.get("delegate_targets")
-            delegates = [
-                str(x).strip() for x in (dt_raw or []) if isinstance(x, str) and x.strip()
-            ] if isinstance(dt_raw, list) else []
-            result.append(NodeInfo(
-                id=nid, name=name, description=desc,
-                node_type=ntype, delegate_targets=delegates,
-            ))
+        # internal 节点回的是给程序看的判定值，选它当入口只会收到 "no|群友之间在对话" 这种话
+        if (node.extra or {}).get("internal"):
+            continue
+        seen_ids.add(node.id)
+        result.append(NodeInfo(
+            id=node.id, name=node.name, description=node.description,
+            node_type=node.type, delegate_targets=list(node.delegate_targets),
+        ))
     return result
 
 

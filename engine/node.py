@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from clonoth_runtime import load_yaml_dict, load_runtime_config, resolve_env_ref
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -49,6 +53,8 @@ class Node:
     provider: str = ""
     provider_options: dict = field(default_factory=dict)  # 透传给 provider 的参数（thinking/reasoning 等）
     delegate_targets: list[str] = field(default_factory=list)
+    # 改名前的 id：会话、定时任务、配置里还写着旧 id 的照样找得到这个节点
+    aliases: list[str] = field(default_factory=list)
     # [2026-05-27] persistent 标记：声明该节点为持久节点。
     # 为什么：子节点在 accumulate 模式下复用 child session，但缺少显式配置标记
     # 来告知引擎该 session 需要接入自动压缩。
@@ -64,18 +70,125 @@ class Node:
     extra: dict = field(default_factory=dict)
 
 
-def load_node(workspace_root: Path, node_id: str) -> Node | None:
-    nid = (node_id or "").strip()
-    if not nid:
+_NODE_SUFFIX = ".yaml"
+# 按旧 id 找节点要把两个节点目录都过一遍，解析出的别名按 (文件, 修改时间) 缓存
+_ALIAS_CACHE: dict[str, tuple[int, tuple[str, ...]]] = {}
+_WARNED_ALIAS_CONFLICTS: set[tuple[str, ...]] = set()
+
+
+def _node_dirs(workspace_root: Path) -> tuple[Path, Path]:
+    # 系统节点跟随代码仓库同步，和用户目录同名时优先
+    return workspace_root / "engine" / "system_nodes", workspace_root / "config" / "nodes"
+
+
+def _is_node_name(name: str) -> bool:
+    # id 直接拼成文件名：带分隔符、盘符或 .. 就能把节点目录外的 yaml 当节点加载
+    return bool(name) and name not in {".", ".."} and not any(ch in name for ch in "/\\:\0")
+
+
+def _exact_node_file(workspace_root: Path, name: str) -> Path | None:
+    for nodes_dir in _node_dirs(workspace_root):
+        path = nodes_dir / f"{name}{_NODE_SUFFIX}"
+        if path.is_file():
+            return path
+    return None
+
+
+def _parse_aliases(data: dict[str, Any], stem: str) -> tuple[str, ...]:
+    raw = data.get("aliases")
+    items = [raw] if isinstance(raw, str) else raw if isinstance(raw, list) else []
+    names: list[str] = []
+    for item in items:
+        name = item.strip() if isinstance(item, str) else ""
+        if _is_node_name(name) and name != stem and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def _declared_aliases(path: Path) -> tuple[str, ...]:
+    try:
+        mtime = os.stat(path).st_mtime_ns
+    except OSError:
+        return ()
+    key = str(path.resolve())
+    cached = _ALIAS_CACHE.get(key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    aliases = _parse_aliases(load_yaml_dict(path) or {}, path.stem)
+    _ALIAS_CACHE[key] = (mtime, aliases)
+    return aliases
+
+
+def node_files(workspace_root: Path) -> list[Path]:
+    """能按 id 派发到的节点文件：系统目录在前，同一目录按文件名排序。"""
+    files: list[Path] = []
+    for nodes_dir in _node_dirs(workspace_root):
+        if not nodes_dir.is_dir():
+            continue
+        for path in sorted(nodes_dir.glob(f"*{_NODE_SUFFIX}")):
+            # 模板和示例不会被派发到；被同名系统节点顶掉的用户文件永远加载不到
+            if path.name.startswith("_") or ".example" in path.name:
+                continue
+            if _exact_node_file(workspace_root, path.stem) == path:
+                files.append(path)
+    return files
+
+
+def _alias_owner(workspace_root: Path, name: str) -> Path | None:
+    owners = [path for path in node_files(workspace_root) if name in _declared_aliases(path)]
+    if len(owners) > 1:
+        _warn_alias_conflict(name, owners)
+    return owners[0] if owners else None
+
+
+def _warn_alias_conflict(name: str, owners: list[Path]) -> None:
+    key = (name, *(str(path) for path in owners))
+    if key in _WARNED_ALIAS_CONFLICTS:
+        return
+    _WARNED_ALIAS_CONFLICTS.add(key)
+    logger.warning(
+        "node alias %s is declared by %s; %s wins",
+        name, ", ".join(path.name for path in owners), owners[0].name,
+    )
+
+
+def _effective_aliases(workspace_root: Path, path: Path, declared: Iterable[str]) -> tuple[str, ...]:
+    # 有同名文件、或被排在前面的节点先认领了的旧 id 找不到这里，不算这个节点的
+    return tuple(name for name in declared if node_file(workspace_root, name) == path)
+
+
+def node_file(workspace_root: Path, node_id: str) -> Path | None:
+    """节点 id 对应的文件：先按文件名找，找不到再看哪个节点把它声明成了旧 id。"""
+    name = (node_id or "").strip()
+    if not _is_node_name(name):
         return None
-    # 系统节点目录分离：优先从 engine/system_nodes/ 加载内建系统节点，
-    # 找不到时回退到 config/nodes/ 用户配置目录。确保系统节点跟随代码仓库同步。
-    _sys_path = workspace_root / "engine" / "system_nodes" / f"{nid}.yaml"
-    _usr_path = workspace_root / "config" / "nodes" / f"{nid}.yaml"
-    _node_path = _sys_path if _sys_path.is_file() else _usr_path
-    data = load_yaml_dict(_node_path)
+    return _exact_node_file(workspace_root, name) or _alias_owner(workspace_root, name)
+
+
+def canonical_node_id(workspace_root: Path, node_id: str) -> str:
+    """节点现在的 id，即文件名。旧 id 换成现在的，找不到节点就原样返回。"""
+    name = (node_id or "").strip()
+    path = node_file(workspace_root, name)
+    return path.stem if path is not None else name
+
+
+def known_node_ids(workspace_root: Path, node_id: str) -> tuple[str, ...]:
+    """节点认的全部 id：现在的在前，旧的按声明顺序在后。按 id 查设置时依次试。"""
+    name = (node_id or "").strip()
+    path = node_file(workspace_root, name)
+    if path is None:
+        return (name,) if name else ()
+    return (path.stem, *_effective_aliases(workspace_root, path, _declared_aliases(path)))
+
+
+def load_node(workspace_root: Path, node_id: str) -> Node | None:
+    node_path = node_file(workspace_root, node_id)
+    if node_path is None:
+        return None
+    data = load_yaml_dict(node_path)
     if not isinstance(data, dict):
         return None
+    nid = node_path.stem
     # kind 默认 "node"，允许省略
     if str(data.get("kind") or "node").strip() != "node":
         return None
@@ -174,11 +287,11 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
     raw_po = data.get("provider_options")
     provider_options = dict(raw_po) if isinstance(raw_po, dict) else {}
 
-    # delegate_targets
+    # delegate_targets：统一换成现在的 id，派发工具名、白名单、子会话键都按它算
     dt_raw = data.get("delegate_targets")
-    delegate_targets: list[str] = [
-        str(x).strip() for x in (dt_raw or []) if isinstance(x, str) and x.strip()
-    ] if isinstance(dt_raw, list) else []
+    delegate_targets: list[str] = list(dict.fromkeys(
+        canonical_node_id(workspace_root, x) for x in dt_raw if isinstance(x, str) and x.strip()
+    )) if isinstance(dt_raw, list) else []
 
     # [2026-05-27] persistent 字段解析：从 node yaml 读取 persistent 布尔值。
     # 为什么：支持节点级别的持久化声明，用于控制 context_mode 默认值和自动压缩。
@@ -191,7 +304,7 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         "kind", "id", "type", "name", "description", "model", "api_key",
         "base_url", "prompt", "tool_access", "skills", "memories",
         "tool_mode", "output_mode", "provider", "provider_options",
-        "delegate_targets", "persistent",
+        "delegate_targets", "aliases", "persistent",
     }
     extra = {k: v for k, v in data.items() if k not in _KNOWN_KEYS}
 
@@ -212,6 +325,7 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         provider=provider,
         provider_options=provider_options,
         delegate_targets=delegate_targets,
+        aliases=list(_effective_aliases(workspace_root, node_path, _parse_aliases(data, nid))),
         persistent=persistent,
         extra=extra,
     )

@@ -86,11 +86,11 @@ routing:
     # 后一半是因为空值会回落全局 —— 绕过来还是同一个模型，只是工具和委派没了。
     # true = 一律绕（带图消息碰不到工具，想要这道隔离就写它）；false = 一律不绕。
     enabled: auto
-    entry_node_id: "qq.vision"
+    entry_node_id: "chat.vision"
     # 所有平台默认都用上面这个节点；要按通道（如 qq_group）或平台 id（如 qq）单独指定时再写：
     # channels:
     #   qq_group:
-    #     entry_node_id: "qq.vision"
+    #     entry_node_id: "chat.vision"
 
 meta:
   execute_command:

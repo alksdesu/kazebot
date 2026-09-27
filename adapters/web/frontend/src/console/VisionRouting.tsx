@@ -95,7 +95,7 @@ export const VisionRouting = () => {
       {mode === 'auto' && (
         <Facts>
           按上面每个渠道的「带图消息」判定。绕过去还有一个前提：视觉入口节点得有自己的
-          QQ_VISION_MODEL 或 QQ_VISION_BASE_URL。两个都空时它解析出来就是主渠道那个模型，
+          CLONOTH_VISION_MODEL 或 CLONOTH_VISION_BASE_URL（旧名 QQ_VISION_* 也认）。两个都空时它解析出来就是主渠道那个模型，
           绕过去只是白丢工具，所以自动档会留在主渠道并在日志里说一声。
         </Facts>
       )}

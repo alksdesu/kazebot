@@ -157,3 +157,23 @@ def test_effective_tools_reads_the_real_file_too(client) -> None:
     body = client("GET", f"{_BASE}/qq.orchestrator/effective-tools", headers=_AUTH).json()
 
     assert {row["name"] for row in body["tools"]} == {"read_file", "write_file", "execute_command"}
+
+
+@pytest.mark.parametrize("taken", ["system.compactor", "qq.vision"])
+def test_creating_a_node_under_a_taken_id_is_refused(client, workspace: Path, taken: str) -> None:
+    # 同名系统节点、把它声明成旧 id 的节点都排在新文件前面：建了看着成功，实际永远加载不到。
+    (workspace / "config" / "nodes" / "chat.vision.yaml").write_text(
+        "id: chat.vision\ntype: ai\naliases:\n  - qq.vision\n", encoding="utf-8",
+    )
+
+    resp = client("POST", _BASE, headers=_AUTH, json={"id": taken, "content": "type: ai\n"})
+
+    assert resp.status_code == 409
+    assert not (workspace / "config" / "nodes" / f"{taken}.yaml").exists()
+
+
+def test_creating_a_node_under_a_free_id_still_works(client, workspace: Path) -> None:
+    resp = client("POST", _BASE, headers=_AUTH, json={"id": "chat.helper", "content": "type: ai\n"})
+
+    assert resp.status_code == 200
+    assert (workspace / "config" / "nodes" / "chat.helper.yaml").read_text(encoding="utf-8") == "type: ai\n"

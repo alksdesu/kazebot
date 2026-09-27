@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -33,46 +32,19 @@ class TaskStoreMixin:
     def _entry_node_pinned(self, payload: dict[str, Any]) -> bool:
         return bool(payload.get("entry_node_pinned")) and bool(str(payload.get("entry_node_id") or "").strip())
 
-    def _node_yaml(self, node_id: str) -> dict[str, Any]:
-        """按 id 找节点定义。文件名不一定等于 id，engine 内建目录优先。"""
-        import yaml
-
-        target = (node_id or "").strip()
-        if not target:
-            return {}
-        for nodes_dir in (
-            self.workspace_root / "engine" / "system_nodes",
-            self.workspace_root / "config" / "nodes",
-        ):
-            if not nodes_dir.exists():
-                continue
-            for path in sorted(nodes_dir.glob("*.yaml")):
-                try:
-                    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-                except Exception:
-                    continue
-                if isinstance(data, dict) and str(data.get("id") or path.stem) == target:
-                    return data
-        return {}
-
-    def _deref_env(self, value: Any) -> str:
-        text = str(value or "").strip()
-        for head in ("$ENV{", "${"):
-            if text.startswith(head) and text.endswith("}") and len(text) > len(head) + 1:
-                return os.environ.get(text[len(head):-1].strip(), "").strip()
-        return text
-
     def _vision_node_is_configured(self, node_id: str) -> bool:
         """视觉入口节点有没有自己的模型或地址。
 
         没有就别绕：engine/model.py 里空值一律回落全局，这个节点解析出来就是主渠道那个
         看不了图的模型，只是顺带把工具和委派也砍光了 —— 比不绕更糟。
-        读不到节点定义时按「配了」算，维持原来的绕。
+        节点照 engine 的方式加载（先认文件名，再认旧 id），加载不到时按「配了」算，维持原来的绕。
         """
-        node = self._node_yaml(node_id)
-        if not node:
+        from engine.node import load_node
+
+        node = load_node(self.workspace_root, node_id)
+        if node is None:
             return True
-        return bool(self._deref_env(node.get("model")) or self._deref_env(node.get("base_url")))
+        return bool(node.model or node.base_url)
 
     def _warn_vision_node_unconfigured(self, node_id: str) -> None:
         seen = getattr(self, "_vision_unconfigured_warned", None)
@@ -84,7 +56,8 @@ class TaskStoreMixin:
         seen.add(node_id)
         logger.warning(
             "vision routing: %s has no model/base_url of its own, keeping images on the main channel. "
-            "Set QQ_VISION_MODEL / QQ_VISION_API_KEY / QQ_VISION_BASE_URL to make the detour meaningful.",
+            "Set CLONOTH_VISION_MODEL / CLONOTH_VISION_API_KEY / CLONOTH_VISION_BASE_URL "
+            "(QQ_VISION_* still read) to make the detour meaningful.",
             node_id,
         )
 

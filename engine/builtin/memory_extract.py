@@ -113,7 +113,7 @@ class MemoryExtractHandler:
             log.debug("memory_extract gate: blocked by _system_task")
             return
         # 用户轮次按 task 来源判定，不比对入口节点 id：入口是"平台 × 会话 × 消息能力"
-        # 三维决定的（qq.orchestrator / qq.vision / draw.* / 前端任选节点），
+        # 三维决定的（qq.orchestrator / chat.vision / draw.* / 前端任选节点），
         # 单个全局标量不可能同时等于它们。
         if getattr(task, "source_inbound_seq", None) is None:
             log.debug("memory_extract gate: task not created from an inbound turn")

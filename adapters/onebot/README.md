@@ -81,7 +81,7 @@ pip install nonebot2 nonebot-adapter-onebot httpx
 |---|---|---|---|
 | `CLONOTH_BASE_URL` | 否 | `http://127.0.0.1:8765` | Supervisor API 地址 |
 | `CLONOTH_WORKSPACE` | 否 | 仓库根（由 `config.py` 位置推导） | 工作区路径，用于 SDK 导入和附件存储。只有适配器与工作区不在同一仓库时才要显式配 |
-| `CLONOTH_ENTRY_NODE` | 否 | `qq.orchestrator` | QQ 入口节点 ID。默认使用综合入口，支持联网搜索、调度、重启、取消任务，并可委派项目/命令相关任务；如需搜索-only 安全窄入口，可显式设置为 `qq.web_search`。 |
+| `CLONOTH_ENTRY_NODE` | 否 | `qq.orchestrator` | QQ 入口节点 ID。默认使用综合入口，支持联网搜索、调度、重启、取消任务，并可委派项目/命令相关任务；如需搜索-only 安全窄入口，可显式设置为 `chat.web_search`（旧 id `qq.web_search` 仍然认）。 |
 | `CLONOTH_QQ_CONFIG_PATH` | 否 | `${CLONOTH_WORKSPACE}/config/qq.yaml` | 热载配置文件位置。文件不存在时全部热载键回落 env / 内置默认 |
 | `CLONOTH_QQ_CUSTOM_FACES_PATH` | 否 | `${CLONOTH_WORKSPACE}/config/qq_custom_faces.txt` | AI 可见的 QQ 收藏表情名称文件；一行一个名称，空行和 `#` 注释忽略。 |
 | `CLONOTH_QQ_CUSTOM_FACES_METADATA_PATH` | 否 | `${CLONOTH_WORKSPACE}/config/qq_custom_faces.json` | 内部元数据文件（name/md5/resId/emojiId/fileName/url）。AI 不读取，用于稳定匹配与直接发送。 |
@@ -276,7 +276,7 @@ QQ 适配器不会再自动放行 `approval_requested`。当 Clonoth 触发需�
 
 ### 任务状态反馈
 
-默认入口为 `qq.orchestrator`，适合希望 QQ 同时承担联网搜索、调度、重启和取消任务的部署；`qq.web_search` 会继续保留为极简搜索入口，适合只想开放联网搜索能力的部署。
+默认入口为 `qq.orchestrator`，适合希望 QQ 同时承担联网搜索、调度、重启和取消任务的部署；`chat.web_search` 会继续保留为极简搜索入口，适合只想开放联网搜索能力的部署。
 
 检测到联网搜索工具进度时，会向会话发送低频文本提示，例如“已收到联网搜索请求，正在检索网页资料……”，避免用户误以为 Bot 卡住。
 

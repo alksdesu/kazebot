@@ -14,6 +14,8 @@ from fastapi import APIRouter, Depends, HTTPException, Body, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from engine.node import node_file
+
 from .tool_catalog import ToolEntry, tool_catalog, tool_names
 
 class RawContent(BaseModel):
@@ -312,6 +314,13 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         p = _safe_path(workspace_root / "config" / "nodes", payload.id, ".yaml")
         if p.exists():
             raise HTTPException(status_code=409, detail="Node already exists")
+        # 同名系统节点、把这个 id 声明成旧 id 的节点都排在新文件前面，建了也加载不到。
+        taken_by = node_file(workspace_root, payload.id)
+        if taken_by is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{payload.id} 已经指向 {taken_by.relative_to(workspace_root).as_posix()}，新建的文件不会被加载",
+            )
         return _write_text(p, payload.content)
 
     @router.delete("/nodes/{node_id}")

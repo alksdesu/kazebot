@@ -266,14 +266,30 @@ class TestTheVisionNodeMustBeWorthTheDetour:
         state = _state(tmp_path, _store(tmp_path, "deepseek"), "auto")
         assert _route(state) == "qq.vision"
 
-    def test_the_node_is_found_by_id_not_by_filename(self, tmp_path) -> None:
+    def test_an_id_field_alone_does_not_make_a_file_the_node(self, tmp_path) -> None:
+        # engine 按文件名加载，yaml 里的 id 字段不参与查找：照那个字段找到的定义根本跑不起来，
+        # 拿它判断配没配只会得出一个和实际执行对不上的结论，所以同样按「读不到」处理。
         nodes = tmp_path / "config" / "nodes"
         nodes.mkdir(parents=True, exist_ok=True)
         (nodes / "whatever.yaml").write_text(
             yaml.safe_dump({"id": "qq.vision", "type": "ai"}, sort_keys=False), encoding="utf-8",
         )
         state = _state(tmp_path, _store(tmp_path, "deepseek"), "auto")
+        assert _route(state) == "qq.vision"
+
+    def test_a_renamed_node_is_judged_under_its_old_id(self, tmp_path) -> None:
+        # runtime.yaml 还写着旧 id，节点文件已经改名、把旧 id 记进了 aliases。
+        _node(tmp_path, "chat.vision", aliases=["qq.vision"])
+        state = _state(tmp_path, _store(tmp_path, "deepseek"), "auto")
         assert _route(state) == "qq.orchestrator"
+
+    def test_an_env_fallback_list_is_resolved_like_the_engine_does(self, tmp_path, monkeypatch) -> None:
+        # 新变量名空着、旧变量名配了：engine 会用旧的那个，这里也得算「配过了」。
+        monkeypatch.delenv("CLONOTH_VISION_MODEL", raising=False)
+        monkeypatch.setenv("QQ_VISION_MODEL", "gpt-4o-mini")
+        _node(tmp_path, "chat.vision", aliases=["qq.vision"], model="$ENV{CLONOTH_VISION_MODEL|QQ_VISION_MODEL}")
+        state = _state(tmp_path, _store(tmp_path, "deepseek"), "auto")
+        assert _route(state) == "qq.vision"
 
     @pytest.mark.parametrize("written", ["true", '"true"', "yes", "on"])
     def test_explicit_true_still_diverts_to_an_unconfigured_node(self, tmp_path, written: str) -> None:
@@ -298,6 +314,6 @@ class TestTheVisionNodeMustBeWorthTheDetour:
             _route(state)
             _route(state)
 
-        hits = [r for r in caplog.records if "QQ_VISION_MODEL" in r.getMessage()]
+        hits = [r for r in caplog.records if "CLONOTH_VISION_MODEL" in r.getMessage()]
         assert len(hits) == 1
         assert "qq.vision" in hits[0].getMessage()
