@@ -13,6 +13,8 @@ from adapters._shared.outbound import (
     EVERYONE,
     FOREIGN_CUSTOM_EMOJI,
     REACT_MARKER,
+    SEGMENT_NATIVE_EMOJI,
+    SEGMENT_STICKER,
     EmojiPiece,
     MarkerGrammar,
     MentionPiece,
@@ -23,10 +25,13 @@ from adapters._shared.outbound import (
     join_rendered,
     limit_parts,
     mention_as_text,
+    native_emoji_segment,
     pick_reaction,
+    planned_stickers,
     resolve_mention,
     split_mention_tokens,
     split_reply,
+    sticker_segment,
     strip_markup,
     tokenize,
     truncate_text,
@@ -239,3 +244,26 @@ class TestEmojiLookup:
     @pytest.mark.parametrize("raw", ["", None, "whatever"])
     def test_an_unknown_order_falls_back_to_the_platform_emoji(self, raw: object) -> None:
         assert emoji_lookup(raw) == (EMOJI_NATIVE, EMOJI_LIBRARY)  # type: ignore[arg-type]
+
+
+class TestEmojiSegments:
+    def test_a_sticker_segment_keeps_only_its_digests(self) -> None:
+        assert sticker_segment("a" * 64, "b" * 64) == {
+            "type": SEGMENT_STICKER, "sha256": "a" * 64, "content_sha256": "b" * 64,
+        }
+
+    def test_a_native_emoji_segment_names_its_platform(self) -> None:
+        assert native_emoji_segment("chat", "wave:1") == {
+            "type": SEGMENT_NATIVE_EMOJI, "platform": "chat", "ref": "wave:1",
+        }
+
+    def test_planned_stickers_keep_the_first_appearance_order(self) -> None:
+        segments = [
+            sticker_segment("b" * 64, "1" * 64),
+            {"type": "text", "content": "看"},
+            native_emoji_segment("chat", "wave:1"),
+            sticker_segment("a" * 64, "2" * 64),
+            sticker_segment("b" * 64, "1" * 64),
+        ]
+
+        assert planned_stickers(segments) == ["b" * 64, "a" * 64]

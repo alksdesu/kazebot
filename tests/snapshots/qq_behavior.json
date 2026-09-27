@@ -213,31 +213,31 @@
   "empty": [],
   "faces": [
    {
-    "emoji": true,
-    "type": "image",
-    "url": "http://faces.invalid/2"
+    "platform": "qq",
+    "ref": "http://faces.invalid/2",
+    "type": "native_emoji"
    },
    {
-    "emoji": true,
-    "type": "image",
-    "url": "http://faces.invalid/1"
+    "platform": "qq",
+    "ref": "http://faces.invalid/1",
+    "type": "native_emoji"
    },
    {
-    "emoji": true,
-    "type": "image",
-    "url": "http://faces.invalid/1"
+    "platform": "qq",
+    "ref": "http://faces.invalid/1",
+    "type": "native_emoji"
    },
    {
-    "emoji": true,
-    "type": "image",
-    "url": "http://faces.invalid/1"
+    "platform": "qq",
+    "ref": "http://faces.invalid/1",
+    "type": "native_emoji"
    }
   ],
   "markdown": [
    {
-    "emoji": true,
-    "type": "image",
-    "url": "http://faces.invalid/1"
+    "platform": "qq",
+    "ref": "http://faces.invalid/1",
+    "type": "native_emoji"
    },
    {
     "content": " 代码 链接（https://example.invalid） ## 标题 _保留_",
@@ -250,9 +250,9 @@
     "type": "text"
    },
    {
-    "emoji": true,
-    "type": "image",
-    "url": "http://faces.invalid/1"
+    "platform": "qq",
+    "ref": "http://faces.invalid/1",
+    "type": "native_emoji"
    },
    {
     "content": "中间",

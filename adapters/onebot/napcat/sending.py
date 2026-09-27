@@ -8,10 +8,11 @@ import contextlib
 import hashlib
 import os
 import time
-from typing import Any, Awaitable, Callable, Dict, List
+from typing import Any, Awaitable, Callable, Dict, List, Mapping
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 from adapters._shared import outbound
+from platforms.builtin import QQ_NAPCAT
 from ..config import ONEBOT_IDEMPOTENCY_FALLBACK_SENT_TTL_SECONDS
 from ..live_config import live
 from adapters._shared.send_guard import (
@@ -45,36 +46,48 @@ def _truncate_qq_text(text: str) -> str:
     return outbound.truncate_text(text, live.message_limit, suffix=_TRUNCATED_NOTICE)
 
 
-def _message_from_processed_segments(segments: List[Dict[str, Any]]) -> Message:
-    """把 emoji_handler 的轻量段描述转换为 OneBot Message。"""
+def _message_from_processed_segments(
+    segments: List[Dict[str, Any]], *, sticker_files: Mapping[str, str] | None = None,
+) -> Message:
+    """把 emoji_handler 渲染的段翻成 OneBot Message；表情包段的文件由 _materialize_sticker_segments 读好传进来。"""
     message_segments: List[MessageSegment] = []
     for segment in segments:
-        if segment.get("type") == "text":
+        kind = segment.get("type")
+        if kind == "text":
             content = str(segment.get("content", ""))
             if content:
                 message_segments.append(MessageSegment.text(content))
-        elif segment.get("type") == "image":
+        elif kind == outbound.SEGMENT_NATIVE_EMOJI:
+            ref = str(segment.get("ref") or "")
+            # 别的平台的表情引用在 QQ 上没有意义，只能丢掉。
+            if ref and segment.get("platform") == QQ_NAPCAT.id:
+                message_segments.append(_emoji_image(ref))
+        elif kind == outbound.SEGMENT_STICKER:
+            file = (sticker_files or {}).get(str(segment.get("sha256") or ""))
+            if not file:
+                raise SendContractError("表情包段没有读好的文件，只能按发送计划发")
+            message_segments.append(_emoji_image(file))
+        elif kind == "image":
             url = segment.get("url")
             if url:
-                if segment.get("emoji"):
-                    # QQ 收藏表情：在普通 image 段基础上补 sub_type=1（表情子类型），
-                    # 让 QQ 客户端按小图/贴纸渲染而不是普通大图；summary 提供
-                    # "[表情]" 占位，兼容不支持 sub_type 的客户端摘要显示。
-                    emoji_seg = MessageSegment.image(url)
-                    emoji_seg.data["sub_type"] = 1
-                    emoji_seg.data.setdefault("summary", "[表情]")
-                    message_segments.append(emoji_seg)
-                else:
-                    message_segments.append(MessageSegment.image(url))
-        elif segment.get("type") == "at":
+                message_segments.append(MessageSegment.image(url))
+        elif kind == "at":
             qq_id = segment.get("qq")
             if qq_id:
                 message_segments.append(MessageSegment.at(qq_id))
-        elif segment.get("type") == "reply":
+        elif kind == "reply":
             message_id = segment.get("message_id")
             if message_id:
                 message_segments.append(MessageSegment.reply(message_id))
     return Message(message_segments)
+
+
+def _emoji_image(file: str) -> MessageSegment:
+    # sub_type=1 让客户端按表情小图渲染而不是普通大图；summary 给不认 sub_type 的客户端当摘要。
+    segment = MessageSegment.image(file)
+    segment.data["sub_type"] = 1
+    segment.data.setdefault("summary", "[表情]")
+    return segment
 
 
 def _bind_qq_reply_waiter(conversation_key: str, inbound_seq: int) -> None:
@@ -510,31 +523,33 @@ async def _send_split_text(
     return sent_any
 
 
-def _freeze_sticker_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    frozen = []
-    for segment in segments:
-        item = dict(segment)
-        if item.get("sticker_sha256"):
-            encoded = str(item.pop("url", "")).removeprefix("base64://")
-            item["content_sha256"] = hashlib.sha256(base64.b64decode(encoded)).hexdigest()
-        frozen.append(item)
-    return frozen
+def _planned_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
+    """落盘的计划里可能还是旧写法：表情是带 emoji 标记的图片段，图库的图另带 sticker_sha256。"""
+    if segment.get("type") != "image" or not segment.get("emoji"):
+        return segment
+    if segment.get("sticker_sha256"):
+        return outbound.sticker_segment(str(segment["sticker_sha256"]), str(segment.get("content_sha256") or ""))
+    return outbound.native_emoji_segment(QQ_NAPCAT.id, str(segment.get("url") or ""))
+
+
+async def _read_planned_sticker(segment: Dict[str, Any]) -> str:
+    store = emotes._sticker_store_handle()
+    row = store.get(str(segment.get("sha256") or "")) if store is not None else None
+    raw = await asyncio.to_thread(emotes._read_sticker, row) if row is not None else b""
+    if not raw or hashlib.sha256(raw).hexdigest() != segment.get("content_sha256"):
+        raise SendContractError("已选表情包不可用，保持原投递内容且不自动换图")
+    # 图库是几个号共用的，NapCat 容器里没有它的挂载，只能把图内容直接发过去。
+    return "base64://" + base64.b64encode(raw).decode("ascii")
 
 
 async def _materialize_sticker_segments(segments: List[Dict[str, Any]]) -> Message:
-    materialized = []
-    for segment in segments:
-        item = dict(segment)
-        digest = str(item.get("sticker_sha256") or "")
-        if digest:
-            store = emotes._sticker_store_handle()
-            row = store.get(digest) if store is not None else None
-            raw = await asyncio.to_thread(emotes._read_sticker, row) if row is not None else b""
-            if not raw or hashlib.sha256(raw).hexdigest() != item.get("content_sha256"):
-                raise SendContractError("已选表情包不可用，保持原投递内容且不自动换图")
-            item["url"] = "base64://" + base64.b64encode(raw).decode("ascii")
-        materialized.append(item)
-    return _message_from_processed_segments(materialized)
+    """计划里只冻结了选中哪张图，真要发时才读文件；内容和选图时对不上就拒发，不自动换图。"""
+    planned = [_planned_segment(segment) for segment in segments]
+    files: Dict[str, str] = {}
+    for segment in planned:
+        if segment.get("type") == outbound.SEGMENT_STICKER:
+            files[str(segment.get("sha256") or "")] = await _read_planned_sticker(segment)
+    return _message_from_processed_segments(planned, sticker_files=files)
 
 
 async def _send_planned_sticker_message(
@@ -606,11 +621,9 @@ async def _send_split_parts(
             async def build_plan() -> Dict[str, Any]:
                 segments = await prepare()
                 return {
-                    "processed_segments": _freeze_sticker_segments(segments),
+                    "processed_segments": segments,
                     "send_identity": hashlib.sha256(part.encode("utf-8")).hexdigest(),
-                    "selected_images": list(dict.fromkeys(
-                        str(item["sticker_sha256"]) for item in segments if item.get("sticker_sha256")
-                    )),
+                    "selected_images": outbound.planned_stickers(segments),
                     "conversation_key": state._adapter.sticker_send_conversation.get(""),
                 }
 

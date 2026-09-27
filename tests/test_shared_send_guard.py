@@ -14,6 +14,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from adapters._shared.send_guard import (  # noqa: E402
+    SendContractError,
     SendError,
     SendNotStartedError,
     TwoPhaseIdempotencyStore,
@@ -131,3 +132,46 @@ class TestProtectedSend:
                 protected_claim_send(store, claim, send)  # type: ignore[call-arg]
         finally:
             store.close()
+
+
+class TestMessagePlanSegments:
+    """计划会落盘、重启后照着发：媒体段只能存引用，不能存图本身，也不能存只有本机读得到的路径。"""
+
+    @staticmethod
+    def _plan_with(tmp_path: Path, segment: dict[str, Any]) -> Any:
+        store = _store(tmp_path / "segments.sqlite3")
+
+        async def build() -> dict[str, Any]:
+            return {**await _plan_body(), "processed_segments": [segment]}
+
+        try:
+            return asyncio.run(store.get_or_create_message_plan("plan-segment", {"room": "abc"}, build))
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize("segment", [
+        {"type": "sticker", "sha256": "a" * 64, "content_sha256": "b" * 64},
+        {"type": "native_emoji", "platform": "chat", "ref": "https://synthetic.invalid/wave.png"},
+        {"type": "native_emoji", "platform": "chat", "ref": "wave:1234567890"},
+        {"type": "image", "url": "https://synthetic.invalid/picture.png"},
+    ])
+    def test_references_are_kept_as_given(self, tmp_path: Path, segment: dict[str, Any]) -> None:
+        assert self._plan_with(tmp_path, segment).processed_segments == [segment]
+
+    @pytest.mark.parametrize("segment", [
+        {"type": "sticker", "sha256": "a" * 64},
+        {"type": "sticker", "sha256": "not-a-sha", "content_sha256": "b" * 64},
+        {"type": "sticker", "sha256": "a" * 64, "content_sha256": "b" * 64, "data": {"file": "base64://c2VjcmV0"}},
+        {"type": "native_emoji", "ref": "https://synthetic.invalid/wave.png"},
+        {"type": "native_emoji", "platform": "chat", "ref": ""},
+        {"type": "native_emoji", "platform": "chat", "ref": "base64://c2VjcmV0"},
+        {"type": "native_emoji", "platform": "chat", "ref": "data:image/png;base64,c2VjcmV0"},
+        {"type": "native_emoji", "platform": "chat", "ref": "file:///synthetic/wave.png"},
+        {"type": "native_emoji", "platform": "chat", "ref": "/synthetic/wave.png"},
+        {"type": "image", "content": "synthetic/picture.png"},
+    ])
+    def test_inline_data_local_paths_and_broken_digests_are_refused(
+        self, tmp_path: Path, segment: dict[str, Any],
+    ) -> None:
+        with pytest.raises(SendContractError):
+            self._plan_with(tmp_path, segment)

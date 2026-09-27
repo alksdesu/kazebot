@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Callable, Collection, Optional, Sequence, Union
+from typing import Any, Callable, Collection, Iterable, Mapping, Optional, Sequence, Union
 
 from platforms.descriptor import ID_NUMERIC
 
@@ -25,6 +25,10 @@ EMOJI_LIBRARY = "library"
 # 两边都有同名的时候先用谁，是平台配置。
 EMOJI_NATIVE_FIRST = "native_first"
 EMOJI_LIBRARY_FIRST = "library_first"
+
+# 驱动渲染好、等着发的表情段：表情包只记图库哈希，发的时候才读文件；平台表情记平台和平台自己的引用。
+SEGMENT_STICKER = "sticker"
+SEGMENT_NATIVE_EMOJI = "native_emoji"
 
 _REACT_RE = re.compile(REACT_MARKER)
 _MENTION_MARKER = r"\[at:([^\]]+)\]"
@@ -101,6 +105,29 @@ def emoji_lookup(order: str) -> tuple[str, str]:
     if str(order or "").strip().lower() == EMOJI_LIBRARY_FIRST:
         return EMOJI_LIBRARY, EMOJI_NATIVE
     return EMOJI_NATIVE, EMOJI_LIBRARY
+
+
+@dataclass(frozen=True)
+class ResolvedSticker:
+    """图库里挑中的一张：库里的哈希，和挑中时读到的文件内容哈希。发送前按后者核对，图变了就不发。"""
+
+    sha256: str
+    content_sha256: str
+
+
+def sticker_segment(sha256: str, content_sha256: str) -> dict[str, str]:
+    return {"type": SEGMENT_STICKER, "sha256": sha256, "content_sha256": content_sha256}
+
+
+def native_emoji_segment(platform: str, ref: str) -> dict[str, str]:
+    return {"type": SEGMENT_NATIVE_EMOJI, "platform": platform, "ref": ref}
+
+
+def planned_stickers(segments: Iterable[Mapping[str, Any]]) -> list[str]:
+    """段里挑中的图，按出现先后去重；发送确认后按这份记账。"""
+    return list(dict.fromkeys(
+        str(segment["sha256"]) for segment in segments if segment.get("type") == SEGMENT_STICKER
+    ))
 
 
 def split_reply(text: str) -> list[str]:

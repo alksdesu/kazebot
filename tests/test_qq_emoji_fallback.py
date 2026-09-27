@@ -12,11 +12,16 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from adapters._shared.outbound import EMOJI_LIBRARY, EMOJI_NATIVE, ResolvedSticker  # noqa: E402
 from adapters.onebot import emoji_handler as emoji  # noqa: E402
+from platforms.builtin import QQ_NAPCAT  # noqa: E402
 
 _DIGEST = "a" * 64
-_LOCAL_URL = "base64://c3RpY2tlcg=="
+_CONTENT = "b" * 64
 _FACE_URL = "https://example.invalid/face.gif"
+_PICKED = ResolvedSticker(_DIGEST, _CONTENT)
+_STICKER = {"type": "sticker", "sha256": _DIGEST, "content_sha256": _CONTENT}
+_FACE = {"type": "native_emoji", "platform": QQ_NAPCAT.id, "ref": _FACE_URL}
 
 
 class FaceBot:
@@ -52,22 +57,18 @@ def test_emoji_marker_detection_ignores_plain_text(text: str) -> None:
 
 
 @pytest.mark.parametrize("metadata", [None, [{"name": "其他收藏", "url": _FACE_URL}]])
-@pytest.mark.parametrize("typed", [False, True])
-def test_collection_failure_falls_back_to_local_sticker(metadata, typed: bool) -> None:
+def test_collection_failure_falls_back_to_local_sticker(metadata) -> None:
     bot = FaceBot(error=RuntimeError("synthetic collection failure"))
     selected: list[str] = []
 
     async def resolve(name: str):
         selected.append(name)
-        return emoji.ResolvedSticker(_LOCAL_URL, _DIGEST) if typed else _LOCAL_URL
+        return _PICKED
 
     renderer = emoji.EmojiRenderer(sticker_resolver=resolve)
     segments = asyncio.run(renderer.process_emojis("前文[表情:无语]后文", bot, [], metadata=metadata))
 
-    image = {"type": "image", "url": _LOCAL_URL, "emoji": True}
-    if typed:
-        image["sticker_sha256"] = _DIGEST
-    assert segments == [{"type": "text", "content": "前文"}, image, {"type": "text", "content": "后文"}]
+    assert segments == [{"type": "text", "content": "前文"}, _STICKER, {"type": "text", "content": "后文"}]
     assert selected == ["无语"]
     assert bot.calls == ["fetch_custom_face_detail"]
 
@@ -77,17 +78,17 @@ def test_collection_failure_is_not_retried_for_every_marker(metadata) -> None:
     bot = FaceBot(error=RuntimeError("synthetic collection failure"))
 
     async def resolve(name: str):
-        return emoji.ResolvedSticker(_LOCAL_URL, _DIGEST)
+        return _PICKED
 
     renderer = emoji.EmojiRenderer(sticker_resolver=resolve)
     segments = asyncio.run(renderer.process_emojis("[表情:开心][表情:无语]", bot, [], metadata=metadata))
 
-    assert len(segments) == 2
-    assert all(segment["sticker_sha256"] == _DIGEST for segment in segments)
+    assert segments == [_STICKER, _STICKER]
     assert len(bot.calls) == 1
 
 
-@pytest.mark.parametrize("resolved", ["", None, 42])
+# 只给个地址不算挑中：没有哈希，发送前既核对不了内容，也记不了账。
+@pytest.mark.parametrize("resolved", ["", None, 42, "base64://c3RpY2tlcg=="])
 def test_unresolved_marker_does_not_remove_surrounding_text(resolved) -> None:
     bot = FaceBot(error=RuntimeError("synthetic collection failure"))
 
@@ -143,27 +144,25 @@ def test_collection_match_has_priority_and_no_local_digest(from_metadata: bool) 
     renderer = emoji.EmojiRenderer(sticker_resolver=resolve)
     segments = asyncio.run(renderer.process_emojis("[表情:开心]", bot, [], metadata=metadata))
 
-    assert segments == [{"type": "image", "url": _FACE_URL, "emoji": True}]
+    assert segments == [_FACE]
     assert len(bot.calls) == (0 if from_metadata else 1)
 
 
 def test_digest_does_not_leak_from_local_to_next_collection() -> None:
     async def resolve(name: str):
-        return emoji.ResolvedSticker(_LOCAL_URL, _DIGEST)
+        return _PICKED
 
     renderer = emoji.EmojiRenderer(sticker_resolver=resolve)
     bot = FaceBot(faces=[{"name": "收藏", "url": _FACE_URL}])
     segments = asyncio.run(renderer.process_emojis("[表情:本地][表情:收藏]", bot, []))
 
-    assert segments == [
-        {"type": "image", "url": _LOCAL_URL, "emoji": True, "sticker_sha256": _DIGEST},
-        {"type": "image", "url": _FACE_URL, "emoji": True},
-    ]
+    assert segments == [_STICKER, _FACE]
 
 
-def test_empty_typed_result_does_not_emit_image_or_receipt() -> None:
+@pytest.mark.parametrize("picked", [ResolvedSticker("", _CONTENT), ResolvedSticker(_DIGEST, "")])
+def test_a_pick_missing_either_digest_emits_nothing(picked: ResolvedSticker) -> None:
     async def resolve(name: str):
-        return emoji.ResolvedSticker("", _DIGEST)
+        return picked
 
     renderer = emoji.EmojiRenderer(sticker_resolver=resolve)
     assert asyncio.run(renderer.process_emojis("[表情:本地]", FaceBot(), [])) == []
@@ -180,14 +179,12 @@ def test_the_library_can_come_before_a_favourite_of_the_same_name() -> None:
     bot = FaceBot(faces=[{"name": "开心", "url": _FACE_URL}])
 
     async def resolve(name: str):
-        return emoji.ResolvedSticker(_LOCAL_URL, _DIGEST)
+        return _PICKED
 
     renderer = emoji.EmojiRenderer(sticker_resolver=resolve)
-    segments = asyncio.run(renderer.process_emojis(
-        "[表情:开心]", bot, [], lookup=(emoji.EMOJI_LIBRARY, emoji.EMOJI_NATIVE),
-    ))
+    segments = asyncio.run(renderer.process_emojis("[表情:开心]", bot, [], lookup=(EMOJI_LIBRARY, EMOJI_NATIVE)))
 
-    assert segments == [{"type": "image", "url": _LOCAL_URL, "emoji": True, "sticker_sha256": _DIGEST}]
+    assert segments == [_STICKER]
     # 图库先命中，就不必再去拉收藏列表。
     assert bot.calls == []
 
@@ -196,11 +193,9 @@ def test_a_library_miss_still_falls_back_to_the_favourite() -> None:
     bot = FaceBot(faces=[{"name": "开心", "url": _FACE_URL}])
 
     async def resolve(name: str):
-        return ""
+        return None
 
     renderer = emoji.EmojiRenderer(sticker_resolver=resolve)
-    segments = asyncio.run(renderer.process_emojis(
-        "[表情:开心]", bot, [], lookup=(emoji.EMOJI_LIBRARY, emoji.EMOJI_NATIVE),
-    ))
+    segments = asyncio.run(renderer.process_emojis("[表情:开心]", bot, [], lookup=(EMOJI_LIBRARY, EMOJI_NATIVE)))
 
-    assert segments == [{"type": "image", "url": _FACE_URL, "emoji": True}]
+    assert segments == [_FACE]

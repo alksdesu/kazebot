@@ -55,7 +55,7 @@ def _prepared_sticker_plan(digest: str = "a" * 64) -> dict[str, Any]:
     return {
         "processed_segments": [
             {"type": "text", "content": "synthetic test body"},
-            {"type": "image", "sticker_sha256": digest, "content_sha256": "b" * 64},
+            {"type": "sticker", "sha256": digest, "content_sha256": "b" * 64},
         ],
         "send_identity": "frozen-send-digest", "selected_images": [digest],
         "conversation_key": "synthetic-conversation", "quoted": True,
@@ -339,6 +339,8 @@ def test_message_plan_keys_bind_raw_body_index_target_and_replay_generation(tmp_
     {"type": "image", "content": "C:/synthetic.png"},
     {"type": "image", "sticker_sha256": "a" * 64, "data": {"file": "base64://c2VjcmV0"}},
     {"type": "image", "sticker_sha256": "not-a-sha"},
+    {"type": "image", "emoji": True, "sticker_sha256": "a" * 64, "content_sha256": "b" * 64},
+    {"type": "native_emoji", "platform": "qq", "ref": "C:/synthetic.png"},
 ])
 def test_message_plan_rejects_inline_images_or_invalid_references(tmp_path: Path, image: dict[str, Any]) -> None:
     async def exercise() -> None:
@@ -530,7 +532,7 @@ def test_message_plan_freezes_favorite_url_and_mixed_library_images(tmp_path: Pa
     async def exercise() -> None:
         store = OneBotIdempotencyStore(tmp_path / "favorites.sqlite3")
         prepared = _prepared_sticker_plan()
-        favorite = {"type": "image", "url": "https://synthetic.invalid/favorite.png"}
+        favorite = {"type": "native_emoji", "platform": "qq", "ref": "https://synthetic.invalid/favorite.png"}
         prepared["processed_segments"] = [favorite, *prepared["processed_segments"]] if mixed else [favorite]
         prepared["selected_images"] = prepared["selected_images"] if mixed else []
         plan = await store.get_or_create_message_plan("favorite-key", {"type": "group", "group_id": 1}, lambda: asyncio.sleep(0, result=prepared))

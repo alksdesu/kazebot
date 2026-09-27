@@ -1,6 +1,6 @@
 """QQ 的出站标记写法、收藏表情与输出文本清理。
 
-标记解析在 adapters/_shared/outbound.py；这里补 QQ 自己的写法，把解析出的段渲染成 OneBot 消息段描述，
+标记解析在 adapters/_shared/outbound.py；这里补 QQ 自己的写法，把解析出的段渲染成待发的段，
 收藏表情走 NapCat 的私有接口。
 """
 from __future__ import annotations
@@ -11,9 +11,8 @@ import os
 import random
 import re
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 from adapters._shared.outbound import (
     EMOJI_LIBRARY,
@@ -22,10 +21,13 @@ from adapters._shared.outbound import (
     REACT_MARKER,
     MarkerGrammar,
     MentionPiece,
+    ResolvedSticker,
     TextPiece,
     mention_as_text,
+    native_emoji_segment,
     resolve_mention,
     split_mention_tokens,
+    sticker_segment,
     strip_markup,
     tokenize,
 )
@@ -47,16 +49,10 @@ def has_emoji_markers(text: str) -> bool:
     return QQ_MARKERS.has_emoji(text)
 
 
-@dataclass(frozen=True)
-class ResolvedSticker:
-    url: str
-    sha256: str
-
-
 # 输入别名/显示名，返回真实 QQ 号字符串；解析不到返回 None。
 AtAliasResolver = Callable[[str], Optional[str]]
-# 表情包名 -> 可发送地址。和收藏表情谁先问由查找顺序定。
-StickerResolver = Callable[[str], Awaitable[Union[ResolvedSticker, str, None]]]
+# 表情包名 -> 图库里挑中的一张，挑不出返回 None。和收藏表情谁先问由查找顺序定。
+StickerResolver = Callable[[str], Awaitable[Optional[ResolvedSticker]]]
 
 
 # fetch_custom_face_detail 在 NapCat 中会返回 QQ 收藏表情详情。该列表一般不会在一轮
@@ -655,9 +651,10 @@ class EmojiRenderer:
         strip_markdown_styles: bool | None = None,
         lookup: Sequence[str] = (EMOJI_NATIVE, EMOJI_LIBRARY),
     ) -> List[Dict[str, Any]]:
-        """把一条回复渲染成 OneBot 消息段描述：先剥掉渲染不了的写法，再按共享解析切出的段逐个渲染。
+        """把一条回复渲染成待发的段：先剥掉渲染不了的写法，再按共享解析切出的段逐个渲染。
 
-        表情名按 lookup 的先后去收藏表情和表情包库里找。返回 dict 而不是 MessageSegment，这个模块才不用依赖 NoneBot。
+        表情名按 lookup 的先后去收藏表情和表情包库里找，出平台表情段或表情包段，发送时才翻成 OneBot 图片。
+        返回 dict 而不是 MessageSegment，这个模块才不用依赖 NoneBot。
         """
         text = strip_output_markers(
             text,
@@ -676,47 +673,43 @@ class EmojiRenderer:
                 segments.extend(self.mention_segments(piece))
                 continue
 
-            name = piece.name
-            url, sticker_sha256 = await self._resolve_emoji(name, faces, lookup)
-            if url:
-                # emoji=True 发送时变成 image 的 sub_type=1，客户端按表情小图渲染，不当普通大图。
-                segment = {"type": "image", "url": url, "emoji": True}
-                if sticker_sha256:
-                    segment["sticker_sha256"] = sticker_sha256
+            segment = await self._resolve_emoji(piece.name, faces, lookup)
+            if segment is not None:
                 segments.append(segment)
             else:
                 # 名字对不上说明是模型臆造的，留占位等于把内部格式发给用户，而提示词
                 # 里正要求不要暴露它。丢掉标记只丢一个编出来的名字，留日志便于发现。
-                logger.info("custom face not found, marker dropped: %s", name)
+                logger.info("custom face not found, marker dropped: %s", piece.name)
 
         return segments
 
-    async def _resolve_emoji(self, name: str, faces: "_FaceLookup", lookup: Sequence[str]) -> tuple[str, str]:
-        """按查找顺序找一个表情名，返回（地址, 表情包库里的哈希）；收藏表情没有哈希。"""
+    async def _resolve_emoji(
+        self, name: str, faces: "_FaceLookup", lookup: Sequence[str],
+    ) -> Optional[Dict[str, str]]:
+        """按查找顺序找一个表情名：收藏表情出平台表情段，图库出表情包段。"""
         for source in lookup:
             if source == EMOJI_NATIVE:
                 url = await faces.url(name)
                 if url:
-                    return url, ""
+                    return native_emoji_segment(QQ_NAPCAT.id, url)
             elif source == EMOJI_LIBRARY:
-                url, digest = await self._library_sticker(name)
-                if url:
-                    return url, digest
-        return "", ""
+                sticker = await self._library_sticker(name)
+                if sticker is not None:
+                    return sticker_segment(sticker.sha256, sticker.content_sha256)
+        return None
 
-    async def _library_sticker(self, name: str) -> tuple[str, str]:
+    async def _library_sticker(self, name: str) -> Optional[ResolvedSticker]:
         if self.sticker_resolver is None:
-            return "", ""
+            return None
         try:
             resolved = await self.sticker_resolver(name)
         except Exception:
             logger.warning("sticker resolve failed: %s", name, exc_info=True)
-            return "", ""
-        if isinstance(resolved, ResolvedSticker):
-            return resolved.url, resolved.sha256
-        if isinstance(resolved, str):
-            return resolved, ""
-        return "", ""
+            return None
+        # 缺了内容哈希，发送前就核对不了选中的还是不是这张图。
+        if isinstance(resolved, ResolvedSticker) and resolved.sha256 and resolved.content_sha256:
+            return resolved
+        return None
 
 
 class _FaceLookup:

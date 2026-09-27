@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
+from adapters._shared.outbound import SEGMENT_NATIVE_EMOJI, SEGMENT_STICKER
 from clonoth_sdk.types import DeliveryContext as OutboundSendContext
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,58 @@ class MessagePlan:
     platform_message_id: str = ""
 
 
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+_WEB_PREFIXES = ("https://", "http://")
+_INLINE_IMAGE_PREFIXES = ("base64://", "data:image/")
+_PLAN_MEDIA_SEGMENTS = frozenset({"image", SEGMENT_STICKER, SEGMENT_NATIVE_EMOJI})
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and _SHA256_HEX.fullmatch(value) is not None
+
+
+def _carries_inline_image(segment: Mapping[str, Any]) -> bool:
+    remaining: list[Any] = [segment]
+    visited: set[int] = set()
+    while remaining:
+        value = remaining.pop()
+        if isinstance(value, (dict, list)):
+            if id(value) in visited:
+                continue
+            visited.add(id(value))
+            remaining.extend(value.values() if isinstance(value, dict) else value)
+        elif isinstance(value, str) and value.lower().startswith(_INLINE_IMAGE_PREFIXES):
+            return True
+    return False
+
+
+def _portable_emoji_ref(ref: Any) -> bool:
+    # Plans are replayed after restarts: keep URLs or platform ids, never inline data or local paths.
+    if not isinstance(ref, str) or not ref.strip():
+        return False
+    lowered = ref.strip().lower()
+    if lowered.startswith(_WEB_PREFIXES):
+        return True
+    return not lowered.startswith(("base64:", "data:", "file:")) and not any(sep in ref for sep in "/\\")
+
+
+def _check_plan_segment(segment: Mapping[str, Any]) -> None:
+    kind = str(segment.get("type") or "")
+    if kind not in _PLAN_MEDIA_SEGMENTS:
+        return
+    if _carries_inline_image(segment):
+        raise SendContractError("message plans cannot persist inline image data")
+    if kind == SEGMENT_STICKER:
+        if not (_is_sha256(segment.get("sha256")) and _is_sha256(segment.get("content_sha256"))):
+            raise SendContractError("plan stickers need their library and content SHA-256 digests")
+    elif kind == SEGMENT_NATIVE_EMOJI:
+        platform = segment.get("platform")
+        if not isinstance(platform, str) or not platform.strip() or not _portable_emoji_ref(segment.get("ref")):
+            raise SendContractError("plan native emoji needs a platform and a URL or platform id")
+    elif not str(segment.get("url") or segment.get("content") or "").lower().startswith(_WEB_PREFIXES):
+        raise SendContractError("plan images must be URLs; library pictures belong in sticker segments")
+
+
 def _plan_payload(prepared: Mapping[str, Any]) -> str:
     if not isinstance(prepared, Mapping):
         raise SendContractError("message plan builder must return an object")
@@ -153,39 +206,14 @@ def _plan_payload(prepared: Mapping[str, Any]) -> str:
     quoted = prepared.get("quoted", False)
     if not isinstance(segments, list) or any(not isinstance(item, dict) for item in segments):
         raise SendContractError("message plan requires processed segment objects")
-    if not isinstance(digests, list) or any(
-        not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{64}", item) for item in digests
-    ):
+    if not isinstance(digests, list) or not all(_is_sha256(item) for item in digests):
         raise SendContractError("message plan requires SHA-256 image references")
     if not isinstance(identity, str) or not identity or not isinstance(conversation, str):
         raise SendContractError("message plan requires a send identity and conversation key")
     if not isinstance(quoted, bool):
         raise SendContractError("message plan quoted flag must be boolean")
     for item in segments:
-        if str(item.get("type") or "") != "image":
-            continue
-        remaining: list[Any] = [item]
-        visited: set[int] = set()
-        while remaining:
-            value = remaining.pop()
-            if isinstance(value, (dict, list)):
-                if id(value) in visited:
-                    continue
-                visited.add(id(value))
-            if isinstance(value, dict):
-                remaining.extend(value.values())
-            elif isinstance(value, list):
-                remaining.extend(value)
-            elif isinstance(value, str) and value.lower().startswith(("base64://", "data:image/")):
-                raise SendContractError("message plans cannot persist inline image data")
-        content = str(item.get("url") or item.get("content") or "")
-        if content and not content.lower().startswith(("https://", "http://")):
-            raise SendContractError("local plan images must use SHA-256 references, not inline data or paths")
-        if not content and not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sticker_sha256") or "")):
-            raise SendContractError("local plan image is missing its SHA-256 reference")
-        for name in ("sticker_sha256", "content_sha256"):
-            if name in item and not re.fullmatch(r"[0-9a-f]{64}", str(item[name])):
-                raise SendContractError("invalid message plan image digest")
+        _check_plan_segment(item)
     payload = {
         "processed_segments": segments, "send_identity": identity,
         "selected_images": digests, "conversation_key": conversation, "quoted": quoted,

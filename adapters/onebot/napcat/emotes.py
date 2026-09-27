@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import asyncio
-import base64
 import contextlib
 import hashlib
 import random
@@ -15,9 +14,9 @@ from platforms.ids import normalize_id
 from platforms.inbound import InboundFacts
 from ..config import CLONOTH_WORKSPACE, CUSTOM_FACE_METADATA_PATH, CUSTOM_FACE_NAMES_PATH
 from ..live_config import live
+from adapters._shared.outbound import ResolvedSticker, planned_stickers, sticker_segment
 from adapters._shared.send_guard import OutboundSendContext
 from ..emoji_handler import (
-    ResolvedSticker,
     extract_named_custom_face_metadata,
     extract_named_custom_face_names,
     load_custom_face_metadata,
@@ -203,13 +202,14 @@ async def _sticker_receipts_forever() -> None:
         await asyncio.sleep(10)
 
 
-async def _resolve_sticker(name: str) -> ResolvedSticker | str:
+async def _resolve_sticker(name: str) -> ResolvedSticker | None:
+    """按名字、再按标签挑一张；读一遍文件只为确认发得出去，并记下这一刻的内容哈希。"""
     store = _sticker_store_handle()
     if store is None:
-        return ""
+        return None
     try:
         if not await _reconcile_sticker_receipts():
-            return ""
+            return None
         key = state._adapter.sticker_send_conversation.get("")
         skip = store.recently_sent(
             key, within_sec=int(live.sticker_repeat_window_sec),
@@ -222,13 +222,11 @@ async def _resolve_sticker(name: str) -> ResolvedSticker | str:
             if raw:
                 if selected is not None:
                     selected.add(row.sha256)
-                return ResolvedSticker(
-                    "base64://" + base64.b64encode(raw).decode("ascii"), row.sha256,
-                )
-        return ""
+                return ResolvedSticker(row.sha256, hashlib.sha256(raw).hexdigest())
+        return None
     except Exception:
         common.logger.warning("表情包取图失败: %s", name, exc_info=True)
-        return ""
+        return None
 
 
 def _sticker_combat_config() -> CombatConfig:
@@ -296,14 +294,11 @@ async def _send_combat_sticker(
 ) -> str:
     async def build_plan() -> Dict[str, Any]:
         sticker = await _pick_combat_sticker(context_text, context.conversation_key)
-        segments = [{
-            "type": "image", "url": sticker.url, "emoji": True,
-            "sticker_sha256": sticker.sha256,
-        }] if isinstance(sticker, ResolvedSticker) else []
+        segments = [] if sticker is None else [sticker_segment(sticker.sha256, sticker.content_sha256)]
         return {
-            "processed_segments": sending._freeze_sticker_segments(segments),
+            "processed_segments": segments,
             "send_identity": f"combat:{index}",
-            "selected_images": [sticker.sha256] if segments else [],
+            "selected_images": planned_stickers(segments),
             "conversation_key": context.conversation_key,
         }
 
@@ -317,15 +312,15 @@ async def _send_combat_sticker(
         return ""
 
 
-async def _pick_combat_sticker(context_text: str, conversation_key: str) -> ResolvedSticker | str:
-    """按语境挑一张，挑不出就返回空串。"""
+async def _pick_combat_sticker(context_text: str, conversation_key: str) -> ResolvedSticker | None:
+    """按语境挑一张，挑不出就返回 None。"""
     store = _sticker_store_handle()
     if store is None or not context_text.strip():
-        return ""
+        return None
     try:
         usable = [row for row in store.all_usable() if _sticker_file_path(row) is not None]
         if not usable:
-            return ""
+            return None
         recent = store.recently_sent(
             conversation_key, within_sec=int(live.sticker_repeat_window_sec),
         )
@@ -333,19 +328,19 @@ async def _pick_combat_sticker(context_text: str, conversation_key: str) -> Reso
         result = rank(context_text, usable, recently_sent=recent, limit=len(usable))
         # generic 是闲聊闸门：语境不明确时宁可不发。
         if result.generic or result.best is None:
-            return ""
+            return None
         token = state._adapter.sticker_send_conversation.set(conversation_key)
         try:
             for candidate in result.items:
                 sticker = await _resolve_sticker(candidate.name)
-                if sticker:
+                if sticker is not None:
                     return sticker
-            return ""
+            return None
         finally:
             state._adapter.sticker_send_conversation.reset(token)
     except Exception:
         common.logger.debug("表情包接梗选图失败", exc_info=True)
-        return ""
+        return None
 
 
 def _start_sticker_tagger() -> None:

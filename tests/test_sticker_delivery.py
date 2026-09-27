@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -92,7 +93,8 @@ def test_collection_failure_still_sends_local_image_and_text(runtime, kind):
     ))
     assert len(images(bot)) == 1
     assert any(item["data"].get("text") == "正文" for item in bot.sent[0])
-    assert all("sticker_sha256" not in item["data"] for item in bot.sent[0])
+    # 图库哈希只在发送计划里用，不能跟着消息发出去。
+    assert all(not {"sha256", "content_sha256", "sticker_sha256"} & set(item["data"]) for item in bot.sent[0])
     assert store.get(digest).sent_count == 1
 
 
@@ -467,3 +469,69 @@ def test_the_lookup_order_setting_picks_between_a_favourite_and_a_library_sticke
     [sent] = images(bot)
     assert sent.startswith("base64://") is from_library and (sent == favourite) is not from_library
     assert store.get(digest).sent_count == (1 if from_library else 0)
+
+
+def test_a_library_sticker_goes_out_as_an_inline_emoji_image(runtime):
+    _, _, path = add_image(runtime)
+    bot = Bot(runtime)
+
+    asyncio.run(runtime.sending._send_split_text(bot, target(), "[表情:甲]", send_context=context(runtime)))
+
+    [[segment]] = bot.sent
+    assert segment["type"] == "image"
+    assert segment["data"]["file"] == "base64://" + base64.b64encode(path.read_bytes()).decode("ascii")
+    assert segment["data"]["sub_type"] == 1 and segment["data"]["summary"] == "[表情]"
+
+
+def _legacy_and_current_plans(digest, content, favourite):
+    legacy = [
+        {"type": "text", "content": "正文"},
+        {"type": "image", "emoji": True, "sticker_sha256": digest, "content_sha256": content},
+        {"type": "image", "url": favourite, "emoji": True},
+    ]
+    current = [
+        {"type": "text", "content": "正文"},
+        {"type": "sticker", "sha256": digest, "content_sha256": content},
+        {"type": "native_emoji", "platform": "qq", "ref": favourite},
+    ]
+    return legacy, current
+
+
+def test_a_plan_persisted_in_the_old_shape_sends_the_same_message(runtime):
+    _, digest, path = add_image(runtime)
+    legacy, current = _legacy_and_current_plans(
+        digest, hashlib.sha256(path.read_bytes()).hexdigest(), "https://example.invalid/favourite.png",
+    )
+
+    old = asyncio.run(runtime.sending._materialize_sticker_segments(legacy))
+    new = asyncio.run(runtime.sending._materialize_sticker_segments(current))
+
+    assert old == new
+    assert [segment["data"]["sub_type"] for segment in new if segment["type"] == "image"] == [1, 1]
+
+
+def test_an_old_shape_plan_still_refuses_a_changed_file(runtime):
+    _, digest, path = add_image(runtime)
+    legacy, _ = _legacy_and_current_plans(
+        digest, hashlib.sha256(path.read_bytes()).hexdigest(), "https://example.invalid/favourite.png",
+    )
+    path.write_bytes(b"changed image")
+
+    with pytest.raises(runtime.sending.SendContractError):
+        asyncio.run(runtime.sending._materialize_sticker_segments(legacy))
+
+
+def test_another_platforms_native_emoji_is_dropped(runtime):
+    message = runtime.sending._message_from_processed_segments([
+        {"type": "text", "content": "看"},
+        {"type": "native_emoji", "platform": "other_platform", "ref": "wave:1"},
+    ])
+
+    assert [segment["type"] for segment in message] == ["text"]
+
+
+def test_a_sticker_is_only_sent_through_its_plan(runtime):
+    with pytest.raises(runtime.sending.SendContractError):
+        runtime.sending._message_from_processed_segments([
+            {"type": "sticker", "sha256": "a" * 64, "content_sha256": "b" * 64},
+        ])
