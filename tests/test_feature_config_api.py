@@ -281,6 +281,17 @@ class TestState:
         assert _qq(body)["applied"] is False
         assert _qq(body)["reason"] == f"bot 读的是另一份全局文件：{other}"
 
+    def test_the_same_global_file_spelled_another_way_is_not_another_file(self, call: Any, tmp_path: Path) -> None:
+        # bot 和 supervisor 各自拼出的路径写法可以不同，指的是同一个文件就不该拦着。
+        _put(call, _NAME_ON)
+        current = _state(call)["file"]
+        detour = tmp_path / "config" / ".." / "config" / "features.yaml"
+        _publish_qq(tmp_path, defaults=_defaults(tmp_path, current, config_path=detour))
+
+        body = _state(call)
+
+        assert _qq(body)["applied"] is True and "reason" not in _qq(body)
+
     def test_a_broken_file_keeps_the_last_good_values_and_reads_as_pending(self, call: Any, tmp_path: Path) -> None:
         _put(call, _NAME_ON)
         assert _state(call)["state"]["values"]["signal_name"] is True

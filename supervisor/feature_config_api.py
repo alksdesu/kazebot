@@ -5,19 +5,18 @@
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from platforms.descriptor import PlatformDescriptor
+from platforms.live import live_status, read_live_state, same_file
 from platforms.registry import all_platforms, features_module
 
 from . import config_files
 from .admin_api import verify_admin_token
 from .config_files import RawConfig
-from .platform_api import live_state, publication_age
 
 
 def features_file(workspace_root: Path) -> Path:
@@ -42,7 +41,7 @@ def _unknown_detail(workspace_root: Path, unknown: list[str]) -> str:
     """拒收的路径里是某个平台专属项的，指明该写进哪个平台的配置文件。"""
     owners: dict[str, list[str]] = {}
     for platform in all_platforms():
-        published = live_state(workspace_root, platform).get("paths")
+        published = read_live_state(platform, workspace_root).get("paths")
         if not isinstance(published, dict):
             continue
         for path in sorted(set(unknown) & set(published.values())):
@@ -57,27 +56,21 @@ def _unknown_detail(workspace_root: Path, unknown: list[str]) -> str:
     return "；".join(parts)
 
 
-def _same_file(published: Any, path: Path) -> bool:
-    if not isinstance(published, str) or not published:
-        return False
-    return os.path.normcase(os.path.abspath(published)) == os.path.normcase(os.path.abspath(path))
-
-
 def platform_adoption(
     workspace_root: Path, platform: PlatformDescriptor, path: Path, current: dict[str, Any],
 ) -> dict[str, Any]:
     """这个平台的 bot 是否已经换上当前这份全局文件。"""
     entry: dict[str, Any] = {"id": platform.id, "display_name": platform.display_name}
-    state = live_state(workspace_root, platform)
+    state = read_live_state(platform, workspace_root)
     if not state:
         return {**entry, "published": False, "applied": False, "reason": "bot 进程尚未公布生效配置"}
-    age_sec, stale = publication_age(state)
-    entry.update(published=True, age_sec=age_sec, stale=stale)
+    status = live_status(state)
+    entry.update(published=True, age_sec=status.age_sec, stale=status.stale)
     defaults = state.get("defaults")
     if not isinstance(defaults, dict):
         return {**entry, "applied": False, "reason": "这个 bot 的版本还不读全局文件，更新并重启之后才会生效"}
     seen = defaults.get("config_path")
-    if not _same_file(seen, path):
+    if not same_file(seen, path):
         return {**entry, "applied": False, "reason": f"bot 读的是另一份全局文件：{seen}"}
     # 和平台那边一样比 loaded：文件写坏时 bot 看到的指纹等于当前文件，用的却还是上一份。
     return {**entry, "applied": defaults.get("loaded") == current}

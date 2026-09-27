@@ -583,6 +583,30 @@ export function useRuntime(): PlatformRuntimeFacts {
   return useConsoleStore((state) => state.live?.state?.runtime || NO_RUNTIME);
 }
 
+/** 各平台 live 状态都有的链路事实：连没连上、当前账号、积压条数。 */
+export interface LinkFacts {
+  connected: boolean;
+  account: string;
+  backlog: number;
+}
+
+export function readLinkFacts(state: ConsoleState): LinkFacts {
+  const published = state.live?.state;
+  const backlog = Number(published?.backlog ?? 0);
+  return {
+    connected: published?.connected === true,
+    account: typeof published?.account === 'string' ? published.account : '',
+    backlog: Number.isFinite(backlog) && backlog > 0 ? backlog : 0,
+  };
+}
+
+export function useLinkFacts(): LinkFacts {
+  const connected = useConsoleStore((state) => readLinkFacts(state).connected);
+  const account = useConsoleStore((state) => readLinkFacts(state).account);
+  const backlog = useConsoleStore((state) => readLinkFacts(state).backlog);
+  return { connected, account, backlog };
+}
+
 /** 三态开关要能区分「没配」和「配成 false」，所以 null 不能被 fallback 吃掉。
  *
  * 抽成纯函数才测得到：hook 里那一层只是 store 订阅。 */

@@ -15,6 +15,8 @@ from fastapi.testclient import TestClient
 
 from clonoth_sdk.feature_paths import validate_feature_path
 from engine.eventlog_rotation import eventlog_file_lock
+from platforms.builtin import QQ_NAPCAT
+from platforms.registry import platform_config_path
 from providers import registry
 from providers.base import ProviderResponse
 from supervisor.admin_api import create_admin_router
@@ -130,7 +132,7 @@ def test_retired_template_routes_cannot_write_explicit_instance_config(operation
     monkeypatch.setenv("CLONOTH_QQ_CONFIG_PATH", str(target))
     app = FastAPI()
     app.include_router(create_router(state))
-    assert state.operations.qq_file == target
+    assert platform_config_path(QQ_NAPCAT, state.workspace_root) == target
     before = workspace_state(tmp_path)
     with TestClient(app) as client:
         response = client.request(method, path, headers={"Authorization": "Bearer synthetic-operations-token"},
@@ -185,12 +187,12 @@ def test_stale_or_future_heartbeat_does_not_claim_live_qq_connection(tmp_path, a
     operations, _ = service(tmp_path)
     live = tmp_path / "data/qq_live_state.json"
     live.parent.mkdir(parents=True)
-    live.write_text(json.dumps({"published_at": time.time() - age, "runtime": {"onebot_connected": True}}))
-    status = operations.status()
+    live.write_text(json.dumps({"published_at": time.time() - age, "connected": True}))
+    status = next(item for item in operations.status()["platforms"] if item["id"] == "qq")
     assert status["adapter_online"] is False
-    assert status["onebot_connected"] is not True
+    assert status["connected"] is not True
     report = asyncio.run(operations.diagnose())
-    assert next(item for item in report["checks"] if item["name"] == "OneBot连接")["status"] != "passed"
+    assert next(item for item in report["checks"] if item["name"] == "QQ · NapCat 连接")["status"] != "passed"
 
 
 @pytest.mark.parametrize("provider_name,limit_option", [("openai", "max_completion_tokens"), ("gemini", "max_output_tokens"), ("anthropic", "max_tokens")])

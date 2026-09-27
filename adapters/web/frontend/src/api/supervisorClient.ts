@@ -1500,6 +1500,12 @@ export interface ConfigLiveState {
   applied?: boolean;
   file: ConfigFileFingerprint;
   state?: {
+    /** 平台连没连上。下面三项是各平台 live 状态都有的，平台自己的事实在 runtime 里。 */
+    connected?: boolean;
+    /** 当前登录的平台账号，还没登录过是空串。 */
+    account?: string;
+    /** 等着处理的消息条数。 */
+    backlog?: number;
     config_path?: string;
     parse_error?: string;
     /** 这份快照是哪一层：global 或 platform。 */
@@ -1543,7 +1549,6 @@ export interface PlatformCapability {
 /** 配置之外、只有 bot 进程知道的事。密钥只报「设没设」，永不回传值。 */
 export interface PlatformRuntimeFacts {
   pid?: number;
-  onebot_connected?: boolean;
   queue_workers_running?: number;
   forward_bridge_running?: boolean;
   forward_bridge_endpoint?: string;
@@ -1555,7 +1560,6 @@ export interface PlatformRuntimeFacts {
     hash_secret_set?: boolean;
   };
   volatile?: {
-    queue_pending?: number;
     cached_groups?: number;
     history_gap_groups?: number;
   };

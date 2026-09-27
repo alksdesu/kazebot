@@ -219,6 +219,8 @@ class PlatformDescriptor:
     display_name: str
     # 称呼这个平台的用户时用的前缀，比如提醒署名「QQ 12345」。
     short_name: str
+    # 诊断里「连接」这一项没通过时让人先查什么；空串用通用的说法。
+    connection_hint: str = ""
     # platform_auth.platform 的历史取值，读到它们都算这个平台。
     aliases: frozenset[str] = frozenset()
     channels: tuple[ChannelDescriptor, ...] = ()

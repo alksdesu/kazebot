@@ -26,9 +26,8 @@ from ..live_config import RECONCILED_KEYS, live, state_payload as live_config_st
 from ..emoji_handler import load_bqbs
 from adapters._shared.user_profiles import load_profiles
 from clonoth_sdk import BotConfig, ClonothClient, EventRouter, SessionState
+from platforms import live as platform_live
 from platforms.builtin import QQ_NAPCAT
-from platforms.descriptor import STATE_LIVE
-from platforms.registry import platform_state_path
 
 from . import anonymize, callbacks, common, emotes, forward_bridge, identity, inbound, media, models, proactive, queueing, routing, state
 
@@ -37,10 +36,6 @@ logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
 # 热载键落到运行期对象上的对齐周期。停等一次 stat 的代价换「改完两秒内生效」。
 _LIVE_RECONCILE_INTERVAL_SEC = 2.0
-
-
-# 快照没变也定期重写一次，supervisor 靠这个时间戳判断 bot 进程是不是还活着。
-_LIVE_STATE_HEARTBEAT_SEC = 30.0
 
 
 def _reconcile_group_history_capacity() -> bool:
@@ -97,23 +92,32 @@ async def _reconcile_forward_bridge() -> bool:
 
 
 def _live_state_file() -> Path:
-    return platform_state_path(QQ_NAPCAT, STATE_LIVE, Path(CLONOTH_WORKSPACE))
+    return platform_live.live_state_path(QQ_NAPCAT, Path(CLONOTH_WORKSPACE))
 
 
-def _live_runtime_facts() -> Dict[str, Any]:
-    """配置之外、只有 bot 进程知道的运行期事实。
-
-    volatile 里的计数每时每刻都在动，单独一层是为了让 dedup 只看会长期稳定的部分。
-    """
+def _live_link_facts() -> Dict[str, Any]:
+    """live 状态约定里各平台都有的几项：连没连上 NapCat、当前账号、排队条数。"""
     try:
         # 没有 OneBot 实现连上来时 get_bot() 抛，这不是错误，是「NapCat 还没连」。
         # 也要挡住返回 None 的情况，否则「没连」会被报成「已连」。
-        onebot_connected = get_bot() is not None
+        connected = get_bot() is not None
     except Exception:
-        onebot_connected = False
+        connected = False
+    return {
+        platform_live.CONNECTED: connected,
+        # 迁移功能靠它认「当前号」。空串 = 还没连上过任何账号，此时全部会话键都没作用域。
+        platform_live.ACCOUNT: routing._active_bot_scope(),
+        platform_live.BACKLOG: len(state._adapter.qq_queue),
+    }
+
+
+def _live_runtime_facts() -> Dict[str, Any]:
+    """配置之外、只有 bot 进程知道、只有 QQ 自己的界面读的运行期事实。
+
+    volatile 里的计数每时每刻都在动，单独一层是为了让 dedup 只看会长期稳定的部分。
+    """
     return {
         "pid": os.getpid(),
-        "onebot_connected": onebot_connected,
         "queue_workers_running": len([t for t in state._adapter.qq_queue_tasks.values() if not t.done()]),
         "forward_bridge_running": bool(state._adapter.forward_bridge_started),
         "forward_bridge_endpoint": f"http://{FORWARD_BRIDGE_HOST}:{FORWARD_BRIDGE_PORT}/qq_forward",
@@ -127,10 +131,7 @@ def _live_runtime_facts() -> Dict[str, Any]:
             "hash_secret_set": bool(CONVERSATION_HASH_SECRET),
             "conversation_digest_salted": anonymize.CONVERSATION_DIGEST_SALTED,
         },
-        # 迁移功能靠它认「当前号」。空串 = 还没连上过任何账号，此时全部会话键都没作用域。
-        "bot_scope": routing._active_bot_scope(),
         "volatile": {
-            "queue_pending": len(state._adapter.qq_queue),
             "cached_groups": len(state._adapter.group_history),
             "history_gap_groups": len(state._adapter.group_history.gapped_channels()),
         },
@@ -194,26 +195,25 @@ def _publish_live_state(*, force: bool = False) -> None:
     「界面显示已生效、进程其实没读到」正是热重载最需要防的那种假象。
     """
     payload: Dict[str, Any] = live_config_state_payload()
-    payload["runtime"] = _live_runtime_facts()
+    payload.update(_live_link_facts())
+    payload[platform_live.RUNTIME] = _live_runtime_facts()
     _seed_group_names()
     payload["group_names"] = dict(state._adapter.group_names)
     payload["scope_conversation_keys"] = routing._current_scope_keys()
     signature = json.dumps(
-        {k: v for k, v in payload.items() if k != "runtime"}
-        | {k: v for k, v in payload["runtime"].items() if k != "volatile"},
+        {k: v for k, v in payload.items() if k not in platform_live.VOLATILE_FIELDS and k != platform_live.RUNTIME}
+        | {k: v for k, v in payload[platform_live.RUNTIME].items() if k != "volatile"},
         ensure_ascii=False, sort_keys=True,
     )
     now = time.time()
-    if not force and signature == state._adapter.live_state_signature and now - state._adapter.live_state_published_at < _LIVE_STATE_HEARTBEAT_SEC:
+    since = now - state._adapter.live_state_published_at
+    # 时钟往回拨过时上次的时间戳在将来，supervisor 不认，得马上重写，不能等它追上。
+    if not force and signature == state._adapter.live_state_signature and 0 <= since < platform_live.HEARTBEAT_SEC:
         return
-    payload["published_at"] = now
+    payload[platform_live.PUBLISHED_AT] = now
     path = _live_state_file()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # 先写同目录 tmp 再 replace：supervisor 随时可能在读，不能让它读到半截 JSON。
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        platform_live.write_live_state(path, payload)
     except OSError:
         common.logger.warning("failed to publish QQ live state to %s", path, exc_info=True)
         return

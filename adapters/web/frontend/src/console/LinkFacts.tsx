@@ -11,14 +11,15 @@ import {
   Panel,
   ReadOnlyRow,
 } from './components';
-import { useLiveValue, useRuntime } from './consoleStore';
+import { useLinkFacts, useLiveValue, useRuntime } from './consoleStore';
 
 export const QueueFacts = () => {
   const runtime = useRuntime();
+  const link = useLinkFacts();
   const wanted = useLiveValue<number>('queue_workers', 0);
   const enabled = useLiveValue<boolean>('enable_queue', false);
   const running = runtime.queue_workers_running ?? 0;
-  const pending = runtime.volatile?.queue_pending ?? 0;
+  const pending = link.backlog;
   if (!enabled) return null;
   return (
     <Facts>

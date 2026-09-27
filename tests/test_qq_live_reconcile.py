@@ -429,6 +429,32 @@ class TestPublishedState:
 
         assert self._read(runtime)["published_at"] > 0
 
+    def test_the_link_facts_sit_at_the_top_where_every_platform_puts_them(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(runtime.state._adapter, "active_bot_scope", "10001")
+        asyncio.run(runtime.state._adapter.qq_queue.put(
+            "conv-a", _queued(runtime, "conv-a"),
+            identity_of=lambda queued: None, merge=runtime.queueing._merge_queued_inbound,
+        ))
+
+        runtime.lifecycle._publish_live_state(force=True)
+
+        state = self._read(runtime)
+        assert (state["connected"], state["account"], state["backlog"]) == (False, "10001", 1)
+
+    def test_a_new_account_triggers_a_rewrite(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 迁移和归属查询按它认当前号，换了号还要等心跳才写出去，这段时间里认的是旧号。
+        runtime.lifecycle._publish_live_state(force=True)
+        writes = self._count_writes(runtime, monkeypatch)
+        monkeypatch.setattr(runtime.state._adapter, "active_bot_scope", "10002")
+
+        runtime.lifecycle._publish_live_state()
+
+        assert len(writes) == 1 and self._read(runtime)["account"] == "10002"
+
     def _count_writes(self, runtime: Any, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
         """数真实落盘次数。
 
@@ -491,6 +517,19 @@ class TestPublishedState:
         runtime.lifecycle._publish_live_state()
 
         assert len(writes) == 1
+
+    def test_a_clock_that_went_back_rewrites_at_once(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """上次的时间戳在将来，supervisor 不当它是心跳；等时钟追上要等到拨回去的那么久。"""
+        runtime.lifecycle._publish_live_state(force=True)
+        writes = self._count_writes(runtime, monkeypatch)
+        future = runtime.state._adapter.live_state_published_at + 3600
+        monkeypatch.setattr(runtime.state._adapter, "live_state_published_at", future)
+
+        runtime.lifecycle._publish_live_state()
+
+        assert len(writes) == 1 and self._read(runtime)["published_at"] < future
 
     def test_it_leaves_no_temp_file_behind(self, runtime: Any) -> None:
         runtime.lifecycle._publish_live_state(force=True)

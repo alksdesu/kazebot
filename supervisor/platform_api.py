@@ -5,29 +5,25 @@ supervisor 不自己算生效值 —— bot 是独立进程，env 可能和这�
 """
 from __future__ import annotations
 
-import json
-import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from platforms.descriptor import HOOK_CONSOLE_SCHEMA, HOOK_TRIGGER_POLICY, STATE_LIVE, PlatformDescriptor
+from platforms.descriptor import HOOK_CONSOLE_SCHEMA, HOOK_TRIGGER_POLICY, PlatformDescriptor
+from platforms.live import file_fingerprint, live_status, read_live_state, same_file
 from platforms.registry import (
     all_platforms,
     features_module,
     get_platform,
     platform_config_path,
     platform_hook,
-    platform_state_path,
 )
 
 from . import config_files, platform_trigger
 from .admin_api import verify_admin_token
 from .config_files import RawConfig
 
-# bot 至少每 30 秒重写一次 live 状态，留三倍余量再判定失联。
-_STALE_AFTER_SEC = 90.0
 _DRY_RUN_LIMIT = 200
 
 
@@ -45,27 +41,36 @@ def config_file(workspace_root: Path, platform: PlatformDescriptor) -> Path:
     return path
 
 
-def live_state(workspace_root: Path, platform: PlatformDescriptor) -> dict[str, Any]:
-    try:
-        data = json.loads(platform_state_path(platform, STATE_LIVE, workspace_root).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def published_states(workspace_root: Path) -> dict[str, dict[str, Any]]:
     """各平台 bot 最近一次公布的生效快照，按平台 id。失联的也算：写在配置和 env 里的设置不随 bot 停下而消失。"""
     return {
         platform.id: state
         for platform in all_platforms()
-        if (state := live_state(workspace_root, platform))
+        if (state := read_live_state(platform, workspace_root))
     }
 
 
-def publication_age(state: Mapping[str, Any]) -> tuple[float, bool]:
-    """live 状态公布了多久，以及是否久到该当 bot 失联。"""
-    age_sec = max(0.0, time.time() - float(state.get("published_at") or 0.0))
-    return round(age_sec, 3), age_sec > _STALE_AFTER_SEC
+def platform_health(workspace_root: Path, platform: PlatformDescriptor) -> dict[str, Any]:
+    """按 live 状态约定给出一个平台的链路健康。诊断和运维状态都用它，不认平台 runtime 里自己的字段。"""
+    status = live_status(read_live_state(platform, workspace_root))
+    path = platform_config_path(platform, workspace_root)
+    mismatch = bool(path is not None and status.config_path and not same_file(status.config_path, path))
+    return {
+        "id": platform.id,
+        "display_name": platform.display_name,
+        "published": status.published,
+        "adapter_online": status.fresh,
+        "connected": status.connected,
+        "account": status.account,
+        "heartbeat_age": status.age_sec,
+        "backlog": status.backlog,
+        # 没有热载配置的平台谈不上生效没生效，给 None。
+        "config_applied": None if path is None else (
+            status.fresh and not mismatch and status.config_loaded == file_fingerprint(path)
+        ),
+        "config_path_mismatch": mismatch,
+        "parse_error": status.parse_error,
+    }
 
 
 def read_config_raw(workspace_root: Path, platform: PlatformDescriptor) -> dict[str, Any]:
@@ -106,7 +111,7 @@ def write_config_raw(workspace_root: Path, platform: PlatformDescriptor, content
         features = _shown_path(features_module().features_config_path(workspace_root), workspace_root)
         raise HTTPException(status_code=400, detail=f"只能写在全局设置 {features} 里：{misplaced}")
     warnings: list[str] = []
-    known = live_state(workspace_root, platform).get("paths")
+    known = read_live_state(platform, workspace_root).get("paths")
     if isinstance(known, dict) and known:
         unknown = config_files.unknown_paths(document, known.values())
         if unknown:
@@ -118,19 +123,19 @@ def write_config_raw(workspace_root: Path, platform: PlatformDescriptor, content
 
 
 def config_state(workspace_root: Path, platform: PlatformDescriptor) -> dict[str, Any]:
-    state = live_state(workspace_root, platform)
-    fingerprint = config_files.fingerprint(config_file(workspace_root, platform))
+    state = read_live_state(platform, workspace_root)
+    fingerprint = file_fingerprint(config_file(workspace_root, platform))
     if not state:
         return {
             "published": False,
             "reason": "bot 进程尚未公布生效配置（未启动，或还没跑完第一轮对齐）",
             "file": fingerprint,
         }
-    age_sec, stale = publication_age(state)
+    status = live_status(state)
     return {
         "published": True,
-        "age_sec": age_sec,
-        "stale": stale,
+        "age_sec": status.age_sec,
+        "stale": status.stale,
         # 「已生效」的判据是 bot 跑着的那份值确实来自当前这个文件版本。
         # 不能拿 state["file"] 比 —— 那是 bot 看到的文件指纹，文件写坏时它照样等于
         # 当前文件，而 bot 用的还是上一份配置。
@@ -165,7 +170,7 @@ def trigger_dry_run(workspace_root: Path, platform: PlatformDescriptor, payload:
 
     values = payload.get("config")
     if not isinstance(values, dict):
-        values = live_state(workspace_root, platform).get("values")
+        values = read_live_state(platform, workspace_root).get("values")
     if not isinstance(values, dict) or not values:
         raise HTTPException(status_code=409, detail="bot 进程尚未公布生效配置，请显式传 config 后再试听")
     try:

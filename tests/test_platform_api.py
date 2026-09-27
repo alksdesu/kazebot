@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -230,3 +231,37 @@ def test_the_dry_run_uses_the_published_values(call, tmp_path: Path) -> None:
 
     assert out.status_code == 200
     assert out.json()["results"][0]["triggered"] is True
+
+
+def _publish_qq(tmp_path: Path, **fields: Any) -> None:
+    live = tmp_path / "data" / "qq_live_state.json"
+    live.parent.mkdir(parents=True, exist_ok=True)
+    live.write_text(json.dumps(fields), encoding="utf-8")
+
+
+@pytest.mark.parametrize("stamp", ["soon", {"at": 1}, [1], None])
+def test_an_unreadable_heartbeat_reads_as_stale_not_as_a_server_error(call, tmp_path: Path, stamp: Any) -> None:
+    _publish_qq(tmp_path, published_at=stamp, values=_TRIGGER_VALUES)
+
+    response = call("GET", "/v1/platforms/qq/config/state")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["published"], body["stale"], body["age_sec"]) == (True, True, None)
+
+
+def test_a_heartbeat_from_the_future_reads_as_stale(call, tmp_path: Path) -> None:
+    # 和诊断、运维状态同一个判据：时间戳在将来不能证明 bot 还在跑。
+    _publish_qq(tmp_path, published_at=time.time() + 3600)
+
+    body = call("GET", "/v1/platforms/qq/config/state").json()
+
+    assert body["stale"] is True and body["age_sec"] < 0
+
+
+def test_a_recent_heartbeat_reads_as_live(call, tmp_path: Path) -> None:
+    _publish_qq(tmp_path, published_at=time.time() - 5)
+
+    body = call("GET", "/v1/platforms/qq/config/state").json()
+
+    assert body["stale"] is False and 0 <= body["age_sec"] < 60

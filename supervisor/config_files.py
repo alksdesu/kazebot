@@ -1,4 +1,4 @@
-"""控制台直接改的 YAML 配置文件：读原文、解析校验、原子写回、文件指纹。"""
+"""控制台直接改的 YAML 配置文件：读原文、解析校验、原子写回。"""
 from __future__ import annotations
 
 import os
@@ -76,11 +76,3 @@ def write_raw(path: Path, content: str) -> None:
             os.replace(tmp, path)
         finally:
             tmp.unlink(missing_ok=True)
-
-
-def fingerprint(path: Path) -> dict[str, Any]:
-    try:
-        stat = path.stat()
-    except OSError:
-        return {"exists": False, "mtime_ns": 0, "size": 0}
-    return {"exists": True, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size}

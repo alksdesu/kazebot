@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -666,6 +667,49 @@ class TestSupervisorScopeQuery:
         assert response.json() == {
             "current_scope": _OLD_BOT, "live_scope": "", "bot_alive": False, "preview": None, "ambiguous_sources": [],
         }
+
+    def _publish(self, tmp_path: Path, *, age: float, account: str = _NEW_BOT) -> None:
+        live = tmp_path / "data" / "qq_live_state.json"
+        live.parent.mkdir(parents=True, exist_ok=True)
+        live.write_text(json.dumps({"published_at": time.time() - age, "account": account}), encoding="utf-8")
+
+    def test_the_console_sees_the_account_a_running_bot_reports(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _store(tmp_path).save(_OLD_BOT)
+        self._publish(tmp_path, age=5)
+
+        body = self._get(tmp_path, monkeypatch, "/v1/admin/qq/scope").json()
+
+        assert (body["current_scope"], body["live_scope"], body["bot_alive"]) == (_OLD_BOT, _NEW_BOT, True)
+
+    @pytest.mark.parametrize("age", [5, -3600])
+    def test_a_bot_that_may_still_be_running_blocks_the_migration(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, age: float,
+    ) -> None:
+        # 时间戳在将来说明时钟被拨过，排除不了 bot 还在跑；它内存里的旧键会把搬好的数据写回去。
+        seed = _seed(tmp_path, scope=_OLD_BOT)
+        self._publish(tmp_path, age=age)
+
+        response = self._call(
+            tmp_path, monkeypatch, "POST", "/v1/admin/qq/scope/migrate", body={"target": _NEW_BOT, "source": _OLD_BOT},
+        )
+
+        assert response.status_code == 409 and "停掉 bot" in response.json()["detail"]
+        assert (tmp_path / "data" / "memory" / seed["ns"]).is_dir()
+
+    def test_a_bot_that_went_quiet_no_longer_blocks_the_migration(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _seed(tmp_path, scope=_OLD_BOT)
+        self._publish(tmp_path, age=3600)
+
+        response = self._call(
+            tmp_path, monkeypatch, "POST", "/v1/admin/qq/scope/migrate", body={"target": _NEW_BOT, "source": _OLD_BOT},
+        )
+
+        assert response.status_code == 200, response.text
+        assert self._get(tmp_path, monkeypatch, "/v1/admin/qq/scope").json()["bot_alive"] is False
 
     def test_the_console_preview_works_when_the_secret_is_in_the_environment(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

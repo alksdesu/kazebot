@@ -20,6 +20,9 @@ from pydantic import ValidationError
 
 from engine.attachments import blocked_file_reject_reason
 from engine.conversation_migration import RekeyConflict
+from platforms.builtin import QQ_NAPCAT
+from platforms.descriptor import PlatformDescriptor
+from platforms.live import read_live_status
 from platforms.registry import conversation_key_prefix, features_module
 
 from . import provisioning
@@ -1536,19 +1539,10 @@ def create_app(
         spec.loader.exec_module(module)
         return module
 
-    def _bot_liveness(st: "SupervisorState") -> tuple[bool, str]:
-        """(bot 是否还活着, 当前登录的号)。搬迁必须在 bot 停掉之后做。"""
-        path = st.workspace_root / "data" / "qq_live_state.json"
-        try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return False, ""
-        if not isinstance(state, dict):
-            return False, ""
-        runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
-        # bot 至少每 30s 重写一次，留三倍余量再判定它真的停了。
-        alive = (time.time() - float(state.get("published_at") or 0.0)) <= 90.0
-        return alive, str(runtime.get("bot_scope") or "")
+    def _bot_liveness(st: "SupervisorState", platform: PlatformDescriptor) -> tuple[bool, str]:
+        """(bot 是否可能还在跑, 当前登录的号)。搬迁必须在 bot 停掉之后做，拿不准就当它还在跑。"""
+        status = read_live_status(platform, st.workspace_root)
+        return status.may_be_running, status.account
 
     def _scope_count_rows(scopes: dict[str, int]) -> list[dict[str, Any]]:
         return [{"scope": scope, "conversations": count} for scope, count in scopes.items()]
@@ -1572,7 +1566,7 @@ def create_app(
         verify_admin_token(request)
         st: SupervisorState = app.state.state
         migration = _scope_migration()
-        bot_alive, live_scope = _bot_liveness(st)
+        bot_alive, live_scope = _bot_liveness(st, QQ_NAPCAT)
         current = migration.recorded_scope(st.workspace_root)
         payload: dict[str, Any] = {
             "current_scope": current,
@@ -1615,7 +1609,7 @@ def create_app(
         verify_admin_token(request)
         st: SupervisorState = app.state.state
         migration = _scope_migration()
-        bot_alive, _live_scope = _bot_liveness(st)
+        bot_alive, _live_scope = _bot_liveness(st, QQ_NAPCAT)
         if bot_alive:
             raise HTTPException(
                 status_code=409,

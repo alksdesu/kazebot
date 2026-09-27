@@ -17,11 +17,11 @@ from platforms.descriptor import (
     CHANNEL_GROUP,
     CONVERSATION_KINDS,
     STATE_ALIASES,
-    STATE_LIVE,
     STATE_ROUTES,
     PlatformDescriptor,
 )
 from platforms.ids import split_identity_key
+from platforms.live import read_live_state
 from platforms.registry import (
     all_platforms,
     conversation_channel,
@@ -98,8 +98,7 @@ class AccountScope:
 def account_scope(workspace_root: Path) -> AccountScope:
     keys: dict[str, frozenset[str] | None] = {}
     for platform in all_platforms():
-        live = _read_json(platform_state_path(platform, STATE_LIVE, workspace_root))
-        published = live.get("scope_conversation_keys")
+        published = read_live_state(platform, workspace_root).get("scope_conversation_keys")
         keys[platform.id] = (
             frozenset(str(key) for key in published if str(key or "").strip())
             if isinstance(published, list) else None
@@ -112,8 +111,7 @@ class _DisplayNames:
 
     def __init__(self, workspace_root: Path, platform: PlatformDescriptor) -> None:
         root = Path(workspace_root)
-        live = _read_json(platform_state_path(platform, STATE_LIVE, root))
-        groups = live.get("group_names")
+        groups = read_live_state(platform, root).get("group_names")
         self._groups = groups if isinstance(groups, dict) else {}
         roster = _read_json(root / "data" / _ROSTER).get("subjects")
         self._users = roster if isinstance(roster, dict) else {}

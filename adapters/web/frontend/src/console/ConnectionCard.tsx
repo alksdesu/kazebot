@@ -1,6 +1,6 @@
 // 平台链路的实况：适配进程活没活、它和 NapCat 通没通。断一段 bot 就不说话。
 import { Block, List, Pip, Row } from './components';
-import { useConsoleStore, useRuntime } from './consoleStore';
+import { useConsoleStore, useLinkFacts, useRuntime } from './consoleStore';
 
 const Link = ({ name, state, detail }: { name: string; state: string; detail: string }) => (
   <div className="flex flex-wrap items-baseline gap-2.5">
@@ -13,9 +13,10 @@ const Link = ({ name, state, detail }: { name: string; state: string; detail: st
 export const ConnectionCard = () => {
   const live = useConsoleStore((state) => state.live);
   const runtime = useRuntime();
+  const link = useLinkFacts();
 
   const botAlive = Boolean(live?.published && !live.stale);
-  const napcat = Boolean(runtime.onebot_connected);
+  const napcat = link.connected;
 
   return (
     <Block hint="两段链路，断一段 bot 就不说话" title="连接">

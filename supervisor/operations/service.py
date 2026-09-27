@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import re
 import shutil
@@ -17,11 +16,15 @@ import yaml
 
 from providers import registry
 from clonoth_runtime import load_yaml_dict, platform_secret, resolve_env_ref
-from platforms.builtin import QQ_NAPCAT
-from platforms.registry import all_platforms, platform_config_path, required_config_path
+from platforms.descriptor import PlatformDescriptor
+from platforms.registry import all_platforms, platform_config_path
 from supervisor.config_store import ConfigStore
 from supervisor.instances import load_instances, url_prefix
 from supervisor.log_access import LogReader, redact
+from supervisor.platform_api import platform_health
+
+# 平台没声明自己的排查提示时用的说法。
+_CONNECTION_HINT = "检查平台账号登录和适配进程的连接配置"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -45,12 +48,17 @@ def _atomic(path: Path, text: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _mismatch_action(platform: PlatformDescriptor) -> str:
+    if platform.config_env:
+        return f"统一两个进程的 {platform.config_env} 后重新检查"
+    return "确认两个进程用的是同一个工作区后重新检查"
+
+
 class OperationsService:
     def __init__(self, state: Any) -> None:
         self.state = state
         self.root = Path(state.workspace_root)
         self.reports = self.root / "data" / "diagnostics"
-        self.qq_file = required_config_path(QQ_NAPCAT, self.root)
         self._probe_lock = asyncio.Lock()
 
     def _configured_secrets(self) -> tuple[str, ...]:
@@ -126,39 +134,43 @@ class OperationsService:
             return {key: limit}
         raise ValueError("当前渠道未声明可用的低额度输出上限，未发起诊断模型请求")
 
+    def _platform_health(self) -> list[tuple[PlatformDescriptor, dict[str, Any]]]:
+        return [(platform, platform_health(self.root, platform)) for platform in all_platforms()]
+
     def status(self) -> dict[str, Any]:
-        live = _read_json(self.root / "data" / "qq_live_state.json")
-        runtime = live.get("runtime") if isinstance(live.get("runtime"), dict) else {}
-        try:
-            published = float(live.get("published_at") or 0)
-        except (ValueError, TypeError):
-            published = 0
-        age = time.time() - published
-        fresh = bool(published and math.isfinite(age) and 0 <= age < 90)
-        reported_path = str(live.get("config_path") or "")
-        path_mismatch = bool(reported_path and Path(reported_path).resolve() != self.qq_file.resolve())
         manager = getattr(self.state, "feature_process_manager", None)
         workers = manager.worker_health() if manager is not None else {}
         workers = {name: {key: value for key, value in worker.items() if key != "last_log"} for name, worker in workers.items()}
         with self.state._lock:
             active_tasks = sum(not self.state._task_terminal(task) for task in self.state.tasks.values())
-        try:
-            stat = self.qq_file.stat()
-            fingerprint = {"exists": True, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
-        except OSError:
-            fingerprint = {"exists": False, "mtime_ns": 0, "size": 0}
         return {
             "instance_prefix": url_prefix(), "supervisor": "online",
-            "adapter_online": fresh,
-            "onebot_connected": fresh and runtime.get("onebot_connected") is True,
-            "heartbeat_age": round(age, 1) if published and math.isfinite(age) and age >= 0 else None,
+            "platforms": [health for _, health in self._platform_health()],
             "workers": self._clean(workers),
             "active_tasks": active_tasks,
-            "queue_pending": int((runtime.get("volatile") or {}).get("queue_pending") or 0),
-            "config_applied": fresh and not path_mismatch and live.get("loaded") == fingerprint,
-            "config_path_mismatch": path_mismatch,
             "observed_at": datetime.now(timezone.utc).isoformat(),
         }
+
+    @staticmethod
+    def _platform_checks(add: Any, platform: PlatformDescriptor, health: dict[str, Any]) -> None:
+        name = platform.display_name
+        adapter = f"{name} 适配进程"
+        if not health["published"]:
+            # 注册了不等于这个实例在跑它，从没收到过状态时只提醒不判失败。
+            add(adapter, "warning", "还没收到过它公布的状态", "这个实例不跑这个平台就不用管；要跑就检查 bot 进程和 Supervisor 地址")
+            return
+        online = health["adapter_online"]
+        add(adapter, "passed" if online else "failed", "心跳正常" if online else "心跳中断", "检查 bot 进程和 Supervisor 地址")
+        if not online:
+            add(f"{name} 连接", "skipped", "适配进程没在跑，无从判断")
+        else:
+            connected = health["connected"]
+            add(f"{name} 连接", "passed" if connected else "failed", "已连接" if connected else "尚未确认连接",
+                platform.connection_hint or _CONNECTION_HINT)
+        if health["config_path_mismatch"]:
+            add(f"{name} 配置路径", "failed", "Supervisor 与 bot 用的配置文件不同", _mismatch_action(platform))
+        if health["parse_error"]:
+            add(f"{name} 配置文件", "failed", "配置文件读不懂，bot 还在用上一份能读的", "到平台页修正 YAML 语法后重新检查")
 
     def instances(self) -> list[dict[str, Any]]:
         rows = load_instances(self.root)
@@ -178,12 +190,8 @@ class OperationsService:
                 checks.append({"name": name, "status": status, "detail": detail, "action": action, **extra})
 
             add("Supervisor", "passed", "管理服务正常响应")
-            add("QQ适配器", "passed" if facts["adapter_online"] else "failed",
-                "心跳正常" if facts["adapter_online"] else "未收到新鲜心跳", "检查Bot进程和Supervisor地址")
-            add("OneBot连接", "passed" if facts["onebot_connected"] else "failed",
-                "已连接" if facts["onebot_connected"] else "尚未确认连接", "检查NapCat登录与反向WebSocket地址")
-            if facts["config_path_mismatch"]:
-                add("QQ配置路径", "failed", "Supervisor与Bot使用的QQ配置文件不同", "统一两个进程的CLONOTH_QQ_CONFIG_PATH后重新检查")
+            for platform, health in self._platform_health():
+                self._platform_checks(add, platform, health)
             workers = facts["workers"]
             add("Engine", "passed" if workers and all(w.get("alive") for w in workers.values()) else "warning",
                 f"已登记 {len(workers)} 个worker" if workers else "当前进程未提供worker管理信息", "查看运行页面")

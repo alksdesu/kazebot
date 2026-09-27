@@ -74,7 +74,7 @@ class TestConnectionIsReportedHonestly:
         # 夹具的 get_bot 返回 None 而不是抛 —— 「返回空」照样是没连上。
         runtime = _load(monkeypatch, tmp_path)
 
-        assert runtime.lifecycle._live_runtime_facts()["onebot_connected"] is False
+        assert runtime.lifecycle._live_link_facts()["connected"] is False
 
     def test_a_raising_get_bot_reads_as_disconnected(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -86,7 +86,7 @@ class TestConnectionIsReportedHonestly:
 
         patch_imported(monkeypatch, runtime, "get_bot", boom)
 
-        assert runtime.lifecycle._live_runtime_facts()["onebot_connected"] is False
+        assert runtime.lifecycle._live_link_facts()["connected"] is False
 
     def test_an_attached_bot_reads_as_connected(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -94,7 +94,25 @@ class TestConnectionIsReportedHonestly:
         runtime = _load(monkeypatch, tmp_path)
         patch_imported(monkeypatch, runtime, "get_bot", lambda: object())
 
-        assert runtime.lifecycle._live_runtime_facts()["onebot_connected"] is True
+        assert runtime.lifecycle._live_link_facts()["connected"] is True
+
+    def test_the_account_is_the_one_the_bot_is_logged_in_as(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        runtime = _load(monkeypatch, tmp_path)
+        monkeypatch.setattr(runtime.state._adapter, "active_bot_scope", "10001")
+
+        assert runtime.lifecycle._live_link_facts()["account"] == "10001"
+
+    def test_link_facts_are_not_repeated_among_the_qq_runtime_facts(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        # 两处各写一份迟早对不上，supervisor 和控制台只读约定里的那份。
+        runtime = _load(monkeypatch, tmp_path)
+
+        facts = runtime.lifecycle._live_runtime_facts()
+
+        assert not {"onebot_connected", "bot_scope", "connected", "account", "backlog"} & set(facts)
 
 
 class TestTheShapeTheConsoleReads:
@@ -116,8 +134,9 @@ class TestTheShapeTheConsoleReads:
 
         facts = runtime.lifecycle._live_runtime_facts()
 
-        assert set(facts["volatile"]) == {"queue_pending", "cached_groups", "history_gap_groups"}
-        assert "queue_pending" not in facts
+        assert set(facts["volatile"]) == {"cached_groups", "history_gap_groups"}
+        # 排队条数是约定里的一项，在顶层；它同样每时每刻在动，由约定排除在去重之外。
+        assert "backlog" in runtime.lifecycle._live_link_facts()
 
     def test_an_overflowing_group_shows_up_in_the_gap_counter(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
