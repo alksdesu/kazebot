@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import json
 import logging
 import os
@@ -16,12 +18,14 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 import yaml
 
 from engine.context_store import cleanup_old_contexts
+from engine.conversation_migration import ConversationRekey, RekeyCount
 from engine.cron import cron_match
+from file_lock import exclusive_lock
 
 
 if TYPE_CHECKING:
@@ -44,29 +48,95 @@ def _creator_fields(schedule: dict) -> dict[str, str]:
 #  schedules.yaml CRUD
 # ---------------------------------------------------------------------------
 
-def _schedules_path(workspace_root: Path) -> Path:
-    return workspace_root / "data" / "schedules.yaml"
+def schedules_path(workspace_root: Path) -> Path:
+    return Path(workspace_root) / "data" / "schedules.yaml"
 
 
 def load_schedules(workspace_root: Path) -> list[dict[str, Any]]:
-    p = _schedules_path(workspace_root)
-    if not p.exists():
-        return []
     try:
-        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        return _read_schedule_file(schedules_path(workspace_root))
     except Exception:
         return []
-    items = data.get("schedules")
-    if not isinstance(items, list):
-        return []
-    return [s for s in items if isinstance(s, dict)]
 
 
 def save_schedules(workspace_root: Path, schedules: list[dict[str, Any]]) -> None:
-    p = _schedules_path(workspace_root)
-    p.parent.mkdir(parents=True, exist_ok=True)
+    path = schedules_path(workspace_root)
+    with exclusive_lock(_schedule_lock_path(path)):
+        _write_schedule_file(path, schedules)
+
+
+def update_schedules(
+    workspace_root: Path, change: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """在锁里读、改、写回，返回改完的清单。scheduler、定时任务工具和迁移都改这份文件，各读各写会互相冲掉。"""
+    return _update_schedule_file(schedules_path(workspace_root), change)
+
+
+def schedules_lock(workspace_root: Path) -> contextlib.AbstractContextManager[None]:
+    """整份改写定时任务文件的人拿这把锁，和 update_schedules 排队。"""
+    return exclusive_lock(_schedule_lock_path(schedules_path(workspace_root)))
+
+
+def rekey_schedules(path: Path, rekey: ConversationRekey, *, apply: bool) -> RekeyCount:
+    """定时任务跟着会话走：到点按新会话键注入，旧键在平台的路由表里已经查不到真实会话。"""
+    if not rekey or not Path(path).exists():
+        return RekeyCount()
+    moved = 0
+
+    def change(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        nonlocal moved
+        for item in items:
+            new = rekey.key(item.get("conversation_key"))
+            if new is not None:
+                item["conversation_key"] = new
+                moved += 1
+        return items
+
+    if apply:
+        _update_schedule_file(path, change)
+    else:
+        change(_read_schedule_file(path))
+    return RekeyCount(moved)
+
+
+def _schedule_lock_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.lock")
+
+
+def _read_schedule_file(path: Path) -> list[dict[str, Any]]:
+    """文件在但读不懂就抛：读坏当成空表再写回去，全部定时任务就没了。"""
+    if not path.exists():
+        return []
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"schedules file root is {type(data).__name__}, expected a mapping: {path}")
+    items = data.get("schedules") or []
+    if not isinstance(items, list):
+        raise ValueError(f"schedules in {path} is {type(items).__name__}, expected a list")
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _write_schedule_file(path: Path, schedules: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     text = yaml.safe_dump({"schedules": schedules}, sort_keys=False, allow_unicode=True)
-    p.write_text(text, encoding="utf-8")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _update_schedule_file(
+    path: Path, change: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    with exclusive_lock(_schedule_lock_path(path)):
+        current = _read_schedule_file(path)
+        updated = change(copy.deepcopy(current))
+        if updated != current:
+            _write_schedule_file(path, updated)
+        return updated
 
 
 # ---------------------------------------------------------------------------
@@ -271,9 +341,10 @@ class SchedulerThread:
 
     def _remove_schedule(self, sid: str) -> None:
         try:
-            items = load_schedules(self._workspace_root)
-            items = [s for s in items if str(s.get("id") or "").strip() != sid]
-            save_schedules(self._workspace_root, items)
+            update_schedules(
+                self._workspace_root,
+                lambda items: [s for s in items if str(s.get("id") or "").strip() != sid],
+            )
             log.info(f"[scheduler] removed once-schedule: {sid}")
         except Exception as e:
             log.warning(f"[scheduler] failed to remove once-schedule {sid}: {e}")

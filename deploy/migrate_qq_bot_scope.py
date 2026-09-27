@@ -20,11 +20,13 @@ from adapters._shared import conversation_hash as _conversation_hash  # noqa: E4
 from adapters._shared.active_account import ActiveAccountStore, normalize_account  # noqa: E402
 from clonoth_runtime import offline_workspace  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
+from supervisor.conversation_stores import LiveRekey, format_store_counts, rekey_conversation_stores  # noqa: E402
+from workspace import workspace_instance  # noqa: E402
 
 rekey = _conversation_hash.rekey
 
 from engine.conversation_migration import (  # noqa: E402
-    Rename, apply_migration, load_route_map, plan_migration, route_state_file,
+    ConversationRekey, RekeyCount, Rename, apply_migration, load_route_map, plan_migration, route_state_file,
 )
 
 
@@ -46,13 +48,18 @@ class ScopeReport:
     unknown_conv_dirs: list[str] = field(default_factory=list)
     hit_keys_rewritten: int = 0
     route_keys_changed: int = 0
-    sessions_changed: int = 0
+    # 按会话键存数据的各个库：dry-run 是预览，apply 是实际改写的行数。
+    stores: dict[str, RekeyCount] = field(default_factory=dict)
     scope_written: bool = False
     backup_dir: Path | None = None
 
     @property
     def changed_renames(self) -> list[Rename]:
         return [r for r in self.renames if r.changed]
+
+    @property
+    def sessions_changed(self) -> int:
+        return self.stores.get("sessions", RekeyCount()).moved
 
 
 def read_secret(workspace: Path) -> str:
@@ -121,8 +128,9 @@ def verify_source_scope(workspace: Path, secret: str, source_scope: str) -> None
 
 def run_scope_migration(
     *, workspace: Path, target_scope: str, source_scope: str | None = None,
-    apply: bool = False, adopt: bool = True,
+    apply: bool = False, adopt: bool = True, live_sessions: LiveRekey | None = None,
 ) -> ScopeReport:
+    """live_sessions 给在线迁移用：supervisor 自己持有的会话注册表，直接改内存再落盘。"""
     workspace = Path(workspace)
     secret = read_secret(workspace)
     if source_scope is None:
@@ -151,21 +159,31 @@ def run_scope_migration(
     report.missing_source_dirs = plan.missing_source_dirs
     report.unknown_conv_dirs = plan.unknown_conv_dirs
 
+    conversation_rekey = ConversationRekey(
+        {rename.old_stable: rename.new_stable for rename in plan.changed},
+        # 无作用域时功能记录的账号记的是工作区实例号，不换成新号，新号上的人就看不到自己的提醒和资料。
+        bot_scopes={source or workspace_instance(workspace): target},
+    )
+    live = {"sessions": live_sessions} if live_sessions is not None else None
+    # 先按同一份对照预览：哪个库读不懂或有冲突，在动任何东西之前就停下。
+    report.stores = rekey_conversation_stores(workspace, conversation_rekey, apply=False, live=live)
+
     if not apply:
         return report
 
-    # 会话历史与长期记忆共用一个会话键，两边一起搬才不会一半跟着走一半留在旧号。
+    # 会话历史、长期记忆和各项功能数据共用一个会话键，一起搬才不会一半跟着走一半留在旧号。
     outcome = apply_migration(
-        workspace=workspace, platform=QQ_NAPCAT, plan=plan,
-        move_attachments=True, rewrite_sessions=True,
+        workspace=workspace, platform=QQ_NAPCAT, plan=plan, move_attachments=True,
     )
     report.moved_dirs = outcome.moved_dirs
     report.moved_attachment_dirs = outcome.moved_attachment_dirs
     report.skipped_target_exists = outcome.skipped_target_exists
     report.hit_keys_rewritten = outcome.hit_keys_rewritten
     report.route_keys_changed = outcome.route_keys_changed
-    report.sessions_changed = outcome.sessions_changed
     report.backup_dir = outcome.backup_dir
+    report.stores = rekey_conversation_stores(
+        workspace, conversation_rekey, apply=True, backup_dir=outcome.backup_dir, live=live,
+    )
 
     # 作用域写在最后：前面抛异常就不会到这里，bot 仍按旧作用域启动，脚本可重跑。
     if adopt:
@@ -193,13 +211,13 @@ def _print_report(report: ScopeReport) -> None:
         print("目标目录已存在、跳过搬迁:")
         for old_ns, new_ns in report.skipped_target_exists:
             print(f"  {old_ns} -> {new_ns}")
+    print(f"{'已改写' if report.apply else '将改写'}的按会话键存的数据: {format_store_counts(report.stores)}")
     if report.apply:
         print(f"备份目录: {report.backup_dir}")
         print(f"搬迁记忆目录: {len(report.moved_dirs)}；"
               f"附件目录: {len(report.moved_attachment_dirs)}；"
               f"命中缓存 key: {report.hit_keys_rewritten}；"
               f"路由状态 key: {report.route_keys_changed}；"
-              f"会话注册表: {report.sessions_changed}；"
               f"当前账号已写入: {report.scope_written}")
         print("重启 bot 让它读到新的作用域，否则进程内还留着按旧账号算出的键。")
     else:

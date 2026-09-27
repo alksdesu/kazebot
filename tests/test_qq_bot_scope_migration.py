@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -18,14 +19,21 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from adapters._shared import conversation_hash as ch  # noqa: E402
+from supervisor._helpers import SessionInfo  # noqa: E402
 from adapters._shared.active_account import ActiveAccountStore, normalize_account  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 import supervisor.admin_api as admin_api  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
+from supervisor.conversation_stores import ConversationStoreError  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
+from supervisor.feature_auth import FeatureActor  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
+from supervisor.reminders import ReminderService  # noqa: E402
+from supervisor.scheduler import load_schedules, save_schedules  # noqa: E402
+from supervisor.session_store import SessionStore  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
+from workspace import workspace_instance  # noqa: E402
 
 _migrate_spec = importlib.util.spec_from_file_location(
     "_test_migrate_scope", _ROOT / "deploy" / "migrate_qq_bot_scope.py",
@@ -78,8 +86,12 @@ def _seed(tmp_path: Path, *, scope: str = "") -> dict:
         }),
         encoding="utf-8",
     )
+    # supervisor 的会话注册表就是 session_id 到条目的扁平映射，SessionStore 按这个形状读写。
     (data / "sessions.json").write_text(
-        json.dumps({"sessions": {"sid-1": {"conversation_key": stable, "channel": "qq_group"}}}),
+        json.dumps({"sid-1": {
+            "session_id": "sid-1", "conversation_key": stable, "channel": "qq_group",
+            "created_at": "2026-01-01T00:00:00+00:00", "reset": False,
+        }}),
         encoding="utf-8",
     )
     (data / "onebot_conversation_hash_secret").write_text(_SECRET, encoding="utf-8")
@@ -88,6 +100,31 @@ def _seed(tmp_path: Path, *, scope: str = "") -> dict:
     if scope:
         _store(tmp_path).save(scope)
     return {"stable": stable, "ns": ns}
+
+
+def _reminder(workspace: Path, scope: str, bot_scope: str) -> dict:
+    state = SupervisorState(
+        workspace_root=workspace,
+        eventlog=EventLog(workspace / "data" / "events.jsonl", run_id="run-reminder"),
+        policy=PolicyEngine(workspace_root=workspace),
+    )
+    service = ReminderService(state)
+    try:
+        actor = FeatureActor(scope=scope, owner="user:alice", bot_scope=bot_scope, channel="qq_group", user_id="30003")
+        return service.create(actor, "交材料", (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+    finally:
+        service.close()
+
+
+def _stored_reminder(workspace: Path, reminder_id: str) -> dict:
+    import sqlite3
+
+    db = sqlite3.connect(workspace / "data" / "reminders" / "reminders.sqlite3")
+    try:
+        (body,) = db.execute("SELECT body FROM reminders WHERE id=?", (reminder_id,)).fetchone()
+    finally:
+        db.close()
+    return json.loads(body)
 
 
 class TestScopedDigest:
@@ -164,7 +201,8 @@ class TestScopeMigration:
         assert new_stable in state["real_conversation_keys"]
         assert state["session_targets"]["sid-1"]["conversation_key"] == new_stable
         sessions = json.loads((data / "sessions.json").read_text(encoding="utf-8"))
-        assert sessions["sessions"]["sid-1"]["conversation_key"] == new_stable
+        assert sessions["sid-1"]["conversation_key"] == new_stable
+        assert report.sessions_changed == 1
         assert (data / "attachments" / new_stable.replace(":", "_") / "a.png").is_file()
         assert _store(tmp_path).load() == _NEW_BOT
         assert report.backup_dir is not None and report.backup_dir.is_dir()
@@ -175,7 +213,64 @@ class TestScopeMigration:
             workspace=tmp_path, target_scope=_NEW_BOT, source_scope="", apply=True,
         )
         assert (report.backup_dir / seed["ns"] / "book.yaml").is_file()
-        assert (report.backup_dir / "sessions.json").is_file()
+        backed_up = json.loads((report.backup_dir / "data" / "sessions.json").read_text(encoding="utf-8"))
+        assert backed_up["sid-1"]["conversation_key"] == seed["stable"]
+
+    def test_the_registry_the_supervisor_writes_follows_the_move(self, tmp_path: Path) -> None:
+        seed = _seed(tmp_path)
+        (tmp_path / "data" / "sessions.json").unlink()
+        now = datetime.now(timezone.utc)
+        SessionStore(tmp_path / "data" / "sessions.json").on_session_created(
+            SessionInfo(session_id="sid-real", channel="qq_group", conversation_key=seed["stable"], created_at=now, updated_at=now),
+        )
+
+        migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, source_scope="", apply=True)
+
+        _sessions, conversation_map, _, _ = SessionStore(tmp_path / "data" / "sessions.json").load()
+        new_stable = f"qq_group:{ch.digest(_REAL, _SECRET, bot_scope=_NEW_BOT)}"
+        assert conversation_map == {new_stable: "sid-real"}
+
+    def test_feature_data_follows_the_move_and_the_new_account(self, tmp_path: Path) -> None:
+        # 加隔离之前没有账号，功能记录里的账号是工作区实例号，搬到新号名下得换成新号。
+        seed = _seed(tmp_path)
+        save_schedules(tmp_path, [{"id": "morning", "cron": "0 9 * * *", "text": "早", "conversation_key": seed["stable"]}])
+        reminder = _reminder(tmp_path, seed["stable"], workspace_instance(tmp_path))
+
+        report = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, source_scope="", apply=True)
+
+        new_stable = f"qq_group:{ch.digest(_REAL, _SECRET, bot_scope=_NEW_BOT)}"
+        assert load_schedules(tmp_path)[0]["conversation_key"] == new_stable
+        stored = _stored_reminder(tmp_path, reminder["id"])
+        assert (stored["scope"], stored["bot_scope"]) == (new_stable, _NEW_BOT)
+        assert report.stores["schedules"].moved == 1 and report.stores["reminders"].moved == 1
+
+    def test_feature_data_under_the_old_account_is_handed_to_the_new_one(self, tmp_path: Path) -> None:
+        seed = _seed(tmp_path, scope=_OLD_BOT)
+        reminder = _reminder(tmp_path, seed["stable"], _OLD_BOT)
+
+        migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, source_scope=_OLD_BOT, apply=True)
+
+        assert _stored_reminder(tmp_path, reminder["id"])["bot_scope"] == _NEW_BOT
+
+    def test_a_dry_run_previews_the_stores_without_writing_them(self, tmp_path: Path) -> None:
+        seed = _seed(tmp_path)
+        before = (tmp_path / "data" / "sessions.json").read_bytes()
+
+        report = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, source_scope="", apply=False)
+
+        assert report.sessions_changed == 1
+        assert (tmp_path / "data" / "sessions.json").read_bytes() == before
+        assert (tmp_path / "data" / "memory" / seed["ns"]).is_dir()
+
+    def test_a_store_that_cannot_be_read_stops_before_anything_moves(self, tmp_path: Path) -> None:
+        seed = _seed(tmp_path)
+        (tmp_path / "data" / "sessions.json").write_text("{not json", encoding="utf-8")
+
+        with pytest.raises(ConversationStoreError):
+            migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, source_scope="", apply=True)
+
+        assert (tmp_path / "data" / "memory" / seed["ns"]).is_dir()
+        assert _store(tmp_path).load() == ""
 
     def test_the_source_is_detected_when_the_recorded_account_disagrees(self, tmp_path: Path) -> None:
         # 存量数据没有作用域，而 bot 一登录就把当前号记下了，两者天然对不上。
@@ -321,15 +416,21 @@ class TestDeploymentsThatMoveThings:
 class TestSupervisorScopeQuery:
     _TOKEN = "scope-admin-token"
 
-    def _get(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, url: str) -> httpx.Response:
+    def _state(self, tmp_path: Path) -> SupervisorState:
+        return SupervisorState(
+            workspace_root=tmp_path,
+            eventlog=EventLog(tmp_path / "data" / "events.jsonl", run_id="run-qq-scope"),
+            policy=PolicyEngine(workspace_root=tmp_path),
+        )
+
+    def _call(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, url: str, *,
+        state: SupervisorState | None = None, body: dict | None = None,
+    ) -> httpx.Response:
         monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", self._TOKEN)
         monkeypatch.setattr(admin_api, "_admin_token", "")
         app = create_app(
-            state=SupervisorState(
-                workspace_root=tmp_path,
-                eventlog=EventLog(tmp_path / "data" / "events.jsonl", run_id="run-qq-scope"),
-                policy=PolicyEngine(workspace_root=tmp_path),
-            ),
+            state=state or self._state(tmp_path),
             process_manager=None,
             config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"),
         )
@@ -337,9 +438,14 @@ class TestSupervisorScopeQuery:
         async def go() -> httpx.Response:
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as http:
-                return await http.get(url, headers={"Authorization": f"Bearer {self._TOKEN}"})
+                return await http.request(
+                    method, url, json=body, headers={"Authorization": f"Bearer {self._TOKEN}"},
+                )
 
         return asyncio.run(go())
+
+    def _get(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, url: str) -> httpx.Response:
+        return self._call(tmp_path, monkeypatch, "GET", url)
 
     def test_the_script_reads_the_account_the_bot_recorded(self, tmp_path: Path) -> None:
         assert migrate.recorded_scope(tmp_path) == ""
@@ -365,3 +471,39 @@ class TestSupervisorScopeQuery:
 
         assert response.status_code == 200, response.text
         assert response.json()["preview"]["source_scope"] == _OLD_BOT
+        assert response.json()["preview"]["stores"]["sessions"] == {"label": "会话注册表", "moved": 1, "replaced": 0}
+
+    def test_the_console_migration_rekeys_the_registry_the_supervisor_holds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 在线迁移时内存才是权威：先改文件再重读，中间任何一次落盘都会拿旧键盖回去，还没落盘的改动也会丢。
+        seed = _seed(tmp_path, scope=_OLD_BOT)
+        state = self._state(tmp_path)
+        touched = datetime(2026, 3, 4, tzinfo=timezone.utc)
+        state._session_store.touch_updated_at("sid-1", touched)
+
+        response = self._call(
+            tmp_path, monkeypatch, "POST", "/v1/admin/qq/scope/migrate", state=state,
+            body={"target": _NEW_BOT, "source": _OLD_BOT},
+        )
+
+        assert response.status_code == 200, response.text
+        new_stable = f"qq_group:{ch.digest(_REAL, _SECRET, bot_scope=_NEW_BOT)}"
+        assert response.json()["sessions_changed"] == 1
+        assert response.json()["stores"]["sessions"]["moved"] == 1
+        assert state.conversation_map.get(new_stable) == "sid-1" and seed["stable"] not in state.conversation_map
+        row = json.loads((tmp_path / "data" / "sessions.json").read_text(encoding="utf-8"))["sid-1"]
+        assert row["conversation_key"] == new_stable and row["updated_at"] == touched.isoformat()
+
+    def test_a_store_the_migration_cannot_read_is_a_server_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        seed = _seed(tmp_path, scope=_OLD_BOT)
+        (tmp_path / "data" / "schedules.yaml").write_text("schedules: [unclosed\n", encoding="utf-8")
+
+        response = self._call(
+            tmp_path, monkeypatch, "POST", "/v1/admin/qq/scope/migrate", body={"target": _NEW_BOT, "source": _OLD_BOT},
+        )
+
+        assert response.status_code == 500 and "定时任务" in response.json()["detail"]
+        assert (tmp_path / "data" / "memory" / seed["ns"]).is_dir()

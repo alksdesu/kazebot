@@ -19,10 +19,12 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import ValidationError
 
 from engine.attachments import blocked_file_reject_reason
+from engine.conversation_migration import RekeyConflict
 from platforms.registry import conversation_key_prefix, features_module
 
 from . import provisioning
 from .config_store import ConfigStore
+from .conversation_stores import ConversationStoreError, store_counts_payload
 from .sticker_api import create_sticker_router
 from .instances import load_instances, url_prefix
 from .log_access import LogReader
@@ -1578,9 +1580,12 @@ def create_app(
         try:
             report = migration.run_scope_migration(
                 workspace=st.workspace_root, target_scope=target, apply=False,
+                live_sessions=st.rekey_session_registry,
             )
-        except migration.ScopeMismatch as exc:
+        except (migration.ScopeMismatch, RekeyConflict) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ConversationStoreError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         payload["preview"] = {
@@ -1588,6 +1593,7 @@ def create_app(
             "target_scope": report.target_scope,
             "conversations": _scope_plan_rows(report),
             "unknown_namespaces": report.unknown_conv_dirs,
+            "stores": store_counts_payload(report.stores),
         }
         return payload
 
@@ -1609,12 +1615,14 @@ def create_app(
                 target_scope=str(payload.get("target") or ""),
                 source_scope=payload.get("source"),
                 apply=True,
+                live_sessions=st.rekey_session_registry,
             )
-        except migration.ScopeMismatch as exc:
+        except (migration.ScopeMismatch, RekeyConflict) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ConversationStoreError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        # 立刻把内存拉回与盘一致：晚一步 flush 就会拿旧的 conversation_key 覆盖掉刚搬好的。
         reloaded = st.reload_session_registry()
         st.eventlog.append(
             session_id="", component="supervisor", type_="qq_scope_migrated",
@@ -1633,6 +1641,7 @@ def create_app(
             "route_keys_changed": report.route_keys_changed,
             "sessions_changed": report.sessions_changed,
             "sessions_reloaded": reloaded,
+            "stores": store_counts_payload(report.stores),
             "skipped": [
                 {"old_namespace": old, "new_namespace": new}
                 for old, new in report.skipped_target_exists

@@ -326,6 +326,80 @@ async def test_a_non_admin_can_delete_only_their_own(tmp_path: Path) -> None:
     assert (await delete_schedule({"id": "mine"}, _Ctx(workspace, platform_auth=_MEMBER, safety="auto")))["ok"] is True
 
 
+def _claimed_meanwhile(monkeypatch: pytest.MonkeyPatch, entry: dict[str, Any]) -> None:
+    """让别的进程抢在这次写入之前改了同名任务：锁外读的那份已经过时。"""
+    import supervisor.scheduler as scheduler
+
+    real = scheduler.update_schedules
+
+    def racing(root: Path, change: Any) -> list[dict[str, Any]]:
+        real(root, lambda items: [item for item in items if item.get("id") != entry["id"]] + [dict(entry)])
+        return real(root, change)
+
+    monkeypatch.setattr(scheduler, "update_schedules", racing)
+
+
+_THEIRS = {
+    "id": "mine", "cron": "0 8 * * *", "text": "theirs", "conversation_key": "qq_group:abcdef",
+    "created_by": "40004", "created_platform": "qq",
+}
+
+
+@pytest.mark.asyncio
+async def test_a_schedule_claimed_meanwhile_by_someone_else_is_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from supervisor.scheduler import load_schedules
+
+    workspace = _workspace(tmp_path)
+    _claimed_meanwhile(monkeypatch, _THEIRS)
+
+    result = await create_schedule(
+        {"id": "mine", "cron": "0 9 * * *", "text": "hi"},
+        _Ctx(workspace, platform_auth=_MEMBER, safety="auto"),
+    )
+
+    assert result["ok"] is False
+    assert [item["text"] for item in load_schedules(workspace) if item["id"] == "mine"] == ["theirs"]
+
+
+@pytest.mark.asyncio
+async def test_a_schedule_handed_to_someone_else_meanwhile_is_not_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from supervisor.scheduler import load_schedules
+
+    workspace = _workspace(tmp_path)
+    await create_schedule(
+        {"id": "mine", "cron": "0 9 * * *", "text": "hi"},
+        _Ctx(workspace, platform_auth=_MEMBER, safety="auto"),
+    )
+    _claimed_meanwhile(monkeypatch, _THEIRS)
+
+    result = await delete_schedule({"id": "mine"}, _Ctx(workspace, platform_auth=_MEMBER, safety="auto"))
+
+    assert result["ok"] is False
+    assert [item["text"] for item in load_schedules(workspace) if item["id"] == "mine"] == ["theirs"]
+
+
+@pytest.mark.asyncio
+async def test_a_schedule_written_meanwhile_under_another_id_survives_a_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from supervisor.scheduler import load_schedules
+
+    workspace = _workspace(tmp_path)
+    _claimed_meanwhile(monkeypatch, {**_THEIRS, "id": "theirs"})
+
+    result = await create_schedule(
+        {"id": "mine", "cron": "0 9 * * *", "text": "hi"},
+        _Ctx(workspace, platform_auth=_MEMBER, safety="auto"),
+    )
+
+    assert result["ok"] is True
+    assert {item["id"] for item in load_schedules(workspace)} == {"nightly_backup", "theirs", "mine"}
+
+
 @pytest.mark.asyncio
 async def test_a_non_admin_runs_out_of_quota(tmp_path: Path) -> None:
     # 没有额度的话，一个人就能把 schedules.yaml 撑爆。

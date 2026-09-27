@@ -19,11 +19,12 @@ from .compact_breaker import CompactBreaker
 from .reply_intent import IntentRegistry
 from .eventlog import EventLog, SYSTEM_SESSION_ID
 from engine.builtin.loader import auto_discover_and_register
+from engine.conversation_migration import ConversationRekey, RekeyCount
 from engine.hooks import HookRegistry
 from platforms.sources import classify_operation_source
 from .policy import PolicyEngine
 from .session import SessionMixin
-from .session_store import SessionStore
+from .session_store import SessionStore, session_registry_path
 from .task_router import TaskRouterMixin
 from .task_store import TaskStoreMixin
 from .types import (
@@ -151,7 +152,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self.entry_branch_parents: dict[str, str] = {}
 
         # ---- 方案 A: 独立 session 持久化 ----
-        self._session_store = SessionStore(workspace_root / "data" / "sessions.json")
+        self._session_store = SessionStore(session_registry_path(workspace_root))
         loaded_sessions, loaded_conv_map, loaded_child_map, loaded_parent_children = self._session_store.load()
         if loaded_sessions:
             self.sessions.update(loaded_sessions)
@@ -197,6 +198,13 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             self.conversation_map.clear()
             self.conversation_map.update(loaded_conv_map)
         return len(loaded_sessions)
+
+    def rekey_session_registry(self, rekey: ConversationRekey, *, apply: bool) -> RekeyCount:
+        """在线迁移改会话键：改内存里的注册表并落盘，再按它重建会话映射。"""
+        count = self._session_store.rekey_conversations(rekey, apply=apply)
+        if apply and count:
+            self.reload_session_registry()
+        return count
 
     def _restore_branch_finalize_claims_from_events(self) -> int:
         """Seed missing SQLite identities from legacy EventLog ownership receipts."""

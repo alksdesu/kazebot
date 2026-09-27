@@ -1,26 +1,199 @@
-"""按新的会话键摘要搬迁记忆目录、命中缓存与路由状态。
+"""按新的会话键摘要搬迁记忆目录、命中缓存与路由状态，并给出各个按会话键存数据的库共用的新旧对照。
 
-换盐（deploy/migrate_qq_conversation_hash.py）和换 bot 账号共用这一套：摘要怎么算由
-调用方给的 restable 决定，本模块只负责「算出新旧对照，然后一样不落地搬过去」。
-路由状态文件和附件目录前缀由平台描述给出。
+换盐、换 bot 账号和跨平台绑定共用这一套：摘要怎么算由调用方决定，本模块只负责「算出新旧对照，
+然后一样不落地搬过去」。路由状态文件和附件目录前缀由平台描述给出。
 """
 from __future__ import annotations
 
 import json
 import os
 import shutil
+import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
-from typing import Callable
+from types import MappingProxyType
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 import engine.memory_hit_cache as hit_cache
 from engine.eventlog_rotation import eventlog_file_lock
 from platforms.descriptor import STATE_ROUTES, PlatformDescriptor
-from platforms.registry import platform_state_path
+from platforms.registry import conversation_key_prefix, platform_state_path
 
 HIT_KEY_SEP = "/"
+
+
+class RekeyConflict(ValueError):
+    """两边各有一份、谁顶掉谁都会丢东西的数据：整次迁移停下，让人先处理。"""
+
+
+@dataclass(frozen=True)
+class RekeyCount:
+    """一个库改写的行数；replaced 是撞上目标已有的数据、被源会话顶掉的行。"""
+
+    moved: int = 0
+    replaced: int = 0
+
+    def __add__(self, other: "RekeyCount") -> "RekeyCount":
+        return RekeyCount(self.moved + other.moved, self.replaced + other.replaced)
+
+    def __bool__(self) -> bool:
+        return bool(self.moved or self.replaced)
+
+
+@dataclass(frozen=True)
+class ConversationRekey:
+    """一次迁移里会话键的新旧对照，连同跟着换的机器人账号。
+
+    只改会话键落在对照里的记录：渠道名原来就是旧键的前缀才跟着换（web 这类发起渠道不动），
+    账号按 bot_scopes 换。
+    """
+
+    keys: Mapping[str, str]
+    bot_scopes: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        pairs = {str(old): str(new) for old, new in self.keys.items() if str(old) and str(new) and str(old) != str(new)}
+        # 链式、多对一的对照让结果取决于改写顺序：a→b、b→c 先改哪条都不对。
+        if set(pairs.values()) & set(pairs):
+            raise ValueError("a new conversation key is also an old one in the same rekey")
+        if len(set(pairs.values())) != len(pairs):
+            raise ValueError("two conversation keys would be merged into one")
+        scopes = {str(old): str(new) for old, new in self.bot_scopes.items() if str(new) and str(old) != str(new)}
+        object.__setattr__(self, "keys", MappingProxyType(pairs))
+        object.__setattr__(self, "bot_scopes", MappingProxyType(scopes))
+
+    def __bool__(self) -> bool:
+        return bool(self.keys)
+
+    def items(self) -> Iterator[tuple[str, str]]:
+        return iter(self.keys.items())
+
+    def key(self, value: Any) -> str | None:
+        """对照里的新键；不在对照里返回 None。"""
+        return self.keys.get(str(value or "").strip())
+
+    def channel(self, old_key: str, new_key: str, value: Any) -> Any:
+        text = str(value or "").strip()
+        return conversation_key_prefix(new_key) if text and text == conversation_key_prefix(old_key) else value
+
+    def bot_scope(self, value: Any) -> Any:
+        return self.bot_scopes.get(str(value or "").strip(), value)
+
+    def rewrite(
+        self, document: dict[str, Any], old_key: str, new_key: str, *,
+        keys: Iterable[str] = (), channels: Iterable[str] = (), bot_scopes: Iterable[str] = (),
+    ) -> None:
+        """改一条记录里列出的字段：keys 按对照换键，channels 按渠道规则换，bot_scopes 按对照换号。"""
+        for name in keys:
+            mapped = self.key(document.get(name)) if name in document else None
+            if mapped is not None:
+                document[name] = mapped
+        for name in channels:
+            if name in document:
+                document[name] = self.channel(old_key, new_key, document[name])
+        for name in bot_scopes:
+            if name in document:
+                document[name] = self.bot_scope(document[name])
+
+
+@contextmanager
+def sqlite_rekey_transaction(path: Path, *, apply: bool) -> Iterator[sqlite3.Connection]:
+    """一个库的改写在一个事务里做完；不 apply 就回滚，预览和真正执行走同一段代码。"""
+    db = sqlite3.connect(path, timeout=30.0, isolation_level=None)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            yield db
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
+        db.execute("COMMIT" if apply else "ROLLBACK")
+    finally:
+        db.close()
+
+
+def sqlite_tables(db: sqlite3.Connection) -> set[str]:
+    return {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def rekey_sqlite_table(
+    db: sqlite3.Connection, table: str, rekey: ConversationRekey, *,
+    unique_with: tuple[str, ...] | None = None,
+    bot_scope_column: str = "",
+    document_column: str = "",
+    rewrite_document: Callable[[str, ConversationRekey, str, str], str] | None = None,
+) -> RekeyCount:
+    """把一张表里 scope 列落在旧会话键下的行改挂到新键。表不存在（老库）当没有。
+
+    unique_with 是和 scope 一起构成唯一键的列：空元组表示 scope 自己唯一，None 表示行有自己的 id、不会撞。
+    撞上目标已有的行时删掉目标那行，源会话胜出。bot_scope_column 是按账号分的列，按对照换号，
+    判断撞没撞用换过的号。document_column 存着整条记录的 JSON，交给 rewrite_document 同步改。
+    """
+    if table not in sqlite_tables(db):
+        return RekeyCount()
+    total = RekeyCount()
+    for old, new in rekey.items():
+        if bot_scope_column:
+            accounts = [row[0] for row in db.execute(f"SELECT DISTINCT {bot_scope_column} FROM {table} WHERE scope=?", (old,))]
+            groups = [
+                ([("scope", old), (bot_scope_column, account)], [("scope", new), (bot_scope_column, rekey.bot_scope(account))])
+                for account in accounts
+            ]
+        else:
+            groups = [([("scope", old)], [("scope", new)])]
+        for source, target in groups:
+            total += _rekey_sqlite_group(db, table, source, target, unique_with, document_column, rewrite_document, rekey, old, new)
+    return total
+
+
+def rekey_sqlite_documents(
+    db: sqlite3.Connection, table: str, rekey: ConversationRekey, *,
+    document_column: str,
+    rewrite_document: Callable[[str, ConversationRekey, str, str], str],
+) -> RekeyCount:
+    """没有 scope 列、只在 JSON 里存着整条记录的表（历史版本、幂等结果）：按 JSON 里的 scope 认行，同步改写。"""
+    if table not in sqlite_tables(db):
+        return RekeyCount()
+    moved = 0
+    for old, new in rekey.items():
+        rows = db.execute(
+            f"SELECT rowid, {document_column} FROM {table} WHERE json_extract({document_column}, '$.scope')=?", (old,),
+        ).fetchall()
+        for rowid, raw in rows:
+            db.execute(f"UPDATE {table} SET {document_column}=? WHERE rowid=?", (rewrite_document(raw, rekey, old, new), rowid))
+            moved += 1
+    return RekeyCount(moved)
+
+
+def _rekey_sqlite_group(
+    db: sqlite3.Connection, table: str,
+    source: list[tuple[str, Any]], target: list[tuple[str, Any]],
+    unique_with: tuple[str, ...] | None, document_column: str,
+    rewrite_document: Callable[[str, ConversationRekey, str, str], str] | None,
+    rekey: ConversationRekey, old: str, new: str,
+) -> RekeyCount:
+    source_where = " AND ".join(f"{column}=?" for column, _ in source)
+    source_args = tuple(value for _, value in source)
+    target_where = " AND ".join(f"{column}=?" for column, _ in target)
+    target_args = tuple(value for _, value in target)
+    replaced = 0
+    if unique_with is not None:
+        if unique_with:
+            columns = ", ".join(unique_with)
+            conflict = f"({columns}) IN (SELECT {columns} FROM {table} WHERE {source_where})"
+        else:
+            conflict = f"EXISTS (SELECT 1 FROM {table} WHERE {source_where})"
+        replaced = db.execute(f"DELETE FROM {table} WHERE {target_where} AND {conflict}", target_args + source_args).rowcount
+    if document_column and rewrite_document is not None:
+        rows = db.execute(f"SELECT rowid, {document_column} FROM {table} WHERE {source_where}", source_args).fetchall()
+        for rowid, raw in rows:
+            db.execute(f"UPDATE {table} SET {document_column}=? WHERE rowid=?", (rewrite_document(raw, rekey, old, new), rowid))
+    assignments = ", ".join(f"{column}=?" for column, _ in target)
+    moved = db.execute(f"UPDATE {table} SET {assignments} WHERE {source_where}", target_args + source_args).rowcount
+    return RekeyCount(moved, replaced)
 
 
 def attachment_dir_prefixes(platform: PlatformDescriptor) -> tuple[str, ...]:
@@ -66,7 +239,6 @@ class MigrationOutcome:
     moved_attachment_dirs: list[tuple[str, str]] = field(default_factory=list)
     hit_keys_rewritten: int = 0
     route_keys_changed: int = 0
-    sessions_changed: int = 0
     backup_dir: Path | None = None
 
 
@@ -136,11 +308,10 @@ def fresh_backup_dir(workspace: Path) -> Path:
 
 
 def backup(*, workspace: Path, platform: PlatformDescriptor, backup_dir: Path, plan: MigrationPlan) -> None:
-    """备份要被改名的记忆目录，以及会被原地重写的几个状态文件。"""
+    """备份要被改名的记忆目录，以及会被原地重写的路由状态和命中缓存；各个按会话键存数据的库由它们的清单自己备份。"""
     workspace = Path(workspace)
     backup_dir.mkdir(parents=True, exist_ok=False)
-    for path in (route_state_file(workspace, platform), hit_cache.hit_cache_path(workspace),
-                 workspace / "data" / "sessions.json"):
+    for path in (route_state_file(workspace, platform), hit_cache.hit_cache_path(workspace)):
         if path.exists():
             shutil.copy2(path, backup_dir / path.name)
     root = memory_root(workspace)
@@ -152,10 +323,12 @@ def backup(*, workspace: Path, platform: PlatformDescriptor, backup_dir: Path, p
 
 def apply_migration(
     *, workspace: Path, platform: PlatformDescriptor, plan: MigrationPlan,
-    move_attachments: bool = False, rewrite_sessions: bool = False,
-    make_backup: bool = True,
+    move_attachments: bool = False, make_backup: bool = True,
 ) -> MigrationOutcome:
-    """执行搬迁。没有要改的东西就整个跳过，重复运行是幂等的空操作。"""
+    """执行搬迁。没有要改的东西就整个跳过，重复运行是幂等的空操作。
+
+    只动 bot 和引擎这一侧的东西；会话注册表、定时任务这些按会话键存数据的库由调用方按同一份对照另外改写。
+    """
     workspace = Path(workspace)
     outcome = MigrationOutcome()
     if not plan.changed:
@@ -183,8 +356,6 @@ def apply_migration(
     outcome.route_keys_changed = _rewrite_route_state(route_state_file(workspace, platform), remap)
     if move_attachments:
         outcome.moved_attachment_dirs = _move_attachment_dirs(workspace, remap, attachment_dir_prefixes(platform))
-    if rewrite_sessions:
-        outcome.sessions_changed = _rewrite_sessions(workspace, remap)
     return outcome
 
 
@@ -248,33 +419,6 @@ def _rewrite_route_state(route_state: Path, remap: dict[str, str]) -> int:
     if not changed:
         return 0
     _atomic_write_json(route_state, data)
-    return changed
-
-
-def _rewrite_sessions(workspace: Path, remap: dict[str, str]) -> int:
-    """把 supervisor 的会话注册表指向新会话键，让对话历史跟着一起搬。"""
-    path = Path(workspace) / "data" / "sessions.json"
-    if not remap or not path.exists():
-        return 0
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return 0
-
-    rows = data.get("sessions") if isinstance(data, dict) else data
-    if not isinstance(rows, dict):
-        return 0
-    changed = 0
-    for row in rows.values():
-        if not isinstance(row, dict):
-            continue
-        new_key = remap.get(str(row.get("conversation_key") or ""))
-        if new_key:
-            row["conversation_key"] = new_key
-            changed += 1
-    if not changed:
-        return 0
-    _atomic_write_json(path, data)
     return changed
 
 

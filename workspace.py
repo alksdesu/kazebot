@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -28,3 +29,8 @@ def resolve_workspace_root(fallback: Path | str) -> Path:
     """
     configured = workspace_env_root()
     return configured if configured is not None else Path(fallback).resolve()
+
+
+def workspace_instance(workspace_root: Path | str) -> str:
+    """工作区的实例号：功能记录没有机器人账号时拿它顶替，用户身份的摘要也拌进它，多开的实例互不相认。"""
+    return hashlib.sha256(str(Path(workspace_root).resolve()).encode("utf-8")).hexdigest()[:24]

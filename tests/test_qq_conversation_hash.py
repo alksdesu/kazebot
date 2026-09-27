@@ -247,7 +247,13 @@ def _seed_legacy_workspace(tmp_path: Path, real: str = "qq_group:123456789") -> 
                     "session_targets": {}}),
         encoding="utf-8",
     )
-    (data / "sessions.json").write_text(json.dumps({"sentinel": old_stable}), encoding="utf-8")
+    (data / "sessions.json").write_text(
+        json.dumps({"sid-1": {
+            "session_id": "sid-1", "conversation_key": old_stable, "channel": "qq_group",
+            "created_at": "2026-01-01T00:00:00+00:00", "reset": False,
+        }}),
+        encoding="utf-8",
+    )
     (data / "onebot_conversation_hash_secret").write_text(ch.LEGACY_MARKER, encoding="utf-8")
     return {"real": real, "old_stable": old_stable, "old_ns": old_ns}
 
@@ -291,9 +297,28 @@ class TestMigration:
         sessions = tmp_path / "data" / "sessions.json"
         before = sessions.read_text(encoding="utf-8")
 
-        migrate.run_migration(workspace=tmp_path, apply=True, secret=_SECRET)
+        report = migrate.run_migration(workspace=tmp_path, apply=True, secret=_SECRET)
 
         assert sessions.read_text(encoding="utf-8") == before
+        assert seed["old_stable"] in before and "sessions" not in report.stores
+
+    def test_feature_data_follows_the_new_digest(self, tmp_path: Path) -> None:
+        # 短期上下文按既定做法丢一次，但定时任务、提醒到点要按新键找到会话，不跟着换就投不出去。
+        from supervisor.scheduler import load_schedules, save_schedules
+
+        seed = _seed_legacy_workspace(tmp_path)
+        save_schedules(tmp_path, [{"id": "morning", "cron": "0 9 * * *", "text": "早", "conversation_key": seed["old_stable"]}])
+        new_stable = f"qq_group:{ch.digest(seed['real'], _SECRET)}"
+
+        preview = migrate.run_migration(workspace=tmp_path, apply=False, secret=_SECRET)
+        assert preview.stores["schedules"].moved == 1
+        assert load_schedules(tmp_path)[0]["conversation_key"] == seed["old_stable"]
+
+        report = migrate.run_migration(workspace=tmp_path, apply=True, secret=_SECRET)
+
+        assert load_schedules(tmp_path)[0]["conversation_key"] == new_stable
+        assert report.stores["schedules"].moved == 1
+        assert (report.backup_dir / "data" / "schedules.yaml").is_file()
 
     def test_an_unmapped_namespace_dir_is_left_alone_and_reported(self, tmp_path: Path) -> None:
         _seed_legacy_workspace(tmp_path)

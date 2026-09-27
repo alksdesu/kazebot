@@ -17,6 +17,10 @@ _MIN_INTERVAL_MINUTES = 5
 _MAX_MINUTE_POINTS = 4
 
 
+class _ScheduleOwnedByOther(Exception):
+    """锁里再认归属时，同名任务已经归了别人。"""
+
+
 def _ok(result_text: str, **fields: Any) -> dict[str, Any]:
     # [AutoC 2026-05-31] Why: schedule tools return structured management data but
     # still need a canonical readable transcript. How: place all structured fields
@@ -108,7 +112,7 @@ def _resolve_schedule_conversation_key(args: dict[str, Any], ctx: ToolContext, s
 
 async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Create or update a scheduled task."""
-    from supervisor.scheduler import load_schedules, save_schedules
+    from supervisor.scheduler import load_schedules, update_schedules
 
     sid = str(args.get("id") or "").strip()
     if not sid:
@@ -177,7 +181,6 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         if err is not None:
             return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
-    schedules = list(existing.values())
     entry: dict[str, Any] = {
         "id": sid,
         "cron": cron_expr,
@@ -208,15 +211,25 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         entry["workflow_id"] = workflow_id
 
     replaced = False
-    for i, s in enumerate(schedules):
-        if str(s.get("id") or "").strip() == sid:
-            schedules[i] = entry
-            replaced = True
-            break
-    if not replaced:
-        schedules.append(entry)
 
-    save_schedules(ctx.workspace_root, schedules)
+    def upsert(schedules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        nonlocal replaced
+        for index, schedule in enumerate(schedules):
+            if str(schedule.get("id") or "").strip() != sid:
+                continue
+            # 前面的归属判断用的是锁外读的那份，别的进程可能已经抢先建了同名任务。
+            if not is_admin and origin and str(schedule.get("created_by") or "") != creator:
+                raise _ScheduleOwnedByOther(sid)
+            schedules[index] = entry
+            replaced = True
+            return schedules
+        schedules.append(entry)
+        return schedules
+
+    try:
+        update_schedules(ctx.workspace_root, upsert)
+    except _ScheduleOwnedByOther:
+        return _err(f"schedule {sid} belongs to someone else")
     return _ok(f"Schedule {'updated' if replaced else 'created'}: {sid}", schedule=entry, replaced=replaced)
 
 
@@ -237,7 +250,7 @@ async def list_schedules(args: dict[str, Any], ctx: ToolContext) -> dict[str, An
 
 async def delete_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Delete a scheduled task."""
-    from supervisor.scheduler import load_schedules, save_schedules
+    from supervisor.scheduler import load_schedules, update_schedules
 
     sid = str(args.get("id") or "").strip()
     if not sid:
@@ -255,9 +268,21 @@ async def delete_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     if target is None:
         return _err(f"schedule not found: {sid}")
     # 条目本身不带渠道信息，没有归属校验的话群友能删掉管理员建的任何定时任务。
-    if not is_admin and str(target.get("created_by") or "") != _creator_id(ctx):
+    creator = _creator_id(ctx)
+    if not is_admin and str(target.get("created_by") or "") != creator:
         return _err(f"schedule {sid} belongs to someone else")
-    schedules = [s for s in schedules if str(s.get("id") or "").strip() != sid]
 
-    save_schedules(ctx.workspace_root, schedules)
+    def remove(schedules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        kept = []
+        for schedule in schedules:
+            if str(schedule.get("id") or "").strip() != sid:
+                kept.append(schedule)
+            elif not is_admin and str(schedule.get("created_by") or "") != creator:
+                raise _ScheduleOwnedByOther(sid)
+        return kept
+
+    try:
+        update_schedules(ctx.workspace_root, remove)
+    except _ScheduleOwnedByOther:
+        return _err(f"schedule {sid} belongs to someone else")
     return _ok(f"Schedule deleted: {sid}", deleted=True, id=sid)

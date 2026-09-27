@@ -11,6 +11,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from engine.conversation_migration import (
+    ConversationRekey,
+    RekeyConflict,
+    RekeyCount,
+    rekey_sqlite_table,
+    sqlite_rekey_transaction,
+    sqlite_tables,
+)
+
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_TEXT_CHARS = 2_000_000
 
@@ -60,13 +69,67 @@ def dump(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
+def materials_root(workspace: Path) -> Path:
+    return Path(workspace).resolve() / "data" / "materials"
+
+
+def materials_index_path(workspace: Path) -> Path:
+    return materials_root(workspace) / "index.sqlite3"
+
+
+def rekey_materials(path: Path, rekey: ConversationRekey, *, apply: bool) -> RekeyCount:
+    """资料跟着会话走：资料、版本、聊天记录和记录设置挂到新会话键、换成新号；文件按内容存，不用搬。"""
+    if not rekey or not Path(path).exists():
+        return RekeyCount()
+    with sqlite_rekey_transaction(Path(path), apply=apply) as db:
+        _refuse_duplicate_generations(db, rekey)
+        return (
+            rekey_sqlite_table(
+                db, "objects", rekey, bot_scope_column="bot_scope",
+                document_column="data", rewrite_document=_rekey_material_document,
+            )
+            + rekey_sqlite_table(
+                db, "journal", rekey, unique_with=("message_id",), bot_scope_column="bot_scope",
+                document_column="data", rewrite_document=_rekey_material_document,
+            )
+            + rekey_sqlite_table(db, "settings", rekey, unique_with=(), bot_scope_column="bot_scope")
+        )
+
+
+def _rekey_material_document(raw: str, rekey: ConversationRekey, old: str, new: str) -> str:
+    record = json.loads(raw)
+    rekey.rewrite(record, old, new, keys=("scope",), bot_scopes=("bot_scope",))
+    return dump(record)
+
+
+def _refuse_duplicate_generations(db: sqlite3.Connection, rekey: ConversationRekey) -> None:
+    """同一个人同一次生成的版本两边各有一份：删哪份都会让引用它的资料断掉，只能停下让人处理。"""
+    if "objects" not in sqlite_tables(db):
+        return
+    generation = "json_extract({table}.data, '$.metadata.generation_key')"
+    for old, new in rekey.items():
+        rows = db.execute(
+            f"SELECT source.bot_scope, source.owner, {generation.format(table='source')} FROM objects AS source "
+            f"WHERE source.scope=? AND source.kind='version' AND {generation.format(table='source')} IS NOT NULL",
+            (old,),
+        ).fetchall()
+        for bot_scope, owner, key in rows:
+            clash = db.execute(
+                f"SELECT 1 FROM objects AS target WHERE target.scope=? AND target.bot_scope=? AND target.owner=? "
+                f"AND target.kind='version' AND {generation.format(table='target')}=?",
+                (new, rekey.bot_scope(bot_scope), owner, key),
+            ).fetchone()
+            if clash is not None:
+                raise RekeyConflict(f"资料库里同一次生成的版本在 {old} 和 {new} 下各有一份，先在控制台删掉其中一份再迁移")
+
+
 class MaterialStore:
     def __init__(self, workspace: Path):
         self.workspace = Path(workspace).resolve()
-        self.root = self.workspace / "data" / "materials"
+        self.root = materials_root(self.workspace)
         self.root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
-        self.db = sqlite3.connect(self.root / "index.sqlite3", check_same_thread=False, isolation_level=None)
+        self.db = sqlite3.connect(materials_index_path(self.workspace), check_same_thread=False, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=10000")

@@ -14,11 +14,22 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from engine.conversation_migration import (
+    ConversationRekey,
+    RekeyCount,
+    rekey_sqlite_documents,
+    rekey_sqlite_table,
+    sqlite_rekey_transaction,
+)
 from platforms.registry import find_platform
 from platforms.sources import is_external_platform
 from supervisor.feature_auth import FeatureActor
 
 log = logging.getLogger(__name__)
+
+
+def reminders_path(workspace_root: Path) -> Path:
+    return Path(workspace_root) / "data/reminders/reminders.sqlite3"
 
 
 def _owner_label(actor: FeatureActor) -> str:
@@ -40,7 +51,7 @@ class ReminderConflict(ValueError):
 class ReminderService:
     def __init__(self, state: Any):
         self.state = state
-        self.path = Path(state.workspace_root) / "data/reminders/reminders.sqlite3"
+        self.path = reminders_path(state.workspace_root)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         config_path = Path(state.workspace_root) / "config/reminders.yaml"
         config = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
@@ -314,3 +325,22 @@ class ReminderService:
                         self._save(db, latest)
         finally:
             self._tick_lock.release()
+
+
+def rekey_reminders(path: Path, rekey: ConversationRekey, *, apply: bool) -> RekeyCount:
+    """提醒跟着会话走：到点投进新会话，账号换成新号，已发提醒的引用绑定一起改挂，引用回复照样认得出。"""
+    if not rekey or not Path(path).exists():
+        return RekeyCount()
+    with sqlite_rekey_transaction(Path(path), apply=apply) as db:
+        return (
+            rekey_sqlite_table(db, "reminders", rekey, document_column="body", rewrite_document=_rekey_reminder_body)
+            + rekey_sqlite_table(db, "reminder_message_bindings", rekey, unique_with=("message_id",), bot_scope_column="bot_scope")
+            # 动作的幂等结果存着当时整条提醒，重放时原样返回。
+            + rekey_sqlite_documents(db, "reminder_actions", rekey, document_column="result", rewrite_document=_rekey_reminder_body)
+        )
+
+
+def _rekey_reminder_body(raw: str, rekey: ConversationRekey, old: str, new: str) -> str:
+    record = json.loads(raw)
+    rekey.rewrite(record, old, new, keys=("scope",), channels=("channel",), bot_scopes=("bot_scope",))
+    return json.dumps(record, ensure_ascii=False)

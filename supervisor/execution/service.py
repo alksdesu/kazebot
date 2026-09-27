@@ -21,7 +21,7 @@ from supervisor.feature_auth import FeatureActor
 from supervisor.types import TaskKind
 from .inputs import fetch_url, read_document
 from .models import PlanDraft, READ_ONLY_TOOLS, TERMINAL_STEPS
-from .store import ConflictError, PlanStore
+from .store import ConflictError, PlanStore, plans_path
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ class ExecutionService:
     def __init__(self, state: Any):
         self.state = state
         self.root = Path(state.workspace_root)
-        self.store = PlanStore(self.root / "data/execution/execution.sqlite3")
+        self.store = PlanStore(plans_path(self.root))
         config_path = self.root / "config/execution.yaml"
         self.config = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
         self.config = self.config if isinstance(self.config, dict) else {}

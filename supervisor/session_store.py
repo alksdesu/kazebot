@@ -24,6 +24,7 @@ session 信息仍可从此文件完整恢复。
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import logging
@@ -34,6 +35,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from engine.conversation_migration import ConversationRekey, RekeyCount
 
 from ._helpers import SessionInfo, _now
 
@@ -404,3 +407,106 @@ class SessionStore:
     def _flush(self) -> bool:
         """Compatibility wrapper that snapshots under lock and writes lock-free."""
         return self.flush_snapshot(self.snapshot())
+
+    def rekey_conversations(self, rekey: ConversationRekey, *, apply: bool) -> RekeyCount:
+        """在线迁移用：直接改内存里的注册表再落盘。先改文件再重读的话，中间任何一次落盘都会拿旧键盖回去。"""
+        with self._lock:
+            registry = self._registry if apply else copy.deepcopy(self._registry)
+            count = _rekey_registry(registry, rekey) if rekey else RekeyCount()
+            if not apply or not count:
+                return count
+            snapshot = self._changed_locked()
+        if not self.flush_snapshot(snapshot):
+            raise OSError(f"sessions.json: rekeyed registry could not be written to {self._path}")
+        return count
+
+
+def session_registry_path(workspace_root: Path) -> Path:
+    return Path(workspace_root) / "data" / "sessions.json"
+
+
+def rekey_session_registry(path: Path, rekey: ConversationRekey, *, apply: bool) -> RekeyCount:
+    """会话注册表里挂在旧会话键下的条目改挂到新键，对话历史按 session_id 跟着走。
+
+    新键下原来就有活跃会话时源会话胜出，目标那条标成已重置：同一个键两条活跃会话，加载时谁赢
+    取决于文件里的先后。老式派发的 agent: 会话键里嵌着父会话键，一并换掉。
+    """
+    registry = _read_registry(path)
+    if not registry or not rekey:
+        return RekeyCount()
+    count = _rekey_registry(registry, rekey)
+    if apply and count:
+        _write_registry(path, registry)
+    return count
+
+
+def _rekey_registry(registry: dict[str, Any], rekey: ConversationRekey) -> RekeyCount:
+    moved: set[str] = set()
+    claimed: set[str] = set()
+    for session_id, row in registry.items():
+        if not isinstance(row, dict):
+            continue
+        found = _rekeyed_conversation_key(str(row.get("conversation_key") or "").strip(), rekey)
+        if found is None:
+            continue
+        old, new, rewritten = found
+        row["conversation_key"] = rewritten
+        rekey.rewrite(row, old, new, channels=("channel",))
+        moved.add(session_id)
+        if _is_active_root(row):
+            claimed.add(rewritten)
+    replaced = 0
+    for session_id, row in registry.items():
+        if session_id in moved or not isinstance(row, dict) or not _is_active_root(row):
+            continue
+        if str(row.get("conversation_key") or "").strip() in claimed:
+            row["reset"] = True
+            replaced += 1
+    return RekeyCount(len(moved), replaced)
+
+
+def _rekeyed_conversation_key(key: str, rekey: ConversationRekey) -> tuple[str, str, str] | None:
+    """(旧会话键, 新会话键, 换过之后的这个键)；agent:<节点>[:<上下文>]:<父会话键>[:<uuid>] 按嵌着的父会话键认。"""
+    new = rekey.key(key)
+    if new is not None:
+        return key, new, new
+    if not key.startswith("agent:"):
+        return None
+    for old, new in rekey.items():
+        if key.endswith(f":{old}"):
+            return old, new, key[: -len(old)] + new
+        if f":{old}:" in key:
+            return old, new, key.replace(f":{old}:", f":{new}:", 1)
+    return None
+
+
+def _is_active_root(row: dict[str, Any]) -> bool:
+    return not row.get("reset") and not row.get("is_child")
+
+
+def _read_registry(path: Path) -> dict[str, Any] | None:
+    """没有或空文件是 None；读不懂就抛：当成空表会让没搬的会话看起来像搬完了。"""
+    try:
+        raw = Path(path).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    if not raw:
+        return None
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError(f"sessions.json root is {type(data).__name__}, expected an object: {path}")
+    return data
+
+
+def _write_registry(path: Path, registry: dict[str, Any]) -> None:
+    path = Path(path)
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=".sessions_rekey_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(registry, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        os.replace(tmp_path, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise

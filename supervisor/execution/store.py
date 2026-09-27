@@ -6,9 +6,51 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
+from engine.conversation_migration import (
+    ConversationRekey,
+    RekeyCount,
+    rekey_sqlite_documents,
+    rekey_sqlite_table,
+    sqlite_rekey_transaction,
+)
+
 
 class ConflictError(ValueError):
     pass
+
+
+def plans_path(workspace_root: Path) -> Path:
+    return Path(workspace_root) / "data/execution/execution.sqlite3"
+
+
+def rekey_plans(path: Path, rekey: ConversationRekey, *, apply: bool) -> RekeyCount:
+    """执行计划跟着会话走：在新会话里接着执行，执行身份和任务上下文里的会话键、渠道、账号一起换，历史版本同样。"""
+    if not rekey or not Path(path).exists():
+        return RekeyCount()
+    with sqlite_rekey_transaction(Path(path), apply=apply) as db:
+        return (
+            rekey_sqlite_table(db, "plans", rekey, document_column="body", rewrite_document=_rekey_plan_body)
+            + rekey_sqlite_documents(db, "revisions", rekey, document_column="body", rewrite_document=_rekey_plan_body)
+        )
+
+
+def _rekey_plan_body(raw: str, rekey: ConversationRekey, old: str, new: str) -> str:
+    plan = json.loads(raw)
+    rekey.rewrite(plan, old, new, keys=("scope",), channels=("channel",), bot_scopes=("bot_scope",))
+    binding = plan.get("actor_binding")
+    if isinstance(binding, dict):
+        # 到点执行时按它重建执行身份，漏换的话身份还挂在旧会话上，群管理这类角色判定就对不上。
+        rekey.rewrite(binding, old, new, keys=("scope",), channels=("channel",), bot_scopes=("bot_scope",))
+    context = plan.get("task_context")
+    if isinstance(context, dict):
+        rekey.rewrite(
+            context, old, new,
+            keys=("conversation_key", "route_conversation_key", "parent_conversation_key"), channels=("channel",),
+        )
+        auth = context.get("platform_auth")
+        if isinstance(auth, dict):
+            rekey.rewrite(auth, old, new, keys=("group_scope",), channels=("platform",), bot_scopes=("bot_scope",))
+    return json.dumps(plan, ensure_ascii=False)
 
 
 class PlanStore:

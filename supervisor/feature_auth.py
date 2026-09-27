@@ -9,6 +9,7 @@ from fastapi import HTTPException, Request
 
 from platforms.descriptor import CHANNEL_GROUP
 from platforms.registry import conversation_channel, conversation_key_prefix
+from workspace import workspace_instance
 
 from .admin_api import verify_admin_token
 
@@ -64,7 +65,7 @@ def _owner(instance: str, user_id: str, fallback: str) -> str:
 
 def resolve_actor(request: Request, state: Any, scope: str = "") -> FeatureActor:
     verify_admin_token(request)
-    instance = hashlib.sha256(str(state.workspace_root.resolve()).encode("utf-8")).hexdigest()[:24]
+    instance = workspace_instance(state.workspace_root)
     requested_scope = _text(scope or request.query_params.get("scope") or request.headers.get("X-Clonoth-Scope"))
     task_id = _text(request.headers.get("X-Clonoth-Task-Id"))
     if task_id:

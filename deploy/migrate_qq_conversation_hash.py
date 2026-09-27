@@ -1,7 +1,7 @@
 """把存量部署的会话键摘要从无盐迁移到加盐：离线、可 dry-run、失败可中止。
 
-只改 bot 拥有的东西（记忆目录名、.hit_cache.json 前缀、路由状态键），
-按 real_conversation_keys 逐条重算摘要，不动 supervisor 的 sessions.json。
+记忆目录名、.hit_cache.json 前缀、路由状态键按 real_conversation_keys 逐条重算；定时任务、提醒这些
+按会话键存的功能数据跟着换键；supervisor 的 sessions.json 不动，那几个会话下次说话各自新开。
 """
 from __future__ import annotations
 
@@ -20,12 +20,13 @@ if str(_ROOT) not in sys.path:
 from adapters._shared import conversation_hash as _conversation_hash  # noqa: E402
 from clonoth_runtime import offline_workspace  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
+from supervisor.conversation_stores import format_store_counts, rekey_conversation_stores  # noqa: E402
 
 rekey = _conversation_hash.rekey
 _SECRET_RE = _conversation_hash._SECRET_RE
 
 from engine.conversation_migration import (  # noqa: E402
-    Rename, apply_migration, plan_migration,
+    ConversationRekey, RekeyCount, Rename, apply_migration, plan_migration,
 )
 
 _SECRET_BYTES = 32
@@ -50,6 +51,8 @@ class MigrationReport:
     unknown_conv_dirs: list[str] = field(default_factory=list)
     route_keys_changed: int = 0
     hit_keys_rewritten: int = 0
+    # 按会话键存的功能数据：dry-run 是预览，apply 是实际改写的行数。
+    stores: dict[str, RekeyCount] = field(default_factory=dict)
     secret_written: bool = False
     backup_dir: Path | None = None
 
@@ -106,6 +109,10 @@ def run_migration(
     report.missing_source_dirs = plan.missing_source_dirs
     report.unknown_conv_dirs = plan.unknown_conv_dirs
 
+    conversation_rekey = ConversationRekey({rename.old_stable: rename.new_stable for rename in plan.changed})
+    # 先按同一份对照预览：哪个库读不懂或有冲突，在动任何东西之前就停下。
+    report.stores = rekey_conversation_stores(workspace, conversation_rekey, apply=False, history=False)
+
     if not apply:
         return report
 
@@ -115,6 +122,10 @@ def run_migration(
     report.hit_keys_rewritten = outcome.hit_keys_rewritten
     report.route_keys_changed = outcome.route_keys_changed
     report.backup_dir = outcome.backup_dir
+    # 定时任务、提醒到点要按新键找到会话，不跟着换就投不出去；短期上下文按既定做法不搬。
+    report.stores = rekey_conversation_stores(
+        workspace, conversation_rekey, apply=True, history=False, backup_dir=outcome.backup_dir,
+    )
 
     if report.explicit_secret:
         # 显式配置的密钥由 bot 直接读，落一份文件也不会被用到。
@@ -154,6 +165,7 @@ def _print_report(report: MigrationReport) -> None:
         print("目标目录已存在、跳过改名:")
         for old_ns, new_ns in report.skipped_target_exists:
             print(f"  {old_ns} -> {new_ns}")
+    print(f"{'已改写' if report.apply else '将改写'}的按会话键存的功能数据: {format_store_counts(report.stores)}")
     if report.apply:
         print(f"备份目录: {report.backup_dir}")
         print(f"改名记忆目录: {len(report.moved_dirs)}；"
@@ -162,8 +174,8 @@ def _print_report(report: MigrationReport) -> None:
               f"密钥文件已写入: {report.secret_written}")
     else:
         print("这是 dry-run，未改动任何文件。加 --apply 真正执行。")
-    print("supervisor 会话未改：这些群下次说话会各自新建 session，只丢一次短期上下文，"
-          "长期记忆已随目录迁移。")
+    print("supervisor 会话不改：这些群下次说话会各自新建 session，只丢一次短期上下文；"
+          "长期记忆随目录迁移，定时任务、提醒这些功能数据跟着换成新键。")
     print("在 bot 与 supervisor 都停止的状态下运行本脚本。")
 
 

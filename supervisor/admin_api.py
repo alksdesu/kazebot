@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from engine.node import node_file
 
+from .scheduler import schedules_lock, schedules_path
 from .tool_catalog import ToolEntry, tool_catalog, tool_names
 
 class RawContent(BaseModel):
@@ -554,15 +555,15 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     # ----- Schedules -----
     @router.get("/schedules/raw")
     def get_schedules() -> dict[str, str]:
-        p = workspace_root / "data" / "schedules.yaml"
+        p = schedules_path(workspace_root)
         if not p.exists():
             return {"content": "schedules: []"}
         return _read_text(p)
-        
+
     @router.put("/schedules/raw")
     def update_schedules(payload: RawContent) -> dict[str, Any]:
-        p = workspace_root / "data" / "schedules.yaml"
-        return _write_text(p, payload.content)
+        with schedules_lock(workspace_root):
+            return _write_text(schedules_path(workspace_root), payload.content)
 
     # ----- Skills -----
     @router.get("/skills")

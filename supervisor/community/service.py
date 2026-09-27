@@ -11,6 +11,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from engine.conversation_migration import ConversationRekey, RekeyCount, rekey_sqlite_table, sqlite_rekey_transaction
 from platforms.descriptor import CHANNEL_GROUP
 from platforms.registry import is_platform_conversation
 
@@ -30,6 +31,29 @@ POLICY_DEFAULTS = {
 }
 POLICY_FIELDS = tuple(POLICY_DEFAULTS)
 DEFAULT_SETTINGS = {**LEGACY_POLICY_DEFAULTS, "welcome_enabled": False}
+_SCOPED_TABLES: tuple[tuple[str, tuple[str, ...] | None], ...] = (
+    ("groups", ()),
+    ("activities", None),
+    ("operations", ("key",)),
+    ("notifications", None),
+    ("messages", ("ref",)),
+    ("decisions", ("ref",)),
+)
+
+
+def community_path(workspace_root: Path) -> Path:
+    return Path(workspace_root) / "data" / "community.sqlite3"
+
+
+def rekey_community(path: Path, rekey: ConversationRekey, *, apply: bool) -> RekeyCount:
+    """群协作跟着会话走：安静时段、接话设置、活动、通知和话题都挂到新会话键；目标原有的会话设置被源会话的顶掉。"""
+    if not rekey or not Path(path).exists():
+        return RekeyCount()
+    with sqlite_rekey_transaction(Path(path), apply=apply) as db:
+        return sum(
+            (rekey_sqlite_table(db, table, rekey, unique_with=unique_with) for table, unique_with in _SCOPED_TABLES),
+            RekeyCount(),
+        )
 
 
 class SettingsConflict(ValueError):
@@ -38,7 +62,7 @@ class SettingsConflict(ValueError):
 
 class CommunityService:
     def __init__(self, workspace_root: Path):
-        self.path = Path(workspace_root) / "data" / "community.sqlite3"
+        self.path = community_path(workspace_root)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
             self._enable_wal(db)
