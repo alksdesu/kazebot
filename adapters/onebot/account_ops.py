@@ -1,7 +1,7 @@
-"""NapCat WebUI 代理：查询与切换 bot 登录的 QQ 账号。
+"""QQ 的账号运维：经 NapCat WebUI 查询、切换、扫码登录 bot 的 QQ 号。
 
 WebUI 只监听 127.0.0.1，且有独立于本系统的 token——浏览器既够不到它，也不该拿到
-那个 token，所以账号相关操作一律由 supervisor 转发。
+那个 token，所以账号相关操作一律由 supervisor 经这里转发。
 """
 from __future__ import annotations
 
@@ -19,6 +19,15 @@ from typing import Any
 import httpx
 
 from clonoth_runtime import platform_secret, read_admin_token
+from platforms.account_ops import (
+    AccountConflict,
+    AccountOpsError,
+    AccountRequestInvalid,
+    AccountStatus,
+    AccountUnreachable,
+    QuickLoginTarget,
+    SwitchResult,
+)
 from platforms.builtin import QQ_NAPCAT
 
 _BASE_URL = "http://127.0.0.1:6099"
@@ -42,11 +51,11 @@ _READY_TIMEOUT_SEC = 90.0
 _READY_POLL_SEC = 1.5
 
 
-class NapCatError(RuntimeError):
+class NapCatError(AccountOpsError):
     """失败原因可以直接展示给人。"""
 
 
-class NapCatUnreachable(NapCatError):
+class NapCatUnreachable(NapCatError, AccountUnreachable):
     """WebUI 还没应答。换号重启和首次部署都会经过这里，不是故障。"""
 
 
@@ -76,7 +85,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _quick_login_target(item: Any) -> dict[str, Any] | None:
+def _quick_login_target(item: Any) -> QuickLoginTarget | None:
     """GetQuickLoginListNew 给对象，旧版 GetQuickLoginList 给裸 uin，两种都认。
 
     非数字 uin 一律丢掉：切换接口只收数字，放它过去就是让人点一个必然 400 的按钮。
@@ -91,7 +100,7 @@ def _quick_login_target(item: Any) -> dict[str, Any] | None:
         uin, nick, avatar, available = str(item or "").strip(), "", "", True
     if not uin.isdigit():
         return None
-    return {"uin": uin, "nick": nick, "avatar": avatar, "available": available}
+    return {"account": uin, "nick": nick, "avatar": avatar, "available": available}
 
 
 def _read_dead_logins(path: Path) -> dict[str, Any]:
@@ -269,60 +278,112 @@ class NapCatClient:
         key = str(uin or "").strip()
         if not key:
             return
-        dead = _read_dead_logins(self._dead_path)
+        dead = self.dead_logins()
         dead[key] = {"at": _now_iso(), "reason": str(reason or "").strip()}
         self._save_dead_logins(dead)
+
+    def dead_logins(self) -> dict[str, Any]:
+        return _read_dead_logins(self._dead_path)
 
     def clear_login_dead(self, uin: str) -> bool:
         """这个号又能用了，撤掉标记。"""
         key = str(uin or "").strip()
-        dead = _read_dead_logins(self._dead_path)
+        dead = self.dead_logins()
         if not key or key not in dead:
             return False
         dead.pop(key)
         self._save_dead_logins(dead)
         return True
 
-    async def account(self) -> dict[str, Any]:
-        """当前账号 + 可免扫码切换的号。任一子查询失败都不该让整页打不开。"""
-        info = await self.call("GetQQLoginInfo")
-        status: dict[str, Any] = {}
-        quick: list[Any] = []
+
+class NapCatAccountOps:
+    """账号运维约定的 QQ 实现。凭证缓存在 NapCatClient 上，supervisor 按平台只留一个实例。"""
+
+    def __init__(self, workspace_root: Path) -> None:
+        self.client = NapCatClient(workspace_root)
+
+    @property
+    def configured(self) -> bool:
+        return self.client.configured
+
+    async def status(self) -> AccountStatus:
+        """任一子查询失败都不该让整页打不开。"""
+        client = self.client
+        current = await client.call("GetQQLoginInfo") or {}
         try:
-            status = await self.call("CheckLoginStatus") or {}
+            login = await client.call("CheckLoginStatus") or {}
         except NapCatError:
-            status = {}
+            login = {}
         try:
-            quick = await self.call("GetQuickLoginListNew") or []
+            quick = await client.call("GetQuickLoginListNew") or []
         except NapCatError:
             quick = []
-        current = info or {}
-        is_login = bool(status.get("isLogin", False))
+        is_login = bool(login.get("isLogin", False))
         uin = str(current.get("uin") or "")
         # 扫码登回来了就撤掉死号标记，否则一次失效会永久跟着这个号。
         if is_login and uin:
-            self.clear_login_dead(uin)
-        dead = _read_dead_logins(self._dead_path)
-        targets = []
+            client.clear_login_dead(uin)
+        dead = client.dead_logins()
+        targets: list[QuickLoginTarget] = []
         for item in quick:
             target = _quick_login_target(item)
-            if not target:
+            if target is None:
                 continue
-            note = dead.get(target["uin"])
+            note = dead.get(target["account"])
             if isinstance(note, dict):
                 target["available"] = False
                 target["dead_reason"] = str(note.get("reason") or "")
             targets.append(target)
         return {
-            "uin": str(current.get("uin") or ""),
+            "account": uin,
             "nick": str(current.get("nick") or ""),
             # GetQQLoginInfo 不返回在线状态，只有 CheckLoginStatus 有；用它推会恒为「不在线」。
-            "online": is_login and not bool(status.get("isOffline", False)),
+            "online": is_login and not bool(login.get("isOffline", False)),
             "is_login": is_login,
             # NapCat 登录成功后不清扫码流程的残留，loginError 和 qrcodeurl 会一直留着
             # 上一轮的值 —— 照搬就成了「在线 — 二维码已过期」。登录上了就没有这两样。
-            "login_error": "" if is_login else str(status.get("loginError") or ""),
-            # 等扫码时这里就带着二维码，前端不必再单发一次请求去撞重启窗口。
-            "qrcode": "" if is_login else str(status.get("qrcodeurl") or ""),
+            "login_error": "" if is_login else str(login.get("loginError") or ""),
+            "qrcode": "" if is_login else str(login.get("qrcodeurl") or ""),
             "quick_login": targets,
         }
+
+    async def switch(self, account: str) -> SwitchResult:
+        uin = str(account or "").strip()
+        if not uin.isdigit():
+            raise AccountRequestInvalid("QQ 号必须是数字")
+        try:
+            await self.client.call("SetQuickLogin", {"uin": uin})
+        except NapCatUnreachable:
+            # 容器没起来跟这个号本身没关系，标死了下次就再也点不动。
+            raise
+        except NapCatError as exc:
+            # QQ 明确拒了才算死号：缓存的登录态过期后 isQuickLogin 仍报 true，
+            # 不记一笔的话这个号会永远停在列表里，点一次失败一次。
+            self.client.mark_login_dead(uin, str(exc))
+            raise
+        # 号已经切过去了，钉自动登录只是锦上添花：这一步失败不该让人以为没切成。
+        try:
+            await self.client.set_auto_login(uin)
+        except NapCatError as exc:
+            return {"ok": True, "account": uin, "pinned": False, "pin_error": str(exc)}
+        return {"ok": True, "account": uin, "pinned": True, "pin_error": ""}
+
+    async def login_qrcode(self) -> str:
+        data = await self.client.call("GetQQLoginQrcode")
+        payload = data if isinstance(data, dict) else {}
+        return str(payload.get("qrcode") or payload.get("qrcodeurl") or "")
+
+    async def relogin(self) -> None:
+        # NapCat 在已登录状态下拒发二维码，且不提供登出，只能重启进等扫码状态。
+        await self.client.enter_login_mode()
+
+    async def pin(self) -> str:
+        uin = (await self.status()).get("account", "")
+        if not uin:
+            raise AccountConflict("当前没有登录任何账号")
+        await self.client.set_auto_login(uin)
+        return uin
+
+
+def account_ops(workspace_root: Path) -> NapCatAccountOps:
+    return NapCatAccountOps(workspace_root)

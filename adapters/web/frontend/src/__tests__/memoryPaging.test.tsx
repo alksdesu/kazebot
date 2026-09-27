@@ -47,7 +47,7 @@ function stub({ namespaces = [] as any[], entries = [] as any[], conversations =
     if (url.includes('/memory/overview')) return jsonResponse({ namespaces });
     if (url.includes('/entries')) return jsonResponse({ entries });
     if (url.includes('/admin/conversations')) return jsonResponse({ conversations });
-    if (url.includes('/admin/qq/scope')) return jsonResponse({ current_scope: '', bot_alive: false });
+    if (url.includes('/platforms/qq/account/scope')) return jsonResponse({ current_scope: '', bot_alive: false });
     return jsonResponse({});
   }));
 }

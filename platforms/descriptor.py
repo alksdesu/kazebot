@@ -31,6 +31,8 @@ HOOK_TRIGGER_POLICY = "trigger_policy"
 HOOK_CONSOLE_SCHEMA = "console_schema"
 # 模块提供 known_accounts(workspace)：平台自己留下的、登录过的账号，离线迁移认会话键时拿来当候选。
 HOOK_KNOWN_ACCOUNTS = "known_accounts"
+# 模块提供 account_ops(workspace_root)，约定见 platforms/account_ops.py；控制台的登录、切号、扫码都走它。
+HOOK_ACCOUNT_OPS = "account_ops"
 
 # native 由驱动按平台 ID 渲染成真正的提及，text 只能写成「@名字」的文字。
 MENTION_NONE = "none"

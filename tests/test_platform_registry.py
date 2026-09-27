@@ -21,6 +21,7 @@ from platforms.descriptor import (  # noqa: E402
     CHANNEL_BRIDGE,
     CHANNEL_GROUP,
     CHANNEL_PRIVATE,
+    HOOK_ACCOUNT_OPS,
     HOOK_CONSOLE_SCHEMA,
     HOOK_KNOWN_ACCOUNTS,
     HOOK_TRIGGER_POLICY,
@@ -320,6 +321,12 @@ class TestFilesAndHooks:
         assert platform_hook(QQ_NAPCAT, HOOK_KNOWN_ACCOUNTS) is accounts
         assert accounts.known_accounts(tmp_path) == ["10001", "20002"]
         assert accounts.known_accounts(tmp_path / "elsewhere") == []
+
+    def test_the_account_ops_hook_is_the_qq_implementation(self) -> None:
+        from adapters.onebot import account_ops
+
+        assert platform_hook(QQ_NAPCAT, HOOK_ACCOUNT_OPS) is account_ops
+        assert callable(account_ops.account_ops)
 
     def test_the_shared_features_load_through_the_registry(self) -> None:
         from adapters._shared import features

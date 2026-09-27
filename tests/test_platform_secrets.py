@@ -28,6 +28,7 @@ if str(_ROOT / "tools") not in sys.path:
 
 from _channel import platform_secret as tool_platform_secret  # noqa: E402
 from _onebot_harness import body_attr, load_runtime  # noqa: E402
+from adapters.onebot.account_ops import NapCatClient, NapCatError  # noqa: E402
 from clonoth_runtime import (  # noqa: E402
     CONFIG_META_KEYS,
     PLATFORMS_CONFIG_KEY,
@@ -41,7 +42,6 @@ from clonoth_runtime import (  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 from platforms.descriptor import CHANNEL_GROUP, ChannelDescriptor, PlatformDescriptor, SecretField  # noqa: E402
 from platforms.registry import register_platform, unregister_platform  # noqa: E402
-from supervisor.napcat import NapCatClient, NapCatError  # noqa: E402
 from supervisor.operations.service import OperationsService  # noqa: E402
 from toolbox._common import safe_subprocess_env  # noqa: E402
 

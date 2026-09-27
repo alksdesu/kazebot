@@ -7,16 +7,16 @@ import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
 vi.mock('../api/supervisorClient', async importOriginal => ({
   ...await importOriginal<typeof import('../api/supervisorClient')>(),
-  getInstances: vi.fn(), getQqAccount: vi.fn(), getQqLoginQrcode: vi.fn(),
+  getInstances: vi.fn(), getPlatformAccount: vi.fn(), getPlatformLoginQrcode: vi.fn(),
   createInstance: vi.fn(), deleteInstance: vi.fn(), getInstanceProgress: vi.fn(),
-  qqEnterLoginMode: vi.fn(), qqQuickLogin: vi.fn(), qqPinAccount: vi.fn(), getQqScope: vi.fn(),
+  enterPlatformLoginMode: vi.fn(), switchPlatformAccount: vi.fn(), pinPlatformAccount: vi.fn(), getAccountScope: vi.fn(),
 }));
 
 const rows: api.ConsoleInstance[] = [
   { uin: '1000001', label: '主实例', path: '', current: true, idx: 0 },
   { uin: '1000002', label: '第二实例', path: '/i/1000002', current: false, idx: 1 },
 ];
-const account: api.QqAccount = { configured: true, reachable: true, is_login: true, online: true, uin: '1000001', nick: '当前机器人' };
+const account: api.AccountStatus = { configured: true, reachable: true, is_login: true, online: true, account: '1000001', nick: '当前机器人' };
 const deferred = <T,>() => {
   let resolve!: (value: T) => void;
   let reject!: (error: Error) => void;
@@ -28,8 +28,8 @@ beforeEach(() => {
   vi.resetAllMocks();
   useSettingsStore.setState({ adminToken: 'current-token', isAuthenticated: true });
   vi.mocked(api.getInstances).mockResolvedValue(rows);
-  vi.mocked(api.getQqAccount).mockResolvedValue(account);
-  vi.mocked(api.getQqScope).mockResolvedValue({
+  vi.mocked(api.getPlatformAccount).mockResolvedValue(account);
+  vi.mocked(api.getAccountScope).mockResolvedValue({
     current_scope: '1000001', live_scope: '1000001', bot_alive: false, preview: null, ambiguous_sources: [],
   });
   vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('unexpected request')));
@@ -42,7 +42,7 @@ describe('实例管理入口', () => {
     ['NapCat 未配置', { configured: false }],
     ['NapCat 离线', { configured: true, reachable: false }],
   ])('%s 时仍可进入其他实例，不再显示模板', async (_label, state) => {
-    vi.mocked(api.getQqAccount).mockResolvedValue(state);
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(state);
     render(<AccountWorkspaceSlot />);
     expect(await screen.findByRole('heading', { name: '多开实例' })).toBeInTheDocument();
     expect(await screen.findByRole('combobox', { name: '切换实例' })).toBeInTheDocument();
@@ -54,7 +54,7 @@ describe('实例管理入口', () => {
   });
 
   it('账号读取失败不阻塞实例列表，错误保留并可重试', async () => {
-    vi.mocked(api.getQqAccount).mockRejectedValueOnce(new Error('账号状态读取失败')).mockResolvedValue(account);
+    vi.mocked(api.getPlatformAccount).mockRejectedValueOnce(new Error('账号状态读取失败')).mockResolvedValue(account);
     render(<AccountWorkspaceSlot />);
     expect(await screen.findByText('账号状态读取失败')).toBeInTheDocument();
     expect(screen.getByRole('combobox', { name: '切换实例' })).toBeInTheDocument();
@@ -73,9 +73,9 @@ describe('实例管理入口', () => {
   });
 
   it('令牌变更时清空旧视图，拒绝旧账号和实例列表的迟到结果', async () => {
-    const oldAccount = deferred<api.QqAccount>();
+    const oldAccount = deferred<api.AccountStatus>();
     const oldRows = deferred<api.ConsoleInstance[]>();
-    vi.mocked(api.getQqAccount).mockReturnValueOnce(oldAccount.promise).mockResolvedValue({ ...account, nick: '新凭据机器人' });
+    vi.mocked(api.getPlatformAccount).mockReturnValueOnce(oldAccount.promise).mockResolvedValue({ ...account, nick: '新凭据机器人' });
     vi.mocked(api.getInstances).mockReturnValueOnce(oldRows.promise).mockResolvedValue([{ ...rows[0], label: '新凭据实例' }]);
     render(<AccountWorkspaceSlot />);
     act(() => useSettingsStore.setState({ adminToken: 'new-token' }));
@@ -87,9 +87,9 @@ describe('实例管理入口', () => {
   });
 
   it('凭据切换 A → B → A 后，第一次 A 的响应仍然失效', async () => {
-    const oldAccount = deferred<api.QqAccount>();
+    const oldAccount = deferred<api.AccountStatus>();
     const oldRows = deferred<api.ConsoleInstance[]>();
-    vi.mocked(api.getQqAccount).mockReturnValueOnce(oldAccount.promise).mockResolvedValue({ ...account, nick: '最新机器人' });
+    vi.mocked(api.getPlatformAccount).mockReturnValueOnce(oldAccount.promise).mockResolvedValue({ ...account, nick: '最新机器人' });
     vi.mocked(api.getInstances).mockReturnValueOnce(oldRows.promise).mockResolvedValue([{ ...rows[0], label: '最新实例' }]);
     render(<AccountWorkspaceSlot />);
     act(() => useSettingsStore.setState({ adminToken: 'other-token' }));
@@ -103,7 +103,7 @@ describe('实例管理入口', () => {
   });
 
   it('共享一份实例清单，归属别的实例的 QQ 只能进入其控制台', async () => {
-    vi.mocked(api.getQqAccount).mockResolvedValue({ ...account, quick_login: [{ uin: '1000002', nick: '另一个QQ' }] });
+    vi.mocked(api.getPlatformAccount).mockResolvedValue({ ...account, quick_login: [{ account: '1000002', nick: '另一个QQ' }] });
     render(<AccountWorkspaceSlot />);
     const quick = (await screen.findByRole('heading', { name: '快速切换' })).closest('section')!;
     expect(within(quick).getByRole('link', { name: '去它的控制台' })).toHaveAttribute('href', '/i/1000002/web/?view=settings&tab=qq-account');
@@ -113,12 +113,12 @@ describe('实例管理入口', () => {
 
   it('实例清单读取失败时不能绕过账号归属检查进行快速登录', async () => {
     vi.mocked(api.getInstances).mockRejectedValue(new Error('归属未知'));
-    vi.mocked(api.getQqAccount).mockResolvedValue({ ...account, quick_login: [{ uin: '1000002', nick: '另一个QQ' }] });
+    vi.mocked(api.getPlatformAccount).mockResolvedValue({ ...account, quick_login: [{ account: '1000002', nick: '另一个QQ' }] });
     render(<AccountWorkspaceSlot />);
     await screen.findByText('归属未知');
     expect(screen.getByRole('button', { name: '切到这个号' })).toBeDisabled();
     expect(screen.getByText(/实例归属尚未确认/)).toBeInTheDocument();
-    expect(api.qqQuickLogin).not.toHaveBeenCalled();
+    expect(api.switchPlatformAccount).not.toHaveBeenCalled();
   });
 
   it('实例整页跳转沿用原生离开保护，未放行时保留实例与草稿', async () => {
@@ -262,37 +262,37 @@ describe('实例创建与归档', () => {
 
 describe('账号操作请求归属', () => {
   it('旧登录轮询迟到时不能替新凭据固定自动登录账号', async () => {
-    const pending = deferred<api.QqAccount>();
+    const pending = deferred<api.AccountStatus>();
     let oldReads = 0;
-    vi.mocked(api.getQqAccount).mockImplementation(token => token === 'new-token'
+    vi.mocked(api.getPlatformAccount).mockImplementation(token => token === 'new-token'
       ? Promise.resolve({ ...account, nick: '新机器人' })
       : oldReads++ ? pending.promise : Promise.resolve({ ...account, is_login: false }));
     vi.useFakeTimers();
     await act(async () => render(<AccountWorkspaceSlot />));
     expect(screen.getByText('未登录')).toBeInTheDocument();
     await act(async () => vi.advanceTimersByTimeAsync(3000));
-    expect(api.getQqAccount).toHaveBeenCalledTimes(2);
+    expect(api.getPlatformAccount).toHaveBeenCalledTimes(2);
     await act(async () => useSettingsStore.setState({ adminToken: 'new-token' }));
     await act(async () => pending.resolve({ ...account, nick: '旧轮询机器人' }));
-    expect(api.qqPinAccount).not.toHaveBeenCalled();
+    expect(api.pinPlatformAccount).not.toHaveBeenCalled();
     expect(screen.getByText('新机器人')).toBeInTheDocument();
     expect(screen.queryByText('旧轮询机器人')).not.toBeInTheDocument();
   });
 
   it('旧凭据重启请求完成后不应对新账号启动登录轮询', async () => {
     const pending = deferred<void>();
-    vi.mocked(api.qqEnterLoginMode).mockReturnValue(pending.promise);
+    vi.mocked(api.enterPlatformLoginMode).mockReturnValue(pending.promise);
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     render(<AccountWorkspaceSlot />);
     await screen.findByText('当前机器人');
     fireEvent.click(screen.getByRole('button', { name: '换个号登录' }));
     act(() => useSettingsStore.setState({ adminToken: 'new-token' }));
-    await waitFor(() => expect(api.getQqAccount).toHaveBeenCalledWith('new-token'));
+    await waitFor(() => expect(api.getPlatformAccount).toHaveBeenCalledWith('new-token', 'qq'));
     vi.useFakeTimers();
     await act(async () => pending.resolve());
     await act(async () => vi.advanceTimersByTimeAsync(9000));
-    expect(api.getQqAccount).toHaveBeenCalledTimes(2);
-    expect(api.qqPinAccount).not.toHaveBeenCalled();
+    expect(api.getPlatformAccount).toHaveBeenCalledTimes(2);
+    expect(api.pinPlatformAccount).not.toHaveBeenCalled();
     expect(screen.queryByRole('heading', { name: '扫码登录' })).not.toBeInTheDocument();
   });
 });

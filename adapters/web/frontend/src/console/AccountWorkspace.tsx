@@ -7,23 +7,24 @@ import QRCode from 'qrcode';
 import {
   createInstance,
   deleteInstance,
+  enterPlatformLoginMode,
   getInstanceProgress,
   getInstances,
-  getQqAccount,
-  getQqLoginQrcode,
+  getPlatformAccount,
+  getPlatformLoginQrcode,
   ownedByAnotherInstance,
-  qqEnterLoginMode,
-  qqPinAccount,
-  qqQuickLogin,
+  pinPlatformAccount,
+  switchPlatformAccount,
+  type AccountStatus,
   type ConsoleInstance,
   type InstanceProgress,
-  type QqAccount,
-  type QqQuickLoginTarget,
+  type QuickLoginTarget,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { AccountScope } from './AccountScope';
 import { Block, Button, Empty, Facts, Input, Panel, Pre } from './components';
 import { InstanceLink, InstanceSwitch } from './InstanceSwitch';
+import { usePlatform } from './platformContext';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useRequestScope } from '../features/asyncState';
 
@@ -194,11 +195,12 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
 };
 
 const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: string; instances: ConsoleInstance[]; ownershipReady: boolean }) => {
+  const platformId = usePlatform().id;
   const identity = useRequestScope(token);
   const isCurrent = () => identity.isCurrent() && useSettingsStore.getState().adminToken === token;
   const mutation = useRef(false);
   const refreshSequence = useRef(0);
-  const [account, setAccount] = useState<QqAccount | null>(null);
+  const [status, setStatus] = useState<AccountStatus | null>(null);
   const [stage, setStage] = useState<Stage>('idle');
   const [qrImage, setQrImage] = useState('');
   const [note, setNote] = useState('正在读取…');
@@ -206,14 +208,14 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
   const [loading, setLoading] = useState(true);
   const stageStartedAt = useRef(0);
 
-  const refresh = useCallback(async (): Promise<QqAccount | null> => {
+  const refresh = useCallback(async (): Promise<AccountStatus | null> => {
     if (!isCurrent()) return null;
     const request = ++refreshSequence.current;
     setLoading(true);
     try {
-      const next = await getQqAccount(token);
+      const next = await getPlatformAccount(token, platformId);
       if (!isCurrent() || request !== refreshSequence.current) return null;
-      setAccount(next);
+      setStatus(next);
       setNote('');
       return next;
     } catch (error) {
@@ -223,7 +225,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
     } finally {
       if (isCurrent() && request === refreshSequence.current) setLoading(false);
     }
-  }, [token]);
+  }, [token, platformId]);
 
   useEffect(() => {
     void refresh();
@@ -232,7 +234,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
 
   // 没登录上就一直盯着：等容器应答、等二维码、等扫码结果。首次部署进页面就是
   // 这个状态，早先只在换号时才轮询，于是第一次进来只能靠人反复手点。
-  const watching = account?.configured === true && (account.reachable === false || !account.is_login);
+  const watching = status?.configured === true && (status.reachable === false || !status.is_login);
 
   useEffect(() => {
     if (!token || (stage === 'idle' && !watching)) return undefined;
@@ -256,14 +258,14 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
             return;
           }
 
-          if (next.is_login && next.uin) {
+          if (next.is_login && next.account) {
             setQrImage('');
             setStage('idle');
             try {
-              await qqPinAccount(token);
-              if (isCurrent()) setNote(`已登录 ${next.nick || next.uin}，并设为重启后自动登录。`);
+              await pinPlatformAccount(token, platformId);
+              if (isCurrent()) setNote(`已登录 ${next.nick || next.account}，并设为重启后自动登录。`);
             } catch (error) {
-              if (isCurrent()) setNote(`已登录 ${next.nick || next.uin}，但设置自动登录失败：${say(error)}`);
+              if (isCurrent()) setNote(`已登录 ${next.nick || next.account}，但设置自动登录失败：${say(error)}`);
             }
             return;
           }
@@ -271,7 +273,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
           if (stage === 'restarting' || !qrImage) {
             try {
               // CheckLoginStatus 在等扫码时就带着二维码，能省一次请求。
-              const raw = next.qrcode || (await getQqLoginQrcode(token)).qrcode;
+              const raw = next.qrcode || (await getPlatformLoginQrcode(token, platformId)).qrcode;
               if (!raw || !alive || !isCurrent()) return;
               const image = await QRCode.toDataURL(raw, { width: 240, margin: 1 });
               if (!alive || !isCurrent()) return;
@@ -286,11 +288,11 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
       })();
     }, POLL_MS);
     return () => { alive = false; window.clearInterval(timer); };
-  }, [stage, token, qrImage, refresh, watching]);
+  }, [stage, token, platformId, qrImage, refresh, watching]);
 
   const startRelogin = async () => {
-    if (!isCurrent() || mutation.current || stage !== 'idle' || !account?.configured) return;
-    const current = account?.nick || account?.uin || '当前账号';
+    if (!isCurrent() || mutation.current || stage !== 'idle' || !status?.configured) return;
+    const current = status?.nick || status?.account || '当前账号';
     if (!window.confirm(
       `确定要换号吗？\n\n${current} 会立刻下线，NapCat 容器重启后停在等扫码状态，`
       + '期间 bot 完全不可用。新号如果不在原来的群里，群名单和管理员名单都要重配。\n\n'
@@ -303,7 +305,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
     setQrImage('');
     setNote('正在重启 NapCat…');
     try {
-      await qqEnterLoginMode(token);
+      await enterPlatformLoginMode(token, platformId);
       if (!isCurrent()) return;
       stageStartedAt.current = Date.now();
       setStage('restarting');
@@ -315,15 +317,14 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
     }
   };
 
-  const switchTo = async (target: QqQuickLoginTarget) => {
-    if (!isCurrent() || mutation.current || !ownershipReady || stage !== 'idle' || target.available === false || target.uin === account?.uin || ownedByAnotherInstance(target.uin, instances)) return;
-    const { uin } = target;
-    const who = target.nick ? `${target.nick}（${uin}）` : uin;
+  const switchTo = async (target: QuickLoginTarget) => {
+    if (!isCurrent() || mutation.current || !ownershipReady || stage !== 'idle' || target.available === false || target.account === status?.account || ownedByAnotherInstance(target.account, instances)) return;
+    const who = target.nick ? `${target.nick}（${target.account}）` : target.account;
     if (!window.confirm(`切换到 ${who}？当前账号会下线，会话和长期记忆各号各算。`)) return;
     if (!isCurrent()) return;
     mutation.current = true; refreshSequence.current++; setLoading(false); setBusy(true);
     try {
-      await qqQuickLogin(token, uin);
+      await switchPlatformAccount(token, platformId, target.account);
       if (!isCurrent()) return;
       stageStartedAt.current = Date.now();
       setStage('restarting');
@@ -343,7 +344,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
     if (!isCurrent() || mutation.current) return;
     mutation.current = true; setBusy(true);
     try {
-      const { qrcode, reachable } = await getQqLoginQrcode(token);
+      const { qrcode, reachable } = await getPlatformLoginQrcode(token, platformId);
       if (!isCurrent()) return;
       const image = qrcode ? await QRCode.toDataURL(qrcode, { width: 240, margin: 1 }) : '';
       if (!isCurrent()) return;
@@ -360,7 +361,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
 
   if (!token) return <Empty>需要管理员令牌。</Empty>;
 
-  if (account && !account.configured) {
+  if (status && !status.configured) {
     return (
       <Block hint="supervisor 拿不到 NapCat 的 WebUI token" title="机器人账号">
         <Panel>
@@ -378,25 +379,25 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
     <>
       <Block hint="这一个实例现在用哪个号在说话" title="机器人账号">
         <Panel>
-          {account ? (
+          {status ? (
             <>
               <div className={ROW}>
                 <span className={LABEL}>账号</span>
                 <div className={BODY}>
-                  <code className="text-xs">{account.uin || '未登录'}</code>
-                  {account.nick && <span className={DESC}>{account.nick}</span>}
+                  <code className="text-xs">{status.account || '未登录'}</code>
+                  {status.nick && <span className={DESC}>{status.nick}</span>}
                 </div>
               </div>
               <div className={ROW}>
                 <span className={LABEL}>状态</span>
                 <div className={BODY}>
                   <span className={DESC}>
-                    {account.reachable === false
+                    {status.reachable === false
                       ? 'NapCat 没应答，容器可能正在重启'
-                      : account.is_login
-                        ? (account.online ? '在线' : '已登录，但不在线')
+                      : status.is_login
+                        ? (status.online ? '在线' : '已登录，但不在线')
                         : '未登录'}
-                    {account.login_error ? ` — ${account.login_error}` : ''}
+                    {status.login_error ? ` — ${status.login_error}` : ''}
                   </span>
                 </div>
               </div>
@@ -409,7 +410,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
             <div className={BODY}>
               <Button
                 className="flex-none"
-                disabled={busy || loading || stage !== 'idle' || !account}
+                disabled={busy || loading || stage !== 'idle' || !status}
                 onClick={() => void startRelogin()}
                 tone="quiet"
               >
@@ -455,13 +456,13 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
 
       <Block hint="换这一个实例登录的号，免扫码。数据不跟着走" title="快速切换">
         <Panel>
-          {account?.quick_login?.length ? (
-            account.quick_login.map((target) => {
-              const current = target.uin === account.uin;
+          {status?.quick_login?.length ? (
+            status.quick_login.map((target) => {
+              const current = target.account === status.account;
               const usable = target.available !== false;
-              const elsewhere = ownedByAnotherInstance(target.uin, instances);
+              const elsewhere = ownedByAnotherInstance(target.account, instances);
               return (
-                <div className={ROW} key={target.uin}>
+                <div className={ROW} key={target.account}>
                   <span className="flex min-w-0 flex-none items-center gap-2">
                     {target.avatar && (
                       <img
@@ -477,7 +478,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
                           {target.nick}
                         </strong>
                       )}
-                      <code className={DESC}>{target.uin}</code>
+                      <code className={DESC}>{target.account}</code>
                     </span>
                   </span>
                   <div className={BODY}>
@@ -517,9 +518,9 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
         </Panel>
       </Block>
 
-      {!ownershipReady && account?.quick_login?.length ? <Facts>实例归属尚未确认，请先刷新实例列表后再快速登录。</Facts> : null}
+      {!ownershipReady && status?.quick_login?.length ? <Facts>实例归属尚未确认，请先刷新实例列表后再快速登录。</Facts> : null}
 
-      {note && account && <Facts>{note}</Facts>}
+      {note && status && <Facts>{note}</Facts>}
     </>
   );
 };

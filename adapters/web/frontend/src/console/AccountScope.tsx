@@ -1,9 +1,10 @@
 // 账号作用域搬迁。换号之后同一个群会各记各的，这里把旧号名下的会话与记忆整批划给新号。
 import { useEffect, useRef, useState } from 'react';
 
-import { getQqScope, migrateQqScope, type ScopeStatus, type ScopeStoreCount } from '../api/supervisorClient';
+import { getAccountScope, migrateAccountScope, type ScopeStatus, type ScopeStoreCount } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Button, Footnote, Input } from './components';
+import { usePlatform } from './platformContext';
 
 const TEXT = 'mt-1.5 break-words text-xs leading-relaxed';
 const KW = 'mt-1 break-words font-mono text-mini text-[var(--duties-secondary)]';
@@ -24,6 +25,7 @@ const storeSummary = (stores: Record<string, ScopeStoreCount>): string => Object
 
 export const AccountScope = () => {
   const adminToken = useSettingsStore((state) => state.adminToken);
+  const platformId = usePlatform().id;
   const [status, setStatus] = useState<ScopeStatus | null>(null);
   const [target, setTarget] = useState('');
   const [note, setNote] = useState('');
@@ -37,7 +39,7 @@ export const AccountScope = () => {
     setPreviewTarget('');
     setBusy(true);
     try {
-      const result = await getQqScope(adminToken, withTarget, withSource);
+      const result = await getAccountScope(adminToken, platformId, withTarget, withSource);
       if (version !== requestVersion.current) return;
       setStatus(result);
       setPreviewTarget(withTarget);
@@ -45,7 +47,7 @@ export const AccountScope = () => {
     finally { if (version === requestVersion.current) setBusy(false); }
   };
 
-  useEffect(() => { void load(); return () => { requestVersion.current += 1; }; }, [adminToken]);
+  useEffect(() => { void load(); return () => { requestVersion.current += 1; }; }, [adminToken, platformId]);
 
   const preview = async (source?: string) => {
     if (busy || !target.trim()) return;
@@ -62,7 +64,7 @@ export const AccountScope = () => {
     setBusy(true);
     try {
       // 按预览认定的源账号搬：预览之后盘上多出别的账号的会话，也不会换成搬另一批。
-      const result = await migrateQqScope(adminToken, to, from);
+      const result = await migrateAccountScope(adminToken, platformId, to, from);
       setNote(`已搬迁 ${result.moved_memory_dirs} 份记忆、${result.sessions_changed} 个会话。备份在 ${result.backup_dir}`);
       await load();
     } catch (error) { setNote(say(error)); } finally { setBusy(false); }

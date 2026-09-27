@@ -1,7 +1,16 @@
 // [2026-05-16] Updated: tests for real Supervisor API client signatures.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, decideApproval, getAllToolNames, fetchActiveTasks, cancelTask, getQqScope } from '../api/supervisorClient';
+import { postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, decideApproval, getAllToolNames, fetchActiveTasks, cancelTask, enterPlatformLoginMode, getAccountScope, getPlatformAccount, getPlatformLoginQrcode, migrateAccountScope, pinPlatformAccount, switchPlatformAccount } from '../api/supervisorClient';
+
+function stubFetch(body: unknown = {}) {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  }));
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
 
 describe('Supervisor API client', () => {
   afterEach(() => {
@@ -51,22 +60,6 @@ describe('Supervisor API client', () => {
     // button. How: assert the client wrapper exists before wiring the modal. Purpose:
     // UI code can call one typed helper instead of constructing endpoint strings.
     expect(typeof cancelTask).toBe('function');
-  });
-
-  it('sends the picked migration source, an empty one included', async () => {
-    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({}), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    }));
-    vi.stubGlobal('fetch', fetchMock);
-
-    await getQqScope('secret-token');
-    await getQqScope('secret-token', '20002');
-    await getQqScope('secret-token', '20002', '');
-
-    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      '/v1/admin/qq/scope', '/v1/admin/qq/scope?target=20002', '/v1/admin/qq/scope?target=20002&source=',
-    ]);
   });
 
   it('fetches active task summaries with the admin bearer token', async () => {
@@ -119,5 +112,119 @@ describe('Supervisor API client', () => {
     expect(fetchMock).toHaveBeenCalledWith('/v1/admin/config/all-tool-names', {
       headers: { Authorization: 'Bearer secret-token' },
     });
+  });
+});
+
+describe('Platform account client', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('reads the account of the addressed platform', async () => {
+    const fetchMock = stubFetch({ configured: true, account: '1000001' });
+
+    await expect(getPlatformAccount('secret-token', 'qq')).resolves.toEqual({ configured: true, account: '1000001' });
+    expect(fetchMock).toHaveBeenCalledWith('/v1/platforms/qq/account', {
+      headers: { Authorization: 'Bearer secret-token' },
+    });
+  });
+
+  it('reads an empty account response as unconfigured', async () => {
+    stubFetch(null);
+
+    await expect(getPlatformAccount('secret-token', 'qq')).resolves.toEqual({ configured: false });
+  });
+
+  it('escapes the platform id in every account path', async () => {
+    const fetchMock = stubFetch();
+
+    await getPlatformAccount('secret-token', 'we chat/v2');
+    await switchPlatformAccount('secret-token', 'we chat/v2', '1000002');
+    await enterPlatformLoginMode('secret-token', 'we chat/v2');
+    await pinPlatformAccount('secret-token', 'we chat/v2');
+    await getPlatformLoginQrcode('secret-token', 'we chat/v2');
+    await getAccountScope('secret-token', 'we chat/v2');
+    await migrateAccountScope('secret-token', 'we chat/v2', '20002');
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      '/v1/platforms/we%20chat%2Fv2/account',
+      '/v1/platforms/we%20chat%2Fv2/account/switch',
+      '/v1/platforms/we%20chat%2Fv2/account/relogin',
+      '/v1/platforms/we%20chat%2Fv2/account/pin',
+      '/v1/platforms/we%20chat%2Fv2/account/qrcode',
+      '/v1/platforms/we%20chat%2Fv2/account/scope',
+      '/v1/platforms/we%20chat%2Fv2/account/scope/migrate',
+    ]);
+  });
+
+  it('names the switch target with the platform-neutral account field', async () => {
+    const fetchMock = stubFetch();
+
+    await switchPlatformAccount('secret-token', 'qq', '1000002');
+
+    expect(fetchMock).toHaveBeenCalledWith('/v1/platforms/qq/account/switch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer secret-token' },
+      body: '{"account":"1000002"}',
+    });
+  });
+
+  it('posts an empty body for relogin and pin', async () => {
+    const fetchMock = stubFetch();
+
+    await enterPlatformLoginMode('secret-token', 'qq');
+    await pinPlatformAccount('secret-token', 'qq');
+
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method, init?.body])).toEqual([
+      ['/v1/platforms/qq/account/relogin', 'POST', '{}'],
+      ['/v1/platforms/qq/account/pin', 'POST', '{}'],
+    ]);
+  });
+
+  it('requests the login qrcode and fills in the missing fields', async () => {
+    const fetchMock = stubFetch({ qrcode: 'qr-payload' });
+
+    await expect(getPlatformLoginQrcode('secret-token', 'qq')).resolves.toEqual({
+      qrcode: 'qr-payload', reachable: true, reason: '',
+    });
+    expect(fetchMock).toHaveBeenCalledWith('/v1/platforms/qq/account/qrcode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer secret-token' },
+      body: '{}',
+    });
+  });
+
+  it('keeps an unreachable platform out of the qrcode result', async () => {
+    stubFetch({ reachable: false, reason: '容器还没起来' });
+
+    await expect(getPlatformLoginQrcode('secret-token', 'qq')).resolves.toEqual({
+      qrcode: '', reachable: false, reason: '容器还没起来',
+    });
+  });
+
+  it('sends the picked migration source, an empty one included', async () => {
+    const fetchMock = stubFetch();
+
+    await getAccountScope('secret-token', 'qq');
+    await getAccountScope('secret-token', 'qq', '20002');
+    await getAccountScope('secret-token', 'qq', '20002', '');
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      '/v1/platforms/qq/account/scope',
+      '/v1/platforms/qq/account/scope?target=20002',
+      '/v1/platforms/qq/account/scope?target=20002&source=',
+    ]);
+  });
+
+  it('carries the same source rule into the migration body', async () => {
+    const fetchMock = stubFetch();
+
+    await migrateAccountScope('secret-token', 'qq', '20002');
+    await migrateAccountScope('secret-token', 'qq', '20002', '');
+
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method, init?.body])).toEqual([
+      ['/v1/platforms/qq/account/scope/migrate', 'POST', '{"target":"20002"}'],
+      ['/v1/platforms/qq/account/scope/migrate', 'POST', '{"target":"20002","source":""}'],
+    ]);
   });
 });

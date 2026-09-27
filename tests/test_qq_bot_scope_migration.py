@@ -25,6 +25,14 @@ from adapters._shared import conversation_hash as ch  # noqa: E402
 from supervisor._helpers import SessionInfo  # noqa: E402
 from adapters._shared.active_account import ActiveAccountStore, normalize_account  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
+from platforms.descriptor import (  # noqa: E402
+    CHANNEL_GROUP,
+    ID_SCOPE_ACCOUNT,
+    ChannelDescriptor,
+    PlatformDescriptor,
+    SecretField,
+)
+from platforms.registry import register_platform, unregister_platform  # noqa: E402
 import supervisor.admin_api as admin_api  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
@@ -52,6 +60,20 @@ _OTHER_REAL = "qq_group:987654321"
 _OLD_BOT = "10000001"
 _NEW_BOT = "10000002"
 _QQ_ENVS = ("ONEBOT_CONVERSATION_HASH_SECRET", "ONEBOT_CONVERSATION_HASH_SECRET_FILE", "ONEBOT_STATE_FILE")
+_LEGACY_SCOPE = "/v1/admin/qq/scope"
+_PLATFORM_SCOPE = "/v1/platforms/qq/account/scope"
+_SCOPE_ROUTES = pytest.mark.parametrize("scope", [_LEGACY_SCOPE, _PLATFORM_SCOPE], ids=["legacy", "platform"])
+
+PLAINCHAT = PlatformDescriptor(
+    id="plainchat", display_name="无归属平台", short_name="PC",
+    channels=(ChannelDescriptor("pc_group", CHANNEL_GROUP),),
+)
+PERACCOUNT = PlatformDescriptor(
+    id="peraccount", display_name="按号发号平台", short_name="PA",
+    channels=(ChannelDescriptor("pa_group", CHANNEL_GROUP),),
+    id_scope=ID_SCOPE_ACCOUNT,
+    secrets=(SecretField(ch.SECRET_NAME, "会话键摘要密钥", env="PERACCOUNT_HASH_SECRET"),),
+)
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +82,15 @@ def _no_deployment_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (*_QQ_ENVS, "CLONOTH_WORKSPACE", "ONEBOT_WORKSPACE_ROOT"):
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
+
+
+@pytest.fixture
+def plainchat() -> PlatformDescriptor:
+    register_platform(PLAINCHAT)
+    try:
+        yield PLAINCHAT
+    finally:
+        unregister_platform(PLAINCHAT.id)
 
 
 def _store(workspace: Path) -> ActiveAccountStore:
@@ -377,7 +408,7 @@ class TestScopeMigration:
 
     def test_a_non_numeric_target_is_refused(self, tmp_path: Path) -> None:
         _seed(tmp_path)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="--to 必须是目标 bot 的QQ 号（纯数字）"):
             migrate.run_scope_migration(
                 workspace=tmp_path, target_scope="not-a-qq", source_scope="", apply=True,
             )
@@ -619,6 +650,79 @@ class TestDeploymentsThatMoveThings:
         assert f"源账号: {_OLD_BOT}" in done.stdout and "待搬迁会话数: 1" in done.stdout
 
 
+class TestPlatformChoice:
+    """哪些平台搬得动，以及命令行怎么认平台。"""
+
+    def _cli(self, capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, str, str]:
+        code = migrate.main(list(argv))
+        captured = capsys.readouterr()
+        return code, captured.out, captured.err
+
+    def test_qq_hands_its_data_over(self) -> None:
+        assert migrate.check_platform(QQ_NAPCAT) is QQ_NAPCAT
+
+    def test_a_platform_without_scoped_keys_has_no_ownership_to_move(self) -> None:
+        with pytest.raises(migrate.UnsupportedPlatform, match="不按账号分作用域"):
+            migrate.check_platform(PLAINCHAT)
+
+    def test_ids_issued_per_account_are_sent_to_the_other_script(self) -> None:
+        with pytest.raises(migrate.UnsupportedPlatform, match="migrate_platform_identity.py"):
+            migrate.check_platform(PERACCOUNT)
+
+    def test_an_unsupported_platform_stops_before_reading_the_workspace(self, tmp_path: Path) -> None:
+        seed = _seed(tmp_path, scope=_OLD_BOT)
+
+        with pytest.raises(migrate.UnsupportedPlatform):
+            migrate.run_scope_migration(
+                workspace=tmp_path, target_scope=_NEW_BOT, source_scope=_OLD_BOT, apply=True, platform=PLAINCHAT,
+            )
+
+        assert (tmp_path / "data" / "memory" / seed["ns"]).is_dir()
+        assert list(_routes(tmp_path)) == [seed["stable"]]
+        assert _store(tmp_path).load() == _OLD_BOT
+
+    def test_an_unknown_platform_lists_the_ones_it_knows(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        code, _out, err = self._cli(capsys, "--workspace", str(tmp_path), "--platform", "wechat", "--to", _NEW_BOT)
+
+        assert code == 2
+        assert "不认识的平台 'wechat'" in err and QQ_NAPCAT.id in err
+
+    @pytest.mark.parametrize("name", ["QQ · NapCat", "qq_group"])
+    def test_only_the_id_and_its_aliases_name_a_platform(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], name: str,
+    ) -> None:
+        # 显示名和通道名认得出平台，但写在 --platform 里一律当没写对：它们会随文案改。
+        code, _out, err = self._cli(capsys, "--workspace", str(tmp_path), "--platform", name, "--to", _NEW_BOT)
+
+        assert code == 2 and "不认识的平台" in err
+
+    def test_a_historical_alias_still_names_qq(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _seed(tmp_path, scope=_OLD_BOT)
+
+        code, out, err = self._cli(capsys, "--workspace", str(tmp_path), "--platform", "onebot", "--to", _NEW_BOT)
+
+        assert code == 0, err
+        assert f"源账号: {_OLD_BOT}" in out and "待搬迁会话数: 1" in out
+
+    def test_an_unsupported_platform_changes_nothing_on_disk(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], plainchat: PlatformDescriptor,
+    ) -> None:
+        seed = _seed(tmp_path, scope=_OLD_BOT)
+
+        code, _out, err = self._cli(
+            capsys, "--workspace", str(tmp_path), "--platform", plainchat.id, "--to", _NEW_BOT, "--apply",
+        )
+
+        assert code == 2 and "没法搬，未改动任何文件" in err
+        assert (tmp_path / "data" / "memory" / seed["ns"]).is_dir()
+        assert list(_routes(tmp_path)) == [seed["stable"]]
+        assert _store(tmp_path).load() == _OLD_BOT
+
+
 class TestSupervisorScopeQuery:
     _TOKEN = "scope-admin-token"
 
@@ -658,10 +762,13 @@ class TestSupervisorScopeQuery:
         _store(tmp_path).save(_OLD_BOT)
         assert migrate.recorded_scope(tmp_path) == _OLD_BOT
 
-    def test_the_console_sees_the_recorded_account(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    @_SCOPE_ROUTES
+    def test_the_console_sees_the_recorded_account(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str,
+    ) -> None:
         _store(tmp_path).save(_OLD_BOT)
 
-        response = self._get(tmp_path, monkeypatch, "/v1/admin/qq/scope")
+        response = self._get(tmp_path, monkeypatch, scope)
 
         assert response.status_code == 200
         assert response.json() == {
@@ -698,27 +805,30 @@ class TestSupervisorScopeQuery:
         assert response.status_code == 409 and "停掉 bot" in response.json()["detail"]
         assert (tmp_path / "data" / "memory" / seed["ns"]).is_dir()
 
+    @_SCOPE_ROUTES
     def test_a_bot_that_went_quiet_no_longer_blocks_the_migration(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str,
     ) -> None:
         _seed(tmp_path, scope=_OLD_BOT)
         self._publish(tmp_path, age=3600)
 
         response = self._call(
-            tmp_path, monkeypatch, "POST", "/v1/admin/qq/scope/migrate", body={"target": _NEW_BOT, "source": _OLD_BOT},
+            tmp_path, monkeypatch, "POST", f"{scope}/migrate", body={"target": _NEW_BOT, "source": _OLD_BOT},
         )
 
         assert response.status_code == 200, response.text
-        assert self._get(tmp_path, monkeypatch, "/v1/admin/qq/scope").json()["bot_alive"] is False
+        assert response.json()["target_scope"] == _NEW_BOT
+        assert self._get(tmp_path, monkeypatch, scope).json()["bot_alive"] is False
 
+    @_SCOPE_ROUTES
     def test_the_console_preview_works_when_the_secret_is_in_the_environment(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str,
     ) -> None:
         _seed(tmp_path, scope=_OLD_BOT)
         (tmp_path / "data" / "onebot_conversation_hash_secret").unlink()
         monkeypatch.setenv("ONEBOT_CONVERSATION_HASH_SECRET", _SECRET)
 
-        response = self._get(tmp_path, monkeypatch, f"/v1/admin/qq/scope?target={_NEW_BOT}")
+        response = self._get(tmp_path, monkeypatch, f"{scope}?target={_NEW_BOT}")
 
         assert response.status_code == 200, response.text
         assert response.json()["preview"]["source_scope"] == _OLD_BOT

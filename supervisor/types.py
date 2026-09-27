@@ -259,8 +259,14 @@ class PolicyUpdateIn(BaseModel):
     policy: dict[str, Any]
 
 
+class AccountSwitchIn(BaseModel):
+    """切到某个此前登录过的号。没有缓存登录态的号只能扫码。"""
+
+    account: str
+
+
 class QqQuickLoginIn(BaseModel):
-    """切到某个此前登录过的 QQ 号。没有缓存登录态的号只能扫码。"""
+    """改路径之前的 QQ 切号请求，账号字段叫 uin。"""
 
     uin: str
 

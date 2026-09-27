@@ -12,7 +12,7 @@ vi.mock('../api/supervisorClient', async importOriginal => ({
   getProviderProfiles: vi.fn(), getProviders: vi.fn(), getNodes: vi.fn(), getRuntimeRaw: vi.fn(), getNodeRaw: vi.fn(),
   updateRuntimeRaw: vi.fn(), updateNodeRaw: vi.fn(), upsertProvider: vi.fn(), setActiveProvider: vi.fn(), deleteProvider: vi.fn(),
   getMemoryOverview: vi.fn(), getMemoryEntries: vi.fn(), saveMemoryEntry: vi.fn(), deleteMemoryEntry: vi.fn(), clearMemoryNamespace: vi.fn(),
-  getConversations: vi.fn(), getConversationMessages: vi.fn(), resetConversationBySession: vi.fn(), getQqScope: vi.fn(), migrateQqScope: vi.fn(),
+  getConversations: vi.fn(), getConversationMessages: vi.fn(), resetConversationBySession: vi.fn(), getAccountScope: vi.fn(), migrateAccountScope: vi.fn(),
 }));
 vi.mock('../console/FallbackChain', () => ({ FallbackChain: () => null }));
 vi.mock('../console/SystemSlots', () => ({ SystemSlots: () => null }));
@@ -75,8 +75,8 @@ beforeEach(() => {
   vi.mocked(api.saveMemoryEntry).mockResolvedValue(memoryEntry('已保存'));
   vi.mocked(api.getConversations).mockResolvedValue([]);
   vi.mocked(api.getConversationMessages).mockResolvedValue({ total: 0, messages: [] });
-  vi.mocked(api.getQqScope).mockImplementation(async (_auth, target) => scopeStatus(target));
-  vi.mocked(api.migrateQqScope).mockResolvedValue({ moved_memory_dirs: 1, sessions_changed: 1, backup_dir: 'synthetic-backup' });
+  vi.mocked(api.getAccountScope).mockImplementation(async (_auth, _platform, target) => scopeStatus(target));
+  vi.mocked(api.migrateAccountScope).mockResolvedValue({ moved_memory_dirs: 1, sessions_changed: 1, backup_dir: 'synthetic-backup' });
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
@@ -230,21 +230,21 @@ describe('迁移预览目标绑定', () => {
     fireEvent.change(screen.getByLabelText('搬到'), { target: { value: '20002' } }); fireEvent.click(screen.getByRole('button', { name: '预览' }));
     await screen.findByRole('button', { name: '执行搬迁' });
     fireEvent.change(screen.getByLabelText('搬到'), { target: { value: '30003' } });
-    expect(screen.queryByRole('button', { name: '执行搬迁' })).not.toBeInTheDocument(); expect(api.migrateQqScope).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: '执行搬迁' })).not.toBeInTheDocument(); expect(api.migrateAccountScope).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: '预览' })); fireEvent.click(await screen.findByRole('button', { name: '执行搬迁' }));
-    await waitFor(() => expect(api.migrateQqScope).toHaveBeenCalledWith('fixture-auth', '30003', '10001'));
-    expect(api.migrateQqScope).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(api.migrateAccountScope).toHaveBeenCalledWith('fixture-auth', 'qq', '30003', '10001'));
+    expect(api.migrateAccountScope).toHaveBeenCalledTimes(1);
   });
   it('预览和迁移期间禁用目标输入，失败保留受绑定的目标供重试', async () => {
-    const preview = deferred<api.ScopeStatus>(); const write = deferred<Awaited<ReturnType<typeof api.migrateQqScope>>>();
-    vi.mocked(api.getQqScope).mockImplementation(async (_auth, target) => target ? preview.promise : scopeStatus());
-    vi.mocked(api.migrateQqScope).mockReturnValue(write.promise);
+    const preview = deferred<api.ScopeStatus>(); const write = deferred<Awaited<ReturnType<typeof api.migrateAccountScope>>>();
+    vi.mocked(api.getAccountScope).mockImplementation(async (_auth, _platform, target) => target ? preview.promise : scopeStatus());
+    vi.mocked(api.migrateAccountScope).mockReturnValue(write.promise);
     render(<AccountScope />); await screen.findByText('10001');
     fireEvent.change(screen.getByLabelText('搬到'), { target: { value: ' 20002 ' } }); fireEvent.click(screen.getByRole('button', { name: '预览' }));
     expect(screen.getByLabelText('搬到')).toBeDisabled();
     await act(async () => preview.resolve(scopeStatus('20002')));
     fireEvent.click(screen.getByRole('button', { name: '执行搬迁' })); expect(screen.getByLabelText('搬到')).toBeDisabled();
-    expect(api.migrateQqScope).toHaveBeenCalledWith('fixture-auth', '20002', '10001');
+    expect(api.migrateAccountScope).toHaveBeenCalledWith('fixture-auth', 'qq', '20002', '10001');
     await act(async () => write.reject(Error('迁移失败'))); await screen.findByText('迁移失败');
     expect(screen.getByLabelText('搬到')).toHaveValue(' 20002 '); expect(screen.getByLabelText('搬到')).toBeEnabled();
     expect(screen.getByRole('button', { name: '执行搬迁' })).toBeEnabled();
@@ -257,7 +257,7 @@ describe('迁移源账号与预览内容', () => {
     fireEvent.change(screen.getByLabelText('搬到'), { target: { value: target } }); fireEvent.click(screen.getByRole('button', { name: '预览' }));
   };
   it('分属几个账号时先挑源账号，执行时带着它', async () => {
-    vi.mocked(api.getQqScope).mockImplementation(async (_auth, target, source) => {
+    vi.mocked(api.getAccountScope).mockImplementation(async (_auth, _platform, target, source) => {
       if (!target) return scopeStatus();
       if (source === undefined) return { ...scopeStatus(), ambiguous_sources: [{ scope: '', conversations: 2 }, { scope: '10001', conversations: 1 }] };
       return scopePreview(target, { source_scope: source, other_scopes: [{ scope: '10001', conversations: 1 }] });
@@ -267,14 +267,14 @@ describe('迁移源账号与预览内容', () => {
     expect(screen.queryByRole('button', { name: '执行搬迁' })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '「无归属」名下的 2 个会话' }));
     await screen.findByRole('button', { name: '执行搬迁' });
-    expect(api.getQqScope).toHaveBeenLastCalledWith('fixture-auth', '20002', '');
+    expect(api.getAccountScope).toHaveBeenLastCalledWith('fixture-auth', 'qq', '20002', '');
     expect(screen.getByText('「10001」名下还有 1 个会话，不在这次搬迁里。')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '「无归属」名下的 2 个会话' })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '执行搬迁' }));
-    await waitFor(() => expect(api.migrateQqScope).toHaveBeenCalledWith('fixture-auth', '20002', ''));
+    await waitFor(() => expect(api.migrateAccountScope).toHaveBeenCalledWith('fixture-auth', 'qq', '20002', ''));
   });
   it('预览列出要改写的功能数据、查不到归属的记忆和两边都有记忆的会话', async () => {
-    vi.mocked(api.getQqScope).mockImplementation(async (_auth, target) => target ? scopePreview(target, {
+    vi.mocked(api.getAccountScope).mockImplementation(async (_auth, _platform, target) => target ? scopePreview(target, {
       conversations: [
         { old_namespace: 'old-a', new_namespace: 'new-a', has_memory: true, blocked: false },
         { old_namespace: 'old-b', new_namespace: 'new-b', has_memory: true, blocked: true },
@@ -292,7 +292,7 @@ describe('迁移源账号与预览内容', () => {
     expect(screen.getByText('另有 3 份记忆查不到归属，搬不了，会原样留着。')).toBeInTheDocument();
   });
   it('没有能搬的会话时不提功能数据，也不给执行', async () => {
-    vi.mocked(api.getQqScope).mockImplementation(async (_auth, target) => target ? scopePreview(target, {
+    vi.mocked(api.getAccountScope).mockImplementation(async (_auth, _platform, target) => target ? scopePreview(target, {
       conversations: [{ old_namespace: 'old-b', new_namespace: 'new-b', has_memory: true, blocked: true }],
     }) : scopeStatus());
     await openPreview('20002');

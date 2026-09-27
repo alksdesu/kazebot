@@ -365,7 +365,7 @@ start_and_verify() {
     || warn "$BOT_PORT 没在听，NapCat 会连不上：journalctl -u kazebot-qq -n 50"
 
   curl -fsS --max-time 5 -H "Authorization: Bearer $(cat "$REPO/data/.admin_token")" \
-    "http://127.0.0.1:$SUP_PORT/v1/qq/account" 2>/dev/null | grep -q '"configured": *true' \
+    "http://127.0.0.1:$SUP_PORT/v1/platforms/qq/account" 2>/dev/null | grep -q '"configured": *true' \
     && info "NapCat 通道就绪，控制台可以扫码" \
     || warn "控制台还连不上 NapCat，扫码页可能是空的：docker logs napcat"
 }

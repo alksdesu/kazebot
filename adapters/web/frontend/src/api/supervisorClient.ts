@@ -665,31 +665,31 @@ export async function updatePolicy(token: string, policy: PolicyDoc): Promise<Po
   return (data && data.policy) || {};
 }
 
-// ── bot 登录账号（经 supervisor 转发 NapCat WebUI）──
+// ── bot 登录账号（经 supervisor 转发给平台的账号运维）──
 
 /** 此前登录过、可以免扫码切回去的号。 */
-export interface QqQuickLoginTarget {
-  uin: string;
+export interface QuickLoginTarget {
+  account: string;
   nick?: string;
   avatar?: string;
-  /** 切过一次被 QQ 拒了。NapCat 自报的 isQuickLogin 在这种情况下仍会给 true。 */
+  /** 切过一次被平台拒了。平台自报的免扫码标记在这种情况下仍会给 true。 */
   available?: boolean;
   dead_reason?: string;
 }
 
-export interface QqAccount {
+export interface AccountStatus {
   configured: boolean;
-  /** NapCat 有没有应答。容器重启期间为 false，这不是错误。 */
+  /** 平台那头有没有应答。重启期间为 false，这不是错误。 */
   reachable?: boolean;
   reason?: string;
-  uin?: string;
+  account?: string;
   nick?: string;
   online?: boolean;
   is_login?: boolean;
   login_error?: string;
-  /** 等扫码时 NapCat 会把二维码一并带出来。 */
+  /** 等扫码时会把二维码一并带出来。 */
   qrcode?: string;
-  quick_login?: QqQuickLoginTarget[];
+  quick_login?: QuickLoginTarget[];
 }
 
 /** 一个后端实例 = 一个 QQ 号。多开时它们共用域名，各自挂在 path 下。 */
@@ -781,47 +781,50 @@ export async function deleteInstance(token: string, uin: string): Promise<void> 
   });
 }
 
-export async function getQqAccount(token: string): Promise<QqAccount> {
-  const resp = await apiFetch('/qq/account', { headers: authHeaders(token) });
+const platformAccountPath = (platformId: string, leaf = ''): string =>
+  `/platforms/${encodeURIComponent(platformId)}/account${leaf}`;
+
+export async function getPlatformAccount(token: string, platformId: string): Promise<AccountStatus> {
+  const resp = await apiFetch(platformAccountPath(platformId), { headers: authHeaders(token) });
   const data = await resp.json();
   return data || { configured: false };
 }
 
-export async function qqQuickLogin(token: string, uin: string): Promise<void> {
-  await apiFetch('/qq/account/quick-login', {
+export async function switchPlatformAccount(token: string, platformId: string, account: string): Promise<void> {
+  await apiFetch(platformAccountPath(platformId, '/switch'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ uin }),
+    body: JSON.stringify({ account }),
   });
 }
 
-/** 清掉自动登录并重启容器：NapCat 在已登录状态下拒发二维码，也没有登出接口。 */
-export async function qqEnterLoginMode(token: string): Promise<void> {
-  await apiFetch('/qq/account/relogin', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: '{}',
-  });
-}
-
-/** 把当前在线的号钉成自动登录，否则下次容器重启会停在等扫码。 */
-export async function qqPinAccount(token: string): Promise<void> {
-  await apiFetch('/qq/account/pin', {
+/** 让平台停在等扫码的状态。QQ 在已登录状态下拒发二维码、也没有登出接口，只能清掉自动登录再重启容器。 */
+export async function enterPlatformLoginMode(token: string, platformId: string): Promise<void> {
+  await apiFetch(platformAccountPath(platformId, '/relogin'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
     body: '{}',
   });
 }
 
-export interface QqQrcode {
+/** 把当前在线的号钉成自动登录，否则下次重启会停在等扫码。 */
+export async function pinPlatformAccount(token: string, platformId: string): Promise<void> {
+  await apiFetch(platformAccountPath(platformId, '/pin'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: '{}',
+  });
+}
+
+export interface LoginQrcode {
   qrcode: string;
-  /** false 表示 NapCat 还没起来，等下一轮即可，不必当成失败。 */
+  /** false 表示平台那头还没起来，等下一轮即可，不必当成失败。 */
   reachable: boolean;
   reason?: string;
 }
 
-export async function getQqLoginQrcode(token: string): Promise<QqQrcode> {
-  const resp = await apiFetch('/qq/account/qrcode', {
+export async function getPlatformLoginQrcode(token: string, platformId: string): Promise<LoginQrcode> {
+  const resp = await apiFetch(platformAccountPath(platformId, '/qrcode'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
     body: '{}',
@@ -1079,18 +1082,30 @@ export interface ScopeStatus {
   ambiguous_sources: ScopeCount[];
 }
 
-export async function getQqScope(token: string, target = '', source?: string): Promise<ScopeStatus> {
+export async function getAccountScope(
+  token: string,
+  platformId: string,
+  target = '',
+  source?: string,
+): Promise<ScopeStatus> {
   const params = new URLSearchParams();
   if (target) params.set('target', target);
   // 空串是「没有归属的存量」，和不传是两回事。
   if (source !== undefined) params.set('source', source);
   const query = params.toString();
-  const resp = await apiFetch(`/admin/qq/scope${query ? `?${query}` : ''}`, { headers: authHeaders(token) });
+  const resp = await apiFetch(`${platformAccountPath(platformId, '/scope')}${query ? `?${query}` : ''}`, {
+    headers: authHeaders(token),
+  });
   return resp.json();
 }
 
-export async function migrateQqScope(token: string, target: string, source?: string): Promise<any> {
-  const resp = await apiFetch('/admin/qq/scope/migrate', {
+export async function migrateAccountScope(
+  token: string,
+  platformId: string,
+  target: string,
+  source?: string,
+): Promise<any> {
+  const resp = await apiFetch(platformAccountPath(platformId, '/scope/migrate'), {
     method: 'POST',
     headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
     body: JSON.stringify(source === undefined ? { target } : { target, source }),

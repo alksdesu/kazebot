@@ -1,4 +1,4 @@
-"""把一个 bot QQ 号名下的会话与长期记忆整体搬到另一个号名下：离线、可 dry-run、自动备份。
+"""把一个 bot 账号名下的会话与长期记忆整体搬到另一个号名下：离线、可 dry-run、自动备份。默认搬 QQ。
 
 会话键摘要按 bot 账号分作用域，换号即换命名空间。存量数据是在没有作用域时攒的，
 用 --from "" --to <当前号> 把它们一次性划给当前账号；别的账号名下的会话原样留着。
@@ -22,6 +22,8 @@ from adapters._shared import conversation_hash as _conversation_hash  # noqa: E4
 from adapters._shared.active_account import ActiveAccountStore, account_candidates, normalize_account  # noqa: E402
 from clonoth_runtime import offline_workspace  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
+from platforms.descriptor import ID_NUMERIC, ID_SCOPE_PLATFORM, PlatformDescriptor, normalize_name  # noqa: E402
+from platforms.registry import all_platforms, find_platform  # noqa: E402
 from supervisor.conversation_stores import LiveRekey, format_store_counts, rekey_conversation_stores  # noqa: E402
 from workspace import workspace_instance  # noqa: E402
 
@@ -32,6 +34,10 @@ from engine.conversation_migration import (  # noqa: E402
     ConversationRekey, RekeyCount, Rename, Unresolved, apply_migration, load_route_map, plan_migration,
     route_state_file,
 )
+
+
+class UnsupportedPlatform(ValueError):
+    """这个平台没有可以整批搬的账号归属。"""
 
 
 class ScopeMismatch(RuntimeError):
@@ -77,25 +83,43 @@ class ScopeReport:
         return self.stores.get("sessions", RekeyCount()).moved
 
 
-def read_secret(workspace: Path) -> str:
+def check_platform(platform: PlatformDescriptor) -> PlatformDescriptor:
+    """整批搬要求会话键按账号分作用域，而且同一个群、同一个人在别的账号下还是同一串 ID。"""
+    if all(secret.name != _conversation_hash.SECRET_NAME for secret in platform.secrets):
+        raise UnsupportedPlatform(f"{platform.display_name} 的会话键不按账号分作用域，没有归属可搬")
+    if platform.id_scope != ID_SCOPE_PLATFORM:
+        raise UnsupportedPlatform(
+            f"{platform.display_name} 的 ID 按机器人账号发，换号后同一个群的 ID 也跟着变，不能整批搬；"
+            "用 migrate_platform_identity.py 逐个会话接过去"
+        )
+    return platform
+
+
+def _account_name(platform: PlatformDescriptor) -> str:
+    return f"{platform.short_name} 号（纯数字）" if platform.id_shape == ID_NUMERIC else "账号"
+
+
+def read_secret(workspace: Path, platform: PlatformDescriptor = QQ_NAPCAT) -> str:
     """bot 正在用的摘要密钥：data/config.yaml 或环境变量里配的优先，否则钉住的文件。无盐部署返回空串。"""
-    return _conversation_hash.current_secret(QQ_NAPCAT, Path(workspace)).value
+    return _conversation_hash.current_secret(platform, Path(workspace)).value
 
 
-def recorded_scope(workspace: Path) -> str:
+def recorded_scope(workspace: Path, platform: PlatformDescriptor = QQ_NAPCAT) -> str:
     """bot 上次记下的当前账号。supervisor 的归属查询读的也是这一份。"""
-    return ActiveAccountStore(QQ_NAPCAT, Path(workspace)).load()
+    return ActiveAccountStore(platform, Path(workspace)).load()
 
 
 def scope_label(scope: str) -> str:
     return scope or "<无作用域>"
 
 
-def route_key_scopes(workspace: Path, secret: str, candidates: Iterable[str]) -> dict[str, str | None]:
+def route_key_scopes(
+    workspace: Path, secret: str, candidates: Iterable[str], platform: PlatformDescriptor = QQ_NAPCAT,
+) -> dict[str, str | None]:
     """路由表里每个会话键是在哪个账号下算出来的，认不出的记 None。"""
     tried = tuple(candidates)
     scopes: dict[str, str | None] = {}
-    for old_stable, real in load_route_map(route_state_file(workspace, QQ_NAPCAT)).items():
+    for old_stable, real in load_route_map(route_state_file(workspace, platform)).items():
         origin = key_origin(old_stable, real, candidate_secrets=(secret,), candidate_scopes=tried)
         scopes[old_stable] = origin.bot_scope if origin else None
     return scopes
@@ -123,36 +147,41 @@ def pick_source_scope(key_scopes: Mapping[str, str | None], *, target: str, reco
     return target if counts else None
 
 
-def detect_source_scope(workspace: Path, secret: str, *, target_scope: str) -> str | None:
+def detect_source_scope(
+    workspace: Path, secret: str, *, target_scope: str, platform: PlatformDescriptor = QQ_NAPCAT,
+) -> str | None:
     """按盘上的会话键认出这次该搬哪个账号名下的数据，规则见 pick_source_scope。"""
     workspace = Path(workspace)
-    target = normalize_account(target_scope, QQ_NAPCAT)
-    key_scopes = route_key_scopes(workspace, secret, account_candidates(QQ_NAPCAT, workspace, extra=(target,)))
-    return pick_source_scope(key_scopes, target=target, recorded=recorded_scope(workspace))
+    target = normalize_account(target_scope, platform)
+    candidates = account_candidates(platform, workspace, extra=(target,))
+    key_scopes = route_key_scopes(workspace, secret, candidates, platform)
+    return pick_source_scope(key_scopes, target=target, recorded=recorded_scope(workspace, platform))
 
 
 def run_scope_migration(
     *, workspace: Path, target_scope: str, source_scope: str | None = None,
     apply: bool = False, adopt: bool = True, live_sessions: LiveRekey | None = None,
+    platform: PlatformDescriptor = QQ_NAPCAT,
 ) -> ScopeReport:
     """只搬 source 名下的会话键，别的账号的原样留着。
 
     live_sessions 给在线迁移用：supervisor 自己持有的会话注册表，直接改内存再落盘。
     """
     workspace = Path(workspace)
-    secret = read_secret(workspace)
-    target = normalize_account(target_scope, QQ_NAPCAT)
+    check_platform(platform)
+    secret = read_secret(workspace, platform)
+    target = normalize_account(target_scope, platform)
     if not target:
-        raise ValueError("--to 必须是目标 bot 的 QQ 号（纯数字）")
-    named = None if source_scope is None else normalize_account(source_scope, QQ_NAPCAT)
+        raise ValueError(f"--to 必须是目标 bot 的{_account_name(platform)}")
+    named = None if source_scope is None else normalize_account(source_scope, platform)
     if named == "" and str(source_scope).strip():
         # 写错的号规范化出来是空串，会被当成「无作用域」去搬存量数据。
-        raise ValueError("--from 必须是源 bot 的 QQ 号（纯数字）；存量无作用域的数据传空串")
-    candidates = account_candidates(QQ_NAPCAT, workspace, extra=(target,) if named is None else (named, target))
-    key_scopes = route_key_scopes(workspace, secret, candidates)
+        raise ValueError(f"--from 必须是源 bot 的{_account_name(platform)}；存量无作用域的数据传空串")
+    candidates = account_candidates(platform, workspace, extra=(target,) if named is None else (named, target))
+    key_scopes = route_key_scopes(workspace, secret, candidates, platform)
 
     if named is None:
-        source = pick_source_scope(key_scopes, target=target, recorded=recorded_scope(workspace))
+        source = pick_source_scope(key_scopes, target=target, recorded=recorded_scope(workspace, platform))
         if source is None:
             raise ScopeMismatch("认不出盘上这批会话键属于哪个账号，用 --from 显式指定")
     elif key_scopes and named not in key_scopes.values():
@@ -174,7 +203,7 @@ def run_scope_migration(
             return None
         return rekey(old_stable, real, secret, bot_scope=target) if scope == source else old_stable
 
-    plan = plan_migration(workspace=workspace, platform=QQ_NAPCAT, restable=restable)
+    plan = plan_migration(workspace=workspace, platform=platform, restable=restable)
     report.renames = plan.renames
     report.blocked = plan.blocked
     report.unresolved = plan.unresolved
@@ -194,7 +223,7 @@ def run_scope_migration(
         return report
 
     # 会话历史、长期记忆和各项功能数据共用一个会话键，一起搬才不会一半跟着走一半留在旧号。
-    outcome = apply_migration(workspace=workspace, platform=QQ_NAPCAT, plan=plan)
+    outcome = apply_migration(workspace=workspace, platform=platform, plan=plan)
     report.moved_dirs = outcome.moved_dirs
     report.hit_keys_rewritten = outcome.hit_keys_rewritten
     report.route_keys_changed = outcome.route_keys_changed
@@ -205,7 +234,7 @@ def run_scope_migration(
 
     # 作用域写在最后：前面抛异常就不会到这里，bot 仍按旧作用域启动，脚本可重跑。
     if adopt:
-        report.scope_written = ActiveAccountStore(QQ_NAPCAT, workspace).save(target)
+        report.scope_written = ActiveAccountStore(platform, workspace).save(target)
     return report
 
 
@@ -253,10 +282,14 @@ def main(argv: list[str] | None = None) -> int:
         "--workspace", default=None,
         help="Clonoth 工作区根目录；不给就和 bot 一样取 CLONOTH_WORKSPACE / ONEBOT_WORKSPACE_ROOT，可以写在 .env 里，都没设是仓库根。",
     )
-    parser.add_argument("--to", required=True, help="目标 bot 的 QQ 号。")
+    parser.add_argument(
+        "--platform", default=QQ_NAPCAT.id,
+        help="搬哪个平台的账号归属，写平台 id 或历史别名；默认 qq。",
+    )
+    parser.add_argument("--to", required=True, help="目标 bot 的账号，QQ 就是 QQ 号。")
     parser.add_argument(
         "--from", dest="source", default=None,
-        help='源 bot 的 QQ 号；存量无作用域数据传空串 ""。不给则按盘上的会话键自动认。',
+        help='源 bot 的账号；存量无作用域数据传空串 ""。不给则按盘上的会话键自动认。',
     )
     parser.add_argument("--apply", action="store_true", help="真正执行；不加则只 dry-run。")
     parser.add_argument(
@@ -264,12 +297,22 @@ def main(argv: list[str] | None = None) -> int:
         help="搬完不把目标号记成当前账号（迁给一个还没登录的号时用）。",
     )
     args = parser.parse_args(argv)
+    platform = find_platform(args.platform)
+    if platform is None or normalize_name(args.platform) not in {platform.id, *platform.aliases}:
+        known = "、".join(sorted(item.id for item in all_platforms()))
+        print(f"不认识的平台 {args.platform!r}，认得的有：{known}", file=sys.stderr)
+        return 2
+    try:
+        check_platform(platform)
+    except UnsupportedPlatform as error:
+        print(f"没法搬，未改动任何文件: {error}", file=sys.stderr)
+        return 2
     workspace = offline_workspace(args.workspace)
 
     try:
         report = run_scope_migration(
             workspace=workspace, target_scope=args.to, source_scope=args.source,
-            apply=args.apply, adopt=not args.no_adopt,
+            apply=args.apply, adopt=not args.no_adopt, platform=platform,
         )
     except ScopeMismatch as error:
         print(f"源账号校验失败，未改动任何文件: {error}", file=sys.stderr)

@@ -5,7 +5,6 @@ import contextlib
 import json
 import logging
 import os
-import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -19,15 +18,10 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import ValidationError
 
 from engine.attachments import blocked_file_reject_reason
-from engine.conversation_migration import RekeyConflict
-from platforms.builtin import QQ_NAPCAT
-from platforms.descriptor import PlatformDescriptor
-from platforms.live import read_live_status
 from platforms.registry import conversation_key_prefix, features_module
 
 from . import provisioning
 from .config_store import ConfigStore
-from .conversation_stores import ConversationStoreError, store_counts_payload
 from .sticker_api import create_sticker_router
 from .instances import load_instances, url_prefix
 from .log_access import LogReader
@@ -64,7 +58,6 @@ from .types import (
     FallbacksUpdateIn,
     NodeFallbacksUpdateIn,
     PolicyUpdateIn,
-    QqQuickLoginIn,
     OpRequestIn,
     OpRequestOut,
     OutboundMessageIn,
@@ -78,9 +71,9 @@ from .types import (
 )
 from .admin_api import create_admin_router
 from .feature_config_api import create_feature_config_router
+from .platform_accounts import PlatformAccounts, create_legacy_qq_account_router, create_platform_account_router
 from .platform_api import create_platform_router
 from .admin_api import init_admin_token, verify_admin_token
-from .napcat import NapCatClient, NapCatError, NapCatUnreachable
 
 
 log = logging.getLogger(__name__)
@@ -220,7 +213,7 @@ def create_app(
     app.state.state = state
     app.state.process_manager = process_manager
     app.state.config_store = config_store
-    app.state.napcat = NapCatClient(state.workspace_root)
+    app.state.platform_accounts = PlatformAccounts(state.workspace_root)
 
     @app.get("/v1/health", response_model=HealthOut)
     async def health() -> HealthOut:
@@ -326,104 +319,6 @@ def create_app(
             },
         )
         return {"policy": saved}
-
-    @app.get("/v1/qq/account")
-    async def get_qq_account(request: Request) -> dict[str, Any]:
-        verify_admin_token(request)
-        client: NapCatClient = app.state.napcat
-        if not client.configured:
-            return {"configured": False}
-        try:
-            return {"configured": True, "reachable": True, **await client.account()}
-        except NapCatUnreachable as exc:
-            # 换号重启和首次部署都会经过这里。判成 502 的话，页面上什么都渲染不出来，
-            # 连「正在重启」都说不了 —— 而这恰恰是最需要告诉人的时候。
-            return {"configured": True, "reachable": False, "reason": str(exc)}
-        except NapCatError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    @app.post("/v1/qq/account/quick-login")
-    async def qq_quick_login(body: QqQuickLoginIn, request: Request) -> dict[str, Any]:
-        verify_admin_token(request)
-        client: NapCatClient = app.state.napcat
-        uin = body.uin.strip()
-        if not uin.isdigit():
-            raise HTTPException(status_code=400, detail="QQ 号必须是数字")
-        try:
-            await client.call("SetQuickLogin", {"uin": uin})
-        except NapCatUnreachable as exc:
-            # 容器没起来跟这个号本身没关系，标死了下次就再也点不动。
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        except NapCatError as exc:
-            # QQ 明确拒了才算死号：缓存的登录态过期后 isQuickLogin 仍报 true，
-            # 不记一笔的话这个号会永远停在列表里，点一次失败一次。
-            client.mark_login_dead(uin, str(exc))
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        # 号已经切过去了，钉自动登录只是锦上添花：这一步失败不该让人以为没切成。
-        pinned = True
-        pin_error = ""
-        try:
-            await client.set_auto_login(uin)
-        except NapCatError as exc:
-            pinned = False
-            pin_error = str(exc)
-        st: SupervisorState = app.state.state
-        # 换号等于换掉 bot 的身份，出事时必须查得到是谁在什么时候换的。
-        st.eventlog.append(
-            session_id="",
-            component="supervisor",
-            type_="qq_account_switched",
-            payload={"uin": uin, "pinned": pinned},
-        )
-        return {"ok": True, "uin": uin, "pinned": pinned, "pin_error": pin_error}
-
-    @app.post("/v1/qq/account/qrcode")
-    async def qq_login_qrcode(request: Request) -> dict[str, Any]:
-        verify_admin_token(request)
-        client: NapCatClient = app.state.napcat
-        try:
-            data = await client.call("GetQQLoginQrcode")
-        except NapCatUnreachable as exc:
-            return {"qrcode": "", "reachable": False, "reason": str(exc)}
-        except NapCatError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        payload = data if isinstance(data, dict) else {}
-        return {
-            "qrcode": str(payload.get("qrcode") or payload.get("qrcodeurl") or ""),
-            "reachable": True,
-        }
-
-    @app.post("/v1/qq/account/relogin")
-    async def qq_relogin(request: Request) -> dict[str, Any]:
-        verify_admin_token(request)
-        client: NapCatClient = app.state.napcat
-        st: SupervisorState = app.state.state
-        # NapCat 在已登录状态下拒发二维码，且不提供登出，只能重启进等扫码状态。
-        st.eventlog.append(
-            session_id="",
-            component="supervisor",
-            type_="qq_account_relogin_requested",
-            payload={},
-        )
-        try:
-            await client.enter_login_mode()
-        except NapCatError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        return {"ok": True}
-
-    @app.post("/v1/qq/account/pin")
-    async def qq_pin_account(request: Request) -> dict[str, Any]:
-        verify_admin_token(request)
-        client: NapCatClient = app.state.napcat
-        try:
-            info = await client.account()
-            uin = str(info.get("uin") or "")
-            if not uin:
-                raise HTTPException(status_code=409, detail="当前没有登录任何账号")
-            await client.set_auto_login(uin)
-        except NapCatError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        return {"ok": True, "uin": uin}
 
     @app.get("/v1/config/system-models")
     async def get_system_models(request: Request) -> dict[str, Any]:
@@ -1521,141 +1416,6 @@ def create_app(
             raise HTTPException(status_code=404, detail="session has no conversation to reset")
         return _reset_conversation(st, conv_key)
 
-    def _scope_migration():
-        """按文件加载迁移脚本：deploy/ 不是包；摘要算法和 bot 跑的是同一份。"""
-        import importlib.util
-        import sys
-
-        key = "_supervisor_scope_migration"
-        cached = sys.modules.get(key)
-        if cached is not None:
-            return cached
-        path = Path(__file__).resolve().parents[1] / "deploy" / "migrate_qq_bot_scope.py"
-        spec = importlib.util.spec_from_file_location(key, path)
-        if spec is None or spec.loader is None:
-            raise HTTPException(status_code=500, detail="迁移脚本不可用")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[key] = module
-        spec.loader.exec_module(module)
-        return module
-
-    def _bot_liveness(st: "SupervisorState", platform: PlatformDescriptor) -> tuple[bool, str]:
-        """(bot 是否可能还在跑, 当前登录的号)。搬迁必须在 bot 停掉之后做，拿不准就当它还在跑。"""
-        status = read_live_status(platform, st.workspace_root)
-        return status.may_be_running, status.account
-
-    def _scope_count_rows(scopes: dict[str, int]) -> list[dict[str, Any]]:
-        return [{"scope": scope, "conversations": count} for scope, count in scopes.items()]
-
-    def _scope_plan_rows(report: Any) -> list[dict[str, Any]]:
-        return [
-            {
-                "old_namespace": rename.old_ns,
-                "new_namespace": rename.new_ns,
-                "has_memory": rename.dir_exists,
-                "blocked": rename.blocked,
-            }
-            for rename in report.changed_renames
-        ]
-
-    @app.get("/v1/admin/qq/scope")
-    async def admin_qq_scope(
-        request: Request, target: str = Query(""), source: str | None = Query(None),
-    ) -> dict[str, Any]:
-        """当前账号归属，以及把 source（不给就自动认）名下的数据搬到 target 会动哪些东西的预览。"""
-        verify_admin_token(request)
-        st: SupervisorState = app.state.state
-        migration = _scope_migration()
-        bot_alive, live_scope = _bot_liveness(st, QQ_NAPCAT)
-        current = migration.recorded_scope(st.workspace_root)
-        payload: dict[str, Any] = {
-            "current_scope": current,
-            "live_scope": live_scope,
-            "bot_alive": bot_alive,
-            "preview": None,
-            "ambiguous_sources": [],
-        }
-        if not target.strip():
-            return payload
-        try:
-            report = migration.run_scope_migration(
-                workspace=st.workspace_root, target_scope=target, source_scope=source, apply=False,
-                live_sessions=st.rekey_session_registry,
-            )
-        except migration.AmbiguousSource as exc:
-            # 让人从盘上实际有的几个账号里挑一个，再带着 source 重新预览。
-            payload["ambiguous_sources"] = _scope_count_rows(exc.scopes)
-            return payload
-        except (migration.ScopeMismatch, RekeyConflict) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except ConversationStoreError as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        payload["preview"] = {
-            "source_scope": report.source_scope,
-            "target_scope": report.target_scope,
-            "conversations": _scope_plan_rows(report),
-            "unknown_namespaces": report.unknown_conv_dirs,
-            "unresolved_namespaces": [item.old_ns for item in report.unresolved],
-            "other_scopes": _scope_count_rows(report.other_scopes),
-            "stores": store_counts_payload(report.stores),
-        }
-        return payload
-
-    @app.post("/v1/admin/qq/scope/migrate")
-    async def admin_qq_scope_migrate(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        """把全部会话与长期记忆搬到另一个 bot 账号名下。"""
-        verify_admin_token(request)
-        st: SupervisorState = app.state.state
-        migration = _scope_migration()
-        bot_alive, _live_scope = _bot_liveness(st, QQ_NAPCAT)
-        if bot_alive:
-            raise HTTPException(
-                status_code=409,
-                detail="bot 进程还在运行。它内存里存着按旧账号算出的会话键，搬迁会被它写回去 —— 请先停掉 bot。",
-            )
-        try:
-            report = migration.run_scope_migration(
-                workspace=st.workspace_root,
-                target_scope=str(payload.get("target") or ""),
-                source_scope=payload.get("source"),
-                apply=True,
-                live_sessions=st.rekey_session_registry,
-            )
-        except (migration.ScopeMismatch, RekeyConflict) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except ConversationStoreError as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        reloaded = st.reload_session_registry()
-        st.eventlog.append(
-            session_id="", component="supervisor", type_="qq_scope_migrated",
-            payload={
-                "source_scope": report.source_scope, "target_scope": report.target_scope,
-                "moved": len(report.moved_dirs), "sessions": report.sessions_changed,
-            },
-        )
-        return {
-            "ok": True,
-            "source_scope": report.source_scope,
-            "target_scope": report.target_scope,
-            "moved_memory_dirs": len(report.moved_dirs),
-            "hit_keys_rewritten": report.hit_keys_rewritten,
-            "route_keys_changed": report.route_keys_changed,
-            "sessions_changed": report.sessions_changed,
-            "sessions_reloaded": reloaded,
-            "stores": store_counts_payload(report.stores),
-            "skipped": [
-                {"old_namespace": rename.old_ns, "new_namespace": rename.new_ns}
-                for rename in report.blocked
-            ],
-            "unknown_namespaces": report.unknown_conv_dirs,
-            "unresolved_namespaces": [item.old_ns for item in report.unresolved],
-            "backup_dir": str(report.backup_dir) if report.backup_dir else "",
-        }
-
     @app.post("/v1/tasks/{task_id}/cancel")
     async def task_cancel(task_id: str) -> dict[str, Any]:
         """取消单个 task 及其所有子任务链。"""
@@ -2361,6 +2121,8 @@ def create_app(
     admin_router = create_admin_router(workspace_root=state.workspace_root)
     app.include_router(admin_router, prefix="/v1/admin/config")
     app.include_router(create_platform_router(workspace_root=state.workspace_root), prefix="/v1/platforms")
+    app.include_router(create_platform_account_router(state, app.state.platform_accounts), prefix="/v1/platforms")
+    app.include_router(create_legacy_qq_account_router(state, app.state.platform_accounts))
     # 路由和打标共用一份：路由写完作废缓存，打标下一轮就看到新值。
     features_config = features_module().new_features_config(state.workspace_root)
     app.include_router(
