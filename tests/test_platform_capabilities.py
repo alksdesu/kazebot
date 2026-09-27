@@ -45,7 +45,7 @@ class TestDefaults:
             capabilities.merged_forward, capabilities.progress_edit, capabilities.recall, capabilities.edit,
             capabilities.mention_everyone,
         ))
-        assert capabilities.typing == frozenset() and dict(capabilities.reply_quotas) == {}
+        assert capabilities.typing == capabilities.reactions == frozenset() and dict(capabilities.reply_quotas) == {}
 
     def test_plain_text_platforms_can_still_push_and_send_links(self) -> None:
         capabilities = PlatformCapabilities()
@@ -62,6 +62,7 @@ class TestValidation:
         pytest.param({"max_split_parts": -1}, id="negative_parts"),
         pytest.param({"proactive_daily_limit": -1}, id="negative_daily_limit"),
         pytest.param({"typing": frozenset({"bridge"})}, id="typing_outside_conversations"),
+        pytest.param({"reactions": frozenset({"bridge"})}, id="reactions_outside_conversations"),
         pytest.param({"reply_quotas": {"other": ReplyQuota(5, 300)}}, id="quota_outside_conversations"),
     ])
     def test_a_malformed_declaration_is_rejected(self, overrides: dict) -> None:
@@ -86,12 +87,15 @@ class TestValidation:
         with pytest.raises(ValueError):
             _platform(PlatformCapabilities(typing=frozenset({CHANNEL_PRIVATE})), channels=(_ROOM, _FALLBACK))
         with pytest.raises(ValueError):
+            _platform(PlatformCapabilities(reactions=frozenset({CHANNEL_PRIVATE})), channels=(_ROOM, _FALLBACK))
+        with pytest.raises(ValueError):
             _platform(PlatformCapabilities(reply_quotas={CHANNEL_PRIVATE: ReplyQuota(4, 3600)}), channels=(_ROOM, _FALLBACK))
 
     def test_a_consistent_declaration_is_accepted(self) -> None:
         platform = _platform(PlatformCapabilities(
             mention=MENTION_TEXT,
             reply_quotas={CHANNEL_GROUP: ReplyQuota(5, 300), CHANNEL_PRIVATE: ReplyQuota(4, 3600)},
+            reactions=frozenset({CHANNEL_GROUP}),
             typing=frozenset({CHANNEL_PRIVATE}),
             links=False,
         ))
@@ -110,8 +114,11 @@ class TestNormalization:
         with pytest.raises(TypeError):
             capabilities.reply_quotas[CHANNEL_PRIVATE] = ReplyQuota(4, 3600)  # type: ignore[index]
 
-    def test_a_typing_list_becomes_a_set(self) -> None:
-        assert PlatformCapabilities(typing=[CHANNEL_PRIVATE, CHANNEL_PRIVATE]).typing == frozenset({CHANNEL_PRIVATE})  # type: ignore[arg-type]
+    @pytest.mark.parametrize("name", ["reactions", "typing"])
+    def test_a_list_of_conversation_kinds_becomes_a_set(self, name: str) -> None:
+        capabilities = PlatformCapabilities(**{name: [CHANNEL_PRIVATE, CHANNEL_PRIVATE]})
+
+        assert getattr(capabilities, name) == frozenset({CHANNEL_PRIVATE})
 
 
 class TestPublicView:
@@ -120,6 +127,7 @@ class TestPublicView:
             mention=MENTION_NATIVE,
             reply_quotas={CHANNEL_GROUP: ReplyQuota(5, 300)},
             images=ImageSupport(formats=frozenset({"png", "gif"}), max_bytes=1024, upload_first=True),
+            reactions=frozenset({CHANNEL_GROUP}),
             typing=frozenset({CHANNEL_PRIVATE}),
         )
 
@@ -135,7 +143,7 @@ class TestPublicView:
             "formats": ["gif", "png"], "max_bytes": 1024, "animated": True,
             "inline_with_text": True, "upload_first": True,
         }
-        assert public["typing"] == ["private"]
+        assert public["reactions"] == ["group"] and public["typing"] == ["private"]
 
     def test_a_platform_without_images_says_null(self) -> None:
         assert PlatformCapabilities().public_dict()["images"] is None
@@ -164,6 +172,9 @@ class TestQQDeclaration:
 
     def test_only_private_chats_show_typing(self) -> None:
         assert QQ_NAPCAT.capabilities.typing == frozenset({CHANNEL_PRIVATE})
+
+    def test_only_group_messages_take_reactions(self) -> None:
+        assert QQ_NAPCAT.capabilities.reactions == frozenset({CHANNEL_GROUP})
 
     def test_images_go_out_directly_including_animations(self) -> None:
         images = QQ_NAPCAT.capabilities.images

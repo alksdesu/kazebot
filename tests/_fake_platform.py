@@ -44,6 +44,7 @@ from adapters._shared.outbound import (
     strip_markup,
     tokenize,
 )
+from adapters._shared.output_guide import OutputGuide, split_section
 from adapters._shared.send_guard import (
     AmbiguousAckError,
     IdempotencyClaim,
@@ -363,6 +364,10 @@ class FakeChatAdapter:
             alias_of_user_id=self.aliases.user_alias,
         )}
 
+    def output_guide(self) -> OutputGuide:
+        """按能力声明给：表态和表情 fakechat 都没有，只剩分条。"""
+        return OutputGuide.of(split_section(FAKE_CHAT))
+
     async def submit(self, facts: InboundFacts, *, exclude_seq: int = 0) -> bool:
         conversation = facts.conversation
         text, covered = self.inbound_text(facts, exclude_seq=exclude_seq)
@@ -382,6 +387,7 @@ class FakeChatAdapter:
                 "target_type": conversation.kind,
             },
             memory_hints=self.memory_hints(facts),
+            output_guide=self.output_guide().payload(),
         )
         if not result.session_id or not result.accepted:
             return False

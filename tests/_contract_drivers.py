@@ -202,6 +202,10 @@ class ContractDriver:
     def remove_admins(self) -> None:
         raise NotImplementedError
 
+    def offer_reactions(self) -> None:
+        """打开驱动能给的表态目录；平台没有表态就什么也不做。"""
+        return None
+
     @property
     def feature_host(self) -> Any:
         raise NotImplementedError
@@ -321,6 +325,9 @@ class QQDriver(ContractDriver):
 
     def remove_admins(self) -> None:
         set_live_config(self.runtime, admin_users=[])
+
+    def offer_reactions(self) -> None:
+        set_live_config(self.runtime, enable_reactions=True)
 
     @property
     def feature_host(self) -> Any:

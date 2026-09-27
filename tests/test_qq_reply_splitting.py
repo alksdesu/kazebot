@@ -19,6 +19,7 @@ if str(_TESTS) not in sys.path:
 from _onebot_harness import load_runtime, set_live_config  # noqa: E402
 
 from adapters._shared import outbound  # noqa: E402
+from adapters._shared.output_guide import SECTION_SPLIT  # noqa: E402
 
 GROUP_ID = 700001
 USER_ID = 30003
@@ -84,6 +85,10 @@ def _target(kind: str) -> dict[str, Any]:
     }
 
 
+def _split_text(runtime: Any) -> str:
+    return runtime.output_guide._split_section().text
+
+
 def _context(runtime: Any, target: dict[str, Any]) -> Any:
     return runtime.state.OutboundSendContext(
         event_id="split-reply", idempotency_key="delivery:split-reply",
@@ -107,7 +112,7 @@ def _replies(messages: list[dict[str, Any]]) -> list[list[str]]:
 
 
 @pytest.mark.parametrize("entry", ["group", "private", "draw_group", "draw_private"])
-def test_every_inbound_injects_one_shared_split_prompt(runtime: Any, entry: str) -> None:
+def test_every_inbound_teaches_splitting_once_outside_the_text(runtime: Any, entry: str) -> None:
     kind = entry.removeprefix("draw_")
     event = _event(kind)
     target = _target(kind)
@@ -125,14 +130,32 @@ def test_every_inbound_injects_one_shared_split_prompt(runtime: Any, entry: str)
         )
 
     text = asyncio.run(build())
-    block = runtime.emotes._reply_format_prompt_block()
-    assert text.count(block) == 1
-    assert text.count("【QQ回复分条】") == 1
-    assert outbound.SPLIT_MARKER in block
+    guide = runtime.output_guide._turn_output_guide(
+        target["conversation_key"], is_dm=kind == "private",
+        entry_node_id=runtime.common.DRAW_NODE_ID if entry.startswith("draw_") else "",
+    )
+
+    assert [section.key for section in guide.sections].count(SECTION_SPLIT) == 1
+    assert guide.section(SECTION_SPLIT).text == _split_text(runtime)
+    # 正文会写进对话历史，分条说明却每轮都要给，只能随提交单独带。
+    assert "【QQ回复分条】" not in text and outbound.SPLIT_MARKER not in text
+
+
+def test_qq_split_guidance_keeps_its_wording(runtime: Any) -> None:
+    marker = outbound.SPLIT_MARKER
+    assert _split_text(runtime) == (
+        "【QQ回复分条】\n"
+        "普通换行只在一个消息气泡内排版。想分成独立消息时，"
+        f"用 {marker} 分隔直接发给用户的回复正文（包括 finish.text、reply.text）；平台会分条发送，标记不会显示。\n"
+        f"例如“收到{marker}我看看”会发成两条。按语气和信息量决定，通常一条就够，"
+        "确需分条时以 2–3 条为宜，不要逐句刷屏。\n"
+        "代码、列表、引用等需要连续阅读的内容不要拆散，保留普通换行。\n"
+        f"当前任务要求简短接话或只回一句时，只发一条，不使用 {marker}。"
+    )
 
 
 def test_split_prompt_preserves_single_reply_and_formatted_content(runtime: Any) -> None:
-    block = runtime.emotes._reply_format_prompt_block()
+    block = _split_text(runtime)
     for required in (
         "普通换行", "一个消息气泡", "finish.text", "reply.text", "标记不会显示",
         "通常一条", "2–3 条", "不要逐句刷屏", "代码、列表、引用", "保留普通换行",
@@ -145,7 +168,7 @@ def test_split_prompt_preserves_single_reply_and_formatted_content(runtime: Any)
 def test_prompt_and_sender_use_the_same_split_signal(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     signal = "[QQ_TEST_SPLIT]"
     monkeypatch.setattr(outbound, "SPLIT_MARKER", signal)
-    block = runtime.emotes._reply_format_prompt_block()
+    block = _split_text(runtime)
     assert signal in block
     assert "[SPLIT]" not in block
     bot = SplitBot()

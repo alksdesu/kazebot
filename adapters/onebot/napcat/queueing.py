@@ -19,7 +19,7 @@ from clonoth_sdk import TriggerInfo
 from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE
 from platforms.inbound import InboundFacts
 
-from . import anonymize, common, history, identity, inbound, models, permissions, routing, sending, state
+from . import anonymize, common, history, identity, inbound, models, output_guide, permissions, routing, sending, state
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
@@ -34,8 +34,9 @@ async def _try_preempt_running_task(
     is_dm: bool,
     platform_updates: Dict[str, Any],
     get_memory_hints: Callable[[], Dict[str, Any]] | None = None,
+    guide: Dict[str, Any] | None = None,
 ) -> bool:
-    """尝试把 QQ 新消息注入当前会话正在运行的入口任务。"""
+    """尝试把 QQ 新消息注入当前会话正在运行的入口任务；guide 是这一轮的输出说明。"""
     # 先查询当前 session 的入口任务，再用 preempt_task 注入新消息：让同一会话的
     # 新指令打断并接续旧任务，而不是在已有入口任务运行时并发开新任务。
     if state._adapter.client is None or state._adapter.session_state is None:
@@ -74,6 +75,8 @@ async def _try_preempt_running_task(
             preempt_args: Dict[str, Any] = {"message": inbound_text, "attachments": attachments}
             if get_memory_hints is not None:
                 preempt_args["memory_hints"] = get_memory_hints()
+            if guide is not None:
+                preempt_args["output_guide"] = guide
             ok = await state._adapter.client.preempt_task(
                 rt.task_id,
                 **preempt_args,
@@ -153,6 +156,11 @@ async def _submit_or_preempt_inbound(
             )}
         return memory_hints
 
+    # 说明随提交单独给，不拼进正文：正文会写进对话历史，说明却每轮都在变。
+    guide = output_guide._turn_output_guide(
+        stable_conversation_key, is_dm=is_dm, entry_node_id=entry_node_id,
+    ).payload()
+
     # 显式命令自带入口节点，打断注入会落到正在跑的那个节点上。
     if live.enable_preempt and not entry_node_id:
         preempt_ok = await _try_preempt_running_task(
@@ -164,6 +172,7 @@ async def _submit_or_preempt_inbound(
             is_dm=is_dm,
             platform_updates=platform_updates,
             get_memory_hints=get_memory_hints,
+            guide=guide,
         )
         if preempt_ok:
             # preempt 注入的消息会被写进 ConversationStore（engine/builtin/preempt.py），
@@ -203,6 +212,7 @@ async def _submit_or_preempt_inbound(
             **dict(platform_updates.get("_route_hints") or {}),
         },
         memory_hints=get_memory_hints(),
+        output_guide=guide,
     )
     if not result.session_id or not result.accepted:
         return False

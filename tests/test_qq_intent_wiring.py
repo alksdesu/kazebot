@@ -287,6 +287,30 @@ class TestWhatIsSentToTheModel:
 
         assert sent["context_lines"] == []
 
+    @staticmethod
+    def _under_response_policy(runtime, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 开了回应策略，判定可以只选「贴个表态」，所以它得知道这一轮能贴哪些。
+        metadata = {"policy": {"settings": {"response_policy_enabled": True}}}
+        monkeypatch.setattr(runtime.state._adapter, "features", SimpleNamespace(
+            available=True, actor=lambda bot, event: "actor", coordinator=SimpleNamespace(metadata=lambda actor: metadata),
+        ))
+
+    def test_the_judge_sees_the_same_reaction_catalog_as_the_turn(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
+        set_live_config(runtime, enable_reactions=True, llm_intent_context_messages=0)
+        self._under_response_policy(runtime, monkeypatch)
+
+        sent = self._sent(runtime, monkeypatch)
+
+        assert sent["context_lines"] == [runtime.output_guide._reaction_section("group").text]
+
+    def test_with_reactions_off_the_judge_gets_no_catalog_line(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
+        set_live_config(runtime, enable_reactions=False, llm_intent_context_messages=0)
+        self._under_response_policy(runtime, monkeypatch)
+
+        sent = self._sent(runtime, monkeypatch)
+
+        assert sent["context_lines"] == []
+
     def test_a_missing_client_answers_undecided(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(runtime.state._adapter, "client", None, raising=False)
 

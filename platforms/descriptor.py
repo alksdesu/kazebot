@@ -103,8 +103,8 @@ class PlatformCapabilities:
     mention: str = MENTION_NONE
     mention_everyone: bool = False
     quote: bool = False
-    # 能否在别人的消息上贴表态；可用的表态由驱动运行时给出。
-    reactions: bool = False
+    # 能在别人的消息上贴表态的会话种类；可用的表态由驱动运行时给出。
+    reactions: frozenset[str] = frozenset()
     images: ImageSupport | None = None
     # 平台自己的表情，比如 QQ 收藏表情、Discord 服务器表情；目录由驱动运行时给出。
     native_emoji: bool = False
@@ -127,10 +127,11 @@ class PlatformCapabilities:
         for name in ("max_text_length", "max_split_parts", "proactive_daily_limit"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} cannot be negative")
-        kinds = {*self.reply_quotas, *self.typing}
+        kinds = {*self.reply_quotas, *self.reactions, *self.typing}
         if not kinds <= CONVERSATION_KINDS:
             raise ValueError(f"capabilities only apply to conversation kinds, got {sorted(kinds - CONVERSATION_KINDS)}")
         object.__setattr__(self, "reply_quotas", MappingProxyType(dict(self.reply_quotas)))
+        object.__setattr__(self, "reactions", frozenset(self.reactions))
         object.__setattr__(self, "typing", frozenset(self.typing))
 
     def public_dict(self) -> dict[str, Any]:
@@ -142,7 +143,7 @@ class PlatformCapabilities:
             "mention": self.mention,
             "mention_everyone": self.mention_everyone,
             "quote": self.quote,
-            "reactions": self.reactions,
+            "reactions": sorted(self.reactions),
             "images": None if self.images is None else self.images.public_dict(),
             "native_emoji": self.native_emoji,
             "merged_forward": self.merged_forward,
@@ -184,7 +185,7 @@ class PlatformDescriptor:
         names = [channel.name for channel in self.channels]
         if len(names) != len(set(names)):
             raise ValueError(f"duplicate channel names in platform {self.id!r}")
-        declared = {*self.capabilities.reply_quotas, *self.capabilities.typing}
+        declared = {*self.capabilities.reply_quotas, *self.capabilities.reactions, *self.capabilities.typing}
         missing = declared - {channel.kind for channel in self.channels}
         if missing:
             raise ValueError(f"platform {self.id!r} declares capabilities for kinds it has no channel for: {sorted(missing)}")

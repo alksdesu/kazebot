@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,10 +21,11 @@ if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
 from _onebot_harness import load_runtime, set_live_config  # noqa: E402
+from adapters._shared.output_guide import SECTION_REACTIONS  # noqa: E402
+from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE  # noqa: E402
 
 HOME_GROUP = 700001
 USER_QQ = 30003
-README_PATH = _ROOT / "adapters" / "onebot" / "README.md"
 
 
 class ReactBot:
@@ -100,17 +100,29 @@ def test_reactions_drop_ids_outside_the_whitelist(runtime: Any) -> None:
 def test_reaction_prompt_lists_whole_whitelist_when_enabled(runtime: Any) -> None:
     set_live_config(runtime, enable_reactions=True)
 
-    block = runtime.emotes._reaction_prompt_block()
+    block = runtime.output_guide._reaction_section(CHANNEL_GROUP).text
 
     assert "[REACT:" in block
     for eid in runtime.common._REACT_MODEL_EMOJIS:
         assert eid in block
 
 
+def test_reaction_prompt_keeps_its_wording(runtime: Any) -> None:
+    set_live_config(runtime, enable_reactions=True)
+    items = "、".join(f"{eid}={name}" for eid, name in runtime.common._REACT_MODEL_EMOJIS.items())
+
+    assert runtime.output_guide._reaction_section(CHANNEL_GROUP).text == (
+        "【QQ表情表态】\n"
+        "想对用户这条消息表态时，在回复里写 [REACT:ID]，平台会把对应表情贴到用户那条消息上。\n"
+        f"只能使用下列 ID：{items}。\n"
+        "标记本身不会出现在回复文本里；表态是点缀，一条回复最多 1 个。"
+    )
+
+
 def test_reaction_prompt_is_empty_when_disabled(runtime: Any) -> None:
     set_live_config(runtime, enable_reactions=False)
 
-    assert runtime.emotes._reaction_prompt_block() == ""
+    assert runtime.output_guide._reaction_section(CHANNEL_GROUP) is None
 
 
 def _group_event() -> SimpleNamespace:
@@ -121,18 +133,20 @@ def _group_event() -> SimpleNamespace:
     )
 
 
-def test_group_inbound_injects_reaction_prompt(runtime: Any) -> None:
+def test_group_turn_offers_reactions_outside_the_text(runtime: Any) -> None:
     set_live_config(runtime, enable_reactions=True)
     bot = ReactBot()
 
     text, _ = asyncio.run(runtime.inbound._build_inbound_text(
         _group_event(), bot, "在吗", "conv_abc", [],
     ))
+    guide = runtime.output_guide._turn_output_guide("conv_abc", is_dm=False)
 
-    assert "【QQ表情表态】" in text
+    assert "【QQ表情表态】" not in text and "[REACT:" not in text
+    assert guide.section(SECTION_REACTIONS).text.startswith("【QQ表情表态】")
 
 
-def test_private_inbound_omits_reaction_prompt(runtime: Any) -> None:
+def test_private_turn_offers_no_reactions(runtime: Any) -> None:
     set_live_config(runtime, enable_reactions=True)
     bot = ReactBot()
     event = SimpleNamespace(
@@ -142,8 +156,11 @@ def test_private_inbound_omits_reaction_prompt(runtime: Any) -> None:
     )
 
     text = asyncio.run(runtime.inbound._build_private_inbound_text(event, bot, "在吗", "conv_dm", []))
+    guide = runtime.output_guide._turn_output_guide("conv_dm", is_dm=True)
 
+    # QQ 的表情回应只在群消息上有，私聊给了模型也贴不上。
     assert "【QQ表情表态】" not in text
+    assert guide.section(SECTION_REACTIONS) is None and runtime.output_guide._reaction_section(CHANNEL_PRIVATE) is None
 
 
 def test_orchestrator_nodes_teach_react(runtime: Any) -> None:

@@ -1547,7 +1547,7 @@ export interface PlatformCapabilitiesSummary {
   mention: 'none' | 'native' | 'text';
   mention_everyone: boolean;
   quote: boolean;
-  reactions: boolean;
+  reactions: string[];
   images: {
     formats: string[];
     max_bytes: number;

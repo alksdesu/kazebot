@@ -25,7 +25,7 @@ from ..live_config import live
 from stickers.collect import any_marked_segment
 from clonoth_sdk import IntentVerdict
 
-from . import anonymize, common, emotes, forward_bridge, history, identity, media, message_text, models, permissions, routing, state
+from . import anonymize, common, forward_bridge, history, identity, media, message_text, models, output_guide, permissions, routing, state
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
@@ -303,7 +303,9 @@ async def _judge_llm_intent(bot: Bot, event: GroupMessageEvent, text: str) -> In
     if topic.get("context"):
         context_lines = [f"{line['label']}: {line['text']}" for line in topic["context"]]
     if metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled"):
-        context_lines.append(emotes._reaction_prompt_block())
+        reactions = output_guide._reaction_section(CHANNEL_GROUP)
+        if reactions is not None:
+            context_lines.append(reactions.text)
     speaker = anonymize._anonymize_text_for_ai(identity._event_display_name(event))
     return await state._adapter.client.judge_reply_intent(
         conversation_key=routing._stable_conversation_key(f"qq_group:{group_id}"),
@@ -483,16 +485,8 @@ async def _build_inbound_text(
         attachments.extend(quoted_attachments)
     if reply_context:
         parts.extend(["", "【当前消息引用】", reply_context])
-    custom_face_prompt = emotes._custom_face_prompt_block(conversation_key)
-    if custom_face_prompt:
-        parts.extend(["", custom_face_prompt])
-    reaction_prompt = emotes._reaction_prompt_block()
-    if reaction_prompt:
-        parts.extend(["", reaction_prompt])
 
     parts.extend([
-        "",
-        emotes._reply_format_prompt_block(),
         "",
         f"当前时间: {now}",
         "【当前用户身份】",
@@ -530,8 +524,6 @@ async def _build_draw_direct_inbound_text(event: Event, user_text: str, is_dm: b
         f"当前时间: {now}",
         f"来源: QQ{target} / /生图 直达命令",
         "",
-        emotes._reply_format_prompt_block(),
-        "",
         "【当前用户身份】",
         *identity._user_identity_lines(event, name),
         "",
@@ -555,12 +547,7 @@ async def _build_private_inbound_text(event: PrivateMessageEvent, bot: Bot, user
         attachments.extend(quoted_attachments)
     if reply_context:
         parts.extend(["", "【当前消息引用】", reply_context])
-    custom_face_prompt = emotes._custom_face_prompt_block(conversation_key)
-    if custom_face_prompt:
-        parts.extend(["", custom_face_prompt])
     parts.extend([
-        "",
-        emotes._reply_format_prompt_block(),
         "",
         "【当前用户身份】",
         *identity._user_identity_lines(event, name),

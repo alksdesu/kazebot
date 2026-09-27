@@ -27,6 +27,7 @@ from .napcat import (  # noqa: E402,F401  # sys.path 必须先插入工作区。
     history,
     media,
     emotes,
+    output_guide,
     inbound,
     queueing,
     sending,

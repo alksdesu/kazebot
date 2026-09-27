@@ -47,7 +47,8 @@ QQ_NAPCAT = PlatformDescriptor(
         mention=MENTION_NATIVE,
         mention_everyone=True,
         quote=True,
-        reactions=True,
+        # 表情回应只有群消息上有。
+        reactions=frozenset({CHANNEL_GROUP}),
         images=ImageSupport(formats=frozenset({"png", "jpeg", "gif", "webp", "bmp"})),
         native_emoji=True,
         merged_forward=True,

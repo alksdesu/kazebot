@@ -1,6 +1,6 @@
 """适配器契约：任何平台都要过的一组断言，QQ 与只在测试里存在的 fakechat 各跑一遍。
 
-只断言平台无关的事：提交字段与身份、外部平台硬规则、发送防重、出站渲染与降级、审批、上下文重置、提醒回执。文案与协议细节归各平台自己的测试。
+只断言平台无关的事：提交字段与身份、输出说明、外部平台硬规则、发送防重、出站渲染与降级、审批、上下文重置、提醒回执。文案与协议细节归各平台自己的测试。
 """
 from __future__ import annotations
 
@@ -23,7 +23,8 @@ if str(_TESTS) not in sys.path:
 from _contract_drivers import DRIVERS, ContractDriver, Delivery, open_driver, registered_fake_platform  # noqa: E402
 from _fake_platform import FAULT_HANG, FAULT_LOST_ACK, FAULT_REFUSED  # noqa: E402
 from adapters._shared.feature_gateway import FeatureHost, QuietDeliveryDeferred  # noqa: E402
-from adapters._shared.outbound import EVERYONE  # noqa: E402
+from adapters._shared.outbound import EVERYONE, SPLIT_MARKER  # noqa: E402
+from adapters._shared.output_guide import SECTION_REACTIONS, SECTION_SPLIT  # noqa: E402
 from adapters._shared.send_guard import SendError  # noqa: E402
 from clonoth_sdk.callbacks import AdapterCallbacks  # noqa: E402
 from clonoth_sdk.state import TriggerInfo  # noqa: E402
@@ -61,6 +62,11 @@ def _decisions(driver: ContractDriver) -> list[tuple[str, str]]:
 
 def _texts(driver: ContractDriver, kind: str, target: str) -> list[str]:
     return [delivery.text.strip() for delivery in driver.delivered_to(kind, target)]
+
+
+def _guide_sections(call: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    guide = call.get("output_guide") or {}
+    return {section["key"]: section for section in guide.get("sections", [])}
 
 
 async def _group_trigger(driver: ContractDriver, text: str = "a question", *, message_id: str = "101") -> TriggerInfo:
@@ -163,7 +169,10 @@ class TestInboundSubmission:
         asyncio.run(scenario())
 
         [call] = driver.client.submissions
-        visible = "\n".join([call["text"], call["conversation_key"], *call["memory_hints"]["subjects"]])
+        visible = "\n".join([
+            call["text"], call["conversation_key"], *call["memory_hints"]["subjects"],
+            *(section["text"] for section in _guide_sections(call).values()),
+        ])
         leaked = sorted(real for real in (driver.admin, driver.member, driver.room) if real in visible)
         assert leaked == []
 
@@ -174,6 +183,48 @@ class TestInboundSubmission:
         subjects = call["memory_hints"]["subjects"]
         assert subjects and subjects[0] not in driver.private_ids
         assert re.fullmatch(r"User[A-Z]+", subjects[0])
+
+
+class TestOutputGuide:
+    """平台输出说明随提交单独带：按能力声明给，不混进会写进对话历史的正文。"""
+
+    @staticmethod
+    async def _group_then_private(driver: ContractDriver) -> None:
+        await driver.group_message("hello there", sender=driver.member, message_id="101", mention_bot=True)
+        await driver.private_message("hi bot", sender=driver.admin, message_id="102")
+
+    def test_splitting_is_taught_as_far_as_the_platform_allows(self, driver: ContractDriver) -> None:
+        asyncio.run(driver.group_message("hello there", sender=driver.member, message_id="101", mention_bot=True))
+
+        [call] = driver.client.submissions
+        most = driver.platform.capabilities.max_split_parts
+        split = _guide_sections(call).get(SECTION_SPLIT)
+        assert (split is not None) == (most != 1)
+        if split is not None:
+            assert SPLIT_MARKER in split["text"]
+            assert most <= 0 or str(most) in split["text"]
+
+    def test_reactions_are_offered_only_where_the_platform_takes_them(self, driver: ContractDriver) -> None:
+        driver.offer_reactions()
+
+        asyncio.run(self._group_then_private(driver))
+
+        group, private = (_guide_sections(call) for call in driver.client.submissions)
+        declared = driver.platform.capabilities.reactions
+        assert (SECTION_REACTIONS in group) == (CHANNEL_GROUP in declared)
+        assert (SECTION_REACTIONS in private) == (CHANNEL_PRIVATE in declared)
+
+    def test_the_guide_never_enters_the_text_kept_as_history(self, driver: ContractDriver) -> None:
+        driver.offer_reactions()
+
+        asyncio.run(self._group_then_private(driver))
+
+        for call in driver.client.submissions:
+            sections = _guide_sections(call)
+            assert sections
+            titles = [section["text"].splitlines()[0] for section in sections.values()]
+            assert [title for title in titles if title in call["text"]] == []
+            assert SPLIT_MARKER not in call["text"] and "[REACT:" not in call["text"]
 
 
 class TestExternalPlatformRules:
