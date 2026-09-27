@@ -136,6 +136,7 @@ class ClonothClient:
         platform_auth: dict[str, Any] | None = None,
         route_hints: dict[str, Any] | None = None,
         memory_hints: dict[str, Any] | None = None,
+        output_guide: dict[str, Any] | None = None,
     ) -> InboundResult:
         """提交用户消息到 Supervisor。
 
@@ -154,6 +155,8 @@ class ClonothClient:
             memory_hints: 本轮涉及的人（{"subjects": [别名]}），用于按人加载长期记忆。
                 单独一个参数而不塞进 platform_auth，是因为后者参与鉴权判定，
                 混入非鉴权字段会让 is_admin 的判断面变大。
+            output_guide: 平台输出说明（{"version": 1, "sections": [{"key", "text", "volatile"}]}），
+                按平台能力声明生成。引擎只把它放进这一轮的提示词，不写进对话历史，所以别再拼进 text。
 
         Returns:
             InboundResult 包含 session_id 和 inbound_seq
@@ -180,6 +183,8 @@ class ClonothClient:
             payload["route_hints"] = dict(route_hints)
         if memory_hints:
             payload["memory_hints"] = dict(memory_hints)
+        if output_guide:
+            payload["output_guide"] = dict(output_guide)
 
         resp = await self._http().post(f"{self._base_url}/v1/inbound", json=payload)
         resp.raise_for_status()
@@ -416,6 +421,7 @@ class ClonothClient:
         message: str = "",
         attachments: list[dict[str, Any]] | None = None,
         memory_hints: dict[str, Any] | None = None,
+        output_guide: dict[str, Any] | None = None,
     ) -> bool:
         """向正在运行的任务注入 preempt 请求。
 
@@ -428,6 +434,7 @@ class ClonothClient:
             task_id: 要打断的任务 ID
             message: 注入的新消息文本
             attachments: 注入的附件列表（可选）
+            output_guide: 新消息那一刻的平台输出说明；不传就沿用任务原有的，传一段都没有的就是清掉。
 
         Returns:
             True 表示 preempt 请求已被 Supervisor 接受
@@ -437,6 +444,8 @@ class ClonothClient:
             body["attachments"] = attachments
         if memory_hints is not None:
             body["memory_hints"] = memory_hints
+        if output_guide is not None:
+            body["output_guide"] = output_guide
         resp = await self._http().post(
             f"{self._base_url}/v1/tasks/{task_id}/preempt", json=body,
         )

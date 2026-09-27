@@ -16,6 +16,7 @@ import secrets
 from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, Response
+from pydantic import ValidationError
 
 from engine.attachments import blocked_file_reject_reason
 from platforms.registry import conversation_key_prefix
@@ -46,6 +47,7 @@ from .types import (
     InboundMessageOut,
     InboundWorkItem,
     OpenAIConfigPublic,
+    OutputGuide,
     ActiveProviderSecret,
     SystemModelUpdateIn,
     DreamRunIn,
@@ -714,10 +716,20 @@ def create_app(
             or not isinstance(memory_hints.get("subjects", []), list)
         ):
             raise HTTPException(status_code=422, detail="memory_hints.subjects must be a list")
+        output_guide = body.get("output_guide")
+        if output_guide is not None:
+            try:
+                output_guide = OutputGuide.model_validate(output_guide)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=422, detail="output_guide: " + "; ".join(error["msg"] for error in exc.errors()),
+                ) from exc
         st: SupervisorState = app.state.state
         kwargs = {"message": msg, "attachments": atts}
         if memory_hints is not None:
             kwargs["memory_hints"] = memory_hints
+        if output_guide is not None:
+            kwargs["output_guide"] = output_guide
         ok = st.preempt_task(task_id, **kwargs)
         if not ok:
             raise HTTPException(status_code=404, detail="task not found or not active")

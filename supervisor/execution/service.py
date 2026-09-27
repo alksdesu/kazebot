@@ -16,6 +16,7 @@ from typing import Any
 import yaml
 from fastapi import HTTPException
 
+from engine.output_guide import OUTPUT_GUIDE_KEY
 from supervisor.feature_auth import FeatureActor
 from supervisor.types import TaskKind
 from .inputs import fetch_url, read_document
@@ -82,7 +83,10 @@ class ExecutionService:
     def _origin(self, actor: FeatureActor) -> tuple[str, dict]:
         task = self.state.tasks.get(actor.task_id) if actor.task_id else None
         if task:
-            return str(task.node_id or task.input.get("origin_node_id") or self.state._default_entry_node()), dict(task.input.get("task_context") or {})
+            context = dict(task.input.get("task_context") or {})
+            # 输出说明只给那一轮用；计划晚些才跑，抄进计划库只会过期，还白占地方。
+            context.pop(OUTPUT_GUIDE_KEY, None)
+            return str(task.node_id or task.input.get("origin_node_id") or self.state._default_entry_node()), context
         return self.state._default_entry_node(), {
             "conversation_key": actor.scope, "channel": actor.channel,
             "platform_auth": {"is_admin": actor.is_admin, "platform": actor.channel, "user_id": actor.user_id, "group_role": actor.role, "bot_scope": actor.bot_scope},

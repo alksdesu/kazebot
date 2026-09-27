@@ -20,6 +20,8 @@ from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
 from ._helpers import _now
 from .branch_finalize_store import BranchClaim
 from .reply_intent import result_from_task as reply_intent_result_from_task
+from engine.output_guide import OUTPUT_GUIDE_KEY
+
 from .types import RouteStatus, Task, TaskKind, TaskStatus
 
 
@@ -2010,6 +2012,9 @@ class TaskRouterMixin:
         # 结果回到原编排节点，由它决定如何向用户推送。
         if caller_node:
             payload["entry_node_id"] = caller_node
+        output_guide = self._inherited_output_guide_locked(origin.get("caller_task_id"))
+        if output_guide:
+            payload[OUTPUT_GUIDE_KEY] = output_guide
         if attachments_outbound_sent:
             payload["attachments_outbound_sent"] = True
         elif result_atts:
@@ -2172,6 +2177,9 @@ class TaskRouterMixin:
                     "async_tool_name": tool,
                     "async_tool_error": str(error)[:1000] if error else "",
                 }
+            output_guide = self._inherited_output_guide_locked(event_task_id)
+            if output_guide:
+                payload[OUTPUT_GUIDE_KEY] = output_guide
 
             evt = self.eventlog.append(
                 session_id=session_id,
@@ -2186,6 +2194,13 @@ class TaskRouterMixin:
                 inbound_seq=seq, session_id=session_id, payload=payload,
             )
             return {"ok": True, "strategy": "inbound"}
+
+    def _inherited_output_guide_locked(self, task_id: Any) -> dict[str, Any] | None:
+        """转述结果的那一轮沿用发起任务的输出说明：回的还是同一个平台上的同一个会话。"""
+        origin = self.tasks.get(str(task_id or "").strip())
+        context = origin.input.get("task_context") if origin is not None else None
+        guide = context.get(OUTPUT_GUIDE_KEY) if isinstance(context, dict) else None
+        return dict(guide) if isinstance(guide, dict) else None
 
     def _find_entry_task_by_status_locked(self, session_id: str, statuses: set) -> Task | None:
         """在 session 中查找指定状态的入口 task。

@@ -4,7 +4,52 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+
+OUTPUT_GUIDE_MAX_SECTIONS = 32
+OUTPUT_GUIDE_SECTION_MAX_CHARS = 32_000
+OUTPUT_GUIDE_MAX_CHARS = 64_000
+
+
+class OutputGuideSection(BaseModel):
+    """平台输出说明的一段。volatile 的每轮会变，引擎放进动态区；其余进缓存前缀。"""
+
+    key: str = Field(min_length=1, max_length=64)
+    text: str = Field(max_length=OUTPUT_GUIDE_SECTION_MAX_CHARS)
+    volatile: bool = False
+
+
+class OutputGuide(BaseModel):
+    """适配器按平台能力声明生成的输出说明，随入站送来，只进提示词不进对话历史。"""
+
+    version: int = 1
+    sections: list[OutputGuideSection] = Field(default_factory=list, max_length=OUTPUT_GUIDE_MAX_SECTIONS)
+
+    @model_validator(mode="after")
+    def _bounded(self) -> "OutputGuide":
+        if sum(len(section.text) for section in self.sections) > OUTPUT_GUIDE_MAX_CHARS:
+            raise ValueError(f"output_guide is longer than {OUTPUT_GUIDE_MAX_CHARS} characters")
+        return self
+
+    def task_payload(self) -> dict[str, Any]:
+        """存进 task_context 的形状，没有正文的段不存。"""
+        return {
+            "version": self.version,
+            "sections": [section.model_dump() for section in self.sections if section.text.strip()],
+        }
+
+
+def output_guide_payload(raw: Any) -> dict[str, Any] | None:
+    """规整成存进任务的形状；形状不对、或者一段正文都没有时是 None。"""
+    if not raw:
+        return None
+    try:
+        guide = raw if isinstance(raw, OutputGuide) else OutputGuide.model_validate(raw)
+    except ValidationError:
+        return None
+    payload = guide.task_payload()
+    return payload if payload["sections"] else None
 
 
 class SafetyLevel(str, Enum):
@@ -80,6 +125,7 @@ class InboundMessageIn(BaseModel):
     # 本轮涉及的人（{"subjects": [匿名别名]}），用于按人加载跨会话长期记忆。
     # 与 platform_auth 分开：后者参与鉴权，不该混入非鉴权字段。
     memory_hints: dict[str, Any] = Field(default_factory=dict)
+    output_guide: OutputGuide | None = None
 
 
 class InboundMessageOut(BaseModel):
@@ -117,6 +163,7 @@ class InboundWorkItem(BaseModel):
     platform_auth: dict[str, Any] = Field(default_factory=dict)
     route_hints: dict[str, Any] = Field(default_factory=dict)
     memory_hints: dict[str, Any] = Field(default_factory=dict)
+    output_guide: dict[str, Any] | None = None
 
 
 class InboundAckIn(BaseModel):
@@ -148,6 +195,8 @@ class Task(BaseModel):
     preempt_message: str = ""
     preempt_attachments: list = Field(default_factory=list)
     preempt_memory_hints: dict[str, Any] | None = None
+    # 没带是沿用任务原有的输出说明；带了一段都没有的就是清掉。
+    preempt_output_guide: dict[str, Any] | None = None
     preempt_revision: int = 0
     worker_id: str | None = None
     created_at: datetime

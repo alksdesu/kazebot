@@ -5,6 +5,13 @@ from typing import Any
 
 from engine.attachments import build_multimodal_content
 from engine.memory_subjects import resolve_load_subjects
+from engine.output_guide import (
+    OUTPUT_GUIDE_KEY,
+    STATIC_GUIDE_MARKER,
+    has_static_guide,
+    static_guide_messages,
+    turn_guide_parts,
+)
 # Why: engine.builtin handlers must not depend on the hook package after relocation.
 # How: return a local HookResult-compatible shape instead. Purpose: avoid
 # cycles while keeping the existing hook registry duck-typed.
@@ -89,11 +96,15 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     new_instruction = ls.preempt_inject_info.get("message", "")
     new_attachments = ls.preempt_inject_info.get("attachments", [])
     memory_hints = ls.preempt_inject_info.get("memory_hints")
+    output_guide = ls.preempt_inject_info.get(OUTPUT_GUIDE_KEY)
     task_context = dict(getattr(ls.rctx, "task_context", {}) or {})
     if isinstance(memory_hints, dict):
         task_context["memory_hints"] = {
             "subjects": resolve_load_subjects(ls.rctx.workspace_root, memory_hints.get("subjects")),
         }
+    if isinstance(output_guide, dict):
+        task_context[OUTPUT_GUIDE_KEY] = output_guide
+    if isinstance(memory_hints, dict) or isinstance(output_guide, dict):
         ls.rctx.task_context = task_context
     ls.rctx.user_text = new_instruction
 
@@ -114,6 +125,10 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     if isinstance(memory_hints, dict):
         _replace_static_memories(ls, skill_static, memory_static)
         ctx.messages = ls.messages
+    guide_in_prefix = has_static_guide(ls.messages)
+    if isinstance(output_guide, dict) and guide_in_prefix:
+        _replace_static_guide(ls, output_guide)
+        ctx.messages = ls.messages
 
     dynamic_parts: list[str] = []
     if not ls.is_block_mode and len(ls.system_prompt) >= 2 and ls.system_prompt[1].get("content"):
@@ -124,6 +139,7 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     for dynamic_msg in memory_dynamic:
         if dynamic_msg.get("content"):
             dynamic_parts.append(dynamic_msg["content"])
+    dynamic_parts.extend(turn_guide_parts(task_context.get(OUTPUT_GUIDE_KEY), include_stable=not guide_in_prefix))
 
     if dynamic_parts:
         dynamic_prefix = (
@@ -236,3 +252,11 @@ def _replace_static_memories(ls: Any, skill_static: list, memory_static: list) -
                 break
         insertion_index = prefix_length + len(skill_static)
     ls.messages[insertion_index:insertion_index] = memory_static
+
+
+def _replace_static_guide(ls: Any, output_guide: dict[str, Any]) -> None:
+    """原位换上新的稳定输出说明：内容没变时前缀也没变，缓存照样命中。"""
+    indices = [index for index, message in enumerate(ls.messages) if message.get(STATIC_GUIDE_MARKER)]
+    removed = set(indices)
+    ls.messages = [message for index, message in enumerate(ls.messages) if index not in removed]
+    ls.messages[indices[0]:indices[0]] = static_guide_messages(output_guide)

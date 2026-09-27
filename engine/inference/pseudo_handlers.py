@@ -543,6 +543,10 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     parent_generation = getattr(ls.rctx, "session_generation", 0)
     if parent_generation:
         inbound_payload["dispatch_origin"]["parent_session_generation"] = parent_generation
+    caller_task_id = str(getattr(ls.rctx, "task_id", "") or "")
+    if caller_task_id:
+        # 结果回来时，转述它的那一轮靠这个找回发起任务的输出说明。
+        inbound_payload["dispatch_origin"]["caller_task_id"] = caller_task_id
     if ctx_mode == "fork":
         inbound_payload["dispatch_fork_from_session"] = parent_session_id
 

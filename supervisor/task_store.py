@@ -8,10 +8,11 @@ from datetime import timedelta
 from typing import Any
 
 from clonoth_runtime import get_str, load_runtime_config
+from engine.output_guide import OUTPUT_GUIDE_KEY
 from platforms.registry import find_platform
 
 from ._helpers import _now
-from .types import RouteStatus, Task, TaskKind, TaskStatus
+from .types import OutputGuide, RouteStatus, Task, TaskKind, TaskStatus, output_guide_payload
 
 
 logger = logging.getLogger(__name__)
@@ -256,6 +257,10 @@ class TaskStoreMixin:
                 ):
                     if _k in raw_input:
                         slim_input[_k] = raw_input[_k]
+                context = slim_input.get("task_context")
+                if isinstance(context, dict) and OUTPUT_GUIDE_KEY in context:
+                    # 输出说明只给那一轮用，task_created 里已经存过完整的一份，后面的快照不再重复写。
+                    slim_input["task_context"] = {key: value for key, value in context.items() if key != OUTPUT_GUIDE_KEY}
                 payload["input"] = slim_input
         return payload
 
@@ -503,6 +508,7 @@ class TaskStoreMixin:
         platform_auth = dict(payload.get("platform_auth") or {}) if isinstance(payload.get("platform_auth"), dict) else {}
         route_hints = dict(payload.get("route_hints") or {}) if isinstance(payload.get("route_hints"), dict) else {}
         memory_hints = dict(payload.get("memory_hints") or {}) if isinstance(payload.get("memory_hints"), dict) else {}
+        output_guide = output_guide_payload(payload.get(OUTPUT_GUIDE_KEY))
         # Step 2（2026-04-16）：主节点切 ConversationStore。
         # flag 开启时不再注入 context_ref，engine 侧 runner.py 会从 data/conversations/{session_id}.jsonl
         # 加载 history，不再依赖 node_contexts snapshot。
@@ -598,6 +604,8 @@ class TaskStoreMixin:
                     # knowledge_inject 从 rctx.task_context 读它，决定这轮要不要
                     # 按人加载某些人的跨会话记忆档案。
                     "memory_hints": memory_hints,
+                    # 平台输出说明，引擎渲染进提示词的缓存前缀和动态区，不写进对话历史。
+                    **({OUTPUT_GUIDE_KEY: output_guide} if output_guide else {}),
                     # [2026-05-29 方案C第一步] 为什么：SDK 只读取 task_created
                     # 事件的 payload.input.task_context，不能依赖后续对 Task 的补写。
                     # 怎么改：把 dispatch 上下文模式和父频道 route key 写入
@@ -838,6 +846,7 @@ class TaskStoreMixin:
     def preempt_task(
         self, task_id: str, message: str = "", attachments: list | None = None,
         memory_hints: dict[str, Any] | None = None,
+        output_guide: OutputGuide | dict[str, Any] | None = None,
     ) -> bool:
         """标记单个 task 为 preempt_requested。不影响 session 状态。"""
         with self._lock:
@@ -857,6 +866,9 @@ class TaskStoreMixin:
                         self.workspace_root, memory_hints.get("subjects"),
                     ),
                 }
+            task.preempt_output_guide = None
+            if output_guide is not None:
+                task.preempt_output_guide = output_guide_payload(output_guide) or OutputGuide().task_payload()
             # [Fork/Merge 2026-05-17] Why: a task can be running inside a
             # temporary entry branch, but session event consumers watch the
             # durable parent session. How: use the task route helper when the
@@ -898,14 +910,19 @@ class TaskStoreMixin:
             if task.preempt_memory_hints is not None:
                 hints = {"subjects": list(task.preempt_memory_hints.get("subjects") or [])}
                 payload["memory_hints"] = hints
-                task_context = task.input.get("task_context")
-                if not isinstance(task_context, dict):
-                    task_context = {}
-                    task.input["task_context"] = task_context
-                task_context["memory_hints"] = hints
+                self._task_context_locked(task)["memory_hints"] = hints
+            if task.preempt_output_guide is not None:
+                guide = dict(task.preempt_output_guide)
+                payload[OUTPUT_GUIDE_KEY] = guide
+                # 写回任务上：同一个任务之后再恢复运行，用的还是这次的说明。
+                if guide.get("sections"):
+                    self._task_context_locked(task)[OUTPUT_GUIDE_KEY] = guide
+                else:
+                    self._task_context_locked(task).pop(OUTPUT_GUIDE_KEY, None)
             task.preempt_message = ""
             task.preempt_attachments = []
             task.preempt_memory_hints = None
+            task.preempt_output_guide = None
             task.preempt_requested = False
             return payload
 
@@ -925,7 +942,17 @@ class TaskStoreMixin:
                 payload["memory_hints"] = {
                     "subjects": list(task.preempt_memory_hints.get("subjects") or []),
                 }
+            if task.preempt_output_guide is not None:
+                payload[OUTPUT_GUIDE_KEY] = dict(task.preempt_output_guide)
             return payload
+
+    @staticmethod
+    def _task_context_locked(task: Task) -> dict[str, Any]:
+        task_context = task.input.get("task_context")
+        if not isinstance(task_context, dict):
+            task_context = {}
+            task.input["task_context"] = task_context
+        return task_context
 
     def renew_lease(self, task_id: str, worker_id: str, lease_sec: float = 120.0) -> bool:
         """续租 task 的 lease，延长 lease_expires_at。仅 status=running 且 worker_id 匹配时生效。"""
