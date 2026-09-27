@@ -10,13 +10,11 @@ import sys
 import threading
 import time
 import os
-from pathlib import Path
 
 import uvicorn
-from dotenv import load_dotenv
 from fastapi import FastAPI
 
-from workspace import resolve_workspace_root
+from clonoth_runtime import process_workspace
 
 from .api import create_app
 from .instances import url_prefix
@@ -33,9 +31,8 @@ PORT_IN_USE_EXIT_CODE = 98
 
 
 def main() -> None:
-    # [2026-05-14] override=True: .env 文件值覆盖继承的环境变量。
-    # 多实例部署时，每个实例读自己 cwd 下的 .env，互不干扰。
-    load_dotenv(override=True)
+    # 要在读端口等参数之前：多实例靠各自工作区的 .env 给端口和密钥。
+    workspace_root = process_workspace()
 
     parser = argparse.ArgumentParser(description="Clonoth Supervisor")
     parser.add_argument("--host", default=os.getenv("CLONOTH_HOST", "127.0.0.1"))
@@ -51,8 +48,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # 放在 load_dotenv 之后：多实例靠各自 cwd 的 .env 指定自己的工作区。
-    workspace_root = resolve_workspace_root(Path(__file__).resolve().parents[1])
     data_dir = workspace_root / "data"
     log_dir = data_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)

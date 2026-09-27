@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import ValidationError
 
+from clonoth_runtime import load_workspace_env
 from engine.attachments import blocked_file_reject_reason
 from platforms.registry import conversation_key_prefix, features_module
 
@@ -1705,10 +1706,9 @@ def create_app(
                     payload={"target": inp.target, "reason": "no process manager", "ts": _now().isoformat()},
                 )
                 return RestartOut(scheduled=False, target=inp.target)
-            # 重新加载 .env，确保修改后的环境变量在 supervisor 进程中生效
+            # 重新灌本实例的 .env，改过的密钥才会被新的 engine 继承。
             try:
-                from dotenv import load_dotenv
-                load_dotenv(override=True)
+                load_workspace_env(st.workspace_root, override=True)
             except Exception:
                 pass
             # 先注入 outbound 让 handle_agent 正常闭合（log embed 有终态）

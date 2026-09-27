@@ -45,7 +45,7 @@ extensions:
 
 `auto_tag` 每轮循环现读，关掉之后手上那批做完就停，不用重启。已经排队等打标的图会原样留着，开回来接着打。
 
-打标跑在 supervisor 里，全系统只有一份：bot 不在线也照打；多开时几个号的 supervisor 轮流打共用的那个库，同一时刻只有一个在调看图渠道。`features.yaml` 没写 `auto_tag` 时，`qq.yaml` 老位置上的写法和 `.env` 里的 `ONEBOT_STICKER_AUTO_TAG` 照旧算数，bot 停着也认它上次公布的值。
+打标跑在 supervisor 里，全系统只有一份：bot 不在线也照打；多开时几个实例的 supervisor 轮流打共用的那个库，同一时刻只有一个在调看图渠道。`features.yaml` 没写 `auto_tag` 时，`qq.yaml` 老位置上的写法和 `.env` 里的 `ONEBOT_STICKER_AUTO_TAG` 照旧算数，bot 停着也认它上次公布的值。
 
 热载，改完两秒生效，不用重启。
 
@@ -84,7 +84,7 @@ data/stickers/
   └ backups/             /表情包 备份 的产物
 ```
 
-**多开时这个目录是软链**，指向 `/opt/kazebot-data/stickers/`，几个号共用一份。做成软链而不是配绝对路径，是因为附件白名单只认工作区内的 `data/` 前缀，库放在外面就发不出去。
+**多开时这个目录是软链**，指向 `/opt/kazebot-data/stickers/`，几个实例共用一份。做成软链而不是配绝对路径，是因为附件白名单只认工作区内的 `data/` 前缀，库放在外面就发不出去。
 
 图库**不会被定时清理动到** —— `engine/data_cleanup.py` 只扫显式点名的子目录，`data/stickers` 不在列。`tests/test_sticker_library_survives_cleanup.py` 钉住了这一点，谁往任务表里加一行会被测试挡下。
 
@@ -100,7 +100,7 @@ data/stickers/
 - 同一会话 `repeat_window_sec`（默认半小时）内发过的不进清单。
 - 模型写的名字不在清单里时，拿这个词去标签里找：精确等于某个标签的优先，其次是被标签包含的 —— 写 `[表情:唐笑]` 能钓出标签是「塔菲唐笑」那张。一个都不沾边就不发，宁可少发也不硬塞不相干的图。
 - 名字对不上又检索不到时标记会被丢掉，不会漏成一行字面的 `[表情:xxx]`。
-- 发图走 base64 而不是本地路径：库是几个号共用的，NapCat 容器里没有那个挂载。
+- 发图走 base64 而不是本地路径：库是几个实例共用的，NapCat 容器里没有那个挂载。
 
 `send_probability` 设 0 就是彻底不发。想让它多发，调高这个数，别去动标签。
 

@@ -13,7 +13,7 @@ import httpx
 import yaml
 from dotenv import load_dotenv
 
-from workspace import resolve_workspace_root, workspace_env_root
+from workspace import pin_workspace_env, resolve_workspace_root, workspace_env_root
 
 if TYPE_CHECKING:
     from platforms.descriptor import PlatformDescriptor
@@ -557,23 +557,31 @@ _CODE_ROOT = Path(__file__).resolve().parent
 _CODE_ENV_FILE = _CODE_ROOT / ".env"
 
 
-def load_workspace_env(workspace_root: Path | str) -> Path | None:
-    """离线工具照 bot 的办法灌 .env：工作区那份优先，没有就用代码目录那份，进程里已经有的变量不覆盖。
+def load_workspace_env(workspace_root: Path | str, *, override: bool = False) -> Path | None:
+    """认定本进程的工作区是 workspace_root 并灌它的 .env：工作区那份优先，没有就用代码目录那份。返回灌的是哪份。
 
-    路径覆盖和平台密钥常常只写在 .env 里，不灌进来的话离线工具读到的是另一份文件、另一把密钥。返回灌的是哪份。
+    路径覆盖和平台密钥常常只写在 .env 里，不灌进来的话读到的是另一份文件、另一把密钥。
+    override 只对工作区自己那份生效：代码目录那份是几个实例共用的兜底，只补缺，不能盖掉进程拿到的值。
+    灌完把工作区变量钉回 workspace_root：从别的实例整份抄来的 .env 带着那个实例的 CLONOTH_WORKSPACE，
+    不钉的话这个进程用的是这里，拉起的 engine 却认到那边。
     """
-    for candidate in (Path(workspace_root) / ".env", _CODE_ENV_FILE):
-        if candidate.is_file():
-            load_dotenv(candidate, override=False)
-            return candidate
-    return None
+    own = Path(workspace_root) / ".env"
+    loaded: Path | None = None
+    if own.is_file():
+        load_dotenv(own, override=override)
+        loaded = own
+    elif _CODE_ENV_FILE.is_file():
+        load_dotenv(_CODE_ENV_FILE, override=False)
+        loaded = _CODE_ENV_FILE
+    pin_workspace_env(workspace_root)
+    return loaded
 
 
-def offline_workspace(explicit: Path | str | None = None) -> Path:
-    """离线工具照 bot 的办法定工作区并灌 .env，返回工作区根。进程里已经有的变量都不覆盖。
+def _settle_workspace(explicit: Path | str | None, *, override: bool) -> Path:
+    """定工作区并灌它的 .env，返回工作区根。
 
     没给工作区、env 里也没设时，先灌 cwd 下或代码目录那份 .env 再从里面认，和 bot.py 一样。
-    env 里设了就不碰 cwd 那份：在代码目录里迁别的实例，读进来的会是主实例的密钥。
+    env 里设了就不碰 cwd 那份：在代码目录里跑别的实例，读进来的会是主实例的端口和密钥。
     """
     if explicit is not None and str(explicit).strip():
         root = Path(explicit).expanduser().resolve()
@@ -585,8 +593,21 @@ def offline_workspace(explicit: Path | str | None = None) -> Path:
             if bot_env.is_file():
                 load_dotenv(bot_env, override=False)
             root = resolve_workspace_root(_CODE_ROOT)
-    load_workspace_env(root)
+    load_workspace_env(root, override=override)
     return root
+
+
+def offline_workspace(explicit: Path | str | None = None) -> Path:
+    """离线工具定工作区并灌 .env，返回工作区根。进程里已经有的变量都不覆盖。"""
+    return _settle_workspace(explicit, override=False)
+
+
+def process_workspace() -> Path:
+    """常驻进程启动时定工作区并灌 .env，工作区自己那份盖过继承来的值。
+
+    supervisor 退出码 75 自己重启时，launcher 的环境还停在服务启动那一刻；控制台改过的密钥要靠这个生效。
+    """
+    return _settle_workspace(None, override=True)
 
 
 def undeclared_platform_secrets(

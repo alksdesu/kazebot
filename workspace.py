@@ -22,6 +22,20 @@ def workspace_env_root() -> Path | None:
     return None
 
 
+def pin_workspace_env(root: Path | str) -> None:
+    """把这一组变量钉回 root：本进程后来再按 env 解析的地方和它拉起的子进程，认的都是这一个根。
+
+    子进程的 cwd 是工作区，钉相对路径会在那边解析到别处，所以钉解析后的绝对路径。
+    """
+    value = str(Path(root).expanduser().resolve())
+    primary, *aliases = _ENV_NAMES
+    os.environ[primary] = value
+    for name in aliases:
+        # 没设过的别名不补：主名排在前面，补了也不改变谁认到哪。
+        if name in os.environ:
+            os.environ[name] = value
+
+
 def resolve_workspace_root(fallback: Path | str) -> Path:
     """按 env 解析工作区根；没设就用调用方给的回落值。
 

@@ -122,7 +122,7 @@ supervisor 跑在 `kazebot` 下，`ProtectSystem=strict` + `NoNewPrivileges=yes`
 
 | 变量 | 作用 |
 |---|---|
-| `CLONOTH_WORKSPACE` | 工作区根。不设时回落到代码目录，行为与改造前一致 |
+| `CLONOTH_WORKSPACE` | 工作区根。不设时回落到代码目录，行为与改造前一致。实例的工作区由 systemd 单元给，实例 `.env` 里别写这一行：`EnvironmentFile=` 的值总是盖过单元里的 `Environment=`，整份抄主实例的 `.env` 过来，这个实例就落到了主实例的目录 |
 | `CLONOTH_URL_PREFIX` | 控制台与 API 挂载的路径前缀，留空为根 |
 | `CLONOTH_INSTANCES_FILE` | 共享清单位置，默认 `<工作区>/config/instances.yaml` |
 | `NAPCAT_WEBUI_URL` | 本实例对应的 NapCat WebUI，默认 `http://127.0.0.1:6099` |

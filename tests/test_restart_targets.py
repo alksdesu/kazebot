@@ -7,6 +7,7 @@ web 连接和 TUI 一起死，而 os._exit(75) 只在外层 launcher 下才是�
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -71,6 +72,10 @@ def _fast_and_safe(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(admin_api, "_admin_token", "")
     # 两条路径的 deferred 线程都靠 sleep 给 HTTP 响应让路，测试里不必真等。
     monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    # 重启会把工作区变量钉成 tmp_path：先经 monkeypatch 登记一次，别漏给后面的用例。
+    for name in ("CLONOTH_WORKSPACE", "ONEBOT_WORKSPACE_ROOT"):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
 
 
 def _make(tmp_path: Path, pm: Any):
@@ -177,6 +182,62 @@ class TestEngineOnlyRestart:
         assert response.status_code == 200, response.text
         assert response.json()["scheduled"] is False
         assert "restart_failed" in _event_types(state)
+
+
+class TestEngineRestartReloadsTheWorkspaceEnv:
+    """控制台改过的密钥要先进 supervisor 的环境，新拉起的 engine 才继承得到。"""
+
+    def test_it_reloads_the_env_of_this_instance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 不带路径的 load_dotenv 找到的是代码目录那份：多开时那是主实例的端口和密钥。
+        import supervisor.api as api_module
+
+        loaded: list[tuple[Any, bool]] = []
+        monkeypatch.setattr(
+            api_module, "load_workspace_env",
+            lambda root, *, override=False: loaded.append((root, override)),
+        )
+        pm = _FakeProcessManager()
+        state, app = _make(tmp_path, pm)
+
+        _post(app, {"target": "engine", "reason": "test"})
+        _settle(pm, "start_engine")
+
+        # override=True：supervisor 的环境还停在服务启动那一刻，不盖就等于没改。
+        assert loaded == [(state.workspace_root, True)]
+
+    def test_it_pins_the_workspace_this_supervisor_runs_in(self, tmp_path: Path) -> None:
+        # 从别的实例抄来的 .env 带着那个实例的根：不钉回来，这次重启拉起的 engine 就落到那边去了。
+        other = tmp_path / "other"
+        other.mkdir()
+        (tmp_path / ".env").write_text(f"CLONOTH_WORKSPACE={other.as_posix()}\n", encoding="utf-8")
+        pm = _FakeProcessManager()
+        state, app = _make(tmp_path, pm)
+
+        _post(app, {"target": "engine", "reason": "test"})
+        _settle(pm, "start_engine")
+
+        assert os.environ["CLONOTH_WORKSPACE"] == str(Path(state.workspace_root).resolve())
+
+    def test_a_failed_reload_does_not_cancel_the_restart(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # .env 被删掉或正写到一半，重启本身不能跟着黄掉。
+        import supervisor.api as api_module
+
+        def _boom(*_args: Any, **_kwargs: Any) -> None:
+            raise OSError("no .env here")
+
+        monkeypatch.setattr(api_module, "load_workspace_env", _boom)
+        pm = _FakeProcessManager()
+        _state, app = _make(tmp_path, pm)
+
+        response = _post(app, {"target": "engine", "reason": "test"})
+        _settle(pm, "start_engine")
+
+        assert response.json()["scheduled"] is True
+        assert "start_engine" in pm.calls
 
 
 class TestFullRestartStillWorks:
