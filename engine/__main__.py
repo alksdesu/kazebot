@@ -10,8 +10,7 @@ from pathlib import Path
 
 from workspace import resolve_workspace_root
 
-# [2026-05-25] Ensure all loggers (including plugins like fallback_provider)
-# output to stderr so PM2 can capture them.
+# Route every logger (plugins included) to stderr; the supervisor captures it into data/logs/.
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",

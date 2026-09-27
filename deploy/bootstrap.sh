@@ -192,7 +192,6 @@ write_configs() {
 
   copy_template "$REPO/config.example.yaml" "$REPO/data/config.yaml" \
     "data/config.yaml —— 空渠道，等控制台「渠道」页填"
-  # 比内置默认更严：额外禁读 config/nodes/** 与 engine/system_nodes/**
   copy_template "$REPO/policy.example.yaml" "$REPO/data/policy.yaml" \
     "data/policy.yaml —— 权限策略"
   # 白名单和管理员留空是 fail-closed 的默认状态，控制台填完即时生效

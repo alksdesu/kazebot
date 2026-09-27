@@ -16,7 +16,7 @@ class BotConfig:
 
     Attributes:
         base_url: Supervisor HTTP API 地址，如 "http://127.0.0.1:8765"
-        secret: 认证密钥（保留字段，当前 Supervisor 未启用认证）
+        secret: 保留字段，SDK 不读取。Supervisor 的鉴权走 ClonothClient 的 admin_token / admin_token_path
         entry_node_id: 默认入口节点 ID，如 "ereuna_main"
         conversation_key_prefix: 会话键前缀，如 "qq_group" 使生成的 key 为 "qq_group:{channel_id}"
         poll_interval: 事件轮询间隔（秒）
