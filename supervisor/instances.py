@@ -5,15 +5,15 @@
 """
 from __future__ import annotations
 
-import contextlib
 import os
 import socket
-import threading
-from collections.abc import Iterator
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from file_lock import exclusive_lock
 
 _ENV_FILE = "CLONOTH_INSTANCES_FILE"
 _ENV_PREFIX = "CLONOTH_URL_PREFIX"
@@ -28,9 +28,6 @@ _PORTS: dict[str, tuple[int, int]] = {
 
 # 序号无上限会一路撞进别的服务的端口，磁盘也撑不住这么多号。
 MAX_INDEX = 8
-
-_LOCKS_GUARD = threading.Lock()
-_LOCKS: dict[str, threading.Lock] = {}
 
 
 def ports_for(idx: int) -> dict[str, int]:
@@ -130,36 +127,9 @@ def allocate_index(
     raise ValueError(f"没有空闲序号了（上限 {MAX_INDEX}）")
 
 
-@contextlib.contextmanager
-def _locked(path: Path) -> Iterator[None]:
+def _locked(path: Path) -> AbstractContextManager[None]:
     """跨实例互斥。几个 supervisor 各自的进程锁管不到彼此，得落到文件上。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_name(f"{path.name}.lock")
-    key = str(lock_path)
-    with _LOCKS_GUARD:
-        process_lock = _LOCKS.setdefault(key, threading.Lock())
-    with process_lock, lock_path.open("a+b") as stream:
-        stream.seek(0, os.SEEK_END)
-        if stream.tell() == 0:
-            stream.write(b"0")
-            stream.flush()
-        stream.seek(0)
-        if os.name == "nt":
-            import msvcrt
-            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            stream.seek(0)
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    return exclusive_lock(path.with_name(f"{path.name}.lock"))
 
 
 def _write(path: Path, rows: list[dict[str, Any]]) -> None:

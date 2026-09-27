@@ -324,49 +324,6 @@ class TestPromptBlock:
         assert "[表情:无语]" in block
 
 
-class TestAutoTag:
-    """自动打标是花钱的那一步，得能单独关掉。"""
-
-    def test_默认开着(self, runtime: Any) -> None:
-        assert runtime.state.live.sticker_auto_tag is True
-
-    def test_关掉之后打标循环不再干活(
-        self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        set_live_config(runtime, sticker_auto_tag=False)
-        seen: list[bool] = []
-        monkeypatch.setattr(
-            runtime.emotes, "StickerTagger",
-            lambda *a, **kw: seen.append(kw["config"]().enabled) or _Stub(),
-        )
-        runtime.state._adapter.sticker_tagger = None
-        runtime.emotes._start_sticker_tagger()
-
-        assert seen == [False]
-
-    def test_开关是每轮现读的_不用重启(
-        self, runtime: Any, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        holder: list[Any] = []
-        monkeypatch.setattr(
-            runtime.emotes, "StickerTagger",
-            lambda *a, **kw: holder.append(kw["config"]) or _Stub(),
-        )
-        runtime.state._adapter.sticker_tagger = None
-        runtime.emotes._start_sticker_tagger()
-        read = holder[0]
-
-        assert read().enabled is True
-        set_live_config(runtime, sticker_auto_tag=False)
-        # 同一个 callable 再问一次就该是新值 —— 存快照的话这里还是 True。
-        assert read().enabled is False
-
-
-class _Stub:
-    def start(self) -> None:
-        return None
-
-
 class TestRosterLayout:
     """一行一张。挤成一行时，标签自带顿号或名字带括号就分不清归属了。"""
 

@@ -95,7 +95,7 @@ supervisor 跑在 `kazebot` 下，`ProtectSystem=strict` + `NoNewPrivileges=yes`
 
 之所以做成软链而不是配一个绝对路径：附件白名单（`engine/attachments.py`）只认工作区内的 `data/` 前缀，库放在工作区外就发不出去。
 
-索引是 SQLite，几个实例同时读写靠 WAL，不需要额外协调。「最近发过」的去重记录按会话键分开存，所以共享图库不会让 A 群发过的图在 B 群被跳过。
+索引是 SQLite，几个实例同时读写靠 WAL，不需要额外协调。打标例外：各号的 supervisor 每批开打前抢库旁的 `stickers.sqlite3.tagging.lock`，同一时刻只有一个在调看图渠道，免得几份一起把频率限制打满。抢到的号用自己配的看图渠道，没配好的号抢到了也只是歇着，别的号接着打。「最近发过」的去重记录按会话键分开存，所以共享图库不会让 A 群发过的图在 B 群被跳过。
 
 代码和 `.venv` 也是共享的，git 更新会同时作用于所有号，做不到逐个灰度。
 

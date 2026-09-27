@@ -46,6 +46,8 @@ SOURCE_PLATFORM = LAYER_PLATFORM
 SOURCE_LEGACY = "legacy"
 SOURCE_ENV = "env"
 SOURCE_DEFAULT = "default"
+# 运营者在平台那边亲手写下的兜底。只认全局的键在全局文件里没写时，平台按它们取值。
+FALLBACK_SOURCES: frozenset[str] = frozenset({SOURCE_LEGACY, SOURCE_ENV})
 
 
 @dataclass(frozen=True)
@@ -488,6 +490,12 @@ class LiveConfig:
             cache.values, cache.sources = self._build(cache.document, defaults_document)
             return cache.values
 
+    def resolved(self) -> tuple[Mapping[str, Any], Mapping[str, str]]:
+        """生效值和每个键的来源，出自同一次重载。不看上下文里钉住的快照：钉住的只有值，没有来源。"""
+        self._reload_if_changed()
+        with self._cache_lock:
+            return self._cache.values, self._cache.sources
+
     def adopted_document(self) -> tuple[Mapping[str, Any], int]:
         """当前采纳的文档和第几次采纳。别的层拿它当默认值；文件写坏时给的是上一份有效的。"""
         self._reload_if_changed()
@@ -627,8 +635,7 @@ class LiveConfig:
         """进程实际生效的配置快照 + 文件指纹，由适配器公布给控制台。"""
         values = self.current()
         payload = self.file_state()
-        with self._cache_lock:
-            sources = dict(self._cache.sources)
+        _, sources = self.resolved()
         payload.update({
             "layer": self.layer,
             "values": {name: jsonable(values[name]) for name in sorted(values)},

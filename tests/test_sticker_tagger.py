@@ -15,8 +15,13 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 if str(_ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(_ROOT / "tools"))
+_TESTS = Path(__file__).resolve().parent
+if str(_TESTS) not in sys.path:
+    sys.path.insert(0, str(_TESTS))
 
 
+from _lock_holder import LockHolder
+from file_lock import try_exclusive_lock
 from stickers import store as ss
 from stickers import tagger as st
 
@@ -105,6 +110,25 @@ def bench(tmp_path: Path):
         "root": tmp_path, "store": store, "tagger": tagger, "holder": holder,
     })
     store.close()
+
+
+@pytest.fixture()
+def hold():
+    started: list[LockHolder] = []
+
+    def start(path: Path) -> LockHolder:
+        holder = LockHolder(path)
+        started.append(holder)
+        return holder
+
+    yield start
+    for holder in started:
+        holder.close()
+
+
+def _lock_free(store) -> bool:
+    with try_exclusive_lock(st.tagging_lock_path(store.path)) as held:
+        return held
 
 
 def _seed(bench, digest: str = "a" * 64) -> str:
@@ -504,10 +528,15 @@ async def test_a_cancelled_pass_puts_the_image_back(bench, monkeypatch: pytest.M
 
     assert bench.store.get(digest).caption_state == ss.CAPTION_PENDING
     assert bench.store.claim_caption() is not None
+    # 锁也得跟着放掉，否则共用图库的其他进程再也轮不到。
+    assert _lock_free(bench.store)
 
 
 @pytest.mark.asyncio
-async def test_two_taggers_never_describe_the_same_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_two_taggers_past_the_lock_never_describe_the_same_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 锁之外还有原子领取兜底：升级过渡期还没换新的 bot 照旧自己打标，不认这把锁。
     import asyncio
 
     (tmp_path / "data" / "stickers").mkdir(parents=True)
@@ -537,10 +566,155 @@ async def test_two_taggers_never_describe_the_same_image(tmp_path: Path, monkeyp
 
     try:
         config = st.TaggerConfig(min_interval=0.0)
-        await asyncio.gather(make(first)._sweep(config), make(second)._sweep(config))
+        await asyncio.gather(make(first)._tag_batch(first, config), make(second)._tag_batch(second, config))
     finally:
         first.close()
         second.close()
 
     assert sorted(seen) == sorted(set(seen))
     assert len(seen) == 4
+
+
+# ── 共用一个图库时轮流打 ──
+
+def test_the_lock_sits_next_to_the_library(tmp_path: Path) -> None:
+    # 多开时图库目录是指向共享库的软链，锁放在旁边，几个进程抢的才是同一个文件。
+    library = tmp_path / "data" / "stickers" / "stickers.sqlite3"
+
+    assert st.tagging_lock_path(library) == library.with_name("stickers.sqlite3.tagging.lock")
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_sits_out_while_another_process_tags_the_library(
+    bench, monkeypatch: pytest.MonkeyPatch, hold,
+) -> None:
+    digest = _seed(bench)
+    monkeypatch.setitem(sys.modules, "tools._channel", _FakeChannel(_Vision()))
+    described: list[int] = []
+    monkeypatch.setattr(
+        bench.tagger, "_describe", lambda *_a, **_k: described.append(1) or _async(["表情包", "猫"]),
+    )
+    holder = hold(st.tagging_lock_path(bench.store.path))
+
+    assert await bench.tagger._sweep(bench.holder["config"]) == 0
+    assert described == []
+    assert bench.store.get(digest).caption_state == ss.CAPTION_PENDING
+
+    holder.release()
+
+    assert await bench.tagger._sweep(bench.holder["config"]) == 1
+    assert bench.store.get(digest).caption_state == ss.CAPTION_DONE
+
+
+@pytest.mark.asyncio
+async def test_a_second_tagger_in_one_process_sits_out_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    (tmp_path / "data" / "stickers").mkdir(parents=True)
+    path = tmp_path / "stickers.sqlite3"
+    first_store, second_store = ss.StickerStore(path), ss.StickerStore(path)
+    for index in range(2):
+        digest = str(index) * 64
+        image = tmp_path / "data" / "stickers" / f"{digest}.png"
+        image.write_bytes(b"fake png bytes")
+        first_store.add(sha256=digest, rel_path=image.relative_to(tmp_path).as_posix(),
+                        source=ss.SOURCE_GROUP, state=ss.STATE_LIBRARY, name="待标")
+    monkeypatch.setitem(sys.modules, "tools._channel", _FakeChannel(_Vision()))
+    config = st.TaggerConfig(batch=1, min_interval=0.0)
+    first = st.StickerTagger(tmp_path, config=lambda: config, open_store=lambda: first_store)
+    second = st.StickerTagger(tmp_path, config=lambda: config, open_store=lambda: second_store)
+    entered, leave = asyncio.Event(), asyncio.Event()
+    second_described: list[int] = []
+
+    async def slow(_vision, _path):
+        entered.set()
+        await leave.wait()
+        return ["表情包", "猫"]
+
+    monkeypatch.setattr(first, "_describe", slow)
+    monkeypatch.setattr(
+        second, "_describe", lambda *_a, **_k: second_described.append(1) or _async(["表情包", "猫"]),
+    )
+    try:
+        running = asyncio.create_task(first._sweep(config))
+        await asyncio.wait_for(entered.wait(), timeout=10)
+
+        assert await second._sweep(config) == 0
+        assert second_described == []
+
+        leave.set()
+        assert await running == 1
+        assert await second._sweep(config) == 1
+    finally:
+        first_store.close()
+        second_store.close()
+
+
+@pytest.mark.asyncio
+async def test_the_lock_is_given_back_after_every_batch(bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    for index in range(3):
+        _seed(bench, str(index) * 64)
+    bench.holder["config"] = st.TaggerConfig(batch=2, min_interval=0.0)
+    monkeypatch.setitem(sys.modules, "tools._channel", _FakeChannel(_Vision()))
+    monkeypatch.setattr(bench.tagger, "_describe", lambda *_a, **_k: _async(["表情包", "猫"]))
+
+    assert await bench.tagger._sweep(bench.holder["config"]) == 2
+
+    # 按批放锁：别的进程在两批之间也有机会接手，不会被一个进程攥到库打完。
+    assert _lock_free(bench.store)
+
+
+@pytest.mark.asyncio
+async def test_opening_the_library_leaves_the_event_loop_free(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 打标跑在 supervisor 的事件循环里，开库卡住的话管理接口和引擎轮询一起停摆。
+    import asyncio
+    import time
+
+    def slow_open():
+        time.sleep(0.5)
+        return None
+
+    tagger = st.StickerTagger(tmp_path, config=lambda: st.TaggerConfig(), open_store=slow_open)
+    ticks = 0
+
+    async def tick() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    ticker = asyncio.create_task(tick())
+    try:
+        assert await tagger._sweep(st.TaggerConfig()) == 0
+    finally:
+        ticker.cancel()
+
+    assert ticks > 5
+
+
+@pytest.mark.asyncio
+async def test_a_switch_that_cannot_be_read_skips_a_round_instead_of_ending_the_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    import asyncio
+
+    monkeypatch.setattr(st, "_IDLE_SLEEP", 0.0)
+    calls: list[int] = []
+    second_round = asyncio.Event()
+
+    def config() -> st.TaggerConfig:
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("features.yaml 读不了")
+        second_round.set()
+        return st.TaggerConfig(enabled=False, idle_sleep=0.0)
+
+    tagger = st.StickerTagger(tmp_path, config=config, open_store=lambda: None)
+    with caplog.at_level("WARNING"):
+        tagger.start()
+        try:
+            await asyncio.wait_for(second_round.wait(), timeout=10)
+        finally:
+            await tagger.stop()
+
+    assert "表情包打标出错" in caplog.text

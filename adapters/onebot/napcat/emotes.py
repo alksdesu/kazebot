@@ -30,7 +30,6 @@ from stickers.collect import sticker_root, store_path as sticker_store_path
 from stickers.rank import rank
 from stickers.roster import RosterRules, offered, prompt_roster, roster_entry
 from stickers.store import Sticker, StickerStore
-from stickers.tagger import StickerTagger, TaggerConfig
 
 from . import anonymize, common, media, outbound_attachments, routing, sending, state
 
@@ -296,24 +295,7 @@ async def _pick_combat_sticker(context_text: str, conversation_key: str) -> Reso
         return None
 
 
-def _start_sticker_tagger() -> None:
-    """图库没启用也照跑：手动传的图同样要打标，只是平时没活会一直空转睡着。
-
-    每轮循环都重新读一次开关，所以关掉之后正在跑的这一批做完就停，不用重启。
-    """
-    if state._adapter.sticker_tagger is None:
-        state._adapter.sticker_tagger = StickerTagger(
-            Path(CLONOTH_WORKSPACE),
-            config=lambda: TaggerConfig(enabled=bool(live.sticker_auto_tag)),
-            open_store=_sticker_store_handle,
-        )
-    state._adapter.sticker_tagger.start()
-
-
 async def _stop_stickers() -> None:
-    if state._adapter.sticker_tagger is not None:
-        await state._adapter.sticker_tagger.stop()
-        state._adapter.sticker_tagger = None
     if state._adapter.sticker_collector is not None:
         await state._adapter.sticker_collector.stop()
         state._adapter.sticker_collector = None

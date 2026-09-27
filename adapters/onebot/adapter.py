@@ -42,7 +42,6 @@ if TYPE_CHECKING:
     from clonoth_sdk import ClonothClient, EventRouter, SessionState
     from stickers.collect import StickerCollector
     from stickers.store import StickerStore
-    from stickers.tagger import StickerTagger
 
     from adapters._shared.feature_gateway import FeatureGateway
     from .napcat.callbacks import TangQiuCallbacks
@@ -219,7 +218,6 @@ class OneBotAdapter:
         self.custom_face_metadata: List[Dict[str, Any]] = []
         self.sticker_store: Optional["StickerStore"] = None
         self.sticker_collector: Optional["StickerCollector"] = None
-        self.sticker_tagger: Optional["StickerTagger"] = None
         # 发图时要记「这个会话刚发过这张」，而 process_emojis 的签名里没有会话键。
         self.sticker_send_conversation: contextvars.ContextVar[str] = contextvars.ContextVar(
             "sticker_send_conversation", default="",

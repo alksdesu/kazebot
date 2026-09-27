@@ -280,7 +280,6 @@ async def _startup() -> None:
         common.logger.info("loaded %d QQ user profiles", len(state._adapter.qq_user_profiles))
     routing._load_route_state()
     routing._load_reply_attachment_cache()
-    emotes._start_sticker_tagger()
     anonymize._load_anon_map()
     await emotes._reconcile_sticker_receipts()
     state._adapter.sticker_receipt_task = asyncio.create_task(emotes._sticker_receipts_forever())

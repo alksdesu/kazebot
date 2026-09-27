@@ -46,7 +46,8 @@ _STORES: dict[str, StickerStore] = {}
 _STORES_GUARD = threading.Lock()
 
 
-def _store(workspace_root: Path) -> StickerStore:
+def library_store(workspace_root: Path) -> StickerStore:
+    """本进程共用的图库句柄，控制台接口和打标都从这里取。"""
     key = str(store_path(workspace_root))
     with _STORES_GUARD:
         handle = _STORES.get(key)
@@ -92,7 +93,7 @@ def create_sticker_router(workspace_root: Path) -> APIRouter:
     router = APIRouter(dependencies=[Depends(verify_admin_token)])
 
     def _row(sha256: str) -> tuple[StickerStore, Sticker]:
-        store = _store(workspace_root)
+        store = library_store(workspace_root)
         row = store.get(str(sha256 or "").strip())
         if row is None:
             raise HTTPException(status_code=404, detail="没有这张图")
@@ -107,13 +108,13 @@ def create_sticker_router(workspace_root: Path) -> APIRouter:
     ) -> dict[str, Any]:
         if state and state not in STATES:
             raise HTTPException(status_code=400, detail="未知状态")
-        store = _store(workspace_root)
+        store = library_store(workspace_root)
         rows = store.browse(state=state, search=search, limit=limit, offset=offset)
         return {"items": [_as_json(row) for row in rows], "counts": store.counts()}
 
     @router.get("/counts")
     async def sticker_counts() -> dict[str, int]:
-        return _store(workspace_root).counts()
+        return library_store(workspace_root).counts()
 
     @router.get("/{sha256}/image")
     async def sticker_image(sha256: str) -> FileResponse:
@@ -177,7 +178,7 @@ def create_sticker_router(workspace_root: Path) -> APIRouter:
     async def recaption(request: Request) -> dict[str, int]:
         body = await request.json() if await request.body() else {}
         only_failed = bool(body.get("only_failed")) if isinstance(body, dict) else False
-        return {"queued": _store(workspace_root).reset_captions(only_failed=only_failed)}
+        return {"queued": library_store(workspace_root).reset_captions(only_failed=only_failed)}
 
     @router.post("/upload")
     async def upload_sticker(
@@ -195,7 +196,7 @@ def create_sticker_router(workspace_root: Path) -> APIRouter:
         if shape is None:
             raise HTTPException(status_code=415, detail="认不出这是什么图片格式")
 
-        store = _store(workspace_root)
+        store = library_store(workspace_root)
         digest = hashlib.sha256(content).hexdigest()
         if store.known(digest):
             raise HTTPException(status_code=409, detail="这张图库里已经有了")
@@ -238,7 +239,7 @@ def create_sticker_router(workspace_root: Path) -> APIRouter:
         if workspace_root.resolve() not in source.parents or not source.is_dir():
             raise HTTPException(status_code=400, detail="目录必须在工作区内")
 
-        store = _store(workspace_root)
+        store = library_store(workspace_root)
         state = STATE_LIBRARY if accept else STATE_PENDING
         target_dir = sticker_root(workspace_root) / (LIBRARY_DIR if accept else PENDING_DIR)
         target_dir.mkdir(parents=True, exist_ok=True)

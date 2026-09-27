@@ -104,10 +104,9 @@ def features_state(workspace_root: Path, config: Any) -> dict[str, Any]:
     }
 
 
-def create_feature_config_router(workspace_root: Path) -> APIRouter:
+def create_feature_config_router(workspace_root: Path, config: Any) -> APIRouter:
+    """config 是全局那层的实例，由 create_app 建好传进来。"""
     router = APIRouter(dependencies=[Depends(verify_admin_token)])
-    # 实例跟着路由活：文件写坏时它和各个 bot 一样留着上一份有效配置，算出来的值才对得上。
-    config = features_module().new_features_config(workspace_root)
 
     @router.get("/config/raw")
     def get_raw() -> dict[str, Any]:

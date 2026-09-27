@@ -14,12 +14,15 @@ from .console_schema import build_schema, number, percent, text_input, toggle, t
 from .features_layout import FEATURE_SECTIONS
 from .live_config import (
     BOOL,
+    FALLBACK_SOURCES,
     GLOBAL_AND_PLATFORM,
     GLOBAL_ONLY,
     LAYER_GLOBAL,
     PLAIN_STR,
     PREFIX_LIST,
     RELOAD_RECONCILED,
+    SOURCE_ENV,
+    SOURCE_GLOBAL,
     TRIGGER_MODE,
     TRISTATE_BOOL,
     WORD_LIST,
@@ -337,6 +340,73 @@ def new_features_config(workspace_root: Path) -> LiveConfig:
     """全局默认那一层。实例由使用方持有：共享层整个进程只有一份，缓存放这里会被几次加载共用。"""
     root = Path(workspace_root)
     return LiveConfig(FEATURE_KEYS, path=lambda: features_config_path(root), layer=LAYER_GLOBAL)
+
+
+@dataclasses.dataclass(frozen=True)
+class PlatformFallback:
+    """一个平台的 bot 公布出来、它眼下用着的兜底值。"""
+
+    platform: str
+    source: str
+    value: Any
+
+    @property
+    def from_env(self) -> bool:
+        """取自平台自己的环境变量；否则是平台配置文件老位置上的写法。"""
+        return self.source == SOURCE_ENV
+
+
+@dataclasses.dataclass(frozen=True)
+class CentralSwitch:
+    """全系统只跑一份的功能开不开，以及是谁定的。"""
+
+    enabled: bool
+    # 全局文件写了这一项，平台那边的兜底一概不看。
+    set_globally: bool
+    # 全局没写时起作用的平台兜底；也为空就是用的默认值。
+    fallbacks: tuple[PlatformFallback, ...] = ()
+
+
+def platform_fallbacks(name: str, published: Mapping[str, Mapping[str, Any]]) -> tuple[PlatformFallback, ...]:
+    """只认全局的键，各平台 bot 公布的生效值里取自老位置或 env 的那些。published 是平台 id 到它公布的快照。
+
+    没公布来源的旧版本 bot 看不出值是不是亲手写的，不算。
+    """
+    key = FEATURE_KEYS_BY_NAME[name]
+    if key.layers != GLOBAL_ONLY:
+        raise ValueError(f"{name} 平台能直接覆盖，谈不上兜底")
+    found: list[PlatformFallback] = []
+    for platform_id, state in published.items():
+        values, sources = state.get("values"), state.get("sources")
+        if not isinstance(values, Mapping) or not isinstance(sources, Mapping) or name not in values:
+            continue
+        source = sources.get(name)
+        if source in FALLBACK_SOURCES:
+            found.append(PlatformFallback(platform_id, source, key.coerce(values[name], key.default)))
+    return tuple(found)
+
+
+def central_switch(
+    name: str, config: LiveConfig, published: Mapping[str, Mapping[str, Any]],
+) -> CentralSwitch:
+    """只认全局的开关，管的是全系统只跑一份的功能（比如打标）。config 是全局那层。
+
+    全局文件写了就听它的，改了下一轮就生效；没写时认各平台的兜底，有一个开着就开，和以前每个 bot
+    各跑一份时一样；都没有才用默认值。
+    """
+    if config.layer != LAYER_GLOBAL:
+        raise ValueError(f"central_switch 要的是全局那层，给的是 {config.layer}")
+    if FEATURE_KEYS_BY_NAME[name].coerce is not BOOL:
+        raise ValueError(f"{name} 不是开关")
+    fallbacks = platform_fallbacks(name, published)
+    values, sources = config.resolved()
+    if sources.get(name) == SOURCE_GLOBAL:
+        return CentralSwitch(enabled=bool(values[name]), set_globally=True)
+    if fallbacks:
+        return CentralSwitch(
+            enabled=any(bool(fallback.value) for fallback in fallbacks), set_globally=False, fallbacks=fallbacks,
+        )
+    return CentralSwitch(enabled=bool(values[name]), set_globally=False)
 
 
 def adopt(name: str, *, env: tuple[str, ...] = ()) -> LiveKey:

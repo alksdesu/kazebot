@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import ValidationError
 
 from engine.attachments import blocked_file_reject_reason
-from platforms.registry import conversation_key_prefix
+from platforms.registry import conversation_key_prefix, features_module
 
 from . import provisioning
 from .config_store import ConfigStore
@@ -2346,8 +2346,11 @@ def create_app(
     admin_router = create_admin_router(workspace_root=state.workspace_root)
     app.include_router(admin_router, prefix="/v1/admin/config")
     app.include_router(create_platform_router(workspace_root=state.workspace_root), prefix="/v1/platforms")
+    # 路由和打标共用一份：路由写完作废缓存，打标下一轮就看到新值。
+    features_config = features_module().new_features_config(state.workspace_root)
     app.include_router(
-        create_feature_config_router(workspace_root=state.workspace_root), prefix="/v1/features",
+        create_feature_config_router(workspace_root=state.workspace_root, config=features_config),
+        prefix="/v1/features",
     )
     app.include_router(
         create_sticker_router(workspace_root=state.workspace_root), prefix="/v1/stickers",
@@ -2440,5 +2443,5 @@ def create_app(
 
     init_admin_token(state.workspace_root, console_url=console_url)
 
-    register_features(app, state, process_manager, config_store)
+    register_features(app, state, process_manager, config_store, features_config)
     return app

@@ -56,6 +56,15 @@ def live_state(workspace_root: Path, platform: PlatformDescriptor) -> dict[str, 
     return data if isinstance(data, dict) else {}
 
 
+def published_states(workspace_root: Path) -> dict[str, dict[str, Any]]:
+    """各平台 bot 最近一次公布的生效快照，按平台 id。失联的也算：写在配置和 env 里的设置不随 bot 停下而消失。"""
+    return {
+        platform.id: state
+        for platform in all_platforms()
+        if (state := live_state(workspace_root, platform))
+    }
+
+
 def publication_age(state: Mapping[str, Any]) -> tuple[float, bool]:
     """live 状态公布了多久，以及是否久到该当 bot 失联。"""
     age_sec = max(0.0, time.time() - float(state.get("published_at") or 0.0))

@@ -1,6 +1,7 @@
 """给表情包打标签。
 
-标签是检索的全部依据，没打上的图对模型不可描述。后台慢慢跑，别和聊天抢 API 配额。
+标签是检索的全部依据，没打上的图对模型不可描述。后台慢慢跑，别和聊天抢 API 配额；
+共用一个图库的几个进程按批轮流打。
 """
 from __future__ import annotations
 
@@ -11,6 +12,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
+
+from file_lock import try_exclusive_lock
 
 from .store import CAPTION_PROMPT_VERSION, CaptionClaim, StickerStore
 
@@ -100,6 +103,12 @@ def normalize_tags(tags: Sequence[str], *, fallback: str = "") -> list[str]:
     return ordered[:_TAG_MAX]
 
 
+def tagging_lock_path(store_path: Path) -> Path:
+    """图库旁的打标锁。多开时图库目录是共享的软链，几个进程抢的是同一个文件。"""
+    path = Path(store_path)
+    return path.with_name(f"{path.name}.tagging.lock")
+
+
 def _json_or_none(response: Any) -> Any:
     try:
         return response.json()
@@ -145,23 +154,33 @@ class StickerTagger:
 
     async def _run(self) -> None:
         while True:
-            config = self._config()
             done = 0
-            if config.enabled:
-                try:
+            idle = _IDLE_SLEEP
+            try:
+                # 开关要读配置文件，读取出错也只是跳过这一轮，不能让循环整个死掉。
+                config = self._config()
+                idle = config.idle_sleep
+                if config.enabled:
                     done = await self._sweep(config)
-                except Exception:
-                    logger.warning("表情包打标出错", exc_info=True)
+            except Exception:
+                logger.warning("表情包打标出错", exc_info=True)
             # 有活就立刻接着干，没活才睡；不然新收的图要等一整轮。
-            await asyncio.sleep(0.0 if done else max(config.idle_sleep, 1.0))
+            await asyncio.sleep(0.0 if done else max(idle, 1.0))
 
     async def _sweep(self, config: TaggerConfig) -> int:
-        store = self._open_store()
+        # 开库可能要等十几秒（WAL 重试、迁移），放进线程，别卡住宿主的事件循环。
+        store = await asyncio.to_thread(self._open_store)
         if store is None:
             return 0
         if not store.due_for_caption(limit=1):
             return 0
+        with try_exclusive_lock(tagging_lock_path(store.path)) as held:
+            if not held:
+                # 共用这个图库的另一个进程正在打，这一轮歇着，免得几份一起把看图渠道的频率限制打满。
+                return 0
+            return await self._tag_batch(store, config)
 
+    async def _tag_batch(self, store: StickerStore, config: TaggerConfig) -> int:
         from tools._channel import resolve_vision_channel
 
         vision = resolve_vision_channel(root=self.workspace_root)

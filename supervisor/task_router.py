@@ -10,12 +10,13 @@ import queue
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
 from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
+from file_lock import exclusive_lock
 
 from ._helpers import _now
 from .branch_finalize_store import BranchClaim
@@ -26,9 +27,6 @@ from .types import RouteStatus, Task, TaskKind, TaskStatus
 
 
 log = logging.getLogger(__name__)
-
-_BRANCH_PROCESS_LOCKS_GUARD = threading.Lock()
-_BRANCH_PROCESS_LOCKS: dict[str, threading.Lock] = {}
 
 
 class BranchFinalizeDeferred(RuntimeError):
@@ -708,38 +706,9 @@ class TaskRouterMixin:
         )
         self._branch_finalize_claims[plan.identity] = {**claim.__dict__, "status": status}
 
-    @contextmanager
-    def _branch_parent_write_lock(self, parent_session_id: str):
+    def _branch_parent_write_lock(self, parent_session_id: str) -> AbstractContextManager[None]:
         digest = hashlib.sha256(parent_session_id.encode("utf-8")).hexdigest()[:24]
-        lock_dir = self.workspace_root / "data" / "locks"
-        lock_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = lock_dir / f"branch-merge-{digest}.lock"
-        key = str(lock_path.resolve())
-        with _BRANCH_PROCESS_LOCKS_GUARD:
-            process_lock = _BRANCH_PROCESS_LOCKS.setdefault(key, threading.Lock())
-        with process_lock:
-            with lock_path.open("a+b") as stream:
-                stream.seek(0, os.SEEK_END)
-                if stream.tell() == 0:
-                    stream.write(b"0")
-                    stream.flush()
-                stream.seek(0)
-                if os.name == "nt":
-                    import msvcrt
-                    msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    stream.seek(0)
-                    if os.name == "nt":
-                        import msvcrt
-                        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-                    else:
-                        import fcntl
-                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        return exclusive_lock(self.workspace_root / "data" / "locks" / f"branch-merge-{digest}.lock")
 
     def _prepare_branch_finalize_locked(
         self, task: Task, *, merge: bool,

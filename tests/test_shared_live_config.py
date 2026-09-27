@@ -392,6 +392,49 @@ class TestFailClosed:
         assert "chat.yaml is unusable" in caplog.text
 
 
+class TestResolved:
+    """值和来源一起取：只拿到值的话，分不清是运营者亲手写的还是默认值。"""
+
+    def test_each_value_comes_with_where_it_was_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("CHAT_LIBRARY", "7")
+        _shared, platform = _layers(tmp_path)
+        _write(platform, "feature:\n  limit: 5\n")
+
+        values, sources = platform.resolved()
+
+        assert (values["limit"], sources["limit"]) == (5, SOURCE_PLATFORM)
+        assert (values["library"], sources["library"]) == (7, SOURCE_ENV)
+        assert (values["enabled"], sources["enabled"]) == (False, SOURCE_DEFAULT)
+
+    def test_a_pinned_snapshot_stays_out_of_it(self, tmp_path: Path) -> None:
+        # 钉住的只有值；混进来的话，值是钉的、来源却是文件的，两边对不上。
+        config = _config(tmp_path / "chat.yaml")
+        _write(config, "feature:\n  limit: 5\n")
+
+        with config.pinned(limit=9):
+            values, sources = config.resolved()
+
+        assert (values["limit"], sources["limit"]) == (5, SOURCE_PLATFORM)
+
+    def test_it_follows_the_file(self, tmp_path: Path) -> None:
+        config = _config(tmp_path / "chat.yaml")
+        assert config.resolved()[1]["limit"] == SOURCE_DEFAULT
+
+        _write(config, "feature:\n  limit: 4\n")
+        values, sources = config.resolved()
+
+        assert (values["limit"], sources["limit"]) == (4, SOURCE_PLATFORM)
+
+    def test_the_published_sources_are_these(self, tmp_path: Path) -> None:
+        shared, platform = _layers(tmp_path)
+        _write(shared, "chat:\n  library: 3\n")
+
+        assert platform.state_payload()["sources"] == dict(platform.resolved()[1])
+        assert platform.resolved()[1]["library"] == SOURCE_GLOBAL
+
+
 class TestSaveAndPublish:
     def test_save_writes_the_nested_layout_and_reloads(self, tmp_path: Path) -> None:
         config = _config(tmp_path / "chat.yaml")

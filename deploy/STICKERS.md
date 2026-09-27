@@ -45,6 +45,8 @@ extensions:
 
 `auto_tag` 每轮循环现读，关掉之后手上那批做完就停，不用重启。已经排队等打标的图会原样留着，开回来接着打。
 
+打标跑在 supervisor 里，全系统只有一份：bot 不在线也照打；多开时几个号的 supervisor 轮流打共用的那个库，同一时刻只有一个在调看图渠道。`features.yaml` 没写 `auto_tag` 时，`qq.yaml` 老位置上的写法和 `.env` 里的 `ONEBOT_STICKER_AUTO_TAG` 照旧算数，bot 停着也认它上次公布的值。
+
 热载，改完两秒生效，不用重启。
 
 三档过滤的差别：
@@ -76,6 +78,7 @@ extensions:
 ```
 data/stickers/
   ├ stickers.sqlite3     索引（WAL，几个进程同时读写）
+  ├ stickers.sqlite3.tagging.lock   打标锁，几个 supervisor 轮流打时抢它
   ├ pending/             待审
   ├ library/             在库
   └ backups/             /表情包 备份 的产物
@@ -123,8 +126,8 @@ extensions:
 | 现象 | 看哪 |
 |---|---|
 | 收不到图 | `collect` 开了吗；`groups` 白名单；`strategy` 是不是 strict 而对方发的是普通图片 |
-| 图收进来但一直没标签 | `auto_tag` 是不是关了；看图渠道没配好，日志搜「打标停用」 |
+| 图收进来但一直没标签 | `auto_tag` 是不是关了（`features.yaml` 没写时，`qq.yaml` 老位置和 `.env` 的 `ONEBOT_STICKER_AUTO_TAG` 也算）；看图渠道没配好。supervisor 的日志里搜「打标」 |
 | 有标签但模型不发 | `send_probability` 是不是太低（默认 0.2 就是五轮才摊开一次）；`/表情包 统计` 看 usable 数；或者半小时内刚发过 |
 | 打不开库 | systemd 的 `ReadWritePaths` 要放开共享目录 —— 它按真实路径判权限，软链不算 |
 
-进度和错误都在 bot 日志里，前缀是 `stickers`。
+收图的进度和错误在 bot 日志里，前缀是 `stickers`。打标跑在 supervisor 里，它的提示在 supervisor 的输出里：systemd 下用 `journalctl -u kazebot` 看，多开是 `kazebot@<号>`。
