@@ -1875,7 +1875,6 @@ class TaskRouterMixin:
         )
         seq = int(evt.get("seq", 0))
         self._apply_inbound_message(seq=seq, session_id=route_session_id, payload=payload)
-        self._advance_inbound_cursor()
         self._create_entry_task_for_inbound_locked(
             inbound_seq=seq, session_id=route_session_id, payload=payload,
         )
@@ -2007,7 +2006,6 @@ class TaskRouterMixin:
         )
         seq = int(evt.get("seq", 0))
         self._apply_inbound_message(seq=seq, session_id=target_session_id, payload=payload)
-        self._advance_inbound_cursor()
         self._create_entry_task_for_inbound_locked(
             inbound_seq=seq, session_id=target_session_id, payload=payload,
         )
@@ -2158,7 +2156,6 @@ class TaskRouterMixin:
             )
             seq = int(evt.get("seq", 0))
             self._apply_inbound_message(seq=seq, session_id=session_id, payload=payload)
-            self._advance_inbound_cursor()
             self._create_entry_task_for_inbound_locked(
                 inbound_seq=seq, session_id=session_id, payload=payload,
             )

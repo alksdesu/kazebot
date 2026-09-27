@@ -41,11 +41,8 @@ from .types import (
     HandoffEventIn,
     HealthOut,
     ImageDefaultChannelIn,
-    InboundAckIn,
-    InboundAckOut,
     InboundMessageIn,
     InboundMessageOut,
-    InboundWorkItem,
     OpenAIConfigPublic,
     OutputGuide,
     ActiveProviderSecret,
@@ -567,26 +564,6 @@ def create_app(
         st.record_inbound_message_event(evt)
         inbound_seq = int(evt.get("seq", 0) or 0)
         return InboundMessageOut(session_id=session_id, inbound_seq=inbound_seq, accepted=True)
-
-    @app.get("/v1/inbound/next", response_model=InboundWorkItem)
-    async def inbound_next(
-        worker_id: str = Query(..., min_length=1),
-        lease_sec: float = Query(30.0, ge=1.0, le=600.0),
-    ) -> InboundWorkItem:
-        st: SupervisorState = app.state.state
-        st.mark_engine_seen(worker_id=worker_id)
-        item = st.assign_next_inbound(worker_id=worker_id, lease_sec=float(lease_sec))
-        if item is None:
-            return Response(status_code=204)  # type: ignore[return-value]
-        return InboundWorkItem.model_validate(item)
-
-    @app.post("/v1/inbound/{inbound_seq}/ack", response_model=InboundAckOut)
-    async def inbound_ack(inbound_seq: int, body: InboundAckIn) -> InboundAckOut:
-        st: SupervisorState = app.state.state
-        ok = st.ack_inbound(inbound_seq=int(inbound_seq), worker_id=body.worker_id)
-        if not ok:
-            raise HTTPException(status_code=404, detail="inbound item not found")
-        return InboundAckOut(ok=True)
 
     @app.get("/v1/tasks/next", response_model=Task)
     async def task_next(

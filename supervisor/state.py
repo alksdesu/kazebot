@@ -6,7 +6,6 @@ import json
 import logging
 import threading
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -41,7 +40,7 @@ from .types import (
 
 
 class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
-    """Supervisor 核心状态。管理会话、inbound 队列、task 队列与审批。"""
+    """Supervisor 核心状态。管理会话、inbound 记录、task 队列与审批。"""
 
     def __init__(self, *, workspace_root: Path, eventlog: EventLog, policy: PolicyEngine) -> None:
         self.workspace_root = workspace_root
@@ -65,11 +64,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._engine_last_seen_at: datetime | None = None
         self._engine_last_worker_id: str | None = None
 
-        self._inbound_order: list[int] = []
         self._inbound_events: dict[int, dict[str, Any]] = {}
-        self._inbound_processed: set[int] = set()
         self._inbound_routed: dict[int, dict[str, Any]] = {}
-        self._inbound_cursor: int = 0
         self._post_work_states: dict[str, str] = {}
         self._post_work_enqueued: set[str] = set()
         self._post_work_running: set[str] = set()
@@ -91,14 +87,6 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             and isinstance(event.get("payload"), dict)
             and str((event.get("payload") or {}).get("delivery_id") or "").strip()
         }
-
-        @dataclass
-        class _InboundLease:
-            worker_id: str
-            expires_at: datetime
-
-        self._InboundLease = _InboundLease
-        self._inbound_leases: dict[int, _InboundLease] = {}
 
         self._cancelled_sessions: set[str] = set()
         self._tools_reload_seq: int = 0
@@ -963,8 +951,6 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                             # explicit while the dataclass grows a new field.
                         )
                 self._apply_inbound_message(seq=seq, session_id=session_id, payload=payload)
-            elif et == "inbound_processed":
-                self._apply_inbound_processed(payload)
             elif et == "outbound_message":
                 self._apply_outbound_message(seq=seq, session_id=session_id, payload=payload)
             elif et == "approval_requested":
@@ -991,7 +977,6 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 if wid and gid:
                     self._engine_generations[wid] = gid
 
-        self._advance_inbound_cursor()
     # ------------------------------------------------------------------ #
     #  节点切换
     # ------------------------------------------------------------------ #

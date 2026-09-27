@@ -150,30 +150,6 @@ class OutboundMessageOut(BaseModel):
     ok: bool = True
 
 
-class InboundWorkItem(BaseModel):
-    inbound_seq: int
-    session_id: str
-    channel: str = "cli"
-    conversation_key: str
-    message_id: str | None = None
-    text: str
-    attachments: list[dict[str, Any]] | None = None
-    use_context: bool = True
-    entry_node_id: str | None = None
-    platform_auth: dict[str, Any] = Field(default_factory=dict)
-    route_hints: dict[str, Any] = Field(default_factory=dict)
-    memory_hints: dict[str, Any] = Field(default_factory=dict)
-    output_guide: dict[str, Any] | None = None
-
-
-class InboundAckIn(BaseModel):
-    worker_id: str
-
-
-class InboundAckOut(BaseModel):
-    ok: bool = True
-
-
 class Task(BaseModel):
     task_id: str
     session_id: str

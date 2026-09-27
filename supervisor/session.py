@@ -3,12 +3,11 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from ._helpers import SessionInfo, _now
-from .eventlog import SYSTEM_SESSION_ID
 from .types import ApprovalStatus, RouteStatus, TaskStatus
 
 
@@ -427,16 +426,6 @@ class SessionMixin:
         with self._lock:
             return self._tools_reload_seq
 
-    # ---- inbound 游标 ----
-
-    def _advance_inbound_cursor(self) -> None:
-        while self._inbound_cursor < len(self._inbound_order):
-            seq = self._inbound_order[self._inbound_cursor]
-            if seq in self._inbound_processed or seq in self._inbound_routed:
-                self._inbound_cursor += 1
-                continue
-            break
-
     # ---- 事件 apply（rebuild 用） ----
 
     def _apply_session_created(self, session_id: str, payload: dict[str, Any]) -> None:
@@ -477,7 +466,6 @@ class SessionMixin:
             self._session_store.touch_updated_at(session_id, si.updated_at)
         if seq not in self._inbound_events:
             self._inbound_events[seq] = {"session_id": session_id, "payload": payload}
-            self._inbound_order.append(seq)
             # Why: inbound side effects now belong to supervisor hook handlers.
             # How: fire only when this seq is first applied, so replayed or
             # duplicate inbound events do not repeatedly disturb handler state.
@@ -494,14 +482,6 @@ class SessionMixin:
                     payload=payload,
                 ),
             )
-
-    def _apply_inbound_processed(self, payload: dict[str, Any]) -> None:
-        try:
-            inbound_seq = int(payload.get("inbound_seq", 0))
-        except Exception:
-            return
-        if inbound_seq > 0:
-            self._inbound_processed.add(inbound_seq)
 
     def _apply_outbound_message(self, *, seq: int, session_id: str, payload: dict[str, Any]) -> None:
         if not session_id or not isinstance(payload, dict):
@@ -593,7 +573,6 @@ class SessionMixin:
             return
         with self._lock:
             self._apply_inbound_message(seq=seq, session_id=session_id, payload=payload)
-            self._advance_inbound_cursor()
             if session_id and session_id in self.sessions:
                 self._create_entry_task_for_inbound_locked(inbound_seq=seq, session_id=session_id, payload=payload)
 
@@ -610,73 +589,6 @@ class SessionMixin:
             return
         with self._lock:
             self._apply_outbound_message(seq=seq, session_id=session_id, payload=payload)
-            self._advance_inbound_cursor()
-
-    # ---- inbound 队列 ----
-
-    def assign_next_inbound(self, *, worker_id: str, lease_sec: float = 30.0) -> dict[str, Any] | None:
-        wid = (worker_id or "").strip()
-        if not wid:
-            return None
-        with self._lock:
-            now = _now()
-            lease_val = max(5.0, min(lease_sec, 120.0))
-            for i in range(self._inbound_cursor, len(self._inbound_order)):
-                seq = self._inbound_order[i]
-
-                if seq in self._inbound_processed or seq in self._inbound_routed:
-                    if i == self._inbound_cursor:
-                        self._inbound_cursor += 1
-                    self._inbound_leases.pop(seq, None)
-                    continue
-
-                lease = self._inbound_leases.get(seq)
-                if lease is not None and lease.expires_at > now:
-                    continue
-
-                evt = self._inbound_events.get(seq)
-                if not isinstance(evt, dict):
-                    continue
-
-                session_id = str(evt.get("session_id") or "")
-                payload = evt.get("payload")
-                if not session_id or not isinstance(payload, dict):
-                    continue
-
-                self._inbound_leases[seq] = self._InboundLease(
-                    worker_id=wid,
-                    expires_at=now + timedelta(seconds=lease_val),
-                )
-                return {"inbound_seq": seq, "session_id": session_id, **payload}
-
-            return None
-
-    def ack_inbound(self, *, inbound_seq: int, worker_id: str) -> bool:
-        wid = (worker_id or "").strip()
-        if not wid:
-            return False
-        try:
-            seq = int(inbound_seq)
-        except Exception:
-            seq = 0
-        if seq <= 0:
-            return False
-
-        with self._lock:
-            if seq in self._inbound_processed:
-                return True
-            if seq not in self._inbound_events:
-                return False
-            self.eventlog.append(
-                session_id=SYSTEM_SESSION_ID,
-                component="shell",
-                type_="inbound_processed",
-                payload={"inbound_seq": seq, "worker_id": wid, "ts": _now().isoformat()},
-            )
-            self._inbound_processed.add(seq)
-            self._inbound_leases.pop(seq, None)
-            self._advance_inbound_cursor()
-            return True
 
     # ---- outbound / session 创建 ----
 
