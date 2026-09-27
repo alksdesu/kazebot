@@ -1,4 +1,4 @@
-"""会话键摘要的盐：显式环境变量优先，否则用工作区里自动生成并钉住的密钥。
+"""会话键摘要的盐：显式配置优先，否则用工作区里自动生成并钉住的密钥。
 
 无盐 SHA256 的输入只有「前缀 + 一串数字」，枚举一遍就能反推真实群号和账号。
 """
@@ -10,9 +10,13 @@ import logging
 import os
 import re
 import secrets
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
-from platforms.descriptor import CHANNEL_OTHER, ChannelDescriptor, PlatformDescriptor
+from clonoth_runtime import platform_secret
+from platforms.descriptor import CHANNEL_OTHER, STATE_ROUTES, ChannelDescriptor, PlatformDescriptor
+from platforms.registry import platform_secret_file, platform_state_path
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +25,13 @@ logger = logging.getLogger(__name__)
 LEGACY_MARKER = "legacy-unsalted"
 _SECRET_BYTES = 32
 _SECRET_RE = re.compile(r"[0-9a-fA-F]{64,}")
+# 平台描述里摘要密钥的名字。接稳定会话键的平台都要声明它，并给出自动生成的文件位置。
+SECRET_NAME = "conversation_hash_secret"
+# 离线工具读到的密钥从哪来：显式配置、钉住的文件、首次启动会钉成无盐、还没定下来。
+SECRET_EXPLICIT = "explicit"
+SECRET_PINNED = "pinned"
+SECRET_LEGACY = "legacy"
+SECRET_UNSETTLED = "unsettled"
 
 
 def scoped_key(conversation_key: str, bot_scope: str) -> str:
@@ -46,7 +57,7 @@ def digest(conversation_key: str, secret: str, *, bot_scope: str = "") -> str:
 class ConversationKeys:
     """真实会话键 → 交给核心的稳定键：渠道前缀取平台声明，摘要拌进密钥和账号作用域。"""
 
-    __slots__ = ("_hashed", "_fallback", "_secret")
+    __slots__ = ("_hashed", "_fallback", "_secret", "_platform", "_unscoped_allowed")
 
     def __init__(self, platform: PlatformDescriptor, secret: str) -> None:
         hashed = tuple(channel for channel in platform.channels if channel.hashed)
@@ -56,6 +67,9 @@ class ConversationKeys:
         self._hashed = hashed
         self._fallback = fallback
         self._secret = secret
+        self._platform = platform.id
+        # 新平台漏传账号，两个号看到的同一个群会并成一个会话、一份记忆。
+        self._unscoped_allowed = platform.legacy_conversation_keys
 
     def channel_of(self, real_key: str) -> ChannelDescriptor:
         """真实会话键落在哪个渠道。不做摘要的渠道和认不出的前缀都归兜底渠道。"""
@@ -63,7 +77,10 @@ class ConversationKeys:
             (channel for channel in self._hashed if real_key.startswith(f"{channel.name}:")), self._fallback,
         )
 
-    def stable_key(self, real_key: str, *, bot_scope: str = "") -> str:
+    def stable_key(self, real_key: str, *, bot_scope: str) -> str:
+        """bot_scope 是当前登录的账号。只有加账号隔离之前就有数据的平台可以给空串。"""
+        if not str(bot_scope or "").strip() and not self._unscoped_allowed:
+            raise ValueError(f"platform {self._platform!r} needs the bot account to derive a conversation key")
         return f"{self.channel_of(real_key).name}:{digest(real_key, self._secret, bot_scope=bot_scope)}"
 
 
@@ -84,18 +101,27 @@ def has_digest_derived_state(workspace: Path, route_state_file: Path) -> bool:
 
 
 def resolve_secret(
-    *, env_secret: str, secret_file: Path, workspace: Path, route_state_file: Path, legacy_hint: str = "",
+    *,
+    explicit_secret: str,
+    secret_file: Path,
+    workspace: Path,
+    route_state_file: Path,
+    allow_legacy: bool,
+    legacy_hint: str = "",
 ) -> tuple[str, bool]:
-    """返回 (secret, salted)。首次启动时决定并钉住模式，之后只读文件。"""
-    if env_secret:
+    """返回 (secret, salted)。首次启动时决定并钉住模式，之后只读文件。
+
+    allow_legacy 只给加盐之前就有数据的平台。新平台一律生成新密钥：同一工作区里别的平台留下的记忆目录不是它的存量。
+    """
+    if explicit_secret:
         # 显式配置优先，既不读也不写自动密钥文件。
-        return (env_secret, True)
+        return (explicit_secret, True)
 
     pinned = _read_pinned_secret(secret_file)
     if pinned is not None:
         return pinned
 
-    if has_digest_derived_state(workspace, route_state_file):
+    if allow_legacy and has_digest_derived_state(workspace, route_state_file):
         # 存量部署：钉在无盐上让摘要保持不变，加盐迁移交离线脚本。
         logger.warning(
             "existing conversation state found without a hash secret; pinning legacy "
@@ -108,6 +134,60 @@ def resolve_secret(
     if result is not None:
         return result
     return ("", False)
+
+
+def secret_file(platform: PlatformDescriptor, workspace: Path, *, environ: Mapping[str, str] | None = None) -> Path:
+    """平台自动生成、钉住摘要密钥的那份文件，位置能用声明里的 env 改。"""
+    path = platform_secret_file(platform, SECRET_NAME, Path(workspace), environ=environ)
+    if path is None:
+        raise LookupError(f"platform {platform.id!r} declares no generated file for {SECRET_NAME}")
+    return path
+
+
+def platform_conversation_secret(
+    platform: PlatformDescriptor, workspace: Path, *, legacy_hint: str = "",
+) -> tuple[str, bool]:
+    """平台运行时用的摘要密钥，返回 (secret, salted)：显式配置优先，否则首次启动时生成并钉住。"""
+    root = Path(workspace)
+    return resolve_secret(
+        explicit_secret=platform_secret(root, platform, SECRET_NAME).value,
+        secret_file=secret_file(platform, root),
+        workspace=root,
+        route_state_file=platform_state_path(platform, STATE_ROUTES, root),
+        allow_legacy=platform.legacy_conversation_keys,
+        legacy_hint=legacy_hint,
+    )
+
+
+@dataclass(frozen=True)
+class CurrentSecret:
+    """离线工具读到的摘要密钥和它的来处。无盐的值是空串。"""
+
+    value: str
+    source: str
+
+    @property
+    def settled(self) -> bool:
+        """平台还没起过时密钥要到首次启动才生成，算不出它将来的会话键。"""
+        return self.source != SECRET_UNSETTLED
+
+
+def current_secret(
+    platform: PlatformDescriptor, workspace: Path, *, environ: Mapping[str, str] | None = None,
+) -> CurrentSecret:
+    """平台眼下在用的摘要密钥，和运行时同一个顺序，但不写任何文件。给离线迁移用。"""
+    root = Path(workspace)
+    explicit = platform_secret(root, platform, SECRET_NAME, environ=environ).value
+    if explicit:
+        return CurrentSecret(explicit, SECRET_EXPLICIT)
+    pinned = _read_pinned_secret(secret_file(platform, root, environ=environ))
+    if pinned is not None:
+        return CurrentSecret(pinned[0], SECRET_PINNED)
+    routes = platform_state_path(platform, STATE_ROUTES, root, environ=environ)
+    if platform.legacy_conversation_keys and has_digest_derived_state(root, routes):
+        # 运行时首次启动会钉在无盐上，算出来的键一样。
+        return CurrentSecret("", SECRET_LEGACY)
+    return CurrentSecret("", SECRET_UNSETTLED)
 
 
 def _read_pinned_secret(secret_file: Path) -> tuple[str, bool] | None:

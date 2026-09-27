@@ -204,11 +204,8 @@ FORWARD_BRIDGE_TOKEN_TOOLS_WARNING = _unseen_by_tools("forward_bridge_token")
 
 # 提交给 Supervisor 的 QQ conversation_key 使用稳定哈希，真实群号/QQ 号只保留在插件本地路由里。
 # 显式配置的密钥，优先于自动密钥文件；为空时由 conversation_hash 决定加盐还是钉在无盐。
+# 这里只给控制台报「设没设」，摘要用的那把由 conversation_hash 按 QQ 描述里的声明取。
 CONVERSATION_HASH_SECRET = _secret("conversation_hash_secret").value
-
-# 没显式配 secret 时用的自动密钥文件。内容是随机密钥或 legacy-unsalted 标记；
-# 与 onebot_anon_map.json 同级敏感，不得进版本库。
-CONVERSATION_HASH_SECRET_FILE = _secret_file("conversation_hash_secret")
 
 # 本地路由状态文件：保存 stable conversation_key/session_id 到真实 QQ 群/用户目标的映射。
 # 位置和改位置的 ONEBOT_STATE_FILE 都在 QQ 描述里，supervisor 和迁移脚本按同一份声明找它。

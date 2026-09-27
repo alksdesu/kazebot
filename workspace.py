@@ -12,13 +12,19 @@ from pathlib import Path
 _ENV_NAMES = ("CLONOTH_WORKSPACE", "ONEBOT_WORKSPACE_ROOT")
 
 
+def workspace_env_root() -> Path | None:
+    """env 里设的工作区根；都没设返回 None。"""
+    for name in _ENV_NAMES:
+        raw = str(os.environ.get(name) or "").strip()
+        if raw:
+            return Path(raw).expanduser().resolve()
+    return None
+
+
 def resolve_workspace_root(fallback: Path | str) -> Path:
     """按 env 解析工作区根；没设就用调用方给的回落值。
 
     回落值是各调用方原本硬编码的代码目录，所以不设 env 时行为与改造前逐字相同。
     """
-    for name in _ENV_NAMES:
-        raw = str(os.environ.get(name) or "").strip()
-        if raw:
-            return Path(raw).expanduser().resolve()
-    return Path(fallback).resolve()
+    configured = workspace_env_root()
+    return configured if configured is not None else Path(fallback).resolve()

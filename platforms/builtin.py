@@ -34,6 +34,7 @@ QQ_NAPCAT = PlatformDescriptor(
         ChannelDescriptor("qq_unknown", CHANNEL_OTHER),
     ),
     id_shape=ID_NUMERIC,
+    legacy_conversation_keys=True,
     config_path="config/qq.yaml",
     config_env="CLONOTH_QQ_CONFIG_PATH",
     state_files={

@@ -18,6 +18,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from clonoth_runtime import offline_workspace  # noqa: E402
 from engine.builtin.knowledge_inject import _memory_write_lock  # noqa: E402
 
 _MANUAL = "manual"
@@ -88,8 +89,8 @@ def run_migration(*, workspace: Path, apply: bool) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--workspace", default=os.environ.get("CLONOTH_WORKSPACE", str(_ROOT)),
-        help="Clonoth 工作区根目录（默认取 CLONOTH_WORKSPACE 或仓库根）。",
+        "--workspace", default=None,
+        help="Clonoth 工作区根目录；不给就和 bot 一样取 CLONOTH_WORKSPACE / ONEBOT_WORKSPACE_ROOT，可以写在 .env 里，都没设是仓库根。",
     )
     parser.add_argument(
         "--apply", action="store_true",
@@ -98,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        run_migration(workspace=Path(args.workspace).resolve(), apply=args.apply)
+        run_migration(workspace=offline_workspace(args.workspace), apply=args.apply)
     except Exception as error:
         print(f"迁移中止（可从 data/memory.bak-* 恢复后重跑）: {error}", file=sys.stderr)
         return 1

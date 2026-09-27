@@ -429,7 +429,8 @@ class TestAdapterStartup:
         config = _config_module(_adapter(monkeypatch, _workspace(tmp_path)))
 
         assert Path(config.FORWARD_BRIDGE_TOKEN_FILE) == tmp_path / "data" / "onebot_forward_bridge_token"
-        assert Path(config.CONVERSATION_HASH_SECRET_FILE) == tmp_path / "data" / "onebot_conversation_hash_secret"
+        # 干净工作区首启就把摘要密钥钉在声明的位置。
+        assert (tmp_path / "data" / "onebot_conversation_hash_secret").is_file()
 
     def test_the_state_files_follow_the_declared_env_overrides(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

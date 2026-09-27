@@ -10,7 +10,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from workspace import resolve_workspace_root  # noqa: E402
+from workspace import resolve_workspace_root, workspace_env_root  # noqa: E402
 
 _ENV_NAMES = ("CLONOTH_WORKSPACE", "ONEBOT_WORKSPACE_ROOT")
 
@@ -23,6 +23,19 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_falls_back_to_caller_default() -> None:
     assert resolve_workspace_root(_ROOT) == _ROOT
+
+
+def test_no_env_root_when_nothing_is_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLONOTH_WORKSPACE", "  ")
+    assert workspace_env_root() is None
+
+
+def test_env_root_honours_both_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 离线工具靠它判断 env 里设没设工作区，认的名字必须和 resolve_workspace_root 一样。
+    monkeypatch.setenv("ONEBOT_WORKSPACE_ROOT", str(tmp_path / "alias"))
+    assert workspace_env_root() == (tmp_path / "alias").resolve()
+    monkeypatch.setenv("CLONOTH_WORKSPACE", str(tmp_path / "primary"))
+    assert workspace_env_root() == (tmp_path / "primary").resolve()
 
 
 def test_fallback_is_resolved(tmp_path: Path) -> None:

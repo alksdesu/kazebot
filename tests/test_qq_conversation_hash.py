@@ -11,11 +11,22 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from adapters._shared import conversation_hash as ch  # noqa: E402
+from platforms.builtin import QQ_NAPCAT  # noqa: E402
+from platforms.descriptor import (  # noqa: E402
+    CHANNEL_GROUP,
+    CHANNEL_OTHER,
+    ID_STRING,
+    ChannelDescriptor,
+    PlatformDescriptor,
+    SecretField,
+)
 
 
 def _load(name: str, relpath: str):
@@ -30,20 +41,40 @@ def _load(name: str, relpath: str):
 migrate = _load("_qq_migrate_conversation_hash", "deploy/migrate_qq_conversation_hash.py")
 
 _SECRET = "0123456789abcdef" * 4  # 64 hex chars
+_QQ_ENVS = ("ONEBOT_CONVERSATION_HASH_SECRET", "ONEBOT_CONVERSATION_HASH_SECRET_FILE", "ONEBOT_STATE_FILE")
+_NEW = PlatformDescriptor(
+    id="newchat", display_name="New Chat", short_name="New", id_shape=ID_STRING,
+    channels=(ChannelDescriptor("new_room", CHANNEL_GROUP), ChannelDescriptor("new_unknown", CHANNEL_OTHER)),
+    secrets=(SecretField(
+        "conversation_hash_secret", "会话键摘要密钥", env="NEWCHAT_HASH_SECRET",
+        file="data/platforms/newchat/conversation_hash_secret",
+    ),),
+)
 
 
-def _resolve(tmp_path: Path, *, env_secret: str = "", route_state: str = "state.json"):
+@pytest.fixture(autouse=True)
+def _no_deployment_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 密钥和路由文件的位置都认 env，开发机上设着的话会读到别处去。先登记一次，命令行从 .env 灌进来的测完也撤掉。
+    for name in (*_QQ_ENVS, "NEWCHAT_HASH_SECRET", "CLONOTH_WORKSPACE", "ONEBOT_WORKSPACE_ROOT"):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
+
+def _resolve(
+    tmp_path: Path, *, explicit_secret: str = "", route_state: str = "state.json", allow_legacy: bool = True,
+):
     return ch.resolve_secret(
-        env_secret=env_secret,
+        explicit_secret=explicit_secret,
         secret_file=tmp_path / "data" / "onebot_conversation_hash_secret",
         workspace=tmp_path,
         route_state_file=tmp_path / "data" / route_state,
+        allow_legacy=allow_legacy,
     )
 
 
 class TestResolveSecret:
     def test_an_explicit_secret_wins_and_writes_no_file(self, tmp_path: Path) -> None:
-        secret, salted = _resolve(tmp_path, env_secret="explicit-value")
+        secret, salted = _resolve(tmp_path, explicit_secret="explicit-value")
 
         assert (secret, salted) == ("explicit-value", True)
         assert not (tmp_path / "data" / "onebot_conversation_hash_secret").exists()
@@ -83,6 +114,15 @@ class TestResolveSecret:
         secret_file = tmp_path / "data" / "onebot_conversation_hash_secret"
         assert secret_file.read_text(encoding="utf-8").strip() == ch.LEGACY_MARKER
 
+    def test_a_platform_without_legacy_data_never_pins_the_legacy_mode(self, tmp_path: Path) -> None:
+        # 同一工作区里别的平台留下的记忆目录和路由不是它的存量，钉成无盐就永远不加盐了。
+        (tmp_path / "data" / "memory" / "conv_deadbeef").mkdir(parents=True)
+        (tmp_path / "data" / "state.json").write_text("{}", encoding="utf-8")
+
+        secret, salted = _resolve(tmp_path, allow_legacy=False)
+
+        assert salted is True and ch._SECRET_RE.fullmatch(secret)
+
     def test_a_corrupt_secret_file_degrades_instead_of_rotating(self, tmp_path: Path) -> None:
         secret_file = tmp_path / "data" / "onebot_conversation_hash_secret"
         secret_file.parent.mkdir(parents=True, exist_ok=True)
@@ -93,6 +133,89 @@ class TestResolveSecret:
         assert (secret, salted) == ("", False)
         # 密钥文件绝不能被改写：一旦重生成，现存记忆目录全成孤儿。
         assert secret_file.read_text(encoding="utf-8") == "xx"
+
+
+class TestPlatformSecret:
+    def test_qq_reads_an_explicit_secret_from_data_config(self, tmp_path: Path) -> None:
+        (tmp_path / "data").mkdir()
+        (tmp_path / "data" / "config.yaml").write_text(
+            f"platforms:\n  qq:\n    conversation_hash_secret: {_SECRET}\n", encoding="utf-8",
+        )
+
+        assert ch.platform_conversation_secret(QQ_NAPCAT, tmp_path) == (_SECRET, True)
+        assert not (tmp_path / "data" / "onebot_conversation_hash_secret").exists()
+
+    def test_qq_still_pins_legacy_over_its_own_old_state(self, tmp_path: Path) -> None:
+        (tmp_path / "data" / "memory" / "conv_deadbeef").mkdir(parents=True)
+
+        assert ch.platform_conversation_secret(QQ_NAPCAT, tmp_path) == ("", False)
+
+    def test_a_new_platform_mints_its_own_secret_next_to_qq_history(self, tmp_path: Path) -> None:
+        (tmp_path / "data" / "memory" / "conv_deadbeef").mkdir(parents=True)
+
+        secret, salted = ch.platform_conversation_secret(_NEW, tmp_path)
+
+        pinned = tmp_path / "data" / "platforms" / "newchat" / "conversation_hash_secret"
+        assert salted is True and pinned.read_text(encoding="utf-8") == secret
+
+    def test_the_pinned_file_follows_its_env_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ONEBOT_CONVERSATION_HASH_SECRET_FILE", "private/hash")
+
+        secret, _salted = ch.platform_conversation_secret(QQ_NAPCAT, tmp_path)
+
+        assert (tmp_path / "private" / "hash").read_text(encoding="utf-8") == secret
+        assert not (tmp_path / "data" / "onebot_conversation_hash_secret").exists()
+
+
+class TestCurrentSecret:
+    def test_an_explicit_secret_from_env_comes_first(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # bootstrap 生成的部署把密钥写在 .env 里，自动密钥文件根本不存在。
+        monkeypatch.setenv("ONEBOT_CONVERSATION_HASH_SECRET", _SECRET)
+
+        assert ch.current_secret(QQ_NAPCAT, tmp_path) == ch.CurrentSecret(_SECRET, ch.SECRET_EXPLICIT)
+
+    def test_an_explicit_environ_stands_in_for_the_process_one(self, tmp_path: Path) -> None:
+        current = ch.current_secret(QQ_NAPCAT, tmp_path, environ={"ONEBOT_CONVERSATION_HASH_SECRET": _SECRET})
+
+        assert current.value == _SECRET
+
+    def test_the_pinned_file_is_read_where_the_bot_keeps_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        moved = tmp_path / "private" / "hash"
+        moved.parent.mkdir()
+        moved.write_text(_SECRET, encoding="utf-8")
+        monkeypatch.setenv("ONEBOT_CONVERSATION_HASH_SECRET_FILE", str(moved))
+
+        assert ch.current_secret(QQ_NAPCAT, tmp_path) == ch.CurrentSecret(_SECRET, ch.SECRET_PINNED)
+
+    def test_the_legacy_marker_reads_as_unsalted(self, tmp_path: Path) -> None:
+        (tmp_path / "data").mkdir()
+        (tmp_path / "data" / "onebot_conversation_hash_secret").write_text(ch.LEGACY_MARKER, encoding="utf-8")
+
+        assert ch.current_secret(QQ_NAPCAT, tmp_path) == ch.CurrentSecret("", ch.SECRET_PINNED)
+
+    def test_old_qq_state_without_a_file_reads_as_the_legacy_mode(self, tmp_path: Path) -> None:
+        (tmp_path / "data" / "memory" / "conv_deadbeef").mkdir(parents=True)
+
+        current = ch.current_secret(QQ_NAPCAT, tmp_path)
+
+        assert current == ch.CurrentSecret("", ch.SECRET_LEGACY) and current.settled
+        assert not (tmp_path / "data" / "onebot_conversation_hash_secret").exists()
+
+    def test_a_platform_that_never_started_is_unsettled(self, tmp_path: Path) -> None:
+        (tmp_path / "data" / "memory" / "conv_deadbeef").mkdir(parents=True)
+
+        current = ch.current_secret(_NEW, tmp_path)
+
+        assert current == ch.CurrentSecret("", ch.SECRET_UNSETTLED) and not current.settled
+        assert not (tmp_path / "data" / "platforms").exists()
+
+    def test_a_platform_without_the_secret_declared_says_so(self, tmp_path: Path) -> None:
+        bare = PlatformDescriptor(id="bare", display_name="Bare", short_name="B")
+
+        with pytest.raises(LookupError):
+            ch.current_secret(bare, tmp_path)
 
 
 class TestDigest:
@@ -181,6 +304,69 @@ class TestMigration:
 
         assert orphan.is_dir()
         assert "conv_000000000000000000000000" in report.unknown_conv_dirs
+
+    def test_an_explicit_secret_is_the_target_and_no_file_is_written(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # bot 用的是配好的那把；另生成一把写进文件的话，迁完 bot 照样对不上。
+        seed = _seed_legacy_workspace(tmp_path)
+        monkeypatch.setenv("ONEBOT_CONVERSATION_HASH_SECRET", _SECRET)
+        data = tmp_path / "data"
+
+        report = migrate.run_migration(workspace=tmp_path, apply=True)
+
+        new_stable = f"qq_group:{ch.digest(seed['real'], _SECRET)}"
+        state = json.loads((data / "onebot_plugin_state.json").read_text(encoding="utf-8"))
+        assert report.explicit_secret is True and report.target_secret == _SECRET
+        assert new_stable in state["real_conversation_keys"]
+        assert report.secret_written is False
+        assert (data / "onebot_conversation_hash_secret").read_text(encoding="utf-8") == ch.LEGACY_MARKER
+
+    def test_a_secret_argument_that_the_bot_would_ignore_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        seed = _seed_legacy_workspace(tmp_path)
+        monkeypatch.setenv("ONEBOT_CONVERSATION_HASH_SECRET", _SECRET)
+
+        with pytest.raises(migrate.SecretConflict):
+            migrate.run_migration(workspace=tmp_path, apply=True, secret="f" * 64)
+
+        assert (tmp_path / "data" / "memory" / seed["old_ns"]).is_dir()
+        assert migrate.run_migration(workspace=tmp_path, apply=False, secret=_SECRET).target_secret == _SECRET
+
+    def test_the_command_line_takes_the_secret_from_the_workspace_env_file(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # deploy/bootstrap.sh 把密钥写进工作区 .env；命令行不灌它就会另生成一把，迁完 bot 对不上。
+        seed = _seed_legacy_workspace(tmp_path)
+        (tmp_path / ".env").write_text(f"ONEBOT_CONVERSATION_HASH_SECRET={_SECRET}\n", encoding="utf-8")
+
+        refused = migrate.main(["--workspace", str(tmp_path), "--apply", "--secret", "f" * 64])
+
+        assert refused == 2 and "密钥冲突" in capsys.readouterr().err
+        assert (tmp_path / "data" / "memory" / seed["old_ns"]).is_dir()
+
+        assert migrate.main(["--workspace", str(tmp_path), "--apply"]) == 0
+
+        new_stable = f"qq_group:{ch.digest(seed['real'], _SECRET)}"
+        state = json.loads((tmp_path / "data" / "onebot_plugin_state.json").read_text(encoding="utf-8"))
+        assert new_stable in state["real_conversation_keys"]
+        assert (tmp_path / "data" / "onebot_conversation_hash_secret").read_text(encoding="utf-8") == ch.LEGACY_MARKER
+
+    def test_the_secret_file_is_written_where_the_bot_reads_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _seed_legacy_workspace(tmp_path)
+        moved = tmp_path / "private" / "hash"
+        moved.parent.mkdir()
+        moved.write_text(ch.LEGACY_MARKER, encoding="utf-8")
+        monkeypatch.setenv("ONEBOT_CONVERSATION_HASH_SECRET_FILE", str(moved))
+
+        report = migrate.run_migration(workspace=tmp_path, apply=True, secret=_SECRET)
+
+        assert report.secret_written is True
+        assert moved.read_text(encoding="utf-8") == _SECRET
+        assert (tmp_path / "data" / "onebot_conversation_hash_secret").read_text(encoding="utf-8") == ch.LEGACY_MARKER
 
     def test_a_second_run_is_idempotent(self, tmp_path: Path) -> None:
         _seed_legacy_workspace(tmp_path)

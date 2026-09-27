@@ -18,10 +18,10 @@ if str(_ROOT) not in sys.path:
 # 摘要算法与账号作用域必须与运行时同一份，所以直接用共享层的模块。
 from adapters._shared import conversation_hash as _conversation_hash  # noqa: E402
 from adapters._shared.active_account import ActiveAccountStore, normalize_account  # noqa: E402
+from clonoth_runtime import offline_workspace  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 
 rekey = _conversation_hash.rekey
-LEGACY_MARKER = _conversation_hash.LEGACY_MARKER
 
 from engine.conversation_migration import (  # noqa: E402
     Rename, apply_migration, load_route_map, plan_migration, route_state_file,
@@ -56,13 +56,8 @@ class ScopeReport:
 
 
 def read_secret(workspace: Path) -> str:
-    """读已钉住的摘要密钥。无盐部署返回空串，与运行时的降级行为一致。"""
-    path = Path(workspace) / "data" / "onebot_conversation_hash_secret"
-    try:
-        content = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
-    return "" if content == LEGACY_MARKER else content
+    """bot 正在用的摘要密钥：data/config.yaml 或环境变量里配的优先，否则钉住的文件。无盐部署返回空串。"""
+    return _conversation_hash.current_secret(QQ_NAPCAT, Path(workspace)).value
 
 
 def recorded_scope(workspace: Path) -> str:
@@ -213,12 +208,10 @@ def _print_report(report: ScopeReport) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    import os
-
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--workspace", default=os.environ.get("CLONOTH_WORKSPACE", str(_ROOT)),
-        help="Clonoth 工作区根目录（默认取 CLONOTH_WORKSPACE 或仓库根）。",
+        "--workspace", default=None,
+        help="Clonoth 工作区根目录；不给就和 bot 一样取 CLONOTH_WORKSPACE / ONEBOT_WORKSPACE_ROOT，可以写在 .env 里，都没设是仓库根。",
     )
     parser.add_argument("--to", required=True, help="目标 bot 的 QQ 号。")
     parser.add_argument(
@@ -231,10 +224,11 @@ def main(argv: list[str] | None = None) -> int:
         help="搬完不把目标号记成当前账号（迁给一个还没登录的号时用）。",
     )
     args = parser.parse_args(argv)
+    workspace = offline_workspace(args.workspace)
 
     try:
         report = run_scope_migration(
-            workspace=Path(args.workspace), target_scope=args.to, source_scope=args.source,
+            workspace=workspace, target_scope=args.to, source_scope=args.source,
             apply=args.apply, adopt=not args.no_adopt,
         )
     except ScopeMismatch as error:

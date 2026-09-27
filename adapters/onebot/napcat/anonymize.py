@@ -8,13 +8,8 @@ from typing import Any, Dict, Iterable, List
 from nonebot.adapters.onebot.v11 import Event
 from engine import memory_subjects
 from platforms.builtin import QQ_NAPCAT
-from ..config import (
-    CLONOTH_WORKSPACE,
-    CONVERSATION_HASH_SECRET,
-    CONVERSATION_HASH_SECRET_FILE,
-    ONEBOT_STATE_FILE,
-)
-from adapters._shared.conversation_hash import ConversationKeys, resolve_secret
+from ..config import CLONOTH_WORKSPACE
+from adapters._shared.conversation_hash import ConversationKeys, platform_conversation_secret
 from adapters._shared.memory_hints import collect_subjects as collect_memory_subjects
 from ..segments import at_segment_user_ids
 
@@ -214,11 +209,7 @@ def _anonymize_text_for_ai(text: str) -> str:
     return state._adapter.aliases.substitute(text)
 
 
-_CONVERSATION_SECRET, CONVERSATION_DIGEST_SALTED = resolve_secret(
-    env_secret=CONVERSATION_HASH_SECRET,
-    secret_file=Path(CONVERSATION_HASH_SECRET_FILE),
-    workspace=Path(CLONOTH_WORKSPACE),
-    route_state_file=Path(ONEBOT_STATE_FILE),
-    legacy_hint="Run deploy/migrate_qq_conversation_hash.py to salt them.",
+_CONVERSATION_SECRET, CONVERSATION_DIGEST_SALTED = platform_conversation_secret(
+    QQ_NAPCAT, Path(CLONOTH_WORKSPACE), legacy_hint="Run deploy/migrate_qq_conversation_hash.py to salt them.",
 )
 CONVERSATION_KEYS = ConversationKeys(QQ_NAPCAT, _CONVERSATION_SECRET)

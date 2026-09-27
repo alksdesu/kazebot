@@ -5,6 +5,8 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -37,6 +39,15 @@ _SECRET = "a" * 64
 _REAL = "qq_group:123456789"
 _OLD_BOT = "10000001"
 _NEW_BOT = "10000002"
+_QQ_ENVS = ("ONEBOT_CONVERSATION_HASH_SECRET", "ONEBOT_CONVERSATION_HASH_SECRET_FILE", "ONEBOT_STATE_FILE")
+
+
+@pytest.fixture(autouse=True)
+def _no_deployment_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 密钥和路由文件的位置都认 env，开发机上设着的话会读到别处去。先登记一次，命令行从 .env 灌进来的测完也撤掉。
+    for name in (*_QQ_ENVS, "CLONOTH_WORKSPACE", "ONEBOT_WORKSPACE_ROOT"):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
 
 
 def _store(workspace: Path) -> ActiveAccountStore:
@@ -236,6 +247,77 @@ class TestScopeMigration:
             )
 
 
+class TestDeploymentsThatMoveThings:
+    """bot 认的密钥和文件位置，迁移也得认；认错了会把全部会话判成「认不出归属」。"""
+
+    def _secret_moves_to_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        (tmp_path / "data" / "onebot_conversation_hash_secret").unlink()
+        monkeypatch.setenv("ONEBOT_CONVERSATION_HASH_SECRET", _SECRET)
+
+    def test_a_secret_configured_in_the_environment_is_used(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # deploy/bootstrap.sh 生成的部署就是这样：密钥在 .env 里，自动密钥文件不存在。
+        _seed(tmp_path, scope=_OLD_BOT)
+        self._secret_moves_to_env(tmp_path, monkeypatch)
+
+        report = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=False)
+
+        assert report.source_scope == _OLD_BOT and len(report.changed_renames) == 1
+
+    def test_a_secret_configured_in_data_config_is_used(self, tmp_path: Path) -> None:
+        _seed(tmp_path, scope=_OLD_BOT)
+        (tmp_path / "data" / "onebot_conversation_hash_secret").unlink()
+        (tmp_path / "data" / "config.yaml").write_text(
+            f"platforms:\n  qq:\n    conversation_hash_secret: {_SECRET}\n", encoding="utf-8",
+        )
+
+        report = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=False)
+
+        assert report.source_scope == _OLD_BOT
+
+    def test_a_moved_secret_file_is_found(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _seed(tmp_path, scope=_OLD_BOT)
+        moved = tmp_path / "private" / "hash"
+        moved.parent.mkdir()
+        (tmp_path / "data" / "onebot_conversation_hash_secret").replace(moved)
+        monkeypatch.setenv("ONEBOT_CONVERSATION_HASH_SECRET_FILE", "private/hash")
+
+        report = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=False)
+
+        assert report.source_scope == _OLD_BOT
+
+    def test_a_moved_route_state_is_migrated_where_it_lives(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _seed(tmp_path, scope=_OLD_BOT)
+        moved = tmp_path / "private" / "routes.json"
+        moved.parent.mkdir()
+        (tmp_path / "data" / "onebot_plugin_state.json").replace(moved)
+        monkeypatch.setenv("ONEBOT_STATE_FILE", str(moved))
+
+        migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=True)
+
+        new_stable = f"qq_group:{ch.digest(_REAL, _SECRET, bot_scope=_NEW_BOT)}"
+        assert new_stable in json.loads(moved.read_text(encoding="utf-8"))["real_conversation_keys"]
+        assert not (tmp_path / "data" / "onebot_plugin_state.json").exists()
+
+    def test_the_command_line_reads_the_workspace_env_file(self, tmp_path: Path) -> None:
+        _seed(tmp_path, scope=_OLD_BOT)
+        (tmp_path / "data" / "onebot_conversation_hash_secret").unlink()
+        (tmp_path / ".env").write_text(f"ONEBOT_CONVERSATION_HASH_SECRET={_SECRET}\n", encoding="utf-8")
+        env = {key: value for key, value in os.environ.items() if key not in _QQ_ENVS}
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        done = subprocess.run(
+            [sys.executable, str(_ROOT / "deploy" / "migrate_qq_bot_scope.py"), "--workspace", str(tmp_path), "--to", _NEW_BOT],
+            capture_output=True, text=True, encoding="utf-8", env=env, timeout=120, check=False,
+        )
+
+        assert done.returncode == 0, done.stderr
+        assert f"源账号: {_OLD_BOT}" in done.stdout and "待搬迁会话数: 1" in done.stdout
+
+
 class TestSupervisorScopeQuery:
     _TOKEN = "scope-admin-token"
 
@@ -271,3 +353,15 @@ class TestSupervisorScopeQuery:
 
         assert response.status_code == 200
         assert response.json() == {"current_scope": _OLD_BOT, "live_scope": "", "bot_alive": False, "preview": None}
+
+    def test_the_console_preview_works_when_the_secret_is_in_the_environment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _seed(tmp_path, scope=_OLD_BOT)
+        (tmp_path / "data" / "onebot_conversation_hash_secret").unlink()
+        monkeypatch.setenv("ONEBOT_CONVERSATION_HASH_SECRET", _SECRET)
+
+        response = self._get(tmp_path, monkeypatch, f"/v1/admin/qq/scope?target={_NEW_BOT}")
+
+        assert response.status_code == 200, response.text
+        assert response.json()["preview"]["source_scope"] == _OLD_BOT

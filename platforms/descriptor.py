@@ -217,6 +217,9 @@ class PlatformDescriptor:
     aliases: frozenset[str] = frozenset()
     channels: tuple[ChannelDescriptor, ...] = ()
     id_shape: str = ID_STRING
+    # 加盐、加账号隔离之前就攒下会话数据的平台：会话键允许不带账号作用域，首次启动发现存量数据就钉在无盐上。
+    # 只给已经在用它的平台，新平台不加。
+    legacy_conversation_keys: bool = False
     # 平台配置文件，相对工作区；空串表示这个平台没有热载配置。
     config_path: str = ""
     # 覆盖配置路径的环境变量。只给已经在用它的平台，新平台不加。

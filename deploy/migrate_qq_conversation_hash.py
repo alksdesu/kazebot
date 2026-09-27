@@ -18,10 +18,10 @@ if str(_ROOT) not in sys.path:
 
 # 摘要算法必须与运行时同一份，所以直接用共享层的模块。
 from adapters._shared import conversation_hash as _conversation_hash  # noqa: E402
+from clonoth_runtime import offline_workspace  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 
 rekey = _conversation_hash.rekey
-LEGACY_MARKER = _conversation_hash.LEGACY_MARKER
 _SECRET_RE = _conversation_hash._SECRET_RE
 
 from engine.conversation_migration import (  # noqa: E402
@@ -31,12 +31,18 @@ from engine.conversation_migration import (  # noqa: E402
 _SECRET_BYTES = 32
 
 
+class SecretConflict(RuntimeError):
+    """--secret 和 bot 用的显式密钥不是同一把，按它迁完 bot 也不会用。"""
+
+
 @dataclass
 class MigrationReport:
     workspace: Path
     apply: bool
     target_secret: str = ""
     already_salted: bool = False
+    # bot 用的是 data/config.yaml 或环境变量里配的密钥：迁到它，不写密钥文件。
+    explicit_secret: bool = False
     renames: list[Rename] = field(default_factory=list)
     moved_dirs: list[tuple[str, str]] = field(default_factory=list)
     skipped_target_exists: list[tuple[str, str]] = field(default_factory=list)
@@ -52,21 +58,20 @@ class MigrationReport:
         return [r for r in self.renames if r.changed]
 
 
-def _resolve_target_secret(secret_file: Path, override: str | None) -> tuple[str, bool]:
-    """返回 (target_secret, already_salted)。override > 文件里的已有密钥 > 新生成。"""
-    already = False
-    if secret_file.exists():
-        try:
-            content = secret_file.read_text(encoding="utf-8").strip()
-        except OSError:
-            content = ""
-        if content and content != LEGACY_MARKER and _SECRET_RE.fullmatch(content):
-            already = True
-            if override is None:
-                # 复用已钉住的密钥，让重复运行成为幂等的空操作。
-                return content, already
+def _resolve_target_secret(
+    current: _conversation_hash.CurrentSecret, override: str | None,
+) -> tuple[str, bool]:
+    """返回 (target_secret, already_salted)。bot 用的显式密钥 > override > 文件里的已有密钥 > 新生成。"""
+    if current.source == _conversation_hash.SECRET_EXPLICIT:
+        if override is not None and override != current.value:
+            raise SecretConflict("bot 用的是 data/config.yaml 或环境变量里配的密钥，--secret 不会生效；要换密钥先改那边")
+        return current.value, True
+    already = bool(current.value)
     if override is not None:
         return override, already
+    if already:
+        # 复用已钉住的密钥，让重复运行成为幂等的空操作。
+        return current.value, already
     return secrets.token_hex(_SECRET_BYTES), already
 
 
@@ -85,10 +90,12 @@ def run_migration(
     *, workspace: Path, apply: bool, secret: str | None = None,
 ) -> MigrationReport:
     workspace = Path(workspace)
-    secret_file = workspace / "data" / "onebot_conversation_hash_secret"
+    secret_file = _conversation_hash.secret_file(QQ_NAPCAT, workspace)
+    current = _conversation_hash.current_secret(QQ_NAPCAT, workspace)
 
     report = MigrationReport(workspace=workspace, apply=apply)
-    report.target_secret, report.already_salted = _resolve_target_secret(secret_file, secret)
+    report.explicit_secret = current.source == _conversation_hash.SECRET_EXPLICIT
+    report.target_secret, report.already_salted = _resolve_target_secret(current, secret)
 
     plan = plan_migration(
         workspace=workspace,
@@ -109,6 +116,9 @@ def run_migration(
     report.route_keys_changed = outcome.route_keys_changed
     report.backup_dir = outcome.backup_dir
 
+    if report.explicit_secret:
+        # 显式配置的密钥由 bot 直接读，落一份文件也不会被用到。
+        return report
     # 密钥写在最后：前面任何一步抛异常都不会到这里，摘要模式保持原样，脚本可重跑。
     current = ""
     if secret_file.exists():
@@ -125,6 +135,8 @@ def run_migration(
 def _print_report(report: MigrationReport) -> None:
     mode = "APPLY" if report.apply else "DRY-RUN"
     print(f"[{mode}] workspace: {report.workspace}")
+    if report.explicit_secret:
+        print("bot 用的是 data/config.yaml 或环境变量里配的密钥：按它重算，不写密钥文件。")
     if report.already_salted and not report.changed_renames:
         print("会话键摘要已是加盐状态，无需迁移。")
     changed = report.changed_renames
@@ -158,8 +170,8 @@ def _print_report(report: MigrationReport) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--workspace", default=os.environ.get("CLONOTH_WORKSPACE", str(_ROOT)),
-        help="Clonoth 工作区根目录（默认取 CLONOTH_WORKSPACE 或仓库根）。",
+        "--workspace", default=None,
+        help="Clonoth 工作区根目录；不给就和 bot 一样取 CLONOTH_WORKSPACE / ONEBOT_WORKSPACE_ROOT，可以写在 .env 里，都没设是仓库根。",
     )
     parser.add_argument(
         "--apply", action="store_true",
@@ -170,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         help="迁移到的目标密钥（≥64 位 hex）；不给则复用已有密钥或随机生成。",
     )
     args = parser.parse_args(argv)
+    workspace = offline_workspace(args.workspace)
 
     secret = args.secret
     if secret is not None:
@@ -178,7 +191,10 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--secret 必须是 ≥64 位十六进制字符串")
 
     try:
-        report = run_migration(workspace=Path(args.workspace), apply=args.apply, secret=secret)
+        report = run_migration(workspace=workspace, apply=args.apply, secret=secret)
+    except SecretConflict as error:
+        print(f"密钥冲突，未改动任何文件: {error}", file=sys.stderr)
+        return 2
     except Exception as error:
         print(f"迁移中止（未写入密钥，可修复后重跑；如已部分改动请从备份恢复）: {error}", file=sys.stderr)
         return 1

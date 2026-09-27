@@ -11,6 +11,9 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 import yaml
+from dotenv import load_dotenv
+
+from workspace import resolve_workspace_root, workspace_env_root
 
 if TYPE_CHECKING:
     from platforms.descriptor import PlatformDescriptor
@@ -546,6 +549,44 @@ def platform_secret(
     if from_env:
         return PlatformSecret(from_env, SECRET_FROM_ENV)
     return PlatformSecret()
+
+
+# 离线工具不给工作区、env 里也没设时退回代码目录，和 bot.py、supervisor 一样。
+_CODE_ROOT = Path(__file__).resolve().parent
+# 工作区里没有 .env 时退回代码目录那份，和 bot.py 找不到 cwd 下那份时一样。
+_CODE_ENV_FILE = _CODE_ROOT / ".env"
+
+
+def load_workspace_env(workspace_root: Path | str) -> Path | None:
+    """离线工具照 bot 的办法灌 .env：工作区那份优先，没有就用代码目录那份，进程里已经有的变量不覆盖。
+
+    路径覆盖和平台密钥常常只写在 .env 里，不灌进来的话离线工具读到的是另一份文件、另一把密钥。返回灌的是哪份。
+    """
+    for candidate in (Path(workspace_root) / ".env", _CODE_ENV_FILE):
+        if candidate.is_file():
+            load_dotenv(candidate, override=False)
+            return candidate
+    return None
+
+
+def offline_workspace(explicit: Path | str | None = None) -> Path:
+    """离线工具照 bot 的办法定工作区并灌 .env，返回工作区根。进程里已经有的变量都不覆盖。
+
+    没给工作区、env 里也没设时，先灌 cwd 下或代码目录那份 .env 再从里面认，和 bot.py 一样。
+    env 里设了就不碰 cwd 那份：在代码目录里迁别的实例，读进来的会是主实例的密钥。
+    """
+    if explicit is not None and str(explicit).strip():
+        root = Path(explicit).expanduser().resolve()
+    else:
+        root = workspace_env_root()
+        if root is None:
+            local = Path.cwd() / ".env"
+            bot_env = local if local.is_file() else _CODE_ENV_FILE
+            if bot_env.is_file():
+                load_dotenv(bot_env, override=False)
+            root = resolve_workspace_root(_CODE_ROOT)
+    load_workspace_env(root)
+    return root
 
 
 def undeclared_platform_secrets(
