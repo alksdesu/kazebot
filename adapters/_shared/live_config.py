@@ -196,6 +196,14 @@ def grant_for(capability_key: str) -> Coercer:
 
 
 @dataclass(frozen=True)
+class DerivedDefault:
+    """从别的 env 推导出的默认值，以及它是不是真取自 env：取自 env 时来源报 env，控制台显示的来源才对得上。"""
+
+    value: Any
+    from_env: bool
+
+
+@dataclass(frozen=True)
 class LiveKey:
     """一个热载键。name 是 call site 用的属性名，path 是配置文件里的点分路径，layers 是它能写在哪几层，
     ui 是控制台上怎么画它；没有 ui 的键控制台上没有控件，要么只读，要么由专门的组件管。
@@ -208,7 +216,7 @@ class LiveKey:
     env: tuple[str, ...] = ()
     reload: str = RELOAD_LIVE
     # env 也没配时的兜底。只给那几个「默认值本身要从别的 env 推导」的键用。
-    derive_default: Callable[[], Any] | None = None
+    derive_default: Callable[[], DerivedDefault] | None = None
     note: str = ""
     layers: frozenset[str] = PLATFORM_ONLY
     ui: Control | None = None
@@ -239,7 +247,8 @@ class LiveKey:
                 continue
             return self.coerce(value, self.default), SOURCE_ENV
         if self.derive_default is not None:
-            return self.coerce(self.derive_default(), self.default), SOURCE_DEFAULT
+            derived = self.derive_default()
+            return self.coerce(derived.value, self.default), SOURCE_ENV if derived.from_env else SOURCE_DEFAULT
         return self.coerce(self.default, self.default), SOURCE_DEFAULT
 
 

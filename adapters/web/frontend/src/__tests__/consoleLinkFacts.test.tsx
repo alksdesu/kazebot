@@ -6,7 +6,7 @@ import type { ReactNode } from 'react';
 import type { ConfigLiveState } from '../api/supervisorClient';
 import { ConnectionCard } from '../console/ConnectionCard';
 import { platformConsoleStore, readLinkFacts, type ConsoleState } from '../console/consoleStore';
-import { nameWith } from '../console/format';
+import { nameBetween, nameWith } from '../console/format';
 import { QueueFacts } from '../console/LinkFacts';
 import { PlatformProvider } from '../console/platformContext';
 import { AccountSummary } from '../console/sectionSummaries';
@@ -86,6 +86,12 @@ describe('名字后面接一句中文', () => {
     expect(nameWith('', '已连接')).toBe('已连接');
   });
 
+  it('那句话是空的就只剩名字，不留一个尾随空格', () => {
+    expect(nameWith('NapCat', '')).toBe('NapCat');
+    expect(nameWith('微信', '')).toBe('微信');
+    expect(nameWith('', '')).toBe('');
+  });
+
   it('扩展区的汉字占两个 UTF-16 单元，按码点判才认得出来', () => {
     expect(nameWith('\u{20BB7}号', '已连接')).toBe('\u{20BB7}号已连接');
     expect(nameWith('网关\u{20BB7}', '已连接')).toBe('网关\u{20BB7}已连接');
@@ -104,6 +110,43 @@ describe('名字后面接一句中文', () => {
     expect(nameWith('Кот', '已连接')).toBe('Кот 已连接');
     // 半角间隔号是拉丁扩展里的，和全角标点不是一回事。
     expect(nameWith('QQ·NapCat·', '已连接')).toBe('QQ·NapCat· 已连接');
+  });
+});
+
+// 「这个 QQ 号」要空格，「这个微信号」不要：名字夹在两段中文中间，两边各按它挨着的那一头判。
+describe('名字夹在两段中文之间', () => {
+  it('拉丁名两边各空一个', () => {
+    expect(nameBetween('这个', 'QQ', '号')).toBe('这个 QQ 号');
+    expect(nameBetween('启动', 'OtherChat', '的适配器进程')).toBe('启动 OtherChat 的适配器进程');
+  });
+
+  it('汉字名两边都不空', () => {
+    expect(nameBetween('这个', '微信', '号')).toBe('这个微信号');
+    expect(nameBetween('启动', '保险库', '的适配器进程')).toBe('启动保险库的适配器进程');
+  });
+
+  it('首尾各判各的', () => {
+    expect(nameBetween('这个', 'QQ群', '里')).toBe('这个 QQ群里');
+    expect(nameBetween('这个', '微信 Work', '号')).toBe('这个微信 Work 号');
+  });
+
+  it('前半段是空的就不留先导空格', () => {
+    expect(nameBetween('', 'QQ', '号')).toBe('QQ 号');
+    expect(nameBetween('', '微信', '号')).toBe('微信号');
+  });
+
+  it('后半段是空的就到名字为止', () => {
+    expect(nameBetween('这个', 'QQ', '')).toBe('这个 QQ');
+    expect(nameBetween('这个', '微信', '')).toBe('这个微信');
+  });
+
+  it('名字是空的两段直接接上', () => {
+    expect(nameBetween('这个', '', '号')).toBe('这个号');
+  });
+
+  it('扩展区的汉字开头也按码点判', () => {
+    expect(nameBetween('这个', '\u{20BB7}号', '群')).toBe('这个\u{20BB7}号群');
+    expect(nameBetween('这个', '\u{1F680}Chat', '号')).toBe('这个 \u{1F680}Chat 号');
   });
 });
 

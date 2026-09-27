@@ -8,11 +8,12 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from platforms.registry import features_module, get_platform, platform_config_path
+from platforms.registry import features_module, get_platform
+from platforms.wording import name_with
 from stickers.store import StickerStore
 from stickers.tagger import StickerTagger, TaggerConfig
 
-from .platform_api import published_states
+from .platform_api import config_file_name, published_states
 from .sticker_api import library_store
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,5 @@ class StickerTaggingService:
         platform = get_platform(fallback.platform)
         value = "开" if fallback.value else "关"
         if fallback.from_env:
-            return f"{platform.display_name} 的环境变量（{value}）"
-        path = platform_config_path(platform, self.workspace_root)
-        return f"{platform.display_name} 的 {path.name if path is not None else '配置文件'} 老位置（{value}）"
+            return name_with(platform.display_name, f"的环境变量（{value}）")
+        return name_with(platform.display_name, f"的 {config_file_name(self.workspace_root, platform)} 老位置（{value}）")

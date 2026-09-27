@@ -16,6 +16,7 @@ from typing import Any, Mapping
 from platforms.descriptor import HOOK_INSTANCE_ENV
 from platforms.ids import normalize_id
 from platforms.registry import MissingPlatformHook, all_platforms, get_platform, platform_hook
+from platforms.wording import name_with
 
 from .instances import (
     MAX_INDEX,
@@ -87,7 +88,7 @@ def normalize_accounts(raw: Any) -> dict[str, str]:
             raise ProvisionError(f"不认识的平台：{name}") from None
         account = normalize_id(text, platform.id_shape)
         if not account:
-            raise ProvisionError(f"{platform.display_name} 的账号写法不对：{text}")
+            raise ProvisionError(name_with(platform.display_name, f"的账号写法不对：{text}"))
         accounts[platform.id] = account
     return accounts
 

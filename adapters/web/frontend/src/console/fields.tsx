@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 
 import { Field, Input, Option, Segmented, Sub } from './components';
 import { useConsoleStore, useLiveValue, useNote, useTristate } from './consoleStore';
+import { asPercent } from './format';
 
 interface BoolOptionProps {
   /** 跟在控件标题旁边的东西，比如来源切换。 */
@@ -145,8 +146,7 @@ export const PercentField = ({ aside, configKey, label }: { aside?: ReactNode; c
         }}
         step={0.5}
         type="number"
-        // 0.15 * 100 会算出 15.000000000000002，定到小数点后两位再显示。
-        value={String(Math.round(value * 10000) / 100)}
+        value={String(asPercent(value))}
       />
       <label className="text-[var(--duties-secondary)]">%</label>
     </Field>

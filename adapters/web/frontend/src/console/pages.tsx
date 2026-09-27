@@ -7,6 +7,7 @@ import { FEATURES_SCOPE, type ConfigScope } from './configScope';
 import { ConnectionCard } from './ConnectionCard';
 import { DEFAULTS_PAGE_SECTIONS, STICKERS_PAGE_SECTIONS } from './FeatureSection';
 import { FeaturesPage } from './FeaturesPage';
+import { nameBetween } from './format';
 import { MemoryPage } from './MemoryPage';
 import { ModelsPage } from './ModelsPage';
 import { PersonaPage } from './PersonaPage';
@@ -114,7 +115,7 @@ const PLATFORM_PAGE_EXTRAS: Readonly<Record<string, PlatformPageExtras>> = {
 };
 
 const platformNote = (platform: PlatformDescriptor): string =>
-  `bot 在 ${platform.shortName} 上怎么收发消息。改完点顶部的「应用」写进配置文件，状态条会显示 bot 有没有读到这一份。`;
+  `bot ${nameBetween('在', platform.shortName, '上怎么收发消息')}。改完点顶部的「应用」写进配置文件，状态条会显示 bot 有没有读到这一份。`;
 
 /** 平台组：有配置文件的平台一个一页，跟着平台清单走。 */
 export function platformPages(platforms: readonly PlatformDescriptor[]): PlatformPageDefinition[] {

@@ -332,6 +332,9 @@ FEATURE_KEYS_BY_NAME: Mapping[str, LiveKey] = MappingProxyType({key.name: key fo
 # 平台文件老位置上的写法只作升级前的兜底，平台配置的写入接口拿它拒收新写法。
 GLOBAL_ONLY_PATHS: frozenset[str] = frozenset(key.path for key in FEATURE_KEYS if key.layers == GLOBAL_ONLY)
 
+# 全系统只跑一份、由 supervisor 统一跑的功能的开关。全局页按 central_switch 的算法标出它们实际开不开。
+CENTRAL_SWITCHES: frozenset[str] = frozenset({"sticker_auto_tag"})
+
 
 def features_config_path(workspace_root: Path) -> Path:
     override = os.environ.get(FEATURES_CONFIG_ENV, "").strip()
@@ -388,6 +391,26 @@ def platform_fallbacks(name: str, published: Mapping[str, Mapping[str, Any]]) ->
     return tuple(found)
 
 
+def global_fallbacks(
+    config: LiveConfig, published: Mapping[str, Mapping[str, Any]],
+) -> dict[str, tuple[PlatformFallback, ...]]:
+    """全局文件没写的只认全局的键，各平台眼下用着的兜底，按键名。config 是全局那层。
+
+    全局页显示的是全局那层的值；这些键平台实际用的是兜底，控制台要标出来。
+    """
+    if config.layer != LAYER_GLOBAL:
+        raise ValueError(f"global_fallbacks 要的是全局那层，给的是 {config.layer}")
+    _, sources = config.resolved()
+    report: dict[str, tuple[PlatformFallback, ...]] = {}
+    for key in FEATURE_KEYS:
+        if key.layers != GLOBAL_ONLY or sources.get(key.name) == SOURCE_GLOBAL:
+            continue
+        found = platform_fallbacks(key.name, published)
+        if found:
+            report[key.name] = found
+    return report
+
+
 def central_switch(
     name: str, config: LiveConfig, published: Mapping[str, Mapping[str, Any]],
 ) -> CentralSwitch:
@@ -398,6 +421,8 @@ def central_switch(
     """
     if config.layer != LAYER_GLOBAL:
         raise ValueError(f"central_switch 要的是全局那层，给的是 {config.layer}")
+    if name not in CENTRAL_SWITCHES:
+        raise ValueError(f"{name} 没登记在 CENTRAL_SWITCHES 里，全局页标不出它实际开不开")
     if FEATURE_KEYS_BY_NAME[name].coerce is not BOOL:
         raise ValueError(f"{name} 不是开关")
     fallbacks = platform_fallbacks(name, published)

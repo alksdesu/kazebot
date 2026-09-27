@@ -142,7 +142,7 @@ def test_a_platform_without_a_console_layout_has_no_schema(call, chatless) -> No
     response = call("GET", "/v1/platforms/chatless/config/schema")
 
     assert response.status_code == 404
-    assert response.json()["detail"] == "无配置平台 没有控制台配置界面"
+    assert response.json()["detail"] == "无配置平台没有控制台配置界面"
     assert call("GET", "/v1/platforms/telegram/config/schema").status_code == 404
 
 

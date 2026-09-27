@@ -27,6 +27,7 @@ import {
   settlePlatforms,
   type PlatformDescriptor,
 } from '../platforms/registry';
+import { confirmNavigation } from '../hooks/useUnsavedChanges';
 import { usePlatformRegistry } from '../platforms/usePlatformRegistry';
 import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
@@ -41,6 +42,18 @@ const OTHERCHAT: PlatformDescriptor = {
   entrypoints: ['otherchat_bot.py'],
   connectionPeer: 'OtherChat 网关',
   connectionHint: '检查网关地址与接入密钥',
+};
+
+// 汉字名的平台：说明和提示里名字接着中文，不该多出一个空格。
+const WECHAT: PlatformDescriptor = {
+  id: 'wechat',
+  displayName: '微信',
+  shortName: '微信',
+  channels: [{ name: 'wechat_group', kind: 'group', hashed: true }],
+  hasConfig: true,
+  entrypoints: ['wechat_bot.py'],
+  connectionPeer: '微信网关',
+  connectionHint: '检查登录状态与出网代理',
 };
 
 // 没有配置文件的平台（比如只发不收的通知渠道）：认会话键要它，但没什么可设置的。
@@ -128,6 +141,12 @@ describe('平台页跟着清单生成', () => {
 
     expect(qq.note).toBe('bot 在 QQ 上怎么收发消息。改完点顶部的「应用」写进配置文件，状态条会显示 bot 有没有读到这一份。');
     expect(other.note).toBe('bot 在 Other 上怎么收发消息。改完点顶部的「应用」写进配置文件，状态条会显示 bot 有没有读到这一份。');
+  });
+
+  it('汉字简称接中文时不多一个空格', () => {
+    const [wechat] = platformPages([WECHAT]);
+
+    expect(wechat.note).toBe('bot 在微信上怎么收发消息。改完点顶部的「应用」写进配置文件，状态条会显示 bot 有没有读到这一份。');
   });
 
   it('同一个平台永远是同一个组件 —— 换引用就会把整页重新挂载', () => {
@@ -366,6 +385,36 @@ describe('bot 还没上报时的提示', () => {
     expect(screen.getByText(
       'bot 还没上报生效配置。在服务器上启动 OtherChat 的适配器进程之后，这里会显示它实际在用的值。',
     )).toBeInTheDocument();
+  });
+
+  it('汉字名的平台前后都不多空格', () => {
+    platformConsoleStore('wechat').setState({ live: null, loading: false, draft: {} });
+    pageFor(WECHAT);
+
+    expect(screen.getByText(
+      'bot 还没上报生效配置。在服务器上启动微信的适配器进程（wechat_bot.py）之后，这里会显示它实际在用的值。',
+    )).toBeInTheDocument();
+  });
+});
+
+// 离开有草稿的平台页时那句确认，名字同样接着中文。
+describe('未应用修改的离开确认', () => {
+  const pageWithDraft = (platform: PlatformDescriptor) => {
+    adoptPlatforms([QQ_NAPCAT, platform].filter((row, index, rows) => rows.indexOf(row) === index));
+    platformConsoleStore(platform.id).setState({ live: null, loading: false, draft: { signal_name: true } });
+    const Page = platformPageComponent(platform.id);
+    return render(<Page />);
+  };
+
+  it.each([
+    ['拉丁名照旧空一格', QQ_NAPCAT, 'QQ · NapCat 配置还有未应用修改，确定离开或丢弃吗？'],
+    ['汉字名直接连上', WECHAT, '微信配置还有未应用修改，确定离开或丢弃吗？'],
+  ])('%s', (_label: string, platform: PlatformDescriptor, expected: string) => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    pageWithDraft(platform);
+
+    expect(confirmNavigation()).toBe(false);
+    expect(confirm).toHaveBeenCalledWith(expected);
   });
 });
 

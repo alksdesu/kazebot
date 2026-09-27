@@ -19,6 +19,7 @@ from adapters._shared.live_config import (
     PLAIN_STR,
     RELOAD_RECONCILED,
     Coercer,
+    DerivedDefault,
     LiveConfig,
     LiveKey,
     coerce_bool,
@@ -73,20 +74,22 @@ _STICKER_STRATEGIES = (("strict", "严格"), ("loose", "宽松"), ("none", "全�
 _STICKER_LOOKUP_ORDERS = (("native_first", "收藏表情"), ("library_first", "图库"))
 
 
-def _legacy_strip_markdown_default(fallback: bool) -> Callable[[], Any]:
+def _legacy_strip_markdown_default(fallback: bool) -> Callable[[], DerivedDefault]:
     """ONEBOT_STRIP_MARKDOWN_STYLES 是星号/下划线拆分前的旧总开关。
 
     设了它就同时决定两个新开关的默认值，没设则各自用自己的默认。
     """
 
-    def derive() -> Any:
+    def derive() -> DerivedDefault:
         raw = os.environ.get("ONEBOT_STRIP_MARKDOWN_STYLES")
-        return fallback if raw is None else coerce_bool(raw, False)
+        if raw is None:
+            return DerivedDefault(fallback, from_env=False)
+        return DerivedDefault(coerce_bool(raw, False), from_env=True)
 
     return derive
 
 
-def _derive_allow_private_friends() -> bool:
+def _derive_allow_private_friends() -> DerivedDefault:
     """私聊放行策略以前是从白名单文本里找「好友」二字推导出来的。
 
     yaml 里已经是显式布尔，这里只保留 env 兜底路径的原语义：名单为空 = 只放行好友，
@@ -98,12 +101,12 @@ def _derive_allow_private_friends() -> bool:
         if value is not None and value.strip():
             raw = value.strip()
             break
+    from_env = bool(raw)
     if not raw:
         raw = "[私聊只允许已经通过好友请求的人]"
-    return (
-        not parse_qq_id_list(raw)
-        or "好友" in raw
-        or "friend" in raw.lower()
+    return DerivedDefault(
+        not parse_qq_id_list(raw) or "好友" in raw or "friend" in raw.lower(),
+        from_env=from_env,
     )
 
 

@@ -26,6 +26,7 @@ import { getPlatform } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
 import { AccountScope } from './AccountScope';
 import { Block, Button, Empty, Facts, Input, Panel, Pre } from './components';
+import { nameBetween } from './format';
 import { InstanceLink, InstanceSwitch } from './InstanceSwitch';
 import { usePlatform } from './platformContext';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
@@ -131,7 +132,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
     if (!isValidInstanceId(id)) { setNote('实例名要以小写字母开头，只用小写字母、数字和下划线，2-32 位'); return; }
     if (instances.some(row => row.id === id)) { setNote('已经有叫这个名字的实例了，换一个。'); return; }
     const owner = instanceOwning(platform.id, account, instances);
-    if (owner) { setNote(`这个 ${platform.shortName} 号已经归实例「${owner.label}」管了，请直接切换到它的控制台。`); return; }
+    if (owner) { setNote(`${nameBetween('这个', platform.shortName, '号已经归实例')}「${owner.label}」管了，请直接切换到它的控制台。`); return; }
     const login = account ? `扫码登录 ${account}` : '扫码登录';
     if (!window.confirm(`建一个新 bot「${id}」？\n\n会新建 NapCat 容器、systemd 服务和域名路由，约一两分钟。\n建好后要去它自己的控制台${login}，当前这个实例不受影响。`)) return;
     if (!isCurrent()) return;
@@ -195,8 +196,8 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
           <Input aria-label="实例备注" disabled={locked} onChange={event => setNewLabel(event.target.value)} placeholder="备注，可留空" value={newLabel} width="wide" />
         </label>
         <label className="flex min-w-0 flex-col gap-1 text-sm">
-          要登录的 {platform.shortName} 号
-          <Input aria-label={`新实例要登录的 ${platform.shortName} 号`} disabled={locked} inputMode="numeric" onChange={event => setNewAccount(event.target.value)} placeholder="可留空，登录后自动记上" value={newAccount} width="wide" />
+          {nameBetween('要登录的', platform.shortName, '号')}
+          <Input aria-label={nameBetween('新实例要登录的', platform.shortName, '号')} disabled={locked} inputMode="numeric" onChange={event => setNewAccount(event.target.value)} placeholder="可留空，登录后自动记上" value={newAccount} width="wide" />
         </label>
         <Button disabled={locked || !newId.trim()} onClick={() => void addInstance()} tone="quiet">建实例</Button>
       </div>}

@@ -16,6 +16,7 @@ import { entrypointNote, type PlatformDescriptor } from '../platforms/registry';
 import { FEATURES_SCOPE, platformScope } from './configScope';
 import { configStore, useConsoleStore, useSectionPending } from './consoleStore';
 import { SchemaFields } from './FieldRenderer';
+import { nameBetween, nameWith } from './format';
 import { PlatformProvider } from './platformContext';
 import { useConsoleSchema, useSchemaStore } from './schemaStore';
 import { Section, SectionNote } from './Section';
@@ -110,7 +111,7 @@ const PlatformPageBody = ({ connection, note, platform }: Omit<PlatformPageProps
   const refreshInherited = configStore(FEATURES_SCOPE)((state) => state.refresh);
   const confirmDiscard = useUnsavedChanges(
     Object.keys(draft).length > 0,
-    `${platform.displayName} 配置还有未应用修改，确定离开或丢弃吗？`,
+    nameWith(platform.displayName, '配置还有未应用修改，确定离开或丢弃吗？'),
   );
   const parseError = String(live?.state?.parse_error || '');
 
@@ -129,7 +130,7 @@ const PlatformPageBody = ({ connection, note, platform }: Omit<PlatformPageProps
   const body = loading && !live ? <Empty>正在读取配置…</Empty>
     : !published ? (
       <Empty>
-        {live?.reason || `bot 还没上报生效配置。在服务器上启动 ${platform.displayName} 的适配器进程${entrypointNote(platform)}之后，这里会显示它实际在用的值。`}
+        {live?.reason || `bot 还没上报生效配置。在服务器上${nameBetween('启动', platform.displayName, '的适配器进程')}${entrypointNote(platform)}之后，这里会显示它实际在用的值。`}
       </Empty>
     ) : null;
   const layout = schemaError ? <ErrorText>{schemaError}</ErrorText>

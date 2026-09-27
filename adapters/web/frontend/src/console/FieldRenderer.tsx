@@ -58,7 +58,7 @@ const FieldControl = ({ context, node }: { context: Context; node: FieldNodeSpec
   if (!spec) return null;
   const children = node.children?.length ? <Children context={context} nodes={node.children} /> : undefined;
   // 全局那层写得进的键才谈得上跟随：平台页上是「跟随全局 / 本平台」，全局页上每一项都能回到默认。
-  const aside = spec.layers.includes('global') ? <LayerSwitch configKey={node.key} label={spec.label} /> : undefined;
+  const aside = spec.layers.includes('global') ? <LayerSwitch configKey={node.key} spec={spec} /> : undefined;
   switch (spec.kind) {
     case 'bool':
       return node.sub

@@ -1614,9 +1614,29 @@ export interface FeatureAdoption {
   reason?: string;
 }
 
+/** 只认全局的键全局文件没写时，一个平台的 bot 眼下用着的兜底。 */
+export interface FeatureFallback {
+  platform: string;
+  display_name: string;
+  /** legacy 是平台配置文件老位置上的写法，env 是平台自己的环境变量。 */
+  source: Extract<ConfigSource, 'legacy' | 'env'>;
+  /** 老位置在哪个文件；env 兜底是空串。 */
+  file: string;
+  value: unknown;
+}
+
+/** 全系统只跑一份的功能实际开不开。全局没写时按各平台的兜底算，有一个开着就开。 */
+export interface CentralSwitchState {
+  enabled: boolean;
+  set_globally: boolean;
+}
+
 /** 全局默认的生效快照。applied 要求文件解析得了、每个在跑的 bot 都换上了它。 */
 export interface FeaturesLiveState extends ConfigLiveState {
   platforms: FeatureAdoption[];
+  /** 按键名。旧后端没有这两项。 */
+  fallbacks?: Record<string, FeatureFallback[]>;
+  central?: Record<string, CentralSwitchState>;
 }
 
 export type ConsoleControlKind = 'bool' | 'tristate' | 'number' | 'percent' | 'text' | 'choice' | 'words' | 'ids';

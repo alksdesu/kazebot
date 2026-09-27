@@ -241,7 +241,7 @@ class TestOpsPerPlatform:
         response = call("GET", "/v1/platforms/otherchat/account")
 
         assert response.status_code == 404
-        assert response.json()["detail"] == "别的平台 没有账号运维"
+        assert response.json()["detail"] == "别的平台没有账号运维"
 
     def test_a_hook_module_that_breaks_on_import_is_not_a_missing_hook(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

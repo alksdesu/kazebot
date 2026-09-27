@@ -1,7 +1,7 @@
 """全局功能设置 config/features.yaml 的原文读写、生效状态和控制台 schema。
 
-全局那层不读环境变量，supervisor 自己算出的值就是各平台 bot 落到全局时用的那一份；
-各平台换没换上当前这份文件，看它们公布的 defaults 指纹。
+全局那层不读环境变量，supervisor 自己算出的值就是各平台 bot 落到全局时用的那一份；只认全局的键全局没写时，
+平台用的是自己的老位置或 env 兜底，另行列出。各平台换没换上当前这份文件，看它们公布的 defaults 指纹。
 """
 from __future__ import annotations
 
@@ -12,11 +12,12 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from platforms.descriptor import PlatformDescriptor
 from platforms.live import live_status, read_live_state, same_file
-from platforms.registry import all_platforms, features_module
+from platforms.registry import all_platforms, features_module, get_platform
 
 from . import config_files
 from .admin_api import verify_admin_token
 from .config_files import RawConfig
+from .platform_api import config_file_name, published_states
 
 
 def features_file(workspace_root: Path) -> Path:
@@ -76,12 +77,30 @@ def platform_adoption(
     return {**entry, "applied": defaults.get("loaded") == current}
 
 
+def _fallback_payload(workspace_root: Path, fallback: Any) -> dict[str, Any]:
+    platform = get_platform(fallback.platform)
+    return {
+        "platform": platform.id,
+        "display_name": platform.display_name,
+        "source": fallback.source,
+        # 老位置在哪个文件；env 兜底给空串。
+        "file": "" if fallback.from_env else config_file_name(workspace_root, platform),
+        "value": fallback.value,
+    }
+
+
+def _central_payload(switch: Any) -> dict[str, Any]:
+    return {"enabled": switch.enabled, "set_globally": switch.set_globally}
+
+
 def features_state(workspace_root: Path, config: Any) -> dict[str, Any]:
     path = features_file(workspace_root)
     state = config.state_payload()
     current = state["file"]
     platforms = [platform_adoption(workspace_root, platform, path, current) for platform in all_platforms()]
     running = [entry for entry in platforms if entry["published"] and not entry["stale"]]
+    features = features_module()
+    published = published_states(workspace_root)
     return {
         # 生效值由 supervisor 当场算，不存在「还没公布」；外形和平台的 state 端点一致，控制台共用一套草稿逻辑。
         "published": True,
@@ -90,6 +109,16 @@ def features_state(workspace_root: Path, config: Any) -> dict[str, Any]:
         "file": current,
         "state": state,
         "platforms": platforms,
+        # 全局没写的只认全局的键：页面上显示的是默认值，平台实际用着自己的兜底。
+        "fallbacks": {
+            name: [_fallback_payload(workspace_root, fallback) for fallback in found]
+            for name, found in features.global_fallbacks(config, published).items()
+        },
+        # 统一跑的功能实际开不开：全局没写时按各平台的兜底算，有一个开着就开。
+        "central": {
+            name: _central_payload(features.central_switch(name, config, published))
+            for name in sorted(features.CENTRAL_SWITCHES)
+        },
     }
 
 

@@ -22,6 +22,7 @@ from platforms.descriptor import HOOK_ACCOUNT_OPS, PlatformDescriptor
 from platforms.ids import normalize_id
 from platforms.live import read_live_status
 from platforms.registry import MissingPlatformHook, platform_hook
+from platforms.wording import name_with
 
 from .admin_api import verify_admin_token
 from .conversation_stores import ConversationStoreError, store_counts_payload
@@ -51,7 +52,7 @@ class PlatformAccounts:
                 try:
                     module = platform_hook(platform, HOOK_ACCOUNT_OPS)
                 except MissingPlatformHook:
-                    raise HTTPException(status_code=404, detail=f"{platform.display_name} 没有账号运维") from None
+                    raise HTTPException(status_code=404, detail=name_with(platform.display_name, "没有账号运维")) from None
                 found = self._ops[platform.id] = module.account_ops(self._root)
             return found
 

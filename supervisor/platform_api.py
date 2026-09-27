@@ -20,6 +20,7 @@ from platforms.registry import (
     platform_config_path,
     platform_hook,
 )
+from platforms.wording import name_with
 
 from . import config_files, platform_trigger
 from .admin_api import verify_admin_token
@@ -38,8 +39,14 @@ def resolve_platform(platform_id: str) -> PlatformDescriptor:
 def config_file(workspace_root: Path, platform: PlatformDescriptor) -> Path:
     path = platform_config_path(platform, workspace_root)
     if path is None:
-        raise HTTPException(status_code=404, detail=f"{platform.display_name} 没有热载配置")
+        raise HTTPException(status_code=404, detail=name_with(platform.display_name, "没有热载配置"))
     return path
+
+
+def config_file_name(workspace_root: Path, platform: PlatformDescriptor) -> str:
+    """跟人说平台配置写在哪个文件时用的文件名；没有热载配置的平台给个通称。"""
+    path = platform_config_path(platform, workspace_root)
+    return path.name if path is not None else "配置文件"
 
 
 def published_states(workspace_root: Path) -> dict[str, dict[str, Any]]:
@@ -151,7 +158,7 @@ def config_schema(platform: PlatformDescriptor) -> dict[str, Any]:
     try:
         layout = platform_hook(platform, HOOK_CONSOLE_SCHEMA)
     except MissingPlatformHook:
-        raise HTTPException(status_code=404, detail=f"{platform.display_name} 没有控制台配置界面") from None
+        raise HTTPException(status_code=404, detail=name_with(platform.display_name, "没有控制台配置界面")) from None
     return layout.schema()
 
 
@@ -162,7 +169,7 @@ def trigger_dry_run(workspace_root: Path, platform: PlatformDescriptor, payload:
     拼出来的那份和 bot 跑着的不一样就等于试听骗人。
     """
     if HOOK_TRIGGER_POLICY not in platform.hooks:
-        raise HTTPException(status_code=404, detail=f"{platform.display_name} 没有触发判定")
+        raise HTTPException(status_code=404, detail=name_with(platform.display_name, "没有触发判定"))
     messages = payload.get("messages")
     if not isinstance(messages, list):
         raise HTTPException(status_code=400, detail="messages 必须是数组")

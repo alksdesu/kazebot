@@ -12,8 +12,11 @@ import {
   type ConfigInputRule,
   type ConfigLiveState,
   type ConfigRawFile,
+  type CentralSwitchState,
   type ConfigSaveResult,
   type ConfigSource,
+  type FeatureFallback,
+  type FeaturesLiveState,
   type PlatformCapability,
   type PlatformRuntimeFacts,
 } from '../api/supervisorClient';
@@ -139,14 +142,20 @@ const sameValue = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSO
 
 /** 把刚写进去的值叠到 live 上。键空间与 state 端点的 values 一致，可以直接铺。
  *
+ * 写进去的键来源落到本层，来源切换和旁边的提示不必等生效方认账。旧版生效方不公布来源，那就不补。
  * 删行（null）不叠：删完落到哪一层的值只有生效方算得出来，先显示成 null 会闪一下默认值。 */
-const withApplied = (live: ConfigLiveState | null, draft: Draft): ConfigLiveState | null => {
+const withApplied = (live: ConfigLiveState | null, draft: Draft, layer: ConfigSource): ConfigLiveState | null => {
   if (!live?.state) return live;
   const written = Object.fromEntries(Object.entries(draft).filter(([, value]) => value !== null));
+  const { sources } = live.state;
   return {
     ...live,
     applied: false,
-    state: { ...live.state, values: { ...(live.state.values || {}), ...written } },
+    state: {
+      ...live.state,
+      values: { ...(live.state.values || {}), ...written },
+      sources: sources && { ...sources, ...Object.fromEntries(Object.keys(written).map((name) => [name, layer])) },
+    },
   };
 };
 
@@ -268,7 +277,7 @@ const createConsoleState = (scope: ConfigScope) => (
       for (const [name, value] of Object.entries(subset)) {
         if (sameValue(pending[name], value)) delete pending[name];
       }
-      set({ draft: pending, raw, rawExists: true, live: withApplied(live, subset) });
+      set({ draft: pending, raw, rawExists: true, live: withApplied(live, subset, OWN_LAYER[scope.kind]) });
       const settled = await settle(token, api, settleWording(scope), set, raw);
       return { ok: true, message: [...result.warnings, settled].filter(Boolean).join('；') };
     } catch (error) {
@@ -464,6 +473,22 @@ export interface LayerState {
   /** 写回之后这一项落在本层：草稿里有值，或者没有草稿而文件里本来就写着。 */
   own: boolean;
   source: ConfigSource | undefined;
+}
+
+const NO_FALLBACKS: readonly FeatureFallback[] = [];
+
+export interface GlobalFallbacks {
+  /** 全局文件没写这一项时，各平台眼下用着的兜底。只有全局页有，平台页上恒为空。 */
+  fallbacks: readonly FeatureFallback[];
+  /** 这一项是统一跑的开关时，它实际开不开。 */
+  central: CentralSwitchState | undefined;
+}
+
+export function useGlobalFallbacks(name: string): GlobalFallbacks {
+  // 各取公布快照里的原引用：选择器每次拼新数组会让订阅方空转。
+  const fallbacks = useConsoleStore((state) => (state.live as FeaturesLiveState | null)?.fallbacks?.[name]);
+  const central = useConsoleStore((state) => (state.live as FeaturesLiveState | null)?.central?.[name]);
+  return { fallbacks: fallbacks || NO_FALLBACKS, central };
 }
 
 export function useLayerState(name: string): LayerState {

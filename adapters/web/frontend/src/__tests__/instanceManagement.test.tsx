@@ -1,7 +1,9 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AccountWorkspaceSlot } from '../console/AccountWorkspace';
+import { PlatformProvider } from '../console/platformContext';
 import * as api from '../api/supervisorClient';
+import { QQ_NAPCAT, type PlatformDescriptor } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
@@ -376,5 +378,54 @@ describe('账号操作请求归属', () => {
     expect(api.getPlatformAccount).toHaveBeenCalledTimes(2);
     expect(api.pinPlatformAccount).not.toHaveBeenCalled();
     expect(screen.queryByRole('heading', { name: '扫码登录' })).not.toBeInTheDocument();
+  });
+});
+
+// 平台名接中文：「这个 QQ 号」要空格，「这个微信号」不要。
+describe('汉字名平台的账号文案', () => {
+  const WECHAT: PlatformDescriptor = {
+    id: 'wechat',
+    displayName: '微信',
+    shortName: '微信',
+    channels: [{ name: 'wechat_group', kind: 'group', hashed: true }],
+    hasConfig: true,
+    entrypoints: ['wechat_bot.py'],
+    connectionPeer: '微信网关',
+    connectionHint: '检查登录状态与出网代理',
+  };
+  const renderFor = (platform: PlatformDescriptor) => render(
+    <PlatformProvider platform={platform}><AccountWorkspaceSlot /></PlatformProvider>,
+  );
+
+  it('要登录的号那一栏两处名字都不多空格', async () => {
+    renderFor(WECHAT);
+    await screen.findByRole('combobox', { name: '切换实例' });
+
+    expect(screen.getByText('要登录的微信号')).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: '新实例要登录的微信号' })).toBeInTheDocument();
+  });
+
+  it('QQ 那两处照旧带空格', async () => {
+    renderFor(QQ_NAPCAT);
+    await screen.findByRole('combobox', { name: '切换实例' });
+
+    expect(screen.getByText('要登录的 QQ 号')).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: '新实例要登录的 QQ 号' })).toBeInTheDocument();
+  });
+
+  it('账号已经归别的实例时那句也不多空格', async () => {
+    vi.mocked(api.getInstances).mockResolvedValue([
+      { ...rows[0], accounts: { wechat: '1000001' } }, { ...rows[1], accounts: { wechat: '1000002' } },
+    ]);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    renderFor(WECHAT);
+    await screen.findByRole('combobox', { name: '切换实例' });
+
+    fireEvent.change(screen.getByRole('textbox', { name: '新实例名' }), { target: { value: 'xiaoyu2' } });
+    fireEvent.change(screen.getByRole('textbox', { name: '新实例要登录的微信号' }), { target: { value: '1000002' } });
+    fireEvent.click(screen.getByRole('button', { name: '建实例' }));
+
+    expect(api.createInstance).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert')).toHaveTextContent('这个微信号已经归实例「第二实例」管了，请直接切换到它的控制台。');
   });
 });
