@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# root 侧建号/删号：docker、systemd、cloudflared。
+# root 侧建/删实例：docker、systemd、cloudflared。
 #
 # 必须装到 /usr/local/lib/kazebot/（见 install_provision.sh）。留在 /opt/kazebot 下
 # 就是提权洞：那里 kazebot 可写，而 agent 能以 kazebot 身份执行任意命令。
@@ -15,15 +15,17 @@ CF_CONF=/etc/cloudflared/config.yml
 OWNER=kazebot
 
 ACTION="${1:-}"
-UIN="${2:-}"
+INSTANCE="${2:-}"
 
-[[ "$UIN" =~ ^[1-9][0-9]{4,10}$ ]] || { echo "uin 不合法" >&2; exit 2; }
+[[ "$INSTANCE" =~ ^([a-z][a-z0-9_]{1,31}|[1-9][0-9]{4,10})$ ]] || { echo "实例名不合法" >&2; exit 2; }
+# 数据根下的共享表情包库，实例叫这个名字工作区就是它。
+[ "$INSTANCE" != stickers ] || { echo "实例名不合法" >&2; exit 2; }
 [[ "$ACTION" == "create" || "$ACTION" == "remove" ]] || { echo "action 不合法" >&2; exit 2; }
 
-WS="$DATA_ROOT/$UIN"
-NC_HOME="/opt/napcat-$UIN"
-# 放在工作区外：删号会把工作区改名，日志跟着搬走的话控制台就永远等不到结果。
-LOG="$DATA_ROOT/provision-$UIN.log"
+WS="$DATA_ROOT/$INSTANCE"
+NC_HOME="/opt/napcat-$INSTANCE"
+# 放在工作区外：删实例会把工作区改名，日志跟着搬走的话控制台就永远等不到结果。
+LOG="$DATA_ROOT/provision-$INSTANCE.log"
 
 say() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 fail() { printf 'DONE fail: %s\n' "$*" >>"$LOG"; echo "$*" >&2; exit 1; }
@@ -50,18 +52,18 @@ do_create() {
   [[ "$napcat_port" =~ ^[0-9]{4,5}$ ]] || fail "NAPCAT_WEBUI_URL 不合形状"
   access_token="$(env_get ONEBOT_ACCESS_TOKEN '^[0-9a-f]{16,64}$')"
 
-  say "实例 $UIN：supervisor $sup_port / bot $bot_port / napcat $napcat_port"
+  say "实例 $INSTANCE：supervisor $sup_port / bot $bot_port / napcat $napcat_port"
 
-  # 版本跟现役容器走，避免新号悄悄用上另一个 NapCat。
+  # 版本跟现役容器走，避免新实例悄悄用上另一个 NapCat。
   image="$(docker inspect napcat --format '{{.Config.Image}}' 2>/dev/null || true)"
   [ -n "$image" ] || fail "读不到现有 napcat 容器的镜像，先确认它在跑"
 
-  if docker inspect "napcat-$UIN" >/dev/null 2>&1; then
-    say "容器 napcat-$UIN 已存在，跳过创建"
+  if docker inspect "napcat-$INSTANCE" >/dev/null 2>&1; then
+    say "容器 napcat-$INSTANCE 已存在，跳过创建"
   else
-    say "拉起容器 napcat-$UIN（$image）"
+    say "拉起容器 napcat-$INSTANCE（$image）"
     mkdir -p "$NC_HOME/config" "$NC_HOME/qq"
-    # 反向 WS 的模板：新号登录后 NapCat 从 onebot11.json 派生自己那份。
+    # 反向 WS 的模板：新实例登录后 NapCat 从 onebot11.json 派生自己那份。
     "$PY" - "$NC_HOME/config/onebot11.json" "$bot_port" "$access_token" <<'PY'
 import json, sys
 path, port, token = sys.argv[1], int(sys.argv[2]), sys.argv[3]
@@ -81,7 +83,7 @@ json.dump({
 }, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 PY
     # 序号 0 那个跑 --network host，第二个 host 容器会抢 6099 和 QQ NT 占的 4001/4301。
-    docker run -d --name "napcat-$UIN" --restart always \
+    docker run -d --name "napcat-$INSTANCE" --restart always \
       -p "127.0.0.1:$napcat_port:6099" \
       --add-host "host.docker.internal:host-gateway" \
       -e NAPCAT_UID=0 -e NAPCAT_GID=0 -e TZ=Asia/Shanghai \
@@ -94,7 +96,7 @@ PY
   say "等 WebUI 生成 token…"
   local waited=0
   while [ ! -s "$NC_HOME/config/webui.json" ]; do
-    [ "$waited" -ge 90 ] && fail "容器 90 秒没写出 webui.json，docker logs napcat-$UIN 看看"
+    [ "$waited" -ge 90 ] && fail "容器 90 秒没写出 webui.json，docker logs napcat-$INSTANCE 看看"
     sleep 2; waited=$((waited + 2))
   done
 
@@ -119,20 +121,20 @@ PY
   systemctl daemon-reload
 
   say "接入 cloudflared"
-  "$PY" "$CF_EDIT" add --config "$CF_CONF" --uin "$UIN" --port "$sup_port" | tee -a "$LOG"
+  "$PY" "$CF_EDIT" add --config "$CF_CONF" --instance "$INSTANCE" --port "$sup_port" | tee -a "$LOG"
 
   say "启动服务"
   chown -R "$OWNER:$OWNER" "$WS"
-  systemctl enable --now "kazebot@$UIN" "kazebot-qq@$UIN" "kazebot-cleanup@$UIN.timer"
+  systemctl enable --now "kazebot@$INSTANCE" "kazebot-qq@$INSTANCE" "kazebot-cleanup@$INSTANCE.timer"
 
   say "等 supervisor 应答 127.0.0.1:$sup_port …"
   waited=0
   until curl -fsS --max-time 2 "http://127.0.0.1:$sup_port/v1/health" >/dev/null 2>&1; do
-    [ "$waited" -ge 120 ] && fail "服务 120 秒没起来，journalctl -u kazebot@$UIN 看看"
+    [ "$waited" -ge 120 ] && fail "服务 120 秒没起来，journalctl -u kazebot@$INSTANCE 看看"
     sleep 3; waited=$((waited + 3))
   done
 
-  say "完成。去 /i/$UIN/web/ 扫码登录这个号。"
+  say "完成。去 /i/$INSTANCE/web/ 扫码登录这个实例要用的号。"
   printf 'DONE ok\n' >>"$LOG"
 }
 
@@ -145,24 +147,24 @@ do_remove() {
   local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
 
   say "停服务"
-  systemctl disable --now "kazebot@$UIN" "kazebot-qq@$UIN" "kazebot-cleanup@$UIN.timer" 2>&1 | tee -a "$LOG" || true
+  systemctl disable --now "kazebot@$INSTANCE" "kazebot-qq@$INSTANCE" "kazebot-cleanup@$INSTANCE.timer" 2>&1 | tee -a "$LOG" || true
 
-  # 名字精确到 napcat-<数字>，永远撞不上序号 0 的 napcat，也撞不上 gitea。
-  if docker inspect "napcat-$UIN" >/dev/null 2>&1; then
-    say "移除容器 napcat-$UIN"
-    docker rm -f "napcat-$UIN" >/dev/null
+  # 名字是 napcat- 加实例名，永远撞不上序号 0 的 napcat，也撞不上 gitea。
+  if docker inspect "napcat-$INSTANCE" >/dev/null 2>&1; then
+    say "移除容器 napcat-$INSTANCE"
+    docker rm -f "napcat-$INSTANCE" >/dev/null
   fi
 
   say "摘掉 cloudflared 规则"
-  "$PY" "$CF_EDIT" remove --config "$CF_CONF" --uin "$UIN" | tee -a "$LOG"
+  "$PY" "$CF_EDIT" remove --config "$CF_CONF" --instance "$INSTANCE" | tee -a "$LOG"
 
   # 由完成方摘清单，不由发起方乐观预摘：root 这边失败的话，控制台里那条还在，
   # 至少不会出现「清单查无此号、进程却还在跑」的幽灵。
   # 锁的是 supervisor 侧用的同一个文件，否则两边同时改会丢条目。
-  say "从清单摘掉 $UIN"
-  flock "$DATA_ROOT/instances.yaml.lock" "$PY" - "$DATA_ROOT/instances.yaml" "$UIN" <<'PY'
+  say "从清单摘掉 $INSTANCE"
+  flock "$DATA_ROOT/instances.yaml.lock" "$PY" - "$DATA_ROOT/instances.yaml" "$INSTANCE" <<'PY'
 import pathlib, sys, yaml
-path, uin = pathlib.Path(sys.argv[1]), sys.argv[2]
+path, instance = pathlib.Path(sys.argv[1]), sys.argv[2]
 try:
     doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 except OSError:
@@ -170,7 +172,11 @@ except OSError:
 rows = doc.get("instances") if isinstance(doc, dict) else None
 if not isinstance(rows, list):
     sys.exit(0)
-kept = [r for r in rows if not (isinstance(r, dict) and str(r.get("uin")) == uin)]
+def row_id(row):
+    # 和 supervisor.instances 读清单时一样认：先 id，空的退回改造前条目的 uin，两边都去空白。
+    return str(row.get("id") or "").strip() or str(row.get("uin") or "").strip()
+
+kept = [r for r in rows if not (isinstance(r, dict) and row_id(r) == instance)]
 tmp = path.with_name(path.name + ".tmp")
 tmp.write_text(yaml.safe_dump({"instances": kept}, allow_unicode=True, sort_keys=False), encoding="utf-8")
 tmp.replace(path)

@@ -13,10 +13,13 @@ vi.mock('../api/supervisorClient', async importOriginal => ({
 }));
 
 const rows: api.ConsoleInstance[] = [
-  { uin: '1000001', label: '主实例', path: '', current: true, idx: 0 },
-  { uin: '1000002', label: '第二实例', path: '/i/1000002', current: false, idx: 1 },
+  { id: 'main', label: '主实例', path: '', current: true, idx: 0, accounts: { qq: '1000001' } },
+  { id: 'xiaoyu', label: '第二实例', path: '/i/xiaoyu', current: false, idx: 1, accounts: { qq: '1000002' } },
 ];
 const account: api.AccountStatus = { configured: true, reachable: true, is_login: true, online: true, account: '1000001', nick: '当前机器人' };
+const plan = (id: string): api.InstancePlan => ({
+  id, label: '', idx: 2, prefix: `/i/${id}`, ports: {}, workspace: '/synthetic', accounts: {},
+});
 const deferred = <T,>() => {
   let resolve!: (value: T) => void;
   let reject!: (error: Error) => void;
@@ -46,11 +49,31 @@ describe('实例管理入口', () => {
     render(<AccountWorkspaceSlot />);
     expect(await screen.findByRole('heading', { name: '多开实例' })).toBeInTheDocument();
     expect(await screen.findByRole('combobox', { name: '切换实例' })).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: '去它的控制台' })).toHaveAttribute('href', '/i/1000002/web/?view=settings&tab=qq-account');
+    expect(screen.getByRole('link', { name: '去它的控制台' })).toHaveAttribute('href', '/i/xiaoyu/web/?view=settings&tab=qq-account');
     expect(screen.queryByText('多实例总览与模板')).not.toBeInTheDocument();
     expect(screen.queryByText('已保存的模板')).not.toBeInTheDocument();
     expect(fetch).not.toHaveBeenCalled();
     expect(api.getInstances).toHaveBeenCalledTimes(1);
+  });
+
+  it('每行标出实例名和它登记的账号', async () => {
+    vi.mocked(api.getInstances).mockResolvedValue([
+      rows[0], { ...rows[1], accounts: { qq: '1000002', telegram: '777' } },
+    ]);
+    render(<AccountWorkspaceSlot />);
+    const list = (await screen.findByRole('heading', { name: '多开实例' })).closest('section')!;
+    expect(within(list).getByText('main')).toBeInTheDocument();
+    expect(within(list).getByText('QQ 1000001')).toBeInTheDocument();
+    expect(within(list).getByText('xiaoyu')).toBeInTheDocument();
+    // 认不出的平台退回平台 id，不能把账号行整行吞掉。
+    expect(within(list).getByText('QQ 1000002，telegram 777')).toBeInTheDocument();
+  });
+
+  it('还没建过实例时给出装机命令，也不给建实例的入口', async () => {
+    vi.mocked(api.getInstances).mockResolvedValue([]);
+    render(<AccountWorkspaceSlot />);
+    expect(await screen.findByText('sudo deploy/install_provision.sh <主实例名> <当前QQ号>')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '建实例' })).not.toBeInTheDocument();
   });
 
   it('账号读取失败不阻塞实例列表，错误保留并可重试', async () => {
@@ -106,9 +129,20 @@ describe('实例管理入口', () => {
     vi.mocked(api.getPlatformAccount).mockResolvedValue({ ...account, quick_login: [{ account: '1000002', nick: '另一个QQ' }] });
     render(<AccountWorkspaceSlot />);
     const quick = (await screen.findByRole('heading', { name: '快速切换' })).closest('section')!;
-    expect(within(quick).getByRole('link', { name: '去它的控制台' })).toHaveAttribute('href', '/i/1000002/web/?view=settings&tab=qq-account');
+    expect(within(quick).getByRole('link', { name: '去它的控制台' })).toHaveAttribute('href', '/i/xiaoyu/web/?view=settings&tab=qq-account');
     expect(within(quick).queryByRole('button', { name: '切到这个号' })).not.toBeInTheDocument();
     expect(api.getInstances).toHaveBeenCalledTimes(1);
+  });
+
+  it('快速切换只认账号归属，实例名和号码撞上不算占用', async () => {
+    vi.mocked(api.getInstances).mockResolvedValue([
+      rows[0], { id: '1000002', label: '数字名实例', path: '/i/1000002', current: false, idx: 1, accounts: { qq: '2000002' } },
+    ]);
+    vi.mocked(api.getPlatformAccount).mockResolvedValue({ ...account, quick_login: [{ account: '1000002', nick: '另一个QQ' }] });
+    render(<AccountWorkspaceSlot />);
+    const quick = (await screen.findByRole('heading', { name: '快速切换' })).closest('section')!;
+    expect(within(quick).getByRole('button', { name: '切到这个号' })).toBeEnabled();
+    expect(within(quick).queryByRole('link', { name: '去它的控制台' })).not.toBeInTheDocument();
   });
 
   it('实例清单读取失败时不能绕过账号归属检查进行快速登录', async () => {
@@ -125,15 +159,24 @@ describe('实例管理入口', () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
     render(<AccountWorkspaceSlot />);
     const select = await screen.findByRole('combobox', { name: '切换实例' });
-    fireEvent.change(screen.getByRole('textbox', { name: '新实例 QQ 号' }), { target: { value: '1000003' } });
+    fireEvent.change(screen.getByRole('textbox', { name: '新实例名' }), { target: { value: 'xiaoyu2' } });
     const link = screen.getByRole('link', { name: '去它的控制台' });
-    expect(link).toHaveAttribute('href', '/i/1000002/web/?view=settings&tab=qq-account');
+    expect(link).toHaveAttribute('href', '/i/xiaoyu/web/?view=settings&tab=qq-account');
     const unload = new Event('beforeunload', { cancelable: true });
     window.dispatchEvent(unload);
     expect(unload.defaultPrevented).toBe(true);
     expect(confirm).not.toHaveBeenCalled();
     expect(select).toHaveValue('');
-    expect(screen.getByRole('textbox', { name: '新实例 QQ 号' })).toHaveValue('1000003');
+    expect(screen.getByRole('textbox', { name: '新实例名' })).toHaveValue('xiaoyu2');
+  });
+
+  it.each(['新实例名', '实例备注', '新实例要登录的 QQ 号'])('%s 填了东西就算未保存', async name => {
+    render(<AccountWorkspaceSlot />);
+    await screen.findByRole('combobox', { name: '切换实例' });
+    fireEvent.change(screen.getByRole('textbox', { name }), { target: { value: '1' } });
+    const unload = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(unload);
+    expect(unload.defaultPrevented).toBe(true);
   });
 
   it('实例链接保留另开标签能力，不提示丢弃当前页草稿', async () => {
@@ -157,69 +200,108 @@ describe('实例创建与归档', () => {
   it('创建只发给当前实例，提交期间冻结输入且不重复发起，失败保留草稿', async () => {
     const pending = deferred<api.InstancePlan>();
     vi.mocked(api.createInstance).mockReturnValue(pending.promise);
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
-    render(<AccountWorkspaceSlot />);
-    await screen.findByRole('combobox', { name: '切换实例' });
-    const number = screen.getByRole('textbox', { name: '新实例 QQ 号' });
-    const label = screen.getByRole('textbox', { name: '实例备注' });
-    fireEvent.change(number, { target: { value: '1000003' } });
-    fireEvent.change(label, { target: { value: '新实例备注' } });
-    const create = screen.getByRole('button', { name: '建实例' });
-    fireEvent.click(create); fireEvent.click(create);
-    expect(number).toBeDisabled(); expect(label).toBeDisabled();
-    expect(api.createInstance).toHaveBeenCalledExactlyOnceWith('current-token', '1000003', '新实例备注');
-    await act(async () => pending.reject(new Error('创建失败')));
-    expect(screen.getByRole('alert')).toHaveTextContent('创建失败');
-    expect(number).toHaveValue('1000003'); expect(label).toHaveValue('新实例备注');
-    expect(create).toBeEnabled();
-  });
-
-  it.each(['0', '100', '123456789012', 'not-a-number', '1000002'])('拒绝无效或已存在的 QQ 号 %s', async value => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
     render(<AccountWorkspaceSlot />);
     await screen.findByRole('combobox', { name: '切换实例' });
-    fireEvent.change(screen.getByRole('textbox', { name: '新实例 QQ 号' }), { target: { value } });
+    const id = screen.getByRole('textbox', { name: '新实例名' });
+    const label = screen.getByRole('textbox', { name: '实例备注' });
+    const number = screen.getByRole('textbox', { name: '新实例要登录的 QQ 号' });
+    const create = screen.getByRole('button', { name: '建实例' });
+    expect(create).toBeDisabled();
+    fireEvent.change(id, { target: { value: 'xiaoyu2' } });
+    fireEvent.change(label, { target: { value: '新实例备注' } });
+    fireEvent.change(number, { target: { value: '1000003' } });
+    fireEvent.click(create); fireEvent.click(create);
+    expect(id).toBeDisabled(); expect(label).toBeDisabled(); expect(number).toBeDisabled();
+    expect(confirm).toHaveBeenCalledWith(expect.stringMatching(/^建一个新 bot「xiaoyu2」？/));
+    expect(api.createInstance).toHaveBeenCalledExactlyOnceWith('current-token', 'xiaoyu2', '新实例备注', { qq: '1000003' });
+    await act(async () => pending.reject(new Error('创建失败')));
+    expect(screen.getByRole('alert')).toHaveTextContent('创建失败');
+    expect(id).toHaveValue('xiaoyu2'); expect(label).toHaveValue('新实例备注'); expect(number).toHaveValue('1000003');
+    expect(create).toBeEnabled();
+  });
+
+  it('留空 QQ 号时不替新实例登记任何账号', async () => {
+    vi.mocked(api.createInstance).mockReturnValue(deferred<api.InstancePlan>().promise);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(<AccountWorkspaceSlot />);
+    await screen.findByRole('combobox', { name: '切换实例' });
+    fireEvent.change(screen.getByRole('textbox', { name: '新实例名' }), { target: { value: 'xiaoyu2' } });
+    fireEvent.click(screen.getByRole('button', { name: '建实例' }));
+    expect(api.createInstance).toHaveBeenCalledExactlyOnceWith('current-token', 'xiaoyu2', '', {});
+  });
+
+  it.each([
+    ['Xiaoyu', '', '实例名要以小写字母开头，只用小写字母、数字和下划线，2-32 位'],
+    ['bot-2', '', '实例名要以小写字母开头，只用小写字母、数字和下划线，2-32 位'],
+    ['stickers', '', '实例名要以小写字母开头，只用小写字母、数字和下划线，2-32 位'],
+    ['xiaoyu', '', '已经有叫这个名字的实例了，换一个。'],
+    ['xiaoyu2', '1000002', '这个 QQ 号已经归实例「第二实例」管了，请直接切换到它的控制台。'],
+    ['xiaoyu2', '1000001', '这个 QQ 号已经归实例「主实例」管了，请直接切换到它的控制台。'],
+  ])('拦住 %s / %s 并说清原因', async (id, number, note) => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(<AccountWorkspaceSlot />);
+    await screen.findByRole('combobox', { name: '切换实例' });
+    fireEvent.change(screen.getByRole('textbox', { name: '新实例名' }), { target: { value: id } });
+    fireEvent.change(screen.getByRole('textbox', { name: '新实例要登录的 QQ 号' }), { target: { value: number } });
     fireEvent.click(screen.getByRole('button', { name: '建实例' }));
     expect(api.createInstance).not.toHaveBeenCalled();
     expect(confirm).not.toHaveBeenCalled();
-    expect(screen.getByRole('alert')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(note);
   });
 
   it('创建确认取消后没有写请求或清空草稿', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(false);
     render(<AccountWorkspaceSlot />);
     await screen.findByRole('combobox', { name: '切换实例' });
-    const number = screen.getByRole('textbox', { name: '新实例 QQ 号' });
-    fireEvent.change(number, { target: { value: '1000003' } });
+    const id = screen.getByRole('textbox', { name: '新实例名' });
+    fireEvent.change(id, { target: { value: 'xiaoyu2' } });
     fireEvent.click(screen.getByRole('button', { name: '建实例' }));
     expect(api.createInstance).not.toHaveBeenCalled();
-    expect(number).toHaveValue('1000003');
+    expect(id).toHaveValue('xiaoyu2');
   });
 
-  it('归档要求准确输入号码，当前实例和主实例不能被删除', async () => {
-    const prompt = vi.spyOn(window, 'prompt').mockReturnValue('1000099');
+  it('按后端定的实例名轮询进度，不用输入框里那个', async () => {
+    vi.mocked(api.createInstance).mockResolvedValue(plan('xiaoyu2_1'));
+    vi.mocked(api.getInstanceProgress).mockResolvedValue({ id: 'xiaoyu2_1', lines: ['建好了'], finished: true, ok: true, detail: '' });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(<AccountWorkspaceSlot />);
+    await screen.findByRole('combobox', { name: '切换实例' });
+    fireEvent.change(screen.getByRole('textbox', { name: '新实例名' }), { target: { value: 'xiaoyu2' } });
+    vi.useFakeTimers();
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: '建实例' })));
+    await act(async () => vi.advanceTimersByTimeAsync(2500));
+    expect(api.getInstanceProgress).toHaveBeenCalledExactlyOnceWith('current-token', 'xiaoyu2_1');
+    expect(screen.getByText('实例已建立，请去它自己的控制台扫码登录。')).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: '新实例名' })).toHaveValue('');
+  });
+
+  it('归档要求准确输入实例名，当前实例和主实例不能被删除', async () => {
+    const prompt = vi.spyOn(window, 'prompt').mockReturnValue('xiaoyu9');
     render(<AccountWorkspaceSlot />);
     const remove = await screen.findByRole('button', { name: '停用并归档' });
     expect(screen.getAllByRole('button', { name: '停用并归档' })).toHaveLength(1);
     fireEvent.click(remove);
+    expect(prompt).toHaveBeenCalledWith(expect.stringMatching(/^归档实例 第二实例（xiaoyu）？/));
+    expect(prompt).toHaveBeenCalledWith(expect.stringContaining('输入这个实例名确认：'));
     expect(api.deleteInstance).not.toHaveBeenCalled();
-    expect(screen.getByRole('alert')).toHaveTextContent('输入的号对不上');
+    expect(screen.getByRole('alert')).toHaveTextContent('输入的实例名对不上，没有执行');
     prompt.mockReturnValue(null); fireEvent.click(remove);
     expect(api.deleteInstance).not.toHaveBeenCalled();
   });
 
   it('归档完成刷新共享实例清单，并显示归档而非新号登录提示', async () => {
-    vi.spyOn(window, 'prompt').mockReturnValue('1000002');
+    vi.spyOn(window, 'prompt').mockReturnValue('xiaoyu');
     vi.mocked(api.deleteInstance).mockResolvedValue();
-    vi.mocked(api.getInstanceProgress).mockResolvedValue({ uin: '1000002', lines: ['已归档'], finished: true, ok: true, detail: '' });
+    vi.mocked(api.getInstanceProgress).mockResolvedValue({ id: 'xiaoyu', lines: ['已归档'], finished: true, ok: true, detail: '' });
     render(<AccountWorkspaceSlot />);
     const remove = await screen.findByRole('button', { name: '停用并归档' });
     vi.useFakeTimers();
     await act(async () => fireEvent.click(remove));
     vi.mocked(api.getInstances).mockResolvedValue([rows[0]]);
     await act(async () => vi.advanceTimersByTimeAsync(2500));
-    expect(api.deleteInstance).toHaveBeenCalledExactlyOnceWith('current-token', '1000002');
-    expect(api.getInstanceProgress).toHaveBeenCalledExactlyOnceWith('current-token', '1000002');
+    expect(api.deleteInstance).toHaveBeenCalledExactlyOnceWith('current-token', 'xiaoyu');
+    expect(api.getInstanceProgress).toHaveBeenCalledExactlyOnceWith('current-token', 'xiaoyu');
     expect(screen.getByText('实例已停用，工作区和聊天记录已归档。')).toBeInTheDocument();
     expect(screen.queryByRole('combobox', { name: '切换实例' })).not.toBeInTheDocument();
     expect(screen.queryByText('第二实例')).not.toBeInTheDocument();
@@ -231,21 +313,21 @@ describe('实例创建与归档', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     render(<AccountWorkspaceSlot />);
     await screen.findByRole('combobox', { name: '切换实例' });
-    fireEvent.change(screen.getByRole('textbox', { name: '新实例 QQ 号' }), { target: { value: '1000003' } });
+    fireEvent.change(screen.getByRole('textbox', { name: '新实例名' }), { target: { value: 'xiaoyu2' } });
     fireEvent.click(screen.getByRole('button', { name: '建实例' }));
     act(() => useSettingsStore.setState({ adminToken: 'new-token' }));
     await waitFor(() => expect(api.getInstances).toHaveBeenCalledWith('new-token'));
     vi.useFakeTimers();
-    await act(async () => pending.resolve({ uin: '1000003', label: '旧请求', idx: 2, prefix: '/i/1000003', ports: {}, workspace: '/synthetic' }));
+    await act(async () => pending.resolve({ ...plan('xiaoyu2'), label: '旧请求' }));
     await act(async () => vi.advanceTimersByTimeAsync(5000));
     expect(api.getInstanceProgress).not.toHaveBeenCalled();
     expect(screen.queryByText('已提交，等 root 侧接手…')).not.toBeInTheDocument();
   });
 
   it('归档进度读取失败保留任务并自动重试，不重复提交归档', async () => {
-    vi.spyOn(window, 'prompt').mockReturnValue('1000002');
+    vi.spyOn(window, 'prompt').mockReturnValue('xiaoyu');
     vi.mocked(api.deleteInstance).mockResolvedValue();
-    vi.mocked(api.getInstanceProgress).mockRejectedValueOnce(new Error('暂时断线')).mockResolvedValue({ uin: '1000002', lines: ['完成'], finished: true, ok: true, detail: '' });
+    vi.mocked(api.getInstanceProgress).mockRejectedValueOnce(new Error('暂时断线')).mockResolvedValue({ id: 'xiaoyu', lines: ['完成'], finished: true, ok: true, detail: '' });
     render(<AccountWorkspaceSlot />);
     const remove = await screen.findByRole('button', { name: '停用并归档' });
     vi.useFakeTimers();

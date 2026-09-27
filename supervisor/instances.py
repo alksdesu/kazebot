@@ -1,7 +1,7 @@
-"""控制台的账号清单。
+"""控制台的实例清单。
 
-多开时每个号是一套独立进程，各自挂在自己的 URL 前缀下，靠这份共享文件互相看见。
-端口与序号的推导也在这里，shell 侧同样从这里取，两套算法漂移会让新号静默抢占旧号的端口。
+多开时每个 bot 是一套独立进程，各自挂在自己的 URL 前缀下，靠这份共享文件互相看见；平台账号是实例下的子项。
+端口与序号的推导也在这里，shell 侧同样从这里取，两套算法漂移会让新实例静默抢占旧实例的端口。
 """
 from __future__ import annotations
 
@@ -14,36 +14,56 @@ from typing import Any
 import yaml
 
 from file_lock import exclusive_lock
+from platforms.builtin import QQ_NAPCAT
+from platforms.descriptor import InstancePort, normalize_name
+from platforms.registry import all_platforms
 
 _ENV_FILE = "CLONOTH_INSTANCES_FILE"
 _ENV_PREFIX = "CLONOTH_URL_PREFIX"
 
-# (基准端口, 每号步长)。序号 0 正好落在单实例部署原有的那一组上。
-_PORTS: dict[str, tuple[int, int]] = {
-    "supervisor": (8765, 10),
-    "bot": (8080, 10),
-    "bridge": (8769, 10),
-    "napcat": (6099, 100),
-}
+# 核心自己的端口。平台进程要的端口由平台描述的 instance_ports 声明，序号 0 落在单实例部署原有的那一组上。
+_CORE_PORTS: tuple[InstancePort, ...] = (InstancePort("supervisor", 8765, 10),)
 
-# 序号无上限会一路撞进别的服务的端口，磁盘也撑不住这么多号。
+# 序号无上限会一路撞进别的服务的端口，磁盘也撑不住这么多实例。
 MAX_INDEX = 8
 
 
+def port_table() -> tuple[InstancePort, ...]:
+    """全部要按序号分配的端口。名字重了、两个序号落到同一个端口都直接报错，不能等到新实例起不来才发现。"""
+    ports = (*_CORE_PORTS, *(port for platform in all_platforms() for port in platform.instance_ports))
+    names = [port.name for port in ports]
+    duplicated = sorted({name for name in names if names.count(name) > 1})
+    if duplicated:
+        raise ValueError(f"端口名重复：{duplicated}")
+    owners: dict[int, str] = {}
+    for idx in range(MAX_INDEX + 1):
+        for port in ports:
+            number = port.at(idx)
+            if number in owners:
+                raise ValueError(f"序号 {idx} 的 {port.name} 端口 {number} 和{owners[number]}撞了")
+            owners[number] = f"序号 {idx} 的 {port.name}"
+    return ports
+
+
 def ports_for(idx: int) -> dict[str, int]:
-    """按序号推导四个监听端口。"""
-    return {name: base + step * idx for name, (base, step) in _PORTS.items()}
+    """按序号推导全部监听端口。"""
+    return {port.name: port.at(idx) for port in port_table()}
 
 
-def prefix_for(idx: int, uin: str) -> str:
-    """序号 0 占站点根，其余各挂一层，几个号共用一个域名。"""
-    return "" if idx == 0 else f"/i/{uin}"
+def normalize_prefix(raw: Any) -> str:
+    """URL 前缀一律写成 "" 或 "/a/b"。清单里的 path、env 里的前缀、调用方传进来的都按这个比，差一个斜杠就认不出自己。"""
+    text = str(raw or "").strip().strip("/")
+    return f"/{text}" if text else ""
+
+
+def prefix_for(idx: int, instance_id: str) -> str:
+    """序号 0 占站点根，其余各挂一层，几个实例共用一个域名。"""
+    return "" if idx == 0 else normalize_prefix(f"/i/{instance_id}")
 
 
 def url_prefix() -> str:
     """本实例挂在哪个 URL 前缀下。单实例为空串，路由与挂载前逐字相同。"""
-    raw = str(os.environ.get(_ENV_PREFIX) or "").strip().strip("/")
-    return f"/{raw}" if raw else ""
+    return normalize_prefix(os.environ.get(_ENV_PREFIX))
 
 
 def instances_file(workspace_root: Path) -> Path:
@@ -54,25 +74,48 @@ def instances_file(workspace_root: Path) -> Path:
     return Path(workspace_root) / "config" / "instances.yaml"
 
 
+def legacy_accounts(uin: Any) -> dict[str, str]:
+    """改造前一个实例就是一个 QQ 号，实例名也是它：那个号就是这个实例在 QQ 上的账号。"""
+    text = str(uin or "").strip()
+    return {QQ_NAPCAT.id: text} if text else {}
+
+
+def _accounts(raw: Any, legacy_uin: str = "") -> dict[str, str]:
+    """读和写走同一套清洗：写进去的脏值读出来就不见了，写的一方却以为记上了。"""
+    accounts = legacy_accounts(legacy_uin)
+    if isinstance(raw, dict):
+        for platform_id, account in raw.items():
+            key, value = normalize_name(platform_id), str(account or "").strip()
+            if key and value:
+                accounts[key] = value
+    return accounts
+
+
+def _is_index(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_INDEX
+
+
 def _clean(entry: Any) -> dict[str, Any] | None:
     if not isinstance(entry, dict):
         return None
-    uin = str(entry.get("uin") or "").strip()
-    if not uin:
+    legacy_uin = str(entry.get("uin") or "").strip()
+    instance_id = str(entry.get("id") or "").strip() or legacy_uin
+    if not instance_id:
         return None
-    path = str(entry.get("path") or "").strip().strip("/")
+    path = normalize_prefix(entry.get("path"))
     raw_idx = entry.get("idx")
-    if isinstance(raw_idx, int) and not isinstance(raw_idx, bool) and 0 <= raw_idx <= MAX_INDEX:
+    if _is_index(raw_idx):
         idx = raw_idx
     else:
         # 老清单没这个字段。根实例必然是序号 0；带前缀的推不出来，标 -1 让分配退回
         # 端口探测 —— 宁可多跳一个序号，也不能算出一个正在跑的实例的端口。
         idx = 0 if not path else -1
     return {
-        "uin": uin,
-        "label": str(entry.get("label") or "").strip() or uin,
-        "path": f"/{path}" if path else "",
+        "id": instance_id,
+        "label": str(entry.get("label") or "").strip() or instance_id,
+        "path": path,
         "idx": idx,
+        "accounts": _accounts(entry.get("accounts"), legacy_uin),
     }
 
 
@@ -88,9 +131,9 @@ def _read(path: Path) -> list[dict[str, Any]]:
     cleaned: list[dict[str, Any]] = []
     for entry in rows:
         row = _clean(entry)
-        # 同一个号写两条会让切换器多出一个永远点不到的重复项。
-        if row and row["uin"] not in seen:
-            seen.add(row["uin"])
+        # 同一个实例写两条会让切换器多出一个永远点不到的重复项。
+        if row and row["id"] not in seen:
+            seen.add(row["id"])
             cleaned.append(row)
     return cleaned
 
@@ -100,11 +143,40 @@ def load_instances(workspace_root: Path) -> list[dict[str, Any]]:
     return _read(instances_file(workspace_root))
 
 
+def account_owner_in(
+    rows: list[dict[str, Any]], platform_id: str, account: str, *, prefix: str | None = None,
+) -> dict[str, Any] | None:
+    """rows 里登记着这个号的那一条。给了 prefix 就不算挂在它下面的那个实例，那是自己。"""
+    key, value = normalize_name(platform_id), str(account or "").strip()
+    if not key or not value:
+        return None
+    # None 是谁都不放过，"" 是放过根实例，两者不能折成一个。
+    excused = None if prefix is None else normalize_prefix(prefix)
+    return next(
+        (
+            row for row in rows
+            if (excused is None or row["path"] != excused) and row["accounts"].get(key) == value
+        ),
+        None,
+    )
+
+
+def account_owner(
+    workspace_root: Path, platform_id: str, account: str, *, prefix: str,
+) -> dict[str, Any] | None:
+    """别的实例里登记着这个号的那一条。同一个号两边登，会互相把对方踢下线。"""
+    return account_owner_in(load_instances(workspace_root), platform_id, account, prefix=prefix)
+
+
 def port_in_use(port: int, *, host: str = "127.0.0.1", timeout: float = 0.35) -> bool:
     """连得上就是有人在听。不用 bind 探测：那会短暂占住端口，撞上正要启动的实例。"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.settimeout(timeout)
         return probe.connect_ex((host, port)) == 0
+
+
+class NoFreeIndex(ValueError):
+    """序号用完了。要告诉操作的人，和端口表写错那类代码错误分开报。"""
 
 
 def allocate_index(
@@ -117,14 +189,14 @@ def allocate_index(
     清单是软状态（可能被手改、可能漏记），所以除了避开已登记的序号，还要实测端口。
     """
     check = probe if probe is not None else port_in_use
-    taken = {row["idx"] for row in rows if isinstance(row.get("idx"), int) and row["idx"] >= 0}
+    taken = {row["idx"] for row in rows if _is_index(row.get("idx"))}
     for idx in range(MAX_INDEX + 1):
         if idx in taken:
             continue
         if any(check(port) for port in ports_for(idx).values()):
             continue
         return idx
-    raise ValueError(f"没有空闲序号了（上限 {MAX_INDEX}）")
+    raise NoFreeIndex(f"没有空闲序号了（上限 {MAX_INDEX}）")
 
 
 def _locked(path: Path) -> AbstractContextManager[None]:
@@ -142,25 +214,59 @@ def _write(path: Path, rows: list[dict[str, Any]]) -> None:
 def save_instance(
     workspace_root: Path,
     *,
-    uin: str,
+    instance_id: str,
     label: str,
     idx: int,
+    accounts: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """登记一个号。同 uin 视为改写，不会留下两条。"""
+    """登记一个实例。同名视为改写，不会留下两条；已经记下的平台账号保留，给了的覆盖上去。"""
+    instance_id = str(instance_id or "").strip()
+    if not instance_id:
+        raise ValueError("实例名不能为空")
+    # 读取时序号越界会被当成 -1，照写就成了读回来和写进去对不上的一条。
+    if not _is_index(idx):
+        raise ValueError(f"序号要在 0-{MAX_INDEX} 之间：{idx!r}")
     path = instances_file(workspace_root)
-    row = {"uin": uin, "label": label or uin, "path": prefix_for(idx, uin), "idx": idx}
     with _locked(path):
-        rows = [r for r in _read(path) if r["uin"] != uin]
+        rows = _read(path)
+        previous = next((r for r in rows if r["id"] == instance_id), None)
+        merged = {**(previous["accounts"] if previous else {}), **_accounts(accounts)}
+        row = {
+            "id": instance_id,
+            "label": str(label or "").strip() or instance_id,
+            "path": prefix_for(idx, instance_id),
+            "idx": idx,
+            "accounts": merged,
+        }
+        rows = [r for r in rows if r["id"] != instance_id]
         rows.append(row)
-        rows.sort(key=lambda r: (r["idx"] if r["idx"] >= 0 else MAX_INDEX + 1, r["uin"]))
+        rows.sort(key=lambda r: (r["idx"] if r["idx"] >= 0 else MAX_INDEX + 1, r["id"]))
         _write(path, rows)
         return rows
 
 
-def remove_instance(workspace_root: Path, uin: str) -> list[dict[str, Any]]:
-    """摘掉一个号。不碰它的数据目录，那是 root 侧的事。"""
+def record_account(workspace_root: Path, *, prefix: str, platform_id: str, account: str) -> bool:
+    """本实例在一个平台上换了号，记进清单，别的实例据此拦着同一个号双登。单实例部署没有清单，什么也不做。"""
+    path = instances_file(workspace_root)
+    key, value = normalize_name(platform_id), str(account or "").strip()
+    if not key or not value or not path.is_file():
+        return False
+    where = normalize_prefix(prefix)
+    with _locked(path):
+        rows = _read(path)
+        row = next((r for r in rows if r["path"] == where), None)
+        if row is None or row["accounts"].get(key) == value:
+            return False
+        row["accounts"][key] = value
+        _write(path, rows)
+        return True
+
+
+def remove_instance(workspace_root: Path, instance_id: str) -> list[dict[str, Any]]:
+    """摘掉一个实例。不碰它的数据目录，那是 root 侧的事。"""
+    key = str(instance_id or "").strip()
     path = instances_file(workspace_root)
     with _locked(path):
-        rows = [r for r in _read(path) if r["uin"] != uin]
+        rows = [r for r in _read(path) if r["id"] != key]
         _write(path, rows)
         return rows

@@ -20,6 +20,7 @@ from platforms.registry import platform_config_path
 from providers import registry
 from providers.base import ProviderResponse
 from supervisor.admin_api import create_admin_router
+from supervisor.instances import save_instance
 from supervisor.operations.service import OperationsService
 
 
@@ -146,7 +147,12 @@ def test_operations_status_instances_and_diagnostics_remain_available(operations
     config = tmp_path / "config"
     config.mkdir()
     instances = config / "instances.yaml"
-    instances.write_text("instances:\n  - {uin: '111', label: 主实例, path: '', idx: 0}\n  - {uin: '222', label: 副实例, path: /i/222, idx: 1}\n", encoding="utf-8")
+    instances.write_text(
+        "instances:\n"
+        "  - {id: rong, label: 主实例, path: '', idx: 0, accounts: {qq: '111'}}\n"
+        "  - {uin: '222', label: 副实例, path: /i/222, idx: 1}\n",
+        encoding="utf-8",
+    )
     monkeypatch.setenv("CLONOTH_INSTANCES_FILE", str(instances))
     monkeypatch.setenv("CLONOTH_URL_PREFIX", "/i/222")
     headers = {"Authorization": "Bearer synthetic-operations-token"}
@@ -158,8 +164,8 @@ def test_operations_status_instances_and_diagnostics_remain_available(operations
     rows = client.get("/v1/operations/instances", headers=headers)
     assert rows.status_code == 200
     assert rows.json()["instances"] == [
-        {"uin": "111", "label": "主实例", "path": "", "idx": 0, "current": False},
-        {"uin": "222", "label": "副实例", "path": "/i/222", "idx": 1, "current": True},
+        {"id": "rong", "label": "主实例", "path": "", "idx": 0, "accounts": {"qq": "111"}, "current": False},
+        {"id": "222", "label": "副实例", "path": "/i/222", "idx": 1, "accounts": {"qq": "222"}, "current": True},
     ]
     assert workspace_state(tmp_path) == before
     diagnosed = client.post("/v1/operations/diagnostics", headers=headers, json={"test_model": False})
@@ -180,6 +186,48 @@ def service(root):
     state = SimpleNamespace(workspace_root=root, tasks={}, _lock=threading.RLock(), _task_terminal=lambda _: False,
         feature_config_store=SimpleNamespace(get_openai_secret=lambda: secret))
     return OperationsService(state), secret
+
+
+@pytest.mark.parametrize("prefix,path,idx", [
+    (None, "", 0), ("", "", 0), ("  ", "", 0), ("/", "", 0),
+    ("/i/xiaoyu", "/i/xiaoyu", -1), ("i/koki/", "/i/koki", -1), (" /i/koki ", "/i/koki", -1),
+])
+def test_a_deployment_without_a_roster_still_names_the_instance_it_is(tmp_path, monkeypatch, prefix, path, idx):
+    # 兜底行要和读清单时一样推序号：根实例必然是 0，带前缀的推不出来标 -1，别算出一个正在跑的实例的端口。
+    monkeypatch.setenv("CLONOTH_INSTANCES_FILE", str(tmp_path / "missing.yaml"))
+    if prefix is None:
+        monkeypatch.delenv("CLONOTH_URL_PREFIX", raising=False)
+    else:
+        monkeypatch.setenv("CLONOTH_URL_PREFIX", prefix)
+    operations, _ = service(tmp_path)
+    assert operations.instances() == [
+        {"id": "current", "label": "当前实例", "path": path, "idx": idx, "accounts": {}, "current": True},
+    ]
+
+
+@pytest.mark.parametrize("prefix", ["i/koki/", "/i/koki", " /i/koki "])
+def test_a_roster_leaves_no_room_for_the_fallback_row(tmp_path, monkeypatch, prefix):
+    monkeypatch.setenv("CLONOTH_INSTANCES_FILE", str(tmp_path / "instances.yaml"))
+    monkeypatch.setenv("CLONOTH_URL_PREFIX", prefix)
+    save_instance(tmp_path, instance_id="rong", label="主号", idx=0)
+    save_instance(tmp_path, instance_id="koki", label="小号", idx=1, accounts={"qq": "1000000002"})
+    operations, _ = service(tmp_path)
+    assert operations.instances() == [
+        {"id": "rong", "label": "主号", "path": "", "idx": 0, "accounts": {}, "current": False},
+        {"id": "koki", "label": "小号", "path": "/i/koki", "idx": 1, "accounts": {"qq": "1000000002"}, "current": True},
+    ]
+
+
+def test_a_prefix_the_roster_never_heard_of_marks_nobody_current(tmp_path, monkeypatch):
+    # 清单是软状态，漏记了本实例也不能凭空补一行：那会在切换器里多出一个点不到的选项。
+    monkeypatch.setenv("CLONOTH_INSTANCES_FILE", str(tmp_path / "instances.yaml"))
+    monkeypatch.setenv("CLONOTH_URL_PREFIX", "/i/nobody")
+    save_instance(tmp_path, instance_id="rong", label="主号", idx=0)
+    save_instance(tmp_path, instance_id="koki", label="小号", idx=1)
+    operations, _ = service(tmp_path)
+    rows = operations.instances()
+    assert [row["id"] for row in rows] == ["rong", "koki"]
+    assert not any(row["current"] for row in rows)
 
 
 @pytest.mark.parametrize("age", [120, -3600])

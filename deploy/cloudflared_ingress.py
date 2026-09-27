@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,8 @@ from typing import Any
 import yaml
 
 CLOUDFLARED = "/usr/local/bin/cloudflared"
+# 和 supervisor 侧、建实例脚本、polkit 规则同一条：实例名会拼进 ingress 的路径正则。
+INSTANCE_ID = re.compile(r"^(?:[a-z][a-z0-9_]{1,31}|[1-9][0-9]{4,10})$")
 
 
 class _Dumper(yaml.SafeDumper):
@@ -28,9 +31,9 @@ class _Dumper(yaml.SafeDumper):
         return super().increase_indent(flow, False)
 
 
-def _rule_path(uin: str) -> str:
-    # 收尾用 (/|$)：只写 ^/i/<uin>/ 的话，不带尾斜杠的访问会漏给主实例。
-    return f"^/i/{uin}(/|$)"
+def _rule_path(instance: str) -> str:
+    # 收尾用 (/|$)：只写 ^/i/<实例名>/ 的话，不带尾斜杠的访问会漏给主实例。
+    return f"^/i/{instance}(/|$)"
 
 
 def _load(config: Path) -> dict[str, Any]:
@@ -41,7 +44,7 @@ def _load(config: Path) -> dict[str, Any]:
 
 
 def _base_hostname(rules: list[Any], base_port: int) -> str:
-    """主实例那条规则的域名。几个号共用它，只按路径分流。"""
+    """主实例那条规则的域名。几个实例共用它，只按路径分流。"""
     wanted = {f"http://localhost:{base_port}", f"http://127.0.0.1:{base_port}"}
     for rule in rules:
         if isinstance(rule, dict) and rule.get("service") in wanted and rule.get("hostname"):
@@ -86,12 +89,12 @@ def _reload(config: Path, backup: Path) -> None:
     raise SystemExit("cloudflared 重载失败，已回滚到备份并重启")
 
 
-def add(config: Path, uin: str, port: int, base_port: int) -> None:
+def add(config: Path, instance: str, port: int, base_port: int) -> None:
     doc = _load(config)
     rules: list[Any] = doc["ingress"]
-    path = _rule_path(uin)
+    path = _rule_path(instance)
     if any(isinstance(r, dict) and r.get("path") == path for r in rules):
-        print(f"    /i/{uin} 的规则已存在，跳过")
+        print(f"    /i/{instance} 的规则已存在，跳过")
         return
 
     hostname = _base_hostname(rules, base_port)
@@ -105,38 +108,38 @@ def add(config: Path, uin: str, port: int, base_port: int) -> None:
         rules.insert(max(len(rules) - 1, 0), entry)
 
     _write_checked(config, doc)
-    print(f"    {hostname}/i/{uin}/ → localhost:{port}")
+    print(f"    {hostname}/i/{instance}/ → localhost:{port}")
 
 
-def remove(config: Path, uin: str) -> None:
+def remove(config: Path, instance: str) -> None:
     doc = _load(config)
-    path = _rule_path(uin)
+    path = _rule_path(instance)
     kept = [r for r in doc["ingress"] if not (isinstance(r, dict) and r.get("path") == path)]
     if len(kept) == len(doc["ingress"]):
-        print(f"    /i/{uin} 没有对应规则，跳过")
+        print(f"    /i/{instance} 没有对应规则，跳过")
         return
     doc["ingress"] = kept
     _write_checked(config, doc)
-    print(f"    已摘掉 /i/{uin}")
+    print(f"    已摘掉 /i/{instance}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("add", "remove"))
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument("--uin", required=True)
+    parser.add_argument("--instance", required=True)
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--base-port", type=int, default=8765)
     args = parser.parse_args()
 
-    if not args.uin.isdigit():
-        raise SystemExit("uin 必须是纯数字")
+    if not INSTANCE_ID.match(args.instance) or args.instance == "stickers":
+        raise SystemExit("实例名不合法")
     if args.action == "add":
         if not 1024 < args.port < 65536:
             raise SystemExit("port 不合法")
-        add(args.config, args.uin, args.port, args.base_port)
+        add(args.config, args.instance, args.port, args.base_port)
     else:
-        remove(args.config, args.uin)
+        remove(args.config, args.instance)
 
 
 if __name__ == "__main__":

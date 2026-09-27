@@ -33,6 +33,8 @@ HOOK_CONSOLE_SCHEMA = "console_schema"
 HOOK_KNOWN_ACCOUNTS = "known_accounts"
 # 模块提供 account_ops(workspace_root)，约定见 platforms/account_ops.py；控制台的登录、切号、扫码都走它。
 HOOK_ACCOUNT_OPS = "account_ops"
+# 模块提供 instance_env(index, ports)：多开建新实例时，这个平台的进程要写进 .env 的那几行。
+HOOK_INSTANCE_ENV = "instance_env"
 
 # native 由驱动按平台 ID 渲染成真正的提及，text 只能写成「@名字」的文字。
 MENTION_NONE = "none"
@@ -187,6 +189,24 @@ class PlatformCapabilities:
 
 
 @dataclass(frozen=True)
+class InstancePort:
+    """多开时每个实例各占一个的监听端口：序号 N 用 base + step * N。"""
+
+    name: str
+    base: int
+    step: int
+
+    def __post_init__(self) -> None:
+        if not _KEY_NAME.match(self.name):
+            raise ValueError(f"port name must be lower_snake_case: {self.name!r}")
+        if not 1024 < self.base < 65536 or self.step <= 0:
+            raise ValueError(f"port {self.name!r} needs a base above 1024 and a positive step")
+
+    def at(self, index: int) -> int:
+        return self.base + self.step * index
+
+
+@dataclass(frozen=True)
 class SecretField:
     """平台的一项密钥。值写在 data/config.yaml 的 platforms.<平台 id> 段或环境变量里，不进 config/。"""
 
@@ -258,6 +278,8 @@ class PlatformDescriptor:
     owned_files: tuple[str, ...] = ()
     # 记着真实号码、审批下允许修改的文件（glob）：只是不能经聊天外传。配置文件自动算在内。
     private_files: tuple[str, ...] = ()
+    # 多开时这个平台的进程在每个实例里要占的端口。序号 0 必须等于单实例部署原有的那组，已有部署才不用改端口。
+    instance_ports: tuple[InstancePort, ...] = ()
 
     def __post_init__(self) -> None:
         if not _KEY_NAME.match(self.id):
@@ -279,6 +301,9 @@ class PlatformDescriptor:
         secret_envs = [secret.env for secret in self.secrets if secret.env]
         if len(secret_envs) != len(set(secret_envs)):
             raise ValueError(f"duplicate secret env names in platform {self.id!r}")
+        port_names = [port.name for port in self.instance_ports]
+        if len(port_names) != len(set(port_names)):
+            raise ValueError(f"duplicate instance port names in platform {self.id!r}")
         for kind, patterns in (
             ("secret_files", self.secret_files),
             ("owned_files", self.owned_files),
@@ -295,7 +320,7 @@ class PlatformDescriptor:
         object.__setattr__(self, "state_files", MappingProxyType(dict(self.state_files)))
         object.__setattr__(self, "state_env", MappingProxyType(dict(self.state_env)))
         object.__setattr__(self, "hooks", MappingProxyType(dict(self.hooks)))
-        for name in ("secrets", "secret_files", "owned_files", "private_files"):
+        for name in ("secrets", "secret_files", "owned_files", "private_files", "instance_ports"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
 
     def _check_movable_file(self, what: str, path: str, env: str) -> None:

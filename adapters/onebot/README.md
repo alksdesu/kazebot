@@ -36,6 +36,7 @@ adapters/onebot/
 ├── account_ops.py               # 账号运维：经 NapCat WebUI 查询、切换、扫码登录，supervisor 按平台钩子加载
 ├── accounts.py                  # NapCat 在工作区里留下的、登录过的 QQ 号，离线迁移拿来认会话键
 ├── console_layout.py            # 控制台 QQ 页的分区布局
+├── provisioning.py              # 多开建新实例时 QQ 这一侧写进 .env 的几行
 ├── config.py                    # 环境变量配置
 ├── live_config.py               # config/qq.yaml 热载配置，通用键落到 config/features.yaml
 ├── send_contract.py             # QQ 目标身份与 NapCat 错误指纹，绑定共享的发送防重

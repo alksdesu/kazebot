@@ -1,11 +1,12 @@
 """平台账号运维与记忆归属搬迁：/v1/platforms/<id>/account…
 
-登录、切号、扫码由平台声明的 account_ops 模块实现，这里只转发、翻译错误、记审计；
+登录、切号、扫码由平台声明的 account_ops 模块实现，这里只转发、翻译错误、记审计，换上的号记进实例清单；
 搬迁算法在 deploy/migrate_qq_bot_scope.py，和离线脚本跑的是同一份。
 """
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sys
 import threading
 from pathlib import Path
@@ -18,14 +19,18 @@ from engine.conversation_migration import RekeyConflict
 from platforms.account_ops import AccountConflict, AccountOps, AccountOpsError, AccountRequestInvalid, AccountUnreachable
 from platforms.builtin import QQ_NAPCAT
 from platforms.descriptor import HOOK_ACCOUNT_OPS, PlatformDescriptor
+from platforms.ids import normalize_id
 from platforms.live import read_live_status
 from platforms.registry import platform_hook
 
 from .admin_api import verify_admin_token
 from .conversation_stores import ConversationStoreError, store_counts_payload
+from .instances import account_owner, record_account, url_prefix
 from .platform_api import resolve_platform
 from .state import SupervisorState
 from .types import AccountSwitchIn, QqQuickLoginIn
+
+_log = logging.getLogger(__name__)
 
 _MIGRATION_MODULE = "_supervisor_scope_migration"
 _MIGRATION_SCRIPT = Path(__file__).resolve().parents[1] / "deploy" / "migrate_qq_bot_scope.py"
@@ -78,15 +83,30 @@ async def account_status(ops: AccountOps) -> dict[str, Any]:
         raise _refusal(exc) from exc
 
 
+def _remember_account(state: SupervisorState, platform: PlatformDescriptor, account: Any) -> None:
+    """记进实例清单，别的实例据此拦着同一个号双登。记不上不影响已经切成的号。"""
+    text = str(account or "").strip()
+    try:
+        record_account(state.workspace_root, prefix=url_prefix(), platform_id=platform.id, account=text)
+    except OSError as exc:
+        _log.warning("实例清单没记上 %s 的新账号 %s：%s", platform.id, text, exc)
+
+
 async def switch_account(
     state: SupervisorState, platform: PlatformDescriptor, ops: AccountOps, account: str,
 ) -> dict[str, Any]:
+    target = normalize_id(account, platform.id_shape)
+    owner = account_owner(state.workspace_root, platform.id, target, prefix=url_prefix())
+    if owner is not None:
+        # 同一个号两边登，会互相把对方踢下线，数据也会分成两份。
+        raise HTTPException(status_code=409, detail=f"{target} 归实例 {owner['label']} 管，去它的控制台登录")
     try:
         result = await ops.switch(account)
     except AccountOpsError as exc:
         raise _refusal(exc) from exc
     # 换号等于换掉 bot 的身份，出事时必须查得到是谁在什么时候换的。
     _audit(state, "platform_account_switched", platform, account=result.get("account"), pinned=result.get("pinned"))
+    _remember_account(state, platform, result.get("account"))
     return result
 
 
@@ -110,11 +130,13 @@ async def relogin(state: SupervisorState, platform: PlatformDescriptor, ops: Acc
     return {"ok": True}
 
 
-async def pin_account(ops: AccountOps) -> dict[str, Any]:
+async def pin_account(state: SupervisorState, platform: PlatformDescriptor, ops: AccountOps) -> dict[str, Any]:
     try:
         account = await ops.pin()
     except AccountOpsError as exc:
         raise _refusal(exc) from exc
+    # 扫码登上的号只有这里说得清是哪个：控制台见到登录成功就来钉自动登录。
+    _remember_account(state, platform, account)
     return {"ok": True, "account": account}
 
 
@@ -291,8 +313,8 @@ def create_platform_account_router(state: SupervisorState, accounts: PlatformAcc
 
     @router.post("/{platform_id}/account/pin")
     async def post_pin(platform_id: str) -> dict[str, Any]:
-        _, ops = resolve(platform_id)
-        return await pin_account(ops)
+        platform, ops = resolve(platform_id)
+        return await pin_account(state, platform, ops)
 
     @router.get("/{platform_id}/account/scope")
     async def get_scope(
@@ -341,7 +363,7 @@ def create_legacy_qq_account_router(state: SupervisorState, accounts: PlatformAc
 
     @router.post("/v1/qq/account/pin")
     async def post_pin() -> dict[str, Any]:
-        return _named_uin(await pin_account(accounts.ops(QQ_NAPCAT)))
+        return _named_uin(await pin_account(state, QQ_NAPCAT, accounts.ops(QQ_NAPCAT)))
 
     @router.get("/v1/admin/qq/scope")
     async def get_scope(target: str = Query(""), source: str | None = Query(None)) -> dict[str, Any]:

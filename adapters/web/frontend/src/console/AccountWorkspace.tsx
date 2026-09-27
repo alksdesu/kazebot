@@ -1,5 +1,5 @@
 // 两件容易混的事：换这一个实例登录的号（下面的扫码与快速切换），和这台机器上
-// 同时跑着几个号（多开，各有各的进程与数据）。NapCat 只监听本机、且带自己的
+// 同时跑着几个 bot（多开，各有各的进程与数据）。NapCat 只监听本机、且带自己的
 // token，所有账号动作都由 supervisor 代转。
 import { useCallback, useEffect, useRef, useState } from 'react';
 import QRCode from 'qrcode';
@@ -12,6 +12,8 @@ import {
   getInstances,
   getPlatformAccount,
   getPlatformLoginQrcode,
+  instanceOwning,
+  isValidInstanceId,
   ownedByAnotherInstance,
   pinPlatformAccount,
   switchPlatformAccount,
@@ -20,6 +22,7 @@ import {
   type InstanceProgress,
   type QuickLoginTarget,
 } from '../api/supervisorClient';
+import { getPlatform } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
 import { AccountScope } from './AccountScope';
 import { Block, Button, Empty, Facts, Input, Panel, Pre } from './components';
@@ -40,6 +43,10 @@ const BODY = 'flex min-w-0 flex-1 flex-wrap items-center gap-2';
 const DESC = 'text-xs text-[var(--duties-secondary)]';
 
 const say = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+const accountsLine = (row: ConsoleInstance): string => Object.entries(row.accounts ?? {})
+  .map(([platformId, account]) => `${getPlatform(platformId)?.shortName ?? platformId} ${account}`)
+  .join('，');
 
 // 扫码登录、多开、记忆归属都得盯着 NapCat 的 WebUI 一路轮询，编不成 schema 字段。
 export const AccountWorkspaceSlot = () => {
@@ -83,8 +90,10 @@ interface InstanceManagementProps {
 }
 
 const InstanceManagement = ({ token, instances, loading, error, refresh }: InstanceManagementProps) => {
-  const [newUin, setNewUin] = useState('');
+  const platform = usePlatform();
+  const [newId, setNewId] = useState('');
   const [newLabel, setNewLabel] = useState('');
+  const [newAccount, setNewAccount] = useState('');
   const [job, setJob] = useState<InstanceProgress | null>(null);
   const [jobAction, setJobAction] = useState<'create' | 'remove'>('create');
   const [busy, setBusy] = useState(false);
@@ -95,7 +104,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
   const isCurrent = () => identity.isCurrent() && useSettingsStore.getState().adminToken === token;
   const running = job !== null && !job.finished;
   const locked = busy || running || loading || Boolean(error);
-  useUnsavedChanges(Boolean(newUin || newLabel), '新实例还没建立，切换或离开会丢失填好的信息，确定继续吗？');
+  useUnsavedChanges(Boolean(newId || newLabel || newAccount), '新实例还没建立，切换或离开会丢失填好的信息，确定继续吗？');
 
   useEffect(() => {
     if (!job || job.finished) return;
@@ -104,7 +113,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
     const timer = window.setInterval(() => {
       if (polling || !alive || !isCurrent()) return;
       polling = true;
-      void getInstanceProgress(token, job.uin).then(async next => {
+      void getInstanceProgress(token, job.id).then(async next => {
         if (!alive || !isCurrent()) return;
         setJob(next); setProgressError('');
         if (next.finished) await refresh();
@@ -117,33 +126,37 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
 
   const addInstance = async () => {
     if (!isCurrent() || mutation.current || locked) return;
-    const uin = newUin.trim();
-    if (!/^[1-9]\d{4,10}$/.test(uin)) { setNote('QQ 号要是 5-11 位数字'); return; }
-    if (instances.some(row => row.uin === uin)) { setNote('这个 QQ 号已有独立实例，请直接切换到它的控制台。'); return; }
-    if (!window.confirm(`给 ${uin} 建一套独立实例？\n\n会新建 NapCat 容器、systemd 服务和域名路由，约一两分钟。\n建好后要去它自己的控制台扫码登录，当前这个号不受影响。`)) return;
+    const id = newId.trim();
+    const account = newAccount.trim();
+    if (!isValidInstanceId(id)) { setNote('实例名要以小写字母开头，只用小写字母、数字和下划线，2-32 位'); return; }
+    if (instances.some(row => row.id === id)) { setNote('已经有叫这个名字的实例了，换一个。'); return; }
+    const owner = instanceOwning(platform.id, account, instances);
+    if (owner) { setNote(`这个 ${platform.shortName} 号已经归实例「${owner.label}」管了，请直接切换到它的控制台。`); return; }
+    const login = account ? `扫码登录 ${account}` : '扫码登录';
+    if (!window.confirm(`建一个新 bot「${id}」？\n\n会新建 NapCat 容器、systemd 服务和域名路由，约一两分钟。\n建好后要去它自己的控制台${login}，当前这个实例不受影响。`)) return;
     if (!isCurrent()) return;
     mutation.current = true; setBusy(true); setNote(''); setProgressError('');
     try {
-      const plan = await createInstance(token, uin, newLabel.trim());
+      const plan = await createInstance(token, id, newLabel.trim(), account ? { [platform.id]: account } : {});
       if (!isCurrent()) return;
-      setNewUin(''); setNewLabel(''); setJobAction('create');
-      setJob({ uin: plan.uin, lines: ['已请求建实例，等 root 侧接手…'], finished: false, ok: false, detail: '' });
+      setNewId(''); setNewLabel(''); setNewAccount(''); setJobAction('create');
+      setJob({ id: plan.id, lines: ['已请求建实例，等 root 侧接手…'], finished: false, ok: false, detail: '' });
     } catch (failure) { if (isCurrent()) setNote(say(failure)); }
     finally { mutation.current = false; if (isCurrent()) setBusy(false); }
   };
 
   const dropInstance = async (row: ConsoleInstance) => {
     if (!isCurrent() || mutation.current || locked || row.current || row.idx === 0) return;
-    const typed = window.prompt(`归档实例 ${row.label}（${row.uin}）？\n\n它的进程会停掉，NapCat 容器会被移除，工作区和聊天记录改名归档，不会直接删除。\n确认无误后可自行在服务器上清理。\n\n输入这个 QQ 号确认：`);
+    const typed = window.prompt(`归档实例 ${row.label}（${row.id}）？\n\n它的进程会停掉，NapCat 容器会被移除，工作区和聊天记录改名归档，不会直接删除。\n确认无误后可自行在服务器上清理。\n\n输入这个实例名确认：`);
     if (typed === null) return;
-    if (typed.trim() !== row.uin) { setNote('输入的号对不上，没有执行'); return; }
+    if (typed.trim() !== row.id) { setNote('输入的实例名对不上，没有执行'); return; }
     if (!isCurrent()) return;
     mutation.current = true; setBusy(true); setNote(''); setProgressError('');
     try {
-      await deleteInstance(token, row.uin);
+      await deleteInstance(token, row.id);
       if (!isCurrent()) return;
       setJobAction('remove');
-      setJob({ uin: row.uin, lines: ['已请求停服与归档…'], finished: false, ok: false, detail: '' });
+      setJob({ id: row.id, lines: ['已请求停服与归档…'], finished: false, ok: false, detail: '' });
     } catch (failure) { if (isCurrent()) setNote(say(failure)); }
     finally { mutation.current = false; if (isCurrent()) setBusy(false); }
   };
@@ -157,12 +170,13 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
     {error && <p role="alert" className="mb-3 text-sm text-[var(--duties-danger)]">{error}</p>}
     <Panel>
       {!loading && !error && !instances.length && <Facts>
-        还没启用多开。在服务器上执行一次 <code>sudo deploy/install_provision.sh &lt;当前QQ号&gt;</code>，之后这里就能直接加号。
+        还没启用多开。在服务器上执行一次 <code>sudo deploy/install_provision.sh &lt;主实例名&gt; &lt;当前{platform.shortName}号&gt;</code>，之后这里就能直接建实例。
       </Facts>}
-      {instances.map(row => <div className={ROW} key={row.uin}>
+      {instances.map(row => <div className={ROW} key={row.id}>
         <span className="flex min-w-0 flex-col">
           <strong className="break-all text-sm font-medium">{row.label}</strong>
-          <code className={DESC}>{row.uin}</code>
+          <code className={DESC}>{row.id}</code>
+          {accountsLine(row) && <span className={DESC}>{accountsLine(row)}</span>}
         </span>
         <div className={BODY}>
           {row.current ? <span className={DESC}>当前实例</span> : <>
@@ -173,14 +187,18 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
       </div>)}
       {instances.length > 0 && <div className="mt-4 space-y-3 border-t border-[var(--duties-border)] pt-4">
         <label className="flex min-w-0 flex-col gap-1 text-sm">
-          新实例 QQ 号
-          <Input aria-label="新实例 QQ 号" disabled={locked} inputMode="numeric" onChange={event => setNewUin(event.target.value)} placeholder="QQ 号" value={newUin} width="wide" />
+          新实例名
+          <Input aria-label="新实例名" disabled={locked} onChange={event => setNewId(event.target.value)} placeholder="小写字母开头，比如 xiaoyu" value={newId} width="wide" />
         </label>
         <label className="flex min-w-0 flex-col gap-1 text-sm">
           实例备注
           <Input aria-label="实例备注" disabled={locked} onChange={event => setNewLabel(event.target.value)} placeholder="备注，可留空" value={newLabel} width="wide" />
         </label>
-        <Button disabled={locked || !newUin.trim()} onClick={() => void addInstance()} tone="quiet">建实例</Button>
+        <label className="flex min-w-0 flex-col gap-1 text-sm">
+          要登录的 {platform.shortName} 号
+          <Input aria-label={`新实例要登录的 ${platform.shortName} 号`} disabled={locked} inputMode="numeric" onChange={event => setNewAccount(event.target.value)} placeholder="可留空，登录后自动记上" value={newAccount} width="wide" />
+        </label>
+        <Button disabled={locked || !newId.trim()} onClick={() => void addInstance()} tone="quiet">建实例</Button>
       </div>}
       {note && <p role="alert" className="mt-3 text-sm text-[var(--duties-danger)]">{note}</p>}
       {job && <>
@@ -318,7 +336,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
   };
 
   const switchTo = async (target: QuickLoginTarget) => {
-    if (!isCurrent() || mutation.current || !ownershipReady || stage !== 'idle' || target.available === false || target.account === status?.account || ownedByAnotherInstance(target.account, instances)) return;
+    if (!isCurrent() || mutation.current || !ownershipReady || stage !== 'idle' || target.available === false || target.account === status?.account || ownedByAnotherInstance(platformId, target.account, instances)) return;
     const who = target.nick ? `${target.nick}（${target.account}）` : target.account;
     if (!window.confirm(`切换到 ${who}？当前账号会下线，会话和长期记忆各号各算。`)) return;
     if (!isCurrent()) return;
@@ -460,7 +478,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
             status.quick_login.map((target) => {
               const current = target.account === status.account;
               const usable = target.available !== false;
-              const elsewhere = ownedByAnotherInstance(target.account, instances);
+              const elsewhere = ownedByAnotherInstance(platformId, target.account, instances);
               return (
                 <div className={ROW} key={target.account}>
                   <span className="flex min-w-0 flex-none items-center gap-2">

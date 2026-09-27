@@ -1,7 +1,7 @@
 // [2026-05-16] Updated: tests for real Supervisor API client signatures.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, decideApproval, getAllToolNames, fetchActiveTasks, cancelTask, enterPlatformLoginMode, getAccountScope, getPlatformAccount, getPlatformLoginQrcode, migrateAccountScope, pinPlatformAccount, switchPlatformAccount } from '../api/supervisorClient';
+import { postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, createInstance, decideApproval, deleteInstance, getAllToolNames, fetchActiveTasks, cancelTask, enterPlatformLoginMode, getAccountScope, getInstanceProgress, getPlatformAccount, getPlatformLoginQrcode, migrateAccountScope, pinPlatformAccount, switchPlatformAccount } from '../api/supervisorClient';
 
 function stubFetch(body: unknown = {}) {
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(body), {
@@ -225,6 +225,47 @@ describe('Platform account client', () => {
     expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method, init?.body])).toEqual([
       ['/v1/platforms/qq/account/scope/migrate', 'POST', '{"target":"20002"}'],
       ['/v1/platforms/qq/account/scope/migrate', 'POST', '{"target":"20002","source":""}'],
+    ]);
+  });
+});
+
+describe('Instance provisioning client', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('names the new instance by id and carries its platform accounts', async () => {
+    const plan = {
+      id: 'xiaoyu', label: '小鱼', idx: 2, prefix: '/i/xiaoyu',
+      ports: { napcat: 6103 }, workspace: '/srv/xiaoyu', accounts: { qq: '1000000002' },
+    };
+    const fetchMock = stubFetch(plan);
+
+    await expect(createInstance('secret-token', 'xiaoyu', '小鱼', { qq: '1000000002' })).resolves.toEqual(plan);
+    expect(fetchMock).toHaveBeenCalledWith('/v1/instances', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer secret-token', 'Content-Type': 'application/json' },
+      body: '{"id":"xiaoyu","label":"小鱼","accounts":{"qq":"1000000002"}}',
+    });
+  });
+
+  it('sends an empty account map when the new instance claims no account yet', async () => {
+    const fetchMock = stubFetch();
+
+    await createInstance('secret-token', 'xiaoyu', '', {});
+
+    expect(fetchMock.mock.calls.map(([, init]) => init?.body)).toEqual(['{"id":"xiaoyu","label":"","accounts":{}}']);
+  });
+
+  it('escapes the instance id in the progress and archive paths', async () => {
+    const fetchMock = stubFetch();
+
+    await getInstanceProgress('secret-token', 'a b/c');
+    await deleteInstance('secret-token', 'a b/c');
+
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method])).toEqual([
+      ['/v1/instances/a%20b%2Fc/progress', undefined],
+      ['/v1/instances/a%20b%2Fc', 'DELETE'],
     ]);
   });
 });

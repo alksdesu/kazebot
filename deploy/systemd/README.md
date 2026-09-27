@@ -2,14 +2,14 @@
 
 This directory contains optional systemd unit templates for a Debian deployment under `/opt/Clonoth`.
 
-## Multi-account templates
+## Multi-instance templates
 
-`kazebot@.service` and `kazebot-qq@.service` run one QQ account per instance, all sharing a single checkout. The instance name is the uin; the workspace is `/opt/kazebot-data/<uin>`. Use `deploy/new_instance.sh <uin> <index>` to lay out a workspace, then:
+`kazebot@.service` and `kazebot-qq@.service` run one bot per instance, all sharing a single checkout; platform accounts such as the QQ login belong to the instance. The instance name is the instance id (a lowercase slug, or the QQ number for instances created before ids existed); the workspace is `/opt/kazebot-data/<id>`. `deploy/new_instance.sh <id> [label] [qq]` lays out the workspace and hands the rest to `kazebot-provision@<id>`, which installs and enables these units. To do it by hand:
 
 ```bash
 sudo cp deploy/systemd/kazebot@.service deploy/systemd/kazebot-qq@.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now kazebot@<uin> kazebot-qq@<uin>
+sudo systemctl enable --now kazebot@<id> kazebot-qq@<id>
 ```
 
 See `deploy/MULTI-ACCOUNT.md` for ports, NapCat containers, and the shared console.

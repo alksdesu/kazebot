@@ -79,9 +79,14 @@ def test_other_sites_are_untouched(config: Path, calls: list[Any]) -> None:
 
 
 def test_path_pattern_also_matches_without_the_trailing_slash(config: Path, calls: list[Any]) -> None:
-    # 只写 ^/i/<uin>/ 的话，访问 /i/<uin> 会漏给主实例，看起来像是切换失败。
-    ingress.add(config, "1000000002", 8775, 8765)
-    assert next(r for r in _rules(config) if r.get("path"))["path"] == "^/i/1000000002(/|$)"
+    # 只写 ^/i/<实例名>/ 的话，访问 /i/<实例名> 会漏给主实例，看起来像是切换失败。
+    ingress.add(config, "koki", 8775, 8765)
+    assert next(r for r in _rules(config) if r.get("path"))["path"] == "^/i/koki(/|$)"
+
+
+@pytest.mark.parametrize("instance", ["koki", "bot_2", "1000000002"])
+def test_the_rule_path_is_anchored_on_the_instance_name(instance: str) -> None:
+    assert ingress._rule_path(instance) == f"^/i/{instance}(/|$)"
 
 
 def test_adding_twice_is_a_no_op(config: Path, calls: list[Any]) -> None:
@@ -167,3 +172,57 @@ def test_reload_prefers_reload_over_restart(config: Path, calls: list[list[str]]
     systemctl = [c for c in calls if c and c[0] == "systemctl"]
     assert systemctl and systemctl[0][1] == "reload"
     assert not any(c[1] == "restart" for c in systemctl)
+
+
+# ── 实例名 ──
+# 这个脚本跑在 root 侧，实例名会拼进落盘的 ingress 路径正则；宽一格就是一条提权面。
+
+@pytest.mark.parametrize("instance", ["koki", "bot_2", "ab", "x" * 32, "1000000002", "12345678901"])
+def test_a_plausible_instance_name_passes(instance: str) -> None:
+    assert ingress.INSTANCE_ID.match(instance)
+
+
+@pytest.mark.parametrize("bad", [
+    "", "a", "1234", "0123456", "1abc", "Koki", "bot-2", "x" * 33, "1234567890123",
+    "koki/../rong", "koki|rong", "koki(/|$)", "koki\nrong", "12345 67890", "12345$(id)",
+])
+def test_a_bad_instance_name_never_matches(bad: str) -> None:
+    assert not ingress.INSTANCE_ID.match(bad)
+
+
+@pytest.mark.parametrize("instance", ["Koki", "bot-2", "stickers", "../rong", ""])
+def test_the_entry_point_refuses_a_name_it_should_not_touch(
+    config: Path, calls: list[Any], monkeypatch: pytest.MonkeyPatch, instance: str,
+) -> None:
+    # stickers 是数据根下的共享表情包库，不是实例。
+    monkeypatch.setattr(
+        "sys.argv",
+        ["cloudflared_ingress.py", "add", "--config", str(config), "--instance", instance, "--port", "8775"],
+    )
+    with pytest.raises(SystemExit, match="实例名不合法"):
+        ingress.main()
+    assert calls == []
+
+
+@pytest.mark.parametrize("port", ["0", "80", "1024", "65536", "99999"])
+def test_the_entry_point_refuses_a_port_outside_the_unprivileged_range(
+    config: Path, calls: list[Any], monkeypatch: pytest.MonkeyPatch, port: str,
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        ["cloudflared_ingress.py", "add", "--config", str(config), "--instance", "koki", "--port", port],
+    )
+    with pytest.raises(SystemExit, match="port 不合法"):
+        ingress.main()
+    assert calls == []
+
+
+def test_the_entry_point_routes_a_good_name_through(
+    config: Path, calls: list[Any], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        ["cloudflared_ingress.py", "add", "--config", str(config), "--instance", "koki", "--port", "8775"],
+    )
+    ingress.main()
+    assert next(r for r in _rules(config) if r.get("path"))["path"] == "^/i/koki(/|$)"

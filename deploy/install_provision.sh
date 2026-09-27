@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# 一次性安装：把 root 侧的建号组件放到 kazebot 写不到的地方，并让主实例认得清单。
+# 一次性安装：把 root 侧的建实例组件放到 kazebot 写不到的地方，并让主实例认得清单。
 #
-# 用法: sudo deploy/install_provision.sh <主实例QQ号>
-# 改过 provision_instance.sh / cloudflared_ingress.py / systemd 模板后要重跑一遍 ——
-# git 更新的是 /opt/kazebot 里的源，不会自动同步到 /usr/local/lib。
+# 用法: sudo deploy/install_provision.sh <主实例名> [主实例QQ号]
+# 主实例名写成 QQ 号（老习惯）又没另给 QQ 号时，它就是主实例的 QQ 号。
+# 改过 provision_instance.sh / cloudflared_ingress.py / polkit 规则 / systemd 模板后要重跑一遍 ——
+# git 更新的是 /opt/kazebot 里的源，不会自动同步到 /usr/local/lib 和 /etc。
 set -euo pipefail
 
 REPO="${KAZEBOT_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -12,8 +13,13 @@ LIB=/usr/local/lib/kazebot
 OWNER=kazebot
 
 [ "$(id -u)" -eq 0 ] || { echo "要 root" >&2; exit 1; }
-MAIN_UIN="${1:-}"
-[[ "$MAIN_UIN" =~ ^[1-9][0-9]{4,10}$ ]] || { echo "用法: $0 <主实例QQ号>" >&2; exit 2; }
+MAIN="${1:-}"
+MAIN_QQ="${2:-}"
+[[ "$MAIN" =~ ^([a-z][a-z0-9_]{1,31}|[1-9][0-9]{4,10})$ ]] || { echo "用法: $0 <主实例名> [主实例QQ号]" >&2; exit 2; }
+# 数据根下的共享表情包库占着这个名字。
+[ "$MAIN" != stickers ] || { echo "实例名不能叫 stickers" >&2; exit 2; }
+if [[ -z "$MAIN_QQ" && "$MAIN" =~ ^[0-9]+$ ]]; then MAIN_QQ="$MAIN"; fi
+[[ -z "$MAIN_QQ" || "$MAIN_QQ" =~ ^[0-9]+$ ]] || { echo "QQ 号必须是数字" >&2; exit 2; }
 
 echo "==> 安装 root 侧组件到 $LIB"
 install -d -m 0755 -o root -g root "$LIB" "$LIB/units"
@@ -73,15 +79,21 @@ systemctl daemon-reload
 
 echo "==> 把主实例登记进清单"
 sudo -u "$OWNER" CLONOTH_INSTANCES_FILE="$DATA_ROOT/instances.yaml" \
-  "$REPO/.venv/bin/python" - "$REPO" "$MAIN_UIN" <<'PY'
+  "$REPO/.venv/bin/python" - "$REPO" "$MAIN" "$MAIN_QQ" <<'PY'
 import sys
 from pathlib import Path
 
 sys.path.insert(0, sys.argv[1])
+from platforms.builtin import QQ_NAPCAT
 from supervisor.instances import save_instance
+from supervisor.provisioning import normalize_accounts, validate_instance_id
 
-rows = save_instance(Path(sys.argv[1]), uin=sys.argv[2], label=f"主实例 {sys.argv[2]}", idx=0)
-print(f"    清单共 {len(rows)} 个号")
+instance_id = validate_instance_id(sys.argv[2])
+accounts = normalize_accounts({QQ_NAPCAT.id: sys.argv[3]} if sys.argv[3] else None)
+rows = save_instance(
+    Path(sys.argv[1]), instance_id=instance_id, label=f"主实例 {instance_id}", idx=0, accounts=accounts,
+)
+print(f"    清单共 {len(rows)} 个实例")
 PY
 
 echo "==> 重启主实例让 drop-in 生效"
@@ -89,10 +101,10 @@ systemctl restart kazebot
 
 cat <<EOF
 
-装好了。现在控制台的「多开实例」里就能直接建号。
+装好了。现在控制台的「多开实例」里就能直接建实例。
 
 自检：
   systemctl show kazebot -p ReadWritePaths | tr ' ' '\n' | grep kazebot-data
-  sudo -u $OWNER systemctl start kazebot-provision@$MAIN_UIN   # 应当被 polkit 放行（会报工作区已存在）
+  sudo -u $OWNER systemctl start kazebot-provision@$MAIN   # 应当被 polkit 放行（会报工作区已存在）
   sudo -u $OWNER systemctl start sshd                          # 应当被拒绝
 EOF

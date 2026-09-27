@@ -174,9 +174,11 @@ class OperationsService:
 
     def instances(self) -> list[dict[str, Any]]:
         rows = load_instances(self.root)
+        prefix = url_prefix()
         if not rows:
-            rows = [{"uin": "current", "label": "当前实例", "path": url_prefix(), "idx": 0}]
-        return [{**row, "current": row["path"] == url_prefix()} for row in rows]
+            # 和读清单时一样：序号 0 占站点根，带前缀的推不出序号，标 -1。
+            rows = [{"id": "current", "label": "当前实例", "path": prefix, "idx": 0 if not prefix else -1, "accounts": {}}]
+        return [{**row, "current": row["path"] == prefix} for row in rows]
 
     async def diagnose(self, *, test_model: bool = False, include_logs: bool = False) -> dict[str, Any]:
         if self._probe_lock.locked():

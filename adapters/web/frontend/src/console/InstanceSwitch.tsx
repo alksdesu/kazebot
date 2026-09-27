@@ -1,4 +1,4 @@
-// 账号切换器。多开时几个号各是一套独立后端，共用域名、各挂一个路径前缀。
+// 实例切换器。多开时几个 bot 各是一套独立后端，共用域名、各挂一个路径前缀。
 import type { ComponentProps } from 'react';
 
 import { instanceConsoleHref, MOUNT, type ConsoleInstance } from '../api/supervisorClient';
@@ -31,7 +31,7 @@ export const InstanceSwitch = ({ rows }: { rows: ConsoleInstance[] }) => {
         width="alias"
       >
         {rows.map((row) => (
-          <option key={row.uin} value={row.path}>{row.label}</option>
+          <option key={row.id} value={row.path}>{row.label}</option>
         ))}
       </Select>
     </label>

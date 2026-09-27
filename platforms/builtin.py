@@ -8,6 +8,7 @@ from .descriptor import (
     CHANNEL_PRIVATE,
     HOOK_ACCOUNT_OPS,
     HOOK_CONSOLE_SCHEMA,
+    HOOK_INSTANCE_ENV,
     HOOK_KNOWN_ACCOUNTS,
     HOOK_TRIGGER_POLICY,
     ID_NUMERIC,
@@ -19,6 +20,7 @@ from .descriptor import (
     STATE_ROUTES,
     ChannelDescriptor,
     ImageSupport,
+    InstancePort,
     PlatformCapabilities,
     PlatformDescriptor,
     SecretField,
@@ -61,6 +63,7 @@ QQ_NAPCAT = PlatformDescriptor(
         HOOK_CONSOLE_SCHEMA: "adapters.onebot.console_layout",
         HOOK_KNOWN_ACCOUNTS: "adapters.onebot.accounts",
         HOOK_ACCOUNT_OPS: "adapters.onebot.account_ops",
+        HOOK_INSTANCE_ENV: "adapters.onebot.provisioning",
     },
     # 按驱动现在做得到的填：NapCat 能撤回消息，但驱动没接，就不声明。
     # 字数上限不写死，由 output.message_limit 截断。
@@ -101,6 +104,12 @@ QQ_NAPCAT = PlatformDescriptor(
     # 别名双向表、会话哈希到真实群号的路由、真实 sender_id 的附件索引都在 onebot_* 里，
     # 写成前缀通配，以后再加一份状态文件也默认护住。快捷登录状态由真实的切号结果推出来，只有 supervisor 该写。
     owned_files=("data/onebot_*", "data/cache/onebot_*", "data/qq_dead_logins.json"),
+    # 依次是 NoneBot 收反向 WS、qq_forward 转发桥、NapCat WebUI 的端口。
+    instance_ports=(
+        InstancePort("bot", 8080, 10),
+        InstancePort("bridge", 8769, 10),
+        InstancePort("napcat", 6099, 100),
+    ),
 )
 
 BUILTIN_PLATFORMS: tuple[PlatformDescriptor, ...] = (QQ_NAPCAT,)

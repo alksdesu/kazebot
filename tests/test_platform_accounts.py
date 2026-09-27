@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from typing import Any, Iterator
 
 import httpx
 import pytest
+import yaml
 from fastapi import FastAPI
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -190,6 +192,26 @@ def call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hook: _Hook):
         return asyncio.run(go())
 
     return request
+
+
+@pytest.fixture
+def roster(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """两个实例共用一份清单，本控制台是挂在 /i/koki 下的那个。"""
+    path = tmp_path / "instances.yaml"
+    path.write_text(
+        "instances:\n"
+        f"  - {{id: rong, label: 主号, path: '', idx: 0, accounts: {{qq: '{_ACCOUNT}'}}}}\n"
+        "  - {id: koki, label: 小号, path: /i/koki, idx: 1}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CLONOTH_INSTANCES_FILE", str(path))
+    monkeypatch.setenv("CLONOTH_URL_PREFIX", "/i/koki")
+    return path
+
+
+def _roster_accounts(path: Path) -> dict[str, dict[str, str]]:
+    rows = yaml.safe_load(path.read_text(encoding="utf-8"))["instances"]
+    return {row["id"]: row.get("accounts") or {} for row in rows}
 
 
 @pytest.fixture
@@ -389,6 +411,82 @@ class TestPinAccount:
         response = call("POST", "/v1/platforms/qq/account/pin")
 
         assert response.status_code == 409 and response.json()["detail"] == "当前没有登录任何账号"
+
+
+class TestAccountOwnership:
+    """一个号只能归一个实例。两边同时登会互相把对方踢下线，数据也会分成两份。"""
+
+    @pytest.mark.parametrize("url,payload", [
+        ("/v1/platforms/qq/account/switch", {"account": _ACCOUNT}),
+        ("/v1/qq/account/quick-login", {"uin": _ACCOUNT}),
+    ])
+    def test_a_number_another_instance_holds_is_a_conflict(
+        self, call, ops: _FakeOps, roster: Path, url: str, payload: dict[str, str],
+    ) -> None:
+        response = call("POST", url, json=payload)
+
+        assert response.status_code == 409
+        # 说清楚去哪台控制台登，不然只能挨个实例翻。
+        assert response.json()["detail"] == f"{_ACCOUNT} 归实例 主号 管，去它的控制台登录"
+        assert ops.calls == []
+
+    def test_the_requested_number_is_normalised_before_the_lookup(
+        self, call, ops: _FakeOps, roster: Path,
+    ) -> None:
+        # 前端表单里粘进来的号常带空白，不规范化就绕过了归属检查。
+        assert call("POST", "/v1/platforms/qq/account/switch", json={"account": f"  {_ACCOUNT} "}).status_code == 409
+        assert ops.calls == []
+
+    def test_the_number_this_instance_already_holds_can_be_relogged(
+        self, call, ops: _FakeOps, roster: Path,
+    ) -> None:
+        roster.write_text(
+            f"instances:\n  - {{id: koki, label: 小号, path: /i/koki, idx: 1, accounts: {{qq: '{_OTHER}'}}}}\n",
+            encoding="utf-8",
+        )
+
+        assert call("POST", "/v1/platforms/qq/account/switch", json={"account": _OTHER}).status_code == 200
+
+    @pytest.mark.parametrize("url,payload", [
+        ("/v1/platforms/qq/account/switch", {"account": _OTHER}),
+        ("/v1/qq/account/quick-login", {"uin": _OTHER}),
+    ])
+    def test_a_switch_lands_on_this_instance_row(
+        self, call, ops: _FakeOps, roster: Path, url: str, payload: dict[str, str],
+    ) -> None:
+        assert call("POST", url, json=payload).status_code == 200
+        assert _roster_accounts(roster) == {"rong": {"qq": _ACCOUNT}, "koki": {"qq": _OTHER}}
+
+    @pytest.mark.parametrize("url", ["/v1/platforms/qq/account/pin", "/v1/qq/account/pin"])
+    def test_pinning_records_the_number_that_was_scanned_in(
+        self, call, ops: _FakeOps, roster: Path, url: str,
+    ) -> None:
+        # 扫码登上的号只有钉自动登录这一步说得清是哪个。
+        ops.outcomes["pin"] = _OTHER
+
+        assert call("POST", url).status_code == 200
+        assert _roster_accounts(roster)["koki"] == {"qq": _OTHER}
+
+    @pytest.mark.parametrize("url,payload", [
+        ("/v1/platforms/qq/account/switch", {"account": _OTHER}),
+        ("/v1/platforms/qq/account/pin", None),
+    ])
+    def test_a_roster_that_cannot_be_written_does_not_undo_the_switch(
+        self, call, ops: _FakeOps, roster: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture, url: str, payload: dict[str, str] | None,
+    ) -> None:
+        # 号已经换过去了，记不上清单只是别的实例少一道拦截，不能反过来报失败。
+        def refuse(*_args: Any, **_kwargs: Any) -> bool:
+            raise OSError("清单所在的盘满了")
+
+        monkeypatch.setattr(platform_accounts, "record_account", refuse)
+
+        with caplog.at_level(logging.WARNING, logger="supervisor.platform_accounts"):
+            response = call("POST", url, json=payload) if payload else call("POST", url)
+
+        assert response.status_code == 200
+        assert [record.message for record in caplog.records if record.levelno == logging.WARNING]
+        assert "清单所在的盘满了" in caplog.text
 
 
 class TestLegacyQqRoutes:

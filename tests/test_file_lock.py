@@ -201,7 +201,7 @@ class TestCallers:
         path = instances_file(tmp_path)
         holder = hold(path.with_name(f"{path.name}.lock"))
 
-        thread, done = _in_thread(lambda: save_instance(tmp_path, uin="10001", label="a", idx=1))
+        thread, done = _in_thread(lambda: save_instance(tmp_path, instance_id="10001", label="a", idx=1))
         assert not done.wait(0.5)
 
         holder.release()

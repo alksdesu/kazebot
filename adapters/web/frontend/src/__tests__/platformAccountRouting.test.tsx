@@ -8,6 +8,7 @@ import { AccountWorkspaceSlot } from '../console/AccountWorkspace';
 import { PlatformProvider } from '../console/platformContext';
 import { QQ_NAPCAT, type PlatformDescriptor } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
+import type { ConsoleInstance } from '../api/supervisorClient';
 
 const TELEGRAM: PlatformDescriptor = {
   id: 'telegram',
@@ -17,7 +18,11 @@ const TELEGRAM: PlatformDescriptor = {
   hasConfig: true,
 };
 
-const instances = [{ uin: '1000001', label: '主实例', path: '', current: true, idx: 0 }];
+const main: ConsoleInstance = { id: 'main', label: '主实例', path: '', current: true, idx: 0, accounts: { qq: '1000001' } };
+const other = (accounts: Record<string, string>): ConsoleInstance => ({
+  id: 'xiaoyu', label: '第二实例', path: '/i/xiaoyu', current: false, idx: 1, accounts,
+});
+let instances: ConsoleInstance[] = [main];
 const scope = { current_scope: '90001', live_scope: '', bot_alive: false, preview: null, ambiguous_sources: [] };
 const online = {
   configured: true, reachable: true, is_login: true, online: true, account: '1000001', nick: '当前机器人',
@@ -53,6 +58,7 @@ const inTelegram = (child: ReactNode) => render(<PlatformProvider platform={TELE
 
 beforeEach(() => {
   accountState = online;
+  instances = [main];
   useSettingsStore.setState({ adminToken: 'current-token', isAuthenticated: true });
   window.history.replaceState(null, '', '/web/?view=settings&tab=qq-account');
 });
@@ -100,6 +106,24 @@ describe('账号页的平台归属', () => {
     expect(within(quick).getByText('2000002')).toBeInTheDocument();
     expect(within(quick).getByRole('button', { name: '当前账号' })).toBeDisabled();
     expect(within(quick).getByRole('button', { name: '切到这个号' })).toBeEnabled();
+  });
+
+  it('别的实例在另一个平台上记着同一串号码，不算占用', async () => {
+    instances = [main, other({ qq: '2000002' })];
+    stubFetch();
+    inTelegram(<AccountWorkspaceSlot />);
+    const quick = (await screen.findByRole('heading', { name: '快速切换' })).closest('section')!;
+    expect(within(quick).getByRole('button', { name: '切到这个号' })).toBeEnabled();
+    expect(within(quick).queryByRole('link', { name: '去它的控制台' })).not.toBeInTheDocument();
+  });
+
+  it('本平台上被别的实例占着的号只给控制台入口', async () => {
+    instances = [main, other({ telegram: '2000002' })];
+    stubFetch();
+    inTelegram(<AccountWorkspaceSlot />);
+    const quick = (await screen.findByRole('heading', { name: '快速切换' })).closest('section')!;
+    expect(within(quick).getByRole('link', { name: '去它的控制台' })).toHaveAttribute('href', '/i/xiaoyu/web/?view=settings&tab=qq-account');
+    expect(within(quick).queryByRole('button', { name: '切到这个号' })).not.toBeInTheDocument();
   });
 
   it('切号请求带着 account 字段发给本平台', async () => {

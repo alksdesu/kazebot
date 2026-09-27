@@ -30,6 +30,7 @@ from platforms.descriptor import (  # noqa: E402
     STATE_LIVE,
     STATE_ROUTES,
     ChannelDescriptor,
+    InstancePort,
     PlatformDescriptor,
 )
 from platforms.registry import (  # noqa: E402
@@ -195,6 +196,45 @@ class TestRegistration:
         assert public["id"] == "qq" and public["has_config"] is True
         assert "config_env" not in public and "adapters._shared.trigger_policy" not in json.dumps(public)
         assert "state_env" not in public and "ONEBOT_STATE_FILE" not in json.dumps(public)
+        # 端口是部署细节，控制台按不上用场，露出去只是多告诉人一件事。
+        assert "instance_ports" not in public and "8080" not in json.dumps(public)
+
+
+class TestInstancePorts:
+    def test_a_port_steps_once_per_index(self) -> None:
+        port = InstancePort("bot", 8080, 10)
+        assert (port.at(0), port.at(1), port.at(8)) == (8080, 8090, 8160)
+
+    @pytest.mark.parametrize("name", ["Bot", "bot-2", "_bot", "2bot", "", "bot.web"])
+    def test_port_names_are_lower_snake_case(self, name: str) -> None:
+        # 端口名是 .env 里那几行的来源，也是清单和 shell 侧对账用的键。
+        with pytest.raises(ValueError, match="lower_snake_case"):
+            InstancePort(name, 8080, 10)
+
+    @pytest.mark.parametrize("base,step", [(80, 10), (1024, 10), (65536, 10), (70000, 10), (8080, 0), (8080, -10)])
+    def test_a_port_needs_an_unprivileged_base_and_a_forward_step(self, base: int, step: int) -> None:
+        # 1024 以下要 root 才能监听，步长不前进的话所有实例都落在同一个号上。
+        with pytest.raises(ValueError, match="positive step"):
+            InstancePort("bot", base, step)
+
+    def test_one_platform_cannot_claim_a_port_name_twice(self) -> None:
+        with pytest.raises(ValueError, match="duplicate instance port names"):
+            PlatformDescriptor(
+                id="x", display_name="X", short_name="X",
+                instance_ports=(InstancePort("bot", 8080, 10), InstancePort("bot", 9090, 10)),
+            )
+
+    def test_declared_ports_are_frozen_into_a_tuple(self) -> None:
+        platform = PlatformDescriptor(
+            id="x", display_name="X", short_name="X", instance_ports=[InstancePort("bot", 8080, 10)],
+        )
+        assert platform.instance_ports == (InstancePort("bot", 8080, 10),)
+
+    def test_qq_keeps_the_single_instance_ports_at_index_zero(self) -> None:
+        # 序号 0 必须等于改造前的单实例部署，已有部署才不用改端口。
+        assert {port.name: port.at(0) for port in QQ_NAPCAT.instance_ports} == {
+            "bot": 8080, "bridge": 8769, "napcat": 6099,
+        }
 
 
 class TestFilesAndHooks:

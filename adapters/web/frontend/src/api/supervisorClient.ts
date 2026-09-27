@@ -692,15 +692,17 @@ export interface AccountStatus {
   quick_login?: QuickLoginTarget[];
 }
 
-/** 一个后端实例 = 一个 QQ 号。多开时它们共用域名，各自挂在 path 下。 */
+/** 一个后端实例 = 一个 bot。多开时它们共用域名，各自挂在 path 下；平台账号是实例下的子项。 */
 export interface ConsoleInstance {
-  uin: string;
+  id: string;
   label: string;
   /** 挂载前缀，根实例为空串。 */
   path: string;
   current: boolean;
   /** 序号，决定端口。老清单没有这个字段时后端给 -1。 */
   idx?: number;
+  /** 各平台登记的账号，按平台 id。 */
+  accounts?: Record<string, string>;
 }
 
 /**
@@ -712,18 +714,28 @@ export function instanceConsoleHref(path: string): string {
   return `${path}/web/${window.location.search}`;
 }
 
+/** 清单里登记着这个号的实例，本实例也算。 */
+export function instanceOwning(
+  platformId: string,
+  account: string,
+  instances: ConsoleInstance[],
+): ConsoleInstance | null {
+  if (!account) return null;
+  return instances.find((row) => row.accounts?.[platformId] === account) ?? null;
+}
+
 /**
- * 这个号归不归别的实例管。归了就不能从本实例登过去 —— 同一个 QQ 双登，
+ * 这个号归不归别的实例管。归了就不能从本实例登过去 —— 同一个号双登，
  * 两边会互相把对方踢下线，数据也会分成两份。
  *
  * 清单为空（单实例，或读不到）时一律返回 null：宁可不拦，也不能把所有号都锁死。
  */
 export function ownedByAnotherInstance(
-  uin: string,
+  platformId: string,
+  account: string,
   instances: ConsoleInstance[],
 ): ConsoleInstance | null {
-  const owner = instances.find((row) => row.uin === uin);
-  return owner && !owner.current ? owner : null;
+  return instanceOwning(platformId, account, instances.filter((row) => !row.current));
 }
 
 export async function getInstances(token: string): Promise<ConsoleInstance[]> {
@@ -734,48 +746,59 @@ export async function getInstances(token: string): Promise<ConsoleInstance[]> {
 
 /** 新实例落点。序号决定端口，前缀决定它挂在域名的哪一层。 */
 export interface InstancePlan {
-  uin: string;
+  id: string;
   label: string;
   idx: number;
   prefix: string;
   ports: Record<string, number>;
   workspace: string;
+  accounts: Record<string, string>;
 }
 
-/** root 侧建号的实时进度。finished 之前一直轮询。 */
+/** root 侧建实例的实时进度。finished 之前一直轮询。 */
 export interface InstanceProgress {
-  uin: string;
+  id: string;
   lines: string[];
   finished: boolean;
   ok: boolean;
   detail: string;
 }
 
+// 和后端 provisioning 同一条规则，这里只为提前提示，以后端判定为准。
+const INSTANCE_ID = /^(?:[a-z][a-z0-9_]{1,31}|[1-9]\d{4,10})$/;
+// 数据根下的共享表情包库占着这个名字。
+const RESERVED_INSTANCE_IDS: ReadonlySet<string> = new Set(['stickers']);
+
+export function isValidInstanceId(id: string): boolean {
+  return INSTANCE_ID.test(id) && !RESERVED_INSTANCE_IDS.has(id);
+}
+
 export async function createInstance(
   token: string,
-  uin: string,
+  id: string,
   label: string,
+  accounts: Record<string, string>,
 ): Promise<InstancePlan> {
   const resp = await apiFetch('/instances', {
     method: 'POST',
     headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ uin, label }),
+    body: JSON.stringify({ id, label, accounts }),
   });
   return resp.json();
 }
 
 export async function getInstanceProgress(
   token: string,
-  uin: string,
+  id: string,
 ): Promise<InstanceProgress> {
-  const resp = await apiFetch(`/instances/${encodeURIComponent(uin)}/progress`, {
+  const resp = await apiFetch(`/instances/${encodeURIComponent(id)}/progress`, {
     headers: authHeaders(token),
   });
   return resp.json();
 }
 
-export async function deleteInstance(token: string, uin: string): Promise<void> {
-  await apiFetch(`/instances/${encodeURIComponent(uin)}`, {
+export async function deleteInstance(token: string, id: string): Promise<void> {
+  await apiFetch(`/instances/${encodeURIComponent(id)}`, {
     method: 'DELETE',
     headers: authHeaders(token),
   });
