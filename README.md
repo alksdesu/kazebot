@@ -247,21 +247,21 @@ docker logs --tail 50 napcat            # QQ 那边的日志
 
 更新代码用 `deploy/deploy.sh`：拉代码、按需重建前端、重启，最后**盯 90 秒确认 engine 真的起来了**。这一步不能省 —— supervisor 活着而 engine 没起来的时候，systemd 照样显示 running，从外面完全看不出问题。
 
-想再加几个号（最多 9 个）：
+想再多开几个实例（一台机器最多 9 个，一个实例登一个号）：
 
 ```bash
-sudo /opt/kazebot/deploy/install_provision.sh <第一个号的QQ号>
+sudo /opt/kazebot/deploy/install_provision.sh <主实例名> <主实例QQ号>
 ```
 
-跑完控制台「账号」页就多出「多开实例」，点两下加一个。
+主实例就是现在这一套，名字自己起；只给一个 QQ 号的老写法照旧能用，实例名就是那个号。跑完控制台「账号」页就多出「多开实例」，点两下加一个。
 
 ### 装完的样子
 
 ```
-/opt/kazebot/                 代码，同时也是第一个号的工作区
+/opt/kazebot/                 代码，同时也是主实例的工作区
 /opt/kazebot-data/
-  ├ stickers/                 几个号共用的表情包库
-  └ <QQ号>/                   多开时，第二个号起各自一个工作区
+  ├ stickers/                 几个实例共用的表情包库
+  └ <实例名>/                 多开时，其余实例各自一个工作区
 ```
 
 生产用 systemd，Docker 只拿来跑 NapCat。端口 `8765`（控制台）/ `8080`（NoneBot）/ `8769`（转发桥）/ `6099`（NapCat）全部只听本机，**防火墙只放 22 就够**。

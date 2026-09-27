@@ -44,6 +44,10 @@ INSTALLER = REPO_ROOT / "deploy" / "install_provision.sh"
 NEW_INSTANCE = REPO_ROOT / "deploy" / "new_instance.sh"
 CLOUDFLARED = REPO_ROOT / "deploy" / "cloudflared_ingress.py"
 POLKIT = REPO_ROOT / "deploy" / "polkit" / "49-kazebot-provision.rules"
+INSTALL_DOC = REPO_ROOT / "deploy" / "INSTALL.md"
+BOOTSTRAP = REPO_ROOT / "deploy" / "bootstrap.sh"
+README = REPO_ROOT / "README.md"
+README_EN = REPO_ROOT / "README.en.md"
 
 
 def _script_code(path: Path) -> str:
@@ -691,6 +695,45 @@ def test_the_command_line_entry_points_refuse_a_qq_number_that_is_not_digits(pat
     first_action = next(i for i, l in enumerate(lines) if l.startswith('echo "==> '))
     # 实例名是纯数字时那个号是推出来的，推完才轮到校验。
     assert inferred < guard < first_action
+
+
+_ZH_USAGE = "install_provision.sh <主实例名> <主实例QQ号>"
+_ZH_STALE = "<第一个号的QQ号>"
+
+
+@pytest.mark.parametrize(("path", "usage", "stale"), [
+    pytest.param(INSTALL_DOC, _ZH_USAGE, _ZH_STALE, id="INSTALL.md"),
+    pytest.param(BOOTSTRAP, _ZH_USAGE, _ZH_STALE, id="bootstrap.sh"),
+    pytest.param(README, _ZH_USAGE, _ZH_STALE, id="README.md"),
+    pytest.param(
+        README_EN,
+        "install_provision.sh <main instance name> <main instance QQ number>",
+        "<first account's QQ number>",
+        id="README.en.md",
+    ),
+])
+def test_the_multi_instance_hint_asks_for_the_instance_name_first(
+    path: Path, usage: str, stale: str,
+) -> None:
+    # 照着只给一个 QQ 号的写法跑，那串数字会被当成实例名，主实例就叫那个号了。
+    body = path.read_text(encoding="utf-8")
+
+    assert usage in body
+    assert stale not in body
+
+
+@pytest.mark.parametrize(("path", "workspace", "stale"), [
+    pytest.param(README, "<实例名>/", "<QQ号>/", id="README.md"),
+    pytest.param(README_EN, "<instance>/", "<uin>/", id="README.en.md"),
+])
+def test_the_layout_names_the_extra_workspaces_by_instance(
+    path: Path, workspace: str, stale: str,
+) -> None:
+    # 工作区目录按实例名建，示意图画成 QQ 号的话，多开之后照着找目录只会扑空。
+    body = path.read_text(encoding="utf-8")
+
+    assert workspace in body
+    assert stale not in body
 
 
 def test_the_installer_registers_the_main_instance_through_the_shared_validators() -> None:

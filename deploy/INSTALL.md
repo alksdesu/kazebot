@@ -96,13 +96,13 @@ docker logs --tail 100 napcat
 
 ## 之后
 
-**多开**（一台机器最多 9 个号）：
+**多开**（一台机器最多 9 个实例，一个实例登一个号）：
 
 ```bash
-sudo /opt/kazebot/deploy/install_provision.sh <第一个号的QQ号>
+sudo /opt/kazebot/deploy/install_provision.sh <主实例名> <主实例QQ号>
 ```
 
-跑完之后控制台「账号」页就有「多开实例」了，点两下加一个号。细节见 [MULTI-ACCOUNT.md](MULTI-ACCOUNT.md)。
+主实例就是现在这一套，名字自己起：小写字母开头，只含小写字母、数字和下划线，2-32 位。只给一个 QQ 号的老写法照旧能用，实例名就是那个号。跑完之后控制台「账号」页就有「多开实例」了，点两下加一个实例。细节见 [MULTI-ACCOUNT.md](MULTI-ACCOUNT.md)。
 
 **表情包库**的配置和排障见 [STICKERS.md](STICKERS.md)。
 

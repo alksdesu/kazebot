@@ -407,7 +407,7 @@ $(printf '\033[1;32m装好了。剩下的全在控制台里点。\033[0m')
   填完即时生效，不用重启。然后去群里 @ 它。
 
   之后：
-    想多开（最多 9 个号）    sudo $REPO/deploy/install_provision.sh <第一个号的QQ号>
+    想多开（最多 9 个实例）  sudo $REPO/deploy/install_provision.sh <主实例名> <主实例QQ号>
     更新代码                 sudo /usr/local/lib/kazebot/deploy.sh
     看日志                   journalctl -u kazebot -f
 

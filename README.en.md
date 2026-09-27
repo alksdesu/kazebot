@@ -252,21 +252,21 @@ If @-ing it in a group does nothing, the group almost certainly isn't in the all
 
 To update, run `deploy/deploy.sh`: it pulls, rebuilds the frontend if the lockfile changed, restarts, and **watches for 90 seconds to confirm the engine actually came up**. Don't skip that check — with supervisor alive and the engine dead, systemd still reports running and nothing looks wrong from the outside.
 
-To add more accounts (up to nine):
+To run more instances (up to nine per machine, one account each):
 
 ```bash
-sudo /opt/kazebot/deploy/install_provision.sh <first account's QQ number>
+sudo /opt/kazebot/deploy/install_provision.sh <main instance name> <main instance QQ number>
 ```
 
-After that the console's Account page grows a "multi-instance" section; adding one is two clicks.
+The main instance is the one you already have; you pick its name. The old form with only a QQ number still works, and that number becomes the instance name. After that the console's Account page grows a "multi-instance" section; adding one is two clicks.
 
 ### What you end up with
 
 ```
-/opt/kazebot/                 code, and also the first account's workspace
+/opt/kazebot/                 code, and also the main instance's workspace
 /opt/kazebot-data/
-  ├ stickers/                 sticker library shared across accounts
-  └ <uin>/                    one workspace per additional account
+  ├ stickers/                 sticker library shared across instances
+  └ <instance>/               one workspace per additional instance
 ```
 
 Production runs on systemd; Docker only hosts NapCat. Ports `8765` (console), `8080` (NoneBot), `8769` (forward bridge), and `6099` (NapCat) all listen on localhost only — **your firewall only needs to allow 22**.
