@@ -24,7 +24,14 @@ from .pseudo_tools import (
     _filter_tool_specs,
 )
 from .resume_builder import _build_resume_messages
-from .loop_state import _LoopState, _persist_ctx, _short, compact_target_session_id
+from .loop_state import (
+    TOOL_CONTEXT_EXTRA_ATTRS,
+    _LoopState,
+    _persist_ctx,
+    _short,
+    build_tool_context,
+    compact_target_session_id,
+)
 from .llm_call import _call_llm_with_retry, _build_failure_action, _is_retryable_error, _RETRYABLE_STATUS_CODES
 from .pseudo_handlers import _handle_pseudo_tool
 
@@ -735,10 +742,7 @@ def _snapshot_tool_context(tool_ctx: ToolContext) -> ToolContext:
     # 节点级动态属性。Purpose: 后台异步的 execute_command 回调仍保留原始工具调用的
     # 审批与产物身份，不会被后续同批次工具覆盖。
     snapshot = replace(tool_ctx)
-    for attr in (
-        "_node_id", "_node_extra", "_memory_subjects",
-        "_route_conversation_key", "_parent_conversation_key",
-    ):
+    for attr in TOOL_CONTEXT_EXTRA_ATTRS:
         if hasattr(tool_ctx, attr):
             setattr(snapshot, attr, getattr(tool_ctx, attr))
     return snapshot
@@ -1109,46 +1113,8 @@ async def _execute_real_tools(
         "task_id": ls.rctx.task_id,
     })
 
-    _tool_ctx = ToolContext(
-        supervisor_url=ls.rctx.supervisor_url,
-        session_id=ls.rctx.session_id,
-        run_id=ls.rctx.task_id or ls.run_id or ls.node.id,
-        worker_id=ls.rctx.worker_id,
-        workspace_root=ls.rctx.workspace_root,
-        http=ls.rctx.http,
-        registry=ls.registry,
-        task_id=ls.rctx.task_id,
-        session_generation=ls.rctx.session_generation,
-        # [Fork/Merge 2026-05-17] Why: real tools may call supervisor APIs while
-        # their node is running on a branch session. How: pass RunContext's parent
-        # route session into ToolContext. Purpose: tool events, approvals, and
-        # session-scoped built-ins stay attached to the durable user session.
-        parent_session_id=getattr(ls.rctx, "parent_session_id", "") or "",
-        conversation_key=str((getattr(ls.rctx, "task_context", None) or {}).get("conversation_key", "")).strip(),
-        platform_auth=dict((getattr(ls.rctx, "task_context", None) or {}).get("platform_auth") or {}),
-        # [AutoC 2026-05-31] Why: the context object is created before iterating
-        # individual real tool calls. How: initialize node_id here and set
-        # tool_call_id inside each loop iteration below. Purpose: approval requests
-        # made by built-in guards can carry the correct active tool identity.
-        node_id=ls.node.id,
-    )
-    # [2026-05-27 refactor] 传递通用节点上下文给插件层。
-    # 为什么：插件（如 save_memory）需要读取节点级配置（如 memory_book），
-    # 但不应让插件每次重新读取 yaml 文件。
-    # 怎么改：传递 node_id 和 node.extra dict，插件零 IO 从 extra 读取业务配置。
-    # 目的：引擎核心只提供通用上下文，不知道具体插件字段的存在。
-    _tool_ctx._node_id = ls.node.id  # type: ignore[attr-defined]
-    _tool_ctx._node_extra = ls.node.extra  # type: ignore[attr-defined]
-    # 注入了谁的跨会话档案，就得让记忆工具够得着那份档案 —— 否则模型只改 content
-    # 的一次更新会在会话 namespace 里新长一条，读的时候又被档案那份去重盖掉。
-    _tool_ctx._memory_subjects = list(  # type: ignore[attr-defined]
-        ((getattr(ls.rctx, "task_context", None) or {}).get("memory_hints") or {}).get("subjects") or []
-    )
-    # dispatch 子节点的运行期 conversation_key 是 agent:...（fresh/fork 还带 uuid）；
-    # 记忆工具要落到发起会话的 namespace，和注入侧算出同一个答案。
-    _tc = getattr(ls.rctx, "task_context", None) or {}
-    _tool_ctx._route_conversation_key = str(_tc.get("route_conversation_key") or "")  # type: ignore[attr-defined]
-    _tool_ctx._parent_conversation_key = str(_tc.get("parent_conversation_key") or "")  # type: ignore[attr-defined]
+    # 整批共用一个实例，每次调用前在循环里刷新 tool_call_id
+    _tool_ctx = build_tool_context(ls)
 
     _tool_entries: list[dict[str, Any]] = []
     _tool_atts: list[dict[str, Any]] = []

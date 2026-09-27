@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from toolbox.context import ToolContext
 from toolbox.registry import ToolRegistry
 from providers.base import BaseProvider
 from ..node import Node
@@ -167,6 +168,49 @@ def compact_target_session_id(ls: _LoopState) -> str:
     if child_sid:
         return child_sid
     return str(getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id or "").strip()
+
+
+# ToolContext 之外挂在实例上的节点级属性；后台快照要照这份清单一起复制
+TOOL_CONTEXT_EXTRA_ATTRS: tuple[str, ...] = (
+    "_node_id", "_node_extra", "_memory_subjects",
+    "_route_conversation_key", "_parent_conversation_key",
+)
+
+
+def build_tool_context(ls: _LoopState, *, tool_call_id: str = "") -> ToolContext:
+    """当前节点调工具、做策略判定用的 ToolContext；真工具和伪工具共用这一份。"""
+    task_context = getattr(ls.rctx, "task_context", None) or {}
+    ctx = ToolContext(
+        supervisor_url=ls.rctx.supervisor_url,
+        session_id=ls.rctx.session_id,
+        run_id=ls.rctx.task_id or ls.run_id or ls.node.id,
+        worker_id=ls.rctx.worker_id,
+        workspace_root=ls.rctx.workspace_root,
+        http=ls.rctx.http,
+        registry=ls.registry,
+        task_id=ls.rctx.task_id,
+        session_generation=ls.rctx.session_generation,
+        # 节点跑在入口分支上时，审批和工具事件要落到持久的主会话
+        parent_session_id=getattr(ls.rctx, "parent_session_id", "") or "",
+        conversation_key=str(task_context.get("conversation_key", "")).strip(),
+        platform_auth=dict(task_context.get("platform_auth") or {}),
+        # 审批卡按 tool_call_id 挂到对应的工具卡片上
+        tool_call_id=tool_call_id,
+        node_id=ls.node.id,
+    )
+    # 插件（如 save_memory）从 node.extra 读节点级配置，不必再读一遍 yaml
+    ctx._node_id = ls.node.id  # type: ignore[attr-defined]
+    ctx._node_extra = ls.node.extra  # type: ignore[attr-defined]
+    # 注入了谁的跨会话档案，就得让记忆工具够得着那份档案 —— 否则模型只改 content
+    # 的一次更新会在会话 namespace 里新长一条，读的时候又被档案那份去重盖掉。
+    ctx._memory_subjects = list(  # type: ignore[attr-defined]
+        (task_context.get("memory_hints") or {}).get("subjects") or []
+    )
+    # dispatch 子节点的运行期 conversation_key 是 agent:...（fresh/fork 还带 uuid）；
+    # 记忆工具要落到发起会话的 namespace，和注入侧算出同一个答案。
+    ctx._route_conversation_key = str(task_context.get("route_conversation_key") or "")  # type: ignore[attr-defined]
+    ctx._parent_conversation_key = str(task_context.get("parent_conversation_key") or "")  # type: ignore[attr-defined]
+    return ctx
 
 
 def _persist_ctx(ls: _LoopState, step_count: int) -> str:

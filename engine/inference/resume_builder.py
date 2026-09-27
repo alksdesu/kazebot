@@ -203,6 +203,8 @@ def _select_attachments(
     """Select attachments by path from collected, or read from disk as fallback.
 
     Disk fallback is restricted to paths under workspace_root for security.
+    It still reads any file in the workspace, so model-supplied paths must go
+    through screen_model_attachment_paths first.
     """
     if not isinstance(selected_paths, list) or not selected_paths:
         return collected

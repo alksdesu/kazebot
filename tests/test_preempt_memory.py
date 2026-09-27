@@ -179,7 +179,7 @@ async def test_sdk_api_and_engine_update_the_same_preempt_memory(
     state: SupervisorState, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from clonoth_sdk.client import ClonothClient
-    from engine.inference import ai_step
+    from engine.inference import ai_step, loop_state
     from supervisor.api import create_app
     from supervisor.config_store import ConfigStore
 
@@ -188,14 +188,14 @@ async def test_sdk_api_and_engine_update_the_same_preempt_memory(
     app = create_app(state=state, process_manager=None, config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"))
     loop = _loop(tmp_path, {})
     captured_contexts = []
-    original_context = ai_step.ToolContext
+    original_context = loop_state.ToolContext
 
     def capture_context(**kwargs):
         context = original_context(**kwargs)
         captured_contexts.append(context)
         return context
 
-    monkeypatch.setattr(ai_step, "ToolContext", capture_context)
+    monkeypatch.setattr(loop_state, "ToolContext", capture_context)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         sdk = ClonothClient("http://test")
         sdk._client = client

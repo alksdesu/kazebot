@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .resume_builder import _select_attachments
+from .attachment_access import RefusedAttachment, screen_model_attachment_paths
 from ..attachments import is_allowed_attachment_path
 from ..compact import _format_messages_for_summary
 from ..protocol import TaskAction, ACTION_ASK, ACTION_DISPATCH, ACTION_FINISH
@@ -34,7 +35,10 @@ logger = logging.getLogger(__name__)
 #  目的：让动态 dispatch 的附件行为保持不变。
 # ---------------------------------------------------------------------------
 def _paths_to_attachments(paths: list, workspace_root: Path) -> list[dict]:
-    """Convert workspace-relative file paths to attachment dicts for dispatch."""
+    """Convert workspace-relative file paths to attachment dicts for dispatch.
+
+    Model-supplied paths must go through screen_model_attachment_paths first.
+    """
     result = []
     for p in paths:
         p_str = str(p).strip()
@@ -113,6 +117,15 @@ def _reject_already_sent_dispatch_paths(ls: _LoopState, selected_paths: Any) -> 
     return []
 
 
+def _refusal_note(refused: list[RefusedAttachment]) -> str:
+    detail = "；".join(f"{item.path}（{item.reason}）" for item in refused)
+    return f"以下附件没有发出：{detail}"
+
+
+def _ok_with_refusals(refused: list[RefusedAttachment]) -> str:
+    return f"ok\n{_refusal_note(refused)}" if refused else "ok"
+
+
 def _emit_pseudo_tool_result(
     ls: _LoopState,
     pseudo_call,
@@ -174,16 +187,19 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     if pseudo_call.name == "reply":
         reply_text = str(args.get("text") or "").strip()
         selected_atts = []
+        refused: list[RefusedAttachment] = []
         selected_paths = args.get("attachment_paths")
         # [2026-07-08] Drop paths already auto-forwarded via dispatch_attachment,
         # so the caller LLM cannot re-send generated draw images a second time.
         selected_paths = _reject_already_sent_dispatch_paths(ls, selected_paths)
         if isinstance(selected_paths, list) and selected_paths:
-            selected_atts = _select_attachments(
-                ls.collected_attachments, selected_paths,
-                workspace_root=ls.rctx.workspace_root,
-                session_id=ls.rctx.session_id,
-            )
+            allowed_paths, refused = await screen_model_attachment_paths(ls, pseudo_call, selected_paths)
+            if allowed_paths:
+                selected_atts = _select_attachments(
+                    ls.collected_attachments, allowed_paths,
+                    workspace_root=ls.rctx.workspace_root,
+                    session_id=ls.rctx.session_id,
+                )
         if reply_text or selected_atts:
             await ls.rctx.emit_event("intermediate_reply", {
                 "node_id": ls.node.id,
@@ -191,7 +207,9 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                 "text": reply_text,
                 "attachments": selected_atts,
             })
-            _emit_pseudo_tool_result(ls, pseudo_call, "ok")
+            _emit_pseudo_tool_result(ls, pseudo_call, _ok_with_refusals(refused))
+        elif refused:
+            _emit_pseudo_tool_result(ls, pseudo_call, _refusal_note(refused))
         return None
 
     # compact_context: 非终止，手动压缩
@@ -222,22 +240,30 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                 f'in text and call {terminal_name} again.',
             )
             return None
-        _emit_pseudo_tool_result(ls, pseudo_call, "ok")
 
-        ctx_ref = _persist_ctx(ls, step + 1)
-        summary_text = str(args.get("summary") or "").strip()
-        final_atts = []
+        # None 表示模型没点名附件，走下面的自动转发；点名了就只发点名且放行的
+        explicit_paths: list[str] | None = None
+        refused: list[RefusedAttachment] = []
         if terminal_name == "finish":
             _selected_paths = args.get("attachment_paths")
             # [2026-07-08] Drop paths already auto-forwarded via dispatch_attachment
             # (async draw images), so finish() cannot re-send the same files.
             _selected_paths = _reject_already_sent_dispatch_paths(ls, _selected_paths)
             if isinstance(_selected_paths, list) and _selected_paths:
-                final_atts = _select_attachments(
-                    ls.collected_attachments, _selected_paths,
-                    workspace_root=ls.rctx.workspace_root,
-                    session_id=ls.rctx.session_id,
-                )
+                explicit_paths, refused = await screen_model_attachment_paths(ls, pseudo_call, _selected_paths)
+        _emit_pseudo_tool_result(ls, pseudo_call, _ok_with_refusals(refused))
+
+        ctx_ref = _persist_ctx(ls, step + 1)
+        summary_text = str(args.get("summary") or "").strip()
+        final_atts = []
+        if terminal_name == "finish":
+            if explicit_paths is not None:
+                if explicit_paths:
+                    final_atts = _select_attachments(
+                        ls.collected_attachments, explicit_paths,
+                        workspace_root=ls.rctx.workspace_root,
+                        session_id=ls.rctx.session_id,
+                    )
             elif ls.tool_produced_attachments:
                 final_atts = list(ls.tool_produced_attachments)
             else:
@@ -492,7 +518,9 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     else:
         ctx_mode = "accumulate" if _target_is_persistent(ls, target) else "fresh"
     ctx_key = str(args.get("context_key") or "").strip() or None
-    attachment_paths = args.get("attachment_paths") or []
+    attachment_paths, refused_attachments = await screen_model_attachment_paths(
+        ls, pseudo_call, args.get("attachment_paths") or [], data_dir_only=True,
+    )
     attachments = _paths_to_attachments(attachment_paths, ls.rctx.workspace_root)
 
     # 获取父 session 信息
@@ -562,17 +590,19 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         )
         if _dispatch_resp.status_code == 200:
             _d_data = _dispatch_resp.json()
-            _dispatch_result = json.dumps({
+            dispatch_result: dict[str, Any] = {
                 "success": True,
                 "session_id": _d_data.get("session_id", ""),
                 "message": f"已异步委派给 {target}",
-            }, ensure_ascii=False)
+            }
         else:
-            _dispatch_result = json.dumps({
+            dispatch_result = {
                 "success": False,
                 "error": f"inbound API 返回 {_dispatch_resp.status_code}: {_dispatch_resp.text}",
-            }, ensure_ascii=False)
+            }
     except Exception as e:
-        _dispatch_result = json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
-    _emit_pseudo_tool_result(ls, pseudo_call, _dispatch_result)
+        dispatch_result = {"success": False, "error": str(e)}
+    if refused_attachments:
+        dispatch_result["refused_attachments"] = [item.as_dict() for item in refused_attachments]
+    _emit_pseudo_tool_result(ls, pseudo_call, json.dumps(dispatch_result, ensure_ascii=False))
     return None

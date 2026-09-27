@@ -130,6 +130,7 @@ def test_dispatch_sender_includes_parent_generation(tmp_path: Path, monkeypatch:
     http = SimpleNamespace(post=AsyncMock(return_value=response))
     loop = SimpleNamespace(
         allowed_dispatch_targets={"child"}, node=SimpleNamespace(id="main"),
+        collected_attachments=[],
         rctx=SimpleNamespace(
             parent_session_id="parent", session_id="branch", session_generation=4,
             workspace_root=tmp_path, supervisor_url="http://unused", http=http,

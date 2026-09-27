@@ -336,7 +336,7 @@ class TestSubjectOrderReachesTheBudget:
 
 
 class TestToolContextWiring:
-    def test_ai_step_hands_the_routed_key_to_tools(self) -> None:
+    def test_build_tool_context_hands_the_routed_key_to_tools(self) -> None:
         """ToolContext 上这两个属性是写入侧算 namespace 的唯一来源。
 
         赋成空字符串，dispatch 子节点就又开始写进用一次就废弃的目录，而注入侧
@@ -344,7 +344,7 @@ class TestToolContextWiring:
         """
         import ast
 
-        tree = ast.parse((_ROOT / "engine/inference/ai_step.py").read_text(encoding="utf-8"))
+        tree = ast.parse((_ROOT / "engine/inference/loop_state.py").read_text(encoding="utf-8"))
         wired: dict[str, str] = {}
         for node in ast.walk(tree):
             if not isinstance(node, ast.Assign) or len(node.targets) != 1:

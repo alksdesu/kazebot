@@ -40,6 +40,7 @@ class _LS:
     def __init__(self, allowed: set[str], workspace: Path) -> None:
         self.node = _Node()
         self.allowed_dispatch_targets = allowed
+        self.collected_attachments: list[dict] = []
         self.rctx = SimpleNamespace(workspace_root=workspace)
         self.emitted: list[str] = []
 
