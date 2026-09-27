@@ -30,8 +30,19 @@ class MaintenanceContext(Protocol):
         """删 directory 下超过 max_age 秒没改过的文件；recursive 时连子目录一起，顺带删掉空了的子目录。"""
 
 
+# 工作区级的由各实例自己的清理跑。宿主级的一台机器跑一份就够，往往要 root：装了宿主清理的部署由它单独跑，实例的清理跳过。
+SCOPE_WORKSPACE = "workspace"
+SCOPE_HOST = "host"
+SCOPES = (SCOPE_WORKSPACE, SCOPE_HOST)
+
+
 @dataclass(frozen=True)
 class MaintenanceTask:
     # 写进清理日志的名字，出错时也按它报。
     name: str
     run: Callable[[MaintenanceContext], None]
+    scope: str = SCOPE_WORKSPACE
+
+    def __post_init__(self) -> None:
+        if self.scope not in SCOPES:
+            raise ValueError(f"maintenance task {self.name!r}: scope must be one of {SCOPES}, got {self.scope!r}")

@@ -10,6 +10,7 @@ set -euo pipefail
 
 REPO=/opt/kazebot
 DATA_ROOT=/opt/kazebot-data
+LIB=/usr/local/lib/kazebot
 NAPCAT_HOME=/opt/napcat
 OWNER=kazebot
 IMAGE="${KAZEBOT_NAPCAT_IMAGE:-mlikiowa/napcat-docker:v4.18.5}"
@@ -318,14 +319,26 @@ PY
 
 # ---------------------------------------------------------------- systemd
 
+install_root_side() {
+  say "装 root 侧组件"
+  # 以 root 跑的只从这里取：/opt/kazebot 归 kazebot，改写那边的脚本再等 root 来跑就是提权
+  install -d -m 0755 -o root -g root "$LIB"
+  install -m 0755 -o root -g root "$REPO/deploy/deploy.sh" "$LIB/deploy.sh"
+  install -m 0644 -o root -g root "$REPO/adapters/onebot/qq_cache.py" "$LIB/qq_cache.py"
+  info "$LIB/deploy.sh / $LIB/qq_cache.py"
+}
+
 install_units() {
   say "装 systemd 单元"
   install -m 0644 -o root -g root \
     "$REPO/deploy/systemd/kazebot.service" \
     "$REPO/deploy/systemd/kazebot-qq.service" \
+    "$REPO/deploy/systemd/kazebot-host-cleanup.service" \
+    "$REPO/deploy/systemd/kazebot-host-cleanup.timer" \
     /etc/systemd/system/
   systemctl daemon-reload
-  info "kazebot.service / kazebot-qq.service"
+  systemctl enable --now kazebot-host-cleanup.timer >/dev/null 2>&1
+  info "kazebot.service / kazebot-qq.service / kazebot-host-cleanup.timer"
 }
 
 start_and_verify() {
@@ -416,6 +429,7 @@ main() {
   write_configs
   build_frontend
   setup_napcat
+  install_root_side
   install_units
   start_and_verify
   summary

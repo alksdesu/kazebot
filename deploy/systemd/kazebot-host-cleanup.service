@@ -1,0 +1,16 @@
+[Unit]
+Description=Kazebot host cleanup: NTQQ/NapCat caches of every instance
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# 缓存在各 NapCat 容器里、归 root，只能 root 跑。/opt/kazebot 和它的 .venv 归 kazebot，
+# 拿那边的代码或解释器以 root 跑就是把机器交给 agent，所以脚本是 /usr/local/lib 里的副本、解释器是系统的。
+# 保留天数、额外的缓存根用 systemctl edit 加 Environment=，不读任何工作区的 .env。
+ExecStart=/usr/bin/python3 -I /usr/local/lib/kazebot/qq_cache.py
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=yes
+# 只删本机文件，用不着网络
+PrivateNetwork=yes

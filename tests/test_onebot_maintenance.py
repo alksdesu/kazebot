@@ -21,8 +21,9 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import adapters.onebot.maintenance as maint  # noqa: E402
+import adapters.onebot.qq_cache as qq_cache  # noqa: E402
 import engine.data_cleanup as cleanup  # noqa: E402
-from platforms.maintenance import MaintenanceTask  # noqa: E402
+from platforms.maintenance import SCOPE_HOST, SCOPE_WORKSPACE, SCOPES, MaintenanceTask  # noqa: E402
 
 _DAY = 24 * 3600
 
@@ -81,13 +82,35 @@ class TestTheTaskContract:
 
         assert (task.name, task.run) == ("onebot_cache", run)
 
+    def test_a_task_without_a_scope_runs_in_the_workspace(self) -> None:
+        # 绝大多数维护都归实例自己跑；默认成宿主级就会在没装宿主清理的机器上永远不跑。
+        assert MaintenanceTask("onebot_cache", lambda _context: None).scope == SCOPE_WORKSPACE
+
+    @pytest.mark.parametrize("scope", SCOPES)
+    def test_every_declared_scope_is_accepted(self, scope: str) -> None:
+        assert MaintenanceTask("qq_cache", lambda _context: None, scope=scope).scope == scope
+
+    @pytest.mark.parametrize("scope", ["", "Host", "root", "workspaces", None])
+    def test_an_unknown_scope_is_refused_at_declaration(self, scope: object) -> None:
+        """拼错的 scope 不在任何一组里，清理会安静跳过这一项，谁也发现不了。"""
+        with pytest.raises(ValueError, match="scope"):
+            MaintenanceTask("qq_cache", lambda _context: None, scope=scope)  # type: ignore[arg-type]
+
     def test_the_qq_tasks_are_named_and_ordered(self) -> None:
         tasks = maint.maintenance_tasks()
 
         assert [task.name for task in tasks] == ["onebot_cache", "qq_cache"]
         assert [task.run for task in tasks] == [
-            maint.purge_adapter_cache, maint.purge_qq_internal_cache,
+            maint.purge_adapter_cache, qq_cache.purge_qq_internal_cache,
         ]
+
+    def test_only_the_client_cache_is_left_to_the_host(self) -> None:
+        """NapCat 容器里的缓存归 root，实例的清理删不动；适配器自己那份必须留在工作区里清。"""
+        tasks = maint.maintenance_tasks()
+
+        assert {task.name: task.scope for task in tasks} == {
+            "onebot_cache": SCOPE_WORKSPACE, "qq_cache": SCOPE_HOST,
+        }
 
 
 class TestTheHookStaysLightweight:
@@ -376,19 +399,19 @@ class TestPurgingTheAdapterCache:
 
 class TestFindingTheClientCacheRoots:
     def test_configured_roots_come_first_and_accept_both_separators(self, monkeypatch) -> None:
-        monkeypatch.setattr(maint, "QQ_CACHE_ROOTS_RAW", "/a/qq , /b/napcat\n/c/qq")
+        monkeypatch.setattr(qq_cache, "QQ_CACHE_ROOTS_RAW", "/a/qq , /b/napcat\n/c/qq")
 
-        assert maint._discover_qq_cache_roots()[:3] == [Path("/a/qq"), Path("/b/napcat"), Path("/c/qq")]
+        assert qq_cache._discover_qq_cache_roots()[:3] == [Path("/a/qq"), Path("/b/napcat"), Path("/c/qq")]
 
     def test_the_packaged_defaults_are_always_candidates(self, monkeypatch) -> None:
-        monkeypatch.setattr(maint, "QQ_CACHE_ROOTS_RAW", "")
-        roots = maint._discover_qq_cache_roots()
+        monkeypatch.setattr(qq_cache, "QQ_CACHE_ROOTS_RAW", "")
+        roots = qq_cache._discover_qq_cache_roots()
 
         assert {Path("/app/.config/QQ"), Path("/app/napcat"), Path("/root/.config/QQ")} <= set(roots)
 
     def test_a_root_is_never_listed_twice(self, monkeypatch) -> None:
-        monkeypatch.setattr(maint, "QQ_CACHE_ROOTS_RAW", "/app/napcat,/app/napcat")
-        roots = maint._discover_qq_cache_roots()
+        monkeypatch.setattr(qq_cache, "QQ_CACHE_ROOTS_RAW", "/app/napcat,/app/napcat")
+        roots = qq_cache._discover_qq_cache_roots()
 
         assert [str(root) for root in roots].count(str(Path("/app/napcat"))) == 1
 
@@ -400,13 +423,13 @@ class TestFindingTheClientCacheRoots:
         ("/a/qq\n/b/qq", [Path("/a/qq"), Path("/b/qq")]),
     ])
     def test_the_configured_list_is_split_and_trimmed(self, raw: str, expected: list[Path]) -> None:
-        assert maint._split_configured_roots(raw) == expected
+        assert qq_cache._split_configured_roots(raw) == expected
 
     def test_an_empty_or_dot_path_is_not_a_root(self) -> None:
         # Path("") 是 "."，当成根就会从工作目录开始递归删。
         roots: list[Path] = []
-        maint._append_unique_path(roots, Path(""))
-        maint._append_unique_path(roots, Path("."))
+        qq_cache._append_unique_path(roots, Path(""))
+        qq_cache._append_unique_path(roots, Path("."))
 
         assert roots == []
 
@@ -414,18 +437,18 @@ class TestFindingTheClientCacheRoots:
         path = tmp_path / "cmdline"
         path.write_bytes(b"/opt/QQ/qq\x00--user-data-dir=/app/.config/QQ\x00\x00")
 
-        assert maint._read_proc_strings(path) == ["/opt/QQ/qq", "--user-data-dir=/app/.config/QQ"]
+        assert qq_cache._read_proc_strings(path) == ["/opt/QQ/qq", "--user-data-dir=/app/.config/QQ"]
 
     def test_an_unreadable_proc_entry_is_empty(self, tmp_path: Path) -> None:
-        assert maint._read_proc_strings(tmp_path / "gone") == []
+        assert qq_cache._read_proc_strings(tmp_path / "gone") == []
 
     @pytest.mark.parametrize("root", ["/", "/app", "/root", "/proc", "", "/var/lib/other"])
     def test_a_root_outside_the_client_dirs_is_refused(self, root: str) -> None:
-        assert maint._is_safe_qq_cache_root(Path(root)) is False
+        assert qq_cache._is_safe_qq_cache_root(Path(root)) is False
 
     @pytest.mark.parametrize("root", ["/app/.config/QQ", "/app/napcat", "/proc/7/root/app/NapCat"])
     def test_a_client_dir_is_accepted(self, root: str) -> None:
-        assert maint._is_safe_qq_cache_root(Path(root)) is True
+        assert qq_cache._is_safe_qq_cache_root(Path(root)) is True
 
 
 class TestRecognisingCacheLikePaths:
@@ -435,15 +458,15 @@ class TestRecognisingCacheLikePaths:
         "nt_qq/emoji/x", "record/x",
     ])
     def test_a_cache_directory_marks_the_file(self, rel: str) -> None:
-        assert maint._is_cache_like_relative_path(Path(rel)) is True
+        assert qq_cache._is_cache_like_relative_path(Path(rel)) is True
 
     @pytest.mark.parametrize("rel", ["login.json", "nt_db/msg.db", "12345/config.json", "versions/app.asar"])
     def test_durable_state_is_not_cache(self, rel: str) -> None:
-        assert maint._is_cache_like_relative_path(Path(rel)) is False
+        assert qq_cache._is_cache_like_relative_path(Path(rel)) is False
 
     def test_only_the_parent_directories_count(self) -> None:
         # 文件名自己带 cache 不算：nt_db/msg_cache.db 是数据库不是缓存。
-        assert maint._is_cache_like_relative_path(Path("nt_db/msg_cache.db")) is False
+        assert qq_cache._is_cache_like_relative_path(Path("nt_db/msg_cache.db")) is False
 
 
 class TestPurgingTheClientCache:
@@ -452,15 +475,15 @@ class TestPurgingTheClientCache:
         # 安全判定要求根路径里有 qq/napcat，随机的 tmp 目录名满足不了。
         target = tmp_path / "napcat"
         target.mkdir()
-        monkeypatch.setattr(maint, "QQ_CACHE_MAX_AGE", 7.0 * _DAY)
-        monkeypatch.setattr(maint, "_discover_qq_cache_roots", lambda: [target])
+        monkeypatch.setattr(qq_cache, "QQ_CACHE_MAX_AGE", 7.0 * _DAY)
+        monkeypatch.setattr(qq_cache, "_discover_qq_cache_roots", lambda: [target])
         return target
 
     def test_an_old_media_file_goes_through_the_context(self, tmp_path: Path, root: Path) -> None:
         stale = _write(root / "old.jpg", age=30 * _DAY)
         context = _recorder(tmp_path)
 
-        maint.purge_qq_internal_cache(context)
+        qq_cache.purge_qq_internal_cache(context)
 
         assert context.files == [stale]
         assert stale.exists()
@@ -470,7 +493,7 @@ class TestPurgingTheClientCache:
         stale = _write(root / "12345" / "Image" / "blob", age=30 * _DAY)
         context = _recorder(tmp_path)
 
-        maint.purge_qq_internal_cache(context)
+        qq_cache.purge_qq_internal_cache(context)
 
         assert context.files == [stale]
 
@@ -478,7 +501,7 @@ class TestPurgingTheClientCache:
         _write(root / "fresh.jpg")
         context = _recorder(tmp_path)
 
-        maint.purge_qq_internal_cache(context)
+        qq_cache.purge_qq_internal_cache(context)
 
         assert context.files == []
 
@@ -488,7 +511,7 @@ class TestPurgingTheClientCache:
         _write(root / "nt_db" / "msg.db", age=365 * _DAY)
         context = _recorder(tmp_path)
 
-        maint.purge_qq_internal_cache(context)
+        qq_cache.purge_qq_internal_cache(context)
 
         assert context.files == []
 
@@ -497,7 +520,7 @@ class TestPurgingTheClientCache:
         cache_dir.mkdir(parents=True)
         context = _recorder(tmp_path)
 
-        maint.purge_qq_internal_cache(context)
+        qq_cache.purge_qq_internal_cache(context)
 
         assert context.dirs == [cache_dir]
 
@@ -505,17 +528,17 @@ class TestPurgingTheClientCache:
         (root / "12345").mkdir()
         context = _recorder(tmp_path)
 
-        maint.purge_qq_internal_cache(context)
+        qq_cache.purge_qq_internal_cache(context)
 
         assert context.dirs == []
 
     def test_a_zero_max_age_disables_the_whole_task(self, tmp_path: Path, root: Path, monkeypatch, caplog) -> None:
         _write(root / "old.jpg", age=30 * _DAY)
-        monkeypatch.setattr(maint, "QQ_CACHE_MAX_AGE", 0.0)
+        monkeypatch.setattr(qq_cache, "QQ_CACHE_MAX_AGE", 0.0)
         context = _recorder(tmp_path)
 
         with caplog.at_level(logging.INFO):
-            maint.purge_qq_internal_cache(context)
+            qq_cache.purge_qq_internal_cache(context)
 
         assert context.files == []
         assert any("[qq_cache] disabled" in r.getMessage() for r in caplog.records)
@@ -524,7 +547,7 @@ class TestPurgingTheClientCache:
         _write(root / "old.jpg", "12345", age=30 * _DAY)
 
         with caplog.at_level(logging.INFO):
-            maint.purge_qq_internal_cache(_recorder(tmp_path))
+            qq_cache.purge_qq_internal_cache(_recorder(tmp_path))
 
         assert any(
             "[qq_cache] scanned_roots=1 deleted=1" in r.getMessage() for r in caplog.records
@@ -533,22 +556,22 @@ class TestPurgingTheClientCache:
     def test_a_root_that_is_not_a_client_dir_is_skipped(self, tmp_path: Path, monkeypatch, caplog) -> None:
         other = tmp_path / "somewhere"
         _write(other / "old.jpg", age=30 * _DAY)
-        monkeypatch.setattr(maint, "QQ_CACHE_MAX_AGE", 7.0 * _DAY)
-        monkeypatch.setattr(maint, "_discover_qq_cache_roots", lambda: [other])
+        monkeypatch.setattr(qq_cache, "QQ_CACHE_MAX_AGE", 7.0 * _DAY)
+        monkeypatch.setattr(qq_cache, "_discover_qq_cache_roots", lambda: [other])
         context = _recorder(tmp_path)
 
         with caplog.at_level(logging.INFO):
-            maint.purge_qq_internal_cache(context)
+            qq_cache.purge_qq_internal_cache(context)
 
         assert context.files == []
         assert any("scanned_roots=0" in r.getMessage() for r in caplog.records)
 
     def test_a_missing_root_is_skipped(self, tmp_path: Path, monkeypatch, caplog) -> None:
-        monkeypatch.setattr(maint, "QQ_CACHE_MAX_AGE", 7.0 * _DAY)
-        monkeypatch.setattr(maint, "_discover_qq_cache_roots", lambda: [tmp_path / "napcat-gone"])
+        monkeypatch.setattr(qq_cache, "QQ_CACHE_MAX_AGE", 7.0 * _DAY)
+        monkeypatch.setattr(qq_cache, "_discover_qq_cache_roots", lambda: [tmp_path / "napcat-gone"])
 
         with caplog.at_level(logging.INFO):
-            maint.purge_qq_internal_cache(_recorder(tmp_path))
+            qq_cache.purge_qq_internal_cache(_recorder(tmp_path))
 
         assert any("scanned_roots=0" in r.getMessage() for r in caplog.records)
 
@@ -560,7 +583,7 @@ class TestPurgingTheClientCache:
         context = cleanup._CleanupContext(workspace_root=tmp_path, data_dir=tmp_path / "data")
 
         with caplog.at_level(logging.INFO):
-            maint.purge_qq_internal_cache(context)
+            qq_cache.purge_qq_internal_cache(context)
 
         assert stale.exists() and empty.exists()
         messages = [r.getMessage() for r in caplog.records]
@@ -572,7 +595,7 @@ class TestPurgingTheClientCache:
         monkeypatch.setattr(cleanup, "DRY_RUN", False)
         context = cleanup._CleanupContext(workspace_root=tmp_path, data_dir=tmp_path / "data")
 
-        maint.purge_qq_internal_cache(context)
+        qq_cache.purge_qq_internal_cache(context)
 
         assert not stale.exists()
         # 文件删完这一层就空了，同一趟里连空目录一起收走。

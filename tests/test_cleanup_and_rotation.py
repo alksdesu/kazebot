@@ -23,6 +23,7 @@ import engine.signals.bridge as bridge
 from engine.eventlog_rotation import SIGNALS_BACKUPS, SIGNALS_MAX_BYTES
 from engine.signals.bus import SignalBus
 from engine.signals.types import Signal
+from platforms.maintenance import SCOPE_HOST, SCOPE_WORKSPACE
 
 
 class TestSignalsRotation:
@@ -239,12 +240,15 @@ class TestDryRun:
         import ast
 
         tree = ast.parse((_ROOT / "engine/data_cleanup.py").read_text(encoding="utf-8"))
-        fn = next(
+        main = next(
             node for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef) and node.name == "main"
         )
 
-        assert "--dry-run" in ast.unparse(fn)
+        assert cleanup._parse_args(["--dry-run"]).dry_run is True
+        assert cleanup._parse_args([]).dry_run is False
+        # 解析出来没接到闸门上，演练模式照删不误。
+        assert "DRY_RUN = args.dry_run" in ast.unparse(main)
 
     def test_every_destructive_call_goes_through_a_helper(self) -> None:
         """漏一处就是 dry-run 下仍然真删，而日志看着像什么都没干。"""
@@ -298,6 +302,9 @@ class TestDryRun:
         assert offenders == [], f"这些删除没走 context: {offenders}"
 
 
+_MAINTENANCE_ENTRY = "(run_platform_maintenance, dict(scopes=CLEANUP_SCOPES[scope]))"
+
+
 def _main_task_entries() -> list[str]:
     """main() 任务表里每一项的源码写法，按登记顺序。"""
     import ast
@@ -315,6 +322,46 @@ def _main_task_entries() -> list[str]:
     return [ast.unparse(element) for element in assign.value.elts]
 
 
+def _platform(platform_id: str) -> Any:
+    from platforms.descriptor import CHANNEL_GROUP, ChannelDescriptor, PlatformDescriptor
+
+    return PlatformDescriptor(
+        id=platform_id, display_name=platform_id, short_name=platform_id.upper(),
+        channels=(ChannelDescriptor(f"{platform_id}_group", CHANNEL_GROUP),),
+    )
+
+
+def _wire_platforms(monkeypatch: pytest.MonkeyPatch, hooks: dict[str, Any]) -> None:
+    """把注册表换成给定的几个假平台；值是异常就当钩子查找时抛出来。"""
+    platforms = tuple(_platform(platform_id) for platform_id in hooks)
+
+    def lookup(platform: Any, name: str) -> Any:
+        found = hooks[platform.id]
+        if isinstance(found, BaseException):
+            raise found
+        return found
+
+    monkeypatch.setattr(cleanup, "all_platforms", lambda: platforms)
+    monkeypatch.setattr(cleanup, "platform_hook", lookup)
+
+
+def _hook(*tasks: Any) -> Any:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(maintenance_tasks=lambda: tasks)
+
+
+def _task(name: str, calls: list[str], *, boom: BaseException | None = None, scope: str = SCOPE_WORKSPACE):
+    from platforms.maintenance import MaintenanceTask
+
+    def run(_context: Any) -> None:
+        calls.append(name)
+        if boom is not None:
+            raise boom
+
+    return MaintenanceTask(name, run, scope=scope)
+
+
 class TestPlatformMaintenance:
     """平台自己的缓存清理：核心只按平台逐个调钩子，一个平台坏掉不能连累别的。"""
 
@@ -323,48 +370,13 @@ class TestPlatformMaintenance:
         monkeypatch.setattr(cleanup, "DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(cleanup, "DRY_RUN", False)
 
-    def _platform(self, platform_id: str) -> Any:
-        from platforms.descriptor import CHANNEL_GROUP, ChannelDescriptor, PlatformDescriptor
-
-        return PlatformDescriptor(
-            id=platform_id, display_name=platform_id, short_name=platform_id.upper(),
-            channels=(ChannelDescriptor(f"{platform_id}_group", CHANNEL_GROUP),),
-        )
-
-    def _wire(self, monkeypatch: pytest.MonkeyPatch, hooks: dict[str, Any]) -> None:
-        platforms = tuple(self._platform(platform_id) for platform_id in hooks)
-
-        def lookup(platform: Any, name: str) -> Any:
-            found = hooks[platform.id]
-            if isinstance(found, BaseException):
-                raise found
-            return found
-
-        monkeypatch.setattr(cleanup, "all_platforms", lambda: platforms)
-        monkeypatch.setattr(cleanup, "platform_hook", lookup)
-
-    def _tasks(self, *tasks: Any) -> Any:
-        from types import SimpleNamespace
-
-        return SimpleNamespace(maintenance_tasks=lambda: tasks)
-
-    def _task(self, name: str, calls: list[str], *, boom: BaseException | None = None):
-        from platforms.maintenance import MaintenanceTask
-
-        def run(_context: Any) -> None:
-            calls.append(name)
-            if boom is not None:
-                raise boom
-
-        return MaintenanceTask(name, run)
-
     def test_a_platform_without_the_hook_is_skipped_quietly(self, monkeypatch, caplog) -> None:
         from platforms.registry import MissingPlatformHook
 
         calls: list[str] = []
-        self._wire(monkeypatch, {
+        _wire_platforms(monkeypatch, {
             "silent": MissingPlatformHook("no hook"),
-            "loud": self._tasks(self._task("cache", calls)),
+            "loud": _hook(_task("cache", calls)),
         })
 
         with caplog.at_level(logging.ERROR):
@@ -376,9 +388,9 @@ class TestPlatformMaintenance:
     def test_a_hook_module_that_breaks_on_import_is_reported_and_not_fatal(self, monkeypatch, caplog) -> None:
         """钩子模块自己抛的 KeyError 也是 LookupError，被当成「没声明」就永远查不出来。"""
         calls: list[str] = []
-        self._wire(monkeypatch, {
+        _wire_platforms(monkeypatch, {
             "broken": KeyError("napcat config"),
-            "healthy": self._tasks(self._task("cache", calls)),
+            "healthy": _hook(_task("cache", calls)),
         })
 
         with caplog.at_level(logging.ERROR):
@@ -389,10 +401,10 @@ class TestPlatformMaintenance:
 
     def test_a_failing_task_does_not_stop_the_next_one(self, monkeypatch, caplog) -> None:
         calls: list[str] = []
-        self._wire(monkeypatch, {
-            "qq": self._tasks(
-                self._task("first", calls, boom=RuntimeError("disk gone")),
-                self._task("second", calls),
+        _wire_platforms(monkeypatch, {
+            "qq": _hook(
+                _task("first", calls, boom=RuntimeError("disk gone")),
+                _task("second", calls),
             ),
         })
 
@@ -406,7 +418,7 @@ class TestPlatformMaintenance:
         from platforms.maintenance import MaintenanceTask
 
         seen: list[Any] = []
-        self._wire(monkeypatch, {"qq": self._tasks(MaintenanceTask("cache", seen.append))})
+        _wire_platforms(monkeypatch, {"qq": _hook(MaintenanceTask("cache", seen.append))})
 
         cleanup.run_platform_maintenance()
 
@@ -419,8 +431,8 @@ class TestPlatformMaintenance:
         victim = tmp_path / "data" / "cache" / "idx.json"
         victim.parent.mkdir(parents=True, exist_ok=True)
         victim.write_text("x", encoding="utf-8")
-        self._wire(monkeypatch, {
-            "qq": self._tasks(MaintenanceTask("cache", lambda context: context.remove_file(victim))),
+        _wire_platforms(monkeypatch, {
+            "qq": _hook(MaintenanceTask("cache", lambda context: context.remove_file(victim))),
         })
 
         cleanup.run_platform_maintenance()
@@ -443,7 +455,7 @@ class TestPlatformMaintenance:
             context.remove_file(victim)
             context.remove_empty_dir(empty)
 
-        self._wire(monkeypatch, {"qq": self._tasks(MaintenanceTask("cache", run))})
+        _wire_platforms(monkeypatch, {"qq": _hook(MaintenanceTask("cache", run))})
 
         with caplog.at_level(logging.INFO):
             cleanup.run_platform_maintenance()
@@ -479,7 +491,7 @@ class TestPlatformMaintenance:
         assert platform_hook(QQ_NAPCAT, HOOK_MAINTENANCE) is maintenance
 
     def test_it_is_wired_into_the_task_list(self) -> None:
-        assert "(run_platform_maintenance, {})" in _main_task_entries()
+        assert _MAINTENANCE_ENTRY in _main_task_entries()
 
     def test_the_qq_specific_entries_are_gone_from_the_core(self) -> None:
         """平台专属的清理留在核心里，就是下一个平台接进来时再抄一遍。"""
@@ -494,7 +506,173 @@ class TestPlatformMaintenance:
         attachments = next(i for i, entry in enumerate(entries) if "attachments" in entry)
         memory = next(i for i, entry in enumerate(entries) if "purge_expired_memory_entries" in entry)
 
-        assert attachments < entries.index("(run_platform_maintenance, {})") < memory
+        assert attachments < entries.index(_MAINTENANCE_ENTRY) < memory
+
+    def test_every_scope_runs_by_default(self, monkeypatch, caplog) -> None:
+        calls: list[str] = []
+        _wire_platforms(monkeypatch, {
+            "qq": _hook(
+                _task("onebot_cache", calls),
+                _task("qq_cache", calls, scope=SCOPE_HOST),
+            ),
+        })
+
+        with caplog.at_level(logging.INFO):
+            cleanup.run_platform_maintenance()
+
+        assert calls == ["onebot_cache", "qq_cache"]
+        assert not any("skipped" in r.getMessage() for r in caplog.records)
+
+    def test_a_workspace_run_leaves_the_host_task_alone(self, monkeypatch, caplog) -> None:
+        """宿主级的缓存归 root，实例的清理删不动；照跑只会每小时刷一条权限错误。"""
+        calls: list[str] = []
+        _wire_platforms(monkeypatch, {
+            "qq": _hook(
+                _task("onebot_cache", calls),
+                _task("qq_cache", calls, scope=SCOPE_HOST),
+            ),
+        })
+
+        with caplog.at_level(logging.INFO):
+            cleanup.run_platform_maintenance(scopes=cleanup.CLEANUP_SCOPES["workspace"])
+
+        assert calls == ["onebot_cache"]
+        assert any(
+            "[qq.qq_cache] skipped: host task, left to the host cleanup" == r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_the_real_qq_hook_puts_the_container_cache_out_of_workspace_reach(self) -> None:
+        # 真钩子的 scope 标错，上面那些围栏就全落在假平台上。
+        from adapters.onebot import maintenance
+
+        scopes = {task.name: task.scope for task in maintenance.maintenance_tasks()}
+
+        assert scopes == {"onebot_cache": SCOPE_WORKSPACE, "qq_cache": SCOPE_HOST}
+
+
+class TestCleanupScopeSelection:
+    """一台机器上跑着几个实例，宿主级的那份只该由宿主清理跑一次。"""
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        data = tmp_path / "data"
+        monkeypatch.setattr(cleanup, "DATA_DIR", data)
+        # 这几个是导入时按仓库根算死的，不改就会去轮转真的 data/events.jsonl。
+        monkeypatch.setattr(cleanup, "EVENTS_FILE", data / "events.jsonl")
+        monkeypatch.setattr(cleanup, "SIGNALS_FILE", data / "signals.jsonl")
+        monkeypatch.setattr(cleanup, "_log_init", lambda: None)
+        monkeypatch.setattr(cleanup, "DRY_RUN", False)
+        monkeypatch.delenv(cleanup.CLEANUP_SCOPE_ENV, raising=False)
+
+    def test_no_flag_and_no_env_means_everything(self) -> None:
+        assert cleanup._resolve_scope(None) == "all"
+
+    def test_the_flag_picks_the_scope(self) -> None:
+        assert cleanup._resolve_scope("workspace") == "workspace"
+
+    def test_the_env_picks_the_scope_when_no_flag_is_given(self, monkeypatch) -> None:
+        # 单元文件给的是 Environment=，engine 定时拉起的那次没有命令行。
+        monkeypatch.setenv(cleanup.CLEANUP_SCOPE_ENV, "workspace")
+
+        assert cleanup._resolve_scope(None) == "workspace"
+
+    def test_the_flag_wins_over_the_env(self, monkeypatch) -> None:
+        monkeypatch.setenv(cleanup.CLEANUP_SCOPE_ENV, "workspace")
+
+        assert cleanup._resolve_scope("all") == "all"
+
+    def test_a_blank_env_is_the_same_as_unset(self, monkeypatch) -> None:
+        monkeypatch.setenv(cleanup.CLEANUP_SCOPE_ENV, "   ")
+
+        assert cleanup._resolve_scope(None) == "all"
+
+    def test_a_misspelt_env_falls_back_to_everything_and_says_so(self, monkeypatch, caplog) -> None:
+        """静默按 workspace 跑的话，宿主缓存就再也没人清，而日志里看不出区别。"""
+        monkeypatch.setenv(cleanup.CLEANUP_SCOPE_ENV, "workspaces")
+
+        with caplog.at_level(logging.WARNING):
+            assert cleanup._resolve_scope(None) == "all"
+
+        assert any("CLONOTH_MAINTENANCE_SCOPE" in r.getMessage() for r in caplog.records)
+
+    # host 是 MaintenanceTask 的合法 scope，却不是能拿来跑一整轮清理的范围。
+    @pytest.mark.parametrize("value", ["host", "workspaces", ""])
+    def test_an_unknown_scope_on_the_command_line_is_refused(self, value: str) -> None:
+        with pytest.raises(SystemExit) as raised:
+            cleanup.main(["--scope", value])
+
+        assert raised.value.code == 2
+
+    def test_a_workspace_run_skips_the_host_task_end_to_end(self, monkeypatch, caplog) -> None:
+        calls: list[str] = []
+        _wire_platforms(monkeypatch, {
+            "qq": _hook(
+                _task("onebot_cache", calls),
+                _task("qq_cache", calls, scope=SCOPE_HOST),
+            ),
+        })
+
+        with caplog.at_level(logging.INFO):
+            cleanup.main(["--scope", "workspace"])
+
+        assert calls == ["onebot_cache"]
+        assert any("[qq.qq_cache] skipped: host task" in r.getMessage() for r in caplog.records)
+
+    def test_a_plain_run_still_does_the_host_task(self, monkeypatch) -> None:
+        calls: list[str] = []
+        _wire_platforms(monkeypatch, {
+            "qq": _hook(
+                _task("onebot_cache", calls),
+                _task("qq_cache", calls, scope=SCOPE_HOST),
+            ),
+        })
+
+        cleanup.main([])
+
+        assert calls == ["onebot_cache", "qq_cache"]
+
+    def test_the_env_reaches_the_tasks_without_a_flag(self, monkeypatch) -> None:
+        calls: list[str] = []
+        monkeypatch.setenv(cleanup.CLEANUP_SCOPE_ENV, "workspace")
+        _wire_platforms(monkeypatch, {
+            "qq": _hook(
+                _task("onebot_cache", calls),
+                _task("qq_cache", calls, scope=SCOPE_HOST),
+            ),
+        })
+
+        cleanup.main([])
+
+        assert calls == ["onebot_cache"]
+
+    def test_the_opening_line_names_a_narrowed_scope(self, monkeypatch, caplog) -> None:
+        _wire_platforms(monkeypatch, {})
+
+        with caplog.at_level(logging.INFO):
+            cleanup.main(["--scope", "workspace"])
+
+        assert any("=== data cleanup start (scope: workspace) ===" == r.getMessage() for r in caplog.records)
+
+    def test_the_opening_line_is_unchanged_for_a_full_run(self, monkeypatch, caplog) -> None:
+        # 现役机器的日志按这一行做锚点，全量跑时多一个后缀就等于换了格式。
+        _wire_platforms(monkeypatch, {})
+
+        with caplog.at_level(logging.INFO):
+            cleanup.main([])
+
+        assert any("=== data cleanup start ===" == r.getMessage() for r in caplog.records)
+
+    def test_a_dry_run_still_says_dry_run_alongside_the_scope(self, monkeypatch, caplog) -> None:
+        _wire_platforms(monkeypatch, {})
+
+        with caplog.at_level(logging.INFO):
+            cleanup.main(["--dry-run", "--scope", "workspace"])
+
+        assert any(
+            "=== data cleanup start (dry-run) (scope: workspace) ===" == r.getMessage()
+            for r in caplog.records
+        )
 
 
 class TestCleanupSchedule:

@@ -34,6 +34,13 @@ if [[ -n "$SRC" && "$SELF" != "$SRC" ]] && ! cmp -s "$SRC" "$SELF"; then
   exec "$SELF" "$@"
 fi
 
+# 宿主清理以 root 跑 /usr/local/lib 里的副本；装过的话跟着仓库更新，免得修了清理逻辑却一直跑旧的。
+HOST_CLEANUP=/usr/local/lib/kazebot/qq_cache.py
+if [[ -f "$HOST_CLEANUP" ]] && ! cmp -s "$ROOT/adapters/onebot/qq_cache.py" "$HOST_CLEANUP"; then
+  install -m 0644 -o root -g root "$ROOT/adapters/onebot/qq_cache.py" "$HOST_CLEANUP"
+  echo "[deploy] 宿主清理脚本有更新，已同步"
+fi
+
 # 兜底：谁手敲过一条 root 命令都能在这里改回来。
 STRAY=$(find "$ROOT" ! -user "$OWNER" -print -quit 2>/dev/null || true)
 if [[ -n "$STRAY" ]]; then

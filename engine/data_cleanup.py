@@ -8,6 +8,7 @@ and each platform's own maintenance (adapter and client caches) through the
 platform's maintenance hook.
 """
 
+import argparse
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ if str(_REPO_ROOT) not in sys.path:  # 直接 ``python engine/data_cleanup.py`` 
     sys.path.insert(0, str(_REPO_ROOT))
 from engine.memory_namespace import SUBJECT_PREFIX, is_memory_namespace  # noqa: E402
 from platforms.descriptor import HOOK_MAINTENANCE  # noqa: E402
+from platforms.maintenance import SCOPE_WORKSPACE, SCOPES  # noqa: E402
 from platforms.registry import MissingPlatformHook, all_platforms, platform_hook  # noqa: E402
 from workspace import resolve_workspace_root  # noqa: E402
 
@@ -201,6 +203,11 @@ def purge_dir(directory: Path, max_age: float, label: str, recursive=False):
 
 
 # ── platform maintenance ──────────────────────
+# 宿主级的维护（清 NapCat 容器里的缓存这类）要 root。装了宿主清理的机器由它单独跑，实例的清理只管自己的工作区。
+CLEANUP_SCOPES = {"all": frozenset(SCOPES), "workspace": frozenset({SCOPE_WORKSPACE})}
+CLEANUP_SCOPE_ENV = "CLONOTH_MAINTENANCE_SCOPE"
+
+
 @dataclass(frozen=True)
 class _CleanupContext:
     """交给平台 maintenance 钩子的上下文：删文件都走这里，演练模式才管得住。"""
@@ -222,8 +229,11 @@ class _CleanupContext:
         purge_dir(directory, max_age, label, recursive=recursive)
 
 
-def run_platform_maintenance():
-    """各平台自己的定期维护，比如清适配器和平台客户端攒的缓存，由平台描述的 maintenance 钩子给出。"""
+def run_platform_maintenance(scopes: frozenset[str] = CLEANUP_SCOPES["all"]):
+    """各平台自己的定期维护，比如清适配器和平台客户端攒的缓存，由平台描述的 maintenance 钩子给出。
+
+    scopes 之外的不跑，只记一笔，免得日志里看不出那一项去哪了。
+    """
     context = _CleanupContext(workspace_root=DATA_DIR.parent, data_dir=DATA_DIR)
     for platform in all_platforms():
         try:
@@ -235,6 +245,9 @@ def run_platform_maintenance():
             logging.error("[%s] maintenance hook unavailable: %s", platform.id, exc)
             continue
         for task in tasks:
+            if task.scope not in scopes:
+                logging.info("[%s.%s] skipped: %s task, left to the host cleanup", platform.id, task.name, task.scope)
+                continue
             try:
                 task.run(context)
             except Exception as exc:
@@ -556,13 +569,40 @@ def purge_stocktool_cache():
 
 
 # ── main ──────────────────────────────────────
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="python -m engine.data_cleanup")
+    parser.add_argument("--dry-run", action="store_true", help="只记会删什么，不动文件")
+    parser.add_argument(
+        "--scope",
+        choices=sorted(CLEANUP_SCOPES),
+        help=f"workspace 只清本工作区，all 连宿主级的一起清；不给时看 {CLEANUP_SCOPE_ENV}，再没有就是 all",
+    )
+    return parser.parse_args(argv)
+
+
+def _resolve_scope(flag: str | None) -> str:
+    if flag:
+        return flag
+    configured = os.getenv(CLEANUP_SCOPE_ENV, "").strip()
+    if not configured or configured in CLEANUP_SCOPES:
+        return configured or "all"
+    # 写错了按 all 跑，和没设时一样：宿主级任务多跑一遍无害。
+    logging.warning(
+        "[scope] %s=%r is not one of %s, running all",
+        CLEANUP_SCOPE_ENV, configured, "/".join(sorted(CLEANUP_SCOPES)),
+    )
+    return "all"
+
+
 def main(argv: list[str] | None = None):
     global DRY_RUN
 
-    args = list(sys.argv[1:] if argv is None else argv)
-    DRY_RUN = "--dry-run" in args
+    args = _parse_args(argv)
+    DRY_RUN = args.dry_run
     _log_init()
-    logging.info("=== data cleanup start%s ===", " (dry-run)" if DRY_RUN else "")
+    scope = _resolve_scope(args.scope)
+    suffix = (" (dry-run)" if DRY_RUN else "") + ("" if scope == "all" else f" (scope: {scope})")
+    logging.info("=== data cleanup start%s ===", suffix)
 
     tasks = [
         (rotate_events, {}),
@@ -583,7 +623,7 @@ def main(argv: list[str] | None = None):
         (purge_dir, dict(directory=DATA_DIR / "attachments",
                          max_age=ATTACH_MAX_AGE, label="attachments", recursive=True)),
         # 平台自己的缓存由各平台声明的维护钩子清。
-        (run_platform_maintenance, {}),
+        (run_platform_maintenance, dict(scopes=CLEANUP_SCOPES[scope])),
         (purge_expired_memory_entries, {}),
         # 新增：之前未覆盖的目录
         (purge_expired_transcripts, {}),

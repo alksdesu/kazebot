@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily host cleanup for kazebot
+
+[Timer]
+OnCalendar=daily
+# 缓存默认按七天算龄，一天清一次足够；错开整点，免得和各实例的清理一起扫盘
+RandomizedDelaySec=1h
+Persistent=true
+Unit=kazebot-host-cleanup.service
+
+[Install]
+WantedBy=timers.target

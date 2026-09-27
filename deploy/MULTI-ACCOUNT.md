@@ -4,7 +4,7 @@
 
 ```
 /opt/kazebot/                 代码，git 更新一次，全部实例生效；序号 0 的实例就住在这里，端口与路径和单实例时一样
-/usr/local/lib/kazebot/       root 侧建实例组件，kazebot 写不到
+/usr/local/lib/kazebot/       root 侧组件（建实例、宿主清理），kazebot 写不到
 /opt/kazebot-data/
   ├ instances.yaml            控制台切换器读的共享清单
   ├ provision-<实例名>.log     建实例进度，控制台轮询它
@@ -44,7 +44,7 @@
 sudo /opt/kazebot/deploy/install_provision.sh <主实例名> <主实例QQ号>
 ```
 
-它会装好 root 侧组件与 polkit 规则、建 `/opt/kazebot-data`、用 drop-in 放开主实例对它的写权限，并把主实例登记进清单。装完控制台的「账号 → 多开实例」里就能直接建实例。老写法 `install_provision.sh <主实例QQ号>` 照旧能用：实例名和 QQ 号都是那个号。
+它会装好 root 侧组件与 polkit 规则、建 `/opt/kazebot-data`、用 drop-in 放开主实例对它的写权限，并把主实例登记进清单；宿主清理的定时任务也在这一步装上，见下面「宿主清理」。装完控制台的「账号 → 多开实例」里就能直接建实例。老写法 `install_provision.sh <主实例QQ号>` 照旧能用：实例名和 QQ 号都是那个号。
 
 **改过 `provision_instance.sh`、`cloudflared_ingress.py`、polkit 规则或 `deploy/systemd/` 里的模板之后要重跑一次** —— git 更新的是 `/opt/kazebot` 里的源，不会自动同步到 `/usr/local/lib` 和 `/etc`。实例改按 bot 命名这一次就要重跑：老 polkit 规则只放行纯数字的实例名，老的删实例脚本也只按 `uin` 摘清单。
 
@@ -77,9 +77,27 @@ supervisor 跑在 `kazebot` 下，`ProtectSystem=strict` + `NoNewPrivileges=yes`
 - **不 `source` 工作区的 `.env`。** 那是 kazebot 可写的，当输入看待：grep 取值，逐个按形状校验。
 - **不用 `/opt/kazebot/.venv` 的解释器。** 同理，用 `/usr/bin/python3`。
 - **脚本里不出现递归删除。** 删实例只 `mv` 归档。
+- **宿主清理只跑自己那一份。** `qq_cache.py` 只用标准库；它一 import 仓库里的模块，root 拿到的就又是 kazebot 可写的代码。
 - **实例名的正则几处必须一致**：`supervisor/provisioning.py`、`provision_instance.sh`、`cloudflared_ingress.py`、polkit 规则，外加两个手动入口 `new_instance.sh`、`install_provision.sh`。宽的那一处说了算。
 
 `tests/test_provisioning.py` 会静态检查上面每一条。
+
+## 宿主清理
+
+各实例 NapCat 容器里的 NTQQ 图片、视频和缓存归 root。实例自己的定期清理以 kazebot 跑、带沙箱，删不动它们，所以整台机器由一个 root 定时任务统一清：`kazebot-host-cleanup.timer` 每天跑一次 `kazebot-host-cleanup.service`，默认删七天没动过的。
+
+- 跑的是 `/usr/local/lib/kazebot/qq_cache.py`，解释器是 `/usr/bin/python3 -I`。这个文件是 `adapters/onebot/qq_cache.py` 的副本，`bootstrap.sh` 和 `install_provision.sh` 负责装，`deploy.sh` 每次更新顺带同步；单元文件改了照上面的规矩重跑 `install_provision.sh`。
+- 不读任何工作区的 `.env`。改保留天数、加缓存根用 `sudo systemctl edit kazebot-host-cleanup.service`，在 `[Service]` 下写 `Environment=CLONOTH_QQ_CACHE_MAX_AGE_SECONDS=...` 或 `Environment=CLONOTH_QQ_CACHE_ROOTS=...`。
+- 除了经 `/proc/<pid>/root` 找正在跑的容器，还认部署脚本挂出来的 `/opt/napcat/qq` 和 `/opt/napcat-<实例名>/qq`，容器停着也清得到；删实例归档的 `.deleted-*` 目录不碰。以 root 跑时只跟 root 的进程，别的用户起一个命令行带 napcat 的进程引不走它。
+- 实例的清理以 `--scope workspace` 跑，不再碰这一项：`kazebot-cleanup@` 写在 `ExecStart` 里，engine 自己定时拉起的那份靠单元里的 `CLONOTH_MAINTENANCE_SCOPE=workspace`。
+
+先演练，再看排期和日志：
+
+```bash
+sudo /usr/bin/python3 -I /usr/local/lib/kazebot/qq_cache.py --dry-run
+systemctl list-timers kazebot-host-cleanup.timer
+journalctl -u kazebot-host-cleanup -n 100 --no-pager
+```
 
 ## 端口
 
@@ -124,6 +142,7 @@ supervisor 跑在 `kazebot` 下，`ProtectSystem=strict` + `NoNewPrivileges=yes`
 |---|---|
 | `CLONOTH_WORKSPACE` | 工作区根。不设时回落到代码目录，行为与改造前一致。实例的工作区由 systemd 单元给，实例 `.env` 里别写这一行：`EnvironmentFile=` 的值总是盖过单元里的 `Environment=`，整份抄主实例的 `.env` 过来，这个实例就落到了主实例的目录 |
 | `CLONOTH_URL_PREFIX` | 控制台与 API 挂载的路径前缀，留空为根 |
+| `CLONOTH_MAINTENANCE_SCOPE` | 定期清理管到哪：`workspace` 只清本工作区，不设就是 `all`，连宿主级的一起。装了宿主清理的机器，单元里已经写成 `workspace` |
 | `CLONOTH_INSTANCES_FILE` | 共享清单位置，默认 `<工作区>/config/instances.yaml` |
 | `NAPCAT_WEBUI_URL` | 本实例对应的 NapCat WebUI，默认 `http://127.0.0.1:6099` |
 | `CLONOTH_PORT` / `PORT` / `ONEBOT_FORWARD_BRIDGE_PORT` | 三个监听端口 |

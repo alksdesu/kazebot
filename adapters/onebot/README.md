@@ -37,7 +37,8 @@ adapters/onebot/
 ├── accounts.py                  # NapCat 在工作区里留下的、登录过的 QQ 号，离线迁移拿来认会话键
 ├── console_layout.py            # 控制台 QQ 页的分区布局
 ├── provisioning.py              # 多开建新实例时 QQ 这一侧写进 .env 的几行
-├── maintenance.py               # 定期维护：清 NTQQ/NapCat 的图片视频缓存和引用附件索引，数据清理经平台钩子调它
+├── maintenance.py               # 定期维护：清引用附件索引，NTQQ 缓存那项转给 qq_cache 并标成宿主级，数据清理经平台钩子调它
+├── qq_cache.py                  # NTQQ/NapCat 的图片视频缓存；只用标准库，宿主清理以 root 单独跑它的副本
 ├── config.py                    # 环境变量配置
 ├── live_config.py               # config/qq.yaml 热载配置，通用键落到 config/features.yaml
 ├── send_contract.py             # QQ 目标身份与 NapCat 错误指纹，绑定共享的发送防重

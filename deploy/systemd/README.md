@@ -14,6 +14,33 @@ sudo systemctl enable --now kazebot@<id> kazebot-qq@<id>
 
 See `deploy/MULTI-ACCOUNT.md` for ports, NapCat containers, and the shared console.
 
+## Host cleanup timer
+
+NTQQ/NapCat keep their images, videos and caches inside the NapCat containers, owned by root. The per-instance cleanup runs as `kazebot` in a sandbox and cannot delete them, so on kazebot deployments a single root timer cleans them for every instance on the machine: `kazebot-host-cleanup.timer` runs `kazebot-host-cleanup.service` once a day.
+
+The service runs `/usr/local/lib/kazebot/qq_cache.py` with `/usr/bin/python3 -I`. That file is a root-owned copy of `adapters/onebot/qq_cache.py`, which uses only the standard library: `/opt/kazebot` and its `.venv` belong to `kazebot`, and running anything from there as root would hand the machine to the agent. `bootstrap.sh` and `install_provision.sh` install the copy and the units; `deploy.sh` refreshes the copy on every update.
+
+Running as root, it only follows root-owned processes through `/proc/<pid>/root`, because any user can start a process whose command line mentions napcat. It also scans the host directories the deploy scripts mount into the containers, `/opt/napcat/qq` and `/opt/napcat-<instance>/qq`, so stopped containers are cleaned too; archived `*.deleted-*` directories are left alone.
+
+Instance cleanups skip this task: `kazebot-cleanup@.service` passes `--scope workspace`, and `kazebot.service` / `kazebot@.service` set `CLONOTH_MAINTENANCE_SCOPE=workspace` for the cleanup the engine schedules itself. Without either, `engine.data_cleanup` still runs every task, as the legacy `clonoth-data-cleanup.service` below does.
+
+It never reads a workspace `.env`. Override the retention or add cache roots with a drop-in:
+
+```bash
+sudo systemctl edit kazebot-host-cleanup.service
+# [Service]
+# Environment=CLONOTH_QQ_CACHE_MAX_AGE_SECONDS=259200
+# Environment=CLONOTH_QQ_CACHE_ROOTS=/srv/qq-extra
+```
+
+Dry run, schedule and logs:
+
+```bash
+sudo /usr/bin/python3 -I /usr/local/lib/kazebot/qq_cache.py --dry-run
+systemctl list-timers kazebot-host-cleanup.timer
+journalctl -u kazebot-host-cleanup.service -n 100 --no-pager
+```
+
 ## Data cleanup timer
 
 `clonoth-data-cleanup.timer` runs `engine.data_cleanup` periodically. The cleanup script rotates large event logs and removes expired temporary files, artifacts, child-session files, node-context files, and files under `data/attachments/`.

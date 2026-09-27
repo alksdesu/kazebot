@@ -12,7 +12,8 @@ Environment=PYTHONPATH=/opt/kazebot
 Environment=CLONOTH_WORKSPACE=/opt/kazebot-data/%i
 Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=-/opt/kazebot-data/%i/.env
-ExecStart=/opt/kazebot/.venv/bin/python -m engine.data_cleanup
+# NapCat 容器里的缓存归 root，这里删不动，交给宿主清理（kazebot-host-cleanup）
+ExecStart=/opt/kazebot/.venv/bin/python -m engine.data_cleanup --scope workspace
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

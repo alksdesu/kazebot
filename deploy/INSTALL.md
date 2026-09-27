@@ -21,8 +21,9 @@ sudo /opt/kazebot/deploy/bootstrap.sh
 5  铺配置模板        data/config.yaml、data/policy.yaml、config/qq.yaml，都是空的等你填
 6  编前端            npm ci && npm run build，控制台就是配置入口
 7  起 NapCat         docker 容器 + 反向 WS 指向 127.0.0.1:8080
-8  装 systemd        kazebot.service、kazebot-qq.service
-9  启动并验证        health → engine → 8080 监听 → NapCat 通道
+8  装 root 侧组件    deploy.sh、宿主清理脚本放进 /usr/local/lib/kazebot，归 root
+9  装 systemd        kazebot.service、kazebot-qq.service、宿主清理的 timer
+10 启动并验证        health → engine → 8080 监听 → NapCat 通道
 ```
 
 端口固定是 `8765`（控制台）/ `8080`（NoneBot）/ `8769`（转发 Bridge）/ `6099`（NapCat WebUI），全部只听本机。这四个数字不能改，以后多开时新号的端口是在它们基础上推出来的。

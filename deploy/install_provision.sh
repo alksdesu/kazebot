@@ -27,6 +27,8 @@ install -m 0755 -o root -g root "$REPO/deploy/provision_instance.sh" "$LIB/provi
 install -m 0755 -o root -g root "$REPO/deploy/cloudflared_ingress.py" "$LIB/cloudflared_ingress.py"
 # 这一份不用重装：它每次跑都会先把自己同步成仓库里的最新版。
 install -m 0755 -o root -g root "$REPO/deploy/deploy.sh" "$LIB/deploy.sh"
+# 宿主清理以 root 跑这一份；之后 deploy.sh 每次更新会顺带同步它。
+install -m 0644 -o root -g root "$REPO/adapters/onebot/qq_cache.py" "$LIB/qq_cache.py"
 install -m 0644 -o root -g root \
   "$REPO/deploy/systemd/kazebot@.service" \
   "$REPO/deploy/systemd/kazebot-qq@.service" \
@@ -34,10 +36,12 @@ install -m 0644 -o root -g root \
   "$REPO/deploy/systemd/kazebot-cleanup@.timer" \
   "$LIB/units/"
 
-echo "==> 装触发单元与 polkit 规则"
+echo "==> 装触发单元、宿主清理与 polkit 规则"
 install -m 0644 -o root -g root \
   "$REPO/deploy/systemd/kazebot-provision@.service" \
   "$REPO/deploy/systemd/kazebot-deprovision@.service" \
+  "$REPO/deploy/systemd/kazebot-host-cleanup.service" \
+  "$REPO/deploy/systemd/kazebot-host-cleanup.timer" \
   /etc/systemd/system/
 install -d -m 0755 /etc/polkit-1/rules.d
 install -m 0644 -o root -g root \
@@ -65,6 +69,8 @@ cat >/etc/systemd/system/kazebot.service.d/10-instances.conf <<EOF
 [Service]
 ReadWritePaths=$DATA_ROOT
 Environment=CLONOTH_INSTANCES_FILE=$DATA_ROOT/instances.yaml
+# NapCat 容器里的缓存从此归宿主清理，engine 定时拉起的数据清理只管本工作区
+Environment=CLONOTH_MAINTENANCE_SCOPE=workspace
 EOF
 
 # bot 进程也要能开表情包库。工作区里那个 data/stickers 只是软链，
@@ -76,6 +82,9 @@ ReadWritePaths=$DATA_ROOT/stickers
 EOF
 
 systemctl daemon-reload
+
+echo "==> 启用宿主清理"
+systemctl enable --now kazebot-host-cleanup.timer
 
 echo "==> 把主实例登记进清单"
 sudo -u "$OWNER" CLONOTH_INSTANCES_FILE="$DATA_ROOT/instances.yaml" \
@@ -107,4 +116,5 @@ cat <<EOF
   systemctl show kazebot -p ReadWritePaths | tr ' ' '\n' | grep kazebot-data
   sudo -u $OWNER systemctl start kazebot-provision@$MAIN   # 应当被 polkit 放行（会报工作区已存在）
   sudo -u $OWNER systemctl start sshd                          # 应当被拒绝
+  systemctl list-timers kazebot-host-cleanup.timer             # 应当排着下一次宿主清理
 EOF

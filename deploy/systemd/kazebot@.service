@@ -14,6 +14,8 @@ Environment=CLONOTH_WORKSPACE=/opt/kazebot-data/%i
 Environment=CLONOTH_INSTANCES_FILE=/opt/kazebot-data/instances.yaml
 # 代码目录只读，几个实例同时写 __pycache__ 只会互相打架
 Environment=PYTHONDONTWRITEBYTECODE=1
+# engine 定时拉起的数据清理跟着它走：NapCat 容器里的缓存归宿主清理（kazebot-host-cleanup）
+Environment=CLONOTH_MAINTENANCE_SCOPE=workspace
 EnvironmentFile=-/opt/kazebot-data/%i/.env
 ExecStart=/opt/kazebot/.venv/bin/python /opt/kazebot/main.py
 Restart=always

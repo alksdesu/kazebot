@@ -8,6 +8,8 @@ Type=simple
 User=kazebot
 Group=kazebot
 WorkingDirectory=/opt/kazebot
+# engine 定时拉起的数据清理跟着它走：NapCat 容器里的缓存归宿主清理（kazebot-host-cleanup）
+Environment=CLONOTH_MAINTENANCE_SCOPE=workspace
 ExecStart=/opt/kazebot/.venv/bin/python main.py
 Restart=always
 RestartSec=3
