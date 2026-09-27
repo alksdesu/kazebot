@@ -11,18 +11,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from engine import memory_subjects
 from engine.builtin.knowledge_inject import (
     _BOOK_NAME_RE,
     _DEFAULT_SCAN_DEPTH,
     _MEMORY_ID_RE,
-    _MEMORY_NAMESPACE_RE,
     _invalidate_cache,
     _load_book,
     _memory_write_lock,
     _save_book,
     memory_dir,
 )
+from engine.memory_namespace import is_memory_namespace, is_valid_subject, subject_from_namespace
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +50,7 @@ def _valid_namespace(namespace: str) -> str:
     text = str(namespace or "").strip()
     if not text:
         return ""
-    if _MEMORY_NAMESPACE_RE.match(text):
-        return text
-    if text.startswith("user_") and memory_subjects.is_valid_subject(text[len("user_"):]):
+    if is_memory_namespace(text):
         return text
     raise MemoryAdminError(f"非法的记忆 namespace: {namespace}")
 
@@ -70,10 +67,6 @@ def _valid_entry_id(entry_id: str) -> str:
     if not _MEMORY_ID_RE.match(text):
         raise MemoryAdminError(f"非法的记忆 id: {entry_id}")
     return text
-
-
-def _namespace_subject(namespace: str) -> str:
-    return namespace[len("user_"):] if namespace.startswith("user_") else ""
 
 
 def _clean_keywords(raw: Any) -> list[str]:
@@ -110,10 +103,11 @@ def list_namespaces(workspace_root: Path) -> list[dict[str, Any]]:
         # 空的子目录仍要列出来，人才能把它清掉；根目录没东西就没什么可看的。
         if not entries and not namespace:
             continue
+        subject = subject_from_namespace(namespace)
         result.append({
             "namespace": namespace,
-            "kind": "subject" if namespace.startswith("user_") else ("conversation" if namespace else "orphan"),
-            "subject": _namespace_subject(namespace),
+            "kind": "subject" if subject else ("conversation" if namespace else "orphan"),
+            "subject": subject,
             "entry_count": len(entries),
             "books": sorted({entry["book"] for entry in entries}),
             "updated_at": max((entry.get("updated_at") or "" for entry in entries), default=""),
@@ -155,8 +149,8 @@ def upsert_entry(
 
     keywords = _clean_keywords(payload.get("keywords"))
     constant = bool(payload.get("constant"))
-    subject = str(payload.get("subject") or "").strip() or _namespace_subject(namespace)
-    if subject and not memory_subjects.is_valid_subject(subject):
+    subject = str(payload.get("subject") or "").strip() or subject_from_namespace(namespace)
+    if subject and not is_valid_subject(subject):
         raise MemoryAdminError(f"非法的 subject: {subject}")
     # 与 save_memory 同一条硬约束：三者皆空的条目注入侧会直接跳过，存了也读不到。
     if not keywords and not constant and not subject:

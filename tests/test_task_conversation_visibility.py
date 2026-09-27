@@ -21,10 +21,11 @@ if str(_ROOT) not in sys.path:
 
 import httpx  # noqa: E402
 import engine.data_cleanup as cleanup  # noqa: E402
+from engine.memory_namespace import conversation_namespace  # noqa: E402
 import supervisor.admin_api as admin_api  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
-from supervisor.conversation_labels import is_internal_task_key, memory_namespace  # noqa: E402
+from supervisor.conversation_labels import is_internal_task_key  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
@@ -35,7 +36,7 @@ _TOKEN = "test-admin-token"
 
 class TestInternalTaskKey:
     def test_a_namespace_shaped_key_is_internal(self) -> None:
-        assert is_internal_task_key(memory_namespace(_GROUP_KEY))
+        assert is_internal_task_key(conversation_namespace(_GROUP_KEY))
 
     @pytest.mark.parametrize("key", ["user_UserB", "user_UserAX", "user_A", "user_a_b_2"])
     def test_a_profile_namespace_is_internal_too(self, key: str) -> None:
@@ -72,12 +73,12 @@ class TestInternalTaskKey:
         "conv_short", "user_1abc", "user_a-b", "users_UserB",
     ])
     def test_the_cleanup_side_agrees(self, key: str) -> None:
-        # 两份独立实现 —— engine 不该为了一个正则去依赖 supervisor。靠这条锁住不漂移。
-        assert bool(cleanup._TASK_CONVERSATION_KEY_RE.match(key)) is is_internal_task_key(key)
+        # 两个消费端共用同一份判定，谁绕过去自己写一份都会在这里露出来。
+        assert cleanup.is_memory_namespace(key) is is_internal_task_key(key)
 
     def test_it_agrees_with_the_namespace_algorithm(self) -> None:
         # 真实会话键算出的 namespace 必然是内部形态 —— 两个函数说的是同一件事。
-        assert is_internal_task_key(memory_namespace("qq_group:abc"))
+        assert is_internal_task_key(conversation_namespace("qq_group:abc"))
 
 
 def _seed(tmp_path: Path, sessions: dict[str, dict], conv_files: dict[str, str]) -> None:
@@ -97,7 +98,7 @@ class TestConsoleListing:
     def rows(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[dict]:
         monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", _TOKEN)
         monkeypatch.setattr(admin_api, "_admin_token", "")
-        namespace = memory_namespace(_GROUP_KEY)
+        namespace = conversation_namespace(_GROUP_KEY)
         _seed(
             tmp_path,
             {
@@ -148,7 +149,7 @@ class TestCleanup:
     def env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         monkeypatch.setattr(cleanup, "DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(cleanup, "DRY_RUN", False, raising=False)
-        namespace = memory_namespace(_GROUP_KEY)
+        namespace = conversation_namespace(_GROUP_KEY)
         _seed(
             tmp_path,
             {

@@ -15,7 +15,8 @@ import pytest
 import yaml
 
 from engine import memory_subjects
-from engine.builtin.knowledge_inject import _conversation_memory_namespace, save_memory
+from engine.builtin.knowledge_inject import save_memory
+from engine.memory_namespace import conversation_namespace
 from toolbox.context import ToolContext
 
 from tests._node_prompts import assembled_prompt
@@ -64,27 +65,27 @@ class TestSaveMemoryRouting:
         _save(tmp_path, subject="UserZ")
 
         assert not (tmp_path / "data" / "memory" / "user_UserZ").exists()
-        conv = tmp_path / "data" / "memory" / _conversation_memory_namespace(_CONV_KEY) / "profile.yaml"
+        conv = tmp_path / "data" / "memory" / conversation_namespace(_CONV_KEY) / "profile.yaml"
         assert conv.exists()
         assert "subject" not in _read(conv)[0]
 
     def test_no_subject_keeps_the_old_conversation_scoping(self, tmp_path: Path) -> None:
         _save(tmp_path)
 
-        conv = tmp_path / "data" / "memory" / _conversation_memory_namespace(_CONV_KEY) / "profile.yaml"
+        conv = tmp_path / "data" / "memory" / conversation_namespace(_CONV_KEY) / "profile.yaml"
         assert conv.exists()
 
     def test_a_path_traversal_subject_cannot_escape_the_memory_dir(self, tmp_path: Path) -> None:
         _save(tmp_path, subject="../../etc")
 
-        conv = tmp_path / "data" / "memory" / _conversation_memory_namespace(_CONV_KEY) / "profile.yaml"
+        conv = tmp_path / "data" / "memory" / conversation_namespace(_CONV_KEY) / "profile.yaml"
         assert conv.exists()
         assert not (tmp_path / "data" / "etc").exists()
 
     def test_node_ids_are_written_instead_of_silently_dropped(self, tmp_path: Path) -> None:
         _save(tmp_path, node_ids=["qq.orchestrator"])
 
-        conv = tmp_path / "data" / "memory" / _conversation_memory_namespace(_CONV_KEY) / "profile.yaml"
+        conv = tmp_path / "data" / "memory" / conversation_namespace(_CONV_KEY) / "profile.yaml"
         assert _read(conv)[0]["node_ids"] == ["qq.orchestrator"]
 
     def test_an_update_does_not_wipe_fields_the_caller_omitted(self, tmp_path: Path) -> None:
@@ -101,7 +102,7 @@ class TestSaveMemoryRouting:
     def test_the_default_scan_depth_is_written_to_disk(self, tmp_path: Path) -> None:
         _save(tmp_path)
 
-        conv = tmp_path / "data" / "memory" / _conversation_memory_namespace(_CONV_KEY) / "profile.yaml"
+        conv = tmp_path / "data" / "memory" / conversation_namespace(_CONV_KEY) / "profile.yaml"
         assert _read(conv)[0]["scan_depth"] > 0
 
 

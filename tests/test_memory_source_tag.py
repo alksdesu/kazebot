@@ -13,10 +13,10 @@ import pytest
 import yaml
 
 from engine.builtin.knowledge_inject import (
-    _conversation_memory_namespace,
     delete_memory,
     save_memory,
 )
+from engine.memory_namespace import conversation_namespace
 from toolbox.context import ToolContext
 
 _CONV_KEY = "qq_group:bc3f12b0621298e191a49fa7"
@@ -55,7 +55,7 @@ def _delete(tmp_path: Path, node_id: str, mid: str = "m1") -> dict[str, Any]:
 
 
 def _book_path(tmp_path: Path, book: str = "habits") -> Path:
-    return tmp_path / "data" / "memory" / _conversation_memory_namespace(_CONV_KEY) / f"{book}.yaml"
+    return tmp_path / "data" / "memory" / conversation_namespace(_CONV_KEY) / f"{book}.yaml"
 
 
 def _entries(tmp_path: Path, book: str = "habits") -> list[dict[str, Any]]:

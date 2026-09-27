@@ -98,9 +98,12 @@ class TestUpsert:
 
 
 class TestNamespaceValidation:
-    @pytest.mark.parametrize("bad", ["../etc", "user_../x", "conv_zzz", "user_1bad", "conv_短", "x" * 90])
+    @pytest.mark.parametrize("bad", [
+        "../etc", "user_../x", "conv_zzz", "user_1bad", "conv_短", "x" * 90,
+        "user_ UserA", "user_UserA x", "conv_0123456789abcdef01234567 x",
+    ])
     def test_a_namespace_that_could_escape_the_memory_dir_is_refused(self, tmp_path: Path, bad: str) -> None:
-        # namespace 会被拼进目录名，穿越必须在入口就挡掉。
+        # namespace 会被拼进目录名，穿越必须在入口就挡掉；校验的是整串，前半截合规不算数。
         with pytest.raises(memory_admin.MemoryAdminError):
             memory_admin.list_entries(tmp_path, bad)
 

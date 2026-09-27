@@ -26,7 +26,7 @@ from engine.builtin.dream import (
     DreamHandler,
     _days_since,
 )
-from engine.builtin.knowledge_inject import _conversation_memory_namespace
+from engine.memory_namespace import conversation_namespace
 from tests._onebot_harness import load_runtime, set_live_config, adapter_source
 
 _NOW = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
@@ -38,7 +38,7 @@ def _iso(days_ago: int) -> str:
 
 
 def _write(tmp_path: Path, book: str, entries: list[dict[str, Any]], namespace: str = "") -> None:
-    ns = namespace or _conversation_memory_namespace(_KEY)
+    ns = namespace or conversation_namespace(_KEY)
     book_dir = tmp_path / "data" / "memory" / ns
     book_dir.mkdir(parents=True, exist_ok=True)
     (book_dir / f"{book}.yaml").write_text(
@@ -66,7 +66,7 @@ class TestDaysSince:
 
 class TestTopologyFields:
     def test_entries_carry_what_the_constraints_ask_for(self, tmp_path: Path) -> None:
-        namespace = _conversation_memory_namespace(_KEY)
+        namespace = conversation_namespace(_KEY)
         _write(tmp_path, "习惯", [
             {"id": "m1", "content": "内容一", "keywords": ["部署"], "created_at": _iso(40), "priority": 3},
             {"id": "m2", "content": "内容二", "keywords": ["部署"], "created_at": _iso(2), "priority": 0},
@@ -79,7 +79,7 @@ class TestTopologyFields:
             assert field in entry, f"约束按 {field} 判断，payload 里却没有"
 
     def test_the_loader_reads_them_off_disk(self, tmp_path: Path) -> None:
-        namespace = _conversation_memory_namespace(_KEY)
+        namespace = conversation_namespace(_KEY)
         _write(tmp_path, "习惯", [
             {"id": "m1", "content": "x" * 300, "keywords": ["a"], "created_at": _iso(9), "priority": 5},
         ])

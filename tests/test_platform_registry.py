@@ -481,7 +481,8 @@ class TestCoreRecognisesANewPlatform:
         assert accounts.is_current("web:console") is True
 
     def test_memory_directories_are_labelled_from_its_own_state(self, tmp_path: Path, telegram: PlatformDescriptor) -> None:
-        from supervisor.conversation_labels import describe_namespaces, memory_namespace
+        from engine.memory_namespace import conversation_namespace
+        from supervisor.conversation_labels import describe_namespaces
 
         platform_data_dir(telegram, tmp_path).mkdir(parents=True)
         platform_state_path(telegram, STATE_ROUTES, tmp_path).write_text(
@@ -493,13 +494,14 @@ class TestCoreRecognisesANewPlatform:
 
         labels = describe_namespaces(tmp_path)
 
-        assert labels[memory_namespace(_TG_GROUP)]["label"] == "猫猫群"
-        assert labels[memory_namespace(_TG_GROUP)]["kind"] == "group"
+        assert labels[conversation_namespace(_TG_GROUP)]["label"] == "猫猫群"
+        assert labels[conversation_namespace(_TG_GROUP)]["kind"] == "group"
 
     def test_aliases_keyed_by_bot_account_still_name_its_private_chats(
         self, tmp_path: Path, telegram: PlatformDescriptor,
     ) -> None:
-        from supervisor.conversation_labels import describe_namespaces, memory_namespace
+        from engine.memory_namespace import conversation_namespace
+        from supervisor.conversation_labels import describe_namespaces
 
         platform_data_dir(telegram, tmp_path).mkdir(parents=True)
         platform_state_path(telegram, STATE_ROUTES, tmp_path).write_text(
@@ -509,7 +511,7 @@ class TestCoreRecognisesANewPlatform:
             json.dumps({"users": {"bot1/555": {"alias": "UserC", "last_seen": 1}}}), encoding="utf-8",
         )
 
-        label = describe_namespaces(tmp_path)[memory_namespace(_TG_PRIVATE)]
+        label = describe_namespaces(tmp_path)[conversation_namespace(_TG_PRIVATE)]
 
         assert label["alias"] == "UserC" and label["label"] == "UserC"
 
@@ -517,7 +519,8 @@ class TestCoreRecognisesANewPlatform:
         self, tmp_path: Path, telegram: PlatformDescriptor,
     ) -> None:
         # 会话键里看不出是哪个号，挑一个就可能把别人的名字安到这段私聊上。
-        from supervisor.conversation_labels import describe_namespaces, memory_namespace
+        from engine.memory_namespace import conversation_namespace
+        from supervisor.conversation_labels import describe_namespaces
 
         platform_data_dir(telegram, tmp_path).mkdir(parents=True)
         platform_state_path(telegram, STATE_ROUTES, tmp_path).write_text(
@@ -531,6 +534,6 @@ class TestCoreRecognisesANewPlatform:
             encoding="utf-8",
         )
 
-        label = describe_namespaces(tmp_path)[memory_namespace(_TG_PRIVATE)]
+        label = describe_namespaces(tmp_path)[conversation_namespace(_TG_PRIVATE)]
 
         assert label["alias"] == "" and label["label"] == "私聊 555"

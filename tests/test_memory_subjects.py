@@ -32,6 +32,7 @@ from engine.builtin.knowledge_inject import (  # noqa: E402
     _load_subject_memory_entries,
     normalize_memory_entries,
 )
+from engine.memory_namespace import subject_namespace  # noqa: E402
 
 
 def _enroll(tmp_path: Path, *aliases: str) -> None:
@@ -232,8 +233,8 @@ class TestRoster:
         assert memory_subjects.enrolled_subjects(tmp_path) == set()
 
     def test_the_namespace_is_derived_from_the_alias(self) -> None:
-        assert memory_subjects.subject_namespace("UserA") == "user_UserA"
-        assert memory_subjects.subject_namespace("../etc") == ""
+        assert subject_namespace("UserA") == "user_UserA"
+        assert subject_namespace("../etc") == ""
 
     def test_only_enrolled_subjects_survive_resolution(self, tmp_path: Path) -> None:
         _enroll(tmp_path, "UserA", "UserC")

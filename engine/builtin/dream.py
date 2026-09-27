@@ -12,10 +12,11 @@ from typing import Any
 import yaml
 
 from clonoth_runtime import get_bool, get_str, load_runtime_config
-from engine.builtin.knowledge_inject import _MEMORY_NAMESPACE_RE, _conversation_memory_namespace, memory_dir
+from engine.builtin.knowledge_inject import memory_dir
 from engine.cron import cron_match
 from engine.builtin.memory_extract import _format_transcript_for_extract
 from engine import memory_subjects
+from engine.memory_namespace import conversation_namespace, is_memory_namespace, subject_namespace
 
 
 log = logging.getLogger(__name__)
@@ -416,7 +417,7 @@ class DreamHandler:
         skill_list = ""
         created: list[str] = []
         for subject in sorted(memory_subjects.enrolled_subjects(workspace_root)):
-            namespace = memory_subjects.subject_namespace(subject)
+            namespace = subject_namespace(subject)
             if not namespace:
                 continue
             entries = self._load_memory_topology_entries(workspace_root, namespace)
@@ -539,8 +540,7 @@ class DreamHandler:
                         "entry_node_id": node_id,
                         "is_system_task": True,
                         "use_context": False,
-                        # 人物档案的 namespace 推不出 conv_ 摘要，记忆工具靠这里定位
-                        # 已有条目；漏了它，改写会在会话目录另长一条。
+                        # 会话键本身就是档案目录；这里再点一次名，记忆工具寻址不只押在会话键这一条路上。
                         **({"memory_hints": {"subjects": [subject]}} if subject else {}),
                     },
                 },
@@ -705,11 +705,11 @@ class DreamHandler:
             # conversations, not its own internal system sessions. How: skip
             # system/internal registry rows before ranking JSONL mtimes. Purpose:
             # prevent recursive Dream self-analysis.
-            # Dream 自己的整理任务以目标 namespace 为 conversation_key，长得像
-            # conv_<hash>，不排掉的话下一轮会把上一轮的整理记录当成活跃会话再提取一次。
+            # Dream 自己的整理任务以目标 namespace 为 conversation_key：会话整理是 conv_<摘要>，
+            # 人物档案整理是 user_<别名>。不排掉的话下一轮会把上一轮的整理记录当成活跃会话再提取一次。
             if conv_key.startswith("system:") or channel == "internal":
                 continue
-            if _MEMORY_NAMESPACE_RE.match(conv_key):
+            if is_memory_namespace(conv_key):
                 continue
             active.add(sid)
         return active
@@ -740,7 +740,7 @@ class DreamHandler:
         targets: dict[str, tuple[str, str]] = {}
         for sid in session_ids:
             conv_key = str((rows.get(sid) or {}).get("conversation_key") or "").strip()
-            namespace = _conversation_memory_namespace(conv_key)
+            namespace = conversation_namespace(conv_key)
             if namespace:
                 targets[sid] = (conv_key, namespace)
         return targets

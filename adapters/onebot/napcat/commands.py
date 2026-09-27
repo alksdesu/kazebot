@@ -9,8 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from nonebot.adapters.onebot.v11 import Bot, Event
-from engine.conversation_migration import namespace_dir
 from engine.memory_hit_cache import prune_namespace_hits
+from engine.memory_namespace import conversation_namespace
 from ..config import CLONOTH_WORKSPACE, CUSTOM_FACE_METADATA_PATH, CUSTOM_FACE_NAMES_PATH
 from adapters._shared import capability
 from adapters._shared.send_guard import AmbiguousClaim
@@ -589,7 +589,7 @@ def _conversation_memory_namespace_for_group(group_id: int) -> str:
     这里用 _scoped_stable_key 而非 _stable_conversation_key，后者会顺带
     给群分配匿名别名。
     """
-    return namespace_dir(routing._scoped_stable_key(f"qq_group:{int(group_id)}"))
+    return conversation_namespace(routing._scoped_stable_key(f"qq_group:{int(group_id)}"))
 
 
 def _clear_group_memory_namespace(group_id: int) -> tuple[bool, int]:
@@ -599,6 +599,9 @@ def _clear_group_memory_namespace(group_id: int) -> tuple[bool, int]:
     的命中记录，不再整份删掉全局 .hit_cache.json 抹平其他群的命中。
     """
     namespace = _conversation_memory_namespace_for_group(group_id)
+    if not namespace:
+        # 空串拼出来就是 data/memory 根目录，删下去是所有会话的记忆。
+        return False, 0
     mem_root = Path(CLONOTH_WORKSPACE) / "data" / "memory"
     ns_dir = mem_root / namespace
     deleted_books = 0

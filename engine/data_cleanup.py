@@ -29,6 +29,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct ``python engine/data_cl
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:  # 直接 ``python engine/data_cleanup.py`` 时项目根不在路径上
     sys.path.insert(0, str(_REPO_ROOT))
+from engine.memory_namespace import SUBJECT_PREFIX, is_memory_namespace  # noqa: E402
 from platforms.descriptor import HOOK_MAINTENANCE  # noqa: E402
 from platforms.registry import MissingPlatformHook, all_platforms, platform_hook  # noqa: E402
 from workspace import resolve_workspace_root  # noqa: E402
@@ -66,10 +67,6 @@ CHILD_SESSION_MAX_AGE = 24 * 3600     # 24 h（与默认 TTL 一致）
 # dream 的整理任务会话。留 7 天够回溯几轮整理做了什么，再久没有价值。
 TASK_CONVERSATION_MAX_AGE = float(
     os.getenv("CLONOTH_TASK_CONVERSATION_MAX_AGE_SECONDS", str(7 * 24 * 3600)))
-# 与 supervisor.conversation_labels._TASK_KEY_RE 同一个形态，两边改一起改。
-# conv_<摘要> 是会话记忆整理，user_<别名> 是人物档案整理。
-_TASK_CONVERSATION_KEY_RE = re.compile(
-    r"^(?:conv_[0-9a-f]{24}|user_[A-Za-z][A-Za-z0-9_]{0,63})$")
 
 # Phase D：node_contexts 目录清理。child session 已替代 snapshot 机制，
 # 保留 48h 宽裕期后清理旧文件（比 child session TTL 长一倍，确保兼容期充分）。
@@ -315,7 +312,7 @@ def purge_expired_memory_entries():
             namespace = ""
         if namespace == ".":
             namespace = ""
-        if namespace.startswith("user_"):
+        if namespace.startswith(SUBJECT_PREFIX):
             # 跨会话人物档案不参与年龄淘汰：画像的价值就在长期积累，
             # 「三个月前提过对象生日」正是它存在的理由。只能手工删。
             skipped_archives += 1
@@ -473,8 +470,7 @@ def purge_expired_task_conversations():
     session_ids = {
         str(row.get("session_id") or "").strip()
         for row in rows
-        if isinstance(row, dict)
-        and _TASK_CONVERSATION_KEY_RE.match(str(row.get("conversation_key") or "").strip())
+        if isinstance(row, dict) and is_memory_namespace(row.get("conversation_key"))
     }
     cutoff = time.time() - TASK_CONVERSATION_MAX_AGE
     deleted = 0

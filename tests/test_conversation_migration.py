@@ -20,10 +20,11 @@ from engine.conversation_migration import (  # noqa: E402
     apply_migration,
     memory_root,
     move_memory,
-    namespace_dir,
+    plan_migration,
     record_route,
     route_state_file,
 )
+from engine.memory_namespace import conversation_namespace  # noqa: E402
 from platforms.descriptor import CHANNEL_GROUP, ChannelDescriptor, PlatformDescriptor  # noqa: E402
 
 MATRIX = PlatformDescriptor(
@@ -117,14 +118,14 @@ class TestRecordRoute:
 
 class TestMoveMemory:
     def _plan(self, tmp_path: Path, *, dir_exists: bool = True) -> MigrationPlan:
-        old_ns, new_ns = namespace_dir(SOURCE), namespace_dir(TARGET)
+        old_ns, new_ns = conversation_namespace(SOURCE), conversation_namespace(TARGET)
         return MigrationPlan(renames=[Rename(
             real="qq_group:12345", old_stable=SOURCE, new_stable=TARGET, old_ns=old_ns, new_ns=new_ns,
             dir_exists=dir_exists, target_exists=(memory_root(tmp_path) / new_ns).exists(),
         )])
 
     def test_memory_and_hits_move_and_the_backup_holds_the_routes_about_to_change(self, tmp_path: Path) -> None:
-        old_ns, new_ns = namespace_dir(SOURCE), namespace_dir(TARGET)
+        old_ns, new_ns = conversation_namespace(SOURCE), conversation_namespace(TARGET)
         (memory_root(tmp_path) / old_ns).mkdir(parents=True)
         (memory_root(tmp_path) / old_ns / "book.yaml").write_text("entries: []\n", encoding="utf-8")
         hit_cache.hit_cache_path(tmp_path).write_text(json.dumps({f"{old_ns}/e1": "2026-01-01"}), encoding="utf-8")
@@ -145,7 +146,7 @@ class TestMoveMemory:
         assert _routes(routes) == {"real_conversation_keys": {OTHER: OTHER_REAL}}
 
     def test_the_caller_can_do_without_the_backup(self, tmp_path: Path) -> None:
-        old_ns, new_ns = namespace_dir(SOURCE), namespace_dir(TARGET)
+        old_ns, new_ns = conversation_namespace(SOURCE), conversation_namespace(TARGET)
         (memory_root(tmp_path) / old_ns).mkdir(parents=True)
 
         outcome = move_memory(workspace=tmp_path, platform=MATRIX, plan=self._plan(tmp_path), make_backup=False)
@@ -163,7 +164,7 @@ class TestMoveMemory:
         assert not list(tmp_path.glob("data/migration_backup_*"))
 
     def test_a_target_that_appears_after_the_preview_stops_before_the_backup(self, tmp_path: Path) -> None:
-        old_ns, new_ns = namespace_dir(SOURCE), namespace_dir(TARGET)
+        old_ns, new_ns = conversation_namespace(SOURCE), conversation_namespace(TARGET)
         (memory_root(tmp_path) / old_ns).mkdir(parents=True)
         plan = self._plan(tmp_path)
         (memory_root(tmp_path) / new_ns).mkdir()
@@ -175,6 +176,35 @@ class TestMoveMemory:
         assert not list(tmp_path.glob("data/migration_backup_*"))
 
 
+class TestPlanMigration:
+    def _routes(self, tmp_path: Path, mapping: dict[str, str]) -> None:
+        path = route_state_file(tmp_path, MATRIX)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"real_conversation_keys": mapping}), encoding="utf-8")
+
+    @pytest.mark.parametrize("answer", [None, ""], ids=["认不出来历", "算出空键"])
+    def test_a_key_that_cannot_be_rekeyed_is_left_to_a_human(self, tmp_path: Path, answer: str | None) -> None:
+        # 空键的目录名是空串，当成新键就把 data/memory 根目录本身当成了搬运目标。
+        self._routes(tmp_path, {TARGET: TARGET_REAL})
+
+        plan = plan_migration(workspace=tmp_path, platform=MATRIX, restable=lambda _old, _real: answer)
+
+        assert [(item.old_stable, item.old_ns) for item in plan.unresolved] == [
+            (TARGET, conversation_namespace(TARGET)),
+        ]
+        assert plan.renames == []
+
+    def test_a_rekeyed_conversation_becomes_a_rename(self, tmp_path: Path) -> None:
+        self._routes(tmp_path, {SOURCE: TARGET_REAL})
+
+        plan = plan_migration(workspace=tmp_path, platform=MATRIX, restable=lambda _old, _real: TARGET)
+
+        assert [(r.old_ns, r.new_ns) for r in plan.renames] == [
+            (conversation_namespace(SOURCE), conversation_namespace(TARGET)),
+        ]
+        assert plan.unresolved == []
+
+
 class TestApplyMigration:
     def test_a_new_platform_migrates_inside_its_own_data_dir(self, tmp_path: Path) -> None:
         renamed = "mx_room:" + "d" * 24
@@ -183,10 +213,10 @@ class TestApplyMigration:
         routes.write_text(json.dumps({
             "real_conversation_keys": {TARGET: TARGET_REAL}, "session_targets": {"s1": {"conversation_key": TARGET}},
         }), encoding="utf-8")
-        (memory_root(tmp_path) / namespace_dir(TARGET)).mkdir(parents=True)
+        (memory_root(tmp_path) / conversation_namespace(TARGET)).mkdir(parents=True)
         plan = MigrationPlan(renames=[Rename(
-            real=TARGET_REAL, old_stable=TARGET, new_stable=renamed, old_ns=namespace_dir(TARGET),
-            new_ns=namespace_dir(renamed), dir_exists=True, target_exists=False,
+            real=TARGET_REAL, old_stable=TARGET, new_stable=renamed, old_ns=conversation_namespace(TARGET),
+            new_ns=conversation_namespace(renamed), dir_exists=True, target_exists=False,
         )])
 
         outcome = apply_migration(workspace=tmp_path, platform=MATRIX, plan=plan, make_backup=False)
@@ -195,5 +225,5 @@ class TestApplyMigration:
             "real_conversation_keys": {renamed: TARGET_REAL}, "session_targets": {"s1": {"conversation_key": renamed}},
         }
         assert (outcome.route_keys_changed, outcome.backup_dir) == (2, None)
-        assert (memory_root(tmp_path) / namespace_dir(renamed)).is_dir()
+        assert (memory_root(tmp_path) / conversation_namespace(renamed)).is_dir()
         assert routes.parent == tmp_path / "data" / "platforms" / "matrix"

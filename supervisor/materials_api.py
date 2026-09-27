@@ -11,9 +11,10 @@ from fastapi.responses import FileResponse
 
 from engine.materials import MaterialError, MaterialService
 from engine.materials.storage import MAX_FILE_BYTES, identity
+from engine.memory_namespace import conversation_namespace
 from .feature_auth import resolve_actor
 from .admin_api import verify_admin_token
-from .conversation_labels import account_scope, describe_namespaces, memory_namespace
+from .conversation_labels import account_scope, describe_namespaces
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +109,7 @@ def create_router(state) -> APIRouter:
         accounts = account_scope(state.workspace_root)
         return [{
             **dict(row),
-            "owner": labels.get(memory_namespace(row["scope"])),
+            "owner": labels.get(conversation_namespace(row["scope"])),
             "current_account": accounts.is_current(row["scope"]),
         } for row in rows]
 

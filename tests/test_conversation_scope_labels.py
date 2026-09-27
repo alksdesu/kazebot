@@ -13,7 +13,8 @@ from fastapi import FastAPI
 import supervisor.admin_api as admin_api
 import supervisor.materials_api as materials_api
 from engine.materials import MaterialService
-from supervisor.conversation_labels import describe_namespaces, memory_namespace
+from engine.memory_namespace import conversation_namespace
+from supervisor.conversation_labels import describe_namespaces
 from supervisor.feature_auth import FeatureActor
 
 GROUP = "qq_group:" + "a" * 24
@@ -38,7 +39,7 @@ def seed_names(root: Path, group_name: str = "测试群", person_name: str = "�
 
 def test_unknown_group_has_an_explicit_missing_name_label(tmp_path: Path):
     seed_names(tmp_path)
-    owner = describe_namespaces(tmp_path)[memory_namespace(UNKNOWN)]
+    owner = describe_namespaces(tmp_path)[conversation_namespace(UNKNOWN)]
     assert owner["label"] == "群聊（名称暂不可用）"
     assert owner["real_id"] == ""
     assert owner["conversation_key"] == UNKNOWN
@@ -47,7 +48,7 @@ def test_unknown_group_has_an_explicit_missing_name_label(tmp_path: Path):
 
 def test_explicit_material_scope_without_session_keeps_original_identity(tmp_path: Path):
     key = "qq_private:" + "d" * 24
-    owner = describe_namespaces(tmp_path, conversation_keys=[key])[memory_namespace(key)]
+    owner = describe_namespaces(tmp_path, conversation_keys=[key])[conversation_namespace(key)]
     assert owner["label"] == "私聊（名称暂不可用）"
     assert owner["conversation_key"] == key
     assert owner["name_available"] is False
@@ -57,7 +58,7 @@ def test_explicit_material_scope_without_session_keeps_original_identity(tmp_pat
 def test_bad_alias_entry_does_not_break_known_group_name(tmp_path: Path):
     seed_names(tmp_path)
     (tmp_path / "data/onebot_anon_map.json").write_text(json.dumps({"groups": {"101": "old-invalid-entry"}}))
-    assert describe_namespaces(tmp_path)[memory_namespace(GROUP)]["label"] == "测试群"
+    assert describe_namespaces(tmp_path)[conversation_namespace(GROUP)]["label"] == "测试群"
 
 
 def test_workspace_name_resolution_does_not_share_names(tmp_path: Path):
@@ -66,14 +67,14 @@ def test_workspace_name_resolution_does_not_share_names(tmp_path: Path):
     seed_names(second, "乙实例群", "乙实例联系人")
     for root, group, person in [(first, "甲实例群", "甲实例联系人"), (second, "乙实例群", "乙实例联系人")]:
         labels = describe_namespaces(root)
-        assert labels[memory_namespace(GROUP)]["label"] == group
-        assert labels[memory_namespace(PRIVATE)]["label"] == person
+        assert labels[conversation_namespace(GROUP)]["label"] == group
+        assert labels[conversation_namespace(PRIVATE)]["label"] == person
 
 
 @pytest.mark.parametrize("name", ["GroupA", "qq_group:兴趣小组"])
 def test_real_names_are_distinguished_from_technical_fallbacks(tmp_path: Path, name: str):
     seed_names(tmp_path, name)
-    owner = describe_namespaces(tmp_path)[memory_namespace(GROUP)]
+    owner = describe_namespaces(tmp_path)[conversation_namespace(GROUP)]
     assert owner["label"] == name
     assert owner["name_available"] is True
 
@@ -83,10 +84,10 @@ def test_malformed_name_metadata_uses_known_aliases(tmp_path: Path):
     (tmp_path / "data/qq_live_state.json").write_text(json.dumps({"group_names": {"101": {"wrong": "shape"}}}))
     (tmp_path / "data/memory_subjects.json").write_text(json.dumps({"subjects": {"UserA": {"display_name": ["wrong"]}}}))
     owners = describe_namespaces(tmp_path)
-    assert owners[memory_namespace(GROUP)]["label"] == "GroupA"
-    assert owners[memory_namespace(PRIVATE)]["label"] == "UserA"
-    assert owners[memory_namespace(GROUP)]["name_available"] is False
-    assert owners[memory_namespace(PRIVATE)]["name_available"] is False
+    assert owners[conversation_namespace(GROUP)]["label"] == "GroupA"
+    assert owners[conversation_namespace(PRIVATE)]["label"] == "UserA"
+    assert owners[conversation_namespace(GROUP)]["name_available"] is False
+    assert owners[conversation_namespace(PRIVATE)]["name_available"] is False
 
 
 def test_a_route_state_moved_by_env_is_still_read(tmp_path: Path, monkeypatch):
@@ -98,7 +99,7 @@ def test_a_route_state_moved_by_env_is_still_read(tmp_path: Path, monkeypatch):
     moved.write_text(json.dumps({"real_conversation_keys": {GROUP: "qq_group:101"}}), encoding="utf-8")
     monkeypatch.setenv("ONEBOT_STATE_FILE", "private/routes.json")
 
-    assert describe_namespaces(tmp_path)[memory_namespace(GROUP)]["label"] == "测试群"
+    assert describe_namespaces(tmp_path)[conversation_namespace(GROUP)]["label"] == "测试群"
 
 
 @pytest.fixture

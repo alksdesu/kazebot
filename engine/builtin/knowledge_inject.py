@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import os as _os
 import re
@@ -13,10 +12,10 @@ from typing import Any, Iterable
 import yaml
 
 from clonoth_runtime import get_int
+from engine.memory_namespace import conversation_namespace, subject_namespace
 from engine.memory_subjects import (
     is_enrolled as _subject_is_enrolled,
     resolve_load_subjects,
-    subject_namespace,
 )
 from engine.node import Node
 from toolbox._common import request_guard, resolve_under_allowed_roots
@@ -378,26 +377,9 @@ def memory_dir(workspace_root: Path, memory_book: str = "") -> Path:
     return base
 
 
-
-_MEMORY_NAMESPACE_RE = re.compile(r"^conv_[0-9a-f]{24}$")
-
 # 记忆条目缺 scan_depth 时的扫描轮数。写入侧和载入侧共用同一个值，否则手工写的
 # YAML 会退回「只看当前这一句」，而那正是召回率最大的那个洞。
 _DEFAULT_SCAN_DEPTH = 2
-
-
-def _conversation_memory_namespace(conversation_key: Any) -> str:
-    """Return a stable per-conversation memory namespace without leaking raw ids."""
-    raw = str(conversation_key or "").strip()
-    if not raw:
-        return ""
-    # 已经是 namespace 就原样返回：dream 需要以目标会话的 namespace 为 conversation_key
-    # 建任务，才能让 save_memory/delete_memory 落到那个会话的目录。真实 key 一律形如
-    # <channel>:<id>，必带冒号，不会命中这里。
-    if _MEMORY_NAMESPACE_RE.match(raw):
-        return raw
-    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
-    return f"conv_{digest}"
 
 
 def memory_owner_conversation_key(conversation_key: Any, routed_key: Any = "", parent_key: Any = "") -> str:
@@ -421,7 +403,7 @@ def _context_memory_namespace(node: Node | None = None, task_context: dict[str, 
     if explicit:
         return explicit
     ctx = task_context if isinstance(task_context, dict) else {}
-    return _conversation_memory_namespace(memory_owner_conversation_key(
+    return conversation_namespace(memory_owner_conversation_key(
         ctx.get("conversation_key"),
         ctx.get("route_conversation_key"),
         ctx.get("parent_conversation_key"),
@@ -444,7 +426,7 @@ def _tool_memory_namespaces(ctx: ToolContext, subject: str = "") -> list[str]:
     node_extra = getattr(ctx, "_node_extra", None) or {}
     explicit = str(node_extra.get("memory_book") or "").strip()
     # 写入侧必须和注入侧算出同一个 namespace，否则子节点写进的目录下一轮读不到。
-    namespaces.append(explicit or _conversation_memory_namespace(memory_owner_conversation_key(
+    namespaces.append(explicit or conversation_namespace(memory_owner_conversation_key(
         getattr(ctx, "conversation_key", ""),
         getattr(ctx, "_route_conversation_key", ""),
         getattr(ctx, "_parent_conversation_key", ""),

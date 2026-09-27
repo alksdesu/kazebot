@@ -5,14 +5,13 @@
 """
 from __future__ import annotations
 
-import hashlib
 import json
-import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from engine.memory_namespace import conversation_namespace, is_memory_namespace
 from platforms.descriptor import (
     CHANNEL_GROUP,
     CONVERSATION_KINDS,
@@ -29,12 +28,6 @@ from platforms.registry import (
     stable_key_pattern,
 )
 
-# 两种 memory namespace 形态：会话记忆按摘要建目录，人物档案按别名
-# （别名规则见 engine.memory_subjects.SUBJECT_RE）。
-_CONV_NAMESPACE = r"conv_[0-9a-f]{24}"
-_SUBJECT_NAMESPACE = r"user_[A-Za-z][A-Za-z0-9_]{0,63}"
-_NAMESPACE_RE = re.compile(rf"^{_CONV_NAMESPACE}$")
-_TASK_KEY_RE = re.compile(rf"^(?:{_CONV_NAMESPACE}|{_SUBJECT_NAMESPACE})$")
 _SESSIONS = "sessions.json"
 _ROSTER = "memory_subjects.json"
 
@@ -47,16 +40,6 @@ def _read_json(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def memory_namespace(conversation_key: str) -> str:
-    """与 knowledge_inject._conversation_memory_namespace 同一个算法。"""
-    raw = str(conversation_key or "").strip()
-    if not raw:
-        return ""
-    if _NAMESPACE_RE.match(raw):
-        return raw
-    return "conv_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
-
-
 def is_internal_task_key(conversation_key: str) -> bool:
     """这条会话键是内部任务借 memory namespace 建的，不是真人对话。
 
@@ -64,7 +47,7 @@ def is_internal_task_key(conversation_key: str) -> bool:
     supervisor 于是给它开一条 session。会话整理用 conv_<摘要>，人物档案整理用
     user_<别名>；真人会话键永远带平台通道前缀，两种都长不成。
     """
-    return bool(_TASK_KEY_RE.match(str(conversation_key or "").strip()))
+    return is_memory_namespace(conversation_key)
 
 
 def is_runtime_copy_session(session_id: str) -> bool:
@@ -225,7 +208,7 @@ def describe_namespaces(
         key for key in conversation_keys if isinstance(key, str) and key
     }
     for key in keys:
-        namespace = memory_namespace(key)
+        namespace = conversation_namespace(key)
         if not namespace:
             continue
         found = conversation_channel(key)

@@ -15,7 +15,7 @@ import pytest
 import yaml
 
 from engine.builtin.dream import DreamHandler
-from engine.builtin.knowledge_inject import _conversation_memory_namespace
+from engine.memory_namespace import conversation_namespace
 
 _NOW = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
 _KEY = "qq_group:bc3f12b0621298e191a49fa7"
@@ -43,7 +43,7 @@ def _write_session(tmp_path: Path) -> None:
 
 def _write_memory(tmp_path: Path) -> None:
     """两条说同一件事的记忆：没有可整理的内容时 dream 直接收尾，跑不到整理阶段。"""
-    book_dir = tmp_path / "data" / "memory" / _conversation_memory_namespace(_KEY)
+    book_dir = tmp_path / "data" / "memory" / conversation_namespace(_KEY)
     book_dir.mkdir(parents=True, exist_ok=True)
     (book_dir / "people.yaml").write_text(yaml.safe_dump({
         "book": "people",

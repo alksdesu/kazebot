@@ -16,7 +16,7 @@ import pytest
 import yaml
 
 from engine.builtin.dream import DreamHandler
-from engine.builtin.knowledge_inject import _conversation_memory_namespace
+from engine.memory_namespace import conversation_namespace, subject_namespace
 
 _NOW = datetime(2026, 8, 16, 19, 0, tzinfo=timezone.utc)
 _GROUP_KEY = "qq_group:bc3f12b0621298e191a49fa7"
@@ -99,7 +99,7 @@ def _ctx(tmp_path: Path, recorder: _Recorder, *, now: datetime = _NOW) -> dict[s
 
 class TestNamespaceScan:
     def test_book_list_reads_the_conversation_subdirectory(self, tmp_path: Path) -> None:
-        namespace = _conversation_memory_namespace(_GROUP_KEY)
+        namespace = conversation_namespace(_GROUP_KEY)
         _write_memory(tmp_path, namespace, "习惯", [_entry("m1", ["a"])])
         _write_memory(tmp_path, namespace, "术语", [_entry("m2", ["b"])])
 
@@ -108,20 +108,20 @@ class TestNamespaceScan:
     def test_book_list_carries_entry_counts(self, tmp_path: Path) -> None:
         # 提示词让模型合并「条目数 ≤ 5 的碎片 book」，只给名字它只能猜，
         # 或者去全量 list_memories —— 那正是约束 1 明令禁止的。
-        namespace = _conversation_memory_namespace(_GROUP_KEY)
+        namespace = conversation_namespace(_GROUP_KEY)
         _write_memory(tmp_path, namespace, "大本", [_entry(f"m{i}", ["a"]) for i in range(7)])
         _write_memory(tmp_path, namespace, "碎片", [_entry("z1", ["b"])])
 
         assert DreamHandler()._build_book_list(tmp_path, namespace) == "大本(7), 碎片(1)"
 
     def test_book_list_does_not_leak_other_conversations(self, tmp_path: Path) -> None:
-        _write_memory(tmp_path, _conversation_memory_namespace(_GROUP_KEY), "群本", [_entry("m1", ["a"])])
-        _write_memory(tmp_path, _conversation_memory_namespace(_PRIVATE_KEY), "私聊本", [_entry("m2", ["b"])])
+        _write_memory(tmp_path, conversation_namespace(_GROUP_KEY), "群本", [_entry("m1", ["a"])])
+        _write_memory(tmp_path, conversation_namespace(_PRIVATE_KEY), "私聊本", [_entry("m2", ["b"])])
 
-        assert DreamHandler()._build_book_list(tmp_path, _conversation_memory_namespace(_GROUP_KEY)) == "群本(1)"
+        assert DreamHandler()._build_book_list(tmp_path, conversation_namespace(_GROUP_KEY)) == "群本(1)"
 
     def test_topology_clusters_entries_inside_one_namespace(self, tmp_path: Path) -> None:
-        namespace = _conversation_memory_namespace(_GROUP_KEY)
+        namespace = conversation_namespace(_GROUP_KEY)
         _write_memory(tmp_path, namespace, "习惯", [
             _entry("m1", ["部署", "生产"]),
             _entry("m2", ["部署", "生产"]),
@@ -133,10 +133,10 @@ class TestNamespaceScan:
         assert payload["total_clusters"] == 1
 
     def test_topology_is_empty_for_a_namespace_without_memory(self, tmp_path: Path) -> None:
-        _write_memory(tmp_path, _conversation_memory_namespace(_GROUP_KEY), "群本", [_entry("m1", ["a"])])
+        _write_memory(tmp_path, conversation_namespace(_GROUP_KEY), "群本", [_entry("m1", ["a"])])
 
         payload = json.loads(
-            DreamHandler()._build_keyword_topology_json(tmp_path, _conversation_memory_namespace(_PRIVATE_KEY))
+            DreamHandler()._build_keyword_topology_json(tmp_path, conversation_namespace(_PRIVATE_KEY))
         )
 
         assert payload["total_entries"] == 0
@@ -197,17 +197,17 @@ class TestNamespaceScan:
 
 class TestNamespaceResolution:
     def test_namespace_of_an_existing_namespace_is_itself(self) -> None:
-        namespace = _conversation_memory_namespace(_GROUP_KEY)
+        namespace = conversation_namespace(_GROUP_KEY)
 
-        assert _conversation_memory_namespace(namespace) == namespace
+        assert conversation_namespace(namespace) == namespace
 
     def test_real_keys_still_hash(self) -> None:
-        assert _conversation_memory_namespace(_GROUP_KEY).startswith("conv_")
-        assert _conversation_memory_namespace(_GROUP_KEY) != _GROUP_KEY
+        assert conversation_namespace(_GROUP_KEY).startswith("conv_")
+        assert conversation_namespace(_GROUP_KEY) != _GROUP_KEY
 
     def test_lookalike_strings_are_not_treated_as_namespaces(self) -> None:
         for value in ["conv_" + "z" * 24, "conv_abc", "conv_" + "a" * 25, "channel:conv_" + "a" * 24]:
-            assert _conversation_memory_namespace(value) != value
+            assert conversation_namespace(value) != value
 
     def test_sessions_map_to_the_namespace_their_tools_write_into(self, tmp_path: Path) -> None:
         _write_session(tmp_path, "sess-a", _GROUP_KEY)
@@ -216,15 +216,22 @@ class TestNamespaceResolution:
         mapping = DreamHandler()._session_memory_targets(tmp_path, ["sess-a", "sess-b", "sess-missing"])
 
         assert mapping == {
-            "sess-a": (_GROUP_KEY, _conversation_memory_namespace(_GROUP_KEY)),
-            "sess-b": (_PRIVATE_KEY, _conversation_memory_namespace(_PRIVATE_KEY)),
+            "sess-a": (_GROUP_KEY, conversation_namespace(_GROUP_KEY)),
+            "sess-b": (_PRIVATE_KEY, conversation_namespace(_PRIVATE_KEY)),
         }
 
     def test_dream_own_sessions_are_excluded_from_the_next_run(self, tmp_path: Path) -> None:
         # Dream 的整理任务以 namespace 作为 conversation_key；不排掉就会被当成
         # 活跃会话，下一轮对上一轮的整理记录再提取一次。
         _write_session(tmp_path, "sess-a", _GROUP_KEY)
-        _write_session(tmp_path, "sess-dream", _conversation_memory_namespace(_GROUP_KEY), channel="system")
+        _write_session(tmp_path, "sess-dream", conversation_namespace(_GROUP_KEY), channel="system")
+
+        assert DreamHandler()._active_session_ids_from_registry(tmp_path) == {"sess-a"}
+
+    def test_profile_sessions_are_excluded_the_same_way(self, tmp_path: Path) -> None:
+        # 人物档案整理的 conversation_key 是 user_<别名>，只认 conv_ 的话它每轮都算一条活跃会话。
+        _write_session(tmp_path, "sess-a", _GROUP_KEY)
+        _write_session(tmp_path, "sess-profile", subject_namespace("UserA"), channel="system")
 
         assert DreamHandler()._active_session_ids_from_registry(tmp_path) == {"sess-a"}
 
@@ -257,8 +264,8 @@ class TestPipeline:
 
         finals = recorder.by_node("system.dream")
         assert {call["conversation_key"] for call in finals} == {
-            _conversation_memory_namespace(_GROUP_KEY),
-            _conversation_memory_namespace(_PRIVATE_KEY),
+            conversation_namespace(_GROUP_KEY),
+            conversation_namespace(_PRIVATE_KEY),
         }
 
     def test_the_organizer_writes_into_the_directory_it_was_given(self, tmp_path: Path) -> None:
@@ -272,7 +279,7 @@ class TestPipeline:
         self._run_to_final(tmp_path, recorder)
 
         conv_key = recorder.by_node("system.dream")[0]["conversation_key"]
-        assert _conversation_memory_namespace(conv_key) == _conversation_memory_namespace(_GROUP_KEY)
+        assert conversation_namespace(conv_key) == conversation_namespace(_GROUP_KEY)
 
     def test_the_organizer_key_never_looks_like_a_qq_session(self, tmp_path: Path) -> None:
         # qq_ 前缀会命中 supervisor 的 QQ 非管理员硬限制，data/ 直接写不进去。
@@ -290,8 +297,8 @@ class TestPipeline:
     def test_the_instruction_carries_that_conversation_own_books(self, tmp_path: Path) -> None:
         _write_runtime(tmp_path)
         _write_session(tmp_path, "sess-a", _GROUP_KEY)
-        _write_memory(tmp_path, _conversation_memory_namespace(_GROUP_KEY), "群本", [_entry("m1", ["a"])])
-        _write_memory(tmp_path, _conversation_memory_namespace(_PRIVATE_KEY), "私聊本", [_entry("m2", ["b"])])
+        _write_memory(tmp_path, conversation_namespace(_GROUP_KEY), "群本", [_entry("m1", ["a"])])
+        _write_memory(tmp_path, conversation_namespace(_PRIVATE_KEY), "私聊本", [_entry("m2", ["b"])])
         recorder = _Recorder()
         recorder.results = {"task-0": json.dumps([{"id": "s1", "book": "群本", "content": "x", "keywords": ["k"]}])}
 
@@ -304,8 +311,8 @@ class TestPipeline:
     def test_extractors_are_told_the_books_of_their_own_conversation(self, tmp_path: Path) -> None:
         _write_runtime(tmp_path)
         _write_session(tmp_path, "sess-a", _GROUP_KEY)
-        _write_memory(tmp_path, _conversation_memory_namespace(_GROUP_KEY), "群本", [_entry("m1", ["a"])])
-        _write_memory(tmp_path, _conversation_memory_namespace(_PRIVATE_KEY), "私聊本", [_entry("m2", ["b"])])
+        _write_memory(tmp_path, conversation_namespace(_GROUP_KEY), "群本", [_entry("m1", ["a"])])
+        _write_memory(tmp_path, conversation_namespace(_PRIVATE_KEY), "私聊本", [_entry("m2", ["b"])])
         recorder = _Recorder()
 
         DreamHandler().on_tick(_ctx(tmp_path, recorder))
@@ -324,7 +331,7 @@ class TestPipeline:
 
         task_context = recorder.by_node("system.memory_extractor")[0]["input_data"]["task_context"]
         assert task_context["conversation_key"] == _GROUP_KEY
-        assert _conversation_memory_namespace(task_context["conversation_key"]) == _conversation_memory_namespace(
+        assert conversation_namespace(task_context["conversation_key"]) == conversation_namespace(
             _GROUP_KEY
         )
 
@@ -343,7 +350,7 @@ class TestPipeline:
         # 没有新信号也要跑：过期清理、碎片 book 合并都只看已有条目。
         _write_runtime(tmp_path)
         _write_session(tmp_path, "sess-a", _GROUP_KEY)
-        _write_memory(tmp_path, _conversation_memory_namespace(_GROUP_KEY), "群本", [_entry("m1", ["a"])])
+        _write_memory(tmp_path, conversation_namespace(_GROUP_KEY), "群本", [_entry("m1", ["a"])])
         recorder = _Recorder()
 
         self._run_to_final(tmp_path, recorder)
@@ -471,16 +478,16 @@ class TestClearGroupMemoryCommand:
         group_id = 123456789
         stable_key = runtime.routing._stable_conversation_key(f"qq_group:{group_id}")
 
-        assert runtime.commands._conversation_memory_namespace_for_group(group_id) == _conversation_memory_namespace(stable_key)
+        assert runtime.commands._conversation_memory_namespace_for_group(group_id) == conversation_namespace(stable_key)
 
     def test_namespace_is_not_the_raw_group_digest(self, runtime) -> None:
-        assert runtime.commands._conversation_memory_namespace_for_group(123456789) != _conversation_memory_namespace(
+        assert runtime.commands._conversation_memory_namespace_for_group(123456789) != conversation_namespace(
             "qq_group:123456789"
         )
 
     def test_clearing_removes_the_directory_the_engine_wrote(self, runtime, tmp_path: Path) -> None:
         group_id = 123456789
-        namespace = _conversation_memory_namespace(runtime.routing._stable_conversation_key(f"qq_group:{group_id}"))
+        namespace = conversation_namespace(runtime.routing._stable_conversation_key(f"qq_group:{group_id}"))
         _write_memory(tmp_path, namespace, "群本", [_entry("m1", ["a"])])
 
         existed, count = runtime.commands._clear_group_memory_namespace(group_id)
@@ -489,11 +496,11 @@ class TestClearGroupMemoryCommand:
         assert not (tmp_path / "data" / "memory" / namespace).exists()
 
     def test_clearing_one_group_keeps_the_others(self, runtime, tmp_path: Path) -> None:
-        keep = _conversation_memory_namespace(runtime.routing._stable_conversation_key("qq_group:999"))
+        keep = conversation_namespace(runtime.routing._stable_conversation_key("qq_group:999"))
         _write_memory(tmp_path, keep, "别的群", [_entry("m1", ["a"])])
         _write_memory(
             tmp_path,
-            _conversation_memory_namespace(runtime.routing._stable_conversation_key("qq_group:123456789")),
+            conversation_namespace(runtime.routing._stable_conversation_key("qq_group:123456789")),
             "本群",
             [_entry("m2", ["b"])],
         )
@@ -504,6 +511,17 @@ class TestClearGroupMemoryCommand:
 
     def test_missing_namespace_reports_nothing_cleared(self, runtime) -> None:
         assert runtime.commands._clear_group_memory_namespace(555) == (False, 0)
+
+    def test_an_empty_namespace_deletes_nothing(
+        self, runtime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 算不出目录名时空串拼出来就是 data/memory 本身，删下去是所有会话的记忆。
+        keep = conversation_namespace(runtime.routing._stable_conversation_key("qq_group:999"))
+        _write_memory(tmp_path, keep, "别的群", [_entry("m1", ["a"])])
+        monkeypatch.setattr(runtime.routing, "_scoped_stable_key", lambda _key: "")
+
+        assert runtime.commands._clear_group_memory_namespace(123456789) == (False, 0)
+        assert (tmp_path / "data" / "memory" / keep / "别的群.yaml").exists()
 
     def test_computing_the_namespace_does_not_mint_an_alias(self, runtime) -> None:
         # _stable_conversation_key 会顺带分配匿名别名；清记忆不该有这个副作用。

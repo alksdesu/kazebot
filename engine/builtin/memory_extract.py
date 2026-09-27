@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
+from engine.memory_namespace import conversation_namespace
 
 
 log = logging.getLogger(__name__)
@@ -440,11 +441,7 @@ class MemoryExtractHandler:
             workspace_value = ctx.get("workspace_root") or pending_extract.get("workspace_root")
             workspace_root = Path(workspace_value) if workspace_value is not None else None
             conversation_key = str(pending_extract.get("conversation_key") or "").strip()
-            try:
-                from engine.builtin.knowledge_inject import _conversation_memory_namespace
-                memory_namespace = _conversation_memory_namespace(conversation_key)
-            except Exception:
-                memory_namespace = ""
+            memory_namespace = conversation_namespace(conversation_key)
             mem_dir = workspace_root / "data" / "memory" if workspace_root is not None else None
             if mem_dir is not None and memory_namespace:
                 mem_dir = mem_dir / memory_namespace

@@ -13,13 +13,13 @@ import time
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
 import engine.memory_hit_cache as hit_cache
 from engine.eventlog_rotation import eventlog_file_lock
+from engine.memory_namespace import CONVERSATION_PREFIX, conversation_namespace
 from platforms.descriptor import STATE_ROUTES, PlatformDescriptor, normalize_name
 from platforms.registry import conversation_channel, conversation_key_prefix, platform_state_path
 
@@ -213,11 +213,6 @@ def _rekey_sqlite_group(
     return RekeyCount(moved, replaced)
 
 
-def namespace_dir(stable_key: str) -> str:
-    """stable conversation_key 对应的记忆目录名，与 knowledge_inject 同一个算法。"""
-    return "conv_" + sha256(stable_key.encode("utf-8")).hexdigest()[:24]
-
-
 @dataclass
 class Rename:
     real: str
@@ -311,17 +306,18 @@ def plan_migration(
 
     for old_stable, real in load_route_map(route_state_file(workspace, platform)).items():
         new_stable = restable(old_stable, real)
-        known.add(namespace_dir(old_stable))
-        if new_stable is None:
-            plan.unresolved.append(Unresolved(real, old_stable, namespace_dir(old_stable)))
+        known.add(conversation_namespace(old_stable))
+        # 空键也当认不出：它的目录名是空串，拼出来就是 data/memory 根目录本身。
+        if not new_stable:
+            plan.unresolved.append(Unresolved(real, old_stable, conversation_namespace(old_stable)))
             continue
-        known.add(namespace_dir(new_stable))
+        known.add(conversation_namespace(new_stable))
         pairs.append((old_stable, real, new_stable))
 
     targets = Counter(new_stable for old_stable, _real, new_stable in pairs if old_stable != new_stable)
     for old_stable, real, new_stable in pairs:
-        old_ns = namespace_dir(old_stable)
-        new_ns = namespace_dir(new_stable)
+        old_ns = conversation_namespace(old_stable)
+        new_ns = conversation_namespace(new_stable)
         dir_exists = (root / old_ns).is_dir()
         rename = Rename(
             real, old_stable, new_stable, old_ns, new_ns,
@@ -335,7 +331,7 @@ def plan_migration(
     if root.is_dir():
         # 路由表里查不到真实 key 的目录无法重算，只能报出来让人工判断。
         plan.unknown_conv_dirs = [
-            child.name for child in sorted(root.glob("conv_*"))
+            child.name for child in sorted(root.glob(f"{CONVERSATION_PREFIX}*"))
             if child.is_dir() and child.name not in known
         ]
     return plan

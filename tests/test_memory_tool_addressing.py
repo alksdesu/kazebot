@@ -15,12 +15,12 @@ import yaml
 
 from engine import memory_subjects
 from engine.builtin.knowledge_inject import (
-    _conversation_memory_namespace,
     build_knowledge_context,
     delete_memory,
     list_memories,
     save_memory,
 )
+from engine.memory_namespace import conversation_namespace
 from engine.node import Node
 from toolbox.context import ToolContext
 
@@ -32,6 +32,7 @@ def _ctx(
     tmp_path: Path,
     node_extra: dict[str, Any] | None = None,
     subjects: list[str] | None = None,
+    conversation_key: str = _CONV_KEY,
 ) -> ToolContext:
     ctx = ToolContext(
         supervisor_url="http://localhost:0",
@@ -41,7 +42,7 @@ def _ctx(
         workspace_root=tmp_path,
         http=None,  # type: ignore[arg-type]
         registry=None,
-        conversation_key=_CONV_KEY,
+        conversation_key=conversation_key,
         node_id="system.memory_extractor",
     )
     if node_extra is not None:
@@ -55,8 +56,9 @@ def _ctx(
 def _save(tmp_path: Path, **args: Any) -> dict[str, Any]:
     node_extra = args.pop("_node_extra", None)
     subjects = args.pop("_subjects", None)
+    conversation_key = args.pop("_conversation_key", _CONV_KEY)
     payload = {"id": "m1", "book": "people", "content": "内容", **args}
-    return asyncio.run(save_memory(payload, _ctx(tmp_path, node_extra, subjects)))
+    return asyncio.run(save_memory(payload, _ctx(tmp_path, node_extra, subjects, conversation_key)))
 
 
 def _read(tmp_path: Path, namespace: str, book: str = "people") -> list[dict[str, Any]]:
@@ -67,7 +69,7 @@ def _read(tmp_path: Path, namespace: str, book: str = "people") -> list[dict[str
 
 
 def _conv(tmp_path: Path, book: str = "people") -> list[dict[str, Any]]:
-    return _read(tmp_path, _conversation_memory_namespace(_CONV_KEY), book)
+    return _read(tmp_path, conversation_namespace(_CONV_KEY), book)
 
 
 def _archive(tmp_path: Path, book: str = "people") -> list[dict[str, Any]]:
@@ -191,6 +193,16 @@ class TestNamespaceAddressing:
         assert len(_conv(tmp_path)) == 1
         assert _conv(tmp_path)[0]["content"] == "新内容"
         assert _archive(tmp_path) == []
+
+    def test_a_profile_organizing_task_writes_into_that_profile(self, tmp_path: Path) -> None:
+        # dream 拿要整理的档案目录名当会话键建任务，再哈希一次就落进一个没人认领的 conv_ 目录。
+        _enroll(tmp_path)
+
+        assert _save(tmp_path, keywords=["k"], _conversation_key=f"user_{_SUBJECT}")["ok"]
+
+        assert len(_archive(tmp_path)) == 1
+        assert _conv(tmp_path) == []
+        assert [p.name for p in (tmp_path / "data" / "memory").iterdir() if p.is_dir()] == [f"user_{_SUBJECT}"]
 
     def test_a_node_memory_book_is_honoured(self, tmp_path: Path) -> None:
         _save(tmp_path, keywords=["k"], _node_extra={"memory_book": "shared"})
@@ -331,7 +343,7 @@ class TestReadSideDedupe:
 
     def test_a_duplicated_id_renders_once_and_the_archive_wins(self, tmp_path: Path) -> None:
         _enroll(tmp_path)
-        self._write_raw(tmp_path, _conversation_memory_namespace(_CONV_KEY), "会话里的旧版本")
+        self._write_raw(tmp_path, conversation_namespace(_CONV_KEY), "会话里的旧版本")
         self._write_raw(tmp_path, f"user_{_SUBJECT}", "档案里的新版本")
 
         text = self._memory_text(tmp_path, [_SUBJECT])
@@ -342,7 +354,7 @@ class TestReadSideDedupe:
 
     def test_distinct_ids_from_both_places_all_show_up(self, tmp_path: Path) -> None:
         _enroll(tmp_path)
-        self._write_raw(tmp_path, _conversation_memory_namespace(_CONV_KEY), "会话内容")
+        self._write_raw(tmp_path, conversation_namespace(_CONV_KEY), "会话内容")
         archive = tmp_path / "data" / "memory" / f"user_{_SUBJECT}" / "people.yaml"
         archive.parent.mkdir(parents=True, exist_ok=True)
         archive.write_text(
@@ -362,7 +374,7 @@ class TestReadSideDedupe:
 
     def test_the_same_id_in_a_different_book_is_not_deduped(self, tmp_path: Path) -> None:
         _enroll(tmp_path)
-        self._write_raw(tmp_path, _conversation_memory_namespace(_CONV_KEY), "会话内容")
+        self._write_raw(tmp_path, conversation_namespace(_CONV_KEY), "会话内容")
         archive = tmp_path / "data" / "memory" / f"user_{_SUBJECT}" / "rules.yaml"
         archive.parent.mkdir(parents=True, exist_ok=True)
         archive.write_text(

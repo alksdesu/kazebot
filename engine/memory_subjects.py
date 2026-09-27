@@ -9,20 +9,16 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from engine.memory_namespace import is_valid_subject
 from file_lock import exclusive_lock
 
 log = logging.getLogger(__name__)
 
 _ROSTER_FILENAME = "memory_subjects.json"
-# 别名由适配层的匿名化计数器产生（UserA / UserAF / GroupB…）；限定字符集，避免
-# subject 被拼进目录名时越出 data/memory/。
-SUBJECT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
-_MEMORY_NAMESPACE_PREFIX = "user_"
 
 
 def roster_path(workspace_root: Path) -> Path:
@@ -32,18 +28,6 @@ def roster_path(workspace_root: Path) -> Path:
 def _roster_lock_path(workspace_root: Path) -> Path:
     path = roster_path(workspace_root)
     return path.with_name(f"{path.name}.lock")
-
-
-def is_valid_subject(subject: Any) -> bool:
-    return bool(SUBJECT_RE.match(str(subject or "").strip()))
-
-
-def subject_namespace(subject: str) -> str:
-    """Return the memory directory name for one person, or "" when invalid."""
-    text = str(subject or "").strip()
-    if not is_valid_subject(text):
-        return ""
-    return f"{_MEMORY_NAMESPACE_PREFIX}{text}"
 
 
 def load_roster(workspace_root: Path) -> dict[str, dict[str, Any]]:

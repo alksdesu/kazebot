@@ -43,10 +43,10 @@ from engine.conversation_migration import (  # noqa: E402
     load_route_map,
     memory_root,
     move_memory,
-    namespace_dir,
     record_route,
     route_state_file,
 )
+from engine.memory_namespace import conversation_namespace, subject_namespace  # noqa: E402
 from platforms.descriptor import (  # noqa: E402
     CHANNEL_GROUP,
     CHANNEL_PRIVATE,
@@ -101,7 +101,7 @@ class Side:
 
     @property
     def namespace(self) -> str:
-        return namespace_dir(self.stable)
+        return conversation_namespace(self.stable)
 
 
 @dataclass
@@ -206,7 +206,7 @@ def list_conversations(workspace: Path, platforms: Iterable[PlatformDescriptor])
             origin = key_origin(stable, real, candidate_secrets=(secret.value,), candidate_scopes=candidates)
             rows.append(ConversationRow(
                 real=real, stable=stable, account=origin.bot_scope if origin else None,
-                memory=(root / namespace_dir(stable)).is_dir(),
+                memory=(root / conversation_namespace(stable)).is_dir(),
             ))
         listed.append(PlatformConversations(platform, secret.source, account, rows))
     return listed
@@ -390,7 +390,7 @@ def run_identity_binding(
 def _check_person(workspace: Path, report: IdentityReport) -> None:
     """人的别名连着长期记忆和建档：被换掉的别名已经攒下记忆就拒绝，建过档就并进沿用的别名。"""
     if report.replaced:
-        namespace = memory_subjects.subject_namespace(report.replaced)
+        namespace = subject_namespace(report.replaced)
         if namespace and (memory_root(workspace) / namespace).is_dir():
             raise BindingRefused(
                 f"{report.target.label} 在 {report.target.platform.display_name} 上已经有自己的长期记忆（{namespace}），"

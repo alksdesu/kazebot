@@ -23,7 +23,6 @@ from engine import memory_subjects
 from engine.builtin.knowledge_inject import (
     _apply_global_budget,
     _apply_memory_budget,
-    _conversation_memory_namespace,
     _load_book,
     _save_book,
     _tool_memory_namespaces,
@@ -31,6 +30,7 @@ from engine.builtin.knowledge_inject import (
     memory_owner_conversation_key,
     save_memory,
 )
+from engine.memory_namespace import conversation_namespace
 from toolbox.context import ToolContext
 
 _CONV_KEY = "qq_group:900001"
@@ -239,7 +239,7 @@ class TestMemoryOwner:
         first = memory_owner_conversation_key("agent:x:qq_group:1:uuid-aaa", "qq_group:1")
         second = memory_owner_conversation_key("agent:x:qq_group:1:uuid-bbb", "qq_group:1")
 
-        assert _conversation_memory_namespace(first) == _conversation_memory_namespace(second)
+        assert conversation_namespace(first) == conversation_namespace(second)
 
     def test_it_falls_back_to_the_parent_key(self) -> None:
         assert memory_owner_conversation_key("agent:x:qq_group:1:u", "", "qq_group:1") == "qq_group:1"
@@ -369,7 +369,7 @@ def _save(ctx: ToolContext, **args: Any) -> dict[str, Any]:
 
 class TestWriteSafety:
     def _book(self, tmp_path: Path, namespace: str = "") -> Path:
-        ns = namespace or _conversation_memory_namespace(_CONV_KEY)
+        ns = namespace or conversation_namespace(_CONV_KEY)
         return tmp_path / "data" / "memory" / ns / "profile.yaml"
 
     def test_concurrent_saves_do_not_lose_entries(self, tmp_path: Path) -> None:

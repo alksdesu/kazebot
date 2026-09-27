@@ -1357,9 +1357,11 @@ def create_app(
         """控制台用的会话清单：每条带归属、消息数和体积。"""
         verify_admin_token(request)
         st: SupervisorState = app.state.state
+        from engine.memory_namespace import conversation_namespace
+
         from .conversation_labels import (
             account_scope, describe_namespaces, is_internal_task_key, is_runtime_copy_session,
-            load_sessions, memory_namespace,
+            load_sessions,
         )
 
         labels = describe_namespaces(st.workspace_root)
@@ -1386,7 +1388,7 @@ def create_app(
                 "session_id": session_id,
                 "conversation_key": conv_key,
                 # session 已被清掉但 jsonl 还在的孤儿也要列出来，否则永远没人删。
-                "owner": labels.get(memory_namespace(conv_key)) if conv_key else None,
+                "owner": labels.get(conversation_namespace(conv_key)) if conv_key else None,
                 # 内部入口的会话（web / cli）不参与账号归属，始终算当前。
                 "current_account": accounts.is_current(conv_key),
                 "channel": str(info.get("channel") or ""),

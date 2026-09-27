@@ -15,7 +15,8 @@ if str(_ROOT) not in sys.path:
 from adapters._shared.active_account import ActiveAccountStore  # noqa: E402
 from adapters._shared.aliases import GROUP_BUCKET, USER_BUCKET, AliasBook  # noqa: E402
 from adapters._shared.conversation_hash import ConversationKeys  # noqa: E402
-from engine.conversation_migration import load_route_map, memory_root, namespace_dir, route_state_file  # noqa: E402
+from engine.conversation_migration import load_route_map, memory_root, route_state_file  # noqa: E402
+from engine.memory_namespace import conversation_namespace  # noqa: E402
 from engine import memory_subjects  # noqa: E402
 from engine.materials.service import MaterialService  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
@@ -110,8 +111,8 @@ def _seed(
     stable = _qq_stable(real, account=account)
     _add_route(route_state_file(tmp_path, QQ_NAPCAT), stable, real)
     if memory:
-        (memory_root(tmp_path) / namespace_dir(stable)).mkdir(parents=True)
-        (memory_root(tmp_path) / namespace_dir(stable) / "book.yaml").write_text("entries: []\n", encoding="utf-8")
+        (memory_root(tmp_path) / conversation_namespace(stable)).mkdir(parents=True)
+        (memory_root(tmp_path) / conversation_namespace(stable) / "book.yaml").write_text("entries: []\n", encoding="utf-8")
     if features:
         session_registry_path(tmp_path).write_text(json.dumps({"sid-1": {
             "session_id": "sid-1", "conversation_key": stable, "channel": real.split(":", 1)[0],
@@ -193,7 +194,7 @@ class TestBinding:
         assert (report.target.stable, report.target.account) == (_mx_stable(), MX_BOT)
         assert (report.source_memory, report.target_memory, report.route_recorded) == (True, False, True)
         assert (report.stores["sessions"].moved, report.stores["materials"].moved) == (1, 1)
-        assert (memory_root(tmp_path) / namespace_dir(stable)).is_dir()
+        assert (memory_root(tmp_path) / conversation_namespace(stable)).is_dir()
         assert not route_state_file(tmp_path, MATRIX).exists()
         assert _session(tmp_path)["conversation_key"] == stable
         assert _journal_enabled(tmp_path, stable, QQ_BOT)
@@ -209,8 +210,8 @@ class TestBinding:
 
         report = bind.run_binding(workspace=tmp_path, source_real=QQ_REAL, target_real=MX_REAL, apply=True)
 
-        assert (memory_root(tmp_path) / namespace_dir(target) / "book.yaml").is_file()
-        assert not (memory_root(tmp_path) / namespace_dir(stable)).exists()
+        assert (memory_root(tmp_path) / conversation_namespace(target) / "book.yaml").is_file()
+        assert not (memory_root(tmp_path) / conversation_namespace(stable)).exists()
         assert load_route_map(route_state_file(tmp_path, MATRIX)) == {elsewhere: "mx_room:elsewhere", target: MX_REAL}
         assert (report.backup_dir / route_state_file(tmp_path, MATRIX).name).read_text(encoding="utf-8") == mx_routes
         # 源 bot 还在那个群里的话，之后说的话照常落在源会话名下。
@@ -218,8 +219,8 @@ class TestBinding:
         assert (_session(tmp_path)["conversation_key"], _session(tmp_path)["channel"]) == (target, "mx_room")
         assert _journal_enabled(tmp_path, target, MX_BOT)
         assert not _journal_enabled(tmp_path, stable, QQ_BOT)
-        assert report.moved_dirs == [(namespace_dir(stable), namespace_dir(target))]
-        assert (report.backup_dir / namespace_dir(stable) / "book.yaml").is_file()
+        assert report.moved_dirs == [(conversation_namespace(stable), conversation_namespace(target))]
+        assert (report.backup_dir / conversation_namespace(stable) / "book.yaml").is_file()
         assert (report.backup_dir / "data" / "sessions.json").is_file()
 
     def test_legacy_unscoped_data_ends_up_under_the_target_account(self, tmp_path: Path) -> None:
@@ -243,7 +244,7 @@ class TestBinding:
     def test_a_target_that_only_has_memory_on_its_side_keeps_it(self, tmp_path: Path) -> None:
         _seed(tmp_path, memory=False)
         _target_ready(tmp_path)
-        own = memory_root(tmp_path) / namespace_dir(_mx_stable())
+        own = memory_root(tmp_path) / conversation_namespace(_mx_stable())
         own.mkdir(parents=True)
         (own / "mine.yaml").write_text("x: 1\n", encoding="utf-8")
 
@@ -287,7 +288,7 @@ class TestBinding:
         report = bind.run_binding(
             workspace=tmp_path, source_real=QQ_REAL, target_real=MX_REAL, source_account=QQ_BOT, apply=True,
         )
-        assert report.moved_dirs == [(namespace_dir(stable), namespace_dir(_mx_stable()))]
+        assert report.moved_dirs == [(conversation_namespace(stable), conversation_namespace(_mx_stable()))]
 
     def test_a_key_from_an_account_nobody_remembers_is_named_by_account(self, tmp_path: Path) -> None:
         stable = _seed(tmp_path, account="30003")
@@ -345,7 +346,7 @@ class TestRefusals:
         with pytest.raises(bind.BindingRefused, match=message):
             bind.run_binding(workspace=tmp_path, source_real=source, target_real=target, apply=True)
 
-        assert (memory_root(tmp_path) / namespace_dir(_qq_stable())).is_dir()
+        assert (memory_root(tmp_path) / conversation_namespace(_qq_stable())).is_dir()
 
     def test_a_channel_whose_keys_are_not_digested_is_refused(self, tmp_path: Path) -> None:
         raw = PlatformDescriptor(
@@ -374,7 +375,7 @@ class TestRefusals:
         with pytest.raises(bind.BindingRefused, match="启动一次目标 bot"):
             bind.run_binding(workspace=tmp_path, source_real=QQ_REAL, target_real=MX_REAL, apply=True)
 
-        assert (memory_root(tmp_path) / namespace_dir(_qq_stable())).is_dir()
+        assert (memory_root(tmp_path) / conversation_namespace(_qq_stable())).is_dir()
 
     def test_a_source_platform_that_never_started_is_refused(self, tmp_path: Path) -> None:
         _seed(tmp_path)
@@ -402,12 +403,12 @@ class TestRefusals:
     def test_memory_on_both_sides_is_refused(self, tmp_path: Path) -> None:
         stable = _seed(tmp_path)
         _target_ready(tmp_path)
-        (memory_root(tmp_path) / namespace_dir(_mx_stable())).mkdir(parents=True)
+        (memory_root(tmp_path) / conversation_namespace(_mx_stable())).mkdir(parents=True)
 
         with pytest.raises(bind.BindingRefused, match="两边都有长期记忆"):
             bind.run_binding(workspace=tmp_path, source_real=QQ_REAL, target_real=MX_REAL, apply=True)
 
-        assert (memory_root(tmp_path) / namespace_dir(stable) / "book.yaml").is_file()
+        assert (memory_root(tmp_path) / conversation_namespace(stable) / "book.yaml").is_file()
         assert _session(tmp_path)["conversation_key"] == stable
 
     def test_a_source_with_nothing_to_bind_is_refused(self, tmp_path: Path) -> None:
@@ -432,7 +433,7 @@ class TestRefusals:
         with pytest.raises(bind.BindingRefused):
             bind.run_binding(workspace=tmp_path, source_real=QQ_REAL, target_real=MX_REAL, apply=True)
 
-        assert (memory_root(tmp_path) / namespace_dir(stable) / "book.yaml").is_file()
+        assert (memory_root(tmp_path) / conversation_namespace(stable) / "book.yaml").is_file()
         assert _session(tmp_path)["conversation_key"] == stable
         assert not list(tmp_path.glob("data/migration_backup_*"))
 
@@ -533,7 +534,7 @@ class TestCommandLine:
 
         assert code == 2
         assert "未改动任何文件" in capsys.readouterr().err
-        assert (memory_root(tmp_path) / namespace_dir(stable)).is_dir()
+        assert (memory_root(tmp_path) / conversation_namespace(stable)).is_dir()
 
 
 class TestIdentityBinding:

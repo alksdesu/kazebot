@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from clonoth_runtime import platform_secret
+from engine.memory_namespace import CONVERSATION_PREFIX
 from platforms.descriptor import CHANNEL_OTHER, STATE_ROUTES, ChannelDescriptor, PlatformDescriptor
 from platforms.registry import platform_secret_file, platform_state_path
 
@@ -118,7 +119,7 @@ def has_digest_derived_state(workspace: Path, route_state_file: Path) -> bool:
         return True
     memory_root = workspace / "data" / "memory"
     try:
-        return any(memory_root.glob("conv_*"))
+        return any(memory_root.glob(f"{CONVERSATION_PREFIX}*"))
     except OSError:
         return False
 
