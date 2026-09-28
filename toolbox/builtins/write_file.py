@@ -5,6 +5,7 @@ from typing import Any
 
 from ..context import ToolContext
 from .._common import request_guard, resolve_under_allowed_roots
+from ..text_files import rewrite_text
 
 
 async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -30,8 +31,7 @@ async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
     p = resolve_under_allowed_roots(ctx.workspace_root, path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding="utf-8")
-    byte_count = len(content.encode("utf-8"))
+    byte_count = rewrite_text(p, content)
     # [AutoC 2026-05-31] Why: write_file now follows the shared ok/data/error
     # response contract. How: put path and byte count under data and make data.result
     # the human-readable transcript. Purpose: let result_to_raw consume a uniform

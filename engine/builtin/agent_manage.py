@@ -16,6 +16,7 @@ import yaml
 from engine.node import node_file
 from toolbox._common import request_guard
 from toolbox.context import ToolContext
+from toolbox.text_files import rewrite_text
 
 # ---------------------------------------------------------------------------
 #  PLUGIN_META — loader auto-discovery 需要的元数据声明
@@ -160,7 +161,7 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
         return _guard_err(err)
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    target_path.write_text(_node_yaml, encoding="utf-8")
+    rewrite_text(target_path, _node_yaml)
 
     # Step 6: 更新调用者的 delegate_targets（如果指定了 caller_node_id）
     # 追加新节点到调用者的委派列表，使调用者可以 dispatch 到新节点
@@ -195,7 +196,7 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
                         },
                     )
                     if err is None:
-                        caller_path.write_text(_caller_yaml, encoding="utf-8")
+                        rewrite_text(caller_path, _caller_yaml)
                         caller_updated = True
                     else:
                         caller_denied = str(err.get("error", "denied")) if isinstance(err, dict) else str(err)

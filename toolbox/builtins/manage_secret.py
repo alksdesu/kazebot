@@ -14,6 +14,7 @@ from typing import Any
 
 from ..context import ToolContext
 from .._common import request_guard
+from ..text_files import newline_of, write_text_as
 
 _NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 # classify_path 会规范化路径，`secret://X` 会被折叠成 `secret:/X` 让规则匹配不上。
@@ -54,7 +55,7 @@ def _atomic_write(path: Path, lines: list[str]) -> None:
         mode = path.stat().st_mode & 0o777
     tmp = path.with_name(path.name + "." + str(os.getpid()) + ".tmp")
     try:
-        tmp.write_text(text, encoding="utf-8")
+        write_text_as(tmp, text, newline_of(path))
         with contextlib.suppress(OSError):
             os.chmod(tmp, mode)
         os.replace(tmp, path)

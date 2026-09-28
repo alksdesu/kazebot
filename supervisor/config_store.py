@@ -14,6 +14,7 @@ from clonoth_runtime import (
     resolve_env_ref,
 )
 from engine.node import canonical_node_id, known_node_ids
+from toolbox.text_files import rewrite_text
 
 from .types import (
     ActiveProviderSecret,
@@ -100,7 +101,7 @@ class ConfigStore:
             sort_keys=False,
             allow_unicode=True,
         )
-        self.path.write_text(text, encoding="utf-8")
+        rewrite_text(self.path, text)
 
     def reload(self) -> AppConfigSecret:
         with self._lock:
@@ -229,7 +230,7 @@ class ConfigStore:
     def _save_raw(self, data: dict[str, Any]) -> None:
         """Write raw dict to YAML file."""
         text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
-        self.path.write_text(text, encoding="utf-8")
+        rewrite_text(self.path, text)
 
     def _type_of(self, name: str, data: dict[str, Any] | None = None) -> str:
         """这个渠道说哪种线格式。

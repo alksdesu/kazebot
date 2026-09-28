@@ -26,6 +26,7 @@ from engine.context_store import cleanup_old_contexts
 from engine.conversation_migration import ConversationRekey, RekeyCount
 from engine.cron import cron_match
 from file_lock import exclusive_lock
+from toolbox.text_files import newline_of, write_text_as
 
 
 if TYPE_CHECKING:
@@ -121,7 +122,7 @@ def _write_schedule_file(path: Path, schedules: list[dict[str, Any]]) -> None:
     text = yaml.safe_dump({"schedules": schedules}, sort_keys=False, allow_unicode=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        tmp.write_text(text, encoding="utf-8")
+        write_text_as(tmp, text, newline_of(path))
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)

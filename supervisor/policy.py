@@ -17,6 +17,7 @@ import yaml
 from clonoth_runtime import classify_path, load_yaml_dict, parse_extra_roots
 from platforms.protection import policy_floor
 from platforms.registry import all_platforms
+from toolbox.text_files import newline_of, rewrite_text, write_text_as
 
 from .types import SafetyLevel
 
@@ -373,7 +374,7 @@ class PolicyEngine:
         try:
             self._policy_path.parent.mkdir(parents=True, exist_ok=True)
             text = yaml.safe_dump(_default_policy_dict(), sort_keys=False, allow_unicode=True)
-            self._policy_path.write_text(text, encoding="utf-8")
+            rewrite_text(self._policy_path, text)
             with contextlib.suppress(OSError):
                 os.chmod(self._policy_path, 0o600)
         except Exception:
@@ -411,7 +412,7 @@ class PolicyEngine:
             mode = self._policy_path.stat().st_mode & 0o777
         try:
             self._policy_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(text, encoding='utf-8')
+            write_text_as(tmp, text, newline_of(self._policy_path))
             with contextlib.suppress(OSError):
                 os.chmod(tmp, mode)
             os.replace(tmp, self._policy_path)

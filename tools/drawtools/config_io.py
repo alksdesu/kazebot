@@ -7,6 +7,7 @@ Only *.example.* files should be versioned as defaults. Runtime files
 created from examples when missing.
 """
 
+import shutil
 from pathlib import Path
 
 DRAWTOOLS_DIR = Path(__file__).resolve().parent
@@ -26,6 +27,6 @@ def ensure_user_configs() -> list[str]:
         if dst.exists() or not src.exists():
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        shutil.copyfile(src, dst)
         created.append(str(dst.relative_to(DRAWTOOLS_DIR.parents[1]).as_posix()))
     return created

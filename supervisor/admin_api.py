@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from engine.node import node_file
+from toolbox.text_files import rewrite_text
 
 from .scheduler import schedules_lock, schedules_path
 from .tool_catalog import ToolEntry, tool_catalog, tool_names
@@ -218,7 +219,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 raise HTTPException(
                     status_code=500, detail=f"备份 {p.name} 失败，未写入：{exc}",
                 ) from exc
-        p.write_text(content, encoding="utf-8")
+        rewrite_text(p, content)
         return {"ok": True}
 
     def _parse_skill_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -412,7 +413,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     def _drawtools_write(path: Path, content: str) -> dict[str, Any]:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        rewrite_text(path, content)
         return {"ok": True, "path": str(path.relative_to(workspace_root).as_posix())}
 
     @router.get("/drawtools")

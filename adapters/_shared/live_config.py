@@ -576,10 +576,11 @@ class LiveConfig:
         text = yaml.safe_dump(dict(document), allow_unicode=True, sort_keys=False)
         path.parent.mkdir(parents=True, exist_ok=True)
         from engine.eventlog_rotation import eventlog_file_lock
+        from toolbox.text_files import newline_of, write_text_as
         with eventlog_file_lock(path):
             tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
             try:
-                tmp.write_text(text, encoding="utf-8")
+                write_text_as(tmp, text, newline_of(path))
                 os.replace(tmp, path)
             finally:
                 tmp.unlink(missing_ok=True)

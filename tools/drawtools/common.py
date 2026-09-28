@@ -11,6 +11,7 @@ DRAWTOOLS_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = DRAWTOOLS_DIR.parents[1]
 if str(_REPO_ROOT) not in sys.path:  # 工具以子进程跑，sys.path 里只有自己那一级
     sys.path.insert(0, str(_REPO_ROOT))
+from toolbox.text_files import rewrite_text  # noqa: E402
 from workspace import resolve_workspace_root  # noqa: E402
 
 WORKSPACE_ROOT = resolve_workspace_root(_REPO_ROOT)
@@ -191,7 +192,7 @@ def set_selected_preset(preset_ref: str) -> dict[str, Any]:
         raise ValueError("preset has no id")
     settings.setdefault("params", {})["selected_preset_id"] = target_id
     # 用户运行期选择写入 settings.yaml；仓库只应维护 settings.example.yaml，避免升级覆盖用户配置。
-    SETTINGS_PATH.write_text(yaml.safe_dump(settings, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    rewrite_text(SETTINGS_PATH, yaml.safe_dump(settings, allow_unicode=True, sort_keys=False))
     return target
 
 

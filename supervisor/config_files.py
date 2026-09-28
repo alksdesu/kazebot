@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel
 
 from engine.eventlog_rotation import eventlog_file_lock
+from toolbox.text_files import newline_of, write_text_as
 
 # 顶层的格式版本号，哪份配置文件都可以写，不对应任何键。
 VERSION_PATH = "version"
@@ -72,7 +73,7 @@ def write_raw(path: Path, content: str) -> None:
     with eventlog_file_lock(path):
         tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
         try:
-            tmp.write_text(content, encoding="utf-8")
+            write_text_as(tmp, content, newline_of(path))
             os.replace(tmp, path)
         finally:
             tmp.unlink(missing_ok=True)

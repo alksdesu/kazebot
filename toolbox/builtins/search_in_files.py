@@ -16,6 +16,7 @@ from clonoth_runtime import get_int, load_runtime_config
 
 from ..context import ToolContext
 from .._common import resolve_and_classify, guard_external_read, request_guard
+from ..text_files import rewrite_text
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +260,7 @@ async def _do_replace(
 
         new_text = regex.sub(replace_str, text)
         try:
-            p.write_text(new_text, encoding="utf-8")
+            rewrite_text(p, new_text)
         except Exception:
             continue
 

@@ -13,6 +13,7 @@ from typing import Any
 
 from ..context import ToolContext
 from .._common import request_guard, resolve_under_allowed_roots
+from ..text_files import rewrite_text
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +310,7 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     # ------------------------------------------------------------------
     try:
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(content, encoding="utf-8")
+        rewrite_text(resolved, content)
     except Exception as exc:
         return _apply_diff_error_response(
             f"Failed to write file: {exc}",

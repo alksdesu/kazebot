@@ -14,6 +14,8 @@ import yaml
 
 from clonoth_runtime import resolve_env_ref
 
+from .text_files import rewrite_text
+
 _MCP_IMPORT_ERROR: Exception | None = None
 
 try:
@@ -125,7 +127,7 @@ def _save_raw_config(workspace_root: Path, cfg: dict[str, Any]) -> None:
     p = _config_path(workspace_root)
     p.parent.mkdir(parents=True, exist_ok=True)
     text = yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True)
-    p.write_text(text, encoding="utf-8")
+    rewrite_text(p, text)
 
 
 def _normalize_public_spec(client_id: str, spec: dict[str, Any]) -> dict[str, Any]:
