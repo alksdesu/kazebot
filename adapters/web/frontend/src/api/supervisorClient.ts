@@ -23,6 +23,11 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   return resp;
 }
 
+/** apiFetch 抛的错误信息以状态码打头，靠它认出「要的东西不存在」。 */
+export function isNotFound(error: unknown): boolean {
+  return error instanceof Error && /^404\b/.test(error.message);
+}
+
 function authHeaders(token: string): Record<string, string> {
   return { Authorization: `Bearer ${token}` };
 }

@@ -1,5 +1,6 @@
 // 人格页的模型字段。model 是上游 API 的字面量，前端无从校验 ——
 // 候选只能当提示，输入框必须继续收任意值，否则节点里在用的 $ENV{...} 会被界面挡死。
+// 连带覆盖 isNotFound：只有以 404 打头的错误才算「文件还没建」。
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -10,6 +11,7 @@ import {
   getNodeRaw,
   getNodes,
   getProviders,
+  isNotFound,
   updateNodeRaw,
   type NodeFileInfo,
 } from '../api/supervisorClient';
@@ -88,6 +90,31 @@ beforeEach(() => {
   vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true });
 });
 
+describe('认出「不存在」', () => {
+  it('以 404 打头才算', () => {
+    expect(isNotFound(new Error('404'))).toBe(true);
+    expect(isNotFound(new Error('404 Not Found'))).toBe(true);
+    expect(isNotFound(new Error('404 节点文件不存在'))).toBe(true);
+  });
+
+  it('数字还没断开就不算，免得 4040 被当成 404', () => {
+    expect(isNotFound(new Error('4040 网关把状态码拼错了'))).toBe(false);
+    expect(isNotFound(new Error('404500'))).toBe(false);
+  });
+
+  it('404 出现在别处不算', () => {
+    expect(isNotFound(new Error('Upload failed: 404'))).toBe(false);
+    expect(isNotFound(new Error('500 上游返回 404'))).toBe(false);
+  });
+
+  it('不是 Error 的一律不算', () => {
+    expect(isNotFound('404 Not Found')).toBe(false);
+    expect(isNotFound({ message: '404 Not Found' })).toBe(false);
+    expect(isNotFound(null)).toBe(false);
+    expect(isNotFound(undefined)).toBe(false);
+  });
+});
+
 describe('人设文件', () => {
   it('文件在就把正文读进编辑框', async () => {
     render(<PersonaPage />);
@@ -120,6 +147,15 @@ describe('人设文件', () => {
     render(<PersonaPage />);
 
     expect(await screen.findByText('500 读不到节点文件清单')).toBeInTheDocument();
+    expect(screen.queryByText(isOnlyExample)).toBeNull();
+    expect(screen.getByRole('textbox', { name: '人设内容' })).toBeDisabled();
+  });
+
+  it('状态码只是开头几位碰上 404，照样按读失败算', async () => {
+    vi.mocked(getNodeFileRaw).mockRejectedValue(new Error('4040 网关把状态码拼错了'));
+    render(<PersonaPage />);
+
+    expect(await screen.findByText('4040 网关把状态码拼错了')).toBeInTheDocument();
     expect(screen.queryByText(isOnlyExample)).toBeNull();
     expect(screen.getByRole('textbox', { name: '人设内容' })).toBeDisabled();
   });

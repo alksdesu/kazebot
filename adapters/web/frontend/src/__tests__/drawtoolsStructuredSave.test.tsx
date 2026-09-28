@@ -1,6 +1,8 @@
 // 绘图页的结构化字段写回：只重写改了的键，运营者手写的注释留着；原文坏了一个字节都不写。
 // 保存的提示要活过紧跟着的那次重载，只有「刷新」清得掉。
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+// 分析节点那一栏：404 才当空文件，别的读失败要锁住；接连重读只认最后发出的那次。
+// 写出去之后换了 token，这一趟的结果不能落到新会话的页面上。
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import yaml from 'js-yaml';
 
@@ -23,6 +25,16 @@ vi.mock('../api/supervisorClient', async (importOriginal) => ({
 }));
 
 const RELOAD_FAILURE = '503 拉不到绘图配置';
+
+const NODE_FAILURE = '503 读不到节点文件';
+
+const NODE_YAML = 'id: draw.novelai_planner\nmodel: $ENV{DRAW_MODEL}\n';
+
+const NODE_LOCKED = `读不到这份文件：${NODE_FAILURE}。点上面的「刷新」重读；读到之前不能在这里改，免得空白内容盖掉原文件。`;
+
+const STALE_SETTINGS_YAML = 'api:\n  base_url: https://stale.example\n';
+
+const EDITED_SETTINGS_YAML = 'api:\n  base_url: https://relay.example\n';
 
 const SETTINGS_YAML = [
   '# NovelAI 绘图设置，注释是运营者自己写的，改字段不能把它们冲掉。',
@@ -92,10 +104,30 @@ function holdReload(first = bundle()): { resolve: (data: DrawtoolsBundle) => voi
   return handles;
 }
 
+/** 一次由测试决定何时回来的读。 */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason: Error) => void } {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: Error) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
 /** 没有消息时整个 StatusText 不渲染，只能等它出现。 */
 const statusText = async (): Promise<string> => (await screen.findByRole('status')).textContent || '';
 
 const baseUrlBox = () => screen.getByPlaceholderText('https://image.novelai.net');
+
+// 页上好几处都有 textarea 和「丢弃」，原始编辑器只能连着它那一块一起找。
+const rawBlock = () => screen.getByRole('heading', { name: '原始配置编辑器' }).closest('section') as HTMLElement;
+
+const rawEditor = () => within(rawBlock()).getByRole('textbox') as HTMLTextAreaElement;
+
+const rawButton = (name: string) => within(rawBlock()).getByRole('button', { name });
+
+const pickSection = (key: string) => {
+  const select = screen.getByRole('option', { name: '绘图分析节点 YAML' }).closest('select') as HTMLSelectElement;
+  fireEvent.change(select, { target: { value: key } });
+};
 
 const written = (writer: { mock: { calls: unknown[][] } }): string => String(writer.mock.calls[0][1]);
 
@@ -108,6 +140,7 @@ beforeEach(() => {
   vi.mocked(api.initDrawtoolsConfigs).mockResolvedValue({ ok: true, created: [] });
   vi.mocked(api.updateDrawtoolsSettingsRaw).mockResolvedValue({ ok: true });
   vi.mocked(api.updateDrawtoolsCharactersRaw).mockResolvedValue({ ok: true });
+  vi.mocked(api.updateNodeRaw).mockResolvedValue({ ok: true });
 });
 
 describe('绘图设置的结构化写回', () => {
@@ -306,5 +339,259 @@ describe('绘图设置的提示存活', () => {
 
     await waitFor(() => expect(api.getDrawtoolsBundle).toHaveBeenCalledTimes(3));
     await waitFor(() => expect(screen.queryByRole('status')).toBeNull());
+  });
+});
+
+describe('分析节点那一栏', () => {
+  const settled = () => waitFor(() => expect(rawEditor()).toHaveValue(SETTINGS_YAML));
+
+  it('节点文件还没建就按空文件编辑，保存把它建出来', async () => {
+    vi.mocked(api.getNodeRaw).mockRejectedValue(new Error('404 Not Found'));
+    render(<DrawtoolsSettingsPage />);
+    await settled();
+
+    pickSection('node');
+    expect(rawEditor()).toHaveValue('');
+    expect(rawEditor()).toBeEnabled();
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    fireEvent.change(rawEditor(), { target: { value: NODE_YAML } });
+    fireEvent.click(rawButton('保存当前文件'));
+
+    await waitFor(() => expect(api.updateNodeRaw).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.updateNodeRaw).mock.calls[0])
+      .toEqual(['admin-token', 'draw.novelai_planner', NODE_YAML]);
+  });
+
+  it('别的读失败就锁住这一栏，说清为什么不让改', async () => {
+    vi.mocked(api.getNodeRaw).mockRejectedValue(new Error(NODE_FAILURE));
+    render(<DrawtoolsSettingsPage />);
+    await settled();
+
+    pickSection('node');
+
+    expect(rawEditor()).toBeDisabled();
+    expect(screen.getByRole('alert').textContent).toBe(NODE_LOCKED);
+
+    // 绕开 disabled 硬塞一段草稿：两个按钮得靠锁本身关着，不能只靠「没改过」。
+    fireEvent.change(rawEditor(), { target: { value: NODE_YAML } });
+    expect(rawButton('保存当前文件')).toBeDisabled();
+    expect(rawButton('丢弃')).toBeDisabled();
+  });
+
+  it('节点读不回来不连累别的栏', async () => {
+    vi.mocked(api.getNodeRaw).mockRejectedValue(new Error(NODE_FAILURE));
+    render(<DrawtoolsSettingsPage />);
+    await settled();
+
+    expect(rawEditor()).toBeEnabled();
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    fireEvent.change(rawEditor(), { target: { value: EDITED_SETTINGS_YAML } });
+    fireEvent.click(rawButton('保存当前文件'));
+
+    await waitFor(() => expect(api.updateDrawtoolsSettingsRaw).toHaveBeenCalledOnce());
+    expect(written(vi.mocked(api.updateDrawtoolsSettingsRaw))).toBe(EDITED_SETTINGS_YAML);
+    expect(api.updateNodeRaw).not.toHaveBeenCalled();
+  });
+
+  it('刷新读到了就解锁，提示跟着消失', async () => {
+    vi.mocked(api.getNodeRaw).mockRejectedValueOnce(new Error(NODE_FAILURE)).mockResolvedValue(NODE_YAML);
+    render(<DrawtoolsSettingsPage />);
+    await settled();
+    pickSection('node');
+    expect(rawEditor()).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新' }));
+
+    await waitFor(() => expect(rawEditor()).toBeEnabled());
+    expect(rawEditor()).toHaveValue(NODE_YAML);
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    fireEvent.change(rawEditor(), { target: { value: `${NODE_YAML}persistent: true\n` } });
+    expect(rawButton('保存当前文件')).toBeEnabled();
+  });
+});
+
+describe('接连重读只认最后发出的那次', () => {
+  /** 首读压着不放，换 token 再读一次 —— 两次读谁先回来由测试摆布。 */
+  const raceTwoLoads = () => {
+    const first = deferred<DrawtoolsBundle>();
+    const second = deferred<DrawtoolsBundle>();
+    vi.mocked(api.getDrawtoolsBundle).mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    return { first, second };
+  };
+
+  const startSecondLoad = async () => {
+    act(() => { useSettingsStore.setState({ adminToken: 'another-token' }); });
+    await waitFor(() => expect(api.getDrawtoolsBundle).toHaveBeenCalledTimes(2));
+  };
+
+  it('慢回来的旧数据不覆盖新的，loading 也只由最新那次收掉', async () => {
+    const { first, second } = raceTwoLoads();
+    render(<DrawtoolsSettingsPage />);
+    await waitFor(() => expect(api.getDrawtoolsBundle).toHaveBeenCalledOnce());
+    await startSecondLoad();
+
+    await act(async () => { first.resolve(bundle(STALE_SETTINGS_YAML)); });
+
+    expect(rawEditor()).toHaveValue('');
+    expect(screen.getByRole('button', { name: '正在刷新…' })).toBeDisabled();
+
+    await act(async () => { second.resolve(bundle()); });
+
+    expect(rawEditor()).toHaveValue(SETTINGS_YAML);
+    expect(screen.getByRole('button', { name: '刷新' })).toBeEnabled();
+  });
+
+  it('慢回来的那次读失败，不摆出过时的原因', async () => {
+    const { first, second } = raceTwoLoads();
+    render(<DrawtoolsSettingsPage />);
+    await waitFor(() => expect(api.getDrawtoolsBundle).toHaveBeenCalledOnce());
+    await startSecondLoad();
+    await act(async () => { second.resolve(bundle()); });
+
+    await act(async () => { first.reject(new Error(RELOAD_FAILURE)); });
+
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(rawEditor()).toHaveValue(SETTINGS_YAML);
+    expect(screen.getByRole('button', { name: '刷新' })).toBeEnabled();
+  });
+});
+
+describe('写出去之后换了 token', () => {
+  const ROTATED = 'rotated-token';
+  const WRITE_FAILURE = '503 写不进用户配置';
+
+  const settled = () => waitFor(() => expect(rawEditor()).toHaveValue(SETTINGS_YAML));
+
+  /** 换 token 自己就会重读一次，之后的读都是这一趟守卫漏掉的。 */
+  const rotate = async () => {
+    act(() => { useSettingsStore.setState({ adminToken: ROTATED }); });
+    await waitFor(() => expect(api.getDrawtoolsBundle).toHaveBeenCalledTimes(2));
+  };
+
+  const loadTokens = () => vi.mocked(api.getDrawtoolsBundle).mock.calls.map(([token]) => token);
+
+  const saveRawEditor = () => {
+    fireEvent.change(rawEditor(), { target: { value: EDITED_SETTINGS_YAML } });
+    fireEvent.click(rawButton('保存当前文件'));
+  };
+
+  it('保存当前文件写完才换 token，不提示也不拿旧 token 重读', async () => {
+    const write = deferred<unknown>();
+    vi.mocked(api.updateDrawtoolsSettingsRaw).mockReturnValueOnce(write.promise);
+    render(<DrawtoolsSettingsPage />);
+    await settled();
+
+    saveRawEditor();
+    await waitFor(() => expect(api.updateDrawtoolsSettingsRaw).toHaveBeenCalledOnce());
+    await rotate();
+    await act(async () => { write.resolve({ ok: true }); });
+
+    expect(loadTokens()).toEqual(['admin-token', ROTATED]);
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('保存当前文件失败之前换了 token，不摆出这一趟的报错', async () => {
+    const write = deferred<unknown>();
+    vi.mocked(api.updateDrawtoolsSettingsRaw).mockReturnValueOnce(write.promise);
+    render(<DrawtoolsSettingsPage />);
+    await settled();
+
+    saveRawEditor();
+    await waitFor(() => expect(api.updateDrawtoolsSettingsRaw).toHaveBeenCalledOnce());
+    await rotate();
+    await act(async () => { write.reject(new Error(WRITE_FAILURE)); });
+
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('初始化建完文件才换 token，不提示也不拿旧 token 重读', async () => {
+    const init = deferred<{ ok: boolean; created: string[] }>();
+    vi.mocked(api.initDrawtoolsConfigs).mockReturnValueOnce(init.promise);
+    render(<DrawtoolsSettingsPage />);
+    await settled();
+
+    fireEvent.click(screen.getByRole('button', { name: '从 Example 初始化用户配置' }));
+    await waitFor(() => expect(api.initDrawtoolsConfigs).toHaveBeenCalledOnce());
+    await rotate();
+    await act(async () => { init.resolve({ ok: true, created: ['settings.yaml'] }); });
+
+    expect(loadTokens()).toEqual(['admin-token', ROTATED]);
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('初始化失败之前换了 token，不摆出这一趟的报错', async () => {
+    const init = deferred<{ ok: boolean; created: string[] }>();
+    vi.mocked(api.initDrawtoolsConfigs).mockReturnValueOnce(init.promise);
+    render(<DrawtoolsSettingsPage />);
+    await settled();
+
+    fireEvent.click(screen.getByRole('button', { name: '从 Example 初始化用户配置' }));
+    await waitFor(() => expect(api.initDrawtoolsConfigs).toHaveBeenCalledOnce());
+    await rotate();
+    await act(async () => { init.reject(new Error(WRITE_FAILURE)); });
+
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('结构化字段写完才换 token，不提示也不拿旧 token 重读', async () => {
+    const write = deferred<unknown>();
+    vi.mocked(api.updateDrawtoolsSettingsRaw).mockReturnValueOnce(write.promise);
+    render(<DrawtoolsSettingsPage />);
+    await waitFor(() => expect(baseUrlBox()).toHaveValue('https://image.novelai.net'));
+
+    fireEvent.blur(baseUrlBox(), { target: { value: 'https://relay.example' } });
+    await waitFor(() => expect(api.updateDrawtoolsSettingsRaw).toHaveBeenCalledOnce());
+    await rotate();
+    await act(async () => { write.resolve({ ok: true }); });
+
+    expect(loadTokens()).toEqual(['admin-token', ROTATED]);
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('结构化字段写失败之前换了 token，不摆出这一趟的报错', async () => {
+    const write = deferred<unknown>();
+    vi.mocked(api.updateDrawtoolsSettingsRaw).mockReturnValueOnce(write.promise);
+    render(<DrawtoolsSettingsPage />);
+    await waitFor(() => expect(baseUrlBox()).toHaveValue('https://image.novelai.net'));
+
+    fireEvent.blur(baseUrlBox(), { target: { value: 'https://relay.example' } });
+    await waitFor(() => expect(api.updateDrawtoolsSettingsRaw).toHaveBeenCalledOnce());
+    await rotate();
+    await act(async () => { write.reject(new Error(WRITE_FAILURE)); });
+
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('清理跑完才换 token，删了几个文件不报到新会话', async () => {
+    const cleanup = deferred<unknown>();
+    vi.mocked(api.cleanupDrawtoolsAttachments).mockReturnValueOnce(cleanup.promise);
+    render(<DrawtoolsSettingsPage />);
+    await settled();
+
+    fireEvent.click(screen.getByRole('button', { name: '立即清理' }));
+    await waitFor(() => expect(api.cleanupDrawtoolsAttachments).toHaveBeenCalledOnce());
+    await rotate();
+    await act(async () => {
+      cleanup.resolve({ deleted_count: 3, deleted_mb: 12, remaining_count: 8, remaining_mb: 40 });
+    });
+
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('清理失败之前换了 token，不摆出这一趟的报错', async () => {
+    const cleanup = deferred<unknown>();
+    vi.mocked(api.cleanupDrawtoolsAttachments).mockReturnValueOnce(cleanup.promise);
+    render(<DrawtoolsSettingsPage />);
+    await settled();
+
+    fireEvent.click(screen.getByRole('button', { name: '立即清理' }));
+    await waitFor(() => expect(api.cleanupDrawtoolsAttachments).toHaveBeenCalledOnce());
+    await rotate();
+    await act(async () => { cleanup.reject(new Error(WRITE_FAILURE)); });
+
+    expect(screen.queryByRole('status')).toBeNull();
   });
 });

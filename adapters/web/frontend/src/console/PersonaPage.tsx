@@ -8,6 +8,7 @@ import {
   getNodeRaw,
   getNodes,
   getProviders,
+  isNotFound,
   updateNodeFileRaw,
   updateNodeRaw,
 } from '../api/supervisorClient';
@@ -35,8 +36,6 @@ const PERSONA_FILE = '_persona.md';
 
 const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');
 
-const isMissing = (error: unknown): boolean => error instanceof Error && /^404\b/.test(error.message);
-
 /** 读人设文件，还没建是 null。先查列表再读：直接去读不存在的文件，浏览器控制台会留一条 404 报错。 */
 async function readPersona(token: string): Promise<string | null> {
   const files = await getNodeFiles(token);
@@ -45,7 +44,7 @@ async function readPersona(token: string): Promise<string | null> {
     return await getNodeFileRaw(token, PERSONA_FILE);
   } catch (error) {
     // 查完列表到读之间被删掉了，一样按还没建算。
-    if (isMissing(error)) return null;
+    if (isNotFound(error)) return null;
     throw error;
   }
 }

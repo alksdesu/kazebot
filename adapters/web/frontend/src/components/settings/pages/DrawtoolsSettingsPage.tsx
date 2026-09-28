@@ -6,6 +6,7 @@ import {
   getDrawtoolsBundle,
   getNodeRaw,
   initDrawtoolsConfigs,
+  isNotFound,
   updateDrawtoolsCharactersRaw,
   updateDrawtoolsPromptRaw,
   updateDrawtoolsSettingsRaw,
@@ -16,8 +17,8 @@ import { usePageNotice } from '../../../hooks/usePageNotice';
 import { appendSentence } from '../../../utils/sentence';
 import { rewriteYaml } from '../../../console/yamlRewrite';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
-import { useSettingsStore } from '../../../store/settingsStore';
-import { Block, Button, Field, Input, PageShell, Select, StatusText } from './settingsControls';
+import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { Block, Button, ErrorText, Field, Input, PageShell, Select, StatusText } from './settingsControls';
 
 const presetTextAreaClass = 'w-full resize-y overflow-hidden border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-sm leading-5 text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]';
 
@@ -60,6 +61,8 @@ function makePresetId(name: string, presets: any[]): string {
 }
 
 type SectionKey = 'settings' | 'characters' | 'node' | 'top-system' | 'output-format' | 'tag-guide';
+
+const PLANNER_NODE = 'draw.novelai_planner';
 
 const sectionLabels: Record<SectionKey, string> = {
   settings: '绘图设置 / 预设',
@@ -150,7 +153,7 @@ function getSectionContent(bundle: DrawtoolsBundle | null, key: SectionKey): str
 
 function fileMeta(bundle: DrawtoolsBundle | null, key: SectionKey): string {
   if (!bundle) return '';
-  if (key === 'node') return 'config/nodes/draw.novelai_planner.yaml';
+  if (key === 'node') return `config/nodes/${PLANNER_NODE}.yaml`;
   const item = key === 'settings'
     ? bundle.settings
     : key === 'characters'
@@ -160,14 +163,26 @@ function fileMeta(bundle: DrawtoolsBundle | null, key: SectionKey): string {
   return item.exists ? `用户配置：${item.path}` : `正在显示模板：${item.example_path}`;
 }
 
+// 节点文件还没建时按空文件编辑，保存就建出来；别的读失败不能当成空文件，不然一保存就把原文件盖掉了。
+async function readPlannerNode(token: string): Promise<{ content: string; error: string }> {
+  try {
+    return { content: await getNodeRaw(token, PLANNER_NODE), error: '' };
+  } catch (error) {
+    if (isNotFound(error)) return { content: '', error: '' };
+    return { content: '', error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 export const DrawtoolsSettingsPage = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const [bundle, setBundle] = useState<DrawtoolsBundle | null>(null);
   const [section, setSection] = useState<SectionKey>('settings');
   const [editor, setEditor] = useState('');
   const [nodeRaw, setNodeRaw] = useState('');
+  const [nodeError, setNodeError] = useState('');
   const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
+  const loadVersion = useRef(0);
   const [presetsExpanded, setPresetsExpanded] = useState(false);
   const [characterQuery, setCharacterQuery] = useState('');
   const [editingCharacterIndex, setEditingCharacterIndex] = useState<number | null>(null);
@@ -191,20 +206,21 @@ export const DrawtoolsSettingsPage = () => {
   /** 重读绘图配置。只动读取那一半提示：保存之后紧接着读，刚写下的「已保存」不能被冲掉。 */
   const load = async () => {
     if (!adminToken || !isAuthenticated) return;
+    const version = ++loadVersion.current;
     setLoading(true);
     try {
-      const [data, nodeYaml] = await Promise.all([
-        getDrawtoolsBundle(adminToken),
-        getNodeRaw(adminToken, 'draw.novelai_planner').catch(() => ''),
-      ]);
+      const [data, node] = await Promise.all([getDrawtoolsBundle(adminToken), readPlannerNode(adminToken)]);
+      if (version !== loadVersion.current) return;
       setBundle(data);
-      setNodeRaw(nodeYaml);
-      setEditor(section === 'node' ? nodeYaml : getSectionContent(data, section));
+      setNodeRaw(node.content);
+      setNodeError(node.error);
+      setEditor(section === 'node' ? node.content : getSectionContent(data, section));
       setLoadError('');
     } catch (error) {
+      if (version !== loadVersion.current) return;
       setLoadError(error instanceof Error ? error.message : '加载绘图配置失败');
     } finally {
-      setLoading(false);
+      if (version === loadVersion.current) setLoading(false);
     }
   };
 
@@ -214,10 +230,11 @@ export const DrawtoolsSettingsPage = () => {
     await load();
   };
 
-  useEffect(() => { void refresh(); }, [adminToken, isAuthenticated]);
+  useEffect(() => { void refresh(); return () => { loadVersion.current += 1; }; }, [adminToken, isAuthenticated]);
 
   const sourceText = section === 'node' ? nodeRaw : getSectionContent(bundle, section);
   const editorDirty = bundle !== null && editor !== sourceText;
+  const nodeLocked = section === 'node' && nodeError !== '';
   const confirmDiscard = useUnsavedChanges(editorDirty, '绘图的「原始配置编辑器」还有未保存修改，确定离开或丢弃吗？');
 
   useEffect(() => {
@@ -229,11 +246,13 @@ export const DrawtoolsSettingsPage = () => {
     try {
       if (section === 'settings') await updateDrawtoolsSettingsRaw(adminToken, editor);
       else if (section === 'characters') await updateDrawtoolsCharactersRaw(adminToken, editor);
-      else if (section === 'node') await updateNodeRaw(adminToken, 'draw.novelai_planner', editor);
+      else if (section === 'node') await updateNodeRaw(adminToken, PLANNER_NODE, editor);
       else await updateDrawtoolsPromptRaw(adminToken, section, editor);
+      if (tokenChanged(adminToken)) return;
       setMessage('已保存。用户配置文件会写入非 example 文件，后续更新不会覆盖。');
       await load();
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(error instanceof Error ? error.message : '保存失败');
     }
   };
@@ -242,9 +261,11 @@ export const DrawtoolsSettingsPage = () => {
     if (!adminToken) return;
     try {
       const result = await initDrawtoolsConfigs(adminToken);
+      if (tokenChanged(adminToken)) return;
       setMessage(result.created.length ? `已创建：${result.created.join('、')}` : '用户配置已存在，无需创建。');
       await load();
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(error instanceof Error ? error.message : '初始化失败');
     }
   };
@@ -261,9 +282,11 @@ export const DrawtoolsSettingsPage = () => {
     try {
       const { content, message: done } = rewriteStructured(base, next, okText);
       await write(adminToken, content);
+      if (tokenChanged(adminToken)) return;
       setMessage(done);
       await load();
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(error instanceof Error ? error.message : failText);
     }
   };
@@ -301,8 +324,10 @@ export const DrawtoolsSettingsPage = () => {
     if (!window.confirm('立即清理 data/attachments/novelai？过期文件会被删除，超出容量上限时还会删掉最旧的那些。')) return;
     try {
       const result = await cleanupDrawtoolsAttachments(adminToken);
+      if (tokenChanged(adminToken)) return;
       setMessage(`清理完成：删除 ${result.deleted_count ?? 0} 个文件，释放 ${result.deleted_mb ?? 0} MB；剩余 ${result.remaining_count ?? 0} 个文件 / ${result.remaining_mb ?? 0} MB`);
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(error instanceof Error ? error.message : '清理失败');
     }
   };
@@ -804,13 +829,15 @@ export const DrawtoolsSettingsPage = () => {
           </div>
           <textarea
             className="h-[var(--duties-pane-height-tall)] w-full resize-y border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 font-mono text-xs leading-5 text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            disabled={nodeLocked}
             onChange={(event) => setEditor(event.currentTarget.value)}
             spellCheck={false}
             value={editor}
           />
+          {nodeLocked && <ErrorText role="alert">读不到这份文件：{nodeError}。点上面的「刷新」重读；读到之前不能在这里改，免得空白内容盖掉原文件。</ErrorText>}
           <div className="mt-3 flex flex-wrap gap-2">
-            <Button disabled={!editorDirty} onClick={saveCurrent}>保存当前文件</Button>
-            <Button tone="quiet" disabled={!editorDirty} onClick={() => setEditor(sourceText)}>丢弃</Button>
+            <Button disabled={!editorDirty || nodeLocked} onClick={saveCurrent}>保存当前文件</Button>
+            <Button tone="quiet" disabled={!editorDirty || nodeLocked} onClick={() => setEditor(sourceText)}>丢弃</Button>
           </div>
         </Block>
       </>
