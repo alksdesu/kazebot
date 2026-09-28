@@ -15,6 +15,7 @@ from platforms.live import file_fingerprint, live_status, read_live_state, same_
 from platforms.registry import (
     MissingPlatformHook,
     all_platforms,
+    current_platform,
     features_module,
     get_platform,
     platform_config_path,
@@ -50,12 +51,13 @@ def config_file_name(workspace_root: Path, platform: PlatformDescriptor) -> str:
 
 
 def published_states(workspace_root: Path) -> dict[str, dict[str, Any]]:
-    """各平台 bot 最近一次公布的生效快照，按平台 id。失联的也算：写在配置和 env 里的设置不随 bot 停下而消失。"""
-    return {
-        platform.id: state
-        for platform in all_platforms()
-        if (state := read_live_state(platform, workspace_root))
-    }
+    """本实例 bot 最近一次公布的生效快照，按平台 id。失联的也算：写在配置和 env 里的设置不随 bot 停下而消失。
+
+    只认本实例在跑的平台：换过平台的实例盘上还留着那个平台的旧快照，算进来会拿早已不跑的 bot 的兜底当真。
+    """
+    platform = current_platform()
+    state = read_live_state(platform, workspace_root)
+    return {platform.id: state} if state else {}
 
 
 def platform_health(workspace_root: Path, platform: PlatformDescriptor) -> dict[str, Any]:
@@ -196,7 +198,11 @@ def create_platform_router(workspace_root: Path) -> APIRouter:
 
     @router.get("")
     def list_platforms() -> dict[str, Any]:
-        return {"platforms": [platform.public_dict() for platform in all_platforms()]}
+        # 全部平台都给：前端靠它认会话键的前缀，迁移过来的历史会话出自别的平台也得认得出。current 才是本实例在跑的那个。
+        return {
+            "platforms": [platform.public_dict() for platform in all_platforms()],
+            "current": current_platform().id,
+        }
 
     @router.get("/{platform_id}")
     def get_one(platform_id: str) -> dict[str, Any]:

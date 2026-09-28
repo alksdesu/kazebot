@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from platforms.builtin import QQ_NAPCAT
 from platforms.descriptor import PlatformDescriptor
-from platforms.registry import platform_config_path, register_platform, unregister_platform
+from platforms.registry import PLATFORM_ENV, platform_config_path, register_platform, unregister_platform
 from supervisor.operations.service import OperationsService
 
 # 没有热载配置、也没声明排查提示的平台，看诊断是不是按通用说法给。
@@ -145,21 +145,41 @@ def test_fleet_status_uses_the_live_convention_and_applied_fingerprint(tmp_path)
     assert (status["adapter_online"], status["connected"], status["config_applied"]) == (False, False, False)
 
 
-def test_status_lists_every_registered_platform(tmp_path):
+def test_status_lists_only_the_platform_this_instance_runs(tmp_path, monkeypatch):
+    # 别的平台注册着不等于这台在跑它，列出来只会让人以为它掉线了。
     register_platform(PLAIN)
     try:
         rows = service(tmp_path).status()["platforms"]
+        monkeypatch.setenv(PLATFORM_ENV, PLAIN.id)
+        switched = service(tmp_path).status()["platforms"]
     finally:
         unregister_platform(PLAIN.id)
-    assert [row["id"] for row in rows] == ["qq", "plainchat"]
-    assert rows[1]["published"] is False and rows[1]["config_applied"] is None
+    assert [row["id"] for row in rows] == ["qq"]
+    assert [row["id"] for row in switched] == ["plainchat"]
+    assert switched[0]["published"] is False and switched[0]["config_applied"] is None
 
 
-def test_a_platform_that_never_published_is_a_warning_not_a_failure(tmp_path):
-    # 注册了不等于这个实例在跑它：从没收到过状态只提醒，也不去判连接。
+def test_a_platform_that_never_published_is_a_failure(tmp_path):
+    # 一个实例只跑这一个平台，它从没公布过状态就是 bot 没起来或连不上，不是「本来就不跑」。
     report = asyncio.run(service(tmp_path).diagnose())
-    assert check(report, "QQ · NapCat 适配进程")["status"] == "warning"
+    found = check(report, "QQ · NapCat 适配进程")
+    assert found["status"] == "failed"
+    assert found["detail"] == "还没收到过它公布的状态"
+    assert found["action"] == "检查 bot 进程是否在跑、连的是不是这个 Supervisor 的地址"
     assert not any(item["name"] == "QQ · NapCat 连接" for item in report["checks"])
+
+
+def test_another_platform_left_behind_state_is_not_diagnosed(tmp_path, monkeypatch):
+    # 换过平台的实例盘上还留着旧平台的快照，算进来就成了「两个适配进程」。
+    publish(tmp_path, published_at=time.time(), connected=True)
+    register_platform(PLAIN)
+    try:
+        monkeypatch.setenv(PLATFORM_ENV, PLAIN.id)
+        report = asyncio.run(service(tmp_path).diagnose())
+    finally:
+        unregister_platform(PLAIN.id)
+    assert check(report, "Plain 适配进程")["status"] == "failed"
+    assert not any(item["name"].startswith("QQ · NapCat") for item in report["checks"])
 
 
 def test_a_silent_adapter_fails_and_its_connection_is_not_judged(tmp_path):
@@ -177,8 +197,9 @@ def test_an_unconnected_platform_points_at_its_declared_hint(tmp_path):
     assert (found["status"], found["action"]) == ("failed", QQ_NAPCAT.connection_hint)
 
 
-def test_a_platform_without_a_hint_or_config_gets_the_generic_wording(tmp_path):
+def test_a_platform_without_a_hint_or_config_gets_the_generic_wording(tmp_path, monkeypatch):
     register_platform(PLAIN)
+    monkeypatch.setenv(PLATFORM_ENV, PLAIN.id)
     try:
         live = tmp_path / "data/platforms/plainchat/live.json"
         live.parent.mkdir(parents=True)
@@ -191,9 +212,10 @@ def test_a_platform_without_a_hint_or_config_gets_the_generic_wording(tmp_path):
     assert not any(item["name"] == "Plain 配置路径" for item in report["checks"])
 
 
-def test_a_platform_that_keeps_no_config_env_points_at_the_workspace(tmp_path):
+def test_a_platform_that_keeps_no_config_env_points_at_the_workspace(tmp_path, monkeypatch):
     other = PlatformDescriptor(id="filechat", display_name="File", short_name="F", config_path="config/file.yaml")
     register_platform(other)
+    monkeypatch.setenv(PLATFORM_ENV, other.id)
     try:
         live = tmp_path / "data/platforms/filechat/live.json"
         live.parent.mkdir(parents=True)

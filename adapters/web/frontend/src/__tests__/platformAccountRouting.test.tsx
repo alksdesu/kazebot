@@ -21,9 +21,9 @@ const TELEGRAM: PlatformDescriptor = {
   connectionHint: '检查 bot token 与出网代理',
 };
 
-const main: ConsoleInstance = { id: 'main', label: '主实例', path: '', current: true, idx: 0, accounts: { qq: '1000001' } };
-const other = (accounts: Record<string, string>): ConsoleInstance => ({
-  id: 'xiaoyu', label: '第二实例', path: '/i/xiaoyu', current: false, idx: 1, accounts,
+const main: ConsoleInstance = { id: 'main', label: '主实例', path: '', current: true, idx: 0, platform: 'qq', account: '1000001' };
+const other = (platform: string, account: string): ConsoleInstance => ({
+  id: 'xiaoyu', label: '第二实例', path: '/i/xiaoyu', current: false, idx: 1, platform, account,
 });
 let instances: ConsoleInstance[] = [main];
 const scope = { current_scope: '90001', live_scope: '', bot_alive: false, preview: null, ambiguous_sources: [] };
@@ -112,7 +112,7 @@ describe('账号页的平台归属', () => {
   });
 
   it('别的实例在另一个平台上记着同一串号码，不算占用', async () => {
-    instances = [main, other({ qq: '2000002' })];
+    instances = [main, other('qq', '2000002')];
     stubFetch();
     inTelegram(<AccountWorkspaceSlot />);
     const quick = (await screen.findByRole('heading', { name: '快速切换' })).closest('section')!;
@@ -121,7 +121,7 @@ describe('账号页的平台归属', () => {
   });
 
   it('本平台上被别的实例占着的号只给控制台入口', async () => {
-    instances = [main, other({ telegram: '2000002' })];
+    instances = [main, other('telegram', '2000002')];
     stubFetch();
     inTelegram(<AccountWorkspaceSlot />);
     const quick = (await screen.findByRole('heading', { name: '快速切换' })).closest('section')!;

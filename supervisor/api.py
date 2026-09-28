@@ -2174,11 +2174,13 @@ def create_app(
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail="请求体要是对象")
         try:
+            platform, account = provisioning.platform_account_from(body)
             plan = provisioning.plan_instance(
                 st.workspace_root,
                 instance_id=str(body.get("id") or ""),
                 label=str(body.get("label") or ""),
-                accounts=body.get("accounts"),
+                platform=platform,
+                account=account,
             )
             # 先占清单再触发：并发两个请求时后来的会看见序号已被占，不会分到同一组端口。
             provisioning.scaffold(plan, st.workspace_root)
@@ -2188,7 +2190,7 @@ def create_app(
         return {
             "id": plan.instance_id, "label": plan.label, "idx": plan.idx,
             "prefix": plan.prefix, "ports": plan.ports,
-            "workspace": str(plan.workspace), "accounts": plan.accounts,
+            "workspace": str(plan.workspace), "platform": plan.platform, "account": plan.account,
         }
 
     @app.get("/v1/instances/{instance_id}/progress")

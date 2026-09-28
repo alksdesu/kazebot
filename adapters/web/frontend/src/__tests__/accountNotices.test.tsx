@@ -33,7 +33,7 @@ const ROUNDS_TO_RESTART_TIMEOUT = 61;
 const ROUNDS_TO_READ_TIMEOUT = 20;
 
 const instances: api.ConsoleInstance[] = [
-  { id: 'main', label: '主实例', path: '', current: true, idx: 0, accounts: { qq: '1000001' } },
+  { id: 'main', label: '主实例', path: '', current: true, idx: 0, platform: 'qq', account: '1000001' },
 ];
 const online: api.AccountStatus = {
   configured: true, reachable: true, is_login: true, online: true, account: '1000001', nick: '当前机器人',

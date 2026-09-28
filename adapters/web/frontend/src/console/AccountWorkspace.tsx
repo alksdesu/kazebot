@@ -46,9 +46,12 @@ const DESC = 'text-xs text-[var(--duties-secondary)]';
 
 const say = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-const accountsLine = (row: ConsoleInstance): string => Object.entries(row.accounts ?? {})
-  .map(([platformId, account]) => `${getPlatform(platformId)?.shortName ?? platformId} ${account}`)
-  .join('，');
+// 一个实例只跑一个平台：写成「QQ 12345」，还没登录过的写成「QQ · 还没登录」。老后端不给平台时整行不写。
+const accountLine = (row: ConsoleInstance): string => {
+  if (!row.platform) return '';
+  const name = getPlatform(row.platform)?.shortName ?? row.platform;
+  return row.account ? `${name} ${row.account}` : `${name} · 还没登录`;
+};
 
 // 扫码登录、多开、记忆归属都得盯着 NapCat 的 WebUI 一路轮询，编不成 schema 字段。
 export const AccountWorkspaceSlot = () => {
@@ -139,7 +142,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
     if (!isCurrent()) return;
     mutation.current = true; setBusy(true); setNote(''); setProgressError('');
     try {
-      const plan = await createInstance(token, id, newLabel.trim(), account ? { [platform.id]: account } : {});
+      const plan = await createInstance(token, id, newLabel.trim(), platform.id, account);
       if (!isCurrent()) return;
       setNewId(''); setNewLabel(''); setNewAccount(''); setJobAction('create');
       setJob({ id: plan.id, lines: ['已请求建实例，等 root 侧接手…'], finished: false, ok: false, detail: '' });
@@ -178,7 +181,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
         <span className="flex min-w-0 flex-col">
           <strong className="break-all text-sm font-medium">{row.label}</strong>
           <code className={DESC}>{row.id}</code>
-          {accountsLine(row) && <span className={DESC}>{accountsLine(row)}</span>}
+          {accountLine(row) && <span className={DESC}>{accountLine(row)}</span>}
         </span>
         <div className={BODY}>
           {row.current ? <span className={DESC}>当前实例</span> : <>

@@ -15,8 +15,9 @@ const row = (
   id: string,
   path: string,
   current: boolean,
-  accounts?: Record<string, string>,
-): ConsoleInstance => ({ id, label: `bot-${id}`, path, current, accounts });
+  platform?: string,
+  account?: string,
+): ConsoleInstance => ({ id, label: `bot-${id}`, path, current, platform, account });
 
 describe('isValidInstanceId', () => {
   it.each(['xiaoyu', 'bot_2', '1000000002', 'ab', 'a'.repeat(32), '10000'])('收下 %s', id => {
@@ -40,31 +41,31 @@ describe('isValidInstanceId', () => {
 
 describe('instanceOwning', () => {
   it('本实例登记的号也算归它管', () => {
-    const instances = [row('main', '', true, { qq: '111' })];
+    const instances = [row('main', '', true, 'qq', '111')];
     expect(instanceOwning('qq', '111', instances)?.id).toBe('main');
   });
 
   it('别的实例登记的号返回那个实例', () => {
-    const instances = [row('main', '', true, { qq: '111' }), row('xiaoyu', '/i/xiaoyu', false, { qq: '222' })];
+    const instances = [row('main', '', true, 'qq', '111'), row('xiaoyu', '/i/xiaoyu', false, 'qq', '222')];
     expect(instanceOwning('qq', '222', instances)?.path).toBe('/i/xiaoyu');
   });
 
   it('空账号谁都不归 —— 后端没登记时字段就是空串', () => {
-    const instances = [row('main', '', true, { qq: '' })];
+    const instances = [row('main', '', true, 'qq', '')];
     expect(instanceOwning('qq', '', instances)).toBeNull();
   });
 
   it('别的平台记着同一串数字不算', () => {
-    const instances = [row('xiaoyu', '/i/xiaoyu', false, { telegram: '222' })];
+    const instances = [row('xiaoyu', '/i/xiaoyu', false, 'telegram', '222')];
     expect(instanceOwning('qq', '222', instances)).toBeNull();
   });
 
-  it('老清单没有 accounts 时谁都不归它', () => {
+  it('老清单没有 platform 时谁都不归它', () => {
     expect(instanceOwning('qq', '222', [row('xiaoyu', '/i/xiaoyu', false)])).toBeNull();
   });
 
   it('同一个号登记在多条上时取第一条', () => {
-    const instances = [row('a', '/i/a', false, { qq: '222' }), row('b', '/i/b', false, { qq: '222' })];
+    const instances = [row('a', '/i/a', false, 'qq', '222'), row('b', '/i/b', false, 'qq', '222')];
     expect(instanceOwning('qq', '222', instances)?.id).toBe('a');
   });
 });
@@ -76,37 +77,37 @@ describe('ownedByAnotherInstance', () => {
   });
 
   it('号归别的实例时返回那个实例', () => {
-    const instances = [row('main', '', true, { qq: '111' }), row('xiaoyu', '/i/xiaoyu', false, { qq: '222' })];
+    const instances = [row('main', '', true, 'qq', '111'), row('xiaoyu', '/i/xiaoyu', false, 'qq', '222')];
     expect(ownedByAnotherInstance('qq', '222', instances)?.path).toBe('/i/xiaoyu');
   });
 
   it('本实例自己的号不拦', () => {
-    const instances = [row('main', '', true, { qq: '111' }), row('xiaoyu', '/i/xiaoyu', false, { qq: '222' })];
+    const instances = [row('main', '', true, 'qq', '111'), row('xiaoyu', '/i/xiaoyu', false, 'qq', '222')];
     expect(ownedByAnotherInstance('qq', '111', instances)).toBeNull();
   });
 
   it('不在清单里的号不拦', () => {
-    expect(ownedByAnotherInstance('qq', '999', [row('main', '', true, { qq: '111' })])).toBeNull();
+    expect(ownedByAnotherInstance('qq', '999', [row('main', '', true, 'qq', '111')])).toBeNull();
   });
 
   it('账号按字符串精确比，不做数字宽松匹配', () => {
-    const instances = [row('xiaoyu', '/i/xiaoyu', false, { qq: '111' })];
+    const instances = [row('xiaoyu', '/i/xiaoyu', false, 'qq', '111')];
     expect(ownedByAnotherInstance('qq', '1110', instances)).toBeNull();
     expect(ownedByAnotherInstance('qq', '11', instances)).toBeNull();
   });
 
   it('只按账号判，实例名撞上同一串数字不算', () => {
-    const instances = [row('1000002', '/i/1000002', false, { qq: '2000002' })];
+    const instances = [row('1000002', '/i/1000002', false, 'qq', '2000002')];
     expect(ownedByAnotherInstance('qq', '1000002', instances)).toBeNull();
   });
 
   it('别的平台的同号不拦', () => {
-    const instances = [row('xiaoyu', '/i/xiaoyu', false, { telegram: '222' })];
+    const instances = [row('xiaoyu', '/i/xiaoyu', false, 'telegram', '222')];
     expect(ownedByAnotherInstance('qq', '222', instances)).toBeNull();
   });
 
   it('空账号不拦', () => {
-    const instances = [row('xiaoyu', '/i/xiaoyu', false, { qq: '' })];
+    const instances = [row('xiaoyu', '/i/xiaoyu', false, 'qq', '')];
     expect(ownedByAnotherInstance('qq', '', instances)).toBeNull();
   });
 });

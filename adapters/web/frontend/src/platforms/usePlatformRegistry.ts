@@ -40,9 +40,9 @@ export function usePlatformRegistry(): void {
     if (!token) return;
     let alive = true;
     void getPlatforms(token)
-      .then((rows) => {
+      .then(({ platforms, current }) => {
         if (!alive) return;
-        adoptPlatforms(rows.map(toDescriptor).filter((row): row is PlatformDescriptor => row !== null));
+        adoptPlatforms(platforms.map(toDescriptor).filter((row): row is PlatformDescriptor => row !== null), current);
       })
       .catch(() => {
         if (alive) settlePlatforms();

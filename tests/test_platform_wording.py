@@ -29,7 +29,7 @@ from platforms.descriptor import (  # noqa: E402
 from platforms.registry import register_platform, unregister_platform  # noqa: E402
 from platforms.wording import name_with  # noqa: E402
 from supervisor.platform_accounts import PlatformAccounts  # noqa: E402
-from supervisor.provisioning import ProvisionError, normalize_accounts  # noqa: E402
+from supervisor.provisioning import ProvisionError, normalize_account  # noqa: E402
 from supervisor.sticker_tagging import StickerTaggingService  # noqa: E402
 
 # 汉字名、有配置文件：能说到「它的配置文件叫什么」的那几句用它。
@@ -126,8 +126,8 @@ class TestRefusals:
         assert _refused(lambda: accounts.ops(INKWELL)) == "InkWell 没有账号运维"
 
     def test_an_account_that_does_not_fit_the_platform(self) -> None:
-        assert _refused(lambda: normalize_accounts({VAULT.id: "abc"})) == "保险库的账号写法不对：abc"
-        assert _refused(lambda: normalize_accounts({QQ_NAPCAT.id: "abc"})) == "QQ · NapCat 的账号写法不对：abc"
+        assert _refused(lambda: normalize_account(VAULT, "abc")) == "保险库的账号写法不对：abc"
+        assert _refused(lambda: normalize_account(QQ_NAPCAT, "abc")) == "QQ · NapCat 的账号写法不对：abc"
 
 
 class TestTaggingFallbackText:

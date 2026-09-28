@@ -19,7 +19,6 @@ import {
 } from '../../console/pages';
 import type { SectionPick } from '../../console/sectionPick';
 import {
-  allPlatforms,
   platformRegistryState,
   type PlatformDescriptor,
   type PlatformRegistryState,
@@ -152,7 +151,9 @@ const FIXED_TABS: SettingsTabDefinition[] = [...CORE_TABS, ...BOT_TABS, ...MODEL
 
 let built: { platforms: readonly PlatformDescriptor[]; tabs: SettingsTabDefinition[] } | null = null;
 
-/** 侧栏、页面宿主、右侧面板共用的页签表。平台组跟着平台清单生成，清单没换就还是同一个数组。 */
+/** 侧栏、页面宿主、右侧面板共用的页签表。平台组跟着给的平台生成，给的没换就还是同一个数组。
+ *
+ * 传进来的是要列页的平台，按注册表取时是 running：一个实例只跑一个平台，别的平台的页列出来也没有 bot 在读。 */
 export function settingsTabsFor(platforms: readonly PlatformDescriptor[]): SettingsTabDefinition[] {
   if (built?.platforms !== platforms) {
     built = { platforms, tabs: [...FIXED_TABS, ...platformTabs(platforms)].sort((a, b) => a.order - b.order) };
@@ -162,11 +163,11 @@ export function settingsTabsFor(platforms: readonly PlatformDescriptor[]): Setti
 
 /** 组件外按眼下的平台清单取。组件里用 useSettingsTabs，清单换了才跟着重画。 */
 export function currentSettingsTabs(): SettingsTabDefinition[] {
-  return settingsTabsFor(allPlatforms());
+  return settingsTabsFor(platformRegistryState().running);
 }
 
 export function useSettingsTabs(): SettingsTabDefinition[] {
-  return settingsTabsFor(usePlatformRegistryState().platforms);
+  return settingsTabsFor(usePlatformRegistryState().running);
 }
 
 export function getSettingsTab(
@@ -192,7 +193,7 @@ export function resolveSettingsTab(
   tabId: string,
   registry: PlatformRegistryState = platformRegistryState(),
 ): ResolvedSettingsTab {
-  const tab = getSettingsTab(tabId, settingsTabsFor(registry.platforms));
+  const tab = getSettingsTab(tabId, settingsTabsFor(registry.running));
   const resolved = resolveSettingsTabId(tabId);
   return { tab, pending: !registry.settled && tab.id !== resolved && isPlatformPageId(resolved) };
 }

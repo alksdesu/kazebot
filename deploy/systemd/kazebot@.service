@@ -20,9 +20,9 @@ EnvironmentFile=-/opt/kazebot-data/%i/.env
 ExecStart=/opt/kazebot/.venv/bin/python /opt/kazebot/main.py
 Restart=always
 RestartSec=3
-# main.py 内部循环处理退出码 75；98 是端口被占，重启无意义，停住等人
+# main.py 内部循环处理退出码 75；98 是端口被占、78 是实例配置写错，重启都无意义，停住等人
 SuccessExitStatus=75
-RestartPreventExitStatus=98
+RestartPreventExitStatus=98 78
 KillMode=mixed
 TimeoutStopSec=30
 

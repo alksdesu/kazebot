@@ -95,12 +95,16 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from platforms.builtin import QQ_NAPCAT
 from supervisor.instances import save_instance
-from supervisor.provisioning import normalize_accounts, validate_instance_id
+from supervisor.provisioning import normalize_account, validate_instance_id
 
 instance_id = validate_instance_id(sys.argv[2])
-accounts = normalize_accounts({QQ_NAPCAT.id: sys.argv[3]} if sys.argv[3] else None)
 rows = save_instance(
-    Path(sys.argv[1]), instance_id=instance_id, label=f"主实例 {instance_id}", idx=0, accounts=accounts,
+    Path(sys.argv[1]),
+    instance_id=instance_id,
+    label=f"主实例 {instance_id}",
+    idx=0,
+    platform=QQ_NAPCAT.id,
+    account=normalize_account(QQ_NAPCAT, sys.argv[3]),
 )
 print(f"    清单共 {len(rows)} 个实例")
 PY

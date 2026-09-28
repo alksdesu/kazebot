@@ -1,4 +1,4 @@
-// 热载配置的草稿态。每份配置文件一份：各平台的配置、全平台共用的全局默认，可以同时攒着没写回的改动。
+// 热载配置的草稿态。每份配置文件一份：平台配置、不分平台的全局默认，可以同时攒着没写回的改动。
 import yaml from 'js-yaml';
 import { create, type StoreApi, type UseBoundStore } from 'zustand';
 
@@ -209,7 +209,7 @@ const CONFIRM_LIMIT_TEXT = `${CONFIRM_LIMIT_MS / 1000} 秒`;
 
 const FEATURES_WORDING: Record<Verdict, string> = {
   changed: '全局文件在保存之后又被改过，请核对当前内容。',
-  unreadable: '已保存，但暂时读不到全局设置的状态，还不知道各平台换没换上。',
+  unreadable: '已保存，但暂时读不到全局设置的状态，还不知道 bot 换没换上。',
   unconfirmed: `已保存，但有在跑的 bot 没在 ${CONFIRM_LIMIT_TEXT}内换上新文件，「全局默认」页顶部列着是哪一个。`,
 };
 
@@ -314,7 +314,7 @@ const createConsoleState = (scope: ConfigScope) => (
   /**
    * 隔 interval 探一次，最多 rounds 次，探到结论就停。返回最后一次探测；被新的写回顶掉时返回 null。
    *
-   * 还在等的时候换上最新的实况（心跳、各平台换没换上），值照旧叠着写进去的那些：
+   * 还在等的时候换上最新的实况（心跳、bot 换没换上），值照旧叠着写进去的那些：
    * 生效方还没换上新文件，它公布的是写回前的值，原样铺上去界面就闪回旧值了。
    */
   const poll = async (token: string, written: Written, rounds: number, interval: number): Promise<Probe | null> => {
@@ -598,7 +598,7 @@ export interface LayerState {
 const NO_FALLBACKS: readonly FeatureFallback[] = [];
 
 export interface GlobalFallbacks {
-  /** 全局文件没写这一项时，各平台眼下用着的兜底。只有全局页有，平台页上恒为空。 */
+  /** 全局文件没写这一项时，bot 眼下用着的兜底。只有全局页有，平台页上恒为空。 */
   fallbacks: readonly FeatureFallback[];
   /** 这一项是统一跑的开关时，它实际开不开。 */
   central: CentralSwitchState | undefined;

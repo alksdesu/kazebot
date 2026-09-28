@@ -9,13 +9,20 @@ import asyncio
 import os
 import re
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from platforms.descriptor import HOOK_INSTANCE_ENV
+from platforms.descriptor import HOOK_INSTANCE_ENV, PlatformDescriptor
 from platforms.ids import normalize_id
-from platforms.registry import MissingPlatformHook, all_platforms, get_platform, platform_hook
+from platforms.registry import (
+    DEFAULT_PLATFORM_ID,
+    PLATFORM_ENV,
+    MissingPlatformHook,
+    UnknownPlatform,
+    platform_hook,
+    platform_named,
+)
 from platforms.wording import name_with
 
 from .instances import (
@@ -58,7 +65,9 @@ class Plan:
     workspace: Path
     ports: dict[str, int]
     prefix: str
-    accounts: dict[str, str] = field(default_factory=dict)
+    platform: str = DEFAULT_PLATFORM_ID
+    # 建实例时还没登录的话是空串，扫码登上之后由账号页记进清单。
+    account: str = ""
 
 
 def validate_instance_id(raw: str) -> str:
@@ -71,26 +80,47 @@ def validate_instance_id(raw: str) -> str:
     return instance_id
 
 
-def normalize_accounts(raw: Any) -> dict[str, str]:
-    """建实例时登记的平台账号：平台要认得，账号写法要合这个平台的 ID 形状。"""
-    if raw is None:
-        return {}
-    if not isinstance(raw, Mapping):
+def resolve_platform(raw: Any) -> PlatformDescriptor:
+    """新实例要跑的平台。没写就是 QQ，和没声明平台的老实例一样。"""
+    try:
+        return platform_named(str(raw or "").strip() or DEFAULT_PLATFORM_ID)
+    except UnknownPlatform as error:
+        raise ProvisionError(str(error)) from None
+
+
+def normalize_account(platform: PlatformDescriptor, raw: Any) -> str:
+    """建实例时登记的账号，写法要合这个平台的 ID 形状。可以不给，登录之后再记。"""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    account = normalize_id(text, platform.id_shape)
+    if not account:
+        raise ProvisionError(name_with(platform.display_name, f"的账号写法不对：{text}"))
+    return account
+
+
+def platform_account_from(body: Mapping[str, Any]) -> tuple[PlatformDescriptor, str]:
+    """请求里的平台和账号。
+
+    没开页面刷新的旧控制台还会发一个实例挂几个平台时的 accounts 映射：只有一项时照认，
+    多于一项说明它还以为一个实例能挂多个平台，直接拒掉，不替它挑。
+    """
+    if "platform" in body or "account" in body:
+        platform = resolve_platform(body.get("platform"))
+        return platform, normalize_account(platform, body.get("account"))
+    legacy = body.get("accounts")
+    if legacy is None:
+        return resolve_platform(None), ""
+    if not isinstance(legacy, Mapping):
         raise ProvisionError("accounts 要写成「平台 id: 账号」")
-    accounts: dict[str, str] = {}
-    for name, value in raw.items():
-        text = str(value or "").strip()
-        if not text:
-            continue
-        try:
-            platform = get_platform(name)
-        except KeyError:
-            raise ProvisionError(f"不认识的平台：{name}") from None
-        account = normalize_id(text, platform.id_shape)
-        if not account:
-            raise ProvisionError(name_with(platform.display_name, f"的账号写法不对：{text}"))
-        accounts[platform.id] = account
-    return accounts
+    filled = [(name, value) for name, value in legacy.items() if str(value or "").strip()]
+    if len(filled) > 1:
+        raise ProvisionError("一个实例只跑一个平台，请刷新控制台后重新建")
+    if not filled:
+        return resolve_platform(next(iter(legacy), None)), ""
+    name, value = filled[0]
+    platform = resolve_platform(name)
+    return platform, normalize_account(platform, value)
 
 
 def data_root(workspace_root: Path) -> Path:
@@ -127,18 +157,23 @@ def _repo_root() -> Path:
 
 
 def plan_instance(
-    workspace_root: Path, *, instance_id: str, label: str, accounts: Any = None,
+    workspace_root: Path,
+    *,
+    instance_id: str,
+    label: str,
+    platform: PlatformDescriptor | None = None,
+    account: str = "",
 ) -> Plan:
     """算出新实例的落点。不落盘，纯计算，便于先给前端看一眼。"""
     instance_id = validate_instance_id(instance_id)
-    accounts = normalize_accounts(accounts)
+    platform = platform or resolve_platform(None)
+    account = normalize_account(platform, account)
     rows = load_instances(workspace_root)
     if any(row["id"] == instance_id for row in rows):
         raise ProvisionError(f"{instance_id} 已经在清单里了")
-    for platform_id, account in accounts.items():
-        owner = account_owner_in(rows, platform_id, account)
-        if owner is not None:
-            raise ProvisionError(f"{account} 已经归实例 {owner['label']} 管了，同一个号两边登会互相踢下线")
+    owner = account_owner_in(rows, platform.id, account)
+    if owner is not None:
+        raise ProvisionError(f"{account} 已经归实例 {owner['label']} 管了，同一个号两边登会互相踢下线")
 
     root = data_root(workspace_root)
     target = root / instance_id
@@ -160,25 +195,26 @@ def plan_instance(
         workspace=target,
         ports=ports_for(idx),
         prefix=prefix_for(idx, instance_id),
-        accounts=accounts,
+        platform=platform.id,
+        account=account,
     )
 
 
 def _platform_env(plan: Plan) -> list[str]:
-    lines: list[str] = []
-    for platform in all_platforms():
-        try:
-            module = platform_hook(platform, HOOK_INSTANCE_ENV)
-        except MissingPlatformHook:
-            continue
-        ports = {port.name: plan.ports[port.name] for port in platform.instance_ports}
-        lines.extend(module.instance_env(plan.idx, ports))
-    return lines
+    """只写实例自己那个平台的几行：别的平台的端口和令牌写进来，只会让人以为这个实例也在跑它。"""
+    platform = platform_named(plan.platform)
+    try:
+        module = platform_hook(platform, HOOK_INSTANCE_ENV)
+    except MissingPlatformHook:
+        return []
+    ports = {port.name: plan.ports[port.name] for port in platform.instance_ports}
+    return list(module.instance_env(plan.idx, ports))
 
 
 def _env_body(plan: Plan) -> str:
     lines = [
         f"# 实例 {plan.instance_id} ({plan.label})",
+        f"{PLATFORM_ENV}={plan.platform}",
         f"CLONOTH_PORT={plan.ports['supervisor']}",
         *_platform_env(plan),
     ]
@@ -222,7 +258,12 @@ def scaffold(plan: Plan, workspace_root: Path) -> None:
     )
 
     save_instance(
-        workspace_root, instance_id=plan.instance_id, label=plan.label, idx=plan.idx, accounts=plan.accounts,
+        workspace_root,
+        instance_id=plan.instance_id,
+        label=plan.label,
+        idx=plan.idx,
+        platform=plan.platform,
+        account=plan.account,
     )
 
 
@@ -300,8 +341,10 @@ __all__ = [
     "forget",
     "guard_removable",
     "log_path",
-    "normalize_accounts",
+    "normalize_account",
     "plan_instance",
+    "platform_account_from",
+    "resolve_platform",
     "progress",
     "scaffold",
     "start_unit",

@@ -129,7 +129,7 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
     }, global ? '实例默认配置已保存；已有会话覆盖保持不变。' : clearingOrphan ? '会话覆盖已清除；此会话已无聊天记录及单独覆盖，请选择当前实例默认配置继续。' : '会话覆盖已保存。');
   };
 
-  return <FeaturePage title="会话与接话" description="当前实例默认配置适用于本实例各平台的群聊和私聊。每个会话可逐项使用默认值或自定义；已有覆盖不会被全局保存清除。">
+  return <FeaturePage title="会话与接话" description="当前实例默认配置适用于本实例的群聊和私聊。每个会话可逐项使用默认值或自定义；已有覆盖不会被全局保存清除。">
     <ScopeSelect picker={picker} value={scope} onChange={value => { if (value !== scope && confirmDiscard()) setScope(value); }} />
     <FeatureFeedback error={error} notice={notice} retry={picker.valid ? reload : undefined} />
     {loading && <p role="status">正在读取接话设置…</p>}

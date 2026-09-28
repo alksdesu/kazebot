@@ -1,6 +1,6 @@
 """表情包自动打标，全系统只跑一份，放在 supervisor 里。
 
-开关听全局文件；全局没写时认各平台 bot 公布的老位置和 env 兜底，bot 停着也照认。
+开关听全局文件；全局没写时认本实例 bot 公布的老位置和 env 兜底，bot 停着也照认。
 """
 from __future__ import annotations
 

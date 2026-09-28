@@ -1,4 +1,4 @@
-"""全平台共用的功能设置：触发、复读、队列、表情包这类每个平台都要的项，默认值写在全局文件里。
+"""不分平台的功能设置：触发、复读、队列、表情包这类每个平台都要的项，默认值写在全局文件里。
 
 平台文件里写同一路径就是这个平台单独覆盖；表情包图库那几项只认全局文件，平台文件里的老写法只兜底。
 """
@@ -48,7 +48,7 @@ def _overridable(name: str, path: str, coerce: Coercer, default: Any, **extra: A
 
 
 def _global_only(name: str, path: str, coerce: Coercer, default: Any, **extra: Any) -> LiveKey:
-    # 图库全平台只有一份，按平台各设一个上限说不通。
+    # 图库这台机器上的实例共用一份，平台页各设一个上限说不通。
     return LiveKey(name, path, coerce, default, layers=GLOBAL_ONLY, **extra)
 
 
@@ -437,7 +437,7 @@ def central_switch(
 
 
 def adopt(name: str, *, env: tuple[str, ...] = ()) -> LiveKey:
-    """平台键表里的全平台设置：路径、解析、默认值、层和控件都跟着全局声明走，平台只补自己早就有的 env 兜底。"""
+    """平台键表里的不分平台设置：路径、解析、默认值、层和控件都跟着全局声明走，平台只补自己早就有的 env 兜底。"""
     return dataclasses.replace(FEATURE_KEYS_BY_NAME[name], env=env)
 
 

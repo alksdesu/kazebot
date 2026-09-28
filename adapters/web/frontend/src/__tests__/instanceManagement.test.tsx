@@ -15,12 +15,12 @@ vi.mock('../api/supervisorClient', async importOriginal => ({
 }));
 
 const rows: api.ConsoleInstance[] = [
-  { id: 'main', label: '主实例', path: '', current: true, idx: 0, accounts: { qq: '1000001' } },
-  { id: 'xiaoyu', label: '第二实例', path: '/i/xiaoyu', current: false, idx: 1, accounts: { qq: '1000002' } },
+  { id: 'main', label: '主实例', path: '', current: true, idx: 0, platform: 'qq', account: '1000001' },
+  { id: 'xiaoyu', label: '第二实例', path: '/i/xiaoyu', current: false, idx: 1, platform: 'qq', account: '1000002' },
 ];
 const account: api.AccountStatus = { configured: true, reachable: true, is_login: true, online: true, account: '1000001', nick: '当前机器人' };
 const plan = (id: string): api.InstancePlan => ({
-  id, label: '', idx: 2, prefix: `/i/${id}`, ports: {}, workspace: '/synthetic', accounts: {},
+  id, label: '', idx: 2, prefix: `/i/${id}`, ports: {}, workspace: '/synthetic', platform: 'qq', account: '',
 });
 const deferred = <T,>() => {
   let resolve!: (value: T) => void;
@@ -58,9 +58,9 @@ describe('实例管理入口', () => {
     expect(api.getInstances).toHaveBeenCalledTimes(1);
   });
 
-  it('每行标出实例名和它登记的账号', async () => {
+  it('每行标出实例名和它跑的那个平台加号', async () => {
     vi.mocked(api.getInstances).mockResolvedValue([
-      rows[0], { ...rows[1], accounts: { qq: '1000002', telegram: '777' } },
+      rows[0], { ...rows[1], platform: 'telegram', account: '777' },
     ]);
     render(<AccountWorkspaceSlot />);
     const list = (await screen.findByRole('heading', { name: '多开实例' })).closest('section')!;
@@ -68,7 +68,22 @@ describe('实例管理入口', () => {
     expect(within(list).getByText('QQ 1000001')).toBeInTheDocument();
     expect(within(list).getByText('xiaoyu')).toBeInTheDocument();
     // 认不出的平台退回平台 id，不能把账号行整行吞掉。
-    expect(within(list).getByText('QQ 1000002，telegram 777')).toBeInTheDocument();
+    expect(within(list).getByText('telegram 777')).toBeInTheDocument();
+  });
+
+  it('建了还没扫码登录的实例也要说它跑哪个平台', async () => {
+    vi.mocked(api.getInstances).mockResolvedValue([rows[0], { ...rows[1], account: '' }]);
+    render(<AccountWorkspaceSlot />);
+    const list = (await screen.findByRole('heading', { name: '多开实例' })).closest('section')!;
+    expect(within(list).getByText('QQ · 还没登录')).toBeInTheDocument();
+  });
+
+  it('旧版后端不给平台时整行不写 —— 写个牌子说它跑 QQ 可能是错的', async () => {
+    vi.mocked(api.getInstances).mockResolvedValue([{ ...rows[1], platform: undefined, account: undefined }]);
+    render(<AccountWorkspaceSlot />);
+    const row = (await screen.findByText('xiaoyu')).closest('div')!;
+    expect(within(row).queryByText(/QQ/)).toBeNull();
+    expect(within(row).queryByText(/还没登录/)).toBeNull();
   });
 
   it('还没建过实例时给出装机命令，也不给建实例的入口', async () => {
@@ -138,7 +153,7 @@ describe('实例管理入口', () => {
 
   it('快速切换只认账号归属，实例名和号码撞上不算占用', async () => {
     vi.mocked(api.getInstances).mockResolvedValue([
-      rows[0], { id: '1000002', label: '数字名实例', path: '/i/1000002', current: false, idx: 1, accounts: { qq: '2000002' } },
+      rows[0], { id: '1000002', label: '数字名实例', path: '/i/1000002', current: false, idx: 1, platform: 'qq', account: '2000002' },
     ]);
     vi.mocked(api.getPlatformAccount).mockResolvedValue({ ...account, quick_login: [{ account: '1000002', nick: '另一个QQ' }] });
     render(<AccountWorkspaceSlot />);
@@ -216,21 +231,21 @@ describe('实例创建与归档', () => {
     fireEvent.click(create); fireEvent.click(create);
     expect(id).toBeDisabled(); expect(label).toBeDisabled(); expect(number).toBeDisabled();
     expect(confirm).toHaveBeenCalledWith(expect.stringMatching(/^建一个新 bot「xiaoyu2」？/));
-    expect(api.createInstance).toHaveBeenCalledExactlyOnceWith('current-token', 'xiaoyu2', '新实例备注', { qq: '1000003' });
+    expect(api.createInstance).toHaveBeenCalledExactlyOnceWith('current-token', 'xiaoyu2', '新实例备注', 'qq', '1000003');
     await act(async () => pending.reject(new Error('创建失败')));
     expect(screen.getByRole('alert')).toHaveTextContent('创建失败');
     expect(id).toHaveValue('xiaoyu2'); expect(label).toHaveValue('新实例备注'); expect(number).toHaveValue('1000003');
     expect(create).toBeEnabled();
   });
 
-  it('留空 QQ 号时不替新实例登记任何账号', async () => {
+  it('留空 QQ 号时不替新实例登记账号，平台照旧要告诉后端', async () => {
     vi.mocked(api.createInstance).mockReturnValue(deferred<api.InstancePlan>().promise);
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     render(<AccountWorkspaceSlot />);
     await screen.findByRole('combobox', { name: '切换实例' });
     fireEvent.change(screen.getByRole('textbox', { name: '新实例名' }), { target: { value: 'xiaoyu2' } });
     fireEvent.click(screen.getByRole('button', { name: '建实例' }));
-    expect(api.createInstance).toHaveBeenCalledExactlyOnceWith('current-token', 'xiaoyu2', '', {});
+    expect(api.createInstance).toHaveBeenCalledExactlyOnceWith('current-token', 'xiaoyu2', '', 'qq', '');
   });
 
   it.each([
@@ -415,7 +430,7 @@ describe('汉字名平台的账号文案', () => {
 
   it('账号已经归别的实例时那句也不多空格', async () => {
     vi.mocked(api.getInstances).mockResolvedValue([
-      { ...rows[0], accounts: { wechat: '1000001' } }, { ...rows[1], accounts: { wechat: '1000002' } },
+      { ...rows[0], platform: 'wechat', account: '1000001' }, { ...rows[1], platform: 'wechat', account: '1000002' },
     ]);
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     renderFor(WECHAT);

@@ -10,6 +10,7 @@ import {
   adoptPlatforms,
   connectionPeerName,
   conversationKindForScope,
+  currentPlatformId,
   entrypointNote,
   isConversationScope,
   looksLikeScopeKey,
@@ -61,6 +62,60 @@ describe('平台注册表', () => {
 
     adoptPlatforms([]);
     expect(conversationKindForScope('tg_group:abc')).toBe('group');
+  });
+});
+
+describe('本实例在跑的平台', () => {
+  afterEach(resetPlatforms);
+
+  it('后端说了跑哪个，要列页的就只有它，认会话键的还是整张清单', () => {
+    adoptPlatforms([QQ_NAPCAT, TELEGRAM], 'telegram');
+
+    expect(currentPlatformId()).toBe('telegram');
+    expect(platformRegistryState().running).toEqual([TELEGRAM]);
+    expect(platformRegistryState().platforms).toEqual([QQ_NAPCAT, TELEGRAM]);
+    // 迁移过来的历史会话出自别的平台，前缀照样要认得出。
+    expect(conversationKindForScope('qq_group:abc')).toBe('group');
+  });
+
+  it('后端不说跑哪个时照旧全列 —— 旧版后端没有这个字段', () => {
+    adoptPlatforms([QQ_NAPCAT, TELEGRAM]);
+
+    expect(currentPlatformId()).toBeNull();
+    expect(platformRegistryState().running).toEqual([QQ_NAPCAT, TELEGRAM]);
+  });
+
+  it('后端说的平台不在它自己给的清单里时，宁可多列也不能一页不剩', () => {
+    adoptPlatforms([QQ_NAPCAT, TELEGRAM], 'nowhere');
+
+    expect(currentPlatformId()).toBe('nowhere');
+    expect(platformRegistryState().running).toEqual([QQ_NAPCAT, TELEGRAM]);
+  });
+
+  it('清单没到之前不知道跑哪个，reset 之后也回到不知道', () => {
+    expect(currentPlatformId()).toBeNull();
+    expect(platformRegistryState().running).toEqual([QQ_NAPCAT]);
+
+    adoptPlatforms([QQ_NAPCAT, TELEGRAM], 'telegram');
+    resetPlatforms();
+
+    expect(currentPlatformId()).toBeNull();
+    expect(platformRegistryState().running).toEqual([QQ_NAPCAT]);
+  });
+
+  it('清单拿不到时只是不用再等，跑哪个还是不知道', () => {
+    settlePlatforms();
+
+    expect(currentPlatformId()).toBeNull();
+    expect(platformRegistryState().running).toEqual([QQ_NAPCAT]);
+    expect(platformRegistryState().settled).toBe(true);
+  });
+
+  it('空清单不换内置那份，也不认后端顺带说的那个 current', () => {
+    adoptPlatforms([], 'telegram');
+
+    expect(currentPlatformId()).toBeNull();
+    expect(platformRegistryState().platforms).toEqual([QQ_NAPCAT]);
   });
 });
 

@@ -35,16 +35,22 @@ from platforms.descriptor import (  # noqa: E402
     PlatformDescriptor,
 )
 from platforms.registry import (  # noqa: E402
+    DEFAULT_PLATFORM_ID,
+    PLATFORM_ENV,
     STANDARD_STATE_FILES,
     MissingPlatformHook,
+    UnknownPlatform,
     alias_numbering_path,
     all_platforms,
     conversation_channel,
+    current_platform,
+    current_platform_id,
     features_module,
     find_platform,
     get_platform,
     is_platform_conversation,
     platform_config_path,
+    platform_named,
     platform_data_dir,
     platform_hook,
     platform_profiles_path,
@@ -140,6 +146,74 @@ class TestLookups:
         assert pattern is not None
         assert pattern.search(f"agent:x:{_QQ_GROUP}:uuid").group(0) == _QQ_GROUP
         assert pattern.search("agent:x:qq_forward:" + "c" * 24) is None
+
+
+class TestTheInstancePlatform:
+    """一个实例只跑一个平台，运行期处处认 CLONOTH_PLATFORM 这一个值。"""
+
+    @pytest.mark.parametrize("name", ["qq", "  QQ  ", "onebot", "onebot11"])
+    def test_a_platform_id_or_a_historical_alias_names_it(self, name: str) -> None:
+        assert platform_named(name) is QQ_NAPCAT
+
+    @pytest.mark.parametrize("name", ["qq_group", "qq_private", "qq_forward", "qq_unknown"])
+    def test_a_conversation_channel_is_not_a_platform_name(self, name: str) -> None:
+        # find_platform 认通道名，这里不能跟着认：清单和 .env 里写的是平台 id。
+        assert find_platform(name) is QQ_NAPCAT
+        with pytest.raises(UnknownPlatform):
+            platform_named(name)
+
+    @pytest.mark.parametrize("name", ["nowhere", "", "   ", None, "telegram"])
+    def test_a_name_nobody_registered_is_refused(self, name: object) -> None:
+        with pytest.raises(UnknownPlatform):
+            platform_named(name)
+
+    def test_the_refusal_lists_what_it_does_know(self) -> None:
+        with pytest.raises(UnknownPlatform, match="qq"):
+            platform_named("nowhere")
+
+    def test_a_platform_registered_later_is_nameable(self, telegram: PlatformDescriptor) -> None:
+        assert platform_named("TELEGRAM") is telegram
+        with pytest.raises(UnknownPlatform):
+            platform_named("tg_group")
+
+    def test_an_instance_that_does_not_say_runs_qq(self) -> None:
+        # 改造前的实例 .env 里没有这一行，那时候能跑的只有 QQ。
+        assert current_platform_id({}) == DEFAULT_PLATFORM_ID == "qq"
+        assert current_platform({}) is QQ_NAPCAT
+
+    @pytest.mark.parametrize("raw", ["", "   "])
+    def test_a_blank_declaration_is_the_same_as_not_saying(self, raw: str) -> None:
+        assert current_platform({PLATFORM_ENV: raw}) is QQ_NAPCAT
+
+    @pytest.mark.parametrize("raw", ["  QQ  ", "onebot", "onebot11"])
+    def test_a_declaration_goes_through_the_same_naming(self, raw: str) -> None:
+        assert current_platform_id({PLATFORM_ENV: raw}) == raw.strip().lower()
+        assert current_platform({PLATFORM_ENV: raw}) is QQ_NAPCAT
+
+    def test_the_declared_platform_is_the_one_registered_under_that_id(
+        self, telegram: PlatformDescriptor,
+    ) -> None:
+        assert current_platform({PLATFORM_ENV: "telegram"}) is telegram
+
+    @pytest.mark.parametrize("raw", ["nowhere", "qq_group", "telegram"])
+    def test_a_declaration_nobody_registered_is_refused(self, raw: str) -> None:
+        # 带着一个不存在的平台跑下去，会话、记忆和维护都会落到一个没人认的 id 下。
+        assert current_platform_id({PLATFORM_ENV: raw}) == raw
+        with pytest.raises(UnknownPlatform):
+            current_platform({PLATFORM_ENV: raw})
+
+    def test_without_an_environ_it_reads_the_process_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(PLATFORM_ENV, raising=False)
+        assert current_platform() is QQ_NAPCAT
+
+        monkeypatch.setenv(PLATFORM_ENV, "nowhere")
+        assert current_platform_id() == "nowhere"
+        with pytest.raises(UnknownPlatform):
+            current_platform()
+
+    def test_it_is_a_lookup_error(self) -> None:
+        # 老的按 LookupError/KeyError 兜的调用方不能因为换了类型漏掉。
+        assert issubclass(UnknownPlatform, LookupError)
 
 
 class TestRegistration:
@@ -466,19 +540,53 @@ class TestCoreRecognisesANewPlatform:
         assert _owner_label(FeatureActor(channel="qq_group", user_id="7")) == "QQ 7"
         assert _owner_label(FeatureActor(channel="web", is_admin=True)) == "控制台管理员"
 
-    def test_account_scope_is_tracked_per_platform(self, tmp_path: Path, telegram: PlatformDescriptor) -> None:
+    def test_account_scope_follows_the_platform_this_instance_runs(
+        self, tmp_path: Path, telegram: PlatformDescriptor, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         from supervisor.conversation_labels import account_scope
 
+        monkeypatch.setenv(PLATFORM_ENV, telegram.id)
         live = platform_state_path(telegram, STATE_LIVE, tmp_path)
         live.parent.mkdir(parents=True)
         live.write_text(json.dumps({"scope_conversation_keys": [_TG_GROUP]}), encoding="utf-8")
         accounts = account_scope(tmp_path)
 
+        assert accounts.platform == telegram.id
         assert accounts.is_current(_TG_GROUP) is True
         assert accounts.is_current(_TG_PRIVATE) is False
-        # QQ 没公布过归属，无从判断就一律算当前；内部入口的会话不参与归属。
-        assert accounts.is_current(_QQ_GROUP) is True
+        # QQ 的会话是换平台之前留下的，这个实例已经不跑它；内部入口的会话不参与归属。
+        assert accounts.is_current(_QQ_GROUP) is False
         assert accounts.is_current("web:console") is True
+
+    def test_a_platform_that_never_published_claims_all_of_its_own(
+        self, tmp_path: Path, telegram: PlatformDescriptor, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 密钥只有 bot 进程有，没公布过就无从判断，一律算当前；别的平台的照样不算。
+        from supervisor.conversation_labels import account_scope
+
+        monkeypatch.setenv(PLATFORM_ENV, telegram.id)
+        accounts = account_scope(tmp_path)
+
+        assert accounts.keys is None
+        assert accounts.is_current(_TG_GROUP) is True
+        assert accounts.is_current(_TG_PRIVATE) is True
+        assert accounts.is_current(_QQ_GROUP) is False
+
+    def test_the_other_platform_left_behind_state_does_not_count(
+        self, tmp_path: Path, telegram: PlatformDescriptor, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 换过平台的实例盘上还留着旧平台的快照，读它等于拿早已不跑的 bot 说的话当真。
+        from supervisor.conversation_labels import account_scope
+
+        monkeypatch.delenv(PLATFORM_ENV, raising=False)
+        live = platform_state_path(telegram, STATE_LIVE, tmp_path)
+        live.parent.mkdir(parents=True)
+        live.write_text(json.dumps({"scope_conversation_keys": [_TG_GROUP]}), encoding="utf-8")
+        accounts = account_scope(tmp_path)
+
+        assert accounts.platform == "qq" and accounts.keys is None
+        assert accounts.is_current(_TG_GROUP) is False
+        assert accounts.is_current(_QQ_GROUP) is True
 
     def test_memory_directories_are_labelled_from_its_own_state(self, tmp_path: Path, telegram: PlatformDescriptor) -> None:
         from engine.memory_namespace import conversation_namespace
@@ -537,3 +645,138 @@ class TestCoreRecognisesANewPlatform:
         label = describe_namespaces(tmp_path)[conversation_namespace(_TG_PRIVATE)]
 
         assert label["alias"] == "" and label["label"] == "私聊 555"
+
+
+class TestAWrongPlatformStopsTheProcess:
+    """实例声明的平台不认识时宁可不起：带着一个没人认的 id 跑下去，会话、记忆和维护全落到空处。"""
+
+    @pytest.fixture
+    def supervisor_main(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """把 main() 前面那几步换成不落盘、不监听的替身，只留平台校验和端口检查。"""
+        from supervisor import main as supervisor_main_module
+
+        monkeypatch.setattr(supervisor_main_module, "process_workspace", lambda: tmp_path)
+        monkeypatch.setattr(supervisor_main_module, "configure_supervisor_logging", lambda *_a, **_k: "info")
+        monkeypatch.setattr(sys, "argv", ["supervisor"])
+        monkeypatch.delenv(PLATFORM_ENV, raising=False)
+        return supervisor_main_module
+
+    @pytest.fixture
+    def bot_entry(self, monkeypatch: pytest.MonkeyPatch):
+        """按入口文件加载 bot.py：它不是包的一部分，import 不到。"""
+        import importlib.util
+
+        import dotenv
+
+        # 真加载的话测试机上的 .env 会灌进 os.environ，后面所有用例都跟着变。
+        monkeypatch.setattr(dotenv, "load_dotenv", lambda *_a, **_k: False)
+        spec = importlib.util.spec_from_file_location("clonoth_bot_entry_probe", _ROOT / "bot.py")
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+            yield module
+        finally:
+            sys.modules.pop("clonoth_bot_entry_probe", None)
+
+    def test_the_exit_code_is_the_sysexits_config_error(self) -> None:
+        # 单元文件的 RestartPreventExitStatus 按它写死，改一处就要连带改另一处。
+        from workspace import CONFIG_ERROR_EXIT_CODE
+
+        assert CONFIG_ERROR_EXIT_CODE == 78
+
+    def test_the_supervisor_refuses_to_start_on_an_unknown_platform(
+        self, supervisor_main, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from workspace import CONFIG_ERROR_EXIT_CODE
+
+        monkeypatch.setenv(PLATFORM_ENV, "nowhere")
+
+        with pytest.raises(SystemExit) as exited:
+            supervisor_main.main()
+
+        assert exited.value.code == CONFIG_ERROR_EXIT_CODE
+
+    def test_the_supervisor_checks_the_platform_before_it_touches_the_port(
+        self, supervisor_main, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 校验排在端口检查之后的话，一个写错平台的实例会先去抢正在跑的那个的端口。
+        def taken(*_args: object, **_kwargs: object) -> None:
+            raise OSError("address already in use")
+
+        monkeypatch.setattr(
+            supervisor_main, "socket",
+            SimpleNamespace(socket=taken, AF_INET=0, SOCK_STREAM=0, SOL_SOCKET=0, SO_REUSEADDR=0),
+        )
+        monkeypatch.setenv(PLATFORM_ENV, "nowhere")
+        with pytest.raises(SystemExit) as refused:
+            supervisor_main.main()
+
+        monkeypatch.setenv(PLATFORM_ENV, "onebot")
+        with pytest.raises(SystemExit) as allowed:
+            supervisor_main.main()
+
+        assert refused.value.code == 78
+        assert allowed.value.code == supervisor_main.PORT_IN_USE_EXIT_CODE
+
+    def test_the_qq_adapter_refuses_an_unknown_platform(
+        self, bot_entry, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from workspace import CONFIG_ERROR_EXIT_CODE
+
+        monkeypatch.setenv(PLATFORM_ENV, "nowhere")
+
+        with pytest.raises(SystemExit) as exited:
+            bot_entry._require_qq_instance()
+
+        assert exited.value.code == CONFIG_ERROR_EXIT_CODE
+
+    def test_the_qq_adapter_refuses_an_instance_that_runs_another_platform(
+        self, bot_entry, telegram: PlatformDescriptor, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 两个平台的进程挂在同一个工作区，会话和记忆会混成一份。
+        monkeypatch.setenv(PLATFORM_ENV, telegram.id)
+
+        with pytest.raises(SystemExit) as exited:
+            bot_entry._require_qq_instance()
+
+        assert exited.value.code == 78
+
+    @pytest.mark.parametrize("declared", [None, "qq", "  QQ  ", "onebot", "onebot11"])
+    def test_the_qq_adapter_starts_on_a_qq_instance(
+        self, bot_entry, declared: str | None, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if declared is None:
+            monkeypatch.delenv(PLATFORM_ENV, raising=False)
+        else:
+            monkeypatch.setenv(PLATFORM_ENV, declared)
+
+        assert bot_entry._require_qq_instance() is None
+
+    def test_the_qq_adapter_checks_before_it_waits_for_the_supervisor(self) -> None:
+        # 排在等 supervisor 之后的话，一个起不来的实例要先干等三分钟才说原因。
+        import ast
+
+        tree = ast.parse((_ROOT / "bot.py").read_text(encoding="utf-8"))
+        body = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        ).body
+        names = [
+            node.value.func.id for node in body
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+        ]
+
+        assert names and names[0] == "_require_qq_instance"
+
+    @pytest.mark.parametrize("unit,expected", [
+        ("kazebot.service", "98 78"),
+        ("kazebot@.service", "98 78"),
+        ("kazebot-qq.service", "78"),
+        ("kazebot-qq@.service", "78"),
+    ])
+    def test_the_units_do_not_restart_on_a_config_error(self, unit: str, expected: str) -> None:
+        # 反复拉起一个起不来的进程，只会把日志刷满，真正的原因翻不到。
+        body = (_ROOT / "deploy" / "systemd" / unit).read_text(encoding="utf-8")
+
+        assert f"RestartPreventExitStatus={expected}\n" in body

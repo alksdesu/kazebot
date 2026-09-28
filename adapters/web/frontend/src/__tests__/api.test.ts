@@ -1,7 +1,7 @@
 // [2026-05-16] Updated: tests for real Supervisor API client signatures.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, createInstance, decideApproval, deleteInstance, getAllToolNames, fetchActiveTasks, cancelTask, enterPlatformLoginMode, getAccountScope, getInstanceProgress, getPlatformAccount, getPlatformLoginQrcode, migrateAccountScope, pinPlatformAccount, switchPlatformAccount } from '../api/supervisorClient';
+import { postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, createInstance, decideApproval, deleteInstance, getAllToolNames, fetchActiveTasks, cancelTask, enterPlatformLoginMode, getAccountScope, getInstanceProgress, getPlatformAccount, getPlatformLoginQrcode, getPlatforms, migrateAccountScope, pinPlatformAccount, switchPlatformAccount } from '../api/supervisorClient';
 
 function stubFetch(body: unknown = {}) {
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(body), {
@@ -238,27 +238,29 @@ describe('Instance provisioning client', () => {
     vi.unstubAllGlobals();
   });
 
-  it('names the new instance by id and carries its platform accounts', async () => {
+  it('names the new instance by id and carries the one platform it runs', async () => {
     const plan = {
       id: 'xiaoyu', label: '小鱼', idx: 2, prefix: '/i/xiaoyu',
-      ports: { napcat: 6103 }, workspace: '/srv/xiaoyu', accounts: { qq: '1000000002' },
+      ports: { napcat: 6103 }, workspace: '/srv/xiaoyu', platform: 'qq', account: '1000000002',
     };
     const fetchMock = stubFetch(plan);
 
-    await expect(createInstance('secret-token', 'xiaoyu', '小鱼', { qq: '1000000002' })).resolves.toEqual(plan);
+    await expect(createInstance('secret-token', 'xiaoyu', '小鱼', 'qq', '1000000002')).resolves.toEqual(plan);
     expect(fetchMock).toHaveBeenCalledWith('/v1/instances', {
       method: 'POST',
       headers: { Authorization: 'Bearer secret-token', 'Content-Type': 'application/json' },
-      body: '{"id":"xiaoyu","label":"小鱼","accounts":{"qq":"1000000002"}}',
+      body: '{"id":"xiaoyu","label":"小鱼","platform":"qq","account":"1000000002"}',
     });
   });
 
-  it('sends an empty account map when the new instance claims no account yet', async () => {
+  it('sends an empty account when the new instance claims no account yet', async () => {
     const fetchMock = stubFetch();
 
-    await createInstance('secret-token', 'xiaoyu', '', {});
+    await createInstance('secret-token', 'xiaoyu', '', 'qq', '');
 
-    expect(fetchMock.mock.calls.map(([, init]) => init?.body)).toEqual(['{"id":"xiaoyu","label":"","accounts":{}}']);
+    expect(fetchMock.mock.calls.map(([, init]) => init?.body)).toEqual([
+      '{"id":"xiaoyu","label":"","platform":"qq","account":""}',
+    ]);
   });
 
   it('escapes the instance id in the progress and archive paths', async () => {
@@ -271,5 +273,37 @@ describe('Instance provisioning client', () => {
       ['/v1/instances/a%20b%2Fc/progress', undefined],
       ['/v1/instances/a%20b%2Fc', 'DELETE'],
     ]);
+  });
+});
+
+describe('Platform catalog client', () => {
+  const qq = { id: 'qq', display_name: 'QQ · NapCat', short_name: 'QQ', channels: [], has_config: true };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('keeps the whole catalog and says which one this instance runs', async () => {
+    stubFetch({ platforms: [qq], current: 'qq' });
+
+    await expect(getPlatforms('secret-token')).resolves.toEqual({ platforms: [qq], current: 'qq' });
+  });
+
+  it('an older backend that names no current platform reads as null', async () => {
+    stubFetch({ platforms: [qq] });
+
+    await expect(getPlatforms('secret-token')).resolves.toEqual({ platforms: [qq], current: null });
+  });
+
+  it.each([[''], [123], [null]])('a current that is not a platform id reads as null (%s)', async current => {
+    stubFetch({ platforms: [qq], current });
+
+    expect((await getPlatforms('secret-token')).current).toBeNull();
+  });
+
+  it('a body without a platform list reads as an empty catalog', async () => {
+    stubFetch({ current: 'qq' });
+
+    await expect(getPlatforms('secret-token')).resolves.toEqual({ platforms: [], current: 'qq' });
   });
 });

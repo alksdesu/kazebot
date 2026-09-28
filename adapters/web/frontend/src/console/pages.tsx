@@ -33,14 +33,14 @@ export interface ConsolePageDefinition {
   sections?: SectionPick;
 }
 
-/** 全平台共用的那几页：它是谁、记得什么、图库里有什么。 */
+/** 不分平台的那几页：它是谁、记得什么、图库里有什么。 */
 export const BOT_PAGES: ConsolePageDefinition[] = [
   {
     id: 'persona',
     label: '人格',
     icon: 'draft',
     Page: PersonaPage,
-    note: 'bot 是谁、用哪个模型。两块各自保存，写的是节点文件，所有平台共用同一份。',
+    note: 'bot 是谁、用哪个模型。两块各自保存，写的是这个实例的节点文件。',
   },
   {
     id: 'defaults',
@@ -49,7 +49,7 @@ export const BOT_PAGES: ConsolePageDefinition[] = [
     Page: FeaturesPage,
     configScope: FEATURES_SCOPE,
     sections: DEFAULTS_PAGE_SECTIONS,
-    note: '各平台没单独设置时用的值。每块各自保存，写进全局设置，不用重启；平台页里选了「本平台」的项不跟着变。',
+    note: '平台页没单独设置时用的值。每块各自保存，写进全局设置，不用重启；平台页里选了「本平台」的项不跟着变。',
   },
   {
     id: 'memory',
@@ -65,7 +65,7 @@ export const BOT_PAGES: ConsolePageDefinition[] = [
     Page: StickersPage,
     configScope: FEATURES_SCOPE,
     sections: STICKERS_PAGE_SECTIONS,
-    note: '全平台共用一份图库。群里收来的先进待审，人工转正之后才进候选；每块自己保存。',
+    note: '这台机器上的实例共用一份图库。群里收来的先进待审，人工转正之后才进候选；每块自己保存。',
   },
 ];
 

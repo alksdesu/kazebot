@@ -17,7 +17,7 @@ import yaml
 from providers import registry
 from clonoth_runtime import load_yaml_dict, platform_secret, resolve_env_ref
 from platforms.descriptor import PlatformDescriptor
-from platforms.registry import all_platforms, platform_config_path
+from platforms.registry import all_platforms, current_platform, platform_config_path
 from supervisor.config_store import ConfigStore
 from supervisor.instances import load_instances, url_prefix
 from supervisor.log_access import LogReader, redact
@@ -135,7 +135,8 @@ class OperationsService:
         raise ValueError("当前渠道未声明可用的低额度输出上限，未发起诊断模型请求")
 
     def _platform_health(self) -> list[tuple[PlatformDescriptor, dict[str, Any]]]:
-        return [(platform, platform_health(self.root, platform)) for platform in all_platforms()]
+        platform = current_platform()
+        return [(platform, platform_health(self.root, platform))]
 
     def status(self) -> dict[str, Any]:
         manager = getattr(self.state, "feature_process_manager", None)
@@ -156,8 +157,8 @@ class OperationsService:
         name = platform.display_name
         adapter = f"{name} 适配进程"
         if not health["published"]:
-            # 注册了不等于这个实例在跑它，从没收到过状态时只提醒不判失败。
-            add(adapter, "warning", "还没收到过它公布的状态", "这个实例不跑这个平台就不用管；要跑就检查 bot 进程和 Supervisor 地址")
+            # 一个实例只跑这一个平台，它从没公布过状态就是 bot 进程没起来或连不上 Supervisor。
+            add(adapter, "failed", "还没收到过它公布的状态", "检查 bot 进程是否在跑、连的是不是这个 Supervisor 的地址")
             return
         online = health["adapter_online"]
         add(adapter, "passed" if online else "failed", "心跳正常" if online else "心跳中断", "检查 bot 进程和 Supervisor 地址")
@@ -177,7 +178,10 @@ class OperationsService:
         prefix = url_prefix()
         if not rows:
             # 和读清单时一样：序号 0 占站点根，带前缀的推不出序号，标 -1。
-            rows = [{"id": "current", "label": "当前实例", "path": prefix, "idx": 0 if not prefix else -1, "accounts": {}}]
+            rows = [{
+                "id": "current", "label": "当前实例", "path": prefix, "idx": 0 if not prefix else -1,
+                "platform": current_platform().id, "account": "",
+            }]
         return [{**row, "current": row["path"] == prefix} for row in rows]
 
     async def diagnose(self, *, test_model: bool = False, include_logs: bool = False) -> dict[str, Any]:

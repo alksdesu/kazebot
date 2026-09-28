@@ -3,7 +3,7 @@ import { useEffect } from 'react';
 
 import { createLatch } from '../utils/polling';
 
-// 状态条、连接卡、各平台换没换上都靠它跟上实况。刚写回那阵子认账那边两秒探一次，这里不必更勤。
+// 状态条、连接卡、bot 换没换上都靠它跟上实况。刚写回那阵子认账那边两秒探一次，这里不必更勤。
 const LIVE_REFRESH_MS = 15_000;
 // 切回标签页时 focus 和 visibilitychange 前后脚都会来，读一次就够。
 const RERUN_GAP_MS = 1000;

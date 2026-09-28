@@ -164,8 +164,11 @@ def test_operations_status_instances_and_diagnostics_remain_available(operations
     rows = client.get("/v1/operations/instances", headers=headers)
     assert rows.status_code == 200
     assert rows.json()["instances"] == [
-        {"id": "rong", "label": "主实例", "path": "", "idx": 0, "accounts": {"qq": "111"}, "current": False},
-        {"id": "222", "label": "副实例", "path": "/i/222", "idx": 1, "accounts": {"qq": "222"}, "current": True},
+        {"id": "rong", "label": "主实例", "path": "", "idx": 0, "platform": "qq", "account": "111", "current": False},
+        {
+            "id": "222", "label": "副实例", "path": "/i/222", "idx": 1,
+            "platform": "qq", "account": "222", "current": True,
+        },
     ]
     assert workspace_state(tmp_path) == before
     diagnosed = client.post("/v1/operations/diagnostics", headers=headers, json={"test_model": False})
@@ -200,9 +203,10 @@ def test_a_deployment_without_a_roster_still_names_the_instance_it_is(tmp_path, 
     else:
         monkeypatch.setenv("CLONOTH_URL_PREFIX", prefix)
     operations, _ = service(tmp_path)
-    assert operations.instances() == [
-        {"id": "current", "label": "当前实例", "path": path, "idx": idx, "accounts": {}, "current": True},
-    ]
+    assert operations.instances() == [{
+        "id": "current", "label": "当前实例", "path": path, "idx": idx,
+        "platform": "qq", "account": "", "current": True,
+    }]
 
 
 @pytest.mark.parametrize("prefix", ["i/koki/", "/i/koki", " /i/koki "])
@@ -210,11 +214,14 @@ def test_a_roster_leaves_no_room_for_the_fallback_row(tmp_path, monkeypatch, pre
     monkeypatch.setenv("CLONOTH_INSTANCES_FILE", str(tmp_path / "instances.yaml"))
     monkeypatch.setenv("CLONOTH_URL_PREFIX", prefix)
     save_instance(tmp_path, instance_id="rong", label="主号", idx=0)
-    save_instance(tmp_path, instance_id="koki", label="小号", idx=1, accounts={"qq": "1000000002"})
+    save_instance(tmp_path, instance_id="koki", label="小号", idx=1, platform="qq", account="1000000002")
     operations, _ = service(tmp_path)
     assert operations.instances() == [
-        {"id": "rong", "label": "主号", "path": "", "idx": 0, "accounts": {}, "current": False},
-        {"id": "koki", "label": "小号", "path": "/i/koki", "idx": 1, "accounts": {"qq": "1000000002"}, "current": True},
+        {"id": "rong", "label": "主号", "path": "", "idx": 0, "platform": "qq", "account": "", "current": False},
+        {
+            "id": "koki", "label": "小号", "path": "/i/koki", "idx": 1,
+            "platform": "qq", "account": "1000000002", "current": True,
+        },
     ]
 
 

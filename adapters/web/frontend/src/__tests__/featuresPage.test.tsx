@@ -133,11 +133,11 @@ describe('全局默认页', () => {
     expect(screen.getByText('bot 没在跑')).toBeInTheDocument();
   });
 
-  it('没有能读全局设置的平台时直说', () => {
+  it('后端没给出生效情况时直说', () => {
     configStore(FEATURES_SCOPE).setState({ live: featuresLive({ platforms: [] }) });
     render(<DefaultsTab />);
 
-    expect(screen.getByText('还没有能读全局设置的平台。')).toBeInTheDocument();
+    expect(screen.getByText('后端没给出 bot 的生效情况。')).toBeInTheDocument();
   });
 
   it('全局文件写坏时说清楚 bot 还在用上一份', () => {

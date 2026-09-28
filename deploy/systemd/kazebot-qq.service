@@ -13,6 +13,8 @@ WorkingDirectory=/opt/kazebot
 ExecStart=/opt/kazebot/.venv/bin/python bot.py
 Restart=always
 RestartSec=3
+# 78 是实例声明的平台写错或不是 QQ，重启也起不来，停住等人
+RestartPreventExitStatus=78
 KillMode=mixed
 TimeoutStopSec=20
 

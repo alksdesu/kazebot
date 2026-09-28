@@ -26,7 +26,7 @@ from .descriptor import (
 
 # 稳定会话键的摘要部分，与适配器侧 conversation_hash.digest 的输出同形。
 DIGEST_PATTERN = r"[0-9a-f]{24}"
-# 全平台共用的功能设置。核心层和取平台钩子一样经这里按需导入，不直接 import 适配器包。
+# 不分平台的功能设置。核心层和取平台钩子一样经这里按需导入，不直接 import 适配器包。
 FEATURES_MODULE = "adapters._shared.features"
 # 平台自己的数据按平台 id 分子目录放在这下面，文件名不用再带平台前缀。
 PLATFORM_DATA_ROOT = "data/platforms"
@@ -38,6 +38,9 @@ STANDARD_STATE_FILES: Mapping[str, str] = MappingProxyType({
 })
 # 全平台共用的别名编号：记忆跨平台共享，UserA 在哪个平台都只能是同一个人。平台 id 不带点，不会和它撞名。
 ALIAS_NUMBERING_FILE = "alias_numbering.json"
+# 一个实例只跑一个平台，由这个变量声明；没写的是改造前按 QQ 号开的实例。
+PLATFORM_ENV = "CLONOTH_PLATFORM"
+DEFAULT_PLATFORM_ID = "qq"
 
 _lock = threading.Lock()
 _platforms: dict[str, PlatformDescriptor] = {}
@@ -102,6 +105,30 @@ def find_platform(name: Any) -> PlatformDescriptor | None:
         return None
     with _lock:
         return _by_name.get(key)
+
+
+class UnknownPlatform(LookupError):
+    """实例声明的平台不在注册表里。"""
+
+
+def platform_named(name: Any) -> PlatformDescriptor:
+    """按平台 id 或历史别名找平台。会话通道名不算：qq_group 不是一个平台的名字。"""
+    key = normalize_name(name)
+    platform = find_platform(key)
+    if platform is None or (key != platform.id and key not in platform.aliases):
+        known = "、".join(sorted(item.id for item in all_platforms()))
+        raise UnknownPlatform(f"不认识的平台：{name!r}（认得的有 {known}）")
+    return platform
+
+
+def current_platform_id(environ: Mapping[str, str] | None = None) -> str:
+    source = os.environ if environ is None else environ
+    return normalize_name(source.get(PLATFORM_ENV, "")) or DEFAULT_PLATFORM_ID
+
+
+def current_platform(environ: Mapping[str, str] | None = None) -> PlatformDescriptor:
+    """本实例在跑的那个平台。运行期「我在跑什么」都认它；认会话键、兜底防护这类解析期的事仍认全部平台。"""
+    return platform_named(current_platform_id(environ))
 
 
 def split_conversation_key(conversation_key: Any) -> tuple[str, str]:

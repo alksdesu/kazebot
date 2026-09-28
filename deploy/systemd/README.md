@@ -4,7 +4,7 @@ This directory contains optional systemd unit templates for a Debian deployment 
 
 ## Multi-instance templates
 
-`kazebot@.service` and `kazebot-qq@.service` run one bot per instance, all sharing a single checkout; platform accounts such as the QQ login belong to the instance. The instance name is the instance id (a lowercase slug, or the QQ number for instances created before ids existed); the workspace is `/opt/kazebot-data/<id>`. `deploy/new_instance.sh <id> [label] [qq]` lays out the workspace and hands the rest to `kazebot-provision@<id>`, which installs and enables these units. To do it by hand:
+`kazebot@.service` and `kazebot-qq@.service` run one bot per instance, all sharing a single checkout. Each instance runs exactly one platform, declared as `CLONOTH_PLATFORM` in its `.env` (instances without it run QQ), and logs in one account; `kazebot-qq@` is the adapter unit for QQ instances. The supervisor and the QQ adapter exit with status 78 when the declared platform is unknown or not the one the unit serves, and the units do not restart on it. The instance name is the instance id (a lowercase slug, or the QQ number for instances created before ids existed); the workspace is `/opt/kazebot-data/<id>`. `deploy/new_instance.sh <id> [label] [qq]` lays out the workspace and hands the rest to `kazebot-provision@<id>`, which installs and enables these units. To do it by hand:
 
 ```bash
 sudo cp deploy/systemd/kazebot@.service deploy/systemd/kazebot-qq@.service /etc/systemd/system/

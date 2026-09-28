@@ -27,7 +27,12 @@ from adapters._shared import features  # noqa: E402
 from adapters._shared.live_config import SOURCE_DEFAULT, SOURCE_ENV, SOURCE_LEGACY  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 from platforms.descriptor import CHANNEL_GROUP, STATE_LIVE, ChannelDescriptor, PlatformDescriptor  # noqa: E402
-from platforms.registry import platform_state_path, register_platform, unregister_platform  # noqa: E402
+from platforms.registry import (  # noqa: E402
+    PLATFORM_ENV,
+    platform_state_path,
+    register_platform,
+    unregister_platform,
+)
 from stickers.collect import store_path  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
@@ -133,13 +138,27 @@ class TestSwitch:
 
         assert service.switch().enabled is False
 
-    def test_another_platform_left_on_keeps_it_running(
+    def test_another_platform_left_on_does_not_keep_it_running(
         self, service: StickerTaggingService, tmp_path: Path, vault: PlatformDescriptor,
     ) -> None:
+        # 一个实例只跑一个平台：盘上那份旧快照是换平台之前留下的，拿它当真就重新开始花钱。
         _publish(tmp_path, QQ_NAPCAT, False, SOURCE_ENV)
         _publish(tmp_path, vault, True, SOURCE_LEGACY)
 
-        assert service.switch().enabled is True
+        assert service.switch().enabled is False
+
+    def test_the_platform_this_instance_runs_decides(
+        self, service: StickerTaggingService, tmp_path: Path, vault: PlatformDescriptor,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _publish(tmp_path, QQ_NAPCAT, False, SOURCE_ENV)
+        _publish(tmp_path, vault, True, SOURCE_LEGACY)
+        monkeypatch.setenv(PLATFORM_ENV, vault.id)
+
+        switch = service.switch()
+
+        assert switch.enabled is True
+        assert [fallback.platform for fallback in switch.fallbacks] == [vault.id]
 
     def test_the_switch_is_read_every_round(self, service: StickerTaggingService, tmp_path: Path) -> None:
         assert service._tagger_config().enabled is True

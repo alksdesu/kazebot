@@ -964,6 +964,9 @@ class TestTheFullRestartLockIsFreedWhenNothingStarts:
         assert app.state.restart_gate.current is None
         assert exits == []
         assert _post(app, {"target": "all", "reason": "next"}).json()["scheduled"] is True
+        # 排进去的那次退出在线程里跑，不等它就会记到下一个用例的 exits 上。
+        _until(lambda: bool(exits))
+        assert exits == [75]
 
 
 # 真的 os._exit 会把这个异常一起带走，只有替身放行它才冒到线程外。

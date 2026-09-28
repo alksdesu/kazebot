@@ -698,7 +698,7 @@ export interface AccountStatus {
   quick_login?: QuickLoginTarget[];
 }
 
-/** 一个后端实例 = 一个 bot。多开时它们共用域名，各自挂在 path 下；平台账号是实例下的子项。 */
+/** 一个后端实例 = 一个 bot，只跑一个平台、登一个号。多开时它们共用域名，各自挂在 path 下。 */
 export interface ConsoleInstance {
   id: string;
   label: string;
@@ -707,8 +707,10 @@ export interface ConsoleInstance {
   current: boolean;
   /** 序号，决定端口。老清单没有这个字段时后端给 -1。 */
   idx?: number;
-  /** 各平台登记的账号，按平台 id。 */
-  accounts?: Record<string, string>;
+  /** 这个实例跑的平台 id。 */
+  platform?: string;
+  /** 登记的账号；还没登录过是空串。 */
+  account?: string;
 }
 
 /**
@@ -720,14 +722,14 @@ export function instanceConsoleHref(path: string): string {
   return `${path}/web/${window.location.search}`;
 }
 
-/** 清单里登记着这个号的实例，本实例也算。 */
+/** 清单里登记着这个号的实例，本实例也算。比的是平台加账号：别的平台上可以有长得一样的号。 */
 export function instanceOwning(
   platformId: string,
   account: string,
   instances: ConsoleInstance[],
 ): ConsoleInstance | null {
   if (!account) return null;
-  return instances.find((row) => row.accounts?.[platformId] === account) ?? null;
+  return instances.find((row) => row.platform === platformId && row.account === account) ?? null;
 }
 
 /**
@@ -758,7 +760,8 @@ export interface InstancePlan {
   prefix: string;
   ports: Record<string, number>;
   workspace: string;
-  accounts: Record<string, string>;
+  platform: string;
+  account: string;
 }
 
 /** root 侧建实例的实时进度。finished 之前一直轮询。 */
@@ -783,12 +786,13 @@ export async function createInstance(
   token: string,
   id: string,
   label: string,
-  accounts: Record<string, string>,
+  platform: string,
+  account: string,
 ): Promise<InstancePlan> {
   const resp = await apiFetch('/instances', {
     method: 'POST',
     headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id, label, accounts }),
+    body: JSON.stringify({ id, label, platform, account }),
   });
   return resp.json();
 }
@@ -1508,7 +1512,7 @@ export async function restartEngine(
 }
 
 // ================================================================
-//  热载配置（各平台的配置文件与全局默认 config/features.yaml）与平台清单
+//  热载配置（平台配置文件与全局默认 config/features.yaml）与平台清单
 // ================================================================
 
 export interface ConfigRawFile {
@@ -1638,7 +1642,7 @@ export interface FeatureFallback {
   value: unknown;
 }
 
-/** 全系统只跑一份的功能实际开不开。全局没写时按各平台的兜底算，有一个开着就开。 */
+/** 全系统只跑一份的功能实际开不开。全局没写时按 bot 眼下用着的兜底算。 */
 export interface CentralSwitchState {
   enabled: boolean;
   set_globally: boolean;
@@ -1781,10 +1785,20 @@ export interface PlatformSummary {
   connection_hint?: string;
 }
 
-export async function getPlatforms(token: string): Promise<PlatformSummary[]> {
+export interface PlatformCatalog {
+  /** 认得的全部平台：认会话键前缀要用全表，迁移过来的历史会话可能出自别的平台。 */
+  platforms: PlatformSummary[];
+  /** 本实例在跑的那个平台；旧版后端不给，是 null。 */
+  current: string | null;
+}
+
+export async function getPlatforms(token: string): Promise<PlatformCatalog> {
   const resp = await apiFetch('/platforms', { headers: authHeaders(token) });
   const json = await resp.json();
-  return Array.isArray(json.platforms) ? json.platforms : [];
+  return {
+    platforms: Array.isArray(json.platforms) ? json.platforms : [],
+    current: typeof json.current === 'string' && json.current ? json.current : null,
+  };
 }
 
 const platformConfigPath = (platformId: string, leaf: string): string =>

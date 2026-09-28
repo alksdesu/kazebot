@@ -12,6 +12,9 @@ from pathlib import Path
 # 值不一致时附件、记忆、admin token 会静默落到两个地方。
 _ENV_NAMES = ("CLONOTH_WORKSPACE", "ONEBOT_WORKSPACE_ROOT")
 
+# 实例配置写错了（sysexits 的 EX_CONFIG），重启也起不来：systemd 单元据此停住等人，不反复拉起刷日志。
+CONFIG_ERROR_EXIT_CODE = 78
+
 
 def workspace_env_root() -> Path | None:
     """env 里设的工作区根；都没设返回 None。"""

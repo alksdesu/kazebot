@@ -45,6 +45,13 @@ do_create() {
   [ -d "$WS" ] || fail "工作区 $WS 不存在，应该由控制台先建好"
   [ -f "$WS/.env" ] || fail "$WS/.env 不存在"
 
+  # 一个实例只跑一个平台。root 侧目前只会搭 QQ 这一套（NapCat 容器 + kazebot-qq@），别的平台先拦下，不装半套。
+  local platform
+  platform="$(sed -n 's/^CLONOTH_PLATFORM=//p' "$WS/.env" | head -1 | tr -d '\r' | tr -d '"')"
+  platform="${platform:-qq}"
+  [[ "$platform" =~ ^[a-z][a-z0-9_]*$ ]] || fail "$WS/.env 里 CLONOTH_PLATFORM 的值不合形状"
+  [ "$platform" = qq ] || fail "实例声明跑 $platform，root 侧还没有这个平台的建实例流程"
+
   local sup_port bot_port napcat_port access_token image
   sup_port="$(env_get CLONOTH_PORT '^[0-9]{4,5}$')"
   bot_port="$(env_get PORT '^[0-9]{4,5}$')"

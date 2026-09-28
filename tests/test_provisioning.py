@@ -99,6 +99,10 @@ def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path / "workspace"
 
 
+def _qq() -> PlatformDescriptor:
+    return provisioning.resolve_platform("qq")
+
+
 @contextmanager
 def _extra_platform(platform_id: str, **fields: Any) -> Iterator[PlatformDescriptor]:
     platform = PlatformDescriptor(
@@ -145,39 +149,88 @@ def test_the_instance_name_regex_is_the_same_word_for_word_in_all_six_places() -
         assert shape in _script_code(path), f"{path.name} 里的实例名正则和 provisioning.py 对不上"
 
 
-# ── 登记的平台账号 ──
+# ── 新实例的平台与账号 ──
 
-def test_no_accounts_is_an_instance_nobody_has_logged_in_yet() -> None:
-    assert provisioning.normalize_accounts(None) == {}
-    assert provisioning.normalize_accounts({}) == {}
-
-
-def test_accounts_must_be_a_mapping_of_platform_to_account() -> None:
-    with pytest.raises(provisioning.ProvisionError, match="平台 id"):
-        provisioning.normalize_accounts([("qq", "1000000002")])
+@pytest.mark.parametrize("raw", [None, "", "   ", "qq", "  QQ  "])
+def test_an_unstated_platform_is_qq(raw: object) -> None:
+    # 改造前建出来的只有 QQ 实例，没写就跟它们一样。
+    assert provisioning.resolve_platform(raw).id == "qq"
 
 
-def test_a_blank_account_is_skipped_rather_than_refused() -> None:
-    # 前端的表单里留空就是「这个平台先不登」。
-    assert provisioning.normalize_accounts({"qq": "  "}) == {}
-    assert provisioning.normalize_accounts({"qq": None}) == {}
+@pytest.mark.parametrize("name", ["onebot", "onebot11"])
+def test_a_historical_alias_still_names_the_platform(name: str) -> None:
+    assert provisioning.resolve_platform(name).id == "qq"
+
+
+@pytest.mark.parametrize("name", ["nowhere", "qq_group", "qq_private", "别的"])
+def test_an_unknown_platform_name_is_refused(name: str) -> None:
+    # 会话通道名不是平台名：认宽了，清单里的 platform 和运行期认的那个会对不上。
+    with pytest.raises(provisioning.ProvisionError, match="不认识的平台"):
+        provisioning.resolve_platform(name)
+
+
+def test_a_blank_account_is_an_instance_nobody_has_logged_in_yet() -> None:
+    # 前端的表单里留空就是「先不登，扫完码再记」。
+    qq = provisioning.resolve_platform("qq")
+    assert provisioning.normalize_account(qq, None) == ""
+    assert provisioning.normalize_account(qq, "  ") == ""
 
 
 def test_an_account_is_normalised_to_the_platform_id_shape() -> None:
-    assert provisioning.normalize_accounts({"qq": "  1000000002 "}) == {"qq": "1000000002"}
-
-
-@pytest.mark.parametrize("name", ["nowhere", "onebot", "onebot11", "qq_group", ""])
-def test_an_unknown_platform_name_is_refused(name: str) -> None:
-    # 按 id 认，别名和通道名都不算：清单里的键就是这个 id，认宽了两处会对不上。
-    with pytest.raises(provisioning.ProvisionError, match="不认识的平台"):
-        provisioning.normalize_accounts({name: "1000000002"})
+    assert provisioning.normalize_account(provisioning.resolve_platform("qq"), "  1000000002 ") == "1000000002"
 
 
 @pytest.mark.parametrize("account", ["abc", "10000 00002", "1000000002; id", "١٢٣٤٥"])
 def test_an_account_that_does_not_fit_the_platform_is_refused(account: str) -> None:
     with pytest.raises(provisioning.ProvisionError, match="账号写法不对"):
-        provisioning.normalize_accounts({"qq": account})
+        provisioning.normalize_account(provisioning.resolve_platform("qq"), account)
+
+
+@pytest.mark.parametrize("body,expected", [
+    ({"platform": "qq", "account": " 1000000002 "}, ("qq", "1000000002")),
+    ({"platform": "onebot", "account": "1000000002"}, ("qq", "1000000002")),
+    ({"platform": "qq"}, ("qq", "")),
+    ({"account": "1000000002"}, ("qq", "1000000002")),
+    ({"platform": "", "account": ""}, ("qq", "")),
+    ({}, ("qq", "")),
+])
+def test_the_request_says_which_platform_and_which_account(
+    body: dict[str, Any], expected: tuple[str, str],
+) -> None:
+    platform, account = provisioning.platform_account_from(body)
+    assert (platform.id, account) == expected
+
+
+@pytest.mark.parametrize("legacy,expected", [
+    ({"qq": " 1000000002 "}, ("qq", "1000000002")),
+    ({"  QQ  ": "1000000002"}, ("qq", "1000000002")),
+    ({"qq": "1000000002", "telegram": ""}, ("qq", "1000000002")),
+    ({"qq": ""}, ("qq", "")),
+    ({}, ("qq", "")),
+])
+def test_an_old_console_still_gets_its_one_platform_through(
+    legacy: dict[str, str], expected: tuple[str, str],
+) -> None:
+    # 没刷新页面的控制台还发着「平台 id: 账号」的映射，只填了一项时照认。
+    platform, account = provisioning.platform_account_from({"accounts": legacy})
+    assert (platform.id, account) == expected
+
+
+def test_an_old_console_asking_for_two_platforms_at_once_is_refused() -> None:
+    # 替它挑一个就是猜，猜错开出来的实例跑的是另一个平台。
+    with pytest.raises(provisioning.ProvisionError, match="一个实例只跑一个平台"):
+        provisioning.platform_account_from({"accounts": {"qq": "1000000002", "telegram": "@yu"}})
+
+
+def test_the_new_fields_win_over_an_old_accounts_mapping() -> None:
+    body = {"platform": "qq", "account": "1000000002", "accounts": {"telegram": "@yu"}}
+    platform, account = provisioning.platform_account_from(body)
+    assert (platform.id, account) == ("qq", "1000000002")
+
+
+def test_accounts_must_be_a_mapping_of_platform_to_account() -> None:
+    with pytest.raises(provisioning.ProvisionError, match="平台 id"):
+        provisioning.platform_account_from({"accounts": [("qq", "1000000002")]})
 
 
 # ── 端口与序号 ──
@@ -287,7 +340,7 @@ def test_legacy_roster_without_idx_still_loads(workspace: Path) -> None:
     assert rows[0]["idx"] == 0
     assert rows[1]["idx"] == -1
     assert rows[1]["path"] == "/i/1000000002"
-    assert rows[1]["accounts"] == {"qq": "1000000002"}
+    assert (rows[1]["platform"], rows[1]["account"]) == ("qq", "1000000002")
 
 
 # ── 计划与脚手架 ──
@@ -300,35 +353,58 @@ def test_plan_refuses_a_name_already_on_the_roster(workspace: Path) -> None:
 
 def test_plan_refuses_an_account_another_instance_already_holds(workspace: Path) -> None:
     # 同一个号两边登会互相踢下线，数据也会分成两份。
-    save_instance(workspace, instance_id="rong", label="主号", idx=0, accounts={"qq": "1000000001"})
+    save_instance(workspace, instance_id="rong", label="主号", idx=0, platform="qq", account="1000000001")
     with pytest.raises(provisioning.ProvisionError, match="已经归实例 主号 管了"):
-        provisioning.plan_instance(workspace, instance_id="koki", label="", accounts={"qq": "1000000001"})
+        provisioning.plan_instance(
+            workspace, instance_id="koki", label="", platform=_qq(), account="1000000001",
+        )
 
 
-@pytest.mark.parametrize("accounts", [
-    {"qq": " 1000000001 "},
-    {"  QQ  ": "1000000001"},
-    {"QQ": "\t1000000001 "},
+@pytest.mark.parametrize("body", [
+    {"platform": "qq", "account": " 1000000001 "},
+    {"platform": "  QQ  ", "account": "1000000001"},
+    {"platform": "onebot", "account": "\t1000000001 "},
+    {"accounts": {"  QQ  ": " 1000000001 "}},
 ])
-def test_plan_refuses_a_held_account_however_it_was_typed(workspace: Path, accounts: dict[str, str]) -> None:
-    # 请求体里的写法拦不住冲突检查：normalize_accounts 和清单查询走的是同一套清洗。
-    save_instance(workspace, instance_id="rong", label="主号", idx=0, accounts={"qq": "1000000001"})
+def test_plan_refuses_a_held_account_however_it_was_typed(workspace: Path, body: dict[str, Any]) -> None:
+    # 请求体里的写法拦不住冲突检查：解析请求和清单查询走的是同一套清洗。
+    save_instance(workspace, instance_id="rong", label="主号", idx=0, platform="qq", account="1000000001")
+    platform, account = provisioning.platform_account_from(body)
     with pytest.raises(provisioning.ProvisionError, match="已经归实例 主号 管了"):
-        provisioning.plan_instance(workspace, instance_id="koki", label="", accounts=accounts)
+        provisioning.plan_instance(
+            workspace, instance_id="koki", label="", platform=platform, account=account,
+        )
 
 
 def test_plan_counts_the_instances_hanging_under_a_prefix_too(workspace: Path) -> None:
     # 新实例还没有自己的前缀，谁都不该被当成「那就是我」放过去。
-    save_instance(workspace, instance_id="koki", label="小号", idx=1, accounts={"qq": "1000000002"})
+    save_instance(workspace, instance_id="koki", label="小号", idx=1, platform="qq", account="1000000002")
     with pytest.raises(provisioning.ProvisionError, match="已经归实例 小号 管了"):
-        provisioning.plan_instance(workspace, instance_id="yu", label="", accounts={"qq": "1000000002"})
+        provisioning.plan_instance(
+            workspace, instance_id="yu", label="", platform=_qq(), account="1000000002",
+        )
+
+
+def test_plan_only_checks_the_platform_it_is_opening_on(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 别的平台上一个长得一样的号不是冲突，拦下来就没法在两个平台上用同一串数字开实例。
+    monkeypatch.setattr(provisioning, "allocate_index", lambda *_a, **_k: 2)
+    save_instance(workspace, instance_id="rong", label="主号", idx=0, platform="qq", account="1000000001")
+    with _extra_platform("elsewhere") as other:
+        plan = provisioning.plan_instance(
+            workspace, instance_id="koki", label="", platform=other, account="1000000001",
+        )
+    assert (plan.platform, plan.account) == ("elsewhere", "1000000001")
 
 
 def test_plan_lets_through_an_account_nobody_holds(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(provisioning, "allocate_index", lambda *_a, **_k: 2)
-    save_instance(workspace, instance_id="rong", label="主号", idx=0, accounts={"qq": "1000000001"})
-    plan = provisioning.plan_instance(workspace, instance_id="koki", label="", accounts={"qq": "1000000002"})
-    assert plan.accounts == {"qq": "1000000002"}
+    save_instance(workspace, instance_id="rong", label="主号", idx=0, platform="qq", account="1000000001")
+    plan = provisioning.plan_instance(
+        workspace, instance_id="koki", label="", platform=_qq(), account="1000000002",
+    )
+    assert (plan.platform, plan.account) == ("qq", "1000000002")
 
 
 def test_plan_refuses_when_the_workspace_dir_is_already_there(workspace: Path) -> None:
@@ -345,16 +421,22 @@ def test_plan_refuses_when_the_disk_is_nearly_full(workspace: Path, monkeypatch:
         provisioning.plan_instance(workspace, instance_id="koki", label="")
 
 
-def test_a_plan_carries_the_prefix_ports_and_accounts(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_plan_carries_the_prefix_ports_and_account(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(provisioning, "allocate_index", lambda *_a, **_k: 1)
     plan = provisioning.plan_instance(
-        workspace, instance_id="koki", label=" 小号 ", accounts={"qq": " 1000000002 "},
+        workspace, instance_id="koki", label=" 小号 ", platform=_qq(), account=" 1000000002 ",
     )
     assert plan.idx == 1 and plan.label == "小号"
     assert plan.prefix == "/i/koki"
     assert plan.ports == ports_for(1)
-    assert plan.accounts == {"qq": "1000000002"}
+    assert (plan.platform, plan.account) == ("qq", "1000000002")
     assert plan.workspace == provisioning.data_root(workspace) / "koki"
+
+
+def test_a_plan_without_a_platform_opens_a_qq_instance(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(provisioning, "allocate_index", lambda *_a, **_k: 1)
+    plan = provisioning.plan_instance(workspace, instance_id="koki", label="")
+    assert (plan.platform, plan.account) == ("qq", "")
 
 
 def test_a_nameless_plan_is_labelled_with_its_own_name(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -366,7 +448,7 @@ def test_a_nameless_plan_is_labelled_with_its_own_name(workspace: Path, monkeypa
 def test_scaffold_links_code_dirs_and_writes_env(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(provisioning, "allocate_index", lambda *_a, **_k: 1)
     plan = provisioning.plan_instance(
-        workspace, instance_id="koki", label="小号", accounts={"qq": "1000000002"},
+        workspace, instance_id="koki", label="小号", platform=_qq(), account="1000000002",
     )
     provisioning.scaffold(plan, workspace)
 
@@ -377,7 +459,7 @@ def test_scaffold_links_code_dirs_and_writes_env(workspace: Path, monkeypatch: p
     assert "CLONOTH_URL_PREFIX=i/koki" in env
     rows = load_instances(workspace)
     assert [r["id"] for r in rows] == ["koki"]
-    assert rows[0]["accounts"] == {"qq": "1000000002"}
+    assert (rows[0]["platform"], rows[0]["account"]) == ("qq", "1000000002")
 
 
 # ── .env 的内容 ──
@@ -404,12 +486,23 @@ def test_primary_instance_stays_on_loopback(workspace: Path, monkeypatch: pytest
     assert "ONEBOT_ACCESS_TOKEN" not in body
 
 
-def test_the_env_opens_with_the_instance_and_its_supervisor_port(
+def test_the_env_opens_with_the_instance_its_platform_and_its_supervisor_port(
     workspace: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # 运行期处处认这一个值，漏了这行整个实例会退回默认的 QQ。
     lines = provisioning._env_body(_plan(workspace, monkeypatch, 1)).splitlines()
     assert lines[0] == "# 实例 koki (koki)"
-    assert lines[1] == "CLONOTH_PORT=8775"
+    assert lines[1] == "CLONOTH_PLATFORM=qq"
+    assert lines[2] == "CLONOTH_PORT=8775"
+
+
+def test_the_env_declares_the_platform_the_instance_was_opened_on(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provisioning, "allocate_index", lambda *_a, **_k: 1)
+    with _extra_platform("elsewhere") as other:
+        plan = provisioning.plan_instance(workspace, instance_id="koki", label="", platform=other)
+        assert "CLONOTH_PLATFORM=elsewhere" in provisioning._env_body(plan)
 
 
 def test_the_qq_lines_carry_this_instance_ports(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -432,10 +525,25 @@ def test_the_root_instance_gets_no_prefix_line(workspace: Path, monkeypatch: pyt
 
 
 def test_a_platform_without_the_hook_writes_nothing(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    with _extra_platform("silent", instance_ports=(InstancePort("hush", 9300, 10),)):
-        body = provisioning._env_body(_plan(workspace, monkeypatch, 1))
+    monkeypatch.setattr(provisioning, "allocate_index", lambda *_a, **_k: 1)
+    with _extra_platform("silent", instance_ports=(InstancePort("hush", 9300, 10),)) as silent:
+        plan = provisioning.plan_instance(workspace, instance_id="koki", label="", platform=silent)
+        body = provisioning._env_body(plan)
     assert "9310" not in body
     assert "hush" not in body
+
+
+def test_another_platform_lines_do_not_land_in_this_instance_env(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 别的平台的端口和令牌写进来，只会让人以为这个实例也在跑它。
+    monkeypatch.setattr(provisioning, "allocate_index", lambda *_a, **_k: 1)
+    with _extra_platform("elsewhere") as other:
+        body = provisioning._env_body(
+            provisioning.plan_instance(workspace, instance_id="koki", label="", platform=other),
+        )
+    assert "ONEBOT_FORWARD_BRIDGE_PORT" not in body
+    assert "NAPCAT_WEBUI_URL" not in body
 
 
 def test_a_platform_only_sees_the_ports_it_declared(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -453,12 +561,14 @@ def test_a_platform_only_sees_the_ports_it_declared(workspace: Path, monkeypatch
         return stub if platform.id == "noisy" and name == HOOK_INSTANCE_ENV else real(platform, name)
 
     monkeypatch.setattr(provisioning, "platform_hook", lookup)
+    monkeypatch.setattr(provisioning, "allocate_index", lambda *_a, **_k: 1)
     with _extra_platform(
         "noisy",
         instance_ports=(InstancePort("noisy", 9300, 10),),
         hooks={HOOK_INSTANCE_ENV: "noisy.provisioning"},
-    ):
-        body = provisioning._env_body(_plan(workspace, monkeypatch, 1))
+    ) as noisy:
+        plan = provisioning.plan_instance(workspace, instance_id="koki", label="", platform=noisy)
+        body = provisioning._env_body(plan)
 
     assert seen == [{"noisy": 9310}]
     assert "NOISY_INDEX=1" in body and "NOISY_PORT=9310" in body
@@ -471,8 +581,8 @@ def test_a_hook_module_that_breaks_on_import_is_not_a_missing_hook(
     def lookup(platform: PlatformDescriptor, name: str) -> Any:
         raise KeyError("napcat ports")
 
-    monkeypatch.setattr(provisioning, "platform_hook", lookup)
     plan = _plan(workspace, monkeypatch, 1)
+    monkeypatch.setattr(provisioning, "platform_hook", lookup)
 
     with pytest.raises(KeyError):
         provisioning._platform_env(plan)
@@ -543,9 +653,9 @@ def test_cannot_remove_a_name_that_is_not_on_the_roster(workspace: Path) -> None
 
 
 def test_removable_instance_passes(workspace: Path) -> None:
-    save_instance(workspace, instance_id="koki", label="小号", idx=1, accounts={"qq": "1000000002"})
+    save_instance(workspace, instance_id="koki", label="小号", idx=1, platform="qq", account="1000000002")
     row = provisioning.guard_removable(workspace, "koki", current_prefix="")
-    assert row["id"] == "koki" and row["accounts"] == {"qq": "1000000002"}
+    assert row["id"] == "koki" and (row["platform"], row["account"]) == ("qq", "1000000002")
 
 
 @pytest.mark.parametrize("name", ["stickers", "Koki", "k", "../rong"])
@@ -666,6 +776,24 @@ def test_the_root_script_names_the_instance_when_it_edits_cloudflared() -> None:
         assert f'{action} --config "$CF_CONF" --instance "$INSTANCE"' in body
 
 
+def test_the_root_script_only_builds_the_platform_the_env_declares() -> None:
+    # root 侧只搭得起 QQ 那一套（NapCat 容器 + kazebot-qq@），别的平台装半套比不装更难查。
+    body = _script_code(SCRIPT)
+    assert "CLONOTH_PLATFORM" in body
+    assert '[ "$platform" = qq ]' in body
+
+
+def test_the_bootstrap_env_declares_the_platform() -> None:
+    # 单机装出来的实例也要写这一行，运行期处处认它。
+    assert "CLONOTH_PLATFORM=qq" in BOOTSTRAP.read_text(encoding="utf-8")
+
+
+def test_the_command_line_entry_point_opens_a_qq_instance() -> None:
+    code = _heredoc(NEW_INSTANCE, "PY", "plan_instance")
+    assert "platform=QQ_NAPCAT" in code
+    assert "accounts=" not in code
+
+
 def test_the_command_line_entry_points_validate_the_same_way() -> None:
     for path in (NEW_INSTANCE, INSTALLER):
         body = _script_code(path)
@@ -688,7 +816,7 @@ def test_the_command_line_entry_points_refuse_the_shared_sticker_name(path: Path
 
 @pytest.mark.parametrize("path", [NEW_INSTANCE, INSTALLER], ids=lambda p: p.name)
 def test_the_command_line_entry_points_refuse_a_qq_number_that_is_not_digits(path: Path) -> None:
-    # 非数字的号会一路走到 normalize_accounts 才炸，那时候工作区和单元已经落下去了。
+    # 非数字的号会一路走到 normalize_account 才炸，那时候工作区和单元已经落下去了。
     lines = [l.strip() for l in _script_code(path).splitlines() if l.strip()]
     inferred = next(i for i, l in enumerate(lines) if l.startswith("if [[ -z"))
     guard = next(i for i, l in enumerate(lines) if "QQ 号必须是数字" in l)
@@ -739,9 +867,10 @@ def test_the_layout_names_the_extra_workspaces_by_instance(
 def test_the_installer_registers_the_main_instance_through_the_shared_validators() -> None:
     # 自己再写一遍校验就会和 supervisor 漂移，宽的那一份说了算。
     code = _heredoc(INSTALLER, "PY", "save_instance")
-    assert "from supervisor.provisioning import normalize_accounts, validate_instance_id" in code
+    assert "from supervisor.provisioning import normalize_account, validate_instance_id" in code
     assert "validate_instance_id(sys.argv[2])" in code
-    assert "normalize_accounts(" in code
+    assert "normalize_account(" in code
+    assert "platform=QQ_NAPCAT.id" in code
 
 
 def _install_main(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -762,16 +891,17 @@ def test_the_installer_puts_the_main_instance_on_the_roster_at_index_zero(tmp_pa
     done = _install_main(tmp_path, "rong", "1000000001")
     assert done.returncode == 0, done.stderr
     rows = yaml.safe_load((tmp_path / "instances.yaml").read_text(encoding="utf-8"))["instances"]
-    assert rows == [
-        {"id": "rong", "label": "主实例 rong", "path": "", "idx": 0, "accounts": {"qq": "1000000001"}},
-    ]
+    assert rows == [{
+        "id": "rong", "label": "主实例 rong", "path": "", "idx": 0,
+        "platform": "qq", "account": "1000000001", "uin": "1000000001",
+    }]
 
 
-def test_the_installer_leaves_the_accounts_empty_when_no_number_was_given(tmp_path: Path) -> None:
+def test_the_installer_leaves_the_account_empty_when_no_number_was_given(tmp_path: Path) -> None:
     done = _install_main(tmp_path, "rong", "")
     assert done.returncode == 0, done.stderr
     rows = yaml.safe_load((tmp_path / "instances.yaml").read_text(encoding="utf-8"))["instances"]
-    assert rows[0]["accounts"] == {}
+    assert rows[0]["platform"] == "qq" and rows[0]["account"] == ""
 
 
 @pytest.mark.parametrize("main,qq", [

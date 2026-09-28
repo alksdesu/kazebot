@@ -1,6 +1,6 @@
 """控制台的实例清单。
 
-多开时每个 bot 是一套独立进程，各自挂在自己的 URL 前缀下，靠这份共享文件互相看见；平台账号是实例下的子项。
+多开时每个 bot 是一套独立进程，各自挂在自己的 URL 前缀下，靠这份共享文件互相看见；一个实例只跑一个平台、登一个号。
 端口与序号的推导也在这里，shell 侧同样从这里取，两套算法漂移会让新实例静默抢占旧实例的端口。
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ import yaml
 from file_lock import exclusive_lock
 from platforms.builtin import QQ_NAPCAT
 from platforms.descriptor import InstancePort, normalize_name
-from platforms.registry import all_platforms
+from platforms.registry import DEFAULT_PLATFORM_ID, all_platforms
 
 _ENV_FILE = "CLONOTH_INSTANCES_FILE"
 _ENV_PREFIX = "CLONOTH_URL_PREFIX"
@@ -74,21 +74,32 @@ def instances_file(workspace_root: Path) -> Path:
     return Path(workspace_root) / "config" / "instances.yaml"
 
 
-def legacy_accounts(uin: Any) -> dict[str, str]:
-    """改造前一个实例就是一个 QQ 号，实例名也是它：那个号就是这个实例在 QQ 上的账号。"""
-    text = str(uin or "").strip()
-    return {QQ_NAPCAT.id: text} if text else {}
+def _platform_account(entry: dict[str, Any]) -> tuple[str, str]:
+    """一条清单记着的平台和账号。
 
-
-def _accounts(raw: Any, legacy_uin: str = "") -> dict[str, str]:
-    """读和写走同一套清洗：写进去的脏值读出来就不见了，写的一方却以为记上了。"""
-    accounts = legacy_accounts(legacy_uin)
-    if isinstance(raw, dict):
-        for platform_id, account in raw.items():
-            key, value = normalize_name(platform_id), str(account or "").strip()
-            if key and value:
-                accounts[key] = value
-    return accounts
+    读和写走同一套清洗：写进去的脏值读出来就不见了，写的一方却以为记上了。改造前的两种写法照样认：
+    实例名就是 QQ 号时的 uin，和一个实例挂几个平台时的 accounts 映射。映射里有几项时认 QQ 那一项，
+    改造前能挂多个平台的只有它；其余的是那时的遗留，这个实例已经不跑它们了。
+    """
+    platform = normalize_name(entry.get("platform"))
+    account = str(entry.get("account") or "").strip()
+    if platform:
+        return platform, account
+    if account:
+        # 手改的清单只写了账号没写平台：按没声明平台的实例算，账号不能丢。
+        return DEFAULT_PLATFORM_ID, account
+    legacy = entry.get("accounts")
+    if isinstance(legacy, dict):
+        cleaned = {
+            normalize_name(key): str(value or "").strip()
+            for key, value in legacy.items()
+            if normalize_name(key) and str(value or "").strip()
+        }
+        if cleaned:
+            chosen = QQ_NAPCAT.id if QQ_NAPCAT.id in cleaned else next(iter(cleaned))
+            return chosen, cleaned[chosen]
+    uin = str(entry.get("uin") or "").strip()
+    return (QQ_NAPCAT.id, uin) if uin else (DEFAULT_PLATFORM_ID, "")
 
 
 def _is_index(value: Any) -> bool:
@@ -110,13 +121,23 @@ def _clean(entry: Any) -> dict[str, Any] | None:
         # 老清单没这个字段。根实例必然是序号 0；带前缀的推不出来，标 -1 让分配退回
         # 端口探测 —— 宁可多跳一个序号，也不能算出一个正在跑的实例的端口。
         idx = 0 if not path else -1
+    platform, account = _platform_account(entry)
     return {
         "id": instance_id,
         "label": str(entry.get("label") or "").strip() or instance_id,
         "path": path,
         "idx": idx,
-        "accounts": _accounts(entry.get("accounts"), legacy_uin),
+        "platform": platform,
+        "account": account,
     }
+
+
+def _stored(row: dict[str, Any]) -> dict[str, Any]:
+    """落盘的写法。QQ 实例另记一份 uin：退回改造前的版本时，那边只认这个字段，没有它整条会被丢掉。"""
+    stored = {key: row[key] for key in ("id", "label", "path", "idx", "platform", "account")}
+    if row["platform"] == QQ_NAPCAT.id and row["account"]:
+        stored["uin"] = row["account"]
+    return stored
 
 
 def _read(path: Path) -> list[dict[str, Any]]:
@@ -146,7 +167,10 @@ def load_instances(workspace_root: Path) -> list[dict[str, Any]]:
 def account_owner_in(
     rows: list[dict[str, Any]], platform_id: str, account: str, *, prefix: str | None = None,
 ) -> dict[str, Any] | None:
-    """rows 里登记着这个号的那一条。给了 prefix 就不算挂在它下面的那个实例，那是自己。"""
+    """rows 里登记着这个号的那一条。给了 prefix 就不算挂在它下面的那个实例，那是自己。
+
+    比的是平台加账号：同机可能同时跑着 QQ 实例和别的平台的实例，两边的号可以长得一样。
+    """
     key, value = normalize_name(platform_id), str(account or "").strip()
     if not key or not value:
         return None
@@ -155,7 +179,7 @@ def account_owner_in(
     return next(
         (
             row for row in rows
-            if (excused is None or row["path"] != excused) and row["accounts"].get(key) == value
+            if (excused is None or row["path"] != excused) and row["platform"] == key and row["account"] == value
         ),
         None,
     )
@@ -205,7 +229,7 @@ def _locked(path: Path) -> AbstractContextManager[None]:
 
 
 def _write(path: Path, rows: list[dict[str, Any]]) -> None:
-    body = yaml.safe_dump({"instances": rows}, allow_unicode=True, sort_keys=False)
+    body = yaml.safe_dump({"instances": [_stored(row) for row in rows]}, allow_unicode=True, sort_keys=False)
     tmp = path.with_name(f"{path.name}.tmp")
     tmp.write_text(body, encoding="utf-8")
     os.replace(tmp, path)
@@ -217,26 +241,29 @@ def save_instance(
     instance_id: str,
     label: str,
     idx: int,
-    accounts: dict[str, str] | None = None,
+    platform: str = DEFAULT_PLATFORM_ID,
+    account: str = "",
 ) -> list[dict[str, Any]]:
-    """登记一个实例。同名视为改写，不会留下两条；已经记下的平台账号保留，给了的覆盖上去。"""
+    """登记一个实例。同名视为改写，不会留下两条；没给账号时留着原来记下的那个，平台换了就不留。"""
     instance_id = str(instance_id or "").strip()
     if not instance_id:
         raise ValueError("实例名不能为空")
     # 读取时序号越界会被当成 -1，照写就成了读回来和写进去对不上的一条。
     if not _is_index(idx):
         raise ValueError(f"序号要在 0-{MAX_INDEX} 之间：{idx!r}")
+    platform_id = normalize_name(platform) or DEFAULT_PLATFORM_ID
     path = instances_file(workspace_root)
     with _locked(path):
         rows = _read(path)
         previous = next((r for r in rows if r["id"] == instance_id), None)
-        merged = {**(previous["accounts"] if previous else {}), **_accounts(accounts)}
+        kept = previous["account"] if previous and previous["platform"] == platform_id else ""
         row = {
             "id": instance_id,
             "label": str(label or "").strip() or instance_id,
             "path": prefix_for(idx, instance_id),
             "idx": idx,
-            "accounts": merged,
+            "platform": platform_id,
+            "account": str(account or "").strip() or kept,
         }
         rows = [r for r in rows if r["id"] != instance_id]
         rows.append(row)
@@ -246,7 +273,7 @@ def save_instance(
 
 
 def record_account(workspace_root: Path, *, prefix: str, platform_id: str, account: str) -> bool:
-    """本实例在一个平台上换了号，记进清单，别的实例据此拦着同一个号双登。单实例部署没有清单，什么也不做。"""
+    """本实例在它的平台上换了号，记进清单，别的实例据此拦着同一个号双登。单实例部署没有清单，什么也不做。"""
     path = instances_file(workspace_root)
     key, value = normalize_name(platform_id), str(account or "").strip()
     if not key or not value or not path.is_file():
@@ -255,9 +282,10 @@ def record_account(workspace_root: Path, *, prefix: str, platform_id: str, accou
     with _locked(path):
         rows = _read(path)
         row = next((r for r in rows if r["path"] == where), None)
-        if row is None or row["accounts"].get(key) == value:
+        if row is None or (row["platform"] == key and row["account"] == value):
             return False
-        row["accounts"][key] = value
+        # 清单里的平台是建实例时声明的；上报的对不上时以实例实际在跑的那个为准。
+        row["platform"], row["account"] = key, value
         _write(path, rows)
         return True
 

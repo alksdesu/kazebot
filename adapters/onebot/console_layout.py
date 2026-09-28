@@ -1,4 +1,4 @@
-"""QQ · NapCat 在控制台上的九个分区。全平台共用的那几块引用共享布局，这里只拼 QQ 自己的部分。"""
+"""QQ · NapCat 在控制台上的九个分区。不分平台的那几块引用共享布局，这里只拼 QQ 自己的部分。"""
 from __future__ import annotations
 
 from typing import Any

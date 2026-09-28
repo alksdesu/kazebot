@@ -20,6 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import supervisor.admin_api as admin_api  # noqa: E402
 from adapters._shared import features  # noqa: E402
+from platforms.descriptor import CHANNEL_GROUP, ChannelDescriptor, PlatformDescriptor  # noqa: E402
+from platforms.registry import PLATFORM_ENV, register_platform, unregister_platform  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
@@ -58,6 +60,19 @@ def call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         return asyncio.run(go())
 
     return request
+
+
+@pytest.fixture
+def elsewhere():
+    platform = PlatformDescriptor(
+        id="elsewhere", display_name="别处", short_name="EL",
+        channels=(ChannelDescriptor("el_group", CHANNEL_GROUP),),
+    )
+    register_platform(platform)
+    try:
+        yield platform
+    finally:
+        unregister_platform(platform.id)
 
 
 def _features_path(tmp_path: Path) -> Path:
@@ -196,8 +211,41 @@ class TestWriteValidation:
 
         assert response.json()["detail"] == "无人消费的配置项：['channels.allowed_groups']"
 
+    def test_a_key_owned_by_a_platform_this_instance_does_not_run_is_just_unconsumed(
+        self, call: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, elsewhere: Any,
+    ) -> None:
+        # 指向一份这个实例根本没有的平台配置，只会让人去改一个不存在的文件。
+        _publish_qq(tmp_path)
+        monkeypatch.setenv(PLATFORM_ENV, elsewhere.id)
+
+        response = _put(call, "channels:\n  allowed_groups: [1]\n")
+
+        assert response.json()["detail"] == "无人消费的配置项：['channels.allowed_groups']"
+
 
 class TestState:
+    def test_only_the_platform_this_instance_runs_is_listed(
+        self, call: Any, elsewhere: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 列上别的平台，界面就会一直等一个这台机器上根本不会起来的 bot 换文件。
+        assert [entry["id"] for entry in _state(call)["platforms"]] == ["qq"]
+
+        monkeypatch.setenv(PLATFORM_ENV, elsewhere.id)
+        assert [entry["id"] for entry in _state(call)["platforms"]] == [elsewhere.id]
+
+    def test_another_platform_left_behind_state_does_not_hold_it_back(
+        self, call: Any, tmp_path: Path, elsewhere: Any, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 换过平台的实例盘上还留着 QQ 的旧快照，算进来「已生效」就永远等不到。
+        _put(call, _NAME_ON)
+        _publish_qq(tmp_path, defaults=_defaults(tmp_path, {"exists": False, "mtime_ns": 0, "size": 0}))
+        monkeypatch.setenv(PLATFORM_ENV, elsewhere.id)
+
+        body = _state(call)
+
+        assert body["applied"] is True
+        assert [entry["published"] for entry in body["platforms"]] == [False]
+
     def test_the_values_come_from_the_global_file(self, call: Any) -> None:
         _put(call, _NAME_ON)
 

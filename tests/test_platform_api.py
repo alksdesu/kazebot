@@ -20,7 +20,12 @@ import supervisor.admin_api as admin_api  # noqa: E402
 import supervisor.platform_api as platform_api  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 from platforms.descriptor import CHANNEL_GROUP, ChannelDescriptor, PlatformDescriptor  # noqa: E402
-from platforms.registry import register_platform, unregister_platform  # noqa: E402
+from platforms.registry import (  # noqa: E402
+    PLATFORM_ENV,
+    platform_state_path,
+    register_platform,
+    unregister_platform,
+)
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
@@ -80,6 +85,14 @@ def chatless():
         unregister_platform(platform.id)
 
 
+def _write_live(root: Path, platform: PlatformDescriptor, body: dict[str, Any]) -> None:
+    from platforms.descriptor import STATE_LIVE
+
+    path = platform_state_path(platform, STATE_LIVE, root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body), encoding="utf-8")
+
+
 def test_the_listing_needs_the_admin_token(call) -> None:
     assert call("GET", "/v1/platforms", headers={}).status_code == 401
 
@@ -93,6 +106,35 @@ def test_the_listing_includes_qq(call) -> None:
         "account_ops", "console_schema", "instance_env", "known_accounts", "maintenance", "trigger_policy",
     ]
     assert qq["capabilities"]["mention"] == "native" and qq["capabilities"]["markdown"] is False
+
+
+def test_the_listing_keeps_every_platform_and_names_the_one_in_use(call, chatless) -> None:
+    # 认会话键的前缀要用全表：迁移过来的历史会话可能出自别的平台。current 才是本实例在跑的那个。
+    body = call("GET", "/v1/platforms").json()
+    assert {item["id"] for item in body["platforms"]} >= {"qq", "chatless"}
+    assert body["current"] == "qq"
+
+
+def test_the_listing_follows_the_declared_platform(call, chatless, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(PLATFORM_ENV, "chatless")
+    assert call("GET", "/v1/platforms").json()["current"] == "chatless"
+
+
+def test_only_the_current_platform_state_is_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, chatless) -> None:
+    # 换过平台的实例盘上还留着旧平台的快照，算进来就会拿早已不跑的 bot 的兜底当真。
+    _write_live(tmp_path, QQ_NAPCAT, {"connected": True})
+    _write_live(tmp_path, chatless, {"connected": False})
+
+    assert set(platform_api.published_states(tmp_path)) == {"qq"}
+
+    monkeypatch.setenv(PLATFORM_ENV, chatless.id)
+    assert set(platform_api.published_states(tmp_path)) == {"chatless"}
+
+
+def test_a_platform_that_never_published_has_no_state(tmp_path: Path, chatless) -> None:
+    _write_live(tmp_path, chatless, {"connected": False})
+
+    assert platform_api.published_states(tmp_path) == {}
 
 
 def test_the_listing_says_which_process_connects_to_what(call) -> None:

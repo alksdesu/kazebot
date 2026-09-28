@@ -209,9 +209,9 @@ def roster(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return path
 
 
-def _roster_accounts(path: Path) -> dict[str, dict[str, str]]:
+def _roster_accounts(path: Path) -> dict[str, tuple[str, str]]:
     rows = yaml.safe_load(path.read_text(encoding="utf-8"))["instances"]
-    return {row["id"]: row.get("accounts") or {} for row in rows}
+    return {row["id"]: (row.get("platform") or "", row.get("account") or "") for row in rows}
 
 
 @pytest.fixture
@@ -449,6 +449,20 @@ class TestAccountOwnership:
         assert call("POST", "/v1/platforms/qq/account/switch", json={"account": f"  {_ACCOUNT} "}).status_code == 409
         assert ops.calls == []
 
+    def test_the_same_number_on_another_platform_is_not_a_conflict(
+        self, call, ops: _FakeOps, roster: Path,
+    ) -> None:
+        # 同机可以一边跑 QQ 一边跑别的平台，两边的号可以长得一样。
+        roster.write_text(
+            "instances:\n"
+            f"  - {{id: rong, label: 主号, path: '', idx: 0, platform: telegram, account: '{_ACCOUNT}'}}\n"
+            "  - {id: koki, label: 小号, path: /i/koki, idx: 1}\n",
+            encoding="utf-8",
+        )
+
+        assert call("POST", "/v1/platforms/qq/account/switch", json={"account": _ACCOUNT}).status_code == 200
+        assert _roster_accounts(roster)["koki"] == ("qq", _ACCOUNT)
+
     def test_the_number_this_instance_already_holds_can_be_relogged(
         self, call, ops: _FakeOps, roster: Path,
     ) -> None:
@@ -467,7 +481,7 @@ class TestAccountOwnership:
         self, call, ops: _FakeOps, roster: Path, url: str, payload: dict[str, str],
     ) -> None:
         assert call("POST", url, json=payload).status_code == 200
-        assert _roster_accounts(roster) == {"rong": {"qq": _ACCOUNT}, "koki": {"qq": _OTHER}}
+        assert _roster_accounts(roster) == {"rong": ("qq", _ACCOUNT), "koki": ("qq", _OTHER)}
 
     @pytest.mark.parametrize("url", ["/v1/platforms/qq/account/pin", "/v1/qq/account/pin"])
     def test_pinning_records_the_number_that_was_scanned_in(
@@ -477,7 +491,7 @@ class TestAccountOwnership:
         ops.outcomes["pin"] = _OTHER
 
         assert call("POST", url).status_code == 200
-        assert _roster_accounts(roster)["koki"] == {"qq": _OTHER}
+        assert _roster_accounts(roster)["koki"] == ("qq", _OTHER)
 
     @pytest.mark.parametrize("url,payload", [
         ("/v1/platforms/qq/account/switch", {"account": _OTHER}),

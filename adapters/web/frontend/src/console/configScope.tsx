@@ -1,4 +1,4 @@
-// 控件写到哪一份配置：某个平台的配置文件，或全平台共用的 config/features.yaml。
+// 控件写到哪一份配置：平台的配置文件，或不分平台的 config/features.yaml。
 // 草稿 store、分区组件、schema 都按它分家，同一套控件两边都能用。
 import { createContext, useContext, type ReactNode } from 'react';
 

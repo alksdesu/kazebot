@@ -55,7 +55,8 @@ def scaffolded(monkeypatch: pytest.MonkeyPatch) -> list[provisioning.Plan]:
     def scaffold(plan: provisioning.Plan, workspace_root: Path) -> None:
         built.append(plan)
         save_instance(
-            workspace_root, instance_id=plan.instance_id, label=plan.label, idx=plan.idx, accounts=plan.accounts,
+            workspace_root, instance_id=plan.instance_id, label=plan.label, idx=plan.idx,
+            platform=plan.platform, account=plan.account,
         )
 
     monkeypatch.setattr(provisioning, "scaffold", scaffold)
@@ -115,7 +116,7 @@ class TestListing:
     def test_each_row_says_whether_it_is_the_one_you_are_on(
         self, call, workspace: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        save_instance(workspace, instance_id="rong", label="主号", idx=0, accounts={"qq": "1000000001"})
+        save_instance(workspace, instance_id="rong", label="主号", idx=0, platform="qq", account="1000000001")
         save_instance(workspace, instance_id="koki", label="小号", idx=1)
         monkeypatch.setenv("CLONOTH_URL_PREFIX", "/i/koki")
 
@@ -123,8 +124,14 @@ class TestListing:
 
         assert body["current_prefix"] == "/i/koki"
         assert body["instances"] == [
-            {"id": "rong", "label": "主号", "path": "", "idx": 0, "accounts": {"qq": "1000000001"}, "current": False},
-            {"id": "koki", "label": "小号", "path": "/i/koki", "idx": 1, "accounts": {}, "current": True},
+            {
+                "id": "rong", "label": "主号", "path": "", "idx": 0,
+                "platform": "qq", "account": "1000000001", "current": False,
+            },
+            {
+                "id": "koki", "label": "小号", "path": "/i/koki", "idx": 1,
+                "platform": "qq", "account": "", "current": True,
+            },
         ]
 
 
@@ -132,17 +139,40 @@ class TestCreate:
     def test_a_new_instance_is_planned_scaffolded_and_handed_to_root(
         self, call, units: list[str], scaffolded: list[provisioning.Plan], workspace: Path,
     ) -> None:
-        response = call("POST", "/v1/instances", json={"id": "koki", "label": "小号", "accounts": {"qq": "1000000002"}})
+        response = call(
+            "POST", "/v1/instances",
+            json={"id": "koki", "label": "小号", "platform": "qq", "account": "1000000002"},
+        )
 
         assert response.status_code == 200
         assert response.json() == {
             "id": "koki", "label": "小号", "idx": 1, "prefix": "/i/koki",
             "ports": {"supervisor": 8775, "bot": 8090, "bridge": 8779, "napcat": 6199},
             "workspace": str(provisioning.data_root(workspace) / "koki"),
-            "accounts": {"qq": "1000000002"},
+            "platform": "qq", "account": "1000000002",
         }
         assert [plan.instance_id for plan in scaffolded] == ["koki"]
         assert units == ["kazebot-provision@koki.service"]
+
+    def test_an_old_console_still_gets_its_one_platform_through(
+        self, call, units: list[str], scaffolded: list[provisioning.Plan],
+    ) -> None:
+        # 没刷新页面的控制台还发着「平台 id: 账号」的映射。
+        body = call("POST", "/v1/instances", json={"id": "koki", "accounts": {"qq": "1000000002"}}).json()
+
+        assert (body["platform"], body["account"]) == ("qq", "1000000002")
+
+    def test_an_old_console_asking_for_two_platforms_at_once_is_refused(
+        self, call, units: list[str], scaffolded: list[provisioning.Plan],
+    ) -> None:
+        response = call(
+            "POST", "/v1/instances",
+            json={"id": "koki", "accounts": {"qq": "1000000002", "telegram": "@koki"}},
+        )
+
+        assert response.status_code == 400
+        assert "一个实例只跑一个平台" in response.json()["detail"]
+        assert scaffolded == [] and units == []
 
     def test_the_roster_is_claimed_before_root_is_asked_to_start(
         self, call, units: list[str], scaffolded: list[provisioning.Plan], monkeypatch: pytest.MonkeyPatch,
@@ -171,12 +201,15 @@ class TestCreate:
     ) -> None:
         body = call("POST", "/v1/instances", json={"id": "koki"}).json()
 
-        assert body["label"] == "koki" and body["accounts"] == {}
+        assert body["label"] == "koki" and (body["platform"], body["account"]) == ("qq", "")
 
     @pytest.mark.parametrize("body,refusal", [
         ({"id": "Koki"}, "实例名"),
         ({"id": "stickers"}, "stickers"),
         ({"id": ""}, "实例名"),
+        ({"id": "koki", "platform": "nowhere"}, "不认识的平台"),
+        ({"id": "koki", "platform": "qq_group"}, "不认识的平台"),
+        ({"id": "koki", "account": "abc"}, "账号写法不对"),
         ({"id": "koki", "accounts": {"nowhere": "1"}}, "不认识的平台"),
         ({"id": "koki", "accounts": {"qq": "abc"}}, "账号写法不对"),
         ({"id": "koki", "accounts": ["qq"]}, "accounts"),
@@ -203,9 +236,9 @@ class TestCreate:
     def test_a_number_another_instance_holds_is_refused(
         self, call, units: list[str], scaffolded: list[provisioning.Plan], workspace: Path,
     ) -> None:
-        save_instance(workspace, instance_id="rong", label="主号", idx=0, accounts={"qq": "1000000001"})
+        save_instance(workspace, instance_id="rong", label="主号", idx=0, platform="qq", account="1000000001")
 
-        response = call("POST", "/v1/instances", json={"id": "koki", "accounts": {"qq": "1000000001"}})
+        response = call("POST", "/v1/instances", json={"id": "koki", "platform": "qq", "account": "1000000001"})
 
         assert response.status_code == 400 and "已经归实例 主号 管了" in response.json()["detail"]
         assert units == []

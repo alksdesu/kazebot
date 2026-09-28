@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,7 @@ from platforms.live import read_live_state
 from platforms.registry import (
     all_platforms,
     conversation_channel,
+    current_platform,
     platform_state_path,
     stable_key_pattern,
 )
@@ -62,31 +63,33 @@ def is_runtime_copy_session(session_id: str) -> bool:
 
 @dataclass(frozen=True)
 class AccountScope:
-    """各平台当前登录账号名下的会话键。
+    """本实例当前登录账号名下的会话键。
 
     摘要带账号作用域，换号后同一个群另起一条，两个号的会话会并排堆在列表里。
-    密钥只有 bot 进程有，这里只消费它算好的集合；平台没公布过时无从判断，一律算当前。
+    密钥只有 bot 进程有，这里只消费它算好的集合；bot 没公布过时无从判断，一律算当前。
+    别的平台的会话是换平台之前留下的，这个实例已经不跑那个平台，不算当前。
     """
 
-    keys: Mapping[str, frozenset[str] | None]
+    platform: str
+    keys: frozenset[str] | None
 
     def is_current(self, conversation_key: str) -> bool:
         found = conversation_channel(conversation_key)
         if found is None or found[1].kind not in CONVERSATION_KINDS:
             return True
-        keys = self.keys.get(found[0].id)
-        return keys is None or conversation_key in keys
+        if found[0].id != self.platform:
+            return False
+        return self.keys is None or conversation_key in self.keys
 
 
 def account_scope(workspace_root: Path) -> AccountScope:
-    keys: dict[str, frozenset[str] | None] = {}
-    for platform in all_platforms():
-        published = read_live_state(platform, workspace_root).get("scope_conversation_keys")
-        keys[platform.id] = (
-            frozenset(str(key) for key in published if str(key or "").strip())
-            if isinstance(published, list) else None
-        )
-    return AccountScope(keys=keys)
+    platform = current_platform()
+    published = read_live_state(platform, workspace_root).get("scope_conversation_keys")
+    keys = (
+        frozenset(str(key) for key in published if str(key or "").strip())
+        if isinstance(published, list) else None
+    )
+    return AccountScope(platform=platform.id, keys=keys)
 
 
 class _DisplayNames:

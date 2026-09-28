@@ -331,9 +331,16 @@ def _platform(platform_id: str) -> Any:
     )
 
 
-def _wire_platforms(monkeypatch: pytest.MonkeyPatch, hooks: dict[str, Any]) -> None:
-    """把注册表换成给定的几个假平台；值是异常就当钩子查找时抛出来。"""
-    platforms = tuple(_platform(platform_id) for platform_id in hooks)
+def _wire_platforms(monkeypatch: pytest.MonkeyPatch, hooks: dict[str, Any], current: str = "") -> None:
+    """把注册表换成给定的几个假平台；值是异常就当钩子查找时抛出来。
+
+    current 是本实例在跑的那个，默认第一个；一个都不给就是「有平台但没有维护钩子」。
+    """
+    from platforms.registry import MissingPlatformHook
+
+    hooks = hooks or {"nohook": MissingPlatformHook("no hook")}
+    platforms = {platform_id: _platform(platform_id) for platform_id in hooks}
+    running = platforms[current or next(iter(platforms))]
 
     def lookup(platform: Any, name: str) -> Any:
         found = hooks[platform.id]
@@ -341,7 +348,7 @@ def _wire_platforms(monkeypatch: pytest.MonkeyPatch, hooks: dict[str, Any]) -> N
             raise found
         return found
 
-    monkeypatch.setattr(cleanup, "all_platforms", lambda: platforms)
+    monkeypatch.setattr(cleanup, "current_platform", lambda: running)
     monkeypatch.setattr(cleanup, "platform_hook", lookup)
 
 
@@ -363,40 +370,67 @@ def _task(name: str, calls: list[str], *, boom: BaseException | None = None, sco
 
 
 class TestPlatformMaintenance:
-    """平台自己的缓存清理：核心只按平台逐个调钩子，一个平台坏掉不能连累别的。"""
+    """平台自己的缓存清理：核心只调本实例那个平台的钩子，别的平台的客户端不在这台实例底下。"""
 
     @pytest.fixture(autouse=True)
     def _isolate(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         monkeypatch.setattr(cleanup, "DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(cleanup, "DRY_RUN", False)
 
-    def test_a_platform_without_the_hook_is_skipped_quietly(self, monkeypatch, caplog) -> None:
-        from platforms.registry import MissingPlatformHook
-
+    def test_only_the_platform_this_instance_runs_is_cleaned(self, monkeypatch, caplog) -> None:
+        # 清别的平台的缓存目录，清的是同机另一个实例的东西。
         calls: list[str] = []
         _wire_platforms(monkeypatch, {
-            "silent": MissingPlatformHook("no hook"),
-            "loud": _hook(_task("cache", calls)),
-        })
+            "qq": _hook(_task("qq_cache", calls)),
+            "elsewhere": _hook(_task("other_cache", calls)),
+        }, current="elsewhere")
 
         with caplog.at_level(logging.ERROR):
             cleanup.run_platform_maintenance()
 
-        assert calls == ["cache"]
+        assert calls == ["other_cache"]
+        assert caplog.records == []
+
+    def test_the_declared_platform_decides_which_hook_runs(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """走真注册表挑平台：环境变量说跑哪个，就只跑那个的维护钩子，没写就是 QQ。"""
+        from platforms.registry import PLATFORM_ENV, register_platform, unregister_platform
+
+        calls: list[str] = []
+        elsewhere = _platform("elsewhere")
+        register_platform(elsewhere)
+        monkeypatch.setattr(
+            cleanup, "platform_hook",
+            lambda platform, name: _hook(_task(f"{platform.id}_cache", calls)),
+        )
+        try:
+            monkeypatch.setenv(PLATFORM_ENV, "elsewhere")
+            cleanup.run_platform_maintenance()
+            monkeypatch.delenv(PLATFORM_ENV)
+            cleanup.run_platform_maintenance()
+        finally:
+            unregister_platform(elsewhere.id)
+
+        assert calls == ["elsewhere_cache", "qq_cache"]
+
+    def test_a_platform_without_the_hook_is_skipped_quietly(self, monkeypatch, caplog) -> None:
+        from platforms.registry import MissingPlatformHook
+
+        _wire_platforms(monkeypatch, {"silent": MissingPlatformHook("no hook")})
+
+        with caplog.at_level(logging.ERROR):
+            cleanup.run_platform_maintenance()
+
         assert caplog.records == []
 
     def test_a_hook_module_that_breaks_on_import_is_reported_and_not_fatal(self, monkeypatch, caplog) -> None:
         """钩子模块自己抛的 KeyError 也是 LookupError，被当成「没声明」就永远查不出来。"""
-        calls: list[str] = []
-        _wire_platforms(monkeypatch, {
-            "broken": KeyError("napcat config"),
-            "healthy": _hook(_task("cache", calls)),
-        })
+        _wire_platforms(monkeypatch, {"broken": KeyError("napcat config")})
 
         with caplog.at_level(logging.ERROR):
             cleanup.run_platform_maintenance()
 
-        assert calls == ["cache"]
         assert any("[broken] maintenance hook unavailable" in r.getMessage() for r in caplog.records)
 
     def test_a_failing_task_does_not_stop_the_next_one(self, monkeypatch, caplog) -> None:

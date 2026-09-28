@@ -1,4 +1,4 @@
-// 机器人 › 全局默认：各平台没单独设置时用的值，写进全局设置文件。区块各自保存，没有「应用」。
+// 机器人 › 全局默认：平台页没单独设置时用的值，写进全局设置文件。区块各自保存，没有「应用」。
 import { useEffect, useMemo } from 'react';
 
 import type { ConsoleSchema, ConsoleSectionSchema, FeatureAdoption, FeaturesLiveState } from '../api/supervisorClient';
@@ -26,7 +26,7 @@ export function adoptionState(platform: FeatureAdoption): { tone: PipTone; text:
 }
 
 const Adoption = ({ platforms }: { platforms: readonly FeatureAdoption[] }) => (
-  <Block hint="保存之后，在跑的 bot 两秒内换上新文件" title="各平台">
+  <Block hint="保存之后，在跑的 bot 两秒内换上新文件" title="生效情况">
     {platforms.length ? (
       <List>
         {platforms.map((platform) => {
@@ -41,7 +41,7 @@ const Adoption = ({ platforms }: { platforms: readonly FeatureAdoption[] }) => (
         })}
       </List>
     ) : (
-      <Empty>还没有能读全局设置的平台。</Empty>
+      <Empty>后端没给出 bot 的生效情况。</Empty>
     )}
   </Block>
 );

@@ -1,6 +1,6 @@
 """控制台的实例清单：单实例部署必须什么都不显示，多开时几个实例靠这份共享文件互相看见。
 
-实例名是身份，平台账号是实例下的子项；端口由平台描述声明，两套算法漂移会让新实例静默抢占旧实例的端口。
+实例名是身份，一个实例只跑一个平台、登一个号；端口由平台描述声明，两套算法漂移会让新实例静默抢占旧实例的端口。
 """
 from __future__ import annotations
 
@@ -25,12 +25,12 @@ from platforms.registry import register_platform, unregister_platform  # noqa: E
 from supervisor.instances import (  # noqa: E402
     MAX_INDEX,
     NoFreeIndex,
-    _accounts,
+    _platform_account,
+    _stored,
     account_owner,
     account_owner_in,
     allocate_index,
     instances_file,
-    legacy_accounts,
     load_instances,
     normalize_prefix,
     port_table,
@@ -223,8 +223,8 @@ instances:
 """)
     # idx 是后加的：根实例推得出是 0，带前缀的老条目推不出来，标 -1 交给端口探测。
     assert load_instances(tmp_path) == [
-        {"id": "rong", "label": "Rong", "path": "", "idx": 0, "accounts": {"qq": "1000000001"}},
-        {"id": "koki", "label": "koki", "path": "/i/koki", "idx": -1, "accounts": {}},
+        {"id": "rong", "label": "Rong", "path": "", "idx": 0, "platform": "qq", "account": "1000000001"},
+        {"id": "koki", "label": "koki", "path": "/i/koki", "idx": -1, "platform": "qq", "account": ""},
     ]
 
 
@@ -257,13 +257,42 @@ def test_env_overrides_the_file_location(tmp_path: Path, monkeypatch: pytest.Mon
     assert [row["id"] for row in load_instances(tmp_path)] == ["xiaoyu"]
 
 
-# ── 清单里的平台账号 ───────────────────────
+# ── 清单里的平台和账号 ─────────────────────
+
+def test_an_entry_says_which_platform_it_runs(tmp_path: Path) -> None:
+    _write(tmp_path, "instances:\n  - id: yu\n    path: /i/yu\n    idx: 1\n    platform: '  QQ  '\n    account: ' 1000000002 '\n")
+    assert load_instances(tmp_path)[0] == {
+        "id": "yu", "label": "yu", "path": "/i/yu", "idx": 1, "platform": "qq", "account": "1000000002",
+    }
+
+
+def test_an_entry_without_a_platform_is_a_qq_one(tmp_path: Path) -> None:
+    # 改造前没有这个字段，那时能建出来的只有 QQ 实例。
+    _write(tmp_path, "instances:\n  - id: yu\n    path: /i/yu\n")
+    assert load_instances(tmp_path)[0]["platform"] == "qq"
+    assert load_instances(tmp_path)[0]["account"] == ""
+
+
+def test_an_account_without_a_platform_lands_on_the_default_one(tmp_path: Path) -> None:
+    # 手改的清单只写了账号：读回来把号丢掉最坏，冲突检查从此看不见它。
+    _write(tmp_path, "instances:\n  - id: yu\n    account: '1000000002'\n")
+    row = load_instances(tmp_path)[0]
+    assert (row["platform"], row["account"]) == ("qq", "1000000002")
+
+
+@pytest.mark.parametrize("legacy", ["uin: '1000000001'", "accounts: {qq: '1000000001'}", "accounts: {telegram: '@yu'}"])
+def test_a_bare_account_wins_over_the_old_writings(tmp_path: Path, legacy: str) -> None:
+    # 老字段是退回旧版时留的备份，不能反过来盖住手写的那个号。
+    _write(tmp_path, f"instances:\n  - id: yu\n    account: ' 1000000002 '\n    {legacy}\n")
+    row = load_instances(tmp_path)[0]
+    assert (row["platform"], row["account"]) == ("qq", "1000000002")
+
 
 def test_an_old_entry_is_a_qq_named_instance_logged_into_that_number(tmp_path: Path) -> None:
     # 改造前一个实例就是一个 QQ 号，实例名也是它。
     _write(tmp_path, "instances:\n  - uin: '1000000001'\n    label: 主号\n    path: ''\n")
     assert load_instances(tmp_path) == [
-        {"id": "1000000001", "label": "主号", "path": "", "idx": 0, "accounts": {"qq": "1000000001"}},
+        {"id": "1000000001", "label": "主号", "path": "", "idx": 0, "platform": "qq", "account": "1000000001"},
     ]
 
 
@@ -271,13 +300,36 @@ def test_an_old_entry_that_switched_numbers_says_so(tmp_path: Path) -> None:
     # 实例名还是当年那个号，但现在登的是别的号：写出来的那个说了算。
     _write(tmp_path, "instances:\n  - uin: '1000000001'\n    accounts: {qq: '1000000009'}\n")
     assert load_instances(tmp_path)[0] == {
-        "id": "1000000001", "label": "1000000001", "path": "", "idx": 0, "accounts": {"qq": "1000000009"},
+        "id": "1000000001", "label": "1000000001", "path": "", "idx": 0,
+        "platform": "qq", "account": "1000000009",
     }
 
 
-def test_account_platform_keys_are_normalised(tmp_path: Path) -> None:
-    _write(tmp_path, "instances:\n  - id: xiaoyu\n    accounts: {'  QQ  ': '1000000002', Telegram: '@yu'}\n")
-    assert load_instances(tmp_path)[0]["accounts"] == {"qq": "1000000002", "telegram": "@yu"}
+def test_a_declared_platform_wins_over_both_old_writings(tmp_path: Path) -> None:
+    # 新字段在，老字段就是退回旧版时留的备份，不能反过来盖住现在跑的那个。
+    _write(tmp_path, """
+instances:
+  - id: yu
+    platform: telegram
+    account: "@yu"
+    uin: "1000000001"
+    accounts: {qq: "1000000001"}
+""")
+    row = load_instances(tmp_path)[0]
+    assert (row["platform"], row["account"]) == ("telegram", "@yu")
+
+
+def test_an_old_multi_platform_entry_keeps_the_qq_number(tmp_path: Path) -> None:
+    # 改造前能同时挂几个平台的只有 QQ，剩下的是那会儿的遗留。
+    _write(tmp_path, "instances:\n  - id: yu\n    accounts: {telegram: '@yu', '  QQ  ': ' 1000000002 '}\n")
+    row = load_instances(tmp_path)[0]
+    assert (row["platform"], row["account"]) == ("qq", "1000000002")
+
+
+def test_an_old_entry_without_qq_keeps_the_first_platform(tmp_path: Path) -> None:
+    _write(tmp_path, "instances:\n  - id: yu\n    accounts: {telegram: '@yu', wechat: 'w-1'}\n")
+    row = load_instances(tmp_path)[0]
+    assert (row["platform"], row["account"]) == ("telegram", "@yu")
 
 
 @pytest.mark.parametrize("body", [
@@ -286,46 +338,55 @@ def test_account_platform_keys_are_normalised(tmp_path: Path) -> None:
     "accounts: {'': '1000000002'}",
     "accounts: [qq, '1000000002']",
     "accounts: 1000000002",
+    "account: '   '",
+    "platform: '   '",
 ])
 def test_blank_and_malformed_accounts_are_dropped(tmp_path: Path, body: str) -> None:
     _write(tmp_path, f"instances:\n  - id: xiaoyu\n    {body}\n")
-    assert load_instances(tmp_path)[0]["accounts"] == {}
+    row = load_instances(tmp_path)[0]
+    assert (row["platform"], row["account"]) == ("qq", "")
 
 
-@pytest.mark.parametrize("uin,expected", [
-    ("1000000001", {"qq": "1000000001"}),
-    ("  1000000001  ", {"qq": "1000000001"}),
-    ("", {}),
-    (None, {}),
+@pytest.mark.parametrize("entry,expected", [
+    ({"platform": "  QQ  ", "account": " 1000000002 "}, ("qq", "1000000002")),
+    ({"platform": "telegram"}, ("telegram", "")),
+    ({"platform": "telegram", "account": None}, ("telegram", "")),
+    ({"account": " 1000000002 "}, ("qq", "1000000002")),
+    ({"account": "1000000002", "uin": "1000000001"}, ("qq", "1000000002")),
+    ({"account": "1000000002", "accounts": {"telegram": "@yu"}}, ("qq", "1000000002")),
+    ({"uin": "  1000000001  "}, ("qq", "1000000001")),
+    ({"uin": ""}, ("qq", "")),
+    ({"uin": None}, ("qq", "")),
+    ({}, ("qq", "")),
+    ({"accounts": {"qq": 0}}, ("qq", "")),
+    ({"accounts": {"qq": False}}, ("qq", "")),
+    ({"accounts": {None: "1000000002"}}, ("qq", "")),
+    ({"accounts": [("qq", "1000000002")]}, ("qq", "")),
+    # 老 uin 只在没有别的说法时才算数，映射里写出来的那个盖在它上面。
+    ({"uin": "1000000001", "accounts": {"qq": "   "}}, ("qq", "1000000001")),
+    ({"uin": "1000000001", "accounts": {"telegram": "@yu"}}, ("telegram", "@yu")),
 ])
-def test_the_legacy_number_maps_onto_the_qq_platform(uin: object, expected: dict[str, str]) -> None:
-    assert legacy_accounts(uin) == expected
+def test_reading_a_platform_and_account_cleans_both(
+    entry: dict[str, Any], expected: tuple[str, str],
+) -> None:
+    assert _platform_account(entry) == expected
 
 
-def test_cleaning_accounts_does_not_need_a_legacy_number() -> None:
-    # 写入侧没有老 uin 可给，清洗规则却必须和读取侧逐字一样。
-    assert _accounts({"  QQ  ": " 1000000002 ", "Telegram": "@yu"}) == {"qq": "1000000002", "telegram": "@yu"}
+def test_a_qq_row_also_lands_as_a_uin(tmp_path: Path) -> None:
+    # 退回改造前的版本时那边只认 uin，没有它整条会被丢掉，这个实例从清单上消失。
+    save_instance(tmp_path, instance_id="rong", label="主号", idx=0, platform="qq", account="1000000001")
+    assert "uin: '1000000001'" in instances_file(tmp_path).read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("raw", [None, "1000000002", 1000000002, ["qq", "1000000002"], [("qq", "1000000002")]])
-def test_cleaning_a_non_mapping_yields_no_accounts(raw: object) -> None:
-    assert _accounts(raw) == {}
-
-
-@pytest.mark.parametrize("raw", [
-    {"qq": ""}, {"qq": "   "}, {"qq": None}, {"qq": 0}, {"qq": False},
-    {"": "1000000002"}, {"   ": "1000000002"}, {None: "1000000002"},
+@pytest.mark.parametrize("row,expected", [
+    ({"platform": "qq", "account": "1000000001"}, "1000000001"),
+    ({"platform": "qq", "account": ""}, None),
+    ({"platform": "telegram", "account": "@yu"}, None),
 ])
-def test_cleaning_drops_the_pairs_that_would_vanish_on_read(raw: dict[Any, Any]) -> None:
-    assert _accounts(raw) == {}
-
-
-def test_the_legacy_number_is_only_a_default() -> None:
-    # 老 uin 先铺底，写出来的 qq 号盖在它上面；别的平台照常并存。
-    assert _accounts({"qq": "1000000009", "telegram": "@yu"}, "1000000001") == {
-        "qq": "1000000009", "telegram": "@yu",
-    }
-    assert _accounts({"qq": "   "}, "1000000001") == {"qq": "1000000001"}
+def test_only_a_logged_in_qq_row_carries_a_uin(row: dict[str, Any], expected: str | None) -> None:
+    stored = _stored({"id": "yu", "label": "yu", "path": "/i/yu", "idx": 1, **row})
+    assert stored.get("uin") == expected
+    assert list(stored)[:6] == ["id", "label", "path", "idx", "platform", "account"]
 
 
 # ── 账号归属 ───────────────────────────────
@@ -500,6 +561,28 @@ def test_no_prefix_at_all_is_not_the_same_as_an_empty_one(tmp_path: Path) -> Non
     assert account_owner_in(rows, "qq", "1000000001", prefix="") is None
 
 
+def test_the_same_number_on_another_platform_is_not_a_clash(tmp_path: Path) -> None:
+    # 同机可以一边跑 QQ 一边跑别的平台，两边的号可以长得一模一样，不该互相拦着。
+    _write(tmp_path, """
+instances:
+  - id: rong
+    label: 主号
+    path: ""
+    platform: qq
+    account: "1000000001"
+  - id: koki
+    label: 小号
+    path: /i/koki
+    platform: telegram
+    account: "1000000001"
+""")
+    rows = load_instances(tmp_path)
+    for platform_id, expected in (("qq", "rong"), ("telegram", "koki")):
+        owner = account_owner_in(rows, platform_id, "1000000001")
+        assert owner is not None and owner["id"] == expected
+    assert account_owner_in(rows, "wechat", "1000000001") is None
+
+
 # ── 清单写入 ───────────────────────────────
 
 def test_save_sorts_by_index_and_derives_the_path(tmp_path: Path) -> None:
@@ -514,45 +597,52 @@ def test_saving_the_same_name_twice_rewrites_instead_of_duplicating(tmp_path: Pa
     assert len(rows) == 1 and rows[0]["label"] == "新"
 
 
-def test_saving_keeps_the_accounts_already_on_record(tmp_path: Path) -> None:
-    # 重存一遍不该把控制台切过的号抹掉。
-    save_instance(tmp_path, instance_id="rong", label="主号", idx=0, accounts={"qq": "1000000001"})
+def test_saving_defaults_to_a_qq_instance_with_nobody_logged_in(tmp_path: Path) -> None:
     rows = save_instance(tmp_path, instance_id="rong", label="主号", idx=0)
-    assert rows[0]["accounts"] == {"qq": "1000000001"}
+    assert (rows[0]["platform"], rows[0]["account"]) == ("qq", "")
+    assert load_instances(tmp_path)[0] == rows[0]
 
 
-def test_saving_overwrites_only_the_platforms_it_was_given(tmp_path: Path) -> None:
-    save_instance(
-        tmp_path, instance_id="rong", label="主号", idx=0, accounts={"qq": "1000000001", "telegram": "@rong"},
-    )
-    rows = save_instance(tmp_path, instance_id="rong", label="主号", idx=0, accounts={"qq": "1000000009"})
-    assert rows[0]["accounts"] == {"qq": "1000000009", "telegram": "@rong"}
+def test_saving_keeps_the_account_already_on_record(tmp_path: Path) -> None:
+    # 重存一遍不该把控制台切过的号抹掉。
+    save_instance(tmp_path, instance_id="rong", label="主号", idx=0, platform="qq", account="1000000001")
+    rows = save_instance(tmp_path, instance_id="rong", label="主号", idx=0, platform="qq")
+    assert rows[0]["account"] == "1000000001"
 
 
-@pytest.mark.parametrize("accounts", [
-    {"qq": ""}, {"qq": "   "}, {"qq": None}, {"": "1000000001"}, {"   ": "1000000001"},
-    "1000000001", ["qq", "1000000001"],
-])
-def test_saving_never_writes_an_account_that_would_vanish_on_read(tmp_path: Path, accounts: object) -> None:
+def test_switching_platform_drops_the_account_from_the_old_one(tmp_path: Path) -> None:
+    # 留着的话，QQ 号会挂在一个跑 Telegram 的实例名下，冲突检查从此按错的平台拦人。
+    save_instance(tmp_path, instance_id="rong", label="主号", idx=0, platform="qq", account="1000000001")
+    rows = save_instance(tmp_path, instance_id="rong", label="主号", idx=0, platform="telegram")
+    assert (rows[0]["platform"], rows[0]["account"]) == ("telegram", "")
+    assert load_instances(tmp_path)[0] == rows[0]
+
+
+@pytest.mark.parametrize("platform,expected", [("  QQ  ", "qq"), ("", "qq"), ("   ", "qq"), (None, "qq")])
+def test_saving_cleans_the_platform_id(tmp_path: Path, platform: object, expected: str) -> None:
+    rows = save_instance(tmp_path, instance_id="rong", label="主号", idx=0, platform=platform)
+    assert rows[0]["platform"] == expected
+    assert load_instances(tmp_path)[0]["platform"] == expected
+
+
+@pytest.mark.parametrize("account", ["", "   ", "\t\n", None])
+def test_saving_never_writes_an_account_that_would_vanish_on_read(tmp_path: Path, account: object) -> None:
     # 写进去读不出来最坏：调用方以为记上了，冲突检查却看不见这个号。
-    rows = save_instance(tmp_path, instance_id="rong", label="主号", idx=0, accounts=accounts)
-    assert rows[0]["accounts"] == {}
-    assert load_instances(tmp_path)[0]["accounts"] == {}
+    rows = save_instance(tmp_path, instance_id="rong", label="主号", idx=0, account=account)
+    assert rows[0]["account"] == ""
+    assert load_instances(tmp_path)[0]["account"] == ""
 
 
-def test_saving_cleans_the_accounts_it_does_write(tmp_path: Path) -> None:
-    rows = save_instance(
-        tmp_path, instance_id="rong", label="主号", idx=0,
-        accounts={" QQ ": " 1000000001 ", "Telegram": "@rong ", "wechat": "  "},
-    )
-    assert rows[0]["accounts"] == {"qq": "1000000001", "telegram": "@rong"}
-    assert load_instances(tmp_path)[0]["accounts"] == {"qq": "1000000001", "telegram": "@rong"}
+def test_saving_cleans_the_account_it_does_write(tmp_path: Path) -> None:
+    rows = save_instance(tmp_path, instance_id="rong", label="主号", idx=0, account=" 1000000001 ")
+    assert rows[0]["account"] == "1000000001"
+    assert load_instances(tmp_path)[0]["account"] == "1000000001"
 
 
 def test_a_dirty_new_account_does_not_wipe_the_one_on_record(tmp_path: Path) -> None:
-    save_instance(tmp_path, instance_id="rong", label="主号", idx=0, accounts={"qq": "1000000001"})
-    rows = save_instance(tmp_path, instance_id="rong", label="主号", idx=0, accounts={"qq": "   "})
-    assert rows[0]["accounts"] == {"qq": "1000000001"}
+    save_instance(tmp_path, instance_id="rong", label="主号", idx=0, account="1000000001")
+    rows = save_instance(tmp_path, instance_id="rong", label="主号", idx=0, account="   ")
+    assert rows[0]["account"] == "1000000001"
 
 
 @pytest.mark.parametrize("label", ["", "   ", "\t\n", None])
@@ -597,7 +687,7 @@ def test_the_whole_range_is_written_and_read_back_unchanged(tmp_path: Path, idx:
 def test_a_refused_save_does_not_touch_the_roster_it_found(
     tmp_path: Path, instance_id: object, idx: object,
 ) -> None:
-    save_instance(tmp_path, instance_id="koki", label="小号", idx=1, accounts={"qq": "1000000002"})
+    save_instance(tmp_path, instance_id="koki", label="小号", idx=1, account="1000000002")
     path = instances_file(tmp_path)
     before = path.read_bytes()
 
@@ -612,14 +702,14 @@ def test_a_padded_name_is_cleaned_before_it_lands(tmp_path: Path) -> None:
     assert rows[0]["id"] == "rong" and rows[0]["path"] == "/i/rong"
     assert load_instances(tmp_path)[0] == rows[0]
     assert record_account(tmp_path, prefix="/i/rong", platform_id="qq", account="1000000001") is True
-    assert load_instances(tmp_path)[0]["accounts"] == {"qq": "1000000001"}
+    assert load_instances(tmp_path)[0]["account"] == "1000000001"
 
 
 def test_a_padded_name_is_the_same_instance(tmp_path: Path) -> None:
-    save_instance(tmp_path, instance_id="  rong  ", label="旧", idx=1, accounts={"qq": "1000000001"})
+    save_instance(tmp_path, instance_id="  rong  ", label="旧", idx=1, account="1000000001")
     rows = save_instance(tmp_path, instance_id="rong", label="新", idx=1)
     assert [(row["id"], row["path"], row["label"]) for row in rows] == [("rong", "/i/rong", "新")]
-    assert rows[0]["accounts"] == {"qq": "1000000001"}
+    assert rows[0]["account"] == "1000000001"
 
 
 # ── 记下换上的号 ───────────────────────────
@@ -630,12 +720,28 @@ def test_recording_writes_the_new_account_onto_this_instance(tmp_path: Path) -> 
 
     assert record_account(tmp_path, prefix="/i/koki", platform_id="qq", account="1000000002") is True
 
-    rows = {row["id"]: row["accounts"] for row in load_instances(tmp_path)}
-    assert rows == {"rong": {}, "koki": {"qq": "1000000002"}}
+    rows = {row["id"]: (row["platform"], row["account"]) for row in load_instances(tmp_path)}
+    assert rows == {"rong": ("qq", ""), "koki": ("qq", "1000000002")}
+
+
+def test_recording_moves_the_row_onto_the_platform_it_reports(tmp_path: Path) -> None:
+    # 清单里的平台是建实例时声明的，实际在跑的那个才作数，不然冲突检查按错的平台拦人。
+    save_instance(tmp_path, instance_id="koki", label="小号", idx=1, platform="qq", account="1000000002")
+    assert record_account(tmp_path, prefix="/i/koki", platform_id="  Telegram ", account=" @koki ") is True
+    row = load_instances(tmp_path)[0]
+    assert (row["platform"], row["account"]) == ("telegram", "@koki")
+    # 号搬走了，退回旧版用的 uin 不能留在原地。
+    assert "uin" not in instances_file(tmp_path).read_text(encoding="utf-8")
+
+
+def test_recording_the_same_account_on_another_platform_still_rewrites(tmp_path: Path) -> None:
+    save_instance(tmp_path, instance_id="koki", label="小号", idx=1, platform="qq", account="1000000002")
+    assert record_account(tmp_path, prefix="/i/koki", platform_id="telegram", account="1000000002") is True
+    assert load_instances(tmp_path)[0]["platform"] == "telegram"
 
 
 def test_recording_the_same_account_again_does_not_rewrite(tmp_path: Path) -> None:
-    save_instance(tmp_path, instance_id="koki", label="小号", idx=1, accounts={"qq": "1000000002"})
+    save_instance(tmp_path, instance_id="koki", label="小号", idx=1, account="1000000002")
     path = instances_file(tmp_path)
     before = path.read_text(encoding="utf-8")
 
@@ -650,9 +756,7 @@ def test_recording_finds_this_instance_however_the_prefix_is_written(tmp_path: P
     save_instance(tmp_path, instance_id="koki", label="小号", idx=1)
 
     assert record_account(tmp_path, prefix=prefix, platform_id="qq", account="1000000002") is True
-    assert {row["id"]: row["accounts"] for row in load_instances(tmp_path)} == {
-        "rong": {}, "koki": {"qq": "1000000002"},
-    }
+    assert {row["id"]: row["account"] for row in load_instances(tmp_path)} == {"rong": "", "koki": "1000000002"}
 
 
 @pytest.mark.parametrize("prefix", ["", "/", "  ", " / "])
@@ -661,21 +765,19 @@ def test_recording_with_an_empty_prefix_lands_on_the_root_instance(tmp_path: Pat
     save_instance(tmp_path, instance_id="koki", label="小号", idx=1)
 
     assert record_account(tmp_path, prefix=prefix, platform_id="qq", account="1000000001") is True
-    assert {row["id"]: row["accounts"] for row in load_instances(tmp_path)} == {
-        "rong": {"qq": "1000000001"}, "koki": {},
-    }
+    assert {row["id"]: row["account"] for row in load_instances(tmp_path)} == {"rong": "1000000001", "koki": ""}
 
 
 def test_recording_against_a_prefix_nobody_claims_does_nothing(tmp_path: Path) -> None:
     save_instance(tmp_path, instance_id="koki", label="小号", idx=1)
     assert record_account(tmp_path, prefix="/i/nobody", platform_id="qq", account="1000000002") is False
-    assert load_instances(tmp_path)[0]["accounts"] == {}
+    assert load_instances(tmp_path)[0]["account"] == ""
 
 
 def test_recording_a_blank_account_does_nothing(tmp_path: Path) -> None:
     save_instance(tmp_path, instance_id="rong", label="主号", idx=0)
     assert record_account(tmp_path, prefix="", platform_id="qq", account="") is False
-    assert load_instances(tmp_path)[0]["accounts"] == {}
+    assert load_instances(tmp_path)[0]["account"] == ""
 
 
 @pytest.mark.parametrize("platform_id,account", [
@@ -696,19 +798,20 @@ def test_recording_something_that_cleans_to_nothing_leaves_the_file_alone(
 
     assert record_account(tmp_path, prefix="", platform_id=platform_id, account=account) is False
     assert path.read_bytes() == before
-    assert load_instances(tmp_path)[0]["accounts"] == {}
+    assert load_instances(tmp_path)[0]["account"] == ""
 
 
 def test_recording_strips_the_account_before_writing_it(tmp_path: Path) -> None:
     save_instance(tmp_path, instance_id="rong", label="主号", idx=0)
     assert record_account(tmp_path, prefix="", platform_id="qq", account="  1000000001  ") is True
-    assert load_instances(tmp_path)[0]["accounts"] == {"qq": "1000000001"}
+    assert load_instances(tmp_path)[0]["account"] == "1000000001"
 
 
 def test_recording_normalises_the_platform_id(tmp_path: Path) -> None:
     save_instance(tmp_path, instance_id="rong", label="主号", idx=0)
     assert record_account(tmp_path, prefix="", platform_id="  QQ  ", account="1000000001") is True
-    assert load_instances(tmp_path)[0]["accounts"] == {"qq": "1000000001"}
+    assert load_instances(tmp_path)[0]["platform"] == "qq"
+    assert load_instances(tmp_path)[0]["account"] == "1000000001"
 
 
 @pytest.mark.parametrize("platform_id,account", [
@@ -720,7 +823,7 @@ def test_recording_a_value_that_cleans_to_the_current_one_does_not_rewrite(
     tmp_path: Path, platform_id: str, account: str,
 ) -> None:
     # 清洗后再比，否则每次带空白的重登都会重写一遍清单。
-    save_instance(tmp_path, instance_id="koki", label="小号", idx=1, accounts={"qq": "1000000002"})
+    save_instance(tmp_path, instance_id="koki", label="小号", idx=1, account="1000000002")
     path = instances_file(tmp_path)
     before = path.read_bytes()
 

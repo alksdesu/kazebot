@@ -991,7 +991,7 @@ describe('confirmationNote', () => {
 
   it('全局设置自己一套话', () => {
     expect(confirmationNote(FEATURES_SCOPE, 'changed')).toBe('全局文件在保存之后又被改过，请核对当前内容。');
-    expect(confirmationNote(FEATURES_SCOPE, 'unreadable')).toBe('已保存，但暂时读不到全局设置的状态，还不知道各平台换没换上。');
+    expect(confirmationNote(FEATURES_SCOPE, 'unreadable')).toBe('已保存，但暂时读不到全局设置的状态，还不知道 bot 换没换上。');
   });
 });
 

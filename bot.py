@@ -53,12 +53,32 @@ def _bridge_stdlib_logging() -> None:
         target.propagate = False
 
 
+def _require_qq_instance() -> None:
+    """一个实例只跑一个平台。声明的不是 QQ 就别起：两个平台的进程挂在同一个工作区，会话和记忆会混成一份。"""
+    from platforms.builtin import QQ_NAPCAT
+    from platforms.registry import PLATFORM_ENV, UnknownPlatform, current_platform
+    from workspace import CONFIG_ERROR_EXIT_CODE
+
+    try:
+        platform = current_platform()
+    except UnknownPlatform as exc:
+        logging.getLogger(__name__).error("[qq] %s；改 .env 里的 %s 后再启动", exc, PLATFORM_ENV)
+        sys.exit(CONFIG_ERROR_EXIT_CODE)
+    if platform.id != QQ_NAPCAT.id:
+        logging.getLogger(__name__).error(
+            "[qq] 这个实例声明跑的是 %s（%s=%s），bot.py 只接 QQ", platform.display_name, PLATFORM_ENV, platform.id,
+        )
+        sys.exit(CONFIG_ERROR_EXIT_CODE)
+
+
 def main() -> None:
     # 延迟到这里再取：本文件会被单独复制出去做入口冒烟，import 期要求整个仓库在位
     # 就跑不起来。
     from clonoth_runtime import SECRET_FROM_CONFIG, platform_secret, wait_supervisor
     from platforms.builtin import QQ_NAPCAT
     from workspace import resolve_workspace_root
+
+    _require_qq_instance()
 
     # 先等 supervisor。systemd 的 After/BindsTo 只排启动顺序，不等它 ready，而
     # NoneBot 一 run 起来就开始收 QQ 消息 —— 那十几秒里的 submit inbound 全部失败，

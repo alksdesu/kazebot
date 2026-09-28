@@ -32,6 +32,7 @@ from adapters._shared.live_config import (  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 from platforms.descriptor import CHANNEL_GROUP, STATE_LIVE, ChannelDescriptor, PlatformDescriptor  # noqa: E402
 from platforms.registry import (  # noqa: E402
+    PLATFORM_ENV,
     platform_config_path,
     platform_state_path,
     register_platform,
@@ -347,22 +348,24 @@ class TestTaggingLogWording:
             "按QQ · NapCat 的 qq.yaml 老位置（开）",
         ]
 
-    def test_two_platforms_are_listed_together(
+    def test_only_the_platform_this_instance_runs_is_named(
         self, tmp_path: Path, config: LiveConfig, caplog: pytest.LogCaptureFixture, vault: PlatformDescriptor,
     ) -> None:
+        # 换过平台的实例盘上还留着旧平台的快照，报出来就是叫人去改一份早已没人读的配置。
         _publish(tmp_path, QQ_NAPCAT, sticker_auto_tag=(False, SOURCE_ENV))
         _publish(tmp_path, vault, sticker_auto_tag=(False, SOURCE_LEGACY))
 
         assert self._run(tmp_path, config, caplog) == [
             "表情包自动打标关着：features.yaml 没写 extensions.sticker.auto_tag，"
-            "按QQ · NapCat 的环境变量（关）、保险库的 vault.yaml 老位置（关）。"
-            "要打标就在控制台表情包图库页打开，写进全局设置",
+            "按QQ · NapCat 的环境变量（关）。要打标就在控制台表情包图库页打开，写进全局设置",
         ]
 
     def test_a_platform_without_a_config_file_is_named_generically(
-        self, tmp_path: Path, config: LiveConfig, caplog: pytest.LogCaptureFixture, paperless: PlatformDescriptor,
+        self, tmp_path: Path, config: LiveConfig, caplog: pytest.LogCaptureFixture,
+        paperless: PlatformDescriptor, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # 没有配置文件的平台公布不出老位置兜底，这一句只兜住「真碰上了也别把日志打崩」。
+        monkeypatch.setenv(PLATFORM_ENV, paperless.id)
         _publish(tmp_path, paperless, sticker_auto_tag=(False, SOURCE_LEGACY))
 
         assert self._run(tmp_path, config, caplog) == [

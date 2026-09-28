@@ -33,7 +33,7 @@ if str(_REPO_ROOT) not in sys.path:  # 直接 ``python engine/data_cleanup.py`` 
 from engine.memory_namespace import SUBJECT_PREFIX, is_memory_namespace  # noqa: E402
 from platforms.descriptor import HOOK_MAINTENANCE  # noqa: E402
 from platforms.maintenance import SCOPE_WORKSPACE, SCOPES  # noqa: E402
-from platforms.registry import MissingPlatformHook, all_platforms, platform_hook  # noqa: E402
+from platforms.registry import MissingPlatformHook, current_platform, platform_hook  # noqa: E402
 from workspace import resolve_workspace_root  # noqa: E402
 
 # ── Paths ──────────────────────────────────────
@@ -230,28 +230,28 @@ class _CleanupContext:
 
 
 def run_platform_maintenance(scopes: frozenset[str] = CLEANUP_SCOPES["all"]):
-    """各平台自己的定期维护，比如清适配器和平台客户端攒的缓存，由平台描述的 maintenance 钩子给出。
+    """本实例平台自己的定期维护，比如清适配器和平台客户端攒的缓存，由平台描述的 maintenance 钩子给出。
 
+    只跑本实例在跑的那个平台：别的平台的客户端不在这台实例底下，清它的缓存目录清的是别人的东西。
     scopes 之外的不跑，只记一笔，免得日志里看不出那一项去哪了。
     """
     context = _CleanupContext(workspace_root=DATA_DIR.parent, data_dir=DATA_DIR)
-    for platform in all_platforms():
+    platform = current_platform()
+    try:
+        tasks = platform_hook(platform, HOOK_MAINTENANCE).maintenance_tasks()
+    except MissingPlatformHook:
+        return
+    except Exception as exc:
+        logging.error("[%s] maintenance hook unavailable: %s", platform.id, exc)
+        return
+    for task in tasks:
+        if task.scope not in scopes:
+            logging.info("[%s.%s] skipped: %s task, left to the host cleanup", platform.id, task.name, task.scope)
+            continue
         try:
-            tasks = platform_hook(platform, HOOK_MAINTENANCE).maintenance_tasks()
-        except MissingPlatformHook:
-            continue
+            task.run(context)
         except Exception as exc:
-            # 一个平台的模块导不进来，别的平台照样清。
-            logging.error("[%s] maintenance hook unavailable: %s", platform.id, exc)
-            continue
-        for task in tasks:
-            if task.scope not in scopes:
-                logging.info("[%s.%s] skipped: %s task, left to the host cleanup", platform.id, task.name, task.scope)
-                continue
-            try:
-                task.run(context)
-            except Exception as exc:
-                logging.error("[%s.%s] %s", platform.id, task.name, exc)
+            logging.error("[%s.%s] %s", platform.id, task.name, exc)
 
 
 # ── persistent memory entry cleanup ───────────

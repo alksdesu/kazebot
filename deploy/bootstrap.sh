@@ -137,6 +137,8 @@ write_env() {
 # 由 deploy/bootstrap.sh 生成。业务配置请在控制台里改，不要往这里加。
 
 # ── Supervisor ────────────────────────────────
+# 一个实例只跑一个平台
+CLONOTH_PLATFORM=qq
 CLONOTH_HOST=127.0.0.1
 CLONOTH_PORT=$SUP_PORT
 CLONOTH_BASE_URL=http://127.0.0.1:$SUP_PORT

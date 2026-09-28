@@ -21,11 +21,13 @@ import { useSchemaStore } from '../console/schemaStore';
 import {
   adoptPlatforms,
   allPlatforms,
+  currentPlatformId,
   platformRegistryState,
   QQ_NAPCAT,
   resetPlatforms,
   settlePlatforms,
   type PlatformDescriptor,
+  type PlatformRegistryState,
 } from '../platforms/registry';
 import { confirmNavigation } from '../hooks/useUnsavedChanges';
 import { usePlatformRegistry } from '../platforms/usePlatformRegistry';
@@ -110,6 +112,10 @@ function stubBackend(): string[] {
 
 const pathsOf = (seen: readonly string[], leaf: string) => seen.filter((url) => url.endsWith(leaf));
 
+/** 没说本实例跑哪个平台的清单：平台组照旧把整张清单都列出来。 */
+const registry = (platforms: PlatformDescriptor[], settled: boolean): PlatformRegistryState =>
+  ({ platforms, current: null, running: platforms, settled });
+
 beforeEach(() => {
   localStorage.clear();
   window.history.replaceState(null, '', '/');
@@ -186,6 +192,28 @@ describe('从后端拉清单', () => {
     expect(allPlatforms().map((platform) => platform.id)).toEqual(['otherchat']);
   });
 
+  it('后端说本实例跑哪个，平台组就只剩那一个', async () => {
+    useSettingsStore.setState({ adminToken: 'admin-token' });
+    vi.stubGlobal('fetch', vi.fn(async () => json({ platforms: [OTHER_ROW], current: 'otherchat' })));
+
+    render(<Probe />);
+
+    await waitFor(() => expect(platformRegistryState().settled).toBe(true));
+    expect(currentPlatformId()).toBe('otherchat');
+    expect(platformRegistryState().running.map((platform) => platform.id)).toEqual(['otherchat']);
+  });
+
+  it('旧版后端不说跑哪个，整张清单照旧全列', async () => {
+    useSettingsStore.setState({ adminToken: 'admin-token' });
+    vi.stubGlobal('fetch', vi.fn(async () => json({ platforms: [OTHER_ROW] })));
+
+    render(<Probe />);
+
+    await waitFor(() => expect(platformRegistryState().settled).toBe(true));
+    expect(currentPlatformId()).toBeNull();
+    expect(platformRegistryState().running).toEqual(allPlatforms());
+  });
+
   it('拉不到也得停下来 —— 不然深链到的平台页会一直说在读清单', async () => {
     useSettingsStore.setState({ adminToken: 'admin-token' });
     vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 500 })));
@@ -243,15 +271,22 @@ describe('页签解析', () => {
   });
 
   it('给了清单就按给的判，不看眼下这一份', () => {
-    const arrived = resolveSettingsTab('platform-otherchat', { platforms: [QQ_NAPCAT, OTHERCHAT], settled: true });
+    const arrived = resolveSettingsTab('platform-otherchat', registry([QQ_NAPCAT, OTHERCHAT], true));
     expect(arrived).toMatchObject({ pending: false, tab: { id: 'platform-otherchat' } });
 
     adoptPlatforms([QQ_NAPCAT, OTHERCHAT]);
-    const waiting = resolveSettingsTab('platform-otherchat', { platforms: [QQ_NAPCAT], settled: false });
+    const waiting = resolveSettingsTab('platform-otherchat', registry([QQ_NAPCAT], false));
     expect(waiting).toMatchObject({ pending: true, tab: { id: 'general' } });
     // 清单到了也没有这个平台，才是真的解析不出来。
-    expect(resolveSettingsTab('platform-gone', { platforms: [QQ_NAPCAT], settled: true }))
+    expect(resolveSettingsTab('platform-gone', registry([QQ_NAPCAT], true)))
       .toMatchObject({ pending: false, tab: { id: 'general' } });
+  });
+
+  it('本实例不跑的平台页解析不出来 —— 它的页根本不在页签表里', () => {
+    const state = { platforms: [QQ_NAPCAT, OTHERCHAT], current: 'qq', running: [QQ_NAPCAT], settled: true };
+    expect(resolveSettingsTab('platform-otherchat', state))
+      .toMatchObject({ pending: false, tab: { id: 'general' } });
+    expect(resolveSettingsTab('platform-qq', state)).toMatchObject({ pending: false, tab: { id: 'platform-qq' } });
   });
 });
 
@@ -265,6 +300,28 @@ describe('侧栏的「平台」组', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'OtherChat' }));
     expect(useViewStore.getState().activeSettingsTab).toBe('platform-otherchat');
+    expect(screen.getByRole('button', { name: 'QQ · NapCat' })).toBeInTheDocument();
+  });
+
+  it('只列本实例在跑的那个平台 —— 别的平台的页没有 bot 在读', () => {
+    seedConsoleSchemas();
+    render(<SettingsSidebar />);
+
+    act(() => { adoptPlatforms([QQ_NAPCAT, OTHERCHAT], 'otherchat'); });
+
+    expect(screen.getByRole('button', { name: 'OtherChat' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'QQ · NapCat' })).toBeNull();
+    expect(currentSettingsTabs().filter((tab) => tab.group === 'platform').map((tab) => tab.id))
+      .toEqual(['platform-otherchat']);
+  });
+
+  it('后端说的平台不在它自己给的清单里时，宁可多列也不留空组', () => {
+    seedConsoleSchemas();
+    render(<SettingsSidebar />);
+
+    act(() => { adoptPlatforms([QQ_NAPCAT, OTHERCHAT], 'nowhere'); });
+
+    expect(screen.getByRole('button', { name: 'OtherChat' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'QQ · NapCat' })).toBeInTheDocument();
   });
 

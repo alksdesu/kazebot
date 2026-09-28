@@ -34,8 +34,7 @@ from platforms.builtin import QQ_NAPCAT
 from supervisor.provisioning import plan_instance, scaffold
 
 repo = Path(sys.argv[1])
-accounts = {QQ_NAPCAT.id: sys.argv[4]} if sys.argv[4] else None
-plan = plan_instance(repo, instance_id=sys.argv[2], label=sys.argv[3], accounts=accounts)
+plan = plan_instance(repo, instance_id=sys.argv[2], label=sys.argv[3], platform=QQ_NAPCAT, account=sys.argv[4])
 scaffold(plan, repo)
 print(f"    序号 {plan.idx}，supervisor {plan.ports['supervisor']}，工作区 {plan.workspace}")
 PY

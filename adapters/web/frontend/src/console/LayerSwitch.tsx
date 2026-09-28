@@ -35,7 +35,7 @@ export function fallbackText(
   spec: Pick<ConsoleFieldSchema, 'kind' | 'scale' | 'unit'>,
 ): string {
   if (!fallbacks.length) return '';
-  // 统一跑的开关只有一个结果，各平台的兜底只是依据；别的键是每个平台各用各的。
+  // 统一跑的开关只有一个结果，平台的兜底只是依据；别的键就是平台实际用着的值。
   if (central && !central.set_globally) {
     const basis = fallbacks.map((fallback) => fallbackPlace(fallback, fieldValueText(spec, fallback.value)));
     return `实际${central.enabled ? '开着' : '关着'}：${basis.join('、')}`;

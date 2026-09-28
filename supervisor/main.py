@@ -12,6 +12,8 @@ import uvicorn
 from fastapi import FastAPI
 
 from clonoth_runtime import TASK_REAP_INTERVAL_SECONDS, process_workspace
+from platforms.registry import PLATFORM_ENV, UnknownPlatform, current_platform
+from workspace import CONFIG_ERROR_EXIT_CODE
 
 from .api import create_app
 from .instances import url_prefix
@@ -55,6 +57,13 @@ def main() -> None:
 
     # 整个进程的日志都进这份文件，终端留给前台的 TUI。
     log_level = configure_supervisor_logging(log_dir / "supervisor.log", args.log_level)
+
+    # 运行期「本实例在跑什么」处处认这一个值，写错了宁可不起，也别带着一个不存在的平台跑下去。
+    try:
+        current_platform()
+    except UnknownPlatform as exc:
+        _logger.error(f"[supervisor] {exc}；改 .env 里的 {PLATFORM_ENV} 后再启动")
+        sys.exit(CONFIG_ERROR_EXIT_CODE)
 
     # 在做任何状态变更之前，先检查端口是否可用
     # 如果端口被占用就立即退出，不会误删 restart_pending.json 或取消任务

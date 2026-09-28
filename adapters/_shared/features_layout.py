@@ -1,4 +1,4 @@
-"""全平台共用设置在控制台上的布局：全局页的分区，以及平台页拼自己分区时引用的片段。"""
+"""不分平台的设置在控制台上的布局：全局页的分区，以及平台页拼自己分区时引用的片段。"""
 from __future__ import annotations
 
 from .console_schema import (
@@ -180,7 +180,7 @@ FEATURE_SECTIONS = (
         "trigger", "触发时机",
         TRIGGER_CONDITIONS, LLM_INTENT, COOLDOWN,
         icon="timer",
-        note="所有平台默认的开口规则。平台页的「触发时机」可以单独改其中任意一项，试听也在那里。",
+        note="平台页没单独设时的开口规则。平台页的「触发时机」可以单独改其中任意一项，试听也在那里。",
         paths=("trigger",),
     ),
     section(
@@ -224,7 +224,7 @@ FEATURE_SECTIONS = (
         block("发送", grid(fixed("发图", *STICKER_PICKING), STICKER_COMBAT), hint=STICKER_SENDING_HINT),
         STICKER_CANDIDATES,
         icon="mood",
-        note="什么时候把表情包清单摊给模型、怎么挑。收不收、从哪收在各平台页里设。",
+        note="什么时候把表情包清单摊给模型、怎么挑。收不收、从哪收在平台页里设。",
         paths=STICKER_SENDING_PATHS,
     ),
     section(
@@ -252,7 +252,7 @@ FEATURE_SECTIONS = (
             hint="收进来的图怎么进图库、存多少",
         ),
         icon="photo_library",
-        note="全平台共用一份图库，这几项只在这里设，平台页里改不了。",
+        note="这台机器上的实例共用一份图库，这几项只在这里设，平台页里改不了。",
         paths=STICKER_LIBRARY_PATHS,
     ),
 )

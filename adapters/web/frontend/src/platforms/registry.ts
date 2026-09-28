@@ -47,12 +47,28 @@ export const QQ_NAPCAT: PlatformDescriptor = {
 const BUILTIN_PLATFORMS: readonly PlatformDescriptor[] = [QQ_NAPCAT];
 
 export interface PlatformRegistryState {
+  /** 认得的全部平台。认会话键前缀用全表：迁移过来的历史会话可能出自别的平台。 */
   platforms: readonly PlatformDescriptor[];
+  /** 本实例在跑的平台 id。清单还没到、或者旧版后端不给时是 null。 */
+  current: string | null;
+  /** 侧栏平台组要列的平台：知道本实例跑哪个就只列它，不知道就照旧全列。 */
+  running: readonly PlatformDescriptor[];
   /** 后端的清单到了，或者确定拿不到了。到之前认不出的平台页，可能只是清单还在路上。 */
   settled: boolean;
 }
 
-let state: PlatformRegistryState = { platforms: BUILTIN_PLATFORMS, settled: false };
+function runningOf(platforms: readonly PlatformDescriptor[], current: string | null): readonly PlatformDescriptor[] {
+  if (!current) return platforms;
+  const found = platforms.filter((platform) => platform.id === current);
+  // 后端说的平台不在它自己给的清单里，是后端的毛病；宁可多列，也不能让平台组一页都不剩。
+  return found.length ? found : platforms;
+}
+
+function makeState(platforms: readonly PlatformDescriptor[], current: string | null, settled: boolean): PlatformRegistryState {
+  return { platforms, current, running: runningOf(platforms, current), settled };
+}
+
+let state: PlatformRegistryState = makeState(BUILTIN_PLATFORMS, null, false);
 let channelIndex = buildIndex(state.platforms);
 const listeners = new Set<() => void>();
 
@@ -83,6 +99,11 @@ export function platformRegistryState(): PlatformRegistryState {
   return state;
 }
 
+/** 本实例在跑的平台 id，不知道时是 null。 */
+export function currentPlatformId(): string | null {
+  return state.current;
+}
+
 export function subscribePlatforms(listener: () => void): () => void {
   listeners.add(listener);
   return () => {
@@ -91,12 +112,12 @@ export function subscribePlatforms(listener: () => void): () => void {
 }
 
 /** 换上后端公布的清单。空清单一律忽略：认不出通道会让整张会话列表退化成「会话」。 */
-export function adoptPlatforms(rows: readonly PlatformDescriptor[]): void {
+export function adoptPlatforms(rows: readonly PlatformDescriptor[], current: string | null = null): void {
   if (!rows.length) {
     settlePlatforms();
     return;
   }
-  publish({ platforms: rows, settled: true });
+  publish(makeState(rows, current, true));
 }
 
 /** 清单拿不到：接着用内置的那份，但不用再等了。 */
@@ -105,7 +126,7 @@ export function settlePlatforms(): void {
 }
 
 export function resetPlatforms(): void {
-  publish({ platforms: BUILTIN_PLATFORMS, settled: false });
+  publish(makeState(BUILTIN_PLATFORMS, null, false));
 }
 
 /** 接在「适配器进程」后面的入口脚本，写成「（bot.py）」；平台没声明时是空串。 */
