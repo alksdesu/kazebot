@@ -41,11 +41,30 @@ function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
 }
 
-function stub({ namespaces = [] as any[], entries = [] as any[], conversations = [] as any[] } = {}) {
-  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+// 页面上看见的那句由状态码接 detail 拼成。
+const fails = (detail: string) => () =>
+  new Response(JSON.stringify({ detail }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+
+type Reply = (() => Response) | null;
+
+function stub({
+  namespaces = [] as any[],
+  entries = [] as any[],
+  conversations = [] as any[],
+  removed = 0,
+  replies = {} as { overview?: Reply[]; entries?: Reply[] },
+} = {}) {
+  // 总览和条目各读各的，得能单排某一路第几次读的成败：按调用顺序取，null 是这一次照常回。
+  const queued = { overview: [...(replies.overview || [])], entries: [...(replies.entries || [])] };
+  const take = (key: 'overview' | 'entries', body: unknown) =>
+    (queued[key].length ? queued[key].shift() : null)?.() ?? jsonResponse(body);
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
-    if (url.includes('/memory/overview')) return jsonResponse({ namespaces });
-    if (url.includes('/entries')) return jsonResponse({ entries });
+    if (url.includes('/memory/overview')) return take('overview', { namespaces });
+    if (url.includes('/entries')) {
+      return (init?.method || 'GET') === 'GET' ? take('entries', { entries }) : jsonResponse({ entry: {} });
+    }
+    if (url.includes('/admin/config/memory/')) return jsonResponse({ removed });
     if (url.includes('/admin/conversations')) return jsonResponse({ conversations });
     if (url.includes('/platforms/qq/account/scope')) return jsonResponse({ current_scope: '', bot_alive: false });
     return jsonResponse({});
@@ -66,6 +85,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe('翻页条', () => {
@@ -254,5 +274,68 @@ describe('会话上下文', () => {
     await screen.findByText('会话100（历史账号）');
     expect(screen.getByText('当前账号')).toBeInTheDocument();
     expect(screen.getByText('这个号还没有任何会话。')).toBeInTheDocument();
+  });
+});
+
+describe('记忆页的那一句提示', () => {
+  const sources = [namespace(1, '甲群', 'group'), namespace(2, '乙群', 'group')];
+
+  const addEntry = async () => {
+    await waitFor(() => expect(screen.getByLabelText('内容')).toBeEnabled());
+    fireEvent.change(screen.getByLabelText('标识'), { target: { value: 'note_1' } });
+    fireEvent.change(screen.getByLabelText('内容'), { target: { value: '记一笔' } });
+    fireEvent.click(screen.getByRole('button', { name: '添加' }));
+  };
+
+  it('条目那一路读失败，换一份读成功就不再报那句', async () => {
+    stub({ namespaces: sources, replies: { entries: [fails('条目读不回来')] } });
+    render(<MemoryPage />);
+
+    await pickSource('甲群');
+    expect(await screen.findByText('503 条目读不回来')).toBeInTheDocument();
+
+    await pickSource('乙群');
+
+    await waitFor(() => expect(screen.queryByText('503 条目读不回来')).toBeNull());
+  });
+
+  it('「已添加」不被紧跟那次重读的失败盖掉，两路的原因各接一句', async () => {
+    stub({
+      namespaces: sources,
+      replies: { entries: [null, fails('条目读不回来')], overview: [null, fails('总览读不回来')] },
+    });
+    render(<MemoryPage />);
+    await pickSource('甲群');
+
+    await addEntry();
+
+    expect(await screen.findByText('已添加。503 条目读不回来。503 总览读不回来')).toBeInTheDocument();
+  });
+
+  it('「已清空 N 条」不被紧跟那次重读的失败盖掉，合成一句', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    stub({ namespaces: sources, removed: 7, replies: { overview: [null, fails('总览读不回来')] } });
+    render(<MemoryPage />);
+    await pickSource('甲群');
+    await waitFor(() => expect(screen.getByRole('button', { name: '清空' })).toBeEnabled());
+
+    fireEvent.click(screen.getByRole('button', { name: '清空' }));
+
+    expect(await screen.findByText('已清空 7 条。503 总览读不回来')).toBeInTheDocument();
+  });
+
+  it('点另一个来源：操作结果和条目那一路的失败都清掉，总览那一路的留着', async () => {
+    stub({
+      namespaces: sources,
+      replies: { entries: [null, fails('条目读不回来'), null], overview: [null, fails('总览读不回来')] },
+    });
+    render(<MemoryPage />);
+    await pickSource('甲群');
+    await addEntry();
+    await screen.findByText('已添加。503 条目读不回来。503 总览读不回来');
+
+    await pickSource('乙群');
+
+    expect(await screen.findByText('503 总览读不回来')).toBeInTheDocument();
   });
 });

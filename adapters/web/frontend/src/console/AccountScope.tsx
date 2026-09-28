@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from 'react';
 
 import { getAccountScope, migrateAccountScope, type ScopeStatus, type ScopeStoreCount } from '../api/supervisorClient';
+import { usePageNotice } from '../hooks/usePageNotice';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Button, Footnote, Input } from './components';
 import { usePlatform } from './platformContext';
@@ -28,7 +29,7 @@ export const AccountScope = () => {
   const platformId = usePlatform().id;
   const [status, setStatus] = useState<ScopeStatus | null>(null);
   const [target, setTarget] = useState('');
-  const [note, setNote] = useState('');
+  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [busy, setBusy] = useState(false);
   const [previewTarget, setPreviewTarget] = useState('');
   const requestVersion = useRef(0);
@@ -43,7 +44,8 @@ export const AccountScope = () => {
       if (version !== requestVersion.current) return;
       setStatus(result);
       setPreviewTarget(withTarget);
-    } catch (error) { if (version === requestVersion.current) setNote(say(error)); }
+      setLoadError('');
+    } catch (error) { if (version === requestVersion.current) setLoadError(say(error)); }
     finally { if (version === requestVersion.current) setBusy(false); }
   };
 
@@ -51,7 +53,7 @@ export const AccountScope = () => {
 
   const preview = async (source?: string) => {
     if (busy || !target.trim()) return;
-    setNote('');
+    clearNotice();
     await load(target.trim(), source);
   };
 
@@ -65,9 +67,9 @@ export const AccountScope = () => {
     try {
       // 按预览认定的源账号搬：预览之后盘上多出别的账号的会话，也不会换成搬另一批。
       const result = await migrateAccountScope(adminToken, platformId, to, from);
-      setNote(`已搬迁 ${result.moved_memory_dirs} 份记忆、${result.sessions_changed} 个会话。备份在 ${result.backup_dir}`);
+      setMessage(`已搬迁 ${result.moved_memory_dirs} 份记忆、${result.sessions_changed} 个会话。备份在 ${result.backup_dir}`);
       await load();
-    } catch (error) { setNote(say(error)); } finally { setBusy(false); }
+    } catch (error) { setMessage(say(error)); } finally { setBusy(false); }
   };
 
   const current = previewTarget && previewTarget === target.trim();
@@ -154,7 +156,7 @@ export const AccountScope = () => {
           )}
         </div>
       )}
-      {note && <Footnote>{note}</Footnote>}
+      {notice && <Footnote>{notice}</Footnote>}
     </Block>
   );
 };

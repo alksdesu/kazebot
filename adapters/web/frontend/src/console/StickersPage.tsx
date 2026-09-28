@@ -15,8 +15,9 @@ import {
   type StickerCounts,
   type StickerState,
 } from '../api/supervisorClient';
+import { usePageNotice } from '../hooks/usePageNotice';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
-import { useSettingsStore } from '../store/settingsStore';
+import { tokenChanged, useSettingsStore } from '../store/settingsStore';
 import {
   Block,
   Button,
@@ -85,7 +86,7 @@ const LibraryBlock = () => {
   const [draft, setDraft] = useState(EMPTY_DRAFT);
   const [editBaseline, setEditBaseline] = useState('');
   const [onlyFailed, setOnlyFailed] = useState(false);
-  const [note, setNote] = useState('');
+  const { notice, setMessage, setLoadError } = usePageNotice();
   const [busy, setBusy] = useState(false);
 
   const [file, setFile] = useState<File | null>(null);
@@ -94,6 +95,8 @@ const LibraryBlock = () => {
   const [importPath, setImportPath] = useState('');
   const [importAccept, setImportAccept] = useState(false);
   const filePicker = useRef<HTMLInputElement>(null);
+  // 切页签、翻页、搜索接连触发时只认最后发出的那次，慢回来的旧结果不能盖掉眼前这一页。
+  const generation = useRef(0);
 
   const confirmDiscard = useUnsavedChanges(
     editing !== '' && JSON.stringify(draft) !== editBaseline,
@@ -102,16 +105,19 @@ const LibraryBlock = () => {
 
   const load = async () => {
     if (!adminToken) return;
+    const version = ++generation.current;
     try {
       const page = await listStickers(adminToken, {
         state: tab, search, limit: PAGE_SIZE, offset,
       });
+      if (version !== generation.current) return;
       setItems(page.items);
       setCounts(page.counts);
-    } catch (error) { setNote(say(error)); }
+      setLoadError('');
+    } catch (error) { if (version === generation.current) setLoadError(say(error)); }
   };
 
-  useEffect(() => { void load(); }, [adminToken, tab, search, offset]);
+  useEffect(() => { void load(); return () => { generation.current += 1; }; }, [adminToken, tab, search, offset]);
 
   // 每敲一个字查一次会让 LIKE 全表扫打满，停手再查。
   useEffect(() => {
@@ -127,13 +133,16 @@ const LibraryBlock = () => {
   const run = async (job: (token: string) => Promise<string>) => {
     if (!adminToken || busy) return;
     setBusy(true);
-    setNote('');
+    setMessage('');
     try {
       const done = await job(adminToken);
+      if (tokenChanged(adminToken)) return;
       await load();
-      setNote(done);
+      if (tokenChanged(adminToken)) return;
+      setMessage(done);
     } catch (error) {
-      setNote(say(error));
+      if (tokenChanged(adminToken)) return;
+      setMessage(say(error));
     } finally {
       setBusy(false);
     }
@@ -338,7 +347,7 @@ const LibraryBlock = () => {
         )}
 
         <Pager offset={offset} onOffset={setOffset} pageSize={PAGE_SIZE} total={total} unit="张" />
-        {note && <Footnote>{note}</Footnote>}
+        {notice && <Footnote>{notice}</Footnote>}
       </Block>
 
       <Block hint="上传和导入都是立刻写入" title="添加">

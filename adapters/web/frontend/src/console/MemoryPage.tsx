@@ -1,5 +1,6 @@
 // 长期记忆与会话上下文。这一页直接对文件动手，改动立即生效。
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { usePageNotice } from '../hooks/usePageNotice';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
 import {
@@ -68,7 +69,7 @@ const MemoryBlock = () => {
   const [selected, setSelected] = useState('');
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
   const [draft, setDraft] = useState(EMPTY_DRAFT);
-  const [note, setNote] = useState('');
+  const { notice, setMessage, setLoadError } = usePageNotice();
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
   const [overviewLoading, setOverviewLoading] = useState(true);
@@ -86,19 +87,19 @@ const MemoryBlock = () => {
   const loadOverview = async () => {
     if (!adminToken) return;
     setOverviewLoading(true);
-    try { setNamespaces(await getMemoryOverview(adminToken)); } catch (error) { setNote(say(error)); } finally { setOverviewLoading(false); }
+    try { setNamespaces(await getMemoryOverview(adminToken)); setLoadError('', 'overview'); } catch (error) { setLoadError(say(error), 'overview'); } finally { setOverviewLoading(false); }
   };
 
   const loadEntries = async (namespace: string) => {
     const version = ++entryVersion.current;
-    if (!adminToken || !namespace) { setEntries([]); return; }
+    if (!adminToken || !namespace) { setEntries([]); setLoadError('', 'entries'); return; }
     setLoading(true);
     try {
       const result = await getMemoryEntries(adminToken, namespace);
       if (version !== entryVersion.current || selectedRef.current !== namespace) return;
-      setEntries(result); setEntriesScope(namespace);
+      setEntries(result); setEntriesScope(namespace); setLoadError('', 'entries');
     } catch (error) {
-      if (version === entryVersion.current && selectedRef.current === namespace) setNote(say(error));
+      if (version === entryVersion.current && selectedRef.current === namespace) setLoadError(say(error), 'entries');
     } finally {
       if (version === entryVersion.current) setLoading(false);
     }
@@ -138,7 +139,7 @@ const MemoryBlock = () => {
   const submit = async () => {
     if (!adminToken || !selected || busy || loading || entriesScope !== selected) return;
     setBusy(true);
-    setNote('');
+    setMessage('');
     try {
       await saveMemoryEntry(adminToken, selected, {
         id: draft.id.trim(),
@@ -149,9 +150,9 @@ const MemoryBlock = () => {
       setDraft(EMPTY_DRAFT);
       await loadEntries(selected);
       await loadOverview();
-      setNote('已添加');
+      setMessage('已添加');
     } catch (error) {
-      setNote(say(error));
+      setMessage(say(error));
     } finally {
       setBusy(false);
     }
@@ -164,7 +165,7 @@ const MemoryBlock = () => {
       await deleteMemoryEntry(adminToken, selected, entry.book, entry.id);
       await loadEntries(selected);
       await loadOverview();
-    } catch (error) { setNote(say(error)); } finally { setBusy(false); }
+    } catch (error) { setMessage(say(error)); } finally { setBusy(false); }
   };
 
   const clearAll = async () => {
@@ -176,13 +177,13 @@ const MemoryBlock = () => {
       setSelected('');
       setDraft(EMPTY_DRAFT);
       await loadOverview();
-      setNote(`已清空 ${removed} 条`);
-    } catch (error) { setNote(say(error)); } finally { setBusy(false); }
+      setMessage(`已清空 ${removed} 条`);
+    } catch (error) { setMessage(say(error)); } finally { setBusy(false); }
   };
 
   return (
     <Block hint="模型聊天时自己攒下来的。手动加的不会被自动清理" title="长期记忆">
-      {overviewLoading ? <Empty>正在读取记忆来源…</Empty> : namespaces.length === 0 && <Empty>{note || '还没有任何记忆。'}</Empty>}
+      {overviewLoading ? <Empty>正在读取记忆来源…</Empty> : namespaces.length === 0 && <Empty>{notice || '还没有任何记忆。'}</Empty>}
       <div className="grid grid-cols-1 items-start gap-3.5 md:grid-cols-[var(--duties-split-columns)]">
         <div className="flex flex-col gap-1">
           <Input
@@ -203,7 +204,7 @@ const MemoryBlock = () => {
                 disabled={busy}
                 aria-current={selected === row.key ? 'true' : undefined}
                 className="flex w-full items-baseline gap-2 border border-[var(--duties-border)] bg-[var(--duties-panel)] px-2.5 py-1.5 text-left text-xs hover:bg-[var(--duties-muted)] aria-[current=true]:border-[var(--duties-text)] aria-[current=true]:bg-[var(--duties-muted)]"
-                onClick={() => { if (row.key !== selected && confirmDiscard()) { setEntries([]); setEntriesScope(''); setDraft(EMPTY_DRAFT); setNote(''); setSelected(row.key); } }}
+                onClick={() => { if (row.key !== selected && confirmDiscard()) { setEntries([]); setEntriesScope(''); setDraft(EMPTY_DRAFT); setMessage(''); setLoadError('', 'entries'); setSelected(row.key); } }}
                 type="button"
               >
                 <span className="min-w-0 flex-1 truncate">{row.owner.label}</span>
@@ -308,7 +309,7 @@ const MemoryBlock = () => {
           )}
         </div>
       </div>
-      {note && <Footnote>{note}</Footnote>}
+      {notice && <Footnote>{notice}</Footnote>}
     </Block>
   );
 };

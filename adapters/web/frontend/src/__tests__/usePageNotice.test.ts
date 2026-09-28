@@ -69,4 +69,97 @@ describe('usePageNotice', () => {
     expect(result.current.setLoadError).toBe(first.setLoadError);
     expect(result.current.clearNotice).toBe(first.clearNotice);
   });
+
+  it('两路各记各的，一路读成功不抹掉另一路的失败', () => {
+    const { result } = renderHook(() => usePageNotice());
+
+    act(() => { result.current.setLoadError('503 总览读不回来', 'overview'); });
+    act(() => { result.current.setLoadError('500 条目读不回来', 'entries'); });
+    act(() => { result.current.setLoadError('', 'entries'); });
+
+    expect(result.current.notice).toBe('503 总览读不回来');
+  });
+
+  it('几路的失败按写下的先后接在操作结果后面', () => {
+    const { result } = renderHook(() => usePageNotice());
+
+    act(() => { result.current.setLoadError('503 总览读不回来', 'overview'); });
+    act(() => { result.current.setLoadError('500 条目读不回来', 'entries'); });
+    act(() => { result.current.setMessage('已添加'); });
+
+    expect(result.current.notice).toBe('已添加。503 总览读不回来。500 条目读不回来');
+  });
+
+  it('两路报的是同一句就只说一遍', () => {
+    const { result } = renderHook(() => usePageNotice());
+
+    act(() => { result.current.setLoadError('503 后台连不上', 'overview'); });
+    act(() => { result.current.setLoadError('503 后台连不上', 'entries'); });
+
+    expect(result.current.notice).toBe('503 后台连不上');
+  });
+
+  it('手动刷新把几路的失败一起清掉', () => {
+    const { result } = renderHook(() => usePageNotice());
+
+    act(() => { result.current.setMessage('已添加'); });
+    act(() => { result.current.setLoadError('503 总览读不回来', 'overview'); });
+    act(() => { result.current.setLoadError('500 条目读不回来', 'entries'); });
+    act(() => { result.current.clearNotice(); });
+
+    expect(result.current.notice).toBe('');
+  });
+
+  it('分开记之后三个写入口的引用照样不变', () => {
+    const { result } = renderHook(() => usePageNotice());
+    const first = result.current;
+
+    act(() => { result.current.setLoadError('503 总览读不回来', 'overview'); });
+    act(() => { result.current.setLoadError('500 条目读不回来', 'entries'); });
+
+    expect(result.current.setMessage).toBe(first.setMessage);
+    expect(result.current.setLoadError).toBe(first.setLoadError);
+    expect(result.current.clearNotice).toBe(first.clearNotice);
+  });
+
+  it('同一路重复报同一句不重渲染', () => {
+    // 没重渲染时 result.current 还是上一次那个对象。
+    const { result } = renderHook(() => usePageNotice());
+
+    act(() => { result.current.setLoadError('503 总览读不回来', 'overview'); });
+    const settled = result.current;
+    act(() => { result.current.setLoadError('503 总览读不回来', 'overview'); });
+
+    expect(result.current).toBe(settled);
+  });
+
+  it('轮询一路读成功，一遍遍报空也不重渲染', () => {
+    const { result } = renderHook(() => usePageNotice());
+
+    act(() => { result.current.setLoadError('', 'overview'); });
+    const settled = result.current;
+    act(() => { result.current.setLoadError('', 'overview'); });
+
+    expect(result.current).toBe(settled);
+  });
+
+  it('一路头一回就报空，也不白渲染一遍', () => {
+    // 这一路还没记过任何东西，和「读成功」说的是同一件事，不该为它新建一份。
+    const { result } = renderHook(() => usePageNotice());
+    const fresh = result.current;
+
+    act(() => { result.current.setLoadError('', 'entries'); });
+
+    expect(result.current).toBe(fresh);
+    expect(result.current.notice).toBe('');
+  });
+
+  it('头一回报空之后，真出了错照样报得出来', () => {
+    const { result } = renderHook(() => usePageNotice());
+
+    act(() => { result.current.setLoadError('', 'entries'); });
+    act(() => { result.current.setLoadError('500 条目读不回来', 'entries'); });
+
+    expect(result.current.notice).toBe('500 条目读不回来');
+  });
 });
