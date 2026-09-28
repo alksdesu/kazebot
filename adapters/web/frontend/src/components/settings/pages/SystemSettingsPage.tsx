@@ -5,13 +5,13 @@ import { usePageNotice } from '../../../hooks/usePageNotice';
 // restart. How: combine existing health/admin endpoints with guarded action buttons
 // and a 15-second status refresh. Purpose: high-impact system controls stay visible
 // while still requiring admin auth and restart confirmation.
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { ActiveTasksModal } from '../../dashboard/ActiveTasksModal';
 
 import { checkHealth, getAdminState, reloadConfig, restartEngine, type AdminState, type HealthState } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
-import { useSettingsStore } from '../../../store/settingsStore';
+import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { countActiveTasks, formatUptime, restartRefusal } from '../../../utils/systemStatus';
 import { Block, Button, PageShell, StatusText } from './settingsControls';
 
@@ -30,7 +30,13 @@ const Stat = ({ label, value, detail, onClick }: { label: string; value: string 
   return <div className={cls}>{content}</div>;
 };
 
+// 换了登录整页重来：上一个会话留下的提示和在途的读取都不带进新会话。
 export const SystemSettingsPage = () => {
+  const token = useSettingsStore((state) => state.adminToken);
+  return <SystemSettingsPageBody key={token || ''} />;
+};
+
+const SystemSettingsPageBody = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const [adminState, setAdminState] = useState<AdminState | null>(null);
   const [health, setHealth] = useState<HealthState | null>(null);
@@ -39,6 +45,8 @@ export const SystemSettingsPage = () => {
   const { busy, run } = useExclusiveAction();
   const [activeTasksOpen, setActiveTasksOpen] = useState(false);
   const addSystemLog = useSettingsSelectionStore(state => state.addSystemLog);
+  // 轮询和重载配置后的重读会撞在一起，只认最后发出的那次。
+  const generation = useRef(0);
 
   // 只记重载与重启，15 秒一次的状态轮询失败不进操作日志。
   const report = useCallback((text: string) => {
@@ -48,13 +56,16 @@ export const SystemSettingsPage = () => {
 
   const load = useCallback(async (showSpinner = true) => {
     if (!adminToken || !isAuthenticated) return;
+    const version = ++generation.current;
     if (showSpinner) setLoading(true);
     try {
       const [state, healthState] = await Promise.all([getAdminState(adminToken), checkHealth()]);
+      if (version !== generation.current) return;
       setAdminState(state);
       setHealth(healthState);
       setLoadError('');
     } catch (error) {
+      if (version !== generation.current) return;
       setLoadError(error instanceof Error ? error.message : '加载系统状态失败');
     } finally {
       if (showSpinner) setLoading(false);
@@ -75,7 +86,7 @@ export const SystemSettingsPage = () => {
     // operators keep this tab open. How: run a quiet refresh without replacing the
     // manual button with a spinner. Purpose: the status cards remain current.
     const timer = window.setInterval(() => { void load(false); }, 15000);
-    return () => window.clearInterval(timer);
+    return () => { window.clearInterval(timer); generation.current += 1; };
   }, [adminToken, isAuthenticated, load]);
 
   const engineInfo = useMemo(() => {
@@ -95,9 +106,11 @@ export const SystemSettingsPage = () => {
     if (!adminToken) return;
     try {
       await reloadConfig(adminToken);
+      if (tokenChanged(adminToken)) return;
       report('配置已重载');
       await load(false);
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       report(error instanceof Error ? error.message : '配置重载失败');
     }
   });
@@ -106,9 +119,11 @@ export const SystemSettingsPage = () => {
     if (!window.confirm('确认要重启引擎吗？运行中的任务会全部中断，调度器与本页面的连接不受影响。')) return;
     try {
       const result = await restartEngine(adminToken);
+      if (tokenChanged(adminToken)) return;
       // 没说排上就当没排上：报成功会让人白等。
       report(result?.scheduled ? '已请求重启引擎' : `未能重启：${restartRefusal(result)}`);
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       report(error instanceof Error ? error.message : '重启失败');
     }
   });

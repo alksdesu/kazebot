@@ -6,11 +6,11 @@ import { usePageNotice } from '../../../hooks/usePageNotice';
 // list configured nodes, support template-based creation and deletion, and keep the
 // raw YAML editor in the independent Settings right panel. Purpose: the center page
 // stays focused on selection and operations while the right rail owns editing.
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { createNode, deleteNode, getNodes, type AdminNode } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
-import { useSettingsStore } from '../../../store/settingsStore';
+import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { describeEnvRef } from '../../../utils/envRef';
 import { Block, Button, Field, Input, PageShell, Select, StatusText } from './settingsControls';
 
@@ -37,19 +37,23 @@ export const AgentsSettingsPage = () => {
   const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const { busy, run } = useExclusiveAction();
+  const generation = useRef(0);
 
   const loadNodes = async () => {
     if (!adminToken || !isAuthenticated) return;
+    const version = ++generation.current;
     setLoading(true);
     try {
       const items = await getNodes(adminToken);
+      if (version !== generation.current) return;
       setNodes(items);
       if (selectedNode && !items.some((item) => item.id === selectedNode.id)) setSelectedNode(null);
       setLoadError('');
     } catch (error) {
+      if (version !== generation.current) return;
       setLoadError(error instanceof Error ? error.message : '加载节点失败');
     } finally {
-      setLoading(false);
+      if (version === generation.current) setLoading(false);
     }
   };
 
@@ -59,7 +63,7 @@ export const AgentsSettingsPage = () => {
     await loadNodes();
   };
 
-  useEffect(() => { void refresh(); }, [adminToken, isAuthenticated]);
+  useEffect(() => { void refresh(); return () => { generation.current += 1; }; }, [adminToken, isAuthenticated]);
 
   useEffect(() => {
     // [2026-06-02] Refresh the list after the right panel saves raw YAML. Why: the
@@ -78,11 +82,14 @@ export const AgentsSettingsPage = () => {
     if (!confirmNavigation()) return;
     try {
       await createNode(adminToken, { id, content: nodeTemplate(id, template) });
+      if (tokenChanged(adminToken)) return;
       setNewId('');
       setMessage('节点已创建，请在右栏继续编辑 YAML。');
       await loadNodes();
+      if (tokenChanged(adminToken)) return;
       setSelectedNode({ id, name: id, type: template === 'tool' ? 'tool' : 'ai', model: '', description: '通过设置页面创建的节点。', delegate_targets: [] } as AdminNode);
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(error instanceof Error ? error.message : '创建节点失败');
     }
   });
@@ -92,10 +99,12 @@ export const AgentsSettingsPage = () => {
     if (!confirmNavigation()) return;
     try {
       await deleteNode(adminToken, selectedNode.id);
+      if (tokenChanged(adminToken)) return;
       setSelectedNode(null);
       setMessage('节点已删除');
       await loadNodes();
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(error instanceof Error ? error.message : '删除节点失败');
     }
   });

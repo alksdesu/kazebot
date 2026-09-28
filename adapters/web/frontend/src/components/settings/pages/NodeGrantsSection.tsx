@@ -1,7 +1,7 @@
 // 节点授权：这个节点自己能调哪些工具。
 // 勾选一律表示「能调用」。底下 allowlist 存 allow、all 存 deny，含义正相反，
 // 让复选框直接绑名单，同一个勾在两种模式下就是两个意思 —— 点一次「全选」能把工具全关掉。
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
 import {
   getAllToolNames,
@@ -18,7 +18,7 @@ import {
   upsertYamlNested,
 } from '../../../console/nodeYaml';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
-import { useSettingsStore } from '../../../store/settingsStore';
+import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskLabel } from '../../../utils/toolRisk';
 import { Block, Button, Check, Empty, ErrorText, Facts, Footnote, Input, Item, ItemTitle, List, SaveBar, Segmented, StatusText, Tag } from './settingsControls';
 
@@ -257,20 +257,24 @@ const NodeRow = ({ node, tools, onSaved }: {
     setMessage('');
     try {
       const raw = await getNodeRaw(adminToken, node.id);
+      if (tokenChanged(adminToken)) return;
       let next = upsertYamlNested(raw, ['tool_access', 'mode'], mode);
       if (mode === 'allowlist') next = upsertYamlList(next, ['tool_access', 'allow'], allow);
       if (mode === 'all') next = upsertYamlList(next, ['tool_access', 'deny'], deny);
       await updateNodeRaw(adminToken, node.id, next);
+      if (tokenChanged(adminToken)) return;
       setMessage('已保存，下一个任务即生效');
       onSaved();
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(
         error instanceof NodeYamlShapeError
           ? `${error.message}（请到「节点文件」页改原文）`
           : error instanceof Error ? error.message : '保存失败',
       );
+    } finally {
+      setBusy(false);
     }
-    setBusy(false);
   };
 
   const delegates = node.delegate_targets?.length || 0;
@@ -376,24 +380,28 @@ export const NodeGrantsSection = () => {
   const [nodes, setNodes] = useState<AdminNode[]>([]);
   const [tools, setTools] = useState<string[]>([]);
   const [message, setMessage] = useState('');
+  // 每行保存完都会重读；两行接连保存时先发的那次慢回来，会把后存的那行打回保存前的样子。
+  const generation = useRef(0);
 
   const load = async () => {
     if (!adminToken || !isAuthenticated) return;
+    const version = ++generation.current;
     try {
       const [nodeList, toolNames] = await Promise.all([
         getNodes(adminToken),
         getAllToolNames(adminToken),
       ]);
+      if (version !== generation.current) return;
       // 模板和示例文件派发不到，摆在授权页里只会让人配一份永远不生效的权限。
       setNodes(nodeList.filter((node) => node.active !== false));
       setTools(toolNames);
       setMessage('');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '读取节点失败');
+      if (version === generation.current) setMessage(error instanceof Error ? error.message : '读取节点失败');
     }
   };
 
-  useEffect(() => { void load(); }, [adminToken, isAuthenticated]);
+  useEffect(() => { void load(); return () => { generation.current += 1; }; }, [adminToken, isAuthenticated]);
 
   return (
     <Block frame="boxed"

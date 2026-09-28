@@ -5,12 +5,12 @@ import { useExclusiveAction } from '../../../hooks/useExclusiveAction';
 // How: list parsed skill metadata and support create/delete actions here, while the
 // full frontmatter form and Markdown editor live in the Settings right panel. Purpose:
 // skill maintenance is split into a clean list and a focused editor.
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { createSkill, deleteSkill, getSkills, type AdminSkill } from '../../../api/supervisorClient';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
-import { useSettingsStore } from '../../../store/settingsStore';
+import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
 
 function defaultSkillMarkdown(name: string): string {
@@ -33,19 +33,23 @@ export const SkillsSettingsPage = () => {
   const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const { busy, run } = useExclusiveAction();
+  const generation = useRef(0);
 
   const load = async () => {
     if (!adminToken || !isAuthenticated) return;
+    const version = ++generation.current;
     setLoading(true);
     try {
       const items = await getSkills(adminToken);
+      if (version !== generation.current) return;
       setSkills(items);
       if (selectedSkill && !items.some((item) => item.name === selectedSkill.name)) setSelectedSkill(null);
       setLoadError('');
     } catch (error) {
+      if (version !== generation.current) return;
       setLoadError(error instanceof Error ? error.message : '加载技能失败');
     } finally {
-      setLoading(false);
+      if (version === generation.current) setLoading(false);
     }
   };
 
@@ -55,7 +59,7 @@ export const SkillsSettingsPage = () => {
     await load();
   };
 
-  useEffect(() => { void refresh(); }, [adminToken, isAuthenticated]);
+  useEffect(() => { void refresh(); return () => { generation.current += 1; }; }, [adminToken, isAuthenticated]);
 
   useEffect(() => {
     // [2026-06-02] Refresh parsed skill metadata after the right-panel editor saves.
@@ -74,11 +78,14 @@ export const SkillsSettingsPage = () => {
     if (!confirmNavigation()) return;
     try {
       await createSkill(adminToken, { id: name, content: defaultSkillMarkdown(name) });
+      if (tokenChanged(adminToken)) return;
       setNewName('');
       setMessage('技能已创建，请在右栏编辑 frontmatter 和正文。');
       await load();
+      if (tokenChanged(adminToken)) return;
       setSelectedSkill({ name, description: '通过设置页面创建的技能。', enabled: true, strategy: 'normal', keywords: [] });
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(error instanceof Error ? error.message : '创建技能失败');
     }
   });
@@ -88,10 +95,12 @@ export const SkillsSettingsPage = () => {
     if (!confirmNavigation()) return;
     try {
       await deleteSkill(adminToken, selectedSkill.name);
+      if (tokenChanged(adminToken)) return;
       setSelectedSkill(null);
       setMessage('技能已删除');
       await load();
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(error instanceof Error ? error.message : '删除技能失败');
     }
   });

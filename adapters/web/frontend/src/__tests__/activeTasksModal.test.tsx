@@ -35,6 +35,18 @@ const task = (over: Partial<ActiveTask> = {}): ActiveTask => ({
 
 const noop = () => {};
 
+const OTHER_TOKEN = 'another-admin-token';
+
+/** fetchActiveTasks 每一次用的 token，按调用先后排。 */
+const taskTokens = (): (string | undefined)[] => vi.mocked(fetchActiveTasks).mock.calls.map(([token]) => token);
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((ok, fail) => { resolve = ok; reject = fail; });
+  return { promise, resolve, reject };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   useSettingsStore.setState({ adminToken: 'admin-token' });
@@ -116,5 +128,74 @@ describe('活跃任务弹窗的提示', () => {
 
     await tick();
     expect(screen.queryByText('活跃任务刷新失败。')).not.toBeInTheDocument();
+  });
+});
+
+describe('取消完发现换了人', () => {
+  /** 换人登录：取消还没回来就改掉 store 里的 token。 */
+  const swapToken = () => act(async () => { useSettingsStore.setState({ adminToken: OTHER_TOKEN }); });
+
+  it('取消成功也不拿旧 token 再刷一次列表', async () => {
+    const slow = deferred<void>();
+    vi.mocked(cancelTask).mockReturnValueOnce(slow.promise);
+    await open();
+
+    await clickCancel();
+    await swapToken();
+    // 这一次是换人之后重挂轮询自己读的。
+    expect(taskTokens()).toEqual(['admin-token', OTHER_TOKEN]);
+
+    await act(async () => { slow.resolve(); });
+
+    expect(cancelTask).toHaveBeenCalledWith('admin-token', TASK_ID);
+    expect(taskTokens()).toEqual(['admin-token', OTHER_TOKEN]);
+  });
+
+  it('取消失败也不把原因写到新会话的弹窗上', async () => {
+    const slow = deferred<void>();
+    vi.mocked(cancelTask).mockReturnValueOnce(slow.promise);
+    await open();
+
+    await clickCancel();
+    await swapToken();
+
+    await act(async () => { slow.reject(new Error('这个任务已经结束了，取消不了。')); });
+
+    expect(screen.queryByText('这个任务已经结束了，取消不了。')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: CANCEL_LABEL })).not.toBeDisabled();
+  });
+});
+
+describe('两次轮询撞车', () => {
+  it('慢的那次回来不把旧列表放回去，转圈由最新那次收掉', async () => {
+    const slow = deferred<ActiveTask[]>();
+    vi.mocked(fetchActiveTasks)
+      .mockReturnValueOnce(slow.promise)
+      .mockResolvedValue([]);
+    await open();
+    expect(screen.getByText('正在加载活跃任务…')).toBeInTheDocument();
+
+    await tick();
+    expect(screen.getByText('当前没有活跃任务')).toBeInTheDocument();
+
+    await act(async () => { slow.resolve([task({ input_summary: '旧的那一轮' })]); });
+
+    expect(screen.getByText('当前没有活跃任务')).toBeInTheDocument();
+    expect(screen.queryByText('旧的那一轮')).not.toBeInTheDocument();
+  });
+
+  it('慢的那次失败不报原因', async () => {
+    const slow = deferred<ActiveTask[]>();
+    vi.mocked(fetchActiveTasks)
+      .mockReturnValueOnce(slow.promise)
+      .mockResolvedValue([task()]);
+    await open();
+
+    await tick();
+    expect(screen.getByText('在查日志')).toBeInTheDocument();
+
+    await act(async () => { slow.reject(new Error('503 活跃任务读不到')); });
+
+    expect(screen.queryByText('503 活跃任务读不到')).not.toBeInTheDocument();
   });
 });

@@ -1,6 +1,8 @@
 // 节点授权。这一页显示的是权限边界，勾着却不生效比勾不上更糟 ——
 // 白名单里写错的名字注入时是静默忽略的，界面不说就没人知道那一条从来没生效过。
-import { fireEvent, render, screen, within } from '@testing-library/react';
+// 每行保存完都重读整页，两行接连保存时只能认最后发出的那一次。
+// 请求发出去之后换了 token，这一趟的结果不能落到新会话的页面上。
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -271,6 +273,163 @@ describe('勾选在两种模式下是同一个意思', () => {
 
     expect(cellFor(item, 'read_file')).not.toBeChecked();
     expect(cellFor(item, 'write_file')).toBeChecked();
+  });
+});
+
+describe('两行接连保存', () => {
+  const granted = (id: string, allow: string[]): AdminNode => ({
+    id, type: 'ai', tool_access: { mode: 'allowlist', allow },
+  });
+
+  const BEFORE = [granted('qq.alpha', []), granted('qq.beta', [])];
+  const AFTER = [granted('qq.alpha', ['read_file']), granted('qq.beta', ['write_file'])];
+  // 存 alpha 引起的那次重读慢回来时，beta 还是保存前的空名单。
+  const STALE = [granted('qq.alpha', ['read_file']), granted('qq.beta', [])];
+
+  const checkbox = (id: string, tool: string) => within(
+    within(nodeRow(id)).getByText(tool).closest('div') as HTMLElement,
+  ).getByRole('checkbox');
+
+  const saveRow = async (id: string, tool: string) => {
+    const item = within(await expand(id));
+    fireEvent.click(checkbox(id, tool));
+    fireEvent.click(item.getByRole('button', { name: '保存授权' }));
+  };
+
+  beforeEach(() => {
+    vi.mocked(getEffectiveTools).mockResolvedValue({
+      node_id: 'qq.alpha', mode: 'allowlist', dead_names: [], tools: [],
+    });
+    vi.mocked(getNodeRaw).mockImplementation(async (_token, id) => `id: ${id}\n`);
+    vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true });
+  });
+
+  it('先发的那次重读慢回来，不把后保存的那一行打回旧值', async () => {
+    let slow!: (nodes: AdminNode[]) => void;
+    const held = new Promise<AdminNode[]>((resolve) => { slow = resolve; });
+    vi.mocked(getNodes)
+      .mockResolvedValueOnce(BEFORE)
+      .mockReturnValueOnce(held)
+      .mockResolvedValue(AFTER);
+
+    render(<NodeGrantsSection />);
+    await saveRow('qq.alpha', 'read_file');
+    await waitFor(() => expect(getNodes).toHaveBeenCalledTimes(2));
+
+    await saveRow('qq.beta', 'write_file');
+    await waitFor(() => expect(getNodes).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(within(nodeRow('qq.beta')).getByText('1 个工具')).toBeTruthy());
+
+    await act(async () => { slow(STALE); });
+
+    expect(within(nodeRow('qq.beta')).getByText('1 个工具')).toBeTruthy();
+    expect(checkbox('qq.beta', 'write_file')).toBeChecked();
+    expect(within(nodeRow('qq.alpha')).getByText('1 个工具')).toBeTruthy();
+  });
+});
+
+describe('保存到一半换了 token', () => {
+  const ROTATED = 'rotated-token';
+  const WRITE_FAILURE = '503 写不进节点文件';
+  const ALPHA: AdminNode = { id: 'qq.alpha', type: 'ai', tool_access: { mode: 'allowlist', allow: [] } };
+
+  /** 请求什么时候回来由测试说了算，好在它回来之前把 token 换掉。 */
+  function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason: Error) => void } {
+    let resolve!: (value: T) => void;
+    let reject!: (reason: Error) => void;
+    const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+    return { promise, resolve, reject };
+  }
+
+  const alphaRow = () => within(nodeRow('qq.alpha'));
+
+  const note = () => alphaRow().getByRole('status').textContent;
+
+  const startSave = async () => {
+    const item = within(await expand('qq.alpha'));
+    fireEvent.click(within(item.getByText('read_file').closest('div') as HTMLElement).getByRole('checkbox'));
+    fireEvent.click(item.getByRole('button', { name: '保存授权' }));
+  };
+
+  const rotate = () => { act(() => { useSettingsStore.setState({ adminToken: ROTATED }); }); };
+
+  beforeEach(() => {
+    vi.mocked(getNodes).mockResolvedValue([ALPHA]);
+    vi.mocked(getEffectiveTools).mockResolvedValue({
+      node_id: ALPHA.id, mode: 'allowlist', dead_names: [], tools: [],
+    });
+    vi.mocked(getNodeRaw).mockResolvedValue('id: qq.alpha\n');
+    vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true });
+  });
+
+  it('读回节点原文时 token 已经换掉，不拿旧 token 往回写', async () => {
+    const read = deferred<string>();
+    vi.mocked(getNodeRaw).mockReturnValueOnce(read.promise);
+    render(<NodeGrantsSection />);
+    await startSave();
+    await waitFor(() => expect(getNodeRaw).toHaveBeenCalledOnce());
+
+    rotate();
+    await act(async () => { read.resolve('id: qq.alpha\n'); });
+
+    expect(updateNodeRaw).not.toHaveBeenCalled();
+    expect(note()).toBe('有未保存的改动');
+  });
+
+  it('提前收手也要把「正在保存」收掉，不然这一行再也点不动', async () => {
+    const read = deferred<string>();
+    vi.mocked(getNodeRaw).mockReturnValueOnce(read.promise);
+    render(<NodeGrantsSection />);
+    await startSave();
+    await waitFor(() => expect(alphaRow().getByRole('button', { name: '正在保存…' })).toBeDisabled());
+
+    rotate();
+    await act(async () => { read.resolve('id: qq.alpha\n'); });
+
+    expect(alphaRow().queryByRole('button', { name: '正在保存…' })).toBeNull();
+    expect(alphaRow().getByRole('button', { name: '保存授权' })).toBeEnabled();
+  });
+
+  it('写完才换的 token，不提示已保存，也不拿旧 token 重读', async () => {
+    const write = deferred<unknown>();
+    vi.mocked(updateNodeRaw).mockReturnValueOnce(write.promise);
+    render(<NodeGrantsSection />);
+    await startSave();
+    await waitFor(() => expect(updateNodeRaw).toHaveBeenCalledOnce());
+
+    rotate();
+    await waitFor(() => expect(getNodes).toHaveBeenCalledTimes(2));
+    await act(async () => { write.resolve({ ok: true }); });
+
+    expect(vi.mocked(getNodes).mock.calls.map(([token]) => token)).toEqual(['admin-token', ROTATED]);
+    expect(note()).toBe('有未保存的改动');
+  });
+
+  it('写失败之前换了 token，不摆出这一趟的报错', async () => {
+    const write = deferred<unknown>();
+    vi.mocked(updateNodeRaw).mockReturnValueOnce(write.promise);
+    render(<NodeGrantsSection />);
+    await startSave();
+    await waitFor(() => expect(updateNodeRaw).toHaveBeenCalledOnce());
+
+    rotate();
+    await act(async () => { write.reject(new Error(WRITE_FAILURE)); });
+
+    expect(note()).toBe('有未保存的改动');
+    expect(screen.queryByText(WRITE_FAILURE)).toBeNull();
+  });
+
+  it('退出登录后，上一个 token 读回来的节点清单不再套用', async () => {
+    const list = deferred<AdminNode[]>();
+    vi.mocked(getNodes).mockReturnValueOnce(list.promise);
+    render(<NodeGrantsSection />);
+    await waitFor(() => expect(getNodes).toHaveBeenCalledOnce());
+
+    act(() => { useSettingsStore.setState({ adminToken: '' }); });
+    await act(async () => { list.resolve([ALPHA]); });
+
+    expect(screen.queryByRole('heading', { name: 'qq.alpha' })).toBeNull();
+    expect(screen.getByText('正在读取…')).toBeTruthy();
   });
 });
 

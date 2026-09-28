@@ -8,7 +8,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { decideApproval, getAdminState, type AdminApproval } from '../../../api/supervisorClient';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
-import { useSettingsStore } from '../../../store/settingsStore';
+import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { Icon } from '../../common';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
 import { Block, Button, PageShell, StatusText } from './settingsControls';
@@ -39,7 +39,13 @@ function approvalReason(approval: AdminApproval): string {
   return detailString(approval, 'reason') || detailString(approval, 'description') || detailString(approval, 'summary') || approval.comment || '未提供';
 }
 
+// A new sign-in starts the page over: notices and in-flight reads from the last session don't carry over.
 export const ApprovalsSettingsPage = () => {
+  const token = useSettingsStore((state) => state.adminToken);
+  return <ApprovalsSettingsPageBody key={token || ''} />;
+};
+
+const ApprovalsSettingsPageBody = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const { selectedApproval, setSelectedApproval } = useSettingsSelectionStore();
   const [approvals, setApprovals] = useState<AdminApproval[]>([]);
@@ -47,17 +53,22 @@ export const ApprovalsSettingsPage = () => {
   const [loading, setLoading] = useState(false);
   const pending = useRef(new Set<string>());
   const [deciding, setDeciding] = useState<string[]>([]);
+  // Polls and the reload after a decision can overlap; only the latest request may land.
+  const generation = useRef(0);
 
   const load = useCallback(async (showSpinner = true) => {
     if (!adminToken || !isAuthenticated) return;
+    const version = ++generation.current;
     if (showSpinner) setLoading(true);
     try {
       const state = await getAdminState(adminToken);
+      if (version !== generation.current) return;
       const pending = state.pending_approvals || [];
       setApprovals(pending);
       if (selectedApproval && !pending.some((item) => item.approval_id === selectedApproval.approval_id)) setSelectedApproval(null);
       setLoadError('');
     } catch (error) {
+      if (version !== generation.current) return;
       setLoadError(error instanceof Error ? error.message : '加载审批失败');
     } finally {
       if (showSpinner) setLoading(false);
@@ -78,7 +89,7 @@ export const ApprovalsSettingsPage = () => {
     // open. How: poll the admin state quietly between manual refreshes. Purpose:
     // operators can make decisions from a current queue.
     const timer = window.setInterval(() => { void load(false); }, 10000);
-    return () => window.clearInterval(timer);
+    return () => { window.clearInterval(timer); generation.current += 1; };
   }, [adminToken, isAuthenticated, load]);
 
   const decide = async (approval: AdminApproval, decision: 'allow' | 'deny') => {
@@ -86,9 +97,11 @@ export const ApprovalsSettingsPage = () => {
     pending.current.add(approval.approval_id); setDeciding([...pending.current]);
     try {
       await decideApproval(adminToken || '', approval.approval_id, decision, `settings ${decision}`);
+      if (tokenChanged(adminToken)) return;
       setMessage(decision === 'allow' ? '已允许审批' : '已拒绝审批');
       await load();
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(error instanceof Error ? error.message : '审批操作失败');
     } finally { pending.current.delete(approval.approval_id); setDeciding([...pending.current]); }
   };

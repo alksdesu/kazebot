@@ -9,6 +9,8 @@ import {
   listLogFiles,
   readLogTail,
   retryEngine,
+  type LogFileInfo,
+  type RuntimeStatus,
 } from '../api/supervisorClient';
 import { RuntimeSettingsPage } from '../components/settings/pages/RuntimeSettingsPage';
 import { useSettingsStore } from '../store/settingsStore';
@@ -21,6 +23,20 @@ vi.mock('../api/supervisorClient', async (importOriginal) => ({
   readLogTail: vi.fn(),
   retryEngine: vi.fn(),
 }));
+
+const OTHER_TOKEN = 'another-admin-token';
+
+/** 换人登录：写接口返回前改掉 store 里的 token。 */
+const swapToken = () => { useSettingsStore.setState({ adminToken: OTHER_TOKEN }); };
+
+/** getRuntimeStatus 每一次用的 token，按调用先后排。 */
+const statusTokens = (): (string | undefined)[] => vi.mocked(getRuntimeStatus).mock.calls.map(([token]) => token);
+
+const LOGS_A: LogFileInfo[] = [
+  { name: 'supervisor.log', size: 28990, modified: 1000 },
+  { name: 'engine-1-20260822.log', size: 220, modified: 900 },
+];
+const LOGS_B: LogFileInfo[] = [{ name: 'engine-2-20260901.log', size: 512, modified: 1100 }];
 
 const worker = (over: Record<string, unknown> = {}) => ({
   alive: true, pid: 9001, uptime_sec: 120, failures: 0, respawns: 0,
@@ -42,10 +58,7 @@ beforeEach(() => {
   useSettingsStore.setState({ adminToken: 'admin-token', isAuthenticated: true });
   vi.mocked(checkHealth).mockResolvedValue({ status: 'ok', uptime_seconds: 3600 } as any);
   vi.mocked(getRuntimeStatus).mockResolvedValue(status() as any);
-  vi.mocked(listLogFiles).mockResolvedValue([
-    { name: 'supervisor.log', size: 28990, modified: 1000 },
-    { name: 'engine-1-20260822.log', size: 220, modified: 900 },
-  ]);
+  vi.mocked(listLogFiles).mockResolvedValue(LOGS_A);
   vi.mocked(readLogTail).mockResolvedValue({ text: '[engine] worker ready', truncated: false });
   vi.mocked(retryEngine).mockResolvedValue(undefined);
 });
@@ -54,6 +67,20 @@ afterEach(() => { vi.useRealTimers(); });
 
 const rowFor = (name: string) =>
   screen.getAllByText(name).map((node) => node.parentElement!).find(Boolean)!;
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((ok, fail) => { resolve = ok; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+// 轮询在 mount 时就挂上了，假定时器得先于 render 接管才推得动它。
+const mount = async () => {
+  vi.useFakeTimers();
+  await act(async () => { render(<RuntimeSettingsPage />); });
+};
+const tick = () => act(async () => { await vi.advanceTimersByTimeAsync(5000); });
 
 describe('worker 状态', () => {
   it('两个 worker 都摆出来，带运行时长', async () => {
@@ -135,13 +162,6 @@ describe('停止重试之后', () => {
 });
 
 describe('提示的去留', () => {
-  const mount = async () => {
-    // 轮询在 mount 时就挂上了，假定时器得先于 render 接管才推得动它。
-    vi.useFakeTimers();
-    await act(async () => { render(<RuntimeSettingsPage />); });
-  };
-  const tick = () => act(async () => { await vi.advanceTimersByTimeAsync(5000); });
-
   it('重试失败的原因熬得过一轮轮询', async () => {
     vi.mocked(getRuntimeStatus).mockResolvedValue(givenUp() as any);
     vi.mocked(retryEngine).mockRejectedValue(new Error('拉不起来：端口 8770 被占用'));
@@ -203,6 +223,98 @@ describe('提示的去留', () => {
   });
 });
 
+describe('重试完发现换了人', () => {
+  it('不拿旧 token 重读状态', async () => {
+    vi.mocked(getRuntimeStatus).mockResolvedValue(givenUp() as any);
+    vi.mocked(retryEngine).mockImplementation(async () => { swapToken(); });
+    await mount();
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '手动重试' })); });
+
+    expect(retryEngine).toHaveBeenCalledWith('admin-token');
+    // 第二次是换人之后重挂轮询自己读的，不是重试收尾那次。
+    expect(statusTokens()).toEqual(['admin-token', OTHER_TOKEN]);
+  });
+
+  it('重试失败也不把原因写到新会话的页面上', async () => {
+    vi.mocked(getRuntimeStatus).mockResolvedValue(givenUp() as any);
+    vi.mocked(retryEngine).mockImplementation(async () => {
+      swapToken();
+      throw new Error('拉不起来：端口 8770 被占用');
+    });
+    await mount();
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '手动重试' })); });
+
+    expect(screen.queryByText('拉不起来：端口 8770 被占用')).toBeNull();
+    expect(screen.getByRole('button', { name: '手动重试' })).not.toBeDisabled();
+  });
+});
+
+describe('换人登录之后', () => {
+  it('丢掉上一个会话重试失败的原因', async () => {
+    vi.mocked(getRuntimeStatus).mockResolvedValue(givenUp() as any);
+    vi.mocked(retryEngine).mockRejectedValue(new Error('拉不起来：端口 8770 被占用'));
+    await mount();
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '手动重试' })); });
+    expect(screen.getByText('拉不起来：端口 8770 被占用')).toBeInTheDocument();
+
+    await act(async () => { swapToken(); });
+
+    expect(screen.queryByText('拉不起来：端口 8770 被占用')).toBeNull();
+    expect(statusTokens()).toEqual(['admin-token', OTHER_TOKEN]);
+  });
+
+  it('丢掉上一个会话读取失败的原因，不等新会话读完', async () => {
+    const slow = deferred<RuntimeStatus>();
+    vi.mocked(getRuntimeStatus).mockImplementation(async (token) => {
+      if (token === 'admin-token') throw new Error('502 Bad Gateway');
+      return slow.promise;
+    });
+    await mount();
+    expect(screen.getByText('502 Bad Gateway')).toBeInTheDocument();
+
+    await act(async () => { swapToken(); });
+
+    expect(screen.queryByText('502 Bad Gateway')).toBeNull();
+    await act(async () => { slow.resolve(status() as any); });
+  });
+});
+
+describe('状态读取撞车', () => {
+  it('慢的那次读回来不覆盖后发的那次', async () => {
+    const slow = deferred<RuntimeStatus>();
+    vi.mocked(getRuntimeStatus)
+      .mockReturnValueOnce(slow.promise)
+      .mockResolvedValue(status({ tasks: { queued: 1, running: 2 } }) as any);
+    await mount();
+
+    await tick();
+    expect(screen.getByText('任务队列：等待 1 个，执行中 2 个。')).toBeInTheDocument();
+
+    await act(async () => { slow.resolve(status({ tasks: { queued: 9, running: 9 } }) as any); });
+
+    expect(screen.getByText('任务队列：等待 1 个，执行中 2 个。')).toBeInTheDocument();
+    expect(screen.queryByText('任务队列：等待 9 个，执行中 9 个。')).toBeNull();
+  });
+
+  it('被顶掉的那次读取失败不报原因', async () => {
+    const slow = deferred<RuntimeStatus>();
+    vi.mocked(getRuntimeStatus)
+      .mockReturnValueOnce(slow.promise)
+      .mockResolvedValue(status() as any);
+    await mount();
+
+    await tick();
+    expect(screen.getByText('engine-1')).toBeInTheDocument();
+
+    await act(async () => { slow.reject(new Error('502 Bad Gateway')); });
+
+    expect(screen.queryByText('502 Bad Gateway')).toBeNull();
+  });
+});
+
 describe('日志', () => {
   it('列出文件并默认打开最新那个', async () => {
     render(<RuntimeSettingsPage />);
@@ -235,12 +347,147 @@ describe('日志', () => {
     await waitFor(() => expect(screen.getByText('404 没有这个日志文件')).toBeTruthy());
   });
 
+  it('连着点两个文件，先点的慢回来不摆到后点的名字底下', async () => {
+    const slow = deferred<{ text: string; truncated: boolean }>();
+    vi.mocked(readLogTail).mockImplementation(async (_token, name) => (
+      name === 'supervisor.log' ? slow.promise : { text: '[engine] 后点的这个', truncated: false }
+    ));
+    render(<RuntimeSettingsPage />);
+    fireEvent.click(await screen.findByText('engine-1-20260822.log'));
+    await screen.findByText('[engine] 后点的这个');
+    expect(readLogTail).toHaveBeenNthCalledWith(1, 'admin-token', 'supervisor.log', 500);
+
+    await act(async () => { slow.resolve({ text: '[supervisor] 先点的那个', truncated: true }); });
+
+    expect(screen.getByText('[engine] 后点的这个')).toBeInTheDocument();
+    expect(screen.queryByText('[supervisor] 先点的那个')).toBeNull();
+    expect(screen.queryByText(/只显示了尾部/)).toBeNull();
+  });
+
+  it('先点的那个读失败不显示原因，转圈由后点的收掉', async () => {
+    const slow = deferred<{ text: string; truncated: boolean }>();
+    vi.mocked(readLogTail).mockImplementation(async (_token, name) => (
+      name === 'supervisor.log' ? slow.promise : { text: '[engine] 后点的这个', truncated: false }
+    ));
+    render(<RuntimeSettingsPage />);
+    fireEvent.click(await screen.findByText('engine-1-20260822.log'));
+    await screen.findByText('[engine] 后点的这个');
+    expect(screen.getByRole('button', { name: '刷新' })).not.toBeDisabled();
+
+    await act(async () => { slow.reject(new Error('404 没有这个日志文件')); });
+
+    expect(screen.queryByText('404 没有这个日志文件')).toBeNull();
+    expect(screen.getByRole('button', { name: '刷新' })).not.toBeDisabled();
+  });
+
   it('一个日志都没有时不报错', async () => {
     vi.mocked(listLogFiles).mockResolvedValue([]);
     render(<RuntimeSettingsPage />);
 
     await waitFor(() => expect(screen.getByText(/还没有日志文件/)).toBeTruthy());
     expect(readLogTail).not.toHaveBeenCalled();
+  });
+});
+
+describe('换人之后的日志', () => {
+  it('选中的文件回到新会话列表的第一个', async () => {
+    vi.mocked(listLogFiles).mockImplementation(async (token) => (token === 'admin-token' ? LOGS_A : LOGS_B));
+    vi.mocked(readLogTail).mockImplementation(async (_token, name) => ({ text: `[tail] ${name}`, truncated: false }));
+    render(<RuntimeSettingsPage />);
+    fireEvent.click(await screen.findByText('engine-1-20260822.log'));
+    await screen.findByText('[tail] engine-1-20260822.log');
+
+    await act(async () => { swapToken(); });
+    await screen.findByText('[tail] engine-2-20260901.log');
+
+    // 选中的那个在列表和标题里各出现一次。
+    expect(screen.getAllByText('engine-2-20260901.log')).toHaveLength(2);
+    expect(screen.queryByText('engine-1-20260822.log')).toBeNull();
+    expect(readLogTail).toHaveBeenLastCalledWith(OTHER_TOKEN, 'engine-2-20260901.log', 500);
+    expect(readLogTail).not.toHaveBeenCalledWith(OTHER_TOKEN, 'engine-1-20260822.log', 500);
+  });
+
+  it('旧会话在途的文件列表慢回来，不摆进新会话', async () => {
+    const slow = deferred<LogFileInfo[]>();
+    vi.mocked(listLogFiles).mockImplementation((token) => (token === 'admin-token' ? slow.promise : Promise.resolve(LOGS_B)));
+    render(<RuntimeSettingsPage />);
+    await screen.findByText(/还没有日志文件/);
+
+    await act(async () => { swapToken(); });
+    await screen.findAllByText('engine-2-20260901.log');
+
+    await act(async () => { slow.resolve(LOGS_A); });
+
+    expect(screen.queryByText('supervisor.log')).toBeNull();
+    expect(screen.getAllByText('engine-2-20260901.log')).toHaveLength(2);
+    expect(readLogTail).not.toHaveBeenCalledWith(OTHER_TOKEN, 'supervisor.log', 500);
+  });
+
+  it('旧会话的文件列表读失败，原因不摆进新会话', async () => {
+    const slow = deferred<LogFileInfo[]>();
+    vi.mocked(listLogFiles).mockImplementation((token) => (token === 'admin-token' ? slow.promise : Promise.resolve(LOGS_B)));
+    render(<RuntimeSettingsPage />);
+    await screen.findByText(/还没有日志文件/);
+
+    await act(async () => { swapToken(); });
+    await screen.findAllByText('engine-2-20260901.log');
+
+    await act(async () => { slow.reject(new Error('403 日志目录读不了')); });
+
+    expect(screen.queryByText('403 日志目录读不了')).toBeNull();
+  });
+
+  it('新会话的正文从空开始，不接着摆上一个会话读到的内容', async () => {
+    const slow = deferred<{ text: string; truncated: boolean }>();
+    vi.mocked(readLogTail).mockImplementation((token) => (
+      token === 'admin-token' ? Promise.resolve({ text: '[A] 旧会话的日志', truncated: false }) : slow.promise
+    ));
+    render(<RuntimeSettingsPage />);
+    await screen.findByText('[A] 旧会话的日志');
+
+    await act(async () => { swapToken(); });
+    await screen.findByRole('button', { name: '正在刷新…' });
+
+    expect(screen.queryByText('[A] 旧会话的日志')).toBeNull();
+    expect(screen.getByText('（空）')).toBeInTheDocument();
+
+    await act(async () => { slow.resolve({ text: '[B] 新会话的日志', truncated: false }); });
+  });
+
+  it('旧会话在途的正文慢回来，不摆进新会话', async () => {
+    const slow = deferred<{ text: string; truncated: boolean }>();
+    vi.mocked(readLogTail).mockImplementation((token) => (
+      token === 'admin-token' ? slow.promise : Promise.resolve({ text: '[B] 新会话的日志', truncated: false })
+    ));
+    render(<RuntimeSettingsPage />);
+    await screen.findByRole('button', { name: '正在刷新…' });
+
+    await act(async () => { swapToken(); });
+    await screen.findByText('[B] 新会话的日志');
+
+    await act(async () => { slow.resolve({ text: '[A] 旧会话的日志', truncated: true }); });
+
+    expect(screen.getByText('[B] 新会话的日志')).toBeInTheDocument();
+    expect(screen.queryByText('[A] 旧会话的日志')).toBeNull();
+    expect(screen.queryByText(/只显示了尾部/)).toBeNull();
+    expect(screen.getByRole('button', { name: '刷新' })).not.toBeDisabled();
+  });
+
+  it('旧会话的正文读失败，原因不摆进新会话', async () => {
+    const slow = deferred<{ text: string; truncated: boolean }>();
+    vi.mocked(readLogTail).mockImplementation((token) => (
+      token === 'admin-token' ? slow.promise : Promise.resolve({ text: '[B] 新会话的日志', truncated: false })
+    ));
+    render(<RuntimeSettingsPage />);
+    await screen.findByRole('button', { name: '正在刷新…' });
+
+    await act(async () => { swapToken(); });
+    await screen.findByText('[B] 新会话的日志');
+
+    await act(async () => { slow.reject(new Error('404 没有这个日志文件')); });
+
+    expect(screen.queryByText('404 没有这个日志文件')).toBeNull();
+    expect(screen.getByRole('button', { name: '刷新' })).not.toBeDisabled();
   });
 });
 

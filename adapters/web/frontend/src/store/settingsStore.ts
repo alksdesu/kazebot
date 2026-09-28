@@ -105,4 +105,7 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   setRightPanelOpen: (open) => set({ rightPanelOpen: open }),
 }));
 
+/** The token a request went out with is no longer the signed-in one: leave the page and follow-up requests alone. */
+export const tokenChanged = (token: string | null): boolean => useSettingsStore.getState().adminToken !== token;
+
 export type { SessionProviderOverride, SettingsState };

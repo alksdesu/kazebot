@@ -15,7 +15,7 @@ import {
   type WorkerHealth,
 } from '../../../api/supervisorClient';
 import { usePageNotice } from '../../../hooks/usePageNotice';
-import { useSettingsStore } from '../../../store/settingsStore';
+import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { Block, Button, Empty, Facts, Footnote, List, PageShell, Pip, Row, StatusText } from './settingsControls';
 
 const POLL_MS = 5000;
@@ -138,6 +138,8 @@ const LogViewer = ({ token }: { token: string }) => {
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
   const box = useRef<HTMLPreElement>(null);
+  // 连着点两个文件时只认后点的那个，先点的慢回来不能把别的文件内容摆到这个文件名底下。
+  const generation = useRef(0);
 
   const loadList = useCallback(async () => {
     try {
@@ -153,10 +155,12 @@ const LogViewer = ({ token }: { token: string }) => {
 
   const loadTail = useCallback(async (name: string) => {
     if (!name) return;
+    const version = ++generation.current;
     setBusy(true);
     setNote('');
     try {
       const result = await readLogTail(token, name, TAIL_LINES);
+      if (version !== generation.current) return;
       setText(result.text);
       setTruncated(result.truncated);
       // 日志是往下追加的，打开就该看到最新那几行。
@@ -164,9 +168,9 @@ const LogViewer = ({ token }: { token: string }) => {
         if (box.current) box.current.scrollTop = box.current.scrollHeight;
       });
     } catch (error) {
-      setNote(say(error));
+      if (version === generation.current) setNote(say(error));
     } finally {
-      setBusy(false);
+      if (version === generation.current) setBusy(false);
     }
   }, [token]);
 
@@ -217,20 +221,31 @@ const LogViewer = ({ token }: { token: string }) => {
   );
 };
 
+// 换了登录整页重来：上一个会话留下的提示和在途的读取都不带进新会话。
 export const RuntimeSettingsPage = () => {
+  const token = useSettingsStore((state) => state.adminToken);
+  return <RuntimeSettingsPageBody key={token || ''} />;
+};
+
+const RuntimeSettingsPageBody = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const { notice, setMessage, setLoadError } = usePageNotice();
   const [retrying, setRetrying] = useState(false);
+  // 轮询和重试后的重读会撞在一起，只认最后发出的那次。
+  const generation = useRef(0);
 
   // 轮询只动读取那一半提示：重试失败的原因要留到下一次重试，不能五秒后就被冲掉。
   const load = useCallback(async () => {
     if (!adminToken) return;
+    const version = ++generation.current;
     try {
-      setStatus(await getRuntimeStatus(adminToken));
+      const next = await getRuntimeStatus(adminToken);
+      if (version !== generation.current) return;
+      setStatus(next);
       setLoadError('');
     } catch (error) {
-      setLoadError(say(error));
+      if (version === generation.current) setLoadError(say(error));
     }
   }, [adminToken, setLoadError]);
 
@@ -238,7 +253,7 @@ export const RuntimeSettingsPage = () => {
     if (!adminToken) return;
     void load();
     const timer = setInterval(() => void load(), POLL_MS);
-    return () => clearInterval(timer);
+    return () => { clearInterval(timer); generation.current += 1; };
   }, [adminToken, load]);
 
   const onRetry = async () => {
@@ -247,8 +262,10 @@ export const RuntimeSettingsPage = () => {
     setMessage('');
     try {
       await retryEngine(adminToken);
+      if (tokenChanged(adminToken)) return;
       await load();
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(say(error));
     } finally {
       setRetrying(false);

@@ -8,7 +8,7 @@ import { useEffect, useRef, useState } from 'react';
 import { getMcpClients, getMcpClientsRaw, updateMcpClientsRaw, type McpClient } from '../../../api/supervisorClient';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
-import { useSettingsStore } from '../../../store/settingsStore';
+import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
 import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
 import { parseMcpClients, serializeMcpClients, type McpClientFormState } from '../settingsStructuredConfig';
@@ -80,17 +80,20 @@ export const McpSettingsPage = () => {
     mutation.current = true; setBusy(true);
     try {
       const raw = await getMcpClientsRaw(adminToken);
+      if (tokenChanged(adminToken)) return;
       const forms = parseMcpClients(raw);
       if (forms.some((client) => client.id === id)) { setMessage('该 MCP Client 已存在'); return; }
       const nextForms = [...forms, emptyMcpClient(id)];
       await updateMcpClientsRaw(adminToken, serializeMcpClients(nextForms, raw));
-      if (useSettingsStore.getState().adminToken !== adminToken) return;
+      if (tokenChanged(adminToken)) return;
       setNewId('');
       setMessage('Client 已创建但尚未启用，请在右栏填写连接信息后启用。');
-      setRightPanelOpen(true);
       await load();
+      if (tokenChanged(adminToken)) return;
       setSelectedMcpClient({ id, enabled: false, transport: 'streamable_http', description: '通过设置页面创建的 MCP Client。' });
+      setRightPanelOpen(true);
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(error instanceof Error ? error.message : '创建 MCP Client 失败');
     } finally { mutation.current = false; setBusy(false); }
   };
@@ -102,12 +105,15 @@ export const McpSettingsPage = () => {
     mutation.current = true; setBusy(true);
     try {
       const raw = await getMcpClientsRaw(adminToken);
+      if (tokenChanged(adminToken)) return;
       const nextForms = parseMcpClients(raw).filter((client) => client.id !== selectedMcpClient.id);
       await updateMcpClientsRaw(adminToken, serializeMcpClients(nextForms, raw));
+      if (tokenChanged(adminToken)) return;
       setSelectedMcpClient(null);
       setMessage('MCP Client 已删除');
       await load();
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(error instanceof Error ? error.message : '删除 MCP Client 失败');
     } finally { mutation.current = false; setBusy(false); }
   };

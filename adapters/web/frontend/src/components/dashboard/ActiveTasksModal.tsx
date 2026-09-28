@@ -6,7 +6,7 @@ import { useEffect, useState } from 'react';
 
 import { cancelTask, fetchActiveTasks, type ActiveTask } from '../../api/supervisorClient';
 import { usePageNotice } from '../../hooks/usePageNotice';
-import { useSettingsStore } from '../../store/settingsStore';
+import { tokenChanged, useSettingsStore } from '../../store/settingsStore';
 import { useChatStore, type TaskActivity } from '../../store/chatStore';
 import { useViewStore } from '../../store/viewStore';
 import { Modal } from '../common';
@@ -110,10 +110,14 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
   useEffect(() => {
     if (!open) return undefined;
     let cancelled = false;
+    // A slow poll that returns after a newer one must not put the older list back.
+    let latest = 0;
 
     const load = async () => {
+      const request = ++latest;
+      const isLatest = () => !cancelled && request === latest;
       if (!adminToken) {
-        if (!cancelled) {
+        if (isLatest()) {
           setTasks([]);
           setLoadError('需要管理员令牌才能读取活跃任务。');
           setLoading(false);
@@ -124,16 +128,16 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
       try {
         setLoading(true);
         const nextTasks = await fetchActiveTasks(adminToken);
-        if (!cancelled) {
+        if (isLatest()) {
           setTasks(nextTasks);
           setLoadError('');
         }
       } catch (loadError) {
-        if (!cancelled) {
+        if (isLatest()) {
           setLoadError(loadError instanceof Error ? loadError.message : '活跃任务刷新失败。');
         }
       } finally {
-        if (!cancelled) setLoading(false);
+        if (isLatest()) setLoading(false);
       }
     };
 
@@ -155,8 +159,10 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
     setMessage('');
     try {
       await cancelTask(adminToken, task.task_id);
+      if (tokenChanged(adminToken)) return;
       setRefreshTick(value => value + 1);
     } catch (cancelError) {
+      if (tokenChanged(adminToken)) return;
       setMessage(cancelError instanceof Error ? cancelError.message : '任务取消失败。');
     } finally {
       setCancellingTaskIds(current => {

@@ -8,7 +8,7 @@ import { useEffect, useRef, useState } from 'react';
 import { getSchedulesRaw, updateSchedulesRaw } from '../../../api/supervisorClient';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
-import { useSettingsStore } from '../../../store/settingsStore';
+import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
 import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
 import { parseSchedules, serializeSchedules, type ScheduleFormState } from '../settingsStructuredConfig';
@@ -79,17 +79,20 @@ export const AutomationSettingsPage = () => {
     mutation.current = true; setBusy(true);
     try {
       const raw = await getSchedulesRaw(adminToken);
+      if (tokenChanged(adminToken)) return;
       const current = parseSchedules(raw);
       if (current.some((schedule) => schedule.id === id)) { setMessage('该任务 ID 已存在'); return; }
       const next = [...current, emptySchedule(id)];
       await updateSchedulesRaw(adminToken, serializeSchedules(next, raw));
-      if (useSettingsStore.getState().adminToken !== adminToken) return;
+      if (tokenChanged(adminToken)) return;
       setNewId('');
-      setSelectedScheduleId(id);
       setMessage('任务已创建但尚未启用，请在右栏填写内容后启用。');
-      setRightPanelOpen(true);
       await load();
+      if (tokenChanged(adminToken)) return;
+      setSelectedScheduleId(id);
+      setRightPanelOpen(true);
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(error instanceof Error ? error.message : '创建定时任务失败');
     } finally { mutation.current = false; setBusy(false); }
   };
@@ -101,12 +104,15 @@ export const AutomationSettingsPage = () => {
     mutation.current = true; setBusy(true);
     try {
       const raw = await getSchedulesRaw(adminToken);
+      if (tokenChanged(adminToken)) return;
       const next = parseSchedules(raw).filter((schedule) => schedule.id !== selectedScheduleId);
       await updateSchedulesRaw(adminToken, serializeSchedules(next, raw));
+      if (tokenChanged(adminToken)) return;
       setSelectedScheduleId(null);
       setMessage('定时任务已删除');
       await load();
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(error instanceof Error ? error.message : '删除定时任务失败');
     } finally { mutation.current = false; setBusy(false); }
   };
