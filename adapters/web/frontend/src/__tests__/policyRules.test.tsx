@@ -1,6 +1,6 @@
 // 策略规则的顺序有语义：supervisor/policy.py 自上而下取第一条命中的。
 // 界面必须让人看得见顺序、改得动顺序，否则加的规则会被兜底规则挡住而毫无提示。
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PolicyRulesSection } from '../components/settings/pages/PolicyRulesSection';
@@ -32,8 +32,35 @@ const POLICY = {
   restart: { default: 'approval_required' },
 };
 
+const ROTATED_TOKEN = 'rotated-token';
+const SAVE_FAILURE = '策略写不进去';
+// 服务端回写的文档多一条规则：真落到界面上，第一眼就看得见。
+const SERVER_RULE = 'server/rewrote/**';
+const REWRITTEN = {
+  ...POLICY,
+  write_file: {
+    ...POLICY.write_file,
+    rules: [{ pattern: SERVER_RULE, decision: 'deny', reason: '服务端补的' }, ...POLICY.write_file.rules],
+  },
+};
+
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+}
+
+function errorResponse(status: number, detail: string): Response {
+  return new Response(JSON.stringify({ detail }), { status, headers: { 'Content-Type': 'application/json' } });
+}
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
 }
 
 let lastPut: any = null;
@@ -174,5 +201,57 @@ describe('服务端策略', () => {
     fireEvent.click(screen.getByRole('button', { name: '保存策略' }));
 
     await waitFor(() => expect(lastPut?.restart?.default).toBe('deny'));
+  });
+
+  describe('保存回来时 token 已经换掉', () => {
+    // 新会话那次读故意挂着：读回来会把本地改动一并冲掉，就看不出旧会话有没有乱写了。
+    const saveInFlight = async (): Promise<Deferred<Response>> => {
+      const put = deferred<Response>();
+      let reads = 0;
+      vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === 'PUT') return put.promise;
+        reads += 1;
+        return reads === 1 ? Promise.resolve(jsonResponse({ policy: POLICY })) : new Promise<Response>(() => {});
+      }));
+      render(<PolicyRulesSection />);
+      await screen.findByRole('button', { name: /写入/ });
+      fireEvent.change(screen.getByLabelText('兜底档位'), { target: { value: 'approval_required' } });
+      fireEvent.click(screen.getByRole('button', { name: '保存策略' }));
+      await waitFor(() => expect(screen.getByRole('button', { name: '正在保存…' })).toBeDisabled());
+      return put;
+    };
+
+    const rotateThenLand = async (put: Deferred<Response>, response: Response) => {
+      act(() => { useSettingsStore.setState({ adminToken: ROTATED_TOKEN }); });
+      await act(async () => { put.resolve(response); });
+    };
+
+    it('不把服务端回写的文档落到新会话，也不写已保存那句', async () => {
+      const put = await saveInFlight();
+
+      await rotateThenLand(put, jsonResponse({ policy: REWRITTEN }));
+
+      expect(screen.queryByText(SERVER_RULE)).toBeNull();
+      expect(screen.queryByText('已保存，立即生效，不用重启')).toBeNull();
+      expect(screen.getByLabelText('兜底档位')).toHaveValue('approval_required');
+    });
+
+    it('保存失败也不把失败原因写到新会话', async () => {
+      const put = await saveInFlight();
+
+      await rotateThenLand(put, errorResponse(500, SAVE_FAILURE));
+
+      expect(screen.queryByText(new RegExp(SAVE_FAILURE))).toBeNull();
+      expect(screen.getByRole('status')).toHaveTextContent('有未保存的改动');
+    });
+
+    it('提前 return 之后保存按钮不卡在正在保存', async () => {
+      const put = await saveInFlight();
+
+      await rotateThenLand(put, jsonResponse({ policy: REWRITTEN }));
+
+      expect(screen.queryByRole('button', { name: '正在保存…' })).toBeNull();
+      expect(screen.getByRole('button', { name: '保存策略' })).toBeEnabled();
+    });
   });
 });

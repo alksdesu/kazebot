@@ -9,7 +9,7 @@ import {
   type PolicyRule,
 } from '../../../api/supervisorClient';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
-import { useSettingsStore } from '../../../store/settingsStore';
+import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { firstMatchIndex } from '../../../utils/globMatch';
 import { SaveBar, ScopeBadge } from './settingsControls';
 
@@ -453,13 +453,16 @@ export const PolicyRulesSection = () => {
     setMessage('');
     try {
       const next = await updatePolicy(adminToken, doc);
+      if (tokenChanged(adminToken)) return;
       setDoc(next);
       setSaved(JSON.stringify(next));
       setMessage('已保存，立即生效，不用重启');
     } catch (error) {
+      if (tokenChanged(adminToken)) return;
       setMessage(error instanceof Error ? error.message : '保存失败');
+    } finally {
+      setBusy(false);
     }
-    setBusy(false);
   };
 
   if (!isAuthenticated || !adminToken) {
