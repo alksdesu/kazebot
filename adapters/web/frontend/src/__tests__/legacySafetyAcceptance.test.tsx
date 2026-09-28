@@ -128,7 +128,7 @@ describe('configuration preservation', () => {
   it('preserves structured node prompts instead of stringifying objects', () => {
     const raw = 'id: test\nprompt:\n  - role: system\n    content: hello\n';
     const form = parseNodeConfig(raw); form.name = 'renamed';
-    expect(yaml.load(serializeNodeConfig(raw, form))).toMatchObject({ name: 'renamed', prompt: [{ role: 'system', content: 'hello' }] });
+    expect(yaml.load(serializeNodeConfig(raw, form).content)).toMatchObject({ name: 'renamed', prompt: [{ role: 'system', content: 'hello' }] });
     expect(() => serializeNodeConfig(raw, { ...form, prompt: '{}' })).toThrow();
   });
   it('uses real YAML validation, allowing apostrophes in block text', () => {

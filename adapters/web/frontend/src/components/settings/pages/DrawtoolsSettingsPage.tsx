@@ -12,6 +12,9 @@ import {
   updateNodeRaw,
   type DrawtoolsBundle,
 } from '../../../api/supervisorClient';
+import { usePageNotice } from '../../../hooks/usePageNotice';
+import { appendSentence } from '../../../utils/sentence';
+import { rewriteYaml } from '../../../console/yamlRewrite';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { Block, Button, Field, Input, PageShell, Select, StatusText } from './settingsControls';
@@ -128,8 +131,13 @@ function parseYamlObject(text: string): any {
   }
 }
 
-function stringifyYaml(data: unknown): string {
-  return yaml.dump(data, { lineWidth: 120, noRefs: true });
+const DUMP_OPTIONS: yaml.DumpOptions = { lineWidth: 120, noRefs: true };
+
+/** 结构化字段改完写回原文：只重写改了的键，运营者写的注释留着。原文坏了 rewriteYaml 会抛 ——
+ *  parseYamlObject 把坏文件读成空对象，照着它写回去整份配置就只剩改的那一项。 */
+function rewriteStructured(base: string, next: Record<string, unknown>, okText: string): { content: string; message: string } {
+  const { content, note } = rewriteYaml(base, next, DUMP_OPTIONS);
+  return { content, message: appendSentence(okText, note && `${note}。`) };
 }
 
 function getSectionContent(bundle: DrawtoolsBundle | null, key: SectionKey): string {
@@ -158,7 +166,7 @@ export const DrawtoolsSettingsPage = () => {
   const [section, setSection] = useState<SectionKey>('settings');
   const [editor, setEditor] = useState('');
   const [nodeRaw, setNodeRaw] = useState('');
-  const [message, setMessage] = useState('');
+  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const [presetsExpanded, setPresetsExpanded] = useState(false);
   const [characterQuery, setCharacterQuery] = useState('');
@@ -180,6 +188,7 @@ export const DrawtoolsSettingsPage = () => {
   const effectiveSelectedPresetId = selectedPresetId || String(presets[0]?.id || '');
   const selectedPreset = presets.find((preset: any) => String(preset?.id || '') === effectiveSelectedPresetId) || presets[0] || {};
 
+  /** 重读绘图配置。只动读取那一半提示：保存之后紧接着读，刚写下的「已保存」不能被冲掉。 */
   const load = async () => {
     if (!adminToken || !isAuthenticated) return;
     setLoading(true);
@@ -191,15 +200,21 @@ export const DrawtoolsSettingsPage = () => {
       setBundle(data);
       setNodeRaw(nodeYaml);
       setEditor(section === 'node' ? nodeYaml : getSectionContent(data, section));
-      setMessage('');
+      setLoadError('');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '加载绘图配置失败');
+      setLoadError(error instanceof Error ? error.message : '加载绘图配置失败');
     } finally {
       setLoading(false);
     }
   };
 
-  useEffect(() => { void load(); }, [adminToken, isAuthenticated]);
+  /** 「刷新」和登录后的首读：先清掉上一次的提示再读。 */
+  const refresh = async () => {
+    clearNotice();
+    await load();
+  };
+
+  useEffect(() => { void refresh(); }, [adminToken, isAuthenticated]);
 
   const sourceText = section === 'node' ? nodeRaw : getSectionContent(bundle, section);
   const editorDirty = bundle !== null && editor !== sourceText;
@@ -235,27 +250,31 @@ export const DrawtoolsSettingsPage = () => {
   };
 
   // 结构化字段是 onBlur 直写，写完 load() 会把原始编辑器重置掉 —— 有草稿时先问一声。
-  const saveSettingsObject = async (next: any, okText: string) => {
+  const saveStructured = async (
+    base: string,
+    next: Record<string, unknown>,
+    write: (token: string, content: string) => Promise<unknown>,
+    okText: string,
+    failText: string,
+  ) => {
     if (!adminToken || !confirmDiscard()) return;
     try {
-      await updateDrawtoolsSettingsRaw(adminToken, stringifyYaml(next));
-      setMessage(okText);
+      const { content, message: done } = rewriteStructured(base, next, okText);
+      await write(adminToken, content);
+      setMessage(done);
       await load();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '保存设置失败');
+      setMessage(error instanceof Error ? error.message : failText);
     }
   };
 
-  const saveCharacterObject = async (next: any, okText: string) => {
-    if (!adminToken || !confirmDiscard()) return;
-    try {
-      await updateDrawtoolsCharactersRaw(adminToken, stringifyYaml(next));
-      setMessage(okText);
-      await load();
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : '保存角色标签库失败');
-    }
-  };
+  const saveSettingsObject = (next: any, okText: string) => saveStructured(
+    bundle?.settings?.content || '', next, updateDrawtoolsSettingsRaw, okText, '保存设置失败',
+  );
+
+  const saveCharacterObject = (next: any, okText: string) => saveStructured(
+    bundle?.character_tags?.content || '', next, updateDrawtoolsCharactersRaw, okText, '保存角色标签库失败',
+  );
 
   const updateApiField = (key: string, value: string) => {
     const next = parseYamlObject(bundle?.settings?.content || '');
@@ -455,10 +474,10 @@ export const DrawtoolsSettingsPage = () => {
       <>
         <Block frame="boxed" title="运行期配置" hint="用户配置写入 settings.yaml / character_tags.yaml / prompt .md；仓库更新只维护 .example。">
           <div className="flex flex-wrap gap-2">
-            <Button tone="quiet" disabled={loading} onClick={load}>{loading ? '正在刷新…' : '刷新'}</Button>
+            <Button tone="quiet" disabled={loading} onClick={() => void refresh()}>{loading ? '正在刷新…' : '刷新'}</Button>
             <Button onClick={initConfigs}>从 Example 初始化用户配置</Button>
           </div>
-          <StatusText message={message} />
+          <StatusText message={notice} />
         </Block>
 
         <Block frame="boxed" title="API 配置" hint="API Key 推荐使用环境变量 NOVELAI_API_KEY；如必须写入文件，可在下方保存。">

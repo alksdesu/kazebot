@@ -236,13 +236,13 @@ const AgentsEditor = () => {
       // path. How: replace the edited fields in the loaded YAML, submit updateNodeRaw,
       // and update the fallback editor with the exact saved content. Purpose: the
       // panel writes valid YAML while keeping user edits to unrelated fields intact.
-      const nextYaml = serializeNodeConfig(nodeYaml, nodeConfigForm);
+      const { content: nextYaml, note } = serializeNodeConfig(nodeYaml, nodeConfigForm);
       await updateNodeRaw(adminToken, node.id, nextYaml);
       setNodeYaml(nextYaml);
       setNodeConfigForm(parseNodeConfig(nextYaml, node.id));
       setNodeBaseline(JSON.stringify([nextYaml, parseNodeConfig(nextYaml, node.id)]));
       window.dispatchEvent(new Event('settings:nodes-updated'));
-      setNodeMessage('节点配置已保存。');
+      setNodeMessage(note ? `节点配置已保存。${note}。` : '节点配置已保存。');
     } catch (error) {
       setNodeMessage(error instanceof Error ? error.message : '保存节点配置失败');
     } finally {

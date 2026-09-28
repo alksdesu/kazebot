@@ -4,98 +4,68 @@
 // dump 一遍会变成带引号的长字符串，注释也全没了。认不出格式就抛，宁可让人去改原文，
 // 也不能赌一把把文件写坏。
 
-export class NodeYamlShapeError extends Error {}
+import yaml from 'js-yaml';
 
-const indentOf = (line: string): number => line.length - line.trimStart().length;
+import {
+  YamlShapeError as NodeYamlShapeError,
+  blockEnd,
+  findKey,
+  indentOf,
+  keyHead,
+  keyParts,
+  locate,
+  openBlock,
+  splitLines,
+} from './yamlText';
 
-/** 拆行时吃掉 \r，写回时还原原来的行尾。仓库里的节点文件是 CRLF，
- *  按 '\n' 硬拆会让每行尾巴留一个 \r（键名就此匹配不上），拼回去又会混入 LF。 */
-function splitLines(raw: string): { lines: string[]; eol: string } {
-  return { lines: raw.split(/\r?\n/), eol: raw.includes('\r\n') ? '\r\n' : '\n' };
+export { NodeYamlShapeError };
+
+/** 自由输入的文字写成 YAML 字符串标量：原样写读回来还是同一个字符串（按 YAML 1.1 读也一样）就不加引号，否则加双引号。
+ *  下面几个写入函数收的是标量原文，数字、布尔要原样写进去；只有当字符串用的值才先过这一道。 */
+export function yamlString(text: string): string {
+  const dumped = yaml.dump(text, { lineWidth: -1, quotingType: '"' }).trimEnd();
+  return dumped.includes('\n') ? JSON.stringify(text) : dumped;
 }
 
-/** 找到 key 所在行。path 逐层下探，子键必须比父键缩进更深。 */
-function locate(lines: string[], path: string[]): { at: number; indent: number } {
-  let from = 0;
-  let until = lines.length;
-  let parentIndent = -1;
-  let found = { at: -1, indent: 0 };
-
-  for (const key of path) {
-    const head = `${key}:`;
-    let hit = -1;
-    for (let i = from; i < until; i += 1) {
-      const bare = lines[i].trimStart();
-      if (!bare || bare.startsWith('#')) continue;
-      const indent = indentOf(lines[i]);
-      // 缩进退回父级或更浅，说明父块已经结束，后面同名的键是别人的。
-      if (indent <= parentIndent) { until = i; break; }
-      if (bare === head || bare.startsWith(`${head} `)) { hit = i; break; }
-    }
-    if (hit < 0) throw new NodeYamlShapeError(`yaml 里找不到 ${path.join('.')}`);
-    parentIndent = indentOf(lines[hit]);
-    found = { at: hit, indent: parentIndent };
-    from = hit + 1;
+/** 行内取值还原成文字。带引号的交给 js-yaml 解析，转义才还原得对；裸写的原样返回，数字照用户写的样子显示。 */
+function scalarText(value: string): string {
+  if (!/^(["']).*\1$/.test(value)) return value;
+  try {
+    const parsed = yaml.load(value);
+    return typeof parsed === 'string' ? parsed : value;
+  } catch {
+    return value.slice(1, -1);
   }
-  return found;
-}
-
-/** 取出行尾注释（含前导空白），没有则返回空串。
- *  runtime.yaml 的每个调参键后面都跟着一句说明，改一次值就冲掉等于把文档吃了。
- *  值里出现引号或 # 时无法判断哪个 # 才是注释起点，宁可不认。 */
-function trailingComment(line: string): string {
-  const colon = line.indexOf(':');
-  if (colon < 0) return '';
-  const matched = /^[^"'#]*?(\s+#.*)$/.exec(line.slice(colon + 1));
-  return matched ? matched[1] : '';
-}
-
-/** key 所辖的块到哪一行为止（不含）。 */
-function blockEnd(lines: string[], at: number, indent: number): number {
-  let end = at + 1;
-  while (end < lines.length) {
-    const line = lines[end];
-    if (!line.trim()) { end += 1; continue; }
-    if (indentOf(line) <= indent) break;
-    end += 1;
-  }
-  // 尾随空行归还给下一块，否则每存一次就多吞一行。
-  while (end > at + 1 && !lines[end - 1].trim()) end -= 1;
-  return end;
 }
 
 /** 替换一个块状列表（`key:` 之后若干 `- item` 行）的全部条目。 */
 export function replaceYamlList(raw: string, path: string[], items: readonly string[]): string {
   const { lines, eol } = splitLines(raw);
-  const { at, indent } = locate(lines, path);
-  const head = lines[at];
-  const inline = head.slice(head.indexOf(':') + 1).trim();
-  if (inline && !inline.startsWith('#')) {
+  const key = locate(lines, path);
+  if (keyParts(lines, key).value) {
     // `allow: [a, b]` 这种 flow 写法不在支持范围内，改它要重排整行。
     throw new NodeYamlShapeError(`${path.join('.')} 不是分行列表，请直接编辑原文`);
   }
-  const end = blockEnd(lines, at, indent);
-  for (let i = at + 1; i < end; i += 1) {
+  const end = blockEnd(lines, key);
+  for (let i = key.at + 1; i < end; i += 1) {
     const bare = lines[i].trimStart();
     if (bare && !bare.startsWith('- ') && !bare.startsWith('#')) {
       throw new NodeYamlShapeError(`${path.join('.')} 下面混着别的内容，请直接编辑原文`);
     }
   }
-  const pad = ' '.repeat(indent + 2);
+  // 跟着原来的条目缩进走：不缩进的列表（PyYAML 的写法）改完还是不缩进。
+  const first = lines.slice(key.at + 1, end).find((line) => line.trimStart().startsWith('- '));
+  const pad = ' '.repeat(first === undefined ? key.indent + 2 : indentOf(first));
   const body = items.map((item) => `${pad}- ${item}`);
-  return [...lines.slice(0, at + 1), ...body, ...lines.slice(end)].join(eol);
+  return [...lines.slice(0, key.at + 1), ...body, ...lines.slice(end)].join(eol);
 }
 
 /** 读一个块状列表的条目。 */
 export function readYamlList(raw: string, path: string[]): string[] {
   const { lines } = splitLines(raw);
-  let found;
-  try {
-    found = locate(lines, path);
-  } catch {
-    return [];
-  }
-  const end = blockEnd(lines, found.at, found.indent);
+  const found = findKey(lines, path);
+  if (!found) return [];
+  const end = blockEnd(lines, found);
   const out: string[] = [];
   for (let i = found.at + 1; i < end; i += 1) {
     const bare = lines[i].trimStart();
@@ -104,31 +74,27 @@ export function readYamlList(raw: string, path: string[]): string[] {
   return out;
 }
 
-/** 替换一个标量值。空串表示删掉这一行（回落节点默认）。 */
+/** 替换一个标量值。空串表示删掉这一行（回落节点默认）。value 是标量原文。 */
 export function replaceYamlScalar(raw: string, path: string[], value: string): string {
   const { lines, eol } = splitLines(raw);
-  let at: number;
-  let indent: number;
-  try {
-    ({ at, indent } = locate(lines, path));
-  } catch (error) {
+  const key = findKey(lines, path);
+  if (!key) {
     // 键本来就不在，而要写的又是空值 —— 目标状态已经达成。
     if (!value) return raw;
-    throw error;
+    throw new NodeYamlShapeError(`yaml 里找不到 ${path.join('.')}`);
   }
-  if (blockEnd(lines, at, indent) > at + 1) {
+  if (blockEnd(lines, key) > key.at + 1) {
     throw new NodeYamlShapeError(`${path.join('.')} 不是单行取值，请直接编辑原文`);
   }
-  if (!value) return [...lines.slice(0, at), ...lines.slice(at + 1)].join(eol);
-  const key = lines[at].trimStart().split(':')[0];
+  if (!value) return [...lines.slice(0, key.at), ...lines.slice(key.at + 1)].join(eol);
   return [
-    ...lines.slice(0, at),
-    `${' '.repeat(indent)}${key}: ${value}${trailingComment(lines[at])}`,
-    ...lines.slice(at + 1),
+    ...lines.slice(0, key.at),
+    `${keyHead(lines, key)}: ${value}${keyParts(lines, key).comment}`,
+    ...lines.slice(key.at + 1),
   ].join(eol);
 }
 
-/** 写一个顶层标量，键不在就插到 afterKey 后面。空值表示删掉这一行。 */
+/** 写一个顶层标量，键不在就插到 afterKey 那一块后面。空值表示删掉这一行。value 是标量原文。 */
 export function upsertYamlScalar(
   raw: string,
   key: string,
@@ -136,31 +102,28 @@ export function upsertYamlScalar(
   afterKey: string,
 ): string {
   const { lines, eol } = splitLines(raw);
-  const exists = lines.some((line) => line.trimStart().startsWith(`${key}:`) && indentOf(line) === 0);
-  if (exists) return replaceYamlScalar(raw, [key], value);
+  if (findKey(lines, [key])) return replaceYamlScalar(raw, [key], value);
   if (!value) return raw;
-  const anchor = lines.findIndex(
-    (line) => indentOf(line) === 0 && line.trimStart().startsWith(`${afterKey}:`),
-  );
-  if (anchor < 0) throw new NodeYamlShapeError(`yaml 里找不到 ${afterKey}，无处插入 ${key}`);
-  return [...lines.slice(0, anchor + 1), `${key}: ${value}`, ...lines.slice(anchor + 1)].join(eol);
+  const anchor = findKey(lines, [afterKey]);
+  if (!anchor) throw new NodeYamlShapeError(`yaml 里找不到 ${afterKey}，无处插入 ${key}`);
+  // 插在 afterKey 整块之后：它要是跟着多行取值，插在它那一行后面就把块切断了。
+  const at = blockEnd(lines, anchor);
+  return [...lines.slice(0, at), `${' '.repeat(anchor.indent)}${key}: ${value}`, ...lines.slice(at)].join(eol);
 }
 
-/** 写一个嵌套标量，中间层不存在就顺路建出来。空值表示删掉这一行。 */
+/** 从最深处往回退，数出 path 里已经存在的那段前缀有几层。 */
+function knownDepth(lines: readonly string[], path: readonly string[]): number {
+  let known = path.length;
+  while (known > 0 && !findKey(lines, path.slice(0, known))) known -= 1;
+  return known;
+}
+
+/** 写一个嵌套标量，中间层不存在就顺路建出来。空值表示删掉这一行。value 是标量原文。 */
 export function upsertYamlNested(raw: string, path: string[], value: string): string {
   if (!path.length) throw new NodeYamlShapeError('路径为空');
   const { lines, eol } = splitLines(raw);
 
-  // 从最深处往回退，找出已经存在的那段前缀。
-  let known = path.length;
-  while (known > 0) {
-    try {
-      locate(lines, path.slice(0, known));
-      break;
-    } catch {
-      known -= 1;
-    }
-  }
+  const known = knownDepth(lines, path);
   if (known === path.length) return replaceYamlScalar(raw, path, value);
   if (!value) return raw;
 
@@ -173,21 +136,10 @@ export function upsertYamlNested(raw: string, path: string[], value: string): st
   }
 
   const parent = locate(lines, path.slice(0, known));
-  const head = lines[parent.at];
-  const inline = head.slice(head.indexOf(':') + 1).trim();
   const next = [...lines];
-  if (inline) {
-    // `options: {}` 这种占位后面不能直接跟缩进子项，那是坏 yaml。空容器可以安全
-    // 抹掉换成块写法；真有值就不敢猜，交回给人。
-    if (inline !== '{}' && inline !== '[]' && inline !== 'null' && inline !== '~') {
-      throw new NodeYamlShapeError(
-        `${path.slice(0, known).join('.')} 已经有值 ${inline}，无法在它下面加 ${missing.join('.')}`,
-      );
-    }
-    next[parent.at] = `${' '.repeat(parent.indent)}${head.trimStart().split(':')[0]}:`;
-  }
+  openBlock(next, parent, path.slice(0, known), missing);
 
-  const insertAt = blockEnd(next, parent.at, parent.indent);
+  const insertAt = blockEnd(next, parent);
   const block = missing.map((key, depth) => {
     const indent = ' '.repeat(parent.indent + 2 * (depth + 1));
     return depth === missing.length - 1 ? `${indent}${key}: ${value}` : `${indent}${key}:`;
@@ -200,15 +152,7 @@ export function upsertYamlList(raw: string, path: string[], items: readonly stri
   if (!path.length) throw new NodeYamlShapeError('路径为空');
   const { lines, eol } = splitLines(raw);
 
-  let known = path.length;
-  while (known > 0) {
-    try {
-      locate(lines, path.slice(0, known));
-      break;
-    } catch {
-      known -= 1;
-    }
-  }
+  const known = knownDepth(lines, path);
   if (known === path.length) return replaceYamlList(raw, path, items);
 
   const missing = path.slice(known);
@@ -224,29 +168,15 @@ export function upsertYamlList(raw: string, path: string[], items: readonly stri
   }
 
   const parent = locate(lines, path.slice(0, known));
-  const head = lines[parent.at];
-  const inline = head.slice(head.indexOf(':') + 1).trim();
   const next = [...lines];
-  if (inline) {
-    if (inline !== '{}' && inline !== '[]' && inline !== 'null' && inline !== '~') {
-      throw new NodeYamlShapeError(
-        `${path.slice(0, known).join('.')} 已经有值 ${inline}，无法在它下面加 ${missing.join('.')}`,
-      );
-    }
-    next[parent.at] = `${' '.repeat(parent.indent)}${head.trimStart().split(':')[0]}:`;
-  }
-  const insertAt = blockEnd(next, parent.at, parent.indent);
+  openBlock(next, parent, path.slice(0, known), missing);
+  const insertAt = blockEnd(next, parent);
   return [...next.slice(0, insertAt), ...render(parent.indent + 2), ...next.slice(insertAt)].join(eol);
 }
 
 export function readYamlScalar(raw: string, path: string[]): string {
   const { lines } = splitLines(raw);
-  try {
-    const { at } = locate(lines, path);
-    const line = lines[at];
-    const after = line.slice(line.indexOf(':') + 1).trim();
-    return after.replace(/^["']|["']$/g, '');
-  } catch {
-    return '';
-  }
+  const found = findKey(lines, path);
+  // 行尾注释不算取值，否则改一次值就把注释又抄一遍写回去。
+  return found ? scalarText(keyParts(lines, found).value) : '';
 }

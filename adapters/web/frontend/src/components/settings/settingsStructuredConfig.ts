@@ -4,18 +4,10 @@
 // signature so that consuming components need zero changes.
 import yaml from 'js-yaml';
 
-import { upsertYamlNested } from '../../console/nodeYaml';
+import { upsertYamlNested, yamlString } from '../../console/nodeYaml';
+import { rewriteYaml, type YamlRewrite } from '../../console/yamlRewrite';
 
 // ==================== Type Definitions ====================
-
-export type ScalarValue = string | number | boolean | null;
-export type SimpleYamlValue = ScalarValue | SimpleYamlObject | SimpleYamlValue[];
-export interface SimpleYamlObject { [key: string]: SimpleYamlValue; }
-
-export interface ParsedProvidersResult {
-  providers: Record<string, SimpleYamlObject>;
-  rawProviders: string;
-}
 
 export interface ScheduleFormState {
   original?: Record<string, unknown>;
@@ -110,10 +102,6 @@ function safeLoad(raw: string): Record<string, any> {
   return result as Record<string, any>;
 }
 
-function safeDump(obj: any): string {
-  return yaml.dump(obj, DUMP_OPTS);
-}
-
 function str(value: any, fallback = ''): string {
   if (value === null || value === undefined) return fallback;
   return String(value);
@@ -184,7 +172,8 @@ export function parseNodeConfig(raw: string, fallbackId = ''): NodeConfigFormSta
   };
 }
 
-export function serializeNodeConfig(raw: string, form: NodeConfigFormState): string {
+/** 节点文件满是手写的说明注释，prompt 常是上百行的块标量：只重写表单改了的键，其余原文照旧。 */
+export function serializeNodeConfig(raw: string, form: NodeConfigFormState): YamlRewrite {
   const doc = safeLoad(raw);
   doc.id = form.id.trim();
   doc.name = form.name.trim();
@@ -202,9 +191,8 @@ export function serializeNodeConfig(raw: string, form: NodeConfigFormState): str
     } else doc.prompt = form.prompt;
   } else delete doc.prompt;
   doc.delegate_targets = commaTextToItems(form.delegate_targetsText);
-  // tool_access 只能改 YAML 原文；这里整份 dump 会把 mode 对应不上的那半
-  // （allowlist 下的 deny）连同注释一起洗掉。
-  return safeDump(doc);
+  // tool_access 只能改 YAML 原文，表单不碰它：按 mode 重写会把对应不上的那半（allowlist 下的 deny）洗掉。
+  return rewriteYaml(raw, doc, DUMP_OPTS);
 }
 
 // ==================== Runtime Config ====================
@@ -250,7 +238,8 @@ export function serializeRuntimeConfig(raw: string, form: RuntimeConfigFormState
   // 逐键定点改写而不是 load/dump 一轮：runtime.yaml 里一百多行说明注释全靠原文留着。
   safeLoad(raw);
   let out = raw;
-  out = upsertYamlNested(out, [...RUNTIME_ENTRY_NODE_PATH], form.entry_node_id.trim());
+  const entryNode = form.entry_node_id.trim();
+  out = upsertYamlNested(out, [...RUNTIME_ENTRY_NODE_PATH], entryNode && yamlString(entryNode));
   out = upsertYamlNested(out, [...RUNTIME_TOOL_MODE_PATH], normalizeEngineToolMode(form.tool_mode));
   // 留空表示不覆盖默认值；写 0 会让 engine 一个 worker 都不起。
   out = upsertYamlNested(out, [...RUNTIME_MAX_WORKERS_PATH], intText(form.max_workers, 1));
@@ -260,35 +249,6 @@ export function serializeRuntimeConfig(raw: string, form: RuntimeConfigFormState
   out = upsertYamlNested(out, [...RUNTIME_COMPACT_KEEP_TOKENS_PATH], intText(form.compact_keep_recent_tokens));
   out = upsertYamlNested(out, [...RUNTIME_COMPACT_KEEP_SEGMENTS_PATH], intText(form.compact_keep_recent, 2));
   return out;
-}
-
-// ==================== Providers ====================
-
-export function parseProvidersFromRuntime(raw: string): ParsedProvidersResult {
-  const doc = safeLoad(raw);
-  const src = doc.providers;
-  const providers: Record<string, SimpleYamlObject> = {};
-  if (src && typeof src === 'object' && !Array.isArray(src)) {
-    for (const [k, v] of Object.entries(src)) {
-      if (v && typeof v === 'object' && !Array.isArray(v)) providers[k] = v as SimpleYamlObject;
-    }
-  }
-  const rawBlock = Object.keys(providers).length > 0
-    ? yaml.dump({ providers }, DUMP_OPTS).trimEnd()
-    : 'providers: {}';
-  return { providers, rawProviders: rawBlock };
-}
-
-export function serializeProvidersBlock(providers: Record<string, SimpleYamlObject>): string {
-  const filtered = Object.fromEntries(Object.entries(providers).filter(([k]) => k.trim()));
-  if (Object.keys(filtered).length === 0) return 'providers: {}';
-  return yaml.dump({ providers: filtered }, DUMP_OPTS).trimEnd();
-}
-
-export function replaceProvidersInRuntime(raw: string, providers: Record<string, SimpleYamlObject>): string {
-  const doc = safeLoad(raw);
-  doc.providers = providers;
-  return safeDump(doc);
 }
 
 // ==================== Schedules ====================

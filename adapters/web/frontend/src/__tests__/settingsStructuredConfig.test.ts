@@ -9,11 +9,9 @@ import type { RuntimeConfigFormState } from '../components/settings/settingsStru
 import {
   parseMcpClients,
   parseNodeConfig,
-  parseProvidersFromRuntime,
   parseRuntimeConfig,
   parseSchedules,
   parseSkillMarkdown,
-  replaceProvidersInRuntime,
   serializeMcpClients,
   serializeNodeConfig,
   serializeRuntimeConfig,
@@ -37,7 +35,7 @@ describe('node config keeps tool_access untouched', () => {
   ].join('\n');
 
   it('carries the allow list through a load-then-save round trip', () => {
-    const saved = serializeNodeConfig(ALLOWLIST_NODE, parseNodeConfig(ALLOWLIST_NODE));
+    const { content: saved } = serializeNodeConfig(ALLOWLIST_NODE, parseNodeConfig(ALLOWLIST_NODE));
 
     expect(saved).toContain('mode: allowlist');
     expect(saved).toContain('- web_search');
@@ -48,14 +46,14 @@ describe('node config keeps tool_access untouched', () => {
     const raw = ['id: bootstrap.executor', 'tool_access:', '  mode: all',
       '  deny:', '    - execute_command', ''].join('\n');
 
-    const saved = serializeNodeConfig(raw, parseNodeConfig(raw));
+    const { content: saved } = serializeNodeConfig(raw, parseNodeConfig(raw));
 
     expect(saved).toContain('mode: all');
     expect(saved).toContain('- execute_command');
   });
 
   it('still writes the fields it does own', () => {
-    const saved = serializeNodeConfig(ALLOWLIST_NODE, {
+    const { content: saved } = serializeNodeConfig(ALLOWLIST_NODE, {
       ...parseNodeConfig(ALLOWLIST_NODE),
       name: '改过的名字',
     });
@@ -106,6 +104,30 @@ describe('runtime config key paths', () => {
     expect(saved).not.toMatch(/^entry_node_id:/m);
     expect(saved).not.toMatch(/^tool_mode:/m);
     expect(saved).not.toMatch(/^max_concurrent_tasks:/m);
+  });
+
+  // 只换 entry_node_id 的一份写回，其余键给成和原文一致的值。
+  const withEntryNode = (id: string): string => serializeRuntimeConfig(RUNTIME, form({
+    entry_node_id: id, tool_mode: 'json', max_workers: '4',
+  }));
+
+  const replacingEntryNode = (line: string): string => RUNTIME.replace('entry_node_id: bootstrap.shell_orchestrator', line);
+
+  // runtime.yaml 由 PyYAML（YAML 1.1）读回：裸写的 no 会变成布尔、12 变成数字、# 后面被当注释切掉，
+  // 节点 id 就此对不上任何节点。
+  it('quotes an entry node id that a YAML 1.1 reader would fold', () => {
+    expect(withEntryNode('no')).toBe(replacingEntryNode('entry_node_id: "no"'));
+    expect(withEntryNode('12')).toBe(replacingEntryNode('entry_node_id: "12"'));
+    expect(withEntryNode('a # b')).toBe(replacingEntryNode('entry_node_id: "a # b"'));
+  });
+
+  it('leaves an ordinary entry node id unquoted', () => {
+    expect(withEntryNode('qq.orchestrator')).toBe(replacingEntryNode('entry_node_id: qq.orchestrator'));
+  });
+
+  it('reads a quoted entry node id back as the text that was typed', () => {
+    expect(parseRuntimeConfig(withEntryNode('a # b')).entry_node_id).toBe('a # b');
+    expect(parseRuntimeConfig(withEntryNode('no')).entry_node_id).toBe('no');
   });
 
   it('refuses to serialize onto an empty base', () => {
@@ -246,17 +268,6 @@ describe('runtime config key paths', () => {
 });
 
 describe('settingsStructuredConfig', () => {
-  it('replaces only the runtime providers block', () => {
-    const raw = 'version: 1\nengine:\n  model: ""\nproviders:\n  openai:\n    timeout_sec: 600.0\nmeta:\n  x: 1\n';
-    const parsed = parseProvidersFromRuntime(raw);
-    expect(parsed.providers.openai.timeout_sec).toBe(600);
-
-    const next = replaceProvidersInRuntime(raw, { openai: { timeout_sec: 120, base_url: 'https://example.test/v1' } });
-    expect(next).toContain('providers:\n  openai:\n    timeout_sec: 120\n    base_url: https://example.test/v1');
-    expect(next).toContain('engine:\n  model: ""');
-    expect(next).toContain('meta:\n  x: 1');
-  });
-
   it('round trips editable schedules', () => {
     const raw = 'schedules:\n- id: demo\n  cron: "*/5 * * * *"\n  type: script\n  command: python task.py\n  enabled: false\n  once: true\n  text: "运行脚本"\n';
     const schedules = parseSchedules(raw);
