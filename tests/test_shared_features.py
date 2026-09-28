@@ -28,7 +28,7 @@ from adapters._shared.live_config import (  # noqa: E402
 )
 from adapters._shared.yaml_loader import load_yaml  # noqa: E402
 
-_EXAMPLE = _ROOT / "config" / "features.example.yaml"
+_EXAMPLE = _ROOT / "defaults" / "features.example.yaml"
 _STICKER_LIBRARY = frozenset({
     "sticker_auto_tag", "sticker_auto_accept", "sticker_pending_limit", "sticker_library_limit",
     "sticker_pending_ttl_days",

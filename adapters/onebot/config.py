@@ -14,11 +14,13 @@ from dotenv import dotenv_values
 
 from adapters._shared.env import env_first, env_float, env_int, split_list
 from adapters.onebot.maintenance import reply_attachment_cache_file
+import config_layout
 from clonoth_runtime import (
     SECRET_FROM_ENV,
     PlatformSecret,
-    load_yaml_dict,
+    load_platform_secrets,
     platform_secret,
+    stray_platforms_section,
     undeclared_platform_secrets,
 )
 from platforms.builtin import QQ_NAPCAT
@@ -154,12 +156,12 @@ LOCAL_SOURCE_ROOTS = split_list(env_first("ONEBOT_LOCAL_SOURCE_ROOTS", default="
 # 监听地址在启动时绑定，改了要重启；开关与条数上限在 live_config。
 FORWARD_BRIDGE_HOST = env_first("ONEBOT_FORWARD_BRIDGE_HOST", default="127.0.0.1")
 FORWARD_BRIDGE_PORT = env_int("ONEBOT_FORWARD_BRIDGE_PORT", 8769, min_value=1, max_value=65535)
-# 平台密钥按 QQ 描述里的声明读：data/config.yaml 的 platforms.qq 优先，其次 env。
-_WORKSPACE_CONFIG: dict[str, Any] = load_yaml_dict(Path(CLONOTH_WORKSPACE) / "data" / "config.yaml") or {}
+# 平台密钥按 QQ 描述里的声明读：data/platform_secrets.yaml 的 qq 段优先，其次 env。
+_WORKSPACE_SECRETS: dict[str, Any] = load_platform_secrets(CLONOTH_WORKSPACE)
 
 
 def _secret(name: str) -> PlatformSecret:
-    return platform_secret(CLONOTH_WORKSPACE, QQ_NAPCAT, name, config=_WORKSPACE_CONFIG)
+    return platform_secret(CLONOTH_WORKSPACE, QQ_NAPCAT, name, secrets=_WORKSPACE_SECRETS)
 
 
 def _secret_file(name: str) -> str:
@@ -171,10 +173,15 @@ def _secret_file(name: str) -> str:
 
 
 def _secret_config_warnings() -> tuple[str, ...]:
-    """platforms.qq 段里拼错被无视的键、被它盖住的 env。不在启动时说出来，改了不见效还查不出原因。"""
-    section = f"data/config.yaml platforms.{QQ_NAPCAT.id}"
+    """qq 段里拼错被无视的键、被它盖住的 env、照旧写在模型配置里的 platforms 段。不在启动时说出来，改了不见效还查不出原因。"""
+    section = f"{config_layout.PLATFORM_SECRETS_FILE} {QQ_NAPCAT.id}"
     warnings: list[str] = []
-    unknown = undeclared_platform_secrets(CLONOTH_WORKSPACE, QQ_NAPCAT, config=_WORKSPACE_CONFIG)
+    if stray_platforms_section(CLONOTH_WORKSPACE):
+        warnings.append(
+            f"{config_layout.MODELS_FILE} still has a platforms section, which is no longer read: "
+            f"move it to {config_layout.PLATFORM_SECRETS_FILE}",
+        )
+    unknown = undeclared_platform_secrets(CLONOTH_WORKSPACE, QQ_NAPCAT, secrets=_WORKSPACE_SECRETS)
     if unknown:
         warnings.append(f"{section} has keys QQ does not read: {', '.join(unknown)}")
     for spec in QQ_NAPCAT.secrets:
@@ -187,7 +194,7 @@ SECRET_CONFIG_WARNINGS = _secret_config_warnings()
 
 
 def _unseen_by_tools(name: str) -> str:
-    """这项密钥只在进程环境里时返回提示。工具子进程的环境剥掉了平台密钥，只读 data/config.yaml 和工作区 .env。"""
+    """这项密钥只在进程环境里时返回提示。工具子进程的环境剥掉了平台密钥，只读 data/platform_secrets.yaml 和工作区 .env。"""
     spec = QQ_NAPCAT.secret(name)
     if _secret(name).source != SECRET_FROM_ENV:
         return ""
@@ -196,7 +203,7 @@ def _unseen_by_tools(name: str) -> str:
         return ""
     return (
         f"{spec.env} is set only in the process environment and tool subprocesses have it stripped: "
-        f"put it in data/config.yaml platforms.{QQ_NAPCAT.id}.{spec.name} or {dotenv_path}"
+        f"put it in {config_layout.PLATFORM_SECRETS_FILE} {QQ_NAPCAT.id}.{spec.name} or {dotenv_path}"
     )
 
 
@@ -249,7 +256,7 @@ REPLY_ATTACHMENT_CACHE_FILE = str(reply_attachment_cache_file(Path(CLONOTH_WORKS
 # 匿名别名映射持久化文件：保存 真实 QQ 号/群号 <-> UserX/GroupX 别名 的双向映射。
 # 目的：跨重启保持别名一致，避免历史/记忆里同一人出现不同别名，并支持别名反解。
 # 注意：这是一份“去匿名化字典”（明文对照真实号 <-> 别名），属于敏感文件，
-# 必须与 data/config.yaml 同级别保护、不得提交到版本库。与路由状态分离存放。
+# 必须与 data/platform_secrets.yaml 同级别保护、不得提交到版本库。与路由状态分离存放。
 # 改位置用 ONEBOT_ANON_MAP_FILE，同样声明在 QQ 描述里。
 ANON_MAP_FILE = str(platform_state_path(QQ_NAPCAT, STATE_ALIASES, Path(CLONOTH_WORKSPACE)))
 

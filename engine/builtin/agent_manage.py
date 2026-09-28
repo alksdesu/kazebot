@@ -13,10 +13,10 @@ from typing import Any
 
 import yaml
 
+import config_layout
 from engine.node import node_file
 from toolbox._common import request_guard
 from toolbox.context import ToolContext
-from toolbox.text_files import rewrite_text
 
 # ---------------------------------------------------------------------------
 #  PLUGIN_META — loader auto-discovery 需要的元数据声明
@@ -83,7 +83,7 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     """Create a new persistent sub-node from an existing node yaml template.
 
     [2026-05-28] 工作流程：
-    1. 按节点 id 找模板 yaml（和 load_node 同一个查法：先系统目录，再 config/nodes/，也认旧 id）
+    1. 按节点 id 找模板 yaml（和 load_node 同一个查法：系统目录、config/nodes/、仓库默认依次找，也认旧 id）
     2. 替换 id / name / description / persistent / memory_book / provider 字段
     3. 写入 config/nodes/{name}.yaml
     4. 可选：追加到 caller_node_id 的 delegate_targets
@@ -111,15 +111,17 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
 
     # Step 1: 检查节点 id 是否已被占用，避免误覆盖。同名系统节点、把它声明成旧 id 的节点
     # 都会让新文件永远加载不到；后者还会把写着旧 id 的会话和配置悄悄引到新节点上。
-    target_path = workspace_root / "config" / "nodes" / f"{name}.yaml"
+    target_path = config_layout.nodes_dir(workspace_root) / f"{name}.yaml"
     taken_by = node_file(workspace_root, name)
     if taken_by is not None:
-        return _err(f"node id already taken: {name} resolves to {taken_by.relative_to(workspace_root).as_posix()}")
+        return _err(f"node id already taken: {name} resolves to {config_layout.logical_path(workspace_root, taken_by)}")
 
     # Step 2: 查找模板 yaml。模板名是模型给的参数，只认节点目录里能按 id 找到的文件。
     tmpl_path = node_file(workspace_root, template)
     if tmpl_path is None:
-        return _err(f"template not found: {template} (checked engine/system_nodes/ and config/nodes/)")
+        return _err(
+            f"template not found: {template} (checked engine/system_nodes/, config/nodes/ and defaults/nodes/)"
+        )
 
     # Step 3: 解析模板 yaml
     try:
@@ -146,7 +148,7 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     # 节点定义里有 prompt、模型和 tool_access，落一份就等于加一条新的执行路径，
     # 和 write_file 写 config/nodes/** 是同一件事，走同一道策略。
     _node_yaml = yaml.safe_dump(tmpl_data, default_flow_style=False, allow_unicode=True)
-    _rel_target = f"config/nodes/{name}.yaml"
+    _rel_target = f"{config_layout.NODES_DIR}/{name}.yaml"
     _op, err = await request_guard(
         ctx,
         "write_file",
@@ -160,16 +162,16 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     if err is not None:
         return _guard_err(err)
 
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    rewrite_text(target_path, _node_yaml)
+    config_layout.write_config_text(target_path, _node_yaml)
 
     # Step 6: 更新调用者的 delegate_targets（如果指定了 caller_node_id）
     # 追加新节点到调用者的委派列表，使调用者可以 dispatch 到新节点
     caller_updated = False
     caller_denied = ""
-    # 改的是调用者实际加载的那份文件：被系统节点顶掉的同名用户文件改了也不生效
+    # 读的是调用者实际加载的那份文件：被系统节点顶掉的同名用户文件改了也不生效
     caller_path = node_file(workspace_root, caller_node_id) if caller_node_id else None
     if caller_path is not None:
+        caller_target = config_layout.node_edit_target(workspace_root, caller_path)
         try:
             caller_data = yaml.safe_load(caller_path.read_text(encoding="utf-8"))
             if isinstance(caller_data, dict):
@@ -181,7 +183,7 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
                     caller_data["delegate_targets"] = targets
                     # 改的是别人的委派清单，等于给调用者开一条新的下派路径，
                     # 和上面写节点定义一样送策略，不能因为「只加一行」就免检。
-                    _caller_rel = caller_path.relative_to(workspace_root).as_posix()
+                    _caller_rel = config_layout.logical_path(workspace_root, caller_target)
                     _caller_yaml = yaml.safe_dump(
                         caller_data, default_flow_style=False, allow_unicode=True,
                     )
@@ -196,7 +198,7 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
                         },
                     )
                     if err is None:
-                        rewrite_text(caller_path, _caller_yaml)
+                        config_layout.write_config_text(caller_target, _caller_yaml)
                         caller_updated = True
                     else:
                         caller_denied = str(err.get("error", "denied")) if isinstance(err, dict) else str(err)
@@ -210,7 +212,7 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     return _ok(
         f"Agent created: {name}",
         node_id=name,
-        config_path=f"config/nodes/{name}.yaml",
+        config_path=_rel_target,
         memory_book=memory_book,
         memory_dir=f"data/memory/{memory_book}/",
         persistent=persistent,
@@ -250,7 +252,7 @@ PLUGIN_META["tools"] = [
                 },
                 "template": {
                     "type": "string",
-                    "description": "模板节点 ID，如 bootstrap.coder。先查 config/nodes/，再查 engine/system_nodes/",
+                    "description": "模板节点 ID，如 bootstrap.coder。依次查 engine/system_nodes/、config/nodes/、defaults/nodes/",
                 },
                 "description": {
                     "type": "string",

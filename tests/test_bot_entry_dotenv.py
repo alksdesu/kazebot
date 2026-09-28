@@ -175,12 +175,12 @@ def _run_main(
     (home / "bot.py").write_bytes(BOT_ENTRY.read_bytes())
     if config is not None:
         (home / "data").mkdir()
-        (home / "data" / "config.yaml").write_text(config, encoding="utf-8")
+        (home / "data" / "platform_secrets.yaml").write_text(config, encoding="utf-8")
     harness = tmp_path / "main_harness.py"
     harness.write_text(_MAIN_HARNESS, encoding="utf-8")
     dumped = tmp_path / "seen.json"
 
-    # 工作区不设就落在复制出去的那个目录，data/config.yaml 才是这里写的那份。
+    # 工作区不设就落在复制出去的那个目录，data/platform_secrets.yaml 才是这里写的那份。
     env = {k: v for k, v in os.environ.items() if not k.startswith(("CLONOTH_", "ONEBOT_"))}
     env.update(extra_env or {})
     env["PYTHONIOENCODING"] = "utf-8"
@@ -207,10 +207,10 @@ def test_main_runs_end_to_end_with_nonebot_stubbed(tmp_path: Path) -> None:
 
 
 def test_a_configured_access_token_is_handed_to_nonebot(tmp_path: Path) -> None:
-    # NoneBot 只从环境变量读它；data/config.yaml 那份不递过去，NapCat 连上来就被拒。
+    # NoneBot 只从环境变量读它；data/platform_secrets.yaml 那份不递过去，NapCat 连上来就被拒。
     result = _run_main(
         tmp_path,
-        config="platforms:\n  qq:\n    access_token: from-config\n",
+        config="qq:\n  access_token: from-config\n",
         extra_env={"ONEBOT_ACCESS_TOKEN": "from-env"},
     )
 

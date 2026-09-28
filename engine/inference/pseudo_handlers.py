@@ -461,7 +461,7 @@ def _target_is_persistent(ls: _LoopState, target: str) -> bool:
 
     [AutoC 2026-07-09] Why: 只有声明为长期节点（persistent=true）的 target
     才应默认 accumulate；其余节点默认 fresh。How: 复用 engine.node.load_node
-    的同一搭载逻辑（config/nodes 与 system_nodes 搜索顺序），失败时保守返回
+    的同一搭载逻辑（system_nodes、config/nodes、defaults/nodes 的搜索顺序），失败时保守返回
     False。Purpose: 避免把普通工具型/一次性节点默认持久化。
     """
     tid = str(target or "").strip()

@@ -11,6 +11,7 @@ import os
 import uvicorn
 from fastapi import FastAPI
 
+import config_layout
 from clonoth_runtime import TASK_REAP_INTERVAL_SECONDS, process_workspace
 from platforms.registry import PLATFORM_ENV, UnknownPlatform, current_platform
 from workspace import CONFIG_ERROR_EXIT_CODE
@@ -78,8 +79,15 @@ def main() -> None:
         )
         sys.exit(PORT_IN_USE_EXIT_CODE)
 
+    # 搬家没搬完就往下走，ConfigStore 会在新位置建一份空配置，下次启动再也不会把旧配置搬过来。
+    try:
+        config_layout.ensure_layout(workspace_root)
+    except Exception:
+        _logger.exception("[supervisor] 配置搬进 config/ 失败，先修好再启动")
+        sys.exit(CONFIG_ERROR_EXIT_CODE)
+
     events_path = data_dir / "events.jsonl"
-    config_path = data_dir / "config.yaml"
+    config_path = config_layout.models_path(workspace_root)
 
     run_id = os.urandom(16).hex()
 
@@ -87,7 +95,7 @@ def main() -> None:
     policy = PolicyEngine(workspace_root=workspace_root)
     state = SupervisorState(workspace_root=workspace_root, eventlog=eventlog, policy=policy)
 
-    config_store = ConfigStore(path=config_path)
+    config_store = ConfigStore(path=config_path, workspace_root=workspace_root)
     # 带图路由要问「当前渠道收不收图」，问的是同一个 store，不另开一份读盘。
     state.config_store = config_store
     state.write_boot_event()

@@ -2,31 +2,17 @@ from __future__ import annotations
 
 """Helpers for user-editable drawtools config files.
 
-Only *.example.* files should be versioned as defaults. Runtime files
-(settings.yaml, character_tags.yaml, prompts/*.md) are user-owned and can be
-created from examples when missing.
+Only *.example.* files ship with the repository. Runtime files (settings.yaml,
+character_tags.yaml, prompts/*.md) belong to the instance, live in its
+config/drawtools/, and are created from the examples when missing.
 """
 
-import shutil
-from pathlib import Path
-
-DRAWTOOLS_DIR = Path(__file__).resolve().parent
-PROMPT_DIR = DRAWTOOLS_DIR / "prompts" / "novelai"
+# The supervisor and bot import this as tools.drawtools.config_io; scripts load it from its own directory.
+if __package__:
+    from .common import WORKSPACE_ROOT, config_layout
+else:
+    from common import WORKSPACE_ROOT, config_layout
 
 
 def ensure_user_configs() -> list[str]:
-    pairs = [
-        (DRAWTOOLS_DIR / "settings.example.yaml", DRAWTOOLS_DIR / "settings.yaml"),
-        (DRAWTOOLS_DIR / "character_tags.example.yaml", DRAWTOOLS_DIR / "character_tags.yaml"),
-        (PROMPT_DIR / "top-system.example.md", PROMPT_DIR / "top-system.md"),
-        (PROMPT_DIR / "output-format.example.md", PROMPT_DIR / "output-format.md"),
-        (PROMPT_DIR / "tag-guide.example.md", PROMPT_DIR / "tag-guide.md"),
-    ]
-    created: list[str] = []
-    for src, dst in pairs:
-        if dst.exists() or not src.exists():
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, dst)
-        created.append(str(dst.relative_to(DRAWTOOLS_DIR.parents[1]).as_posix()))
-    return created
+    return config_layout.ensure_drawtools_configs(WORKSPACE_ROOT)

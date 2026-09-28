@@ -140,7 +140,7 @@ prompt: |
 
   - 生图模式：在回复用户前，必须真实调用 `nai_generate_from_plan`，并等待真实工具结果；禁止把 YAML、工具调用文本或想象中的工具结果当作成功。
   - 只给提示词 / TAG 模式：不要调用生图工具。
-  - 如果生图失败，如实说明失败原因；如果失败原因是 NovelAI API Key 未配置，明确提示需要设置 NOVELAI_API_KEY 或 tools/drawtools/settings.yaml 的 api.api_key。
+  - 如果生图失败，如实说明失败原因；如果失败原因是 NovelAI API Key 未配置，明确提示需要设置 NOVELAI_API_KEY 或 config/drawtools/settings.yaml 的 api.api_key。
 
   # %%DYNAMIC%%
 

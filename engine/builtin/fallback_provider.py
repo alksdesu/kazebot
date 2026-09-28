@@ -3,7 +3,7 @@
 Why: when the primary LLM provider exhausts retries (429/5xx), the task fails
 with no recourse. How: hook into after_llm_call, detect non-OK responses for
 retryable status codes, and replay the same request against fallback providers
-listed in data/config.yaml. Purpose: improve availability without modifying
+listed in config/models.yaml. Purpose: improve availability without modifying
 core llm_call.py or ai_step.py.
 """
 from __future__ import annotations
@@ -15,6 +15,7 @@ from typing import Any, Iterable
 
 import yaml
 
+import config_layout
 from clonoth_runtime import resolve_channel, resolve_env_ref
 
 # [fix 2026-05-28] Import message formatting utilities so fallback calls go
@@ -82,7 +83,7 @@ PLUGIN_META = {
 def _resolve_env_value(value: str | None) -> str:
     """Expand ${VAR} / $ENV{VAR} references against process environment.
 
-    Why: fallback_provider reads data/config.yaml directly via yaml.safe_load and
+    Why: fallback_provider reads config/models.yaml directly via yaml.safe_load and
     never goes through ConfigStore, so unexpanded placeholders in fallback blocks
     would reach the API verbatim. Purpose: fallback secrets can live in .env.
     """
@@ -90,8 +91,8 @@ def _resolve_env_value(value: str | None) -> str:
 
 
 def _load_config(workspace_root: str | Path) -> dict[str, Any]:
-    """Read full data/config.yaml."""
-    cfg_path = Path(workspace_root) / "data" / "config.yaml"
+    """Read full config/models.yaml."""
+    cfg_path = config_layout.models_path(workspace_root)
     if not cfg_path.exists():
         return {}
     try:
@@ -169,12 +170,12 @@ def _select_fallbacks_for_node(
 
     [2026-07-16] Why: system nodes (system.compactor / system.turn_summarizer /
     read_image 等) may want a cheaper/different backup chain than the main
-    conversation. How: look up config.yaml's optional ``node_fallbacks`` mapping
+    conversation. How: look up models.yaml's optional ``node_fallbacks`` mapping
     (keyed by node id) first; if the node has an explicit entry use it, otherwise
     fall back to the top-level ``fallbacks`` list. Purpose: keep existing configs
     working (no node_fallbacks -> global fallbacks) while allowing per-node chains.
 
-    config.yaml layout::
+    models.yaml layout::
 
         fallbacks:              # 全局默认备选链（主对话等）
           - provider: openai
@@ -353,7 +354,7 @@ class FallbackProviderHandler:
         full_cfg = _load_config(workspace_root)
         # [2026-07-16] Why: 系统节点（压缩/轮摘要/读图等）希望能配置与
         # 对话主链不同的备选渠道/模型（例如主链用大模型，压缩用便宜模型）。
-        # How: 先按当前节点 id 在 config.yaml 的 node_fallbacks 映射里查专属备选链，
+        # How: 先按当前节点 id 在 models.yaml 的 node_fallbacks 映射里查专属备选链，
         # 命中则用它；未命中回退到全局 fallbacks。Purpose: 不改变旧配置行为
         # 的前提下，让系统节点能单独指定备选渠道。
         _node = getattr(ctx, "node", None)

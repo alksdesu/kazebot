@@ -66,6 +66,8 @@ const nodeFile = (name: string, isExample = false): NodeFileInfo => ({
   base_name: name.replace(/\.md$/, ''),
   size: 1,
   updated_at: 0,
+  source: 'custom',
+  same_as_default: false,
 });
 
 const ONLY_EXAMPLE = '还没有 _persona.md，bot 现在读的是 _persona.example.md。 在这里保存一次就会创建它，示例从此不再生效。';

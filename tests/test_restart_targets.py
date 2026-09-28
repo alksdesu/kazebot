@@ -122,7 +122,7 @@ def _make(tmp_path: Path, pm: Any):
     )
     app = create_app(
         state=state, process_manager=pm,
-        config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"),
+        config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path),
     )
     return state, app
 

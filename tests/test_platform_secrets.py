@@ -1,4 +1,4 @@
-"""平台密钥从哪读：data/config.yaml 的 platforms 段 > 环境变量 > 平台自己生成的文件。
+"""平台密钥从哪读：data/platform_secrets.yaml 的平台段 > 环境变量 > 平台自己生成的文件。
 
 bot、工具子进程、诊断包各读一遍，顺序必须一样。工具的环境里剥掉了密钥，只能回 config 和 .env 里找。
 """
@@ -37,6 +37,7 @@ from clonoth_runtime import (  # noqa: E402
     PlatformSecret,
     is_channel_block,
     platform_secret,
+    stray_platforms_section,
     undeclared_platform_secrets,
 )
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
@@ -78,15 +79,15 @@ def vault():
 def _workspace(root: Path, *, config: str = "", dotenv: str = "") -> Path:
     (root / "data").mkdir(parents=True, exist_ok=True)
     if config:
-        (root / "data" / "config.yaml").write_text(config, encoding="utf-8")
+        (root / "data" / "platform_secrets.yaml").write_text(config, encoding="utf-8")
     if dotenv:
         (root / ".env").write_text(dotenv, encoding="utf-8")
     return root
 
 
 def _qq(**secrets: Any) -> str:
-    lines = [f"{PLATFORMS_CONFIG_KEY}:", f"  {QQ_NAPCAT.id}:"]
-    lines.extend(f"    {name}: {json.dumps(value)}" for name, value in secrets.items())
+    lines = [f"{QQ_NAPCAT.id}:"]
+    lines.extend(f"  {name}: {json.dumps(value)}" for name, value in secrets.items())
     return "\n".join(lines) + "\n"
 
 
@@ -157,13 +158,15 @@ class TestRuntimeLookup:
 
         assert secret.value == "mapped"
 
-    def test_an_already_loaded_config_is_not_read_again(self, tmp_path: Path) -> None:
-        config = {PLATFORMS_CONFIG_KEY: {QQ_NAPCAT.id: {"forward_bridge_token": "handed-in"}}}
+    def test_an_already_loaded_mapping_is_not_read_again(self, tmp_path: Path) -> None:
+        secrets = {QQ_NAPCAT.id: {"forward_bridge_token": "handed-in"}}
 
-        assert platform_secret(tmp_path / "missing", QQ_NAPCAT, "forward_bridge_token", config=config).value == "handed-in"
+        assert platform_secret(
+            tmp_path / "missing", QQ_NAPCAT, "forward_bridge_token", secrets=secrets,
+        ).value == "handed-in"
 
     def test_another_platforms_section_is_not_read(self, tmp_path: Path) -> None:
-        root = _workspace(tmp_path, config="platforms:\n  vault:\n    forward_bridge_token: wrong-platform\n")
+        root = _workspace(tmp_path, config="vault:\n  forward_bridge_token: wrong-platform\n")
 
         assert platform_secret(root, QQ_NAPCAT, "forward_bridge_token") == PlatformSecret()
 
@@ -176,11 +179,24 @@ class TestRuntimeLookup:
 
         assert undeclared_platform_secrets(root, QQ_NAPCAT) == ["Access_Token", "forward_bridge_tokn"]
 
-    def test_the_section_is_a_reserved_top_level_key(self) -> None:
+    def test_the_old_section_name_is_still_a_reserved_top_level_key(self) -> None:
+        # 挪走之后老的 models.yaml 里还留着这一段，不能把它当成一个叫 platforms 的渠道块。
         section = {QQ_NAPCAT.id: {"forward_bridge_token": "x"}}
 
         assert PLATFORMS_CONFIG_KEY in CONFIG_META_KEYS
         assert not is_channel_block(section)
+
+    def test_a_platforms_section_left_in_the_models_file_is_not_read(self, tmp_path: Path) -> None:
+        # 照改造前的文档配的那一段现在谁也不读，认了它等于两个位置各生效一半。
+        root = _workspace(tmp_path)
+        models = root / "config" / "models.yaml"
+        models.parent.mkdir(parents=True, exist_ok=True)
+        models.write_text(
+            f"{PLATFORMS_CONFIG_KEY}:\n  {QQ_NAPCAT.id}:\n    forward_bridge_token: stale\n", encoding="utf-8",
+        )
+
+        assert platform_secret(root, QQ_NAPCAT, "forward_bridge_token") == PlatformSecret()
+        assert stray_platforms_section(root) is True
 
 
 class TestToolLookup:
@@ -365,7 +381,8 @@ class TestNapCatWebuiToken:
             asyncio.run(client._authenticate(None))
 
         assert WEBUI_ENV in str(caught.value)
-        assert "platforms.qq.napcat_webui_token" in str(caught.value)
+        assert "data/platform_secrets.yaml" in str(caught.value)
+        assert "qq.napcat_webui_token" in str(caught.value)
 
 
 class TestDiagnosticsRedaction:
@@ -377,7 +394,7 @@ class TestDiagnosticsRedaction:
     ) -> None:
         # signing_key、VAULT_SIGNING 都不叫 token/secret，按名字猜的那一套认不出它们。
         monkeypatch.setenv("VAULT_SIGNING", "sign-from-env")
-        root = _workspace(tmp_path, config="platforms:\n  vault:\n    signing_key: sign-from-config\n")
+        root = _workspace(tmp_path, config="vault:\n  signing_key: sign-from-config\n")
         service = OperationsService(SimpleNamespace(workspace_root=root))
 
         secrets = service._configured_secrets()
@@ -473,7 +490,9 @@ class TestAdapterStartup:
 
         warnings = _config_module(_adapter(monkeypatch, workspace, **{BRIDGE_ENV: "env-bridge"})).SECRET_CONFIG_WARNINGS
 
-        assert warnings == (f"{BRIDGE_ENV} is ignored: data/config.yaml platforms.qq.forward_bridge_token takes precedence",)
+        assert warnings == (
+            f"{BRIDGE_ENV} is ignored: data/platform_secrets.yaml qq.forward_bridge_token takes precedence",
+        )
 
     def test_a_token_only_in_the_process_environment_is_flagged(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -481,7 +500,7 @@ class TestAdapterStartup:
         # systemd Environment= 或 docker -e 配的令牌，工具子进程拿不到，转发会全被 Bridge 拒掉。
         config = _config_module(_adapter(monkeypatch, _workspace(tmp_path), **{BRIDGE_ENV: "env-only"}))
 
-        assert "platforms.qq.forward_bridge_token" in config.FORWARD_BRIDGE_TOKEN_TOOLS_WARNING
+        assert "data/platform_secrets.yaml qq.forward_bridge_token" in config.FORWARD_BRIDGE_TOKEN_TOOLS_WARNING
         assert BRIDGE_ENV in config.FORWARD_BRIDGE_TOKEN_TOOLS_WARNING
 
     def test_a_token_the_workspace_dotenv_also_carries_is_fine(

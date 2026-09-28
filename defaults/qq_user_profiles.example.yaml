@@ -8,7 +8,7 @@
 # 使用方式：
 # 1. 默认会读取 Clonoth 工作区下的 config/qq_user_profiles.yaml。
 #    如果你使用默认位置，复制本文件为：
-#      cp config/qq_user_profiles.example.yaml config/qq_user_profiles.yaml
+#      cp defaults/qq_user_profiles.example.yaml <工作区>/config/qq_user_profiles.yaml
 # 2. 修改 users 下的 QQ 号和字段值。
 # 3. 如果要使用其它路径，只设置这个环境变量：
 #      CLONOTH_QQ_USER_PROFILES_PATH=/test/clonoth-onebot/qq_user_profiles.yaml

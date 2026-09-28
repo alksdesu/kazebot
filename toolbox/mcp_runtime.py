@@ -12,9 +12,8 @@ from typing import Any
 
 import yaml
 
+import config_layout
 from clonoth_runtime import resolve_env_ref
-
-from .text_files import rewrite_text
 
 _MCP_IMPORT_ERROR: Exception | None = None
 
@@ -36,7 +35,7 @@ except Exception as e:  # pragma: no cover - depends on optional dependency at r
     streamable_http_client = None  # type: ignore[assignment]
 
 
-_CONFIG_REL_PATH = "data/mcp_clients.yaml"
+_CONFIG_REL_PATH = config_layout.MCP_FILE
 _CLIENT_ID_RE = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _MCP_IMAGE_INLINE_DATA_THRESHOLD = 10000
 _MCP_IMAGE_MIME_EXTENSIONS = {
@@ -62,7 +61,7 @@ def _ensure_sdk() -> None:
 
 
 def _config_path(workspace_root: Path) -> Path:
-    return workspace_root / _CONFIG_REL_PATH
+    return config_layout.mcp_path(workspace_root)
 
 
 def _default_config() -> dict[str, Any]:
@@ -124,10 +123,10 @@ def _load_raw_config(workspace_root: Path) -> dict[str, Any]:
 
 
 def _save_raw_config(workspace_root: Path, cfg: dict[str, Any]) -> None:
+    """调用方已经拿着这份配置的锁：读改写之间别的实例插进来改的那笔会被整份覆盖掉。"""
     p = _config_path(workspace_root)
-    p.parent.mkdir(parents=True, exist_ok=True)
     text = yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True)
-    rewrite_text(p, text)
+    config_layout.write_locked(p, text, mode=config_layout.private_mode_for(workspace_root, p))
 
 
 def _normalize_public_spec(client_id: str, spec: dict[str, Any]) -> dict[str, Any]:
@@ -212,24 +211,26 @@ def upsert_client(workspace_root: Path, spec: dict[str, Any]) -> dict[str, Any]:
         record["url"] = url
         record["headers"] = {str(k): str(v) for k, v in headers.items()} if isinstance(headers, dict) else {}
 
-    cfg = _load_raw_config(workspace_root)
-    clients = cfg.get("clients")
-    if not isinstance(clients, dict):
-        clients = {}
-        cfg["clients"] = clients
-    clients[cid] = record
-    _save_raw_config(workspace_root, cfg)
+    with config_layout.locked(_config_path(workspace_root)):
+        cfg = _load_raw_config(workspace_root)
+        clients = cfg.get("clients")
+        if not isinstance(clients, dict):
+            clients = {}
+            cfg["clients"] = clients
+        clients[cid] = record
+        _save_raw_config(workspace_root, cfg)
     return _normalize_public_spec(cid, record)
 
 
 def delete_client(workspace_root: Path, client_id: str) -> bool:
     cid = _normalize_client_id(client_id)
-    cfg = _load_raw_config(workspace_root)
-    clients = cfg.get("clients")
-    if not isinstance(clients, dict) or cid not in clients:
-        return False
-    clients.pop(cid, None)
-    _save_raw_config(workspace_root, cfg)
+    with config_layout.locked(_config_path(workspace_root)):
+        cfg = _load_raw_config(workspace_root)
+        clients = cfg.get("clients")
+        if not isinstance(clients, dict) or cid not in clients:
+            return False
+        clients.pop(cid, None)
+        _save_raw_config(workspace_root, cfg)
     return True
 
 

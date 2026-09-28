@@ -11,7 +11,7 @@ import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'rea
 // through full raw YAML reloads. How: import only the existing raw read/write wrappers
 // alongside the earlier node, skill, and tool helpers. Purpose: the panel can update
 // one selected item without introducing new API contracts or touching other panels.
-import { channelChoices, getMcpClientsRaw, getNodeRaw, getNodes, getProviders, getSchedulesRaw, getSkillRaw, getToolRaw, listUpstreamModels, reloadTools, updateMcpClientsRaw, updateNodeRaw, updateSchedulesRaw, updateSkillRaw, updateToolRaw, type ChannelChoice } from '../../../api/supervisorClient';
+import { channelChoices, getMcpClientsRaw, getNodeRaw, getNodes, getProviders, getSchedulesRaw, getSkillRaw, getToolRaw, listUpstreamModels, reloadTools, updateMcpClientsRaw, updateNodeRaw, updateSchedulesRaw, updateSkillRaw, updateToolRaw, type ChannelChoice, type OverlaySource, type ToolOrigin } from '../../../api/supervisorClient';
 // [2026-06-02] Use shared lightweight structured YAML helpers in the two requested panels.
 // Why: MCP clients and automation schedules already have parse and serialize helpers
 // that preserve the expected config shape. How: import the form state types and
@@ -47,6 +47,17 @@ const JsonBlock = ({ value }: { value: unknown }) => (
 // stay visually consistent and are easy to audit against the task requirements.
 const STRUCTURED_INPUT_CLASS = 'w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-xs';
 const STRUCTURED_LABEL_CLASS = 'block mb-1 text-[var(--duties-tertiary)] text-xs';
+
+// 编辑仓库默认的那份时说清楚保存落到哪：存成本实例自己的一份，从此不再随仓库更新。
+const NODE_SOURCE_HINT: Partial<Record<OverlaySource, string>> = {
+  default: '这是仓库默认节点。保存后会在 config/nodes 下存一份本实例的版本，从此不再随仓库更新。',
+  override: '本实例改过的版本，存在 config/nodes 下，盖住仓库默认；在节点管理页可以恢复默认。',
+};
+
+const TOOL_ORIGIN_HINT: Partial<Record<ToolOrigin, string>> = {
+  bundled: '仓库自带的工具。保存后会在 config/tools 下存一份本实例的版本，盖住仓库这份，从此不再随仓库更新。',
+  override: '本实例改过的版本，存在 config/tools 下，盖住仓库自带的那份；在工具页可以恢复默认。',
+};
 
 const EMPTY_NODE_CONFIG_FORM: NodeConfigFormState = {
   id: '',
@@ -289,6 +300,9 @@ const AgentsEditor = () => {
                   <span className={STRUCTURED_LABEL_CLASS}>节点 ID</span>
                   <p aria-label="节点 ID" className="font-mono text-xs">{nodeConfigForm.id}</p>
                 </div>
+                {node.source && NODE_SOURCE_HINT[node.source] && (
+                  <p className="text-[var(--duties-secondary)]">{NODE_SOURCE_HINT[node.source]}</p>
+                )}
                 <label className="block">
                   <span className={STRUCTURED_LABEL_CLASS}>名称</span>
                   <input className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ name: event.target.value })} value={nodeConfigForm.name} />
@@ -526,6 +540,9 @@ const ToolsEditor = () => {
             ) : (
             <div className="space-y-2 text-xs leading-5">
               <h3 className="mb-2 font-mono text-xs font-semibold text-[var(--duties-tertiary)]">Python 脚本编辑</h3>
+              {tool.origin && TOOL_ORIGIN_HINT[tool.origin] && (
+                <p className="text-[var(--duties-secondary)]">{TOOL_ORIGIN_HINT[tool.origin]}</p>
+              )}
               {/* [2026-06-02] Add the requested raw Python editor below schema details.
                   Why: tool metadata alone cannot change implementation code. How: bind
                   the selected tool's raw script to the specified monospace textarea and

@@ -30,8 +30,8 @@ inject = _load("_test_image_inject", "plugins/image_gen_inject.py")
 
 
 def _workspace(tmp_path: Path, config: str, dotenv: str = "") -> Path:
-    (tmp_path / "data").mkdir(exist_ok=True)
-    (tmp_path / "data" / "config.yaml").write_text(config, encoding="utf-8")
+    (tmp_path / "config").mkdir(exist_ok=True)
+    (tmp_path / "config" / "models.yaml").write_text(config, encoding="utf-8")
     if dotenv:
         (tmp_path / ".env").write_text(dotenv, encoding="utf-8")
     return tmp_path
@@ -252,7 +252,7 @@ class TestRealPrompt:
         import yaml
 
         data = yaml.safe_load(
-            (_ROOT / "config" / "nodes" / "draw.image_gen.yaml").read_text(encoding="utf-8"))
+            (_ROOT / "defaults" / "nodes" / "draw.image_gen.yaml").read_text(encoding="utf-8"))
         return str(data["prompt"])
 
     def test_only_gemini_leaves_no_trace_of_gpt(self) -> None:
@@ -278,17 +278,19 @@ class TestRealPrompt:
 
 
 def _drawtools_workspace(tmp_path: Path, config: str, settings: str | None) -> Path:
-    """带 tools/ 的完整工作区。按路径加载靠的是模块位置，所以文件得真的在。"""
+    """带 tools/ 的完整工作区。按路径加载靠的是模块位置，所以脚本得真的在；运行时配置在实例的 config/drawtools/。"""
     root = _workspace(tmp_path, config)
     (root / "tools" / "drawtools").mkdir(parents=True, exist_ok=True)
     for name in ("_channel.py",):
         (root / "tools" / name).write_text(
             (_ROOT / "tools" / name).read_text(encoding="utf-8"), encoding="utf-8")
-    for name in ("common.py", "settings.example.yaml"):
+    for name in ("common.py",):
         (root / "tools" / "drawtools" / name).write_text(
             (_ROOT / "tools" / "drawtools" / name).read_text(encoding="utf-8"), encoding="utf-8")
     if settings is not None:
-        (root / "tools" / "drawtools" / "settings.yaml").write_text(settings, encoding="utf-8")
+        target = root / "config" / "drawtools" / "settings.yaml"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(settings, encoding="utf-8")
     return root
 
 

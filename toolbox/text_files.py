@@ -18,14 +18,19 @@ def newline_of(path: Path) -> str | None:
     return CRLF if b"\r\n" in data else LF
 
 
-def write_text_as(path: Path, content: str, newline: str | None) -> int:
-    """按给定的换行符写 UTF-8 文本，返回落盘的字节数；newline 为 None 时照内容原样写。"""
+def encode_as(content: str, newline: str | None) -> bytes:
+    """按给定的换行符编码成 UTF-8；newline 为 None 时照内容原样。"""
     text = content
     if newline is not None:
         text = content.replace(CRLF, LF)
         if newline != LF:
             text = text.replace(LF, newline)
-    data = text.encode("utf-8")
+    return text.encode("utf-8")
+
+
+def write_text_as(path: Path, content: str, newline: str | None) -> int:
+    """按给定的换行符写 UTF-8 文本，返回落盘的字节数；newline 为 None 时照内容原样写。"""
+    data = encode_as(content, newline)
     path.write_bytes(data)
     return len(data)
 

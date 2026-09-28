@@ -66,7 +66,7 @@ def client(workspace: Path, monkeypatch: pytest.MonkeyPatch):
             policy=PolicyEngine(workspace_root=workspace),
         ),
         process_manager=None,
-        config_store=ConfigStore(path=workspace / "data" / "config.yaml"),
+        config_store=ConfigStore(path=workspace / "config" / "models.yaml", workspace_root=workspace),
     )
 
     def call(method: str, url: str, **kwargs: Any) -> httpx.Response:
@@ -175,19 +175,45 @@ def test_the_editor_opens_a_tool_that_lives_in_a_subdirectory(client) -> None:
     assert '"name": "pkg_entry"' in resp.json()["content"]
 
 
-def test_saving_writes_back_to_the_file_the_name_came_from(client, workspace: Path) -> None:
+def test_saving_lands_at_the_path_the_name_came_from(client, workspace: Path) -> None:
+    # 改仓库那份不动原文件，落成 config/tools/ 里同一相对路径的覆盖。
     client("PUT", f"{_BASE}/spec_name/raw", headers=_AUTH, json={"content": _script("spec_name")})
 
-    assert not (workspace / "tools" / "spec_name.py").exists()
-    assert (workspace / "tools" / "renamed.py").read_text(encoding="utf-8").startswith("SPEC")
+    assert not (workspace / "config" / "tools" / "spec_name.py").exists()
+    assert (workspace / "config" / "tools" / "renamed.py").read_text(encoding="utf-8").startswith("SPEC")
 
 
 def test_deleting_removes_the_real_file_instead_of_reporting_a_silent_success(
     client, workspace: Path,
 ) -> None:
-    assert client("DELETE", f"{_BASE}/pkg_entry", headers=_AUTH).json()["ok"] is True
+    own = workspace / "config" / "tools" / "own" / "entry.py"
+    own.parent.mkdir(parents=True)
+    own.write_text(_script("own_entry"), encoding="utf-8")
 
-    assert not (workspace / "tools" / "pkg" / "entry.py").exists()
+    assert client("DELETE", f"{_BASE}/own_entry", headers=_AUTH).json() == {"ok": True, "restored": False}
+
+    assert not own.exists()
+
+
+def test_deleting_a_bundled_tool_is_refused_instead_of_reporting_a_silent_success(
+    client, workspace: Path,
+) -> None:
+    # 仓库那份只读，删掉下次升级又回来；说不能删，别报成功。
+    resp = client("DELETE", f"{_BASE}/pkg_entry", headers=_AUTH)
+
+    assert resp.status_code == 409
+    assert (workspace / "tools" / "pkg" / "entry.py").exists()
+
+
+def test_deleting_an_override_restores_the_bundled_file(client, workspace: Path) -> None:
+    override = workspace / "config" / "tools" / "pkg" / "entry.py"
+    override.parent.mkdir(parents=True)
+    override.write_text(_script("pkg_entry"), encoding="utf-8")
+
+    assert client("DELETE", f"{_BASE}/pkg_entry", headers=_AUTH).json() == {"ok": True, "restored": True}
+
+    assert not override.exists()
+    assert (workspace / "tools" / "pkg" / "entry.py").exists()
 
 
 def test_creating_a_name_a_subdirectory_already_owns_is_a_conflict(client) -> None:

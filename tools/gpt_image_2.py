@@ -122,7 +122,7 @@ if __name__ == "__main__":
     except ValueError:
         fail(f'Invalid size format: {size}. Use WxH, e.g. 1024x1536')
 
-    # 优先级：config.yaml system_models.image_gpt > CLONOTH_IMAGE_GPT_* > OPENAI_* > 主渠道。
+    # 优先级：models.yaml system_models.image_gpt > CLONOTH_IMAGE_GPT_* > OPENAI_* > 主渠道。
     # 主渠道只在它本来就收 OpenAI 格式时才借，否则地址对了格式也不对。
     # model 不跟着借：主渠道那个是聊天模型，生图得用这里的默认值。
     if str(Path(__file__).resolve().parent) not in sys.path:
@@ -136,7 +136,7 @@ if __name__ == "__main__":
     model_name = channel.model
 
     if not api_key:
-        fail('No API key found in config.yaml / env / .env file')
+        fail('No API key found in config/models.yaml / env / .env file')
     if not base_url:
         fail('No base_url configured (system_models.image_gpt / OPENAI_BASE_URL)')
 

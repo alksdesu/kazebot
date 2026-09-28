@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
-import { getPolicyRaw, getRuntimeRaw, updatePolicyRaw, updateRuntimeRaw } from '../../../api/supervisorClient';
+import { getPolicyRaw, getRuntimeFile, resetRuntime, updatePolicyRaw, updateRuntimeRaw, type RuntimeFile } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { parseRuntimeConfig, serializeRuntimeConfig, type EngineToolMode, type RuntimeConfigFormState } from '../settingsStructuredConfig';
@@ -24,6 +24,12 @@ const FILES: Array<{ key: FileKey; title: string; filename: string; description:
   { key: 'runtime', title: '运行时配置 (runtime.yaml)', filename: 'runtime.yaml', description: '运行时参数、入口节点、工具模式、记忆和进程配置。' },
   { key: 'policy', title: '安全策略 (policy.yaml)', filename: 'policy.yaml', description: '原始 YAML 兜底。读写规则和敏感路径请在「工具与权限」页改，这里用于 deny_patterns 等结构化编辑覆盖不到的字段。' },
 ];
+
+// runtime 逐键盖在仓库默认上面：本实例那份没写到的键跟着仓库更新。
+const RUNTIME_SOURCE_HINT: Record<RuntimeFile['source'], string> = {
+  default: '现在用的是仓库默认。保存后会在 config/runtime.yaml 存一份本实例的，没写到的键仍跟随仓库默认。',
+  override: '本实例有自己的 config/runtime.yaml，逐键盖在仓库默认上面；没写到的键跟随仓库更新。',
+};
 
 const STRUCTURED_INPUT_CLASS = 'w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-xs';
 const STRUCTURED_LABEL_CLASS = 'block mb-1 text-[var(--duties-tertiary)] text-mini';
@@ -60,6 +66,7 @@ export const AdvancedSettingsPage = () => {
     policy: { value: '', saved: '', message: '', loading: false, loaded: false },
   });
   const [runtimeConfigForm, setRuntimeConfigForm] = useState<RuntimeConfigFormState>(EMPTY_RUNTIME_CONFIG_FORM);
+  const [runtimeSource, setRuntimeSource] = useState<RuntimeFile['source'] | ''>('');
 
   const [runtimeBaseline, setRuntimeBaseline] = useState(EMPTY_RUNTIME_CONFIG_FORM);
   const [runtimeFormEdited, setRuntimeFormEdited] = useState(false);
@@ -78,6 +85,7 @@ export const AdvancedSettingsPage = () => {
       policy: { value: '', saved: '', message: '', loading: false, loaded: false },
     });
     setRuntimeConfigForm(EMPTY_RUNTIME_CONFIG_FORM); setRuntimeBaseline(EMPTY_RUNTIME_CONFIG_FORM); setRuntimeFormEdited(false);
+    setRuntimeSource('');
     return () => {
       mounted.current = false;
       for (const operation of Object.values(operations.current)) { operation.id++; operation.busy = false; }
@@ -113,10 +121,12 @@ export const AdvancedSettingsPage = () => {
     if (fileDirty(key) && !window.confirm(`重新加载 ${key}.yaml 会丢弃这个文件的未保存修改，确定继续吗？`)) return;
     const id = begin(key);
     try {
-      const raw = key === 'runtime' ? await getRuntimeRaw(adminToken) : await getPolicyRaw(adminToken);
+      const runtime = key === 'runtime' ? await getRuntimeFile(adminToken) : null;
+      const raw = runtime ? runtime.content : await getPolicyRaw(adminToken);
       if (!isCurrent(key, id)) return;
       setFileState(key, { value: raw, saved: raw, loaded: true, message: '' });
-      if (key === 'runtime') {
+      if (runtime) {
+        setRuntimeSource(runtime.source);
         setRuntimeFormEdited(false); setRuntimeConfigForm(EMPTY_RUNTIME_CONFIG_FORM); setRuntimeBaseline(EMPTY_RUNTIME_CONFIG_FORM);
         const form = parseRuntimeConfig(raw);
         setRuntimeConfigForm(form); setRuntimeBaseline(form);
@@ -141,10 +151,28 @@ export const AdvancedSettingsPage = () => {
       else await updatePolicyRaw(adminToken, value);
       if (!isCurrent(key, id)) return;
       setFileState(key, { value, saved: value, message: '已保存' });
-      if (form) { setRuntimeConfigForm(form); setRuntimeBaseline(form); setRuntimeFormEdited(false); }
+      if (form) { setRuntimeConfigForm(form); setRuntimeBaseline(form); setRuntimeFormEdited(false); setRuntimeSource('override'); }
     } catch (error) {
       if (isCurrent(key, id)) setFileState(key, { message: error instanceof Error ? error.message : '保存失败' });
     } finally { finish(key, id); }
+  };
+
+  const resetRuntimeToDefault = async () => {
+    if (!adminToken || !isAuthenticated || operations.current.runtime.busy || runtimeSource !== 'override') return;
+    const unsaved = fileDirty('runtime') ? '未保存的修改也会一起丢掉。' : '';
+    if (!window.confirm(`删掉本实例的 config/runtime.yaml，全部参数恢复成仓库默认？${unsaved}`)) return;
+    const id = begin('runtime');
+    try {
+      await resetRuntime(adminToken);
+      const runtime = await getRuntimeFile(adminToken);
+      if (!isCurrent('runtime', id)) return;
+      setFileState('runtime', { value: runtime.content, saved: runtime.content, loaded: true, message: '已恢复成仓库默认' });
+      setRuntimeSource(runtime.source);
+      const form = parseRuntimeConfig(runtime.content);
+      setRuntimeConfigForm(form); setRuntimeBaseline(form); setRuntimeFormEdited(false);
+    } catch (error) {
+      if (isCurrent('runtime', id)) setFileState('runtime', { message: error instanceof Error ? error.message : '恢复默认失败' });
+    } finally { finish('runtime', id); }
   };
 
   return (
@@ -159,7 +187,14 @@ export const AdvancedSettingsPage = () => {
                 <fieldset disabled={state.loading} className="mt-3 min-w-0 space-y-3">
                   {file.key === 'runtime' ? (
                     <>
-                      <div className="flex flex-wrap gap-2"><Button tone="quiet" disabled={state.loading} onClick={() => loadOne(file.key)}>{state.loading ? '正在加载…' : '加载'}</Button><Button disabled={state.loading || !state.loaded || !state.value} onClick={() => saveOne(file.key)}>保存运行时配置</Button></div>
+                      <div className="flex flex-wrap gap-2">
+                        <Button tone="quiet" disabled={state.loading} onClick={() => loadOne(file.key)}>{state.loading ? '正在加载…' : '加载'}</Button>
+                        <Button disabled={state.loading || !state.loaded || !state.value} onClick={() => saveOne(file.key)}>保存运行时配置</Button>
+                        <Button tone="quiet" disabled={state.loading || runtimeSource !== 'override'} onClick={() => void resetRuntimeToDefault()}>恢复默认</Button>
+                      </div>
+                      {state.loaded && runtimeSource && (
+                        <p className="text-mini leading-4 text-[var(--duties-tertiary)]">{RUNTIME_SOURCE_HINT[runtimeSource]}</p>
+                      )}
                       <fieldset disabled={!state.loaded} className="min-w-0 space-y-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-sm leading-5">
                         <label className="block">
                           <span className={STRUCTURED_LABEL_CLASS}>入口节点 ID</span>

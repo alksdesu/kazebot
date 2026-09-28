@@ -18,6 +18,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import config_layout
 import engine.data_cleanup as cleanup
 import engine.signals.bridge as bridge
 from engine.eventlog_rotation import SIGNALS_BACKUPS, SIGNALS_MAX_BYTES
@@ -774,6 +775,8 @@ class TestCleanupSchedule:
 
     def test_dry_run_defaults_to_true(self, tmp_path: Path, monkeypatch) -> None:
         # 一个从来没跑过的清理脚本第一次上线，默认必须是只报告不删。
+        # 仓库那份 defaults/runtime.yaml 显式写了 dry_run: false，量的是它下面那层代码兜底。
+        monkeypatch.setattr(config_layout, "CODE_ROOT", tmp_path)
         (tmp_path / "config").mkdir(parents=True, exist_ok=True)
         (tmp_path / "config" / "runtime.yaml").write_text(
             yaml.safe_dump({"maintenance": {"data_cleanup": {"cron": "17 * * * *"}}}), encoding="utf-8",

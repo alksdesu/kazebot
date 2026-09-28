@@ -1,4 +1,4 @@
-"""扫描 engine/system_nodes/ 和 config/nodes/ 构建节点图，找出根节点（无上游）。"""
+"""扫描 engine/system_nodes/、config/nodes/ 和仓库默认的 defaults/nodes/ 构建节点图，找出根节点（无上游）。"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field

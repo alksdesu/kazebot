@@ -2,9 +2,32 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 
-import { getNodeFileRaw, getNodeFiles, makeNodeFileExample, updateNodeFileRaw, type NodeFileInfo } from '../../../api/supervisorClient';
+import { deleteNodeFile, getNodeFileRaw, getNodeFiles, updateNodeFileRaw, type NodeFileInfo } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { overlaySourceLabel, removalFor } from '../../../utils/overlaySource';
 import { Block, Button, Field, PageShell, Select, StatusText } from './settingsControls';
+
+type FileFilter = 'all' | 'node' | 'fragment' | 'example' | 'changed';
+
+const FILTERS: Array<{ key: FileFilter; label: string }> = [
+  { key: 'all', label: '全部' },
+  { key: 'node', label: '节点 YAML' },
+  { key: 'fragment', label: '片段 MD' },
+  { key: 'example', label: 'Example 模板' },
+  { key: 'changed', label: '本实例改过或自建的' },
+];
+
+function matchesFilter(file: NodeFileInfo, filter: FileFilter): boolean {
+  if (filter === 'all') return true;
+  if (filter === 'changed') return file.source !== 'default';
+  if (filter === 'example') return file.is_example;
+  return file.kind === filter && !file.is_example;
+}
+
+function fileOptionLabel(file: NodeFileInfo): string {
+  const tags = [overlaySourceLabel(file.source, file.same_as_default), file.is_example ? 'example' : ''].filter(Boolean);
+  return tags.length ? `${file.name} · ${tags.join(' · ')}` : file.name;
+}
 
 export const NodeFilesSettingsPage = () => {
   const token = useSettingsStore(state => state.adminToken);
@@ -16,7 +39,7 @@ const NodeFilesSettingsPageEditor = () => {
   const [files, setFiles] = useState<NodeFileInfo[]>([]);
   const [selected, setSelected] = useState('');
   const [content, setContent] = useState('');
-  const [filter, setFilter] = useState<'all' | 'node' | 'fragment' | 'example'>('all');
+  const [filter, setFilter] = useState<FileFilter>('all');
   const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -25,11 +48,7 @@ const NodeFilesSettingsPageEditor = () => {
   const requestVersion = useRef(0);
   const confirmDiscard = useUnsavedChanges(content !== saved, '当前文件还有未保存修改，确定离开或重新加载吗？');
 
-  const visibleFiles = useMemo(() => files.filter((file) => {
-    if (filter === 'all') return true;
-    if (filter === 'example') return file.is_example;
-    return file.kind === filter && !file.is_example;
-  }), [files, filter]);
+  const visibleFiles = useMemo(() => files.filter((file) => matchesFilter(file, filter)), [files, filter]);
 
   const loadFiles = async () => {
     if (!adminToken || !isAuthenticated) return;
@@ -54,7 +73,7 @@ const NodeFilesSettingsPageEditor = () => {
     }
   };
 
-  // 手动刷新才清提示：创建 example 写完结果紧接着就会重读。
+  // 手动刷新才清提示：恢复默认写完结果紧接着就会重读。
   const refresh = async () => {
     if (!confirmDiscard()) return;
     clearNotice();
@@ -89,6 +108,8 @@ const NodeFilesSettingsPageEditor = () => {
       await updateNodeFileRaw(adminToken, selected, content);
       setSaved(content);
       setMessage(`已保存 ${selected}`);
+      // 保存仓库默认会在 config/nodes 下落一份本实例的，列表里的来源和路径跟着变。
+      if (files.find(file => file.name === selected)?.source === 'default') await loadFiles();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '保存失败');
     } finally {
@@ -96,33 +117,36 @@ const NodeFilesSettingsPageEditor = () => {
     }
   };
 
-  const createExample = async () => {
-    if (!adminToken || !selected || loading || saving || !confirmDiscard()) return;
+  const current = files.find(file => file.name === selected);
+  const removal = current ? removalFor(current.source, `文件 ${current.name}`) : null;
+
+  const remove = async () => {
+    if (!adminToken || !current || !removal || loading || saving) return;
+    const unsaved = content !== saved ? '当前还有未保存修改，也会一起丢掉。' : '';
+    if (!window.confirm(`${removal.confirm}${unsaved}`)) return;
     setSaving(true);
     try {
-      const result = await makeNodeFileExample(adminToken, selected);
-      setMessage(result.created ? `已创建 ${result.path}` : `Example 已存在：${result.path}`);
+      await deleteNodeFile(adminToken, current.name);
+      // 恢复默认后文件还在，只是换回仓库那份；重读列表时照旧选中它。
+      if (!removal.restores) setSelected('');
+      setSaved(content);
+      setMessage(removal.done);
       await loadFiles();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '创建 example 失败');
+      setMessage(error instanceof Error ? error.message : `${removal.label}失败`);
     } finally {
       setSaving(false);
     }
   };
 
-  const current = files.find(file => file.name === selected);
-
   return (
-    <PageShell authed={isAuthenticated} description="管理 config/nodes 下的 YAML 节点与 Markdown 片段，包括 _persona.example.md、_persona.md、qq.orchestrator.yaml 等。" title="节点文件">
-      <Block frame="boxed" title="config/nodes 文件编辑器" hint="可编辑 .yaml/.yml/.md。建议长期自定义内容放入非 example 文件；example 文件可作为模板同步。">
+    <PageShell authed={isAuthenticated} description="节点 YAML 与 Markdown 片段，包括 _persona.md、qq.orchestrator.yaml 等。仓库自带的默认文件直接生效并跟着代码更新；保存后会在 config/nodes 下存一份本实例的版本，从此不再随仓库变化，恢复默认即删掉这份。" title="节点文件">
+      <Block frame="boxed" title="节点文件编辑器" hint="可编辑 .yaml/.yml/.md。只改需要改的文件：改过的文件会盖住仓库默认，以后仓库对它的更新到不了这个实例。">
         <div className="mb-3 grid gap-3 md:grid-cols-[var(--duties-split-columns-narrow)]">
           <div>
             <Field label="过滤" layout="stacked">
-              <Select width="wide" aria-label="文件类型过滤" onChange={(event) => setFilter(event.currentTarget.value as any)} value={filter}>
-                <option value="all">全部</option>
-                <option value="node">节点 YAML</option>
-                <option value="fragment">片段 MD</option>
-                <option value="example">Example 模板</option>
+              <Select width="wide" aria-label="文件类型过滤" onChange={(event) => setFilter(event.currentTarget.value as FileFilter)} value={filter}>
+                {FILTERS.map(item => <option key={item.key} value={item.key}>{item.label}</option>)}
               </Select>
             </Field>
           </div>
@@ -131,13 +155,16 @@ const NodeFilesSettingsPageEditor = () => {
               <Select width="wide" aria-label="当前文件" disabled={saving} onChange={(event) => void selectFile(event.currentTarget.value)} value={selected}>
                 {selected && !visibleFiles.some(file => file.name === selected) && <option value={selected}>{selected} · 当前编辑</option>}
                 {visibleFiles.map(file => (
-                  <option key={file.name} value={file.name}>{file.name}{file.is_example ? ' · example' : ''}</option>
+                  <option key={file.name} value={file.name}>{fileOptionLabel(file)}</option>
                 ))}
               </Select>
             </Field>
           </div>
         </div>
-        {current && <p className="mb-3 font-mono text-mini text-[var(--duties-tertiary)]">{current.path} · {current.kind === 'fragment' ? 'Markdown 片段' : '节点 YAML'} · {current.size} bytes</p>}
+        {current && <p className="mb-3 font-mono text-mini text-[var(--duties-tertiary)]">{current.path} · {current.kind === 'fragment' ? 'Markdown 片段' : '节点 YAML'} · {current.size} bytes · {overlaySourceLabel(current.source, current.same_as_default)}</p>}
+        {current?.same_as_default && (
+          <p className="mb-3 text-mini leading-4 text-[var(--duties-secondary)]">这份和仓库默认一字不差，什么也没改，只会挡住以后仓库对它的更新，建议恢复默认。</p>
+        )}
         <textarea
           aria-label="文件内容"
           disabled={loading || saving || !selected || !loaded}
@@ -149,7 +176,7 @@ const NodeFilesSettingsPageEditor = () => {
         <div className="mt-3 flex flex-wrap gap-2">
           <Button tone="quiet" disabled={loading || saving} onClick={() => void refresh()}>{loading ? '正在刷新…' : '刷新列表'}</Button>
           <Button disabled={!selected || !loaded || loading || saving || content === saved} onClick={save}>{saving ? '正在保存…' : '保存当前文件'}</Button>
-          <Button tone="quiet" disabled={!selected || loading || saving || current?.is_example} onClick={createExample}>从已保存文件创建 Example</Button>
+          <Button tone={removal?.restores ? 'quiet' : 'danger'} disabled={!removal || loading || saving} onClick={() => void remove()}>{removal?.label ?? '恢复默认'}</Button>
         </div>
         <StatusText message={notice} />
       </Block>

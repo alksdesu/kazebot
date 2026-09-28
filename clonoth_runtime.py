@@ -14,6 +14,7 @@ import httpx
 import yaml
 from dotenv import load_dotenv
 
+import config_layout
 from workspace import pin_workspace_env, resolve_workspace_root, workspace_env_root
 
 if TYPE_CHECKING:
@@ -93,13 +94,13 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
 }
 
 
-_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_CACHE: dict[str, tuple[tuple[float, float], dict[str, Any]]] = {}
 
 
 # 键 → 去处，空串表示没有替代项。旧工作区的 runtime.yaml 里可能还留着它们。
 RETIRED_RUNTIME_KEYS: dict[str, str] = {
     "engine.history_limit": "对话历史不按条数截断，长度交给 engine.compact 控制",
-    "engine.model": "模型写在 data/config.yaml 的渠道块或节点 yaml 里",
+    "engine.model": "模型写在 config/models.yaml 的渠道块或节点 yaml 里",
     "engine.approval_poll_interval_sec": "",
     "engine.supervisor": "",
     "engine.tool_trace": "",
@@ -139,7 +140,8 @@ def _warn_retired_keys(path: Path, user_cfg: Mapping[str, Any]) -> None:
 
 
 def runtime_config_path(workspace_root: Path) -> Path:
-    return workspace_root / "config" / "runtime.yaml"
+    """实例改过的那份 runtime。没有时整份用仓库默认的 defaults/runtime.yaml。"""
+    return config_layout.runtime_path(workspace_root)
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -152,30 +154,42 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return out
 
 
-def load_runtime_config(workspace_root: Path) -> dict[str, Any]:
-    path = runtime_config_path(workspace_root)
+def _mtime(path: Path) -> float:
     try:
-        mtime = path.stat().st_mtime if path.exists() else -1.0
+        return path.stat().st_mtime if path.exists() else -1.0
     except Exception:
-        mtime = -1.0
+        return -1.0
 
-    key = str(path.resolve())
+
+def _read_runtime_layer(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def load_runtime_config(workspace_root: Path) -> dict[str, Any]:
+    """代码里的默认值 ← 仓库的 defaults/runtime.yaml ← 实例改过的 config/runtime.yaml，逐键往上盖。
+
+    实例那份只盖它写了的键：发版给默认 runtime 加的新键，改过 runtime 的实例也照样拿得到。
+    """
+    default_path, own_path = config_layout.runtime_layers(workspace_root)
+    stamp = (_mtime(default_path), _mtime(own_path))
+
+    key = str(own_path.resolve())
     cached = _CACHE.get(key)
-    if cached is not None and cached[0] == mtime:
+    if cached is not None and cached[0] == stamp:
         return copy.deepcopy(cached[1])
 
-    user_cfg: dict[str, Any] = {}
-    if path.exists():
-        try:
-            loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-            if isinstance(loaded, dict):
-                user_cfg = loaded
-        except Exception:
-            user_cfg = {}
-
-    _warn_retired_keys(path, user_cfg)
-    merged = _deep_merge(DEFAULT_RUNTIME_CONFIG, user_cfg)
-    _CACHE[key] = (mtime, merged)
+    default_cfg = _read_runtime_layer(default_path)
+    user_cfg = _read_runtime_layer(own_path)
+    _warn_retired_keys(default_path, default_cfg)
+    _warn_retired_keys(own_path, user_cfg)
+    merged = _deep_merge(_deep_merge(DEFAULT_RUNTIME_CONFIG, default_cfg), user_cfg)
+    _CACHE[key] = (stamp, merged)
     return copy.deepcopy(merged)
 
 
@@ -363,12 +377,12 @@ def normalize_openai_secret(data: dict[str, Any]) -> MainChannel:
 # [2026-07-16] Why: 压缩/轮摘要/读图这三个系统用途，用户希望：
 #   1) 不填时跟随主渠道 url/key（只换模型名，甚至模型名也可留空跟随主模型）；
 #   2) 也能单独指定 url/key/model；
-#   3) 环境变量和 config.yaml 两种方式都支持。
-# How: 统一读 data/config.yaml 的 system_models.<slot> 块，每个字段解析 ${VAR}；
+#   3) 环境变量和 config/models.yaml 两种方式都支持。
+# How: 统一读 config/models.yaml 的 system_models.<slot> 块，每个字段解析 ${VAR}；
 #   字段留空时按 slot 专属环境变量兜底，再留空则跟随主渠道对应值。
-# Purpose: 三个系统用途共用同一套解析规则，配置集中在 config.yaml + .env。
+# Purpose: 三个系统用途共用同一套解析规则，配置集中在 config/models.yaml + .env。
 #
-# config.yaml 布局：
+# config/models.yaml 布局：
 #   system_models:
 #     compact:  { model: "...", base_url: "${...}", api_key: "${...}" }
 #     summary:  { model: "..." }                 # 只换模型，url/key 跟随主渠道
@@ -458,8 +472,8 @@ def image_tool_available(workspace_root: Path, tool_name: str) -> bool:
 def novelai_available(workspace_root: Path) -> bool:
     """NovelAI 配了 key 才算可用：settings.yaml 优先，其次 NOVELAI_API_KEY。
 
-    判定借 drawtools 自己那份 —— 它的路径常量按模块位置算，从这里加载正好指向同一个
-    工作区。settings.example.yaml 里 api_key 是空串，回退到示例不会判成已配。
+    判定借 drawtools 自己那份 —— 它按工作区变量找 config/drawtools，supervisor 早把那组变量
+    钉在本工作区上。settings.example.yaml 里 api_key 是空串，回退到示例不会判成已配。
     """
     module = load_module_from(
         Path(workspace_root) / "tools" / "drawtools" / "common.py", "clonoth_drawtools_common")
@@ -472,18 +486,30 @@ def novelai_available(workspace_root: Path) -> bool:
 
 
 def _load_config_yaml(workspace_root: Path) -> dict[str, Any]:
-    p = workspace_root / "data" / "config.yaml"
-    data = load_yaml_dict(p)
+    """模型渠道配置 config/models.yaml。"""
+    data = load_yaml_dict(config_layout.models_path(workspace_root))
     return data if isinstance(data, dict) else {}
+
+
+def load_platform_secrets(workspace_root: Path | str) -> dict[str, Any]:
+    """平台密钥 data/platform_secrets.yaml：顶层按平台 id 分段。"""
+    data = load_yaml_dict(config_layout.platform_secrets_path(workspace_root))
+    return data if isinstance(data, dict) else {}
+
+
+def stray_platforms_section(workspace_root: Path | str) -> bool:
+    """模型配置里还写着 platforms 段：照改造前的文档配的，那一段现在谁也不读。"""
+    return config_layout.LEGACY_PLATFORMS_KEY in _load_config_yaml(Path(workspace_root))
 
 
 # ---------------------------------------------------------------------------
 #  命名渠道解析
 # ---------------------------------------------------------------------------
-# 各平台的密钥写在这一段下：platforms.<平台 id>.<密钥名>。
-PLATFORMS_CONFIG_KEY = "platforms"
+# 平台密钥原先写在模型配置顶层的这一段下。挪走之后仍占着这个名字：老配置里还留着这一段时，
+# 不能把它当成一个叫 platforms 的渠道。
+PLATFORMS_CONFIG_KEY = config_layout.LEGACY_PLATFORMS_KEY
 
-# config.yaml 顶层的渠道块由用户自己命名，只能靠排除法认出来。
+# 模型配置顶层的渠道块由用户自己命名，只能靠排除法认出来。
 CONFIG_META_KEYS = frozenset({
     "version", "provider", "fallbacks", "node_fallbacks", "system_models", "image_gen",
     PLATFORMS_CONFIG_KEY,
@@ -498,7 +524,7 @@ def is_channel_block(value: Any) -> bool:
 
 @dataclass(frozen=True)
 class Channel:
-    """config.yaml 里的一个渠道块。known=False 表示这名字底下没有块。"""
+    """config/models.yaml 里的一个渠道块。known=False 表示这名字底下没有块。"""
 
     name: str = ""
     wire: str = ""
@@ -517,7 +543,7 @@ def resolve_channel(
 ) -> Channel:
     """把 provider 字段上的那个名字解析成一个渠道。
 
-    渠道名区分大小写（`gemini-中转A` 就是这么存进 config.yaml 的），线格式名不区分。
+    渠道名区分大小写（`gemini-中转A` 就是这么存进 config/models.yaml 的），线格式名不区分。
     名字底下没有块时按线格式名处理，老配置的 `provider: deepseek` 因此原样继续可用。
     """
     requested = str(name or "").strip()
@@ -558,13 +584,12 @@ class PlatformSecret:
 
     value: str = ""
     source: str = ""
-    # data/config.yaml 那份盖住了一个不同的 env 值。改了 .env 不见效时，这是唯一的线索。
+    # data/platform_secrets.yaml 那份盖住了一个不同的 env 值。改了 .env 不见效时，这是唯一的线索。
     env_shadowed: bool = False
 
 
-def _platform_section(config: Mapping[str, Any], platform_id: str) -> Mapping[str, Any]:
-    section = config.get(PLATFORMS_CONFIG_KEY)
-    block = section.get(platform_id) if isinstance(section, dict) else None
+def _platform_section(secrets: Mapping[str, Any], platform_id: str) -> Mapping[str, Any]:
+    block = secrets.get(platform_id)
     return block if isinstance(block, dict) else {}
 
 
@@ -580,17 +605,17 @@ def platform_secret(
     platform: PlatformDescriptor,
     name: str,
     *,
-    config: Mapping[str, Any] | None = None,
+    secrets: Mapping[str, Any] | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> PlatformSecret:
-    """平台显式配的密钥：data/config.yaml 的 platforms.<id>.<name> 优先，其次声明的环境变量。
+    """平台显式配的密钥：data/platform_secrets.yaml 的 <id>.<name> 优先，其次声明的环境变量。
 
-    和系统槽位一样文件优先：运维改的是文件，一行早就忘了的 env 不该顶掉它。config 里可以写
-    ${VAR} 引用 .env。自动生成的密钥文件由平台自己管，不在这里读。environ 给了就拿它代替进程环境，
-    供要每次重读 .env 文件的调用方用。
+    和系统槽位一样文件优先：运维改的是文件，一行早就忘了的 env 不该顶掉它。文件里可以写
+    ${VAR} 引用 .env。自动生成的密钥文件由平台自己管，不在这里读。secrets 给了就不再读文件；
+    environ 给了就拿它代替进程环境，供要每次重读 .env 文件的调用方用。
     """
     spec = platform.secret(name)
-    data = _load_config_yaml(Path(workspace_root)) if config is None else config
+    data = load_platform_secrets(workspace_root) if secrets is None else secrets
     from_config = _secret_text(_platform_section(data, platform.id).get(name), environ)
     source = os.environ if environ is None else environ
     from_env = str(source.get(spec.env, "") or "").strip() if spec.env else ""
@@ -648,8 +673,13 @@ def _settle_workspace(explicit: Path | str | None, *, override: bool) -> Path:
 
 
 def offline_workspace(explicit: Path | str | None = None) -> Path:
-    """离线工具定工作区并灌 .env，返回工作区根。进程里已经有的变量都不覆盖。"""
-    return _settle_workspace(explicit, override=False)
+    """离线工具定工作区并灌 .env，返回工作区根。进程里已经有的变量都不覆盖。
+
+    升级后服务还没起过就跑迁移脚本时，配置还在旧位置：先搬好再读，否则按空的平台密钥算出来的全是错的。
+    """
+    root = _settle_workspace(explicit, override=False)
+    config_layout.ensure_layout(root)
+    return root
 
 
 def process_workspace() -> Path:
@@ -664,10 +694,10 @@ def undeclared_platform_secrets(
     workspace_root: Path | str,
     platform: PlatformDescriptor,
     *,
-    config: Mapping[str, Any] | None = None,
+    secrets: Mapping[str, Any] | None = None,
 ) -> list[str]:
-    """platforms.<id> 下平台没声明的键。拼错的键会被静默无视，运营者还以为配上了。"""
-    data = _load_config_yaml(Path(workspace_root)) if config is None else config
+    """平台密钥文件里 <id> 段下平台没声明的键。拼错的键会被静默无视，运营者还以为配上了。"""
+    data = load_platform_secrets(workspace_root) if secrets is None else secrets
     declared = {secret.name for secret in platform.secrets}
     return sorted(str(key) for key in _platform_section(data, platform.id) if str(key) not in declared)
 
@@ -693,7 +723,7 @@ def resolve_system_model(
 ) -> SystemModel:
     """解析一个系统槽位的渠道四项。
 
-    每项独立回退：config.yaml system_models.<slot> > slot 专属环境变量 > 调用方给的
+    每项独立回退：config/models.yaml system_models.<slot> > slot 专属环境变量 > 调用方给的
     主渠道值。留空表示跟随主渠道。
 
     provider 决定用哪套请求格式，也可以写成一个渠道名让调用方去继承那个块。给了
@@ -711,7 +741,7 @@ def resolve_system_model(
             block = raw_block
 
     def _pick(field: str, env_suffix: str, fallback: str) -> str:
-        # 1) config.yaml 字段（支持 ${VAR}）
+        # 1) config/models.yaml 字段（支持 ${VAR}）
         v = resolve_env_ref(str(block.get(field) or "").strip())
         if v:
             return v
@@ -733,8 +763,7 @@ def resolve_system_model(
 
 
 def load_policy_config(workspace_root: Path) -> dict[str, Any]:
-    p = workspace_root / "data" / "policy.yaml"
-    data = load_yaml_dict(p)
+    data = load_yaml_dict(config_layout.policy_path(workspace_root))
     return data if isinstance(data, dict) else {}
 
 

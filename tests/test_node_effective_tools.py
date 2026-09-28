@@ -62,7 +62,7 @@ def client(workspace: Path, monkeypatch: pytest.MonkeyPatch):
             policy=PolicyEngine(workspace_root=workspace),
         ),
         process_manager=None,
-        config_store=ConfigStore(path=workspace / "data" / "config.yaml"),
+        config_store=ConfigStore(path=workspace / "config" / "models.yaml", workspace_root=workspace),
     )
 
     def call(method: str, url: str, **kwargs: Any) -> httpx.Response:

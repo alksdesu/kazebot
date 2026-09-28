@@ -220,11 +220,11 @@ const PAGES: PageCase[] = [
     selection: () => useSettingsSelectionStore.getState().selectedTool,
     deleteLabel: '删除选中工具',
     deleteWriter: vi.mocked(api.deleteTool),
-    deletedText: '工具已删除',
+    deletedText: `工具 ${EXISTING_TOOL.name}已删除，重载工具后生效`,
     created: {
       selection: {
         name: 'demo_tool', source: 'external', editable: true, description: '通过设置页面创建的工具。',
-        input_schema: { type: 'object', properties: {} }, timeout_sec: 30, has_spec: true,
+        input_schema: { type: 'object', properties: {} }, timeout_sec: 30, has_spec: true, origin: 'custom',
       },
       panelOpen: false,
     },
@@ -307,7 +307,7 @@ const PAGES: PageCase[] = [
     selection: () => useSettingsSelectionStore.getState().selectedNode,
     deleteLabel: '删除选中节点',
     deleteWriter: vi.mocked(api.deleteNode),
-    deletedText: '节点已删除',
+    deletedText: `节点 ${EXISTING_NODE.id}已删除`,
     created: {
       selection: { id: 'demo_node', name: 'demo_node', type: 'ai', model: '', description: '通过设置页面创建的节点。', delegate_targets: [] },
       panelOpen: false,
@@ -332,9 +332,9 @@ beforeEach(() => {
   vi.mocked(api.createNode).mockResolvedValue({ ok: true });
   vi.mocked(api.createSkill).mockResolvedValue({ ok: true });
   vi.mocked(api.createTool).mockResolvedValue({ ok: true });
-  vi.mocked(api.deleteNode).mockResolvedValue({ ok: true });
+  vi.mocked(api.deleteNode).mockResolvedValue({ ok: true, restored: false });
   vi.mocked(api.deleteSkill).mockResolvedValue({ ok: true });
-  vi.mocked(api.deleteTool).mockResolvedValue({ ok: true });
+  vi.mocked(api.deleteTool).mockResolvedValue({ ok: true, restored: false });
   vi.mocked(api.reloadTools).mockResolvedValue({ seq: 7 });
   vi.mocked(api.updateMcpClientsRaw).mockResolvedValue({ ok: true });
   vi.mocked(api.updateSchedulesRaw).mockResolvedValue({ ok: true });

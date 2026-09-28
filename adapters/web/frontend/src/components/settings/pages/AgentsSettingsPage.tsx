@@ -11,6 +11,7 @@ import { useEffect, useRef, useState } from 'react';
 import { createNode, deleteNode, getNodes, type AdminNode } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { overlaySourceLabel, removalFor } from '../../../utils/overlaySource';
 import { describeEnvRef } from '../../../utils/envRef';
 import { Block, Button, Field, Input, PageShell, Select, StatusText } from './settingsControls';
 
@@ -39,19 +40,21 @@ export const AgentsSettingsPage = () => {
   const { busy, run } = useExclusiveAction();
   const generation = useRef(0);
 
-  const loadNodes = async () => {
-    if (!adminToken || !isAuthenticated) return;
+  const loadNodes = async (): Promise<AdminNode[] | undefined> => {
+    if (!adminToken || !isAuthenticated) return undefined;
     const version = ++generation.current;
     setLoading(true);
     try {
       const items = await getNodes(adminToken);
-      if (version !== generation.current) return;
+      if (version !== generation.current) return undefined;
       setNodes(items);
       if (selectedNode && !items.some((item) => item.id === selectedNode.id)) setSelectedNode(null);
       setLoadError('');
+      return items;
     } catch (error) {
-      if (version !== generation.current) return;
+      if (version !== generation.current) return undefined;
       setLoadError(error instanceof Error ? error.message : '加载节点失败');
+      return undefined;
     } finally {
       if (version === generation.current) setLoading(false);
     }
@@ -93,27 +96,36 @@ export const AgentsSettingsPage = () => {
       setMessage(error instanceof Error ? error.message : '创建节点失败');
     }
   });
+  // 没声明来源的是老版本后端给的，那时列出来的都是实例自己的文件。
+  const removal = selectedNode ? removalFor(selectedNode.source ?? 'custom', `节点 ${selectedNode.id}`) : null;
   const remove = () => run(async () => {
-    if (!adminToken || !selectedNode) return;
-    if (!window.confirm(`确定要删除节点 ${selectedNode.id} 吗？此操作会删除对应 YAML 文件。`)) return;
+    if (!adminToken || !selectedNode || !removal) return;
+    if (!window.confirm(removal.confirm)) return;
     if (!confirmNavigation()) return;
+    const nodeId = selectedNode.id;
     try {
-      await deleteNode(adminToken, selectedNode.id);
+      await deleteNode(adminToken, nodeId);
       if (tokenChanged(adminToken)) return;
+      // 先清掉选中：恢复默认后 id 没变，右栏要看到选中换过一次才会重读成仓库那份。
       setSelectedNode(null);
-      setMessage('节点已删除');
-      await loadNodes();
+      setMessage(removal.done);
+      const items = await loadNodes();
+      if (tokenChanged(adminToken) || !removal.restores) return;
+      const restored = items?.find((item) => item.id === nodeId);
+      if (restored) setSelectedNode(restored);
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '删除节点失败');
+      setMessage(error instanceof Error ? error.message : `${removal.label}失败`);
     }
   });
   return (
-    <PageShell authed={isAuthenticated} description="查看、创建和删除节点配置文件。选择节点后，请在右侧面板编辑对应 YAML。" title="节点管理">
+    <PageShell authed={isAuthenticated} description="查看、创建和删除节点配置文件。选择节点后，请在右侧面板编辑对应 YAML。仓库默认节点直接生效，保存后会在 config/nodes 下存一份本实例的版本。" title="节点管理">
       <Block frame="boxed" title="节点列表" hint="中间区域只负责列表和操作，节点 YAML 编辑器显示在右栏。">
         <div className="mb-3 flex flex-wrap gap-2">
           <Button tone="quiet" disabled={loading || busy} onClick={() => void refresh()}>{loading ? '正在刷新…' : '刷新节点'}</Button>
-          <Button tone="danger" disabled={busy || !selectedNode} onClick={remove}>删除选中节点</Button>
+          <Button tone={removal?.restores ? 'quiet' : 'danger'} disabled={busy || !removal} onClick={remove}>
+            {removal ? `${removal.label}选中节点` : '删除选中节点'}
+          </Button>
         </div>
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">
           {nodes.map((node) => (
@@ -123,6 +135,11 @@ export const AgentsSettingsPage = () => {
                 {node.active === false && (
                   <span className="border border-[var(--duties-border)] px-1.5 py-0.5 text-nano font-normal text-[var(--duties-secondary)]">
                     模板，派发不到
+                  </span>
+                )}
+                {node.source && (
+                  <span className="border border-[var(--duties-border)] px-1.5 py-0.5 text-nano font-normal text-[var(--duties-secondary)]">
+                    {overlaySourceLabel(node.source, node.same_as_default)}
                   </span>
                 )}
               </p>

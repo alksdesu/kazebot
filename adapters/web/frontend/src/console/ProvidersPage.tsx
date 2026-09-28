@@ -42,7 +42,7 @@ interface Draft {
   /** 服务端展开后的值，只用来提示，不回填。 */
   modelResolved: string;
   baseUrlResolved: string;
-  /** 还没在 config.yaml 里建块。 */
+  /** 还没在 models.yaml 里建块。 */
   fresh: boolean;
 }
 
@@ -437,7 +437,7 @@ const ProvidersEditor = () => {
               </Button>
             </div>
             {nameTaken && <Facts>已经有一个叫 {pendingName} 的渠道了，换个名字。</Facts>}
-            {nameReserved && <Facts>{pendingName} 是 data/config.yaml 里的保留段名，换个名字。</Facts>}
+            {nameReserved && <Facts>{pendingName} 是 config/models.yaml 里的保留段名，换个名字。</Facts>}
           </>
         )}
 
@@ -463,7 +463,7 @@ const ProvidersEditor = () => {
       />
 
       <Footnote>
-        密钥可以写成环境变量引用，只把变量名留在 config.yaml 里，值放 .env。地址留空时用这家的默认端点。
+        密钥可以写成环境变量引用，只把变量名留在 models.yaml 里，值放 .env。地址留空时用这家的默认端点。
         删掉的渠道如果还被备选链引用，那条链会在轮到它时失败 —— 去「模型」页一并清掉。
       </Footnote>
     </>

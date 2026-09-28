@@ -348,7 +348,7 @@ class ActiveProviderSecret(OpenAIConfigSecret):
 
     多一个 provider 字段告诉 engine 该用哪个 provider 类。不把它加进
     OpenAIConfigSecret：那个类型是 AppConfigSecret.openai 的成员，加了字段会让
-    data/config.yaml 的 openai 块凭空多 dump 出一个 provider 键。
+    config/models.yaml 的 openai 块凭空多 dump 出一个 provider 键。
     """
 
     provider: str = "openai"

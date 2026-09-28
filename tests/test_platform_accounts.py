@@ -285,7 +285,7 @@ class TestOpsPerPlatform:
                 policy=PolicyEngine(workspace_root=tmp_path),
             ),
             process_manager=None,
-            config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"),
+            config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path),
         )
 
         mounted = {

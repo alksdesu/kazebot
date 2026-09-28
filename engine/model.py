@@ -29,7 +29,7 @@ def resolve_provider(
 ) -> ResolvedProvider:
     """根据全局、节点和 session 配置解析模型和可选 api_key/base_url。
 
-    provider 字段可以是 config.yaml 里的渠道名，也可以是裸线格式名。命中渠道块时
+    provider 字段可以是 models.yaml 里的渠道名，也可以是裸线格式名。命中渠道块时
     连同它的 base_url/api_key/model 一起继承，自己写了的那几项仍然压过它。
     """
     model = node.model.strip() if node.model else ""

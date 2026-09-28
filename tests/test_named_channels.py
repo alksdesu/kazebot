@@ -56,7 +56,7 @@ def store(tmp_path):
 def api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", _TOKEN)
     monkeypatch.setattr(admin_api, "_admin_token", "")
-    path = tmp_path / "data" / "config.yaml"
+    path = tmp_path / "config" / "models.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(CONFIG, encoding="utf-8")
     app = create_app(
@@ -251,7 +251,7 @@ platforms:
 
 
 class TestReservedSectionNamesAreNotChannels:
-    """渠道块和这几段同在 data/config.yaml 顶层：拿它们当渠道名，保存就改坏那一段，删除就整段没了。"""
+    """渠道块和这几段同在 config/models.yaml 顶层：拿它们当渠道名，保存就改坏那一段，删除就整段没了。"""
 
     @pytest.mark.parametrize("name", sorted(CONFIG_META_KEYS))
     def test_the_store_refuses_every_write_under_one(self, tmp_path, name):
@@ -292,7 +292,7 @@ class TestReservedSectionNamesAreNotChannels:
         assert saved["platforms"] == {"qq": {"forward_bridge_token": "keep-me"}}
 
     def test_the_api_answers_400_and_leaves_the_section_alone(self, api, tmp_path):
-        path = tmp_path / "data" / "config.yaml"
+        path = tmp_path / "config" / "models.yaml"
         path.write_text(CONFIG + RESERVED_SECTIONS, encoding="utf-8")
 
         written = api("PUT", "/v1/config/providers/platforms", headers=_AUTH, json={

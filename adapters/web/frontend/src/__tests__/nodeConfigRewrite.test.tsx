@@ -161,3 +161,31 @@ describe('节点面板的保存提示', () => {
     expect(await screen.findByText(`节点配置已保存。${BLOCK_COMMENTS_DROPPED}。`)).toBeInTheDocument();
   });
 });
+
+describe('节点面板的来源提示', () => {
+  const renderNode = (source?: api.OverlaySource) => {
+    vi.mocked(api.getNodeRaw).mockResolvedValue(NODE_YAML);
+    useSettingsSelectionStore.setState({ selectedNode: { id: 'qq.orchestrator', type: 'ai', source } });
+    render(<AgentsSettingsRightPanel />);
+  };
+
+  it('编辑仓库默认那份时先说清楚保存落到哪', async () => {
+    renderNode('default');
+
+    expect(await screen.findByText('这是仓库默认节点。保存后会在 config/nodes 下存一份本实例的版本，从此不再随仓库更新。')).toBeInTheDocument();
+  });
+
+  it('已经是本实例那份就改说去哪恢复默认', async () => {
+    renderNode('override');
+
+    expect(await screen.findByText('本实例改过的版本，存在 config/nodes 下，盖住仓库默认；在节点管理页可以恢复默认。')).toBeInTheDocument();
+  });
+
+  it('自建的和老后端不给来源的都不摆这句', async () => {
+    renderNode('custom');
+
+    await waitFor(() => expect(screen.getByLabelText('名称')).toHaveValue('旧名字'));
+    expect(screen.queryByText(/config\/nodes 下存一份本实例的版本/)).toBeNull();
+    expect(screen.queryByText(/在节点管理页可以恢复默认/)).toBeNull();
+  });
+});

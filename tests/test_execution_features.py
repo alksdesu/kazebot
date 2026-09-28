@@ -168,7 +168,7 @@ async def test_mixed_file_and_link_plan_runs_real_engine_loop_with_injected_mode
         value = "file result" if "file content" in prompt else "link result"
         return ProviderResponse(ok=True, tool_calls=[ToolCall(id=f"finish-{len(observed)}", name="finish", arguments={"text": value})])
     monkeypatch.setattr(ai_step, "_call_llm_with_retry", model_response)
-    app = create_app(state=state, process_manager=None, config_store=ConfigStore(path=state.workspace_root / "data/config.yaml"))
+    app = create_app(state=state, process_manager=None, config_store=ConfigStore(path=state.workspace_root / "config/models.yaml", workspace_root=state.workspace_root))
     plan = state.execution.create(actor, PlanDraft(goal="summarize sources", inputs=[{"kind": "file", "value": source.relative_to(state.workspace_root).as_posix(), "label": "文件"}, {"kind": "url", "value": "https://example.test/source", "label": "链接"}]))
     state.execution.confirm(actor, plan["id"], 1)
     state.execution.tick(); state.execution.tick()
@@ -393,7 +393,7 @@ async def test_full_api_plan_tool_waits_for_real_approval_before_writing(state):
     from supervisor.api import create_app
     from supervisor.config_store import ConfigStore
 
-    app = create_app(state=state, process_manager=None, config_store=ConfigStore(path=state.workspace_root / "data/config.yaml"))
+    app = create_app(state=state, process_manager=None, config_store=ConfigStore(path=state.workspace_root / "config/models.yaml", workspace_root=state.workspace_root))
     headers = {"Authorization": "Bearer feature-test"}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers=headers) as client:
         response = await client.post("/v1/execution/plans?scope=web:console", json={"goal": "write config", "steps": [{"id": "save", "title": "写入指定配置", "kind": "tool", "operation": "write_file", "arguments": {"path": "config/result.yaml", "content": "approved: true"}}]})

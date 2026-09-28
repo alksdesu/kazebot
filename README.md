@@ -138,7 +138,7 @@ React 写的，跟着 supervisor 一起跑，浏览器打开就用。
 
 **服务器那层有兜底。** 生产用 systemd 跑在专用用户下，整个文件系统只读，只有这个实例的工作区可写 —— 代码目录不在可写名单里，它改不了自己的源码。这层是内核在管，不是靠字符串黑名单，所以是真拦得住的那一层。上面那些配置更像是「别让它误操作」，这一层才是「就算想干也干不了」。
 
-另外几件默认就做了的事：密钥不进仓库（`.env`、整个 `data/`、`config/qq.yaml` 都在 `.gitignore` 里，只带模板）；模型看到的群号和 QQ 号都是 `GroupA`、`UserB` 这样的代号，真实号码存在本地对照表里；日志出去之前会把 key 打码；`.env`、配置文件、私钥这些东西不允许通过 QQ 发出去，管理员也不行。
+另外几件默认就做了的事：密钥不进仓库（`.env`、整个 `data/` 和 `config/` 都在 `.gitignore` 里，仓库只带 `defaults/` 下的默认和模板）；模型看到的群号和 QQ 号都是 `GroupA`、`UserB` 这样的代号，真实号码存在本地对照表里；日志出去之前会把 key 打码；`.env`、配置文件、私钥这些东西不允许通过 QQ 发出去，管理员也不行。
 
 ## 快速开始
 
@@ -148,10 +148,11 @@ React 写的，跟着 supervisor 一起跑，浏览器打开就用。
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-cp config.example.yaml data/config.yaml     # 用哪家模型
-cp policy.example.yaml data/policy.yaml     # 权限策略
-cp .env.example .env                        # 密钥
-cp config/qq.example.yaml config/qq.yaml    # QQ 配置
+mkdir -p config
+cp defaults/models.example.yaml config/models.yaml   # 用哪家模型
+cp defaults/policy.example.yaml config/policy.yaml   # 权限策略
+cp .env.example .env                                 # 密钥
+cp defaults/qq.example.yaml config/qq.yaml           # QQ 配置
 
 cd adapters/web/frontend && npm ci && npm run build && cd -
 
@@ -167,15 +168,23 @@ python bot.py      # QQ 适配器，另开一个终端
 
 | 文件 | 管什么 | 改完 |
 |---|---|---|
-| `data/config.yaml` | 用哪家模型、备选链、看图和压缩分别走哪个渠道 | 立即生效 |
-| `data/policy.yaml` | 权限策略 | 立即生效 |
+| `config/models.yaml` | 用哪家模型、备选链、看图和压缩分别走哪个渠道 | 立即生效 |
+| `config/policy.yaml` | 权限策略 | 立即生效 |
 | `config/features.yaml` | 各平台共用的开关：触发、审批、复读、收图收文件、队列、表情包 | 两秒内生效 |
 | `config/qq.yaml` | QQ 独有的三十多个开关；也能写共用开关的同名项，只对 QQ 生效 | 两秒内生效 |
-| `config/runtime.yaml` | 引擎调参、压缩阈值、记忆预算、数据清理 | 立即生效 |
-| `config/nodes/*.yaml` | 节点定义 | 立即生效 |
+| `config/runtime.yaml` | 引擎调参、压缩阈值、记忆预算、数据清理；只写要改的键，其余照 `defaults/runtime.yaml` | 立即生效 |
+| `config/nodes/*.yaml` | 节点定义；只放改过的和新加的，其余用 `defaults/nodes/` 里的默认 | 立即生效 |
+| `config/skills/`、`config/tools/`、`config/mcp.yaml`、`config/drawtools/` | 技能、自己加的脚本工具、MCP 客户端、绘图配置 | 立即生效 |
+| `data/platform_secrets.yaml` | 平台连接令牌这类实例身份，也可以写在 `.env` | **要重启** |
 | `.env` | 端口、密钥、workspace 位置 | **要重启** |
 
-`config/features.yaml` 不用整份复制模板，照 `config/features.example.yaml` 只抄要改的那几项：它比 `.env` 优先，整份抄过去 `.env` 里的同名设置就全失效了。
+仓库自带的节点和 runtime 在 `defaults/` 下直接生效，升级时跟着代码更新。控制台改过哪一份，就在 `config/` 下存一份这个实例自己的，从此不再随仓库变化；想回到默认，在控制台点「恢复默认」。
+改过仓库自带的脚本工具也一样，改动存进 `config/tools/` 的同一路径。
+
+从旧版本升上来时，`data/config.yaml`、`data/policy.yaml`、`data/mcp_clients.yaml`、`skills/` 和绘图配置在第一次启动时自动复制进 `config/`，
+`data/config.yaml` 里的 `platforms` 段挪进 `data/platform_secrets.yaml`；旧文件原样留着，退回旧版本还能用。
+
+`config/features.yaml` 不用整份复制模板，照 `defaults/features.example.yaml` 只抄要改的那几项：它比 `.env` 优先，整份抄过去 `.env` 里的同名设置就全失效了。
 
 这两份写坏了都不会把 bot 弄停 —— 解析失败时它会继续用上一份能跑的配置，同时记一条错误。想确认当前到底哪些值生效了、每一项来自哪份文件，看 `GET /qq/state`，那是 bot 进程里的实况。
 

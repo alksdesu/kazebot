@@ -153,7 +153,7 @@ async def _maybe_handle_model_command(
     """处理 QQ 管理员 /切换模型 <模型名> 命令，切换全局主模型。
 
     返回回复文本；None 表示不是本命令。切换通过 Supervisor 的
-    POST /v1/config/openai 实时写入 data/config.yaml；Engine 每次处理任务
+    POST /v1/config/openai 实时写入 config/models.yaml；Engine 每次处理任务
     前都会重新拉取该配置（fetch_openai_secret），因此无需重启服务。
     """
     text = (user_text or "").strip()

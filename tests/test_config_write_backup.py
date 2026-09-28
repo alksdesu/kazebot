@@ -17,6 +17,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import config_layout  # noqa: E402
 from supervisor import admin_api  # noqa: E402
 from supervisor.admin_api import create_admin_router  # noqa: E402
 
@@ -26,10 +27,10 @@ _AUTH = {"Authorization": f"Bearer {_TOKEN}"}
 # 十二个写入点共用 _write_text，这几条覆盖不同目录布局与敏感度。
 WRITE_TARGETS = (
     ("/runtime/raw", "config/runtime.yaml"),
-    ("/policy/raw", "data/policy.yaml"),
+    ("/policy/raw", "config/policy.yaml"),
     ("/schedules/raw", "data/schedules.yaml"),
-    ("/config/raw", "data/config.yaml"),
-    ("/mcp-clients/raw", "data/mcp_clients.yaml"),
+    ("/config/raw", "config/models.yaml"),
+    ("/mcp-clients/raw", "config/mcp.yaml"),
 )
 
 
@@ -85,17 +86,17 @@ class TestTheBackupIsWritten:
         response = client("PUT", "/policy/raw", json={"content": "version: 1\n"}, headers=_AUTH)
 
         assert response.status_code == 200, response.text
-        assert (tmp_path / "data/policy.yaml").exists()
-        assert not (tmp_path / "data/policy.yaml.bak").exists()
+        assert (tmp_path / "config/policy.yaml").exists()
+        assert not (tmp_path / "config/policy.yaml.bak").exists()
 
     def test_the_backup_holds_only_the_last_version(self, client, tmp_path: Path) -> None:
         # 单份覆盖式，不按时间戳堆积：要防的是「刚才那一次误操作」。
-        _seed(tmp_path, "data/policy.yaml", "gen: 1\n")
+        _seed(tmp_path, "config/policy.yaml", "gen: 1\n")
 
         client("PUT", "/policy/raw", json={"content": "gen: 2\n"}, headers=_AUTH)
         client("PUT", "/policy/raw", json={"content": "gen: 3\n"}, headers=_AUTH)
 
-        assert (tmp_path / "data/policy.yaml.bak").read_text(encoding="utf-8") == "gen: 2\n"
+        assert (tmp_path / "config/policy.yaml.bak").read_text(encoding="utf-8") == "gen: 2\n"
 
     def test_node_files_are_backed_up_too(self, client, tmp_path: Path) -> None:
         _seed(tmp_path, "config/nodes/qq.orchestrator.yaml", "id: qq.orchestrator\nprompt: old\n")
@@ -121,9 +122,22 @@ class TestBackupFailureBlocksTheWrite:
         def _boom(*_args: Any, **_kwargs: Any) -> None:
             raise OSError("disk full")
 
-        monkeypatch.setattr(admin_api.shutil, "copy2", _boom)
+        monkeypatch.setattr(config_layout.shutil, "copy2", _boom)
         response = client("PUT", "/runtime/raw", json={"content": "version: 2\n"}, headers=_AUTH)
 
         assert response.status_code == 500
         assert "备份" in response.json()["detail"]
+        assert (tmp_path / "config/runtime.yaml").read_text(encoding="utf-8") == original
+
+    def test_a_rejected_base_hash_leaves_no_backup_either(self, client, tmp_path: Path) -> None:
+        # 指纹对不上时一个字节都不该写，留下的 .bak 会让人以为刚才那次保存生效过。
+        original = "version: 1\nkeep: me\n"
+        _seed(tmp_path, "config/runtime.yaml", original)
+
+        response = client(
+            "PUT", "/runtime/raw", json={"content": "version: 2\n", "base_hash": "0" * 64}, headers=_AUTH,
+        )
+
+        assert response.status_code == 409
+        assert not (tmp_path / "config/runtime.yaml.bak").exists()
         assert (tmp_path / "config/runtime.yaml").read_text(encoding="utf-8") == original

@@ -137,4 +137,33 @@ describe('工具右栏', () => {
 
     expect(await screen.findByRole('button', { name: '保存' })).toBeInTheDocument();
   });
+
+  it('改仓库自带的那份之前先说清楚保存落到哪', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ content: 'SPEC = {}\n' })));
+    useSettingsSelectionStore.setState({ selectedTool: { ...CATALOG[2], origin: 'bundled' } as never });
+
+    render(<ToolsSettingsRightPanel />);
+
+    expect(await screen.findByText('仓库自带的工具。保存后会在 config/tools 下存一份本实例的版本，盖住仓库这份，从此不再随仓库更新。')).toBeInTheDocument();
+  });
+
+  it('已经是本实例那份就改说去哪恢复默认', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ content: 'SPEC = {}\n' })));
+    useSettingsSelectionStore.setState({ selectedTool: { ...CATALOG[2], origin: 'override' } as never });
+
+    render(<ToolsSettingsRightPanel />);
+
+    expect(await screen.findByText('本实例改过的版本，存在 config/tools 下，盖住仓库自带的那份；在工具页可以恢复默认。')).toBeInTheDocument();
+  });
+
+  it('自建的和老后端不给来源的都不摆这句', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ content: 'SPEC = {}\n' })));
+    useSettingsSelectionStore.setState({ selectedTool: { ...CATALOG[2], origin: 'custom' } as never });
+
+    render(<ToolsSettingsRightPanel />);
+
+    await screen.findByRole('button', { name: '保存' });
+    expect(screen.queryByText(/config\/tools 下存一份本实例的版本/)).toBeNull();
+    expect(screen.queryByText(/在工具页可以恢复默认/)).toBeNull();
+  });
 });

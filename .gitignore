@@ -26,22 +26,19 @@ node_modules/
 # private skills
 secret_skills/
 
-# drawtools user runtime configs (keep *.example.* templates versioned)
+# 实例配置：这个 bot 的全部配置都在这下面，各部署自己的，整个不进仓库；仓库自带的默认节点、
+# runtime 和各种模板在 defaults/。不带斜杠：加入共享组之后它是个指向组目录的软链。
+/config
+
+# 挪进 config/ 之前的旧位置，搬过之后原样留着给退回旧版本用
+/skills/
 /tools/drawtools/settings.yaml
 /tools/drawtools/character_tags.yaml
 /tools/drawtools/prompts/novelai/top-system.md
 /tools/drawtools/prompts/novelai/output-format.md
 /tools/drawtools/prompts/novelai/tag-guide.md
 
-# user node configs / fragments that may be created from examples
-/config/nodes/_persona.md
-
-# QQ 热载配置：装的是真实群号与管理员 QQ 号，和 .env 同级敏感（模板见 qq.example.yaml）
-/config/qq.yaml
-# 全平台共用的功能设置：各部署自己的开关，和 qq.yaml 一样不进仓库（模板见 features.example.yaml）
-/config/features.yaml
-
-# 配置端点覆盖写入前留的备份，内容等同原文件（data/config.yaml.bak 含明文 api_key）
+# 配置端点覆盖写入前留的备份，内容等同原文件（config/models.yaml.bak 含明文 api_key）
 *.bak
 
 # 文档与内部工程说明不进公开仓库；节点定义要进，否则 clone 下来没有入口节点

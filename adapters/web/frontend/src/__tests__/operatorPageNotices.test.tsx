@@ -20,9 +20,9 @@ vi.mock('../api/supervisorClient', async (importOriginal) => ({
   checkHealth: vi.fn(),
   decideApproval: vi.fn(),
   getAdminState: vi.fn(),
+  deleteNodeFile: vi.fn(),
   getNodeFileRaw: vi.fn(),
   getNodeFiles: vi.fn(),
-  makeNodeFileExample: vi.fn(),
   reloadConfig: vi.fn(),
   restartEngine: vi.fn(),
   updateNodeFileRaw: vi.fn(),
@@ -90,6 +90,8 @@ const nodeFile = (name: string, over: Partial<NodeFileInfo> = {}): NodeFileInfo 
   base_name: name,
   size: 1,
   updated_at: 0,
+  source: 'override',
+  same_as_default: false,
   ...over,
 });
 
@@ -891,41 +893,39 @@ describe('节点文件页的提示', () => {
     vi.mocked(api.getNodeFiles).mockResolvedValue([nodeFile('qq.orchestrator.yaml')]);
     vi.mocked(api.getNodeFileRaw).mockResolvedValue('id: qq');
     vi.mocked(api.updateNodeFileRaw).mockResolvedValue({ ok: true });
-    vi.mocked(api.makeNodeFileExample).mockResolvedValue({
-      ok: true, created: true, path: 'config/nodes/qq.orchestrator.example.yaml',
-    });
+    vi.mocked(api.deleteNodeFile).mockResolvedValue({ ok: true, restored: true });
   });
 
-  it('创建 Example 的结果熬过紧接着那次重读', async () => {
+  it('恢复默认的结果熬过紧接着那次重读', async () => {
     vi.mocked(api.getNodeFiles)
       .mockResolvedValueOnce([nodeFile('qq.orchestrator.yaml')])
-      .mockResolvedValue([nodeFile('qq.orchestrator.yaml'), nodeFile('qq.orchestrator.example.yaml', { is_example: true })]);
+      .mockResolvedValue([nodeFile('qq.orchestrator.yaml', { source: 'default' })]);
     render(<NodeFilesSettingsPage />);
     await tick();
     expect(api.getNodeFiles).toHaveBeenCalledTimes(1);
 
-    click('从已保存文件创建 Example');
+    click('恢复默认');
     await tick();
 
-    expect(api.makeNodeFileExample).toHaveBeenCalledWith('admin-token', 'qq.orchestrator.yaml');
+    expect(api.deleteNodeFile).toHaveBeenCalledWith('admin-token', 'qq.orchestrator.yaml');
     expect(api.getNodeFiles).toHaveBeenCalledTimes(2);
-    expect(screen.getByRole('option', { name: 'qq.orchestrator.example.yaml · example' })).toBeInTheDocument();
-    expect(statusText()).toBe('已创建 config/nodes/qq.orchestrator.example.yaml');
-    // 没有未保存修改就一句都不问：读列表本身不再弹确认。
-    expect(window.confirm).not.toHaveBeenCalled();
+    expect(screen.getByRole('option', { name: 'qq.orchestrator.yaml · 仓库默认' })).toBeInTheDocument();
+    expect(statusText()).toBe('文件 qq.orchestrator.yaml已恢复成仓库默认');
+    // 只问删不删这一句：没有未保存修改，读列表本身不再弹确认。
+    expect(window.confirm).toHaveBeenCalledTimes(1);
   });
 
-  it('创建 Example 后重读失败把原因接在后面，点「刷新列表」两样都清', async () => {
+  it('恢复默认后重读失败把原因接在后面，点「刷新列表」两样都清', async () => {
     vi.mocked(api.getNodeFiles)
       .mockResolvedValueOnce([nodeFile('qq.orchestrator.yaml')])
       .mockRejectedValueOnce(new Error('503 节点文件列表拉不到'))
-      .mockResolvedValue([nodeFile('qq.orchestrator.yaml')]);
+      .mockResolvedValue([nodeFile('qq.orchestrator.yaml', { source: 'default' })]);
     render(<NodeFilesSettingsPage />);
     await tick();
 
-    click('从已保存文件创建 Example');
+    click('恢复默认');
     await tick();
-    expect(statusText()).toBe('已创建 config/nodes/qq.orchestrator.example.yaml。503 节点文件列表拉不到');
+    expect(statusText()).toBe('文件 qq.orchestrator.yaml已恢复成仓库默认。503 节点文件列表拉不到');
 
     click('刷新列表');
     await tick();

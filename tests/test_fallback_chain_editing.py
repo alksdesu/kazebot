@@ -42,7 +42,7 @@ node_fallbacks:
   system.compactor:
     - provider: deepseek
       model: deepseek-v4-flash
-  qq.vision: []
+  chat.helper: []
 """
 
 
@@ -90,7 +90,7 @@ def test_node_chains_are_published_including_the_empty_one(store: ConfigStore) -
     chains = store.get_providers_public()["node_fallbacks"]
     assert chains["system.compactor"][0]["model"] == "deepseek-v4-flash"
     # 空列表表示「这个节点禁用 fallback」，丢掉它就变成了「跟随全局」。
-    assert chains["qq.vision"] == []
+    assert chains["chat.helper"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -206,12 +206,12 @@ def test_empty_node_chain_means_disabled_not_absent(store: ConfigStore) -> None:
 
 
 def test_deleting_a_node_chain_falls_back_to_the_global_one(store: ConfigStore) -> None:
-    store.update_node_fallbacks("qq.vision", None)
-    assert "qq.vision" not in _saved(store)["node_fallbacks"]
+    store.update_node_fallbacks("chat.helper", None)
+    assert "chat.helper" not in _saved(store)["node_fallbacks"]
 
 
 def test_last_node_chain_removal_drops_the_whole_key(store: ConfigStore) -> None:
-    store.update_node_fallbacks("qq.vision", None)
+    store.update_node_fallbacks("chat.helper", None)
     store.update_node_fallbacks("system.compactor", None)
     assert "node_fallbacks" not in _saved(store)
 

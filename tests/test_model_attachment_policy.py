@@ -1,7 +1,7 @@
 """模型在伪工具参数里点名的附件路径，和它直接调 read_file 走同一道策略。
 
 reply / finish / dispatch 的 attachment_paths 以前直接落到磁盘回退上：只要路径在工作区里，
-.env、data/config.yaml、别人的会话记录都能被当成附件发出去，而同一个模型调 read_file 读它们
+.env、config/models.yaml、别人的会话记录都能被当成附件发出去，而同一个模型调 read_file 读它们
 是要过审批的。判定按解析后的真实位置做，换种写法或经 data/ 里的符号链接指过去都绕不开。
 """
 from __future__ import annotations

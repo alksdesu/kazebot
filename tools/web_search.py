@@ -392,7 +392,7 @@ if __name__ == "__main__":
         final_text += (
             "\n\n修复建议：主模型没有可用的联网搜索能力，且没有配置 Exa/X 密钥。"
             "可以用 manage_secret 设置 EXA_API_KEY，"
-            "或把 data/config.yaml 的 system_models.native_search 指向一个支持联网搜索的模型。"
+            "或把 config/models.yaml 的 system_models.native_search 指向一个支持联网搜索的模型。"
         )
         output({
             "ok": False,

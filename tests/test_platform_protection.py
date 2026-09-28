@@ -26,6 +26,7 @@ from platforms.descriptor import (  # noqa: E402
 )
 from platforms.protection import (  # noqa: E402
     CORE_OUTBOUND_DENY,
+    CORE_READ_FLOOR,
     CORE_WRITE_FLOOR,
     normalize_relative,
     outbound_deny_patterns,
@@ -105,11 +106,17 @@ def otherchat():
         unregister_platform(OTHERCHAT.id)
 
 
+def _policy_file(workspace: Path) -> Path:
+    return workspace / "config" / "policy.yaml"
+
+
 def _engine(workspace: Path, policy: str | None = PERMISSIVE_POLICY) -> PolicyEngine:
     """policy 为 None 时不写文件，引擎自己落一份内置默认。"""
     (workspace / "data").mkdir(parents=True, exist_ok=True)
     if policy is not None:
-        (workspace / "data" / "policy.yaml").write_text(policy, encoding="utf-8")
+        path = _policy_file(workspace)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(policy, encoding="utf-8")
     return PolicyEngine(workspace_root=workspace)
 
 
@@ -312,9 +319,25 @@ class TestOutboundDeny:
 class TestPolicyFloor:
     def test_reads_are_floored_only_for_files_that_carry_credentials(self) -> None:
         read, _write = policy_floor(platforms=[QQ_NAPCAT], environ={})
+        core = {rule.pattern for rule in CORE_READ_FLOOR}
 
-        assert {rule.pattern for rule in read} == QQ_SECRET_FILES
-        assert all(QQ_NAPCAT.id in rule.reason for rule in read)
+        assert {rule.pattern for rule in read} == QQ_SECRET_FILES | core
+        assert all(QQ_NAPCAT.id in rule.reason for rule in read if rule.pattern not in core)
+
+    def test_the_two_shared_secret_files_are_floored_before_any_platform(self) -> None:
+        # 改造后才有的两份，老部署的 policy.yaml 里既没有它们的规则，也没有旧名字可认。
+        read, write = policy_floor(platforms=[], environ={})
+
+        assert list(read) == list(CORE_READ_FLOOR)
+        assert {"config/secrets.env", "data/platform_secrets.yaml"} == {rule.pattern for rule in CORE_READ_FLOOR}
+        assert set(CORE_READ_FLOOR) <= set(write)
+
+    @pytest.mark.parametrize("path", ["config/secrets.env", "data/platform_secrets.yaml"])
+    def test_a_permissive_policy_file_cannot_open_the_shared_secret_files(self, tmp_path: Path, path: str) -> None:
+        engine = _engine(tmp_path)
+
+        assert engine.evaluate_read_file(path=path).safety_level == SafetyLevel.deny
+        assert engine.evaluate_write_file(path=path).safety_level == SafetyLevel.deny
 
     def test_writes_are_floored_for_everything_the_platform_maintains(self) -> None:
         _read, write = policy_floor(platforms=[QQ_NAPCAT], environ={})
@@ -504,19 +527,19 @@ class TestEntrypointWriteRules:
         # 默认只在文件不存在时落盘；重写会把管理员放宽过的判定悄悄改回去。
         engine = _engine(tmp_path)
 
-        assert (tmp_path / "data" / "policy.yaml").read_text(encoding="utf-8") == PERMISSIVE_POLICY
+        assert _policy_file(tmp_path).read_text(encoding="utf-8") == PERMISSIVE_POLICY
         assert engine.evaluate_write_file(path="bot.py").safety_level == SafetyLevel.auto
 
     @pytest.mark.parametrize("section", ["read_file", "write_file"])
     def test_the_example_file_copies_the_built_in_default_rule_for_rule(self, section: str) -> None:
         # 样例是手抄的，入口脚本那条尤其容易漏：照它起的部署会少一层判定，而且看不出少了。
-        example = yaml.safe_load((_ROOT / "policy.example.yaml").read_text(encoding="utf-8"))
+        example = yaml.safe_load((_ROOT / "defaults" / "policy.example.yaml").read_text(encoding="utf-8"))
 
         assert example[section]["rules"] == _default_policy_dict()[section]["rules"]
 
     def test_the_example_file_is_what_the_engine_actually_enforces(self) -> None:
-        # data/policy.yaml 落盘前控制台回的是这份样例，判定却走内置默认：差一处，界面显示的就不是生效的策略。
-        example = yaml.safe_load((_ROOT / "policy.example.yaml").read_text(encoding="utf-8"))
+        # config/policy.yaml 落盘前控制台回的是这份样例，判定却走内置默认：差一处，界面显示的就不是生效的策略。
+        example = yaml.safe_load((_ROOT / "defaults" / "policy.example.yaml").read_text(encoding="utf-8"))
         default = _default_policy_dict()
 
         drifted = sorted(key for key in {*example, *default} if example.get(key) != default.get(key))

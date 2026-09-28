@@ -492,7 +492,7 @@ export const PolicyRulesSection = () => {
           <ScopeBadge scope="all-channels" />
         </div>
         <p className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]">
-          写进 data/policy.yaml，QQ、控制台、定时任务共用这一份。只管 read_file、write_file、
+          写进 config/policy.yaml，QQ、控制台、定时任务共用这一份。只管 read_file、write_file、
           execute_command、restart 这四类操作；外部脚本工具除非自己声明 guard，否则不受这里约束。
         </p>
         <p className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]">

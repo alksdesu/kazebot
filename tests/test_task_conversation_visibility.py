@@ -115,7 +115,7 @@ class TestConsoleListing:
         app = create_app(
             state=state,
             process_manager=None,
-            config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"),
+            config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path),
         )
 
         async def _call() -> httpx.Response:

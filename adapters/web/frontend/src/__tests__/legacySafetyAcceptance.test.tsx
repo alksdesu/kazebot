@@ -141,7 +141,7 @@ describe('configuration preservation', () => {
 describe('editor identity and draft protection', () => {
   it('does not enable saving stale node-file contents while the next file loads', async () => {
     const request = deferred<string>();
-    vi.mocked(api.getNodeFiles).mockResolvedValue(['a.yaml', 'b.yaml'].map(name => ({ name, path: name, kind: 'node', size: 1, is_example: false, suffix: '.yaml', base_name: name, updated_at: 0 })));
+    vi.mocked(api.getNodeFiles).mockResolvedValue(['a.yaml', 'b.yaml'].map(name => ({ name, path: name, kind: 'node', size: 1, is_example: false, suffix: '.yaml', base_name: name, updated_at: 0, source: 'custom' as const, same_as_default: false })));
     vi.mocked(api.getNodeFileRaw).mockImplementation(async (_, name) => name === 'a.yaml' ? 'id: a' : request.promise);
     render(<NodeFilesSettingsPage />);
     await waitFor(() => expect(screen.getByLabelText('文件内容')).toHaveValue('id: a'));

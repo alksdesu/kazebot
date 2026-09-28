@@ -31,7 +31,8 @@ ALLOW_EVERYTHING = {
 def _state(workspace: Path) -> SupervisorState:
     """策略全部放行，模拟管理员在控制台把档位都点成「自动放行」。"""
     (workspace / "data").mkdir(parents=True, exist_ok=True)
-    (workspace / "data" / "policy.yaml").write_text(
+    (workspace / "config").mkdir(parents=True, exist_ok=True)
+    (workspace / "config" / "policy.yaml").write_text(
         yaml.safe_dump(ALLOW_EVERYTHING, sort_keys=False), encoding="utf-8",
     )
     return SupervisorState(
@@ -58,7 +59,8 @@ LEAKY_PATHS = [
     "supervisor/state.py",        # 鉴权逻辑本身，读了就知道往哪绕
     "tools/remote_exec.py",       # 工具脚本里的基础设施细节
     "engine/system_nodes/system.dream.yaml",
-    "data/config.yaml",
+    "config/models.yaml",
+    "data/platform_secrets.yaml",
     "README.md",                  # 连普通文件也不给：白名单比黑名单可靠
 ]
 

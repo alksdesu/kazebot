@@ -20,6 +20,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import config_layout  # noqa: E402
 from engine.builtin import fallback_provider as fallback_module  # noqa: E402
 from engine.builtin.finish_guard import _has_unresolved_vision_failure, vision_node_ids  # noqa: E402
 from engine.builtin.knowledge_inject import build_knowledge_context  # noqa: E402
@@ -31,7 +32,9 @@ from supervisor.config_store import ConfigStore  # noqa: E402
 
 
 @pytest.fixture()
-def workspace(tmp_path: Path) -> Path:
+def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    # 仓库自带的 defaults/nodes 排在实例目录后面，不挡住就会混进这个假工作区的节点表。
+    monkeypatch.setattr(config_layout, "CODE_ROOT", tmp_path)
     (tmp_path / "config" / "nodes").mkdir(parents=True)
     (tmp_path / "engine" / "system_nodes").mkdir(parents=True)
     return tmp_path
@@ -237,7 +240,7 @@ class TestSettingsWrittenUnderAnOldId:
         # 视觉节点在旧 id 下写了空链：改名后要是落回全局那条只能读文字的链，图就被丢掉、模型开始瞎猜。
         _renamed_vision(workspace)
         (workspace / "data").mkdir()
-        (workspace / "data" / "config.yaml").write_text(yaml.safe_dump({
+        config_layout.models_path(workspace).write_text(yaml.safe_dump({
             "fallbacks": [{"provider": "openai", "base_url": "https://example.test/v1", "api_key": "k", "model": "text"}],
             "node_fallbacks": {"qq.vision": []},
         }), encoding="utf-8")
@@ -299,10 +302,9 @@ node_fallbacks:
 @pytest.fixture()
 def store(workspace: Path) -> ConfigStore:
     _renamed_vision(workspace)
-    path = workspace / "data" / "config.yaml"
-    path.parent.mkdir()
+    path = config_layout.models_path(workspace)
     path.write_text(_CONFIG, encoding="utf-8")
-    return ConfigStore(path=path)
+    return ConfigStore(path=path, workspace_root=workspace)
 
 
 def _saved_chains(store: ConfigStore) -> dict:
@@ -363,7 +365,7 @@ class TestShippedRenames:
         assert node.extra.get("system_model_slot") == "intent"
 
     def test_vision_routing_points_at_the_new_id(self) -> None:
-        runtime = yaml.safe_load((_ROOT / "config" / "runtime.yaml").read_text(encoding="utf-8"))
+        runtime = yaml.safe_load((_ROOT / "defaults" / "runtime.yaml").read_text(encoding="utf-8"))
 
         assert runtime["routing"]["vision"]["entry_node_id"] == "chat.vision"
 

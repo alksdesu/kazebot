@@ -92,8 +92,8 @@ class TestTheSlotProvider:
     """槽位换 url/key 不换请求格式的话，等于拿 A 家的格式打 B 家的地址。"""
 
     def test_provider_comes_from_config_yaml(self, tmp_path: Path) -> None:
-        (tmp_path / "data").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "data" / "config.yaml").write_text(
+        (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "config" / "models.yaml").write_text(
             "\n".join([
                 "system_models:",
                 "  compact:",
@@ -150,8 +150,8 @@ class TestTheIntentEnvPrefix:
 
     def test_config_yaml_beats_the_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CLONOTH_INTENT_MODEL", "from-env")
-        (tmp_path / "data").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "data" / "config.yaml").write_text(
+        (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "config" / "models.yaml").write_text(
             "system_models:\n  intent:\n    model: from-config\n", encoding="utf-8",
         )
 

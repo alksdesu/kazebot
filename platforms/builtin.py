@@ -82,7 +82,7 @@ QQ_NAPCAT = PlatformDescriptor(
         typing=frozenset({CHANNEL_PRIVATE}),
     ),
     secrets=(
-        # NoneBot 自己从 env 读这一项；写在 data/config.yaml 里时由 bot.py 交给它。
+        # NoneBot 自己从 env 读这一项；写在 data/platform_secrets.yaml 里时由 bot.py 交给它。
         SecretField("access_token", "NapCat 连接令牌", env="ONEBOT_ACCESS_TOKEN"),
         SecretField(
             "forward_bridge_token",

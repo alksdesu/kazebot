@@ -4,7 +4,6 @@ import contextlib
 import copy
 import fnmatch
 import ipaddress
-import os
 import re
 import shlex
 from dataclasses import dataclass
@@ -14,10 +13,10 @@ from urllib.parse import urlparse
 
 import yaml
 
+import config_layout
 from clonoth_runtime import classify_path, load_yaml_dict, parse_extra_roots
 from platforms.protection import policy_floor
 from platforms.registry import all_platforms
-from toolbox.text_files import newline_of, rewrite_text, write_text_as
 
 from .types import SafetyLevel
 
@@ -66,11 +65,18 @@ def _default_policy_dict() -> dict[str, Any]:
             "rules": [
                 {"pattern": ".env", "decision": "deny", "reason": "do not allow reading dotenv secrets"},
                 {"pattern": "**/.env", "decision": "deny", "reason": "do not allow reading dotenv secrets"},
+                {"pattern": "config/secrets.env", "decision": "deny", "reason": "do not allow reading shared dotenv secrets"},
                 # manage_secret 的虚拟路径，不是真目录；list 只回键名与是否已配，不回值。
                 {"pattern": ".secret", "decision": "auto", "reason": "listing secret names exposes no values"},
                 {"pattern": "config/nodes/**", "decision": "deny", "reason": "node prompts are internal"},
+                # 仓库自带的默认节点，实例没改过的那几份就读它。
+                {"pattern": "defaults/nodes/**", "decision": "deny", "reason": "node prompts are internal"},
                 {"pattern": "engine/system_nodes/**", "decision": "deny", "reason": "system prompts are internal"},
-                # data/ 下有 config.yaml、.admin_token、会话与事件流。落到 default:auto
+                {"pattern": "config/models.yaml", "decision": "approval_required", "reason": "model channels may hold api keys in plaintext"},
+                {"pattern": "config/mcp.yaml", "decision": "approval_required", "reason": "mcp clients may carry tokens in env or headers"},
+                {"pattern": "config/policy.yaml", "decision": "approval_required", "reason": "policy exposes the shape of every guard"},
+                {"pattern": "config/drawtools/settings.yaml", "decision": "approval_required", "reason": "drawtools settings may hold the NovelAI api key"},
+                # data/ 下有平台密钥、.admin_token、会话与事件流。落到 default:auto
                 # 等于任何人问一句就能把密钥读出来。
                 {"pattern": "data/**", "decision": "approval_required", "reason": "runtime data may contain secrets or private context"},
             ],
@@ -82,7 +88,19 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "config/runtime.yaml", "decision": "auto", "reason": "runtime tuning config"},
                 {"pattern": "config/nodes/**", "decision": "approval_required", "reason": "node definition changes affect execution, prompts, and model selection"},
                 {"pattern": "config/workflows/**", "decision": "approval_required", "reason": "workflow changes affect node graph"},
-                # 第一个命中的规则赢，所以这条兜底必须排在上面两条之后。config/ 下的任何
+                {"pattern": "config/policy.yaml", "decision": "deny", "reason": "policy is high-risk (human-only)"},
+                # 共享的密钥只经 manage_secret 的虚拟路径写，一次一个键。
+                {"pattern": "config/secrets.env", "decision": "deny", "reason": "do not allow writing shared dotenv secrets"},
+                {"pattern": "config/models.yaml", "decision": "approval_required", "reason": "config changes require approval"},
+                # stdio 客户端的 command 会在 reload 后被启动，等价于 config/tools/** 的代码执行风险。
+                {"pattern": "config/mcp.yaml", "decision": "approval_required", "reason": "mcp stdio clients execute local commands"},
+                {"pattern": "config/tools/**", "decision": "approval_required", "reason": "creating/updating tools requires approval"},
+                # skill 正文直接进系统提示词，和 config/nodes/** 是同一类影响。
+                # 注意副作用：dream 想把高频记忆提升成 skill 会被这条挡下 —— scheduler
+                # 会话遇到 sensitive 决策是直接拒绝而非转审批。要那个功能就在
+                # config/policy.yaml 里把这条连同 skills/** 一起放宽，别在这里改默认值。
+                {"pattern": "config/skills/**", "decision": "approval_required", "reason": "skill bodies are injected into prompts"},
+                # 第一个命中的规则赢，所以这条兜底必须排在上面几条具体规则之后。config/ 下的任何
                 # 文件都参与决定 engine 怎么跑，落到 default:auto 等于免审批改行为。
                 {"pattern": "config/**", "decision": "approval_required", "reason": "config changes affect execution"},
                 # 下面这些以前落在 default:auto 上，而它们和 engine/** 一样是重启即执行的代码。
@@ -91,15 +109,14 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "clonoth_sdk/**", "decision": "approval_required", "reason": "sdk source changes require approval"},
                 {"pattern": "plugins/**", "decision": "approval_required", "reason": "plugin source changes require approval"},
                 {"pattern": "deploy/**", "decision": "approval_required", "reason": "deployment units run as services"},
-                # skill 正文直接进系统提示词，和 config/nodes/** 是同一类影响。
-                # 注意副作用：dream 想把高频记忆提升成 skill 会被这条挡下 —— scheduler
-                # 会话遇到 sensitive 决策是直接拒绝而非转审批。要那个功能就在
-                # data/policy.yaml 里显式放宽，别在这里改默认值。
+                # 仓库自带的默认节点和模板，跟代码一起发布；实例要改的写进 config/。
+                {"pattern": "defaults/**", "decision": "approval_required", "reason": "repository defaults ship with the code"},
+                # 下面四条是挪进 config/ 之前的位置。判定时新位置也按这些旧名字判一遍，老 policy 给它们写的规则照样生效。
                 {"pattern": "skills/**", "decision": "approval_required", "reason": "skill bodies are injected into prompts"},
                 {"pattern": "data/config.yaml", "decision": "approval_required", "reason": "config changes require approval"},
                 {"pattern": "data/policy.yaml", "decision": "deny", "reason": "policy is high-risk (human-only)"},
-                # stdio 客户端的 command 会在 reload 后被启动，等价于 tools/** 的代码执行风险。
                 {"pattern": "data/mcp_clients.yaml", "decision": "approval_required", "reason": "mcp stdio clients execute local commands"},
+                {"pattern": "data/platform_secrets.yaml", "decision": "deny", "reason": "platform tokens are the instance identity"},
                 {"pattern": "data/events.jsonl", "decision": "deny", "reason": "event log is append-only; never modify"},
                 {"pattern": "data/schedules.yaml", "decision": "approval_required", "reason": "schedule changes require approval"},
                 {"pattern": "engine/**", "decision": "approval_required", "reason": "engine source changes require approval"},
@@ -188,7 +205,7 @@ def _path_text_pattern(literal: str) -> re.Pattern[str] | None:
     r"""字面路径 → 命令行文本匹配器。
 
     前一个字符不能是 "\w"/"."/"-"，否则 metadata/ 会被 data/ 命中；但要允许 / 打头，
-    因为 /opt/kazebot/data/config.yaml 正是要拦的形态。
+    因为 /opt/kazebot/config/models.yaml 正是要拦的形态。
     """
     token = literal.strip().replace("\\", "/")
     if len(token) < 4:
@@ -208,6 +225,16 @@ def _to_safety_level(s: str) -> SafetyLevel:
 
 _SAFETY_NAMES: frozenset[str] = frozenset(level.value for level in SafetyLevel)
 _SAFETY_HINT = " / ".join(sorted(_SAFETY_NAMES))
+
+# 一个路径按几个名字各判一遍时，谁更严听谁。
+_STRICTNESS: dict[SafetyLevel, int] = {
+    SafetyLevel.auto: 0,
+    SafetyLevel.approval_required: 1,
+    SafetyLevel.deny: 2,
+}
+
+# 策略暴露的是整套防护面的形状，同机其他用户没有理由读到。
+_POLICY_FILE_MODE = 0o600
 
 
 def _validate_rules_section(name: str, section: Any) -> dict[str, Any]:
@@ -346,7 +373,7 @@ class PolicyEngine:
 
     def __init__(self, *, workspace_root: Path, policy_path: Path | None = None):
         self._root = workspace_root
-        self._policy_path = policy_path or (workspace_root / "data" / "policy.yaml")
+        self._policy_path = policy_path or config_layout.policy_path(workspace_root)
 
         self._cached_mtime: float | None = None
 
@@ -371,14 +398,11 @@ class PolicyEngine:
     def _ensure_policy_file_exists(self) -> None:
         if self._policy_path.exists():
             return
-        try:
-            self._policy_path.parent.mkdir(parents=True, exist_ok=True)
-            text = yaml.safe_dump(_default_policy_dict(), sort_keys=False, allow_unicode=True)
-            rewrite_text(self._policy_path, text)
-            with contextlib.suppress(OSError):
-                os.chmod(self._policy_path, 0o600)
-        except Exception:
-            pass
+        text = yaml.safe_dump(_default_policy_dict(), sort_keys=False, allow_unicode=True)
+        with contextlib.suppress(Exception), config_layout.locked(self._policy_path):
+            # 共享组里几个实例同时首启，拿到锁时别人可能已经写好了。
+            if not self._policy_path.exists():
+                config_layout.write_locked(self._policy_path, text, mode=_POLICY_FILE_MODE)
 
     def export_config(self) -> dict[str, Any]:
         """当前生效的 policy，给控制台编辑用。
@@ -404,21 +428,9 @@ class PolicyEngine:
         """
         validated = _validate_policy_dict(data)
         text = yaml.safe_dump(validated, sort_keys=False, allow_unicode=True)
-        tmp = self._policy_path.with_name(self._policy_path.name + '.' + str(os.getpid()) + '.tmp')
-        # 新建的临时文件走 umask 通常是 0644，直接替换过去会把原文件的权限降下来。
-        # 策略暴露的是整套防护面的形状，同机其他用户没有理由读到。
-        mode = 0o600
-        with contextlib.suppress(OSError):
-            mode = self._policy_path.stat().st_mode & 0o777
         try:
-            self._policy_path.parent.mkdir(parents=True, exist_ok=True)
-            write_text_as(tmp, text, newline_of(self._policy_path))
-            with contextlib.suppress(OSError):
-                os.chmod(tmp, mode)
-            os.replace(tmp, self._policy_path)
+            config_layout.write_config_text(self._policy_path, text, mode=_POLICY_FILE_MODE)
         except OSError as exc:
-            with contextlib.suppress(OSError):
-                tmp.unlink()
             raise ValueError('策略写入失败：' + str(exc)) from exc
         self._reload_if_needed(force=True)
         return self.export_config()
@@ -482,7 +494,11 @@ class PolicyEngine:
         for pat, dec, _reason in self._read_rules:
             if dec == SafetyLevel.auto:
                 continue
-            add(_rule_path_literal(pat), dec)
+            literal = _rule_path_literal(pat)
+            add(literal, dec)
+            # 按旧名字写的规则也要认出新位置：data/ 那条连带拦住 cat config/models.yaml。
+            for alias in config_layout.policy_literal_aliases(literal):
+                add(alias, dec)
         for item in (extra_literals if isinstance(extra_literals, list) else []):
             add(str(item or "").strip(), SafetyLevel.approval_required)
         return compiled
@@ -547,13 +563,27 @@ class PolicyEngine:
         return classify_path(self._root, self._extra_roots, path_str)
 
     @staticmethod
-    def _match_rules(rel: str, rules: list[tuple[str, SafetyLevel, str]], default: SafetyLevel) -> PolicyDecision:
+    def _first_match(rel: str, rules: list[tuple[str, SafetyLevel, str]], default: SafetyLevel) -> PolicyDecision:
         for pat, dec, reason in rules:
             if fnmatch.fnmatchcase(rel, pat):
-                # 命中显式规则(如 engine/**、config/nodes/**、data/config.yaml 等)，
+                # 命中显式规则(如 engine/**、config/nodes/**、config/models.yaml 等)，
                 # 标记为敏感，使管理员任务也无法自动放行。
                 return PolicyDecision(dec, reason or f"matched rule: {pat}", sensitive=True)
         return PolicyDecision(default, "default policy")
+
+    @classmethod
+    def _match_rules(cls, rel: str, rules: list[tuple[str, SafetyLevel, str]], default: SafetyLevel) -> PolicyDecision:
+        """挪了位置的文件连同旧名字各判一遍，取最严的；一样严时命中显式规则的那个算数，它带着敏感标记。"""
+        chosen: PolicyDecision | None = None
+        for name in config_layout.policy_names(rel):
+            decision = cls._first_match(name, rules, default)
+            if chosen is None:
+                chosen = decision
+                continue
+            stricter = _STRICTNESS[decision.safety_level] - _STRICTNESS[chosen.safety_level]
+            if stricter > 0 or (stricter == 0 and decision.sensitive and not chosen.sensitive):
+                chosen = decision
+        return chosen if chosen is not None else PolicyDecision(default, "default policy")
 
     def evaluate_read_file(self, *, path: str) -> PolicyDecision:
         self._reload_if_needed()
@@ -593,7 +623,7 @@ class PolicyEngine:
             if pat.search(cmd):
                 return PolicyDecision(SafetyLevel.deny, f"command denied by pattern: {pat.pattern}")
 
-        # read_file 拦得住 read_file data/config.yaml，拦不住 cat data/config.yaml。
+        # read_file 拦得住 read_file config/models.yaml，拦不住 cat config/models.yaml。
         # 命令提到敏感路径时按同一档处理，否则管理员免审批那条快车道等于给凭据开了后门。
         for path_pat, level, literal in self._sensitive_path_patterns:
             if not path_pat.search(cmd):

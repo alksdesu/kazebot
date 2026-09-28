@@ -125,6 +125,6 @@ def test_load_tui_settings_on_a_bare_workspace_uses_defaults(tmp_path: Path) -> 
 
 def test_the_shipped_runtime_yaml_matches_the_code_defaults() -> None:
     """配置文件里写的就是代码默认值，改一边不改另一边会让「默认是什么」有两个答案。"""
-    cfg = yaml.safe_load((_ROOT / "config" / "runtime.yaml").read_text(encoding="utf-8"))
+    cfg = yaml.safe_load((_ROOT / "defaults" / "runtime.yaml").read_text(encoding="utf-8"))
 
     assert TuiSettings.from_runtime_config(cfg) == TuiSettings()

@@ -44,7 +44,7 @@ MENTION_NATIVE = "native"
 MENTION_TEXT = "text"
 MENTION_FORMS: frozenset[str] = frozenset({MENTION_NONE, MENTION_NATIVE, MENTION_TEXT})
 
-# data/config.yaml 里 platforms.<平台 id>.<密钥名> 这两级键名；平台 id 还是 data/platforms/ 下的目录名。
+# data/platform_secrets.yaml 里 <平台 id>.<密钥名> 这两级键名；平台 id 还是 data/platforms/ 下的目录名。
 _KEY_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 # config/ 下的文件控制台和 agent 在审批下就能改，还常被整份贴出去问问题，密钥不放那里。
@@ -210,11 +210,11 @@ class InstancePort:
 
 @dataclass(frozen=True)
 class SecretField:
-    """平台的一项密钥。值写在 data/config.yaml 的 platforms.<平台 id> 段或环境变量里，不进 config/。"""
+    """平台的一项密钥。值写在 data/platform_secrets.yaml 的 <平台 id> 段或环境变量里，不进 config/。"""
 
     name: str
     label: str
-    # 部署时惯用的环境变量。data/config.yaml 没写这一项时才读它。
+    # 部署时惯用的环境变量。data/platform_secrets.yaml 没写这一项时才读它。
     env: str = ""
     # 两处都没配时平台自己生成、写进这里的文件，相对工作区。空串表示不自动生成。
     file: str = ""
@@ -273,7 +273,7 @@ class PlatformDescriptor:
     # 核心层需要调用的平台策略：名字 → 模块路径，按需导入。
     hooks: Mapping[str, str] = field(default_factory=dict)
     capabilities: PlatformCapabilities = field(default_factory=PlatformCapabilities)
-    # 平台自己的密钥：连接令牌、AppSecret 这类。读取顺序是 data/config.yaml 的 platforms 段 > env > 自动生成的文件。
+    # 平台自己的密钥：连接令牌、AppSecret 这类。读取顺序是 data/platform_secrets.yaml 的 <平台 id> 段 > env > 自动生成的文件。
     secrets: tuple[SecretField, ...] = ()
     # 其他夹着凭据的文件（glob，相对工作区），比如排队的账号操作里带着管理员令牌。
     # 和自动生成的密钥文件一样，agent 读、写、经聊天外传都拒绝。

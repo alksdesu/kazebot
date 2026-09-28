@@ -45,7 +45,7 @@ class MigrationReport:
     apply: bool
     target_secret: str = ""
     already_salted: bool = False
-    # bot 用的是 data/config.yaml 或环境变量里配的密钥：迁到它，不写密钥文件。
+    # bot 用的是 data/platform_secrets.yaml 或环境变量里配的密钥：迁到它，不写密钥文件。
     explicit_secret: bool = False
     renames: list[Rename] = field(default_factory=list)
     # 认键时试过的账号作用域：认不出的键多半出自不在这里的旧号。
@@ -73,7 +73,7 @@ def _resolve_target_secret(
     """返回 (target_secret, already_salted)。bot 用的显式密钥 > override > 文件里的已有密钥 > 新生成。"""
     if current.source == _conversation_hash.SECRET_EXPLICIT:
         if override is not None and override != current.value:
-            raise SecretConflict("bot 用的是 data/config.yaml 或环境变量里配的密钥，--secret 不会生效；要换密钥先改那边")
+            raise SecretConflict("bot 用的是 data/platform_secrets.yaml 或环境变量里配的密钥，--secret 不会生效；要换密钥先改那边")
         return current.value, True
     already = bool(current.value)
     if override is not None:
@@ -160,7 +160,7 @@ def _print_report(report: MigrationReport) -> None:
     mode = "APPLY" if report.apply else "DRY-RUN"
     print(f"[{mode}] workspace: {report.workspace}")
     if report.explicit_secret:
-        print("bot 用的是 data/config.yaml 或环境变量里配的密钥：按它重算，不写密钥文件。")
+        print("bot 用的是 data/platform_secrets.yaml 或环境变量里配的密钥：按它重算，不写密钥文件。")
     if report.already_salted and not report.changed_renames:
         print("会话键摘要已是加盐状态，无需迁移。")
     changed = report.changed_renames

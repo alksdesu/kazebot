@@ -32,7 +32,7 @@ def _make_app(workspace: Path):
     return create_app(
         state=state,
         process_manager=None,
-        config_store=ConfigStore(path=workspace / "data" / "config.yaml"),
+        config_store=ConfigStore(path=workspace / "config" / "models.yaml", workspace_root=workspace),
     )
 
 

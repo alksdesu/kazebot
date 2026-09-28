@@ -67,8 +67,8 @@ function applyEdit(raw: string, mutate: (doc: Doc) => void): { content: string; 
 }
 
 const EXAMPLES = [
-  'config/qq.example.yaml',
-  'config/features.example.yaml',
+  'defaults/qq.example.yaml',
+  'defaults/features.example.yaml',
   'tools/drawtools/settings.example.yaml',
 ];
 
@@ -80,8 +80,8 @@ describe('rewriteYaml on the shipped example configs', () => {
   });
 });
 
-describe('rewriteYaml against config/qq.example.yaml', () => {
-  const raw = read('config/qq.example.yaml');
+describe('rewriteYaml against defaults/qq.example.yaml', () => {
+  const raw = read('defaults/qq.example.yaml');
 
   it('changes one scalar and nothing else', () => {
     const edit = applyEdit(raw, (doc) => { doc.output.message_limit = 5000; });
@@ -123,8 +123,8 @@ describe('rewriteYaml against config/qq.example.yaml', () => {
   });
 });
 
-describe('rewriteYaml against config/features.example.yaml', () => {
-  const raw = read('config/features.example.yaml');
+describe('rewriteYaml against defaults/features.example.yaml', () => {
+  const raw = read('defaults/features.example.yaml');
 
   it('changes one scalar and nothing else', () => {
     const edit = applyEdit(raw, (doc) => { doc.trigger.random.probability = 0.5; });

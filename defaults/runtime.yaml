@@ -1,7 +1,7 @@
 # Clonoth runtime tuning config
 #
 # - 本文件可以提交到仓库。
-# - 敏感信息应放在环境变量或 data/config.yaml 中。
+# - 敏感信息应放在环境变量或 config/models.yaml 中。
 
 version: 1
 

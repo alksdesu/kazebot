@@ -185,7 +185,7 @@ async def test_sdk_api_and_engine_update_the_same_preempt_memory(
 
     _archive(tmp_path, "UserA", constant=True)
     _archive(tmp_path, "UserB")
-    app = create_app(state=state, process_manager=None, config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"))
+    app = create_app(state=state, process_manager=None, config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path))
     loop = _loop(tmp_path, {})
     captured_contexts = []
     original_context = loop_state.ToolContext

@@ -93,7 +93,7 @@ params:
       sm_dyn: false
       decrisper: false
 character_tags:
-  path: tools/drawtools/character_tags.yaml
+  path: config/drawtools/character_tags.yaml
   auto_search_unknown: true
 llm:
   provider: openai
@@ -102,6 +102,6 @@ llm:
   base_url_env: DRAW_PLANNER_BASE_URL
   use_stream: false
 prompts:
-  top_system_path: tools/drawtools/prompts/novelai/top-system.md
-  output_format_path: tools/drawtools/prompts/novelai/output-format.md
-  tag_guide_path: tools/drawtools/prompts/novelai/tag-guide.md
+  top_system_path: config/drawtools/prompts/novelai/top-system.md
+  output_format_path: config/drawtools/prompts/novelai/output-format.md
+  tag_guide_path: config/drawtools/prompts/novelai/tag-guide.md

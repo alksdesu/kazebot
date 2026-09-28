@@ -138,7 +138,7 @@ class NapCatClient:
         if not token:
             raise NapCatError(
                 _TOKEN.env + " 未配置。它在 NapCat 容器的 /app/napcat/config/webui.json 里，"
-                "用 manage_secret 写进 .env，或写在 data/config.yaml 的 platforms.qq." + _TOKEN.name + "。"
+                "用 manage_secret 写进 .env，或写在 data/platform_secrets.yaml 的 qq." + _TOKEN.name + "。"
             )
         # NapCat 校验 sha256(token + ".napcat")，明文 token 不离开本机。
         digest = hashlib.sha256((token + ".napcat").encode("utf-8")).hexdigest()

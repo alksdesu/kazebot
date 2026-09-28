@@ -4,8 +4,8 @@
 # 全局文件和 .env 里的同名设置，所以只保留你真的要接管的键，其余整行删掉或注释掉。
 #
 # 这里只列 QQ 独有的键。触发、审批、复读、收图收文件、队列、群历史、表情包挑图这些
-# 全平台共用的设置写在 config/features.yaml（模板是 config/features.example.yaml），
-# 要让 QQ 单独用另一套值，在本文件写同样的路径即可；表情包图库那五项全平台只有一份，只认全局文件。
+# 不分平台的设置写在 config/features.yaml（模板是 defaults/features.example.yaml），
+# 要让 QQ 单独用另一套值，在本文件写同样的路径即可；表情包图库那五项这台机器上的实例共用一份，只认全局文件。
 #
 # 每个键的解析规则、环境变量兜底和生效方式都声明在 adapters/onebot/live_config.py 的
 # LIVE_KEYS 里；GET /qq/state 返回 bot 进程当前实际生效的值，改完对着它确认。
@@ -107,6 +107,6 @@ forward_bridge:
   enabled: true
   max_messages: 30
   # 监听地址与令牌不在这里：ONEBOT_FORWARD_BRIDGE_HOST/PORT 和令牌在启动时绑定，改了要重启。
-  # 令牌写在 data/config.yaml 的 platforms.qq.forward_bridge_token 或 .env 的 ONEBOT_FORWARD_BRIDGE_TOKEN；
+  # 令牌写在 data/platform_secrets.yaml 的 qq.forward_bridge_token 或 .env 的 ONEBOT_FORWARD_BRIDGE_TOKEN；
   # 都没配时 bot 自签一份写到 ONEBOT_FORWARD_BRIDGE_TOKEN_FILE
   # （默认 ${CLONOTH_WORKSPACE}/data/onebot_forward_bridge_token），仍强制校验；文件不可写则 Bridge 不启动。

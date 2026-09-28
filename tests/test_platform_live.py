@@ -35,6 +35,29 @@ def _status(**fields: Any) -> live.LiveStatus:
     return live_status({"published_at": _NOW, **fields}, now=_NOW)
 
 
+def _repo_top_level_modules() -> set[str]:
+    root = _PLATFORMS_DIR.parent
+    return {p.stem for p in root.glob("*.py")} | {p.name for p in root.iterdir() if (p / "__init__.py").is_file()}
+
+
+def _non_stdlib_imports() -> list[tuple[str, str]]:
+    """platforms/*.py 里 import 的非标准库模块，(文件名, 模块名)。"""
+    found: list[tuple[str, str]] = []
+    for path in sorted(_PLATFORMS_DIR.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level:
+                names = [node.module or ""]
+            else:
+                continue
+            found.extend(
+                (path.name, name) for name in names
+                if name.split(".")[0] not in sys.stdlib_module_names and name != "__future__"
+            )
+    return found
+
+
 class TestHeartbeat:
     def test_nothing_published_is_neither_fresh_nor_possibly_running(self) -> None:
         status = live_status({}, now=_NOW)
@@ -200,17 +223,14 @@ class TestTheContract:
 
     def test_the_platforms_package_imports_nothing_but_the_standard_library(self) -> None:
         # 核心、工具和各平台适配器都从这里认平台，牵出任何第三方库都会让某一方装不起来。
-        offenders: list[str] = []
-        for path in sorted(_PLATFORMS_DIR.glob("*.py")):
-            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-                if isinstance(node, ast.Import):
-                    names = [alias.name for alias in node.names]
-                elif isinstance(node, ast.ImportFrom) and not node.level:
-                    names = [node.module or ""]
-                else:
-                    continue
-                offenders.extend(
-                    f"{path.name}: {name}" for name in names
-                    if name.split(".")[0] not in sys.stdlib_module_names and name != "__future__"
-                )
+        # 仓库自己的顶层模块不算：它们跟着同一份代码走，不会缺。
+        first_party = _repo_top_level_modules()
+        offenders = [
+            f"{filename}: {name}" for filename, name in _non_stdlib_imports()
+            if name.split(".")[0] not in first_party
+        ]
         assert offenders == []
+
+    def test_the_only_first_party_import_is_the_config_layout(self) -> None:
+        """放开仓库自己的模块之后，这条钉住实际放进来的是哪几个，别顺手再拖进半个引擎。"""
+        assert {name.split(".")[0] for _filename, name in _non_stdlib_imports()} == {"config_layout"}

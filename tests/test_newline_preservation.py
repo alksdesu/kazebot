@@ -121,7 +121,7 @@ def supervisor_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             policy=PolicyEngine(workspace_root=tmp_path),
         ),
         process_manager=None,
-        config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"),
+        config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path),
     )
 
     def call(method: str, url: str, **kwargs: Any) -> httpx.Response:
@@ -168,21 +168,21 @@ def ctx(tmp_path: Path) -> _Ctx:
 
 # 端点、落盘路径；覆盖不同目录布局与文件类型（yaml / py / md）。
 RAW_ENDPOINTS = (
-    ("/config/raw", "data/config.yaml"),
+    ("/config/raw", "config/models.yaml"),
     ("/runtime/raw", "config/runtime.yaml"),
-    ("/policy/raw", "data/policy.yaml"),
+    ("/policy/raw", "config/policy.yaml"),
     ("/schedules/raw", "data/schedules.yaml"),
-    ("/mcp-clients/raw", "data/mcp_clients.yaml"),
+    ("/mcp-clients/raw", "config/mcp.yaml"),
     ("/nodes/qq.orchestrator/raw", "config/nodes/qq.orchestrator.yaml"),
     ("/node-files/shared.md/raw", "config/nodes/shared.md"),
-    ("/skills/writing/raw", "skills/writing/SKILL.md"),
-    ("/tools/weather/raw", "tools/weather.py"),
+    ("/skills/writing/raw", "config/skills/writing/SKILL.md"),
+    ("/tools/weather/raw", "config/tools/weather.py"),
 )
 
 # /tools/{name}/raw 只认注册表里已有的工具，头一份得从 POST 建。
 CREATE_ENDPOINTS = (
     ("/nodes", "config/nodes/scout.yaml", "scout"),
-    ("/tools", "tools/weather.py", "weather"),
+    ("/tools", "config/tools/weather.py", "weather"),
 )
 
 
@@ -266,10 +266,10 @@ class TestTheConsoleRawConfigEndpoints:
 
 class TestTheDrawtoolsEndpoints:
     DRAW_ENDPOINTS = (
-        ("/drawtools/settings/raw", "tools/drawtools/settings.yaml"),
-        ("/drawtools/characters/raw", "tools/drawtools/character_tags.yaml"),
-        ("/drawtools/prompts/top-system/raw", "tools/drawtools/prompts/novelai/top-system.md"),
-        ("/drawtools/prompts/tag-guide/raw", "tools/drawtools/prompts/novelai/tag-guide.md"),
+        ("/drawtools/settings/raw", "config/drawtools/settings.yaml"),
+        ("/drawtools/characters/raw", "config/drawtools/character_tags.yaml"),
+        ("/drawtools/prompts/top-system/raw", "config/drawtools/prompts/novelai/top-system.md"),
+        ("/drawtools/prompts/tag-guide/raw", "config/drawtools/prompts/novelai/tag-guide.md"),
     )
 
     @pytest.mark.parametrize("url,rel", DRAW_ENDPOINTS)
@@ -339,7 +339,8 @@ class TestThePlatformConfigFile:
 
         supervisor_call("PUT", "/v1/platforms/qq/config/raw", json={"content": _QQ_TEXT})
 
-        assert sorted(p.name for p in (tmp_path / "config").iterdir()) == ["qq.yaml"]
+        assert not list((tmp_path / "config").glob("*.tmp"))
+        assert [p.name for p in (tmp_path / "config").iterdir() if p.name.startswith("qq")] == ["qq.yaml"]
 
     def test_the_legacy_qq_route_writes_the_same_bytes(self, admin, tmp_path: Path) -> None:
         # 没刷新的旧控制台还在调 /v1/admin/config/qq/raw，它也走 write_raw。
@@ -384,8 +385,8 @@ class TestTheModelConfigStore:
     def test_upserting_a_provider_keeps_the_newline(
         self, tmp_path: Path, data: bytes, checker: Callable[[Path], None],
     ) -> None:
-        path = seed(tmp_path / "data/config.yaml", data)
-        store = ConfigStore(path=path)
+        path = seed(tmp_path / "config/models.yaml", data)
+        store = ConfigStore(path=path, workspace_root=tmp_path)
 
         store.upsert_provider("openai", base_url="https://api.example.com", model="gpt-4o")
 
@@ -397,8 +398,8 @@ class TestTheModelConfigStore:
         self, tmp_path: Path, data: bytes, checker: Callable[[Path], None],
     ) -> None:
         # 群里一句「/切换模型」就走这条，落的是 _save_yaml。
-        path = seed(tmp_path / "data/config.yaml", data)
-        store = ConfigStore(path=path)
+        path = seed(tmp_path / "config/models.yaml", data)
+        store = ConfigStore(path=path, workspace_root=tmp_path)
 
         store.update_openai(OpenAIConfigUpdateIn(model="gpt-4o-mini"))
 
@@ -410,17 +411,17 @@ class TestTheModelConfigStore:
         self, tmp_path: Path, newline: bytes, checker: Callable[[Path], None],
     ) -> None:
         # 顶层不是映射时 reload() 会落一份默认配置回去，走的是 _save_yaml。
-        path = seed(tmp_path / "data/config.yaml", b"- one\n- two\n".replace(b"\n", newline))
-        store = ConfigStore(path=path)
+        path = seed(tmp_path / "config/models.yaml", b"- one\n- two\n".replace(b"\n", newline))
+        store = ConfigStore(path=path, workspace_root=tmp_path)
 
         store.reload()
 
         checker(path)
 
     def test_a_brand_new_config_file_is_written_as_lf(self, tmp_path: Path) -> None:
-        path = tmp_path / "data/config.yaml"
+        path = tmp_path / "config/models.yaml"
         path.parent.mkdir(parents=True, exist_ok=True)
-        store = ConfigStore(path=path)
+        store = ConfigStore(path=path, workspace_root=tmp_path)
 
         store.upsert_provider("openai", model="gpt-4o")
 
@@ -436,7 +437,7 @@ class TestThePolicyFile:
     def test_replacing_the_policy_keeps_the_newline(
         self, tmp_path: Path, data: bytes, checker: Callable[[Path], None],
     ) -> None:
-        path = seed(tmp_path / "data/policy.yaml", data)
+        path = seed(tmp_path / "config/policy.yaml", data)
         engine = PolicyEngine(workspace_root=tmp_path)
 
         engine.replace_config({"version": 1, "extra_roots": ["/srv/shared"]})
@@ -445,23 +446,24 @@ class TestThePolicyFile:
         assert yaml.safe_load(path.read_text(encoding="utf-8"))["extra_roots"] == ["/srv/shared"]
 
     def test_a_generated_policy_file_is_lf(self, tmp_path: Path) -> None:
-        # 没有 data/policy.yaml 时构造 PolicyEngine 会落一份默认策略。
+        # 没有 config/policy.yaml 时构造 PolicyEngine 会落一份默认策略。
         PolicyEngine(workspace_root=tmp_path)
 
-        assert_lf(tmp_path / "data" / "policy.yaml")
+        assert_lf(tmp_path / "config" / "policy.yaml")
 
     def test_the_replace_leaves_no_tmp_file_behind(self, tmp_path: Path) -> None:
-        seed(tmp_path / "data/policy.yaml", _CRLF_SEED)
+        seed(tmp_path / "config/policy.yaml", _CRLF_SEED)
         engine = PolicyEngine(workspace_root=tmp_path)
 
         engine.replace_config({"version": 1})
 
-        assert [p.name for p in (tmp_path / "data").iterdir()] == ["policy.yaml"]
+        # 锁文件挨着配置放，是替换之外唯一留下的东西。
+        assert sorted(p.name for p in (tmp_path / "config").iterdir()) == [".policy.yaml.lock", "policy.yaml"]
 
     @pytest.mark.skipif(os.name == "nt", reason="Windows 不用 POSIX 权限位")
     def test_the_replace_does_not_loosen_the_permissions(self, tmp_path: Path) -> None:
         # tmp 走 umask 通常是 0644，替换过去会把策略暴露给同机其他用户。
-        path = seed(tmp_path / "data/policy.yaml", _CRLF_SEED)
+        path = seed(tmp_path / "config/policy.yaml", _CRLF_SEED)
         os.chmod(path, 0o600)
         engine = PolicyEngine(workspace_root=tmp_path)
 
@@ -474,7 +476,7 @@ class TestThePolicyFile:
     def test_a_generated_policy_file_is_owner_only(self, tmp_path: Path) -> None:
         PolicyEngine(workspace_root=tmp_path)
 
-        assert (tmp_path / "data" / "policy.yaml").stat().st_mode & 0o777 == 0o600
+        assert (tmp_path / "config" / "policy.yaml").stat().st_mode & 0o777 == 0o600
 
 
 # ---------------------------------------------------------------------------
@@ -683,7 +685,7 @@ class TestTheMcpClientConfig:
     def test_upserting_a_client_keeps_the_newline(
         self, tmp_path: Path, data: bytes, checker: Callable[[Path], None],
     ) -> None:
-        path = seed(tmp_path / "data/mcp_clients.yaml", data)
+        path = seed(tmp_path / "config/mcp.yaml", data)
 
         mcp_runtime.upsert_client(tmp_path, _MCP_SPEC)
 
@@ -694,7 +696,7 @@ class TestTheMcpClientConfig:
     def test_deleting_a_client_keeps_the_newline(
         self, tmp_path: Path, data: bytes, checker: Callable[[Path], None],
     ) -> None:
-        path = seed(tmp_path / "data/mcp_clients.yaml", data)
+        path = seed(tmp_path / "config/mcp.yaml", data)
         mcp_runtime.upsert_client(tmp_path, _MCP_SPEC)
 
         assert mcp_runtime.delete_client(tmp_path, "fs") is True
@@ -703,7 +705,7 @@ class TestTheMcpClientConfig:
     def test_a_first_mcp_config_is_lf(self, tmp_path: Path) -> None:
         mcp_runtime.upsert_client(tmp_path, _MCP_SPEC)
 
-        assert_lf(tmp_path / "data" / "mcp_clients.yaml")
+        assert_lf(tmp_path / "config" / "mcp.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -868,14 +870,17 @@ class TestTheDrawtoolsSettingsFile:
 
 class TestBootstrappingTheDrawtoolsUserConfigs:
     @pytest.fixture
-    def draw_dirs(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    def draw_dirs(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
+        """(仓库发的模板目录, 实例的运行时配置目录)。"""
         import config_io
 
-        prompts = tmp_path / "prompts" / "novelai"
-        prompts.mkdir(parents=True)
-        monkeypatch.setattr(config_io, "DRAWTOOLS_DIR", tmp_path)
-        monkeypatch.setattr(config_io, "PROMPT_DIR", prompts)
-        return tmp_path
+        code = tmp_path / "code"
+        (code / "tools" / "drawtools" / "prompts" / "novelai").mkdir(parents=True)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.setattr(config_io.config_layout, "CODE_ROOT", code)
+        monkeypatch.setattr(config_io, "WORKSPACE_ROOT", workspace)
+        return code / "tools" / "drawtools", workspace / "config" / "drawtools"
 
     EXAMPLES = (
         ("settings.example.yaml", "settings.yaml"),
@@ -886,31 +891,43 @@ class TestBootstrappingTheDrawtoolsUserConfigs:
     )
 
     @pytest.mark.parametrize("data", [_CRLF_SEED, _LF_SEED])
-    def test_the_copy_is_byte_for_byte(self, draw_dirs: Path, data: bytes) -> None:
+    def test_the_copy_is_byte_for_byte(self, draw_dirs: tuple[Path, Path], data: bytes) -> None:
         import config_io
 
+        examples, runtime = draw_dirs
         for src, _dst in self.EXAMPLES:
-            seed(draw_dirs / src, data)
+            seed(examples / src, data)
 
         created = config_io.ensure_user_configs()
 
         assert len(created) == len(self.EXAMPLES)
         for src, dst in self.EXAMPLES:
-            assert (draw_dirs / dst).read_bytes() == (draw_dirs / src).read_bytes() == data
+            assert (runtime / dst).read_bytes() == (examples / src).read_bytes() == data
 
-    def test_an_existing_user_config_is_not_touched(self, draw_dirs: Path) -> None:
+    def test_the_new_files_are_reported_by_their_workspace_path(self, draw_dirs: tuple[Path, Path]) -> None:
         import config_io
 
-        seed(draw_dirs / "settings.example.yaml", _LF_SEED)
-        mine = seed(draw_dirs / "settings.yaml", _CRLF_SEED)
+        examples, _runtime = draw_dirs
+        seed(examples / "settings.example.yaml", _LF_SEED)
+
+        assert config_io.ensure_user_configs() == ["config/drawtools/settings.yaml"]
+
+    def test_an_existing_user_config_is_not_touched(self, draw_dirs: tuple[Path, Path]) -> None:
+        import config_io
+
+        examples, runtime = draw_dirs
+        seed(examples / "settings.example.yaml", _LF_SEED)
+        mine = seed(runtime / "settings.yaml", _CRLF_SEED)
 
         created = config_io.ensure_user_configs()
 
         assert created == []
         assert mine.read_bytes() == _CRLF_SEED
 
-    def test_a_missing_example_creates_nothing(self, draw_dirs: Path) -> None:
+    def test_a_missing_example_creates_nothing(self, draw_dirs: tuple[Path, Path]) -> None:
         import config_io
 
+        _examples, runtime = draw_dirs
+
         assert config_io.ensure_user_configs() == []
-        assert not (draw_dirs / "settings.yaml").exists()
+        assert not (runtime / "settings.yaml").exists()

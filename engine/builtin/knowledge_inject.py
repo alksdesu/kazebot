@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 import yaml
 
+import config_layout
 from clonoth_runtime import get_int
 from engine.memory_namespace import conversation_namespace, subject_namespace
 from engine.memory_subjects import (
@@ -30,7 +31,7 @@ from engine.memory_hit_cache import record_hits
 
 logger = logging.getLogger(__name__)
 
-# Skill 名同时是 skills/<name>/ 目录名
+# Skill 名同时是 config/skills/<name>/ 目录名
 SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
@@ -217,7 +218,7 @@ class _SkillCache:
 
 
 def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list[dict[str, Any]]:
-    """Scan ``skills/*/SKILL.md`` and return metadata + body for each skill."""
+    """Scan ``config/skills/*/SKILL.md`` and return metadata + body for each skill."""
     # Why: skill scanning is now owned by the knowledge plugin. How: move the
     # former skill catalog loader here byte-for-byte except for local matcher
     # references. Purpose: keep skill injection output stable while removing the
@@ -227,7 +228,7 @@ def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list
         if cached is not None:
             return cached
 
-    skills_dir = workspace_root / "skills"
+    skills_dir = config_layout.skills_dir(workspace_root)
     if not skills_dir.exists() or not skills_dir.is_dir():
         return []
 
@@ -272,7 +273,7 @@ def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list
                 "name": name,
                 "description": description,
                 "enabled": enabled,
-                "path": skill_md.relative_to(workspace_root).as_posix(),
+                "path": config_layout.logical_path(workspace_root, skill_md),
                 "strategy": strategy,
                 "keywords": keywords,
                 "compiled_keywords": [compile_keyword(k) for k in keywords],
@@ -1334,7 +1335,7 @@ def _tool_err(message: Any, **fields: Any) -> dict[str, Any]:
 
 
 async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """Create or update a skill under skills/<name>/SKILL.md."""
+    """Create or update a skill under config/skills/<name>/SKILL.md."""
     # Why: skill management tools now live beside skill loading and injection.
     # How: move the old skill-tool implementation here and keep the
     # async tool signature unchanged. Purpose: let PLUGIN_META register the tool
@@ -1374,7 +1375,7 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
     if not SKILL_NAME_RE.fullmatch(name):
         return _tool_err("invalid skill name: only [A-Za-z0-9][A-Za-z0-9_-]{0,63} is allowed")
 
-    path = f"skills/{name}/SKILL.md"
+    path = f"{config_layout.SKILLS_DIR}/{name}/SKILL.md"
     if not isinstance(content, str) or not content.strip():
         meta: dict[str, Any] = {
             "name": name,
@@ -1427,17 +1428,17 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
 
 
 async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """List local skills under skills/*/SKILL.md."""
+    """List local skills under config/skills/*/SKILL.md."""
     # Why: the listing tool was moved with the skill parser. How: keep the same
     # filesystem scan and metadata coercion. Purpose: preserve tool output shape.
-    skills_dir = ctx.workspace_root / "skills"
+    skills_dir = config_layout.skills_dir(ctx.workspace_root)
     if not skills_dir.exists():
         return _tool_ok("0 skills", skills=[])
 
     items: list[dict[str, Any]] = []
     for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
         try:
-            rel = skill_md.relative_to(ctx.workspace_root).as_posix()
+            rel = config_layout.logical_path(ctx.workspace_root, skill_md)
             text = skill_md.read_text(encoding="utf-8")
             meta, _body = parse_skill_frontmatter(text)
             if not isinstance(meta, dict):
@@ -1472,13 +1473,13 @@ async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
                 }
             )
         except Exception as e:
-            items.append({"name": skill_md.parent.name, "path": skill_md.relative_to(ctx.workspace_root).as_posix(), "error": str(e)})
+            items.append({"name": skill_md.parent.name, "path": config_layout.logical_path(ctx.workspace_root, skill_md), "error": str(e)})
 
     return _tool_ok(f"{len(items)} skills", skills=items)
 
 
 async def delete_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """Delete a skill directory under skills/<name>/."""
+    """Delete a skill directory under config/skills/<name>/."""
     # Why: delete_skill is now plugin-owned like the other knowledge tools. How:
     # keep the old guard and shutil.rmtree behavior. Purpose: preserve approval
     # and deletion semantics while removing the old skill-tool file.
@@ -1488,13 +1489,13 @@ async def delete_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     if not SKILL_NAME_RE.fullmatch(name):
         return _tool_err("invalid skill name")
 
-    skill_dir = resolve_under_allowed_roots(ctx.workspace_root, f"skills/{name}")
+    skill_dir = resolve_under_allowed_roots(ctx.workspace_root, f"{config_layout.SKILLS_DIR}/{name}")
     if not skill_dir.exists():
         return _tool_err(f"skill not found: {name}")
     if not skill_dir.is_dir():
         return _tool_err(f"not a skill directory: {name}")
 
-    _op, err = await request_guard(ctx, "write_file", {"path": f"skills/{name}/SKILL.md", "delete": True})
+    _op, err = await request_guard(ctx, "write_file", {"path": f"{config_layout.SKILLS_DIR}/{name}/SKILL.md", "delete": True})
     if err is not None:
         return _tool_err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
@@ -1862,7 +1863,7 @@ def _delete_memory_locked(
 PLUGIN_META["tools"] = [
     {
         "name": "create_or_update_skill",
-        "description": "Create or update a skill under skills/<name>/SKILL.md.",
+        "description": "Create or update a skill under config/skills/<name>/SKILL.md.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1882,13 +1883,13 @@ PLUGIN_META["tools"] = [
     },
     {
         "name": "list_skills",
-        "description": "List local skills under skills/*/SKILL.md.",
+        "description": "List local skills under config/skills/*/SKILL.md.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
         "func": list_skills,
     },
     {
         "name": "delete_skill",
-        "description": "Delete a skill directory under skills/<name>/.",
+        "description": "Delete a skill directory under config/skills/<name>/.",
         "input_schema": {
             "type": "object",
             "properties": {

@@ -8,7 +8,7 @@
 
 **不配这一步，收进来的图永远打不上标签，也就永远进不了检索。**
 
-控制台「表情包」页有一块看图渠道：选渠道、填地址、点「拉取」挑模型、填 key。它写的是 `data/config.yaml` 的 `system_models.image`，`read_image` 工具用的是同一份。
+控制台「表情包」页有一块看图渠道：选渠道、填地址、点「拉取」挑模型、填 key。它写的是 `config/models.yaml` 的 `system_models.image`，`read_image` 工具用的是同一份。
 
 「渠道」决定按谁的格式发请求，四种都支持（OpenAI / Responses / Claude / Gemini 原生）。它也决定地址写到哪一级：OpenAI 系要带 `/v1`，Claude 和 Gemini 不带，多带的版本段会被去掉。
 

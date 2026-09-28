@@ -24,7 +24,7 @@ from engine.node import Node  # noqa: E402
 from engine.prompt import _expand_includes, assemble_prompt  # noqa: E402
 
 MARKER = "# %%DYNAMIC%%"
-_NODE_DIRS = ("config/nodes", "engine/system_nodes")
+_NODE_DIRS = ("defaults/nodes", "engine/system_nodes")
 
 
 def _node_files() -> list[Path]:
@@ -38,7 +38,7 @@ def _prompt_of(path: Path) -> str:
     """渲染变量之前的提示词模板，include 已按引擎的方式展开：规则大多写在片段里。"""
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     prompt = data.get("prompt")
-    return _expand_includes(prompt, _ROOT / "config" / "nodes") if isinstance(prompt, str) else ""
+    return _expand_includes(prompt, _ROOT) if isinstance(prompt, str) else ""
 
 
 def _rel(path: Path) -> str:
@@ -72,9 +72,9 @@ class TestNodePromptsDoNotEchoTheInstruction:
         assert empty == [], f"删引导句时把整个 prompt 清空了: {empty}"
 
     @pytest.mark.parametrize("rel", [
-        "config/nodes/qq.orchestrator.yaml",
-        "config/nodes/chat.vision.yaml",
-        "config/nodes/chat.web_search.yaml",
+        "defaults/nodes/qq.orchestrator.yaml",
+        "defaults/nodes/chat.vision.yaml",
+        "defaults/nodes/chat.web_search.yaml",
     ])
     def test_entry_prompts_carry_no_turn_varying_variable_at_all(self, rel: str) -> None:
         """当前时间由平台写进入站消息（QQ 三条入站路径都带「当前时间: ... CST」），入口节点连 now 都不需要。
@@ -116,14 +116,14 @@ class TestAssembledPromptContainsInstructionOnce:
         assert self._text(messages).count("查一下天气") == 2
 
     def test_the_current_qq_prompt_yields_exactly_one_copy(self, tmp_path: Path) -> None:
-        prompt = _prompt_of(_ROOT / "config/nodes/qq.orchestrator.yaml")
+        prompt = _prompt_of(_ROOT / "defaults/nodes/qq.orchestrator.yaml")
 
         messages = self._assemble(tmp_path, prompt, "查一下天气")
 
         assert self._text(messages).count("查一下天气") == 1
 
     def test_the_copy_that_survives_is_the_trailing_user_message(self, tmp_path: Path) -> None:
-        prompt = _prompt_of(_ROOT / "config/nodes/qq.orchestrator.yaml")
+        prompt = _prompt_of(_ROOT / "defaults/nodes/qq.orchestrator.yaml")
 
         messages = self._assemble(tmp_path, prompt, "查一下天气")
 
@@ -132,7 +132,7 @@ class TestAssembledPromptContainsInstructionOnce:
 
     def test_history_tail_dedupe_still_prevents_a_third_copy(self, tmp_path: Path) -> None:
         # resume 场景：instruction 已经在 JSONL 历史末尾。
-        prompt = _prompt_of(_ROOT / "config/nodes/qq.orchestrator.yaml")
+        prompt = _prompt_of(_ROOT / "defaults/nodes/qq.orchestrator.yaml")
         history = [{"role": "user", "content": "查一下天气"}]
 
         messages = self._assemble(tmp_path, prompt, "查一下天气", history=history)
@@ -141,7 +141,7 @@ class TestAssembledPromptContainsInstructionOnce:
 
     def test_system_prefix_is_byte_stable_across_turns(self, tmp_path: Path) -> None:
         """两轮不同用户输入必须产出完全相同的系统消息，否则前缀缓存无从命中。"""
-        prompt = _prompt_of(_ROOT / "config/nodes/qq.orchestrator.yaml")
+        prompt = _prompt_of(_ROOT / "defaults/nodes/qq.orchestrator.yaml")
 
         first = self._assemble(tmp_path, prompt, "第一轮问题")[0]
         second = self._assemble(tmp_path, prompt, "第二轮完全不同的问题")[0]

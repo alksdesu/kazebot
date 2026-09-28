@@ -96,10 +96,10 @@ create_user_and_dirs() {
   fi
 
   install -d -m 0755 -o "$OWNER" -g "$OWNER" "$DATA_ROOT"
-  # 代码目录本身就是第一个号的工作区，所以它必须可写：engine 起来要 touch
-  # tools/__init__.py，控制台改节点要写 config/nodes/*.yaml。多开时第二个号起才是只读代码。
+  # 代码目录本身就是第一个号的工作区，所以它必须可写：控制台改节点、渠道这些要写 config/，
+  # 运行时状态落在 data/。多开时第二个号起才是只读代码。
   chown -R "$OWNER:$OWNER" "$REPO"
-  install -d -m 0700 -o "$OWNER" -g "$OWNER" "$REPO/data"
+  install -d -m 0700 -o "$OWNER" -g "$OWNER" "$REPO/data" "$REPO/config"
   install -d -m 0755 -o "$OWNER" -g "$OWNER" "$REPO/data/attachments" "$REPO/data/logs"
   info "$REPO 与 $DATA_ROOT 属主已归 $OWNER"
 }
@@ -192,14 +192,15 @@ write_configs() {
     info "$3"
   }
 
-  copy_template "$REPO/config.example.yaml" "$REPO/data/config.yaml" \
-    "data/config.yaml —— 空渠道，等控制台「渠道」页填"
-  copy_template "$REPO/policy.example.yaml" "$REPO/data/policy.yaml" \
-    "data/policy.yaml —— 权限策略"
+  copy_template "$REPO/defaults/models.example.yaml" "$REPO/config/models.yaml" \
+    "config/models.yaml —— 空渠道，等控制台「渠道」页填"
+  copy_template "$REPO/defaults/policy.example.yaml" "$REPO/config/policy.yaml" \
+    "config/policy.yaml —— 权限策略"
   # 白名单和管理员留空是 fail-closed 的默认状态，控制台填完即时生效
-  copy_template "$REPO/config/qq.example.yaml" "$REPO/config/qq.yaml" \
+  copy_template "$REPO/defaults/qq.example.yaml" "$REPO/config/qq.yaml" \
     "config/qq.yaml —— 白名单为空，等控制台「信道」「权限」页填"
   # features.example.yaml 刻意不铺：全局文件比 .env 优先，整份铺下去 .env 里的同名设置就全失效了。
+  # 节点和 runtime 不铺：仓库默认在 defaults/ 下直接生效，config/ 里只放改过的那几份。
 }
 
 build_frontend() {

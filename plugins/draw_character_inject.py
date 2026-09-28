@@ -20,6 +20,8 @@ from typing import Any
 
 import yaml
 
+import config_layout
+
 logger = logging.getLogger(__name__)
 
 # 只对这些节点注入角色库（draw 分析/生成节点）。
@@ -31,17 +33,10 @@ _SCAN_HISTORY_DEPTH = 4
 _MAX_INJECT_CHARACTERS = 8
 
 
-def _drawtools_dir(workspace_root: Path) -> Path:
-    return workspace_root / "tools" / "drawtools"
-
-
 def _load_character_tags(workspace_root: Path) -> list[dict[str, Any]]:
-    """读取 character_tags.yaml（不存在则回退 example）。"""
-    base = _drawtools_dir(workspace_root)
-    path = base / "character_tags.yaml"
-    if not path.exists():
-        path = base / "character_tags.example.yaml"
-    if not path.exists():
+    """读取实例的 config/drawtools/character_tags.yaml（不存在则回退仓库的 example）。"""
+    path = config_layout.drawtools_effective(workspace_root, "character_tags.yaml")
+    if not path.is_file():
         return []
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))

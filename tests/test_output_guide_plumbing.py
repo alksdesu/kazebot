@@ -328,7 +328,7 @@ class TestApi:
         monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", "test-token")
         monkeypatch.setattr(admin_api, "_admin_token", "")
         monkeypatch.setattr(admin_api, "_auth_failures", OrderedDict())
-        app = create_app(state=state, process_manager=None, config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"))
+        app = create_app(state=state, process_manager=None, config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path))
         return TestClient(app, headers={"Authorization": "Bearer test-token"})
 
     def _post_inbound(self, client: TestClient, guide: object) -> httpx.Response:
@@ -455,7 +455,7 @@ class TestSdk:
 async def test_sdk_api_and_engine_swap_the_same_guide(state: SupervisorState, tmp_path: Path) -> None:
     task = _inbound(state, _session(state), output_guide=_GUIDE)
     task.status = TaskStatus.running
-    app = create_app(state=state, process_manager=None, config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"))
+    app = create_app(state=state, process_manager=None, config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path))
     loop = _loop(tmp_path, {})
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         sdk = ClonothClient("http://test")

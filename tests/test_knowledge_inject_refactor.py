@@ -36,7 +36,7 @@ def test_knowledge_inject_sets_existing_extra_keys_and_rebuilds_prompt(tmp_path:
     # memory_* ctx.extra keys. How: create a tiny workspace, run KnowledgeInjector,
     # and compare its rebuilt messages with the shared assembly helper. Purpose:
     # ensure the unified plugin changes ownership, not prompt layout or key names.
-    skills_dir = tmp_path / "skills" / "demo"
+    skills_dir = tmp_path / "config" / "skills" / "demo"
     skills_dir.mkdir(parents=True)
     (skills_dir / "SKILL.md").write_text(
         "---\n"

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+import config_layout
 from clonoth_runtime import load_yaml_dict, load_runtime_config, resolve_env_ref
 
 logger = logging.getLogger(__name__)
@@ -49,7 +50,7 @@ class Node:
     # hybrid output_mode: 纯文本输出不再 reject 重试，直接作为隐式 finish 投递给用户。
     # tool_only = 现有行为（强制 finish）；hybrid = 允许纯文本直接投递。
     output_mode: str = "tool_only"  # "tool_only" | "hybrid"
-    # config.yaml 里的渠道名，或直接写线格式名。空表示跟随全局活跃渠道。
+    # models.yaml 里的渠道名，或直接写线格式名。空表示跟随全局活跃渠道。
     provider: str = ""
     provider_options: dict = field(default_factory=dict)  # 透传给 provider 的参数（thinking/reasoning 等）
     delegate_targets: list[str] = field(default_factory=list)
@@ -71,14 +72,13 @@ class Node:
 
 
 _NODE_SUFFIX = ".yaml"
-# 按旧 id 找节点要把两个节点目录都过一遍，解析出的别名按 (文件, 修改时间) 缓存
+# 按旧 id 找节点要把几个节点目录都过一遍，解析出的别名按 (文件, 修改时间) 缓存
 _ALIAS_CACHE: dict[str, tuple[int, tuple[str, ...]]] = {}
 _WARNED_ALIAS_CONFLICTS: set[tuple[str, ...]] = set()
 
 
-def _node_dirs(workspace_root: Path) -> tuple[Path, Path]:
-    # 系统节点跟随代码仓库同步，和用户目录同名时优先
-    return workspace_root / "engine" / "system_nodes", workspace_root / "config" / "nodes"
+def _node_dirs(workspace_root: Path) -> tuple[Path, ...]:
+    return config_layout.node_search_dirs(workspace_root)
 
 
 def _is_node_name(name: str) -> bool:
@@ -120,13 +120,13 @@ def _declared_aliases(path: Path) -> tuple[str, ...]:
 
 
 def node_files(workspace_root: Path) -> list[Path]:
-    """能按 id 派发到的节点文件：系统目录在前，同一目录按文件名排序。"""
+    """能按 id 派发到的节点文件：系统目录、实例目录、仓库默认依次排，同一目录按文件名排序。"""
     files: list[Path] = []
     for nodes_dir in _node_dirs(workspace_root):
         if not nodes_dir.is_dir():
             continue
         for path in sorted(nodes_dir.glob(f"*{_NODE_SUFFIX}")):
-            # 模板和示例不会被派发到；被同名系统节点顶掉的用户文件永远加载不到
+            # 模板和示例不会被派发到；被排在前面的同名文件顶掉的那份永远加载不到
             if path.name.startswith("_") or ".example" in path.name:
                 continue
             if _exact_node_file(workspace_root, path.stem) == path:
@@ -279,7 +279,7 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
     output_mode = raw_output_mode if raw_output_mode in {"tool_only", "hybrid"} else "tool_only"
 
     # provider — 渠道名或线格式名，空表示跟随全局活跃渠道。
-    # 不在这里校验也不转小写：认得的只有线格式，config.yaml 里的自定义渠道名会被
+    # 不在这里校验也不转小写：认得的只有线格式，models.yaml 里的自定义渠道名会被
     # 判成非法而静默清空，而渠道名是区分大小写的。真解析在 model.resolve_provider。
     provider = str(data.get("provider") or "").strip()
 

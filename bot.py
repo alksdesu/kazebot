@@ -71,6 +71,18 @@ def _require_qq_instance() -> None:
         sys.exit(CONFIG_ERROR_EXIT_CODE)
 
 
+def _ensure_config_layout() -> None:
+    """改造前的平台令牌在 data/config.yaml 里：搬家没做完就读，连接令牌是空的。supervisor 正在搬时这里等它的锁。"""
+    import config_layout
+    from workspace import CONFIG_ERROR_EXIT_CODE, resolve_workspace_root
+
+    try:
+        config_layout.ensure_layout(resolve_workspace_root(_REPO_ROOT))
+    except Exception:
+        logging.getLogger(__name__).exception("[qq] 配置搬进 config/ 失败，先修好再启动")
+        sys.exit(CONFIG_ERROR_EXIT_CODE)
+
+
 def main() -> None:
     # 延迟到这里再取：本文件会被单独复制出去做入口冒烟，import 期要求整个仓库在位
     # 就跑不起来。
@@ -79,13 +91,14 @@ def main() -> None:
     from workspace import resolve_workspace_root
 
     _require_qq_instance()
+    _ensure_config_layout()
 
     # 先等 supervisor。systemd 的 After/BindsTo 只排启动顺序，不等它 ready，而
     # NoneBot 一 run 起来就开始收 QQ 消息 —— 那十几秒里的 submit inbound 全部失败，
     # 每次重启都静默吞掉几条群消息。
     wait_supervisor(_SUPERVISOR_URL, label="qq", max_wait_sec=_SUPERVISOR_WAIT_SEC)
 
-    # NoneBot 只从环境变量读连接令牌，写在 data/config.yaml 的那份得显式交给它。
+    # NoneBot 只从环境变量读连接令牌，写在 data/platform_secrets.yaml 的那份得显式交给它。
     access = platform_secret(resolve_workspace_root(_REPO_ROOT), QQ_NAPCAT, "access_token")
     nonebot.init(**({"onebot_access_token": access.value} if access.source == SECRET_FROM_CONFIG else {}))
     _bridge_stdlib_logging()

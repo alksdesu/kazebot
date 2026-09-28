@@ -1,5 +1,6 @@
 # Clonoth configuration example
-# Copy to data/config.yaml and fill in your settings.
+# Copy to config/models.yaml and fill in your settings.
+# 聊天平台的连接令牌不写在这里：它们是实例身份，写进 data/platform_secrets.yaml（模板见同目录的 platform_secrets.example.yaml）。
 #
 # 敏感信息（api_key / base_url）建议放到 .env，再用 ${VAR} 在这里引用。
 # ${VAR} / $ENV{VAR} 会在运行时从进程环境变量展开：
@@ -230,17 +231,3 @@ fallbacks:
 #   system.turn_summarizer:
 #     - provider: deepseek
 #       model: deepseek-v4-flash
-
-# ---------------------------------------------------------------------------
-# 平台密钥（platforms，可选）
-# ---------------------------------------------------------------------------
-# 各聊天平台的连接令牌和密钥写在 platforms.<平台 id> 下，比 .env 里对应的变量优先；
-# 两处都写且不一样时，启动日志会提醒 .env 那个没生效。支持 ${VAR} 引用 .env。
-# 平台不认识的键同样会在启动时报出来，免得拼错了还以为配上了。
-#
-# platforms:
-#   qq:
-#     access_token: "${ONEBOT_ACCESS_TOKEN}"   # NapCat 连接令牌，NapCat 侧配了就填同一个值
-#     forward_bridge_token: "..."              # 转发 Bridge 令牌；都没配时 bot 自签到 data/onebot_forward_bridge_token
-#     conversation_hash_secret: "..."          # 会话键摘要密钥；改动会让已有会话映射全部失配
-#     napcat_webui_token: "..."                # NapCat WebUI 令牌，控制台扫码和切号用；部署脚本会回填进 .env

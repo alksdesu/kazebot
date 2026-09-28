@@ -370,7 +370,7 @@ def _warn_startup_config() -> None:
     if live.enable_forward_bridge and not FORWARD_BRIDGE_TOKEN:
         if forward_bridge._forward_bridge_token():
             common.logger.info(
-                "forward bridge token is not configured (data/config.yaml platforms.qq.forward_bridge_token "
+                "forward bridge token is not configured (data/platform_secrets.yaml qq.forward_bridge_token "
                 "or ONEBOT_FORWARD_BRIDGE_TOKEN): using self-signed bridge token file %s",
                 FORWARD_BRIDGE_TOKEN_FILE,
             )

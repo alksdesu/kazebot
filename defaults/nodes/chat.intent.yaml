@@ -7,7 +7,7 @@ aliases:
   - qq.intent
 
 # 模型/渠道优先级由 runner 按 system_model_slot 统一解析：
-#   1) data/config.yaml 的 system_models.intent.{model,base_url,api_key}
+#   1) config/models.yaml 的 system_models.intent.{model,base_url,api_key}
 #   2) CLONOTH_INTENT_MODEL / CLONOTH_INTENT_BASE_URL / CLONOTH_INTENT_API_KEY
 #   3) 留空 → 跟随主渠道
 # 这个节点每条不命中的群消息都会跑一次，务必指到便宜的小模型。

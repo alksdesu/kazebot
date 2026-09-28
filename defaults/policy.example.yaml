@@ -1,5 +1,5 @@
 # Clonoth policy configuration
-# Copy to data/policy.yaml to override defaults.
+# Copy to config/policy.yaml to override defaults.
 #
 # 命令安全采用双层机制：
 # 1. cmd_reviewer 节点做 AI 前置审核。
@@ -9,6 +9,8 @@
 #
 # 各平台声明的密钥文件（读写都拒）和平台自己维护的状态文件（拒写）不用写在这里：
 # supervisor 按平台描述把它们排在所有规则前面，改这份文件也放不开。
+# 挪进 config/ 的几份配置在判定时还认原来的名字：给 data/config.yaml、skills/** 这些旧路径
+# 写的规则照样护住 config/models.yaml、config/skills/**，几个名字取最严的那条。
 
 version: 1
 
@@ -23,6 +25,9 @@ read_file:
     - pattern: "**/.env"
       decision: deny
       reason: "do not allow reading dotenv secrets"
+    - pattern: "config/secrets.env"
+      decision: deny
+      reason: "do not allow reading shared dotenv secrets"
     # manage_secret 的虚拟路径，不是真目录；list 只回键名与是否已配，不回值。
     - pattern: ".secret"
       decision: auto
@@ -30,9 +35,26 @@ read_file:
     - pattern: "config/nodes/**"
       decision: deny
       reason: "node prompts are internal"
+    # 仓库自带的默认节点，实例没改过的那几份就读它。
+    - pattern: "defaults/nodes/**"
+      decision: deny
+      reason: "node prompts are internal"
     - pattern: "engine/system_nodes/**"
       decision: deny
       reason: "system prompts are internal"
+    - pattern: "config/models.yaml"
+      decision: approval_required
+      reason: "model channels may hold api keys in plaintext"
+    - pattern: "config/mcp.yaml"
+      decision: approval_required
+      reason: "mcp clients may carry tokens in env or headers"
+    - pattern: "config/policy.yaml"
+      decision: approval_required
+      reason: "policy exposes the shape of every guard"
+    - pattern: "config/drawtools/settings.yaml"
+      decision: approval_required
+      reason: "drawtools settings may hold the NovelAI api key"
+    # data/ 下有平台密钥、.admin_token、会话与事件流。落到 default:auto 等于任何人问一句就能把密钥读出来。
     - pattern: "data/**"
       decision: approval_required
       reason: "runtime data may contain secrets or private context"
@@ -52,6 +74,28 @@ write_file:
     - pattern: "config/workflows/**"
       decision: approval_required
       reason: "workflow changes affect node graph"
+    - pattern: "config/policy.yaml"
+      decision: deny
+      reason: "policy is high-risk (human-only)"
+    # 共享的密钥只经 manage_secret 的虚拟路径写，一次一个键。
+    - pattern: "config/secrets.env"
+      decision: deny
+      reason: "do not allow writing shared dotenv secrets"
+    - pattern: "config/models.yaml"
+      decision: approval_required
+      reason: "config changes require approval"
+    # stdio 客户端的 command 会在 reload 后被启动，等价于 config/tools/** 的代码执行风险。
+    - pattern: "config/mcp.yaml"
+      decision: approval_required
+      reason: "mcp stdio clients execute local commands"
+    - pattern: "config/tools/**"
+      decision: approval_required
+      reason: "creating/updating tools requires approval"
+    # skill 正文直接进系统提示词。dream 想把高频记忆提升成 skill 会被这条挡下，
+    # 要那个功能就把这条连同下面的 skills/** 一起放宽。
+    - pattern: "config/skills/**"
+      decision: approval_required
+      reason: "skill bodies are injected into prompts"
     # 第一个命中的规则赢，所以下面这条兜底必须排在上面几条具体规则之后。
     # config/ 下任何文件都参与决定 engine 怎么跑，落到 default:auto 等于免审批改行为。
     - pattern: "config/**"
@@ -73,6 +117,11 @@ write_file:
     - pattern: "deploy/**"
       decision: approval_required
       reason: "deployment units run as services"
+    # 仓库自带的默认节点和模板，跟代码一起发布；实例要改的写进 config/。
+    - pattern: "defaults/**"
+      decision: approval_required
+      reason: "repository defaults ship with the code"
+    # 下面四条是挪进 config/ 之前的位置。判定时新位置也按这些旧名字判一遍，老 policy 给它们写的规则照样生效。
     - pattern: "skills/**"
       decision: approval_required
       reason: "skill bodies are injected into prompts"
@@ -85,6 +134,9 @@ write_file:
     - pattern: "data/mcp_clients.yaml"
       decision: approval_required
       reason: "mcp stdio clients execute local commands"
+    - pattern: "data/platform_secrets.yaml"
+      decision: deny
+      reason: "platform tokens are the instance identity"
     - pattern: "data/events.jsonl"
       decision: deny
       reason: "event log is append-only; never modify"
@@ -164,7 +216,7 @@ execute_command:
     # 网络监听（可能开后门）。
     - "\\b(?:nc|ncat|netcat|socat)\\b[^|]*(?:\\s-l\\b|--listen\\b)"
   # 命令里提到这些路径时，按 read_file 对同一路径的档次处理。否则 read_file 拦住了
-  # data/config.yaml，一句 cat 就绕过去。read_file 的规则会自动并进来，这里只补工作区
+  # config/models.yaml，一句 cat 就绕过去。read_file 的规则会自动并进来，这里只补工作区
   # 之外的凭据位置；写成 [] 表示关掉这层。
   sensitive_path_patterns:
     - ".ssh/"

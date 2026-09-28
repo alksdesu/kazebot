@@ -19,7 +19,7 @@ import {
   yamlString,
 } from '../console/nodeYaml';
 
-// 贴着 config/nodes/qq.orchestrator.yaml 的真实形状：顶层列表、嵌套列表、末尾 block scalar。
+// 贴着 defaults/nodes/qq.orchestrator.yaml 的真实形状：顶层列表、嵌套列表、末尾 block scalar。
 const NODE = [
   'id: qq.orchestrator',
   'type: ai',
@@ -264,7 +264,7 @@ describe('against the real qq.orchestrator.yaml', () => {
   // 手写的样例再像也只是样例。真文件格式一变，这里先红。
   const NODE_PATH = resolve(
     dirname(fileURLToPath(import.meta.url)),
-    '../../../../../config/nodes/qq.orchestrator.yaml',
+    '../../../../../defaults/nodes/qq.orchestrator.yaml',
   );
   const real = readFileSync(NODE_PATH, 'utf-8');
 

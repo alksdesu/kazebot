@@ -265,6 +265,12 @@ export interface ActiveTask {
   current_detail: string;
 }
 
+/**
+ * 配置文件从哪来。仓库默认直接生效，改过就在 config/ 下存一份本实例的，没改过的跟着代码更新。
+ * default：仓库默认原样；override：改过的仓库默认；custom：本实例自己加的；system：跟着代码走的系统节点，改不了。
+ */
+export type OverlaySource = 'default' | 'override' | 'custom' | 'system';
+
 export interface AdminNode extends NodeDef {
   tool_access?: unknown;
   skills?: unknown;
@@ -272,9 +278,15 @@ export interface AdminNode extends NodeDef {
   active?: boolean;
   /** yaml 里写的 id，且和文件名不一致。engine 认文件名，这个字段改了不换节点。 */
   declared_id?: string;
+  source?: OverlaySource;
+  /** 改过却和仓库默认一字不差：什么也没改，只会挡住以后默认的更新。 */
+  same_as_default?: boolean;
 }
 
 export type ToolSource = 'builtin' | 'plugin' | 'external';
+
+/** 外部脚本从哪来：本实例自己加的、改过仓库那份的、仓库原样的。改仓库那份会在 config/tools/ 存一份本实例的。 */
+export type ToolOrigin = 'custom' | 'override' | 'bundled';
 
 export interface AdminTool {
   name: string;
@@ -286,6 +298,13 @@ export interface AdminTool {
   input_schema?: Record<string, unknown>;
   timeout_sec?: number;
   has_spec?: boolean;
+  origin?: ToolOrigin;
+}
+
+/** 删掉本实例那份配置的结果。restored = 删的是改过的仓库默认，现在回到了默认。 */
+export interface ConfigRemoveResult {
+  ok: boolean;
+  restored: boolean;
 }
 
 export interface AdminSkill {
@@ -459,7 +478,7 @@ export interface ProvidersResponse {
   // 按节点的专属链。空数组表示这个节点禁用 fallback，键不存在才是跟随全局。
   node_fallbacks: Record<string, FallbackEntryPublic[]>;
   registered: string[];
-  /** data/config.yaml 顶层的保留段名。渠道块和它们同层，起这些名字保存时会被拒。 */
+  /** config/models.yaml 顶层的保留段名。渠道块和它们同层，起这些名字保存时会被拒。 */
   reserved_names: string[];
 }
 
@@ -947,6 +966,32 @@ export function getRuntimeRaw(token: string): Promise<string> {
   return readRawConfig('/admin/config/runtime/raw', token);
 }
 
+export interface RuntimeFile {
+  content: string;
+  /** default：本实例还没改过，显示的是仓库默认；override：本实例有自己的 config/runtime.yaml，逐键盖在默认上面。 */
+  source: 'default' | 'override';
+  path: string;
+}
+
+export async function getRuntimeFile(token: string): Promise<RuntimeFile> {
+  const resp = await apiFetch('/admin/config/runtime/raw', { headers: authHeaders(token) });
+  const json = await resp.json();
+  return {
+    content: typeof json.content === 'string' ? json.content : '',
+    source: json.source === 'override' ? 'override' : 'default',
+    path: typeof json.path === 'string' ? json.path : '',
+  };
+}
+
+/** 删掉本实例的 runtime.yaml，全部参数回到仓库默认。 */
+export async function resetRuntime(token: string): Promise<ConfigRemoveResult> {
+  const resp = await apiFetch('/admin/config/runtime/raw', {
+    method: 'DELETE',
+    headers: authHeaders(token),
+  });
+  return resp.json();
+}
+
 export function updateRuntimeRaw(token: string, yaml: string): Promise<any> {
   return writeRawConfig('/admin/config/runtime/raw', token, yaml);
 }
@@ -1301,6 +1346,8 @@ export interface NodeFileInfo {
   base_name: string;
   size: number;
   updated_at: number;
+  source: Exclude<OverlaySource, 'system'>;
+  same_as_default: boolean;
 }
 
 export async function getNodeFiles(token: string): Promise<NodeFileInfo[]> {
@@ -1316,9 +1363,10 @@ export function updateNodeFileRaw(token: string, filename: string, content: stri
   return writeRawConfig(`/admin/config/node-files/${pathPart(filename)}/raw`, token, content);
 }
 
-export async function makeNodeFileExample(token: string, filename: string): Promise<{ ok: boolean; created: boolean; path: string }> {
-  const resp = await apiFetch(`/admin/config/node-files/${pathPart(filename)}/make-example`, {
-    method: 'POST',
+/** 改过的仓库默认文件恢复成默认；本实例自己加的直接删。没改过的仓库默认删不掉，后端回 409。 */
+export async function deleteNodeFile(token: string, filename: string): Promise<ConfigRemoveResult> {
+  const resp = await apiFetch(`/admin/config/node-files/${pathPart(filename)}`, {
+    method: 'DELETE',
     headers: authHeaders(token),
   });
   return resp.json();
@@ -1346,7 +1394,7 @@ export async function createNode(token: string, data: AdminCreatePayload): Promi
   return resp.json();
 }
 
-export async function deleteNode(token: string, nodeId: string): Promise<any> {
+export async function deleteNode(token: string, nodeId: string): Promise<ConfigRemoveResult> {
   const resp = await apiFetch(`/admin/config/nodes/${pathPart(nodeId)}`, {
     method: 'DELETE',
     headers: authHeaders(token),
@@ -1376,7 +1424,7 @@ export async function createTool(token: string, data: AdminCreatePayload): Promi
   return resp.json();
 }
 
-export async function deleteTool(token: string, name: string): Promise<any> {
+export async function deleteTool(token: string, name: string): Promise<ConfigRemoveResult> {
   const resp = await apiFetch(`/admin/config/tools/${pathPart(name)}`, {
     method: 'DELETE',
     headers: authHeaders(token),

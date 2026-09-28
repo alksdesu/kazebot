@@ -11,14 +11,15 @@ DRAWTOOLS_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = DRAWTOOLS_DIR.parents[1]
 if str(_REPO_ROOT) not in sys.path:  # 工具以子进程跑，sys.path 里只有自己那一级
     sys.path.insert(0, str(_REPO_ROOT))
-from toolbox.text_files import rewrite_text  # noqa: E402
+import config_layout  # noqa: E402
 from workspace import resolve_workspace_root  # noqa: E402
 
 WORKSPACE_ROOT = resolve_workspace_root(_REPO_ROOT)
-SETTINGS_PATH = DRAWTOOLS_DIR / "settings.yaml"
-SETTINGS_EXAMPLE_PATH = DRAWTOOLS_DIR / "settings.example.yaml"
-CHARACTER_TAGS_PATH = DRAWTOOLS_DIR / "character_tags.yaml"
-CHARACTER_TAGS_EXAMPLE_PATH = DRAWTOOLS_DIR / "character_tags.example.yaml"
+# 运行时配置归实例，放在它的 config/drawtools/；仓库这边只发同名的 .example 模板。
+SETTINGS_PATH = config_layout.drawtools_file(WORKSPACE_ROOT, "settings.yaml")
+SETTINGS_EXAMPLE_PATH = config_layout.drawtools_example("settings.yaml")
+CHARACTER_TAGS_PATH = config_layout.drawtools_file(WORKSPACE_ROOT, "character_tags.yaml")
+CHARACTER_TAGS_EXAMPLE_PATH = config_layout.drawtools_example("character_tags.yaml")
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "api": {
@@ -49,7 +50,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "presets": [],
     },
     "character_tags": {
-        "path": "tools/drawtools/character_tags.yaml",
+        "path": f"{config_layout.DRAWTOOLS_DIR}/character_tags.yaml",
         "auto_search_unknown": True,
     },
 }
@@ -185,14 +186,20 @@ def selected_preset(settings: dict[str, Any] | None = None, preset_ref: str = ""
 
 
 def set_selected_preset(preset_ref: str) -> dict[str, Any]:
-    settings = load_settings()
-    target = require_preset(settings, preset_ref)
-    target_id = str(target.get("id") or "").strip()
-    if not target_id:
-        raise ValueError("preset has no id")
-    settings.setdefault("params", {})["selected_preset_id"] = target_id
-    # 用户运行期选择写入 settings.yaml；仓库只应维护 settings.example.yaml，避免升级覆盖用户配置。
-    rewrite_text(SETTINGS_PATH, yaml.safe_dump(settings, allow_unicode=True, sort_keys=False))
+    # 读改写全程持锁：控制台和 QQ 命令同时改，后写的会把先写的那笔整份盖掉。
+    with config_layout.locked(SETTINGS_PATH):
+        settings = load_settings()
+        target = require_preset(settings, preset_ref)
+        target_id = str(target.get("id") or "").strip()
+        if not target_id:
+            raise ValueError("preset has no id")
+        settings.setdefault("params", {})["selected_preset_id"] = target_id
+        # 用户运行期选择写入实例的 settings.yaml；仓库只维护 settings.example.yaml，升级不会覆盖用户配置。
+        config_layout.write_locked(
+            SETTINGS_PATH,
+            yaml.safe_dump(settings, allow_unicode=True, sort_keys=False),
+            mode=config_layout.private_mode_for(WORKSPACE_ROOT, SETTINGS_PATH),
+        )
     return target
 
 

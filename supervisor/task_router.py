@@ -1246,7 +1246,7 @@ class TaskRouterMixin:
 
         [AutoC 2026-07-09] Why: 当上游未显式传 context_mode 时，需要依据
         节点的 persistent 声明推导默认（persistent→accumulate，否则 fresh）。
-        How: 复用 engine.node.load_node（config/nodes 与 system_nodes 搜索顺序），
+        How: 复用 engine.node.load_node（system_nodes、config/nodes、defaults/nodes 的搜索顺序），
         失败时保守返回 False。Purpose: engine 侧与 supervisor 侧行为一致。
         """
         nid = str(node_id or "").strip()

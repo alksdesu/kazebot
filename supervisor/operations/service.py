@@ -14,8 +14,9 @@ from typing import Any
 import httpx
 import yaml
 
+import config_layout
 from providers import registry
-from clonoth_runtime import load_yaml_dict, platform_secret, resolve_env_ref
+from clonoth_runtime import load_platform_secrets, platform_secret, resolve_env_ref, stray_platforms_section
 from platforms.descriptor import PlatformDescriptor
 from platforms.registry import all_platforms, current_platform, platform_config_path
 from supervisor.config_store import ConfigStore
@@ -76,8 +77,15 @@ class OperationsService:
                 if resolved:
                     values.add(resolved)
 
-        workspace_config = self.root / "data/config.yaml"
-        config_files = [workspace_config]
+        # 搬家后旧位置那几份还留着给退回旧版本用，里面可能是没轮换掉的旧密钥，一并抹。
+        config_files = [
+            config_layout.models_path(self.root),
+            config_layout.platform_secrets_path(self.root),
+            config_layout.mcp_path(self.root),
+            config_layout.drawtools_file(self.root, "settings.yaml"),
+            self.root / config_layout.LEGACY_MODELS_FILE,
+            self.root / config_layout.LEGACY_MCP_FILE,
+        ]
         for platform in all_platforms():
             path = platform_config_path(platform, self.root)
             if path is not None and path not in config_files:
@@ -87,12 +95,12 @@ class OperationsService:
                 collect(yaml.safe_load(path.read_text(encoding="utf-8")))
             except (OSError, yaml.YAMLError):
                 continue
-        # 平台声明的密钥不一定叫 token/secret，按声明再收一遍；被 config 盖住的那个 env 值也收。
+        # 平台声明的密钥不一定叫 token/secret，按声明再收一遍；被密钥文件盖住的那个 env 值也收。
         # 自动生成的密钥文件不收：代码从不打印它们，里面也可能只是模式标记，抹掉反而丢排障线索。
-        config = load_yaml_dict(workspace_config) or {}
+        platform_secrets = load_platform_secrets(self.root)
         for platform in all_platforms():
             for spec in platform.secrets:
-                values.add(platform_secret(self.root, platform, spec.name, config=config).value)
+                values.add(platform_secret(self.root, platform, spec.name, secrets=platform_secrets).value)
                 if spec.env:
                     values.add(os.environ.get(spec.env, "").strip())
         for key, value in os.environ.items():
@@ -173,6 +181,23 @@ class OperationsService:
         if health["parse_error"]:
             add(f"{name} 配置文件", "failed", "配置文件读不懂，bot 还在用上一份能读的", "到平台页修正 YAML 语法后重新检查")
 
+    def _layout_check(self, add: Any) -> None:
+        layout = config_layout.layout_status(self.root)
+        if not layout["migrated"]:
+            add("配置布局", "failed", "配置还没搬进 config/", "重启 Supervisor，按日志里的报错修好后再检查")
+            return
+        notes = [*layout["warnings"], *layout["stale_legacy"]]
+        if stray_platforms_section(self.root):
+            notes.append(
+                f"{config_layout.MODELS_FILE} 里还写着 platforms 段，现在没人读它，"
+                f"平台令牌要挪到 {config_layout.PLATFORM_SECRETS_FILE}",
+            )
+        if notes:
+            # 旧位置比新位置新，多半是退回旧版本那阵子改的：那些改动现在不生效。
+            add("配置布局", "warning", "；".join(notes), "旧位置的改动不会生效，要保留的话手动挪进 config/ 里对应的文件")
+            return
+        add("配置布局", "passed", "配置都在 config/ 下")
+
     def instances(self) -> list[dict[str, Any]]:
         rows = load_instances(self.root)
         prefix = url_prefix()
@@ -204,7 +229,10 @@ class OperationsService:
             disk = shutil.disk_usage(self.root)
             add("存储空间", "passed" if disk.free > 512 * 1024 * 1024 else "warning",
                 f"可用 {disk.free // (1024 * 1024)} MiB")
-            store = getattr(self.state, "feature_config_store", None) or ConfigStore(path=self.root / "data" / "config.yaml")
+            self._layout_check(add)
+            store = getattr(self.state, "feature_config_store", None) or ConfigStore(
+                path=config_layout.models_path(self.root), workspace_root=self.root,
+            )
             secret = store.get_openai_secret()
             protected = (*self._configured_secrets(), secret.api_key)
             provider_class = registry.get(secret.provider)

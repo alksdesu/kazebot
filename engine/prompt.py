@@ -4,18 +4,40 @@ import locale
 import platform
 import re
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+
+import config_layout
 
 from .node import Node
 
 DEFAULT_PROMPT = "你是一个 AI 节点。请根据指令完成处理。\n"
 
 _INCLUDE_RE = re.compile(r'\{\{include:([^}]+)\}\}')
+_DRAWTOOLS_PREFIX = "drawtools/"
 
 
-def _expand_includes(text: str, nodes_dir: Path, *, depth: int = 0) -> str:
-    """展开 {{include:filename}} 指令，读取 config/nodes/ 下的文件并内联。
+def _include_name(raw: str) -> str | None:
+    """include 里写的相对名字。绝对路径、盘符、带 .. 的一律不认：片段只能从节点目录和绘图配置里取。"""
+    text = raw.strip().replace("\\", "/")
+    if not text or text.startswith("/") or text[1:2] == ":":
+        return None
+    parts = PurePosixPath(text).parts
+    if not parts or any(part in {".", ".."} for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def _include_file(workspace_root: Path, filename: str) -> Path | None:
+    """drawtools/ 开头的取实例的绘图配置，没有就取仓库模板；其余取节点片段，实例改过的优先，再退到仓库默认和模板。"""
+    if filename.startswith(_DRAWTOOLS_PREFIX):
+        path = config_layout.drawtools_effective(workspace_root, filename[len(_DRAWTOOLS_PREFIX):])
+        return path if path.is_file() else None
+    return config_layout.fragment_file(workspace_root, filename)
+
+
+def _expand_includes(text: str, workspace_root: Path, *, depth: int = 0) -> str:
+    """展开 {{include:filename}} 指令，把节点片段或绘图配置的内容内联进来。
 
     最多递归 3 层，防止循环引用。
     """
@@ -23,40 +45,18 @@ def _expand_includes(text: str, nodes_dir: Path, *, depth: int = 0) -> str:
         return text
 
     def _repl(m: re.Match) -> str:
-        filename = m.group(1).strip()
-        if not filename:
+        filename = _include_name(m.group(1))
+        if filename is None:
             return m.group(0)
-        if filename.startswith("drawtools/"):
-            workspace_root = nodes_dir.parent.parent
-            rel = filename[len("drawtools/"):].lstrip("/")
-            fp = (workspace_root / "tools" / "drawtools" / rel).resolve()
-            allowed_root = (workspace_root / "tools" / "drawtools").resolve()
-            try:
-                fp.relative_to(allowed_root)
-            except ValueError:
-                return m.group(0)
-            if not fp.exists() and fp.suffix:
-                example = fp.with_name(f"{fp.stem}.example{fp.suffix}")
-                if example.exists():
-                    fp = example
-        else:
-            fp = (nodes_dir / filename).resolve()
-            # 安全检查：不能逃逸出 nodes_dir
-            try:
-                fp.relative_to(nodes_dir.resolve())
-            except ValueError:
-                return m.group(0)
-            # 缺失时回退同名 .example，让 _persona.md 这类用户覆盖文件可选存在
-            if not fp.exists() and fp.suffix:
-                example = fp.with_name(f"{fp.stem}.example{fp.suffix}")
-                if example.exists():
-                    fp = example
+        fp = _include_file(workspace_root, filename)
+        if fp is None:
+            return m.group(0)
         try:
             content = fp.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             return m.group(0)
         # 递归展开被包含文件中的 include
-        return _expand_includes(content, nodes_dir, depth=depth + 1)
+        return _expand_includes(content, workspace_root, depth=depth + 1)
 
     return _INCLUDE_RE.sub(_repl, text)
 
@@ -102,7 +102,6 @@ def _assemble_block_prompt(
     Special role "history" marks the conversation history insertion point.
     Returns processed block list for ai_step to consume.
     """
-    nodes_dir = workspace_root / "config" / "nodes"
     merged = _build_variables(workspace_root, node, variables)
 
     result: list[dict[str, Any]] = []
@@ -128,7 +127,7 @@ def _assemble_block_prompt(
             continue
 
         # Expand includes and render variables
-        content = _expand_includes(content, nodes_dir)
+        content = _expand_includes(content, workspace_root)
         content = _render_variables(content, merged)
 
         entry: dict[str, Any] = {"role": role, "content": content}
@@ -177,8 +176,7 @@ def assemble_prompt(
     if not raw_str:
         return [{"role": "system", "content": DEFAULT_PROMPT}]
 
-    nodes_dir = workspace_root / "config" / "nodes"
-    expanded = _expand_includes(raw_str, nodes_dir)
+    expanded = _expand_includes(raw_str, workspace_root)
 
     merged = _build_variables(workspace_root, node, variables)
 

@@ -84,7 +84,7 @@ def test_admin_active_tasks_returns_summaries_sorted_and_requires_auth(tmp_path:
     app = create_app(
         state=state,
         process_manager=None,
-        config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"),
+        config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path),
     )
     now = datetime(2026, 6, 4, 2, 58, tzinfo=timezone.utc)
     with state._lock:
@@ -214,7 +214,7 @@ def test_create_app_writes_but_does_not_print_admin_token(
     create_app(
         state=state,
         process_manager=None,
-        config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"),
+        config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path),
     )
 
     output = capsys.readouterr().out

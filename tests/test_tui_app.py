@@ -18,6 +18,7 @@ if str(_ROOT) not in sys.path:
 from textual.css.query import NoMatches  # noqa: E402
 from textual.widgets import Static  # noqa: E402
 
+import config_layout  # noqa: E402
 import shell.tui.app as app_module  # noqa: E402
 from shell.tui.app import ClonothApp  # noqa: E402
 from shell.tui.models import NodeCompleted, NodeStarted, StreamThinking  # noqa: E402
@@ -69,6 +70,8 @@ class _StubPoller:
 def make_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(app_module, "SupervisorClient", _StubSupervisor)
     monkeypatch.setattr(app_module, "EventPoller", _StubPoller)
+    # 仓库自带的 defaults/nodes 在代码目录下，不跟着工作区走：指到这里才是真的空工作区。
+    monkeypatch.setattr(config_layout, "CODE_ROOT", tmp_path)
 
     def _factory(settings: TuiSettings | None = None) -> ClonothApp:
         # 空工作区：节点扫描找不到入口，直接进聊天界面，不弹节点选择遮罩

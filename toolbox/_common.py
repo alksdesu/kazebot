@@ -76,7 +76,7 @@ def safe_subprocess_env() -> dict[str, str]:
         if ku.endswith("_API_KEY"):
             env.pop(k, None)
             continue
-        # Declared by platforms/; a tool that needs one reads data/config.yaml or .env itself.
+        # Declared by platforms/; a tool that needs one reads data/platform_secrets.yaml or .env itself.
         if ku in platform_secrets:
             env.pop(k, None)
             continue

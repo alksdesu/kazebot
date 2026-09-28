@@ -10,6 +10,7 @@ from typing import Any
 
 import yaml
 
+import config_layout
 from clonoth_runtime import (
     TASK_REAP_INTERVAL_SECONDS,
     get_bool,
@@ -1147,10 +1148,10 @@ class DreamHandler:
         """Load existing skill names and descriptions.
 
         [AutoC 2026-05-31] Why: Dream Promote phase needs to know existing
-        skills to avoid creating duplicates. How: scan skills/*/SKILL.md
+        skills to avoid creating duplicates. How: scan config/skills/*/SKILL.md
         frontmatter for name and description. Purpose: enable L1→L2 promotion.
         """
-        skills_dir = workspace_root / "skills"
+        skills_dir = config_layout.skills_dir(workspace_root)
         if not skills_dir.exists():
             return "(no skills directory)"
         lines: list[str] = []

@@ -69,7 +69,7 @@ export const BOT_PAGES: ConsolePageDefinition[] = [
   },
 ];
 
-/** 模型与渠道。写的是 data/config.yaml，和任何平台都无关。 */
+/** 模型与渠道。写的是 config/models.yaml，和任何平台都无关。 */
 export const MODEL_PAGES: ConsolePageDefinition[] = [
   {
     id: 'providers',

@@ -108,8 +108,8 @@ def _fallback_ctx(tmp_path: Path) -> SimpleNamespace:
 
 
 def test_text_only_fallback_is_skipped_for_image_request(tmp_path, monkeypatch) -> None:
-    (tmp_path / "data").mkdir()
-    (tmp_path / "data" / "config.yaml").write_text(
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "models.yaml").write_text(
         yaml.safe_dump({
             "fallbacks": [{
                 "provider": "openai",
@@ -137,8 +137,8 @@ def test_text_only_fallback_is_skipped_for_image_request(tmp_path, monkeypatch) 
 
 
 def test_vision_fallback_preserves_image_blocks(tmp_path, monkeypatch) -> None:
-    (tmp_path / "data").mkdir()
-    (tmp_path / "data" / "config.yaml").write_text(
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "models.yaml").write_text(
         yaml.safe_dump({
             "fallbacks": [{
                 "provider": "openai",

@@ -95,7 +95,7 @@ SPEC = {
                 "items": {"type": "string"},
                 "description": (
                     "op=file 时要发送的文件路径列表（可多个）。路径相对于 Clonoth 工作区根目录"
-                    "（例如 data/report.pdf、config/nodes/qq.orchestrator.yaml）；只允许工作区内的文件。"
+                    "（例如 data/report.pdf、config/drawtools/character_tags.yaml）；只允许工作区内的文件。"
                 ),
             },
             "file_names": {
@@ -167,7 +167,7 @@ if __name__ == "__main__":
         return default
 
     def _resolve_bridge_token():
-        """和 bot 同一个顺序：显式配置（data/config.yaml 的 platforms.qq > env > .env 文件），
+        """和 bot 同一个顺序：显式配置（data/platform_secrets.yaml 的 qq 段 > env > .env 文件），
         否则读 bot 自签的令牌文件（env 指定 / 工作区 / 当前目录）；都读不到返回空串。
 
         令牌名、env 名和文件位置都按 QQ 描述里的声明，不在这里另抄一份。

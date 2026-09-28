@@ -32,7 +32,9 @@ def app_and_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     att.mkdir(parents=True)
     (att / "shot.png").write_bytes(b"\x89PNG fake")
     # 附件目录之外的东西一律不该经由这个端点读到。
-    (tmp_path / "data").joinpath("config.yaml").write_text("secret: yes", encoding="utf-8")
+    (tmp_path / "data").joinpath("platform_secrets.yaml").write_text(
+        "qq:\n  access_token: secret\n", encoding="utf-8",
+    )
 
     state = SupervisorState(
         workspace_root=tmp_path,
@@ -42,7 +44,7 @@ def app_and_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     app = create_app(
         state=state,
         process_manager=None,
-        config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"),
+        config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path),
     )
     return app, tmp_path
 
@@ -92,10 +94,10 @@ def test_a_missing_file_is_not_found(app_and_root) -> None:
 @pytest.mark.parametrize(
     "rel",
     [
-        "data/config.yaml",
-        "data/attachments/../config.yaml",
-        "data/attachments/../../data/config.yaml",
-        "../config.yaml",
+        "data/platform_secrets.yaml",
+        "data/attachments/../platform_secrets.yaml",
+        "data/attachments/../../data/platform_secrets.yaml",
+        "../platform_secrets.yaml",
         "data",
         "data/attachments",
     ],
@@ -108,7 +110,7 @@ def test_anything_outside_the_attachment_tree_is_refused(app_and_root, rel: str)
 
 def test_a_symlink_pointing_out_of_the_tree_is_refused(app_and_root) -> None:
     app, root = app_and_root
-    secret = root / "data" / "config.yaml"
+    secret = root / "data" / "platform_secrets.yaml"
     link = root / "data" / "attachments" / "qq_group_abc" / "escape.yaml"
     try:
         link.symlink_to(secret)

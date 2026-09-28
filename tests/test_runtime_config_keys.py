@@ -152,7 +152,7 @@ def _reader_files(dotted: str, sources: dict[str, str]) -> list[str]:
 
 @pytest.fixture(scope="module")
 def config() -> dict:
-    return yaml.safe_load((_ROOT / "config" / "runtime.yaml").read_text(encoding="utf-8"))
+    return yaml.safe_load((_ROOT / "defaults" / "runtime.yaml").read_text(encoding="utf-8"))
 
 
 @pytest.fixture(scope="module")
@@ -257,7 +257,7 @@ def test_call_site_fallbacks_match_the_shipped_default(module_path: str, dotted:
 @pytest.mark.parametrize("dotted", sorted(RETIRED_RUNTIME_KEYS))
 def test_retired_keys_stay_retired(dotted: str, config: dict, sources: dict[str, str]) -> None:
     """退役键不许在配置里复活，也不许在代码里留下还有人读的样子。"""
-    assert not _has_dotted(config, dotted), f"{dotted} 又被声明进 config/runtime.yaml 了"
+    assert not _has_dotted(config, dotted), f"{dotted} 又被声明进 defaults/runtime.yaml 了"
     assert not _has_dotted(DEFAULT_RUNTIME_CONFIG, dotted), f"{dotted} 又回到 DEFAULT_RUNTIME_CONFIG 了"
 
     readers = [
@@ -389,6 +389,6 @@ def test_retired_subtree_key_matches_any_child() -> None:
 
 
 def test_shipped_runtime_yaml_declares_no_retired_keys() -> None:
-    cfg = yaml.safe_load((_ROOT / "config" / "runtime.yaml").read_text(encoding="utf-8"))
+    cfg = yaml.safe_load((_ROOT / "defaults" / "runtime.yaml").read_text(encoding="utf-8"))
 
     assert retired_runtime_keys(cfg) == []

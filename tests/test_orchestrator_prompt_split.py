@@ -17,7 +17,7 @@ if str(_TESTS) not in sys.path:
 
 from _node_prompts import assembled_prompt  # noqa: E402
 
-_NODES = _ROOT / "config" / "nodes"
+_NODES = _ROOT / "defaults" / "nodes"
 _SHARED = "_orchestrator.md"
 _QQ = "_platform_qq.md"
 _ENTRIES = ("qq.orchestrator", "qq.orchestrator.example")

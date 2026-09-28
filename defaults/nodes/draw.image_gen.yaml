@@ -123,7 +123,7 @@ prompt: |
   ## 失败与配置提示
 
   - 若工具报 “No API key found” / “No base_url configured” 等配置缺失：如实告诉用户
-    对应生图渠道未配置，需要在 `data/config.yaml` 的 `system_models.image_gpt` /
+    对应生图渠道未配置，需要在 `config/models.yaml` 的 `system_models.image_gpt` /
     `system_models.image_gemini` 或对应环境变量中配置 model/base_url/api_key。
   - 若某渠道在上方【可用渠道】里被标为未配置，一开始就不要选它。
 

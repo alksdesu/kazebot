@@ -4,10 +4,13 @@ import ast
 import asyncio
 import json
 import logging
+import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterator
+from typing import Any, Awaitable, Callable, Iterator, Literal
 
+import config_layout
 from clonoth_runtime import get_float, load_runtime_config
 
 from . import builtins as _builtins
@@ -160,7 +163,7 @@ extract_tool_spec = _extract_tool_spec
 
 
 def iter_external_tool_files(tools_dir: Path) -> Iterator[Path]:
-    """tools/ 下算作外部工具的 .py。
+    """一个工具目录下算作外部工具的 .py。
 
     stocktool、drawtools 这类工具包把入口放在子目录里，所以要递归；包初始化文件、
     下划线开头的私有模块和 .disabled.py 都不是工具入口。
@@ -173,6 +176,62 @@ def iter_external_tool_files(tools_dir: Path) -> Iterator[Path]:
         if any(part == "__pycache__" for part in py.parts):
             continue
         yield py
+
+
+ToolOrigin = Literal["custom", "override", "bundled"]
+
+
+@dataclass(frozen=True)
+class ExternalToolFile:
+    """一个实际生效的脚本工具文件。rel 是它在所属工具目录里的相对路径，同一个 rel 实例那份顶掉仓库那份。"""
+
+    path: Path
+    rel: str
+    origin: ToolOrigin
+    base: Path
+
+    @property
+    def is_bundled(self) -> bool:
+        return self.origin == "bundled"
+
+
+def external_tool_files(workspace_root: Path, bundled_dir: Path | None = None) -> list[ExternalToolFile]:
+    """本实例的脚本工具：config/tools/ 里自己加的和改过的排在前，仓库 tools/ 里没被顶掉的在后。
+
+    注册表和控制台都按这个顺序取，同名时先出现的那个算数。
+    """
+    custom = config_layout.custom_tools_dir(workspace_root)
+    bundled = bundled_dir if bundled_dir is not None else config_layout.workspace_tools_dir(workspace_root)
+    # 改造前自定义工具直接写在代码目录的 tools/ 里，搬家后旧文件还在：当成仓库工具的话，删掉自己那份它又冒出来。
+    leftovers = config_layout.legacy_tool_rels(workspace_root)
+    bundled_files = {
+        rel: path
+        for path in iter_external_tool_files(bundled)
+        if (rel := path.relative_to(bundled).as_posix()) not in leftovers
+    }
+    found: list[ExternalToolFile] = []
+    for path in iter_external_tool_files(custom):
+        rel = path.relative_to(custom).as_posix()
+        found.append(ExternalToolFile(path, rel, "override" if rel in bundled_files else "custom", custom))
+    taken = {item.rel for item in found}
+    found.extend(
+        ExternalToolFile(path, rel, "bundled", bundled)
+        for rel, path in bundled_files.items()
+        if rel not in taken
+    )
+    return found
+
+
+def custom_tool_python_path(item: ExternalToolFile, bundled_dir: Path) -> tuple[str, ...]:
+    """实例自己的工具跑起来时补的 import 路径：仓库里同一层目录、仓库 tools/ 和代码根。
+
+    改过的 drawtools 入口还得 import 仓库那份 common，新写的工具照抄 from _channel import 也得能用。
+    """
+    if item.is_bundled:
+        return ()
+    sibling = bundled_dir / Path(item.rel).parent
+    candidates = (sibling, bundled_dir, config_layout.CODE_ROOT)
+    return tuple(dict.fromkeys(str(path) for path in candidates if path.is_dir()))
 
 
 _SCRIPT_IDENTITY_ENV_KEYS = {
@@ -243,12 +302,21 @@ async def _script_guard_error(
     )
 
 
+def _with_python_path(env: dict[str, str], extra: tuple[str, ...]) -> dict[str, str]:
+    if not extra:
+        return env
+    inherited = [part for part in str(env.get("PYTHONPATH") or "").split(os.pathsep) if part]
+    env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys([*extra, *inherited]))
+    return env
+
+
 def _make_script_tool(
     *,
     script_path: Path,
     timeout_sec: float | None,
     tool_name: str = "",
     guard: dict[str, Any] | None = None,
+    python_path: tuple[str, ...] = (),
 ) -> ToolFunc:
     """Create a tool function that runs a Python script as a subprocess.
 
@@ -293,7 +361,7 @@ def _make_script_tool(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(root) if isinstance(root, Path) else None,
-                env=_script_tool_env(ctx),
+                env=_with_python_path(_script_tool_env(ctx), python_path),
                 # Fix: run in new session so os.killpg can kill the entire
                 # process tree, preventing orphaned grandchildren from holding
                 # pipe fds and causing communicate() to hang forever.
@@ -390,13 +458,14 @@ class ToolRegistry:
 
         self._tool_specs: dict[str, dict[str, Any]] = {}
         self._tool_funcs: dict[str, ToolFunc] = {}
+        self._mcp_specs: dict[str, dict[str, Any]] = {}
+        self._mcp_funcs: dict[str, ToolFunc] = {}
 
         self._load_builtin_meta_tools()
         self._builtin_specs = dict(self._tool_specs)
         self._builtin_funcs = dict(self._tool_funcs)
 
-        # 只想读内置工具元数据的调用方（管理接口）跳过这一步：reload 会 mkdir、
-        # touch tools/__init__.py，一个 GET 不该留下这些痕迹。
+        # 只想读内置工具元数据的调用方（管理接口）跳过这一步，省得每个 GET 都去扫两个工具目录。
         if load_external:
             self.reload()
 
@@ -593,7 +662,7 @@ class ToolRegistry:
             ),
             (
                 "create_or_update_mcp_client",
-                "Create or update an MCP client config in data/mcp_clients.yaml. Supports stdio, sse, and streamable_http transports.",
+                "Create or update an MCP client config in config/mcp.yaml. Supports stdio, sse, and streamable_http transports.",
                 {
                     "type": "object",
                     "properties": {
@@ -631,7 +700,7 @@ class ToolRegistry:
             ),
             (
                 "create_or_update_tool",
-                "Create/update an external tool under tools/. "
+                "Create/update an external tool under config/tools/. "
                 "Provide 'script' (Python code body). "
                 "The tool runs as a subprocess: JSON in via stdin, JSON out via stdout.",
                 {
@@ -649,7 +718,7 @@ class ToolRegistry:
             ),
             (
                 "reload_tools",
-                "Reload tools/ directory and MCP tools.",
+                "Reload script tools (config/tools/ and the bundled tools/) and MCP tools.",
                 {"type": "object", "properties": {}, "required": []},
                 _builtins.reload_tools,
             ),
@@ -745,19 +814,19 @@ class ToolRegistry:
             module.register_tools(self)
 
     def reload(self) -> int:
-        """Reload external tools under tools/.
+        """Reload script tools from config/tools/ and the bundled tools directory.
 
         Returns total number of tools available.
         """
 
         self._tool_specs = dict(self._builtin_specs)
         self._tool_funcs = dict(self._builtin_funcs)
-
-        self.tools_dir.mkdir(parents=True, exist_ok=True)
-        (self.tools_dir / "__init__.py").touch(exist_ok=True)
         # 工具在子进程里以脚本跑，本进程不 import 它们；把工作区插进 sys.path 反倒让它的 tools 盖住代码目录那份。
+        # 代码目录对多开实例只读，这里只扫不建。
 
-        for py in iter_external_tool_files(self.tools_dir):
+        external_names: set[str] = set()
+        for item in external_tool_files(self.workspace_root, self.tools_dir):
+            py = item.path
             spec, timeout_sec = _extract_tool_spec(py)
             if spec is None:
                 continue
@@ -771,6 +840,10 @@ class ToolRegistry:
             if reserved:
                 log.warning("skipping external tool %s: name %r is %s", py.name, name, reserved)
                 continue
+            if name in external_names:
+                log.warning("skipping external tool %s: name %r is already taken by another script", item.rel, name)
+                continue
+            external_names.add(name)
 
             description = str(spec.get("description", ""))
             input_schema = spec.get("input_schema")
@@ -798,7 +871,14 @@ class ToolRegistry:
                 timeout_sec=timeout_sec,
                 tool_name=name,
                 guard=guard if isinstance(guard, dict) else None,
+                python_path=custom_tool_python_path(item, self.tools_dir),
             )
+
+        # MCP 工具由 load_mcp_tools 单独登记；只重扫脚本时得原样留着，不然热重载一次就全没了。
+        for mcp_name, mcp_spec in self._mcp_specs.items():
+            if mcp_name not in self._tool_specs:
+                self._tool_specs[mcp_name] = mcp_spec
+                self._tool_funcs[mcp_name] = self._mcp_funcs[mcp_name]
 
         return len(self._tool_specs)
 
@@ -847,7 +927,15 @@ class ToolRegistry:
         return _ensure_tool_response_shape(result)
 
     async def load_mcp_tools(self) -> int:
-        """Scan enabled MCP clients and register their tools as first-class tools."""
+        """Scan enabled MCP clients and register their tools as first-class tools.
+
+        整批重登：删掉或停用的客户端，它的工具这一轮就摘掉。
+        """
+        for mcp_name, mcp_spec in self._mcp_specs.items():
+            if self._tool_specs.get(mcp_name) is mcp_spec:
+                self._tool_specs.pop(mcp_name, None)
+                self._tool_funcs.pop(mcp_name, None)
+        self._mcp_specs, self._mcp_funcs = {}, {}
         count = 0
         try:
             clients = mcp_runtime.list_clients(self.workspace_root)
@@ -891,12 +979,16 @@ class ToolRegistry:
                 if not isinstance(schema, dict):
                     schema = {"type": "object", "properties": {}, "required": []}
 
-                self._tool_specs[reg_name] = {
+                mcp_spec = {
                     "name": reg_name,
                     "description": f"[MCP:{cid}] {desc}" if desc else f"[MCP:{cid}] {raw_name}",
                     "input_schema": schema,
                 }
-                self._tool_funcs[reg_name] = _make_mcp_tool(self.workspace_root, cid, raw_name)
+                mcp_func = _make_mcp_tool(self.workspace_root, cid, raw_name)
+                self._mcp_specs[reg_name] = mcp_spec
+                self._mcp_funcs[reg_name] = mcp_func
+                self._tool_specs[reg_name] = mcp_spec
+                self._tool_funcs[reg_name] = mcp_func
                 count += 1
 
         return count

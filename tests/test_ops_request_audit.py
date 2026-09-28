@@ -41,7 +41,7 @@ def app_and_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     app = create_app(
         state=state,
         process_manager=None,
-        config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"),
+        config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path),
     )
     return app, log_path
 

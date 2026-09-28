@@ -34,8 +34,8 @@ CONFIG = "\n".join([
 
 
 def _workspace(tmp_path: Path, config: str) -> Path:
-    (tmp_path / "data").mkdir(exist_ok=True)
-    (tmp_path / "data" / "config.yaml").write_text(config, encoding="utf-8")
+    (tmp_path / "config").mkdir(exist_ok=True)
+    (tmp_path / "config" / "models.yaml").write_text(config, encoding="utf-8")
     return tmp_path
 
 

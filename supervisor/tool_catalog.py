@@ -7,7 +7,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+import config_layout
+
+if TYPE_CHECKING:
+    from toolbox.registry import ToolOrigin
 
 ToolSource = Literal["builtin", "plugin", "external"]
 
@@ -21,10 +26,14 @@ class ToolEntry:
     file: str | None = None
     timeout_sec: float | None = None
     has_spec: bool = True
+    # 外部脚本才有：实例自己加的、改过仓库那份的、仓库原样的。
+    origin: ToolOrigin | None = None
+    # 外部脚本在所属工具目录里的相对路径，改仓库那份时按它落到 config/tools/ 的同一位置。
+    rel: str | None = None
 
     @property
     def editable(self) -> bool:
-        """只有外部脚本工具落在 tools/ 下有源码，内置和插件工具改不了。"""
+        """只有外部脚本工具有源码，内置和插件工具改不了。仓库那份改了落成 config/tools/ 里的同路径文件。"""
         return self.source == "external"
 
     def to_dict(self) -> dict[str, Any]:
@@ -40,6 +49,8 @@ class ToolEntry:
             out["file"] = self.file
         if self.timeout_sec is not None:
             out["timeout_sec"] = self.timeout_sec
+        if self.origin is not None:
+            out["origin"] = self.origin
         return out
 
 
@@ -49,7 +60,7 @@ def builtin_entries(workspace_root: Path) -> list[ToolEntry]:
 
     registry = ToolRegistry(
         workspace_root=workspace_root,
-        tools_dir=workspace_root / "tools",
+        tools_dir=config_layout.workspace_tools_dir(workspace_root),
         load_external=False,
     )
     return [_from_spec(spec, "builtin") for spec in registry.builtin_specs()]
@@ -63,32 +74,30 @@ def plugin_entries() -> list[ToolEntry]:
 
 
 def external_entries(workspace_root: Path) -> list[ToolEntry]:
-    """tools/ 下的脚本工具。"""
-    from toolbox.registry import extract_tool_spec, iter_external_tool_files
-
-    tools_dir = workspace_root / "tools"
-    if not tools_dir.is_dir():
-        return []
+    """config/tools/ 和仓库 tools/ 下的脚本工具，同一相对路径只列生效的那份。"""
+    from toolbox.registry import external_tool_files, extract_tool_spec
 
     out: list[ToolEntry] = []
-    for path in iter_external_tool_files(tools_dir):
-        rel = path.relative_to(workspace_root).as_posix()
-        spec, timeout_sec = extract_tool_spec(path)
+    for item in external_tool_files(workspace_root):
+        rel = config_layout.logical_path(workspace_root, item.path)
+        spec, timeout_sec = extract_tool_spec(item.path)
         name = ""
         if isinstance(spec, dict):
             name = str(spec.get("name") or "").strip()
         if not name:
             # SPEC 写坏了也要列出来，否则唯一能修它的入口——源码编辑器——打不开。
-            if path.parent != tools_dir:
+            if "/" in item.rel:
                 continue
-            out.append(ToolEntry(name=path.stem, source="external", file=rel, has_spec=False))
+            out.append(ToolEntry(
+                name=item.path.stem, source="external", file=rel, has_spec=False, origin=item.origin, rel=item.rel,
+            ))
             continue
-        out.append(_from_spec(spec, "external", file=rel, timeout_sec=timeout_sec))
+        out.append(_from_spec(spec, "external", file=rel, timeout_sec=timeout_sec, origin=item.origin, rel=item.rel))
     return out
 
 
 def tool_catalog(workspace_root: Path) -> list[ToolEntry]:
-    """三类合一，按名字排序。重名时外部工具让位，和注册表 reload 的取舍一致。"""
+    """三类合一，按名字排序。重名时外部工具让位，外部工具之间先出现的算数，和注册表 reload 的取舍一致。"""
     entries: dict[str, ToolEntry] = {}
     for entry in builtin_entries(workspace_root) + plugin_entries():
         entries[entry.name] = entry
@@ -107,6 +116,8 @@ def _from_spec(
     *,
     file: str | None = None,
     timeout_sec: float | None = None,
+    origin: ToolOrigin | None = None,
+    rel: str | None = None,
 ) -> ToolEntry:
     schema = spec.get("input_schema")
     return ToolEntry(
@@ -116,4 +127,6 @@ def _from_spec(
         input_schema=schema if isinstance(schema, dict) else {},
         file=file,
         timeout_sec=timeout_sec,
+        origin=origin,
+        rel=rel,
     )

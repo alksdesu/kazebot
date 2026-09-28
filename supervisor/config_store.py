@@ -13,8 +13,8 @@ from clonoth_runtime import (
     is_channel_block,
     resolve_env_ref,
 )
+import config_layout
 from engine.node import canonical_node_id, known_node_ids
-from toolbox.text_files import rewrite_text
 
 from .types import (
     ActiveProviderSecret,
@@ -27,7 +27,7 @@ from .types import (
 
 
 def _resolve_env_value(value: str) -> str:
-    # 与节点 yaml 共用一套解析：$ENV{NEW|OLD} 的回退写法在 config.yaml 里也得认，
+    # 与节点 yaml 共用一套解析：$ENV{NEW|OLD} 的回退写法在 models.yaml 里也得认，
     # 否则照抄节点的写法会静默解析成空模型名。
     return resolve_env_ref((value or "").strip())
 
@@ -58,14 +58,16 @@ def _redact_api_key(api_key: str) -> tuple[bool, str]:
 class ConfigStore:
     """YAML-backed config store.
 
-    - Canonical file: data/config.yaml
+    - Canonical file: config/models.yaml
     - Contains provider selection + OpenAI settings.
 
-    注意：api_key 属于敏感信息，本仓库会将 data/config.yaml 加入 .gitignore。
+    注意：api_key 属于敏感信息，config/ 整个不进版本库，新建时只给属主读写。
     """
 
-    def __init__(self, *, path: Path):
+    def __init__(self, *, path: Path, workspace_root: Path | None = None):
         self.path = path
+        # 共享组里 config/ 是软链，从 path 往上数两级数到的是组目录，得由调用方给准。
+        self._root = Path(workspace_root) if workspace_root is not None else path.parent.parent
         self._lock = threading.RLock()
         self._config: AppConfigSecret = AppConfigSecret()
         self._extra_keys: dict[str, Any] = {}  # preserve unknown top-level keys
@@ -88,9 +90,14 @@ class ConfigStore:
             return None
         return data
 
+    def _write(self, text: str) -> None:
+        config_layout.write_config_text(
+            self.path, text, mode=config_layout.private_mode_for(self._root, self.path),
+        )
+
     def _save_yaml(self, cfg: AppConfigSecret) -> None:
         # [2026-05-24] Preserve unknown top-level keys (e.g. fallbacks) that
-        # plugins may have added to config.yaml but are not part of the
+        # plugins may have added to models.yaml but are not part of the
         # AppConfigSecret Pydantic model. Without this, reload() would strip
         # any key not declared in the model.
         data = cfg.model_dump(mode="json")
@@ -101,7 +108,7 @@ class ConfigStore:
             sort_keys=False,
             allow_unicode=True,
         )
-        rewrite_text(self.path, text)
+        self._write(text)
 
     def reload(self) -> AppConfigSecret:
         with self._lock:
@@ -230,7 +237,7 @@ class ConfigStore:
     def _save_raw(self, data: dict[str, Any]) -> None:
         """Write raw dict to YAML file."""
         text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
-        rewrite_text(self.path, text)
+        self._write(text)
 
     def _type_of(self, name: str, data: dict[str, Any] | None = None) -> str:
         """这个渠道说哪种线格式。
@@ -246,7 +253,7 @@ class ConfigStore:
         return (name or "").strip().lower() or "openai"
 
     def _public_block(self, val: dict[str, Any], name: str = "") -> dict[str, Any]:
-        # raw 一并给出去：编辑器回填展开值再保存，就把 ${VAR} 这层间接烧死在 config.yaml 里了。
+        # raw 一并给出去：编辑器回填展开值再保存，就把 ${VAR} 这层间接烧死在 models.yaml 里了。
         # api_key 没有 raw —— 那等于用明文换掉旁边的脱敏串。
         present, redacted = _redact_api_key(_resolve_env_value(val.get("api_key", "")))
         declared = str(val.get("type") or "").strip().lower()
@@ -305,9 +312,9 @@ class ConfigStore:
 
     @staticmethod
     def _check_channel_name(name: str) -> None:
-        # 渠道块和这几段配置同在 data/config.yaml 顶层，重名就会把那一段当成渠道块改写或整段删掉。
+        # 渠道块和这几段配置同在 config/models.yaml 顶层，重名就会把那一段当成渠道块改写或整段删掉。
         if name in CONFIG_META_KEYS:
-            raise ValueError(f"'{name}' 是 data/config.yaml 里的保留段名，不能当渠道名")
+            raise ValueError(f"'{name}' 是 config/models.yaml 里的保留段名，不能当渠道名")
 
     def get_providers_public(self) -> dict[str, Any]:
         """Return all providers with redacted api_keys, plus active_provider and fallbacks."""
@@ -479,8 +486,7 @@ class ConfigStore:
 
     @property
     def _workspace_root(self) -> Path:
-        """config.yaml 固定在 <workspace>/data/ 下。"""
-        return self.path.parent.parent
+        return self._root
 
     def _image_tools_public(self) -> list[dict[str, Any]]:
         """生图工具的真实可用性。含主渠道回退，跟工具子进程同源。"""

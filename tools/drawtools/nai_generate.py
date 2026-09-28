@@ -9,12 +9,12 @@ Input supports either:
 - prompt / negative_prompt / width / height (low-level direct generation)
 - character_prompts for NovelAI V4+ per-character captions
 
-Configuration is loaded from tools/drawtools/settings.yaml.
+Configuration is loaded from config/drawtools/settings.yaml (falls back to settings.example.yaml).
 """
 
 SPEC = {
     "name": "nai_generate",
-    "description": "使用 NovelAI 生成 anime 图片。读取 tools/drawtools/settings.yaml 中的 API 和默认参数，支持 V4/V4.5 角色级 prompt，返回图片附件路径。",
+    "description": "使用 NovelAI 生成 anime 图片。读取 config/drawtools/settings.yaml 中的 API 和默认参数，支持 V4/V4.5 角色级 prompt，返回图片附件路径。",
     "async_mode": True,
     "input_schema": {
         "type": "object",
@@ -150,7 +150,7 @@ if __name__ == "__main__":
 
     api_key = resolve_api_key(settings)
     if not api_key:
-        fail("NovelAI API key is missing. Set NOVELAI_API_KEY or tools/drawtools/settings.yaml api.api_key")
+        fail("NovelAI API key is missing. Set NOVELAI_API_KEY or config/drawtools/settings.yaml api.api_key")
     base_url = resolve_base_url(settings)
     api_url = f"{base_url}/ai/generate-image"
 

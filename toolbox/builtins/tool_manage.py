@@ -5,6 +5,8 @@ import pprint
 import re
 from typing import Any
 
+import config_layout
+
 from ..context import ToolContext
 from ..tool_names import TOOL_NAME_RE
 
@@ -76,7 +78,7 @@ def _render_tool_py(*, spec: dict[str, Any], script_body: str, timeout_sec: floa
 # ---------------------------------------------------------------------------
 
 async def create_or_update_tool(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """Create or update an external tool under tools/."""
+    """Create or update an external tool under config/tools/."""
     name = str(args.get("name", "")).strip()
     description = str(args.get("description", "")).strip()
     input_schema = args.get("input_schema")
@@ -103,7 +105,8 @@ async def create_or_update_tool(args: dict[str, Any], ctx: ToolContext) -> dict[
     )
 
     from .write_file import write_file
-    path = f"tools/{name}.py"
+    # 和仓库 tools/ 里同名同路径的脚本会顶掉仓库那份，控制台的工具页把它标成改过的版本。
+    path = f"{config_layout.TOOLS_DIR}/{name}.py"
     res = await write_file({"path": path, "content": code}, ctx)
     if not res.get("ok"):
         return res
@@ -117,7 +120,7 @@ async def create_or_update_tool(args: dict[str, Any], ctx: ToolContext) -> dict[
 
 
 async def reload_tools(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """Reload tools/ directory and MCP tools.
+    """Reload script tools (config/tools/ and the bundled tools/) and MCP tools.
 
     [AutoC 2026-05-31] Why: MCP tools were only loaded at engine startup,
     requiring a full restart after adding/modifying MCP clients.

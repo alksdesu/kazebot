@@ -16,11 +16,19 @@ if str(_ROOT) not in sys.path:
 
 import yaml  # noqa: E402
 
+import config_layout  # noqa: E402
 from providers import registry  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _own_nodes_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """仓库自带的 defaults/nodes 里就有视觉入口，漏进来会让「没写节点定义」这一档测不到。"""
+    monkeypatch.setattr(config_layout, "CODE_ROOT", tmp_path)
+
 
 def _store(tmp_path: Path, active: str = "openai", vision: object = None) -> ConfigStore:
     data: dict = {

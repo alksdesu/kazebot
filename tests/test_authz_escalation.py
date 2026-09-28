@@ -91,7 +91,7 @@ class TestDispatchCannotShedQQLimits:
         out = state.request_operation(
             session_id=child_sid,
             op="read_file",
-            parameters={"path": "data/config.yaml", "platform_auth": {"platform": "qq", "is_admin": False}},
+            parameters={"path": "config/models.yaml", "platform_auth": {"platform": "qq", "is_admin": False}},
             task_id=task.task_id,
         )
 
@@ -148,7 +148,10 @@ class TestConfigWritesNeedApproval:
         "clonoth_sdk/client.py",
         "plugins/anything.py",
         "deploy/systemd/clonoth.service",
-        "skills/persona/SKILL.md",
+        "config/skills/persona/SKILL.md",
+        "config/models.yaml",
+        "config/tools/scraper.py",
+        "defaults/nodes/qq.orchestrator.yaml",
     ])
     def test_execution_affecting_paths_are_not_auto(self, tmp_path: Path, path: str) -> None:
         """这些路径写入后都会被执行或进提示词，落在 default:auto 上等于免审批改行为。"""

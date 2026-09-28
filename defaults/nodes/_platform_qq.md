@@ -13,7 +13,7 @@
 - 用户要求“把刚才/刚生成的那张图发给 xx / 发到群 xxx”时（指本会话之前由生图插件生成并发出的图片）：先用 op=recent 查看最近生成/发送的图片列表，再用 op=send（或 op=file）+ use_recent=true（多选时用 recent_refs 挑选 ref，如 a7）+ target_type 发送；不确定是哪张时先用 op=recent 确认。
 - 需要连图片/文件一起发时保持 include_images/include_files 为 true（默认）；只发文本时可关闭。
 - 真实 QQ 号由平台内部解析，你只需给出显示名或匿名 ref 标识，不要编造真实号码。
-- 权限边界（平台侧强制，不要尝试绕过或换写法重试）：发送到**其他**用户或群、以及 op=file 带 file_paths，都只有 Clonoth 管理员可用；普通用户只能发给自己（self）或本群（current），以及用 use_recent 发本会话刚生成的图。密钥/凭据类文件（.env、data/config.yaml、data/.admin_token 等）对任何人都不可发送。
+- 权限边界（平台侧强制，不要尝试绕过或换写法重试）：发送到**其他**用户或群、以及 op=file 带 file_paths，都只有 Clonoth 管理员可用；普通用户只能发给自己（self）或本群（current），以及用 use_recent 发本会话刚生成的图。密钥/凭据类文件（.env、config/secrets.env、config/models.yaml、data/.admin_token 等）对任何人都不可发送。
 - 被权限拒绝时直接如实告知用户"这项操作仅限管理员"，并给出可行替代（改成发给自己或本群）；不要重试、不要改参数试探、不要暗示自己能绕过。
 - 工具返回失败时如实向用户说明失败原因（例如目标找不到、当前不是群聊、没有可挑选的消息），并给出下一步建议。
 

@@ -13,6 +13,8 @@ import re
 from pathlib import Path
 from typing import Any, Mapping
 
+import config_layout
+
 logger = logging.getLogger(__name__)
 
 _TARGET_NODE_ID = "draw.image_gen"
@@ -44,13 +46,13 @@ def _read_default_channel(root: Path) -> str:
         import yaml  # type: ignore
     except Exception:
         return ""
-    path = root / "data" / "config.yaml"
+    path = config_layout.models_path(root)
     if not path.exists():
         return ""
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception as exc:  # noqa: BLE001
-        logger.warning("image_gen_inject: 读取 config.yaml 失败: %s", exc)
+        logger.warning("image_gen_inject: 读取 models.yaml 失败: %s", exc)
         return ""
     block = data.get("image_gen") if isinstance(data, dict) else None
     if not isinstance(block, dict):

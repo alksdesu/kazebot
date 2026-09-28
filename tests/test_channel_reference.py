@@ -51,8 +51,8 @@ deepseek:
 
 @pytest.fixture
 def root(tmp_path: Path) -> Path:
-    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "data" / "config.yaml").write_text(CONFIG, encoding="utf-8")
+    (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "config" / "models.yaml").write_text(CONFIG, encoding="utf-8")
     return tmp_path
 
 
@@ -94,8 +94,8 @@ class TestResolveChannel:
 
     def test_env_refs_are_expanded(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setenv("RELAY_KEY", "sk-from-env")
-        (tmp_path / "data").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "data" / "config.yaml").write_text(
+        (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "config" / "models.yaml").write_text(
             "relay:\n  type: openai\n  api_key: $ENV{RELAY_KEY}\n", encoding="utf-8",
         )
         assert resolve_channel(tmp_path, "relay").api_key == "sk-from-env"

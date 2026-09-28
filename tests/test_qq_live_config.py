@@ -860,7 +860,7 @@ class TestExampleFileStaysInSync:
 
     def _example(self, live: Any) -> dict[str, Any]:
         """校验和生效解析必须是同一个 loader，否则文档按一套语义、bot 按另一套。"""
-        text = (_ROOT / "config" / "qq.example.yaml").read_text(encoding="utf-8")
+        text = (_ROOT / "defaults" / "qq.example.yaml").read_text(encoding="utf-8")
         loaded = live_engine.load_yaml(text)
         assert isinstance(loaded, dict)
         return loaded
@@ -901,7 +901,7 @@ class TestExampleFileStaysInSync:
 
         path = module.config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text((_ROOT / "config" / "qq.example.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+        path.write_text((_ROOT / "defaults" / "qq.example.yaml").read_text(encoding="utf-8"), encoding="utf-8")
         module.invalidate()
 
         assert {k.name: getattr(module.live, k.name) for k in module.LIVE_KEYS} == defaults

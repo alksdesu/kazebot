@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
+import config_layout
+
 from .descriptor import PlatformDescriptor
 from .registry import (
     alias_numbering_relpath,
@@ -18,16 +20,28 @@ from .registry import (
     workspace_path,
 )
 
-# 和平台无关的凭据位置：dotenv、模型渠道密钥、管理令牌、policy 本身、私钥与证书。
+# 共享组的密钥文件：config/ 整份共享时跟着走的那几个 API key。
+SHARED_SECRETS_FILE = f"{config_layout.CONFIG_DIR}/secrets.env"
+
+# 和平台无关的凭据位置：dotenv、模型渠道和 MCP 的密钥、平台令牌、管理令牌、policy 本身、私钥与证书。
+# 挪进 config/ 之前的旧位置也在：搬家只复制不删，旧文件里还是同一把密钥。
 CORE_OUTBOUND_DENY: tuple[str, ...] = (
     ".env",
     ".env.*",
     "*/.env",
     "*/.env.*",
-    "data/config.yaml",
+    SHARED_SECRETS_FILE,
+    config_layout.MODELS_FILE,
+    config_layout.POLICY_FILE,
+    config_layout.MCP_FILE,
+    f"{config_layout.DRAWTOOLS_DIR}/settings.yaml",
+    config_layout.PLATFORM_SECRETS_FILE,
+    config_layout.LEGACY_MODELS_FILE,
+    config_layout.LEGACY_POLICY_FILE,
+    config_layout.LEGACY_MCP_FILE,
+    f"{config_layout.LEGACY_DRAWTOOLS_DIR}/settings.yaml",
     "data/.admin_token",
-    "data/policy.yaml",
-    # 配置端点覆盖写入前会留 .bak，副本的敏感度等于原文件（data/config.yaml.bak 里就是明文 api_key），
+    # 配置端点覆盖写入前会留 .bak，副本的敏感度等于原文件（config/models.yaml.bak 里就是明文 api_key），
     # 按原文件名匹配的规则一条都盖不住多出来的后缀。
     "*.bak",
     "id_rsa*",
@@ -41,15 +55,23 @@ CORE_OUTBOUND_DENY: tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class FloorRule:
-    """policy 兜底规则：排在 data/policy.yaml 的规则前面，改那份文件放不开。"""
+    """policy 兜底规则：排在 config/policy.yaml 的规则前面，改那份文件放不开。"""
 
     pattern: str
     reason: str
 
 
+# 改造后才有的两份密钥文件，老部署的 policy.yaml 里没有它们的规则，也没有旧名字可认。
+CORE_READ_FLOOR: tuple[FloorRule, ...] = (
+    FloorRule(SHARED_SECRETS_FILE, "shared api keys travel with the config group"),
+    FloorRule(config_layout.PLATFORM_SECRETS_FILE, "platform tokens are the instance identity"),
+)
+
 # 不属于哪个平台、由核心代码维护的文件。编号被改小，新发的别名就会撞上旧记忆里的人。
+# 两份密钥文件只经 manage_secret 和控制台逐键改。
 CORE_WRITE_FLOOR: tuple[FloorRule, ...] = (
     FloorRule(f"{alias_numbering_relpath()}*", "alias numbering shared by every platform"),
+    *CORE_READ_FLOOR,
 )
 
 
@@ -183,7 +205,7 @@ def policy_floor(
     写挡平台自有的全部文件：它们由平台进程维护，agent 改一笔就能让会话键分叉、路由指错人。
     配置文件不在其中，审批下改 qq.yaml 这类照常可以。
     """
-    read: list[FloorRule] = []
+    read: list[FloorRule] = list(CORE_READ_FLOOR)
     write: list[FloorRule] = list(CORE_WRITE_FLOOR)
     for platform in _platforms(platforms):
         for pattern in secret_file_patterns(platform, environ=environ, workspace=workspace):

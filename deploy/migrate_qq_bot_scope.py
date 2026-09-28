@@ -100,7 +100,7 @@ def _account_name(platform: PlatformDescriptor) -> str:
 
 
 def read_secret(workspace: Path, platform: PlatformDescriptor = QQ_NAPCAT) -> str:
-    """bot 正在用的摘要密钥：data/config.yaml 或环境变量里配的优先，否则钉住的文件。无盐部署返回空串。"""
+    """bot 正在用的摘要密钥：data/platform_secrets.yaml 或环境变量里配的优先，否则钉住的文件。无盐部署返回空串。"""
     return _conversation_hash.current_secret(platform, Path(workspace)).value
 
 

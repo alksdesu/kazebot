@@ -153,7 +153,8 @@ function getSectionContent(bundle: DrawtoolsBundle | null, key: SectionKey): str
 
 function fileMeta(bundle: DrawtoolsBundle | null, key: SectionKey): string {
   if (!bundle) return '';
-  if (key === 'node') return `config/nodes/${PLANNER_NODE}.yaml`;
+  // 没改过时读的是仓库默认，保存才会在 config/nodes 下落一份本实例的。
+  if (key === 'node') return `节点 ${PLANNER_NODE}：保存到 config/nodes/${PLANNER_NODE}.yaml，没改过时用仓库默认`;
   const item = key === 'settings'
     ? bundle.settings
     : key === 'characters'

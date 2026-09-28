@@ -11,12 +11,13 @@ from typing import NamedTuple
 
 # 这几家收 OpenAI 格式的 /chat/completions；anthropic 与 gemini 原生走自己的端点和请求体。
 OPENAI_COMPATIBLE = frozenset({"openai", "deepseek"})
-# data/config.yaml 里平台密钥那一段，和 clonoth_runtime.PLATFORMS_CONFIG_KEY 同值。
-_PLATFORMS_KEY = "platforms"
+# 和 config_layout 的 MODELS_FILE、PLATFORM_SECRETS_FILE 同值：这里只吃标准库，导不了它。
+_MODELS_FILE = ("config", "models.yaml")
+_PLATFORM_SECRETS_FILE = ("data", "platform_secrets.yaml")
 
 
 class MainChannel(NamedTuple):
-    """data/config.yaml 里当前活跃的那个渠道块。字段可能为空。"""
+    """config/models.yaml 里当前活跃的那个渠道块。字段可能为空。"""
 
     provider: str = ""
     base_url: str = ""
@@ -38,12 +39,11 @@ def _read_dotenv(root: Path) -> dict[str, str]:
     return pairs
 
 
-def _read_config(root: Path) -> dict:
+def _read_yaml(path: Path) -> dict:
     try:
         import yaml  # type: ignore
     except Exception:
         return {}
-    path = root / "data" / "config.yaml"
     if not path.exists():
         return {}
     try:
@@ -58,14 +58,15 @@ def _is_provider_block(value: object) -> bool:
 
 
 class _ConfigView:
-    """工作区的 .env 与 data/config.yaml。"""
+    """工作区的 .env、模型渠道配置 config/models.yaml 和平台密钥 data/platform_secrets.yaml。"""
 
     def __init__(self, *, root: Path | None = None) -> None:
         # root 默认 cwd：工具是以工作区为 cwd 拉起的子进程。主进程里的调用方
         # （提示词注入）cwd 不一定在工作区，得把 root 显式传进来。
         base = Path(root) if root is not None else Path.cwd()
         self._dotenv = _read_dotenv(base)
-        self._config = _read_config(base)
+        self._config = _read_yaml(base.joinpath(*_MODELS_FILE))
+        self._platform_secrets = _read_yaml(base.joinpath(*_PLATFORM_SECRETS_FILE))
 
     def env(self, key: str) -> str:
         return (os.environ.get(key, "") or self._dotenv.get(key, "")).strip()
@@ -86,9 +87,8 @@ class _ConfigView:
         return text
 
     def platform_secret(self, platform_id: str, name: str, env: str = "") -> str:
-        """和主进程同一个顺序：data/config.yaml 的 platforms.<id>.<name> > 环境变量 > .env 文件。"""
-        section = self._config.get(_PLATFORMS_KEY) if isinstance(self._config, dict) else None
-        block = section.get(platform_id) if isinstance(section, dict) else None
+        """和主进程同一个顺序：data/platform_secrets.yaml 的 <id>.<name> > 环境变量 > .env 文件。"""
+        block = self._platform_secrets.get(platform_id)
         raw = block.get(name) if isinstance(block, dict) else None
         # YAML 会把纯数字的令牌读成 int；布尔、列表、映射当成没配，和主进程判得一样。
         if isinstance(raw, (str, int)) and not isinstance(raw, bool):
@@ -101,7 +101,7 @@ class _ConfigView:
 def platform_secret(platform_id: str, name: str, env: str = "", *, root: Path | None = None) -> str:
     """平台显式配的一项密钥，都没配返回空串，由调用方去读平台自动生成的密钥文件。
 
-    子进程的环境里剥掉了平台密钥，env 那一档通常是空的，实际落到 data/config.yaml 或 .env 文件。
+    子进程的环境里剥掉了平台密钥，env 那一档通常是空的，实际落到 data/platform_secrets.yaml 或 .env 文件。
     """
     return _ConfigView(root=root).platform_secret(platform_id, name, env)
 
@@ -117,7 +117,7 @@ class Channel(_ConfigView):
         self._block = block if isinstance(block, dict) else {}
 
     def own(self, field: str, env_suffix: str) -> str:
-        """只看这一槽自己配了什么：config.yaml 的槽位块 > 槽位专属环境变量。"""
+        """只看这一槽自己配了什么：models.yaml 的槽位块 > 槽位专属环境变量。"""
         value = self._deref(self._block.get(field))
         if value:
             return value
@@ -298,7 +298,7 @@ def resolve_vision_channel(*, root: Path | None = None) -> VisionChannel:
         )
     if not api_key:
         # 与同目录其它工具同一句：排障时按这句话搜得到所有缺 key 的场景。
-        return VisionChannel(error="No API key found in config.yaml / env / .env file")
+        return VisionChannel(error="No API key found in config/models.yaml / env / .env file")
 
     wire = wire_mod.wire_for(provider)
     if not base_url:
@@ -312,7 +312,7 @@ def resolve_vision_channel(*, root: Path | None = None) -> VisionChannel:
     if not model:
         return VisionChannel(error=(
             f"看图渠道选了 {provider}，但没有能替它猜的模型名。"
-            "请在控制台的表情包页或 data/config.yaml 的 system_models.image 里填上 model。"
+            "请在控制台的表情包页或 config/models.yaml 的 system_models.image 里填上 model。"
         ))
     return VisionChannel(
         base_url=base_url, api_key=api_key, model=model, provider=provider, wire=wire,

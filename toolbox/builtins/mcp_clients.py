@@ -3,11 +3,13 @@ from __future__ import annotations
 
 from typing import Any
 
+import config_layout
+
 from ..context import ToolContext
 from .._common import request_guard
 from .. import mcp_runtime
 
-_CONFIG_PATH = "data/mcp_clients.yaml"
+_CONFIG_PATH = config_layout.MCP_FILE
 
 
 def _ok(result_text: str, **fields: Any) -> dict[str, Any]:

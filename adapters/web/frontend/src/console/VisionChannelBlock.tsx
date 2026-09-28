@@ -1,4 +1,4 @@
-// 看图渠道的回显。它写的是 data/config.yaml 的 system_models.image，
+// 看图渠道的回显。它写的是 config/models.yaml 的 system_models.image，
 // 入口只留在渠道页的系统槽位一处，这里不再放第二套表单。
 import { useEffect, useState } from 'react';
 

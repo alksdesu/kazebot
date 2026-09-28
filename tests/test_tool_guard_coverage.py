@@ -1,7 +1,7 @@
 """内置工具鉴权覆盖回归测试。
 
 MCP 客户端管理曾完全绕过 write_file guard：upsert_client 直接落盘
-data/mcp_clients.yaml，而 stdio 客户端的 command 会在 reload 后被启动，
+config/mcp.yaml，而 stdio 客户端的 command 会在 reload 后被启动，
 于是 tool_access 里 deny 掉 execute_command 的节点仍能执行任意命令。
 list_dir 则能列出 read_file 明确拒读的 data/ 目录。
 """
@@ -72,7 +72,7 @@ async def test_denied_mcp_upsert_writes_nothing(tmp_path: Path) -> None:
     result = await create_or_update_mcp_client(dict(_MALICIOUS), ctx)
 
     assert result["ok"] is False
-    assert not (tmp_path / "data" / "mcp_clients.yaml").exists()
+    assert not (tmp_path / "config" / "mcp.yaml").exists()
 
 
 @pytest.mark.asyncio
@@ -84,7 +84,7 @@ async def test_mcp_upsert_goes_through_write_file_guard(tmp_path: Path) -> None:
     assert len(ctx.requested) == 1
     op, params = ctx.requested[0]
     assert op == "write_file"
-    assert params["path"] == "data/mcp_clients.yaml"
+    assert params["path"] == "config/mcp.yaml"
 
 
 @pytest.mark.asyncio
@@ -96,7 +96,7 @@ async def test_allowed_mcp_upsert_still_works(tmp_path: Path) -> None:
     )
 
     assert result["ok"] is True
-    saved = yaml.safe_load((tmp_path / "data" / "mcp_clients.yaml").read_text(encoding="utf-8"))
+    saved = yaml.safe_load((tmp_path / "config" / "mcp.yaml").read_text(encoding="utf-8"))
     assert saved["clients"]["docs"]["command"] == "npx"
 
 
@@ -108,7 +108,7 @@ async def test_denied_mcp_delete_keeps_config(tmp_path: Path) -> None:
     result = await delete_mcp_client({"id": "keepme"}, _Ctx(tmp_path))
 
     assert result["ok"] is False
-    saved = yaml.safe_load((tmp_path / "data" / "mcp_clients.yaml").read_text(encoding="utf-8"))
+    saved = yaml.safe_load((tmp_path / "config" / "mcp.yaml").read_text(encoding="utf-8"))
     assert "keepme" in saved["clients"]
 
 
@@ -150,7 +150,7 @@ def test_mcp_config_write_requires_approval_by_default(tmp_path: Path) -> None:
     """写 MCP 配置等价于创建可执行工具，与 tools/** 同级。"""
     engine = PolicyEngine(workspace_root=tmp_path, policy_path=tmp_path / "policy.yaml")
 
-    decision = engine.evaluate_write_file(path="data/mcp_clients.yaml")
+    decision = engine.evaluate_write_file(path="config/mcp.yaml")
 
     assert decision.safety_level == SafetyLevel.approval_required
     # sensitive 使 state.py 的 QQ 管理员免审批分支失效，管理员也要确认。
@@ -160,10 +160,13 @@ def test_mcp_config_write_requires_approval_by_default(tmp_path: Path) -> None:
 def test_mcp_config_is_as_guarded_as_tools_dir(tmp_path: Path) -> None:
     engine = PolicyEngine(workspace_root=tmp_path, policy_path=tmp_path / "policy.yaml")
 
-    mcp = engine.evaluate_write_file(path="data/mcp_clients.yaml")
-    tools = engine.evaluate_write_file(path="tools/whatever.py")
+    mcp = engine.evaluate_write_file(path="config/mcp.yaml")
+    tools = engine.evaluate_write_file(path="config/tools/whatever.py")
+    legacy = engine.evaluate_write_file(path="data/mcp_clients.yaml")
 
     assert (mcp.safety_level, mcp.sensitive) == (tools.safety_level, tools.sensitive)
+    # 老 policy 只给旧名字写了规则，新位置照样得判成同一档。
+    assert (legacy.safety_level, legacy.sensitive) == (mcp.safety_level, mcp.sensitive)
 
 
 # --- list_dir ---

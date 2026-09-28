@@ -14,14 +14,16 @@ from fastapi import APIRouter, Depends, HTTPException, Body, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+import config_layout
 from engine.node import node_file
-from toolbox.text_files import rewrite_text
 
 from .scheduler import schedules_lock, schedules_path
 from .tool_catalog import ToolEntry, tool_catalog, tool_names
 
 class RawContent(BaseModel):
     content: str
+    # 打开编辑器时拿到的指纹。给了就先比对：中途被别处改过就 409，一个字节都不写。
+    base_hash: str | None = None
 
 class NodeCreate(BaseModel):
     id: str
@@ -184,11 +186,20 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     router = APIRouter(dependencies=[Depends(verify_admin_token)])
 
     def _safe_path(base_dir: Path, rel_path: str, suffix: str = "") -> Path:
+        """base_dir 下的相对路径，走出去就 400。
+
+        返回不解析软链的写法：共享组的 config/ 是软链，显示给人看的路径和 policy 认的名字都按工作区里的走。
+        """
         name = rel_path if not suffix or rel_path.endswith(suffix) else rel_path + suffix
-        p = (base_dir / name).resolve()
-        if not str(p).startswith(str(base_dir.resolve())):
+        base = base_dir.resolve()
+        resolved = (base_dir / name).resolve()
+        # 按字符串前缀比会放过 nodes-evil/ 这种同名开头的兄弟目录。
+        if resolved == base or not resolved.is_relative_to(base):
             raise HTTPException(status_code=400, detail="Invalid path")
-        return p
+        return base_dir / resolved.relative_to(base)
+
+    def _rel(path: Path) -> str:
+        return config_layout.logical_path(workspace_root, path)
 
     def _read_yaml(p: Path) -> dict[str, Any]:
         if not p.exists():
@@ -199,28 +210,51 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         except Exception:
             return {}
 
-    def _read_text(p: Path) -> dict[str, str]:
-        if not p.exists():
+    def _read_text(p: Path, **extra: Any) -> dict[str, Any]:
+        """文件内容连同指纹：编辑器保存时带回指纹，写入方据此认出中途被别处改过。"""
+        if not p.is_file():
             raise HTTPException(status_code=404, detail="File not found")
-        return {"content": p.read_text(encoding="utf-8")}
+        data = p.read_bytes()
+        # 和 read_text 一样把换行统一成 \n；指纹按落盘的原始字节算，写入方比的也是字节。
+        text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        return {"content": text, "hash": config_layout.bytes_hash(data), "path": _rel(p), **extra}
 
-    def _write_text(p: Path, content: str) -> dict[str, Any]:
-        """整份覆盖写入，覆盖前留一份 .bak。
+    def _write_overlay(target: Path, shown: Path, content: str, base_hash: str | None) -> dict[str, Any]:
+        """整份覆盖写入 target，覆盖前留一份 .bak。
 
+        target 还不存在时编辑器里显示的是 shown（仓库默认或模板），指纹按那份比。
         这一层不解析、不校验，上游表单出一次 bug 就能把 163 行的 runtime.yaml 截成三行，
         而覆盖不可逆。备份失败就不写：没有退路的覆盖比保存失败危险得多。
-        十二个 raw 配置端点共用这个函数，所以保险加在这里而不是逐个端点。
+        raw 配置端点共用这个函数，所以保险加在这里而不是逐个端点。
         """
-        p.parent.mkdir(parents=True, exist_ok=True)
-        if p.exists():
-            try:
-                shutil.copy2(p, p.with_name(f"{p.name}.bak"))
-            except OSError as exc:
-                raise HTTPException(
-                    status_code=500, detail=f"备份 {p.name} 失败，未写入：{exc}",
-                ) from exc
-        rewrite_text(p, content)
-        return {"ok": True}
+        try:
+            with config_layout.locked(target):
+                current = target if target.exists() else shown
+                if base_hash is not None and base_hash != config_layout.file_hash(current):
+                    raise config_layout.ConfigConflict(f"{target.name} 已被别处改过，刷新后再改")
+                new_hash = config_layout.write_locked(
+                    target, content, backup=True, mode=config_layout.private_mode_for(workspace_root, target),
+                )
+        except config_layout.ConfigConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except config_layout.ConfigBackupError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"写入 {target.name} 失败，原文件没动：{exc}") from exc
+        return {"ok": True, "hash": new_hash, "path": _rel(target)}
+
+    def _write_text(p: Path, content: str, base_hash: str | None = None) -> dict[str, Any]:
+        return _write_overlay(p, p, content, base_hash)
+
+    def _create_text(p: Path, content: str) -> dict[str, Any]:
+        """只在文件还不存在时写：检查和落盘之间被别处抢先建了，照样按冲突报。"""
+        return _write_overlay(p, p, content, "")
+
+    def _remove(p: Path) -> bool:
+        try:
+            return config_layout.remove_config_file(p)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"删除 {p.name} 失败：{exc}") from exc
 
     def _parse_skill_frontmatter(text: str) -> tuple[dict[str, Any], str]:
         if not text.startswith("---\n"):
@@ -239,6 +273,20 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         return meta, body
 
     # ----- Nodes -----
+    def _node_source(path: Path) -> str:
+        """system：跟着代码走的系统节点；default：仓库默认原样；override：改过的仓库默认；custom：实例自己加的。"""
+        system_dir, _own_dir, default_dir = config_layout.node_search_dirs(workspace_root)
+        if path.parent == system_dir:
+            return "system"
+        if path.parent == default_dir:
+            return "default"
+        return "override" if (default_dir / path.name).is_file() else "custom"
+
+    def _same_as_default(path: Path) -> bool:
+        """和仓库默认一字不差的覆盖什么也没改，只会让以后默认的更新到不了这个实例。"""
+        default = config_layout.default_nodes_dir() / path.name
+        return path.parent != default.parent and default.is_file() and path.read_bytes() == default.read_bytes()
+
     @router.get("/nodes")
     def list_nodes() -> list[dict[str, Any]]:
         """节点列表。id 一律取文件名。
@@ -248,16 +296,12 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         把同名的 qq.orchestrator.yaml 顶掉了：界面显示示例文件的内容，写回却按文件名
         落到真文件上——读一份、写另一份。
         """
-        # 系统节点目录分离：engine/system_nodes/ 优先，同名时用户目录那份不再列出，
+        # 系统节点、实例改过或自己加的、仓库默认依次排，同名时排在前面的那份才会被加载，
         # 和 load_node 的取舍顺序一致。
-        dirs = [
-            workspace_root / "engine" / "system_nodes",
-            workspace_root / "config" / "nodes",
-        ]
         res = []
         seen_ids: set[str] = set()
-        for nodes_dir in dirs:
-            if not nodes_dir.exists():
+        for nodes_dir in config_layout.node_search_dirs(workspace_root):
+            if not nodes_dir.is_dir():
                 continue
             for f in sorted(nodes_dir.glob("*.yaml")):
                 nid = f.stem
@@ -271,6 +315,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 elif not isinstance(ta_raw, dict):
                     ta_raw = {"mode": "none"}
                 declared = str(data.get("id") or "").strip()
+                source = _node_source(f)
                 res.append({
                     "id": nid,
                     # 模板和示例不会被派发到，列出来只是为了能编辑，别混进要配置的节点里。
@@ -284,208 +329,215 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                     "skills": data.get("skills", {}),
                     "description": data.get("description", ""),
                     "delegate_targets": list(data.get("delegate_targets") or []),
+                    "source": source,
+                    "same_as_default": source == "override" and _same_as_default(f),
                 })
         return res
 
-    def _node_file(node_id: str, *, for_write: bool = False) -> Path:
-        """节点 id 对应的文件，取舍顺序和 engine 的 load_node 一样。
+    def _node_file(node_id: str) -> Path:
+        """节点 id 实际加载的那份文件，取舍顺序和 engine 的 load_node 一样。一份都没有时是实例里该建的位置。"""
+        dirs = config_layout.node_search_dirs(workspace_root)
+        for nodes_dir in dirs:
+            path = _safe_path(nodes_dir, node_id, ".yaml")
+            if path.is_file():
+                return path
+        return _safe_path(dirs[1], node_id, ".yaml")
+
+    def _node_targets(node_id: str) -> tuple[Path, Path]:
+        """(改这个节点时写的位置, 仓库默认那份)。
 
         写系统节点要挡住：落到 config/nodes/ 下的同名文件永远不会被加载，
-        改完看着成功，实际什么也没变。
+        改完看着成功，实际什么也没变。仓库默认那份不动，改动落成实例目录里的同名覆盖。
         """
-        sys_path = _safe_path(workspace_root / "engine" / "system_nodes", node_id, ".yaml")
-        if sys_path.exists():
-            if for_write:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"{node_id} 是系统节点，跟着代码仓库走，不能从这里改",
-                )
-            return sys_path
-        return _safe_path(workspace_root / "config" / "nodes", node_id, ".yaml")
+        system_dir, own_dir, default_dir = config_layout.node_search_dirs(workspace_root)
+        if _safe_path(system_dir, node_id, ".yaml").exists():
+            raise HTTPException(
+                status_code=409,
+                detail=f"{node_id} 是系统节点，跟着代码仓库走，不能从这里改",
+            )
+        return _safe_path(own_dir, node_id, ".yaml"), _safe_path(default_dir, node_id, ".yaml")
 
     @router.get("/nodes/{node_id}/raw")
-    def get_node_raw(node_id: str) -> dict[str, str]:
-        return _read_text(_node_file(node_id))
+    def get_node_raw(node_id: str) -> dict[str, Any]:
+        path = _node_file(node_id)
+        return _read_text(path, source=_node_source(path))
 
     @router.put("/nodes/{node_id}/raw")
     def update_node_raw(node_id: str, payload: RawContent) -> dict[str, Any]:
-        return _write_text(_node_file(node_id, for_write=True), payload.content)
+        target, default = _node_targets(node_id)
+        return _write_overlay(target, default, payload.content, payload.base_hash)
 
     @router.post("/nodes")
     def create_node(payload: NodeCreate) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "config" / "nodes", payload.id, ".yaml")
+        p = _safe_path(config_layout.nodes_dir(workspace_root), payload.id, ".yaml")
         if p.exists():
             raise HTTPException(status_code=409, detail="Node already exists")
-        # 同名系统节点、把这个 id 声明成旧 id 的节点都排在新文件前面，建了也加载不到。
+        # 同名的系统节点和仓库默认、把这个 id 声明成旧 id 的节点都会让新文件加载不到或顶掉别人。
         taken_by = node_file(workspace_root, payload.id)
         if taken_by is not None:
             raise HTTPException(
                 status_code=409,
-                detail=f"{payload.id} 已经指向 {taken_by.relative_to(workspace_root).as_posix()}，新建的文件不会被加载",
+                detail=f"{payload.id} 已经指向 {_rel(taken_by)}，新建的文件不会被加载",
             )
-        return _write_text(p, payload.content)
+        return _create_text(p, payload.content)
 
     @router.delete("/nodes/{node_id}")
     def delete_node(node_id: str) -> dict[str, Any]:
-        p = _node_file(node_id, for_write=True)
-        if not p.exists():
+        """删实例自己加的节点；改过的仓库默认删掉覆盖，恢复成默认。"""
+        target, default = _node_targets(node_id)
+        if not target.exists():
+            if default.exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{node_id} 是仓库自带的默认节点，没有改过，删不掉；不想用它就从委派关系里去掉",
+                )
             raise HTTPException(status_code=404, detail="Node not found")
-        p.unlink()
-        return {"ok": True}
+        _remove(target)
+        return {"ok": True, "restored": default.exists()}
 
-    # ----- Node files: YAML nodes and Markdown fragments under config/nodes/ -----
+    # ----- Node files: YAML nodes and Markdown fragments -----
+    _NODE_FILE_SUFFIXES = (".yaml", ".yml", ".md")
+
+    def _node_file_targets(filename: str) -> tuple[Path, Path]:
+        """(实例里这份文件的位置, 仓库默认那份)。"""
+        if not filename.endswith(_NODE_FILE_SUFFIXES):
+            raise HTTPException(status_code=400, detail="Only .yaml/.yml/.md files are allowed")
+        return (
+            _safe_path(config_layout.nodes_dir(workspace_root), filename),
+            _safe_path(config_layout.default_nodes_dir(), filename),
+        )
+
+    def _layer_source(own: Path, default: Path) -> str:
+        if own.is_file():
+            return "override" if default.is_file() else "custom"
+        return "default"
+
+    def _node_file_map(nodes_dir: Path) -> dict[str, Path]:
+        if not nodes_dir.is_dir():
+            return {}
+        return {
+            f.name: f
+            for f in nodes_dir.iterdir()
+            if f.is_file() and f.suffix in _NODE_FILE_SUFFIXES
+        }
+
     @router.get("/node-files")
     def list_node_files() -> list[dict[str, Any]]:
-        nodes_dir = workspace_root / "config" / "nodes"
-        if not nodes_dir.exists():
-            return []
+        own = _node_file_map(config_layout.nodes_dir(workspace_root))
+        defaults = _node_file_map(config_layout.default_nodes_dir())
         res: list[dict[str, Any]] = []
-        for f in sorted([*nodes_dir.glob("*.yaml"), *nodes_dir.glob("*.yml"), *nodes_dir.glob("*.md")]):
-            if not f.is_file():
-                continue
-            name = f.name
+        for name in sorted({*own, *defaults}):
+            f = own.get(name) or defaults[name]
             stem = f.stem
             is_example = ".example" in name or stem.endswith("_example")
             base_name = name.replace(".example.yaml", ".yaml").replace(".example.yml", ".yml").replace(".example.md", ".md")
+            stat = f.stat()
+            overrides = name in own and name in defaults
             res.append({
                 "name": name,
-                "path": str(f.relative_to(workspace_root).as_posix()),
+                "path": _rel(f),
                 "kind": "fragment" if f.suffix == ".md" else "node",
                 "suffix": f.suffix,
                 "is_example": is_example,
                 "base_name": base_name,
-                "size": f.stat().st_size,
-                "updated_at": f.stat().st_mtime,
+                "size": stat.st_size,
+                "updated_at": stat.st_mtime,
+                "source": "override" if overrides else ("custom" if name in own else "default"),
+                "same_as_default": overrides and _same_as_default(f),
             })
         return res
 
     @router.get("/node-files/{filename}/raw")
-    def get_node_file_raw(filename: str) -> dict[str, str]:
-        if not (filename.endswith(".yaml") or filename.endswith(".yml") or filename.endswith(".md")):
-            raise HTTPException(status_code=400, detail="Only .yaml/.yml/.md files are allowed")
-        p = _safe_path(workspace_root / "config" / "nodes", filename)
-        return _read_text(p)
+    def get_node_file_raw(filename: str) -> dict[str, Any]:
+        own, default = _node_file_targets(filename)
+        return _read_text(own if own.is_file() else default, source=_layer_source(own, default))
 
     @router.put("/node-files/{filename}/raw")
     def update_node_file_raw(filename: str, payload: RawContent) -> dict[str, Any]:
-        if not (filename.endswith(".yaml") or filename.endswith(".yml") or filename.endswith(".md")):
-            raise HTTPException(status_code=400, detail="Only .yaml/.yml/.md files are allowed")
-        p = _safe_path(workspace_root / "config" / "nodes", filename)
-        return _write_text(p, payload.content)
+        own, default = _node_file_targets(filename)
+        return _write_overlay(own, default, payload.content, payload.base_hash)
 
-    @router.post("/node-files/{filename}/make-example")
-    def make_node_file_example(filename: str) -> dict[str, Any]:
-        if not (filename.endswith(".yaml") or filename.endswith(".yml") or filename.endswith(".md")):
-            raise HTTPException(status_code=400, detail="Only .yaml/.yml/.md files are allowed")
-        src = _safe_path(workspace_root / "config" / "nodes", filename)
-        if not src.exists():
-            raise HTTPException(status_code=404, detail="Source file not found")
-        if filename.endswith(".yaml"):
-            example_name = filename[:-5] + ".example.yaml"
-        elif filename.endswith(".yml"):
-            example_name = filename[:-4] + ".example.yml"
-        else:
-            example_name = filename[:-3] + ".example.md"
-        dst = _safe_path(workspace_root / "config" / "nodes", example_name)
-        if dst.exists():
-            return {"ok": True, "created": False, "path": str(dst.relative_to(workspace_root).as_posix())}
-        shutil.copyfile(src, dst)
-        return {"ok": True, "created": True, "path": str(dst.relative_to(workspace_root).as_posix())}
+    @router.delete("/node-files/{filename}")
+    def delete_node_file(filename: str) -> dict[str, Any]:
+        """改过的仓库默认文件恢复成默认；实例自己加的直接删。"""
+        own, default = _node_file_targets(filename)
+        if not own.exists():
+            if default.exists():
+                raise HTTPException(status_code=409, detail=f"{filename} 是仓库自带的默认文件，没有改过，不用恢复")
+            raise HTTPException(status_code=404, detail="File not found")
+        _remove(own)
+        return {"ok": True, "restored": default.exists()}
 
     # ----- Drawtools (NovelAI image generation) -----
-    def _drawtools_dir() -> Path:
-        return workspace_root / "tools" / "drawtools"
+    # 前端的名字 → drawtools 目录里的相对路径。
+    _DRAWTOOLS_PROMPTS = {
+        "top-system": "prompts/novelai/top-system.md",
+        "output-format": "prompts/novelai/output-format.md",
+        "tag-guide": "prompts/novelai/tag-guide.md",
+    }
 
-    def _drawtools_prompt_dir() -> Path:
-        return _drawtools_dir() / "prompts" / "novelai"
-
-    def _drawtools_read_with_example(path: Path, example_path: Path) -> dict[str, Any]:
+    def _drawtools_read_with_example(name: str) -> dict[str, Any]:
+        path = config_layout.drawtools_file(workspace_root, name)
+        example_path = config_layout.drawtools_example(name)
         target = path if path.exists() else example_path
-        if not target.exists():
+        if not target.is_file():
             return {"content": "", "exists": False, "using_example": False}
         return {
-            "content": target.read_text(encoding="utf-8"),
+            **_read_text(target),
             "exists": path.exists(),
             "using_example": not path.exists() and example_path.exists(),
-            "path": str(path.relative_to(workspace_root).as_posix()),
-            "example_path": str(example_path.relative_to(workspace_root).as_posix()),
+            "path": _rel(path),
+            "example_path": _rel(example_path),
         }
 
-    def _drawtools_write(path: Path, content: str) -> dict[str, Any]:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        rewrite_text(path, content)
-        return {"ok": True, "path": str(path.relative_to(workspace_root).as_posix())}
+    def _drawtools_write(name: str, payload: RawContent) -> dict[str, Any]:
+        path = config_layout.drawtools_file(workspace_root, name)
+        return _write_overlay(path, config_layout.drawtools_example(name), payload.content, payload.base_hash)
+
+    def _drawtools_prompt(name: str) -> str:
+        if name not in _DRAWTOOLS_PROMPTS:
+            raise HTTPException(status_code=404, detail="Unknown prompt template")
+        return _DRAWTOOLS_PROMPTS[name]
 
     @router.get("/drawtools")
     def get_drawtools_bundle() -> dict[str, Any]:
-        base = _drawtools_dir()
-        prompt_dir = _drawtools_prompt_dir()
         return {
-            "settings": _drawtools_read_with_example(base / "settings.yaml", base / "settings.example.yaml"),
-            "character_tags": _drawtools_read_with_example(base / "character_tags.yaml", base / "character_tags.example.yaml"),
+            "settings": _drawtools_read_with_example("settings.yaml"),
+            "character_tags": _drawtools_read_with_example("character_tags.yaml"),
             "prompts": {
-                "top_system": _drawtools_read_with_example(prompt_dir / "top-system.md", prompt_dir / "top-system.example.md"),
-                "output_format": _drawtools_read_with_example(prompt_dir / "output-format.md", prompt_dir / "output-format.example.md"),
-                "tag_guide": _drawtools_read_with_example(prompt_dir / "tag-guide.md", prompt_dir / "tag-guide.example.md"),
+                "top_system": _drawtools_read_with_example(_DRAWTOOLS_PROMPTS["top-system"]),
+                "output_format": _drawtools_read_with_example(_DRAWTOOLS_PROMPTS["output-format"]),
+                "tag_guide": _drawtools_read_with_example(_DRAWTOOLS_PROMPTS["tag-guide"]),
             },
         }
 
     @router.post("/drawtools/init")
     def init_drawtools_configs() -> dict[str, Any]:
-        created: list[str] = []
-        pairs = [
-            (_drawtools_dir() / "settings.example.yaml", _drawtools_dir() / "settings.yaml"),
-            (_drawtools_dir() / "character_tags.example.yaml", _drawtools_dir() / "character_tags.yaml"),
-            (_drawtools_prompt_dir() / "top-system.example.md", _drawtools_prompt_dir() / "top-system.md"),
-            (_drawtools_prompt_dir() / "output-format.example.md", _drawtools_prompt_dir() / "output-format.md"),
-            (_drawtools_prompt_dir() / "tag-guide.example.md", _drawtools_prompt_dir() / "tag-guide.md"),
-        ]
-        for src, dst in pairs:
-            if dst.exists() or not src.exists():
-                continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src, dst)
-            created.append(str(dst.relative_to(workspace_root).as_posix()))
-        return {"ok": True, "created": created}
+        return {"ok": True, "created": config_layout.ensure_drawtools_configs(workspace_root)}
 
     @router.get("/drawtools/settings/raw")
     def get_drawtools_settings_raw() -> dict[str, Any]:
-        return _drawtools_read_with_example(_drawtools_dir() / "settings.yaml", _drawtools_dir() / "settings.example.yaml")
+        return _drawtools_read_with_example("settings.yaml")
 
     @router.put("/drawtools/settings/raw")
     def update_drawtools_settings_raw(payload: RawContent) -> dict[str, Any]:
-        return _drawtools_write(_drawtools_dir() / "settings.yaml", payload.content)
+        return _drawtools_write("settings.yaml", payload)
 
     @router.get("/drawtools/characters/raw")
     def get_drawtools_characters_raw() -> dict[str, Any]:
-        return _drawtools_read_with_example(_drawtools_dir() / "character_tags.yaml", _drawtools_dir() / "character_tags.example.yaml")
+        return _drawtools_read_with_example("character_tags.yaml")
 
     @router.put("/drawtools/characters/raw")
     def update_drawtools_characters_raw(payload: RawContent) -> dict[str, Any]:
-        return _drawtools_write(_drawtools_dir() / "character_tags.yaml", payload.content)
+        return _drawtools_write("character_tags.yaml", payload)
 
     @router.get("/drawtools/prompts/{name}/raw")
     def get_drawtools_prompt_raw(name: str) -> dict[str, Any]:
-        mapping = {
-            "top-system": ("top-system.md", "top-system.example.md"),
-            "output-format": ("output-format.md", "output-format.example.md"),
-            "tag-guide": ("tag-guide.md", "tag-guide.example.md"),
-        }
-        if name not in mapping:
-            raise HTTPException(status_code=404, detail="Unknown prompt template")
-        actual, example = mapping[name]
-        return _drawtools_read_with_example(_drawtools_prompt_dir() / actual, _drawtools_prompt_dir() / example)
+        return _drawtools_read_with_example(_drawtools_prompt(name))
 
     @router.put("/drawtools/prompts/{name}/raw")
     def update_drawtools_prompt_raw(name: str, payload: RawContent) -> dict[str, Any]:
-        mapping = {
-            "top-system": "top-system.md",
-            "output-format": "output-format.md",
-            "tag-guide": "tag-guide.md",
-        }
-        if name not in mapping:
-            raise HTTPException(status_code=404, detail="Unknown prompt template")
-        return _drawtools_write(_drawtools_prompt_dir() / mapping[name], payload.content)
+        return _drawtools_write(_drawtools_prompt(name), payload)
 
     @router.post("/drawtools/cleanup")
     def cleanup_drawtools_attachments() -> dict[str, Any]:
@@ -493,28 +545,33 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         from tools.drawtools.cleanup import cleanup_novelai_attachments
         return cleanup_novelai_attachments(force=True)
 
-    # ----- Runtime config -----
-    # ----- Config (data/config.yaml) -----
+    # ----- Model channels (config/models.yaml) -----
     @router.get("/config/raw")
-    def get_config_raw() -> dict[str, str]:
-        p = workspace_root / "data" / "config.yaml"
-        return _read_text(p)
+    def get_config_raw() -> dict[str, Any]:
+        return _read_text(config_layout.models_path(workspace_root))
 
     @router.put("/config/raw")
     def update_config_raw(payload: RawContent) -> dict[str, Any]:
-        p = workspace_root / "data" / "config.yaml"
-        return _write_text(p, payload.content)
+        return _write_text(config_layout.models_path(workspace_root), payload.content, payload.base_hash)
 
     # ----- Runtime -----
+    # 编辑的是实例那份；还没改过时显示仓库默认，保存后落成实例那份，运行时逐键盖在默认上面。
     @router.get("/runtime/raw")
-    def get_runtime() -> dict[str, str]:
-        p = workspace_root / "config" / "runtime.yaml"
-        return _read_text(p)
-        
+    def get_runtime() -> dict[str, Any]:
+        default, own = config_layout.runtime_layers(workspace_root)
+        if own.is_file():
+            return _read_text(own, source="override")
+        return _read_text(default, source="default")
+
     @router.put("/runtime/raw")
     def update_runtime(payload: RawContent) -> dict[str, Any]:
-        p = workspace_root / "config" / "runtime.yaml"
-        return _write_text(p, payload.content)
+        default, own = config_layout.runtime_layers(workspace_root)
+        return _write_overlay(own, default, payload.content, payload.base_hash)
+
+    @router.delete("/runtime/raw")
+    def reset_runtime() -> dict[str, Any]:
+        _default, own = config_layout.runtime_layers(workspace_root)
+        return {"ok": True, "restored": _remove(own)}
 
     # ----- 旧的 QQ 热载配置路由 -----
     # 没刷新的旧控制台和照文档写的运维脚本还在调这几条，行为与 /v1/platforms/qq/... 完全一致。
@@ -539,16 +596,18 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     # ----- Policy -----
     @router.get("/policy/raw")
-    def get_policy() -> dict[str, str]:
-        p = workspace_root / "data" / "policy.yaml"
-        if not p.exists():
-            p = workspace_root / "policy.example.yaml"
-        return _read_text(p)
-        
+    def get_policy() -> dict[str, Any]:
+        p = config_layout.policy_path(workspace_root)
+        return _read_text(p if p.is_file() else config_layout.default_template(config_layout.POLICY_TEMPLATE))
+
     @router.put("/policy/raw")
     def update_policy(payload: RawContent) -> dict[str, Any]:
-        p = workspace_root / "data" / "policy.yaml"
-        return _write_text(p, payload.content)
+        return _write_overlay(
+            config_layout.policy_path(workspace_root),
+            config_layout.default_template(config_layout.POLICY_TEMPLATE),
+            payload.content,
+            payload.base_hash,
+        )
 
     # ----- Schedules -----
     @router.get("/schedules/raw")
@@ -561,13 +620,16 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     @router.put("/schedules/raw")
     def update_schedules(payload: RawContent) -> dict[str, Any]:
         with schedules_lock(workspace_root):
-            return _write_text(schedules_path(workspace_root), payload.content)
+            return _write_text(schedules_path(workspace_root), payload.content, payload.base_hash)
 
     # ----- Skills -----
+    def _skills_dir() -> Path:
+        return config_layout.skills_dir(workspace_root)
+
     @router.get("/skills")
     def list_skills() -> list[dict[str, Any]]:
-        skills_dir = workspace_root / "skills"
-        if not skills_dir.exists():
+        skills_dir = _skills_dir()
+        if not skills_dir.is_dir():
             return []
         res = []
         for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
@@ -587,31 +649,24 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         return res
 
     @router.get("/skills/{name}/raw")
-    def get_skill_raw(name: str) -> dict[str, str]:
-        p = _safe_path(workspace_root / "skills", name)
-        md = p / "SKILL.md"
-        return _read_text(md)
+    def get_skill_raw(name: str) -> dict[str, Any]:
+        return _read_text(_safe_path(_skills_dir(), name) / "SKILL.md")
 
     @router.put("/skills/{name}/raw")
     def update_skill_raw(name: str, payload: RawContent) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "skills", name)
-        md = p / "SKILL.md"
-        md.parent.mkdir(parents=True, exist_ok=True)
-        return _write_text(md, payload.content)
+        return _write_text(_safe_path(_skills_dir(), name) / "SKILL.md", payload.content, payload.base_hash)
 
     @router.post("/skills")
     def create_skill(payload: NodeCreate) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "skills", payload.id)
-        md = p / "SKILL.md"
+        md = _safe_path(_skills_dir(), payload.id) / "SKILL.md"
         if md.exists():
             raise HTTPException(status_code=409, detail="Skill already exists")
-        md.parent.mkdir(parents=True, exist_ok=True)
-        return _write_text(md, payload.content)
+        return _create_text(md, payload.content)
 
     @router.delete("/skills/{name}")
     def delete_skill(name: str) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "skills", name)
-        if p.exists() and p.is_dir():
+        p = _safe_path(_skills_dir(), name)
+        if p.is_dir():
             shutil.rmtree(p)
         return {"ok": True}
 
@@ -619,8 +674,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     def _catalog() -> list[ToolEntry]:
         return tool_catalog(workspace_root)
 
-    def _tool_file(name: str) -> Path:
-        """工具名对应的源码文件。
+    def _tool_entry(name: str) -> ToolEntry:
+        """工具名对应的外部脚本。
 
         子目录里的工具、SPEC 名和文件名对不上的都得走这里。内置和插件工具没有源码，
         直接说清楚 —— 拼一条 tools/{name}.py 出来只会让人看到「文件不存在」。
@@ -628,46 +683,56 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         for entry in _catalog():
             if entry.name != name:
                 continue
-            if not entry.editable or not entry.file:
+            if not entry.editable or not entry.file or entry.rel is None:
                 raise HTTPException(
                     status_code=409,
                     detail=f"{name} 是{'插件' if entry.source == 'plugin' else '内置'}工具，没有可编辑的源码文件",
                 )
-            return workspace_root / entry.file
+            return entry
         raise HTTPException(status_code=404, detail="Tool not found")
+
+    def _tool_override(entry: ToolEntry) -> Path:
+        """改这个工具时写的位置：config/tools/ 里同一相对路径。仓库那份不动，改了就落成覆盖。"""
+        return _safe_path(config_layout.custom_tools_dir(workspace_root), str(entry.rel))
 
     @router.get("/tools")
     def list_tools() -> list[dict[str, Any]]:
         return [entry.to_dict() for entry in _catalog()]
 
     @router.get("/tools/{name}/raw")
-    def get_tool_raw(name: str) -> dict[str, str]:
-        return _read_text(_tool_file(name))
+    def get_tool_raw(name: str) -> dict[str, Any]:
+        entry = _tool_entry(name)
+        return _read_text(workspace_root / str(entry.file), origin=entry.origin)
 
     @router.put("/tools/{name}/raw")
     def update_tool_raw(name: str, payload: RawContent) -> dict[str, Any]:
-        return _write_text(_tool_file(name), payload.content)
+        entry = _tool_entry(name)
+        return _write_overlay(_tool_override(entry), workspace_root / str(entry.file), payload.content, payload.base_hash)
 
     @router.post("/tools")
     def create_tool(payload: NodeCreate) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "tools", payload.id, ".py")
+        p = _safe_path(config_layout.custom_tools_dir(workspace_root), payload.id, ".py")
         # 重名的新文件建了也没用：注册表只认其中一个，内置工具还会直接盖掉外部同名。
         if p.exists() or any(entry.name == payload.id for entry in _catalog()):
             raise HTTPException(status_code=409, detail="Tool already exists")
-        return _write_text(p, payload.content)
+        return _create_text(p, payload.content)
 
     @router.delete("/tools/{name}")
     def delete_tool(name: str) -> dict[str, Any]:
-        p = _tool_file(name)
-        if not p.exists():
+        """删实例自己加的工具；改过的仓库工具删掉覆盖，恢复成仓库那份。"""
+        entry = _tool_entry(name)
+        if entry.origin == "bundled":
+            raise HTTPException(status_code=409, detail=f"{name} 是仓库自带的工具，没有改过，删不掉；不想用它就在节点里去掉")
+        target = _tool_override(entry)
+        if not target.exists():
             raise HTTPException(status_code=404, detail="Tool not found")
-        p.unlink()
-        return {"ok": True}
+        _remove(target)
+        return {"ok": True, "restored": entry.origin == "override"}
 
     # ----- MCP Clients -----
     @router.get("/mcp-clients")
     def list_mcp_clients() -> list[dict[str, Any]]:
-        p = workspace_root / "data" / "mcp_clients.yaml"
+        p = config_layout.mcp_path(workspace_root)
         if not p.exists():
             return []
         data = _read_yaml(p)
@@ -684,16 +749,15 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         return res
 
     @router.get("/mcp-clients/raw")
-    def get_mcp_clients_raw() -> dict[str, str]:
-        p = workspace_root / "data" / "mcp_clients.yaml"
+    def get_mcp_clients_raw() -> dict[str, Any]:
+        p = config_layout.mcp_path(workspace_root)
         if not p.exists():
-            return {"content": "version: 1\nclients: {}\n"}
+            return {"content": "version: 1\nclients: {}\n", "hash": "", "path": _rel(p)}
         return _read_text(p)
 
     @router.put("/mcp-clients/raw")
     def update_mcp_clients_raw(payload: RawContent) -> dict[str, Any]:
-        p = workspace_root / "data" / "mcp_clients.yaml"
-        return _write_text(p, payload.content)
+        return _write_text(config_layout.mcp_path(workspace_root), payload.content, payload.base_hash)
 
     # ----- All tool names -----
     @router.get("/all-tool-names")
@@ -708,7 +772,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         勾了不等于能用：名字可能根本不存在，生图渠道没配 model 会在构建工具表时
         被摘掉，而外部脚本除非自己声明 guard，否则服务端策略那一页管不到它。
         """
-        from toolbox.registry import extract_tool_spec, iter_external_tool_files
+        from toolbox.registry import external_tool_files, extract_tool_spec
 
         path = _node_file(node_id)
         if not path.exists():
@@ -726,9 +790,10 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
             return [str(x).strip() for x in (ta.get(key) or []) if str(x or "").strip()]
 
         external: dict[str, bool] = {}
-        for f in iter_external_tool_files(workspace_root / "tools"):
-            spec, _timeout = extract_tool_spec(f)
-            if spec and isinstance(spec.get("name"), str):
+        for item in external_tool_files(workspace_root):
+            spec, _timeout = extract_tool_spec(item.path)
+            # 同名时先出现的那份生效，和注册表一致。
+            if spec and isinstance(spec.get("name"), str) and spec["name"] not in external:
                 external[spec["name"]] = isinstance(spec.get("guard"), dict)
 
         known = {entry.name for entry in _catalog()}

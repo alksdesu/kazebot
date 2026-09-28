@@ -110,7 +110,7 @@ if __name__ == "__main__":
     else:
         image_paths = []
 
-    # 优先级：config.yaml system_models.image_gemini > CLONOTH_IMAGE_GEMINI_* > GEMINI_*
+    # 优先级：models.yaml system_models.image_gemini > CLONOTH_IMAGE_GEMINI_* > GEMINI_*
     # > OPENAI_* > 主渠道。主渠道只在它本身就是 Gemini 时才借 —— 这里走的是原生
     # generateContent，别家的地址接不住。model 不跟着借：那个是聊天模型。
     if str(Path(__file__).resolve().parent) not in sys.path:
@@ -124,7 +124,7 @@ if __name__ == "__main__":
     base_url = channel.base_url
 
     if not api_key:
-        fail("No API key found in config.yaml / env / .env file")
+        fail("No API key found in config/models.yaml / env / .env file")
 
     # ---- 构建请求 ----
     url = f"{base_url}/v1beta/models/{model}:generateContent?key={api_key}"

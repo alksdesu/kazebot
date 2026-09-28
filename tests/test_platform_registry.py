@@ -251,7 +251,7 @@ class TestRegistration:
 
     @pytest.mark.parametrize("platform_id", ["QQ", "qq-official", "../qq", "", "1qq"])
     def test_platform_ids_are_lower_snake_case(self, platform_id: str) -> None:
-        # id 是 data/platforms/ 下的目录名，也是 data/config.yaml 里的键。
+        # id 是 data/platforms/ 下的目录名，也是 data/platform_secrets.yaml 里的键。
         with pytest.raises(ValueError):
             PlatformDescriptor(id=platform_id, display_name="X", short_name="X")
 

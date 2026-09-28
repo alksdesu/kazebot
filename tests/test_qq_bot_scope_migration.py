@@ -597,11 +597,11 @@ class TestDeploymentsThatMoveThings:
 
         assert report.source_scope == _OLD_BOT and len(report.changed_renames) == 1
 
-    def test_a_secret_configured_in_data_config_is_used(self, tmp_path: Path) -> None:
+    def test_a_secret_configured_in_the_platform_secrets_file_is_used(self, tmp_path: Path) -> None:
         _seed(tmp_path, scope=_OLD_BOT)
         (tmp_path / "data" / "onebot_conversation_hash_secret").unlink()
-        (tmp_path / "data" / "config.yaml").write_text(
-            f"platforms:\n  qq:\n    conversation_hash_secret: {_SECRET}\n", encoding="utf-8",
+        (tmp_path / "data" / "platform_secrets.yaml").write_text(
+            f"qq:\n  conversation_hash_secret: {_SECRET}\n", encoding="utf-8",
         )
 
         report = migrate.run_scope_migration(workspace=tmp_path, target_scope=_NEW_BOT, apply=False)
@@ -742,7 +742,7 @@ class TestSupervisorScopeQuery:
         app = create_app(
             state=state or self._state(tmp_path),
             process_manager=None,
-            config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"),
+            config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path),
         )
 
         async def go() -> httpx.Response:

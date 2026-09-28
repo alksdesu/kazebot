@@ -8,6 +8,7 @@ import { createTool, deleteTool, getTools, reloadTools, type AdminTool } from '.
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { removalFor, toolOriginLabel } from '../../../utils/overlaySource';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
 import { AutoApproveSection } from './AutoApproveSection';
 import { NodeGrantsSection } from './NodeGrantsSection';
@@ -58,21 +59,23 @@ const ToolInventorySection = () => {
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all');
   const generation = useRef(0);
 
-  const load = async () => {
-    if (!adminToken || !isAuthenticated) return;
+  const load = async (): Promise<AdminTool[] | undefined> => {
+    if (!adminToken || !isAuthenticated) return undefined;
     const version = ++generation.current;
     setLoading(true);
     try {
       // 授权页那份名单和这里同源，拉一次就够。
       const items = await getTools(adminToken);
-      if (version !== generation.current) return;
+      if (version !== generation.current) return undefined;
       setTools(items);
       setAllToolNames(items.map((item) => item.name));
       if (selectedTool && !items.some((item) => item.name === selectedTool.name)) setSelectedTool(null);
       setLoadError('');
+      return items;
     } catch (error) {
-      if (version !== generation.current) return;
+      if (version !== generation.current) return undefined;
       setLoadError(error instanceof Error ? error.message : '加载工具失败');
+      return undefined;
     } finally {
       if (version === generation.current) setLoading(false);
     }
@@ -108,25 +111,32 @@ const ToolInventorySection = () => {
       setMessage('工具已创建，请在右栏编辑 Python 脚本。');
       await load();
       if (tokenChanged(adminToken)) return;
-      setSelectedTool({ name, source: 'external', editable: true, description: '通过设置页面创建的工具。', input_schema: { type: 'object', properties: {} }, timeout_sec: 30, has_spec: true });
+      setSelectedTool({ name, source: 'external', editable: true, description: '通过设置页面创建的工具。', input_schema: { type: 'object', properties: {} }, timeout_sec: 30, has_spec: true, origin: 'custom' });
     } catch (error) {
       if (tokenChanged(adminToken)) return;
       setMessage(error instanceof Error ? error.message : '创建工具失败');
     }
   });
+  // 没声明来源的外部工具是老版本后端给的，那时它们都放在可以直接删的 tools/ 下。
+  const removal = selectedTool?.editable ? removalFor(selectedTool.origin ?? 'custom', `工具 ${selectedTool.name}`) : null;
   const remove = () => run(async () => {
-    if (!adminToken || !selectedTool || !selectedTool.editable) return;
-    if (!window.confirm(`确定要删除工具 ${selectedTool.name} 吗？`)) return;
+    if (!adminToken || !selectedTool || !removal) return;
+    if (!window.confirm(removal.confirm)) return;
     if (!confirmNavigation()) return;
+    const toolName = selectedTool.name;
     try {
-      await deleteTool(adminToken, selectedTool.name);
+      await deleteTool(adminToken, toolName);
       if (tokenChanged(adminToken)) return;
+      // 先清掉选中：恢复默认后名字没变，右栏要看到选中换过一次才会重读成仓库那份脚本。
       setSelectedTool(null);
-      setMessage('工具已删除');
-      await load();
+      setMessage(`${removal.done}，重载工具后生效`);
+      const items = await load();
+      if (tokenChanged(adminToken) || !removal.restores) return;
+      const restored = items?.find((item) => item.name === toolName);
+      if (restored) setSelectedTool(restored);
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '删除工具失败');
+      setMessage(error instanceof Error ? error.message : `${removal.label}失败`);
     }
   });
   const reload = () => run(async () => {
@@ -152,7 +162,7 @@ const ToolInventorySection = () => {
 
   return (
     <Block frame="boxed"
-      hint="模型能调的全部工具都在这里。外部脚本工具可以增删改，内置和插件工具只能看；风险等级根据工具名前缀推断，脚本编辑器在右栏。"
+      hint="模型能调的全部工具都在这里。外部脚本工具可以增删改：改仓库自带的会在 config/tools 下存一份本实例的版本，恢复默认即删掉这份；内置和插件工具只能看。风险等级根据工具名前缀推断，脚本编辑器在右栏。"
       scope="all-channels"
       title={`工具清单 · 共 ${tools.length}`}
     >
@@ -160,7 +170,9 @@ const ToolInventorySection = () => {
           <div className="mb-3 flex flex-wrap gap-2">
             <Button tone="quiet" disabled={loading || busy} onClick={() => void refresh()}>{loading ? '正在刷新…' : '刷新工具'}</Button>
             <Button disabled={busy} onClick={reload}>重载工具</Button>
-            <Button tone="danger" disabled={busy || !selectedTool?.editable} onClick={remove}>删除选中工具</Button>
+            <Button tone={removal?.restores ? 'quiet' : 'danger'} disabled={busy || !removal} onClick={remove}>
+              {removal ? `${removal.label}选中工具` : '删除选中工具'}
+            </Button>
           </div>
           <div className="mb-3 flex flex-wrap items-center gap-2">
             <Input width="wide"
@@ -198,6 +210,7 @@ const ToolInventorySection = () => {
                       <span className="font-mono text-xs font-semibold">{tool.name}</span>
                       <span className={`border px-1.5 py-0.5 font-mono text-nano ${riskClassName(risk)}`}>{riskLabel(risk)}</span>
                       <span className="border border-[var(--duties-border)] px-1.5 py-0.5 font-mono text-nano text-[var(--duties-secondary)]">{SOURCE_LABEL[tool.source]}</span>
+                      {tool.origin && <span className="border border-[var(--duties-border)] px-1.5 py-0.5 font-mono text-nano text-[var(--duties-secondary)]">{toolOriginLabel(tool.origin)}</span>}
                       {!tool.editable && <span className="font-mono text-nano text-[var(--duties-tertiary)]">只读</span>}
                     </div>
                     <p className="mt-1 text-xs text-[var(--duties-secondary)]">

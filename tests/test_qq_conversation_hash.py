@@ -138,10 +138,10 @@ class TestResolveSecret:
 
 
 class TestPlatformSecret:
-    def test_qq_reads_an_explicit_secret_from_data_config(self, tmp_path: Path) -> None:
+    def test_qq_reads_an_explicit_secret_from_the_platform_secrets_file(self, tmp_path: Path) -> None:
         (tmp_path / "data").mkdir()
-        (tmp_path / "data" / "config.yaml").write_text(
-            f"platforms:\n  qq:\n    conversation_hash_secret: {_SECRET}\n", encoding="utf-8",
+        (tmp_path / "data" / "platform_secrets.yaml").write_text(
+            f"qq:\n  conversation_hash_secret: {_SECRET}\n", encoding="utf-8",
         )
 
         assert ch.platform_conversation_secret(QQ_NAPCAT, tmp_path) == (_SECRET, True)

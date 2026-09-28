@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # 拉代码、重启、确认 engine 真的起来了。装到 /usr/local/lib/kazebot/deploy.sh。
 #
-# git 必须以 kazebot 身份跑：root 跑过一次 reset --hard，被改动的文件属主全变 root，
-# engine 启动要写 tools/__init__.py 就 EACCES，而 supervisor 照常活着，systemd 显示
-# active running —— 表面看不出任何异常，实际没人接任务。
+# git 必须以 kazebot 身份跑：root 跑过一次 reset --hard，被改动的文件和新建的目录属主全变 root，
+# 服务以 kazebot 身份再写不动它们，而 supervisor 照常活着，systemd 显示 active running ——
+# 表面看不出任何异常。
 set -euo pipefail
 
 ROOT=/opt/kazebot
@@ -19,9 +19,48 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+# reset --hard 会连本地改动一起抹掉。目标提交不再跟踪的文件，本地改动就是实例自己的配置
+# （配置整个退出 git 的那次升级，config/ 下改过的节点和 runtime 就是这样）：先留一份，
+# 切过去之后放回原处，成为盖在仓库默认上面的那一份。其余改动照旧丢弃，备份留着备查。
+BACKUP="$ROOT/data/deploy-backup/$(date +%Y%m%d-%H%M%S)"
+PRESERVED=()
+
+preserve_local_changes() {
+  local path
+  while IFS= read -r -d '' path; do
+    [[ -f "$ROOT/$path" ]] || continue
+    [[ -d "$BACKUP" ]] || sudo -u "$OWNER" mkdir -p "$BACKUP"
+    (cd "$ROOT" && sudo -u "$OWNER" cp -p --parents -- "$path" "$BACKUP/")
+    PRESERVED+=("$path")
+  done < <(sudo -u "$OWNER" git -C "$ROOT" diff --name-only -z HEAD --)
+  if ((${#PRESERVED[@]})); then
+    echo "[deploy] 本地改过 ${#PRESERVED[@]} 个受跟踪的文件，已备份到 $BACKUP"
+  fi
+}
+
+restore_untracked_changes() {
+  local path
+  # 空数组在老版本 bash 的 set -u 下会被当成未定义。
+  for path in ${PRESERVED[@]+"${PRESERVED[@]}"}; do
+    if sudo -u "$OWNER" git -C "$ROOT" cat-file -e "HEAD:$path" 2>/dev/null; then
+      echo "[deploy] $path 在新版本里仍归仓库管，本地改动没有放回（备份在 $BACKUP/$path）" >&2
+      continue
+    fi
+    if [[ -e "$ROOT/$path" ]]; then
+      echo "[deploy] $path 已经存在，没有覆盖（备份在 $BACKUP/$path）" >&2
+      continue
+    fi
+    sudo -u "$OWNER" mkdir -p "$(dirname "$ROOT/$path")"
+    sudo -u "$OWNER" cp -p -- "$BACKUP/$path" "$ROOT/$path"
+    echo "[deploy] 放回 $path：新版本不再跟踪它，本地改动成为实例自己的配置"
+  done
+}
+
 echo "[deploy] 拉取 ${BRANCH}"
 sudo -u "$OWNER" git -C "$ROOT" fetch --all --prune
+preserve_local_changes
 sudo -u "$OWNER" git -C "$ROOT" reset --hard "$BRANCH"
+restore_untracked_changes
 echo "[deploy] 现在是 $(git -C "$ROOT" log -1 --format='%h %s')"
 
 # 跑的是 /usr/local/lib 里的副本，git 更新的是仓库里那份。拉完自己同步一次，

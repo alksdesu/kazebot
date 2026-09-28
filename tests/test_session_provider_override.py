@@ -144,7 +144,7 @@ def test_provider_override_admin_api_requires_auth_and_persists(tmp_path: Path, 
     app = create_app(
         state=state,
         process_manager=None,
-        config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"),
+        config_store=ConfigStore(path=tmp_path / "config" / "models.yaml", workspace_root=tmp_path),
     )
 
     async def _exercise_api() -> tuple[httpx.Response, httpx.Response, httpx.Response, httpx.Response]:
