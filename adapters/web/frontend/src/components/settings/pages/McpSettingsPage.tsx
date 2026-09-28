@@ -6,6 +6,7 @@
 import { useEffect, useRef, useState } from 'react';
 
 import { getMcpClients, getMcpClientsRaw, updateMcpClientsRaw, type McpClient } from '../../../api/supervisorClient';
+import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
@@ -29,7 +30,7 @@ export const McpSettingsPage = () => {
   const { selectedMcpClient, setSelectedMcpClient } = useSettingsSelectionStore();
   const [clients, setClients] = useState<McpClient[]>([]);
   const [newId, setNewId] = useState('');
-  const [message, setMessage] = useState('');
+  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const mutation = useRef(false);
@@ -44,15 +45,22 @@ export const McpSettingsPage = () => {
       if (version !== generation.current) return;
       setClients(items);
       if (selectedMcpClient && !items.some((item) => item.id === selectedMcpClient.id)) setSelectedMcpClient(null);
+      setLoadError('');
     } catch (error) {
       if (version !== generation.current) return;
-      setMessage(error instanceof Error ? error.message : '加载 MCP 配置失败');
+      setLoadError(error instanceof Error ? error.message : '加载 MCP 配置失败');
     } finally {
       if (version === generation.current) setLoading(false);
     }
   };
 
-  useEffect(() => { void load(); return () => { generation.current += 1; }; }, [adminToken, isAuthenticated]);
+  // Clear the notice only on an explicit refresh: create and delete reload right after writing theirs.
+  const refresh = async () => {
+    clearNotice();
+    await load();
+  };
+
+  useEffect(() => { void refresh(); return () => { generation.current += 1; }; }, [adminToken, isAuthenticated]);
 
   useEffect(() => {
     // [2026-06-02] Refresh parsed MCP list after the right-panel form saves raw YAML.
@@ -113,7 +121,7 @@ export const McpSettingsPage = () => {
     <PageShell authed={isAuthenticated} description="查看 MCP Client 列表，选择后在右栏编辑连接字段和保存。" title="MCP">
       <Block frame="boxed" title="Client 列表" hint="展示 ID、传输方式、启用状态和连接预览。编辑表单位于右栏。">
         <div className="mb-3 flex flex-wrap gap-2">
-          <Button tone="quiet" disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新 MCP'}</Button>
+          <Button tone="quiet" disabled={loading || busy} onClick={() => void refresh()}>{loading ? '正在刷新…' : '刷新 MCP'}</Button>
           <Button tone="danger" disabled={loading || busy || !selectedMcpClient} onClick={remove}>删除选中 Client</Button>
         </div>
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">
@@ -130,7 +138,7 @@ export const McpSettingsPage = () => {
             <Button className="mt-2" disabled={busy || loading || !newId.trim()} onClick={create}>创建 Client</Button>
           </Field>
         </div>
-        <StatusText message={message} />
+        <StatusText message={notice} />
       </Block>
     </PageShell>
   );

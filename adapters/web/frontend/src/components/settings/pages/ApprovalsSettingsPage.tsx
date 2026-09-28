@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { decideApproval, getAdminState, type AdminApproval } from '../../../api/supervisorClient';
+import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { Icon } from '../../common';
@@ -42,7 +43,7 @@ export const ApprovalsSettingsPage = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const { selectedApproval, setSelectedApproval } = useSettingsSelectionStore();
   const [approvals, setApprovals] = useState<AdminApproval[]>([]);
-  const [message, setMessage] = useState('');
+  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const pending = useRef(new Set<string>());
   const [deciding, setDeciding] = useState<string[]>([]);
@@ -50,18 +51,24 @@ export const ApprovalsSettingsPage = () => {
   const load = useCallback(async (showSpinner = true) => {
     if (!adminToken || !isAuthenticated) return;
     if (showSpinner) setLoading(true);
-    setMessage('');
     try {
       const state = await getAdminState(adminToken);
       const pending = state.pending_approvals || [];
       setApprovals(pending);
       if (selectedApproval && !pending.some((item) => item.approval_id === selectedApproval.approval_id)) setSelectedApproval(null);
+      setLoadError('');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '加载审批失败');
+      setLoadError(error instanceof Error ? error.message : '加载审批失败');
     } finally {
       if (showSpinner) setLoading(false);
     }
-  }, [adminToken, isAuthenticated, selectedApproval, setSelectedApproval]);
+  }, [adminToken, isAuthenticated, selectedApproval, setSelectedApproval, setLoadError]);
+
+  // Clear the notice only on an explicit refresh: deciding reloads right after writing its result.
+  const refresh = useCallback(async () => {
+    clearNotice();
+    await load();
+  }, [clearNotice, load]);
 
   useEffect(() => {
     void load();
@@ -90,7 +97,7 @@ export const ApprovalsSettingsPage = () => {
     <PageShell authed={isAuthenticated} description="查看所有会话的待审批项，并对工具或操作请求执行允许或拒绝。" title="审批">
       <Block frame="boxed" title="全局待审批列表" hint="列表来自 /v1/admin/state 的 pending_approvals 字段。">
         <div className="mb-3 flex flex-wrap gap-2">
-          <Button tone="quiet" disabled={loading} onClick={() => load()}>{loading ? '正在刷新…' : '刷新列表'}</Button>
+          <Button tone="quiet" disabled={loading} onClick={() => void refresh()}>{loading ? '正在刷新…' : '刷新列表'}</Button>
         </div>
         {approvals.length === 0 ? (
           <div className="flex items-center gap-2 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-4 text-sm text-[var(--duties-secondary)]">
@@ -138,7 +145,7 @@ export const ApprovalsSettingsPage = () => {
             ))}
           </div>
         )}
-        <StatusText message={message} />
+        <StatusText message={notice} />
       </Block>
     </PageShell>
   );

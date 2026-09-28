@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
+import { usePageNotice } from '../../../hooks/usePageNotice';
 
 import { getNodeFileRaw, getNodeFiles, makeNodeFileExample, updateNodeFileRaw, type NodeFileInfo } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
@@ -16,7 +17,7 @@ const NodeFilesSettingsPageEditor = () => {
   const [selected, setSelected] = useState('');
   const [content, setContent] = useState('');
   const [filter, setFilter] = useState<'all' | 'node' | 'fragment' | 'example'>('all');
-  const [message, setMessage] = useState('');
+  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState('');
@@ -30,9 +31,8 @@ const NodeFilesSettingsPageEditor = () => {
     return file.kind === filter && !file.is_example;
   }), [files, filter]);
 
-  const loadFiles = async (initial = false) => {
+  const loadFiles = async () => {
     if (!adminToken || !isAuthenticated) return;
-    if (!initial && !confirmDiscard()) return;
     const version = ++requestVersion.current;
     setLoading(true); setLoaded(false);
     try {
@@ -45,30 +45,38 @@ const NodeFilesSettingsPageEditor = () => {
       const body = nextSelected ? await getNodeFileRaw(adminToken, nextSelected) : '';
       if (version !== requestVersion.current) return;
       setContent(body); setSaved(body); setLoaded(Boolean(nextSelected));
-      setMessage('');
+      setLoadError('');
     } catch (error) {
       if (version !== requestVersion.current) return;
-      setMessage(error instanceof Error ? error.message : '加载节点文件失败');
+      setLoadError(error instanceof Error ? error.message : '加载节点文件失败');
     } finally {
       if (version === requestVersion.current) setLoading(false);
     }
   };
 
-  useEffect(() => { void loadFiles(true); return () => { ++requestVersion.current; }; }, [adminToken, isAuthenticated]);
+  // 手动刷新才清提示：创建 example 写完结果紧接着就会重读。
+  const refresh = async () => {
+    if (!confirmDiscard()) return;
+    clearNotice();
+    await loadFiles();
+  };
+
+  useEffect(() => { void loadFiles(); return () => { ++requestVersion.current; }; }, [adminToken, isAuthenticated]);
 
   const selectFile = async (filename: string) => {
     if (!adminToken || saving || filename === selected || !confirmDiscard()) return;
     const version = ++requestVersion.current;
     setSelected(filename);
     setContent(''); setSaved(''); setLoading(true); setLoaded(false);
+    // 换了文件，上一份的保存结果和读取失败都跟这份无关。
+    clearNotice();
     try {
       const body = await getNodeFileRaw(adminToken, filename);
       if (version !== requestVersion.current) return;
       setContent(body); setSaved(body); setLoaded(true);
-      setMessage('');
     } catch (error) {
       if (version !== requestVersion.current) return;
-      setMessage(error instanceof Error ? error.message : '读取文件失败');
+      setLoadError(error instanceof Error ? error.message : '读取文件失败');
     } finally {
       if (version === requestVersion.current) setLoading(false);
     }
@@ -94,7 +102,7 @@ const NodeFilesSettingsPageEditor = () => {
     try {
       const result = await makeNodeFileExample(adminToken, selected);
       setMessage(result.created ? `已创建 ${result.path}` : `Example 已存在：${result.path}`);
-      await loadFiles(true);
+      await loadFiles();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '创建 example 失败');
     } finally {
@@ -139,11 +147,11 @@ const NodeFilesSettingsPageEditor = () => {
           value={content}
         />
         <div className="mt-3 flex flex-wrap gap-2">
-          <Button tone="quiet" disabled={loading || saving} onClick={() => void loadFiles()}>{loading ? '正在刷新…' : '刷新列表'}</Button>
+          <Button tone="quiet" disabled={loading || saving} onClick={() => void refresh()}>{loading ? '正在刷新…' : '刷新列表'}</Button>
           <Button disabled={!selected || !loaded || loading || saving || content === saved} onClick={save}>{saving ? '正在保存…' : '保存当前文件'}</Button>
           <Button tone="quiet" disabled={!selected || loading || saving || current?.is_example} onClick={createExample}>从已保存文件创建 Example</Button>
         </div>
-        <StatusText message={message} />
+        <StatusText message={notice} />
       </Block>
     </PageShell>
   );

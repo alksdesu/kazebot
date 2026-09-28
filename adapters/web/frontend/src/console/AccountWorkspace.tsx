@@ -29,6 +29,7 @@ import { Block, Button, Empty, Facts, Input, Panel, Pre } from './components';
 import { nameBetween } from './format';
 import { InstanceLink, InstanceSwitch } from './InstanceSwitch';
 import { usePlatform } from './platformContext';
+import { usePageNotice } from '../hooks/usePageNotice';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useRequestScope } from '../features/asyncState';
 
@@ -222,12 +223,12 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
   const [status, setStatus] = useState<AccountStatus | null>(null);
   const [stage, setStage] = useState<Stage>('idle');
   const [qrImage, setQrImage] = useState('');
-  const [note, setNote] = useState('正在读取…');
+  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const stageStartedAt = useRef(0);
 
-  const refresh = useCallback(async (): Promise<AccountStatus | null> => {
+  const load = useCallback(async (): Promise<AccountStatus | null> => {
     if (!isCurrent()) return null;
     const request = ++refreshSequence.current;
     setLoading(true);
@@ -235,21 +236,27 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
       const next = await getPlatformAccount(token, platformId);
       if (!isCurrent() || request !== refreshSequence.current) return null;
       setStatus(next);
-      setNote('');
+      setLoadError('');
       return next;
     } catch (error) {
       // 只有网络层或鉴权失败才到这里。NapCat 没起来是正常响应，由 reachable 表达。
-      if (isCurrent() && request === refreshSequence.current) setNote(say(error));
+      if (isCurrent() && request === refreshSequence.current) setLoadError(say(error));
       return null;
     } finally {
       if (isCurrent() && request === refreshSequence.current) setLoading(false);
     }
-  }, [token, platformId]);
+  }, [token, platformId, setLoadError]);
+
+  // 只有手动刷新清提示：换号失败后那次重读、扫码阶段的轮询都不能冲掉刚写下的原因和进展。
+  const refresh = async () => {
+    clearNotice();
+    await load();
+  };
 
   useEffect(() => {
-    void refresh();
+    void load();
     return () => { refreshSequence.current++; };
-  }, [refresh]);
+  }, [load]);
 
   // 没登录上就一直盯着：等容器应答、等二维码、等扫码结果。首次部署进页面就是
   // 这个状态，早先只在换号时才轮询，于是第一次进来只能靠人反复手点。
@@ -266,14 +273,14 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
         try {
           if (stage !== 'idle' && Date.now() - stageStartedAt.current > RESTART_TIMEOUT_MS) {
             setStage('idle');
-            setNote('等待超时。NapCat 可能没起来，去服务器上看看容器状态。');
+            setMessage('等待超时。NapCat 可能没起来，去服务器上看看容器状态。');
             return;
           }
-          const next = await refresh();
+          const next = await load();
           if (!alive || !isCurrent() || !next) return;
 
           if (next.reachable === false) {
-            setNote('NapCat 还没应答，等它起来…');
+            setMessage('NapCat 还没应答，等它起来…');
             return;
           }
 
@@ -282,9 +289,9 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
             setStage('idle');
             try {
               await pinPlatformAccount(token, platformId);
-              if (isCurrent()) setNote(`已登录 ${next.nick || next.account}，并设为重启后自动登录。`);
+              if (isCurrent()) setMessage(`已登录 ${next.nick || next.account}，并设为重启后自动登录。`);
             } catch (error) {
-              if (isCurrent()) setNote(`已登录 ${next.nick || next.account}，但设置自动登录失败：${say(error)}`);
+              if (isCurrent()) setMessage(`已登录 ${next.nick || next.account}，但设置自动登录失败：${say(error)}`);
             }
             return;
           }
@@ -298,16 +305,16 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
               if (!alive || !isCurrent()) return;
               setQrImage(image);
               setStage('scanning');
-              setNote('用要登录的那个 QQ 扫码。二维码会过期，过期就点一下「刷新二维码」。');
+              setMessage('用要登录的那个 QQ 扫码。二维码会过期，过期就点一下「刷新二维码」。');
             } catch (error) {
-              if (alive && isCurrent()) setNote(say(error));
+              if (alive && isCurrent()) setMessage(say(error));
             }
           }
         } finally { polling = false; }
       })();
     }, POLL_MS);
     return () => { alive = false; window.clearInterval(timer); };
-  }, [stage, token, platformId, qrImage, refresh, watching]);
+  }, [stage, token, platformId, qrImage, load, watching]);
 
   const startRelogin = async () => {
     if (!isCurrent() || mutation.current || stage !== 'idle' || !status?.configured) return;
@@ -322,14 +329,14 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
     if (!isCurrent()) return;
     mutation.current = true; refreshSequence.current++; setLoading(false); setBusy(true);
     setQrImage('');
-    setNote('正在重启 NapCat…');
+    setMessage('正在重启 NapCat…');
     try {
       await enterPlatformLoginMode(token, platformId);
       if (!isCurrent()) return;
       stageStartedAt.current = Date.now();
       setStage('restarting');
     } catch (error) {
-      if (isCurrent()) setNote(say(error));
+      if (isCurrent()) setMessage(say(error));
     } finally {
       mutation.current = false;
       if (isCurrent()) setBusy(false);
@@ -347,12 +354,12 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
       if (!isCurrent()) return;
       stageStartedAt.current = Date.now();
       setStage('restarting');
-      setNote('已请求切换，等它上线…');
+      setMessage('已请求切换，等它上线…');
     } catch (error) {
       if (!isCurrent()) return;
-      setNote(say(error));
+      setMessage(say(error));
       // 切失败会把这个号记成死号，刷一次列表让它立刻置灰。
-      void refresh();
+      void load();
     } finally {
       mutation.current = false;
       if (isCurrent()) setBusy(false);
@@ -368,10 +375,10 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
       const image = qrcode ? await QRCode.toDataURL(qrcode, { width: 240, margin: 1 }) : '';
       if (!isCurrent()) return;
       setQrImage(image);
-      if (qrcode) setNote('');
-      else setNote(reachable ? '拿不到二维码，可能已经登录上了。' : 'NapCat 还没应答，等它起来…');
+      if (qrcode) setMessage('');
+      else setMessage(reachable ? '拿不到二维码，可能已经登录上了。' : 'NapCat 还没应答，等它起来…');
     } catch (error) {
-      if (isCurrent()) setNote(say(error));
+      if (isCurrent()) setMessage(say(error));
     } finally {
       mutation.current = false;
       if (isCurrent()) setBusy(false);
@@ -422,7 +429,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
               </div>
             </>
           ) : (
-            <Facts>{note || '正在读取…'}</Facts>
+            <Facts>{notice || '正在读取…'}</Facts>
           )}
           <div className={ROW}>
             <span className={LABEL} />
@@ -451,7 +458,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
                 <Facts>扫完不用管，这一页会自己确认登录结果。</Facts>
               </>
             ) : (
-              <Facts>{note || '等 NapCat 起来…'}</Facts>
+              <Facts>{notice || '等 NapCat 起来…'}</Facts>
             )}
             <div className={ROW}>
               <span className={LABEL} />
@@ -462,7 +469,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
                 <Button
                   className="flex-none"
                   disabled={busy}
-                  onClick={() => { setStage('idle'); setQrImage(''); setNote(''); }}
+                  onClick={() => { setStage('idle'); setQrImage(''); setMessage(''); }}
                   tone="halt"
                 >
                   停止等待
@@ -539,7 +546,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
 
       {!ownershipReady && status?.quick_login?.length ? <Facts>实例归属尚未确认，请先刷新实例列表后再快速登录。</Facts> : null}
 
-      {note && status && <Facts>{note}</Facts>}
+      {notice && status && <Facts>{notice}</Facts>}
     </>
   );
 };

@@ -14,6 +14,7 @@ import {
   type RuntimeStatus,
   type WorkerHealth,
 } from '../../../api/supervisorClient';
+import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { Block, Button, Empty, Facts, Footnote, List, PageShell, Pip, Row, StatusText } from './settingsControls';
 
@@ -219,34 +220,36 @@ const LogViewer = ({ token }: { token: string }) => {
 export const RuntimeSettingsPage = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
-  const [note, setNote] = useState('');
+  const { notice, setMessage, setLoadError } = usePageNotice();
   const [retrying, setRetrying] = useState(false);
 
-  const refresh = useCallback(async () => {
+  // 轮询只动读取那一半提示：重试失败的原因要留到下一次重试，不能五秒后就被冲掉。
+  const load = useCallback(async () => {
     if (!adminToken) return;
     try {
       setStatus(await getRuntimeStatus(adminToken));
-      setNote('');
+      setLoadError('');
     } catch (error) {
-      setNote(say(error));
+      setLoadError(say(error));
     }
-  }, [adminToken]);
+  }, [adminToken, setLoadError]);
 
   useEffect(() => {
     if (!adminToken) return;
-    void refresh();
-    const timer = setInterval(() => void refresh(), POLL_MS);
+    void load();
+    const timer = setInterval(() => void load(), POLL_MS);
     return () => clearInterval(timer);
-  }, [adminToken, refresh]);
+  }, [adminToken, load]);
 
   const onRetry = async () => {
     if (!adminToken) return;
     setRetrying(true);
+    setMessage('');
     try {
       await retryEngine(adminToken);
-      await refresh();
+      await load();
     } catch (error) {
-      setNote(say(error));
+      setMessage(say(error));
     } finally {
       setRetrying(false);
     }
@@ -283,7 +286,7 @@ export const RuntimeSettingsPage = () => {
               任务队列：等待 {status.tasks.queued} 个，执行中 {status.tasks.running} 个。
             </Facts>
           )}
-          <StatusText message={note} />
+          <StatusText message={notice} />
         </Block>
 
         {adminToken && <LogViewer token={adminToken} />}

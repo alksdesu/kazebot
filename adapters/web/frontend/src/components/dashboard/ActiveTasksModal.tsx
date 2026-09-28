@@ -5,6 +5,7 @@
 import { useEffect, useState } from 'react';
 
 import { cancelTask, fetchActiveTasks, type ActiveTask } from '../../api/supervisorClient';
+import { usePageNotice } from '../../hooks/usePageNotice';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useChatStore, type TaskActivity } from '../../store/chatStore';
 import { useViewStore } from '../../store/viewStore';
@@ -99,9 +100,12 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
   const taskActivities = useChatStore(state => state.taskActivities);
   const [tasks, setTasks] = useState<ActiveTask[]>([]);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
+  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [refreshTick, setRefreshTick] = useState(0);
   const [cancellingTaskIds, setCancellingTaskIds] = useState<Record<string, boolean>>({});
+
+  // Reopening starts a fresh look: a cancel failure from the last round should not linger.
+  useEffect(() => { if (open) clearNotice(); }, [open, clearNotice]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -111,7 +115,7 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
       if (!adminToken) {
         if (!cancelled) {
           setTasks([]);
-          setError('需要管理员令牌才能读取活跃任务。');
+          setLoadError('需要管理员令牌才能读取活跃任务。');
           setLoading(false);
         }
         return;
@@ -122,11 +126,11 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
         const nextTasks = await fetchActiveTasks(adminToken);
         if (!cancelled) {
           setTasks(nextTasks);
-          setError('');
+          setLoadError('');
         }
       } catch (loadError) {
         if (!cancelled) {
-          setError(loadError instanceof Error ? loadError.message : '活跃任务刷新失败。');
+          setLoadError(loadError instanceof Error ? loadError.message : '活跃任务刷新失败。');
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -148,11 +152,12 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
     // call the precise cancel endpoint, then trigger an immediate list refresh.
     // Purpose: users get fast feedback and cannot double-submit the same task cancel.
     setCancellingTaskIds(current => ({ ...current, [task.task_id]: true }));
+    setMessage('');
     try {
       await cancelTask(adminToken, task.task_id);
       setRefreshTick(value => value + 1);
     } catch (cancelError) {
-      setError(cancelError instanceof Error ? cancelError.message : '任务取消失败。');
+      setMessage(cancelError instanceof Error ? cancelError.message : '任务取消失败。');
     } finally {
       setCancellingTaskIds(current => {
         const next = { ...current };
@@ -172,9 +177,9 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
       title="活跃任务详情"
     >
       <div className="p-3">
-        {error && (
+        {notice && (
           <div className="mb-3 border border-orange-200 bg-orange-50 px-2.5 py-2 text-[0.65rem] text-orange-700">
-            {error}
+            {notice}
           </div>
         )}
 

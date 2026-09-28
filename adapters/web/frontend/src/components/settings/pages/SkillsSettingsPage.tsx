@@ -8,6 +8,7 @@ import { useExclusiveAction } from '../../../hooks/useExclusiveAction';
 import { useEffect, useState } from 'react';
 
 import { createSkill, deleteSkill, getSkills, type AdminSkill } from '../../../api/supervisorClient';
+import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
@@ -29,7 +30,7 @@ export const SkillsSettingsPage = () => {
   const { selectedSkill, setSelectedSkill } = useSettingsSelectionStore();
   const [skills, setSkills] = useState<AdminSkill[]>([]);
   const [newName, setNewName] = useState('');
-  const [message, setMessage] = useState('');
+  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const { busy, run } = useExclusiveAction();
 
@@ -40,15 +41,21 @@ export const SkillsSettingsPage = () => {
       const items = await getSkills(adminToken);
       setSkills(items);
       if (selectedSkill && !items.some((item) => item.name === selectedSkill.name)) setSelectedSkill(null);
-      setMessage('');
+      setLoadError('');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '加载技能失败');
+      setLoadError(error instanceof Error ? error.message : '加载技能失败');
     } finally {
       setLoading(false);
     }
   };
 
-  useEffect(() => { void load(); }, [adminToken, isAuthenticated]);
+  // Clear the notice only on an explicit refresh: create and delete reload right after writing theirs.
+  const refresh = async () => {
+    clearNotice();
+    await load();
+  };
+
+  useEffect(() => { void refresh(); }, [adminToken, isAuthenticated]);
 
   useEffect(() => {
     // [2026-06-02] Refresh parsed skill metadata after the right-panel editor saves.
@@ -92,7 +99,7 @@ export const SkillsSettingsPage = () => {
     <PageShell authed={isAuthenticated} description="管理 skills 目录下的 SKILL.md 文件。选择技能后，请在右栏编辑 frontmatter 和 Markdown 正文。" title="技能管理">
       <Block frame="boxed" title="技能列表" hint="列表展示技能名称、启用状态、策略和关键词预览。编辑器位于右栏。">
         <div className="mb-3 flex flex-wrap gap-2">
-          <Button tone="quiet" disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新技能'}</Button>
+          <Button tone="quiet" disabled={loading || busy} onClick={() => void refresh()}>{loading ? '正在刷新…' : '刷新技能'}</Button>
           <Button tone="danger" disabled={busy || !selectedSkill} onClick={remove}>删除选中技能</Button>
         </div>
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">
@@ -110,7 +117,7 @@ export const SkillsSettingsPage = () => {
             <Button className="mt-2" disabled={busy} onClick={create}>创建技能</Button>
           </Field>
         </div>
-        <StatusText message={message} />
+        <StatusText message={notice} />
       </Block>
     </PageShell>
   );

@@ -5,6 +5,7 @@ import { useExclusiveAction } from '../../../hooks/useExclusiveAction';
 import { useEffect, useState } from 'react';
 
 import { createTool, deleteTool, getTools, reloadTools, type AdminTool } from '../../../api/supervisorClient';
+import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
@@ -50,7 +51,7 @@ const ToolInventorySection = () => {
   const { selectedTool, setAllToolNames, setSelectedTool } = useSettingsSelectionStore();
   const [tools, setTools] = useState<AdminTool[]>([]);
   const [newName, setNewName] = useState('');
-  const [message, setMessage] = useState('');
+  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const { busy, run } = useExclusiveAction();
   const [query, setQuery] = useState('');
@@ -65,15 +66,21 @@ const ToolInventorySection = () => {
       setTools(items);
       setAllToolNames(items.map((item) => item.name));
       if (selectedTool && !items.some((item) => item.name === selectedTool.name)) setSelectedTool(null);
-      setMessage('');
+      setLoadError('');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '加载工具失败');
+      setLoadError(error instanceof Error ? error.message : '加载工具失败');
     } finally {
       setLoading(false);
     }
   };
 
-  useEffect(() => { void load(); }, [adminToken, isAuthenticated]);
+  // 只在手动刷新时清提示：新建、删除、重载写完提示紧接着就会重读。
+  const refresh = async () => {
+    clearNotice();
+    await load();
+  };
+
+  useEffect(() => { void refresh(); }, [adminToken, isAuthenticated]);
 
   useEffect(() => {
     // [2026-06-02] Let the right-panel editor refresh parsed tool metadata after save.
@@ -140,7 +147,7 @@ const ToolInventorySection = () => {
     >
       <>
           <div className="mb-3 flex flex-wrap gap-2">
-            <Button tone="quiet" disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新工具'}</Button>
+            <Button tone="quiet" disabled={loading || busy} onClick={() => void refresh()}>{loading ? '正在刷新…' : '刷新工具'}</Button>
             <Button disabled={busy} onClick={reload}>重载工具</Button>
             <Button tone="danger" disabled={busy || !selectedTool?.editable} onClick={remove}>删除选中工具</Button>
           </div>
@@ -202,7 +209,7 @@ const ToolInventorySection = () => {
               <Button className="mt-2" disabled={busy} onClick={create}>创建工具</Button>
             </Field>
           </div>
-          <StatusText message={message} />
+          <StatusText message={notice} />
       </>
     </Block>
   );

@@ -1,9 +1,10 @@
 // 运行诊断页。engine 崩了 supervisor 照样活着，这一页是唯一看得出来的地方，
 // 所以最要紧的是「挂了要看得出来是挂了」，不能显示成空白或正常。
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  checkHealth,
   getRuntimeStatus,
   listLogFiles,
   readLogTail,
@@ -14,6 +15,7 @@ import { useSettingsStore } from '../store/settingsStore';
 
 vi.mock('../api/supervisorClient', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../api/supervisorClient')>()),
+  checkHealth: vi.fn(),
   getRuntimeStatus: vi.fn(),
   listLogFiles: vi.fn(),
   readLogTail: vi.fn(),
@@ -38,6 +40,7 @@ const status = (over: Record<string, unknown> = {}) => ({
 beforeEach(() => {
   vi.clearAllMocks();
   useSettingsStore.setState({ adminToken: 'admin-token', isAuthenticated: true });
+  vi.mocked(checkHealth).mockResolvedValue({ status: 'ok', uptime_seconds: 3600 } as any);
   vi.mocked(getRuntimeStatus).mockResolvedValue(status() as any);
   vi.mocked(listLogFiles).mockResolvedValue([
     { name: 'supervisor.log', size: 28990, modified: 1000 },
@@ -46,6 +49,8 @@ beforeEach(() => {
   vi.mocked(readLogTail).mockResolvedValue({ text: '[engine] worker ready', truncated: false });
   vi.mocked(retryEngine).mockResolvedValue(undefined);
 });
+
+afterEach(() => { vi.useRealTimers(); });
 
 const rowFor = (name: string) =>
   screen.getAllByText(name).map((node) => node.parentElement!).find(Boolean)!;
@@ -91,16 +96,16 @@ describe('worker 状态', () => {
   });
 });
 
-describe('停止重试之后', () => {
-  const givenUp = () => status({
-    workers: {
-      'engine-1': worker({
-        alive: false, pid: null, given_up: true, failures: 5, last_exit_code: 13,
-        last_log: 'PermissionError: /opt/kazebot/tools/__init__.py',
-      }),
-    },
-  });
+const givenUp = () => status({
+  workers: {
+    'engine-1': worker({
+      alive: false, pid: null, given_up: true, failures: 5, last_exit_code: 13,
+      last_log: 'PermissionError: /opt/kazebot/tools/__init__.py',
+    }),
+  },
+});
 
+describe('停止重试之后', () => {
   it('置顶一条，把最后那次的原因摆出来', async () => {
     vi.mocked(getRuntimeStatus).mockResolvedValue(givenUp() as any);
     render(<RuntimeSettingsPage />);
@@ -126,6 +131,75 @@ describe('停止重试之后', () => {
     await screen.findByText('engine-1');
 
     expect(screen.queryByRole('button', { name: '手动重试' })).toBeNull();
+  });
+});
+
+describe('提示的去留', () => {
+  const mount = async () => {
+    // 轮询在 mount 时就挂上了，假定时器得先于 render 接管才推得动它。
+    vi.useFakeTimers();
+    await act(async () => { render(<RuntimeSettingsPage />); });
+  };
+  const tick = () => act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+
+  it('重试失败的原因熬得过一轮轮询', async () => {
+    vi.mocked(getRuntimeStatus).mockResolvedValue(givenUp() as any);
+    vi.mocked(retryEngine).mockRejectedValue(new Error('拉不起来：端口 8770 被占用'));
+    await mount();
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '手动重试' })); });
+    expect(screen.getByText('拉不起来：端口 8770 被占用')).toBeInTheDocument();
+
+    await tick();
+    expect(getRuntimeStatus).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('拉不起来：端口 8770 被占用')).toBeInTheDocument();
+  });
+
+  it('再点一次重试，开头就把上一次的原因抹掉', async () => {
+    let unblock!: () => void;
+    const pending = new Promise<void>((resolve) => { unblock = resolve; });
+    vi.mocked(getRuntimeStatus).mockResolvedValue(givenUp() as any);
+    vi.mocked(retryEngine)
+      .mockRejectedValueOnce(new Error('拉不起来：端口 8770 被占用'))
+      .mockReturnValueOnce(pending);
+    await mount();
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '手动重试' })); });
+    expect(screen.getByText('拉不起来：端口 8770 被占用')).toBeInTheDocument();
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '手动重试' })); });
+    expect(screen.queryByText('拉不起来：端口 8770 被占用')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '正在重试…' })).toBeDisabled();
+
+    await act(async () => { unblock(); });
+  });
+
+  it('轮询失败的原因在下一次轮询成功后消失', async () => {
+    vi.mocked(getRuntimeStatus)
+      .mockResolvedValueOnce(status() as any)
+      .mockRejectedValueOnce(new Error('502 Bad Gateway'))
+      .mockResolvedValue(status() as any);
+    await mount();
+    expect(screen.queryByText('502 Bad Gateway')).not.toBeInTheDocument();
+
+    await tick();
+    expect(screen.getByText('502 Bad Gateway')).toBeInTheDocument();
+
+    await tick();
+    expect(screen.queryByText('502 Bad Gateway')).not.toBeInTheDocument();
+  });
+
+  it('重试失败后轮询也失败，两句都在', async () => {
+    vi.mocked(getRuntimeStatus)
+      .mockResolvedValueOnce(givenUp() as any)
+      .mockRejectedValue(new Error('502 Bad Gateway'));
+    vi.mocked(retryEngine).mockRejectedValue(new Error('拉不起来：端口 8770 被占用'));
+    await mount();
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '手动重试' })); });
+    await tick();
+
+    expect(screen.getByText('拉不起来：端口 8770 被占用。502 Bad Gateway')).toBeInTheDocument();
   });
 });
 

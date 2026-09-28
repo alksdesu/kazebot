@@ -2,7 +2,7 @@
 //
 // 界面读到的是脱敏视图 —— 内联密钥只回来一个星号串，手写进 yaml 的键根本看不见。
 // 所以每条都带上原始位置提交，由后端按条目合并；留空的密钥表示不改，不是清空。
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 
 import {
   channelChoices,
@@ -224,7 +224,9 @@ export const FallbackChain = ({
 }) => {
   const token = useSettingsStore((state) => state.adminToken);
   const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState('');
+  // 提示记着是写给哪条链的：换了节点就不显示，保存后数据重读也冲不掉。
+  const [note, setNote] = useState({ scope, text: '' });
+  const noteText = note.scope === scope ? note.text : '';
 
   const { channels, wires } = useMemo(() => channelChoices(data), [data]);
   // 新建的一条默认指向第一个已配渠道 —— 那才是马上能用的，裸线格式还得再填地址密钥。
@@ -238,8 +240,6 @@ export const FallbackChain = ({
   const [editor, setEditor] = useState(() => ({ source: stored, drafts: stored.map(toDraft) }));
   const drafts = editor.source === stored ? editor.drafts : stored.map(toDraft);
   const setDrafts = (next: Draft[]) => setEditor({ source: stored, drafts: next });
-
-  useEffect(() => { setNote(''); }, [stored]);
 
   const dirty = !sameChain(drafts, stored);
   const confirmDiscard = useUnsavedChanges(dirty || busy, '备选链还有未保存修改或保存进行中，确定切换或重置吗？');
@@ -261,9 +261,9 @@ export const FallbackChain = ({
     setBusy(true);
     try {
       onSaved(await action(token));
-      setNote(done);
+      setNote({ scope, text: done });
     } catch (error) {
-      setNote(say(error));
+      setNote({ scope, text: say(error) });
     }
     setBusy(false);
   };
@@ -338,7 +338,7 @@ export const FallbackChain = ({
             busy={busy}
             dirty={dirty}
             label="保存备选链"
-            note={note}
+            note={noteText}
             onReset={() => { if (confirmDiscard()) setDrafts(stored.map(toDraft)); }}
             onSave={() => void save()}
           />

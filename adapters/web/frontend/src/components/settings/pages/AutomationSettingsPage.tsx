@@ -6,6 +6,7 @@
 import { useEffect, useRef, useState } from 'react';
 
 import { getSchedulesRaw, updateSchedulesRaw } from '../../../api/supervisorClient';
+import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
@@ -29,7 +30,7 @@ export const AutomationSettingsPage = () => {
   const { selectedScheduleId, setSelectedScheduleId } = useSettingsSelectionStore();
   const [schedules, setSchedules] = useState<ScheduleFormState[]>([]);
   const [newId, setNewId] = useState('');
-  const [message, setMessage] = useState('');
+  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const mutation = useRef(false);
@@ -44,15 +45,22 @@ export const AutomationSettingsPage = () => {
       if (version !== generation.current) return;
       setSchedules(parsed);
       if (selectedScheduleId && !parsed.some((schedule) => schedule.id === selectedScheduleId)) setSelectedScheduleId(null);
+      setLoadError('');
     } catch (error) {
       if (version !== generation.current) return;
-      setMessage(error instanceof Error ? error.message : '加载定时任务失败');
+      setLoadError(error instanceof Error ? error.message : '加载定时任务失败');
     } finally {
       if (version === generation.current) setLoading(false);
     }
   };
 
-  useEffect(() => { void load(); return () => { generation.current += 1; }; }, [adminToken, isAuthenticated]);
+  // Clear the notice only on an explicit refresh: create and delete reload right after writing theirs.
+  const refresh = async () => {
+    clearNotice();
+    await load();
+  };
+
+  useEffect(() => { void refresh(); return () => { generation.current += 1; }; }, [adminToken, isAuthenticated]);
 
   useEffect(() => {
     // [2026-06-02] Refresh schedule rows after the right-panel form saves. Why: the
@@ -107,7 +115,7 @@ export const AutomationSettingsPage = () => {
     <PageShell authed={isAuthenticated} description="查看 data/schedules.yaml 中的定时任务。cron 时间按 UTC 解释，选择任务后在右栏编辑字段。" title="自动化">
       <Block frame="boxed" title="定时任务列表" hint="每项显示 ID、cron、类型、启用状态和 text 预览。字段表单与 Raw YAML fallback 位于右栏。">
         <div className="mb-3 flex flex-wrap gap-2">
-          <Button tone="quiet" disabled={loading || busy} onClick={load}>{loading ? '正在刷新…' : '刷新'}</Button>
+          <Button tone="quiet" disabled={loading || busy} onClick={() => void refresh()}>{loading ? '正在刷新…' : '刷新'}</Button>
           <Button tone="danger" disabled={loading || busy || !selectedScheduleId} onClick={remove}>删除选中任务</Button>
         </div>
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">
@@ -125,7 +133,7 @@ export const AutomationSettingsPage = () => {
             <Button className="mt-2" disabled={busy || loading || !newId.trim()} onClick={create}>创建任务</Button>
           </Field>
         </div>
-        <StatusText message={message} />
+        <StatusText message={notice} />
       </Block>
     </PageShell>
   );

@@ -258,6 +258,50 @@ describe('备选链', () => {
   });
 });
 
+describe('保存之后的那一句', () => {
+  const SAVED = '已保存。下一次主渠道失败就按这条链往下试。';
+
+  it('保存成功那句不会被重读回来的数据冲掉', async () => {
+    const saved = structuredClone(PROVIDERS);
+    saved.fallbacks[1].model = 'backup-v2';
+    saved.fallbacks[1].model_raw = 'backup-v2';
+    vi.mocked(updateFallbacks).mockResolvedValue(saved as any);
+    render(<ModelsPage />);
+    await ready();
+    fireEvent.change(within(rows()[1]).getByLabelText('模型'), { target: { value: 'backup-v2' } });
+    saveChain();
+
+    expect(await screen.findByText(SAVED)).toBeInTheDocument();
+    // 存完这一版就是最新的，没有未保存修改了。
+    expect(screen.getByRole('button', { name: '保存备选链' })).toBeDisabled();
+  });
+
+  it('保存失败那句同样留得住', async () => {
+    vi.mocked(updateFallbacks).mockRejectedValue(new Error('写配置失败：磁盘只读'));
+    render(<ModelsPage />);
+    await ready();
+    fireEvent.change(within(rows()[1]).getByLabelText('模型'), { target: { value: 'backup-v2' } });
+    saveChain();
+
+    expect(await screen.findByText('写配置失败：磁盘只读')).toBeInTheDocument();
+  });
+
+  it('换一条链就不再显示上一条链的提示', async () => {
+    const data = structuredClone(PROVIDERS) as any;
+    data.node_fallbacks['qq.chat'] = [structuredClone(PROVIDERS.fallbacks[0])];
+    const props = { catalog: CATALOG as any, data, onSaved: vi.fn() };
+    const { rerender } = render(<FallbackChain {...props} scope={null} />);
+    fireEvent.change(within(rows()[1]).getByLabelText('模型'), { target: { value: 'backup-v2' } });
+    saveChain();
+    expect(await screen.findByText(SAVED)).toBeInTheDocument();
+
+    rerender(<FallbackChain {...props} scope="qq.chat" />);
+
+    expect(screen.getByRole('button', { name: '保存备选链' })).toBeInTheDocument();
+    expect(screen.queryByText(SAVED)).not.toBeInTheDocument();
+  });
+});
+
 describe('按节点的备选链', () => {
   const openNode = async (id: string) => {
     render(<ModelsPage />);

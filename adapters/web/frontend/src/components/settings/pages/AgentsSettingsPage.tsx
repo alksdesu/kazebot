@@ -1,5 +1,6 @@
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
 import { useExclusiveAction } from '../../../hooks/useExclusiveAction';
+import { usePageNotice } from '../../../hooks/usePageNotice';
 // [2026-06-02] Agent and node management settings page.
 // Why: node YAML files are core runtime assets and need a first-class editor. How:
 // list configured nodes, support template-based creation and deletion, and keep the
@@ -33,7 +34,7 @@ export const AgentsSettingsPage = () => {
   const [nodes, setNodes] = useState<AdminNode[]>([]);
   const [newId, setNewId] = useState('');
   const [template, setTemplate] = useState('ai');
-  const [message, setMessage] = useState('');
+  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const { busy, run } = useExclusiveAction();
 
@@ -44,15 +45,21 @@ export const AgentsSettingsPage = () => {
       const items = await getNodes(adminToken);
       setNodes(items);
       if (selectedNode && !items.some((item) => item.id === selectedNode.id)) setSelectedNode(null);
-      setMessage('');
+      setLoadError('');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '加载节点失败');
+      setLoadError(error instanceof Error ? error.message : '加载节点失败');
     } finally {
       setLoading(false);
     }
   };
 
-  useEffect(() => { void loadNodes(); }, [adminToken, isAuthenticated]);
+  // Clear the notice only on an explicit refresh: create and delete reload right after writing theirs.
+  const refresh = async () => {
+    clearNotice();
+    await loadNodes();
+  };
+
+  useEffect(() => { void refresh(); }, [adminToken, isAuthenticated]);
 
   useEffect(() => {
     // [2026-06-02] Refresh the list after the right panel saves raw YAML. Why: the
@@ -96,7 +103,7 @@ export const AgentsSettingsPage = () => {
     <PageShell authed={isAuthenticated} description="查看、创建和删除节点配置文件。选择节点后，请在右侧面板编辑对应 YAML。" title="节点管理">
       <Block frame="boxed" title="节点列表" hint="中间区域只负责列表和操作，节点 YAML 编辑器显示在右栏。">
         <div className="mb-3 flex flex-wrap gap-2">
-          <Button tone="quiet" disabled={loading || busy} onClick={loadNodes}>{loading ? '正在刷新…' : '刷新节点'}</Button>
+          <Button tone="quiet" disabled={loading || busy} onClick={() => void refresh()}>{loading ? '正在刷新…' : '刷新节点'}</Button>
           <Button tone="danger" disabled={busy || !selectedNode} onClick={remove}>删除选中节点</Button>
         </div>
         <div className="max-h-[var(--duties-pane-height-tall)] space-y-2 overflow-y-auto">
@@ -131,7 +138,7 @@ export const AgentsSettingsPage = () => {
             <Button className="mt-2" disabled={busy} onClick={create}>创建节点</Button>
           </Field>
         </div>
-        <StatusText message={message} />
+        <StatusText message={notice} />
       </Block>
     </PageShell>
   );

@@ -1,4 +1,5 @@
 import { useExclusiveAction } from '../../../hooks/useExclusiveAction';
+import { usePageNotice } from '../../../hooks/usePageNotice';
 // [2026-06-02] System settings page for Supervisor status and runtime controls.
 // Why: operators need one tab for health, admin state, config reload, and engine
 // restart. How: combine existing health/admin endpoints with guarded action buttons
@@ -33,7 +34,7 @@ export const SystemSettingsPage = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const [adminState, setAdminState] = useState<AdminState | null>(null);
   const [health, setHealth] = useState<HealthState | null>(null);
-  const [message, setMessage] = useState('');
+  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const { busy, run } = useExclusiveAction();
   const [activeTasksOpen, setActiveTasksOpen] = useState(false);
@@ -43,22 +44,28 @@ export const SystemSettingsPage = () => {
   const report = useCallback((text: string) => {
     setMessage(text);
     addSystemLog(text);
-  }, [addSystemLog]);
+  }, [addSystemLog, setMessage]);
 
   const load = useCallback(async (showSpinner = true) => {
     if (!adminToken || !isAuthenticated) return;
     if (showSpinner) setLoading(true);
-    setMessage('');
     try {
       const [state, healthState] = await Promise.all([getAdminState(adminToken), checkHealth()]);
       setAdminState(state);
       setHealth(healthState);
+      setLoadError('');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '加载系统状态失败');
+      setLoadError(error instanceof Error ? error.message : '加载系统状态失败');
     } finally {
       if (showSpinner) setLoading(false);
     }
-  }, [adminToken, isAuthenticated]);
+  }, [adminToken, isAuthenticated, setLoadError]);
+
+  // 手动刷新才清提示：重载配置写完结果紧接着就会重读。
+  const refresh = useCallback(async () => {
+    clearNotice();
+    await load();
+  }, [clearNotice, load]);
 
   useEffect(() => {
     void load();
@@ -119,7 +126,7 @@ export const SystemSettingsPage = () => {
             <p><span className="text-[var(--duties-tertiary)]">Engine worker：</span><span className="font-mono">{engineInfo}</span></p>
           </div>
           <div className="mt-3 flex flex-wrap gap-2">
-            <Button tone="quiet" disabled={loading || busy} onClick={() => load()}>{loading ? '正在刷新…' : '刷新状态'}</Button>
+            <Button tone="quiet" disabled={loading || busy} onClick={() => void refresh()}>{loading ? '正在刷新…' : '刷新状态'}</Button>
           </div>
         </Block>
 
@@ -130,7 +137,7 @@ export const SystemSettingsPage = () => {
             <Button disabled={busy} onClick={handleReload}>重载配置</Button>
             <Button tone="danger" disabled={busy} onClick={handleRestart}>重启引擎</Button>
           </div>
-          <StatusText message={message} />
+          <StatusText message={notice} />
         </Block>
       </>
     </PageShell>
