@@ -226,6 +226,8 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
   const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  // 点过「停止等待」或等重启超时之后就不再自己盯着，等手动刷新、换号或快速切换再接着看。
+  const [paused, setPaused] = useState(false);
   const stageStartedAt = useRef(0);
 
   const load = useCallback(async (): Promise<AccountStatus | null> => {
@@ -249,6 +251,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
 
   // 只有手动刷新清提示：换号失败后那次重读、扫码阶段的轮询都不能冲掉刚写下的原因和进展。
   const refresh = async () => {
+    setPaused(false);
     clearNotice();
     await load();
   };
@@ -263,19 +266,25 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
   const watching = status?.configured === true && (status.reachable === false || !status.is_login);
 
   useEffect(() => {
-    if (!token || (stage === 'idle' && !watching)) return undefined;
+    if (!token || paused || (stage === 'idle' && !watching)) return undefined;
     let alive = true;
     let polling = false;
     const timer = window.setInterval(() => {
       void (async () => {
-        if (!alive || !isCurrent() || polling || mutation.current) return;
+        if (!alive || !isCurrent() || mutation.current) return;
+        // 只给重启计时：到了扫码这一步 NapCat 已经起来了，扫多久都不算超时。
+        if (stage === 'restarting' && Date.now() - stageStartedAt.current > RESTART_TIMEOUT_MS) {
+          // 上一轮的读取可能挂着不回来：丢掉它，放开被它锁住的按钮。
+          refreshSequence.current++;
+          setLoading(false);
+          setStage('idle');
+          setPaused(true);
+          setMessage('等待超时。NapCat 可能没起来，去服务器上看看容器状态，好了再点「刷新账号状态」。');
+          return;
+        }
+        if (polling) return;
         polling = true;
         try {
-          if (stage !== 'idle' && Date.now() - stageStartedAt.current > RESTART_TIMEOUT_MS) {
-            setStage('idle');
-            setMessage('等待超时。NapCat 可能没起来，去服务器上看看容器状态。');
-            return;
-          }
           const next = await load();
           if (!alive || !isCurrent() || !next) return;
 
@@ -314,7 +323,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
       })();
     }, POLL_MS);
     return () => { alive = false; window.clearInterval(timer); };
-  }, [stage, token, platformId, qrImage, load, watching]);
+  }, [stage, token, platformId, qrImage, load, watching, paused]);
 
   const startRelogin = async () => {
     if (!isCurrent() || mutation.current || stage !== 'idle' || !status?.configured) return;
@@ -329,6 +338,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
     if (!isCurrent()) return;
     mutation.current = true; refreshSequence.current++; setLoading(false); setBusy(true);
     setQrImage('');
+    setPaused(false);
     setMessage('正在重启 NapCat…');
     try {
       await enterPlatformLoginMode(token, platformId);
@@ -349,6 +359,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
     if (!window.confirm(`切换到 ${who}？当前账号会下线，会话和长期记忆各号各算。`)) return;
     if (!isCurrent()) return;
     mutation.current = true; refreshSequence.current++; setLoading(false); setBusy(true);
+    setPaused(false);
     try {
       await switchPlatformAccount(token, platformId, target.account);
       if (!isCurrent()) return;
@@ -400,6 +411,9 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
       </Block>
     );
   }
+
+  // 等 NapCat 起来那段，扫码块里已经念着这句了，底下不再重复一遍。
+  const noticeInWaitBlock = stage !== 'idle' && !qrImage;
 
   return (
     <>
@@ -469,7 +483,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
                 <Button
                   className="flex-none"
                   disabled={busy}
-                  onClick={() => { setStage('idle'); setQrImage(''); setMessage(''); }}
+                  onClick={() => { setPaused(true); setStage('idle'); setQrImage(''); setMessage('已停止等待。要接着扫码，点「刷新账号状态」。'); }}
                   tone="halt"
                 >
                   停止等待
@@ -546,7 +560,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
 
       {!ownershipReady && status?.quick_login?.length ? <Facts>实例归属尚未确认，请先刷新实例列表后再快速登录。</Facts> : null}
 
-      {notice && status && <Facts>{notice}</Facts>}
+      {notice && status && !noticeInWaitBlock && <Facts>{notice}</Facts>}
     </>
   );
 };
