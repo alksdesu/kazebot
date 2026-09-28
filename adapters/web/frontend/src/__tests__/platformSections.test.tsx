@@ -1,5 +1,7 @@
 // 平台页的折叠分区：摘要只看生效值、待应用按配置段归位、深链能展开、展开状态记得住。
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+// 页头那几条交代（状态条、警告、读取与解析失败）和跟着实况刷新也在这里。
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import type { ComponentProps } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ConfigLiveState } from '../api/supervisorClient';
@@ -7,6 +9,7 @@ import { getSettingsTab } from '../components/settings/settingsTabs';
 import { platformScope } from '../console/configScope';
 import { platformConsoleStore } from '../console/consoleStore';
 import { useSchemaStore } from '../console/schemaStore';
+import { Section } from '../console/Section';
 import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
 import { clearConsoleSchemas, seedConsoleSchemas } from './consoleSchemaFixture';
@@ -50,6 +53,9 @@ const live = (values: Record<string, unknown> = {}): ConfigLiveState => ({
   },
 });
 
+const NOT_PUBLISHED = 'bot 还没上报生效配置。在服务器上启动 QQ · NapCat 的适配器进程（bot.py）之后，这里会显示它实际在用的值。';
+const UNCONFIRMED = '已应用，但 bot 没在 60 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程（bot.py）。';
+
 const PlatformTab = () => {
   const Page = getSettingsTab('platform-qq').Page;
   return <Page />;
@@ -57,12 +63,14 @@ const PlatformTab = () => {
 
 const header = (name: string) => screen.getByRole('button', { name: new RegExp(`^${name}`) });
 
+const sectionBody = (name: string) => document.getElementById(header(name).getAttribute('aria-controls')!)!;
+
 beforeEach(() => {
   localStorage.clear();
   window.history.replaceState(null, '', '/');
   useSettingsStore.setState({ adminToken: '', isAuthenticated: true });
   useViewStore.setState({ viewMode: 'settings', activeSettingsTab: 'platform-qq', activeSettingsSection: '' });
-  platformConsoleStore('qq').setState({ live: live(), draft: {}, raw: '', loading: false, saving: false, error: '', notice: '' });
+  platformConsoleStore('qq').setState({ live: live(), draft: {}, raw: '', loading: false, saving: false, loadError: '', applyError: '', notice: '', confirmation: null });
   seedConsoleSchemas();
   // jsdom 没有 confirm，不打桩的话「丢弃」的二次确认永远拿到 undefined。
   vi.spyOn(window, 'confirm').mockReturnValue(true);
@@ -104,6 +112,29 @@ describe('折叠分区', () => {
     expect(screen.getByText('允许说话的群')).toBeInTheDocument();
   });
 
+  it('收起时正文容器还留着，只是藏起来 —— aria-controls 指的元素不能不在', () => {
+    render(<PlatformTab />);
+    const body = sectionBody('信道');
+
+    expect(body).toBeInTheDocument();
+    expect(body).not.toBeVisible();
+    expect(body).toBeEmptyDOMElement();
+
+    fireEvent.click(header('信道'));
+
+    expect(sectionBody('信道')).toBeVisible();
+    expect(within(sectionBody('信道')).getByText('允许说话的群')).toBeInTheDocument();
+  });
+
+  it('按钮的名字只念标题和要紧的标记，摘要另外作为描述念', () => {
+    platformConsoleStore('qq').setState({ draft: { allowed_groups: [101] } });
+    render(<PlatformTab />);
+
+    expect(header('信道')).toHaveAccessibleName('信道 1 项待应用');
+    expect(header('信道')).toHaveAccessibleDescription('2 个群 · 私聊仅好友');
+    expect(header('触发时机')).toHaveAccessibleName('触发时机');
+  });
+
   it('展开状态记在这台浏览器上', () => {
     const view = render(<PlatformTab />);
     fireEvent.click(header('触发时机'));
@@ -119,6 +150,29 @@ describe('折叠分区', () => {
     render(<PlatformTab />);
 
     expect(header('信道')).toHaveAttribute('aria-expanded', 'false');
+  });
+});
+
+// 眼下没有页面给分区传 error，名字的拼法还是得连这一档一起定死。
+describe('分区头的可访问名称', () => {
+  const renderSection = (props: Partial<ComponentProps<typeof Section>>) => render(
+    <Section id="demo" onToggle={() => undefined} open={false} summary="一行摘要" title="示例" {...props}>
+      <p>正文</p>
+    </Section>,
+  );
+
+  it('标题之外只念「配置有误」和待办计数，摘要另作描述', () => {
+    renderSection({ error: '第 3 行缩进不对', pending: 2 });
+
+    expect(screen.getByRole('button')).toHaveAccessibleName('示例 配置有误 2 项待应用');
+    expect(screen.getByRole('button')).toHaveAccessibleDescription('一行摘要');
+  });
+
+  it('没有摘要就不留一个空描述', () => {
+    renderSection({ summary: null });
+
+    expect(screen.getByRole('button')).toHaveAccessibleName('示例');
+    expect(screen.getByRole('button')).not.toHaveAttribute('aria-describedby');
   });
 });
 
@@ -205,10 +259,35 @@ describe('控制台布局', () => {
 describe('顶部状态栏', () => {
   it('没有待应用改动时应用和丢弃都点不动', () => {
     render(<PlatformTab />);
-    const bar = screen.getByText('已生效').parentElement!;
+    const bar = screen.getByText('已生效').closest('div')!;
 
     expect(within(bar).getByRole('button', { name: '应用' })).toBeDisabled();
     expect(within(bar).getByRole('button', { name: '丢弃' })).toBeDisabled();
+  });
+
+  it('写完还没等到 bot 认账时说在等，不报成出了错', () => {
+    platformConsoleStore('qq').setState({ live: { ...live(), applied: false }, confirmation: 'waiting' });
+    render(<PlatformTab />);
+
+    expect(screen.getByText('已写入，等 bot 确认生效…')).toBeInTheDocument();
+    expect(screen.queryByText('bot 用的还是旧配置')).toBeNull();
+  });
+
+  it('等认账期间语法错误和心跳中断照样压在上面', () => {
+    const broken = live();
+    platformConsoleStore('qq').setState({
+      live: { ...broken, applied: false, state: { ...broken.state!, parse_error: 'line 3: bad indent' } },
+      confirmation: 'waiting',
+    });
+    const view = render(<PlatformTab />);
+    expect(screen.getByText('配置有语法错误，bot 仍在用上一份')).toBeInTheDocument();
+
+    view.unmount();
+    platformConsoleStore('qq').setState({ live: { ...live(), applied: false, stale: true }, confirmation: 'waiting' });
+    render(<PlatformTab />);
+
+    expect(screen.getByText('bot 心跳已中断')).toBeInTheDocument();
+    expect(screen.queryByText('已写入，等 bot 确认生效…')).toBeNull();
   });
 
   it('丢弃清掉全部草稿，各分区的计数一起归零', () => {
@@ -219,5 +298,95 @@ describe('顶部状态栏', () => {
 
     expect(platformConsoleStore('qq').getState().draft).toEqual({});
     expect(header('信道')).not.toHaveTextContent('待应用');
+  });
+});
+
+describe('页头的交代', () => {
+  it('应用的警告和认账的结论连成一句', () => {
+    platformConsoleStore('qq').setState({ notice: '原文认不出，整份文件重写了', confirmation: 'unconfirmed' });
+    const view = render(<PlatformTab />);
+    expect(screen.getByText(`原文认不出，整份文件重写了；${UNCONFIRMED}`)).toBeInTheDocument();
+
+    view.unmount();
+    platformConsoleStore('qq').setState({ notice: '', confirmation: 'unconfirmed' });
+    render(<PlatformTab />);
+
+    expect(screen.getByText(UNCONFIRMED)).toBeInTheDocument();
+  });
+
+  it('认账了就只剩应用时的警告，没有警告时一句都不摆', () => {
+    platformConsoleStore('qq').setState({ notice: '原文认不出，整份文件重写了', confirmation: 'confirmed' });
+    const view = render(<PlatformTab />);
+    expect(screen.getByText('原文认不出，整份文件重写了')).toBeInTheDocument();
+
+    view.unmount();
+    platformConsoleStore('qq').setState({ notice: '', confirmation: 'confirmed' });
+    render(<PlatformTab />);
+
+    expect(screen.queryByText(/重写/)).toBeNull();
+  });
+
+  it('「应用」失败在页头报，读取失败和解析失败各是一条 alert', () => {
+    const broken = live();
+    platformConsoleStore('qq').setState({
+      applyError: '写入失败：403 没有权限',
+      loadError: '读取配置失败',
+      live: { ...broken, state: { ...broken.state!, parse_error: 'line 3: bad indent' } },
+    });
+    render(<PlatformTab />);
+
+    expect(screen.getAllByRole('alert').map((node) => node.textContent)).toEqual([
+      '写入失败：403 没有权限',
+      '读取配置失败',
+      '平台配置解析失败：line 3: bad indent。bot 仍在用上一份有效配置。请先修复原文件语法；本页不会覆盖损坏文件。',
+    ]);
+  });
+
+  it('「bot 还没上报」排在连接卡前面，先交代整页为什么空着', () => {
+    platformConsoleStore('qq').setState({ live: { published: false, file: { exists: false, mtime_ns: 0, size: 0 } } });
+    render(<PlatformTab />);
+
+    const reason = screen.getByText(NOT_PUBLISHED);
+    const card = screen.getByRole('heading', { name: '连接' });
+
+    expect(reason.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
+describe('跟着实况刷新', () => {
+  const json = (body: unknown) =>
+    new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+  /** 记下每个请求的路径，供断言各拉了几次。 */
+  const stubBackend = (): string[] => {
+    const seen: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      seen.push(url);
+      if (url.endsWith('/config/raw')) return json({ content: '', exists: false });
+      if (url.endsWith('/config/state')) return json({ published: false, applied: false, file: {}, state: null, platforms: [] });
+      return json({});
+    }));
+    return seen;
+  };
+
+  const countOf = (seen: readonly string[], leaf: string) => seen.filter((url) => url.endsWith(leaf)).length;
+
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('进页各拉一次，之后每 15 秒再拉一次；本平台那份和全局那份都跟着读', async () => {
+    const seen = stubBackend();
+    useSettingsStore.setState({ adminToken: 'fixture-token' });
+    vi.useFakeTimers();
+
+    render(<PlatformTab />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(countOf(seen, '/v1/platforms/qq/config/state')).toBe(1);
+    expect(countOf(seen, '/v1/features/config/state')).toBe(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+
+    expect(countOf(seen, '/v1/platforms/qq/config/state')).toBe(2);
+    expect(countOf(seen, '/v1/features/config/state')).toBe(2);
   });
 });

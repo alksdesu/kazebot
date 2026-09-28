@@ -18,6 +18,10 @@ export function nameBetween(before: string, name: string, after: string): string
   return `${lead}${nameWith(name, after)}`;
 }
 
+/** 几句交代连成一段，空的跳过。 */
+export function joinNotes(...notes: readonly string[]): string {
+  return notes.filter(Boolean).join('；');
+}
 /** 比例换成百分数。0.15 * 100 会算出 15.000000000000002，定到小数点后两位。 */
 export function asPercent(ratio: number): number {
   return Math.round(ratio * 10000) / 100;

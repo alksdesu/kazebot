@@ -24,34 +24,50 @@ interface SectionProps {
 export const Section = ({
   children, commitVerb = '应用', error, icon, id, onToggle, open, pending = 0, summary, title,
 }: SectionProps) => {
-  const bodyId = useId();
+  const baseId = useId();
+  const ids = {
+    body: `${baseId}-body`,
+    title: `${baseId}-title`,
+    summary: `${baseId}-summary`,
+    error: `${baseId}-error`,
+    pending: `${baseId}-pending`,
+  };
+  // 按钮的名字只念标题和要紧的标记，摘要作为描述另念：整行连成一个名字，读屏每次聚焦都得听完一长串。
+  const labelledBy = [ids.title, error ? ids.error : '', pending > 0 ? ids.pending : ''].filter(Boolean).join(' ');
 
   return (
     <section className="border-b border-[var(--duties-border)] last:border-b-0" id={`section-${id}`}>
       <h2 className="m-0">
         <button
-          aria-controls={bodyId}
+          aria-controls={ids.body}
+          aria-describedby={summary ? ids.summary : undefined}
           aria-expanded={open}
+          aria-labelledby={labelledBy}
           className="app-button flex w-full min-w-0 flex-wrap items-center gap-2.5 px-1 py-3 text-left"
           onClick={onToggle}
           type="button"
         >
           <Icon className="flex-none text-[var(--duties-secondary)]" name={open ? 'keyboard_arrow_down' : 'chevron_right'} size={18} />
           {icon && <Icon className="flex-none text-[var(--duties-secondary)]" name={icon} size={18} />}
-          <span className="flex-none text-base font-semibold">{title}</span>
-          <span className="min-w-0 flex-1 truncate text-xs text-[var(--duties-secondary)]">{summary}</span>
-          {error && <span className="flex-none text-xs text-[var(--duties-danger)]">配置有误</span>}
+          <span className="flex-none text-base font-semibold" id={ids.title}>{title}</span>
+          <span className="min-w-0 flex-1 truncate text-xs text-[var(--duties-secondary)]" id={ids.summary}>{summary}</span>
+          {error && <span className="flex-none text-xs text-[var(--duties-danger)]" id={ids.error}>配置有误</span>}
           {pending > 0 && (
-            <span className="flex-none text-xs font-medium text-[var(--duties-danger)]">{pending} 项待{commitVerb}</span>
+            <span className="flex-none text-xs font-medium text-[var(--duties-danger)]" id={ids.pending}>
+              {pending} 项待{commitVerb}
+            </span>
           )}
         </button>
       </h2>
-      {open && (
-        <div className="settings-section-body pb-5" id={bodyId}>
-          {error && <ErrorText>{error}</ErrorText>}
-          {children}
-        </div>
-      )}
+      {/* 收起时容器也留着：aria-controls 指向的元素不在，读屏就不知道这个按钮管的是哪一块。 */}
+      <div className="settings-section-body pb-5" hidden={!open} id={ids.body}>
+        {open && (
+          <>
+            {error && <ErrorText>{error}</ErrorText>}
+            {children}
+          </>
+        )}
+      </div>
     </section>
   );
 };

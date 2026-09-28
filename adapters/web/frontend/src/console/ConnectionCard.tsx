@@ -20,7 +20,11 @@ export const ConnectionCard = () => {
   const link = useLinkFacts();
 
   const botAlive = Boolean(live?.published && !live.stale);
+  const botState = botAlive ? '在线' : live?.published ? '心跳中断' : '没在跑';
   const linked = link.connected;
+  const peerDetail = !botAlive ? `适配进程${botState}，这一项无从判断`
+    : !linked ? platform.connectionHint
+      : link.account ? `账号 ${link.account}` : '';
 
   return (
     <Block hint="两段链路，断一段 bot 就不说话" title="连接">
@@ -30,13 +34,13 @@ export const ConnectionCard = () => {
           <Link
             detail={runtime.pid ? `pid ${runtime.pid}` : ''}
             name={nameWith(platform.shortName, '适配进程')}
-            state={botAlive ? '在线' : live?.published ? '心跳中断' : '没在跑'}
+            state={botState}
           />
         </Row>
         <Row>
           <Pip tone={linked ? 'live' : botAlive ? 'halt' : 'idle'} />
           <Link
-            detail={!botAlive ? '适配进程没在跑，这一项无从判断' : linked ? '' : platform.connectionHint}
+            detail={peerDetail}
             name={connectionPeerName(platform)}
             state={!botAlive ? '未知' : linked ? '已连接' : '未连接'}
           />

@@ -22,6 +22,8 @@ import {
 } from '../api/supervisorClient';
 import { entrypointNote, getPlatform } from '../platforms/registry';
 import { FEATURES_SCOPE, platformScope, useConfigScope, type ConfigScope } from './configScope';
+import { joinNotes } from './format';
+import { rewriteYaml, type YamlRewrite } from './yamlRewrite';
 
 /** 草稿按 live_config 的键名存（如 signal_at），不是 yaml 的点分路径。
  *
@@ -30,11 +32,17 @@ import { FEATURES_SCOPE, platformScope, useConfigScope, type ConfigScope } from 
  * 值为 null 表示把这一行从文件里删掉，交给下一层（平台交给全局，全局交给内置默认）。 */
 export type Draft = Record<string, unknown>;
 
-/** 一次写回的结果。ok=false 时 message 是错误；ok=true 时 message 是警告或「写进去了但没确认生效」。 */
+/** 一次写回的结果。ok=false 时 message 是错误；ok=true 时 message 是警告，生效方认没认账看 confirmation。 */
 export interface CommitOutcome {
   ok: boolean;
   message: string;
 }
+
+/** 写回之后生效方认账到哪一步。waiting：已经写进文件，生效方还没换上；其余都是结论。
+ *
+ * 结论说的是最近那一次写回，跟着写回走：下一次写回才换掉，定时刷新读到的实况推翻了它才清掉。
+ * 改动、丢弃草稿都不动它 —— 全局设置按块保存，别的块改一下就把这块的结论抹掉是不对的。 */
+export type Confirmation = 'confirmed' | 'waiting' | 'unconfirmed' | 'changed' | 'unreadable';
 
 export interface ConsoleState {
   live: ConfigLiveState | null;
@@ -43,8 +51,14 @@ export interface ConsoleState {
   rawExists: boolean;
   loading: boolean;
   saving: boolean;
-  error: string;
+  /** 读取失败的原因，下一次读到就清掉。定时刷新只动它，不碰「应用」的结果。 */
+  loadError: string;
+  /** 「应用」失败的原因，挂到下一次应用或全部丢弃。 */
+  applyError: string;
+  /** 「应用」成功时附带的警告，改动或丢弃时清掉。 */
   notice: string;
+  /** 最近一次写回的认账情况。null：还没写过，或者结论已被实况推翻、被手动收起。 */
+  confirmation: Confirmation | null;
   draft: Draft;
 
   refresh: (token: string) => Promise<void>;
@@ -53,9 +67,10 @@ export interface ConsoleState {
   inherit: (name: string) => void;
   /** 把当前生效值写进本层，下一层以后怎么改都不再跟。本层本来就写着时，只是撤掉「删行」。 */
   pin: (name: string) => void;
-  /** 不给 names 就丢掉全部草稿；给了只丢这几项，区块自己的「丢弃」用。 */
+  /** 不给 names 就丢掉全部草稿，连带收起「应用」的提示和失败原因；给了只丢这几项，区块自己的「丢弃」用，
+   *  不碰页面级的提示 —— 区块保存的结果由区块自己拿着。 */
   discard: (names?: readonly string[]) => void;
-  /** 平台的「应用」：全部草稿一起写回，结果挂在 notice / error 上给状态栏看。 */
+  /** 平台的「应用」：全部草稿一起写回，结果挂在 notice / applyError 上给页面看。 */
   apply: (token: string) => Promise<void>;
   /** 区块的「保存」：只写回 names 里的草稿，结果交给调用方留在区块里。没有可写的返回 null。 */
   save: (token: string, names: readonly string[]) => Promise<CommitOutcome | null>;
@@ -123,17 +138,17 @@ export function readByPath(doc: Record<string, unknown> | undefined, path: strin
   return cursor;
 }
 
-/** 把草稿合进原文档，返回要 PUT 上去的整份 yaml。
+/** 把草稿合进原文，返回要 PUT 上去的整份 yaml。只改草稿里那几个键，运营者手写的注释和空行照旧。
  *
  * paths 同时当白名单用：后端会拒绝无人消费的键，用它转换就不可能写出未知键。 */
-export function mergeDraft(raw: string, draft: Draft, paths: Record<string, string>): string {
+export function mergeDraft(raw: string, draft: Draft, paths: Record<string, string>): YamlRewrite {
   const doc = parseDocument(raw);
   for (const [name, value] of Object.entries(draft)) {
     const path = paths[name];
     if (!path) throw new Error(`没有公布配置项 ${name}，拒绝写入`);
     setByPath(doc, path, value === null ? undefined : value);
   }
-  return yaml.dump(doc, DUMP_OPTIONS);
+  return rewriteYaml(raw, doc, DUMP_OPTIONS);
 }
 
 const sleep = (ms: number) => new Promise((done) => { setTimeout(done, ms); });
@@ -180,65 +195,75 @@ const configApi = (scope: ConfigScope): ConfigApi => (
       }
 );
 
-interface SettleWording {
-  changed: string;
-  unreadable: string;
-  unconfirmed: string;
-}
+// 写完先锁着按钮等一小会儿：生效方两秒对齐一次配置，常见情况这里就等到了。
+const QUICK_ROUNDS = 12;
+const QUICK_INTERVAL_MS = 250;
+// 没等到就放开按钮、转到后台接着等。忙的 bot 会晚几轮对齐，从写完算起一分钟还没换上就不是忙的问题了。
+const WATCH_INTERVAL_MS = 2000;
+const CONFIRM_LIMIT_MS = 60_000;
+const WATCH_ROUNDS = Math.ceil((CONFIRM_LIMIT_MS - QUICK_ROUNDS * QUICK_INTERVAL_MS) / WATCH_INTERVAL_MS);
 
-const FEATURES_WORDING: SettleWording = {
-  changed: '全局文件在保存之后又被改过，请刷新核对当前内容。',
-  unreadable: '已保存，但暂时读不到全局设置的状态，请稍后刷新。',
-  unconfirmed: '已保存，但有在跑的 bot 没在 3 秒内换上新文件，页面顶部列着是哪一个。',
+type Verdict = Exclude<Confirmation, 'confirmed' | 'waiting'>;
+
+const CONFIRM_LIMIT_TEXT = `${CONFIRM_LIMIT_MS / 1000} 秒`;
+
+const FEATURES_WORDING: Record<Verdict, string> = {
+  changed: '全局文件在保存之后又被改过，请核对当前内容。',
+  unreadable: '已保存，但暂时读不到全局设置的状态，还不知道各平台换没换上。',
+  unconfirmed: `已保存，但有在跑的 bot 没在 ${CONFIRM_LIMIT_TEXT}内换上新文件，「全局默认」页顶部列着是哪一个。`,
 };
 
 /** 平台页没确认生效时，按平台声明的入口脚本告诉人去看哪个进程。 */
-const settleWording = (scope: ConfigScope): SettleWording => {
+const confirmationWording = (scope: ConfigScope): Record<Verdict, string> => {
   if (scope.kind === 'features') return FEATURES_WORDING;
   const platform = getPlatform(scope.platformId);
   return {
-    changed: '配置文件在应用之后又被改过，请刷新核对当前内容。',
-    unreadable: '已应用，但暂时读不到 bot 的状态，无法确认是否生效，请稍后刷新。',
-    unconfirmed: `已应用，但 bot 没在 3 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程${platform ? entrypointNote(platform) : ''}。`,
+    changed: '配置文件在应用之后又被改过，请核对当前内容。',
+    unreadable: '已应用，但暂时读不到 bot 的状态，还不知道是否生效。',
+    unconfirmed: `已应用，但 bot 没在 ${CONFIRM_LIMIT_TEXT}内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程${platform ? entrypointNote(platform) : ''}。`,
   };
 };
 
-/**
- * 轮询到生效方认账为止，返回要告诉用户的话（空串表示已确认生效）。
- *
- * applied 比的是实际加载的那份配置的指纹，不是看到的文件指纹 —— 后者在文件
- * 写坏时也等于当前文件。中途没认账的快照一律不写回 state：那是写回前的值，
- * 覆盖上去界面就会闪回旧值，等于这个修复没做。
- */
-const settle = async (
-  token: string,
-  api: ConfigApi,
-  wording: SettleWording,
-  set: (partial: Partial<ConsoleState>) => void,
-  savedRaw: string,
-): Promise<string> => {
-  for (let round = 0; round < 12; round += 1) {
-    await sleep(250);
-    try {
-      const [state, file] = await Promise.all([api.getState(token), api.getRaw(token)]);
-      if (file.content !== savedRaw) return wording.changed;
-      if (state.applied) {
-        set({ live: state, raw: file.content, rawExists: file.exists });
-        return '';
-      }
-    } catch {
-      return wording.unreadable;
-    }
-  }
-  return wording.unconfirmed;
-};
+const isVerdict = (confirmation: Confirmation | null): confirmation is Verdict => (
+  confirmation === 'changed' || confirmation === 'unreadable' || confirmation === 'unconfirmed'
+);
 
-/** 每个作用域一份请求代次。一份配置的刷新不该作废另一份在飞的请求。 */
+/** 认账出了岔子时要交代的话。认账了、还在等、没写过都是空串 ——
+ *  还在等由各页自己摆：平台页在状态条上，全局设置在区块的保存条上。 */
+export function confirmationNote(scope: ConfigScope, confirmation: Confirmation | null): string {
+  return isVerdict(confirmation) ? confirmationWording(scope)[confirmation] : '';
+}
+
+/** 定时刷新读到的实况推翻了上一次的结论：读不到的现在读到了，没认账的现在认了。 */
+const verdictOutdated = (confirmation: Confirmation | null, state: ConfigLiveState): boolean => (
+  confirmation === 'unreadable' || (confirmation === 'unconfirmed' && Boolean(state.applied))
+);
+
+/** 手动收起提示时连结论一起收；还在等的不是结论，照等。 */
+const verdictDismissed = (confirmation: Confirmation | null): Partial<ConsoleState> => (
+  confirmation === 'waiting' ? {} : { confirmation: null }
+);
+
+/** 刚写回的那一份：认账时要比对的原文、写进去的草稿、第几次写回。 */
+interface Written {
+  generation: number;
+  content: string;
+  subset: Draft;
+}
+
+/** 探一次的结果。applied 比的是生效方实际加载的那份配置的指纹，不是它看到的文件指纹 —— 后者在文件写坏时也等于当前文件。 */
+type Probe =
+  | { kind: 'confirmed' | 'changed' | 'waiting'; state: ConfigLiveState; file: ConfigRawFile }
+  | { kind: 'unreadable' };
+
+/** 每个作用域各自的代次。一份配置的刷新、写回不该作废另一份在飞的请求。 */
 const refreshVersions = new Map<string, number>();
+// 和刷新分开计：刷新作废的是在飞的读取，写回的代次作废的是上一次写回还在等的认账。
+const writeVersions = new Map<string, number>();
 
-const bumpVersion = (scopeId: string): number => {
-  const version = (refreshVersions.get(scopeId) || 0) + 1;
-  refreshVersions.set(scopeId, version);
+const bump = (versions: Map<string, number>, scopeId: string): number => {
+  const version = (versions.get(scopeId) || 0) + 1;
+  versions.set(scopeId, version);
   return version;
 };
 
@@ -259,27 +284,111 @@ const createConsoleState = (scope: ConfigScope) => (
   get: () => ConsoleState,
 ): ConsoleState => {
   const api = configApi(scope);
+  const layer = OWN_LAYER[scope.kind];
 
-  /** 把一批草稿合进磁盘上最新那份原文写回，再等生效方认账。 */
+  /** 这一次写回还是不是最新的一次。新的写回一开始，旧的那次就无权再改认账状态。 */
+  const current = (written: Written): boolean => writeVersions.get(scope.id) === written.generation;
+
+  /** 把草稿合进磁盘上最新那份原文写回。返回写进去的原文和要交代的警告。 */
+  const write = async (token: string, live: ConfigLiveState | null, subset: Draft) => {
+    const latest = await api.getRaw(token);
+    const merged = mergeDraft(latest.content, subset, live?.state?.paths || {});
+    const result = await api.putRaw(token, merged.content);
+    return {
+      content: merged.content,
+      warnings: merged.note ? [...result.warnings, merged.note] : result.warnings,
+    };
+  };
+
+  /** 探一次：文件还是不是写进去的那份，生效方换上没有。 */
+  const probe = async (token: string, content: string): Promise<Probe> => {
+    try {
+      const [state, file] = await Promise.all([api.getState(token), api.getRaw(token)]);
+      if (file.content !== content) return { kind: 'changed', state, file };
+      return { kind: state.applied ? 'confirmed' : 'waiting', state, file };
+    } catch {
+      return { kind: 'unreadable' };
+    }
+  };
+
+  /**
+   * 隔 interval 探一次，最多 rounds 次，探到结论就停。返回最后一次探测；被新的写回顶掉时返回 null。
+   *
+   * 还在等的时候换上最新的实况（心跳、各平台换没换上），值照旧叠着写进去的那些：
+   * 生效方还没换上新文件，它公布的是写回前的值，原样铺上去界面就闪回旧值了。
+   */
+  const poll = async (token: string, written: Written, rounds: number, interval: number): Promise<Probe | null> => {
+    let last: Probe | null = null;
+    for (let round = 0; round < rounds; round += 1) {
+      await sleep(interval);
+      if (!current(written)) return null;
+      last = await probe(token, written.content);
+      if (!current(written)) return null;
+      if (last.kind !== 'waiting') return last;
+      set({ live: withApplied(last.state, written.subset, layer) });
+    }
+    return last;
+  };
+
+  /** 落下结论。认账、被别处改过、等满了没认账都换上最后探到的实况；读不到的没有实况可换。 */
+  const conclude = (written: Written, result: Probe): void => {
+    if (!current(written)) return;
+    if (result.kind === 'unreadable') {
+      set({ confirmation: 'unreadable' });
+      return;
+    }
+    set({
+      live: result.state,
+      raw: result.file.content,
+      rawExists: result.file.exists,
+      loadError: '',
+      confirmation: result.kind === 'waiting' ? 'unconfirmed' : result.kind,
+    });
+  };
+
+  /** 后台接着等，等满了还没认账就算没确认。 */
+  const watch = (token: string, written: Written): void => {
+    poll(token, written, WATCH_ROUNDS, WATCH_INTERVAL_MS)
+      .then((last) => { if (last) conclude(written, last); })
+      // 这一趟没人 await，意外中断也得落个结论：一直挂在 waiting 上，定时刷新就再也不跑了。
+      .catch(() => conclude(written, { kind: 'unreadable' }));
+  };
+
+  /** 认账：锁着按钮先等一小会儿，没等到就放开按钮转到后台。写已经成功了，这里出什么意外都不能报成写失败。 */
+  const confirm = async (token: string, written: Written): Promise<void> => {
+    try {
+      const quick = await poll(token, written, QUICK_ROUNDS, QUICK_INTERVAL_MS);
+      if (quick?.kind === 'waiting') watch(token, written);
+      else if (quick) conclude(written, quick);
+    } catch {
+      conclude(written, { kind: 'unreadable' });
+    }
+  };
+
+  /** 把一批草稿写回，再等生效方认账。 */
   const commit = async (token: string, subset: Draft): Promise<CommitOutcome | null> => {
     const { live, saving } = get();
     if (saving || !Object.keys(subset).length) return null;
-    bumpVersion(scope.id);
-    set({ saving: true, loading: false, error: '', notice: '' });
+    bump(refreshVersions, scope.id);
+    const generation = bump(writeVersions, scope.id);
+    set({ saving: true, loading: false, applyError: '', notice: '', confirmation: null });
     try {
-      const paths = live?.state?.paths || {};
-      const latest = await api.getRaw(token);
-      const raw = mergeDraft(latest.content, subset, paths);
-      const result = await api.putRaw(token, raw);
+      const saved = await write(token, live, subset);
       // 生效方隔一会儿才重读配置。这里先按刚写进去的值显示：
       // 草稿一清、live 又还是旧快照的话，界面会退回写回前的样子，看着像没存上。
       const pending = { ...get().draft };
       for (const [name, value] of Object.entries(subset)) {
         if (sameValue(pending[name], value)) delete pending[name];
       }
-      set({ draft: pending, raw, rawExists: true, live: withApplied(live, subset, OWN_LAYER[scope.kind]) });
-      const settled = await settle(token, api, settleWording(scope), set, raw);
-      return { ok: true, message: [...result.warnings, settled].filter(Boolean).join('；') };
+      set({
+        draft: pending,
+        raw: saved.content,
+        rawExists: true,
+        live: withApplied(live, subset, layer),
+        confirmation: 'waiting',
+      });
+      await confirm(token, { generation, content: saved.content, subset });
+      return { ok: true, message: joinNotes(...saved.warnings) };
     } catch (error) {
       return { ok: false, message: error instanceof Error ? error.message : '写入失败' };
     } finally {
@@ -293,21 +402,32 @@ const createConsoleState = (scope: ConfigScope) => (
     rawExists: false,
     loading: false,
     saving: false,
-    error: '',
+    loadError: '',
+    applyError: '',
     notice: '',
+    confirmation: null,
     draft: {},
 
     refresh: async (token) => {
-      if (get().saving) return;
-      const version = bumpVersion(scope.id);
-      set({ loading: true, error: '' });
+      const { saving, confirmation } = get();
+      // 写完到认账之间读到的是换上新文件之前的值，铺上去会闪回旧值；这段时间认账那边自己在探。
+      if (saving || confirmation === 'waiting') return;
+      const version = bump(refreshVersions, scope.id);
+      set({ loading: true });
       try {
         const [state, file] = await Promise.all([api.getState(token), api.getRaw(token)]);
         if (version !== refreshVersions.get(scope.id)) return;
-        set({ live: state, raw: file.content, rawExists: file.exists, loading: false });
+        set({
+          live: state,
+          raw: file.content,
+          rawExists: file.exists,
+          loading: false,
+          loadError: '',
+          ...(verdictOutdated(get().confirmation, state) ? { confirmation: null } : {}),
+        });
       } catch (error) {
         if (version !== refreshVersions.get(scope.id)) return;
-        set({ loading: false, error: error instanceof Error ? error.message : '读取配置失败' });
+        set({ loading: false, loadError: error instanceof Error ? error.message : '读取配置失败' });
       }
     },
 
@@ -316,7 +436,7 @@ const createConsoleState = (scope: ConfigScope) => (
       const draft = { ...current };
       if (value === null) {
         // 删行只在本层确实写着这一行时才算改动；没写着就是本来就在跟随下一层。
-        if (sourceOf(live, name) === OWN_LAYER[scope.kind]) draft[name] = null;
+        if (sourceOf(live, name) === layer) draft[name] = null;
         else delete draft[name];
       } else if (!saving && sameValue(value, live?.state?.values?.[name])) {
         // 改回生效值就不该继续算成待写回，否则「3 项待应用」里会混进已经撤销的改动。
@@ -333,7 +453,7 @@ const createConsoleState = (scope: ConfigScope) => (
     pin: (name) => {
       const { draft: current, live } = get();
       const draft = { ...current };
-      if (sourceOf(live, name) === OWN_LAYER[scope.kind]) {
+      if (sourceOf(live, name) === layer) {
         if (draft[name] === null) delete draft[name];
       } else if (!(name in draft) || draft[name] === null) {
         const applied = live?.state?.values?.[name];
@@ -346,7 +466,7 @@ const createConsoleState = (scope: ConfigScope) => (
 
     discard: (names) => {
       if (!names) {
-        set({ draft: {}, notice: '', error: '' });
+        set({ draft: {}, notice: '', applyError: '' });
         return;
       }
       const draft = { ...get().draft };
@@ -357,12 +477,12 @@ const createConsoleState = (scope: ConfigScope) => (
     apply: async (token) => {
       const outcome = await commit(token, get().draft);
       if (!outcome) return;
-      set(outcome.ok ? { notice: outcome.message } : { error: outcome.message });
+      set(outcome.ok ? { notice: outcome.message } : { applyError: outcome.message });
     },
 
     save: (token, names) => commit(token, pick(get().draft, names)),
 
-    dismissNotice: () => set({ notice: '' }),
+    dismissNotice: () => set({ notice: '', ...verdictDismissed(get().confirmation) }),
   };
 };
 

@@ -1,5 +1,5 @@
 // 机器人 › 全局默认：分区来自全局 schema、区块各自保存、列出各平台换没换上当前这份；图库那块摆在表情包图库页上。
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as api from '../api/supervisorClient';
@@ -23,8 +23,16 @@ vi.mock('../api/supervisorClient', async importOriginal => ({
   getFeaturesRaw: vi.fn(), getFeaturesState: vi.fn(), updateFeaturesRaw: vi.fn(), getFeaturesSchema: vi.fn(),
 }));
 
-const PAGE_LEAVE = '全局默认还有没保存的修改，确定离开吗？';
+const PAGE_LEAVE = '全局默认的「回复」还有没保存的修改，确定离开吗？';
 const LIBRARY_LEAVE = '「入库」里还有没保存的修改，确定离开吗？';
+
+// 快等阶段 250ms × 12 锁着按钮，之后后台 2000ms 一轮接着等，从写完算起满一分钟才下结论。
+const QUICK_MS = 250 * 12;
+const CONFIRM_MS = 61_000;
+const LIVE_REFRESH_MS = 15_000;
+
+const WAITING_NOTE = '已保存，正在等在跑的 bot 换上新文件…';
+const UNCONFIRMED_NOTE = '已保存，但有在跑的 bot 没在 60 秒内换上新文件，「全局默认」页顶部列着是哪一个。';
 
 // 键名 → 路径照后端快照取，写回时的换算和真实页面一致。
 const PATHS = Object.fromEntries(Object.entries(FEATURES_SCHEMA.fields).map(([key, spec]) => [key, spec.path]));
@@ -84,7 +92,7 @@ beforeEach(() => {
   useSettingsStore.setState({ adminToken: '', isAuthenticated: true });
   useViewStore.setState({ viewMode: 'settings', activeSettingsTab: 'defaults', activeSettingsSection: '' });
   configStore(FEATURES_SCOPE).setState({
-    live: featuresLive(), draft: {}, raw: '', rawExists: true, loading: false, saving: false, error: '', notice: '',
+    live: featuresLive(), draft: {}, raw: '', rawExists: true, loading: false, saving: false, loadError: '', applyError: '', notice: '', confirmation: null,
   });
   seedConsoleSchemas();
   vi.mocked(api.getFeaturesState).mockImplementation(async () => featuresLive());
@@ -101,6 +109,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   clearConsoleSchemas();
+  vi.useRealTimers();
   vi.clearAllMocks();
   vi.restoreAllMocks();
 });
@@ -172,6 +181,36 @@ describe('全局默认页', () => {
     expect(JSON.parse(localStorage.getItem('console_sections_features')!)).toEqual({ approval: true });
     expect(localStorage.getItem('console_sections_qq')).toBeNull();
   });
+
+  it('这一页的分区头没有摘要，名字里只剩标题和待保存计数', () => {
+    configStore(FEATURES_SCOPE).setState({ draft: { reply_to_trigger: false } });
+    render(<DefaultsTab />);
+
+    expect(header('回复')).toHaveAccessibleName('回复 1 项待保存');
+    expect(header('回复')).not.toHaveAttribute('aria-describedby');
+    expect(header('审批')).toHaveAccessibleName('审批');
+  });
+
+  it('读取失败是一条 alert，已经画出来的东西照旧留着', () => {
+    configStore(FEATURES_SCOPE).setState({ loadError: '读取全局设置失败' });
+    render(<DefaultsTab />);
+
+    expect(screen.getByRole('alert')).toHaveTextContent('读取全局设置失败');
+    expect(header('回复')).toBeInTheDocument();
+  });
+
+  it('页面开着就跟着读，进页一次之后每 15 秒一次', async () => {
+    signIn();
+    vi.useFakeTimers();
+    render(<DefaultsTab />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(api.getFeaturesState).toHaveBeenCalledTimes(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(LIVE_REFRESH_MS); });
+
+    expect(api.getFeaturesState).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('一个平台换没换上', () => {
@@ -239,9 +278,10 @@ describe('区块各自保存', () => {
     fireEvent.click(header('回复'));
     fireEvent.click(within(sectionOf('回复')).getByRole('button', { name: '保存' }));
 
-    expect(await within(sectionOf('回复')).findByText('400 全局设置写不进去')).toBeInTheDocument();
+    // 页面开着时才冒出来的错误，读屏不会自己去看。
+    expect(await within(sectionOf('回复')).findByRole('alert')).toHaveTextContent('400 全局设置写不进去');
     expect(configStore(FEATURES_SCOPE).getState().draft).toEqual({ reply_to_trigger: false });
-    expect(configStore(FEATURES_SCOPE).getState().error).toBe('');
+    expect(configStore(FEATURES_SCOPE).getState().applyError).toBe('');
   });
 
   it('字段旁是「默认 / 自定义」，回到默认保存之后全局文件里那一行没了', async () => {
@@ -264,6 +304,74 @@ describe('区块各自保存', () => {
   });
 });
 
+describe('保存之后那一句', () => {
+  /** 保存成功，但在跑的 bot 一直不换上新文件。 */
+  const neverAdopts = (warnings: string[] = []) => {
+    vi.mocked(api.getFeaturesState).mockImplementation(async () => ({ ...featuresLive(), applied: false }));
+    vi.mocked(api.updateFeaturesRaw).mockImplementation(async (_token, content) => {
+      written.push(content);
+      return { ok: true, warnings };
+    });
+  };
+
+  const saveReply = (warnings: string[] = []) => {
+    signIn();
+    neverAdopts(warnings);
+    configStore(FEATURES_SCOPE).setState({ draft: { reply_to_trigger: false } });
+    render(<DefaultsTab />);
+    fireEvent.click(header('回复'));
+    vi.useFakeTimers();
+    fireEvent.click(within(sectionOf('回复')).getByRole('button', { name: '保存' }));
+  };
+
+  it('还在等在跑的 bot 换文件时先这么说，等满了换成结论', async () => {
+    saveReply();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(QUICK_MS); });
+    expect(within(sectionOf('回复')).getByText(WAITING_NOTE)).toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(CONFIRM_MS); });
+    expect(within(sectionOf('回复')).getByText(UNCONFIRMED_NOTE)).toBeInTheDocument();
+  });
+
+  it('写回时的警告排在这一句前面', async () => {
+    saveReply(['bot 没在跑，只校验了 YAML 语法']);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(QUICK_MS); });
+    expect(within(sectionOf('回复')).getByText(`bot 没在跑，只校验了 YAML 语法；${WAITING_NOTE}`)).toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(CONFIRM_MS); });
+    expect(within(sectionOf('回复')).getByText(`bot 没在跑，只校验了 YAML 语法；${UNCONFIRMED_NOTE}`)).toBeInTheDocument();
+  });
+
+  it('去改别的块不会把这一块的结论抹掉', async () => {
+    saveReply();
+    await act(async () => { await vi.advanceTimersByTimeAsync(QUICK_MS + CONFIRM_MS); });
+    expect(within(sectionOf('回复')).getByText(UNCONFIRMED_NOTE)).toBeInTheDocument();
+
+    // 结论说的是上一次保存到底生没生效，人又去动别处并不会让它变得不确定。
+    act(() => { configStore(FEATURES_SCOPE).getState().setDraft('enable_echo', true); });
+
+    expect(within(sectionOf('回复')).getByText(UNCONFIRMED_NOTE)).toBeInTheDocument();
+  });
+
+  it('bot 认账了就只剩警告，没警告才是一句「已保存。」', async () => {
+    signIn();
+    vi.mocked(api.updateFeaturesRaw).mockImplementation(async (_token, content) => {
+      written.push(content);
+      return { ok: true, warnings: ['bot 没在跑，只校验了 YAML 语法'] };
+    });
+    configStore(FEATURES_SCOPE).setState({ draft: { reply_to_trigger: false } });
+    render(<DefaultsTab />);
+
+    fireEvent.click(header('回复'));
+    fireEvent.click(within(sectionOf('回复')).getByRole('button', { name: '保存' }));
+
+    expect(await within(sectionOf('回复')).findByText('bot 没在跑，只校验了 YAML 语法')).toBeInTheDocument();
+    expect(configStore(FEATURES_SCOPE).getState().confirmation).toBe('confirmed');
+  });
+});
+
 describe('离开前拦未保存的改动', () => {
   it('全局默认页只算这一页摆出来的键', () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
@@ -280,6 +388,15 @@ describe('离开前拦未保存的改动', () => {
 
     expect(confirmNavigation()).toBe(false);
     expect(confirm).toHaveBeenCalledWith(PAGE_LEAVE);
+  });
+
+  it('各块分开保存，那句话里得点名是哪几块', () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    configStore(FEATURES_SCOPE).setState({ draft: { reply_to_trigger: false, enable_echo: true } });
+    render(<DefaultsTab />);
+
+    expect(confirmNavigation()).toBe(false);
+    expect(confirm).toHaveBeenCalledWith('全局默认的「回复」「群互动」还有没保存的修改，确定离开吗？');
   });
 
   it('表情包图库页上的入库规则只拦图库那几项', () => {
@@ -319,7 +436,39 @@ describe('表情包图库页上的入库规则', () => {
     useSchemaStore.setState({ schemas: {}, errors: { [FEATURES_SCOPE.id]: '读不到控制台布局：网关超时' } });
     renderLibrary();
 
-    expect(screen.getByText('读不到控制台布局：网关超时')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('读不到控制台布局：网关超时');
+  });
+
+  it('读到过之后再读失败只在区块上面提一句，正在改的东西不从眼前消失', () => {
+    configStore(FEATURES_SCOPE).setState({ loadError: '读取全局设置失败' });
+    renderLibrary();
+
+    const alert = screen.getByRole('alert');
+    const block = screen.getByRole('heading', { name: '入库' });
+    expect(alert).toHaveTextContent('读取全局设置失败');
+    expect(alert.compareDocumentPosition(block) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByRole('checkbox', { name: /跳过人工筛选/ })).toBeInTheDocument();
+  });
+
+  it('一次都没读到时整块换成错误', () => {
+    configStore(FEATURES_SCOPE).setState({ live: null, loadError: '读取全局设置失败' });
+    renderLibrary();
+
+    expect(screen.getByRole('alert')).toHaveTextContent('读取全局设置失败');
+    expect(screen.queryByText('入库')).toBeNull();
+  });
+
+  it('页面开着就跟着读，进页一次之后每 15 秒一次', async () => {
+    signIn();
+    vi.useFakeTimers();
+    renderLibrary();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(api.getFeaturesState).toHaveBeenCalledTimes(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(LIVE_REFRESH_MS); });
+
+    expect(api.getFeaturesState).toHaveBeenCalledTimes(2);
   });
 
   it('从侧栏搜过来才滚到这一块，平常打开这页不乱滚', () => {
@@ -357,7 +506,9 @@ describe('一份全局 schema 分摆两页', () => {
     fireEvent.change(screen.getByLabelText('搜索设置'), { target: { value: '跳过人工筛选' } });
 
     expect(screen.queryByRole('button', { name: '全局默认：表情包图库' })).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: '表情包图库：表情包图库' }));
+    // 分区和页同名，并进页那一行，同一个名字不上下列两遍。
+    expect(screen.queryByRole('button', { name: '表情包图库：表情包图库' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '表情包图库' }));
     expect(useViewStore.getState().activeSettingsTab).toBe('stickers');
     expect(useViewStore.getState().activeSettingsSection).toBe(STICKER_LIBRARY_SECTION);
   });

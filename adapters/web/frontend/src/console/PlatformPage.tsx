@@ -14,9 +14,16 @@ import { useSettingsStore } from '../store/settingsStore';
 import { scopedKey } from '../store/storageKey';
 import { entrypointNote, type PlatformDescriptor } from '../platforms/registry';
 import { FEATURES_SCOPE, platformScope } from './configScope';
-import { configStore, useConsoleStore, useSectionPending } from './consoleStore';
+import {
+  configStore,
+  confirmationNote,
+  useConsoleStore,
+  useSectionPending,
+  type Confirmation,
+} from './consoleStore';
 import { SchemaFields } from './FieldRenderer';
-import { nameBetween, nameWith } from './format';
+import { joinNotes, nameBetween, nameWith } from './format';
+import { useLiveRefresh } from './liveRefresh';
 import { PlatformProvider } from './platformContext';
 import { useConsoleSchema, useSchemaStore } from './schemaStore';
 import { Section, SectionNote } from './Section';
@@ -33,9 +40,12 @@ interface BarState {
 function barState(
   live: { published: boolean; stale?: boolean; applied?: boolean } | null,
   parseError: string,
+  confirmation: Confirmation | null,
 ): BarState {
   if (parseError) return { tone: 'halt', text: '配置有语法错误，bot 仍在用上一份' };
   if (live?.published && live.stale) return { tone: 'halt', text: 'bot 心跳已中断' };
+  // 写完到 bot 换上之间 applied 必然为假，这时亮红灯像是出了错。
+  if (live?.published && confirmation === 'waiting') return { tone: 'idle', text: '已写入，等 bot 确认生效…' };
   if (live?.published && live.applied) return { tone: 'live', text: '已生效' };
   if (live?.published) return { tone: 'halt', text: 'bot 用的还是旧配置' };
   return { tone: 'idle', text: '等待 bot 上报' };
@@ -43,20 +53,25 @@ function barState(
 
 const PlatformStatusBar = ({ confirmDiscard }: { confirmDiscard: () => boolean }) => {
   const adminToken = useSettingsStore((state) => state.adminToken);
-  const { live, saving, draft, apply, discard } = useConsoleStore();
+  const { live, saving, draft, confirmation, apply, discard } = useConsoleStore();
   const pending = Object.keys(draft).length;
-  const { tone, text } = barState(live, String(live?.state?.parse_error || ''));
+  const { tone, text } = barState(live, String(live?.state?.parse_error || ''), confirmation);
 
   return (
-    <StatusBar tone={tone}>
-      <span className="font-medium">{text}</span>
-      {pending > 0 && (
+    <StatusBar
+      status={(
         <>
-          <span className="text-[var(--duties-border)]">·</span>
-          <span className="font-medium text-[var(--duties-danger)]">{pending} 项待应用</span>
+          <span className="font-medium">{text}</span>
+          {pending > 0 && (
+            <>
+              <span aria-hidden="true" className="text-[var(--duties-border)]">·</span>
+              <span className="font-medium text-[var(--duties-danger)]">{pending} 项待应用</span>
+            </>
+          )}
         </>
       )}
-      <span className="flex-1" />
+      tone={tone}
+    >
       <Button disabled={pending === 0 || saving} onClick={() => { if (confirmDiscard()) discard(); }} tone="quiet">丢弃</Button>
       <Button disabled={pending === 0 || saving} onClick={() => adminToken && void apply(adminToken)}>
         {saving ? '正在应用…' : '应用'}
@@ -104,7 +119,7 @@ interface PlatformPageProps {
 
 const PlatformPageBody = ({ connection, note, platform }: Omit<PlatformPageProps, 'parts'>) => {
   const { adminToken, isAuthenticated } = useSettingsStore();
-  const { live, loading, error, notice, refresh, draft } = useConsoleStore();
+  const { live, loading, loadError, applyError, notice, confirmation, refresh, draft } = useConsoleStore();
   const scope = platformScope(platform.id);
   const { schema, error: schemaError } = useConsoleSchema(scope);
   const loadSchema = useSchemaStore((state) => state.load);
@@ -117,14 +132,14 @@ const PlatformPageBody = ({ connection, note, platform }: Omit<PlatformPageProps
 
   const { isOpen, requested, toggle } = useSectionOpenState(scopedKey(`console_sections_${platform.id}`));
 
-  // 各设置页之间没有共同的父组件替它们拉，只能每页各自拉一次。
-  // 全局那份也拉：共享键选「跟随全局」之后，没应用之前要显示全局那边的值。
+  // 各设置页之间没有共同的父组件替它们拉，只能每页各自拉。
+  // 全局那份也跟着读：共享键选「跟随全局」之后，没应用之前要显示全局那边的值。
+  useLiveRefresh(refresh, adminToken);
+  useLiveRefresh(refreshInherited, adminToken);
   useEffect(() => {
     if (!adminToken) return;
-    void refresh(adminToken);
-    void refreshInherited(adminToken);
     void loadSchema(adminToken, scope);
-  }, [adminToken, loadSchema, refresh, refreshInherited, scope]);
+  }, [adminToken, loadSchema, scope]);
 
   const published = Boolean(live?.published);
   const body = loading && !live ? <Empty>正在读取配置…</Empty>
@@ -142,18 +157,20 @@ const PlatformPageBody = ({ connection, note, platform }: Omit<PlatformPageProps
       authed={isAuthenticated}
       bar={isAuthenticated ? <PlatformStatusBar confirmDiscard={confirmDiscard} /> : undefined}
       description={note}
-      error={error}
+      error={applyError}
       eyebrow="平台"
-      notice={notice}
+      notice={joinNotes(notice, confirmationNote(scope, confirmation))}
       title={platform.displayName}
     >
+      {loadError && <ErrorText role="alert">{loadError}</ErrorText>}
       {parseError && (
-        <ErrorText>
+        <ErrorText role="alert">
           平台配置解析失败：{parseError}。bot 仍在用上一份有效配置。请先修复原文件语法；本页不会覆盖损坏文件。
         </ErrorText>
       )}
-      {connection}
+      {/* 「bot 还没上报」说的是整页为什么空着，得排在连接卡前面先交代。 */}
       {body}
+      {connection}
       {layout}
       {schema && (
         <div className="border-t border-[var(--duties-border)]">

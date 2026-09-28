@@ -6,11 +6,12 @@ import type { ReactNode } from 'react';
 import type { ConfigLiveState } from '../api/supervisorClient';
 import { ConnectionCard } from '../console/ConnectionCard';
 import { platformConsoleStore, readLinkFacts, type ConsoleState } from '../console/consoleStore';
-import { nameBetween, nameWith } from '../console/format';
+import { joinNotes, nameBetween, nameWith } from '../console/format';
 import { QueueFacts } from '../console/LinkFacts';
 import { PlatformProvider } from '../console/platformContext';
 import { AccountSummary } from '../console/sectionSummaries';
 import { QQ_NAPCAT, type PlatformDescriptor } from '../platforms/registry';
+import { appendSentence } from '../utils/sentence';
 
 // 后端新出的平台：前端没登记过，连接卡上的两行名字全从描述里来。
 const OTHERCHAT: PlatformDescriptor = {
@@ -150,6 +151,91 @@ describe('名字夹在两段中文之间', () => {
   });
 });
 
+// 写回的警告和认账的结论各说各的，拼在一行给人看；哪一句空着都不能留一个孤零零的分号。
+describe('几句交代连成一段', () => {
+  it('用「；」连起来', () => {
+    expect(joinNotes('原文认不出，整份文件重写了', '已保存，正在等在跑的 bot 换上新文件…'))
+      .toBe('原文认不出，整份文件重写了；已保存，正在等在跑的 bot 换上新文件…');
+    expect(joinNotes('甲', '乙', '丙')).toBe('甲；乙；丙');
+  });
+
+  it('空的那几句跳过，不留多余的分号', () => {
+    expect(joinNotes('', '已保存。')).toBe('已保存。');
+    expect(joinNotes('已保存。', '')).toBe('已保存。');
+    expect(joinNotes('甲', '', '丙')).toBe('甲；丙');
+  });
+
+  it('全是空的就什么都不剩', () => {
+    expect(joinNotes()).toBe('');
+    expect(joinNotes('')).toBe('');
+    expect(joinNotes('', '')).toBe('');
+  });
+});
+
+// 写完的那句还在，紧跟着重读失败的原因接在它后面：中间少个句号两句就粘成一句，同一个原因连报两次不能叠。
+describe('在已有的一句后面再接一句', () => {
+  it('前一句没收尾就先补个句号', () => {
+    expect(appendSentence('已保存角色字段：danbooru', '503 拉不到绘图配置'))
+      .toBe('已保存角色字段：danbooru。503 拉不到绘图配置');
+    expect(appendSentence('工具已重载，序号 7', '加载工具失败')).toBe('工具已重载，序号 7。加载工具失败');
+  });
+
+  it('前一句已经收了尾就直接接上', () => {
+    expect(appendSentence('API 配置已保存。', '503 拉不到绘图配置')).toBe('API 配置已保存。503 拉不到绘图配置');
+    expect(appendSentence('这份配置写不进去！', '503 拉不到绘图配置')).toBe('这份配置写不进去！503 拉不到绘图配置');
+    expect(appendSentence('改的是哪一份配置？', '503 拉不到绘图配置')).toBe('改的是哪一份配置？503 拉不到绘图配置');
+  });
+
+  it('前一句是空的就只剩后一句，不补先导句号', () => {
+    expect(appendSentence('', '503 拉不到绘图配置')).toBe('503 拉不到绘图配置');
+  });
+
+  it('后一句是空的就只剩前一句，不补尾随句号', () => {
+    expect(appendSentence('已保存角色字段：danbooru', '')).toBe('已保存角色字段：danbooru');
+    expect(appendSentence('API 配置已保存。', '')).toBe('API 配置已保存。');
+  });
+
+  it('两边都空就什么都不剩', () => {
+    expect(appendSentence('', '')).toBe('');
+  });
+
+  it('同一个原因连报两次不叠加', () => {
+    const once = appendSentence('API 配置已保存。', '503 拉不到绘图配置');
+    expect(once).toBe('API 配置已保存。503 拉不到绘图配置');
+    expect(appendSentence(once, '503 拉不到绘图配置')).toBe(once);
+    expect(appendSentence(appendSentence(once, '503 拉不到绘图配置'), '503 拉不到绘图配置')).toBe(once);
+  });
+
+  it('按句去重，不是按后缀', () => {
+    // 「失败」是「加载A失败」的后缀却不是同一句，吞掉它就把真正的新原因吃了。
+    expect(appendSentence('加载A失败', '失败')).toBe('加载A失败。失败');
+    expect(appendSentence('工具已创建，请在右栏编辑 Python 脚本。', '脚本')).toBe(
+      '工具已创建，请在右栏编辑 Python 脚本。脚本',
+    );
+  });
+
+  it('要接的几句全说过了就一句不接', () => {
+    expect(appendSentence('读不到清单。连不上 supervisor', '读不到清单。连不上 supervisor')).toBe(
+      '读不到清单。连不上 supervisor',
+    );
+    // 说过的顺序不同也算说过。
+    expect(appendSentence('读不到清单。连不上 supervisor', '连不上 supervisor。读不到清单')).toBe(
+      '读不到清单。连不上 supervisor',
+    );
+  });
+
+  it('只要有一句没说过，整段都接上', () => {
+    expect(appendSentence('读不到清单', '读不到清单。连不上 supervisor')).toBe(
+      '读不到清单。读不到清单。连不上 supervisor',
+    );
+  });
+
+  it('句末标点是哪一个都算同一句', () => {
+    expect(appendSentence('这份配置写不进去！', '这份配置写不进去')).toBe('这份配置写不进去！');
+    expect(appendSentence('改的是哪一份配置？', '改的是哪一份配置')).toBe('改的是哪一份配置？');
+  });
+});
+
 describe('连接卡', () => {
   it('按约定里的 connected 报平台那一段', () => {
     seed(live({ connected: true, runtime: { pid: 42 } }));
@@ -166,12 +252,26 @@ describe('连接卡', () => {
     expect(screen.getByText('未连接')).toBeTruthy();
   });
 
-  it('心跳断了平台那一段无从判断', () => {
+  it('心跳断了平台那一段无从判断，说的是心跳中断不是没在跑', () => {
     seed(live({ connected: true }, true));
     inQq(<ConnectionCard />);
 
     expect(screen.getByText('心跳中断')).toBeTruthy();
     expect(screen.getByText('未知')).toBeTruthy();
+    expect(screen.getByText('适配进程心跳中断，这一项无从判断')).toBeTruthy();
+    expect(screen.queryByText('适配进程没在跑，这一项无从判断')).toBeNull();
+  });
+
+  it('连上了就把账号摆出来，没报账号的只说已连接', () => {
+    seed(live({ connected: true, account: '10001' }));
+    const view = inQq(<ConnectionCard />);
+    expect(screen.getByText('账号 10001')).toBeTruthy();
+
+    view.unmount();
+    seed(live({ connected: true }));
+    inQq(<ConnectionCard />);
+
+    expect(screen.queryByText(/^账号 /)).toBeNull();
   });
 
   it('两行名字都从平台描述里来，QQ 的还是原来那两个', () => {

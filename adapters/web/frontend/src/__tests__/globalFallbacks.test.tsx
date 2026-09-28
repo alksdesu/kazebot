@@ -76,10 +76,10 @@ const Probe = ({ name }: { name: string }) => {
 
 beforeEach(() => {
   configStore(FEATURES_SCOPE).setState({
-    live: null, draft: {}, raw: '', rawExists: true, loading: false, saving: false, error: '', notice: '',
+    live: null, draft: {}, raw: '', rawExists: true, loading: false, saving: false, loadError: '', applyError: '', notice: '', confirmation: null,
   });
   platformConsoleStore('qq').setState({
-    live: null, draft: {}, raw: '', rawExists: true, loading: false, saving: false, error: '', notice: '',
+    live: null, draft: {}, raw: '', rawExists: true, loading: false, saving: false, loadError: '', applyError: '', notice: '', confirmation: null,
   });
 });
 
@@ -292,8 +292,11 @@ describe('useGlobalFallbacks', () => {
   });
 });
 
+// 写回落地到生效方换上新文件之间，界面按刚写进去的值显示；探测一落结论就换成实况，所以断言都在这一小段里。
 describe('保存之后先按写进去的算', () => {
-  /** 写回成功，但生效方还没认账：写完之后读到的原文是别人又改过的那份，settle 不会拿它盖掉刚写进去的值。 */
+  const CONFIRM_MS = 61_000;
+
+  /** 写回成功，生效方还没换上；第一轮探测读到的原文是别人又改过的那份，落个「被改过」的结论收场。 */
   const serveDiverged = (): void => {
     let reads = 0;
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -306,20 +309,40 @@ describe('保存之后先按写进去的算', () => {
     }));
   };
 
+  const saves: Promise<unknown>[] = [];
+
+  /** 保存，停在写回已落地、第一轮探测还没开始的那一刻。 */
+  const startSave = async (): Promise<void> => {
+    serveDiverged();
+    vi.useFakeTimers();
+    saves.push(configStore(FEATURES_SCOPE).getState().save('token', ['sticker_auto_tag']));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(configStore(FEATURES_SCOPE).getState().confirmation).toBe('waiting');
+  };
+
+  /** 推到探测落结论为止：留一趟还在等的探测，会在别的测试里改 store。 */
+  const settle = async (): Promise<unknown[]> => {
+    await vi.advanceTimersByTimeAsync(CONFIRM_MS);
+    const outcomes = await Promise.all(saves.splice(0));
+    vi.useRealTimers();
+    return outcomes;
+  };
+
+  afterEach(() => { vi.useRealTimers(); });
+
   it('写进去的键立刻算成本层写着，来源也跟着落到本层', async () => {
     configStore(FEATURES_SCOPE).setState({
       live: featuresLive({ values: { sticker_auto_tag: true }, sources: { sticker_auto_tag: 'default' } }),
       draft: {},
     });
     configStore(FEATURES_SCOPE).getState().setDraft('sticker_auto_tag', false);
-    serveDiverged();
 
-    const outcome = await configStore(FEATURES_SCOPE).getState().save('token', ['sticker_auto_tag']);
+    await startSave();
 
-    expect(outcome?.ok).toBe(true);
     render(<ConfigScopeProvider scope={FEATURES_SCOPE}><Probe name="sticker_auto_tag" /></ConfigScopeProvider>);
     expect(screen.getByTestId('layer')).toHaveTextContent('true|true|global');
     expect(configStore(FEATURES_SCOPE).getState().live?.state?.values?.sticker_auto_tag).toBe(false);
+    expect(await settle()).toEqual([{ ok: true, message: '' }]);
   });
 
   it('生效方不公布来源时不凭空造一份出来', async () => {
@@ -329,14 +352,14 @@ describe('保存之后先按写进去的算', () => {
       draft: {},
     });
     configStore(FEATURES_SCOPE).getState().setDraft('sticker_auto_tag', false);
-    serveDiverged();
 
-    await configStore(FEATURES_SCOPE).getState().save('token', ['sticker_auto_tag']);
+    await startSave();
 
     expect(configStore(FEATURES_SCOPE).getState().live?.state?.sources).toBeUndefined();
     expect(configStore(FEATURES_SCOPE).getState().live?.state?.values?.sticker_auto_tag).toBe(false);
     render(<ConfigScopeProvider scope={FEATURES_SCOPE}><Probe name="sticker_auto_tag" /></ConfigScopeProvider>);
     expect(screen.getByTestId('layer')).toHaveTextContent('false|false|-');
+    await settle();
   });
 
   it('删行不叠：删完落到哪一层只有生效方算得出来', async () => {
@@ -346,12 +369,28 @@ describe('保存之后先按写进去的算', () => {
     });
     configStore(FEATURES_SCOPE).getState().inherit('sticker_auto_tag');
 
-    serveDiverged();
-    await configStore(FEATURES_SCOPE).getState().save('token', ['sticker_auto_tag']);
+    await startSave();
 
     const { live } = configStore(FEATURES_SCOPE).getState();
     expect(live?.state?.values?.sticker_auto_tag).toBe(false);
     expect(live?.state?.sources?.sticker_auto_tag).toBe('global');
+    await settle();
+  });
+
+  it('探测落了结论就换成生效方那一份，不再拿写进去的值顶着', async () => {
+    configStore(FEATURES_SCOPE).setState({
+      live: featuresLive({ values: { sticker_auto_tag: true }, sources: { sticker_auto_tag: 'default' } }),
+      draft: {},
+    });
+    configStore(FEATURES_SCOPE).getState().setDraft('sticker_auto_tag', false);
+
+    await startSave();
+    await settle();
+
+    const state = configStore(FEATURES_SCOPE).getState();
+    expect(state.confirmation).toBe('changed');
+    expect(state.raw).toBe('version: 2\n');
+    expect(state.live?.state?.values).toEqual({});
   });
 });
 

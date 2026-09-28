@@ -8,7 +8,8 @@ import { NodeFilesSettingsPage } from '../components/settings/pages/NodeFilesSet
 import { AgentsSettingsRightPanel, AutomationSettingsRightPanel } from '../components/settings/panels/SettingsContextPanels';
 import { hasLikelyYamlSyntaxIssue } from '../components/settings/settingsStructuredConfig';
 import { parseMcpClients, parseNodeConfig, parseSchedules, serializeMcpClients, serializeNodeConfig, serializeSchedules } from '../components/settings/settingsStructuredConfig';
-import { platformConsoleStore } from '../console/consoleStore';
+import { platformScope } from '../console/configScope';
+import { confirmationNote, platformConsoleStore } from '../console/consoleStore';
 import { useSettingsSelectionStore } from '../store/settingsSelectionStore';
 import { useSettingsStore } from '../store/settingsStore';
 
@@ -32,7 +33,7 @@ beforeEach(() => {
   vi.spyOn(window, 'confirm').mockReturnValue(true);
   useSettingsStore.setState({ adminToken: 'synthetic-token', isAuthenticated: true });
   useSettingsSelectionStore.setState({ selectedNode: null, selectedScheduleId: null });
-  platformConsoleStore('qq').setState({ draft: {}, raw: '', live: null, saving: false, loading: false, error: '', notice: '' });
+  platformConsoleStore('qq').setState({ draft: {}, raw: '', live: null, saving: false, loading: false, loadError: '', applyError: '', notice: '', confirmation: null });
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
@@ -200,7 +201,10 @@ describe('shared QQ apply transaction', () => {
     expect(platformConsoleStore('qq').getState().draft).toEqual({ a: true, b: false });
     expect(platformConsoleStore('qq').getState().raw).toContain('other: latest');
     expect(platformConsoleStore('qq').getState().live?.applied).toBe(false);
-    expect(platformConsoleStore('qq').getState().notice).toContain('无法确认');
+    // 探不到生效方时不能报成写失败：写已经成功了，只是认账这一步没结论。
+    expect(platformConsoleStore('qq').getState().applyError).toBe('');
+    expect(platformConsoleStore('qq').getState().confirmation).toBe('unreadable');
+    expect(confirmationNote(platformScope('qq'), 'unreadable')).toContain('还不知道是否生效');
   });
   it('never PUTs over malformed YAML and keeps the draft for repair', async () => {
     seed();
@@ -209,6 +213,6 @@ describe('shared QQ apply transaction', () => {
     await platformConsoleStore('qq').getState().apply('synthetic');
     expect(api.updatePlatformRaw).not.toHaveBeenCalled();
     expect(platformConsoleStore('qq').getState().draft).toEqual({ a: false });
-    expect(platformConsoleStore('qq').getState().error).not.toBe('');
+    expect(platformConsoleStore('qq').getState().applyError).not.toBe('');
   });
 });

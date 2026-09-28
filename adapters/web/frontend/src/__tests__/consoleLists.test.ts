@@ -161,7 +161,7 @@ describe('local aliases', () => {
     });
     platformConsoleStore('qq').getState().setDraft('allowed_groups', [700]);
 
-    const out = mergeDraft('', platformConsoleStore('qq').getState().draft, { allowed_groups: 'channels.allowed_groups' });
+    const out = mergeDraft('', platformConsoleStore('qq').getState().draft, { allowed_groups: 'channels.allowed_groups' }).content;
 
     expect(out).toContain('700');
     expect(out).not.toContain('公司内部群');

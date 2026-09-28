@@ -117,7 +117,7 @@ beforeEach(() => {
   clearConsoleSchemas();
   useViewStore.setState({ viewMode: 'settings', activeSettingsTab: 'general', activeSettingsSection: '' });
   useSettingsStore.setState({ adminToken: '', isAuthenticated: true, isConnected: true });
-  platformConsoleStore('otherchat').setState({ live: null, draft: {}, raw: '', loading: false, saving: false, error: '', notice: '' });
+  platformConsoleStore('otherchat').setState({ live: null, draft: {}, raw: '', loading: false, saving: false, loadError: '', applyError: '', notice: '', confirmation: null });
 });
 
 afterEach(() => {

@@ -37,7 +37,7 @@ describe('控制台排版 token', () => {
   });
 
   it('字号、字距、动效由 @theme 出 utility', () => {
-    for (const token of ['--text-mini', '--text-micro', '--text-nano', '--tracking-caps', '--tracking-figure', '--tracking-ident', '--animate-verdict-flip']) {
+    for (const token of ['--text-mini', '--text-micro', '--text-nano', '--tracking-caps', '--tracking-figure', '--tracking-ident', '--animate-verdict-flip', '--animate-section-open', '--animate-section-fade']) {
       expect(STYLESHEET).toContain(`${token}:`);
     }
   });

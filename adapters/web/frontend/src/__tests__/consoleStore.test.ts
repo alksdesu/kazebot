@@ -3,12 +3,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ConfigInputRule, ConfigSource } from '../api/supervisorClient';
-import { FEATURES_SCOPE } from '../console/configScope';
+import { FEATURES_SCOPE, platformScope, type ConfigScope } from '../console/configScope';
 import { barState } from '../console/PlatformPage';
 import {
   addWord,
   asWordList,
   configStore,
+  confirmationNote,
   countDraftFor,
   displayedValue,
   effectiveValues,
@@ -19,6 +20,7 @@ import {
   setByPath,
   type ConfigConsoleStore,
 } from '../console/consoleStore';
+import { BLOCK_COMMENTS_DROPPED, WHOLE_FILE_REWRITTEN } from '../console/yamlRewrite';
 import { adoptPlatforms, QQ_NAPCAT, resetPlatforms, type PlatformDescriptor } from '../platforms/registry';
 
 const PATHS: Record<string, string> = {
@@ -33,7 +35,7 @@ const PATHS: Record<string, string> = {
 const WORD_RULE: ConfigInputRule = { kind: 'word', trim: true };
 
 const dumpedWords = (words: string[]): string[] =>
-  mergeDraft('', { keyword_words: words }, PATHS)
+  mergeDraft('', { keyword_words: words }, PATHS).content
     .split('\n')
     .map((line) => line.trim())
     .filter((line) => line.startsWith('- '))
@@ -71,21 +73,60 @@ const seedSourced = (
 const json = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 
-/** 假的配置接口：记下每次 PUT 的原文，读原文时还回最近写进去的那份，状态按 applied 回。 */
-const serveConfig = (values: Record<string, unknown>, { applied = true, raw = 'version: 1\n' } = {}): string[] => {
-  const sent: string[] = [];
+/** 假的配置接口：记下每次 PUT 的原文，读原文时还回最近写进去的那份，状态按 applied 回。
+ *  返回的盒子随时可以改口，认账那边隔一会儿探一次，中途换答案才测得到各种结论。 */
+const serveConfig = (values: Record<string, unknown>, { applied = true, raw = 'version: 1\n' } = {}) => {
+  const box = {
+    sent: [] as string[],
+    applied,
+    /** 非空表示文件被别处改过：读原文不再还回自己写的那份。 */
+    override: '',
+    /** 只让状态端点失败：写回用的读原文还得能走通。 */
+    stateDown: false,
+    /** 每次状态快照换个心跳读数，看得出 live 有没有跟着换。 */
+    beat: 0,
+    warnings: [] as string[],
+  };
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     if (init?.method === 'PUT') {
-      sent.push(String(JSON.parse(String(init.body)).content));
-      return json({ ok: true, warnings: [] });
+      box.sent.push(String(JSON.parse(String(init.body)).content));
+      return json({ ok: true, warnings: box.warnings });
     }
     if (String(input).endsWith('/config/state')) {
-      return json({ published: true, applied, file: {}, state: { values, paths: PATHS }, platforms: [] });
+      if (box.stateDown) throw new Error('读不到 bot 的状态');
+      box.beat += 1;
+      return json({
+        published: true, applied: box.applied, age_sec: box.beat, file: {},
+        state: { values, paths: PATHS }, platforms: [],
+      });
     }
-    return json({ content: sent.length ? sent[sent.length - 1] : raw, exists: true });
+    return json({ content: box.override || (box.sent.length ? box.sent[box.sent.length - 1] : raw), exists: true });
   }));
-  return sent;
+  return box;
 };
+
+/** 写回之后 bot 还没认账时，store 的那份快照：值是写进去的，applied 仍为假。 */
+const stage = (store: ConfigConsoleStore, values: Record<string, unknown>) => {
+  store.setState({
+    live: {
+      published: true,
+      applied: false,
+      file: { exists: true, mtime_ns: 1, size: 1 },
+      state: { values, paths: PATHS },
+    },
+    draft: {},
+    raw: '',
+    saving: false,
+    notice: '',
+    loadError: '',
+    applyError: '',
+    confirmation: null,
+  });
+};
+
+// 快等 12 轮 × 250ms，之后后台每 2000ms 再探，从写完算满 60 秒才算没确认。
+const QUICK_MS = 250 * 12;
+const CONFIRM_MS = 61_000;
 
 afterEach(() => { vi.unstubAllGlobals(); });
 
@@ -142,7 +183,7 @@ describe('setByPath', () => {
 
 describe('mergeDraft', () => {
   it('translates key names into the dotted yaml paths', () => {
-    const out = mergeDraft('', { signal_name: true }, PATHS);
+    const { content: out } = mergeDraft('', { signal_name: true }, PATHS);
 
     expect(out).toContain('trigger:');
     expect(out).toContain('    name: true');
@@ -153,7 +194,7 @@ describe('mergeDraft', () => {
   it('keeps everything the draft did not touch', () => {
     const raw = ['version: 1', 'channels:', '  allowed_groups:', '    - 123', ''].join('\n');
 
-    const out = mergeDraft(raw, { signal_at: false }, PATHS);
+    const { content: out } = mergeDraft(raw, { signal_at: false }, PATHS);
 
     expect(out).toContain('version: 1');
     expect(out).toContain('- 123');
@@ -170,7 +211,7 @@ describe('mergeDraft', () => {
   });
 
   it('writes numbers as numbers', () => {
-    const out = mergeDraft('', { cooldown_group_sec: 30 }, PATHS);
+    const { content: out } = mergeDraft('', { cooldown_group_sec: 30 }, PATHS);
 
     expect(out).toContain('per_group_sec: 30');
     expect(out).not.toContain("per_group_sec: '30'");
@@ -203,7 +244,7 @@ describe('mergeDraft', () => {
   it('a null deletes the line so the next layer takes over', () => {
     const raw = ['version: 1', 'trigger:', '  signals:', '    at: false', '    name: true', ''].join('\n');
 
-    const out = mergeDraft(raw, { signal_at: null }, PATHS);
+    const { content: out } = mergeDraft(raw, { signal_at: null }, PATHS);
 
     expect(out).not.toContain('at:');
     expect(out).toContain('    name: true');
@@ -408,7 +449,7 @@ describe('useInputRule', () => {
 
 describe('the draft counter', () => {
   beforeEach(() => {
-    platformConsoleStore('qq').setState({ draft: {}, live: null, raw: '', notice: '', error: '' });
+    platformConsoleStore('qq').setState({ draft: {}, live: null, raw: '', notice: '', loadError: '', applyError: '', confirmation: null });
   });
 
   it('counts a change away from the applied value', () => {
@@ -602,23 +643,24 @@ describe('inherit and pin', () => {
 
 describe('apply', () => {
   beforeEach(() => {
-    platformConsoleStore('qq').setState({ draft: {}, live: null, raw: '', notice: '', error: '' });
+    platformConsoleStore('qq').setState({ draft: {}, live: null, raw: '', notice: '', loadError: '', applyError: '', confirmation: null });
   });
 
   it('sends the merged document, clears the draft and waits for the bot to confirm', async () => {
     seedLive({ signal_name: false });
     platformConsoleStore('qq').getState().setDraft('signal_name', true);
-    const sent = serveConfig({ signal_name: true });
+    const box = serveConfig({ signal_name: true });
 
     await platformConsoleStore('qq').getState().apply('token');
 
-    expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain('version: 1');
-    expect(sent[0]).toContain('    name: true');
+    expect(box.sent).toHaveLength(1);
+    expect(box.sent[0]).toContain('version: 1');
+    expect(box.sent[0]).toContain('    name: true');
     const state = platformConsoleStore('qq').getState();
     expect(state.draft).toEqual({});
-    // bot 第一轮就认账，不该冒出「没在 3 秒内确认」。
+    // bot 第一轮就认账，页面级提示里不该冒出交代认账的话。
     expect(state.notice).toBe('');
+    expect(state.confirmation).toBe('confirmed');
     expect(state.live?.applied).toBe(true);
   });
 
@@ -632,33 +674,33 @@ describe('apply', () => {
 
     const state = platformConsoleStore('qq').getState();
     expect(state.draft).toEqual({ signal_name: true });
-    expect(state.error).toContain('无人消费的配置项');
+    expect(state.applyError).toContain('无人消费的配置项');
     expect(state.saving).toBe(false);
   });
 });
 
 describe('save', () => {
   beforeEach(() => {
-    platformConsoleStore('qq').setState({ draft: {}, live: null, raw: '', notice: '', error: '' });
-    configStore(FEATURES_SCOPE).setState({ draft: {}, live: null, raw: '', notice: '', error: '' });
+    platformConsoleStore('qq').setState({ draft: {}, live: null, raw: '', notice: '', loadError: '', applyError: '', confirmation: null });
+    configStore(FEATURES_SCOPE).setState({ draft: {}, live: null, raw: '', notice: '', loadError: '', applyError: '', confirmation: null });
   });
 
   it('writes only the keys it was given and leaves the rest staged', async () => {
     seedLive({ signal_name: false, signal_at: true });
     platformConsoleStore('qq').getState().setDraft('signal_name', true);
     platformConsoleStore('qq').getState().setDraft('signal_at', false);
-    const sent = serveConfig({ signal_name: true, signal_at: true });
+    const box = serveConfig({ signal_name: true, signal_at: true });
 
     const outcome = await platformConsoleStore('qq').getState().save('token', ['signal_name']);
 
     expect(outcome).toEqual({ ok: true, message: '' });
-    expect(sent[0]).toContain('    name: true');
-    expect(sent[0]).not.toContain('at:');
+    expect(box.sent[0]).toContain('    name: true');
+    expect(box.sent[0]).not.toContain('at:');
     const state = platformConsoleStore('qq').getState();
     expect(state.draft).toEqual({ signal_at: false });
     // 结果留给区块自己显示，页面级的提示不动。
     expect(state.notice).toBe('');
-    expect(state.error).toBe('');
+    expect(state.applyError).toBe('');
   });
 
   it('does not touch the server when none of its keys is staged', async () => {
@@ -680,7 +722,7 @@ describe('save', () => {
     expect(outcome?.ok).toBe(false);
     expect(outcome?.message).toContain('只能写在平台配置里');
     expect(platformConsoleStore('qq').getState().draft).toEqual({ signal_name: true });
-    expect(platformConsoleStore('qq').getState().error).toBe('');
+    expect(platformConsoleStore('qq').getState().applyError).toBe('');
   });
 
   it('the global file goes through /features and reports in its own words', async () => {
@@ -702,13 +744,167 @@ describe('save', () => {
 
     const outcome = await configStore(FEATURES_SCOPE).getState().save('token', ['signal_name']);
 
-    expect(outcome).toEqual({ ok: true, message: '全局文件在保存之后又被改过，请刷新核对当前内容。' });
+    // 认账的结论走 confirmation，message 只留后端的警告。
+    expect(outcome).toEqual({ ok: true, message: '' });
+    expect(configStore(FEATURES_SCOPE).getState().confirmation).toBe('changed');
     expect(requests.some((line) => line.startsWith('PUT ') && line.endsWith('/features/config/raw'))).toBe(true);
     expect(requests.filter((line) => line.includes('/platforms/'))).toEqual([]);
   });
+
+  it('只把后端的警告交回给调用方', async () => {
+    seedLive({ signal_name: false });
+    platformConsoleStore('qq').getState().setDraft('signal_name', true);
+    const box = serveConfig({ signal_name: true });
+    box.warnings = ['bot 没在跑，只校验了 YAML 语法'];
+
+    const outcome = await platformConsoleStore('qq').getState().save('token', ['signal_name']);
+
+    expect(outcome).toEqual({ ok: true, message: 'bot 没在跑，只校验了 YAML 语法' });
+  });
+
+  it('原文认不出、只能整份重写时接在警告后面交代一句', async () => {
+    seedLive({ signal_name: false });
+    platformConsoleStore('qq').getState().setDraft('signal_name', true);
+    // 父键是流式映射，往它下面加子键就只能整份重写。
+    const box = serveConfig({ signal_name: true }, { raw: 'trigger: {signals: {at: true}}\n' });
+    box.warnings = ['bot 没在跑，只校验了 YAML 语法'];
+
+    const outcome = await platformConsoleStore('qq').getState().save('token', ['signal_name']);
+
+    expect(outcome).toEqual({
+      ok: true,
+      message: `bot 没在跑，只校验了 YAML 语法；${WHOLE_FILE_REWRITTEN}`,
+    });
+  });
+
+  it('列表整块重写洗掉注释时也如实说一句', async () => {
+    seedLive({ keyword_words: ['早安', '晚安'] });
+    platformConsoleStore('qq').getState().setDraft('keyword_words', ['晚安', '午安', '夜安']);
+    // 一次换掉好几项只能整块重写，夹在条目之间的注释就留不住了。
+    serveConfig({ keyword_words: ['早安', '晚安'] }, {
+      raw: ['trigger:', '  keyword:', '    words:', '      - 早安', '      # 这条是夜里用的', '      - 晚安', ''].join('\n'),
+    });
+
+    const outcome = await platformConsoleStore('qq').getState().save('token', ['keyword_words']);
+
+    expect(outcome).toEqual({ ok: true, message: BLOCK_COMMENTS_DROPPED });
+  });
 });
 
-// 应用了但 bot 一直不认账时，要告诉人去服务器上看哪个进程。哪个进程按平台清单说。
+// 写回之后到 bot 换上新文件之间：先锁着按钮快等一阵，没等到就放开按钮转后台，
+// 等满一分钟还没换上才下「没确认」的结论。中间任何一步把状态搞错，界面都会骗人。
+describe('认账', () => {
+  const qq = () => platformConsoleStore('qq');
+
+  beforeEach(() => { stage(qq(), { signal_name: false }); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('写回成功就先记成等 bot 认账，值按写进去的那些显示', async () => {
+    qq().getState().setDraft('signal_name', true);
+    serveConfig({ signal_name: false }, { applied: false });
+
+    vi.useFakeTimers();
+    const applying = qq().getState().apply('token');
+    await vi.advanceTimersByTimeAsync(250 * 3);
+
+    const waiting = qq().getState();
+    expect(waiting.confirmation).toBe('waiting');
+    expect(waiting.saving).toBe(true);
+    // 生效方公布的还是写回前的值，原样铺上去界面就闪回旧值了。
+    expect(waiting.live?.state?.values).toEqual({ signal_name: true });
+    expect(waiting.live?.applied).toBe(false);
+    // 心跳这类实况仍按每次探到的换：探了三轮就是第三份快照。
+    expect(waiting.live?.age_sec).toBe(3);
+
+    await vi.advanceTimersByTimeAsync(CONFIRM_MS);
+    await applying;
+  });
+
+  it('快等十二轮还没认账就放开按钮，结论留到后台等满再下', async () => {
+    qq().getState().setDraft('signal_name', true);
+    serveConfig({ signal_name: false }, { applied: false });
+
+    vi.useFakeTimers();
+    const applying = qq().getState().apply('token');
+    await vi.advanceTimersByTimeAsync(QUICK_MS);
+    await applying;
+
+    expect(qq().getState().saving).toBe(false);
+    expect(qq().getState().confirmation).toBe('waiting');
+
+    await vi.advanceTimersByTimeAsync(CONFIRM_MS - QUICK_MS);
+
+    expect(qq().getState().confirmation).toBe('unconfirmed');
+    // 等满之后换上最后探到的快照：值回到 bot 实际在用的那些。
+    expect(qq().getState().live?.state?.values).toEqual({ signal_name: false });
+  });
+
+  it('bot 中途换上新文件就收在认账上', async () => {
+    qq().getState().setDraft('signal_name', true);
+    const box = serveConfig({ signal_name: false }, { applied: false });
+
+    vi.useFakeTimers();
+    const applying = qq().getState().apply('token');
+    await vi.advanceTimersByTimeAsync(QUICK_MS);
+    await applying;
+    expect(qq().getState().confirmation).toBe('waiting');
+
+    box.applied = true;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(qq().getState().confirmation).toBe('confirmed');
+    expect(qq().getState().live?.applied).toBe(true);
+  });
+
+  it('文件在写回之后又被别处改过就不再等，换上探到的那一份', async () => {
+    qq().getState().setDraft('signal_name', true);
+    const box = serveConfig({ signal_name: false }, { applied: false });
+    box.override = 'version: 9\n';
+
+    await qq().getState().apply('token');
+
+    const state = qq().getState();
+    expect(state.confirmation).toBe('changed');
+    expect(state.raw).toBe('version: 9\n');
+  });
+
+  it('探不到生效方就是读不到，live 不动', async () => {
+    qq().getState().setDraft('signal_name', true);
+    const box = serveConfig({ signal_name: false }, { applied: false });
+    box.stateDown = true;
+
+    await qq().getState().apply('token');
+
+    const state = qq().getState();
+    expect(state.confirmation).toBe('unreadable');
+    expect(state.applyError).toBe('');
+    expect(state.live?.state?.values).toEqual({ signal_name: true });
+  });
+
+  it('新的一次写回顶掉旧的后台等待', async () => {
+    qq().getState().setDraft('signal_name', true);
+    const box = serveConfig({ signal_name: false }, { applied: false });
+
+    vi.useFakeTimers();
+    const first = qq().getState().apply('token');
+    await vi.advanceTimersByTimeAsync(QUICK_MS);
+    await first;
+    expect(qq().getState().confirmation).toBe('waiting');
+
+    box.applied = true;
+    qq().getState().setDraft('signal_at', true);
+    const second = qq().getState().apply('token');
+    await vi.advanceTimersByTimeAsync(250);
+    await second;
+    expect(qq().getState().confirmation).toBe('confirmed');
+
+    // 旧的那趟即使等满也无权再改结论。
+    await vi.advanceTimersByTimeAsync(CONFIRM_MS);
+    expect(qq().getState().confirmation).toBe('confirmed');
+  });
+});
+
+// 认账出了岔子时要告诉人去服务器上看哪个进程。哪个进程按平台清单说。
 describe('没确认生效的提示', () => {
   const OTHERCHAT: PlatformDescriptor = {
     id: 'otherchat',
@@ -721,67 +917,258 @@ describe('没确认生效的提示', () => {
     connectionHint: '检查网关地址',
   };
 
-  /** 应用一次，让 bot 十二轮都不认账，返回状态条上那句话。 */
-  const applyUnconfirmed = async (store: ConfigConsoleStore): Promise<string> => {
-    store.setState({
-      live: {
-        published: true,
-        applied: false,
-        file: { exists: true, mtime_ns: 1, size: 1 },
-        state: { values: { signal_name: false }, paths: PATHS },
-      },
-      draft: {},
-      notice: '',
-      error: '',
-    });
+  /** 应用一次，让 bot 从头到尾不认账，返回落定之后要交代的那句话。 */
+  const applyUnconfirmed = async (store: ConfigConsoleStore, scope: ConfigScope): Promise<string> => {
+    stage(store, { signal_name: false });
     store.getState().setDraft('signal_name', true);
     serveConfig({ signal_name: false }, { applied: false });
 
     vi.useFakeTimers();
     try {
       const applying = store.getState().apply('token');
-      await vi.advanceTimersByTimeAsync(250 * 12 + 250);
+      await vi.advanceTimersByTimeAsync(QUICK_MS);
       await applying;
+      // 快等这一段只放开按钮，还不下结论。
+      expect(store.getState().confirmation).toBe('waiting');
+      await vi.advanceTimersByTimeAsync(CONFIRM_MS - QUICK_MS);
     } finally {
       vi.useRealTimers();
     }
-    return store.getState().notice;
+    expect(store.getState().confirmation).toBe('unconfirmed');
+    return confirmationNote(scope, store.getState().confirmation);
   };
 
   afterEach(resetPlatforms);
 
   it('内置的 QQ 报它的入口脚本', async () => {
-    expect(await applyUnconfirmed(platformConsoleStore('qq'))).toBe(
-      '已应用，但 bot 没在 3 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程（bot.py）。',
+    expect(await applyUnconfirmed(platformConsoleStore('qq'), platformScope('qq'))).toBe(
+      '已应用，但 bot 没在 60 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程（bot.py）。',
     );
   });
 
   it('后端新出的平台报它自己声明的入口脚本', async () => {
     adoptPlatforms([QQ_NAPCAT, OTHERCHAT]);
 
-    expect(await applyUnconfirmed(platformConsoleStore('otherchat'))).toBe(
-      '已应用，但 bot 没在 3 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程（otherchat_bot.py）。',
+    expect(await applyUnconfirmed(platformConsoleStore('otherchat'), platformScope('otherchat'))).toBe(
+      '已应用，但 bot 没在 60 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程（otherchat_bot.py）。',
     );
   });
 
   it('没声明入口的平台不留空括号', async () => {
     adoptPlatforms([QQ_NAPCAT, { ...OTHERCHAT, entrypoints: [] }]);
 
-    expect(await applyUnconfirmed(platformConsoleStore('otherchat'))).toBe(
-      '已应用，但 bot 没在 3 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程。',
+    expect(await applyUnconfirmed(platformConsoleStore('otherchat'), platformScope('otherchat'))).toBe(
+      '已应用，但 bot 没在 60 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程。',
     );
   });
 
   it('清单里根本没有这个平台时也不留空括号', async () => {
-    expect(await applyUnconfirmed(platformConsoleStore('ghost'))).toBe(
-      '已应用，但 bot 没在 3 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程。',
+    expect(await applyUnconfirmed(platformConsoleStore('ghost'), platformScope('ghost'))).toBe(
+      '已应用，但 bot 没在 60 秒内确认生效。它可能没在跑，去服务器上看这个平台的适配器进程。',
     );
   });
 
   it('全局设置那套话不跟着平台走', async () => {
-    expect(await applyUnconfirmed(configStore(FEATURES_SCOPE))).toBe(
-      '已保存，但有在跑的 bot 没在 3 秒内换上新文件，页面顶部列着是哪一个。',
+    expect(await applyUnconfirmed(configStore(FEATURES_SCOPE), FEATURES_SCOPE)).toBe(
+      '已保存，但有在跑的 bot 没在 60 秒内换上新文件，「全局默认」页顶部列着是哪一个。',
     );
+  });
+});
+
+describe('confirmationNote', () => {
+  afterEach(resetPlatforms);
+
+  it('认账了、还在等、没写过都不交代什么', () => {
+    expect(confirmationNote(platformScope('qq'), 'confirmed')).toBe('');
+    expect(confirmationNote(platformScope('qq'), 'waiting')).toBe('');
+    expect(confirmationNote(platformScope('qq'), null)).toBe('');
+  });
+
+  it('平台页：文件被改过和读不到各有各的话', () => {
+    expect(confirmationNote(platformScope('qq'), 'changed')).toBe('配置文件在应用之后又被改过，请核对当前内容。');
+    expect(confirmationNote(platformScope('qq'), 'unreadable')).toBe('已应用，但暂时读不到 bot 的状态，还不知道是否生效。');
+  });
+
+  it('全局设置自己一套话', () => {
+    expect(confirmationNote(FEATURES_SCOPE, 'changed')).toBe('全局文件在保存之后又被改过，请核对当前内容。');
+    expect(confirmationNote(FEATURES_SCOPE, 'unreadable')).toBe('已保存，但暂时读不到全局设置的状态，还不知道各平台换没换上。');
+  });
+});
+
+describe('refresh', () => {
+  const qq = () => platformConsoleStore('qq');
+
+  beforeEach(() => { stage(qq(), { signal_name: false }); });
+
+  it('正在写回时不刷新', async () => {
+    serveConfig({ signal_name: false });
+    qq().setState({ saving: true });
+
+    await qq().getState().refresh('token');
+
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('还在等 bot 认账时不刷新', async () => {
+    // 这段时间读到的是换上新文件之前的值，铺上去会闪回旧值。
+    serveConfig({ signal_name: false });
+    qq().setState({ confirmation: 'waiting' });
+
+    await qq().getState().refresh('token');
+
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('读到了只清读取失败，不碰应用的结果', async () => {
+    serveConfig({ signal_name: false });
+    qq().setState({ loadError: '上一次读不到', applyError: '上一次应用失败', notice: '已应用。' });
+
+    await qq().getState().refresh('token');
+
+    const state = qq().getState();
+    expect(state.loadError).toBe('');
+    expect(state.applyError).toBe('上一次应用失败');
+    expect(state.notice).toBe('已应用。');
+  });
+
+  it('读失败只写读取失败这一项', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('连不上 supervisor'); }));
+    qq().setState({ applyError: '上一次应用失败', notice: '已应用。' });
+
+    await qq().getState().refresh('token');
+
+    const state = qq().getState();
+    expect(state.loadError).toBe('连不上 supervisor');
+    expect(state.applyError).toBe('上一次应用失败');
+    expect(state.notice).toBe('已应用。');
+  });
+
+  it('读到了就把「读不到」这个结论撤掉', async () => {
+    serveConfig({ signal_name: false }, { applied: false });
+    qq().setState({ confirmation: 'unreadable' });
+
+    await qq().getState().refresh('token');
+
+    expect(qq().getState().confirmation).toBeNull();
+  });
+
+  it('bot 后来换上了就把「没确认」撤掉', async () => {
+    serveConfig({ signal_name: false }, { applied: true });
+    qq().setState({ confirmation: 'unconfirmed' });
+
+    await qq().getState().refresh('token');
+
+    expect(qq().getState().confirmation).toBeNull();
+  });
+
+  it('bot 还是没换上就留着「没确认」', async () => {
+    serveConfig({ signal_name: false }, { applied: false });
+    qq().setState({ confirmation: 'unconfirmed' });
+
+    await qq().getState().refresh('token');
+
+    expect(qq().getState().confirmation).toBe('unconfirmed');
+  });
+
+  it('「文件被改过」不由定时刷新翻篇', async () => {
+    // 读一遍不代表人核对过内容，这句得挂到人自己收起或者下一次写回。
+    serveConfig({ signal_name: false }, { applied: true });
+    qq().setState({ confirmation: 'changed' });
+
+    await qq().getState().refresh('token');
+
+    expect(qq().getState().confirmation).toBe('changed');
+  });
+});
+
+// 结论说的是上一次写回到底生没生效，这件事不因为人又动了别处而变得不确定：
+// 只有下一次写回、人自己收起、或者刷新读到相反的实况才作数。
+describe('结论的去留', () => {
+  const qq = () => platformConsoleStore('qq');
+
+  beforeEach(() => { stage(qq(), { signal_name: false, cooldown_group_sec: 30 }); });
+
+  it('改一项不碰结论，但清掉提示', () => {
+    qq().setState({ confirmation: 'unconfirmed', notice: '已应用。' });
+
+    qq().getState().setDraft('signal_name', true);
+
+    expect(qq().getState().confirmation).toBe('unconfirmed');
+    expect(qq().getState().notice).toBe('');
+  });
+
+  it('还在等的时候改动也照等', () => {
+    qq().setState({ confirmation: 'waiting' });
+
+    qq().getState().setDraft('signal_name', true);
+
+    expect(qq().getState().confirmation).toBe('waiting');
+  });
+
+  it('钉一项不碰结论', () => {
+    seedSourced(qq(), { cooldown_group_sec: 30 }, { cooldown_group_sec: 'global' });
+    qq().setState({ confirmation: 'unconfirmed', notice: '已应用。' });
+
+    qq().getState().pin('cooldown_group_sec');
+
+    expect(qq().getState().confirmation).toBe('unconfirmed');
+    expect(qq().getState().notice).toBe('');
+  });
+
+  it('全部丢弃清掉应用失败和提示，结论和读取失败都留着', () => {
+    qq().setState({
+      draft: { signal_name: true },
+      confirmation: 'unconfirmed',
+      applyError: '写不进去',
+      notice: '已应用。',
+      loadError: '读不到',
+    });
+
+    qq().getState().discard();
+
+    const state = qq().getState();
+    expect(state.draft).toEqual({});
+    expect(state.applyError).toBe('');
+    expect(state.notice).toBe('');
+    expect(state.loadError).toBe('读不到');
+    expect(state.confirmation).toBe('unconfirmed');
+  });
+
+  it('只丢几项也不碰结论', () => {
+    qq().setState({ draft: { signal_name: true, cooldown_group_sec: 60 }, confirmation: 'changed' });
+
+    qq().getState().discard(['signal_name']);
+
+    expect(qq().getState().draft).toEqual({ cooldown_group_sec: 60 });
+    expect(qq().getState().confirmation).toBe('changed');
+  });
+
+  it('人自己收起提示时连结论一起收', () => {
+    qq().setState({ confirmation: 'changed', notice: '已应用。' });
+
+    qq().getState().dismissNotice();
+
+    expect(qq().getState().notice).toBe('');
+    expect(qq().getState().confirmation).toBeNull();
+  });
+
+  it('还在等的结论收不掉', () => {
+    // 后台还在探，收掉就等于把「已写入，等 bot 确认生效」这句提前撤了。
+    qq().setState({ confirmation: 'waiting', notice: '已应用。' });
+
+    qq().getState().dismissNotice();
+
+    expect(qq().getState().confirmation).toBe('waiting');
+  });
+
+  it('下一次写回把上一次的结论换掉', async () => {
+    qq().setState({ confirmation: 'unconfirmed' });
+    qq().getState().setDraft('signal_name', true);
+    serveConfig({ signal_name: true });
+
+    await qq().getState().apply('token');
+
+    expect(qq().getState().confirmation).toBe('confirmed');
   });
 });
 
@@ -791,26 +1178,46 @@ describe('生效状态条', () => {
     ({ published: true, stale: false, applied: true, ...over }) as Parameters<typeof barState>[0];
 
   it('bot 认账了才是已生效', () => {
-    expect(barState(live(), '')).toEqual({ tone: 'live', text: '已生效' });
+    expect(barState(live(), '', 'confirmed')).toEqual({ tone: 'live', text: '已生效' });
   });
 
   it('心跳断了不能显示成已生效', () => {
-    expect(barState(live({ stale: true }), '').tone).toBe('halt');
+    expect(barState(live({ stale: true }), '', null).tone).toBe('halt');
   });
 
   it('bot 还在用旧配置也是红的', () => {
-    expect(barState(live({ applied: false }), '').tone).toBe('halt');
+    expect(barState(live({ applied: false }), '', null).tone).toBe('halt');
+  });
+
+  // 写完到 bot 换上之间 applied 必然为假，按它判会亮红灯，看着像刚才那一下出了错。
+  it('刚写回还在等认账时是灰的，不是红的', () => {
+    expect(barState(live({ applied: false }), '', 'waiting')).toEqual({
+      tone: 'idle', text: '已写入，等 bot 确认生效…',
+    });
+  });
+
+  it('语法错误压过等认账', () => {
+    expect(barState(live({ applied: false }), 'line 3: bad indent', 'waiting')).toEqual({
+      tone: 'halt', text: '配置有语法错误，bot 仍在用上一份',
+    });
+  });
+
+  it('心跳中断压过等认账', () => {
+    expect(barState(live({ stale: true, applied: false }), '', 'waiting')).toEqual({
+      tone: 'halt', text: 'bot 心跳已中断',
+    });
   });
 
   // 语法错误压过一切：文件写坏时 applied 仍然为真（bot 用的是上一份），
   // 按 applied 判就会显示「已生效」，而实际上刚才那次改动一个字都没进去。
   it('语法错误压过 applied', () => {
-    expect(barState(live(), 'line 3: bad indent')).toEqual({
+    expect(barState(live(), 'line 3: bad indent', 'confirmed')).toEqual({
       tone: 'halt', text: '配置有语法错误，bot 仍在用上一份',
     });
   });
 
   it('bot 没上报时是灰的，不是红的', () => {
-    expect(barState(null, '')).toEqual({ tone: 'idle', text: '等待 bot 上报' });
+    expect(barState(null, '', null)).toEqual({ tone: 'idle', text: '等待 bot 上报' });
+    expect(barState(null, '', 'waiting')).toEqual({ tone: 'idle', text: '等待 bot 上报' });
   });
 });

@@ -8,8 +8,9 @@ import { useSettingsStore } from '../store/settingsStore';
 import { scopedKey } from '../store/storageKey';
 import { Block, Empty, ErrorText, ItemTitle, List, Pip, Row } from './components';
 import { ConfigScopeProvider, FEATURES_SCOPE } from './configScope';
-import { useConsoleStore, useDraftCount } from './consoleStore';
+import { countDraftFor, useConsoleStore, useDraftCount } from './consoleStore';
 import { DEFAULTS_PAGE_SECTIONS, FeatureSectionBody } from './FeatureSection';
+import { useLiveRefresh } from './liveRefresh';
 import { fieldKeys } from './schemaNodes';
 import { useConsoleSchema, useSchemaStore } from './schemaStore';
 import { Section, SectionNote } from './Section';
@@ -75,7 +76,7 @@ const FeatureSectionEntry = ({ deepLinked, fields, onToggle, open, section }: {
 
 const FeaturesPageBody = () => {
   const adminToken = useSettingsStore((state) => state.adminToken);
-  const { error, live, loading, refresh } = useConsoleStore();
+  const { loadError, live, loading, refresh } = useConsoleStore();
   const { schema, error: schemaError } = useConsoleSchema(FEATURES_SCOPE);
   const loadSchema = useSchemaStore((state) => state.load);
   const { isOpen, requested, toggle } = useSectionOpenState(scopedKey('console_sections_features'));
@@ -85,24 +86,31 @@ const FeaturesPageBody = () => {
     [schema],
   );
   // 只算这一页摆出来的键：图库那几项在表情包页上改，没保存也不该拦着离开这一页。
-  const pageKeys = useMemo(() => sections.flatMap((section) => fieldKeys(section.nodes)), [sections]);
-  const pending = useDraftCount(pageKeys);
-  useUnsavedChanges(pending > 0, '全局默认还有没保存的修改，确定离开吗？');
+  const sectionKeys = useMemo(
+    () => sections.map((section) => ({ label: section.label, names: fieldKeys(section.nodes) })),
+    [sections],
+  );
+  // 各块分开保存，离开时得说清是哪几块没存；拼成字符串再比，选择器才不会每次给新值。
+  const unsaved = useConsoleStore((state) => sectionKeys
+    .filter(({ names }) => countDraftFor(state, names) > 0)
+    .map(({ label }) => `「${label}」`)
+    .join(''));
+  useUnsavedChanges(Boolean(unsaved), `全局默认的${unsaved}还有没保存的修改，确定离开吗？`);
 
+  useLiveRefresh(refresh, adminToken);
   useEffect(() => {
     if (!adminToken) return;
-    void refresh(adminToken);
     void loadSchema(adminToken, FEATURES_SCOPE);
-  }, [adminToken, loadSchema, refresh]);
+  }, [adminToken, loadSchema]);
 
   const parseError = String(live?.state?.parse_error || '');
   const platforms = (live as FeaturesLiveState | null)?.platforms || [];
 
   return (
     <>
-      {error && <ErrorText>{error}</ErrorText>}
+      {loadError && <ErrorText role="alert">{loadError}</ErrorText>}
       {parseError && (
-        <ErrorText>
+        <ErrorText role="alert">
           全局设置解析失败：{parseError}。bot 仍在用上一份有效内容。请先修复原文件语法；本页不会覆盖损坏文件。
         </ErrorText>
       )}

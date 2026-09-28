@@ -4,6 +4,7 @@ import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
 import {
   getNodeFileRaw,
+  getNodeFiles,
   getNodeRaw,
   getNodes,
   getProviders,
@@ -26,12 +27,28 @@ import {
   NodeYamlShapeError,
   readYamlScalar,
   upsertYamlScalar,
+  yamlString,
 } from './nodeYaml';
 
 const NODE_ID = 'qq.orchestrator';
 const PERSONA_FILE = '_persona.md';
 
 const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');
+
+const isMissing = (error: unknown): boolean => error instanceof Error && /^404\b/.test(error.message);
+
+/** 读人设文件，还没建是 null。先查列表再读：直接去读不存在的文件，浏览器控制台会留一条 404 报错。 */
+async function readPersona(token: string): Promise<string | null> {
+  const files = await getNodeFiles(token);
+  if (!files.some((file) => file.name === PERSONA_FILE && !file.is_example)) return null;
+  try {
+    return await getNodeFileRaw(token, PERSONA_FILE);
+  } catch (error) {
+    // 查完列表到读之间被删掉了，一样按还没建算。
+    if (isMissing(error)) return null;
+    throw error;
+  }
+}
 
 /** 一块独立保存的区域共用的底栏。草稿在这一块自己手里，不进顶部的「N 项待应用」。 */
 const Persona = () => {
@@ -56,19 +73,18 @@ const PersonaEditor = () => {
     setLoaded(false);
     void (async () => {
       try {
-        const body = await getNodeFileRaw(token, PERSONA_FILE);
+        const body = await readPersona(token);
         if (cancelled) return;
-        setSaved(body);
-        setText(body);
-        setOnlyExample(false);
+        setSaved(body ?? '');
+        setText(body ?? '');
+        setOnlyExample(body === null);
         setNote('');
         setLoaded(true);
       } catch (error) {
         if (cancelled) return;
-        const missing = error instanceof Error && /^404\b/.test(error.message);
-        setOnlyExample(missing);
-        setLoaded(missing);
-        setNote(missing ? '' : say(error));
+        setOnlyExample(false);
+        setLoaded(false);
+        setNote(say(error));
       }
     })();
     return () => { cancelled = true; };
@@ -164,7 +180,8 @@ const ModelChoiceEditor = () => {
     if (!token || !raw || busy) return;
     setBusy(true);
     try {
-      const next = upsertYamlScalar(raw, 'model', model.trim(), 'type');
+      const value = model.trim();
+      const next = upsertYamlScalar(raw, 'model', value && yamlString(value), 'type');
       await updateNodeRaw(token, NODE_ID, next);
       adopt(next);
       setNote('已保存。节点文件每次任务都重新读，立刻生效。');

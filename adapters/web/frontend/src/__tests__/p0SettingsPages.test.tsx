@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AdvancedSettingsPage } from '../components/settings/pages/AdvancedSettingsPage';
 import { ApprovalsSettingsPage } from '../components/settings/pages/ApprovalsSettingsPage';
 import { SystemSettingsPage } from '../components/settings/pages/SystemSettingsPage';
+import { PageShell } from '../components/settings/pages/settingsControls';
 import {
   AdvancedSettingsRightPanel,
   ApprovalsSettingsRightPanel,
@@ -69,6 +70,29 @@ describe('P0 settings pages', () => {
       expect(screen.getByText('请先在通用页面登录 Admin Token')).toBeInTheDocument();
       view.unmount();
     }
+  });
+
+  it('announces shell errors as alerts and shell notices as polite status, and drops both before login', () => {
+    const view = render(
+      <PageShell description="改完点应用写进配置文件。" error="写入失败：403" notice="已应用，等待 bot 读入。" title="QQ · NapCat">
+        <p>正文</p>
+      </PageShell>,
+    );
+    expect(screen.getByRole('alert').textContent).toBe('写入失败：403');
+    const notice = screen.getByRole('status');
+    expect(notice).toHaveAttribute('aria-live', 'polite');
+    expect(notice.textContent).toBe('已应用，等待 bot 读入。');
+    view.unmount();
+
+    // Both live inside the body, which the shell drops entirely before login.
+    render(
+      <PageShell authed={false} description="改完点应用写进配置文件。" error="写入失败：403" notice="已应用，等待 bot 读入。" title="QQ · NapCat">
+        <p>正文</p>
+      </PageShell>,
+    );
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.getByText('请先在通用页面登录 Admin Token')).toBeInTheDocument();
   });
 
   it('renders System status cards and guards the engine restart action', async () => {

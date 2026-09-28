@@ -13,6 +13,7 @@
    后面去，少一个 Consolas 就落到泛型 monospace，字号字形全交给浏览器默认值。 */
 @theme {
   --animate-section-open: section-open 120ms ease-out;
+  --animate-section-fade: section-fade 120ms ease-out;
   --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
     'Liberation Mono', 'Courier New', monospace;
   /* 正文 text-sm 之下的三档小字：标签、元信息、角标。差一档就是 0.03rem，再细分肉眼分不出。 */
@@ -395,6 +396,17 @@
   }
 }
 
+/* 同一次展开去掉位移，只剩淡入，给 reduced-motion 用。 */
+@keyframes section-fade {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms;
@@ -403,9 +415,9 @@
     scroll-behavior: auto;
   }
 
-  /* 只留透明度。位移在 0.01ms 里跳一下比不动更晃眼。 */
+  /* 只留透明度。位移在 0.01ms 里跳一下比不动更晃眼；类选择器压过上面的 *，淡入照常走完。 */
   .settings-section-body {
-    animation: none;
+    animation: var(--animate-section-fade);
   }
 }
 

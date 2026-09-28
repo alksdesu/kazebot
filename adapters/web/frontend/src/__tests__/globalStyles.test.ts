@@ -88,6 +88,23 @@ describe('全局 reset 的级联层', () => {
   }, 30000);
 });
 
+describe('折叠分区的动效', () => {
+  // 压成 none 就没有淡入了：位移在 0.01ms 里跳一下比不动更晃眼，透明度那一半要照常走完。
+  it('reduced-motion 下换成只有透明度的那支，不是整个关掉', () => {
+    expect(stylesheet).toMatch(/\.settings-section-body \{\s*animation: var\(--animate-section-open\);\s*\}/);
+    expect(stylesheet).toMatch(
+      /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.settings-section-body \{\s*animation: var\(--animate-section-fade\);\s*\}/,
+    );
+
+    const at = stylesheet.indexOf('@keyframes section-fade {');
+    expect(at).toBeGreaterThan(-1);
+    const frames = stylesheet.slice(at, stylesheet.indexOf('\n}\n', at));
+    expect(frames).toContain('opacity: 0;');
+    expect(frames).toContain('opacity: 1;');
+    expect(frames).not.toContain('transform');
+  });
+});
+
 describe('global Duties styles', () => {
   it('defines cross-browser custom scrollbar styling', () => {
     expect(stylesheet).toContain('scrollbar-width: thin;');

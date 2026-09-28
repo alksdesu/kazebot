@@ -109,8 +109,9 @@ export const Item = ({ children, className = '' }: { children: ReactNode; classN
   </li>
 );
 
-export const ErrorText = ({ children }: { children: ReactNode }) => (
-  <p className="mt-2.5 text-xs leading-5 text-[var(--duties-danger)]">{children}</p>
+/** role 给页面开着时才冒出来的错误用：读屏不会自己去看新长出来的一行字。 */
+export const ErrorText = ({ children, role }: { children: ReactNode; role?: 'alert' }) => (
+  <p className="mt-2.5 text-xs leading-5 text-[var(--duties-danger)]" role={role}>{children}</p>
 );
 
 export const Footnote = ({ children }: { children: ReactNode }) => (
@@ -121,8 +122,15 @@ export const StatusText = ({ message }: { message: string }) => (
   message ? <p role="status" aria-live="polite" className="mt-2 text-sm leading-6 text-[var(--duties-secondary)]">{message}</p> : null
 );
 
-export const Facts = ({ children, className = '' }: { children: ReactNode; className?: string }) => (
-  <p className={`mt-2.5 text-xs leading-5 ${MUTED} ${className}`}>{children}</p>
+/** role 同 ErrorText：操作结果这类中途出现的交代要让读屏念出来。 */
+export const Facts = ({ children, className = '', role }: { children: ReactNode; className?: string; role?: 'status' }) => (
+  <p
+    aria-live={role === 'status' ? 'polite' : undefined}
+    className={`mt-2.5 text-xs leading-5 ${MUTED} ${className}`}
+    role={role}
+  >
+    {children}
+  </p>
 );
 
 /** 开关名底下那行说明。缩进对齐复选框右侧，与 Option 的 desc 同一档。 */
@@ -477,7 +485,8 @@ export const SaveBar = ({ busy, dirty, label = '保存', note, onReset, onSave }
   onSave: () => void;
 }) => (
   <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-[var(--duties-border)] pt-3">
-    <span className={`text-xs ${MUTED}`}>{note}</span>
+    {/* 保存的结果写在这一句里，读屏要在它变的时候念出来。 */}
+    <span aria-live="polite" className={`text-xs ${MUTED}`} role="status">{note}</span>
     <span className="flex-1" />
     <Button disabled={!dirty || busy} onClick={onReset} tone="quiet">丢弃</Button>
     <Button disabled={!dirty || busy} onClick={onSave}>{busy ? '正在保存…' : label}</Button>
@@ -525,9 +534,12 @@ export const Pip = ({ tone }: { tone: PipTone }) => (
   <span aria-hidden="true" className={`inline-block h-2 w-2 flex-none rounded-full ${PIP_TONE[tone]}`} />
 );
 
-export const StatusBar = ({ children, tone }: { children: ReactNode; tone: PipTone }) => (
+/** 页顶状态条。status 是会变的那句状态，变了读屏会念；children 是靠右的按钮，不进播报。 */
+export const StatusBar = ({ children, status, tone }: { children?: ReactNode; status: ReactNode; tone: PipTone }) => (
   <div className="flex min-h-[var(--duties-control-size)] flex-wrap items-center gap-2 border-b border-[var(--duties-border)] px-4 py-2 text-sm">
     <Pip tone={tone} />
+    <span aria-live="polite" className="flex min-w-0 flex-wrap items-center gap-2" role="status">{status}</span>
+    <span className="flex-1" />
     {children}
   </div>
 );
@@ -571,8 +583,8 @@ export const PageShell = ({
         <PageHeader description={description} eyebrow={eyebrow} title={title} />
         {authed ? (
           <>
-            {error && <ErrorText>{error}</ErrorText>}
-            {notice && <Facts>{notice}</Facts>}
+            {error && <ErrorText role="alert">{error}</ErrorText>}
+            {notice && <Facts role="status">{notice}</Facts>}
             {children}
           </>
         ) : (

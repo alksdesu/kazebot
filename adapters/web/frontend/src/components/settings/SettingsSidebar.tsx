@@ -59,11 +59,14 @@ export const SettingsSidebar = () => {
           {SETTINGS_GROUP_LABELS[group] && <p className="px-3 pb-2 pt-3 text-xs font-semibold text-[var(--duties-tertiary)]">{SETTINGS_GROUP_LABELS[group]}</p>}
           {tabs.map(({ tab, sections }) => {
             const active = viewMode === 'settings' && tab.id === selectedTab;
+            // 和页同名的分区（表情包图库页只摆那一块）并进页那一行，同一个名字不上下列两遍。
+            const merged = sections.find(section => section.label === tab.label);
+            const rest = merged ? sections.filter(section => section !== merged) : sections;
             return <div key={tab.id}>
-              <button aria-current={active ? 'page' : undefined} aria-label={tab.label} className={`app-nav-item ${active ? 'app-nav-item-active' : ''}`} onClick={() => setSettingsTab(tab.id)} type="button">
+              <button aria-current={active ? 'page' : undefined} aria-label={tab.label} className={`app-nav-item ${active ? 'app-nav-item-active' : ''}`} onClick={() => setSettingsTab(tab.id, merged?.id)} type="button">
                 {tab.icon && <Icon name={tab.icon} size={18} />}<span>{tab.label}</span>
               </button>
-              {sections.map(section => (
+              {rest.map(section => (
                 <button
                   aria-label={`${tab.label}：${section.label}`}
                   className="app-nav-item pl-9 text-xs"

@@ -7,8 +7,16 @@ import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
 import { ErrorText, SaveBar } from './components';
 import { ConfigScopeProvider, FEATURES_SCOPE } from './configScope';
-import { useConsoleStore, useDraftCount, type CommitOutcome } from './consoleStore';
+import {
+  confirmationNote,
+  useConsoleStore,
+  useDraftCount,
+  type CommitOutcome,
+  type Confirmation,
+} from './consoleStore';
 import { SchemaFields, type SchemaFieldMap } from './FieldRenderer';
+import { joinNotes } from './format';
+import { useLiveRefresh } from './liveRefresh';
 import { fieldKeys } from './schemaNodes';
 import { useConsoleSchema, useSchemaStore } from './schemaStore';
 import { SectionAnchor } from './sectionOpen';
@@ -22,6 +30,13 @@ export const DEFAULTS_PAGE_SECTIONS: SectionPick = { except: [STICKER_LIBRARY_SE
 export const STICKERS_PAGE_SECTIONS: SectionPick = { only: [STICKER_LIBRARY_SECTION] };
 
 const SAVE_NOTE = '写进全局设置，没单独设置这一项的平台都跟着变。';
+const WAITING_NOTE = '已保存，正在等在跑的 bot 换上新文件…';
+
+/** 保存成功之后那一句：写回时的警告，加上在跑的 bot 换没换上。 */
+const savedNote = (message: string, confirmation: Confirmation | null): string => {
+  const status = confirmation === 'waiting' ? WAITING_NOTE : confirmationNote(FEATURES_SCOPE, confirmation);
+  return joinNotes(message, status) || '已保存。';
+};
 
 export const FeatureSectionBody = ({ fields, names, section }: {
   fields: SchemaFieldMap;
@@ -32,6 +47,7 @@ export const FeatureSectionBody = ({ fields, names, section }: {
   const token = useSettingsStore((state) => state.adminToken);
   const pending = useDraftCount(names);
   const saving = useConsoleStore((state) => state.saving);
+  const confirmation = useConsoleStore((state) => state.confirmation);
   const save = useConsoleStore((state) => state.save);
   const discard = useConsoleStore((state) => state.discard);
   const [outcome, setOutcome] = useState<CommitOutcome | null>(null);
@@ -48,11 +64,11 @@ export const FeatureSectionBody = ({ fields, names, section }: {
   return (
     <>
       <SchemaFields fields={fields} nodes={section.nodes} sectionId={section.id} />
-      {shown && !shown.ok && <ErrorText>{shown.message}</ErrorText>}
+      {shown && !shown.ok && <ErrorText role="alert">{shown.message}</ErrorText>}
       <SaveBar
         busy={saving}
         dirty={pending > 0}
-        note={shown?.ok ? shown.message || '已保存。' : SAVE_NOTE}
+        note={shown?.ok ? savedNote(shown.message, confirmation) : SAVE_NOTE}
         onReset={() => { setOutcome(null); discard(names); }}
         onSave={() => void commit()}
       />
@@ -63,7 +79,8 @@ export const FeatureSectionBody = ({ fields, names, section }: {
 const StandaloneBody = ({ leaveMessage, sectionId }: { leaveMessage: string; sectionId: string }) => {
   const adminToken = useSettingsStore((state) => state.adminToken);
   const refresh = useConsoleStore((state) => state.refresh);
-  const loadError = useConsoleStore((state) => state.error);
+  const loadError = useConsoleStore((state) => state.loadError);
+  const loaded = useConsoleStore((state) => state.live !== null);
   const { schema, error: schemaError } = useConsoleSchema(FEATURES_SCOPE);
   const loadSchema = useSchemaStore((state) => state.load);
   const requested = useViewStore((state) => state.activeSettingsSection);
@@ -72,18 +89,20 @@ const StandaloneBody = ({ leaveMessage, sectionId }: { leaveMessage: string; sec
   const pending = useDraftCount(names);
   useUnsavedChanges(pending > 0, leaveMessage);
 
+  useLiveRefresh(refresh, adminToken);
   useEffect(() => {
     if (!adminToken) return;
-    void refresh(adminToken);
     void loadSchema(adminToken, FEATURES_SCOPE);
-  }, [adminToken, loadSchema, refresh]);
+  }, [adminToken, loadSchema]);
 
-  const problem = schemaError || loadError;
-  if (problem) return <ErrorText>{problem}</ErrorText>;
+  // 读到过一次之后再读失败只提示一句：换成整块报错的话，正在改的东西会从眼前消失。
+  const blocking = schemaError || (loaded ? '' : loadError);
+  if (blocking) return <ErrorText role="alert">{blocking}</ErrorText>;
   if (!schema || !section) return null;
   // 侧栏搜到这一块时带着分区 id 跳过来，页面上面还有别的块，得滚到它这儿。
   return (
     <SectionAnchor deepLinked={requested === sectionId} open>
+      {loadError && <ErrorText role="alert">{loadError}</ErrorText>}
       <FeatureSectionBody fields={schema.fields} names={names} section={section} />
     </SectionAnchor>
   );
