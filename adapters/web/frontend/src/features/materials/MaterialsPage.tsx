@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useSettingsStore } from '../../store/settingsStore';
+import { fetchWithDeadline } from '../../api/requestDeadline';
 import { featureRequest, featureUrl } from '../client';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
+import { startPolling } from '../../utils/polling';
 import { useRequestScope } from '../asyncState';
 import { EmptyState, FeatureFeedback, FeaturePage, actionClass } from '../ui';
 import { Block, Button, Check, Desc, ErrorText, Input, Panel, Select, Textarea } from '../../console/components';
@@ -43,7 +45,7 @@ export function MaterialImage({ path, scope, botScope, alt, onReady }: {
     const controller = new AbortController();
     let objectUrl = '';
     setUrl(''); setError('');
-    fetch(featureUrl(path, { scope, params: { bot_scope: botScope } }), {
+    fetchWithDeadline(featureUrl(path, { scope, params: { bot_scope: botScope } }), {
       signal: controller.signal, headers: token ? { Authorization: `Bearer ${token}` } : {},
     }).then(async response => {
       if (!response.ok) throw new Error(`预览加载失败：${response.status}`);
@@ -170,22 +172,21 @@ export function MaterialsPage() {
   useEffect(() => {
     if (!job || !['queued', 'running'].includes(job.status)) return;
     let active = true;
-    const timer = window.setInterval(() => {
-      api<Job>(`/jobs/${job.id}`).then(next => {
-        if (!active) return;
-        setJob(next);
-        if (next.status === 'preview_ready') {
-          void perform(async () => { await refresh(); await openArtifact(next.artifact_id, next.version_id); });
-        } else if (next.status === 'failed') setError(next.error || '生成失败，未发送成品。');
-      }).catch(reason => { if (active) setError(String(reason)); });
-    }, 2000);
-    return () => { active = false; window.clearInterval(timer); };
+    const check = () => api<Job>(`/jobs/${job.id}`).then(next => {
+      if (!active) return;
+      setJob(next);
+      if (next.status === 'preview_ready') {
+        void perform(async () => { await refresh(); await openArtifact(next.artifact_id, next.version_id); });
+      } else if (next.status === 'failed') setError(next.error || '生成失败，未发送成品。');
+    }).catch(reason => { if (active) setError(String(reason)); });
+    const stop = startPolling(check, 2000);
+    return () => { active = false; stop(); };
   }, [job?.id, job?.status, scope, botScope]);
 
   async function upload(file: File) {
     const form = new FormData(); form.append('file', file);
     identity.check();
-    const response = await fetch(featureUrl('/v1/materials/sources/upload', { scope, params: { bot_scope: botScope } }), {
+    const response = await fetchWithDeadline(featureUrl('/v1/materials/sources/upload', { scope, params: { bot_scope: botScope } }), {
       method: 'POST', headers: token ? { Authorization: `Bearer ${token}` } : {}, body: form,
     });
     if (!response.ok) throw new Error((await response.text()).slice(0, 500));
@@ -202,7 +203,7 @@ export function MaterialsPage() {
   }
 
   async function downloadVersion(item: Version, name: string) {
-    const response = await fetch(featureUrl(`/v1/materials/versions/${item.id}/download`, { scope, params: { bot_scope: botScope } }), {
+    const response = await fetchWithDeadline(featureUrl(`/v1/materials/versions/${item.id}/download`, { scope, params: { bot_scope: botScope } }), {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (!response.ok) throw new Error(`下载失败：${response.status}`);

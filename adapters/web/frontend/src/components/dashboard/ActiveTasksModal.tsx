@@ -9,6 +9,7 @@ import { usePageNotice } from '../../hooks/usePageNotice';
 import { tokenChanged, useSettingsStore } from '../../store/settingsStore';
 import { useChatStore, type TaskActivity } from '../../store/chatStore';
 import { useViewStore } from '../../store/viewStore';
+import { startPolling } from '../../utils/polling';
 import { Modal } from '../common';
 
 interface ActiveTasksModalProps {
@@ -141,11 +142,10 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
       }
     };
 
-    void load();
-    const timer = setInterval(load, 5000);
+    const stop = startPolling(load, 5000, { first: load });
     return () => {
       cancelled = true;
-      clearInterval(timer);
+      stop();
     };
   }, [adminToken, open, refreshTick]);
 

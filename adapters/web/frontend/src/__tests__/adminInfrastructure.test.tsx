@@ -103,9 +103,11 @@ describe('admin API infrastructure wrappers', () => {
     await updateSkillRaw('admin-token', 'skill/a', '# Skill\n');
     await updateMcpClientsRaw('admin-token', 'clients: {}\n');
 
-    expect(fetchMock).toHaveBeenCalledWith('/v1/admin/config/nodes/node%2Fa/raw', expect.any(Object));
-    expect(fetchMock).toHaveBeenCalledWith('/v1/admin/config/tools/tool%2Fa/raw', expect.any(Object));
-    expect(fetchMock).toHaveBeenCalledWith('/v1/admin/config/skills/skill%2Fa/raw', expect.any(Object));
+    // Every read init now carries a deadline signal, so expect.any(Object) proved nothing about auth.
+    const readInit = { headers: { Authorization: 'Bearer admin-token' }, signal: expect.any(AbortSignal) };
+    expect(fetchMock).toHaveBeenCalledWith('/v1/admin/config/nodes/node%2Fa/raw', readInit);
+    expect(fetchMock).toHaveBeenCalledWith('/v1/admin/config/tools/tool%2Fa/raw', readInit);
+    expect(fetchMock).toHaveBeenCalledWith('/v1/admin/config/skills/skill%2Fa/raw', readInit);
     expect(fetchMock).toHaveBeenCalledWith('/v1/admin/config/runtime/raw', expect.objectContaining({
       method: 'PUT',
       body: JSON.stringify({ content: 'runtime: true\n' }),

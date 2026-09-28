@@ -3,6 +3,7 @@ import { uploadAttachment } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
 import { featureRequest, downloadFeature } from '../client';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
+import { startPolling } from '../../utils/polling';
 import { useRequestScope } from '../asyncState';
 import { actionClass, controlClass, EmptyState, FeatureFeedback, FeaturePage, primaryClass, sectionClass } from '../ui';
 import { ScopeSelect } from './ScopeSelect';
@@ -46,10 +47,9 @@ export function ExecutionPage({ scope: initialScope = 'web:console' }: { scope?:
   }, [scope]);
   useEffect(() => {
     setLoading(true); setReadError(''); setTools([]);
-    void refresh();
+    const stop = startPolling(async () => { if (!mutating.current) await refresh(); }, 3000, { first: refresh });
     void featureRequest<{ tools: ToolOption[] }>('/v1/execution/tools', { scope }).then(result => { if (identity.isCurrent()) setTools(Array.isArray(result?.tools) ? result.tools : []); }).catch(reason => { if (identity.isCurrent()) setError(`工具列表读取失败：${String(reason)}`); });
-    const timer = setInterval(() => { if (!mutating.current) void refresh(); }, 3000);
-    return () => { clearInterval(timer); sequence.current++; };
+    return () => { stop(); sequence.current++; };
   }, [refresh, scope]);
   const choose = (plan: ExecutionPlan | null) => {
     setSelected(plan); setEditRevision(plan?.revision ?? null); setGoal(plan?.goal || ''); setWorkScope(plan?.work_scope || ''); setSources(plan?.inputs || []); setSteps(plan?.steps || []); setFailedIds([]); setSourceText(''); setError(''); setNotice(''); setStepsValid(true);

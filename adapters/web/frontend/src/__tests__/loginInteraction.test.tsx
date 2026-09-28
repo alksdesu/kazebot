@@ -168,12 +168,18 @@ describe('认证请求分类', () => {
 
   it('传递取消信号并区分服务器故障', async () => {
     const api = await vi.importActual<typeof import('../api/supervisorClient')>('../api/supervisorClient');
-    const fetcher = vi.fn().mockResolvedValue({ ok: false, status: 503 });
-    vi.stubGlobal('fetch', fetcher);
-    const controller = new AbortController();
-    await expect(api.verifyAdminAuth('fixture-token', controller.signal)).rejects.toThrow('503');
-    expect(fetcher.mock.calls[0][1].signal).toBe(controller.signal);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 503 }));
+    await expect(api.verifyAdminAuth('fixture-token')).rejects.toThrow('503');
     await expect(api.checkAdminAuth('fixture-token')).resolves.toBe(false);
+
+    // 读请求自带时限，fetch 拿到的是时限的内部信号，外部取消得转发进去才中止得掉。
+    vi.stubGlobal('fetch', vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+    })));
+    const controller = new AbortController();
+    const verifying = api.verifyAdminAuth('fixture-token', controller.signal);
+    controller.abort();
+    await expect(verifying).rejects.toThrow('Aborted');
   });
 });
 

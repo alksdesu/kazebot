@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { getConversations } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
+import { startPolling } from '../../utils/polling';
 import { featureRequest } from '../client';
 import { actionClass } from '../ui';
 import { ExecutionProgressCard } from './ExecutionProgressCard';
@@ -30,11 +31,10 @@ export function ConversationPlans({ sessionId }: { sessionId: string }) {
         }
       } catch (failure) { if (alive && request === generation) setError(String(failure)); }
     }
-    void refresh();
-    const timer = setInterval(() => void refresh(), 5000);
+    const stop = startPolling(refresh, 5000, { first: refresh });
     const update = () => void refresh();
     window.addEventListener('clonoth:execution-updated', update);
-    return () => { alive = false; clearInterval(timer); window.removeEventListener('clonoth:execution-updated', update); };
+    return () => { alive = false; stop(); window.removeEventListener('clonoth:execution-updated', update); };
   }, [sessionId, token]);
   if (!plans.length && !error) return null;
   return <details className="min-w-0 max-h-80 overflow-y-auto [overflow-wrap:anywhere] border-t border-[var(--duties-border)] p-3" open>

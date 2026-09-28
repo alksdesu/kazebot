@@ -73,8 +73,10 @@ describe('Supervisor API client', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     await expect(fetchActiveTasks('secret-token')).resolves.toEqual([]);
+    // Read requests carry a deadline, so fetch receives an extra abort signal.
     expect(fetchMock).toHaveBeenCalledWith('/v1/admin/tasks/active', {
       headers: { Authorization: 'Bearer secret-token' },
+      signal: expect.any(AbortSignal),
     });
   });
 
@@ -111,6 +113,7 @@ describe('Supervisor API client', () => {
     await expect(getAllToolNames('secret-token')).resolves.toEqual(['read_file', 'gemini_image']);
     expect(fetchMock).toHaveBeenCalledWith('/v1/admin/config/all-tool-names', {
       headers: { Authorization: 'Bearer secret-token' },
+      signal: expect.any(AbortSignal),
     });
   });
 });
@@ -126,6 +129,7 @@ describe('Platform account client', () => {
     await expect(getPlatformAccount('secret-token', 'qq')).resolves.toEqual({ configured: true, account: '1000001' });
     expect(fetchMock).toHaveBeenCalledWith('/v1/platforms/qq/account', {
       headers: { Authorization: 'Bearer secret-token' },
+      signal: expect.any(AbortSignal),
     });
   });
 

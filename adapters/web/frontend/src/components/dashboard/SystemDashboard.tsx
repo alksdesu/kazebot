@@ -8,6 +8,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { checkHealth, getAdminState, type AdminState, type HealthState } from '../../api/supervisorClient';
 import { useChatStore } from '../../store/chatStore';
 import { useSettingsStore } from '../../store/settingsStore';
+import { startPolling } from '../../utils/polling';
 import { countActiveTasks, formatUptime } from '../../utils/systemStatus';
 import { ActiveTasksModal } from './ActiveTasksModal';
 
@@ -97,11 +98,10 @@ export const SystemDashboard = () => {
       }
     };
 
-    void load();
-    const timer = setInterval(load, 15000);
+    const stop = startPolling(load, 15000, { first: load });
     return () => {
       cancelled = true;
-      clearInterval(timer);
+      stop();
     };
   }, [adminToken]);
 

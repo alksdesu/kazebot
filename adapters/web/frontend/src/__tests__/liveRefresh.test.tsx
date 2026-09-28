@@ -1,4 +1,4 @@
-// 生效状态只能拉：进页拉一次、每 15 秒一次、切回页面补一次，藏在后台和没登录时一次都不拉。
+// 生效状态只能拉：进页拉一次、每 15 秒一次、切回页面补一次；藏在后台、没登录、上一次还没回来时一次都不拉，被在途挡掉的那次不占去重间隔。
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -16,7 +16,16 @@ const focus = () => act(() => { window.dispatchEvent(new Event('focus')); });
 const visibilityChange = () => act(() => { document.dispatchEvent(new Event('visibilitychange')); });
 const tick = (ms: number) => act(() => { vi.advanceTimersByTime(ms); });
 
+// 在途闩要等 refresh 的 promise settle 之后的微任务才松开，不放干队列后面每一次都会被挡掉。
+const settle = async (): Promise<void> => { await Promise.resolve(); await Promise.resolve(); };
+
 let refresh: ReturnType<typeof vi.fn>;
+
+const pendingRefresh = (): { release: () => void } => {
+  let resolve!: () => void;
+  refresh.mockImplementation(() => new Promise<void>((res) => { resolve = res; }));
+  return { release: () => resolve() };
+};
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -37,33 +46,38 @@ describe('useLiveRefresh', () => {
     expect(refresh).toHaveBeenCalledWith('admin-token');
   });
 
-  it('之后每 15 秒拉一次', () => {
+  it('之后每 15 秒拉一次', async () => {
     renderHook(() => useLiveRefresh(refresh, 'admin-token'));
+    await settle();
 
     tick(REFRESH_MS - 1);
     expect(refresh).toHaveBeenCalledTimes(1);
 
     tick(1);
     expect(refresh).toHaveBeenCalledTimes(2);
+    await settle();
 
     tick(REFRESH_MS);
     expect(refresh).toHaveBeenCalledTimes(3);
   });
 
-  it('切回标签页就补一次，focus 和 visibilitychange 都算', () => {
+  it('切回标签页就补一次，focus 和 visibilitychange 都算', async () => {
     renderHook(() => useLiveRefresh(refresh, 'admin-token'));
+    await settle();
 
     tick(RERUN_GAP_MS);
     focus();
     expect(refresh).toHaveBeenCalledTimes(2);
+    await settle();
 
     tick(RERUN_GAP_MS);
     visibilityChange();
     expect(refresh).toHaveBeenCalledTimes(3);
   });
 
-  it('隔不到一秒的第二次跳过 —— 切回标签页时两个事件前后脚都会来', () => {
+  it('隔不到一秒的第二次跳过 —— 切回标签页时两个事件前后脚都会来', async () => {
     renderHook(() => useLiveRefresh(refresh, 'admin-token'));
+    await settle();
 
     tick(RERUN_GAP_MS - 1);
     focus();
@@ -72,6 +86,55 @@ describe('useLiveRefresh', () => {
 
     tick(1);
     focus();
+    expect(refresh).toHaveBeenCalledTimes(2);
+  });
+
+  it('上一次还没回来时，定时、focus、visibilitychange 都不再拉，回来之后照常', async () => {
+    const inflight = pendingRefresh();
+    renderHook(() => useLiveRefresh(refresh, 'admin-token'));
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    tick(REFRESH_MS * 3);
+    focus();
+    visibilityChange();
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    inflight.release();
+    await settle();
+
+    tick(REFRESH_MS);
+    expect(refresh).toHaveBeenCalledTimes(2);
+  });
+
+  it('在途挡掉的 focus 不占去重间隔，读回来之后紧接着的 focus 立刻拉', async () => {
+    const inflight = pendingRefresh();
+    renderHook(() => useLiveRefresh(refresh, 'admin-token'));
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    tick(RERUN_GAP_MS);
+    focus();
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    inflight.release();
+    await settle();
+
+    // 时间一毫秒都没走，挡掉那次要是记了账，这里就被去重间隔盖住了。
+    focus();
+    expect(refresh).toHaveBeenCalledTimes(2);
+  });
+
+  it('在途挡掉的定时那次不占去重间隔，读回来之后紧接着的 visibilitychange 立刻拉', async () => {
+    const inflight = pendingRefresh();
+    renderHook(() => useLiveRefresh(refresh, 'admin-token'));
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    tick(REFRESH_MS);
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    inflight.release();
+    await settle();
+
+    visibilityChange();
     expect(refresh).toHaveBeenCalledTimes(2);
   });
 
@@ -116,9 +179,11 @@ describe('useLiveRefresh', () => {
     expect(refresh).toHaveBeenCalledWith('admin-token');
   });
 
-  it('卸载之后定时器和监听都撤掉', () => {
+  it('卸载之后定时器和监听都撤掉', async () => {
     const { unmount } = renderHook(() => useLiveRefresh(refresh, 'admin-token'));
     expect(refresh).toHaveBeenCalledTimes(1);
+    // 不放行头一次的话，后面不拉是在途闩挡的，看不出定时器和监听有没有真撤掉。
+    await settle();
 
     unmount();
 

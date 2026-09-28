@@ -1,5 +1,5 @@
 // 活跃任务弹窗的提示。五秒一次的轮询会不停重读，取消的结果不能被它顺手冲掉。
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, type RenderResult } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { cancelTask, fetchActiveTasks, type ActiveTask } from '../api/supervisorClient';
@@ -63,7 +63,7 @@ const open = async () => {
   await act(async () => {});
   return view;
 };
-const tick = () => act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+const tick = (ms = 5000) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
 const clickCancel = () => act(async () => {
   fireEvent.click(screen.getByRole('button', { name: CANCEL_LABEL }));
 });
@@ -166,16 +166,74 @@ describe('取消完发现换了人', () => {
   });
 });
 
-describe('两次轮询撞车', () => {
+describe('上一轮没回来', () => {
+  it('挂住时推几个间隔都不再发，放行后接着轮询', async () => {
+    const slow = deferred<ActiveTask[]>();
+    vi.mocked(fetchActiveTasks)
+      .mockReturnValueOnce(slow.promise)
+      .mockResolvedValue([task()]);
+    await open();
+    expect(fetchActiveTasks).toHaveBeenCalledTimes(1);
+
+    await tick();
+    await tick();
+    await tick();
+    expect(fetchActiveTasks).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('正在加载活跃任务…')).toBeInTheDocument();
+
+    await act(async () => { slow.resolve([]); });
+    expect(fetchActiveTasks).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('当前没有活跃任务')).toBeInTheDocument();
+
+    await tick();
+    expect(fetchActiveTasks).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('在查日志')).toBeInTheDocument();
+  });
+
+  it('头一次读挂住时第一个间隔就不发，放行后下一个间隔正好补一次', async () => {
+    const slow = deferred<ActiveTask[]>();
+    vi.mocked(fetchActiveTasks)
+      .mockReturnValueOnce(slow.promise)
+      .mockResolvedValue([task({ input_summary: '换了一件事做' })]);
+    await open();
+    expect(fetchActiveTasks).toHaveBeenCalledTimes(1);
+
+    await tick(4999);
+    expect(fetchActiveTasks).toHaveBeenCalledTimes(1);
+
+    await tick(1);
+    expect(fetchActiveTasks).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('正在加载活跃任务…')).toBeInTheDocument();
+
+    await act(async () => { slow.resolve([task()]); });
+    expect(fetchActiveTasks).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('在查日志')).toBeInTheDocument();
+
+    await tick(4999);
+    expect(fetchActiveTasks).toHaveBeenCalledTimes(1);
+
+    await tick(1);
+    expect(fetchActiveTasks).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('换了一件事做')).toBeInTheDocument();
+  });
+});
+
+describe('在途的读取撞上新一轮', () => {
+  // 轮询自己撞不了车（上一轮没回来就跳过这一轮），只有关掉再打开才让在途那次和新一轮并排。
+  const reopen = async (view: RenderResult) => {
+    await act(async () => { view.rerender(<ActiveTasksModal onClose={noop} open={false} />); });
+    await act(async () => { view.rerender(<ActiveTasksModal onClose={noop} open />); });
+  };
+
   it('慢的那次回来不把旧列表放回去，转圈由最新那次收掉', async () => {
     const slow = deferred<ActiveTask[]>();
     vi.mocked(fetchActiveTasks)
       .mockReturnValueOnce(slow.promise)
       .mockResolvedValue([]);
-    await open();
+    const view = await open();
     expect(screen.getByText('正在加载活跃任务…')).toBeInTheDocument();
 
-    await tick();
+    await reopen(view);
     expect(screen.getByText('当前没有活跃任务')).toBeInTheDocument();
 
     await act(async () => { slow.resolve([task({ input_summary: '旧的那一轮' })]); });
@@ -189,9 +247,9 @@ describe('两次轮询撞车', () => {
     vi.mocked(fetchActiveTasks)
       .mockReturnValueOnce(slow.promise)
       .mockResolvedValue([task()]);
-    await open();
+    const view = await open();
 
-    await tick();
+    await reopen(view);
     expect(screen.getByText('在查日志')).toBeInTheDocument();
 
     await act(async () => { slow.reject(new Error('503 活跃任务读不到')); });

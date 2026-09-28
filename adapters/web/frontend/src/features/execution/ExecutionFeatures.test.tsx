@@ -187,3 +187,223 @@ it('keeps unsaved plan edits when a different plan is selected and discard is de
   fireEvent.click(screen.getByRole('button', { name: '另一个计划 · 待确认' }));
   expect(screen.getByLabelText('目标')).toHaveValue('本地修改');
 });
+
+const reads = (path: string) => vi.mocked(featureRequest).mock.calls.filter(([called, options]) => called === path && !options?.method).length;
+const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+
+describe('polling waits for the round already in flight', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('sends no further plan reads while one is pending and resumes once it settles', async () => {
+    vi.useFakeTimers();
+    const pending: Array<(value: unknown) => void> = [];
+    vi.mocked(featureRequest).mockImplementation(async path => path.endsWith('/tools') ? { tools: [] } : new Promise(resolve => pending.push(resolve)));
+    render(<ExecutionPage />);
+    await tick(0);
+    // The mount read holds the same latch as the interval, so no tick opens a round of its own.
+    expect(reads('/v1/execution/plans')).toBe(1);
+    await tick(3000);
+    expect(reads('/v1/execution/plans')).toBe(1);
+
+    await tick(9000);
+    expect(reads('/v1/execution/plans')).toBe(1);
+
+    await act(async () => { pending.forEach(resolve => resolve({ plans: [initial()] })); await vi.advanceTimersByTimeAsync(0); });
+    expect(reads('/v1/execution/plans')).toBe(1);
+    await tick(3000);
+    expect(reads('/v1/execution/plans')).toBe(2);
+  });
+
+  it('opens the plan read before the tool list and keeps the tool list off the latch', async () => {
+    vi.useFakeTimers();
+    vi.mocked(featureRequest).mockImplementation(async path => path.endsWith('/tools') ? { tools: [] } : new Promise(() => undefined));
+    render(<ExecutionPage />);
+    await tick(0);
+    expect(vi.mocked(featureRequest).mock.calls.map(([path]) => path)).toEqual(['/v1/execution/plans', '/v1/execution/tools']);
+
+    await tick(12000);
+    expect(vi.mocked(featureRequest).mock.calls.map(([path]) => path)).toEqual(['/v1/execution/plans', '/v1/execution/tools']);
+  });
+
+  it('lands a plan list even when every response outlasts the interval', async () => {
+    vi.useFakeTimers();
+    let round = 0;
+    vi.mocked(featureRequest).mockImplementation(async path => {
+      if (path.endsWith('/tools')) return { tools: [] };
+      const goal = `第 ${++round} 轮目标`;
+      await new Promise(resolve => { setTimeout(resolve, 8000); });
+      return { plans: [{ ...initial(), goal }] };
+    });
+    render(<ExecutionPage />);
+    expect(screen.getByText('正在读取计划…')).toBeInTheDocument();
+
+    // 8s responses against a 3s interval: the mount read keeps the latch until it lands, and every round after it lands too.
+    await tick(8000);
+    expect(screen.queryByText('正在读取计划…')).toBeNull();
+    expect(screen.getByRole('button', { name: '第 1 轮目标 · 待确认' })).toBeInTheDocument();
+    expect(reads('/v1/execution/plans')).toBe(1);
+
+    await tick(9000);
+    expect(screen.getByRole('button', { name: '第 2 轮目标 · 待确认' })).toBeInTheDocument();
+    expect(reads('/v1/execution/plans')).toBe(2);
+
+    await tick(9000);
+    expect(screen.getByRole('button', { name: '第 3 轮目标 · 待确认' })).toBeInTheDocument();
+    expect(reads('/v1/execution/plans')).toBe(3);
+  });
+
+  it('sends no plan reads while a plan mutation is in flight', async () => {
+    vi.useFakeTimers();
+    let finish!: (value: unknown) => void;
+    vi.mocked(featureRequest).mockImplementation(async (path, options) => {
+      if (path.endsWith('/tools')) return { tools: [] };
+      if (options?.method === 'POST') return new Promise(resolve => { finish = resolve; });
+      return { plans: [] };
+    });
+    render(<ExecutionPage />);
+    await tick(0);
+    fireEvent.change(screen.getByLabelText('目标'), { target: { value: '保存报表' } });
+    fireEvent.click(screen.getByRole('button', { name: '生成计划预览' }));
+    await tick(0);
+    expect(reads('/v1/execution/plans')).toBe(1);
+
+    await tick(9000);
+    expect(reads('/v1/execution/plans')).toBe(1);
+
+    // The write itself re-reads once it finishes, then the interval takes over again.
+    await act(async () => { finish(initial()); await vi.advanceTimersByTimeAsync(0); });
+    expect(reads('/v1/execution/plans')).toBe(2);
+    await tick(3000);
+    expect(reads('/v1/execution/plans')).toBe(3);
+  });
+
+  it('lets a finished write re-read while the mount read still holds the latch', async () => {
+    vi.useFakeTimers();
+    let finish!: (value: unknown) => void;
+    vi.mocked(featureRequest).mockImplementation(async (path, options) => {
+      if (path.endsWith('/tools')) return { tools: [] };
+      if (options?.method === 'POST') return new Promise(resolve => { finish = resolve; });
+      return new Promise(() => undefined);
+    });
+    render(<ExecutionPage />);
+    await tick(0);
+    fireEvent.change(screen.getByLabelText('目标'), { target: { value: '保存报表' } });
+    fireEvent.click(screen.getByRole('button', { name: '生成计划预览' }));
+    await tick(9000);
+    expect(reads('/v1/execution/plans')).toBe(1);
+
+    // The write re-reads through refresh directly, past the latch the never-settling mount read still holds.
+    await act(async () => { finish(initial()); await vi.advanceTimersByTimeAsync(0); });
+    expect(reads('/v1/execution/plans')).toBe(2);
+
+    await tick(9000);
+    expect(reads('/v1/execution/plans')).toBe(2);
+  });
+
+  it('sends no further progress reads while the card is waiting for its first one', async () => {
+    vi.useFakeTimers();
+    let release!: (value: unknown) => void;
+    vi.mocked(featureRequest).mockImplementation(() => new Promise(resolve => { release = resolve; }));
+    render(<ExecutionProgressCard planId={initial().id} scope="web:console" />);
+    expect(featureRequest).toHaveBeenCalledTimes(1);
+
+    await tick(12000);
+    expect(featureRequest).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('正在读取计划进度…')).toBeInTheDocument();
+
+    await act(async () => { release(initial()); await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByText('保存报表 · 待确认')).toBeInTheDocument();
+    await tick(3000);
+    expect(featureRequest).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the card to one progress read in flight after its first one lands', async () => {
+    vi.useFakeTimers();
+    let round = 0;
+    vi.mocked(featureRequest).mockImplementation(async () => {
+      const goal = `第 ${++round} 轮进度`;
+      if (round > 1) await new Promise(resolve => { setTimeout(resolve, 7000); });
+      return { ...initial(), goal };
+    });
+    render(<ExecutionProgressCard planId={initial().id} scope="web:console" />);
+    await tick(0);
+    expect(screen.getByText('第 1 轮进度 · 待确认')).toBeInTheDocument();
+
+    await tick(3000);
+    expect(featureRequest).toHaveBeenCalledTimes(2);
+    await tick(6000);
+    expect(featureRequest).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('第 1 轮进度 · 待确认')).toBeInTheDocument();
+
+    await tick(1000);
+    expect(screen.getByText('第 2 轮进度 · 待确认')).toBeInTheDocument();
+    await tick(2000);
+    expect(featureRequest).toHaveBeenCalledTimes(3);
+  });
+
+  it('sends no further reminder reads while one is pending and resumes once it settles', async () => {
+    vi.useFakeTimers();
+    const pending: Array<(value: unknown) => void> = [];
+    vi.mocked(featureRequest).mockImplementation(() => new Promise(resolve => pending.push(resolve)));
+    render(<RemindersPage embedded />);
+    await tick(0);
+    expect(reads('/v1/reminders')).toBe(1);
+    await tick(5000);
+    expect(reads('/v1/reminders')).toBe(1);
+
+    await tick(15000);
+    expect(reads('/v1/reminders')).toBe(1);
+
+    await act(async () => { pending.forEach(resolve => resolve({ reminders: [] })); await vi.advanceTimersByTimeAsync(0); });
+    expect(reads('/v1/reminders')).toBe(1);
+    await tick(5000);
+    expect(reads('/v1/reminders')).toBe(2);
+  });
+
+  it('lands a reminder list even when every response outlasts the interval', async () => {
+    vi.useFakeTimers();
+    let round = 0;
+    vi.mocked(featureRequest).mockImplementation(async () => {
+      const text = `第 ${++round} 轮提醒`;
+      await new Promise(resolve => { setTimeout(resolve, 12000); });
+      return { reminders: [{ id: 'R123456789abc', text, due_at: '2030-01-01T00:00:00Z', timezone: 'Asia/Shanghai', revision: 1, status: 'open', delivery_status: 'delivered' }] };
+    });
+    render(<RemindersPage embedded />);
+    expect(screen.getByText('正在读取提醒…')).toBeInTheDocument();
+
+    // 12s responses against a 5s interval: the mount read keeps the latch until it lands, and every round after it lands too.
+    await tick(12000);
+    expect(screen.queryByText('正在读取提醒…')).toBeNull();
+    expect(screen.getByText('第 1 轮提醒')).toBeInTheDocument();
+    expect(reads('/v1/reminders')).toBe(1);
+
+    await tick(15000);
+    expect(screen.getByText('第 2 轮提醒')).toBeInTheDocument();
+    expect(reads('/v1/reminders')).toBe(2);
+
+    await tick(15000);
+    expect(screen.getByText('第 3 轮提醒')).toBeInTheDocument();
+    expect(reads('/v1/reminders')).toBe(3);
+  });
+
+  it('sends no reminder reads while a reminder is being created', async () => {
+    vi.useFakeTimers();
+    let finish!: (value: unknown) => void;
+    vi.mocked(featureRequest).mockImplementation(async (_path, options) => options?.method === 'POST' ? new Promise(resolve => { finish = resolve; }) : { reminders: [] });
+    render(<RemindersPage embedded />);
+    await tick(0);
+    fireEvent.change(screen.getByLabelText('提醒内容'), { target: { value: '交材料' } });
+    fireEvent.change(screen.getByLabelText('当地时间'), { target: { value: '2030-01-01T10:00' } });
+    fireEvent.click(screen.getByRole('button', { name: '创建提醒' }));
+    await tick(0);
+    expect(reads('/v1/reminders')).toBe(1);
+
+    await tick(15000);
+    expect(reads('/v1/reminders')).toBe(1);
+
+    await act(async () => { finish({}); await vi.advanceTimersByTimeAsync(0); });
+    expect(reads('/v1/reminders')).toBe(2);
+    await tick(5000);
+    expect(reads('/v1/reminders')).toBe(3);
+  });
+});

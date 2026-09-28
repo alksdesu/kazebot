@@ -12,6 +12,7 @@ import { ActiveTasksModal } from '../../dashboard/ActiveTasksModal';
 import { checkHealth, getAdminState, reloadConfig, restartEngine, type AdminState, type HealthState } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { startPolling } from '../../../utils/polling';
 import { countActiveTasks, formatUptime, restartRefusal } from '../../../utils/systemStatus';
 import { Block, Button, PageShell, StatusText } from './settingsControls';
 
@@ -79,14 +80,13 @@ const SystemSettingsPageBody = () => {
   }, [clearNotice, load]);
 
   useEffect(() => {
-    void load();
     if (!adminToken || !isAuthenticated) return undefined;
     // [2026-06-02] Refresh System status every 15 seconds.
     // Why: sessions, approvals, running tasks, workers, and uptime can change while
     // operators keep this tab open. How: run a quiet refresh without replacing the
     // manual button with a spinner. Purpose: the status cards remain current.
-    const timer = window.setInterval(() => { void load(false); }, 15000);
-    return () => { window.clearInterval(timer); generation.current += 1; };
+    const stop = startPolling(() => load(false), 15000, { first: () => load() });
+    return () => { stop(); generation.current += 1; };
   }, [adminToken, isAuthenticated, load]);
 
   const engineInfo = useMemo(() => {

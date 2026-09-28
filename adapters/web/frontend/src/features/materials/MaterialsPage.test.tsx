@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { featureRequest } from '../client';
 import { useSettingsStore } from '../../store/settingsStore';
-import { buildMaterialSpec, MaterialsPage } from './MaterialsPage';
+import { buildMaterialSpec, MaterialImage, MaterialsPage } from './MaterialsPage';
 import { scopeIdentity } from '../conversationNames';
 
 vi.mock('../client', async original => ({ ...await original<typeof import('../client')>(), featureRequest: vi.fn() }));
@@ -75,6 +75,18 @@ describe('materials preview confirmation', () => {
       expect(String(url)).not.toContain('test-secret');
       expect(options?.headers).toEqual({ Authorization: 'Bearer test-secret' });
     }
+  });
+
+  it('cancels a preview body still being read when the image unmounts', async () => {
+    const blob = vi.fn(() => new Promise<Blob>(() => {}));
+    vi.mocked(fetch).mockImplementation(async () => ({ ok: true, status: 200, blob } as unknown as Response));
+    const view = render(<MaterialImage path="/v1/materials/versions/v1/preview/1" scope="web:materials" botScope={null} alt="预览第1页" />);
+    // blob() 被调用才说明响应头已经交给组件，此时超时转发早该摘掉的话正文就取消不了了
+    await waitFor(() => expect(blob).toHaveBeenCalledOnce());
+    const signal = vi.mocked(fetch).mock.calls[0][1]!.signal!;
+    expect(signal.aborted).toBe(false);
+    view.unmount();
+    expect(signal.aborted).toBe(true);
   });
 
   it('blocks confirmation when preview rendering cannot be displayed', async () => {
@@ -275,4 +287,32 @@ it.each([null, '', 'fixture-bot'])('uses the same bot partition for upload, prev
       expect(url.searchParams.get('bot_scope')).toBe(botScope);
     }
   } finally { click.mockRestore(); }
+});
+
+it('sends no further job progress reads while one is pending and resumes once it settles', async () => {
+  const original = mockedRequest.getMockImplementation()!;
+  const pending: Array<(value: unknown) => void> = [];
+  mockedRequest.mockImplementation(async (path, options) => path === '/v1/materials/jobs/j1' ? new Promise(resolve => pending.push(resolve)) : original(path, options));
+  render(<MaterialsPage />);
+  await screen.findByRole('option', { name: 'Report' });
+  await screen.findByText(/Office 渲染：可用/);
+  fireEvent.change(screen.getByLabelText('成品标题'), { target: { value: 'Synthetic report' } });
+  fireEvent.change(screen.getByLabelText('成品内容'), { target: { value: 'Synthetic body' } });
+  vi.useFakeTimers();
+  try {
+    fireEvent.click(screen.getByRole('button', { name: '生成并渲染预览' }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByText(/任务 j1：排队中/)).toBeInTheDocument();
+    expect(pending).toHaveLength(0);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(pending).toHaveLength(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
+    expect(pending).toHaveLength(1);
+
+    await act(async () => { pending[0]({ id: 'j1', artifact_id: 'a1', status: 'queued' }); await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(pending).toHaveLength(2);
+  } finally { vi.useRealTimers(); }
 });

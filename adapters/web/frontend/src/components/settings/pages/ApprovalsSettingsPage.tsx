@@ -10,6 +10,7 @@ import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { Icon } from '../../common';
+import { startPolling } from '../../../utils/polling';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
 import { Block, Button, PageShell, StatusText } from './settingsControls';
 
@@ -65,7 +66,9 @@ const ApprovalsSettingsPageBody = () => {
       if (version !== generation.current) return;
       const pending = state.pending_approvals || [];
       setApprovals(pending);
-      if (selectedApproval && !pending.some((item) => item.approval_id === selectedApproval.approval_id)) setSelectedApproval(null);
+      // Read the selection at call time: depending on it would tear down and restart the poll on every click.
+      const selected = useSettingsSelectionStore.getState().selectedApproval;
+      if (selected && !pending.some((item) => item.approval_id === selected.approval_id)) setSelectedApproval(null);
       setLoadError('');
     } catch (error) {
       if (version !== generation.current) return;
@@ -73,7 +76,7 @@ const ApprovalsSettingsPageBody = () => {
     } finally {
       if (showSpinner) setLoading(false);
     }
-  }, [adminToken, isAuthenticated, selectedApproval, setSelectedApproval, setLoadError]);
+  }, [adminToken, isAuthenticated, setSelectedApproval, setLoadError]);
 
   // Clear the notice only on an explicit refresh: deciding reloads right after writing its result.
   const refresh = useCallback(async () => {
@@ -82,14 +85,13 @@ const ApprovalsSettingsPageBody = () => {
   }, [clearNotice, load]);
 
   useEffect(() => {
-    void load();
     if (!adminToken || !isAuthenticated) return undefined;
     // [2026-06-02] Refresh pending approvals every 10 seconds.
     // Why: approvals may be created or decided by other sessions while this tab is
     // open. How: poll the admin state quietly between manual refreshes. Purpose:
     // operators can make decisions from a current queue.
-    const timer = window.setInterval(() => { void load(false); }, 10000);
-    return () => { window.clearInterval(timer); generation.current += 1; };
+    const stop = startPolling(() => load(false), 10000, { first: () => load() });
+    return () => { stop(); generation.current += 1; };
   }, [adminToken, isAuthenticated, load]);
 
   const decide = async (approval: AdminApproval, decision: 'allow' | 'deny') => {

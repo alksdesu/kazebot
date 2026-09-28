@@ -1,3 +1,4 @@
+import { fetchWithDeadline } from '../api/requestDeadline';
 import { MOUNT } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 
@@ -21,7 +22,7 @@ export function featureUrl(path: string, options: Pick<FeatureRequestOptions, 'p
 
 export async function featureRequest<T>(path: string, options: FeatureRequestOptions = {}): Promise<T> {
   const token = useSettingsStore.getState().adminToken;
-  const response = await fetch(featureUrl(path, options), {
+  const response = await fetchWithDeadline(featureUrl(path, options), {
     method: options.method || 'GET', signal: options.signal,
     headers: {
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -39,7 +40,7 @@ export async function featureRequest<T>(path: string, options: FeatureRequestOpt
 
 export async function downloadFeature(path: string, filename: string, scope?: string): Promise<void> {
   const token = useSettingsStore.getState().adminToken;
-  const response = await fetch(featureUrl(path, { scope }), {
+  const response = await fetchWithDeadline(featureUrl(path, { scope }), {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
   if (!response.ok) throw new Error(`下载失败：${response.status}`);

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { featureRequest } from '../client';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
+import { startPolling } from '../../utils/polling';
 import { useRequestScope } from '../asyncState';
 import { actionClass, controlClass, EmptyState, FeatureFeedback, FeaturePage, primaryClass, sectionClass } from '../ui';
 import { ScopeSelect } from './ScopeSelect';
@@ -52,8 +53,8 @@ export function RemindersPage({ scope: initialScope = 'web:console', embedded = 
   }, [scope]);
   useEffect(() => {
     setItems([]); setLoading(true); setError(''); setReadError(''); setNotice('');
-    void refresh(); const timer = setInterval(() => { if (!mutating.current) void refresh(); }, 5000);
-    return () => { clearInterval(timer); sequence.current++; };
+    const stop = startPolling(async () => { if (!mutating.current) await refresh(); }, 5000, { first: refresh });
+    return () => { stop(); sequence.current++; };
   }, [refresh]);
   const run = async (action: () => Promise<unknown>, message: string) => {
     if (mutating.current) return;

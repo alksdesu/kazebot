@@ -16,6 +16,7 @@ import {
 } from '../../../api/supervisorClient';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { startPolling } from '../../../utils/polling';
 import { Block, Button, Empty, Facts, Footnote, List, PageShell, Pip, Row, StatusText } from './settingsControls';
 
 const POLL_MS = 5000;
@@ -41,10 +42,8 @@ const SupervisorBlock = () => {
   const [health, setHealth] = useState<HealthState | null>(null);
 
   useEffect(() => {
-    const probe = () => { void checkHealth().then(setHealth).catch(() => setHealth(null)); };
-    probe();
-    const timer = setInterval(probe, POLL_MS);
-    return () => clearInterval(timer);
+    const probe = () => checkHealth().then(setHealth).catch(() => setHealth(null));
+    return startPolling(probe, POLL_MS, { first: probe });
   }, []);
 
   const uptime = health?.uptime_seconds;
@@ -251,9 +250,8 @@ const RuntimeSettingsPageBody = () => {
 
   useEffect(() => {
     if (!adminToken) return;
-    void load();
-    const timer = setInterval(() => void load(), POLL_MS);
-    return () => { clearInterval(timer); generation.current += 1; };
+    const stop = startPolling(load, POLL_MS, { first: load });
+    return () => { stop(); generation.current += 1; };
   }, [adminToken, load]);
 
   const onRetry = async () => {

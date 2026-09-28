@@ -1,5 +1,6 @@
 // [2026-05-16] Real Supervisor API client — zero mock.
 import type { NodeDef, SupervisorEvent } from '../types';
+import { fetchWithDeadline } from './requestDeadline';
 
 /** 本实例挂载的路径前缀。多开时几个号共用一个域名，各自挂在 /i/<号>/ 下。 */
 export const MOUNT = (() => {
@@ -14,7 +15,7 @@ const API = `${MOUNT}/v1`;
 // ── Helper ──
 
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
-  const resp = await fetch(`${API}${path}`, init);
+  const resp = await fetchWithDeadline(`${API}${path}`, init);
   if (!resp.ok) {
     let detail = '';
     try { const j = await resp.json(); detail = j.detail || ''; } catch { /* ignore */ }
@@ -59,7 +60,7 @@ export async function uploadAttachment(
 ): Promise<UploadedAttachment> {
   const form = new FormData();
   form.append('file', file);
-  const resp = await fetch(
+  const resp = await fetchWithDeadline(
     `${API}/attachments/upload?conversation_key=${encodeURIComponent(conversationKey)}`,
     // 不手动设 Content-Type：浏览器要自己填 multipart boundary。
     { method: 'POST', body: form, headers: authHeaders(token) },
@@ -356,7 +357,7 @@ export async function fetchActiveTasks(token = ''): Promise<ActiveTask[]> {
   // helper used by other admin APIs. Purpose: task monitoring stays independent of
   // chatStore and does not duplicate request construction in UI components.
   const init = token ? { headers: authHeaders(token) } : undefined;
-  const resp = await fetch(`${API}/admin/tasks/active`, init);
+  const resp = await fetchWithDeadline(`${API}/admin/tasks/active`, init);
   if (!resp.ok) throw new Error(`Failed to fetch active tasks: ${resp.status}`);
   return resp.json();
 }
@@ -369,7 +370,7 @@ export async function cancelTask(adminToken: string, taskId: string): Promise<vo
   const headers = adminToken
     ? { ...authHeaders(adminToken), 'X-Admin-Token': adminToken }
     : {};
-  const resp = await fetch(`${API}/tasks/${encodeURIComponent(taskId)}/cancel`, {
+  const resp = await fetchWithDeadline(`${API}/tasks/${encodeURIComponent(taskId)}/cancel`, {
     method: 'POST',
     headers,
   });
@@ -379,7 +380,7 @@ export async function cancelTask(adminToken: string, taskId: string): Promise<vo
 // ── Admin auth ──
 
 export async function verifyAdminAuth(token: string, signal?: AbortSignal): Promise<boolean> {
-  const resp = await fetch(`${API}/admin/auth/check`, {
+  const resp = await fetchWithDeadline(`${API}/admin/auth/check`, {
     headers: authHeaders(token),
     ...(signal ? { signal } : {}),
   });
@@ -2087,7 +2088,7 @@ export async function deleteSession(sessionId: string): Promise<{ ok: boolean }>
 
 export async function getSessionMessages(sessionId: string, limit = 200): Promise<{ role: string; content: string }[]> {
   try {
-    const resp = await fetch(`${API}/sessions/${sessionId}/messages?limit=${limit}`);
+    const resp = await fetchWithDeadline(`${API}/sessions/${sessionId}/messages?limit=${limit}`);
     if (!resp.ok) return [];
     return resp.json();
   } catch {
@@ -2174,7 +2175,7 @@ export async function getSessionHistory(sessionId: string, limit = 200, taskId?:
   try {
     let url = `${API}/sessions/${sessionId}/history?limit=${limit}`;
     if (taskId) url += `&task_id=${encodeURIComponent(taskId)}`;
-    const resp = await fetch(url);
+    const resp = await fetchWithDeadline(url);
     if (!resp.ok) return [];
     return resp.json();
   } catch {
@@ -2188,7 +2189,7 @@ export async function getSessionChildren(sessionId: string): Promise<ChildSessio
     // while /history only returns messages. How: call the dedicated read-only endpoint
     // and tolerate missing older backends by returning an empty array. Purpose: the web
     // app can be deployed independently while still restoring childNodes when possible.
-    const resp = await fetch(`${API}/sessions/${sessionId}/children`);
+    const resp = await fetchWithDeadline(`${API}/sessions/${sessionId}/children`);
     if (!resp.ok) return [];
     return resp.json();
   } catch {

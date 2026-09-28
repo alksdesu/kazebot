@@ -2,7 +2,7 @@
 // Why: the main chat right panel should show system status instead of session editing.
 // How: mock Supervisor state and health responses, then assert the displayed counters.
 // Purpose: the right rail remains a stable operations dashboard across chat turns.
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { SystemDashboard } from '../components/dashboard/SystemDashboard';
@@ -14,6 +14,12 @@ function jsonResponse(value: unknown): Response {
     status: 200,
     headers: { 'Content-Type': 'application/json' },
   });
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((ok) => { resolve = ok; });
+  return { promise, resolve };
 }
 
 describe('SystemDashboard', () => {
@@ -61,6 +67,7 @@ describe('SystemDashboard', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
@@ -90,8 +97,10 @@ describe('SystemDashboard', () => {
     expect(screen.getByText('running')).toBeInTheDocument();
     expect(screen.getByText('Inspect current production state')).toBeInTheDocument();
     expect(screen.getByText('wk-12345')).toBeInTheDocument();
+    // Read requests carry a deadline, so fetch receives an extra abort signal.
     expect(fetch).toHaveBeenCalledWith('/v1/admin/tasks/active', {
       headers: { Authorization: 'Bearer admin-token' },
+      signal: expect.any(AbortSignal),
     });
   });
 
@@ -120,5 +129,73 @@ describe('SystemDashboard', () => {
       method: 'POST',
       headers: { Authorization: 'Bearer admin-token', 'X-Admin-Token': 'admin-token' },
     }));
+  });
+
+  it('skips every poll round while the first state read is still in flight', async () => {
+    const slow = deferred<Response>();
+    let stateCalls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/v1/admin/state')) {
+        stateCalls += 1;
+        return stateCalls === 1 ? slow.promise : jsonResponse({ sessions: 7, approvals: { pending: 0 }, tasks: {}, engine_runtime: {} });
+      }
+      if (url.endsWith('/v1/health')) return jsonResponse({ status: 'ok', uptime_seconds: 60 });
+      return jsonResponse({});
+    }));
+    // Polling attaches on mount, so fake timers must take over before render.
+    vi.useFakeTimers();
+    render(<SystemDashboard />);
+    await act(async () => {});
+    expect(stateCalls).toBe(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(45_000); });
+    expect(stateCalls).toBe(1);
+    expect(screen.getByText('…')).toBeInTheDocument();
+
+    await act(async () => { slow.resolve(jsonResponse({ sessions: 3, approvals: { pending: 0 }, tasks: {}, engine_runtime: {} })); });
+    expect(stateCalls).toBe(1);
+    expect(screen.getByText('3')).toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+    expect(stateCalls).toBe(2);
+    expect(screen.getByText('7')).toBeInTheDocument();
+  });
+
+  it('skips the very first interval while the first read hangs, then sends exactly one more', async () => {
+    const slow = deferred<Response>();
+    let stateCalls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/v1/admin/state')) {
+        stateCalls += 1;
+        return stateCalls === 1 ? slow.promise : jsonResponse({ sessions: 9, approvals: { pending: 0 }, tasks: {}, engine_runtime: {} });
+      }
+      if (url.endsWith('/v1/health')) return jsonResponse({ status: 'ok', uptime_seconds: 60 });
+      return jsonResponse({});
+    }));
+    // Polling attaches on mount, so fake timers must take over before render.
+    vi.useFakeTimers();
+    render(<SystemDashboard />);
+    await act(async () => {});
+    expect(stateCalls).toBe(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(14_999); });
+    expect(stateCalls).toBe(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(stateCalls).toBe(1);
+    expect(screen.getByText('…')).toBeInTheDocument();
+
+    await act(async () => { slow.resolve(jsonResponse({ sessions: 4, approvals: { pending: 0 }, tasks: {}, engine_runtime: {} })); });
+    expect(stateCalls).toBe(1);
+    expect(screen.getByText('4')).toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(14_999); });
+    expect(stateCalls).toBe(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(stateCalls).toBe(2);
+    expect(screen.getByText('9')).toBeInTheDocument();
   });
 });

@@ -220,6 +220,8 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
   const isCurrent = () => identity.isCurrent() && useSettingsStore.getState().adminToken === token;
   const mutation = useRef(false);
   const refreshSequence = useRef(0);
+  // 还没回来的那次读取的序号，0 表示没有在读。
+  const pendingLoad = useRef(0);
   const [status, setStatus] = useState<AccountStatus | null>(null);
   const [stage, setStage] = useState<Stage>('idle');
   const [qrImage, setQrImage] = useState('');
@@ -230,10 +232,12 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
   const [paused, setPaused] = useState(false);
   const stageStartedAt = useRef(0);
 
-  const load = useCallback(async (): Promise<AccountStatus | null> => {
+  // quiet：后台轮询的读取不锁按钮。NapCat 慢的时候一轮要读十几秒，锁着的话按钮几乎一直是灰的。
+  const load = useCallback(async (quiet = false): Promise<AccountStatus | null> => {
     if (!isCurrent()) return null;
     const request = ++refreshSequence.current;
-    setLoading(true);
+    pendingLoad.current = request;
+    if (!quiet) setLoading(true);
     try {
       const next = await getPlatformAccount(token, platformId);
       if (!isCurrent() || request !== refreshSequence.current) return null;
@@ -245,7 +249,8 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
       if (isCurrent() && request === refreshSequence.current) setLoadError(say(error));
       return null;
     } finally {
-      if (isCurrent() && request === refreshSequence.current) setLoading(false);
+      if (pendingLoad.current === request) pendingLoad.current = 0;
+      if (!quiet && isCurrent() && request === refreshSequence.current) setLoading(false);
     }
   }, [token, platformId, setLoadError]);
 
@@ -283,9 +288,11 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
           return;
         }
         if (polling) return;
+        // 手动刷新那次还没回来就先不发：后发的会把它作废，按钮得跟着多锁一轮。被换号、超时丢掉的那次不算。
+        if (pendingLoad.current !== 0 && pendingLoad.current === refreshSequence.current) return;
         polling = true;
         try {
-          const next = await load();
+          const next = await load(true);
           if (!alive || !isCurrent() || !next) return;
 
           if (next.reachable === false) {
@@ -370,7 +377,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
       if (!isCurrent()) return;
       setMessage(say(error));
       // 切失败会把这个号记成死号，刷一次列表让它立刻置灰。
-      void load();
+      void load(true);
     } finally {
       mutation.current = false;
       if (isCurrent()) setBusy(false);
@@ -450,7 +457,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
             <div className={BODY}>
               <Button
                 className="flex-none"
-                disabled={busy || loading || stage !== 'idle' || !status}
+                disabled={busy || stage !== 'idle' || !status}
                 onClick={() => void startRelogin()}
                 tone="quiet"
               >

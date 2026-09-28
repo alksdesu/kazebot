@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { startPolling } from '../../utils/polling';
 import { downloadFeature, featureRequest } from '../client';
 import { useRequestScope } from '../asyncState';
 import { actionClass, FeatureFeedback, primaryClass } from '../ui';
@@ -22,9 +23,8 @@ export function ExecutionProgressCard({ planId, scope }: { planId: string; scope
       try { const value = await featureRequest<unknown>(`/v1/execution/plans/${planId}`, { scope }); if (alive && request === sequence.current) { setPlan(readExecutionPlan(value)); setReadError(''); } }
       catch (reason) { if (alive && request === sequence.current) setReadError(String(reason)); }
     };
-    void refresh();
-    const timer = setInterval(() => void refresh(), 3000);
-    return () => { alive = false; sequence.current++; clearInterval(timer); };
+    const stop = startPolling(refresh, 3000, { first: refresh });
+    return () => { alive = false; sequence.current++; stop(); };
   }, [planId, scope, retry]);
   if (!plan || plan.id !== planId || (scope && plan.scope !== scope)) return readError ? <FeatureFeedback error={readError} retry={() => setRetry(current => current + 1)} /> : <p role="status">正在读取计划进度…</p>;
   const action = async (name: string) => {

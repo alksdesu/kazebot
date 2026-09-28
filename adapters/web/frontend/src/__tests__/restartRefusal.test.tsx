@@ -30,6 +30,9 @@ const blockedBy = (target: string, since = SINCE): RestartResult => ({
   in_progress: { target, since },
 });
 
+// 读请求一律带着管理员令牌和时限用的 signal；只断言「有 init」的话什么都拦不住。
+const readInit = { headers: { Authorization: 'Bearer admin-token' }, signal: expect.any(AbortSignal) };
+
 // 系统页要先拿到这两份状态才渲染得出重启按钮。
 const stubFetch = (restart: RestartResult) => {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -101,7 +104,7 @@ describe('被拒的重启在界面上', () => {
     const fetchMock = stubFetch(refused('restart already in progress'));
 
     render(<SystemSettingsPage />);
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/v1/admin/state', expect.anything()));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/v1/admin/state', readInit));
     fireEvent.click(screen.getByRole('button', { name: '重启引擎' }));
 
     expect(await screen.findByRole('status')).toHaveTextContent('未能重启：上一次重启还没收尾，稍后再试');
@@ -112,7 +115,7 @@ describe('被拒的重启在界面上', () => {
     const fetchMock = stubFetch(blockedBy('all'));
 
     render(<SystemSettingsPage />);
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/v1/admin/state', expect.anything()));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/v1/admin/state', readInit));
     fireEvent.click(screen.getByRole('button', { name: '重启引擎' }));
 
     expect(await screen.findByRole('status'))
@@ -125,7 +128,7 @@ describe('被拒的重启在界面上', () => {
     const fetchMock = stubFetch({ target: 'engine' } as RestartResult);
 
     render(<SystemSettingsPage />);
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/v1/admin/state', expect.anything()));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/v1/admin/state', readInit));
     fireEvent.click(screen.getByRole('button', { name: '重启引擎' }));
 
     expect(await screen.findByRole('status')).toHaveTextContent('未能重启：调度器没有排上这次重启');
@@ -136,7 +139,7 @@ describe('被拒的重启在界面上', () => {
     const fetchMock = stubFetch({ scheduled: true, target: 'engine' });
 
     render(<SystemSettingsPage />);
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/v1/admin/state', expect.anything()));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/v1/admin/state', readInit));
     fireEvent.click(screen.getByRole('button', { name: '重启引擎' }));
 
     expect(await screen.findByRole('status')).toHaveTextContent('已请求重启引擎');

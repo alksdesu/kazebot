@@ -5,7 +5,7 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as api from '../api/supervisorClient';
-import type { AdminState, NodeFileInfo } from '../api/supervisorClient';
+import type { AdminApproval, AdminState, NodeFileInfo } from '../api/supervisorClient';
 import { ApprovalsSettingsPage } from '../components/settings/pages/ApprovalsSettingsPage';
 import { NodeFilesSettingsPage } from '../components/settings/pages/NodeFilesSettingsPage';
 import { SystemSettingsPage } from '../components/settings/pages/SystemSettingsPage';
@@ -65,13 +65,21 @@ const adminState = (over: Partial<AdminState> = {}): AdminState => ({
   ...over,
 });
 
-const withApproval = (): AdminState => adminState({
-  pending_approvals: [{
-    approval_id: 'approval-1',
-    operation: '执行命令',
-    details: { tool_name: 'execute_command', path: '/tmp/demo', reason: '需要执行命令' },
-  }],
+const approval = (id: string, toolName: string): AdminApproval => ({
+  approval_id: id,
+  operation: '执行命令',
+  details: { tool_name: toolName, path: '/tmp/demo', reason: '需要执行命令' },
 });
+
+const withApproval = (): AdminState => adminState({ pending_approvals: [approval('approval-1', 'execute_command')] });
+
+const withApprovals = (...items: AdminApproval[]): AdminState => adminState({ pending_approvals: items });
+
+/** 当前选中那条的 id，没选就是 null。 */
+const selectedId = (): string | null => useSettingsSelectionStore.getState().selectedApproval?.approval_id ?? null;
+
+/** 点列表里那一条：整条是个按钮，点工具名会冒泡上去。 */
+const pick = (toolName: string) => fireEvent.click(screen.getByText(toolName));
 
 const nodeFile = (name: string, over: Partial<NodeFileInfo> = {}): NodeFileInfo => ({
   name,
@@ -394,6 +402,346 @@ describe('系统页两次读取撞车', () => {
 
     expectNoStatus();
     expect(screen.getByRole('button', { name: '刷新状态' })).not.toBeDisabled();
+  });
+});
+
+describe('上一轮没回来', () => {
+  it('审批页挂住时推几个间隔都不再发，放行后接着轮询', async () => {
+    const slow = deferred<AdminState>();
+    vi.mocked(api.getAdminState)
+      .mockResolvedValueOnce(adminState())
+      .mockReturnValueOnce(slow.promise)
+      .mockResolvedValue(withApproval());
+    render(<ApprovalsSettingsPage />);
+    await tick();
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+
+    await tick(APPROVALS_POLL_MS);
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+
+    await tick(APPROVALS_POLL_MS * 3);
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+    // 轮询是静默的，挂住也不会把刷新按钮按下去。
+    expect(screen.getByRole('button', { name: '刷新列表' })).not.toBeDisabled();
+
+    await act(async () => { slow.resolve(adminState()); });
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+
+    await tick(APPROVALS_POLL_MS);
+    expect(api.getAdminState).toHaveBeenCalledTimes(3);
+    expect(screen.getByText('execute_command')).toBeInTheDocument();
+  });
+
+  it('系统页挂住时推几个间隔都不再发，放行后接着轮询', async () => {
+    const slow = deferred<AdminState>();
+    vi.mocked(api.getAdminState)
+      .mockResolvedValueOnce(adminState())
+      .mockReturnValueOnce(slow.promise)
+      .mockResolvedValue(adminState({ engine_runtime: { worker_id: 'worker-b' } }));
+    render(<SystemSettingsPage />);
+    await tick();
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('worker-a')).toBeInTheDocument();
+
+    await tick(SYSTEM_POLL_MS);
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+
+    await tick(SYSTEM_POLL_MS * 3);
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('button', { name: '刷新状态' })).not.toBeDisabled();
+    expect(screen.getByText('worker-a')).toBeInTheDocument();
+
+    await act(async () => { slow.resolve(adminState()); });
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+
+    await tick(SYSTEM_POLL_MS);
+    expect(api.getAdminState).toHaveBeenCalledTimes(3);
+    expect(screen.getByText('worker-b')).toBeInTheDocument();
+  });
+});
+
+describe('审批页每一轮都比间隔慢', () => {
+  it('列表照样落得了地，不会一直读不到', async () => {
+    // 25 秒一次响应、10 秒一个间隔：不跳过的话每一轮都被后发的作废，列表一次也落不了地。
+    vi.mocked(api.getAdminState).mockImplementation(
+      () => new Promise<AdminState>((resolve) => { setTimeout(() => resolve(withApproval()), 25_000); }),
+    );
+    render(<ApprovalsSettingsPage />);
+    await tick();
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+
+    // 首读占着闩，10 秒和 20 秒这两轮一个请求都不发。
+    await tick(24_999);
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('暂无待审批项')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '正在刷新…' })).toBeDisabled();
+
+    await tick(1);
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('execute_command')).toBeInTheDocument();
+    expect(screen.queryByText('暂无待审批项')).toBeNull();
+    expect(screen.getByRole('button', { name: '刷新列表' })).not.toBeDisabled();
+
+    // 放开闩之后每 30 秒落一轮：25 秒读完，等到下一个 10 秒的点再发。
+    await tick(5_000);
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+
+    await tick(30_000);
+    expect(api.getAdminState).toHaveBeenCalledTimes(3);
+    expect(screen.getByText('execute_command')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '刷新列表' })).not.toBeDisabled();
+  });
+});
+
+describe('审批页点选与选中项', () => {
+  it('点选一条不发新的读取，也不打断 10 秒的节拍', async () => {
+    vi.mocked(api.getAdminState).mockResolvedValue(withApproval());
+    render(<ApprovalsSettingsPage />);
+    await tick();
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+
+    await tick(4_000);
+    pick('execute_command');
+
+    expect(selectedId()).toBe('approval-1');
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', { name: '正在刷新…' })).toBeNull();
+    expect(screen.getByRole('button', { name: '刷新列表' })).not.toBeDisabled();
+
+    // 点选要是重挂了轮询，这一轮就得推到点选后的第 10 秒，这里读不到第二次。
+    await tick(APPROVALS_POLL_MS - 4_000 - 1);
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+
+    await tick(1);
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+    expect(selectedId()).toBe('approval-1');
+  });
+
+  it('轮询读回来时选中那条已经不在了，选中项跟着清掉', async () => {
+    vi.mocked(api.getAdminState).mockResolvedValue(withApproval());
+    render(<ApprovalsSettingsPage />);
+    await tick();
+    pick('execute_command');
+    expect(selectedId()).toBe('approval-1');
+
+    vi.mocked(api.getAdminState).mockResolvedValue(adminState());
+    await tick(APPROVALS_POLL_MS);
+
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+    expect(selectedId()).toBeNull();
+    expect(screen.getByText('暂无待审批项')).toBeInTheDocument();
+  });
+
+  it('轮询读回来时选中那条还在，选中项原样留着', async () => {
+    vi.mocked(api.getAdminState).mockResolvedValue(
+      withApprovals(approval('approval-1', 'execute_command'), approval('approval-2', 'write_file')),
+    );
+    render(<ApprovalsSettingsPage />);
+    await tick();
+    pick('write_file');
+    expect(selectedId()).toBe('approval-2');
+
+    // 只剩选中那条，而且是服务端重新序列化出来的新对象：按 id 认，不按位置也不按引用。
+    vi.mocked(api.getAdminState).mockResolvedValue(withApprovals(approval('approval-2', 'write_file')));
+    await tick(APPROVALS_POLL_MS);
+
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+    expect(selectedId()).toBe('approval-2');
+    expect(screen.queryByText('execute_command')).toBeNull();
+    expect(screen.getByText('write_file')).toBeInTheDocument();
+  });
+
+  it('读取发出之后才点选，那一份读回来照样按最新的选中项判断', async () => {
+    const later = deferred<AdminState>();
+    vi.mocked(api.getAdminState)
+      .mockResolvedValueOnce(withApprovals(approval('approval-1', 'execute_command'), approval('approval-2', 'write_file')))
+      .mockReturnValueOnce(later.promise);
+    render(<ApprovalsSettingsPage />);
+    await tick();
+    expect(selectedId()).toBeNull();
+
+    // 这一轮发出去的时候一条都没选，选中是它还在路上时才发生的。
+    await tick(APPROVALS_POLL_MS);
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+    pick('write_file');
+    expect(selectedId()).toBe('approval-2');
+
+    await act(async () => { later.resolve(withApprovals(approval('approval-1', 'execute_command'))); });
+
+    expect(selectedId()).toBeNull();
+    expect(screen.queryByText('write_file')).toBeNull();
+    expect(screen.getByText('execute_command')).toBeInTheDocument();
+  });
+
+  it('允许之后那次重读按当时的选中项判断，决定掉的那条选中就清掉', async () => {
+    vi.mocked(api.getAdminState).mockResolvedValueOnce(withApproval()).mockResolvedValue(adminState());
+    render(<ApprovalsSettingsPage />);
+    await tick();
+    pick('execute_command');
+    expect(selectedId()).toBe('approval-1');
+
+    click('允许');
+    await tick();
+
+    expect(api.decideApproval).toHaveBeenCalledTimes(1);
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+    expect(selectedId()).toBeNull();
+    expect(statusText()).toBe('已允许审批');
+  });
+
+  it('决定的是别人那条，选中的自己还在就不受牵连', async () => {
+    const both = withApprovals(approval('approval-1', 'execute_command'), approval('approval-2', 'write_file'));
+    vi.mocked(api.getAdminState).mockResolvedValueOnce(both)
+      .mockResolvedValue(withApprovals(approval('approval-2', 'write_file')));
+    render(<ApprovalsSettingsPage />);
+    await tick();
+    pick('write_file');
+    expect(selectedId()).toBe('approval-2');
+
+    fireEvent.click(screen.getAllByRole('button', { name: '允许' })[0]);
+    await tick();
+
+    expect(api.decideApproval).toHaveBeenCalledWith('admin-token', 'approval-1', 'allow', 'settings allow');
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+    expect(selectedId()).toBe('approval-2');
+    expect(statusText()).toBe('已允许审批');
+  });
+});
+
+describe('首读带转圈，轮询静默', () => {
+  it('审批页首读转圈，之后每一轮都不按下刷新按钮', async () => {
+    const first = deferred<AdminState>();
+    vi.mocked(api.getAdminState).mockReturnValueOnce(first.promise).mockResolvedValue(withApproval());
+    render(<ApprovalsSettingsPage />);
+    await tick();
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: '正在刷新…' })).toBeDisabled();
+
+    await act(async () => { first.resolve(adminState()); });
+    expect(screen.getByRole('button', { name: '刷新列表' })).not.toBeDisabled();
+    expect(screen.getByText('暂无待审批项')).toBeInTheDocument();
+
+    await tick(APPROVALS_POLL_MS);
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('execute_command')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '刷新列表' })).not.toBeDisabled();
+
+    await tick(APPROVALS_POLL_MS);
+    expect(api.getAdminState).toHaveBeenCalledTimes(3);
+    expect(screen.getByText('execute_command')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '刷新列表' })).not.toBeDisabled();
+  });
+
+  it('系统页首读转圈，之后每一轮都不按下刷新按钮', async () => {
+    const first = deferred<AdminState>();
+    vi.mocked(api.getAdminState)
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValue(adminState({ engine_runtime: { worker_id: 'worker-b' } }));
+    render(<SystemSettingsPage />);
+    await tick();
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: '正在刷新…' })).toBeDisabled();
+    expect(screen.getByText('…')).toBeInTheDocument();
+
+    await act(async () => { first.resolve(adminState()); });
+    expect(screen.getByRole('button', { name: '刷新状态' })).not.toBeDisabled();
+    expect(screen.getByText('worker-a')).toBeInTheDocument();
+
+    await tick(SYSTEM_POLL_MS);
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('worker-b')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '刷新状态' })).not.toBeDisabled();
+
+    await tick(SYSTEM_POLL_MS);
+    expect(api.getAdminState).toHaveBeenCalledTimes(3);
+    expect(screen.getByText('worker-b')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '刷新状态' })).not.toBeDisabled();
+  });
+});
+
+describe('首读还没回来', () => {
+  it('审批页推几个间隔都不再发，首读回来后按间隔恢复', async () => {
+    const first = deferred<AdminState>();
+    vi.mocked(api.getAdminState).mockReturnValueOnce(first.promise).mockResolvedValue(withApproval());
+    render(<ApprovalsSettingsPage />);
+    await tick();
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+
+    await tick(APPROVALS_POLL_MS - 1);
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+
+    await tick(1);
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+
+    await tick(APPROVALS_POLL_MS * 2);
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: '正在刷新…' })).toBeDisabled();
+
+    await act(async () => { first.resolve(adminState()); });
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('暂无待审批项')).toBeInTheDocument();
+
+    await tick(APPROVALS_POLL_MS - 1);
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+
+    await tick(1);
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('execute_command')).toBeInTheDocument();
+  });
+
+  it('系统页推几个间隔都不再发，首读回来后按间隔恢复', async () => {
+    const first = deferred<AdminState>();
+    vi.mocked(api.getAdminState)
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValue(adminState({ engine_runtime: { worker_id: 'worker-b' } }));
+    render(<SystemSettingsPage />);
+    await tick();
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+
+    await tick(SYSTEM_POLL_MS - 1);
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+
+    await tick(1);
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+
+    await tick(SYSTEM_POLL_MS * 2);
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: '正在刷新…' })).toBeDisabled();
+
+    await act(async () => { first.resolve(adminState()); });
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('worker-a')).toBeInTheDocument();
+
+    await tick(SYSTEM_POLL_MS - 1);
+    expect(api.getAdminState).toHaveBeenCalledTimes(1);
+
+    await tick(1);
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('worker-b')).toBeInTheDocument();
+  });
+});
+
+describe('没登录', () => {
+  it('审批页没有 token 就一个请求都不发', async () => {
+    useSettingsStore.setState({ adminToken: '', isAuthenticated: true });
+    render(<ApprovalsSettingsPage />);
+    await tick();
+
+    await tick(APPROVALS_POLL_MS * 3);
+    expect(api.getAdminState).not.toHaveBeenCalled();
+    expect(screen.getByText('暂无待审批项')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '刷新列表' })).not.toBeDisabled();
+  });
+
+  it('系统页没通过鉴权就一个请求都不发', async () => {
+    useSettingsStore.setState({ adminToken: 'admin-token', isAuthenticated: false });
+    render(<SystemSettingsPage />);
+    await tick();
+
+    await tick(SYSTEM_POLL_MS * 3);
+    expect(api.getAdminState).not.toHaveBeenCalled();
+    expect(api.checkHealth).not.toHaveBeenCalled();
+    expect(screen.getByText('请先在通用页面登录 Admin Token')).toBeInTheDocument();
   });
 });
 

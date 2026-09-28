@@ -9,6 +9,7 @@ import {
   listLogFiles,
   readLogTail,
   retryEngine,
+  type HealthState,
   type LogFileInfo,
   type RuntimeStatus,
 } from '../api/supervisorClient';
@@ -282,13 +283,66 @@ describe('换人登录之后', () => {
   });
 });
 
-describe('状态读取撞车', () => {
-  it('慢的那次读回来不覆盖后发的那次', async () => {
+describe('上一轮没回来', () => {
+  it('状态挂住时推几个间隔都不再发，放行后接着轮询', async () => {
     const slow = deferred<RuntimeStatus>();
     vi.mocked(getRuntimeStatus)
       .mockReturnValueOnce(slow.promise)
+      .mockResolvedValue(status({ tasks: { queued: 4, running: 1 } }) as any);
+    await mount();
+    expect(getRuntimeStatus).toHaveBeenCalledTimes(1);
+
+    await tick();
+    await tick();
+    await tick();
+    expect(getRuntimeStatus).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('正在读取…')).toBeInTheDocument();
+
+    await act(async () => { slow.resolve(status() as any); });
+    expect(getRuntimeStatus).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('任务队列：等待 0 个，执行中 0 个。')).toBeInTheDocument();
+
+    await tick();
+    expect(getRuntimeStatus).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('任务队列：等待 4 个，执行中 1 个。')).toBeInTheDocument();
+  });
+
+  it('健康探测挂住时推几个间隔都不再探，放行后接着探', async () => {
+    const slow = deferred<HealthState>();
+    vi.mocked(checkHealth)
+      .mockReturnValueOnce(slow.promise)
+      .mockResolvedValue({ status: 'ok', uptime_seconds: 7200 } as any);
+    await mount();
+    expect(checkHealth).toHaveBeenCalledTimes(1);
+
+    await tick();
+    await tick();
+    await tick();
+    expect(checkHealth).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('连不上')).toBeInTheDocument();
+
+    await act(async () => { slow.resolve({ status: 'ok', uptime_seconds: 3600 } as any); });
+    expect(checkHealth).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('在线')).toBeInTheDocument();
+    expect(screen.getByText('已运行 1 小时')).toBeInTheDocument();
+
+    await tick();
+    expect(checkHealth).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('已运行 2 小时')).toBeInTheDocument();
+  });
+});
+
+describe('状态读取撞车', () => {
+  // 轮询自己撞不了车（上一轮没回来就跳过这一轮），只有手动重试收尾那次重读不走轮询，才和下一轮并排。
+  it('慢的那次读回来不覆盖后发的那次', async () => {
+    const slow = deferred<RuntimeStatus>();
+    vi.mocked(getRuntimeStatus)
+      .mockResolvedValueOnce(givenUp() as any)
+      .mockReturnValueOnce(slow.promise)
       .mockResolvedValue(status({ tasks: { queued: 1, running: 2 } }) as any);
     await mount();
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '手动重试' })); });
 
     await tick();
     expect(screen.getByText('任务队列：等待 1 个，执行中 2 个。')).toBeInTheDocument();
@@ -302,9 +356,12 @@ describe('状态读取撞车', () => {
   it('被顶掉的那次读取失败不报原因', async () => {
     const slow = deferred<RuntimeStatus>();
     vi.mocked(getRuntimeStatus)
+      .mockResolvedValueOnce(givenUp() as any)
       .mockReturnValueOnce(slow.promise)
       .mockResolvedValue(status() as any);
     await mount();
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '手动重试' })); });
 
     await tick();
     expect(screen.getByText('engine-1')).toBeInTheDocument();

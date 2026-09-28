@@ -14,15 +14,23 @@ vi.mock('../api/supervisorClient', async (importOriginal) => ({
 }));
 vi.mock('qrcode', () => ({ default: { toDataURL: vi.fn(async () => 'data:image/png;base64,QR') } }));
 
+// 走真接口才过得到 apiFetch 里的读请求时限，页面这一层看到的还是被 mock 的那个模块。
+const actualApi = await vi.importActual<typeof import('../api/supervisorClient')>('../api/supervisorClient');
+
 const SCAN_HINT = '用要登录的那个 QQ 扫码。二维码会过期，过期就点一下「刷新二维码」。';
 const WAITING_HINT = 'NapCat 还没应答，等它起来…';
 const TIMEOUT_HINT = '等待超时。NapCat 可能没起来，去服务器上看看容器状态，好了再点「刷新账号状态」。';
 const PAUSED_HINT = '已停止等待。要接着扫码，点「刷新账号状态」。';
 const READ_FAILED = '读账号状态超时。';
+const TIMEOUT_REASON = '请求超时：60 秒内服务器没有应答';
 const MIGRATED = '已搬迁 2 份记忆、3 个会话。备份在 /srv/backup/scope-1';
 const SCOPE_FAILED = '读归属超时。';
 // 重启超时阈值 180 秒，一轮轮询 3 秒，65 轮稳稳跨过去。
 const ROUNDS_PAST_TIMEOUT = 65;
+// 超过 180 秒才认输，第 60 轮刚好卡在阈值上，第 61 轮才判得出来。
+const ROUNDS_TO_RESTART_TIMEOUT = 61;
+// 读请求的时限 60 秒，同样按一轮 3 秒数。
+const ROUNDS_TO_READ_TIMEOUT = 20;
 
 const instances: api.ConsoleInstance[] = [
   { id: 'main', label: '主实例', path: '', current: true, idx: 0, accounts: { qq: '1000001' } },
@@ -82,6 +90,14 @@ const fillTarget = (account: string) => act(async () => {
 // 号配好了但没登录，watching 会自己盯着，第一轮轮询就把二维码取回来。
 const intoScanning = async () => { await mount(); await tick(); };
 
+// 挂住的得是底层 fetch：把客户端函数换成不返回的 promise，走不到读请求的时限那一段。
+const hangInFetch = () => {
+  vi.mocked(api.getPlatformAccount).mockImplementation(actualApi.getPlatformAccount);
+  vi.stubGlobal('fetch', vi.fn((_input: string, init: RequestInit = {}) => new Promise<Response>((_resolve, reject) => {
+    init.signal?.addEventListener('abort', () => reject(new DOMException('The operation was aborted.', 'AbortError')), { once: true });
+  })));
+};
+
 describe('账号页的提示', () => {
   it('首次读回来之前说的是正在读取', async () => {
     vi.mocked(api.getPlatformAccount).mockReturnValue(new Promise(() => {}));
@@ -107,6 +123,34 @@ describe('账号页的提示', () => {
     expect(screen.getByText('这个号的登录态已经失效了。')).toBeInTheDocument();
     expect(screen.getByText('登录态已失效，只能扫码')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '切到这个号' })).toBeDisabled();
+  });
+
+  it('切换失败后补的那次重读不锁按钮，读回来照样把死号置灰', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(api.switchPlatformAccount).mockRejectedValue(new Error('这个号的登录态已经失效了。'));
+    await mount();
+
+    // 这次重读是切失败之后自己补的，挂住了也不该让人连刷新都点不了。
+    let land: (next: api.AccountStatus) => void = () => {};
+    vi.mocked(api.getPlatformAccount).mockReturnValue(new Promise<api.AccountStatus>((resolve) => { land = resolve; }));
+    await click('切到这个号');
+
+    expect(screen.getByText('这个号的登录态已经失效了。')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '刷新账号状态' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '换个号登录' })).toBeEnabled();
+
+    await act(async () => {
+      land({
+        ...online,
+        quick_login: [{ account: '1000001', nick: '本号' }, { account: '2000002', nick: '备用号', available: false }],
+      });
+    });
+
+    expect(api.getPlatformAccount).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('这个号的登录态已经失效了。')).toBeInTheDocument();
+    expect(screen.getByText('登录态已失效，只能扫码')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '切到这个号' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '刷新账号状态' })).toBeEnabled();
   });
 
   it('手动刷新把换号失败的原因和读取失败的原因一起清掉', async () => {
@@ -242,6 +286,27 @@ describe('账号页的提示', () => {
     expect(screen.queryByText('当前机器人')).not.toBeInTheDocument();
   });
 
+  it('换号把挂着的那次读取丢下了，轮询不用等它 settle', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(api.enterPlatformLoginMode).mockResolvedValue(undefined);
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(napcatDown);
+    await mount();
+    await click('换个号登录');
+
+    // 这次读取一直不回来，等重启超时把序号推过去，它就成了被丢掉的那次。
+    vi.mocked(api.getPlatformAccount).mockReturnValue(new Promise(() => {}));
+    await tickUntil(TIMEOUT_HINT);
+
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(waitingScan);
+    await click('换个号登录');
+    const reads = vi.mocked(api.getPlatformAccount).mock.calls.length;
+    await tick();
+
+    expect(api.getPlatformAccount).toHaveBeenCalledTimes(reads + 1);
+    expect(screen.getByRole('img', { name: 'QQ 登录二维码' })).toBeInTheDocument();
+    expect(screen.getByText(SCAN_HINT)).toBeInTheDocument();
+  });
+
   it('等待超时之后点刷新账号状态，又自己盯着了', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     vi.mocked(api.enterPlatformLoginMode).mockResolvedValue(undefined);
@@ -257,6 +322,121 @@ describe('账号页的提示', () => {
     expect(api.getPlatformAccount).toHaveBeenCalledTimes(reads + 1);
     expect(screen.getByText(WAITING_HINT)).toBeInTheDocument();
     expect(screen.queryByText(TIMEOUT_HINT)).not.toBeInTheDocument();
+  });
+
+  it('等待超时之后点刷新账号状态，这次读取挂在 fetch 层也会自己了结', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(api.enterPlatformLoginMode).mockResolvedValue(undefined);
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(napcatDown);
+    await mount();
+    await click('换个号登录');
+    await tickUntil(TIMEOUT_HINT);
+
+    hangInFetch();
+    const reads = vi.mocked(api.getPlatformAccount).mock.calls.length;
+    await click('刷新账号状态');
+    expect(screen.getByRole('button', { name: '刷新账号状态' })).toBeDisabled();
+    // 换号会自己把在途那次读取丢掉，不必陪着手动这次一起锁。
+    expect(screen.getByRole('button', { name: '换个号登录' })).toBeEnabled();
+
+    // 轮询让着手动这次，它就按自己的 60 秒认输，不会被后发的顶掉而多熬一轮。
+    await tickRounds(ROUNDS_TO_READ_TIMEOUT - 1);
+    expect(screen.queryByText(TIMEOUT_REASON)).not.toBeInTheDocument();
+    expect(api.getPlatformAccount).toHaveBeenCalledTimes(reads + 1);
+
+    await tick();
+
+    expect(screen.getByText(TIMEOUT_REASON)).toBeInTheDocument();
+    // 认输的同时把位置让出来，轮询同一轮就接着往下读。
+    expect(api.getPlatformAccount).toHaveBeenCalledTimes(reads + 2);
+  });
+
+  it('手动刷新还挂着的时候，轮询不另发一次顶掉它', async () => {
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(napcatDown);
+    await mount();
+
+    let land: (next: api.AccountStatus) => void = () => {};
+    vi.mocked(api.getPlatformAccount).mockReturnValue(new Promise<api.AccountStatus>((resolve) => { land = resolve; }));
+    const reads = vi.mocked(api.getPlatformAccount).mock.calls.length;
+    await click('刷新账号状态');
+    await tickRounds(5);
+
+    expect(api.getPlatformAccount).toHaveBeenCalledTimes(reads + 1);
+
+    await act(async () => { land(online); });
+
+    expect(screen.getByText('当前机器人')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '刷新账号状态' })).toBeEnabled();
+  });
+
+  it('轮询那次读取挂着的时候，两个按钮都不跟着锁，提示也不动', async () => {
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(napcatDown);
+    await mount();
+    await tick();
+    expect(screen.getByText(WAITING_HINT)).toBeInTheDocument();
+
+    // NapCat 慢的时候一轮要读十几秒，轮询锁按钮的话这一页几乎一直点不动。
+    vi.mocked(api.getPlatformAccount).mockReturnValue(new Promise(() => {}));
+    const reads = vi.mocked(api.getPlatformAccount).mock.calls.length;
+    await tickRounds(4);
+
+    expect(api.getPlatformAccount).toHaveBeenCalledTimes(reads + 1);
+    expect(screen.getByRole('button', { name: '刷新账号状态' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '换个号登录' })).toBeEnabled();
+    expect(screen.queryByText('正在读取…')).not.toBeInTheDocument();
+    expect(screen.getByText(WAITING_HINT)).toBeInTheDocument();
+    expect(screen.getByText('NapCat 没应答，容器可能正在重启')).toBeInTheDocument();
+  });
+
+  it('手动刷新挂着时只锁刷新，换号点得动且把在途那次读取丢下', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(api.enterPlatformLoginMode).mockResolvedValue(undefined);
+    await mount();
+
+    let land: (next: api.AccountStatus) => void = () => {};
+    vi.mocked(api.getPlatformAccount).mockReturnValue(new Promise<api.AccountStatus>((resolve) => { land = resolve; }));
+    await click('刷新账号状态');
+
+    expect(screen.getByRole('button', { name: '刷新账号状态' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '换个号登录' })).toBeEnabled();
+
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(napcatDown);
+    await click('换个号登录');
+
+    expect(screen.getByRole('button', { name: '刷新账号状态' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '换个号登录' })).toBeDisabled();
+    expect(screen.getByText('正在重启 NapCat…')).toBeInTheDocument();
+
+    await tick();
+    expect(screen.getByText(WAITING_HINT)).toBeInTheDocument();
+
+    await act(async () => { land(online); });
+
+    expect(screen.getByText(WAITING_HINT)).toBeInTheDocument();
+    expect(screen.getByText('NapCat 没应答，容器可能正在重启')).toBeInTheDocument();
+    expect(screen.queryByText('当前机器人')).not.toBeInTheDocument();
+    expect(api.getPlatformAccount).toHaveBeenCalledTimes(3);
+  });
+
+  it('手动刷新挂着也不耽误重启超时，到点照样认输', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(api.enterPlatformLoginMode).mockResolvedValue(undefined);
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(napcatDown);
+    await mount();
+    await click('换个号登录');
+
+    vi.mocked(api.getPlatformAccount).mockReturnValue(new Promise(() => {}));
+    await click('刷新账号状态');
+    const reads = vi.mocked(api.getPlatformAccount).mock.calls.length;
+    await tickRounds(ROUNDS_TO_RESTART_TIMEOUT - 1);
+    expect(screen.queryByText(TIMEOUT_HINT)).not.toBeInTheDocument();
+
+    await tick();
+
+    expect(screen.getByText(TIMEOUT_HINT)).toBeInTheDocument();
+    expect(api.getPlatformAccount).toHaveBeenCalledTimes(reads);
+    expect(screen.getByRole('button', { name: '刷新账号状态' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '换个号登录' })).toBeEnabled();
   });
 
   it('停止等待之后不再轮询，读取失败的原因还留着', async () => {

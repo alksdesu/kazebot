@@ -4,7 +4,7 @@
 // 页面只认最后发出的那次读，写完发现 token 换了就不再替旧会话收尾。
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { ComponentType } from 'react';
-import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 import * as api from '../api/supervisorClient';
 import type { AdminNode, AdminSkill, AdminTool, McpClient } from '../api/supervisorClient';
@@ -39,6 +39,9 @@ vi.mock('../api/supervisorClient', async (importOriginal) => ({
   updateMcpClientsRaw: vi.fn(),
   updateSchedulesRaw: vi.fn(),
 }));
+
+// 走真接口才过得到 apiFetch 里的读请求时限，页面这一层看到的还是被 mock 的那个模块。
+const actualApi = await vi.importActual<typeof import('../api/supervisorClient')>('../api/supervisorClient');
 
 /** 没有消息时整个 StatusText 不渲染，只能等它出现。 */
 const statusText = async (): Promise<string> => (await screen.findByRole('status')).textContent || '';
@@ -659,6 +662,37 @@ for (const page of PAGES) describe(`${page.title}的提示`, () => {
       expect(page.selection()).toBe(selected);
       expect(screen.queryByRole('status')).toBeNull();
     });
+  });
+});
+
+describe('技能页读请求挂住', () => {
+  const READ_DEADLINE_MS = 60_000;
+  const TIMEOUT_REASON = '请求超时：60 秒内服务器没有应答';
+
+  // 挂住的得是底层 fetch：把客户端函数换成不返回的 promise，走不到读请求的时限那一段。
+  const hangingFetch = () => vi.fn((_input: string, init: RequestInit = {}) => new Promise<Response>((_resolve, reject) => {
+    init.signal?.addEventListener('abort', () => reject(new DOMException('The operation was aborted.', 'AbortError')), { once: true });
+  }));
+
+  beforeEach(() => {
+    vi.mocked(api.getSkills).mockImplementation(actualApi.getSkills);
+    vi.stubGlobal('fetch', hangingFetch());
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('服务器一分钟不应答就报超时，刷新技能重新可点', async () => {
+    render(<SkillsSettingsPage />);
+    expect(screen.getByRole('button', { name: '正在刷新…' })).toBeDisabled();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(READ_DEADLINE_MS); });
+
+    expect(screen.getByRole('status').textContent).toBe(TIMEOUT_REASON);
+    expect(screen.getByRole('button', { name: '刷新技能' })).toBeEnabled();
   });
 });
 
