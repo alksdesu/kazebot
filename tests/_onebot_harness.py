@@ -48,18 +48,32 @@ def install_nonebot_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
             return lambda func: func
 
     class Driver:
+        def __init__(self):
+            self.startup_hooks = []
+            self.shutdown_hooks = []
+            self.bot_connect_hooks = []
+
+        @staticmethod
+        def _register(hooks, func):
+            def register(value):
+                hooks.append(value)
+                return value
+
+            return register if func is None else register(func)
+
         def on_startup(self, func=None):
-            return (lambda value: value) if func is None else func
+            return self._register(self.startup_hooks, func)
 
         def on_shutdown(self, func=None):
-            return (lambda value: value) if func is None else func
+            return self._register(self.shutdown_hooks, func)
 
         def on_bot_connect(self, func=None):
-            return (lambda value: value) if func is None else func
+            return self._register(self.bot_connect_hooks, func)
 
+    driver = Driver()
     nonebot = types.ModuleType("nonebot")
     nonebot.get_bot = lambda *a, **k: None
-    nonebot.get_driver = lambda: Driver()
+    nonebot.get_driver = lambda: driver
     nonebot.on_message = lambda *a, **k: Matcher()
     nonebot.on_notice = lambda *a, **k: Matcher()
 

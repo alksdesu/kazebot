@@ -278,7 +278,6 @@ def _profiles_source() -> ProfileFile:
     return current
 
 
-@common.driver.on_startup
 def _load_user_profiles() -> None:
     """按 QQ 描述声明的位置读按人资料；位置能用 CLONOTH_QQ_USER_PROFILES_PATH 改。"""
     state._adapter.qq_user_profiles = _profiles_source().load()
@@ -294,6 +293,7 @@ def _reload_user_profiles_if_changed() -> bool:
     return True
 
 
+@common.driver.on_startup
 async def _startup() -> None:
     """NoneBot 启动时初始化 Clonoth SDK 与事件路由。"""
     if state._adapter.router_task is not None and not state._adapter.router_task.done():
