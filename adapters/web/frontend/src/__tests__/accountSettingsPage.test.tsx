@@ -1,8 +1,9 @@
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as api from '../api/supervisorClient';
 import { GeneralSettingsPage } from '../components/settings/pages/GeneralSettingsPage';
+import { getSettingsTab } from '../components/settings/settingsTabs';
 import { platformConsoleStore } from '../console/consoleStore';
 import { adoptPlatforms, QQ_NAPCAT, resetPlatforms } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
@@ -18,6 +19,10 @@ vi.mock('../api/supervisorClient', async importOriginal => ({
 const account: api.AccountStatus = {
   configured: true, reachable: true, is_login: true, online: true, account: '1000001', nick: '当前机器人',
 };
+const AccountPage = () => {
+  const Page = getSettingsTab('account').Page;
+  return <Page />;
+};
 const deferred = <T,>() => {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(done => { resolve = done; });
@@ -27,8 +32,8 @@ const deferred = <T,>() => {
 beforeEach(() => {
   vi.resetAllMocks();
   localStorage.clear();
-  window.history.replaceState(null, '', '/web/?view=settings&tab=general&section=account');
-  useViewStore.setState({ viewMode: 'settings', activeSettingsTab: 'general', activeSettingsSection: 'account' });
+  window.history.replaceState(null, '', '/web/?view=settings&tab=account');
+  useViewStore.setState({ viewMode: 'settings', activeSettingsTab: 'account', activeSettingsSection: '' });
   useSettingsStore.setState({ adminToken: 'current-token', isAuthenticated: true, isConnected: true });
   resetPlatforms();
   adoptPlatforms([QQ_NAPCAT], 'qq');
@@ -57,11 +62,12 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('通用设置中的账号与连接', () => {
-  it('深链直接展开管理区，bot 未上报时仍可管理实例、共享配置与账号', async () => {
-    render(<GeneralSettingsPage />);
+describe('机器人分组中的账号与连接', () => {
+  it('独立页直接显示管理内容，bot 未上报时仍可管理实例、共享配置与账号', async () => {
+    render(<AccountPage />);
     expect(await screen.findByText('当前机器人')).toBeVisible();
-    expect(screen.getByRole('button', { name: '账号与连接' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('heading', { name: '账号与连接', level: 1 })).toBeVisible();
+    expect(screen.queryByRole('button', { name: '账号与连接' })).not.toBeInTheDocument();
     for (const name of ['多开实例', '共享配置', '机器人账号', '快速切换', '记忆归属']) {
       expect(screen.getByRole('heading', { name })).toBeVisible();
     }
@@ -71,9 +77,9 @@ describe('通用设置中的账号与连接', () => {
     expect(api.getShareGroups).toHaveBeenCalledTimes(1);
   });
 
-  it('尚未确认的平台不会使用默认 QQ 发账号请求，清单到达后继续打开深链', async () => {
+  it('尚未确认的平台不会使用默认 QQ 发账号请求，清单到达后显示管理内容', async () => {
     resetPlatforms();
-    render(<GeneralSettingsPage />);
+    render(<AccountPage />);
     expect(await screen.findByText('正在读取当前实例的平台…')).toBeVisible();
     expect(api.getPlatformAccount).not.toHaveBeenCalled();
     await act(async () => { adoptPlatforms([QQ_NAPCAT], 'qq'); });
@@ -83,14 +89,14 @@ describe('通用设置中的账号与连接', () => {
 
   it('旧后端只公布一个平台时仍可管理当前实例', async () => {
     adoptPlatforms([QQ_NAPCAT]);
-    render(<GeneralSettingsPage />);
+    render(<AccountPage />);
     expect(await screen.findByText('当前机器人')).toBeVisible();
     expect(api.getPlatformAccount).toHaveBeenCalledWith('current-token', 'qq');
   });
 
   it('平台清单有多项但未指定当前实例平台时不猜测账号归属', async () => {
     adoptPlatforms([QQ_NAPCAT, { ...QQ_NAPCAT, id: 'other' }]);
-    render(<GeneralSettingsPage />);
+    render(<AccountPage />);
     expect(await screen.findByText('无法确定当前实例的平台，请刷新页面后重试。')).toBeVisible();
     expect(api.getPlatformAccount).not.toHaveBeenCalled();
     expect(api.getInstances).not.toHaveBeenCalled();
@@ -98,7 +104,7 @@ describe('通用设置中的账号与连接', () => {
 
   it.each(['missing', 'other'])('当前平台为 %s 时不会误操作 QQ 账号', async current => {
     adoptPlatforms([QQ_NAPCAT, { ...QQ_NAPCAT, id: 'other', shortName: '其他平台' }], current);
-    render(<GeneralSettingsPage />);
+    render(<AccountPage />);
     expect(await screen.findByText(current === 'missing'
       ? '无法确定当前实例的平台，请刷新页面后重试。'
       : '当前实例的平台尚未提供账号管理界面。')).toBeVisible();
@@ -109,9 +115,9 @@ describe('通用设置中的账号与连接', () => {
 
   it('令牌尚未通过认证时不挂载管理区或发出账号请求', async () => {
     useSettingsStore.setState({ isAuthenticated: false });
-    render(<GeneralSettingsPage />);
+    render(<AccountPage />);
     await act(async () => {});
-    expect(screen.queryByRole('button', { name: '账号与连接' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '多开实例' })).not.toBeInTheDocument();
     expect(api.getInstances).not.toHaveBeenCalled();
     expect(api.getPlatformAccount).not.toHaveBeenCalled();
     expect(api.getShareGroups).not.toHaveBeenCalled();
@@ -120,10 +126,10 @@ describe('通用设置中的账号与连接', () => {
   it('退出后重新登录，旧令牌迟到的账号响应不能回填到新页面', async () => {
     const old = deferred<api.AccountStatus>();
     vi.mocked(api.getPlatformAccount).mockReturnValueOnce(old.promise);
-    render(<GeneralSettingsPage />);
+    render(<AccountPage />);
     await act(async () => {});
-    fireEvent.click(screen.getByRole('button', { name: '退出登录' }));
-    expect(screen.queryByRole('button', { name: '账号与连接' })).not.toBeInTheDocument();
+    await act(async () => { useSettingsStore.setState({ adminToken: null, isAuthenticated: false }); });
+    expect(screen.queryByRole('heading', { name: '多开实例' })).not.toBeInTheDocument();
     await act(async () => { useSettingsStore.setState({ adminToken: 'next-token', isAuthenticated: true }); });
     expect(await screen.findByText('当前机器人')).toBeVisible();
     await act(async () => { old.resolve({ ...account, nick: '旧身份账号' }); });
@@ -131,10 +137,10 @@ describe('通用设置中的账号与连接', () => {
     expect(api.getPlatformAccount).toHaveBeenLastCalledWith('next-token', 'qq');
   });
 
-  it('离开通用设置后停止账号状态轮询', async () => {
+  it('离开账号设置后停止账号状态轮询', async () => {
     vi.useFakeTimers();
     vi.mocked(api.getPlatformAccount).mockResolvedValue({ configured: true, reachable: false });
-    const page = render(<GeneralSettingsPage />);
+    const page = render(<AccountPage />);
     await act(async () => {});
     expect(api.getPlatformAccount).toHaveBeenCalledTimes(1);
     await act(async () => { vi.advanceTimersByTime(3000); });
@@ -142,5 +148,14 @@ describe('通用设置中的账号与连接', () => {
     page.unmount();
     await act(async () => { vi.advanceTimersByTime(30000); });
     expect(api.getPlatformAccount).toHaveBeenCalledTimes(2);
+  });
+
+  it('通用设置不再包含账号管理或发出账号请求', async () => {
+    render(<GeneralSettingsPage />);
+    await act(async () => {});
+    expect(screen.queryByText('账号与连接')).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '多开实例' })).not.toBeInTheDocument();
+    expect(api.getPlatformAccount).not.toHaveBeenCalled();
+    expect(api.getInstances).not.toHaveBeenCalled();
   });
 });

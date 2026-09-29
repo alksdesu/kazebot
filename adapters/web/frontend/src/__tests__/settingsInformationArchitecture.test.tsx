@@ -19,7 +19,7 @@ const idsInGroup = (group: SettingsGroup) =>
 describe('设置分组归属', () => {
   it('机器人组放全平台共用的那几页', () => {
     expect(idsInGroup('bot')).toEqual([
-      'persona', 'defaults', 'memory', 'stickers', 'community', 'conversation', 'reminders',
+      'account', 'persona', 'defaults', 'memory', 'stickers', 'community', 'conversation', 'reminders',
     ]);
   });
 
@@ -28,7 +28,8 @@ describe('设置分组归属', () => {
     const sectionIds = QQ_SCHEMA.sections.map(section => section.id);
     expect(sectionIds).not.toContain('providers');
     expect(sectionIds).not.toContain('models');
-    expect([...BOT_PAGES, ...MODEL_PAGES].map(page => page.id)).not.toContain('account');
+    expect(BOT_PAGES[0]).toMatchObject({ id: 'account', label: '账号与连接', icon: 'account_circle' });
+    expect(MODEL_PAGES.map(page => page.id)).not.toContain('account');
   });
 
   it('平台组一个平台一页，只保留平台行为分区', () => {
@@ -74,11 +75,13 @@ describe('旧 id 别名', () => {
     expect(resolveSettingsLocation('platform-qq', 'channels')).toEqual({ tab: 'platform-qq', section: 'channels' });
   });
 
-  it('旧账号页和 QQ 账号分区归通用，其他平台分区原样保留', () => {
-    expect(resolveSettingsLocation('qq-account')).toEqual({ tab: 'general', section: 'account' });
-    expect(resolveSettingsLocation('platform-qq', 'account')).toEqual({ tab: 'general', section: 'account' });
+  it('旧账号入口都归独立账号页，其他平台分区原样保留', () => {
+    expect(resolveSettingsLocation('qq-account')).toEqual({ tab: 'account', section: '' });
+    expect(resolveSettingsLocation('platform-qq', 'account')).toEqual({ tab: 'account', section: '' });
+    expect(resolveSettingsLocation('general', 'account')).toEqual({ tab: 'account', section: '' });
+    expect(resolveSettingsLocation('account', 'account')).toEqual({ tab: 'account', section: '' });
     expect(resolveSettingsLocation('platform-otherchat', 'account')).toEqual({ tab: 'platform-otherchat', section: 'account' });
-    expect(getSettingsTab('qq-account').id).toBe('general');
+    expect(getSettingsTab('qq-account').id).toBe('account');
   });
 
   it('getSettingsTab 认旧 id，不再落到「通用」', () => {
@@ -129,12 +132,12 @@ describe('旧深链', () => {
     expect(new URLSearchParams(window.location.search).get('tab')).toBe('providers');
   });
 
-  it.each(['qq-account', 'platform-qq'])('账号入口 %s 的导航和地址都迁到通用', (tab) => {
+  it.each(['qq-account', 'platform-qq', 'general', 'account'])('账号入口 %s 的导航和地址都迁到独立账号页', (tab) => {
     useViewStore.getState().openSettings(tab, 'account');
-    expect(useViewStore.getState()).toMatchObject({ activeSettingsTab: 'general', activeSettingsSection: 'account' });
+    expect(useViewStore.getState()).toMatchObject({ activeSettingsTab: 'account', activeSettingsSection: '' });
     const params = new URLSearchParams(window.location.search);
-    expect(params.get('tab')).toBe('general');
-    expect(params.get('section')).toBe('account');
+    expect(params.get('tab')).toBe('account');
+    expect(params.has('section')).toBe(false);
   });
 });
 

@@ -86,13 +86,7 @@ export interface SettingsTabDefinition {
 const BOT_TAIL = 20 + BOT_PAGES.length;
 
 const CORE_TABS = [
-  {
-    id: 'general', label: '通用', icon: 'tune', group: 'basics', order: 0, Page: GeneralSettingsPage,
-    searchSections: [{
-      id: 'account', label: '账号与连接',
-      text: '账号与连接 account 多开实例 共享配置 机器人账号 快速切换 记忆归属',
-    }],
-  },
+  { id: 'general', label: '通用', icon: 'tune', group: 'basics', order: 0, Page: GeneralSettingsPage },
   // [2026-06-01] Register browser-only preferences as a first-class settings tab.
   // Why: auto-approval and render defaults are local frontend choices, not backend
   // policy. How: point the new Client tab to ClientSettingsPage. Purpose: future
@@ -129,6 +123,7 @@ const BOT_TABS: SettingsTabDefinition[] = BOT_PAGES.map((page, index) => ({
   order: 20 + index,
   configScope: page.configScope,
   sections: page.sections,
+  searchSections: page.searchSections,
   Page: wrapConsolePage(SETTINGS_GROUP_LABELS.bot, page),
 }));
 

@@ -31,8 +31,8 @@ const TAB_ALIASES: Record<string, SettingsLocation> = {
 export function resolveSettingsLocation(tabId: string, section = ''): SettingsLocation {
   const alias = TAB_ALIASES[tabId];
   const location = { tab: alias?.tab || tabId, section: section || alias?.section || '' };
-  if (location.tab === 'platform-qq' && location.section === 'account') {
-    return { tab: 'general', section: 'account' };
+  if (location.section === 'account' && ['platform-qq', 'general', 'account'].includes(location.tab)) {
+    return { tab: 'account', section: '' };
   }
   return location;
 }

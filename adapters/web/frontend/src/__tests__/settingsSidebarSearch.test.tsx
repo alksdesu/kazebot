@@ -1,5 +1,5 @@
 // 侧栏搜索命中后，页那一行带不带分区定位。
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
@@ -26,16 +26,30 @@ afterEach(() => {
 });
 
 describe('侧栏搜索命中的页那一行', () => {
-  it.each(['账号与连接', '多开实例', '共享配置', '机器人账号', '快速切换', '记忆归属'])('没有 schema 也能从 %s 找到通用账号管理', (text) => {
+  it('没有搜索时账号与连接就是机器人组里与人格同级的独立入口', () => {
+    render(<SettingsSidebar />);
+    const account = screen.getByRole('button', { name: '账号与连接' });
+    const persona = screen.getByRole('button', { name: '人格' });
+    const group = account.parentElement!.parentElement!;
+
+    expect(persona.parentElement!.parentElement).toBe(group);
+    expect(within(group).getByText('机器人')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '通用：账号与连接' })).not.toBeInTheDocument();
+    fireEvent.click(account);
+    expect(useViewStore.getState()).toMatchObject({ activeSettingsTab: 'account', activeSettingsSection: '' });
+    expect(new URLSearchParams(window.location.search).has('section')).toBe(false);
+  });
+
+  it.each(['账号与连接', '多开实例', '共享配置', '机器人账号', '快速切换', '记忆归属'])('没有 schema 也能从 %s 找到独立账号页', (text) => {
     clearConsoleSchemas();
     render(<SettingsSidebar />);
 
     search(text);
-    fireEvent.click(screen.getByRole('button', { name: '通用：账号与连接' }));
-    expect(useViewStore.getState()).toMatchObject({ activeSettingsTab: 'general', activeSettingsSection: 'account' });
+    fireEvent.click(screen.getByRole('button', { name: '账号与连接' }));
+    expect(useViewStore.getState()).toMatchObject({ activeSettingsTab: 'account', activeSettingsSection: '' });
     const params = new URLSearchParams(window.location.search);
-    expect(params.get('tab')).toBe('general');
-    expect(params.get('section')).toBe('account');
+    expect(params.get('tab')).toBe('account');
+    expect(params.has('section')).toBe(false);
   });
 
   it('旧后端 QQ schema 里的账号分区不再产生平台搜索入口', () => {
@@ -50,7 +64,8 @@ describe('侧栏搜索命中的页那一行', () => {
     render(<SettingsSidebar />);
 
     search('账号与连接');
-    expect(screen.getByRole('button', { name: '通用：账号与连接' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '账号与连接' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '通用：账号与连接' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'QQ · NapCat：账号与连接' })).not.toBeInTheDocument();
   });
 

@@ -3,6 +3,7 @@
 import { Empty } from '../components/settings/pages/settingsControls';
 import { DiagnosticsPanel } from '../features/operations/DiagnosticsPanel';
 import { PlainPage } from './components';
+import { AccountSettingsPage } from './AccountSettingsPage';
 import { FEATURES_SCOPE, type ConfigScope } from './configScope';
 import { ConnectionCard } from './ConnectionCard';
 import { DEFAULTS_PAGE_SECTIONS, STICKERS_PAGE_SECTIONS } from './FeatureSection';
@@ -16,6 +17,7 @@ import { ProvidersPage } from './ProvidersPage';
 import { QQ_PARTS } from './qqParts';
 import { NO_PARTS, type PageParts } from './sectionParts';
 import type { SectionPick } from './sectionPick';
+import type { SearchableSection } from './schemaSearch';
 import { StickersPage } from './StickersPage';
 import { QQ_NAPCAT, type PlatformDescriptor } from '../platforms/registry';
 import { usePlatformRegistryState } from '../platforms/usePlatformRegistry';
@@ -31,10 +33,22 @@ export interface ConsolePageDefinition {
   configScope?: ConfigScope;
   /** 这页摆那份 schema 里的哪几块。不给就是整份。 */
   sections?: SectionPick;
+  searchSections?: readonly SearchableSection[];
 }
 
 /** 不分平台的那几页：它是谁、记得什么、图库里有什么。 */
 export const BOT_PAGES: ConsolePageDefinition[] = [
+  {
+    id: 'account',
+    label: '账号与连接',
+    icon: 'account_circle',
+    Page: AccountSettingsPage,
+    note: '管理实例、共享配置和当前实例的账号连接。每个实例只连接一个平台、登录一个账号。',
+    searchSections: [{
+      id: 'account', label: '账号与连接',
+      text: '账号与连接 account 多开实例 共享配置 机器人账号 快速切换 记忆归属',
+    }],
+  },
   {
     id: 'persona',
     label: '人格',

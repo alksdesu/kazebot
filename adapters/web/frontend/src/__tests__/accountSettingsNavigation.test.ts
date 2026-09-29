@@ -7,17 +7,20 @@ describe('账号设置的初始地址', () => {
     '/web/?view=settings&tab=qq-account',
     '/web/?view=console&domain=account',
     '/i/second/web/?view=settings&tab=platform-qq&section=account',
-  ])('%s 刷新后仍定位通用的账号分区', async (url) => {
+    '/web/?view=settings&tab=general&section=account',
+    '/web/?view=settings&tab=account&section=account',
+    '/web/?view=settings&section=account',
+  ])('%s 刷新后定位独立账号页并清除旧分区参数', async (url) => {
     vi.resetModules();
     window.history.replaceState(null, '', `${url}&keep=1#details`);
     const { useViewStore } = await import('../store/viewStore');
 
     expect(useViewStore.getState()).toMatchObject({
-      viewMode: 'settings', activeSettingsTab: 'general', activeSettingsSection: 'account',
+      viewMode: 'settings', activeSettingsTab: 'account', activeSettingsSection: '',
     });
     const params = new URLSearchParams(window.location.search);
-    expect(params.get('tab')).toBe('general');
-    expect(params.get('section')).toBe('account');
+    expect(params.get('tab')).toBe('account');
+    expect(params.has('section')).toBe(false);
     expect(params.has('domain')).toBe(false);
     expect(params.get('keep')).toBe('1');
     expect(window.location.pathname).toBe(url.split('?')[0]);

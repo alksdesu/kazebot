@@ -57,6 +57,7 @@ describe('expanded settings registry', () => {
       'automation',
       'advanced',
       // 机器人组：全平台共用的那几页。
+      'account',
       'persona',
       'defaults',
       'memory',

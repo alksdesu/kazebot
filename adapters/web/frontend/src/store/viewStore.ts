@@ -110,7 +110,10 @@ export const useViewStore = create<ViewState>((set, get) => ({
 }));
 
 // 老链接进来先把地址栏改写成新参数，不然刷新一次又走一遍迁移，且 ?domain= 一直挂着。
-if (REQUESTED_VIEW === 'console' || (initialViewMode === 'settings' && query.get('tab') && query.get('tab') !== initialLocation.tab)) {
+if (REQUESTED_VIEW === 'console' || (initialViewMode === 'settings' && (
+  (query.get('tab') || DEFAULT_SETTINGS_TAB) !== initialLocation.tab
+  || (query.get('section') || '') !== initialLocation.section
+))) {
   syncViewQuery('settings', initialLocation.tab, initialLocation.section);
 }
 
