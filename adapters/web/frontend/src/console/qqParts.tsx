@@ -1,13 +1,11 @@
 // QQ · NapCat 页上前端自己画的部分：各分区收起时的摘要，和布局里 custom 节点点名的组件。
 // 分区本身、字段和说明都来自后端的 schema，这里只放编不成字段的东西。
-import { AccountWorkspaceSlot } from './AccountWorkspace';
 import { Audition } from './Audition';
 import { Capabilities } from './CapabilityGrants';
 import { BridgeFacts, Environment, HistoryFacts, QueueFacts, RestartEngine } from './LinkFacts';
 import { AdminListWarning, GroupListWarning } from './listWarnings';
 import type { PageParts } from './sectionParts';
 import {
-  AccountSummary,
   ChannelsSummary,
   InputSummary,
   InteractionSummary,
@@ -19,7 +17,6 @@ import {
 } from './sectionSummaries';
 
 export const QQ_PARTS: PageParts = Object.freeze({
-  account: { Summary: AccountSummary, components: { workspace: AccountWorkspaceSlot } },
   channels: { Summary: ChannelsSummary, components: { groupWarning: GroupListWarning } },
   trigger: { Summary: TriggerSummary, components: { audition: Audition } },
   permissions: {

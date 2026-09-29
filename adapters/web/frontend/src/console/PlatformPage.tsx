@@ -12,7 +12,7 @@ import {
 } from '../components/settings/pages/settingsControls';
 import { useSettingsStore } from '../store/settingsStore';
 import { scopedKey } from '../store/storageKey';
-import { entrypointNote, type PlatformDescriptor } from '../platforms/registry';
+import { entrypointNote, QQ_NAPCAT, type PlatformDescriptor } from '../platforms/registry';
 import { FEATURES_SCOPE, platformScope } from './configScope';
 import {
   configStore,
@@ -122,6 +122,7 @@ const PlatformPageBody = ({ connection, note, platform }: Omit<PlatformPageProps
   const { live, loading, loadError, applyError, notice, confirmation, refresh, draft } = useConsoleStore();
   const scope = platformScope(platform.id);
   const { schema, error: schemaError } = useConsoleSchema(scope);
+  const sections = schema?.sections.filter((section) => platform.id !== QQ_NAPCAT.id || section.id !== 'account');
   const loadSchema = useSchemaStore((state) => state.load);
   const refreshInherited = configStore(FEATURES_SCOPE)((state) => state.refresh);
   const confirmDiscard = useUnsavedChanges(
@@ -172,10 +173,10 @@ const PlatformPageBody = ({ connection, note, platform }: Omit<PlatformPageProps
       {body}
       {connection}
       {layout}
-      {schema && (
+      {schema && sections && (
         <div className="border-t border-[var(--duties-border)]">
-          {schema.sections.map((section) => (
-            // 不写平台配置的分区（账号与连接）在 bot 没上报时照样能用。
+          {sections.map((section) => (
+            // 不写平台配置的分区在 bot 没上报时照样能用。
             (published || !section.paths.length) && (
               <SectionEntry
                 deepLinked={requested === section.id}

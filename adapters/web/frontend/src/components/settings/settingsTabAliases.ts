@@ -30,8 +30,11 @@ const TAB_ALIASES: Record<string, SettingsLocation> = {
 /** 旧 id 自带分区，显式传的分区优先 —— 深链已经指名要哪一块了。 */
 export function resolveSettingsLocation(tabId: string, section = ''): SettingsLocation {
   const alias = TAB_ALIASES[tabId];
-  if (!alias) return { tab: tabId, section };
-  return { tab: alias.tab, section: section || alias.section };
+  const location = { tab: alias?.tab || tabId, section: section || alias?.section || '' };
+  if (location.tab === 'platform-qq' && location.section === 'account') {
+    return { tab: 'general', section: 'account' };
+  }
+  return location;
 }
 
 export function resolveSettingsTabId(tabId: string): string {

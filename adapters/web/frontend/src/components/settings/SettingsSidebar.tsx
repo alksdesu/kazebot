@@ -36,8 +36,9 @@ export const SettingsSidebar = () => {
     const query = search.trim().toLocaleLowerCase();
     return tabs.flatMap(tab => {
       const schema = tab.configScope ? schemas[tab.configScope.id] : undefined;
-      const sections = query && schema
-        ? searchableSections(schema).filter(section => picksSection(tab.sections, section.id) && section.text.includes(query))
+      const sections = query
+        ? [...(tab.searchSections || []), ...(schema ? searchableSections(schema) : [])]
+          .filter(section => picksSection(tab.sections, section.id) && section.text.includes(query))
         : [];
       const tabHit = `${tab.label} ${SETTINGS_GROUP_LABELS[tab.group || 'basics']} ${tab.id}`.toLocaleLowerCase().includes(query);
       return tabHit || sections.length ? [{ tab, sections }] : [];

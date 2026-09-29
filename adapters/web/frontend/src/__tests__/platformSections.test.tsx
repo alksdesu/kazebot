@@ -12,7 +12,7 @@ import { useSchemaStore } from '../console/schemaStore';
 import { Section } from '../console/Section';
 import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
-import { clearConsoleSchemas, seedConsoleSchemas } from './consoleSchemaFixture';
+import { clearConsoleSchemas, QQ_SCHEMA, seedConsoleSchemas } from './consoleSchemaFixture';
 
 const SECTION_STORE_KEY = 'console_sections_qq';
 
@@ -91,6 +91,7 @@ describe('折叠分区', () => {
     expect(header('信道')).toHaveTextContent('2 个群');
     expect(header('触发时机')).toHaveTextContent('冷却 30 秒');
     expect(header('链路')).toHaveTextContent('队列 2 个 worker');
+    expect(screen.queryByRole('button', { name: /^账号与连接/ })).toBeNull();
   });
 
   it('折叠头是按钮，展开状态报给读屏', () => {
@@ -223,16 +224,37 @@ describe('分区深链', () => {
     expect(header('信道')).toHaveAttribute('aria-expanded', 'false');
   });
 
-  it('bot 没上报时其余分区不出现，账号与连接照样能用', () => {
+  it('bot 没上报时配置分区不出现，平台页不再提供账号与连接', () => {
     platformConsoleStore('qq').setState({ live: { published: false, file: { exists: false, mtime_ns: 0, size: 0 } } });
     render(<PlatformTab />);
 
-    expect(screen.getByRole('button', { name: /^账号与连接/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^账号与连接/ })).toBeNull();
     expect(screen.queryByRole('button', { name: /^信道/ })).toBeNull();
   });
 });
 
 describe('控制台布局', () => {
+  it.each([true, false])('旧后端的 QQ 账号分区不会重新出现（已上报：%s）', (published) => {
+    platformConsoleStore('qq').setState({ live: { ...live(), published } });
+    useSchemaStore.setState({
+      schemas: {
+        ...useSchemaStore.getState().schemas,
+        [platformScope('qq').id]: {
+          ...QQ_SCHEMA,
+          sections: [
+            { id: 'account', label: '账号与连接', icon: 'account_circle', note: '', paths: [], nodes: [] },
+            ...QQ_SCHEMA.sections,
+          ],
+        },
+      },
+    });
+    useViewStore.setState({ activeSettingsSection: 'account' });
+    render(<PlatformTab />);
+
+    expect(screen.queryByRole('button', { name: /^账号与连接/ })).toBeNull();
+    expect(Boolean(screen.queryByRole('button', { name: /^信道/ }))).toBe(published);
+  });
+
   it('布局还在路上时说一声，不拿空白冒充没有分区', () => {
     clearConsoleSchemas();
     useSettingsStore.setState({ adminToken: 'fixture-token' });

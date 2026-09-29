@@ -1,4 +1,4 @@
-"""QQ · NapCat 在控制台上的九个分区。不分平台的那几块引用共享布局，这里只拼 QQ 自己的部分。"""
+"""QQ · NapCat 的控制台分区。不分平台的那几块引用共享布局，这里只拼 QQ 自己的部分。"""
 from __future__ import annotations
 
 from typing import Any
@@ -38,12 +38,6 @@ from adapters._shared.features_layout import (
 from .live_config import LIVE_KEYS
 
 SECTIONS = (
-    section(
-        "account", "账号与连接",
-        custom("workspace"),
-        icon="account_circle",
-        note="这一个实例用哪个号在说话，以及多开与记忆归属。换号会重启 NapCat，期间 bot 不可用。",
-    ),
     section(
         "channels", "信道",
         block(

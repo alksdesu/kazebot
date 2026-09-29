@@ -18,6 +18,7 @@ import {
   wrapConsolePage,
 } from '../../console/pages';
 import type { SectionPick } from '../../console/sectionPick';
+import type { SearchableSection } from '../../console/schemaSearch';
 import {
   platformRegistryState,
   type PlatformDescriptor,
@@ -70,6 +71,7 @@ export interface SettingsTabDefinition {
   configScope?: ConfigScope;
   /** 这页摆那份 schema 里的哪几块。一份 schema 分摆在几页上时，搜索结果只挂在真正摆着它的那页下面。 */
   sections?: SectionPick;
+  searchSections?: readonly SearchableSection[];
   group?: SettingsGroup;
   // [2026-06-01] Why: settings icon values used to be literal Unicode glyphs.
   // How: keep the field as a string but store Material Symbol names instead.
@@ -84,7 +86,13 @@ export interface SettingsTabDefinition {
 const BOT_TAIL = 20 + BOT_PAGES.length;
 
 const CORE_TABS = [
-  { id: 'general', label: '通用', icon: 'tune', group: 'basics', order: 0, Page: GeneralSettingsPage },
+  {
+    id: 'general', label: '通用', icon: 'tune', group: 'basics', order: 0, Page: GeneralSettingsPage,
+    searchSections: [{
+      id: 'account', label: '账号与连接',
+      text: '账号与连接 account 多开实例 共享配置 机器人账号 快速切换 记忆归属',
+    }],
+  },
   // [2026-06-01] Register browser-only preferences as a first-class settings tab.
   // Why: auto-approval and render defaults are local frontend choices, not backend
   // policy. How: point the new Client tab to ClientSettingsPage. Purpose: future
@@ -143,6 +151,7 @@ function platformTabs(platforms: readonly PlatformDescriptor[]): SettingsTabDefi
     group: 'platform',
     order: 40 + index,
     configScope: platformScope(page.platformId),
+    sections: page.platformId === 'qq' ? { except: ['account'] } : undefined,
     Page: platformPageComponent(page.platformId),
   }));
 }

@@ -31,10 +31,10 @@ describe('设置分组归属', () => {
     expect([...BOT_PAGES, ...MODEL_PAGES].map(page => page.id)).not.toContain('account');
   });
 
-  it('平台组一个平台一页，分区按 14.4 的清单折在页里', () => {
+  it('平台组一个平台一页，只保留平台行为分区', () => {
     expect(idsInGroup('platform')).toEqual(['platform-qq']);
     expect(QQ_SCHEMA.sections.map(section => section.id)).toEqual([
-      'account', 'channels', 'trigger', 'permissions',
+      'channels', 'trigger', 'permissions',
       'input', 'output', 'interaction', 'sticker', 'link',
     ]);
     expect(platformPages(allPlatforms())[0].platformId).toBe('qq');
@@ -49,14 +49,16 @@ describe('旧 id 别名', () => {
   it('每条别名都指向注册过的页与分区，且自己不再占用 id', () => {
     const tabs = currentSettingsTabs();
     const ids = new Set(tabs.map(tab => tab.id));
-    for (const [legacy, target] of Object.entries(TAB_ALIASES)) {
+    for (const legacy of Object.keys(TAB_ALIASES)) {
+      const target = resolveSettingsLocation(legacy);
       expect(ids.has(target.tab)).toBe(true);
       expect(ids.has(legacy)).toBe(false);
       if (!target.section) continue;
       // 一份 schema 分摆几页时，别名只能指到这页真摆着的那块。
       const tab = tabs.find(entry => entry.id === target.tab)!;
       const sections = tab.configScope ? snapshotFor(tab.configScope)?.sections || [] : [];
-      const shown = sections.filter(section => picksSection(tab.sections, section.id));
+      const shown = [...sections, ...(tab.searchSections || [])]
+        .filter(section => picksSection(tab.sections, section.id));
       expect(shown.map(section => section.id)).toContain(target.section);
     }
   });
@@ -68,6 +70,15 @@ describe('旧 id 别名', () => {
   it('显式指定的分区压过别名自带的', () => {
     expect(resolveSettingsLocation('qq-timing')).toEqual({ tab: 'platform-qq', section: 'trigger' });
     expect(resolveSettingsLocation('qq-timing', 'link')).toEqual({ tab: 'platform-qq', section: 'link' });
+    expect(resolveSettingsLocation('qq-account', 'link')).toEqual({ tab: 'platform-qq', section: 'link' });
+    expect(resolveSettingsLocation('platform-qq', 'channels')).toEqual({ tab: 'platform-qq', section: 'channels' });
+  });
+
+  it('旧账号页和 QQ 账号分区归通用，其他平台分区原样保留', () => {
+    expect(resolveSettingsLocation('qq-account')).toEqual({ tab: 'general', section: 'account' });
+    expect(resolveSettingsLocation('platform-qq', 'account')).toEqual({ tab: 'general', section: 'account' });
+    expect(resolveSettingsLocation('platform-otherchat', 'account')).toEqual({ tab: 'platform-otherchat', section: 'account' });
+    expect(getSettingsTab('qq-account').id).toBe('general');
   });
 
   it('getSettingsTab 认旧 id，不再落到「通用」', () => {
@@ -116,6 +127,14 @@ describe('旧深链', () => {
 
     expect(useViewStore.getState().activeSettingsTab).toBe('providers');
     expect(new URLSearchParams(window.location.search).get('tab')).toBe('providers');
+  });
+
+  it.each(['qq-account', 'platform-qq'])('账号入口 %s 的导航和地址都迁到通用', (tab) => {
+    useViewStore.getState().openSettings(tab, 'account');
+    expect(useViewStore.getState()).toMatchObject({ activeSettingsTab: 'general', activeSettingsSection: 'account' });
+    const params = new URLSearchParams(window.location.search);
+    expect(params.get('tab')).toBe('general');
+    expect(params.get('section')).toBe('account');
   });
 });
 

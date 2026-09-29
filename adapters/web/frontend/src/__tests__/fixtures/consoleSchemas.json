@@ -1224,19 +1224,6 @@
       "version": 1,
       "sections": [
         {
-          "id": "account",
-          "label": "账号与连接",
-          "icon": "account_circle",
-          "note": "这一个实例用哪个号在说话，以及多开与记忆归属。换号会重启 NapCat，期间 bot 不可用。",
-          "paths": [],
-          "nodes": [
-            {
-              "kind": "custom",
-              "name": "workspace"
-            }
-          ]
-        },
-        {
           "id": "channels",
           "label": "信道",
           "icon": "inbox",

@@ -387,7 +387,7 @@ class TestQQPage:
         schema = console_layout.schema()
 
         assert [part["id"] for part in schema["sections"]] == [
-            "account", "channels", "trigger", "permissions", "input", "output", "interaction", "sticker", "link",
+            "channels", "trigger", "permissions", "input", "output", "interaction", "sticker", "link",
         ]
 
     def test_only_grants_and_the_legacy_mode_go_without_controls(self) -> None:
@@ -432,7 +432,7 @@ class TestQQPage:
     def test_the_platform_pieces(self) -> None:
         """这些块由前端按「qq:分区」登记的组件画，改名要两边一起改。"""
         assert _custom_names(console_layout.SECTIONS) == {
-            "workspace", "groupWarning", "audition", "adminWarning", "capabilities",
+            "groupWarning", "audition", "adminWarning", "capabilities",
             "queueFacts", "historyFacts", "bridgeFacts", "environment", "restartEngine",
         }
 

@@ -57,7 +57,8 @@ const accountLine = (row: ConsoleInstance): string => {
 // 扫码登录、多开、记忆归属都得盯着 NapCat 的 WebUI 一路轮询，编不成 schema 字段。
 export const AccountWorkspaceSlot = () => {
   const token = useSettingsStore(state => state.adminToken);
-  return token ? <AccountWorkspace key={token} token={token} /> : <Empty>需要管理员令牌。</Empty>;
+  const platform = usePlatform();
+  return token ? <AccountWorkspace key={`${token}:${platform.id}`} token={token} /> : <Empty>需要管理员令牌。</Empty>;
 };
 
 const AccountWorkspace = ({ token }: { token: string }) => {

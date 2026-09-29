@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { activeProviderConfig, checkHealth, getProviders } from '../../../api/supervisorClient';
+import { GeneralAccountSettings } from '../../../console/GeneralAccountSettings';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { LoginPage } from '../../auth/LoginPage';
@@ -71,7 +72,7 @@ export const GeneralSettingsPage = () => {
     settings.setGlobalConfig('', '');
   };
 
-  return <PageShell title="通用" description="查看控制台连接，管理当前浏览器的管理员登录。退出登录不会停止机器人或后台任务。">
+  return <PageShell title="通用" description="管理实例、共享配置和当前实例的账号，查看控制台连接与管理员登录状态。退出登录不会停止机器人或后台任务。">
     <Block frame="boxed" title="调度器连接">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p role="status" className="flex items-center gap-2 text-sm"><span aria-hidden="true" className={`h-2 w-2 rounded-full ${isConnected ? 'bg-[var(--duties-live)]' : 'bg-[var(--duties-danger)]'}`} />{checking ? '正在检查连接…' : isConnected ? '调度器已连接' : '调度器未连接'}</p>
@@ -87,5 +88,6 @@ export const GeneralSettingsPage = () => {
       </div> : <LoginPage embedded />}
       {storageWarning && <p role="status" className="mt-3 text-sm text-[var(--duties-secondary)]">{storageWarning}</p>}
     </Block>
+    <GeneralAccountSettings />
   </PageShell>;
 };
