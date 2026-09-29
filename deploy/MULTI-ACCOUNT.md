@@ -162,6 +162,8 @@ journalctl -u kazebot-host-cleanup -n 100 --no-pager
 
 ### 已有实例启用共享配置前
 
+从旧配置布局升级时，先按 [升级手册](UPGRADE-MULTI-PLATFORM.md) 完成停写备份、配置迁移与验收。
+
 重跑 `install_provision.sh` 会准备共享目录和主实例的 drop-in，但只把多实例模板更新到 `/usr/local/lib/kazebot/units/`，不会替换已经装在 `/etc/systemd/system/` 的模板，也不会重启主实例的 QQ 适配器。
 
 升级时还需要完成以下步骤，再在控制台建组或加入：
