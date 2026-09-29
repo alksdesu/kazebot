@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import base64
+import stat
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -96,6 +98,31 @@ class TestIsDirLink:
         (ws / "data" / "f.txt").write_text("x", encoding="utf-8")
 
         assert config_layout.is_dir_link(ws / "data" / "f.txt") is False
+
+    def test_layout_checks_work_without_windows_reparse_constants(
+        self, ws: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        file = ws / "data" / "f.txt"
+        file.write_text("x", encoding="utf-8")
+        monkeypatch.setattr(config_layout, "stat", SimpleNamespace(S_ISLNK=stat.S_ISLNK))
+
+        assert config_layout.is_dir_link(ws / "config") is False
+        assert config_layout.is_dir_link(file) is False
+        config_layout.check_config_dir(ws)
+
+    @pytest.mark.parametrize("tag, expected", [(0xA0000003, True), (0, False), (None, False)])
+    def test_only_the_junction_reparse_tag_marks_a_directory_link(
+        self, ws: Path, monkeypatch: pytest.MonkeyPatch, tag: int | None, expected: bool,
+    ) -> None:
+        info = SimpleNamespace(st_mode=stat.S_IFDIR)
+        if tag is not None:
+            info.st_reparse_tag = tag
+        monkeypatch.setattr(config_layout, "os", SimpleNamespace(lstat=lambda path: info))
+        monkeypatch.setattr(config_layout, "stat", SimpleNamespace(
+            S_ISLNK=stat.S_ISLNK, IO_REPARSE_TAG_MOUNT_POINT=0xA0000003,
+        ))
+
+        assert config_layout.is_dir_link(ws / "config") is expected
 
     def test_a_directory_link_is_one(self, ws: Path, outside: Path) -> None:
         _link(ws / "data" / "mine", outside)

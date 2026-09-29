@@ -309,7 +309,8 @@ def is_dir_link(path: Path | str) -> bool:
         return False
     if stat.S_ISLNK(info.st_mode):
         return True
-    return getattr(info, "st_reparse_tag", 0) == stat.IO_REPARSE_TAG_MOUNT_POINT
+    junction_tag = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", None)
+    return junction_tag is not None and getattr(info, "st_reparse_tag", None) == junction_tag
 
 
 def config_share_group(workspace_root: Path | str) -> str | None:
