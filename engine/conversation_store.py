@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import config_layout
 from engine.eventlog_rotation import eventlog_file_lock
 
 
@@ -143,7 +144,7 @@ class ConversationStore:
         # session_id -> list[Message] 的内存缓存
         self._cache: dict[str, list[Message]] = {}
         # 缓存对应的文件指纹 (mtime_ns, size)，用于发现别的进程改过这个文件
-        self._cache_stamps: dict[str, tuple[int, int]] = {}
+        self._cache_stamps: dict[str, tuple[int, int, int]] = {}
 
     # ── 写入 ──
 
@@ -186,13 +187,9 @@ class ConversationStore:
 
     # ── 读取 ──
 
-    def _file_stamp(self, path: Path) -> tuple[int, int]:
-        """文件指纹；不存在时返回 (0, 0)。"""
-        try:
-            st = path.stat()
-        except OSError:
-            return (0, 0)
-        return (st.st_mtime_ns, st.st_size)
+    def _file_stamp(self, path: Path) -> tuple[int, int, int]:
+        """文件指纹；不存在时是 (0, 0, 0)。另一个进程整份替换会换 inode，同一刻写进等长内容也认得出来。"""
+        return config_layout.file_stamp(path) or (0, 0, 0)
 
     def load(self, session_id: str) -> list[Message]:
         """加载 session 的全部消息。缓存命中前先确认文件没被别的进程改过。

@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
-import { getPolicyRaw, getRuntimeFile, resetRuntime, updatePolicyRaw, updateRuntimeRaw, type RuntimeFile } from '../../../api/supervisorClient';
+import { getPolicyRaw, getRuntimeFile, isEditConflict, resetRuntime, updatePolicyRaw, updateRuntimeRaw, type RuntimeFile } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { parseRuntimeConfig, serializeRuntimeConfig, type EngineToolMode, type RuntimeConfigFormState } from '../settingsStructuredConfig';
@@ -18,6 +18,8 @@ interface RawFileState {
   loading: boolean;
   loaded: boolean;
   saved: string;
+  /** 编辑器里这份内容是基于哪一版改的，保存时交回：中途被别处改过就 409。 */
+  base: string | null;
 }
 
 const FILES: Array<{ key: FileKey; title: string; filename: string; description: string }> = [
@@ -62,8 +64,8 @@ export const AdvancedSettingsPage = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const { setAdvancedFile } = useSettingsSelectionStore();
   const [files, setFiles] = useState<Record<FileKey, RawFileState>>({
-    runtime: { value: '', saved: '', message: '', loading: false, loaded: false },
-    policy: { value: '', saved: '', message: '', loading: false, loaded: false },
+    runtime: { value: '', saved: '', message: '', loading: false, loaded: false, base: null },
+    policy: { value: '', saved: '', message: '', loading: false, loaded: false, base: null },
   });
   const [runtimeConfigForm, setRuntimeConfigForm] = useState<RuntimeConfigFormState>(EMPTY_RUNTIME_CONFIG_FORM);
   const [runtimeSource, setRuntimeSource] = useState<RuntimeFile['source'] | ''>('');
@@ -81,8 +83,8 @@ export const AdvancedSettingsPage = () => {
     mounted.current = true;
     for (const operation of Object.values(operations.current)) { operation.id++; operation.busy = false; }
     setFiles({
-      runtime: { value: '', saved: '', message: '', loading: false, loaded: false },
-      policy: { value: '', saved: '', message: '', loading: false, loaded: false },
+      runtime: { value: '', saved: '', message: '', loading: false, loaded: false, base: null },
+      policy: { value: '', saved: '', message: '', loading: false, loaded: false, base: null },
     });
     setRuntimeConfigForm(EMPTY_RUNTIME_CONFIG_FORM); setRuntimeBaseline(EMPTY_RUNTIME_CONFIG_FORM); setRuntimeFormEdited(false);
     setRuntimeSource('');
@@ -122,9 +124,10 @@ export const AdvancedSettingsPage = () => {
     const id = begin(key);
     try {
       const runtime = key === 'runtime' ? await getRuntimeFile(adminToken) : null;
-      const raw = runtime ? runtime.content : await getPolicyRaw(adminToken);
+      const file = runtime ?? await getPolicyRaw(adminToken);
+      const raw = file.content;
       if (!isCurrent(key, id)) return;
-      setFileState(key, { value: raw, saved: raw, loaded: true, message: '' });
+      setFileState(key, { value: raw, saved: raw, loaded: true, message: '', base: file.hash });
       if (runtime) {
         setRuntimeSource(runtime.source);
         setRuntimeFormEdited(false); setRuntimeConfigForm(EMPTY_RUNTIME_CONFIG_FORM); setRuntimeBaseline(EMPTY_RUNTIME_CONFIG_FORM);
@@ -147,13 +150,18 @@ export const AdvancedSettingsPage = () => {
       const issue = hasLikelyYamlSyntaxIssue(value);
       if (issue) throw new Error(issue);
       const form = key === 'runtime' ? parseRuntimeConfig(value) : null;
-      if (key === 'runtime') await updateRuntimeRaw(adminToken, value);
-      else await updatePolicyRaw(adminToken, value);
+      const base = files[key].base;
+      const result = key === 'runtime' ? await updateRuntimeRaw(adminToken, value, base) : await updatePolicyRaw(adminToken, value, base);
       if (!isCurrent(key, id)) return;
-      setFileState(key, { value, saved: value, message: '已保存' });
+      setFileState(key, { value, saved: value, message: '已保存', base: result.hash });
       if (form) { setRuntimeConfigForm(form); setRuntimeBaseline(form); setRuntimeFormEdited(false); setRuntimeSource('override'); }
     } catch (error) {
-      if (isCurrent(key, id)) setFileState(key, { message: error instanceof Error ? error.message : '保存失败' });
+      if (!isCurrent(key, id)) return;
+      setFileState(key, {
+        message: isEditConflict(error)
+          ? `${key}.yaml 在打开之后被别处改过，没有保存：点「加载」读入最新内容，再把改动重做一遍。`
+          : error instanceof Error ? error.message : '保存失败',
+      });
     } finally { finish(key, id); }
   };
 
@@ -166,7 +174,7 @@ export const AdvancedSettingsPage = () => {
       await resetRuntime(adminToken);
       const runtime = await getRuntimeFile(adminToken);
       if (!isCurrent('runtime', id)) return;
-      setFileState('runtime', { value: runtime.content, saved: runtime.content, loaded: true, message: '已恢复成仓库默认' });
+      setFileState('runtime', { value: runtime.content, saved: runtime.content, loaded: true, message: '已恢复成仓库默认', base: runtime.hash });
       setRuntimeSource(runtime.source);
       const form = parseRuntimeConfig(runtime.content);
       setRuntimeConfigForm(form); setRuntimeBaseline(form); setRuntimeFormEdited(false);

@@ -91,10 +91,10 @@ beforeEach(() => {
   vi.mocked(getProviderProfiles).mockResolvedValue({ options: CATALOG, wireFormats: {}, hostProfiles: {} } as any);
   vi.mocked(getProviders).mockResolvedValue(PROVIDERS as any);
   vi.mocked(getNodes).mockResolvedValue(NODES as any);
-  vi.mocked(getRuntimeRaw).mockResolvedValue(RUNTIME);
-  vi.mocked(getNodeRaw).mockResolvedValue(NODE_YAML);
-  vi.mocked(updateRuntimeRaw).mockResolvedValue({ ok: true } as any);
-  vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true } as any);
+  vi.mocked(getRuntimeRaw).mockResolvedValue({ content: RUNTIME, hash: 'runtime-1' });
+  vi.mocked(getNodeRaw).mockResolvedValue({ content: NODE_YAML, hash: 'node-1' });
+  vi.mocked(updateRuntimeRaw).mockResolvedValue({ ok: true, hash: 'runtime-2' });
+  vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true, hash: 'node-2' });
 });
 
 const save = () => fireEvent.click(screen.getByRole('button', { name: '保存参数' }));
@@ -138,6 +138,42 @@ describe('模型参数页', () => {
       provider_options: { thinking_mode: 'budget' },
     });
     expect(updateRuntimeRaw).not.toHaveBeenCalled();
+  });
+
+  it('保存前现读一次，别处刚加的键不会被打开时那份旧原文盖掉', async () => {
+    // 接在 providers 那一块后面：别的实例刚给 gemini 加了一段。
+    const LATER = `${RUNTIME}  gemini:\n    timeout_sec: 300.0\n`;
+    vi.mocked(getRuntimeRaw)
+      .mockResolvedValueOnce({ content: RUNTIME, hash: 'runtime-1' })
+      .mockResolvedValue({ content: LATER, hash: 'runtime-9' });
+    render(<ModelsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: '高' }));
+    save();
+
+    await waitFor(() => expect(updateRuntimeRaw).toHaveBeenCalled());
+    const [, written, base] = vi.mocked(updateRuntimeRaw).mock.calls[0];
+    expect(written).toContain('gemini:');
+    expect(yaml.load(written)).toMatchObject({
+      providers: { openai: { options: { reasoning_effort: 'high' } }, gemini: { timeout_sec: 300 } },
+    });
+    // 带的是刚读那一版的指纹，不是打开时那份。
+    expect(base).toBe('runtime-9');
+  });
+
+  it('节点作用域同样现读现合并', async () => {
+    const LATER = `${NODE_YAML}max_steps: 9\n`;
+    vi.mocked(getNodeRaw)
+      .mockResolvedValueOnce({ content: NODE_YAML, hash: 'node-1' })
+      .mockResolvedValue({ content: LATER, hash: 'node-9' });
+    render(<ModelsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'qq.vision' }));
+    fireEvent.click(await screen.findByRole('button', { name: '按预算' }));
+    save();
+
+    await waitFor(() => expect(updateNodeRaw).toHaveBeenCalled());
+    const [, , written, base] = vi.mocked(updateNodeRaw).mock.calls[0];
+    expect(yaml.load(written)).toMatchObject({ max_steps: 9, provider_options: { thinking_mode: 'budget' } });
+    expect(base).toBe('node-9');
   });
 
   it('依赖项没满足时子控件不出现', async () => {

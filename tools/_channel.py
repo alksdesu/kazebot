@@ -1,19 +1,21 @@
 """工具子进程共用的渠道与平台密钥解析。
 
 工具是独立子进程、只吃标准库，导不了 clonoth_runtime，所以在这里放一份而不是各抄一遍。
-密钥只能从 .env 文件读：safe_subprocess_env() 会把 *_API_KEY 和平台声明的密钥变量从环境里剥掉。
+密钥只能从 .env 和 config/secrets.env 读：safe_subprocess_env() 会把 *_API_KEY 和平台声明的密钥变量从环境里剥掉。
 """
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import NamedTuple
 
 # 这几家收 OpenAI 格式的 /chat/completions；anthropic 与 gemini 原生走自己的端点和请求体。
 OPENAI_COMPATIBLE = frozenset({"openai", "deepseek"})
-# 和 config_layout 的 MODELS_FILE、PLATFORM_SECRETS_FILE 同值：这里只吃标准库，导不了它。
+# 和 config_layout 的 MODELS_FILE、PLATFORM_SECRETS_FILE、SHARED_SECRETS_FILE 同值：这里只吃标准库，导不了它。
 _MODELS_FILE = ("config", "models.yaml")
 _PLATFORM_SECRETS_FILE = ("data", "platform_secrets.yaml")
+_SHARED_SECRETS_FILE = ("config", "secrets.env")
 
 
 class MainChannel(NamedTuple):
@@ -25,18 +27,77 @@ class MainChannel(NamedTuple):
     model: str = ""
 
 
-def _read_dotenv(root: Path) -> dict[str, str]:
-    path = root / ".env"
-    if not path.exists():
-        return {}
-    pairs: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+_DOUBLE_QUOTE_ESCAPES = {"\\": "\\", '"': '"', "'": "'", "n": "\n", "r": "\r", "t": "\t"}
+
+
+def _env_value(raw: str) -> str:
+    """一行赋值等号右边的值，引号规则照 python-dotenv：单引号里原样，双引号里认转义，不带引号的截掉「空白+#」起的注释。"""
+    raw = raw.strip()
+    quote = raw[:1]
+    if quote in ("'", '"'):
+        chars: list[str] = []
+        index = 1
+        while index < len(raw):
+            char = raw[index]
+            if char == quote:
+                return "".join(chars)
+            if char == "\\" and index + 1 < len(raw):
+                escaped = raw[index + 1]
+                if quote == '"' and escaped in _DOUBLE_QUOTE_ESCAPES:
+                    chars.append(_DOUBLE_QUOTE_ESCAPES[escaped])
+                    index += 2
+                    continue
+                if quote == "'" and escaped in ("\\", "'"):
+                    chars.append(escaped)
+                    index += 2
+                    continue
+            chars.append(char)
+            index += 1
+    return re.sub(r"\s+#.*", "", raw).rstrip()
+
+
+def _parse_env_text(text: str) -> dict[str, str | None]:
+    pairs: dict[str, str | None] = {}
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        pairs[key.strip()] = value.strip().strip("'\"")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        pairs[key] = _env_value(value)
     return pairs
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    """dotenv 文件里有值的键。和主进程一样用 python-dotenv 解析，装不上时退回上面照它写的解析；
+    空值不收：.env 里留着「KEY=」占位时，共享密钥里的同名项照样生效，主进程也是这么取的。"""
+    try:
+        from dotenv import dotenv_values as parse  # type: ignore
+    except Exception:
+        parse = None
+    try:
+        if parse is not None:
+            if not path.is_file():
+                return {}
+            raw = parse(path, encoding="utf-8")
+        else:
+            raw = _parse_env_text(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}
+    return {str(key): str(value).strip() for key, value in raw.items() if value is not None and str(value).strip()}
+
+
+def dotenv_values(root: Path | None = None) -> dict[str, str]:
+    """工作区的 dotenv 值：共享密钥文件 config/secrets.env 垫底，本实例 .env 的同名项盖在上面。
+
+    root 默认 cwd：工具是以工作区为 cwd 拉起的子进程。
+    """
+    base = Path(root) if root is not None else Path.cwd()
+    merged = _read_env_file(base.joinpath(*_SHARED_SECRETS_FILE))
+    merged.update(_read_env_file(base / ".env"))
+    return merged
 
 
 def _read_yaml(path: Path) -> dict:
@@ -58,13 +119,13 @@ def _is_provider_block(value: object) -> bool:
 
 
 class _ConfigView:
-    """工作区的 .env、模型渠道配置 config/models.yaml 和平台密钥 data/platform_secrets.yaml。"""
+    """工作区的 .env 与共享密钥、模型渠道配置 config/models.yaml 和平台密钥 data/platform_secrets.yaml。"""
 
     def __init__(self, *, root: Path | None = None) -> None:
         # root 默认 cwd：工具是以工作区为 cwd 拉起的子进程。主进程里的调用方
         # （提示词注入）cwd 不一定在工作区，得把 root 显式传进来。
         base = Path(root) if root is not None else Path.cwd()
-        self._dotenv = _read_dotenv(base)
+        self._dotenv = dotenv_values(base)
         self._config = _read_yaml(base.joinpath(*_MODELS_FILE))
         self._platform_secrets = _read_yaml(base.joinpath(*_PLATFORM_SECRETS_FILE))
 

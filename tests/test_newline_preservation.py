@@ -25,6 +25,7 @@ for _p in (str(_ROOT), str(_DRAWTOOLS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import config_layout  # noqa: E402
 import supervisor.admin_api as admin_api  # noqa: E402
 import toolbox.mcp_runtime as mcp_runtime  # noqa: E402
 from adapters._shared.live_config import BOOL, LiveConfig, LiveKey, int_in  # noqa: E402
@@ -630,10 +631,27 @@ class TestTheSearchReplaceTool:
 
 
 # ---------------------------------------------------------------------------
-#  .env（manage_secret._atomic_write 的 tmp + replace）
+#  密钥文件（manage_secret 逐键改 .env 与 config/secrets.env）
 # ---------------------------------------------------------------------------
 
 class TestTheDotenvFile:
+    @pytest.mark.parametrize(
+        "data,expected",
+        [
+            (b"EXISTING=1\r\nOTHER=2\r\n", b"EXISTING=1\r\nOTHER=2\r\nCLONOTH_PORT=8775\r\n"),
+            (b"EXISTING=1\nOTHER=2\n", b"EXISTING=1\nOTHER=2\nCLONOTH_PORT=8775\n"),
+        ],
+    )
+    def test_setting_an_instance_key_keeps_the_newline(
+        self, ctx: _Ctx, tmp_path: Path, data: bytes, expected: bytes,
+    ) -> None:
+        path = seed(tmp_path / ".env", data)
+
+        result = asyncio.run(manage_secret({"action": "set", "name": "CLONOTH_PORT", "value": "8775"}, ctx))
+
+        assert result["ok"] is True, result
+        assert path.read_bytes() == expected
+
     @pytest.mark.parametrize(
         "data,expected",
         [
@@ -641,10 +659,10 @@ class TestTheDotenvFile:
             (b"EXISTING=1\nOTHER=2\n", b"EXISTING=1\nOTHER=2\nNEW_KEY=v\n"),
         ],
     )
-    def test_setting_a_secret_keeps_the_newline(
+    def test_setting_a_shareable_key_keeps_the_shared_files_newline(
         self, ctx: _Ctx, tmp_path: Path, data: bytes, expected: bytes,
     ) -> None:
-        path = seed(tmp_path / ".env", data)
+        path = seed(config_layout.shared_secrets_path(tmp_path), data)
 
         result = asyncio.run(manage_secret({"action": "set", "name": "NEW_KEY", "value": "v"}, ctx))
 
@@ -668,9 +686,14 @@ class TestTheDotenvFile:
         assert path.read_bytes() == expected
 
     def test_a_brand_new_dotenv_is_lf(self, ctx: _Ctx, tmp_path: Path) -> None:
+        asyncio.run(manage_secret({"action": "set", "name": "CLONOTH_PORT", "value": "8775"}, ctx))
+
+        assert (tmp_path / ".env").read_bytes() == b"CLONOTH_PORT=8775\n"
+
+    def test_a_brand_new_shared_secrets_file_is_lf(self, ctx: _Ctx, tmp_path: Path) -> None:
         asyncio.run(manage_secret({"action": "set", "name": "NEW_KEY", "value": "v"}, ctx))
 
-        assert (tmp_path / ".env").read_bytes() == b"NEW_KEY=v\n"
+        assert config_layout.shared_secrets_path(tmp_path).read_bytes() == b"NEW_KEY=v\n"
 
 
 # ---------------------------------------------------------------------------
@@ -800,7 +823,8 @@ class TestTheLiveConfigSave:
 
         _live(path).save({"feature": {"enabled": True}})
 
-        assert [p.name for p in tmp_path.iterdir() if p.is_file()] == ["chat.yaml"]
+        # 锁文件是常驻的，和 supervisor 写同一份配置时拿的就是它。
+        assert sorted(p.name for p in tmp_path.iterdir() if p.is_file()) == [".chat.yaml.lock", "chat.yaml"]
 
 
 # ---------------------------------------------------------------------------

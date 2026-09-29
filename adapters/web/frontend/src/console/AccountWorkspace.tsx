@@ -26,6 +26,7 @@ import { getPlatform } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
 import { AccountScope } from './AccountScope';
 import { Block, Button, Empty, Facts, Input, Panel, Pre } from './components';
+import { ConfigShareGroups } from './ConfigShareGroups';
 import { nameBetween } from './format';
 import { InstanceLink, InstanceSwitch } from './InstanceSwitch';
 import { usePlatform } from './platformContext';
@@ -81,6 +82,7 @@ const AccountWorkspace = ({ token }: { token: string }) => {
   useEffect(() => { void refresh(); return () => { sequence.current++; }; }, [refresh]);
   return <>
     <InstanceManagement token={token} instances={instances} loading={loading} error={error} refresh={refresh} />
+    <ConfigShareGroups token={token} />
     <AccountConnectionPage token={token} instances={instances} ownershipReady={!loading && !error} />
     <AccountScope />
   </>;
@@ -166,7 +168,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
     finally { mutation.current = false; if (isCurrent()) setBusy(false); }
   };
 
-  return <Block title="多开实例" hint="会话、记忆、渠道、人格按实例独立；切换后自动读取该实例的内容，不复制配置。">
+  return <Block title="多开实例" hint="会话、记忆、渠道、人格默认按实例独立，要共用配置见下面的「共享配置」；切换后自动读取该实例的内容。">
     <div className="mb-3 flex flex-wrap items-center gap-3">
       <InstanceSwitch rows={instances} />
       <Button disabled={loading || busy} onClick={() => void refresh()} tone="quiet">刷新实例列表</Button>

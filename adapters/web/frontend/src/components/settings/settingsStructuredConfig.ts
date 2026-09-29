@@ -153,6 +153,11 @@ function parseLooseKV(text: string): Record<string, string> {
   return result;
 }
 
+/** 按项合并保存前核对：表单打开之后这一项在文件里变了，就不能拿旧表单盖掉；别的项照常合并。 */
+export function itemChangedSince(loaded: { original?: Record<string, unknown> }, latest: { original?: Record<string, unknown> }): boolean {
+  return JSON.stringify(loaded.original ?? null) !== JSON.stringify(latest.original ?? null);
+}
+
 // ==================== Node Config ====================
 
 export function parseNodeConfig(raw: string, fallbackId = ''): NodeConfigFormState {

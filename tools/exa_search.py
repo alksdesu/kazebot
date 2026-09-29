@@ -102,22 +102,8 @@ if __name__ == "__main__":
                 return clamp_int(args.get(key), default, minimum, maximum)
         return default
 
-    def load_dotenv():
-        env_path = os.path.join(os.getcwd(), ".env")
-        values = {}
-        if not os.path.isfile(env_path):
-            return values
-        try:
-            with open(env_path, "r", encoding="utf-8") as f:
-                for line in f.read().splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    key, value = line.split("=", 1)
-                    values[key.strip()] = value.strip().strip("'\"")
-        except Exception:
-            return {}
-        return values
+    # 本实例 .env 盖在共享密钥文件上面：组里共用的 EXA_API_KEY 也读得到。
+    from _channel import dotenv_values as load_dotenv
 
     args = _input if isinstance(_input, dict) else {}
 

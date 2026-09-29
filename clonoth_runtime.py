@@ -94,7 +94,7 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
 }
 
 
-_CACHE: dict[str, tuple[tuple[float, float], dict[str, Any]]] = {}
+_CACHE: dict[str, tuple[tuple[tuple[int, int, int] | None, tuple[int, int, int] | None], dict[str, Any]]] = {}
 
 
 # 键 → 去处，空串表示没有替代项。旧工作区的 runtime.yaml 里可能还留着它们。
@@ -154,13 +154,6 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return out
 
 
-def _mtime(path: Path) -> float:
-    try:
-        return path.stat().st_mtime if path.exists() else -1.0
-    except Exception:
-        return -1.0
-
-
 def _read_runtime_layer(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -177,7 +170,8 @@ def load_runtime_config(workspace_root: Path) -> dict[str, Any]:
     实例那份只盖它写了的键：发版给默认 runtime 加的新键，改过 runtime 的实例也照样拿得到。
     """
     default_path, own_path = config_layout.runtime_layers(workspace_root)
-    stamp = (_mtime(default_path), _mtime(own_path))
+    # 共享组里别的实例也改 config/runtime.yaml：按 file_stamp 比，同一刻写进的改动也认得出来。
+    stamp = (config_layout.file_stamp(default_path), config_layout.file_stamp(own_path))
 
     key = str(own_path.resolve())
     cached = _CACHE.get(key)
@@ -280,13 +274,21 @@ def admin_auth_headers(workspace_root: Path) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
+def shared_env_value(key: str) -> str:
+    """本进程工作区的共享密钥文件里这个键的值。没钉工作区的进程（测试、临时脚本）没有这一层。"""
+    root = workspace_env_root()
+    if root is None:
+        return ""
+    return config_layout.shared_secrets(root).get(key, "")
+
+
 def _resolve_env_names(names: str, extra: Mapping[str, str] | None = None) -> str:
     """Resolve a ``|``-separated list of env var names with fallback.
 
     Why: config wants "new var wins, fall back to old var" without duplicating
     node YAML. How: split on ``|``; return the first name whose value is a
     non-empty string, reading the process environment before ``extra`` (a
-    parsed .env mapping); otherwise "". Purpose: e.g.
+    parsed .env mapping), then the shared secrets file; otherwise "". Purpose: e.g.
     ``DRAW_TAG_MODEL|DRAW_PLANNER_MODEL`` prefers the new name but stays
     backward compatible with the old one.
     """
@@ -294,7 +296,8 @@ def _resolve_env_names(names: str, extra: Mapping[str, str] | None = None) -> st
         key = name.strip()
         if not key:
             continue
-        val = os.getenv(key, "") or (extra.get(key, "") if extra else "")
+        # 共享密钥垫在最底下：实例 .env 的同名项优先；不灌进 os.environ，组里别的实例改了它这边下一次取值就生效。
+        val = os.getenv(key, "") or (extra.get(key, "") if extra else "") or shared_env_value(key)
         # 返回 strip 后的值：.env 在 CRLF 仓库里解析出来常带尾随 \r，原样送上游会 400。
         if val and val.strip():
             return val.strip()
@@ -799,15 +802,12 @@ def classify_path(
         return None, f"invalid path: {e}", False
 
     # Ensure roots are resolved for reliable comparison
-    ws = workspace_root.resolve()
     extras = [r.resolve() for r in extra_roots]
 
-    # Tier 1: workspace
-    try:
-        rel = p.relative_to(ws)
-        return p, rel.as_posix(), False
-    except ValueError:
-        pass
+    # Tier 1: workspace。多开实例的代码目录、共享表情包库和共享组配置经受信链接通到外面，照样按工作区里的名字判。
+    logical = config_layout.workspace_logical_path(workspace_root, p)
+    if logical is not None:
+        return p, logical, False
 
     # Tier 2: trusted extra_roots
     for r in extras:

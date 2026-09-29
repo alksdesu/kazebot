@@ -17,6 +17,7 @@ from typing import Any, Iterator
 import pytest
 import yaml
 
+import config_layout
 from adapters.onebot import provisioning as qq_provisioning
 from platforms.descriptor import (
     CHANNEL_GROUP,
@@ -452,7 +453,7 @@ def test_scaffold_links_code_dirs_and_writes_env(workspace: Path, monkeypatch: p
     )
     provisioning.scaffold(plan, workspace)
 
-    for name in ("adapters", "engine", "plugins", "tools"):
+    for name in config_layout.CODE_LINKS:
         assert (plan.workspace / name).is_symlink()
     env = (plan.workspace / ".env").read_text(encoding="utf-8")
     assert "CLONOTH_PORT=8775" in env
@@ -762,7 +763,7 @@ def test_root_script_has_no_recursive_delete() -> None:
 def test_root_script_validates_the_instance_name_before_anything_else() -> None:
     lines = [l.strip() for l in _script_code(SCRIPT).splitlines() if l.strip()]
     guard = next(i for i, l in enumerate(lines) if "^([a-z][a-z0-9_]{1,31}|[1-9][0-9]{4,10})$" in l)
-    reserved = next(i for i, l in enumerate(lines) if "!= stickers" in l)
+    reserved = next(i for i, l in enumerate(lines) if l.startswith("case "))
     for risky in ("docker ", "systemctl ", "mv ", "install "):
         hits = [i for i, l in enumerate(lines) if l.startswith(risky)]
         assert all(i > guard for i in hits), f"{risky} 出现在实例名校验之前"
@@ -803,15 +804,16 @@ def test_the_command_line_entry_points_validate_the_same_way() -> None:
 
 
 @pytest.mark.parametrize("path", [NEW_INSTANCE, INSTALLER], ids=lambda p: p.name)
-def test_the_command_line_entry_points_refuse_the_shared_sticker_name(path: Path) -> None:
-    # 叫 stickers 的话工作区就是共享表情包库那个目录，建下去等于往库里灌实例数据。
+def test_the_command_line_entry_points_refuse_the_names_the_data_root_took(path: Path) -> None:
+    # 叫 stickers 或 shared 的话工作区就是共享表情包库、共享配置组那个目录，建下去等于往里灌实例数据。
     lines = [l.strip() for l in _script_code(path).splitlines() if l.strip()]
     root_check = next(i for i, l in enumerate(lines) if '"$(id -u)" -eq 0' in l)
     shape = next(i for i, l in enumerate(lines) if "^([a-z][a-z0-9_]{1,31}|[1-9][0-9]{4,10})$" in l)
-    reserved = next(i for i, l in enumerate(lines) if "!= stickers" in l)
+    reserved = next(i for i, l in enumerate(lines) if l.startswith("case "))
     first_action = next(i for i, l in enumerate(lines) if l.startswith('echo "==> '))
     assert root_check < shape < reserved < first_action
-    assert "实例名不能叫 stickers" in lines[reserved]
+    assert "stickers|shared)" in lines[reserved]
+    assert "实例名不能叫" in lines[reserved]
 
 
 @pytest.mark.parametrize("path", [NEW_INSTANCE, INSTALLER], ids=lambda p: p.name)

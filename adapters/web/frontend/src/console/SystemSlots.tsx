@@ -48,6 +48,19 @@ const changed = (draft: Draft): boolean => (
   || draft.apiKeyInput.trim() !== ''
 );
 
+/** 要提交的项。没改的不传、后端不动：共享组里别的实例刚改的项不会被这边的旧值盖回去。空串是「删掉这一项」。 */
+const slotPatch = (draft: Draft) => {
+  // 槽位不收 provider 时存着的残留值照旧清掉。
+  const provider = draft.slot.supports_provider ? draft.provider : '';
+  const key = draft.apiKeyInput.trim();
+  return {
+    ...(draft.model !== draft.slot.model_raw ? { model: draft.model.trim() } : {}),
+    ...(draft.baseUrl !== draft.slot.base_url_raw ? { base_url: draft.baseUrl.trim() } : {}),
+    ...(provider !== draft.slot.provider ? { provider } : {}),
+    ...(key ? { api_key: key } : {}),
+  };
+};
+
 const CAP_DESC = 'mt-1 text-xs text-[var(--duties-secondary)]';
 
 const Row = ({
@@ -223,14 +236,7 @@ export const SystemSlots = ({ channels, wires, profiles, activeProvider }: {
       let latest: SystemModelsResponse | null = null;
       for (const draft of drafts) {
         if (!changed(draft)) continue;
-        const key = draft.apiKeyInput.trim();
-        latest = await updateSystemModel(token, draft.slot.key, {
-          // 空串是「删掉这一项」的信号，和「不传」不是一回事。
-          model: draft.model.trim(),
-          base_url: draft.baseUrl.trim(),
-          provider: draft.slot.supports_provider ? draft.provider : '',
-          ...(key ? { api_key: key } : {}),
-        });
+        latest = await updateSystemModel(token, draft.slot.key, slotPatch(draft));
       }
       // 放在槽位之后：改完 key 才知道现在到底有几个渠道可选。
       if (imageDefault !== savedImageDefault) {

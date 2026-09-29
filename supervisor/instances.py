@@ -13,12 +13,13 @@ from typing import Any
 
 import yaml
 
+import config_layout
 from file_lock import exclusive_lock
 from platforms.builtin import QQ_NAPCAT
 from platforms.descriptor import InstancePort, normalize_name
 from platforms.registry import DEFAULT_PLATFORM_ID, all_platforms
 
-_ENV_FILE = "CLONOTH_INSTANCES_FILE"
+_ENV_FILE = config_layout.INSTANCES_FILE_ENV
 _ENV_PREFIX = "CLONOTH_URL_PREFIX"
 
 # 核心自己的端口。平台进程要的端口由平台描述的 instance_ports 声明，序号 0 落在单实例部署原有的那一组上。

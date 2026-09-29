@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from 'react';
 
 import {
   getPolicy,
+  isEditConflict,
   updatePolicy,
   type PolicyDecision,
   type PolicyDoc,
@@ -425,6 +426,10 @@ export const PolicyRulesSection = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const [doc, setDoc] = useState<PolicyDoc | null>(null);
   const [saved, setSaved] = useState('');
+  // 这份策略出自哪一版文件，保存时交回：共享组里别的实例中途改过就不写，免得整份盖掉。
+  const [base, setBase] = useState<string | null>(null);
+  // 「丢弃」重读服务器上现在那一份，保存报冲突之后靠它换成最新内容。
+  const [generation, setGeneration] = useState(0);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [tab, setTab] = useState<TabKey>('write_file');
@@ -433,16 +438,17 @@ export const PolicyRulesSection = () => {
     if (!adminToken || !isAuthenticated) return undefined;
     let alive = true;
     getPolicy(adminToken)
-      .then((next) => {
+      .then(({ policy: next, hash }) => {
         if (!alive) return;
         setDoc(next);
         setSaved(JSON.stringify(next));
+        setBase(hash);
       })
       .catch((error) => {
         if (alive) setMessage(error instanceof Error ? error.message : '读取策略失败');
       });
     return () => { alive = false; };
-  }, [adminToken, isAuthenticated]);
+  }, [adminToken, isAuthenticated, generation]);
 
   const dirty = Boolean(doc) && JSON.stringify(doc) !== saved;
   const confirmDiscard = useUnsavedChanges(dirty, '「服务端策略」还有未保存修改，确定离开或丢弃吗？');
@@ -452,14 +458,17 @@ export const PolicyRulesSection = () => {
     setBusy(true);
     setMessage('');
     try {
-      const next = await updatePolicy(adminToken, doc);
+      const next = await updatePolicy(adminToken, doc, base);
       if (tokenChanged(adminToken)) return;
-      setDoc(next);
-      setSaved(JSON.stringify(next));
+      setDoc(next.policy);
+      setSaved(JSON.stringify(next.policy));
+      setBase(next.hash);
       setMessage('已保存，立即生效，不用重启');
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '保存失败');
+      setMessage(isEditConflict(error)
+        ? '策略在打开之后被别处改过，没有保存：点「丢弃」读入最新内容，再把改动重做一遍。'
+        : error instanceof Error ? error.message : '保存失败');
     } finally {
       setBusy(false);
     }
@@ -563,7 +572,7 @@ export const PolicyRulesSection = () => {
             dirty={dirty}
             label="保存策略"
             note={message || (dirty ? '有未保存的改动' : '与服务器一致')}
-            onReset={() => { if (saved && confirmDiscard()) { setDoc(JSON.parse(saved) as PolicyDoc); setMessage(''); } }}
+            onReset={() => { if (saved && confirmDiscard()) { setMessage(''); setGeneration((value) => value + 1); } }}
             onSave={() => void save()}
           />
         </div>

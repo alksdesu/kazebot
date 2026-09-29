@@ -12,6 +12,8 @@ import {
   getNodes,
   updateNodeRaw,
   type AdminNode,
+  type RawSaveResult,
+  type RawText,
   type EffectiveTool,
 } from '../api/supervisorClient';
 import { NodeGrantsSection } from '../components/settings/pages/NodeGrantsSection';
@@ -216,8 +218,11 @@ describe('勾选在两种模式下是同一个意思', () => {
     vi.mocked(getEffectiveTools).mockResolvedValue({
       node_id: EXECUTOR.id, mode: 'all', dead_names: [], tools: [],
     });
-    vi.mocked(getNodeRaw).mockResolvedValue('id: bootstrap.executor\ntool_access:\n  mode: all\n  deny:\n    - execute_command\n');
-    vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true } as never);
+    vi.mocked(getNodeRaw).mockResolvedValue({
+      content: 'id: bootstrap.executor\ntool_access:\n  mode: all\n  deny:\n    - execute_command\n',
+      hash: 'executor-1',
+    });
+    vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true, hash: 'executor-2' });
   });
 
   it('默认全给时，禁用名单里的那个才是没勾的', async () => {
@@ -237,9 +242,11 @@ describe('勾选在两种模式下是同一个意思', () => {
     fireEvent.click(item.getByRole('button', { name: '保存授权' }));
 
     await vi.waitFor(() => expect(updateNodeRaw).toHaveBeenCalled());
-    const written = vi.mocked(updateNodeRaw).mock.calls[0][2];
+    const [, , written, base] = vi.mocked(updateNodeRaw).mock.calls[0];
     expect(written).toContain('- execute_command');
     expect(written).toContain('- read_file');
+    // 合并的底子是保存前现读的那一版，指纹得跟着它一起交回去。
+    expect(base).toBe('executor-1');
   });
 
   it('「全部可调用」在默认全给下是清空禁用名单，不是禁掉全部', async () => {
@@ -300,8 +307,8 @@ describe('两行接连保存', () => {
     vi.mocked(getEffectiveTools).mockResolvedValue({
       node_id: 'qq.alpha', mode: 'allowlist', dead_names: [], tools: [],
     });
-    vi.mocked(getNodeRaw).mockImplementation(async (_token, id) => `id: ${id}\n`);
-    vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true });
+    vi.mocked(getNodeRaw).mockImplementation(async (_token, id) => ({ content: `id: ${id}\n`, hash: `${id}-1` }));
+    vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true, hash: 'saved' });
   });
 
   it('先发的那次重读慢回来，不把后保存的那一行打回旧值', async () => {
@@ -358,40 +365,40 @@ describe('保存到一半换了 token', () => {
     vi.mocked(getEffectiveTools).mockResolvedValue({
       node_id: ALPHA.id, mode: 'allowlist', dead_names: [], tools: [],
     });
-    vi.mocked(getNodeRaw).mockResolvedValue('id: qq.alpha\n');
-    vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true });
+    vi.mocked(getNodeRaw).mockResolvedValue({ content: 'id: qq.alpha\n', hash: 'alpha-1' });
+    vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true, hash: 'alpha-2' });
   });
 
   it('读回节点原文时 token 已经换掉，不拿旧 token 往回写', async () => {
-    const read = deferred<string>();
+    const read = deferred<RawText>();
     vi.mocked(getNodeRaw).mockReturnValueOnce(read.promise);
     render(<NodeGrantsSection />);
     await startSave();
     await waitFor(() => expect(getNodeRaw).toHaveBeenCalledOnce());
 
     rotate();
-    await act(async () => { read.resolve('id: qq.alpha\n'); });
+    await act(async () => { read.resolve({ content: 'id: qq.alpha\n', hash: 'alpha-1' }); });
 
     expect(updateNodeRaw).not.toHaveBeenCalled();
     expect(note()).toBe('有未保存的改动');
   });
 
   it('提前收手也要把「正在保存」收掉，不然这一行再也点不动', async () => {
-    const read = deferred<string>();
+    const read = deferred<RawText>();
     vi.mocked(getNodeRaw).mockReturnValueOnce(read.promise);
     render(<NodeGrantsSection />);
     await startSave();
     await waitFor(() => expect(alphaRow().getByRole('button', { name: '正在保存…' })).toBeDisabled());
 
     rotate();
-    await act(async () => { read.resolve('id: qq.alpha\n'); });
+    await act(async () => { read.resolve({ content: 'id: qq.alpha\n', hash: 'alpha-1' }); });
 
     expect(alphaRow().queryByRole('button', { name: '正在保存…' })).toBeNull();
     expect(alphaRow().getByRole('button', { name: '保存授权' })).toBeEnabled();
   });
 
   it('写完才换的 token，不提示已保存，也不拿旧 token 重读', async () => {
-    const write = deferred<unknown>();
+    const write = deferred<RawSaveResult>();
     vi.mocked(updateNodeRaw).mockReturnValueOnce(write.promise);
     render(<NodeGrantsSection />);
     await startSave();
@@ -399,14 +406,14 @@ describe('保存到一半换了 token', () => {
 
     rotate();
     await waitFor(() => expect(getNodes).toHaveBeenCalledTimes(2));
-    await act(async () => { write.resolve({ ok: true }); });
+    await act(async () => { write.resolve({ ok: true, hash: 'alpha-2' }); });
 
     expect(vi.mocked(getNodes).mock.calls.map(([token]) => token)).toEqual(['admin-token', ROTATED]);
     expect(note()).toBe('有未保存的改动');
   });
 
   it('写失败之前换了 token，不摆出这一趟的报错', async () => {
-    const write = deferred<unknown>();
+    const write = deferred<RawSaveResult>();
     vi.mocked(updateNodeRaw).mockReturnValueOnce(write.promise);
     render(<NodeGrantsSection />);
     await startSave();

@@ -18,8 +18,8 @@ ACTION="${1:-}"
 INSTANCE="${2:-}"
 
 [[ "$INSTANCE" =~ ^([a-z][a-z0-9_]{1,31}|[1-9][0-9]{4,10})$ ]] || { echo "实例名不合法" >&2; exit 2; }
-# 数据根下的共享表情包库，实例叫这个名字工作区就是它。
-[ "$INSTANCE" != stickers ] || { echo "实例名不合法" >&2; exit 2; }
+# 数据根下的共享表情包库和共享配置组，实例叫这两个名字工作区就是它们。
+case "$INSTANCE" in stickers|shared) echo "实例名不合法" >&2; exit 2 ;; esac
 [[ "$ACTION" == "create" || "$ACTION" == "remove" ]] || { echo "action 不合法" >&2; exit 2; }
 
 WS="$DATA_ROOT/$INSTANCE"

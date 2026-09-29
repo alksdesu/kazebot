@@ -225,15 +225,17 @@ describe('rewriteYaml against tools/drawtools/settings.example.yaml', () => {
   });
 
   it('keeps the file on CRLF', () => {
-    const doc = clone(load(raw));
+    // .gitattributes 定了 eol=lf，仓库里这份签出来一定是 LF；CRLF 的原文得在这里造。
+    const crlf = raw.replace(/\r?\n/g, '\r\n');
+    const doc = clone(load(crlf));
     doc.storage.retention_days = 14;
 
-    const { content } = rewriteYaml(raw, doc, OPTS);
+    const { content } = rewriteYaml(crlf, doc, OPTS);
 
     expect(content.includes('\r\n')).toBe(true);
     expect(/[^\r]\n/.test(content)).toBe(false);
-    expect(soleEdit(raw, content)).toEqual({
-      at: rows(raw).indexOf('  retention_days: 7'),
+    expect(soleEdit(crlf, content)).toEqual({
+      at: rows(crlf).indexOf('  retention_days: 7'),
       removed: ['  retention_days: 7'],
       added: ['  retention_days: 14'],
     });

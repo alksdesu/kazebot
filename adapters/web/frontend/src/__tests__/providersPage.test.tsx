@@ -71,7 +71,7 @@ beforeEach(() => {
   vi.mocked(getProviders).mockResolvedValue(structuredClone(PROVIDERS) as any);
   vi.mocked(getNodes).mockResolvedValue(structuredClone(NODES) as any);
   vi.mocked(getProviderProfiles).mockResolvedValue(structuredClone(PROFILES) as any);
-  vi.mocked(getRuntimeRaw).mockResolvedValue('routing:\n  vision:\n    enabled: auto\n');
+  vi.mocked(getRuntimeRaw).mockResolvedValue({ content: 'routing:\n  vision:\n    enabled: auto\n', hash: 'runtime-1' });
   vi.mocked(upsertProvider).mockResolvedValue(structuredClone(PROVIDERS) as any);
   vi.mocked(setActiveProvider).mockResolvedValue(structuredClone(PROVIDERS) as any);
   vi.mocked(deleteProvider).mockResolvedValue(structuredClone(PROVIDERS) as any);
@@ -182,6 +182,22 @@ describe('新增与删除', () => {
     saveChain();
     await waitFor(() => expect(upsertProvider).toHaveBeenCalledTimes(1));
     expect(vi.mocked(upsertProvider).mock.calls[0][1]).toBe('deepseek');
+  });
+
+  it('新建的渠道整份提交，没填的字段也带着空串 —— 后端要靠它把块建全', async () => {
+    render(<ProvidersPage />);
+    await ready();
+    fireEvent.change(screen.getByLabelText('新渠道格式'), { target: { value: 'deepseek' } });
+    fireEvent.click(screen.getByRole('button', { name: '添加' }));
+    fireEvent.change(within(rowFor('deepseek')).getByLabelText('deepseek 模型'), {
+      target: { value: 'deepseek-v4-pro' },
+    });
+    saveChain();
+
+    await waitFor(() => expect(upsertProvider).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(upsertProvider).mock.calls[0][2]).toEqual({
+      model: 'deepseek-v4-pro', base_url: '', supports_vision: 'auto', label: '', type: 'deepseek',
+    });
   });
 
   it('每种格式都能再开一个，已经配过的也不例外', async () => {

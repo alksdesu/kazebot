@@ -9,18 +9,19 @@
   ├ instances.yaml            控制台切换器读的共享清单
   ├ provision-<实例名>.log     建实例进度，控制台轮询它
   ├ stickers/                 几个实例共用的表情包库
+  ├ shared/<组名>/config/      共享配置组，加入的实例 config/ 链到这里
   └ xiaoyu/                   序号 1，:8775 :8090 :8779，NapCat WebUI :6199
       ├ data/ config/ .env
-      └ adapters engine plugins tools   → 软链回代码目录
+      └ adapters engine plugins tools defaults   → 软链回代码目录
 ```
 
-软链那四个目录不能省：`workspace_root` 既用来找 `data/`，也用来找 `tools/`、`engine/system_nodes/` 和前端 `dist`。
+软链那几个目录不能省：`workspace_root` 既用来找 `data/`，也用来找 `tools/`、`engine/system_nodes/` 和前端 `dist`。`defaults` 是后加的，之前建的实例补一条：`ln -s /opt/kazebot/defaults /opt/kazebot-data/<实例名>/defaults`，否则 agent 读 `defaults/nodes/...` 时找不到文件。
 
-每个实例的 `config/` 默认只属于它自己，里面只放它改过的配置；没改过的节点和 runtime 直接用代码目录 `defaults/` 下的默认，代码更新一次全部实例跟着变。
+每个实例的 `config/` 默认只属于它自己，里面只放它改过的配置；没改过的节点和 runtime 直接用代码目录 `defaults/` 下的默认，代码更新一次全部实例跟着变。想让几个实例用同一套配置，见下面的「共享配置」。
 
 ## 实例名
 
-实例名会拼进 systemd 单元名、工作区目录、NapCat 容器名和 URL 前缀（`/i/<实例名>/`），所以收得很紧：小写字母开头，只含小写字母、数字和下划线，2-32 位；`stickers` 被共享表情包库占着，不能用。
+实例名会拼进 systemd 单元名、工作区目录、NapCat 容器名和 URL 前缀（`/i/<实例名>/`），所以收得很紧：小写字母开头，只含小写字母、数字和下划线，2-32 位；`stickers` 和 `shared` 被共享表情包库、共享配置组占着，不能用。
 
 改成按 bot 开之前，实例是按 QQ 号开的，实例名就是那个号。这类老实例照旧认（5-11 位、不以 0 开头的数字），目录、单元、容器、前缀都不用动；清单里老条目的 `uin` 读出来就是实例名，同时也是它的 QQ 账号。
 
@@ -141,6 +142,34 @@ journalctl -u kazebot-host-cleanup -n 100 --no-pager
 索引是 SQLite，几个实例同时读写靠 WAL，不需要额外协调。打标例外：各实例的 supervisor 每批开打前抢库旁的 `stickers.sqlite3.tagging.lock`，同一时刻只有一个在调看图渠道，免得几份一起把频率限制打满。抢到的实例用自己配的看图渠道，没配好的实例抢到了也只是歇着，别的实例接着打。「最近发过」的去重记录按会话键分开存，所以共享图库不会让 A 群发过的图在 B 群被跳过。
 
 代码和 `.venv` 也是共享的，git 更新会同时作用于所有实例，做不到逐个灰度。
+
+## 共享配置
+
+默认每个实例一套配置。控制台「账号」页的「共享配置」里可以建组：几个实例共用整套 `config/`——节点与人格、技能、工具、MCP、模型渠道与密钥、policy、全局设置、平台配置、绘图、runtime 都在里面，同平台、跨平台都行。**记忆在 `data/` 里，永远不共享。**
+
+- **建组**：把本实例现在的 `config/` 整份抄到 `/opt/kazebot-data/shared/<组名>/config/`，本实例随即加入。本实例 `.env` 里能共享的键（API key 这类）一并抄进组的 `config/secrets.env`，端口、监听地址、平台令牌、路径不抄。
+- **加入**：本实例的 `config/` 换成指向组目录的链接，原来那份改名归档到 `data/config.archived-<时间>/`，不删。
+- **退出**：拷一份组里当时的配置换成本实例自己的 `config/`，之后两边各改各的。
+- **删组**：组里没有成员才能删；组目录改名成 `<组名>.deleted-<时间>` 留着，不做递归删除。
+
+切换之后控制台会重启本实例的 engine，工具和节点换成新配置；模型渠道、policy、runtime、平台配置和按人资料按文件的修改时间、大小和 inode 自己重读，组里别的实例改了这边不用重启。成员身份只看 `config/` 链到哪，没有另记一份名单。
+
+组里几个实例的控制台改的是同一份文件。整份写回的编辑器（原文编辑器、人设正文、服务端策略的规则表）记着读到的是哪一版，保存时发现中途被别处改过就报冲突、不盖掉，按提示点「刷新」「加载」或「丢弃」读入最新内容再改；只改几个键的表单（模型参数、带图路由、平台设置、工具权限）保存时现读现合并，渠道和系统槽位只提交改过的项，别处改的其他项都留着。
+
+密钥分两处放：`config/secrets.env` 跟着组走，放能共享的 API key；`.env` 是实例身份。两边有同名项时 `.env` 的算数。`manage_secret` 按键名自动分流。共享密钥不灌进进程环境，渠道配置里写 `${EXA_API_KEY}` 这种引用、以及搜索绘图这类工具，下次取值就读到新值；直接读进程环境的地方（比如节点声明了别家 provider 却没配密钥时的兜底）看不到它，这种情况把密钥写进渠道配置。
+
+单元里给整个 `/opt/kazebot-data/shared` 放开了写权限：建组要在那下面新建目录，没法只放开某一个组。所以在内核层面，任何一个实例都写得到所有组的配置，连不在组里的实例也一样；组与组之间、组和组外实例之间的边界靠控制台和 policy（agent 改工作区外的路径要审批），不靠 systemd。
+
+### 已有实例启用共享配置前
+
+重跑 `install_provision.sh` 会准备共享目录和主实例的 drop-in，但只把多实例模板更新到 `/usr/local/lib/kazebot/units/`，不会替换已经装在 `/etc/systemd/system/` 的模板，也不会重启主实例的 QQ 适配器。
+
+升级时还需要完成以下步骤，再在控制台建组或加入：
+
+1. 备份并核对现有单元的本机修改，把新版 `kazebot@.service`、`kazebot-qq@.service` 安装到 `/etc/systemd/system/`；保留本机所需的 drop-in。
+2. 执行 `systemctl daemon-reload`，在维护窗口重启主实例 `kazebot-qq.service`，以及本次升级的各实例 `kazebot@<实例名>.service`、`kazebot-qq@<实例名>.service`。只重启 engine 不会重建 supervisor 或 bot 的 systemd 文件系统沙箱。
+3. 用 `systemctl show <单元名> -p ReadWritePaths` 核对共享目录权限，并检查服务状态与日志。主 supervisor 的权限来自 `10-instances.conf`，主 QQ 的权限来自 `20-shared-config.conf`，多实例的权限来自新版模板。
+4. 给旧实例工作区补上指向 `/opt/kazebot/defaults` 的 `defaults` 软链；若同名位置已有内容，先核对并保留，不能直接覆盖。
 
 ## 相关环境变量
 

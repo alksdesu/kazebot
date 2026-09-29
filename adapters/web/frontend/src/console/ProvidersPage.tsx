@@ -83,6 +83,24 @@ const changed = (draft: Draft, stored: Draft | undefined): boolean => (
   || draft.apiKeyInput.trim() !== ''
 );
 
+/** 要提交的项。没改的不传、后端不动：共享组里别的实例刚改的项不会被这边的旧值盖回去。 */
+const providerPatch = (draft: Draft, stored: Draft | undefined) => {
+  const differs = (field: 'model' | 'baseUrl' | 'vision' | 'label'): boolean => (
+    draft.fresh || !stored || draft[field] !== stored[field]
+  );
+  const key = draft.apiKeyInput.trim();
+  return {
+    ...(differs('model') ? { model: draft.model.trim() } : {}),
+    ...(differs('baseUrl') ? { base_url: draft.baseUrl.trim() } : {}),
+    ...(differs('vision') ? { supports_vision: draft.vision } : {}),
+    ...(differs('label') ? { label: draft.label.trim() } : {}),
+    // 名字猜不出格式时必须写死，否则后端只能按块名去查，查不到就拒。
+    ...(draft.typeExplicit || draft.type !== draft.name ? { type: draft.type } : {}),
+    // 只有真填了才提交，留空表示沿用原值。
+    ...(key ? { api_key: key } : {}),
+  };
+};
+
 const HEAD = 'flex items-center gap-2';
 
 /** 名字旁边那枚绿标：块名、以及「在用」。 */
@@ -335,18 +353,9 @@ const ProvidersEditor = () => {
     try {
       let latest = data;
       for (const draft of drafts) {
-        if (!changed(draft, storedBy.get(draft.name))) continue;
-        const key = draft.apiKeyInput.trim();
-        latest = await upsertProvider(token, draft.name, {
-          model: draft.model.trim(),
-          base_url: draft.baseUrl.trim(),
-          supports_vision: draft.vision,
-          label: draft.label.trim(),
-          // 名字猜不出格式时必须写死，否则后端只能按块名去查，查不到就拒。
-          ...(draft.typeExplicit || draft.type !== draft.name ? { type: draft.type } : {}),
-          // 只有真填了才提交，留空表示沿用原值。
-          ...(key ? { api_key: key } : {}),
-        });
+        const stored = storedBy.get(draft.name);
+        if (!changed(draft, stored)) continue;
+        latest = await upsertProvider(token, draft.name, providerPatch(draft, stored));
       }
       if (latest) absorb(latest, '已保存。engine 每个任务重新取一次密钥，下一条消息就用新的。');
     } catch (caught) {

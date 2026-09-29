@@ -205,7 +205,12 @@ def test_writing_and_reading_the_qq_config(call, tmp_path: Path) -> None:
     assert (tmp_path / "config" / "qq.yaml").read_text(encoding="utf-8").startswith("channels:")
 
     raw = call("GET", "/v1/platforms/qq/config/raw").json()
-    assert raw == {"content": "channels:\n  allowed_groups: [1]\n", "exists": True}
+    # 指纹一路带到编辑器里，保存时拿它认出中途有没有别人改过。
+    assert raw == {
+        "content": "channels:\n  allowed_groups: [1]\n",
+        "exists": True,
+        "hash": written.json()["hash"],
+    }
 
 
 def test_the_legacy_routes_answer_the_same(call, tmp_path: Path) -> None:

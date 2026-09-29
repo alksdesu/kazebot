@@ -29,6 +29,11 @@ export function isNotFound(error: unknown): boolean {
   return error instanceof Error && /^404\b/.test(error.message);
 }
 
+/** 带着指纹写回时 409：打开之后这份配置被别处改过。别的写入的 409 另有含义（比如系统节点不让改），不能拿它判断。 */
+export function isEditConflict(error: unknown): boolean {
+  return error instanceof Error && /^409\b/.test(error.message);
+}
+
 function authHeaders(token: string): Record<string, string> {
   return { Authorization: `Bearer ${token}` };
 }
@@ -335,7 +340,32 @@ export interface AdminCreatePayload {
   content: string;
 }
 
-async function readRawConfig(path: string, token: string): Promise<string> {
+/**
+ * 原文连同读到它时的指纹。编辑器自己留着 hash，保存时原样交回：文件中途被别处改过
+ * （共享组里别的实例、另一个标签页、同一页上的另一个面板），后端回 409，一个字节都不写。
+ * 空串表示读的时候文件还不存在；null 表示后端没给指纹，保存时照旧整份覆盖。
+ */
+export interface RawText {
+  content: string;
+  hash: string | null;
+}
+
+/** 保存之后磁盘上那一版的指纹，拿它当下一次保存的基准。 */
+export interface RawSaveResult {
+  ok: boolean;
+  hash: string | null;
+}
+
+export function hashOf(json: unknown): string | null {
+  const hash = (json as { hash?: unknown } | null)?.hash;
+  return typeof hash === 'string' ? hash : null;
+}
+
+function rawWriteBody(content: string, baseHash: string | null): string {
+  return JSON.stringify(baseHash === null ? { content } : { content, base_hash: baseHash });
+}
+
+async function readRawConfig(path: string, token: string): Promise<RawText> {
   // [2026-06-02] Shared raw-config reader for the expanded Settings tabs.
   // Why: nodes, tools, skills, MCP clients, schedules, policy, and runtime all expose
   // the same {content:string} shape. How: centralize bearer auth and response
@@ -343,10 +373,10 @@ async function readRawConfig(path: string, token: string): Promise<string> {
   // response handling or accidentally returning the wrapper object.
   const resp = await apiFetch(path, { headers: authHeaders(token) });
   const json = await resp.json();
-  return typeof json.content === 'string' ? json.content : '';
+  return { content: typeof json.content === 'string' ? json.content : '', hash: hashOf(json) };
 }
 
-async function writeRawConfig(path: string, token: string, content: string): Promise<any> {
+async function writeRawConfig(path: string, token: string, content: string, baseHash: string | null): Promise<RawSaveResult> {
   // [2026-06-02] Shared raw-config writer for the expanded Settings tabs.
   // Why: every raw editor saves through the same {content:string} backend model. How:
   // send JSON with the admin bearer header in one helper. Purpose: the UI can add new
@@ -354,9 +384,10 @@ async function writeRawConfig(path: string, token: string, content: string): Pro
   const resp = await apiFetch(path, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ content }),
+    body: rawWriteBody(content, baseHash),
   });
-  return resp.json();
+  const json = await resp.json();
+  return { ok: json?.ok !== false, hash: hashOf(json) };
 }
 
 const pathPart = (value: string): string => encodeURIComponent(value);
@@ -423,12 +454,12 @@ export async function getNodes(token: string): Promise<AdminNode[]> {
   return resp.json();
 }
 
-export function getConfigRaw(token: string): Promise<string> {
+export function getConfigRaw(token: string): Promise<RawText> {
   return readRawConfig('/admin/config/config/raw', token);
 }
 
-export function updateConfigRaw(token: string, yaml: string): Promise<any> {
-  return writeRawConfig('/admin/config/config/raw', token, yaml);
+export function updateConfigRaw(token: string, yaml: string, baseHash: string | null): Promise<RawSaveResult> {
+  return writeRawConfig('/admin/config/config/raw', token, yaml, baseHash);
 }
 
 // ── Multi-provider config ──
@@ -672,22 +703,28 @@ export interface PolicyDoc {
   restart?: { default: PolicyDecision };
 }
 
-export async function getPolicy(token: string): Promise<PolicyDoc> {
-  const resp = await apiFetch('/config/policy', { headers: authHeaders(token) });
-  const data = await resp.json();
-  // 拿不到 policy 字段就给空文档：调用方按对象用，返回 undefined 会让渲染直接炸。
-  return (data && data.policy) || {};
+/** 策略连同它出自的那一版文件的指纹。 */
+export interface PolicyFile {
+  policy: PolicyDoc;
+  hash: string | null;
 }
 
-/** 整份替换。部分更新没法表达「删掉一条规则」，后端也按整份校验。 */
-export async function updatePolicy(token: string, policy: PolicyDoc): Promise<PolicyDoc> {
+// 拿不到 policy 字段就给空文档：调用方按对象用，返回 undefined 会让渲染直接炸。
+const policyFileOf = (data: any): PolicyFile => ({ policy: (data && data.policy) || {}, hash: hashOf(data) });
+
+export async function getPolicy(token: string): Promise<PolicyFile> {
+  const resp = await apiFetch('/config/policy', { headers: authHeaders(token) });
+  return policyFileOf(await resp.json());
+}
+
+/** 整份替换。部分更新没法表达「删掉一条规则」，后端也按整份校验。baseHash 是读到时的指纹，中途被别处改过就 409。 */
+export async function updatePolicy(token: string, policy: PolicyDoc, baseHash: string | null): Promise<PolicyFile> {
   const resp = await apiFetch('/config/policy', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ policy }),
+    body: JSON.stringify(baseHash === null ? { policy } : { policy, base_hash: baseHash }),
   });
-  const data = await resp.json();
-  return (data && data.policy) || {};
+  return policyFileOf(await resp.json());
 }
 
 // ── bot 登录账号（经 supervisor 转发给平台的账号运维）──
@@ -794,8 +831,8 @@ export interface InstanceProgress {
 
 // 和后端 provisioning 同一条规则，这里只为提前提示，以后端判定为准。
 const INSTANCE_ID = /^(?:[a-z][a-z0-9_]{1,31}|[1-9]\d{4,10})$/;
-// 数据根下的共享表情包库占着这个名字。
-const RESERVED_INSTANCE_IDS: ReadonlySet<string> = new Set(['stickers']);
+// 数据根下的共享表情包库和共享配置组占着这两个名字。
+const RESERVED_INSTANCE_IDS: ReadonlySet<string> = new Set(['stickers', 'shared']);
 
 export function isValidInstanceId(id: string): boolean {
   return INSTANCE_ID.test(id) && !RESERVED_INSTANCE_IDS.has(id);
@@ -831,6 +868,94 @@ export async function deleteInstance(token: string, id: string): Promise<void> {
     method: 'DELETE',
     headers: authHeaders(token),
   });
+}
+
+// ── 共享配置组 ──
+
+export interface ShareGroupMember {
+  id: string;
+  label: string;
+  current: boolean;
+}
+
+export interface ShareGroup {
+  name: string;
+  members: ShareGroupMember[];
+  created_at: string;
+  created_by: string;
+}
+
+/** 本实例能不能用共享配置、在哪个组、各组有谁、加入组时归档过哪几份旧配置。 */
+export interface ShareGroupOverview {
+  available: boolean;
+  reason: string;
+  current: string | null;
+  groups: ShareGroup[];
+  archives: string[];
+}
+
+/** 建组、加入、退出、删组的结果。archived 是本实例旧配置归档到哪，没归档是空串。 */
+export interface ShareGroupChange {
+  group: string;
+  archived?: string;
+  copied_env?: string[];
+  overview: ShareGroupOverview;
+}
+
+// 和后端 config_layout 同一条规则，这里只为提前提示，以后端判定为准。
+const SHARE_GROUP_NAME = /^[a-z][a-z0-9_]{1,31}$/;
+
+export function isValidShareGroupName(name: string): boolean {
+  return SHARE_GROUP_NAME.test(name);
+}
+
+const normalizeShareGroups = (raw: any): ShareGroupOverview => ({
+  available: Boolean(raw?.available),
+  reason: typeof raw?.reason === 'string' ? raw.reason : '',
+  current: typeof raw?.current === 'string' && raw.current ? raw.current : null,
+  groups: Array.isArray(raw?.groups) ? raw.groups.map((group: any) => ({
+    name: String(group?.name ?? ''),
+    members: Array.isArray(group?.members) ? group.members.map((member: any) => ({
+      id: String(member?.id ?? ''),
+      label: String(member?.label ?? member?.id ?? ''),
+      current: Boolean(member?.current),
+    })) : [],
+    created_at: typeof group?.created_at === 'string' ? group.created_at : '',
+    created_by: typeof group?.created_by === 'string' ? group.created_by : '',
+  })) : [],
+  archives: Array.isArray(raw?.archives) ? raw.archives.map(String) : [],
+});
+
+async function changeShareGroup(path: string, token: string, init: RequestInit): Promise<ShareGroupChange> {
+  const resp = await apiFetch(path, { ...init, headers: { 'Content-Type': 'application/json', ...authHeaders(token) } });
+  const json = await resp.json();
+  return {
+    group: String(json?.group ?? ''),
+    archived: typeof json?.archived === 'string' ? json.archived : '',
+    copied_env: Array.isArray(json?.copied_env) ? json.copied_env.map(String) : [],
+    overview: normalizeShareGroups(json?.overview),
+  };
+}
+
+export async function getShareGroups(token: string): Promise<ShareGroupOverview> {
+  const resp = await apiFetch('/share-groups', { headers: authHeaders(token) });
+  return normalizeShareGroups(await resp.json());
+}
+
+export function createShareGroup(token: string, name: string): Promise<ShareGroupChange> {
+  return changeShareGroup('/share-groups', token, { method: 'POST', body: JSON.stringify({ name }) });
+}
+
+export function joinShareGroup(token: string, name: string): Promise<ShareGroupChange> {
+  return changeShareGroup(`/share-groups/${encodeURIComponent(name)}/join`, token, { method: 'POST', body: '{}' });
+}
+
+export function leaveShareGroup(token: string): Promise<ShareGroupChange> {
+  return changeShareGroup('/share-groups/leave', token, { method: 'POST', body: '{}' });
+}
+
+export function deleteShareGroup(token: string, name: string): Promise<ShareGroupChange> {
+  return changeShareGroup(`/share-groups/${encodeURIComponent(name)}`, token, { method: 'DELETE' });
 }
 
 const platformAccountPath = (platformId: string, leaf = ''): string =>
@@ -962,12 +1087,11 @@ export async function clearNodeFallbacks(
   return resp.json();
 }
 
-export function getRuntimeRaw(token: string): Promise<string> {
+export function getRuntimeRaw(token: string): Promise<RawText> {
   return readRawConfig('/admin/config/runtime/raw', token);
 }
 
-export interface RuntimeFile {
-  content: string;
+export interface RuntimeFile extends RawText {
   /** default：本实例还没改过，显示的是仓库默认；override：本实例有自己的 config/runtime.yaml，逐键盖在默认上面。 */
   source: 'default' | 'override';
   path: string;
@@ -978,6 +1102,7 @@ export async function getRuntimeFile(token: string): Promise<RuntimeFile> {
   const json = await resp.json();
   return {
     content: typeof json.content === 'string' ? json.content : '',
+    hash: hashOf(json),
     source: json.source === 'override' ? 'override' : 'default',
     path: typeof json.path === 'string' ? json.path : '',
   };
@@ -992,16 +1117,16 @@ export async function resetRuntime(token: string): Promise<ConfigRemoveResult> {
   return resp.json();
 }
 
-export function updateRuntimeRaw(token: string, yaml: string): Promise<any> {
-  return writeRawConfig('/admin/config/runtime/raw', token, yaml);
+export function updateRuntimeRaw(token: string, yaml: string, baseHash: string | null): Promise<RawSaveResult> {
+  return writeRawConfig('/admin/config/runtime/raw', token, yaml, baseHash);
 }
 
-export function getPolicyRaw(token: string): Promise<string> {
+export function getPolicyRaw(token: string): Promise<RawText> {
   return readRawConfig('/admin/config/policy/raw', token);
 }
 
-export function updatePolicyRaw(token: string, yaml: string): Promise<any> {
-  return writeRawConfig('/admin/config/policy/raw', token, yaml);
+export function updatePolicyRaw(token: string, yaml: string, baseHash: string | null): Promise<RawSaveResult> {
+  return writeRawConfig('/admin/config/policy/raw', token, yaml, baseHash);
 }
 
 // ── Memory & conversation context ──
@@ -1329,12 +1454,12 @@ export async function importStickers(
   return resp.json();
 }
 
-export function getSchedulesRaw(token: string): Promise<string> {
+export function getSchedulesRaw(token: string): Promise<RawText> {
   return readRawConfig('/admin/config/schedules/raw', token);
 }
 
-export function updateSchedulesRaw(token: string, yaml: string): Promise<any> {
-  return writeRawConfig('/admin/config/schedules/raw', token, yaml);
+export function updateSchedulesRaw(token: string, yaml: string, baseHash: string | null): Promise<RawSaveResult> {
+  return writeRawConfig('/admin/config/schedules/raw', token, yaml, baseHash);
 }
 
 export interface NodeFileInfo {
@@ -1355,12 +1480,12 @@ export async function getNodeFiles(token: string): Promise<NodeFileInfo[]> {
   return resp.json();
 }
 
-export function getNodeFileRaw(token: string, filename: string): Promise<string> {
+export function getNodeFileRaw(token: string, filename: string): Promise<RawText> {
   return readRawConfig(`/admin/config/node-files/${pathPart(filename)}/raw`, token);
 }
 
-export function updateNodeFileRaw(token: string, filename: string, content: string): Promise<any> {
-  return writeRawConfig(`/admin/config/node-files/${pathPart(filename)}/raw`, token, content);
+export function updateNodeFileRaw(token: string, filename: string, content: string, baseHash: string | null): Promise<RawSaveResult> {
+  return writeRawConfig(`/admin/config/node-files/${pathPart(filename)}/raw`, token, content, baseHash);
 }
 
 /** 改过的仓库默认文件恢复成默认；本实例自己加的直接删。没改过的仓库默认删不掉，后端回 409。 */
@@ -1372,12 +1497,12 @@ export async function deleteNodeFile(token: string, filename: string): Promise<C
   return resp.json();
 }
 
-export function getNodeRaw(token: string, nodeId: string): Promise<string> {
+export function getNodeRaw(token: string, nodeId: string): Promise<RawText> {
   return readRawConfig(`/admin/config/nodes/${pathPart(nodeId)}/raw`, token);
 }
 
-export function updateNodeRaw(token: string, nodeId: string, yaml: string): Promise<any> {
-  return writeRawConfig(`/admin/config/nodes/${pathPart(nodeId)}/raw`, token, yaml);
+export function updateNodeRaw(token: string, nodeId: string, yaml: string, baseHash: string | null): Promise<RawSaveResult> {
+  return writeRawConfig(`/admin/config/nodes/${pathPart(nodeId)}/raw`, token, yaml, baseHash);
 }
 
 export async function createNode(token: string, data: AdminCreatePayload): Promise<any> {
@@ -1407,12 +1532,12 @@ export async function getTools(token: string): Promise<AdminTool[]> {
   return resp.json();
 }
 
-export function getToolRaw(token: string, name: string): Promise<string> {
+export function getToolRaw(token: string, name: string): Promise<RawText> {
   return readRawConfig(`/admin/config/tools/${pathPart(name)}/raw`, token);
 }
 
-export function updateToolRaw(token: string, name: string, script: string): Promise<any> {
-  return writeRawConfig(`/admin/config/tools/${pathPart(name)}/raw`, token, script);
+export function updateToolRaw(token: string, name: string, script: string, baseHash: string | null): Promise<RawSaveResult> {
+  return writeRawConfig(`/admin/config/tools/${pathPart(name)}/raw`, token, script, baseHash);
 }
 
 export async function createTool(token: string, data: AdminCreatePayload): Promise<any> {
@@ -1436,6 +1561,8 @@ export async function deleteTool(token: string, name: string): Promise<ConfigRem
 
 export interface DrawtoolsRawFile {
   content: string;
+  /** 读到时的指纹，保存时交回；两份都不存在时是空串。 */
+  hash?: string | null;
   exists?: boolean;
   using_example?: boolean;
   path?: string;
@@ -1458,20 +1585,20 @@ export async function initDrawtoolsConfigs(token: string): Promise<{ ok: boolean
   return resp.json();
 }
 
-export function getDrawtoolsSettingsRaw(token: string): Promise<string> {
+export function getDrawtoolsSettingsRaw(token: string): Promise<RawText> {
   return readRawConfig('/admin/config/drawtools/settings/raw', token);
 }
 
-export function updateDrawtoolsSettingsRaw(token: string, content: string): Promise<any> {
-  return writeRawConfig('/admin/config/drawtools/settings/raw', token, content);
+export function updateDrawtoolsSettingsRaw(token: string, content: string, baseHash: string | null): Promise<RawSaveResult> {
+  return writeRawConfig('/admin/config/drawtools/settings/raw', token, content, baseHash);
 }
 
-export function getDrawtoolsCharactersRaw(token: string): Promise<string> {
+export function getDrawtoolsCharactersRaw(token: string): Promise<RawText> {
   return readRawConfig('/admin/config/drawtools/characters/raw', token);
 }
 
-export function updateDrawtoolsCharactersRaw(token: string, content: string): Promise<any> {
-  return writeRawConfig('/admin/config/drawtools/characters/raw', token, content);
+export function updateDrawtoolsCharactersRaw(token: string, content: string, baseHash: string | null): Promise<RawSaveResult> {
+  return writeRawConfig('/admin/config/drawtools/characters/raw', token, content, baseHash);
 }
 
 export async function cleanupDrawtoolsAttachments(token: string): Promise<any> {
@@ -1479,12 +1606,12 @@ export async function cleanupDrawtoolsAttachments(token: string): Promise<any> {
   return resp.json();
 }
 
-export function getDrawtoolsPromptRaw(token: string, name: string): Promise<string> {
+export function getDrawtoolsPromptRaw(token: string, name: string): Promise<RawText> {
   return readRawConfig(`/admin/config/drawtools/prompts/${pathPart(name)}/raw`, token);
 }
 
-export function updateDrawtoolsPromptRaw(token: string, name: string, content: string): Promise<any> {
-  return writeRawConfig(`/admin/config/drawtools/prompts/${pathPart(name)}/raw`, token, content);
+export function updateDrawtoolsPromptRaw(token: string, name: string, content: string, baseHash: string | null): Promise<RawSaveResult> {
+  return writeRawConfig(`/admin/config/drawtools/prompts/${pathPart(name)}/raw`, token, content, baseHash);
 }
 
 export async function getSkills(token: string): Promise<AdminSkill[]> {
@@ -1492,12 +1619,12 @@ export async function getSkills(token: string): Promise<AdminSkill[]> {
   return resp.json();
 }
 
-export function getSkillRaw(token: string, name: string): Promise<string> {
+export function getSkillRaw(token: string, name: string): Promise<RawText> {
   return readRawConfig(`/admin/config/skills/${pathPart(name)}/raw`, token);
 }
 
-export function updateSkillRaw(token: string, name: string, content: string): Promise<any> {
-  return writeRawConfig(`/admin/config/skills/${pathPart(name)}/raw`, token, content);
+export function updateSkillRaw(token: string, name: string, content: string, baseHash: string | null): Promise<RawSaveResult> {
+  return writeRawConfig(`/admin/config/skills/${pathPart(name)}/raw`, token, content, baseHash);
 }
 
 export async function createSkill(token: string, data: AdminCreatePayload): Promise<any> {
@@ -1522,12 +1649,12 @@ export async function getMcpClients(token: string): Promise<McpClient[]> {
   return resp.json();
 }
 
-export function getMcpClientsRaw(token: string): Promise<string> {
+export function getMcpClientsRaw(token: string): Promise<RawText> {
   return readRawConfig('/admin/config/mcp-clients/raw', token);
 }
 
-export function updateMcpClientsRaw(token: string, yaml: string): Promise<any> {
-  return writeRawConfig('/admin/config/mcp-clients/raw', token, yaml);
+export function updateMcpClientsRaw(token: string, yaml: string, baseHash: string | null): Promise<RawSaveResult> {
+  return writeRawConfig('/admin/config/mcp-clients/raw', token, yaml, baseHash);
 }
 
 export interface RestartInProgress {
@@ -1563,14 +1690,12 @@ export async function restartEngine(
 //  热载配置（平台配置文件与全局默认 config/features.yaml）与平台清单
 // ================================================================
 
-export interface ConfigRawFile {
-  content: string;
+export interface ConfigRawFile extends RawText {
   /** false = 还没接管，控制台该显示「跟随 .env」而不是一份空配置。 */
   exists: boolean;
 }
 
-export interface ConfigSaveResult {
-  ok: boolean;
+export interface ConfigSaveResult extends RawSaveResult {
   /** bot 没在跑时后端只能校验 YAML 语法，会在这里说明。 */
   warnings: string[];
 }
@@ -1853,26 +1978,29 @@ const platformConfigPath = (platformId: string, leaf: string): string =>
   `/platforms/${encodeURIComponent(platformId)}/config/${leaf}`;
 const featuresConfigPath = (leaf: string): string => `/features/config/${leaf}`;
 
-// 不复用 readRawConfig：那个 helper 只留 content，会把 exists 一起丢掉，
+// 不复用 readRawConfig：那个 helper 不给 exists，
 // 于是「还没接管」和「接管了但是空的」在界面上长得一样。
 async function readConfigFile(path: string, token: string): Promise<ConfigRawFile> {
   const resp = await apiFetch(path, { headers: authHeaders(token) });
   const json = await resp.json();
   return {
     content: typeof json.content === 'string' ? json.content : '',
+    hash: hashOf(json),
     exists: Boolean(json.exists),
   };
 }
 
-/** 整份写回。后端拒绝无人消费的键（400），错误会带着那批键名抛出来。 */
-async function writeConfigFile(path: string, token: string, content: string): Promise<ConfigSaveResult> {
+/** 整份写回。后端拒绝无人消费的键（400）、文件中途被别处改过（409），错误会带着原因抛出来。 */
+async function writeConfigFile(
+  path: string, token: string, content: string, baseHash: string | null,
+): Promise<ConfigSaveResult> {
   const resp = await apiFetch(path, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ content }),
+    body: rawWriteBody(content, baseHash),
   });
   const json = await resp.json();
-  return { ok: Boolean(json.ok), warnings: Array.isArray(json.warnings) ? json.warnings : [] };
+  return { ok: Boolean(json.ok), hash: hashOf(json), warnings: Array.isArray(json.warnings) ? json.warnings : [] };
 }
 
 async function readJson<T>(path: string, token: string): Promise<T> {
@@ -1884,8 +2012,10 @@ export function getPlatformRaw(token: string, platformId: string): Promise<Confi
   return readConfigFile(platformConfigPath(platformId, 'raw'), token);
 }
 
-export function updatePlatformRaw(token: string, platformId: string, content: string): Promise<ConfigSaveResult> {
-  return writeConfigFile(platformConfigPath(platformId, 'raw'), token, content);
+export function updatePlatformRaw(
+  token: string, platformId: string, content: string, baseHash: string | null,
+): Promise<ConfigSaveResult> {
+  return writeConfigFile(platformConfigPath(platformId, 'raw'), token, content, baseHash);
 }
 
 export function getPlatformState(token: string, platformId: string): Promise<ConfigLiveState> {
@@ -1901,8 +2031,8 @@ export function getFeaturesRaw(token: string): Promise<ConfigRawFile> {
   return readConfigFile(featuresConfigPath('raw'), token);
 }
 
-export function updateFeaturesRaw(token: string, content: string): Promise<ConfigSaveResult> {
-  return writeConfigFile(featuresConfigPath('raw'), token, content);
+export function updateFeaturesRaw(token: string, content: string, baseHash: string | null): Promise<ConfigSaveResult> {
+  return writeConfigFile(featuresConfigPath('raw'), token, content, baseHash);
 }
 
 export function getFeaturesState(token: string): Promise<FeaturesLiveState> {

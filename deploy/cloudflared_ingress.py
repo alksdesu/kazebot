@@ -22,6 +22,8 @@ import yaml
 CLOUDFLARED = "/usr/local/bin/cloudflared"
 # 和 supervisor 侧、建实例脚本、polkit 规则同一条：实例名会拼进 ingress 的路径正则。
 INSTANCE_ID = re.compile(r"^(?:[a-z][a-z0-9_]{1,31}|[1-9][0-9]{4,10})$")
+# 数据根下的共享表情包库和共享配置组占着的名字。root 侧不导 supervisor 的代码，这里另抄一份。
+RESERVED_IDS = frozenset({"stickers", "shared"})
 
 
 class _Dumper(yaml.SafeDumper):
@@ -132,7 +134,7 @@ def main() -> None:
     parser.add_argument("--base-port", type=int, default=8765)
     args = parser.parse_args()
 
-    if not INSTANCE_ID.match(args.instance) or args.instance == "stickers":
+    if not INSTANCE_ID.match(args.instance) or args.instance in RESERVED_IDS:
         raise SystemExit("实例名不合法")
     if args.action == "add":
         if not 1024 < args.port < 65536:

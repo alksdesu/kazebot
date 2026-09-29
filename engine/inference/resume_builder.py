@@ -7,6 +7,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import config_layout
+
 from ..attachments import build_multimodal_content
 
 
@@ -221,10 +223,12 @@ def _select_attachments(
             p = Path(raw)
             if not p.is_absolute():
                 p = workspace_root / p
-            # Security: only allow paths within workspace
+            # 只读工作区里的文件，和 screen_model_attachment_paths 放行的范围一致：受信链接后面的也算。
             try:
-                p.resolve().relative_to(workspace_root.resolve())
-            except ValueError:
+                resolved = p.resolve()
+            except (OSError, RuntimeError):
+                continue
+            if config_layout.workspace_logical_path(workspace_root, resolved) is None:
                 continue
             if not p.is_file():
                 continue

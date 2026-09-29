@@ -126,12 +126,15 @@ const STALE_CLIENT: McpClient = { id: 'stale_client', enabled: false, transport:
 
 const STALE_SCHEDULES_RAW = SCHEDULES_RAW.replace('existing_schedule', 'stale_schedule');
 
+/** 原文读回来连着读到它的那一版指纹，保存时交回。 */
+const rawFile = (content: string, hash = 'raw-1'): api.RawText => ({ content, hash });
+
 /** 定时任务和 MCP 这两页没有增删接口，新建和删除都得先把整份原文读回来再整份写回去。 */
 interface RawCase {
   /** 读原文那个接口，和列表重读的不一定是同一个。 */
   reader: Mock;
-  /** 读回来的原文。 */
-  value: string;
+  /** 读回来的原文连同指纹。 */
+  value: api.RawText;
   /** 用原文里已有的那个名字去创建。 */
   createExisting: () => void;
   existsText: string;
@@ -233,11 +236,11 @@ const PAGES: PageCase[] = [
     title: '定时任务页',
     Page: AutomationSettingsPage,
     reader: vi.mocked(api.getSchedulesRaw),
-    listValue: SCHEDULES_RAW,
+    listValue: rawFile(SCHEDULES_RAW),
     writeReads: 2,
     preReads: 1,
     listName: 'existing_schedule',
-    staleValue: STALE_SCHEDULES_RAW,
+    staleValue: rawFile(STALE_SCHEDULES_RAW),
     staleName: 'stale_schedule',
     event: 'settings:schedules-updated',
     refreshLabel: '刷新',
@@ -252,7 +255,7 @@ const PAGES: PageCase[] = [
     created: { selection: 'demo_schedule', panelOpen: true },
     raw: {
       reader: vi.mocked(api.getSchedulesRaw),
-      value: SCHEDULES_RAW,
+      value: rawFile(SCHEDULES_RAW),
       createExisting: () => { fill('创建定时任务', 'existing_schedule'); click('创建任务'); },
       existsText: '该任务 ID 已存在',
     },
@@ -283,7 +286,7 @@ const PAGES: PageCase[] = [
     },
     raw: {
       reader: vi.mocked(api.getMcpClientsRaw),
-      value: MCP_RAW,
+      value: rawFile(MCP_RAW),
       createExisting: () => { fill('创建 MCP Client', 'existing_client'); click('创建 Client'); },
       existsText: '该 MCP Client 已存在',
     },
@@ -327,8 +330,8 @@ beforeEach(() => {
   vi.mocked(api.getSkills).mockResolvedValue([EXISTING_SKILL]);
   vi.mocked(api.getTools).mockResolvedValue([EXISTING_TOOL]);
   vi.mocked(api.getMcpClients).mockResolvedValue([EXISTING_CLIENT]);
-  vi.mocked(api.getMcpClientsRaw).mockResolvedValue(MCP_RAW);
-  vi.mocked(api.getSchedulesRaw).mockResolvedValue(SCHEDULES_RAW);
+  vi.mocked(api.getMcpClientsRaw).mockResolvedValue(rawFile(MCP_RAW));
+  vi.mocked(api.getSchedulesRaw).mockResolvedValue(rawFile(SCHEDULES_RAW));
   vi.mocked(api.createNode).mockResolvedValue({ ok: true });
   vi.mocked(api.createSkill).mockResolvedValue({ ok: true });
   vi.mocked(api.createTool).mockResolvedValue({ ok: true });
@@ -336,8 +339,8 @@ beforeEach(() => {
   vi.mocked(api.deleteSkill).mockResolvedValue({ ok: true });
   vi.mocked(api.deleteTool).mockResolvedValue({ ok: true, restored: false });
   vi.mocked(api.reloadTools).mockResolvedValue({ seq: 7 });
-  vi.mocked(api.updateMcpClientsRaw).mockResolvedValue({ ok: true });
-  vi.mocked(api.updateSchedulesRaw).mockResolvedValue({ ok: true });
+  vi.mocked(api.updateMcpClientsRaw).mockResolvedValue({ ok: true, hash: 'raw-2' });
+  vi.mocked(api.updateSchedulesRaw).mockResolvedValue({ ok: true, hash: 'raw-2' });
 });
 
 for (const page of PAGES) describe(`${page.title}的提示`, () => {
@@ -597,8 +600,8 @@ for (const page of PAGES) describe(`${page.title}的提示`, () => {
   const raw = page.raw;
   if (raw) describe('先读原文再写回', () => {
     /** 原文卡在半路，写不写得下去全看它回来时 token 还在不在。 */
-    const holdRawRead = async (start: () => void): Promise<Deferred<string>> => {
-      const read = deferred<string>();
+    const holdRawRead = async (start: () => void): Promise<Deferred<api.RawText>> => {
+      const read = deferred<api.RawText>();
       const before = raw.reader.mock.calls.length;
       raw.reader.mockReturnValueOnce(read.promise);
       start();
@@ -606,7 +609,7 @@ for (const page of PAGES) describe(`${page.title}的提示`, () => {
       return read;
     };
 
-    const finishRawRead = async (read: Deferred<string>) => {
+    const finishRawRead = async (read: Deferred<api.RawText>) => {
       await act(async () => { read.resolve(raw.value); });
       await settled(page.refreshLabel);
     };

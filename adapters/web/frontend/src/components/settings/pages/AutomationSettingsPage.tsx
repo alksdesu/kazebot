@@ -41,7 +41,7 @@ export const AutomationSettingsPage = () => {
     const version = ++generation.current;
     setLoading(true);
     try {
-      const parsed = parseSchedules(await getSchedulesRaw(adminToken));
+      const parsed = parseSchedules((await getSchedulesRaw(adminToken)).content);
       if (version !== generation.current) return;
       setSchedules(parsed);
       if (selectedScheduleId && !parsed.some((schedule) => schedule.id === selectedScheduleId)) setSelectedScheduleId(null);
@@ -78,12 +78,12 @@ export const AutomationSettingsPage = () => {
     if (!confirmNavigation()) return;
     mutation.current = true; setBusy(true);
     try {
-      const raw = await getSchedulesRaw(adminToken);
+      const file = await getSchedulesRaw(adminToken);
       if (tokenChanged(adminToken)) return;
-      const current = parseSchedules(raw);
+      const current = parseSchedules(file.content);
       if (current.some((schedule) => schedule.id === id)) { setMessage('该任务 ID 已存在'); return; }
       const next = [...current, emptySchedule(id)];
-      await updateSchedulesRaw(adminToken, serializeSchedules(next, raw));
+      await updateSchedulesRaw(adminToken, serializeSchedules(next, file.content), file.hash);
       if (tokenChanged(adminToken)) return;
       setNewId('');
       setMessage('任务已创建但尚未启用，请在右栏填写内容后启用。');
@@ -103,10 +103,10 @@ export const AutomationSettingsPage = () => {
     if (!confirmNavigation()) return;
     mutation.current = true; setBusy(true);
     try {
-      const raw = await getSchedulesRaw(adminToken);
+      const file = await getSchedulesRaw(adminToken);
       if (tokenChanged(adminToken)) return;
-      const next = parseSchedules(raw).filter((schedule) => schedule.id !== selectedScheduleId);
-      await updateSchedulesRaw(adminToken, serializeSchedules(next, raw));
+      const next = parseSchedules(file.content).filter((schedule) => schedule.id !== selectedScheduleId);
+      await updateSchedulesRaw(adminToken, serializeSchedules(next, file.content), file.hash);
       if (tokenChanged(adminToken)) return;
       setSelectedScheduleId(null);
       setMessage('定时任务已删除');

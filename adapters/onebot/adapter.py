@@ -17,6 +17,7 @@ from adapters._shared.conversation_queue import ConversationQueue
 from adapters._shared.history_window import ClearBarriers, HistoryWindows
 from adapters._shared.sticker_delivery import ConversationLocks
 from adapters._shared.trigger_policy import CooldownState, TriggerDecision
+from adapters._shared.user_profiles import ProfileFile
 from platforms.builtin import QQ_NAPCAT
 from stickers.combat import CombatTracker
 
@@ -204,6 +205,8 @@ class OneBotAdapter:
         self.anon_sender_next: int = 0
         # QQ 用户身份/称呼 Profile。只影响模型可见的称呼和身份说明，不授予任何权限。
         self.qq_user_profiles: Dict[str, Dict[str, Any]] = {}
+        # 上面那份资料读自哪个文件、读的是哪一版：文件改过就整份重读。
+        self.qq_profiles_file: Optional[ProfileFile] = None
 
         # ---- 审批 ----
         self.approvals = ApprovalBook(

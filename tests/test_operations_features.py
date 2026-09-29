@@ -25,7 +25,7 @@ def service(root):
     secret = SimpleNamespace(provider="missing", model="", api_key="secret-test-key")
     state = SimpleNamespace(
         workspace_root=root, tasks={}, _lock=threading.RLock(), _task_terminal=lambda _: False,
-        feature_config_store=SimpleNamespace(get_openai_secret=lambda: secret),
+        feature_config_store=SimpleNamespace(get_openai_secret=lambda: secret, load_error=""),
         feature_process_manager=SimpleNamespace(worker_health=lambda: {"worker": {"alive": False, "last_log": "api_key=secret-test-key"}}),
     )
     return OperationsService(state)

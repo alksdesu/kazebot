@@ -11,6 +11,7 @@ import httpx
 import pytest
 from fastapi import FastAPI, HTTPException
 
+import config_layout
 from adapters._shared import reminder_commands
 from adapters.onebot import send_contract
 import supervisor.admin_api as admin_api
@@ -128,7 +129,10 @@ def test_owner_listing_and_quota_are_not_hidden_by_other_reminders(state, actor)
             rows.append((other["id"], other["scope"], other["owner"], None, json.dumps(other)))
         db.executemany("INSERT INTO reminders VALUES (?,?,?,?,?)", rows)
     assert [item["id"] for item in state.reminders.list(actor)] == [reminder["id"]]
-    state.reminders.max_open = 1
+    config = config_layout.config_dir(state.workspace_root) / "reminders.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("max_open_per_owner: 1\n", encoding="utf-8")
+    assert state.reminders.max_open == 1
     with pytest.raises(ValueError, match="最多"):
         create(state, actor)
     different_scope = FeatureActor(**{**actor.__dict__, "scope": "qq_group:elsewhere"})

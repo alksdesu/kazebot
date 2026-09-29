@@ -13,11 +13,13 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 import yaml
 
@@ -39,6 +41,18 @@ TOOLS_DIR = f"{CONFIG_DIR}/tools"
 DRAWTOOLS_DIR = f"{CONFIG_DIR}/drawtools"
 # 平台的连接令牌是实例身份，config/ 可能整份共享出去，所以放 data/。
 PLATFORM_SECRETS_FILE = "data/platform_secrets.yaml"
+# 能跟着 config/ 一起共享的 API 密钥。端口、地址、平台令牌这类实例身份留在各自的 .env，同名时 .env 的算数。
+SHARED_SECRETS_FILE = f"{CONFIG_DIR}/secrets.env"
+
+# 多开时清单文件放在几个实例共用的数据根下，数据根就按它的位置认。单实例部署不设它。
+INSTANCES_FILE_ENV = "CLONOTH_INSTANCES_FILE"
+# 数据根下放共享组的目录：每组一个子目录，组的配置在子目录的 config/ 里，成员的 config/ 是指向它的链接。
+SHARED_DIR = "shared"
+SHARE_GROUP_PATTERN = r"[a-z][a-z0-9_]{1,31}"
+_SHARE_GROUP_RE = re.compile(rf"^{SHARE_GROUP_PATTERN}$")
+# 多开实例的工作区里软链回代码目录的几个目录，和共享表情包库的链接位置。
+CODE_LINKS: tuple[str, ...] = ("adapters", "engine", "plugins", "tools", "defaults")
+STICKERS_LINK = "data/stickers"
 
 DEFAULTS_DIR = "defaults"
 DEFAULT_NODES_DIR = f"{DEFAULTS_DIR}/nodes"
@@ -70,7 +84,7 @@ DRAWTOOLS_FILES: tuple[str, ...] = (
 # 装着明文密钥的配置，新建时只给属主读写。
 _PRIVATE_MODE = 0o600
 _SECRET_BEARING = frozenset({
-    MODELS_FILE, POLICY_FILE, MCP_FILE, PLATFORM_SECRETS_FILE, f"{DRAWTOOLS_DIR}/settings.yaml",
+    MODELS_FILE, POLICY_FILE, MCP_FILE, PLATFORM_SECRETS_FILE, SHARED_SECRETS_FILE, f"{DRAWTOOLS_DIR}/settings.yaml",
 })
 
 LAYOUT_VERSION = 1
@@ -153,6 +167,10 @@ def drawtools_dir(workspace_root: Path | str) -> Path:
 
 def platform_secrets_path(workspace_root: Path | str) -> Path:
     return Path(workspace_root) / PLATFORM_SECRETS_FILE
+
+
+def shared_secrets_path(workspace_root: Path | str) -> Path:
+    return Path(workspace_root) / SHARED_SECRETS_FILE
 
 
 def example_name(name: str) -> str:
@@ -251,6 +269,213 @@ def is_secret_bearing(rel_path: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+#  共享组与受信链接
+# ---------------------------------------------------------------------------
+
+def data_root() -> Path | None:
+    """几个实例共用的数据根：清单文件所在的目录。单实例部署没配清单，也就没有数据根。"""
+    raw = str(os.environ.get(INSTANCES_FILE_ENV) or "").strip()
+    return Path(raw).expanduser().parent if raw else None
+
+
+def shared_root() -> Path | None:
+    root = data_root()
+    return root / SHARED_DIR if root is not None else None
+
+
+def is_share_group_name(name: str) -> bool:
+    return bool(_SHARE_GROUP_RE.fullmatch(str(name or "")))
+
+
+def share_group_dir(group: str) -> Path:
+    """组的目录。没有数据根或名字不合规时抛 ValueError：拿任意字符串拼出来的路径可能落在任何地方。"""
+    root = shared_root()
+    if root is None:
+        raise ValueError("单实例部署没有数据根，用不了共享组")
+    if not is_share_group_name(group):
+        raise ValueError(f"组名不合规：{group!r}")
+    return root / group
+
+
+def share_group_config_dir(group: str) -> Path:
+    return share_group_dir(group) / CONFIG_DIR
+
+
+def is_dir_link(path: Path | str) -> bool:
+    """软链，或者 Windows 上没有建软链的权限时退而用的目录联接。"""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return getattr(info, "st_reparse_tag", 0) == stat.IO_REPARSE_TAG_MOUNT_POINT
+
+
+def config_share_group(workspace_root: Path | str) -> str | None:
+    """本实例在哪个共享组：config/ 是指向数据根 shared/<组名>/config 的链接就是那个组，否则 None。"""
+    link = config_dir(workspace_root)
+    shared = shared_root()
+    if shared is None or not is_dir_link(link):
+        return None
+    try:
+        relative = link.resolve(strict=True).relative_to(shared.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return None
+    parts = relative.parts
+    if len(parts) != 2 or parts[1] != CONFIG_DIR or not is_share_group_name(parts[0]):
+        return None
+    return parts[0]
+
+
+def trusted_links(workspace_root: Path | str) -> tuple[tuple[str, Path], ...]:
+    """工作区里允许通到外面去的链接，以及各自必须通到的真实目录：代码目录那几个、共享表情包库、共享组的配置。
+
+    路径判定只认这几处。链接被改去指别处就不再算数，工作区里随手建的软链也一概不认：否则建一个链接就能把任意目录变成工作区。
+    """
+    root = Path(workspace_root)
+    links: list[tuple[str, Path]] = [(name, CODE_ROOT / name) for name in CODE_LINKS]
+    data = data_root()
+    if data is not None:
+        links.append((STICKERS_LINK, data / "stickers"))
+    group = config_share_group(root)
+    if group is not None:
+        links.append((CONFIG_DIR, share_group_config_dir(group)))
+    return tuple(links)
+
+
+def workspace_logical_path(workspace_root: Path | str, resolved: Path) -> str | None:
+    """解析到底的 resolved 在工作区里叫什么：工作区里的写相对路径，经受信链接通到外面的按链接名写，都不是返回 None。"""
+    root = Path(workspace_root)
+    try:
+        return resolved.relative_to(root.resolve()).as_posix()
+    except (OSError, ValueError):
+        pass
+    for name, expected in trusted_links(root):
+        link = root / name
+        if not is_dir_link(link):
+            continue
+        try:
+            target = link.resolve(strict=True)
+            if target != expected.resolve():
+                continue
+            relative = resolved.relative_to(target)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        return name if relative == Path(".") else f"{name}/{relative.as_posix()}"
+    return None
+
+
+class ConfigLayoutError(RuntimeError):
+    """工作区的 config/ 用不了：共享组的链接断了，或者这个名字被一个普通文件占着。"""
+
+
+def check_config_dir(workspace_root: Path | str) -> None:
+    """config/ 要么不存在，要么是能进得去的目录。断掉的共享组链接必须停下等人：接着跑会在链接旁边另起一份空配置。"""
+    link = config_dir(workspace_root)
+    if is_dir_link(link) and not link.is_dir():
+        try:
+            target = os.readlink(link)
+        except OSError:
+            target = "?"
+        raise ConfigLayoutError(
+            f"{link} 指向的共享配置不在了（{target}）：把链接改回存在的组，或者删掉链接、从 data/config.archived-* 挑一份改名回 config"
+        )
+    if (link.exists() or link.is_symlink()) and not link.is_dir():
+        raise ConfigLayoutError(f"{link} 不是目录")
+
+
+# ---------------------------------------------------------------------------
+#  dotenv
+# ---------------------------------------------------------------------------
+
+_ENV_ASSIGN = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+# 按路径缓存解析结果，按 file_stamp 认出改动。
+_ENV_FILE_CACHE: dict[str, tuple[tuple[int, int, int], Mapping[str, str]]] = {}
+_EMPTY_ENV: Mapping[str, str] = MappingProxyType({})
+
+
+def env_line_key(line: str) -> str:
+    """dotenv 里这一行给哪个键赋值；注释、空行和不像赋值的行是空串。"""
+    match = _ENV_ASSIGN.match(line)
+    return match.group(1) if match else ""
+
+
+# 不加引号 dotenv 和 systemd 的 EnvironmentFile 都能原样读回的值。
+_BARE_ENV_VALUE = re.compile(r"[A-Za-z0-9_\-.:/+=@,%~]*")
+
+
+def env_assignment(key: str, value: str) -> str:
+    """写进 dotenv 的一行。带空格、# 的值加单引号，否则 # 后面会被当成注释截掉；
+    值里本身有单引号或反斜杠的，两种解析器对引号里的转义理解不一致，只能照原样写。"""
+    if _BARE_ENV_VALUE.fullmatch(value) or "'" in value or "\\" in value:
+        return f"{key}={value}"
+    return f"{key}='{value}'"
+
+
+def read_env_file(path: Path) -> Mapping[str, str]:
+    """dotenv 文件的 {键: 值}，读不到是空表。解析器和进程启动时灌 .env 用的是同一个，两边对同一行的理解才一致。"""
+    stamp = file_stamp(path)
+    if stamp is None:
+        return _EMPTY_ENV
+    key = str(path)
+    cached = _ENV_FILE_CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    from dotenv import dotenv_values
+
+    try:
+        raw = dotenv_values(path, encoding="utf-8")
+    except (OSError, UnicodeDecodeError, ValueError):
+        _log.warning("读不了 %s，当它是空的", path, exc_info=True)
+        return _EMPTY_ENV
+    values: Mapping[str, str] = MappingProxyType({
+        str(name): str(value).strip() for name, value in raw.items() if value is not None and str(value).strip()
+    })
+    _ENV_FILE_CACHE[key] = (stamp, values)
+    return values
+
+
+def shared_secrets(workspace_root: Path | str) -> Mapping[str, str]:
+    """共享密钥文件的现状。别的实例改了它，这边下一次取值就换上，不用重启。"""
+    return read_env_file(shared_secrets_path(workspace_root))
+
+
+def edit_env_file(path: Path, updates: Mapping[str, str | None], *, mode: int | None = _PRIVATE_MODE) -> bool:
+    """逐键改一份 dotenv，返回改没改：值为 None 的键删掉，其余写成「键=值」；别的行原样留着。
+
+    读改写都在锁里：共享组里几个实例可能同时改同一份 secrets.env，各读各写会丢掉对方刚写的键。
+    """
+    with locked(path):
+        try:
+            text = path.read_bytes().decode("utf-8")
+        except FileNotFoundError:
+            text = ""
+        lines = text.splitlines()
+        pending = dict(updates)
+        kept: list[str] = []
+        written: set[str] = set()
+        for line in lines:
+            key = env_line_key(line)
+            if key not in pending:
+                kept.append(line)
+                continue
+            value = pending[key]
+            # 同一个键写了好几行时只留第一行的位置，后面几行一并去掉：dotenv 取最后一行，留着就改不动。
+            if value is not None and key not in written:
+                kept.append(env_assignment(key, value))
+                written.add(key)
+        for key, value in pending.items():
+            if value is not None and key not in written:
+                kept.append(env_assignment(key, value))
+                written.add(key)
+        if kept == lines:
+            return False
+        write_locked(path, "\n".join(kept) + "\n" if kept else "", mode=mode)
+        return True
+
+
+# ---------------------------------------------------------------------------
 #  policy 眼里的旧名字
 # ---------------------------------------------------------------------------
 
@@ -317,8 +542,22 @@ def file_hash(path: Path) -> str:
         return ""
 
 
+def file_stamp(path: Path) -> tuple[int, int, int] | None:
+    """不读内容的版本指纹：修改时间、大小和 inode，不存在是 None。按文件做缓存的地方都拿它比对。
+
+    保存都是同目录临时文件替换，每次换 inode：同一个时钟刻度里写进等长内容，只有 inode 认得出来。
+    """
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return info.st_mtime_ns, info.st_size, info.st_ino
+
+
 def _lock_path(path: Path) -> Path:
-    return path.with_name(f".{path.name}.lock")
+    # .env 这类本来就以点开头的，不再叠一个点。
+    name = path.name
+    return path.with_name(f"{name}.lock" if name.startswith(".") else f".{name}.lock")
 
 
 @contextlib.contextmanager
@@ -606,6 +845,7 @@ def ensure_layout(workspace_root: Path | str) -> LayoutReport:
     只复制不删：旧文件原样留着，退回旧版本时还能用；新位置已有的一概不覆盖。几个进程同时启动时只有一个在搬。
     """
     root = Path(workspace_root)
+    check_config_dir(root)
     (root / "data").mkdir(parents=True, exist_ok=True)
     with exclusive_lock(root / _LAYOUT_LOCK):
         if _marker_version(root) >= LAYOUT_VERSION:

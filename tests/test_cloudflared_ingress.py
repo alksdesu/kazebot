@@ -190,11 +190,11 @@ def test_a_bad_instance_name_never_matches(bad: str) -> None:
     assert not ingress.INSTANCE_ID.match(bad)
 
 
-@pytest.mark.parametrize("instance", ["Koki", "bot-2", "stickers", "../rong", ""])
+@pytest.mark.parametrize("instance", ["Koki", "bot-2", "stickers", "shared", "../rong", ""])
 def test_the_entry_point_refuses_a_name_it_should_not_touch(
     config: Path, calls: list[Any], monkeypatch: pytest.MonkeyPatch, instance: str,
 ) -> None:
-    # stickers 是数据根下的共享表情包库，不是实例。
+    # stickers 是数据根下的共享表情包库，shared 是共享配置组，都不是实例。
     monkeypatch.setattr(
         "sys.argv",
         ["cloudflared_ingress.py", "add", "--config", str(config), "--instance", instance, "--port", "8775"],

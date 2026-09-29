@@ -1,7 +1,7 @@
 // 人格页的模型字段。model 是上游 API 的字面量，前端无从校验 ——
 // 候选只能当提示，输入框必须继续收任意值，否则节点里在用的 $ENV{...} 会被界面挡死。
 // 连带覆盖 isNotFound：只有以 404 打头的错误才算「文件还没建」。
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -12,6 +12,7 @@ import {
   getNodes,
   getProviders,
   isNotFound,
+  updateNodeFileRaw,
   updateNodeRaw,
   type NodeFileInfo,
 } from '../api/supervisorClient';
@@ -26,6 +27,7 @@ vi.mock('../api/supervisorClient', async (importOriginal) => ({
   getNodeRaw: vi.fn(),
   getNodes: vi.fn(),
   getProviders: vi.fn(),
+  updateNodeFileRaw: vi.fn(),
   updateNodeRaw: vi.fn(),
 }));
 
@@ -84,12 +86,13 @@ beforeEach(() => {
   vi.clearAllMocks();
   useSettingsStore.setState({ adminToken: 'admin-token' });
   vi.mocked(getNodeFiles).mockResolvedValue([nodeFile('_persona.md')]);
-  vi.mocked(getNodeFileRaw).mockResolvedValue('人设正文');
-  vi.mocked(getNodeRaw).mockResolvedValue(ORCHESTRATOR_YAML);
+  vi.mocked(getNodeFileRaw).mockResolvedValue({ content: '人设正文', hash: 'persona-1' });
+  vi.mocked(getNodeRaw).mockResolvedValue({ content: ORCHESTRATOR_YAML, hash: 'node-1' });
   vi.mocked(getAllToolNames).mockResolvedValue(['read_file']);
   vi.mocked(getNodes).mockResolvedValue(NODES as any);
   vi.mocked(getProviders).mockResolvedValue(PROVIDERS as any);
-  vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true });
+  vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true, hash: 'node-2' });
+  vi.mocked(updateNodeFileRaw).mockResolvedValue({ ok: true, hash: 'persona-2' });
 });
 
 describe('认出「不存在」', () => {
@@ -264,5 +267,102 @@ describe('模型输入', () => {
 
     expect(modelBox()).toHaveAttribute('placeholder', '留空 = 跟随全局默认模型');
     expect(screen.getByText('$ENV{VAR}')).toBeInTheDocument();
+  });
+});
+
+describe('人设正文的保存基准', () => {
+  const editor = () => screen.getByRole('textbox', { name: '人设内容' });
+  // 一页两块各有一条底栏，「丢弃」得挑人设那一条。
+  const discard = () => within(screen.getByRole('button', { name: '保存人设' }).closest('div')!)
+    .getByRole('button', { name: '丢弃' });
+  const ready = async () => { render(<PersonaPage />); await waitFor(() => expect(editor()).toHaveValue('人设正文')); };
+
+  it('保存交回读到的那一版指纹，存完换成结果里的新指纹', async () => {
+    await ready();
+
+    fireEvent.change(editor(), { target: { value: '改了一版' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存人设' }));
+    await waitFor(() => expect(updateNodeFileRaw).toHaveBeenCalledOnce());
+    fireEvent.change(editor(), { target: { value: '又改一版' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存人设' }));
+    await waitFor(() => expect(updateNodeFileRaw).toHaveBeenCalledTimes(2));
+
+    expect(vi.mocked(updateNodeFileRaw).mock.calls.map((call) => call[3])).toEqual(['persona-1', 'persona-2']);
+  });
+
+  it('文件还没建时指纹是空串 —— 第一次保存要求它仍然不存在', async () => {
+    vi.mocked(getNodeFiles).mockResolvedValue([nodeFile('_persona.md', true)]);
+    render(<PersonaPage />);
+    await screen.findByText(isOnlyExample);
+
+    fireEvent.change(editor(), { target: { value: '头一份人设' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存人设' }));
+
+    await waitFor(() => expect(updateNodeFileRaw).toHaveBeenCalledOnce());
+    expect(vi.mocked(updateNodeFileRaw).mock.calls[0]).toEqual(['admin-token', '_persona.md', '头一份人设', '']);
+  });
+
+  it('指纹对不上时说清楚没保存，草稿留在手里', async () => {
+    vi.mocked(updateNodeFileRaw).mockRejectedValue(new Error('409 _persona.md 已被别处改过，刷新后再改'));
+    await ready();
+
+    fireEvent.change(editor(), { target: { value: '改了一版' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存人设' }));
+
+    expect(await screen.findByText('人设在打开之后被别处改过，没有保存：点「丢弃」读入最新内容，再把改动重做一遍。'))
+      .toBeInTheDocument();
+    expect(editor()).toHaveValue('改了一版');
+  });
+
+  it('别的失败照实说，不冒充成冲突', async () => {
+    vi.mocked(updateNodeFileRaw).mockRejectedValue(new Error('500 磁盘满了'));
+    await ready();
+
+    fireEvent.change(editor(), { target: { value: '改了一版' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存人设' }));
+
+    expect(await screen.findByText('500 磁盘满了')).toBeInTheDocument();
+  });
+
+  it('「丢弃」重读磁盘上现在那一份，而不是退回打开时的旧正文', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    await ready();
+    fireEvent.change(editor(), { target: { value: '改了一版' } });
+    vi.mocked(getNodeFileRaw).mockResolvedValue({ content: '别处刚写的人设', hash: 'persona-9' });
+
+    fireEvent.click(discard());
+
+    await waitFor(() => expect(editor()).toHaveValue('别处刚写的人设'));
+    expect(getNodeFileRaw).toHaveBeenCalledTimes(2);
+  });
+
+  it('「丢弃」被拒绝就不重读，草稿留着', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(false);
+    await ready();
+    fireEvent.change(editor(), { target: { value: '改了一版' } });
+
+    fireEvent.click(discard());
+
+    expect(editor()).toHaveValue('改了一版');
+    expect(getNodeFileRaw).toHaveBeenCalledOnce();
+  });
+});
+
+describe('模型那一块的合并保存', () => {
+  it('保存前现读节点文件，别处刚加的键不会被这边的旧底子盖掉', async () => {
+    const LATER = `${ORCHESTRATOR_YAML}max_steps: 12\n`;
+    vi.mocked(getNodeRaw)
+      .mockResolvedValueOnce({ content: ORCHESTRATOR_YAML, hash: 'node-1' })
+      .mockResolvedValue({ content: LATER, hash: 'node-9' });
+    render(<PersonaPage />);
+    await waitFor(() => expect(modelBox()).toHaveValue('$ENV{QQ_MAIN_MODEL}'));
+
+    fireEvent.change(modelBox(), { target: { value: 'gpt-4o' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存模型' }));
+
+    await waitFor(() => expect(updateNodeRaw).toHaveBeenCalledOnce());
+    const [, , written, base] = vi.mocked(updateNodeRaw).mock.calls[0];
+    expect(written).toBe(LATER.replace('model: $ENV{QQ_MAIN_MODEL}', 'model: gpt-4o'));
+    expect(base).toBe('node-9');
   });
 });

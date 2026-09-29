@@ -28,14 +28,14 @@ def read_features_raw(workspace_root: Path) -> dict[str, Any]:
     return config_files.read_raw(features_file(workspace_root))
 
 
-def write_features_raw(workspace_root: Path, content: str) -> dict[str, Any]:
+def write_features_raw(workspace_root: Path, content: str, *, base_hash: str | None = None) -> dict[str, Any]:
     path = features_file(workspace_root)
     document = config_files.parse_mapping(content)
     unknown = config_files.unknown_paths(document, (key.path for key in features_module().FEATURE_KEYS))
     if unknown:
         raise HTTPException(status_code=400, detail=_unknown_detail(workspace_root, unknown))
-    config_files.write_raw(path, content)
-    return {"ok": True, "warnings": []}
+    new_hash = config_files.write_raw(path, content, base_hash=base_hash)
+    return {"ok": True, "warnings": [], "hash": new_hash}
 
 
 def _unknown_detail(workspace_root: Path, unknown: list[str]) -> str:
@@ -131,10 +131,7 @@ def create_feature_config_router(workspace_root: Path, config: Any) -> APIRouter
 
     @router.put("/config/raw")
     def put_raw(payload: RawConfig) -> dict[str, Any]:
-        result = write_features_raw(workspace_root, payload.content)
-        # 同一个 mtime 刻度里写进等长内容时指纹不变，缓存得手动作废。
-        config.invalidate()
-        return result
+        return write_features_raw(workspace_root, payload.content, base_hash=payload.base_hash)
 
     @router.get("/config/state")
     def get_state() -> dict[str, Any]:

@@ -13,8 +13,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import config_layout
 from clonoth_sdk.feature_paths import validate_feature_path
-from engine.eventlog_rotation import eventlog_file_lock
 from platforms.builtin import QQ_NAPCAT
 from platforms.registry import platform_config_path
 from providers import registry
@@ -187,7 +187,7 @@ def test_operations_status_instances_and_diagnostics_remain_available(operations
 def service(root):
     secret = SimpleNamespace(provider="missing", model="", base_url="https://example.invalid/v1", api_key="synthetic-config-secret")
     state = SimpleNamespace(workspace_root=root, tasks={}, _lock=threading.RLock(), _task_terminal=lambda _: False,
-        feature_config_store=SimpleNamespace(get_openai_secret=lambda: secret))
+        feature_config_store=SimpleNamespace(get_openai_secret=lambda: secret, load_error=""))
     return OperationsService(state), secret
 
 
@@ -299,6 +299,7 @@ def test_encoded_feature_paths_still_cannot_change_routing(path):
 
 
 def test_existing_raw_config_writer_keeps_transaction_lock(tmp_path, monkeypatch):
+    # 和 config/ 下其余配置同一把锁：共享组里几个实例的控制台改的是同一份文件。
     monkeypatch.setattr("supervisor.admin_api.verify_admin_token", lambda: None)
     app = FastAPI()
     app.include_router(create_admin_router(tmp_path))
@@ -311,7 +312,7 @@ def test_existing_raw_config_writer_keeps_transaction_lock(tmp_path, monkeypatch
         with TestClient(app) as client:
             return client.put("/qq/raw", json={"content": "queue:\n  workers: 3\n"})
     with ThreadPoolExecutor(max_workers=1) as pool:
-        with eventlog_file_lock(path):
+        with config_layout.locked(path):
             pending = pool.submit(update)
             assert started.wait(1)
             time.sleep(0.2)

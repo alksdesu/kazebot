@@ -65,21 +65,8 @@ if __name__ == "__main__":
         print(json.dumps({"ok": False, "error": message, "data": {"result": f"ERROR: {message}"}}, ensure_ascii=False))
         sys.exit(1)
 
-    def load_dotenv() -> dict[str, str]:
-        env_path = Path(os.getcwd()) / ".env"
-        values: dict[str, str] = {}
-        if not env_path.is_file():
-            return values
-        try:
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                values[key.strip()] = value.strip().strip("'\"")
-        except Exception:
-            return {}
-        return values
+    # 本实例 .env 盖在共享密钥文件上面：判断配没配 Exa/X 的密钥时，组里共用的那几把也算。
+    from _channel import dotenv_values as load_dotenv
 
     def has_config_key(dotenv: dict[str, str], *names: str) -> bool:
         for name in names:

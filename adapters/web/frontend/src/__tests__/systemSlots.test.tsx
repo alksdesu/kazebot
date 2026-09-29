@@ -145,7 +145,7 @@ describe('保存', () => {
     expect(vi.mocked(updateSystemModel).mock.calls[0][2].base_url).toBe('');
   });
 
-  it('生图槽位提交的 provider 恒为空', async () => {
+  it('生图槽位只提交改过的那一项，本来就没有的 provider 不掺进去', async () => {
     render1();
     await screen.findByText('系统槽位');
     fireEvent.change(within(rowFor('生图（GPT）')).getByLabelText('生图（GPT） 模型'), {
@@ -154,7 +154,22 @@ describe('保存', () => {
     save();
 
     await waitFor(() => expect(updateSystemModel).toHaveBeenCalled());
-    expect(vi.mocked(updateSystemModel).mock.calls[0][2].provider).toBe('');
+    expect(vi.mocked(updateSystemModel).mock.calls[0][2]).toEqual({ model: 'gpt-image-3' });
+  });
+
+  it('不收 provider 的槽位存着残留值时，提交空串把它清掉', async () => {
+    const stale = structuredClone(SLOTS);
+    stale.slots = stale.slots.map((item) => (item.key === 'image_gpt' ? { ...item, provider: 'deepseek' } : item));
+    vi.mocked(getSystemModels).mockResolvedValue(stale as any);
+    render1();
+    await screen.findByText('系统槽位');
+    fireEvent.change(within(rowFor('生图（GPT）')).getByLabelText('生图（GPT） 模型'), {
+      target: { value: 'gpt-image-3' },
+    });
+    save();
+
+    await waitFor(() => expect(updateSystemModel).toHaveBeenCalled());
+    expect(vi.mocked(updateSystemModel).mock.calls[0][2]).toEqual({ model: 'gpt-image-3', provider: '' });
   });
 
   it('引擎槽位能选渠道并提交', async () => {

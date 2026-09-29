@@ -87,21 +87,21 @@ describe('admin API infrastructure wrappers', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(getRuntimeRaw('admin-token')).resolves.toBe('value: 1\n');
-    await expect(getPolicyRaw('admin-token')).resolves.toBe('value: 1\n');
-    await expect(getSchedulesRaw('admin-token')).resolves.toBe('value: 1\n');
-    await expect(getNodeRaw('admin-token', 'node/a')).resolves.toBe('value: 1\n');
-    await expect(getToolRaw('admin-token', 'tool/a')).resolves.toBe('value: 1\n');
-    await expect(getSkillRaw('admin-token', 'skill/a')).resolves.toBe('value: 1\n');
-    await expect(getMcpClientsRaw('admin-token')).resolves.toBe('value: 1\n');
+    await expect(getRuntimeRaw('admin-token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
+    await expect(getPolicyRaw('admin-token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
+    await expect(getSchedulesRaw('admin-token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
+    await expect(getNodeRaw('admin-token', 'node/a')).resolves.toEqual({ content: 'value: 1\n', hash: null });
+    await expect(getToolRaw('admin-token', 'tool/a')).resolves.toEqual({ content: 'value: 1\n', hash: null });
+    await expect(getSkillRaw('admin-token', 'skill/a')).resolves.toEqual({ content: 'value: 1\n', hash: null });
+    await expect(getMcpClientsRaw('admin-token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
 
-    await updateRuntimeRaw('admin-token', 'runtime: true\n');
-    await updatePolicyRaw('admin-token', 'policy: true\n');
-    await updateSchedulesRaw('admin-token', 'schedules: []\n');
-    await updateNodeRaw('admin-token', 'node/a', 'id: node/a\n');
-    await updateToolRaw('admin-token', 'tool/a', 'print("ok")\n');
-    await updateSkillRaw('admin-token', 'skill/a', '# Skill\n');
-    await updateMcpClientsRaw('admin-token', 'clients: {}\n');
+    await updateRuntimeRaw('admin-token', 'runtime: true\n', null);
+    await updatePolicyRaw('admin-token', 'policy: true\n', null);
+    await updateSchedulesRaw('admin-token', 'schedules: []\n', null);
+    await updateNodeRaw('admin-token', 'node/a', 'id: node/a\n', null);
+    await updateToolRaw('admin-token', 'tool/a', 'print("ok")\n', null);
+    await updateSkillRaw('admin-token', 'skill/a', '# Skill\n', null);
+    await updateMcpClientsRaw('admin-token', 'clients: {}\n', null);
 
     // Every read init now carries a deadline signal, so expect.any(Object) proved nothing about auth.
     const readInit = { headers: { Authorization: 'Bearer admin-token' }, signal: expect.any(AbortSignal) };

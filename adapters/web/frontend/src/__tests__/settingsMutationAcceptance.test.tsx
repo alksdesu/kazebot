@@ -53,13 +53,15 @@ it.each([
 
 it('creates a disabled schedule and preserves existing ownership and root metadata', async () => {
   let raw = 'root_extra: preserve\nschedules:\n - id: owned\n   created_by: qq:123\n';
-  vi.mocked(api.getSchedulesRaw).mockImplementation(async () => raw);
-  vi.mocked(api.updateSchedulesRaw).mockImplementation(async (_, next) => { raw = next; });
+  vi.mocked(api.getSchedulesRaw).mockImplementation(async () => ({ content: raw, hash: 'schedules-1' }));
+  vi.mocked(api.updateSchedulesRaw).mockImplementation(async (_, next) => { raw = next; return { ok: true, hash: 'schedules-2' }; });
   render(<AutomationSettingsPage />);
   await screen.findByText('owned');
   fireEvent.change(screen.getByLabelText('创建定时任务'), { target: { value: 'new_schedule' } });
   fireEvent.click(screen.getByRole('button', { name: '创建任务' }));
   await waitFor(() => expect(api.updateSchedulesRaw).toHaveBeenCalledOnce());
+  // 建之前先读一遍，写回去带的是那一版的指纹。
+  expect(vi.mocked(api.updateSchedulesRaw).mock.calls[0][2]).toBe('schedules-1');
   expect(yaml.load(raw)).toMatchObject({ root_extra: 'preserve', schedules: [
     { id: 'owned', created_by: 'qq:123' }, { id: 'new_schedule', enabled: false },
   ] });
@@ -67,7 +69,7 @@ it('creates a disabled schedule and preserves existing ownership and root metada
 });
 
 it('does not create over a structurally invalid schedules document', async () => {
-  vi.mocked(api.getSchedulesRaw).mockResolvedValue('schedules: {not: a list}');
+  vi.mocked(api.getSchedulesRaw).mockResolvedValue({ content: 'schedules: {not: a list}', hash: 'schedules-1' });
   render(<AutomationSettingsPage />);
   await screen.findByText(/schedules 必须/);
   fireEvent.change(screen.getByLabelText('创建定时任务'), { target: { value: 'new_schedule' } });
@@ -77,8 +79,8 @@ it('does not create over a structurally invalid schedules document', async () =>
 });
 
 it('refreshes skill quick fields after raw save and preserves unknown frontmatter and Markdown', async () => {
-  vi.mocked(api.getSkillRaw).mockResolvedValue('---\nname: test\nstrategy: normal\nkeywords: []\n---\nbody\n');
-  vi.mocked(api.updateSkillRaw).mockResolvedValue(undefined);
+  vi.mocked(api.getSkillRaw).mockResolvedValue({ content: '---\nname: test\nstrategy: normal\nkeywords: []\n---\nbody\n', hash: 'skill-1' });
+  vi.mocked(api.updateSkillRaw).mockResolvedValue({ ok: true, hash: 'skill-2' });
   useSettingsSelectionStore.setState({ selectedSkill: { name: 'test', enabled: true, strategy: 'normal', keywords: [] } });
   render(<SkillsSettingsRightPanel />);
   const raw = await screen.findByLabelText('技能 Raw Markdown 编辑器');
@@ -97,8 +99,11 @@ it('refreshes skill quick fields after raw save and preserves unknown frontmatte
 
 it('keeps commas and newlines in MCP arguments when only description is edited', async () => {
   const args = ['one,two', 'three\nfour'];
-  vi.mocked(api.getMcpClientsRaw).mockResolvedValue(yaml.dump({ clients: { a: { transport: 'stdio', command: 'synthetic', args } } }));
-  vi.mocked(api.updateMcpClientsRaw).mockResolvedValue(undefined);
+  vi.mocked(api.getMcpClientsRaw).mockResolvedValue({
+    content: yaml.dump({ clients: { a: { transport: 'stdio', command: 'synthetic', args } } }),
+    hash: 'mcp-1',
+  });
+  vi.mocked(api.updateMcpClientsRaw).mockResolvedValue({ ok: true, hash: 'mcp-2' });
   useSettingsSelectionStore.setState({ selectedMcpClient: { id: 'a', transport: 'stdio', enabled: true } });
   render(<McpSettingsRightPanel />);
   fireEvent.change(await screen.findByLabelText('description'), { target: { value: 'new description' } });

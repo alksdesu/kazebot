@@ -16,8 +16,8 @@ OWNER=kazebot
 MAIN="${1:-}"
 MAIN_QQ="${2:-}"
 [[ "$MAIN" =~ ^([a-z][a-z0-9_]{1,31}|[1-9][0-9]{4,10})$ ]] || { echo "用法: $0 <主实例名> [主实例QQ号]" >&2; exit 2; }
-# 数据根下的共享表情包库占着这个名字。
-[ "$MAIN" != stickers ] || { echo "实例名不能叫 stickers" >&2; exit 2; }
+# 数据根下的共享表情包库和共享配置组占着这两个名字。
+case "$MAIN" in stickers|shared) echo "实例名不能叫 $MAIN" >&2; exit 2 ;; esac
 if [[ -z "$MAIN_QQ" && "$MAIN" =~ ^[0-9]+$ ]]; then MAIN_QQ="$MAIN"; fi
 [[ -z "$MAIN_QQ" || "$MAIN_QQ" =~ ^[0-9]+$ ]] || { echo "QQ 号必须是数字" >&2; exit 2; }
 
@@ -49,6 +49,8 @@ install -m 0644 -o root -g root \
 
 echo "==> 准备 $DATA_ROOT"
 install -d -m 0755 -o "$OWNER" -g "$OWNER" "$DATA_ROOT"
+# 共享配置组放这下面；组里有模型密钥，只给属主进。
+install -d -m 0700 -o "$OWNER" -g "$OWNER" "$DATA_ROOT/shared"
 
 echo "==> 表情包库软链到共享目录"
 install -d -m 0755 -o "$OWNER" -g "$OWNER" "$DATA_ROOT/stickers"
@@ -79,6 +81,11 @@ install -d -m 0755 /etc/systemd/system/kazebot-qq.service.d
 cat >/etc/systemd/system/kazebot-qq.service.d/10-stickers.conf <<EOF
 [Service]
 ReadWritePaths=$DATA_ROOT/stickers
+EOF
+# 主实例加入共享配置组后 config/ 是指到 $DATA_ROOT/shared 下的链接，bot 同步收藏表情时要往里写。
+cat >/etc/systemd/system/kazebot-qq.service.d/20-shared-config.conf <<EOF
+[Service]
+ReadWritePaths=-$DATA_ROOT/shared
 EOF
 
 systemctl daemon-reload

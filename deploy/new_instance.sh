@@ -14,8 +14,8 @@ INSTANCE="${1:-}"
 LABEL="${2:-}"
 QQ="${3:-}"
 [[ "$INSTANCE" =~ ^([a-z][a-z0-9_]{1,31}|[1-9][0-9]{4,10})$ ]] || { echo "用法: $0 <实例名> [标签] [QQ号]" >&2; exit 2; }
-# 数据根下的共享表情包库占着这个名字。
-[ "$INSTANCE" != stickers ] || { echo "实例名不能叫 stickers" >&2; exit 2; }
+# 数据根下的共享表情包库和共享配置组占着这两个名字。
+case "$INSTANCE" in stickers|shared) echo "实例名不能叫 $INSTANCE" >&2; exit 2 ;; esac
 if [[ -z "$QQ" && "$INSTANCE" =~ ^[0-9]+$ ]]; then QQ="$INSTANCE"; fi
 [[ -z "$QQ" || "$QQ" =~ ^[0-9]+$ ]] || { echo "QQ 号必须是数字" >&2; exit 2; }
 [ -x /usr/local/lib/kazebot/provision_instance.sh ] \

@@ -12,6 +12,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
+import config_layout
 from clonoth_runtime import get_int, load_runtime_config
 
 from ..context import ToolContext
@@ -125,11 +126,19 @@ def _collect_files(root: Path, pattern: str, max_file_size: int, workspace: Path
     For paths under *workspace*, rel_posix is workspace-relative.
     For paths under extra_roots (outside workspace), rel_posix is the absolute path.
     """
+    # root 已经解析到底；共享组配置、多开实例的代码目录经受信链接通到工作区外，只算一次它在工作区里叫什么。
+    base = config_layout.workspace_logical_path(workspace, root)
+
     def _rel(p: Path) -> str:
+        if base is None:
+            return p.as_posix()
         try:
-            return p.relative_to(workspace).as_posix()
+            tail = p.relative_to(root).as_posix()
         except ValueError:
             return p.as_posix()
+        if tail == ".":
+            return base
+        return tail if base == "." else f"{base}/{tail}"
 
     if root.is_file():
         rel = _rel(root)

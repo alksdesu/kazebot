@@ -233,6 +233,8 @@ class PolicyUpdateIn(BaseModel):
     """整份替换 policy。部分更新会让"删掉一条规则"没法表达。"""
 
     policy: dict[str, Any]
+    # 打开编辑器时读到的指纹。给了就先比对，中途被共享组里别的实例改过就 409，一个字节都不写。
+    base_hash: str | None = None
 
 
 class AccountSwitchIn(BaseModel):

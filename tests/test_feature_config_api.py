@@ -18,6 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import config_layout  # noqa: E402
 import supervisor.admin_api as admin_api  # noqa: E402
 from adapters._shared import features  # noqa: E402
 from platforms.descriptor import CHANNEL_GROUP, ChannelDescriptor, PlatformDescriptor  # noqa: E402
@@ -120,7 +121,7 @@ class TestAuth:
 
 class TestRaw:
     def test_an_absent_file_is_a_normal_state(self, call: Any) -> None:
-        assert call("GET", f"{_BASE}/raw").json() == {"content": "", "exists": False}
+        assert call("GET", f"{_BASE}/raw").json() == {"content": "", "exists": False, "hash": ""}
 
     def test_it_never_serves_the_example_as_the_current_file(self, call: Any, tmp_path: Path) -> None:
         example = tmp_path / "config" / "features.example.yaml"
@@ -135,9 +136,10 @@ class TestRaw:
         response = _put(call, content)
 
         assert response.status_code == 200
-        assert response.json() == {"ok": True, "warnings": []}
+        written = config_layout.file_hash(_features_path(tmp_path))
+        assert response.json() == {"ok": True, "warnings": [], "hash": written}
         assert _features_path(tmp_path).read_text(encoding="utf-8") == content
-        assert call("GET", f"{_BASE}/raw").json() == {"content": content, "exists": True}
+        assert call("GET", f"{_BASE}/raw").json() == {"content": content, "exists": True, "hash": written}
 
     def test_the_path_override_is_honoured(self, call: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         elsewhere = tmp_path / "elsewhere" / "shared.yaml"
@@ -353,7 +355,7 @@ class TestState:
         assert body["state"]["loaded"] != body["file"]
 
     def test_a_same_size_rewrite_in_the_same_tick_is_still_picked_up(self, call: Any, tmp_path: Path) -> None:
-        """写完不作废缓存的话，mtime 粒度看不出这次改动，界面会一直显示旧值。"""
+        """mtime 粒度看不出这次改动，认出来靠的是 inode：写入是换文件落盘。"""
         _put(call, "queue:\n  workers: 4\n")
         assert _state(call)["state"]["values"]["queue_workers"] == 4
         stamp = _features_path(tmp_path).stat().st_mtime_ns

@@ -26,6 +26,10 @@ const GLOBAL = '__global__';
 
 const say = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
+const readScope = (token: string, scope: string) => (
+  scope === GLOBAL ? getRuntimeRaw(token) : getNodeRaw(token, scope)
+);
+
 interface NodeChoice {
   id: string;
   provider: string;
@@ -78,9 +82,9 @@ const ModelsPageEditor = () => {
     setRaw(''); setLoading(true);
     void (async () => {
       try {
-        const body = scope === GLOBAL ? await getRuntimeRaw(token) : await getNodeRaw(token, scope);
+        const file = await readScope(token, scope);
         if (cancelled) return;
-        setRaw(body);
+        setRaw(file.content);
         setNote('');
       } catch (error) {
         if (cancelled) return;
@@ -134,13 +138,15 @@ const ModelsPageEditor = () => {
     if (!token || !raw || busy || loading) return;
     setBusy(true);
     try {
-      let next = raw;
+      // 只写改过的键，合并到现读的这一版上：别处改的其他键留着，读和写之间又被改了才报冲突。
+      const latest = await readScope(token, scope);
+      let next = latest.content;
       for (const spec of specs) {
         if (!(spec.key in edits)) continue;
         next = upsertYamlNested(next, pathFor(spec.key), toYamlScalar(spec, edits[spec.key]));
       }
-      if (scope === GLOBAL) await updateRuntimeRaw(token, next);
-      else await updateNodeRaw(token, scope, next);
+      if (scope === GLOBAL) await updateRuntimeRaw(token, next, latest.hash);
+      else await updateNodeRaw(token, scope, next, latest.hash);
       setRaw(next);
       setEdits({});
       setNote(scope === GLOBAL

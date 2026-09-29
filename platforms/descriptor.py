@@ -284,6 +284,8 @@ class PlatformDescriptor:
     private_files: tuple[str, ...] = ()
     # 多开时这个平台的进程在每个实例里要占的端口。序号 0 必须等于单实例部署原有的那组，已有部署才不用改端口。
     instance_ports: tuple[InstancePort, ...] = ()
+    # 建实例时 instance_env 钩子写进 .env 的变量名。端口、监听地址、连接令牌都是实例身份，共享组里不能跟着配置走。
+    instance_env: tuple[str, ...] = ()
     # 平台进程的入口脚本（相对工作区）。和 engine/** 一样是重启即执行的代码，policy 默认要审批才能改。
     entrypoints: tuple[str, ...] = ()
 
@@ -310,6 +312,9 @@ class PlatformDescriptor:
         port_names = [port.name for port in self.instance_ports]
         if len(port_names) != len(set(port_names)):
             raise ValueError(f"duplicate instance port names in platform {self.id!r}")
+        bad_env = [name for name in self.instance_env if not _ENV_NAME.match(name)]
+        if bad_env:
+            raise ValueError(f"platform {self.id!r} instance env names must be UPPER_SNAKE_CASE: {bad_env}")
         for kind, patterns in (
             ("secret_files", self.secret_files),
             ("owned_files", self.owned_files),
@@ -327,7 +332,7 @@ class PlatformDescriptor:
         object.__setattr__(self, "state_files", MappingProxyType(dict(self.state_files)))
         object.__setattr__(self, "state_env", MappingProxyType(dict(self.state_env)))
         object.__setattr__(self, "hooks", MappingProxyType(dict(self.hooks)))
-        for name in ("secrets", "secret_files", "owned_files", "private_files", "instance_ports", "entrypoints"):
+        for name in ("secrets", "secret_files", "owned_files", "private_files", "instance_ports", "instance_env", "entrypoints"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
 
     def _check_movable_file(self, what: str, path: str, env: str) -> None:

@@ -66,7 +66,7 @@ const LISTED_YAML = [
 ].join('\n');
 
 const renderPanel = (raw: string) => {
-  vi.mocked(api.getNodeRaw).mockResolvedValue(raw);
+  vi.mocked(api.getNodeRaw).mockResolvedValue({ content: raw, hash: 'node-1' });
   useSettingsSelectionStore.setState({ selectedNode: { id: 'qq.orchestrator', type: 'ai' } });
   return render(<AgentsSettingsRightPanel />);
 };
@@ -93,7 +93,7 @@ beforeEach(() => {
   vi.mocked(api.getProviders).mockResolvedValue({
     registered: [], providers: {}, active_provider: '', fallbacks: [], node_fallbacks: {}, reserved_names: [],
   } as any);
-  vi.mocked(api.updateNodeRaw).mockResolvedValue({ ok: true });
+  vi.mocked(api.updateNodeRaw).mockResolvedValue({ ok: true, hash: 'node-2' });
 });
 
 describe('serializeNodeConfig', () => {
@@ -164,7 +164,7 @@ describe('节点面板的保存提示', () => {
 
 describe('节点面板的来源提示', () => {
   const renderNode = (source?: api.OverlaySource) => {
-    vi.mocked(api.getNodeRaw).mockResolvedValue(NODE_YAML);
+    vi.mocked(api.getNodeRaw).mockResolvedValue({ content: NODE_YAML, hash: 'node-1' });
     useSettingsSelectionStore.setState({ selectedNode: { id: 'qq.orchestrator', type: 'ai', source } });
     render(<AgentsSettingsRightPanel />);
   };

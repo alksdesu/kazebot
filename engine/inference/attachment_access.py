@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import config_layout
 from toolbox._common import request_guard
 
 from ..attachments import is_allowed_attachment_path
@@ -34,16 +35,16 @@ def _unique_paths(paths: Any) -> list[str]:
 
 
 def _workspace_relative(workspace_root: Path, path: str) -> str | None:
-    """指向工作区内现成文件时，返回解析后的工作区相对路径；否则 None。"""
+    """指向工作区内现成文件时，返回解析后的工作区相对路径（经受信链接的按链接名写）；否则 None。"""
     candidate = Path(path)
     if not candidate.is_absolute():
         candidate = workspace_root / candidate
     try:
         resolved = candidate.resolve()
-        relative = resolved.relative_to(workspace_root.resolve())
-    except (OSError, ValueError):
+    except (OSError, RuntimeError):
         return None
-    return relative.as_posix() if resolved.is_file() else None
+    relative = config_layout.workspace_logical_path(workspace_root, resolved)
+    return relative if relative is not None and resolved.is_file() else None
 
 
 def _collected_paths(ls: _LoopState, workspace_root: Path) -> tuple[set[str], set[str]]:

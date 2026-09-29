@@ -50,7 +50,7 @@ const modelOptions = (container: HTMLElement) => {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  vi.mocked(getNodeRaw).mockResolvedValue(NODE_YAML);
+  vi.mocked(getNodeRaw).mockResolvedValue({ content: NODE_YAML, hash: 'node-1' });
   vi.mocked(getNodes).mockResolvedValue(NODES as any);
   vi.mocked(getProviders).mockResolvedValue(PROVIDERS as any);
   vi.mocked(listUpstreamModels).mockResolvedValue([]);
@@ -158,7 +158,7 @@ describe('渠道下拉', () => {
   });
 
   it('yaml 里手写的野名字照样列出来，不会被悄悄改掉', async () => {
-    vi.mocked(getNodeRaw).mockResolvedValue(NODE_YAML + 'provider: some-relay\n');
+    vi.mocked(getNodeRaw).mockResolvedValue({ content: `${NODE_YAML}provider: some-relay\n`, hash: 'node-1' });
     selectNode();
     render(<AgentsSettingsRightPanel />);
 

@@ -140,9 +140,11 @@ describe('configuration preservation', () => {
 
 describe('editor identity and draft protection', () => {
   it('does not enable saving stale node-file contents while the next file loads', async () => {
-    const request = deferred<string>();
+    const request = deferred<api.RawText>();
     vi.mocked(api.getNodeFiles).mockResolvedValue(['a.yaml', 'b.yaml'].map(name => ({ name, path: name, kind: 'node', size: 1, is_example: false, suffix: '.yaml', base_name: name, updated_at: 0, source: 'custom' as const, same_as_default: false })));
-    vi.mocked(api.getNodeFileRaw).mockImplementation(async (_, name) => name === 'a.yaml' ? 'id: a' : request.promise);
+    vi.mocked(api.getNodeFileRaw).mockImplementation(async (_, name) => (
+      name === 'a.yaml' ? { content: 'id: a', hash: 'a-1' } : request.promise
+    ));
     render(<NodeFilesSettingsPage />);
     await waitFor(() => expect(screen.getByLabelText('文件内容')).toHaveValue('id: a'));
     fireEvent.change(screen.getByLabelText('当前文件'), { target: { value: 'b.yaml' } });
@@ -153,10 +155,10 @@ describe('editor identity and draft protection', () => {
     expect(api.updateNodeFileRaw).not.toHaveBeenCalled();
   });
   it('keeps the later selected node untouched by the previous node save', async () => {
-    const request = deferred<void>();
+    const request = deferred<api.RawSaveResult>();
     vi.mocked(api.getNodes).mockResolvedValue([]);
     vi.mocked(api.getProviders).mockResolvedValue({ registered: [], providers: {}, active_provider: '', fallbacks: [], node_fallbacks: {}, reserved_names: [] });
-    vi.mocked(api.getNodeRaw).mockImplementation(async (_, id) => `id: ${id}\nname: ${id}`);
+    vi.mocked(api.getNodeRaw).mockImplementation(async (_, id) => ({ content: `id: ${id}\nname: ${id}`, hash: `${id}-1` }));
     vi.mocked(api.updateNodeRaw).mockReturnValue(request.promise);
     useSettingsSelectionStore.setState({ selectedNode: { id: 'a', type: 'ai' } });
     render(<AgentsSettingsRightPanel />);
@@ -166,11 +168,11 @@ describe('editor identity and draft protection', () => {
     expect(screen.getByLabelText('名称')).toBeDisabled();
     act(() => useSettingsSelectionStore.getState().setSelectedNode({ id: 'b', type: 'ai' }));
     await waitFor(() => expect(screen.getByLabelText('名称')).toHaveValue('b'));
-    await act(async () => request.resolve());
+    await act(async () => request.resolve({ ok: true, hash: 'saved' }));
     expect(screen.getByLabelText('名称')).toHaveValue('b');
   });
   it('refuses a same-page schedule selection when discarding dirty fields is rejected', async () => {
-    vi.mocked(api.getSchedulesRaw).mockResolvedValue('schedules:\n - id: a\n   text: original\n - id: b\n');
+    vi.mocked(api.getSchedulesRaw).mockResolvedValue({ content: 'schedules:\n - id: a\n   text: original\n - id: b\n', hash: 'schedules-1' });
     useSettingsSelectionStore.setState({ selectedScheduleId: 'a' });
     render(<AutomationSettingsRightPanel />);
     const field = await screen.findByLabelText('text');
@@ -186,17 +188,19 @@ describe('shared QQ apply transaction', () => {
   const seed = () => platformConsoleStore('qq').setState({ live: { published: true, applied: true, file: { exists: true, size: 1, mtime_ns: 1 }, state: { values: { a: true, b: true }, paths: { a: 'signals.a', b: 'signals.b' } } } });
   it('preserves edits made while saving, including a revert to the formerly applied value', async () => {
     seed();
-    const request = deferred<{ ok: boolean; warnings: string[] }>();
+    const request = deferred<api.ConfigSaveResult>();
     let content = 'other: latest\n';
-    vi.mocked(api.getPlatformRaw).mockImplementation(async () => ({ content, exists: true }));
+    vi.mocked(api.getPlatformRaw).mockImplementation(async () => ({ content, hash: 'platform-1', exists: true }));
     vi.mocked(api.updatePlatformRaw).mockImplementation(async (_token, _platform, raw) => { content = raw; return request.promise; });
     vi.mocked(api.getPlatformState).mockRejectedValue(new Error('heartbeat unavailable'));
     platformConsoleStore('qq').getState().setDraft('a', false);
     const operation = platformConsoleStore('qq').getState().apply('synthetic');
     await waitFor(() => expect(api.updatePlatformRaw).toHaveBeenCalledOnce());
+    // 合并的底子是刚读回来那一版，指纹跟着它交回去。
+    expect(vi.mocked(api.updatePlatformRaw).mock.calls[0][3]).toBe('platform-1');
     platformConsoleStore('qq').getState().setDraft('a', true);
     platformConsoleStore('qq').getState().setDraft('b', false);
-    request.resolve({ ok: true, warnings: [] });
+    request.resolve({ ok: true, hash: 'platform-2', warnings: [] });
     await operation;
     expect(platformConsoleStore('qq').getState().draft).toEqual({ a: true, b: false });
     expect(platformConsoleStore('qq').getState().raw).toContain('other: latest');
@@ -208,7 +212,7 @@ describe('shared QQ apply transaction', () => {
   });
   it('never PUTs over malformed YAML and keeps the draft for repair', async () => {
     seed();
-    vi.mocked(api.getPlatformRaw).mockResolvedValue({ content: 'signals: [', exists: true });
+    vi.mocked(api.getPlatformRaw).mockResolvedValue({ content: 'signals: [', hash: 'platform-1', exists: true });
     platformConsoleStore('qq').getState().setDraft('a', false);
     await platformConsoleStore('qq').getState().apply('synthetic');
     expect(api.updatePlatformRaw).not.toHaveBeenCalled();

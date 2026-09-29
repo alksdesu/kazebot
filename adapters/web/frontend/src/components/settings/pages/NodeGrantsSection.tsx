@@ -256,12 +256,12 @@ const NodeRow = ({ node, tools, onSaved }: {
     setBusy(true);
     setMessage('');
     try {
-      const raw = await getNodeRaw(adminToken, node.id);
+      const file = await getNodeRaw(adminToken, node.id);
       if (tokenChanged(adminToken)) return;
-      let next = upsertYamlNested(raw, ['tool_access', 'mode'], mode);
+      let next = upsertYamlNested(file.content, ['tool_access', 'mode'], mode);
       if (mode === 'allowlist') next = upsertYamlList(next, ['tool_access', 'allow'], allow);
       if (mode === 'all') next = upsertYamlList(next, ['tool_access', 'deny'], deny);
-      await updateNodeRaw(adminToken, node.id, next);
+      await updateNodeRaw(adminToken, node.id, next, file.hash);
       if (tokenChanged(adminToken)) return;
       setMessage('已保存，下一个任务即生效');
       onSaved();

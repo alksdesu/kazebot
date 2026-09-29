@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import yaml
-
+import config_layout
+from clonoth_runtime import get_int, load_yaml_dict
 from engine.conversation_migration import (
     ConversationRekey,
     RekeyCount,
@@ -53,9 +53,6 @@ class ReminderService:
         self.state = state
         self.path = reminders_path(state.workspace_root)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        config_path = Path(state.workspace_root) / "config/reminders.yaml"
-        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
-        self.max_open = max(1, min(int((config or {}).get("max_open_per_owner", 50)), 500))
         with self.connection() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
@@ -76,6 +73,12 @@ class ReminderService:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._tick_lock = threading.Lock()
+
+    @property
+    def max_open(self) -> int:
+        """每人最多同时留几条未完成的提醒。每次取值都重读 config/reminders.yaml：共享组里别的实例也会改它；填的不是数按默认算。"""
+        config = load_yaml_dict(config_layout.config_dir(self.state.workspace_root) / "reminders.yaml") or {}
+        return get_int(config, "max_open_per_owner", 50, min_value=1, max_value=500)
 
     @contextmanager
     def connection(self):

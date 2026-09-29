@@ -89,8 +89,8 @@ const ALIASED_CHARACTERS_YAML = [
 ].join('\n');
 
 const bundle = (settings = SETTINGS_YAML, characters = CHARACTERS_YAML): DrawtoolsBundle => ({
-  settings: { content: settings, exists: true, path: 'config/drawtools/settings.yaml' },
-  character_tags: { content: characters, exists: true, path: 'config/drawtools/character_tags.yaml' },
+  settings: { content: settings, hash: 'settings-1', exists: true, path: 'config/drawtools/settings.yaml' },
+  character_tags: { content: characters, hash: 'characters-1', exists: true, path: 'config/drawtools/character_tags.yaml' },
   prompts: {},
 });
 
@@ -136,11 +136,11 @@ beforeEach(() => {
   vi.spyOn(window, 'confirm').mockReturnValue(true);
   useSettingsStore.setState({ adminToken: 'admin-token', isAuthenticated: true });
   serve(bundle());
-  vi.mocked(api.getNodeRaw).mockResolvedValue('id: draw.novelai_planner\n');
+  vi.mocked(api.getNodeRaw).mockResolvedValue({ content: 'id: draw.novelai_planner\n', hash: 'planner-1' });
   vi.mocked(api.initDrawtoolsConfigs).mockResolvedValue({ ok: true, created: [] });
-  vi.mocked(api.updateDrawtoolsSettingsRaw).mockResolvedValue({ ok: true });
-  vi.mocked(api.updateDrawtoolsCharactersRaw).mockResolvedValue({ ok: true });
-  vi.mocked(api.updateNodeRaw).mockResolvedValue({ ok: true });
+  vi.mocked(api.updateDrawtoolsSettingsRaw).mockResolvedValue({ ok: true, hash: 'settings-2' });
+  vi.mocked(api.updateDrawtoolsCharactersRaw).mockResolvedValue({ ok: true, hash: 'characters-2' });
+  vi.mocked(api.updateNodeRaw).mockResolvedValue({ ok: true, hash: 'planner-2' });
 });
 
 describe('绘图设置的结构化写回', () => {
@@ -342,6 +342,77 @@ describe('绘图设置的提示存活', () => {
   });
 });
 
+describe('每一份配置带自己的指纹', () => {
+  const withPrompts = (): DrawtoolsBundle => ({
+    ...bundle(),
+    prompts: {
+      top_system: { content: 'top\n', hash: 'top-1', exists: true },
+      output_format: { content: 'fmt\n', hash: 'fmt-1', exists: true },
+    },
+  });
+
+  it('原文编辑器保存的是当前分区那一份的指纹', async () => {
+    render(<DrawtoolsSettingsPage />);
+    await waitFor(() => expect(rawEditor()).toHaveValue(SETTINGS_YAML));
+
+    fireEvent.change(rawEditor(), { target: { value: EDITED_SETTINGS_YAML } });
+    fireEvent.click(rawButton('保存当前文件'));
+
+    await waitFor(() => expect(api.updateDrawtoolsSettingsRaw).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.updateDrawtoolsSettingsRaw).mock.calls[0][2]).toBe('settings-1');
+  });
+
+  it('提示词分区按下划线键去整包里取指纹，保存走连字符那条路径', async () => {
+    serve(withPrompts());
+    vi.mocked(api.updateDrawtoolsPromptRaw).mockResolvedValue({ ok: true, hash: 'top-2' });
+    render(<DrawtoolsSettingsPage />);
+    await waitFor(() => expect(rawEditor()).toHaveValue(SETTINGS_YAML));
+
+    pickSection('top-system');
+    await waitFor(() => expect(rawEditor()).toHaveValue('top\n'));
+    fireEvent.change(rawEditor(), { target: { value: 'top v2\n' } });
+    fireEvent.click(rawButton('保存当前文件'));
+
+    await waitFor(() => expect(api.updateDrawtoolsPromptRaw).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.updateDrawtoolsPromptRaw).mock.calls[0])
+      .toEqual(['admin-token', 'top-system', 'top v2\n', 'top-1']);
+  });
+
+  it('节点分区带的是节点文件的指纹', async () => {
+    render(<DrawtoolsSettingsPage />);
+    await waitFor(() => expect(rawEditor()).toHaveValue(SETTINGS_YAML));
+
+    pickSection('node');
+    await waitFor(() => expect(rawEditor()).toHaveValue('id: draw.novelai_planner\n'));
+    fireEvent.change(rawEditor(), { target: { value: NODE_YAML } });
+    fireEvent.click(rawButton('保存当前文件'));
+
+    await waitFor(() => expect(api.updateNodeRaw).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.updateNodeRaw).mock.calls[0][3]).toBe('planner-1');
+  });
+
+  it('结构化字段直写也带整包里那一份的指纹', async () => {
+    render(<DrawtoolsSettingsPage />);
+    await waitFor(() => expect(baseUrlBox()).toHaveValue('https://image.novelai.net'));
+
+    fireEvent.blur(baseUrlBox(), { target: { value: 'https://relay.example' } });
+
+    await waitFor(() => expect(api.updateDrawtoolsSettingsRaw).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.updateDrawtoolsSettingsRaw).mock.calls[0][2]).toBe('settings-1');
+  });
+
+  it('角色标签库那一份记的是自己的指纹', async () => {
+    render(<DrawtoolsSettingsPage />);
+    await waitFor(() => expect(screen.getByText('初音未来')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }));
+    fireEvent.blur(screen.getByPlaceholderText('hatsune_miku'), { target: { value: 'hatsune_miku_v4' } });
+
+    await waitFor(() => expect(api.updateDrawtoolsCharactersRaw).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.updateDrawtoolsCharactersRaw).mock.calls[0][2]).toBe('characters-1');
+  });
+});
+
 describe('分析节点那一栏', () => {
   const settled = () => waitFor(() => expect(rawEditor()).toHaveValue(SETTINGS_YAML));
 
@@ -359,8 +430,9 @@ describe('分析节点那一栏', () => {
     fireEvent.click(rawButton('保存当前文件'));
 
     await waitFor(() => expect(api.updateNodeRaw).toHaveBeenCalledOnce());
+    // 读到 404 时指纹是空串：保存要求它仍然不存在，被别处抢先建了就报冲突。
     expect(vi.mocked(api.updateNodeRaw).mock.calls[0])
-      .toEqual(['admin-token', 'draw.novelai_planner', NODE_YAML]);
+      .toEqual(['admin-token', 'draw.novelai_planner', NODE_YAML, '']);
   });
 
   it('别的读失败就锁住这一栏，说清为什么不让改', async () => {
@@ -396,7 +468,7 @@ describe('分析节点那一栏', () => {
   });
 
   it('刷新读到了就解锁，提示跟着消失', async () => {
-    vi.mocked(api.getNodeRaw).mockRejectedValueOnce(new Error(NODE_FAILURE)).mockResolvedValue(NODE_YAML);
+    vi.mocked(api.getNodeRaw).mockRejectedValueOnce(new Error(NODE_FAILURE)).mockResolvedValue({ content: NODE_YAML, hash: 'planner-1' });
     render(<DrawtoolsSettingsPage />);
     await settled();
     pickSection('node');
@@ -479,7 +551,7 @@ describe('写出去之后换了 token', () => {
   };
 
   it('保存当前文件写完才换 token，不提示也不拿旧 token 重读', async () => {
-    const write = deferred<unknown>();
+    const write = deferred<api.RawSaveResult>();
     vi.mocked(api.updateDrawtoolsSettingsRaw).mockReturnValueOnce(write.promise);
     render(<DrawtoolsSettingsPage />);
     await settled();
@@ -487,14 +559,14 @@ describe('写出去之后换了 token', () => {
     saveRawEditor();
     await waitFor(() => expect(api.updateDrawtoolsSettingsRaw).toHaveBeenCalledOnce());
     await rotate();
-    await act(async () => { write.resolve({ ok: true }); });
+    await act(async () => { write.resolve({ ok: true, hash: 'settings-2' }); });
 
     expect(loadTokens()).toEqual(['admin-token', ROTATED]);
     expect(screen.queryByRole('status')).toBeNull();
   });
 
   it('保存当前文件失败之前换了 token，不摆出这一趟的报错', async () => {
-    const write = deferred<unknown>();
+    const write = deferred<api.RawSaveResult>();
     vi.mocked(api.updateDrawtoolsSettingsRaw).mockReturnValueOnce(write.promise);
     render(<DrawtoolsSettingsPage />);
     await settled();
@@ -537,7 +609,7 @@ describe('写出去之后换了 token', () => {
   });
 
   it('结构化字段写完才换 token，不提示也不拿旧 token 重读', async () => {
-    const write = deferred<unknown>();
+    const write = deferred<api.RawSaveResult>();
     vi.mocked(api.updateDrawtoolsSettingsRaw).mockReturnValueOnce(write.promise);
     render(<DrawtoolsSettingsPage />);
     await waitFor(() => expect(baseUrlBox()).toHaveValue('https://image.novelai.net'));
@@ -545,14 +617,14 @@ describe('写出去之后换了 token', () => {
     fireEvent.blur(baseUrlBox(), { target: { value: 'https://relay.example' } });
     await waitFor(() => expect(api.updateDrawtoolsSettingsRaw).toHaveBeenCalledOnce());
     await rotate();
-    await act(async () => { write.resolve({ ok: true }); });
+    await act(async () => { write.resolve({ ok: true, hash: 'settings-2' }); });
 
     expect(loadTokens()).toEqual(['admin-token', ROTATED]);
     expect(screen.queryByRole('status')).toBeNull();
   });
 
   it('结构化字段写失败之前换了 token，不摆出这一趟的报错', async () => {
-    const write = deferred<unknown>();
+    const write = deferred<api.RawSaveResult>();
     vi.mocked(api.updateDrawtoolsSettingsRaw).mockReturnValueOnce(write.promise);
     render(<DrawtoolsSettingsPage />);
     await waitFor(() => expect(baseUrlBox()).toHaveValue('https://image.novelai.net'));

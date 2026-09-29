@@ -75,8 +75,8 @@ beforeEach(() => {
   vi.mocked(getProviderProfiles).mockResolvedValue({ options: CATALOG, wireFormats: {}, hostProfiles: {} } as any);
   vi.mocked(getProviders).mockResolvedValue(structuredClone(PROVIDERS) as any);
   vi.mocked(getNodes).mockResolvedValue(NODES as any);
-  vi.mocked(getRuntimeRaw).mockResolvedValue('providers:\n  openai:\n    timeout_sec: 600.0\n');
-  vi.mocked(getNodeRaw).mockResolvedValue('id: qq.vision\nprovider: openai\n');
+  vi.mocked(getRuntimeRaw).mockResolvedValue({ content: 'providers:\n  openai:\n    timeout_sec: 600.0\n', hash: 'runtime-1' });
+  vi.mocked(getNodeRaw).mockResolvedValue({ content: 'id: qq.vision\nprovider: openai\n', hash: 'node-1' });
   vi.mocked(updateFallbacks).mockResolvedValue(structuredClone(PROVIDERS) as any);
   vi.mocked(updateNodeFallbacks).mockResolvedValue(structuredClone(PROVIDERS) as any);
   vi.mocked(clearNodeFallbacks).mockResolvedValue(structuredClone(PROVIDERS) as any);

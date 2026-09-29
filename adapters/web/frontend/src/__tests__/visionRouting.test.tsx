@@ -23,13 +23,14 @@ const RUNTIME = [
   '',
 ].join('\n');
 
-const setRuntime = (text: string) => vi.mocked(getRuntimeRaw).mockResolvedValue(text);
+const setRuntime = (text: string, hash: string | null = 'runtime-1') =>
+  vi.mocked(getRuntimeRaw).mockResolvedValue({ content: text, hash });
 
 beforeEach(() => {
   vi.clearAllMocks();
   useSettingsStore.setState({ adminToken: 'admin-token' });
   setRuntime(RUNTIME);
-  vi.mocked(updateRuntimeRaw).mockResolvedValue({} as any);
+  vi.mocked(updateRuntimeRaw).mockResolvedValue({ ok: true, hash: 'runtime-2' });
 });
 
 const picker = () => screen.getByLabelText('带图消息路由') as HTMLSelectElement;

@@ -6,6 +6,8 @@ import logging
 from pathlib import Path
 from typing import Any, Mapping
 
+import config_layout
+
 from .yaml_loader import load_yaml
 
 logger = logging.getLogger(__name__)
@@ -22,6 +24,26 @@ _FIELDS = (
 def _field(profile: Mapping[str, Any], spellings: tuple[str, ...]) -> str:
     value = next((profile.get(spelling) for spelling in spellings if profile.get(spelling)), "")
     return str(value or "").strip()
+
+
+class ProfileFile:
+    """一份按人资料文件，按修改时间、大小和 inode 认出改动。控制台和共享组里别的实例都会直接改它。"""
+
+    def __init__(self, path: Path | None) -> None:
+        self.path = Path(path) if path is not None else None
+        # 最近一次读的是哪一版；None 是没读过或文件不在。
+        self._stamp: tuple[int, int, int] | None = None
+
+    def _current_stamp(self) -> tuple[int, int, int] | None:
+        return config_layout.file_stamp(self.path) if self.path is not None else None
+
+    def load(self) -> dict[str, dict[str, str]]:
+        # 先记版本再读：读的途中又被改了，下一次比对就会认出来再读一遍，不会停在旧内容上。
+        self._stamp = self._current_stamp()
+        return load_profiles(self.path)
+
+    def changed(self) -> bool:
+        return self._current_stamp() != self._stamp
 
 
 def load_profiles(path: Path | None) -> dict[str, dict[str, str]]:

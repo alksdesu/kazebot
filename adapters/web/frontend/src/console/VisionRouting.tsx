@@ -45,7 +45,7 @@ export const VisionRouting = () => {
     if (!token) return;
     let cancelled = false;
     setRaw(null);
-    void getRuntimeRaw(token).then((text) => {
+    void getRuntimeRaw(token).then(({ content: text }) => {
       if (cancelled) return;
       setRaw(text);
       const current = normalizeMode(readYamlScalar(text, PATH));
@@ -65,8 +65,8 @@ export const VisionRouting = () => {
     setError('');
     try {
       const latest = await getRuntimeRaw(token);
-      const next = upsertYamlNested(latest, PATH, mode);
-      await updateRuntimeRaw(token, next);
+      const next = upsertYamlNested(latest.content, PATH, mode);
+      await updateRuntimeRaw(token, next, latest.hash);
       setRaw(next);
       setSaved(mode);
       setNote('已保存。下一条带图消息就按新规矩走。');

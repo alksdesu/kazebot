@@ -1,8 +1,6 @@
 """控制台直接改的 YAML 配置文件：读原文、解析校验、原子写回。"""
 from __future__ import annotations
 
-import os
-import secrets
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -10,8 +8,7 @@ import yaml
 from fastapi import HTTPException
 from pydantic import BaseModel
 
-from engine.eventlog_rotation import eventlog_file_lock
-from toolbox.text_files import newline_of, write_text_as
+import config_layout
 
 # 顶层的格式版本号，哪份配置文件都可以写，不对应任何键。
 VERSION_PATH = "version"
@@ -19,6 +16,8 @@ VERSION_PATH = "version"
 
 class RawConfig(BaseModel):
     content: str
+    # 打开编辑器时拿到的指纹。给了就先比对：中途被别处改过就 409，一个字节都不写。
+    base_hash: str | None = None
 
 
 def leaf_paths(document: Any, prefix: str = "") -> list[str]:
@@ -45,11 +44,15 @@ def value_at(document: Any, path: str) -> Any:
 
 
 def read_raw(path: Path) -> dict[str, Any]:
-    if not path.exists():
+    """原文连同指纹。指纹按落盘的原始字节算，空串表示文件还不存在。"""
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
         # 「还没接管」是正常状态，不是错误。刻意不回落到示例文件：
         # 那份是默认值，被当成当前配置保存下去就等于悄悄盖掉 .env 里的设置。
-        return {"content": "", "exists": False}
-    return {"content": path.read_text(encoding="utf-8"), "exists": True}
+        return {"content": "", "exists": False, "hash": ""}
+    text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    return {"content": text, "exists": True, "hash": config_layout.bytes_hash(data)}
 
 
 def parse_mapping(content: str) -> dict[str, Any]:
@@ -67,13 +70,15 @@ def unknown_paths(document: dict[str, Any], known: Iterable[str]) -> list[str]:
     return sorted(set(leaf_paths(document)) - set(known) - {VERSION_PATH})
 
 
-def write_raw(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # 同目录 tmp + replace：bot 进程随时在读，读到半截 yaml 等于整份配置塌掉。
-    with eventlog_file_lock(path):
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
-        try:
-            write_text_as(tmp, content, newline_of(path))
-            os.replace(tmp, path)
-        finally:
-            tmp.unlink(missing_ok=True)
+def write_raw(path: Path, content: str, *, base_hash: str | None = None) -> str:
+    """整份写回，返回写完的指纹。
+
+    和 config/ 下其余配置同一把锁、同一套同目录临时文件替换：bot 随时在读，读到半截 yaml 等于整份配置塌掉；
+    共享组里几个实例的控制台改的是同一份文件，拿的也是同一把锁。给了 base_hash 就先比对，对不上 409。
+    """
+    try:
+        return config_layout.write_config_text(path, content, base_hash=base_hash)
+    except config_layout.ConfigConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"写入 {path.name} 失败，原文件没动：{exc}") from exc

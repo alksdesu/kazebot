@@ -103,9 +103,12 @@ class OperationsService:
                 values.add(platform_secret(self.root, platform, spec.name, secrets=platform_secrets).value)
                 if spec.env:
                     values.add(os.environ.get(spec.env, "").strip())
-        for key, value in os.environ.items():
-            if re.search(r"(?:TOKEN|SECRET|PASSWORD|API_?KEY)$", key, re.I) and value:
-                values.add(value)
+        # 共享密钥文件不灌进进程环境，得单独收一遍。
+        shared = config_layout.shared_secrets(self.root)
+        for source in (os.environ, shared):
+            for key, value in source.items():
+                if re.search(r"(?:TOKEN|SECRET|PASSWORD|API_?KEY)$", key, re.I) and value:
+                    values.add(value)
         values.discard("")
         return tuple(sorted(values, key=len, reverse=True))
 
@@ -196,7 +199,8 @@ class OperationsService:
             # 旧位置比新位置新，多半是退回旧版本那阵子改的：那些改动现在不生效。
             add("配置布局", "warning", "；".join(notes), "旧位置的改动不会生效，要保留的话手动挪进 config/ 里对应的文件")
             return
-        add("配置布局", "passed", "配置都在 config/ 下")
+        group = config_layout.config_share_group(self.root)
+        add("配置布局", "passed", f"配置用的是共享组 {group}" if group else "配置都在 config/ 下")
 
     def instances(self) -> list[dict[str, Any]]:
         rows = load_instances(self.root)
@@ -233,6 +237,10 @@ class OperationsService:
             store = getattr(self.state, "feature_config_store", None) or ConfigStore(
                 path=config_layout.models_path(self.root), workspace_root=self.root,
             )
+            if store.load_error:
+                # 文件写坏了不影响运行：一直用着上一份能用的配置，但之后在控制台改渠道会被拒。
+                add("模型配置文件", "warning", f"{store.load_error}，现在用的是上一份能用的配置",
+                    f"在原文编辑器里修好 {config_layout.MODELS_FILE}")
             secret = store.get_openai_secret()
             protected = (*self._configured_secrets(), secret.api_key)
             provider_class = registry.get(secret.provider)

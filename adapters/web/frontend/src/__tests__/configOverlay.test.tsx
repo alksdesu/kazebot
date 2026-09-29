@@ -81,7 +81,7 @@ describe('覆盖层接口', () => {
     const fetchMock = stubFetch({ content: 'engine: {}\n', source: 'override', path: 'config/runtime.yaml' });
 
     await expect(client.getRuntimeFile(TOKEN)).resolves.toEqual({
-      content: 'engine: {}\n', source: 'override', path: 'config/runtime.yaml',
+      content: 'engine: {}\n', hash: null, source: 'override', path: 'config/runtime.yaml',
     });
 
     expect(fetchMock).toHaveBeenCalledWith('/v1/admin/config/runtime/raw', {
@@ -93,7 +93,7 @@ describe('覆盖层接口', () => {
   it('后端没说来源就当仓库默认，缺的字段补空串', async () => {
     stubFetch({});
 
-    await expect(client.getRuntimeFile(TOKEN)).resolves.toEqual({ content: '', source: 'default', path: '' });
+    await expect(client.getRuntimeFile(TOKEN)).resolves.toEqual({ content: '', hash: null, source: 'default', path: '' });
   });
 
   it('runtime 恢复默认删的是同一个地址', async () => {
@@ -107,10 +107,10 @@ describe('覆盖层接口', () => {
     });
   });
 
-  it('读 runtime 原文的老包装还在，只取正文', async () => {
-    stubFetch({ content: 'engine: {}\n', source: 'override' });
+  it('读 runtime 原文的老包装还在，正文连指纹一起给', async () => {
+    stubFetch({ content: 'engine: {}\n', hash: 'runtime-1', source: 'override' });
 
-    await expect(client.getRuntimeRaw(TOKEN)).resolves.toBe('engine: {}\n');
+    await expect(client.getRuntimeRaw(TOKEN)).resolves.toEqual({ content: 'engine: {}\n', hash: 'runtime-1' });
   });
 });
 
@@ -158,12 +158,40 @@ describe('节点文件的来源与删除', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     useSettingsStore.setState({ adminToken: TOKEN, isAuthenticated: true });
     vi.mocked(api.getNodeFiles).mockResolvedValue(FILES);
-    vi.mocked(api.getNodeFileRaw).mockImplementation(async (_token, name) => `# ${name}`);
-    vi.mocked(api.updateNodeFileRaw).mockResolvedValue({ ok: true });
+    vi.mocked(api.getNodeFileRaw).mockImplementation(async (_token, name) => ({ content: `# ${name}`, hash: `${name}-1` }));
+    vi.mocked(api.updateNodeFileRaw).mockResolvedValue({ ok: true, hash: 'saved' });
     vi.mocked(api.deleteNodeFile).mockResolvedValue({ ok: true, restored: true });
   });
 
   afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+
+  it('保存交回这份文件加载时的指纹，存完换成结果里的新指纹', async () => {
+    await ready();
+    // 自建的那份保存后不重读列表，才看得出底子换的是保存结果里那一版。
+    await selectFile('mine.yaml');
+
+    fireEvent.change(screen.getByLabelText('文件内容'), { target: { value: '# 改过' } });
+    click('保存当前文件');
+    await waitFor(() => expect(api.updateNodeFileRaw).toHaveBeenCalledOnce());
+    fireEvent.change(screen.getByLabelText('文件内容'), { target: { value: '# 再改一次' } });
+    click('保存当前文件');
+    await waitFor(() => expect(api.updateNodeFileRaw).toHaveBeenCalledTimes(2));
+
+    expect(vi.mocked(api.updateNodeFileRaw).mock.calls.map(call => [call[1], call[3]]))
+      .toEqual([['mine.yaml', 'mine.yaml-1'], ['mine.yaml', 'saved']]);
+  });
+
+  it('换一份文件就换一份底子，不拿上一份的指纹去存这一份', async () => {
+    await ready();
+
+    await selectFile('mine.yaml');
+    fireEvent.change(screen.getByLabelText('文件内容'), { target: { value: '# 改过' } });
+    click('保存当前文件');
+
+    await waitFor(() => expect(api.updateNodeFileRaw).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.updateNodeFileRaw).mock.calls[0])
+      .toEqual([TOKEN, 'mine.yaml', '# 改过', 'mine.yaml-1']);
+  });
 
   it('每个选项都带来源，路径那行也写着', async () => {
     await ready();

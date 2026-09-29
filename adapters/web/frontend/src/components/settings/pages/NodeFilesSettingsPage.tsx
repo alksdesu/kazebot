@@ -44,6 +44,8 @@ const NodeFilesSettingsPageEditor = () => {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState('');
+  // 编辑器里的内容是基于哪一版改的，保存时交回：中途被共享组里别的实例改过就报冲突。
+  const [base, setBase] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const requestVersion = useRef(0);
   const confirmDiscard = useUnsavedChanges(content !== saved, '当前文件还有未保存修改，确定离开或重新加载吗？');
@@ -60,10 +62,11 @@ const NodeFilesSettingsPageEditor = () => {
       setFiles(list);
       const nextSelected = selected && list.some(file => file.name === selected) ? selected : (list.find(file => file.name === 'qq.orchestrator.yaml')?.name || list[0]?.name || '');
       setSelected(nextSelected);
-      setContent(''); setSaved('');
-      const body = nextSelected ? await getNodeFileRaw(adminToken, nextSelected) : '';
+      setContent(''); setSaved(''); setBase(null);
+      const file = nextSelected ? await getNodeFileRaw(adminToken, nextSelected) : null;
       if (version !== requestVersion.current) return;
-      setContent(body); setSaved(body); setLoaded(Boolean(nextSelected));
+      const body = file?.content ?? '';
+      setContent(body); setSaved(body); setBase(file?.hash ?? null); setLoaded(Boolean(nextSelected));
       setLoadError('');
     } catch (error) {
       if (version !== requestVersion.current) return;
@@ -86,13 +89,13 @@ const NodeFilesSettingsPageEditor = () => {
     if (!adminToken || saving || filename === selected || !confirmDiscard()) return;
     const version = ++requestVersion.current;
     setSelected(filename);
-    setContent(''); setSaved(''); setLoading(true); setLoaded(false);
+    setContent(''); setSaved(''); setBase(null); setLoading(true); setLoaded(false);
     // 换了文件，上一份的保存结果和读取失败都跟这份无关。
     clearNotice();
     try {
-      const body = await getNodeFileRaw(adminToken, filename);
+      const file = await getNodeFileRaw(adminToken, filename);
       if (version !== requestVersion.current) return;
-      setContent(body); setSaved(body); setLoaded(true);
+      setContent(file.content); setSaved(file.content); setBase(file.hash); setLoaded(true);
     } catch (error) {
       if (version !== requestVersion.current) return;
       setLoadError(error instanceof Error ? error.message : '读取文件失败');
@@ -105,8 +108,8 @@ const NodeFilesSettingsPageEditor = () => {
     if (!adminToken || !selected || !loaded || loading || saving) return;
     setSaving(true);
     try {
-      await updateNodeFileRaw(adminToken, selected, content);
-      setSaved(content);
+      const result = await updateNodeFileRaw(adminToken, selected, content, base);
+      setSaved(content); setBase(result.hash);
       setMessage(`已保存 ${selected}`);
       // 保存仓库默认会在 config/nodes 下落一份本实例的，列表里的来源和路径跟着变。
       if (files.find(file => file.name === selected)?.source === 'default') await loadFiles();

@@ -254,4 +254,90 @@ describe('服务端策略', () => {
       expect(screen.getByRole('button', { name: '保存策略' })).toBeEnabled();
     });
   });
+
+  // 整份 PUT 覆盖：中途被共享组里别的实例改过还照写，那边加的规则连个提示都不留就没了。
+  describe('中途被别处改过', () => {
+    const CONFLICT = '策略在打开之后被别处改过，没有保存：点「丢弃」读入最新内容，再把改动重做一遍。';
+
+    /** 读给 read 那一版指纹，写按 current 判：对不上回 409。两者不同就是「读完之后被别处改过」。 */
+    const stubVersioned = (read = 'p1', currentHash = read) => {
+      const puts: any[] = [];
+      let current = currentHash;
+      vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method !== 'PUT') return jsonResponse({ policy: POLICY, hash: read });
+        const body = JSON.parse(String(init.body));
+        puts.push(body);
+        if (body.base_hash !== current) return errorResponse(409, 'policy.yaml 已被别处改过，刷新后再改');
+        current = 'p2';
+        return jsonResponse({ policy: body.policy, hash: current });
+      }));
+      return puts;
+    };
+
+    const edit = () => fireEvent.change(screen.getByLabelText('兜底档位'), { target: { value: 'deny' } });
+    const saveButton = () => screen.getByRole('button', { name: '保存策略' });
+
+    it('保存交回读到的那一版指纹，存完换成结果里的新指纹', async () => {
+      const puts = stubVersioned();
+      render(<PolicyRulesSection />);
+      await screen.findByRole('button', { name: /写入/ });
+
+      edit();
+      fireEvent.click(saveButton());
+      await screen.findByText('已保存，立即生效，不用重启');
+      fireEvent.change(screen.getByLabelText('兜底档位'), { target: { value: 'auto' } });
+      fireEvent.click(saveButton());
+      await waitFor(() => expect(puts).toHaveLength(2));
+
+      expect(puts.map((body) => body.base_hash)).toEqual(['p1', 'p2']);
+    });
+
+    it('指纹对不上时说清楚没保存，服务器上那份没被动过', async () => {
+      const puts = stubVersioned('p1', 'changed-elsewhere');
+      render(<PolicyRulesSection />);
+      await screen.findByRole('button', { name: /写入/ });
+
+      edit();
+      fireEvent.click(saveButton());
+
+      expect(await screen.findByText(CONFLICT)).toBeInTheDocument();
+      expect(puts).toHaveLength(1);
+      // 草稿还在手里，重做一遍之前不能被清掉。
+      expect(screen.getByLabelText('兜底档位')).toHaveValue('deny');
+    });
+
+    it('「丢弃」重读服务器，换来的是现在磁盘上那一份', async () => {
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      let served = POLICY;
+      const reads: number[] = [];
+      vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === 'PUT') return jsonResponse({ policy: POLICY, hash: 'p2' });
+        reads.push(reads.length);
+        return jsonResponse({ policy: served, hash: 'p1' });
+      }));
+      render(<PolicyRulesSection />);
+      await screen.findByRole('button', { name: /写入/ });
+      edit();
+
+      served = REWRITTEN;
+      fireEvent.click(screen.getByRole('button', { name: '丢弃' }));
+
+      expect(await screen.findByText(SERVER_RULE)).toBeInTheDocument();
+      expect(reads).toHaveLength(2);
+      expect(screen.getByLabelText('兜底档位')).toHaveValue('auto');
+    });
+
+    it('「丢弃」被拒绝就不重读，草稿留着', async () => {
+      vi.spyOn(window, 'confirm').mockReturnValue(false);
+      const puts = stubVersioned();
+      render(<PolicyRulesSection />);
+      await screen.findByRole('button', { name: /写入/ });
+      edit();
+
+      fireEvent.click(screen.getByRole('button', { name: '丢弃' }));
+
+      expect(screen.getByLabelText('兜底档位')).toHaveValue('deny');
+      expect(puts).toHaveLength(0);
+    });
+  });
 });

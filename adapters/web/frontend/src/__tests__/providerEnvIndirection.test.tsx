@@ -60,7 +60,7 @@ describe('渠道编辑器与环境变量引用', () => {
     expect(boxesFor(container, '地址')[0]).toHaveValue('${OPENAI_BASE_URL}');
   });
 
-  it('只改密钥再保存，没动过的字段提交回去还是那份原文', async () => {
+  it('只改密钥再保存，没动过的字段一个都不提交，${VAR} 那层间接留在配置里', async () => {
     const { container } = render(<ProvidersPage />);
 
     await waitFor(() => expect(boxesFor(container, '模型')).toHaveLength(2));
@@ -68,10 +68,18 @@ describe('渠道编辑器与环境变量引用', () => {
     fireEvent.click(screen.getByRole('button', { name: '保存渠道' }));
 
     await waitFor(() => expect(upsertProvider).toHaveBeenCalled());
-    expect(vi.mocked(upsertProvider).mock.calls[0][2]).toMatchObject({
-      model: '${OPENAI_MODEL}',
-      base_url: '${OPENAI_BASE_URL}',
-    });
+    expect(vi.mocked(upsertProvider).mock.calls[0][2]).toEqual({ api_key: 'sk-new' });
+  });
+
+  it('改了模型就只带模型那一项，原样带的是引用而不是展开值', async () => {
+    const { container } = render(<ProvidersPage />);
+
+    await waitFor(() => expect(boxesFor(container, '模型')).toHaveLength(2));
+    fireEvent.change(boxesFor(container, '模型')[0], { target: { value: '${OPENAI_MODEL_V2}' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存渠道' }));
+
+    await waitFor(() => expect(upsertProvider).toHaveBeenCalled());
+    expect(vi.mocked(upsertProvider).mock.calls[0][2]).toEqual({ model: '${OPENAI_MODEL_V2}' });
   });
 
   it('旁边交代它当前指向谁', async () => {

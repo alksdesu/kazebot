@@ -18,7 +18,7 @@ import { channelChoices, getMcpClientsRaw, getNodeRaw, getNodes, getProviders, g
 // parser/serializer functions from settingsStructuredConfig. Purpose: the new forms
 // can edit structured fields while writing valid raw YAML back to Supervisor.
 import { mergeModelChoices, modelsFromNodes, modelsFromProviders } from '../../../utils/modelChoices';
-import { parseMcpClients, parseNodeConfig, parseSchedules, serializeMcpClients, serializeNodeConfig, serializeSchedules, type McpClientFormState, type NodeConfigFormState, type NodeConfigType, type ScheduleFormState } from '../settingsStructuredConfig';
+import { itemChangedSince, parseMcpClients, parseNodeConfig, parseSchedules, serializeMcpClients, serializeNodeConfig, serializeSchedules, type McpClientFormState, type NodeConfigFormState, type NodeConfigType, type ScheduleFormState } from '../settingsStructuredConfig';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
@@ -33,6 +33,21 @@ const PanelShell = ({ title, eyebrow, disabled, children }: { title: string; eye
     <fieldset disabled={disabled} className="min-w-0">{children}</fieldset>
   </section>
 );
+
+interface EditorProps {
+  onReload: () => void;
+}
+
+/** 右栏编辑器的「刷新」：换一代 key 让编辑器整个重建、重读文件，保存报冲突之后靠它换成最新内容。 */
+function useReloadGeneration(): [number, () => void] {
+  const [generation, setGeneration] = useState(0);
+  return [generation, () => setGeneration((value) => value + 1)];
+}
+
+function staleItemMessage(label: string): string {
+  const gap = /[A-Za-z0-9]$/.test(label) ? ' ' : '';
+  return `${label}${gap}打开之后被别处改过，点「刷新」读入最新内容再改。`;
+}
 
 const JsonBlock = ({ value }: { value: unknown }) => (
   <pre className="max-h-80 overflow-auto border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 font-mono text-xs leading-4 text-[var(--duties-secondary)]">
@@ -114,20 +129,24 @@ export const ApprovalsSettingsRightPanel = () => {
 export const AgentsSettingsRightPanel = () => {
   const id = useSettingsSelectionStore(state => state.selectedNode?.id);
   const token = useSettingsStore(state => state.adminToken);
-  return <AgentsEditor key={`${token}\0${id || ''}`} />;
+  const [generation, reload] = useReloadGeneration();
+  return <AgentsEditor key={`${token}\0${id || ''}\0${generation}`} onReload={reload} />;
 };
 
-const AgentsEditor = () => {
+const AgentsEditor = ({ onReload }: EditorProps) => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const node = useSettingsSelectionStore(state => state.selectedNode);
   const [nodeYaml, setNodeYaml] = useState('');
   const [nodeBaseline, setNodeBaseline] = useState('');
+  // 表单和原文编辑器都基于这一版改，保存时交回：中途被别处改过就报冲突，不静默盖掉。
+  const [nodeBase, setNodeBase] = useState<string | null>(null);
   const [nodeConfigForm, setNodeConfigForm] = useState<NodeConfigFormState>(EMPTY_NODE_CONFIG_FORM);
   const [nodeYamlEditable, setNodeYamlEditable] = useState(false);
   const [nodeYamlLoading, setNodeYamlLoading] = useState(false);
   const [nodeYamlSaving, setNodeYamlSaving] = useState(false);
   const [nodeMessage, setNodeMessage] = useState('');
-  useUnsavedChanges(nodeYamlEditable && JSON.stringify([nodeYaml, nodeConfigForm]) !== nodeBaseline);
+  const confirmDiscard = useUnsavedChanges(nodeYamlEditable && JSON.stringify([nodeYaml, nodeConfigForm]) !== nodeBaseline);
+  const reload = () => { if (confirmDiscard()) onReload(); };
   const [modelChoices, setModelChoices] = useState<string[]>([]);
   const [channels, setChannels] = useState<ChannelChoice[]>([]);
   const [wires, setWires] = useState<string[]>([]);
@@ -178,6 +197,7 @@ const AgentsEditor = () => {
   useEffect(() => {
     let cancelled = false;
     setNodeYaml('');
+    setNodeBase(null);
     setNodeConfigForm({ ...EMPTY_NODE_CONFIG_FORM, id: node?.id || '' });
     setNodeYamlEditable(false);
     setNodeMessage('');
@@ -193,9 +213,10 @@ const AgentsEditor = () => {
     // parseNodeConfig. Purpose: users edit common node properties directly while the
     // advanced YAML section remains available for unsupported fields.
     getNodeRaw(adminToken, node.id)
-      .then((raw) => {
+      .then(({ content: raw, hash }) => {
         if (cancelled) return;
         setNodeYaml(raw);
+        setNodeBase(hash);
         setNodeConfigForm(parseNodeConfig(raw, node.id));
         setNodeBaseline(JSON.stringify([raw, parseNodeConfig(raw, node.id)]));
         setNodeYamlEditable(true);
@@ -248,8 +269,9 @@ const AgentsEditor = () => {
       // and update the fallback editor with the exact saved content. Purpose: the
       // panel writes valid YAML while keeping user edits to unrelated fields intact.
       const { content: nextYaml, note } = serializeNodeConfig(nodeYaml, nodeConfigForm);
-      await updateNodeRaw(adminToken, node.id, nextYaml);
+      const result = await updateNodeRaw(adminToken, node.id, nextYaml, nodeBase);
       setNodeYaml(nextYaml);
+      setNodeBase(result.hash);
       setNodeConfigForm(parseNodeConfig(nextYaml, node.id));
       setNodeBaseline(JSON.stringify([nextYaml, parseNodeConfig(nextYaml, node.id)]));
       window.dispatchEvent(new Event('settings:nodes-updated'));
@@ -271,7 +293,8 @@ const AgentsEditor = () => {
       // the controlled fallback editor and reparse it into the structured form after a
       // successful write. Purpose: advanced edits remain possible without making raw
       // YAML the default editing surface.
-      await updateNodeRaw(adminToken, node.id, nodeYaml);
+      const result = await updateNodeRaw(adminToken, node.id, nodeYaml, nodeBase);
+      setNodeBase(result.hash);
       setNodeConfigForm(parseNodeConfig(nodeYaml, node.id));
       setNodeBaseline(JSON.stringify([nodeYaml, parseNodeConfig(nodeYaml, node.id)]));
       window.dispatchEvent(new Event('settings:nodes-updated'));
@@ -292,7 +315,10 @@ const AgentsEditor = () => {
           {nodeYamlLoading ? (
             <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-[var(--duties-secondary)]">正在加载节点配置。</p>
           ) : !nodeYamlEditable ? (
-            <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-[var(--duties-secondary)]">{nodeMessage || '系统内建节点不可编辑'}</p>
+            <div className="space-y-2">
+              <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-[var(--duties-secondary)]">{nodeMessage || '系统内建节点不可编辑'}</p>
+              <Button onClick={reload} size="sm" tone="quiet">刷新</Button>
+            </div>
           ) : (
             <>
               <div className="space-y-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
@@ -401,7 +427,10 @@ const AgentsEditor = () => {
                   工具权限（tool_access）要在下面的高级 YAML 编辑里改。保存这里会重排 YAML
                   并丢掉注释，想保留注释也走那边。
                 </p>
-                <Button disabled={nodeYamlSaving} onClick={saveNodeConfig} size="sm">保存节点配置</Button>
+                <div className="flex flex-wrap gap-2">
+                  <Button disabled={nodeYamlSaving} onClick={saveNodeConfig} size="sm">保存节点配置</Button>
+                  <Button disabled={nodeYamlSaving} onClick={reload} size="sm" tone="quiet">刷新</Button>
+                </div>
                 {nodeMessage && <p className="text-[var(--duties-tertiary)]">{nodeMessage}</p>}
               </div>
               <details className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
@@ -428,24 +457,28 @@ const AgentsEditor = () => {
 export const ToolsSettingsRightPanel = () => {
   const id = useSettingsSelectionStore(state => state.selectedTool?.name);
   const token = useSettingsStore(state => state.adminToken);
-  return <ToolsEditor key={`${token}\0${id || ''}`} />;
+  const [generation, reload] = useReloadGeneration();
+  return <ToolsEditor key={`${token}\0${id || ''}\0${generation}`} onReload={reload} />;
 };
 
-const ToolsEditor = () => {
+const ToolsEditor = ({ onReload }: EditorProps) => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const tool = useSettingsSelectionStore(state => state.selectedTool);
   const [toolScript, setToolScript] = useState('');
   const [toolBaseline, setToolBaseline] = useState('');
+  const [toolBase, setToolBase] = useState<string | null>(null);
   const [toolScriptLoaded, setToolScriptLoaded] = useState(false);
   const [toolScriptLoading, setToolScriptLoading] = useState(false);
   const [toolScriptSaving, setToolScriptSaving] = useState(false);
   const [toolReloading, setToolReloading] = useState(false);
   const [toolMessage, setToolMessage] = useState('');
   const confirmToolDiscard = useUnsavedChanges(toolScriptLoaded && toolScript !== toolBaseline);
+  const reload = () => { if (confirmToolDiscard()) onReload(); };
 
   useEffect(() => {
     let cancelled = false;
     setToolScript('');
+    setToolBase(null);
     setToolScriptLoaded(false);
     setToolMessage('');
     if (!tool) return () => { cancelled = true; };
@@ -462,10 +495,11 @@ const ToolsEditor = () => {
     // the selected tool name changes and store it in a controlled textarea. Purpose:
     // users can update one tool implementation without leaving the context panel.
     getToolRaw(adminToken, tool.name)
-      .then((raw) => {
+      .then(({ content: raw, hash }) => {
         if (cancelled) return;
         setToolScript(raw);
         setToolBaseline(raw);
+        setToolBase(hash);
         setToolScriptLoaded(true);
       })
       .catch((error) => {
@@ -489,8 +523,9 @@ const ToolsEditor = () => {
       // the rest of Settings reload parsed metadata. How: PUT the controlled Python
       // script and dispatch settings:tools-updated after success. Purpose: the tool
       // list can refresh after a raw script save without requiring an engine restart.
-      await updateToolRaw(adminToken, tool.name, toolScript);
+      const result = await updateToolRaw(adminToken, tool.name, toolScript, toolBase);
       setToolBaseline(toolScript);
+      setToolBase(result.hash);
       window.dispatchEvent(new Event('settings:tools-updated'));
       setToolMessage('工具脚本已保存。');
     } catch (error) {
@@ -559,6 +594,7 @@ const ToolsEditor = () => {
               />
               <div className="flex flex-wrap gap-2">
                 <Button disabled={!toolScriptLoaded || toolScriptLoading || toolScriptSaving} onClick={saveToolScript} size="sm">保存</Button>
+                <Button disabled={toolScriptLoading || toolScriptSaving || toolReloading} onClick={reload} size="sm" tone="quiet">刷新</Button>
                 <Button disabled={!adminToken || toolReloading} onClick={reloadToolRegistry} size="sm" tone="quiet">重载工具</Button>
               </div>
               {toolMessage && <p className="text-[var(--duties-tertiary)]">{toolMessage}</p>}
@@ -615,20 +651,23 @@ function applySkillFrontmatter(raw: string, edit: SkillFrontmatterEdit): string 
 export const SkillsSettingsRightPanel = () => {
   const id = useSettingsSelectionStore(state => state.selectedSkill?.name);
   const token = useSettingsStore(state => state.adminToken);
-  return <SkillsEditor key={`${token}\0${id || ''}`} />;
+  const [generation, reload] = useReloadGeneration();
+  return <SkillsEditor key={`${token}\0${id || ''}\0${generation}`} onReload={reload} />;
 };
 
-const SkillsEditor = () => {
+const SkillsEditor = ({ onReload }: EditorProps) => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const skill = useSettingsSelectionStore(state => state.selectedSkill);
   const [edit, setEdit] = useState<SkillFrontmatterEdit>({ enabled: true, strategy: 'normal', keywords: '', order: '0', priority: '0', scan_depth: '0' });
   const [rawMarkdown, setRawMarkdown] = useState('');
   const [skillBaseline, setSkillBaseline] = useState('');
+  const [skillBase, setSkillBase] = useState<string | null>(null);
   const [rawMarkdownLoaded, setRawMarkdownLoaded] = useState(false);
   const [rawMarkdownLoading, setRawMarkdownLoading] = useState(false);
   const [rawMarkdownSaving, setRawMarkdownSaving] = useState(false);
   const [message, setMessage] = useState('');
-  useUnsavedChanges(rawMarkdownLoaded && JSON.stringify([rawMarkdown, edit]) !== skillBaseline);
+  const confirmDiscard = useUnsavedChanges(rawMarkdownLoaded && JSON.stringify([rawMarkdown, edit]) !== skillBaseline);
+  const reload = () => { if (confirmDiscard()) onReload(); };
 
   useEffect(() => {
     let cancelled = false;
@@ -642,12 +681,13 @@ const SkillsEditor = () => {
     };
     setEdit(baseEdit);
     setRawMarkdown('');
+    setSkillBase(null);
     setRawMarkdownLoaded(false);
     setMessage('');
     if (!adminToken || !skill) return () => { cancelled = true; };
     setRawMarkdownLoading(true);
     getSkillRaw(adminToken, skill.name)
-      .then((raw) => {
+      .then(({ content: raw, hash }) => {
         if (cancelled) return;
         // [2026-06-02] Load the full skill Markdown beside the quick fields.
         // Why: frontmatter editing remains convenient, but advanced users need the
@@ -655,6 +695,7 @@ const SkillsEditor = () => {
         // response for both scalar extraction and the collapsed Markdown textarea.
         // Purpose: one fetch initializes quick metadata and the advanced raw editor.
         setRawMarkdown(raw);
+        setSkillBase(hash);
         setRawMarkdownLoaded(true);
         const parsed = parseSkillEdit(raw);
         setEdit(parsed);
@@ -674,10 +715,11 @@ const SkillsEditor = () => {
       // How: apply the frontmatter patch to the loaded raw Markdown when available,
       // otherwise fetch it once as before. Purpose: both editors show the same saved
       // content without requiring a full Settings refresh.
-      const raw = rawMarkdownLoaded ? rawMarkdown : await getSkillRaw(adminToken, skill.name);
-      const next = applySkillFrontmatter(raw, edit);
-      await updateSkillRaw(adminToken, skill.name, next);
+      const source = rawMarkdownLoaded ? { content: rawMarkdown, hash: skillBase } : await getSkillRaw(adminToken, skill.name);
+      const next = applySkillFrontmatter(source.content, edit);
+      const result = await updateSkillRaw(adminToken, skill.name, next, source.hash);
       setRawMarkdown(next);
+      setSkillBase(result.hash);
       const parsed = parseSkillEdit(next);
       setEdit(parsed);
       setSkillBaseline(JSON.stringify([next, parsed]));
@@ -700,7 +742,8 @@ const SkillsEditor = () => {
       // the existing skill raw endpoint and notify the list page to reload metadata.
       // Purpose: advanced editing remains available while hidden until requested.
       const parsed = parseSkillEdit(rawMarkdown);
-      await updateSkillRaw(adminToken, skill.name, rawMarkdown);
+      const result = await updateSkillRaw(adminToken, skill.name, rawMarkdown, skillBase);
+      setSkillBase(result.hash);
       setEdit(parsed);
       setSkillBaseline(JSON.stringify([rawMarkdown, parsed]));
       setRawMarkdownLoaded(true);
@@ -743,7 +786,10 @@ const SkillsEditor = () => {
               </label>
             ))}
           </div>
-          <Button onClick={save} size="sm">保存快捷字段</Button>
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={save} size="sm">保存快捷字段</Button>
+            <Button disabled={rawMarkdownLoading || rawMarkdownSaving} onClick={reload} size="sm" tone="quiet">刷新</Button>
+          </div>
           <details className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
             <summary className="cursor-pointer font-mono text-xs font-semibold text-[var(--duties-tertiary)]">Raw Markdown 编辑（高级）</summary>
             <div className="mt-3 space-y-2">
@@ -811,10 +857,11 @@ function serializeEnvTextForYaml(envText: string): string {
 export const McpSettingsRightPanel = () => {
   const id = useSettingsSelectionStore(state => state.selectedMcpClient?.id);
   const token = useSettingsStore(state => state.adminToken);
-  return <McpEditor key={`${token}\0${id || ''}`} />;
+  const [generation, reload] = useReloadGeneration();
+  return <McpEditor key={`${token}\0${id || ''}\0${generation}`} onReload={reload} />;
 };
 
-const McpEditor = () => {
+const McpEditor = ({ onReload }: EditorProps) => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const client = useSettingsSelectionStore(state => state.selectedMcpClient);
   const [form, setForm] = useState<McpClientFormState | null>(null);
@@ -822,7 +869,8 @@ const McpEditor = () => {
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
   const [baseline, setBaseline] = useState('');
-  useUnsavedChanges(Boolean(form) && JSON.stringify(form) !== baseline);
+  const confirmDiscard = useUnsavedChanges(Boolean(form) && JSON.stringify(form) !== baseline);
+  const reload = () => { if (confirmDiscard()) onReload(); };
 
   useEffect(() => {
     let cancelled = false;
@@ -840,7 +888,7 @@ const McpEditor = () => {
     // copy the matching id into local component state with display-format conversions.
     // Purpose: switching selections resets the editor and avoids saving stale fields.
     getMcpClientsRaw(adminToken)
-      .then((raw) => {
+      .then(({ content: raw }) => {
         if (cancelled) return;
         const selected = parseMcpClients(raw).find((item) => item.id === client.id) || null;
         if (!selected) {
@@ -873,13 +921,18 @@ const McpEditor = () => {
       // id with the local form converted back to serializer format, serialize, save,
       // and emit the settings:mcp-updated event. Purpose: the main MCP list can refresh
       // after a successful edit without an engine restart.
-      const raw = await getMcpClientsRaw(adminToken);
-      const forms = parseMcpClients(raw);
+      const file = await getMcpClientsRaw(adminToken);
+      const forms = parseMcpClients(file.content);
       const index = forms.findIndex((item) => item.id === client.id);
       if (index < 0) throw new Error('未在 MCP YAML 中找到此 Client。');
+      if (itemChangedSince(form, forms[index])) throw new Error(staleItemMessage('这个 Client'));
       forms[index] = { ...form, original: forms[index].original, argsText: form.argsText, envText: serializeEnvTextForYaml(form.envText) };
-      await updateMcpClientsRaw(adminToken, serializeMcpClients(forms, raw));
-      setBaseline(JSON.stringify(form));
+      const content = serializeMcpClients(forms, file.content);
+      await updateMcpClientsRaw(adminToken, content, file.hash);
+      // 下一次保存要拿刚写下的这一版核对。
+      const original = parseMcpClients(content).find((item) => item.id === client.id)?.original;
+      setForm((current) => current && { ...current, original });
+      setBaseline(JSON.stringify({ ...form, original }));
       window.dispatchEvent(new Event('settings:mcp-updated'));
       setMessage('MCP Client 已保存。');
     } catch (error) {
@@ -896,7 +949,10 @@ const McpEditor = () => {
       ) : loading ? (
         <p className="text-xs leading-5 text-[var(--duties-secondary)]">正在加载 MCP Client。</p>
       ) : !form ? (
-        <p className="text-xs leading-5 text-[var(--duties-secondary)]">{message || '未找到可编辑的 MCP Client。'}</p>
+        <div className="space-y-2">
+          <p className="text-xs leading-5 text-[var(--duties-secondary)]">{message || '未找到可编辑的 MCP Client。'}</p>
+          <Button onClick={reload} size="sm" tone="quiet">刷新</Button>
+        </div>
       ) : (
         <div className="space-y-3 text-xs leading-5">
           <p><span className="text-[var(--duties-tertiary)]">ID：</span><span className="font-mono">{form.id}</span></p>
@@ -944,7 +1000,10 @@ const McpEditor = () => {
               </label>
             </div>
           )}
-          <Button disabled={saving} onClick={save} size="sm">保存</Button>
+          <div className="flex flex-wrap gap-2">
+            <Button disabled={saving} onClick={save} size="sm">保存</Button>
+            <Button disabled={saving} onClick={reload} size="sm" tone="quiet">刷新</Button>
+          </div>
           {message && <p className="text-[var(--duties-tertiary)]">{message}</p>}
         </div>
       )}
@@ -955,10 +1014,11 @@ const McpEditor = () => {
 export const AutomationSettingsRightPanel = () => {
   const id = useSettingsSelectionStore(state => state.selectedScheduleId);
   const token = useSettingsStore(state => state.adminToken);
-  return <AutomationEditor key={`${token}\0${id || ''}`} />;
+  const [generation, reload] = useReloadGeneration();
+  return <AutomationEditor key={`${token}\0${id || ''}\0${generation}`} onReload={reload} />;
 };
 
-const AutomationEditor = () => {
+const AutomationEditor = ({ onReload }: EditorProps) => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const selectedScheduleId = useSettingsSelectionStore(state => state.selectedScheduleId);
   const [form, setForm] = useState<ScheduleFormState | null>(null);
@@ -966,7 +1026,8 @@ const AutomationEditor = () => {
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
   const [baseline, setBaseline] = useState('');
-  useUnsavedChanges(Boolean(form) && JSON.stringify(form) !== baseline);
+  const confirmDiscard = useUnsavedChanges(Boolean(form) && JSON.stringify(form) !== baseline);
+  const reload = () => { if (confirmDiscard()) onReload(); };
 
   useEffect(() => {
     let cancelled = false;
@@ -984,7 +1045,7 @@ const AutomationEditor = () => {
     // and copy the matching id into local state. Purpose: changing selected schedules
     // resets fields and avoids editing an outdated list snapshot.
     getSchedulesRaw(adminToken)
-      .then((raw) => {
+      .then(({ content: raw }) => {
         if (cancelled) return;
         const selected = parseSchedules(raw).find((item) => item.id === selectedScheduleId) || null;
         setForm(selected);
@@ -1012,13 +1073,17 @@ const AutomationEditor = () => {
       // the matching id, serialize the complete list, write it back, and emit the
       // settings:schedules-updated event. Purpose: the Automation page refreshes after
       // save while the operation stays limited to the requested right-panel editor.
-      const raw = await getSchedulesRaw(adminToken);
-      const schedules = parseSchedules(raw);
+      const file = await getSchedulesRaw(adminToken);
+      const schedules = parseSchedules(file.content);
       const index = schedules.findIndex((item) => item.id === selectedScheduleId);
       if (index < 0) throw new Error('未在 schedules.yaml 中找到此定时任务。');
+      if (itemChangedSince(form, schedules[index])) throw new Error(staleItemMessage('这个定时任务'));
       schedules[index] = { ...form, original: schedules[index].original };
-      await updateSchedulesRaw(adminToken, serializeSchedules(schedules, raw));
-      setBaseline(JSON.stringify(form));
+      const content = serializeSchedules(schedules, file.content);
+      await updateSchedulesRaw(adminToken, content, file.hash);
+      const original = parseSchedules(content).find((item) => item.id === selectedScheduleId)?.original;
+      setForm((current) => current && { ...current, original });
+      setBaseline(JSON.stringify({ ...form, original }));
       window.dispatchEvent(new Event('settings:schedules-updated'));
       setMessage('定时任务已保存。');
     } catch (error) {
@@ -1035,7 +1100,10 @@ const AutomationEditor = () => {
       ) : loading ? (
         <p className="text-xs leading-5 text-[var(--duties-secondary)]">正在加载定时任务。</p>
       ) : !form ? (
-        <p className="text-xs leading-5 text-[var(--duties-secondary)]">{message || '未找到可编辑的定时任务。'}</p>
+        <div className="space-y-2">
+          <p className="text-xs leading-5 text-[var(--duties-secondary)]">{message || '未找到可编辑的定时任务。'}</p>
+          <Button onClick={reload} size="sm" tone="quiet">刷新</Button>
+        </div>
       ) : (
         <div className="space-y-3 text-xs leading-5">
           <p><span className="text-[var(--duties-tertiary)]">ID：</span><span className="font-mono">{form.id}</span></p>
@@ -1089,7 +1157,10 @@ const AutomationEditor = () => {
               ))}
             </div>
           </details>
-          <Button disabled={saving} onClick={save} size="sm">保存</Button>
+          <div className="flex flex-wrap gap-2">
+            <Button disabled={saving} onClick={save} size="sm">保存</Button>
+            <Button disabled={saving} onClick={reload} size="sm" tone="quiet">刷新</Button>
+          </div>
           {message && <p className="text-[var(--duties-tertiary)]">{message}</p>}
         </div>
       )}

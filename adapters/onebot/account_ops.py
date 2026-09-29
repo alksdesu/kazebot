@@ -18,6 +18,7 @@ from typing import Any
 
 import httpx
 
+import config_layout
 from clonoth_runtime import platform_secret, read_admin_token
 from platforms.account_ops import (
     AccountConflict,
@@ -59,26 +60,9 @@ class NapCatUnreachable(NapCatError, AccountUnreachable):
     """WebUI 还没应答。换号重启和首次部署都会经过这里，不是故障。"""
 
 
-def _read_env_file(env_path: Path) -> dict[str, str]:
-    # NapCat 的 webui.json 是 root 0600，supervisor 以普通用户跑，只能从 .env 拿。
-    if not env_path.is_file():
-        return {}
-    try:
-        lines = env_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return {}
-    pairs: dict[str, str] = {}
-    for line in lines:
-        text = line.strip()
-        if not text or text.startswith("#") or "=" not in text:
-            continue
-        name, value = text.split("=", 1)
-        pairs.setdefault(name.strip(), value.strip().strip("'\""))
-    return pairs
-
-
 def _read_env_value(env_path: Path, key: str) -> str:
-    return _read_env_file(env_path).get(key, "")
+    # NapCat 的 webui.json 是 root 0600，supervisor 以普通用户跑，只能从 .env 拿。
+    return config_layout.read_env_file(env_path).get(key, "")
 
 
 def _now_iso() -> str:
@@ -126,7 +110,7 @@ class NapCatClient:
     def _webui_token(self) -> str:
         # 两份文件每次都重读：令牌是容器首启后才回填进 .env 的，supervisor 不重启也得认得出。
         return platform_secret(
-            self._env_path.parent, QQ_NAPCAT, _TOKEN.name, environ=_read_env_file(self._env_path),
+            self._env_path.parent, QQ_NAPCAT, _TOKEN.name, environ=config_layout.read_env_file(self._env_path),
         ).value
 
     @property

@@ -12,6 +12,9 @@ import {
   updateDrawtoolsSettingsRaw,
   updateNodeRaw,
   type DrawtoolsBundle,
+  type DrawtoolsRawFile,
+  type RawSaveResult,
+  type RawText,
 } from '../../../api/supervisorClient';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { appendSentence } from '../../../utils/sentence';
@@ -143,34 +146,35 @@ function rewriteStructured(base: string, next: Record<string, unknown>, okText: 
   return { content, message: appendSentence(okText, note && `${note}。`) };
 }
 
+function sectionFile(bundle: DrawtoolsBundle | null, key: SectionKey): DrawtoolsRawFile | undefined {
+  if (!bundle || key === 'node') return undefined;
+  if (key === 'settings') return bundle.settings;
+  if (key === 'characters') return bundle.character_tags;
+  return bundle.prompts?.[key.replace('-', '_')];
+}
+
 function getSectionContent(bundle: DrawtoolsBundle | null, key: SectionKey): string {
-  if (!bundle) return '';
-  if (key === 'settings') return bundle.settings?.content || '';
-  if (key === 'characters') return bundle.character_tags?.content || '';
-  if (key === 'node') return '';
-  return bundle.prompts?.[key.replace('-', '_')]?.content || '';
+  return sectionFile(bundle, key)?.content || '';
 }
 
 function fileMeta(bundle: DrawtoolsBundle | null, key: SectionKey): string {
   if (!bundle) return '';
   // 没改过时读的是仓库默认，保存才会在 config/nodes 下落一份本实例的。
   if (key === 'node') return `节点 ${PLANNER_NODE}：保存到 config/nodes/${PLANNER_NODE}.yaml，没改过时用仓库默认`;
-  const item = key === 'settings'
-    ? bundle.settings
-    : key === 'characters'
-      ? bundle.character_tags
-      : bundle.prompts?.[key.replace('-', '_')];
+  const item = sectionFile(bundle, key);
   if (!item) return '';
   return item.exists ? `用户配置：${item.path}` : `正在显示模板：${item.example_path}`;
 }
 
 // 节点文件还没建时按空文件编辑，保存就建出来；别的读失败不能当成空文件，不然一保存就把原文件盖掉了。
-async function readPlannerNode(token: string): Promise<{ content: string; error: string }> {
+async function readPlannerNode(token: string): Promise<RawText & { error: string }> {
   try {
-    return { content: await getNodeRaw(token, PLANNER_NODE), error: '' };
+    const { content, hash } = await getNodeRaw(token, PLANNER_NODE);
+    return { content, hash, error: '' };
   } catch (error) {
-    if (isNotFound(error)) return { content: '', error: '' };
-    return { content: '', error: error instanceof Error ? error.message : String(error) };
+    // 指纹给空串：保存时要求文件仍然不存在，中途被别处建出来就报冲突。
+    if (isNotFound(error)) return { content: '', hash: '', error: '' };
+    return { content: '', hash: null, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -179,7 +183,8 @@ export const DrawtoolsSettingsPage = () => {
   const [bundle, setBundle] = useState<DrawtoolsBundle | null>(null);
   const [section, setSection] = useState<SectionKey>('settings');
   const [editor, setEditor] = useState('');
-  const [nodeRaw, setNodeRaw] = useState('');
+  const [nodeFile, setNodeFile] = useState<RawText>({ content: '', hash: null });
+  const nodeRaw = nodeFile.content;
   const [nodeError, setNodeError] = useState('');
   const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
@@ -213,7 +218,7 @@ export const DrawtoolsSettingsPage = () => {
       const [data, node] = await Promise.all([getDrawtoolsBundle(adminToken), readPlannerNode(adminToken)]);
       if (version !== loadVersion.current) return;
       setBundle(data);
-      setNodeRaw(node.content);
+      setNodeFile({ content: node.content, hash: node.hash });
       setNodeError(node.error);
       setEditor(section === 'node' ? node.content : getSectionContent(data, section));
       setLoadError('');
@@ -245,10 +250,11 @@ export const DrawtoolsSettingsPage = () => {
   const saveCurrent = async () => {
     if (!adminToken) return;
     try {
-      if (section === 'settings') await updateDrawtoolsSettingsRaw(adminToken, editor);
-      else if (section === 'characters') await updateDrawtoolsCharactersRaw(adminToken, editor);
-      else if (section === 'node') await updateNodeRaw(adminToken, PLANNER_NODE, editor);
-      else await updateDrawtoolsPromptRaw(adminToken, section, editor);
+      const base = section === 'node' ? nodeFile.hash : sectionFile(bundle, section)?.hash ?? null;
+      if (section === 'settings') await updateDrawtoolsSettingsRaw(adminToken, editor, base);
+      else if (section === 'characters') await updateDrawtoolsCharactersRaw(adminToken, editor, base);
+      else if (section === 'node') await updateNodeRaw(adminToken, PLANNER_NODE, editor, base);
+      else await updateDrawtoolsPromptRaw(adminToken, section, editor, base);
       if (tokenChanged(adminToken)) return;
       setMessage('已保存。用户配置文件会写入非 example 文件，后续更新不会覆盖。');
       await load();
@@ -273,16 +279,16 @@ export const DrawtoolsSettingsPage = () => {
 
   // 结构化字段是 onBlur 直写，写完 load() 会把原始编辑器重置掉 —— 有草稿时先问一声。
   const saveStructured = async (
-    base: string,
+    file: DrawtoolsRawFile | undefined,
     next: Record<string, unknown>,
-    write: (token: string, content: string) => Promise<unknown>,
+    write: (token: string, content: string, baseHash: string | null) => Promise<RawSaveResult>,
     okText: string,
     failText: string,
   ) => {
     if (!adminToken || !confirmDiscard()) return;
     try {
-      const { content, message: done } = rewriteStructured(base, next, okText);
-      await write(adminToken, content);
+      const { content, message: done } = rewriteStructured(file?.content || '', next, okText);
+      await write(adminToken, content, file?.hash ?? null);
       if (tokenChanged(adminToken)) return;
       setMessage(done);
       await load();
@@ -293,11 +299,11 @@ export const DrawtoolsSettingsPage = () => {
   };
 
   const saveSettingsObject = (next: any, okText: string) => saveStructured(
-    bundle?.settings?.content || '', next, updateDrawtoolsSettingsRaw, okText, '保存设置失败',
+    bundle?.settings, next, updateDrawtoolsSettingsRaw, okText, '保存设置失败',
   );
 
   const saveCharacterObject = (next: any, okText: string) => saveStructured(
-    bundle?.character_tags?.content || '', next, updateDrawtoolsCharactersRaw, okText, '保存角色标签库失败',
+    bundle?.character_tags, next, updateDrawtoolsCharactersRaw, okText, '保存角色标签库失败',
   );
 
   const updateApiField = (key: string, value: string) => {

@@ -113,6 +113,15 @@ QQ_NAPCAT = PlatformDescriptor(
         InstancePort("bridge", 8769, 10),
         InstancePort("napcat", 6099, 100),
     ),
+    # 和 adapters.onebot.provisioning.instance_env 写进 .env 的那几行一一对应。
+    instance_env=(
+        "HOST",
+        "PORT",
+        "ONEBOT_FORWARD_BRIDGE_PORT",
+        "NAPCAT_WEBUI_URL",
+        "NAPCAT_WEBUI_TOKEN",
+        "ONEBOT_ACCESS_TOKEN",
+    ),
     # NoneBot 宿主，注册 OneBot V11 适配器后加载 adapters.onebot。
     entrypoints=("bot.py",),
 )

@@ -17,13 +17,15 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import ValidationError
 
+import config_layout
 from clonoth_runtime import load_workspace_env
 from engine.attachments import blocked_file_reject_reason
 from platforms.registry import conversation_key_prefix, features_module
 
-from . import provisioning
+from . import provisioning, share_groups
 from .config_store import ConfigStore
 from .sticker_api import create_sticker_router
+from .tool_watch import ToolTreeWatch
 from .instances import load_instances, url_prefix
 from .log_access import LogReader
 from .process_manager import ProcessManager
@@ -252,7 +254,10 @@ def create_app(
         cs: ConfigStore = app.state.config_store
         st: SupervisorState = app.state.state
 
-        out = cs.update_openai(body)
+        try:
+            out = cs.update_openai(body)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         st.eventlog.append(
             session_id="__system__",
             component="supervisor",
@@ -301,14 +306,17 @@ def create_app(
     async def get_policy(request: Request) -> dict[str, Any]:
         verify_admin_token(request)
         st: SupervisorState = app.state.state
-        return {"policy": st.policy.export_config()}
+        policy, digest = st.policy.export_versioned()
+        return {"policy": policy, "hash": digest}
 
     @app.put("/v1/config/policy")
     async def put_policy(body: PolicyUpdateIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
         st: SupervisorState = app.state.state
         try:
-            saved = st.policy.replace_config(body.policy)
+            saved, digest = st.policy.replace_config(body.policy, base_hash=body.base_hash)
+        except config_layout.ConfigConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         # 策略是整套权限判定的根。改了什么必须能事后查，否则出事时无从复盘。
@@ -323,7 +331,7 @@ def create_app(
                 "policy": saved,
             },
         )
-        return {"policy": saved}
+        return {"policy": saved, "hash": digest}
 
     @app.get("/v1/config/system-models")
     async def get_system_models(request: Request) -> dict[str, Any]:
@@ -461,7 +469,10 @@ def create_app(
     async def update_fallbacks(body: FallbacksUpdateIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
-        return _providers_payload(cs.update_fallbacks(body.fallbacks))
+        try:
+            return _providers_payload(cs.update_fallbacks(body.fallbacks))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     @app.put("/v1/config/node-fallbacks/{node_id}")
     async def update_node_fallbacks(
@@ -795,9 +806,14 @@ def create_app(
         result = st.register_engine(worker_id, generation_id)
         return result
 
+    tool_watch = ToolTreeWatch(state.workspace_root)
+
     @app.get("/v1/tools/reload-seq")
     async def tools_reload_seq() -> dict[str, Any]:
         st: SupervisorState = app.state.state
+        # 共享组里别的实例改了工具目录不会通知这边，engine 靠这里的序号变了才重载。
+        if tool_watch.changed():
+            st.bump_tools_reload()
         return {"seq": st.tools_reload_seq()}
 
     @app.post("/v1/tools/reload")
@@ -2215,6 +2231,61 @@ def create_app(
         except provisioning.ProvisionError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return {"ok": True, "id": row["id"]}
+
+    # ----- 共享配置组 -----
+    # 换的是本实例 config/ 指向哪里。换完要重启 engine 才会重新加载工具和节点，由控制台接着发重启。
+
+    @app.get("/v1/share-groups")
+    async def list_share_groups(request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        return await asyncio.to_thread(share_groups.overview, st.workspace_root)
+
+    async def _change_share_group(action: str, change: Any) -> dict[str, Any]:
+        st: SupervisorState = app.state.state
+        try:
+            result = await asyncio.to_thread(change)
+        except (share_groups.ShareGroupError, config_layout.ConfigLayoutError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except OSError as error:
+            raise HTTPException(status_code=500, detail=f"共享配置没切换成功：{error}") from error
+        # 换了整套配置，事后要能查到是谁在什么时候换的。
+        st.eventlog.append(
+            session_id="__system__",
+            component="supervisor",
+            type_="share_group_changed",
+            payload={"action": action, **result, "ts": _now().isoformat()},
+        )
+        overview = await asyncio.to_thread(share_groups.overview, st.workspace_root)
+        return {**result, "overview": overview}
+
+    @app.post("/v1/share-groups")
+    async def create_share_group(request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        body = await request.json() if await request.body() else {}
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="请求体要是对象")
+        name = body.get("name")
+        return await _change_share_group("create", lambda: share_groups.create_group(st.workspace_root, name))
+
+    @app.post("/v1/share-groups/leave")
+    async def leave_share_group(request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        return await _change_share_group("leave", lambda: share_groups.leave_group(st.workspace_root))
+
+    @app.post("/v1/share-groups/{name}/join")
+    async def join_share_group(name: str, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        return await _change_share_group("join", lambda: share_groups.join_group(st.workspace_root, name))
+
+    @app.delete("/v1/share-groups/{name}")
+    async def delete_share_group(name: str, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        return await _change_share_group("delete", lambda: share_groups.delete_group(st.workspace_root, name))
 
     web_dist = state.workspace_root / "adapters" / "web" / "frontend" / "dist"
     console_url = ""

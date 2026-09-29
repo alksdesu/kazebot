@@ -12,6 +12,7 @@ vi.mock('../api/supervisorClient', async importOriginal => ({
   getInstances: vi.fn(), getPlatformAccount: vi.fn(), getPlatformLoginQrcode: vi.fn(),
   createInstance: vi.fn(), deleteInstance: vi.fn(), getInstanceProgress: vi.fn(),
   enterPlatformLoginMode: vi.fn(), switchPlatformAccount: vi.fn(), pinPlatformAccount: vi.fn(), getAccountScope: vi.fn(),
+  getShareGroups: vi.fn(),
 }));
 
 const rows: api.ConsoleInstance[] = [
@@ -37,6 +38,10 @@ beforeEach(() => {
   vi.mocked(api.getAccountScope).mockResolvedValue({
     current_scope: '1000001', live_scope: '1000001', bot_alive: false, preview: null, ambiguous_sources: [],
   });
+  // 同一页上还挂着共享配置那一块，这里只管实例管理，让它报「用不上」收起自己。
+  vi.mocked(api.getShareGroups).mockResolvedValue({
+    available: false, reason: '这台机器没开共享配置', current: null, groups: [], archives: [],
+  });
   vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('unexpected request')));
   window.history.replaceState(null, '', '/web/?view=settings&tab=qq-account');
 });
@@ -56,6 +61,18 @@ describe('实例管理入口', () => {
     expect(screen.queryByText('已保存的模板')).not.toBeInTheDocument();
     expect(fetch).not.toHaveBeenCalled();
     expect(api.getInstances).toHaveBeenCalledTimes(1);
+  });
+
+  it('实例说明指向下面那块共享配置，那一块就排在多开实例和账号之间', async () => {
+    vi.mocked(api.getShareGroups).mockResolvedValue({
+      available: true, reason: '', current: null, groups: [], archives: [],
+    });
+    render(<AccountWorkspaceSlot />);
+    await screen.findByRole('combobox', { name: '切换实例' });
+
+    expect(screen.getByText(/要共用配置见下面的「共享配置」/)).toBeInTheDocument();
+    expect(screen.getAllByRole('heading', { level: 2 }).map(node => node.textContent))
+      .toEqual(['多开实例', '共享配置', '机器人账号', '快速切换', '记忆归属']);
   });
 
   it('每行标出实例名和它跑的那个平台加号', async () => {
@@ -252,6 +269,7 @@ describe('实例创建与归档', () => {
     ['Xiaoyu', '', '实例名要以小写字母开头，只用小写字母、数字和下划线，2-32 位'],
     ['bot-2', '', '实例名要以小写字母开头，只用小写字母、数字和下划线，2-32 位'],
     ['stickers', '', '实例名要以小写字母开头，只用小写字母、数字和下划线，2-32 位'],
+    ['shared', '', '实例名要以小写字母开头，只用小写字母、数字和下划线，2-32 位'],
     ['xiaoyu', '', '已经有叫这个名字的实例了，换一个。'],
     ['xiaoyu2', '1000002', '这个 QQ 号已经归实例「第二实例」管了，请直接切换到它的控制台。'],
     ['xiaoyu2', '1000001', '这个 QQ 号已经归实例「主实例」管了，请直接切换到它的控制台。'],

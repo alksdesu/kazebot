@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+import config_layout
 from platforms.descriptor import HOOK_INSTANCE_ENV, PlatformDescriptor
 from platforms.ids import normalize_id
 from platforms.registry import (
@@ -42,10 +43,10 @@ from .instances import (
 # 实例名会一路传进 root 侧的 systemd 单元名，宽一格都是提权面。纯数字那支认改造前按 QQ 号开的实例。
 INSTANCE_ID_PATTERN = r"[a-z][a-z0-9_]{1,31}|[1-9][0-9]{4,10}"
 _INSTANCE_ID_RE = re.compile(rf"^(?:{INSTANCE_ID_PATTERN})$")
-# 数据根下已有的共享目录。实例叫这个名字，工作区就和它是同一个目录。
-RESERVED_IDS = frozenset({"stickers"})
-# 工作区里这几个名字必须解析到代码：workspace_root 直接拼接它们找 dist、system_nodes 和工具。
-_LINKED = ("adapters", "engine", "plugins", "tools")
+# 数据根下已有的共享目录：表情包库和共享配置组。实例叫这个名字，工作区就和它是同一个目录。
+RESERVED_IDS = frozenset({"stickers", config_layout.SHARED_DIR})
+# 工作区里这几个名字必须解析到代码：workspace_root 直接拼接它们找 dist、system_nodes、工具和仓库默认。
+_LINKED = config_layout.CODE_LINKS
 # 磁盘每个实例每月涨 4G 左右，留不出这么多就别开新实例了。
 _MIN_FREE_BYTES = 8 * 1024**3
 
@@ -74,7 +75,7 @@ def validate_instance_id(raw: str) -> str:
     instance_id = str(raw or "").strip()
     if not _INSTANCE_ID_RE.match(instance_id) or instance_id in RESERVED_IDS:
         raise ProvisionError(
-            "实例名要以小写字母开头、只含小写字母数字和下划线，2-32 位（不能叫 stickers）；"
+            f"实例名要以小写字母开头、只含小写字母数字和下划线，2-32 位（不能叫 {'、'.join(sorted(RESERVED_IDS))}）；"
             "按 QQ 号开的老实例是 5-11 位数字"
         )
     return instance_id

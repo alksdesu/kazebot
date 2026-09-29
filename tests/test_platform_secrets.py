@@ -363,10 +363,11 @@ class TestNapCatWebuiToken:
 
         assert NapCatClient(root)._webui_token() == "from-config"
 
-    def test_the_first_assignment_in_dotenv_wins(self, tmp_path: Path) -> None:
+    def test_the_last_assignment_in_dotenv_wins(self, tmp_path: Path) -> None:
+        # 和进程启动时灌 .env 一致：dotenv 取最后一行。
         root = _workspace(tmp_path, dotenv=f"{WEBUI_ENV}=first\n{WEBUI_ENV}=second\n")
 
-        assert NapCatClient(root)._webui_token() == "first"
+        assert NapCatClient(root)._webui_token() == "second"
 
     def test_the_process_environment_is_not_consulted(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # 多开时每个实例连自己的容器，地址和令牌得出自同一份工作区文件；进程环境里那份可能是别的实例的。

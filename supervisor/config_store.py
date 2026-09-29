@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import contextlib
+import copy
+import logging
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import ValidationError
+
 from clonoth_runtime import (
     CONFIG_META_KEYS,
     IMAGE_TOOL_SLOTS,
@@ -24,6 +30,15 @@ from .types import (
     OpenAIConfigSecret,
     OpenAIConfigUpdateIn,
 )
+
+_log = logging.getLogger(__name__)
+
+# 文件不存在或是空的时候，按这份起步。
+_EMPTY_CONFIG: dict[str, Any] = {"version": 1, "provider": "openai"}
+
+
+class ConfigUnreadable(ValueError):
+    """config/models.yaml 现在解析不了。改写被拒：拿默认值盖上去，等于把整个共享组的渠道一起清空。"""
 
 
 def _resolve_env_value(value: str) -> str:
@@ -70,79 +85,122 @@ class ConfigStore:
         self._root = Path(workspace_root) if workspace_root is not None else path.parent.parent
         self._lock = threading.RLock()
         self._config: AppConfigSecret = AppConfigSecret()
-        self._extra_keys: dict[str, Any] = {}  # preserve unknown top-level keys
+        # 最近一次解析成功的原文，读接口都从这里取；文件写坏时它和 _config 一起停在上一份能用的配置上。
+        self._raw: dict[str, Any] = dict(_EMPTY_CONFIG)
+        # 已经按哪个文件版本读过，None 是文件不存在。
+        self._stamp: tuple[int, int, int] | None = None
+        self._error = ""
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_file()
         self.reload()
 
-    def _load_yaml_dict(self) -> dict[str, Any] | None:
-        if not self.path.exists():
-            return None
+    # ---------------------------------------------------------------- 读
 
-        text = self.path.read_text(encoding="utf-8")
+    def _read_file(self) -> dict[str, Any]:
+        """文件现状解析成 dict。不存在或是空的按空配置算；解析不了、顶层不是映射抛 ConfigUnreadable。"""
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return dict(_EMPTY_CONFIG)
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ConfigUnreadable(f"读不了 {config_layout.MODELS_FILE}：{exc}") from exc
         if not text.strip():
-            return None
-
-        data = yaml.safe_load(text)
+            return dict(_EMPTY_CONFIG)
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            raise ConfigUnreadable(f"{config_layout.MODELS_FILE} 解析失败：{exc}") from exc
         if data is None:
-            return None
+            return dict(_EMPTY_CONFIG)
         if not isinstance(data, dict):
-            return None
+            raise ConfigUnreadable(f"{config_layout.MODELS_FILE} 顶层必须是映射（key: value）")
         return data
 
-    def _write(self, text: str) -> None:
-        config_layout.write_config_text(
-            self.path, text, mode=config_layout.private_mode_for(self._root, self.path),
-        )
+    def _load_locked(self) -> None:
+        """按文件现状重读，从不写回。解析不了或字段不合法时留着上一份能用的，文件原样不动，等人去修。"""
+        stamp = config_layout.file_stamp(self.path)
+        try:
+            data = self._read_file()
+            config = AppConfigSecret.model_validate(data)
+        except (ConfigUnreadable, ValidationError) as exc:
+            if stamp != self._stamp or not self._error:
+                _log.warning("%s 用不了，继续用上一份能用的配置：%s", config_layout.MODELS_FILE, exc)
+            self._stamp = stamp
+            self._error = str(exc)
+            return
+        self._raw = data
+        self._config = config
+        self._stamp = stamp
+        self._error = ""
 
-    def _save_yaml(self, cfg: AppConfigSecret) -> None:
-        # [2026-05-24] Preserve unknown top-level keys (e.g. fallbacks) that
-        # plugins may have added to models.yaml but are not part of the
-        # AppConfigSecret Pydantic model. Without this, reload() would strip
-        # any key not declared in the model.
-        data = cfg.model_dump(mode="json")
-        if self._extra_keys:
-            data.update(self._extra_keys)
-        text = yaml.safe_dump(
-            data,
-            sort_keys=False,
-            allow_unicode=True,
-        )
-        self._write(text)
+    @contextlib.contextmanager
+    def _current(self) -> Iterator[None]:
+        """读之前对一下文件：共享组里别的实例、控制台的原文编辑器都会直接改它。"""
+        with self._lock:
+            if config_layout.file_stamp(self.path) != self._stamp:
+                self._load_locked()
+            yield
 
     def reload(self) -> AppConfigSecret:
         with self._lock:
-            data = self._load_yaml_dict()
-            if data is None:
-                self._config = AppConfigSecret()
-                self._save_yaml(self._config)
-                return self._config.model_copy(deep=True)
-
-            # Capture top-level keys not in the Pydantic model
-            _known_keys = set(AppConfigSecret.model_fields.keys())
-            self._extra_keys = {k: v for k, v in data.items() if k not in _known_keys}
-            try:
-                self._config = AppConfigSecret.model_validate(data)
-            except Exception:
-                # 备份坏配置，写回默认值
-                try:
-                    bak = self.path.with_suffix(self.path.suffix + ".bak")
-                    if self.path.exists() and not bak.exists():
-                        self.path.replace(bak)
-                except Exception:
-                    pass
-
-                self._config = AppConfigSecret()
-                self._save_yaml(self._config)
-                return self._config.model_copy(deep=True)
-
-            # 写回一次，确保字段齐全且格式统一
-            self._save_yaml(self._config)
+            self._load_locked()
             return self._config.model_copy(deep=True)
+
+    @property
+    def load_error(self) -> str:
+        """文件现在为什么用不了；空串表示用的就是文件里那份。"""
+        with self._current():
+            return self._error
 
     def get_secret(self) -> AppConfigSecret:
-        with self._lock:
+        with self._current():
             return self._config.model_copy(deep=True)
+
+    # ---------------------------------------------------------------- 写
+
+    def _ensure_file(self) -> None:
+        """文件还不存在时建一份默认值，原文编辑器才有东西可开。已有的一个字节都不动。"""
+        if self.path.exists():
+            return
+        try:
+            config_layout.write_config_text(
+                self.path,
+                self._dump(AppConfigSecret().model_dump(mode="json")),
+                base_hash="",
+                mode=config_layout.private_mode_for(self._root, self.path),
+            )
+        except config_layout.ConfigConflict:
+            # 共享组里别的实例刚好先建好了。
+            pass
+
+    @staticmethod
+    def _dump(data: dict[str, Any]) -> str:
+        return yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+
+    @contextlib.contextmanager
+    def _editing(self) -> Iterator[dict[str, Any]]:
+        """改一份模型配置：拿着文件锁读最新的原文交给调用方改，改完原地写回再重读。
+
+        读和写之间一直拿着锁：共享组里几个实例的控制台可能同时在改这一份，各读各写会丢掉对方的改动。
+        调用方中途抛错就什么都不写。文件解析不了时抛 ConfigUnreadable，不拿默认值盖上去。
+        """
+        with self._lock, config_layout.locked(self.path):
+            self._load_locked()
+            if self._error:
+                raise ConfigUnreadable(f"{self._error}。先在原文编辑器里修好再改")
+            data = copy.deepcopy(self._raw)
+            yield data
+            # 没改动就不写：写一次就把手写的注释和排版洗掉一次，组里别的实例也会跟着重读。
+            if data == self._raw:
+                return
+            try:
+                AppConfigSecret.model_validate(data)
+            except ValidationError as exc:
+                raise ValueError(f"改完的配置不合法，没有写入：{exc}") from exc
+            config_layout.write_locked(
+                self.path, self._dump(data), mode=config_layout.private_mode_for(self._root, self.path),
+            )
+            self._load_locked()
 
     def _openai_public(self, openai: OpenAIConfigSecret) -> OpenAIConfigPublic:
         # present 按展开后判断：${MISSING} 引用得到的是一把用不了的钥匙。
@@ -154,7 +212,7 @@ class ConfigStore:
         )
 
     def get_public(self) -> AppConfigPublic:
-        with self._lock:
+        with self._current():
             return self._active_public(self._active_name())
 
     def _active_name(self) -> str:
@@ -185,7 +243,7 @@ class ConfigStore:
         )
 
     def get_openai_secret(self) -> ActiveProviderSecret:
-        with self._lock:
+        with self._current():
             name = self._active_name()
             cfg = self._block_of(name)
             return ActiveProviderSecret(
@@ -197,33 +255,26 @@ class ConfigStore:
             )
 
     def get_openai_public(self) -> OpenAIConfigPublic:
-        with self._lock:
+        with self._current():
             return self._openai_public(self._block_of(self._active_name()))
 
     def update_openai(self, update: OpenAIConfigUpdateIn) -> AppConfigPublic:
         """改当前活跃渠道的三项。QQ 里的「/切换模型」走这条。"""
-        with self._lock:
+        fields = {
+            "base_url": update.base_url,
+            "api_key": update.api_key,
+            "model": update.model,
+        }
+        with self._editing() as data:
             name = self._active_name()
-            fields = {
-                "base_url": update.base_url,
-                "api_key": update.api_key,
-                "model": update.model,
-            }
-            if name == "openai":
-                cfg = self._config
-                for field, value in fields.items():
-                    if value is not None:
-                        setattr(cfg.openai, field, value.strip())
-                self._save_yaml(cfg)
-                self._config = cfg
-            else:
-                data = self._load_raw()
-                for field, value in fields.items():
-                    if value is not None:
-                        data[name][field] = value.strip()
-                self._save_raw(data)
-                self.reload()
-
+            block = data.get(name)
+            if not isinstance(block, dict):
+                block = {}
+                data[name] = block
+            for field, value in fields.items():
+                if value is not None:
+                    block[field] = value.strip()
+        with self._current():
             return self._active_public(name)
 
     # ================================================================
@@ -231,13 +282,9 @@ class ConfigStore:
     # ================================================================
 
     def _load_raw(self) -> dict[str, Any]:
-        """Load raw YAML dict from disk."""
-        return self._load_yaml_dict() or {"version": 1, "provider": "openai"}
-
-    def _save_raw(self, data: dict[str, Any]) -> None:
-        """Write raw dict to YAML file."""
-        text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
-        self._write(text)
+        """最近一次解析成功的原文，给调用方一份自己的副本。"""
+        with self._current():
+            return copy.deepcopy(self._raw)
 
     def _type_of(self, name: str, data: dict[str, Any] | None = None) -> str:
         """这个渠道说哪种线格式。
@@ -318,7 +365,7 @@ class ConfigStore:
 
     def get_providers_public(self) -> dict[str, Any]:
         """Return all providers with redacted api_keys, plus active_provider and fallbacks."""
-        with self._lock:
+        with self._current():
             data = self._load_raw()
             active = data.get("provider", "openai")
             fallbacks = data.get("fallbacks", []) or []
@@ -353,12 +400,12 @@ class ConfigStore:
 
     def wire_of(self, name: str) -> str:
         """这个渠道按哪种线格式发请求。查 providers 注册表前都得先过这一层。"""
-        with self._lock:
+        with self._current():
             return self._type_of((name or "").strip() or self._active_name())
 
     def channel_names(self) -> list[str]:
         """配置里有块的那些渠道名。大小写敏感 —— 节点和备选链是按原名查块的。"""
-        with self._lock:
+        with self._current():
             data = self._load_raw()
         return [
             key for key, val in data.items()
@@ -370,7 +417,7 @@ class ConfigStore:
 
         绝不能进任何响应体：调用方要么拿它去请求上游，要么什么都不做。
         """
-        with self._lock:
+        with self._current():
             block = self._load_raw().get(name)
         if not isinstance(block, dict):
             return "", ""
@@ -384,7 +431,7 @@ class ConfigStore:
         known = {spec.key for spec in SYSTEM_MODEL_SLOTS}
         if slot not in known:
             return "", ""
-        with self._lock:
+        with self._current():
             blocks = self._load_raw().get("system_models")
             block = blocks.get(slot) if isinstance(blocks, dict) else None
         if not isinstance(block, dict):
@@ -400,7 +447,7 @@ class ConfigStore:
         块里显式写了就听它的；没写按这家 provider 的默认算 —— 带图消息靠它决定
         直接走主模型还是绕去视觉节点。
         """
-        with self._lock:
+        with self._current():
             data = self._load_raw()
             block_name = (name or "").strip() or self._active_name()
             block = data.get(block_name)
@@ -421,8 +468,7 @@ class ConfigStore:
                         wire: str | None = None, label: str | None = None) -> dict[str, Any]:
         """Create or update a provider entry."""
         self._check_channel_name(name)
-        with self._lock:
-            data = self._load_raw()
+        with self._editing() as data:
             if name not in data or not isinstance(data.get(name), dict):
                 data[name] = {}
             if wire is not None:
@@ -450,13 +496,11 @@ class ConfigStore:
                     data[name].pop("supports_vision", None)
                 else:
                     data[name]["supports_vision"] = supports_vision == "yes"
-            self._save_raw(data)
-            self.reload()
-            return self.get_providers_public()
+        return self.get_providers_public()
 
     def get_system_models_public(self) -> dict[str, Any]:
         """系统槽位的对外形状。密钥同样只报有无。"""
-        with self._lock:
+        with self._current():
             configured = self._load_raw().get("system_models")
             configured = configured if isinstance(configured, dict) else {}
             slots = []
@@ -508,8 +552,7 @@ class ConfigStore:
         text = str(name or "").strip()
         if text and text not in IMAGE_TOOL_SLOTS:
             raise ValueError(f"Unknown image tool '{text}'")
-        with self._lock:
-            data = self._load_raw()
+        with self._editing() as data:
             block = data.get("image_gen")
             if not isinstance(block, dict):
                 block = {}
@@ -523,9 +566,7 @@ class ConfigStore:
                     data["image_gen"] = block
                 else:
                     data.pop("image_gen", None)
-            self._save_raw(data)
-            self.reload()
-            return self.get_system_models_public()
+        return self.get_system_models_public()
 
     def update_system_model(
         self, slot: str, *, base_url: str | None = None, api_key: str | None = None,
@@ -535,8 +576,7 @@ class ConfigStore:
         known = {spec.key for spec in SYSTEM_MODEL_SLOTS}
         if slot not in known:
             raise ValueError(f"Unknown system model slot '{slot}'")
-        with self._lock:
-            data = self._load_raw()
+        with self._editing() as data:
             blocks = data.get("system_models")
             if not isinstance(blocks, dict):
                 blocks = {}
@@ -561,21 +601,16 @@ class ConfigStore:
                 blocks.pop(slot, None)
             if not blocks:
                 data.pop("system_models", None)
-            self._save_raw(data)
-            self.reload()
-            return self.get_system_models_public()
+        return self.get_system_models_public()
 
     def set_active_provider(self, name: str) -> dict[str, Any]:
         """Switch the active provider."""
         self._check_channel_name(name)
-        with self._lock:
-            data = self._load_raw()
+        with self._editing() as data:
             if name not in data or not is_channel_block(data.get(name)):
                 raise ValueError(f"Provider '{name}' not found in config")
             data["provider"] = name
-            self._save_raw(data)
-            self.reload()
-            return self.get_providers_public()
+        return self.get_providers_public()
 
     # 读接口派生出来给编辑器用的字段。原样回写会在 yaml 里留下引擎不认识的键。
     # 备选条目认 provider 不认 type：那两个键是渠道块的东西，跟着读接口漏过来的。
@@ -633,12 +668,9 @@ class ConfigStore:
 
     def update_fallbacks(self, fallbacks: list[dict[str, Any]]) -> dict[str, Any]:
         """Replace the fallback chain."""
-        with self._lock:
-            data = self._load_raw()
+        with self._editing() as data:
             data["fallbacks"] = self._merge_chain(fallbacks, data.get("fallbacks") or [])
-            self._save_raw(data)
-            self.reload()
-            return self.get_providers_public()
+        return self.get_providers_public()
 
     def update_node_fallbacks(self, node_id: str, fallbacks: list[dict[str, Any]] | None) -> dict[str, Any]:
         """按节点的专属备选链。传 None 表示删掉这条，让该节点回退到全局链。
@@ -649,8 +681,7 @@ class ConfigStore:
         node = (node_id or "").strip()
         if not node:
             raise ValueError("node id is empty")
-        with self._lock:
-            data = self._load_raw()
+        with self._editing() as data:
             chains = data.get("node_fallbacks")
             if not isinstance(chains, dict):
                 chains = {}
@@ -668,9 +699,7 @@ class ConfigStore:
                 data["node_fallbacks"] = chains
             else:
                 data.pop("node_fallbacks", None)
-            self._save_raw(data)
-            self.reload()
-            return self.get_providers_public()
+        return self.get_providers_public()
 
     def _node_chain_key(self, chains: dict[str, Any], node_id: str) -> str | None:
         """节点实际生效的链记在哪个键下：先认现在的 id，再按声明顺序认旧 id，和引擎查的顺序一样。"""
@@ -682,22 +711,18 @@ class ConfigStore:
     def delete_provider(self, name: str) -> dict[str, Any]:
         """Delete a provider entry."""
         self._check_channel_name(name)
-        with self._lock:
-            data = self._load_raw()
-            if name not in data:
-                return self.get_providers_public()
-            if data.get("provider") == name:
-                raise ValueError(f"Cannot delete active provider '{name}'; switch to another first")
-            del data[name]
-            fb = data.get("fallbacks", []) or []
-            data["fallbacks"] = [f for f in fb if f.get("provider") != name]
-            # 节点链也得跟着清：漏在这里的条目会拿着已经不存在的渠道名去查配置，
-            # 继承到一份空的 url+key，然后在真的降级时才炸。
-            chains = data.get("node_fallbacks")
-            if isinstance(chains, dict):
-                for node_id, chain in list(chains.items()):
-                    if isinstance(chain, list):
-                        chains[node_id] = [f for f in chain if f.get("provider") != name]
-            self._save_raw(data)
-            self.reload()
-            return self.get_providers_public()
+        with self._editing() as data:
+            if name in data:
+                if data.get("provider") == name:
+                    raise ValueError(f"Cannot delete active provider '{name}'; switch to another first")
+                del data[name]
+                fb = data.get("fallbacks", []) or []
+                data["fallbacks"] = [f for f in fb if f.get("provider") != name]
+                # 节点链也得跟着清：漏在这里的条目会拿着已经不存在的渠道名去查配置，
+                # 继承到一份空的 url+key，然后在真的降级时才炸。
+                chains = data.get("node_fallbacks")
+                if isinstance(chains, dict):
+                    for node_id, chain in list(chains.items()):
+                        if isinstance(chain, list):
+                            chains[node_id] = [f for f in chain if f.get("provider") != name]
+        return self.get_providers_public()

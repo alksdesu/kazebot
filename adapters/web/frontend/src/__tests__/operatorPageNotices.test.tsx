@@ -891,8 +891,8 @@ describe('节点文件页的提示', () => {
   beforeEach(() => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     vi.mocked(api.getNodeFiles).mockResolvedValue([nodeFile('qq.orchestrator.yaml')]);
-    vi.mocked(api.getNodeFileRaw).mockResolvedValue('id: qq');
-    vi.mocked(api.updateNodeFileRaw).mockResolvedValue({ ok: true });
+    vi.mocked(api.getNodeFileRaw).mockResolvedValue({ content: 'id: qq', hash: 'file-1' });
+    vi.mocked(api.updateNodeFileRaw).mockResolvedValue({ ok: true, hash: 'file-2' });
     vi.mocked(api.deleteNodeFile).mockResolvedValue({ ok: true, restored: true });
   });
 
@@ -963,10 +963,10 @@ describe('节点文件页的提示', () => {
   });
 
   it('换文件立刻清掉上一份的提示，读失败再显示原因', async () => {
-    const second = deferred<string>();
+    const second = deferred<api.RawText>();
     vi.mocked(api.getNodeFiles).mockResolvedValue([nodeFile('a.yaml'), nodeFile('b.yaml')]);
     vi.mocked(api.getNodeFileRaw).mockImplementation(async (_token, name) => (
-      name === 'a.yaml' ? 'id: a' : second.promise
+      name === 'a.yaml' ? { content: 'id: a', hash: 'a-1' } : second.promise
     ));
     render(<NodeFilesSettingsPage />);
     await tick();

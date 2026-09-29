@@ -14,6 +14,8 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import config_layout
+
 
 _logger = logging.getLogger(__name__)
 
@@ -506,10 +508,9 @@ def _resolve_file_url(url: str, workspace_root: Path) -> str | None:
 
     p = (workspace_root / rel_path).resolve()
 
-    # Security: must be under workspace_root
-    try:
-        p.relative_to(workspace_root.resolve())
-    except ValueError:
+    # 解析到底之后还得落在 data/ 下：共享表情包库经受信链接认回 data/stickers；data/ 里随手建的软链指到别处一律不发。
+    logical = config_layout.workspace_logical_path(workspace_root, p)
+    if logical is None or not is_allowed_attachment_path(logical):
         return None
 
     if not p.exists() or not p.is_file():

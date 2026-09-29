@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping
 
 import yaml
 
+import config_layout
+
 from . import capability
 from .env import split_list
 from .yaml_loader import load_yaml
@@ -323,12 +325,12 @@ def _check_layering(keys: tuple[LiveKey, ...], layer: str, defaults: "LiveConfig
         raise ValueError("invalid live config layering: " + "; ".join(problems))
 
 
-def _file_stamp(path: Path) -> tuple[int, int]:
-    try:
-        st = path.stat()
-    except OSError:
-        return (0, 0)
-    return (st.st_mtime_ns, st.st_size)
+# 文件不在时的指纹，和 config_layout.file_stamp 同形状。
+_MISSING_STAMP: tuple[int, int, int] = (0, 0, 0)
+
+
+def _file_stamp(path: Path) -> tuple[int, int, int]:
+    return config_layout.file_stamp(path) or _MISSING_STAMP
 
 
 def jsonable(value: Any) -> Any:
@@ -340,9 +342,9 @@ def jsonable(value: Any) -> Any:
     return value
 
 
-def _parse_document(path: Path, stamp: tuple[int, int]) -> tuple[Mapping[str, Any] | None, str]:
+def _parse_document(path: Path, stamp: tuple[int, int, int]) -> tuple[Mapping[str, Any] | None, str]:
     """文件解析成文档。文件不存在是空文档；解析不了返回 None 和原因。"""
-    if stamp == (0, 0):
+    if stamp == _MISSING_STAMP:
         return {}, ""
     try:
         loaded = load_yaml(path.read_text(encoding="utf-8"))
@@ -360,13 +362,13 @@ class _Cache:
     path: str = ""
     # None = 强制重解析。和 valid 分开两个字段：invalidate() 只能让缓存过期，
     # 不能把「上一份有效配置」一起丢掉 —— 否则写坏 yaml 时白名单会塌成空。
-    stamp: tuple[int, int] | None = None
+    stamp: tuple[int, int, int] | None = None
     # values 是从哪个文件版本来的。和 stamp 不同：解析失败时 stamp 记的是坏文件，
     # values 还是旧的那份 —— 外部要靠这个才能区分「已生效」和「还在用旧配置」。
-    values_stamp: tuple[int, int] = (0, 0)
+    values_stamp: tuple[int, int, int] = _MISSING_STAMP
     document: Mapping[str, Any] = field(default_factory=dict)
-    # 采纳过几次文档。拿这一层当默认值的配置按它判断要不要重算：同一秒内改两次、
-    # 大小又没变时指纹认不出来。
+    # 采纳过几次文档。拿这一层当默认值的配置按它判断要不要重算：看的是这层换没换文档，
+    # 全局文件写坏、留用上一份时不必重算。
     generation: int = 0
     values: Mapping[str, Any] = field(default_factory=dict)
     sources: Mapping[str, str] = field(default_factory=dict)
@@ -451,7 +453,7 @@ class LiveConfig:
                     "%s sets %s, but %s sets it too and wins; the line in %s has no effect", here, key.path, there, here,
                 )
 
-    def _adopt_file_locked(self, path: Path, key: str, stamp: tuple[int, int]) -> None:
+    def _adopt_file_locked(self, path: Path, key: str, stamp: tuple[int, int, int]) -> None:
         """重解析这一层的文件并采纳。持有 _cache_lock 时调。"""
         cache = self._cache
         document, error = _parse_document(path, stamp)
@@ -467,7 +469,7 @@ class LiveConfig:
             if not had_valid:
                 # 从没读到过有效内容（进程起来时文件就是坏的），只能用 env + 默认值兜。
                 cache.document = {}
-                cache.values_stamp = (0, 0)
+                cache.values_stamp = _MISSING_STAMP
                 cache.generation += 1
                 cache.valid = True
             return
@@ -480,7 +482,7 @@ class LiveConfig:
         cache.valid = True
 
     def _reload_if_changed(self) -> Mapping[str, Any]:
-        """按 mtime+size 判断要不要重解析；解析失败保留上一份有效配置。全局那层换了文档也要重算。"""
+        """按文件指纹判断要不要重解析；解析失败保留上一份有效配置。全局那层换了文档也要重算。"""
         # 先在锁外拿全局那层：两把锁不嵌套，谁先谁后都不会死锁。
         defaults_document, defaults_generation = (
             self.defaults.adopted_document() if self.defaults is not None else (None, None)
@@ -550,7 +552,7 @@ class LiveConfig:
             self._snapshot.reset(token)
 
     def invalidate(self) -> None:
-        """让文件缓存过期。别处改过配置文件、而 mtime 粒度可能看不出来时调。
+        """让文件缓存过期，下一次读必定重新解析。
 
         只动缓存不动上下文里钉住的快照 —— 钉住的语义就是「这条消息处理期间配置不变」，
         别人改文件不该把它掀掉。
@@ -568,22 +570,13 @@ class LiveConfig:
         """在本进程内写回配置文件并立刻重载，返回新的生效快照。
 
         生产写入在 supervisor（bot 没起来时也要能改配置），这里是测试与本地工具的入口。
-        dump 阶段就抛掉表示不出来的值、同目录 tmp + replace，避免 bot 读到半截 yaml。
+        dump 阶段就抛掉表示不出来的值；写入和 supervisor 同一把锁、同一套同目录临时文件替换，避免 bot 读到半截 yaml。
         """
         path = self._path()
         if not isinstance(document, Mapping):
             raise TypeError(f"{path.name} must be a mapping, got {type(document).__name__}")
         text = yaml.safe_dump(dict(document), allow_unicode=True, sort_keys=False)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        from engine.eventlog_rotation import eventlog_file_lock
-        from toolbox.text_files import newline_of, write_text_as
-        with eventlog_file_lock(path):
-            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-            try:
-                write_text_as(tmp, text, newline_of(path))
-                os.replace(tmp, path)
-            finally:
-                tmp.unlink(missing_ok=True)
+        config_layout.write_config_text(path, text)
         # 连调用方自己钉住的快照一起解开：保存完立刻读到旧值会被当成「没生效」。
         return self.reload()
 
@@ -628,13 +621,13 @@ class LiveConfig:
         return {
             "config_path": str(path),
             "file": {
-                "exists": stamp != (0, 0),
+                "exists": stamp != _MISSING_STAMP,
                 "mtime_ns": stamp[0],
                 "size": stamp[1],
             },
             # values 实际来自哪个文件版本。和 file 不一致就说明这份文件没被采纳。
             "loaded": {
-                "exists": values_stamp != (0, 0),
+                "exists": values_stamp != _MISSING_STAMP,
                 "mtime_ns": values_stamp[0],
                 "size": values_stamp[1],
             },

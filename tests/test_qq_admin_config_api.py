@@ -19,6 +19,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import config_layout  # noqa: E402
 import supervisor.admin_api as admin_api  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
@@ -113,7 +114,7 @@ class TestReadRaw:
         response = client("GET", f"{_BASE}/raw", headers=_AUTH)
 
         assert response.status_code == 200
-        assert response.json() == {"content": "", "exists": False}
+        assert response.json() == {"content": "", "exists": False, "hash": ""}
 
     def test_it_never_serves_the_example_as_if_it_were_current(
         self, client: Any, tmp_path: Path,
@@ -133,7 +134,7 @@ class TestReadRaw:
 
         response = client("GET", f"{_BASE}/raw", headers=_AUTH)
 
-        assert response.json() == {"content": text, "exists": True}
+        assert response.json() == {"content": text, "exists": True, "hash": config_layout.file_hash(path)}
 
 
 class TestWriteRaw:

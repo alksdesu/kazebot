@@ -216,6 +216,8 @@ def resolve_api_key(settings: dict[str, Any]) -> str:
         value = os.environ.get(env_name, "").strip()
         if value:
             return value
+        # 进程环境里是本实例 .env 的值，没有再看共享密钥文件：共享组里别的实例配上的这边也用得上。
+        return config_layout.shared_secrets(WORKSPACE_ROOT).get(env_name, "")
     return ""
 
 

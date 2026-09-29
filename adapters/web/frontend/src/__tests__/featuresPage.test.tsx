@@ -98,11 +98,12 @@ beforeEach(() => {
   vi.mocked(api.getFeaturesState).mockImplementation(async () => featuresLive());
   vi.mocked(api.getFeaturesRaw).mockImplementation(async () => ({
     content: written.length ? written[written.length - 1] : baseRaw,
+    hash: `features-${written.length}`,
     exists: true,
   }));
   vi.mocked(api.updateFeaturesRaw).mockImplementation(async (_token, content) => {
     written.push(content);
-    return { ok: true, warnings: [] };
+    return { ok: true, hash: `features-${written.length}`, warnings: [] };
   });
 });
 
@@ -310,7 +311,7 @@ describe('保存之后那一句', () => {
     vi.mocked(api.getFeaturesState).mockImplementation(async () => ({ ...featuresLive(), applied: false }));
     vi.mocked(api.updateFeaturesRaw).mockImplementation(async (_token, content) => {
       written.push(content);
-      return { ok: true, warnings };
+      return { ok: true, hash: `features-${written.length}`, warnings };
     });
   };
 
@@ -359,7 +360,7 @@ describe('保存之后那一句', () => {
     signIn();
     vi.mocked(api.updateFeaturesRaw).mockImplementation(async (_token, content) => {
       written.push(content);
-      return { ok: true, warnings: ['bot 没在跑，只校验了 YAML 语法'] };
+      return { ok: true, hash: `features-${written.length}`, warnings: ['bot 没在跑，只校验了 YAML 语法'] };
     });
     configStore(FEATURES_SCOPE).setState({ draft: { reply_to_trigger: false } });
     render(<DefaultsTab />);

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -73,7 +72,7 @@ class Node:
 
 _NODE_SUFFIX = ".yaml"
 # 按旧 id 找节点要把几个节点目录都过一遍，解析出的别名按 (文件, 修改时间) 缓存
-_ALIAS_CACHE: dict[str, tuple[int, tuple[str, ...]]] = {}
+_ALIAS_CACHE: dict[str, tuple[tuple[int, int, int], tuple[str, ...]]] = {}
 _WARNED_ALIAS_CONFLICTS: set[tuple[str, ...]] = set()
 
 
@@ -106,16 +105,15 @@ def _parse_aliases(data: dict[str, Any], stem: str) -> tuple[str, ...]:
 
 
 def _declared_aliases(path: Path) -> tuple[str, ...]:
-    try:
-        mtime = os.stat(path).st_mtime_ns
-    except OSError:
+    stamp = config_layout.file_stamp(path)
+    if stamp is None:
         return ()
     key = str(path.resolve())
     cached = _ALIAS_CACHE.get(key)
-    if cached is not None and cached[0] == mtime:
+    if cached is not None and cached[0] == stamp:
         return cached[1]
     aliases = _parse_aliases(load_yaml_dict(path) or {}, path.stem)
-    _ALIAS_CACHE[key] = (mtime, aliases)
+    _ALIAS_CACHE[key] = (stamp, aliases)
     return aliases
 
 

@@ -13,9 +13,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-import yaml
 from fastapi import HTTPException
 
+import config_layout
+from clonoth_runtime import get_int, load_yaml_dict
 from engine.output_guide import OUTPUT_GUIDE_KEY
 from supervisor.feature_auth import FeatureActor
 from supervisor.types import TaskKind
@@ -35,14 +36,22 @@ class ExecutionService:
         self.state = state
         self.root = Path(state.workspace_root)
         self.store = PlanStore(plans_path(self.root))
-        config_path = self.root / "config/execution.yaml"
-        self.config = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
-        self.config = self.config if isinstance(self.config, dict) else {}
-        self.max_bytes = max(1024, min(int(self.config.get("max_input_bytes", 10 * 1024 * 1024)), 50 * 1024 * 1024))
-        self.max_parallel = max(1, min(int(self.config.get("max_parallel_steps", 3)), 8))
         self._stop = threading.Event()
         self._tick_lock = threading.Lock()
         self._thread: threading.Thread | None = None
+
+    def _config(self) -> dict[str, Any]:
+        """config/execution.yaml 的现状。每次取值都重读：只有几行，共享组里别的实例也会改它。"""
+        return load_yaml_dict(config_layout.config_dir(self.root) / "execution.yaml") or {}
+
+    # 填了不是数的值按默认算：每次取值都重读，抛出去就是这个组里每个实例的每个请求都 500。
+    @property
+    def max_bytes(self) -> int:
+        return get_int(self._config(), "max_input_bytes", 10 * 1024 * 1024, min_value=1024, max_value=50 * 1024 * 1024)
+
+    @property
+    def max_parallel(self) -> int:
+        return get_int(self._config(), "max_parallel_steps", 3, min_value=1, max_value=8)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():

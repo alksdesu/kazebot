@@ -177,7 +177,7 @@ const withApplied = (live: ConfigLiveState | null, draft: Draft, layer: ConfigSo
 interface ConfigApi {
   getState: (token: string) => Promise<ConfigLiveState>;
   getRaw: (token: string) => Promise<ConfigRawFile>;
-  putRaw: (token: string, content: string) => Promise<ConfigSaveResult>;
+  putRaw: (token: string, content: string, baseHash: string | null) => Promise<ConfigSaveResult>;
 }
 
 // 每次调用时才解引用接口函数：测试按模块替换它们，建 store 时拍下的引用会绕过替身。
@@ -186,12 +186,12 @@ const configApi = (scope: ConfigScope): ConfigApi => (
     ? {
         getState: (token) => getFeaturesState(token),
         getRaw: (token) => getFeaturesRaw(token),
-        putRaw: (token, content) => updateFeaturesRaw(token, content),
+        putRaw: (token, content, baseHash) => updateFeaturesRaw(token, content, baseHash),
       }
     : {
         getState: (token) => getPlatformState(token, scope.platformId),
         getRaw: (token) => getPlatformRaw(token, scope.platformId),
-        putRaw: (token, content) => updatePlatformRaw(token, scope.platformId, content),
+        putRaw: (token, content, baseHash) => updatePlatformRaw(token, scope.platformId, content, baseHash),
       }
 );
 
@@ -293,7 +293,8 @@ const createConsoleState = (scope: ConfigScope) => (
   const write = async (token: string, live: ConfigLiveState | null, subset: Draft) => {
     const latest = await api.getRaw(token);
     const merged = mergeDraft(latest.content, subset, live?.state?.paths || {});
-    const result = await api.putRaw(token, merged.content);
+    // 合并的底子是刚读的这一版：读和写之间被共享组里别的实例改了，就报冲突，不拿旧底子盖掉。
+    const result = await api.putRaw(token, merged.content, latest.hash);
     return {
       content: merged.content,
       warnings: merged.note ? [...result.warnings, merged.note] : result.warnings,

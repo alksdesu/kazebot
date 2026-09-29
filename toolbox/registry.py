@@ -562,11 +562,13 @@ class ToolRegistry:
             ),
             (
                 "manage_secret",
-                "Manage API keys in .env, one key at a time. "
-                "action=list returns key names and whether each is set; values are never returned. "
-                "action=set writes or updates a single key, leaving every other line untouched. "
-                "action=unset removes one key. "
-                "Reading or writing .env directly is denied, so use this tool instead. "
+                "Manage API keys one key at a time. "
+                "action=list returns key names and where each is set; values are never returned. "
+                "action=set writes or updates a single key, leaving every other line untouched: "
+                "API keys go to config/secrets.env, which instances in a share group use together; "
+                "instance identity (ports, hosts, platform tokens, paths) goes to this instance's .env. "
+                "action=unset removes one key from both files. "
+                "Reading or writing .env or config/secrets.env directly is denied, so use this tool instead. "
                 "Common keys: EXA_API_KEY, XAI_API_KEY, DEEPSEEK_API_KEY, ANTHROPIC_API_KEY. "
                 "Policy+approval guarded.",
                 {

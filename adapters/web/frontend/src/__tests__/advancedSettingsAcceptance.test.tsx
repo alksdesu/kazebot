@@ -10,8 +10,10 @@ vi.mock('../api/supervisorClient', async importOriginal => ({
   getRuntimeFile: vi.fn(), resetRuntime: vi.fn(), getPolicyRaw: vi.fn(), updateRuntimeRaw: vi.fn(), updatePolicyRaw: vi.fn(),
 }));
 const runtime = '# keep this comment\nengine:\n  tool_mode: native\n  max_workers: 4\nshell:\n  entry_node_id: entry.original\ncustom:\n  preserved: true\n';
-const runtimeFile = (content = runtime, source: api.RuntimeFile['source'] = 'default'): api.RuntimeFile => ({
-  content, source, path: source === 'override' ? 'config/runtime.yaml' : 'defaults/runtime.yaml',
+const runtimeFile = (
+  content = runtime, source: api.RuntimeFile['source'] = 'default', hash: string | null = 'runtime-1',
+): api.RuntimeFile => ({
+  content, hash, source, path: source === 'override' ? 'config/runtime.yaml' : 'defaults/runtime.yaml',
 });
 function deferred<T>() {
   let resolve!: (value: T) => void; let reject!: (error: Error) => void;
@@ -36,9 +38,10 @@ const saveRuntime = () => fireEvent.click(within(section('runtime')).getByRole('
 beforeEach(() => {
   vi.resetAllMocks(); vi.spyOn(window, 'confirm').mockReturnValue(true);
   useSettingsStore.setState({ adminToken: 'synthetic-auth', isAuthenticated: true });
-  vi.mocked(api.getRuntimeFile).mockResolvedValue(runtimeFile()); vi.mocked(api.getPolicyRaw).mockResolvedValue('rules: []\n');
+  vi.mocked(api.getRuntimeFile).mockResolvedValue(runtimeFile()); vi.mocked(api.getPolicyRaw).mockResolvedValue({ content: 'rules: []\n', hash: 'policy-1' });
   vi.mocked(api.resetRuntime).mockResolvedValue({ ok: true, restored: true });
-  vi.mocked(api.updateRuntimeRaw).mockResolvedValue({}); vi.mocked(api.updatePolicyRaw).mockResolvedValue({});
+  vi.mocked(api.updateRuntimeRaw).mockResolvedValue({ ok: true, hash: 'runtime-2' });
+  vi.mocked(api.updatePolicyRaw).mockResolvedValue({ ok: true, hash: 'policy-2' });
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
@@ -64,13 +67,14 @@ describe('高级配置加载与提交边界', () => {
     expect(within(section('runtime')).getAllByRole('status').some(node => node.textContent !== '有未保存修改')).toBe(true);
   });
   it('提交失败保留草稿，保存期间冻结表单和原文，重试成功后清理dirty', async () => {
-    const write = deferred<unknown>(); vi.mocked(api.updateRuntimeRaw).mockReturnValueOnce(write.promise).mockResolvedValueOnce({});
+    const write = deferred<api.RawSaveResult>();
+    vi.mocked(api.updateRuntimeRaw).mockReturnValueOnce(write.promise).mockResolvedValueOnce({ ok: true, hash: 'runtime-2' });
     await loadRuntime(); fireEvent.change(screen.getByLabelText('入口节点 ID'), { target: { value: 'entry.local' } });
     saveRuntime(); expect(screen.getByLabelText('入口节点 ID')).toBeDisabled(); expect(rawEditor()).toBeDisabled();
     await act(async () => write.reject(Error('写入失败'))); await screen.findByText('写入失败');
     expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.local'); expect((rawEditor() as HTMLTextAreaElement).value).toContain('entry.local');
     saveRuntime(); await screen.findByText('已保存');
-    expect(api.updateRuntimeRaw).toHaveBeenLastCalledWith('synthetic-auth', expect.stringContaining('# keep this comment'));
+    expect(api.updateRuntimeRaw).toHaveBeenLastCalledWith('synthetic-auth', expect.stringContaining('# keep this comment'), 'runtime-1');
     expect(screen.queryByText('有未保存修改')).not.toBeInTheDocument(); vi.mocked(window.confirm).mockClear();
     expect(confirmNavigation()).toBe(true); expect(window.confirm).not.toHaveBeenCalled();
   });
@@ -99,14 +103,24 @@ describe('结构化与原文编辑一致性', () => {
     const combined = (rawEditor() as HTMLTextAreaElement).value.replace('preserved: true', 'preserved: false');
     fireEvent.change(rawEditor(), { target: { value: combined } });
     expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.local'); saveRuntime(); await screen.findByText('已保存');
-    expect(api.updateRuntimeRaw).toHaveBeenCalledWith('synthetic-auth', combined);
+    expect(api.updateRuntimeRaw).toHaveBeenCalledWith('synthetic-auth', combined, 'runtime-1');
   });
   it('只编辑原文时保留原文格式，并同步结构化字段与保存基准', async () => {
     await loadRuntime(); const raw = '# manual formatting\nshell: {entry_node_id: entry.from_raw}\nengine: {tool_mode: json, max_workers: 8}\n';
     fireEvent.change(rawEditor(), { target: { value: raw } }); expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.from_raw');
     expect(screen.getByLabelText('工具调用格式')).toHaveValue('json'); saveRuntime(); await screen.findByText('已保存');
-    expect(api.updateRuntimeRaw).toHaveBeenCalledWith('synthetic-auth', raw); expect(rawEditor()).toHaveValue(raw);
+    expect(api.updateRuntimeRaw).toHaveBeenCalledWith('synthetic-auth', raw, 'runtime-1'); expect(rawEditor()).toHaveValue(raw);
     expect(screen.queryByText('有未保存修改')).not.toBeInTheDocument();
+  });
+  it('保存撞上冲突时按文件名说清楚，草稿留着重做', async () => {
+    vi.mocked(api.updatePolicyRaw).mockRejectedValueOnce(Error('409 policy.yaml 已被别处改过，刷新后再改'));
+    render(<AdvancedSettingsPage />); const area = openSection('policy'); fireEvent.click(area.getByRole('button', { name: '加载' }));
+    const editor = area.getByLabelText('policy.yaml YAML 编辑器'); await waitFor(() => expect(editor).toHaveValue('rules: []\n'));
+    fireEvent.change(editor, { target: { value: 'rules: [a]\n' } });
+    fireEvent.click(area.getByRole('button', { name: '保存策略 YAML' }));
+
+    expect(await screen.findByText('policy.yaml 在打开之后被别处改过，没有保存：点「加载」读入最新内容，再把改动重做一遍。')).toBeInTheDocument();
+    expect(editor).toHaveValue('rules: [a]\n');
   });
   it('策略确认被拒绝不提交，网络失败保留原始策略草稿', async () => {
     render(<AdvancedSettingsPage />); const area = openSection('policy'); fireEvent.click(area.getByRole('button', { name: '加载' }));

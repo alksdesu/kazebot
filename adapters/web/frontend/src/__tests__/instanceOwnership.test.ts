@@ -26,6 +26,7 @@ describe('isValidInstanceId', () => {
 
   it.each([
     ['stickers', '数据根下的共享表情包库占着这个名字'],
+    ['shared', '数据根下的共享配置组占着这个名字'],
     ['Xiaoyu', '大写'],
     ['bot-2', '连字符'],
     ['a', '单字符'],

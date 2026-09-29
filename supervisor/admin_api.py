@@ -481,7 +481,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         example_path = config_layout.drawtools_example(name)
         target = path if path.exists() else example_path
         if not target.is_file():
-            return {"content": "", "exists": False, "using_example": False}
+            return {"content": "", "exists": False, "using_example": False, "hash": "", "path": _rel(path)}
         return {
             **_read_text(target),
             "exists": path.exists(),
@@ -584,7 +584,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     @router.put("/qq/raw")
     def update_qq_raw(payload: RawContent) -> dict[str, Any]:
-        return platform_api.write_config_raw(workspace_root, QQ_NAPCAT, payload.content)
+        return platform_api.write_config_raw(workspace_root, QQ_NAPCAT, payload.content, base_hash=payload.base_hash)
 
     @router.get("/qq/state")
     def get_qq_state() -> dict[str, Any]:
@@ -611,10 +611,11 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     # ----- Schedules -----
     @router.get("/schedules/raw")
-    def get_schedules() -> dict[str, str]:
+    def get_schedules() -> dict[str, Any]:
         p = schedules_path(workspace_root)
         if not p.exists():
-            return {"content": "schedules: []"}
+            # 空指纹表示「文件还不存在」：保存时有人抢先建了，照样按冲突报。
+            return {"content": "schedules: []", "hash": "", "path": _rel(p)}
         return _read_text(p)
 
     @router.put("/schedules/raw")

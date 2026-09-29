@@ -8,9 +8,11 @@ import {
   getNodeRaw,
   getNodes,
   getProviders,
+  isEditConflict,
   isNotFound,
   updateNodeFileRaw,
   updateNodeRaw,
+  type RawText,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { mergeModelChoices, modelsFromNodes, modelsFromProviders } from '../utils/modelChoices';
@@ -37,7 +39,7 @@ const PERSONA_FILE = '_persona.md';
 const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');
 
 /** 读人设文件，还没建是 null。先查列表再读：直接去读不存在的文件，浏览器控制台会留一条 404 报错。 */
-async function readPersona(token: string): Promise<string | null> {
+async function readPersona(token: string): Promise<RawText | null> {
   const files = await getNodeFiles(token);
   if (!files.some((file) => file.name === PERSONA_FILE && !file.is_example)) return null;
   try {
@@ -52,13 +54,17 @@ async function readPersona(token: string): Promise<string | null> {
 /** 一块独立保存的区域共用的底栏。草稿在这一块自己手里，不进顶部的「N 项待应用」。 */
 const Persona = () => {
   const token = useSettingsStore(state => state.adminToken);
-  return <PersonaEditor key={token || ""} />;
+  const [generation, setGeneration] = useState(0);
+  return <PersonaEditor key={`${token || ''}:${generation}`} onReload={() => setGeneration((value) => value + 1)} />;
 };
 
-const PersonaEditor = () => {
+/** onReload 让编辑器整个重建、重读文件：「丢弃」换回的是磁盘上现在那一版，保存报冲突之后靠它继续。 */
+const PersonaEditor = ({ onReload }: { onReload: () => void }) => {
   const token = useSettingsStore((state) => state.adminToken);
   const [saved, setSaved] = useState('');
   const [text, setText] = useState('');
+  // 保存时交回的指纹。文件还没建是空串：第一次保存要求它仍然不存在，被别处抢先建了就报冲突。
+  const [base, setBase] = useState<string | null>(null);
   /** 文件不存在时 bot 读的是 _persona.example.md，第一次保存会把这层回退关掉。 */
   const [onlyExample, setOnlyExample] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -72,11 +78,12 @@ const PersonaEditor = () => {
     setLoaded(false);
     void (async () => {
       try {
-        const body = await readPersona(token);
+        const file = await readPersona(token);
         if (cancelled) return;
-        setSaved(body ?? '');
-        setText(body ?? '');
-        setOnlyExample(body === null);
+        setSaved(file?.content ?? '');
+        setText(file?.content ?? '');
+        setBase(file ? file.hash : '');
+        setOnlyExample(file === null);
         setNote('');
         setLoaded(true);
       } catch (error) {
@@ -93,12 +100,15 @@ const PersonaEditor = () => {
     if (!token || busy || !loaded) return;
     setBusy(true);
     try {
-      await updateNodeFileRaw(token, PERSONA_FILE, text);
+      const result = await updateNodeFileRaw(token, PERSONA_FILE, text, base);
       setSaved(text);
+      setBase(result.hash);
       setOnlyExample(false);
       setNote('已保存，下一条消息就会用新的人设。');
     } catch (error) {
-      setNote(say(error));
+      setNote(isEditConflict(error)
+        ? '人设在打开之后被别处改过，没有保存：点「丢弃」读入最新内容，再把改动重做一遍。'
+        : say(error));
     }
     setBusy(false);
   };
@@ -124,7 +134,7 @@ const PersonaEditor = () => {
         dirty={loaded && text !== saved}
         label="保存人设"
         note={note}
-        onReset={() => { if (confirmDiscard()) setText(saved); }}
+        onReset={() => { if (confirmDiscard()) onReload(); }}
         onSave={() => void save()}
       />
     </>
@@ -147,16 +157,15 @@ const ModelChoiceEditor = () => {
   const [note, setNote] = useState('正在读取…');
 
   const adopt = (body: string) => {
-    const currentModel = readYamlScalar(body, ['model']);
     setRaw(body);
-    setModel(currentModel);
+    setModel(readYamlScalar(body, ['model']));
   };
 
   useEffect(() => {
     if (!token) return;
     void (async () => {
       try {
-        adopt(await getNodeRaw(token, NODE_ID));
+        adopt((await getNodeRaw(token, NODE_ID)).content);
         setNote('');
       } catch (error) {
         setNote(say(error));
@@ -180,8 +189,10 @@ const ModelChoiceEditor = () => {
     setBusy(true);
     try {
       const value = model.trim();
-      const next = upsertYamlScalar(raw, 'model', value && yamlString(value), 'type');
-      await updateNodeRaw(token, NODE_ID, next);
+      // 只改 model 这一个键，合并到现读的这一版上：节点文件的其他改动留着。
+      const latest = await getNodeRaw(token, NODE_ID);
+      const next = upsertYamlScalar(latest.content, 'model', value && yamlString(value), 'type');
+      await updateNodeRaw(token, NODE_ID, next, latest.hash);
       adopt(next);
       setNote('已保存。节点文件每次任务都重新读，立刻生效。');
     } catch (error) {

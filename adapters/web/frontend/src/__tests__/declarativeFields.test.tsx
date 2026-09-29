@@ -377,7 +377,7 @@ describe('按配置作用域分家的草稿与 API', () => {
 
   it('平台的读写走 /v1/platforms/{id}，平台 id 带进每一次请求', async () => {
     vi.mocked(api.getPlatformState).mockResolvedValue(live({}, {}));
-    vi.mocked(api.getPlatformRaw).mockResolvedValue({ content: '', exists: false });
+    vi.mocked(api.getPlatformRaw).mockResolvedValue({ content: '', hash: null, exists: false });
 
     await platformConsoleStore('telegram').getState().refresh('fixture-token');
 
@@ -388,7 +388,7 @@ describe('按配置作用域分家的草稿与 API', () => {
 
   it('全局的读写走 /v1/features，不碰任何平台', async () => {
     vi.mocked(api.getFeaturesState).mockResolvedValue({ ...live({}, {}), platforms: [] });
-    vi.mocked(api.getFeaturesRaw).mockResolvedValue({ content: '', exists: false });
+    vi.mocked(api.getFeaturesRaw).mockResolvedValue({ content: '', hash: null, exists: false });
 
     await configStore(FEATURES_SCOPE).getState().refresh('fixture-token');
 

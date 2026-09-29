@@ -79,12 +79,12 @@ export const McpSettingsPage = () => {
     if (!confirmNavigation()) return;
     mutation.current = true; setBusy(true);
     try {
-      const raw = await getMcpClientsRaw(adminToken);
+      const file = await getMcpClientsRaw(adminToken);
       if (tokenChanged(adminToken)) return;
-      const forms = parseMcpClients(raw);
+      const forms = parseMcpClients(file.content);
       if (forms.some((client) => client.id === id)) { setMessage('该 MCP Client 已存在'); return; }
       const nextForms = [...forms, emptyMcpClient(id)];
-      await updateMcpClientsRaw(adminToken, serializeMcpClients(nextForms, raw));
+      await updateMcpClientsRaw(adminToken, serializeMcpClients(nextForms, file.content), file.hash);
       if (tokenChanged(adminToken)) return;
       setNewId('');
       setMessage('Client 已创建但尚未启用，请在右栏填写连接信息后启用。');
@@ -104,10 +104,10 @@ export const McpSettingsPage = () => {
     if (!confirmNavigation()) return;
     mutation.current = true; setBusy(true);
     try {
-      const raw = await getMcpClientsRaw(adminToken);
+      const file = await getMcpClientsRaw(adminToken);
       if (tokenChanged(adminToken)) return;
-      const nextForms = parseMcpClients(raw).filter((client) => client.id !== selectedMcpClient.id);
-      await updateMcpClientsRaw(adminToken, serializeMcpClients(nextForms, raw));
+      const nextForms = parseMcpClients(file.content).filter((client) => client.id !== selectedMcpClient.id);
+      await updateMcpClientsRaw(adminToken, serializeMcpClients(nextForms, file.content), file.hash);
       if (tokenChanged(adminToken)) return;
       setSelectedMcpClient(null);
       setMessage('MCP Client 已删除');

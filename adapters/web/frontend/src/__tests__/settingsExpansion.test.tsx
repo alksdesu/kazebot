@@ -133,21 +133,21 @@ describe('expanded settings API wrappers', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(getRuntimeRaw('token')).resolves.toBe('value: 1\n');
-    await expect(getPolicyRaw('token')).resolves.toBe('value: 1\n');
-    await expect(getSchedulesRaw('token')).resolves.toBe('value: 1\n');
-    await expect(getMcpClientsRaw('token')).resolves.toBe('value: 1\n');
-    await expect(getNodeRaw('token', 'ereuna_main')).resolves.toBe('value: 1\n');
-    await expect(getToolRaw('token', 'read_file')).resolves.toBe('value: 1\n');
-    await expect(getSkillRaw('token', 'jina-reader')).resolves.toBe('value: 1\n');
+    await expect(getRuntimeRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
+    await expect(getPolicyRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
+    await expect(getSchedulesRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
+    await expect(getMcpClientsRaw('token')).resolves.toEqual({ content: 'value: 1\n', hash: null });
+    await expect(getNodeRaw('token', 'ereuna_main')).resolves.toEqual({ content: 'value: 1\n', hash: null });
+    await expect(getToolRaw('token', 'read_file')).resolves.toEqual({ content: 'value: 1\n', hash: null });
+    await expect(getSkillRaw('token', 'jina-reader')).resolves.toEqual({ content: 'value: 1\n', hash: null });
 
-    await updateRuntimeRaw('token', 'runtime: true\n');
-    await updatePolicyRaw('token', 'policy: true\n');
-    await updateSchedulesRaw('token', 'schedules: []\n');
-    await updateMcpClientsRaw('token', 'clients: {}\n');
-    await updateNodeRaw('token', 'ereuna_main', 'id: ereuna_main\n');
-    await updateToolRaw('token', 'read_file', 'print("ok")\n');
-    await updateSkillRaw('token', 'jina-reader', '# Skill\n');
+    await updateRuntimeRaw('token', 'runtime: true\n', null);
+    await updatePolicyRaw('token', 'policy: true\n', null);
+    await updateSchedulesRaw('token', 'schedules: []\n', null);
+    await updateMcpClientsRaw('token', 'clients: {}\n', null);
+    await updateNodeRaw('token', 'ereuna_main', 'id: ereuna_main\n', null);
+    await updateToolRaw('token', 'read_file', 'print("ok")\n', null);
+    await updateSkillRaw('token', 'jina-reader', '# Skill\n', null);
 
     expect(fetchMock).toHaveBeenCalledWith('/v1/admin/config/runtime/raw', expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer token' }) }));
     expect(fetchMock).toHaveBeenCalledWith('/v1/admin/config/runtime/raw', expect.objectContaining({

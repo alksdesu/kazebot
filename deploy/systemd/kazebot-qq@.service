@@ -27,6 +27,8 @@ ReadWritePaths=/opt/kazebot-data/%i
 # 表情包库是几个号共用的一份，工作区里那个 data/stickers 只是软链；
 # systemd 按真实路径判权限，不放开共享目录进程就打不开库文件。
 ReadWritePaths=/opt/kazebot-data/stickers
+# 加入共享配置组的实例，config/ 是指到这下面的链接；同步收藏表情会往里写。前面的 - 是目录还没建时照常启动。
+ReadWritePaths=-/opt/kazebot-data/shared
 ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes

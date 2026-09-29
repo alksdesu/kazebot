@@ -13,7 +13,6 @@ from nonebot import get_bot
 from nonebot.adapters.onebot.v11 import Bot
 from platforms.ids import normalize_id
 from ..config import (
-    CLONOTH_WORKSPACE,
     FORWARD_BRIDGE_HOST,
     FORWARD_BRIDGE_PORT,
     FORWARD_BRIDGE_TOKEN,
@@ -519,7 +518,7 @@ def _forward_bridge_resolve_files(raw_paths: Any, display_names: Any = None) -> 
     """把工具传来的仓库相对/绝对路径解析为可发送的 file 附件。
 
     Why: 管理员“把仓库里的 xx 文件发出来”需要把工作区内文件发到 QQ。
-    How: 复用 _attachment_path_under_workspace 限定在工作区内，防止目录穿越。
+    How: 复用 proactive._workspace_file 限定在工作区内，防止目录穿越。
     Purpose: 只允许发送工作区内存在的普通文件，逐个回报错误。
     """
     paths: list[str] = []
@@ -539,19 +538,15 @@ def _forward_bridge_resolve_files(raw_paths: Any, display_names: Any = None) -> 
         raw = str(raw or "").strip()
         if not raw:
             continue
-        path = proactive._attachment_path_under_workspace(raw)
-        if path is None:
+        found = proactive._workspace_file(raw)
+        if found is None:
             errors.append(f"{raw}：路径必须位于 Clonoth 工作区内。")
             continue
+        path, rel_path = found
         if not path.exists() or not path.is_file():
             errors.append(f"{raw}：文件不存在。")
             continue
-        rel_path = str(path)
-        try:
-            rel_path = str(path.relative_to(Path(CLONOTH_WORKSPACE).resolve()))
-        except Exception:
-            pass
-        # 黑名单按工作区相对路径判定，故必须在 relative_to 之后。
+        # 黑名单按工作区里的名字判定：经共享组链接的 config/models.yaml 也得认成 config/models.yaml。
         deny_reason = forward_file_deny_reason(rel_path)
         if deny_reason:
             common.logger.warning("qq_forward blocked sensitive file: %s", rel_path)

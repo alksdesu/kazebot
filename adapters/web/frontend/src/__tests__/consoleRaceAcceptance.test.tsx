@@ -40,7 +40,10 @@ const profiles: api.ProviderProfiles = {
   }, wireFormats: { openai: 'openai', anthropic: 'anthropic' }, hostProfiles: {}, defaultVision: {},
 };
 const runtime = 'providers:\n  openai:\n    options:\n      temperature: 0.2\n  anthropic:\n    options:\n      temperature: 0.9\n';
-const nodeRaw = (id: string, temperature: number) => `id: ${id}\nprovider: relay\nprovider_options:\n  temperature: ${temperature}\n`;
+const nodeRaw = (id: string, temperature: number) => ({
+  content: `id: ${id}\nprovider: relay\nprovider_options:\n  temperature: ${temperature}\n`,
+  hash: `${id}-1`,
+});
 const memoryNamespace = (key: string, label: string): api.MemoryNamespace => ({ key, namespace: key, kind: 'conversation', subject: '', entry_count: 1, books: [], updated_at: '', owner: { kind: 'group', label } });
 const memoryEntry = (content: string): api.MemoryEntry => ({ id: `id-${content}`, book: 'main', content, keywords: [], constant: false, source: 'manual' });
 const scopeStatus = (target = ''): api.ScopeStatus => ({
@@ -64,9 +67,10 @@ beforeEach(() => {
   vi.mocked(api.getProviderProfiles).mockResolvedValue(structuredClone(profiles));
   vi.mocked(api.getProviders).mockResolvedValue(providers());
   vi.mocked(api.getNodes).mockResolvedValue([{ id: 'node.a', provider: 'relay' }, { id: 'node.b', provider: 'relay' }] as api.AdminNode[]);
-  vi.mocked(api.getRuntimeRaw).mockResolvedValue(runtime);
+  vi.mocked(api.getRuntimeRaw).mockResolvedValue({ content: runtime, hash: 'runtime-1' });
   vi.mocked(api.getNodeRaw).mockImplementation(async (_auth, id) => nodeRaw(id, id === 'node.a' ? 0.4 : 0.7));
-  vi.mocked(api.updateRuntimeRaw).mockResolvedValue({}); vi.mocked(api.updateNodeRaw).mockResolvedValue({});
+  vi.mocked(api.updateRuntimeRaw).mockResolvedValue({ ok: true, hash: 'runtime-2' });
+  vi.mocked(api.updateNodeRaw).mockResolvedValue({ ok: true, hash: 'node-2' });
   vi.mocked(api.upsertProvider).mockResolvedValue(providers());
   vi.mocked(api.setActiveProvider).mockResolvedValue({ ...providers(), active_provider: 'spare' });
   vi.mocked(api.deleteProvider).mockResolvedValue(providers());
@@ -90,7 +94,7 @@ const pickFormat = (name: string) => fireEvent.click(within(screen.getByRole('gr
 
 describe('模型参数请求与草稿归属', () => {
   it.each(['resolve', 'reject'] as const)('拒绝旧节点的迟到 %s，不覆盖当前节点参数', async outcome => {
-    const old = deferred<string>();
+    const old = deferred<api.RawText>();
     vi.mocked(api.getNodeRaw).mockImplementation(async (_auth, id) => id === 'node.a' ? old.promise : nodeRaw(id, 0.7));
     await openModels(); pickNode('node.a');
     expect(screen.queryByLabelText('采样温度')).not.toBeInTheDocument();
@@ -110,14 +114,14 @@ describe('模型参数请求与草稿归属', () => {
     expect(screen.getByLabelText('另一格式温度')).toHaveValue('0.9');
   });
   it('保存期间冻结参数及切换入口，失败保留草稿供重试', async () => {
-    const write = deferred<unknown>(); vi.mocked(api.updateRuntimeRaw).mockReturnValue(write.promise);
+    const write = deferred<api.RawSaveResult>(); vi.mocked(api.updateRuntimeRaw).mockReturnValue(write.promise);
     await openModels(); fireEvent.change(screen.getByLabelText('采样温度'), { target: { value: '0.6' } });
     fireEvent.click(screen.getByRole('button', { name: '保存参数' }));
     expect(screen.getByLabelText('采样温度')).toBeDisabled(); expect(screen.getByRole('button', { name: 'node.a' })).toBeDisabled();
     await act(async () => write.reject(Error('写入被拒绝')));
     expect(await screen.findByText('写入被拒绝')).toBeInTheDocument(); expect(screen.getByLabelText('采样温度')).toHaveValue('0.6');
     expect(screen.getByRole('button', { name: '保存参数' })).toBeEnabled();
-    expect(api.updateRuntimeRaw).toHaveBeenCalledWith('fixture-auth', expect.stringContaining('temperature: 0.6'));
+    expect(api.updateRuntimeRaw).toHaveBeenCalledWith('fixture-auth', expect.stringContaining('temperature: 0.6'), 'runtime-1');
     expect(api.updateNodeRaw).not.toHaveBeenCalled();
   });
 });

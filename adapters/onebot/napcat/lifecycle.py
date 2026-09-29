@@ -24,7 +24,7 @@ from ..config import (
 )
 from ..live_config import RECONCILED_KEYS, live, state_payload as live_config_state_payload
 from ..emoji_handler import load_bqbs
-from adapters._shared.user_profiles import load_profiles
+from adapters._shared.user_profiles import ProfileFile
 from clonoth_sdk import BotConfig, ClonothClient, EventRouter, SessionState
 from platforms import live as platform_live
 from platforms.builtin import QQ_NAPCAT
@@ -246,6 +246,7 @@ async def _live_config_reconcile_forever() -> None:
                     )
                 await _reconcile_live_config()
                 previous = snapshot
+            _reload_user_profiles_if_changed()
             await _refresh_group_names()
             _publish_live_state()
         except asyncio.CancelledError:
@@ -267,12 +268,30 @@ async def _attachment_cleanup_forever() -> None:
         await asyncio.sleep(models._ATTACHMENT_CLEANUP_INTERVAL_SEC)
 
 
+def _profiles_source() -> ProfileFile:
+    """按人资料文件。按当前的 USER_PROFILES_PATH 取，位置变了就换一个新的来盯。"""
+    path = Path(USER_PROFILES_PATH)
+    current = state._adapter.qq_profiles_file
+    if current is None or current.path != path:
+        current = ProfileFile(path)
+        state._adapter.qq_profiles_file = current
+    return current
+
+
 @common.driver.on_startup
 def _load_user_profiles() -> None:
     """按 QQ 描述声明的位置读按人资料；位置能用 CLONOTH_QQ_USER_PROFILES_PATH 改。"""
-    state._adapter.qq_user_profiles = load_profiles(Path(USER_PROFILES_PATH))
+    state._adapter.qq_user_profiles = _profiles_source().load()
     if state._adapter.qq_user_profiles:
         common.logger.info("loaded %d QQ user profiles", len(state._adapter.qq_user_profiles))
+
+
+def _reload_user_profiles_if_changed() -> bool:
+    """按人资料改过就整份换上新的：控制台改完不用重启 bot，共享组里别的实例改的也一样。"""
+    if not _profiles_source().changed():
+        return False
+    _load_user_profiles()
+    return True
 
 
 async def _startup() -> None:

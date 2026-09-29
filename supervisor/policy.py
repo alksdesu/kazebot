@@ -6,6 +6,7 @@ import fnmatch
 import ipaddress
 import re
 import shlex
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,7 @@ from urllib.parse import urlparse
 import yaml
 
 import config_layout
-from clonoth_runtime import classify_path, load_yaml_dict, parse_extra_roots
+from clonoth_runtime import classify_path, parse_extra_roots
 from platforms.protection import policy_floor
 from platforms.registry import all_platforms
 
@@ -361,6 +362,15 @@ def _is_public_http_url(raw: str) -> bool:
     return True
 
 
+def _load_policy_bytes(raw: bytes) -> dict[str, Any] | None:
+    """解析读到的那份字节：指纹也按这份字节算，内容和指纹才出自同一版。"""
+    try:
+        data = yaml.safe_load(raw.decode("utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 class PolicyEngine:
     """策略引擎。
 
@@ -375,7 +385,11 @@ class PolicyEngine:
         self._root = workspace_root
         self._policy_path = policy_path or config_layout.policy_path(workspace_root)
 
-        self._cached_mtime: float | None = None
+        self._cached_stamp: tuple[int, int, int] | None = None
+        # 生效的这份策略出自哪一版文件，按内容算；文件不在是空串。编辑器保存时交回比对。
+        self._cfg_hash = ""
+        # 重读和导出都在锁里：交给编辑器的内容和指纹必须出自同一版文件。
+        self._lock = threading.RLock()
 
         self._cfg: dict[str, Any] = _default_policy_dict()
 
@@ -405,53 +419,67 @@ class PolicyEngine:
                 config_layout.write_locked(self._policy_path, text, mode=_POLICY_FILE_MODE)
 
     def export_config(self) -> dict[str, Any]:
-        """当前生效的 policy，给控制台编辑用。
+        return self.export_versioned()[0]
+
+    def export_versioned(self) -> tuple[dict[str, Any], str]:
+        """当前生效的 policy 和它出自的那一版文件的指纹，给控制台编辑用；保存时交回指纹，中途被别处改过就不写。
 
         缺省项补成实际生效的值。文件里没写 sensitive_path_patterns 时运行期用的是内置
         清单，直接回原文会让界面显示成空 —— 照着存一次就把默认换成了「明确关闭」。
         """
-        self._reload_if_needed()
-        cfg = copy.deepcopy(self._cfg)
+        with self._lock:
+            self._reload_if_needed()
+            cfg = copy.deepcopy(self._cfg)
+            digest = self._cfg_hash
         cmd = cfg.get("execute_command")
         if not isinstance(cmd, dict):
             cmd = {"default": self._command_default.value}
             cfg["execute_command"] = cmd
         if cmd.get("sensitive_path_patterns") is None:
             cmd["sensitive_path_patterns"] = list(_DEFAULT_SENSITIVE_PATH_LITERALS)
-        return cfg
+        return cfg, digest
 
-    def replace_config(self, data: Any) -> dict[str, Any]:
-        """整份替换并落盘，返回落盘后的内容。
+    def replace_config(self, data: Any, *, base_hash: str | None = None) -> tuple[dict[str, Any], str]:
+        """整份替换并落盘，返回落盘后的内容和指纹。
 
         校验不过就抛 ValueError 且不写盘：一份解析不了的 yaml 会让 _reload_if_needed
-        静默退回内置默认，策略被换掉却看不出任何迹象。
+        静默退回内置默认，策略被换掉却看不出任何迹象。给了 base_hash 而文件已被别处改过，
+        抛 config_layout.ConfigConflict，同样不写。
         """
         validated = _validate_policy_dict(data)
         text = yaml.safe_dump(validated, sort_keys=False, allow_unicode=True)
         try:
-            config_layout.write_config_text(self._policy_path, text, mode=_POLICY_FILE_MODE)
+            config_layout.write_config_text(self._policy_path, text, base_hash=base_hash, mode=_POLICY_FILE_MODE)
         except OSError as exc:
             raise ValueError('策略写入失败：' + str(exc)) from exc
         self._reload_if_needed(force=True)
-        return self.export_config()
+        return self.export_versioned()
 
     def _reload_if_needed(self, *, force: bool = False) -> None:
-        try:
-            st = self._policy_path.stat()
-            mtime = float(st.st_mtime)
-        except Exception:
-            return
+        # 共享组里别的实例也改这份文件：按 file_stamp 比，同一刻写进的新规则也认得出来。
+        stamp = config_layout.file_stamp(self._policy_path)
+        with self._lock:
+            if stamp is None:
+                # 文件被删了：规则照旧用上一份，指纹记成「不存在」，编辑器保存时把它重新建出来。
+                self._cfg_hash = ""
+                self._cached_stamp = None
+                return
 
-        if not force and self._cached_mtime is not None and mtime == self._cached_mtime:
-            return
+            if not force and stamp == self._cached_stamp:
+                return
 
-        data = load_yaml_dict(self._policy_path)
-        if not isinstance(data, dict):
-            data = _default_policy_dict()
+            try:
+                raw = self._policy_path.read_bytes()
+            except OSError:
+                return
+            data = _load_policy_bytes(raw)
+            if not isinstance(data, dict):
+                data = _default_policy_dict()
 
-        self._cfg = data
-        self._cached_mtime = mtime
-        self._compile()
+            self._cfg = data
+            self._cfg_hash = config_layout.bytes_hash(raw)
+            self._cached_stamp = stamp
+            self._compile()
 
     def _compile_rules(self, section: dict[str, Any]) -> tuple[SafetyLevel, list[tuple[str, SafetyLevel, str]]]:
         default_s = str(section.get("default", "deny"))

@@ -13,6 +13,7 @@ import config_layout
 
 from .descriptor import PlatformDescriptor
 from .registry import (
+    PLATFORM_ENV,
     alias_numbering_relpath,
     all_platforms,
     env_override,
@@ -20,8 +21,7 @@ from .registry import (
     workspace_path,
 )
 
-# 共享组的密钥文件：config/ 整份共享时跟着走的那几个 API key。
-SHARED_SECRETS_FILE = f"{config_layout.CONFIG_DIR}/secrets.env"
+SHARED_SECRETS_FILE = config_layout.SHARED_SECRETS_FILE
 
 # 和平台无关的凭据位置：dotenv、模型渠道和 MCP 的密钥、平台令牌、管理令牌、policy 本身、私钥与证书。
 # 挪进 config/ 之前的旧位置也在：搬家只复制不删，旧文件里还是同一把密钥。
@@ -84,18 +84,16 @@ def _unique(patterns: Iterable[str]) -> tuple[str, ...]:
 
 
 def _moved_to(raw: str, workspace: Path | None) -> str:
-    """env 改到的文件位置换成判定用的写法：工作区里是相对路径，工作区外是绝对路径。
+    """env 改到的文件位置换成判定用的写法：工作区里（含经受信链接通出去的）是相对路径，工作区外是绝对路径。
 
-    和 policy 的 classify_path 一样先 resolve，两边才比得上。
+    和 policy 的 classify_path 走同一个函数，两边才比得上。
     """
     if workspace is None:
         return Path(raw).expanduser().as_posix()
     root = Path(workspace).resolve()
     resolved = workspace_path(raw, root).resolve()
-    try:
-        return resolved.relative_to(root).as_posix()
-    except ValueError:
-        return resolved.as_posix()
+    logical = config_layout.workspace_logical_path(root, resolved)
+    return logical if logical is not None else resolved.as_posix()
 
 
 def secret_file_patterns(
@@ -222,4 +220,43 @@ def secret_env_names(platforms: Iterable[PlatformDescriptor] | None = None) -> f
         for platform in _platforms(platforms)
         for secret in platform.secrets
         if secret.env
+    )
+
+
+# 核心进程的实例身份：平台、端口、监听地址、URL 前缀、工作区、清单位置、管理令牌、数据清理范围。
+_CORE_INSTANCE_ENV: frozenset[str] = frozenset({
+    PLATFORM_ENV,
+    "CLONOTH_PORT",
+    "CLONOTH_HOST",
+    "CLONOTH_URL_PREFIX",
+    "CLONOTH_WORKSPACE",
+    "ONEBOT_WORKSPACE_ROOT",
+    config_layout.INSTANCES_FILE_ENV,
+    "CLONOTH_ADMIN_TOKEN",
+    "CLONOTH_MAINTENANCE_SCOPE",
+})
+# 值是路径的变量指着本实例工作区里的某处，抄给别的实例就指到别人家里去了。
+_PATH_ENV_SUFFIXES: tuple[str, ...] = ("_FILE", "_PATH", "_DIR", "_ROOT", "_ROOTS")
+# 解释器自己的设置，谈不上配置也谈不上密钥。
+_PROCESS_ENV_PREFIXES: tuple[str, ...] = ("PYTHON",)
+
+
+def instance_env_names(platforms: Iterable[PlatformDescriptor] | None = None) -> frozenset[str]:
+    """实例身份的环境变量名：只写在实例自己的 .env 里，共享密钥文件不收，建组时也不抄过去。"""
+    names = set(_CORE_INSTANCE_ENV)
+    for platform in _platforms(platforms):
+        names.update(platform.instance_env)
+        names.update(secret.env for secret in platform.secrets if secret.env)
+        names.update(secret.file_env for secret in platform.secrets if secret.file_env)
+        names.update(env for env in (platform.config_env, platform.profiles_env) if env)
+        names.update(platform.state_env.values())
+    return frozenset(names)
+
+
+def is_instance_env(name: str, platforms: Iterable[PlatformDescriptor] | None = None) -> bool:
+    key = str(name or "").strip().upper()
+    return (
+        key in instance_env_names(platforms)
+        or key.endswith(_PATH_ENV_SUFFIXES)
+        or key.startswith(_PROCESS_ENV_PREFIXES)
     )

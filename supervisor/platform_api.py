@@ -113,7 +113,9 @@ def _shown_path(path: Path, workspace_root: Path) -> str:
         return str(path)
 
 
-def write_config_raw(workspace_root: Path, platform: PlatformDescriptor, content: str) -> dict[str, Any]:
+def write_config_raw(
+    workspace_root: Path, platform: PlatformDescriptor, content: str, *, base_hash: str | None = None,
+) -> dict[str, Any]:
     path = config_file(workspace_root, platform)
     document = config_files.parse_mapping(content)
     misplaced = _global_only_writes(path, document)
@@ -128,8 +130,8 @@ def write_config_raw(workspace_root: Path, platform: PlatformDescriptor, content
             raise HTTPException(status_code=400, detail=f"无人消费的配置项：{unknown}")
     else:
         warnings.append("bot 进程未公布配置结构，本次只校验了 YAML 语法")
-    config_files.write_raw(path, content)
-    return {"ok": True, "warnings": warnings}
+    new_hash = config_files.write_raw(path, content, base_hash=base_hash)
+    return {"ok": True, "warnings": warnings, "hash": new_hash}
 
 
 def config_state(workspace_root: Path, platform: PlatformDescriptor) -> dict[str, Any]:
@@ -214,7 +216,9 @@ def create_platform_router(workspace_root: Path) -> APIRouter:
 
     @router.put("/{platform_id}/config/raw")
     def put_raw(platform_id: str, payload: RawConfig) -> dict[str, Any]:
-        return write_config_raw(workspace_root, resolve_platform(platform_id), payload.content)
+        return write_config_raw(
+            workspace_root, resolve_platform(platform_id), payload.content, base_hash=payload.base_hash,
+        )
 
     @router.get("/{platform_id}/config/state")
     def get_state(platform_id: str) -> dict[str, Any]:

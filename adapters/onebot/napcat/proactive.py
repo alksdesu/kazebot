@@ -12,6 +12,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List
 from nonebot.adapters.onebot.v11 import Bot, Event
+import config_layout
 from ..config import CLONOTH_WORKSPACE
 from adapters._shared import capability
 from ..live_config import live
@@ -323,7 +324,9 @@ def _target_to_send_dict(target: models.ProactiveTarget) -> Dict[str, Any]:
     return {"type": "group", "group_id": target.target_id}
 
 
-def _attachment_path_under_workspace(raw_path: str) -> Path | None:
+def _workspace_file(raw_path: str) -> tuple[Path, str] | None:
+    """路径解析到底，返回 (真实位置, 在工作区里的名字)。共享表情包库、共享组配置这类经受信链接通出去的照样按工作区里的名字给；
+    不在工作区里的返回 None。外传黑名单按这个名字判，所以不能拿真实位置去比。"""
     raw = str(raw_path or "").strip()
     if not raw:
         return None
@@ -334,29 +337,23 @@ def _attachment_path_under_workspace(raw_path: str) -> Path | None:
         path = Path(CLONOTH_WORKSPACE) / path
     try:
         resolved = path.resolve()
-        workspace = Path(CLONOTH_WORKSPACE).resolve()
-        if workspace not in resolved.parents and resolved != workspace:
-            return None
     except Exception:
         return None
-    return resolved
+    logical = config_layout.workspace_logical_path(Path(CLONOTH_WORKSPACE), resolved)
+    return (resolved, logical) if logical is not None else None
 
 
 def _parse_file_send_body(body: str) -> tuple[Dict[str, Any] | None, str]:
     parts = str(body or "").strip().split(maxsplit=1)
     if not parts:
         return None, "缺少文件路径。"
-    path = _attachment_path_under_workspace(parts[0])
-    if path is None:
+    found = _workspace_file(parts[0])
+    if found is None:
         return None, "文件路径必须位于 Clonoth 工作区内。"
+    path, rel_path = found
     if not path.exists() or not path.is_file():
         return None, f"文件不存在：{parts[0]}"
     display_name = parts[1].strip() if len(parts) > 1 else path.name
-    rel_path = str(path)
-    try:
-        rel_path = str(path.relative_to(Path(CLONOTH_WORKSPACE).resolve()))
-    except Exception:
-        pass
     return {"type": "file", "path": rel_path, "name": display_name}, ""
 
 
