@@ -41,6 +41,8 @@ from supervisor.instances import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "deploy" / "provision_instance.sh"
+WRITABLE_SCRIPT = REPO_ROOT / "deploy" / "enable_instance_writable.sh"
+WRITABLE_UNIT = REPO_ROOT / "deploy" / "systemd" / "kazebot-writable@.service"
 INSTALLER = REPO_ROOT / "deploy" / "install_provision.sh"
 NEW_INSTANCE = REPO_ROOT / "deploy" / "new_instance.sh"
 CLOUDFLARED = REPO_ROOT / "deploy" / "cloudflared_ingress.py"
@@ -999,16 +1001,36 @@ def test_the_roster_edit_survives_a_missing_file(tmp_path: Path) -> None:
 def test_units_are_installed_outside_the_agent_writable_tree() -> None:
     installer = _script_code(INSTALLER)
     assert "/usr/local/lib/kazebot" in installer
+    assert '"$REPO/deploy/enable_instance_writable.sh" "$LIB/enable_instance_writable.sh"' in installer
+    assert 'kazebot-writable@.service' in installer
     script = _script_code(SCRIPT)
     assert "UNITS=/usr/local/lib/kazebot/units" in script
     # 从 /opt/kazebot/deploy 直接装单元，agent 改一行就能让 root 跑它的东西。
     assert "$REPO/deploy/systemd" not in script
 
 
-def test_polkit_rule_only_grants_start_on_the_two_templates() -> None:
+def test_polkit_rule_only_grants_start_on_the_fixed_templates() -> None:
     body = POLKIT.read_text(encoding="utf-8")
     assert 'subject.user !== "kazebot"' in body
     assert 'action.lookup("verb") === "start"' in body
-    assert "kazebot-(provision|deprovision)@" in body
+    assert "kazebot-(provision|deprovision|writable)@" in body
     # 授权只能是那一个 action id，多一个就是多一条提权路径。
     assert body.count("polkit.Result.YES") == 1
+
+
+def test_code_write_helper_has_a_fixed_dropin_and_restart_target() -> None:
+    body = _script_code(WRITABLE_SCRIPT)
+    assert 'DROPIN_DIR="/etc/systemd/system/${UNIT}.d"' in body
+    assert 'DROPIN="$DROPIN_DIR/50-writable.conf"' in body
+    assert "ReadWritePaths=/opt/kazebot" in body
+    assert "NoNewPrivileges=no" in body
+    assert "RestrictSUIDSGID=no" in body
+    assert 'systemctl restart "$UNIT"' in body
+    assert "/opt/kazebot/" not in body.replace("/opt/kazebot\n", "")
+
+
+def test_code_write_unit_runs_only_the_root_owned_helper() -> None:
+    body = _script_code(WRITABLE_UNIT)
+    assert "Type=oneshot" in body
+    assert "ExecStart=/usr/local/lib/kazebot/enable_instance_writable.sh %i" in body
+    assert "/opt/kazebot/deploy" not in body

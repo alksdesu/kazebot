@@ -64,10 +64,16 @@ function deferred<T>(): Deferred<T> {
 }
 
 let lastPut: any = null;
+let codeWriteCalls = 0;
 
 function stubPolicy(policy = POLICY) {
   lastPut = null;
+  codeWriteCalls = 0;
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input).includes('/runtime/code-write')) {
+      codeWriteCalls += 1;
+      return jsonResponse({ ok: true });
+    }
     if (init?.method === 'PUT') {
       lastPut = JSON.parse(String(init.body)).policy;
       return jsonResponse({ policy: lastPut });
@@ -212,6 +218,8 @@ describe('服务端策略', () => {
     fireEvent.click(screen.getByRole('button', { name: '取消' }));
     expect(screen.getByRole('button', { name: '一键全自动放行' })).toBeInTheDocument();
     expect(lastPut).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /命令/ }));
+    expect(screen.getByText('rm\\s+-rf\\s+/')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '一键全自动放行' }));
     fireEvent.click(screen.getByRole('button', { name: '确认并保存全自动放行' }));
@@ -225,6 +233,19 @@ describe('服务端策略', () => {
       default: 'auto', deny_patterns: [], sensitive_patterns: [], sensitive_path_patterns: [],
     });
     expect(lastPut.restart.default).toBe('auto');
+  });
+
+  it('二次确认时勾选代码目录写入才调用宿主机权限接口', async () => {
+    await renderPolicy();
+
+    fireEvent.click(screen.getByRole('button', { name: '一键全自动放行' }));
+    fireEvent.click(screen.getByLabelText(/同时开放 \/opt\/kazebot/));
+    fireEvent.click(screen.getByRole('button', { name: '确认并保存全自动放行' }));
+
+    await waitFor(() => expect(codeWriteCalls).toBe(1));
+    expect(lastPut.execute_command).toMatchObject({
+      default: 'auto', deny_patterns: [], sensitive_patterns: [], sensitive_path_patterns: [],
+    });
   });
 
   it('保存整份文档，没显示的字段不会被吞掉', async () => {

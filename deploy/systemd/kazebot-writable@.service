@@ -1,0 +1,9 @@
+[Unit]
+Description=Enable writable Kazebot code for %i
+After=kazebot@%i.service
+
+[Service]
+Type=oneshot
+# 脚本必须放在 root 所有的 /usr/local/lib，不能让实例工作区改写它。
+ExecStart=/usr/local/lib/kazebot/enable_instance_writable.sh %i
+TimeoutStartSec=90

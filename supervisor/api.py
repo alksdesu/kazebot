@@ -2166,6 +2166,22 @@ def create_app(
             raise HTTPException(status_code=401, detail="Unauthorized")
         return {"ok": True}
 
+    @app.post("/v1/admin/runtime/code-write")
+    async def enable_code_write(request: Request) -> dict[str, Any]:
+        """由控制台管理员明确确认后，给多开实例安装代码目录写权限。"""
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        prefix = url_prefix()
+        if not prefix.startswith("/i/"):
+            raise HTTPException(status_code=409, detail="单实例部署没有可切换的多开实例代码权限")
+        instance_id = prefix.removeprefix("/i/").strip("/")
+        try:
+            instance_id = provisioning.validate_instance_id(instance_id)
+            await provisioning.start_unit(provisioning.WRITABLE_UNIT.format(instance_id=instance_id))
+        except provisioning.ProvisionError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        return {"ok": True, "instance_id": instance_id, "workspace": str(st.workspace_root)}
+
     @app.get("/v1/instances")
     async def list_instances(request: Request) -> dict[str, Any]:
         """控制台实例切换器的数据源。单实例时 instances 为空，前端据此不渲染切换器。"""

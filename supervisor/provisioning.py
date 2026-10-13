@@ -52,6 +52,7 @@ _MIN_FREE_BYTES = 8 * 1024**3
 
 CREATE_UNIT = "kazebot-provision@{instance_id}.service"
 REMOVE_UNIT = "kazebot-deprovision@{instance_id}.service"
+WRITABLE_UNIT = "kazebot-writable@{instance_id}.service"
 
 
 class ProvisionError(RuntimeError):

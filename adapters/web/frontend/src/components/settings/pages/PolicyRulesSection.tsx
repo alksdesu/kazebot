@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from 'react';
 
 import {
+  enableCodeWrite,
   getPolicy,
   isEditConflict,
   updatePolicy,
@@ -78,6 +79,8 @@ const COMMAND_LISTS: Array<{ key: CommandListKey; title: string; hint: string; p
 
 const EMPTY_SECTION: RuleSection = { default: 'auto', rules: [] };
 const KAZEBOT_ROOT = '/opt/kazebot';
+
+const clonePolicy = (policy: PolicyDoc): PolicyDoc => JSON.parse(JSON.stringify(policy)) as PolicyDoc;
 
 const allAutoPolicy = (policy: PolicyDoc): PolicyDoc => ({
   ...policy,
@@ -459,6 +462,8 @@ export const PolicyRulesSection = () => {
   const [message, setMessage] = useState('');
   const [tab, setTab] = useState<TabKey>('write_file');
   const [fullAutoPending, setFullAutoPending] = useState(false);
+  const [fullAutoOriginal, setFullAutoOriginal] = useState<PolicyDoc | null>(null);
+  const [codeWriteRequested, setCodeWriteRequested] = useState(false);
 
   useEffect(() => {
     if (!adminToken || !isAuthenticated) return undefined;
@@ -470,6 +475,8 @@ export const PolicyRulesSection = () => {
         setSaved(JSON.stringify(next));
         setBase(hash);
         setFullAutoPending(false);
+        setFullAutoOriginal(null);
+        setCodeWriteRequested(false);
       })
       .catch((error) => {
         if (alive) setMessage(error instanceof Error ? error.message : '读取策略失败');
@@ -482,6 +489,7 @@ export const PolicyRulesSection = () => {
 
   const save = async () => {
     if (!doc || !adminToken) return;
+    const enableCodeWriteAfterSave = fullAutoPending && codeWriteRequested;
     setBusy(true);
     setMessage('');
     try {
@@ -491,7 +499,18 @@ export const PolicyRulesSection = () => {
       setSaved(JSON.stringify(next.policy));
       setBase(next.hash);
       setFullAutoPending(false);
-      setMessage('已保存，立即生效，不用重启');
+      setFullAutoOriginal(null);
+      setCodeWriteRequested(false);
+      if (enableCodeWriteAfterSave) {
+        try {
+          await enableCodeWrite(adminToken);
+          setMessage('策略已保存，已提交 /opt/kazebot 写入权限并重启 miaomiao');
+        } catch (error) {
+          setMessage(`策略已保存，但代码目录写权限未启用：${error instanceof Error ? error.message : '宿主机操作失败'}`);
+        }
+      } else {
+        setMessage('已保存，立即生效，不用重启');
+      }
     } catch (error) {
       if (tokenChanged(adminToken)) return;
       setMessage(isEditConflict(error)
@@ -523,6 +542,7 @@ export const PolicyRulesSection = () => {
 
   const prepareFullAuto = () => {
     if (!doc) return;
+    setFullAutoOriginal(clonePolicy(doc));
     setDoc(allAutoPolicy(doc));
     setFullAutoPending(true);
     setMessage('已生成全自动放行草稿；请确认后保存。');
@@ -551,9 +571,20 @@ export const PolicyRulesSection = () => {
             </p>
           </div>
           {fullAutoPending ? (
-            <div className="flex flex-wrap gap-2">
-              <Button disabled={busy} onClick={() => void save()} tone="danger">确认并保存全自动放行</Button>
-              <Button disabled={busy} onClick={() => { setFullAutoPending(false); setMessage('已取消全自动放行保存。'); }} tone="quiet">取消</Button>
+            <div className="flex flex-col items-start gap-2">
+              <label className="flex items-start gap-2 text-micro text-[var(--duties-secondary)]">
+                <input
+                  checked={codeWriteRequested}
+                  disabled={busy}
+                  onChange={(event) => setCodeWriteRequested(event.target.checked)}
+                  type="checkbox"
+                />
+                <span>同时开放 <code>/opt/kazebot</code> 写入并重启 miaomiao（高风险，仅本控制台管理员）</span>
+              </label>
+              <div className="flex flex-wrap gap-2">
+                <Button disabled={busy} onClick={() => void save()} tone="danger">确认并保存全自动放行</Button>
+                <Button disabled={busy} onClick={() => { if (fullAutoOriginal) setDoc(fullAutoOriginal); setFullAutoOriginal(null); setFullAutoPending(false); setCodeWriteRequested(false); setMessage('已取消全自动放行保存。'); }} tone="quiet">取消</Button>
+              </div>
             </div>
           ) : (
             <Button disabled={busy} onClick={prepareFullAuto} tone="danger">一键全自动放行</Button>

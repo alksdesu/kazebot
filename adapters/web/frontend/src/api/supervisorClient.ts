@@ -1716,6 +1716,12 @@ export async function restartEngine(
   return resp.json();
 }
 
+export async function enableCodeWrite(token: string): Promise<void> {
+  await apiFetch('/admin/runtime/code-write', {
+    method: 'POST', headers: authHeaders(token),
+  });
+}
+
 // ================================================================
 //  热载配置（平台配置文件与全局默认 config/features.yaml）与平台清单
 // ================================================================

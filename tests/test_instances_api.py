@@ -32,6 +32,7 @@ _ROUTES = (
     ("POST", "/v1/instances"),
     ("GET", "/v1/instances/koki/progress"),
     ("DELETE", "/v1/instances/koki"),
+    ("POST", "/v1/admin/runtime/code-write"),
 )
 
 
@@ -133,6 +134,23 @@ class TestListing:
                 "platform": "qq", "account": "", "current": True,
             },
         ]
+
+
+class TestCodeWrite:
+    def test_code_write_is_scoped_to_the_current_multi_instance(self, call, units: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLONOTH_URL_PREFIX", "/i/koki")
+
+        response = call("POST", "/v1/admin/runtime/code-write")
+
+        assert response.status_code == 200
+        assert response.json()["instance_id"] == "koki"
+        assert units == ["kazebot-writable@koki.service"]
+
+    def test_single_instance_cannot_enable_multi_instance_code_write(self, call, units: list[str]) -> None:
+        response = call("POST", "/v1/admin/runtime/code-write")
+
+        assert response.status_code == 409
+        assert units == []
 
 
 class TestCreate:
