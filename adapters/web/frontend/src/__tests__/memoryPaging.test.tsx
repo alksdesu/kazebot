@@ -188,6 +188,11 @@ describe('来源列表', () => {
       namespaces: [
         ...Array.from({ length: 12 }, (_, index) => namespace(index, `群${index}`, 'group')),
         ...Array.from({ length: 4 }, (_, index) => namespace(100 + index, `人${index}`, 'private')),
+        {
+          ...namespace(200, '人物档案', 'private'),
+          kind: 'subject',
+          owner: { kind: 'subject', label: '人物档案' },
+        },
       ],
     });
     render(<MemoryPage />);
@@ -199,8 +204,9 @@ describe('来源列表', () => {
     clickNext('项');
 
     await screen.findByText('人0');
-    // 第二页开头还是群组的尾巴，两个标题都要在。
+    // 第二页开头还是群组的尾巴，私聊和人物档案标题都要在。
     expect(screen.getByText('群组')).toBeInTheDocument();
+    expect(screen.getByText('私聊')).toBeInTheDocument();
     expect(screen.getByText('人物')).toBeInTheDocument();
   });
 });

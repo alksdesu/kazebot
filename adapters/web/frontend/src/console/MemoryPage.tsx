@@ -54,11 +54,12 @@ const GROUP = 'mb-1.5 mt-3.5 text-xs text-[var(--duties-secondary)]';
 
 const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');
 
-// 群里说的话归群、关于某个人的归人、认不出出处的归通用。
-const BUCKETS = ['群组', '人物', '通用'] as const;
+// 群聊、私聊和人物档案分开，认不出出处的归通用。
+const BUCKETS = ['群组', '私聊', '人物', '通用'] as const;
 
 function bucketOf(row: MemoryNamespace): (typeof BUCKETS)[number] {
-  if (row.kind === 'subject' || row.owner.kind === 'private') return '人物';
+  if (row.kind === 'subject') return '人物';
+  if (row.owner.kind === 'private') return '私聊';
   if (row.owner.kind === 'group' || row.owner.kind === 'agent') return '群组';
   return '通用';
 }
@@ -108,7 +109,7 @@ const MemoryBlock = () => {
   useEffect(() => { void loadOverview(); }, [adminToken]);
   useEffect(() => { setEntries([]); setEntriesScope(''); void loadEntries(selected); setEntryOffset(0); return () => { ++entryVersion.current; }; }, [selected, adminToken]);
 
-  // 固定按「群组 / 人物 / 通用」排，拍平成一条序列再分页 —— 按组各自分页会在一栏
+  // 固定按「群组 / 私聊 / 人物 / 通用」排，拍平成一条序列再分页 —— 按组各自分页会在一栏
   // 里挂出三个分页器。组标题在每页按需重新出现，翻页不会丢掉这一项属于哪一档。
   const sources = useMemo(() => {
     const wanted = query.trim().toLowerCase();
