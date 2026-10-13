@@ -579,7 +579,10 @@ export const PolicyRulesSection = () => {
                   onChange={(event) => setCodeWriteRequested(event.target.checked)}
                   type="checkbox"
                 />
-                <span>同时开放 <code>/opt/kazebot</code> 写入并重启 miaomiao（高风险，仅本控制台管理员）</span>
+                <span>
+                  同时开放 <code>/opt/kazebot</code> 写入并重启 miaomiao（高风险，仅本控制台管理员）。
+                  一旦开启，Bot 将可以完全控制此设备（其它未修改的 systemd 保护仍按现状生效），仅限开发调试使用。
+                </span>
               </label>
               <div className="flex flex-wrap gap-2">
                 <Button disabled={busy} onClick={() => void save()} tone="danger">确认并保存全自动放行</Button>

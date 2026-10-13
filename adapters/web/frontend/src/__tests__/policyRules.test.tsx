@@ -239,6 +239,7 @@ describe('服务端策略', () => {
     await renderPolicy();
 
     fireEvent.click(screen.getByRole('button', { name: '一键全自动放行' }));
+    expect(screen.getByText(/一旦开启，Bot 将可以完全控制此设备（其它未修改的 systemd 保护仍按现状生效）/)).toBeInTheDocument();
     fireEvent.click(screen.getByLabelText(/同时开放 \/opt\/kazebot/));
     fireEvent.click(screen.getByRole('button', { name: '确认并保存全自动放行' }));
 
