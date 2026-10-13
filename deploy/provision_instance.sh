@@ -134,13 +134,15 @@ PY
   chown -R "$OWNER:$OWNER" "$WS"
   systemctl enable --now "kazebot@$INSTANCE" "kazebot-qq@$INSTANCE" "kazebot-cleanup@$INSTANCE.timer"
 
-  say "等 supervisor 应答 127.0.0.1:$sup_port …"
+  say "等 supervisor 应答 127.0.0.1:$sup_port/i/$INSTANCE …"
   waited=0
-  until curl -fsS --max-time 2 "http://127.0.0.1:$sup_port/v1/health" >/dev/null 2>&1; do
+  until curl -fsS --max-time 2 "http://127.0.0.1:$sup_port/i/$INSTANCE/v1/health" >/dev/null 2>&1; do
     [ "$waited" -ge 120 ] && fail "服务 120 秒没起来，journalctl -u kazebot@$INSTANCE 看看"
     sleep 3; waited=$((waited + 3))
   done
 
+  [ -s "$WS/data/.admin_token" ] || fail "Supervisor 已应答但没有生成 $WS/data/.admin_token"
+  say "Supervisor admin token: $(cat "$WS/data/.admin_token")"
   say "完成。去 /i/$INSTANCE/web/ 扫码登录这个实例要用的号。"
   printf 'DONE ok\n' >>"$LOG"
 }

@@ -180,6 +180,33 @@ describe('服务端策略', () => {
     expect(screen.getByText('.ssh/')).toBeInTheDocument();
   });
 
+  it('全自动放行先生成草稿，二次确认后才保存并清空三组命令列表', async () => {
+    await renderPolicy();
+
+    fireEvent.click(screen.getByRole('button', { name: '一键全自动放行' }));
+
+    expect(lastPut).toBeNull();
+    expect(screen.getByRole('button', { name: '确认并保存全自动放行' })).toBeInTheDocument();
+    expect(screen.getByText('已生成全自动放行草稿；请确认后保存。')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    expect(screen.getByRole('button', { name: '一键全自动放行' })).toBeInTheDocument();
+    expect(lastPut).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: '一键全自动放行' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认并保存全自动放行' }));
+
+    await waitFor(() => expect(lastPut).not.toBeNull());
+    expect(lastPut.read_file.default).toBe('auto');
+    expect(lastPut.read_file.rules.every((rule: any) => rule.decision === 'auto')).toBe(true);
+    expect(lastPut.write_file.default).toBe('auto');
+    expect(lastPut.write_file.rules.every((rule: any) => rule.decision === 'auto')).toBe(true);
+    expect(lastPut.execute_command).toMatchObject({
+      default: 'auto', deny_patterns: [], sensitive_patterns: [], sensitive_path_patterns: [],
+    });
+    expect(lastPut.restart.default).toBe('auto');
+  });
+
   it('保存整份文档，没显示的字段不会被吞掉', async () => {
     // PUT 是整份替换：漏带 deny_patterns 等于把 12 条硬拦截规则悄悄删了。
     await renderPolicy();

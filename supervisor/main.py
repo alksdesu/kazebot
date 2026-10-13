@@ -34,6 +34,10 @@ PORT_IN_USE_EXIT_CODE = 98
 _logger = logging.getLogger("supervisor.main")
 
 
+def _worker_supervisor_url(host: str, port: int) -> str:
+    return f"http://{host}:{port}{url_prefix()}"
+
+
 def main() -> None:
     # 要在读端口等参数之前：多实例靠各自工作区的 .env 给端口和密钥。
     workspace_root = process_workspace()
@@ -138,7 +142,7 @@ def main() -> None:
             except Exception:
                 pass
 
-    base_url = f"http://{args.host}:{args.port}"
+    base_url = _worker_supervisor_url(args.host, args.port)
 
     process_manager: ProcessManager | None = None
     if not args.no_workers:

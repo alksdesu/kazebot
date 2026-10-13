@@ -118,7 +118,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
     if (!job || job.finished) return;
     let alive = true;
     let polling = false;
-    const timer = window.setInterval(() => {
+    const poll = () => {
       if (polling || !alive || !isCurrent()) return;
       polling = true;
       void getInstanceProgress(token, job.id).then(async next => {
@@ -128,7 +128,9 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
       }).catch(failure => {
         if (alive && isCurrent()) setProgressError(`读取进度失败，将自动重试：${say(failure)}`);
       }).finally(() => { polling = false; });
-    }, 2500);
+    };
+    void poll();
+    const timer = window.setInterval(poll, 2500);
     return () => { alive = false; window.clearInterval(timer); };
   }, [token, job, refresh]);
 
@@ -149,6 +151,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
       if (!isCurrent()) return;
       setNewId(''); setNewLabel(''); setNewAccount(''); setJobAction('create');
       setJob({ id: plan.id, lines: ['已请求建实例，等 root 侧接手…'], finished: false, ok: false, detail: '' });
+      void refresh();
     } catch (failure) { if (isCurrent()) setNote(say(failure)); }
     finally { mutation.current = false; if (isCurrent()) setBusy(false); }
   };

@@ -40,6 +40,26 @@ describe('Supervisor API client', () => {
     expect(typeof checkAdminAuth).toBe('function');
   });
 
+  it('keeps JSON error details from the supervisor', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ detail: '上游返回 400：API key 无效' }), {
+      status: 502,
+      headers: { 'Content-Type': 'application/json' },
+    })));
+
+    await expect(getPlatformAccount('secret-token', 'qq'))
+      .rejects.toThrow('502 上游返回 400：API key 无效');
+  });
+
+  it('turns HTML gateway errors into readable response text', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      '<html><head><style>.x{display:none}</style></head><body><h1>Bad gateway</h1><p>Error code: 502</p></body></html>',
+      { status: 502, headers: { 'Content-Type': 'text/html; charset=UTF-8' } },
+    )));
+
+    await expect(getPlatformAccount('secret-token', 'qq'))
+      .rejects.toThrow('502 Bad gateway Error code: 502');
+  });
+
   it('exports decideApproval as a function', () => {
     expect(typeof decideApproval).toBe('function');
   });

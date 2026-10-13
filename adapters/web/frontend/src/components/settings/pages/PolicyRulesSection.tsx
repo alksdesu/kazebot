@@ -12,7 +12,7 @@ import {
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { firstMatchIndex } from '../../../utils/globMatch';
-import { SaveBar, ScopeBadge } from './settingsControls';
+import { Button, DangerPanel, SaveBar, ScopeBadge } from './settingsControls';
 
 type RuleSectionKey = 'read_file' | 'write_file';
 type TabKey = RuleSectionKey | 'execute_command' | 'restart';
@@ -77,6 +77,28 @@ const COMMAND_LISTS: Array<{ key: CommandListKey; title: string; hint: string; p
 ];
 
 const EMPTY_SECTION: RuleSection = { default: 'auto', rules: [] };
+
+const allAutoPolicy = (policy: PolicyDoc): PolicyDoc => ({
+  ...policy,
+  read_file: {
+    ...(policy.read_file || {}),
+    default: 'auto',
+    rules: (policy.read_file?.rules || []).map((rule) => ({ ...rule, decision: 'auto' })),
+  },
+  write_file: {
+    ...(policy.write_file || {}),
+    default: 'auto',
+    rules: (policy.write_file?.rules || []).map((rule) => ({ ...rule, decision: 'auto' })),
+  },
+  execute_command: {
+    ...(policy.execute_command || {}),
+    default: 'auto',
+    deny_patterns: [],
+    sensitive_patterns: [],
+    sensitive_path_patterns: [],
+  },
+  restart: { ...(policy.restart || {}), default: 'auto' },
+});
 
 const INPUT_CLASS =
   'min-w-0 flex-1 border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-mini text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]';
@@ -433,6 +455,7 @@ export const PolicyRulesSection = () => {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [tab, setTab] = useState<TabKey>('write_file');
+  const [fullAutoPending, setFullAutoPending] = useState(false);
 
   useEffect(() => {
     if (!adminToken || !isAuthenticated) return undefined;
@@ -443,6 +466,7 @@ export const PolicyRulesSection = () => {
         setDoc(next);
         setSaved(JSON.stringify(next));
         setBase(hash);
+        setFullAutoPending(false);
       })
       .catch((error) => {
         if (alive) setMessage(error instanceof Error ? error.message : '读取策略失败');
@@ -463,6 +487,7 @@ export const PolicyRulesSection = () => {
       setDoc(next.policy);
       setSaved(JSON.stringify(next.policy));
       setBase(next.hash);
+      setFullAutoPending(false);
       setMessage('已保存，立即生效，不用重启');
     } catch (error) {
       if (tokenChanged(adminToken)) return;
@@ -493,6 +518,13 @@ export const PolicyRulesSection = () => {
     restart: 0,
   };
 
+  const prepareFullAuto = () => {
+    if (!doc) return;
+    setDoc(allAutoPolicy(doc));
+    setFullAutoPending(true);
+    setMessage('已生成全自动放行草稿；请确认后保存。');
+  };
+
   return (
     <section className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
       <div className="mb-3">
@@ -508,6 +540,22 @@ export const PolicyRulesSection = () => {
           同一条规则，谁触发结果不同：QQ 群里的非管理员一律拒绝，不看规则；QQ 管理员碰到
           「需审批」但没命中任何一条具体规则时会直接执行；定时任务没人点审批，需审批即拒绝。
         </p>
+        <DangerPanel>
+          <div className="min-w-0 flex-1">
+            <p className="font-mono text-xs font-semibold">全自动放行策略规则</p>
+            <p className="mt-1 text-micro leading-5 text-[var(--duties-secondary)]">
+              将四类规则和三组命令列表改成自动放行并清空列表。代码级密钥、平台状态和受保护路径仍由服务端硬保护。
+            </p>
+          </div>
+          {fullAutoPending ? (
+            <div className="flex flex-wrap gap-2">
+              <Button disabled={busy} onClick={() => void save()} tone="danger">确认并保存全自动放行</Button>
+              <Button disabled={busy} onClick={() => { setFullAutoPending(false); setMessage('已取消全自动放行保存。'); }} tone="quiet">取消</Button>
+            </div>
+          ) : (
+            <Button disabled={busy} onClick={prepareFullAuto} tone="danger">一键全自动放行</Button>
+          )}
+        </DangerPanel>
       </div>
 
       {!doc ? (

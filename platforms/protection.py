@@ -227,6 +227,7 @@ def secret_env_names(platforms: Iterable[PlatformDescriptor] | None = None) -> f
 _CORE_INSTANCE_ENV: frozenset[str] = frozenset({
     PLATFORM_ENV,
     "CLONOTH_PORT",
+    "CLONOTH_BASE_URL",
     "CLONOTH_HOST",
     "CLONOTH_URL_PREFIX",
     "CLONOTH_WORKSPACE",

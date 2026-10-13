@@ -331,9 +331,9 @@ describe('实例创建与归档', () => {
     vi.mocked(api.getInstanceProgress).mockResolvedValue({ id: 'xiaoyu', lines: ['已归档'], finished: true, ok: true, detail: '' });
     render(<AccountWorkspaceSlot />);
     const remove = await screen.findByRole('button', { name: '停用并归档' });
+    vi.mocked(api.getInstances).mockResolvedValue([rows[0]]);
     vi.useFakeTimers();
     await act(async () => fireEvent.click(remove));
-    vi.mocked(api.getInstances).mockResolvedValue([rows[0]]);
     await act(async () => vi.advanceTimersByTimeAsync(2500));
     expect(api.deleteInstance).toHaveBeenCalledExactlyOnceWith('current-token', 'xiaoyu');
     expect(api.getInstanceProgress).toHaveBeenCalledExactlyOnceWith('current-token', 'xiaoyu');
@@ -367,7 +367,6 @@ describe('实例创建与归档', () => {
     const remove = await screen.findByRole('button', { name: '停用并归档' });
     vi.useFakeTimers();
     await act(async () => fireEvent.click(remove));
-    await act(async () => vi.advanceTimersByTimeAsync(2500));
     expect(screen.getByRole('alert')).toHaveTextContent('读取进度失败，将自动重试：暂时断线');
     expect(remove).toBeDisabled();
     await act(async () => vi.advanceTimersByTimeAsync(2500));

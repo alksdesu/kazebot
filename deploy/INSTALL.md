@@ -108,6 +108,45 @@ sudo /opt/kazebot/deploy/install_provision.sh <主实例名> <主实例QQ号>
 
 **备份**：值得留一份的是 `/opt/kazebot/.env`、`data/config.yaml`、`data/policy.yaml`、`config/qq.yaml`，以及 `data/memory/` 和 `data/stickers/`。前四个含密钥，注意存放位置。
 
+## 模型与工具的出站代理
+
+主模型客户端默认忽略系统代理。只有将 `CLONOTH_LLM_TRUST_ENV=1` 注入 `kazebot.service`，它才读取 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`。留空或设为 `0` 保持原来的直连行为。
+
+需要统一代理时，使用 `systemd/kazebot-model-proxy.conf` 作为主服务的 drop-in。先确认本机代理可用，再将其中的 `127.0.0.1:7893` 换成实际入口；不要把文件装到 `kazebot-qq.service.d`。示例通过 mihomo 的独立 listener 选择出口，不改变其他应用已有的节点选择：
+
+```yaml
+listeners:
+  - name: qqbot-models
+    type: mixed
+    listen: 127.0.0.1
+    port: 7893
+    proxy: QQbot模型出口
+```
+
+`QQbot模型出口` 必须是 mihomo 配置中已存在的节点或策略组名称，按实际情况填写。入口及 mihomo 控制 API 都应只监听回环地址。校验配置后热加载 mihomo，避免重启其他代理应用。
+
+```bash
+sudo install -d /etc/systemd/system/kazebot.service.d
+```
+
+```bash
+sudo install -m 644 deploy/systemd/kazebot-model-proxy.conf /etc/systemd/system/kazebot.service.d/20-model-proxy.conf
+```
+
+```bash
+sudo systemctl daemon-reload
+```
+
+```bash
+sudo systemctl restart kazebot
+```
+
+代理覆盖主模型的普通请求与流式回复、备用模型、系统节点、控制台模型列表，以及继承环境的读图、绘图、联网搜索等工具。代理不可用时请求失败，不会自动偷偷改成直连。QQ 收发适配器与 NapCat 不继承此 drop-in。若适配器单元已有 `BindsTo=kazebot.service`，重启主服务会按原有依赖使它短暂重连；不要修改这项依赖或重启 NapCat。engine 到 supervisor 的客户端仍强制直连，其他本机调用由 `NO_PROXY` 保持直连。若另有本地模型域名或内网服务，应将实际主机名或地址同时加入两种大小写的 `NO_PROXY`。
+
+检查主服务与两个 engine 子进程均继承代理环境，并通过 mihomo 连接记录确认实际出口。公开模型列表成功只能证明网络连通；生成权限、余额及地区限制仍需单独验证，验证时使用不含聊天记录的最小请求。
+
+回滚时移除本次新增的 drop-in、重载 systemd 并重启 `kazebot`；如改了 mihomo 配置，恢复备份并热加载。不要删其他已有 drop-in，也不要重启 NapCat。
+
 ## 不想用脚本
 
 手工装的顺序是：系统依赖 → 建 kazebot 用户 → clone 到 `/opt/kazebot` 并 chown → venv 和 pip → 拷三份配置模板 → 编前端 → 起 NapCat 容器并把 WebUI token 填回 `.env` → 装 `deploy/systemd/` 里那两个单元 → `systemctl enable --now kazebot kazebot-qq`。

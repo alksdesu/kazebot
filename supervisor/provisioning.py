@@ -217,6 +217,7 @@ def _env_body(plan: Plan) -> str:
         f"# 实例 {plan.instance_id} ({plan.label})",
         f"{PLATFORM_ENV}={plan.platform}",
         f"CLONOTH_PORT={plan.ports['supervisor']}",
+        f"CLONOTH_BASE_URL=http://127.0.0.1:{plan.ports['supervisor']}{plan.prefix}",
         *_platform_env(plan),
     ]
     if plan.prefix:

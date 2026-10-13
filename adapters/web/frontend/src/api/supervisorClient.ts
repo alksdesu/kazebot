@@ -14,11 +14,41 @@ const API = `${MOUNT}/v1`;
 
 // ── Helper ──
 
+const ERROR_BODY_LIMIT = 4000;
+
+const htmlErrorText = (body: string): string => body
+  .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+  .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+  .replace(/<[^>]*>/g, ' ')
+  .replace(/&nbsp;/gi, ' ')
+  .replace(/&amp;/gi, '&')
+  .replace(/&lt;/gi, '<')
+  .replace(/&gt;/gi, '>')
+  .replace(/&quot;/gi, '"')
+  .replace(/&#39;/gi, "'")
+  .replace(/\s+/g, ' ')
+  .trim();
+
+const errorDetail = async (resp: Response): Promise<string> => {
+  const body = await resp.text();
+  if (!body.trim()) return resp.statusText;
+  try {
+    const payload = JSON.parse(body);
+    const detail = payload?.detail ?? payload?.message ?? payload?.error;
+    if (typeof detail === 'string' && detail.trim()) return detail.trim();
+    if (detail && typeof detail === 'object') return JSON.stringify(detail);
+  } catch {
+    // Non-JSON responses include proxy and tunnel error pages.
+  }
+  return (resp.headers.get('content-type') || '').includes('text/html')
+    ? htmlErrorText(body).slice(0, ERROR_BODY_LIMIT)
+    : body.trim().slice(0, ERROR_BODY_LIMIT);
+};
+
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   const resp = await fetchWithDeadline(`${API}${path}`, init);
   if (!resp.ok) {
-    let detail = '';
-    try { const j = await resp.json(); detail = j.detail || ''; } catch { /* ignore */ }
+    const detail = await errorDetail(resp);
     throw new Error(`${resp.status}${detail ? ` ${detail}` : ''}`);
   }
   return resp;

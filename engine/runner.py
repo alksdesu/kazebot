@@ -567,6 +567,11 @@ async def wait_supervisor(
         await asyncio.sleep(interval)
 
 
+def _create_llm_http_client(timeout: float) -> httpx.AsyncClient:
+    trust_env = os.environ.get("CLONOTH_LLM_TRUST_ENV", "").strip().lower() in {"1", "true", "yes", "on"}
+    return httpx.AsyncClient(timeout=timeout, trust_env=trust_env, headers={"User-Agent": "Clonoth"})
+
+
 async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: str = "") -> None:
     wid = worker_id or str(uuid.uuid4())
     generation_id = str(uuid.uuid4())  # Direction 2: unique generation per engine startup
@@ -594,7 +599,7 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
 
     async with (
         httpx.AsyncClient(timeout=sup_timeout, trust_env=False, headers=_sup_headers) as http,
-        httpx.AsyncClient(timeout=llm_timeout, trust_env=False, headers={"User-Agent": "Clonoth"}) as llm_http,
+        _create_llm_http_client(llm_timeout) as llm_http,
     ):
         await wait_supervisor(http, supervisor_url)
 

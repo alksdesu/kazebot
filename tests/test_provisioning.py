@@ -495,6 +495,7 @@ def test_the_env_opens_with_the_instance_its_platform_and_its_supervisor_port(
     assert lines[0] == "# 实例 koki (koki)"
     assert lines[1] == "CLONOTH_PLATFORM=qq"
     assert lines[2] == "CLONOTH_PORT=8775"
+    assert lines[3] == "CLONOTH_BASE_URL=http://127.0.0.1:8775/i/koki"
 
 
 def test_the_env_declares_the_platform_the_instance_was_opened_on(
@@ -522,7 +523,9 @@ def test_the_url_prefix_is_the_last_line(workspace: Path, monkeypatch: pytest.Mo
 
 
 def test_the_root_instance_gets_no_prefix_line(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    assert "CLONOTH_URL_PREFIX" not in provisioning._env_body(_plan(workspace, monkeypatch, 0, "rong"))
+    body = provisioning._env_body(_plan(workspace, monkeypatch, 0, "rong"))
+    assert "CLONOTH_BASE_URL=http://127.0.0.1:8765" in body
+    assert "CLONOTH_URL_PREFIX" not in body
 
 
 def test_a_platform_without_the_hook_writes_nothing(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -782,6 +785,14 @@ def test_the_root_script_only_builds_the_platform_the_env_declares() -> None:
     body = _script_code(SCRIPT)
     assert "CLONOTH_PLATFORM" in body
     assert '[ "$platform" = qq ]' in body
+
+
+def test_the_root_script_checks_the_prefixed_health_and_logs_the_admin_token() -> None:
+    body = _script_code(SCRIPT)
+
+    assert '127.0.0.1:$sup_port/i/$INSTANCE/v1/health' in body
+    assert 'Supervisor admin token:' in body
+    assert '$WS/data/.admin_token' in body
 
 
 def test_the_bootstrap_env_declares_the_platform() -> None:

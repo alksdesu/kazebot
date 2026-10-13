@@ -94,6 +94,7 @@ class TestWhatCountsAsInstanceIdentity:
     @pytest.mark.parametrize("name", [
         PLATFORM_ENV,
         "CLONOTH_PORT",
+        "CLONOTH_BASE_URL",
         "CLONOTH_HOST",
         "CLONOTH_URL_PREFIX",
         "CLONOTH_WORKSPACE",
