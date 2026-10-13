@@ -8,7 +8,7 @@ import { useSettingsStore } from '../store/settingsStore';
 
 const POLICY = {
   version: 1,
-  extra_roots: [],
+  extra_roots: ['/opt/kazebot'],
   read_file: {
     default: 'auto',
     rules: [
@@ -65,19 +65,19 @@ function deferred<T>(): Deferred<T> {
 
 let lastPut: any = null;
 
-function stubPolicy() {
+function stubPolicy(policy = POLICY) {
   lastPut = null;
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     if (init?.method === 'PUT') {
       lastPut = JSON.parse(String(init.body)).policy;
       return jsonResponse({ policy: lastPut });
     }
-    return jsonResponse({ policy: POLICY });
+    return jsonResponse({ policy });
   }));
 }
 
-async function renderPolicy() {
-  stubPolicy();
+async function renderPolicy(policy = POLICY) {
+  stubPolicy(policy);
   render(<PolicyRulesSection />);
   await screen.findByRole('button', { name: /写入/ });
 }
@@ -106,6 +106,26 @@ describe('服务端策略', () => {
 
     expect(screen.getByText('engine/system_nodes/**')).toBeInTheDocument();
     expect(screen.queryByText('tools/**')).toBeNull();
+  });
+
+  it('把代码根目录放在规则列表第一项并加粗', async () => {
+    const policy = {
+      ...POLICY,
+      write_file: {
+        ...POLICY.write_file,
+        rules: [
+          { pattern: '/opt/kazebot', decision: 'approval_required', reason: '代码目录需要单独关注' },
+          ...POLICY.write_file.rules,
+        ],
+      },
+    };
+    await renderPolicy(policy);
+
+    const root = screen.getByText('/opt/kazebot');
+    expect(root.tagName).toBe('CODE');
+    expect(root).toHaveClass('font-bold');
+    expect(root.closest('li')).toBe(ruleItems()[0]);
+    expect(screen.queryByText('策略扩展目录')).toBeNull();
   });
 
   it('新规则插在最前面 —— 追加到末尾会被兜底规则永久挡住', async () => {

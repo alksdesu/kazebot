@@ -60,10 +60,12 @@ def _default_policy_dict() -> dict[str, Any]:
 
     return {
         "version": 1,
-        "extra_roots": [],
+        "extra_roots": ["/opt/kazebot"],
         "read_file": {
             "default": "auto",
             "rules": [
+                {"pattern": "/opt/kazebot", "decision": "approval_required", "reason": "code directory is outside the instance workspace"},
+                {"pattern": "/opt/kazebot/**", "decision": "approval_required", "reason": "code directory is outside the instance workspace"},
                 {"pattern": ".env", "decision": "deny", "reason": "do not allow reading dotenv secrets"},
                 {"pattern": "**/.env", "decision": "deny", "reason": "do not allow reading dotenv secrets"},
                 {"pattern": "config/secrets.env", "decision": "deny", "reason": "do not allow reading shared dotenv secrets"},
@@ -85,6 +87,8 @@ def _default_policy_dict() -> dict[str, Any]:
         "write_file": {
             "default": "auto",
             "rules": [
+                {"pattern": "/opt/kazebot", "decision": "approval_required", "reason": "code directory changes require approval"},
+                {"pattern": "/opt/kazebot/**", "decision": "approval_required", "reason": "code directory changes require approval"},
                 {"pattern": "tools/**", "decision": "approval_required", "reason": "creating/updating tools requires approval"},
                 {"pattern": "config/runtime.yaml", "decision": "auto", "reason": "runtime tuning config"},
                 {"pattern": "config/nodes/**", "decision": "approval_required", "reason": "node definition changes affect execution, prompts, and model selection"},

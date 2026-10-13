@@ -362,6 +362,15 @@ class TestPolicySeesThroughLinks:
 
         assert (decision.reason, decision.sensitive) == ("default policy", False)
 
+    def test_an_extra_root_is_trusted_but_keeps_its_absolute_policy_name(
+        self, ws: Path, outside: Path,
+    ) -> None:
+        resolved, display, external = clonoth_runtime.classify_path(ws, [outside], str(outside / "x.py"))
+
+        assert resolved == (outside / "x.py").resolve()
+        assert display == resolved.as_posix()
+        assert external is False
+
 
 class TestWhereAnEnvMovedFileLands:
     def test_a_file_inside_the_workspace_is_relative(self, ws: Path, code_root: Path) -> None:

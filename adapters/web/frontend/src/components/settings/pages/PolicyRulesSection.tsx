@@ -77,6 +77,7 @@ const COMMAND_LISTS: Array<{ key: CommandListKey; title: string; hint: string; p
 ];
 
 const EMPTY_SECTION: RuleSection = { default: 'auto', rules: [] };
+const KAZEBOT_ROOT = '/opt/kazebot';
 
 const allAutoPolicy = (policy: PolicyDoc): PolicyDoc => ({
   ...policy,
@@ -287,7 +288,9 @@ const RuleRows = ({
               <span className="w-6 shrink-0 text-right font-mono text-micro text-[var(--duties-tertiary)]">
                 {index + 1}
               </span>
-              <code className="min-w-0 flex-1 truncate font-mono text-mini text-[var(--duties-text)]">
+              <code className={`min-w-0 flex-1 truncate font-mono text-mini text-[var(--duties-text)] ${
+                rule.pattern === KAZEBOT_ROOT || rule.pattern === `${KAZEBOT_ROOT}/**` ? 'font-bold' : ''
+              }`}>
                 {rule.pattern}
               </code>
               <DecisionSelect
