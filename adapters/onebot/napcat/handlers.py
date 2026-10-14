@@ -606,20 +606,21 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
                 await _private_matcher.finish(error)
             await _finish_approval_decision(user_id, approval_id, decision)
 
-    # 收到卡片后最自然的回复就是「同意」两个字，既没引用也没带 ID。这条没有卡片可依，
-    # 所以要求带斜杠 —— 否则私聊里一句「ok」就能批掉一条待审批。只认本人名下恰好
-    # 一条待审批的情况：0 条说明这就是句普通聊天，多条则无从判断指的是哪一条。
-    if live.approval_bare_verb_unique:
-        bare_verb = parse_reply_verb(common._strip_command_prefix(user_text))
-        if bare_verb is not None and permissions._can("approval", event):
+    # 裸动词只有在本人确实有待审批时才拦截；没有待审批仍是普通聊天。
+    # 关闭唯一匹配开关时也要给出明确提示，不能静默把「同意」送进普通 Agent。
+    bare_text = common._strip_command_prefix(user_text) or user_text
+    bare_verb = parse_reply_verb(bare_text)
+    if bare_verb is not None and permissions._can("approval", event):
+        pending_count = state._adapter.approvals.pending_count_for(user_id)
+        if live.approval_bare_verb_unique:
             unique_id = state._adapter.approvals.unique_pending_for(user_id)
             if unique_id:
                 await _finish_approval_decision(user_id, unique_id, bare_verb)
-            elif state._adapter.approvals.pending_count_for(user_id) > 1:
-                await _private_matcher.finish(
-                    "你名下有多条待审批，分不清是哪一条。请引用那张卡片回复，"
-                    "或发送：/审批 同意 <ID>。"
-                )
+        if pending_count > 0:
+            await _private_matcher.finish(
+                "这条私聊有待审批，但无法安全确定目标。请引用审批卡片回复，"
+                "或发送：/审批 同意 <ID>。"
+            )
 
     # 命令顺序与群侧一致：清记忆 / 死信 / 切模型在私聊里只有名单能用，而名单恒过闸门。
     help_reply = await commands._maybe_handle_help_command(event=event, user_text=user_text)

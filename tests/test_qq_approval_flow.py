@@ -117,6 +117,14 @@ class TestReplyTargetAnchoring:
         assert target.matched() is False
         assert AID in runtime.state._adapter.approvals.pending
 
+    def test_bare_verb_with_pending_approval_is_not_sent_to_agent(self, runtime: Any) -> None:
+        runtime.state._adapter.approvals.pending[AID] = {"operation": "read_file", "created_at": time.time()}
+        runtime.state._adapter.approvals.remember_card(111, AID, admin_id=LISTED_QQ)
+
+        # The handler-level guard is covered in the private gate tests; this
+        # assertion pins the recipient-scoped pending count used by that guard.
+        assert runtime.state._adapter.approvals.pending_count_for(LISTED_QQ) == 1
+
     def test_quoted_non_card_message_is_ignored(self, runtime: Any) -> None:
         runtime.state._adapter.approvals.pending[AID] = {"operation": "read_file", "created_at": time.time()}
         bot = _fake_bot(1, {999: {"message": [{"type": "text", "data": {"text": "普通消息"}}],

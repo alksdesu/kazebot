@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -137,6 +138,21 @@ def test_the_operator_can_put_a_notice_back(runtime: Any, monkeypatch: pytest.Mo
 
 def test_the_default_notice_is_empty(runtime: Any) -> None:
     assert runtime.state.live.private_denied_reply == ""
+
+
+def test_a_bare_approval_word_with_pending_card_does_not_create_agent_task(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_live_config(runtime, approval_bare_verb_unique=False)
+    runtime.state._adapter.approvals.pending["approval-1"] = {
+        "operation": "read_file", "created_at": time.time(),
+    }
+    runtime.state._adapter.approvals.remember_card(111, "approval-1", admin_id=LISTED_QQ)
+    matcher = _wire_agent_path(runtime, monkeypatch, "同意")
+
+    _run(runtime, _private_event(LISTED_QQ))
+
+    assert matcher.sent and "待审批" in matcher.sent[0]
 
 
 def test_an_unparsable_user_id_is_not_let_in(runtime: Any) -> None:
