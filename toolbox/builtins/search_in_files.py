@@ -7,6 +7,7 @@ Supports:
 """
 from __future__ import annotations
 
+import os
 import re
 from fnmatch import fnmatch
 from pathlib import Path
@@ -34,8 +35,10 @@ _SKIP_DIRS = frozenset({
 })
 _SKIP_SUFFIXES = frozenset({
     ".pyc", ".pyo", ".so", ".dll", ".exe", ".bin", ".whl", ".egg",
-    ".jsonl", ".log",
+    ".jsonl", ".log", ".sqlite", ".sqlite3", ".db", ".bak", ".map",
 })
+_MAX_CANDIDATE_FILES = 10_000
+_MAX_SCAN_BYTES = 256 * 1024 * 1024
 
 # Hard limit on total chars returned in search results to prevent context explosion
 _MAX_TOTAL_RESULT_CHARS = 50_000
@@ -44,11 +47,15 @@ _MAX_CONTEXT_LINE_CHARS = 500
 
 def _match_pattern(rel_path: str, pattern: str) -> bool:
     """Check if *rel_path* matches a glob *pattern*."""
-    if pattern in ("**/*", "*"):
+    normalized = pattern.replace("\\", "/").strip()
+    if normalized in ("**/*", "*"):
         return True
-    filename = rel_path.rsplit("/", 1)[-1]
-    file_pattern = pattern.rsplit("/", 1)[-1] if "/" in pattern else pattern
-    return fnmatch(filename, file_pattern)
+    rel = rel_path.replace("\\", "/")
+    if fnmatch(rel, normalized):
+        return True
+    if "/" not in normalized:
+        return fnmatch(rel.rsplit("/", 1)[-1], normalized)
+    return normalized.startswith("**/") and fnmatch(rel, normalized[3:])
 
 
 def _get_context(lines: list[str], line_idx: int, n: int = 1) -> str:
@@ -149,22 +156,32 @@ def _collect_files(root: Path, pattern: str, max_file_size: int, workspace: Path
             pass
         return
 
-    for p in sorted(root.rglob("*")):
-        if not p.is_file():
-            continue
-        if any(part in _SKIP_DIRS for part in p.parts):
-            continue
-        if p.suffix in _SKIP_SUFFIXES:
-            continue
-        try:
-            if p.stat().st_size > max_file_size:
+    candidate_count = 0
+    scanned_bytes = 0
+    for directory, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        dirnames[:] = sorted(
+            name for name in dirnames
+            if name not in _SKIP_DIRS
+            and not name.startswith(("dist.backup", "backup.", ".backup"))
+        )
+        for filename in sorted(filenames):
+            if candidate_count >= _MAX_CANDIDATE_FILES or scanned_bytes >= _MAX_SCAN_BYTES:
+                return
+            p = Path(directory) / filename
+            if filename.endswith(".min.js") or p.suffix in _SKIP_SUFFIXES:
                 continue
-        except Exception:
-            continue
-        rel = _rel(p)
-        if not _match_pattern(rel, pattern):
-            continue
-        yield p, rel
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            scanned_bytes += size
+            if size > max_file_size:
+                continue
+            rel = _rel(p)
+            if not _match_pattern(rel, pattern):
+                continue
+            candidate_count += 1
+            yield p, rel
 
 
 # ---------------------------------------------------------------------------
