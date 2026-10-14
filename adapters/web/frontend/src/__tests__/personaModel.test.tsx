@@ -151,7 +151,7 @@ describe('人设文件', () => {
     vi.mocked(getNodeFiles).mockRejectedValue(new Error('500 读不到节点文件清单'));
     render(<PersonaPage />);
 
-    expect(await screen.findByText('500 读不到节点文件清单')).toBeInTheDocument();
+    expect(await screen.findAllByText('500 读不到节点文件清单')).toHaveLength(2);
     expect(screen.queryByText(isOnlyExample)).toBeNull();
     expect(screen.getByRole('textbox', { name: '人设内容' })).toBeDisabled();
   });
@@ -163,6 +163,43 @@ describe('人设文件', () => {
     expect(await screen.findByText('4040 网关把状态码拼错了')).toBeInTheDocument();
     expect(screen.queryByText(isOnlyExample)).toBeNull();
     expect(screen.getByRole('textbox', { name: '人设内容' })).toBeDisabled();
+  });
+});
+
+describe('补充 System 文件', () => {
+  const tailEditor = () => screen.getByRole('textbox', { name: '补充 System内容' });
+
+  it('从独立文件读取并只保存补充 System', async () => {
+    vi.mocked(getNodeFiles).mockResolvedValue([nodeFile('_persona.md'), nodeFile('_persona-tail.md')]);
+    vi.mocked(getNodeFileRaw).mockImplementation(async (_token, filename) => (
+      filename === '_persona-tail.md'
+        ? { content: '尾部系统', hash: 'tail-1' }
+        : { content: '人设正文', hash: 'persona-1' }
+    ));
+
+    render(<PersonaPage />);
+
+    await waitFor(() => expect(tailEditor()).toHaveValue('尾部系统'));
+    expect(screen.getByRole('textbox', { name: '人设内容' })).toHaveValue('人设正文');
+    fireEvent.change(tailEditor(), { target: { value: '新的尾部系统' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存补充 System' }));
+
+    await waitFor(() => expect(updateNodeFileRaw).toHaveBeenCalledWith(
+      'admin-token', '_persona-tail.md', '新的尾部系统', 'tail-1',
+    ));
+  });
+
+  it('没有补充文件时从空草稿开始，首次保存用空指纹创建', async () => {
+    render(<PersonaPage />);
+
+    const editor = await screen.findByRole('textbox', { name: '补充 System内容' });
+    expect(editor).toHaveValue('');
+    fireEvent.change(editor, { target: { value: '只在需要时追加' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存补充 System' }));
+
+    await waitFor(() => expect(updateNodeFileRaw).toHaveBeenCalledWith(
+      'admin-token', '_persona-tail.md', '只在需要时追加', '',
+    ));
   });
 });
 

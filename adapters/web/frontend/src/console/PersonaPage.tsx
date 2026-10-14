@@ -1,4 +1,4 @@
-// 人格：bot 是谁、用哪个模型。两块各自就地保存，写的是节点文件，不经过任何平台配置。
+// 人格：人设、模型与补充 System。各块各自保存，写的是节点文件。
 import { useEffect, useId, useState } from 'react';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
@@ -34,16 +34,41 @@ import {
 } from './nodeYaml';
 
 const NODE_ID = 'qq.orchestrator';
-const PERSONA_FILE = '_persona.md';
+
+interface PromptFragment {
+  filename: string;
+  label: string;
+  placeholder: string;
+  rows: number;
+  savedNote: string;
+  fallback?: string;
+}
+
+const PERSONA: PromptFragment = {
+  filename: '_persona.md',
+  label: '人设',
+  placeholder: '写 bot 的性格、说话方式、忌讳。这段会原样拼进提示词。',
+  rows: 14,
+  savedNote: '已保存，下一条消息就会用新的人设。',
+  fallback: '_persona.example.md',
+};
+
+const PERSONA_TAIL: PromptFragment = {
+  filename: '_persona-tail.md',
+  label: '补充 System',
+  placeholder: '填写追加到系统提示词末尾的内容，留空关闭。',
+  rows: 8,
+  savedNote: '已保存，下一条消息就会使用新的补充 System。留空时不注入。',
+};
 
 const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');
 
-/** 读人设文件，还没建是 null。先查列表再读：直接去读不存在的文件，浏览器控制台会留一条 404 报错。 */
-async function readPersona(token: string): Promise<RawText | null> {
+// 先查列表，避免尚未创建的可选片段在浏览器控制台留下 404。
+async function readPromptFragment(token: string, filename: string): Promise<RawText | null> {
   const files = await getNodeFiles(token);
-  if (!files.some((file) => file.name === PERSONA_FILE && !file.is_example)) return null;
+  if (!files.some((file) => file.name === filename && !file.is_example)) return null;
   try {
-    return await getNodeFileRaw(token, PERSONA_FILE);
+    return await getNodeFileRaw(token, filename);
   } catch (error) {
     // 查完列表到读之间被删掉了，一样按还没建算。
     if (isNotFound(error)) return null;
@@ -51,26 +76,24 @@ async function readPersona(token: string): Promise<RawText | null> {
   }
 }
 
-/** 一块独立保存的区域共用的底栏。草稿在这一块自己手里，不进顶部的「N 项待应用」。 */
-const Persona = () => {
+const PromptFragment = ({ fragment }: { fragment: PromptFragment }) => {
   const token = useSettingsStore(state => state.adminToken);
   const [generation, setGeneration] = useState(0);
-  return <PersonaEditor key={`${token || ''}:${generation}`} onReload={() => setGeneration((value) => value + 1)} />;
+  return <PromptFragmentEditor fragment={fragment} key={`${token || ''}:${fragment.filename}:${generation}`} onReload={() => setGeneration((value) => value + 1)} />;
 };
 
-/** onReload 让编辑器整个重建、重读文件：「丢弃」换回的是磁盘上现在那一版，保存报冲突之后靠它继续。 */
-const PersonaEditor = ({ onReload }: { onReload: () => void }) => {
+// 丢弃时重建编辑器，读回磁盘最新版，也隔离旧凭证下尚未返回的请求。
+const PromptFragmentEditor = ({ fragment, onReload }: { fragment: PromptFragment; onReload: () => void }) => {
   const token = useSettingsStore((state) => state.adminToken);
   const [saved, setSaved] = useState('');
   const [text, setText] = useState('');
   // 保存时交回的指纹。文件还没建是空串：第一次保存要求它仍然不存在，被别处抢先建了就报冲突。
   const [base, setBase] = useState<string | null>(null);
-  /** 文件不存在时 bot 读的是 _persona.example.md，第一次保存会把这层回退关掉。 */
-  const [onlyExample, setOnlyExample] = useState(false);
+  const [missing, setMissing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [note, setNote] = useState('正在读取…');
-  const confirmDiscard = useUnsavedChanges(text !== saved, '人设有未保存修改，确定离开或丢弃吗？');
+  const confirmDiscard = useUnsavedChanges(text !== saved, `${fragment.label}有未保存修改，确定离开或丢弃吗？`);
 
   useEffect(() => {
     if (!token) return;
@@ -78,36 +101,36 @@ const PersonaEditor = ({ onReload }: { onReload: () => void }) => {
     setLoaded(false);
     void (async () => {
       try {
-        const file = await readPersona(token);
+        const file = await readPromptFragment(token, fragment.filename);
         if (cancelled) return;
         setSaved(file?.content ?? '');
         setText(file?.content ?? '');
         setBase(file ? file.hash : '');
-        setOnlyExample(file === null);
+        setMissing(file === null);
         setNote('');
         setLoaded(true);
       } catch (error) {
         if (cancelled) return;
-        setOnlyExample(false);
+        setMissing(false);
         setLoaded(false);
         setNote(say(error));
       }
     })();
     return () => { cancelled = true; };
-  }, [token]);
+  }, [token, fragment.filename]);
 
   const save = async () => {
     if (!token || busy || !loaded) return;
     setBusy(true);
     try {
-      const result = await updateNodeFileRaw(token, PERSONA_FILE, text, base);
+      const result = await updateNodeFileRaw(token, fragment.filename, text, base);
       setSaved(text);
       setBase(result.hash);
-      setOnlyExample(false);
-      setNote('已保存，下一条消息就会用新的人设。');
+      setMissing(false);
+      setNote(fragment.savedNote);
     } catch (error) {
       setNote(isEditConflict(error)
-        ? '人设在打开之后被别处改过，没有保存：点「丢弃」读入最新内容，再把改动重做一遍。'
+        ? `${fragment.label}在打开之后被别处改过，没有保存：点「丢弃」读入最新内容，再把改动重做一遍。`
         : say(error));
     }
     setBusy(false);
@@ -115,24 +138,24 @@ const PersonaEditor = ({ onReload }: { onReload: () => void }) => {
 
   return (
     <>
-      {onlyExample && (
+      {missing && fragment.fallback && (
         <ErrorText>
-          还没有 <code>_persona.md</code>，bot 现在读的是 <code>_persona.example.md</code>。
+          还没有 <code>{fragment.filename}</code>，bot 现在读的是 <code>{fragment.fallback}</code>。
           在这里保存一次就会创建它，示例从此不再生效。
         </ErrorText>
       )}
       <Textarea
-        aria-label="人设内容"
+        aria-label={`${fragment.label}内容`}
         disabled={busy || !loaded}
         onChange={(event) => setText(event.target.value)}
-        placeholder="写 bot 的性格、说话方式、忌讳。这段会原样拼进提示词。"
-        rows={14}
+        placeholder={fragment.placeholder}
+        rows={fragment.rows}
         value={text}
       />
       <SaveBar
         busy={busy}
         dirty={loaded && text !== saved}
-        label="保存人设"
+        label={`保存${fragment.label}`}
         note={note}
         onReset={() => { if (confirmDiscard()) onReload(); }}
         onSave={() => void save()}
@@ -234,7 +257,7 @@ export const PersonaPage = () => (
   <>
     <Block hint="拼进提示词的那段人设，改完下一条消息就生效" title="人设">
       <Panel>
-        <Persona />
+        <PromptFragment fragment={PERSONA} />
       </Panel>
     </Block>
 
@@ -245,8 +268,14 @@ export const PersonaPage = () => (
       </Panel>
     </Block>
 
+    <Block hint="追加在系统提示词末尾，保持原生 System；留空关闭。仅对引用人格片段的入口生效。" title="补充 System">
+      <Panel>
+        <PromptFragment fragment={PERSONA_TAIL} />
+      </Panel>
+    </Block>
+
     <Footnote>
-      两块各自保存，写的是这个实例的节点文件。平台自己的发送处理在「平台」组里改。
+      各块各自保存，写入当前节点配置；加入共享组后，这些文件跟随组内共享配置。平台自己的发送处理在「平台」组里改。
     </Footnote>
   </>
 );

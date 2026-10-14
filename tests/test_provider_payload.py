@@ -85,6 +85,18 @@ def test_gemini_safety_is_opt_in_and_covers_every_category() -> None:
     assert len(settings) == 4
 
 
+def test_gemini_merges_system_fragments_in_order_into_native_instruction() -> None:
+    provider = GeminiProvider(http=None, api_key="k", base_url=None, model="g")
+    body = provider._build_body([
+        {"role": "system", "content": "基础系统"},
+        {"role": "user", "content": "任务"},
+        {"role": "system", "content": "尾部补充"},
+    ], None)
+
+    assert body["systemInstruction"] == {"parts": [{"text": "基础系统\n\n尾部补充"}]}
+    assert body["contents"] == [{"role": "user", "parts": [{"text": "任务"}]}]
+
+
 def test_gemini_sampling_is_only_sent_when_configured() -> None:
     assert "temperature" not in _gemini()["generationConfig"]
     assert _gemini(temperature=0.9)["generationConfig"]["temperature"] == 0.9

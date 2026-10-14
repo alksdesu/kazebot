@@ -16,8 +16,8 @@ tool_access:
 skills:
   mode: none
 prompt: |
-  {{include:_shared.md}}
   {{include:_persona.md}}
+  {{include:_shared.md}}
 
   # Role: Shell Orchestrator
 
@@ -68,3 +68,4 @@ prompt: |
   以下是本轮的动态信息，每轮可能变化。
 
   当前时间：{{now}}
+  {{include:_persona-tail.md}}

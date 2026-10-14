@@ -54,7 +54,7 @@ export const BOT_PAGES: ConsolePageDefinition[] = [
     label: '人格',
     icon: 'draft',
     Page: PersonaPage,
-    note: 'bot 是谁、用哪个模型。两块各自保存，写的是这个实例的节点文件。',
+    note: 'bot 是谁、用哪个模型，以及系统提示词末尾的补充内容。各块各自保存，写入节点配置。',
   },
   {
     id: 'defaults',

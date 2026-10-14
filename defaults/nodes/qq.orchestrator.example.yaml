@@ -38,8 +38,8 @@ tool_access:
 skills:
   mode: none
 prompt: |
-  {{include:_shared.md}}
   {{include:_persona.md}}
+  {{include:_shared.md}}
 
   # Role: QQ Orchestrator
 
@@ -48,3 +48,4 @@ prompt: |
   {{include:_orchestrator.md}}
 
   {{include:_platform_qq.md}}
+  {{include:_persona-tail.md}}
