@@ -112,6 +112,23 @@ def test_dispatch_retains_generation_from_before_cancel(state: SupervisorState) 
     assert _callbacks(state) == []
 
 
+def test_cancelled_child_resumes_a_suspended_caller(state: SupervisorState) -> None:
+    parent = _parent(state)
+    caller = _inbound(state, parent)
+    child = _inbound(state, parent, caller_task_id=caller.task_id)
+    child.caller_task_id = caller.task_id
+    caller.status = TaskStatus.suspended
+    caller.waiting_for_task_id = child.task_id
+
+    result = state.cancel_single_task(child.task_id)
+
+    assert result["cancelled_count"] == 1
+    assert child.status == TaskStatus.cancelled
+    assert caller.status == TaskStatus.pending
+    assert caller.waiting_for_task_id is None
+    assert caller.input["resume_data"]["type"] == "child_cancelled"
+
+
 @pytest.mark.parametrize("cancelled", [False, True])
 def test_legacy_task_retains_generation_guard(state: SupervisorState, cancelled: bool) -> None:
     parent = _parent(state)

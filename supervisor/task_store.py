@@ -787,6 +787,29 @@ class TaskStoreMixin:
                         else:
                             self._event_task_snapshot("task_cancel_requested", t)
                         count += 1
+                if t.status == TaskStatus.cancelled and t.caller_task_id and t.caller_task_id not in to_cancel:
+                    caller = self.tasks.get(t.caller_task_id)
+                    route_session_id = self._route_session_id_for_task_locked(caller) if caller else ""
+                    current_generation = self._current_session_generation_locked(route_session_id) if caller else 0
+                    if (
+                        caller is not None
+                        and caller.status == TaskStatus.suspended
+                        and not caller.cancel_requested
+                        and route_session_id not in self._cancelled_sessions
+                        and (not current_generation or caller.session_generation == current_generation)
+                    ):
+                        caller.status = TaskStatus.pending
+                        caller.waiting_for_task_id = None
+                        caller.worker_id = None
+                        caller.lease_expires_at = None
+                        caller.updated_at = now
+                        caller.input["resume_data"] = {
+                            "type": "child_cancelled",
+                            "child_task_id": t.task_id,
+                            "child_node_id": str(t.node_id or t.tool_name or ""),
+                            "error": "child task cancelled",
+                        }
+                        self._event_task_snapshot("task_resumed", caller)
             return {"ok": True, "cancelled_count": count}
 
     # ---- orphaned task cleanup ----
