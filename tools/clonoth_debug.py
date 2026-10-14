@@ -69,6 +69,7 @@ TIMEOUT_SEC = 15.0
 
 if __name__ == "__main__":
     import json, sys
+    from pathlib import Path
     _input = json.loads(sys.stdin.read())
     def _readable_result(result):
         # [AutoC 2026-05-31] Why: clonoth_debug has many action-specific payloads,
@@ -104,13 +105,28 @@ if __name__ == "__main__":
     node_id = args.get("node_id", "")
     limit = args.get("limit", 20)
     EVENTS_FILE = "data/events.jsonl"
-    CLONOTH_URL = "http://127.0.0.1:8765"
+    CLONOTH_URL = (
+        os.environ.get("CLONOTH_SUPERVISOR_URL")
+        or os.environ.get("CLONOTH_BASE_URL")
+        or os.environ.get("CLONOTH_URL")
+        or "http://127.0.0.1:8765"
+    ).rstrip("/")
+    if CLONOTH_URL.endswith("/v1"):
+        CLONOTH_URL = CLONOTH_URL[:-3].rstrip("/")
+    ADMIN_TOKEN = os.environ.get("CLONOTH_ADMIN_TOKEN", "").strip()
+    if not ADMIN_TOKEN:
+        try:
+            ADMIN_TOKEN = (Path("data/.admin_token").read_text(encoding="utf-8")).strip()
+        except OSError:
+            ADMIN_TOKEN = ""
     def api_call(path, method="GET", body=None, params=None):
         url = f"{CLONOTH_URL}{path}"
         if params:
             url += "?" + urlencode(params)
         data = json.dumps(body).encode() if body else None
         headers = {"Content-Type": "application/json"} if data else {}
+        if ADMIN_TOKEN:
+            headers["Authorization"] = f"Bearer {ADMIN_TOKEN}"
         req = Request(url, data=data, headers=headers, method=method)
         try:
             with urlopen(req, timeout=10) as resp:
@@ -163,8 +179,24 @@ if __name__ == "__main__":
                     "message": (p.get("message", "") or "")[:100],
                 })
         output({"task_id_prefix": task_id, "count": len(matched), "events": matched[-limit:]})
-    # ── active_tasks: 从事件推算活跃任务 + API 交叉校验 ──
+    # ── active_tasks: 优先读取权威 API，事件尾部只作降级 ──
     elif action == "active_tasks":
+        api_active = api_call("/v1/admin/tasks/active")
+        if isinstance(api_active, list):
+            active = [{
+                "task_id": str(item.get("task_id", ""))[:12],
+                "session_id": item.get("session_id", ""),
+                "node_id": item.get("node_id") or "?",
+                "status": item.get("status", ""),
+                "kind": item.get("kind", ""),
+                "created": item.get("created_at", ""),
+                "last_ts": item.get("updated_at", ""),
+                "caller_task_id": str(item.get("caller_task_id") or "")[:12],
+                "cancel_requested": bool(item.get("cancel_requested")),
+                "current_phase": item.get("current_phase", ""),
+                "current_detail": item.get("current_detail", ""),
+            } for item in api_active]
+            output({"active_count": len(active), "tasks": active, "source": "admin_api"})
         events = read_events_tail(2000)
         tasks = {}  # tid -> info
         for ev in events:
@@ -204,9 +236,13 @@ if __name__ == "__main__":
                     "created": info.get("created", ""),
                     "last_ts": info.get("last_ts", ""),
                 })
-        api_state = api_call("/v1/admin/state")
-        api_counts = api_state.get("tasks", {}) if isinstance(api_state, dict) else {}
-        output({"active_count": len(active), "tasks": active, "api_task_counts": api_counts})
+        output({
+            "active_count": len(active),
+            "tasks": active,
+            "source": "event_tail_fallback",
+            "warning": "权威 active-task API 不可用，结果只覆盖最近 2000 条事件",
+            "api_error": api_active.get("error", "unknown") if isinstance(api_active, dict) else "invalid response",
+        })
     # ── pending_approvals: 从 API 查 ──
     elif action == "pending_approvals":
         data = api_call("/v1/admin/state")
