@@ -16,6 +16,20 @@ const API = `${MOUNT}/v1`;
 
 const ERROR_BODY_LIMIT = 4000;
 
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(`${status}${message ? ` ${message}` : ''}`);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
+export function isTransientApiError(error: unknown): boolean {
+  return !(error instanceof ApiError) || [502, 503, 504, 530].includes(error.status);
+}
+
 const htmlErrorText = (body: string): string => body
   .replace(/<script[\s\S]*?<\/script>/gi, ' ')
   .replace(/<style[\s\S]*?<\/style>/gi, ' ')
@@ -49,7 +63,7 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   const resp = await fetchWithDeadline(`${API}${path}`, init);
   if (!resp.ok) {
     const detail = await errorDetail(resp);
-    throw new Error(`${resp.status}${detail ? ` ${detail}` : ''}`);
+    throw new ApiError(resp.status, detail);
   }
   return resp;
 }
@@ -797,6 +811,7 @@ export interface ConsoleInstance {
   platform?: string;
   /** 登记的账号；还没登录过是空串。 */
   account?: string;
+  provisioning?: InstanceProgress;
 }
 
 /**
@@ -857,6 +872,9 @@ export interface InstanceProgress {
   finished: boolean;
   ok: boolean;
   detail: string;
+  state?: 'queued' | 'running';
+  retryable?: boolean;
+  action?: 'create' | 'remove';
 }
 
 // 和后端 provisioning 同一条规则，这里只为提前提示，以后端判定为准。

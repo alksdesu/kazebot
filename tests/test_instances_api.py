@@ -135,6 +135,17 @@ class TestListing:
             },
         ]
 
+    def test_listing_carries_an_active_provisioning_job_for_page_recovery(
+        self, call, workspace: Path,
+    ) -> None:
+        save_instance(workspace, instance_id="koki", label="小号", idx=1)
+        provisioning.log_path(workspace, "koki").write_text("等 supervisor 应答\n", encoding="utf-8")
+
+        row = call("GET", "/v1/instances").json()["instances"][0]
+
+        assert row["provisioning"]["id"] == "koki"
+        assert row["provisioning"]["state"] == "running"
+
 
 class TestCodeWrite:
     def test_code_write_is_scoped_to_the_current_multi_instance(self, call, units: list[str], monkeypatch: pytest.MonkeyPatch) -> None:

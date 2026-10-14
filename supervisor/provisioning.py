@@ -304,13 +304,20 @@ def progress(workspace_root: Path, instance_id: str) -> dict[str, Any]:
     instance_id = validate_instance_id(instance_id)
     lines = read_log(log_path(workspace_root, instance_id))
     done = next((line for line in reversed(lines) if line.startswith("DONE")), "")
-    return {
+    payload: dict[str, Any] = {
         "id": instance_id,
         "lines": lines,
         "finished": bool(done),
         "ok": done.startswith("DONE ok"),
         "detail": done[len("DONE fail:"):].strip() if done.startswith("DONE fail:") else "",
     }
+    if not done:
+        payload.update({
+            "state": "running" if lines else "queued",
+            "retryable": True,
+            "action": "remove" if any("归档" in line or "停服务" in line for line in lines) else "create",
+        })
+    return payload
 
 
 def forget(workspace_root: Path, instance_id: str) -> None:

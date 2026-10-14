@@ -311,6 +311,20 @@ describe('实例创建与归档', () => {
     expect(screen.getByRole('textbox', { name: '新实例名' })).toHaveValue('');
   });
 
+  it('页面重新打开时从实例清单恢复未完成的创建任务', async () => {
+    vi.mocked(api.getInstances).mockResolvedValue([
+      { ...rows[0], provisioning: { id: 'xiaoyu2', lines: ['等 supervisor 应答'], finished: false, ok: false, detail: '', state: 'running', retryable: true, action: 'create' } },
+    ]);
+    vi.mocked(api.getInstanceProgress).mockResolvedValue({ id: 'xiaoyu2', lines: ['已完成'], finished: true, ok: true, detail: '' });
+    vi.useFakeTimers();
+
+    render(<AccountWorkspaceSlot />);
+    await act(async () => vi.advanceTimersByTimeAsync(2500));
+
+    expect(api.getInstanceProgress).toHaveBeenCalledWith('current-token', 'xiaoyu2');
+    expect(screen.getByText('实例已建立，请去它自己的控制台扫码登录。')).toBeInTheDocument();
+  });
+
   it('归档要求准确输入实例名，当前实例和主实例不能被删除', async () => {
     const prompt = vi.spyOn(window, 'prompt').mockReturnValue('xiaoyu9');
     render(<AccountWorkspaceSlot />);
@@ -367,7 +381,7 @@ describe('实例创建与归档', () => {
     const remove = await screen.findByRole('button', { name: '停用并归档' });
     vi.useFakeTimers();
     await act(async () => fireEvent.click(remove));
-    expect(screen.getByRole('alert')).toHaveTextContent('读取进度失败，将自动重试：暂时断线');
+    expect(screen.getByRole('status')).toHaveTextContent('部署连接短暂中断，任务仍在后台运行，将自动重试。');
     expect(remove).toBeDisabled();
     await act(async () => vi.advanceTimersByTimeAsync(2500));
     expect(screen.getByText('实例已停用，工作区和聊天记录已归档。')).toBeInTheDocument();

@@ -136,8 +136,8 @@ PY
 
   say "等 supervisor 应答 127.0.0.1:$sup_port/i/$INSTANCE …"
   waited=0
-  until curl -fsS --max-time 2 "http://127.0.0.1:$sup_port/i/$INSTANCE/v1/health" >/dev/null 2>&1; do
-    [ "$waited" -ge 120 ] && fail "服务 120 秒没起来，journalctl -u kazebot@$INSTANCE 看看"
+  until curl --noproxy '*' -fsS --max-time 2 "http://127.0.0.1:$sup_port/i/$INSTANCE/v1/health" >/dev/null 2>&1; do
+    [ "$waited" -ge 300 ] && fail "服务 300 秒没起来，journalctl -u kazebot@$INSTANCE 看看"
     sleep 3; waited=$((waited + 3))
   done
 

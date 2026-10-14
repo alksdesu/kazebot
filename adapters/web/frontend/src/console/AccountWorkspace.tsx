@@ -21,6 +21,7 @@ import {
   type ConsoleInstance,
   type InstanceProgress,
   type QuickLoginTarget,
+  isTransientApiError,
 } from '../api/supervisorClient';
 import { getPlatform } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
@@ -107,12 +108,20 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
   const [progressError, setProgressError] = useState('');
+  const [progressTransient, setProgressTransient] = useState(false);
   const mutation = useRef(false);
   const identity = useRequestScope(token);
   const isCurrent = () => identity.isCurrent() && useSettingsStore.getState().adminToken === token;
   const running = job !== null && !job.finished;
   const locked = busy || running || loading || Boolean(error);
   useUnsavedChanges(Boolean(newId || newLabel || newAccount), '新实例还没建立，切换或离开会丢失填好的信息，确定继续吗？');
+
+  useEffect(() => {
+    const restored = instances.find(row => row.provisioning && !row.provisioning.finished)?.provisioning;
+    if (!restored || job?.id === restored.id) return;
+    setJob(restored);
+    setJobAction(restored.action || 'create');
+  }, [instances, job?.id]);
 
   useEffect(() => {
     if (!job || job.finished) return;
@@ -123,10 +132,13 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
       polling = true;
       void getInstanceProgress(token, job.id).then(async next => {
         if (!alive || !isCurrent()) return;
-        setJob(next); setProgressError('');
+        setJob(next); setProgressError(''); setProgressTransient(false);
         if (next.finished) await refresh();
       }).catch(failure => {
-        if (alive && isCurrent()) setProgressError(`读取进度失败，将自动重试：${say(failure)}`);
+        if (!alive || !isCurrent()) return;
+        const transient = isTransientApiError(failure);
+        setProgressTransient(transient);
+        setProgressError(transient ? '部署连接短暂中断，任务仍在后台运行，将自动重试。' : `读取进度失败，将自动重试：${say(failure)}`);
       }).finally(() => { polling = false; });
     };
     void poll();
@@ -145,7 +157,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
     const login = account ? `扫码登录 ${account}` : '扫码登录';
     if (!window.confirm(`建一个新 bot「${id}」？\n\n会新建 NapCat 容器、systemd 服务和域名路由，约一两分钟。\n建好后要去它自己的控制台${login}，当前这个实例不受影响。`)) return;
     if (!isCurrent()) return;
-    mutation.current = true; setBusy(true); setNote(''); setProgressError('');
+    mutation.current = true; setBusy(true); setNote(''); setProgressError(''); setProgressTransient(false);
     try {
       const plan = await createInstance(token, id, newLabel.trim(), platform.id, account);
       if (!isCurrent()) return;
@@ -162,7 +174,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
     if (typed === null) return;
     if (typed.trim() !== row.id) { setNote('输入的实例名对不上，没有执行'); return; }
     if (!isCurrent()) return;
-    mutation.current = true; setBusy(true); setNote(''); setProgressError('');
+    mutation.current = true; setBusy(true); setNote(''); setProgressError(''); setProgressTransient(false);
     try {
       await deleteInstance(token, row.id);
       if (!isCurrent()) return;
@@ -214,7 +226,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
       {note && <p role="alert" className="mt-3 text-sm text-[var(--duties-danger)]">{note}</p>}
       {job && <>
         <Pre className="mt-3 max-h-60">{job.lines.join('\n')}</Pre>
-        {progressError && <p role="alert" className="mt-3 text-sm text-[var(--duties-danger)]">{progressError}</p>}
+        {progressError && <p role={progressTransient ? 'status' : 'alert'} className={`mt-3 text-sm ${progressTransient ? DESC : 'text-[var(--duties-danger)]'}`}>{progressError}</p>}
         {job.finished && <Facts>{job.ok
           ? jobAction === 'create' ? '实例已建立，请去它自己的控制台扫码登录。' : '实例已停用，工作区和聊天记录已归档。'
           : `没成功：${job.detail || '看上面的日志'}`}</Facts>}

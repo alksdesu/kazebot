@@ -705,6 +705,15 @@ def test_progress_on_a_missing_log_is_not_finished(workspace: Path) -> None:
     assert state["lines"] == [] and not state["finished"]
 
 
+def test_active_progress_exposes_a_resumable_state(workspace: Path) -> None:
+    provisioning.log_path(workspace, "koki").parent.mkdir(parents=True, exist_ok=True)
+    provisioning.log_path(workspace, "koki").write_text("等 supervisor 应答\n", encoding="utf-8")
+
+    state = provisioning.progress(workspace, "koki")
+
+    assert state["state"] == "running" and state["retryable"] is True and state["action"] == "create"
+
+
 def test_the_progress_log_sits_outside_the_workspace(workspace: Path) -> None:
     # 删实例会把工作区改名，日志跟着搬走就再也读不到结果。
     log = provisioning.log_path(workspace, "koki")
@@ -793,6 +802,7 @@ def test_the_root_script_checks_the_prefixed_health_and_logs_the_admin_token() -
     body = _script_code(SCRIPT)
 
     assert '127.0.0.1:$sup_port/i/$INSTANCE/v1/health' in body
+    assert "--noproxy '*'" in body and 'waited" -ge 300' in body
     assert 'Supervisor admin token:' in body
     assert '$WS/data/.admin_token' in body
 

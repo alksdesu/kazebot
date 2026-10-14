@@ -2189,12 +2189,19 @@ def create_app(
         verify_admin_token(request)
         st: SupervisorState = app.state.state
         prefix = url_prefix()
+        rows: list[dict[str, Any]] = []
+        for row in load_instances(st.workspace_root):
+            item = {**row, "current": row["path"] == prefix}
+            try:
+                active_progress = provisioning.progress(st.workspace_root, str(row["id"]))
+            except provisioning.ProvisionError:
+                active_progress = None
+            if active_progress and not active_progress.get("finished") and active_progress.get("lines"):
+                item["provisioning"] = active_progress
+            rows.append(item)
         return {
             "current_prefix": prefix,
-            "instances": [
-                {**row, "current": row["path"] == prefix}
-                for row in load_instances(st.workspace_root)
-            ],
+            "instances": rows,
         }
 
     @app.post("/v1/instances")
