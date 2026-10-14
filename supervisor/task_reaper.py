@@ -36,6 +36,7 @@ def reap_reason(
     max_running_sec: float,
     approval_pending: bool,
     waiting_task_terminal: bool = False,
+    waiting_task_missing: bool = False,
 ) -> str | None:
     """该回收时返回写进 task.result 的原因，不该回收返回 None。"""
     silence = now - task.updated_at
@@ -51,6 +52,8 @@ def reap_reason(
             return None
         if waiting_task_terminal and silence > SUSPENDED_CHILD_GRACE:
             return "等待的子任务已结束但入口未恢复，按僵尸任务回收"
+        if waiting_task_missing and silence > SUSPENDED_CHILD_GRACE:
+            return "等待的子任务已丢失，按僵尸任务回收"
         if not task.waiting_for_task_id and silence > SUSPENDED_SILENCE_LIMIT:
             return f"任务挂起过久（{_minutes(silence)} 分钟无等待目标），按僵尸任务回收"
         return None
@@ -116,6 +119,11 @@ def reap_stuck_tasks_locked(
                 and task.waiting_for_task_id
                 and waiting_task is not None
                 and state._task_terminal(waiting_task)
+            ),
+            waiting_task_missing=bool(
+                task.status == TaskStatus.suspended
+                and task.waiting_for_task_id
+                and waiting_task is None
             ),
         )
         if reason is None:

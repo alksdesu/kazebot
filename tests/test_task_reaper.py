@@ -212,6 +212,21 @@ def test_a_suspended_task_waiting_for_a_terminal_child_gets_a_grace_period() -> 
     ) is not None
 
 
+def test_a_suspended_task_waiting_for_a_missing_child_is_reaped() -> None:
+    task = _task(status=TaskStatus.suspended, silent_for=timedelta(minutes=5, seconds=1))
+    task.waiting_for_task_id = "missing-child"
+
+    reason = reap_reason(
+        task,
+        now=_NOW,
+        max_running_sec=_MAX_RUNNING,
+        approval_pending=False,
+        waiting_task_missing=True,
+    )
+
+    assert reason is not None and "丢失" in reason
+
+
 def test_an_expired_lease_is_reaped_only_after_the_grace_minute() -> None:
     assert _reason(_task(lease_in=-LEASE_GRACE)) is None
 
