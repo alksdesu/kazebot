@@ -529,6 +529,8 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     # 重建本次请求视图，重新走 build_llm_messages + prepare 流程。
                     _formatted = _build_messages_for_provider(_request_messages, ls.formatter, ls.provider)
                     llm_messages = prepare_messages_for_llm(_formatted, ls.rctx.workspace_root)
+                    if _node_strips_images(ls.node):
+                        llm_messages = _strip_image_blocks(llm_messages)
                     resp = None
                     continue  # 重试
 

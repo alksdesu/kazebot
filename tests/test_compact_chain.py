@@ -282,9 +282,9 @@ class TestCharsPerToken:
 
         view, changed = bounded_tool_result_view(messages, max_chars=100)
 
-        assert changed == 1
+        assert changed == 2
         assert len(view[1]["content"]) < 200
-        assert len(view[3]["content"]) == 5_000
+        assert len(view[3]["content"]) < 500
         assert len(messages[1]["content"]) == 5_000
 
 

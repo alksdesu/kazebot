@@ -116,8 +116,8 @@ def bounded_tool_result_view(
     """Return a request-only view with old tool results bounded.
 
     The durable message list is never mutated. The latest assistant tool-call
-    round and all of its results stay intact so native providers keep valid
-    call/result pairs.
+    round keeps its native call/result pairing while its content still gets a
+    larger bound than older results.
     """
     result = [dict(message) for message in messages]
     tool_indices = [index for index, message in enumerate(result) if _is_tool_result(message)]
@@ -130,12 +130,12 @@ def bounded_tool_result_view(
             if message.get("role") == "assistant" and message.get("tool_calls"):
                 latest_round_start = index
 
+    latest_limit = max_chars * 4 if latest_round_start >= 0 and keep_latest_round else max_chars
     changed = 0
     for index in tool_indices:
-        if keep_latest_round and latest_round_start >= 0 and index > latest_round_start:
-            continue
         message = result[index]
-        bounded = _bounded_content(message.get("content", ""), max_chars)
+        limit = latest_limit if latest_round_start >= 0 and index > latest_round_start else max_chars
+        bounded = _bounded_content(message.get("content", ""), limit)
         if bounded != message.get("content", ""):
             message["content"] = bounded
             changed += 1
