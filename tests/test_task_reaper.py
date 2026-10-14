@@ -172,6 +172,46 @@ def test_a_missing_lease_is_protected_by_a_pending_approval() -> None:
     assert _reason(task, approval_pending=True) is None
 
 
+def test_a_pending_task_is_reaped_after_queue_ttl() -> None:
+    task = _task(status=TaskStatus.pending, created_ago=timedelta(minutes=15, seconds=1))
+
+    reason = _reason(task)
+
+    assert reason is not None and "排队过久" in reason
+
+
+def test_a_fresh_pending_task_is_kept() -> None:
+    assert _reason(_task(status=TaskStatus.pending, created_ago=timedelta(minutes=15))) is None
+
+
+def test_a_suspended_task_without_wait_target_is_reaped_after_silence() -> None:
+    task = _task(status=TaskStatus.suspended, silent_for=timedelta(minutes=20, seconds=1))
+
+    reason = _reason(task)
+
+    assert reason is not None and "挂起过久" in reason
+
+
+def test_a_suspended_task_waiting_for_a_terminal_child_gets_a_grace_period() -> None:
+    task = _task(status=TaskStatus.suspended, silent_for=timedelta(minutes=4, seconds=59))
+    task.waiting_for_task_id = "child"
+
+    assert reap_reason(
+        task,
+        now=_NOW,
+        max_running_sec=_MAX_RUNNING,
+        approval_pending=False,
+        waiting_task_terminal=True,
+    ) is None
+    assert reap_reason(
+        task,
+        now=_NOW + timedelta(minutes=5),
+        max_running_sec=_MAX_RUNNING,
+        approval_pending=False,
+        waiting_task_terminal=True,
+    ) is not None
+
+
 def test_an_expired_lease_is_reaped_only_after_the_grace_minute() -> None:
     assert _reason(_task(lease_in=-LEASE_GRACE)) is None
 
@@ -270,8 +310,8 @@ def test_an_expired_lease_task_is_failed_with_an_event_and_routed(
     assert completed[0]["component"] == "supervisor"
 
 
-@pytest.mark.parametrize("status", [TaskStatus.pending, TaskStatus.suspended, TaskStatus.completed])
-def test_only_running_tasks_are_reaped(
+@pytest.mark.parametrize("status", [TaskStatus.completed])
+def test_terminal_tasks_are_not_reaped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: TaskStatus,
 ) -> None:
     state = _make_state(tmp_path)

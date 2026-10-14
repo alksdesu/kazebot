@@ -1,4 +1,4 @@
-"""running 任务的回收：租约过期、心跳沉默太久或运行超过硬上限的任务按失败收尾，走正常的完成路由。"""
+"""回收卡住的任务，并沿用正常完成路由通知调用方。"""
 from __future__ import annotations
 
 import logging
@@ -21,15 +21,46 @@ LEASE_GRACE = timedelta(seconds=60)
 MISSING_LEASE_GRACE = timedelta(minutes=5)
 # 续租会顺带刷新 updated_at；十分钟没动静说明 worker 已经不在了，哪怕它还挂着审批
 HEARTBEAT_SILENCE_LIMIT = timedelta(minutes=10)
+# 队列长时间没有被 worker 接走时，避免 pending 任务永久占据会话。
+PENDING_QUEUE_LIMIT = timedelta(minutes=15)
+# 没有合法等待目标的 suspended 任务，超过这个时间按丢失的等待链收尾。
+SUSPENDED_SILENCE_LIMIT = timedelta(minutes=20)
+# 子任务已终态但 caller 仍挂起时，给路由线程一小段完成收尾的时间。
+SUSPENDED_CHILD_GRACE = timedelta(minutes=5)
 
 
-def reap_reason(task: Task, *, now: datetime, max_running_sec: float, approval_pending: bool) -> str | None:
+def reap_reason(
+    task: Task,
+    *,
+    now: datetime,
+    max_running_sec: float,
+    approval_pending: bool,
+    waiting_task_terminal: bool = False,
+) -> str | None:
     """该回收时返回写进 task.result 的原因，不该回收返回 None。"""
+    silence = now - task.updated_at
+    if task.status == TaskStatus.pending:
+        if approval_pending:
+            return None
+        age = now - task.created_at
+        if age > PENDING_QUEUE_LIMIT:
+            return f"任务排队过久（{_minutes(age)} 分钟无 worker 接手），已自动终止"
+        return None
+    if task.status == TaskStatus.suspended:
+        if approval_pending:
+            return None
+        if waiting_task_terminal and silence > SUSPENDED_CHILD_GRACE:
+            return "等待的子任务已结束但入口未恢复，按僵尸任务回收"
+        if not task.waiting_for_task_id and silence > SUSPENDED_SILENCE_LIMIT:
+            return f"任务挂起过久（{_minutes(silence)} 分钟无等待目标），按僵尸任务回收"
+        return None
+    if task.status != TaskStatus.running:
+        return None
+
     age_sec = (now - task.created_at).total_seconds()
     if age_sec > max_running_sec:
         return f"任务运行过久（{int(age_sec)} 秒，上限 {int(max_running_sec)} 秒），已自动终止以防止僵死阻塞聊天"
 
-    silence = now - task.updated_at
     if silence > HEARTBEAT_SILENCE_LIMIT:
         return f"任务运行超时（{_minutes(silence)} 分钟无响应，疑似 worker 崩溃）"
 
@@ -52,7 +83,7 @@ def reap_stuck_tasks_locked(
     now: datetime | None = None,
     session_ids: Iterable[str] | None = None,
 ) -> list[str]:
-    """回收卡死的 running 任务，返回被回收的 task_id。调用方必须持有 state._lock。
+    """回收卡住的任务，返回被回收的 task_id。调用方必须持有 state._lock。
 
     给了 session_ids 就只看这些会话里的任务。
     """
@@ -68,17 +99,24 @@ def reap_stuck_tasks_locked(
     reaped: list[str] = []
     # 完成路由会增删 state.tasks，先拍快照再遍历
     for task in list(state.tasks.values()):
-        if task.status != TaskStatus.running:
+        if task.status not in {TaskStatus.running, TaskStatus.pending, TaskStatus.suspended}:
             continue
         if scope is not None and task.session_id not in scope:
             continue
         # 分支上跑的任务，审批可能挂在父会话上
         route_session_id = state._route_session_id_for_task_locked(task)
+        waiting_task = state.tasks.get(task.waiting_for_task_id or "")
         reason = reap_reason(
             task,
             now=now,
             max_running_sec=max_running_sec,
             approval_pending=task.session_id in waiting_sessions or route_session_id in waiting_sessions,
+            waiting_task_terminal=bool(
+                task.status == TaskStatus.suspended
+                and task.waiting_for_task_id
+                and waiting_task is not None
+                and state._task_terminal(waiting_task)
+            ),
         )
         if reason is None:
             continue
