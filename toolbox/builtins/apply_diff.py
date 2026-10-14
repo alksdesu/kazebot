@@ -134,12 +134,12 @@ def _apply_diff_result_text(path: str, applied: int, failed: int) -> str:
     return f"apply_diff on {path}: {applied} applied, {failed} rejected"
 
 
-def _apply_diff_error_response(message: Any, path: str = "", **data_fields: Any) -> dict[str, Any]:
+def _apply_diff_error_response(error: Any, path: str = "", **data_fields: Any) -> dict[str, Any]:
     # [AutoC 2026-05-31] Why: every apply_diff failure should include ok=false and
     # data.result, including validation and policy failures that occur before counts
     # exist. How: normalize the error and add any known path/count details under
     # data. Purpose: make failed diffs readable and schema-consistent.
-    text = str(message)
+    text = str(error)
     data: dict[str, Any] = {"result": f"ERROR: {text}"}
     if path:
         data["file"] = path
