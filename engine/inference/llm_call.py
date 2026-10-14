@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any
 
@@ -417,7 +418,9 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                 "usage": resp.usage,
                 # 配上真实 token 数，supervisor 侧的字符预算才能按本会话的实际比例裁剪；
                 # 硬编码 3 字符/token 是按英文定的，中文会把预算放大两三倍。
-                "prompt_chars": total_content_chars(ls.messages),
+                "prompt_chars": total_content_chars(llm_messages) + (
+                    len(json.dumps(tools_arg, ensure_ascii=False, default=str)) if tools_arg else 0
+                ),
             })
 
         # ---- 重试判定 ----

@@ -272,6 +272,10 @@ class TestCharsPerToken:
         message = {"content": "", "tool_calls": [{"function": {"name": "read", "arguments": "x" * 300}}]}
         assert total_content_chars([message]) > 300
 
+    def test_gemini_raw_parts_are_counted(self) -> None:
+        message = {"content": "", "_meta": {"metadata": {"gemini": {"raw_parts": [{"functionCall": {"args": "x" * 300}}]}}}}
+        assert total_content_chars([message]) > 300
+
     def test_old_tool_results_are_bounded_without_mutating_history(self) -> None:
         messages = [
             {"role": "assistant", "tool_calls": [{"id": "old"}], "content": ""},

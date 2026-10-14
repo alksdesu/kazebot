@@ -23,6 +23,7 @@ from clonoth_runtime import resolve_channel, resolve_env_ref
 # Without this, internal fields like _meta/_ephemeral leak into provider requests.
 from engine.inference.llm_call import _build_messages_for_provider
 from engine.attachments import prepare_messages_for_llm
+from engine.compact import bounded_tool_result_view
 
 
 def _messages_contain_images(messages: list[dict[str, Any]]) -> bool:
@@ -364,7 +365,7 @@ class FallbackProviderHandler:
             return None
 
         original_error = getattr(resp, "error", "unknown")
-        messages = ctx.messages
+        messages, _ = bounded_tool_result_view(ctx.messages)
         tools = ctx.tools
         original_provider = ctx.provider
         has_image_input = _messages_contain_images(messages)

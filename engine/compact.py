@@ -65,6 +65,15 @@ def total_content_chars(messages: list[Any]) -> int:
                 total += len(json.dumps(function_call, ensure_ascii=False, default=str))
             except (TypeError, ValueError):
                 total += len(str(function_call))
+        if isinstance(message, dict):
+            metadata = message.get("_meta", {}).get("metadata", {})
+            gemini = metadata.get("gemini", {}) if isinstance(metadata, dict) else {}
+            raw_parts = gemini.get("raw_parts") if isinstance(gemini, dict) else None
+            if raw_parts:
+                try:
+                    total += len(json.dumps(raw_parts, ensure_ascii=False, default=str))
+                except (TypeError, ValueError):
+                    total += len(str(raw_parts))
     return total
 
 
