@@ -2046,6 +2046,35 @@ class TaskRouterMixin:
             log.warning("cleanup dispatch session %s failed: %s", _dispatch_sid[:12], e)
             raise
 
+    def _async_result_origin_guard_locked(
+        self, session_id: str, task_id: str,
+    ) -> dict[str, Any] | None:
+        """Drop late async results before they can create a new inbound task."""
+        if session_id in self._cancelled_sessions:
+            return {"ok": True, "strategy": "dropped", "reason": "session_cancelled"}
+        if not task_id:
+            return None
+
+        origin = self.tasks.get(task_id)
+        if origin is None:
+            return {"ok": True, "strategy": "dropped", "reason": "origin_not_found"}
+        if origin.cancel_requested or origin.status == TaskStatus.cancelled:
+            return {"ok": True, "strategy": "dropped", "reason": "origin_cancelled"}
+
+        route_session_id = self._route_session_id_for_task_locked(origin) or session_id
+        if route_session_id != session_id:
+            return {"ok": True, "strategy": "dropped", "reason": "route_mismatch"}
+        if route_session_id in self._cancelled_sessions:
+            return {"ok": True, "strategy": "dropped", "reason": "route_session_cancelled"}
+        current_generation = self._current_session_generation_locked(route_session_id)
+        if (
+            origin.session_generation
+            and current_generation
+            and origin.session_generation != current_generation
+        ):
+            return {"ok": True, "strategy": "dropped", "reason": "stale_generation"}
+        return None
+
     def inject_async_result(
         self,
         session_id: str,
@@ -2072,6 +2101,13 @@ class TaskRouterMixin:
             result_atts = list(attachments or [])
             event_node_id = str(node_id or "").strip()
             event_task_id = str(task_id or "").strip()
+            guard_result = self._async_result_origin_guard_locked(session_id, event_task_id)
+            if guard_result is not None:
+                log.warning(
+                    "async tool result dropped: session=%s task=%s reason=%s",
+                    session_id[:12], event_task_id[:12], guard_result["reason"],
+                )
+                return guard_result
 
             # Successful media tools keep the existing direct-outbound fast path.
             # A failed result must deliver its failure text/metadata instead of

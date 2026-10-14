@@ -407,6 +407,28 @@ class TestRelays:
         assert relay.task_id != launcher.task_id
         assert relay.input["task_context"][OUTPUT_GUIDE_KEY] == _GUIDE
 
+    def test_a_late_async_result_after_cancel_does_not_create_a_new_task(self, state: SupervisorState) -> None:
+        session = _session(state)
+        launcher = _inbound(state, session, output_guide=_GUIDE)
+        state.cancel_active_tasks(session)
+        task_count = len(state.tasks)
+
+        result = state.inject_async_result(session, "late", task_id=launcher.task_id)
+
+        assert result == {"ok": True, "strategy": "dropped", "reason": "origin_cancelled"}
+        assert len(state.tasks) == task_count
+        assert not any(event["type"] == "inbound_message" and event["payload"].get("text") == "late" for event in state.eventlog.events)
+
+    def test_a_late_attachment_after_cancel_does_not_send_outbound(self, state: SupervisorState) -> None:
+        session = _session(state)
+        launcher = _inbound(state, session)
+        state.cancel_active_tasks(session)
+
+        result = state.inject_async_result(session, "", ["/tmp/late.png"], task_id=launcher.task_id)
+
+        assert result == {"ok": True, "strategy": "dropped", "reason": "origin_cancelled"}
+        assert not any(event["type"] == "outbound_message" and event["payload"].get("task_id") == launcher.task_id for event in state.eventlog.events)
+
     def test_a_plan_does_not_copy_the_turns_guide(self, state: SupervisorState, tmp_path: Path) -> None:
         task = _inbound(state, _session(state), output_guide=_GUIDE)
         service = ExecutionService.__new__(ExecutionService)
