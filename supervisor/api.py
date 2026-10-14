@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -72,6 +73,26 @@ from .types import (
     TaskKind,
     TaskStatus,
 )
+
+
+def _provider_catalog_error(status: int, url: str, body: str) -> str:
+    """Keep upstream status and readable body without returning credentials."""
+    detail = (body or "").strip()
+    try:
+        payload = json.loads(detail)
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                status_text = str(error.get("status") or "").strip()
+                message_text = str(error.get("message") or "").strip()
+                detail = "：".join(part for part in (status_text, message_text) if part) or detail
+            elif isinstance(error, str) and error:
+                detail = error
+    except (TypeError, ValueError):
+        detail = re.sub(r"<[^>]+>", " ", detail)
+        detail = re.sub(r"\s+", " ", detail).strip()
+    detail = detail[:4000] or "上游没有返回错误正文"
+    return f"上游 HTTP {status}（{url}）：{detail}"
 from .admin_api import create_admin_router
 from .feature_config_api import create_feature_config_router
 from .platform_accounts import PlatformAccounts, create_legacy_qq_account_router, create_platform_account_router
@@ -435,7 +456,7 @@ def create_app(
         if resp.status_code != 200:
             raise HTTPException(
                 status_code=502,
-                detail=f"上游返回 {resp.status_code}：{resp.text[:200]}",
+                detail=_provider_catalog_error(resp.status_code, url, resp.text),
             )
         try:
             payload = resp.json()

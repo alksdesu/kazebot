@@ -438,6 +438,7 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
         "conversation_key": stable_conversation_key,
         "_source_attachments": [dict(att) for att in attachments if isinstance(att, dict)],
     }
+    ok = False
     try:
         ok = await queueing._enqueue_or_submit_inbound(models.QueuedInbound(
             matcher=matcher,
@@ -696,6 +697,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
         "conversation_key": stable_conversation_key,
         "_source_attachments": [dict(att) for att in attachments if isinstance(att, dict)],
     }
+    ok = False
     try:
         ok = await queueing._enqueue_or_submit_inbound(models.QueuedInbound(
             matcher=_private_matcher,
