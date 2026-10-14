@@ -10,7 +10,7 @@ from typing import Any
 
 from .stream_buffer import _StreamBuffer
 from ..attachments import prepare_messages_for_llm
-from ..compact import total_content_chars
+from ..compact import bounded_tool_result_view, total_content_chars
 from ..protocol import TaskAction, ACTION_CANCELLED, ACTION_FAIL
 from .loop_state import _LoopState, _persist_ctx, _short
 # message_to_llm 反序列化：在发送 LLM 前做格式转换（role 修正 + 内部字段剥离）
@@ -221,7 +221,10 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     # 再用 prepare_messages_for_llm 处理图片 file:// → base64 解析。
     # build_llm_messages 会跳过 _ephemeral 消息（retry hint 等），但保留 _dynamic（动态上下文）。
     # 注意：不能修改 ls.messages 本身，它是运行时状态。
-    _formatted = _build_messages_for_provider(ls.messages, ls.formatter, ls.provider)
+    # Keep large historical tool output out of the request while preserving the
+    # durable transcript and the newest native tool-call round.
+    _request_messages, _ = bounded_tool_result_view(ls.messages)
+    _formatted = _build_messages_for_provider(_request_messages, ls.formatter, ls.provider)
     llm_messages = prepare_messages_for_llm(_formatted, ls.rctx.workspace_root)
     # [2026-08-01] 节点级图片剥离开关：某些节点（如绘图分析节点）使用的模型
     # 不支持视觉（如 deepseek-v4-flash），收到 image_url 多模态消息会直接 400
@@ -511,18 +514,20 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
             if _is_too_long and not getattr(ls, '_reactive_compact_done', False):
                 ls._reactive_compact_done = True  # 只尝试一次
                 # 从尾部往前找 tool_result，保留最近 3 个，清除其余
-                from engine.compact import microcompact_messages
-                _, _rc_cleared = microcompact_messages(
-                    ls.messages, gap_minutes=0, keep_recent=3, min_tool_results=1,
+                _request_messages, _rc_cleared = bounded_tool_result_view(
+                    ls.messages, max_chars=2_000, keep_latest_round=True,
                 )
+                if not _rc_cleared:
+                    _request_messages, _rc_cleared = bounded_tool_result_view(
+                        ls.messages, max_chars=2_000, keep_latest_round=False,
+                    )
                 if _rc_cleared:
                     await ls.rctx.emit_event("reactive_compact", {
                         "node_id": ls.node.id, "step": step,
                         "cleared": _rc_cleared, "error": resp.error or "",
                     })
-                    # 重建 llm_messages：microcompact 原地修改了 ls.messages，
-                    # 需要重新走 build_llm_messages + prepare 流程
-                    _formatted = _build_messages_for_provider(ls.messages, ls.formatter, ls.provider)
+                    # 重建本次请求视图，重新走 build_llm_messages + prepare 流程。
+                    _formatted = _build_messages_for_provider(_request_messages, ls.formatter, ls.provider)
                     llm_messages = prepare_messages_for_llm(_formatted, ls.rctx.workspace_root)
                     resp = None
                     continue  # 重试

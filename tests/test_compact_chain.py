@@ -19,6 +19,7 @@ if str(_ROOT) not in sys.path:
 
 from engine.compact import (
     DEFAULT_CHARS_PER_TOKEN,
+    bounded_tool_result_view,
     observed_chars_per_token,
     segments_within_token_budget,
     should_compact,
@@ -252,10 +253,9 @@ class TestCharsPerToken:
         assert not should_compact(messages, 500, chars_per_token=DEFAULT_CHARS_PER_TOKEN)
         assert should_compact(messages, 500, chars_per_token=1.2)
 
-    def test_a_real_prompt_token_count_still_wins(self) -> None:
-        # 有真实值就不该再估算。
+    def test_current_message_growth_cannot_be_hidden_by_stale_usage(self) -> None:
         assert should_compact([{"content": "x"}], 100, last_prompt_tokens=101)
-        assert not should_compact([{"content": "x" * 10_000}], 100, last_prompt_tokens=50)
+        assert should_compact([{"content": "x" * 10_000}], 100, last_prompt_tokens=50)
 
     def test_multimodal_content_counts_only_its_text(self) -> None:
         messages = [{"content": [
@@ -267,6 +267,25 @@ class TestCharsPerToken:
 
     def test_message_objects_are_counted_like_dicts(self) -> None:
         assert total_content_chars([Message(id="m", role="user", content="abc")]) == 3
+
+    def test_tool_call_arguments_are_counted(self) -> None:
+        message = {"content": "", "tool_calls": [{"function": {"name": "read", "arguments": "x" * 300}}]}
+        assert total_content_chars([message]) > 300
+
+    def test_old_tool_results_are_bounded_without_mutating_history(self) -> None:
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "old"}], "content": ""},
+            {"role": "tool", "tool_call_id": "old", "content": "x" * 5_000},
+            {"role": "assistant", "tool_calls": [{"id": "new"}], "content": ""},
+            {"role": "tool", "tool_call_id": "new", "content": "y" * 5_000},
+        ]
+
+        view, changed = bounded_tool_result_view(messages, max_chars=100)
+
+        assert changed == 1
+        assert len(view[1]["content"]) < 200
+        assert len(view[3]["content"]) == 5_000
+        assert len(messages[1]["content"]) == 5_000
 
 
 class TestSupervisorCalibration:

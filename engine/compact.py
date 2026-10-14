@@ -43,7 +43,7 @@ def observed_chars_per_token(total_chars: int, prompt_tokens: int | None) -> flo
 
 
 def total_content_chars(messages: list[Any]) -> int:
-    """统计消息集的文本字符总数，多模态只数 text 块。"""
+    """统计消息集的文本和工具参数字符总数。"""
     total = 0
     for message in messages:
         content = message.get("content", "") if isinstance(message, dict) else getattr(message, "content", "")
@@ -53,7 +53,93 @@ def total_content_chars(messages: list[Any]) -> int:
             for part in content:
                 if isinstance(part, dict) and isinstance(part.get("text"), str):
                     total += len(part["text"])
+        tool_calls = message.get("tool_calls") if isinstance(message, dict) else getattr(message, "tool_calls", None)
+        if tool_calls:
+            try:
+                total += len(json.dumps(tool_calls, ensure_ascii=False, default=str))
+            except (TypeError, ValueError):
+                total += len(str(tool_calls))
+        function_call = message.get("function_call") if isinstance(message, dict) else getattr(message, "function_call", None)
+        if function_call:
+            try:
+                total += len(json.dumps(function_call, ensure_ascii=False, default=str))
+            except (TypeError, ValueError):
+                total += len(str(function_call))
     return total
+
+
+_TOOL_RESULT_PLACEHOLDER = "[tool result truncated for context budget]"
+
+
+def _is_tool_result(message: dict[str, Any]) -> bool:
+    meta = message.get("_meta") or {}
+    if isinstance(meta, dict) and meta.get("message_type") == "tool_result":
+        return True
+    if message.get("role") == "tool":
+        return True
+    content = message.get("content")
+    return isinstance(content, str) and content.startswith('Tool result for "')
+
+
+def _bounded_content(content: Any, max_chars: int) -> Any:
+    if max_chars <= 0:
+        return _TOOL_RESULT_PLACEHOLDER
+    if isinstance(content, str):
+        if len(content) <= max_chars:
+            return content
+        keep = max(0, max_chars - len(_TOOL_RESULT_PLACEHOLDER) - 1)
+        return content[:keep] + "\n" + _TOOL_RESULT_PLACEHOLDER
+    if isinstance(content, list):
+        remaining = max_chars
+        bounded: list[Any] = []
+        changed = False
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                text = part["text"]
+                if len(text) > remaining:
+                    text = _bounded_content(text, remaining)
+                    changed = True
+                remaining = max(0, remaining - len(text))
+                bounded.append({**part, "text": text})
+            else:
+                bounded.append(part)
+        return bounded if changed else content
+    return content
+
+
+def bounded_tool_result_view(
+    messages: list[dict[str, Any]],
+    *,
+    max_chars: int = 2_000,
+    keep_latest_round: bool = True,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return a request-only view with old tool results bounded.
+
+    The durable message list is never mutated. The latest assistant tool-call
+    round and all of its results stay intact so native providers keep valid
+    call/result pairs.
+    """
+    result = [dict(message) for message in messages]
+    tool_indices = [index for index, message in enumerate(result) if _is_tool_result(message)]
+    if not tool_indices:
+        return result, 0
+
+    latest_round_start = -1
+    if keep_latest_round:
+        for index, message in enumerate(result):
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                latest_round_start = index
+
+    changed = 0
+    for index in tool_indices:
+        if keep_latest_round and latest_round_start >= 0 and index > latest_round_start:
+            continue
+        message = result[index]
+        bounded = _bounded_content(message.get("content", ""), max_chars)
+        if bounded != message.get("content", ""):
+            message["content"] = bounded
+            changed += 1
+    return result, changed
 
 
 # ---------------------------------------------------------------------------
@@ -193,14 +279,15 @@ def should_compact(
 ) -> bool:
     """Return True if estimated/actual token count exceeds *threshold_tokens*.
 
-    有 *last_prompt_tokens*（上一轮响应的 usage）就直接用，否则按字符数估算。
+    上一轮真实 usage 只能作为下限，不能掩盖本轮消息已经增长的估算值。
     """
     if threshold_tokens <= 0:
         return False
-    if last_prompt_tokens is not None:
-        return last_prompt_tokens > threshold_tokens
     divisor = chars_per_token if chars_per_token > 0 else DEFAULT_CHARS_PER_TOKEN
-    return total_content_chars(messages) / divisor > threshold_tokens
+    estimated_tokens = total_content_chars(messages) / divisor
+    if last_prompt_tokens is not None:
+        estimated_tokens = max(estimated_tokens, last_prompt_tokens)
+    return estimated_tokens > threshold_tokens
 
 
 def _source_task_id_from_message_like(message: Any) -> str:
