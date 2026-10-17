@@ -15,6 +15,8 @@ DEFAULT_PROMPT = "你是一个 AI 节点。请根据指令完成处理。\n"
 
 _INCLUDE_RE = re.compile(r'\{\{include:([^}]+)\}\}')
 _DRAWTOOLS_PREFIX = "drawtools/"
+SYSTEM_TAIL_KEY = "_system_tail"
+_SYSTEM_TAIL_FILE = "_persona-tail.md"
 
 
 def _include_name(raw: str) -> str | None:
@@ -36,7 +38,10 @@ def _include_file(workspace_root: Path, filename: str) -> Path | None:
     return config_layout.fragment_file(workspace_root, filename)
 
 
-def _expand_includes(text: str, workspace_root: Path, *, depth: int = 0) -> str:
+def _expand_includes(
+    text: str, workspace_root: Path, *, depth: int = 0,
+    system_tails: dict[str, str] | None = None,
+) -> str:
     """展开 {{include:filename}} 指令，把节点片段或绘图配置的内容内联进来。
 
     最多递归 3 层，防止循环引用。
@@ -48,17 +53,61 @@ def _expand_includes(text: str, workspace_root: Path, *, depth: int = 0) -> str:
         filename = _include_name(m.group(1))
         if filename is None:
             return m.group(0)
+        deferred = system_tails is not None and filename == _SYSTEM_TAIL_FILE
+        if deferred:
+            if filename in system_tails:
+                return ""
+            system_tails[filename] = ""
         fp = _include_file(workspace_root, filename)
         if fp is None:
-            return m.group(0)
+            return "" if deferred else m.group(0)
         try:
             content = fp.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
-            return m.group(0)
+            return "" if deferred else m.group(0)
         # 递归展开被包含文件中的 include
-        return _expand_includes(content, workspace_root, depth=depth + 1)
+        expanded = _expand_includes(content, workspace_root, depth=depth + 1, system_tails=system_tails)
+        if deferred:
+            system_tails[filename] = expanded
+            return ""
+        return expanded
 
     return _INCLUDE_RE.sub(_repl, text)
+
+
+def _with_system_tail(
+    messages: list[dict[str, Any]], tails: dict[str, str], variables: dict[str, str],
+) -> list[dict[str, Any]]:
+    tail = "\n\n".join(_render_variables(text, variables) for text in tails.values())
+    if tail.strip():
+        target = next((message for message in messages if message.get("role") == "system"), None)
+        if target is None:
+            target = {"role": "system", "content": ""}
+            messages.insert(0, target)
+        target[SYSTEM_TAIL_KEY] = tail
+    return messages
+
+
+def finalize_system_tail(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """在请求副本的最后一条 System 中追加尾部片段。"""
+    result = [{key: value for key, value in message.items() if key != SYSTEM_TAIL_KEY} for message in messages]
+    tails = list(dict.fromkeys(
+        message[SYSTEM_TAIL_KEY]
+        for message in messages
+        if message.get("role") == "system" and not message.get("_ephemeral")
+        and isinstance(message.get(SYSTEM_TAIL_KEY), str) and message[SYSTEM_TAIL_KEY].strip()
+    ))
+    if not tails:
+        return result
+    target = next(message for message in reversed(result) if message.get("role") == "system" and not message.get("_ephemeral"))
+    content = target.get("content") or ""
+    tail = "\n\n".join(tails)
+    if isinstance(content, list):
+        target["content"] = [*content, {"type": "text", "text": tail}]
+    else:
+        target["content"] = f"{content}\n\n{tail}" if content else tail
+    # 仅含尾部片段的模板可能留下空 System；供应商不接受空指令块。
+    return [message for message in result if message.get("role") != "system" or message.get("content")]
 
 
 def _render_variables(text: str, variables: dict[str, str]) -> str:
@@ -104,6 +153,7 @@ def _assemble_block_prompt(
     """
     merged = _build_variables(workspace_root, node, variables)
 
+    system_tails: dict[str, str] = {}
     result: list[dict[str, Any]] = []
     for block in blocks:
         if not isinstance(block, dict):
@@ -127,7 +177,7 @@ def _assemble_block_prompt(
             continue
 
         # Expand includes and render variables
-        content = _expand_includes(content, workspace_root)
+        content = _expand_includes(content, workspace_root, system_tails=system_tails if role == "system" else None)
         content = _render_variables(content, merged)
 
         entry: dict[str, Any] = {"role": role, "content": content}
@@ -146,7 +196,7 @@ def _assemble_block_prompt(
     if not any(isinstance(b, dict) and b.get("role") == "history" for b in result):
         result.append({"role": "history"})
 
-    return result if result else [{"role": "system", "content": DEFAULT_PROMPT}]
+    return _with_system_tail(result, system_tails, merged)
 
 
 def assemble_prompt(
@@ -176,7 +226,8 @@ def assemble_prompt(
     if not raw_str:
         return [{"role": "system", "content": DEFAULT_PROMPT}]
 
-    expanded = _expand_includes(raw_str, workspace_root)
+    system_tails: dict[str, str] = {}
+    expanded = _expand_includes(raw_str, workspace_root, system_tails=system_tails)
 
     merged = _build_variables(workspace_root, node, variables)
 
@@ -188,12 +239,14 @@ def assemble_prompt(
         static_part = _render_variables(expanded[:idx], merged).strip()
         dynamic_part = _render_variables(expanded[idx + len(marker):], merged).strip()
         msgs: list[dict[str, Any]] = []
-        if static_part:
+        if static_part or any(system_tails.values()):
             msgs.append({"role": "system", "content": static_part})
         if dynamic_part:
             msgs.append({"role": "system", "content": dynamic_part})
         if msgs:
-            return msgs
+            return _with_system_tail(msgs, system_tails, merged)
 
     # 没有标记，整体作为一条 system 消息
-    return [{"role": "system", "content": _render_variables(expanded, merged)}]
+    return _with_system_tail(
+        [{"role": "system", "content": _render_variables(expanded, merged)}], system_tails, merged,
+    )

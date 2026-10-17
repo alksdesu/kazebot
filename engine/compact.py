@@ -16,6 +16,8 @@ import logging
 import re
 from typing import Any
 
+from .prompt import SYSTEM_TAIL_KEY
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,6 +49,9 @@ def total_content_chars(messages: list[Any]) -> int:
     total = 0
     for message in messages:
         content = message.get("content", "") if isinstance(message, dict) else getattr(message, "content", "")
+        tail = message.get(SYSTEM_TAIL_KEY) if isinstance(message, dict) else None
+        if isinstance(message, dict) and message.get("role") == "system" and isinstance(tail, str):
+            total += len(tail)
         if isinstance(content, str):
             total += len(content)
         elif isinstance(content, list):

@@ -12,6 +12,7 @@ from typing import Any
 from .stream_buffer import _StreamBuffer
 from ..attachments import prepare_messages_for_llm
 from ..compact import bounded_tool_result_view, total_content_chars
+from ..prompt import finalize_system_tail
 from ..protocol import TaskAction, ACTION_CANCELLED, ACTION_FAIL
 from .loop_state import _LoopState, _persist_ctx, _short
 # message_to_llm 反序列化：在发送 LLM 前做格式转换（role 修正 + 内部字段剥离）
@@ -188,6 +189,7 @@ def _build_messages_for_provider(
     modes, then performs its own final API conversion.  Other providers keep
     the existing L2 formatter path.
     """
+    messages = finalize_system_tail(messages)
     provider_name = getattr(provider, "name", "") or ""
     formatter_mode = getattr(formatter, "mode", "") if formatter else ""
     # [2026-05-01] Responses conversion needs storage-level tool_calls and _meta.
