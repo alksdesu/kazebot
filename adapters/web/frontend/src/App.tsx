@@ -12,10 +12,21 @@ import { useClientPrefsStore } from './store/clientPrefsStore';
 import { useSettingsStore } from './store/settingsStore';
 import { useViewStore, type ViewMode } from './store/viewStore';
 import type { Attachment } from './types';
-import { viewRegistry, type AppViewContext } from './views/viewRegistry';
+import { viewRegistry, type AppViewContext, type AppViewDefinition } from './views/viewRegistry';
 import { Button } from './components/settings/pages/settingsControls';
+import { extensions, useExtensionRevision } from './plugins/registry';
+import { PluginRender } from './plugins/PluginRender';
+import { useBrowserPlugins } from './plugins/status';
+import { useFrontendPlugins } from './plugins/runtime';
+import { bindCommands, executeCommand } from './plugins/commands';
+import type { LayoutRenderer, SlotRenderer } from './plugins/sdk';
+
+const defaultLayout: LayoutRenderer = (props) => <AppLayout {...props} />;
+extensions.builtin('slots', 'app.layout', defaultLayout);
 
 const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
+  useExtensionRevision();
+  const pluginState = useBrowserPlugins();
   const {
     conversations, activeConversationId, activeConversation, messages, isGenerating,
     selectConversation, createConversation, deleteConversation, renameConversation, sendMessage, cancelCurrentTask,
@@ -97,52 +108,66 @@ const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
     finally { resetLock.current = false; setResetting(false); }
   };
 
-  const view = viewRegistry[viewMode];
+  const knownView = Boolean(extensions.resolve('views', viewMode) || viewRegistry[viewMode]);
+  useEffect(() => {
+    if (!knownView && pluginState.settled && (pluginState.generation || pluginState.error)) useViewStore.getState().openWorkspace('chat');
+  }, [knownView, pluginState.settled, pluginState.generation, pluginState.error]);
+  const requestReset = () => {
+    if (!activeConversation || viewingChildSessionId) return;
+    setNotice(null); setResetTarget({ id: activeConversation.id, title: activeConversation.title, sessionId: activeConversation.sessionId || '' });
+  };
+  bindCommands({ 'chat.send': handleSend, 'chat.cancel': handleCancel, 'chat.reset': requestReset, 'chat.reset.confirm': confirmReset });
   const viewContext: AppViewContext = {
     sessionId: activeSessionId, title: activeTitle, conversations, activeConversationId, messages,
     toolsById, isGenerating, isCancelling: cancelling, viewingChildSessionId, viewingChildNodeId: viewingChildNode?.nodeId,
     activeSettingsTab, onExitChildSession: exitChildSession,
     onCreateConversation: createConversation,
     onSelectConversation: selectConversation, onDeleteConversation: deleteConversation,
-    onSendMessage: handleSend, onCancel: handleCancel,
-    onReset: activeConversation && !viewingChildSessionId ? () => {
-      if (!activeConversation || viewingChildSessionId) return;
-      setNotice(null); setResetTarget({ id: activeConversation.id, title: activeConversation.title, sessionId: activeConversation.sessionId || '' });
-    } : undefined,
+    onSendMessage: (text, attachments) => executeCommand<Promise<void>>('chat.send', text, attachments), onCancel: () => executeCommand('chat.cancel'),
+    onReset: activeConversation && !viewingChildSessionId ? () => executeCommand('chat.reset') : undefined,
     onTitleChange: activeConversationId ? title => renameConversation(activeConversationId, title) : undefined,
   };
-  const hasRightPanel = view.hasRightPanel?.(viewContext) ?? true;
   const pageKey = `${viewMode}:${activeSettingsTab}:${activeSessionId}`;
-  const rightPanel = hasRightPanel ? view.rightTop?.(viewContext) : undefined;
-  const logPanel = hasRightPanel ? view.rightBottom?.(viewContext) : undefined;
-  return <>
-    <AppLayout
-      navigationKey={`${viewMode}:${activeSettingsTab}:${activeConversationId || ''}:${viewingChildSessionId || ''}`}
-      composer={view.composer?.(viewContext)} header={view.header(viewContext)}
-      logPanel={logPanel ? <PageBoundary label="日志" resetKey={pageKey}>{logPanel}</PageBoundary> : undefined}
-      rightPanel={rightPanel ? <PageBoundary label="详情面板" resetKey={pageKey}>{rightPanel}</PageBoundary> : undefined} sidebar={view.sidebar(viewContext)}>
+  const fallbackView = viewRegistry[viewMode] || { ...viewRegistry.chat, main: () => <p className="p-4" role="status">{pluginState.settled ? '插件工作区暂时无法显示，请在插件设置中查看状态。' : '正在读取插件工作区…'}</p> };
+  return <PluginRender<AppViewDefinition> kind="views" id={viewMode} base={fallbackView} resetKey={pageKey} render={(view) => {
+    const hasRightPanel = extensions.hasContribution('slots', `${viewMode}.rightTop`) || extensions.hasContribution('slots', `${viewMode}.rightBottom`) || (view.hasRightPanel?.(viewContext) ?? true);
+    const slot = (name: 'sidebar' | 'header' | 'main' | 'composer' | 'rightTop' | 'rightBottom') => {
+      if (!view[name] && !extensions.hasContribution('slots', `${viewMode}.${name}`)) return undefined;
+      return <PageBoundary label={name} resetKey={pageKey}><PluginRender<SlotRenderer> kind="slots" id={`${viewMode}.${name}`} base={view[name]} resetKey={pageKey} render={(render) => render(viewContext)} /></PageBoundary>;
+    };
+    const layoutProps = {
+      navigationKey: `${viewMode}:${activeSettingsTab}:${activeConversationId || ''}:${viewingChildSessionId || ''}`,
+    };
+    return <>
+    <PluginRender<LayoutRenderer> kind="slots" id="app.layout" base={defaultLayout} resetKey={pageKey} render={(Layout) => Layout({
+      ...layoutProps, composer: slot('composer'), header: slot('header'), sidebar: slot('sidebar'),
+      logPanel: hasRightPanel ? slot('rightBottom') : undefined,
+      rightPanel: hasRightPanel ? slot('rightTop') : undefined,
+      children:
       <div className="flex h-full min-h-0 flex-col">
         {(storageWarning || preferenceWarning) && <p className="app-notice app-notice-error shrink-0" role="status">{storageWarning || preferenceWarning}</p>}
         {notice && <div className={`app-notice flex shrink-0 items-center justify-between gap-3 ${notice.error ? 'app-notice-error' : ''}`} role={notice.error ? 'alert' : 'status'}>
           <span>{notice.text}</span><button className="app-icon-button shrink-0" aria-label="关闭提示" type="button" onClick={() => setNotice(null)}><Icon name="close" size={18} /></button>
         </div>}
-        <div className="relative min-h-0 flex-1"><PageBoundary label="当前页面" resetKey={pageKey}>{view.main(viewContext)}</PageBoundary></div>
+        <div className="relative min-h-0 flex-1">{slot('main')}</div>
       </div>
-    </AppLayout>
+    })} />
     <Modal open={Boolean(resetTarget)} title="重置对话" onClose={() => { if (!resetLock.current) setResetTarget(null); }}>
       <div className="space-y-4 p-4">
         <p>重置“{resetTarget?.title}”的上下文？原上下文与正在进行的任务将被清理，其他对话不受影响。</p>
         {notice?.error && <p className="text-sm text-[var(--duties-danger)]" role="alert">{notice.text}</p>}
-        <div className="flex justify-end gap-2"><Button tone="quiet" disabled={resetting} onClick={() => setResetTarget(null)}>保留对话</Button><Button tone="danger" loading={resetting} onClick={() => void confirmReset()}>确认重置</Button></div>
+        <div className="flex justify-end gap-2"><Button tone="quiet" disabled={resetting} onClick={() => setResetTarget(null)}>保留对话</Button><Button tone="danger" loading={resetting} onClick={() => void executeCommand('chat.reset.confirm')}>确认重置</Button></div>
       </div>
     </Modal>
   </>;
+  }} />;
 };
 
 const App = () => {
   const isAuthenticated = useSettingsStore(state => state.isAuthenticated);
   const viewMode = useViewStore(state => state.viewMode);
   usePlatformRegistry();
+  useFrontendPlugins();
   return isAuthenticated ? <MainApp viewMode={viewMode} /> : <LoginPage />;
 };
 

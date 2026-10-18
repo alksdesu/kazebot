@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 from dataclasses import replace
+from contextlib import nullcontext
 from pathlib import Path
 
 from fastapi import APIRouter, Body, File, HTTPException, Query, Request, UploadFile
@@ -21,7 +22,9 @@ logger = logging.getLogger(__name__)
 
 class MaterialRuntime:
     def __init__(self, service: MaterialService):
+        from plugin_runtime.host import ServiceProxy
         self.service = service
+        self.plugin_host = service._host if isinstance(service, ServiceProxy) else None
         self.slots = asyncio.Semaphore(2)
         self.inflight: set[asyncio.Task] = set()
         self.background: set[asyncio.Task] = set()
@@ -32,11 +35,19 @@ class MaterialRuntime:
     async def call(self, function, *args, **kwargs):
         if self.closing:
             raise HTTPException(503, detail="资料服务正在停止，请稍后重试。")
-        task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        versions = self.plugin_host.acquire_services() if self.plugin_host else []
+
+        def execute():
+            with self.plugin_host.lease_context(versions) if self.plugin_host else nullcontext():
+                return function(*args, **kwargs)
+
+        task = asyncio.create_task(asyncio.to_thread(execute))
         self.inflight.add(task)
 
         def finished(completed):
             self.inflight.discard(completed)
+            if self.plugin_host:
+                self.plugin_host.manager.release(versions)
             if not completed.cancelled():
                 completed.exception()
 
@@ -47,16 +58,20 @@ class MaterialRuntime:
             raise HTTPException(exc.status, detail={"code": exc.code, "message": str(exc)}) from exc
 
     def launch(self, actor, job: dict) -> None:
+        versions = self.plugin_host.acquire_services() if self.plugin_host else []
         async def execute():
-            async with self.slots:
-                if not self.closing:
-                    await self.call(self.service.run_job, actor, job["id"])
+            with self.plugin_host.lease_context(versions) if self.plugin_host else nullcontext():
+                async with self.slots:
+                    if not self.closing:
+                        await self.call(self.service.run_job, actor, job["id"])
 
         task = asyncio.create_task(execute())
         self.background.add(task)
 
         def finished(completed):
             self.background.discard(completed)
+            if self.plugin_host:
+                self.plugin_host.manager.release(versions)
             if not completed.cancelled() and completed.exception():
                 logger.error("Material job failed: %s", completed.exception())
 
@@ -80,6 +95,10 @@ def create_router(state) -> APIRouter:
     if not getattr(state, "materials", None):
         state.materials = MaterialService(state.workspace_root)
     service = state.materials
+    host = getattr(state, "plugin_host", None)
+    if host is not None:
+        service = host.register_base("materials", service)
+        state.materials = service
     runtime = MaterialRuntime(service)
     state.materials_runtime = runtime
     slots = runtime.slots

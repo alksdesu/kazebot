@@ -17,6 +17,7 @@ import yaml
 
 import config_layout
 from clonoth_runtime import resolve_channel, resolve_env_ref
+from plugin_runtime import PluginExecutionError, plugin_scope
 
 # [fix 2026-05-28] Import message formatting utilities so fallback calls go
 # through the same conversion pipeline as the primary call (llm_call.py L171-172).
@@ -463,10 +464,15 @@ class FallbackProviderHandler:
                     _fb_messages = _strip_image_blocks(_fb_messages)
 
                 t0 = time.monotonic()
-                new_resp = await fb_provider.chat(
-                    messages=_fb_messages,
-                    tools=tools,
-                )
+                fb_provider.plugin_channel = fb_channel
+                with plugin_scope(
+                    workspace_root=workspace_root, node_id=_node_id,
+                    task_id=getattr(rctx, "task_id", ""), channel=fb_channel, purpose="fallback",
+                ):
+                    new_resp = await fb_provider.chat(
+                        messages=_fb_messages,
+                        tools=tools,
+                    )
                 elapsed = round((time.monotonic() - t0) * 1000, 1)
 
                 if new_resp.ok:
@@ -512,6 +518,8 @@ class FallbackProviderHandler:
                         f"[Fallback {fb_channel} failed: {str(_fb_err)[:150]}]"
                     )
 
+            except PluginExecutionError:
+                raise
             except Exception as exc:
                 logger.error(
                     "fallback_provider: fallback[%d] exception: %s",

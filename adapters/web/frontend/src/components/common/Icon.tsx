@@ -26,6 +26,7 @@ import { EditW400 } from '@material-symbols-svg/react/icons/edit';
 import { DisplaySettingsW400 } from '@material-symbols-svg/react/icons/display-settings';
 import { DraftW400 } from '@material-symbols-svg/react/icons/draft';
 import { ErrorW400 } from '@material-symbols-svg/react/icons/error';
+import { ExtensionW400 } from '@material-symbols-svg/react/icons/extension';
 import { FolderW400 } from '@material-symbols-svg/react/icons/folder';
 import { FormatAlignLeftW400 } from '@material-symbols-svg/react/icons/format-align-left';
 import { FolderManagedW400 } from '@material-symbols-svg/react/icons/folder-managed';
@@ -83,6 +84,7 @@ const ICON_MAP: Record<string, SvgIcon> = {
   display_settings: DisplaySettingsW400,
   draft: DraftW400,
   error: ErrorW400,
+  extension: ExtensionW400,
   folder: FolderW400,
   folder_managed: FolderManagedW400,
   format_align_left: FormatAlignLeftW400,

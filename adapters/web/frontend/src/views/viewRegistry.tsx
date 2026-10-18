@@ -22,6 +22,7 @@ import type { ConversationMeta } from '../store/chatStore';
 import type { ViewMode } from '../store/viewStore';
 import type { Attachment } from '../types';
 import type { ToolExecution, WsMessage } from '../types/message';
+import { extensions } from '../plugins/registry';
 
 export interface AppViewContext {
   sessionId: string;
@@ -146,3 +147,10 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
     // AppLayout can promote SettingsRightPanel to full height without view-specific CSS.
   },
 };
+
+for (const view of Object.values(viewRegistry)) {
+  extensions.builtin('views', view.id, view);
+  for (const slot of ['sidebar', 'header', 'main', 'composer', 'rightTop', 'rightBottom'] as const) {
+    extensions.builtin('slots', `${view.id}.${slot}`, view[slot] || (() => null));
+  }
+}

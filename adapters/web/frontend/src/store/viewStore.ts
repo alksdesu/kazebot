@@ -6,8 +6,9 @@
 import { create } from 'zustand';
 import { resolveSettingsLocation } from '../components/settings/settingsTabAliases';
 import { confirmNavigation } from '../hooks/useUnsavedChanges';
+import { commandAction } from '../plugins/commands';
 
-export type ViewMode = 'chat' | 'settings' | 'execution' | 'materials';
+export type ViewMode = string;
 
 export interface ViewState {
   viewMode: ViewMode;
@@ -17,7 +18,7 @@ export interface ViewState {
   openSettings: (tab?: string, section?: string) => void;
   closeSettings: () => void;
   setSettingsTab: (tab: string, section?: string) => void;
-  openWorkspace: (view: 'chat' | 'execution' | 'materials') => void;
+  openWorkspace: (view: string) => void;
 }
 
 const DEFAULT_SETTINGS_TAB = 'general';
@@ -39,7 +40,7 @@ const REQUESTED_VIEW = query.get('view');
 const LEGACY_DOMAIN = REQUESTED_VIEW === 'console' ? query.get('domain') : null;
 const initialViewMode: ViewMode =
   REQUESTED_VIEW === 'settings' || REQUESTED_VIEW === 'console' ? 'settings' :
-    REQUESTED_VIEW === 'execution' || REQUESTED_VIEW === 'materials' ? REQUESTED_VIEW : 'chat';
+    REQUESTED_VIEW || 'chat';
 const initialLocation = LEGACY_DOMAIN
   ? locationForLegacyDomain(LEGACY_DOMAIN)
   : resolveSettingsLocation(query.get('tab') || DEFAULT_SETTINGS_TAB, query.get('section') || '');
@@ -70,13 +71,13 @@ export const useViewStore = create<ViewState>((set, get) => ({
   viewMode: initialViewMode,
   activeSettingsTab: initialLocation.tab,
   activeSettingsSection: initialLocation.section,
-  openWorkspace: (viewMode) => {
+  openWorkspace: commandAction('navigation.workspace', (viewMode: string) => {
     if (viewMode !== get().viewMode && !confirmNavigation()) return;
     syncViewQuery(viewMode, get().activeSettingsTab, get().activeSettingsSection);
     set({ viewMode });
-  },
+  }),
 
-  openSettings: (tab, section) => {
+  openSettings: commandAction('navigation.settings', (tab?: string, section?: string) => {
     // [2026-06-01] Opening settings optionally selects the requested tab first.
     // Why: Header node/model labels should land directly on the related settings
     // page. How: set both the view mode and tab in one store update. Purpose: the
@@ -85,9 +86,9 @@ export const useViewStore = create<ViewState>((set, get) => ({
     if ((get().viewMode !== 'settings' || next.tab !== get().activeSettingsTab) && !confirmNavigation()) return;
     syncViewQuery('settings', next.tab, next.section);
     set({ viewMode: 'settings', activeSettingsTab: next.tab, activeSettingsSection: next.section });
-  },
+  }),
 
-  closeSettings: () => {
+  closeSettings: commandAction('navigation.closeSettings', () => {
     if (get().viewMode !== 'chat' && !confirmNavigation()) return;
     // [2026-06-01] Closing settings returns to chat without erasing the tab.
     // Why: preserving the tab makes a later Settings click reopen where the user
@@ -95,9 +96,9 @@ export const useViewStore = create<ViewState>((set, get) => ({
     // Purpose: the navigation state stays predictable and compact.
     syncViewQuery('chat', get().activeSettingsTab, get().activeSettingsSection);
     set({ viewMode: 'chat' });
-  },
+  }),
 
-  setSettingsTab: (requested, section) => {
+  setSettingsTab: commandAction('navigation.settingsTab', (requested: string, section?: string) => {
     const next = resolveSettingsLocation(requested, section);
     if ((get().viewMode !== 'settings' || next.tab !== get().activeSettingsTab) && !confirmNavigation()) return;
     // [2026-06-01] Tab changes are local to the settings view.
@@ -106,7 +107,7 @@ export const useViewStore = create<ViewState>((set, get) => ({
     // registry. Purpose: tab routing remains data-driven.
     syncViewQuery('settings', next.tab, next.section);
     set({ activeSettingsTab: next.tab, activeSettingsSection: next.section, viewMode: 'settings' });
-  },
+  }),
 }));
 
 // 老链接进来先把地址栏改写成新参数，不然刷新一次又走一遍迁移，且 ?domain= 一直挂着。

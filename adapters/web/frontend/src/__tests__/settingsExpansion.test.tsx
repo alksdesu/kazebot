@@ -45,6 +45,7 @@ describe('expanded settings registry', () => {
     expect(currentSettingsTabs().map((tab) => tab.id)).toEqual([
       'general',
       'client',
+      'plugins',
       'runtime',
       'system',
       'approvals',

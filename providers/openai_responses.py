@@ -24,6 +24,10 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+from plugin_sdk import PluginExecutionError
+
+from .plugin_transport import iter_sse_events, wrap_client
+
 from providers.base import BaseProvider, ProviderResponse, ToolCall, image_part_url
 # Reuse the base-URL normalizer from the sibling openai provider
 from providers.degrade import DegradeRule, degrade, unset_options
@@ -225,7 +229,7 @@ class OpenAIResponsesProvider(BaseProvider):
         # 原因：下游仍通过 provider.name 判断 provider 特性；做法：从类属性传入；
         # 目的：注册 key、实例名和配置 provider 字段保持一致。
         super().__init__(model=model, name=self.provider_name)
-        self._http = http
+        self._http = wrap_client(http, self)
         self._api_key = api_key
         # _normalize_base_url ensures the URL ends with /v1
         self._base_url = _normalize_base_url(base_url)
@@ -432,6 +436,8 @@ class OpenAIResponsesProvider(BaseProvider):
                 json=payload,
                 timeout=self._timeout,
             )
+        except PluginExecutionError:
+            raise
         except Exception as exc:
             return ProviderResponse(ok=False, error=str(exc))
 
@@ -459,6 +465,8 @@ class OpenAIResponsesProvider(BaseProvider):
                         json=payload,
                         timeout=self._timeout,
                     )
+                except PluginExecutionError:
+                    raise
                 except Exception as exc:
                     return ProviderResponse(ok=False, error=str(exc))
                 if resp.status_code >= 400:
@@ -559,10 +567,8 @@ class OpenAIResponsesProvider(BaseProvider):
                                 _degrade_attempt=_degrade_attempt + 1,
                             )
                         return ProviderResponse(ok=False, error=err_msg, status_code=stream.status_code)
-                    async for line in stream.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        raw = line[6:]
+                    async for sse_event in iter_sse_events(stream):
+                        raw = sse_event["data"]
                         if raw.strip() == "[DONE]":
                             break
                         try:
@@ -698,6 +704,8 @@ class OpenAIResponsesProvider(BaseProvider):
                             err_msg = event.get("message", str(event))
                             return ProviderResponse(ok=False, error=f"Stream error: {err_msg}")
 
+            except PluginExecutionError:
+                raise
             except Exception as exc:
                 return ProviderResponse(ok=False, error=str(exc))
 

@@ -18,6 +18,7 @@ class ResolvedProvider:
     base_url: str | None = None  # None 表示使用全局默认
     # 渠道块里写的 provider_options，比 runtime.yaml 的同名项更具体。
     channel_options: dict[str, Any] = field(default_factory=dict)
+    channel_name: str = ""
 
 
 def resolve_provider(
@@ -26,6 +27,7 @@ def resolve_provider(
     provider_default: str,
     provider_default_type: str = "openai",
     session_override: dict[str, Any] | None = None,
+    provider_default_channel: str = "",
 ) -> ResolvedProvider:
     """根据全局、节点和 session 配置解析模型和可选 api_key/base_url。
 
@@ -66,4 +68,5 @@ def resolve_provider(
         api_key=api_key or None,
         base_url=base_url or None,
         channel_options=dict(channel.options),
+        channel_name=channel.name or provider_default_channel or provider_default_type,
     )

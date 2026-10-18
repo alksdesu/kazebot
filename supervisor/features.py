@@ -16,6 +16,13 @@ def register_features(app, state, process_manager, config_store, features_config
     state.execution = execution.ExecutionService(state)
     state.reminders = reminders.ReminderService(state)
     state.sticker_tagging = sticker_tagging.StickerTaggingService(state.workspace_root, features_config)
+    host = getattr(state, "plugin_host", None)
+    if host is not None:
+        for name in ("execution", "reminders"):
+            setattr(state, name, host.register_base(name, getattr(state, name), managed=True))
+        for name, service in (("state", state), ("config_store", config_store), ("process_manager", process_manager),
+                              ("eventlog", state.eventlog), ("hooks", state.hook_registry)):
+            host.register_base(name, service)
     for module in (execution, reminders, community, materials_api, operations):
         app.include_router(module.create_router(state))
 
@@ -23,15 +30,20 @@ def register_features(app, state, process_manager, config_store, features_config
 @asynccontextmanager
 async def feature_lifespan(app):
     state = app.state.state
-    services = (state.execution, state.reminders)
+    host = getattr(state, "plugin_host", None)
+    services = () if host is not None else (state.execution, state.reminders)
     started = []
     try:
         for service in services:
             service.start()
             started.append(service)
         state.sticker_tagging.start()
+        if host is not None:
+            await host.start()
         yield
     finally:
+        if host is not None:
+            await host.stop()
         try:
             await state.sticker_tagging.stop()
         except Exception:

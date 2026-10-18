@@ -16,6 +16,7 @@ import yaml
 
 import config_layout
 from providers import registry
+from plugin_runtime import plugin_scope
 from clonoth_runtime import load_platform_secrets, platform_secret, resolve_env_ref, stray_platforms_section
 from platforms.descriptor import PlatformDescriptor
 from platforms.registry import all_platforms, current_platform, platform_config_path
@@ -256,9 +257,10 @@ class OperationsService:
                             http=http, api_key=secret.api_key, base_url=secret.base_url, model=secret.model,
                             provider_options=self._probe_options(provider_class),
                         )
-                        response = await asyncio.wait_for(provider.chat(
-                            messages=[{"role": "user", "content": "Connection check. Reply OK."}], tools=None,
-                        ), timeout=20)
+                        with plugin_scope(workspace_root=self.root, purpose="diagnostic", channel=getattr(secret, "channel_name", "") or secret.provider):
+                            response = await asyncio.wait_for(provider.chat(
+                                messages=[{"role": "user", "content": "Connection check. Reply OK."}], tools=None,
+                            ), timeout=20)
                         if not response.ok or not str(response.text or "").strip():
                             raise RuntimeError(str(response.error or "模型未返回有效文本"))
                     add("模型响应", "passed", "最小请求已完成", latency_ms=round((time.monotonic() - started) * 1000))

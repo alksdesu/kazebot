@@ -354,6 +354,7 @@ class ActiveProviderSecret(OpenAIConfigSecret):
     """
 
     provider: str = "openai"
+    channel_name: str = ""
 
 
 class OpenAIConfigUpdateIn(BaseModel):

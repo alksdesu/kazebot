@@ -27,7 +27,7 @@ function layoutMetrics() {
   };
 }
 
-interface AppLayoutProps extends PropsWithChildren {
+export interface AppLayoutProps extends PropsWithChildren {
   sidebar: ReactNode;
   header: ReactNode;
   composer?: ReactNode;

@@ -1,6 +1,7 @@
 // [2026-05-16] Real Supervisor API client — zero mock.
 import type { NodeDef, SupervisorEvent } from '../types';
 import { fetchWithDeadline } from './requestDeadline';
+import { commandAction } from '../plugins/commands';
 
 /** 本实例挂载的路径前缀。多开时几个号共用一个域名，各自挂在 /i/<号>/ 下。 */
 export const MOUNT = (() => {
@@ -2265,14 +2266,14 @@ export async function getActiveNode(sessionId: string): Promise<{
   return resp.json();
 }
 
-export async function switchNode(sessionId: string, targetNodeId: string): Promise<any> {
+export const switchNode = commandAction('node.switch', async (sessionId: string, targetNodeId: string): Promise<any> => {
   const resp = await apiFetch(`/sessions/${sessionId}/switch_node`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ target_node_id: targetNodeId }),
   });
   return resp.json();
-}
+});
 
 // ── App config (public, no auth needed) ──
 
@@ -2500,3 +2501,133 @@ export async function retryEngine(token: string): Promise<void> {
 // ── Legacy compat exports ──
 
 export const sendInbound = postInbound;
+
+export interface PluginSelectors {
+  nodes: string[];
+  channels: string[];
+  providers: string[];
+  purposes: string[];
+}
+
+export interface PluginParamSchema {
+  key?: string;
+  name?: string;
+  label?: string;
+  kind?: string;
+  type?: string;
+  default?: unknown;
+  description?: string;
+  desc?: string;
+  choices?: unknown[];
+  options?: unknown[];
+  minimum?: number;
+  maximum?: number;
+  required?: boolean;
+}
+
+export interface AdminPlugin {
+  kind?: 'module' | 'package';
+  source_editable?: boolean;
+  files?: Array<{ path: string; size: number; hash: string }>;
+  frontend?: { entry: { path: string; hash: string } | null; styles: Array<{ path: string; hash: string }> };
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  author: string;
+  source: 'custom' | 'bundled';
+  filename: string;
+  source_hash: string;
+  desired_hash: string;
+  enabled: boolean;
+  config: Record<string, unknown>;
+  selectors: PluginSelectors;
+  params_schema: PluginParamSchema[];
+  metadata: Record<string, unknown>;
+  error: string | null;
+}
+
+export interface PluginRuntimeProcess {
+  pid: number;
+  process: 'engine' | 'supervisor';
+  alive: boolean;
+  generation: string;
+  updated_at: string;
+  plugins: Array<{
+    id: string;
+    desired_hash: string;
+    status: 'loaded' | 'disabled' | 'error' | 'retiring' | 'stopped' | 'not_applicable';
+    active_requests?: number;
+    error?: string;
+    errors?: Array<{ phase: string; message: string; at: string }>;
+  }>;
+}
+
+export interface PluginsResponse {
+  plugins: AdminPlugin[];
+  generation: string;
+  shared_group: string | null;
+  runtime: PluginRuntimeProcess[];
+}
+
+export async function getPlugins(token: string, signal?: AbortSignal): Promise<PluginsResponse> {
+  const resp = await apiFetch('/admin/plugins', { headers: authHeaders(token), signal });
+  return resp.json();
+}
+
+export async function getPluginSource(token: string, id: string): Promise<{ content: string; hash: string }> {
+  const resp = await apiFetch(`/admin/plugins/${encodeURIComponent(id)}/source`, { headers: authHeaders(token) });
+  return resp.json();
+}
+
+export async function installPlugin(token: string, filename: string, content: string): Promise<AdminPlugin> {
+  const resp = await apiFetch('/admin/plugins', {
+    method: 'POST', headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename, content }),
+  });
+  return resp.json();
+}
+
+export async function installPluginPackage(token: string, file: File, baseHash?: string, current: () => boolean = () => true): Promise<AdminPlugin> {
+  if (file.size > 32 * 1024 * 1024) throw new Error('插件包不能超过 32 MiB');
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (bytes.length > 32 * 1024 * 1024) throw new Error('插件包不能超过 32 MiB');
+  let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += 8192) binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+  if (!current()) throw new Error('登录状态已变化，请重新导入插件包');
+  const resp = await apiFetch('/admin/plugins/packages', {
+    method: 'POST', headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename: file.name, content_base64: btoa(binary), ...(baseHash ? { base_hash: baseHash } : {}) }),
+  });
+  return resp.json();
+}
+
+export async function updatePluginSource(token: string, id: string, content: string, baseHash: string): Promise<AdminPlugin> {
+  const resp = await apiFetch(`/admin/plugins/${encodeURIComponent(id)}/source`, {
+    method: 'PUT', headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content, base_hash: baseHash }),
+  });
+  return resp.json();
+}
+
+export async function updatePluginConfig(
+  token: string, id: string,
+  config: Pick<AdminPlugin, 'enabled' | 'config' | 'selectors'> & { base_hash: string },
+): Promise<AdminPlugin> {
+  const resp = await apiFetch(`/admin/plugins/${encodeURIComponent(id)}/config`, {
+    method: 'PUT', headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+  return resp.json();
+}
+
+export async function deletePlugin(token: string, id: string, baseHash: string): Promise<void> {
+  await apiFetch(`/admin/plugins/${encodeURIComponent(id)}?base_hash=${encodeURIComponent(baseHash)}`, {
+    method: 'DELETE', headers: authHeaders(token),
+  });
+}
+
+export async function applyPlugins(token: string): Promise<Pick<PluginsResponse, 'generation' | 'runtime'> & { message: string }> {
+  const resp = await apiFetch('/admin/plugins/apply', { method: 'POST', headers: authHeaders(token) });
+  return resp.json();
+}

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import signal
 import logging
 import socket
 import sys
@@ -36,6 +38,20 @@ _logger = logging.getLogger("supervisor.main")
 
 def _worker_supervisor_url(host: str, port: int) -> str:
     return f"http://{host}:{port}{url_prefix()}"
+
+
+def _mount_instance(app: FastAPI, prefix: str) -> FastAPI:
+    if not prefix:
+        return app
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        async with app.router.lifespan_context(app):
+            yield
+
+    mounted = FastAPI(lifespan=lifespan)
+    mounted.mount(prefix, app)
+    return mounted
 
 
 def main() -> None:
@@ -184,18 +200,22 @@ def main() -> None:
 
     threading.Thread(target=_housekeeping_loop, daemon=True, name="supervisor-housekeeping").start()
 
+    shutdown_requested = threading.Event()
+    shutdown_code = 0
+
+    def request_app_shutdown(code=0):
+        nonlocal shutdown_code
+        shutdown_code = max(shutdown_code, code)
+        shutdown_requested.set()
+
     app = create_app(
         state=state, process_manager=process_manager, config_store=config_store,
         host=args.host, port=args.port,
     )
 
-    prefix = url_prefix()
-    if prefix:
-        # 多开时几个号共用一个域名，靠路径前缀分流：同源才能共用登录态，
-        # WebSocket 也就不必经过任何代理。Mount 会自己剥前缀并设好 root_path。
-        mounted = FastAPI()
-        mounted.mount(prefix, app)
-        app = mounted
+    app.state.request_shutdown = request_app_shutdown
+
+    app = _mount_instance(app, url_prefix())
 
     env_access_log = (os.getenv("CLONOTH_ACCESS_LOG") or "").strip().lower() in {"1", "true", "yes", "y"}
     access_log = bool(args.access_log or env_access_log)
@@ -227,10 +247,7 @@ def main() -> None:
             # 退出码 75 = 请求重启（由 main.py 外层循环检测）
             _code = 75 if restart else 0
             _logger.info(f"[supervisor] exit code={_code}")
-            import traceback as _tb
-            _logger.info(f'[DIAG] _watch_shell os._exit({_code}) stack:\n{"" .join(_tb.format_stack())}')
-            import time as _t; _t.sleep(0.5)  # 确保日志写出
-            os._exit(_code)
+            request_app_shutdown(_code)
 
         threading.Thread(target=_watch_shell, daemon=True, name="shell-watcher").start()
 
@@ -249,15 +266,49 @@ def main() -> None:
         log_config=None,
     )
     _uvi_server = uvicorn.Server(_uvi_config)
-    _uvi_server.install_signal_handlers = lambda: None  # 禁用 uvicorn 信号捕获
-    # 用 loop.run_until_complete 替代 asyncio.run()，后者会重装 SIGINT handler
-    # 信号处理交给 process_manager._install_signal_handlers + _restarting_engine flag
+    _uvi_server.install_signal_handlers = lambda: None
+    if hasattr(_uvi_server, "capture_signals"):
+        _uvi_server.capture_signals = contextlib.nullcontext
+
+    def request_shutdown(signum, frame):
+        if process_manager and process_manager._restarting_engine:
+            return
+        shutdown_requested.set()
+
+    previous_handlers = {}
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous_handlers[sig] = signal.signal(sig, request_shutdown)
+        except (ValueError, OSError):
+            pass
+
+    async def serve():
+        async def watch_shutdown():
+            while not shutdown_requested.is_set():
+                await asyncio.sleep(0.1)
+            _uvi_server.should_exit = True
+
+        watcher = asyncio.create_task(watch_shutdown())
+        try:
+            await _uvi_server.serve()
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+
     _loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_loop)
     try:
-        _loop.run_until_complete(_uvi_server.serve())
+        _loop.run_until_complete(serve())
     finally:
+        _loop.run_until_complete(_loop.shutdown_asyncgens())
+        _loop.run_until_complete(_loop.shutdown_default_executor())
         _loop.close()
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
+        if process_manager:
+            process_manager._cleanup()
+    if shutdown_code:
+        raise SystemExit(shutdown_code)
     _logger.info("[DIAG] uvicorn server exited! supervisor about to exit")
 
 

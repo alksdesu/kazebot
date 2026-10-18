@@ -360,6 +360,7 @@ class MainChannel:
     base_url: str = ""
     model: str = ""
     provider: str = "openai"
+    channel_name: str = ""
 
 
 def normalize_openai_secret(data: dict[str, Any]) -> MainChannel:
@@ -371,6 +372,7 @@ def normalize_openai_secret(data: dict[str, Any]) -> MainChannel:
         model=resolve_env_ref(str(data.get("model") or "gpt-4o-mini").strip()) or "gpt-4o-mini",
         # 老 supervisor 不回这个字段，回落 openai 即改动前的行为。
         provider=str(data.get("provider") or "").strip().lower() or "openai",
+        channel_name=str(data.get("channel_name") or "").strip(),
     )
 
 

@@ -1,0 +1,17 @@
+{
+  "id": "system-workspace",
+  "name": "应用级插件示例",
+  "version": "1.0.0",
+  "sdk_version": 1,
+  "description": "新增工作区、包装聊天界面、提供接口、后台任务和工具。",
+  "backend": "backend.py",
+  "frontend": "frontend.js",
+  "styles": ["style.css"],
+  "processes": ["supervisor", "engine"],
+  "priority": 100,
+  "params_schema": [
+    {"key": "workspace_label", "label": "工作区名称", "type": "text", "default": "插件工作区"},
+    {"key": "message_prefix", "label": "发送消息前缀", "type": "text", "default": ""},
+    {"key": "interval", "label": "后台计数间隔（秒）", "type": "number", "default": 5, "minimum": 1, "maximum": 3600}
+  ]
+}

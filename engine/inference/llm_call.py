@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextvars import ContextVar
+from functools import wraps
 from typing import Any
 
 from .stream_buffer import _StreamBuffer
@@ -22,6 +24,8 @@ from .tool_format import build_llm_messages, sanitize_control_tool_history
 # 在重试路径发射 llm.retry，在不可重试失败时发射 llm.error。
 from engine.signals import Signal, get_bus
 from engine.signals.types import make_span_id
+from plugin_runtime import plugin_scope
+from plugin_runtime.manager import current_scope
 
 
 # ---------------------------------------------------------------------------
@@ -29,6 +33,7 @@ from engine.signals.types import make_span_id
 # ---------------------------------------------------------------------------
 
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+_llm_child_tasks: ContextVar[list[asyncio.Task] | None] = ContextVar("llm_child_tasks", default=None)
 
 
 def _node_strips_images(node: Any) -> bool:
@@ -211,6 +216,41 @@ def _build_messages_for_provider(
 #  LLM 调用（含重试）
 # ---------------------------------------------------------------------------
 
+def _llm_plugin_context(function):
+    @wraps(function)
+    async def call(ls, step):
+        with plugin_scope(
+            workspace_root=ls.rctx.workspace_root, node_id=ls.node.id,
+            task_id=ls.rctx.task_id,
+            channel=getattr(ls.provider, "plugin_channel", "") or getattr(ls.node, "provider", ""),
+            provider=getattr(ls.provider, "provider_name", "") or getattr(ls.provider, "name", ""),
+            purpose=current_scope().get("purpose") or ("system" if ls.node.id.startswith("system.") else "inference"),
+        ):
+            tasks = []
+            token = _llm_child_tasks.set(tasks)
+            try:
+                return await function(ls, step)
+            finally:
+                try:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                finally:
+                    _llm_child_tasks.reset(token)
+    return call
+
+
+def _create_llm_task(coroutine):
+    task = asyncio.create_task(coroutine)
+    tasks = _llm_child_tasks.get()
+    if tasks is not None:
+        tasks.append(task)
+    return task
+
+
+@_llm_plugin_context
 async def _call_llm_with_retry(ls: _LoopState, step: int):
     """LLM 调用（含重试）。
 
@@ -274,7 +314,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                 event_payload.setdefault("llm_request_id", request_id)
                 await ls.rctx.emit_event("tool_call_delta", event_payload)
 
-            stream_task = asyncio.create_task(
+            stream_task = _create_llm_task(
                 ls.provider.chat_stream(
                     messages=llm_messages,
                     tools=tools_arg,
@@ -379,7 +419,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                 ls.use_stream = False
         else:
             # ---- 非流式调用（可取消） ----
-            llm_task = asyncio.create_task(
+            llm_task = _create_llm_task(
                 ls.provider.chat(messages=llm_messages, tools=tools_arg)
             )
             while True:

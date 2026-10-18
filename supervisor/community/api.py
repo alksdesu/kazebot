@@ -14,6 +14,10 @@ def create_router(state) -> APIRouter:
     if getattr(state, "community", None) is None:
         state.community = CommunityService(state.workspace_root)
     service = state.community
+    host = getattr(state, "plugin_host", None)
+    if host is not None:
+        service = host.register_base("community", service)
+        state.community = service
     router = APIRouter(prefix="/v1/community", tags=["community"])
 
     def call(request, method, *args, defaults=False):

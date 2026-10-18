@@ -6,6 +6,10 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+from plugin_sdk import PluginExecutionError
+
+from .plugin_transport import iter_sse_events, wrap_client
+
 from .base import BaseProvider, ProviderResponse, ToolCall
 from .degrade import DegradeRule, degrade, set_option, unset_options
 from .options import ENUM, FLOAT, INT, TEXT, OptionSet, OptionSpec
@@ -255,7 +259,7 @@ class OpenAIProvider(BaseProvider):
         if not k:
             raise RuntimeError("openai api_key is empty")
 
-        self._http = http
+        self._http = wrap_client(http, self)
         self._api_key = k
         self._base_url = _normalize_base_url(base_url)
         self._options = OptionSet(self.OPTIONS, provider_options)
@@ -360,11 +364,8 @@ class OpenAIProvider(BaseProvider):
                 stream_usage: dict[str, int] | None = None
                 _stream_finish_reason: str | None = None
                 _stream_error: str | None = None
-                async for line in resp.aiter_lines():
-                    line = line.strip()
-                    if not line or not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
+                async for event in iter_sse_events(resp):
+                    data_str = event["data"]
                     if data_str == "[DONE]":
                         break
 
@@ -508,6 +509,8 @@ class OpenAIProvider(BaseProvider):
                     inline_data=[], provider_meta={},
                 )
 
+        except PluginExecutionError:
+            raise
         except Exception as e:
             # [fix 2026-04-18] 补齐 inline_data / provider_meta，与成功路径风格一致
             return ProviderResponse(ok=False, error=str(e) or type(e).__name__, inline_data=[], provider_meta={})
@@ -526,6 +529,8 @@ class OpenAIProvider(BaseProvider):
 
         try:
             r = await self._http.post(url, headers=headers, json=payload, timeout=self._timeout)
+        except PluginExecutionError:
+            raise
         except Exception as e:
             # [fix 2026-04-18] 补齐 inline_data / provider_meta，与成功路径风格一致
             return ProviderResponse(ok=False, error=str(e) or type(e).__name__, inline_data=[], provider_meta={})
@@ -650,5 +655,7 @@ class OpenAIProvider(BaseProvider):
                 status_code=status, usage=usage, raw=data, inline_data=[], provider_meta={},
             )
 
+        except PluginExecutionError:
+            raise
         except Exception as e:
             return ProviderResponse(ok=False, error=f"failed to parse response: {e}", status_code=status, raw=data, inline_data=[], provider_meta={})

@@ -71,6 +71,7 @@ class ReminderService:
                 );
             """)
         self._stop = threading.Event()
+        self._paused = threading.Event()
         self._thread: threading.Thread | None = None
         self._tick_lock = threading.Lock()
 
@@ -107,8 +108,17 @@ class ReminderService:
 
     stop = close
 
+    def pause(self) -> None:
+        self._paused.set()
+
+    def resume(self) -> None:
+        self._paused.clear()
+        self.start()
+
     def _loop(self) -> None:
         while not self._stop.wait(1):
+            if self._paused.is_set():
+                continue
             try:
                 self.tick()
             except Exception:

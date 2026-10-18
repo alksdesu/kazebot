@@ -94,6 +94,7 @@ def _provider_catalog_error(status: int, url: str, body: str) -> str:
     detail = detail[:4000] or "上游没有返回错误正文"
     return f"上游 HTTP {status}（{url}）：{detail}"
 from .admin_api import create_admin_router
+from .plugin_api import create_plugin_router
 from .feature_config_api import create_feature_config_router
 from .platform_accounts import PlatformAccounts, create_legacy_qq_account_router, create_platform_account_router
 from .platform_api import create_platform_router
@@ -1857,8 +1858,7 @@ def create_app(
                     payload=_all_restart_payload,
                 )
 
-        # --no-shell 模式下没有 _watch_shell 线程，需要直接退出
-        # 先停 engine，再延迟退出让 HTTP 响应发出去
+        # 先发出 HTTP 响应，再让宿主排空连接并退出。
         def _deferred_exit() -> None:
             try:
                 time.sleep(1)
@@ -1873,14 +1873,16 @@ def create_app(
                             _eng.popen.wait(timeout=5)
                         except Exception:
                             pass
-                import traceback as _tb
-                _msg = f'[DIAG] os._exit(75) called from api.py! stack:\n{"" .join(_tb.format_stack())}'
-                log.info(_msg)
-                import sys as _sys; _sys.stdout.flush(); _sys.stderr.flush()
-                import time as _t; _t.sleep(0.5)  # 确保日志写出
             finally:
-                # 重启占着不放、挂起标志也已置上：半路抛异常而进程不退，之后的重启全被挡住。
-                os._exit(75)  # main.py 外层循环检测到 75 会重启
+                shutdown = getattr(app.state, "request_shutdown", None)
+                if shutdown is not None:
+                    shutdown(75)
+                else:
+                    host = getattr(app.state, "plugin_host", None)
+                    if host is not None and host.running:
+                        host.run(host.stop())
+                    os._exit(75)
+
 
         try:
             _announce_full_restart()
@@ -2165,6 +2167,7 @@ def create_app(
 
     admin_router = create_admin_router(workspace_root=state.workspace_root)
     app.include_router(admin_router, prefix="/v1/admin/config")
+    app.include_router(create_plugin_router(state.workspace_root), prefix="/v1/admin/plugins")
     app.include_router(create_platform_router(workspace_root=state.workspace_root), prefix="/v1/platforms")
     app.include_router(create_platform_account_router(state, app.state.platform_accounts), prefix="/v1/platforms")
     app.include_router(create_legacy_qq_account_router(state, app.state.platform_accounts))
@@ -2347,4 +2350,8 @@ def create_app(
     init_admin_token(state.workspace_root, console_url=console_url)
 
     register_features(app, state, process_manager, config_store, features_config)
+    from plugin_runtime.host import PluginDispatcher
+    state.plugin_host.app = app
+    app.state.plugin_host = state.plugin_host
+    app.add_middleware(PluginDispatcher, host=state.plugin_host, authenticate=verify_admin_token)
     return app

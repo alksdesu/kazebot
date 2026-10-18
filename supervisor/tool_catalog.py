@@ -30,6 +30,8 @@ class ToolEntry:
     origin: ToolOrigin | None = None
     # 外部脚本在所属工具目录里的相对路径，改仓库那份时按它落到 config/tools/ 的同一位置。
     rel: str | None = None
+    plugin_id: str | None = None
+    plugin_version: str | None = None
 
     @property
     def editable(self) -> bool:
@@ -51,6 +53,9 @@ class ToolEntry:
             out["timeout_sec"] = self.timeout_sec
         if self.origin is not None:
             out["origin"] = self.origin
+        if self.plugin_id:
+            out["plugin_id"] = self.plugin_id
+            out["plugin_version"] = self.plugin_version
         return out
 
 
@@ -103,7 +108,39 @@ def tool_catalog(workspace_root: Path) -> list[ToolEntry]:
         entries[entry.name] = entry
     for entry in external_entries(workspace_root):
         entries.setdefault(entry.name, entry)
+    for plugin_id, revision, declaration in application_tool_declarations(workspace_root):
+        spec = declaration.get("spec", {})
+        name = spec.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        from toolbox.tool_names import is_engine_owned_name
+        if is_engine_owned_name(name) or (name in entries and not declaration.get("replace")):
+            continue
+        entries[name] = _from_spec(spec, "plugin", plugin_id=plugin_id, plugin_version=revision)
     return sorted(entries.values(), key=lambda item: item.name)
+
+
+def application_tool_declarations(workspace_root: Path) -> list[tuple[str, str, dict]]:
+    from .plugin_api import runtime_status
+
+    latest: dict[str, tuple[str, dict]] = {}
+    for report in runtime_status(workspace_root):
+        if not report.get("alive") or report.get("process") != "engine":
+            continue
+        stamp = str(report.get("updated_at") or "")
+        for plugin in report.get("plugins", []):
+            plugin_id = str(plugin.get("id") or "")
+            if plugin.get("status") not in {"loaded", "error"} or not plugin_id:
+                continue
+            if plugin_id not in latest or stamp > latest[plugin_id][0]:
+                latest[plugin_id] = (stamp, plugin)
+    result = []
+    ordered = sorted(latest.items(), key=lambda pair: (-int(pair[1][1].get("priority", 100)), pair[0]), reverse=True)
+    for plugin_id, (_, plugin) in ordered:
+        for declaration in plugin.get("tools", []):
+            if isinstance(declaration, dict) and isinstance(declaration.get("spec"), dict):
+                result.append((plugin_id, str(plugin.get("desired_hash") or ""), declaration))
+    return result
 
 
 def tool_names(workspace_root: Path) -> list[str]:
@@ -118,6 +155,8 @@ def _from_spec(
     timeout_sec: float | None = None,
     origin: ToolOrigin | None = None,
     rel: str | None = None,
+    plugin_id: str | None = None,
+    plugin_version: str | None = None,
 ) -> ToolEntry:
     schema = spec.get("input_schema")
     return ToolEntry(
@@ -129,4 +168,6 @@ def _from_spec(
         timeout_sec=timeout_sec,
         origin=origin,
         rel=rel,
+        plugin_id=plugin_id,
+        plugin_version=plugin_version,
     )

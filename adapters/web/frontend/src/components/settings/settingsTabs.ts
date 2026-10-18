@@ -4,6 +4,8 @@
 // panel component. Purpose: the settings sidebar, host, and right panel all resolve
 // pages from the same data source.
 import { type ComponentType } from 'react';
+import { extensions, useExtensionRevision } from '../../plugins/registry';
+import { browserPluginState, useBrowserPlugins } from '../../plugins/status';
 import { CommunityPage } from '../../features/community/CommunityPage';
 import { ConversationSettings } from '../../features/community/ConversationSettings';
 import { RemindersPage } from '../../features/execution/RemindersPage';
@@ -39,6 +41,7 @@ import { SystemSettingsPage } from './pages/SystemSettingsPage';
 import { ToolsSettingsPage } from './pages/ToolsSettingsPage';
 import { DrawtoolsSettingsPage } from './pages/DrawtoolsSettingsPage';
 import { RuntimeSettingsPage } from './pages/RuntimeSettingsPage';
+import { PluginsSettingsPage } from './pages/PluginsSettingsPage';
 import {
   AdvancedSettingsRightPanel,
   AgentsSettingsRightPanel,
@@ -92,6 +95,7 @@ const CORE_TABS = [
   // policy. How: point the new Client tab to ClientSettingsPage. Purpose: future
   // client preferences can be added without editing App.tsx or settings hosts.
   { id: 'client', label: '客户端', icon: 'display_settings', group: 'basics', order: 1, Page: ClientSettingsPage },
+  { id: 'plugins', label: '插件', icon: 'extension', group: 'basics', order: 2, Page: PluginsSettingsPage },
   // [2026-06-02] Register the full P0/P1 settings surface requested by operators.
   // Why: system, approvals, agents, tools, skills, MCP, automation, and advanced raw
   // config are independent settings domains. How: add each page with a Material
@@ -152,15 +156,24 @@ function platformTabs(platforms: readonly PlatformDescriptor[]): SettingsTabDefi
 }
 
 const FIXED_TABS: SettingsTabDefinition[] = [...CORE_TABS, ...BOT_TABS, ...MODEL_TABS];
+for (const tab of FIXED_TABS) extensions.builtin('settings', tab.id, tab);
+extensions.provideBuiltins('settings', () => Object.fromEntries(platformTabs(platformRegistryState().running).map((tab) => [tab.id, tab])));
 
-let built: { platforms: readonly PlatformDescriptor[]; tabs: SettingsTabDefinition[] } | null = null;
+export function builtinSettingsTab(id: string): SettingsTabDefinition | undefined {
+  return FIXED_TABS.find((tab) => tab.id === id) || platformTabs(platformRegistryState().running).find((tab) => tab.id === id);
+}
+
+let built: { platforms: readonly PlatformDescriptor[]; revision: number; tabs: SettingsTabDefinition[] } | null = null;
 
 /** 侧栏、页面宿主、右侧面板共用的页签表。平台组跟着给的平台生成，给的没换就还是同一个数组。
  *
  * 传进来的是要列页的平台，按注册表取时是 running：一个实例只跑一个平台，别的平台的页列出来也没有 bot 在读。 */
 export function settingsTabsFor(platforms: readonly PlatformDescriptor[]): SettingsTabDefinition[] {
-  if (built?.platforms !== platforms) {
-    built = { platforms, tabs: [...FIXED_TABS, ...platformTabs(platforms)].sort((a, b) => a.order - b.order) };
+  const revision = extensions.snapshot();
+  if (built?.platforms !== platforms || built.revision !== revision) {
+    const bases = [...FIXED_TABS, ...platformTabs(platforms)];
+    const ids = [...new Set([...bases.map((tab) => tab.id), ...extensions.ids('settings').filter((id) => extensions.hasContribution('settings', id))])];
+    built = { platforms, revision, tabs: ids.map((id) => extensions.resolve<SettingsTabDefinition>('settings', id, bases.find((tab) => tab.id === id))!).sort((a, b) => a.order - b.order) };
   }
   return built.tabs;
 }
@@ -171,6 +184,7 @@ export function currentSettingsTabs(): SettingsTabDefinition[] {
 }
 
 export function useSettingsTabs(): SettingsTabDefinition[] {
+  useExtensionRevision();
   return settingsTabsFor(usePlatformRegistryState().running);
 }
 
@@ -199,9 +213,11 @@ export function resolveSettingsTab(
 ): ResolvedSettingsTab {
   const tab = getSettingsTab(tabId, settingsTabsFor(registry.running));
   const resolved = resolveSettingsTabId(tabId);
-  return { tab, pending: !registry.settled && tab.id !== resolved && isPlatformPageId(resolved) };
+  return { tab, pending: tab.id !== resolved && (!browserPluginState().settled || (!registry.settled && isPlatformPageId(resolved))) };
 }
 
 export function useResolvedSettingsTab(tabId: string): ResolvedSettingsTab {
+  useExtensionRevision();
+  useBrowserPlugins();
   return resolveSettingsTab(tabId, usePlatformRegistryState());
 }

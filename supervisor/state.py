@@ -119,12 +119,11 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._memory_extract_handler = _builtin_handlers.get("memory_extract")
         self._dream_handler = _builtin_handlers.get("dream")
 
-        # External plugins: same mechanism as engine, scan plugins/ directory
-        from engine.hooks.loader import load_external_plugins
-        _plugins_dir = workspace_root / "plugins"
-        _ext_count = load_external_plugins(self.hook_registry, _plugins_dir)
-        if _ext_count:
-            logger.info("Loaded %d external plugin(s) for supervisor hooks", _ext_count)
+        from plugin_runtime import get_manager
+        from plugin_runtime.host import PluginHost
+        self.plugin_manager = get_manager(workspace_root, process="supervisor")
+        self.plugin_host = PluginHost(self.plugin_manager, state=self)
+        self.hook_registry.bind_plugins(self.plugin_manager)
 
         # ---- Child Session 隔离（Phase A）：映射表 ----
         # (parent_session_id, node_id, context_key) → child_session_id

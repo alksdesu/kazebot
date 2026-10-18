@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import inspect
 import json
 import os
@@ -23,6 +24,7 @@ from clonoth_runtime import (
     resolve_system_model,
 )
 from providers import registry as provider_registry
+from plugin_runtime import get_manager
 from toolbox.context import ToolContext
 from toolbox.registry import ToolRegistry
 
@@ -49,6 +51,9 @@ from engine.signals.bridge import install_event_bridge
 
 
 _OPENAI_COMPATIBLE_PROVIDERS = frozenset({"openai", "openai-responses"})
+
+
+logger = logging.getLogger(__name__)
 
 
 def _shares_endpoint_with_main(provider_name: str, active_provider: str) -> bool:
@@ -630,56 +635,73 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
 
         print(f"[engine] worker {wid[:8]} ready (max_concurrent={max_workers})", flush=True)
         _active: set[asyncio.Task] = set()
+        plugin_manager = get_manager(workspace_root, process="engine")
+        from plugin_runtime.host import PluginHost
+        plugin_host = PluginHost(plugin_manager)
+        registry = plugin_host.register_base("tools", registry)
+        http = plugin_host.register_base("supervisor_http", http)
+        llm_http = plugin_host.register_base("llm_http", llm_http)
+        await plugin_host.start()
+        plugin_refresh_at = 0.0
 
-        while not stop_event.is_set():
-            try:
-                # ---- reap finished tasks ----
-                _done = {t for t in _active if t.done()}
-                for t in _done:
-                    if not t.cancelled():
-                        _exc = t.exception()
-                        if _exc:
-                            print(f"[engine] task error: {_exc}", flush=True)
-                _active -= _done
-
-                # ---- tools hot-reload check ----
+        try:
+            while not stop_event.is_set():
                 try:
-                    rr = await http.get(f"{supervisor_url}/v1/tools/reload-seq")
-                    if rr.status_code == 200:
-                        new_seq = int(rr.json().get("seq", 0))
-                        if new_seq > _last_reload_seq:
-                            _last_reload_seq = new_seq
-                            count = registry.reload()
-                            print(f"[engine] tools reloaded ({count} tools)", flush=True)
-                except Exception:
+                    if _loop.time() >= plugin_refresh_at:
+                        plugin_refresh_at = _loop.time() + 2.0
+                        try:
+                            await asyncio.to_thread(plugin_manager.heartbeat)
+                        except Exception as exc:
+                            logger.warning("Plugin runtime refresh failed (%s)", type(exc).__name__)
+                    # ---- reap finished tasks ----
+                    _done = {t for t in _active if t.done()}
+                    for t in _done:
+                        if not t.cancelled():
+                            _exc = t.exception()
+                            if _exc:
+                                print(f"[engine] task error: {_exc}", flush=True)
+                    _active -= _done
+
+                    # ---- tools hot-reload check ----
+                    try:
+                        rr = await http.get(f"{supervisor_url}/v1/tools/reload-seq")
+                        if rr.status_code == 200:
+                            new_seq = int(rr.json().get("seq", 0))
+                            if new_seq > _last_reload_seq:
+                                _last_reload_seq = new_seq
+                                count = registry.reload()
+                                print(f"[engine] tools reloaded ({count} tools)", flush=True)
+                    except Exception:
+                        pass
+
+                    # ---- poll for new task (only if below capacity) ----
+                    if len(_active) < max_workers:
+                        nr = await http.get(f"{supervisor_url}/v1/tasks/next", params={"worker_id": wid})
+                        if nr.status_code == 200:
+                            item = nr.json()
+                            if isinstance(item, dict) and item.get("task_id"):
+                                _t = asyncio.create_task(
+                                    _handle_task(http, llm_http, supervisor_url, workspace_root, registry, item, wid)
+                                )
+                                _active.add(_t)
+                                continue
+                except Exception as e:
+                    print(f"[engine] error: {e}", flush=True)
+                # Stop-aware sleep: wake immediately on stop signal
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=poll_sec)
+                except asyncio.TimeoutError:
                     pass
 
-                # ---- poll for new task (only if below capacity) ----
-                if len(_active) < max_workers:
-                    nr = await http.get(f"{supervisor_url}/v1/tasks/next", params={"worker_id": wid})
-                    if nr.status_code == 200:
-                        item = nr.json()
-                        if isinstance(item, dict) and item.get("task_id"):
-                            _t = asyncio.create_task(
-                                _handle_task(http, llm_http, supervisor_url, workspace_root, registry, item, wid)
-                            )
-                            _active.add(_t)
-                            continue
-            except Exception as e:
-                print(f"[engine] error: {e}", flush=True)
-            # Stop-aware sleep: wake immediately on stop signal
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=poll_sec)
-            except asyncio.TimeoutError:
-                pass
-
-        # ---- Direction 1: graceful shutdown — cancel active tasks and write terminal states ----
-        if _active:
-            print(f"[engine] shutting down, cancelling {len(_active)} active task(s)...", flush=True)
-            for t in _active:
-                t.cancel()
-            # Wait for tasks to handle CancelledError and POST terminal state
-            await asyncio.wait(_active, timeout=15.0)
+        finally:
+            # ---- Direction 1: graceful shutdown — cancel active tasks and write terminal states ----
+            if _active:
+                print(f"[engine] shutting down, cancelling {len(_active)} active task(s)...", flush=True)
+                for t in _active:
+                    t.cancel()
+                # Wait for tasks to handle CancelledError and POST terminal state
+                await asyncio.wait(_active, timeout=15.0)
+            await plugin_host.stop()
         print(f"[engine] worker {wid[:8]} stopped (generation {generation_id[:8]})", flush=True)
 
 
@@ -732,6 +754,7 @@ async def _handle_task(
                 session_id=session_id, session_generation=session_generation,
                 api_key=main.api_key, base_url=main.base_url,
                 default_model=main.model, default_provider=main.provider,
+                default_channel=main.channel_name,
             )
         elif kind == "tool":
             result = await _run_tool_task(
@@ -809,6 +832,7 @@ def _apply_system_slot(ws_root: Path, rp: Any, slot: Any, slot_name: str) -> Non
         # 槽位的 provider 跟节点的一样，可以是渠道名。只填它不填地址就整块继承过来。
         channel = resolve_channel(ws_root, slot.provider)
         rp.provider_type = channel.wire
+        rp.channel_name = channel.name
         if channel.known:
             rp.base_url = rp.base_url or channel.base_url or None
             rp.api_key = rp.api_key or channel.api_key or None
@@ -876,6 +900,7 @@ async def _run_node_task(
     base_url: str,
     default_model: str,
     default_provider: str = "openai",
+    default_channel: str = "",
 ) -> dict[str, Any]:
     task_id = str(task.get("task_id") or "").strip()
     node_id = str(task.get("node_id") or "").strip()
@@ -1015,6 +1040,7 @@ async def _run_node_task(
         ws_root, node, default_model,
         provider_default_type=default_provider,
         session_override=session_provider_override,
+        provider_default_channel=default_channel,
     )
     # [2026-07-16] 系统节点（压缩/轮摘要）支持单独配置 model/base_url/api_key，
     # 来源 config.yaml 的 system_models.<slot> 或同名环境变量；留空则跟随主渠道。
@@ -1056,6 +1082,7 @@ async def _run_node_task(
         provider_options=_po,
         active_provider=default_provider,
     )
+    provider.plugin_channel = rp.channel_name
 
     await rctx.emit_event("node_started", {
         "task_id": task_id, "node_id": node.id,
@@ -1310,6 +1337,7 @@ async def _run_tool_task(
     # 否则派发方能借它调用自己 tool_access 之外的工具。
     # 查不到发起节点就不放行：宁可这条路走不通，也不要一条没人管的执行入口。
     _origin_node_id = str(input_data.get("origin_node_id") or "").strip()
+    kctx.origin_node_id = _origin_node_id
     _origin_node = load_node(ws_root, _origin_node_id) if _origin_node_id else None
     if _origin_node is None or not tool_allowed(_origin_node, tool_name):
         _why = (

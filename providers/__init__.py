@@ -10,7 +10,7 @@ from .options import OptionSpec, catalog
 
 
 # 这些是 provider 共用的基础设施，不是 provider 本身，扫描时跳过。
-_NON_PROVIDER_MODULES = frozenset({"__init__", "base", "options", "degrade"})
+_NON_PROVIDER_MODULES = frozenset({"__init__", "base", "options", "degrade", "plugin_transport"})
 
 
 class ProviderRegistry:

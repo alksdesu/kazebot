@@ -113,6 +113,11 @@ class TestWireFormat:
     def test_provider_is_normalised(self):
         assert normalize_openai_secret({"provider": "  AnThRoPiC "}).provider == "anthropic"
 
+    def test_channel_name_keeps_case_independent_of_wire(self):
+        main = normalize_openai_secret({"provider": "gemini", "channel_name": " Relay-A "})
+        assert main.provider == "gemini"
+        assert main.channel_name == "Relay-A"
+
     def test_garbage_payload_yields_usable_defaults(self):
         assert normalize_openai_secret(None).provider == "openai"
 
@@ -131,6 +136,12 @@ class TestResolveProvider:
 
     def test_both_empty_falls_back_to_openai(self):
         assert resolve_provider(None, self._node(), "m").provider_type == "openai"
+
+    def test_plugin_scope_distinguishes_active_and_session_channels(self):
+        inherited = resolve_provider(None, self._node(), "m", provider_default_type="gemini", provider_default_channel="Relay-A")
+        overridden = resolve_provider(None, self._node(), "m", provider_default_type="gemini", provider_default_channel="Relay-A", session_override={"provider": "Relay-B"})
+        assert inherited.channel_name == "Relay-A"
+        assert overridden.channel_name == "Relay-B"
 
     def test_session_override_still_outranks_everything(self):
         rp = resolve_provider(

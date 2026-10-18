@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import inspect
 import logging
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,6 +34,7 @@ class _RegisteredHook:
     priority: int
     name: str
     callback: Any
+    plugin_version: Any = None
 
 
 class HookRegistry:
@@ -50,6 +53,55 @@ class HookRegistry:
         # be visible after startup. How: keep one normalized dict per plugin name.
         # Purpose: expose loaded plugin information without changing handler execution.
         self._loaded_plugins: list[dict] = []
+        self._plugin_manager = None
+        self._scoped_registry: ContextVar[HookRegistry | None] = ContextVar("hook_registry", default=None)
+
+    @contextmanager
+    def scoped(self):
+        registry = HookRegistry()
+        source = self._scoped_registry.get() or self
+        registry._hooks = {key: list(entries) for key, entries in source._hooks.items()}
+        registry._loaded_plugins = [_copy_plugin_meta(meta) for meta in source._loaded_plugins]
+        token = self._scoped_registry.set(registry)
+        try:
+            yield registry
+        finally:
+            self._scoped_registry.reset(token)
+
+    def bind_plugins(self, manager: Any) -> None:
+        target = self._scoped_registry.get()
+        if target is not None:
+            target.bind_plugins(manager)
+        else:
+            self._plugin_manager = manager
+
+    @contextmanager
+    def _entries(self, hook_point: str, ctx: Any = None):
+        point = _normalize_hook_point(hook_point)
+        entries = list(self._hooks.get(point, []))
+        manager = self._plugin_manager
+        versions = []
+        if manager is not None:
+            from plugin_runtime.manager import current_scope
+            scope = current_scope()
+            node = getattr(ctx, "node", None)
+            provider = getattr(ctx, "provider", None)
+            if node is not None:
+                scope["node_id"] = getattr(node, "id", "")
+            if provider is not None:
+                scope["provider"] = getattr(provider, "provider_name", "") or getattr(provider, "name", "")
+                scope["channel"] = getattr(provider, "plugin_channel", "") or scope.get("channel", "")
+            versions = manager.acquire(scope)
+            for version in versions:
+                for entry in version.api.hooks._hooks.get(point, []):
+                    entries.append(_RegisteredHook(entry.priority, f"{version.api.plugin_id}:{entry.name}", entry.callback, version))
+            entries.sort(key=lambda entry: entry.priority, reverse=True)
+        try:
+            with manager.host.lease_context(versions) if manager is not None and manager.host is not None else nullcontext():
+                yield entries
+        finally:
+            if manager is not None:
+                manager.release(versions)
 
     def register(self, hook_point: str, handler: Any, priority: int | None = None) -> None:
         """Register one handler to a hook point.
@@ -59,6 +111,9 @@ class HookRegistry:
         derive name/priority from the handler or its bound instance. Purpose: make
         repeated auto-discovery idempotent across all built-in hook points.
         """
+        target = self._scoped_registry.get()
+        if target is not None:
+            return target.register(hook_point, handler, priority)
         point = _normalize_hook_point(hook_point)
         callback = _handler_callback(handler)
         name = _handler_name(handler)
@@ -70,6 +125,9 @@ class HookRegistry:
 
     def unregister(self, hook_point: str, handler_name: str) -> bool:
         """Remove a handler by name and report whether anything changed."""
+        target = self._scoped_registry.get()
+        if target is not None:
+            return target.unregister(hook_point, handler_name)
         point = _normalize_hook_point(hook_point)
         handlers = self._hooks.get(point)
         if not handlers:
@@ -86,6 +144,9 @@ class HookRegistry:
         # How: replace a previous record with the same name instead of appending a
         # duplicate, while storing a copy of the caller's dict. Purpose: make
         # metadata registration idempotent like handler registration.
+        target = self._scoped_registry.get()
+        if target is not None:
+            return target.register_plugin_meta(meta)
         stored = _copy_plugin_meta(meta)
         name = stored.get("name") or stored.get("handler_class") or "unknown"
         stored["name"] = name
@@ -100,7 +161,14 @@ class HookRegistry:
         # Why: callers should inspect plugin state without mutating registry internals.
         # How: return copied metadata dicts and copied hook lists. Purpose: keep the
         # registry state owned by HookRegistry.
-        return [_copy_plugin_meta(plugin) for plugin in self._loaded_plugins]
+        target = self._scoped_registry.get()
+        if target is not None:
+            return target.list_plugins()
+        result = [_copy_plugin_meta(plugin) for plugin in self._loaded_plugins]
+        if self._plugin_manager is not None:
+            self._plugin_manager.refresh()
+            result.extend(_copy_plugin_meta(version.definition["metadata"]) for version in self._plugin_manager._versions.values())
+        return result
 
     def fire(self, hook_point: str, ctx: Any) -> HookResult:
         """Synchronously run handlers for one hook point.
@@ -110,46 +178,69 @@ class HookRegistry:
         engine hooks. Purpose: replace the old supervisor-only registry without making
         supervisor code async.
         """
-        modified = False
-        for entry in list(self._hooks.get(_normalize_hook_point(hook_point), [])):
-            try:
-                result = entry.callback(ctx)
-                if inspect.isawaitable(result):
-                    _close_awaitable(result)
-                    raise RuntimeError("async hook handler registered on sync fire(); use afire()")
-                stop_result, modified = _process_hook_result(result, modified)
-                if stop_result is not None:
-                    return stop_result
-            except Exception as exc:
-                logger.warning("Hook %s.%s failed: %s", hook_point, entry.name, exc)
-        return HookResult(modified=modified)
+        from plugin_sdk import PluginExecutionError
+        target = self._scoped_registry.get()
+        if target is not None:
+            return target.fire(hook_point, ctx)
+        with self._entries(hook_point, ctx) as entries:
+            modified = False
+            for entry in entries:
+                try:
+                    result = entry.callback(ctx)
+                    if inspect.isawaitable(result):
+                        _close_awaitable(result)
+                        raise RuntimeError("async hook handler registered on sync fire(); use afire()")
+                    stop_result, modified = _process_hook_result(result, modified)
+                    if stop_result is not None:
+                        return stop_result
+                except PluginExecutionError:
+                    raise
+                except Exception as exc:
+                    if entry.plugin_version is not None:
+                        self._plugin_manager.record_error(entry.plugin_version, "hook", exc)
+                    logger.warning("Hook %s.%s failed: %s", hook_point, entry.name, exc)
+            return HookResult(modified=modified)
 
     async def afire(self, hook_point: str, ctx: Any) -> HookResult:
         """Asynchronously run handlers for one hook point."""
         # Why: engine inference handlers can be async and often await runtime checks.
         # How: call each normalized callback and await awaitable results. Purpose:
         # keep engine control-flow semantics while sharing registration with sync hooks.
-        modified = False
-        for entry in list(self._hooks.get(_normalize_hook_point(hook_point), [])):
-            try:
-                result = entry.callback(ctx)
-                if inspect.isawaitable(result):
-                    result = await result
-                stop_result, modified = _process_hook_result(result, modified)
-                if stop_result is not None:
-                    return stop_result
-            except Exception as exc:
-                logger.warning("Hook %s.%s failed: %s", hook_point, entry.name, exc)
-        return HookResult(modified=modified)
+        from plugin_sdk import PluginExecutionError
+        target = self._scoped_registry.get()
+        if target is not None:
+            return await target.afire(hook_point, ctx)
+        with self._entries(hook_point, ctx) as entries:
+            modified = False
+            for entry in entries:
+                try:
+                    result = entry.callback(ctx)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    stop_result, modified = _process_hook_result(result, modified)
+                    if stop_result is not None:
+                        return stop_result
+                except PluginExecutionError:
+                    raise
+                except Exception as exc:
+                    if entry.plugin_version is not None:
+                        self._plugin_manager.record_error(entry.plugin_version, "hook", exc)
+                    logger.warning("Hook %s.%s failed: %s", hook_point, entry.name, exc)
+            return HookResult(modified=modified)
 
     def handlers_for(self, hook_point: str) -> list[dict[str, Any]]:
         """Return stable handler descriptors for per-plugin Supervisor ledgers."""
+        target = self._scoped_registry.get()
+        if target is not None:
+            return target.handlers_for(hook_point)
         result: list[dict[str, Any]] = []
-        for entry in list(self._hooks.get(_normalize_hook_point(hook_point), [])):
+        with self._entries(hook_point) as entries:
+            entries = list(entries)
+        for entry in entries:
             owner = getattr(entry.callback, "__self__", None)
             result.append({
                 "name": entry.name,
-                "callback": entry.callback,
+                "callback": self._descriptor_callback(hook_point, entry) if entry.plugin_version else entry.callback,
                 "post_work_idempotent": bool(
                     getattr(owner, "post_work_idempotent", False)
                     or getattr(entry.callback, "post_work_idempotent", False)
@@ -157,12 +248,42 @@ class HookRegistry:
             })
         return result
 
+    def _descriptor_callback(self, hook_point: str, descriptor: _RegisteredHook):
+        def invoke(ctx):
+            lease = self._entries(hook_point, ctx)
+            entries = lease.__enter__()
+            try:
+                entry = next((item for item in entries if item.name == descriptor.name), None)
+                result = entry.callback(ctx) if entry is not None else None
+            except BaseException:
+                lease.__exit__(None, None, None)
+                raise
+            if inspect.isawaitable(result):
+                async def complete():
+                    try:
+                        return await result
+                    finally:
+                        lease.__exit__(None, None, None)
+                return complete()
+            lease.__exit__(None, None, None)
+            return result
+        return invoke
+
     def list_hooks(self) -> dict[str, list[str]]:
         """Return registered hook points and handler names."""
-        return {
-            hook_point: [entry.name for entry in handlers]
-            for hook_point, handlers in self._hooks.items()
-        }
+        target = self._scoped_registry.get()
+        if target is not None:
+            return target.list_hooks()
+        points = set(self._hooks)
+        if self._plugin_manager is not None:
+            self._plugin_manager.refresh()
+            for version in self._plugin_manager._versions.values():
+                points.update(version.api.hooks._hooks)
+        result = {}
+        for point in sorted(points):
+            with self._entries(point) as entries:
+                result[point] = [entry.name for entry in entries]
+        return result
 
 
 def _normalize_hook_point(hook_point: Any) -> str:

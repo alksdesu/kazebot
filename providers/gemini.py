@@ -18,6 +18,10 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+from plugin_sdk import PluginExecutionError
+
+from .plugin_transport import PluginTransportError, iter_sse_events, wrap_client
+
 from .base import BaseProvider, ProviderResponse, ToolCall, image_part_url, split_data_url
 from .degrade import DegradeRule, degrade, set_option
 from .options import BOOL, ENUM, FLOAT, INT, OptionSet, OptionSpec
@@ -167,7 +171,7 @@ class GeminiProvider(BaseProvider):
         # 原因：下游仍通过 provider.name 判断 provider 特性；做法：从类属性传入；
         # 目的：注册 key、实例名和配置 provider 字段保持一致。
         super().__init__(model=model, name=self.provider_name)
-        self._http = http
+        self._http = wrap_client(http, self)
         self._api_key = api_key
         self._base_url = (base_url or self.default_base_url).rstrip("/")
         self._options = OptionSet(self.OPTIONS, provider_options)
@@ -409,6 +413,8 @@ class GeminiProvider(BaseProvider):
                     json=body,
                     timeout=self._timeout,
                 )
+            except PluginExecutionError:
+                raise
             except Exception as exc:
                 return ProviderResponse(ok=False, error=f"Gemini request failed: {exc}")
 
@@ -453,6 +459,8 @@ class GeminiProvider(BaseProvider):
                 timeout=self._timeout,
             )
             resp = await self._http.send(req, stream=True)
+        except PluginExecutionError:
+            raise
         except Exception as exc:
             return ProviderResponse(ok=False, error=f"Gemini stream request failed: {exc}")
 
@@ -493,83 +501,78 @@ class GeminiProvider(BaseProvider):
         all_raw_parts: list[dict[str, Any]] = []
 
         try:
-            # Gemini SSE: each line is "data: {json}\n\n"
-            buf = ""
-            async for raw_chunk in resp.aiter_text():
-                buf += raw_chunk
-                # Process complete SSE events in buffer
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    line = line.rstrip("\r")
-                    if not line.startswith("data: "):
-                        continue
-                    json_str = line[6:]  # strip "data: " prefix
-                    if not json_str.strip():
-                        continue
-                    try:
-                        chunk_data = json.loads(json_str)
-                    except json.JSONDecodeError:
-                        continue
+            async for sse_event in iter_sse_events(resp):
+                json_str = sse_event["data"]
+                if not json_str.strip():
+                    continue
+                try:
+                    chunk_data = json.loads(json_str)
+                except json.JSONDecodeError:
+                    continue
 
-                    # Extract parts from the first candidate
-                    candidates = chunk_data.get("candidates") or []
-                    if candidates:
-                        parts = (candidates[0].get("content") or {}).get("parts") or []
-                        for part in parts:
-                            # 收集所有原始 parts 用于 round-trip
-                            all_raw_parts.append(part)
-                            # Thinking / reasoning parts
-                            if part.get("thought"):
-                                t = part.get("text", "")
-                                if t:
-                                    thinking_parts.append(t)
-                                    if on_thinking:
-                                        await on_thinking(t)
-                            # Regular text
-                            elif "text" in part:
-                                t = part["text"]
-                                text_parts.append(t)
-                                if on_text:
-                                    await on_text(t)
-                            # Function calls
-                            elif "functionCall" in part:
-                                fc = part["functionCall"]
-                                tc_counter += 1
-                                tc_id = f"call_{tc_counter}"
-                                tc_index = tc_counter - 1
-                                tc_name = fc.get("name", "")
-                                tc_args_raw = fc.get("args") or {}
-                                tc_args = tc_args_raw if isinstance(tc_args_raw, dict) else {"_raw": tc_args_raw}
-                                # [tool-stream 2026-05-19] Gemini 当前返回完整 functionCall part，而非逐字符参数流。
-                                # 原因：没有真实 args delta 时仍要接入统一实时管道。
-                                # 做法：收到完整 functionCall 后合成 start、完整 args_delta、done 三个事件。
-                                # 目的：前端和 supervisor 不需要为 Gemini 维护另一套非流式工具调用逻辑。
-                                if on_tool_delta:
-                                    await on_tool_delta({
-                                        "event": "tool_call_start",
-                                        "index": tc_index,
-                                        "id": tc_id,
-                                        "name": tc_name,
-                                    })
-                                    await on_tool_delta({
-                                        "event": "tool_call_args_delta",
-                                        "index": tc_index,
-                                        "delta": json.dumps(tc_args, ensure_ascii=False),
-                                    })
-                                    await on_tool_delta({"event": "tool_call_done", "index": tc_index})
-                                tool_calls.append(ToolCall(
-                                    id=tc_id,
-                                    name=tc_name,
-                                    arguments=tc_args,
-                                ))
-                            # Inline data (images etc generated by model)
-                            elif "inlineData" in part:
-                                inline_data_list.append(part["inlineData"])
+                # Extract parts from the first candidate
+                candidates = chunk_data.get("candidates") or []
+                if candidates:
+                    parts = (candidates[0].get("content") or {}).get("parts") or []
+                    for part in parts:
+                        # 收集所有原始 parts 用于 round-trip
+                        all_raw_parts.append(part)
+                        # Thinking / reasoning parts
+                        if part.get("thought"):
+                            t = part.get("text", "")
+                            if t:
+                                thinking_parts.append(t)
+                                if on_thinking:
+                                    await on_thinking(t)
+                        # Regular text
+                        elif "text" in part:
+                            t = part["text"]
+                            text_parts.append(t)
+                            if on_text:
+                                await on_text(t)
+                        # Function calls
+                        elif "functionCall" in part:
+                            fc = part["functionCall"]
+                            tc_counter += 1
+                            tc_id = f"call_{tc_counter}"
+                            tc_index = tc_counter - 1
+                            tc_name = fc.get("name", "")
+                            tc_args_raw = fc.get("args") or {}
+                            tc_args = tc_args_raw if isinstance(tc_args_raw, dict) else {"_raw": tc_args_raw}
+                            # [tool-stream 2026-05-19] Gemini 当前返回完整 functionCall part，而非逐字符参数流。
+                            # 原因：没有真实 args delta 时仍要接入统一实时管道。
+                            # 做法：收到完整 functionCall 后合成 start、完整 args_delta、done 三个事件。
+                            # 目的：前端和 supervisor 不需要为 Gemini 维护另一套非流式工具调用逻辑。
+                            if on_tool_delta:
+                                await on_tool_delta({
+                                    "event": "tool_call_start",
+                                    "index": tc_index,
+                                    "id": tc_id,
+                                    "name": tc_name,
+                                })
+                                await on_tool_delta({
+                                    "event": "tool_call_args_delta",
+                                    "index": tc_index,
+                                    "delta": json.dumps(tc_args, ensure_ascii=False),
+                                })
+                                await on_tool_delta({"event": "tool_call_done", "index": tc_index})
+                            tool_calls.append(ToolCall(
+                                id=tc_id,
+                                name=tc_name,
+                                arguments=tc_args,
+                            ))
+                        # Inline data (images etc generated by model)
+                        elif "inlineData" in part:
+                            inline_data_list.append(part["inlineData"])
 
-                    # Usage metadata (typically present in the last chunk)
-                    um = chunk_data.get("usageMetadata")
-                    if um:
-                        usage = _parse_usage(um)
+                # Usage metadata (typically present in the last chunk)
+                um = chunk_data.get("usageMetadata")
+                if um:
+                    usage = _parse_usage(um)
+        except PluginExecutionError:
+            raise
+        except PluginTransportError as exc:
+            return ProviderResponse(ok=False, error=str(exc))
         except Exception as exc:
             # Partial result is still better than nothing; log and continue
             log.warning("Gemini stream read error: %s", exc)

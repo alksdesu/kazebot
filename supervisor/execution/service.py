@@ -37,6 +37,7 @@ class ExecutionService:
         self.root = Path(state.workspace_root)
         self.store = PlanStore(plans_path(self.root))
         self._stop = threading.Event()
+        self._paused = threading.Event()
         self._tick_lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
@@ -67,8 +68,17 @@ class ExecutionService:
 
     stop = close
 
+    def pause(self) -> None:
+        self._paused.set()
+
+    def resume(self) -> None:
+        self._paused.clear()
+        self.start()
+
     def _loop(self) -> None:
         while not self._stop.wait(0.5):
+            if self._paused.is_set():
+                continue
             try:
                 self.tick()
             except Exception:
@@ -104,7 +114,6 @@ class ExecutionService:
     def _validate(self, actor: FeatureActor, draft: PlanDraft, node_id: str, prior_inputs: list[dict] | None = None) -> None:
         from engine.node import load_node
         from engine.inference.pseudo_tools import tool_allowed
-        from toolbox.registry import ToolRegistry
 
         source = self.state.tasks.get(actor.task_id) if actor.task_id else None
         allowed_files = {str(item.get("path") or "") for item in (source.input.get("attachments") or []) if isinstance(item, dict)} if source else set()
@@ -126,22 +135,27 @@ class ExecutionService:
         tool_steps = [step for step in draft.steps if step.kind == "tool"]
         if tool_steps:
             node = load_node(self.root, node_id)
-            registry = getattr(self.state, "tool_registry", None) or ToolRegistry(workspace_root=self.root, tools_dir=self.root / "tools")
+            specs = self._available_tool_specs()
             for step in tool_steps:
-                if node is None or not tool_allowed(node, step.operation) or registry.get_spec(step.operation) is None:
+                if node is None or not tool_allowed(node, step.operation) or step.operation not in specs:
                     raise PermissionError(f"发起节点无权使用工具：{step.operation}")
+
+    def _available_tool_specs(self) -> dict[str, dict]:
+        registry = getattr(self.state, "tool_registry", None)
+        if registry is not None:
+            return {spec["name"]: spec for spec in registry.list_specs()}
+        from supervisor.tool_catalog import tool_catalog
+        return {entry.name: entry.to_dict() for entry in tool_catalog(self.root)}
 
     def tools(self, actor: FeatureActor) -> list[dict]:
         from engine.node import load_node
         from engine.inference.pseudo_tools import tool_allowed
-        from toolbox.registry import ToolRegistry
 
         node_id, _ = self._origin(actor)
         node = load_node(self.root, node_id)
         if node is None:
             return []
-        registry = getattr(self.state, "tool_registry", None) or ToolRegistry(workspace_root=self.root, tools_dir=self.root / "tools")
-        return [{"name": spec["name"], "description": spec.get("description", ""), "input_schema": spec.get("input_schema", {}), "effect": "read" if spec["name"] in READ_ONLY_TOOLS else "external"} for spec in registry.list_specs() if tool_allowed(node, spec["name"])]
+        return [{"name": spec["name"], "description": spec.get("description", ""), "input_schema": spec.get("input_schema", {}), "effect": "read" if spec["name"] in READ_ONLY_TOOLS else "external"} for spec in self._available_tool_specs().values() if tool_allowed(node, spec["name"])]
 
     def create(self, actor: FeatureActor, draft: PlanDraft) -> dict:
         if not actor.scope:

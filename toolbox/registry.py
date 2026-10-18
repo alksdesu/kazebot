@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
+import inspect
 import json
 import logging
 import os
 import sys
 from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterator, Literal
 
@@ -460,6 +463,7 @@ class ToolRegistry:
         self._tool_funcs: dict[str, ToolFunc] = {}
         self._mcp_specs: dict[str, dict[str, Any]] = {}
         self._mcp_funcs: dict[str, ToolFunc] = {}
+        self._plugin_conflicts: set[tuple[str, str, str]] = set()
 
         self._load_builtin_meta_tools()
         self._builtin_specs = dict(self._tool_specs)
@@ -838,7 +842,7 @@ class ToolRegistry:
                 continue
             name = name.strip()
 
-            reserved = self.reserved_name_reason(name)
+            reserved = self._reserved_base_name_reason(name)
             if reserved:
                 log.warning("skipping external tool %s: name %r is %s", py.name, name, reserved)
                 continue
@@ -885,7 +889,42 @@ class ToolRegistry:
         return len(self._tool_specs)
 
     def list_specs(self) -> list[dict[str, Any]]:
-        return list(self._tool_specs.values())
+        with self._tool_view() as (specs, _funcs, _owners):
+            return copy.deepcopy(list(specs.values()))
+
+    @contextmanager
+    def _tool_view(self, ctx: Any = None):
+        from plugin_runtime import get_manager
+        from plugin_runtime.manager import current_scope
+
+        manager = get_manager(self.workspace_root)
+        scope = current_scope()
+        if ctx is not None:
+            scope = {**scope, "node_id": getattr(ctx, "origin_node_id", "") or getattr(ctx, "node_id", "") or scope.get("node_id", "")}
+        versions = manager.acquire(scope or None)
+        specs, funcs = dict(self._tool_specs), dict(self._tool_funcs)
+        owners: dict[str, Any] = {}
+        current = {(version.api.plugin_id, version.definition["desired_hash"]) for version in versions}
+        self._plugin_conflicts = {key for key in self._plugin_conflicts if key[:2] in current}
+        try:
+            for version in reversed(versions):
+                for declaration in getattr(version.api, "tool_definitions", []):
+                    spec = declaration["spec"]
+                    name = spec["name"]
+                    conflict = is_engine_owned_name(name) or (name in specs and not declaration.get("replace"))
+                    if conflict:
+                        key = (version.api.plugin_id, version.definition["desired_hash"], name)
+                        if key not in self._plugin_conflicts:
+                            manager.record_error(version, "tool_registration", ValueError(f"Tool {name} already exists or belongs to the engine protocol; explicit replace is required for replaceable tools"))
+                            self._plugin_conflicts.add(key)
+                        continue
+                    specs[name] = spec
+                    funcs[name] = declaration["handler"]
+                    owners[name] = version
+            with manager.host.lease_context(versions) if manager.host is not None else nullcontext():
+                yield specs, funcs, owners
+        finally:
+            manager.release(versions)
 
     def builtin_specs(self) -> list[dict[str, Any]]:
         """内置工具的 spec 快照。外部脚本工具不在内，reload 也冲不掉。"""
@@ -896,6 +935,13 @@ class ToolRegistry:
 
         内置工具以注册表快照为准，插件在启动时注册的工具也在里面；引擎伪工具不进注册表，另外判断。
         """
+        reason = self._reserved_base_name_reason(name)
+        if reason:
+            return reason
+        with self._tool_view() as (_specs, _funcs, owners):
+            return "taken by an application plugin" if str(name or "").strip() in owners else None
+
+    def _reserved_base_name_reason(self, name: str) -> str | None:
         clean_name = str(name or "").strip()
         if clean_name in self._builtin_specs:
             return "taken by a builtin tool"
@@ -905,7 +951,8 @@ class ToolRegistry:
 
     def get_spec(self, name: str) -> dict[str, Any] | None:
         """按名称获取单个工具的 spec，不存在返回 None。"""
-        return self._tool_specs.get(name)
+        with self._tool_view() as (specs, _funcs, _owners):
+            return copy.deepcopy(specs.get(name))
 
     async def prepare(self, *, name: str, arguments: dict[str, Any], ctx: Any) -> Any:
         if name in {"gpt_image_2", "gemini_image", "nai_generate", "nai_generate_from_plan"}:
@@ -914,19 +961,45 @@ class ToolRegistry:
         return None
 
     async def execute(self, *, name: str, arguments: dict[str, Any], ctx: Any) -> dict[str, Any]:
-        if name not in self._tool_funcs:
-            return _error_tool_response(f"tool not found: {name}")
-
-        func = self._tool_funcs[name]
-        try:
-            operation = await self.prepare(name=name, arguments=arguments, ctx=ctx)
-        except Exception as error:
-            return _error_tool_response(f"图像版本登记失败，尚未调用生图服务：{error}")
-        result = await func(arguments, ctx)
-        if name in {"gpt_image_2", "gemini_image", "nai_generate", "nai_generate_from_plan"}:
-            from engine.materials.integration import persist_generated_images
-            result = await persist_generated_images(ctx, name, arguments, result, operation=operation)
-        return _ensure_tool_response_shape(result)
+        with self._tool_view(ctx) as (specs, funcs, owners):
+            if name not in funcs:
+                return _error_tool_response(f"tool not found: {name}")
+            owner = owners.get(name)
+            guard = specs[name].get("guard") if owner else None
+            if isinstance(guard, dict):
+                denied = await _script_guard_error(guard, name, arguments or {}, ctx)
+                if denied is not None:
+                    return denied
+            try:
+                operation = await self.prepare(name=name, arguments=arguments, ctx=ctx)
+            except Exception as error:
+                return _error_tool_response(f"图像版本登记失败，尚未调用生图服务：{error}")
+            func = funcs[name]
+            if owner is None:
+                result = await func(arguments, ctx)
+            else:
+                try:
+                    if inspect.iscoroutinefunction(func):
+                        result = await func(arguments, ctx)
+                    else:
+                        task = asyncio.create_task(asyncio.to_thread(func, arguments, ctx))
+                        try:
+                            result = await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            pending = await asyncio.gather(task, return_exceptions=True)
+                            if pending and inspect.iscoroutine(pending[0]):
+                                pending[0].close()
+                            raise
+                        if inspect.isawaitable(result):
+                            result = await result
+                except Exception as error:
+                    from plugin_runtime import get_manager
+                    get_manager(self.workspace_root).record_error(owner, "tool", error)
+                    return _error_tool_response(f"Plugin {owner.api.plugin_id} tool {name} failed ({type(error).__name__})")
+            if name in {"gpt_image_2", "gemini_image", "nai_generate", "nai_generate_from_plan"}:
+                from engine.materials.integration import persist_generated_images
+                result = await persist_generated_images(ctx, name, arguments, result, operation=operation)
+            return _ensure_tool_response_shape(result)
 
     async def load_mcp_tools(self) -> int:
         """Scan enabled MCP clients and register their tools as first-class tools.

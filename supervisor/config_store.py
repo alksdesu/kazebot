@@ -249,6 +249,7 @@ class ConfigStore:
             return ActiveProviderSecret(
                 # engine 拿它去 registry 取实现类，只能给线格式，不能给渠道名。
                 provider=self._type_of(name),
+                channel_name=name,
                 base_url=_resolve_env_value(cfg.base_url),
                 api_key=_resolve_env_value(cfg.api_key),
                 model=_resolve_env_value(cfg.model),

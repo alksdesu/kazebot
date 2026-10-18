@@ -49,6 +49,7 @@ describe('Material Symbols SVG icon system', () => {
     expect(currentSettingsTabs().map(tab => tab.icon)).toEqual([
       'tune',
       'display_settings',
+      'extension',
       'monitor_heart',
       'settings_power',
       'approval',

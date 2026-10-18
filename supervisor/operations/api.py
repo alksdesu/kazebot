@@ -13,6 +13,10 @@ from .service import OperationsService
 def create_router(state: Any) -> APIRouter:
     service = OperationsService(state)
     state.operations = service
+    host = getattr(state, "plugin_host", None)
+    if host is not None:
+        service = host.register_base("operations", service)
+        state.operations = service
     router = APIRouter(prefix="/v1/operations")
 
     async def read_body(request: Request) -> dict:

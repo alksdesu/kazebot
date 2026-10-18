@@ -19,6 +19,10 @@ from typing import Any, Callable, Awaitable
 
 import httpx
 
+from plugin_sdk import PluginExecutionError
+
+from .plugin_transport import iter_sse_events, wrap_client
+
 from .base import BaseProvider, ProviderResponse, ToolCall, image_part_url, split_data_url
 from .degrade import DegradeRule, degrade, unset_options
 from .options import BOOL, ENUM, FLOAT, INT, OptionSet, OptionSpec
@@ -578,7 +582,7 @@ class AnthropicProvider(BaseProvider):
         # 原因：下游仍通过 provider.name 判断 provider 特性；做法：从类属性传入；
         # 目的：注册 key、实例名和配置 provider 字段保持一致。
         super().__init__(model=model, name=self.provider_name)
-        self._http = http
+        self._http = wrap_client(http, self)
         self._api_key = api_key
         # Default to official Anthropic API; strip trailing slash
         self._base_url = (base_url or self.default_base_url).rstrip("/")
@@ -692,6 +696,8 @@ class AnthropicProvider(BaseProvider):
                     json=payload,
                     timeout=self._timeout,
                 )
+            except PluginExecutionError:
+                raise
             except Exception as exc:
                 log.error("Anthropic request failed: %s", exc)
                 return ProviderResponse(ok=False, error=str(exc), status_code=0)
@@ -793,20 +799,8 @@ class AnthropicProvider(BaseProvider):
                         )
                     return self._error_from_body(resp.status_code, body)
 
-                # Parse SSE lines
-                # Anthropic sends: "event: <type>\ndata: <json>\n\n"
-                current_event = ""
-                async for line in resp.aiter_lines():
-                    line = line.rstrip()
-                    if not line:
-                        continue
-                    if line.startswith("event: "):
-                        current_event = line[7:]
-                        continue
-                    if not line.startswith("data: "):
-                        continue
-
-                    raw_data = line[6:]
+                async for sse_event in iter_sse_events(resp):
+                    raw_data = sse_event["data"]
                     if raw_data == "[DONE]":
                         break
 
@@ -816,7 +810,7 @@ class AnthropicProvider(BaseProvider):
                         log.warning("Anthropic SSE: bad JSON: %s", raw_data[:200])
                         continue
 
-                    evt = data.get("type", current_event)
+                    evt = data.get("type", sse_event["event"])
 
                     if evt == "message_start":
                         # Extract input usage from message_start
@@ -947,6 +941,8 @@ class AnthropicProvider(BaseProvider):
                             ok=False, error=err_msg, status_code=resp.status_code,
                         )
 
+        except PluginExecutionError:
+            raise
         except Exception as exc:
             log.error("Anthropic stream failed: %s", exc)
             return ProviderResponse(ok=False, error=str(exc), status_code=0)
@@ -1034,6 +1030,8 @@ class AnthropicProvider(BaseProvider):
             for old in existing[:-10]:
                 old.unlink(missing_ok=True)
             log.info('dumped error payload: %s (%d messages)', filename, snap['message_count'])
+        except PluginExecutionError:
+            raise
         except Exception as exc:
             log.warning('failed to dump error payload: %s', exc)
         finally:

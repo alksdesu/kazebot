@@ -38,6 +38,8 @@ POLICY_FILE = f"{CONFIG_DIR}/policy.yaml"
 MCP_FILE = f"{CONFIG_DIR}/mcp.yaml"
 SKILLS_DIR = f"{CONFIG_DIR}/skills"
 TOOLS_DIR = f"{CONFIG_DIR}/tools"
+PLUGINS_DIR = f"{CONFIG_DIR}/plugins"
+PLUGINS_FILE = f"{CONFIG_DIR}/plugins.yaml"
 DRAWTOOLS_DIR = f"{CONFIG_DIR}/drawtools"
 # 平台的连接令牌是实例身份，config/ 可能整份共享出去，所以放 data/。
 PLATFORM_SECRETS_FILE = "data/platform_secrets.yaml"
@@ -84,7 +86,7 @@ DRAWTOOLS_FILES: tuple[str, ...] = (
 # 装着明文密钥的配置，新建时只给属主读写。
 _PRIVATE_MODE = 0o600
 _SECRET_BEARING = frozenset({
-    MODELS_FILE, POLICY_FILE, MCP_FILE, PLATFORM_SECRETS_FILE, SHARED_SECRETS_FILE, f"{DRAWTOOLS_DIR}/settings.yaml",
+    MODELS_FILE, POLICY_FILE, MCP_FILE, PLUGINS_FILE, PLATFORM_SECRETS_FILE, SHARED_SECRETS_FILE, f"{DRAWTOOLS_DIR}/settings.yaml",
 })
 
 LAYOUT_VERSION = 1
@@ -159,6 +161,14 @@ def skills_dir(workspace_root: Path | str) -> Path:
 def custom_tools_dir(workspace_root: Path | str) -> Path:
     """本实例自己加的脚本工具，和仓库发布的那批分开放，同名同路径时盖过仓库那份。"""
     return Path(workspace_root) / TOOLS_DIR
+
+
+def custom_plugins_dir(workspace_root: Path | str) -> Path:
+    return Path(workspace_root) / PLUGINS_DIR
+
+
+def plugins_path(workspace_root: Path | str) -> Path:
+    return Path(workspace_root) / PLUGINS_FILE
 
 
 def drawtools_dir(workspace_root: Path | str) -> Path:

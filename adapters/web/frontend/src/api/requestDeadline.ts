@@ -1,4 +1,5 @@
 // 请求的时限：读请求迟迟拿不到响应头就中止并报超时，页面不会因为一次挂住的读取一直转圈、按钮一直灰着。
+import { dispatchRequest } from '../plugins/transport';
 
 /** 读请求等响应头的上限。后端调 NapCat 这类外部服务自己有 20 秒超时，一分钟足够宽松。 */
 export const READ_TIMEOUT_MS = 60_000;
@@ -21,8 +22,9 @@ export async function fetchWithDeadline(
   input: string,
   init: RequestInit = {},
   timeoutMs: number | null = defaultTimeout(init),
+  bypassPlugins = false,
 ): Promise<Response> {
-  if (timeoutMs === null) return fetch(input, init);
+  if (timeoutMs === null) return dispatchRequest(input, init, bypassPlugins);
   const controller = new AbortController();
   const outer = init.signal;
   const forward = () => controller.abort(outer?.reason);
@@ -31,7 +33,7 @@ export async function fetchWithDeadline(
   const expired = new RequestTimeoutError(timeoutMs);
   const timer = setTimeout(() => controller.abort(expired), timeoutMs);
   try {
-    return await fetch(input, { ...init, signal: controller.signal });
+    return await dispatchRequest(input, { ...init, signal: controller.signal }, bypassPlugins);
   } catch (error) {
     // 拿到响应头之后转发要留着，调用方才取消得了读到一半的正文；没拿到就没有正文可取消了。
     outer?.removeEventListener('abort', forward);

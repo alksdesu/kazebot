@@ -5,6 +5,7 @@ import asyncio
 import logging
 import time
 import uuid
+from functools import wraps
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
@@ -80,6 +81,7 @@ from ..signals import Signal, get_bus
 from ..hooks import HookContext, hook_registry
 from ..builtin.loader import auto_discover_and_register
 from ..hooks.loader import load_external_plugins
+from plugin_runtime import plugin_scope
 
 logger = logging.getLogger(__name__)
 
@@ -1790,6 +1792,24 @@ async def _fire_task_end_hook_if_finish(ls: _LoopState, action: TaskAction, step
     return action
 
 
+def _isolated_plugin_context(function):
+    @wraps(function)
+    async def run(**kwargs):
+        rctx = kwargs["rctx"]
+        node = kwargs["node"]
+        provider = kwargs["provider"]
+        with hook_registry.scoped(), plugin_scope(
+            workspace_root=rctx.workspace_root, node_id=node.id,
+            task_id=rctx.task_id,
+            channel=getattr(provider, "plugin_channel", "") or getattr(node, "provider", ""),
+            provider=getattr(provider, "provider_name", "") or getattr(provider, "name", ""),
+            purpose="system" if node.id.startswith("system.") else "inference",
+        ):
+            return await function(**kwargs)
+    return run
+
+
+@_isolated_plugin_context
 async def run_ai_node(
     *,
     rctx: "RunContext",
@@ -1819,10 +1839,6 @@ async def run_ai_node(
     # model-visible tool list is built. Purpose: keep hook and tool registration
     # in one plugin discovery pass.
     auto_discover_and_register(hook_registry, tool_registry=registry)
-    # Phase 3 External Hook Plugins：每次进入 AI 节点时扫描工作区 plugins/。
-    # 原因：用户需要在不修改 engine 源码的情况下添加自定义 handler。
-    # 做法：调用幂等的外部插件加载器；HookRegistry 会按 handler.name 替换旧实例。
-    # 目的：启动时自动发现插件，同时避免重复注册和单个插件失败影响引擎启动。
     load_external_plugins(hook_registry, rctx.workspace_root / "plugins")
 
     runtime_cfg = load_runtime_config(rctx.workspace_root)

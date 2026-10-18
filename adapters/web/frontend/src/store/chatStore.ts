@@ -4,6 +4,7 @@
 // every SupervisorEvent is replayed through eventReducer into ChatState. Purpose:
 // let the new message model run beside the old store until the UI migration is done.
 import { create } from 'zustand';
+import { commandAction } from '../plugins/commands';
 import { confirmNavigation } from '../hooks/useUnsavedChanges';
 
 import { connectGlobalWS, disconnectGlobalWS } from '../api';
@@ -1917,7 +1918,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     });
   },
 
-  selectConversation: (id) => {
+  selectConversation: commandAction('session.select', (id: string) => {
     if (id !== get().activeConversationId && !confirmNavigation()) return;
     const target = get().conversations.find((conversation) => conversation.id === id);
     set((state) => ({
@@ -1938,7 +1939,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       // realtime connection outside the global connection lifecycle.
       void loadSessionHistoryIntoStore(target.id, target.sessionId, set, get);
     }
-  },
+  }),
 
   selectChildNodes: (conversationId) => {
     // [2026-06-03] Why: components should not know that childNodes is keyed by
@@ -1974,16 +1975,16 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     void loadChildSessionHistoryIntoStore(trimmed, set, taskId?.trim() || undefined);
   },
 
-  exitChildSession: () => {
+  exitChildSession: commandAction('session.exitChild', () => {
     if (get().viewingChildSessionId && !confirmNavigation()) return;
     // [2026-06-03] Why: returning from child view should reveal the still-selected
     // parent conversation. How: clear only the view marker and leave message caches in
     // place. Purpose: reopening the same child can reuse cached messages while history
     // refreshes in the background on the next view action.
     set({ viewingChildSessionId: null });
-  },
+  }),
 
-  createConversation: () => {
+  createConversation: commandAction('session.create', () => {
     if (!confirmNavigation()) return get().activeConversationId || '';
     const conversation = createConversationMeta();
     set((state) => ({
@@ -1993,9 +1994,9 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       isGenerating: false,
     }));
     return conversation.id;
-  },
+  }),
 
-  deleteConversation: async (id) => {
+  deleteConversation: commandAction('session.delete', async (id: string) => {
     if (get().sendingByConversation[id]) throw new Error('消息仍在发送，请发送结束后再删除会话');
     if (get().deletingByConversation[id]) throw new Error('会话正在删除，请稍候');
     const conversation = get().conversations.find((item) => item.id === id);
@@ -2055,7 +2056,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     } finally {
       if (generation === startupGeneration) set(state => ({ deletingByConversation: { ...state.deletingByConversation, [id]: false } }));
     }
-  },
+  }),
 
   resetConversationView: (id, previousSessionId) => {
     set(state => {
@@ -2073,7 +2074,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     });
   },
 
-  renameConversation: (id, newTitle) => {
+  renameConversation: commandAction('session.rename', (id: string, newTitle: string) => {
     const trimmed = newTitle.trim();
     if (!trimmed) return;
     set((state) => ({
@@ -2085,7 +2086,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     const cache = loadTitleCache();
     cache[id] = trimmed;
     saveTitleCache(cache);
-  },
+  }),
 
   sendMessage: async (text, attachments, entryNodeId) => {
     const trimmed = text.trim();
