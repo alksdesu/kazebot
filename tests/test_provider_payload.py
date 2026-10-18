@@ -82,7 +82,13 @@ def test_gemini_safety_is_opt_in_and_covers_every_category() -> None:
     settings = _gemini(safety_threshold="block_none")["safetySettings"]
     assert {item["threshold"] for item in settings} == {"BLOCK_NONE"}
     # 少一类就会在那一类上继续被拦，而且是静默的空回复。
-    assert len(settings) == 4
+    assert {item["category"] for item in settings} == {
+        "HARM_CATEGORY_HARASSMENT",
+        "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "HARM_CATEGORY_DANGEROUS_CONTENT",
+        "HARM_CATEGORY_JAILBREAK",
+    }
 
 
 def test_gemini_merges_system_fragments_in_order_into_native_instruction() -> None:
