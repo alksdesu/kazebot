@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
 from contextlib import AbstractContextManager
 from pathlib import Path
@@ -141,18 +142,55 @@ def _stored(row: dict[str, Any]) -> dict[str, Any]:
     return stored
 
 
-def _read(path: Path) -> list[dict[str, Any]]:
+class InstanceDirectoryError(ValueError):
+    pass
+
+
+def _navigation_prefix(raw: Any) -> str:
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise InstanceDirectoryError("实例目录包含无效路径")
+    text = raw.strip()
+    if not re.fullmatch(r"/?[\w.~/-]*", text, flags=re.ASCII) or text.startswith("//"):
+        raise InstanceDirectoryError("实例目录包含无效路径")
+    path = normalize_prefix(text)
+    if path and any(part in {"", ".", ".."} for part in path[1:].split("/")):
+        raise InstanceDirectoryError("实例目录包含无效路径")
+    return path
+
+
+def _read(path: Path, *, strict: bool = False) -> list[dict[str, Any]]:
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError):
+    except FileNotFoundError:
         return []
+    except (OSError, yaml.YAMLError) as error:
+        if strict:
+            raise InstanceDirectoryError("实例目录暂时不可用") from error
+        return []
+    except UnicodeError as error:
+        if not strict:
+            raise
+        raise InstanceDirectoryError("实例目录暂时不可用") from error
     rows = raw.get("instances") if isinstance(raw, dict) else raw
     if not isinstance(rows, list):
+        if strict:
+            raise InstanceDirectoryError("实例目录格式无效")
         return []
     seen: set[str] = set()
     cleaned: list[dict[str, Any]] = []
     for entry in rows:
+        if strict:
+            if not isinstance(entry, dict) or any(
+                value is not None and not isinstance(value, (str, int))
+                for value in (entry.get("id"), entry.get("uin"), entry.get("label"))
+            ):
+                raise InstanceDirectoryError("实例目录条目无效")
+            _navigation_prefix(entry.get("path"))
         row = _clean(entry)
+        if strict and row is None:
+            raise InstanceDirectoryError("实例目录条目无效")
         # 同一个实例写两条会让切换器多出一个永远点不到的重复项。
         if row and row["id"] not in seen:
             seen.add(row["id"])
@@ -160,9 +198,27 @@ def _read(path: Path) -> list[dict[str, Any]]:
     return cleaned
 
 
-def load_instances(workspace_root: Path) -> list[dict[str, Any]]:
+def load_instances(workspace_root: Path, *, strict: bool = False) -> list[dict[str, Any]]:
     """读共享清单。文件不存在就是单实例部署，空表让前端不必渲染切换器。"""
-    return _read(instances_file(workspace_root))
+    return _read(instances_file(workspace_root), strict=strict)
+
+
+def load_instance_directory(workspace_root: Path) -> dict[str, Any]:
+    current = _navigation_prefix(os.environ.get(_ENV_PREFIX))
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for row in load_instances(workspace_root, strict=True):
+        path = row["path"]
+        if path in seen:
+            continue
+        seen.add(path)
+        label = row["label"]
+        if not path and (label.isdecimal() or label == row["account"]):
+            label = "主实例"
+        entries.append({"label": label, "path": path})
+    if current not in seen:
+        entries.append({"label": current.rsplit("/", 1)[-1] or "主实例", "path": current})
+    return {"current_path": current, "instances": entries}
 
 
 def account_owner_in(

@@ -27,7 +27,7 @@ from . import provisioning, share_groups
 from .config_store import ConfigStore
 from .sticker_api import create_sticker_router
 from .tool_watch import ToolTreeWatch
-from .instances import load_instances, url_prefix
+from .instances import InstanceDirectoryError, load_instance_directory, load_instances, url_prefix
 from .log_access import LogReader
 from .process_manager import ProcessManager
 from .reply_intent import IntentResult, build_instruction as reply_intent_instruction
@@ -2206,6 +2206,16 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(error)) from error
         return {"ok": True, "instance_id": instance_id, "workspace": str(st.workspace_root)}
 
+    @app.get("/v1/instance-directory")
+    async def get_instance_directory(response: Response) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            return load_instance_directory(app.state.state.workspace_root)
+        except InstanceDirectoryError as error:
+            raise HTTPException(
+                status_code=503, detail=str(error), headers={"Cache-Control": "no-store"},
+            ) from error
+
     @app.get("/v1/instances")
     async def list_instances(request: Request) -> dict[str, Any]:
         """控制台实例切换器的数据源。单实例时 instances 为空，前端据此不渲染切换器。"""
@@ -2340,8 +2350,19 @@ def create_app(
         @app.get("/", include_in_schema=False)
         async def web_root(request: Request) -> RedirectResponse:
             """域名直接指到这个端口，根路径不给个去处就只有一个 404。"""
-            # 挂在前缀下时 root_path 是那个前缀；不带上就会跳出本实例。
-            return RedirectResponse(url=f"{request.scope.get('root_path', '')}/web/")
+            root_path = request.scope.get("root_path", "")
+            target = f"{root_path}/web/"
+            query = request.url.query
+            if query:
+                target += f"?{query}"
+            elif not root_path:
+                try:
+                    show_directory = len(load_instance_directory(app.state.state.workspace_root)["instances"]) > 1
+                except InstanceDirectoryError:
+                    show_directory = True
+                if show_directory:
+                    target += "?entry=instances"
+            return RedirectResponse(url=target, headers={"Cache-Control": "no-store"})
 
         app.mount("/web", StaticFiles(directory=str(web_dist), html=True), name="web")
         console_url = f"http://{host}:{port}{url_prefix()}/web/"

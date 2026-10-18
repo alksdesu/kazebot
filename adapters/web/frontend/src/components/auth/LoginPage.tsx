@@ -4,6 +4,7 @@ import { verifyAdminAuth } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
 import { loadEntryNodes, TOKEN_SOURCE_HINT } from './loadEntryNodes';
 import { Button } from '../settings/pages/settingsControls';
+import { InstanceNavigation } from '../instances/InstanceNavigation';
 
 type VerificationMode = 'saved' | 'link' | 'manual';
 const AUTH_TIMEOUT_MS = 10000;
@@ -95,6 +96,7 @@ export const LoginPage = ({ embedded = false }: { embedded?: boolean }) => {
           <img src={`${import.meta.env.BASE_URL}logo-sm.jpg`} alt="" className="h-11 w-11 rounded-lg" />
           <div><h1 id="login-title" className="text-xl font-semibold">Clonoth 控制台</h1><p className="mt-1 text-sm text-[var(--duties-secondary)]">管理对话、任务与机器人</p></div>
         </header>}
+        {!embedded && <div className="mt-5"><InstanceNavigation /><p className="mt-3 text-xs leading-relaxed text-[var(--duties-secondary)]">请使用当前实例的管理员令牌；各实例的登录状态独立保存。</p></div>}
         <form aria-label="管理员登录" className={embedded ? 'space-y-4' : 'mt-6 space-y-4'} onSubmit={event => { event.preventDefault(); void verify(tokenInput, 'manual'); }}>
           <div>
             <label htmlFor="admin-token" className="mb-2 block text-sm font-medium">管理员令牌</label>

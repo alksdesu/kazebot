@@ -2,14 +2,9 @@
 import type { NodeDef, SupervisorEvent } from '../types';
 import { fetchWithDeadline } from './requestDeadline';
 import { commandAction } from '../plugins/commands';
+import { isInstancePath, MOUNT } from '../instances/paths';
 
-/** 本实例挂载的路径前缀。多开时几个号共用一个域名，各自挂在 /i/<号>/ 下。 */
-export const MOUNT = (() => {
-  // lastIndexOf：前缀本身含 web 时（/web/1/web/），从前往后找会截出空串，
-  // 于是这个实例的请求全部打到根实例上去。
-  const at = window.location.pathname.lastIndexOf('/web/');
-  return at > 0 ? window.location.pathname.slice(0, at) : '';
-})();
+export { MOUNT, instanceConsoleHref } from '../instances/paths';
 
 const API = `${MOUNT}/v1`;
 
@@ -815,13 +810,37 @@ export interface ConsoleInstance {
   provisioning?: InstanceProgress;
 }
 
-/**
- * 另一个实例的控制台地址。
- *
- * 换的是后端不是页面，所以只能整页跳；带上 query 才会停在同一页而不是弹回第一页。
- */
-export function instanceConsoleHref(path: string): string {
-  return `${path}/web/${window.location.search}`;
+export interface InstanceDirectoryEntry {
+  label: string;
+  path: string;
+}
+
+export interface InstanceDirectory {
+  current_path: string;
+  instances: InstanceDirectoryEntry[];
+}
+
+export async function getInstanceDirectory(signal?: AbortSignal): Promise<InstanceDirectory> {
+  const response = await fetchWithDeadline(`${API}/instance-directory`, {
+    signal, credentials: 'omit', cache: 'no-store',
+  }, 10_000, true);
+  if (!response.ok) throw new ApiError(response.status, await errorDetail(response));
+  const data = await response.json();
+  if (!data || data.current_path !== MOUNT || !Array.isArray(data.instances)) {
+    throw new Error('实例列表与当前入口不一致，请检查服务配置');
+  }
+  const paths = new Set<string>();
+  const instances: InstanceDirectoryEntry[] = [];
+  for (const item of data.instances) {
+    if (!item || !isInstancePath(item.path) || typeof item.label !== 'string' || !item.label.trim()) {
+      throw new Error('实例列表包含无效地址或名称');
+    }
+    if (paths.has(item.path)) continue;
+    paths.add(item.path);
+    instances.push({ label: item.label, path: item.path });
+  }
+  if (!paths.has(MOUNT)) throw new Error('实例列表缺少当前实例，请检查服务配置');
+  return { current_path: MOUNT, instances };
 }
 
 /** 清单里登记着这个号的实例，本实例也算。比的是平台加账号：别的平台上可以有长得一样的号。 */

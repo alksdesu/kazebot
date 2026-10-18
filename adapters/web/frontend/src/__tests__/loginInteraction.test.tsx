@@ -15,7 +15,10 @@ const mocks = vi.hoisted(() => {
   };
 });
 
-vi.mock('../api/supervisorClient', () => ({ checkAdminAuth: mocks.verify, verifyAdminAuth: mocks.verify, getNodes: mocks.getNodes }));
+vi.mock('../api/supervisorClient', () => ({
+  checkAdminAuth: mocks.verify, verifyAdminAuth: mocks.verify, getNodes: mocks.getNodes,
+  MOUNT: '', getInstanceDirectory: vi.fn().mockResolvedValue({ current_path: '', instances: [{ label: '主实例', path: '' }] }),
+}));
 vi.mock('../components/auth/loadEntryNodes', () => ({ loadEntryNodes: mocks.loadNodes, TOKEN_SOURCE_HINT: '从服务启动信息中获取管理员令牌。' }));
 vi.mock('../store/settingsStore', () => {
   const getState = () => ({ ...mocks.state, setAdminToken: mocks.setToken, setAuthenticated: mocks.setAuthenticated, setAvailableNodes: mocks.setAvailableNodes, setEntryNodeId: mocks.setEntryNodeId });

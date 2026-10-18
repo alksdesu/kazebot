@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 
-import { checkHealth, getActiveNode, resetConversation } from './api/supervisorClient';
+import { checkHealth, getActiveNode, MOUNT, resetConversation } from './api/supervisorClient';
 import { LoginPage } from './components/auth/LoginPage';
 import { Icon, Modal } from './components/common';
 import { PageBoundary } from './components/common/PageBoundary';
@@ -20,6 +20,9 @@ import { useBrowserPlugins } from './plugins/status';
 import { useFrontendPlugins } from './plugins/runtime';
 import { bindCommands, executeCommand } from './plugins/commands';
 import type { LayoutRenderer, SlotRenderer } from './plugins/sdk';
+import { InstanceDirectory } from './components/instances/InstanceDirectory';
+import { InstanceDirectoryProvider, useInstanceDirectory } from './components/instances/useInstanceDirectory';
+import { isInstanceEntry, rememberInstance } from './instances/navigation';
 
 const defaultLayout: LayoutRenderer = (props) => <AppLayout {...props} />;
 extensions.builtin('slots', 'app.layout', defaultLayout);
@@ -163,12 +166,16 @@ const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
   }} />;
 };
 
-const App = () => {
+const ConsoleApp = () => {
   const isAuthenticated = useSettingsStore(state => state.isAuthenticated);
   const viewMode = useViewStore(state => state.viewMode);
+  const directory = useInstanceDirectory();
   usePlatformRegistry();
   useFrontendPlugins();
+  useEffect(() => { if (isAuthenticated && directory.status === 'ready') rememberInstance(MOUNT); }, [isAuthenticated, directory.status]);
   return isAuthenticated ? <MainApp viewMode={viewMode} /> : <LoginPage />;
 };
+
+const App = () => <InstanceDirectoryProvider>{isInstanceEntry() ? <InstanceDirectory /> : <ConsoleApp />}</InstanceDirectoryProvider>;
 
 export default App;

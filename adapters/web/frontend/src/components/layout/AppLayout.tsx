@@ -5,6 +5,7 @@ import { RIGHT_PANEL_DEFAULT_WIDTH, RIGHT_PANEL_MAX_WIDTH, RIGHT_PANEL_MIN_WIDTH
 import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
 import { Icon } from '../common';
+import { InstanceNavigation } from '../instances/InstanceNavigation';
 
 const RESIZE_STEP = 16;
 
@@ -125,6 +126,7 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, nav
     <aside ref={sidebarRef} id="app-navigation" aria-label="主导航" aria-modal={leftOverlay || undefined} role={leftOverlay ? 'dialog' : undefined} tabIndex={-1} hidden={!leftVisible}
       className={`app-sidebar shrink-0 border-r border-[var(--duties-border)] bg-[var(--duties-panel)] ${metrics.sidebar ? 'relative' : 'fixed inset-y-0 left-0 z-40'} ${leftVisible ? 'translate-x-0' : '-translate-x-full'}`}>
       {!metrics.sidebar && <div className="flex justify-end border-b border-[var(--duties-border)] px-2"><button type="button" className="app-icon-button" aria-label="关闭导航" onClick={closeLeft}><Icon name="close" /></button></div>}
+      <InstanceNavigation />
       <div className="min-h-0 flex-1">{sidebar}</div>
     </aside>
     <main id="app-main" className="flex min-w-0 flex-1 flex-col" tabIndex={-1}>
