@@ -18,14 +18,12 @@ from platforms.registry import is_platform_conversation
 
 LEGACY_POLICY_DEFAULTS = {
     "response_policy_enabled": False,
-    "topic_enabled": False,
     "merge_window_sec": 0.0,
     "merge_max_wait_sec": 4.0,
     "reply_budget_per_minute": 6,
 }
 POLICY_DEFAULTS = {
     **LEGACY_POLICY_DEFAULTS,
-    "topic_enabled": True,
     "merge_window_sec": 8.0,
     "merge_max_wait_sec": 10.0,
 }
@@ -46,7 +44,7 @@ def community_path(workspace_root: Path) -> Path:
 
 
 def rekey_community(path: Path, rekey: ConversationRekey, *, apply: bool) -> RekeyCount:
-    """群协作跟着会话走：安静时段、接话设置、活动、通知和话题都挂到新会话键；目标原有的会话设置被源会话的顶掉。"""
+    """群协作跟着会话走：安静时段、接话设置、活动、通知和旧消息记录都挂到新会话键。"""
     if not rekey or not Path(path).exists():
         return RekeyCount()
     with sqlite_rekey_transaction(Path(path), apply=apply) as db:
@@ -221,6 +219,8 @@ class CommunityService:
         parsed = {}
         allowed = POLICY_FIELDS if policy_only else DEFAULT_SETTINGS
         for key, value in values.items():
+            if key == "topic_enabled":
+                continue
             if key not in allowed:
                 raise ValueError(f"未知对话设置：{key}")
             if isinstance(DEFAULT_SETTINGS[key], bool):
@@ -259,11 +259,11 @@ class CommunityService:
                 raise ValueError("请提供有效的非负整数设置版本")
         values = cls._parse_values(body.get("values", {}))
         reset = body.get("reset_fields", [])
-        if not isinstance(reset, list) or any(not isinstance(key, str) or key not in POLICY_FIELDS for key in reset):
+        if not isinstance(reset, list) or any(not isinstance(key, str) or key not in (*POLICY_FIELDS, "topic_enabled") for key in reset):
             raise ValueError("恢复继承字段必须是接话策略字段列表")
         if len(set(reset)) != len(reset) or set(reset) & set(values):
             raise ValueError("恢复继承字段不能重复，也不能同时设置和恢复同一字段")
-        return values, reset
+        return values, [key for key in reset if key != "topic_enabled"]
 
     @classmethod
     def _defaults_in(cls, db) -> dict:
@@ -629,29 +629,9 @@ class CommunityService:
         return {"ok": True}
 
     def ingest(self, actor, body: dict) -> dict:
-        scope = self._scope(actor)
+        self._scope(actor)
         actor.require_interaction()
-        state = self.state(actor)
-        if not state["settings"]["topic_enabled"]:
-            return {"topic_id": "", "context": []}
-        ref = str(body.get("message_id") or actor.message_id or "")
-        if not ref:
-            raise ValueError("话题消息需要真实消息标识")
-        reply_ref = str(body.get("reply_ref") or "")
-        bound_topic = self._text(body.get("topic_id"), 100) if actor.is_admin else ""
-        now = time.time()
-        with self._db(True) as db:
-            existing = db.execute("SELECT topic FROM messages WHERE scope=? AND ref=?", (scope, ref)).fetchone()
-            parent = db.execute("SELECT topic FROM messages WHERE scope=? AND ref=?", (scope, reply_ref)).fetchone() if reply_ref else None
-            recent = db.execute("SELECT topic FROM messages WHERE scope=? AND owner=? AND created>? ORDER BY created DESC LIMIT 1", (scope, actor.owner, now - 180)).fetchone()
-            topic = existing[0] if existing else bound_topic or (parent[0] if parent else recent[0] if recent and not reply_ref else uuid.uuid4().hex[:12])
-            text = self._text(body.get("text"), 20000)
-            label = self._text(body.get("sender_name"), 100) or "成员"
-            db.execute("INSERT OR IGNORE INTO messages VALUES (?,?,?,?,?,?,?,?)", (scope, ref, actor.owner, label, text, reply_ref, topic, now))
-            db.execute("DELETE FROM messages WHERE scope=? AND created<?", (scope, now - 21600))
-            db.execute("DELETE FROM messages WHERE scope=? AND ref NOT IN (SELECT ref FROM messages WHERE scope=? ORDER BY created DESC LIMIT 500)", (scope, scope))
-            rows = db.execute("SELECT ref,label,text,reply_ref FROM messages WHERE scope=? AND topic=? ORDER BY created DESC LIMIT 12", (scope, topic)).fetchall()
-        return {"topic_id": topic, "context": [dict(row) for row in reversed(rows)], "reply_ref": ref}
+        return {"topic_id": "", "context": []}
 
     def record_decision(self, actor, body: dict) -> dict:
         scope = self._scope(actor)
@@ -659,8 +639,7 @@ class CommunityService:
         if action not in {"ignore", "react", "short_reply", "task", "reply"}:
             raise ValueError("无效回应动作")
         ref = str(actor.message_id or body.get("message_id") or "")
-        decision = {"action": action, "reason": self._text(body.get("reason"), 200),
-                    "topic_id": str(body.get("topic_id") or ""), "message_id": ref}
+        decision = {"action": action, "reason": self._text(body.get("reason"), 200), "message_id": ref}
         with self._db(True) as db:
             db.execute("INSERT OR REPLACE INTO decisions VALUES (?,?,?,?)", (scope, ref, self._dump(decision), time.time()))
             db.execute("DELETE FROM decisions WHERE scope=? AND ref NOT IN (SELECT ref FROM decisions WHERE scope=? ORDER BY created DESC LIMIT 100)", (scope, scope))
@@ -670,4 +649,5 @@ class CommunityService:
         scope = self._scope(actor)
         actor.require_manager(scope)
         with self._db() as db:
-            return [json.loads(row[0]) for row in db.execute("SELECT data FROM decisions WHERE scope=? ORDER BY created DESC LIMIT 100", (scope,))]
+            return [{key: value for key, value in json.loads(row[0]).items() if key != "topic_id"}
+                    for row in db.execute("SELECT data FROM decisions WHERE scope=? ORDER BY created DESC LIMIT 100", (scope,))]

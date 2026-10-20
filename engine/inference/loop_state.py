@@ -174,6 +174,7 @@ def compact_target_session_id(ls: _LoopState) -> str:
 TOOL_CONTEXT_EXTRA_ATTRS: tuple[str, ...] = (
     "_node_id", "_node_extra", "_memory_subjects",
     "_route_conversation_key", "_parent_conversation_key",
+    "_context_archive_session_id",
 )
 
 
@@ -201,6 +202,7 @@ def build_tool_context(ls: _LoopState, *, tool_call_id: str = "") -> ToolContext
     # 插件（如 save_memory）从 node.extra 读节点级配置，不必再读一遍 yaml
     ctx._node_id = ls.node.id  # type: ignore[attr-defined]
     ctx._node_extra = ls.node.extra  # type: ignore[attr-defined]
+    ctx._context_archive_session_id = compact_target_session_id(ls)
     # 注入了谁的跨会话档案，就得让记忆工具够得着那份档案 —— 否则模型只改 content
     # 的一次更新会在会话 namespace 里新长一条，读的时候又被档案那份去重盖掉。
     ctx._memory_subjects = list(  # type: ignore[attr-defined]

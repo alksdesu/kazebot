@@ -533,6 +533,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             "task_created", "task_started", "task_completed", "task_cancelled",
             "task_cancel_requested", "task_requeued", "task_suspended",
             "task_resumed", "task_route_failed", "task_branch_finalized", "task_routed",
+            "task_context_compacted",
         }
         snapshots: dict[str, dict[str, Any]] = {}
         order: list[str] = []
@@ -554,12 +555,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 and isinstance(previous, dict)
                 and isinstance(previous.get("input"), dict)
             ):
-                preserved_input = dict(previous["input"])
-                preserved_input.update({
-                    key: value for key, value in raw_input.items()
-                    if key != "_input_slimmed"
-                })
-                merged["input"] = preserved_input
+                merged["input"] = self._merge_slim_task_input(previous["input"], raw_input)
             snapshots[task_id] = merged
             if task_id not in order:
                 order.append(task_id)
@@ -960,6 +956,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 "task_created", "task_started", "task_completed", "task_cancelled",
                 "task_cancel_requested", "task_requeued", "task_suspended",
                 "task_resumed", "task_route_failed", "task_branch_finalized", "task_routed",
+                "task_context_compacted",
             }:
                 self._apply_task_snapshot(payload)
             elif et == "context_reset":

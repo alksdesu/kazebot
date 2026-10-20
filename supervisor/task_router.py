@@ -778,6 +778,7 @@ class TaskRouterMixin:
 
     def _execute_branch_finalize_io_body(self, plan: BranchFinalizePlan) -> int:
         """Idempotently merge and delete branch files without Supervisor._lock."""
+        from engine.branch_history import branch_base_count
         from engine.conversation_store import ConversationStore
 
         merged_count = 0
@@ -789,7 +790,8 @@ class TaskRouterMixin:
         )
         if plan.merge and not session_reset:
             branch_messages = list(store.load(plan.branch_session_id))
-            tail = branch_messages[plan.base_count:]
+            base_count = branch_base_count(branch_messages, plan.branch_session_id, plan.base_count)
+            tail = branch_messages[base_count:]
             parent_ids = {str(getattr(message, "id", "") or "") for message in store.load(plan.parent_session_id)}
             missing = [
                 message for message in tail
@@ -825,13 +827,7 @@ class TaskRouterMixin:
                             stream.write(line + "\n")
 
         for session_id in plan.cleanup_session_ids:
-            store.delete(session_id)
-            transcript_path = self.workspace_root / "data" / "transcripts" / f"{session_id}.jsonl"
-            try:
-                if transcript_path.exists():
-                    transcript_path.unlink()
-            except FileNotFoundError:
-                pass
+            self.purge_session_files(session_id)
         return merged_count
 
     def _commit_branch_finalize_indexes_locked(self, plan: BranchFinalizePlan):
@@ -1303,6 +1299,15 @@ class TaskRouterMixin:
             ).strip()
             if compact_target_session_id:
                 task.input["_compact_target_session_id"] = compact_target_session_id
+            context_ref = str(action.get("context_ref") or task.input.get("context_ref") or "")
+            plan, instruction = self._prepare_compact_input_locked(
+                compact_target_session_id, task.input, context_ref=context_ref,
+            )
+            if not plan or self.compact_breaker.is_open(compact_target_session_id):
+                self._resume_compact_parent_locked(task, context_ref, success=False)
+                return
+            task.input["_compact_plan"] = plan
+            dispatch_input["instruction"] = instruction
 
         created_child_ids: list[str] = []
         # [Fork/Merge 2026-05-17] Why: descendants of an entry branch should keep
@@ -1329,6 +1334,7 @@ class TaskRouterMixin:
                         # 独立 tool task 不走 ai_step 那道白名单，engine 侧要能查出
                         # 是谁派的才复核得了；缺这一项就没有可依据的授权表。
                         "origin_node_id": str(task.node_id or ""),
+                        "_context_archive_session_id": str(task.input.get("child_session_id") or route_parent_session_id or task.session_id),
                     }
                     if route_parent_for_child:
                         # [Fork/Merge 2026-05-17] Why: batch tool tasks inherit
@@ -1732,7 +1738,7 @@ class TaskRouterMixin:
             "child_node_id": node_id,
         }
         hints = (task.input.get("task_context") or {}).get("route_hints") or {}
-        for key in ("delivery_purpose", "topic_id", "reply_message_id"):
+        for key in ("delivery_purpose", "reply_message_id"):
             if key in hints:
                 payload[key] = hints[key]
         if attachment_delivery_id:
@@ -2125,7 +2131,7 @@ class TaskRouterMixin:
                     payload["task_id"] = event_task_id
                     origin = self.tasks.get(event_task_id)
                     hints = ((origin.input.get("task_context") or {}).get("route_hints") or {}) if origin else {}
-                    for key in ("delivery_purpose", "topic_id", "reply_message_id"):
+                    for key in ("delivery_purpose", "reply_message_id"):
                         if key in hints:
                             payload[key] = hints[key]
                 tool = str(tool_name or "").strip()
@@ -2317,231 +2323,222 @@ class TaskRouterMixin:
             prompt_chars = total_content_chars(messages)
         return observed_chars_per_token(prompt_chars, prompt_tokens)
 
-    def _emergency_compact_summary(self, target_session_id: str) -> str:
-        """Build a replacement summary from per-task records when the compactor failed.
+    def _apply_snip_via_conv_store_locked(self, session_id: str, task_ids: set[str]) -> dict[str, Any]:
+        from engine.compaction_plan import record_fingerprint, record_task_id
+        from engine.context_archive import ContextArchiveStore
+        from engine.conversation_store import ConversationChangedError, ConversationStore
+        from engine.task_record import load_task_records, safe_snip_task_ids, snip_store
 
-        压缩器失败时旧的做法是拿一句固定道歉替掉十几个任务段 —— 数据照删、摘要为零。
-        TaskRecord 里已经存了每个任务的摘要，拼起来至少能留住发生过什么。
-        """
-        header = "[上下文压缩摘要生成失败，以下为各任务的既有摘要]"
-        try:
-            from engine.task_record import load_task_records
+        records = load_task_records(self.workspace_root, session_id)
+        summarized_ids = {
+            record.task_id for record in records
+            if isinstance(record.summary, str) and record.summary.strip()
+        }
+        for _ in range(3):
+            store = ConversationStore(self.workspace_root / "data" / "conversations")
+            messages = store.load(session_id)
+            already_snipped = {
+                record_task_id(message) for message in messages
+                if message.message_type == "summary" or (
+                    isinstance(message.content, str) and message.content.startswith("[Task summary — original messages snipped]")
+                )
+            }
+            eligible = (task_ids & summarized_ids & {record_task_id(message) for message in messages}) - already_snipped
+            eligible = safe_snip_task_ids(messages, eligible)
+            if not eligible:
+                return {"applied": False, "reason": "no eligible task summaries"}
+            selected = [
+                {"index": index, "fingerprint": record_fingerprint(message)}
+                for index, message in enumerate(messages) if record_task_id(message) in eligible
+            ]
+            plan = {
+                "version": 1, "source_length": len(messages), "indexed_records": selected,
+                "fingerprints": [item["fingerprint"] for item in selected],
+            }
+            compressed = snip_store(messages, records, eligible)
+            ContextArchiveStore(self.workspace_root).archive(session_id, messages, reason="task_snip")
+            try:
+                store.replace_all(session_id, compressed)
+            except ConversationChangedError:
+                continue
+            summaries = {
+                record_task_id(message): message for message in compressed
+                if record_task_id(message) in eligible and message.message_type == "summary"
+            }
+            synchronized = self._sync_snip_to_branches(session_id, plan, summaries)
+            return {
+                "applied": synchronized, "before": len(messages), "after": len(compressed),
+                "snipped_tasks": len(eligible),
+                "snipped_task_ids": sorted(eligible),
+            }
+        return {"applied": False, "reason": "conversation changed during task compaction"}
 
-            records = load_task_records(self.workspace_root, target_session_id)
-        except Exception as load_error:
-            log.warning("emergency compact summary: task records unavailable: %s", load_error)
-            records = []
+    def _sync_snip_to_branches(self, session_id: str, plan: dict[str, Any], summaries: dict[str, Any]) -> bool:
+        from engine.branch_history import branch_base_count, mark_branch_boundary, without_branch_boundary
+        from engine.compaction_plan import covered_indices, record_task_id
+        from engine.context_archive import ContextArchiveStore
+        from engine.conversation_store import ConversationChangedError, ConversationStore
 
-        lines: list[str] = []
-        for record in records:
-            text = str(getattr(record, "summary", "") or "").strip()
-            if text:
-                lines.append(f"- {text}")
-        if not lines:
-            return "[上下文压缩摘要生成失败，旧消息已被裁剪以恢复服务]"
-        return header + "\n\n" + "\n".join(lines[-40:])
+        branches: dict[str, list[Task]] = {}
+        for task in list(self.tasks.values()):
+            if self._task_terminal(task) or task.input.get("parent_session_id") != session_id:
+                continue
+            branch_id = str(task.input.get("branch_session_id") or "")
+            if branch_id:
+                branches.setdefault(branch_id, []).append(task)
+        synchronized = True
+        for branch_id, tasks in branches.items():
+            try:
+                for attempt in range(3):
+                    store = ConversationStore(self.workspace_root / "data" / "conversations")
+                    messages = store.load(branch_id)
+                    base_count = branch_base_count(
+                        messages, branch_id, max(int(task.input.get("base_count") or 0) for task in tasks),
+                    )
+                    if base_count <= 0 or base_count > len(messages):
+                        synchronized = False
+                        break
+                    prefix = without_branch_boundary(messages[:base_count], branch_id)
+                    indices = covered_indices(prefix, plan)
+                    if indices is None:
+                        synchronized = False
+                        break
+                    selected = set(indices)
+                    replaced = []
+                    seen: set[str] = set()
+                    for index, message in enumerate(prefix):
+                        if index not in selected:
+                            replaced.append(message)
+                            continue
+                        task_id = record_task_id(message)
+                        if task_id not in seen:
+                            replaced.append(summaries[task_id])
+                            seen.add(task_id)
+                    ContextArchiveStore(self.workspace_root).archive(session_id, messages, reason="branch_task_snip")
+                    try:
+                        store.replace_all(
+                            branch_id,
+                            mark_branch_boundary(replaced + messages[base_count:], branch_id, len(replaced)),
+                        )
+                    except ConversationChangedError:
+                        if attempt == 2:
+                            raise
+                        continue
+                    for task in tasks:
+                        task.input["base_count"] = len(replaced)
+                        task.input["base_last_id"] = replaced[-1].id if replaced else ""
+                        task.updated_at = _now()
+                        self._event_task_snapshot("task_context_compacted", task)
+                    break
+            except Exception:
+                synchronized = False
+                log.exception("task summary branch sync failed: %s", branch_id)
+        return synchronized
+
+    def _prepare_compact_input_locked(
+        self, session_id: str, source: dict[str, Any], *, context_ref: str = "",
+    ) -> tuple[dict[str, Any], str]:
+        from clonoth_runtime import load_runtime_config
+        from engine.compaction_plan import build_compaction_plan
+        from engine.context_store import load_context_snapshot
+        from engine.conversation_store import ConversationStore
+
+        config = load_runtime_config(self.workspace_root)
+        use_store = bool(config.get("engine", {}).get("child_session", {}).get("main_session_enabled", True))
+        if use_store or not context_ref:
+            messages = ConversationStore(self.workspace_root / "data" / "conversations").load(session_id)
+            storage = "conversation"
+        else:
+            messages = (load_context_snapshot(self.workspace_root, context_ref) or {}).get("messages") or []
+            storage = "snapshot"
+        plan, instruction = build_compaction_plan(
+            messages, chars_per_token=self._session_chars_per_token(session_id, messages),
+            **self._compact_sizing(source),
+        )
+        if plan:
+            plan.update(session_id=session_id, storage=storage, context_ref=context_ref)
+        return plan, instruction
 
     def _apply_async_compact_result_locked(self, task: Task) -> None:
-        """Apply a background compaction result; there is no caller to resume.
-
-        与同步路径的区别只有两点：没有 caller 需要 resume，也没有旧 snapshot 分支
-        （后台压缩只在 ConversationStore 模式下发起）。摘要校验、应急兜底、熔断
-        记账都复用同一套。
-        """
         from engine.compact import _format_compact_summary
 
-        target_session_id = str(task.input.get("_compact_target_session_id") or "").strip()
-        if not target_session_id:
-            log.warning("async compact result without target session: task=%s", task.task_id[:8])
+        target = str(task.input.get("_compact_target_session_id") or "")
+        plan = task.input.get("_compact_plan") or {}
+        result = task.result or {}
+        summary = _format_compact_summary(str((result.get("result") or {}).get("text") or "")) if result.get("action") == "finish" else ""
+        if not target or not summary or not plan:
+            if target:
+                self.compact_breaker.record_failure(target)
             return
-
-        sizing = self._compact_sizing(task.input)
-        act = str((task.result or {}).get("action") or "").strip()
-        summary = ""
-        if act == "finish":
-            raw_summary = str(((task.result or {}).get("result") or {}).get("text") or "").strip()
-            summary = _format_compact_summary(raw_summary)
-
-        emergency = not summary
-        if emergency:
-            self.compact_breaker.record_failure(target_session_id)
-            summary = self._emergency_compact_summary(target_session_id)
-            log.warning(
-                "async compact fell back to task-record summary: task=%s action=%s",
-                task.task_id[:8], act or "?",
-            )
-
         try:
-            cr = self._apply_compact_via_conv_store_locked(target_session_id, summary, **sizing)
-        except Exception as apply_error:
-            log.warning("async compact apply failed: %s", apply_error)
-            return
-        if not emergency and cr["after"] < cr["before"]:
-            self.compact_breaker.record_success(target_session_id)
-
-        log.info(
-            "async compact applied session=%s before=%d after=%d kept_segments=%d",
-            target_session_id, cr["before"], cr["after"], cr["kept_segments"],
-        )
+            counts = self._apply_compact_via_conv_store_locked(
+                target, summary, plan=plan, **self._compact_sizing(task.input),
+            )
+            if counts.get("applied"):
+                self.compact_breaker.record_success(target)
+        except Exception:
+            self.compact_breaker.record_failure(target)
+            log.exception("async compact apply failed: %s", target)
 
     def _apply_compact_result_locked(self, task: Task) -> None:
-        """compactor 完成后，对父 task 的上下文执行压缩并恢复父 task。
-
-        Step 2（2026-04-16）：支持两条路径。
-        - ConversationStore 路径：caller 是主节点（flag 开启）或子节点（有 child_session_id），
-          直接操作 data/conversations/{target}.jsonl，用 summary 消息替换中间部分。
-        - 旧 snapshot 路径：flag 关闭时的主节点，沿用 caller.input.context_ref 读写。
-        """
-        from engine.compact import _format_compact_summary, apply_compact_summary
+        from datetime import datetime, timezone
+        from engine.compact import _format_compact_summary, total_content_chars
+        from engine.compaction_plan import archive_hint, fully_covered_task_ids, covered_indices, replace_covered
+        from engine.context_archive import ContextArchiveStore
         from engine.context_store import load_context_snapshot, write_context_snapshot
 
-        caller_id = task.caller_task_id
-        caller = self.tasks.get(caller_id)
+        caller = self.tasks.get(task.caller_task_id)
         if not caller or caller.status != TaskStatus.suspended:
             return
-
-        act = str((task.result or {}).get("action") or "").strip()
-        parent_ctx_ref = str(
-            caller.result.get("context_ref")
-            or caller.input.get("context_ref")
-            or ""
-        ).strip()
-
-        # ---- 选择压缩路径 ----
-        # 1. caller 提供 _compact_target_session_id / parent_session_id → ConversationStore（父 session）
-        # 2. caller 无 parent 但 main_session_enabled → ConversationStore（当前 session）
-        # 3. 否则 → 旧 snapshot 路径
-        from clonoth_runtime import load_runtime_config
-        _rc = load_runtime_config(self.workspace_root)
-        _main_conv_enabled = bool(
-            _rc.get("engine", {}).get("child_session", {}).get("main_session_enabled", True)
-        )
- 
-        target_sid_for_conv = str(
-            caller.input.get("_compact_target_session_id")
-            or caller.input.get("target_session_id")
-            or caller.input.get("parent_session_id")
-            or ""
-        ).strip()
-        if not target_sid_for_conv and _main_conv_enabled:
-            # Step 2 修复：main_session_enabled=true 时无条件走 ConvStore 路径。
-            # 原条件 `and not parent_ctx_ref` 会被 _persist_ctx 写入的 context_ref 拦住，
-            # 导致 compact 走旧 snapshot 路径，而 runner.py 已改为从 JSONL 读取——读写不一致。
-            target_sid_for_conv = caller.session_id
-
-        if act == "finish":
-            result = (task.result or {}).get("result") or {}
-            raw_summary = str(result.get("text") or "").strip()
-            summary = _format_compact_summary(raw_summary)
-
-            # --- Circuit breaker + emergency truncation ---
-            # If summary was rejected (empty), record failure for circuit breaker
-            # AND perform emergency segment truncation to break the loop.
-            if not summary and target_sid_for_conv:
-                self.compact_breaker.record_failure(target_sid_for_conv)
-                # Emergency truncation: even without a valid summary, force-remove
-                # old segments to break the compact loop.
-                _emergency_summary = self._emergency_compact_summary(target_sid_for_conv)
-                try:
-                    cr = self._apply_compact_via_conv_store_locked(
-                        target_sid_for_conv, _emergency_summary,
-                        **self._compact_sizing(caller.input),
-                    )
-                    if cr["after"] < cr["before"]:
-                        log.warning(
-                            "compact: emergency truncation applied (summary rejected), "
-                            "before=%d after=%d", cr["before"], cr["after"],
-                        )
-                        self._resume_compact_parent_locked(
-                            caller, parent_ctx_ref,
-                            compact_result=cr, success=True,
-                        )
-                        return
-                except Exception as _et:
-                    log.warning("compact: emergency truncation failed: %s", _et)
-                # If emergency truncation didn't help, fall through to failure path
-
-            if summary and target_sid_for_conv:
-                # ---- ConversationStore 路径 ----
-                cr = self._apply_compact_via_conv_store_locked(
-                    target_sid_for_conv, summary, **self._compact_sizing(caller.input),
+        context_ref = str(caller.result.get("context_ref") or caller.input.get("context_ref") or "")
+        plan = caller.input.get("_compact_plan") or {}
+        target = str(plan.get("session_id") or caller.input.get("_compact_target_session_id") or caller.session_id)
+        result = task.result or {}
+        summary = _format_compact_summary(str((result.get("result") or {}).get("text") or "")) if result.get("action") == "finish" else ""
+        counts = None
+        success = False
+        try:
+            if summary and plan and plan.get("storage") == "conversation":
+                counts = self._apply_compact_via_conv_store_locked(
+                    target, summary, plan=plan, **self._compact_sizing(caller.input),
                 )
-                if cr["after"] < cr["before"]:
-                    self.compact_breaker.record_success(target_sid_for_conv)
-                    self._resume_compact_parent_locked(
-                        caller, parent_ctx_ref,
-                        compact_result=cr, success=True,
-                    )
-                    return
-                # before == after：消息太少未压缩，静默恢复
-                self._resume_compact_parent_locked(
-                    caller, parent_ctx_ref,
-                    compact_result=cr, success=False,
-                )
-                return
-
-            if summary and parent_ctx_ref:
-                # ---- 旧 snapshot 路径（flag 关闭时的主节点）----
-                snapshot = load_context_snapshot(self.workspace_root, parent_ctx_ref)
-                if snapshot and isinstance(snapshot.get("messages"), list):
-                    old_messages = snapshot["messages"]
-                    compressed = apply_compact_summary(
-                        old_messages, summary,
-                        chars_per_token=self._session_chars_per_token(caller.session_id, old_messages),
-                        **self._compact_sizing(caller.input),
-                    )
-                    if len(compressed) < len(old_messages):
+                success = bool(counts.get("applied"))
+            elif summary and plan and plan.get("storage") == "snapshot" and context_ref:
+                snapshot = load_context_snapshot(self.workspace_root, context_ref)
+                messages = (snapshot or {}).get("messages") or []
+                indices = covered_indices(messages, plan)
+                if indices:
+                    archive = ContextArchiveStore(self.workspace_root).archive(target, messages, reason="snapshot_compaction")
+                    summary_message = {
+                        "role": "user",
+                        "content": "[以下是之前对话的结构化摘要，原始上下文已被压缩]\\n\\n" + summary + archive_hint(archive["archive_id"]),
+                        "_meta": {
+                            "source_task_id": "compact_summary", "message_type": "summary",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "compressed_task_ids": fully_covered_task_ids(messages, indices),
+                            "archive_id": archive["archive_id"],
+                        },
+                    }
+                    compressed = replace_covered(messages, plan, summary_message)
+                    success = len(compressed) < len(messages) or total_content_chars(compressed) < total_content_chars(messages)
+                    if success:
                         snapshot["messages"] = compressed
-                        write_context_snapshot(
-                            self.workspace_root, parent_ctx_ref, snapshot,
-                        )
-                        self.compact_breaker.record_success(caller.session_id)
-                        self._resume_compact_parent_locked(
-                            caller, parent_ctx_ref,
-                            before=len(old_messages),
-                            after=len(compressed),
-                            success=True,
-                        )
-                        return
-
-        # ---- 失败路径 ----
-        # [2026-07-16] Why: compactor 子 task 以 action=fail 结束时（例如
-        # 压缩模型 404 / 不可用），act != "finish"，会直接落到这里静默恢复父 task，
-        # 但从未调用 record_compact_failure，导致熔断器计数永远为 0、is_compact_circuit_open
-        # 恒为 False，父 task 恢复后上下文未变小又立即再次 dispatch 压缩，形成死循环
-        # How: 在失败路径同样对 compact target session 记一次失败；累计到
-        # _MAX_CONSECUTIVE_FAILURES 后 _check_and_compact 会跳过压缩。并复用
-        # 与「finish 但 summary 为空」分支相同的应急截断，尽力打破死循环。
-        # Purpose: 压缩模型偶发/持续失败时不再无限重试拖垮群聊主任务。
-        if target_sid_for_conv:
-            self.compact_breaker.record_failure(target_sid_for_conv)
-            _emergency_summary = self._emergency_compact_summary(target_sid_for_conv)
-            try:
-                cr = self._apply_compact_via_conv_store_locked(
-                    target_sid_for_conv, _emergency_summary,
-                    **self._compact_sizing(caller.input),
-                )
-                if cr["after"] < cr["before"]:
-                    log.warning(
-                        "compact: emergency truncation applied (compactor action=%s), "
-                        "before=%d after=%d", act or "?", cr["before"], cr["after"],
-                    )
-                    self._resume_compact_parent_locked(
-                        caller, parent_ctx_ref,
-                        compact_result=cr, success=True,
-                    )
-                    return
-            except Exception as _et:
-                log.warning("compact: emergency truncation failed on fail-path: %s", _et)
-
-        # 静默恢复父 task
+                        write_context_snapshot(self.workspace_root, context_ref, snapshot)
+                        counts = {"before": len(messages), "after": len(compressed), "applied": True}
+        except Exception:
+            log.exception("compact apply failed: %s", target)
+        if success:
+            self.compact_breaker.record_success(target)
+        elif not summary:
+            self.compact_breaker.record_failure(target)
         self._resume_compact_parent_locked(
-            caller, parent_ctx_ref, success=False,
+            caller, context_ref, compact_result=counts, success=success,
         )
 
     def _apply_compact_via_conv_store_locked(
         self, target_session_id: str, summary: str, *, keep_recent: int,
         threshold_tokens: int = 256000, keep_recent_tokens: int = 0,
+        plan: dict[str, Any] | None = None,
     ) -> dict[str, int]:
         from engine.conversation_store import ConversationChangedError, ConversationStore
 
@@ -2550,323 +2547,113 @@ class TaskRouterMixin:
                 return self._apply_compact_via_conv_store_once_locked(
                     target_session_id, summary, keep_recent=keep_recent,
                     threshold_tokens=threshold_tokens, keep_recent_tokens=keep_recent_tokens,
+                    plan=plan,
                 )
             except ConversationChangedError:
                 continue
-        log.info("compact deferred while conversation is changing: %s", target_session_id)
         count = ConversationStore(self.workspace_root / "data" / "conversations").message_count(target_session_id)
-        return {
-            "before": count, "after": count,
-            "total_segments": 0, "kept_segments": 0, "compressed_segments": 0,
-        }
+        return {"before": count, "after": count, "total_segments": 0, "kept_segments": 0, "compressed_segments": 0, "applied": False}
 
     def _apply_compact_via_conv_store_once_locked(
         self, target_session_id: str, summary: str, *, keep_recent: int,
         threshold_tokens: int = 256000, keep_recent_tokens: int = 0,
+        plan: dict[str, Any] | None = None,
     ) -> dict[str, int]:
-        """Step 2（2026-04-16）：在 ConversationStore 层面执行压缩。
-
-        读取 target session 的 JSONL，用 summary 消息替换旧 task segment，保留
-        最近 keep_recent 个完整 task segment。与 engine.compact.apply_compact_summary
-        的策略一致，但直接操作 Message 对象而非 dict。
-
-        注意 ConversationStore 里没有 system 消息（system prompt 每轮由 ai_step
-        的 assemble_initial_messages 重建），所以无需处理 prefix/inner system。
-
-        Returns: dict with keys: before, after, total_segments, kept_segments, compressed_segments
-        """
         from uuid import uuid4
         from datetime import datetime, timezone
+        from engine.compaction_plan import archive_hint, fully_covered_task_ids, covered_indices, replace_covered
+        from engine.compact import total_content_chars
+        from engine.context_archive import ContextArchiveStore
         from engine.conversation_store import ConversationStore, Message, MessageType
 
         store = ConversationStore(self.workspace_root / "data" / "conversations")
-        msgs = store.load(target_session_id)
-        before = len(msgs)
-        chars_per_token = self._session_chars_per_token(target_session_id, msgs)
-
-        # [AutoC 2026-05-13] Why: ConversationStore stores Message objects, while
-        # engine.compact.apply_compact_summary works on dict history. How: read
-        # task ids through Message attributes and meta, then split only when the
-        # consecutive source_task_id changes. Purpose: keep recent task segments
-        # complete instead of slicing by raw message count.
-        # [2026-05-17] Split messages into task segments, but treat old
-        # compact_summary segments as "prefix" rather than a real task segment.
-        # Old summaries should be replaced alongside other old segments, not
-        # counted toward keep_recent (which would cause an infinite loop where
-        # the old summary is deleted and recreated each cycle with no net change).
-        prefix_msgs: list[Any] = []  # old compact_summary messages
-        segments: list[list[Any]] = []
-        cur_seg: list[Any] = []
-        cur_tid: str = ""
-        for msg in msgs:
-            meta = msg.meta if isinstance(getattr(msg, "meta", None), dict) else {}
-            tid = str(meta.get("source_task_id", "") or getattr(msg, "source_task_id", "") or "")
-            if tid == "compact_summary":
-                # [2026-05-17] Why: an old compact_summary is compressed prefix
-                # material, not a task boundary. How: collect it for replacement
-                # and keep the current real segment open. Purpose: the old summary
-                # is fed into the next summary and never consumes keep_recent.
-                prefix_msgs.append(msg)
-                continue
-            if tid != cur_tid and cur_seg:
-                segments.append(cur_seg)
-                cur_seg = []
-            cur_tid = tid
-            cur_seg.append(msg)
-        if cur_seg:
-            segments.append(cur_seg)
-
-        # keep_recent applies to real task segments only (prefix excluded)
-        # keep_recent_tokens > 0 时保留量按 token 算：从最后一段往前累加到预算为止。
-        # 仍然切在段边界上，否则 assistant 的 tool_call 会和它的 tool_result 分家。
-        if keep_recent_tokens > 0:
-            from engine.compact import segments_within_token_budget
-
-            keep_recent = segments_within_token_budget(segments, keep_recent_tokens, chars_per_token)
-        keep_recent = max(keep_recent, 1)
-        if len(segments) <= keep_recent:
-            return {"before": before, "after": before, "total_segments": len(segments), "kept_segments": len(segments), "compressed_segments": 0}
-
-        kept_segments = segments[-keep_recent:]
-        to_remove_segments = segments[:-keep_recent]
-
-        to_keep: list[Any] = []
-        for seg in kept_segments:
-            to_keep.extend(seg)
-
-        to_remove: list[Any] = list(prefix_msgs)  # old summaries are always replaced
-        for seg in to_remove_segments:
-            to_remove.extend(seg)
-
-        # 收集被压缩掉的消息所属的 source_task_id，
-        # 存入 summary 消息的 meta 中。L2 snip_history 据此判断哪些 task 已被
-        # LLM 压缩过，避免因 ID 丢失而反复 fall through 到 LLM compact。
-        # [2026-04-26] 累积继承：旧 compact_summary 被再次压缩时，
-        # 继承其 meta.compressed_task_ids，防止历史 ID 丢失。
-        _ctid_set: set[str] = set()
-        for _rm in to_remove:
-            _rm_meta = _rm.meta if isinstance(getattr(_rm, "meta", None), dict) else {}
-            _rm_tid = str(_rm_meta.get("source_task_id", "") or getattr(_rm, "source_task_id", "") or "")
-            if _rm_tid and _rm_tid != "compact_summary":
-                _ctid_set.add(_rm_tid)
-            _old_ctids = _rm_meta.get("compressed_task_ids")
-            if isinstance(_old_ctids, list):
-                for _ctid in _old_ctids:
-                    if _ctid:
-                        _ctid_set.add(str(_ctid))
-        compressed_task_ids = list(_ctid_set)
-
-        summary_msg = Message(
-            id=str(uuid4()),
-            role="user",
-            content="[以下是之前对话的结构化摘要，原始上下文已被压缩]\n\n" + summary,
-            message_type=MessageType.SUMMARY,
-            created_at=datetime.now(timezone.utc).isoformat(),
-            source_task_id="compact_summary",
-            meta={"compressed_task_ids": compressed_task_ids},
-        )
-        new_messages = [summary_msg] + to_keep
-
-        # --- Progressive keep_recent reduction ---
-        # If the compressed result still exceeds the token threshold,
-        # drop older kept segments one at a time until we fit or reach 0.
-        # Estimate tokens as total chars / 3 (mixed CJK/English).
-        _threshold = threshold_tokens
-        try:
-            from engine.compact import total_content_chars
-
-            _total_chars = total_content_chars(new_messages)
-            while keep_recent > 0 and _total_chars / chars_per_token > _threshold:
-                keep_recent -= 1
-                if keep_recent > 0:
-                    kept_segments = segments[-keep_recent:]
-                else:
-                    kept_segments = []
-                to_keep = []
-                for seg in kept_segments:
-                    to_keep.extend(seg)
-                new_messages = [summary_msg] + to_keep
-                _total_chars = total_content_chars(new_messages)
-                log.info(
-                    "conv_store compact: still over threshold, reduced keep_recent to %d",
-                    keep_recent,
-                )
-        except Exception:
-            pass  # safety net: never break compact flow
-
-        after = len(new_messages)
-        result = {
-            "before": before, "after": after,
-            "total_segments": len(segments),
-            "kept_segments": len(kept_segments),
-            "compressed_segments": len(segments) - len(kept_segments),
+        messages = store.load(target_session_id)
+        before = len(messages)
+        plan = plan or {}
+        counts = {
+            "before": before, "after": before,
+            "total_segments": int(plan.get("total_segments", 0)),
+            "kept_segments": int(plan.get("total_segments", 0)),
+            "compressed_segments": 0,
+            "applied": False,
         }
-        if after >= before:
-            # [2026-05-17] Why: callers treat after==before as an unsuccessful
-            # compact, so persisting a same-length replacement can mutate durable
-            # history while the engine still believes compact failed. How: return
-            # counts without replace_all unless the new message list is shorter.
-            # Purpose: avoid no-op rewrites and prevent compact retry loops.
-            return result
-
-        store.replace_all(target_session_id, new_messages)
-
-        self._sync_compact_to_branches(target_session_id, summary_msg, to_keep)
-        return result
-
-    def _clone_compact_summary_message(self, summary_msg: Any) -> Any:
-        """Clone a compact summary message for a branch session."""
-
-        from uuid import uuid4
-        from datetime import datetime, timezone
-        from engine.conversation_store import Message, MessageType
-
-        return Message(
-            id=str(uuid4()),
-            role=getattr(summary_msg, "role", "user") or "user",
-            content=str(getattr(summary_msg, "content", "") or ""),
-            message_type=getattr(summary_msg, "message_type", "") or MessageType.SUMMARY,
-            created_at=datetime.now(timezone.utc).isoformat(),
-            meta=dict(getattr(summary_msg, "meta", {}) or {}),
-            source_node_id=getattr(summary_msg, "source_node_id", "") or "",
-            source_task_id=getattr(summary_msg, "source_task_id", "") or "compact_summary",
+        if plan.get("session_id", target_session_id) != target_session_id or not summary:
+            return counts
+        indices = covered_indices(messages, plan)
+        if not indices:
+            return counts
+        archive = ContextArchiveStore(self.workspace_root).archive(target_session_id, messages, reason="llm_compaction")
+        summary_message = Message(
+            id=str(uuid4()), role="user",
+            content="[以下是之前对话的结构化摘要，原始上下文已被压缩]\\n\\n" + summary + archive_hint(archive["archive_id"]),
+            message_type=MessageType.SUMMARY,
+            created_at=datetime.now(timezone.utc).isoformat(), source_task_id="compact_summary",
+            meta={
+                "compressed_task_ids": fully_covered_task_ids(messages, indices),
+                "archive_id": archive["archive_id"],
+            },
         )
+        compressed = replace_covered(messages, plan, summary_message)
+        if len(compressed) >= before and total_content_chars(compressed) >= total_content_chars(messages):
+            return counts
+        store.replace_all(target_session_id, compressed)
+        counts.update(
+            after=len(compressed),
+            compressed_segments=int(plan.get("compressed_segments", 0)),
+            kept_segments=int(plan.get("total_segments", 0)) - int(plan.get("compressed_segments", 0)),
+            applied=True,
+        )
+        self._sync_compact_to_branches(target_session_id, summary_message, plan)
+        return counts
 
     def _sync_compact_to_branches(
-        self, target_session_id: str, summary_msg: Any, to_keep: list[Any],
+        self, target_session_id: str, summary_message: Any, plan: dict[str, Any],
     ) -> None:
-        """Synchronize a successful parent compact into active branch sessions."""
- 
-        from engine.conversation_store import ConversationStore
+        from engine.branch_history import branch_base_count, mark_branch_boundary, without_branch_boundary
+        from engine.compaction_plan import replace_covered
+        from engine.context_archive import ContextArchiveStore
+        from engine.conversation_store import ConversationChangedError, ConversationStore
 
-        target = str(target_session_id or "").strip()
-        if not target:
-            return
-        keep_recent = len(to_keep)
-        store = ConversationStore(self.workspace_root / "data" / "conversations")
-
-        entry_branches: dict[str, dict[str, Any]] = {}
-        child_sessions: set[str] = set()
+        branches: dict[str, list[Task]] = {}
         for task in list(self.tasks.values()):
-            if self._task_terminal(task):
+            if self._task_terminal(task) or task.input.get("parent_session_id") != target_session_id:
                 continue
-            parent_sid = str(task.input.get("parent_session_id") or "").strip()
-            branch_sid = str(task.input.get("branch_session_id") or "").strip()
-            if parent_sid == target and branch_sid:
-                info = entry_branches.setdefault(branch_sid, {"tasks": [], "base_count": 0})
-                info["tasks"].append(task)
-                try:
-                    base_count = int(task.input.get("base_count") or 0)
-                except Exception:
-                    base_count = 0
-                if base_count > int(info.get("base_count") or 0):
-                    info["base_count"] = base_count
-
-            child_sid = str(task.input.get("child_session_id") or "").strip()
-            if task.session_id == target and child_sid:
-                child_sessions.add(child_sid)
-
-        for branch_sid, info in entry_branches.items():
-            self._sync_entry_branch_compact_locked(
-                store,
-                branch_sid,
-                summary_msg,
-                keep_recent=keep_recent,
-                base_count=int(info.get("base_count") or 0),
-                tasks=list(info.get("tasks") or []),
-            )
-
-        for child_sid in child_sessions:
-            self._sync_child_session_compact_locked(
-                store,
-                child_sid,
-                summary_msg,
-                keep_recent=keep_recent,
-            )
-
-    def _sync_entry_branch_compact_locked(
-        self,
-        store: Any,
-        branch_session_id: str,
-        summary_msg: Any,
-        *,
-        keep_recent: int,
-        base_count: int,
-        tasks: list[Task],
-    ) -> None:
-        """Compact the forked parent prefix of one active entry branch."""
-        # [AutoC 2026-05-13] Why: entry branch merge uses base_count to append only
-        # branch-local tail messages back to the parent. How: replace only the
-        # forked prefix with summary + recent prefix messages, then update base_count
-        # on active tasks. Purpose: branch sync cannot lose or duplicate the branch
-        # tail during final merge.
-        branch = str(branch_session_id or "").strip()
-        if not branch or base_count <= 0:
-            return
-        try:
-            branch_msgs = list(store.load(branch))
-            if len(branch_msgs) < base_count:
-                log.warning(
-                    "compact branch sync skipped for %s: base_count=%d exceeds len=%d",
-                    branch,
-                    base_count,
-                    len(branch_msgs),
-                )
-                return
-            if base_count <= keep_recent + 1:
-                return
-            branch_prefix = branch_msgs[:base_count]
-            branch_tail = branch_msgs[base_count:]
-            prefix_keep = branch_prefix[-keep_recent:] if keep_recent > 0 else []
-            branch_summary = self._clone_compact_summary_message(summary_msg)
-            new_base = [branch_summary] + prefix_keep
-            store.replace_all(branch, new_base + branch_tail)
-            for task in tasks:
-                task.input["base_count"] = len(new_base)
-                task.input["base_last_id"] = getattr(prefix_keep[-1], "id", "") if prefix_keep else branch_summary.id
-                task.updated_at = _now()
-            log.info(
-                "compact branch sync: %s base %d → %d, preserved tail=%d",
-                branch,
-                base_count,
-                len(new_base),
-                len(branch_tail),
-            )
-        except Exception as exc:
-            log.warning("compact branch sync failed for %s: %s", branch, exc)
-
-    def _sync_child_session_compact_locked(
-        self,
-        store: Any,
-        child_session_id: str,
-        summary_msg: Any,
-        *,
-        keep_recent: int,
-    ) -> None:
-        """Apply simplified compact sync to one active ordinary child session."""
-        # [AutoC 2026-05-13] Why: ordinary child sessions are not merged by
-        # base_count, so they can use the same simple summary + recent messages
-        # shape as the parent. How: replace the whole child JSONL when doing so
-        # shortens it. Purpose: long-lived active child sessions do not keep an
-        # outdated uncompressed parent fork.
-        child = str(child_session_id or "").strip()
-        if not child:
-            return
-        try:
-            child_msgs = list(store.load(child))
-            before = len(child_msgs)
-            if before <= keep_recent + 1:
-                return
-            child_keep = child_msgs[-keep_recent:] if keep_recent > 0 else []
-            store.replace_all(child, [self._clone_compact_summary_message(summary_msg)] + child_keep)
-            log.info(
-                "compact child sync: %s %d → %d",
-                child,
-                before,
-                1 + len(child_keep),
-            )
-        except Exception as exc:
-            log.warning("compact child sync failed for %s: %s", child, exc)
+            branch_id = str(task.input.get("branch_session_id") or "")
+            if branch_id:
+                branches.setdefault(branch_id, []).append(task)
+        for branch_id, tasks in branches.items():
+            try:
+                for attempt in range(3):
+                    store = ConversationStore(self.workspace_root / "data" / "conversations")
+                    messages = store.load(branch_id)
+                    base_count = branch_base_count(
+                        messages, branch_id, max(int(task.input.get("base_count") or 0) for task in tasks),
+                    )
+                    if base_count <= 0 or base_count > len(messages):
+                        break
+                    prefix = replace_covered(
+                        without_branch_boundary(messages[:base_count], branch_id), plan, summary_message,
+                    )
+                    if prefix is None:
+                        break
+                    # 入口分支和父会话共享历史；独立子节点只压缩自己的记录。
+                    ContextArchiveStore(self.workspace_root).archive(target_session_id, messages, reason="branch_compaction")
+                    try:
+                        store.replace_all(
+                            branch_id, mark_branch_boundary(prefix + messages[base_count:], branch_id, len(prefix)),
+                        )
+                    except ConversationChangedError:
+                        if attempt == 2:
+                            raise
+                        continue
+                    for task in tasks:
+                        task.input["base_count"] = len(prefix)
+                        task.input["base_last_id"] = prefix[-1].id if prefix else ""
+                        task.updated_at = _now()
+                        self._event_task_snapshot("task_context_compacted", task)
+                    break
+            except Exception:
+                log.exception("compact branch sync failed: %s", branch_id)
 
     def _resume_compact_parent_locked(
         self, caller: Task, context_ref: str, *,
@@ -2886,6 +2673,7 @@ class TaskRouterMixin:
         caller.input["resume_data"] = _rd
         caller.input["context_ref"] = context_ref
         caller.input.pop("_compact_dispatch_pending", None)
+        caller.input.pop("_compact_plan", None)
         self._event_task_snapshot("task_resumed", caller)
 
 

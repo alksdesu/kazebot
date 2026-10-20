@@ -80,7 +80,13 @@ async def test_new_subject_reaches_preempt_prompt_and_history(
     assert loop.rctx.task_context == {
         "memory_hints": {"subjects": ["UserB"]}, "platform_auth": {"is_admin": False},
     }
-    assert loop.messages[-1] == {"role": "user", "content": "now discuss UserB"}
+    assert loop.messages[-1]["role"] == "user"
+    assert loop.messages[-1]["content"] == "now discuss UserB"
+    metadata = loop.messages[-1]["_meta"]
+    persisted = loop.rctx.conversation_store.load("child")[-1]
+    assert metadata["source_task_id"] == persisted.source_task_id == "task"
+    assert metadata["timestamp"] == persisted.created_at
+    assert metadata["message_id"] == persisted.id
     assert {"role": "tool", "content": "tool result", "tool_call_id": "call-1"} in loop.messages
     assert loop.messages[0] == {"role": "system", "content": "persona"}
     assert hook.messages is loop.messages

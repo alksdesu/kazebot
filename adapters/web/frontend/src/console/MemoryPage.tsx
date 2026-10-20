@@ -22,6 +22,7 @@ import { useConversationDirectory } from '../features/useConversationDirectory';
 import { useConversationNames } from '../features/useConversationNames';
 import { scopeIdentity } from '../features/conversationNames';
 import { useRequestScope } from '../features/asyncState';
+import { ContextArchiveSettings } from './ContextArchiveSettings';
 
 const EMPTY_DRAFT = { id: '', content: '', keywords: '', constant: false };
 
@@ -444,6 +445,7 @@ export const MemoryPage = () => {
   if (identity.current.token !== token) identity.current = { token, generation: identity.current.generation + 1 };
   return <Fragment key={identity.current.generation}>
     <MemoryBlock />
+    <ContextArchiveSettings />
     <ContextBlock />
   </Fragment>;
 };

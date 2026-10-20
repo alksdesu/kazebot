@@ -17,6 +17,8 @@ output_mode: hybrid
 tool_access:
   mode: allowlist
   allow:
+    - search_context_archive
+    - read_context_archive
     - materials_document
     - materials_structure
 

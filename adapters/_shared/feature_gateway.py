@@ -270,11 +270,6 @@ class FeatureGateway:
             await module.record_message(self.host.client, actor, message_id=str(message_id), text=text,
                                         timestamp=time.time(), sender_name="Bot", direction="outbound",
                                         reply_ref=reply_ref)
-            await self.host.client.request_feature("POST", "/v1/community/messages", actor=actor, body={
-                "message_id": str(message_id), "text": self.host.anonymize_text_for_ai(text),
-                "reply_ref": reply_ref, "sender_name": "Bot",
-                "topic_id": str(target.get("_topic_id") or ""),
-            })
         except (ModuleNotFoundError, AttributeError):
             return
         except Exception:
@@ -437,7 +432,7 @@ class FeatureGateway:
         metadata["classified"] = True
         try:
             await self.host.client.request_feature("POST", "/v1/community/decisions", actor=actor, body={
-                "action": action, "reason": reason, "topic_id": metadata.get("topic", {}).get("topic_id", ""),
+                "action": action, "reason": reason,
             })
         except Exception:
             logger.warning("response decision logging failed", exc_info=True)

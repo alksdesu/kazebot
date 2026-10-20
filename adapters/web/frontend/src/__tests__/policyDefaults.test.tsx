@@ -8,7 +8,7 @@ import { useSettingsStore } from '../store/settingsStore';
 
 vi.mock('../api/supervisorClient', async original => ({ ...await original<typeof import('../api/supervisorClient')>(), getConversations: vi.fn() }));
 vi.mock('../features/client', () => ({ featureRequest: vi.fn() }));
-const policy = { response_policy_enabled: true, topic_enabled: true, merge_window_sec: 1, merge_max_wait_sec: 4, reply_budget_per_minute: 6 };
+const policy = { response_policy_enabled: true, merge_window_sec: 1, merge_max_wait_sec: 4, reply_budget_per_minute: 6 };
 const group = 'qq_group:1234567890abcdef12345678';
 const privateScope = 'qq_private:abcdef1234567890abcdef12';
 const row = (scope: string, label: string, current = true): api.ConversationRow => ({ session_id: scope, conversation_key: scope, channel: 'qq', bytes: 1, updated_at: 0, current_account: current, owner: { kind: scope.startsWith('qq_group:') ? 'group' : 'private', label, name_available: true } });
@@ -66,7 +66,33 @@ const mutations = () => vi.mocked(featureRequest).mock.calls.filter(([, options]
 function custom(label: string) { fireEvent.change(screen.getByLabelText(`${label}来源`), { target: { value: 'custom' } }); }
 
 describe('实例默认与逐项继承的读写合同', () => {
-  it('实例保存只提交改动的五项策略，不带scope/欢迎词；false与0均保留', async () => {
+  it.each([false, true])('旧响应保留 topic 元数据时仍可编辑，保存不回传 topic；覆盖=%s', async customized => {
+    const original = vi.mocked(featureRequest).getMockImplementation()!;
+    vi.mocked(featureRequest).mockImplementation(async (path, options) => {
+      if (path.endsWith('/decisions')) return { items: [{ message_id: 'old-message', topic_id: 'old-topic', action: 'reply', reason: '旧记录' }] } as never;
+      const result = await original(path, options) as Record<string, unknown>;
+      if (path.endsWith('/state') || path.endsWith('/settings/overrides')) {
+        const current = result as ReturnType<typeof state>;
+        return {
+          ...current,
+          settings: { ...current.settings, topic_enabled: false },
+          defaults: { ...current.defaults, topic_enabled: true },
+          overrides: { ...current.overrides, ...(customized ? { topic_enabled: false } : {}) },
+          inherited_fields: [...current.inherited_fields, ...(customized ? [] : ['topic_enabled'])],
+        } as never;
+      }
+      return result as never;
+    });
+    render(<ConversationSettings scope={group} />);
+    await screen.findByLabelText(windowLabel);
+    expect(screen.queryByText(/接续话题|old-topic/)).not.toBeInTheDocument();
+    expect(await screen.findByText('消息 old-message')).toBeInTheDocument();
+    custom(windowLabel); fireEvent.change(screen.getByLabelText(windowLabel), { target: { value: '2' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存会话覆盖' }));
+    await screen.findByText('会话覆盖已保存。');
+    expect(JSON.stringify(mutations()[0][1]?.body)).not.toContain('topic');
+  });
+  it('实例保存只提交改动的策略，不带scope/欢迎词；false与0均保留', async () => {
     render(<ConversationSettings />);
     fireEvent.click(await screen.findByLabelText(responseLabel));
     fireEvent.change(screen.getByLabelText(windowLabel), { target: { value: '0' } });
@@ -83,7 +109,7 @@ describe('实例默认与逐项继承的读写合同', () => {
     fireEvent.click(screen.getByRole('button', { name: '保存会话覆盖' }));
     await screen.findByText('会话覆盖已保存。');
     const body = mutations()[0][1]?.body as Record<string, unknown>;
-    expect(body).toEqual({ values: { response_policy_enabled: false, merge_window_sec: 0 }, reset_fields: ['topic_enabled', 'merge_max_wait_sec', 'reply_budget_per_minute'], expected_revision: 3, expected_defaults_revision: 2 });
+    expect(body).toEqual({ values: { response_policy_enabled: false, merge_window_sec: 0 }, reset_fields: ['merge_max_wait_sec', 'reply_budget_per_minute'], expected_revision: 3, expected_defaults_revision: 2 });
     expect(screen.getByLabelText(`${responseLabel}来源`)).toHaveValue('custom');
     expect(screen.getByLabelText(responseLabel)).not.toBeChecked();
   });
@@ -100,11 +126,11 @@ describe('实例默认与逐项继承的读写合同', () => {
     expect(overrides).toEqual({});
   });
   it('自定义与默认数值相同仍是需要保存的来源变更，单项切回默认只删除该来源', async () => {
-    overrides = { topic_enabled: false };
+    overrides = { response_policy_enabled: false };
     render(<ConversationSettings scope={group} />); await screen.findByLabelText(responseLabel);
     custom(windowLabel);
     expect(screen.getByRole('button', { name: '保存会话覆盖' })).toBeEnabled();
-    fireEvent.change(screen.getByLabelText('按引用和参与者接续话题来源'), { target: { value: 'inherit' } });
+    fireEvent.change(screen.getByLabelText(`${responseLabel}来源`), { target: { value: 'inherit' } });
     fireEvent.click(screen.getByRole('button', { name: '保存会话覆盖' }));
     await screen.findByText('会话覆盖已保存。');
     expect(overrides).toEqual({ merge_window_sec: 1 });

@@ -6,6 +6,8 @@
 version: 1
 
 engine:
+  context_archive:
+    retention_days: 7
   max_steps: 64
   streaming: true
   poll_interval_sec: 1.0

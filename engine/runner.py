@@ -42,7 +42,7 @@ from .tool_step import result_to_raw, summarize_result
 # Phase 1 (Session Conversation Store): 导入 ConversationStore 用于影子写入，
 # 在每个 node task 执行时实例化并挂载到 RunContext，供 ai_step 影子写入消息。
 from .conversation_store import ConversationStore, Message, MessageType
-from .conversation_routing import routing_meta, topic_history
+from .conversation_routing import routing_meta
 # Phase 0/1: Signal System — 导入信号总线初始化和桥接函数。
 # 在 _run_node_task 中初始化 bus 并安装 EventLog 桥接，使 LLM 调用信号
 # 自动转发到 data/signals.jsonl 供监控使用。
@@ -352,6 +352,7 @@ def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict
     if isinstance(d["content"], list) and (not current_task_id or msg_task_id != current_task_id):
         d["content"] = _strip_images_from_content(d["content"])
     _meta = dict(msg.meta) if msg.meta else {}
+    _meta.update(message_id=msg.id, timestamp=msg.created_at, message_type=msg.message_type)
     # P6 Snip Compact: 将 source_task_id 透传到 _meta，供 snip_history 按 task 过滤
     if msg.source_task_id:
         _meta["source_task_id"] = msg.source_task_id
@@ -967,16 +968,10 @@ async def _run_node_task(
             # fork: 先从父 session 复制历史到子 session
             _conv_store.fork(fork_from, child_session_id)
 
-        if not is_resume:
-            # 从子 session 的 JSONL 加载历史，过滤 system 消息（子节点重建自己的 system prompt）
-            stored = _conv_store.load(child_session_id)
-            history = [_message_to_history_dict(m, current_task_id=task_id) for m in stored if m.role != "system"]
-            # [2026-05-07] 子会话恢复时先清理 finish 控制流历史。
-            # 原因：system.compactor 等 child session 可能已有旧 finish tool_call/tool_result 污染。
-            # 做法：在进入提示组装前去掉控制流配对，再保留旧 fake-native 尾部兼容清理。
-            # 目的：父会话不会回放子任务 finish 伪工具。
-            history = sanitize_control_tool_history(history)
-            history = _strip_trailing_pseudo_call(history)
+        stored = _conv_store.load(child_session_id)
+        history = [_message_to_history_dict(m, current_task_id=task_id) for m in stored if m.role != "system"]
+        history = sanitize_control_tool_history(history)
+        history = _strip_trailing_pseudo_call(history)
         # child session 模式不使用 context_ref（让 ai_step 重建 system prompt）
         context_ref = ""
     elif _main_conv_enabled:
@@ -1029,7 +1024,6 @@ async def _run_node_task(
         history = await _fetch_history(rctx)
 
     _route_meta = routing_meta(rctx.task_context)
-    history = topic_history(history, str(_route_meta.get("topic_id") or ""), current_task_id=task_id)
     ds_info = _collect_node_info(ws_root, list(node.delegate_targets))
 
     runtime_cfg = load_runtime_config(ws_root)
@@ -1103,7 +1097,7 @@ async def _run_node_task(
     # 会破坏对话顺序并复发图片附件。旧 snapshot 路径下此 case 通过 snapshot.messages
     # 直接回放解决，新路径下需要在这里把 instruction 和 attachments 清空。
     # message_assembly.py 同步改为 instruction 为空且无 attachments 时不追加末尾消息。
-    if _main_conv_enabled and not child_session_id and is_resume:
+    if (_main_conv_enabled or child_session_id) and is_resume:
         instruction = ""
         input_attachments = None
 
@@ -1338,6 +1332,7 @@ async def _run_tool_task(
     # 查不到发起节点就不放行：宁可这条路走不通，也不要一条没人管的执行入口。
     _origin_node_id = str(input_data.get("origin_node_id") or "").strip()
     kctx.origin_node_id = _origin_node_id
+    kctx._context_archive_session_id = str(input_data.get("_context_archive_session_id") or session_id)
     _origin_node = load_node(ws_root, _origin_node_id) if _origin_node_id else None
     if _origin_node is None or not tool_allowed(_origin_node, tool_name):
         _why = (

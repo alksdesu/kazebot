@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import json
 import logging
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from engine.compaction_plan import _tool_call_ids, record_dict, record_meta, record_task_id
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +28,7 @@ log = logging.getLogger(__name__)
 # and remove the aggregate-specific constants/helpers. Purpose: avoid retaining
 # a broken summary-merge path while preserving existing L2 behavior.
 _SNIP_MARKER = "[Task summary — original messages snipped]"
+_SNIP_RETRIEVAL = "Original messages can be retrieved with search_context_archive and read_context_archive."
 
 
 @dataclass
@@ -106,6 +110,41 @@ def write_task_record(ws_root: Path, record: TaskRecord) -> None:
         log.error("Failed to write task record %s: %s", record.task_id, e)
 
 
+def safe_snip_task_ids(messages: list, task_ids: set[str]) -> set[str]:
+    eligible = set(task_ids)
+    calls: dict[str, set[str]] = {}
+    results: dict[str, set[str]] = {}
+    unpaired: set[str] = set()
+    for message in messages:
+        record = record_dict(message)
+        task_id = record_task_id(message)
+        call_ids = _tool_call_ids(record)
+        for call_id in call_ids:
+            calls.setdefault(call_id, set()).add(task_id)
+        if record.get("role") == "assistant" and record.get("tool_calls") and not call_ids:
+            unpaired.add(task_id)
+        meta = record_meta(message)
+        result_id = str(record.get("tool_call_id") or meta.get("tool_call_id") or "")
+        if result_id:
+            results.setdefault(result_id, set()).add(task_id)
+        elif record.get("role") == "tool" or meta.get("message_type") == "tool_result":
+            unpaired.add(task_id)
+    eligible.difference_update(unpaired)
+    dependencies = [
+        (calls.get(call_id, set()), results.get(call_id, set()))
+        for call_id in calls.keys() | results.keys()
+    ]
+    while True:
+        excluded: set[str] = set()
+        for call_tasks, result_tasks in dependencies:
+            related = call_tasks | result_tasks
+            if not call_tasks or not result_tasks or "" in related or not related <= eligible:
+                excluded.update(related & eligible)
+        if not excluded:
+            return eligible
+        eligible.difference_update(excluded)
+
+
 def snip_history(
     messages: list[dict],
     records: list["TaskRecord"],
@@ -135,7 +174,7 @@ def snip_history(
     # Build lookup: task_id → summary (only for tasks that have one)
     summaries: dict[str, str] = {}
     for r in records:
-        if r.summary and r.task_id:
+        if isinstance(r.summary, str) and r.summary.strip() and r.task_id:
             summaries[r.task_id] = r.summary
 
     if not summaries:
@@ -151,13 +190,11 @@ def snip_history(
     already_snipped: set[str] = set()
     for msg in messages:
         content = msg.get("content", "")
-        meta = msg.get("_meta", {})
-        if not isinstance(meta, dict):
-            meta = {}
+        meta = record_meta(msg)
 
         # 场景1：显式标记为已摘要的消息块
         if isinstance(content, str) and content.startswith(_SNIP_MARKER):
-            tid = str(meta.get("source_task_id") or "")
+            tid = record_task_id(msg)
             if tid:
                 already_snipped.add(tid)
 
@@ -175,13 +212,7 @@ def snip_history(
     # to child session JSONLs, not the main session — their task_ids won't
     # appear in messages, so snipping them would waste max_snip slots and
     # always fall through to LLM compaction.
-    present_task_ids: set[str] = set()
-    for msg in messages:
-        _pmeta = msg.get("_meta", {})
-        if isinstance(_pmeta, dict):
-            _ptid = str(_pmeta.get("source_task_id") or "")
-            if _ptid:
-                present_task_ids.add(_ptid)
+    present_task_ids = {record_task_id(message) for message in messages}
 
     eligible_ordered: list[str] = []
     _seen_elig: set[str] = set()
@@ -199,31 +230,35 @@ def snip_history(
         return messages, 0, set()
 
     # Incremental: snip at most max_snip oldest tasks
-    to_snip = eligible_ordered[:max_snip]
-    to_snip_set = set(to_snip)
+    return snip_history_tasks(messages, records, set(eligible_ordered[:max_snip]))
+
+
+def snip_history_tasks(messages: list[dict], records: list["TaskRecord"], task_ids: set[str]) -> tuple[list[dict], int, set[str]]:
+    summaries = {
+        record.task_id: record.summary for record in records
+        if isinstance(record.summary, str) and record.summary.strip() and record.task_id
+    }
+    to_snip_set = safe_snip_task_ids(messages, task_ids & summaries.keys())
 
     result: list[dict] = []
     seen_snipped: set[str] = set()
     for msg in messages:
-        meta = msg.get("_meta", {})
-        msg_tid = ""
-        if isinstance(meta, dict):
-            msg_tid = str(meta.get("source_task_id") or "")
+        meta = record_meta(msg)
+        msg_tid = record_task_id(msg)
         if msg_tid in to_snip_set:
             if msg_tid not in seen_snipped:
                 seen_snipped.add(msg_tid)
                 result.append({
                     "role": "user",
-                    "content": f"[Task summary \u2014 original messages snipped]\n{summaries[msg_tid]}",
-                    "_meta": {"source_task_id": msg_tid},
+                    "content": f"{_SNIP_MARKER}\n{summaries[msg_tid]}\n\n{_SNIP_RETRIEVAL}",
+                    "_meta": {**deepcopy(meta), "source_task_id": msg_tid, "message_type": "summary"},
                 })
         else:
             result.append(msg)
 
     snip_count = len(seen_snipped)
     if snip_count:
-        log.info("snip_history: incremental snip %d/%d eligible tasks, %d → %d messages",
-                 snip_count, len(eligible_ordered), len(messages), len(result))
+        log.info("snip_history: replaced %d tasks, %d → %d messages", snip_count, len(messages), len(result))
 
     return result, snip_count, seen_snipped
 
@@ -242,19 +277,26 @@ def snip_store(
     from engine.conversation_store import Message
     from uuid import uuid4
 
-    summaries = {r.task_id: r.summary for r in records if r.summary and r.task_id}
+    summaries = {
+        r.task_id: r.summary for r in records
+        if isinstance(r.summary, str) and r.summary.strip() and r.task_id
+    }
+    snipped_task_ids = safe_snip_task_ids(store_messages, snipped_task_ids & summaries.keys())
     result = []
     seen: set[str] = set()
     for msg in store_messages:
-        tid = msg.source_task_id or ""
-        if tid in snipped_task_ids:
+        tid = record_task_id(msg)
+        if tid in snipped_task_ids and tid in summaries:
             if tid not in seen:
                 seen.add(tid)
                 result.append(Message(
                     id=str(uuid4()),
                     role="user",
-                    content=f"[Task summary — original messages snipped]\n{summaries.get(tid, '')}",
+                    content=f"{_SNIP_MARKER}\n{summaries.get(tid, '')}\n\n{_SNIP_RETRIEVAL}",
                     message_type="summary",
+                    created_at=msg.created_at,
+                    meta={**deepcopy(msg.meta), "message_type": "summary"},
+                    source_node_id=msg.source_node_id,
                     source_task_id=tid,
                 ))
         else:

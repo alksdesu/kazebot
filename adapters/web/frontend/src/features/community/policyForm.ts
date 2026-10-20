@@ -9,7 +9,7 @@ export interface PolicySnapshot {
   overrides: Partial<ConversationPolicy>;
   community?: CommunityState;
 }
-export const booleanPolicyKeys = new Set<ConversationPolicyKey>(['response_policy_enabled', 'topic_enabled']);
+export const booleanPolicyKeys = new Set<ConversationPolicyKey>(['response_policy_enabled']);
 
 function readPolicy(value: unknown, partial = false): Partial<ConversationPolicy> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('服务端未返回完整策略元数据，请更新服务后重试。');
@@ -34,7 +34,8 @@ export function readPolicySnapshot(value: unknown, global: boolean): PolicySnaps
   const defaults = readPolicy(data.defaults) as ConversationPolicy;
   const overrides = readPolicy(data.overrides, true);
   const expectedInherited = CONVERSATION_POLICY_KEYS.filter(key => !Object.prototype.hasOwnProperty.call(overrides, key));
-  if (data.inherited_fields.length !== expectedInherited.length || expectedInherited.some(key => !(data.inherited_fields as unknown[]).includes(key))) throw new Error('服务端继承关系不完整，未启用保存。');
+  const inherited = data.inherited_fields.filter(key => key !== 'topic_enabled');
+  if (inherited.length !== expectedInherited.length || expectedInherited.some(key => !inherited.includes(key))) throw new Error('服务端继承关系不完整，未启用保存。');
   return { revision: Number(data.revision), defaultsRevision: Number(data.defaults_revision), settings, defaults, overrides, community: value as CommunityState };
 }
 

@@ -765,5 +765,3 @@ def _apply_delivery_context(target: Dict[str, Any], context: OutboundSendContext
     reply_ref = str(getattr(context, "reply_message_id", "") or "")
     if reply_ref and reply_ref.lstrip("-").isdigit():
         target["reply_message_id"] = int(reply_ref)
-    if getattr(context, "topic_id", ""):
-        target["_topic_id"] = context.topic_id

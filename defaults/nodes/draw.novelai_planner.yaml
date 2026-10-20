@@ -21,6 +21,8 @@ strip_images: true
 tool_access:
   mode: allowlist
   allow:
+    - search_context_archive
+    - read_context_archive
     - draw_context
     - nai_generate_from_plan
     - nai_generate

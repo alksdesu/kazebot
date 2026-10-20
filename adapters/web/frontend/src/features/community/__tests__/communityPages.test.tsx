@@ -20,7 +20,7 @@ beforeEach(() => {
   vi.mocked(api.getConversations).mockResolvedValue(['a', 'b'].map(id => ({ conversation_key: `qq_group:${id}`, session_id: id, channel: 'qq', bytes: 0, updated_at: 0, current_account: true, owner: { kind: 'group', label: `群 ${id}`, name_available: true } })));
   activities = [];
   state = { scope: 'qq_group:a', revision: 0, guide: {}, quiet: {}, settings: {
-    response_policy_enabled: false, topic_enabled: false, merge_window_sec: 0,
+    response_policy_enabled: false, merge_window_sec: 0,
     merge_max_wait_sec: 4, reply_budget_per_minute: 6, welcome_enabled: false,
   } };
   const { welcome_enabled: _welcome, ...policy } = state.settings;

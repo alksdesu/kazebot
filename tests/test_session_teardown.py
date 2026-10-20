@@ -41,6 +41,19 @@ def _seed(workspace: Path, session_id: str) -> tuple[Path, Path]:
 
 
 class TestPurgeHelper:
+    def test_it_removes_archives_without_touching_siblings(self, tmp_path: Path) -> None:
+        from engine.context_archive import ContextArchiveStore
+
+        store = ContextArchiveStore(tmp_path)
+        first = store.archive("child_a", [{"id": "m1", "content": "erase"}], reason="compact")
+        second = store.archive("child_b", [{"id": "m2", "content": "keep"}], reason="compact")
+
+        _state(tmp_path).purge_session_files("child_a")
+
+        with pytest.raises(FileNotFoundError):
+            store.read("child_a", first["archive_id"])
+        assert store.read("child_b", second["archive_id"])["message_count"] == 1
+
     def test_it_removes_both_artifacts(self, tmp_path: Path) -> None:
         state = _state(tmp_path)
         conv, transcript = _seed(tmp_path, "child_abc")

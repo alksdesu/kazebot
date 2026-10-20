@@ -11,12 +11,11 @@ import { booleanPolicyKeys, draftIdentity, effectivePolicy, policyDraft, readPol
 
 const labels: Record<ConversationPolicyKey, string> = {
   response_policy_enabled: '统一选择忽略、表态、短答和办事',
-  topic_enabled: '按引用和参与者接续话题',
   reply_budget_per_minute: '每分钟自主回应上限',
   merge_window_sec: '同人短句等待秒数',
   merge_max_wait_sec: '连续追加最长等待秒数',
 };
-interface Decision { message_id: string; topic_id: string; action: string; reason: string }
+interface Decision { message_id: string; action: string; reason: string }
 const displayValue = (value: boolean | number) => typeof value === 'boolean' ? value ? '开启' : '关闭' : String(value);
 
 export function ConversationSettings({ scope: initialScope }: { scope?: string }) {
@@ -137,7 +136,7 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
       <form className="min-w-0 space-y-4 border border-[var(--duties-border)] p-4" onSubmit={event => { event.preventDefault(); save(); }}>
         <fieldset disabled={busy} className="min-w-0 space-y-4">
           <legend className="font-semibold">{global ? '实例默认接话策略' : '会话接话策略'}{dirty ? ' · 有未保存修改' : ''}</legend>
-          <p className="text-[var(--duties-secondary)]">{global ? '这里仅设置五项默认策略，不会让所有会话进入安静，也不会修改群欢迎词。' : '使用默认的字段会跟随实例配置；自定义字段只影响当前会话。切换来源后请保存。'}</p>
+          <p className="text-[var(--duties-secondary)]">{global ? '这里设置实例默认回应策略，不会让所有会话进入安静，也不会修改群欢迎词。' : '使用默认的字段会跟随实例配置；自定义字段只影响当前会话。切换来源后请保存。'}</p>
           <div className="divide-y divide-[var(--duties-border)]">
             {CONVERSATION_POLICY_KEYS.map(key => {
               const custom = global || Object.prototype.hasOwnProperty.call(draft, key);
@@ -157,7 +156,7 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
           {validation && <p role="alert" className="text-[var(--duties-danger)]">{validation}</p>}
           <div className="flex flex-wrap gap-3">
             <button className={primaryClass} disabled={busy || !dirty || Boolean(validation) || conflict || readBlocked}>{busy ? '正在保存…' : global ? '保存实例默认配置' : '保存会话覆盖'}</button>
-            {!global && <button className={actionClass} type="button" disabled={busy || !Object.keys(draft).length} onClick={() => { setDraft({}); setNotice('五项策略已在草稿中恢复继承，保存后生效。'); }}>全部恢复继承</button>}
+            {!global && <button className={actionClass} type="button" disabled={busy || !Object.keys(draft).length} onClick={() => { setDraft({}); setNotice('会话策略已在草稿中恢复继承，保存后生效。'); }}>全部恢复继承</button>}
             <button className={actionClass} type="button" disabled={busy} onClick={reload}>重新载入设置</button>
           </div>
         </fieldset>
@@ -171,7 +170,7 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
         </section>
         <section className={sectionClass}><h2 className="font-semibold">最近接话判定</h2><button className={actionClass} disabled={busy} onClick={() => void run(() => refresh())}>刷新判定</button>
           {!decisions.length && <EmptyState>启用策略并收到消息后，这里会显示当前会话的实际判定。</EmptyState>}
-          {decisions.map(decision => <article key={decision.message_id} className="border border-[var(--duties-border)] p-3"><p>{{ ignore: '忽略', reaction: '表态', react: '表态', reply: '回复', short_reply: '短答', task: '执行任务', execute: '执行任务' }[decision.action] || decision.action} · {decision.reason}</p><p className="text-xs">消息 {decision.message_id} · 话题 {decision.topic_id || '未分配'}</p></article>)}
+          {decisions.map(decision => <article key={decision.message_id} className="border border-[var(--duties-border)] p-3"><p>{{ ignore: '忽略', reaction: '表态', react: '表态', reply: '回复', short_reply: '短答', task: '执行任务', execute: '执行任务' }[decision.action] || decision.action} · {decision.reason}</p><p className="text-xs">消息 {decision.message_id}</p></article>)}
         </section>
       </>}
     </>}

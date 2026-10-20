@@ -516,6 +516,13 @@ def purge_expired_transcripts():
     purge_dir(DATA_DIR / "transcripts", TRANSCRIPTS_MAX_AGE, "transcripts")
 
 
+def purge_expired_context_archives():
+    from engine.context_archive import ContextArchiveStore
+
+    deleted = ContextArchiveStore(DATA_DIR.parent).purge(dry_run=DRY_RUN)
+    logging.info("[context_archives] expired=%d dry_run=%s", deleted, DRY_RUN)
+
+
 # ── logs cleanup ─────────────────────
 def _newest_spawn_logs(log_dir: Path) -> set[str]:
     """每个子进程系列里最新的那份：进程可能还开着它写，删了输出就进了已删的文件。"""
@@ -627,6 +634,7 @@ def main(argv: list[str] | None = None):
         (purge_expired_memory_entries, {}),
         # 新增：之前未覆盖的目录
         (purge_expired_transcripts, {}),
+        (purge_expired_context_archives, {}),
         (purge_old_logs, {}),
         (purge_dir, dict(directory=DATA_DIR / "llm_error_snapshots",
                          max_age=LLM_ERROR_SNAPSHOT_MAX_AGE, label="llm_error_snapshots",

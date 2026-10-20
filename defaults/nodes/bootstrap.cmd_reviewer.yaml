@@ -5,6 +5,8 @@ description: "审核并执行 shell 命令。接收调用方的命令请求，�
 tool_access:
   mode: allowlist
   allow:
+    - search_context_archive
+    - read_context_archive
     - execute_command
 skills:
   mode: none

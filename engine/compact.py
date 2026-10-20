@@ -391,10 +391,7 @@ def apply_compact_summary(
     *keep_recent_tokens* > 0 时保留量按 token 算，keep_recent 的段数语义不参与；
     为 0 时沿用按段数保留的旧行为。
 
-    If *threshold_tokens* > 0, the function will progressively reduce
-    *keep_recent* until the result fits within the budget or keep_recent
-    reaches 0.  This prevents infinite compact loops when the retained
-    segments alone exceed the threshold.
+    Retained segments are never removed after the summary is generated.
 
     Returns compressed message list.  If summary is empty or
     messages too short, returns original list unchanged.
@@ -485,29 +482,6 @@ def apply_compact_summary(
     result.append(summary_msg)
     result.extend(inner_systems)
     result.extend(to_keep)
-
-    # --- Progressive keep_recent reduction ---
-    # If the result still exceeds the token threshold, drop older kept
-    # segments one at a time until we fit or keep_recent reaches 0.
-    if threshold_tokens > 0 and keep_recent > 0:
-        while should_compact(result, threshold_tokens, chars_per_token=chars_per_token) and keep_recent > 0:
-            keep_recent -= 1
-            if keep_recent > 0:
-                kept_segments = segments[-keep_recent:]
-            else:
-                kept_segments = []
-            to_keep = []
-            for seg in kept_segments:
-                to_keep.extend(seg)
-            result = []
-            result.extend(prefix_systems)
-            result.append(summary_msg)
-            result.extend(inner_systems)
-            result.extend(to_keep)
-            logger.info(
-                "apply_compact_summary: still over threshold, reduced keep_recent to %d",
-                keep_recent,
-            )
 
     logger.info(
         "apply_compact_summary: %d -> %d messages (keep_recent=%d)",

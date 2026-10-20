@@ -208,12 +208,12 @@ class TestPreemptCandidates:
         [
             ({}, {}, True),
             ({"topic_id": "tp1"}, {"topic_id": "tp1"}, True),
-            ({"topic_id": "tp1"}, {"topic_id": "tp2"}, False),
+            ({"topic_id": "tp1"}, {"topic_id": "tp2"}, True),
             ({}, {"response_action": "task"}, False),
             ({"response_action": "task"}, {"response_action": "task"}, True),
         ],
     )
-    def test_the_topic_and_response_action_must_match(
+    def test_response_action_must_match_but_legacy_topics_are_ignored(
         self, previous: dict[str, str], current: dict[str, str], accepted: bool,
     ) -> None:
         result = _candidates([_task("t1")], {"t1": _trigger(1, **previous)}, **current)

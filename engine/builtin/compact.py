@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
 from engine.compact import (
-    _format_messages_for_summary,
     count_real_task_segments,
     estimate_message_tokens,
     microcompact_messages,
@@ -17,12 +17,9 @@ from engine.compact import (
 from .result import hook_result
 from engine.inference.loop_state import _persist_ctx, compact_target_session_id
 from engine.protocol import ACTION_DISPATCH, TaskAction
+from engine.context_archive import ContextArchiveStore
 
 logger = logging.getLogger(__name__)
-
-_PTL_MAX_CHARS = 300000
-_SUMMARY_SEPARATOR = "\n\n---\n\n"
-
 
 # Why: the built-in loader discovers handlers from per-file metadata.
 # How: declare the handler class, hook methods, and priority in one place.
@@ -81,13 +78,21 @@ async def _run_idle_cleanup(ctx: Any, ls: Any) -> bool:
     preserve the old trigger timing while keeping CompactChecker readable.
     """
     modified = False
-    _messages, cleared = microcompact_messages(ls.messages)
-    if cleared:
-        logger.info("microcompact: cleared %d tool_results", cleared)
-        modified = True
+    try:
+        compacted, cleared = microcompact_messages(deepcopy(ls.messages))
+        if cleared:
+            ContextArchiveStore(ls.rctx.workspace_root).archive(
+                compact_target_session_id(ls), ls.messages, reason="microcompact",
+            )
+            ls.messages = compacted
+            ctx.messages = compacted
+            logger.info("microcompact: cleared %d tool_results", cleared)
+            modified = True
+    except Exception as archive_error:
+        logger.warning("microcompact archive failed; keeping original messages: %s", archive_error)
 
     try:
-        from engine.task_record import load_task_records, snip_history, snip_store
+        from engine.task_record import load_task_records, snip_history
 
         last_ts = None
         for msg in reversed(ls.messages):
@@ -121,15 +126,7 @@ async def _run_idle_cleanup(ctx: Any, ls: Any) -> bool:
                         max_snip=proactive_max,
                     )
                     if snip_count > 0:
-                        ls.messages = snipped
-                        ctx.messages = ls.messages
-                        store = getattr(ls.rctx, "conversation_store", None)
-                        if store:
-                            try:
-                                persisted = snip_store(store.load(snip_sid), snip_records, snipped_ids)
-                                store.replace_all(snip_sid, persisted)
-                            except Exception as persist_error:
-                                logger.warning("proactive snip persist failed: %s", persist_error)
+                        snip_count = await _apply_snip(ctx, ls, snip_sid, snip_records, snipped, snipped_ids, reason="proactive_snip")
                         logger.info(
                             "proactive snip: replaced %d tasks (gap=%.1fh, max=%d)",
                             snip_count,
@@ -143,20 +140,52 @@ async def _run_idle_cleanup(ctx: Any, ls: Any) -> bool:
     return modified
 
 
+async def _apply_snip(ctx: Any, ls: Any, session_id: str, records: list, messages: list[dict], task_ids: set[str], *, reason: str) -> int:
+    from engine.task_record import safe_snip_task_ids, snip_history_tasks, snip_store
+
+    parent_id = str(getattr(ls.rctx, "parent_session_id", "") or "")
+    child_id = str(getattr(ls.rctx, "child_session_id", "") or "")
+    if parent_id and parent_id != ls.rctx.session_id and not child_id:
+        response = await ls.rctx.http.post(
+            f"{ls.rctx.supervisor_url}/v1/tasks/compact-snip",
+            json={"target_session_id": session_id, "task_ids": sorted(task_ids)},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or not payload.get("applied"):
+            raise RuntimeError("Supervisor could not synchronize task summaries")
+        actual_ids = payload.get("snipped_task_ids")
+        if not isinstance(actual_ids, list) or any(not isinstance(task_id, str) for task_id in actual_ids):
+            raise RuntimeError("Supervisor did not report task summary coverage")
+        actual = set(actual_ids)
+        if not actual or not actual <= task_ids:
+            raise RuntimeError("Supervisor returned unexpected task summary coverage")
+        messages, count, _ = snip_history_tasks(ls.messages, records, actual)
+        ls.messages = messages
+        ctx.messages = messages
+        return count
+    store = getattr(ls.rctx, "conversation_store", None)
+    original = store.load(session_id) if store is not None else ls.messages
+    actual = safe_snip_task_ids(original, safe_snip_task_ids(ls.messages, task_ids))
+    messages, _, actual = snip_history_tasks(ls.messages, records, actual)
+    if not actual:
+        raise RuntimeError("Task summaries would split a tool call and its result")
+    ContextArchiveStore(ls.rctx.workspace_root).archive(session_id, original, reason=reason)
+    if store is not None:
+        store.replace_all(session_id, snip_store(original, records, actual))
+    ls.messages = messages
+    ctx.messages = messages
+    return len(actual)
+
+
 def _build_compactor_input(ctx: Any, ls: Any) -> str:
-    """Flatten the current history into the text the compactor node summarizes."""
-    conversation_text = _format_messages_for_summary(
-        [m for m in ls.messages if m.get("role") != "system" and not m.get("_dynamic")]
+    from engine.compaction_plan import build_compaction_plan
+
+    _, instruction = build_compaction_plan(
+        ls.messages, keep_recent=ls.compact_keep_recent,
+        keep_recent_tokens=int(getattr(ls, "compact_keep_recent_tokens", 0) or 0),
     )
-    if len(conversation_text) <= _PTL_MAX_CHARS:
-        return conversation_text
-    # 保头弃尾：被丢掉的那部分正是马上要压缩的最老内容，保留的最近几段本来就会原样留着。
-    head = conversation_text[:_PTL_MAX_CHARS]
-    last_sep = head.rfind(_SUMMARY_SEPARATOR)
-    if last_sep > 0:
-        head = head[:last_sep]
-    ctx.extra["compact_ptl_original_chars"] = len(conversation_text)
-    return head
+    return instruction
 
 
 async def _request_background_compact(ctx: Any, ls: Any, compact_sid: str) -> None:
@@ -235,7 +264,7 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
             # Purpose: builtin compact and legacy ai_step compact make the same
             # dispatch decision before asking the compactor LLM to summarize.
             _seg_count = count_real_task_segments(_stored_msgs)
-            if _seg_count <= ls.compact_keep_recent:
+            if not getattr(ls, "compact_keep_recent_tokens", 0) and _seg_count <= ls.compact_keep_recent:
                 logger.info(
                     "skip compact: only %d task segments (keep_recent=%d), not enough to compress",
                     _seg_count, ls.compact_keep_recent,
@@ -249,7 +278,6 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
         from engine.task_record import (
             load_task_records,
             snip_history,
-            snip_store,
         )
 
         # [AutoC 2026-05-13] Why: L2 persisted snips must affect the parent
@@ -261,16 +289,7 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
         if snip_records:
             snipped, snip_count, snipped_ids = snip_history(ls.messages, snip_records)
             if snip_count > 0:
-                ls.messages = snipped
-                ctx.messages = ls.messages
-                store = getattr(ls.rctx, "conversation_store", None)
-                if store:
-                    try:
-                        stored = store.load(snip_sid)
-                        persisted = snip_store(stored, snip_records, snipped_ids)
-                        store.replace_all(snip_sid, persisted)
-                    except Exception as persist_error:
-                        logger.warning("failed to persist snipped history: %s", persist_error)
+                snip_count = await _apply_snip(ctx, ls, snip_sid, snip_records, snipped, snipped_ids, reason="threshold_snip")
                 await ls.rctx.emit_event("snip_compact", {
                     "node_id": ls.node.id,
                     "step": ctx.step,
@@ -287,13 +306,6 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
     try:
         await ls.rctx.emit_event("compact_start", {"node_id": ls.node.id, "step": ctx.step, "mode": "blocking"})
         conversation_text = _build_compactor_input(ctx, ls)
-        original_chars = int(ctx.extra.pop("compact_ptl_original_chars", 0) or 0)
-        if original_chars:
-            await ls.rctx.emit_event("ptl_truncated", {
-                "node_id": ls.node.id,
-                "step": ctx.step,
-                "original_chars": original_chars,
-            })
         if conversation_text.strip():
             ctx_ref = _persist_ctx(ls, ctx.step)
             return TaskAction(

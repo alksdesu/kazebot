@@ -224,9 +224,11 @@ class TaskStoreMixin:
                 slim_input: dict[str, Any] = {"_input_slimmed": True}
                 for _k in (
                     "task_context", "_dispatch_origin", "dispatch_context_mode",
-                    "parent_session_id", "branch_session_id", "base_count",
+                    "parent_session_id", "branch_session_id", "base_count", "base_last_id",
                     "_route_session_id", "_branch_finalized", "child_session_id",
                     "_compact_dispatch_pending", "_system_task", "_async_dispatch", "_session_reset",
+                    "_compact_plan", "_compact_target_session_id", "_compact_keep_recent",
+                    "_compact_keep_recent_tokens", "_compact_threshold_tokens", "context_ref",
                 ):
                     if _k in raw_input:
                         slim_input[_k] = raw_input[_k]
@@ -234,15 +236,38 @@ class TaskStoreMixin:
                 if isinstance(context, dict) and OUTPUT_GUIDE_KEY in context:
                     # 输出说明只给那一轮用，task_created 里已经存过完整的一份，后面的快照不再重复写。
                     slim_input["task_context"] = {key: value for key, value in context.items() if key != OUTPUT_GUIDE_KEY}
+                if event_type == "task_resumed":
+                    slim_input["_removed_input_keys"] = [
+                        key for key in ("_compact_dispatch_pending", "_compact_plan") if key not in raw_input
+                    ]
+                    resume_data = raw_input.get("resume_data")
+                    if isinstance(resume_data, dict) and resume_data.get("type") == "compact_done":
+                        slim_input["resume_data"] = resume_data
                 payload["input"] = slim_input
         return payload
 
+    @staticmethod
+    def _merge_slim_task_input(previous: dict[str, Any], updated: dict[str, Any]) -> dict[str, Any]:
+        merged = {
+            **previous,
+            **{key: value for key, value in updated.items() if key not in {"_input_slimmed", "_removed_input_keys"}},
+        }
+        removed = updated.get("_removed_input_keys")
+        if isinstance(removed, list):
+            for key in ("_compact_dispatch_pending", "_compact_plan"):
+                if key in removed:
+                    merged.pop(key, None)
+        old_context = previous.get("task_context")
+        new_context = merged.get("task_context")
+        if (
+            isinstance(old_context, dict) and isinstance(new_context, dict)
+            and OUTPUT_GUIDE_KEY in old_context and OUTPUT_GUIDE_KEY not in new_context
+        ):
+            merged["task_context"] = {**new_context, OUTPUT_GUIDE_KEY: old_context[OUTPUT_GUIDE_KEY]}
+        return merged
+
     def _apply_task_snapshot(self, payload: dict[str, Any]) -> None:
-        # [2026-07-16] Why: 非 task_created 事件的 input 已被瘦身
-        # （只留 _input_slimmed + 少量路由字段）。回放时若直接用瘦身快照覆盖，
-        # 会丢失已从 task_created 恢复的完整 instruction 等。How: 检测到
-        # _input_slimmed 且已有同 task_id 的完整 input 时，保留旧 input。
-        # Purpose: 事件回放后 Task.input 仍为完整值，路由/诊断不受影响。
+        # 后续快照只保存输入增量，回放时仍需保留创建事件中的完整指令。
         try:
             _new_input = payload.get("input")
             if isinstance(_new_input, dict) and _new_input.get("_input_slimmed"):
@@ -251,7 +276,7 @@ class TaskStoreMixin:
                 _prev_input = getattr(_prev, "input", None) if _prev else None
                 if isinstance(_prev_input, dict) and _prev_input:
                     payload = dict(payload)
-                    payload["input"] = _prev_input
+                    payload["input"] = self._merge_slim_task_input(_prev_input, _new_input)
             t = Task.model_validate(payload)
         except Exception:
             return

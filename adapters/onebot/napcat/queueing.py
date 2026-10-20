@@ -272,7 +272,6 @@ def _queue_merge_identity(item: models.QueuedInbound) -> tuple[Any, ...] | None:
         item.real_conversation_key, item.channel, item.is_dm, item.entry_node_id,
         facts.self_id, sender.platform_id, inbound._event_sender_role(item.event),
         sender.listed_admin, tuple(permissions._grant_of(cap.key) for cap in capability.CAPABILITIES),
-        item.platform_updates.get("_route_hints", {}).get("topic_id", ""),
     )
 
 
@@ -312,13 +311,8 @@ async def _enqueue_or_submit_inbound(item: models.QueuedInbound) -> bool:
     metadata = await state._adapter.features.prepare(item.bot, item.event)
     if not metadata:
         return await _queue_or_submit_ready(item)
-    topic = metadata.get("topic", {})
-    topic_id = topic.get("topic_id", "")
-    if topic_id and item.is_dm:
-        context = "\n".join(f"[{line['ref']}] {line['label']}: {line['text']}" for line in topic.get("context", []))
-        item.text += f"\n\n【当前话题 {topic_id}】\n{context}"
     item.platform_updates["_route_hints"] = {
-        "topic_id": topic_id, "response_action": metadata.get("action", "reply"),
+        "response_action": metadata.get("action", "reply"),
         "source_message_refs": [str(getattr(item.event, "message_id", ""))],
         "reply_message_id": str(getattr(item.event, "message_id", "")),
     }
@@ -328,8 +322,6 @@ async def _enqueue_or_submit_inbound(item: models.QueuedInbound) -> bool:
     message = item.event.get_message() if hasattr(item.event, "get_message") else []
     item.memory_user_ids = tuple(dict.fromkeys((*item.memory_user_ids, *at_segment_user_ids(message))))
     identity = _queue_merge_identity(item)
-    if identity:
-        identity += (topic_id,)
     if metadata["policy"].get("settings", {}).get("merge_window_sec", 0) > 0:
         state._adapter.features.stage_burst(item)
     return await state._adapter.features.coordinator.submit(item, metadata["policy"].get("settings", {}), identity,

@@ -171,11 +171,13 @@ class SessionMixin:
         [Fork/Merge 2026-05-12] 分支生命周期由 supervisor 管理：入口分支只是一次
         inbound 的执行副本，merge 后继续保留会污染后续查询。
         """
+        from engine.context_archive import ContextArchiveStore
         from engine.conversation_store import ConversationStore
 
         sid = str(session_id or "").strip()
         if not sid:
             return
+        ContextArchiveStore(self.workspace_root).purge_session(sid)
         # 走 ConversationStore.delete：它同时清掉本进程的内存缓存。
         ConversationStore(self.workspace_root / "data" / "conversations").delete(sid)
         for path in self.session_runtime_files(sid)[1:]:
@@ -272,6 +274,7 @@ class SessionMixin:
 
     def _merge_branch_locked(self, parent_session_id: str, branch_session_id: str, base_count: int) -> int:
         """Merge a completed entry branch back into its parent ConversationStore."""
+        from engine.branch_history import branch_base_count
         from engine.conversation_store import ConversationStore
 
         parent = str(parent_session_id or "").strip()
@@ -281,6 +284,8 @@ class SessionMixin:
         store = ConversationStore(self.workspace_root / "data" / "conversations")
         count = 0
         try:
+            branch_messages = list(store.load(branch))
+            base_count = branch_base_count(branch_messages, branch, int(base_count or 0))
             merge_fn = getattr(store, "merge", None)
             if callable(merge_fn):
                 count = int(merge_fn(parent, branch, base_count=int(base_count or 0)) or 0)
@@ -289,7 +294,6 @@ class SessionMixin:
                 # 原因：本次任务只允许改 supervisor 层，目标树里的 engine store 可能仍是旧版。
                 # 做法：读取 branch 中 fork 基准之后的消息并批量追加到 parent。
                 # 目的：保持新 supervisor 在旧 store 上也能完成分支回写。
-                branch_messages = list(store.load(branch))
                 tail = branch_messages[int(base_count or 0):]
                 if tail:
                     store.append_batch(parent, tail)
@@ -713,7 +717,7 @@ class SessionMixin:
 
             payload: dict[str, Any] = {"text": text_clean}
             if isinstance(route_hints, dict):
-                for key in ("delivery_purpose", "topic_id", "response_action", "reply_message_id", "source_message_refs"):
+                for key in ("delivery_purpose", "response_action", "reply_message_id", "source_message_refs"):
                     if key in route_hints:
                         payload[key] = route_hints[key]
             if delivery_key:

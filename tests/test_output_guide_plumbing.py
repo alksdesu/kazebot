@@ -176,7 +176,9 @@ class TestPreempt:
         assert sum(1 for message in loop.messages if message.get(STATIC_GUIDE_MARKER)) == 1
         assert "【可用表情】丙" in _dynamic(loop.messages) and "甲、乙" not in _texts(loop.messages)
         assert loop.rctx.task_context[OUTPUT_GUIDE_KEY] == _NEW_GUIDE
-        assert loop.messages[-1] == {"role": "user", "content": "follow-up"}
+        assert loop.messages[-1]["role"] == "user"
+        assert loop.messages[-1]["content"] == "follow-up"
+        assert loop.messages[-1]["_meta"]["timestamp"]
 
     @pytest.mark.asyncio
     async def test_without_a_new_guide_the_turn_block_keeps_the_old_one(self, tmp_path: Path) -> None:

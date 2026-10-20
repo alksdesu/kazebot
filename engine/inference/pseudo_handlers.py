@@ -13,7 +13,7 @@ from typing import Any
 from .resume_builder import _select_attachments
 from .attachment_access import RefusedAttachment, screen_model_attachment_paths
 from ..attachments import is_allowed_attachment_path
-from ..compact import _format_messages_for_summary
+from ..compaction_plan import build_compaction_plan
 from ..protocol import TaskAction, ACTION_ASK, ACTION_DISPATCH, ACTION_FINISH
 from .loop_state import _LoopState, _persist_ctx, _short, compact_target_session_id
 # 【Fix 3】reply 工具结果统一走 formatter.format_tool_result，需要 ParsedToolCall 构造、
@@ -335,8 +335,12 @@ async def _handle_pseudo_compact(ls: _LoopState, pseudo_call, step: int) -> Task
         pass
     try:
         await ls.rctx.emit_event("compact_start", {"node_id": ls.node.id, "step": step, "manual": True})
-        conversation_text = _format_messages_for_summary(
-            [m for m in ls.messages if m.get("role") != "system" and not m.get("_dynamic")]
+        _, conversation_text = build_compaction_plan(
+            ls.messages, keep_recent=_manual_keep,
+            keep_recent_tokens=(
+                0 if _manual_keep != ls.compact_keep_recent
+                else int(getattr(ls, "compact_keep_recent_tokens", 0) or 0)
+            ),
         )
         if conversation_text.strip():
             # Dispatch 路径：写 tool_result 后退出循环

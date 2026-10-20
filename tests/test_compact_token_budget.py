@@ -134,8 +134,15 @@ class _Router(TaskRouterMixin):
         # 真实的 SupervisorState 由 SessionMixin 建这张表；空表即「还没收到 usage 上报」。
         self._session_context_usage: dict[str, dict[str, Any]] = usage or {}
 
-    def _sync_compact_to_branches(self, target_session_id: str, summary_msg: Any, to_keep: list[Any]) -> None:
-        self.synced.append((target_session_id, len(to_keep)))
+    def _sync_compact_to_branches(self, target_session_id: str, summary_msg: Any, plan: dict) -> None:
+        self.synced.append((target_session_id, plan["compressed_segments"]))
+
+    def apply_summary(self, session_id, summary, **sizing):
+        from engine.compaction_plan import build_compaction_plan
+        from engine.conversation_store import ConversationStore
+        messages = ConversationStore(self.workspace_root / "data/conversations").load(session_id)
+        plan, _ = build_compaction_plan(messages, **sizing)
+        return self._apply_compact_via_conv_store_locked(session_id, summary, plan=plan, **sizing)
 
 
 class TestSupervisorApplyOnDisk:
@@ -161,7 +168,7 @@ class TestSupervisorApplyOnDisk:
         # 每条 600 字符 = 200 token，预算 450 只装得下最后两条。
         store = self._store(tmp_path, [(f"t{i}", 600) for i in range(5)])
 
-        result = _Router(tmp_path)._apply_compact_via_conv_store_locked(
+        result = _Router(tmp_path).apply_summary(
             self.SESSION, "S" * 300, keep_recent=6, threshold_tokens=256000, keep_recent_tokens=450,
         )
 
@@ -172,7 +179,7 @@ class TestSupervisorApplyOnDisk:
     def test_keep_recent_segments_still_works_when_no_token_budget_is_set(self, tmp_path: Any) -> None:
         store = self._store(tmp_path, [(f"t{i}", 600) for i in range(5)])
 
-        result = _Router(tmp_path)._apply_compact_via_conv_store_locked(
+        result = _Router(tmp_path).apply_summary(
             self.SESSION, "S" * 300, keep_recent=2, threshold_tokens=256000, keep_recent_tokens=0,
         )
 
@@ -183,7 +190,7 @@ class TestSupervisorApplyOnDisk:
     def test_exactly_one_summary_row_replaces_the_compressed_span(self, tmp_path: Any) -> None:
         store = self._store(tmp_path, [(f"t{i}", 600) for i in range(5)])
 
-        _Router(tmp_path)._apply_compact_via_conv_store_locked(
+        _Router(tmp_path).apply_summary(
             self.SESSION, "S" * 300, keep_recent=6, threshold_tokens=256000, keep_recent_tokens=450,
         )
 
@@ -195,23 +202,23 @@ class TestSupervisorApplyOnDisk:
     def test_a_budget_covering_everything_leaves_the_file_untouched(self, tmp_path: Any) -> None:
         store = self._store(tmp_path, [(f"t{i}", 600) for i in range(3)])
 
-        result = _Router(tmp_path)._apply_compact_via_conv_store_locked(
+        result = _Router(tmp_path).apply_summary(
             self.SESSION, "S" * 300, keep_recent=6, threshold_tokens=256000, keep_recent_tokens=100_000,
         )
 
         assert result["before"] == result["after"] == 3
         assert len(store.load(self.SESSION)) == 3
 
-    def test_branch_sync_is_told_the_messages_that_survived(self, tmp_path: Any) -> None:
+    def test_branch_sync_receives_exact_compression_coverage(self, tmp_path: Any) -> None:
         # 分支前缀按存活消息条数对齐；数错了合并回主历史时会重复或丢消息。
         self._store(tmp_path, [(f"t{i}", 600) for i in range(5)])
         router = _Router(tmp_path)
 
-        router._apply_compact_via_conv_store_locked(
+        router.apply_summary(
             self.SESSION, "S" * 300, keep_recent=6, threshold_tokens=256000, keep_recent_tokens=450,
         )
 
-        assert router.synced == [(self.SESSION, 2)]
+        assert router.synced == [(self.SESSION, 3)]
 
 
 class TestHardThreshold:

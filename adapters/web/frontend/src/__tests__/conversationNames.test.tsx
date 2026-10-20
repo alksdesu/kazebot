@@ -83,7 +83,7 @@ describe('共享会话名称', () => {
   ] as const)('真实%s页选名称后读取请求仍携带原key', async (name, Page, endpoint) => {
     const selectedScope = name === '群协作' ? group : person;
     const selectedName = name === '群协作' ? '周末群' : '小周';
-    const policy = { response_policy_enabled: false, topic_enabled: false, merge_window_sec: 0, merge_max_wait_sec: 4, reply_budget_per_minute: 6 };
+    const policy = { response_policy_enabled: false, merge_window_sec: 0, merge_max_wait_sec: 4, reply_budget_per_minute: 6 };
     vi.mocked(featureRequest).mockImplementation(async (path, options) => {
       if (path.endsWith('/settings/scopes')) return { items: [] } as never;
       if (path.endsWith('/state')) return { scope: options?.scope, revision: 0, guide: {}, quiet: {}, settings: { ...policy, welcome_enabled: false }, defaults: policy, overrides: {}, inherited_fields: Object.keys(policy), defaults_revision: 0 } as never;

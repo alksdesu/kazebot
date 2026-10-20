@@ -72,6 +72,16 @@ class TestAnchorResolution:
 
 
 def _post(app, body: dict) -> httpx.Response:
+    from engine.conversation_store import ConversationStore, Message
+    target = body.get("target_session_id", "")
+    state = app.state.state
+    if state.anchor_session_for_locked(target):
+        store = ConversationStore(state.workspace_root / "data/conversations")
+        if not store.load(target):
+            store.append_batch(target, [
+                Message(id=f"m{i}", role="user", content="historical " * 10000, source_task_id=f"t{i}")
+                for i in range(12)
+            ])
     async def _run() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:

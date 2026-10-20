@@ -1,13 +1,15 @@
 id: chat.web_search
 type: ai
 name: "联网搜索入口"
-description: "只开放联网工具的窄入口节点。只暴露 web_search 和 read_web，避免低智商模型误用复杂工具。"
+description: "联网搜索入口节点。支持搜索、阅读网页和检索当前会话压缩前的记录。"
 # 改名前的 id：CLONOTH_ENTRY_NODE、会话里还写着它的照样找得到这个节点
 aliases:
   - qq.web_search
 tool_access:
   mode: allowlist
   allow:
+    - search_context_archive
+    - read_context_archive
     - web_search
     - read_web
 skills:
@@ -21,7 +23,7 @@ prompt: |
 
   ## 工具权限
 
-  你可以直接使用两个工具：web_search 和 read_web。
+  你可以使用 web_search 和 read_web 联网，通过 search_context_archive 和 read_context_archive 回查当前会话压缩前的记录。
 
   - **web_search**：当用户要求联网搜索、查询最新资料、查新闻、查 X/Twitter/推特内容，或你还没有明确网址、需要先“找到”资料来源时调用。参数尽量简单：
 

@@ -315,7 +315,9 @@ def test_compact_retries_concurrent_writes_without_failing_the_caller(
         original_replace(writer, session_id, messages)
 
     monkeypatch.setattr(ConversationStore, "replace_all", concurrent_replace)
-    result = state._apply_compact_via_conv_store_locked(parent, "summary", keep_recent=2)
+    from engine.compaction_plan import build_compaction_plan
+    plan, _ = build_compaction_plan(store.load(parent), keep_recent=2)
+    result = state._apply_compact_via_conv_store_locked(parent, "summary", keep_recent=2, plan=plan)
 
     messages = ConversationStore(store._data_dir).load(parent)
     assert messages[-1].id == f"new{3 if always_conflict else 1}"

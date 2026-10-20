@@ -61,7 +61,6 @@ class TestCompactTarget:
 
         sources = {
             "engine/builtin/compact.py": None,
-            "engine/inference/ai_step.py": None,
             "engine/inference/pseudo_handlers.py": None,
         }
         for rel in sources:
@@ -308,6 +307,12 @@ class TestSupervisorCalibration:
             def _sync_compact_to_branches(self, *args: Any) -> None:
                 return None
 
+            def apply_summary(self, session_id, summary, **sizing):
+                from engine.compaction_plan import build_compaction_plan
+                messages = ConversationStore(self.workspace_root / "data/conversations").load(session_id)
+                plan, _ = build_compaction_plan(messages, chars_per_token=self._session_chars_per_token(session_id, messages), **sizing)
+                return self._apply_compact_via_conv_store_locked(session_id, summary, plan=plan, **sizing)
+
         return _Router()
 
     def _seed(self, tmp_path: Path, segments: int = 5, chars: int = 600) -> ConversationStore:
@@ -324,7 +329,7 @@ class TestSupervisorCalibration:
     def test_without_usage_it_uses_the_default_ratio(self, tmp_path: Path) -> None:
         self._seed(tmp_path)
 
-        result = self._router(tmp_path, None)._apply_compact_via_conv_store_locked(
+        result = self._router(tmp_path, None).apply_summary(
             self.SESSION, "S" * 300, keep_recent=6, threshold_tokens=256000, keep_recent_tokens=450,
         )
 
@@ -336,7 +341,7 @@ class TestSupervisorCalibration:
 
         result = self._router(tmp_path, {
             "prompt_tokens": 2500, "prompt_chars": 3000,
-        })._apply_compact_via_conv_store_locked(
+        }).apply_summary(
             self.SESSION, "S" * 300, keep_recent=6, threshold_tokens=256000, keep_recent_tokens=450,
         )
 

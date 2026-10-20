@@ -305,9 +305,6 @@ async def _judge_llm_intent(bot: Bot, event: GroupMessageEvent, text: str) -> In
     limit = int(live.llm_intent_context_messages)
     context_lines = [entry.text for entry in list(state._adapter.group_history[group_id])[-limit:]] if limit > 0 else []
     metadata = state._adapter.features.coordinator.metadata(state._adapter.features.actor(bot, event)) if state._adapter.features.available else {}
-    topic = metadata.get("topic", {})
-    if topic.get("context"):
-        context_lines = [f"{line['label']}: {line['text']}" for line in topic["context"]]
     if metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled"):
         reactions = output_guide._reaction_section(CHANNEL_GROUP)
         if reactions is not None:
@@ -474,20 +471,12 @@ async def _build_inbound_text(
     now = dt.datetime.now(common._CST).strftime("%Y-%m-%d %H:%M CST")
 
     parts: List[str] = ["【群聊上下文记录】"]
-    metadata = state._adapter.features.coordinator.metadata(state._adapter.features.actor(bot, event)) if state._adapter.features.available else {}
-    topic = metadata.get("topic", {})
-    if topic.get("topic_id"):
-        parts.extend(f"[{line['ref']}] {line['label']}: {line['text']}" for line in topic.get("context", [])
-                     if str(line['ref']) != str(getattr(event, "message_id", "")))
-        if len(parts) == 1:
-            parts.append("（当前话题暂无前文）")
-        covered_seq = watermark
-    elif lost > 0:
+    if lost > 0:
         # 不说这一句，模型会把中间断掉的一段群聊当连续的推理。
         parts.append(f"（此前 {lost} 条群消息超出缓存上限，未包含在内）")
-    if not topic.get("topic_id") and fresh:
+    if fresh:
         parts.extend(entry.text for entry in fresh)
-    elif not topic.get("topic_id") and lost <= 0:
+    elif lost <= 0:
         # 已带过历史却没有新行，和「这个群从没说过话」是两回事，不能都说“暂无”。
         parts.append("（无新消息）" if watermark >= 0 else "（暂无）")
 

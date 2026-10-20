@@ -1,9 +1,4 @@
-"""两处「文本超长截断」的方向必须各自朝对的一边。
-
-送压缩器的文本要保头：被丢掉的正是马上要被删、最需要被总结的最老内容。
-送提取器的 transcript 要保尾：它的任务是「总结刚刚发生了什么」，而原来是正序累加、
-超了就 break，丢掉当条及其后全部，于是一个长回合里它只看得到最早的部分。
-"""
+"""压缩器覆盖旧消息，记忆提取器保留最近消息。"""
 from __future__ import annotations
 
 import sys
@@ -93,13 +88,16 @@ class TestExtractorKeepsTheRecentTail:
 
 class TestCompactorKeepsTheOldHead:
     def test_the_compactor_input_keeps_the_beginning(self) -> None:
-        """方向与提取器相反，而且这两处以前都是同一个错误方向。"""
-        import inspect
-
+        import json
+        from types import SimpleNamespace
         from engine.builtin import compact as compact_mod
 
-        source = inspect.getsource(compact_mod._build_compactor_input)
-
-        # 保头是 [:limit]；保尾会写成 [-limit:]
-        assert "_PTL_MAX_CHARS]" in source
-        assert "-_PTL_MAX_CHARS:" not in source
+        messages = [
+            _msg("user", f"turn {index} " + "x" * 100_000, _meta={"source_task_id": f"task-{index}"})
+            for index in range(5)
+        ]
+        loop = SimpleNamespace(messages=messages, compact_keep_recent=1, compact_keep_recent_tokens=0)
+        instruction = compact_mod._build_compactor_input(SimpleNamespace(extra={}), loop)
+        selected = [json.loads(line) for line in instruction.splitlines()]
+        assert selected == messages[:2]
+        assert messages[2]["content"].startswith("turn 2 ")

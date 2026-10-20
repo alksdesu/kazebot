@@ -1,4 +1,6 @@
 from __future__ import annotations
+from datetime import datetime, timezone
+from uuid import uuid4
 from engine.conversation_routing import routing_meta
 
 from typing import Any
@@ -164,6 +166,16 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
         })
     else:
         ls.messages.append({"role": "user", "content": new_instruction})
+    message_id = str(uuid4())
+    timestamp = datetime.now(timezone.utc).isoformat()
+    ls.messages[-1]["_meta"] = {
+        **routing_meta(task_context),
+        "message_id": message_id,
+        "timestamp": timestamp,
+        "message_type": "user_input",
+        "source_task_id": getattr(ls.rctx, "task_id", ""),
+        **({"attachments": list(new_attachments)} if new_attachments else {}),
+    }
 
     # [Fork/Merge 2026-05-12] Persist the injected preempt user message to ConversationStore.
     # Why: before this hook was extracted, preempt injection only mutated the in-memory prompt,
@@ -174,9 +186,6 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     try:
         store = getattr(ls.rctx, "conversation_store", None)
         if store is not None and (new_instruction or new_attachments):
-            from datetime import datetime, timezone
-            from uuid import uuid4
-
             from engine.conversation_store import Message, MessageType
 
             target_session = getattr(ls.rctx, "child_session_id", "") or ls.rctx.session_id
@@ -197,11 +206,11 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
             store.append(
                 target_session,
                 Message(
-                    id=str(uuid4()),
+                    id=message_id,
                     role="user",
                     content=persisted_content,
                     message_type=MessageType.USER_INPUT,
-                    created_at=datetime.now(timezone.utc).isoformat(),
+                    created_at=timestamp,
                     meta={
                         **routing_meta(task_context),
                         **({"attachments": list(new_attachments)} if new_attachments else {}),

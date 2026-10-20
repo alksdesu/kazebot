@@ -119,17 +119,18 @@ def test_notice_is_opt_in_deduplicated_and_obeys_quiet(service, manager, monkeyp
     assert service.notifications(manager) == []
 
 
-def test_explicit_reply_restores_correct_topic_and_scope(service, manager):
+def test_retired_topic_endpoint_ignores_legacy_references_and_scope(service, manager):
     service.update_settings(manager, {"topic_enabled": True})
     first = service.ingest(member(manager, 1), {"message_id": "1", "text": "A"})
     second = service.ingest(member(manager, 2), {"message_id": "2", "text": "B"})
     followup = service.ingest(member(manager, 3), {"message_id": "3", "reply_ref": "1", "text": "about A"})
-    assert first["topic_id"] == followup["topic_id"] != second["topic_id"]
-    assert [entry["ref"] for entry in followup["context"]] == ["1", "3"]
+    assert first == second == followup == {"topic_id": "", "context": []}
     other = replace(manager, scope="qq_group:two")
     service.update_settings(other, {"topic_enabled": True})
     foreign = service.ingest(other, {"message_id": "4", "reply_ref": "1", "text": "foreign"})
-    assert foreign["topic_id"] != first["topic_id"]
+    assert foreign == first
+    with service._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
 
 
 @pytest.fixture()
@@ -214,9 +215,9 @@ def test_community_api_authorizes_actual_scope_and_runs_commands(tmp_path, monke
         assert client.get('/v1/community/activities?scope=qq_group:b', headers=headers).status_code == 403
         member_headers = {"X-Clonoth-Adapter-Actor": json.dumps({**manager_actor, "user_id": "10002", "role": "member"})}
         assert client.post('/v1/community/quiet', headers=member_headers, json={"mode": "silent"}).status_code == 403
-        saved = client.patch('/v1/community/settings', headers=headers, json={"topic_enabled": True})
+        saved = client.patch('/v1/community/settings', headers=headers, json={"response_policy_enabled": True})
         assert saved.status_code == 200
-        assert client.get('/v1/community/state', headers=headers).json()["settings"]["topic_enabled"] is True
+        assert client.get('/v1/community/state', headers=headers).json()["settings"]["response_policy_enabled"] is True
 
 
 def test_resuming_quiet_wakes_sdk_deferred_delivery(runtime):
@@ -234,7 +235,7 @@ def test_resuming_quiet_wakes_sdk_deferred_delivery(runtime):
     assert calls == [runtime.state._adapter.features.actor(SimpleNamespace(self_id="90000"), event())["scope"]]
 
 
-def test_short_message_stage_survives_restart_and_keeps_topic(runtime, monkeypatch):
+def test_short_message_stage_survives_restart_with_legacy_route_metadata(runtime, monkeypatch):
     import time
 
     bot = SimpleNamespace(self_id="90000", call_api=AsyncMock(return_value={"role": "member"}))
@@ -254,7 +255,7 @@ def test_short_message_stage_survives_restart_and_keeps_topic(runtime, monkeypat
     monkeypatch.setattr(runtime.queueing, "_queue_or_submit_ready", submit)
     asyncio.run(runtime.state._adapter.features.recover_bursts(bot))
     assert len(recovered) == 1
-    assert recovered[0].platform_updates["_route_hints"]["topic_id"] == "topic-1"
+    assert recovered[0].platform_updates["_route_hints"]["source_message_refs"] == ["7"]
     assert recovered[0].platform_updates["_source_attachments"] == queued.attachments
     assert runtime.state._adapter.features.burst_store.recover("another-bot", time.time() + 2) == []
 
@@ -280,7 +281,7 @@ def test_private_metadata_never_grants_group_role(runtime):
     assert actor["channel"] == "qq_private" and actor["role"] == "member"
 
 
-def test_topic_intent_json_keeps_old_yes_no_contract():
+def test_response_intent_json_keeps_old_yes_no_contract():
     from supervisor.reply_intent import parse_intent_text
 
     assert parse_intent_text('yes|followup').agreed
@@ -323,7 +324,7 @@ def test_activity_inputs_do_not_silently_coerce_invalid_types(service, manager, 
         service.create_activity(manager, {"title": "Game", **body})
 
 
-def test_current_inbound_never_embeds_foreign_topic_as_user_content(runtime, monkeypatch):
+def test_current_inbound_uses_group_watermark_and_ignores_legacy_topic(runtime, monkeypatch):
     bot = SimpleNamespace(self_id="90000")
     current = event(message_id=9, text="follow up")
     runtime.state._adapter.client = SimpleNamespace(request_feature=AsyncMock())
@@ -331,11 +332,59 @@ def test_current_inbound_never_embeds_foreign_topic_as_user_content(runtime, mon
     runtime.state._adapter.features.coordinator.messages[(actor["scope"], "9")] = {
         "topic": {"topic_id": "books", "context": [{"ref": "8", "label": "Alice", "text": "book original"}]},
     }
-    runtime.history._append_group_history(12345, "foreign unrelated question")
+    runtime.history._append_group_history(12345, "current conversation history")
     monkeypatch.setattr(runtime.history, "_build_reply_context", AsyncMock(return_value=("", [])))
     text, watermark = asyncio.run(runtime.inbound._build_inbound_text(current, bot, "follow up", actor["scope"], []))
-    assert "book original" in text and "foreign unrelated question" not in text
-    assert watermark == -1
+    assert "book original" not in text and "current conversation history" in text
+    assert watermark >= 0
+
+
+def test_coordinator_no_longer_requests_topic_context_from_legacy_policy(runtime):
+    request = AsyncMock(return_value={"settings": {"topic_enabled": True}, "quiet": {}})
+    actor = {"scope": "qq_private:synthetic", "message_id": "1", "user_id": "12345"}
+    result = asyncio.run(runtime.state._adapter.features.coordinator.prepare(
+        SimpleNamespace(request_feature=request), actor, "new message", reply_ref="old",
+    ))
+    assert result["reply_ref"] == "old" and "topic" not in result
+    request.assert_awaited_once_with("GET", "/v1/community/state", actor=actor)
+
+
+def test_private_queue_ignores_legacy_topic_metadata_without_injecting_a_header(runtime, monkeypatch):
+    bot = SimpleNamespace(self_id="90000")
+    current = event(message_id=9, text="current request")
+    del current.group_id
+    runtime.state._adapter.client = SimpleNamespace(request_feature=AsyncMock())
+    actor = runtime.state._adapter.features.actor(bot, current)
+    metadata = {
+        "actor": actor, "action": "reply", "direct": True, "policy": {"settings": {}},
+        "topic": {"topic_id": "legacy", "context": [{"text": "isolated history"}]},
+    }
+    monkeypatch.setattr(runtime.state._adapter.features, "prepare", AsyncMock(return_value=metadata))
+    submitted = AsyncMock(return_value=True)
+    monkeypatch.setattr(runtime.queueing, "_queue_or_submit_ready", submitted)
+    item = runtime.models.QueuedInbound(
+        None, bot, current, "qq_private", "qq_private:10001", actor["scope"],
+        "current request", [], True, {}, "current request",
+    )
+    assert asyncio.run(runtime.queueing._enqueue_or_submit_inbound(item)) is True
+    assert item.text == "current request"
+    assert "topic_id" not in item.platform_updates["_route_hints"]
+    assert item.platform_updates["_route_hints"]["source_message_refs"] == ["9"]
+    submitted.assert_awaited_once_with(item)
+
+
+def test_queue_merge_identity_ignores_legacy_topics_but_retains_sender_and_entry(runtime):
+    bot = SimpleNamespace(self_id="90000")
+    scope = runtime.state._adapter.features.actor(bot, event())["scope"]
+    first = runtime.models.QueuedInbound(
+        None, bot, event(), "qq_group", "qq_group:12345", scope, "first", [], False,
+        {"_route_hints": {"topic_id": "one"}}, "first",
+    )
+    second = replace(first, event=event(message_id=2), platform_updates={"_route_hints": {"topic_id": "two"}})
+    identity = runtime.queueing._queue_merge_identity(first)
+    assert identity is not None and runtime.queueing._queue_merge_identity(second) == identity
+    assert runtime.queueing._queue_merge_identity(replace(second, event=event(user_id=10002), facts=None)) != identity
+    assert runtime.queueing._queue_merge_identity(replace(second, entry_node_id="another.node")) != identity
 
 
 def test_reaction_rechecks_quiet_instead_of_using_cached_event_policy(runtime):
@@ -473,48 +522,44 @@ def test_silent_blocks_actual_platform_send_families(runtime, tmp_path, path):
     bot.call_api.assert_not_called()
 
 
-def test_restart_fallback_preserves_platform_reference_and_topic(runtime, tmp_path):
+def test_restart_fallback_preserves_platform_reference_without_topic_ingest(runtime, tmp_path):
     from clonoth_sdk.types import DeliveryContext
     service = CommunityService(tmp_path)
     bot = SimpleNamespace(self_id="90000", send_group_msg=AsyncMock(return_value={"message_id": 501}), call_api=AsyncMock(return_value=[]))
     scope = runtime.state._adapter.features.actor(bot, event())["scope"]
     admin = FeatureActor(scope=scope, owner="bot", is_admin=True, role="admin", channel="qq_group")
-    service.update_settings(admin, {"topic_enabled": True})
-    service.ingest(admin, {"message_id": "400", "text": "unrelated bot reply", "topic_id": "other"})
     calls = []
     async def request(method, path, **kwargs):
         calls.append((path, kwargs))
         if path.endswith("/state"):
             return service.state(admin)
-        if path == "/v1/community/messages":
-            return service.ingest(admin, kwargs["body"])
         return {"recorded": True}
     runtime.state._adapter.client = SimpleNamespace(request_feature=request)
     runtime.state._adapter.last_bot = bot
     runtime.state._adapter.real_conversation_keys[scope] = "qq_group:12345"
-    context = DeliveryContext(event_id="final-recovered", conversation_key=scope, topic_id="books", reply_message_id="99", purpose="direct")
+    context = DeliveryContext(event_id="final-recovered", conversation_key=scope, reply_message_id="99", purpose="direct")
     asyncio.run(runtime.callbacks.TangQiuCallbacks().send_to_channel(scope, "restored answer", [], delivery_context=context))
     bot.send_group_msg.assert_awaited_once()
-    topic_call = next(kwargs for path, kwargs in calls if path == "/v1/community/messages")
-    assert topic_call["body"]["reply_ref"] == "99" and topic_call["body"]["topic_id"] == "books"
-    followup = service.ingest(replace(admin, is_admin=False, owner="reader"), {"message_id": "502", "reply_ref": "501", "text": "follow up"})
-    assert followup["topic_id"] == "books"
-    assert all(row["text"] != "unrelated bot reply" for row in followup["context"])
+    assert not any(path == "/v1/community/messages" for path, _ in calls)
+    record = next(kwargs for path, kwargs in calls if path == "/v1/materials/journal/messages")
+    assert record["body"]["reply_ref"] == "99"
 
 
-def test_member_cannot_reassign_message_to_arbitrary_topic(service, manager):
+def test_retired_ingest_cannot_reenable_topics_from_explicit_topic_id(service, manager):
     service.update_settings(manager, {"topic_enabled": True})
     first = service.ingest(member(manager, 1), {"message_id": "1", "text": "A"})
     second = service.ingest(member(manager, 2), {"message_id": "2", "text": "B", "topic_id": first["topic_id"]})
-    assert first["topic_id"] != second["topic_id"]
+    assert first == second == {"topic_id": "", "context": []}
 
 
-def test_context_clear_removes_only_topic_state(service, manager):
-    service.update_settings(manager, {"topic_enabled": True, "welcome_enabled": True})
+def test_context_clear_removes_only_legacy_message_state(service, manager):
+    service.update_settings(manager, {"welcome_enabled": True})
     service.update_guide(manager, {"rules": "published rules"})
     service.set_quiet(manager, "silent", 30)
     service.create_activity(manager, {"title": "Keep activity"})
-    service.ingest(member(manager, 1), {"message_id": "1", "text": "old context"})
+    with service._db(True) as db:
+        db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?,?,?)",
+                   (manager.scope, "1", "1", "Alice", "old context", "", "legacy", 1000))
     service.record_decision(replace(manager, message_id="1"), {"action": "task"})
     service.clear_context(manager.scope)
     assert service.decisions(manager) == []
@@ -522,7 +567,9 @@ def test_context_clear_removes_only_topic_state(service, manager):
     assert service.state(manager)["guide"]["rules"] == "published rules"
     assert len(service.activities(manager)) == 1
     after = service.ingest(member(manager, 1), {"message_id": "2", "text": "new context", "reply_ref": "1"})
-    assert [row["text"] for row in after["context"]] == ["new context"]
+    assert after == {"topic_id": "", "context": []}
+    with service._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
 
 
 def test_adapter_clear_discards_unsubmitted_burst_and_durable_copy(runtime):

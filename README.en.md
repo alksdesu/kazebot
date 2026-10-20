@@ -40,7 +40,7 @@ Joining a group archives the previous configuration. Leaving copies the group's 
 | Category | Capabilities |
 |---|---|
 | Model integrations | OpenAI / Responses, Anthropic, Gemini, and DeepSeek; multiple channels and fallback chains |
-| Conversations and collaboration | Context compaction, subtasks, and specialized nodes |
+| Conversations and collaboration | Full current-session history, context compaction, original-message archives, subtasks, and specialized nodes |
 | Memory | Long-term memory, user profiles, retrieval, and scheduled maintenance |
 | Tools | Web search, page fetch, file access, shell commands, symbolic math, market quotes, custom tools, and MCP |
 | Image generation | NovelAI, Gemini, and GPT Image, with presets and configurable parameters |
@@ -48,6 +48,10 @@ Joining a group archives the previous configuration. Leaving copies the group's 
 | QQ interactions | Images and files, nested forwarded messages, quoted replies, @ mentions, progress reactions, slash commands, and sticker collection and review |
 
 QQ replies to @ mentions by default. Names, keywords, probability, model-based decisions, and cooldowns are configurable. The console tests trigger rules using the actual decision logic. Platform-specific capabilities come from each adapter.
+
+Conversation history is no longer partitioned or filtered by topic. The model receives the current session's history and existing summaries. Compaction replaces only the messages actually supplied to the summarizer and preserves messages appended while it runs. Sessions and instances remain separate.
+
+Original messages, timestamps, tool arguments, and results are saved before compaction in each instance's `data/context_archive.sqlite3`. The model can search its own session with `search_context_archive` and page through results with `read_context_archive`. **Memory → Context archives** controls retention through `engine.context_archive.retention_days`, defaulting to seven days from archive creation. Expired archives become unavailable immediately and are deleted by scheduled cleanup; active history and summaries are unaffected. Resetting or deleting a session also deletes its archives. Previously discarded originals cannot be recovered.
 
 ## Console
 

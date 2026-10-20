@@ -29,6 +29,8 @@ delegate_targets: []
 tool_access:
   mode: allowlist
   allow:
+    - search_context_archive
+    - read_context_archive
     - save_memory
     - list_memories
     - read_file

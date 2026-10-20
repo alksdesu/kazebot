@@ -31,7 +31,6 @@ from .loop_state import (
     _persist_ctx,
     _short,
     build_tool_context,
-    compact_target_session_id,
 )
 from .llm_call import _call_llm_with_retry, _build_failure_action, _is_retryable_error, _RETRYABLE_STATUS_CODES
 from .pseudo_handlers import _handle_pseudo_tool
@@ -43,7 +42,7 @@ from ..attachments import build_multimodal_content
 from ..conversation_store import ConversationStore, Message, MessageType
 from ..node import Node
 from .message_assembly import assemble_initial_messages
-from ..conversation_routing import concise_text, routing_meta, short_reply, topic_history
+from ..conversation_routing import concise_text, routing_meta, short_reply
 from ..protocol import (
     TaskAction,
     ACTION_DISPATCH,
@@ -55,11 +54,6 @@ from ..protocol import (
 )
 # [2026-04-17] write_artifact 移除：截断机制已废弃，不再写 artifact 文件
 from ..tool_step import result_to_raw, summarize_result
-from ..compact import (
-    _format_messages_for_summary,
-    count_real_task_segments,
-    should_compact,
-)
 from clonoth_runtime import get_int, get_float, get_bool, load_runtime_config
 from toolbox.context import ToolContext
 # build_llm_messages: 反序列化方向的格式转换，在 llm_call.py 中实际调用。
@@ -231,141 +225,6 @@ async def _check_preempt_and_cancel(ls: _LoopState, step: int) -> TaskAction | N
                 await ls.rctx.emit_event("preempt_acknowledged", {
                     "node_id": ls.node.id, "task_id": ls.rctx.task_id, "step": step,
                 })
-    return None
-
-
-async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
-    """上下文压缩检查。如需压缩则返回 DISPATCH action。"""
-    if ls.compacted or ls.compact_threshold <= 0:
-        return None
-    compact_sid = compact_target_session_id(ls)
-    # 熔断判定归 supervisor：engine 是多个独立 worker 进程，各自的计数器互相看不见，
-    # 而压缩失败几乎全在 supervisor 侧记账。
-    if not should_compact(ls.messages, ls.compact_threshold, ls.last_prompt_tokens):
-        return None
-
-    # ---------------------------------------------------------------
-    # Pre-check: count task segments in ConversationStore. If there
-    # are not enough segments to compress (≤ keep_recent), skip the
-    # LLM compactor call entirely to avoid wasting API calls.
-    # ---------------------------------------------------------------
-    try:
-        _conv_store = getattr(ls.rctx, 'conversation_store', None)
-        if _conv_store:
-            _stored_msgs = _conv_store.load(compact_sid)
-            # [2026-05-17] Why: compact_summary is the prior compressed prefix,
-            # not a real task segment. How: use the shared segment counter that
-            # skips compact_summary and counts only consecutive real task ids.
-            # Purpose: this legacy ai_step path stays aligned with builtin
-            # compact and stops dispatching when only keep_recent real tasks remain.
-            _seg_count = count_real_task_segments(_stored_msgs)
-            if _seg_count <= ls.compact_keep_recent:
-                logger.info(
-                    "skip compact: only %d task segments (keep_recent=%d), not enough to compress",
-                    _seg_count, ls.compact_keep_recent,
-                )
-                ls.compacted = True  # prevent retrigger this step
-                return None
-    except Exception as _seg_err:
-        logger.warning("segment pre-check failed, proceeding with compact: %s", _seg_err)
-
-    # ---------------------------------------------------------------
-    # P6 Snip Compact (Level 2): 用已有轮摘要替换旧 task 消息链
-    # 在 dispatch LLM compactor 前先尝试，可能免去 LLM 调用
-    # ---------------------------------------------------------------
-    try:
-        from engine.task_record import (
-            load_task_records,
-            snip_history,
-            snip_store,
-        )
-        # [AutoC 2026-05-13] Why: branch sessions are forked copies, so snipping
-        # them does not reduce the durable parent history. How: use the same
-        # parent-first target as LLM compact. Purpose: L2 and L3 compaction both
-        # persist to the session future branches will fork from.
-        _snip_sid = compact_sid
-        _snip_records = load_task_records(ls.rctx.workspace_root, _snip_sid)
-        if _snip_records:
-            # Incremental: snip a few oldest tasks per trigger
-            _snipped, _snip_count, _snipped_ids = snip_history(
-                ls.messages, _snip_records,
-            )
-            if _snip_count > 0:
-                ls.messages = _snipped
-                # Persist to ConversationStore so next load sees snipped version
-                _store = getattr(ls.rctx, 'conversation_store', None)
-                if _store:
-                    try:
-                        _stored = _store.load(_snip_sid)
-                        _persisted = snip_store(_stored, _snip_records, _snipped_ids)
-                        _store.replace_all(_snip_sid, _persisted)
-                    except Exception as _pe:
-                        logger.warning("failed to persist snipped history: %s", _pe)
-                await ls.rctx.emit_event("snip_compact", {
-                    "node_id": ls.node.id, "step": step,
-                    "snipped_tasks": _snip_count,
-                })
-                # Snipped something → done for this round, continue task
-                logger.info("snip_compact: replaced %d tasks, skipping LLM compact", _snip_count)
-                ls.compacted = True
-                return None
-
-    except Exception as _snip_err:
-        logger.warning("snip compact failed, falling through to LLM compact: %s", _snip_err)
-
-    ls.compacted = True
-    try:
-        await ls.rctx.emit_event("compact_start", {"node_id": ls.node.id, "step": step})
-        conversation_text = _format_messages_for_summary(
-            [m for m in ls.messages if m.get("role") != "system" and not m.get("_dynamic")]
-        )
-        # ---------------------------------------------------------------
-        # P5b PTL Retry: 压缩请求本身过长时截断
-        # compactor 节点也有模型上下文上限，如果待压缩的对话文本超过
-        # 这个上限，压缩请求自身就会 413。这里在发送前做预截断：
-        # 保留尾部（最近的对话），丢弃头部（最旧的部分），并对齐到
-        # 消息分隔符边界，避免截断产生不完整消息。
-        # ~100K tokens ≈ 300K chars（按 3 字符/token 估算）
-        # ---------------------------------------------------------------
-        _ptl_max_chars = 300000
-        if len(conversation_text) > _ptl_max_chars:
-            _ptl_original_len = len(conversation_text)
-            conversation_text = conversation_text[-_ptl_max_chars:]
-            # 找到第一个完整消息边界（--- 分隔符），丢弃截断的不完整消息
-            _first_sep = conversation_text.find("\n\n---\n\n")
-            if _first_sep > 0:
-                conversation_text = conversation_text[_first_sep + len("\n\n---\n\n"):]
-            await ls.rctx.emit_event("ptl_truncated", {
-                "node_id": ls.node.id, "step": step,
-                "original_chars": _ptl_original_len,
-            })
-        if conversation_text.strip():
-            ctx_ref = _persist_ctx(ls, step)
-            return TaskAction(
-                action=ACTION_DISPATCH,
-                node_id=ls.node.id,
-                target_node="system.compactor",
-                context_ref=ctx_ref,
-                dispatch_input={
-                    "instruction": conversation_text,
-                    "_compact_dispatch": True,
-                    "context_mode": "fresh",
-                    "_compact_keep_recent": ls.compact_keep_recent,
-                    "_compact_threshold_tokens": ls.compact_threshold,
-                    # [AutoC 2026-05-13] Why: supervisor applies the compactor
-                    # result after dispatch returns, and branch session ids are
-                    # temporary. How: carry the parent-first target session in the
-                    # dispatch input. Purpose: LLM compact rewrites the durable
-                    # parent ConversationStore.
-                    "target_session_id": compact_sid,
-                    "_system_task": True,
-                    "use_context": False,
-                },
-            )
-    except Exception as compact_err:
-        await ls.rctx.emit_event("compact_failed", {
-            "node_id": ls.node.id, "step": step, "error": str(compact_err),
-        })
     return None
 
 
@@ -1843,8 +1702,6 @@ async def run_ai_node(
 
     runtime_cfg = load_runtime_config(rctx.workspace_root)
     route_meta = routing_meta(rctx.task_context)
-    topic_id = str(route_meta.get("topic_id") or "")
-    history = topic_history(history, topic_id, current_task_id=rctx.task_id)
     max_steps = get_int(runtime_cfg, "engine.max_steps", 32, min_value=1, max_value=200)
     # [fix 2026-07-17] 支持节点级 max_steps 覆盖：系统节点（压缩/摘要/读图等）是
     # 单轮一次性任务，不需要 32 步的大循环。压缩模型持续空响应/非法 JSON 时，若沿用
@@ -1902,7 +1759,7 @@ async def run_ai_node(
     _assembled_fresh = False
     snapshot = load_context_snapshot(rctx.workspace_root, context_ref) if context_ref else None
     if snapshot and isinstance(snapshot.get("messages"), list):
-        messages = topic_history(list(snapshot.get("messages") or []), topic_id, current_task_id=rctx.task_id)
+        messages = list(snapshot.get("messages") or [])
         try:
             step_count = int(snapshot.get("step_count") or 0)
         except Exception:
@@ -2126,7 +1983,6 @@ async def run_ai_node(
         # Purpose: avoid knowledge injection imports in this loop while keeping the
         # migrated execution order visible.
 
-        ls.messages = topic_history(ls.messages, topic_id, current_task_id=rctx.task_id)
         result = await _call_llm_with_retry(ls, step)
         if isinstance(result, TaskAction):
             return result

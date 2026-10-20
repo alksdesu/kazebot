@@ -17,14 +17,12 @@ from supervisor.feature_auth import FeatureActor
 
 FACTORY = {
     "response_policy_enabled": False,
-    "topic_enabled": True,
     "merge_window_sec": 8.0,
     "merge_max_wait_sec": 10.0,
     "reply_budget_per_minute": 6,
 }
 LEGACY = {
     "response_policy_enabled": False,
-    "topic_enabled": False,
     "merge_window_sec": 0.0,
     "merge_max_wait_sec": 4.0,
     "reply_budget_per_minute": 6,
@@ -124,8 +122,8 @@ def test_fresh_api_returns_factory_values_for_defaults_group_and_private(tmp_pat
             assert state["overrides"] == {} and state["defaults_revision"] == 0
 
 
-@pytest.mark.parametrize("scope", ["qq_group:topic", "qq_private:topic"])
-def test_fresh_topic_tracking_uses_references_and_participants_without_configuration(tmp_path, admin, scope):
+@pytest.mark.parametrize("scope", ["qq_group:legacy", "qq_private:legacy"])
+def test_retired_message_endpoint_does_not_partition_or_store_conversation(tmp_path, admin, scope):
     service = CommunityService(tmp_path)
     first_actor = replace(admin, scope=scope, owner="synthetic:first", is_admin=False)
     second_actor = replace(first_actor, owner="synthetic:second")
@@ -133,9 +131,9 @@ def test_fresh_topic_tracking_uses_references_and_participants_without_configura
     second = service.ingest(second_actor, {"message_id": "2", "text": "other topic"})
     same_participant = service.ingest(first_actor, {"message_id": "3", "text": "continuation"})
     referenced = service.ingest(second_actor, {"message_id": "4", "reply_ref": "1", "text": "reply"})
-    assert first["topic_id"] and first["topic_id"] != second["topic_id"]
-    assert first["topic_id"] == same_participant["topic_id"] == referenced["topic_id"]
-    assert {row["ref"] for row in referenced["context"]} == {"1", "3", "4"}
+    assert first == second == same_participant == referenced == {"topic_id": "", "context": []}
+    with sqlite3.connect(service.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
     assert service.state(replace(admin, scope=scope))["overrides"] == {}
 
 
@@ -151,7 +149,7 @@ def test_non_qq_scopes_keep_legacy_baseline_before_and_after_default_edits(tmp_p
     assert before["defaults"] == LEGACY
     assert service.ingest(actor, {"message_id": "1", "text": "not a QQ topic"}) == {"topic_id": "", "context": []}
     service.update_defaults(admin, {
-        "values": {"response_policy_enabled": True, "topic_enabled": False, "merge_window_sec": 2},
+        "values": {"response_policy_enabled": True, "merge_window_sec": 2},
         "expected_revision": 0,
     })
     assert service.state(actor) == before
@@ -160,16 +158,16 @@ def test_non_qq_scopes_keep_legacy_baseline_before_and_after_default_edits(tmp_p
 @pytest.mark.parametrize("version", [0, 1, 2])
 @pytest.mark.parametrize("values", [
     pytest.param(NO_TABLE, id="missing-table"), pytest.param(NO_ROW, id="missing-row"),
-    pytest.param({}, id="empty-map"), pytest.param({"topic_enabled": True}, id="sparse-topic"),
+    pytest.param({}, id="empty-map"), pytest.param({"response_policy_enabled": True}, id="sparse-response-policy"),
     pytest.param({"merge_max_wait_sec": 4}, id="sparse-max-without-window"),
     pytest.param({"response_policy_enabled": False, "merge_window_sec": 0, "merge_max_wait_sec": 0}, id="false-zero"),
-    pytest.param({**LEGACY, "topic_enabled": True, "merge_window_sec": 2, "merge_max_wait_sec": 5}, id="full-map"),
+    pytest.param({**LEGACY, "response_policy_enabled": True, "merge_window_sec": 2, "merge_max_wait_sec": 5}, id="full-map"),
 ])
 def test_legacy_migration_freezes_effective_defaults_and_preserves_every_group_byte(tmp_path, admin, version, values):
     groups = {
         "qq_group:partial": {"merge_max_wait_sec": 4, "welcome_enabled": True},
-        "qq_private:explicit": {"topic_enabled": False, "merge_window_sec": 0},
-        "web:console": {"topic_enabled": True, "merge_window_sec": 0, "merge_max_wait_sec": 0},
+        "qq_private:explicit": {"response_policy_enabled": False, "merge_window_sec": 0},
+        "web:console": {"response_policy_enabled": True, "merge_window_sec": 0, "merge_max_wait_sec": 0},
     }
     path = legacy_database(tmp_path, version, values, groups=groups)
     with sqlite3.connect(path) as db:
@@ -206,19 +204,19 @@ def test_versioned_legacy_database_without_tables_is_not_treated_as_fresh(tmp_pa
 
 
 @pytest.mark.parametrize("raw", [
-    "{broken", "[]", '{"topic_enabled":"false"}', '{"merge_window_sec":"1.0"}',
+    "{broken", "[]", '{"response_policy_enabled":"false"}', '{"merge_window_sec":"1.0"}',
     '{"merge_window_sec":5}', '{"unexpected":true}', '{"merge_max_wait_sec":null}',
 ])
 @pytest.mark.parametrize("version", [0, 1, 2])
 def test_invalid_legacy_defaults_fail_without_partial_schema_or_data_migration(tmp_path, raw, version):
-    path = legacy_database(tmp_path, version, raw, groups={"qq_group:kept": {"topic_enabled": False}})
+    path = legacy_database(tmp_path, version, raw, groups={"qq_group:kept": {"response_policy_enabled": False}})
     before = database_snapshot(path)
     with pytest.raises(ValueError):
         CommunityService(tmp_path)
     assert database_snapshot(path) == before
 
 
-@pytest.mark.parametrize("raw", ["{broken", "[]", '{"topic_enabled":"false"}', '{"merge_window_sec":5}'])
+@pytest.mark.parametrize("raw", ["{broken", "[]", '{"response_policy_enabled":"false"}', '{"merge_window_sec":5}'])
 def test_damaged_legacy_group_remains_local_to_that_group_after_migration(tmp_path, admin, raw):
     path = legacy_database(tmp_path, 2, {}, groups={"qq_group:damaged": raw, "qq_group:healthy": {}})
     with sqlite3.connect(path) as db:
@@ -263,7 +261,7 @@ def test_initialization_failure_rolls_back_schema_values_and_version_together(tm
 def test_future_version_keeps_unknown_settings_and_does_not_rewrite_history(tmp_path):
     service = CommunityService(tmp_path)
     with sqlite3.connect(service.path) as db:
-        db.execute("UPDATE conversation_defaults SET settings=?,revision=31 WHERE id=1", ('{ "future_policy": {"mode":"new"}, "topic_enabled": false }',))
+        db.execute("UPDATE conversation_defaults SET settings=?,revision=31 WHERE id=1", ('{ "future_policy": {"mode":"new"}, "response_policy_enabled": false }',))
         db.execute("INSERT INTO groups(scope,settings,revision) VALUES (?,?,?)", ("qq_group:future", '{"future_override":true}', 42))
         db.execute("PRAGMA user_version=99")
     before = database_snapshot(service.path)
@@ -274,7 +272,7 @@ def test_future_version_keeps_unknown_settings_and_does_not_rewrite_history(tmp_
 @pytest.mark.parametrize("initial", ["fresh", "legacy"])
 def test_concurrent_initializers_agree_and_migrate_only_once(tmp_path, admin, initial):
     if initial == "legacy":
-        legacy_database(tmp_path, 2, {"topic_enabled": True})
+        legacy_database(tmp_path, 2, {"response_policy_enabled": True})
     barrier = Barrier(6)
 
     def initialize(_):
@@ -283,42 +281,58 @@ def test_concurrent_initializers_agree_and_migrate_only_once(tmp_path, admin, in
 
     with ThreadPoolExecutor(max_workers=6) as pool:
         results = list(pool.map(initialize, range(6)))
-    expected = {**LEGACY, "topic_enabled": True} if initial == "legacy" else FACTORY
+    expected = {**LEGACY, "response_policy_enabled": True} if initial == "legacy" else FACTORY
     revision = 8 if initial == "legacy" else 0
     assert results == [{"settings": expected, "values": expected if initial == "legacy" else {}, "revision": revision}] * 6
     assert database_snapshot(database_path(tmp_path))[0] == 3
 
 
 def test_old_and_new_instances_keep_independent_values_across_migration_and_restart(tmp_path, admin):
-    legacy_database(tmp_path / "old", 2, {"topic_enabled": False, "merge_window_sec": 0})
+    legacy_database(tmp_path / "old", 2, {"response_policy_enabled": False, "merge_window_sec": 0})
     old = CommunityService(tmp_path / "old")
     fresh = CommunityService(tmp_path / "fresh")
     assert old.defaults(admin)["settings"] == LEGACY
     assert fresh.defaults(admin)["settings"] == FACTORY
-    fresh.update_defaults(admin, {"values": {"topic_enabled": False}, "expected_revision": 0})
-    old.update_defaults(admin, {"values": {"topic_enabled": True}, "expected_revision": 8})
-    assert CommunityService(tmp_path / "old").defaults(admin)["settings"] == {**LEGACY, "topic_enabled": True}
-    assert CommunityService(tmp_path / "fresh").defaults(admin)["settings"] == {**FACTORY, "topic_enabled": False}
+    fresh.update_defaults(admin, {"values": {"response_policy_enabled": False}, "expected_revision": 0})
+    old.update_defaults(admin, {"values": {"response_policy_enabled": True}, "expected_revision": 8})
+    assert CommunityService(tmp_path / "old").defaults(admin)["settings"] == {**LEGACY, "response_policy_enabled": True}
+    assert CommunityService(tmp_path / "fresh").defaults(admin)["settings"] == {**FACTORY, "response_policy_enabled": False}
 
 
 def test_migration_revision_rejects_pre_upgrade_draft_without_losing_it(tmp_path, admin):
-    legacy_database(tmp_path, 2, {"topic_enabled": False}, revision=4)
+    legacy_database(tmp_path, 2, {"response_policy_enabled": False}, revision=4)
     service = CommunityService(tmp_path)
     before = database_snapshot(service.path)
     with pytest.raises(SettingsConflict):
-        service.update_defaults(admin, {"values": {"topic_enabled": True}, "expected_revision": 4})
+        service.update_defaults(admin, {"values": {"response_policy_enabled": True}, "expected_revision": 4})
     assert database_snapshot(service.path) == before
-    saved = service.update_defaults(admin, {"values": {"topic_enabled": True}, "expected_revision": 5})
-    assert saved["revision"] == 6 and saved["settings"]["topic_enabled"] is True
+    saved = service.update_defaults(admin, {"values": {"response_policy_enabled": True}, "expected_revision": 5})
+    assert saved["revision"] == 6 and saved["settings"]["response_policy_enabled"] is True
 
 
 def test_explicit_factory_value_is_still_an_override_with_its_own_revision(tmp_path, admin):
     service = CommunityService(tmp_path)
-    saved = service.update_defaults(admin, {"values": {"topic_enabled": True}, "expected_revision": 0})
-    assert saved == {"settings": FACTORY, "values": {"topic_enabled": True}, "revision": 1}
-    assert service.update_defaults(admin, {"values": {"topic_enabled": True}, "expected_revision": 1}) == saved
-    reset = service.update_defaults(admin, {"reset_fields": ["topic_enabled"], "expected_revision": 1})
+    saved = service.update_defaults(admin, {"values": {"response_policy_enabled": False}, "expected_revision": 0})
+    assert saved == {"settings": FACTORY, "values": {"response_policy_enabled": False}, "revision": 1}
+    assert service.update_defaults(admin, {"values": {"response_policy_enabled": False}, "expected_revision": 1}) == saved
+    reset = service.update_defaults(admin, {"reset_fields": ["response_policy_enabled"], "expected_revision": 1})
     assert reset == {"settings": FACTORY, "values": {}, "revision": 2}
+
+
+@pytest.mark.parametrize("version", [0, 1, 2, 3])
+def test_retired_topic_fields_do_not_change_active_values_or_legacy_group_bytes(tmp_path, admin, version):
+    values = {**LEGACY, "topic_enabled": True}
+    local = {"topic_enabled": False, "response_policy_enabled": True}
+    path = legacy_database(tmp_path, version, values, groups={"qq_group:kept": local})
+    with sqlite3.connect(path) as db:
+        original_group = db.execute("SELECT * FROM groups").fetchone()
+    service = CommunityService(tmp_path)
+    assert service.defaults(admin)["settings"] == LEGACY
+    state = service.state(replace(admin, scope="qq_group:kept"))
+    assert state["overrides"] == {"response_policy_enabled": True}
+    assert state["revision"] == 9 and "topic_enabled" not in state["settings"]
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT * FROM groups").fetchone() == original_group
 
 
 def test_legacy_defaults_reset_adopts_factory_values_and_keeps_unrelated_group_data(tmp_path, admin):

@@ -2094,6 +2094,23 @@ def create_app(
             return {"task_id": task.task_id, **IntentResult(error=str(exc)[:200]).as_dict()}
         return {"task_id": task.task_id, **result.as_dict()}
 
+    @app.post("/v1/tasks/compact-snip")
+    async def compact_snip(request: Request) -> dict[str, Any]:
+        st: SupervisorState = app.state.state
+        body = await request.json()
+        target = body.get("target_session_id") if isinstance(body, dict) else None
+        task_ids = body.get("task_ids") if isinstance(body, dict) else None
+        if not isinstance(target, str) or not target.strip():
+            raise HTTPException(status_code=400, detail="target_session_id required")
+        if not isinstance(task_ids, list) or not 1 <= len(task_ids) <= 10000 or any(
+            not isinstance(task_id, str) or not task_id.strip() or len(task_id) > 256 for task_id in task_ids
+        ):
+            raise HTTPException(status_code=400, detail="task_ids must contain valid task identifiers")
+        with st._lock:
+            if not st.anchor_session_for_locked(target):
+                raise HTTPException(status_code=404, detail="session not found")
+            return st._apply_snip_via_conv_store_locked(target, set(task_ids))
+
     @app.post("/v1/tasks/compact-async")
     async def compact_async(request: Request) -> dict[str, Any]:
         """Create a background compaction task that does not suspend the caller.
@@ -2137,6 +2154,14 @@ def create_app(
             anchor_session_id = st.anchor_session_for_locked(target_session_id)
             if not anchor_session_id:
                 raise HTTPException(status_code=404, detail="session not found")
+            sizing = {
+                "_compact_keep_recent": _int_field("keep_recent", 6),
+                "_compact_keep_recent_tokens": _int_field("keep_recent_tokens"),
+                "_compact_threshold_tokens": _int_field("threshold_tokens"),
+            }
+            plan, instruction = st._prepare_compact_input_locked(target_session_id, sizing)
+            if not plan:
+                return {"ok": True, "task_id": "", "reason": "no complete history segments to compact"}
             generation = st._current_session_generation_locked(anchor_session_id) or 1
             child_sid, _is_new = st.get_or_create_child_session(
                 anchor_session_id, node_id, f"compact:{target_session_id}", "fresh",
@@ -2153,6 +2178,7 @@ def create_app(
                     "use_context": False,
                     "_system_task": True,
                     "_compact_async": True,
+                    "_compact_plan": plan,
                     "_compact_target_session_id": target_session_id,
                     "_compact_keep_recent": _int_field("keep_recent", 6),
                     "_compact_keep_recent_tokens": _int_field("keep_recent_tokens"),

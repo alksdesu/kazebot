@@ -224,7 +224,6 @@ class EventRouter:
             ),
             purpose=EventRouter._delivery_purpose(payload),
             feature_delivery_id=str(payload.get("delivery_id") or ""),
-            topic_id=str(payload.get("topic_id") or ""),
             reply_message_id=str(payload.get("reply_message_id") or ""),
         )
 
@@ -535,7 +534,6 @@ class EventRouter:
                 force_replay=record.replay_generation > 0,
                 purpose=self._delivery_purpose(event.payload),
                 feature_delivery_id=str(event.payload.get("delivery_id") or ""),
-                topic_id=str(event.payload.get("topic_id") or ""),
                 reply_message_id=str(event.payload.get("reply_message_id") or ""),
             )
             if reminder_delivery:

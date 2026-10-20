@@ -103,7 +103,7 @@ def mixed_history():
 
 
 @pytest.mark.parametrize("snapshot", [False, True])
-def test_actual_loop_filters_resume_and_live_hook_history_without_breaking_tool_pairs(loop, monkeypatch, snapshot):
+def test_actual_loop_keeps_all_session_topics_and_tool_pairs(loop, monkeypatch, snapshot):
     messages = mixed_history()
     monkeypatch.setattr(ai_step, "load_context_snapshot", lambda *args: {"messages": messages, "step_count": 0})
 
@@ -121,7 +121,7 @@ def test_actual_loop_filters_resume_and_live_hook_history_without_breaking_tool_
     assert result.action == "finish"
     seen = loop.snapshots[0]["messages"]
     content = "\n".join(str(message.get("content")) for message in seen)
-    assert "foreign" not in content
+    assert "foreign question" in content and "foreign response" in content and "late foreign" in content
     assert "shared summary" in content and "current dynamic memory" in content
     assert any(message.get("tool_call_id") == "lookup" for message in seen)
     assert any(call.get("id") == "lookup" for message in seen for call in message.get("tool_calls", []))

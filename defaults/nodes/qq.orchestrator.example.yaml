@@ -10,6 +10,8 @@ delegate_targets:
 tool_access:
   mode: allowlist
   allow:
+    - search_context_archive
+    - read_context_archive
     - draft_execution_plan
     - inspect_execution_plan
     - revise_execution_plan

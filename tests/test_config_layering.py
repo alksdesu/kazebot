@@ -317,16 +317,16 @@ class TestSessionLayer:
     def test_a_group_override_beats_the_session_default(
         self, service: CommunityService, admin: FeatureActor, group: FeatureActor,
     ) -> None:
-        service.update_defaults(admin, {"values": {"topic_enabled": True}, "expected_revision": 0})
+        service.update_defaults(admin, {"values": {"response_policy_enabled": True}, "expected_revision": 0})
         service.update_overrides(group, {
-            "values": {"topic_enabled": False}, "expected_revision": 0, "expected_defaults_revision": 1,
+            "values": {"response_policy_enabled": False}, "expected_revision": 0, "expected_defaults_revision": 1,
         })
 
         state = service.state(group)
 
-        assert state["settings"]["topic_enabled"] is False
-        assert state["defaults"]["topic_enabled"] is True
-        assert state["overrides"] == {"topic_enabled": False}
+        assert state["settings"]["response_policy_enabled"] is False
+        assert state["defaults"]["response_policy_enabled"] is True
+        assert state["overrides"] == {"response_policy_enabled": False}
 
     def test_a_group_without_an_override_follows_the_session_default(
         self, service: CommunityService, admin: FeatureActor, group: FeatureActor,
@@ -348,8 +348,8 @@ class TestSessionLayer:
     ) -> None:
         before = service.state(group)
 
-        _write(tmp_path / "config" / "features.yaml", "topic_enabled: false\nqueue:\n  workers: 9\n")
-        _write(tmp_path / "config" / "qq.yaml", "topic_enabled: false\nqueue:\n  workers: 7\n")
+        _write(tmp_path / "config" / "features.yaml", "response_policy_enabled: false\nqueue:\n  workers: 9\n")
+        _write(tmp_path / "config" / "qq.yaml", "response_policy_enabled: false\nqueue:\n  workers: 7\n")
 
         assert service.state(group) == before
 

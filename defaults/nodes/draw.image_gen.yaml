@@ -22,6 +22,8 @@ strip_images: true
 tool_access:
   mode: allowlist
   allow:
+    - search_context_archive
+    - read_context_archive
     - gpt_image_2
     - gemini_image
 

@@ -124,12 +124,7 @@ class ConversationCoordinator:
         if key in self.messages:
             return self.messages[key]
         policy = await self.policy(client, actor)
-        topic = {}
-        if policy.get("settings", {}).get("topic_enabled"):
-            topic = await client.request_feature("POST", "/v1/community/messages", actor=actor, body={
-                "text": text, "message_id": actor.get("message_id"), "reply_ref": reply_ref, "sender_name": sender_name,
-            })
-        result = {"policy": policy, "topic": topic, "reply_ref": reply_ref, "action": "reply", "direct": False}
+        result = {"policy": policy, "reply_ref": reply_ref, "action": "reply", "direct": False}
         self.messages[key] = result
         while len(self.messages) > 1024:
             self.messages.popitem(last=False)

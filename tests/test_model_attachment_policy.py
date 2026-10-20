@@ -453,6 +453,7 @@ def test_build_tool_context_carries_the_node_level_extras(tmp_path: Path) -> Non
     assert TOOL_CONTEXT_EXTRA_ATTRS == (
         "_node_id", "_node_extra", "_memory_subjects",
         "_route_conversation_key", "_parent_conversation_key",
+        "_context_archive_session_id",
     )
     assert all(hasattr(ctx, attr) for attr in TOOL_CONTEXT_EXTRA_ATTRS)
     assert ctx._node_id == "qq.orchestrator"
@@ -460,6 +461,7 @@ def test_build_tool_context_carries_the_node_level_extras(tmp_path: Path) -> Non
     assert ctx._memory_subjects == ["UserA"]
     assert ctx._route_conversation_key == "qq_private:123"
     assert ctx._parent_conversation_key == "qq_group:456"
+    assert ctx._context_archive_session_id == "session-1"
 
 
 def test_build_tool_context_defaults_an_empty_task_context(tmp_path: Path) -> None:

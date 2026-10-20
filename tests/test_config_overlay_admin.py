@@ -571,6 +571,24 @@ class TestTheNodeFilesEndpoint:
 
 
 class TestTheRuntimeEndpoint:
+    def test_archive_retention_saved_by_console_is_used_without_restart(self, admin, ws: Path, code_root: Path) -> None:
+        from engine.context_archive import ContextArchiveStore
+
+        _write(config_layout.default_runtime_path(), "engine:\n  max_steps: 40\n  context_archive:\n    retention_days: 7\n")
+        archive = ContextArchiveStore(ws)
+        assert archive.retention_days == 7
+        raw = admin("GET", "/runtime/raw").json()
+        saved = admin("PUT", "/runtime/raw", json={
+            "content": "engine:\n  max_steps: 40\n  context_archive:\n    retention_days: 14\n",
+            "base_hash": raw["hash"],
+        })
+        assert saved.status_code == 200
+        assert archive.retention_days == 14
+        assert clonoth_runtime.load_runtime_config(ws)["engine"]["max_steps"] == 40
+        stale = admin("PUT", "/runtime/raw", json={"content": raw["content"], "base_hash": raw["hash"]})
+        assert stale.status_code == 409
+        assert archive.retention_days == 14
+
     def test_without_an_instance_file_the_bundled_runtime_is_shown(self, admin, ws: Path, code_root: Path) -> None:
         _write(config_layout.default_runtime_path(), "engine:\n  max_steps: 40\n")
 

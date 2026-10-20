@@ -68,16 +68,16 @@ def test_topic_history_keeps_complete_task_tool_pairs_and_shared_legacy():
         {"role": "user", "content": "old"}, {"role": "assistant", "content": "old reply"},
     ]
     selected = topic_history(history, "books")
-    assert selected == [history[index] for index in (0, 1, 3, 5, 6)]
+    assert selected is history
     assert topic_history(history, "") is history
     assert len(history) == 7
 
 
-def test_topic_history_limits_legacy_by_whole_turn():
+def test_legacy_topic_fields_do_not_limit_history():
     history = [{"role": role, "content": str(index)} for index in range(8) for role in ("user", "assistant")]
-    assert topic_history(history, "new") == history[-6:]
+    assert topic_history(history, "new") is history
     assert len(concise_text("很长的回应" * 100)) <= 240
-    assert routing_meta({"route_hints": {"topic_id": "books", "source_message_refs": ["123"], "untrusted": "ignored"}}) == {"topic_id": "books", "source_message_refs": ["123"]}
+    assert routing_meta({"route_hints": {"topic_id": "books", "source_message_refs": ["123"], "untrusted": "ignored"}}) == {"source_message_refs": ["123"]}
 
 
 def request(headers):
@@ -127,7 +127,7 @@ def test_quiet_deferral_survives_restart_without_ack_or_failed_attempt(tmp_path)
         await router._deliver_outbound_record(router._outbound_store.pending()[0])
         assert not router._outbound_store.pending()
         assert callback.call_args.kwargs["delivery_context"].purpose == "ambient"
-        assert callback.call_args.kwargs["delivery_context"].topic_id == "books"
+        assert callback.call_args.kwargs["delivery_context"].topic_id == ""
         assert callback.call_args.kwargs["delivery_context"].reply_message_id == "42"
 
     asyncio.run(exercise())
