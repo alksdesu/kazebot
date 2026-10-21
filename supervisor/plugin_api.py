@@ -94,6 +94,8 @@ def _pid_alive(pid: int) -> bool:
 
 
 def runtime_status(root: Path) -> list[dict[str, Any]]:
+    from plugin_runtime.manager import runtime_stale
+
     result: list[dict[str, Any]] = []
     directory = root / "data" / "plugin_runtime"
     for path in sorted(directory.glob("*.json")):
@@ -105,6 +107,8 @@ def runtime_status(root: Path) -> list[dict[str, Any]]:
             raw = json.loads(path.read_text(encoding="utf-8"))
             pid = raw["pid"]
             if isinstance(pid, bool) or not isinstance(pid, int) or not 0 < pid <= 0xFFFFFFFF:
+                continue
+            if runtime_stale(raw.get("updated_at", "")):
                 continue
             alive = _pid_alive(pid) and raw.get("alive", True) is True
             plugins = []

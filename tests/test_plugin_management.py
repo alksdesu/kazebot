@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -15,6 +17,10 @@ import config_layout
 from plugin_runtime.store import PluginStore, inspect_source
 from supervisor import admin_api
 from supervisor.plugin_api import create_plugin_router, runtime_status
+
+
+def _fresh() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 SOURCE = '''PARAMS_SCHEMA = [
@@ -192,12 +198,56 @@ def test_api_auth_conflicts_and_full_entry_responses(tmp_path, monkeypatch):
 def test_stopped_runtime_not_reported_as_loaded(tmp_path, monkeypatch):
     directory = tmp_path / "data" / "plugin_runtime"
     directory.mkdir(parents=True)
-    (directory / "1.json").write_text(json.dumps({"pid": 1, "process": "engine", "plugins": [{"id": "example", "state": "loaded", "desired_hash": "new", "applied_hash": "old"}]}))
+    (directory / "1.json").write_text(json.dumps({"pid": 1, "process": "engine", "updated_at": _fresh(), "plugins": [{"id": "example", "state": "loaded", "desired_hash": "new", "applied_hash": "old"}]}))
     monkeypatch.setattr("supervisor.plugin_api._pid_alive", lambda _: False)
     state = runtime_status(tmp_path)[0]
     assert state["alive"] is False
     assert state["plugins"][0]["status"] == "stopped"
     assert state["plugins"][0]["desired_hash"] == "old"
+
+
+def test_runtime_status_filters_stale_processes(tmp_path, monkeypatch):
+    directory = tmp_path / "data" / "plugin_runtime"
+    directory.mkdir(parents=True)
+    stale = datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat()
+    (directory / "111.json").write_text(json.dumps({"pid": 111, "process": "engine", "updated_at": stale, "plugins": []}))
+    (directory / "222.json").write_text(json.dumps({"pid": 222, "process": "engine", "updated_at": _fresh(), "plugins": []}))
+    monkeypatch.setattr("supervisor.plugin_api._pid_alive", lambda _: True)
+    result = runtime_status(tmp_path)
+    assert [entry["pid"] for entry in result] == [222]
+    assert result[0]["alive"] is True
+
+
+def test_prune_runtime_dir_removes_only_stale(tmp_path):
+    from plugin_runtime.manager import _prune_runtime_dir
+    directory = tmp_path / "data" / "plugin_runtime"
+    directory.mkdir(parents=True)
+    stale = datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat()
+    keep = directory / "1.json"
+    keep.write_text(json.dumps({"pid": 1, "updated_at": stale}))
+    dead = directory / "2.json"
+    dead.write_text(json.dumps({"pid": 2, "updated_at": stale}))
+    alive = directory / "3.json"
+    alive.write_text(json.dumps({"pid": 3, "updated_at": _fresh()}))
+    corrupt = directory / "4.json"
+    corrupt.write_text("{ not json")
+    _prune_runtime_dir(directory, keep=keep)
+    assert keep.exists() and alive.exists()
+    assert not dead.exists()
+    assert not corrupt.exists()
+
+
+def test_write_status_prunes_dead_runtime_files(tmp_path):
+    from plugin_runtime.manager import PluginManager
+    directory = tmp_path / "data" / "plugin_runtime"
+    directory.mkdir(parents=True)
+    stale = datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat()
+    (directory / "99999.json").write_text(json.dumps({"pid": 99999, "updated_at": stale, "plugins": []}))
+    manager = PluginManager(tmp_path)
+    with manager._lock:
+        manager._write_status_locked()
+    assert (directory / f"{os.getpid()}.json").exists()
+    assert not (directory / "99999.json").exists()
 
 
 def test_static_metadata_unpack_and_dynamic_metadata_rejection(tmp_path):
@@ -294,7 +344,7 @@ def test_runtime_diagnostics_include_frames_and_skip_corrupt_entries(tmp_path, m
     directory = tmp_path / "data" / "plugin_runtime"
     directory.mkdir(parents=True)
     raw = {
-        "pid": 123, "updated_at": "2026-10-18T00:00:00Z", "plugins": [None, {
+        "pid": 123, "updated_at": _fresh(), "plugins": [None, {
             "id": "example", "state": "error", "desired_hash": "new", "applied_hash": "old",
             "error": "request failed", "error_details": {"phase": "request", "type": "ValueError", "message": "invalid setting", "frames": [{"file": "example.py", "line": 17, "function": "before_request"}]},
         }],

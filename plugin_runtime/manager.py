@@ -25,6 +25,7 @@ from typing import Any
 from plugin_sdk import PluginAPI, PluginExecutionError, RequestContext
 
 logger = logging.getLogger(__name__)
+RUNTIME_STALE_SECONDS = 30  # 15 missed 2s heartbeats → process is dead
 _scope: ContextVar[dict[str, Any]] = ContextVar("plugin_scope", default={})
 _loading: ContextVar[bool] = ContextVar("plugin_loading", default=False)
 _managers: dict[tuple[int, str], "PluginManager"] = {}
@@ -71,6 +72,35 @@ def plugin_scope(**values: Any):
 
 def current_scope() -> dict[str, Any]:
     return dict(_scope.get())
+
+
+def runtime_stale(updated_at: str, *, now: float | None = None) -> bool:
+    reference = now if now is not None else datetime.now(timezone.utc).timestamp()
+    try:
+        return datetime.fromisoformat(updated_at).timestamp() < reference - RUNTIME_STALE_SECONDS
+    except (ValueError, TypeError):
+        return True
+
+
+def _prune_runtime_dir(directory: Path, *, keep: Path) -> None:
+    now = datetime.now(timezone.utc).timestamp()
+    for path in directory.glob("*.json"):
+        if path == keep or path.is_symlink():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            updated_at = raw.get("updated_at", "") if isinstance(raw, dict) else ""
+        except OSError:
+            continue
+        except (ValueError, TypeError):
+            updated_at = ""
+        if runtime_stale(updated_at, now=now):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                continue
 
 
 def get_manager(workspace_root: Path | str, process: str | None = None) -> "PluginManager":
@@ -432,6 +462,7 @@ class PluginManager:
             temporary = directory / f".{os.getpid()}.{threading.get_ident()}.tmp"
             temporary.write_text(json.dumps(self._status_locked(), ensure_ascii=False), encoding="utf-8")
             os.replace(temporary, path)
+            _prune_runtime_dir(directory, keep=path)
         except OSError:
             logger.warning("Could not write plugin runtime status")
 
