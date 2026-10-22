@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import base64
+import binascii
 import os
 import re
 import time
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Mapping
+from urllib.parse import unquote, urlsplit
 import httpx
+from httpx import HTTPStatusError, TimeoutException
 from nonebot.adapters.onebot.v11 import Bot, Event
 from engine.attachments import sniff_image_mime
 from ..config import (
@@ -336,19 +340,50 @@ def _safe_attachment_name(name: str, default: str = "attachment") -> str:
 
 
 def _segment_file_source(data: Mapping[str, Any]) -> Dict[str, Any] | None:
-    """把一个 file 段摊成可下载/可复制的来源。地址和文件名都没有时返回 None。"""
-    src = str(data.get("url") or data.get("path") or data.get("file") or "").strip()
+    """保留下载来源和文件 ID，文件名不作为网络地址。"""
+    file_id = str(data.get("file_id") or data.get("id") or "").strip()
+    candidates = []
+    for key in ("url", "path", "file"):
+        value = str(data.get(key) or "").strip()
+        if value and not (key == "file" and value == file_id) and _file_source_kind(value) and value not in candidates:
+            candidates.append(value)
+    src = candidates[0] if candidates else ""
     name = str(data.get("name") or data.get("file_name") or data.get("filename") or "").strip()
+    file_value = str(data.get("file") or "").strip()
+    if not name and file_value and file_value != file_id and not _file_source_kind(file_value):
+        name = file_value
+    name_inferred = not name and bool(src)
     if not name and src:
-        name = Path(src.split("?", 1)[0].split("#", 1)[0]).name
-    if not src and not name:
+        name = Path(unquote(urlsplit(src).path) if src.lower().startswith(("http://", "https://", "file://")) else src).name
+    if not src and not name and not file_id:
         return None
-    size_raw = data.get("size") or data.get("file_size") or data.get("filesize")
+    return {"source": src, "sources": candidates, "file_id": file_id, "name_inferred": name_inferred,
+            "name": _safe_attachment_name(name, "file") if name else "", "size": _file_size(data)}
+
+
+def _file_size(data: Mapping[str, Any]) -> int:
+    for key in ("size", "file_size", "filesize"):
+        try:
+            value = data.get(key)
+            if value is not None and not isinstance(value, bool):
+                return max(0, int(value))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return 0
+
+
+def _file_source_kind(source: str) -> str:
+    if source.startswith("base64://"):
+        return "base64"
+    if source.startswith("file://") or source.startswith("/") or re.match(r"^[a-zA-Z]:[\\/]", source):
+        return "local"
     try:
-        size = int(size_raw) if size_raw is not None and str(size_raw).strip() else 0
-    except Exception:
-        size = 0
-    return {"source": src, "name": _safe_attachment_name(name, "file"), "size": size}
+        url = urlsplit(source)
+        if url.scheme.lower() in {"http", "https"} and url.hostname:
+            return "remote"
+    except ValueError:
+        pass
+    return ""
 
 
 def _iter_qq_file_sources(message: Any) -> List[Dict[str, Any]]:
@@ -367,9 +402,27 @@ def _file_attachment_error_text(error: str) -> str:
     if error == "too_large":
         return f"文件太大，已超过当前限制 {live.file_max_bytes // 1024 // 1024}MB。"
     if error == "no_source":
-        return "我收到了文件消息，但当前 OneBot 事件没有提供可下载链接。"
+        return "我收到了文件消息，但 OneBot 未提供可用的下载地址或文件 ID。"
+    if error == "resolve_failed":
+        return "无法通过文件 ID 从 NapCat 获取文件来源，请重新发送文件后重试。"
+    if error == "resolve_timeout":
+        return "向 NapCat 查询文件来源超时，请稍后重试。"
+    if error == "download_timeout":
+        return "文件下载超时，请稍后重试。"
+    if error.startswith("http_") and error[5:].isdigit():
+        return f"文件下载失败，文件服务返回 HTTP {error[5:]}。"
+    if error == "invalid_source":
+        return "文件来源不是有效的 HTTP(S) 地址、本地路径或 base64 数据。"
+    if error == "invalid_content":
+        return "NapCat 返回的文件数据格式无效，无法解码。"
+    if error == "size_mismatch":
+        return "取得的文件大小与上报大小不一致，可能下载不完整，请重新发送后重试。"
+    if error == "local_unavailable":
+        return "NapCat 返回的本地文件路径在机器人进程中不可访问，请检查容器文件挂载或下载接口。"
+    if error == "storage_failed":
+        return "文件读取或保存失败，请检查机器人的目录权限和磁盘空间。"
     if error == "download_failed":
-        return "我收到了文件，但下载失败了，可能是 QQ 临时链接已过期。"
+        return "文件下载失败，请稍后重试；具体原因已记录日志。"
     if error == "unsupported_type":
         return "这个文件类型我不接收，只收文档、文本、图片、音视频和压缩包。"
     if error == "executable_content":
@@ -428,18 +481,164 @@ async def _read_remote_bytes(client: httpx.AsyncClient, url: str, *, max_bytes: 
 
 async def _read_file_source_bytes(client: httpx.AsyncClient, source: str) -> tuple[bytes, str]:
     """读取 QQ 文件来源；支持 URL、file:// 和本地路径，并限制最大字节数。"""
-    if source.startswith("file://") or re.match(r"^[a-zA-Z]:[\\/]", source) or source.startswith("/"):
+    kind = _file_source_kind(source)
+    if kind == "base64":
+        encoded = source[len("base64://"):]
+        if len(encoded) > 4 * ((live.file_max_bytes + 2) // 3):
+            raise ValueError("too_large")
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("invalid_content") from exc
+        if len(content) > live.file_max_bytes:
+            raise ValueError("too_large")
+        return content, "application/octet-stream"
+    if kind == "local":
+        if source.startswith("file://"):
+            raw = source[len("file://"):]
+            if re.match(r"^[a-zA-Z]:[\\/]", raw):
+                source = unquote(raw)
+            else:
+                parsed = urlsplit(source)
+                if parsed.netloc not in {"", "localhost"}:
+                    raise ValueError("local_denied")
+                source = unquote(parsed.path)
+                if os.name == "nt" and re.match(r"^/[a-zA-Z]:/", source):
+                    source = source[1:]
         local = _local_source_path(source)
         if local is None:
+            if not Path(source).is_file():
+                raise ValueError("local_unavailable")
             raise ValueError("local_denied")
         if local.stat().st_size > live.file_max_bytes:
             raise ValueError("too_large")
-        return local.read_bytes(), "application/octet-stream"
-
+        with local.open("rb") as stream:
+            content = stream.read(live.file_max_bytes + 1)
+        if len(content) > live.file_max_bytes:
+            raise ValueError("too_large")
+        return content, "application/octet-stream"
+    if kind != "remote":
+        raise ValueError("invalid_source")
     return await _read_remote_bytes(client, source, max_bytes=live.file_max_bytes)
 
 
-async def _file_sources_to_attachments(file_sources: List[Dict[str, Any]], conversation_key: str) -> tuple[list[dict], list[str]]:
+def _file_read_error(exc: Exception) -> str:
+    if isinstance(exc, HTTPStatusError):
+        return f"http_{exc.response.status_code}"
+    if isinstance(exc, (TimeoutException, asyncio.TimeoutError)):
+        return "download_timeout"
+    if isinstance(exc, ValueError):
+        return str(exc) or "invalid_source"
+    if isinstance(exc, OSError):
+        return "storage_failed"
+    return "download_failed"
+
+
+async def _file_content(
+    client: httpx.AsyncClient, item: Mapping[str, Any], *, bot: Bot | None, group_id: Any,
+) -> tuple[bytes, str, str]:
+    name = str(item.get("name") or "").strip()
+    file_id = str(item.get("file_id") or "").strip()
+    if item.get("name_inferred") and file_id and inbound_file_reject_reason(name, extra_allowed=live.file_extra_allowed_extensions):
+        name = ""
+    expected_size = _file_size(item)
+    read_errors: list[str] = []
+    seen: set[str] = set()
+    pending_sources: list[str] = []
+
+    async def read(data: Mapping[str, Any]) -> tuple[bytes, str, str] | None:
+        nonlocal name, expected_size
+        supplied_name = str(data.get("name") or data.get("file_name") or data.get("filename") or "").strip()
+        if not name and supplied_name and not data.get("name_inferred"):
+            name = supplied_name
+        returned_size = _file_size(data)
+        if max(returned_size, expected_size) > live.file_max_bytes:
+            raise ValueError("too_large")
+        expected_size = expected_size or returned_size
+        candidates = []
+        if isinstance(data.get("base64"), str):
+            encoded = data["base64"]
+            candidates.append(encoded if encoded.startswith("base64://") else "base64://" + encoded)
+        candidates.extend(pending_sources)
+        pending_sources.clear()
+        sources = data.get("sources")
+        if isinstance(sources, list):
+            candidates.extend(value for value in sources if isinstance(value, str))
+        for key in ("source", "url", "path", "file"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+        if not name:
+            pending_sources.extend(candidates)
+            return None
+        name = _safe_attachment_name(name, "file")
+        reject = inbound_file_reject_reason(name, extra_allowed=live.file_extra_allowed_extensions)
+        if reject:
+            raise ValueError(reject)
+        for source in candidates:
+            if source in seen:
+                continue
+            seen.add(source)
+            if not _file_source_kind(source):
+                read_errors.append("invalid_source")
+                continue
+            try:
+                content, mime_type = await _read_file_source_bytes(client, source)
+                if len(content) > live.file_max_bytes:
+                    raise ValueError("too_large")
+                if expected_size and len(content) != expected_size:
+                    raise ValueError("size_mismatch")
+            except Exception as exc:
+                code = _file_read_error(exc)
+                logger.warning("QQ file read failed: name=%s source_type=%s reason=%s error_type=%s",
+                               name, _file_source_kind(source), code, type(exc).__name__)
+                if code == "too_large":
+                    raise ValueError(code) from exc
+                read_errors.append(code)
+                continue
+            reject = inbound_file_reject_reason(name, content, extra_allowed=live.file_extra_allowed_extensions)
+            if reject:
+                raise ValueError(reject)
+            return content, mime_type, name
+        return None
+
+    result = await read(item)
+    if result is not None:
+        return result
+    resolve_error = "resolve_failed"
+    if file_id and bot is not None:
+        api_calls = [("get_private_file_url", {"file_id": file_id})]
+        if group_id is not None and str(group_id).isdigit() and int(group_id) > 0:
+            api_calls = [("get_group_file_url", {"group_id": str(group_id), "file_id": file_id})]
+        api_calls.append(("get_file", {"file_id": file_id}))
+        for api, parameters in api_calls:
+            try:
+                data = await asyncio.wait_for(bot.call_api(api, **parameters), timeout=IMAGE_DOWNLOAD_TIMEOUT)
+                if not isinstance(data, Mapping):
+                    raise ValueError("invalid API response")
+                if "status" in data or "retcode" in data:
+                    if data.get("status") != "ok" or data.get("retcode", 0) != 0:
+                        raise ValueError("unsuccessful API response")
+                    data = data.get("data")
+                if not isinstance(data, Mapping):
+                    raise ValueError("missing API data")
+            except Exception as exc:
+                resolve_error = "resolve_timeout" if isinstance(exc, (TimeoutException, asyncio.TimeoutError)) else "resolve_failed"
+                logger.warning("QQ file lookup failed: name=%s api=%s error_type=%s", name, api, type(exc).__name__)
+                continue
+            result = await read(data)
+            if result is not None:
+                return result
+    if read_errors:
+        # 下载错误比后续接口不可用更能说明已经取得的地址为何失败。
+        meaningful = [code for code in read_errors if code != "invalid_source"]
+        raise ValueError(meaningful[-1] if meaningful else (resolve_error if file_id else "invalid_source"))
+    raise ValueError(resolve_error if file_id else "no_source")
+
+
+async def _file_sources_to_attachments(
+    file_sources: List[Dict[str, Any]], conversation_key: str, *, bot: Bot | None = None, group_id: Any = None,
+) -> tuple[list[dict], list[str]]:
     """下载/复制 OneBot 普通文件，返回 Clonoth 附件描述。"""
     result: list[dict] = []
     errors: list[str] = []
@@ -453,40 +652,13 @@ async def _file_sources_to_attachments(file_sources: List[Dict[str, Any]], conve
         att_dir.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
         common.logger.warning("collect QQ file attachment cannot create directory %s: %s", att_dir, exc)
-        return result, [_file_attachment_error_text("download_failed")]
+        return result, [_file_attachment_error_text("storage_failed")]
 
     async with httpx.AsyncClient(timeout=IMAGE_DOWNLOAD_TIMEOUT, follow_redirects=True) as client:
         for item in file_sources[:live.max_files_per_turn]:
-            source = str(item.get("source") or "").strip()
-            name = _safe_attachment_name(str(item.get("name") or "file"), "file")
-            reject = inbound_file_reject_reason(name, extra_allowed=live.file_extra_allowed_extensions)
-            if reject:
-                common.logger.warning("collect QQ file attachment refused: name=%s reason=%s", name, reject)
-                errors.append(_file_attachment_error_text(reject))
-                continue
+            file_path: Path | None = None
             try:
-                size = int(item.get("size") or 0)
-            except Exception:
-                size = 0
-            if size and size > live.file_max_bytes:
-                errors.append(_file_attachment_error_text("too_large"))
-                continue
-            if not source:
-                errors.append(_file_attachment_error_text("no_source"))
-                continue
-            try:
-                content, content_type = await _read_file_source_bytes(client, source)
-                if not content:
-                    errors.append(_file_attachment_error_text("download_failed"))
-                    continue
-                if len(content) > live.file_max_bytes:
-                    errors.append(_file_attachment_error_text("too_large"))
-                    continue
-                reject = inbound_file_reject_reason(name, content, extra_allowed=live.file_extra_allowed_extensions)
-                if reject:
-                    common.logger.warning("collect QQ file attachment refused: name=%s reason=%s", name, reject)
-                    errors.append(_file_attachment_error_text(reject))
-                    continue
+                content, content_type, name = await _file_content(client, item, bot=bot, group_id=group_id)
                 target_name = f"{os.urandom(8).hex()}_{name}"
                 file_path = att_dir / target_name
                 file_path.write_bytes(content)
@@ -501,8 +673,13 @@ async def _file_sources_to_attachments(file_sources: List[Dict[str, Any]], conve
             except ValueError as exc:
                 errors.append(_file_attachment_error_text(str(exc) or "download_failed"))
             except Exception as exc:
-                common.logger.warning("collect QQ file attachment failed: source=%s error=%s", source, exc)
-                errors.append(_file_attachment_error_text("download_failed"))
+                logger.warning("QQ file attachment failed: error_type=%s", type(exc).__name__)
+                if file_path is not None:
+                    try:
+                        file_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                errors.append(_file_attachment_error_text(_file_read_error(exc)))
     return result, errors
 
 
@@ -672,7 +849,9 @@ async def _collect_qq_attachments(
     message = event.get_message() if hasattr(event, "get_message") else None
     image_sources, file_sources = await _collect_message_media(bot, message, expand_forward=expand_forward)
     image_attachments, image_errors = await _image_sources_to_attachments(image_sources, conversation_key)
-    file_attachments, file_errors = await _file_sources_to_attachments(file_sources, conversation_key)
+    file_attachments, file_errors = await _file_sources_to_attachments(
+        file_sources, conversation_key, bot=bot, group_id=getattr(event, "group_id", None),
+    )
     return image_attachments + file_attachments, image_errors + file_errors
 
 

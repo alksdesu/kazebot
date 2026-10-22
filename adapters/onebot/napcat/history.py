@@ -134,11 +134,17 @@ def _append_group_record(
     timestamp: float,
     message_id: str = "",
     attachments: List[Dict[str, Any]] | None = None,
+    attachment_errors: List[str] | None = None,
 ) -> int:
     """一条群历史同时进水位队列和结构化副本；两边缺一个，转发筛选就会看不到这条。
 
     返回这一行在群历史里的序号。
     """
+    if attachment_errors:
+        # 错误独立于正文预算，否则长消息会把失败原因截掉。
+        notes = anonymize._anonymize_text_for_ai(" ".join(dict.fromkeys(attachment_errors)))
+        line = f"{line} {notes}".strip()
+        text = f"{text} {notes}".strip()
     gid = int(group_id)
     seq = _append_group_history(gid, line)
     state._adapter.group_content_records[gid].append(models.GroupContentRecord(
@@ -154,12 +160,12 @@ def _append_group_record(
     return seq
 
 
-def _record_group_message(facts: InboundFacts) -> int:
+def _record_group_message(facts: InboundFacts, *, attachment_errors: List[str] | None = None) -> int:
     """记录群最近消息；@Bot 触发消息由 Agent matcher 手动记录，避免被 block 跳过。
 
-    返回这条消息在群历史里的序号，0 = 正文为空没有记。
+    返回这条消息在群历史里的序号，0 = 正文和附件错误都为空没有记。
     """
-    if facts.text.strip():
+    if facts.text.strip() or attachment_errors:
         # 转发 node 的 user_id 要真实号；匿名占位号发不出去，落库留空由 self_id 兜底。
         return _append_group_record(
             int(facts.conversation.raw_id),
@@ -170,6 +176,7 @@ def _record_group_message(facts: InboundFacts) -> int:
             timestamp=facts.sent_at,
             message_id=facts.message_id,
             attachments=[dict(item) for item in facts.attachments] or None,
+            attachment_errors=attachment_errors,
         )
     return 0
 
@@ -230,6 +237,7 @@ async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) ->
         reply_sender_qq = str(reply.get("user_id") or "")
     bot_ids = inbound._bot_self_id_candidates(event, bot)
     reply_from_bot = inbound._qq_matches_bot(reply_sender_qq, bot_ids)
+    file_errors = []
 
     if reply_from_bot:
         # Bot 自己的回复：默认不下载图片附件，避免把表情包送去识图。
@@ -268,14 +276,27 @@ async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) ->
         # 引用一条群文件消息是最明确的「读这个」，而群文件带不了 @，只能这样指。
         # 正文里没有占位符可替，直接挂到附件上让 engine 去读内容。
         if files and live.enable_file_input:
-            file_atts, file_errors = await media._file_sources_to_attachments(files, conversation_key)
+            if reply_message_id is not None and any(source.get("file_id") for source in files):
+                # NapCat 重启会重建文件 ID，引用缓存里的旧 ID 必须用原消息刷新。
+                refreshed = await message_text._get_reply_message(bot, reply_message_id)
+                if refreshed:
+                    _, refreshed_files = await media._collect_message_media(bot, refreshed.get("message"))
+                    if not refreshed_files:
+                        _, refreshed_files = await media._collect_message_media(bot, refreshed.get("raw_message"))
+                    if refreshed_files:
+                        files = refreshed_files
+            file_atts, file_errors = await media._file_sources_to_attachments(
+                files, conversation_key, bot=bot, group_id=getattr(event, "group_id", None),
+            )
             quoted_attachments.extend(file_atts)
-            quoted_errors.extend(file_errors)
         # 下载失败的图（太大/格式不支持）把占位符换成原因，否则引用块里会静默少一张图。
         for note in dict.fromkeys(quoted_errors):
             text = text.replace(message_text.IMAGE_PLACEHOLDER, f"[{note}]", 1)
 
     text = anonymize._anonymize_text_for_ai(message_text._compact_text(text))
+    if file_errors:
+        notes = anonymize._anonymize_text_for_ai(" ".join(dict.fromkeys(file_errors)))
+        text = " ".join([text, notes]).strip()
     if not text:
         if reply_message_id is not None:
             return anonymize._anonymize_text_for_ai(f"（引用消息为空或暂不支持的消息类型：message_id={reply_message_id}）"), quoted_attachments

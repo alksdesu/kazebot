@@ -1,4 +1,4 @@
-"""图片处理提示的注入与附件路径回填：群聊和私聊共用同一份实现。
+"""附件处理提示的注入与附件路径回填：群聊和私聊共用同一份实现。
 
 这段提示是防幻觉的安全提示：拿不到可确认的图片时禁止模型从历史里猜。它一旦分成两份，
 改一处漏一处就等于单边失去防护，而失效在日志里看不出来 —— 模型只是开始编图片内容。
@@ -49,7 +49,7 @@ class TestTheNoGuessingHint:
             [],
         )
 
-        assert "【图片处理提示】" not in result
+        assert "【附件处理提示】" not in result
 
     def test_a_plain_question_gets_no_hint(self, runtime) -> None:
         result = runtime.inbound._apply_attachment_hints("【当前用户指令】今天天气如何", "今天天气如何", [], [])
@@ -64,7 +64,7 @@ class TestTheNoGuessingHint:
     def test_a_download_error_still_reaches_the_model_without_an_image_question(self, runtime) -> None:
         result = runtime.inbound._apply_attachment_hints("正文", "你好", [], ["下载失败"])
 
-        assert "【图片处理提示】" in result
+        assert "【附件处理提示】" in result
         assert _HINT_MARK not in result
 
 

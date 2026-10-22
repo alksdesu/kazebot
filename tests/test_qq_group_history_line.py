@@ -82,7 +82,7 @@ def runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     # 真下载会去访问 source，这里只关心历史行拼装。
     monkeypatch.setattr(
         module.media, "_file_sources_to_attachments",
-        lambda sources, conversation_key: _immediately([]),
+        lambda sources, conversation_key, **kwargs: _immediately([]),
         raising=True,
     )
     set_live_config(module, allowed_groups=[_GROUP_ID])
@@ -201,7 +201,7 @@ class TestBothCachesGetTheLine:
         shared = [{"path": "out/a.txt", "name": "a.txt"}]
         monkeypatch.setattr(
             runtime.media, "_file_sources_to_attachments",
-            lambda sources, conversation_key: _immediately(shared),
+            lambda sources, conversation_key, **kwargs: _immediately(shared),
             raising=True,
         )
         _upload(runtime, {"name": "a.txt", "url": "http://x/a.txt"})

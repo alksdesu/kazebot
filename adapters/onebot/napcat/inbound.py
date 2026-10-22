@@ -576,12 +576,12 @@ def _apply_attachment_hints(
     attachments: List[Dict[str, Any]],
     attachment_errors: List[str],
 ) -> str:
-    """把图片处理提示挂到 inbound 文本上，并把附件路径回填进 [图片] 占位。"""
+    """把附件处理提示挂到 inbound 文本上，并把附件路径回填进 [图片] 占位。"""
     if media._text_looks_like_image_query(user_text) and not attachments:
         # 就地 append：调用方在此之后不再读这个列表。
         attachment_errors.append(_IMAGE_UNBOUND_HINT)
     if attachment_errors:
-        inbound_text += "\n\n【图片处理提示】\n" + "\n".join(dict.fromkeys(attachment_errors))
+        inbound_text += "\n\n【附件处理提示】\n" + "\n".join(dict.fromkeys(attachment_errors))
     for att in attachments:
         # 只有图片占 [图片] 位。文件附件混进来会顶掉后面那张图的位置，路径就对错人了。
         if att.get("type") != "image":

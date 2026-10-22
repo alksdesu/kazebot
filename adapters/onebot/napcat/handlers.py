@@ -116,14 +116,14 @@ async def _record_non_trigger_message(bot: Bot, event: GroupMessageEvent) -> Non
         stable_conversation_key = routing._stable_conversation_key(real_conversation_key)
         # 不回复的消息只扫顶层。下钻是为了让模型看见卡片里的图，而这条根本不会进模型；
         # 真被人引用时 _build_reply_context 会再下钻一次，那时候才值得付这几次下载。
-        attachments, _errors = await media._collect_qq_attachments(
+        attachments, errors = await media._collect_qq_attachments(
             bot, event, stable_conversation_key, expand_forward=False,
         )
         media._remember_recent_images(stable_conversation_key, event, attachments)
         await state._adapter.features.register_attachments(bot, event, attachments)
         facts = inbound._inbound_facts(bot, event, text=expanded_text or None, attachments=attachments)
         emotes._collect_stickers(facts)
-        history._record_group_message(facts)
+        history._record_group_message(facts, attachment_errors=errors)
         metadata = await state._adapter.features.prepare(bot, event)
         if state._adapter.features.blocked(metadata) or metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled"):
             return
@@ -235,14 +235,17 @@ async def _handle_group_upload_notice(bot: Bot, event: Event) -> None:
     real_conversation_key = f"qq_group:{int(event.group_id)}"
     stable_conversation_key = routing._stable_conversation_key(real_conversation_key)
     file_info = getattr(event, "file", None)
+    if callable(getattr(file_info, "model_dump", None)):
+        file_info = file_info.model_dump()
+    elif callable(getattr(file_info, "dict", None)):
+        file_info = file_info.dict()
     if not isinstance(file_info, dict):
         file_info = {}
-    source = str(file_info.get("url") or file_info.get("path") or file_info.get("file") or "").strip()
-    name = media._safe_attachment_name(str(file_info.get("name") or file_info.get("file_name") or file_info.get("filename") or "文件"), "file")
-    size = file_info.get("size") or file_info.get("file_size") or file_info.get("filesize") or 0
-    attachments, _errors = await media._file_sources_to_attachments([
-        {"source": source, "name": name, "size": size},
-    ], stable_conversation_key)
+    source = media._segment_file_source(file_info)
+    name = source["name"] if source else "文件"
+    attachments, errors = await media._file_sources_to_attachments(
+        [source] if source else [], stable_conversation_key, bot=bot, group_id=int(event.group_id),
+    )
     display_text = message_text._segment_to_text("file", {"name": name}, set()) or ""
     sender_id = str(getattr(event, "user_id", "") or "")
     # GroupUploadNoticeEvent 没有 sender/anonymous 属性，helper 会退回 profile / 匿名别名。
@@ -263,6 +266,7 @@ async def _handle_group_upload_notice(bot: Bot, event: Event) -> None:
         timestamp=float(getattr(event, "time", None) or time.time()),
         message_id=str(getattr(event, "message_id", "") or ""),
         attachments=attachments,
+        attachment_errors=errors,
     )
 
 
