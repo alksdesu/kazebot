@@ -149,27 +149,27 @@ class TestNamespaceScan:
     def test_hit_cache_keeps_only_ids_this_namespace_can_touch(self, tmp_path: Path) -> None:
         self._write_cache(tmp_path, {"mine": _NOW.isoformat(), "theirs": _NOW.isoformat()})
 
-        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_x", {"mine"}))
+        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_x", {"mine"}, now=_NOW))
 
         assert loaded == {"mine": _NOW.isoformat()}
 
     def test_hit_cache_is_empty_without_entries(self, tmp_path: Path) -> None:
         self._write_cache(tmp_path, {"whatever": _NOW.isoformat()})
 
-        assert DreamHandler()._load_hit_cache_json(tmp_path, "conv_x", set()) == "{}"
+        assert DreamHandler()._load_hit_cache_json(tmp_path, "conv_x", set(), now=_NOW) == "{}"
 
     def test_a_legacy_flat_key_is_still_found(self, tmp_path: Path) -> None:
         """升级前写的记录不带 namespace；只认新 key 会让全部历史命中一夜变成「从未命中」。"""
         self._write_cache(tmp_path, {"mine": _NOW.isoformat()})
 
-        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_abc", {"mine"}))
+        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_abc", {"mine"}, now=_NOW))
 
         assert loaded == {"mine": _NOW.isoformat()}
 
     def test_a_namespaced_key_is_found(self, tmp_path: Path) -> None:
         self._write_cache(tmp_path, {"conv_abc/mine": _NOW.isoformat()})
 
-        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_abc", {"mine"}))
+        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_abc", {"mine"}, now=_NOW))
 
         assert loaded == {"mine": _NOW.isoformat()}
 
@@ -177,7 +177,7 @@ class TestNamespaceScan:
         # 提取器的 id 规则鼓励用稳定别名，两个会话都有 user_zhangsan 是常态。
         self._write_cache(tmp_path, {"conv_other/mine": _NOW.isoformat()})
 
-        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_abc", {"mine"}))
+        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_abc", {"mine"}, now=_NOW))
 
         assert loaded == {}
 
@@ -185,14 +185,14 @@ class TestNamespaceScan:
         older = (_NOW - timedelta(days=10)).isoformat()
         self._write_cache(tmp_path, {"mine": older, "conv_abc/mine": _NOW.isoformat()})
 
-        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_abc", {"mine"}))
+        loaded = json.loads(DreamHandler()._load_hit_cache_json(tmp_path, "conv_abc", {"mine"}, now=_NOW))
 
         assert loaded == {"mine": _NOW.isoformat()}
 
     def test_a_non_object_cache_does_not_raise(self, tmp_path: Path) -> None:
         self._write_cache(tmp_path, [])  # type: ignore[arg-type]
 
-        assert DreamHandler()._load_hit_cache_json(tmp_path, "conv_abc", {"mine"}) == "{}"
+        assert DreamHandler()._load_hit_cache_json(tmp_path, "conv_abc", {"mine"}, now=_NOW) == "{}"
 
 
 class TestNamespaceResolution:

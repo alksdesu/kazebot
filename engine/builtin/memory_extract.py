@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
-from engine.memory_namespace import conversation_namespace
+from engine.memory_namespace import (
+    InvalidMemoryNamespace,
+    conversation_namespace,
+    memory_dir,
+    namespace_conversation_key,
+    task_memory_namespace,
+)
+from engine.node import load_node
 
 
 log = logging.getLogger(__name__)
@@ -178,6 +185,12 @@ class MemoryExtractHandler:
             log.debug("memory_extract: skip, empty session_id")
             return
         log.debug("memory_extract TRACE: session_id=%s (ctx=%s task=%s)", session_id, ctx.get('session_id'), getattr(task, 'session_id', '?'))
+        try:
+            memory_namespace = _source_memory_namespace(workspace_root, task)
+        except InvalidMemoryNamespace as exc:
+            # 在计数之前挡：配置不改，这个会话的每一轮都会再撞上一次，攒下的任务 id 只增不减。
+            log.warning("memory_extract: skip session %s, its node has no usable namespace: %s", session_id, exc)
+            return
         # [2026-05-23] Why: entry-task completions remain monotonic within this
         # handler and are still useful for diagnostics. How: keep the historical
         # total task counter unchanged. Purpose: preserve observability while the
@@ -235,6 +248,7 @@ class MemoryExtractHandler:
                 runtime_cfg=runtime_cfg,
                 session_id=session_id,
                 task_count=task_count,
+                memory_namespace=memory_namespace,
             )
             if pending_extract is not None:
                 self._schedule_memory_extract_idle_locked(
@@ -252,6 +266,7 @@ class MemoryExtractHandler:
             runtime_cfg=runtime_cfg,
             session_id=session_id,
             task_count=task_count,
+            memory_namespace=memory_namespace,
         )
         if pending_extract is None:
             return
@@ -284,6 +299,7 @@ class MemoryExtractHandler:
         runtime_cfg: dict[str, Any],
         session_id: str,
         task_count: int,
+        memory_namespace: str,
     ) -> dict[str, Any] | None:
         """Build the pending extraction payload shared by normal and fallback timers."""
         # [AutoC 2026-05-24] Why: msg-index ranges can include compact summaries
@@ -326,9 +342,10 @@ class MemoryExtractHandler:
             "pending_task_ids": pending_task_ids,
             "extractor_node": extractor_node,
             "kind": getattr(task, "kind", "node"),
-            # [2026-06-17] 让自动提取出的长期 memory 写入当前 conversation_key
-            # 对应的专属 namespace，避免私聊/群聊/不同群之间串记忆。
             "conversation_key": conversation_key,
+            # 提取结果必须落在注入侧下一轮会读的目录：持久化子节点的会话键是 agent:...，
+            # 按它派生出的目录没有任何一方会读。
+            "memory_namespace": memory_namespace,
         }
 
     def _schedule_memory_extract_idle_locked(
@@ -440,37 +457,38 @@ class MemoryExtractHandler:
                 raise RuntimeError("memory extraction create_task callback is unavailable")
             workspace_value = ctx.get("workspace_root") or pending_extract.get("workspace_root")
             workspace_root = Path(workspace_value) if workspace_value is not None else None
-            conversation_key = str(pending_extract.get("conversation_key") or "").strip()
-            memory_namespace = conversation_namespace(conversation_key)
-            mem_dir = workspace_root / "data" / "memory" if workspace_root is not None else None
-            if mem_dir is not None and memory_namespace:
-                mem_dir = mem_dir / memory_namespace
-            book_names = sorted(
-                path.stem for path in mem_dir.glob("*.yaml")
-            ) if mem_dir is not None and mem_dir.exists() else []
-            book_list_header = ""
-            if book_names:
-                book_list_header = (
-                    f"当前已有的 memory book 列表：{', '.join(book_names)}\n"
-                    "保存时优先使用已有 book，也可以创建新 book。\n\n"
+            try:
+                memory_namespace = _intent_memory_namespace(pending_extract)
+                # 会话键直接点名注入侧要读的目录：持久化子节点的 agent: 键推不出那个目录。
+                memory_conversation_key = namespace_conversation_key(memory_namespace)
+                book_names = _book_names(workspace_root, memory_namespace)
+            except InvalidMemoryNamespace as exc:
+                # 抛出去 supervisor 会隔几秒重放；坏掉的意图重放多少遍都一样，只能丢掉。
+                log.warning("memory_extract: dropping intent %s: %s", intent_id, exc)
+            else:
+                book_list_header = ""
+                if book_names:
+                    book_list_header = (
+                        f"当前已有的 memory book 列表：{', '.join(book_names)}\n"
+                        "保存时优先使用已有 book，也可以创建新 book。\n\n"
+                    )
+                child_sid = f"child_{uuid.uuid4().hex[:12]}"
+                create_task(
+                    session_id=sid,
+                    session_generation=session_generation,
+                    kind=pending_extract.get("kind") or "node",
+                    node_id=extractor_node,
+                    input_data={
+                        "instruction": book_list_header + transcript,
+                        "child_session_id": child_sid,
+                        "_system_task": True,
+                        "_memory_extract_intent_id": intent_id,
+                        "task_context": {"conversation_key": memory_conversation_key},
+                    },
+                    continuation={},
+                    source_inbound_seq=None,
+                    caller_task_id=None,
                 )
-            child_sid = f"child_{uuid.uuid4().hex[:12]}"
-            create_task(
-                session_id=sid,
-                session_generation=session_generation,
-                kind=pending_extract.get("kind") or "node",
-                node_id=extractor_node,
-                input_data={
-                    "instruction": book_list_header + transcript,
-                    "child_session_id": child_sid,
-                    "_system_task": True,
-                    "_memory_extract_intent_id": intent_id,
-                    "task_context": {"conversation_key": conversation_key},
-                },
-                continuation={},
-                source_inbound_seq=None,
-                caller_task_id=None,
-            )
 
         # Move cursors only after task_created is durable (or observed on recovery).
         self._memory_extract_task_counts[sid] = task_count
@@ -480,6 +498,33 @@ class MemoryExtractHandler:
         complete_intent = ctx.get("complete_memory_extract_intent")
         if callable(complete_intent):
             complete_intent(intent_id)
+
+
+def _source_memory_namespace(workspace_root: Path, task: Any) -> str:
+    """跑完这一轮的节点在它的会话里读哪个 namespace，和注入侧同一个算法。
+
+    节点自带 memory_book 不合规时抛 InvalidMemoryNamespace。
+    """
+    task_input = getattr(task, "input", None) or {}
+    task_context = task_input.get("task_context") if isinstance(task_input.get("task_context"), dict) else {}
+    node_id = str(getattr(task, "node_id", "") or "").strip()
+    node = load_node(workspace_root, node_id) if node_id else None
+    memory_book = (node.extra or {}).get("memory_book") if node is not None else None
+    return task_memory_namespace(memory_book, task_context)
+
+
+def _intent_memory_namespace(intent: dict[str, Any]) -> str:
+    """提取结果写进哪个 namespace。持久化的意图里不一定有这一项，没有就从会话键推。"""
+    if "memory_namespace" in intent:
+        return str(intent.get("memory_namespace") or "").strip()
+    return conversation_namespace(intent.get("conversation_key"))
+
+
+def _book_names(workspace_root: Path | None, namespace: str) -> list[str]:
+    if workspace_root is None:
+        return []
+    directory = memory_dir(workspace_root, namespace)
+    return sorted(path.stem for path in directory.glob("*.yaml")) if directory.is_dir() else []
 
 
 def _task_kind_is_node(task: Any) -> bool:

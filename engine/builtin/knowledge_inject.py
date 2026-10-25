@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os as _os
 import re
 import shutil
 import threading
@@ -13,7 +12,14 @@ import yaml
 
 import config_layout
 from clonoth_runtime import get_int
-from engine.memory_namespace import conversation_namespace, subject_namespace
+from engine.memory_namespace import (
+    InvalidMemoryNamespace,
+    memory_dir,
+    memory_root,
+    node_memory_namespace,
+    subject_namespace,
+    task_memory_namespace,
+)
 from engine.memory_subjects import (
     is_enrolled as _subject_is_enrolled,
     resolve_load_subjects,
@@ -27,7 +33,7 @@ from toolbox.context import ToolContext
 # cycles while keeping the existing hook registry duck-typed.
 from .result import hook_result
 from engine.eventlog_rotation import eventlog_file_lock
-from engine.memory_hit_cache import record_hits
+from engine.memory_hit_cache import prune_entry_hits, record_hits
 
 logger = logging.getLogger(__name__)
 
@@ -366,51 +372,15 @@ class _MemoryCache:
             cls._entries.pop(key, None)
 
 
-def memory_dir(workspace_root: Path, memory_book: str = "") -> Path:
-    """Return the memory storage directory path.
-
-    [2026-05-28] 增加 memory_book 参数支持 namespace 隔离。
-    为什么：持久化子节点的记忆应隔离到独立子目录，避免互相污染。
-    怎么改：memory_book 非空时返回 data/memory/{memory_book}/，否则返回 data/memory/。
-    目的：save_memory 和 load_memory_catalog 共用此路径计算。
-    """
-    base = workspace_root / "data" / "memory"
-    if memory_book:
-        return base / memory_book
-    return base
-
-
 # 记忆条目缺 scan_depth 时的扫描轮数。写入侧和载入侧共用同一个值，否则手工写的
 # YAML 会退回「只看当前这一句」，而那正是召回率最大的那个洞。
 _DEFAULT_SCAN_DEPTH = 2
 
 
-def memory_owner_conversation_key(conversation_key: Any, routed_key: Any = "", parent_key: Any = "") -> str:
-    """长期记忆归属哪个会话。
-
-    dispatch 出去的子节点跑在 `agent:<节点>:<父key>` 会话里，fresh/fork 每次还额外拼一个
-    新 uuid —— 按运行期 key 派生 namespace，子节点就是每次读一个空目录、写进一个用一次
-    就废弃的目录，那些目录还会无人清理地堆下去。长期记忆本来跨会话，归发起它的会话。
-    route_conversation_key 沿 dispatch 链恒为根会话的 key，多层委派也不会跑偏。
-    """
-    own = str(conversation_key or "").strip()
-    if not own.startswith("agent:"):
-        return own
-    return str(routed_key or "").strip() or str(parent_key or "").strip() or own
-
-
 def _context_memory_namespace(node: Node | None = None, task_context: dict[str, Any] | None = None) -> str:
     """Resolve memory namespace: explicit node memory_book wins; otherwise the owning conversation."""
-    extra = getattr(node, "extra", {}) if node is not None else {}
-    explicit = str((extra or {}).get("memory_book") or "").strip()
-    if explicit:
-        return explicit
-    ctx = task_context if isinstance(task_context, dict) else {}
-    return conversation_namespace(memory_owner_conversation_key(
-        ctx.get("conversation_key"),
-        ctx.get("route_conversation_key"),
-        ctx.get("parent_conversation_key"),
-    ))
+    extra = getattr(node, "extra", None) or {}
+    return task_memory_namespace(extra.get("memory_book"), task_context)
 
 
 def _tool_memory_namespaces(ctx: ToolContext, subject: str = "") -> list[str]:
@@ -419,6 +389,7 @@ def _tool_memory_namespaces(ctx: ToolContext, subject: str = "") -> list[str]:
     三个工具（save / list / delete）此前各写一份推导，优先级还不一样：save 认 subject，
     另两个不认，于是按人档案写得进删不掉。这里定死顺序 —— 已建档的 subject > 节点
     显式 memory_book > 会话派生 namespace。[0] 是新建时落哪，其余只用于定位已有条目。
+    节点的 memory_book 不合规时抛 InvalidMemoryNamespace。
     """
     namespaces: list[str] = []
     text = str(subject or "").strip()
@@ -427,13 +398,12 @@ def _tool_memory_namespaces(ctx: ToolContext, subject: str = "") -> list[str]:
         if ns:
             namespaces.append(ns)
     node_extra = getattr(ctx, "_node_extra", None) or {}
-    explicit = str(node_extra.get("memory_book") or "").strip()
-    # 写入侧必须和注入侧算出同一个 namespace，否则子节点写进的目录下一轮读不到。
-    namespaces.append(explicit or conversation_namespace(memory_owner_conversation_key(
+    namespaces.append(node_memory_namespace(
+        node_extra.get("memory_book"),
         getattr(ctx, "conversation_key", ""),
         getattr(ctx, "_route_conversation_key", ""),
         getattr(ctx, "_parent_conversation_key", ""),
-    )))
+    ))
     # 本轮被注入档案的人也要能被寻址：模型看得见那些条目，却在不重复给 subject 时
     # 更新不到它们，那次更新会落进会话 namespace 再被读侧去重吃掉。
     for hinted in resolve_load_subjects(ctx.workspace_root, getattr(ctx, "_memory_subjects", None)):
@@ -450,6 +420,7 @@ def _locate_memory_entry(
 
     subject 一旦建档，同一个 id 会既在会话 namespace 又在档案 namespace 出现两份，
     注入时同一条被渲染两遍。定位到就在原处更新，namespace 只在新建时才由 subject 决定。
+    候选里有读不出来的同名本就抛 MemoryBookUnreadable：说不准要找的条目是不是在它里面。
     """
     for namespace in namespaces:
         path = memory_dir(workspace_root, namespace) / f"{book}.yaml"
@@ -485,20 +456,21 @@ def load_memory_catalog(
     memory_book: str = "",
     _use_cache: bool = True,
 ) -> list[dict[str, Any]]:
-    """Scan memory yaml files and return parsed entries.
+    """Scan one namespace's memory yaml files and return parsed entries.
 
-    [2026-05-28] 增加 memory_book 参数支持 namespace 隔离。
-    为什么：持久化子节点的记忆应存储在独立子目录，与主节点互不干扰。
-    怎么改：memory_book 非空时扫 data/memory/{memory_book}/*.yaml，
-    否则扫 data/memory/*.yaml（现有行为，不递归）。
-    缓存 key 用 (workspace_root, memory_book) 元组区分。
+    memory_book 是 namespace：非空时扫 data/memory/{memory_book}/*.yaml，空串扫
+    data/memory/*.yaml，都不递归。namespace 用不了时按没有记忆处理，不让一次 prompt 构建失败。
     """
     if _use_cache:
         cached = _MemoryCache.get(workspace_root, memory_book=memory_book)
         if cached is not None:
             return cached
 
-    mem_dir = memory_dir(workspace_root, memory_book)
+    try:
+        mem_dir = memory_dir(workspace_root, memory_book)
+    except InvalidMemoryNamespace as exc:
+        logger.warning("memory namespace skipped: %s", exc)
+        return []
     if not mem_dir.exists() or not mem_dir.is_dir():
         return []
 
@@ -1239,6 +1211,21 @@ def _load_subject_memory_entries(
     return entries
 
 
+def _namespace_memory_entries(
+    workspace_root: Path, node: Node, task_context: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """这个节点在本会话的 namespace 里的记忆：节点自带 memory_book 优先，否则是发起会话的。"""
+    try:
+        namespace = _context_memory_namespace(node, task_context)
+    except InvalidMemoryNamespace as exc:
+        # 退回会话 namespace 会把这个节点要隔离的记忆混进别人的目录，宁可这一轮不注入。
+        logger.warning("node %s loads no namespace memory: %s", getattr(node, "id", "?"), exc)
+        return []
+    return normalize_memory_entries(
+        load_memory_catalog(workspace_root, memory_book=namespace), namespace=namespace,
+    )
+
+
 def _merge_subject_archives(
     conversation_entries: list[dict[str, Any]], subject_entries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1277,17 +1264,9 @@ def build_knowledge_context(
     """
     safe_runtime_cfg = runtime_cfg or {}
 
-    # Why: the knowledge plugin now owns both storage loaders and the unified
-    # injection pipeline. How: load skill and memory catalogs locally, normalize
-    # them into one Entry shape, and render through build_knowledge_messages.
-    # Purpose: keep prompt injection behavior stable while deleting the old files.
     entries = normalize_skill_entries(load_skill_catalog(workspace_root))
-    # [2026-06-17] conversation_key 级 memory 隔离：默认每个外部会话读取自己的
-    # data/memory/conv_<hash>/ 命名空间；节点显式配置 memory_book 时仍优先使用
-    # 该节点命名空间。目的：避免私聊/群聊/不同群之间的长期记忆串用和隐私泄露。
-    _mb = _context_memory_namespace(node, task_context)
     entries.extend(_merge_subject_archives(
-        normalize_memory_entries(load_memory_catalog(workspace_root, memory_book=_mb), namespace=_mb),
+        _namespace_memory_entries(workspace_root, node, task_context),
         _load_subject_memory_entries(workspace_root, task_context),
     ))
 
@@ -1511,48 +1490,68 @@ _MEMORY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
 _BOOK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,63}$")
 
 
+class MemoryBookUnreadable(ValueError):
+    """记忆本在盘上，却读不出一份 {book, entries}。"""
+
+    def __init__(self, path: Path, reason: Any) -> None:
+        super().__init__(f"memory book {path.parent.name}/{path.name} is unreadable: {reason}")
+        self.path = path
+        self.reason = reason
+
+
 def _load_book(path: Path) -> dict[str, Any]:
-    """Load a memory book yaml. Returns default structure if missing."""
-    # Why: memory CRUD moved into the injection plugin with the cache. How: keep
-    # the same tolerant YAML load and default book structure. Purpose: avoid
-    # changing how malformed or missing memory books are handled.
-    if not path.exists():
-        return {"book": path.stem, "entries": []}
+    """读一本记忆。文件不存在给一本空的；在盘上却读不出来就抛 MemoryBookUnreadable。
+
+    读不出来的本若按空本处理，下一次写入就会整本覆盖，原有条目一条不剩。
+    """
     try:
         text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {"book": path.stem, "entries": []}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise MemoryBookUnreadable(path, exc) from exc
+    try:
         data = yaml.safe_load(text)
-    except Exception:
+    except Exception as exc:
+        raise MemoryBookUnreadable(path, exc) from exc
+    if data is None:
         return {"book": path.stem, "entries": []}
     if not isinstance(data, dict):
-        return {"book": path.stem, "entries": []}
-    if not isinstance(data.get("entries"), list):
+        raise MemoryBookUnreadable(path, f"top level is a {type(data).__name__}, not a mapping")
+    entries = data.get("entries")
+    if entries is None:
         data["entries"] = []
+    elif not isinstance(entries, list):
+        raise MemoryBookUnreadable(path, f"entries is a {type(entries).__name__}, not a list")
     return data
 
 
 def _save_book(path: Path, data: dict[str, Any]) -> None:
-    """Write a memory book yaml back to disk, atomically."""
-    # 直接 write_text 写一半就崩，留下的半截 YAML 会被 _load_book 静默当成空本 ——
-    # 整本记忆无声消失。先写同目录 tmp 再 replace，读者只会看到旧本或新本。
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """整本写回，调用方持有 _memory_write_lock。同目录临时文件替换，读者只会看到旧本或新本。"""
     text = yaml.safe_dump(
         data, sort_keys=False, allow_unicode=True, default_flow_style=False,
     )
-    tmp = path.with_name(f"{path.name}.{_os.getpid()}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    _os.replace(tmp, path)
+    config_layout.write_locked(path, text)
 
 
 def _memory_write_lock(workspace_root: Path):
-    """save/delete 的读-改-写临界区锁。
+    """记忆本读-改-写的临界区锁，engine 的记忆工具、控制台和定时清理共用。
 
     两个 engine worker 各跑一次记忆提取就能撞上：都读到同一份 entries，各自加一条，
     后写的把前一条整段覆盖。粒度取整个 memory 根目录 —— 具体落哪本要等寻址完才知道，
     按 book 加锁等于先探测再加锁，反倒多开一个竞态窗口。
     """
-    lock_path = workspace_root / "data" / "memory" / ".write"
+    lock_path = memory_root(workspace_root) / ".write"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     return eventlog_file_lock(lock_path)
+
+
+def _memory_store_err(exc: Exception) -> dict[str, Any]:
+    """namespace 不合规、记忆本读不出来：都要人去修配置或文件，模型重试多少遍也一样。"""
+    logger.warning("memory tool refused: %s", exc)
+    if isinstance(exc, MemoryBookUnreadable):
+        return _tool_err(f"{exc}; the book was left untouched. Fix or remove that file first.")
+    return _tool_err(str(exc))
 
 
 def _invalidate_cache(workspace_root: Path, *, memory_book: str = "") -> None:
@@ -1568,6 +1567,20 @@ def _invalidate_cache(workspace_root: Path, *, memory_book: str = "") -> None:
         pass
 
 
+def _requested_book(args: dict[str, Any], ctx: ToolContext) -> str:
+    """工具调用落在哪本：显式给的优先；省略时用节点 memory_book 同名的那本，名字当不了书名就用 default。
+
+    save 和 delete 必须算出同一本，否则省略 book 存进去的条目省略 book 删不掉。
+    """
+    explicit = str(args.get("book") or "").strip()
+    if explicit:
+        return explicit
+    node_extra = getattr(ctx, "_node_extra", None) or {}
+    node_book = str(node_extra.get("memory_book") or "").strip()
+    # memory_book 是目录名，允许点和中文；书名是文件名，规则更窄。
+    return node_book if _BOOK_NAME_RE.fullmatch(node_book) else "default"
+
+
 async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Create or update a memory entry in a book."""
     # Why: memory management tools now live beside memory loading and injection.
@@ -1580,19 +1593,7 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if not _MEMORY_ID_RE.fullmatch(mid):
         return _tool_err("invalid id: only [A-Za-z0-9][A-Za-z0-9_.-]{0,127} allowed")
 
-    # [2026-05-27] memory_book namespace 支持：当节点 yaml 配置了 memory_book 时，
-    # 没有显式指定 book 的 save_memory 调用将使用节点配置的默认 book 名称。
-    # 为什么：持久节点的记忆应隔离到独立的 namespace，避免互相污染。
-    # 怎么改：从 ToolContext._node_extra dict 零 IO 读取 memory_book，
-    #   extra 由 Node.load_node 在加载 yaml 时一次性收集，通过 ai_step 传入。
-    # 目的：插件层零 IO 拿到业务配置，引擎核心不知道具体字段的存在。
-    _user_book = str(args.get("book") or "").strip()
-    if _user_book:
-        book = _user_book
-    else:
-        # 从 Node.extra dict 零 IO 读取 memory_book
-        _extra = getattr(ctx, "_node_extra", None) or {}
-        book = str(_extra.get("memory_book") or "").strip() or "default"
+    book = _requested_book(args, ctx)
     if not _BOOK_NAME_RE.fullmatch(book):
         return _tool_err("invalid book name")
 
@@ -1647,13 +1648,16 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if subject and not _subject_is_enrolled(ctx.workspace_root, subject):
         subject = ""
 
-    _namespaces = _tool_memory_namespaces(ctx, subject)
-    # 寻址、改、写必须在同一把锁里：读完再等锁，拿到锁时 data 已经是别人改过之前的快照。
-    with _memory_write_lock(ctx.workspace_root):
-        return _save_memory_locked(
-            ctx, args, mid, book, content, keywords, constant, enabled,
-            node_ids, priority, scan_depth, subject, _namespaces,
-        )
+    try:
+        _namespaces = _tool_memory_namespaces(ctx, subject)
+        # 寻址、改、写必须在同一把锁里：读完再等锁，拿到锁时 data 已经是别人改过之前的快照。
+        with _memory_write_lock(ctx.workspace_root):
+            return _save_memory_locked(
+                ctx, args, mid, book, content, keywords, constant, enabled,
+                node_ids, priority, scan_depth, subject, _namespaces,
+            )
+    except (InvalidMemoryNamespace, MemoryBookUnreadable) as exc:
+        return _memory_store_err(exc)
 
 
 def _save_memory_locked(
@@ -1750,19 +1754,19 @@ def _save_memory_locked(
 
 async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """List memory entries, optionally filtered by book."""
-    # Why: list_memories is now plugin-owned like the memory catalog. How: keep
-    # the old book scan and preview fields. Purpose: preserve the tool response.
-    # [2026-06-17] namespace 隔离：节点显式 memory_book 优先；否则按当前
-    # conversation_key 扫描会话专属 memory 目录。
     book_filter = str(args.get("book") or "").strip() or None
     # 给了 subject 就列那个人的跨会话档案，否则列本会话的 —— 不认 subject 的话，
     # 按人档案里的条目模型压根看不见，也就无从知道该拿什么 id 去删。
-    _ns_memory_book = _tool_memory_namespaces(ctx, str(args.get("subject") or ""))[0]
-    mem_dir = memory_dir(ctx.workspace_root, _ns_memory_book)
+    try:
+        _ns_memory_book = _tool_memory_namespaces(ctx, str(args.get("subject") or ""))[0]
+        mem_dir = memory_dir(ctx.workspace_root, _ns_memory_book)
+    except InvalidMemoryNamespace as exc:
+        return _memory_store_err(exc)
     if not mem_dir.exists():
         return _tool_ok("0 memories", entries=[])
 
     result: list[dict[str, Any]] = []
+    unreadable: list[str] = []
     for yaml_path in sorted(mem_dir.glob("*.yaml")):
         try:
             data = _load_book(yaml_path)
@@ -1786,9 +1790,16 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
                 })
         except Exception as read_error:
             logger.warning("memory book %s skipped while listing: %s", yaml_path.name, read_error)
+            unreadable.append(yaml_path.name)
             continue
 
-    return _tool_ok(f"{len(result)} memories", entries=result)
+    if not unreadable:
+        return _tool_ok(f"{len(result)} memories", entries=result)
+    return _tool_ok(
+        f"{len(result)} memories; unreadable books skipped: {', '.join(unreadable)}",
+        entries=result,
+        unreadable_books=unreadable,
+    )
 
 
 async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -1800,12 +1811,17 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     if not mid:
         return _tool_err("empty memory id")
 
-    book = str(args.get("book") or "default").strip()
-    # 跟 save_memory 走同一套寻址：给了 subject 就先在那个人的档案里找。此前只认会话
-    # namespace，于是 data/memory/user_<别名>/ 下的条目写得进去却删不掉。
-    _namespaces = _tool_memory_namespaces(ctx, str(args.get("subject") or ""))
-    with _memory_write_lock(ctx.workspace_root):
-        return _delete_memory_locked(ctx, book, mid, _namespaces)
+    book = _requested_book(args, ctx)
+    # book 直接拼成文件名，和 save_memory 同一道校验；不挡的话 ../ 能删到别的会话、别的目录里去。
+    if not _BOOK_NAME_RE.fullmatch(book):
+        return _tool_err("invalid book name")
+    # 跟 save_memory 走同一套寻址：给了 subject 就先在那个人的档案里找，否则档案里的条目写得进删不掉。
+    try:
+        _namespaces = _tool_memory_namespaces(ctx, str(args.get("subject") or ""))
+        with _memory_write_lock(ctx.workspace_root):
+            return _delete_memory_locked(ctx, book, mid, _namespaces)
+    except (InvalidMemoryNamespace, MemoryBookUnreadable) as exc:
+        return _memory_store_err(exc)
 
 
 def _delete_memory_locked(
@@ -1848,8 +1864,9 @@ def _delete_memory_locked(
         except Exception:
             pass
 
-    # [2026-05-28] invalidate 时传 memory_book，精确清除对应 namespace 的缓存
     _invalidate_cache(ctx.workspace_root, memory_book=_ns_memory_book)
+    # 和控制台删条目一样摘掉命中戳：留着的话，之后新建的同 id 记忆一进来就带着旧的命中时间。
+    prune_entry_hits(ctx.workspace_root, _ns_memory_book, mid)
     return _tool_ok(f"Memory deleted: {book}/{mid}", book=book, id=mid, deleted=True)
 
 
@@ -1909,7 +1926,7 @@ PLUGIN_META["tools"] = [
             "type": "object",
             "properties": {
                 "id": {"type": "string", "description": "Unique entry id (e.g. user_zhangsan, rule_no_mock)."},
-                "book": {"type": "string", "description": "Book name (file grouping). Default 'default'. Use e.g. 'people' for character profiles, 'rules' for behavioral rules."},
+                "book": {"type": "string", "description": "Book name (file grouping). Omit to use this node's default book. Use e.g. 'people' for character profiles, 'rules' for behavioral rules."},
                 "content": {"type": "string", "description": "Memory content text."},
                 "keywords": {
                     "type": "array",
@@ -1962,7 +1979,7 @@ PLUGIN_META["tools"] = [
             "type": "object",
             "properties": {
                 "id": {"type": "string", "description": "Memory entry id to delete."},
-                "book": {"type": "string", "description": "Book name. Default 'default'."},
+                "book": {"type": "string", "description": "Book name. Omit to use this node's default book, the same one save_memory uses."},
                 "subject": {
                     "type": "string",
                     "description": "Delete from that person's cross-conversation profile. Pass the "

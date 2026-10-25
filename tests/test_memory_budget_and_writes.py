@@ -27,10 +27,9 @@ from engine.builtin.knowledge_inject import (
     _save_book,
     _tool_memory_namespaces,
     delete_memory,
-    memory_owner_conversation_key,
     save_memory,
 )
-from engine.memory_namespace import conversation_namespace
+from engine.memory_namespace import conversation_namespace, memory_owner_conversation_key
 from toolbox.context import ToolContext
 
 _CONV_KEY = "qq_group:900001"
@@ -443,29 +442,28 @@ class TestWriteSafety:
         assert entered == ["lock"]
 
     def test_a_failed_write_leaves_the_old_book_intact(self, tmp_path: Path, monkeypatch) -> None:
-        """write_text 写一半崩掉留下的半截 YAML，会被 _load_book 静默当成空本。
+        """写一半崩掉留下的半截 YAML 读不出来，那本记忆就再也写不进去。
 
-        整本记忆无声消失，而调用方看到的只是一次工具报错。
+        整本记忆无声消失，而调用方看到的只是一次工具报错。临时文件已经写进内容、
+        还没换上去时出错，旧本必须原样留着，临时文件也不能留在目录里。
         """
+        import os
+
         path = self._book(tmp_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         good = {"book": "profile", "entries": [{"id": "keep", "content": "原有内容"}]}
         _save_book(path, good)
 
-        real_write = Path.write_text
+        def _disk_full(_fd: int) -> None:
+            raise OSError("disk full")
 
-        def _boom(self: Path, *args: Any, **kwargs: Any):
-            if self.name.endswith(".tmp"):
-                real_write(self, *args, **kwargs)
-                raise OSError("disk full")
-            return real_write(self, *args, **kwargs)
-
-        monkeypatch.setattr(Path, "write_text", _boom)
+        monkeypatch.setattr(os, "fsync", _disk_full)
         with pytest.raises(OSError):
             _save_book(path, {"book": "profile", "entries": [{"id": "new", "content": "新"}]})
 
         monkeypatch.undo()
         assert yaml.safe_load(path.read_text(encoding="utf-8")) == good
+        assert [p.name for p in path.parent.iterdir()] == [path.name]
 
     def test_no_temp_files_are_left_behind(self, tmp_path: Path) -> None:
         path = self._book(tmp_path)

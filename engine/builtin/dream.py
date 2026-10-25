@@ -18,11 +18,18 @@ from clonoth_runtime import (
     load_runtime_config,
     task_max_running_seconds,
 )
-from engine.builtin.knowledge_inject import memory_dir
 from engine.cron import cron_match
 from engine.builtin.memory_extract import _format_transcript_for_extract
 from engine import memory_subjects
-from engine.memory_namespace import conversation_namespace, is_memory_namespace, subject_namespace
+from engine.memory_namespace import (
+    InvalidMemoryNamespace,
+    conversation_namespace,
+    is_namespace_conversation_key,
+    memory_dir,
+    memory_root,
+    namespace_conversation_key,
+    subject_namespace,
+)
 
 
 log = logging.getLogger(__name__)
@@ -437,7 +444,7 @@ class DreamHandler:
                 signals=[],
                 topology_json=self._build_keyword_topology_json(workspace_root, namespace),
                 hit_cache_json=self._load_hit_cache_json(
-                    workspace_root, namespace, {entry["id"] for entry in entries},
+                    workspace_root, namespace, {entry["id"] for entry in entries}, now=now,
                 ),
                 maintenance_json=json.dumps(
                     self._maintenance_candidates(entries, hits, now=now), ensure_ascii=False,
@@ -484,7 +491,7 @@ class DreamHandler:
             signals=signals,
             topology_json=self._build_keyword_topology_json(workspace_root, namespace),
             hit_cache_json=self._load_hit_cache_json(
-                workspace_root, namespace, {entry["id"] for entry in entries},
+                workspace_root, namespace, {entry["id"] for entry in entries}, now=now,
             ),
             maintenance_json=json.dumps(
                 self._maintenance_candidates(entries, hits, now=now), ensure_ascii=False,
@@ -516,11 +523,11 @@ class DreamHandler:
         if not callable(create_task):
             return ""
         node_id = node_id or get_str(runtime_cfg, "memory.dream.node_id", "system.dream").strip()
-        # conversation_key 就是目标 namespace：save_memory/delete_memory 只认
+        # conversation_key 直接点名目标 namespace：save_memory/delete_memory 只认
         # ToolContext.conversation_key 推出来的目录，写死 system:dream 的话整理动作
-        # 全部落在 Dream 自己的目录里。用 namespace 而不是真实 key，是因为真实 key
-        # 形如 qq_group:xxx，会命中 supervisor 的 QQ 非管理员硬限制，data/ 直接写不进去。
-        conv_key = namespace
+        # 全部落在 Dream 自己的目录里。不用真实 key，是因为真实 key 形如 qq_group:xxx，
+        # 会命中 supervisor 的 QQ 非管理员硬限制，data/ 直接写不进去。
+        conv_key = namespace_conversation_key(namespace)
         channel = "system"
         msg_id = f"dream:{uuid.uuid4()}"
         try:
@@ -631,7 +638,7 @@ class DreamHandler:
             # without giving the Dream node shell access.
             if completed_at.tzinfo is None:
                 completed_at = completed_at.replace(tzinfo=timezone.utc)
-            mem_dir = workspace_root / "data" / "memory"
+            mem_dir = memory_root(workspace_root)
             mem_dir.mkdir(parents=True, exist_ok=True)
             payload = {
                 "last_run": completed_at.astimezone().isoformat(timespec="seconds"),
@@ -707,15 +714,11 @@ class DreamHandler:
         for sid, entry in rows.items():
             conv_key = str(entry.get("conversation_key") or "")
             channel = str(entry.get("channel") or "")
-            # [AutoC 2026-05-31] Why: Dream should preprocess live user-facing
-            # conversations, not its own internal system sessions. How: skip
-            # system/internal registry rows before ranking JSONL mtimes. Purpose:
-            # prevent recursive Dream self-analysis.
-            # Dream 自己的整理任务以目标 namespace 为 conversation_key：会话整理是 conv_<摘要>，
-            # 人物档案整理是 user_<别名>。不排掉的话下一轮会把上一轮的整理记录当成活跃会话再提取一次。
+            # 只整理真人会话。Dream 自己的整理任务拿 namespace_conversation_key 点名目标目录当会话键，
+            # 不排掉的话下一轮会把上一轮的整理记录当成活跃会话再提取一次。
             if conv_key.startswith("system:") or channel == "internal":
                 continue
-            if is_memory_namespace(conv_key):
+            if is_namespace_conversation_key(conv_key):
                 continue
             active.add(sid)
         return active
@@ -848,8 +851,8 @@ class DreamHandler:
         # 空 namespace 只会命中未隔离的历史 book。
         # 带条目数：提示词让模型「合并条目数 ≤ 5 的碎片 book」，只给名字它只能靠猜，
         # 或者去全量 list_memories —— 那正是约束 1 禁止的。
-        mem_dir = memory_dir(workspace_root, namespace)
-        if not mem_dir.exists():
+        mem_dir = self._namespace_dir(workspace_root, namespace)
+        if mem_dir is None or not mem_dir.exists():
             return "(no books found)"
         books: list[str] = []
         for path in sorted(mem_dir.glob("*.yaml")):
@@ -939,10 +942,19 @@ class DreamHandler:
         }
         return json.dumps(payload, ensure_ascii=False)
 
+    @staticmethod
+    def _namespace_dir(workspace_root: Path, namespace: str) -> Path | None:
+        """namespace 的目录；用不了（比如被链到 data/memory 外面）时记一笔，这一轮当它没有记忆。"""
+        try:
+            return memory_dir(workspace_root, namespace)
+        except InvalidMemoryNamespace as exc:
+            log.warning("[scheduler] dream skipped memory namespace %s: %s", namespace, exc)
+            return None
+
     def _load_memory_topology_entries(self, workspace_root: Path, namespace: str) -> list[dict[str, Any]]:
         """Read minimal memory fields required for topology clustering."""
-        mem_dir = memory_dir(workspace_root, namespace)
-        if not mem_dir.exists() or not mem_dir.is_dir():
+        mem_dir = self._namespace_dir(workspace_root, namespace)
+        if mem_dir is None or not mem_dir.is_dir():
             return []
 
         result: list[dict[str, Any]] = []
@@ -1116,13 +1128,17 @@ class DreamHandler:
                 stamps[str(eid)] = stamp
         return stamps
 
-    def _load_hit_cache_json(self, workspace_root: Path, namespace: str, entry_ids: set[str]) -> str:
-        """Load hit_cache.json for one namespace's entries as a compact JSON string.
+    def _load_hit_cache_json(
+        self,
+        workspace_root: Path,
+        namespace: str,
+        entry_ids: set[str],
+        *,
+        now: datetime | None = None,
+    ) -> str:
+        """这个 namespace 的条目近 60 天的命中时间，压成一段 JSON 交给整理任务判断过期。
 
-        [AutoC 2026-05-31] Why: Dream Prune phase needs hit timestamps to
-        determine which auto-source entries are expired (30d no hit).
-        How: read the JSON file, truncate to entries with hits in last 60d
-        to keep instruction bounded. Purpose: enable lifecycle management.
+        只留 60 天内的，instruction 才不会随语料无限变长。
         """
         # 每个 Dream 任务只能操作自己那个 namespace，传全量会让模型引用它删不掉的 id。
         # 命中查找必须走 hit_timestamp：升级前的记录是不带 namespace 的扁平 key，
@@ -1130,8 +1146,7 @@ class DreamHandler:
         stamps = self._hit_stamps(workspace_root, namespace, entry_ids)
         if not stamps:
             return "{}"
-        from datetime import timedelta as _td
-        cutoff = datetime.now(timezone.utc) - _td(days=60)
+        cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=60)
         filtered: dict[str, str] = {}
         for eid, stamp in stamps.items():
             try:

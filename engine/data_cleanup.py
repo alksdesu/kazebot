@@ -15,11 +15,10 @@ import os
 import re
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-
-import yaml
 
 try:
     # Normal package import when launched from the repository root/runtime.
@@ -30,7 +29,18 @@ except ModuleNotFoundError:  # pragma: no cover - direct ``python engine/data_cl
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:  # 直接 ``python engine/data_cleanup.py`` 时项目根不在路径上
     sys.path.insert(0, str(_REPO_ROOT))
-from engine.memory_namespace import SUBJECT_PREFIX, is_memory_namespace  # noqa: E402
+from engine.builtin.knowledge_inject import (  # noqa: E402
+    MemoryBookUnreadable,
+    _load_book,
+    _memory_write_lock,
+    _save_book,
+)
+from engine.memory_namespace import (  # noqa: E402
+    SUBJECT_PREFIX,
+    is_namespace_conversation_key,
+    memory_root,
+    namespace_dirs,
+)
 from platforms.descriptor import HOOK_MAINTENANCE  # noqa: E402
 from platforms.maintenance import SCOPE_WORKSPACE, SCOPES  # noqa: E402
 from platforms.registry import MissingPlatformHook, current_platform, platform_hook  # noqa: E402
@@ -161,11 +171,11 @@ def _rmdir(path: Path) -> None:
     path.rmdir()
 
 
-def _write_text(path: Path, text: str) -> None:
+def _rewrite_book(path: Path, data: dict) -> None:
     if DRY_RUN:
-        logging.info("[dry-run] would rewrite %s (%d bytes)", path, len(text))
+        logging.info("[dry-run] would rewrite %s (%d entries left)", path, len(data.get("entries") or []))
         return
-    path.write_text(text, encoding="utf-8")
+    _save_book(path, data)
 
 
 # ── generic dir purge ─────────────────────────
@@ -296,108 +306,115 @@ def _load_hit_stamps(mem_root: Path) -> tuple[dict, object]:
         return {}, (lambda _cache, _ns, _eid: "")
 
 
-def purge_expired_memory_entries():
-    """Remove stale non-constant memory entries from data/memory/**/*.yaml.
+_HitLookup = Callable[[dict, str, str], str]
 
-    Memory books are YAML files shaped like {book, entries}.  Conversation-scoped
-    memory namespaces live under data/memory/<namespace>/*.yaml, while older/global
-    books live directly under data/memory/*.yaml.  We scan both layouts.
+
+def _memory_entry_expired(
+    entry: object, namespace: str, cutoff: float, hit_cache: dict, hit_lookup: _HitLookup,
+) -> bool:
+    if not isinstance(entry, dict) or bool(entry.get("constant", False)):
+        return False
+    # 只清自动提取写的条目。没有 source 的条目里有人手写的，一律当手工记忆保护，
+    # 判成 auto 就会删掉一批本该只有人能删的东西。
+    # dream 的提示词规则也是「保护 source != auto」，两边必须一致。
+    if str(entry.get("source") or "").strip() != "auto":
+        return False
+    ref_ts = _memory_entry_reference_ts(
+        entry, hit_lookup(hit_cache, namespace, str(entry.get("id") or "")),
+    )
+    # 一个时间戳都没有的条目判不出年龄，留着不猜。
+    return ref_ts is not None and ref_ts < cutoff
+
+
+@dataclass
+class _MemorySweep:
+    scanned_books: int = 0
+    deleted_entries: int = 0
+    removed_empty_books: int = 0
+    skipped_archives: int = 0
+
+
+def _expire_book_locked(
+    book_path: Path, namespace: str, cutoff: float, hit_cache: dict, hit_lookup: _HitLookup,
+) -> tuple[int, bool]:
+    """淘汰一本记忆里过期的自动条目，返回 (删掉的条数, 是否整本删空)。调用方持有记忆写锁。"""
+    data = _load_book(book_path)
+    entries = data["entries"]
+    kept = [entry for entry in entries if not _memory_entry_expired(entry, namespace, cutoff, hit_cache, hit_lookup)]
+    deleted = len(entries) - len(kept)
+    if not deleted:
+        return 0, False
+    if kept:
+        data["entries"] = kept
+        _rewrite_book(book_path, data)
+        return deleted, False
+    _unlink(book_path)
+    return deleted, True
+
+
+def _sweep_namespace_locked(
+    namespace: str,
+    directory: Path,
+    cutoff: float,
+    hit_cache: dict,
+    hit_lookup: _HitLookup,
+    sweep: _MemorySweep,
+) -> None:
+    """一个 namespace：淘汰过期的自动条目，删空了连目录一起收掉。调用方持有记忆写锁。"""
+    books = sorted(path for path in directory.glob("*.yaml") if path.is_file())
+    if namespace.startswith(SUBJECT_PREFIX):
+        # 跨会话人物档案不参与年龄淘汰：画像的价值就在长期积累，
+        # 「三个月前提过对象生日」正是它存在的理由。只能手工删。
+        sweep.skipped_archives += len(books)
+    else:
+        for book_path in books:
+            try:
+                deleted, emptied = _expire_book_locked(book_path, namespace, cutoff, hit_cache, hit_lookup)
+            except MemoryBookUnreadable as exc:
+                logging.info("[memory] skipped unreadable book %s: %s", book_path, exc.reason)
+                continue
+            except OSError as exc:
+                logging.info("[memory] failed to update book %s: %s", book_path, exc)
+                continue
+            sweep.scanned_books += 1
+            sweep.deleted_entries += deleted
+            sweep.removed_empty_books += int(emptied)
+    # 判空和 rmdir 都得在锁里：engine 可能正往这个目录里写第一本。
+    if namespace and not any(directory.iterdir()):
+        _rmdir(directory)
+
+
+def purge_expired_memory_entries():
+    """Remove stale non-constant memory entries from the memory books.
+
+    Memory books are YAML files shaped like {book, entries}.  Namespaced books
+    live under data/memory/<namespace>/*.yaml, while older/global books live
+    directly under data/memory/*.yaml.  We scan both layouts.
     """
     if MEMORY_ENTRY_MAX_AGE <= 0:
         logging.info("[memory] entry cleanup disabled")
         return
 
-    mem_root = DATA_DIR / "memory"
-    if not mem_root.exists() or not mem_root.is_dir():
+    workspace_root = DATA_DIR.parent
+    mem_root = memory_root(workspace_root)
+    if not mem_root.is_dir():
         return
 
     cutoff = time.time() - MEMORY_ENTRY_MAX_AGE
-    scanned_books = 0
-    deleted_entries = 0
-    removed_empty_books = 0
-    skipped_archives = 0
+    sweep = _MemorySweep()
     hit_cache, hit_lookup = _load_hit_stamps(mem_root)
 
-    for book_path in sorted(mem_root.rglob("*.yaml")):
+    namespaces = [("", mem_root), *((directory.name, directory) for directory in namespace_dirs(workspace_root))]
+    for namespace, directory in namespaces:
         try:
-            namespace = book_path.parent.relative_to(mem_root).as_posix()
-        except ValueError:
-            namespace = ""
-        if namespace == ".":
-            namespace = ""
-        if namespace.startswith(SUBJECT_PREFIX):
-            # 跨会话人物档案不参与年龄淘汰：画像的价值就在长期积累，
-            # 「三个月前提过对象生日」正是它存在的理由。只能手工删。
-            skipped_archives += 1
-            continue
-        try:
-            raw = yaml.safe_load(book_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logging.info("[memory] skipped unreadable book %s: %s", book_path, exc)
-            continue
-        if not isinstance(raw, dict):
-            continue
-        entries = raw.get("entries")
-        if not isinstance(entries, list):
-            continue
-
-        scanned_books += 1
-        kept: list[object] = []
-        changed = False
-        for entry in entries:
-            if not isinstance(entry, dict):
-                kept.append(entry)
-                continue
-            if bool(entry.get("constant", False)):
-                kept.append(entry)
-                continue
-            # 只清自动提取写的条目。空 source 一律当手工记忆保护 —— save_memory 早期
-            # 不写这个字段，把它判成 auto 就会删掉一批本该只有人能删的东西。
-            # dream 的提示词规则也是「保护 source != auto」，两边必须一致。
-            if str(entry.get("source") or "").strip() != "auto":
-                kept.append(entry)
-                continue
-            ref_ts = _memory_entry_reference_ts(
-                entry, hit_lookup(hit_cache, namespace, str(entry.get("id") or "")),
-            )
-            # Entries without timestamps are legacy/manual data; keep them rather
-            # than guessing. save_memory now writes created_at for new entries.
-            if ref_ts is None or ref_ts >= cutoff:
-                kept.append(entry)
-                continue
-            deleted_entries += 1
-            changed = True
-
-        if not changed:
-            continue
-        raw["entries"] = kept
-        try:
-            if kept:
-                _write_text(book_path, yaml.safe_dump(raw, allow_unicode=True, sort_keys=False))
-            else:
-                _unlink(book_path)
-                removed_empty_books += 1
-        except Exception as exc:
-            logging.info("[memory] failed to update book %s: %s", book_path, exc)
-
-    # Remove empty namespace directories after empty book deletion.
-    for dirpath, _, _ in os.walk(str(mem_root), topdown=False):
-        dp = Path(dirpath)
-        if dp == mem_root:
-            continue
-        try:
-            next(dp.iterdir())
-        except StopIteration:
-            try:
-                _rmdir(dp)
-            except Exception:
-                pass
-        except Exception:
-            pass
+            # 和 engine 的记忆工具同一把锁：读完到写回之间插进来的那次保存，会被这次整本写回盖掉。
+            with _memory_write_lock(workspace_root):
+                _sweep_namespace_locked(namespace, directory, cutoff, hit_cache, hit_lookup, sweep)
+        except (OSError, TimeoutError) as exc:
+            logging.info("[memory] namespace %s skipped: %s", namespace or "(root)", exc)
 
     removed_hit_keys = 0
     try:
-        # 直跑 data_cleanup.py（Windows 定时器）时 engine 包不在 path，退化成跳过孤儿回收。
         from engine.memory_hit_cache import prune_orphan_namespace_hits
 
         surviving = {p.name for p in mem_root.iterdir() if p.is_dir()}
@@ -408,10 +425,10 @@ def purge_expired_memory_entries():
     logging.info(
         "[memory] scanned_books=%d deleted_entries=%d removed_empty_books=%d "
         "skipped_archives=%d removed_hit_keys=%d max_age_hours=%.1f",
-        scanned_books,
-        deleted_entries,
-        removed_empty_books,
-        skipped_archives,
+        sweep.scanned_books,
+        sweep.deleted_entries,
+        sweep.removed_empty_books,
+        sweep.skipped_archives,
         removed_hit_keys,
         MEMORY_ENTRY_MAX_AGE / 3600,
     )
@@ -483,7 +500,7 @@ def purge_expired_task_conversations():
     session_ids = {
         str(row.get("session_id") or "").strip()
         for row in rows
-        if isinstance(row, dict) and is_memory_namespace(row.get("conversation_key"))
+        if isinstance(row, dict) and is_namespace_conversation_key(row.get("conversation_key"))
     }
     cutoff = time.time() - TASK_CONVERSATION_MAX_AGE
     deleted = 0

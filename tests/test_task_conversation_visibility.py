@@ -21,7 +21,7 @@ if str(_ROOT) not in sys.path:
 
 import httpx  # noqa: E402
 import engine.data_cleanup as cleanup  # noqa: E402
-from engine.memory_namespace import conversation_namespace  # noqa: E402
+from engine.memory_namespace import conversation_namespace, namespace_conversation_key  # noqa: E402
 import supervisor.admin_api as admin_api  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
@@ -67,14 +67,18 @@ class TestInternalTaskKey:
         # 判据一旦放宽就会开始隐藏真实会话，那比多一行更糟。
         assert not is_internal_task_key(key)
 
+    def test_a_task_keyed_by_a_custom_memory_book_is_internal_too(self) -> None:
+        # 节点 memory_book 自己起的名字借的是 memory:<名字>。
+        assert is_internal_task_key(namespace_conversation_key("角色本"))
+
     @pytest.mark.parametrize("key", [
-        "conv_7f777f6eb8df09542755b014", "user_UserB", "user_A",
+        "conv_7f777f6eb8df09542755b014", "user_UserB", "user_A", "memory:角色本",
         "qq_group:5edca2992de82f26297b3a68", "qq_private:abc", "smoke", "",
-        "conv_short", "user_1abc", "user_a-b", "users_UserB",
+        "conv_short", "user_1abc", "user_a-b", "users_UserB", "memory:../escape",
     ])
     def test_the_cleanup_side_agrees(self, key: str) -> None:
         # 两个消费端共用同一份判定，谁绕过去自己写一份都会在这里露出来。
-        assert cleanup.is_memory_namespace(key) is is_internal_task_key(key)
+        assert cleanup.is_namespace_conversation_key(key) is is_internal_task_key(key)
 
     def test_it_agrees_with_the_namespace_algorithm(self) -> None:
         # 真实会话键算出的 namespace 必然是内部形态 —— 两个函数说的是同一件事。

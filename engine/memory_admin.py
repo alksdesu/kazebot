@@ -15,13 +15,21 @@ from engine.builtin.knowledge_inject import (
     _BOOK_NAME_RE,
     _DEFAULT_SCAN_DEPTH,
     _MEMORY_ID_RE,
+    MemoryBookUnreadable,
     _invalidate_cache,
     _load_book,
     _memory_write_lock,
     _save_book,
-    memory_dir,
 )
-from engine.memory_namespace import is_memory_namespace, is_valid_subject, subject_from_namespace
+from engine.memory_namespace import (
+    InvalidMemoryNamespace,
+    is_memory_namespace,
+    is_valid_namespace,
+    is_valid_subject,
+    memory_dir,
+    namespace_dirs,
+    subject_from_namespace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +58,21 @@ def _valid_namespace(namespace: str) -> str:
     text = str(namespace or "").strip()
     if not text:
         return ""
-    if is_memory_namespace(text):
+    if is_valid_namespace(text):
         return text
     raise MemoryAdminError(f"非法的记忆 namespace: {namespace}")
+
+
+def _namespace_dir(workspace_root: Path, namespace: str) -> Path:
+    """校验过的 namespace 目录。名字合规、却是链到 data/memory 外面的目录，同样不认。"""
+    try:
+        return memory_dir(Path(workspace_root), _valid_namespace(namespace))
+    except InvalidMemoryNamespace as exc:
+        raise MemoryAdminError(f"非法的记忆 namespace: {namespace}") from exc
+
+
+def _unreadable(exc: MemoryBookUnreadable) -> MemoryAdminError:
+    return MemoryAdminError(f"记忆本 {exc.path.name} 读不出来（{exc.reason}），先修好或删掉这个文件再改")
 
 
 def _valid_book(book: str) -> str:
@@ -86,28 +106,35 @@ def _clean_keywords(raw: Any) -> list[str]:
     return result[:_MAX_KEYWORDS]
 
 
+def _namespace_kind(namespace: str) -> str:
+    if not namespace:
+        return "orphan"
+    if subject_from_namespace(namespace):
+        return "subject"
+    # 节点在 memory_book 里自己起名的目录，不属于任何一个会话。
+    return "conversation" if is_memory_namespace(namespace) else "memory_book"
+
+
 def list_namespaces(workspace_root: Path) -> list[dict[str, Any]]:
     """每个 namespace 一行，带条目数与最后修改时间。"""
-    root = memory_dir(Path(workspace_root))
-    if not root.is_dir():
-        return []
     result: list[dict[str, Any]] = []
     candidates: list[str] = [""]
-    candidates.extend(sorted(child.name for child in root.iterdir() if child.is_dir()))
+    candidates.extend(directory.name for directory in namespace_dirs(Path(workspace_root)))
     for name in candidates:
+        # 盘上的原名不合规就不列：入口会把首尾空白剥掉，点进去打开的是另一个目录。
+        if name and not is_valid_namespace(name):
+            continue
         try:
-            namespace = _valid_namespace(name)
+            entries = list_entries(workspace_root, name)
         except MemoryAdminError:
             continue
-        entries = list_entries(workspace_root, namespace)
         # 空的子目录仍要列出来，人才能把它清掉；根目录没东西就没什么可看的。
-        if not entries and not namespace:
+        if not entries and not name:
             continue
-        subject = subject_from_namespace(namespace)
         result.append({
-            "namespace": namespace,
-            "kind": "subject" if subject else ("conversation" if namespace else "orphan"),
-            "subject": subject,
+            "namespace": name,
+            "kind": _namespace_kind(name),
+            "subject": subject_from_namespace(name),
             "entry_count": len(entries),
             "books": sorted({entry["book"] for entry in entries}),
             "updated_at": max((entry.get("updated_at") or "" for entry in entries), default=""),
@@ -116,15 +143,19 @@ def list_namespaces(workspace_root: Path) -> list[dict[str, Any]]:
 
 
 def list_entries(workspace_root: Path, namespace: str) -> list[dict[str, Any]]:
-    """某个 namespace 下全部记忆条目，附带它所在的 book。"""
-    namespace = _valid_namespace(namespace)
-    directory = memory_dir(Path(workspace_root), namespace)
+    """某个 namespace 下全部记忆条目，附带它所在的 book。读不出来的本跳过并记一笔。"""
+    directory = _namespace_dir(workspace_root, namespace)
     if not directory.is_dir():
         return []
     result: list[dict[str, Any]] = []
     for path in sorted(directory.glob("*.yaml")):
         book = path.stem
-        for entry in _load_book(path).get("entries") or []:
+        try:
+            entries = _load_book(path)["entries"]
+        except MemoryBookUnreadable as exc:
+            logger.warning("memory book skipped in console listing: %s", exc)
+            continue
+        for entry in entries:
             if not isinstance(entry, dict):
                 continue
             item = dict(entry)
@@ -139,6 +170,7 @@ def upsert_entry(
 ) -> dict[str, Any]:
     """新建或整条更新一条记忆。id 已存在即更新。"""
     namespace = _valid_namespace(namespace)
+    directory = _namespace_dir(workspace_root, namespace)
     book = _valid_book(payload.get("book"))
     entry_id = _valid_entry_id(payload.get("id"))
     content = str(payload.get("content") or "").strip()
@@ -157,11 +189,14 @@ def upsert_entry(
         raise MemoryAdminError("这条记忆永远不会被召回：至少填关键词，或勾选常驻，或指定 subject")
 
     now = datetime.now(timezone.utc).isoformat()
-    path = memory_dir(Path(workspace_root), namespace) / f"{book}.yaml"
+    path = directory / f"{book}.yaml"
     with _memory_write_lock(Path(workspace_root)):
-        data = _load_book(path)
+        try:
+            data = _load_book(path)
+        except MemoryBookUnreadable as exc:
+            raise _unreadable(exc) from exc
         data.setdefault("book", book)
-        entries = data.setdefault("entries", [])
+        entries = data["entries"]
         found = -1
         for index, existing in enumerate(entries):
             if isinstance(existing, dict) and str(existing.get("id") or "").strip() == entry_id:
@@ -199,15 +234,19 @@ def upsert_entry(
 def delete_entry(workspace_root: Path, namespace: str, book: str, entry_id: str) -> bool:
     """删掉一条记忆。返回是否真的删到了。"""
     namespace = _valid_namespace(namespace)
+    directory = _namespace_dir(workspace_root, namespace)
     book = _valid_book(book)
     entry_id = _valid_entry_id(entry_id)
-    path = memory_dir(Path(workspace_root), namespace) / f"{book}.yaml"
+    path = directory / f"{book}.yaml"
     removed = False
     with _memory_write_lock(Path(workspace_root)):
         if not path.exists():
             return False
-        data = _load_book(path)
-        entries = data.get("entries") or []
+        try:
+            data = _load_book(path)
+        except MemoryBookUnreadable as exc:
+            raise _unreadable(exc) from exc
+        entries = data["entries"]
         kept = [
             entry for entry in entries
             if not (isinstance(entry, dict) and str(entry.get("id") or "").strip() == entry_id)
@@ -227,15 +266,18 @@ def delete_entry(workspace_root: Path, namespace: str, book: str, entry_id: str)
 
 
 def clear_namespace(workspace_root: Path, namespace: str) -> int:
-    """清空一个 namespace 的全部记忆，返回删掉的条目数。"""
+    """清空一个 namespace 的全部记忆，返回删掉的条目数。读不出来的本照删，不计条数。"""
     namespace = _valid_namespace(namespace)
-    directory = memory_dir(Path(workspace_root), namespace)
+    directory = _namespace_dir(workspace_root, namespace)
     if not directory.is_dir():
         return 0
     removed = 0
     with _memory_write_lock(Path(workspace_root)):
         for path in sorted(directory.glob("*.yaml")):
-            removed += len(_load_book(path).get("entries") or [])
+            try:
+                removed += len(_load_book(path)["entries"])
+            except MemoryBookUnreadable as exc:
+                logger.warning("clearing memory namespace %s drops an unreadable book: %s", namespace, exc)
             path.unlink(missing_ok=True)
         if namespace:
             # 根目录不能删，它是 data/memory 本身。

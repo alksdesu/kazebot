@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from engine.eventlog_rotation import eventlog_file_lock
+from engine.memory_namespace import memory_root
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ _HIT_KEY_SEP = "/"
 
 
 def hit_cache_path(workspace_root: Path) -> Path:
-    return workspace_root / "data" / "memory" / ".hit_cache.json"
+    return memory_root(workspace_root) / ".hit_cache.json"
 
 
 def hit_cache_key(namespace: str, entry_id: str) -> str:
@@ -154,9 +155,10 @@ def prune_entry_hits(workspace_root: Path, namespace: str, entry_id: str) -> int
     """Drop one entry's hit stamp.
 
     留着的话，之后在同一个会话里新建同 id 的记忆会继承旧命中时间，一进来就是「老热记忆」。
+    根目录条目的命中戳就是扁平 key，同 prune_namespace_hits 一样留着：别的会话的同 id 记忆还靠它判龄。
     """
     entry = str(entry_id or "").strip()
-    if not entry:
+    if not entry or not str(namespace or "").strip():
         return 0
     doomed = hit_cache_key(namespace, entry)
     return _drop_hit_keys(workspace_root, lambda key: key == doomed)

@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 
 import config_layout
+from engine.memory_namespace import InvalidMemoryNamespace, memory_book_error, memory_dir
 from engine.node import node_file
 from toolbox._common import request_guard
 from toolbox.context import ToolContext
@@ -101,13 +102,22 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
 
     display_name = str(args.get("display_name", "")).strip() or name
     description = str(args.get("description", "")).strip()
-    # memory_book 默认等于 name，用于记忆 namespace 子目录隔离
     memory_book = str(args.get("memory_book", "")).strip() or name
     persistent = bool(args.get("persistent", True))
     provider = str(args.get("provider", "")).strip()
     caller_node_id = str(args.get("caller_node_id", "")).strip()
 
     workspace_root = ctx.workspace_root
+
+    # memory_book 会拼成 data/memory 下的目录名，记忆工具在那里读写、整本覆盖或删除；
+    # 落盘任何东西之前先挡掉，免得留下一个指着坏目录的节点。
+    memory_book_reason = memory_book_error(memory_book)
+    if memory_book_reason:
+        return _err(f"invalid memory_book {memory_book!r}: {memory_book_reason}")
+    try:
+        mem_dir = memory_dir(workspace_root, memory_book)
+    except InvalidMemoryNamespace as exc:
+        return _err(str(exc))
 
     # Step 1: 检查节点 id 是否已被占用，避免误覆盖。同名系统节点、把它声明成旧 id 的节点
     # 都会让新文件永远加载不到；后者还会把写着旧 id 的会话和配置悄悄引到新节点上。
@@ -157,6 +167,8 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
             "content_preview": _node_yaml[:200],
             "content_len": len(_node_yaml),
             "create_agent": True,
+            # 预览只截前 200 字，memory_book 常落在后面；审批人得看见新节点会读写哪个记忆库。
+            "memory_book": memory_book,
         },
     )
     if err is not None:
@@ -206,7 +218,6 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
             pass  # 非致命：节点已创建但调用者更新失败
 
     # Step 7: 创建记忆 namespace 目录（mkdir -p）
-    mem_dir = workspace_root / "data" / "memory" / memory_book
     mem_dir.mkdir(parents=True, exist_ok=True)
 
     return _ok(

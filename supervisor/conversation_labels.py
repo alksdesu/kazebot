@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from engine.memory_namespace import conversation_namespace, is_memory_namespace
+from engine.memory_namespace import conversation_namespace, is_namespace_conversation_key
 from platforms.descriptor import (
     CHANNEL_GROUP,
     CONVERSATION_KINDS,
@@ -46,9 +46,9 @@ def is_internal_task_key(conversation_key: str) -> bool:
 
     dream 拿 namespace 当 conversation_key 建整理任务（save_memory 靠它推目录），
     supervisor 于是给它开一条 session。会话整理用 conv_<摘要>，人物档案整理用
-    user_<别名>；真人会话键永远带平台通道前缀，两种都长不成。
+    user_<别名>，节点记忆库用 memory:<名字>；真人会话键永远带平台通道前缀，都长不成。
     """
-    return is_memory_namespace(conversation_key)
+    return is_namespace_conversation_key(conversation_key)
 
 
 def is_runtime_copy_session(session_id: str) -> bool:
