@@ -45,6 +45,26 @@
   --duties-danger-hover: #f7dcd5;
   --duties-success: var(--duties-live);
   --duties-success-bg: #e1f2e9;
+  --duties-success-border: #7fb59d;
+  --duties-success-hover: #cfe8da;
+  /* 等审批、排队、系统插话：要人留意，但还没出错。 */
+  --duties-warning: #7a4a05;
+  --duties-warning-bg: #fbf0dc;
+  --duties-warning-border: #d4a961;
+  --duties-warning-hover: #f5e2c0;
+  /* 正在发生的事：输出中、工具在跑、回复。 */
+  --duties-info: #234e70;
+  --duties-info-bg: #e5edf4;
+  --duties-info-border: #8eabc4;
+  --duties-info-hover: #d5e2ed;
+  /* 不进正文的那一路：子节点回调、异步任务、思考。 */
+  --duties-meta: #5a3d72;
+  --duties-meta-bg: #efe9f4;
+  --duties-meta-border: #b29cc6;
+  --duties-meta-hover: #e3d8ec;
+  /* 彩色卡片里再垫一层，透出卡片自己的底色，不另起一种颜色。 */
+  --duties-veil: color-mix(in srgb, var(--duties-surface) 50%, transparent);
+  --duties-inset: color-mix(in srgb, var(--duties-text) 5%, transparent);
   --duties-focus: #7c4a03;
   --duties-overlay: rgb(37 37 37 / 34%);
   --duties-space-1: 0.25rem;

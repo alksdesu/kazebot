@@ -96,7 +96,7 @@ export const ThinkingBlock = ({ block }: ThinkingBlockProps) => {
         </span>
         {block.streaming ? (
           <>
-            <span className="inline-block animate-spin text-blue-500">
+            <span className="inline-block animate-spin text-[var(--duties-info)]">
               {/* [2026-06-01] Why: streaming thinking used a gapped circle arrow glyph.
                   How: render progress_activity through the shared Icon. Purpose:
                   active reasoning status uses the same spinner symbol as tool cards. */}

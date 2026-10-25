@@ -8,6 +8,7 @@ import { useMemo, useState, type ReactNode } from 'react';
 
 import { useApprovalDecision, type ApprovalDecision } from '../../../hooks/useApprovalDecision';
 import { shouldAutoApproveToolCall, useClientPrefsStore } from '../../../store/clientPrefsStore';
+import { TONE_BOX } from '../../../styles/tones';
 import type { ToolExecution, ToolStatus } from '../../../types/message';
 import { Icon } from '../../common';
 
@@ -48,27 +49,27 @@ interface CommandResult {
 }
 
 const DETAIL_PREVIEW_CHAR_LIMIT = 10000;
-const PREVIEW_PRE_CLASS = 'max-h-56 overflow-auto whitespace-pre-wrap break-words bg-black/5 p-2';
+const PREVIEW_PRE_CLASS = 'max-h-56 overflow-auto whitespace-pre-wrap break-words bg-[var(--duties-inset)] p-2';
 
 const STATUS_STYLES: Record<ToolStatus, StatusStyle> = {
   args_streaming: {
     icon: 'progress_activity',
     label: '参数',
-    className: 'border-blue-200 bg-blue-50 text-blue-700',
-    iconClassName: 'text-blue-600',
+    className: TONE_BOX.info,
+    iconClassName: 'text-[var(--duties-info)]',
     spin: true,
   },
   queued: {
     icon: 'pending',
     label: '排队中',
-    className: 'border-[var(--duties-border)] bg-[var(--duties-bg)] text-[var(--duties-tertiary)]',
+    className: TONE_BOX.neutral,
     iconClassName: 'text-[var(--duties-tertiary)]',
   },
   running: {
     icon: 'progress_activity',
     label: '运行中',
-    className: 'border-blue-200 bg-blue-50 text-blue-700',
-    iconClassName: 'text-blue-600',
+    className: TONE_BOX.info,
+    iconClassName: 'text-[var(--duties-info)]',
     spin: true,
   },
   // [AutoC 2026-05-31] Why: approval is now a ToolExecution lifecycle state.
@@ -78,32 +79,32 @@ const STATUS_STYLES: Record<ToolStatus, StatusStyle> = {
   awaiting_approval: {
     icon: 'verified_user',
     label: '需要审批',
-    className: 'border-orange-200 bg-orange-50 text-orange-700',
-    iconClassName: 'text-orange-600',
+    className: TONE_BOX.warning,
+    iconClassName: 'text-[var(--duties-warning)]',
   },
   async_started: {
     icon: 'open_in_new',
     label: '异步已开始',
-    className: 'border-indigo-200 bg-indigo-50 text-indigo-700',
-    iconClassName: 'text-indigo-600',
+    className: TONE_BOX.meta,
+    iconClassName: 'text-[var(--duties-meta)]',
   },
   success: {
     icon: 'check_circle',
     label: '成功',
-    className: 'border-green-200 bg-green-50 text-green-700',
-    iconClassName: 'text-green-600',
+    className: TONE_BOX.success,
+    iconClassName: 'text-[var(--duties-success)]',
   },
   error: {
     icon: 'error',
     label: '错误',
-    className: 'border-red-200 bg-red-50 text-red-700',
-    iconClassName: 'text-red-600',
+    className: TONE_BOX.danger,
+    iconClassName: 'text-[var(--duties-danger)]',
   },
   cancelled: {
     icon: 'cancel',
     label: '已取消',
-    className: 'border-gray-200 bg-gray-50 text-gray-600',
-    iconClassName: 'text-gray-500',
+    className: TONE_BOX.neutral,
+    iconClassName: 'text-[var(--duties-tertiary)]',
   },
 };
 
@@ -377,7 +378,7 @@ function renderJsonWithHighlightedKeys(text: string): ReactNode {
 
     if (match[2]) {
       nodes.push(
-        <span key={`json-key-${tokenIndex}`} className="text-blue-600">
+        <span key={`json-key-${tokenIndex}`} className="text-[var(--duties-info)]">
           {match[1]}
         </span>,
       );
@@ -415,7 +416,7 @@ function LayeredPreview({ text, emptyLabel = '', renderText }: LayeredPreviewPro
       {limited && !showFull && (
         <button
           type="button"
-          className="text-[0.64rem] font-semibold text-blue-600 hover:underline"
+          className="text-[0.64rem] font-semibold text-[var(--duties-info)] hover:underline"
           onClick={() => setShowFull(true)}
         >
           查看完整内容
@@ -453,9 +454,7 @@ function renderExecuteCommandResult(tool: ToolExecution): ReactNode {
     return <LayeredPreview text={getRawResultText(tool)} />;
   }
 
-  const badgeClassName = commandResult.returnCode === 0
-    ? 'border-green-200 bg-green-100 text-green-700'
-    : 'border-red-200 bg-red-100 text-red-700';
+  const badgeClassName = commandResult.returnCode === 0 ? TONE_BOX.success : TONE_BOX.danger;
 
   return (
     <div className="space-y-2">
@@ -488,7 +487,7 @@ function renderSearchInFilesResult(tool: ToolExecution): ReactNode {
           const match = getStringValue(row.match);
           const context = getStringValue(row.context);
           return (
-            <div key={`${file}-${line}-${index}`} className="break-words rounded bg-black/5 px-2 py-1">
+            <div key={`${file}-${line}-${index}`} className="break-words rounded bg-[var(--duties-inset)] px-2 py-1">
               <span className="font-semibold text-[var(--duties-text)]">{file}:{line}</span>
               <span className="text-[var(--duties-tertiary)]"> | </span>
               <span>{match}</span>
@@ -680,7 +679,7 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
       </button>
 
       {tool.status === 'awaiting_approval' && tool.approvalId && (
-        <div className="space-y-2 border-t border-current/10 bg-white/45 px-3 py-2 font-mono text-[0.66rem]">
+        <div className="space-y-2 border-t border-current/10 bg-[var(--duties-veil)] px-3 py-2 font-mono text-[0.66rem]">
           <div className="space-y-1 text-[var(--duties-secondary)]">
             <div><span className="text-[var(--duties-tertiary)]">操作：</span> <code className="text-[var(--duties-text)]">{approvalOperation}</code></div>
             {approvalDetails.path !== undefined && (
@@ -691,7 +690,7 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
             )}
           </div>
           {isAutoApprovedPending ? (
-            <div className="inline-flex items-center gap-1 rounded-sm bg-gray-100 px-2 py-1 text-xs font-semibold text-gray-600">
+            <div className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-xs font-semibold ${TONE_BOX.neutral}`}>
               {/* [2026-06-01] Why: auto-approved tools should not present manual
                   buttons while the local client decision is being submitted. How:
                   show a muted badge instead. Purpose: users can distinguish local
@@ -703,7 +702,7 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                className="inline-flex items-center gap-1 rounded-sm bg-green-50 px-2 py-1 text-xs font-medium text-green-700 hover:bg-green-100 disabled:cursor-not-allowed disabled:opacity-60"
+                className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-xs font-medium ${TONE_BOX.success} hover:bg-[var(--duties-success-hover)] disabled:cursor-not-allowed disabled:opacity-60`}
                 onClick={() => handleApproval(tool.approvalId!, 'allow')}
                 disabled={approvalLoading}
               >
@@ -715,7 +714,7 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
               </button>
               <button
                 type="button"
-                className="inline-flex items-center gap-1 rounded-sm bg-red-50 px-2 py-1 text-xs font-medium text-red-600 hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-60"
+                className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-xs font-medium ${TONE_BOX.danger} hover:bg-[var(--duties-danger-hover)] disabled:cursor-not-allowed disabled:opacity-60`}
                 onClick={() => handleApproval(tool.approvalId!, 'deny')}
                 disabled={approvalLoading}
               >
@@ -725,12 +724,12 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
               {approvalLoading && <span className="text-[var(--duties-tertiary)]">提交中…</span>}
             </div>
           )}
-          {approvalError && <div className="text-xs font-semibold text-red-600">{approvalError}</div>}
+          {approvalError && <div className="text-xs font-semibold text-[var(--duties-danger)]">{approvalError}</div>}
         </div>
       )}
 
       {tool.approvalStatus === 'allowed' && (
-        <div className="inline-flex items-center gap-1 border-t border-current/10 bg-white/45 px-3 py-2 font-mono text-xs font-semibold text-green-600">
+        <div className="inline-flex items-center gap-1 border-t border-current/10 bg-[var(--duties-veil)] px-3 py-2 font-mono text-xs font-semibold text-[var(--duties-success)]">
           {/* [2026-06-01] Why: approval result banners used emoji marks.
               How: render Material Symbols beside the result text. Purpose: post-
               decision states do not reintroduce platform emoji. */}
@@ -740,14 +739,14 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
       )}
 
       {tool.approvalStatus === 'denied' && (
-        <div className="inline-flex items-center gap-1 border-t border-current/10 bg-white/45 px-3 py-2 font-mono text-xs font-semibold text-red-500">
+        <div className="inline-flex items-center gap-1 border-t border-current/10 bg-[var(--duties-veil)] px-3 py-2 font-mono text-xs font-semibold text-[var(--duties-danger)]">
           <Icon name="cancel" size={14} />
           <span>已拒绝</span>
         </div>
       )}
 
       {expanded && canExpand && (
-        <div className="space-y-2 border-t border-current/10 bg-white/50 px-3 py-2 font-mono text-[0.66rem] text-[var(--duties-secondary)]">
+        <div className="space-y-2 border-t border-current/10 bg-[var(--duties-veil)] px-3 py-2 font-mono text-[0.66rem] text-[var(--duties-secondary)]">
           {(tool.taskId || tool.nodeId || tool.nodeName) && (
             <div className="space-y-0.5">
               <div className="font-semibold text-[var(--duties-text)]">执行信息</div>
@@ -766,7 +765,7 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
           )}
           {resultDisplay && (
             <div>
-              <div className={`mb-1 font-semibold ${tool.status === 'error' || tool.rejected ? 'text-red-600' : 'text-[var(--duties-text)]'}`}>
+              <div className={`mb-1 font-semibold ${tool.status === 'error' || tool.rejected ? 'text-[var(--duties-danger)]' : 'text-[var(--duties-text)]'}`}>
                 {tool.status === 'error' || tool.rejected ? '错误' : '结果'} <span className="font-normal text-[var(--duties-tertiary)]">{resultDisplay.sizeLabel}</span>
               </div>
               {renderResult(tool)}

@@ -26,6 +26,7 @@ import { useViewStore } from '../../store/viewStore';
 import type { NodeDef } from '../../types';
 import { describeEnvRef, envRefNames } from '../../utils/envRef';
 import { literalModelsOnly, mergeModelChoices, modelsFromProviders } from '../../utils/modelChoices';
+import { connectionDotClass } from '../../utils/systemStatus';
 import { Button } from '../settings/pages/settingsControls';
 import { errorMessage } from '../../api/request';
 
@@ -87,18 +88,6 @@ function connectionLabel(status: string): string {
   if (status === 'reconnecting') return '重连中';
   if (status === 'closed') return '已断开';
   return '';
-}
-
-function connectionDotClass(status: string): string {
-  // [2026-06-01] Keep idle and healthy states visually quiet.
-  // Why: idle means no socket is currently needed after normal cleanup, while closed
-  // means an unexpected disconnect. How: map open to green, transient states to
-  // yellow, closed to red, and idle to a muted gray dot. Purpose: the panel avoids
-  // false red warnings after successful turns or cancellations.
-  if (status === 'open') return 'bg-green-500';
-  if (status === 'connecting' || status === 'reconnecting') return 'bg-yellow-500';
-  if (status === 'closed') return 'bg-red-500';
-  return 'bg-[var(--duties-tertiary)] opacity-40';
 }
 
 function connectionAriaLabel(status: string, visibleLabel: string): string {

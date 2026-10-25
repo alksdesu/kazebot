@@ -1,6 +1,7 @@
 // 平铺历史模型的聊天气泡：工具行、思考、审批与附件。
 import { useState } from 'react';
 
+import { TONE_BOX } from '../../styles/tones';
 import type { ChatMessage, ToolCall } from '../../types';
 import { Icon } from '../common';
 import { Markdown } from '../common/Markdown';
@@ -27,14 +28,14 @@ function getStatusIconName(toolCall: ToolCall): string {
 }
 
 function getStatusClass(toolCall: ToolCall): string {
-  if (toolCall.status === 'success') return 'border-green-200 bg-green-50 text-green-700';
-  if (toolCall.status === 'error') return 'border-red-200 bg-red-50 text-red-700';
-  return 'border-[var(--duties-border)] bg-[var(--duties-bg)] text-[var(--duties-tertiary)]';
+  if (toolCall.status === 'success') return TONE_BOX.success;
+  if (toolCall.status === 'error') return TONE_BOX.danger;
+  return TONE_BOX.neutral;
 }
 
 function getIconClass(toolCall: ToolCall): string {
-  if (toolCall.status === 'success') return 'text-green-600';
-  if (toolCall.status === 'error') return 'text-red-600';
+  if (toolCall.status === 'success') return 'text-[var(--duties-success)]';
+  if (toolCall.status === 'error') return 'text-[var(--duties-danger)]';
   return 'text-[var(--duties-tertiary)]';
 }
 
@@ -84,21 +85,21 @@ const ToolCallRow = ({ toolCall, index, expanded, onToggle }: ToolCallRowProps) 
       </button>
 
       {expanded && canExpand && (
-        <div className="border-t border-current/10 bg-white/50 px-3 py-2 font-mono text-[0.66rem] text-[var(--duties-secondary)]">
+        <div className="border-t border-current/10 bg-[var(--duties-veil)] px-3 py-2 font-mono text-[0.66rem] text-[var(--duties-secondary)]">
           {hasArguments && (
             <div className="mb-2">
               <div className="mb-1 font-semibold text-[var(--duties-text)]">参数</div>
-              <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-black/5 p-2">
+              <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-[var(--duties-inset)] p-2">
                 {stringifyArguments(toolCall.arguments)}
               </pre>
             </div>
           )}
           {hasResult && (
             <div>
-              <div className={`mb-1 font-semibold ${toolCall.status === 'error' ? 'text-red-600' : 'text-[var(--duties-text)]'}`}>
+              <div className={`mb-1 font-semibold ${toolCall.status === 'error' ? 'text-[var(--duties-danger)]' : 'text-[var(--duties-text)]'}`}>
                 {toolCall.status === 'error' ? '错误' : '结果摘要'}
               </div>
-              <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-black/5 p-2">
+              <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-[var(--duties-inset)] p-2">
                 {toolCall.result}
               </pre>
             </div>
@@ -150,7 +151,7 @@ export const MessageBubble = ({ message }: MessageBubbleProps) => {
         {/* Role label */}
         <div className="mb-1.5 flex items-center gap-2">
           <span className={`font-mono text-[0.6rem] font-semibold uppercase tracking-[0.18em] ${
-            isUser ? 'text-[var(--duties-text)]' : isSystem ? 'text-orange-600' : 'text-blue-600'
+            isUser ? 'text-[var(--duties-text)]' : isSystem ? 'text-[var(--duties-warning)]' : 'text-[var(--duties-info)]'
           }`}>
             {isUser ? '你' : isSystem ? '系统' : '助手'}
           </span>
@@ -207,15 +208,15 @@ export const MessageBubble = ({ message }: MessageBubbleProps) => {
         {/* Task Complete — subtle divider, not a big banner */}
         {hasFinishSuccess && (
           <div className="mb-2 flex items-center gap-2 text-[var(--duties-tertiary)]">
-            <div className="h-px flex-1 bg-green-200" />
-            <span className="inline-flex items-center gap-1 font-mono text-[0.6rem] text-green-600">
+            <div className="h-px flex-1 bg-[var(--duties-success-border)]" />
+            <span className="inline-flex items-center gap-1 font-mono text-[0.6rem] text-[var(--duties-success)]">
               {/* [2026-06-01] Why: replace the task completion checkmark with Material Symbols.
                   How: render check_circle before the existing label. Purpose: legacy
                   message completion UI no longer emits decorative Unicode. */}
               <Icon name="check_circle" size={12} />
               <span>任务完成</span>
             </span>
-            <div className="h-px flex-1 bg-green-200" />
+            <div className="h-px flex-1 bg-[var(--duties-success-border)]" />
           </div>
         )}
 

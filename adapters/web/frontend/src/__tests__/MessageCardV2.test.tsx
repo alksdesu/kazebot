@@ -107,7 +107,7 @@ describe('MessageCard v2', () => {
     // the MessageCard block container. How: assert the container has the blue reply
     // border while the text block itself does not. Purpose: user messages cannot gain
     // borders from reused text-block delivery metadata.
-    expect(container.querySelector('.space-y-2')).toHaveClass('border-l-2', 'border-blue-400', 'pl-3');
+    expect(container.querySelector('.space-y-2')).toHaveClass('border-l-2', 'border-[var(--duties-info-border)]', 'pl-3');
     expect(screen.getByText('reply text').closest('.markdown-body')).not.toHaveClass('border-l-2');
 
     rerender(
@@ -130,7 +130,7 @@ describe('MessageCard v2', () => {
       />,
     );
 
-    expect(container.querySelector('.space-y-2')).toHaveClass('border-l-2', 'border-green-400', 'pl-3');
+    expect(container.querySelector('.space-y-2')).toHaveClass('border-l-2', 'border-[var(--duties-success-border)]', 'pl-3');
     expect(screen.getByText('已完成')).toBeInTheDocument();
     expect(screen.queryByText('任务完成')).not.toBeInTheDocument();
   });

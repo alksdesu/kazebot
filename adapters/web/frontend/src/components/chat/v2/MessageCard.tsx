@@ -26,18 +26,18 @@ const ROLE_STYLES: Record<MessageRole, { row: string; label: string }> = {
   },
   assistant: {
     row: 'bg-[var(--duties-panel)]',
-    label: 'text-blue-600',
+    label: 'text-[var(--duties-info)]',
   },
   system: {
-    row: 'bg-orange-50/60',
-    label: 'text-orange-600',
+    row: 'bg-[var(--duties-warning-bg)]',
+    label: 'text-[var(--duties-warning)]',
   },
   // [AutoC 2026-06-03] Why: dispatch callbacks need a visual lane separate from
   // user, assistant, and system cards. How: apply a subtle purple row and label.
   // Purpose: the callback remains fully expanded while being easy to scan.
   dispatch_callback: {
-    row: 'bg-purple-50/40',
-    label: 'text-purple-600',
+    row: 'bg-[var(--duties-meta-bg)]',
+    label: 'text-[var(--duties-meta)]',
   },
 };
 
@@ -82,16 +82,15 @@ function getBlocksContainerClassName(message: WsMessage): string {
   // Purpose: live and hydrated assistant reply/finish cards are visually distinct
   // without relying on block-level delivery styling.
   if (message.role !== 'assistant') return 'space-y-2';
-  if (message.completionType === 'reply') return 'space-y-2 border-l-2 border-blue-400 pl-3';
-  if (message.completionType === 'finish' && message.status !== 'failed') return 'space-y-2 border-l-2 border-green-400 pl-3';
+  if (message.completionType === 'reply') return 'space-y-2 border-l-2 border-[var(--duties-info-border)] pl-3';
+  if (message.completionType === 'finish' && message.status !== 'failed') return 'space-y-2 border-l-2 border-[var(--duties-success-border)] pl-3';
   return 'space-y-2';
 }
 
 function getStatusClassName(status: MessageStatus): string {
-  if (status === 'failed') return 'text-red-600';
-  if (status === 'cancelled') return 'text-gray-500';
-  if (status === 'awaiting_approval') return 'text-orange-600';
-  if (isActiveStatus(status)) return 'text-blue-600';
+  if (status === 'failed') return 'text-[var(--duties-danger)]';
+  if (status === 'awaiting_approval') return 'text-[var(--duties-warning)]';
+  if (isActiveStatus(status)) return 'text-[var(--duties-info)]';
   return 'text-[var(--duties-tertiary)]';
 }
 
@@ -134,11 +133,11 @@ export const MessageCard = ({ message, toolsById }: MessageCardProps) => {
           {message.source.nodeName && (
             <span className="font-mono text-[0.55rem] text-[var(--duties-tertiary)]">{message.source.nodeName}</span>
           )}
-          {active && <span aria-label="消息正在活动" className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />}
+          {active && <span aria-label="消息正在活动" className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--duties-info)]" />}
         </header>
 
         {dispatchSummary && (
-          <div className="mb-2 text-xs text-purple-700">
+          <div className="mb-2 text-xs text-[var(--duties-meta)]">
             {dispatchSummary}
           </div>
         )}
@@ -166,7 +165,7 @@ export const MessageCard = ({ message, toolsById }: MessageCardProps) => {
 
         {childSessionId && (
           <button
-            className="mt-1 text-xs font-mono text-purple-600 underline hover:text-purple-800"
+            className="mt-1 text-xs font-mono text-[var(--duties-meta)] underline hover:text-[var(--duties-text)]"
             onClick={() => useChatStore.getState().viewChildSession(childSessionId)}
           >
             {/* [AutoC 2026-06-03] Why: dispatch_result payloads now carry the child

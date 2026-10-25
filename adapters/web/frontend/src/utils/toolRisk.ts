@@ -3,6 +3,8 @@
 // Supervisor registers new built-in, MCP, and external tools. How: classify risk from
 // stable verb prefixes while keeping unknown tools conservative. Purpose: the client
 // can show a consistent risk badge everywhere without editing curated tool metadata.
+import { TONE_BOX } from '../styles/tones';
+
 export type RiskLevel = 'low' | 'medium' | 'high';
 
 export function inferToolRisk(toolName: string): RiskLevel {
@@ -26,7 +28,7 @@ export function riskClassName(risk: RiskLevel): string {
   // settings and Tool settings both need the same low/medium/high badge style. How:
   // return Tailwind utility classes keyed by risk. Purpose: risk display remains
   // consistent without extracting a larger design-system component.
-  if (risk === 'low') return 'border-green-200 bg-green-50 text-green-700';
-  if (risk === 'medium') return 'border-orange-200 bg-orange-50 text-orange-700';
-  return 'border-red-200 bg-red-50 text-red-700';
+  if (risk === 'low') return TONE_BOX.success;
+  if (risk === 'medium') return TONE_BOX.warning;
+  return TONE_BOX.danger;
 }

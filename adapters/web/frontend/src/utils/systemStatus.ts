@@ -1,4 +1,5 @@
 import type { RestartInProgress, RestartResult } from '../api/supervisorClient';
+import type { ConnectionStatus } from '../store/chatStore';
 
 // Shared derivations for Supervisor status surfaces (dashboard and settings).
 export function formatUptime(seconds: number | undefined): string {
@@ -17,6 +18,14 @@ export function formatUptime(seconds: number | undefined): string {
 export function countActiveTasks(tasks: Record<string, number> | undefined): number {
   // Suspended and pending tasks are still non-terminal work, so they count as active.
   return (tasks?.running || 0) + (tasks?.pending || 0) + (tasks?.suspended || 0);
+}
+
+export function connectionDotClass(status: ConnectionStatus): string {
+  if (status === 'open') return 'bg-[var(--duties-live)]';
+  if (status === 'connecting' || status === 'reconnecting') return 'bg-[var(--duties-warning)]';
+  if (status === 'closed') return 'bg-[var(--duties-danger)]';
+  // Idle only means no socket is needed after a finished turn; a red dot there would be a false alarm.
+  return 'bg-[var(--duties-tertiary)] opacity-40';
 }
 
 // Keys are the reason strings in supervisor/types.py; an unknown reason still gets a readable line.

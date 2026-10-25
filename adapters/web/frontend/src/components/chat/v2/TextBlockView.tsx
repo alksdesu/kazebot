@@ -40,7 +40,7 @@ export const TextBlockView = ({ block }: TextBlockViewProps) => {
         // [2026-06-01] Why: the streaming cursor used a block Unicode glyph.
         // How: draw the cursor as a small CSS rectangle instead. Purpose: live text
         // rendering does not rely on decorative Unicode symbols.
-        <span aria-label="流式输出光标" className="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-blue-500 align-middle" />
+        <span aria-label="流式输出光标" className="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-[var(--duties-info)] align-middle" />
       )}
     </div>
   );

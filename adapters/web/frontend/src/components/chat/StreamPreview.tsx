@@ -1,6 +1,7 @@
 // [2026-05-16] Stream preview — thinking chain, text preview, tool logs, timer, retry info.
 import { useEffect, useState } from 'react';
 
+import { TONE_BOX } from '../../styles/tones';
 import type { StreamPreviewState } from '../../types';
 import { Icon } from '../common';
 
@@ -26,7 +27,7 @@ export const StreamPreview = ({ preview }: StreamPreviewProps) => {
       <div className="border border-[var(--duties-border)] bg-[var(--duties-muted)] p-3">
         {/* Timer */}
         <div className="mb-2 flex items-center gap-2 font-mono text-[0.65rem] text-[var(--duties-tertiary)]">
-          <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />
+          <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--duties-info)]" />
           <span>生成中</span>
           {elapsed > 0 && (
             <span className="inline-flex items-center gap-1">
@@ -41,7 +42,7 @@ export const StreamPreview = ({ preview }: StreamPreviewProps) => {
 
         {/* Retry info */}
         {preview.retryInfo && (
-          <div className="mb-2 border-l-2 border-orange-400 bg-orange-50 px-2 py-1 text-xs text-orange-700">
+          <div className={`mb-2 border-l-2 px-2 py-1 text-xs ${TONE_BOX.warning}`}>
             {preview.retryInfo}
           </div>
         )}
@@ -65,7 +66,7 @@ export const StreamPreview = ({ preview }: StreamPreviewProps) => {
             {/* [2026-06-01] Why: the live preview cursor used a block Unicode glyph.
                 How: draw a small CSS rectangle instead. Purpose: stream previews avoid
                 decorative Unicode while keeping the same visible cursor behavior. */}
-            <span aria-label="流式输出光标" className="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-blue-500 align-middle" />
+            <span aria-label="流式输出光标" className="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-[var(--duties-info)] align-middle" />
           </div>
         )}
 

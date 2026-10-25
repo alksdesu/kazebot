@@ -10,6 +10,7 @@ import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useChatStore, type TaskActivity } from '../../store/chatStore';
 import { useViewStore } from '../../store/viewStore';
+import { TONE_BOX } from '../../styles/tones';
 import { startPolling } from '../../utils/polling';
 import { Modal } from '../common';
 import { errorMessage } from '../../api/request';
@@ -51,16 +52,16 @@ function formatRelative(updatedAt: string): string {
 }
 
 function statusClass(status: ActiveTask['status']): string {
-  if (status === 'running') return 'border-green-500/40 bg-green-500/10 text-green-700';
-  if (status === 'pending') return 'border-yellow-500/40 bg-yellow-500/10 text-yellow-700';
-  return 'border-gray-400/40 bg-gray-400/10 text-gray-600';
+  if (status === 'running') return TONE_BOX.success;
+  if (status === 'pending') return TONE_BOX.warning;
+  return TONE_BOX.neutral;
 }
 
 function activityClass(activity: TaskActivity): string {
-  if (activity.phase === 'thinking') return 'animate-pulse border-yellow-500/50 bg-yellow-500/10 text-yellow-700';
-  if (activity.phase === 'generating') return 'animate-pulse border-green-500/50 bg-green-500/10 text-green-700';
-  if (activity.phase === 'tool_call') return 'border-blue-500/50 bg-blue-500/10 text-blue-700';
-  if (activity.phase === 'awaiting_approval') return 'border-orange-500/50 bg-orange-500/10 text-orange-700';
+  if (activity.phase === 'thinking') return `animate-pulse ${TONE_BOX.meta}`;
+  if (activity.phase === 'generating') return `animate-pulse ${TONE_BOX.success}`;
+  if (activity.phase === 'tool_call') return TONE_BOX.info;
+  if (activity.phase === 'awaiting_approval') return TONE_BOX.warning;
   return '';
 }
 
@@ -184,7 +185,7 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
     >
       <div className="p-3">
         {error && (
-          <div className="mb-3 border border-orange-200 bg-orange-50 px-2.5 py-2 text-[0.65rem] text-orange-700" role="alert">
+          <div className={`mb-3 border px-2.5 py-2 text-[0.65rem] ${TONE_BOX.danger}`} role="alert">
             {error}
           </div>
         )}
@@ -237,7 +238,7 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
                   <div className="flex gap-1">
                     <button
                       aria-label={`查看任务 ${task.task_id} 的 session`}
-                      className="rounded-sm border border-blue-500/40 bg-blue-500/10 px-2 py-1 font-mono text-[0.6rem] text-blue-700 transition-colors hover:bg-blue-500/20"
+                      className={`rounded-sm border px-2 py-1 font-mono text-[0.6rem] transition-colors ${TONE_BOX.info} hover:bg-[var(--duties-info-hover)]`}
                       onClick={() => {
                         // [AutoC 2026-06-04] Fix: switch back to chat view, then
                         // enter virtual child session. This is a temporary overlay
@@ -254,8 +255,8 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
                       aria-label={`取消任务 ${task.task_id}`}
                       className={`rounded-sm border px-2 py-1 font-mono text-[0.6rem] transition-colors ${
                         cancelling
-                          ? 'cursor-not-allowed border-gray-300 bg-gray-100 text-gray-500'
-                          : 'border-red-500/40 bg-red-500/10 text-red-700 hover:bg-red-500/20'
+                          ? `cursor-not-allowed ${TONE_BOX.neutral}`
+                          : `${TONE_BOX.danger} hover:bg-[var(--duties-danger-hover)]`
                       }`}
                       disabled={cancelling}
                       onClick={() => { void handleCancel(task); }}

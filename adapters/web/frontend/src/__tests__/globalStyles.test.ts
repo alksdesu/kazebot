@@ -86,6 +86,20 @@ describe('全局 reset 的级联层', () => {
     expect(css).toContain('color:var(--duties-bg)');
     expect(css).toContain('background-color:var(--duties-text)');
   }, 30000);
+
+  it('语义色的框、底、字都真的编进了样式表', async () => {
+    // class 名要是用模板字符串拼出来的，Tailwind 扫源码时认不出，一条 CSS 都不会生成。
+    const output = await buildStylesheet();
+    const css = String(output.find((file) => file.fileName.endsWith('.css'))?.source ?? '');
+
+    for (const tone of ['success', 'danger', 'warning', 'info', 'meta']) {
+      expect(css).toContain(`color:var(--duties-${tone})`);
+      expect(css).toContain(`background-color:var(--duties-${tone}-bg)`);
+      expect(css).toContain(`border-color:var(--duties-${tone}-border)`);
+    }
+    expect(css).toContain('background-color:var(--duties-veil)');
+    expect(css).toContain('background-color:var(--duties-inset)');
+  }, 30000);
 });
 
 describe('折叠分区的动效', () => {

@@ -10,7 +10,8 @@ import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { useChatStore } from '../../store/chatStore';
 import { useSettingsStore } from '../../store/settingsStore';
 import { startPolling } from '../../utils/polling';
-import { countActiveTasks, formatUptime } from '../../utils/systemStatus';
+import { connectionDotClass, countActiveTasks, formatUptime } from '../../utils/systemStatus';
+import { TONE_BOX } from '../../styles/tones';
 import { ActiveTasksModal } from './ActiveTasksModal';
 import { errorMessage } from '../../api/request';
 
@@ -30,13 +31,6 @@ function connectionLabel(status: string): string {
   if (status === 'reconnecting') return 'WebSocket 重连中';
   if (status === 'closed') return 'WebSocket 已断开';
   return 'WebSocket 空闲';
-}
-
-function connectionDotClass(status: string): string {
-  if (status === 'open') return 'bg-green-500';
-  if (status === 'connecting' || status === 'reconnecting') return 'bg-yellow-500';
-  if (status === 'closed') return 'bg-red-500';
-  return 'bg-[var(--duties-tertiary)] opacity-50';
 }
 
 function engineStatus(adminState: AdminState | null): { label: string; detail: string } {
@@ -115,7 +109,7 @@ export const SystemDashboard = () => {
           <h2 className="mt-1 font-mono text-sm font-semibold tracking-[-0.03em]">系统仪表盘</h2>
         </div>
         <span className="inline-flex items-center gap-1.5 rounded-sm border border-[var(--duties-border)] px-2 py-1 font-mono text-[0.55rem] text-[var(--duties-secondary)]">
-          <span className={`h-1.5 w-1.5 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`} />
+          <span className={`h-1.5 w-1.5 rounded-full ${isConnected ? 'bg-[var(--duties-live)]' : 'bg-[var(--duties-danger)]'}`} />
           {isConnected ? 'HTTP 正常' : 'HTTP 断开'}
         </span>
       </div>
@@ -126,7 +120,7 @@ export const SystemDashboard = () => {
       </div>
 
       {data.error && (
-        <div className="mb-3 border border-orange-200 bg-orange-50 px-2.5 py-2 text-[0.65rem] text-orange-700">
+        <div className={`mb-3 border px-2.5 py-2 text-[0.65rem] ${TONE_BOX.warning}`}>
           {data.error}
         </div>
       )}

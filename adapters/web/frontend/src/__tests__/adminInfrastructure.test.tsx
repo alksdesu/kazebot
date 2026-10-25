@@ -37,6 +37,7 @@ import {
   updateToolRaw,
 } from '../api/supervisorClient';
 import { YamlEditor } from '../components/common';
+import { TONE_BOX } from '../styles/tones';
 import { inferToolRisk, riskClassName, riskLabel } from '../utils/toolRisk';
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -174,8 +175,8 @@ describe('tool risk helpers', () => {
     expect(riskLabel('medium')).toBe('中风险');
     expect(riskLabel('high')).toBe('高风险');
 
-    expect(riskClassName('low')).toBe('border-green-200 bg-green-50 text-green-700');
-    expect(riskClassName('medium')).toBe('border-orange-200 bg-orange-50 text-orange-700');
-    expect(riskClassName('high')).toBe('border-red-200 bg-red-50 text-red-700');
+    expect(riskClassName('low')).toBe(TONE_BOX.success);
+    expect(riskClassName('medium')).toBe(TONE_BOX.warning);
+    expect(riskClassName('high')).toBe(TONE_BOX.danger);
   });
 });
