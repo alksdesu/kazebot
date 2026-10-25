@@ -172,6 +172,8 @@ async def _submit_or_preempt_inbound(
                 state._adapter.features.burst_store.remove(stable_conversation_key, platform_updates.get("_route_hints", {}).get("source_message_refs", []))
             return True
 
+    # 匿名消息的发送者号是全群共用的占位号，报给 supervisor 就是空串：无法核验的人不认，也就不会被当成同一个人。
+    sender_id = identity._verified_sender_id(event)
     result = await state._adapter.client.submit_inbound(
         channel=channel,
         conversation_key=stable_conversation_key,
@@ -184,8 +186,8 @@ async def _submit_or_preempt_inbound(
         entry_node_pinned=bool(entry_node_id),
         platform_auth={
             "platform": "qq",
-            "user_id": str(getattr(event, "user_id", "")),
-            "is_admin": permissions._is_admin_user(getattr(event, "user_id", "")),
+            "user_id": sender_id,
+            "is_admin": bool(sender_id) and permissions._is_admin_user(sender_id),
             "group_role": permissions._requester(event).group_role if not is_dm else "",
             "group_scope": stable_conversation_key if not is_dm else "",
             "bot_scope": routing._active_bot_scope(),

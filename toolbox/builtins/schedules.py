@@ -12,6 +12,8 @@ from ..context import ToolContext
 from .._common import request_guard
 
 _SCHEDULE_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
+# 外部平台发来、却没有核验过的发送者（比如群匿名消息）：创建者为空会和控制台建的、不带创建者的任务对上。
+_UNVERIFIED_SENDER = "the sender of this message cannot be verified (e.g. an anonymous group message); schedules need a verified sender"
 # 非管理员的额度：够用来记几件事，又不至于让一个人把 schedules.yaml 撑爆。
 _MAX_SCHEDULES_PER_USER = 10
 _MIN_INTERVAL_MINUTES = 5
@@ -149,6 +151,8 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     creator = _creator_id(ctx)
     existing = {str(s.get("id") or "").strip(): s for s in load_schedules(ctx.workspace_root)}
     if not is_admin and origin:
+        if not creator:
+            return _err(_UNVERIFIED_SENDER)
         # 外部平台普通用户：放开定时提醒，但投递目标与入口节点必须由服务端钉死。
         # 到点注入的 inbound 直接走 entry_node，指定成 cmd_reviewer 之类就绕开了
         # 入口节点的工具白名单 —— 这一条不设限等于给群友一条命令执行通道。
@@ -260,6 +264,8 @@ async def delete_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
 
     is_admin = _platform_admin_can_manage_schedules(ctx)
     origin = _originating_conversation_key(ctx)
+    if not is_admin and origin and not _creator_id(ctx):
+        return _err(_UNVERIFIED_SENDER)
     if not is_admin and not origin:
         _op, err = await request_guard(ctx, "write_file", {"path": "data/schedules.yaml", "delete_schedule": sid})
         if err is not None:

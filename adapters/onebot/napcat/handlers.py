@@ -196,7 +196,8 @@ async def _maybe_echo_group_message(bot: Bot, event: GroupMessageEvent, text: st
         return
 
     now = time.time()
-    state._adapter.echo_recent[group_id].append(EchoEntry(key, str(event.user_id), now))
+    # 匿名成员按各自的匿名身份算人头，不共用占位号。
+    state._adapter.echo_recent[group_id].append(EchoEntry(key, identity._event_sender_key(event), now))
     last_key, last_at = state._adapter.echo_last.get(group_id, ("", 0.0))
     if now - last_at < live.echo_cooldown_sec:
         return

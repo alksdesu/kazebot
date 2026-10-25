@@ -6,6 +6,7 @@ fail-closed：不建档、不给管理员能力、不点赞、不 @。
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import sys
 from pathlib import Path
@@ -22,6 +23,7 @@ if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
 from _onebot_harness import load_runtime, set_live_config  # noqa: E402
+from clonoth_sdk.state import SessionState  # noqa: E402
 
 HOME_GROUP = 700001
 MEMBER_QQ = 30003
@@ -116,3 +118,53 @@ def test_real_sender_regression(runtime: Any) -> None:
 
 def test_sender_key_distinguishes_anonymous_members(runtime: Any) -> None:
     assert runtime.identity._event_sender_key(anon_event(11)) != runtime.identity._event_sender_key(anon_event(22, flag="f2"))
+
+
+def _submitted_auth(runtime: Any, monkeypatch: pytest.MonkeyPatch, event: Any) -> dict[str, Any]:
+    """走一遍入站提交，拿到报给 supervisor 的 platform_auth。"""
+    captured: dict[str, Any] = {}
+
+    async def submit(**kwargs: Any) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(session_id="sess-1", accepted=True, inbound_seq=1)
+
+    async def noop(**kwargs: Any) -> None:
+        return None
+
+    runtime.state._adapter.session_state = SessionState()
+    monkeypatch.setattr(runtime.state._adapter, "client", SimpleNamespace(submit_inbound=submit))
+    monkeypatch.setattr(runtime.routing, "_remember_route_state", noop)
+    set_live_config(runtime, enable_preempt=False, enable_reactions=False)
+    ok = asyncio.run(runtime.queueing._submit_or_preempt_inbound(
+        bot=SimpleNamespace(self_id="90000"), event=event, channel="qq_group",
+        real_conversation_key=f"qq_group:{HOME_GROUP}", stable_conversation_key="conv_home",
+        inbound_text="正文", user_text="在吗", attachments=[], is_dm=False,
+        platform_updates={"type": "group", "group_id": HOME_GROUP},
+    ))
+    assert ok is True
+    return captured["platform_auth"]
+
+
+def test_anonymous_inbound_reports_no_sender_and_no_admin(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 占位号全群共用：报上去 supervisor 就会把所有匿名成员当成同一个人。
+    set_live_config(runtime, admin_users=frozenset({PLACEHOLDER_QQ}))
+
+    auth = _submitted_auth(runtime, monkeypatch, anon_event(11))
+
+    assert auth["user_id"] == ""
+    assert auth["is_admin"] is False
+    assert auth["group_role"] == ""
+
+
+def test_real_inbound_still_reports_the_sender(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    set_live_config(runtime, admin_users=frozenset({MEMBER_QQ}))
+
+    auth = _submitted_auth(runtime, monkeypatch, real_event())
+
+    assert auth["user_id"] == str(MEMBER_QQ)
+    assert auth["is_admin"] is True
+
+
+def test_anonymous_requester_carries_no_number(runtime: Any) -> None:
+    assert runtime.permissions._requester(anon_event(11)).user_id == ""
+    assert runtime.permissions._requester(real_event()).user_id == str(MEMBER_QQ)

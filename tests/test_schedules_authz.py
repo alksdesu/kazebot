@@ -498,3 +498,39 @@ def test_fired_reminders_carry_the_creator_platform(tmp_path: Path, schedule: di
 
     auth = state.payloads[-1]["platform_auth"]
     assert auth == {"platform": expected, "user_id": schedule["created_by"], "is_admin": False}
+
+
+_ANONYMOUS = {"platform": "qq", "user_id": "", "is_admin": False}
+# 群匿名消息报上来的发送者是空的；控制台建的任务到点进群时干脆没有 platform_auth。
+_UNVERIFIED_SENDERS = pytest.mark.parametrize("platform_auth", [_ANONYMOUS, None], ids=["anonymous", "no-auth"])
+
+
+def _ids(workspace: Path) -> list[str]:
+    data = yaml.safe_load((workspace / "data" / "schedules.yaml").read_text(encoding="utf-8")) or {}
+    return [str(item.get("id")) for item in data.get("schedules") or []]
+
+
+@pytest.mark.asyncio
+@_UNVERIFIED_SENDERS
+async def test_an_unverified_sender_cannot_create_a_schedule(tmp_path: Path, platform_auth: dict[str, Any] | None) -> None:
+    # 空的创建者谁都对不上，建出来的任务也就像控制台建的一样，到点不带 platform_auth。
+    workspace = _workspace(tmp_path)
+
+    result = await create_schedule({"id": "probe", "cron": "0 9 * * *", "text": "hi"}, _Ctx(workspace, platform_auth=platform_auth))
+
+    assert result["ok"] is False
+    assert "cannot be verified" in result["error"]
+    assert _ids(workspace) == ["nightly_backup"]
+
+
+@pytest.mark.asyncio
+@_UNVERIFIED_SENDERS
+async def test_an_unverified_sender_cannot_delete_a_schedule_that_has_no_creator(tmp_path: Path, platform_auth: dict[str, Any] | None) -> None:
+    # 控制台建的任务不带 created_by：空创建者和它一比就相等，不拦就能删掉管理员的任务。
+    workspace = _workspace(tmp_path)
+
+    result = await delete_schedule({"id": "nightly_backup"}, _Ctx(workspace, platform_auth=platform_auth))
+
+    assert result["ok"] is False
+    assert "cannot be verified" in result["error"]
+    assert _ids(workspace) == ["nightly_backup"]

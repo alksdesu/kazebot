@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 import sys
 import threading
@@ -21,7 +20,7 @@ from clonoth_sdk.state import SessionState
 from clonoth_sdk.types import Event
 from clonoth_sdk.feature_paths import validate_feature_path
 from engine.conversation_routing import concise_text, routing_meta, topic_history
-from supervisor.feature_auth import resolve_actor
+from supervisor.feature_auth import UNVERIFIED_SENDER_DETAIL, resolve_actor
 
 
 @pytest.mark.parametrize("path", ["/v1/materials/../../admin/config", "/v1/materials/%2e%2e/admin", "/v1/materials\\..\\admin", "/v1/materialsevil/status", "/v1/materials?path=/admin", "/v1/operations/status"])
@@ -99,6 +98,46 @@ def test_feature_actor_uses_active_task_scope_and_bound_group_role(tmp_path, mon
     assert resolve_actor(request({"X-Clonoth-Task-Id": "task"}), state).role == "admin"
     context["channel"] = "qq_private"
     assert resolve_actor(request({"X-Clonoth-Task-Id": "task"}), state).role == "member"
+
+
+def _task_state(tmp_path, context):
+    task = SimpleNamespace(input={"task_context": context}, cancel_requested=False)
+    return SimpleNamespace(workspace_root=tmp_path, tasks={"task": task}, _lock=threading.RLock(), _task_terminal=lambda _: False)
+
+
+def test_a_platform_task_without_a_verified_sender_is_refused(tmp_path, monkeypatch):
+    # 群匿名消息报上来的发送者是空的：认它就等于让所有匿名成员共用一个归属。
+    monkeypatch.setattr("supervisor.feature_auth.verify_admin_token", lambda _: None)
+    state = _task_state(tmp_path, {"conversation_key": "qq_group:one", "channel": "qq_group",
+                                   "platform_auth": {"platform": "qq", "user_id": "", "is_admin": False}})
+
+    with pytest.raises(HTTPException) as refused:
+        resolve_actor(request({"X-Clonoth-Task-Id": "task"}), state)
+
+    assert refused.value.status_code == 403
+    assert refused.value.detail == UNVERIFIED_SENDER_DETAIL
+
+
+def test_tasks_from_internal_entries_keep_their_scope_owner(tmp_path, monkeypatch):
+    monkeypatch.setattr("supervisor.feature_auth.verify_admin_token", lambda _: None)
+    console = _task_state(tmp_path, {"conversation_key": "web:console", "channel": "web",
+                                     "platform_auth": {"platform": "web", "is_admin": True}})
+    bare = _task_state(tmp_path, {"conversation_key": "qq_group:one", "channel": "qq_group"})
+
+    assert resolve_actor(request({"X-Clonoth-Task-Id": "task"}), console).owner == "web:web:console"
+    assert resolve_actor(request({"X-Clonoth-Task-Id": "task"}), bare).owner == "web:qq_group:one"
+
+
+def test_a_platform_task_with_a_verified_sender_is_still_that_person(tmp_path, monkeypatch):
+    monkeypatch.setattr("supervisor.feature_auth.verify_admin_token", lambda _: None)
+    first = _task_state(tmp_path, {"conversation_key": "qq_group:one", "channel": "qq_group",
+                                   "platform_auth": {"platform": "qq", "user_id": "42"}})
+    second = _task_state(tmp_path, {"conversation_key": "qq_group:one", "channel": "qq_group",
+                                    "platform_auth": {"platform": "qq", "user_id": "43"}})
+
+    owner = resolve_actor(request({"X-Clonoth-Task-Id": "task"}), first).owner
+    assert owner.startswith("user:")
+    assert owner != resolve_actor(request({"X-Clonoth-Task-Id": "task"}), second).owner
 
 
 def outbound(seq=1, **payload):

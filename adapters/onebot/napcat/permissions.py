@@ -59,12 +59,12 @@ def _requester(event: Any) -> capability.Requester:
     群消息按有没有 group_id 认，不按事件类型 —— 私聊事件万一带了 sender.role，
     也进不了判定：没有 group_id 的请求者一律算普通用户（Requester.rank）。
     """
-    user_id = getattr(event, "user_id", None)
-    # 匿名消息的身份不可核验，一律按普通群员判定。
+    # 匿名消息的身份不可核验：没有号、按普通群员判定。
     anonymous = bool(identity._anonymous_identity(event))
+    user_id = identity._verified_sender_id(event)
     return capability.Requester(
-        user_id=normalize_id(user_id),
-        listed_admin=(not anonymous) and _is_admin_user(user_id),
+        user_id=user_id,
+        listed_admin=bool(user_id) and _is_admin_user(user_id),
         group_id=normalize_id(getattr(event, "group_id", None)),
         group_role="" if anonymous else _group_role(getattr(getattr(event, "sender", None), "role", "")),
     )
@@ -86,7 +86,7 @@ def _capability_denial(capability_key: str, event: Any, fallback: str) -> str | 
     """
     if _grant_of(capability_key) != capability.OFF:
         return fallback
-    if not _is_admin_user(getattr(event, "user_id", None)):
+    if not _is_admin_user(identity._verified_sender_id(event)):
         common.logger.info(
             "QQ capability %s is off; staying silent for user=%s",
             capability_key, getattr(event, "user_id", None),

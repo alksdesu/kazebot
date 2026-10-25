@@ -9,9 +9,12 @@ from fastapi import HTTPException, Request
 
 from platforms.descriptor import CHANNEL_GROUP
 from platforms.registry import conversation_channel, conversation_key_prefix
+from platforms.sources import is_external_platform
 from workspace import workspace_instance
 
 from .admin_api import verify_admin_token
+
+UNVERIFIED_SENDER_DETAIL = "发起这次请求的人无法核验（比如群匿名消息），不能使用需要认人的功能"
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,9 @@ def resolve_actor(request: Request, state: Any, scope: str = "") -> FeatureActor
                     return bound
             context = dict(task.input.get("task_context") or {})
             auth = dict(context.get("platform_auth") or {})
+            if not _text(auth.get("user_id")) and is_external_platform(auth.get("platform")):
+                # 和适配器那条路一样不认无法核验的人：不拦的话这些人全落到同一个归属上，能互相动对方的东西。
+                raise HTTPException(status_code=403, detail=UNVERIFIED_SENDER_DETAIL)
             task_scope = _text(
                 context.get("route_conversation_key") or context.get("parent_conversation_key")
                 or context.get("conversation_key"),
