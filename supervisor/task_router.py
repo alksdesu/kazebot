@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import hashlib
 import json
 import logging
@@ -10,9 +11,10 @@ import queue
 import threading
 import time
 import uuid
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
@@ -20,7 +22,9 @@ from file_lock import exclusive_lock
 
 from ._helpers import _now
 from .branch_finalize_store import BranchClaim
+from .compact_breaker import MAX_TASK_CONSECUTIVE_FAILURES
 from .reply_intent import result_from_task as reply_intent_result_from_task
+from engine.compact import COMPACT_SUMMARY_PREFIX
 from engine.output_guide import OUTPUT_GUIDE_KEY
 
 from .types import RouteStatus, Task, TaskKind, TaskStatus
@@ -28,9 +32,67 @@ from .types import RouteStatus, Task, TaskKind, TaskStatus
 
 log = logging.getLogger(__name__)
 
+# 让任务就此结束的动作。dispatch 不在其中：派出去的子任务回来后同一个任务还会接着跑。
+_TASK_END_ACTIONS = frozenset({"finish", "ask", "fail", "cancelled", "preempted"})
+
 
 class BranchFinalizeDeferred(RuntimeError):
     """Another live owner is finalizing this branch identity."""
+
+
+@dataclass(frozen=True)
+class CompactPlanRequest:
+    """一次同步压缩 dispatch 要算计划所需的全部输入，锁外算计划时与锁内路由用同一份。"""
+
+    target_session_id: str
+    context_ref: str
+    keep_recent: int
+    keep_recent_tokens: int
+    threshold_tokens: int
+
+    def sizing_inputs(self) -> dict[str, int]:
+        return {
+            "_compact_keep_recent": self.keep_recent,
+            "_compact_keep_recent_tokens": self.keep_recent_tokens,
+            "_compact_threshold_tokens": self.threshold_tokens,
+        }
+
+
+@dataclass(frozen=True)
+class PreparedCompactPlan:
+    request: CompactPlanRequest
+    plan: dict[str, Any]
+    instruction: str
+
+
+@dataclass(frozen=True)
+class CompactApplyJob:
+    """把压缩摘要落盘所需的输入，锁内取、锁外执行。"""
+
+    target_session_id: str
+    summary: str
+    plan: dict[str, Any]
+    storage: str
+    context_ref: str
+    sizing: dict[str, int]
+
+
+@dataclass(frozen=True)
+class CompactApplyOutcome:
+    counts: dict[str, Any] | None
+    success: bool
+
+
+@dataclass(frozen=True)
+class PreparedCompactApply:
+    job: CompactApplyJob
+    outcome: CompactApplyOutcome
+
+
+@dataclass
+class _RouteSlot:
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    users: int = 0
 
 
 @dataclass
@@ -515,10 +577,13 @@ class TaskRouterMixin:
         dispatch_sid = str(task.input.get("parent_session_id") or "").strip()
         branch_sid = str(task.input.get("branch_session_id") or "").strip()
         child_sid = str(task.input.get("child_session_id") or "").strip()
+        # 只拆真正结束了的任务：同步派发后挂起的任务恢复后还要接着用这些会话
+        task_ended = self._task_terminal(task)
         with self._lock:
             dispatch_info = self.sessions.get(dispatch_sid)
             cleanup_dispatch = bool(
-                context_mode in {"fresh", "fork"}
+                task_ended
+                and context_mode in {"fresh", "fork"}
                 and dispatch_info is not None
                 and dispatch_info.conversation_key.startswith("agent:")
             )
@@ -526,7 +591,7 @@ class TaskRouterMixin:
             child_entry = self._session_store.get_entry(child_sid)
             child_mode = str(child_entry.get("context_mode") or "").strip() if isinstance(child_entry, dict) else ""
             cleanup_child = bool(
-                child_sid and self._task_terminal(task)
+                child_sid and task_ended
                 and (child_mode or str(task.input.get("context_mode") or "").strip()) != "accumulate"
             )
 
@@ -833,15 +898,12 @@ class TaskRouterMixin:
     def _commit_branch_finalize_indexes_locked(self, plan: BranchFinalizePlan):
         now = _now()
         cleanup_ids = set(plan.cleanup_session_ids)
-        for candidate in self.tasks.values():
-            if candidate.session_id not in cleanup_ids or self._task_terminal(candidate):
-                continue
-            candidate.cancel_requested = True
-            candidate.status = TaskStatus.cancelled
-            candidate.updated_at = now
-            candidate.lease_expires_at = None
-            candidate.waiting_for_task_id = None
-            self._event_task_snapshot("task_cancelled", candidate)
+        for candidate in list(self.tasks.values()):
+            if candidate.session_id in cleanup_ids:
+                # 会话文件已经删掉，不等 worker 回报；分支收束就是本次 finalize
+                self._cancel_task_locked(
+                    candidate, now, force=True, finalize_branch=False, reason="所在分支已收束",
+                )
         for session_id in cleanup_ids:
             self.sessions.pop(session_id, None)
             self.session_generations.pop(session_id, None)
@@ -979,9 +1041,42 @@ class TaskRouterMixin:
         return route_session_id
 
     def _route_completed_task(self, task: Task) -> None:
+        """路由一次完成。压缩计划和压缩落盘这类大块磁盘 I/O 先在锁外做完，锁内只提交结果。"""
+        with self._task_route_slot(task.task_id):
+            self._prepare_route_io(task)
+            try:
+                self._route_completed_task_with_branch(task)
+            finally:
+                with self._lock:
+                    self._prepared_route_io().pop(task.task_id, None)
+
+    @contextmanager
+    def _task_route_slot(self, task_id: str) -> Iterator[None]:
+        """同一任务的路由一次只跑一个：重发的 complete 要等前一次路由结束，不能拿它锁外算到一半的结果。
+
+        不能在持有 self._lock 时进入，否则与正在路由的线程互等。
+        """
+        with self._lock:
+            slots = getattr(self, "_task_route_slots", None)
+            if slots is None:
+                slots = self._task_route_slots = {}
+            slot = slots.get(task_id)
+            if slot is None:
+                slot = slots[task_id] = _RouteSlot()
+            slot.users += 1
+        try:
+            with slot.lock:
+                yield
+        finally:
+            with self._lock:
+                slot.users -= 1
+                if not slot.users:
+                    slots.pop(task_id, None)
+
+    def _route_completed_task_with_branch(self, task: Task) -> None:
         action = str((task.result or {}).get("action") or "").strip()
         runtime = None
-        if action in {"finish", "ask", "fail", "cancelled"}:
+        if action in _TASK_END_ACTIONS:
             route_session = self._finalize_branch_task(task, merge=True, hold_claim=True)
             if route_session is None:
                 return
@@ -1053,7 +1148,7 @@ class TaskRouterMixin:
         """Route one completion once, persisting success or retryable failure."""
         action = str((task.result or {}).get("action") or "").strip()
         if (
-            action in {"finish", "ask", "fail", "cancelled"}
+            action in _TASK_END_ACTIONS
             and task.input.get("branch_session_id")
             and not task.input.get("_branch_finalized")
         ):
@@ -1177,15 +1272,6 @@ class TaskRouterMixin:
 
     def _route_completed_task_inner_locked(self, task: Task) -> None:
         """执行 task 完成后的实际路由逻辑。"""
-        # [AutoC 2026-05-30] Why: _route_completed_task_locked 需要统一 finally
-        # 清理，但直接包裹原大方法会造成整体缩进变更。How: 保持原路由主体
-        # 缩进不变并移动到 inner。Purpose: 降低重构噪音，便于审查行为差异。
-        # ---- 批量 task：优先走统一批量收集 ----
-        if task.batch_id:
-            self._try_complete_batch_locked(task)
-            # 后置记忆提取不对 batch 子 task 触发
-            return
-
         # ---- 后台压缩结果：无 caller，压缩期间用户那一轮照常在跑 ----
         if task.input.get("_compact_async"):
             self._apply_async_compact_result_locked(task)
@@ -1209,28 +1295,33 @@ class TaskRouterMixin:
         action = task.result or {}
         act = str(action.get("action") or "").strip()
         if act == "preempted":
+            self._finalize_branch_task_locked(task, merge=True)
             self._route_preempted_locked(task, action)
-            return  # preempted 不触发记忆提取，也不 merge branch
-        elif act == "dispatch":
+            return
+        if act == "dispatch":
             self._route_dispatch_locked(task, action)
-        elif act in ("finish", "ask"):
-            # [Fork/Merge 2026-05-12] finish/ask 是入口分支的用户可见终态。
-            # 原因：outbound 必须在主 session 产生，且应先把 branch JSONL 合并回主历史。
-            # 做法：路由 finish 前执行幂等 finalize。目的：SDK 按主 conversation_key 收到回复。
+            if task.status != TaskStatus.failed:
+                return
+            # 同一任务的压缩连续失败到上限，这次 dispatch 已改判为失败，按失败继续路由
+            action = task.result
+            act = "fail"
+        if task.batch_id:
+            if act in _TASK_END_ACTIONS:
+                self._collect_batch_locked(task)
+            return
+        if act in ("finish", "ask"):
+            # 先把分支合并回主历史，再在主 session 产生用户可见的回复
             self._finalize_branch_task_locked(task, merge=True)
             self._route_finish_locked(task, action)
         elif act == "fail":
-            # [Fork/Merge 2026-05-12] fail 也会结束入口分支。
-            # 原因：错误回复应进入主 session，同时保留分支中已产生的上下文。
-            # 做法：先 merge/cleanup，再走原 fail 输出。目的：失败路径与成功路径一致。
             self._finalize_branch_task_locked(task, merge=True)
             self._route_fail_locked(task, action)
         elif act == "cancelled":
-            # [Fork/Merge 2026-05-12] engine 主动返回 cancelled 时不输出，但仍收束分支。
-            # 原因：cancel 是终态，不应遗留 branch session。做法：只 finalize，不调用输出路由。
-            # 目的：符合 finish/cancel 时 merge 回主 session 的架构约束。
             self._finalize_branch_task_locked(task, merge=True)
-        # cancelled → 不做用户输出
+            if (task.caller_task_id or "").strip():
+                self._settle_child_locked(
+                    task, self._child_cancelled_resume_data(task), action_type="cancelled",
+                )
 
 
     # ------------------------------------------------------------------ #
@@ -1273,43 +1364,34 @@ class TaskRouterMixin:
 
         # 标记父 task 正在等待压缩 dispatch
         compact_target_session_id = ""
-        if dispatch_input.get("_compact_dispatch"):
+        compact_request = self._compact_dispatch_request(task, action)
+        if compact_request is not None:
+            compact_target_session_id = compact_request.target_session_id
             task.input["_compact_dispatch_pending"] = True
-            task.input["_compact_keep_recent"] = int(
-                dispatch_input.get("_compact_keep_recent", 6)
-            )
-            # 这两个也必须搬到 caller.input：_apply_compact_result_locked 只读 caller，
+            # 三个尺寸参数都要搬到 caller.input：_apply_compact_result_locked 只读 caller，
             # 少搬一个就等于 supervisor 用默认值收缩，与 engine 的触发阈值脱钩。
-            task.input["_compact_keep_recent_tokens"] = int(
-                dispatch_input.get("_compact_keep_recent_tokens", 0) or 0
-            )
-            task.input["_compact_threshold_tokens"] = int(
-                dispatch_input.get("_compact_threshold_tokens", 0) or 0
-            )
-            # [AutoC 2026-05-13] Why: compactor results are applied after the
-            # caller task is suspended, and caller.session_id may be an entry
-            # branch. How: store the explicit parent-first target from engine,
-            # falling back to caller parent/session for older actions. Purpose:
-            # _apply_compact_result_locked always rewrites the durable session.
-            compact_target_session_id = str(
-                dispatch_input.get("target_session_id")
-                or task.input.get("parent_session_id")
-                or task.session_id
-                or ""
-            ).strip()
+            task.input.update(compact_request.sizing_inputs())
             if compact_target_session_id:
                 task.input["_compact_target_session_id"] = compact_target_session_id
-            context_ref = str(action.get("context_ref") or task.input.get("context_ref") or "")
-            plan, instruction = self._prepare_compact_input_locked(
-                compact_target_session_id, task.input, context_ref=context_ref,
-            )
-            if not plan or self.compact_breaker.is_open(compact_target_session_id):
-                self._resume_compact_parent_locked(task, context_ref, success=False)
+            if self.compact_breaker.is_open(compact_target_session_id):
+                self._fail_compact_round_locked(
+                    task, compact_request.context_ref, reason="压缩熔断冷却中", in_route=True,
+                )
+                return
+            plan, instruction = self._take_compact_plan_locked(task, compact_request)
+            if not plan:
+                self.compact_breaker.record_failure(compact_target_session_id)
+                self._fail_compact_round_locked(
+                    task, compact_request.context_ref, reason="没有可压缩的完整历史段", in_route=True,
+                )
                 return
             task.input["_compact_plan"] = plan
             dispatch_input["instruction"] = instruction
 
         created_child_ids: list[str] = []
+        batch_id: str | None = None
+        delivery_key = str(task.delivery_id or "").strip()
+        existing_children = self._existing_dispatch_children_locked(task, delivery_key)
         # [Fork/Merge 2026-05-17] Why: descendants of an entry branch should keep
         # branch-local storage but still route user-visible events through the
         # parent session. How: compute the parent route once and propagate it in
@@ -1320,11 +1402,17 @@ class TaskRouterMixin:
 
         # ---- 批量委派（node 或 tool 均可） ----
         if isinstance(dispatch_batch, list) and dispatch_batch:
-            batch_id = str(uuid.uuid4())
+            batch_id = next(
+                (child.batch_id for child in existing_children.values() if child.batch_id), None,
+            ) or str(uuid.uuid4())
             for idx, item in enumerate(dispatch_batch):
                 item_kind = str(item.get("kind") or "node").strip()
                 item_target = str(item.get("target") or "").strip()
                 if not item_target:
+                    continue
+                reused = existing_children.get(idx)
+                if reused is not None and reused.batch_id == batch_id:
+                    created_child_ids.append(reused.task_id)
                     continue
 
                 if item_kind == "tool":
@@ -1342,6 +1430,8 @@ class TaskRouterMixin:
                         # parent route in input for engine.runner ToolContext.
                         # Purpose: guarded tools and progress route to parent.
                         _tool_input["parent_session_id"] = route_parent_for_child
+                    if delivery_key:
+                        _tool_input["_dispatch_delivery_id"] = delivery_key
                     child = self._create_task_locked(
                         session_id=task.session_id,
                         session_generation=task.session_generation,
@@ -1380,10 +1470,8 @@ class TaskRouterMixin:
                     _batch_input["use_context"] = False
                     if _batch_ctx_mode == "fork":
                         _batch_input["fork_from_session_id"] = task.session_id
-                    # 审计报告 Step 1（2026-04-16）：删除此处对 _find_last_context_ref_locked
-                    # 的 accumulate fallback 注入。engine/runner.py 在 child_session_id
-                    # 非空时会无条件清空 context_ref（参见 runner.py:514），此注入永远
-                    # 不会被消费。保留只是兼容期死代码，现移除。
+                    if delivery_key:
+                        _batch_input["_dispatch_delivery_id"] = delivery_key
 
                     child = self._create_task_locked(
                         session_id=task.session_id,
@@ -1398,9 +1486,14 @@ class TaskRouterMixin:
                         batch_index=idx,
                     )
                 created_child_ids.append(child.task_id)
+            if not created_child_ids:
+                batch_id = None
 
         # ---- 单节点委派 ----
-        if not created_child_ids and target:
+        reused_single = existing_children.get(-1)
+        if not created_child_ids and target and reused_single is not None:
+            created_child_ids.append(reused_single.task_id)
+        elif not created_child_ids and target:
             # [AutoC 2026-07-09] Why: compact dispatch 等系统任务已显式传 context_mode；
             # 其余单节点委派未传时按 target persistent 推导（persistent→accumulate，
             # 否则 fresh），避免普通节点默认持久化。
@@ -1436,10 +1529,8 @@ class TaskRouterMixin:
             if _ctx_mode == "fork":
                 # fork 模式需要告诉 engine 从哪个 session 复制历史
                 _single_input["fork_from_session_id"] = _dispatch_session_id
-
-            # 审计报告 Step 1（2026-04-16）：删除此处单节点 dispatch 的 accumulate/fresh
-            # 兼容期 fallback。engine/runner.py:514 在 child_session_id 非空时会无条件
-            # 清空 context_ref，accumulate/fresh 两个分支写的值永远不会被消费。
+            if delivery_key:
+                _single_input["_dispatch_delivery_id"] = delivery_key
 
             child = self._create_task_locked(
                 session_id=_dispatch_session_id,
@@ -1456,9 +1547,24 @@ class TaskRouterMixin:
         # ---- 挂起当前 task ----
         if created_child_ids:
             task.status = TaskStatus.suspended
-            task.waiting_for_task_id = created_child_ids[0] if len(created_child_ids) == 1 else None
+            task.waiting_for_batch_id = batch_id
+            task.waiting_for_task_id = None if batch_id else created_child_ids[0]
             task.updated_at = _now()
             self._event_task_snapshot("task_suspended", task)
+
+    def _existing_dispatch_children_locked(self, task: Task, delivery_key: str) -> dict[int, Task]:
+        """同一次完成已经派出的子任务，按批次序号索引（单节点委派记 -1）。
+
+        路由在派出部分子任务后抛异常时，重推这次完成要接着用它们，不能再派一遍。
+        """
+        if not delivery_key:
+            return {}
+        return {
+            (child.batch_index if child.batch_id else -1): child
+            for child in self.tasks.values()
+            if child.caller_task_id == task.task_id
+            and child.input.get("_dispatch_delivery_id") == delivery_key
+        }
 
     # ------------------------------------------------------------------ #
     #  preempted
@@ -1488,27 +1594,13 @@ class TaskRouterMixin:
             transient=True,
         )
 
-        # 子节点被 preempt：恢复 suspended 的 caller，注入 child_preempted
-        caller_id = (task.caller_task_id or "").strip()
-        if caller_id:
-            caller = self.tasks.get(caller_id)
-            if caller and caller.status == TaskStatus.suspended:
-                caller.status = TaskStatus.pending
-                caller.waiting_for_task_id = None
-                caller.worker_id = None
-                caller.lease_expires_at = None
-                caller.updated_at = _now()
-                caller.input["resume_data"] = {
-                    "type": "child_preempted",
-                    "child_node_id": str(task.node_id or ""),
-                    "context_ref": context_ref,
-                }
-                caller.input["context_ref"] = str(
-                    caller.result.get("context_ref")
-                    or caller.input.get("context_ref")
-                    or ""
-                )
-                self._event_task_snapshot("task_resumed", caller)
+        # 子节点被 preempt 也是它这一程的终点：单独派出的直接唤醒 caller，批次里的等兄弟都结束
+        if (task.caller_task_id or "").strip():
+            self._settle_child_locked(task, {
+                "type": "child_preempted",
+                "child_node_id": str(task.node_id or ""),
+                "context_ref": context_ref,
+            }, action_type="preempted")
 
         # 不输出给用户，不注入 inbound
 
@@ -1541,41 +1633,99 @@ class TaskRouterMixin:
         }, {"text": f"[错误] {error}"}, action_type="fail")
 
     # ------------------------------------------------------------------ #
-    #  统一批量收集
+    #  子任务结算：唤醒在等它的调用方
     # ------------------------------------------------------------------ #
 
-    def _try_complete_batch_locked(self, task: Task) -> None:
-        """统一批量收集。不区分 tool/node，等同 batch_id 全部终态后打包恢复 caller。"""
-        batch_id = task.batch_id
-        if not batch_id:
+    @staticmethod
+    def _task_outcome_action(task: Task) -> str:
+        """任务这一程的结局。被取消的任务 result 里可能还是 worker 回报的原动作，以状态为准。"""
+        if task.status == TaskStatus.cancelled:
+            return "cancelled"
+        return str((task.result or {}).get("action") or "").strip()
+
+    @staticmethod
+    def _child_cancelled_resume_data(task: Task) -> dict[str, Any]:
+        return {
+            "type": "child_cancelled",
+            "child_task_id": task.task_id,
+            "child_node_id": str(task.node_id or task.tool_name or ""),
+            "error": "child task cancelled",
+        }
+
+    def _caller_can_resume_locked(self, caller: Task) -> bool:
+        if caller.status != TaskStatus.suspended or caller.cancel_requested:
+            return False
+        route_session_id = self._route_session_id_for_task_locked(caller)
+        if route_session_id in self._cancelled_sessions:
+            return False
+        current_generation = self._current_session_generation_locked(route_session_id)
+        return not current_generation or caller.session_generation == current_generation
+
+    def _caller_waits_for_child_locked(self, caller: Task | None, child: Task) -> bool:
+        return (
+            caller is not None
+            and self._caller_can_resume_locked(caller)
+            and caller.waiting_for_task_id == child.task_id
+        )
+
+    def _caller_waits_for_batch_locked(self, caller: Task | None, child: Task) -> bool:
+        if caller is None or not self._caller_can_resume_locked(caller):
+            return False
+        if caller.waiting_for_batch_id:
+            return caller.waiting_for_batch_id == child.batch_id
+        # 旧快照没有批次等待字段：多项批次挂起时两个等待字段都为空，单项批次记在 waiting_for_task_id 上
+        return not caller.waiting_for_task_id or caller.waiting_for_task_id == child.task_id
+
+    def _log_dropped_child_result_locked(self, child: Task, caller: Task | None) -> None:
+        log.warning(
+            "child result dropped: caller %s is not waiting for task %s "
+            "(caller status=%s, waiting_for=%s, waiting_for_batch=%s, child outcome=%s)",
+            (child.caller_task_id or "")[:12],
+            child.task_id[:12],
+            caller.status.value if caller is not None else "missing",
+            ((caller.waiting_for_task_id or "") if caller is not None else "")[:12],
+            ((caller.waiting_for_batch_id or "") if caller is not None else "")[:12],
+            self._task_outcome_action(child),
+        )
+
+    def _settle_child_locked(
+        self, child: Task, resume_data: dict[str, Any], *, action_type: str = "",
+    ) -> None:
+        """子任务到了终态：单独派出的直接唤醒 caller，批次里的等兄弟都结束再一起唤醒。
+
+        caller 不在等它（已被回收、取消，或正在等别的子任务）时只记日志，结果绝不改投给用户。
+        """
+        if child.batch_id:
+            self._collect_batch_locked(child)
             return
-
-        # 找所有同 batch 的兄弟
-        siblings: list[Task] = []
-        for t in self.tasks.values():
-            if t.batch_id == batch_id and t.session_id == task.session_id:
-                siblings.append(t)
-        if not siblings:
+        caller = self.tasks.get((child.caller_task_id or "").strip())
+        if not self._caller_waits_for_child_locked(caller, child):
+            self._log_dropped_child_result_locked(child, caller)
             return
+        self._resume_suspended_task_locked(caller, resume_data, action_type=action_type)
 
-        # 有任何一个还没结束，等着
-        if any(not self._task_terminal(t) for t in siblings):
+    def _collect_batch_locked(self, child: Task) -> None:
+        """批次里有一个子任务到了终态：兄弟全部结束后打包结果恢复 caller，不区分 tool/node。"""
+        caller = self.tasks.get((child.caller_task_id or "").strip())
+        if not self._caller_waits_for_batch_locked(caller, child):
+            self._log_dropped_child_result_locked(child, caller)
             return
+        siblings = sorted(
+            (
+                sibling for sibling in self.tasks.values()
+                if sibling.batch_id == child.batch_id and sibling.caller_task_id == caller.task_id
+            ),
+            key=lambda sibling: sibling.batch_index,
+        )
+        if any(not self._task_terminal(sibling) for sibling in siblings):
+            return
+        self._resume_suspended_task_locked(caller, self._batch_resume_data(siblings))
 
-        # 防止重复恢复（多个兄弟同时完成时可能多次进入这里）
-        resume_key = f"batch:{batch_id}"
-        for t in self.tasks.values():
-            if t.session_id == task.session_id and str(t.input.get("_resume_key") or "") == resume_key:
-                return
-
-        # 按 batch_index 排序
-        siblings.sort(key=lambda x: x.batch_index)
-
-        # 收集结果
+    def _batch_resume_data(self, siblings: list[Task]) -> dict[str, Any]:
         entries: list[dict[str, Any]] = []
         for t in siblings:
             tr = t.result.get("result") if isinstance(t.result.get("result"), dict) else {}
-            act = str(t.result.get("action") or "").strip()
+            act = self._task_outcome_action(t)
 
             entry: dict[str, Any] = {
                 "kind": t.kind.value,
@@ -1595,7 +1745,7 @@ class TaskRouterMixin:
                 entry["truncated"] = bool(tr.get("truncated", False))
                 entry["ref"] = str(tr.get("ref") or "")
 
-            if act == "fail":
+            if act in ("fail", "cancelled"):
                 entry["error"] = str(t.result.get("error") or "")
 
             atts = tr.get("attachments")
@@ -1603,22 +1753,49 @@ class TaskRouterMixin:
                 entry["attachments"] = atts
 
             entries.append(entry)
+        return {"type": "batch_results", "entries": entries}
 
-        # 构建摘要
-        total = len(entries)
-        fail_count = sum(1 for e in entries if e["status"] == "fail")
-        summary_parts = [f"批量完成 ({total} 个)"]
-        if fail_count:
-            summary_parts.append(f"{fail_count} 个失败")
-        summary_text = ", ".join(summary_parts)
-
-        resume_data: dict[str, Any] = {
-            "type": "batch_results",
-            "entries": entries,
-        }
-        self._resume_caller_or_output_locked(
-            task, resume_data, {"summary": summary_text},
+    def _settle_cancelled_task_locked(self, task: Task, *, finalize_branch: bool = True) -> None:
+        """supervisor 直接终结的取消：收束分支、拆临时会话，并像正常完成一样结算调用方。"""
+        if finalize_branch:
+            self._schedule_cancelled_task_teardown_locked(task)
+        if not (task.caller_task_id or "").strip():
+            return
+        if self._is_compact_dispatch_result(task):
+            self._apply_compact_result_locked(task)
+            return
+        self._settle_child_locked(
+            task, self._child_cancelled_resume_data(task), action_type="cancelled",
         )
+
+    def _schedule_cancelled_task_teardown_locked(self, task: Task) -> None:
+        has_branch = bool(task.input.get("branch_session_id")) and not task.input.get("_branch_finalized")
+        has_sessions = bool(task.input.get("_dispatch_origin") or task.input.get("child_session_id"))
+        if not (has_branch or has_sessions) or task.input.get("_branch_finalize_worker_started"):
+            return
+        task.input["_branch_finalize_worker_started"] = True
+        threading.Thread(
+            target=self._finish_cancelled_task,
+            args=(task,),
+            daemon=True,
+            name=f"cancel-teardown-{task.task_id[:8]}",
+        ).start()
+
+    def _finish_cancelled_task(self, task: Task) -> None:
+        """取消终结之后的收尾：先把分支合并回去，再拆这个任务独占的 fresh/fork 会话。"""
+        try:
+            if task.input.get("branch_session_id") and not task.input.get("_branch_finalized"):
+                if self._finalize_branch_task(task, merge=True) is None:
+                    return
+            with self._lock:
+                work = PostCompletionWork(
+                    task=task.model_copy(deep=True),
+                    route_session_id=self._route_session_id_for_task_locked(task),
+                    session_generation=task.session_generation,
+                )
+            self._execute_post_cleanup(work, {"phase_id": f"task:{task.task_id}:cancel-cleanup", "kind": "cleanup"})
+        except Exception:
+            log.exception("cancelled task teardown failed", extra={"task_id": task.task_id})
 
     # ------------------------------------------------------------------ #
     #  公共：恢复 caller 或输出给用户
@@ -1632,41 +1809,13 @@ class TaskRouterMixin:
         *,
         action_type: str = "",
     ) -> None:
-        """尝试恢复 caller 节点。如果没有 caller，把 fallback_result 输出给用户。"""
-        # 优先尝试直接唤醒 suspended 的 caller
-        caller_id = (task.caller_task_id or "").strip()
-        if caller_id:
-            caller = self.tasks.get(caller_id)
-            if caller and caller.status == TaskStatus.suspended:
-                caller.status = TaskStatus.pending
-                caller.waiting_for_task_id = None
-                caller.worker_id = None
-                caller.lease_expires_at = None
-                caller.updated_at = _now()
-                # 注入 resume_data 到 caller 的 input 中
-                caller.input["resume_data"] = resume_data
-                if action_type:
-                    # [AutoC 2026-05-31] Why: ask and finish currently resume the
-                    # caller through the same code path. How: copy action_type into
-                    # resume_data for callers and also into input for cheap
-                    # supervisor inspection. Purpose: preserve ask identity for
-                    # upcoming topology routing without changing the payload shape.
-                    caller.input["_last_child_action_type"] = str(action_type).strip()
-                caller.input["context_ref"] = str(caller.result.get("context_ref") or caller.input.get("context_ref") or "")
-                # 标记防重复恢复
-                if task.batch_id:
-                    caller.input["_resume_key"] = f"batch:{task.batch_id}"
-                self._event_task_snapshot("task_resumed", caller)
-                return
-
+        """有 caller 的子任务交给 caller 结算；没有 caller 的把 fallback_result 输出给用户。"""
+        if (task.caller_task_id or "").strip():
+            self._settle_child_locked(task, resume_data, action_type=action_type)
+            return
 
         if task.input.get("_dispatch_origin"):
             self._inject_dispatch_result_via_origin_locked(task, fallback_result)
-            # [2026-05-28] fresh/fork session 清理：conversation_key 带 uuid 的
-            # dispatch session 完成后删除，避免资源积累。
-            _d_ctx_mode = str(task.input.get("_dispatch_origin", {}).get("context_mode") or "").strip()
-            if not _d_ctx_mode:
-                _d_ctx_mode = str(task.input.get("dispatch_context_mode") or "").strip()
             return
 
         # 旧路径（向后兼容）：异步 dispatch 子任务完成 → 注入 inbound 通知入口节点
@@ -2016,42 +2165,6 @@ class TaskRouterMixin:
             inbound_seq=seq, session_id=target_session_id, payload=payload,
         )
 
-    def _cleanup_dispatch_session_locked(self, task: Task) -> None:
-        """清理 fresh/fork 模式 dispatch 创建的临时 session。
-
-        [2026-05-28] fresh/fork dispatch 的 conversation_key 带 uuid，
-        完成后不会被复用。清理对应的 session 和 JSONL，释放资源。
-        """
-        # task 运行在 entry branch 上，需要找到其 parent session
-        _parent_sid = str(task.input.get("parent_session_id") or "").strip()
-        _branch_sid = str(task.input.get("branch_session_id") or "").strip()
-        # dispatch session 是 branch 的 parent
-        _dispatch_sid = _parent_sid or ""
-        if not _dispatch_sid:
-            return
-        _info = self.sessions.get(_dispatch_sid)
-        if not _info:
-            return
-        # 只清理 agent: 前缀的 dispatch session
-        if not _info.conversation_key.startswith("agent:"):
-            return
-        try:
-            self.purge_session_files(_dispatch_sid)
-            if _branch_sid:
-                self.purge_session_files(_branch_sid)
-            # 从内存中移除
-            self.conversation_map.pop(_info.conversation_key, None)
-            self.sessions.pop(_dispatch_sid, None)
-            self.session_generations.pop(_dispatch_sid, None)
-            self._cancelled_sessions.discard(_dispatch_sid)
-            self._session_context_usage.pop(_dispatch_sid, None)
-
-            # 阻止 agent:* 派生 session 持续堆积。
-            self._session_store.remove_session(_dispatch_sid)
-        except Exception as e:
-            log.warning("cleanup dispatch session %s failed: %s", _dispatch_sid[:12], e)
-            raise
-
     def _async_result_origin_guard_locked(
         self, session_id: str, task_id: str,
     ) -> dict[str, Any] | None:
@@ -2323,7 +2436,8 @@ class TaskRouterMixin:
             prompt_chars = total_content_chars(messages)
         return observed_chars_per_token(prompt_chars, prompt_tokens)
 
-    def _apply_snip_via_conv_store_locked(self, session_id: str, task_ids: set[str]) -> dict[str, Any]:
+    def _apply_snip_via_conv_store(self, session_id: str, task_ids: set[str]) -> dict[str, Any]:
+        """用 TaskRecord 摘要替换已结束任务的原文。不要求持锁，会话文件按 ConversationChangedError 乐观重试。"""
         from engine.compaction_plan import record_fingerprint, record_task_id
         from engine.context_archive import ContextArchiveStore
         from engine.conversation_store import ConversationChangedError, ConversationStore
@@ -2365,7 +2479,11 @@ class TaskRouterMixin:
                 record_task_id(message): message for message in compressed
                 if record_task_id(message) in eligible and message.message_type == "summary"
             }
-            synchronized = self._sync_snip_to_branches(session_id, plan, summaries)
+            synchronized = self._rewrite_branch_prefixes(
+                session_id,
+                functools.partial(self._snip_branch_prefix, plan=plan, summaries=summaries),
+                reason="branch_task_snip",
+            )
             return {
                 "applied": synchronized, "before": len(messages), "after": len(compressed),
                 "snipped_tasks": len(eligible),
@@ -2373,71 +2491,131 @@ class TaskRouterMixin:
             }
         return {"applied": False, "reason": "conversation changed during task compaction"}
 
-    def _sync_snip_to_branches(self, session_id: str, plan: dict[str, Any], summaries: dict[str, Any]) -> bool:
-        from engine.branch_history import branch_base_count, mark_branch_boundary, without_branch_boundary
+    @staticmethod
+    def _snip_branch_prefix(
+        prefix: list[Any], *, plan: dict[str, Any], summaries: dict[str, Any],
+    ) -> list[Any] | None:
         from engine.compaction_plan import covered_indices, record_task_id
-        from engine.context_archive import ContextArchiveStore
-        from engine.conversation_store import ConversationChangedError, ConversationStore
 
-        branches: dict[str, list[Task]] = {}
-        for task in list(self.tasks.values()):
-            if self._task_terminal(task) or task.input.get("parent_session_id") != session_id:
+        indices = covered_indices(prefix, plan)
+        if indices is None:
+            return None
+        selected = set(indices)
+        replaced: list[Any] = []
+        seen: set[str] = set()
+        for index, message in enumerate(prefix):
+            if index not in selected:
+                replaced.append(message)
+                continue
+            task_id = record_task_id(message)
+            if task_id not in seen:
+                replaced.append(summaries[task_id])
+                seen.add(task_id)
+        return replaced
+
+    def _active_branch_bases_locked(self, target_session_id: str) -> dict[str, int]:
+        """target 下还在跑的入口分支 → 登记的父历史长度（分支文件里没有边界标记时兜底用）。"""
+        bases: dict[str, int] = {}
+        for task in self.tasks.values():
+            if self._task_terminal(task) or task.input.get("parent_session_id") != target_session_id:
                 continue
             branch_id = str(task.input.get("branch_session_id") or "")
             if branch_id:
-                branches.setdefault(branch_id, []).append(task)
+                bases[branch_id] = max(bases.get(branch_id, 0), int(task.input.get("base_count") or 0))
+        return bases
+
+    def _rewrite_branch_prefixes(
+        self,
+        target_session_id: str,
+        rewrite: Callable[[list[Any]], list[Any] | None],
+        *,
+        reason: str,
+    ) -> bool:
+        """父会话上做过的改写同步到各活跃入口分支的父历史前缀，全部同步成功才返回 True。
+
+        分支文件在锁外读写，只有取分支清单和回写 base_count 时短暂持锁。rewrite 对不上前缀时返回 None。
+        """
+        with self._lock:
+            branches = self._active_branch_bases_locked(target_session_id)
         synchronized = True
-        for branch_id, tasks in branches.items():
+        rewritten: dict[str, tuple[int, str]] = {}
+        for branch_id, fallback_base in branches.items():
             try:
-                for attempt in range(3):
-                    store = ConversationStore(self.workspace_root / "data" / "conversations")
-                    messages = store.load(branch_id)
-                    base_count = branch_base_count(
-                        messages, branch_id, max(int(task.input.get("base_count") or 0) for task in tasks),
-                    )
-                    if base_count <= 0 or base_count > len(messages):
-                        synchronized = False
-                        break
-                    prefix = without_branch_boundary(messages[:base_count], branch_id)
-                    indices = covered_indices(prefix, plan)
-                    if indices is None:
-                        synchronized = False
-                        break
-                    selected = set(indices)
-                    replaced = []
-                    seen: set[str] = set()
-                    for index, message in enumerate(prefix):
-                        if index not in selected:
-                            replaced.append(message)
-                            continue
-                        task_id = record_task_id(message)
-                        if task_id not in seen:
-                            replaced.append(summaries[task_id])
-                            seen.add(task_id)
-                    ContextArchiveStore(self.workspace_root).archive(session_id, messages, reason="branch_task_snip")
-                    try:
-                        store.replace_all(
-                            branch_id,
-                            mark_branch_boundary(replaced + messages[base_count:], branch_id, len(replaced)),
-                        )
-                    except ConversationChangedError:
-                        if attempt == 2:
-                            raise
-                        continue
-                    for task in tasks:
-                        task.input["base_count"] = len(replaced)
-                        task.input["base_last_id"] = replaced[-1].id if replaced else ""
-                        task.updated_at = _now()
-                        self._event_task_snapshot("task_context_compacted", task)
-                    break
+                result = self._rewrite_branch_prefix(
+                    target_session_id, branch_id, fallback_base, rewrite, reason=reason,
+                )
             except Exception:
                 synchronized = False
-                log.exception("task summary branch sync failed: %s", branch_id)
+                log.exception("branch history sync failed (%s): %s", reason, branch_id)
+                continue
+            if result is None:
+                synchronized = False
+            else:
+                rewritten[branch_id] = result
+        if rewritten:
+            with self._lock:
+                if not self._commit_branch_bases_locked(target_session_id, rewritten):
+                    synchronized = False
         return synchronized
 
-    def _prepare_compact_input_locked(
+    def _rewrite_branch_prefix(
+        self,
+        target_session_id: str,
+        branch_id: str,
+        fallback_base: int,
+        rewrite: Callable[[list[Any]], list[Any] | None],
+        *,
+        reason: str,
+    ) -> tuple[int, str] | None:
+        from engine.branch_history import branch_base_count, mark_branch_boundary, without_branch_boundary
+        from engine.context_archive import ContextArchiveStore
+        from engine.conversation_store import ConversationChangedError, ConversationStore
+
+        for attempt in range(3):
+            store = ConversationStore(self.workspace_root / "data" / "conversations")
+            messages = store.load(branch_id)
+            base_count = branch_base_count(messages, branch_id, fallback_base)
+            if base_count <= 0 or base_count > len(messages):
+                return None
+            prefix = rewrite(without_branch_boundary(messages[:base_count], branch_id))
+            if prefix is None:
+                return None
+            ContextArchiveStore(self.workspace_root).archive(target_session_id, messages, reason=reason)
+            try:
+                store.replace_all(
+                    branch_id, mark_branch_boundary(prefix + messages[base_count:], branch_id, len(prefix)),
+                )
+            except ConversationChangedError:
+                if attempt == 2:
+                    raise
+                continue
+            return len(prefix), (prefix[-1].id if prefix else "")
+        return None
+
+    def _commit_branch_bases_locked(
+        self, target_session_id: str, rewritten: dict[str, tuple[int, str]],
+    ) -> bool:
+        persisted = True
+        now = _now()
+        for task in list(self.tasks.values()):
+            if self._task_terminal(task) or task.input.get("parent_session_id") != target_session_id:
+                continue
+            branch_id = str(task.input.get("branch_session_id") or "")
+            if branch_id not in rewritten:
+                continue
+            task.input["base_count"], task.input["base_last_id"] = rewritten[branch_id]
+            task.updated_at = now
+            try:
+                self._event_task_snapshot("task_context_compacted", task)
+            except Exception:
+                persisted = False
+                log.exception("persisting compacted branch base failed: %s", branch_id)
+        return persisted
+
+    def _prepare_compact_input(
         self, session_id: str, source: dict[str, Any], *, context_ref: str = "",
     ) -> tuple[dict[str, Any], str]:
+        """算压缩覆盖计划和发给 compactor 的输入。不要求持锁。"""
         from clonoth_runtime import load_runtime_config
         from engine.compaction_plan import build_compaction_plan
         from engine.context_store import load_context_snapshot
@@ -2459,108 +2637,273 @@ class TaskRouterMixin:
             plan.update(session_id=session_id, storage=storage, context_ref=context_ref)
         return plan, instruction
 
-    def _apply_async_compact_result_locked(self, task: Task) -> None:
+    def _prepared_route_io(self) -> dict[str, Any]:
+        """路由前在锁外算好的 I/O 结果，按 task_id 存放，由同一次路由取走。调用方持锁。"""
+        prepared = getattr(self, "_route_io_prepared", None)
+        if prepared is None:
+            prepared = self._route_io_prepared = {}
+        return prepared
+
+    def _prepare_route_io(self, task: Task) -> None:
+        """在锁外先做这次完成要用的压缩 I/O：同步压缩 dispatch 的覆盖计划，或 compactor 摘要的落盘。
+
+        算不出来就什么也不留，路由时退回锁内现算，结果一致。
+        """
+        try:
+            with self._lock:
+                if task.route_status == RouteStatus.routed:
+                    return
+                result = task.result or {}
+                plan_request = None
+                if str(result.get("action") or "").strip() == "dispatch":
+                    plan_request = self._compact_dispatch_request(task, result)
+                    if plan_request is not None and self.compact_breaker.is_open(plan_request.target_session_id):
+                        return
+                apply_job = self._compact_apply_job_locked(task) if plan_request is None else None
+            if plan_request is not None:
+                plan, instruction = self._prepare_compact_input(
+                    plan_request.target_session_id,
+                    plan_request.sizing_inputs(),
+                    context_ref=plan_request.context_ref,
+                )
+                prepared: Any = PreparedCompactPlan(plan_request, plan, instruction)
+            elif apply_job is not None:
+                prepared = PreparedCompactApply(apply_job, self._run_compact_apply_job(apply_job))
+            else:
+                return
+            with self._lock:
+                self._prepared_route_io()[task.task_id] = prepared
+        except Exception:
+            log.exception(
+                "route I/O preparation failed; routing computes it under the lock",
+                extra={"task_id": task.task_id},
+            )
+
+    @staticmethod
+    def _compact_dispatch_request(task: Task, action: dict[str, Any]) -> CompactPlanRequest | None:
+        dispatch_input = action.get("dispatch_input") if isinstance(action.get("dispatch_input"), dict) else {}
+        if not dispatch_input.get("_compact_dispatch"):
+            return None
+        return CompactPlanRequest(
+            # caller 可能跑在入口分支上，压缩要写回持久的父会话，所以 engine 给的目标优先
+            target_session_id=str(
+                dispatch_input.get("target_session_id")
+                or task.input.get("parent_session_id")
+                or task.session_id
+                or ""
+            ).strip(),
+            context_ref=str(action.get("context_ref") or task.input.get("context_ref") or ""),
+            keep_recent=int(dispatch_input.get("_compact_keep_recent", 6)),
+            keep_recent_tokens=int(dispatch_input.get("_compact_keep_recent_tokens", 0) or 0),
+            threshold_tokens=int(dispatch_input.get("_compact_threshold_tokens", 0) or 0),
+        )
+
+    def _take_compact_plan_locked(
+        self, task: Task, request: CompactPlanRequest,
+    ) -> tuple[dict[str, Any], str]:
+        prepared = self._prepared_route_io().pop(task.task_id, None)
+        if isinstance(prepared, PreparedCompactPlan) and prepared.request == request:
+            return prepared.plan, prepared.instruction
+        return self._prepare_compact_input(
+            request.target_session_id, request.sizing_inputs(), context_ref=request.context_ref,
+        )
+
+    @staticmethod
+    def _compact_summary_of(task: Any) -> str:
+        """compactor 产出的可用摘要；没有正常 finish（包括被取消）或格式不对时为空。"""
         from engine.compact import _format_compact_summary
 
+        result = getattr(task, "result", None) or {}
+        if getattr(task, "status", None) == TaskStatus.cancelled or result.get("action") != "finish":
+            return ""
+        return _format_compact_summary(str((result.get("result") or {}).get("text") or ""))
+
+    def _async_compact_job(self, task: Any) -> CompactApplyJob | None:
         target = str(task.input.get("_compact_target_session_id") or "")
         plan = task.input.get("_compact_plan") or {}
-        result = task.result or {}
-        summary = _format_compact_summary(str((result.get("result") or {}).get("text") or "")) if result.get("action") == "finish" else ""
+        summary = self._compact_summary_of(task)
         if not target or not summary or not plan:
-            if target:
-                self.compact_breaker.record_failure(target)
-            return
-        try:
-            counts = self._apply_compact_via_conv_store_locked(
-                target, summary, plan=plan, **self._compact_sizing(task.input),
-            )
-            if counts.get("applied"):
-                self.compact_breaker.record_success(target)
-        except Exception:
-            self.compact_breaker.record_failure(target)
-            log.exception("async compact apply failed: %s", target)
+            return None
+        return CompactApplyJob(
+            target_session_id=target, summary=summary, plan=plan, storage="conversation",
+            context_ref="", sizing=self._compact_sizing(task.input),
+        )
 
-    def _apply_compact_result_locked(self, task: Task) -> None:
-        from datetime import datetime, timezone
-        from engine.compact import _format_compact_summary, total_content_chars
-        from engine.compaction_plan import archive_hint, fully_covered_task_ids, covered_indices, replace_covered
+    def _dispatch_compact_job_locked(self, task: Task) -> CompactApplyJob | None:
+        caller = self.tasks.get((task.caller_task_id or "").strip())
+        if not self._caller_waits_for_child_locked(caller, task):
+            return None
+        plan = caller.input.get("_compact_plan") or {}
+        storage = str(plan.get("storage") or "")
+        context_ref = str(caller.result.get("context_ref") or caller.input.get("context_ref") or "")
+        summary = self._compact_summary_of(task)
+        if not summary or storage not in ("conversation", "snapshot") or (storage == "snapshot" and not context_ref):
+            return None
+        return CompactApplyJob(
+            target_session_id=str(
+                plan.get("session_id") or caller.input.get("_compact_target_session_id") or caller.session_id
+            ),
+            summary=summary, plan=plan, storage=storage, context_ref=context_ref,
+            sizing=self._compact_sizing(caller.input),
+        )
+
+    def _compact_apply_job_locked(self, task: Task) -> CompactApplyJob | None:
+        if task.input.get("_compact_async"):
+            return self._async_compact_job(task)
+        if self._is_compact_dispatch_result(task):
+            return self._dispatch_compact_job_locked(task)
+        return None
+
+    def _run_compact_apply_job(self, job: CompactApplyJob) -> CompactApplyOutcome:
+        """把摘要写进会话历史或旧式快照。不要求持锁；出异常按没落盘算。"""
+        try:
+            if job.storage == "snapshot":
+                counts = self._apply_compact_to_snapshot(job)
+            else:
+                counts = self._apply_compact_via_conv_store_locked(
+                    job.target_session_id, job.summary, plan=job.plan, **job.sizing,
+                )
+        except Exception:
+            log.exception("compact apply failed: %s", job.target_session_id)
+            return CompactApplyOutcome(counts=None, success=False)
+        return CompactApplyOutcome(counts=counts, success=bool(counts and counts.get("applied")))
+
+    def _compact_apply_outcome_locked(self, task: Any, job: CompactApplyJob) -> CompactApplyOutcome:
+        prepared = self._prepared_route_io().pop(getattr(task, "task_id", ""), None)
+        if isinstance(prepared, PreparedCompactApply) and prepared.job == job:
+            return prepared.outcome
+        return self._run_compact_apply_job(job)
+
+    def _apply_compact_to_snapshot(self, job: CompactApplyJob) -> dict[str, Any] | None:
+        from engine.compact import total_content_chars
+        from engine.compaction_plan import archive_hint, covered_indices, fully_covered_task_ids, replace_covered
         from engine.context_archive import ContextArchiveStore
         from engine.context_store import load_context_snapshot, write_context_snapshot
 
-        caller = self.tasks.get(task.caller_task_id)
-        if not caller or caller.status != TaskStatus.suspended:
+        snapshot = load_context_snapshot(self.workspace_root, job.context_ref)
+        messages = (snapshot or {}).get("messages") or []
+        indices = covered_indices(messages, job.plan)
+        if not indices:
+            return None
+        archive = ContextArchiveStore(self.workspace_root).archive(
+            job.target_session_id, messages, reason="snapshot_compaction",
+        )
+        summary_message = {
+            "role": "user",
+            "content": COMPACT_SUMMARY_PREFIX + job.summary + archive_hint(archive["archive_id"]),
+            "_meta": {
+                "source_task_id": "compact_summary", "message_type": "summary",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "compressed_task_ids": fully_covered_task_ids(messages, indices),
+                "archive_id": archive["archive_id"],
+            },
+        }
+        compressed = replace_covered(messages, job.plan, summary_message)
+        if compressed is None or (
+            len(compressed) >= len(messages)
+            and total_content_chars(compressed) >= total_content_chars(messages)
+        ):
+            return None
+        snapshot["messages"] = compressed
+        write_context_snapshot(self.workspace_root, job.context_ref, snapshot)
+        return {"before": len(messages), "after": len(compressed), "applied": True}
+
+    def _apply_async_compact_result_locked(self, task: Task) -> None:
+        target = str(task.input.get("_compact_target_session_id") or "")
+        job = self._async_compact_job(task)
+        outcome = self._compact_apply_outcome_locked(task, job) if job is not None else None
+        if not target or getattr(task, "status", None) == TaskStatus.cancelled:
+            return
+        if outcome is not None and outcome.success:
+            self.compact_breaker.record_success(target)
+        else:
+            self.compact_breaker.record_failure(target)
+
+    def _apply_compact_result_locked(self, task: Task) -> None:
+        caller = self.tasks.get((task.caller_task_id or "").strip())
+        if not self._caller_waits_for_child_locked(caller, task):
+            self._log_dropped_child_result_locked(task, caller)
             return
         context_ref = str(caller.result.get("context_ref") or caller.input.get("context_ref") or "")
         plan = caller.input.get("_compact_plan") or {}
         target = str(plan.get("session_id") or caller.input.get("_compact_target_session_id") or caller.session_id)
-        result = task.result or {}
-        summary = _format_compact_summary(str((result.get("result") or {}).get("text") or "")) if result.get("action") == "finish" else ""
-        counts = None
-        success = False
-        try:
-            if summary and plan and plan.get("storage") == "conversation":
-                counts = self._apply_compact_via_conv_store_locked(
-                    target, summary, plan=plan, **self._compact_sizing(caller.input),
-                )
-                success = bool(counts.get("applied"))
-            elif summary and plan and plan.get("storage") == "snapshot" and context_ref:
-                snapshot = load_context_snapshot(self.workspace_root, context_ref)
-                messages = (snapshot or {}).get("messages") or []
-                indices = covered_indices(messages, plan)
-                if indices:
-                    archive = ContextArchiveStore(self.workspace_root).archive(target, messages, reason="snapshot_compaction")
-                    summary_message = {
-                        "role": "user",
-                        "content": "[以下是之前对话的结构化摘要，原始上下文已被压缩]\\n\\n" + summary + archive_hint(archive["archive_id"]),
-                        "_meta": {
-                            "source_task_id": "compact_summary", "message_type": "summary",
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "compressed_task_ids": fully_covered_task_ids(messages, indices),
-                            "archive_id": archive["archive_id"],
-                        },
-                    }
-                    compressed = replace_covered(messages, plan, summary_message)
-                    success = len(compressed) < len(messages) or total_content_chars(compressed) < total_content_chars(messages)
-                    if success:
-                        snapshot["messages"] = compressed
-                        write_context_snapshot(self.workspace_root, context_ref, snapshot)
-                        counts = {"before": len(messages), "after": len(compressed), "applied": True}
-        except Exception:
-            log.exception("compact apply failed: %s", target)
-        if success:
+        job = self._dispatch_compact_job_locked(task)
+        outcome = self._compact_apply_outcome_locked(task, job) if job is not None else None
+        if outcome is not None and outcome.success:
             self.compact_breaker.record_success(target)
-        elif not summary:
+            self._resume_compact_parent_locked(
+                caller, context_ref, compact_result=outcome.counts, success=True,
+            )
+            return
+        cancelled = task.status == TaskStatus.cancelled
+        if cancelled:
+            reason = "压缩子任务已取消"
+        elif str((task.result or {}).get("action") or "").strip() != "finish":
+            reason = "压缩子任务失败"
+        elif job is None:
+            reason = "压缩摘要为空、格式不对或缺少压缩计划"
+        else:
+            reason = "压缩摘要没能落盘"
+        if not cancelled:
             self.compact_breaker.record_failure(target)
-        self._resume_compact_parent_locked(
-            caller, context_ref, compact_result=counts, success=success,
+        self._fail_compact_round_locked(
+            caller, context_ref, reason=reason, in_route=False,
+            compact_result=outcome.counts if outcome is not None else None,
         )
+
+    def _fail_compact_round_locked(
+        self,
+        task: Task,
+        context_ref: str,
+        *,
+        reason: str,
+        in_route: bool,
+        compact_result: dict[str, Any] | None = None,
+    ) -> None:
+        """一轮同步压缩没成：恢复 task 让它继续；同一任务连续失败到上限就按失败结束。
+
+        in_route 时 task 正在路由它这次的压缩 dispatch，只改判结果，由外层接着按失败路由。
+        """
+        failures = int(task.input.get("_compact_failures") or 0) + 1
+        task.input["_compact_failures"] = failures
+        if failures < MAX_TASK_CONSECUTIVE_FAILURES:
+            self._resume_compact_parent_locked(
+                task, context_ref, compact_result=compact_result, success=False,
+            )
+            return
+        log.warning(
+            "compaction failed %d times in a row, failing task %s: %s",
+            failures, task.task_id[:12], reason,
+        )
+        error = f"上下文压缩连续失败 {failures} 次（{reason}），任务已停止"
+        for key in ("_compact_dispatch_pending", "_compact_plan"):
+            task.input.pop(key, None)
+        if in_route:
+            self._apply_failure_locked(task, error)
+            self._event_task_snapshot("task_completed", task, component="supervisor")
+        else:
+            self._fail_task_locked(task, error=error)
 
     def _apply_compact_via_conv_store_locked(
         self, target_session_id: str, summary: str, *, keep_recent: int,
         threshold_tokens: int = 256000, keep_recent_tokens: int = 0,
         plan: dict[str, Any] | None = None,
     ) -> dict[str, int]:
+        """按覆盖计划把摘要写进会话历史并同步到分支。不要求持锁，会话被并发改动时重试。"""
         from engine.conversation_store import ConversationChangedError, ConversationStore
 
         for _ in range(3):
             try:
-                return self._apply_compact_via_conv_store_once_locked(
-                    target_session_id, summary, keep_recent=keep_recent,
-                    threshold_tokens=threshold_tokens, keep_recent_tokens=keep_recent_tokens,
-                    plan=plan,
-                )
+                return self._apply_compact_via_conv_store_once(target_session_id, summary, plan=plan)
             except ConversationChangedError:
                 continue
         count = ConversationStore(self.workspace_root / "data" / "conversations").message_count(target_session_id)
         return {"before": count, "after": count, "total_segments": 0, "kept_segments": 0, "compressed_segments": 0, "applied": False}
 
-    def _apply_compact_via_conv_store_once_locked(
-        self, target_session_id: str, summary: str, *, keep_recent: int,
-        threshold_tokens: int = 256000, keep_recent_tokens: int = 0,
-        plan: dict[str, Any] | None = None,
+    def _apply_compact_via_conv_store_once(
+        self, target_session_id: str, summary: str, *, plan: dict[str, Any] | None = None,
     ) -> dict[str, int]:
         from uuid import uuid4
-        from datetime import datetime, timezone
         from engine.compaction_plan import archive_hint, fully_covered_task_ids, covered_indices, replace_covered
         from engine.compact import total_content_chars
         from engine.context_archive import ContextArchiveStore
@@ -2585,7 +2928,7 @@ class TaskRouterMixin:
         archive = ContextArchiveStore(self.workspace_root).archive(target_session_id, messages, reason="llm_compaction")
         summary_message = Message(
             id=str(uuid4()), role="user",
-            content="[以下是之前对话的结构化摘要，原始上下文已被压缩]\\n\\n" + summary + archive_hint(archive["archive_id"]),
+            content=COMPACT_SUMMARY_PREFIX + summary + archive_hint(archive["archive_id"]),
             message_type=MessageType.SUMMARY,
             created_at=datetime.now(timezone.utc).isoformat(), source_task_id="compact_summary",
             meta={
@@ -2594,7 +2937,9 @@ class TaskRouterMixin:
             },
         )
         compressed = replace_covered(messages, plan, summary_message)
-        if len(compressed) >= before and total_content_chars(compressed) >= total_content_chars(messages):
+        if compressed is None or (
+            len(compressed) >= before and total_content_chars(compressed) >= total_content_chars(messages)
+        ):
             return counts
         store.replace_all(target_session_id, compressed)
         counts.update(
@@ -2609,51 +2954,14 @@ class TaskRouterMixin:
     def _sync_compact_to_branches(
         self, target_session_id: str, summary_message: Any, plan: dict[str, Any],
     ) -> None:
-        from engine.branch_history import branch_base_count, mark_branch_boundary, without_branch_boundary
         from engine.compaction_plan import replace_covered
-        from engine.context_archive import ContextArchiveStore
-        from engine.conversation_store import ConversationChangedError, ConversationStore
 
-        branches: dict[str, list[Task]] = {}
-        for task in list(self.tasks.values()):
-            if self._task_terminal(task) or task.input.get("parent_session_id") != target_session_id:
-                continue
-            branch_id = str(task.input.get("branch_session_id") or "")
-            if branch_id:
-                branches.setdefault(branch_id, []).append(task)
-        for branch_id, tasks in branches.items():
-            try:
-                for attempt in range(3):
-                    store = ConversationStore(self.workspace_root / "data" / "conversations")
-                    messages = store.load(branch_id)
-                    base_count = branch_base_count(
-                        messages, branch_id, max(int(task.input.get("base_count") or 0) for task in tasks),
-                    )
-                    if base_count <= 0 or base_count > len(messages):
-                        break
-                    prefix = replace_covered(
-                        without_branch_boundary(messages[:base_count], branch_id), plan, summary_message,
-                    )
-                    if prefix is None:
-                        break
-                    # 入口分支和父会话共享历史；独立子节点只压缩自己的记录。
-                    ContextArchiveStore(self.workspace_root).archive(target_session_id, messages, reason="branch_compaction")
-                    try:
-                        store.replace_all(
-                            branch_id, mark_branch_boundary(prefix + messages[base_count:], branch_id, len(prefix)),
-                        )
-                    except ConversationChangedError:
-                        if attempt == 2:
-                            raise
-                        continue
-                    for task in tasks:
-                        task.input["base_count"] = len(prefix)
-                        task.input["base_last_id"] = prefix[-1].id if prefix else ""
-                        task.updated_at = _now()
-                        self._event_task_snapshot("task_context_compacted", task)
-                    break
-            except Exception:
-                log.exception("compact branch sync failed: %s", branch_id)
+        # 入口分支和父会话共享历史；独立子节点只压缩自己的记录。
+        self._rewrite_branch_prefixes(
+            target_session_id,
+            functools.partial(replace_covered, plan=plan, summary=summary_message),
+            reason="branch_compaction",
+        )
 
     def _resume_compact_parent_locked(
         self, caller: Task, context_ref: str, *,
@@ -2661,20 +2969,16 @@ class TaskRouterMixin:
         before: int = 0, after: int = 0, success: bool = True,
     ) -> None:
         """恢复等待压缩的父 task。"""
-        caller.status = TaskStatus.pending
-        caller.waiting_for_task_id = None
-        caller.worker_id = None
-        caller.lease_expires_at = None
-        caller.updated_at = _now()
-        if compact_result:
-            _rd = {"type": "compact_done", "success": success, **compact_result}
-        else:
-            _rd = {"type": "compact_done", "success": success, "before": before, "after": after}
-        caller.input["resume_data"] = _rd
-        caller.input["context_ref"] = context_ref
-        caller.input.pop("_compact_dispatch_pending", None)
-        caller.input.pop("_compact_plan", None)
-        self._event_task_snapshot("task_resumed", caller)
+        if success:
+            caller.input.pop("_compact_failures", None)
+        resume_data = {
+            "type": "compact_done", "success": success,
+            **(compact_result or {"before": before, "after": after}),
+        }
+        self._resume_suspended_task_locked(
+            caller, resume_data, context_ref=context_ref,
+            drop_input_keys=("_compact_dispatch_pending", "_compact_plan"),
+        )
 
 
     # ------------------------------------------------------------------ #

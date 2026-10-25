@@ -29,8 +29,18 @@ def _make_state(workspace: Path) -> SupervisorState:
     )
 
 
-def _dispatched_task(state: SupervisorState, *, parent_conv_key: str, is_admin: bool = False):
+def _dispatched_task(
+    state: SupervisorState, *, parent_conv_key: str, is_admin: bool = False, platform: str | None = "qq",
+):
     """Build the task shape a dispatch actually creates: own session, routed key."""
+    task_context = {
+        "conversation_key": f"agent:bootstrap.executor:{parent_conv_key}:abc",
+        "parent_conversation_key": parent_conv_key,
+        "route_conversation_key": parent_conv_key,
+    }
+    # 带了 task_id 的判权只认任务上记的身份，没有平台身份的来源就不能挂一份 QQ 身份
+    if platform is not None:
+        task_context["platform_auth"] = {"platform": platform, "is_admin": is_admin}
     parent_sid = state.get_or_create_session(channel="qq_group", conversation_key=parent_conv_key)
     child_sid = state.get_or_create_session(
         channel="qq_group", conversation_key=f"agent:bootstrap.executor:{parent_conv_key}:abc",
@@ -41,15 +51,7 @@ def _dispatched_task(state: SupervisorState, *, parent_conv_key: str, is_admin: 
             session_generation=1,
             kind=TaskKind.node,
             node_id="bootstrap.executor",
-            input_data={
-                "instruction": "do the thing",
-                "task_context": {
-                    "conversation_key": f"agent:bootstrap.executor:{parent_conv_key}:abc",
-                    "parent_conversation_key": parent_conv_key,
-                    "route_conversation_key": parent_conv_key,
-                    "platform_auth": {"platform": "qq", "is_admin": is_admin},
-                },
-            },
+            input_data={"instruction": "do the thing", "task_context": task_context},
             continuation={},
             source_inbound_seq=None,
             caller_task_id=None,
@@ -58,6 +60,19 @@ def _dispatched_task(state: SupervisorState, *, parent_conv_key: str, is_admin: 
 
 
 class TestDispatchCannotShedQQLimits:
+    def test_a_forged_admin_claim_does_not_lift_the_limits(self, tmp_path: Path) -> None:
+        state = _make_state(tmp_path)
+        _parent, child_sid, task = _dispatched_task(state, parent_conv_key=_QQ_KEY)
+
+        out = state.request_operation(
+            session_id=child_sid,
+            op="write_file",
+            parameters={"path": "notes.txt", "platform_auth": {"platform": "qq", "is_admin": True}},
+            task_id=task.task_id,
+        )
+
+        assert out.safety_level == SafetyLevel.deny
+
     def test_write_file_stays_denied_inside_a_dispatched_child(self, tmp_path: Path) -> None:
         state = _make_state(tmp_path)
         _parent, child_sid, task = _dispatched_task(state, parent_conv_key=_QQ_KEY)
@@ -113,7 +128,7 @@ class TestDispatchCannotShedQQLimits:
 
     def test_a_non_qq_caller_is_unaffected(self, tmp_path: Path) -> None:
         state = _make_state(tmp_path)
-        _parent, child_sid, task = _dispatched_task(state, parent_conv_key="cli:default")
+        _parent, child_sid, task = _dispatched_task(state, parent_conv_key="cli:default", platform=None)
 
         out = state.request_operation(
             session_id=child_sid,

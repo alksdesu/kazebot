@@ -164,6 +164,7 @@ class Task(BaseModel):
     batch_id: str | None = None
     batch_index: int = 0
     waiting_for_task_id: str | None = None
+    waiting_for_batch_id: str | None = None
     status: TaskStatus = TaskStatus.pending
     cancel_requested: bool = False
     preempt_requested: bool = False
@@ -175,8 +176,14 @@ class Task(BaseModel):
     preempt_output_guide: dict[str, Any] | None = None
     preempt_revision: int = 0
     worker_id: str | None = None
+    # 每次领取换一个；complete / renew_lease / cancelled 带回来比对，旧领取的回报一律作废。
+    claim_id: str = ""
+    # 已受理过完成回报的那次领取，同一领取重发的 complete 据此认作重复。
+    completed_claim_id: str = ""
     created_at: datetime
     updated_at: datetime
+    queued_at: datetime | None = None
+    claimed_at: datetime | None = None
     lease_expires_at: datetime | None = None
     result: dict[str, Any] = Field(default_factory=dict)
     # route_schema_version=0 identifies legacy snapshots. Legacy terminal tasks
@@ -206,6 +213,23 @@ class Task(BaseModel):
 class TaskCompleteIn(BaseModel):
     worker_id: str
     result: dict[str, Any] = Field(default_factory=dict)
+    claim_id: str | None = None
+
+
+class TaskLeaseRenewIn(BaseModel):
+    worker_id: str = ""
+    lease_sec: float = 120.0
+    claim_id: str | None = None
+
+
+class TaskOriginOut(BaseModel):
+    """任务的发起来源：派发出去的子任务回溯到发起会话和入口任务的已校验身份。"""
+
+    task_id: str
+    origin_task_id: str
+    conversation_key: str = ""
+    channel: str = ""
+    platform_auth: dict[str, Any] = Field(default_factory=dict)
 
 
 class SessionEventIn(BaseModel):

@@ -1,11 +1,12 @@
 """压缩熔断器。
 
 连续失败 N 次后停一段冷却，不再为同一个 session 反复调压缩模型。计数只放在
-supervisor 里：压缩模型调用、摘要应用、应急截断全在这一侧，而 engine 是多个独立
-worker 进程，谁也读不到别人的计数器。
+supervisor 里：压缩模型调用、摘要应用全在这一侧，而 engine 是多个独立 worker 进程，
+谁也读不到别人的计数器。
 
-只管软阈值的后台压缩。硬阈值同步压缩不受熔断影响 —— 那条路不压就会顶爆上下文窗口，
-且它的失败分支本身会用 TaskRecord 摘要做应急截断，不需要再调模型。
+后台压缩和硬阈值同步压缩共用这一份计数：没有可压缩的完整历史段、摘要为空、摘要没能
+落盘都算一次失败。冷却期内同步压缩直接按失败恢复调用方，同一任务连续失败到
+MAX_TASK_CONSECUTIVE_FAILURES 次就按失败结束，不再与 engine 来回循环。
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ log = logging.getLogger(__name__)
 MAX_CONSECUTIVE_FAILURES = 3
 COOLDOWN_SECONDS = 600.0
 MAX_TRACKED_SESSIONS = 512
+MAX_TASK_CONSECUTIVE_FAILURES = 3
 
 
 class CompactBreaker:

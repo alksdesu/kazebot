@@ -81,6 +81,15 @@ def _pending_intent_tasks(state: SupervisorState) -> list[Any]:
     ]
 
 
+def _work_off(state: SupervisorState, *, task_id: str, worker_id: str, result: dict[str, Any]) -> None:
+    """替 engine worker 先领取再回报：没被领取过的任务，完成回报会当成过期领取拒掉。"""
+    with state._lock:
+        task = state.tasks[task_id]
+        task.status = TaskStatus.running
+        task.worker_id = worker_id
+    state.complete_task(task_id=task_id, worker_id=worker_id, result=result)
+
+
 def _judge(app, state: SupervisorState, body: dict[str, Any], *, answer: str | None = "yes|在追问",
            action: str = "finish", url: str = _URL) -> httpx.Response:
     """发一次判定请求，并在任务出现后立刻替 engine worker 把它做完。"""
@@ -97,8 +106,8 @@ def _judge(app, state: SupervisorState, body: dict[str, Any], *, answer: str | N
                         result: dict[str, Any] = {"action": action}
                         if answer is not None:
                             result["result"] = {"text": answer}
-                        state.complete_task(
-                            task_id=pending[0].task_id, worker_id="worker-1", result=result,
+                        _work_off(
+                            state, task_id=pending[0].task_id, worker_id="worker-1", result=result,
                         )
                         break
             return await request
@@ -234,8 +243,8 @@ class TestAuth:
                     await asyncio.sleep(0.005)
                     pending = _pending_intent_tasks(state)
                     if pending:
-                        state.complete_task(
-                            task_id=pending[0].task_id, worker_id="worker-1",
+                        _work_off(
+                            state, task_id=pending[0].task_id, worker_id="worker-1",
                             result={"action": "finish", "result": {"text": "yes"}},
                         )
                         break
@@ -314,8 +323,8 @@ class TestTheInflightGate:
                     if _pending_intent_tasks(state):
                         break
                 second = await client.post(_URL, json=_body(timeout_sec=2.0), headers=_AUTH)
-                state.complete_task(
-                    task_id=_pending_intent_tasks(state)[0].task_id,
+                _work_off(
+                    state, task_id=_pending_intent_tasks(state)[0].task_id,
                     worker_id="worker-1",
                     result={"action": "finish", "result": {"text": "yes"}},
                 )
@@ -345,8 +354,8 @@ class TestTheInflightGate:
                     _URL, json=_body(conversation_key="qq_group:hash-other", timeout_sec=2.0),
                     headers=_AUTH,
                 )
-                state.complete_task(
-                    task_id=_pending_intent_tasks(state)[0].task_id,
+                _work_off(
+                    state, task_id=_pending_intent_tasks(state)[0].task_id,
                     worker_id="worker-1",
                     result={"action": "finish", "result": {"text": "yes"}},
                 )
@@ -380,8 +389,8 @@ class TestTheInflightGate:
                     if len(_pending_intent_tasks(state)) >= 2:
                         break
                 for task in _pending_intent_tasks(state):
-                    state.complete_task(
-                        task_id=task.task_id, worker_id="worker-1",
+                    _work_off(
+                        state, task_id=task.task_id, worker_id="worker-1",
                         result={"action": "finish", "result": {"text": "yes"}},
                     )
                 return [r.json() for r in await asyncio.gather(first, second)]

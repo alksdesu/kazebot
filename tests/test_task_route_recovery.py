@@ -25,6 +25,7 @@ from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
 from supervisor.task_router import BranchFinalizePlan, PostCompletionWork  # noqa: E402
+from supervisor.task_store import CompletionOutcome  # noqa: E402
 from supervisor.types import RouteStatus, Task, TaskKind, TaskStatus  # noqa: E402
 
 
@@ -145,7 +146,9 @@ def test_route_failure_is_persisted_and_terminal_complete_retry_resumes_route(
         result={"action": "fail", "error": "must not replace terminal result"},
     )
 
-    assert retried is task
+    # 终态任务没跑完的路由，任何一次回报都会再推一遍；回报本身不属于当前领取，按过期领取应答
+    assert retried is not None and retried.task is task
+    assert retried.outcome is CompletionOutcome.stale
     assert calls == [task.task_id, task.task_id]
     assert task.result == result
     assert task.route_status == RouteStatus.routed

@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import timedelta
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
 from typing import Any
 
-from clonoth_runtime import get_str, load_runtime_config
+from clonoth_runtime import get_str, load_runtime_config, parse_bool
 from engine.output_guide import OUTPUT_GUIDE_KEY
 from platforms.registry import find_platform
 
@@ -15,6 +17,42 @@ from .types import OutputGuide, RouteStatus, Task, TaskKind, TaskStatus, output_
 
 
 logger = logging.getLogger(__name__)
+
+# 恢复运行时会从 input 里拿掉的键；task_resumed 快照只存增量，回放要靠这份清单把它们删掉。
+_RESUME_REMOVABLE_INPUT_KEYS = ("_compact_dispatch_pending", "_compact_plan", "_compact_failures")
+
+
+class CompletionOutcome(str, Enum):
+    accepted = "accepted"
+    duplicate = "duplicate"
+    stale = "stale"
+
+
+@dataclass(frozen=True)
+class TaskCompletion:
+    task: Task
+    outcome: CompletionOutcome
+
+
+@dataclass(frozen=True)
+class LeaseRenewal:
+    ok: bool
+    reason: str = ""
+
+
+class CancelEffect(str, Enum):
+    none = ""
+    requested = "requested"
+    cancelled = "cancelled"
+
+
+@dataclass(frozen=True)
+class TaskOrigin:
+    task_id: str
+    origin_task_id: str
+    conversation_key: str
+    channel: str
+    platform_auth: dict[str, Any] = field(default_factory=dict)
 
 
 class TaskStoreMixin:
@@ -68,13 +106,9 @@ class TaskStoreMixin:
         换来的还常常是同一个模型。读不到配置时按绕算，那是这里的历史行为。
         显式 true 不看节点配没配：那是「把图挡在工具外面」，隔离本身就是目的。
         """
-        if isinstance(setting, bool):
-            return setting
-        mode = str(setting or "").strip().lower()
-        if mode in {"false", "0", "no", "off"}:
-            return False
-        if mode in {"true", "1", "yes", "on"}:
-            return True
+        explicit = parse_bool(setting)
+        if explicit is not None:
+            return explicit
         store = getattr(self, "config_store", None)
         if store is None:
             return True
@@ -228,7 +262,8 @@ class TaskStoreMixin:
                     "_route_session_id", "_branch_finalized", "child_session_id",
                     "_compact_dispatch_pending", "_system_task", "_async_dispatch", "_session_reset",
                     "_compact_plan", "_compact_target_session_id", "_compact_keep_recent",
-                    "_compact_keep_recent_tokens", "_compact_threshold_tokens", "context_ref",
+                    "_compact_keep_recent_tokens", "_compact_threshold_tokens", "_compact_failures",
+                    "context_ref",
                 ):
                     if _k in raw_input:
                         slim_input[_k] = raw_input[_k]
@@ -238,7 +273,7 @@ class TaskStoreMixin:
                     slim_input["task_context"] = {key: value for key, value in context.items() if key != OUTPUT_GUIDE_KEY}
                 if event_type == "task_resumed":
                     slim_input["_removed_input_keys"] = [
-                        key for key in ("_compact_dispatch_pending", "_compact_plan") if key not in raw_input
+                        key for key in _RESUME_REMOVABLE_INPUT_KEYS if key not in raw_input
                     ]
                     resume_data = raw_input.get("resume_data")
                     if isinstance(resume_data, dict) and resume_data.get("type") == "compact_done":
@@ -254,7 +289,7 @@ class TaskStoreMixin:
         }
         removed = updated.get("_removed_input_keys")
         if isinstance(removed, list):
-            for key in ("_compact_dispatch_pending", "_compact_plan"):
+            for key in _RESUME_REMOVABLE_INPUT_KEYS:
                 if key in removed:
                     merged.pop(key, None)
         old_context = previous.get("task_context")
@@ -366,6 +401,7 @@ class TaskStoreMixin:
             worker_id=None,
             created_at=now,
             updated_at=now,
+            queued_at=now,
             lease_expires_at=None,
             result={},
         )
@@ -374,32 +410,115 @@ class TaskStoreMixin:
         self._event_task_snapshot("task_created", task)
         return task
 
+    # ---- 取消、恢复、失败：所有路径共用的状态迁移 ----
+
+    def _cancel_task_locked(
+        self,
+        task: Task,
+        now: datetime,
+        *,
+        force: bool = False,
+        finalize_branch: bool = True,
+        reason: str = "任务已取消",
+    ) -> CancelEffect:
+        """取消一个任务：running 且租约还在时只记取消请求，等 worker 停下回报；其余直接终结并结算。
+
+        force 用于 worker 已经不在的场合（引擎重启、分支拆除），不等回报直接终结。
+        """
+        if self._task_terminal(task):
+            return CancelEffect.none
+        newly_requested = not task.cancel_requested
+        task.cancel_requested = True
+        lease_alive = task.lease_expires_at is not None and task.lease_expires_at >= now
+        if task.status == TaskStatus.running and lease_alive and not force:
+            if not newly_requested:
+                return CancelEffect.none
+            task.updated_at = now
+            self._event_task_snapshot("task_cancel_requested", task)
+            return CancelEffect.requested
+        task.status = TaskStatus.cancelled
+        task.updated_at = now
+        task.lease_expires_at = None
+        task.waiting_for_task_id = None
+        task.waiting_for_batch_id = None
+        task.result = {"action": "cancelled", "node_id": task.node_id or task.tool_name or "", "error": reason}
+        self._event_task_snapshot("task_cancelled", task)
+        self._settle_cancelled_task_locked(task, finalize_branch=finalize_branch)
+        return CancelEffect.cancelled
+
+    def _live_descendants_locked(self, root_task_id: str) -> list[Task]:
+        """root 派出去、还没到终态的全部后代，父在子前。"""
+        children: dict[str, list[Task]] = {}
+        for candidate in self.tasks.values():
+            caller_id = (candidate.caller_task_id or "").strip()
+            if caller_id and not self._task_terminal(candidate):
+                children.setdefault(caller_id, []).append(candidate)
+        found: list[Task] = []
+        seen = {root_task_id}
+        queue = [root_task_id]
+        while queue:
+            for child in children.get(queue.pop(0), []):
+                if child.task_id not in seen:
+                    seen.add(child.task_id)
+                    found.append(child)
+                    queue.append(child.task_id)
+        return found
+
+    def _resume_suspended_task_locked(
+        self,
+        task: Task,
+        resume_data: dict[str, Any],
+        *,
+        action_type: str = "",
+        context_ref: str | None = None,
+        drop_input_keys: tuple[str, ...] = (),
+    ) -> None:
+        """把挂起的任务放回队列，带上恢复数据。重新排队从这一刻起算排队时长。"""
+        now = _now()
+        task.status = TaskStatus.pending
+        task.waiting_for_task_id = None
+        task.waiting_for_batch_id = None
+        task.worker_id = None
+        task.lease_expires_at = None
+        task.updated_at = now
+        task.queued_at = now
+        task.input["resume_data"] = resume_data
+        if action_type:
+            task.input["_last_child_action_type"] = str(action_type).strip()
+        if context_ref is None:
+            context_ref = str((task.result or {}).get("context_ref") or task.input.get("context_ref") or "")
+        task.input["context_ref"] = context_ref
+        for key in drop_input_keys:
+            task.input.pop(key, None)
+        self._event_task_snapshot("task_resumed", task)
+
+    def _apply_failure_locked(self, task: Task, error: str, *, now: datetime | None = None) -> None:
+        """把任务置为失败。cancel_requested 一并置上：还在跑的 worker 靠它和续租结果停手。"""
+        now = now or _now()
+        task.cancel_requested = True
+        task.status = TaskStatus.failed
+        task.updated_at = now
+        task.lease_expires_at = None
+        task.waiting_for_task_id = None
+        task.waiting_for_batch_id = None
+        task.result = {"action": "fail", "node_id": task.node_id or task.tool_name or "", "error": error}
+
+    def _fail_task_locked(self, task: Task, *, error: str, now: datetime | None = None) -> None:
+        """由 supervisor 判定失败的任务：取消它派出去的后代，再按一次新的完成走正常路由。"""
+        now = now or _now()
+        self._apply_failure_locked(task, error, now=now)
+        self._reset_task_route_state_locked(task)
+        self._event_task_snapshot("task_completed", task, component="supervisor")
+        for descendant in self._live_descendants_locked(task.task_id):
+            self._cancel_task_locked(descendant, now, reason="上级任务已失败")
+        # 分支任务失败也要合并回父会话、给用户发错误，和正常完成走同一条路
+        self._route_completed_task_locked(task)
+
     def _cancel_session_tasks_locked(self, session_id: str) -> None:
         now = _now()
-        for task in self.tasks.values():
-            if task.session_id != session_id or self._task_terminal(task):
-                continue
-            if task.status == TaskStatus.pending:
-                task.cancel_requested = True
-                task.status = TaskStatus.cancelled
-                task.updated_at = now
-                task.lease_expires_at = None
-                # [Fork/Merge 2026-05-12] pending 入口分支被 session cancel 直接终结时也要清理。
-                # 原因：此路径不会经过 complete_task/task_router。做法：调用幂等 finalize。
-                # 目的：避免未启动分支在主 session 取消后遗留 JSONL 与映射。
-                self._finalize_branch_task_locked(task, merge=True)
-                self._event_task_snapshot("task_cancelled", task)
-            elif task.status == TaskStatus.suspended:
-                task.cancel_requested = True
-                task.status = TaskStatus.cancelled
-                task.waiting_for_task_id = None
-                task.updated_at = now
-                self._finalize_branch_task_locked(task, merge=True)
-                self._event_task_snapshot("task_cancelled", task)
-            elif task.status == TaskStatus.running and not task.cancel_requested:
-                task.cancel_requested = True
-                task.updated_at = now
-                self._event_task_snapshot("task_cancel_requested", task)
+        for task in list(self.tasks.values()):
+            if task.session_id == session_id:
+                self._cancel_task_locked(task, now)
 
     def _find_last_context_ref_locked(self, session_id: str, node_id: str, *, context_key: str | None = None) -> str:
         """查找同一 session 中指定 node_id 最近一次完成的 task 的 context_ref。
@@ -643,6 +762,130 @@ class TaskStoreMixin:
         )
         return task
 
+    # ---- 发起来源 ----
+
+    @staticmethod
+    def _origin_parent_task_id(task: Task) -> str:
+        """身份往上追一级：同步派发看 caller，异步派发看发起任务，结果回调入站看产出结果的那个任务。"""
+        origin = task.input.get("_dispatch_origin")
+        return str(
+            task.caller_task_id
+            or (origin.get("caller_task_id") if isinstance(origin, dict) else "")
+            or task.input.get("inbound_child_task_id")
+            or ""
+        ).strip()
+
+    def _platform_auth_origin_locked(self, task: Task) -> tuple[Task, dict[str, Any]]:
+        """任务自身 task_context 里的平台身份；没有就沿派发链回溯，返回 (身份所在的任务, 身份)。"""
+        current = task
+        seen: set[str] = set()
+        while current.task_id not in seen:
+            seen.add(current.task_id)
+            context = current.input.get("task_context")
+            auth = context.get("platform_auth") if isinstance(context, dict) else None
+            if isinstance(auth, dict) and auth:
+                return current, dict(auth)
+            parent = self.tasks.get(self._origin_parent_task_id(current))
+            if parent is None:
+                break
+            current = parent
+        return current, {}
+
+    def _authorizing_origin_locked(self, session_id: str, task: Task | None) -> tuple[str, str]:
+        """(conversation_key, channel) whose permissions govern this operation.
+
+        dispatch 出去的子任务跑在自己的 `agent:...` 会话里，按运行期 session 判权就等于：
+        任何群成员只要能让 bot 派一个子节点，「外部平台非管理员禁止写文件 / 禁止敏感命令」
+        那几道硬拒就整段跳过。发起会话的 key 由 dispatch 一路透传，嵌套派发也保留最初那个。
+        """
+        channel = ""
+        if task is not None:
+            raw_ctx = task.input.get("task_context")
+            ctx = raw_ctx if isinstance(raw_ctx, dict) else {}
+            channel = str(ctx.get("channel") or "").strip()
+            routed = str(
+                ctx.get("route_conversation_key") or ctx.get("parent_conversation_key") or ""
+            ).strip()
+            if routed:
+                return routed, channel
+            session = self.sessions.get(task.session_id or session_id)
+            if session is not None:
+                return (
+                    str(getattr(session, "conversation_key", "") or ""),
+                    channel or str(getattr(session, "channel", "") or ""),
+                )
+        session = self.sessions.get(session_id)
+        if session is None:
+            return "", channel
+        return (
+            str(getattr(session, "conversation_key", "") or ""),
+            channel or str(getattr(session, "channel", "") or ""),
+        )
+
+    def task_origin(self, task_id: str) -> TaskOrigin | None:
+        with self._lock:
+            return self._task_origin_locked(task_id)
+
+    def _task_origin_locked(self, task_id: str) -> TaskOrigin | None:
+        task = self.tasks.get((task_id or "").strip())
+        if task is None:
+            return None
+        conversation_key, channel = self._authorizing_origin_locked(task.session_id, task)
+        origin_task, platform_auth = self._platform_auth_origin_locked(task)
+        return TaskOrigin(
+            task_id=task.task_id,
+            origin_task_id=origin_task.task_id,
+            conversation_key=conversation_key,
+            channel=channel,
+            platform_auth=platform_auth,
+        )
+
+    # ---- 内存回收 ----
+
+    def _prune_finished_tasks_locked(self, keep: int) -> int:
+        """内存里只留最近 keep 个已了结的任务，返回删掉几个。还会被用到的不删，也不占名额。"""
+        pinned = self._tasks_still_needed_locked()
+        disposable = [
+            task_id for task_id in self._task_order
+            if task_id in self.tasks and task_id not in pinned and self._task_settled_locked(self.tasks[task_id])
+        ]
+        doomed = set(disposable[:max(len(disposable) - max(keep, 0), 0)])
+        if not doomed:
+            return 0
+        for task_id in doomed:
+            self.tasks.pop(task_id, None)
+        self._task_order = [task_id for task_id in self._task_order if task_id in self.tasks]
+        return len(doomed)
+
+    def _task_settled_locked(self, task: Task) -> bool:
+        """终态之后的路由、分支收束、后置工作都做完了。"""
+        if not self._task_terminal(task) or task.route_status != RouteStatus.routed:
+            return False
+        if task.input.get("branch_session_id") and not task.input.get("_branch_finalized"):
+            return False
+        self._ensure_post_completion_state_locked()
+        post_work_id = task.post_work_id
+        return not post_work_id or (
+            post_work_id not in self._post_work_enqueued and post_work_id not in self._post_work_running
+        )
+
+    def _tasks_still_needed_locked(self) -> set[str]:
+        """活着的任务还要读的已了结任务：派发链上的祖先（认身份），以及批次里先结束的兄弟（等最后一个结束时一起打包）。"""
+        live = {task_id for task_id, task in self.tasks.items() if not self._task_terminal(task)}
+        needed: set[str] = set()
+        for task_id in live:
+            current = self.tasks[task_id]
+            while (parent_id := self._origin_parent_task_id(current)) and parent_id not in needed:
+                needed.add(parent_id)
+                parent = self.tasks.get(parent_id)
+                if parent is None:
+                    break
+                current = parent
+        for task in self.tasks.values():
+            if task.batch_id and task.caller_task_id in live:
+                needed.add(task.task_id)
+        return needed
+
     def _active_tasks_summary_locked(self, session_id: str) -> list[dict[str, Any]]:
         """返回当前 session 中活跃（pending/running）task 的摘要列表。"""
         result: list[dict[str, Any]] = []
@@ -692,53 +935,14 @@ class TaskStoreMixin:
             now = _now()
             count = 0
             session_ids = {sid, *self._entry_branch_ids_for_parent_locked(sid)}
-            for task in self.tasks.values():
-                if task.session_id not in session_ids or self._task_terminal(task) or task.task_id in keep_ids:
+            for task in list(self.tasks.values()):
+                if task.session_id not in session_ids or task.task_id in keep_ids:
                     continue
                 # node_id 过滤：仅当指定了 node_id 且不匹配时跳过
                 if _filter_node and task.node_id != _filter_node:
                     continue
-                if task.status == TaskStatus.pending:
-                    task.cancel_requested = True
-                    task.status = TaskStatus.cancelled
-                    task.updated_at = now
-                    task.lease_expires_at = None
-                    # [Fork/Merge 2026-05-12] 本地取消直接置终态时同步收束入口分支。
-                    # 原因：pending 任务不会再由 engine 上报完成。做法：调用幂等 finalize。
-                    # 目的：让 cancel_active_tasks 与 finish/fail 路径一样清理分支。
-                    self._finalize_branch_task_locked(task, merge=True)
-                    self._event_task_snapshot("task_cancelled", task)
+                if self._cancel_task_locked(task, now) is not CancelEffect.none:
                     count += 1
-                elif task.status == TaskStatus.suspended:
-                    task.cancel_requested = True
-                    task.status = TaskStatus.cancelled
-                    task.waiting_for_task_id = None
-                    task.updated_at = now
-                    self._finalize_branch_task_locked(task, merge=True)
-                    self._event_task_snapshot("task_cancelled", task)
-                    count += 1
-                elif task.status == TaskStatus.running:
-                    if task.cancel_requested:
-                        # 已标记取消但 worker 未响应；如果 lease 已过期，直接终结
-                        if task.lease_expires_at and task.lease_expires_at < now:
-                            task.status = TaskStatus.cancelled
-                            task.lease_expires_at = None
-                            task.updated_at = now
-                            self._finalize_branch_task_locked(task, merge=True)
-                            self._event_task_snapshot("task_cancelled", task)
-                            count += 1
-                    else:
-                        task.cancel_requested = True
-                        task.updated_at = now
-                        # 如果 lease 已过期，worker 大概率已死，直接终结
-                        if task.lease_expires_at and task.lease_expires_at < now:
-                            task.status = TaskStatus.cancelled
-                            task.lease_expires_at = None
-                            self._finalize_branch_task_locked(task, merge=True)
-                            self._event_task_snapshot("task_cancelled", task)
-                        else:
-                            self._event_task_snapshot("task_cancel_requested", task)
-                        count += 1
             return {"ok": True, "cancelled_count": count}
 
     def cancel_single_task(self, task_id: str) -> dict[str, Any]:
@@ -752,89 +956,12 @@ class TaskStoreMixin:
                 return {"ok": False, "error": "task not found"}
             if self._task_terminal(task):
                 return {"ok": True, "cancelled_count": 0, "already_terminal": True}
-
-            # 收集目标 task 及其所有后代子任务（BFS）
-            to_cancel: set[str] = {tid}
-            queue = [tid]
-            while queue:
-                parent_id = queue.pop(0)
-                for t in self.tasks.values():
-                    if t.caller_task_id == parent_id and not self._task_terminal(t) and t.task_id not in to_cancel:
-                        to_cancel.add(t.task_id)
-                        queue.append(t.task_id)
-
             now = _now()
             count = 0
-            for cancel_tid in to_cancel:
-                t = self.tasks.get(cancel_tid)
-                if t is None or self._task_terminal(t):
-                    continue
-                if t.status == TaskStatus.pending:
-                    t.cancel_requested = True
-                    t.status = TaskStatus.cancelled
-                    t.updated_at = now
-                    t.lease_expires_at = None
-                    # [Fork/Merge 2026-05-12] 单任务取消可能直接终结入口分支。
-                    # 原因：pending 分支不会再进入完成路由。做法：在记录取消事件前 finalize。
-                    # 目的：保证显式 task cancel 与自然完成一样回收 branch。
-                    self._finalize_branch_task_locked(t, merge=True)
-                    self._event_task_snapshot("task_cancelled", t)
+            # 父在子前：子任务结算时父已是终态，不会被先唤醒再取消
+            for target in (task, *self._live_descendants_locked(tid)):
+                if self._cancel_task_locked(target, now) is not CancelEffect.none:
                     count += 1
-                elif t.status == TaskStatus.suspended:
-                    t.cancel_requested = True
-                    t.status = TaskStatus.cancelled
-                    t.waiting_for_task_id = None
-                    t.updated_at = now
-                    self._finalize_branch_task_locked(t, merge=True)
-                    self._event_task_snapshot("task_cancelled", t)
-                    count += 1
-                elif t.status == TaskStatus.running:
-                    if t.cancel_requested:
-                        # 已标记取消但 worker 未响应；如果 lease 已过期或从未获得 lease，直接终结
-                        # fix: lease_expires_at 为 None 时也视为 worker 已死，避免永久僵尸
-                        if not t.lease_expires_at or t.lease_expires_at < now:
-                            t.status = TaskStatus.cancelled
-                            t.lease_expires_at = None
-                            t.updated_at = now
-                            self._finalize_branch_task_locked(t, merge=True)
-                            self._event_task_snapshot("task_cancelled", t)
-                            count += 1
-                    else:
-                        t.cancel_requested = True
-                        t.updated_at = now
-                        # 如果 lease 已过期或从未获得 lease，worker 大概率已死，直接终结
-                        # fix: lease_expires_at 为 None 时同样强制终结，防止无 lease 任务成为永久僵尸
-                        if not t.lease_expires_at or t.lease_expires_at < now:
-                            t.status = TaskStatus.cancelled
-                            t.lease_expires_at = None
-                            self._finalize_branch_task_locked(t, merge=True)
-                            self._event_task_snapshot("task_cancelled", t)
-                        else:
-                            self._event_task_snapshot("task_cancel_requested", t)
-                        count += 1
-                if t.status == TaskStatus.cancelled and t.caller_task_id and t.caller_task_id not in to_cancel:
-                    caller = self.tasks.get(t.caller_task_id)
-                    route_session_id = self._route_session_id_for_task_locked(caller) if caller else ""
-                    current_generation = self._current_session_generation_locked(route_session_id) if caller else 0
-                    if (
-                        caller is not None
-                        and caller.status == TaskStatus.suspended
-                        and not caller.cancel_requested
-                        and route_session_id not in self._cancelled_sessions
-                        and (not current_generation or caller.session_generation == current_generation)
-                    ):
-                        caller.status = TaskStatus.pending
-                        caller.waiting_for_task_id = None
-                        caller.worker_id = None
-                        caller.lease_expires_at = None
-                        caller.updated_at = now
-                        caller.input["resume_data"] = {
-                            "type": "child_cancelled",
-                            "child_task_id": t.task_id,
-                            "child_node_id": str(t.node_id or t.tool_name or ""),
-                            "error": "child task cancelled",
-                        }
-                        self._event_task_snapshot("task_resumed", caller)
             return {"ok": True, "cancelled_count": count}
 
     # ---- orphaned task cleanup ----
@@ -849,17 +976,9 @@ class TaskStoreMixin:
         with self._lock:
             now = _now()
             count = 0
-            for task in self.tasks.values():
-                if self._task_terminal(task):
-                    continue
-                task.cancel_requested = True
-                task.status = TaskStatus.cancelled
-                task.updated_at = now
-                task.lease_expires_at = None
-                if task.waiting_for_task_id:
-                    task.waiting_for_task_id = None
-                self._event_task_snapshot("task_cancelled", task)
-                count += 1
+            for task in list(self.tasks.values()):
+                if self._cancel_task_locked(task, now, force=True, reason="引擎重启，任务已终止") is not CancelEffect.none:
+                    count += 1
             return count
 
     # ---- preempt ----
@@ -975,27 +1094,35 @@ class TaskStoreMixin:
             task.input["task_context"] = task_context
         return task_context
 
-    def renew_lease(self, task_id: str, worker_id: str, lease_sec: float = 120.0) -> bool:
-        """续租 task 的 lease，延长 lease_expires_at。仅 status=running 且 worker_id 匹配时生效。"""
+    def _task_cancel_pending_locked(self, task: Task) -> bool:
+        current_gen = self._current_session_generation_locked(task.session_id)
+        return bool(task.cancel_requested or (current_gen and task.session_generation != current_gen))
+
+    def renew_lease(
+        self, task_id: str, worker_id: str, lease_sec: float = 120.0, *, claim_id: str | None = None,
+    ) -> LeaseRenewal:
+        """续租。ok=False 时 worker 必须停下这个任务：它已被回收、取消，或已经交给了别的领取。"""
         tid = (task_id or "").strip()
         wid = (worker_id or "").strip()
-        if not tid or not wid:
-            return False
+        claim = (claim_id or "").strip()
         with self._lock:
-            task = self.tasks.get(tid)
-            if task is None or task.status != TaskStatus.running:
-                return False
-            if task.worker_id != wid:
-                return False
-            lease_val = max(10.0, min(lease_sec, 600.0))
-            task.lease_expires_at = _now() + timedelta(seconds=lease_val)
-            # [AutoC 2026-06-03] Why: during tool execution no stream_delta events
-            # are emitted, so updated_at goes stale even though the worker is alive.
-            # How: piggyback on the 60s heartbeat to refresh updated_at.
-            # Purpose: tool-execution phases are implicitly exempt from the stale
-            # reaper while still catching truly dead workers (no heartbeat = crash).
-            task.updated_at = _now()
-            return True
+            task = self.tasks.get(tid) if tid else None
+            if task is None:
+                return LeaseRenewal(False, "not_found")
+            if task.status != TaskStatus.running:
+                return LeaseRenewal(False, "not_running")
+            if claim:
+                if claim != task.claim_id:
+                    return LeaseRenewal(False, "stale_claim")
+            elif not wid or task.worker_id != wid:
+                return LeaseRenewal(False, "stale_claim")
+            if self._task_cancel_pending_locked(task):
+                return LeaseRenewal(False, "cancelled")
+            now = _now()
+            task.lease_expires_at = now + timedelta(seconds=max(10.0, min(lease_sec, 600.0)))
+            # 工具执行期间没有流式事件刷新 updated_at，靠心跳顺带刷新，回收线程才分得清活着的 worker
+            task.updated_at = now
+            return LeaseRenewal(True)
 
     # ---- task 队列（公开方法） ----
 
@@ -1006,80 +1133,87 @@ class TaskStoreMixin:
         with self._lock:
             now = _now()
             lease_val = max(10.0, min(lease_sec, 600.0))
-            for tid in self._task_order:
+            for tid in list(self._task_order):
                 task = self.tasks.get(tid)
                 if task is None or task.status != TaskStatus.pending:
                     continue
 
-                current_gen = self._current_session_generation_locked(task.session_id)
-                if task.cancel_requested or (current_gen and task.session_generation != current_gen):
-                    task.cancel_requested = True
-                    task.status = TaskStatus.cancelled
-                    task.updated_at = now
-                    task.lease_expires_at = None
-                    self._event_task_snapshot("task_cancelled", task)
+                if self._task_cancel_pending_locked(task):
+                    self._cancel_task_locked(task, now)
                     continue
 
                 if task.lease_expires_at and task.lease_expires_at > now:
                     continue
 
                 if task.worker_id and task.worker_id != wid:
-                    if task.lease_expires_at and task.lease_expires_at > now:
-                        continue
                     # lease expired – 重新排队
-                    task.status = TaskStatus.pending
                     task.worker_id = None
                     task.lease_expires_at = None
                     self._event_task_snapshot("task_requeued", task)
 
                 task.status = TaskStatus.running
                 task.worker_id = wid
+                task.claim_id = uuid.uuid4().hex
+                task.claimed_at = now
                 task.updated_at = now
                 task.lease_expires_at = now + timedelta(seconds=lease_val)
                 self._event_task_snapshot("task_started", task)
                 return task.model_dump(mode="json")
             return None
 
-    def complete_task(self, *, task_id: str, worker_id: str, result: dict[str, Any]) -> Task | None:
+    def _completion_outcome_locked(self, task: Task, *, worker_id: str, claim_id: str) -> CompletionOutcome:
+        if claim_id:
+            if task.status == TaskStatus.running and claim_id == task.claim_id:
+                return CompletionOutcome.accepted
+            if claim_id == task.completed_claim_id:
+                return CompletionOutcome.duplicate
+            return CompletionOutcome.stale
+        # 没带领取代次的旧 worker：保留原来的 worker / 租约校验，但只有 running 才接受回报
+        if task.status != TaskStatus.running:
+            return CompletionOutcome.stale
+        if task.worker_id and task.worker_id != worker_id and task.lease_expires_at and task.lease_expires_at > _now():
+            return CompletionOutcome.stale
+        return CompletionOutcome.accepted
+
+    def complete_task(
+        self, *, task_id: str, worker_id: str, result: dict[str, Any], claim_id: str | None = None,
+    ) -> TaskCompletion | None:
+        """受理 worker 的完成回报；任务不存在时返回 None。
+
+        只有当前领取的回报会改状态，同一领取的重发原样应答，旧领取一律作废。终态但
+        路由没跑完的任务，任何一次回报都会把那次路由重新推一遍（按 delivery_id 幂等）。
+        """
         tid = (task_id or "").strip()
         wid = (worker_id or "").strip()
+        claim = (claim_id or "").strip()
         if not tid or not wid:
             return None
         should_route = False
-        finalize_only = False
-        reset_cleanup = False
+        cancelled_while_running = False
         with self._lock:
             task = self.tasks.get(tid)
             if task is None:
                 return None
-            if task.input.get("_session_reset"):
-                reset_cleanup = True
-            elif self._task_terminal(task):
-                should_route = task.route_status != RouteStatus.routed
-                if not should_route:
-                    logger.info(
-                        "task completion already routed; skipping duplicate route",
-                        extra=self._task_route_log_extra_locked(task, event="task_route_skipped"),
-                    )
-            else:
-                if task.worker_id and task.worker_id != wid and task.lease_expires_at and task.lease_expires_at > _now():
-                    return None
-                current_gen = self._current_session_generation_locked(task.session_id)
-                if task.cancel_requested or (current_gen and task.session_generation != current_gen):
+            reset_cleanup = bool(task.input.get("_session_reset"))
+            outcome = self._completion_outcome_locked(task, worker_id=wid, claim_id=claim)
+            if reset_cleanup:
+                pass
+            elif outcome is CompletionOutcome.accepted:
+                now = _now()
+                task.completed_claim_id = task.claim_id
+                task.result = dict(result or {})
+                task.updated_at = now
+                task.lease_expires_at = None
+                if self._task_cancel_pending_locked(task):
                     task.cancel_requested = True
                     task.status = TaskStatus.cancelled
-                    task.updated_at = _now()
-                    task.lease_expires_at = None
-                    task.result = dict(result or {})
                     task.route_status = RouteStatus.routed
-                    task.routed_at = task.updated_at
+                    task.routed_at = now
                     task.route_error = ""
                     self._event_task_snapshot("task_cancelled", task, component="engine")
-                    finalize_only = True
+                    self._settle_cancelled_task_locked(task, finalize_branch=False)
+                    cancelled_while_running = True
                 else:
-                    task.result = dict(result or {})
-                    task.updated_at = _now()
-                    task.lease_expires_at = None
                     act = str(task.result.get("action") or "").strip()
                     if act == "cancelled":
                         task.status = TaskStatus.cancelled
@@ -1090,6 +1224,18 @@ class TaskStoreMixin:
                     self._reset_task_route_state_locked(task)
                     self._event_task_snapshot("task_completed", task, component="engine")
                     should_route = True
+            elif self._task_terminal(task):
+                should_route = task.route_status != RouteStatus.routed
+                if not should_route:
+                    logger.info(
+                        "task completion already routed; skipping duplicate route",
+                        extra=self._task_route_log_extra_locked(task, event="task_route_skipped"),
+                    )
+            elif outcome is CompletionOutcome.stale:
+                logger.info(
+                    "stale task completion ignored: task=%s status=%s claim=%s current=%s",
+                    task.task_id[:12], task.status.value, claim[:12], (task.claim_id or "")[:12],
+                )
 
         if reset_cleanup:
             session_ids = {
@@ -1100,11 +1246,11 @@ class TaskStoreMixin:
             for session_id in session_ids - {""}:
                 with self._branch_parent_write_lock(session_id):
                     self.purge_session_files(session_id)
-        elif finalize_only:
-            self._finalize_branch_task(task, merge=True)
+        elif cancelled_while_running:
+            self._finish_cancelled_task(task)
         elif should_route:
             self._route_completed_task(task)
         execution = getattr(self, "execution", None)
         if execution is not None:
             execution.on_task_completed(task)
-        return task
+        return TaskCompletion(task, outcome)

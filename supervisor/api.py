@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import threading
@@ -17,6 +18,7 @@ from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFi
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import ValidationError
+from starlette.concurrency import run_in_threadpool
 
 import config_layout
 from clonoth_runtime import load_workspace_env
@@ -33,6 +35,7 @@ from .process_manager import ProcessManager
 from .reply_intent import IntentResult, build_instruction as reply_intent_instruction
 from .state import SupervisorState
 from .task_reaper import reap_stuck_tasks_locked
+from .task_store import CompletionOutcome
 from .types import (
     AdminStateOut,
     AppConfigPublic,
@@ -71,6 +74,8 @@ from .types import (
     Task,
     TaskCompleteIn,
     TaskKind,
+    TaskLeaseRenewIn,
+    TaskOriginOut,
     TaskStatus,
 )
 
@@ -178,6 +183,17 @@ _WS_MAX_EVENT_BYTES = 65_536  # 64 KiB soft cap for individual WS events
 _OUTBOUND_REPLAY_PAGE_SIZE = 200
 _OUTBOUND_REPLAY_SCAN_SIZE = 5000
 _OUTBOUND_EVENT_TYPES = frozenset({"outbound_message", "intermediate_reply"})
+
+# 附件是不可信内容：不许浏览器嗅探成别的类型，直接打开时关进没有脚本的沙箱
+_FILE_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "sandbox",
+}
+
+
+def _renders_inline(media_type: str) -> bool:
+    # SVG 里能写脚本，按普通附件下载
+    return media_type.startswith("image/") and media_type != "image/svg+xml"
 
 
 def _outbound_replay_page(eventlog: Any, after_seq: int, until_seq: int) -> tuple[list[dict[str, Any]], int]:
@@ -559,20 +575,33 @@ def create_app(
         }
 
     @app.get("/v1/files/{rel:path}")
-    async def read_attachment(rel: str, request: Request) -> FileResponse:
+    def read_attachment(rel: str, request: Request) -> FileResponse:
         """按工作区相对路径取附件。
 
         只开放 data/attachments 子树。token 走 query 也认（见 verify_admin_token）——
         img 标签带不了 Authorization 头。
         """
-        verify_admin_token(request)
+        try:
+            verify_admin_token(request)
+        except HTTPException as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail,
+                headers={**(exc.headers or {}), **_FILE_SECURITY_HEADERS},
+            ) from exc
         st: SupervisorState = app.state.state
         root = (st.workspace_root / "data" / "attachments").resolve()
         target = (st.workspace_root / rel).resolve()
         # resolve 之后再比：'..'、绝对路径和符号链接都会在这一步现形。
         if root not in target.parents or not target.is_file():
-            raise HTTPException(status_code=404, detail="Not found")
-        return FileResponse(target)
+            raise HTTPException(status_code=404, detail="Not found", headers=dict(_FILE_SECURITY_HEADERS))
+        media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        if _renders_inline(media_type):
+            return FileResponse(target, media_type=media_type, headers=dict(_FILE_SECURITY_HEADERS))
+        # 附件是群友和模型上传的任意内容：浏览器直接打开 HTML/SVG 就是同源脚本，一律按下载给
+        return FileResponse(
+            target, media_type=media_type, headers=dict(_FILE_SECURITY_HEADERS),
+            filename=target.name, content_disposition_type="attachment",
+        )
 
     @app.post("/v1/inbound", response_model=InboundMessageOut)
     async def inbound(msg: InboundMessageIn, request: Request) -> InboundMessageOut:
@@ -598,8 +627,9 @@ def create_app(
         inbound_seq = int(evt.get("seq", 0) or 0)
         return InboundMessageOut(session_id=session_id, inbound_seq=inbound_seq, accepted=True)
 
+    # 下面这批端点都要拿全局锁，完成还会在锁里路由；写成普通 def 交给线程池，免得卡住事件循环
     @app.get("/v1/tasks/next", response_model=Task)
-    async def task_next(
+    def task_next(
         worker_id: str = Query(..., min_length=1),
         lease_sec: float = Query(120.0, ge=1.0, le=3600.0),
     ) -> Task:
@@ -611,17 +641,41 @@ def create_app(
         return Task.model_validate(item)
 
     @app.post("/v1/tasks/{task_id}/complete")
-    async def task_complete(task_id: str, body: TaskCompleteIn) -> dict[str, Any]:
+    def task_complete(task_id: str, body: TaskCompleteIn) -> dict[str, Any]:
         st: SupervisorState = app.state.state
-        task = st.complete_task(task_id=task_id, worker_id=body.worker_id, result=dict(body.result or {}))
-        if task is None:
+        completion = st.complete_task(
+            task_id=task_id, worker_id=body.worker_id, result=dict(body.result or {}), claim_id=body.claim_id,
+        )
+        if completion is None:
             raise HTTPException(status_code=404, detail="task not found")
-        return {"ok": True, "task_id": task.task_id, "status": task.status.value}
+        if completion.outcome is CompletionOutcome.stale:
+            raise HTTPException(status_code=409, detail="stale_claim")
+        payload: dict[str, Any] = {
+            "ok": True, "task_id": completion.task.task_id, "status": completion.task.status.value,
+        }
+        if completion.outcome is CompletionOutcome.duplicate:
+            payload["duplicate"] = True
+        return payload
 
     @app.get("/v1/tasks/{task_id}/cancelled")
-    async def task_cancelled(task_id: str) -> dict[str, Any]:
+    def task_cancelled(task_id: str, claim_id: str | None = Query(None)) -> dict[str, Any]:
         st: SupervisorState = app.state.state
-        return {"cancelled": st.is_task_cancelled(task_id)}
+        return {"cancelled": st.is_task_cancelled(task_id, claim_id=claim_id)}
+
+    @app.get("/v1/tasks/{task_id}/origin", response_model=TaskOriginOut)
+    def task_origin(task_id: str, request: Request) -> TaskOriginOut:
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        origin = st.task_origin(task_id)
+        if origin is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        return TaskOriginOut(
+            task_id=origin.task_id,
+            origin_task_id=origin.origin_task_id,
+            conversation_key=origin.conversation_key,
+            channel=origin.channel,
+            platform_auth=origin.platform_auth,
+        )
 
     @app.post("/v1/tasks/{task_id}/preempt")
     async def task_preempt(task_id: str, request: Request) -> dict[str, Any]:
@@ -655,13 +709,13 @@ def create_app(
             kwargs["memory_hints"] = memory_hints
         if output_guide is not None:
             kwargs["output_guide"] = output_guide
-        ok = st.preempt_task(task_id, **kwargs)
+        ok = await run_in_threadpool(st.preempt_task, task_id, **kwargs)
         if not ok:
             raise HTTPException(status_code=404, detail="task not found or not active")
         return {"ok": True, "task_id": task_id}
 
     @app.get("/v1/tasks/{task_id}/preempted")
-    async def task_preempted(task_id: str) -> dict[str, Any]:
+    def task_preempted(task_id: str) -> dict[str, Any]:
         """Engine 查询：task 是否被请求 preempt。"""
         st: SupervisorState = app.state.state
         return st.is_task_preempted(task_id)
@@ -680,10 +734,10 @@ def create_app(
         if revision is not None and (type(revision) is not int or revision < 0):
             raise HTTPException(status_code=422, detail="revision must be a non-negative integer")
         st: SupervisorState = app.state.state
-        result = (
-            st.consume_preempt_message(task_id, expected_revision=revision)
-            if revision is not None else st.consume_preempt_message(task_id)
-        )
+        if revision is not None:
+            result = await run_in_threadpool(st.consume_preempt_message, task_id, expected_revision=revision)
+        else:
+            result = await run_in_threadpool(st.consume_preempt_message, task_id)
         return {"ok": True, **result}
 
     @app.post("/v1/sessions/{session_id}/async_tool_result")
@@ -702,7 +756,8 @@ def create_app(
         st: SupervisorState = app.state.state
         if session_id not in st.sessions:
             raise HTTPException(status_code=404, detail="session not found")
-        result = st.inject_async_result(
+        result = await run_in_threadpool(
+            st.inject_async_result,
             session_id,
             text=msg,
             attachments=atts,
@@ -717,7 +772,7 @@ def create_app(
         return result
 
     @app.get("/v1/sessions/{session_id}/running_tasks")
-    async def session_running_tasks(session_id: str) -> dict[str, Any]:
+    def session_running_tasks(session_id: str) -> dict[str, Any]:
         """Bot 查询当前 session（含入口分支）中 running/pending 状态的 task 列表。
 
         列之前先按后台回收线程的同一套规则收掉卡死的 running 任务，适配器据此决定抢占还是排队，
@@ -763,7 +818,7 @@ def create_app(
     # 怎么改：新增端点，遍历所有活跃 task，按 node_id 匹配返回第一个。
     # 目的：支持 preempt_task 跨 session 查找持久节点任务。
     @app.get("/v1/tasks/active-by-node/{node_id}")
-    async def global_task_by_node(node_id: str) -> dict[str, Any]:
+    def global_task_by_node(node_id: str) -> dict[str, Any]:
         """[2026-05-28] 全局查找指定 node_id 的活跃任务（running/pending）。
 
         遍历所有任务，不限定 session。用于跨 session 定位持久节点任务。
@@ -787,7 +842,7 @@ def create_app(
     # 怎么改：新增端点，遍历 session 内所有活跃 task，按 node_id 匹配返回第一个。
     # 目的：允许 engine 侧用 node_id（如 "bob"）定位子节点任务再执行 preempt。
     @app.get("/v1/sessions/{session_id}/tasks/by-node/{node_id}")
-    async def session_task_by_node(session_id: str, node_id: str) -> dict[str, Any]:
+    def session_task_by_node(session_id: str, node_id: str) -> dict[str, Any]:
         """按 node_id 查找 session 中活跃（running/pending）的 task。"""
         st: SupervisorState = app.state.state
         if session_id not in st.sessions:
@@ -806,12 +861,10 @@ def create_app(
         raise HTTPException(status_code=404, detail=f"no active task for node '{node_id}'")
 
     @app.post("/v1/tasks/{task_id}/renew_lease")
-    async def renew_lease(task_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    def renew_lease(task_id: str, body: TaskLeaseRenewIn) -> dict[str, Any]:
         st: SupervisorState = app.state.state
-        worker_id = str(body.get("worker_id") or "").strip()
-        lease_sec = float(body.get("lease_sec", 120.0))
-        ok = st.renew_lease(task_id, worker_id, lease_sec)
-        return {"ok": ok}
+        renewal = st.renew_lease(task_id, body.worker_id.strip(), body.lease_sec, claim_id=body.claim_id)
+        return {"ok": renewal.ok, "reason": renewal.reason}
 
     @app.post("/v1/engine/register")
     async def engine_register(body: dict[str, Any]) -> dict[str, Any]:
@@ -1210,14 +1263,17 @@ def create_app(
         return {"ok": True}
 
     @app.get("/v1/sessions")
-    async def list_sessions(
+    def list_sessions(
         channel: str = Query("", description="Filter by channel (e.g. 'web')"),
         limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0),
     ) -> list[dict[str, Any]]:
         """List sessions, optionally filtered by channel."""
         st: SupervisorState = app.state.state
+        with st._lock:
+            sessions = list(st.sessions.values())
         results = []
-        for sid, si in st.sessions.items():
+        for si in sessions:
             if channel and si.channel != channel:
                 continue
             results.append({
@@ -1229,7 +1285,7 @@ def create_app(
             })
         # Sort by updated_at desc, most recent first
         results.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
-        return results[:limit]
+        return results[offset:offset + limit]
 
     @app.post("/v1/sessions/get_or_create")
     async def get_or_create_session(
@@ -1249,7 +1305,7 @@ def create_app(
         return {"session_id": session_id, "conversation_key": conv_key}
 
     @app.delete("/v1/sessions/{session_id}")
-    async def delete_session(session_id: str) -> dict[str, Any]:
+    def delete_session(session_id: str) -> dict[str, Any]:
         """Delete a session and its conversation store."""
         st: SupervisorState = app.state.state
         result = st.reset_session(session_id=session_id)
@@ -1269,14 +1325,17 @@ def create_app(
         return st.session_messages(session_id=session_id, limit=limit)
 
     @app.get("/v1/sessions/{session_id}/history")
-    async def session_history(
+    def session_history(
         session_id: str,
         limit: int = Query(200, ge=0, le=1000),
         task_id: str = Query("", description="Filter messages by source_task_id"),
+        before: int | None = Query(None, description="Only records whose cursor is below this value"),
     ) -> list[dict[str, Any]]:
         """Structured message history from ConversationStore (for web frontend)."""
         st: SupervisorState = app.state.state
-        return st.session_history_structured(session_id=session_id, limit=limit, task_id=task_id.strip() or None)
+        return st.session_history_structured(
+            session_id=session_id, limit=limit, task_id=task_id.strip() or None, before=before,
+        )
 
     @app.get("/v1/sessions/{session_id}/children")
     async def session_children(session_id: str) -> list[dict[str, Any]]:
@@ -1289,7 +1348,7 @@ def create_app(
         return st.session_children(session_id=session_id)
 
     @app.post("/v1/sessions/{session_id}/cancel")
-    async def session_cancel(session_id: str) -> dict[str, Any]:
+    def session_cancel(session_id: str) -> dict[str, Any]:
         st: SupervisorState = app.state.state
         ok = st.cancel_session(session_id)
         if not ok:
@@ -1332,7 +1391,7 @@ def create_app(
         return result
 
     @app.post("/v1/conversations/reset")
-    async def conversation_reset(body: dict[str, Any]) -> dict[str, Any]:
+    def conversation_reset(body: dict[str, Any]) -> dict[str, Any]:
         """Reset a conversation, forcing next message to create a new session."""
         st: SupervisorState = app.state.state
         conv_key = str(body.get("conversation_key") or "").strip()
@@ -1402,7 +1461,7 @@ def create_app(
         }
 
     @app.post("/v1/admin/conversations/{session_id}/reset")
-    async def admin_conversation_reset(session_id: str, request: Request) -> dict[str, Any]:
+    def admin_conversation_reset(session_id: str, request: Request) -> dict[str, Any]:
         """按 session 重置。走和 /clear 同一条路，adapter 侧的群历史缓存才会跟着清。"""
         verify_admin_token(request)
         st: SupervisorState = app.state.state
@@ -1415,7 +1474,7 @@ def create_app(
         return _reset_conversation(st, conv_key)
 
     @app.post("/v1/tasks/{task_id}/cancel")
-    async def task_cancel(task_id: str) -> dict[str, Any]:
+    def task_cancel(task_id: str) -> dict[str, Any]:
         """取消单个 task 及其所有子任务链。"""
         st: SupervisorState = app.state.state
         result = st.cancel_single_task(task_id)
@@ -1424,7 +1483,7 @@ def create_app(
         return result
 
     @app.post("/v1/sessions/{session_id}/cancel_active_tasks")
-    async def session_cancel_active_tasks(
+    def session_cancel_active_tasks(
         session_id: str,
         exclude_task_id: str = Query(""),
         # [2026-05-28] 可选 node_id 过滤：只取消指定节点的活跃任务。
@@ -1557,7 +1616,7 @@ def create_app(
         return a
 
     @app.post("/v1/ops/request", response_model=OpRequestOut)
-    async def ops_request(inp: OpRequestIn, request: Request) -> OpRequestOut:
+    def ops_request(inp: OpRequestIn, request: Request) -> OpRequestOut:
         st: SupervisorState = app.state.state
         _audit_ops_caller(st, request, inp)
         # [AutoC 2026-05-31] Why: ops/request is the policy path used by tools.
@@ -2106,10 +2165,15 @@ def create_app(
             not isinstance(task_id, str) or not task_id.strip() or len(task_id) > 256 for task_id in task_ids
         ):
             raise HTTPException(status_code=400, detail="task_ids must contain valid task identifiers")
-        with st._lock:
-            if not st.anchor_session_for_locked(target):
-                raise HTTPException(status_code=404, detail="session not found")
-            return st._apply_snip_via_conv_store_locked(target, set(task_ids))
+
+        def snip() -> dict[str, Any]:
+            with st._lock:
+                if not st.anchor_session_for_locked(target):
+                    raise HTTPException(status_code=404, detail="session not found")
+            # 整份读写会话历史和分支，不能占着全局锁
+            return st._apply_snip_via_conv_store(target, set(task_ids))
+
+        return await run_in_threadpool(snip)
 
     @app.post("/v1/tasks/compact-async")
     async def compact_async(request: Request) -> dict[str, Any]:
@@ -2133,14 +2197,17 @@ def create_app(
             except (TypeError, ValueError):
                 return default
 
-        with st._lock:
-            # 连续失败后进冷却：压缩模型持续不可用时，engine 每一步都会再请求一次，
-            # 每次都要起一个 compactor task。engine 已经会把 reason 当成「跳过」处理。
+        sizing = {
+            "_compact_keep_recent": _int_field("keep_recent", 6),
+            "_compact_keep_recent_tokens": _int_field("keep_recent_tokens"),
+            "_compact_threshold_tokens": _int_field("threshold_tokens"),
+        }
+
+        def refusal_locked() -> dict[str, Any] | None:
+            # 熔断冷却中不再起 compactor：压缩模型持续不可用时 engine 每一步都会再请求一次
             if st.compact_breaker.is_open(target_session_id):
                 return {"ok": True, "task_id": "", "reason": "compact breaker open"}
-
-            # 同一个会话只允许一个后台压缩在飞：并发两个压缩会各自基于同一份历史
-            # 算出摘要，后落盘的那个把前一个的结果整段覆盖掉。
+            # 同一会话只许一个后台压缩在飞：两个摘要基于同一份历史，后落盘的会整段覆盖前一个
             for existing in st.tasks.values():
                 if existing.status in (TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled):
                     continue
@@ -2148,48 +2215,59 @@ def create_app(
                     continue
                 if str(existing.input.get("_compact_target_session_id") or "") == target_session_id:
                     return {"ok": True, "task_id": "", "reason": "compact already running"}
+            return None
 
-            # 要压的可能是 child session，而 child 从不进 st.sessions；不换成 anchor 就
-            # 直接 404，等于 bootstrap.executor / draw.* / persistent 节点全部只有硬阈值。
+        def anchor_locked() -> str:
+            # 要压的可能是从不进 st.sessions 的 child session，得换成它挂靠的会话
             anchor_session_id = st.anchor_session_for_locked(target_session_id)
             if not anchor_session_id:
                 raise HTTPException(status_code=404, detail="session not found")
-            sizing = {
-                "_compact_keep_recent": _int_field("keep_recent", 6),
-                "_compact_keep_recent_tokens": _int_field("keep_recent_tokens"),
-                "_compact_threshold_tokens": _int_field("threshold_tokens"),
-            }
-            plan, instruction = st._prepare_compact_input_locked(target_session_id, sizing)
+            return anchor_session_id
+
+        def start() -> dict[str, Any]:
+            with st._lock:
+                refused = refusal_locked()
+                if refused is not None:
+                    return refused
+                anchor_locked()
+            # 算覆盖计划要整份读会话历史，放在锁外
+            plan, compactor_instruction = st._prepare_compact_input(target_session_id, sizing)
             if not plan:
                 return {"ok": True, "task_id": "", "reason": "no complete history segments to compact"}
-            generation = st._current_session_generation_locked(anchor_session_id) or 1
-            child_sid, _is_new = st.get_or_create_child_session(
-                anchor_session_id, node_id, f"compact:{target_session_id}", "fresh",
-            )
-            task = st._create_task_locked(
-                session_id=anchor_session_id,
-                session_generation=generation,
-                kind=TaskKind.node,
-                node_id=node_id,
-                input_data={
-                    "instruction": instruction,
-                    "context_mode": "fresh",
-                    "child_session_id": child_sid,
-                    "use_context": False,
-                    "_system_task": True,
-                    "_compact_async": True,
-                    "_compact_plan": plan,
-                    "_compact_target_session_id": target_session_id,
-                    "_compact_keep_recent": _int_field("keep_recent", 6),
-                    "_compact_keep_recent_tokens": _int_field("keep_recent_tokens"),
-                    "_compact_threshold_tokens": _int_field("threshold_tokens"),
-                    "_caller_node_id": str(body.get("caller_node_id") or "").strip(),
-                },
-                continuation={},
-                source_inbound_seq=None,
-                caller_task_id=None,
-            )
-        return {"ok": True, "task_id": task.task_id}
+            with st._lock:
+                # 锁外算计划的这段时间里别的请求可能已经起了压缩，提交前再判一次
+                refused = refusal_locked()
+                if refused is not None:
+                    return refused
+                anchor_session_id = anchor_locked()
+                generation = st._current_session_generation_locked(anchor_session_id) or 1
+                child_sid, _is_new = st.get_or_create_child_session(
+                    anchor_session_id, node_id, f"compact:{target_session_id}", "fresh",
+                )
+                task = st._create_task_locked(
+                    session_id=anchor_session_id,
+                    session_generation=generation,
+                    kind=TaskKind.node,
+                    node_id=node_id,
+                    input_data={
+                        "instruction": compactor_instruction,
+                        "context_mode": "fresh",
+                        "child_session_id": child_sid,
+                        "use_context": False,
+                        "_system_task": True,
+                        "_compact_async": True,
+                        "_compact_plan": plan,
+                        "_compact_target_session_id": target_session_id,
+                        **sizing,
+                        "_caller_node_id": str(body.get("caller_node_id") or "").strip(),
+                    },
+                    continuation={},
+                    source_inbound_seq=None,
+                    caller_task_id=None,
+                )
+            return {"ok": True, "task_id": task.task_id}
+
+        return await run_in_threadpool(start)
 
     admin_router = create_admin_router(workspace_root=state.workspace_root)
     app.include_router(admin_router, prefix="/v1/admin/config")

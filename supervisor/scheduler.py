@@ -46,6 +46,8 @@ _SCRIPT_TIMEOUT_MAX_SEC = 3600.0
 # 杀掉之后最多再等这么久收管道：自己另开会话逃出进程组的孙进程会一直攥着它。
 _SCRIPT_REAP_GRACE_SEC = 5.0
 _TICK_OFFSET_SEC = 1.0
+# 内存里保留的已了结任务数；还在被活任务引用的不算在内
+_KEEP_FINISHED_TASKS = 200
 
 
 def _creator_fields(schedule: dict) -> dict[str, str]:
@@ -489,21 +491,10 @@ class SchedulerThread:
             if count > 0:
                 log.info(f"[scheduler] cleaned up {count} old context snapshots")
 
-            # 在锁内清理内存中已终结的旧 task（保留最近 200 个）
             with self._state._lock:
-                terminal = {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}
-                finished_ids = [
-                    tid for tid in self._state._task_order
-                    if tid in self._state.tasks and self._state.tasks[tid].status in terminal
-                ]
-                if len(finished_ids) > 200:
-                    to_remove = finished_ids[:-200]
-                    for tid in to_remove:
-                        self._state.tasks.pop(tid, None)
-                    self._state._task_order = [
-                        tid for tid in self._state._task_order if tid in self._state.tasks
-                    ]
-                    log.info(f"[scheduler] pruned {len(to_remove)} old tasks from memory")
+                pruned = self._state._prune_finished_tasks_locked(_KEEP_FINISHED_TASKS)
+            if pruned:
+                log.info("[scheduler] pruned %d old tasks from memory", pruned)
         except Exception as e:
             log.warning(f"[scheduler] cleanup error: {e}")
 

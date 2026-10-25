@@ -358,21 +358,13 @@ class SessionMixin:
             # Purpose: 防止临时 child 记录随 branch 清理后继续堆积。
             self._session_store.remove_session(child_sid)
 
-        # [Fork/Merge 2026-05-12] 删除 branch 前取消仍挂在该运行 session 下的派生任务。
-        # 原因：异步 dispatch 可能让 root entry 已结束但 branch 下仍有 pending/running 子任务。
-        # 做法：把这些任务标记为 cancelled 并写快照，不递归 finalize。目的：避免任务继续
-        # 写入已清理的 branch session。
+        # 删除 branch 前取消仍挂在它上面的任务，免得继续写入已清理的会话；分支收束就是这里，不再递归 finalize
         now = _now()
-        for task in self.tasks.values():
-            if task.session_id != branch or self._task_terminal(task):
-                continue
-            task.cancel_requested = True
-            task.status = TaskStatus.cancelled
-            task.updated_at = now
-            task.lease_expires_at = None
-            if task.waiting_for_task_id:
-                task.waiting_for_task_id = None
-            self._event_task_snapshot("task_cancelled", task)
+        for task in list(self.tasks.values()):
+            if task.session_id == branch:
+                self._cancel_task_locked(
+                    task, now, force=True, finalize_branch=False, reason="所在分支已清理",
+                )
 
         self.purge_session_files(branch)
         self.sessions.pop(branch, None)
@@ -554,15 +546,18 @@ class SessionMixin:
         with self._lock:
             self._cancelled_sessions.discard(session_id)
 
-    def is_task_cancelled(self, task_id: str) -> bool:
+    def is_task_cancelled(self, task_id: str, claim_id: str | None = None) -> bool:
+        """worker 该不该停下这个任务：已取消、已失败（含被回收）、会话已重置、任务不在了，或已交给别的领取。"""
+        claim = (claim_id or "").strip()
         with self._lock:
             task = self.tasks.get((task_id or "").strip())
             if task is None:
                 return True
-            current_gen = self._current_session_generation_locked(task.session_id)
-            if current_gen and task.session_generation != current_gen:
+            if claim and claim != task.claim_id:
                 return True
-            return task.cancel_requested or task.status == TaskStatus.cancelled
+            if task.status in (TaskStatus.cancelled, TaskStatus.failed):
+                return True
+            return self._task_cancel_pending_locked(task)
 
     def record_inbound_message_event(self, evt: dict[str, Any]) -> None:
         if not isinstance(evt, dict) or evt.get("type") != "inbound_message":
@@ -865,6 +860,7 @@ class SessionMixin:
                 task.cancel_requested = True
                 task.status = TaskStatus.cancelled
                 task.waiting_for_task_id = None
+                task.waiting_for_batch_id = None
                 task.lease_expires_at = None
                 task.updated_at = now
                 task.route_status = RouteStatus.routed
@@ -947,13 +943,17 @@ class SessionMixin:
 
     # ---- 结构化历史 (ConversationStore) ----
 
-    def session_history_structured(self, *, session_id: str, limit: int = 200, task_id: str | None = None) -> list[dict[str, Any]]:
+    def session_history_structured(
+        self, *, session_id: str, limit: int = 200, task_id: str | None = None, before: int | None = None,
+    ) -> list[dict[str, Any]]:
         """Read structured messages from ConversationStore for web frontend.
 
         Returns Message objects with thinking, tool_calls, and tool results
         as structured fields rather than flattened text.
 
         If task_id is provided, only messages whose source_task_id matches are returned.
+        Each record carries cursor, its 0-based position in the whole history; before
+        keeps only records with a smaller cursor, so older pages can be fetched.
         """
         from pathlib import Path
         from engine.conversation_store import ConversationStore
@@ -979,17 +979,18 @@ class SessionMixin:
             # Re-sort by created_at to maintain chronological order
             messages.sort(key=lambda m: m.created_at or "")
 
-        # [AutoC 2026-06-04] Why: the active-task modal needs to show only the
-        # messages produced by a single task, not the entire session history.
-        # How: filter by source_task_id when the caller provides a task_id.
-        # Purpose: operators can inspect one task's work without noise from
-        # prior tasks in the same long-lived session.
+        indexed = list(enumerate(messages))
         if task_id:
-            messages = [m for m in messages if getattr(m, 'source_task_id', '') == task_id]
+            indexed = [(cursor, m) for cursor, m in indexed if getattr(m, 'source_task_id', '') == task_id]
+        if before is not None:
+            indexed = [(cursor, m) for cursor, m in indexed if cursor < before]
+        if limit > 0:
+            indexed = indexed[-limit:]
 
         result: list[dict[str, Any]] = []
-        for msg in messages:
+        for cursor, msg in indexed:
             entry: dict[str, Any] = {
+                "cursor": cursor,
                 "id": msg.id,
                 "role": msg.role,
                 "content": msg.content,
@@ -1093,9 +1094,6 @@ class SessionMixin:
             if msg.name:
                 entry["tool_name"] = msg.name
             result.append(entry)
-
-        if limit > 0:
-            result = result[-limit:]
         return result
 
     # ---- 上下文窗口用量 ----

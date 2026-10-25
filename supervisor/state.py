@@ -25,7 +25,7 @@ from .policy import PolicyEngine
 from .session import SessionMixin
 from .session_store import SessionStore, session_registry_path
 from .task_router import TaskRouterMixin
-from .task_store import TaskStoreMixin
+from .task_store import CancelEffect, TaskStoreMixin
 from .types import (
     AdminStateOut,
     Approval,
@@ -37,6 +37,9 @@ from .types import (
     TaskKind,
     TaskStatus,
 )
+
+# 没人定案、由系统按拒绝收掉的审批附言以 auto-denied 结尾，toolbox 的审批超时也是；适配器据此显示成「已失效」。
+ORPHANED_APPROVAL_COMMENT = "task ended before a decision; auto-denied"
 
 
 class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
@@ -1393,6 +1396,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         now = datetime.now(timezone.utc)
         stale_threshold = now - timedelta(hours=24)
         to_remove: list[str] = []
+        purge_files: list[str] = []
 
         for sid, info in self._session_store.items_snapshot():
             if not isinstance(info, dict):
@@ -1403,12 +1407,11 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if info.get("reset"):
                 to_remove.append(sid)
                 continue
-            # [AutoC 2026-05-30] Why: branch session 是入口执行副本，不应长期
-            # 持久化。How: 只要没有非终态 task 仍运行在该 branch，就删除 registry。
-            # Purpose: 清理历史孤儿 branch，同时避免误删仍在执行的 branch。
+            # 分支是入口执行副本：还有任务在用或还没合并回父会话时保留，否则连同文件一起删
             if sid.startswith("branch_"):
-                if not any(t.session_id == sid and not self._task_terminal(t) for t in self.tasks.values()):
+                if not self._session_files_in_use_locked(sid):
                     to_remove.append(sid)
+                    purge_files.append(sid)
                 continue
             # [AutoC 2026-05-30] Why: fresh/fork child session 只用于一次性或
             # 隔离上下文，24h 无活动后应释放；accumulate 是长期上下文，必须保留。
@@ -1419,7 +1422,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 # [AutoC 2026-05-30] 条件从 in ("fresh", "fork") 改为 != "accumulate"，
                 # 因为历史系统节点（turn_summarizer/compactor）创建的 child session
                 # 没有 context_mode 字段（空字符串），旧条件无法匹配，导致堆积。
-                if ctx_mode == "accumulate":
+                if ctx_mode == "accumulate" or self._session_files_in_use_locked(sid):
                     continue
                 # [AutoC 2026-05-30] Why: 没有 context_mode 的历史 child session
                 # 是旧代码遗留，运行时清理对它们无效（旧 task 已消失）。
@@ -1427,6 +1430,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 # Purpose: 一次性清除历史堆积。
                 if not ctx_mode:
                     to_remove.append(sid)
+                    purge_files.append(sid)
                     continue
                 # fresh/fork: 正常 TTL 检查
                 updated_str = str(
@@ -1441,9 +1445,18 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                         updated_at = updated_at.replace(tzinfo=timezone.utc)
                     if updated_at < stale_threshold:
                         to_remove.append(sid)
+                        purge_files.append(sid)
                 except Exception:
                     pass
 
+        if purge_files:
+            # 调用方持着全局锁，删文件放到锁外
+            threading.Thread(
+                target=self._purge_stale_session_files,
+                args=(tuple(purge_files),),
+                daemon=True,
+                name="stale-session-purge",
+            ).start()
         if to_remove:
             self._session_store.remove_sessions(set(to_remove), flush=False)
             for sid in to_remove:
@@ -1461,6 +1474,27 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             self.parent_children = {pid: children for pid, children in self.parent_children.items() if children}
             self._session_store._flush()
             logger.info("stale session cleanup: removed %d sessions from registry", len(to_remove))
+
+    def _session_files_in_use_locked(self, session_id: str) -> bool:
+        """还有任务在这个会话上没结束，或它是还没合并回父会话的入口分支。"""
+        for task in self.tasks.values():
+            task_input = task.input
+            if session_id not in (
+                task.session_id, task_input.get("branch_session_id"), task_input.get("child_session_id"),
+            ):
+                continue
+            if not self._task_terminal(task):
+                return True
+            if task_input.get("branch_session_id") == session_id and not task_input.get("_branch_finalized"):
+                return True
+        return False
+
+    def _purge_stale_session_files(self, session_ids: tuple[str, ...]) -> None:
+        for session_id in session_ids:
+            try:
+                self.purge_session_files(session_id)
+            except Exception:
+                logger.exception("stale session file purge failed: %s", session_id)
 
     # ------------------------------------------------------------------ #
     #  审批
@@ -1544,62 +1578,46 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             a = self.approvals.get(approval_id)
             if a is None or a.status != ApprovalStatus.pending:
                 return a
-            a.status = ApprovalStatus.allowed if decision == "allow" else ApprovalStatus.denied
-            a.decision = decision
-            a.comment = comment
-            a.decided_at = _now()
-            self.eventlog.append(
-                session_id=a.session_id,
-                component="supervisor",
-                type_="approval_decided",
-                payload={
-                    "approval_id": a.approval_id,
-                    "decision": decision,
-                    "comment": comment,
-                    "ts": a.decided_at.isoformat(),
-                    # [AutoC 2026-05-31] Why: approval_decided must find the same
-                    # ToolExecution that approval_requested updated. How: mirror
-                    # the stored execution identity into the decision event. Purpose:
-                    # the frontend does not need a separate lookup endpoint.
-                    "tool_call_id": a.tool_call_id,
-                    "node_id": a.node_id,
-                    "task_id": a.task_id,
-                },
-            )
+            self._decide_approval_locked(a, decision, comment)
             return a
 
-    def _authorizing_origin(self, session_id: str, task_id: str | None) -> tuple[str, str]:
-        """(conversation_key, channel) whose permissions govern this operation.
-
-        dispatch 出去的子任务跑在自己的 `agent:...` 会话里，按运行期 session 判权就等于：
-        任何群成员只要能让 bot 派一个子节点，「外部平台非管理员禁止写文件 / 禁止敏感命令」
-        那几道硬拒就整段跳过。发起会话的 key 由 dispatch 一路透传，嵌套派发也保留最初那个。
-        """
-        channel = ""
-        if task_id:
-            task = self.tasks.get(task_id)
-            if task is not None:
-                raw_ctx = task.input.get("task_context")
-                ctx = raw_ctx if isinstance(raw_ctx, dict) else {}
-                channel = str(ctx.get("channel") or "").strip()
-                routed = str(
-                    ctx.get("route_conversation_key") or ctx.get("parent_conversation_key") or ""
-                ).strip()
-                if routed:
-                    return routed, channel
-                session = self.sessions.get(task.session_id or session_id)
-                if session is not None:
-                    return (
-                        str(getattr(session, "conversation_key", "") or ""),
-                        channel or str(getattr(session, "channel", "") or ""),
-                    )
-        session = self.sessions.get(session_id)
-        if session is None:
-            return "", channel
-        return (
-            str(getattr(session, "conversation_key", "") or ""),
-            channel or str(getattr(session, "channel", "") or ""),
+    def _decide_approval_locked(self, a: Approval, decision: str, comment: str | None) -> None:
+        a.status = ApprovalStatus.allowed if decision == "allow" else ApprovalStatus.denied
+        a.decision = decision
+        a.comment = comment
+        a.decided_at = _now()
+        self.eventlog.append(
+            session_id=a.session_id,
+            component="supervisor",
+            type_="approval_decided",
+            payload={
+                "approval_id": a.approval_id,
+                "decision": decision,
+                "comment": comment,
+                "ts": a.decided_at.isoformat(),
+                # 带上执行身份，前端按它把定案并回 approval_requested 更新过的那张工具卡片
+                "tool_call_id": a.tool_call_id,
+                "node_id": a.node_id,
+                "task_id": a.task_id,
+            },
         )
+
+    def _close_orphaned_approvals_locked(self) -> list[str]:
+        """任务已经结束、或已不在内存里的待审批按拒绝收掉，返回收掉的 id。
+
+        工具等审批时任务被取消或回收，等待循环直接退出，审批就一直挂着待审，适配器重连对账时会把它重新亮给管理员。
+        没有 task_id 的审批判断不了归属，不动。
+        """
+        closed: list[str] = []
+        for approval in list(self.approvals.values()):
+            if approval.status != ApprovalStatus.pending or not approval.task_id:
+                continue
+            task = self.tasks.get(approval.task_id)
+            if task is not None and not self._task_terminal(task):
+                continue
+            self._decide_approval_locked(approval, "deny", ORPHANED_APPROVAL_COMMENT)
+            closed.append(approval.approval_id)
+        return closed
 
     def request_operation(
         self,
@@ -1611,8 +1629,17 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         node_id: str | None = None,
         task_id: str | None = None,
     ) -> OpRequestOut:
-        conv_key, channel = self._authorizing_origin(session_id, task_id)
-        platform_auth = dict(parameters.get("platform_auth") or {}) if isinstance(parameters.get("platform_auth"), dict) else {}
+        with self._lock:
+            task = self.tasks.get(task_id) if task_id else None
+            conv_key, channel = self._authorizing_origin_locked(session_id, task)
+            if task_id:
+                # 带了 task_id 就按任务入站时记下的身份判，调用方自报的 platform_auth 一概不认
+                platform_auth = self._platform_auth_origin_locked(task)[1] if task is not None else {}
+            else:
+                caller_auth = parameters.get("platform_auth")
+                platform_auth = dict(caller_auth) if isinstance(caller_auth, dict) else {}
+        if task_id and ("platform_auth" in parameters or platform_auth):
+            parameters = {**parameters, "platform_auth": platform_auth}
         # 只认 conv_key 前缀的话，一旦某条路径把 key 换成 scheduler:/agent: 之类，
         # 底下那一整段硬规则就静默失效；带着外部平台身份跑的任务照样得吃这些限制。
         source = classify_operation_source(
@@ -1830,20 +1857,14 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         """Cancel all non-terminal tasks assigned to a specific worker_id."""
         now = _now()
         count = 0
-        for task in self.tasks.values():
-            if self._task_terminal(task):
+        reason = f"engine worker {worker_id} restarted (generation mismatch)"
+        for task in list(self.tasks.values()):
+            if self._task_terminal(task) or task.worker_id != worker_id:
                 continue
-            if task.worker_id != worker_id:
-                continue
-            task.cancel_requested = True
-            task.status = TaskStatus.cancelled
-            task.updated_at = now
-            task.lease_expires_at = None
-            if task.waiting_for_task_id:
-                task.waiting_for_task_id = None
-            task.result = {"action": "cancelled", "error": f"engine worker {worker_id} restarted (generation mismatch)"}
-            self._event_task_snapshot("task_cancelled", task)
-            count += 1
+            # 父在子前：子任务结算时父已是终态，不会被先唤醒再取消
+            for target in (task, *self._live_descendants_locked(task.task_id)):
+                if self._cancel_task_locked(target, now, force=True, reason=reason) is not CancelEffect.none:
+                    count += 1
         return count
 
     def write_boot_event(self) -> dict[str, Any]:

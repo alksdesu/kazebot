@@ -43,7 +43,7 @@ def test_one_large_record_can_compact_without_reducing_message_count(tmp_path, m
     summary = "<summary>" + "Preserved decisions and facts from the first large record. " * 8 + "</summary>"
     state.compact_breaker.record_failure(session)
     if mode == "async":
-        plan, _ = state._prepare_compact_input_locked(session, sizing)
+        plan, _ = state._prepare_compact_input(session, sizing)
         assert plan["partial_segment"] and len(plan["indexed_records"]) == 1
         task = SimpleNamespace(
             input={**sizing, "_compact_plan": plan, "_compact_target_session_id": session},

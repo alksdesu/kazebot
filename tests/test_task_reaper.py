@@ -184,12 +184,22 @@ def test_a_fresh_pending_task_is_kept() -> None:
     assert _reason(_task(status=TaskStatus.pending, created_ago=timedelta(minutes=15))) is None
 
 
-def test_a_suspended_task_without_wait_target_is_reaped_after_silence() -> None:
+def test_a_suspended_task_without_any_wait_target_is_reaped_after_silence() -> None:
     task = _task(status=TaskStatus.suspended, silent_for=timedelta(minutes=20, seconds=1))
 
     reason = _reason(task)
 
     assert reason is not None and "挂起过久" in reason
+
+
+def test_a_suspended_batch_caller_is_kept_while_its_batch_still_runs() -> None:
+    # 批次挂起时 waiting_for_task_id 为空，挂起期间也不刷新 updated_at；只要批次还有没结束的就不是僵尸
+    task = _task(status=TaskStatus.suspended, silent_for=timedelta(hours=1))
+    task.waiting_for_batch_id = "batch-1"
+
+    assert reap_reason(
+        task, now=_NOW, max_running_sec=_MAX_RUNNING, approval_pending=False, wait_target_live=True,
+    ) is None
 
 
 def test_a_suspended_task_waiting_for_a_terminal_child_gets_a_grace_period() -> None:
@@ -314,6 +324,8 @@ def test_an_expired_lease_task_is_failed_with_an_event_and_routed(
     assert reaped == [task.task_id]
     assert routed == [task.task_id]
     assert task.status == TaskStatus.failed
+    # 回收即取消：还在跑的 worker 靠它从续租和取消查询里得知要停手
+    assert task.cancel_requested is True
     assert task.lease_expires_at is None
     assert task.updated_at == _NOW
     assert task.result["action"] == "fail"

@@ -157,7 +157,8 @@ class TestEveryTeardownPathPurgesBoth:
         assert not conv.exists()
         assert not transcript.exists()
 
-    def test_a_dispatch_session_cleanup_removes_both(self, tmp_path: Path) -> None:
+    @staticmethod
+    def _dispatch_entry(tmp_path: Path, status: Any) -> tuple[SupervisorState, str, Any]:
         from datetime import datetime, timezone
 
         from supervisor.types import Task, TaskKind
@@ -166,20 +167,49 @@ class TestEveryTeardownPathPurgesBoth:
         dispatch_sid = state.get_or_create_session(
             channel="internal", conversation_key="agent:bootstrap.executor:qq_group:1:uuid-x",
         )
-        conv, transcript = _seed(tmp_path, dispatch_sid)
         now = datetime.now(timezone.utc)
         task = Task(
             task_id="t1", session_id=dispatch_sid, session_generation=1,
-            kind=TaskKind.node, node_id="bootstrap.executor",
-            input={"parent_session_id": dispatch_sid},
+            kind=TaskKind.node, node_id="bootstrap.executor", status=status,
+            input={
+                "parent_session_id": dispatch_sid,
+                "_dispatch_origin": {"parent_session_id": "caller-session", "context_mode": "fresh"},
+            },
             created_at=now, updated_at=now,
         )
+        return state, dispatch_sid, task
 
-        with state._lock:
-            state._cleanup_dispatch_session_locked(task)
+    @staticmethod
+    def _post_cleanup(state: SupervisorState, task: Any, session_id: str) -> None:
+        from supervisor.task_router import PostCompletionWork
+
+        work = PostCompletionWork(task=task, route_session_id=session_id, session_generation=1)
+        state._execute_post_cleanup(work, {"phase_id": "t1:cleanup", "kind": "cleanup"})
+
+    def test_a_finished_dispatch_session_is_torn_down_by_post_cleanup(self, tmp_path: Path) -> None:
+        from supervisor.types import TaskStatus
+
+        state, dispatch_sid, task = self._dispatch_entry(tmp_path, TaskStatus.completed)
+        conv, transcript = _seed(tmp_path, dispatch_sid)
+
+        self._post_cleanup(state, task, dispatch_sid)
 
         assert not conv.exists()
         assert not transcript.exists()
+        assert dispatch_sid not in state.sessions
+
+    def test_a_suspended_dispatch_entry_keeps_its_session(self, tmp_path: Path) -> None:
+        # 同步派发后挂起的入口任务恢复后还要接着用 agent 会话，这时拆掉就把它的上下文删了
+        from supervisor.types import TaskStatus
+
+        state, dispatch_sid, task = self._dispatch_entry(tmp_path, TaskStatus.suspended)
+        conv, transcript = _seed(tmp_path, dispatch_sid)
+
+        self._post_cleanup(state, task, dispatch_sid)
+
+        assert conv.exists()
+        assert transcript.exists()
+        assert dispatch_sid in state.sessions
 
 
 class TestNoTeardownPathHandRollsPaths:
@@ -191,7 +221,7 @@ class TestNoTeardownPathHandRollsPaths:
         ("supervisor/state.py", "_expire_child_session"),
         ("supervisor/state.py", "_reconcile_after_restart"),
         ("supervisor/task_router.py", "_execute_post_cleanup"),
-        ("supervisor/task_router.py", "_cleanup_dispatch_session_locked"),
+        ("supervisor/state.py", "_purge_stale_session_files"),
     }
 
     def _function(self, rel: str, name: str) -> ast.AST | None:

@@ -375,7 +375,7 @@ def test_snip_branch_fingerprint_mismatch_never_rewrites_distinct_records(scenar
     store.replace_all(branch_id, branch)
     old_base = task.input["base_count"]
     with state._lock:
-        result = state._apply_snip_via_conv_store_locked(session_id, {records[0].task_id})
+        result = state._apply_snip_via_conv_store(session_id, {records[0].task_id})
     assert result["applied"] is False
     assert record_list(store, branch_id) == [message.to_dict() for message in branch]
     assert task.input["base_count"] == old_base
@@ -391,7 +391,7 @@ def test_snip_failures_preserve_branch_prefix_and_base_count(scenario, monkeypat
             raise OSError("archive unavailable")
         monkeypatch.setattr(ContextArchiveStore, "archive", archive)
         with pytest.raises(OSError):
-            state._apply_snip_via_conv_store_locked(session_id, {records[0].task_id})
+            state._apply_snip_via_conv_store(session_id, {records[0].task_id})
         assert record_list(store, session_id) == [message.to_dict() for message in original]
     else:
         replace_all = ConversationStore.replace_all
@@ -402,7 +402,7 @@ def test_snip_failures_preserve_branch_prefix_and_base_count(scenario, monkeypat
             return replace_all(writer, target, messages)
 
         monkeypatch.setattr(ConversationStore, "replace_all", replace)
-        result = state._apply_snip_via_conv_store_locked(session_id, {records[0].task_id})
+        result = state._apply_snip_via_conv_store(session_id, {records[0].task_id})
         assert result["applied"] is False
     assert record_list(store, branch_id) == branch_before
     assert task.input["base_count"] == old_base
@@ -422,7 +422,7 @@ def test_snip_retries_parent_concurrent_append_without_losing_new_message(scenar
         return original_replace(writer, target, messages)
 
     monkeypatch.setattr(ConversationStore, "replace_all", replace)
-    result = state._apply_snip_via_conv_store_locked(session_id, {records[0].task_id})
+    result = state._apply_snip_via_conv_store(session_id, {records[0].task_id})
     assert result["applied"] is True
     assert store.load(session_id)[-1].id == late.id
     assert store.load(branch_id)[-1].id == tail.id
@@ -456,7 +456,7 @@ def test_worker_retains_runtime_history_when_supervisor_snip_does_not_apply(tmp_
 def test_compacted_branch_base_metadata_survives_task_event_replay(scenario, mode):
     state, session_id, _, _, _, task, _, records = snip_branch(scenario)
     if mode == "snip":
-        state._apply_snip_via_conv_store_locked(session_id, {records[0].task_id, records[1].task_id})
+        state._apply_snip_via_conv_store(session_id, {records[0].task_id, records[1].task_id})
     else:
         _, compactor = background(state, session_id)
         complete(state, compactor)
@@ -489,7 +489,7 @@ def test_snip_branch_retries_concurrent_stream_append_without_deleting_tail(scen
         return original_replace(writer, target, messages)
 
     monkeypatch.setattr(ConversationStore, "replace_all", replace)
-    result = state._apply_snip_via_conv_store_locked(session_id, {records[0].task_id})
+    result = state._apply_snip_via_conv_store(session_id, {records[0].task_id})
     assert result["applied"] is not always_conflict
     assert attempts == (3 if always_conflict else 2)
     ids = [message.id for message in store.load(branch_id)]
@@ -507,7 +507,7 @@ def test_snip_never_replaces_tasks_without_a_nonempty_record_summary(scenario):
         write_task_record(state.workspace_root, TaskRecord(
             task_id=task_id, session_id=session_id, node_id="test", summary=summary,
         ))
-    result = state._apply_snip_via_conv_store_locked(
+    result = state._apply_snip_via_conv_store(
         session_id, {original[0].source_task_id, original[1].source_task_id, "missing-task"},
     )
     assert result["applied"] is False
@@ -626,7 +626,7 @@ def test_supervisor_snip_rechecks_tool_dependencies_after_concurrent_append(scen
         return replace_all(writer, target, messages)
 
     monkeypatch.setattr(ConversationStore, "replace_all", replace)
-    outcome = state._apply_snip_via_conv_store_locked(session_id, {records[0].task_id, records[1].task_id})
+    outcome = state._apply_snip_via_conv_store(session_id, {records[0].task_id, records[1].task_id})
     assert outcome["applied"] is True
     assert outcome["snipped_task_ids"] == [records[1].task_id]
     stored = store.load(session_id)

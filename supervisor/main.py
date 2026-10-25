@@ -193,6 +193,7 @@ def main() -> None:
             try:
                 with state._lock:
                     reap_stuck_tasks_locked(state)
+                    state._close_orphaned_approvals_locked()
                     # 分支和 fresh/fork 子会话只标 reset 不删，不清的话 sessions.json 会一直涨
                     state._cleanup_stale_sessions_locked()
             except Exception:

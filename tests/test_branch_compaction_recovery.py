@@ -81,7 +81,7 @@ def test_interrupted_compaction_event_cannot_drop_branch_tail(branch_case, mode,
         compact_llm(state, store, parent, keep_recent=2)
     else:
         selected = {"task-0", "task-1"} if mode == "snip" else {"task-5"}
-        assert not state._apply_snip_via_conv_store_locked(parent, selected)["applied"]
+        assert not state._apply_snip_via_conv_store(parent, selected)["applied"]
     task = restore_old_task(state, created)
     branch_messages = store.load(branch)
     boundary = branch_base_count(branch_messages, branch, task.input["base_count"])
@@ -102,7 +102,7 @@ def test_interrupted_compaction_event_cannot_drop_branch_tail(branch_case, mode,
 def test_multiple_compactions_use_durable_boundary_and_keep_fingerprints_compatible(branch_case, first):
     state, store, parent, branch, _, tail, created, _ = branch_case
     if first == "snip_last_task":
-        state._apply_snip_via_conv_store_locked(parent, {"task-5"})
+        state._apply_snip_via_conv_store(parent, {"task-5"})
     else:
         compact_llm(state, store, parent, keep_recent=4)
     restore_old_task(state, created)
@@ -181,7 +181,7 @@ def test_llm_branch_sync_retries_appends_without_losing_tail(branch_case, monkey
         assert [message.to_dict() for message in branch_messages[:len(before)]] == before
         assert ids[-3:] == ["concurrent-1", "concurrent-2", "concurrent-3"]
         assert boundary == previous_base and task.input["base_count"] == 12
-        assert "compact branch sync failed" in caplog.text
+        assert "branch history sync failed (branch_compaction)" in caplog.text
         assert "conversation changed before replacement" in caplog.text
     else:
         assert boundary == len(store.load(parent)) == task.input["base_count"]

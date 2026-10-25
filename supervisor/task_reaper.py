@@ -27,6 +27,16 @@ PENDING_QUEUE_LIMIT = timedelta(minutes=15)
 SUSPENDED_SILENCE_LIMIT = timedelta(minutes=20)
 # 子任务已终态但 caller 仍挂起时，给路由线程一小段完成收尾的时间。
 SUSPENDED_CHILD_GRACE = timedelta(minutes=5)
+# 单次运行按领取时刻计时，挂起再恢复会重新起算；总寿命再按运行上限的这个倍数兜底，防止派发、恢复无限循环
+TASK_LIFETIME_FACTOR = 6
+
+
+def _queued_since(task: Task) -> datetime:
+    return task.queued_at or task.created_at
+
+
+def _claimed_since(task: Task) -> datetime:
+    return task.claimed_at or task.created_at
 
 
 def reap_reason(
@@ -37,37 +47,51 @@ def reap_reason(
     approval_pending: bool,
     waiting_task_terminal: bool = False,
     waiting_task_missing: bool = False,
+    wait_target_live: bool = False,
+    max_lifetime_sec: float | None = None,
 ) -> str | None:
-    """该回收时返回写进 task.result 的原因，不该回收返回 None。"""
+    """该回收时返回写进 task.result 的原因，不该回收返回 None。
+
+    waiting_* 描述挂起任务的等待目标（单个子任务或整个批次）：全部结束、找不到，或还有没结束的。
+    """
     silence = now - task.updated_at
+    lifetime_sec = (now - task.created_at).total_seconds()
+    lifetime_limit = max_lifetime_sec if max_lifetime_sec is not None else max_running_sec * TASK_LIFETIME_FACTOR
     if task.status == TaskStatus.pending:
+        if lifetime_sec > lifetime_limit:
+            return _lifetime_reason(lifetime_sec, lifetime_limit)
         if approval_pending:
             return None
-        age = now - task.created_at
-        if age > PENDING_QUEUE_LIMIT:
-            return f"任务排队过久（{_minutes(age)} 分钟无 worker 接手），已自动终止"
+        queued = now - _queued_since(task)
+        if queued > PENDING_QUEUE_LIMIT:
+            return f"任务排队过久（{_minutes(queued)} 分钟无 worker 接手），已自动终止"
         return None
     if task.status == TaskStatus.suspended:
+        if lifetime_sec > lifetime_limit:
+            return _lifetime_reason(lifetime_sec, lifetime_limit)
         if approval_pending:
             return None
         if waiting_task_terminal and silence > SUSPENDED_CHILD_GRACE:
             return "等待的子任务已结束但入口未恢复，按僵尸任务回收"
         if waiting_task_missing and silence > SUSPENDED_CHILD_GRACE:
             return "等待的子任务已丢失，按僵尸任务回收"
-        if not task.waiting_for_task_id and silence > SUSPENDED_SILENCE_LIMIT:
+        has_target = bool(task.waiting_for_task_id or task.waiting_for_batch_id or wait_target_live)
+        if not has_target and silence > SUSPENDED_SILENCE_LIMIT:
             return f"任务挂起过久（{_minutes(silence)} 分钟无等待目标），按僵尸任务回收"
         return None
     if task.status != TaskStatus.running:
         return None
 
-    age_sec = (now - task.created_at).total_seconds()
+    age_sec = (now - _claimed_since(task)).total_seconds()
     if age_sec > max_running_sec:
         return f"任务运行过久（{int(age_sec)} 秒，上限 {int(max_running_sec)} 秒），已自动终止以防止僵死阻塞聊天"
+    if lifetime_sec > lifetime_limit:
+        return _lifetime_reason(lifetime_sec, lifetime_limit)
 
     if silence > HEARTBEAT_SILENCE_LIMIT:
         return f"任务运行超时（{_minutes(silence)} 分钟无响应，疑似 worker 崩溃）"
 
-    # 等审批是合法阻塞：租约类判定对它网开一面，上面两条兜底照样生效
+    # 等审批是合法阻塞：租约类判定对它网开一面，上面几条兜底照样生效
     if approval_pending:
         return None
 
@@ -78,6 +102,35 @@ def reap_reason(
     if task.lease_expires_at + LEASE_GRACE < now:
         return "任务租约过期，worker 已失联，按僵尸任务回收"
     return None
+
+
+def _wait_target_state(
+    state: "SupervisorState", task: Task, children: dict[str, list[Task]],
+) -> tuple[bool, bool, bool]:
+    """挂起任务等待目标的 (全部结束, 找不到, 还有没结束的)。"""
+    if task.status != TaskStatus.suspended:
+        return False, False, False
+    if task.waiting_for_task_id:
+        child = state.tasks.get(task.waiting_for_task_id)
+        if child is None:
+            return False, True, False
+        terminal = state._task_terminal(child)
+        return terminal, False, not terminal
+    if task.waiting_for_batch_id:
+        siblings = [
+            child for child in children.get(task.task_id, [])
+            if child.batch_id == task.waiting_for_batch_id
+        ]
+        if not siblings:
+            return False, True, False
+        live = any(not state._task_terminal(child) for child in siblings)
+        return not live, False, live
+    # 旧快照里批次挂起不记等待字段：还有没结束的批次子任务就算在等
+    live_batch = any(
+        child.batch_id and not state._task_terminal(child)
+        for child in children.get(task.task_id, [])
+    )
+    return False, False, live_batch
 
 
 def reap_stuck_tasks_locked(
@@ -98,6 +151,11 @@ def reap_stuck_tasks_locked(
         for approval in state.approvals.values()
         if approval.status == ApprovalStatus.pending
     }
+    children: dict[str, list[Task]] = {}
+    for candidate in state.tasks.values():
+        caller_id = (candidate.caller_task_id or "").strip()
+        if caller_id:
+            children.setdefault(caller_id, []).append(candidate)
 
     reaped: list[str] = []
     # 完成路由会增删 state.tasks，先拍快照再遍历
@@ -108,23 +166,15 @@ def reap_stuck_tasks_locked(
             continue
         # 分支上跑的任务，审批可能挂在父会话上
         route_session_id = state._route_session_id_for_task_locked(task)
-        waiting_task = state.tasks.get(task.waiting_for_task_id or "")
+        waiting_terminal, waiting_missing, waiting_live = _wait_target_state(state, task, children)
         reason = reap_reason(
             task,
             now=now,
             max_running_sec=max_running_sec,
             approval_pending=task.session_id in waiting_sessions or route_session_id in waiting_sessions,
-            waiting_task_terminal=bool(
-                task.status == TaskStatus.suspended
-                and task.waiting_for_task_id
-                and waiting_task is not None
-                and state._task_terminal(waiting_task)
-            ),
-            waiting_task_missing=bool(
-                task.status == TaskStatus.suspended
-                and task.waiting_for_task_id
-                and waiting_task is None
-            ),
+            waiting_task_terminal=waiting_terminal,
+            waiting_task_missing=waiting_missing,
+            wait_target_live=waiting_live,
         )
         if reason is None:
             continue
@@ -134,15 +184,13 @@ def reap_stuck_tasks_locked(
 
 
 def _fail_locked(state: "SupervisorState", task: Task, *, reason: str, now: datetime) -> None:
-    task.status = TaskStatus.failed
-    task.updated_at = now
-    task.lease_expires_at = None
-    task.result = {"action": "fail", "node_id": task.node_id or "", "error": reason}
-    state._reset_task_route_state_locked(task)
-    state._event_task_snapshot("task_completed", task, component="supervisor")
-    # 分支任务失败也要合并回父会话、给用户发错误，和正常完成走同一条路
-    state._route_completed_task_locked(task)
-    log.warning("reaped running task %s (node=%s): %s", task.task_id[:12], task.node_id, reason)
+    """回收即取消：置 cancel_requested 让还在跑的 worker 从续租和取消查询里得知停手，再按失败走完成路由。"""
+    log.warning("reaping %s task %s (node=%s): %s", task.status.value, task.task_id[:12], task.node_id, reason)
+    state._fail_task_locked(task, error=reason, now=now)
+
+
+def _lifetime_reason(lifetime_sec: float, limit_sec: float) -> str:
+    return f"任务存在过久（{int(lifetime_sec)} 秒，总上限 {int(limit_sec)} 秒），已自动终止"
 
 
 def _minutes(delta: timedelta) -> int:
