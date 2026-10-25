@@ -1,18 +1,8 @@
 """OpenAI Responses API provider (/v1/responses).
 
-Converts engine's chat/completions-style messages into the Responses API
-'input' array format, sends requests, and parses both streaming and
-non-streaming responses back into the unified ProviderResponse.
-
-Key differences from chat/completions:
-  - system messages become a top-level 'instructions' string
-  - message items carry explicit 'type' fields (message / function_call / function_call_output)
-  - content blocks use input_text/output_text/input_image instead of text/image_url
-  - SSE events carry type in the JSON body, not in an 'event:' line
-  - tool arguments arrive as strings and must be json.loads'd
-
-Created 2026-05-01 to support the Responses API alongside the existing
-chat/completions provider in openai.py.
+Converts chat/completions-style engine messages into Responses 'input' items
+(system → instructions, typed message / function_call / function_call_output)
+and parses streaming and non-streaming replies into ProviderResponse.
 """
 
 from __future__ import annotations
@@ -26,28 +16,32 @@ import httpx
 
 from plugin_sdk import PluginExecutionError
 
+from .assembly import (
+    ToolCallAssembler, arguments_json, conclude, int_field, new_call_id, parse_tool_arguments, usage_dict,
+)
+from .base import (
+    BaseProvider, ProviderResponse, ToolCall, content_parts, content_text, image_part_url, provider_metadata,
+    tool_call_fields,
+)
+from .degrade import DegradeRule, degrade, unset_options
+from .failures import UpstreamError, exception_failure, failed, read_error, upstream_failure
+from .openai import OpenAIProvider
+from .options import ENUM, FLOAT, INT, TEXT, OptionSet, OptionSpec
 from .plugin_transport import iter_sse_events, wrap_client
-
-from providers.base import BaseProvider, ProviderResponse, ToolCall, image_part_url
-# Reuse the base-URL normalizer from the sibling openai provider
-from providers.degrade import DegradeRule, degrade, unset_options
-from providers.openai import OpenAIProvider, _normalize_base_url
-from providers.options import ENUM, FLOAT, INT, TEXT, OptionSet, OptionSpec
 
 _MAX_DEGRADE_ROUNDS = 3
 
 log = logging.getLogger(__name__)
 
-# [2026-05-01] NativeToolFormatter stores tool results as user text, and older
-# fake-native history stores tool calls as textual records.  The Responses
-# provider recognizes both shapes so it can rebuild native input items without
-# changing other providers or the global formatter contract.
+# 流里遇到加密推理校验失败、需要剥掉加密内容重开一次时，_read_stream 用它告诉调用方。
+_RETRY_WITHOUT_ENCRYPTED = object()
+
+# response.incomplete 的原因 → 统一的 finish_reason，其余原因一律算 incomplete。
+_INCOMPLETE_REASONS = {"max_output_tokens": "length", "content_filter": "content_filter"}
+
+# NativeToolFormatter 把工具结果存成用户文本，更早的历史把工具调用存成文字记录：两种都认出来才能还原成原生 input 项。
 _TOOL_RESULT_RE = re.compile(r'^Tool result for "(?P<name>[^"]+)":\r?\n(?P<output>.*)\Z', re.DOTALL)
-# [2026-05-04] Engine pseudo-result markers may now contain dynamic names such
-# as dispatch:target.id. Why: per-target dispatch stores the target in the tool
-# name. How: allow colon, dot, and hyphen after the initial function-name
-# character while preserving the older simple-name markers. Purpose: Responses
-# can pair dynamic dispatch results with the exact preceding function_call.
+# 按目标派发的伪工具名形如 dispatch:target.id，名字里要放行冒号、点和连字符。
 _ENGINE_TOOL_RESULT_RE = re.compile(
     r'^\[(?P<name>[A-Za-z_][A-Za-z0-9_:\.-]*) result: (?P<output>.*)\]\Z',
     re.DOTALL,
@@ -63,11 +57,7 @@ def _strip_encrypted_content(items: list[dict[str, Any]]) -> list[dict[str, Any]
     cleaned: list[dict[str, Any]] = []
     for item in items:
         if isinstance(item, dict) and item.get("type") == "reasoning":
-            # [2026-05-06] Why: OpenAI can reject stale encrypted reasoning
-            # content when verifying prior turns. How: copy only reasoning items
-            # and drop encrypted_content while preserving summary. Purpose: keep
-            # useful visible reasoning summaries without resending unverifiable
-            # encrypted blobs.
+            # 旧轮次的加密推理 OpenAI 可能验不过：只留 summary，加密块不再回传。
             new_item = {k: v for k, v in item.items() if k != "encrypted_content"}
             if "summary" not in new_item:
                 new_item["summary"] = []
@@ -80,52 +70,54 @@ def _strip_encrypted_content(items: list[dict[str, Any]]) -> list[dict[str, Any]
 def _is_encrypted_content_error(error_msg: str) -> bool:
     """Return True for OpenAI encrypted reasoning verification failures."""
     lower = str(error_msg or "").lower()
-    # [2026-05-06] Why: generic verification/decryption errors may refer to
-    # unrelated inputs. How: require an encrypted-content marker plus the known
-    # OpenAI verification/decryption phrases. Purpose: retry only the safe
-    # fallback path requested for reasoning.encrypted_content failures.
+    # 一般的验证/解密失败可能和推理块无关，两个标记都在才走去掉加密块重试这条路。
     has_encrypted_marker = "encrypted content" in lower or "encrypted_content" in lower
     has_verification_failure = "could not be verified" in lower or "could not be decrypted" in lower
     return has_encrypted_marker and has_verification_failure
 
 
-def _detail_int(holder: Any, parent: str, key: str) -> int:
-    branch = holder.get(parent) if isinstance(holder, dict) else None
-    value = branch.get(key) if isinstance(branch, dict) else None
-    return value if isinstance(value, int) else 0
+def _parse_usage(usage: Any) -> dict[str, int] | None:
+    """Responses API 的 usage → 统一形态。缓存与推理量都在 *_details 里；没报用量时为 None。"""
+    if not isinstance(usage, dict) or not usage:
+        return None
+    return usage_dict(
+        prompt=int_field(usage, "input_tokens"),
+        completion=int_field(usage, "output_tokens"),
+        total=int_field(usage, "total_tokens"),
+        cache_read=int_field(usage, "input_tokens_details", "cached_tokens"),
+        reasoning=int_field(usage, "output_tokens_details", "reasoning_tokens"),
+    )
 
 
-def _parse_usage(usage: Any) -> dict[str, int]:
-    """Responses API 的 usage → 统一形态。缓存与推理量都在 *_details 里。"""
-    if not isinstance(usage, dict):
-        usage = {}
-    inp = usage.get("input_tokens") or 0
-    out = usage.get("output_tokens") or 0
-    parsed = {"prompt_tokens": inp, "completion_tokens": out, "total_tokens": inp + out}
-    cached = _detail_int(usage, "input_tokens_details", "cached_tokens")
-    if cached:
-        parsed["cache_read_tokens"] = cached
-    reasoning = _detail_int(usage, "output_tokens_details", "reasoning_tokens")
-    if reasoning:
-        parsed["reasoning_tokens"] = reasoning
-    return parsed
+def _terminal_state(response: dict[str, Any], event_type: str = "") -> tuple[str | None, str]:
+    """一个收尾的 response 对象 → (统一的 finish_reason, 上游原话)。"""
+    status = str(response.get("status") or "").strip().lower()
+    if event_type == "response.incomplete" or status == "incomplete":
+        details = response.get("incomplete_details")
+        reason = str(details.get("reason") or "") if isinstance(details, dict) else ""
+        return _INCOMPLETE_REASONS.get(reason, "incomplete"), f"response incomplete ({reason or 'no reason given'})"
+    if status in ("cancelled", "queued", "in_progress"):
+        return "incomplete", f"response {status}"
+    return "stop", ""
 
 
-def _response_error_message(resp: httpx.Response) -> str:
-    """Extract an API error message from an HTTP response."""
-    try:
-        body = resp.json()
-        return body.get("error", {}).get("message", resp.text[:500])
-    except Exception:
-        return resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
+def _output_index(event: dict[str, Any]) -> int:
+    value = event.get("output_index")
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _stream_error(event: dict[str, Any]) -> UpstreamError:
+    """流里 type=error 事件的错误。字段平铺在事件顶层，个别中转又套了一层 error。"""
+    error = read_error(event, fallback="stream error")
+    code = event.get("code")
+    if not error.code and isinstance(code, str) and code:
+        return UpstreamError(error.message, error.type, code)
+    return error
 
 
 class OpenAIResponsesProvider(BaseProvider):
     """Provider targeting the OpenAI Responses API (`POST /v1/responses`)."""
 
-    # [provider-registry 2026-05-03] 这是自动发现注册使用的 key。
-    # 原因：engine 不再硬编码 OpenAIResponsesProvider 分支；做法：类声明 provider_name；
-    # 目的：registry 能把配置里的 "openai-responses" 映射回这个类。
     provider_name = "openai-responses"
     # 和 openai 同域名不同请求体，所以自成一族：Responses API 收不了 chat/completions 的 body。
     official_hosts = ("api.openai.com",)
@@ -225,14 +217,10 @@ class OpenAIResponsesProvider(BaseProvider):
         model: str,
         provider_options: dict[str, Any] | None = None,
     ):
-        # [provider-registry 2026-05-03] 实例 name 复用 provider_name。
-        # 原因：下游仍通过 provider.name 判断 provider 特性；做法：从类属性传入；
-        # 目的：注册 key、实例名和配置 provider 字段保持一致。
         super().__init__(model=model, name=self.provider_name)
         self._http = wrap_client(http, self)
         self._api_key = api_key
-        # _normalize_base_url ensures the URL ends with /v1
-        self._base_url = _normalize_base_url(base_url)
+        self._base_url = self.resolve_base_url(base_url)
         self._options = OptionSet(self.OPTIONS, provider_options)
         self._timeout = float(self._options.get("timeout_sec"))
         unknown = self._options.unknown_keys()
@@ -244,10 +232,6 @@ class OpenAIResponsesProvider(BaseProvider):
             self.DEGRADE_RULES, self._options, error, provider=self.name, model=self.model,
         ) is not None
 
-    # ------------------------------------------------------------------
-    # URL helpers
-    # ------------------------------------------------------------------
-
     def _endpoint(self) -> str:
         """Return the full POST URL for /v1/responses."""
         return self._base_url.rstrip("/") + "/responses"
@@ -258,10 +242,6 @@ class OpenAIResponsesProvider(BaseProvider):
             "Content-Type": "application/json",
         }
 
-    # ------------------------------------------------------------------
-    # Message conversion (chat/completions → Responses API input)
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
         """Convert engine messages to Responses API format.
@@ -270,11 +250,9 @@ class OpenAIResponsesProvider(BaseProvider):
           - instructions: concatenated system message text (may be empty)
           - input_items: list of Responses-API items
 
-        [2026-05-01] This converter accepts both chat/completions-style tool
-        messages and Clonoth's storage format.  Clonoth stores tool calls as
-        simplified assistant.tool_calls and stores tool results as user text;
-        converting those pairs here lets OpenAI Responses receive native
-        function_call/function_call_output items.
+        Accepts both chat/completions-style tool messages and Clonoth's storage
+        format (assistant.tool_calls plus tool results stored as user text), so
+        Responses receives native function_call / function_call_output pairs.
         """
         instructions_parts: list[str] = []
         items: list[dict[str, Any]] = []
@@ -352,14 +330,9 @@ class OpenAIResponsesProvider(BaseProvider):
 
             if role == "assistant":
                 _flush_unpaired_function_calls(pending_calls, items)
-                # [2026-05-01] Prefer saved raw Responses output items so encrypted
-                # reasoning content round-trips exactly.  Function-call items in
-                # that raw output also seed pending_calls for the following tool result.
-                _meta = msg.get("_meta")
-                _raw_output = None
-                if isinstance(_meta, dict):
-                    _resp_meta = _meta.get("metadata", {}).get("openai-responses", {})
-                    _raw_output = _resp_meta.get("raw_output")
+                # 优先原样回放存下的 output，加密推理才能逐字回传；其中的 function_call
+                # 同时登记进 pending_calls，等着和后面的工具结果配对。
+                _raw_output = provider_metadata(msg, "openai-responses").get("raw_output")
 
                 if _raw_output and isinstance(_raw_output, list):
                     for _raw_item in _raw_output:
@@ -386,7 +359,7 @@ class OpenAIResponsesProvider(BaseProvider):
                         "role": "assistant",
                         "content": [{"type": "output_text", "text": text}],
                     })
-                for tc in msg.get("tool_calls", []):
+                for tc in msg.get("tool_calls") or []:
                     normalized = _normalize_tool_call(tc)
                     if normalized:
                         _append_function_call(normalized)
@@ -410,10 +383,6 @@ class OpenAIResponsesProvider(BaseProvider):
         _flush_unpaired_function_calls(pending_calls, items)
         return "\n\n".join(instructions_parts), items
 
-    # ------------------------------------------------------------------
-    # Non-streaming chat
-    # ------------------------------------------------------------------
-
     async def chat(
         self,
         *,
@@ -429,63 +398,43 @@ class OpenAIResponsesProvider(BaseProvider):
             stream=False,
         )
 
-        try:
-            resp = await self._http.post(
-                self._endpoint(),
-                headers=self._headers(),
-                json=payload,
-                timeout=self._timeout,
-            )
-        except PluginExecutionError:
-            raise
-        except Exception as exc:
-            return ProviderResponse(ok=False, error=str(exc))
-
-        if resp.status_code >= 400:
-            err_msg = _response_error_message(resp)
-            if (
-                resp.status_code == 400
-                and not _is_encrypted_content_error(err_msg)
-                and _attempt < _MAX_DEGRADE_ROUNDS
-                and self._degrade(err_msg)
-            ):
-                return await self.chat(messages=messages, tools=tools, _attempt=_attempt + 1)
-            if resp.status_code == 400 and _is_encrypted_content_error(err_msg):
-                # [2026-05-06] Why: stale encrypted reasoning from saved
-                # Responses output can make OpenAI reject the request. How: strip
-                # encrypted_content from reasoning input items and resend this
-                # payload once. Purpose: recover the conversation while keeping
-                # the retry bounded and preserving summaries.
+        # 存档里的加密推理可能已经验不过；剥掉之后再发一次，第二次还被拒就照实报错。
+        for attempt in range(2):
+            try:
+                resp = await self._http.post(
+                    self._endpoint(),
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=self._timeout,
+                )
+            except PluginExecutionError:
+                raise
+            except Exception as exc:
+                return exception_failure(exc)
+            if resp.status_code < 400:
+                break
+            error = read_error(resp.content, fallback=f"HTTP {resp.status_code}")
+            encrypted = resp.status_code == 400 and _is_encrypted_content_error(error.message)
+            if encrypted and attempt == 0:
                 log.warning("Encrypted content verification failed, retrying without encrypted reasoning")
                 payload["input"] = _strip_encrypted_content(payload["input"])
-                try:
-                    resp = await self._http.post(
-                        self._endpoint(),
-                        headers=self._headers(),
-                        json=payload,
-                        timeout=self._timeout,
-                    )
-                except PluginExecutionError:
-                    raise
-                except Exception as exc:
-                    return ProviderResponse(ok=False, error=str(exc))
-                if resp.status_code >= 400:
-                    err_msg = _response_error_message(resp)
-                    return ProviderResponse(ok=False, error=err_msg, status_code=resp.status_code)
-            else:
-                return ProviderResponse(ok=False, error=err_msg, status_code=resp.status_code)
+                continue
+            if (
+                resp.status_code == 400
+                and not encrypted
+                and _attempt < _MAX_DEGRADE_ROUNDS
+                and self._degrade(error.message)
+            ):
+                return await self.chat(messages=messages, tools=tools, _attempt=_attempt + 1)
+            return upstream_failure(resp.status_code, error)
 
-        body = resp.json()
-        result = self._parse_response(body)
-        # [2026-05-01] 存储原始 output items（含 reasoning encrypted_content）到 provider_meta
-        raw_output = body.get("output")
-        if raw_output and isinstance(raw_output, list):
-            result.provider_meta["raw_output"] = raw_output
-        return result
-
-    # ------------------------------------------------------------------
-    # Streaming chat
-    # ------------------------------------------------------------------
+        try:
+            body = resp.json()
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            return failed("invalid_response", "invalid JSON response", status_code=resp.status_code)
+        return self._parse_response(body, status_code=resp.status_code)
 
     async def chat_stream(
         self,
@@ -505,26 +454,8 @@ class OpenAIResponsesProvider(BaseProvider):
             stream=True,
         )
 
-        # [2026-05-06] Why: stream retries must reopen the whole SSE request
-        # because a failed connection cannot be resumed. How: run at most two
-        # attempts and rebuild accumulators per attempt. Purpose: keep fallback
-        # bounded while avoiding polluted state from a failed first stream.
+        # 断掉的流续不上，加密推理被拒时只能整条请求重开；最多重开一次，每次重新累计。
         for attempt in range(2):
-            # -- Accumulators for the full response ----------------------
-            text_parts: list[str] = []
-            thinking_parts: list[str] = []
-            # tool_calls keyed by output index so we can accumulate arguments
-            pending_calls: dict[int, dict[str, str]] = {}  # idx → {name, call_id, arguments}
-            # [tool-stream 2026-05-19] 记录已发送 done 的 output index。
-            # 原因：Responses API 可能同时给 arguments.done 与 output_item.done。
-            # 做法：每次尝试内用集合去重生命周期结束事件。
-            # 目的：前端只收到一次 tool_call_done，同时 final ProviderResponse 仍按 pending_calls 构建。
-            done_indices: set[int] = set()
-            usage: dict[str, int] = {}
-            raw_output_items: list[dict[str, Any]] = []  # captured from response.completed
-            retry_without_encrypted = False
-            # ------------------------------------------------------------
-
             try:
                 async with self._http.stream(
                     "POST",
@@ -533,32 +464,21 @@ class OpenAIResponsesProvider(BaseProvider):
                     json=payload,
                     timeout=self._timeout,
                 ) as stream:
-                    if stream.status_code >= 400:
-                        body = await stream.aread()
-                        try:
-                            data = json.loads(body)
-                            err_msg = data.get("error", {}).get("message", body.decode()[:500])
-                        except Exception:
-                            err_msg = body.decode("utf-8", errors="replace")[:500]
-                        if (
-                            attempt == 0
-                            and stream.status_code == 400
-                            and _is_encrypted_content_error(err_msg)
-                        ):
-                            # [2026-05-06] Why: OpenAI can reject encrypted
-                            # reasoning before sending any SSE event. How: strip
-                            # encrypted_content and continue to the second and
-                            # final attempt. Purpose: recover once without an
-                            # unbounded retry loop.
+                    status = stream.status_code
+                    if status >= 400:
+                        error = read_error(await stream.aread(), fallback=f"HTTP {status}")
+                        encrypted = status == 400 and _is_encrypted_content_error(error.message)
+                        if encrypted and attempt == 0:
                             log.warning(
                                 "Encrypted content verification failed, retrying stream without encrypted reasoning"
                             )
                             payload["input"] = _strip_encrypted_content(payload["input"])
                             continue
                         if (
-                            stream.status_code == 400
+                            status == 400
+                            and not encrypted
                             and _degrade_attempt < _MAX_DEGRADE_ROUNDS
-                            and self._degrade(err_msg)
+                            and self._degrade(error.message)
                         ):
                             # 状态码先于任何 SSE 事件到达，重来不会让调用方看到半截内容。
                             return await self.chat_stream(
@@ -566,180 +486,164 @@ class OpenAIResponsesProvider(BaseProvider):
                                 on_thinking=on_thinking, on_tool_delta=on_tool_delta,
                                 _degrade_attempt=_degrade_attempt + 1,
                             )
-                        return ProviderResponse(ok=False, error=err_msg, status_code=stream.status_code)
-                    async for sse_event in iter_sse_events(stream):
-                        raw = sse_event["data"]
-                        if raw.strip() == "[DONE]":
-                            break
-                        try:
-                            event = json.loads(raw)
-                        except json.JSONDecodeError:
-                            continue
-
-                        etype = event.get("type", "")
-
-                        # --- text deltas ---
-                        if etype == "response.output_text.delta":
-                            delta = event.get("delta", "")
-                            if delta:
-                                text_parts.append(delta)
-                                if on_text:
-                                    await on_text(delta)
-
-                        # --- reasoning / thinking deltas ---
-                        elif etype in (
-                            "response.reasoning_text.delta",
-                            "response.reasoning_summary_text.delta",
-                        ):
-                            delta = event.get("delta", "")
-                            if delta:
-                                thinking_parts.append(delta)
-                                if on_thinking:
-                                    await on_thinking(delta)
-
-                        # --- new function_call item added ---
-                        elif etype == "response.output_item.added":
-                            item = event.get("item", {})
-                            idx = int(event.get("output_index", 0) or 0)
-                            if item.get("type") == "function_call":
-                                pending_calls[idx] = {
-                                    "name": item.get("name", ""),
-                                    "call_id": item.get("call_id", ""),
-                                    "arguments": "",
-                                }
-                                # [tool-stream 2026-05-19] Responses 的 output_item.added 是 function_call 起点。
-                                # 原因：之前只创建 pending_calls，实时链路无法知道工具调用已开始。
-                                # 做法：登记 pending_calls 后发送统一 tool_call_start。
-                                # 目的：Responses provider 与 Chat Completions provider 暴露相同事件格式。
-                                if on_tool_delta:
-                                    await on_tool_delta({
-                                        "event": "tool_call_start",
-                                        "index": idx,
-                                        "id": pending_calls[idx]["call_id"],
-                                        "name": pending_calls[idx]["name"],
-                                    })
-
-                        # --- function_call arguments delta ---
-                        elif etype == "response.function_call_arguments.delta":
-                            idx = int(event.get("output_index", 0) or 0)
-                            delta = event.get("delta", "")
-                            if idx in pending_calls:
-                                pending_calls[idx]["arguments"] += delta
-                                # [tool-stream 2026-05-19] 转发 Responses 参数增量。
-                                # 原因：response.function_call_arguments.delta 已是最小参数片段。
-                                # 做法：保留原有字符串累积，同时把 delta 透传给 on_tool_delta。
-                                # 目的：不改变最终 JSON 解析，又支持工具参数实时显示。
-                                if delta and on_tool_delta:
-                                    await on_tool_delta({
-                                        "event": "tool_call_args_delta",
-                                        "index": idx,
-                                        "delta": delta,
-                                    })
-
-                        # --- function_call arguments done ---
-                        elif etype == "response.function_call_arguments.done":
-                            idx = int(event.get("output_index", 0) or 0)
-                            arguments = event.get("arguments")
-                            if isinstance(arguments, str) and idx in pending_calls and not pending_calls[idx]["arguments"]:
-                                pending_calls[idx]["arguments"] = arguments
-                            # [tool-stream 2026-05-19] Responses 有显式 arguments.done 时发送 done。
-                            # 原因：OpenAI Responses 相比 Chat Completions 多了参数完成事件。
-                            # 做法：按 output_index 去重后发送 tool_call_done。
-                            # 目的：让支持结束信号的 provider 暴露完整工具调用生命周期。
-                            if idx in pending_calls and idx not in done_indices:
-                                done_indices.add(idx)
-                                if on_tool_delta:
-                                    await on_tool_delta({"event": "tool_call_done", "index": idx})
-
-                        # --- function_call output item done ---
-                        elif etype == "response.output_item.done":
-                            item = event.get("item", {})
-                            idx = int(event.get("output_index", 0) or 0)
-                            if item.get("type") == "function_call" and idx in pending_calls:
-                                if item.get("name"):
-                                    pending_calls[idx]["name"] = item.get("name", "")
-                                if item.get("call_id"):
-                                    pending_calls[idx]["call_id"] = item.get("call_id", "")
-                                if isinstance(item.get("arguments"), str) and not pending_calls[idx]["arguments"]:
-                                    pending_calls[idx]["arguments"] = item.get("arguments", "")
-                                # [tool-stream 2026-05-19] output_item.done 作为兜底结束信号。
-                                # 原因：不同 Responses 版本可能只发送 output_item.done。
-                                # 做法：复用 done_indices 去重，避免与 arguments.done 重复。
-                                # 目的：在事件形态变化时仍能通知前端工具调用结束。
-                                if idx not in done_indices:
-                                    done_indices.add(idx)
-                                    if on_tool_delta:
-                                        await on_tool_delta({"event": "tool_call_done", "index": idx})
-
-                        # --- response completed: extract usage + raw output ---
-                        elif etype in ("response.completed", "response.done"):
-                            resp_obj = event.get("response", {})
-                            u = resp_obj.get("usage", {})
-                            if u:
-                                usage = u
-                            # [2026-05-01] 流式完成时捕获原始 output（含 reasoning encrypted_content）
-                            _raw_out = resp_obj.get("output")
-                            if _raw_out and isinstance(_raw_out, list):
-                                raw_output_items = _raw_out
-
-                        # --- error / failure ---
-                        elif etype == "response.failed":
-                            err = event.get("response", {}).get("error", {})
-                            err_msg = err.get("message", str(err))
-                            if attempt == 0 and _is_encrypted_content_error(err_msg):
-                                # [2026-05-06] Why: OpenAI may report encrypted
-                                # reasoning failure as response.failed after the
-                                # SSE connection opens. How: close this stream,
-                                # strip encrypted_content, and retry exactly once.
-                                # Purpose: support both HTTP 400 and in-stream
-                                # failure shapes for the same fallback.
-                                log.warning(
-                                    "Encrypted content verification failed, retrying stream without encrypted reasoning"
-                                )
-                                payload["input"] = _strip_encrypted_content(payload["input"])
-                                retry_without_encrypted = True
-                                break
-                            return ProviderResponse(ok=False, error=f"API failed: {err_msg}")
-                        elif etype == "error":
-                            err_msg = event.get("message", str(event))
-                            return ProviderResponse(ok=False, error=f"Stream error: {err_msg}")
-
+                        return upstream_failure(status, error)
+                    outcome = await self._read_stream(
+                        stream, status,
+                        on_text=on_text, on_thinking=on_thinking, on_tool_delta=on_tool_delta,
+                        may_retry_encrypted=attempt == 0,
+                    )
             except PluginExecutionError:
                 raise
             except Exception as exc:
-                return ProviderResponse(ok=False, error=str(exc))
+                return exception_failure(exc)
 
-            if retry_without_encrypted:
+            if outcome is _RETRY_WITHOUT_ENCRYPTED:
+                payload["input"] = _strip_encrypted_content(payload["input"])
                 continue
+            return outcome
 
-            # -- Build final ProviderResponse ----------------------------
-            # raw_output_items 在 response.completed 事件中捕获
-            provider_meta: dict[str, Any] = {}
-            if raw_output_items:
-                provider_meta["raw_output"] = raw_output_items
+        return failed("bad_request", "Encrypted content retry failed before receiving a response")
 
-            tool_calls: list[ToolCall] = []
-            for _idx, pc in sorted(pending_calls.items()):
-                tool_calls.append(ToolCall(
-                    id=pc["call_id"],
-                    name=pc["name"],
-                    arguments=_safe_json_loads(pc["arguments"]),
-                ))
+    async def _read_stream(
+        self,
+        stream: httpx.Response,
+        status: int,
+        *,
+        on_text: Callable[[str], Awaitable[None]] | None,
+        on_thinking: Callable[[str], Awaitable[None]] | None,
+        on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None,
+        may_retry_encrypted: bool,
+    ) -> Any:
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
+        refusal_parts: list[str] = []
+        calls = ToolCallAssembler(on_tool_delta)
+        usage: dict[str, int] | None = None
+        raw_output_items: list[dict[str, Any]] = []
+        finish_reason: str | None = None
+        detail = ""
+        # 见到 response.completed / incomplete 或 [DONE] 才算收尾；连接自己断了的流走不到这一步。
+        terminated = False
 
-            return ProviderResponse(
-                ok=True,
-                text="".join(text_parts) or None,
-                tool_calls=tool_calls,
-                reasoning="".join(thinking_parts) or None,
-                usage=_parse_usage(usage),
-                provider_meta=provider_meta,
-            )
+        def partial() -> dict[str, Any]:
+            return {"text": "".join(text_parts), "reasoning": "".join(thinking_parts), "usage": usage}
 
-        return ProviderResponse(ok=False, error="Encrypted content retry failed before receiving a response")
+        try:
+            async for sse_event in iter_sse_events(stream):
+                raw = sse_event["data"]
+                if raw.strip() == "[DONE]":
+                    terminated = True
+                    break
+                try:
+                    event = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                etype = event.get("type") or sse_event["event"]
 
-    # ------------------------------------------------------------------
-    # Payload builder (shared between chat and chat_stream)
-    # ------------------------------------------------------------------
+                if etype == "response.output_text.delta":
+                    delta = event.get("delta")
+                    if isinstance(delta, str) and delta:
+                        text_parts.append(delta)
+                        if on_text:
+                            await on_text(delta)
+
+                elif etype in ("response.reasoning_text.delta", "response.reasoning_summary_text.delta"):
+                    delta = event.get("delta")
+                    if isinstance(delta, str) and delta:
+                        thinking_parts.append(delta)
+                        if on_thinking:
+                            await on_thinking(delta)
+
+                elif etype == "response.refusal.delta":
+                    delta = event.get("delta")
+                    if isinstance(delta, str) and delta:
+                        refusal_parts.append(delta)
+
+                elif etype == "response.output_item.added":
+                    item = event.get("item")
+                    if isinstance(item, dict) and item.get("type") == "function_call":
+                        await calls.open(
+                            _output_index(event),
+                            call_id=str(item.get("call_id") or ""),
+                            name=str(item.get("name") or ""),
+                        )
+
+                elif etype == "response.function_call_arguments.delta":
+                    await calls.append(_output_index(event), event.get("delta"))
+
+                elif etype == "response.function_call_arguments.done":
+                    key = _output_index(event)
+                    arguments = event.get("arguments")
+                    calls.amend(key, arguments=arguments if isinstance(arguments, str) else None)
+                    await calls.close(key)
+
+                elif etype == "response.output_item.done":
+                    item = event.get("item")
+                    if isinstance(item, dict) and item.get("type") == "function_call":
+                        key = _output_index(event)
+                        call_id, name = str(item.get("call_id") or ""), str(item.get("name") or "")
+                        if not calls.is_open(key):
+                            # 有的中转只发 output_item.done，不发 added。
+                            await calls.open(key, call_id=call_id, name=name)
+                        arguments = item.get("arguments")
+                        calls.amend(
+                            key, call_id=call_id, name=name,
+                            arguments=arguments if isinstance(arguments, str) else None,
+                        )
+                        await calls.close(key)
+
+                elif etype in ("response.completed", "response.done", "response.incomplete"):
+                    response = event.get("response") if isinstance(event.get("response"), dict) else {}
+                    usage = _parse_usage(response.get("usage")) or usage
+                    output = response.get("output")
+                    if isinstance(output, list) and output:
+                        raw_output_items = output
+                    finish_reason, detail = _terminal_state(response, etype)
+                    terminated = True
+
+                elif etype == "response.failed":
+                    response = event.get("response") if isinstance(event.get("response"), dict) else {}
+                    error = read_error(response, fallback="response failed")
+                    if may_retry_encrypted and _is_encrypted_content_error(error.message):
+                        # 加密推理被拒也可能在连接建立之后才以 response.failed 报出来。
+                        log.warning(
+                            "Encrypted content verification failed, retrying stream without encrypted reasoning"
+                        )
+                        return _RETRY_WITHOUT_ENCRYPTED
+                    return upstream_failure(
+                        status, UpstreamError(f"API failed: {error.message}", error.type, error.code), **partial(),
+                    )
+
+                elif etype == "error":
+                    error = _stream_error(event)
+                    return upstream_failure(
+                        status, UpstreamError(f"Stream error: {error.message}", error.type, error.code), **partial(),
+                    )
+            if terminated:
+                await calls.finish()
+        except PluginExecutionError:
+            raise
+        except Exception as exc:
+            return exception_failure(exc, mid_stream=True, **partial())
+
+        text = "".join(text_parts)
+        refusal = "".join(refusal_parts)
+        tool_calls = calls.tool_calls()
+        if refusal and not text and not tool_calls and finish_reason in (None, "stop"):
+            finish_reason = "refusal"
+        return conclude(
+            terminated=terminated,
+            finish_reason=finish_reason,
+            status_code=status,
+            text=text,
+            reasoning="".join(thinking_parts),
+            tool_calls=tool_calls,
+            usage=usage,
+            provider_meta={"raw_output": raw_output_items} if raw_output_items else None,
+            detail=refusal or detail,
+        )
 
     def _build_payload(
         self,
@@ -806,139 +710,91 @@ class OpenAIResponsesProvider(BaseProvider):
             payload["reasoning"] = reasoning
         return payload
 
-    # ------------------------------------------------------------------
-    # Non-streaming response parser
-    # ------------------------------------------------------------------
-
     @staticmethod
-    def _parse_response(body: dict[str, Any]) -> ProviderResponse:
+    def _parse_response(body: dict[str, Any], status_code: int | None = None) -> ProviderResponse:
         """Parse a non-streaming Responses API JSON body into ProviderResponse."""
+        if body.get("error") or str(body.get("status") or "").strip().lower() == "failed":
+            return upstream_failure(status_code, read_error(body, fallback="response failed"))
+
         text_parts: list[str] = []
         thinking_parts: list[str] = []
+        refusal_parts: list[str] = []
         tool_calls: list[ToolCall] = []
-
-        for item in body.get("output", []):
+        output = body.get("output")
+        for item in output if isinstance(output, list) else []:
+            if not isinstance(item, dict):
+                continue
             itype = item.get("type", "")
-
             if itype == "message":
-                for block in item.get("content", []):
+                for block in item.get("content") or []:
+                    if not isinstance(block, dict):
+                        continue
                     if block.get("type") == "output_text":
-                        text_parts.append(block.get("text", ""))
-
+                        text_parts.append(str(block.get("text") or ""))
+                    elif block.get("type") == "refusal":
+                        refusal_parts.append(str(block.get("refusal") or ""))
             elif itype == "reasoning":
-                # Reasoning summary blocks
-                for block in item.get("summary", []):
-                    if block.get("type") == "summary_text":
-                        thinking_parts.append(block.get("text", ""))
-
+                for block in item.get("summary") or []:
+                    if isinstance(block, dict) and block.get("type") == "summary_text":
+                        thinking_parts.append(str(block.get("text") or ""))
             elif itype == "function_call":
-                tool_calls.append(ToolCall(
-                    id=item.get("call_id", ""),
-                    name=item.get("name", ""),
-                    arguments=_safe_json_loads(item.get("arguments", "{}")),
-                ))
+                name = str(item.get("name") or "").strip()
+                if name:
+                    tool_calls.append(ToolCall(
+                        id=str(item.get("call_id") or "") or new_call_id(),
+                        name=name,
+                        arguments=parse_tool_arguments(item.get("arguments")),
+                    ))
 
-        return ProviderResponse(
-            ok=True,
-            text="".join(text_parts) or None,
+        text = "".join(text_parts)
+        refusal = "".join(refusal_parts)
+        finish_reason, detail = _terminal_state(body)
+        if refusal and not text and not tool_calls and finish_reason == "stop":
+            finish_reason = "refusal"
+        return conclude(
+            terminated=True,
+            finish_reason=finish_reason,
+            status_code=status_code,
+            text=text,
+            reasoning="".join(thinking_parts),
             tool_calls=tool_calls,
-            reasoning="".join(thinking_parts) or None,
-            usage=_parse_usage(body.get("usage", {})),
+            usage=_parse_usage(body.get("usage")),
+            # 原始 output 带着加密推理，下一轮要原样回传。
+            provider_meta={"raw_output": output} if isinstance(output, list) and output else None,
+            detail=refusal or detail,
         )
 
 
-# ======================================================================
-# Module-level helpers
-# ======================================================================
-
 def _extract_text(msg: dict[str, Any]) -> str:
-    """Extract plain text from a chat/completions message.
-
-    Handles both string content and the list-of-blocks format.
-    """
-    content = msg.get("content")
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    # list-of-blocks: concatenate all text blocks
-    parts: list[str] = []
-    for block in content:
-        if isinstance(block, str):
-            parts.append(block)
-        elif isinstance(block, dict) and block.get("type") == "text":
-            parts.append(block.get("text", ""))
-    return "".join(parts)
+    """Extract plain text from a chat/completions message."""
+    return content_text(msg.get("content"))
 
 
 def _build_user_content(msg: dict[str, Any]) -> list[dict[str, Any]]:
-    """Convert a user message's content into Responses API content blocks.
-
-    Handles:
-      - Plain string → [{type: input_text, text: ...}]
-      - List with text blocks → input_text
-      - List with image_url blocks → input_image
-    """
-    content = msg.get("content", "")
-    if isinstance(content, str):
-        return [{"type": "input_text", "text": content}]
-
+    """Convert a user message's content into Responses API content blocks (input_text / input_image)."""
     result: list[dict[str, Any]] = []
-    for block in content:
-        if isinstance(block, str):
-            result.append({"type": "input_text", "text": block})
-        elif isinstance(block, dict):
-            btype = block.get("type", "")
-            if btype == "text":
-                result.append({"type": "input_text", "text": block.get("text", "")})
-            elif btype == "image_url":
-                url = image_part_url(block)
-                # 空地址发出去就是一个 400，宁可让模型知道这里本该有张图。
-                if url:
-                    result.append({"type": "input_image", "image_url": url})
-                else:
-                    result.append({"type": "input_text", "text": "[image could not be converted]"})
+    for block in content_parts(msg.get("content")):
+        btype = block.get("type", "")
+        if btype == "text":
+            result.append({"type": "input_text", "text": str(block.get("text") or "")})
+        elif btype == "image_url":
+            url = image_part_url(block)
+            # 空地址发出去就是一个 400，宁可让模型知道这里本该有张图。
+            if url:
+                result.append({"type": "input_image", "image_url": url})
+            else:
+                result.append({"type": "input_text", "text": "[image could not be converted]"})
     return result or [{"type": "input_text", "text": ""}]
 
 
-def _arguments_to_json_string(raw: Any) -> str:
-    """Return a JSON object string for a function_call.arguments field.
-
-    [2026-05-01] Clonoth stores simplified tool arguments as dicts, while
-    chat/completions stores function.arguments as a JSON string.  Responses
-    input items require the string form, so this helper normalizes both shapes.
-    """
-    if isinstance(raw, str):
-        return raw if raw.strip() else "{}"
-    if isinstance(raw, dict):
-        return json.dumps(raw, ensure_ascii=False)
-    if raw is None:
-        return "{}"
-    return json.dumps(raw, ensure_ascii=False)
-
-
 def _normalize_tool_call(tc: Any) -> dict[str, str] | None:
-    """Normalize one tool call into Responses function_call fields.
-
-    Supports the nested chat/completions shape and Clonoth's storage shape:
-    ``{"id", "function": {"name", "arguments"}}`` and
-    ``{"id", "name", "arguments"}`` respectively.
-    """
-    if not isinstance(tc, dict):
+    """历史里的一次工具调用 → Responses function_call 的字段。Responses 只收文本形式的参数。"""
+    fields = tool_call_fields(tc)
+    if fields is None:
         return None
-
-    call_id = str(tc.get("id") or "")
-    fn = tc.get("function")
-    if isinstance(fn, dict):
-        name = str(fn.get("name") or "").strip()
-        raw_args = fn.get("arguments", "{}")
-    else:
-        name = str(tc.get("name") or "").strip()
-        raw_args = tc.get("arguments", {})
-
-    if not name:
-        return None
-    return {"call_id": call_id, "name": name, "arguments": _arguments_to_json_string(raw_args)}
+    call_id, name, arguments = fields
+    text = arguments_json(arguments)
+    return {"call_id": call_id, "name": name, "arguments": text if text.strip() else "{}"}
 
 
 def _parse_native_tool_result(text: str) -> dict[str, str] | None:
@@ -957,12 +813,9 @@ def _parse_native_tool_result(text: str) -> dict[str, str] | None:
 def _parse_engine_tool_result(text: str) -> dict[str, str] | None:
     """Parse engine-generated pseudo-tool result text.
 
-    [2026-05-01] Some pseudo tools currently append bracketed result text such
-    as ``[dispatch:target result: ...]`` instead of using format_tool_result().
-    [2026-05-04] Dynamic dispatch tools may have names like dispatch:target, and
-    the stored result marker now keeps that exact name. The Responses provider
-    still has to pair that text with the preceding function_call, otherwise the
-    next API request contains an unpaired tool call.
+    Some pseudo tools store bracketed text such as ``[dispatch:target result: ...]``
+    instead of using format_tool_result(); it must still pair with the preceding
+    function_call, or the next request carries an unpaired tool call.
     """
     raw = text or ""
     match = _ENGINE_TOOL_RESULT_RE.match(raw)
@@ -1018,11 +871,9 @@ def _flush_unpaired_function_calls(
 ) -> None:
     """Emit synthetic outputs for pending calls that have no stored result.
 
-    [2026-05-01] Terminal pseudo tools such as switch_node, and some historical
-    compact paths, can leave an assistant function_call without a following
-    stored result.  Responses requires every function_call to be paired with a
-    function_call_output before later messages, so this keeps the request valid
-    while making the missing result explicit to the model.
+    Terminal pseudo tools such as switch_node, and some compacted histories, can
+    leave a function_call without a stored result. Responses requires every
+    function_call to be paired before later messages.
     """
     while pending_calls:
         pending = pending_calls.pop(0)
@@ -1031,18 +882,3 @@ def _flush_unpaired_function_calls(
             "call_id": pending.get("call_id", ""),
             "output": _SYNTHETIC_TOOL_OUTPUT,
         })
-
-
-def _safe_json_loads(s: str | dict) -> dict:
-    """Parse a JSON string into a dict, returning {} on failure.
-
-    If the input is already a dict (shouldn't happen from the API but
-    defensive), return it directly.
-    """
-    if isinstance(s, dict):
-        return s
-    try:
-        parsed = json.loads(s)
-        return parsed if isinstance(parsed, dict) else {}
-    except (json.JSONDecodeError, TypeError):
-        return {}

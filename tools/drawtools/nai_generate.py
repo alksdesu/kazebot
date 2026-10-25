@@ -57,8 +57,23 @@ SPEC = {
 TIMEOUT_SEC = 180.0
 
 
+def curl_request(
+    api_url: str, api_key: str, *, timeout_sec: int, payload_path: str, output_path: str,
+) -> tuple[list[str], str]:
+    """(curl 参数, 从 stdin 喂给 curl 的请求头)。"""
+    # 密钥只走 stdin：写进命令行参数的话，同机任何用户 ps 一下就能看到。
+    argv = [
+        "curl", "-s", "-m", str(timeout_sec),
+        api_url,
+        "-H", "@-",
+        "-d", f"@{payload_path}",
+        "-o", output_path,
+        "-w", "%{http_code}",
+    ]
+    return argv, f"Authorization: Bearer {api_key}\nContent-Type: application/json\n"
+
+
 if __name__ == "__main__":
-    import base64
     import hashlib
     import json
     import contextlib
@@ -335,16 +350,13 @@ if __name__ == "__main__":
                     tmp_zip.unlink(missing_ok=True)
                 except Exception:
                     pass
+                curl_argv, curl_headers = curl_request(
+                    api_url, api_key,
+                    timeout_sec=timeout_sec, payload_path=str(tmp_payload), output_path=str(tmp_zip),
+                )
                 result = subprocess.run(
-                    [
-                        "curl", "-s", "-m", str(timeout_sec),
-                        api_url,
-                        "-H", f"Authorization: Bearer {api_key}",
-                        "-H", "Content-Type: application/json",
-                        "-d", f"@{tmp_payload}",
-                        "-o", str(tmp_zip),
-                        "-w", "%{http_code}",
-                    ],
+                    curl_argv,
+                    input=curl_headers,
                     capture_output=True,
                     text=True,
                     timeout=timeout_sec + 10,

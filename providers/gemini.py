@@ -1,13 +1,8 @@
 """
 Google Gemini native API provider.
 
-Implements the BaseProvider interface for Gemini's generateContent /
-streamGenerateContent endpoints. Converts OpenAI-format messages and tools
-to Gemini's native format.
-
-Created: 2026-05-01
-Reason: Complete the provider trio (Anthropic, OpenAI, Gemini) so the engine
-        can route to Gemini models natively without an OpenAI-compatible shim.
+Talks to generateContent / streamGenerateContent, converting OpenAI-format
+messages and tools to Gemini's native format.
 """
 
 from __future__ import annotations
@@ -19,12 +14,17 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from plugin_sdk import PluginExecutionError
+from tools._wire import WIRE_GEMINI, headers as wire_headers
 
-from .plugin_transport import PluginTransportError, iter_sse_events, wrap_client
-
-from .base import BaseProvider, ProviderResponse, ToolCall, image_part_url, split_data_url
+from .assembly import ToolCallAssembler, conclude, int_field, parse_tool_arguments, usage_dict
+from .base import (
+    BaseProvider, ProviderResponse, content_parts, content_text, image_part_url, provider_metadata,
+    split_data_url, tool_call_fields,
+)
 from .degrade import DegradeRule, degrade, set_option
+from .failures import exception_failure, failed, read_error, upstream_failure
 from .options import BOOL, ENUM, FLOAT, INT, OptionSet, OptionSpec
+from .plugin_transport import iter_sse_events, wrap_client
 
 log = logging.getLogger(__name__)
 
@@ -39,36 +39,121 @@ _HARM_CATEGORIES = (
     "HARM_CATEGORY_JAILBREAK",
 )
 
+# finishReason → 统一的 finish_reason。
+_FINISH_REASONS = {
+    "STOP": "stop",
+    "MAX_TOKENS": "length",
+    "SAFETY": "content_filter",
+    "RECITATION": "content_filter",
+    "BLOCKLIST": "content_filter",
+    "PROHIBITED_CONTENT": "content_filter",
+    "SPII": "content_filter",
+    "IMAGE_SAFETY": "content_filter",
+    "IMAGE_PROHIBITED_CONTENT": "content_filter",
+    "IMAGE_RECITATION": "content_filter",
+}
+# 模型想调工具却写坏了：什么都没产出时算一次无效响应，换一次大概率就好。
+_EMPTY_KINDS = {
+    "MALFORMED_FUNCTION_CALL": "invalid_response",
+    "UNEXPECTED_TOOL_CALL": "invalid_response",
+    "TOO_MANY_TOOL_CALLS": "invalid_response",
+}
 
-def _error_message(payload: Any, fallback: str) -> str:
-    if isinstance(payload, dict):
-        err = payload.get("error")
-        if isinstance(err, dict):
-            message = err.get("message")
-            if isinstance(message, str) and message:
-                return message
-    return fallback
+
+class _Collected:
+    """一次响应里各类 part 的累积。流式和非流式共用，回调只有流式才给。"""
+
+    def __init__(
+        self,
+        *,
+        on_text: Callable[[str], Awaitable[None]] | None = None,
+        on_thinking: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> None:
+        self.text: list[str] = []
+        self.thinking: list[str] = []
+        self.inline_data: list[dict[str, Any]] = []
+        # Gemini 3 要求整个 response 的 parts 原样回传，任何一块都可能带 thoughtSignature。
+        self.raw_parts: list[dict[str, Any]] = []
+        self.calls = ToolCallAssembler(on_tool_delta)
+        self._on_text = on_text
+        self._on_thinking = on_thinking
+
+    async def take(self, parts: Any) -> None:
+        for part in parts if isinstance(parts, list) else []:
+            if not isinstance(part, dict):
+                continue
+            self.raw_parts.append(part)
+            if part.get("thought"):
+                chunk = part.get("text")
+                if isinstance(chunk, str) and chunk:
+                    self.thinking.append(chunk)
+                    if self._on_thinking:
+                        await self._on_thinking(chunk)
+            elif "text" in part:
+                chunk = part.get("text")
+                if isinstance(chunk, str) and chunk:
+                    self.text.append(chunk)
+                    if self._on_text:
+                        await self._on_text(chunk)
+            elif isinstance(part.get("functionCall"), dict):
+                call = part["functionCall"]
+                # 没有 id 时由 assembler 补一个全局唯一的；各轮都从 call_1 编号会让审批和结果配错对象。
+                await self.calls.add_complete(
+                    call_id=str(call.get("id") or ""), name=str(call.get("name") or ""), arguments=call.get("args"),
+                )
+            elif isinstance(part.get("inlineData"), dict):
+                self.inline_data.append(part["inlineData"])
+
+
+def _gemini_response(
+    collected: _Collected,
+    *,
+    status: int | None,
+    terminated: bool,
+    finish_raw: Any,
+    block_reason: Any,
+    usage: dict[str, int] | None,
+    raw: dict[str, Any] | None = None,
+) -> ProviderResponse:
+    """流式和非流式共用的收尾判定。"""
+    text = "".join(collected.text)
+    tool_calls = collected.calls.tool_calls()
+    if block_reason and not text and not tool_calls and not collected.inline_data:
+        return failed(
+            "content_filter", f"Blocked by safety filter: {block_reason}",
+            status_code=status, finish_reason="content_filter", usage=usage, raw=raw,
+        )
+    key = str(finish_raw or "").strip().upper()
+    finish_reason = _FINISH_REASONS.get(key)
+    return conclude(
+        terminated=terminated,
+        finish_reason=finish_reason,
+        status_code=status,
+        text=text,
+        reasoning="".join(collected.thinking),
+        tool_calls=tool_calls,
+        usage=usage,
+        inline_data=collected.inline_data,
+        provider_meta={"raw_parts": collected.raw_parts} if collected.raw_parts else None,
+        raw=raw,
+        empty_kind=_EMPTY_KINDS.get(key) or ("unknown" if key and finish_reason is None else None),
+        detail=f"upstream stopped (finishReason={finish_raw})" if finish_raw else "",
+    )
 
 
 class GeminiProvider(BaseProvider):
     """Provider for Google Gemini (generativelanguage.googleapis.com)."""
 
-    # [provider-registry 2026-05-03] 这是自动发现注册使用的 key。
-    # 原因：engine 不再硬编码 GeminiProvider 分支；做法：类声明 provider_name；
-    # 目的：registry 能把配置里的 "gemini" 映射回这个类。
     provider_name = "gemini"
     official_hosts = ("generativelanguage.googleapis.com",)
     default_base_url = "https://generativelanguage.googleapis.com"
 
     @classmethod
     def catalog_request(cls, *, base_url: str, api_key: str):
-        base = (base_url or cls.default_base_url).rstrip("/")
-        # 认证方式跟 _headers() 一致：官方域名收 x-goog-api-key，中转站收 Bearer。
-        if "googleapis.com" in base:
-            headers = {"x-goog-api-key": api_key}
-        else:
-            headers = {"Authorization": f"Bearer {api_key}"}
-        return f"{base}/v1beta/models", headers
+        base = cls.resolve_base_url(base_url)
+        # 鉴权头和 _headers() 同一份判定，否则拉得到列表却聊不了天。
+        return f"{base}/v1beta/models", wire_headers(WIRE_GEMINI, base, api_key)
 
     @staticmethod
     def parse_catalog(payload):
@@ -168,13 +253,10 @@ class GeminiProvider(BaseProvider):
         model: str,
         provider_options: dict[str, Any] | None = None,
     ):
-        # [provider-registry 2026-05-03] 实例 name 复用 provider_name。
-        # 原因：下游仍通过 provider.name 判断 provider 特性；做法：从类属性传入；
-        # 目的：注册 key、实例名和配置 provider 字段保持一致。
         super().__init__(model=model, name=self.provider_name)
         self._http = wrap_client(http, self)
         self._api_key = api_key
-        self._base_url = (base_url or self.default_base_url).rstrip("/")
+        self._base_url = self.resolve_base_url(base_url)
         self._options = OptionSet(self.OPTIONS, provider_options)
         self._timeout = float(self._options.get("timeout_sec"))
         unknown = self._options.unknown_keys()
@@ -186,27 +268,14 @@ class GeminiProvider(BaseProvider):
             self.DEGRADE_RULES, self._options, error, provider="gemini", model=self.model,
         ) is not None
 
-    # ── URL helpers ──────────────────────────────────────────────────
-
     def _endpoint(self, stream: bool = False) -> str:
         """Build the request URL for generateContent / streamGenerateContent."""
         action = "streamGenerateContent?alt=sse" if stream else "generateContent"
         return f"{self._base_url}/v1beta/models/{self.model}:{action}"
 
     def _headers(self) -> dict[str, str]:
-        """Return auth headers.
-
-        Official googleapis.com → x-goog-api-key header.
-        Reverse-proxy (any other base_url) → standard Bearer token.
-        """
-        h: dict[str, str] = {"Content-Type": "application/json"}
-        if "googleapis.com" in self._base_url:
-            h["x-goog-api-key"] = self._api_key
-        else:
-            h["Authorization"] = f"Bearer {self._api_key}"
-        return h
-
-    # ── Message conversion ───────────────────────────────────────────
+        """Official googleapis.com takes x-goog-api-key; reverse proxies take a Bearer token."""
+        return wire_headers(WIRE_GEMINI, self._base_url, self._api_key)
 
     @staticmethod
     def _convert_messages(
@@ -233,67 +302,44 @@ class GeminiProvider(BaseProvider):
         for msg in messages:
             role = msg.get("role", "")
 
-            # ── system ──
             if role == "system":
                 txt = _extract_text(msg)
                 if txt:
                     system_parts.append(txt)
                 continue
 
-            # ── user ──
             if role == "user":
                 contents.append({"role": "user", "parts": _user_parts(msg)})
                 continue
 
-            # ── assistant / model ──
             if role == "assistant":
-                # [2026-05-01] Gemini 3 文档要求 "Return the entire response with
-                # all parts back to the model"。任何 part（text/functionCall/thought）
-                # 都可能带 thoughtSignature，必须原样回传，不能合并或重建。
-                # 优先使用 provider_meta 中保存的原始 parts。
-                _meta = msg.get("_meta")
-                _raw_parts = None
-                if isinstance(_meta, dict):
-                    _gem_meta = _meta.get("metadata", {}).get("gemini", {})
-                    _raw_parts = _gem_meta.get("raw_parts")
-
-                if _raw_parts and isinstance(_raw_parts, list):
-                    # 有原始 parts：直接用，保留所有 thoughtSignature
-                    # 同时从 functionCall parts 中提取 tc_id_to_name 映射
-                    # 使用独立计数器避免多轮 ID 冲突
-                    _fc_idx = 0
-                    for rp in _raw_parts:
-                        fc = rp.get("functionCall")
-                        if fc:
-                            _fc_idx += 1
-                            tc_id_to_name[f"call_{_fc_idx}"] = fc.get("name", "")
-                    contents.append({"role": "model", "parts": _raw_parts})
+                calls = [fields for fields in map(tool_call_fields, msg.get("tool_calls") or []) if fields]
+                # Gemini 3 要求整条回复的 parts 原样回传：任何一块都可能带 thoughtSignature，不能合并或重建。
+                raw_parts = provider_metadata(msg, "gemini").get("raw_parts")
+                if raw_parts and isinstance(raw_parts, list):
+                    # 早先的 id 是按 functionCall 出现顺序编的 call_1、call_2，没存 tool_calls 的旧历史只能这样对回名字。
+                    position = 0
+                    for part in raw_parts:
+                        call = part.get("functionCall") if isinstance(part, dict) else None
+                        if isinstance(call, dict):
+                            position += 1
+                            tc_id_to_name[f"call_{position}"] = str(call.get("name") or "")
+                    contents.append({"role": "model", "parts": raw_parts})
                 else:
-                    # 无原始 parts（旧消息或非 Gemini provider 产生的历史）：从 OpenAI 格式重建
+                    # 旧消息或别家 provider 产生的历史：从 tool_calls 重建。
                     parts: list[dict[str, Any]] = []
                     txt = _extract_text(msg)
                     if txt:
                         parts.append({"text": txt})
-                    for tc in msg.get("tool_calls") or []:
-                        # Support both OpenAI API format {function: {name, arguments}}
-                        # and Clonoth simplified storage format {name, arguments}
-                        fn = tc.get("function") or {}
-                        name = fn.get("name", "") or tc.get("name", "")
-                        tc_id = tc.get("id", "")
-                        if tc_id:
-                            tc_id_to_name[tc_id] = name
-                        raw_args = fn.get("arguments", tc.get("arguments", {}))
-                        if isinstance(raw_args, str):
-                            try:
-                                raw_args = json.loads(raw_args)
-                            except (json.JSONDecodeError, TypeError):
-                                raw_args = {}
-                        parts.append({"functionCall": {"name": name, "args": raw_args}})
+                    for _call_id, name, arguments in calls:
+                        parts.append({"functionCall": {"name": name, "args": parse_tool_arguments(arguments)}})
                     if parts:
                         contents.append({"role": "model", "parts": parts})
+                for call_id, name, _arguments in calls:
+                    if call_id:
+                        tc_id_to_name[call_id] = name
                 continue
 
-            # ── tool result ──
             if role == "tool":
                 tc_id = msg.get("tool_call_id", "")
                 # Resolve function name: prefer msg["name"] if present,
@@ -321,15 +367,13 @@ class GeminiProvider(BaseProvider):
                     })
                 continue
 
-            # ── fallback: treat unknown roles as user ──
+            # 认不出的角色按用户消息发。
             txt = _extract_text(msg)
             if txt:
                 contents.append({"role": "user", "parts": [{"text": txt}]})
 
         system_text = "\n\n".join(system_parts) if system_parts else None
         return system_text, contents
-
-    # ── Tool declaration conversion ──────────────────────────────────
 
     @staticmethod
     def _convert_tools(
@@ -354,8 +398,6 @@ class GeminiProvider(BaseProvider):
                 decl["parameters"] = _clean_schema(fn["parameters"])
             decls.append(decl)
         return [{"functionDeclarations": decls}] if decls else None
-
-    # ── Build request body ───────────────────────────────────────────
 
     def _build_body(
         self,
@@ -397,8 +439,6 @@ class GeminiProvider(BaseProvider):
             config["includeThoughts"] = True
         return config
 
-    # ── Non-streaming chat ───────────────────────────────────────────
-
     async def chat(
         self,
         *,
@@ -417,28 +457,22 @@ class GeminiProvider(BaseProvider):
             except PluginExecutionError:
                 raise
             except Exception as exc:
-                return ProviderResponse(ok=False, error=f"Gemini request failed: {exc}")
+                return exception_failure(exc)
 
-            if resp.status_code == 200:
+            if resp.status_code < 400:
                 break
-            if (
-                resp.status_code == 400
-                and attempt < _MAX_DEGRADE_ROUNDS
-                and self._degrade(_response_error_text(resp))
-            ):
+            error = read_error(resp.content, fallback=f"HTTP {resp.status_code}")
+            if resp.status_code == 400 and attempt < _MAX_DEGRADE_ROUNDS and self._degrade(error.message):
                 continue
-            return _error_from_response(resp)
+            return upstream_failure(resp.status_code, error)
 
         try:
             data = resp.json()
         except Exception:
-            return ProviderResponse(
-                ok=False, error="Gemini returned non-JSON response", status_code=resp.status_code,
-            )
-
-        return _parse_response(data)
-
-    # ── Streaming chat ───────────────────────────────────────────────
+            data = None
+        if not isinstance(data, dict):
+            return failed("invalid_response", "Gemini returned non-JSON response", status_code=resp.status_code)
+        return await _parse_response(data, status_code=resp.status_code)
 
     async def chat_stream(
         self,
@@ -463,144 +497,100 @@ class GeminiProvider(BaseProvider):
         except PluginExecutionError:
             raise
         except Exception as exc:
-            return ProviderResponse(ok=False, error=f"Gemini stream request failed: {exc}")
-
-        if resp.status_code != 200:
-            # Need to read the body for error details
-            try:
-                raw_body = await resp.aread()
-                error_text = raw_body.decode("utf-8", errors="replace")
-                try:
-                    msg = _error_message(json.loads(error_text), error_text[:500])
-                except (json.JSONDecodeError, TypeError):
-                    msg = error_text[:500]
-            except Exception:
-                msg = f"HTTP {resp.status_code}"
-            finally:
-                await resp.aclose()
-            if (
-                resp.status_code == 400
-                and _attempt < _MAX_DEGRADE_ROUNDS
-                and self._degrade(msg)
-            ):
-                # 状态码先于任何流式分片到达，重来不会让调用方看到半截内容。
-                return await self.chat_stream(
-                    messages=messages, tools=tools, on_text=on_text,
-                    on_thinking=on_thinking, on_tool_delta=on_tool_delta,
-                    _attempt=_attempt + 1,
-                )
-            return ProviderResponse(ok=False, error=msg, status_code=resp.status_code)
-
-        # Accumulate streaming chunks
-        text_parts: list[str] = []
-        thinking_parts: list[str] = []
-        tool_calls: list[ToolCall] = []
-        usage: dict[str, int] = {}
-        inline_data_list: list[dict[str, Any]] = []
-        tc_counter = 0  # for generating synthetic tool_call ids
-        # [2026-05-01] 收集所有原始 parts，Gemini 3 要求整个 response 原样回传
-        all_raw_parts: list[dict[str, Any]] = []
+            return exception_failure(exc)
 
         try:
-            async for sse_event in iter_sse_events(resp):
-                json_str = sse_event["data"]
-                if not json_str.strip():
-                    continue
-                try:
-                    chunk_data = json.loads(json_str)
-                except json.JSONDecodeError:
-                    continue
-
-                # Extract parts from the first candidate
-                candidates = chunk_data.get("candidates") or []
-                if candidates:
-                    parts = (candidates[0].get("content") or {}).get("parts") or []
-                    for part in parts:
-                        # 收集所有原始 parts 用于 round-trip
-                        all_raw_parts.append(part)
-                        # Thinking / reasoning parts
-                        if part.get("thought"):
-                            t = part.get("text", "")
-                            if t:
-                                thinking_parts.append(t)
-                                if on_thinking:
-                                    await on_thinking(t)
-                        # Regular text
-                        elif "text" in part:
-                            t = part["text"]
-                            text_parts.append(t)
-                            if on_text:
-                                await on_text(t)
-                        # Function calls
-                        elif "functionCall" in part:
-                            fc = part["functionCall"]
-                            tc_counter += 1
-                            tc_id = f"call_{tc_counter}"
-                            tc_index = tc_counter - 1
-                            tc_name = fc.get("name", "")
-                            tc_args_raw = fc.get("args") or {}
-                            tc_args = tc_args_raw if isinstance(tc_args_raw, dict) else {"_raw": tc_args_raw}
-                            # [tool-stream 2026-05-19] Gemini 当前返回完整 functionCall part，而非逐字符参数流。
-                            # 原因：没有真实 args delta 时仍要接入统一实时管道。
-                            # 做法：收到完整 functionCall 后合成 start、完整 args_delta、done 三个事件。
-                            # 目的：前端和 supervisor 不需要为 Gemini 维护另一套非流式工具调用逻辑。
-                            if on_tool_delta:
-                                await on_tool_delta({
-                                    "event": "tool_call_start",
-                                    "index": tc_index,
-                                    "id": tc_id,
-                                    "name": tc_name,
-                                })
-                                await on_tool_delta({
-                                    "event": "tool_call_args_delta",
-                                    "index": tc_index,
-                                    "delta": json.dumps(tc_args, ensure_ascii=False),
-                                })
-                                await on_tool_delta({"event": "tool_call_done", "index": tc_index})
-                            tool_calls.append(ToolCall(
-                                id=tc_id,
-                                name=tc_name,
-                                arguments=tc_args,
-                            ))
-                        # Inline data (images etc generated by model)
-                        elif "inlineData" in part:
-                            inline_data_list.append(part["inlineData"])
-
-                # Usage metadata (typically present in the last chunk)
-                um = chunk_data.get("usageMetadata")
-                if um:
-                    usage = _parse_usage(um)
-        except PluginExecutionError:
-            raise
-        except PluginTransportError as exc:
-            return ProviderResponse(ok=False, error=str(exc))
-        except Exception as exc:
-            # Partial result is still better than nothing; log and continue
-            log.warning("Gemini stream read error: %s", exc)
+            if resp.status_code < 400:
+                return await self._read_stream(
+                    resp, on_text=on_text, on_thinking=on_thinking, on_tool_delta=on_tool_delta,
+                )
+            try:
+                error_body: bytes = await resp.aread()
+            except PluginExecutionError:
+                raise
+            except Exception:
+                error_body = b""
         finally:
             await resp.aclose()
 
-        full_text = "".join(text_parts) or None
-        reasoning = "".join(thinking_parts) or None
+        error = read_error(error_body, fallback=f"HTTP {resp.status_code}")
+        if resp.status_code == 400 and _attempt < _MAX_DEGRADE_ROUNDS and self._degrade(error.message):
+            # 状态码先于任何流式分片到达，重来不会让调用方看到半截内容。
+            return await self.chat_stream(
+                messages=messages, tools=tools, on_text=on_text,
+                on_thinking=on_thinking, on_tool_delta=on_tool_delta,
+                _attempt=_attempt + 1,
+            )
+        return upstream_failure(resp.status_code, error)
 
-        # [2026-05-01] 存储所有原始 parts，Gemini 3 要求整个 response 原样回传
-        provider_meta: dict[str, Any] = {}
-        if all_raw_parts:
-            provider_meta["raw_parts"] = all_raw_parts
+    async def _read_stream(
+        self,
+        resp: httpx.Response,
+        *,
+        on_text: Callable[[str], Awaitable[None]] | None,
+        on_thinking: Callable[[str], Awaitable[None]] | None,
+        on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None,
+    ) -> ProviderResponse:
+        status = int(resp.status_code)
+        collected = _Collected(on_text=on_text, on_thinking=on_thinking, on_tool_delta=on_tool_delta)
+        usage: dict[str, int] | None = None
+        finish_raw: Any = None
+        block_reason: Any = None
+        # 见到 finishReason、提示被拦或 [DONE] 才算收尾；连接自己断了的流走不到这一步。
+        terminated = False
 
-        return ProviderResponse(
-            ok=True,
-            text=full_text,
-            tool_calls=tool_calls,
-            reasoning=reasoning,
-            usage=usage or None,
-            inline_data=inline_data_list,
-            raw=None,
-            provider_meta=provider_meta,
+        def partial() -> dict[str, Any]:
+            return {"text": "".join(collected.text), "reasoning": "".join(collected.thinking), "usage": usage}
+
+        try:
+            async for sse_event in iter_sse_events(resp):
+                data = sse_event["data"].strip()
+                if not data:
+                    continue
+                if data == "[DONE]":
+                    terminated = True
+                    break
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    continue
+                if isinstance(chunk, list):
+                    chunk = next((item for item in chunk if isinstance(item, dict)), None)
+                if not isinstance(chunk, dict):
+                    continue
+                if chunk.get("error"):
+                    return upstream_failure(status, read_error(chunk), **partial())
+
+                feedback = chunk.get("promptFeedback")
+                if isinstance(feedback, dict) and feedback.get("blockReason"):
+                    block_reason = feedback["blockReason"]
+                    terminated = True
+                candidates = chunk.get("candidates")
+                candidate = candidates[0] if isinstance(candidates, list) and candidates else None
+                if isinstance(candidate, dict):
+                    content = candidate.get("content") if isinstance(candidate.get("content"), dict) else {}
+                    await collected.take(content.get("parts"))
+                    if candidate.get("finishReason"):
+                        finish_raw = candidate["finishReason"]
+                        terminated = True
+                if isinstance(chunk.get("usageMetadata"), dict):
+                    usage = _parse_usage(chunk["usageMetadata"]) or usage
+            if terminated:
+                await collected.calls.finish()
+        except PluginExecutionError:
+            raise
+        except Exception as exc:
+            return exception_failure(exc, mid_stream=True, **partial())
+
+        return _gemini_response(
+            collected,
+            status=status,
+            terminated=terminated,
+            finish_raw=finish_raw,
+            block_reason=block_reason,
+            usage=usage,
         )
 
-
-# ── Module-level helpers ─────────────────────────────────────────────
 
 
 def _extract_text(msg: dict[str, Any]) -> str | None:
@@ -609,49 +599,27 @@ def _extract_text(msg: dict[str, Any]) -> str | None:
     Handles both plain-string content and the OpenAI multi-part
     [{"type": "text", "text": "..."}] format.
     """
-    content = msg.get("content")
-    if content is None:
-        return None
-    if isinstance(content, str):
-        return content or None
-    # Multi-part array (OpenAI vision format)
-    if isinstance(content, list):
-        texts = [p.get("text", "") for p in content if p.get("type") == "text"]
-        joined = "".join(texts)
-        return joined or None
-    return None
+    return content_text(msg.get("content")) or None
 
 
 def _user_parts(msg: dict[str, Any]) -> list[dict[str, Any]]:
-    """Build Gemini 'parts' array for a user message.
-
-    Handles plain text and OpenAI multi-modal content arrays
-    (text + image_url with base64 data URIs).
-    """
-    content = msg.get("content", "")
-    if isinstance(content, str):
-        return [{"text": content}] if content else [{"text": ""}]
-    if isinstance(content, list):
-        parts: list[dict[str, Any]] = []
-        for item in content:
-            if not isinstance(item, dict):
-                parts.append({"text": str(item)})
-                continue
-            if item.get("type") == "text":
-                parts.append({"text": item.get("text", "")})
-            elif item.get("type") == "image_url":
-                url = image_part_url(item)
-                parsed = split_data_url(url)
-                if parsed:
-                    mime, b64data = parsed
-                    parts.append({"inlineData": {"mimeType": mime, "data": b64data}})
-                elif url:
-                    # Gemini 不收任意 http(s) 地址，只能把地址本身作为文本交出去。
-                    parts.append({"text": f"[Image: {url}]"})
-                else:
-                    parts.append({"text": "[image could not be converted]"})
-        return parts or [{"text": ""}]
-    return [{"text": str(content)}]
+    """Build Gemini 'parts' array for a user message (text + image_url with base64 data URIs)."""
+    parts: list[dict[str, Any]] = []
+    for item in content_parts(msg.get("content")):
+        if item.get("type") == "text":
+            parts.append({"text": str(item.get("text") or "")})
+        elif item.get("type") == "image_url":
+            url = image_part_url(item)
+            parsed = split_data_url(url)
+            if parsed:
+                mime, b64data = parsed
+                parts.append({"inlineData": {"mimeType": mime, "data": b64data}})
+            elif url:
+                # Gemini 不收任意 http(s) 地址，只能把地址本身作为文本交出去。
+                parts.append({"text": f"[Image: {url}]"})
+            else:
+                parts.append({"text": "[image could not be converted]"})
+    return parts or [{"text": ""}]
 
 
 def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -674,14 +642,7 @@ def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
         elif k in ("anyOf", "oneOf", "allOf") and isinstance(v, list):
             cleaned[k] = [_clean_schema(item) if isinstance(item, dict) else item for item in v]
         elif k == "enum" and isinstance(v, list):
-            # [2026-05-06] Gemini rejects empty enum members in function schemas.
-            # Why: stale or dynamically generated tools can contain target enum values
-            # such as "" for internal runtime semantics, which causes Gemini to reject
-            # the whole GenerateContentRequest before the model runs. How: remove None
-            # and blank-string members, de-duplicate the remaining values while keeping
-            # their order, and omit enum entirely if nothing valid remains. Purpose: keep
-            # Gemini requests valid without changing the runtime handlers that may still
-            # accept an omitted or empty argument value.
+            # 生成出来的工具 enum 里可能混进 None 或空串，Gemini 见到就整个请求拒收。
             enum_values: list[Any] = []
             for item in v:
                 if item is None:
@@ -697,101 +658,50 @@ def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
-def _parse_usage(um: dict[str, Any]) -> dict[str, int]:
-    """Convert Gemini usageMetadata to the standard usage dict format."""
-    usage = {
-        "prompt_tokens": um.get("promptTokenCount", 0),
-        "completion_tokens": um.get("candidatesTokenCount", 0),
-        "total_tokens": um.get("totalTokenCount", 0),
-    }
-    cached = um.get("cachedContentTokenCount")
-    if isinstance(cached, int) and cached:
-        usage["cache_read_tokens"] = cached
-    thoughts = um.get("thoughtsTokenCount")
-    if isinstance(thoughts, int) and thoughts:
-        usage["reasoning_tokens"] = thoughts
-    return usage
+def _parse_usage(um: Any) -> dict[str, int] | None:
+    """Gemini 的 usageMetadata → 统一形态。没报用量时为 None。
 
-
-def _parse_response(data: dict[str, Any]) -> ProviderResponse:
-    """Parse a non-streaming Gemini generateContent response into ProviderResponse."""
-    # Check for API-level errors
-    if "error" in data:
-        err = data["error"]
-        return ProviderResponse(
-            ok=False,
-            error=err.get("message", str(err)),
-            status_code=err.get("code"),
-        )
-
-    candidates = data.get("candidates") or []
-    if not candidates:
-        # Could be a safety block or empty response
-        block_reason = (data.get("promptFeedback") or {}).get("blockReason")
-        if block_reason:
-            return ProviderResponse(ok=False, error=f"Blocked by safety filter: {block_reason}")
-        return ProviderResponse(ok=False, error="Gemini returned no candidates")
-
-    candidate = candidates[0]
-    parts = (candidate.get("content") or {}).get("parts") or []
-
-    text_parts: list[str] = []
-    thinking_parts: list[str] = []
-    tool_calls: list[ToolCall] = []
-    inline_data_list: list[dict[str, Any]] = []
-    tc_counter = 0
-
-    for part in parts:
-        if part.get("thought"):
-            t = part.get("text", "")
-            if t:
-                thinking_parts.append(t)
-        elif "text" in part:
-            text_parts.append(part["text"])
-        elif "functionCall" in part:
-            fc = part["functionCall"]
-            tc_counter += 1
-            tool_calls.append(ToolCall(
-                id=f"call_{tc_counter}",
-                name=fc.get("name", ""),
-                arguments=fc.get("args") or {},
-            ))
-        elif "inlineData" in part:
-            inline_data_list.append(part["inlineData"])
-
-    usage = _parse_usage(data.get("usageMetadata") or {})
-    full_text = "".join(text_parts) or None
-    reasoning = "".join(thinking_parts) or None
-
-    # [2026-05-01] 存储整个 response 的原始 parts 到 provider_meta，
-    # Gemini 3 要求 "Return the entire response with all parts back"，
-    # 任何 part 都可能带 thoughtSignature，不能只存 thought parts
-    provider_meta: dict[str, Any] = {}
-    if parts:
-        provider_meta["raw_parts"] = parts
-
-    return ProviderResponse(
-        ok=True,
-        text=full_text,
-        tool_calls=tool_calls,
-        reasoning=reasoning,
-        usage=usage or None,
-        inline_data=inline_data_list,
-        raw=data,
-        provider_meta=provider_meta,
+    candidatesTokenCount 不含思考消耗、promptTokenCount 不含工具调用带回的输入，都加回来才和别家同一口径。
+    """
+    if not isinstance(um, dict) or not um:
+        return None
+    thoughts = int_field(um, "thoughtsTokenCount")
+    return usage_dict(
+        prompt=int_field(um, "promptTokenCount") + int_field(um, "toolUsePromptTokenCount"),
+        completion=int_field(um, "candidatesTokenCount") + thoughts,
+        total=int_field(um, "totalTokenCount"),
+        cache_read=int_field(um, "cachedContentTokenCount"),
+        reasoning=thoughts,
     )
 
 
-def _response_error_text(resp: httpx.Response) -> str:
-    fallback = resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
-    try:
-        return _error_message(resp.json(), fallback)
-    except Exception:
-        return fallback
+async def _parse_response(data: dict[str, Any], *, status_code: int | None = None) -> ProviderResponse:
+    """Parse a non-streaming Gemini generateContent response into ProviderResponse."""
+    if data.get("error"):
+        return upstream_failure(status_code, read_error(data), raw=data)
 
+    usage = _parse_usage(data.get("usageMetadata"))
+    feedback = data.get("promptFeedback")
+    block_reason = feedback.get("blockReason") if isinstance(feedback, dict) else None
+    candidates = data.get("candidates")
+    candidate = candidates[0] if isinstance(candidates, list) and candidates else None
+    if not isinstance(candidate, dict):
+        if block_reason:
+            return failed(
+                "content_filter", f"Blocked by safety filter: {block_reason}",
+                status_code=status_code, finish_reason="content_filter", usage=usage, raw=data,
+            )
+        return failed("invalid_response", "Gemini returned no candidates", status_code=status_code, raw=data)
 
-def _error_from_response(resp: httpx.Response) -> ProviderResponse:
-    """Build an error ProviderResponse from a failed httpx.Response."""
-    return ProviderResponse(
-        ok=False, error=_response_error_text(resp), status_code=resp.status_code,
+    collected = _Collected()
+    content = candidate.get("content") if isinstance(candidate.get("content"), dict) else {}
+    await collected.take(content.get("parts"))
+    return _gemini_response(
+        collected,
+        status=status_code,
+        terminated=True,
+        finish_raw=candidate.get("finishReason"),
+        block_reason=block_reason,
+        usage=usage,
+        raw=data,
     )

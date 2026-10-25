@@ -28,7 +28,8 @@ def _req(name: str, base: str = ""):
 class TestTheEndpointIsBuiltPerFamily:
     @pytest.mark.parametrize("name,expected", [
         ("openai", "https://api.openai.com/v1/models"),
-        ("deepseek", "https://api.deepseek.com/models"),
+        # 只填域名的 OpenAI 系地址补 /v1，和工具子进程的解释一致；DeepSeek 两种写法都收。
+        ("deepseek", "https://api.deepseek.com/v1/models"),
         ("anthropic", "https://api.anthropic.com/v1/models"),
         ("gemini", "https://generativelanguage.googleapis.com/v1beta/models"),
         ("openai-responses", "https://api.openai.com/v1/models"),

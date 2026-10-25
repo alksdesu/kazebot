@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+# 工具按 0.2s 轮询取消，单次查询不能被无响应的 supervisor 拖住；超时当作没取消，下一轮再问。
+_CANCEL_PROBE_TIMEOUT_SEC = 2.0
+# 等审批期间引擎心跳仍在跑，这里的续租只是兜底，所以间隔放宽、租期放长。
+_APPROVAL_RENEW_INTERVAL_SEC = 30.0
+_APPROVAL_RENEW_LEASE_SEC = 300.0
+_RENEW_TIMEOUT_SEC = 5.0
 
 
 @dataclass
@@ -20,31 +28,22 @@ class ToolContext:
     registry: Any
     task_id: str = ""
     session_generation: int = 0
-    # [Fork/Merge 2026-05-17] Why: tools can execute inside an entry branch while
-    # user-visible supervisor APIs are keyed by the parent session. How: carry the
-    # parent separately and let route_session_id() choose it when present. Purpose:
-    # approvals, tool events, and session-scoped tools do not target a temporary branch.
+    # 工具可能跑在入口分支里，面向用户的 supervisor 接口要按父会话路由。
     parent_session_id: str = ""
     conversation_key: str = ""
     approval_poll_interval_sec: float = 0.5
-    # [AutoC] 审批等待超时上限（秒）。超时后自动按 deny 处理，避免任务无人
-    # 审批时长期挂在 running 状态，直到硬上限才被 scheduler 回收。
-    # 默认 3600s（1 小时），可由 CLONOTH_APPROVAL_TIMEOUT_SECONDS 覆盖。
+    # 无人审批时按 deny 收场，免得任务一直挂在 running；CLONOTH_APPROVAL_TIMEOUT_SECONDS 可覆盖。
     approval_timeout_sec: float = 3600.0
-    # [AutoC 2026-05-31] Why: request_guard runs inside a ToolContext after the
-    # engine has selected a concrete tool call. How: carry the active provider
-    # tool_call_id and node_id on the context. Purpose: policy approvals can be
-    # merged into the matching ToolCallCard.
+    # 审批卡要并进对应的工具调用卡片，靠这两项对上。
     tool_call_id: str = ""
     node_id: str = ""
     platform_auth: dict[str, Any] | None = None
+    # 续租和查取消都带上它：任务被回收、改由别处重领后，旧的执行方才问得出自己已经出局。
+    claim_id: str = ""
 
     def route_session_id(self) -> str:
         """Return the user-visible session for supervisor API calls."""
-        # [Fork/Merge 2026-05-17] Why: session_id remains the runtime storage
-        # session and may be branch_xxx. How: prefer parent_session_id and fall
-        # back to session_id for old tasks and ordinary child tools. Purpose:
-        # route outward-facing tool side effects to the durable conversation.
+        # session_id 可能是临时分支 branch_xxx，对外的副作用要落到父会话上。
         return (self.parent_session_id or self.session_id or "").strip()
 
     async def emit_event(self, type_: str, payload: dict[str, Any]) -> None:
@@ -65,10 +64,6 @@ class ToolContext:
                 "session_id": route_session_id,
                 "op": op,
                 "parameters": {**parameters, "platform_auth": dict(self.platform_auth or {})},
-                # [AutoC 2026-05-31] Why: approval_requested events need the tool
-                # execution identity. How: send optional context fields only known
-                # at runtime. Purpose: the supervisor can attach approval state to
-                # the active tool card while preserving legacy empty values.
                 "tool_call_id": self.tool_call_id or "",
                 "node_id": self.node_id or getattr(self, "_node_id", "") or "",
                 "task_id": self.task_id or "",
@@ -78,31 +73,48 @@ class ToolContext:
         return r.json()
 
     async def check_cancelled(self) -> bool:
-        # [硬取消] 显式 2s 超时，防止 supervisor 无响应时拖延 cancel 检测。
-        # 工具层的 cancel 轮询间隔为 0.2s（execute_command / script tool），
-        # 如果 HTTP 请求无超时，单次 check 可能阻塞远超轮询间隔。
-        # 超时后 except 兜底返回 False，下次轮询再试。
         try:
             if self.task_id:
+                extra: dict[str, Any] = {"params": {"claim_id": self.claim_id}} if self.claim_id else {}
                 r = await self.http.get(
                     f"{self.supervisor_url}/v1/tasks/{self.task_id}/cancelled",
-                    timeout=2.0,
+                    timeout=_CANCEL_PROBE_TIMEOUT_SEC,
+                    **extra,
                 )
-                if r.status_code == 200:
-                    return bool(r.json().get("cancelled", False))
             else:
-                # [Fork/Merge 2026-05-17] Why: session-level cancellation is a
-                # user-visible operation. How: query the parent route session when
-                # present. Purpose: tools without task_id still honor parent cancel.
+                # 没有 task_id 的工具按会话取消，取消是用户在父会话上点的。
                 r = await self.http.get(
                     f"{self.supervisor_url}/v1/sessions/{self.route_session_id()}/cancelled",
-                    timeout=2.0,
+                    timeout=_CANCEL_PROBE_TIMEOUT_SEC,
                 )
-                if r.status_code == 200:
-                    return bool(r.json().get("cancelled", False))
+            if r.status_code == 200:
+                return bool(r.json().get("cancelled", False))
         except Exception:
             pass
         return False
+
+    async def renew_lease(self, lease_sec: float) -> bool | None:
+        """续租本任务。False 表示 supervisor 明确回绝了这次领取，None 表示这轮没问到结果。"""
+        if not self.task_id:
+            return None
+        body: dict[str, Any] = {"worker_id": self.worker_id, "lease_sec": lease_sec}
+        if self.claim_id:
+            body["claim_id"] = self.claim_id
+        try:
+            r = await self.http.post(
+                f"{self.supervisor_url}/v1/tasks/{self.task_id}/renew_lease",
+                json=body,
+                timeout=_RENEW_TIMEOUT_SEC,
+            )
+            verdict = r.json()
+        except Exception:
+            return None
+        if not isinstance(verdict, dict) or not isinstance(verdict.get("ok"), bool):
+            return None
+        # 没有领取凭据的旧任务拿不准 ok=False 是不是自己的问题，照旧只管续、不据此收手。
+        if verdict["ok"] is False and not self.claim_id:
+            return None
+        return verdict["ok"]
 
     def _resolve_approval_timeout_sec(self) -> float:
         """审批等待超时上限。优先 env，其次数据类字段；<=0 表示不超时。"""
@@ -118,16 +130,12 @@ class ToolContext:
             return 3600.0
 
     async def wait_for_approval(self, approval_id: str, poll_interval: float | None = None) -> dict[str, Any]:
-        import time as _time
         interval = float(poll_interval) if poll_interval is not None else float(self.approval_poll_interval_sec or 0.5)
         if interval <= 0:
             interval = 0.5
-        _last_renew = 0.0  # monotonic timestamp of last lease renewal
-        _RENEW_INTERVAL = 30.0  # renew lease every 30s during approval wait
-        _RENEW_LEASE_SEC = 300.0  # request 5-minute lease to survive long waits
-        # [AutoC] 审批等待超时兜底：无人审批时不再无限等待，避免任务挂到硬上限。
-        _timeout_sec = self._resolve_approval_timeout_sec()
-        _wait_started = _time.monotonic()
+        last_renew = 0.0
+        timeout_sec = self._resolve_approval_timeout_sec()
+        wait_started = time.monotonic()
         while True:
             if await self.check_cancelled():
                 return {"approval_id": approval_id, "status": "cancelled"}
@@ -136,34 +144,26 @@ class ToolContext:
             approval = r.json()
             if approval.get("status") != "pending":
                 return approval
-            # [AutoC] 超时自动拒绝：先请求 supervisor 落库 deny，再返回 deny 结果，
-            # 保证审批状态与任务结果一致，避免残留 pending。
-            if _timeout_sec > 0 and (_time.monotonic() - _wait_started) >= _timeout_sec:
-                _timeout_comment = f"approval timed out after {int(_timeout_sec)}s with no decision; auto-denied"
+            if timeout_sec > 0 and (time.monotonic() - wait_started) >= timeout_sec:
+                timeout_comment = f"approval timed out after {int(timeout_sec)}s with no decision; auto-denied"
+                # 先让 supervisor 落库 deny，审批卡才不会残留 pending；落不了库也照样按 deny 收手。
                 try:
                     await self.http.post(
                         f"{self.supervisor_url}/v1/approvals/{approval_id}",
-                        json={"decision": "deny", "comment": _timeout_comment},
+                        json={"decision": "deny", "comment": timeout_comment},
                     )
                 except Exception:
-                    pass  # best-effort；即便落库失败也返回 deny，让工具侧终止等待
+                    pass
                 return {
                     "approval_id": approval_id,
                     "status": "denied",
                     "decision": "deny",
                     "timed_out": True,
-                    "comment": _timeout_comment,
+                    "comment": timeout_comment,
                 }
-            # Renew task lease during approval wait to prevent zombie reaper timeout.
-            # This is defense-in-depth alongside the heartbeat in engine/runner.py.
-            _now_mono = _time.monotonic()
-            if self.task_id and _now_mono - _last_renew >= _RENEW_INTERVAL:
-                try:
-                    await self.http.post(
-                        f"{self.supervisor_url}/v1/tasks/{self.task_id}/renew_lease",
-                        json={"worker_id": self.worker_id, "lease_sec": _RENEW_LEASE_SEC},
-                    )
-                except Exception:
-                    pass  # best-effort; heartbeat is the primary renewal mechanism
-                _last_renew = _now_mono
+            now = time.monotonic()
+            if self.task_id and now - last_renew >= _APPROVAL_RENEW_INTERVAL_SEC:
+                last_renew = now
+                if await self.renew_lease(_APPROVAL_RENEW_LEASE_SEC) is False:
+                    return {"approval_id": approval_id, "status": "cancelled", "reason": "task claim is no longer held"}
             await asyncio.sleep(interval)

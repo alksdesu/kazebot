@@ -8,102 +8,115 @@ import httpx
 
 from plugin_sdk import PluginExecutionError
 
-from .plugin_transport import iter_sse_events, wrap_client
-
-from .base import BaseProvider, ProviderResponse, ToolCall
+from .assembly import ToolCallAssembler, conclude, int_field, new_call_id, parse_tool_arguments, usage_dict
+from .base import BaseProvider, ProviderResponse, ToolCall, content_parts, content_text, tool_call_fields
 from .degrade import DegradeRule, degrade, set_option, unset_options
+from .failures import exception_failure, failed, read_error, upstream_failure
 from .options import ENUM, FLOAT, INT, TEXT, OptionSet, OptionSpec
+from .plugin_transport import iter_sse_events, wrap_client
 
 log = logging.getLogger(__name__)
 
 _MAX_DEGRADE_ROUNDS = 3
 
+# 各家放思维链的字段名不同：DeepSeek 用 reasoning_content，OpenRouter 用 reasoning。
+_REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
 
-def _parse_first_json_object(raw: str) -> dict | None:
-    """Fallback: parse the first JSON object from concatenated '{...}{...}' strings."""
-    raw = raw.strip()
-    if not raw.startswith("{"):
-        return None
-    decoder = json.JSONDecoder()
-    try:
-        obj, _ = decoder.raw_decode(raw)
-        if isinstance(obj, dict):
-            return obj
-    except (json.JSONDecodeError, ValueError):
-        pass
-    return None
-
-
-def _normalize_base_url(base_url: str | None) -> str:
-    """Normalize base_url for OpenAI-compatible APIs.
-
-    Accepts:
-    - https://api.openai.com
-    - https://api.openai.com/v1
-    - https://proxy.example.com/v1
-    - https://api.deepseek.com
-
-    Returns a base URL with trailing slash stripped. Does NOT force /v1 suffix
-    — the caller writes the full path they intend, provider appends
-    /chat/completions directly.
-    """
-
-    base = (base_url or "").strip().rstrip("/")
-    if not base:
-        base = OpenAIProvider.default_base_url
-
-    # 缺少协议前缀时补上 https://
-    if base and not base.startswith("http://") and not base.startswith("https://"):
-        base = "https://" + base
-
-    return base
-
-
-def _extract_openai_error_message(payload: Any) -> str | None:
-    """Try to extract a human-readable error message from OpenAI-style JSON."""
-
-    if not isinstance(payload, dict):
-        return None
-
-    err = payload.get("error")
-    if isinstance(err, dict):
-        msg = err.get("message")
-        if isinstance(msg, str) and msg.strip():
-            return msg.strip()
-
-    return None
-
-def _nested_int(holder: Any, parent: str, key: str) -> int:
-    branch = holder.get(parent) if isinstance(holder, dict) else None
-    value = branch.get(key) if isinstance(branch, dict) else None
-    return value if isinstance(value, int) else 0
+# chat/completions 的 finish_reason → 统一取值。中转把 Claude、Gemini 的原生停止原因原样透传的也收进来。
+_FINISH_REASONS = {
+    "stop": "stop",
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "length": "length",
+    "max_tokens": "length",
+    "model_context_window_exceeded": "length",
+    "tool_calls": "tool_calls",
+    "function_call": "tool_calls",
+    "tool_use": "tool_calls",
+    "content_filter": "content_filter",
+    "safety": "content_filter",
+    "recitation": "content_filter",
+    "blocklist": "content_filter",
+    "prohibited_content": "content_filter",
+    "spii": "content_filter",
+    "image_safety": "content_filter",
+    "refusal": "refusal",
+}
+# 上游自己掐断了这一轮：有内容也只是半截，不能当完整结果。
+_ABORTED_FINISH = {
+    "insufficient_system_resource": "overloaded",
+    "error": "unknown",
+}
 
 
 def _extract_usage(data: Any) -> dict[str, int] | None:
     """Extract token usage dict from an OpenAI response/chunk."""
-    if not isinstance(data, dict):
-        return None
-    usage = data.get("usage")
+    usage = data.get("usage") if isinstance(data, dict) else None
     if not isinstance(usage, dict):
         return None
-    result: dict[str, int] = {}
-    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-        val = usage.get(key)
-        if isinstance(val, int):
-            result[key] = val
-    # 缓存命中量两家放的位置不同：OpenAI 嵌在 prompt_tokens_details 里，
-    # DeepSeek 平铺在 usage 上。两个都收，谁也别漏。
-    cached = _nested_int(usage, "prompt_tokens_details", "cached_tokens")
-    if not cached:
-        hit = usage.get("prompt_cache_hit_tokens")
-        cached = hit if isinstance(hit, int) else 0
-    if cached:
-        result["cache_read_tokens"] = cached
-    reasoning = _nested_int(usage, "completion_tokens_details", "reasoning_tokens")
-    if reasoning:
-        result["reasoning_tokens"] = reasoning
-    return result if result else None
+    if not any(isinstance(usage.get(key), int) for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
+        return None
+    # 缓存命中量两家放的位置不同：OpenAI 嵌在 prompt_tokens_details 里，DeepSeek 平铺在 usage 上。
+    cached = int_field(usage, "prompt_tokens_details", "cached_tokens") or int_field(usage, "prompt_cache_hit_tokens")
+    return usage_dict(
+        prompt=int_field(usage, "prompt_tokens"),
+        completion=int_field(usage, "completion_tokens"),
+        total=int_field(usage, "total_tokens"),
+        cache_read=cached,
+        reasoning=int_field(usage, "completion_tokens_details", "reasoning_tokens"),
+    )
 
+
+def _reasoning_of(holder: dict[str, Any]) -> str:
+    for key in _REASONING_KEYS:
+        value = holder.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _finish_verdict(raw: Any) -> tuple[str | None, str | None]:
+    """(统一的 finish_reason, 被上游中途掐断时的失败种类)。认不出的原因两项都是 None。"""
+    key = str(raw or "").strip().lower()
+    if key in _ABORTED_FINISH:
+        return "incomplete", _ABORTED_FINISH[key]
+    return _FINISH_REASONS.get(key), None
+
+
+def _chat_response(
+    *,
+    status: int,
+    terminated: bool,
+    finish_raw: Any,
+    text: str,
+    reasoning: str,
+    refusal: str,
+    tool_calls: list[ToolCall],
+    usage: dict[str, int] | None,
+    raw: dict[str, Any] | None = None,
+) -> ProviderResponse:
+    """流式和非流式共用的收尾判定。"""
+    finish_reason, aborted = _finish_verdict(finish_raw)
+    if terminated and aborted:
+        return failed(
+            aborted, f"upstream aborted the response (finish_reason={finish_raw})",
+            status_code=status, finish_reason="incomplete", text=text, reasoning=reasoning, usage=usage, raw=raw,
+        )
+    if refusal and not text and not tool_calls and finish_reason in (None, "stop"):
+        finish_reason = "refusal"
+    unknown_finish = finish_raw is not None and finish_reason is None
+    return conclude(
+        terminated=terminated,
+        finish_reason=finish_reason,
+        status_code=status,
+        text=text,
+        reasoning=reasoning,
+        tool_calls=tool_calls,
+        usage=usage,
+        raw=raw,
+        empty_kind="unknown" if unknown_finish else None,
+        detail=refusal or (f"Upstream error (finish_reason={finish_raw})" if finish_raw else ""),
+    )
 
 
 class OpenAIProvider(BaseProvider):
@@ -115,9 +128,6 @@ class OpenAIProvider(BaseProvider):
     It supports tool calling via the `tools` field.
     """
 
-    # [provider-registry 2026-05-03] 这是自动发现注册使用的 key。
-    # 原因：engine 不再硬编码 OpenAIProvider 分支；做法：类声明 provider_name；
-    # 目的：registry 能把配置里的 "openai" 映射回这个类。
     provider_name = "openai"
     wire_format = "openai"
     official_hosts = ("api.openai.com",)
@@ -126,7 +136,7 @@ class OpenAIProvider(BaseProvider):
     @classmethod
     def catalog_request(cls, *, base_url: str, api_key: str):
         return (
-            f"{_normalize_base_url(base_url or cls.default_base_url)}/models",
+            f"{cls.resolve_base_url(base_url)}/models",
             {"Authorization": f"Bearer {api_key}"},
         )
 
@@ -141,28 +151,20 @@ class OpenAIProvider(BaseProvider):
             if isinstance(item, dict) and str(item.get("id") or "").strip()
         ]
 
-    # ------------------------------------------------------------------
-    #  L3 Provider 层：消息预处理
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _prepare_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """L3: 将 L2 输出转换为 OpenAI API 最终格式。
+        """把 engine 交来的消息收成 API 能收的最终形状。
 
-        【三层管道 L3 实现】两项职责：
-        1. 防御性剥离残留的 _ 开头内部字段（_meta, _dynamic 等），
-           正常情况下 L2 已经剥离，这里做二次保险。
-        2. Prefill Guard：如果最后一条消息是 assistant，追加一条
-           user 消息，避免 Anthropic 系模型（通过 OpenAI 兼容端点
-           访问时）因连续 assistant 消息报错。
+        剥掉残留的 _ 开头内部字段；块数组里的裸字符串折成 text 块，对面不收裸字符串。
+        最后一条是 assistant 时追加一条 user，部分兼容端点（尤其经它转发的 Anthropic 系）
+        会拒绝以 assistant 结尾的消息列表。
         """
         result: list[dict[str, Any]] = []
         for msg in messages:
-            # 剥离残留的内部字段（_ 开头的键）
             clean = {k: v for k, v in msg.items() if not k.startswith('_')}
+            if isinstance(clean.get("content"), list):
+                clean["content"] = content_parts(clean["content"])
             result.append(clean)
-        # Prefill Guard：最后一条是 assistant 时追加 user 占位消息，
-        # 防止某些 API 端点拒绝以 assistant 结尾的消息列表。
         if result and result[-1].get('role') == 'assistant':
             result.append({'role': 'user', 'content': '请继续。'})
         return result
@@ -250,9 +252,6 @@ class OpenAIProvider(BaseProvider):
         model: str,
         provider_options: dict[str, Any] | None = None,
     ) -> None:
-        # [provider-registry 2026-05-03] 实例 name 复用 provider_name。
-        # 原因：下游仍通过 provider.name 判断 provider 特性；做法：从类属性传入；
-        # 目的：注册 key、实例名和配置 provider 字段保持一致。
         super().__init__(model=model, name=self.provider_name)
 
         k = (api_key or "").strip()
@@ -261,7 +260,7 @@ class OpenAIProvider(BaseProvider):
 
         self._http = wrap_client(http, self)
         self._api_key = k
-        self._base_url = _normalize_base_url(base_url)
+        self._base_url = self.resolve_base_url(base_url)
         self._options = OptionSet(self.OPTIONS, provider_options)
         self._timeout = float(self._options.get("timeout_sec"))
         unknown = self._options.unknown_keys()
@@ -285,7 +284,6 @@ class OpenAIProvider(BaseProvider):
         tools: list[dict[str, Any]] | None,
         stream: bool = False,
     ) -> dict[str, Any]:
-        # L3: 在发送前对消息做 Provider 层预处理（剥离内部字段 + Prefill Guard）
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": self._prepare_messages(messages),
@@ -304,7 +302,7 @@ class OpenAIProvider(BaseProvider):
             if self._options.is_set(key):
                 payload[key] = self._options.get(key)
         for key in ("reasoning_effort", "verbosity"):
-            # 子类会删掉自己不支持的项，那时 get 返回 None——别把 null 发出去。
+            # 子类不支持的项 get 返回 None，别把 null 发出去。
             value = self._options.get(key)
             if value and value != "default":
                 payload[key] = value
@@ -327,194 +325,116 @@ class OpenAIProvider(BaseProvider):
 
         url = f"{self._base_url}/chat/completions"
         payload = self._build_payload(messages, tools, stream=True)
-        headers = self._headers()
 
         try:
             async with self._http.stream(
-                "POST", url, headers=headers, json=payload, timeout=self._timeout,
+                "POST", url, headers=self._headers(), json=payload, timeout=self._timeout,
             ) as resp:
                 status = int(resp.status_code)
-
                 if status >= 400:
-                    body = await resp.aread()
-                    try:
-                        data = json.loads(body)
-                        msg = _extract_openai_error_message(data)
-                    except Exception:
-                        msg = body.decode("utf-8", errors="replace").strip()
-                    if not msg:
-                        msg = f"HTTP {status}"
-                    if status == 400 and _attempt < _MAX_DEGRADE_ROUNDS and self._degrade(msg):
+                    error = read_error(await resp.aread(), fallback=f"HTTP {status}")
+                    if status == 400 and _attempt < _MAX_DEGRADE_ROUNDS and self._degrade(error.message):
                         # 状态码先于任何 SSE 分片到达，重来不会让调用方看到半截内容。
                         return await self.chat_stream(
                             messages=messages, tools=tools, on_text=on_text,
                             on_thinking=on_thinking, on_tool_delta=on_tool_delta,
                             _attempt=_attempt + 1,
                         )
-                    # [fix 2026-04-18] 补齐 inline_data / provider_meta，与成功路径风格一致
-                    return ProviderResponse(ok=False, error=msg, status_code=status, inline_data=[], provider_meta={})
-
-                text_parts: list[str] = []
-                # [refactor 2026-04-18] thinking_parts → reasoning_parts，
-                # 变量名与 ProviderResponse.reasoning 对齐
-                reasoning_parts: list[str] = []
-                # index -> {id, name, arguments_parts}
-                tc_map: dict[int, dict[str, Any]] = {}
-
-                stream_usage: dict[str, int] | None = None
-                _stream_finish_reason: str | None = None
-                _stream_error: str | None = None
-                async for event in iter_sse_events(resp):
-                    data_str = event["data"]
-                    if data_str == "[DONE]":
-                        break
-
-                    try:
-                        chunk = json.loads(data_str)
-                    except Exception:
-                        continue
-
-                    # [2026-05-24] Capture SSE-level error objects
-                    # Proxied Gemini sends {"error": {"message": ..., "code": "content_filter"}}
-                    _err_obj = chunk.get("error")
-                    if isinstance(_err_obj, dict):
-                        _stream_error = _err_obj.get("message") or str(_err_obj)
-
-                    # 捕获 usage（流式最后一个 chunk 携带）
-                    raw_usage = chunk.get("usage")
-                    if isinstance(raw_usage, dict):
-                        stream_usage = _extract_usage(chunk)
-
-                    choices = chunk.get("choices")
-                    if not isinstance(choices, list) or not choices:
-                        continue
-                    # [2026-05-24] Capture finish_reason for content_filter detection
-                    _fr = choices[0].get("finish_reason")
-                    if _fr:
-                        _stream_finish_reason = _fr
-                    delta = choices[0].get("delta") or {}
-
-                    # 文本内容
-                    content = delta.get("content")
-                    if isinstance(content, str) and content:
-                        text_parts.append(content)
-                        if on_text:
-                            await on_text(content)
-
-                    # 思维链 (reasoning_content / thinking)
-                    # 注意：delta 字段名是 API 定义的，不改；只改内部变量名
-                    reasoning = delta.get("reasoning_content") or delta.get("thinking")
-                    if isinstance(reasoning, str) and reasoning:
-                        reasoning_parts.append(reasoning)
-                        # on_thinking 回调签名暂不改名（engine 接口，后续再统一）
-                        if on_thinking:
-                            await on_thinking(reasoning)
-
-                    # 工具调用
-                    raw_tcs = delta.get("tool_calls")
-                    if isinstance(raw_tcs, list):
-                        for tc in raw_tcs:
-                            if not isinstance(tc, dict):
-                                continue
-                            idx = int(tc.get("index", 0))
-                            fn = tc.get("function") or {}
-                            if not isinstance(fn, dict):
-                                fn = {}
-                            fn_name = fn.get("name")
-                            if idx not in tc_map:
-                                tc_map[idx] = {
-                                    "id": tc.get("id") or "",
-                                    "name": fn_name or "",
-                                    "arg_parts": [],
-                                }
-                                # [tool-stream 2026-05-19] 同步发出工具调用开始事件。
-                                # 原因：OpenAI SSE 的 tool_calls delta 已经携带 index/id/name，过去只进入 tc_map。
-                                # 做法：新 index 第一次出现时调用可选 on_tool_delta，不改变后续聚合逻辑。
-                                # 目的：前端能实时看到 tool_call 建立，同时最终 ProviderResponse 仍完整返回。
-                                if on_tool_delta:
-                                    await on_tool_delta({
-                                        "event": "tool_call_start",
-                                        "index": idx,
-                                        "id": tc_map[idx]["id"],
-                                        "name": tc_map[idx]["name"],
-                                    })
-                            else:
-                                if tc.get("id"):
-                                    tc_map[idx]["id"] = tc["id"]
-                                if fn_name:
-                                    tc_map[idx]["name"] = fn_name
-                            arg_chunk = fn.get("arguments", "")
-                            if arg_chunk:
-                                tc_map[idx]["arg_parts"].append(arg_chunk)
-                                # [tool-stream 2026-05-19] 逐片段转发工具参数。
-                                # 原因：参数字符串可能很长，等完整 JSON 结束才返回会阻塞实时 UI。
-                                # 做法：保留 arg_parts 组装，同时把原始片段作为 args_delta 发出。
-                                # 目的：实现 tool_call 参数与文本、thinking 一致的流式通道。
-                                if on_tool_delta:
-                                    await on_tool_delta({
-                                        "event": "tool_call_args_delta",
-                                        "index": idx,
-                                        "delta": arg_chunk,
-                                    })
-
-                text = "".join(text_parts) if text_parts else None
-                # [refactor 2026-04-18] thinking_text 局部变量 → reasoning_text，
-                # 与 ProviderResponse.reasoning 字段对齐
-                reasoning_text = "".join(reasoning_parts) if reasoning_parts else None
-
-                tool_calls: list[ToolCall] = []
-                for idx in sorted(tc_map.keys()):
-                    tc_data = tc_map[idx]
-                    name = tc_data["name"]
-                    if not name:
-                        continue
-                    raw_args = "".join(tc_data["arg_parts"])
-                    args: dict[str, Any] = {}
-                    if raw_args.strip():
-                        try:
-                            parsed = json.loads(raw_args)
-                            args = parsed if isinstance(parsed, dict) else {"_raw": parsed}
-                        except Exception:
-                            fallback = _parse_first_json_object(raw_args)
-                            args = fallback if fallback is not None else {"_raw": raw_args}
-                    tool_calls.append(ToolCall(id=tc_data["id"], name=name.strip(), arguments=args))
-
-                # [2026-05-24] Detect upstream errors from SSE stream.
-                # Various proxied providers (Gemini, OpenAI, Anthropic via relay)
-                # may return HTTP 200 but signal failure through:
-                #   1. SSE error objects: data: {"error": {"message": ..., "code": ...}}
-                #   2. Abnormal finish_reason with empty content (content_filter, error, etc.)
-                # Normal finish_reasons: stop, tool_calls — anything else with no
-                # content is treated as an upstream error.
-                _normal_finish = {"stop", "tool_calls", None}
-                if _stream_error:
-                    return ProviderResponse(
-                        ok=False, text=text, tool_calls=[],
-                        reasoning=reasoning_text, status_code=status, usage=stream_usage,
-                        inline_data=[], provider_meta={},
-                        error=_stream_error,
-                    )
-                if _stream_finish_reason not in _normal_finish and not text and not tool_calls:
-                    return ProviderResponse(
-                        ok=False, text=None, tool_calls=[],
-                        reasoning=reasoning_text, status_code=status, usage=stream_usage,
-                        inline_data=[], provider_meta={},
-                        error=f"Upstream error (finish_reason={_stream_finish_reason})",
-                    )
-
-                # [refactor 2026-04-18] thinking= → reasoning=，新增 inline_data / provider_meta
-                return ProviderResponse(
-                    ok=True, text=text, tool_calls=tool_calls,
-                    reasoning=reasoning_text, status_code=status, usage=stream_usage,
-                    inline_data=[], provider_meta={},
+                    return upstream_failure(status, error)
+                return await self._read_stream(
+                    resp, status, on_text=on_text, on_thinking=on_thinking, on_tool_delta=on_tool_delta,
                 )
-
         except PluginExecutionError:
             raise
-        except Exception as e:
-            # [fix 2026-04-18] 补齐 inline_data / provider_meta，与成功路径风格一致
-            return ProviderResponse(ok=False, error=str(e) or type(e).__name__, inline_data=[], provider_meta={})
+        except Exception as exc:
+            return exception_failure(exc)
 
+    async def _read_stream(
+        self,
+        resp: httpx.Response,
+        status: int,
+        *,
+        on_text: Callable[[str], Awaitable[None]] | None,
+        on_thinking: Callable[[str], Awaitable[None]] | None,
+        on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None,
+    ) -> ProviderResponse:
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        refusal_parts: list[str] = []
+        calls = ToolCallAssembler(on_tool_delta)
+        usage: dict[str, int] | None = None
+        finish_raw: Any = None
+        # 见到 [DONE] 或 finish_reason 才算收尾；连接自己断了的流走不到这两步。
+        terminated = False
+        try:
+            async for event in iter_sse_events(resp):
+                data = event["data"]
+                if data.strip() == "[DONE]":
+                    terminated = True
+                    break
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    continue
+                if not isinstance(chunk, dict):
+                    continue
+                if chunk.get("error"):
+                    # 中转常在 200 的流里塞一个 error 对象，比如转发 Gemini 时的内容拦截。
+                    return upstream_failure(
+                        status, read_error(chunk),
+                        text="".join(text_parts), reasoning="".join(reasoning_parts), usage=usage,
+                    )
+                if isinstance(chunk.get("usage"), dict):
+                    usage = _extract_usage(chunk) or usage
+                choices = chunk.get("choices")
+                choice = choices[0] if isinstance(choices, list) and choices else None
+                if not isinstance(choice, dict):
+                    continue
+                if choice.get("finish_reason"):
+                    finish_raw = choice["finish_reason"]
+                    terminated = True
+                delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    text_parts.append(content)
+                    if on_text:
+                        await on_text(content)
+
+                reasoning = _reasoning_of(delta)
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                    if on_thinking:
+                        await on_thinking(reasoning)
+
+                refusal = delta.get("refusal")
+                if isinstance(refusal, str) and refusal:
+                    refusal_parts.append(refusal)
+
+                items = delta.get("tool_calls")
+                if isinstance(items, list):
+                    for item in items:
+                        await calls.feed_chat_delta(item)
+            if terminated:
+                await calls.finish()
+        except PluginExecutionError:
+            raise
+        except Exception as exc:
+            return exception_failure(
+                exc, mid_stream=True,
+                text="".join(text_parts), reasoning="".join(reasoning_parts), usage=usage,
+            )
+
+        return _chat_response(
+            status=status,
+            terminated=terminated,
+            finish_raw=finish_raw,
+            text="".join(text_parts),
+            reasoning="".join(reasoning_parts),
+            refusal="".join(refusal_parts),
+            tool_calls=calls.tool_calls(),
+            usage=usage,
+        )
 
     async def chat(
         self,
@@ -525,137 +445,65 @@ class OpenAIProvider(BaseProvider):
     ) -> ProviderResponse:
         url = f"{self._base_url}/chat/completions"
         payload = self._build_payload(messages, tools, stream=False)
-        headers = self._headers()
 
         try:
-            r = await self._http.post(url, headers=headers, json=payload, timeout=self._timeout)
+            r = await self._http.post(url, headers=self._headers(), json=payload, timeout=self._timeout)
         except PluginExecutionError:
             raise
-        except Exception as e:
-            # [fix 2026-04-18] 补齐 inline_data / provider_meta，与成功路径风格一致
-            return ProviderResponse(ok=False, error=str(e) or type(e).__name__, inline_data=[], provider_meta={})
+        except Exception as exc:
+            return exception_failure(exc)
 
         status = int(r.status_code)
-
-        data: Any
         try:
-            data = r.json()
+            data: Any = r.json()
         except Exception:
             data = None
 
         if status >= 400:
-            msg = _extract_openai_error_message(data)
-            if not msg:
-                try:
-                    msg = (r.text or "").strip()
-                except Exception:
-                    msg = ""
-            if not msg:
-                msg = f"HTTP {status}"
-            if status == 400 and _attempt < _MAX_DEGRADE_ROUNDS and self._degrade(msg):
+            error = read_error(data if data is not None else r.content, fallback=f"HTTP {status}")
+            if status == 400 and _attempt < _MAX_DEGRADE_ROUNDS and self._degrade(error.message):
                 return await self.chat(messages=messages, tools=tools, _attempt=_attempt + 1)
-
-            # [fix 2026-04-18] 补齐 inline_data / provider_meta，与成功路径风格一致
-            return ProviderResponse(
-                ok=False,
-                error=msg,
-                status_code=status,
-                raw=data if isinstance(data, dict) else None,
-                inline_data=[], provider_meta={},
-            )
+            return upstream_failure(status, error, raw=data if isinstance(data, dict) else None)
 
         if not isinstance(data, dict):
-            return ProviderResponse(ok=False, error="invalid JSON response", status_code=status, inline_data=[], provider_meta={})
+            return failed("invalid_response", "invalid JSON response", status_code=status)
+        if data.get("error"):
+            return upstream_failure(status, read_error(data), raw=data)
 
-        try:
-            choices = data.get("choices")
-            if not isinstance(choices, list) or not choices:
-                return ProviderResponse(ok=False, error="missing choices", status_code=status, raw=data, inline_data=[], provider_meta={})
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return failed("invalid_response", "missing choices", status_code=status, raw=data)
+        choice0 = choices[0]
+        if not isinstance(choice0, dict):
+            return failed("invalid_response", "invalid choices[0]", status_code=status, raw=data)
+        msg = choice0.get("message")
+        if not isinstance(msg, dict):
+            return failed("invalid_response", "missing message", status_code=status, raw=data)
 
-            choice0 = choices[0]
-            if not isinstance(choice0, dict):
-                return ProviderResponse(ok=False, error="invalid choices[0]", status_code=status, raw=data, inline_data=[], provider_meta={})
+        content = msg.get("content")
+        # 有些中转把 content 也拆成了块数组。
+        text = content if isinstance(content, str) else content_text(content)
+        refusal = msg.get("refusal")
 
-            msg = choice0.get("message")
-            if not isinstance(msg, dict):
-                return ProviderResponse(ok=False, error="missing message", status_code=status, raw=data, inline_data=[], provider_meta={})
+        tool_calls: list[ToolCall] = []
+        raw_calls = msg.get("tool_calls")
+        for raw_call in raw_calls if isinstance(raw_calls, list) else []:
+            if isinstance(raw_call, dict) and raw_call.get("type") not in (None, "function"):
+                continue
+            fields = tool_call_fields(raw_call)
+            if fields is None:
+                continue
+            call_id, name, arguments = fields
+            tool_calls.append(ToolCall(id=call_id or new_call_id(), name=name, arguments=parse_tool_arguments(arguments)))
 
-            content = msg.get("content")
-            text = content if isinstance(content, str) else None
-            # 流式路径一直在读这个字段，非流式却不读，同一个模型换条路走思维链就没了。
-            raw_reasoning = msg.get("reasoning_content") or msg.get("reasoning")
-            reasoning_text = raw_reasoning if isinstance(raw_reasoning, str) and raw_reasoning else None
-
-            tool_calls: list[ToolCall] = []
-            raw_tcs = msg.get("tool_calls")
-            if isinstance(raw_tcs, list):
-                for tc in raw_tcs:
-                    if not isinstance(tc, dict):
-                        continue
-
-                    if tc.get("type") != "function":
-                        continue
-
-                    tc_id = tc.get("id")
-                    tc_id_str = tc_id if isinstance(tc_id, str) else ""
-
-                    fn = tc.get("function")
-                    if not isinstance(fn, dict):
-                        continue
-
-                    name = fn.get("name")
-                    if not isinstance(name, str) or not name.strip():
-                        continue
-
-                    raw_args = fn.get("arguments")
-                    args: dict[str, Any] = {}
-                    if isinstance(raw_args, str) and raw_args.strip():
-                        try:
-                            parsed = json.loads(raw_args)
-                            if isinstance(parsed, dict):
-                                args = parsed
-                            else:
-                                args = {"_raw": parsed}
-                        except Exception:
-                            fallback = _parse_first_json_object(raw_args)
-                            args = fallback if fallback is not None else {"_raw": raw_args}
-
-                    tool_calls.append(ToolCall(id=tc_id_str, name=name.strip(), arguments=args))
-
-            # 解析 usage
-            usage = _extract_usage(data)
-
-            # [2026-05-24] Detect upstream errors in non-streaming responses.
-            # Same logic as chat_stream: check for error objects and abnormal
-            # finish_reason (content_filter, safety blocks, etc.)
-            _err_obj = data.get("error")
-            if isinstance(_err_obj, dict):
-                _err_msg = _err_obj.get("message") or str(_err_obj)
-                return ProviderResponse(
-                    ok=False, text=text, tool_calls=[],
-                    reasoning=reasoning_text,
-                    status_code=status, usage=usage,
-                    inline_data=[], provider_meta={},
-                    error=_err_msg,
-                )
-            _finish_reason = choice0.get("finish_reason")
-            _normal_finish = {"stop", "tool_calls", None}
-            if _finish_reason not in _normal_finish and not text and not tool_calls:
-                return ProviderResponse(
-                    ok=False, text=None, tool_calls=[],
-                    reasoning=reasoning_text,
-                    status_code=status, usage=usage,
-                    inline_data=[], provider_meta={},
-                    error=f"Upstream error (finish_reason={_finish_reason})",
-                )
-
-            # [refactor 2026-04-18] 非流式也补齐 inline_data / provider_meta（OpenAI 目前不用）
-            return ProviderResponse(
-                ok=True, text=text, tool_calls=tool_calls, reasoning=reasoning_text,
-                status_code=status, usage=usage, raw=data, inline_data=[], provider_meta={},
-            )
-
-        except PluginExecutionError:
-            raise
-        except Exception as e:
-            return ProviderResponse(ok=False, error=f"failed to parse response: {e}", status_code=status, raw=data, inline_data=[], provider_meta={})
+        return _chat_response(
+            status=status,
+            terminated=True,
+            finish_raw=choice0.get("finish_reason"),
+            text=text,
+            reasoning=_reasoning_of(msg),
+            refusal=refusal if isinstance(refusal, str) else "",
+            tool_calls=tool_calls,
+            usage=_extract_usage(data),
+            raw=data,
+        )

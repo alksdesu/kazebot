@@ -10,16 +10,15 @@ from .options import OptionSpec, catalog
 
 
 # 这些是 provider 共用的基础设施，不是 provider 本身，扫描时跳过。
-_NON_PROVIDER_MODULES = frozenset({"__init__", "base", "options", "degrade", "plugin_transport"})
+_NON_PROVIDER_MODULES = frozenset({
+    "__init__", "base", "options", "degrade", "plugin_transport", "failures", "assembly",
+})
 
 
 class ProviderRegistry:
     """Registry for provider implementations discovered from this package."""
 
     def __init__(self) -> None:
-        # [provider-registry 2026-05-03] 这里保存 provider_name 到类的映射。
-        # 原因：runner 需要通过配置字符串找到 provider；做法：集中到 registry；
-        # 目的：新增 provider 时只需新增 providers/*.py，不再修改 engine if-elif 路由。
         self._registry: dict[str, type[BaseProvider]] = {}
 
     def register(self, name: str, cls: type[BaseProvider]) -> None:
@@ -29,9 +28,7 @@ class ProviderRegistry:
             raise ValueError("provider name is empty")
         if not issubclass(cls, BaseProvider):
             raise TypeError(f"{cls!r} is not a BaseProvider subclass")
-        # [provider-registry 2026-05-03] 重复注册采用后写覆盖。
-        # 原因：测试和热重载可能重新导入模块；做法：同名 key 覆盖为最新类；
-        # 目的：保持注册操作幂等，避免重复发现导致启动失败。
+        # 同名后写覆盖：测试和热重载会重新导入模块，重复发现不能让启动失败。
         self._registry[provider_name] = cls
 
     def get(self, name: str) -> type[BaseProvider] | None:
@@ -89,9 +86,6 @@ def auto_discover() -> ProviderRegistry:
     for module_info in pkgutil.iter_modules([str(package_dir)]):
         if module_info.ispkg or module_info.name in _NON_PROVIDER_MODULES:
             continue
-        # [provider-registry 2026-05-03] 通过文件扫描导入 provider 模块。
-        # 原因：旧路由必须手写 import 和 if-elif；做法：遍历 providers/*.py；
-        # 目的：让新增 provider 文件可以自动进入注册表。
         module = importlib.import_module(f"{package_name}.{module_info.name}")
         for _, obj in inspect.getmembers(module, inspect.isclass):
             if obj is BaseProvider or not issubclass(obj, BaseProvider):
@@ -105,9 +99,7 @@ def auto_discover() -> ProviderRegistry:
     return registry
 
 
-# [provider-registry 2026-05-03] 包加载时立即发现内置 provider。
-# 原因：engine/node 需要同步读取可用 provider 名称；做法：初始化时扫描一次；
-# 目的：保持调用方只需 import providers.registry 即可使用。
+# 导入即注册：调用方 import providers.registry 就能同步拿到全部 provider。
 auto_discover()
 
 # Compatibility exports: existing code may still import provider classes directly

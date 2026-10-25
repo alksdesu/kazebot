@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal, get_args
+
+from tools._wire import normalize_base_url
 
 
 def image_part_url(part: Any) -> str:
@@ -33,6 +35,68 @@ def split_data_url(url: str) -> tuple[str, str] | None:
     return (mime or "application/octet-stream", payload)
 
 
+def content_parts(content: Any) -> list[dict[str, Any]]:
+    """消息 content 统一成块列表。
+
+    手写消息和外部导入的历史里会出现裸字符串块，甚至整条 content 就是一个块；
+    在这里一并折成 {"type": "text"} 块，各家的转换只需要认块。
+    """
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    if isinstance(content, dict):
+        return [content]
+    if not isinstance(content, (list, tuple)):
+        return [{"type": "text", "text": str(content)}]
+    parts: list[dict[str, Any]] = []
+    for part in content:
+        if isinstance(part, dict):
+            parts.append(part)
+        elif isinstance(part, str):
+            if part:
+                parts.append({"type": "text", "text": part})
+        elif part is not None:
+            parts.append({"type": "text", "text": str(part)})
+    return parts
+
+
+def content_text(content: Any) -> str:
+    """content 里全部文本块按顺序拼起来的正文。"""
+    return "".join(
+        str(part.get("text") or "")
+        for part in content_parts(content)
+        if part.get("type") == "text"
+    )
+
+
+def provider_metadata(message: Any, provider: str) -> dict[str, Any]:
+    """engine 存在消息 _meta.metadata.<provider> 下、要原样回传给这一家的数据。取不到返回空 dict。"""
+    meta = message.get("_meta") if isinstance(message, dict) else None
+    metadata = meta.get("metadata") if isinstance(meta, dict) else None
+    value = metadata.get(provider) if isinstance(metadata, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+def tool_call_fields(call: Any) -> tuple[str, str, Any] | None:
+    """历史里一次工具调用的 (id, 名字, 原样参数)。
+
+    chat/completions 的 {"id", "function": {"name", "arguments": "<json>"}} 和
+    本项目存储用的 {"id", "name", "arguments": {...}} 两种形状都认；没有名字的返回 None。
+    """
+    if not isinstance(call, dict):
+        return None
+    function = call.get("function")
+    if isinstance(function, dict):
+        name, arguments = function.get("name"), function.get("arguments")
+    else:
+        name, arguments = call.get("name"), call.get("arguments")
+    name = str(name or "").strip()
+    if not name:
+        return None
+    return str(call.get("id") or ""), name, arguments
+
+
 @dataclass
 class ToolCall:
     id: str
@@ -40,12 +104,21 @@ class ToolCall:
     arguments: dict[str, Any]
 
 
+FinishReason = Literal["stop", "length", "tool_calls", "content_filter", "refusal", "incomplete"]
+ErrorKind = Literal[
+    "rate_limit", "overloaded", "timeout", "network", "server", "auth", "bad_request",
+    "context_length", "content_filter", "invalid_response", "incomplete", "unknown",
+]
+FINISH_REASONS: frozenset[str] = frozenset(get_args(FinishReason))
+ERROR_KINDS: frozenset[str] = frozenset(get_args(ErrorKind))
+
+
 @dataclass
 class ProviderResponse:
     """A rust-like provider result.
 
     - ok=True  -> text/tool_calls are valid
-    - ok=False -> error contains a human-readable error message
+    - ok=False -> error contains a human-readable error message, error_kind says what failed
 
     Worker loops should NOT rely on exceptions for normal provider failures
     (timeout, 4xx/5xx, invalid payload...).
@@ -54,22 +127,29 @@ class ProviderResponse:
     ok: bool
     text: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
-    # [refactor 2026-04-18] thinking → reasoning：统一命名，保留思维链内容
     reasoning: str | None = None
     error: str | None = None
+    # 收到了上游答复时是它的 HTTP 状态码；连接失败、流半路断掉这类没有完整答复的情况为 None。
     status_code: int | None = None
     raw: dict[str, Any] | None = None
     usage: dict[str, int] | None = None  # {"prompt_tokens": N, "completion_tokens": N, "total_tokens": N}
-    # [refactor 2026-04-18] 新增：provider 解析出的内联附件（图片等）
     inline_data: list[dict] = field(default_factory=list)
-    # [refactor 2026-04-18] 新增：provider 私有元数据，engine 只搬运不解读
+    # provider 私有元数据，engine 只搬运不解读。
     provider_meta: dict[str, Any] = field(default_factory=dict)
+    # 取值见 FinishReason。ok=True 且为 "length" 表示内容被输出上限截断，是否采用由 engine 决定。
+    finish_reason: str | None = None
+    # ok=False 时必填，取值见 ErrorKind；engine 据此决定重试、换渠道还是压缩上下文。
+    error_kind: str | None = None
 
 
 class BaseProvider(ABC):
-    # [provider-registry 2026-05-03] provider_name 是自动注册使用的稳定 key。
-    # 原因：engine 不应再用 if-elif 认识每个 provider；做法：每个子类声明自己的 key；
-    # 目的：新增 provider 文件后可以被 registry 发现，而不用修改 engine 路由代码。
+    """所有 provider 的公共约定。
+
+    子类的 chat / chat_stream 在定义时会被自动包一层兜底：除了取消和插件异常，任何异常都变成
+    ok=False 的响应，所以新写的 provider 不必、也无法绕开「失败不抛异常」这条约定。
+    """
+
+    # 自动发现按它注册，渠道配置里的 provider 字段写的就是它；实例名也默认取它，下游按 provider.name 判断各家特性。
     provider_name: str = ""
 
     # 请求格式族。同族之间只换地址不会挂 —— DeepSeek 继承 OpenAIProvider 就是这个意思。
@@ -87,6 +167,21 @@ class BaseProvider(ABC):
     # 这家默认的接口地址。渠道块留空时用它，列模型时也用它。
     default_base_url: str = ""
 
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        from .failures import never_raises
+
+        for name in ("chat", "chat_stream"):
+            method = cls.__dict__.get(name)
+            if callable(method):
+                setattr(cls, name, never_raises(method))
+
+    @classmethod
+    def resolve_base_url(cls, base_url: str | None) -> str:
+        """渠道地址归一成这家请求格式的根。工具子进程用的是同一个函数，两边才说得到一处去。"""
+        wire = (cls.wire_format or cls.provider_name or "").strip().lower()
+        return normalize_base_url(wire, (base_url or "").strip() or cls.default_base_url)
+
     @classmethod
     def catalog_request(
         cls, *, base_url: str, api_key: str,
@@ -103,8 +198,6 @@ class BaseProvider(ABC):
         """把列模型响应解析成模型名。形状不认识就返回空。"""
         return []
 
-    # [fix 2026-04-18] 新增 name 参数：让 engine 能动态获取 provider 名称。
-    # [provider-registry 2026-05-03] name 默认回落到 provider_name，避免实例名和注册 key 分叉。
     def __init__(self, *, model: str, name: str = ""):
         self.model = model
         self.name = name or self.provider_name
@@ -123,10 +216,5 @@ class BaseProvider(ABC):
         on_thinking: Callable[[str], Awaitable[None]] | None = None,
         on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> ProviderResponse:
-        # [provider-registry 2026-05-03] 所有内置 provider 已实现流式接口。
-        # 在 ABC 中显式声明它，目的：插件作者能看到完整合约，抽象类也能阻止漏实现。
-        # [tool-stream 2026-05-19] 新增 on_tool_delta。
-        # 原因：tool_call 参数过去只在 provider 内部攒完后返回，前端无法实时预览。
-        # 做法：把工具调用增量作为可选 callback 加入统一流式合约。
-        # 目的：text、thinking、tool_call 共享同一条实时事件管道，同时不破坏 ProviderResponse。
+        """流式请求。on_tool_delta 收工具调用参数的增量，前端靠它实时预览正在写的调用。"""
         raise NotImplementedError

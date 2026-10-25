@@ -6,6 +6,8 @@ Ignores ``.git`` by default.
 """
 from __future__ import annotations
 
+import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
@@ -14,10 +16,6 @@ from .._common import request_guard, resolve_and_classify, guard_external_read
 
 
 def _list_dir_result_text(results: list[dict[str, Any]], total_files: int, total_dirs: int) -> str:
-    # [AutoC 2026-05-31] Why: list_dir now provides its readable tree directly in
-    # data.result instead of relying on engine formatter fallback. How: render each
-    # section with file and directory markers, including failures. Purpose: keep
-    # directory listings readable under the unified ok/data/error schema.
     parts: list[str] = []
     for section in results:
         path = section.get("path", "?")
@@ -42,10 +40,6 @@ def _list_dir_result_text(results: list[dict[str, Any]], total_files: int, total
 
 
 def _empty_error_response(message: Any) -> dict[str, Any]:
-    # [AutoC 2026-05-31] Why: early list_dir failures need data.result even when no
-    # directory entries were produced. How: create the empty structured totals and
-    # place the readable error in data.result. Purpose: keep failures compatible
-    # with the same ok/data/error contract as successful listings.
     text = str(message)
     return {
         "ok": False,
@@ -55,13 +49,7 @@ def _empty_error_response(message: Any) -> dict[str, Any]:
     }
 
 
-# Default directories to ignore
 _DEFAULT_IGNORE_DIRS = frozenset({".git"})
-
-
-def _should_ignore(rel_parts: tuple[str, ...], ignore_dirs: frozenset[str]) -> bool:
-    """Return True if any path component is in the ignore set."""
-    return any(part in ignore_dirs for part in rel_parts)
 
 
 def _list_entries_flat(
@@ -102,19 +90,16 @@ def _list_entries_recursive(
     dirs: list[str] = []
     files: list[str] = []
 
-    for child in sorted(base.rglob("*")):
-        try:
-            rel_parts = child.relative_to(base).parts
-        except ValueError:
-            continue
-        if _should_ignore(rel_parts, ignore_dirs):
-            continue
-
-        rel_posix = child.relative_to(base).as_posix()
-        if child.is_dir():
-            dirs.append(rel_posix + "/")
-        elif child.is_file():
-            files.append(rel_posix)
+    # 边走边剪掉忽略的目录：先整棵树遍历再过滤的话，.git 里成千上万个对象也要挨个过一遍。
+    for root, dirnames, filenames in os.walk(base):
+        dirnames[:] = [name for name in dirnames if name not in ignore_dirs]
+        rel_root = Path(root).relative_to(base)
+        for name in dirnames:
+            dirs.append((rel_root / name).as_posix() + "/")
+        for name in filenames:
+            if name in ignore_dirs or not os.path.isfile(os.path.join(root, name)):
+                continue
+            files.append((rel_root / name).as_posix())
 
     entries: list[dict[str, str]] = []
     for d in sorted(dirs):
@@ -126,7 +111,6 @@ def _list_entries_recursive(
 
 
 async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    # ---- Parse paths parameter ----
     paths_arg = args.get("paths")
     if isinstance(paths_arg, list) and paths_arg:
         dir_paths = [str(p).strip() for p in paths_arg if isinstance(p, str) and str(p).strip()]
@@ -140,7 +124,7 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     recursive = bool(args.get("recursive", False))
     ignore_dirs = _DEFAULT_IGNORE_DIRS
 
-    # ---- External path approval (batch: check first external hit) ----
+    # 工作区外的路径整批只送审一次。
     _external_paths: list[str] = []
     for _dp in dir_paths:
         try:
@@ -158,7 +142,6 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         if err is not None:
             return _empty_error_response(err.get("error", "denied") if isinstance(err, dict) else err)
 
-    # ---- Iterate directories ----
     results: list[dict[str, Any]] = []
     total_files = 0
     total_dirs = 0
@@ -201,7 +184,8 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             continue
 
         if recursive:
-            entries, fc, dc = _list_entries_recursive(p, ignore_dirs)
+            # 整棵树的遍历放线程里跑，大目录不至于卡住同进程的其他任务。
+            entries, fc, dc = await asyncio.to_thread(_list_entries_recursive, p, ignore_dirs)
         else:
             entries, fc, dc = _list_entries_flat(p, ignore_dirs)
 
@@ -212,7 +196,6 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         total_files += fc
         total_dirs += dc
 
-    # ---- Build response ----
     all_ok = all(r.get("success") for r in results)
     response: dict[str, Any] = {
         "ok": all_ok,
@@ -227,7 +210,7 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     }
     if not all_ok:
         fail_count = sum(1 for r in results if not r.get("success"))
-        response["error"] = f"Some directories failed to list" if fail_count > 1 else results[next(i for i, r in enumerate(results) if not r.get("success"))].get("error", "unknown")
+        response["error"] = "Some directories failed to list" if fail_count > 1 else results[next(i for i, r in enumerate(results) if not r.get("success"))].get("error", "unknown")
 
     # Backward compat: single path → set top-level path/items
     if len(dir_paths) == 1 and results:

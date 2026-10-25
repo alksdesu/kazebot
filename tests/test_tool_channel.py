@@ -6,18 +6,18 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 _ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 if str(_ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(_ROOT / "tools"))
 
 from _channel import OPENAI_COMPATIBLE, Channel  # noqa: E402
+from toolbox._common import safe_subprocess_env  # noqa: E402
 
 CONFIG = "\n".join([
     "version: 1",
@@ -121,11 +121,12 @@ class TestReadImageFollowsTheMainChannel:
     def _run(self, cwd: Path) -> dict:
         # 两端都钉死 UTF-8：子进程默认按系统 locale 输出，父进程按 locale 解码，
         # 在中文 Windows 上撞见编不出的字符就整条流报 UnicodeDecodeError。
+        # 环境照生产的 safe_subprocess_env() 剥掉 *_API_KEY，开发机上设的密钥不能替配置兜底。
         done = subprocess.run(
             [sys.executable, str(_ROOT / "tools" / "read_image.py")],
             input=json.dumps({"image_path": "no-such-file.png"}),
             capture_output=True, text=True, encoding="utf-8",
-            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            env={**safe_subprocess_env(), "PYTHONIOENCODING": "utf-8"},
             cwd=str(cwd), timeout=120,
         )
         return json.loads(done.stdout.strip().splitlines()[-1])

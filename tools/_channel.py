@@ -241,7 +241,7 @@ class ImageSlotSpec(NamedTuple):
     url_envs: tuple[str, ...]
     default_model: str
     default_base_url: str = ""      # 留空表示这家没有公开的默认端点，必须配地址
-    strip_v1_suffix: bool = False
+    wire: str = "openai"            # 地址按哪家的规则归一，和 provider 发对话时同一套
 
 
 IMAGE_SLOTS: dict[str, ImageSlotSpec] = {
@@ -257,7 +257,7 @@ IMAGE_SLOTS: dict[str, ImageSlotSpec] = {
         url_envs=("GEMINI_BASE_URL", "OPENAI_BASE_URL"),
         default_model="gemini-3-pro-image-preview",
         default_base_url="https://generativelanguage.googleapis.com",
-        strip_v1_suffix=True,
+        wire="gemini",
     ),
 }
 
@@ -397,10 +397,7 @@ def resolve_image_channel(
     )
     base_url = channel.pick(
         "base_url", "BASE_URL", *(channel.env(name) for name in spec.url_envs), main.base_url,
-    ).rstrip("/")
-    if spec.strip_v1_suffix and base_url.endswith("/v1"):
-        base_url = base_url[:-3]
-    model = str(model_override or "").strip() or channel.pick("model", "MODEL", spec.default_model)
-    return ImageChannel(
-        api_key=api_key, base_url=base_url or spec.default_base_url, model=model,
     )
+    base_url = _wire_module().normalize_base_url(spec.wire, base_url or spec.default_base_url)
+    model = str(model_override or "").strip() or channel.pick("model", "MODEL", spec.default_model)
+    return ImageChannel(api_key=api_key, base_url=base_url, model=model)

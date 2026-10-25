@@ -180,8 +180,9 @@ def _usage_samples() -> dict[str, dict]:
             "cache_read_input_tokens": 60, "cache_creation_input_tokens": 0,
             "output_tokens_details": {"thinking_tokens": 8},
         }}),
+        # Gemini 的 candidatesTokenCount 不含思考消耗，totalTokenCount 含：12 + 8 才是别家口径的 20。
         "gemini": gemini_usage({
-            "promptTokenCount": 100, "candidatesTokenCount": 20, "totalTokenCount": 120,
+            "promptTokenCount": 100, "candidatesTokenCount": 12, "totalTokenCount": 120,
             "cachedContentTokenCount": 60, "thoughtsTokenCount": 8,
         }),
         "openai": openai_usage({"usage": {

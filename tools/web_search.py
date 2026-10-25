@@ -48,6 +48,7 @@ if __name__ == "__main__":
     import os
     import subprocess
     import sys
+    import threading
     import time
     from pathlib import Path
     from typing import Any
@@ -191,7 +192,41 @@ if __name__ == "__main__":
         ok = returncode == 0
         return {"ok": ok, "error": "" if ok else text, "data": {"result": text}}
 
-    def start_child(tool_name: str, child_args: dict[str, Any]) -> tuple[subprocess.Popen[str] | None, dict[str, Any] | None]:
+    # 管道交给后台线程 communicate() 边写边读：先等退出再读的话，子进程输出一满管道缓冲就卡死在写上。
+    class Child:
+        def __init__(self, tool_name: str, proc: subprocess.Popen[str], payload: str) -> None:
+            self.tool_name = tool_name
+            self.proc = proc
+            self.started = time.monotonic()
+            self._stdout = ""
+            self._stderr = ""
+            self._error: BaseException | None = None
+            self._reader = threading.Thread(target=self._communicate, args=(payload,), daemon=True)
+            self._reader.start()
+
+        def _communicate(self, payload: str) -> None:
+            try:
+                self._stdout, self._stderr = self.proc.communicate(input=payload)
+            except Exception as exc:
+                self._error = exc
+
+        def finished(self) -> bool:
+            return not self._reader.is_alive()
+
+        def result(self) -> dict[str, Any]:
+            if self._error is not None:
+                return child_error(self.tool_name, f"{self.tool_name} output read failed: {self._error}")
+            return parse_child_result(self.tool_name, int(self.proc.returncode or 0), self._stdout, self._stderr)
+
+        def kill(self, reason: str) -> dict[str, Any]:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            self._reader.join(timeout=2)
+            return child_error(self.tool_name, reason)
+
+    def start_child(tool_name: str, child_args: dict[str, Any]) -> tuple[Child | None, dict[str, Any] | None]:
         script = TOOL_DIR / f"{tool_name}.py"
         if not script.is_file():
             return None, child_error(tool_name, f"tool script not found: {tool_name}")
@@ -205,31 +240,9 @@ if __name__ == "__main__":
                 encoding="utf-8",
                 cwd=os.getcwd(),
             )
-            if proc.stdin is not None:
-                proc.stdin.write(json.dumps(child_args, ensure_ascii=False))
-                proc.stdin.close()
-            return proc, None
         except Exception as exc:
             return None, child_error(tool_name, f"{tool_name} execution failed: {exc}")
-
-    def collect_child(tool_name: str, proc: subprocess.Popen[str]) -> dict[str, Any]:
-        try:
-            stdout = proc.stdout.read() if proc.stdout is not None else ""
-            stderr = proc.stderr.read() if proc.stderr is not None else ""
-        except Exception as exc:
-            return child_error(tool_name, f"{tool_name} output read failed: {exc}")
-        return parse_child_result(tool_name, int(proc.returncode or 0), stdout, stderr)
-
-    def kill_child(tool_name: str, proc: subprocess.Popen[str], reason: str) -> dict[str, Any]:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            pass
-        return child_error(tool_name, reason)
+        return Child(tool_name, proc, json.dumps(child_args, ensure_ascii=False)), None
 
     def run_children(calls: list[tuple[str, dict[str, Any]]], *, total_timeout_sec: float, child_timeout_sec: float) -> dict[str, dict[str, Any]]:
         """Run one or more configured providers with an overall timeout.
@@ -239,34 +252,34 @@ if __name__ == "__main__":
         not the sum of all provider latencies.
         """
         results: dict[str, dict[str, Any]] = {}
-        running: dict[str, tuple[subprocess.Popen[str], float]] = {}
+        running: dict[str, Child] = {}
         started = time.monotonic()
         deadline = started + max(1.0, total_timeout_sec)
 
         for tool_name, child_args in calls:
-            proc, immediate_result = start_child(tool_name, child_args)
+            child, immediate_result = start_child(tool_name, child_args)
             if immediate_result is not None:
                 results[tool_name] = immediate_result
-            elif proc is not None:
-                running[tool_name] = (proc, time.monotonic())
+            elif child is not None:
+                running[tool_name] = child
 
         while running:
             now = time.monotonic()
-            for tool_name, (proc, child_started) in list(running.items()):
-                if proc.poll() is not None:
-                    results[tool_name] = collect_child(tool_name, proc)
+            for tool_name, child in list(running.items()):
+                if child.finished():
+                    results[tool_name] = child.result()
                     running.pop(tool_name, None)
                     continue
-                if now - child_started >= child_timeout_sec:
-                    results[tool_name] = kill_child(tool_name, proc, f"{tool_name} timeout after {child_timeout_sec:.0f}s")
+                if now - child.started >= child_timeout_sec:
+                    results[tool_name] = child.kill(f"{tool_name} timeout after {child_timeout_sec:.0f}s")
                     running.pop(tool_name, None)
 
             if not running:
                 break
             now = time.monotonic()
             if now >= deadline:
-                for tool_name, (proc, _) in list(running.items()):
-                    results[tool_name] = kill_child(tool_name, proc, f"{tool_name} cancelled by web_search total timeout after {total_timeout_sec:.0f}s")
+                for tool_name, child in list(running.items()):
+                    results[tool_name] = child.kill(f"{tool_name} cancelled by web_search total timeout after {total_timeout_sec:.0f}s")
                     running.pop(tool_name, None)
                 break
             time.sleep(min(0.05, max(0.0, deadline - now)))

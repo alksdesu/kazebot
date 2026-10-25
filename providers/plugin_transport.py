@@ -9,7 +9,10 @@ import httpx
 
 
 class PluginTransportError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, cause: type[BaseException] | None = None) -> None:
+        super().__init__(message)
+        # 只留原异常的类型供判定失败种类；它的文本可能带着地址和密钥，不能跟着报错往外走。
+        self.cause: type[BaseException] = cause or type(self)
 
 
 @contextmanager
@@ -21,7 +24,7 @@ def _safe_transport():
     except (asyncio.CancelledError, PluginExecutionError, PluginTransportError):
         raise
     except Exception as exc:
-        raise PluginTransportError(f"Provider transport failed ({type(exc).__name__})") from None
+        raise PluginTransportError(f"Provider transport failed ({type(exc).__name__})", cause=type(exc)) from None
 
 
 async def iter_sse_events(response: httpx.Response) -> AsyncIterator[dict[str, Any]]:

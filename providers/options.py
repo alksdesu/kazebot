@@ -8,14 +8,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from clonoth_runtime import parse_bool
+
 BOOL = "bool"
 INT = "int"
 FLOAT = "float"
 ENUM = "enum"
 TEXT = "text"
-
-_TRUE = frozenset({"true", "yes", "on", "1"})
-_FALSE = frozenset({"false", "no", "off", "0"})
 
 
 @dataclass(frozen=True)
@@ -63,14 +62,7 @@ class OptionSpec:
         return text or self.default
 
     def _coerce_bool(self, value: Any) -> bool:
-        if isinstance(value, bool):
-            return value
-        text = str(value).strip().lower()
-        if text in _TRUE:
-            return True
-        if text in _FALSE:
-            return False
-        return bool(self.default)
+        return bool(parse_bool(value, bool(self.default)))
 
     def _coerce_number(self, value: Any) -> int | float | None:
         # bool 是 int 的子类，"thinking_budget: true" 不该变成 1。
@@ -116,7 +108,8 @@ class OptionSet:
     def get(self, key: str) -> Any:
         spec = self._specs.get(key)
         if spec is None:
-            return self._raw.get(key)
+            # 不认识的键启动时已经告警「已忽略」，就得真的忽略，不能原样透传进请求体。
+            return None
         return spec.coerce(self._raw.get(key))
 
     def is_set(self, key: str) -> bool:
@@ -128,12 +121,15 @@ class OptionSet:
         return self._raw.get(key) is not None
 
     def override(self, key: str, value: Any) -> bool:
-        """记住一次修正，返回是否真的改了。
+        """记住一次修正，返回生效值是否真的变了。
 
         降级重试用。写回这一层而不是改请求体，是为了让修正对之后每一次请求都生效——
         否则同一个参数互斥每轮都要先撞一次 400 再重试，白付一个来回。
+        比的是生效值不是原始值：清掉一个默认值不为空的项只会回落到默认值，请求体一个字都不变，
+        这时要如实说没改，降级才不会拿同一个请求体再撞一次。
         """
-        if self._raw.get(key) == value:
+        spec = self._specs.get(key)
+        if spec is None or spec.coerce(value) == self.get(key):
             return False
         self._raw[key] = value
         return True

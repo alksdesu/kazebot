@@ -1,11 +1,12 @@
-"""看图请求的线格式适配。
+"""各家线格式的共用知识：地址归一化、看图请求、错误体里的人话。
 
-同一件事——一张图换一段文字——四家的端点、鉴权头、请求体和取文字的路径都不一样。
-读图工具和表情包打标共用这一份，格式才不会两边各写一遍然后慢慢分叉。
+读图工具、表情包打标和 providers/ 共用这一份，四家的端点、鉴权头和取文字路径才不会几处各写一遍；
+工具子进程只吃标准库，所以这份只能放在这里、只能用标准库。
 """
 from __future__ import annotations
 
 from typing import Any, NamedTuple
+from urllib.parse import urlsplit
 
 WIRE_OPENAI = "openai"
 WIRE_OPENAI_RESPONSES = "openai-responses"
@@ -56,7 +57,7 @@ def family_for_wire(wire: str) -> str:
 
 
 def normalize_base_url(wire: str, base_url: str) -> str:
-    """把地址收拾成这套格式的根。
+    """把地址收拾成这套格式的根。provider 发对话和工具发请求都走这一份，同一个渠道才不会被解释成两个地址。
 
     OpenAI 系的版本段是根的一部分（`/v1/chat/completions`），另外两家的版本段在路径里由
     端点自己拼，地址上再带一个就成了 `/v1/v1/messages`。
@@ -64,15 +65,16 @@ def normalize_base_url(wire: str, base_url: str) -> str:
     base = str(base_url or "").strip().rstrip("/")
     if not base:
         return ""
-    if not base.startswith(("http://", "https://")):
+    if not base.lower().startswith(("http://", "https://")):
         base = "https://" + base
-    if wire in (WIRE_ANTHROPIC, WIRE_GEMINI):
+    if str(wire or "").strip().lower() in (WIRE_ANTHROPIC, WIRE_GEMINI):
         for suffix in ("/v1beta", "/v1"):
             if base.endswith(suffix):
                 return base[: -len(suffix)]
         return base
-    # OpenAI 系保留旧行为：只填域名的配置一直靠这一步补全，改掉会让现有部署 404。
-    return base if "/v1" in base else base + "/v1"
+    # 只填了域名的配置一直靠补 /v1 才能用；带了路径就是写全的根，/api/v3、/compatible-mode/v1
+    # 这类网关的版本段不叫 /v1，再补一个只会 404。
+    return base if urlsplit(base).path else base + "/v1"
 
 
 def endpoint(wire: str, base_url: str, model: str) -> str:
@@ -86,20 +88,31 @@ def endpoint(wire: str, base_url: str, model: str) -> str:
     return base + "/chat/completions"
 
 
+def _on_official_host(base_url: str, domain: str) -> bool:
+    # 只认主机名：中转站把官方域名写进路径（/proxy/api.anthropic.com）时收的仍是 Bearer。
+    text = str(base_url or "").strip()
+    if "://" not in text:
+        text = "https://" + text
+    try:
+        host = (urlsplit(text).hostname or "").lower()
+    except ValueError:
+        return False
+    return host == domain or host.endswith("." + domain)
+
+
 def headers(wire: str, base_url: str, api_key: str) -> dict[str, str]:
-    """鉴权头。两家官方域名收自己的专用头，中转站一律 Bearer。"""
+    """鉴权头。两家官方域名收自己的专用头，中转站一律 Bearer。provider 和工具子进程共用这一份。"""
     key = str(api_key or "")
-    base = str(base_url or "").lower()
     out = {"Content-Type": "application/json"}
     if wire == WIRE_GEMINI:
-        if _GEMINI_DOMAIN in base:
+        if _on_official_host(base_url, _GEMINI_DOMAIN):
             out["x-goog-api-key"] = key
         else:
             out["Authorization"] = "Bearer " + key
         return out
     if wire == WIRE_ANTHROPIC:
         out["anthropic-version"] = "2023-06-01"
-        if _ANTHROPIC_DOMAIN in base:
+        if _on_official_host(base_url, _ANTHROPIC_DOMAIN):
             out["x-api-key"] = key
         else:
             out["Authorization"] = "Bearer " + key
@@ -320,17 +333,39 @@ def parse_text(wire: str, payload: Any) -> str:
     return "".join(_texts(content, "text")).strip()
 
 
-def error_detail(payload: Any) -> str:
-    """从错误响应里挖出人话。四家都把它塞在 error 下，字段名不一样。"""
+def _first_text(holder: dict, fields: tuple[str, ...]) -> str:
+    for field in fields:
+        value = holder.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def error_fields(payload: Any) -> tuple[str, str, str]:
+    """错误响应里的（人话, 类型, 代码）。取不到的项是空串。
+
+    四家都把它塞在 error 下，字段名不一样：类型在 OpenAI、Anthropic 叫 type，在 Gemini 叫 status；
+    代码 OpenAI 给的是字符串，Gemini 给的是 HTTP 状态码。Gemini 流式出错时整个错误包在一个数组里。
+    """
+    if isinstance(payload, list):
+        payload = next((item for item in payload if isinstance(item, dict)), None)
     if not isinstance(payload, dict):
-        return ""
+        return ("", "", "")
     err = payload.get("error")
     if isinstance(err, str):
-        return err.strip()
+        return (err.strip(), "", "")
     if isinstance(err, dict):
-        for field in ("message", "detail", "status"):
-            value = err.get(field)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    message = payload.get("message")
-    return message.strip() if isinstance(message, str) else ""
+        code = err.get("code")
+        code_text = str(code).strip() if isinstance(code, (str, int)) and not isinstance(code, bool) else ""
+        return (
+            _first_text(err, ("message", "detail", "status")),
+            _first_text(err, ("type", "status")),
+            code_text,
+        )
+    # 一些中转按自己的框架报错，人话直接挂在顶层。
+    return (_first_text(payload, ("message", "detail")), "", "")
+
+
+def error_detail(payload: Any) -> str:
+    """从错误响应里挖出人话。"""
+    return error_fields(payload)[0]

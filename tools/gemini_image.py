@@ -2,19 +2,8 @@ from __future__ import annotations
 
 """Gemini native image generation tool (Nano Banana).
 
-Uses the Gemini generativeLanguage REST API with responseModalities=["TEXT","IMAGE"]
-to generate images. The generated image is saved under data/attachments/ and returned
-as an attachment path compatible with Clonoth's multimodal pipeline.
-
-发图机制（参考 NovelAI 插件）：
-  - async_mode=False：同步执行，出图后直接返回 attachments，引擎据此发图，
-    finish_guard 也能正确记录“工具成功”。
-  - 图片发送统一交给 supervisor 的 dispatch_attachment 路由（子节点任务完成时
-    自动发送），工具本身不再 POST intermediate_reply，避免双发同一张图。
-
-API 渠道配置见 _channel.resolve_image_channel：system_models.image_gemini >
-CLONOTH_IMAGE_GEMINI_* > GEMINI_* > OPENAI_* > 主渠道（仅当主渠道本身是 Gemini）。
-model 不跟主渠道走，默认 gemini-3-pro-image-preview。
+调 generateContent（responseModalities 带 IMAGE）出图，存进 data/attachments/ 作为附件返回；
+发图交给 supervisor 的 dispatch_attachment 路由，工具自己不推图，免得同一张图发两遍。
 """
 
 SPEC = {
@@ -56,11 +45,9 @@ SPEC = {
     },
 }
 
-# [2026-07-19] 超时/重试对齐：单次请求 120s，重试 2 次，退避 5s；
-# 内部最坏耗时 ≈ 2×120+5 = 245s < 工具总超时 300s，两个超时对齐。
+# 内部最坏耗时 2×120+5 = 245s，要留在工具总超时 300s 以内。
 TIMEOUT_SEC = 300
 
-# API 请求重试参数（参考 NovelAI：429/5xx/超时/网络错误自动重试）
 _MAX_ATTEMPTS = 2
 _RETRY_BACKOFF_SEC = (5.0,)
 _REQUEST_TIMEOUT = 120
@@ -82,18 +69,11 @@ if __name__ == "__main__":
         sys.exit(0)
 
     def fail(error):
-        # [AutoC 2026-05-31] Why: image generation errors must be visible through
-        # data.result as well as error. How: emit the unified failure wrapper before
-        # exiting non-zero. Purpose: let the registry preserve detailed API errors.
         print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False))
         sys.exit(1)
 
-    # [2026-07-19] 方案 X：工具不再自己推图，发图统一交给 supervisor 的
-    # dispatch_attachment 路由（和 NovelAI 一致），避免与它双发同一张图。
-
     args = _input
 
-    # ---- 参数 ----
     prompt_text = str(args.get("prompt") or "").strip()
     if not prompt_text:
         fail("prompt is required")
@@ -117,6 +97,7 @@ if __name__ == "__main__":
         sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _channel import resolve_image_channel
     from _image import ImagePayloadError, build_image_part
+    from _wire import WIRE_GEMINI, endpoint, headers as auth_headers
 
     channel = resolve_image_channel("image_gemini", model_override=str(args.get("model") or ""))
     model = channel.model
@@ -126,8 +107,9 @@ if __name__ == "__main__":
     if not api_key:
         fail("No API key found in config/models.yaml / env / .env file")
 
-    # ---- 构建请求 ----
-    url = f"{base_url}/v1beta/models/{model}:generateContent?key={api_key}"
+    # 密钥放请求头、不进 URL：中转站的访问日志和各种报错里都会带上完整 URL。官方域名和中转站的鉴权头与 provider 同一套。
+    url = endpoint(WIRE_GEMINI, base_url, model)
+    request_headers = auth_headers(WIRE_GEMINI, base_url, api_key)
 
     parts = []
     for img_path in image_paths:
@@ -170,7 +152,6 @@ if __name__ == "__main__":
 
     req_data = json.dumps(body).encode("utf-8")
 
-    # ---- 发送请求（带自动重试） ----
     def _retryable_http(code: int) -> bool:
         return code in (408, 409, 425, 429, 500, 502, 503, 504)
 
@@ -180,7 +161,7 @@ if __name__ == "__main__":
         req = urllib_request.Request(
             url,
             data=req_data,
-            headers={"Content-Type": "application/json"},
+            headers=request_headers,
             method="POST",
         )
         try:
@@ -210,7 +191,6 @@ if __name__ == "__main__":
             continue
         fail(last_error)
 
-    # ---- 解析响应 ----
     candidates = resp_data.get("candidates")
     if not isinstance(candidates, list) or not candidates:
         fail(f"No candidates in response: {json.dumps(resp_data)[:500]}")
@@ -222,7 +202,6 @@ if __name__ == "__main__":
     text_parts = []
     image_saved = []
 
-    # 确定保存目录
     # 工具运行时 cwd 是 workspace_root
     workspace_root = Path.cwd()
     attachments_dir = workspace_root / "data" / "attachments" / "gemini_image"
@@ -276,12 +255,7 @@ if __name__ == "__main__":
 
     text = "\n".join(text_parts).strip()
 
-    # === 只返回 attachments，发图交给 supervisor 的 dispatch_attachment 统一处理 ===
-    # [AutoC 2026-05-31] Why: generated image tools now expose their primary text
-    # and attachment metadata under data, but legacy attachment collection still
-    # reads the top-level field. How: store text, attachments, and image metadata in
-    # data and mirror attachments at the top level. Purpose: migrate schema without
-    # breaking final image delivery.
+    # 附件在顶层也留一份：最终发图的附件收集还从顶层读。
     output({
         "ok": True,
         "data": {

@@ -17,7 +17,7 @@ import config_layout
 from clonoth_runtime import get_float, load_runtime_config
 
 from . import builtins as _builtins
-from ._common import kill_process_group as _kill_process_group
+from ._common import ProcessOutcome, run_process
 from ._common import request_guard as _request_guard
 from ._common import safe_subprocess_env as _safe_subprocess_env
 from . import mcp_runtime
@@ -28,12 +28,25 @@ log = logging.getLogger(__name__)
 
 ToolFunc = Callable[[dict[str, Any], Any], Awaitable[dict[str, Any]]]
 
+# 生图工具要在调用前登记素材版本、调用后归档产物。
+_IMAGE_TOOLS = frozenset({"gpt_image_2", "gemini_image", "nai_generate", "nai_generate_from_plan"})
+# 交给模型的 data.result 上限；截的是解析出来的正文，不是 stdout，JSON 结构和附件不受影响。
+_SCRIPT_RESULT_LIMIT_CHARS = 16000
+# 脚本 stdout 最多收这么多字节再解析；超了就整份不认，半截 JSON 解析不出来也不该当文本成功交出去。
+_SCRIPT_OUTPUT_LIMIT_BYTES = 4 * 1024 * 1024
+_SCRIPT_STDERR_LIMIT_BYTES = 64 * 1024
+_DIAGNOSTIC_CHARS = 2000
+
+
+def _describe_exception(error: BaseException) -> str:
+    name = type(error).__name__
+    text = str(error).strip()
+    if not text:
+        return name
+    return text if name in text else f"{name}: {text}"
+
 
 def _json_text(value: Any) -> str:
-    # [AutoC 2026-05-31] Why: registry-level fallback wrapping needs a stable
-    # readable transcript for arbitrary legacy tool payloads. How: serialize JSON
-    # values compactly and fall back to str() if serialization fails. Purpose: let
-    # every tool result expose data.result even when the tool itself is old.
     try:
         return json.dumps(value, ensure_ascii=False, default=str)
     except Exception:
@@ -41,10 +54,7 @@ def _json_text(value: Any) -> str:
 
 
 def _error_tool_response(message: Any, **fields: Any) -> dict[str, Any]:
-    # [AutoC 2026-05-31] Why: registry-generated failures, such as missing tools or
-    # script timeouts, bypass individual tool code. How: put the error in both error
-    # and data.result, with optional metadata under data and top level. Purpose:
-    # keep all registry-originated failures in the unified ok/data/error shape.
+    # 附加字段在顶层和 data 里各放一份：判取消等场合有调用方只看顶层。
     text = str(message)
     data: dict[str, Any] = {"result": f"ERROR: {text}"}
     data.update(fields)
@@ -54,20 +64,13 @@ def _error_tool_response(message: Any, **fields: Any) -> dict[str, Any]:
 
 
 def _ensure_tool_response_shape(result: Any) -> dict[str, Any]:
-    # [AutoC 2026-05-31] Why: user-created external tools and older built-ins may
-    # still return legacy top-level fields. How: preserve already unified payloads,
-    # add data.result to ok=false payloads, and otherwise move legacy fields under
-    # data while mirroring attachments during migration. Purpose: enforce the new
-    # ok/data/error contract at the registry boundary without losing metadata.
+    """把外部脚本和旧内置工具的返回统一成 ok/data/error，原有字段收进 data。"""
     if not isinstance(result, dict):
         return {"ok": True, "data": {"result": str(result), "value": result}}
 
     data = result.get("data") if isinstance(result.get("data"), dict) else None
     if isinstance(data, dict) and isinstance(data.get("result"), str) and "ok" in result:
-        # [AutoC 2026-05-31] Why: some already-migrated tools may still provide
-        # attachments only at the top level for migration compatibility. How: add
-        # the nested data.attachments mirror when it is missing. Purpose: keep the
-        # attachment contract consistent at the registry boundary.
+        # 已经是新格式但附件只放在顶层的工具：补一份 data.attachments。
         attachments = result.get("attachments")
         if isinstance(attachments, list) and not isinstance(data.get("attachments"), list):
             result = dict(result)
@@ -85,7 +88,11 @@ def _ensure_tool_response_shape(result: Any) -> dict[str, Any]:
         for key, value in result.items():
             if key not in {"ok", "data", "error"} and key not in merged_data:
                 merged_data[key] = value
-        return {"ok": False, "data": merged_data, "error": str(error_value or merged_data.get("result") or "unknown")}
+        response = {"ok": False, "data": merged_data, "error": str(error_value or merged_data.get("result") or "unknown")}
+        # 和 _error_tool_response 一样顶层留一份取消标记，只看顶层的调用方才认得出被取消。
+        if merged_data.get("cancelled"):
+            response["cancelled"] = True
+        return response
 
     merged_data = dict(data or {})
     for key, value in result.items():
@@ -313,6 +320,76 @@ def _with_python_path(env: dict[str, str], extra: tuple[str, ...]) -> dict[str, 
     return env
 
 
+def _clip_result(response: dict[str, Any], limit: int = _SCRIPT_RESULT_LIMIT_CHARS) -> dict[str, Any]:
+    """只截 data.result 这段给模型看的正文，其余字段（附件、引用）原样保留。"""
+    data = response.get("data")
+    text = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(text, str) or len(text) <= limit:
+        return response
+    clipped = dict(response)
+    clipped["data"] = {**data, "result": f"{text[:limit]}\n...<truncated {len(text) - limit} chars>"}
+    return clipped
+
+
+def _parse_script_stdout(text: str) -> tuple[Any, bool]:
+    """(解析结果, 是否解析成功)。"""
+    try:
+        return json.loads(text), True
+    except ValueError:
+        pass
+    # 依赖库往 stdout 打的日志会排在前面，协议要求的那个 JSON 对象在最后一行。
+    head, _sep, last = text.rpartition("\n")
+    last = last.strip()
+    if head and last.startswith("{"):
+        try:
+            parsed = json.loads(last)
+        except ValueError:
+            return None, False
+        if isinstance(parsed, dict):
+            return parsed, True
+    return None, False
+
+
+def _with_error_result(payload: dict[str, Any], fallback: str) -> dict[str, Any]:
+    """工具自己报的 ok=false 原样保留，只在缺 data.result 时补上一句。"""
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    if isinstance(data.get("result"), str):
+        return payload
+    filled = dict(payload)
+    filled["data"] = {**data, "result": f"ERROR: {payload.get('error') or fallback}"}
+    return filled
+
+
+def _script_response(outcome: ProcessOutcome) -> dict[str, Any]:
+    stdout_text = outcome.stdout.decode("utf-8", errors="replace").strip()
+    stderr_text = outcome.stderr.decode("utf-8", errors="replace").strip()
+    diagnostics = {"stderr": stderr_text[:_DIAGNOSTIC_CHARS], "stdout": stdout_text[:_DIAGNOSTIC_CHARS]}
+    rc = outcome.returncode
+
+    if outcome.stdout_overflow:
+        return _error_tool_response(
+            f"script output exceeded {_SCRIPT_OUTPUT_LIMIT_BYTES} bytes and was discarded", **diagnostics,
+        )
+
+    parsed, parsed_ok = _parse_script_stdout(stdout_text)
+    if rc != 0:
+        # 迁移过的脚本会先打印结构化的 ok=false 再以非零码退出，具体报错要原样留着。
+        if parsed_ok and isinstance(parsed, dict) and parsed.get("ok") is False:
+            return _clip_result(_with_error_result(parsed, f"script exited with code {rc}"))
+        return _error_tool_response(f"script exited with code {rc}", **diagnostics)
+
+    if parsed_ok:
+        if isinstance(parsed, dict):
+            return _clip_result(_ensure_tool_response_shape(parsed))
+        # 打印 JSON 标量的旧脚本：值放进 value，字符串形式给 data.result。
+        return _clip_result({"ok": True, "data": {"result": str(parsed), "value": parsed}})
+    if stdout_text[:1] in ("{", "["):
+        # 看着是 JSON 却解析不了，多半是写到一半崩了，不能当成功的纯文本交出去。
+        return _error_tool_response("script printed malformed JSON", **diagnostics)
+    # 只打印纯文本的旧脚本照旧可用。
+    return _clip_result({"ok": True, "data": {"result": stdout_text, "output": stdout_text}})
+
+
 def _make_script_tool(
     *,
     script_path: Path,
@@ -353,8 +430,6 @@ def _make_script_tool(
                 default_timeout_sec = 60.0
 
         timeout_val = float(timeout_sec) if timeout_sec is not None else float(default_timeout_sec)
-        max_output = 16000
-
         input_json = json.dumps(args or {}, ensure_ascii=False)
 
         try:
@@ -365,91 +440,25 @@ def _make_script_tool(
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(root) if isinstance(root, Path) else None,
                 env=_with_python_path(_script_tool_env(ctx), python_path),
-                # Fix: run in new session so os.killpg can kill the entire
-                # process tree, preventing orphaned grandchildren from holding
-                # pipe fds and causing communicate() to hang forever.
+                # 独立进程组：超时或取消时整棵进程树一起杀，孙进程攥着管道也不会把等待卡死。
                 start_new_session=True,
             )
-            waiter = asyncio.create_task(proc.communicate(input=input_json.encode("utf-8")))
-            started = asyncio.get_running_loop().time()
-            while True:
-                done, _pending = await asyncio.wait({waiter}, timeout=0.2)
-                if waiter in done:
-                    stdout_bytes, stderr_bytes = waiter.result()
-                    break
-                try:
-                    if hasattr(ctx, "check_cancelled") and await ctx.check_cancelled():
-                        # Fix: kill entire process group, not just the interpreter
-                        _kill_process_group(proc)
-                        # Fix: 5s safety timeout — if killpg didn't clean all
-                        # grandchildren, don't hang forever waiting for pipe EOF
-                        try:
-                            await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            pass
-                        return _error_tool_response("script task cancelled", cancelled=True)
-                except Exception:
-                    pass
-                if asyncio.get_running_loop().time() - started >= timeout_val:
-                    _kill_process_group(proc)
-                    try:
-                        await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        pass
-                    return _error_tool_response(f"script timeout after {timeout_val}s")
-        except asyncio.TimeoutError:
-            try:
-                _kill_process_group(proc)  # type: ignore[union-attr]
-            except Exception:
-                pass
-            return _error_tool_response(f"script timeout after {timeout_val}s")
+            outcome = await run_process(
+                proc,
+                stdin=input_json.encode("utf-8"),
+                timeout_sec=timeout_val,
+                keep_stdout=_SCRIPT_OUTPUT_LIMIT_BYTES,
+                keep_stderr=_SCRIPT_STDERR_LIMIT_BYTES,
+                is_cancelled=getattr(ctx, "check_cancelled", None),
+            )
         except Exception as e:
             return _error_tool_response(f"script execution failed: {e}")
 
-        stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-        stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-
-        if proc.returncode != 0:
-            # [AutoC 2026-05-31] Why: migrated external tools may intentionally
-            # exit non-zero after printing a structured ok=false JSON payload.
-            # How: parse stdout first and preserve the tool-owned error fields,
-            # adding data.result only when the payload does not already have it.
-            # Purpose: keep failures readable without discarding specific messages.
-            try:
-                parsed = json.loads(stdout_text)
-                if isinstance(parsed, dict) and parsed.get("ok") is False:
-                    parsed_data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
-                    if not isinstance(parsed_data.get("result"), str):
-                        parsed = dict(parsed)
-                        parsed_data = dict(parsed_data)
-                        parsed_data["result"] = f"ERROR: {parsed.get('error', f'script exited with code {proc.returncode}')}"
-                        parsed["data"] = parsed_data
-                    return parsed
-            except (json.JSONDecodeError, ValueError):
-                pass
-            return _error_tool_response(
-                f"script exited with code {proc.returncode}",
-                stderr=stderr_text[:2000] if stderr_text else "",
-                stdout=stdout_text[:2000] if stdout_text else "",
-            )
-
-        if len(stdout_text) > max_output:
-            stdout_text = stdout_text[:max_output]
-
-        try:
-            result = json.loads(stdout_text)
-            if isinstance(result, dict):
-                return _ensure_tool_response_shape(result)
-            # [AutoC 2026-05-31] Why: script tools can print JSON scalars, but the
-            # engine now expects ok/data/error. How: keep the scalar under value and
-            # expose its string form as data.result. Purpose: make every successful
-            # external script output readable through the same contract.
-            return {"ok": True, "data": {"result": str(result), "value": result}}
-        except json.JSONDecodeError:
-            # [AutoC 2026-05-31] Why: legacy scripts may still print plain text.
-            # How: wrap stdout as both data.result and data.output. Purpose: keep
-            # plain-text scripts usable while conforming to the unified schema.
-            return {"ok": True, "data": {"result": stdout_text, "output": stdout_text}}
+        if outcome.cancelled:
+            return _error_tool_response("script task cancelled", cancelled=True)
+        if outcome.timed_out:
+            return _error_tool_response(f"script timeout after {timeout_val}s")
+        return _script_response(outcome)
 
     return _run
 
@@ -475,11 +484,6 @@ class ToolRegistry:
 
     def register_builtin_tool(self, name: str, description: str, input_schema: dict[str, Any], func: ToolFunc) -> None:
         """Register one builtin tool declared by a built-in plugin."""
-        # Why: some built-in tools now live with their owning plugin instead of
-        # the central registry table. How: install the spec and callable into the
-        # active maps and, when available, into the builtin snapshots used by
-        # reload(). Purpose: plugin-owned builtin tools remain visible after tools
-        # hot-reload and cannot be overridden by external script tools.
         clean_name = str(name or "").strip()
         if not clean_name:
             raise ValueError("builtin tool name is required")
@@ -496,9 +500,7 @@ class ToolRegistry:
         self._tool_specs[clean_name] = spec
         self._tool_funcs[clean_name] = func
 
-        # Why: plugin tools are registered after ToolRegistry.__init__ has already
-        # captured its builtin snapshot. How: refresh the snapshots when they
-        # exist. Purpose: later reload() calls keep plugin-declared tools.
+        # 插件在 __init__ 拍完内置快照之后才注册，快照不补的话 reload() 一次就丢，还会被同名脚本工具盖掉。
         if hasattr(self, "_builtin_specs"):
             self._builtin_specs[clean_name] = spec
         if hasattr(self, "_builtin_funcs"):
@@ -809,10 +811,6 @@ class ToolRegistry:
         ]
 
         for name, desc, schema, func in builtins:
-            # Why: built-in tools now have a public registration path shared by
-            # registry-owned and plugin-owned tools. How: seed the central table
-            # through register_builtin_tool(). Purpose: keep one code path for
-            # validating and storing builtin specs.
             self.register_builtin_tool(name, desc, schema, func)
 
         from .builtins import community, context_archive, execution_plans, materials, reminders
@@ -856,11 +854,7 @@ class ToolRegistry:
             if not isinstance(input_schema, dict):
                 input_schema = {"type": "object", "properties": {}, "required": []}
 
-            # [AutoC 2026-05-31] Why: external tools may declare SPEC.result_format
-            # so result_to_raw() can route by an explicit formatter id before
-            # falling back to structural predicates. How: copy the literal field
-            # into the registered spec when it is a non-empty string. Purpose: keep
-            # tool metadata available without changing any tool return payload.
+            # result_format 原样带进注册表：result_to_raw() 先按它选格式化器，没有才按结构猜。
             registered_spec = {
                 "name": name,
                 "description": description,
@@ -955,51 +949,47 @@ class ToolRegistry:
             return copy.deepcopy(specs.get(name))
 
     async def prepare(self, *, name: str, arguments: dict[str, Any], ctx: Any) -> Any:
-        if name in {"gpt_image_2", "gemini_image", "nai_generate", "nai_generate_from_plan"}:
+        if name in _IMAGE_TOOLS:
             from engine.materials.integration import begin_image_generation
             return await begin_image_generation(ctx, name, arguments)
         return None
 
     async def execute(self, *, name: str, arguments: dict[str, Any], ctx: Any) -> dict[str, Any]:
-        with self._tool_view(ctx) as (specs, funcs, owners):
-            if name not in funcs:
-                return _error_tool_response(f"tool not found: {name}")
-            owner = owners.get(name)
-            guard = specs[name].get("guard") if owner else None
-            if isinstance(guard, dict):
-                denied = await _script_guard_error(guard, name, arguments or {}, ctx)
-                if denied is not None:
-                    return denied
+        # 不管内置、脚本、MCP 还是插件工具，连同插件视图的借还，出错都只算这一次调用失败，不能把整个任务带崩；取消照常上抛。
+        try:
+            with self._tool_view(ctx) as (specs, funcs, owners):
+                if name not in funcs:
+                    return _error_tool_response(f"tool not found: {name}")
+                return await self._execute_resolved(name, specs[name], funcs[name], owners.get(name), arguments, ctx)
+        except Exception as error:
+            log.exception("tool %s failed", name)
+            return _error_tool_response(f"tool {name} failed: {_describe_exception(error)}")
+
+    async def _execute_resolved(
+        self, name: str, spec: dict[str, Any], func: ToolFunc, owner: Any, arguments: dict[str, Any], ctx: Any,
+    ) -> dict[str, Any]:
+        guard = spec.get("guard") if owner else None
+        if isinstance(guard, dict):
+            denied = await _script_guard_error(guard, name, arguments or {}, ctx)
+            if denied is not None:
+                return denied
+        try:
+            operation = await self.prepare(name=name, arguments=arguments, ctx=ctx)
+        except Exception as error:
+            return _error_tool_response(f"图像版本登记失败，尚未调用生图服务：{error}")
+        if owner is None:
+            result = await func(arguments, ctx)
+        else:
             try:
-                operation = await self.prepare(name=name, arguments=arguments, ctx=ctx)
+                result = await _call_plugin_tool(func, arguments, ctx)
             except Exception as error:
-                return _error_tool_response(f"图像版本登记失败，尚未调用生图服务：{error}")
-            func = funcs[name]
-            if owner is None:
-                result = await func(arguments, ctx)
-            else:
-                try:
-                    if inspect.iscoroutinefunction(func):
-                        result = await func(arguments, ctx)
-                    else:
-                        task = asyncio.create_task(asyncio.to_thread(func, arguments, ctx))
-                        try:
-                            result = await asyncio.shield(task)
-                        except asyncio.CancelledError:
-                            pending = await asyncio.gather(task, return_exceptions=True)
-                            if pending and inspect.iscoroutine(pending[0]):
-                                pending[0].close()
-                            raise
-                        if inspect.isawaitable(result):
-                            result = await result
-                except Exception as error:
-                    from plugin_runtime import get_manager
-                    get_manager(self.workspace_root).record_error(owner, "tool", error)
-                    return _error_tool_response(f"Plugin {owner.api.plugin_id} tool {name} failed ({type(error).__name__})")
-            if name in {"gpt_image_2", "gemini_image", "nai_generate", "nai_generate_from_plan"}:
-                from engine.materials.integration import persist_generated_images
-                result = await persist_generated_images(ctx, name, arguments, result, operation=operation)
-            return _ensure_tool_response_shape(result)
+                from plugin_runtime import get_manager
+                get_manager(self.workspace_root).record_error(owner, "tool", error)
+                return _error_tool_response(f"Plugin {owner.api.plugin_id} tool {name} failed ({type(error).__name__})")
+        if name in _IMAGE_TOOLS:
+            from engine.materials.integration import persist_generated_images
+            result = await persist_generated_images(ctx, name, arguments, result, operation=operation)
+        return _ensure_tool_response_shape(result)
 
     async def load_mcp_tools(self) -> int:
         """Scan enabled MCP clients and register their tools as first-class tools.
@@ -1067,6 +1057,24 @@ class ToolRegistry:
                 count += 1
 
         return count
+
+
+async def _call_plugin_tool(func: Any, arguments: dict[str, Any], ctx: Any) -> Any:
+    """插件工具可以是协程函数，也可以是同步函数；同步的放到线程里跑，不堵事件循环。"""
+    if inspect.iscoroutinefunction(func):
+        return await func(arguments, ctx)
+    task = asyncio.create_task(asyncio.to_thread(func, arguments, ctx))
+    try:
+        result = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # 线程停不下来，得等它跑完；它若返回了协程，关掉免得「从未 await」的告警。
+        pending = await asyncio.gather(task, return_exceptions=True)
+        if pending and inspect.iscoroutine(pending[0]):
+            pending[0].close()
+        raise
+    if inspect.isawaitable(result):
+        result = await result
+    return result
 
 
 def _make_mcp_tool(workspace_root: Path, client_id: str, tool_name: str) -> ToolFunc:

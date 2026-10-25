@@ -1,39 +1,37 @@
 """System management: request_restart (with git snapshot helpers)."""
 from __future__ import annotations
 
+import asyncio
+import shutil
 import subprocess
+import threading
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from clonoth_runtime import get_int, load_runtime_config
 
 from ..context import ToolContext
 from .._common import request_guard, safe_subprocess_env
 
+_T = TypeVar("_T")
+
+# git 在线程池里跑，同时来的两次重启会并发 git add/commit 抢同一个 index.lock。
+_git_lock = threading.Lock()
+
 
 def _ok(result_text: str, **fields: Any) -> dict[str, Any]:
-    # [AutoC 2026-05-31] Why: request_restart returns operational metadata and now
-    # needs a canonical readable transcript. How: place all fields under data with
-    # the result string. Purpose: keep restart output in the shared ok/data/error
-    # schema while preserving structured git data.
     return {"ok": True, "data": {"result": result_text, **fields}}
 
 
 def _err(message: Any, **fields: Any) -> dict[str, Any]:
-    # [AutoC 2026-05-31] Why: restart and git checkpoint failures must include
-    # data.result. How: mirror optional structured fields under data and top level.
-    # Purpose: keep failure details readable and backward-tolerant.
+    # 字段在顶层也留一份：判取消等场合有调用方只看顶层。
     text = str(message)
     data = {"result": f"ERROR: {text}", **fields}
     response: dict[str, Any] = {"ok": False, "error": text, "data": data}
     response.update(fields)
     return response
 
-
-# ---------------------------------------------------------------------------
-#  Git helpers
-# ---------------------------------------------------------------------------
 
 def _run_capture(*, args: list[str], cwd: Path, timeout_sec: float = 10.0) -> tuple[int, str]:
     try:
@@ -52,21 +50,19 @@ def _run_capture(*, args: list[str], cwd: Path, timeout_sec: float = 10.0) -> tu
 
 
 def _cleanup_old_artifacts(*, workspace_root: Path, current_run_id: str) -> None:
-    """[2026-05-25] 用后即焚：删除非当前 run_id 的 artifact 目录。"""
+    """artifact 用后即焚：只留当前 run_id 的目录。"""
     artifacts_root = workspace_root / "data" / "artifacts"
     if not artifacts_root.exists():
         return
     for d in artifacts_root.iterdir():
         if d.is_dir() and d.name != current_run_id:
             try:
-                import shutil
                 shutil.rmtree(d)
             except Exception:
                 pass
 
 
 def _write_text_artifact(*, ctx: ToolContext, filename: str, text: str) -> str:
-    # 写入前清理旧 artifact
     _cleanup_old_artifacts(workspace_root=ctx.workspace_root, current_run_id=ctx.run_id)
     artifacts_dir = ctx.workspace_root / "data" / "artifacts" / ctx.run_id
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -165,15 +161,21 @@ def _git_commit_all(*, ctx: ToolContext, message: str) -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-#  Tool function
-# ---------------------------------------------------------------------------
+def _locked_git(func: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
+    with _git_lock:
+        return func(*args, **kwargs)
+
+
+async def _in_git_thread(func: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
+    # git 是同步子进程，大仓库一次 diff 能跑几十秒，在事件循环里跑会把同进程的其他任务一起卡住。
+    return await asyncio.to_thread(_locked_git, func, *args, **kwargs)
+
 
 async def request_restart(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     target = str(args.get("target", "engine"))
     reason = str(args.get("reason", ""))
 
-    git_info = _git_snapshot(ctx)
+    git_info = await _in_git_thread(_git_snapshot, ctx)
 
     op, err = await request_guard(
         ctx,
@@ -190,7 +192,8 @@ async def request_restart(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
 
     approval_id: str | None = op.get("approval_id") if op.get("safety_level") == "approval_required" else None
 
-    commit_res = _git_commit_all(
+    commit_res = await _in_git_thread(
+        _git_commit_all,
         ctx=ctx,
         message=f"clonoth: checkpoint before restart (handoff={ctx.run_id}, target={target})",
     )
@@ -206,10 +209,7 @@ async def request_restart(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         except Exception:
             pass
 
-    # [Fork/Merge 2026-05-17] Why: restart notifications are written back to the
-    # user-facing session, not the temporary branch where a tool may run. How: use
-    # ToolContext's parent-first route session for the restart request. Purpose:
-    # pending restart messages and outbound status reach the correct conversation.
+    # 工具可能跑在临时分支上，重启通知要回到用户看得见的那个会话。
     r = await ctx.http.post(
         f"{ctx.supervisor_url}/v1/admin/restart",
         json={"target": target, "reason": reason, "approval_id": approval_id, "session_id": ctx.route_session_id()},

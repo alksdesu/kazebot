@@ -1,8 +1,6 @@
 """DeepSeek provider — OpenAI 兼容端点，外加思考模式与思维链回传。
 
-与 OpenAI 的差别只在请求体和默认地址上，所以只覆写 _build_payload：
-SSE 解析、错误对象、异常 finish_reason 全部复用父类，不再各写一份。
-
+与 OpenAI 的差别只在请求体和默认地址上，所以只覆写 _build_payload，流式解析和错误归类都走父类。
 Ref: https://api-docs.deepseek.com/guides/thinking_mode
 """
 from __future__ import annotations
@@ -12,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from .degrade import DegradeRule, unset_options
+from .degrade import DegradeRule, set_option
 from .openai import OpenAIProvider
 from .options import BOOL, ENUM, OptionSet, OptionSpec
 
@@ -20,6 +18,8 @@ log = logging.getLogger(__name__)
 
 # 这几项 DeepSeek 不认：详尽度没有，缓存分组是自动的不接受手动分组。
 _UNSUPPORTED = frozenset({"verbosity", "prompt_cache_key"})
+# 父类这两条规则靠清空回落到「不发」；DeepSeek 的思考档位默认值本身就要发，清空等于没改，得换成下面自己的规则。
+_REPLACED_RULES = frozenset({"去掉详尽度", "去掉思考档位"})
 
 
 class DeepSeekProvider(OpenAIProvider):
@@ -41,19 +41,25 @@ class DeepSeekProvider(OpenAIProvider):
         ),
         OptionSpec(
             key="reasoning_effort", label="思考档位", kind=ENUM, default="high",
-            choices=(("high", "高"), ("max", "最高")),
+            choices=(("default", "不指定"), ("high", "高"), ("max", "最高")),
             depends_on=("thinking", True),
-            desc="只有这两档；「最高」需要更长的输出窗口。",
+            desc="「最高」需要更长的输出窗口；「不指定」则不发这个字段，由对面决定。",
         ),
     )
 
     DEGRADE_RULES: tuple[DegradeRule, ...] = tuple(
-        rule for rule in OpenAIProvider.DEGRADE_RULES if rule.name != "去掉详尽度"
+        rule for rule in OpenAIProvider.DEGRADE_RULES if rule.name not in _REPLACED_RULES
     ) + (
+        DegradeRule(
+            name="去掉思考档位",
+            match=("reasoning_effort", "reasoning.effort"),
+            apply=set_option("reasoning_effort", "default"),
+            advice="这个模型或端点不支持思考档位。",
+        ),
         DegradeRule(
             name="关掉思考模式",
             match=("thinking",),
-            apply=unset_options("thinking"),
+            apply=set_option("thinking", False),
             advice="这个模型或端点不支持思考模式。",
         ),
     )
@@ -102,10 +108,13 @@ class DeepSeekProvider(OpenAIProvider):
 
         thinking = bool(self._options.get("thinking"))
         payload["thinking"] = {"type": "enabled" if thinking else "disabled"}
-        if not thinking:
+        effort = self._options.get("reasoning_effort")
+        if thinking and effort and effort != "default":
+            payload["reasoning_effort"] = effort
+        else:
             payload.pop("reasoning_effort", None)
+        if not thinking:
             return payload
-        payload["reasoning_effort"] = self._options.get("reasoning_effort")
         # 思考模式下这些参数被静默忽略：不报错、也不生效。发出去只会让人
         # 以为调过了，所以这里直接不发。
         dropped = [key for key in ("temperature", "top_p") if payload.pop(key, None) is not None]
