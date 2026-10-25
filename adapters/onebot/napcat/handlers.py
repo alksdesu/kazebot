@@ -41,7 +41,7 @@ async def _feature_command_rule(bot: Bot, event: Event) -> bool:
     metadata = await state._adapter.features.prepare(bot, event)
     text = metadata.get("raw_text") or message_text._message_to_text(event.get_message(), getattr(bot, "self_id", None))
     head = text.strip().replace("／", "/", 1).split(maxsplit=1)
-    reply_ref = str(message_text._extract_reply_message_id(event.get_message(), getattr(event, "raw_message", None)) or "")
+    reply_ref = str(message_text._event_reply_message_id(event) or "")
     return bool(await state._adapter.features.matches_command(bot, event, text, reply_ref) or (head and head[0] in {"/帮助", "/help"}))
 
 
@@ -50,6 +50,8 @@ _feature_matcher = on_message(rule=Rule(_feature_command_rule), priority=5, bloc
 
 @_feature_matcher.handle()
 async def _handle_feature_command(bot: Bot, event: Event) -> None:
+    if not inbound._first_delivery(bot, event):
+        return
     text = (await message_text._event_text_with_forward(bot, event)).strip()
     result = await state._adapter.features.handle_command(bot, event, text)
     if result is None:
@@ -96,7 +98,8 @@ _history_matcher = on_message(rule=Rule(permissions._allowed_group_rule), priori
 @_history_matcher.handle()
 async def _handle_history(bot: Bot, event: GroupMessageEvent) -> None:
     """记录非触发消息，供后续 @Bot 请求作为群聊上下文。"""
-    await _record_non_trigger_message(bot, event)
+    if inbound._first_delivery(bot, event):
+        await _record_non_trigger_message(bot, event)
 
 
 async def _record_non_trigger_message(bot: Bot, event: GroupMessageEvent) -> None:
@@ -242,6 +245,8 @@ async def _handle_group_upload_notice(bot: Bot, event: Event) -> None:
     if not isinstance(file_info, dict):
         file_info = {}
     source = media._segment_file_source(file_info)
+    if not media._first_group_file(int(event.group_id), source):
+        return
     name = source["name"] if source else "文件"
     attachments, errors = await media._file_sources_to_attachments(
         [source] if source else [], stable_conversation_key, bot=bot, group_id=int(event.group_id),
@@ -277,6 +282,8 @@ _agent_matcher = on_message(rule=Rule(permissions._agent_group_rule), priority=1
 @_agent_matcher.handle()
 async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
     """把当前 QQ 群请求提交给 ClonothZX。"""
+    if not inbound._first_delivery(bot, event):
+        return
     await _process_group_message(bot, event, _agent_matcher)
 
 
@@ -424,21 +431,18 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
             await _check_local_group_send(bot, event)
             await matcher.send(inbound._DRAW_REFERENCE_IMAGE_NOTICE)
         # 直达绘图不带群历史，水位保持不动，那些行留给下一条正常消息带出去。
-        inbound_text, history_watermark = await inbound._build_draw_direct_inbound_text(event, draw_direct_prompt, False), -1
+        built = await inbound._build_draw_direct_inbound_text(event, draw_direct_prompt, False)
     else:
-        inbound_text, history_watermark = await inbound._build_inbound_text(
+        built = (await inbound._build_inbound_text(
             event, bot, user_text, stable_conversation_key, attachments, exclude_seq=current_seq,
-        )
-        inbound_text = inbound._apply_attachment_hints(inbound_text, user_text, attachments, attachment_errors)
+        )).map(lambda text: inbound._apply_attachment_hints(text, user_text, attachments, attachment_errors))
 
+    # 不登记触发者的 QQ 号：会话目标会落盘、会被后来的人复用，发起人身份只能来自任务本身。
     platform_updates = {
         "bot": bot,
         "event": event,
         "type": "group",
         "group_id": group_id,
-        # 群会话也登记触发者：qq_forward 的“私发给我”与权限判定都要靠它反查发起人。
-        # 消费端一律先判 type 再读 user_id，因此不会被误认成私聊目标。
-        "user_id": event.user_id,
         "conversation_key": stable_conversation_key,
         "_source_attachments": [dict(att) for att in attachments if isinstance(att, dict)],
     }
@@ -451,15 +455,16 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
             channel="qq_group",
             real_conversation_key=real_conversation_key,
             stable_conversation_key=stable_conversation_key,
-            text=inbound_text,
+            text=built.text,
             attachments=attachments or [],
             is_dm=False,
             platform_updates=platform_updates,
             user_text=user_text,
             entry_node_id=entry_node_id,
-            history_watermark=history_watermark,
+            history_watermark=built.covered_seq,
             direct_interaction=direct_interaction,
             facts=facts,
+            merge_text=built.merge_text,
         ))
     except Exception as exc:
         common.logger.exception("submit inbound failed")
@@ -480,6 +485,8 @@ _intent_matcher = on_message(rule=Rule(permissions._intent_group_rule), priority
 @_intent_matcher.handle()
 async def _handle_intent(bot: Bot, event: GroupMessageEvent) -> None:
     """问一次模型再决定这条群消息要不要接。"""
+    if not inbound._first_delivery(bot, event):
+        return
     text = await permissions._group_trigger_text(bot, event)
     verdict = await inbound._judge_llm_intent(bot, event, text)
     metadata = await state._adapter.features.prepare(bot, event)
@@ -533,7 +540,7 @@ async def _finish_approval_decision(user_id: int, approval_id: str, decision: st
     if info is None:
         await _private_matcher.finish(approval._settled_approval_notice(approval_id))
     try:
-        ok = await state._adapter.client.approve(
+        result = await state._adapter.client.decide_approval(
             approval_id,
             decision=decision,
             comment=f"QQ admin {user_id} {decision}ed via private message.",
@@ -542,9 +549,17 @@ async def _finish_approval_decision(user_id: int, approval_id: str, decision: st
         await book.release(approval_id, info)
         common.logger.exception("submit QQ approval decision failed")
         await _private_matcher.finish(f"提交审批失败：{exc}")
-    if not ok:
-        await book.release(approval_id, info)
-        await _private_matcher.finish("审批提交被 Supervisor 拒绝，请检查日志。")
+    if not result.effective:
+        # supervisor 对已定案的审批照样回 200：状态和这次决定对不上，就是在别处先定了。
+        book.settle(
+            approval_id, decision=approval._book_decision(result.status, result.comment),
+            operation=str(info.get("operation") or ""),
+        )
+        common.logger.info(
+            "approval decision on QQ had no effect: id=%s decision=%s status=%s admin=%s",
+            approval_id, decision, result.status, user_id,
+        )
+        await _private_matcher.finish(approval._decision_not_effective_notice(approval_id, result.status))
     common.logger.info(
         "approval decided on QQ: id=%s decision=%s admin=%s", approval_id, decision, user_id,
     )
@@ -557,6 +572,8 @@ async def _finish_approval_decision(user_id: int, approval_id: str, decision: st
 @_private_matcher.handle()
 async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     """把当前 QQ 私聊请求提交给 ClonothZX。"""
+    if not inbound._first_delivery(bot, event):
+        return
     state._adapter.last_bot = bot
     # on_bot_connect 已经认过一次，这里是兜底：漏认一次就是记忆分叉，代价不对等。
     routing._adopt_bot_scope(bot)
@@ -688,10 +705,11 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
         if attachments:
             attachments.clear()
             await _private_matcher.send(inbound._DRAW_REFERENCE_IMAGE_NOTICE)
-        inbound_text = await inbound._build_draw_direct_inbound_text(event, draw_direct_prompt, True)
+        built = await inbound._build_draw_direct_inbound_text(event, draw_direct_prompt, True)
     else:
-        inbound_text = await inbound._build_private_inbound_text(event, bot, user_text, stable_conversation_key, attachments)
-        inbound_text = inbound._apply_attachment_hints(inbound_text, user_text, attachments, attachment_errors)
+        built = (await inbound._build_private_inbound_text(
+            event, bot, user_text, stable_conversation_key, attachments,
+        )).map(lambda text: inbound._apply_attachment_hints(text, user_text, attachments, attachment_errors))
 
     platform_updates = {
         "bot": bot,
@@ -710,13 +728,14 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
             channel="qq_private",
             real_conversation_key=real_conversation_key,
             stable_conversation_key=stable_conversation_key,
-            text=inbound_text,
+            text=built.text,
             attachments=attachments or [],
             is_dm=True,
             platform_updates=platform_updates,
             user_text=user_text,
             entry_node_id=entry_node_id,
             facts=inbound._inbound_facts(bot, event, text=user_text or None, attachments=attachments),
+            merge_text=built.merge_text,
         ))
         try:
             await bot.call_api("set_input_status", user_id=int(event.user_id), event_type=1)

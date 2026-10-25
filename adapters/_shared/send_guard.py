@@ -6,7 +6,6 @@ and frozen message plans, and how send failures are classified by retry safety.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hashlib
 import json
 import logging
@@ -20,6 +19,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
 from adapters._shared.outbound import SEGMENT_NATIVE_EMOJI, SEGMENT_STICKER
+from clonoth_sdk.lease import lease_heartbeat
 from clonoth_sdk.types import DeliveryContext as OutboundSendContext
 
 logger = logging.getLogger(__name__)
@@ -421,16 +421,13 @@ class TwoPhaseIdempotencyStore:
             raise SendContractError("message plan is missing or incomplete")
         return self._message_plan(row)
 
-    async def _heartbeat_message_plan(self, delivery_id: str, owner: str) -> None:
-        while True:
-            await asyncio.sleep(max(0.05, min(30.0, self.lease_seconds / 3)))
-            async with self._lock:
-                cursor = self._db.execute(
-                    "UPDATE message_plans SET lease_until=? WHERE delivery_id=? AND state='building' AND owner=?",
-                    (self._clock() + self.lease_seconds, delivery_id, owner),
-                )
-                if cursor.rowcount != 1:
-                    return
+    async def _renew_message_plan(self, delivery_id: str, owner: str) -> bool:
+        async with self._lock:
+            cursor = self._db.execute(
+                "UPDATE message_plans SET lease_until=? WHERE delivery_id=? AND state='building' AND owner=?",
+                (self._clock() + self.lease_seconds, delivery_id, owner),
+            )
+            return cursor.rowcount == 1
 
     async def get_or_create_message_plan(
         self, key: str, target: Mapping[str, Any],
@@ -486,33 +483,33 @@ class TwoPhaseIdempotencyStore:
                 raise SendInProgress(key)
             await asyncio.sleep(0.02)
 
-        heartbeat = asyncio.create_task(self._heartbeat_message_plan(delivery_id, owner))
-        try:
-            encoded = _plan_payload(await builder())
-            empty = not json.loads(encoded)["processed_segments"]
-            async with self._lock:
-                now = self._clock()
-                ready_retention = ttl if empty else retention
-                cursor = self._db.execute(
-                    """UPDATE message_plans SET state='ready',owner='',lease_until=0,payload=?,updated=?,
-                    expires=?,cleanup_after=?
-                    WHERE delivery_id=? AND state='building' AND owner=?""",
-                    (encoded, now, now + ready_retention, now + ready_retention, delivery_id, owner),
-                )
-                if cursor.rowcount != 1:
-                    raise IdempotencyOwnershipError(key)
-                return self._read_message_plan_locked(delivery_id)
-        except BaseException:
-            async with self._lock:
-                self._db.execute(
-                    "DELETE FROM message_plans WHERE delivery_id=? AND state='building' AND owner=?",
-                    (delivery_id, owner),
-                )
-            raise
-        finally:
-            heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat
+        async with lease_heartbeat(
+            lambda: self._renew_message_plan(delivery_id, owner),
+            interval=max(0.05, min(30.0, self.lease_seconds / 3)),
+            label=f"message plan {key}",
+        ):
+            try:
+                encoded = _plan_payload(await builder())
+                empty = not json.loads(encoded)["processed_segments"]
+                async with self._lock:
+                    now = self._clock()
+                    ready_retention = ttl if empty else retention
+                    cursor = self._db.execute(
+                        """UPDATE message_plans SET state='ready',owner='',lease_until=0,payload=?,updated=?,
+                        expires=?,cleanup_after=?
+                        WHERE delivery_id=? AND state='building' AND owner=?""",
+                        (encoded, now, now + ready_retention, now + ready_retention, delivery_id, owner),
+                    )
+                    if cursor.rowcount != 1:
+                        raise IdempotencyOwnershipError(key)
+                    return self._read_message_plan_locked(delivery_id)
+            except BaseException:
+                async with self._lock:
+                    self._db.execute(
+                        "DELETE FROM message_plans WHERE delivery_id=? AND state='building' AND owner=?",
+                        (delivery_id, owner),
+                    )
+                raise
 
     async def pending_message_receipts(
         self, *, limit: int = 100, delivery_id: str = "",

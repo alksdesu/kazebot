@@ -29,6 +29,7 @@ if str(_TESTS) not in sys.path:
 
 from _onebot_harness import load_live_config, load_runtime as _load_runtime, set_live_config, write_live_config, patch_imported  # noqa: E402
 from adapters._shared import send_guard  # noqa: E402
+from clonoth_sdk import PlatformAuth, TaskOrigin  # noqa: E402
 from adapters._shared.send_guard import (  # noqa: E402
     AmbiguousAckError,
     IdempotencyOwnershipError,
@@ -1322,12 +1323,21 @@ def test_bridge_independent_identical_text_and_file_requests_are_not_permanently
     patch_imported(monkeypatch, runtime, "get_bot", lambda: bot)
 
     # Delivering to another group and sending workspace files both require an admin
-    # origin, so register the session the bridge resolves the requester from.
+    # origin; the bridge asks the supervisor who started the calling task.
     set_live_config(runtime, admin_users=frozenset({10001}))
     monkeypatch.setitem(
         runtime.state._adapter.session_targets, "sess-authz",
-        {"type": "group", "group_id": 99, "user_id": 10001},
+        {"type": "group", "group_id": 99},
     )
+
+    async def task_origin(task_id: str) -> TaskOrigin:
+        assert task_id == "task-authz"
+        return TaskOrigin(
+            task_id=task_id, origin_task_id=task_id, conversation_key="qq_group:authz", channel="qq_group",
+            platform_auth=PlatformAuth(platform="qq", user_id="10001", is_admin=True),
+        )
+
+    monkeypatch.setattr(runtime.state._adapter, "client", types.SimpleNamespace(get_task_origin=task_origin))
 
     async def resolve(*args: Any, **kwargs: Any):
         return runtime.models.ProactiveTarget("group", 99, "Group99"), ""
@@ -1344,23 +1354,23 @@ def test_bridge_independent_identical_text_and_file_requests_are_not_permanently
 
     async def exercise() -> None:
         first_text = {"action": "remind", "target_type": "group", "target_ref": "x", "text": "same",
-                        "session_id": "sess-authz"}
+                        "session_id": "sess-authz", "task_id": "task-authz"}
         await runtime.forward_bridge._forward_bridge_execute(first_text)
         await runtime.forward_bridge._forward_bridge_execute(first_text)  # same request retry
         second_text = {"action": "remind", "target_type": "group", "target_ref": "x", "text": "same",
-                        "session_id": "sess-authz"}
+                        "session_id": "sess-authz", "task_id": "task-authz"}
         await runtime.forward_bridge._forward_bridge_execute(second_text)
         assert first_text["_request_identity"] != second_text["_request_identity"]
 
         first_file = {
             "action": "file", "target_type": "group", "target_ref": "x",
-            "file_paths": [str(artifact)], "session_id": "sess-authz",
+            "file_paths": [str(artifact)], "session_id": "sess-authz", "task_id": "task-authz",
         }
         await runtime.forward_bridge._forward_bridge_execute(first_file)
         await runtime.forward_bridge._forward_bridge_execute(first_file)  # same request retry
         second_file = {
             "action": "file", "target_type": "group", "target_ref": "x",
-            "file_paths": [str(artifact)], "session_id": "sess-authz",
+            "file_paths": [str(artifact)], "session_id": "sess-authz", "task_id": "task-authz",
         }
         await runtime.forward_bridge._forward_bridge_execute(second_file)
         assert first_file["_request_identity"] != second_file["_request_identity"]

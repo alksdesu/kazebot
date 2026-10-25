@@ -26,7 +26,8 @@ from ..emoji_handler import (
 )
 from stickers.collect import CollectConfig, StickerCollector
 from stickers.combat import CombatConfig
-from stickers.collect import sticker_root, store_path as sticker_store_path
+from stickers.collect import store_path as sticker_store_path
+from stickers.files import sticker_file
 from stickers.rank import rank
 from stickers.roster import RosterRules, offered, prompt_roster, roster_entry
 from stickers.store import Sticker, StickerStore
@@ -131,15 +132,17 @@ def _sticker_conversation_key(target: Dict[str, Any], bot: Bot | None = None) ->
 
 
 def _sticker_file_path(row: Sticker) -> Path | None:
+    """这一行能发出去的那张图。只认待审和在库两个图片目录：库文件、备份、锁文件也在 data/stickers 下。"""
     if not row.usable or not row.rel_path:
         return None
+    path = sticker_file(Path(CLONOTH_WORKSPACE), row.rel_path)
+    if path is None:
+        return None
     try:
-        root = sticker_root(Path(CLONOTH_WORKSPACE)).resolve()
-        path = (Path(CLONOTH_WORKSPACE) / row.rel_path).resolve()
-        if not path.is_relative_to(root) or not path.is_file():
+        if not path.is_file():
             return None
         return path if 0 < path.stat().st_size <= _STICKER_SEND_MAX_BYTES else None
-    except (OSError, RuntimeError, ValueError):
+    except OSError:
         return None
 
 

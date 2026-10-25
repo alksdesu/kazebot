@@ -23,6 +23,7 @@ if str(_TESTS) not in sys.path:
 from _onebot_harness import load_runtime, set_live_config  # noqa: E402
 from adapters._shared import approvals  # noqa: E402
 from adapters.onebot.segments import normalize_message_id  # noqa: E402
+from clonoth_sdk import ApprovalDecision  # noqa: E402
 
 LISTED_QQ = 10001
 ADMIN2_QQ = 10002
@@ -229,6 +230,19 @@ class TestFinishDecision:
             return exc.text
         raise AssertionError("finish was not called")
 
+    @staticmethod
+    def _supervisor(monkeypatch: pytest.MonkeyPatch, runtime: Any, status: str | None = None, *, note: str = "") -> list[tuple[str, str]]:
+        """supervisor 的审批回执带当前状态；status 为 None 时照这次决定生效。"""
+        calls: list[tuple[str, str]] = []
+
+        async def decide_approval(aid: str, *, decision: str, comment: str = "") -> ApprovalDecision:
+            calls.append((aid, decision))
+            effective = "allowed" if decision == "allow" else "denied"
+            return ApprovalDecision(aid, decision, status or effective, comment=note)
+
+        monkeypatch.setattr(runtime.state._adapter, "client", SimpleNamespace(decide_approval=decide_approval))
+        return calls
+
     def test_concurrent_decisions_submit_once(self, wired: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         wired.state._adapter.approvals.pending[AID] = {"operation": "read_file", "created_at": time.time()}
         calls: list[tuple[str, str]] = []
@@ -236,12 +250,12 @@ class TestFinishDecision:
         async def scenario() -> list[Any]:
             gate = asyncio.Event()
 
-            async def approve(aid: str, decision: str, comment: str) -> bool:
+            async def decide_approval(aid: str, *, decision: str, comment: str = "") -> ApprovalDecision:
                 calls.append((aid, decision))
                 await gate.wait()
-                return True
+                return ApprovalDecision(aid, decision, "allowed" if decision == "allow" else "denied")
 
-            monkeypatch.setattr(wired.state._adapter, "client", SimpleNamespace(approve=approve))
+            monkeypatch.setattr(wired.state._adapter, "client", SimpleNamespace(decide_approval=decide_approval))
             t1 = asyncio.create_task(wired.handlers._finish_approval_decision(LISTED_QQ, AID, "allow"))
             t2 = asyncio.create_task(wired.handlers._finish_approval_decision(ADMIN2_QQ, AID, "deny"))
             await asyncio.sleep(0.05)
@@ -258,43 +272,57 @@ class TestFinishDecision:
     def test_submit_exception_rolls_back(self, wired: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         wired.state._adapter.approvals.pending[AID] = {"operation": "read_file", "created_at": time.time()}
 
-        async def approve(aid: str, decision: str, comment: str) -> bool:
+        async def decide_approval(aid: str, *, decision: str, comment: str = "") -> ApprovalDecision:
             raise RuntimeError("boom")
 
-        monkeypatch.setattr(wired.state._adapter, "client", SimpleNamespace(approve=approve))
+        monkeypatch.setattr(wired.state._adapter, "client", SimpleNamespace(decide_approval=decide_approval))
         text = self._decide(wired, LISTED_QQ, AID, "allow")
         assert "提交审批失败" in text
         assert AID in wired.state._adapter.approvals.pending and AID not in wired.state._adapter.approvals.settled
 
-    def test_supervisor_reject_rolls_back(self, wired: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_decision_settled_elsewhere_is_not_echoed_as_success(self, wired: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 控制台先拒了，supervisor 对这次「同意」照样回 200，只是状态还是 denied。
         wired.state._adapter.approvals.pending[AID] = {"operation": "read_file", "created_at": time.time()}
+        self._supervisor(monkeypatch, wired, "denied", note="denied in console")
 
-        async def approve(aid: str, decision: str, comment: str) -> bool:
-            return False
-
-        monkeypatch.setattr(wired.state._adapter, "client", SimpleNamespace(approve=approve))
         text = self._decide(wired, LISTED_QQ, AID, "allow")
-        assert text == "审批提交被 Supervisor 拒绝，请检查日志。"
-        assert AID in wired.state._adapter.approvals.pending and AID not in wired.state._adapter.approvals.settled
+
+        assert text == f"该审批已被处理，当前状态：已拒绝（{AID}）"
+        assert "已同意" not in text
+        assert AID not in wired.state._adapter.approvals.pending
+        assert wired.state._adapter.approvals.settled[AID]["decision"] == approvals.DECISION_DENY
+
+    def test_a_timed_out_approval_is_settled_as_expired(self, wired: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        wired.state._adapter.approvals.pending[AID] = {"operation": "read_file", "created_at": time.time()}
+        self._supervisor(monkeypatch, wired, "denied", note="approval timed out after 300s with no decision; auto-denied")
+
+        text = self._decide(wired, LISTED_QQ, AID, "allow")
+
+        assert text.startswith("该审批已被处理，当前状态：")
+        assert wired.state._adapter.approvals.settled[AID]["decision"] == approvals.DECISION_EXPIRED
+
+    def test_an_approval_the_supervisor_no_longer_knows_is_reported(self, wired: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        wired.state._adapter.approvals.pending[AID] = {"operation": "read_file", "created_at": time.time()}
+        self._supervisor(monkeypatch, wired, "missing")
+
+        text = self._decide(wired, LISTED_QQ, AID, "deny")
+
+        assert text == f"该审批已被处理，当前状态：审批不存在（{AID}）"
+        assert AID not in wired.state._adapter.approvals.pending
 
     def test_success_receipt_carries_operation(self, wired: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         wired.state._adapter.approvals.pending[AID] = {"operation": "read_file", "created_at": time.time()}
+        calls = self._supervisor(monkeypatch, wired)
 
-        async def approve(aid: str, decision: str, comment: str) -> bool:
-            return True
-
-        monkeypatch.setattr(wired.state._adapter, "client", SimpleNamespace(approve=approve))
         text = self._decide(wired, LISTED_QQ, AID, "allow")
+        assert calls == [(AID, "allow")]
         assert f"已同意审批：{AID}" in text and "操作：read_file" in text
         assert AID not in wired.state._adapter.approvals.pending
         assert wired.state._adapter.approvals.settled[AID]["admin_id"] == str(LISTED_QQ)
         assert "已同意" in wired.approval._settled_approval_notice(AID)
 
     def test_second_decision_is_told_already_handled(self, wired: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-        async def approve(aid: str, decision: str, comment: str) -> bool:
-            return True
-
-        monkeypatch.setattr(wired.state._adapter, "client", SimpleNamespace(approve=approve))
+        self._supervisor(monkeypatch, wired)
         wired.state._adapter.approvals.settle(AID, admin_id=LISTED_QQ, decision="allow", operation="read_file")
         text = self._decide(wired, ADMIN2_QQ, AID, "deny")
         assert "已被处理" in text

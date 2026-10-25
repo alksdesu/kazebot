@@ -88,13 +88,22 @@ def _dict_keys(node: ast.Dict) -> set[str]:
     return {k.value for k in node.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)}
 
 
-def test_every_platform_updates_registers_trigger_user() -> None:
-    """会话登记缺 user_id 就反查不到发起人，鉴权会按会话类型出现盲区。"""
+def _literal_type(node: ast.Dict) -> str:
+    for key, value in zip(node.keys, node.values):
+        if isinstance(key, ast.Constant) and key.value == "type" and isinstance(value, ast.Constant):
+            return str(value.value)
+    return ""
+
+
+def test_only_private_registrations_carry_the_trigger_user() -> None:
+    """私聊回复靠 user_id 才发得出去；群里的登记不记触发者：同群后来的人会覆盖它，认人只走任务发起人。"""
     literals = _platform_updates_literals()
 
     assert literals
     for literal in literals:
-        assert "user_id" in _dict_keys(literal)
+        kind = _literal_type(literal)
+        assert kind in {"private", "group"}
+        assert ("user_id" in _dict_keys(literal)) is (kind == "private")
 
 
 class _StubPresetNotFound(ValueError):

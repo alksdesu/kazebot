@@ -10,6 +10,8 @@ from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol, TypeVar
 
+from platforms.ids import same_id
+
 
 class BurstItem(Protocol):
     """能进连发窗口的待提交消息。"""
@@ -20,7 +22,9 @@ class BurstItem(Protocol):
     platform_updates: dict[str, Any]
 
     @property
-    def sender_id(self) -> str: ...
+    def sender_id(self) -> str:
+        """核验过的发送者 ID，匿名或取不到时为空串；空串跟谁都不算同一个人。"""
+        ...
 
     @property
     def message_ref(self) -> str: ...
@@ -129,14 +133,14 @@ class ConversationCoordinator:
         while len(self.messages) > 1024:
             self.messages.popitem(last=False)
         burst = self.bursts.get(actor["scope"])
-        if burst and burst.item.sender_id != str(actor.get("user_id", "")):
+        if burst and not same_id(burst.item.sender_id, actor.get("user_id")):
             burst.deadline = time.monotonic()
             burst.wakeup.set()
         return result
 
     def can_continue(self, actor, reply_ref="") -> bool:
         burst = self.bursts.get(actor["scope"])
-        if not burst or burst.item.sender_id != str(actor.get("user_id", "")):
+        if not burst or not same_id(burst.item.sender_id, actor.get("user_id")):
             return False
         refs = burst.item.platform_updates.get("_route_hints", {}).get("source_message_refs", [])
         return not reply_ref or reply_ref in {str(ref) for ref in refs} | {burst.item.message_ref}

@@ -201,7 +201,12 @@ class TestPreemptCandidates:
         assert _candidates(tasks, triggers) == ["mine"]
 
     def test_private_chats_skip_the_sender_check(self) -> None:
-        assert _candidates([_task("t1")], {}, is_dm=True) == ["t1"]
+        assert _candidates([_task("t1")], {"t1": _trigger(2)}, is_dm=True, user=1) == ["t1"]
+
+    @pytest.mark.parametrize("is_dm", [True, False])
+    def test_a_task_without_its_own_trigger_is_never_taken_over(self, is_dm: bool) -> None:
+        # 拿会话里别的触发顶上，等于把这条消息注进别人的任务。
+        assert _candidates([_task("t1")], {}, is_dm=is_dm) == []
 
     @pytest.mark.parametrize(
         ("previous", "current", "accepted"),

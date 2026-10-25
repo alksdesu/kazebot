@@ -2,13 +2,43 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from types import MappingProxyType
+from typing import Any, Dict, Mapping, Optional
 from nonebot.adapters.onebot.v11 import Bot, Event
 from adapters._shared import approvals
+from clonoth_sdk import APPROVAL_ALLOWED, APPROVAL_DENIED, APPROVAL_EXPIRED, APPROVAL_MISSING, APPROVAL_PENDING
 from ..live_config import live
 from ..segments import normalize_message_id
 
 from . import common, message_text, permissions, sending, state
+
+
+# 没人定案、由系统按拒绝收掉的审批（toolbox 等待超时、任务先结束了）附言里的固定说法；结构化字段里没有这一项。
+_AUTO_DENIED_COMMENT_MARK = "auto-denied"
+
+
+def _book_decision(status: str, comment: str = "") -> str:
+    """supervisor 的审批状态折成审批簿的定案。系统自动拒绝的记成失效：那不是谁批的，是没人批。"""
+    if status == APPROVAL_ALLOWED:
+        return approvals.DECISION_ALLOW
+    if status == APPROVAL_DENIED and _AUTO_DENIED_COMMENT_MARK not in str(comment or "").lower():
+        return approvals.DECISION_DENY
+    return approvals.DECISION_EXPIRED
+
+
+_STATUS_LABELS: Mapping[str, str] = MappingProxyType({
+    APPROVAL_ALLOWED: "已同意",
+    APPROVAL_DENIED: "已拒绝",
+    APPROVAL_EXPIRED: "已失效",
+    APPROVAL_PENDING: "仍待处理",
+    APPROVAL_MISSING: "审批不存在",
+})
+
+
+def _decision_not_effective_notice(approval_id: str, status: str) -> str:
+    """这次决定没有生效时的回执：别处已经定案、已超时，或 supervisor 上查无此审批。"""
+    label = _STATUS_LABELS.get(status) or status or "未知"
+    return f"该审批已被处理，当前状态：{label}（{approval_id}）"
 
 
 # 卡片标题同时是“这条消息确实是审批卡片”的唯一证据，改文案要连反查一起改。
@@ -70,19 +100,7 @@ async def _resolve_approval_target_by_quoted_text(bot: Bot, reply_message_id: An
         reply_obj = None
     if not isinstance(reply_obj, dict):
         return approvals.ApprovalReplyTarget()
-    parts: List[str] = []
-    for key in ("raw_message", "message"):
-        val = reply_obj.get(key)
-        if isinstance(val, str):
-            parts.append(val)
-        elif isinstance(val, list):
-            for seg in val:
-                data = seg.get("data") if isinstance(seg, dict) else None
-                if isinstance(data, dict):
-                    txt = data.get("text")
-                    if isinstance(txt, str):
-                        parts.append(txt)
-    text = "\n".join(parts)
+    text = message_text._message_to_text_generic(message_text._payload_message(reply_obj))
     if _APPROVAL_SUMMARY_HEADER not in text:
         return approvals.ApprovalReplyTarget()
     sender = reply_obj.get("sender")
@@ -96,9 +114,7 @@ async def _resolve_approval_reply_target(bot: Bot, event: Event) -> approvals.Ap
     """引用快捷审批的唯一入口：先 map 反查，再 get_msg 卡片校验，最后按 opt-in 唯一回退。"""
     book = state._adapter.approvals
     book.prune_expired()
-    has_reply, reply_message_id = message_text._scan_reply_reference(
-        event.get_message(), getattr(event, "raw_message", None),
-    )
+    has_reply, reply_message_id = message_text._event_reply_reference(event)
     if not has_reply:
         return approvals.ApprovalReplyTarget()
     user_id = getattr(event, "user_id", None)

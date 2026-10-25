@@ -106,9 +106,9 @@ def _compose_history_line(
 
     匿名消息的显示名/别名由调用方预解析后传入，避免占位号被当成一个真实用户。
     """
-    safe_text = anonymize._anonymize_text_for_ai(message_text._compact_text(text))
-    name = anonymize._anonymize_text_for_ai(name_override or identity._sender_display_name(sender, sender_id))
     alias = alias_override or anonymize._anonymize_user_id(sender_id)
+    safe_text = anonymize._anonymize_text_for_ai(message_text._compact_text(text), user_ids=(sender_id,))
+    name = anonymize._anonymize_text_for_ai(name_override or identity._sender_display_name(sender, sender_id))
     return f"[{message_text._format_hhmm(timestamp)}] {name}({alias}): {safe_text}"
 
 
@@ -208,10 +208,7 @@ def _record_bot_reply(group_id: int, text: str) -> None:
 
 async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) -> tuple[str, List[Dict[str, Any]]]:
     """增强引用消息解析：event.reply → 本地缓存 → NapCat get_msg，并采集引用图片附件。"""
-    reply_message_id = message_text._extract_reply_message_id(
-        event.get_message() if hasattr(event, "get_message") else None,
-        getattr(event, "raw_message", None),
-    )
+    reply_message_id = message_text._event_reply_message_id(event)
     reply = await message_text._resolve_reply_payload(bot, event, reply_message_id)
 
     if not reply:
@@ -219,24 +216,16 @@ async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) ->
             return anonymize._anonymize_text_for_ai(f"（无法获取引用消息内容：message_id={reply_message_id}）"), []
         return "", []
 
-    message = reply.get("message")
-    raw_message = reply.get("raw_message")
+    message = message_text._payload_message(reply)
     text = await message_text._message_to_text_with_forward(bot, message, getattr(bot, "self_id", None))
-    if not text:
-        text = await message_text._message_to_text_with_forward(bot, raw_message, getattr(bot, "self_id", None))
 
     # 判断引用的消息是否为 Bot 自己发出的。QQ Bot 的回复里可能带表情包图片，
     # 用户引用这类回复时不应该把 Bot 自己的图片下载成附件再送去识图——那既浪费
     # 算力，也会让模型误以为用户在要求识别一张图片。这里仅当被引用消息不是 Bot
     # 自身发出时才采集图片附件，否则保留 [图片] 文本占位符。
-    reply_sender = reply.get("sender") if isinstance(reply.get("sender"), dict) else None
-    reply_sender_qq = ""
-    if reply_sender is not None:
-        reply_sender_qq = str(reply_sender.get("user_id") or reply.get("user_id") or "")
-    else:
-        reply_sender_qq = str(reply.get("user_id") or "")
-    bot_ids = inbound._bot_self_id_candidates(event, bot)
-    reply_from_bot = inbound._qq_matches_bot(reply_sender_qq, bot_ids)
+    sender = reply.get("sender")
+    sender_id = identity._field_text(sender, "user_id") or str(reply.get("user_id") or "").strip()
+    reply_from_bot = inbound._qq_matches_bot(sender_id, inbound._bot_self_id_candidates(event, bot))
     file_errors = []
 
     if reply_from_bot:
@@ -268,8 +257,6 @@ async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) ->
             text = text.replace(message_text.IMAGE_PLACEHOLDER, message_text.STICKER_PLACEHOLDER)
     else:
         images, files = await media._collect_message_media(bot, message)
-        if not images and not files:
-            images, files = await media._collect_message_media(bot, raw_message)
         quoted_attachments, quoted_errors = await media._image_sources_to_attachments(images, conversation_key)
         for att in quoted_attachments:
             text = text.replace(message_text.IMAGE_PLACEHOLDER, f"[{media._attachment_label(att)}: {att['path']}]", 1)
@@ -280,9 +267,7 @@ async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) ->
                 # NapCat 重启会重建文件 ID，引用缓存里的旧 ID 必须用原消息刷新。
                 refreshed = await message_text._get_reply_message(bot, reply_message_id)
                 if refreshed:
-                    _, refreshed_files = await media._collect_message_media(bot, refreshed.get("message"))
-                    if not refreshed_files:
-                        _, refreshed_files = await media._collect_message_media(bot, refreshed.get("raw_message"))
+                    _, refreshed_files = await media._collect_message_media(bot, message_text._payload_message(refreshed))
                     if refreshed_files:
                         files = refreshed_files
             file_atts, file_errors = await media._file_sources_to_attachments(
@@ -293,7 +278,9 @@ async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) ->
         for note in dict.fromkeys(quoted_errors):
             text = text.replace(message_text.IMAGE_PLACEHOLDER, f"[{note}]", 1)
 
-    text = anonymize._anonymize_text_for_ai(message_text._compact_text(text))
+    # 先登记被引用的人再替换：他第一次出现时还不在别名表里，名字和正文里的号都会原样漏过去。
+    user = anonymize._anonymize_user_id(sender_id) if sender_id else "UserUnknown"
+    text = anonymize._anonymize_text_for_ai(message_text._compact_text(text), user_ids=(sender_id,))
     if file_errors:
         notes = anonymize._anonymize_text_for_ai(" ".join(dict.fromkeys(file_errors)))
         text = " ".join([text, notes]).strip()
@@ -302,17 +289,5 @@ async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) ->
             return anonymize._anonymize_text_for_ai(f"（引用消息为空或暂不支持的消息类型：message_id={reply_message_id}）"), quoted_attachments
         return "", quoted_attachments
 
-    sender = reply.get("sender")
-    sender_id = ""
-    if isinstance(sender, dict):
-        sender_id = str(sender.get("user_id") or reply.get("user_id") or "")
-        name_raw = identity._sanitize_name(str(sender.get("card") or sender.get("nickname") or sender_id or "原作者"))
-    elif sender is not None:
-        sender_id = str(getattr(sender, "user_id", "") or "")
-        name_raw = identity._sender_display_name(sender, sender_id)
-    else:
-        sender_id = str(reply.get("user_id") or "")
-        name_raw = identity._sanitize_name(sender_id or "原作者")
-    name = anonymize._anonymize_text_for_ai(name_raw)
-    user = anonymize._anonymize_user_id(sender_id) if sender_id else "UserUnknown"
+    name = anonymize._anonymize_text_for_ai(identity._sender_display_name(sender, sender_id))
     return f"[{message_text._format_hhmm(reply.get('time'))}] {name}({user}): {text}", quoted_attachments

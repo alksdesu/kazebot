@@ -40,7 +40,7 @@ def _event(runtime, user_id: int = 10001, group_id: int = _GROUP_ID) -> SimpleNa
 
 
 def _build(runtime, user_id: int = 10001, group_id: int = _GROUP_ID, *, exclude_seq: int = 0) -> tuple[str, int]:
-    return asyncio.run(runtime.inbound._build_inbound_text(
+    built = asyncio.run(runtime.inbound._build_inbound_text(
         _event(runtime, user_id, group_id),
         SimpleNamespace(self_id="90000"),
         "在吗",
@@ -48,6 +48,7 @@ def _build(runtime, user_id: int = 10001, group_id: int = _GROUP_ID, *, exclude_
         [],
         exclude_seq=exclude_seq,
     ))
+    return built.text, built.covered_seq
 
 
 def _record(runtime, text: str = "在吗", group_id: int = _GROUP_ID) -> int:
@@ -454,8 +455,8 @@ class TestWatermarkAdvance:
 
 
 class TestQueueMerge:
-    def test_merging_keeps_the_higher_watermark(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
-        # 合并后的文本含两条各自的历史块，取低的那个会让高的那批行第二次被带出去。
+    def test_merging_keeps_the_earlier_watermark(self, runtime, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 合并只接上后一条自己的引用和指令，它带出的新历史行没拼进来：水位推过去，那批行就再也到不了模型。
         set_live_config(runtime, enable_queue=True)
 
         def _item(watermark: int):
@@ -470,7 +471,7 @@ class TestQueueMerge:
         asyncio.run(runtime.queueing._enqueue_or_submit_inbound(first))
         asyncio.run(runtime.queueing._enqueue_or_submit_inbound(_item(9)))
 
-        assert first.history_watermark == 9
+        assert first.history_watermark == 4
 
 
 class TestEarlyWatermarkAcceptance:

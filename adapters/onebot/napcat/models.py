@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, List
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Dict, List
 from nonebot.adapters.onebot.v11 import Bot, Event, Message, MessageSegment
 from platforms.inbound import InboundFacts
+
+from . import identity
 
 
 @dataclass
@@ -80,14 +82,41 @@ class QueuedInbound:
     direct_interaction: bool = True
     memory_user_ids: tuple[str, ...] = ()
     facts: InboundFacts | None = None
+    # 合并进同一会话前一条排队项时追加的那段（引用块和指令行）；空 = 整段 text，比如不带这个字段的连发暂存行。
+    merge_text: str = ""
 
     @property
     def sender_id(self) -> str:
-        return str(getattr(self.event, "user_id", ""))
+        """核验过的发送者号，匿名消息为空串；连发合并按它判断是不是同一个人。"""
+        if self.facts is not None:
+            return self.facts.sender.platform_id
+        return identity._verified_sender_id(self.event)
+
+    @property
+    def merge_segment(self) -> str:
+        return self.merge_text or self.text
 
     @property
     def message_ref(self) -> str:
         return str(getattr(self.event, "message_id", ""))
+
+
+@dataclass(frozen=True)
+class InboundText:
+    """一条入站要提交给引擎的正文。
+
+    merge_text 是排队或连发合并时接到前一条后面的那段：这条自己的引用块和指令行。
+    群历史和身份块前一条已经带过，整段再拼一遍只会重复。
+    """
+
+    text: str
+    merge_text: str
+    # 群聊带出的最大历史序号，提交成功后据此推进水位；-1 = 没带历史。
+    covered_seq: int = -1
+
+    def map(self, transform: Callable[[str], str]) -> "InboundText":
+        """同一处理同时作用于整段和合并段，两份不会各改各的。"""
+        return replace(self, text=transform(self.text), merge_text=transform(self.merge_text))
 
 
 @dataclass

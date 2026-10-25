@@ -121,8 +121,11 @@ def select_recent_attachment_entries(
 
     Never falls back across senders and never combines separate QQ messages. This
     prevents a follow-up such as “再仔细看看图” from silently receiving an older,
-    unrelated image.
+    unrelated image. An empty sender key matches nobody: senders without a usable
+    identity would otherwise share one bucket.
     """
+    if not str(sender_id or ""):
+        return []
     eligible = [
         item
         for item in entries

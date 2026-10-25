@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping
 import yaml
 
 import config_layout
+from clonoth_runtime import parse_bool
+from platforms.live import stamp_fingerprint
 
 from . import capability
 from .env import split_list
@@ -68,23 +70,20 @@ class Coercer:
         return self.convert(raw, default)
 
 
-_TRUTHY = frozenset({"1", "true", "yes", "y", "on"})
-_FALSY = frozenset({"0", "false", "no", "off", ""})
-
-
 def coerce_bool(raw: Any, default: Any) -> bool:
     if isinstance(raw, bool):
         return raw
     if isinstance(raw, (int, float)):
         return bool(raw)
-    token = str(raw if raw is not None else "").strip().lower()
-    if token in _FALSY:
+    # 空串在这里是「关」（见 empty_env_is_value），通用解析把它当没写。
+    if not str(raw if raw is not None else "").strip():
         return False
-    if token in _TRUTHY:
-        return True
-    # 既不是真值也不是假值的字面量（"maybe"、"是"）不该悄悄变成 True。
-    logger.warning("live config: unrecognized boolean %r, using %r", raw, default)
-    return bool(default)
+    parsed = parse_bool(raw)
+    if parsed is None:
+        # 既不是真值也不是假值的字面量（"maybe"、"是"）不该悄悄变成 True。
+        logger.warning("live config: unrecognized boolean %r, using %r", raw, default)
+        return bool(default)
+    return parsed
 
 
 BOOL = Coercer(coerce_bool, empty_env_is_value=True)
@@ -620,17 +619,9 @@ class LiveConfig:
             values_stamp = self._cache.values_stamp
         return {
             "config_path": str(path),
-            "file": {
-                "exists": stamp != _MISSING_STAMP,
-                "mtime_ns": stamp[0],
-                "size": stamp[1],
-            },
+            "file": stamp_fingerprint(None if stamp == _MISSING_STAMP else stamp),
             # values 实际来自哪个文件版本。和 file 不一致就说明这份文件没被采纳。
-            "loaded": {
-                "exists": values_stamp != _MISSING_STAMP,
-                "mtime_ns": values_stamp[0],
-                "size": values_stamp[1],
-            },
+            "loaded": stamp_fingerprint(None if values_stamp == _MISSING_STAMP else values_stamp),
             "parse_error": error,
         }
 

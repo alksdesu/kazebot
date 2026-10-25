@@ -146,13 +146,24 @@ def _message_to_text_generic(
         return str(message).strip()
 
 
+# OneBot v11 的 CQ 码转义；&amp; 必须最后还原，否则 &amp;#91; 会被多解一层。
+_CQ_UNESCAPES = (("&#44;", ","), ("&#91;", "["), ("&#93;", "]"), ("&amp;", "&"))
+
+
+def _cq_unescape(text: str) -> str:
+    for escaped, plain in _CQ_UNESCAPES:
+        text = text.replace(escaped, plain)
+    return text
+
+
 def _parse_cq_params(raw: str) -> Dict[str, str]:
+    """参数按逗号切开后再逐个反转义：值里真正的逗号是 &#44;。"""
     out: Dict[str, str] = {}
     for item in (raw or "").split(","):
         if "=" not in item:
             continue
         key, value = item.split("=", 1)
-        out[key] = value
+        out[key] = _cq_unescape(value)
     return out
 
 
@@ -260,22 +271,21 @@ async def _forward_source_messages(bot: Bot, source: models.ForwardSource) -> Li
 FORWARD_SENDER_PLACEHOLDER = "转发用户"
 
 
-def _format_forward_sender(sender: Any) -> str:
-    """返回合并转发子消息发送者的显示名。
+# 转发卡片里的发送者和内容都由转发的人拼装，模型得知道这一层不是本人说的。
+FORWARD_UNVERIFIED_NOTE = "转发内容，身份未核验"
 
-    2026-07-09 修改原因：合并转发卡片里的发送者往往是与 Bot 无直接交互的路人
-    （一张卡片可能带几十个陆陌号）。不应把这些无关 QQ 号写入匿名映射表（更不应持久化）。
-    因此这里不再调 _anonymize_user_id（既不登记内存匿名表、也不落盘），直接用
-    profile 显示名 / 群名片 / 昵称；都没有时回退到固定占位，绝不暴露裸 QQ 号。
+
+def _format_forward_sender(sender: Any) -> str:
+    """合并转发子消息发送者的显示名，只用节点自带的名片/昵称。
+
+    节点里的 user_id 谁都能填，拿它查运营者配的显示名等于让人冒充管理员说话；
+    卡片里多是和 bot 无关的路人，也不进别名表。
     """
     if isinstance(sender, dict):
-        user_id = str(sender.get("user_id") or "").strip()
         raw_name = str(sender.get("card") or sender.get("nickname") or "").strip()
     else:
-        user_id = str(getattr(sender, "user_id", "") or "").strip()
         raw_name = str(getattr(sender, "card", "") or getattr(sender, "nickname", "") or "").strip()
-    display = identity._qq_profile_display_name(user_id) or raw_name
-    return identity._sanitize_name(display) if display else FORWARD_SENDER_PLACEHOLDER
+    return identity._sanitize_name(raw_name) if raw_name else FORWARD_SENDER_PLACEHOLDER
 
 
 def _truncate_forward_text(text: str) -> str:
@@ -315,7 +325,7 @@ async def _format_forward_msg(
         visited.discard(forward_id)
         return f"[{label}, 读取失败]"
 
-    lines: List[str] = [f"【{label}】"]
+    lines: List[str] = [f"【{label}（{FORWARD_UNVERIFIED_NOTE}）】"]
     for index, item in enumerate(messages, start=1):
         if remaining[0] <= 0:
             lines.append("…（合并转发条数过多，已截断）")
@@ -412,58 +422,70 @@ async def _event_text_with_forward(bot: Bot, event: Event) -> str:
 def _format_cq_message(
     text: str, bot_self_id: Any = None, forward_blocks: List[str] | None = None,
 ) -> str:
+    """CQ 串转模型可读文本。只反转义码外的原文：渲染结果和展开的转发内容本来就是明文。"""
     bot_ids = _bot_id_set(bot_self_id)
     pending = list(forward_blocks or [])
-
-    def repl(match: re.Match[str]) -> str:
+    parts: List[str] = []
+    cursor = 0
+    for match in common._CQ_RE.finditer(text):
+        parts.append(_cq_unescape(text[cursor:match.start()]))
+        cursor = match.end()
         seg_type = match.group(1)
         if seg_type == "forward" and pending:
-            return "\n" + pending.pop(0) + "\n"
+            parts.append("\n" + pending.pop(0) + "\n")
+            continue
         rendered = _segment_to_text(seg_type, _parse_cq_params(match.group(2) or ""), bot_ids)
-        return "" if rendered is None else rendered
+        if rendered is not None:
+            parts.append(rendered)
+    parts.append(_cq_unescape(text[cursor:]))
+    return "".join(parts)
 
-    return common._CQ_RE.sub(repl, text)
+
+def _reply_id_of(data: Mapping[str, Any]) -> Any | None:
+    for key in ("id", "message_id", "messageId", "messageid", "message_seq", "seq"):
+        value = data.get(key)
+        if value is not None and str(value).strip():
+            return value
+    return None
 
 
-def _scan_reply_reference(message: Any, raw_message: Any = None) -> tuple[bool, Any | None]:
-    """扫描 reply 段：返回（有没有 reply 段, 被引用消息 id）。id 可能为 None（段在但无可用 id）。"""
-    def pick_id(data: Dict[str, Any]) -> Any | None:
-        for key in ("id", "message_id", "messageId", "messageid", "message_seq", "seq"):
-            value = data.get(key)
-            if value is not None and str(value).strip():
-                return value
-        return None
+def _scan_reply_reference(message: Any, raw_message: Any = None, reply: Any = None) -> tuple[bool, Any | None]:
+    """找引用：返回（有没有引用, 被引用消息 id）。id 可能为 None（段在但无可用 id）。
 
+    先看结构化消息里的 reply 段，再看 NoneBot 已经解析好的 reply（_check_reply 成功后会把段删掉），
+    CQ 原文只在根本没有结构化消息时才扫：它和结构化消息说的是同一条，多扫一遍只会多一个伪造入口。
+    """
     has_reply = False
-    try:
-        segments = list(message) if message is not None and not isinstance(message, str) else []
-    except Exception:
-        segments = []
-    for seg in segments:
-        seg_type, data = _segment_type_and_data(seg)
+    for seg_type, data in _iter_segments(message):
         if seg_type != "reply":
             continue
         has_reply = True
-        rid = pick_id(data)
+        rid = _reply_id_of(data)
         if rid is not None:
             return True, rid
-
-    for candidate in (message, raw_message):
-        if not isinstance(candidate, str):
-            continue
-        for match in common._CQ_RE.finditer(candidate):
-            if match.group(1) != "reply":
+    if reply is not None:
+        rid = _reply_id_of(reply if isinstance(reply, Mapping) else {"message_id": getattr(reply, "message_id", None)})
+        if rid is not None:
+            return True, rid
+    if message is None and isinstance(raw_message, str):
+        for seg_type, data in _iter_segments(raw_message):
+            if seg_type != "reply":
                 continue
             has_reply = True
-            rid = _parse_cq_params(match.group(2) or "").get("id")
+            rid = data.get("id")
             if rid is not None and str(rid).strip():
                 return True, rid
     return has_reply, None
 
 
-def _extract_reply_message_id(message: Any, raw_message: Any = None) -> Any | None:
-    """从 reply segment / CQ reply 中提取被引用消息 ID。"""
-    return _scan_reply_reference(message, raw_message)[1]
+def _event_reply_reference(event: Any) -> tuple[bool, Any | None]:
+    """入站事件的引用，结构化消息、已解析的 reply、CQ 原文按这个顺序认。"""
+    message = event.get_message() if hasattr(event, "get_message") else None
+    return _scan_reply_reference(message, getattr(event, "raw_message", None), getattr(event, "reply", None))
+
+
+def _event_reply_message_id(event: Any) -> Any | None:
+    return _event_reply_reference(event)[1]
 
 
 def _remember_message_for_reply_context(event: Event) -> None:
@@ -512,6 +534,12 @@ def _reply_payload_from_source(source: Any) -> Dict[str, Any]:
     if isinstance(source, dict):
         return {key: source.get(key) for key in _REPLY_PAYLOAD_FIELDS}
     return {key: getattr(source, key, None) for key in _REPLY_PAYLOAD_FIELDS}
+
+
+def _payload_message(payload: Mapping[str, Any]) -> Any:
+    """引用或 get_msg 取回的消息体：有结构化 message 就只用它，CQ 原文只在它缺席时顶上。"""
+    message = payload.get("message")
+    return message if message is not None else payload.get("raw_message")
 
 
 def _reply_payload_has_content(payload: Dict[str, Any]) -> bool:

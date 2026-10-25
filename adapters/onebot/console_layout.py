@@ -127,8 +127,9 @@ SECTIONS = (
                 field("strip_underscore_styles"),
                 fixed(
                     "长度上限",
-                    paragraph("超长的回复会被截断，避免被 QQ 拒收。"),
+                    paragraph("超长的回复会被截断，避免被 QQ 拒收。分条超过上限时多出来的并进最后一条，0 表示不限。"),
                     field("message_limit"),
+                    field("max_reply_parts"),
                     HISTORY_TEXT_LIMIT,
                 ),
                 field(

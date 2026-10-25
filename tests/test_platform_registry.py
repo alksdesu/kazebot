@@ -668,8 +668,11 @@ class TestAWrongPlatformStopsTheProcess:
 
         import dotenv
 
-        # 真加载的话测试机上的 .env 会灌进 os.environ，后面所有用例都跟着变。
+        import clonoth_runtime
+
+        # 真加载的话测试机上的 .env 会灌进 os.environ、工作区变量也会被钉住，后面所有用例都跟着变。
         monkeypatch.setattr(dotenv, "load_dotenv", lambda *_a, **_k: False)
+        monkeypatch.setattr(clonoth_runtime, "load_workspace_env", lambda *_a, **_k: None)
         spec = importlib.util.spec_from_file_location("clonoth_bot_entry_probe", _ROOT / "bot.py")
         module = importlib.util.module_from_spec(spec)
         try:

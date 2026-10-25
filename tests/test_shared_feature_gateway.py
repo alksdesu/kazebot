@@ -129,7 +129,7 @@ def _item(facts: InboundFacts) -> SimpleNamespace:
         bot=_BOT, event=SimpleNamespace(facts=facts), facts=facts,
         stable_conversation_key=facts.conversation.conversation_key,
         real_conversation_key=facts.conversation.real_conversation_key,
-        text=facts.text, user_text=facts.text, attachments=[], is_dm=False, channel="chat_room",
+        text=facts.text, merge_text=facts.text, user_text=facts.text, attachments=[], is_dm=False, channel="chat_room",
         entry_node_id="", history_watermark=-1, direct_interaction=True, memory_user_ids=(),
         platform_updates={"_route_hints": {"source_message_refs": ["m1"]}},
         sender_id="alice", message_ref="m1",

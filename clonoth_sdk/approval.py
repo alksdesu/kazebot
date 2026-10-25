@@ -42,6 +42,10 @@ class ApprovalTracker:
             self._handled.clear()
         self._handled.add(approval_id)
 
+    def forget(self, approval_id: str) -> None:
+        """撤销已处理标记：界面没亮出来的审批要留给下次对账重试。"""
+        self._handled.discard(approval_id)
+
     def clear(self) -> None:
         """手动清空去重集合。"""
         self._handled.clear()

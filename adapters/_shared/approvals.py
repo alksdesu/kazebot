@@ -17,11 +17,12 @@ DECISION_ALLOW = "allow"
 DECISION_DENY = "deny"
 DECISION_EXPIRED = "expired"
 
+# 只收专门表达审批决定的词：ok / yes / no 这类随口应答会让管理员一句闲聊被当成批复。
 ALLOW_VERBS = frozenset({
-    "同意", "批准", "通过", "允许", "allow", "approve", "approved", "ok", "yes", "y",
+    "同意", "批准", "通过", "允许", "allow", "approve", "approved",
 })
 DENY_VERBS = frozenset({
-    "拒绝", "驳回", "不同意", "不批准", "deny", "reject", "rejected", "no", "n",
+    "拒绝", "驳回", "不同意", "不批准", "deny", "reject", "rejected",
 })
 COMMAND_PREFIXES = ("审批", "approval")
 _VERB_STRIP = " 　。，、！!.~"
@@ -212,6 +213,13 @@ class ApprovalBook:
         )
         return info
 
+    def close_if_pending(self, approval_id: str, *, decision: str) -> bool:
+        """在别处定案或作废的审批：还挂着才收起。本地已定案的保留原记录，那里记着是哪位管理员批的。"""
+        if approval_id not in self.pending:
+            return False
+        self.close(approval_id, decision=decision)
+        return True
+
     def prune_expired(self) -> None:
         """超过 TTL 的待审批转成已失效。engine 那边到点已经自动拒绝，这里同步收尾。"""
         if not self.pending:
@@ -231,7 +239,7 @@ class ApprovalBook:
             info = self.pending.pop(approval_id, None)
             if info is None:
                 return None
-            # 领取后进程崩溃，这条就停在已决、再也批不了；engine 到点自动拒绝，属于 fail-closed。
+            # 领取后进程崩溃也不会卡死：重启对账时 supervisor 上仍待审的会重新挂回来。
             self.settle(
                 approval_id, decision=decision, admin_id=admin_id,
                 operation=str(info.get("operation") or ""),

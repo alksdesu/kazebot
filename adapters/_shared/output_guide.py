@@ -44,9 +44,12 @@ class OutputGuide:
         return {"version": GUIDE_VERSION, "sections": [section.payload() for section in self.sections]}
 
 
-def split_section(platform: PlatformDescriptor) -> Optional[GuideSection]:
-    """分条说明。平台一次只能发一条时不给：[SPLIT] 会被并回一条，教了也白教。"""
-    most = platform.capabilities.max_split_parts
+def split_section(platform: PlatformDescriptor, *, max_parts: int = 0) -> Optional[GuideSection]:
+    """分条说明。max_parts 是运营者另配的条数上限，和平台声明取最严的那个，必须和发送端用同一个数。
+
+    一次只能发一条时不给：[SPLIT] 会被并回一条，教了也白教。
+    """
+    most = outbound.strictest_limit(platform.capabilities.max_split_parts, max_parts)
     if most == 1:
         return None
     marker = outbound.SPLIT_MARKER

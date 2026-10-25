@@ -161,7 +161,9 @@ def test_draw_command_does_not_absorb_recent_history_images(runtime: Any, monkey
     ):
         patch_body(monkeypatch, runtime, name, _noop_async)
     monkeypatch.setattr(runtime.history, "_record_group_message", lambda *a, **k: 1)
-    monkeypatch.setattr(runtime.inbound, "_build_draw_direct_inbound_text", _resolved("draw text"))
+    monkeypatch.setattr(
+        runtime.inbound, "_build_draw_direct_inbound_text", _resolved(runtime.models.InboundText("draw text", "draw text")),
+    )
 
     # 历史图有货：只有当 draw 判定漏掉、去调 merge 时才会被查询并并进来。
     recent_calls: list[Any] = []

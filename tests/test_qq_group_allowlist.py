@@ -148,11 +148,14 @@ def test_forward_bridge_current_group_denied_when_allowlist_empty(
     runtime = _runtime(monkeypatch, tmp_path, frozenset())
     monkeypatch.setitem(
         runtime.state._adapter.session_targets, _SESSION,
-        {'type': 'group', 'group_id': _NOT_IN_LIST, 'user_id': _ADMIN},
+        {'type': 'group', 'group_id': _NOT_IN_LIST},
     )
+    requester = runtime.permissions.capability.Requester(user_id=_ADMIN, listed_admin=True)
 
     target, err = asyncio.run(
-        runtime.forward_bridge._forward_bridge_resolve_target(_Bot(), _SESSION, 'current', '')
+        runtime.forward_bridge._forward_bridge_resolve_target(
+            _Bot(), _SESSION, 'current', '', requester=requester,
+        )
     )
 
     assert target is None

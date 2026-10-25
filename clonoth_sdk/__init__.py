@@ -32,7 +32,23 @@ SDK 边界（参见 data/sdk_refactor_plan_final.md 一、核心原则）：
 
 from .client import ClonothClient
 from .config import BotConfig
-from .types import DeliveryContext, Event, HealthInfo, InboundResult, IntentVerdict, OpenAIConfig, RunningTask
+from .types import (
+    APPROVAL_ALLOWED,
+    APPROVAL_DENIED,
+    APPROVAL_EXPIRED,
+    APPROVAL_MISSING,
+    APPROVAL_PENDING,
+    ApprovalDecision,
+    DeliveryContext,
+    Event,
+    HealthInfo,
+    InboundResult,
+    IntentVerdict,
+    OpenAIConfig,
+    PlatformAuth,
+    RunningTask,
+    TaskOrigin,
+)
 from .approval import ApprovalTracker, auto_approve, is_external_operation
 # Phase 2 (2026-04-17): 新增 SessionState + 状态数据类
 from .state import (
@@ -54,13 +70,21 @@ __all__ = [
     # 配置
     "BotConfig",
     # 数据类型
+    "ApprovalDecision",
     "DeliveryContext",
     "Event",
     "HealthInfo",
     "InboundResult",
     "IntentVerdict",
     "OpenAIConfig",
+    "PlatformAuth",
     "RunningTask",
+    "TaskOrigin",
+    "APPROVAL_ALLOWED",
+    "APPROVAL_DENIED",
+    "APPROVAL_EXPIRED",
+    "APPROVAL_MISSING",
+    "APPROVAL_PENDING",
     # 状态管理 (Phase 2)
     "SessionState",
     "TriggerInfo",

@@ -22,11 +22,33 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 from typing import Any, AsyncGenerator
+from urllib.parse import quote
 
 import httpx
 
-from .types import Event, HealthInfo, InboundResult, IntentVerdict, OpenAIConfig, RunningTask
+from .types import (
+    APPROVAL_MISSING,
+    ApprovalDecision,
+    Event,
+    HealthInfo,
+    InboundResult,
+    IntentVerdict,
+    OpenAIConfig,
+    RunningTask,
+    TaskOrigin,
+)
+
+# 任务、会话和审批 ID 要拼进带管理员令牌的请求路径：只放行 uuid 这一类字符，杜绝用 ../ 走到别的端点。
+_PATH_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+
+
+def _path_id(value: str) -> str:
+    text = str(value or "").strip()
+    if not _PATH_ID_RE.fullmatch(text):
+        raise ValueError(f"unsafe id for a supervisor path: {text[:40]!r}")
+    return quote(text, safe="")
 
 
 class ClonothClient:
@@ -350,6 +372,36 @@ class ClonothClient:
     #  Approval — 审批决策
     # ================================================================
 
+    async def decide_approval(
+        self,
+        approval_id: str,
+        *,
+        decision: str,
+        comment: str | None = None,
+    ) -> ApprovalDecision:
+        """提交审批决策并带回 supervisor 的回执，对应 POST /v1/approvals/{approval_id}。
+
+        已经定案的审批照样返回 200，所以要看回执里的 status 才知道这次决定有没有生效
+        （ApprovalDecision.effective）。审批不存在时 status 为 APPROVAL_MISSING；其余 HTTP 错误抛出。
+        """
+        body: dict[str, Any] = {"decision": decision}
+        if comment is not None:
+            body["comment"] = comment
+        resp = await self._http().post(
+            f"{self._base_url}/v1/approvals/{_path_id(approval_id)}", json=body,
+        )
+        if resp.status_code == 404:
+            return ApprovalDecision(approval_id=approval_id, decision=decision, status=APPROVAL_MISSING)
+        resp.raise_for_status()
+        data = resp.json()
+        data = data if isinstance(data, dict) else {}
+        return ApprovalDecision(
+            approval_id=approval_id,
+            decision=decision,
+            status=str(data.get("status") or ""),
+            comment=str(data.get("comment") or ""),
+        )
+
     async def approve(
         self,
         approval_id: str,
@@ -357,26 +409,43 @@ class ClonothClient:
         decision: str,
         comment: str | None = None,
     ) -> bool:
-        """提交审批决策。
+        """提交审批决策，返回这次决定是否生效。
 
-        对应 POST /v1/approvals/{approval_id}。
-        提取自 bot_adapter.py _auto_approve() 和 ApprovalView 按钮回调。
-
-        Args:
-            approval_id: 审批请求 ID
-            decision: "allow" 或 "deny"
-            comment: 附加说明（可选）
-
-        Returns:
-            True 表示提交成功（HTTP 状态码 < 400）
+        HTTP 错误返回 False，网络错误照常抛出。要区分「已被别人处理」请用 decide_approval。
         """
-        body: dict[str, Any] = {"decision": decision}
-        if comment is not None:
-            body["comment"] = comment
-        resp = await self._http().post(
-            f"{self._base_url}/v1/approvals/{approval_id}", json=body,
-        )
-        return resp.status_code < 400
+        try:
+            result = await self.decide_approval(approval_id, decision=decision, comment=comment)
+        except httpx.HTTPStatusError:
+            return False
+        return result.effective
+
+    async def get_approval(self, approval_id: str) -> dict[str, Any] | None:
+        """查一条审批的当前状态，对应 GET /v1/approvals/{approval_id}；不存在返回 None。"""
+        resp = await self._http().get(f"{self._base_url}/v1/approvals/{_path_id(approval_id)}")
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+
+    async def list_pending_approvals(self) -> list[dict[str, Any]]:
+        """supervisor 上全部待审批，对应 GET /v1/admin/state 的 pending_approvals。"""
+        resp = await self._http().get(f"{self._base_url}/v1/admin/state")
+        resp.raise_for_status()
+        data = resp.json()
+        pending = data.get("pending_approvals") if isinstance(data, dict) else None
+        return [item for item in pending or [] if isinstance(item, dict)]
+
+    async def get_task_origin(self, task_id: str) -> TaskOrigin | None:
+        """任务的发起会话与入站时核验过的发起人，对应 GET /v1/tasks/{task_id}/origin。
+
+        子任务已由 supervisor 回溯到发起会话。任务不存在返回 None，其余失败抛出。
+        """
+        resp = await self._http().get(f"{self._base_url}/v1/tasks/{_path_id(task_id)}/origin")
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return TaskOrigin.from_dict(resp.json())
 
     # ================================================================
     #  Cancel — 取消任务
@@ -386,13 +455,12 @@ class ClonothClient:
         """取消单个任务及其子任务链。
 
         对应 POST /v1/tasks/{task_id}/cancel。
-        提取自 bot_adapter.py CancelView.cancel_task 精准取消逻辑。
 
         Returns:
             True 表示取消成功，False 表示任务已不存在或已完成
         """
         resp = await self._http().post(
-            f"{self._base_url}/v1/tasks/{task_id}/cancel",
+            f"{self._base_url}/v1/tasks/{_path_id(task_id)}/cancel",
         )
         return resp.status_code < 400
 
@@ -400,13 +468,12 @@ class ClonothClient:
         """取消指定 session 中所有活跃任务。
 
         对应 POST /v1/sessions/{session_id}/cancel_active_tasks。
-        提取自 bot_adapter.py CancelView fallback 逻辑（task_id 未回填时）。
 
         Returns:
             True 表示请求成功
         """
         resp = await self._http().post(
-            f"{self._base_url}/v1/sessions/{session_id}/cancel_active_tasks",
+            f"{self._base_url}/v1/sessions/{_path_id(session_id)}/cancel_active_tasks",
         )
         return resp.status_code < 400
 
@@ -426,7 +493,6 @@ class ClonothClient:
         """向正在运行的任务注入 preempt 请求。
 
         对应 POST /v1/tasks/{task_id}/preempt。
-        提取自 bot_adapter.py _handle_agent_inner() 中的 Preempt V2 逻辑。
         被打断的任务会在当前原子操作完成后保存上下文快照并退出，
         新消息通过 message 参数注入到任务中继续处理。
 
@@ -447,7 +513,7 @@ class ClonothClient:
         if output_guide is not None:
             body["output_guide"] = output_guide
         resp = await self._http().post(
-            f"{self._base_url}/v1/tasks/{task_id}/preempt", json=body,
+            f"{self._base_url}/v1/tasks/{_path_id(task_id)}/preempt", json=body,
         )
         if resp.status_code == 200:
             return bool(resp.json().get("ok"))
@@ -461,14 +527,13 @@ class ClonothClient:
         """查询指定 session 的活跃任务列表。
 
         对应 GET /v1/sessions/{session_id}/running_tasks。
-        提取自 bot_adapter.py _handle_agent_inner() 中的 preempt 目标查找逻辑。
         Supervisor 端会自动收割 lease 过期的僵尸任务。
 
         Returns:
             RunningTask 列表；session 不存在时返回空列表而非抛异常
         """
         resp = await self._http().get(
-            f"{self._base_url}/v1/sessions/{session_id}/running_tasks",
+            f"{self._base_url}/v1/sessions/{_path_id(session_id)}/running_tasks",
         )
         if resp.status_code != 200:
             return []
@@ -576,7 +641,7 @@ class ClonothClient:
     async def get_session_provider_override(self, session_id: str) -> dict[str, Any]:
         """查询 session 的 provider 覆写配置。"""
         resp = await self._http().get(
-            f"{self._base_url}/v1/sessions/{session_id}/provider_override",
+            f"{self._base_url}/v1/sessions/{_path_id(session_id)}/provider_override",
         )
         resp.raise_for_status()
         return resp.json()
@@ -586,7 +651,7 @@ class ClonothClient:
     ) -> dict[str, Any]:
         """设置 session 的 provider 覆写配置。"""
         resp = await self._http().put(
-            f"{self._base_url}/v1/sessions/{session_id}/provider_override",
+            f"{self._base_url}/v1/sessions/{_path_id(session_id)}/provider_override",
             json=override,
         )
         resp.raise_for_status()
@@ -595,7 +660,7 @@ class ClonothClient:
     async def clear_session_provider_override(self, session_id: str) -> dict[str, Any]:
         """清除 session 的 provider 覆写配置。"""
         resp = await self._http().delete(
-            f"{self._base_url}/v1/sessions/{session_id}/provider_override",
+            f"{self._base_url}/v1/sessions/{_path_id(session_id)}/provider_override",
         )
         resp.raise_for_status()
         return resp.json()

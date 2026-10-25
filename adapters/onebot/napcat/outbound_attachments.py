@@ -13,6 +13,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from nonebot.adapters.onebot.v11 import Bot, MessageSegment
 from ..config import CLONOTH_WORKSPACE, IMAGE_FORWARD_MERGE_NICKNAME
 from ..live_config import live
+from .. import local_source
 from adapters._shared.send_guard import (
     AttachmentBatchError,
     IdempotencyClaim,
@@ -55,11 +56,7 @@ def _resolve_attachment_path(attachment: Any) -> Optional[Path]:
         raw_path = None
     if not raw_path:
         return None
-    raw_text = str(raw_path)
-    if raw_text.startswith("file://"):
-        raw_text = raw_text[7:]
-    path = Path(raw_text)
-    return path if path.is_absolute() else Path(CLONOTH_WORKSPACE) / path
+    return local_source.workspace_path(str(raw_path), CLONOTH_WORKSPACE)
 
 
 def _attachment_filename(attachment: Any) -> str:
@@ -67,8 +64,7 @@ def _attachment_filename(attachment: Any) -> str:
     if isinstance(attachment, dict):
         return str(attachment.get("name") or attachment.get("filename") or "")
     if isinstance(attachment, str):
-        text = attachment[7:] if attachment.startswith("file://") else attachment
-        return Path(text).name
+        return local_source.source_path(attachment).name
     return ""
 
 
@@ -105,7 +101,6 @@ async def _send_attachment_path(
             )
         if not claim.acquired:
             return f"idempotent:{key}"
-        heartbeat = asyncio.create_task(sending._heartbeat_idempotency_claim(claim))
         errors: list[BaseException] = []
         file_path = str(path.resolve())
         encoded = "base64://" + base64.b64encode(raw_bytes).decode("ascii")
@@ -118,27 +113,28 @@ async def _send_attachment_path(
             context, platform_message_id="", attempt=context.attempt,
             idempotency_key=key,
         )
-        try:
-            async def send_image() -> str:
-                for index, message in enumerate(attempts, start=1):
-                    try:
-                        return await sending._send_qq_message_once(
-                            bot, target, message, idempotency_key=key,
-                        )
-                    except Exception as exc:
-                        if getattr(exc, "deferred", False):
-                            raise
-                        classified = classify_send_exception(exc)
-                        if classified.ambiguous_ack:
-                            raise classified from exc
-                        errors.append(classified)
-                failure = AttachmentBatchError(errors)
-                common.logger.warning(
-                    "onebot_send_failed",
-                    extra={**fields, "retryable": failure.retryable, "send_error": str(failure)},
-                )
-                raise failure
 
+        async def send_image() -> str:
+            for message in attempts:
+                try:
+                    return await sending._send_qq_message_once(
+                        bot, target, message, idempotency_key=key,
+                    )
+                except Exception as exc:
+                    if getattr(exc, "deferred", False):
+                        raise
+                    classified = classify_send_exception(exc)
+                    if classified.ambiguous_ack:
+                        raise classified from exc
+                    errors.append(classified)
+            failure = AttachmentBatchError(errors)
+            common.logger.warning(
+                "onebot_send_failed",
+                extra={**fields, "retryable": failure.retryable, "send_error": str(failure)},
+            )
+            raise failure
+
+        async with sending._claim_heartbeat(claim):
             message_id = await protected_claim_send(
                 state._adapter.outbound_idempotency,
                 claim,
@@ -146,18 +142,14 @@ async def _send_attachment_path(
                 sent_ttl=sending._sent_ttl_for_context(context),
                 message_id_getter=lambda result: str(result or ""),
             )
-            common.logger.info(
-                "onebot_send_sent",
-                extra=sending._send_audit_fields(
-                    context, platform_message_id=message_id,
-                    attempt=context.attempt, idempotency_key=key,
-                ),
-            )
-            return message_id
-        finally:
-            heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat
+        common.logger.info(
+            "onebot_send_sent",
+            extra=sending._send_audit_fields(
+                context, platform_message_id=message_id,
+                attempt=context.attempt, idempotency_key=key,
+            ),
+        )
+        return message_id
 
     identity = f"file:sha256:{hashlib.sha256(raw_bytes).hexdigest()}"
     context = context.child(identity)
@@ -173,28 +165,23 @@ async def _send_attachment_path(
         )
     if not claim.acquired:
         return f"idempotent:{key}"
-    heartbeat = asyncio.create_task(sending._heartbeat_idempotency_claim(claim))
-    fields = sending._send_audit_fields(
-        context, platform_message_id="", attempt=context.attempt,
-        idempotency_key=key,
-    )
-    try:
-        file_str = "base64://" + base64.b64encode(raw_bytes).decode("ascii")
+    file_str = "base64://" + base64.b64encode(raw_bytes).decode("ascii")
 
-        async def upload_file() -> Any:
-            await state._adapter.features.check_send(bot, target)
-            if target.get("type") == "group" and target.get("group_id") is not None:
-                return await bot.call_api(
-                    "upload_group_file", group_id=target["group_id"],
-                    file=file_str, name=display_name,
-                )
-            if target.get("type") == "private" and target.get("user_id") is not None:
-                return await bot.call_api(
-                    "upload_private_file", user_id=target["user_id"],
-                    file=file_str, name=display_name,
-                )
-            raise SendContractError(f"attachment target is invalid: {target!r}")
+    async def upload_file() -> Any:
+        await state._adapter.features.check_send(bot, target)
+        if target.get("type") == "group" and target.get("group_id") is not None:
+            return await bot.call_api(
+                "upload_group_file", group_id=target["group_id"],
+                file=file_str, name=display_name,
+            )
+        if target.get("type") == "private" and target.get("user_id") is not None:
+            return await bot.call_api(
+                "upload_private_file", user_id=target["user_id"],
+                file=file_str, name=display_name,
+            )
+        raise SendContractError(f"attachment target is invalid: {target!r}")
 
+    async with sending._claim_heartbeat(claim):
         result = await protected_claim_send(
             state._adapter.outbound_idempotency,
             claim,
@@ -202,19 +189,15 @@ async def _send_attachment_path(
             sent_ttl=sending._sent_ttl_for_context(context),
             message_id_getter=sending._extract_sent_message_id,
         )
-        message_id = sending._extract_sent_message_id(result)
-        common.logger.info(
-            "onebot_file_upload_sent",
-            extra=sending._send_audit_fields(
-                context, platform_message_id=message_id,
-                attempt=context.attempt, idempotency_key=key,
-            ),
-        )
-        return message_id or f"uploaded:{key}"
-    finally:
-        heartbeat.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat
+    message_id = sending._extract_sent_message_id(result)
+    common.logger.info(
+        "onebot_file_upload_sent",
+        extra=sending._send_audit_fields(
+            context, platform_message_id=message_id,
+            attempt=context.attempt, idempotency_key=key,
+        ),
+    )
+    return message_id or f"uploaded:{key}"
 
 
 def _target_forward_kind(target: Dict[str, Any]) -> tuple[str, int] | None:
@@ -294,27 +277,27 @@ async def _try_send_images_as_forward(
             claim = IdempotencyClaim(key, False, resolved)
     if not claim.acquired:
         return True
-    heartbeat = asyncio.create_task(sending._heartbeat_idempotency_claim(claim))
-    try:
-        call_timeout = min(240.0, max(60.0, len(nodes) * 45.0))
+    call_timeout = min(240.0, max(60.0, len(nodes) * 45.0))
 
-        async def send_forward() -> Any:
-            await state._adapter.features.check_send(bot, target)
-            if forward_type == "group":
-                return await bot.call_api(
-                    "send_group_forward_msg", group_id=forward_id, messages=nodes, _timeout=call_timeout,
-                )
+    async def send_forward() -> Any:
+        await state._adapter.features.check_send(bot, target)
+        if forward_type == "group":
             return await bot.call_api(
-                "send_private_forward_msg", user_id=forward_id, messages=nodes, _timeout=call_timeout,
+                "send_group_forward_msg", group_id=forward_id, messages=nodes, _timeout=call_timeout,
             )
-
-        result = await protected_claim_send(
-            state._adapter.outbound_idempotency,
-            claim,
-            send_forward,
-            sent_ttl=sending._sent_ttl_for_context(context),
-            message_id_getter=sending._extract_sent_message_id,
+        return await bot.call_api(
+            "send_private_forward_msg", user_id=forward_id, messages=nodes, _timeout=call_timeout,
         )
+
+    try:
+        async with sending._claim_heartbeat(claim):
+            result = await protected_claim_send(
+                state._adapter.outbound_idempotency,
+                claim,
+                send_forward,
+                sent_ttl=sending._sent_ttl_for_context(context),
+                message_id_getter=sending._extract_sent_message_id,
+            )
         message_id = sending._extract_sent_message_id(result)
         common.logger.info(
             "onebot_forward_sent",
@@ -340,10 +323,6 @@ async def _try_send_images_as_forward(
         if classified.ambiguous_ack:
             raise classified from exc
         return False
-    finally:
-        heartbeat.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat
 
 
 async def _send_attachments(

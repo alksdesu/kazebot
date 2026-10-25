@@ -27,20 +27,30 @@ import asyncio
 import contextlib
 import inspect
 import logging
+from collections import OrderedDict
 from pathlib import Path
 import re
 import time
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable
 
 from .approval import ApprovalTracker, auto_approve, is_external_operation
 from .callbacks import AdapterCallbacks
 from .client import ClonothClient
 from .config import BotConfig
-from .outbound_store import OutboundRecord, OutboundStore
+from .delivery_lanes import DeliveryLanes
+from .lease import lease_heartbeat
+from .outbound_store import OutboundOwnershipError, OutboundRecord, OutboundStore
 from .state import ChildTaskState, MainTaskState, SessionState, TriggerInfo
-from .types import DeliveryContext, Event
+from .types import (
+    APPROVAL_ALLOWED,
+    APPROVAL_DENIED,
+    APPROVAL_EXPIRED,
+    APPROVAL_PENDING,
+    DeliveryContext,
+    Event,
+)
 
 logger = logging.getLogger("clonoth_sdk.event_router")
 
@@ -67,6 +77,18 @@ def strip_protocol_markers(text: str) -> str:
     return _TOOL_TRACE_RE.sub("", text).strip()
 
 
+# 刚收起的审批记一阵：对账拿到的待审批清单可能比 approval_decided 旧，不能把它们再亮出来。
+_CLOSED_APPROVAL_MEMORY = 500
+
+
+@dataclass(frozen=True)
+class _OpenApproval:
+    """本适配器亮过审批界面、还没收起的一条审批。"""
+
+    task_id: str
+    conversation_key: str
+
+
 # ==========================================================================
 #  EventRouter
 # ==========================================================================
@@ -75,8 +97,7 @@ def strip_protocol_markers(text: str) -> str:
 class EventRouter:
     """WebSocket 事件消费主循环 + 协议状态管理 + 适配器分发。
 
-    [2026-06-03] WS-only mode. HTTP poll fallback has been removed.
-    /v1/events is now purely a log/audit endpoint.
+    /v1/events 只用于日志审计，事件只从 WebSocket 来。
 
     通过全局 WebSocket /v1/ws 消费实时事件，处理协议状态（trigger 匹配、
     session 映射、watermark 推进、审批去重），然后通过 AdapterCallbacks
@@ -88,6 +109,8 @@ class EventRouter:
                在 SDK 默认处理之前调用。返回 'handled' 跳过默认处理。
       Layer 2 — AdapterCallbacks：SDK 完成协议处理后的通知回调，
                适配器实现平台操作。
+               可选 ``close_approval_ui(approval_id, *, status, comment)``：亮过的审批
+               在别处定案、超时或随任务结束作废时调用；不实现就跳过。
 
     用法::
 
@@ -140,6 +163,13 @@ class EventRouter:
         self._outbound_owner = f"router:{uuid.uuid4().hex}"
         self._outbound_retry_wakeup = asyncio.Event()
         self._last_outbound_prune = 0.0
+        # 落盘之后的平台投递交给按会话分道的 worker：一次几分钟的多图转发不能堵住 WS 接收。
+        self._outbound_lanes: DeliveryLanes[tuple[OutboundRecord, TriggerInfo | None]] = DeliveryLanes(
+            self._run_outbound_lane_job,
+        )
+        self._open_approvals: dict[str, _OpenApproval] = {}
+        self._closed_approvals: OrderedDict[str, None] = OrderedDict()
+        self._approval_reconcile_task: asyncio.Task[None] | None = None
         self._running = False
         # [2026-05-29 restart detection fix] Why: request_restart(target=engine)
         # actually triggers a FULL restart (supervisor+engine), wiping supervisor's
@@ -200,6 +230,10 @@ class EventRouter:
         count = self._outbound_store.resume_deferred(conversation_key)
         self._outbound_retry_wakeup.set()
         return count
+
+    async def drain_outbound(self) -> None:
+        """等已经排进投递道的事件全部投完（成功、转入重试或死信）。"""
+        await self._outbound_lanes.join()
 
     @staticmethod
     def _delivery_purpose(payload: dict) -> str:
@@ -278,6 +312,12 @@ class EventRouter:
             retry_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await retry_task
+            reconcile = self._approval_reconcile_task
+            if reconcile is not None and not reconcile.done():
+                reconcile.cancel()
+                await asyncio.wait({reconcile})
+            # 正在发的那条在适配器里受 shield 保护；排队未发的仍在待发队列，下次启动重放。
+            await self._outbound_lanes.close()
 
         logger.info("EventRouter stopped")
 
@@ -294,10 +334,16 @@ class EventRouter:
         # cancel it in finally. Purpose: keep adapter UI behavior equivalent to
         # the old poll loop.
         sweep_task = asyncio.create_task(self._run_ws_sweep_loop())
+        connected = False
         try:
             async for raw_event in self._client.ws_connect(last_seq=self._outbound_store.received_seq):
                 if not self._running:
                     break
+                if not connected:
+                    # 握手之后 supervisor 总会先发一帧补收检查点，收到第一帧就是连上了。
+                    # 断线期间定案或新挂起的审批没有重放，连上就对一次账。
+                    connected = True
+                    self._schedule_approval_reconcile()
                 if raw_event.get("type") == "ping":
                     continue
                 if raw_event.get("type") == "outbound_replay_gap":
@@ -312,7 +358,7 @@ class EventRouter:
                     self._after_seq = max(self._after_seq, seq)
                     continue
                 event = Event.from_dict(raw_event)
-                accepted = await self._dispatch(event)
+                accepted = await self._receive(event)
                 if not accepted:
                     raise OSError(f"event receipt was not persisted: seq={event.seq}")
                 if event.type in {"outbound_message", "intermediate_reply"}:
@@ -378,11 +424,28 @@ class EventRouter:
     #  分发
     # ------------------------------------------------------------------
 
-    async def _dispatch(self, event: Event) -> bool:
-        """Route one event and report whether it is safe to advance receive state."""
-        if event.type in {"outbound_message", "intermediate_reply"}:
-            return await self._dispatch_durable_outbound(event)
+    _DURABLE_TYPES = frozenset({"outbound_message", "intermediate_reply"})
 
+    async def _receive(self, event: Event) -> bool:
+        """WS 接收：回复类事件落盘即确认，平台投递排进这个会话的投递道。"""
+        if event.type not in self._DURABLE_TYPES:
+            return await self._dispatch_transient(event)
+        accepted, record, trigger = self._persist_durable_outbound(event)
+        if record is not None:
+            self._submit_outbound(record, trigger_hint=trigger)
+        return accepted
+
+    async def _dispatch(self, event: Event) -> bool:
+        """Route one event and report whether it is safe to advance receive state.
+
+        Durable events are delivered inline before this returns; the WS path goes
+        through _receive and does not wait for delivery.
+        """
+        if event.type in self._DURABLE_TYPES:
+            return await self._dispatch_durable_outbound(event)
+        return await self._dispatch_transient(event)
+
+    async def _dispatch_transient(self, event: Event) -> bool:
         # Layer 1: 原始事件拦截
         if self._on_raw_event:
             try:
@@ -426,11 +489,20 @@ class EventRouter:
 
     async def _dispatch_durable_outbound(self, event: Event) -> bool:
         """Persist/deliver one outbound and report whether local receipt is safe."""
+        accepted, record, _trigger = self._persist_durable_outbound(event)
+        if record is not None:
+            await self._deliver_outbound_record(record)
+        return accepted
+
+    def _persist_durable_outbound(
+        self, event: Event,
+    ) -> tuple[bool, OutboundRecord | None, TriggerInfo | None]:
+        """落盘一条回复类事件。返回 (能否确认接收, 需要投递的行, 接收时登记的 trigger)。"""
         try:
             delivery = self._outbound_delivery_metadata(event)
             route = str(delivery.get("conversation_key") or "")
             if route and not self._adapter_owns_conversation_key(route):
-                return True
+                return True, None, None
             record = self._outbound_store.enqueue(
                 event, delivery=delivery,
             )
@@ -449,7 +521,7 @@ class EventRouter:
                     "outcome": "persist_failed",
                 },
             )
-            return False
+            return False, None, None
         if record is None:
             logger.info(
                 "outbound_duplicate_acknowledged event_id=%s seq=%s outcome=duplicate",
@@ -461,7 +533,7 @@ class EventRouter:
                     "outcome": "duplicate",
                 },
             )
-            return True
+            return True, None, None
         if record.next_retry > time.time():
             logger.info(
                 "outbound_duplicate_deferred event_id=%s seq=%s task_id=%s attempt=%s next_retry=%s outcome=deferred",
@@ -477,24 +549,41 @@ class EventRouter:
                 },
             )
             self._outbound_retry_wakeup.set()
-            return True
-        await self._deliver_outbound_record(record)
-        return True
+            return True, None, None
+        src_seq = int(event.payload.get("source_inbound_seq") or 0)
+        return True, record, (self._state.get_trigger(src_seq) if src_seq else None)
 
-    async def _heartbeat_outbound_lease(self, record: OutboundRecord) -> None:
-        interval = max(0.1, min(
+    @staticmethod
+    def _outbound_lane(record: OutboundRecord) -> str:
+        """投递道按用户可见的会话分；取不到会话就按 session，同一来源的回复仍然排在一条道上。"""
+        route = str(record.delivery.get("conversation_key") or "").strip()
+        if route:
+            return route
+        session = str(record.delivery.get("session_id") or "").strip()
+        return f"session:{session}" if session else ""
+
+    def _submit_outbound(self, record: OutboundRecord, *, trigger_hint: TriggerInfo | None = None) -> bool:
+        return self._outbound_lanes.submit(self._outbound_lane(record), record.key, (record, trigger_hint))
+
+    async def _run_outbound_lane_job(self, job: tuple[OutboundRecord, TriggerInfo | None]) -> None:
+        record, trigger_hint = job
+        await self._deliver_outbound_record(record, trigger_hint=trigger_hint)
+
+    def _outbound_heartbeat_interval(self) -> float:
+        return max(0.1, min(
             self._config.outbound_heartbeat_interval,
             self._config.outbound_lease_seconds / 3,
         ))
-        while True:
-            await asyncio.sleep(interval)
-            self._outbound_store.heartbeat(
-                record, owner=self._outbound_owner,
-                lease_seconds=self._config.outbound_lease_seconds,
-            )
 
-    async def _deliver_outbound_record(self, record: OutboundRecord) -> bool:
-        """Atomically claim, heartbeat, and deliver one row across SDK instances."""
+    async def _deliver_outbound_record(
+        self, record: OutboundRecord, *, trigger_hint: TriggerInfo | None = None,
+    ) -> bool:
+        """Atomically claim, heartbeat, and deliver one row across SDK instances.
+
+        trigger_hint is the trigger registered at receive time. While the row waits
+        in its lane a cancel or context clear may drop it from state, and the reply
+        must still quote the original trigger message.
+        """
         if record.key in self._outbound_inflight:
             return False
         claimed = self._outbound_store.claim(
@@ -505,7 +594,23 @@ class EventRouter:
             return False
         record = claimed
         self._outbound_inflight.add(record.key)
-        heartbeat = asyncio.create_task(self._heartbeat_outbound_lease(record))
+        try:
+            async with lease_heartbeat(
+                lambda: self._outbound_store.heartbeat(
+                    record, owner=self._outbound_owner,
+                    lease_seconds=self._config.outbound_lease_seconds,
+                ),
+                interval=self._outbound_heartbeat_interval(),
+                lost=(OutboundOwnershipError,),
+                label=record.key,
+            ):
+                return await self._deliver_claimed_outbound(record, trigger_hint=trigger_hint)
+        finally:
+            self._outbound_inflight.discard(record.key)
+
+    async def _deliver_claimed_outbound(
+        self, record: OutboundRecord, *, trigger_hint: TriggerInfo | None = None,
+    ) -> bool:
         event = Event.from_dict(record.event)
         attempt = record.attempt + 1
         route = str(record.delivery.get("conversation_key") or "")
@@ -547,10 +652,12 @@ class EventRouter:
             if event.type == "intermediate_reply":
                 await self._deliver_intermediate_reply(
                     event, record.delivery, delivery_context=delivery_context,
+                    trigger_hint=trigger_hint,
                 )
             else:
                 await self._deliver_outbound_message(
                     event, record.delivery, delivery_context=delivery_context,
+                    trigger_hint=trigger_hint,
                 )
             platform_sent = True
             if reminder_delivery:
@@ -639,11 +746,6 @@ class EventRouter:
                 },
             )
             return False
-        finally:
-            heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat
-            self._outbound_inflight.discard(record.key)
 
     def _maybe_prune_outbound_sent(self, *, force: bool = False) -> int:
         now = time.time()
@@ -672,11 +774,12 @@ class EventRouter:
             for record in self._outbound_store.due(now):
                 if not self._running:
                     return
-                await self._deliver_outbound_record(record)
+                self._submit_outbound(record)
 
             next_retry = self._outbound_store.next_retry_at()
             timeout = minimum_scan
-            if next_retry is not None:
+            # 已到期的行刚排进投递道，不必空转盯着；投递失败或推迟时会把这里叫醒。
+            if next_retry is not None and next_retry > now:
                 timeout = max(0.05, min(minimum_scan, next_retry - time.time()))
             self._outbound_retry_wakeup.clear()
             try:
@@ -989,6 +1092,7 @@ class EventRouter:
         delivery: dict[str, Any],
         *,
         delivery_context: DeliveryContext | None = None,
+        trigger_hint: TriggerInfo | None = None,
     ) -> None:
         """Deliver once; mutate trigger state only after callback success."""
         p = event.payload
@@ -1009,7 +1113,7 @@ class EventRouter:
 
         # Main reply: retain both objects while the callback is in flight. This
         # lets a failed send retry with the exact same adapter-owned references.
-        trigger = self._state.get_trigger(src_seq) if src_seq else None
+        trigger = (self._state.get_trigger(src_seq) if src_seq else None) or trigger_hint
         if trigger is not None:
             main_state = self._state.get_main_state(src_seq)
             await self._invoke_callback(
@@ -1063,6 +1167,7 @@ class EventRouter:
         delivery: dict[str, Any],
         *,
         delivery_context: DeliveryContext | None = None,
+        trigger_hint: TriggerInfo | None = None,
     ) -> None:
         """Deliver one intermediate reply without consuming the final trigger."""
         p = event.payload
@@ -1080,7 +1185,7 @@ class EventRouter:
         if conv_key != context.conversation_key:
             context = replace(context, conversation_key=conv_key)
 
-        trigger = self._state.get_trigger(src_seq) if src_seq else None
+        trigger = (self._state.get_trigger(src_seq) if src_seq else None) or trigger_hint
         if trigger is not None and node_id == self._entry_node_id:
             trigger.refresh()
             main_state = self._state.get_main_state(src_seq)
@@ -1313,7 +1418,7 @@ class EventRouter:
     #  approval_requested — 审批请求处理
     # ------------------------------------------------------------------
 
-    async def _handle_approval_requested(self, event: Event) -> None:
+    async def _handle_approval_requested(self, event: Event, *, remote_route: bool = False) -> None:
         """处理 approval_requested 事件。
 
         处理流程：
@@ -1323,6 +1428,9 @@ class EventRouter:
                    内部操作 → 自动放行
           4. 向 progress_records 追加审批状态记录
         对应 bot_adapter.py L993-1006 _process_approval_event。
+
+        remote_route：本地会话映射认不出归属时，按审批所属任务向 supervisor 查发起会话。
+        只有对账补发走这条路 —— 重启后分支会话的映射已经没了。
         """
         p = event.payload
         appr_id = p.get("approval_id", "")
@@ -1340,6 +1448,8 @@ class EventRouter:
         conv_key = self._resolve_owned_route_conversation_key(
             event, p, trigger_result=result,
         )
+        if not conv_key and remote_route:
+            conv_key = await self._remote_owned_conversation_key(str(p.get("task_id") or ""))
         # [2026-05-29 方案C第一步] 为什么：旧审批逻辑先 mark_handled 再判归属，
         # 子 session 映射未建立时会把审批永久丢掉，其他 adapter 也无法处理。
         # 怎么改：先解析 route key 并验证 prefix ownership；无法确认归属时直接返回。
@@ -1389,6 +1499,9 @@ class EventRouter:
         # 决定是否自动放行
         if is_external or not self._config.auto_approve_internal:
             # 外部操作 或 bot 未开启自动放行 → 通知适配器展示审批 UI
+            self._open_approvals[appr_id] = _OpenApproval(
+                task_id=str(p.get("task_id") or ""), conversation_key=conv_key,
+            )
             try:
                 await self._cb.show_approval_ui(
                     appr_id, operation, details,
@@ -1397,6 +1510,9 @@ class EventRouter:
                 )
             except Exception as e:
                 logger.error("show_approval_ui failed: %s", e)
+                # 没亮出来就不算处理过，下次对账再补。
+                self._open_approvals.pop(appr_id, None)
+                self._approval.forget(appr_id)
             status = f"⏳ 等待审批: {operation}"
         else:
             # 内部操作 且 bot 开启了自动放行 → 自动放行
@@ -1413,6 +1529,104 @@ class EventRouter:
             if main_state:
                 main_state.progress_records.append(status)
 
+    async def _remote_owned_conversation_key(self, task_id: str) -> str:
+        """按任务向 supervisor 查发起会话；不归本适配器或查不到时返回空串。"""
+        lookup = getattr(self._client, "get_task_origin", None)
+        if not task_id or lookup is None:
+            return ""
+        try:
+            origin = await lookup(task_id)
+        except Exception:
+            logger.warning("approval route lookup failed: task=%s", task_id[:12], exc_info=True)
+            return ""
+        if origin is None:
+            return ""
+        conv_key = str(origin.conversation_key or "").strip()
+        return conv_key if self._adapter_owns_conversation_key(conv_key) else ""
+
+    async def _handle_approval_decided(self, event: Event) -> None:
+        """审批在任何一端定案（含超时自动拒绝）都收起这边亮着的界面，免得再批一次或回执假的。"""
+        p = event.payload
+        approval_id = str(p.get("approval_id") or "")
+        if not approval_id:
+            return
+        status = APPROVAL_ALLOWED if p.get("decision") == "allow" else APPROVAL_DENIED
+        await self._close_approval(approval_id, status=status, comment=str(p.get("comment") or ""))
+
+    async def _close_task_approvals(self, task_id: str, *, reason: str) -> None:
+        """任务结束后，它挂着没批的审批再批也不会生效。"""
+        if not task_id:
+            return
+        for approval_id in [aid for aid, item in self._open_approvals.items() if item.task_id == task_id]:
+            await self._close_approval(approval_id, status=APPROVAL_EXPIRED, comment=reason)
+
+    async def _close_approval(self, approval_id: str, *, status: str, comment: str = "") -> None:
+        """只收起本适配器亮过的审批；别的适配器的审批事件同样会流过这里。"""
+        if self._open_approvals.pop(approval_id, None) is None:
+            return
+        self._closed_approvals[approval_id] = None
+        self._closed_approvals.move_to_end(approval_id)
+        while len(self._closed_approvals) > _CLOSED_APPROVAL_MEMORY:
+            self._closed_approvals.popitem(last=False)
+        closer = getattr(self._cb, "close_approval_ui", None)
+        if closer is None:
+            return
+        try:
+            await closer(approval_id, status=status, comment=comment)
+        except Exception as e:
+            logger.error("close_approval_ui failed: id=%s error=%s", approval_id, e)
+
+    def _schedule_approval_reconcile(self) -> None:
+        running = self._approval_reconcile_task
+        if running is not None and not running.done():
+            return
+        self._approval_reconcile_task = asyncio.create_task(self._reconcile_approvals())
+
+    async def _reconcile_approvals(self) -> None:
+        """启动或重连后和 supervisor 对一次待审批。
+
+        断线期间定案的收起，新挂起的按实时事件同一条路补亮（归属判定、去重、发卡片都一样）。
+        进程重启后本地什么都不记得，supervisor 上属于本适配器的待审批会整批补回来。
+        """
+        lister = getattr(self._client, "list_pending_approvals", None)
+        if lister is None:
+            return
+        try:
+            pending = await lister()
+        except Exception:
+            logger.warning("approval reconcile skipped: pending approvals unavailable", exc_info=True)
+            return
+        pending_ids = {str(item.get("approval_id") or "") for item in pending}
+        for approval_id in [aid for aid in self._open_approvals if aid not in pending_ids]:
+            status, comment = await self._settled_approval_status(approval_id)
+            if status != APPROVAL_PENDING:
+                await self._close_approval(approval_id, status=status, comment=comment)
+        for item in pending:
+            approval_id = str(item.get("approval_id") or "")
+            if not approval_id or approval_id in self._closed_approvals or self._approval.is_handled(approval_id):
+                continue
+            await self._handle_approval_requested(Event(
+                seq=0, event_id="", ts="", run_id="", session_id=str(item.get("session_id") or ""),
+                component="supervisor", type="approval_requested", payload=dict(item),
+            ), remote_route=True)
+
+    async def _settled_approval_status(self, approval_id: str) -> tuple[str, str]:
+        """查一条已不在待审批清单里的审批落到了什么状态；查不到就当作已失效。"""
+        getter = getattr(self._client, "get_approval", None)
+        if getter is None:
+            return APPROVAL_EXPIRED, ""
+        try:
+            approval = await getter(approval_id)
+        except Exception:
+            logger.warning("approval status lookup failed: id=%s", approval_id, exc_info=True)
+            return APPROVAL_EXPIRED, ""
+        if not approval:
+            return APPROVAL_EXPIRED, ""
+        status = str(approval.get("status") or "")
+        if status not in {APPROVAL_PENDING, APPROVAL_ALLOWED, APPROVAL_DENIED}:
+            status = APPROVAL_EXPIRED
+        return status, str(approval.get("comment") or "")
+
     # ------------------------------------------------------------------
     #  task_completed / task_cancelled — 任务生命周期终结
     # ------------------------------------------------------------------
@@ -1427,6 +1641,10 @@ class EventRouter:
         p = event.payload
         node_id = p.get("node_id", "")
         src_seq = int(p.get("source_inbound_seq") or 0)
+        await self._close_task_approvals(
+            str(p.get("task_id") or ""),
+            reason="任务已取消" if event.type == "task_cancelled" else "任务已结束",
+        )
 
         # [Fork/Merge 2026-05-12] 入口节点取消只按 source_inbound_seq 清理 trigger。
         # Why: cancelling one branch must not consume another trigger on the same parent session.
@@ -1681,12 +1899,7 @@ class EventRouter:
             logger.error("on_engine_restarted callback error: %s", e)
 
     async def _handle_raw_only_event(self, event: Event) -> None:
-        """处理仅面向 on_raw_event hook 的事件类型。"""
-        # [SDK WS 2026-05-19] Why: tool_call_* / stream_end /
-        # approval_decided are display-layer signals and do not require SDK state
-        # mutation yet. How: register a no-op handler after the raw-event hook has
-        # already run. Purpose: make these event types explicit in the dispatch
-        # table while preserving AdapterCallbacks compatibility.
+        """只给 on_raw_event hook 看的展示层事件（tool_call_* / stream_end），SDK 不改状态。"""
         return None
 
     # ==================================================================
@@ -1718,13 +1931,9 @@ class EventRouter:
         "context_reset":     _handle_context_reset,
         "inbound_accepted":  _handle_inbound_accepted,
         "engine_registered": _handle_engine_registered,
-        # [SDK WS 2026-05-19] Why: these new events should reach raw-event hooks
-        # but do not need SDK-owned state changes. How: route them to a no-op
-        # handler after Layer 1 dispatch. Purpose: unknown-handler silence remains
-        # available for future events while these supported events are explicit.
         "tool_call_start":  _handle_raw_only_event,
         "tool_call_end":    _handle_raw_only_event,
         "tool_call_delta":  _handle_raw_only_event,
         "stream_end":       _handle_raw_only_event,
-        "approval_decided": _handle_raw_only_event,
+        "approval_decided": _handle_approval_decided,
     }

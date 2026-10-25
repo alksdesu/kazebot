@@ -334,7 +334,8 @@ def test_current_inbound_uses_group_watermark_and_ignores_legacy_topic(runtime, 
     }
     runtime.history._append_group_history(12345, "current conversation history")
     monkeypatch.setattr(runtime.history, "_build_reply_context", AsyncMock(return_value=("", [])))
-    text, watermark = asyncio.run(runtime.inbound._build_inbound_text(current, bot, "follow up", actor["scope"], []))
+    built = asyncio.run(runtime.inbound._build_inbound_text(current, bot, "follow up", actor["scope"], []))
+    text, watermark = built.text, built.covered_seq
     assert "book original" not in text and "current conversation history" in text
     assert watermark >= 0
 

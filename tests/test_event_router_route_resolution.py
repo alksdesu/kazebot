@@ -408,6 +408,8 @@ def test_outbound_startup_retry_recovers_without_server_replay(tmp_path: Path) -
         second._running = False
         second._outbound_retry_wakeup.set()
         await asyncio.wait_for(task, timeout=1.0)
+        # 重试循环只把到期的行排进会话投递道，真正发出去要等投递道跑完。
+        await second.drain_outbound()
 
     asyncio.run(run_local_recovery())
     assert recovered.reply_calls == []
@@ -716,6 +718,7 @@ def test_intermediate_startup_recovery_uses_captured_route_and_acks(tmp_path: Pa
         second._running = False
         second._outbound_retry_wakeup.set()
         await asyncio.wait_for(task, timeout=1)
+        await second.drain_outbound()
 
     asyncio.run(recover())
     assert len(recovered.channel_sends) == 1

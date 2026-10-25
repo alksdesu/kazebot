@@ -136,6 +136,7 @@ def test_persistence_failure_stops_stream_and_restart_recovers_missing_reply(tmp
         first._running = True
         with pytest.raises(OSError, match="not persisted"):
             await first._run_ws()
+        await first.drain_outbound()
         assert first._outbound_store.received_seq == 9
         assert sends == []
         first._outbound_store.close()
@@ -146,6 +147,8 @@ def test_persistence_failure_stops_stream_and_restart_recovers_missing_reply(tmp
                 await second._run_ws()
             assert second._outbound_store.received_seq == 11
         finally:
+            # 投递在会话投递道里跑，接收循环退出时不一定发完。
+            await second.drain_outbound()
             second._outbound_store.close()
 
     asyncio.run(exercise())
@@ -168,6 +171,7 @@ def test_cursor_failure_after_send_replays_without_duplicate_delivery(tmp_path, 
         first._running = True
         with pytest.raises(OSError, match="checkpoint failed"):
             await first._run_ws()
+        await first.drain_outbound()
         first._outbound_store.close()
         second = router(tmp_path, client, sends)
         second._running = True
@@ -176,6 +180,7 @@ def test_cursor_failure_after_send_replays_without_duplicate_delivery(tmp_path, 
                 await second._run_ws()
             assert second._outbound_store.received_seq == 10
         finally:
+            await second.drain_outbound()
             second._outbound_store.close()
 
     asyncio.run(exercise())
@@ -232,6 +237,7 @@ def test_failed_delivery_is_retried_locally_after_receive_cursor_advances(tmp_pa
         first._running = True
         with pytest.raises(ConnectionError, match="stream ended"):
             await first._run_ws()
+        await first.drain_outbound()
         assert first._outbound_store.received_seq == 11
         first._outbound_store.close()
         second = router(tmp_path, ReplayClient([]), sends)

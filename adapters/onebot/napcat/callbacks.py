@@ -313,6 +313,13 @@ class TangQiuCallbacks:
             delivered,
         )
 
+    async def close_approval_ui(self, approval_id: str, *, status: str, comment: str = "") -> None:
+        """审批在别处定案或作废：收起本地待审批，之后引用卡片只会得到「已处理」而不是假回执。"""
+        if state._adapter.approvals.close_if_pending(
+            approval_id, decision=approval._book_decision(status, comment),
+        ):
+            common.logger.info("approval closed on QQ by supervisor: id=%s status=%s", approval_id, status)
+
     async def refresh_typing(self, trigger: TriggerInfo) -> None:
         return None
 

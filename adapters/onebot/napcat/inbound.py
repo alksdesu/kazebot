@@ -148,6 +148,24 @@ def _event_identity(event: Event) -> tuple[str, ...]:
     )
 
 
+def _first_delivery(bot: Any, event: Any) -> bool:
+    """这条消息是不是第一次送到；OneBot 重连补发的同一条只处理第一次。
+
+    只在 handler 入口查：同一个事件对象会被好几个 rule 各判一遍，rule 里查会把它自己当成重复。
+    """
+    message_id = str(getattr(event, "message_id", "") or "").strip()
+    if not message_id:
+        return True
+    group_id = getattr(event, "group_id", None)
+    conversation = f"group:{group_id}" if group_id is not None else f"private:{getattr(event, 'user_id', '')}"
+    if state._adapter.delivered_messages.first((str(getattr(bot, "self_id", "") or ""), conversation, message_id)):
+        return True
+    common.logger.info(
+        "drop duplicate QQ delivery: kind=%s message_id=%s", "group" if group_id is not None else "private", message_id,
+    )
+    return False
+
+
 def _trigger_roll(event: GroupMessageEvent) -> float:
     """随机插话的骰子，[0,1)。同一条消息掷几次都是同一个值。"""
     # 判定可能对同一条消息跑多遍，骰子必须同值：一遍掷中一遍没中的话，
@@ -193,17 +211,18 @@ def _inbound_facts(
     if text is None:
         text = message_text._message_to_text(event.get_message(), self_id) if hasattr(event, "get_message") else ""
     try:
-        reply_to = str(message_text._extract_reply_message_id(event.get_message(), getattr(event, "raw_message", None)) or "")
+        reply_to = str(message_text._event_reply_message_id(event) or "")
     except Exception:
         reply_to = ""
+    sender_id = identity._verified_sender_id(event)
     return InboundFacts(
         sender=InboundSender(
-            platform_id="" if anonymous else user_id,
+            platform_id=sender_id,
             alias=identity._event_user_alias(event),
             display_name=identity._event_display_name(event),
             group_role="" if anonymous or not is_group else _event_sender_role(event),
             anonymous=anonymous,
-            listed_admin=(not anonymous) and permissions._is_admin_user(user_id),
+            listed_admin=bool(sender_id) and permissions._is_admin_user(sender_id),
         ),
         conversation=InboundConversation(
             platform=QQ_NAPCAT.id, channel=channel, kind=kind, raw_id=raw_id,
@@ -445,6 +464,18 @@ async def _auto_like_user(bot: Bot, user_id: int) -> None:
         common.logger.debug("send_like failed for user=%s", user_id, exc_info=True)
 
 
+_REPLY_REQUEST = "请根据以上上下文，执行当前用户的指令并给出回复。"
+
+
+def _quote_block(reply_context: str) -> List[str]:
+    return ["【当前消息引用】", reply_context] if reply_context else []
+
+
+def _merge_text(quote: List[str], instruction: str) -> str:
+    """排队合并时追加的那段：这条自己的引用块和指令行。"""
+    return "\n".join([*quote, *([""] if quote else []), instruction])
+
+
 async def _build_inbound_text(
     event: GroupMessageEvent,
     bot: Bot,
@@ -453,10 +484,10 @@ async def _build_inbound_text(
     attachments: List[Dict[str, Any]],
     *,
     exclude_seq: int = 0,
-) -> tuple[str, int]:
+) -> models.InboundText:
     """组装提交给 tangqiu_main 的群聊 inbound 文本，并匿名化 QQ 群号/用户号。
 
-    第二个返回值是本次带出的最大历史序号，提交成功后据此推进水位。exclude_seq 是
+    covered_seq 是本次带出的最大历史序号，提交成功后据此推进水位。exclude_seq 是
     当前这条触发消息的序号，它由【当前用户指令】带出，不再进历史块。
     """
     group_id = int(event.group_id)
@@ -466,8 +497,9 @@ async def _build_inbound_text(
     covered_seq = pending.covered_seq
     fresh = [entry for entry in pending.lines if entry.seq != exclude_seq]
     lost = pending.lost
-    current_name = anonymize._anonymize_text_for_ai(identity._event_display_name(event))
+    # 先登记发送者再做替换，第一次来的人名片里带着自己的号也不会漏出去。
     current_user = identity._event_user_alias(event)
+    current_name = anonymize._anonymize_text_for_ai(identity._event_display_name(event))
     now = dt.datetime.now(common._CST).strftime("%Y-%m-%d %H:%M CST")
 
     parts: List[str] = ["【群聊上下文记录】"]
@@ -483,9 +515,11 @@ async def _build_inbound_text(
     reply_context, quoted_attachments = await history._build_reply_context(event, bot, conversation_key)
     if quoted_attachments:
         attachments.extend(quoted_attachments)
-    if reply_context:
-        parts.extend(["", "【当前消息引用】", reply_context])
+    quote = _quote_block(reply_context)
+    if quote:
+        parts.extend(["", *quote])
 
+    instruction = f"{current_name}（{current_user}）: {anonymize._anonymize_text_for_ai(user_text)}"
     parts.extend([
         "",
         f"当前时间: {now}",
@@ -493,11 +527,11 @@ async def _build_inbound_text(
         *identity._user_identity_lines(event, current_name),
         "",
         "【当前用户指令】",
-        f"{current_name}（{current_user}）: {anonymize._anonymize_text_for_ai(user_text)}",
+        instruction,
         "",
-        "请根据以上上下文，执行当前用户的指令并给出回复。",
+        _REPLY_REQUEST,
     ])
-    return "\n".join(parts), covered_seq
+    return models.InboundText("\n".join(parts), _merge_text(quote, instruction), covered_seq)
 
 
 def _parse_direct_draw_command(user_text: str) -> Optional[str]:
@@ -514,13 +548,14 @@ def _parse_direct_draw_command(user_text: str) -> Optional[str]:
     return prompt
 
 
-async def _build_draw_direct_inbound_text(event: Event, user_text: str, is_dm: bool) -> str:
+async def _build_draw_direct_inbound_text(event: Event, user_text: str, is_dm: bool) -> models.InboundText:
     """构造直达绘图节点的入站文本，避免普通入口 AI 再判断一次意图。"""
     now = dt.datetime.now(common._CST).strftime("%Y-%m-%d %H:%M CST")
-    name = anonymize._anonymize_text_for_ai(identity._event_display_name(event))
     user = identity._event_user_alias(event)
+    name = anonymize._anonymize_text_for_ai(identity._event_display_name(event))
     target = "私聊" if is_dm else "群聊"
-    return "\n".join([
+    request = f"{name}（{user}）: {anonymize._anonymize_text_for_ai(user_text)}"
+    return models.InboundText("\n".join([
         f"当前时间: {now}",
         f"来源: QQ{target} / /生图 直达命令",
         "",
@@ -528,36 +563,40 @@ async def _build_draw_direct_inbound_text(event: Event, user_text: str, is_dm: b
         *identity._user_identity_lines(event, name),
         "",
         "【绘图请求】",
-        f"{name}（{user}）: {user_text}",
+        request,
         "",
         "请直接按绘图节点规则处理：如果用户要求画图/生图则生成图片；如果用户明确只要提示词/tag则只给提示词。",
-    ])
+    ]), request)
 
 
-async def _build_private_inbound_text(event: PrivateMessageEvent, bot: Bot, user_text: str, conversation_key: str, attachments: List[Dict[str, Any]]) -> str:
+async def _build_private_inbound_text(
+    event: PrivateMessageEvent, bot: Bot, user_text: str, conversation_key: str, attachments: List[Dict[str, Any]],
+) -> models.InboundText:
     """组装提交给 tangqiu_main 的私聊 inbound 文本，并匿名化 QQ 用户号。"""
     fallback_text = await message_text._event_text_with_forward(bot, event)
+    user = identity._event_user_alias(event)
     text = anonymize._anonymize_text_for_ai((user_text or fallback_text).strip() or "你好")
     name = anonymize._anonymize_text_for_ai(identity._event_display_name(event))
-    user = identity._event_user_alias(event)
     now = dt.datetime.now(common._CST).strftime("%Y-%m-%d %H:%M CST")
     parts: List[str] = [f"当前时间: {now}"]
     reply_context, quoted_attachments = await history._build_reply_context(event, bot, conversation_key)
     if quoted_attachments:
         attachments.extend(quoted_attachments)
-    if reply_context:
-        parts.extend(["", "【当前消息引用】", reply_context])
+    quote = _quote_block(reply_context)
+    if quote:
+        parts.extend(["", *quote])
+    instruction = f"{name}（{user}）: {text}"
     parts.extend([
         "",
         "【当前用户身份】",
         *identity._user_identity_lines(event, name),
         "",
         "【当前用户指令】",
-        f"{name}（{user}）: {text}",
+        instruction,
         "",
-        "请根据以上上下文，执行当前用户的指令并给出回复。",
+        _REPLY_REQUEST,
     ])
-    return "\n".join(parts)
+    return models.InboundText("\n".join(parts), _merge_text(quote, instruction))
 
 
 # 拿不到可确认的图片时必须显式禁止模型从历史里猜，否则它会编出一张不存在的图。
@@ -576,12 +615,12 @@ def _apply_attachment_hints(
     attachments: List[Dict[str, Any]],
     attachment_errors: List[str],
 ) -> str:
-    """把附件处理提示挂到 inbound 文本上，并把附件路径回填进 [图片] 占位。"""
+    """把附件处理提示挂到 inbound 文本上，并把附件路径回填进 [图片] 占位。不改动传入的列表。"""
+    notes = list(attachment_errors)
     if media._text_looks_like_image_query(user_text) and not attachments:
-        # 就地 append：调用方在此之后不再读这个列表。
-        attachment_errors.append(_IMAGE_UNBOUND_HINT)
-    if attachment_errors:
-        inbound_text += "\n\n【附件处理提示】\n" + "\n".join(dict.fromkeys(attachment_errors))
+        notes.append(_IMAGE_UNBOUND_HINT)
+    if notes:
+        inbound_text += "\n\n【附件处理提示】\n" + "\n".join(dict.fromkeys(notes))
     for att in attachments:
         # 只有图片占 [图片] 位。文件附件混进来会顶掉后面那张图的位置，路径就对错人了。
         if att.get("type") != "image":

@@ -473,8 +473,15 @@ class AliasBook:
             if raw is not None:
                 yield raw, alias
 
-    def substitute(self, text: str) -> str:
-        """把文本里已登记的真实 ID 换成别名。人和群的 ID 字面相同时按群换。"""
+    def substitute(self, text: str, *, users: Iterable[str] = (), groups: Iterable[str] = ()) -> str:
+        """把文本里已登记的真实 ID 换成别名。人和群的 ID 字面相同时按群换。
+
+        只换登记过的号，所以这段文本自己牵涉的人和群从 users / groups 传进来，先登记再换。
+        """
+        for real in users:
+            self.user_alias(real)
+        for real in groups:
+            self.group_alias(real)
         if not text:
             return ""
         safe = str(text)

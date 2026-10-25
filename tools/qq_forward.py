@@ -271,6 +271,8 @@ if __name__ == "__main__":
         "session_id": session_id,
         "parent_session_id": parent_session_id,
         "runtime_session_id": runtime_session_id,
+        # Bridge 凭它向 supervisor 查发起人。只认引擎注入的环境变量：参数是模型写的，能填成别人的任务。
+        "task_id": _env_first("CLONOTH_TASK_ID", default=""),
     }
     if op == "list":
         payload["query"] = str(args.get("query") or "").strip()

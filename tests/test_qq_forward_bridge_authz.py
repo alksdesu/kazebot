@@ -1,16 +1,16 @@
-"""qq_forward Bridge 端到端鉴权测试。
+"""qq_forward Bridge 端到端鉴权：拒绝时一条消息都没发出去，forward_authz 的纯逻辑测试证明不了这一点。
 
-覆盖“拒绝时一条消息都没发出去”，这是 forward_authz 的纯逻辑测试无法证明的部分。
-原始漏洞：任意白名单群成员都能让 AI 用 op=file 把 data/config.yaml、
-data/.admin_token、data/onebot_anon_map.json 私发给自己，或借 Bot 身份群发。
-"""
+要挡住的是群成员让 AI 用 op=file 把 data/config.yaml、data/.admin_token 等私发给自己，或借 Bot 群发。
+发起人只认 supervisor 按任务号查回的 platform_auth，会话只用来定位「本群」。"""
 from __future__ import annotations
 
 import asyncio
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -22,10 +22,14 @@ if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
 from _onebot_harness import load_runtime, set_live_config, patch_imported  # noqa: E402
+from adapters._shared import capability  # noqa: E402
+from clonoth_sdk import PlatformAuth, TaskOrigin  # noqa: E402
 
 _SESSION = "sess-1"
+_TASK = "task-forward-1"
 _ADMIN_QQ = 10001
 _MEMBER_QQ = 30003
+_ANONYMOUS_PLACEHOLDER_QQ = 80000000
 _HOME_GROUP = 99
 _OTHER_GROUP = 77
 
@@ -55,22 +59,46 @@ class _Bot:
         return self.group_msgs + self.private_msgs + len(self.api_calls)
 
 
+def _task_origin(user_id: int | None, *, is_admin: bool | None = None) -> TaskOrigin | None:
+    """supervisor 为 _TASK 记下的发起人；None 表示查无此任务（404）。"""
+    if user_id is None:
+        return None
+    return TaskOrigin(
+        task_id=_TASK, origin_task_id=_TASK, conversation_key="qq_group:stable", channel="qq_group",
+        platform_auth=PlatformAuth(
+            platform="qq", user_id=str(user_id), is_admin=(user_id == _ADMIN_QQ) if is_admin is None else is_admin,
+        ),
+    )
+
+
+def _supervisor_knows(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch, user_id: int | None, *, is_admin: bool | None = None,
+) -> AsyncMock:
+    lookup = AsyncMock(return_value=_task_origin(user_id, is_admin=is_admin))
+    monkeypatch.setattr(runtime.state._adapter, "client", SimpleNamespace(get_task_origin=lookup), raising=False)
+    return lookup
+
+
 def _harness(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     *,
-    requester: int,
+    requester: int | None,
     origin: dict[str, Any] | None = None,
-    resolved: tuple[str, int] = ("group", _HOME_GROUP),
+    resolved: tuple[str, int] | None = ("group", _HOME_GROUP),
 ):
-    """加载插件并把会话登记成 requester 在 _HOME_GROUP 群里发起的请求。"""
+    """加载插件：会话登记在 _HOME_GROUP，supervisor 认定 _TASK 的发起人是 requester（None = 查不到）。
+
+    resolved 是目标解析的桩结果；None 时保留真实解析。
+    """
     runtime = load_runtime(monkeypatch, tmp_path)
     bot = _Bot()
     patch_imported(monkeypatch, runtime, "get_bot", lambda: bot)
     set_live_config(runtime, admin_users=frozenset({_ADMIN_QQ}))
+    _supervisor_knows(runtime, monkeypatch, requester)
 
     if origin is None:
-        origin = {"type": "group", "group_id": _HOME_GROUP, "user_id": requester}
+        origin = {"type": "group", "group_id": _HOME_GROUP}
     if origin:
         monkeypatch.setitem(runtime.state._adapter.session_targets, _SESSION, origin)
 
@@ -80,13 +108,15 @@ def _harness(
     async def emojis(text: str, *args: Any, **kwargs: Any):
         return [runtime.state.MessageSegment.text(text)]
 
-    monkeypatch.setattr(runtime.forward_bridge, "_forward_bridge_resolve_target", resolve)
+    if resolved is not None:
+        monkeypatch.setattr(runtime.forward_bridge, "_forward_bridge_resolve_target", resolve)
     monkeypatch.setattr(runtime.state._adapter.emoji, "process_emojis", emojis)
     return runtime, bot
 
 
 def _run(runtime, payload: dict[str, Any]) -> dict[str, Any]:
     payload.setdefault("session_id", _SESSION)
+    payload.setdefault("task_id", _TASK)
     return asyncio.run(runtime.forward_bridge._forward_bridge_execute(payload))
 
 
@@ -147,9 +177,9 @@ def test_admin_remind_to_other_group_is_delivered(monkeypatch: pytest.MonkeyPatc
     assert bot.group_msgs == 1
 
 
-def test_unregistered_session_is_denied(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """反查不到发起人时必须 fail-closed，不能默认放行。"""
-    runtime, bot = _harness(monkeypatch, tmp_path, requester=_ADMIN_QQ, origin={})
+def test_unregistered_session_with_unknown_task_is_denied(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """会话和任务都反查不到时必须 fail-closed，不能默认放行。"""
+    runtime, bot = _harness(monkeypatch, tmp_path, requester=None, origin={})
 
     result = _run(runtime, {"action": "remind", "target_type": "current", "text": "hi"})
 
@@ -157,13 +187,74 @@ def test_unregistered_session_is_denied(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert bot.sends == 0
 
 
-def test_group_origin_without_user_id_is_denied(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """本次修复前登记的群会话没有 user_id，旧持久化数据不能被当成管理员。"""
+def test_the_session_target_never_supplies_the_requester(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """会话目标上残留的 user_id（旧持久化数据、同群后来的人）不能被当成发起人。"""
     runtime, bot = _harness(
-        monkeypatch, tmp_path, requester=_ADMIN_QQ,
-        origin={"type": "group", "group_id": _HOME_GROUP},
+        monkeypatch, tmp_path, requester=_MEMBER_QQ,
+        origin={"type": "group", "group_id": _HOME_GROUP, "user_id": _ADMIN_QQ},
         resolved=("group", _OTHER_GROUP),
     )
+
+    result = _run(runtime, {"action": "remind", "target_type": "group", "target_ref": "别的群", "text": "hi"})
+
+    assert result["ok"] is False
+    assert bot.sends == 0
+
+
+@pytest.mark.parametrize("failure", ["missing_task", "lookup_error", "no_task_id", "not_qq"])
+def test_an_unverifiable_requester_cannot_reach_another_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str,
+) -> None:
+    runtime, bot = _harness(monkeypatch, tmp_path, requester=_ADMIN_QQ, resolved=("group", _OTHER_GROUP))
+    payload: dict[str, Any] = {"action": "remind", "target_type": "group", "target_ref": "别的群", "text": "hi"}
+    if failure == "missing_task":
+        _supervisor_knows(runtime, monkeypatch, None)
+    elif failure == "lookup_error":
+        lookup = AsyncMock(side_effect=RuntimeError("supervisor unreachable"))
+        monkeypatch.setattr(runtime.state._adapter, "client", SimpleNamespace(get_task_origin=lookup))
+    elif failure == "no_task_id":
+        payload["task_id"] = ""
+    else:
+        web = TaskOrigin(task_id=_TASK, origin_task_id=_TASK, conversation_key="web:1", channel="web",
+                         platform_auth=PlatformAuth(platform="web", user_id=str(_ADMIN_QQ), is_admin=True))
+        monkeypatch.setattr(runtime.state._adapter, "client", SimpleNamespace(get_task_origin=AsyncMock(return_value=web)))
+
+    result = _run(runtime, payload)
+
+    assert result["ok"] is False
+    assert bot.sends == 0
+
+
+@pytest.mark.parametrize("requester", [None, _ANONYMOUS_PLACEHOLDER_QQ])
+def test_an_unverifiable_requester_gets_a_plain_answer_for_send_to_me(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, requester: int | None,
+) -> None:
+    """查不到发起人，或发起的是匿名消息（占位号全群共用），都不能当成某个人去私发。"""
+    runtime, bot = _harness(monkeypatch, tmp_path, requester=requester, resolved=None)
+
+    result = _run(runtime, {"action": "remind", "target_type": "self", "text": "hi"})
+
+    assert result["ok"] is False
+    assert "无法核验" in result["error"]
+    assert bot.sends == 0
+
+
+def test_an_unverifiable_requester_cannot_send_workspace_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    rel = _workspace_file(tmp_path, "README.md", "# hi")
+    runtime, bot = _harness(monkeypatch, tmp_path, requester=None)
+
+    result = _run(runtime, {"action": "file", "target_type": "current", "file_paths": [rel]})
+
+    assert result["ok"] is False
+    assert bot.sends == 0
+
+
+def test_an_admin_dropped_from_the_roster_is_no_longer_an_admin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """入站时记的管理员身份和现在的名单都得认。"""
+    runtime, bot = _harness(monkeypatch, tmp_path, requester=_ADMIN_QQ, resolved=("group", _OTHER_GROUP))
+    set_live_config(runtime, admin_users=frozenset())
 
     result = _run(runtime, {"action": "remind", "target_type": "group", "target_ref": "别的群", "text": "hi"})
 
@@ -301,10 +392,10 @@ def _handle(runtime, payload: dict[str, Any], *, token: Any = "__signed__", head
     return asyncio.run(runtime.forward_bridge._forward_bridge_http_handler(_Request(body, hdrs)))
 
 
-def _register_group(runtime, monkeypatch: pytest.MonkeyPatch, *, group_id: int = _HOME_GROUP, user_id: int = _MEMBER_QQ) -> None:
+def _register_group(runtime, monkeypatch: pytest.MonkeyPatch, *, group_id: int = _HOME_GROUP) -> None:
     monkeypatch.setitem(
         runtime.state._adapter.session_targets, _SESSION,
-        {"type": "group", "group_id": group_id, "user_id": user_id},
+        {"type": "group", "group_id": group_id},
     )
 
 
@@ -465,9 +556,10 @@ def test_self_send_is_refused_when_origin_left_the_private_allowlist(monkeypatch
         allowed_private_users=frozenset(),
         allow_private_friends=False,
     )
+    _supervisor_knows(runtime, monkeypatch, _MEMBER_QQ)
 
     result = asyncio.run(runtime.forward_bridge._forward_bridge_execute({
-        "session_id": _SESSION, "action": "remind", "target_type": "self", "text": "hi",
+        "session_id": _SESSION, "task_id": _TASK, "action": "remind", "target_type": "self", "text": "hi",
     }))
 
     assert result["ok"] is False
@@ -508,12 +600,14 @@ def test_self_send_needs_the_allowlist_not_just_the_friends_switch(
         allowed_private_users=frozenset(),
         allow_private_friends=True,
     )
+    _supervisor_knows(runtime, monkeypatch, _MEMBER_QQ)
 
     result = asyncio.run(runtime.forward_bridge._forward_bridge_execute({
-        "session_id": _SESSION, "action": "remind", "target_type": "self", "text": "hi",
+        "session_id": _SESSION, "task_id": _TASK, "action": "remind", "target_type": "self", "text": "hi",
     }))
 
     assert result["ok"] is False
+    assert "允许列表" in result["error"]
     assert bot.sends == 0
 
 
@@ -560,11 +654,14 @@ def test_a_member_is_not_shown_which_contacts_matched(monkeypatch: pytest.Monkey
     set_live_config(runtime, admin_users=frozenset({_ADMIN_QQ}))
     monkeypatch.setitem(
         runtime.state._adapter.session_targets, _SESSION,
-        {"type": "group", "group_id": _HOME_GROUP, "user_id": _MEMBER_QQ},
+        {"type": "group", "group_id": _HOME_GROUP},
     )
     _two_contacts_named(runtime, monkeypatch)
+    requester = capability.Requester(user_id=str(_MEMBER_QQ), listed_admin=False, group_id=str(_HOME_GROUP))
 
-    target, err = asyncio.run(runtime.forward_bridge._forward_bridge_resolve_target(bot, _SESSION, "private", "老板"))
+    target, err = asyncio.run(runtime.forward_bridge._forward_bridge_resolve_target(
+        bot, _SESSION, "private", "老板", requester=requester,
+    ))
 
     assert target is None
     assert "张总" not in err and "李总" not in err
@@ -580,8 +677,11 @@ def test_the_roster_still_sees_the_collision(monkeypatch: pytest.MonkeyPatch, tm
         {"type": "private", "user_id": _ADMIN_QQ},
     )
     _two_contacts_named(runtime, monkeypatch)
+    requester = capability.Requester(user_id=str(_ADMIN_QQ), listed_admin=True)
 
-    target, err = asyncio.run(runtime.forward_bridge._forward_bridge_resolve_target(bot, _SESSION, "private", "老板"))
+    target, err = asyncio.run(runtime.forward_bridge._forward_bridge_resolve_target(
+        bot, _SESSION, "private", "老板", requester=requester,
+    ))
 
     assert target is None
     assert "不唯一" in err

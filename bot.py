@@ -16,19 +16,37 @@ _REPO_ROOT = Path(__file__).resolve().parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-# nonebot 的 .env 只进它自己的 Config 对象，而 adapters.onebot.config 在 import 期读 os.environ，
-# 不先灌进来白名单会静默为空。cwd 优先：多实例共用一份代码，端口与工作区只能靠各自那份
-# .env 区分；找不到才回落代码目录，单实例照旧。
-_LOCAL_ENV = Path.cwd() / ".env"
-load_dotenv(_LOCAL_ENV if _LOCAL_ENV.is_file() else _REPO_ROOT / ".env")
+
+def _load_instance_env() -> None:
+    """灌本实例工作区的 .env，进程环境里已有的不覆盖。
+
+    nonebot 的 .env 只进它自己的 Config 对象，而 adapters.onebot.config 在 import 期读 os.environ，
+    不先灌进来白名单会静默为空。env 没指定工作区时先灌 cwd 下那份、没有再灌本文件旁边那份，工作区从里面认；
+    指定了就只认那个工作区自己的 .env，缺了也不借代码目录那份：多开时那是主实例的端口和令牌。
+    """
+    import clonoth_runtime
+    from workspace import resolve_workspace_root, workspace_env_root
+
+    seeded = False
+    if workspace_env_root() is None:
+        local = Path.cwd() / ".env"
+        candidate = local if local.is_file() else _REPO_ROOT / ".env"
+        if candidate.is_file():
+            load_dotenv(candidate)
+            seeded = True
+    root = resolve_workspace_root(_REPO_ROOT)
+    if clonoth_runtime.load_workspace_env(root) is None and not seeded:
+        logging.getLogger(__name__).warning("[qq] %s 下没有 .env：端口、令牌这些实例身份只剩进程环境里那些", root)
+
+
+_load_instance_env()
 
 import nonebot
 from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 
 # supervisor 冷启动约需半分钟，留足余量；等不到也照常起，卡死更难查。
 _SUPERVISOR_WAIT_SEC = 180.0
-# 与 adapters/onebot/config.py 认同一组变量名。这里不 import 那个模块：本文件会被单独
-# 复制出去做入口冒烟，import 期要求整个仓库在位就跑不起来。
+# 与 adapters/onebot/config.py 认同一组变量名。
 _SUPERVISOR_URL = (
     os.environ.get("CLONOTH_BASE_URL")
     or os.environ.get("CLONOTH_SUPERVISOR_URL")
@@ -84,8 +102,7 @@ def _ensure_config_layout() -> None:
 
 
 def main() -> None:
-    # 延迟到这里再取：本文件会被单独复制出去做入口冒烟，import 期要求整个仓库在位
-    # 就跑不起来。
+    # 用到时才取：入口冒烟是加载完本文件之后才换掉 wait_supervisor 的。
     from clonoth_runtime import SECRET_FROM_CONFIG, platform_secret, wait_supervisor
     from platforms.builtin import QQ_NAPCAT
     from workspace import resolve_workspace_root

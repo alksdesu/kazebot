@@ -111,8 +111,13 @@ def _real_conversation_key(conversation_key: str) -> str:
 
 
 def _serializable_target(target: Dict[str, Any]) -> Dict[str, Any]:
-    """提取可持久化的 QQ 回复目标，避免把 Bot/Event 对象写进状态文件。"""
-    allowed = {"type", "group_id", "user_id", "conversation_key"}
+    """提取可持久化的 QQ 回复目标，避免把 Bot/Event 对象写进状态文件。
+
+    只有私聊目标留 user_id：群目标上的号只是某一次触发的人，留着就会被后来的请求当成发起人。
+    """
+    allowed = {"type", "group_id", "conversation_key"}
+    if target.get("type") == "private":
+        allowed.add("user_id")
     return {key: target[key] for key in allowed if key in target and target[key] is not None}
 
 

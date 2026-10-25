@@ -196,6 +196,12 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         env=("ONEBOT_QQ_MESSAGE_LIMIT",),
         ui=number("单条消息", step=100, unit="字"),
     ),
+    LiveKey(
+        "max_reply_parts", "output.max_reply_parts", int_in(min_value=0, max_value=50), 8,
+        env=("ONEBOT_MAX_REPLY_PARTS",),
+        note="0 = 不限。任何能触发 bot 的人都能让模型把一段话拆成几十条刷屏，多出来的并进最后一条",
+        ui=number("一次最多", unit="条"),
+    ),
     adopt("history_text_limit", env=("ONEBOT_HISTORY_TEXT_LIMIT",)),
     LiveKey(
         "face_prompt_limit", "output.face_prompt_limit", int_in(min_value=0, max_value=200), 50,

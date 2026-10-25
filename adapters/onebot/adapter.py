@@ -15,6 +15,7 @@ from adapters._shared.aliases import AliasBook
 from adapters._shared.approvals import ApprovalBook
 from adapters._shared.conversation_queue import ConversationQueue
 from adapters._shared.history_window import ClearBarriers, HistoryWindows
+from adapters._shared.recent_keys import RecentKeys
 from adapters._shared.sticker_delivery import ConversationLocks
 from adapters._shared.trigger_policy import CooldownState, TriggerDecision
 from adapters._shared.user_profiles import ProfileFile
@@ -54,6 +55,13 @@ if TYPE_CHECKING:
     )
 
 CONVERSATION_BUCKET_MAX_KEYS = 512
+
+# 重连补发通常在几分钟内；窗口过后同号的消息当新消息，不会因消息号复用被误吞。
+DELIVERY_DEDUPE_WINDOW_SEC = 600.0
+DELIVERY_DEDUPE_MAX_ITEMS = 4096
+# 同一个群文件的消息和上传通知前后脚到，窗口只需盖住这段间隔。
+GROUP_FILE_DEDUPE_WINDOW_SEC = 120.0
+GROUP_FILE_DEDUPE_MAX_ITEMS = 512
 
 
 class BucketMap(OrderedDict):
@@ -182,6 +190,14 @@ class OneBotAdapter:
         self.trigger_cooldown = CooldownState()
         self.trigger_decisions: "OrderedDict[tuple[str, ...], TriggerDecision]" = OrderedDict()
         self.auto_like_today: Dict[int, str] = {}
+        # (账号, 会话, message_id)：OneBot 重连补发的同一条消息只处理一次。
+        self.delivered_messages: RecentKeys[tuple[str, str, str]] = RecentKeys(
+            window_sec=DELIVERY_DEDUPE_WINDOW_SEC, max_items=DELIVERY_DEDUPE_MAX_ITEMS,
+        )
+        # (群号, file_id)：同一个群文件可能既随消息、又随上传通知各报一次，看 NapCat 版本。
+        self.recent_group_files: RecentKeys[tuple[str, str]] = RecentKeys(
+            window_sec=GROUP_FILE_DEDUPE_WINDOW_SEC, max_items=GROUP_FILE_DEDUPE_MAX_ITEMS,
+        )
 
         # ---- 引用与消息文本缓存 ----
         self.reply_message_cache: Dict[str, Dict[str, Any]] = {}

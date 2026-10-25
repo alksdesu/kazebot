@@ -19,7 +19,9 @@ _HARNESS = textwrap.dedent(
     """
     import importlib.util, json, os, sys, types
 
-    entry, dumped = sys.argv[1], sys.argv[2]
+    entry, repo, dumped = sys.argv[1], sys.argv[2], sys.argv[3]
+    # 灌 .env 用的是仓库里的 clonoth_runtime，复制出去的入口旁边没有它。
+    sys.path.insert(0, repo)
 
     nonebot = types.ModuleType("nonebot")
     nonebot.init = nonebot.run = lambda *a, **k: None
@@ -72,7 +74,7 @@ def _run(
     # 在中文 Windows 上撞见编不出的字符就整条流报 UnicodeDecodeError。
     env["PYTHONIOENCODING"] = "utf-8"
     done = subprocess.run(
-        [sys.executable, str(harness), str(home / "bot.py"), str(dumped)],
+        [sys.executable, str(harness), str(home / "bot.py"), str(REPO_ROOT), str(dumped)],
         cwd=str(cwd), env=env, capture_output=True, text=True,
         encoding="utf-8", timeout=120,
     )

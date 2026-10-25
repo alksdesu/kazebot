@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import logging
-import asyncio
-import contextlib
 import hashlib
 import json
 import re
@@ -16,6 +14,7 @@ import config_layout
 from ..config import CLONOTH_WORKSPACE
 from adapters._shared import capability
 from ..live_config import live
+from .. import local_source
 from adapters._shared.send_guard import IdempotencyClaim, OutboundSendContext
 from ..send_contract import make_idempotency_key, protected_claim_send
 
@@ -318,10 +317,14 @@ async def _proactive_target_list_text(bot: Bot, target_type: str = "") -> str:
     return "\n\n".join(sections) + "\n\n提示：目标列表不展示真实 QQ 号；普通模型上下文也不会接触这些真实 id。"
 
 
-def _target_to_send_dict(target: models.ProactiveTarget) -> Dict[str, Any]:
+def _target_to_send_dict(target: models.ProactiveTarget, *, mention_everyone: bool = False) -> Dict[str, Any]:
+    """mention_everyone 只在发起人是名单管理员时给：不给的话消息里的 @全体成员 会降成文字。"""
     if target.target_type == "private":
         return {"type": "private", "user_id": target.target_id}
-    return {"type": "group", "group_id": target.target_id}
+    send_target: Dict[str, Any] = {"type": "group", "group_id": target.target_id}
+    if mention_everyone:
+        send_target[sending.MENTION_EVERYONE_FLAG] = True
+    return send_target
 
 
 def _workspace_file(raw_path: str) -> tuple[Path, str] | None:
@@ -330,13 +333,8 @@ def _workspace_file(raw_path: str) -> tuple[Path, str] | None:
     raw = str(raw_path or "").strip()
     if not raw:
         return None
-    if raw.startswith("file://"):
-        raw = raw[7:]
-    path = Path(raw)
-    if not path.is_absolute():
-        path = Path(CLONOTH_WORKSPACE) / path
     try:
-        resolved = path.resolve()
+        resolved = local_source.workspace_path(raw, CLONOTH_WORKSPACE).resolve()
     except Exception:
         return None
     logical = config_layout.workspace_logical_path(Path(CLONOTH_WORKSPACE), resolved)
@@ -425,10 +423,7 @@ async def _forward_messages_to_nodes(bot: Bot, messages: list[dict[str, Any]], c
 
 
 async def _forward_nodes_from_reply(bot: Bot, event: Event, conversation_key: str) -> list[dict[str, Any]]:
-    reply_message_id = message_text._extract_reply_message_id(
-        event.get_message() if hasattr(event, "get_message") else None,
-        getattr(event, "raw_message", None),
-    )
+    reply_message_id = message_text._event_reply_message_id(event)
     reply = await message_text._resolve_reply_payload(bot, event, reply_message_id)
     if not reply:
         cached_nodes = media._forward_nodes_from_cached_reply(bot, reply_message_id)
@@ -436,7 +431,7 @@ async def _forward_nodes_from_reply(bot: Bot, event: Event, conversation_key: st
             return cached_nodes
         common.logger.info("forward reply skipped: no reply object/id=%s", reply_message_id)
         return []
-    message = reply.get("message") if reply.get("message") is not None else reply.get("raw_message")
+    message = message_text._payload_message(reply)
     sources = message_text._extract_forward_sources(message)
     if sources:
         nodes: list[dict[str, Any]] = []
@@ -501,18 +496,18 @@ async def _send_forward_nodes(
         )
     if not claim.acquired:
         return
-    heartbeat = asyncio.create_task(sending._heartbeat_idempotency_claim(claim))
-    try:
-        async def send_forward() -> Any:
-            await state._adapter.features.check_send(bot, target_dict)
-            if target.target_type == "group":
-                return await bot.call_api(
-                    "send_group_forward_msg", group_id=int(target.target_id), messages=nodes,
-                )
-            return await bot.call_api(
-                "send_private_forward_msg", user_id=int(target.target_id), messages=nodes,
-            )
 
+    async def send_forward() -> Any:
+        await state._adapter.features.check_send(bot, target_dict)
+        if target.target_type == "group":
+            return await bot.call_api(
+                "send_group_forward_msg", group_id=int(target.target_id), messages=nodes,
+            )
+        return await bot.call_api(
+            "send_private_forward_msg", user_id=int(target.target_id), messages=nodes,
+        )
+
+    async with sending._claim_heartbeat(claim):
         result = await protected_claim_send(
             state._adapter.outbound_idempotency,
             claim,
@@ -520,15 +515,11 @@ async def _send_forward_nodes(
             sent_ttl=sending._sent_ttl_for_context(context),
             message_id_getter=sending._extract_sent_message_id,
         )
-        if image_attachments:
-            message_id = sending._extract_sent_message_id(result)
-            if message_id:
-                # 合并转发只返回卡片一个 message_id，整批图都挂在卡片上
-                outbound_attachments._remember_message_attachments(message_id, list(image_attachments))
-    finally:
-        heartbeat.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat
+    if image_attachments:
+        message_id = sending._extract_sent_message_id(result)
+        if message_id:
+            # 合并转发只返回卡片一个 message_id，整批图都挂在卡片上
+            outbound_attachments._remember_message_attachments(message_id, list(image_attachments))
 
 
 def _filter_attachments_by_kind(
@@ -593,7 +584,7 @@ async def _maybe_handle_proactive_command(
     scope_denied = _target_scope_denied("proactive", requester, target)
     if scope_denied:
         return scope_denied
-    send_target = _target_to_send_dict(target)
+    send_target = _target_to_send_dict(target, mention_everyone=requester.listed_admin)
     label = _target_display_label(target.target_type, target.label)
     request_id = str(getattr(event, "message_id", "") or uuid.uuid4().hex)
     send_context = _request_send_context(

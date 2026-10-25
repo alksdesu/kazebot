@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Iterator, Mapping
 
+import httpx
 import pytest
 
 from _fake_platform import (
@@ -30,7 +31,7 @@ from _fake_platform import (
 from _onebot_harness import live_config_module, load_runtime, set_live_config
 from adapters._shared.aliases import AliasBook
 from clonoth_sdk.state import SessionState
-from clonoth_sdk.types import InboundResult
+from clonoth_sdk.types import APPROVAL_ALLOWED, APPROVAL_DENIED, ApprovalDecision, InboundResult
 from platforms.builtin import QQ_NAPCAT
 from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE, PlatformDescriptor
 from platforms.registry import register_platform, unregister_platform
@@ -72,6 +73,21 @@ class FakeClonoth:
     async def approve(self, approval_id: str, *, decision: str, comment: str | None = None) -> bool:
         self.decisions.append({"approval_id": approval_id, "decision": decision, "comment": comment})
         return self.approve_result
+
+    async def decide_approval(
+        self, approval_id: str, *, decision: str, comment: str | None = None,
+    ) -> ApprovalDecision:
+        """带回执的那条提交路径：提交被拒和 approve 返回 False 一样，是一次 HTTP 错误。"""
+        self.decisions.append({"approval_id": approval_id, "decision": decision, "comment": comment})
+        if not self.approve_result:
+            url = f"http://clonoth.test/v1/approvals/{approval_id}"
+            raise httpx.HTTPStatusError(
+                "approval submission rejected",
+                request=httpx.Request("POST", url),
+                response=httpx.Response(503, request=httpx.Request("POST", url)),
+            )
+        status = APPROVAL_ALLOWED if decision == "allow" else APPROVAL_DENIED
+        return ApprovalDecision(approval_id=approval_id, decision=decision, status=status)
 
     async def request_feature(
         self, method: str, path: str, *, actor: Any = None, body: Any = None, params: Any = None, **kwargs: Any,

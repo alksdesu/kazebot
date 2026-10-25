@@ -143,6 +143,12 @@ def limit_parts(parts: Sequence[str], max_parts: int, *, joiner: str = "\n") -> 
     return [*kept[:max_parts - 1], joiner.join(part.strip() for part in kept[max_parts - 1:])]
 
 
+def strictest_limit(*limits: int) -> int:
+    """几处都给了数量上限时取最严的那个；0 表示那一处不限。"""
+    bounded = [limit for limit in limits if limit > 0]
+    return min(bounded) if bounded else 0
+
+
 @dataclass(frozen=True)
 class Rendered:
     """驱动渲染出来的一小段平台文本。"""

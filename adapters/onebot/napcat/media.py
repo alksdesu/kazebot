@@ -5,6 +5,7 @@ import logging
 import asyncio
 import base64
 import binascii
+import contextlib
 import os
 import re
 import time
@@ -25,6 +26,7 @@ from ..config import (
     RECENT_IMAGE_MAX_AGE_SECONDS,
 )
 from ..live_config import live
+from .. import local_source
 from ..attachment_policy import (
     inbound_file_reject_reason,
     looks_like_file_query,
@@ -47,15 +49,35 @@ _IMAGE_EXT_BY_MIME = MappingProxyType({
 })
 
 
+# QQ 临时链接过期时文件服务回的状态码；别的状态码说明不了过期。
+_EXPIRED_LINK_STATUSES = frozenset({"403", "404", "410"})
+
+
 def _attachment_error_text(error: str) -> str:
+    """图片的错误码转成给用户和模型看的说明；错误码和文件共用 _file_read_error 那一套。"""
     if error == "too_large":
         return f"图片太大，已超过当前限制 {live.image_max_bytes // 1024 // 1024}MB。"
-    if error == "download_failed":
-        return "我收到了图片，但下载失败了，可能是 QQ 临时链接已过期。"
     if error == "unsupported_mime":
         return "我收到了图片，但它不是我能识别的图片格式（只支持 PNG/JPEG/GIF/WEBP/BMP）。"
     if error == "local_denied":
         return "我收到了图片，但它指向 Clonoth 工作区之外的本机路径，已拒绝读取（如为同机部署，请把该目录加入 ONEBOT_LOCAL_SOURCE_ROOTS）。"
+    if error == "local_unavailable":
+        return "我收到了图片，但 NapCat 给的本地路径在机器人进程里访问不到，请检查容器文件挂载。"
+    if error == "download_timeout":
+        return "我收到了图片，但下载超时了，请稍后重发。"
+    if error.startswith("http_") and error[5:].isdigit():
+        status = error[5:]
+        if status in _EXPIRED_LINK_STATUSES:
+            return f"我收到了图片，但下载失败（HTTP {status}），可能是 QQ 临时链接已过期。"
+        return f"我收到了图片，但下载失败，图片服务返回 HTTP {status}。"
+    if error == "invalid_source":
+        return "我收到了图片，但 OneBot 没给出可下载的地址。"
+    if error == "invalid_content":
+        return "我收到了图片，但图片数据格式无效，无法解码。"
+    if error == "storage_failed":
+        return "我收到了图片，但保存时失败了，请检查机器人的目录权限和磁盘空间。"
+    if error == "download_failed":
+        return "我收到了图片，但下载失败了，请稍后重发；具体原因已记录日志。"
     return "我收到了图片，但处理图片时失败了。"
 
 
@@ -115,7 +137,7 @@ def _remember_recent_images(conversation_key: str, event: Event, attachments: Li
     # sender_key 用于"同一发送者"判定（匿名成员之间不互相命中）；sender_qq 会被当真实 QQ 号
     # 塞进转发 node，占位号发不出去，匿名时留空。
     sender_key = identity._event_sender_key(event)
-    sender_qq = "" if identity._anonymous_identity(event) else str(getattr(event, "user_id", "") or "")
+    sender_qq = identity._verified_sender_id(event)
     message_id = str(getattr(event, "message_id", "") or "")
     now = time.time()
     q = state._adapter.recent_images[conversation_key]
@@ -279,10 +301,7 @@ async def _merge_recent_attachments_after_text(
     user_text: str,
     attachments: List[Dict[str, Any]],
 ) -> None:
-    reply_message_id = message_text._extract_reply_message_id(
-        event.get_message() if hasattr(event, "get_message") else None,
-        getattr(event, "raw_message", None),
-    )
+    reply_message_id = message_text._event_reply_message_id(event)
     # A reply must stay on its explicit message chain. _build_reply_context will
     # recover an image directly from the quoted message or from the Bot reply's
     # persisted source-image binding. Falling back to an unrelated recent image
@@ -339,6 +358,14 @@ def _safe_attachment_name(name: str, default: str = "attachment") -> str:
     return raw[:120]
 
 
+def _source_basename(source: str) -> str:
+    if _file_source_kind(source) == "local":
+        return local_source.source_path(source).name
+    if source.lower().startswith(("http://", "https://")):
+        return Path(unquote(urlsplit(source).path)).name
+    return Path(source).name
+
+
 def _segment_file_source(data: Mapping[str, Any]) -> Dict[str, Any] | None:
     """保留下载来源和文件 ID，文件名不作为网络地址。"""
     file_id = str(data.get("file_id") or data.get("id") or "").strip()
@@ -354,7 +381,7 @@ def _segment_file_source(data: Mapping[str, Any]) -> Dict[str, Any] | None:
         name = file_value
     name_inferred = not name and bool(src)
     if not name and src:
-        name = Path(unquote(urlsplit(src).path) if src.lower().startswith(("http://", "https://", "file://")) else src).name
+        name = _source_basename(src)
     if not src and not name and not file_id:
         return None
     return {"source": src, "sources": candidates, "file_id": file_id, "name_inferred": name_inferred,
@@ -375,7 +402,7 @@ def _file_size(data: Mapping[str, Any]) -> int:
 def _file_source_kind(source: str) -> str:
     if source.startswith("base64://"):
         return "base64"
-    if source.startswith("file://") or source.startswith("/") or re.match(r"^[a-zA-Z]:[\\/]", source):
+    if local_source.is_local_source(source):
         return "local"
     try:
         url = urlsplit(source)
@@ -432,33 +459,6 @@ def _file_attachment_error_text(error: str) -> str:
     return "我收到了文件，但处理文件时失败了。"
 
 
-def _local_source_path(source: str) -> Path | None:
-    """把 file:// / 本地绝对路径解析成允许读取的真实文件；越界或不存在返回 None。
-
-    事件里的 path 字段由 OneBot 实现决定，只允许工作区与显式配置的 ONEBOT_LOCAL_SOURCE_ROOTS，
-    否则等于按对端内容读本机任意文件。
-    """
-    raw = source[7:] if source.startswith("file://") else source
-    try:
-        resolved = Path(raw).resolve()
-    except Exception:
-        return None
-    if not resolved.is_file():
-        return None
-    for root in (CLONOTH_WORKSPACE, *LOCAL_SOURCE_ROOTS):
-        try:
-            if resolved.is_relative_to(Path(root).resolve()):
-                return resolved
-        except Exception:
-            continue
-    common.logger.warning(
-        "collect QQ attachment refused local path outside workspace: %s "
-        "(set ONEBOT_LOCAL_SOURCE_ROOTS to allow this directory)",
-        resolved,
-    )
-    return None
-
-
 async def _read_remote_bytes(client: httpx.AsyncClient, url: str, *, max_bytes: int) -> tuple[bytes, str]:
     """流式读取远端附件，超过 max_bytes 立刻断流并抛 ValueError("too_large")。"""
     content = bytearray()
@@ -479,47 +479,38 @@ async def _read_remote_bytes(client: httpx.AsyncClient, url: str, *, max_bytes: 
     return bytes(content), content_type
 
 
-async def _read_file_source_bytes(client: httpx.AsyncClient, source: str) -> tuple[bytes, str]:
-    """读取 QQ 文件来源；支持 URL、file:// 和本地路径，并限制最大字节数。"""
+async def _read_source_bytes(client: httpx.AsyncClient, source: str, *, max_bytes: int) -> tuple[bytes, str]:
+    """读一个入站来源（HTTP(S)、file://、本机路径或 base64），超过 max_bytes 抛 too_large。图片和文件共用。"""
     kind = _file_source_kind(source)
     if kind == "base64":
         encoded = source[len("base64://"):]
-        if len(encoded) > 4 * ((live.file_max_bytes + 2) // 3):
+        if len(encoded) > 4 * ((max_bytes + 2) // 3):
             raise ValueError("too_large")
         try:
             content = base64.b64decode(encoded, validate=True)
         except (binascii.Error, ValueError) as exc:
             raise ValueError("invalid_content") from exc
-        if len(content) > live.file_max_bytes:
+        if len(content) > max_bytes:
             raise ValueError("too_large")
         return content, "application/octet-stream"
     if kind == "local":
-        if source.startswith("file://"):
-            raw = source[len("file://"):]
-            if re.match(r"^[a-zA-Z]:[\\/]", raw):
-                source = unquote(raw)
-            else:
-                parsed = urlsplit(source)
-                if parsed.netloc not in {"", "localhost"}:
-                    raise ValueError("local_denied")
-                source = unquote(parsed.path)
-                if os.name == "nt" and re.match(r"^/[a-zA-Z]:/", source):
-                    source = source[1:]
-        local = _local_source_path(source)
-        if local is None:
-            if not Path(source).is_file():
-                raise ValueError("local_unavailable")
-            raise ValueError("local_denied")
-        if local.stat().st_size > live.file_max_bytes:
-            raise ValueError("too_large")
-        with local.open("rb") as stream:
-            content = stream.read(live.file_max_bytes + 1)
-        if len(content) > live.file_max_bytes:
-            raise ValueError("too_large")
+        content = await asyncio.to_thread(
+            local_source.read_inbound_source, source, roots=(CLONOTH_WORKSPACE, *LOCAL_SOURCE_ROOTS), max_bytes=max_bytes,
+        )
         return content, "application/octet-stream"
     if kind != "remote":
         raise ValueError("invalid_source")
-    return await _read_remote_bytes(client, source, max_bytes=live.file_max_bytes)
+    return await _read_remote_bytes(client, source, max_bytes=max_bytes)
+
+
+def _write_attachment(path: Path, content: bytes) -> None:
+    """写一半失败就删掉，不留半截文件被当成附件。"""
+    try:
+        path.write_bytes(content)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        raise
 
 
 def _file_read_error(exc: Exception) -> str:
@@ -583,7 +574,7 @@ async def _file_content(
                 read_errors.append("invalid_source")
                 continue
             try:
-                content, mime_type = await _read_file_source_bytes(client, source)
+                content, mime_type = await _read_source_bytes(client, source, max_bytes=live.file_max_bytes)
                 if len(content) > live.file_max_bytes:
                     raise ValueError("too_large")
                 if expected_size and len(content) != expected_size:
@@ -656,12 +647,10 @@ async def _file_sources_to_attachments(
 
     async with httpx.AsyncClient(timeout=IMAGE_DOWNLOAD_TIMEOUT, follow_redirects=True) as client:
         for item in file_sources[:live.max_files_per_turn]:
-            file_path: Path | None = None
             try:
                 content, content_type, name = await _file_content(client, item, bot=bot, group_id=group_id)
-                target_name = f"{os.urandom(8).hex()}_{name}"
-                file_path = att_dir / target_name
-                file_path.write_bytes(content)
+                file_path = att_dir / f"{os.urandom(8).hex()}_{name}"
+                _write_attachment(file_path, content)
                 rel_path = file_path.relative_to(workspace).as_posix()
                 result.append({
                     "type": "file",
@@ -674,11 +663,6 @@ async def _file_sources_to_attachments(
                 errors.append(_file_attachment_error_text(str(exc) or "download_failed"))
             except Exception as exc:
                 logger.warning("QQ file attachment failed: error_type=%s", type(exc).__name__)
-                if file_path is not None:
-                    try:
-                        file_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
                 errors.append(_file_attachment_error_text(_file_read_error(exc)))
     return result, errors
 
@@ -699,37 +683,23 @@ async def _image_sources_to_attachments(
         att_dir.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
         common.logger.warning("collect QQ attachments cannot create directory %s: %s", att_dir, exc)
-        return result, [_attachment_error_text("download_failed")]
+        return result, [_attachment_error_text("storage_failed")]
 
     async with httpx.AsyncClient(timeout=IMAGE_DOWNLOAD_TIMEOUT, follow_redirects=True) as client:
         for image in image_sources[:live.max_images_per_turn]:
+            source = image.url.strip()
+            if not source:
+                continue
             try:
-                source = image.url.strip()
-                if not source:
-                    continue
-                if source.startswith("file://") or re.match(r"^[a-zA-Z]:[\\/]", source) or source.startswith("/"):
-                    local = _local_source_path(source)
-                    if local is None:
-                        errors.append(_attachment_error_text("local_denied"))
-                        continue
-                    if local.stat().st_size > live.image_max_bytes:
-                        raise ValueError("too_large")
-                    content = local.read_bytes()
-                else:
-                    content, _content_type = await _read_remote_bytes(client, source, max_bytes=live.image_max_bytes)
+                content, _content_type = await _read_source_bytes(client, source, max_bytes=live.image_max_bytes)
                 if not content:
-                    common.logger.warning("collect QQ image attachment skipped empty response: %s", source)
-                    errors.append(_attachment_error_text("download_failed"))
-                    continue
+                    raise ValueError("download_failed")
                 mime_type = sniff_image_mime(content)
                 if not mime_type:
-                    common.logger.warning("collect QQ image attachment unsupported header: url=%s", source)
-                    errors.append(_attachment_error_text("unsupported_mime"))
-                    continue
+                    raise ValueError("unsupported_mime")
                 ext = _IMAGE_EXT_BY_MIME[mime_type]
-                filename = f"{os.urandom(16).hex()}{ext}"
-                file_path = att_dir / filename
-                file_path.write_bytes(content)
+                file_path = att_dir / f"{os.urandom(16).hex()}{ext}"
+                _write_attachment(file_path, content)
                 rel_path = file_path.relative_to(workspace).as_posix()
                 result.append({
                     "type": "image",
@@ -739,11 +709,11 @@ async def _image_sources_to_attachments(
                     "source": "onebot",
                     "sticker": image.sticker,
                 })
-            except ValueError as exc:
-                errors.append(_attachment_error_text(str(exc) or "download_failed"))
             except Exception as exc:
-                common.logger.warning("collect QQ image attachment failed: url=%s error=%s", image.url, exc)
-                errors.append(_attachment_error_text("download_failed"))
+                code = _file_read_error(exc)
+                logger.warning("QQ image read failed: source_type=%s reason=%s error_type=%s",
+                               _file_source_kind(source), code, type(exc).__name__)
+                errors.append(_attachment_error_text(code))
     return result, errors
 
 
@@ -842,15 +812,25 @@ async def _collect_message_media(
     return _scan_top_level_media(message)
 
 
+def _first_group_file(group_id: Any, source: Mapping[str, Any] | None) -> bool:
+    """这个群文件是不是刚才没处理过：消息里的 file 段和上传通知谁先到谁处理。没有 file_id 的认不出，当第一次。"""
+    file_id = str((source or {}).get("file_id") or "").strip()
+    if group_id is None or not file_id:
+        return True
+    return state._adapter.recent_group_files.first((str(group_id), file_id))
+
+
 async def _collect_qq_attachments(
     bot: Bot, event, conversation_key: str, *, expand_forward: bool = True,
 ) -> tuple[list[dict], list[str]]:
     """下载 QQ 当前消息中的图片/普通文件，并返回 Clonoth 附件列表。引用消息由增强 reply 逻辑单独处理。"""
     message = event.get_message() if hasattr(event, "get_message") else None
     image_sources, file_sources = await _collect_message_media(bot, message, expand_forward=expand_forward)
+    group_id = getattr(event, "group_id", None)
+    file_sources = [source for source in file_sources if _first_group_file(group_id, source)]
     image_attachments, image_errors = await _image_sources_to_attachments(image_sources, conversation_key)
     file_attachments, file_errors = await _file_sources_to_attachments(
-        file_sources, conversation_key, bot=bot, group_id=getattr(event, "group_id", None),
+        file_sources, conversation_key, bot=bot, group_id=group_id,
     )
     return image_attachments + file_attachments, image_errors + file_errors
 
@@ -868,22 +848,14 @@ def _attachment_abs_path(attachment: Dict[str, Any]) -> Path | None:
 
 async def _collect_reply_image_attachments(bot: Bot, event: Event, conversation_key: str) -> tuple[list[dict], list[str]]:
     """为“收藏表情”命令补充引用消息中的图片。"""
-    reply_message_id = message_text._extract_reply_message_id(
-        event.get_message() if hasattr(event, "get_message") else None,
-        getattr(event, "raw_message", None),
-    )
+    reply_message_id = message_text._event_reply_message_id(event)
     if reply_message_id is None:
         return [], []
     reply_obj = await message_text._get_reply_message(bot, reply_message_id)
     if not reply_obj:
         return [], []
-    image_sources: list[models.ImageSource] = []
-    for key in ("message", "raw_message"):
-        value = reply_obj.get(key)
-        if value:
-            image_sources.extend(_iter_qq_image_sources(value))
     # 去重，避免同一引用图被重复下载。
-    image_sources = list(dict.fromkeys(image_sources))
+    image_sources = list(dict.fromkeys(_iter_qq_image_sources(message_text._payload_message(reply_obj))))
     return await _image_sources_to_attachments(image_sources, conversation_key)
 
 

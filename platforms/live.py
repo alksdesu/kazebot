@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+import config_layout
+
 from .descriptor import STATE_LIVE, PlatformDescriptor
 from .registry import platform_state_path
 
@@ -65,13 +67,19 @@ def write_live_state(path: Path, payload: Mapping[str, Any]) -> None:
         raise
 
 
-def file_fingerprint(path: Path) -> dict[str, Any]:
-    """配置文件的版本指纹。CONFIG_FILE、CONFIG_LOADED 都是这个形状，核心拿它比「生效值是不是出自当前文件」。"""
-    try:
-        stat = Path(path).stat()
-    except OSError:
+def stamp_fingerprint(stamp: tuple[int, int, int] | None) -> dict[str, Any]:
+    """config_layout.file_stamp 的结果换成 CONFIG_FILE、CONFIG_LOADED 的形状。
+
+    这个形状是 bot 和核心之间的协议，两边按字典相等比，加键得两边一起改。
+    """
+    if stamp is None:
         return {"exists": False, "mtime_ns": 0, "size": 0}
-    return {"exists": True, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+    return {"exists": True, "mtime_ns": stamp[0], "size": stamp[1]}
+
+
+def file_fingerprint(path: Path) -> dict[str, Any]:
+    """配置文件的版本指纹，核心拿它比「生效值是不是出自当前文件」。"""
+    return stamp_fingerprint(config_layout.file_stamp(Path(path)))
 
 
 def same_file(reported: Any, path: Path) -> bool:

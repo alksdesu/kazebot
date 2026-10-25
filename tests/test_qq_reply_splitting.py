@@ -119,15 +119,16 @@ def test_every_inbound_teaches_splitting_once_outside_the_text(runtime: Any, ent
 
     async def build() -> str:
         if entry.startswith("draw_"):
-            return await runtime.inbound._build_draw_direct_inbound_text(event, "画一片云", kind == "private")
-        if kind == "group":
-            text, _ = await runtime.inbound._build_inbound_text(
+            built = await runtime.inbound._build_draw_direct_inbound_text(event, "画一片云", kind == "private")
+        elif kind == "group":
+            built = await runtime.inbound._build_inbound_text(
                 event, SplitBot(), "在吗", target["conversation_key"], [],
             )
-            return text
-        return await runtime.inbound._build_private_inbound_text(
-            event, SplitBot(), "在吗", target["conversation_key"], [],
-        )
+        else:
+            built = await runtime.inbound._build_private_inbound_text(
+                event, SplitBot(), "在吗", target["conversation_key"], [],
+            )
+        return built.text
 
     text = asyncio.run(build())
     guide = runtime.output_guide._turn_output_guide(
@@ -149,6 +150,7 @@ def test_qq_split_guidance_keeps_its_wording(runtime: Any) -> None:
         f"用 {marker} 分隔直接发给用户的回复正文（包括 finish.text、reply.text）；平台会分条发送，标记不会显示。\n"
         f"例如“收到{marker}我看看”会发成两条。按语气和信息量决定，通常一条就够，"
         "确需分条时以 2–3 条为宜，不要逐句刷屏。\n"
+        f"最多 {runtime.state.live.max_reply_parts} 条，多出来的会并进最后一条。\n"
         "代码、列表、引用等需要连续阅读的内容不要拆散，保留普通换行。\n"
         f"当前任务要求简短接话或只回一句时，只发一条，不使用 {marker}。"
     )

@@ -17,6 +17,7 @@ from ..attachment_policy import source_attachments_from_merged
 from ..segments import at_segment_user_ids
 from clonoth_sdk import TriggerInfo
 from platforms.descriptor import CHANNEL_GROUP, CHANNEL_PRIVATE
+from platforms.ids import same_id
 from platforms.inbound import InboundFacts
 
 from . import anonymize, common, history, identity, inbound, models, output_guide, permissions, routing, sending, state
@@ -54,14 +55,12 @@ async def _try_preempt_running_task(
 
     def trigger_of(task: Any) -> TriggerInfo | None:
         source_seq = task.source_inbound_seq or 0
-        trigger = state._adapter.session_state.get_trigger(source_seq) if source_seq else None
-        if not trigger:
-            found = state._adapter.session_state.find_trigger_by_session(existing_sid)
-            trigger = found[1] if found else None
-        return trigger
+        return state._adapter.session_state.get_trigger(source_seq) if source_seq else None
 
     def same_sender(trigger: TriggerInfo) -> bool:
-        return getattr(trigger.platform_data.get("event"), "user_id", None) == getattr(event, "user_id", None)
+        return same_id(
+            identity._verified_sender_id(trigger.platform_data.get("event")), identity._verified_sender_id(event),
+        )
 
     for rt, rt_trigger in preempt_candidates(
         running_tasks,
@@ -90,23 +89,10 @@ async def _try_preempt_running_task(
 
         sending._bind_qq_reply_waiter(conversation_key, rt_src_seq)
 
-        # 2026-05-03 修改原因：Preempt 成功后不会生成新的 inbound_seq。
-        # 因此必须把旧 trigger 的平台对象更新为本次 QQ event 和 bot；目的
-        # 是让最终回复引用新的触发消息，并继续发到正确的 QQ 会话。
+        # 打断不产生新的 inbound_seq：把旧 trigger 的平台对象换成这一条，最终回复才会引用新消息。
         fresh_platform = dict(platform_updates)
         fresh_platform["last_typing_time"] = time.time()
-        if rt_trigger:
-            rt_trigger.platform_data.update(fresh_platform)
-        elif rt_src_seq:
-            state._adapter.session_state.register_trigger(
-                TriggerInfo(
-                    inbound_seq=rt_src_seq,
-                    conversation_key=conversation_key,
-                    session_id=existing_sid,
-                    is_dm=is_dm,
-                    platform_data=fresh_platform,
-                )
-            )
+        rt_trigger.platform_data.update(fresh_platform)
 
         state._adapter.session_targets[existing_sid] = dict(fresh_platform)
         state._adapter.conversation_bots[conversation_key] = bot
@@ -276,12 +262,17 @@ def _queue_merge_identity(item: models.QueuedInbound) -> tuple[Any, ...] | None:
 
 
 def _merge_queued_inbound(existing: models.QueuedInbound, item: models.QueuedInbound) -> None:
+    """后来那条只接上它自己的引用和指令。
+
+    水位留在前一条：后来那条带出的新历史行没有拼进来，推过去它们就再也不会发给模型。
+    """
     previous_hints = dict(existing.platform_updates.get("_route_hints") or {})
     direct_response = "direct" in {existing.platform_updates.get("_response_purpose", "direct"), item.platform_updates.get("_response_purpose", "direct")}
     correction = re.match(r"^(?:更正|纠正|刚才(?:说|写)错|不对[,，]|不是.+[，,])", item.user_text.strip())
     heading = "同一用户更正此前输入，以这条更正为准；已完成的外部操作不能据此假定已撤销" if correction else "排队期间追加消息"
-    existing.text = f"{existing.text}\n\n【{heading}】\n{item.text}"
-    existing.history_watermark = max(existing.history_watermark, item.history_watermark)
+    appended = f"【{heading}】\n{item.merge_segment}"
+    existing.merge_text = f"{existing.merge_segment}\n\n{appended}"
+    existing.text = f"{existing.text}\n\n{appended}"
     existing.direct_interaction = existing.direct_interaction or item.direct_interaction
     existing.attachments.extend(item.attachments)
     existing.memory_user_ids = tuple(dict.fromkeys((*existing.memory_user_ids, *item.memory_user_ids)))
@@ -458,16 +449,18 @@ def _target_from_conversation_key(conversation_key: str) -> Optional[Dict[str, A
 
 
 def _target_from_platform_data(platform_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """从 trigger 平台数据中提取 QQ 回复目标。"""
-    # 2026-05-01 修改原因：主回调会携带 matcher 保存的平台数据；优先使用
-    # 显式 type 字段区分私聊和群聊，避免只有 user_id 时误判群聊成员为私聊。
-    # 2026-05-03 新增：提取触发消息 ID 和发送者 ID，发第一条回复时自动引用 + @
+    """从 trigger 平台数据中提取 QQ 回复目标，带上触发消息和发送者，第一条回复据此引用 + @。
+
+    按显式 type 区分私聊和群聊：只看有没有 user_id 会把群成员误判成私聊目标。
+    """
     event = platform_data.get("event")
     msg_id = getattr(event, "message_id", None) if event else None
     sender_id = getattr(event, "user_id", None) if event else None
     # 匿名消息的 user_id 是占位号，at 出去群里只会看到一串数字。
     if event is not None and identity._anonymous_identity(event):
         sender_id = None
+    # @全体成员只替名单管理员发：任何能触发 bot 的人都能让模型写出 [at:all]。
+    may_mention_everyone = event is not None and permissions._requester(event).listed_admin
     target_type = platform_data.get("type")
     conversation_key = str(platform_data.get("conversation_key") or "")
     if target_type == "private" and platform_data.get("user_id") is not None:
@@ -491,6 +484,8 @@ def _target_from_platform_data(platform_data: Dict[str, Any]) -> Optional[Dict[s
             t["reply_message_id"] = int(msg_id)
         if sender_id is not None:
             t["reply_sender_id"] = int(sender_id)
+        if may_mention_everyone:
+            t[sending.MENTION_EVERYONE_FLAG] = True
         return t
     if platform_data.get("group_id") is not None:
         t = {"type": "group", "group_id": int(platform_data["group_id"])}
@@ -500,6 +495,8 @@ def _target_from_platform_data(platform_data: Dict[str, Any]) -> Optional[Dict[s
             t["reply_message_id"] = int(msg_id)
         if sender_id is not None:
             t["reply_sender_id"] = int(sender_id)
+        if may_mention_everyone:
+            t[sending.MENTION_EVERYONE_FLAG] = True
         return t
     return None
 
@@ -528,18 +525,20 @@ def _staged_event_fields(event: Any) -> Dict[str, Any]:
 def _restore_staged_inbound(
     bot: Bot, event: Event, data: Mapping[str, Any], facts: InboundFacts, actor: Dict[str, Any],
 ) -> models.QueuedInbound:
-    """按连发暂存行和重放出来的事件重建排队项。"""
-    platform = {"bot": bot, "event": event, "type": "private" if data["is_dm"] else "group", "user_id": event.user_id,
+    """按连发暂存行和重放出来的事件重建排队项。群目标不带 user_id，和实时入站一致。"""
+    platform = {"bot": bot, "event": event, "type": "private" if data["is_dm"] else "group",
                 "conversation_key": data["scope"], "_route_hints": data.get("route_hints") or {"source_message_refs": data["refs"]},
                 "_response_purpose": data.get("response_purpose", "direct"), "_feature_actor": actor,
                 "_source_attachments": data["attachments"]}
+    if data["is_dm"]:
+        platform["user_id"] = event.user_id
     if data["group_id"] is not None:
         platform["group_id"] = data["group_id"]
     return models.QueuedInbound(None, bot, event, data["channel"], data["real_key"], data["scope"],
                                 data["text"], data["attachments"], data["is_dm"], platform, data["user_text"],
                                 entry_node_id=data["entry_node_id"], history_watermark=-1,
                                 direct_interaction=data["direct_interaction"], memory_user_ids=tuple(data["memory_user_ids"]),
-                                facts=facts)
+                                facts=facts, merge_text=str(data.get("merge_text") or ""))
 
 
 def _get_fallback_bot() -> Optional[Bot]:

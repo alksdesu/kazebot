@@ -138,9 +138,9 @@ def test_group_turn_offers_reactions_outside_the_text(runtime: Any) -> None:
     set_live_config(runtime, enable_reactions=True)
     bot = ReactBot()
 
-    text, _ = asyncio.run(runtime.inbound._build_inbound_text(
+    text = asyncio.run(runtime.inbound._build_inbound_text(
         _group_event(), bot, "在吗", "conv_abc", [],
-    ))
+    )).text
     guide = runtime.output_guide._turn_output_guide("conv_abc", is_dm=False)
 
     assert "【QQ表情表态】" not in text and "[REACT:" not in text
@@ -156,7 +156,7 @@ def test_private_turn_offers_no_reactions(runtime: Any) -> None:
         get_message=lambda: [],
     )
 
-    text = asyncio.run(runtime.inbound._build_private_inbound_text(event, bot, "在吗", "conv_dm", []))
+    text = asyncio.run(runtime.inbound._build_private_inbound_text(event, bot, "在吗", "conv_dm", [])).text
     guide = runtime.output_guide._turn_output_guide("conv_dm", is_dm=True)
 
     # QQ 的表情回应只在群消息上有，私聊给了模型也贴不上。

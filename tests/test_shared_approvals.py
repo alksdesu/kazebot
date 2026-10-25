@@ -51,8 +51,10 @@ def _open(book: ApprovalBook, approval_id: str = AID, operation: str = "read_fil
 class TestVerbs:
     @pytest.mark.parametrize(("text", "expected"), [
         ("同意", "allow"), ("审批同意", "allow"), ("同意。", "allow"),
-        ("ok", "allow"), ("OK", "allow"), ("审批：同意", "allow"),
+        ("approve", "allow"), ("审批：同意", "allow"),
         ("拒绝", "deny"), ("不同意", "deny"), ("审批 拒绝", "deny"),
+        # 随口应答不是审批决定。
+        ("ok", None), ("OK", None), ("yes", None), ("y", None), ("no", None), ("n", None),
         ("know", None), ("I don't know", None), ("note", None),
         ("now", None), ("nothing", None), ("no problem", None),
         ("okay 了", None), ("同意吧，快点", None), ("", None),

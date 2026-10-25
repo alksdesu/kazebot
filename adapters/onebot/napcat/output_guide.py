@@ -21,7 +21,7 @@ _NATIVE_FACE_LABEL = "收藏表情"
 
 
 def _split_section() -> Optional[GuideSection]:
-    return split_section(QQ_NAPCAT)
+    return split_section(QQ_NAPCAT, max_parts=live.max_reply_parts)
 
 
 def _reaction_section(kind: str) -> Optional[GuideSection]:

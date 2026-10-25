@@ -74,8 +74,10 @@ def _guide_sections(call: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {section["key"]: section for section in guide.get("sections", [])}
 
 
-async def _group_trigger(driver: ContractDriver, text: str = "a question", *, message_id: str = "101") -> TriggerInfo:
-    await driver.group_message(text, sender=driver.member, message_id=message_id, mention_bot=True)
+async def _group_trigger(
+    driver: ContractDriver, text: str = "a question", *, message_id: str = "101", sender: str = "",
+) -> TriggerInfo:
+    await driver.group_message(text, sender=sender or driver.member, message_id=message_id, mention_bot=True)
     trigger = driver.session_state.get_trigger(len(driver.client.submissions))
     assert trigger is not None, "a submitted group message registers its trigger"
     return trigger
@@ -416,10 +418,10 @@ class TestSendGuard:
 class TestOutboundRendering:
     """模型回复里的标记按能力声明渲染；平台做不到的退回可读文字或者丢掉，标记本身不会漏到聊天里。"""
 
-    def _mention_pair(self, driver: ContractDriver, text: str) -> tuple[Delivery, Delivery]:
+    def _mention_pair(self, driver: ContractDriver, text: str, *, sender: str = "") -> tuple[Delivery, Delivery]:
         """同一个触发下先发一条普通回复再发 text：有的平台引用时顺带提及原作者，比的是多出来的提及。"""
         async def scenario() -> tuple[Delivery, Delivery]:
-            trigger = await _group_trigger(driver)
+            trigger = await _group_trigger(driver, sender=sender)
             [plain] = await _room_reply(driver, trigger, "noted", "plain")
             [marked] = await _room_reply(driver, trigger, text, "marked")
             return plain, marked
@@ -469,13 +471,19 @@ class TestOutboundRendering:
         assert "@NoSuchPerson" in marked.text
 
     def test_everyone_is_mentioned_only_where_the_platform_allows_it(self, driver: ContractDriver) -> None:
-        plain, marked = self._mention_pair(driver, "[at:all] meeting now")
+        plain, marked = self._mention_pair(driver, "[at:all] meeting now", sender=driver.admin)
 
         added = set(marked.mentions) - set(plain.mentions)
         if driver.platform.capabilities.mention_everyone:
             assert added == {EVERYONE}
         else:
             assert added == set() and "@all" in marked.text
+
+    def test_a_member_can_never_make_the_bot_mention_everyone(self, driver: ContractDriver) -> None:
+        # 能触发 bot 的人都能让模型写出 [at:all]，只有名单管理员触发的回复才真的提及全体。
+        plain, marked = self._mention_pair(driver, "[at:all] meeting now", sender=driver.member)
+
+        assert EVERYONE not in set(marked.mentions) - set(plain.mentions)
 
     def test_a_reaction_marker_never_reaches_the_chat(self, driver: ContractDriver) -> None:
         assert _single_room_reply(driver, "fine[REACT:76]").text.strip() == "fine"

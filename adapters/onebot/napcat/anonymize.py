@@ -199,14 +199,16 @@ def _resolve_at_alias_to_real(token: str) -> str:
     return ""
 
 
-def _anonymize_text_for_ai(text: str) -> str:
+def _anonymize_text_for_ai(text: str, *, user_ids: Iterable[Any] = (), group_ids: Iterable[Any] = ()) -> str:
     """把文本里系统已知的真实 QQ 号/群号换成稳定匿名别名后交给模型。
 
     只换别名表里登记过的号，不对任意数字串泛匹配：金额、验证码、订单号、日期不能被误伤成 UserX。
-    所以需要匿名的号必须先在采集入口（发送者、@某人、引用消息、历史行等）调
-    `_anonymize_user_id` / `_anonymize_group_id` 登记。
+    这段文本牵涉的人和群（发送者、被引用的人）从 user_ids / group_ids 传进来，先登记再替换；
+    占位号和明显非法的短号不登记，规则同 _anonymize_user_id。
     """
-    return state._adapter.aliases.substitute(text)
+    users = [real for real in (str(value or "").strip() for value in user_ids) if real and _storable_user_id(real)]
+    groups = [real for real in (str(value or "").strip() for value in group_ids) if real]
+    return state._adapter.aliases.substitute(text, users=users, groups=groups)
 
 
 _CONVERSATION_SECRET, CONVERSATION_DIGEST_SALTED = platform_conversation_secret(

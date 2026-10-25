@@ -54,6 +54,7 @@ class StageableInbound(BurstItem, Protocol):
     history_watermark: int
     direct_interaction: bool
     memory_user_ids: tuple[str, ...]
+    merge_text: str
 
 
 class FeatureHost(Protocol):
@@ -320,7 +321,7 @@ class FeatureGateway:
         actor = self.actor(item.bot, facts)
         refs = item.platform_updates.get("_route_hints", {}).get("source_message_refs", [actor["message_id"]])
         data = {"scope": item.stable_conversation_key, "real_key": item.real_conversation_key,
-                "text": item.text, "user_text": item.user_text, "attachments": item.attachments,
+                "text": item.text, "merge_text": item.merge_text, "user_text": item.user_text, "attachments": item.attachments,
                 "is_dm": item.is_dm, "channel": item.channel, "entry_node_id": item.entry_node_id,
                 "history_watermark": item.history_watermark, "direct_interaction": item.direct_interaction,
                 "memory_user_ids": item.memory_user_ids, "actor": actor, "refs": refs,

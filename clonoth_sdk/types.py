@@ -143,6 +143,78 @@ class RunningTask:
     source_inbound_seq: int | None = None
 
 
+@dataclass(frozen=True)
+class PlatformAuth:
+    """入站时 supervisor 记下的发起人身份。网页、定时任务发起的任务没有这一份，各字段都是空值。"""
+
+    platform: str = ""
+    user_id: str = ""
+    is_admin: bool = False
+    group_role: str = ""
+    group_scope: str = ""
+    bot_scope: str = ""
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "PlatformAuth":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            platform=str(data.get("platform") or "").strip(),
+            user_id=str(data.get("user_id") or "").strip(),
+            # 只认真布尔：字符串 "false" 也是真值。
+            is_admin=data.get("is_admin") is True,
+            group_role=str(data.get("group_role") or "").strip(),
+            group_scope=str(data.get("group_scope") or "").strip(),
+            bot_scope=str(data.get("bot_scope") or "").strip(),
+        )
+
+
+@dataclass(frozen=True)
+class TaskOrigin:
+    """GET /v1/tasks/{task_id}/origin 的返回。子任务已由 supervisor 回溯到发起会话。"""
+
+    task_id: str
+    origin_task_id: str
+    conversation_key: str
+    channel: str
+    platform_auth: PlatformAuth = field(default_factory=PlatformAuth)
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "TaskOrigin":
+        source = data if isinstance(data, dict) else {}
+        return cls(
+            task_id=str(source.get("task_id") or ""),
+            origin_task_id=str(source.get("origin_task_id") or ""),
+            conversation_key=str(source.get("conversation_key") or ""),
+            channel=str(source.get("channel") or ""),
+            platform_auth=PlatformAuth.from_dict(source.get("platform_auth")),
+        )
+
+
+APPROVAL_PENDING = "pending"
+APPROVAL_ALLOWED = "allowed"
+APPROVAL_DENIED = "denied"
+# supervisor 那边查无此审批时回执里的状态。
+APPROVAL_MISSING = "missing"
+# 审批没等到决定就作废了：发起它的任务已结束，或者下落查不到。
+APPROVAL_EXPIRED = "expired"
+_STATUS_OF_DECISION = {"allow": APPROVAL_ALLOWED, "deny": APPROVAL_DENIED}
+
+
+@dataclass(frozen=True)
+class ApprovalDecision:
+    """POST /v1/approvals/{id} 的回执。返回的状态与本次决定一致才算这次决定生效。"""
+
+    approval_id: str
+    decision: str
+    status: str
+    comment: str = ""
+
+    @property
+    def effective(self) -> bool:
+        return _STATUS_OF_DECISION.get(self.decision) == self.status
+
+
 @dataclass
 class HealthInfo:
     """Supervisor 健康状态信息。

@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, Mapping
 from nonebot import get_bot
 from nonebot.adapters.onebot.v11 import Bot
+from clonoth_sdk import PlatformAuth
+from platforms.builtin import QQ_NAPCAT
 from platforms.ids import normalize_id
 from ..config import (
     FORWARD_BRIDGE_HOST,
@@ -119,45 +121,48 @@ def _forward_bridge_origin_group_id(
     return None
 
 
-def _forward_bridge_origin_user_id(
-    session_id: str,
-    *,
-    parent_session_id: str = "",
-    runtime_session_id: str = "",
-) -> int | None:
-    """当前会话触发者 QQ 号，用于把内容“私发给我”。"""
-    target = _forward_bridge_session_target(
-        session_id,
-        parent_session_id=parent_session_id,
-        runtime_session_id=runtime_session_id,
-    )
-    if not target:
+async def _forward_bridge_task_auth(task_id: str) -> PlatformAuth | None:
+    """调用工具的那个任务入站时由 supervisor 核验过的发起人；取不到一律 None。
+
+    会话里记的触发者会被同群后来的人覆盖，绝不能拿来认人。没带 task_id、任务不存在、
+    supervisor 不通、发起人不是 QQ 用户（网页、定时任务），都按「没有发起人」处理。
+    """
+    client = state._adapter.client
+    task_id = str(task_id or "").strip()
+    if not task_id or client is None:
         return None
-    if target.get("user_id") is not None:
-        try:
-            return int(target.get("user_id"))
-        except Exception:
-            return None
-    return None
+    try:
+        origin = await client.get_task_origin(task_id)
+    except Exception:
+        common.logger.warning("qq_forward requester lookup failed: task=%s", task_id[:12], exc_info=True)
+        return None
+    if origin is None:
+        common.logger.warning("qq_forward requester lookup: task %s not found", task_id[:12])
+        return None
+    auth = origin.platform_auth
+    if auth.platform != QQ_NAPCAT.id or not identity._verified_user_id(auth.user_id):
+        return None
+    return auth
 
 
-def _forward_bridge_requester(
+async def _forward_bridge_requester(
+    task_id: str,
     session_id: str,
     *,
     parent_session_id: str = "",
     runtime_session_id: str = "",
 ) -> capability.Requester:
-    """转发桥的请求者身份。桥自己没有身份，发起人来自 session 归属。
+    """转发桥的请求者：身份只认任务的发起人，会话只用来定位「本群」。
 
     group_role 留空：拿群角色要多跑一次 get_group_member_info，而这条路上的
     cross_session 最宽只给到名单，群角色不参与判定。
     """
-    uid = _forward_bridge_origin_user_id(
-        session_id, parent_session_id=parent_session_id, runtime_session_id=runtime_session_id,
-    )
+    auth = await _forward_bridge_task_auth(task_id)
+    user_id = identity._verified_user_id(auth.user_id) if auth is not None else ""
     return capability.Requester(
-        user_id=normalize_id(uid),
-        listed_admin=uid is not None and permissions._is_admin_user(uid),
+        user_id=user_id,
+        # 入站时记的名单身份和现在的名单都得认：撤掉名单的人，他之前触发的任务不能还当管理员用。
+        listed_admin=bool(user_id) and auth is not None and auth.is_admin and permissions._is_admin_user(user_id),
         group_id=normalize_id(_forward_bridge_origin_group_id(
             session_id, parent_session_id=parent_session_id, runtime_session_id=runtime_session_id,
         )),
@@ -444,6 +449,7 @@ async def _forward_bridge_resolve_target(
     target_type: str,
     target_ref: str,
     *,
+    requester: capability.Requester,
     parent_session_id: str = "",
     runtime_session_id: str = "",
 ) -> tuple[models.ProactiveTarget | None, str]:
@@ -451,13 +457,9 @@ async def _forward_bridge_resolve_target(
     target_type = str(target_type or "").strip().lower()
     ref = str(target_ref or "").strip()
     if target_type == "self" or ref in {"我", "自己", "me", "self"}:
-        uid = _forward_bridge_origin_user_id(
-            session_id,
-            parent_session_id=parent_session_id,
-            runtime_session_id=runtime_session_id,
-        )
+        uid = permissions._as_qq_id(requester.user_id)
         if uid is None:
-            return None, "无法确定当前用户，无法私发给你。"
+            return None, "无法核验这次请求是谁发起的，不能私发给你；请让发起人在自己的会话里重新发起。"
         # 用户被移出私聊白名单后不应还能借 Bot 身份私发给他，与 current 分支同款复核。
         if not permissions._is_private_origin_allowed(uid):
             return None, "当前私聊不在允许列表中。"
@@ -476,12 +478,7 @@ async def _forward_bridge_resolve_target(
     # 其余交给既有的目标解析（支持显式 id 前缀与配置的显示名/别名）。
     resolve_type = "group" if target_type == "group" else "private"
     return await proactive._resolve_proactive_target(
-        bot, _forward_bridge_requester(
-            session_id,
-            parent_session_id=parent_session_id,
-            runtime_session_id=runtime_session_id,
-        ),
-        resolve_type, ref, capability_key="cross_session",
+        bot, requester, resolve_type, ref, capability_key="cross_session",
     )
 
 
@@ -601,11 +598,17 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
     if recent_refs:
         use_recent = True
 
+    # 身份只拿任务号去 supervisor 查：payload 里别的字段都可能被提示词左右，自称的身份一概不看。
+    requester = await _forward_bridge_requester(
+        str(payload.get("task_id") or ""), session_id,
+        parent_session_id=parent_session_id, runtime_session_id=runtime_session_id,
+    )
     target, error = await _forward_bridge_resolve_target(
         bot,
         session_id,
         target_type,
         target_ref,
+        requester=requester,
         parent_session_id=parent_session_id,
         runtime_session_id=runtime_session_id,
     )
@@ -614,9 +617,6 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
 
     # 跨会话投递等于借 Bot 身份向任意人/群发消息，只有管理员可用；
     # 非管理员仍可把内容发回自己或本群，那些内容他本来就看得到。
-    requester = _forward_bridge_requester(
-        session_id, parent_session_id=parent_session_id, runtime_session_id=runtime_session_id,
-    )
     origin_user_id = requester.user_id
     origin_group_id = requester.group_id
     is_admin = requester.listed_admin
@@ -637,7 +637,7 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
         )
         return {"ok": False, "error": cross_session_denied}
 
-    send_target = proactive._target_to_send_dict(target)
+    send_target = proactive._target_to_send_dict(target, mention_everyone=requester.listed_admin)
     label = proactive._target_display_label(target.target_type, target.label)
     conversation_key = f"qq_forward:{target.target_type}:{target.target_id}"
     send_context = proactive._request_send_context(

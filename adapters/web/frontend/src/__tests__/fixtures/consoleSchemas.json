@@ -1693,11 +1693,15 @@
                       "children": [
                         {
                           "kind": "desc",
-                          "text": "超长的回复会被截断，避免被 QQ 拒收。"
+                          "text": "超长的回复会被截断，避免被 QQ 拒收。分条超过上限时多出来的并进最后一条，0 表示不限。"
                         },
                         {
                           "kind": "field",
                           "key": "message_limit"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "max_reply_parts"
                         },
                         {
                           "kind": "field",
@@ -2599,6 +2603,16 @@
             "platform"
           ],
           "default": 4300
+        },
+        "max_reply_parts": {
+          "kind": "number",
+          "label": "一次最多",
+          "unit": "条",
+          "path": "output.max_reply_parts",
+          "layers": [
+            "platform"
+          ],
+          "default": 8
         },
         "history_text_limit": {
           "kind": "number",

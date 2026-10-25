@@ -4,11 +4,10 @@ from __future__ import annotations
 import logging
 import asyncio
 import base64
-import contextlib
 import hashlib
 import os
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Mapping
+from typing import Any, AsyncContextManager, Awaitable, Callable, Dict, List, Mapping
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 from adapters._shared import outbound
@@ -22,6 +21,7 @@ from adapters._shared.send_guard import (
     OutboundSendContext,
     SendContractError,
 )
+from clonoth_sdk.lease import lease_heartbeat
 from ..send_contract import (
     classify_send_exception,
     is_at_uid_failure,
@@ -218,56 +218,72 @@ def _resolve_at_alias_in_group(group_id: Any, token: str) -> str:
     return cached[2].get(raw.casefold(), "")
 
 
-async def _sanitize_group_at_segments(bot: Bot, group_id: Any, message: Any) -> Any:
+MENTION_EVERYONE_FLAG = "_mention_everyone"
+_EVERYONE_TEXT = "@全体成员"
+
+
+def _is_everyone_at(segment: Any) -> bool:
+    return getattr(segment, "type", "") == "at" and str((getattr(segment, "data", {}) or {}).get("qq", "")).strip().lower() == "all"
+
+
+def _may_mention_everyone(target: Mapping[str, Any]) -> bool:
+    """这次发送能不能真的 @全体成员：只有触发者是名单管理员时，发送目标上才会带这个标记。"""
+    return target.get(MENTION_EVERYONE_FLAG) is True
+
+
+async def _sanitize_group_at_segments(
+    bot: Bot, group_id: Any, message: Any, *, allow_everyone: bool = False,
+) -> Any:
     """把群消息里"非本群成员/无法解析"的 at 段降级为文本，避免整条消息发送失败。
 
-    2026-07-14 修复：一条消息 @ 多人时，只要其中一个 at 的 uid 被 NapCat 判为
-    Get Uid Error，send_group_msg 就会整条失败。这里在发送前用群成员列表校验，
-    命中不了的 at 用 @昵称/@别名 文本代替，@全体成员(all) 放行。
+    一条消息 @ 多人时，只要其中一个 at 的 uid 被 NapCat 判为 Get Uid Error，send_group_msg
+    就会整条失败，所以发送前用群成员列表校验。@全体成员只在 allow_everyone 时保留，否则降级成文字：
+    任何能触发 bot 的人都能让模型写出 [at:all]。
     """
     if not isinstance(message, Message):
         return message
     loaded = await _load_group_members(bot, group_id)
-    if loaded is None:
-        # 拿不到成员列表时不拦截，保持原样（避免误伤把所有 at 变文本）。
-        return message
-    members, name_map, _card_map = loaded
+    name_map = loaded[1] if loaded is not None else {}
     new_segments: List[MessageSegment] = []
     for seg in message:
-        if getattr(seg, "type", "") == "at":
-            qq = str((getattr(seg, "data", {}) or {}).get("qq", "")).strip()
-            # 特例：[at:all] 但群里真有成员名片/昵称叫 "all"，优先当成 @ 那个人，
-            # 避免把他误伤为 @全体成员。
-            if qq.lower() == "all":
-                mapped = name_map.get("all")
-                if mapped:
-                    common.logger.info("resolve [at:all] to group member %s in group=%s", mapped, group_id)
-                    new_segments.append(MessageSegment.at(mapped))
-                    continue
-                # 确实是 @全体成员，放行。
-                new_segments.append(seg)
-                continue
-            if not qq:
-                new_segments.append(seg)
-                continue
-            # 以 members（本群真实 QQ 号集合）为权威，按理想顺序判定：
-            #   1) qq 是数字且 ∈ members  -> 就是这个真实 QQ 号，放行。
-            #   2) 否则先按 name_map（群名片/昵称，card 优先）反查：命中则改用真实 QQ 号。
-            #     这能修复“群名片恰好是纯数字（如名片叫 1）”被误当成 QQ 号的问题。
-            #   3) 都不中 -> 丢弃这个非法 at（不再降级成 @匿名代号发到群里）。
-            if qq in members:
-                new_segments.append(seg)
-                continue
-            mapped = _resolve_at_alias_in_group(group_id, qq)
-            if mapped and mapped in members:
-                common.logger.info("resolve at token %r to group member %s in group=%s", qq, mapped, group_id)
+        if _is_everyone_at(seg):
+            # 特例：群里真有成员名片/昵称叫 "all"，优先当成 @ 那个人，避免误伤成 @全体成员。
+            mapped = name_map.get("all")
+            if mapped:
+                common.logger.info("resolve [at:all] to group member %s in group=%s", mapped, group_id)
                 new_segments.append(MessageSegment.at(mapped))
-                continue
-            # 既不是本群成员 QQ 号，也没有群友名片/昵称叫这个名字：判为无效 at，直接丢弃。
-            # Why: 这种情况多半是模型凭空捧造的 at（如 qq=1），降级成 @UserXX 反而产生脗肿文本。
-            common.logger.warning("drop invalid at: token=%r not a member/card in group=%s", qq, group_id)
+            elif allow_everyone:
+                new_segments.append(seg)
+            else:
+                common.logger.info("downgrade @everyone to text in group=%s: requester is not a listed admin", group_id)
+                new_segments.append(MessageSegment.text(_EVERYONE_TEXT))
             continue
         new_segments.append(seg)
+    if loaded is None:
+        # 拿不到成员列表时不再校验个人 at，保持原样（避免误伤把所有 at 变文本）。
+        return Message(new_segments)
+    return _drop_invalid_member_ats(group_id, Message(new_segments), loaded[0])
+
+
+def _drop_invalid_member_ats(group_id: Any, message: Any, members: set[str]) -> Any:
+    """以本群成员列表为准：不是成员的号先按名片/昵称反查，查不到就丢掉。"""
+    new_segments: List[MessageSegment] = []
+    for seg in message:
+        if getattr(seg, "type", "") != "at" or _is_everyone_at(seg):
+            new_segments.append(seg)
+            continue
+        qq = str((getattr(seg, "data", {}) or {}).get("qq", "")).strip()
+        if not qq or qq in members:
+            new_segments.append(seg)
+            continue
+        # 名片恰好是纯数字（比如叫 1）时，这里把它纠正成真实 QQ 号。
+        mapped = _resolve_at_alias_in_group(group_id, qq)
+        if mapped and mapped in members:
+            common.logger.info("resolve at token %r to group member %s in group=%s", qq, mapped, group_id)
+            new_segments.append(MessageSegment.at(mapped))
+            continue
+        # 多半是模型编出来的号，降级成 @文字只会在群里留一串没人认识的代号。
+        common.logger.warning("drop invalid at: token=%r not a member/card in group=%s", qq, group_id)
     return Message(new_segments)
 
 
@@ -347,7 +363,9 @@ async def _send_qq_message_once(
             return await bot.send_group_msg(group_id=int(group_id), message=payload)
 
         # 非本群/无法解析的 at 会让 NapCat 整条失败，发送前先清洗。
-        sender, outbound = send_group, await _sanitize_group_at_segments(bot, group_id, message)
+        sender, outbound = send_group, await _sanitize_group_at_segments(
+            bot, group_id, message, allow_everyone=_may_mention_everyone(target),
+        )
     else:
         raise SendContractError(f"unknown QQ target type: {target!r}")
     try:
@@ -403,20 +421,17 @@ def _sent_ttl_for_context(context: OutboundSendContext) -> float | None:
     return ONEBOT_IDEMPOTENCY_FALLBACK_SENT_TTL_SECONDS
 
 
-async def _heartbeat_idempotency_claim(claim: IdempotencyClaim) -> None:
-    """Renew one logical-send owner until its platform operation finishes."""
-    interval = max(0.05, min(30.0, state._adapter.outbound_idempotency.lease_seconds / 3))
-    while True:
-        await asyncio.sleep(interval)
-        try:
-            await state._adapter.outbound_idempotency.heartbeat(claim)
-        except IdempotencyOwnershipError:
-            # The protected send commits pending -> sent/ambiguous atomically. A
-            # heartbeat already queued at that boundary will then observe that its
-            # pending ownership is gone; this is the normal terminal condition.
-            # A real takeover is still detected by the protected operation's strict
-            # owner-checked commit/release path.
-            return
+def _claim_heartbeat(claim: IdempotencyClaim) -> AsyncContextManager[None]:
+    """Renew one logical-send owner while its platform operation runs."""
+    guard = state._adapter.outbound_idempotency
+    return lease_heartbeat(
+        lambda: guard.heartbeat(claim),
+        interval=max(0.05, min(30.0, guard.lease_seconds / 3)),
+        # A renewal queued right as the send commits pending -> sent finds its ownership gone: the normal end.
+        # A real takeover is caught by the owner-checked commit/release of the send itself.
+        lost=(IdempotencyOwnershipError,),
+        label=claim.key,
+    )
 
 
 async def _send_qq_message(
@@ -461,15 +476,15 @@ async def _send_qq_message(
         await state._adapter.features.bind_reminder_message(bot, target, context, platform_message_id)
         return platform_message_id or f"idempotent:{key}"
     common.logger.info("onebot_send_started", extra=fields)
-    heartbeat = asyncio.create_task(_heartbeat_idempotency_claim(claim))
-    try:
-        async def send_once() -> str:
-            payload = await message_factory() if message_factory is not None else message
-            result = await _send_qq_message_once(bot, target, payload, idempotency_key=key)
-            if sticker_delivery_id and not result:
-                raise AmbiguousAckError("平台未返回消息编号，表情包投递状态待确认")
-            return result
 
+    async def send_once() -> str:
+        payload = await message_factory() if message_factory is not None else message
+        result = await _send_qq_message_once(bot, target, payload, idempotency_key=key)
+        if sticker_delivery_id and not result:
+            raise AmbiguousAckError("平台未返回消息编号，表情包投递状态待确认")
+        return result
+
+    async with _claim_heartbeat(claim):
         platform_message_id = await protected_claim_send(
             state._adapter.outbound_idempotency,
             claim,
@@ -477,21 +492,17 @@ async def _send_qq_message(
             sent_ttl=_sent_ttl_for_context(context),
             message_id_getter=lambda result: str(result or ""),
         )
-        common.logger.info(
-            "onebot_send_sent",
-            extra=_send_audit_fields(
-                context, platform_message_id=platform_message_id,
-                attempt=attempt, idempotency_key=key,
-            ),
-        )
-        if sticker_delivery_id:
-            await emotes._reconcile_sticker_receipts(sticker_delivery_id)
-        await state._adapter.features.bind_reminder_message(bot, target, context, platform_message_id)
-        return platform_message_id
-    finally:
-        heartbeat.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat
+    common.logger.info(
+        "onebot_send_sent",
+        extra=_send_audit_fields(
+            context, platform_message_id=platform_message_id,
+            attempt=attempt, idempotency_key=key,
+        ),
+    )
+    if sticker_delivery_id:
+        await emotes._reconcile_sticker_receipts(sticker_delivery_id)
+    await state._adapter.features.bind_reminder_message(bot, target, context, platform_message_id)
+    return platform_message_id
 
 
 async def _send_split_text(
@@ -502,12 +513,10 @@ async def _send_split_text(
     source_attachments: List[Dict[str, Any]] | None = None,
     send_context: OutboundSendContext | None = None,
 ) -> bool:
-    """按 [SPLIT] 拆分文本，并把每段回复绑定到本轮来源图片。"""
-    # 2026-05-01 修改原因：文本拆分逻辑对群聊和私聊相同，实际发送交给
-    # _send_qq_message 处理，确保私聊也能复用表情替换和分段发送能力。
+    """按 [SPLIT] 拆分文本，并把每段回复绑定到本轮来源图片。超过条数上限的并进最后一条。"""
     await state._adapter.features.check_send(bot, target)
     sent_any = False
-    parts = outbound.split_reply(text)
+    parts = outbound.limit_parts(outbound.split_reply(text), _reply_part_limit())
     conversation_key = emotes._sticker_conversation_key(target, bot)
     conversation_token = state._adapter.sticker_send_conversation.set(conversation_key)
     selected_token = state._adapter.sticker_selected.set(set())
@@ -521,6 +530,11 @@ async def _send_split_text(
         state._adapter.sticker_selected.reset(selected_token)
         state._adapter.sticker_send_conversation.reset(conversation_token)
     return sent_any
+
+
+def _reply_part_limit() -> int:
+    """一次回复最多发几条：平台声明和运营者配置取最严的那个，0 表示不限。"""
+    return outbound.strictest_limit(QQ_NAPCAT.capabilities.max_split_parts, live.max_reply_parts)
 
 
 def _planned_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
@@ -633,7 +647,8 @@ async def _send_split_parts(
             if not segments:
                 continue
             msg = _message_from_processed_segments(segments)
-            segment_identity = f"text:{index}:{_message_dedup_text(msg).strip()}"
+            # 用原文而不是渲染结果：引用 + @ 前缀取决于 trigger 还在不在，重放时会变。
+            segment_identity = f"text:{index}:{part}"
             segment_context = send_context.child(segment_identity) if send_context else None
             sent_message_id = await _send_qq_message(
                 bot, target, msg, send_context=segment_context, content_identity=segment_identity,
