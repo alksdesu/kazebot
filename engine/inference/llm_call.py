@@ -11,29 +11,32 @@ from contextvars import ContextVar
 from functools import wraps
 from typing import Any
 
+from clonoth_runtime import parse_bool
+
 from .stream_buffer import _StreamBuffer
-from ..attachments import prepare_messages_for_llm
+from ..attachments import prepare_messages_for_llm, strip_image_blocks
 from ..compact import bounded_tool_result_view, total_content_chars
 from ..prompt import finalize_system_tail
 from ..protocol import TaskAction, ACTION_CANCELLED, ACTION_FAIL
 from .loop_state import _LoopState, _persist_ctx, _short
+from .llm_outcome import (
+    error_kind,
+    is_context_overflow,
+    is_filtered,
+    is_retryable as _is_retryable_error,
+    with_changes,
+)
+from .llm_outcome import RETRYABLE_STATUS_CODES as _RETRYABLE_STATUS_CODES  # noqa: F401
 # message_to_llm 反序列化：在发送 LLM 前做格式转换（role 修正 + 内部字段剥离）
 from .tool_format import build_llm_messages, sanitize_control_tool_history
-# Phase 1: Signal System — 引入信号总线，用于 LLM 调用的可观测性
-# 在 while True 循环前发射 llm.call.start，在 return resp 前发射 llm.call.end，
-# 在重试路径发射 llm.retry，在不可重试失败时发射 llm.error。
 from engine.signals import Signal, get_bus
 from engine.signals.types import make_span_id
 from plugin_runtime import plugin_scope
 from plugin_runtime.manager import current_scope
 
 
-# ---------------------------------------------------------------------------
-#  可重试状态码
-# ---------------------------------------------------------------------------
-
-_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 _llm_child_tasks: ContextVar[list[asyncio.Task] | None] = ContextVar("llm_child_tasks", default=None)
+_POLL_INTERVAL_SEC = 0.3
 
 
 def _node_strips_images(node: Any) -> bool:
@@ -48,135 +51,7 @@ def _node_strips_images(node: Any) -> bool:
     extra = getattr(node, "extra", None)
     if not isinstance(extra, dict):
         return False
-    for key in ("strip_images", "no_vision"):
-        val = extra.get(key)
-        if isinstance(val, bool):
-            if val:
-                return True
-        elif isinstance(val, str) and val.strip().lower() in {"1", "true", "yes", "on"}:
-            return True
-    return False
-
-
-def _strip_image_blocks(messages: list[dict]) -> list[dict]:
-    """Remove image_url content blocks from all messages (non-vision safety).
-
-    Mirrors engine.builtin.fallback_provider._strip_image_blocks so non-vision
-    primary providers get the same protection as non-vision fallbacks. If a
-    message becomes empty after stripping, replace with placeholder text; if it
-    collapses to a single text part, flatten to a plain string.
-    """
-    result: list[dict] = []
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            result.append(msg)
-            continue
-        filtered = [
-            p for p in content
-            if not (isinstance(p, dict) and p.get("type") == "image_url")
-        ]
-        if len(filtered) == len(content):
-            result.append(msg)
-            continue
-        if not filtered:
-            result.append({**msg, "content": "[image content removed]"})
-        elif len(filtered) == 1 and isinstance(filtered[0], dict) and filtered[0].get("type") == "text":
-            result.append({**msg, "content": filtered[0].get("text", "")})
-        else:
-            result.append({**msg, "content": filtered})
-    return result
-
-# [fix 2026-05-07] Why: some OpenAI-compatible proxy layers return upstream
-# key-pool exhaustion as HTTP 400/402/403 instead of 429, and some provider
-# adapters use status_code=0 for transport exceptions. How: keep the strict HTTP
-# status whitelist, but add a separate combined semantic check for proxy resource
-# exhaustion. Purpose: retry recoverable upstream/key-pool failures without
-# retrying ordinary invalid-request 4xx responses that share the proxy prefix.
-_RESOURCE_LIMIT_CLIENT_STATUS_CODES = frozenset({400, 402, 403})
-_PROVIDER_FAILURE_MARKERS = (
-    "provider response failed",
-)
-_RESOURCE_LIMIT_ERROR_MARKERS = (
-    "quota exhausted",
-    "credits exhausted",
-    # [fix 2026-05-07] Why: bare "insufficient" or "credits" can also appear in
-    # schema/field/permission errors. How: only match explicit resource-limit
-    # phrases. Purpose: retry real quota/credit exhaustion without retrying
-    # malformed 400 requests.
-    "insufficient quota",
-    "insufficient_quota",
-    "insufficient credits",
-    "insufficient credit",
-    "insufficient balance",
-    "too many requests",
-    "rate limit",
-    "rate_limit",
-)
-
-
-def _has_resource_limit_marker(error: str | None) -> bool:
-    """Return whether an error is an upstream resource-limit failure."""
-    # [fix 2026-05-07] Why: resource-limit 4xx may be returned directly by a
-    # provider or wrapped by a proxy. How: match explicit quota/rate-limit phrases
-    # without requiring a generic provider-failure prefix. Purpose: keep quota
-    # exhaustion retryable while preventing schema/permission errors from retrying.
-    err = (error or "").lower()
-    return any(marker in err for marker in _RESOURCE_LIMIT_ERROR_MARKERS)
-
-
-# [fix 2026-05-28] Why: some upstream providers (e.g. zoaholic proxies) return
-# HTTP 200 but embed server-side errors (429, 503, overloaded, capacity) inside
-# the SSE stream body. The provider parser sets ok=False but keeps status_code=200.
-# How: define explicit transient server-error markers that indicate recoverable
-# failures, separate from content-policy refusals (safeguard, refused, etc.).
-# Purpose: retry genuine server-side transient errors that arrive via HTTP 200
-# streams, while leaving content-policy refusals for fallback_provider to handle
-# via a different provider (retrying the same provider for safeguard is futile).
-_STREAM_SERVER_ERROR_MARKERS = (
-    "429",
-    "503",
-    "rate_limit",
-    "rate limit",
-    "overloaded",
-    "capacity",
-    "too many requests",
-    "server_error",
-    "internal_error",
-    "service_unavailable",
-)
-
-
-def _has_stream_server_error(error: str | None) -> bool:
-    """Return whether an error text indicates a transient server-side error
-    embedded in an HTTP 200 stream (e.g. SSE error objects with 429/503)."""
-    err = (error or "").lower()
-    return any(marker in err for marker in _STREAM_SERVER_ERROR_MARKERS)
-
-
-def _is_retryable_error(resp) -> bool:
-    """判定 ProviderResponse 是否属于可重试的临时性错误。"""
-    if resp.ok:
-        return False
-    status_code = resp.status_code
-    if status_code is not None:
-        if status_code <= 0:
-            return True
-        if status_code in _RETRYABLE_STATUS_CODES:
-            return True
-        if status_code in _RESOURCE_LIMIT_CLIENT_STATUS_CODES:
-            return _has_resource_limit_marker(getattr(resp, "error", None))
-        # [fix 2026-05-28] Why: SSE streams can return HTTP 200 but contain
-        # server errors (429/503/overloaded) in the event data. The provider
-        # parser sets ok=False but preserves status_code=200. How: check error
-        # text for transient server-error markers. Purpose: retry genuine
-        # server-side transient errors while leaving content-policy refusals
-        # (safeguard blocks) for fallback_provider to handle via a different
-        # provider rather than retrying the same one.
-        if status_code == 200:
-            return _has_stream_server_error(getattr(resp, "error", None))
-        return False
-    return True
+    return any(parse_bool(extra.get(key), False) for key in ("strip_images", "no_vision"))
 
 
 def _build_messages_for_provider(
@@ -250,6 +125,94 @@ def _create_llm_task(coroutine):
     return task
 
 
+def request_view(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """发给模型的那份消息视图：较早的大块工具结果截短，持久历史不动。压缩阈值也按它估，两边口径一致。"""
+    view, _ = bounded_tool_result_view(messages)
+    return view
+
+
+def provider_messages(
+    view: list[dict[str, Any]],
+    *,
+    formatter: Any,
+    provider: Any,
+    workspace_root: Any,
+    strip_images: bool,
+) -> list[dict[str, Any]]:
+    """把请求视图转成某个 provider 能收的消息：格式转换、file:// 图片转 base64，模型不收图时剥掉图片。"""
+    prepared = prepare_messages_for_llm(_build_messages_for_provider(view, formatter, provider), workspace_root)
+    return strip_image_blocks(prepared) if strip_images else prepared
+
+
+def cancelled_action(ls: Any) -> TaskAction:
+    return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id, summary="任务已被用户取消。")
+
+
+async def _acknowledge_cancel(ls: Any, step: int) -> None:
+    await ls.rctx.emit_event("cancel_acknowledged", {"node_id": ls.node.id, "task_id": ls.rctx.task_id, "step": step})
+
+
+async def poll_preempt(ls: Any) -> dict[str, Any] | None:
+    """查一次抢占：带消息的记进 preempt_inject_info 并返回它，不带消息的只标 preempt_after_step。"""
+    if ls.preempt_after_step or ls.preempt_inject_info is not None:
+        return None
+    info = await ls.rctx.check_preempted()
+    if not info.get("preempted"):
+        return None
+    if info.get("message"):
+        ls.preempt_inject_info = info
+        return info
+    ls.preempt_after_step = True
+    return None
+
+
+async def _stop_task(task: asyncio.Task) -> None:
+    if not task.done():
+        task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def wait_provider_call(ls: Any, coroutine: Any, step: int) -> Any:
+    """等一次 provider 调用，期间轮询取消和抢占。被取消时停掉请求、回执 cancel_acknowledged，返回 None。"""
+    rctx = getattr(ls, "rctx", None)
+    if not callable(getattr(rctx, "check_cancelled", None)):
+        return await coroutine
+    task = _create_llm_task(coroutine)
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=_POLL_INTERVAL_SEC)
+            if task in done:
+                return task.result()
+            if await rctx.check_cancelled():
+                await _stop_task(task)
+                await _acknowledge_cancel(ls, step)
+                return None
+            await poll_preempt(ls)
+    except BaseException:
+        await _stop_task(task)
+        raise
+
+
+async def record_response_usage(ls: Any, resp: Any, llm_messages: list[dict[str, Any]], tools_arg: Any) -> None:
+    """记下这次请求的真实 prompt 用量，压缩阈值和 supervisor 的字符预算都按它校准。"""
+    usage = getattr(resp, "usage", None)
+    if not isinstance(usage, dict) or not isinstance(usage.get("prompt_tokens"), int):
+        return
+    ls.last_prompt_tokens = usage["prompt_tokens"]
+    ls.last_usage = dict(usage)
+    ls.compacted = False
+    await ls.rctx.emit_event("context_usage", {
+        "node_id": ls.node.id,
+        "task_id": ls.rctx.task_id,
+        "usage": usage,
+        # 配上真实 token 数，supervisor 侧的字符预算才能按本会话的实际比例裁剪；
+        # 硬编码 3 字符/token 是按英文定的，中文会把预算放大两三倍。
+        "prompt_chars": total_content_chars(llm_messages) + (
+            len(json.dumps(tools_arg, ensure_ascii=False, default=str)) if tools_arg else 0
+        ),
+    })
+
+
 @_llm_plugin_context
 async def _call_llm_with_retry(ls: _LoopState, step: int):
     """LLM 调用（含重试）。
@@ -260,43 +223,29 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
       - None: 思考阶段被 preempt 截断，partial message 已丢弃
     """
     tools_arg = ls.openai_tools if ls.openai_tools else None
-    # 反序列化方向：先用 build_llm_messages 做格式转换（修正跨模式 role、剥离 _meta 等内部字段），
-    # 再用 prepare_messages_for_llm 处理图片 file:// → base64 解析。
-    # build_llm_messages 会跳过 _ephemeral 消息（retry hint 等），但保留 _dynamic（动态上下文）。
-    # 注意：不能修改 ls.messages 本身，它是运行时状态。
-    # Keep large historical tool output out of the request while preserving the
-    # durable transcript and the newest native tool-call round.
-    _request_messages, _ = bounded_tool_result_view(ls.messages)
-    _formatted = _build_messages_for_provider(_request_messages, ls.formatter, ls.provider)
-    llm_messages = prepare_messages_for_llm(_formatted, ls.rctx.workspace_root)
-    # [2026-08-01] 节点级图片剥离开关：某些节点（如绘图分析节点）使用的模型
-    # 不支持视觉（如 deepseek-v4-flash），收到 image_url 多模态消息会直接 400
-    # 报错（unknown variant `image_url`, expected `text`）。当节点 YAML 声明
-    # strip_images: true（或 no_vision: true）时，在调 provider 前剥掉所有 image_url
-    # 内容块，只保留文字，避免整个绘图任务因附带图片而崩溃。
-    if _node_strips_images(ls.node):
-        llm_messages = _strip_image_blocks(llm_messages)
+    # ls.messages 是运行时状态，只在副本上转换；build_llm_messages 跳过 _ephemeral，保留 _dynamic
+    strip_images = _node_strips_images(ls.node)
+    llm_messages = provider_messages(
+        request_view(ls.messages), formatter=ls.formatter, provider=ls.provider,
+        workspace_root=ls.rctx.workspace_root, strip_images=strip_images,
+    )
 
     resp = None
     _retry_attempt = 0
 
-    # Phase 1: Signal System — 初始化信号总线，发射 llm.call.start
-    # 不使用 span 上下文管理器，避免整个函数体缩进变动。
-    # 手动在关键路径发射 start/end/retry/error 信号。
     _bus = get_bus()
     _span_id = make_span_id()
     _sig_payload = {"model": getattr(ls.provider, 'model', 'unknown'), "provider": type(ls.provider).__name__}
     _sig_t0 = time.monotonic()
     _bus.emit(Signal(name="llm.call.start", payload=_sig_payload, span_id=_span_id))
 
+    def _emit_call_end(**extra: Any) -> None:
+        _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
+        _bus.emit(Signal(name="llm.call.end", payload={**_sig_payload, "elapsed_ms": _elapsed, **extra}, span_id=_span_id))
+
     while True:
-        # [AutoC 2026-06-04] Why: retries and multi-step tasks can issue several
-        # provider requests under one task id. How: create a fresh request id at the
-        # start of each actual provider call attempt, before any stream delta can be
-        # emitted. Purpose: all realtime blocks from this attempt share one card key.
+        # 每次真正发请求都换 request id，这一次的流式块在前端共用一张卡片
         request_id = ls.rctx.begin_llm_request()
-        text_buf: _StreamBuffer | None = None
-        think_buf: _StreamBuffer | None = None
 
         # ---- 流式调用 ----
         if ls.use_stream:
@@ -304,15 +253,23 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
             think_buf = _StreamBuffer(ls.rctx, ls.node.id, "thinking", request_id=request_id)
 
             async def _emit_tool_delta(payload: dict[str, Any]) -> None:
-                # [tool-stream 2026-05-19] 将 provider 的工具调用增量接入 RunContext 事件流。
-                # 原因：provider 现在能实时解析 tool_call 参数，但 supervisor 只认识 emit_event。
-                # 做法：复制 payload，补充 node_id/task_id 后以 tool_call_delta 事件发送。
-                # 目的：tool_call 与 text/thinking 一样通过 supervisor 和前端 WebSocket 流动。
+                # supervisor 只认 emit_event，工具调用增量和正文、思考走同一条事件流
                 event_payload = dict(payload or {})
                 event_payload.setdefault("node_id", ls.node.id)
                 event_payload.setdefault("task_id", ls.rctx.task_id)
                 event_payload.setdefault("llm_request_id", request_id)
                 await ls.rctx.emit_event("tool_call_delta", event_payload)
+
+            async def _close_stream_buffers() -> None:
+                await text_buf.flush()
+                await think_buf.flush()
+                if text_buf.flushed_any or think_buf.flushed_any:
+                    await ls.rctx.emit_event("stream_end", {
+                        "node_id": ls.node.id,
+                        "llm_request_id": request_id,
+                        "has_text": text_buf.flushed_any,
+                        "has_reasoning": think_buf.flushed_any,
+                    })
 
             stream_task = _create_llm_task(
                 ls.provider.chat_stream(
@@ -324,81 +281,33 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                 )
             )
             while True:
-                done, _ = await asyncio.wait({stream_task}, timeout=0.3)
+                done, _ = await asyncio.wait({stream_task}, timeout=_POLL_INTERVAL_SEC)
                 if stream_task in done:
                     resp = stream_task.result()
                     break
                 if await ls.rctx.check_cancelled():
-                    stream_task.cancel()
-                    try:
-                        await stream_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    await text_buf.flush()
-                    await think_buf.flush()
-                    if text_buf.flushed_any or think_buf.flushed_any:
-                        # [refactor 2026-04-18] has_thinking → has_reasoning 事件字段对齐
-                        await ls.rctx.emit_event("stream_end", {"node_id": ls.node.id, "llm_request_id": request_id, "has_text": text_buf.flushed_any, "has_reasoning": think_buf.flushed_any})
-                    await ls.rctx.emit_event("cancel_acknowledged", {"node_id": ls.node.id, "task_id": ls.rctx.task_id, "step": step})
-                    # Phase 1: Signal — 取消时也发射 end 信号
-                    _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
-                    _bus.emit(Signal(name="llm.call.end", payload={**_sig_payload, "elapsed_ms": _elapsed, "cancelled": True}, span_id=_span_id))
-                    # [硬取消-场景2] 流式输出中取消：不将未完成的 assistant 消息存入 history。
-                    # 调用方 ai_step.py 收到 TaskAction 后直接 return，
-                    # 不执行 messages.append / _shadow_write，history 停留在上一轮完整状态。
-                    return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id, summary="任务已被用户取消。")
-                if not ls.preempt_after_step and ls.preempt_inject_info is None:
-                    _pi_s = await ls.rctx.check_preempted()
-                    if _pi_s.get("preempted"):
-                        if _pi_s.get("message"):
-                            ls.preempt_inject_info = _pi_s
-                            # -------------------------------------------------------
-                            # Preempt V3 需求1: 思考阶段截断
-                            # 如果 LLM 尚未产出任何 text token（仍在 thinking 阶段
-                            # 或尚未开始输出），立即截断流式输出，丢弃这条不完整的
-                            # assistant message（不存历史），让主循环在下一轮迭代
-                            # 由 _inject_preempt_message 注入 preempt 消息后重新推理。
-                            # text 阶段已开始输出时，维持现行等待逻辑不变（等流结束）。
-                            # 与 cancel 的区别：break 后不终止 task，回到主循环继续。
-                            # -------------------------------------------------------
-                            _in_thinking_phase = not text_buf.flushed_any and text_buf.is_empty
-                            if _in_thinking_phase:
-                                stream_task.cancel()
-                                try:
-                                    await stream_task
-                                except (asyncio.CancelledError, Exception):
-                                    pass
-                                # 清理 buffer 状态：flush 残留的 thinking tokens
-                                await text_buf.flush()
-                                await think_buf.flush()
-                                if text_buf.flushed_any or think_buf.flushed_any:
-                                    await ls.rctx.emit_event("stream_end", {
-                                        "node_id": ls.node.id,
-                                        "llm_request_id": request_id,
-                                        "has_text": text_buf.flushed_any,
-                                        "has_reasoning": think_buf.flushed_any,
-                                    })
-                                await ls.rctx.emit_event("preempt_thinking_truncated", {
-                                    "node_id": ls.node.id,
-                                    "task_id": ls.rctx.task_id,
-                                    "step": step,
-                                })
-                                # Signal System: 发射 llm.call.end 标记截断
-                                _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
-                                _bus.emit(Signal(name="llm.call.end", payload={
-                                    **_sig_payload, "elapsed_ms": _elapsed,
-                                    "preempt_truncated": True,
-                                }, span_id=_span_id))
-                                # 返回 None 通知 ai_step 跳过本次响应处理，
-                                # 直接 continue 到主循环顶部重新推理
-                                return None
-                        else:
-                            ls.preempt_after_step = True
+                    # 流式输出中取消：没写完的 assistant 消息不进历史，停在上一轮的完整状态
+                    await _stop_task(stream_task)
+                    await _close_stream_buffers()
+                    await _acknowledge_cancel(ls, step)
+                    _emit_call_end(cancelled=True)
+                    return cancelled_action(ls)
+                preempt = await poll_preempt(ls)
+                if preempt is not None and not text_buf.flushed_any and text_buf.is_empty:
+                    # 还在思考阶段就来了新消息：丢掉这条没写完的回复，回主循环注入新消息后重新推理；
+                    # 已经开始输出正文的照常等它说完
+                    await _stop_task(stream_task)
+                    await _close_stream_buffers()
+                    await ls.rctx.emit_event("preempt_thinking_truncated", {
+                        "node_id": ls.node.id,
+                        "task_id": ls.rctx.task_id,
+                        "step": step,
+                    })
+                    _emit_call_end(preempt_truncated=True)
+                    return None
             await text_buf.flush()
             await think_buf.flush()
-            # [thinking-time 2026-06-01] Record precise reasoning timing on LoopState.
-            # reasoning_started = first thinking token; reasoning_ended = first text token
-            # (thinking always precedes text in all providers).
+            # 各家 provider 都是思考在前正文在后：第一个思考 token 算开始，第一个正文 token 算结束
             if think_buf.flushed_any:
                 ls._reasoning_started_iso = think_buf.first_push_iso
                 if text_buf.first_push_at is not None:
@@ -408,7 +317,6 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     import datetime as _dt_rc
                     ls._reasoning_ended_iso = _dt_rc.datetime.now(_dt_rc.timezone.utc).isoformat()
             if text_buf.flushed_any or think_buf.flushed_any:
-                # [refactor 2026-04-18] has_thinking → has_reasoning 事件字段对齐
                 await ls.rctx.emit_event("stream_end", {
                     "node_id": ls.node.id,
                     "llm_request_id": request_id,
@@ -418,59 +326,21 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
             if resp.ok and resp.tool_calls:
                 ls.use_stream = False
         else:
-            # ---- 非流式调用（可取消） ----
-            llm_task = _create_llm_task(
-                ls.provider.chat(messages=llm_messages, tools=tools_arg)
-            )
-            while True:
-                done, _ = await asyncio.wait({llm_task}, timeout=0.3)
-                if llm_task in done:
-                    resp = llm_task.result()
-                    break
-                if await ls.rctx.check_cancelled():
-                    llm_task.cancel()
-                    try:
-                        await llm_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    await ls.rctx.emit_event("cancel_acknowledged", {"node_id": ls.node.id, "task_id": ls.rctx.task_id, "step": step})
-                    # Phase 1: Signal — 取消时也发射 end 信号
-                    _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
-                    _bus.emit(Signal(name="llm.call.end", payload={**_sig_payload, "elapsed_ms": _elapsed, "cancelled": True}, span_id=_span_id))
-                    # [硬取消-场景2] 非流式调用中取消：同上，不存盘未完成的 assistant 消息。
-                    return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id, summary="任务已被用户取消。")
-                if not ls.preempt_after_step and ls.preempt_inject_info is None:
-                    _pi_n = await ls.rctx.check_preempted()
-                    if _pi_n.get("preempted"):
-                        if _pi_n.get("message"):
-                            ls.preempt_inject_info = _pi_n
-                        else:
-                            ls.preempt_after_step = True
+            resp = await wait_provider_call(ls, ls.provider.chat(messages=llm_messages, tools=tools_arg), step)
+            if resp is None:
+                _emit_call_end(cancelled=True)
+                return cancelled_action(ls)
 
-        assert resp is not None
-
-        # ---- 提取 token usage ----
-        if resp.usage and isinstance(resp.usage.get("prompt_tokens"), int):
-            ls.last_prompt_tokens = resp.usage["prompt_tokens"]
-            ls.last_usage = dict(resp.usage)
-            ls.compacted = False
-            await ls.rctx.emit_event("context_usage", {
-                "node_id": ls.node.id,
-                "task_id": ls.rctx.task_id,
-                "usage": resp.usage,
-                # 配上真实 token 数，supervisor 侧的字符预算才能按本会话的实际比例裁剪；
-                # 硬编码 3 字符/token 是按英文定的，中文会把预算放大两三倍。
-                "prompt_chars": total_content_chars(llm_messages) + (
-                    len(json.dumps(tools_arg, ensure_ascii=False, default=str)) if tools_arg else 0
-                ),
-            })
+        await record_response_usage(ls, resp, llm_messages, tools_arg)
 
         # ---- 重试判定 ----
         _retry_reason = ""
         _is_empty_ok = resp.ok and not resp.tool_calls and not (resp.text or "").strip()
+        # 被审核拦下的空回复，同一渠道重试只会再被拦一次
+        _blocked_empty = _is_empty_ok and is_filtered(resp)
         if not resp.ok and _is_retryable_error(resp):
-            _retry_reason = resp.error or "unknown"
-        elif _is_empty_ok:
+            _retry_reason = resp.error or error_kind(resp) or "unknown"
+        elif _is_empty_ok and not _blocked_empty:
             _retry_reason = "empty_response"
 
         if _retry_reason and _retry_attempt < ls.retry_max:
@@ -486,13 +356,14 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                 "max_retries": ls.retry_max,
                 "delay_sec": round(_delay, 2),
                 "error": _retry_reason,
+                "error_kind": error_kind(resp),
                 "status_code": resp.status_code,
             })
-            # Phase 1: Signal — 发射重试信号（与现有 emit_event 并行）
             _bus.emit(Signal(
                 name="llm.retry",
                 payload={**_sig_payload, "attempt": _retry_attempt, "error": _retry_reason,
-                         "error_type": "retryable", "status_code": resp.status_code},
+                         "error_type": "retryable", "error_kind": error_kind(resp),
+                         "status_code": resp.status_code},
                 span_id=_span_id,
             ))
             _waited = 0.0
@@ -501,100 +372,65 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                 await asyncio.sleep(_sleep_step)
                 _waited += _sleep_step
                 if await ls.rctx.check_cancelled():
-                    await ls.rctx.emit_event("cancel_acknowledged", {
-                        "node_id": ls.node.id, "task_id": ls.rctx.task_id, "step": step,
-                    })
-                    # Phase 1: Signal — 重试等待期间取消，发射 end 信号
-                    _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
-                    _bus.emit(Signal(name="llm.call.end", payload={**_sig_payload, "elapsed_ms": _elapsed, "cancelled": True}, span_id=_span_id))
-                    return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id, summary="任务已被用户取消。")
-                if not ls.preempt_after_step and ls.preempt_inject_info is None:
-                    _pi_r = await ls.rctx.check_preempted()
-                    if _pi_r.get("preempted"):
-                        if _pi_r.get("message"):
-                            ls.preempt_inject_info = _pi_r
-                        else:
-                            ls.preempt_after_step = True
+                    await _acknowledge_cancel(ls, step)
+                    _emit_call_end(cancelled=True)
+                    return cancelled_action(ls)
+                await poll_preempt(ls)
             resp = None
-            continue  # 重试
+            continue
 
-        # ---------------------------------------------------------------
-        # [fix 2026-07-17] 空响应重试耗尽后，转成可 fallback 的失败响应。
-        # 原因：empty_response 时 provider 返回 ok=True（只是没有 text/tool_calls），
-        # 重试上限用尽后若仍保持 ok=True，会绕过 after_llm_call 的 fallback_provider
-        # hook（该 hook 仅在 ok=False 时介入），导致系统节点（如 system.compactor）
-        # 在同一个空响应模型上原地空转，直到 max_steps 才失败——正是压缩节点卡死的根因。
-        # 做法：把持续空响应改写为 ok=False（保留 status_code），交给下游 fallback。
-        # 目的：让空响应也能走备选渠道，而不是无意义地拖垮整条会话。
-        # ---------------------------------------------------------------
-        if _is_empty_ok and _retry_attempt >= ls.retry_max:
-            from providers.base import ProviderResponse as _PR
-            resp = _PR(
-                ok=False,
-                text=resp.text,
-                tool_calls=list(resp.tool_calls or []),
-                reasoning=resp.reasoning,
-                error=f"empty_response (retried {_retry_attempt} times)",
-                status_code=resp.status_code,
-                usage=resp.usage,
+        # 空回复保持 ok=True 的话 after_llm_call 里的备用渠道 hook 不会介入，
+        # 系统节点会在同一个只回空的模型上一直空转到 max_steps
+        if _blocked_empty:
+            resp = with_changes(
+                resp, ok=False, error_kind="content_filter",
+                error=f"response blocked by the provider ({getattr(resp, 'finish_reason', '')})",
             )
+        elif _is_empty_ok and _retry_attempt >= ls.retry_max:
+            resp = with_changes(resp, ok=False, error=f"empty_response (retried {_retry_attempt} times)")
 
-        # ---------------------------------------------------------------
-        # P5a Reactive Compact: 检测 "request too long" 类错误时，剥离旧
-        # tool_result 内容并重试一次。目的是在 413 / context_length_exceeded
-        # 等不可重试错误触发时提供一层安全网，而不是直接报错给用户。
-        # 只尝试一次（_reactive_compact_done 标记），避免无限循环。
-        # ---------------------------------------------------------------
-        if not resp.ok and not _is_retryable_error(resp):
-            _err_text = (resp.error or "").lower()
-            _is_too_long = (
-                resp.status_code == 413
-                or "too long" in _err_text
-                or "too large" in _err_text
-                or "context_length" in _err_text
-                or "max_tokens" in _err_text
-                or "maximum context" in _err_text
-                or "token limit" in _err_text
+        # 请求超出上下文窗口：截短旧工具结果再试一次，只试一次
+        if (
+            not resp.ok
+            and not _is_retryable_error(resp)
+            and is_context_overflow(resp)
+            and not getattr(ls, '_reactive_compact_done', False)
+        ):
+            ls._reactive_compact_done = True
+            # 刚才那次请求已经按 request_view 截过旧结果，这里连最近一轮也一起截；比它短不了就不必再发
+            _sent_view = request_view(ls.messages)
+            _request_messages, _ = bounded_tool_result_view(
+                ls.messages, max_chars=2_000, keep_latest_round=False,
             )
-            if _is_too_long and not getattr(ls, '_reactive_compact_done', False):
-                ls._reactive_compact_done = True  # 只尝试一次
-                # 从尾部往前找 tool_result，保留最近 3 个，清除其余
-                _request_messages, _rc_cleared = bounded_tool_result_view(
-                    ls.messages, max_chars=2_000, keep_latest_round=True,
+            _rc_cleared = sum(
+                1 for _sent, _bounded in zip(_sent_view, _request_messages)
+                if _sent.get("content") != _bounded.get("content")
+            )
+            if _rc_cleared:
+                await ls.rctx.emit_event("reactive_compact", {
+                    "node_id": ls.node.id, "step": step,
+                    "cleared": _rc_cleared, "error": resp.error or "",
+                })
+                llm_messages = provider_messages(
+                    _request_messages, formatter=ls.formatter, provider=ls.provider,
+                    workspace_root=ls.rctx.workspace_root, strip_images=strip_images,
                 )
-                if not _rc_cleared:
-                    _request_messages, _rc_cleared = bounded_tool_result_view(
-                        ls.messages, max_chars=2_000, keep_latest_round=False,
-                    )
-                if _rc_cleared:
-                    await ls.rctx.emit_event("reactive_compact", {
-                        "node_id": ls.node.id, "step": step,
-                        "cleared": _rc_cleared, "error": resp.error or "",
-                    })
-                    # 重建本次请求视图，重新走 build_llm_messages + prepare 流程。
-                    _formatted = _build_messages_for_provider(_request_messages, ls.formatter, ls.provider)
-                    llm_messages = prepare_messages_for_llm(_formatted, ls.rctx.workspace_root)
-                    if _node_strips_images(ls.node):
-                        llm_messages = _strip_image_blocks(llm_messages)
-                    resp = None
-                    continue  # 重试
+                resp = None
+                continue
 
-        break  # 成功或不可重试，退出重试循环
+        break
 
-    # Phase 1: Signal — 循环结束，发射 llm.call.end 信号
-    # 此时 resp 可能是成功响应，也可能是不可重试的失败响应
-    _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
-    _end_payload = {**_sig_payload, "elapsed_ms": _elapsed, "attempt": _retry_attempt + 1, "ok": resp.ok}
+    _end_payload: dict[str, Any] = {"attempt": _retry_attempt + 1, "ok": resp.ok}
     if not resp.ok:
         _end_payload["error"] = resp.error or "unknown"
-        # Phase 1: Signal — 不可重试错误，额外发射 llm.error 信号
+        _end_payload["error_kind"] = error_kind(resp)
         _bus.emit(Signal(
             name="llm.error",
             payload={**_sig_payload, "error": resp.error or "unknown", "retryable": False,
-                     "status_code": resp.status_code},
+                     "error_kind": error_kind(resp), "status_code": resp.status_code},
             span_id=_span_id,
         ))
-    _bus.emit(Signal(name="llm.call.end", payload=_end_payload, span_id=_span_id))
+    _emit_call_end(**_end_payload)
 
     return resp
 

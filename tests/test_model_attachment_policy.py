@@ -403,6 +403,7 @@ _CONTEXT_FIELDS = {
     "supervisor_url", "session_id", "run_id", "worker_id", "workspace_root", "http", "registry",
     "task_id", "session_generation", "parent_session_id", "conversation_key",
     "approval_poll_interval_sec", "approval_timeout_sec", "tool_call_id", "node_id", "platform_auth",
+    "claim_id",
 }
 
 
@@ -439,6 +440,14 @@ def test_build_tool_context_fills_every_field_from_the_run_context(tmp_path: Pat
     assert ctx.platform_auth == auth and ctx.platform_auth is not auth
     assert ctx.approval_poll_interval_sec == 0.5
     assert ctx.approval_timeout_sec == 3600.0
+    assert ctx.claim_id == ""
+
+
+def test_build_tool_context_carries_the_task_claim(tmp_path: Path) -> None:
+    ls = _loop_state(tmp_path)
+    ls.rctx.claim_id = "claim-3"
+
+    assert build_tool_context(ls).claim_id == "claim-3"
 
 
 def test_build_tool_context_carries_the_node_level_extras(tmp_path: Path) -> None:

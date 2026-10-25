@@ -19,6 +19,24 @@ PLUGIN_META = {
 }
 
 
+# cache_read_tokens / reasoning_tokens 是各家 provider 归一化后的可选项：
+# 缓存命中按一折计价、推理量算在输出里，不累加就看不出开缓存和开思考的实际代价。
+_USAGE_KEYS = (
+    "prompt_tokens", "completion_tokens", "total_tokens",
+    "cache_read_tokens", "cache_write_tokens", "reasoning_tokens",
+)
+
+
+def accumulate_usage(total: dict, usage: dict) -> bool:
+    """把一次请求的用量加进任务累计，返回有没有加上东西。"""
+    added = False
+    for usage_key in _USAGE_KEYS:
+        if usage_key in usage:
+            total[usage_key] = total.get(usage_key, 0) + usage[usage_key]
+            added = True
+    return added
+
+
 class UsageTracker:
     """Accumulate provider token usage after each LLM call."""
 
@@ -36,17 +54,6 @@ class UsageTracker:
         usage = getattr(ctx.response, "usage", None)
         if not usage or not isinstance(usage, dict) or ctx.rctx is None:
             return None
-
-        modified = False
-        # cache_read_tokens / reasoning_tokens 是各家 provider 归一化后的可选项：
-        # 缓存命中按一折计价、推理量算在输出里，不累加就看不出开缓存和开思考的实际代价。
-        for usage_key in (
-            "prompt_tokens", "completion_tokens", "total_tokens",
-            "cache_read_tokens", "cache_write_tokens", "reasoning_tokens",
-        ):
-            if usage_key in usage:
-                ctx.rctx.total_usage[usage_key] = ctx.rctx.total_usage.get(usage_key, 0) + usage[usage_key]
-                modified = True
-        if modified:
+        if accumulate_usage(ctx.rctx.total_usage, usage):
             return hook_result(modified=True)
         return None

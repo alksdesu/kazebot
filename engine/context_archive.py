@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from clonoth_runtime import get_int, load_runtime_config
-from engine.eventlog_rotation import eventlog_file_lock, eventlog_lock_path
+from file_lock import exclusive_lock
 
 
 MAX_PAGE_CHARS = 20_000
@@ -97,7 +97,7 @@ class ContextArchiveStore:
     def __init__(self, workspace_root: Path):
         self.workspace_root = _resolved(Path(workspace_root))
         self.path = self.workspace_root / "data" / "context_archive.sqlite3"
-        self._initialization_path = self.path.with_suffix(".initialize")
+        self._initialization_lock = self.path.with_name(f".{self.path.name}.init.lock")
 
     @property
     def retention_days(self) -> int:
@@ -112,7 +112,7 @@ class ContextArchiveStore:
     def _check_path(self) -> None:
         for path in (
             self.path.parent, self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm"),
-            eventlog_lock_path(self._initialization_path),
+            self._initialization_lock,
         ):
             if not _resolved(path).is_relative_to(self.workspace_root):
                 raise ValueError("Context archive path escapes workspace")
@@ -166,7 +166,7 @@ class ContextArchiveStore:
         connection = None
         try:
             # Only initialization needs this lock; normal WAL transactions use SQLite's own locks.
-            with eventlog_file_lock(self._initialization_path):
+            with exclusive_lock(self._initialization_lock):
                 connection = sqlite3.connect(self.path, timeout=10, isolation_level=None)
                 connection.row_factory = sqlite3.Row
                 connection.execute("PRAGMA busy_timeout=10000")
@@ -246,6 +246,57 @@ class ContextArchiveStore:
             except BaseException:
                 connection.rollback()
                 raise
+
+    def archive_each(self, session_id: str, messages: list[Any], *, reason: str) -> int:
+        """每条消息单独归档，内容相同的已有归档不再重复写；返回新写入的条数。
+
+        同一条原文会被反复处理（比如每次空闲后都清空的旧工具结果），整份上下文一起归档会一遍遍重存。
+        """
+        session_id = _session_id(session_id)
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 128:
+            raise ValueError("Archive reason must contain 1 to 128 characters")
+        records = [message.to_dict() if hasattr(message, "to_dict") else message for message in messages]
+        if any(not isinstance(record, dict) for record in records):
+            raise ValueError("Archive messages must contain objects")
+        if not records:
+            return 0
+        written = 0
+        with self._connect(create=True) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                now = time.time()
+                cutoff = now - self.retention_days * 86400
+                for record in records:
+                    data = _json(record)
+                    source_hash = hashlib.sha256(("[" + data + "]").encode("utf-8")).hexdigest()
+                    connection.execute(
+                        "DELETE FROM archives WHERE session_id=? AND reason=? AND source_hash=? AND created_at<=?",
+                        (session_id, reason, source_hash, cutoff),
+                    )
+                    if connection.execute(
+                        "SELECT 1 FROM archives WHERE session_id=? AND reason=? AND source_hash=?",
+                        (session_id, reason, source_hash),
+                    ).fetchone() is not None:
+                        continue
+                    archive_id = hashlib.sha256(
+                        _json([session_id, reason, source_hash, uuid.uuid4().hex]).encode("utf-8"),
+                    ).hexdigest()
+                    connection.execute(
+                        "INSERT INTO archives VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (archive_id, session_id, now, reason, source_hash, None, 1),
+                    )
+                    text = _search_text(record)
+                    connection.execute(
+                        "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (archive_id, 0, str(record.get("id") or ""), _message_timestamp(record),
+                         str(record.get("role") or ""), text, text.casefold(), data),
+                    )
+                    written += 1
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return written
 
     def search(
         self, session_id: str, query: str = "", after: str = "", before: str = "",

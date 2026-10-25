@@ -1,6 +1,7 @@
 """Signal → JSONL file bridge.
 
-Writes selected signals as JSON lines to data/signals.jsonl.
+Writes selected signals as JSON lines to <workspace>/data/signals.jsonl, with
+full-content payload fields (tool arguments, results, message text) redacted.
 Zero dependency on supervisor — works purely within the engine process.
 
 Usage:
@@ -16,13 +17,28 @@ import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from engine.eventlog_rotation import SIGNALS_BACKUPS, SIGNALS_MAX_BYTES, rotate_event_log
 from engine.signals.types import Signal
 from engine.signals.bus import SignalBus
+from workspace import resolve_workspace_root
 
 log = logging.getLogger(__name__)
+
+# 没配 exclude_patterns 时也不落的事件：高频流式增量，以及整段带着工具参数、工具结果、回复正文的事件。
+DEFAULT_BRIDGE_EXCLUDE_PATTERNS: tuple[str, ...] = (
+    "stream_delta",
+    "tool_call_delta",
+    "tool_call_start",
+    "tool_call_end",
+    "stream_text_final",
+    "intermediate_reply",
+)
+# 落盘前换成占位的 payload 字段：这个文件给监控用，不该成为工具参数、密钥和对话内容的又一份副本。
+DEFAULT_REDACTED_PAYLOAD_KEYS: frozenset[str] = frozenset({
+    "arguments", "args_summary", "result", "raw_inline", "content", "text", "attachments",
+})
 
 _bridge_installed = False
 _SIGNALS_LOG: Optional[Path] = None
@@ -50,6 +66,22 @@ def _maybe_rotate_locked() -> None:
         log.warning("signals log rotation failed", exc_info=True)
 
 
+def _redacted(value: object) -> object:
+    if value in (None, "", [], {}):
+        return value
+    if isinstance(value, str):
+        return f"[redacted {len(value)} chars]"
+    if isinstance(value, (list, tuple)):
+        return f"[redacted {len(value)} items]"
+    return "[redacted]"
+
+
+def _redacted_payload(payload: dict) -> dict:
+    if not _redacted_keys:
+        return payload
+    return {key: _redacted(value) if key in _redacted_keys else value for key, value in payload.items()}
+
+
 def _bridge_handler(signal: Signal) -> None:
     """Append a selected signal as a JSON line to the signals log file."""
     if _SIGNALS_LOG is None:
@@ -68,7 +100,7 @@ def _bridge_handler(signal: Signal) -> None:
     entry = {
         "ts": datetime.fromtimestamp(signal.ts, tz=timezone.utc).isoformat(),
         "name": signal.name,
-        "payload": signal.payload,
+        "payload": _redacted_payload(signal.payload) if isinstance(signal.payload, dict) else signal.payload,
     }
     if signal.trace_id:
         entry["trace_id"] = signal.trace_id
@@ -90,6 +122,8 @@ _install_lock = threading.Lock()
 _bridge_patterns: Optional[list[str]] = None
 # Glob patterns excluded after the optional allowlist is applied.
 _bridge_exclude_patterns: Optional[list[str]] = None
+# Top-level payload keys replaced by a placeholder before writing.
+_redacted_keys: frozenset[str] = DEFAULT_REDACTED_PAYLOAD_KEYS
 
 
 def install_event_bridge(
@@ -97,6 +131,7 @@ def install_event_bridge(
     log_dir: Optional[Path] = None,
     patterns: Optional[list[str]] = None,
     exclude_patterns: Optional[list[str]] = None,
+    redact_keys: Optional[Iterable[str]] = None,
 ) -> None:
     """Install the JSONL file bridge on a SignalBus.
 
@@ -104,21 +139,29 @@ def install_event_bridge(
 
     Args:
         bus: The SignalBus instance to bridge.
-        log_dir: Directory for signals.jsonl. Defaults to data/ relative to workspace root.
+        log_dir: Directory for signals.jsonl. Defaults to the workspace's data/.
         patterns: Optional allowlist of glob patterns. If None, all signals are eligible.
         exclude_patterns: Optional denylist applied after ``patterns``.
+            None means DEFAULT_BRIDGE_EXCLUDE_PATTERNS.
+        redact_keys: Top-level payload keys to redact. None means
+            DEFAULT_REDACTED_PAYLOAD_KEYS; an empty iterable disables redaction.
     """
-    global _bridge_installed, _SIGNALS_LOG, _bridge_patterns, _bridge_exclude_patterns
+    global _bridge_installed, _SIGNALS_LOG, _bridge_patterns, _bridge_exclude_patterns, _redacted_keys
     with _install_lock:
         if _bridge_installed:
             log.debug("Signal bridge already installed, skipping")
             return
         if log_dir is None:
-            log_dir = Path(__file__).resolve().parent.parent.parent / "data"
+            # 多实例部署里代码目录和工作区是分开的，信号文件得落在本实例自己的 data/ 下
+            log_dir = resolve_workspace_root(Path(__file__).resolve().parent.parent.parent) / "data"
+        log_dir = Path(log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
         _SIGNALS_LOG = log_dir / "signals.jsonl"
         _bridge_patterns = patterns
-        _bridge_exclude_patterns = exclude_patterns
+        _bridge_exclude_patterns = (
+            list(DEFAULT_BRIDGE_EXCLUDE_PATTERNS) if exclude_patterns is None else exclude_patterns
+        )
+        _redacted_keys = DEFAULT_REDACTED_PAYLOAD_KEYS if redact_keys is None else frozenset(redact_keys)
         _bridge_installed = True
         # 启动时先补一次：进程重启前积累的体积不该等到再写 512 条才被发现。
         if SIGNALS_MAX_BYTES > 0 and SIGNALS_BACKUPS > 0:
@@ -131,5 +174,5 @@ def install_event_bridge(
             "Signal → JSONL bridge installed: %s (patterns=%s, exclude_patterns=%s)",
             _SIGNALS_LOG,
             patterns,
-            exclude_patterns,
+            _bridge_exclude_patterns,
         )

@@ -8,15 +8,21 @@ See: data/session_conversation_store_design.md
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+import logging
 import os
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import config_layout
-from engine.eventlog_rotation import eventlog_file_lock
+from file_lock import exclusive_lock
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +136,24 @@ class ConversationChangedError(RuntimeError):
     pass
 
 
+_LOCK_DIR_NAME = ".locks"
+_LOCK_STRIPE_CHARS = 2
+
+
+def _append_lines(path: Path, data: bytes) -> None:
+    """追加若干整行。上次写到一半就崩了的话先补换行，半行只坏它自己，不吞掉这次写的第一条。"""
+    with path.open("a+b") as stream:
+        if not data:
+            return
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        if size:
+            stream.seek(size - 1)
+            if stream.read(1) != b"\n":
+                data = b"\n" + data
+        stream.write(data)
+
+
 class ConversationStore:
     """Session-level conversation store backed by JSONL files.
 
@@ -146,6 +170,19 @@ class ConversationStore:
         # 缓存对应的文件指纹 (mtime_ns, size)，用于发现别的进程改过这个文件
         self._cache_stamps: dict[str, tuple[int, int, int]] = {}
 
+    # ── 锁 ──
+
+    def _lock_path(self, session_id: str) -> Path:
+        # 按会话散列到固定数量的锁文件：每个入口分支都是一个新会话，一会话一把锁的话锁文件会无限增长
+        stripe = hashlib.sha1(session_id.encode("utf-8")).hexdigest()[:_LOCK_STRIPE_CHARS]
+        return self._data_dir / _LOCK_DIR_NAME / f"{stripe}.lock"
+
+    @contextmanager
+    def _locked(self, session_id: str) -> Iterator[None]:
+        """跨进程独占这个会话文件；持有者进程死了由操作系统放锁。"""
+        with exclusive_lock(self._lock_path(session_id)):
+            yield
+
     # ── 写入 ──
 
     def append(self, session_id: str, message: Message) -> None:
@@ -157,13 +194,12 @@ class ConversationStore:
         if message.ephemeral:
             return
         path = self._data_dir / f"{session_id}.jsonl"
-        encoded = json.dumps(message.to_dict(), ensure_ascii=False) + "\n"
-        with eventlog_file_lock(path):
+        encoded = (json.dumps(message.to_dict(), ensure_ascii=False) + "\n").encode("utf-8")
+        with self._locked(session_id):
             if self._cache_stamps.get(session_id) != self._file_stamp(path):
                 self.invalidate_cache(session_id)
             try:
-                with path.open("a", encoding="utf-8") as stream:
-                    stream.write(encoded)
+                _append_lines(path, encoded)
             except Exception:
                 self.invalidate_cache(session_id)
                 raise
@@ -177,11 +213,10 @@ class ConversationStore:
         encoded = "".join(
             json.dumps(msg.to_dict(), ensure_ascii=False) + "\n"
             for msg in messages if not msg.ephemeral
-        )
-        with eventlog_file_lock(path):
+        ).encode("utf-8")
+        with self._locked(session_id):
             try:
-                with path.open("a", encoding="utf-8") as stream:
-                    stream.write(encoded)
+                _append_lines(path, encoded)
             finally:
                 self.invalidate_cache(session_id)
 
@@ -200,12 +235,13 @@ class ConversationStore:
         压缩前，下一轮又超阈值。一次 stat 换掉这个。
         """
         path = self._data_dir / f"{session_id}.jsonl"
-        with eventlog_file_lock(path):
+        with self._locked(session_id):
             stamp = self._file_stamp(path)
             cached = self._cache.get(session_id)
             if cached is not None and self._cache_stamps.get(session_id) == stamp:
                 return cached
             messages: list[Message] = []
+            skipped = 0
             if path.exists():
                 with path.open("r", encoding="utf-8") as stream:
                     for line in stream:
@@ -214,7 +250,9 @@ class ConversationStore:
                             try:
                                 messages.append(Message.from_dict(json.loads(line)))
                             except Exception:
-                                pass  # 跳过损坏行，不中断加载
+                                skipped += 1
+            if skipped:
+                logger.warning("conversation %s: skipped %d unreadable line(s)", session_id, skipped)
             self._cache[session_id] = messages
             self._cache_stamps[session_id] = self._file_stamp(path)
             return messages
@@ -224,22 +262,36 @@ class ConversationStore:
     def delete(self, session_id: str) -> None:
         """删除 session 的对话存储文件和缓存。用于 context_reset reason=clear。"""
         path = self._data_dir / f"{session_id}.jsonl"
-        with eventlog_file_lock(path):
+        with self._locked(session_id):
             path.unlink(missing_ok=True)
             self.invalidate_cache(session_id)
+
+    def delete_if_idle_since(self, session_id: str, cutoff: float) -> bool:
+        """文件最后一次修改早于 cutoff（epoch 秒）才删，返回删没删。判断和删除在同一把锁里，刚写进来的不会被删。"""
+        path = self._data_dir / f"{session_id}.jsonl"
+        with self._locked(session_id):
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    return False
+            except FileNotFoundError:
+                return False
+            path.unlink(missing_ok=True)
+            self.invalidate_cache(session_id)
+            return True
 
     def replace_all(self, session_id: str, messages: list[Message]) -> None:
         """完整写入临时文件后替换历史，失败时保留旧文件。"""
         path = self._data_dir / f"{session_id}.jsonl"
-        with eventlog_file_lock(path):
+        with self._locked(session_id):
             expected_stamp = self._cache_stamps.get(session_id)
             if expected_stamp is not None and expected_stamp != self._file_stamp(path):
                 self.invalidate_cache(session_id)
                 raise ConversationChangedError(f"conversation changed before replacement: {session_id}")
             temporary: Path | None = None
             try:
+                # 换行固定写 \n：追加走字节写，Windows 上文本模式会写成 \r\n，同一个文件就混了两种换行
                 with tempfile.NamedTemporaryFile(
-                    mode="w", encoding="utf-8", dir=path.parent,
+                    mode="w", encoding="utf-8", newline="\n", dir=path.parent,
                     prefix=f".{path.name}.", suffix=".tmp", delete=False,
                 ) as stream:
                     temporary = Path(stream.name)
@@ -286,3 +338,38 @@ class ConversationStore:
         """手动使缓存失效，下次 load 时强制从文件重新读取。"""
         self._cache.pop(session_id, None)
         self._cache_stamps.pop(session_id, None)
+
+
+class ConversationWriter:
+    """一个任务的对话写入：按提交顺序在后台线程里追加，事件循环不等磁盘。
+
+    读同一份历史之前、任务结果交回 supervisor 之前都要先 flush。
+    """
+
+    def __init__(self, store: ConversationStore) -> None:
+        self.store = store
+        self._last: asyncio.Future | None = None
+
+    def submit(self, session_id: str, message: Message) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._write(session_id, message)
+            return
+        self._last = asyncio.ensure_future(self._write_after(self._last, session_id, message))
+
+    async def _write_after(self, previous: asyncio.Future | None, session_id: str, message: Message) -> None:
+        if previous is not None and not previous.done():
+            await asyncio.wait({previous})
+        await asyncio.to_thread(self._write, session_id, message)
+
+    def _write(self, session_id: str, message: Message) -> None:
+        try:
+            self.store.append(session_id, message)
+        except Exception:
+            logger.exception("conversation write failed: session=%s message=%s", session_id, message.id)
+
+    async def flush(self) -> None:
+        last = self._last
+        if last is not None and not last.done():
+            await asyncio.wait({last})

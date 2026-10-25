@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from engine.inference.tool_format import JsonToolFormatter
+from engine.inference.tool_format import JsonToolFormatter, invalid_arguments
 from providers.base import ProviderResponse
 
 _SCRIPT = "python3 -c \"\nimport os, json\nprint('hi')\n\""
@@ -81,24 +81,34 @@ class TestEndToEnd:
 
 
 class TestRepairFallback:
-    """宽松解析都救不回来时，至少要把多行参数捞出来。"""
+    """宽松解析也救不回来时，只替 finish / ask / reply 补全；会动文件、跑命令的工具不拿猜出来的参数去执行。"""
 
-    def test_command_is_recovered_from_a_truncated_call(self) -> None:
+    def test_a_truncated_command_is_not_guessed(self) -> None:
         # 少了结尾的 }}，宽松解析也无能为力。
         raw = '<<<TOOL_CALL>>>\n{"name": "execute_command", "arguments": {"command": "ls -la'
-        repaired = JsonToolFormatter._repair_tool_call_json(raw)
 
-        assert repaired is not None
-        assert repaired["name"] == "execute_command"
-        assert repaired["arguments"]["command"] == "ls -la"
+        assert JsonToolFormatter._repair_tool_call_json(raw) is None
 
-    def test_write_file_keeps_both_path_and_content(self) -> None:
+    def test_the_broken_command_comes_back_as_a_call_that_will_not_run(self) -> None:
+        raw = '<<<TOOL_CALL>>>\n{"name": "execute_command", "arguments": {"command": "ls -la'
+        calls = JsonToolFormatter().parse_tool_calls(ProviderResponse(ok=True, text=raw))
+
+        assert len(calls) == 1
+        assert calls[0].name == "execute_command"
+        assert invalid_arguments(calls[0].arguments) is not None
+
+    def test_write_file_is_not_guessed_either(self) -> None:
         raw = ('<<<TOOL_CALL>>>\n{"name": "write_file", "arguments": '
                '{"path": "a.txt", "content": "正文')
-        repaired = JsonToolFormatter._repair_tool_call_json(raw)
 
-        assert repaired["arguments"]["path"] == "a.txt"
-        assert repaired["arguments"]["content"] == "正文"
+        assert JsonToolFormatter._repair_tool_call_json(raw) is None
+
+    def test_a_broken_finish_is_still_repaired(self) -> None:
+        raw = '<<<TOOL_CALL>>>\n{"name": "finish", "arguments": {"text": "第一行\n第二行'
+
+        assert JsonToolFormatter._repair_tool_call_json(raw) == {
+            "name": "finish", "arguments": {"text": "第一行\n第二行"},
+        }
 
     def test_a_tool_with_nothing_recoverable_is_still_refused(self) -> None:
         # 捞不到任何已知参数的非终止工具，宁可判失败也不要瞎调。

@@ -1,4 +1,6 @@
 from __future__ import annotations
+import logging
+from copy import deepcopy
 from datetime import datetime, timezone
 from uuid import uuid4
 from engine.conversation_routing import routing_meta
@@ -6,6 +8,7 @@ from engine.conversation_routing import routing_meta
 from typing import Any
 
 from engine.attachments import build_multimodal_content
+from engine.inference.loop_state import conversation_writer, flush_conversation_writes
 from engine.memory_subjects import resolve_load_subjects
 from engine.output_guide import (
     OUTPUT_GUIDE_KEY,
@@ -21,6 +24,7 @@ from .result import hook_result
 from .knowledge_inject import build_knowledge_context
 from engine.protocol import ACTION_CANCELLED, TaskAction
 
+logger = logging.getLogger(__name__)
 
 # Why: the built-in loader discovers handlers from per-file metadata.
 # How: declare the handler class, hook methods, and priority in one place.
@@ -88,13 +92,7 @@ class PreemptChecker:
 
 
 async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
-    """Inject a pending preempt message into the loop state.
-
-    Why: the next LLM prompt must include the user's new message instead of
-    finishing stale work. How: remove old dynamic messages, rebuild dynamic
-    skill and memory context, append the preempt user input, and acknowledge the
-    runtime. Purpose: keep Preempt V2 behavior identical after extraction.
-    """
+    """把待注入的抢占消息接进本轮：换掉旧的动态上下文，追加用户新消息并落盘，再回执 supervisor。"""
     new_instruction = ls.preempt_inject_info.get("message", "")
     new_attachments = ls.preempt_inject_info.get("attachments", [])
     memory_hints = ls.preempt_inject_info.get("memory_hints")
@@ -177,50 +175,35 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
         **({"attachments": list(new_attachments)} if new_attachments else {}),
     }
 
-    # [Fork/Merge 2026-05-12] Persist the injected preempt user message to ConversationStore.
-    # Why: before this hook was extracted, preempt injection only mutated the in-memory prompt,
-    # so a branch task could lose the new user message when it resumed or later merged. How:
-    # append a USER_INPUT record to the active runtime session, preferring child_session_id for
-    # delegated child nodes and otherwise using rctx.session_id, which may be an entry branch.
-    # Purpose: preempted branch histories remain complete and merge back with the injected input.
-    try:
-        store = getattr(ls.rctx, "conversation_store", None)
-        if store is not None and (new_instruction or new_attachments):
-            from engine.conversation_store import Message, MessageType
+    # 抢占注入的用户消息也要落盘，分支任务恢复或合并回主会话时才不会丢这一条
+    if new_instruction or new_attachments:
+        try:
+            writer = conversation_writer(ls.rctx)
+            if writer is not None:
+                from engine.conversation_store import Message, MessageType
 
-            target_session = getattr(ls.rctx, "child_session_id", "") or ls.rctx.session_id
-            # [AutoC 2026-06-01] Why: preempt messages with attachments were
-            # appended to the live prompt as multimodal content but persisted as
-            # plain text, so a resume inside the same task lost the image. How:
-            # build the same multimodal content for ConversationStore when
-            # attachments are present. Purpose: injected user input follows the
-            # same task-local image retention rule as initial task input.
-            if new_attachments:
-                persisted_content = build_multimodal_content(
-                    new_instruction,
-                    new_attachments,
-                    workspace_root=ls.rctx.workspace_root,
+                target_session = getattr(ls.rctx, "child_session_id", "") or ls.rctx.session_id
+                writer.submit(
+                    target_session,
+                    Message(
+                        id=message_id,
+                        role="user",
+                        # 落盘的和发给模型的是同一份内容，带图时同任务内恢复还看得到图
+                        content=deepcopy(ls.messages[-1]["content"]),
+                        message_type=MessageType.USER_INPUT,
+                        created_at=timestamp,
+                        meta={
+                            **routing_meta(task_context),
+                            **({"attachments": list(new_attachments)} if new_attachments else {}),
+                        },
+                        source_node_id=getattr(ls.node, "id", ""),
+                        source_task_id=getattr(ls.rctx, "task_id", ""),
+                    ),
                 )
-            else:
-                persisted_content = new_instruction
-            store.append(
-                target_session,
-                Message(
-                    id=message_id,
-                    role="user",
-                    content=persisted_content,
-                    message_type=MessageType.USER_INPUT,
-                    created_at=timestamp,
-                    meta={
-                        **routing_meta(task_context),
-                        **({"attachments": list(new_attachments)} if new_attachments else {}),
-                    },
-                    source_node_id=getattr(ls.node, "id", ""),
-                    source_task_id=getattr(ls.rctx, "task_id", ""),
-                ),
-            )
-    except Exception:
-        pass
+        except Exception:
+            logger.exception("persisting preempt message failed: task=%s", getattr(ls.rctx, "task_id", ""))
+        # 先落盘再回执：supervisor 收到回执就丢掉这条消息，中间崩了用户这句话就没了
+        await flush_conversation_writes(ls.rctx)
 
     revision = ls.preempt_inject_info.get("revision")
     if isinstance(revision, int) and not isinstance(revision, bool):

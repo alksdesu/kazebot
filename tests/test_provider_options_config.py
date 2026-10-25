@@ -21,7 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from clonoth_runtime import DEFAULT_RUNTIME_CONFIG  # noqa: E402
 from engine.runner import _merge_provider_options  # noqa: E402
+from engine.attachments import contains_image_blocks  # noqa: E402
 from engine.builtin import fallback_provider as fallback_module  # noqa: E402
+from engine.inference import llm_call  # noqa: E402
 
 
 def test_default_openai_provider_declares_options_dict() -> None:
@@ -161,12 +163,12 @@ def test_vision_fallback_preserves_image_blocks(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(fallback_module, "_create_fallback_provider", lambda **kwargs: _Provider())
     monkeypatch.setattr(
-        fallback_module,
+        llm_call,
         "_build_messages_for_provider",
         lambda messages, formatter, provider: messages,
     )
     monkeypatch.setattr(
-        fallback_module,
+        llm_call,
         "prepare_messages_for_llm",
         lambda messages, workspace_root: messages,
     )
@@ -175,7 +177,7 @@ def test_vision_fallback_preserves_image_blocks(tmp_path, monkeypatch) -> None:
     asyncio.run(fallback_module.FallbackProviderHandler().handle(ctx))
 
     assert ctx.response.ok is True
-    assert fallback_module._messages_contain_images(captured["messages"])
+    assert contains_image_blocks(captured["messages"])
 
 
 def test_fallback_entry_inherits_options_from_its_provider_block() -> None:

@@ -14,6 +14,7 @@ from toolbox.registry import ToolRegistry
 from providers.base import BaseProvider
 from ..node import Node
 from ..context_store import save_context_snapshot, write_context_snapshot
+from ..conversation_store import ConversationWriter
 
 if TYPE_CHECKING:
     from ..context import RunContext
@@ -112,6 +113,9 @@ class _LoopState:
     compact_keep_recent_tokens: int = 0
     compacted: bool = False
     compact_async_requested: bool = False
+    # 同步压缩失败过一次，本任务内不再挂起当轮去压：当前段自己超限时 supervisor 压不出东西，再发只会来回空转
+    hard_compact_disabled: bool = False
+    resume_data: dict[str, Any] | None = None
     last_prompt_tokens: int | None = None
     last_usage: dict | None = None  # 最近一次 LLM resp.usage，用于写入 assistant 消息 meta
 
@@ -122,6 +126,8 @@ class _LoopState:
     retry_backoff: float = 2.0
     plaintext_retry_count: int = 0
     plaintext_retry_max: int = 2
+    truncation_retry_count: int = 0
+    truncation_retry_max: int = 2
 
     # ---- Preempt ----
     preempt_after_step: bool = False
@@ -154,6 +160,26 @@ class _LoopState:
     # 由 _shadow_write() 更新，_persist_ctx() 写入 snapshot 的 last_message_id 字段，
     # 为后续 snapshot 瘦身（不再存完整 messages 数组）做准备。
     last_shadow_message_id: str = ""
+
+
+def conversation_writer(rctx: Any) -> ConversationWriter | None:
+    """本任务的对话写入器，挂着 conversation_store 才有。"""
+    writer = getattr(rctx, "conversation_writer", None)
+    if isinstance(writer, ConversationWriter):
+        return writer
+    store = getattr(rctx, "conversation_store", None)
+    if store is None:
+        return None
+    writer = ConversationWriter(store)
+    rctx.conversation_writer = writer
+    return writer
+
+
+async def flush_conversation_writes(rctx: Any) -> None:
+    """等本任务提交过的对话写入全部落盘。"""
+    writer = getattr(rctx, "conversation_writer", None)
+    if isinstance(writer, ConversationWriter):
+        await writer.flush()
 
 
 def compact_target_session_id(ls: _LoopState) -> str:
@@ -198,6 +224,7 @@ def build_tool_context(ls: _LoopState, *, tool_call_id: str = "") -> ToolContext
         # 审批卡按 tool_call_id 挂到对应的工具卡片上
         tool_call_id=tool_call_id,
         node_id=ls.node.id,
+        claim_id=str(getattr(ls.rctx, "claim_id", "") or ""),
     )
     # 插件（如 save_memory）从 node.extra 读节点级配置，不必再读一遍 yaml
     ctx._node_id = ls.node.id  # type: ignore[attr-defined]

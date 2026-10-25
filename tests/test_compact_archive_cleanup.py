@@ -68,19 +68,34 @@ def run_cleanup(mode, ctx, state):
     return asyncio.run(compact._check_and_compact(ctx, state))
 
 
-@pytest.mark.parametrize("fail_archive", [False, True])
-def test_microcompact_archives_original_before_mutating_nested_history(tmp_path, monkeypatch, fail_archive):
-    stamp = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+def idle_tool_history(stamp):
     messages = [{"role": "assistant", "content": "tools", "_meta": {"timestamp": stamp}}]
     messages.extend(
         {"role": "user", "content": f'Tool result for "tool_{number}"\nOriginal output {number}',
          "_meta": {"message_type": "tool_result", "timestamp": stamp}}
         for number in range(7)
     )
+    return messages
+
+
+def all_archived_messages(tmp_path, session_id="session"):
+    archive = ContextArchiveStore(tmp_path)
+    archive_ids = {match["archive_id"] for match in archive.search(session_id, limit=50)["matches"]}
+    return [
+        item["message"]
+        for archive_id in archive_ids
+        for item in archive.read(session_id, archive_id, limit=50)["messages"]
+    ]
+
+
+@pytest.mark.parametrize("fail_archive", [False, True])
+def test_microcompact_archives_original_before_mutating_nested_history(tmp_path, monkeypatch, fail_archive):
+    stamp = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    messages = idle_tool_history(stamp)
     original = deepcopy(messages)
     ctx, state = loop_state(tmp_path, messages)
     if fail_archive:
-        monkeypatch.setattr(ContextArchiveStore, "archive", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("archive unavailable")))
+        monkeypatch.setattr(ContextArchiveStore, "archive_each", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("archive unavailable")))
     modified = asyncio.run(compact._run_idle_cleanup(ctx, state))
     assert messages == original
     if fail_archive:
@@ -89,9 +104,28 @@ def test_microcompact_archives_original_before_mutating_nested_history(tmp_path,
         assert modified is True
         assert "Original output 0" not in state.messages[1]["content"]
         assert ctx.messages is state.messages
-        archived = [item["message"] for item in archived_messages(tmp_path)]
-        assert archived == original
+        # only the two results that were cleared are archived, one archive per message
+        archived = sorted(all_archived_messages(tmp_path), key=lambda message: message["content"])
+        assert archived == [original[1], original[2]]
         assert ContextArchiveStore(tmp_path).search("session", after=stamp)["matches"]
+
+
+def test_microcompact_does_not_archive_the_same_original_twice(tmp_path):
+    stamp = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    for _ in range(2):
+        ctx, state = loop_state(tmp_path, idle_tool_history(stamp))
+        assert asyncio.run(compact._run_idle_cleanup(ctx, state)) is True
+    assert len(all_archived_messages(tmp_path)) == 2
+
+
+def test_microcompact_leaves_already_cleared_results_alone(tmp_path):
+    stamp = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    ctx, state = loop_state(tmp_path, idle_tool_history(stamp))
+    asyncio.run(compact._run_idle_cleanup(ctx, state))
+    cleared = deepcopy(state.messages)
+    ctx, state = loop_state(tmp_path, cleared)
+    assert asyncio.run(compact._run_idle_cleanup(ctx, state)) is False
+    assert state.messages is cleared
 
 
 @pytest.mark.parametrize("mode", ["proactive", "threshold"])

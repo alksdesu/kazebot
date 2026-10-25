@@ -29,6 +29,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct ``python engine/data_cl
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:  # 直接 ``python engine/data_cleanup.py`` 时项目根不在路径上
     sys.path.insert(0, str(_REPO_ROOT))
+from engine.conversation_store import ConversationStore  # noqa: E402
 from engine.builtin.knowledge_inject import (  # noqa: E402
     MemoryBookUnreadable,
     _load_book,
@@ -162,6 +163,14 @@ def _unlink(path: Path) -> None:
         logging.info("[dry-run] would delete file %s", path)
         return
     path.unlink()
+
+
+def _unlink_idle_conversation(path: Path, cutoff: float) -> bool:
+    """超期的会话文件拿着会话锁再判一次才删：两次判断之间有人写进来的话不删。"""
+    if DRY_RUN:
+        logging.info("[dry-run] would delete file %s", path)
+        return True
+    return ConversationStore(path.parent).delete_if_idle_since(path.stem, cutoff)
 
 
 def _rmdir(path: Path) -> None:
@@ -467,8 +476,7 @@ def purge_expired_child_sessions():
     deleted = 0
     for p in [*conv_dir.glob("child_*.jsonl"), *conv_dir.glob("branch_*.jsonl")]:
         try:
-            if p.is_file() and p.stat().st_mtime < cutoff:
-                _unlink(p)
+            if p.is_file() and p.stat().st_mtime < cutoff and _unlink_idle_conversation(p, cutoff):
                 deleted += 1
         except Exception:
             pass
@@ -509,8 +517,7 @@ def purge_expired_task_conversations():
             continue
         path = conv_dir / f"{session_id}.jsonl"
         try:
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                _unlink(path)
+            if path.is_file() and path.stat().st_mtime < cutoff and _unlink_idle_conversation(path, cutoff):
                 deleted += 1
         except Exception:
             pass

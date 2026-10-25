@@ -39,17 +39,20 @@ engine:
   http:
     client_timeout_sec: 60.0
 
-  # Phase 0/1 Signal System：轻量级进程内信号总线配置。
-  # bus 在 _run_node_task 中初始化，bridge 将信号写入 data/signals.jsonl。
+  # 进程内信号总线；bridge 把信号写进工作区的 data/signals.jsonl 供监控用。
+  # 落盘前 payload 里的工具参数、工具结果、正文字段一律换成占位，这里删掉排除项也不会写出原文。
   signals:
     enabled: true                # false 时 emit 零开销跳过
     bridge_patterns: null        # 可选允许列表；null = 所有信号均可进入 bridge
-    # 排除高频流式增量和包含完整工具结果的重复事件；关键完成信息仍由
-    # stream_text_final、tool.call.end 及 supervisor events.jsonl 保留。
+    # 排除高频流式增量和整段带着工具参数、结果、回复正文的事件；工具耗时和成败
+    # 仍由 tool.call.start / tool.call.end 记录，完整事件在 supervisor 的 events.jsonl。
     bridge_exclude_patterns:
       - stream_delta
       - tool_call_delta
+      - tool_call_start
       - tool_call_end
+      - stream_text_final
+      - intermediate_reply
 
   # 长工具链跑完后，supervisor 另起一个摘要节点给这一轮写摘要
   turn_summary:

@@ -19,16 +19,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from engine.compaction_plan import _tool_call_ids, record_dict, record_meta, record_task_id
+from engine.compact import is_tool_result_message
 
 log = logging.getLogger(__name__)
 
 
-# [AutoC 2026-05-13] Why: L2 snip summaries need one shared marker after the
-# L3 pure-concatenation rollback. How: keep only the marker used by snip_history
-# and remove the aggregate-specific constants/helpers. Purpose: avoid retaining
-# a broken summary-merge path while preserving existing L2 behavior.
 _SNIP_MARKER = "[Task summary — original messages snipped]"
 _SNIP_RETRIEVAL = "Original messages can be retrieved with search_context_archive and read_context_archive."
+
+# 版本 2 起 summary 只由轮摘要回写，任务自己的结局短语记在 outcome。
+# 旧记录的 summary 可能是 "max_steps reached"、报错原文或回复前 240 字，拿来顶替原文会永久丢信息。
+TASK_RECORD_VERSION = 2
 
 
 @dataclass
@@ -48,10 +49,12 @@ class TaskRecord:
     step_count: int = 0
     tool_call_count: int = 0
     token_usage: dict = field(default_factory=dict)  # {prompt_tokens, completion_tokens, total_tokens}
-    summary: str = ""               # TaskAction.summary
+    summary: str = ""               # 轮摘要，L2 snip 只认它
     error: str = ""                 # error message if failed
     child_session_id: str = ""      # if this was a child session task
     compressed: bool = False         # marked True when task messages replaced by summary
+    outcome: str = ""               # TaskAction.summary
+    version: int = TASK_RECORD_VERSION
 
     def to_dict(self) -> dict:
         """Serialize, omitting empty/default fields to reduce JSONL size."""
@@ -76,11 +79,27 @@ class TaskRecord:
             d["child_session_id"] = self.child_session_id
         if self.compressed:
             d["compressed"] = True
+        if self.outcome:
+            d["outcome"] = self.outcome
+        # 旧记录读进来时 summary 已清空，之后再出现的 summary 只可能是轮摘要回写的，按新版本写出才不会再被降级
+        d["version"] = max(self.version, TASK_RECORD_VERSION) if self.summary else self.version
         return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "TaskRecord":
-        """Deserialize from a JSON dict. Missing fields get defaults."""
+        """Deserialize from a JSON dict. Missing fields get defaults.
+
+        没有 version 的旧记录，summary 来路不明，降级为 outcome。
+        """
+        try:
+            version = int(data.get("version") or 1)
+        except (TypeError, ValueError):
+            version = 1
+        summary = str(data.get("summary") or "")
+        outcome = str(data.get("outcome") or "")
+        if version < TASK_RECORD_VERSION:
+            outcome = outcome or summary
+            summary = ""
         return cls(
             task_id=data.get("task_id", ""),
             session_id=data.get("session_id", ""),
@@ -91,11 +110,37 @@ class TaskRecord:
             step_count=data.get("step_count", 0),
             tool_call_count=data.get("tool_call_count", 0),
             token_usage=data.get("token_usage", {}),
-            summary=data.get("summary", ""),
+            summary=summary,
             error=data.get("error", ""),
             child_session_id=data.get("child_session_id", ""),
             compressed=data.get("compressed", False),
+            outcome=outcome,
+            version=version,
         )
+
+
+def snip_summaries(records: list["TaskRecord"]) -> dict[str, str]:
+    """task_id -> 可以顶替原文的轮摘要；同一任务以最后一条为准。"""
+    return {
+        record.task_id: record.summary for record in records
+        if record.task_id and isinstance(record.summary, str) and record.summary.strip()
+    }
+
+
+def recent_task_ids(messages: list, keep: int) -> set[str]:
+    """本会话里真有消息的最近 keep 个任务。
+
+    子任务、系统任务的记录也写在这份 transcript 里，但它们的消息不在本会话，按记录数会挤掉真正的近期任务。
+    """
+    if keep <= 0:
+        return set()
+    order: dict[str, None] = {}
+    for message in messages:
+        task_id = record_task_id(message)
+        if task_id and task_id != "compact_summary":
+            order.pop(task_id, None)
+            order[task_id] = None
+    return set(list(order)[-keep:])
 
 
 def write_task_record(ws_root: Path, record: TaskRecord) -> None:
@@ -127,7 +172,7 @@ def safe_snip_task_ids(messages: list, task_ids: set[str]) -> set[str]:
         result_id = str(record.get("tool_call_id") or meta.get("tool_call_id") or "")
         if result_id:
             results.setdefault(result_id, set()).add(task_id)
-        elif record.get("role") == "tool" or meta.get("message_type") == "tool_result":
+        elif is_tool_result_message(record):
             unpaired.add(task_id)
     eligible.difference_update(unpaired)
     dependencies = [
@@ -171,19 +216,11 @@ def snip_history(
     if not records or not messages:
         return messages, 0, set()
 
-    # Build lookup: task_id → summary (only for tasks that have one)
-    summaries: dict[str, str] = {}
-    for r in records:
-        if isinstance(r.summary, str) and r.summary.strip() and r.task_id:
-            summaries[r.task_id] = r.summary
-
+    summaries = snip_summaries(records)
     if not summaries:
         return messages, 0, set()
 
-    # Identify task_ids to keep (most recent N by order of appearance in records)
-    recent_task_ids: set[str] = set()
-    for r in records[-keep_recent_tasks:]:
-        recent_task_ids.add(r.task_id)
+    recent = recent_task_ids(messages, keep_recent_tasks)
 
     # Collect eligible task_ids in order of appearance (oldest first)
     # Also exclude tasks that have already been snipped (content starts with marker)
@@ -219,7 +256,7 @@ def snip_history(
     for r in records:
         tid = r.task_id
         if (tid and tid in summaries
-                and tid not in recent_task_ids
+                and tid not in recent
                 and tid not in already_snipped
                 and tid not in _seen_elig
                 and tid in present_task_ids):
@@ -234,10 +271,7 @@ def snip_history(
 
 
 def snip_history_tasks(messages: list[dict], records: list["TaskRecord"], task_ids: set[str]) -> tuple[list[dict], int, set[str]]:
-    summaries = {
-        record.task_id: record.summary for record in records
-        if isinstance(record.summary, str) and record.summary.strip() and record.task_id
-    }
+    summaries = snip_summaries(records)
     to_snip_set = safe_snip_task_ids(messages, task_ids & summaries.keys())
 
     result: list[dict] = []
@@ -277,10 +311,7 @@ def snip_store(
     from engine.conversation_store import Message
     from uuid import uuid4
 
-    summaries = {
-        r.task_id: r.summary for r in records
-        if isinstance(r.summary, str) and r.summary.strip() and r.task_id
-    }
+    summaries = snip_summaries(records)
     snipped_task_ids = safe_snip_task_ids(store_messages, snipped_task_ids & summaries.keys())
     result = []
     seen: set[str] = set()

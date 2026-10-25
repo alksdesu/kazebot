@@ -23,7 +23,22 @@ from typing import Any
 
 from providers.base import ProviderResponse
 
+from ..compact import is_tool_result_message
+from .llm_outcome import is_truncated
+
 log = logging.getLogger(__name__)
+
+# provider 解析不出工具参数时统一给 {"_raw": 原文}；这种调用不执行，回给模型一条参数错误
+INVALID_ARGUMENTS_KEY = "_raw"
+# 写坏的工具块只替这三个补全：它们只是把话说出去，猜错了也不会动文件、跑命令
+REPAIRABLE_TOOL_NAMES = frozenset({"finish", "ask", "reply"})
+
+
+def invalid_arguments(arguments: Any) -> str | None:
+    """参数解析失败时 provider 留下的原文；正常参数返回 None。"""
+    if isinstance(arguments, dict) and len(arguments) == 1 and INVALID_ARGUMENTS_KEY in arguments:
+        return str(arguments[INVALID_ARGUMENTS_KEY])
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +155,16 @@ class ToolFormatter(ABC):
         默认实现直接返回 response.text。子类可覆盖。
         """
         return response.text
+
+    def build_truncation_hint(self) -> str:
+        """回复超出输出长度上限被截断时给模型的提示。"""
+        return (
+            "[SYSTEM] Your previous response was cut off at the output length limit, so it was not delivered. "
+            "Answer again more concisely. If the content is long, send it in several reply calls and keep "
+            "the final call short.\n\n"
+            "你上一条回复超出了输出长度上限被截断，没有发出去。请更简洁地重新回答；内容很长时分几次用 reply 发送，"
+            "最后一次调用保持简短。"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -522,80 +547,62 @@ class JsonToolFormatter(ToolFormatter):
     def parse_tool_calls(self, response: ProviderResponse) -> list[ParsedToolCall]:
         """从 response.text 中解析 <<<TOOL_CALL>>>...<<<END_TOOL_CALL>>> 块。
 
-        容错策略：
-        1. 标准正则匹配所有完整块
-        2. JSON 解析失败时尝试 raw_decode 提取第一个对象
-        3. 检测到开始标记但无结束标记时，尝试到文本末尾截取
+        闭合块里的 JSON 先宽松解析；坏到解析不了时只把 finish / ask / reply 修回来，其余工具交给
+        模型一条参数错误重写，不拿猜出来的参数去执行。回复被输出上限截断时，没闭合的块就是被切掉的
+        那半截，只认闭合块。
 
-        正文处理策略：
-        模型在工具调用之外输出的自由正文（plain text）不会被投递给用户，
-        但会通过 build_assistant_message 保留在 assistant 消息的 content 字段中，
-        使 LLM 在下一轮能看到自己说过的话（经 message_to_llm 重建为模型可消费格式）。
-        用户可见的输出只通过 finish / reply 工具调用产生。
+        自由正文不投递给用户，只经 build_assistant_message 留在 assistant 消息里供模型下一轮看到。
         """
-        if not response.text:
+        text = response.text
+        if not text:
             return []
+        truncated = is_truncated(response)
 
         calls: list[ParsedToolCall] = []
+        for match in self._TOOL_CALL_PATTERN.finditer(text):
+            call = self._call_from_block(match.group(1))
+            if call is not None:
+                calls.append(call)
+        if calls or truncated:
+            return calls
 
-        for match in self._TOOL_CALL_PATTERN.finditer(response.text):
-            raw_json = match.group(1)
-            parsed = self._try_parse_json(raw_json) or self._repair_tool_call_json(raw_json)
-            if parsed is None:
-                continue
+        # 有开始标记没有结束标记：模型漏写了结束标记
+        match = self._TOOL_CALL_UNCLOSED.search(text)
+        if match:
+            call = self._call_from_block(match.group(1).strip())
+            if call is not None:
+                return [call]
+
+        # 部分模型会输出 DeepSeek/DSML 风格的伪 XML 工具调用，例如 <｜｜DSML｜｜invoke name="finish">
+        calls = self._parse_dsml_tool_calls(text)
+        if calls:
+            return calls
+
+        # 正文里没有协议标记就不是工具调用：普通回复里引用的一段 JSON 不能被当成 finish
+        if self.CALL_OPEN_TAG in text or self.CALL_CLOSE_TAG in text:
+            repaired = self._repair_tool_call_json(text)
+            if repaired is not None:
+                return [self._make_call(repaired["name"], repaired["arguments"])]
+        return []
+
+    @staticmethod
+    def _make_call(name: str, arguments: Any) -> ParsedToolCall:
+        return ParsedToolCall(
+            id=f"jt_{uuid.uuid4().hex[:8]}",
+            name=str(name),
+            arguments=arguments if isinstance(arguments, dict) else {},
+        )
+
+    def _call_from_block(self, raw_json: str) -> ParsedToolCall | None:
+        parsed = self._try_parse_json(raw_json)
+        if parsed is not None:
             name = parsed.get("name")
-            if not name:
-                continue
-            arguments = parsed.get("arguments", {})
-            if not isinstance(arguments, dict):
-                arguments = {}
-            calls.append(ParsedToolCall(
-                id=f"jt_{uuid.uuid4().hex[:8]}",
-                name=str(name),
-                arguments=arguments,
-            ))
-
-        # 回退：检测到开始标记但没有结束标记，或 JSON 被截断/漏转义。
-        if not calls:
-            match = self._TOOL_CALL_UNCLOSED.search(response.text)
-            if match:
-                raw_json = match.group(1).strip()
-                parsed = self._try_parse_json(raw_json) or self._repair_tool_call_json(raw_json)
-                if parsed and parsed.get("name"):
-                    arguments = parsed.get("arguments", {})
-                    if not isinstance(arguments, dict):
-                        arguments = {}
-                    calls.append(ParsedToolCall(
-                        id=f"jt_{uuid.uuid4().hex[:8]}",
-                        name=str(parsed["name"]),
-                        arguments=arguments,
-                    ))
-
-        # 回退：部分模型会输出 DeepSeek/DSML 风格的伪 XML 工具调用，
-        # 例如 <｜｜DSML｜｜invoke name="finish">...。将其后纠正为统一工具调用。
-        if not calls:
-            calls.extend(self._parse_dsml_tool_calls(response.text))
-
-        # 最后兜底：模型把 JSON 工具块写坏但仍可识别 name/text 时，
-        # 直接纠正为 finish/reply 等工具调用，避免 QQ 端吞回复。
-        if not calls:
-            repaired = self._repair_tool_call_json(response.text)
-            if repaired and repaired.get("name"):
-                arguments = repaired.get("arguments", {})
-                if not isinstance(arguments, dict):
-                    arguments = {}
-                calls.append(ParsedToolCall(
-                    id=f"jt_{uuid.uuid4().hex[:8]}",
-                    name=str(repaired["name"]),
-                    arguments=arguments,
-                ))
-
-        # 自由正文不合成为 reply：正文保留在 build_assistant_message 存储的
-        # assistant 消息 content 中，LLM 下轮可见，用户不可见。
-        # 原 Fix 2 在此处把正文合成为 reply tool_call 追加到 calls 尾部，
-        # 导致模型已显式调用 reply 时产生重复消息，现已删除。
-
-        return calls
+            return self._make_call(name, parsed.get("arguments", {})) if name else None
+        repaired = self._repair_tool_call_json(raw_json)
+        if repaired is not None:
+            return self._make_call(repaired["name"], repaired["arguments"])
+        name = self._tool_name_in(raw_json)
+        return self._make_call(name, {INVALID_ARGUMENTS_KEY: raw_json}) if name else None
 
     @classmethod
     def _parse_dsml_tool_calls(cls, text: str) -> list[ParsedToolCall]:
@@ -619,7 +626,7 @@ class JsonToolFormatter(ToolFormatter):
                 value = cls._strip_dsml_markup(pm.group(2) or "")
                 if key:
                     args[key] = value
-            if not args and name in {"finish", "ask", "reply"}:
+            if not args and name in REPAIRABLE_TOOL_NAMES:
                 fallback_text = cls._strip_dsml_markup(body)
                 if fallback_text:
                     args["text"] = fallback_text
@@ -636,15 +643,7 @@ class JsonToolFormatter(ToolFormatter):
         return html.unescape(text).strip()
 
     @classmethod
-    def _repair_tool_call_json(cls, text: str) -> dict[str, Any] | None:
-        """从损坏/截断的工具 JSON 中尽量恢复 name 与常用参数。
-
-        主要覆盖 QQ 现场出现的两类问题：
-        - ``<<<TOOL_CALL>>>`` 后 JSON 少了结尾 ``}}`` / ``<<<END_TOOL_CALL>>>``；
-        - ``arguments.text`` 很长时被截断或含未转义换行，json.loads 失败。
-        """
-        if not text:
-            return None
+    def _call_body(cls, text: str) -> str:
         raw = text.strip()
         tag_index = raw.find(cls.CALL_OPEN_TAG)
         if tag_index >= 0:
@@ -653,33 +652,46 @@ class JsonToolFormatter(ToolFormatter):
         if end_index >= 0:
             raw = raw[:end_index]
         brace_index = raw.find("{")
-        if brace_index >= 0:
-            raw = raw[brace_index:]
-        name_match = re.search(r'"name"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw, re.DOTALL)
-        if not name_match:
-            # [2026-08-06] 弱模型格式保底：兼容单引叶/中文引号包裹的 name，
-            # 尽量把“看上去像 finish 调用”的畤形 JSON 修回合法工具调用，避免 QQ 端吞回复。
-            name_match = _NAME_FALLBACK_RE.search(raw)
+        return raw[brace_index:] if brace_index >= 0 else raw
+
+    @classmethod
+    def _tool_name_in(cls, text: str) -> str | None:
+        """从解析不了的工具块里认出工具名；单引号、中文引号包着的 name 也认。"""
+        raw = cls._call_body(text or "")
+        name_match = (
+            re.search(r'"name"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw, re.DOTALL)
+            or _NAME_FALLBACK_RE.search(raw)
+        )
         if not name_match:
             return None
         try:
             name = json.loads('"' + name_match.group(1) + '"')
         except Exception:
             name = name_match.group(1)
+        return str(name).strip() or None
+
+    @classmethod
+    def _repair_tool_call_json(cls, text: str) -> dict[str, Any] | None:
+        """把写坏的 finish / ask / reply 调用修回来：结尾少了 ``}}``、正文里有裸换行或裸引号。
+
+        其余工具一律不修，返回 None。
+        """
+        if not text:
+            return None
+        name = cls._tool_name_in(text)
+        if name not in REPAIRABLE_TOOL_NAMES:
+            return None
+        raw = cls._call_body(text)
         args: dict[str, Any] = {}
-        # command / content / path 是多行参数的重灾区 —— 脚本和文件正文里全是裸换行，
-        # 正好是让 json.loads 失败的那种输入，捞不出来就等于整个调用丢了。
-        for key in ("text", "summary", "target", "query", "message", "command", "content", "path"):
+        for key in ("text", "summary"):
             value = cls._extract_broken_json_string(raw, key)
             if value is not None:
                 args[key] = value
-        # 对终止/回复工具，若 text 参数缺失，尝试把工具块前的自由正文作为可见回复。
-        if name in {"finish", "ask", "reply"} and not str(args.get("text") or "").strip():
+        # text 没捞到时，工具块外的自由正文就是它想说的话
+        if not str(args.get("text") or "").strip():
             plain = cls._remove_tool_markers(text).strip()
             if plain:
                 args["text"] = plain
-        if not args and name not in {"finish", "ask", "reply"}:
-            return None
         log.warning("JsonToolFormatter: repaired malformed tool call as %s", name)
         return {"name": name, "arguments": args}
 
@@ -986,18 +998,6 @@ def _parse_text_tool_result(content: Any) -> tuple[str, str] | None:
     return name, output
 
 
-def _is_tool_result_message(message: dict[str, Any]) -> bool:
-    """Return whether a stored message represents a tool result."""
-    if message.get("role") == "tool":
-        return True
-    if str(message.get("message_type") or "") == "tool_result":
-        return True
-    meta = _message_meta(message)
-    if str(meta.get("message_type") or "") == "tool_result":
-        return True
-    return _parse_text_tool_result(message.get("content")) is not None
-
-
 def _tool_result_name(message: dict[str, Any]) -> str:
     """Return the tool name carried by a tool-result message, when known."""
     explicit = str(message.get("name") or "").strip()
@@ -1220,7 +1220,7 @@ def repair_tool_result_pairing_with_stats(
         if not isinstance(original, dict):
             continue
         msg = dict(original)
-        if _is_tool_result_message(msg):
+        if is_tool_result_message(msg):
             matched_call = _consume_matching_result(msg)
             result_name = _tool_result_name(msg) or str((matched_call or {}).get("name") or "")
             if matched_call is not None:

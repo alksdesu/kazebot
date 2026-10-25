@@ -14,6 +14,8 @@ import httpx
 import yaml
 
 from clonoth_runtime import (
+    env_bool,
+    env_value,
     fetch_openai_secret,
     get_bool,
     get_float,
@@ -29,28 +31,27 @@ from toolbox.context import ToolContext
 from toolbox.registry import ToolRegistry
 
 from .inference import run_ai_node
-from .attachments import build_multimodal_content
-from .context import RunContext
+from .attachments import build_multimodal_content, payload_attachments, screen_attachments
+from .context import RunContext, TaskLease
 from .model import resolve_provider
 from .context_store import load_context_snapshot
+from .inference.async_delivery import flush_async_result_outbox
+from .inference.loop_state import conversation_writer, flush_conversation_writes
 from .inference.pseudo_tools import tool_allowed
 from .inference.tool_format import sanitize_control_tool_history
 
 from .node import Node, load_node, node_file, node_files
-# [2026-04-17] write_artifact 移除：截断机制已废弃
-from .tool_step import result_to_raw, summarize_result
-# Phase 1 (Session Conversation Store): 导入 ConversationStore 用于影子写入，
-# 在每个 node task 执行时实例化并挂载到 RunContext，供 ai_step 影子写入消息。
+from .tool_step import TOOL_CANCELLED, result_to_raw, summarize_result, tool_outcome
 from .conversation_store import ConversationStore, Message, MessageType
 from .conversation_routing import routing_meta
-# Phase 0/1: Signal System — 导入信号总线初始化和桥接函数。
-# 在 _run_node_task 中初始化 bus 并安装 EventLog 桥接，使 LLM 调用信号
-# 自动转发到 data/signals.jsonl 供监控使用。
 from engine.signals import get_bus
 from engine.signals.bridge import install_event_bridge
 
 
 _OPENAI_COMPATIBLE_PROVIDERS = frozenset({"openai", "openai-responses"})
+# 续租应答是这几个状态码时，这次领取已经不归本 worker 了
+_LEASE_GONE_STATUS = frozenset({404, 409, 410})
+_OUTBOX_FLUSH_INTERVAL_SEC = 30.0
 
 
 logger = logging.getLogger(__name__)
@@ -67,8 +68,13 @@ def _shares_endpoint_with_main(provider_name: str, active_provider: str) -> bool
     return provider_name == active
 
 
+def _provider_env_prefix(provider_name: str) -> str:
+    return provider_name.upper().replace("-", "_")
+
+
 def _provider_endpoint_from_env(provider_name: str) -> str:
-    return os.environ.get(f"{provider_name.upper().replace('-', '_')}_BASE_URL", "").strip()
+    # 和系统槽位一样认共享密钥文件：共享组里 manage_secret 写进 config/secrets.env 的值不在进程环境里
+    return env_value(f"{_provider_env_prefix(provider_name)}_BASE_URL")
 
 
 def _provider_init_kwargs(
@@ -92,8 +98,7 @@ def _provider_init_kwargs(
         resolved_api_key = rp.api_key or api_key
         resolved_base_url = rp.base_url or borrowed_base_url or None
     else:
-        env_prefix = provider_name.upper().replace("-", "_")
-        resolved_api_key = rp.api_key or os.environ.get(f"{env_prefix}_API_KEY", "") or api_key
+        resolved_api_key = rp.api_key or env_value(f"{_provider_env_prefix(provider_name)}_API_KEY") or api_key
         # 控制台填的地址走 config.yaml 那一块；少了这层兜底会被丢掉，
         # provider 静默回落自己的官方域名。
         resolved_base_url = (
@@ -165,6 +170,14 @@ def _rooted_provider_name(rp: Any, *, active_provider: str) -> str:
     return active
 
 
+class ProviderKeyMissing(RuntimeError):
+    """节点最终解析到的渠道没有 api_key。"""
+
+    def __init__(self, channel: str) -> None:
+        super().__init__(f"api_key missing for channel {channel!r}")
+        self.channel = channel
+
+
 def _create_provider_from_registry(
     rp: Any,
     *,
@@ -174,17 +187,19 @@ def _create_provider_from_registry(
     provider_options: dict[str, Any],
     active_provider: str = "",
 ) -> Any:
-    """Resolve and instantiate the configured provider through ProviderRegistry."""
+    """Resolve and instantiate the configured provider through ProviderRegistry.
+
+    Raises ProviderKeyMissing when neither the node's channel nor the main channel supplies a key.
+    """
     requested_name = _rooted_provider_name(rp, active_provider=active_provider)
     provider_cls = provider_registry.get(requested_name)
     provider_name = requested_name
     if provider_cls is None:
         # 保持回退到 OpenAI 的旧语义，但要留声：拼错块名时这里会拿着别家的 url+key
         # 发 OpenAI 格式的请求，静默的话只能看到一个没头没尾的 400。
-        print(
-            f"[engine] provider {requested_name!r} 未注册，回退成 openai 格式发送"
-            f"（已注册：{','.join(sorted(provider_registry.list()))}）",
-            flush=True,
+        logger.warning(
+            "provider %r 未注册，回退成 openai 格式发送（已注册：%s）",
+            requested_name, ",".join(sorted(provider_registry.list())),
         )
         provider_cls = provider_registry.get("openai")
         provider_name = "openai"
@@ -199,6 +214,8 @@ def _create_provider_from_registry(
         provider_options=provider_options,
         active_provider=active_provider,
     )
+    if not init_kwargs.get("api_key"):
+        raise ProviderKeyMissing(getattr(rp, "channel_name", "") or provider_name)
     return _instantiate_provider(provider_cls, init_kwargs)
 
 
@@ -573,8 +590,15 @@ async def wait_supervisor(
         await asyncio.sleep(interval)
 
 
+async def _flush_outbox(http: httpx.AsyncClient, supervisor_url: str, workspace_root: Path) -> None:
+    try:
+        await flush_async_result_outbox(http, supervisor_url, workspace_root)
+    except Exception:
+        logger.warning("async tool result redelivery failed", exc_info=True)
+
+
 def _create_llm_http_client(timeout: float) -> httpx.AsyncClient:
-    trust_env = os.environ.get("CLONOTH_LLM_TRUST_ENV", "").strip().lower() in {"1", "true", "yes", "on"}
+    trust_env = env_bool("CLONOTH_LLM_TRUST_ENV", False)
     return httpx.AsyncClient(timeout=timeout, trust_env=trust_env, headers={"User-Agent": "Clonoth"})
 
 
@@ -586,7 +610,7 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
     _last_reload_seq = 0
 
     sup_timeout = get_float(runtime_cfg, "engine.http.client_timeout_sec", 60.0, min_value=5.0, max_value=600.0)
-    llm_timeout = get_float(runtime_cfg, "providers.openai.timeout_sec", 60.0, min_value=5.0, max_value=600.0)
+    llm_timeout = get_float(runtime_cfg, "providers.openai.timeout_sec", 600.0, min_value=5.0, max_value=600.0)
     poll_sec = get_float(runtime_cfg, "engine.poll_interval_sec", 1.0, min_value=0.1, max_value=60.0)
     max_workers = get_int(runtime_cfg, "engine.max_workers", 4, min_value=1, max_value=32)
 
@@ -644,6 +668,8 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
         llm_http = plugin_host.register_base("llm_http", llm_http)
         await plugin_host.start()
         plugin_refresh_at = 0.0
+        outbox_flush_at = 0.0
+        outbox_task: asyncio.Task | None = None
 
         try:
             while not stop_event.is_set():
@@ -654,6 +680,10 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
                             await asyncio.to_thread(plugin_manager.heartbeat)
                         except Exception as exc:
                             logger.warning("Plugin runtime refresh failed (%s)", type(exc).__name__)
+                    # 补投之前没送到 supervisor 的异步工具结果；放后台跑，supervisor 连不上时不拖住领任务
+                    if _loop.time() >= outbox_flush_at and (outbox_task is None or outbox_task.done()):
+                        outbox_flush_at = _loop.time() + _OUTBOX_FLUSH_INTERVAL_SEC
+                        outbox_task = asyncio.create_task(_flush_outbox(http, supervisor_url, workspace_root))
                     # ---- reap finished tasks ----
                     _done = {t for t in _active if t.done()}
                     for t in _done:
@@ -695,6 +725,9 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
                     pass
 
         finally:
+            if outbox_task is not None and not outbox_task.done():
+                outbox_task.cancel()
+                await asyncio.gather(outbox_task, return_exceptions=True)
             # ---- Direction 1: graceful shutdown — cancel active tasks and write terminal states ----
             if _active:
                 print(f"[engine] shutting down, cancelling {len(_active)} active task(s)...", flush=True)
@@ -706,27 +739,64 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
         print(f"[engine] worker {wid[:8]} stopped (generation {generation_id[:8]})", flush=True)
 
 
+def _lease_lost_reason(response: Any) -> str:
+    """续租应答里这次领取已失效的原因；仍然有效或判断不了时给空串。"""
+    status = getattr(response, "status_code", None)
+    if status in _LEASE_GONE_STATUS:
+        return f"HTTP {status}"
+    if not isinstance(status, int) or not 200 <= status < 300:
+        return ""
+    try:
+        body = response.json()
+    except Exception:
+        return ""
+    if isinstance(body, dict) and body.get("ok") is False:
+        return str(body.get("reason") or "rejected")
+    return ""
+
+
 async def _heartbeat(
     http: httpx.AsyncClient,
     sup_url: str,
-    task_id: str,
-    worker_id: str,
+    lease: TaskLease,
     interval: float = 60.0,
     lease_sec: float = 120.0,
 ) -> None:
-    """Periodically renew task lease to prevent zombie reaping."""
+    """定期续租。supervisor 说这次领取已失效时记进 lease，任务随即按用户取消的路径收手。"""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            response = await http.post(
+                f"{sup_url}/v1/tasks/{lease.task_id}/renew_lease",
+                json={"worker_id": lease.worker_id, "lease_sec": lease_sec, "claim_id": lease.claim_id},
+            )
+        except Exception as error:
+            logger.warning("lease renewal failed: task=%s (%s: %s)", lease.task_id, type(error).__name__, error)
+            continue
+        reason = _lease_lost_reason(response)
+        if reason:
+            lease.lost_reason = reason
+            logger.warning("lease lost: task=%s reason=%s; stopping the task", lease.task_id, reason)
+            return
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int) and not 200 <= status < 300:
+            logger.warning("lease renewal answered HTTP %s: task=%s", status, lease.task_id)
+
+
+def _log_completion(task_id: str, response: Any) -> None:
+    status = getattr(response, "status_code", None)
+    if status == 409:
+        logger.warning("task %s completion ignored: the claim was superseded", task_id)
+        return
+    if isinstance(status, int) and not 200 <= status < 300:
+        logger.warning("task %s completion rejected: HTTP %s", task_id, status)
+        return
     try:
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                await http.post(
-                    f"{sup_url}/v1/tasks/{task_id}/renew_lease",
-                    json={"worker_id": worker_id, "lease_sec": lease_sec},
-                )
-            except Exception:
-                pass
-    except asyncio.CancelledError:
-        pass
+        body = response.json()
+    except Exception:
+        return
+    if isinstance(body, dict) and body.get("duplicate"):
+        logger.info("task %s completion was already recorded", task_id)
 
 
 async def _handle_task(
@@ -742,66 +812,67 @@ async def _handle_task(
     kind = str(item.get("kind") or "").strip()
     session_id = str(item.get("session_id") or "").strip()
     session_generation = int(item.get("session_generation") or 0)
+    lease = TaskLease(task_id=task_id, worker_id=worker_id, claim_id=str(item.get("claim_id") or "").strip())
 
-    cfg_raw = await fetch_openai_secret(http, sup_url)
-    main = normalize_openai_secret(cfg_raw)
-
-    _hb = asyncio.create_task(_heartbeat(http, sup_url, task_id, worker_id))
+    _hb = asyncio.create_task(_heartbeat(http, sup_url, lease))
     try:
         if kind == "node":
+            # 取渠道配置也算任务的一部分：失败要照常回报，不能让任务挂到租约过期
+            main = normalize_openai_secret(await fetch_openai_secret(http, sup_url))
             result = await _run_node_task(
                 http=http, llm_http=llm_http, sup_url=sup_url, ws_root=ws_root,
                 registry=registry, task=item, worker_id=worker_id,
                 session_id=session_id, session_generation=session_generation,
                 api_key=main.api_key, base_url=main.base_url,
                 default_model=main.model, default_provider=main.provider,
-                default_channel=main.channel_name,
+                default_channel=main.channel_name, lease=lease,
             )
         elif kind == "tool":
             result = await _run_tool_task(
                 http=http, sup_url=sup_url, ws_root=ws_root,
                 registry=registry, task=item, worker_id=worker_id,
                 session_id=session_id, session_generation=session_generation,
-                task_id=task_id,
+                task_id=task_id, lease=lease,
             )
         else:
             result = {"action": "fail", "node_id": "", "error": f"未知 task kind: {kind}"}
     except asyncio.CancelledError:
-        # Direction 1: engine graceful shutdown — write terminal state before exiting
-        print(f"[engine] task {task_id} cancelled (engine shutdown)", flush=True)
+        # engine 优雅退出：先把终态报回去再走
+        logger.warning("task %s cancelled (engine shutdown)", task_id)
         result = {"action": "cancelled", "node_id": str(item.get("node_id") or ""), "error": "engine graceful shutdown"}
     except Exception as exc:
-        print(f"[engine] task {task_id} crashed: {exc}", flush=True)
+        logger.exception("task %s crashed", task_id)
         result = {"action": "fail", "node_id": str(item.get("node_id") or ""), "error": f"引擎内部错误: {exc}"}
+    finally:
+        _hb.cancel()
 
-    _hb.cancel()
-    # 重试 complete_task POST，防止因网络/超时导致 task 永久孤立
+    # 重试 complete_task POST，防止因网络/超时导致 task 永久孤立；4xx（含 409 领取已失效）不再重试
+    body = {"worker_id": worker_id, "result": result, "claim_id": lease.claim_id}
     try:
         for _complete_attempt in range(3):
             try:
-                _cr = await http.post(
-                    f"{sup_url}/v1/tasks/{task_id}/complete",
-                    json={"worker_id": worker_id, "result": result},
-                )
-                if _cr.status_code < 500:
-                    break  # 成功或客户端错误（如 404），不再重试
+                _cr = await http.post(f"{sup_url}/v1/tasks/{task_id}/complete", json=body)
             except asyncio.CancelledError:
                 raise  # Propagate to outer handler for final attempt
             except Exception as _ce:
-                print(f"[engine] task {task_id} complete POST failed (attempt {_complete_attempt + 1}/3): {_ce}", flush=True)
-                if _complete_attempt < 2:
-                    await asyncio.sleep(2 ** _complete_attempt)  # 1s, 2s
+                logger.warning("task %s complete POST failed (attempt %d/3): %s", task_id, _complete_attempt + 1, _ce)
+            else:
+                if _cr.status_code < 500:
+                    _log_completion(task_id, _cr)
+                    break
+                logger.warning(
+                    "task %s complete POST answered HTTP %s (attempt %d/3)", task_id, _cr.status_code, _complete_attempt + 1,
+                )
+            if _complete_attempt < 2:
+                await asyncio.sleep(2 ** _complete_attempt)  # 1s, 2s
         else:
-            print(f"[engine] task {task_id} ORPHANED - all complete POST attempts failed", flush=True)
+            logger.error("task %s ORPHANED - all complete POST attempts failed", task_id)
     except asyncio.CancelledError:
         # Shutdown interrupted the retry loop; make one final attempt
         try:
-            await http.post(
-                f"{sup_url}/v1/tasks/{task_id}/complete",
-                json={"worker_id": worker_id, "result": result},
-            )
+            await http.post(f"{sup_url}/v1/tasks/{task_id}/complete", json=body)
         except Exception:
-            print(f"[engine] task {task_id} ORPHANED - shutdown interrupted complete POST", flush=True)
+            logger.error("task %s ORPHANED - shutdown interrupted complete POST", task_id)
 
 
 # 节点 id 与系统模型槽位的历史绑定。这两个节点 id 是内建常量，没有配置项能改。
@@ -886,6 +957,65 @@ def _build_task_context(input_data: dict[str, Any]) -> dict[str, Any]:
     return ctx
 
 
+async def _build_node_provider(
+    *,
+    ws_root: Path,
+    node: Node,
+    http: httpx.AsyncClient,
+    llm_http: httpx.AsyncClient,
+    sup_url: str,
+    route_session_id: str,
+    runtime_cfg: dict[str, Any],
+    api_key: str,
+    base_url: str,
+    default_model: str,
+    default_provider: str,
+    default_channel: str,
+) -> Any:
+    """按会话覆盖、节点声明、系统槽位和运行配置，解析出这个节点本轮用的 provider。
+
+    最终渠道和主渠道都给不出 api_key 时抛 ProviderKeyMissing。
+    """
+    session_provider_override = await _fetch_session_provider_override(http, sup_url, route_session_id)
+    rp = resolve_provider(
+        ws_root, node, default_model,
+        provider_default_type=default_provider,
+        session_override=session_provider_override,
+        provider_default_channel=default_channel,
+    )
+    # 系统节点（压缩/轮摘要）的 model/base_url/api_key 可以单独配在 system_models.<slot>，留空的项跟随主渠道
+    _sys_slot = _resolve_system_model_slot(node)
+    if _sys_slot:
+        _apply_system_slot(ws_root, rp, resolve_system_model(
+            ws_root, _sys_slot,
+            default_model=rp.model or default_model,
+            default_base_url="",   # 留空→下方 _create_provider_from_registry 用主渠道 base_url
+            default_api_key="",    # 留空→同上用主渠道 api_key
+        ), _sys_slot)
+    provider_cfg = (runtime_cfg.get("providers") or {}).get(rp.provider_type or "openai")
+    global_provider_options = provider_cfg.get("options") if isinstance(provider_cfg, dict) else {}
+    if not isinstance(global_provider_options, dict):
+        global_provider_options = {}
+    node_provider_options = getattr(node, "provider_options", {}) or {}
+    if not isinstance(node_provider_options, dict):
+        node_provider_options = {}
+    # 三层由宽到窄：runtime.yaml 按线格式定的 < 这个渠道块自己写的 < 节点写的。
+    _po = _merge_provider_options(
+        _merge_provider_options(global_provider_options, rp.channel_options),
+        node_provider_options,
+    )
+    provider = _create_provider_from_registry(
+        rp,
+        llm_http=llm_http,
+        api_key=api_key,
+        base_url=base_url,
+        provider_options=_po,
+        active_provider=default_provider,
+    )
+    provider.plugin_channel = rp.channel_name
+    return provider
+
+
 async def _run_node_task(
     *,
     http: httpx.AsyncClient,
@@ -902,6 +1032,7 @@ async def _run_node_task(
     default_model: str,
     default_provider: str = "openai",
     default_channel: str = "",
+    lease: TaskLease | None = None,
 ) -> dict[str, Any]:
     task_id = str(task.get("task_id") or "").strip()
     node_id = str(task.get("node_id") or "").strip()
@@ -917,8 +1048,18 @@ async def _run_node_task(
     node = load_node(ws_root, node_id)
     if node is None:
         return {"action": "fail", "node_id": node_id, "error": f"节点未找到：{node_id}"}
-    if not api_key:
-        return {"action": "fail", "node_id": node_id, "error": "OpenAI api_key 未配置。"}
+
+    runtime_cfg = load_runtime_config(ws_root)
+    # 先把渠道定下来再动历史：key 按节点最终落到的渠道判，缺了直接失败，不留下分叉了一半的子会话
+    try:
+        provider = await _build_node_provider(
+            ws_root=ws_root, node=node, http=http, llm_http=llm_http, sup_url=sup_url,
+            route_session_id=parent_session_id or session_id, runtime_cfg=runtime_cfg,
+            api_key=api_key, base_url=base_url, default_model=default_model,
+            default_provider=default_provider, default_channel=default_channel,
+        )
+    except ProviderKeyMissing as missing:
+        return {"action": "fail", "node_id": node_id, "error": f"渠道 {missing.channel} 的 api_key 未配置。"}
 
     rctx = RunContext(
         workspace_root=ws_root, supervisor_url=sup_url,
@@ -930,11 +1071,8 @@ async def _run_node_task(
         parent_session_id=parent_session_id,
         source_inbound_seq=int(source_inbound_seq) if source_inbound_seq is not None else None,
         task_context=_build_task_context(input_data),
+        lease=lease,
     )
-    # Phase 1 (Session Conversation Store): 创建 ConversationStore 实例并挂载到 rctx。
-    # ai_step 中的 _shadow_write 通过 getattr(ls.rctx, 'conversation_store', None) 访问。
-    # RunContext 是非 frozen dataclass，允许动态添加属性。
-    # 数据目录: data/conversations/{session_id}.jsonl
     _conv_store = ConversationStore(ws_root / "data" / "conversations")
     rctx.conversation_store = _conv_store  # type: ignore[attr-defined]
 
@@ -966,9 +1104,9 @@ async def _run_node_task(
 
         if context_mode == "fork" and fork_from and not is_resume:
             # fork: 先从父 session 复制历史到子 session
-            _conv_store.fork(fork_from, child_session_id)
+            await asyncio.to_thread(_conv_store.fork, fork_from, child_session_id)
 
-        stored = _conv_store.load(child_session_id)
+        stored = await asyncio.to_thread(_conv_store.load, child_session_id)
         history = [_message_to_history_dict(m, current_task_id=task_id) for m in stored if m.role != "system"]
         history = sanitize_control_tool_history(history)
         history = _strip_trailing_pseudo_call(history)
@@ -983,7 +1121,7 @@ async def _run_node_task(
         # resume 场景（compact_done / child_result / child_preempted）也走这里：
         # 此时 context_ref 为空，ai_step 会走 assemble_initial_messages，需要 history 不为空。
         if use_context:
-            stored = _conv_store.load(session_id)
+            stored = await asyncio.to_thread(_conv_store.load, session_id)
             history = [_message_to_history_dict(m, current_task_id=task_id) for m in stored if m.role != "system"]
             # 剥离尾部伪工具（finish/dispatch 等），同 child session 路径处理
             # [2026-05-07] 先执行结构化控制流清理，覆盖 true native 中非文本化的 finish 记录。
@@ -1025,58 +1163,7 @@ async def _run_node_task(
 
     _route_meta = routing_meta(rctx.task_context)
     ds_info = _collect_node_info(ws_root, list(node.delegate_targets))
-
-    runtime_cfg = load_runtime_config(ws_root)
     sw_info = _discover_switchable_nodes(ws_root, node.id)
-
-    session_provider_override = await _fetch_session_provider_override(http, sup_url, parent_session_id or session_id)
-    rp = resolve_provider(
-        ws_root, node, default_model,
-        provider_default_type=default_provider,
-        session_override=session_provider_override,
-        provider_default_channel=default_channel,
-    )
-    # [2026-07-16] 系统节点（压缩/轮摘要）支持单独配置 model/base_url/api_key，
-    # 来源 config.yaml 的 system_models.<slot> 或同名环境变量；留空则跟随主渠道。
-    # 为什么在这里：节点 yaml 仍然支持 $ENV{CLONOTH_*_MODEL}，但 url/key 无法在
-    # 节点 yaml 方便地“跟随主渠道”，故在 runner 统一叠加。
-    _sys_slot = _resolve_system_model_slot(node)
-    if _sys_slot:
-        _apply_system_slot(ws_root, rp, resolve_system_model(
-            ws_root, _sys_slot,
-            default_model=rp.model or default_model,
-            default_base_url="",   # 留空→下方 _create_provider_from_registry 用主渠道 base_url
-            default_api_key="",    # 留空→同上用主渠道 api_key
-        ), _sys_slot)
-    provider_cfg = (runtime_cfg.get("providers") or {}).get(rp.provider_type or "openai")
-    global_provider_options = provider_cfg.get("options") if isinstance(provider_cfg, dict) else {}
-    if not isinstance(global_provider_options, dict):
-        global_provider_options = {}
-    node_provider_options = getattr(node, "provider_options", {}) or {}
-    if not isinstance(node_provider_options, dict):
-        node_provider_options = {}
-    # 三层由宽到窄：runtime.yaml 按线格式定的 < 这个渠道块自己写的 < 节点写的。
-    _po = _merge_provider_options(
-        _merge_provider_options(global_provider_options, rp.channel_options),
-        node_provider_options,
-    )
-    # [AutoC 2026-06-01] Why: runtime.yaml now supports provider-wide options, but
-    # node YAML must remain the most specific layer. How: read
-    # providers.<provider_type>.options and merge it with node.provider_options.
-    # Purpose: providers receive global defaults unless a node overrides them.
-    #
-    # [provider-registry 2026-05-03] Provider 创建改为 registry 查找。
-    # 原因：旧 if-elif 每新增 provider 都要改 runner；做法：按 rp.provider_type 找类并传统一 kwargs；
-    # 目的：保持现有四个 provider 行为不变，同时让 providers/*.py 插件可自动接入。
-    provider = _create_provider_from_registry(
-        rp,
-        llm_http=llm_http,
-        api_key=api_key,
-        base_url=base_url,
-        provider_options=_po,
-        active_provider=default_provider,
-    )
-    provider.plugin_channel = rp.channel_name
 
     await rctx.emit_event("node_started", {
         "task_id": task_id, "node_id": node.id,
@@ -1101,18 +1188,8 @@ async def _run_node_task(
         instruction = ""
         input_attachments = None
 
-    # Phase 1 补丁：将 user_input (instruction) 影子写入 ConversationStore。
-    # 此前 _shadow_write 只写了 assistant 和 tool_result，用户指令完全缺失，
-    # 导致子节点 accumulate 恢复时 JSONL 里缺少用户输入、上下文不完整。
-    # [Fork/Merge 2026-05-12] 写入目标 session：优先 child_session_id，否则 rctx 运行 session。
-    # Why: session_id may be an entry branch rather than the user-facing parent. How: keep the
-    # existing child-session priority and otherwise write to the branch/runtime session. Purpose:
-    # branch histories remain complete until supervisor merge.
-    #
-    # Step 2（2026-04-16）：resume 场景（compact_done / child_result / child_failed 等）
-    # 下 caller task 被 supervisor 重新唤醒，input.instruction 仍是原先的用户指令，
-    # 此指令已在首次进入时写过 JSONL，这里不应再写一次。
-    # 只在非 resume 场景追加 user_input 消息。
+    # 本轮用户输入写进运行 session（子节点写 child session），分支合并前历史才完整；
+    # resume 时 instruction 还是原先那条，首次进入时已经写过，不再写
     _inbound_message_type = str(input_data.get("inbound_message_type") or "").strip()
     _inbound_summary = str(input_data.get("inbound_summary") or "").strip()
     _inbound_child_session_id = str(input_data.get("inbound_child_session_id") or "").strip()
@@ -1127,10 +1204,7 @@ async def _run_node_task(
         or ""
     ).strip()
     _inbound_caller_node_id = str(input_data.get("inbound_caller_node_id") or "").strip()
-    # [AutoC 2026-06-04] Why: dispatch_result.text can be empty when the child only
-    # returns a summary, but the callback still has semantic content. How: allow the
-    # shadow write when dispatch_result has inbound_summary. Purpose: ConversationStore
-    # keeps a structured callback row even without raw result text.
+    # dispatch_result 只带摘要、没有正文时也要留一条回调记录
     _should_write_user_input = bool(
         instruction
         or input_attachments
@@ -1139,21 +1213,12 @@ async def _run_node_task(
     if _should_write_user_input and _conv_store and not is_resume:
         from datetime import datetime, timezone
         _target_sid = child_session_id or session_id
-        # [AutoC 2026-06-01] Why: persisting only plain instruction text lost
-        # image attachments before the next step could reload ConversationStore.
-        # How: when attachments are present, build the same multimodal content
-        # that message assembly sends to the provider; otherwise keep the legacy
-        # string content. Purpose: user image input remains available inside the
-        # current task and can still be stripped when another task reloads it.
+        # 带附件时落盘发给模型的同一份多模态内容，本任务后续步骤重载历史还看得到图
         if input_attachments:
             _user_content = build_multimodal_content(instruction, input_attachments, workspace_root=ws_root)
         else:
             _user_content = instruction
-        # [AutoC 2026-06-04] Why: supervisor-injected dispatch callbacks now carry
-        # child_* metadata and summary separately from raw text. How: persist only the
-        # selected structured fields in Message.meta while leaving content as the raw
-        # child result. Purpose: refreshed history can render callbacks without storing
-        # the LLM-only English prefix or any backend-localized prose.
+        # 派发回调的 child_* 和摘要单独进 meta，正文只存子节点的原始结果
         _inbound_meta: dict[str, Any] = dict(_route_meta)
         if _inbound_summary:
             _inbound_meta["summary"] = _inbound_summary
@@ -1175,7 +1240,7 @@ async def _run_node_task(
             source_node_id=node.id,
             source_task_id=task_id,
         )
-        _conv_store.append(_target_sid, _user_msg)
+        conversation_writer(rctx).submit(_target_sid, _user_msg)
 
     if _inbound_message_type == "dispatch_result":
         # [AutoC 2026-06-04] Why: the model still needs context that this inbound came
@@ -1199,20 +1264,25 @@ async def _run_node_task(
     _bridge_exclude_patterns = _signals_cfg.get("bridge_exclude_patterns")
     install_event_bridge(
         _sig_bus,
+        log_dir=ws_root / "data",
         patterns=_bridge_patterns,
         exclude_patterns=_bridge_exclude_patterns,
     )
 
-    action = await run_ai_node(
-        rctx=rctx, provider=provider, registry=registry, node=node,
-        instruction=instruction,
-        history=history, run_id=task_id, context_ref=context_ref,
-        resume_data=resume_data_raw,
-        downstream_info=ds_info,
-        switch_info=sw_info,
-        streaming=bool(get_bool(runtime_cfg, "engine.streaming", False)),
-        attachments=input_attachments,
-    )
+    try:
+        action = await run_ai_node(
+            rctx=rctx, provider=provider, registry=registry, node=node,
+            instruction=instruction,
+            history=history, run_id=task_id, context_ref=context_ref,
+            resume_data=resume_data_raw,
+            downstream_info=ds_info,
+            switch_info=sw_info,
+            streaming=bool(get_bool(runtime_cfg, "engine.streaming", False)),
+            attachments=input_attachments,
+        )
+    finally:
+        # 本轮的用户输入也走写入队列，结果交回 supervisor 前得落盘
+        await flush_conversation_writes(rctx)
 
     # Child Session 隔离（Phase B）：将 child_session_id 写入 task result，
     # 供 supervisor 侧 _route_completed_task_locked 和调试/监控使用。
@@ -1233,6 +1303,7 @@ async def _run_node_task(
 
     try:
         from engine.task_record import TaskRecord, write_task_record
+        # summary 留给轮摘要节点回写，L2 snip 只认它；这一轮的动作摘要放 outcome
         _record = TaskRecord(
             task_id=task_id,
             session_id=session_id,
@@ -1243,15 +1314,12 @@ async def _run_node_task(
             step_count=rctx.completed_steps,
             tool_call_count=_tool_call_count,
             token_usage=dict(rctx.total_usage) if rctx.total_usage else {},
-            summary=action.summary or "",
+            outcome=action.summary or "",
             error=action.error or "",
             child_session_id=child_session_id,
         )
-        write_task_record(ws_root, _record)
-        # [AutoC 2026-05-30] Why: persistent 子节点的 snip compact 从 child_session_id
-        # 加载 TaskRecord，但上面只写到了父 session 的 transcript JSONL。
-        # How: 额外写一份到 child session 的 transcript。
-        # Purpose: 轮摘要回写和 snip compact 都能通过 child_session_id 找到记录。
+        await asyncio.to_thread(write_task_record, ws_root, _record)
+        # persistent 子节点的轮摘要回写和 snip 都按 child_session_id 找记录，子会话那边也写一份
         if child_session_id and child_session_id != session_id:
             _child_record = TaskRecord(
                 task_id=task_id,
@@ -1263,13 +1331,13 @@ async def _run_node_task(
                 step_count=rctx.completed_steps,
                 tool_call_count=_tool_call_count,
                 token_usage=dict(rctx.total_usage) if rctx.total_usage else {},
-                summary=action.summary or "",
+                outcome=action.summary or "",
                 error=action.error or "",
                 child_session_id=child_session_id,
             )
-            write_task_record(ws_root, _child_record)
-    except Exception as _tr_err:
-        print(f"[engine] Failed to write task record: {_tr_err}", flush=True)
+            await asyncio.to_thread(write_task_record, ws_root, _child_record)
+    except Exception:
+        logger.exception("failed to write task record: task=%s", task_id)
 
     _result = action.to_dict()
     if getattr(rctx, "current_llm_request_id", "") and not _result.get("llm_request_id"):
@@ -1298,6 +1366,7 @@ async def _run_tool_task(
     session_id: str,
     session_generation: int,
     task_id: str,
+    lease: TaskLease | None = None,
 ) -> dict[str, Any]:
     input_data = task.get("input") if isinstance(task.get("input"), dict) else {}
     tool_name = str(task.get("tool_name") or "").strip() or str(input_data.get("tool_name") or "").strip()
@@ -1325,6 +1394,7 @@ async def _run_tool_task(
         # traceable even outside native LLM tool-call execution.
         tool_call_id=str(input_data.get("tool_call_id") or task_id or ""),
         node_id=tool_name,
+        claim_id=lease.claim_id if lease is not None else "",
     )
 
     # 独立 tool task 不经过 ai_step 那道白名单，这里得自己复核一遍，
@@ -1340,7 +1410,7 @@ async def _run_tool_task(
             if _origin_node is None
             else f"工具 {tool_name} 不在节点 {_origin_node_id} 的授权列表内"
         )
-        print(f"[engine] tool task refused: {_why} (task={task_id})", flush=True)
+        logger.warning("tool task refused: %s (task=%s)", _why, task_id)
         return {"action": "error", "node_id": tool_name, "summary": f"拒绝执行：{_why}"}
 
     await kctx.emit_event("handoff_progress", {
@@ -1349,7 +1419,8 @@ async def _run_tool_task(
     })
 
     result = await registry.execute(name=tool_name, arguments=arguments, ctx=kctx)
-    if isinstance(result, dict) and result.get("cancelled"):
+    outcome = tool_outcome(result)
+    if outcome.status == TOOL_CANCELLED:
         await kctx.emit_event("cancel_acknowledged", {"task_id": task_id, "tool_name": tool_name})
         return {
             "action": "cancelled",
@@ -1357,17 +1428,8 @@ async def _run_tool_task(
             "summary": "任务已取消",
         }
 
-    # [AutoC 2026-05-31] Why: standalone tool tasks must collect files from both
-    # the new data.attachments field and the temporary top-level attachments mirror.
-    # How: prefer the nested list and fall back to the legacy top-level list.
-    # Purpose: keep generated media attached for direct tool-node execution.
-    if isinstance(result, dict):
-        result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
-        tool_attachments = result_data.get("attachments") if isinstance(result_data.get("attachments"), list) else result.get("attachments")
-        if not isinstance(tool_attachments, list):
-            tool_attachments = []
-    else:
-        tool_attachments = []
+    # 结果里的附件会随任务结果外发，跟 AI 节点里的工具附件过同一道门
+    tool_attachments = screen_attachments(ws_root, payload_attachments(result))
 
     # [summary-args 2026-05-19] Why: standalone tool tasks emit the same compact
     # handoff_progress row as AI-driven tools. How: pass the task arguments into
@@ -1405,7 +1467,7 @@ async def _run_tool_task(
             "raw_inline": raw_inline,
             "tool_name": tool_name,
             "arguments": arguments,
-            "tool_ok": not isinstance(result, dict) or result.get("ok") is not False,
-            "tool_error": str(result.get("error") or "") if isinstance(result, dict) else "",
+            "tool_ok": outcome.ok,
+            "tool_error": outcome.error,
         },
     }

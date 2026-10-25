@@ -19,7 +19,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 
 import engine.memory_hit_cache as hit_cache
 from engine.eventlog_rotation import eventlog_file_lock
-from engine.memory_namespace import CONVERSATION_PREFIX, conversation_namespace
+from engine.memory_namespace import CONVERSATION_PREFIX, conversation_namespace, memory_root
 from platforms.descriptor import STATE_ROUTES, PlatformDescriptor, normalize_name
 from platforms.registry import conversation_channel, conversation_key_prefix, platform_state_path
 
@@ -274,10 +274,6 @@ class MigrationOutcome:
 
 def route_state_file(workspace: Path, platform: PlatformDescriptor) -> Path:
     return platform_state_path(platform, STATE_ROUTES, workspace)
-
-
-def memory_root(workspace: Path) -> Path:
-    return Path(workspace) / "data" / "memory"
 
 
 def load_route_map(route_state: Path) -> dict[str, str]:

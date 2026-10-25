@@ -57,9 +57,11 @@ def test_legacy_metadata_tool_ids_follow_the_same_dependency_rules():
 @pytest.mark.parametrize("source_in_meta", [False, True])
 def test_history_and_store_never_split_cross_task_tool_pairs(source_in_meta):
     records = [TaskRecord(task_id=f"t{index}", session_id="session", node_id="test", summary=f"Summary {index}") for index in range(6)]
+    # recent tasks are counted from this session's messages: t3-t5 take the kept slots, leaving t0/t1 as candidates
     messages = [
         call("t0"),
         {"role": "user", "content": "plain old task", "_meta": {"source_task_id": "t1"}},
+        *({"role": "user", "content": f"recent task {index}", "_meta": {"source_task_id": f"t{index}"}} for index in (2, 3, 4)),
         result("t5"),
     ]
     history, count, selected = snip_history(messages, records)

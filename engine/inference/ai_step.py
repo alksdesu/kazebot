@@ -5,6 +5,7 @@ import asyncio
 import logging
 import time
 import uuid
+from copy import deepcopy
 from functools import wraps
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -31,15 +32,17 @@ from .loop_state import (
     _persist_ctx,
     _short,
     build_tool_context,
+    conversation_writer,
+    flush_conversation_writes,
 )
-from .llm_call import _call_llm_with_retry, _build_failure_action, _is_retryable_error, _RETRYABLE_STATUS_CODES
+from .llm_call import _call_llm_with_retry, _build_failure_action
+from .llm_outcome import is_truncated, with_changes
+from .async_delivery import build_async_result_payload, deliver_async_result
 from .pseudo_handlers import _handle_pseudo_tool
 
 from ..context_store import load_context_snapshot
-from ..attachments import build_multimodal_content
-# Phase 1 (Session Conversation Store): 导入 Message 模型用于影子写入。
-# ai_step 在每次 append assistant/tool_result 消息后，best-effort 写入 ConversationStore。
-from ..conversation_store import ConversationStore, Message, MessageType
+from ..attachments import build_multimodal_content, payload_attachments, screen_attachments
+from ..conversation_store import Message, MessageType
 from ..node import Node
 from .message_assembly import assemble_initial_messages
 from ..conversation_routing import concise_text, routing_meta, short_reply
@@ -52,8 +55,7 @@ from ..protocol import (
     ACTION_CANCELLED,
     ACTION_PREEMPTED,
 )
-# [2026-04-17] write_artifact 移除：截断机制已废弃，不再写 artifact 文件
-from ..tool_step import result_to_raw, summarize_result
+from ..tool_step import TOOL_CANCELLED, result_to_raw, summarize_result, tool_outcome
 from clonoth_runtime import get_int, get_float, get_bool, load_runtime_config
 from toolbox.context import ToolContext
 # build_llm_messages: 反序列化方向的格式转换，在 llm_call.py 中实际调用。
@@ -62,9 +64,10 @@ from .tool_format import (
     ParsedToolCall,
     create_tool_formatter,
     build_llm_messages,
+    invalid_arguments,
 )
 from .message_model import MessageMeta, set_message_meta
-from providers.base import BaseProvider, ToolCall, ProviderResponse
+from providers.base import BaseProvider, ToolCall
 # Phase 2 Signal System: 导入信号总线，用于发射 tool.call 和 task.error 信号。
 # get_bus() 返回全局单例 SignalBus，Signal 是不可变事件数据类。
 from ..signals import Signal, get_bus
@@ -74,6 +77,7 @@ from ..signals import Signal, get_bus
 # 目的：后续内核逻辑可以插件化注册，同时保持当前推理循环行为不变。
 from ..hooks import HookContext, hook_registry
 from ..builtin.loader import auto_discover_and_register
+from ..builtin.plaintext import build_implicit_finish
 from ..hooks.loader import load_external_plugins
 from plugin_runtime import plugin_scope
 
@@ -131,76 +135,47 @@ def get_async_tool_tasks() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-#  Phase 1: 影子写入辅助函数
-#  将 ls.messages.append() 产生的消息同步写入 ConversationStore（JSONL）。
-#  best-effort：任何异常静默忽略，绝不影响主推理流程。
-#  仅处理 assistant 和 tool_result 消息；_dynamic/_ephemeral 消息跳过。
+#  影子写入：运行期消息同步进 ConversationStore
 # ---------------------------------------------------------------------------
 
 def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> None:
-    """Best-effort shadow write to ConversationStore. Never breaks main flow.
+    """把一条运行期消息排进本任务的对话写入队列，按提交顺序在后台落盘。_dynamic/_ephemeral 消息不落盘。
 
-    Phase 3: 写入成功后将 Message.id 记录到 ls.last_shadow_message_id，
-    供 _persist_ctx 写入 snapshot 的 last_message_id 字段。
-
-    Child Session 隔离（Phase B）：写入目标优先使用 rctx.child_session_id，
-    使子节点的消息写入自己的 JSONL 而非父 session。
+    子节点写自己的 child session，其余写运行 session（可能是入口分支，合并由 supervisor 做）。
     """
+    if msg_dict.get('_dynamic') or msg_dict.get('_ephemeral'):
+        return
+    _routing_meta = routing_meta(getattr(ls.rctx, "task_context", {}) or {})
+    _routing_meta["source_task_id"] = getattr(ls.rctx, "task_id", "")
+    msg_dict.setdefault("_meta", {}).update(_routing_meta)
+    writer = conversation_writer(ls.rctx)
+    if writer is None:
+        return
     try:
-        # 跳过 dynamic context 和 ephemeral 消息（如 retry hint）
-        if msg_dict.get('_dynamic') or msg_dict.get('_ephemeral'):
-            return
-        from ..conversation_routing import routing_meta
-        _routing_meta = routing_meta(getattr(ls.rctx, "task_context", {}) or {})
-        _routing_meta["source_task_id"] = getattr(ls.rctx, "task_id", "")
-        msg_dict.setdefault("_meta", {}).update(_routing_meta)
-        store = getattr(ls.rctx, 'conversation_store', None)
-        if store is None:
-            return
-        # [2026-05-07] 不再按 control_tool_name 跳过 finish。
-        # 原因：finish 已恢复为真实 API 工具，正常结果必须像普通工具一样进入 ConversationStore。
-        # 做法：这里只保留 dynamic/ephemeral 两类运行期消息过滤，普通 tool_result 全部写入。
-        # 目的：长期历史能够保存 assistant.tool_call 与 tool_result 的完整配对。
-        from uuid import uuid4
-        from datetime import datetime, timezone
-        msg_id = str(uuid4())
-        # [AutoC 2026-06-01] Why: converting non-string content with str()
-        # destroyed multimodal user image blocks before same-task history reload.
-        # How: pass provider-style list content through unchanged and only fall
-        # back to text for other unexpected content shapes. Purpose: shadow
-        # writes can preserve images for the active task while keeping legacy
-        # string behavior for ordinary messages.
         _raw_content = msg_dict.get('content', '')
-        _content = _raw_content if isinstance(_raw_content, (str, list)) else str(_raw_content)
+        # 落盘在后台线程里做，排队期间运行期消息可能还会被改，这里先拷一份
         msg = Message(
-            id=msg_id,
+            id=str(uuid.uuid4()),
             role=msg_dict.get('role', 'user'),
-            content=_content,
+            content=deepcopy(_raw_content) if isinstance(_raw_content, (str, list)) else str(_raw_content),
             message_type=message_type,
             created_at=datetime.now(timezone.utc).isoformat(),
-            meta=msg_dict.get('_meta', {}),
+            meta=deepcopy(msg_dict.get('_meta', {})),
             source_node_id=getattr(ls.node, 'id', ''),
             source_task_id=getattr(ls.rctx, 'task_id', ''),
-            tool_calls=msg_dict.get('tool_calls', []),
-            # [2026-05-01] 影子写入时保留原生 role=tool 的配对字段。
-            # 原因：ConversationStore 是下一轮历史来源；丢失 tool_call_id 会破坏 true native。
+            tool_calls=deepcopy(msg_dict.get('tool_calls', [])),
             tool_call_id=str(msg_dict.get('tool_call_id') or ''),
             name=str(msg_dict.get('name') or ''),
         )
-        # [Fork/Merge 2026-05-12] Child sessions still win, otherwise write to the runtime session.
-        # Why: rctx.session_id may now be an entry branch, not the user-facing parent session. How:
-        # keep child_session_id for delegated nodes and use rctx.session_id for main branch tasks.
-        # Purpose: ConversationStore writes stay isolated until supervisor merges the branch.
         target_session = getattr(ls.rctx, 'child_session_id', '') or ls.rctx.session_id
-        store.append(target_session, msg)
-        # Phase 3: 记录最后一次影子写入的 message id，供 snapshot 持久化使用
-        ls.last_shadow_message_id = msg_id
-        # P0 Task 内核化：追踪 first/last message ID 到 RunContext
-        if not ls.rctx.first_shadow_message_id:
-            ls.rctx.first_shadow_message_id = msg_id
-        ls.rctx.last_shadow_message_id = msg_id
+        writer.submit(target_session, msg)
     except Exception:
-        pass  # best-effort, never break main flow
+        logger.exception("shadow write failed: task=%s", getattr(ls.rctx, "task_id", ""))
+        return
+    ls.last_shadow_message_id = msg.id
+    if not getattr(ls.rctx, "first_shadow_message_id", ""):
+        ls.rctx.first_shadow_message_id = msg.id
+    ls.rctx.last_shadow_message_id = msg.id
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +203,63 @@ async def _check_preempt_and_cancel(ls: _LoopState, step: int) -> TaskAction | N
     return None
 
 
+def _invalid_arguments_error(tool_name: str, raw_arguments: str) -> str:
+    return (
+        f"Error: 参数不是合法 JSON，{tool_name} 没有执行。请用一个完整的 JSON 对象作为 arguments 重新调用。"
+        f"收到的参数（截断）：{raw_arguments[:300]}"
+    )
+
+
+def _append_tool_error(ls: _LoopState, tool_call: Any, text: str) -> None:
+    """给一个没有执行的工具调用补上错误结果，保持调用与结果的配对。"""
+    message = ls.formatter.format_tool_result(tool_call, text)
+    # 结果带上当前 tool_mode，真 native 的 role=tool 消息下一轮才会被原样透传
+    set_message_meta(message, MessageMeta(
+        tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+        message_type="tool_result",
+    ))
+    ls.messages.append(message)
+    _shadow_write(ls, message, message_type=MessageType.TOOL_RESULT)
+
+
+def _append_truncation_hint(ls: _LoopState) -> None:
+    ls.messages.append({
+        "role": "user",
+        "content": ls.formatter.build_truncation_hint(),
+        "_retry_hint": True,
+    })
+
+
+def _handle_truncated_response(ls: _LoopState, resp: Any, step: int) -> TaskAction | None:
+    """回复被输出上限截断：不当完整回复交付，带提示重来；次数用完把残文照发并注明被截断。"""
+    if ls.preempt_after_step:
+        return TaskAction(
+            action=ACTION_PREEMPTED, node_id=ls.node.id,
+            context_ref=_persist_ctx(ls, step + 1), summary="任务被软打断，上下文已保存。",
+        )
+    ls.truncation_retry_count += 1
+    if ls.truncation_retry_count <= ls.truncation_retry_max:
+        logger.warning(
+            "model reply truncated by the output limit; retrying (node=%s step=%d attempt=%d/%d)",
+            ls.node.id, step, ls.truncation_retry_count, ls.truncation_retry_max,
+        )
+        _append_truncation_hint(ls)
+        ls.use_stream = ls.streaming
+        return None
+    text = (getattr(resp, "text", None) or "").strip()
+    if text:
+        logger.warning(
+            "model reply still truncated after %d retries; delivering it marked as cut off (node=%s step=%d)",
+            ls.truncation_retry_max, ls.node.id, step,
+        )
+        return build_implicit_finish(ls, resp, text, step=step, truncated=True)
+    error = "模型回复多次超出输出长度上限被截断，未交付。"
+    return TaskAction(
+        action=ACTION_FAIL, node_id=ls.node.id, error=error,
+        context_ref=_persist_ctx(ls, step + 1), summary=error,
+    )
+
+
 async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | None:
     """处理 tool_calls（伪工具 + 真工具）。
 
@@ -243,35 +275,27 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     pseudo_calls: list = []
     real_tool_calls: list[dict[str, Any]] = []
     _unauthorized_names: list[str] = []
+    # 不执行的调用等 assistant 消息进了历史再补错误结果：写在它前面的结果会被配对修复当孤儿删掉
+    _rejected_calls: list[tuple[Any, str]] = []
     for tc in resp.tool_calls:
-        # [2026-05-04] Dynamic per-target dispatch tools are pseudo tools too.
-        # Why: names like dispatch:ereuna_coder are generated from delegate_targets
-        # and must bypass real-tool authorization. How: use the prefix-aware helper
-        # instead of a fixed name-only set. Purpose: route fixed-target dispatches
-        # to pseudo_handlers without accepting removed aggregate dispatch tools.
+        _raw_arguments = invalid_arguments(tc.arguments)
+        if _raw_arguments is not None:
+            logger.warning("node %s tool call %s carried non-JSON arguments; not executed", ls.node.id, tc.name)
+            _rejected_calls.append((tc, _invalid_arguments_error(tc.name, _raw_arguments)))
+            continue
+        # dispatch:{target} 这类按委派目标生成的名字也是伪工具，不走真工具授权
         if is_pseudo_tool_name(tc.name):
             pseudo_calls.append(tc)
+        elif tc.name not in ls.allowed_real_tools:
+            logger.warning("node %s attempted unauthorized tool call: %s (allowed: %s)",
+                           ls.node.id, tc.name, ls.allowed_real_tools)
+            _unauthorized_names.append(tc.name)
+            _rejected_calls.append((
+                tc,
+                f"Error: Tool '{tc.name}' is not in this node's allowed tool list. "
+                f"Use finish() to provide your output directly.",
+            ))
         else:
-            # 【Fix】真工具权限校验：工具必须在节点的授权列表内才能执行
-            if tc.name not in ls.allowed_real_tools:
-                logger.warning("node %s attempted unauthorized tool call: %s (allowed: %s)",
-                               ls.node.id, tc.name, ls.allowed_real_tools)
-                _unauthorized_names.append(tc.name)
-                _err_msg = ls.formatter.format_tool_result(
-                    tc,
-                    f"Error: Tool '{tc.name}' is not in this node's allowed tool list. "
-                    f"Use finish() to provide your output directly.",
-                )
-                # [2026-05-01] 工具结果必须带当前 tool_mode。
-                # 目的：真 native 的 role=tool 消息在下一轮仍由 NativeToolFormatter 透传。
-                set_message_meta(_err_msg, MessageMeta(
-                    tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
-                    message_type="tool_result",
-                ))
-                ls.messages.append(_err_msg)
-                _shadow_write(ls, _err_msg, message_type="tool_result")
-                continue
-
             real_tool_calls.append({
                 "id": tc.id,
                 "name": tc.name,
@@ -311,12 +335,10 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     if resp.reasoning:
         _assistant_msg["reasoning_content"] = resp.reasoning
     ls.messages.append(_assistant_msg)
-    # Phase 1: 影子写入 assistant 消息到 ConversationStore
-    # [2026-05-07] 含 finish 的 assistant 消息也直接持久化。
-    # 原因：finish 是真实 API tool_call，删除或拆分它会使后续 tool_result 失去配对来源。
-    # 做法：不再调用 sanitize_assistant_control_tools，而是保存原始 assistant.tool_calls。
-    # 目的：ConversationStore、snapshot 与 provider replay 的工具轮结构一致。
+    # 含 finish 的 assistant 消息原样落盘：拆掉它后面的 tool_result 就没了配对来源
     _shadow_write(ls, _assistant_msg, MessageType.ASSISTANT)
+    for _rejected_call, _rejected_error in _rejected_calls:
+        _append_tool_error(ls, _rejected_call, _rejected_error)
 
     # 正文处理策略（JSON / Fake Native / Native 模式统一）：
     # 工具调用伴随的自由正文不发送给用户，也不合成为 reply 工具调用。
@@ -350,23 +372,11 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
             or _before_result.reason
             or "Tool call blocked by before_tool_call hook."
         )
+        # 拒绝结果按普通工具结果落盘：标成 ephemeral 的话下一轮 provider 会看到 tool_call 没有回复
+        _answered = {id(_call) for _call, _ in _rejected_calls}
         for tc in resp.tool_calls:
-            _err = ls.formatter.format_tool_result(tc, _reject_msg)
-            # [2026-05-07] 拒绝路径也按普通工具结果持久化。
-            # 原因：finish_guard 产生的是对模型可见的错误 tool_result，若标记为 ephemeral，
-            # 下一轮 provider 会看到 assistant.tool_call 缺少对应结果。
-            # 做法：不再给 finish 错误结果设置 control_tool_name 或 _ephemeral。
-            # 目的：被拒绝的 finish 与同轮其他工具一样保持完整配对历史。
-            set_message_meta(_err, MessageMeta(
-                tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
-                message_type="tool_result",
-            ))
-            ls.messages.append(_err)
-            # [2026-05-07] before_tool_call 拒绝结果也要写入 ConversationStore。
-            # 原因：这些结果是 assistant.tool_call 的真实回复，不是运行期占位消息。
-            # 做法：与普通工具错误结果共用 _shadow_write。
-            # 目的：模型重试时能看到完整的拒绝原因和工具配对。
-            _shadow_write(ls, _err, message_type="tool_result")
+            if id(tc) not in _answered:
+                _append_tool_error(ls, tc, _reject_msg)
         return None  # 不执行任何工具，回到主循环让 AI 重试
     if _before_result.skip_step:
         return None
@@ -587,12 +597,8 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
 
 # ---------------------------------------------------------------------------
 #  异步工具后台执行器 / 自适应转异步辅助
-#  [2026-04-23] 从 commit 7d10197 恢复，在 864a333 大扫除中被误删。
-#  当工具 spec 标记 async_mode=True 时，工具在后台 asyncio.Task 中执行，
-#  完成后通过 preempt API 将结果注入回当前任务的对话流。
-#  [2026-07-14] 追加 execute_command「长任务自动转异步」能力：
-#  同步执行超过阈值时，把仍在运行的 asyncio.Task 转到后台，通过同一套
-#  async_tool_result 回传协议交付结果，模型立即拿到「已转异步」占位结果。
+#  spec 标了 async_mode 的工具在后台跑；execute_command 同步跑超过阈值也转到后台。
+#  两条路都经 async_tool_result 把结果注入回会话，模型当轮先拿到占位结果。
 # ---------------------------------------------------------------------------
 
 
@@ -669,21 +675,92 @@ async def _execute_registry_tool_with_span(
         return await registry.execute(name=tool_name, arguments=tool_args, ctx=tool_ctx)
 
 
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coroutine: Any, *, name: str) -> asyncio.Task:
+    # 事件循环只弱引用任务，不自己留一份引用的话后台回传可能半路被回收
+    task = asyncio.create_task(coroutine, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
 async def _deliver_started_async_task(
     exec_task: "asyncio.Task[Any]",
     **delivery_kwargs: Any,
 ) -> None:
-    """等待一个已启动的工具任务完成，并交付其最终异步结果。"""
-    # [2026-07-14] Why: 自适应 execute_command 先以普通 registry
-    # 执行启动，超过阈值才证明它很慢。How: 等待那个已存在的 task，而不是重新执行命令，
-    # 然后委派给 _run_async_deliver 复用回传逻辑。Purpose: 子进程保持单实例，
-    # execute_command 自身的超时仍拥有最终 kill 行为。
+    """等一个已经在跑的工具任务结束再回传结果；自适应转异步不重跑命令，子进程始终只有一个。"""
     try:
         result = await exec_task
     except Exception as e:
         await _run_async_deliver(error=e, **delivery_kwargs)
     else:
         await _run_async_deliver(result=result, **delivery_kwargs)
+
+
+async def _run_async_tool(
+    *,
+    registry: ToolRegistry,
+    tool_name: str,
+    tool_args: dict,
+    tool_ctx: ToolContext,
+    **delivery_kwargs: Any,
+) -> None:
+    """后台执行声明了 async_mode 的工具，结果走 async_tool_result 回传。"""
+    try:
+        result = await _execute_registry_tool_with_span(registry, tool_name, tool_args, tool_ctx, async_call=True)
+    except Exception as e:
+        await _run_async_deliver(registry=registry, tool_name=tool_name, tool_args=tool_args, error=e, **delivery_kwargs)
+    else:
+        await _run_async_deliver(registry=registry, tool_name=tool_name, tool_args=tool_args, result=result, **delivery_kwargs)
+
+
+def _async_attachment_paths(result: Any, workspace_root: Any) -> list[str]:
+    items = [
+        item if isinstance(item, dict) else {"path": item}
+        for item in payload_attachments(result)
+        if isinstance(item, (dict, str))
+    ]
+    if workspace_root is not None:
+        items = screen_attachments(workspace_root, items)
+    return [str(item["path"]) for item in items if item.get("path")]
+
+
+def _async_failure_message(tool_name: str, async_tool_id: str, error: str, elapsed: float | None = None) -> str:
+    took = f" in {elapsed:.1f}s" if elapsed is not None else ""
+    return (
+        f'\u274c Async tool "{tool_name}" (id: {async_tool_id}) failed{took}: {error}\n'
+        "Do not infer or fabricate the missing tool result. "
+        "Tell the user the operation failed and ask them to retry."
+    )
+
+
+def _async_result_message(
+    *,
+    registry: ToolRegistry,
+    tool_name: str,
+    tool_args: dict,
+    async_tool_id: str,
+    elapsed: float,
+    result: Any,
+    error: Exception | None,
+    workspace_root: Any,
+) -> tuple[str, str, list[str]]:
+    """返回 (回传正文, 失败原因, 附件路径)；失败原因为空表示成功。"""
+    if error is not None:
+        failure = str(error) or type(error).__name__
+        return _async_failure_message(tool_name, async_tool_id, failure), failure, []
+    outcome = tool_outcome(result)
+    if not outcome.ok:
+        return _async_failure_message(tool_name, async_tool_id, outcome.error, elapsed), outcome.error, []
+    summary = summarize_result(tool_name, result, args=tool_args)
+    _fmt, raw = result_to_raw(tool_name, result, tool_spec=registry.get_spec(tool_name))
+    message = (
+        f'\u2705 Async tool "{tool_name}" (id: {async_tool_id}) completed in {elapsed:.1f}s.'
+        f'\nSummary: {summary}\nResult:\n{raw}'
+    )
+    return message, "", _async_attachment_paths(result, workspace_root)
 
 
 async def _run_async_deliver(
@@ -700,255 +777,38 @@ async def _run_async_deliver(
     node_id: str = "",
     result: Any = None,
     error: Exception | None = None,
+    workspace_root: Any = None,
 ) -> None:
-    """格式化、跟踪并通过 supervisor 交付一个异步工具结果。"""
-    # [2026-07-14] Why: 声明式异步工具与自适应 execute_command 共享
-    # 同一套回调协议。How: 把结果整形、tracker 更新、附件提取、async_tool_result POST
-    # 收敛到一个交付函数。Purpose: 自适应转异步可以等待一个已启动进程而无需复制
-    # 现有回调实现。
+    """整形、记账并回传一个异步工具结果。session_id 是面向用户的路由会话，分支任务传父会话。"""
+    elapsed = time.monotonic() - started_at
     try:
-        if error is not None:
-            raise error
-        _elapsed = time.monotonic() - started_at
-        _summary = summarize_result(tool_name, result, args=tool_args)
-        _tool_spec = registry.get_spec(tool_name)
-        _fmt, raw = result_to_raw(tool_name, result, tool_spec=_tool_spec)
-        failure_error = _async_tool_failure(result)
-
-        _async_tool_tasks[async_tool_id] = {
-            "tool_name": tool_name,
-            "status": "failed" if failure_error else "done",
-            "task_id": task_id,
-            "started_at": started_at,
-            "finished_at": time.monotonic(),
-            "elapsed": round(_elapsed, 1),
-            **({"error": failure_error} if failure_error else {}),
-        }
-
-        if failure_error:
-            preempt_text = (
-                f'\u274c Async tool "{tool_name}" (id: {async_tool_id}) failed in {_elapsed:.1f}s: '
-                f'{failure_error}\nDo not infer or fabricate the missing tool result. '
-                "Tell the user the operation failed and ask them to retry."
-            )
-        else:
-            preempt_text = (
-                f'\u2705 Async tool "{tool_name}" (id: {async_tool_id}) completed in {_elapsed:.1f}s.'
-                f'\nSummary: {_summary}\nResult:\n{raw}'
-            )
-
-        attachments: list[str] = []
-        if isinstance(result, dict):
-            data = result.get("data") if isinstance(result.get("data"), dict) else {}
-            source_attachments = data.get("attachments") if isinstance(data.get("attachments"), list) else result.get("attachments")
-            if isinstance(source_attachments, list):
-                for a in source_attachments:
-                    if isinstance(a, dict) and a.get("path"):
-                        attachments.append(str(a["path"]))
-                    elif isinstance(a, str):
-                        attachments.append(a)
-
-        payload = _build_async_result_payload(
-            message=preempt_text,
-            tool_name=tool_name,
-            task_id=task_id,
-            node_id=str(node_id or ""),
-            failure_error=failure_error,
-            attachments=attachments,
+        message, failure_error, attachments = _async_result_message(
+            registry=registry, tool_name=tool_name, tool_args=tool_args, async_tool_id=async_tool_id,
+            elapsed=elapsed, result=result, error=error, workspace_root=workspace_root,
         )
+    except Exception as format_error:
+        logger.exception("formatting async tool result failed: tool=%s id=%s", tool_name, async_tool_id)
+        failure_error = str(format_error) or type(format_error).__name__
+        message, attachments = _async_failure_message(tool_name, async_tool_id, failure_error), []
 
-        await http.post(
-            f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
-            json=payload,
-        )
-    except Exception as e:
-        _async_tool_tasks[async_tool_id] = {
-            "tool_name": tool_name,
-            "status": "failed",
-            "task_id": task_id,
-            "started_at": started_at,
-            "finished_at": time.monotonic(),
-            "elapsed": round(time.monotonic() - started_at, 1),
-            "error": str(e),
-        }
-        try:
-            await http.post(
-                f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
-                json=_build_async_result_payload(
-                    message=(
-                        f'\u274c Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}\n'
-                        "Do not infer or fabricate the missing tool result. Tell the user the operation failed."
-                    ),
-                    tool_name=tool_name,
-                    task_id=task_id,
-                    node_id=str(node_id or ""),
-                    failure_error=str(e),
-                ),
-            )
-        except Exception:
-            pass
-
-
-def _build_async_result_payload(
-    *,
-    message: str,
-    tool_name: str,
-    task_id: str,
-    node_id: str,
-    failure_error: str = "",
-    attachments: list[str] | None = None,
-) -> dict[str, Any]:
-    """Build the shared Supervisor callback contract for all async paths."""
-    payload: dict[str, Any] = {
-        "message": str(message or ""),
-        "tool_name": str(tool_name or ""),
-        "task_id": str(task_id or ""),
-        "node_id": str(node_id or ""),
-        "success": not bool(failure_error),
+    _async_tool_tasks[async_tool_id] = {
+        "tool_name": tool_name,
+        "status": "failed" if failure_error else "done",
+        "task_id": task_id,
+        "started_at": started_at,
+        "finished_at": time.monotonic(),
+        "elapsed": round(elapsed, 1),
+        **({"error": failure_error} if failure_error else {}),
     }
-    if failure_error:
-        payload["error"] = str(failure_error)
-    if attachments:
-        payload["attachment_paths"] = list(attachments)
-    return payload
-
-
-def _async_tool_failure(result: Any) -> str:
-    """Return a readable error when a tool returned an explicit failed envelope.
-
-    Async tools normally report failures as ``{"ok": false, ...}`` instead of
-    raising. Treating that envelope as a completed call produced a misleading ✅
-    callback and let the next model turn invent a result. Keep the decision in a
-    small pure helper so both behavior and regression tests stay deterministic.
-    """
-    if not isinstance(result, dict) or result.get("ok") is not False:
-        return ""
-    error = str(result.get("error") or "").strip()
-    data = result.get("data") if isinstance(result.get("data"), dict) else {}
-    rendered = str(data.get("result") or "").strip()
-    if rendered.upper().startswith("ERROR:"):
-        rendered = rendered[6:].strip()
-    return error or rendered or "tool returned ok=false"
-
-
-async def _run_async_tool(
-    registry: ToolRegistry,
-    http: "httpx.AsyncClient",
-    supervisor_url: str,
-    task_id: str,
-    session_id: str,
-    tool_name: str,
-    tool_args: dict,
-    tool_ctx: ToolContext,
-    async_tool_id: str,
-) -> None:
-    """后台执行异步工具，完成后通过路由 session 的 API 注入结果。"""
-    # [Fork/Merge 2026-05-12] session_id here is the event/user-facing route session.
-    # Why: async tool results create a new inbound and must attach to the parent session when
-    # the original task is running on a branch. How: callers pass parent_session_id when present.
-    # Purpose: branch-local ConversationStore writes remain isolated while async callbacks still
-    # reach the SDK conversation_key mapping.
-    _started = time.monotonic()
-    try:
-        _args_summary = _short(json.dumps(tool_args, ensure_ascii=False, default=str), 200)
-        with get_bus().span('tool.call', payload={'tool': tool_name, 'args_summary': _args_summary, 'async': True}):
-            result = await registry.execute(name=tool_name, arguments=tool_args, ctx=tool_ctx)
-
-        _elapsed = time.monotonic() - _started
-        # [summary-args 2026-05-19] Why: async tool completion is reported through
-        # preempt text and should identify the original call. How: pass the saved
-        # tool arguments into summarize_result(). Purpose: keep async summaries as
-        # informative as synchronous handoff_progress rows.
-        _summary = summarize_result(tool_name, result, args=tool_args)
-        # [AutoC 2026-05-31] Why: result_to_raw() can now honor a tool spec's
-        # optional result_format before structural fallback. How: fetch the spec
-        # from the same registry that executed the async tool and pass it as a
-        # keyword-only argument. Purpose: let async tools use the same automatic
-        # result routing as synchronous tool calls.
-        _tool_spec = registry.get_spec(tool_name)
-        _fmt, raw = result_to_raw(tool_name, result, tool_spec=_tool_spec)
-
-        failure_error = _async_tool_failure(result)
-        _async_tool_tasks[async_tool_id] = {
-            "tool_name": tool_name,
-            "status": "failed" if failure_error else "done",
-            "task_id": task_id,
-            "started_at": _started,
-            "finished_at": time.monotonic(),
-            "elapsed": round(_elapsed, 1),
-            **({"error": failure_error} if failure_error else {}),
-        }
-
-        if failure_error:
-            preempt_text = (
-                f'\u274c Async tool "{tool_name}" (id: {async_tool_id}) failed in {_elapsed:.1f}s: '
-                f'{failure_error}\nDo not infer or fabricate the missing tool result. '
-                "Tell the user the operation failed and ask them to retry or provide the input again."
-            )
-        else:
-            preempt_text = (
-                f'\u2705 Async tool "{tool_name}" (id: {async_tool_id}) completed in {_elapsed:.1f}s.'
-                f'\nSummary: {_summary}\nResult:\n{raw}'
-            )
-
-        attachments: list[str] = []
-        if isinstance(result, dict):
-            # [AutoC 2026-05-31] Why: async media tools are moving attachment
-            # metadata under data.attachments while temporarily mirroring it at the
-            # top level. How: read the nested list first and fall back to the legacy
-            # list. Purpose: keep async callback payloads able to attach files.
-            data = result.get("data") if isinstance(result.get("data"), dict) else {}
-            source_attachments = data.get("attachments") if isinstance(data.get("attachments"), list) else result.get("attachments")
-            if isinstance(source_attachments, list):
-                for a in source_attachments:
-                    if isinstance(a, dict) and a.get("path"):
-                        attachments.append(str(a["path"]))
-                    elif isinstance(a, str):
-                        attachments.append(a)
-
-        payload = _build_async_result_payload(
-            message=preempt_text,
-            tool_name=tool_name,
-            task_id=task_id,
-            node_id=str(getattr(tool_ctx, "node_id", "") or ""),
-            failure_error=failure_error,
-            attachments=attachments,
-        )
-
-        # [Fork/Merge 2026-05-12] Use the route session, not necessarily the runtime session.
-        # Why: branch sessions are internal and may not have SDK channel mappings. How: the caller
-        # passes parent_session_id when available. Purpose: async results become normal inbound
-        # messages on the user-facing parent session.
-        await http.post(
-            f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
-            json=payload,
-        )
-    except Exception as e:
-        _async_tool_tasks[async_tool_id] = {
-            "tool_name": tool_name,
-            "status": "failed",
-            "task_id": task_id,
-            "started_at": _started,
-            "finished_at": time.monotonic(),
-            "elapsed": round(time.monotonic() - _started, 1),
-            "error": str(e),
-        }
-        try:
-            await http.post(
-                f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
-                json=_build_async_result_payload(
-                    message=(
-                        f'\u274c Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}\n'
-                        "Do not infer or fabricate the missing tool result. Tell the user the operation failed."
-                    ),
-                    tool_name=tool_name,
-                    task_id=task_id,
-                    node_id=str(getattr(tool_ctx, "node_id", "") or ""),
-                    failure_error=str(e),
-                ),
-            )
-        except Exception:
-            pass
+    payload = build_async_result_payload(
+        message=message,
+        tool_name=tool_name,
+        task_id=task_id,
+        node_id=str(node_id or ""),
+        failure_error=failure_error,
+        attachments=attachments,
+    )
+    await deliver_async_result(http, supervisor_url, session_id, payload, workspace_root=workspace_root)
 
 
 # ---------------------------------------------------------------------------
@@ -1092,21 +952,21 @@ async def _execute_real_tools(
                 "started_at": _tool_t0,
                 "task_id": ls.rctx.task_id,
             }
-            asyncio.create_task(
+            _spawn_background(
                 _run_async_tool(
                     registry=ls.registry,
-                    http=ls.rctx.http,
-                    supervisor_url=ls.rctx.supervisor_url,
-                    task_id=ls.rctx.task_id,
-                    # [Fork/Merge 2026-05-12] Route async callbacks through the parent session.
-                    # Why: ls.rctx.session_id may be an entry branch used only for runtime history.
-                    # How: prefer parent_session_id and fall back to session_id for old tasks.
-                    # Purpose: async tool results create follow-up inbound messages in the SDK-visible session.
-                    session_id=ls.rctx.parent_session_id or ls.rctx.session_id,
                     tool_name=_t_name,
                     tool_args=_t_args,
                     tool_ctx=_async_tool_ctx,
+                    http=ls.rctx.http,
+                    supervisor_url=ls.rctx.supervisor_url,
+                    task_id=ls.rctx.task_id,
+                    # 回传要落到 SDK 看得见的父会话，入口分支只装运行期历史
+                    session_id=ls.rctx.parent_session_id or ls.rctx.session_id,
                     async_tool_id=_async_id,
+                    started_at=_tool_t0,
+                    node_id=ls.node.id,
+                    workspace_root=ls.rctx.workspace_root,
                 ),
                 name=f"async_tool_{_t_name}_{_async_id}",
             )
@@ -1153,7 +1013,7 @@ async def _execute_real_tools(
                 "result": _t_result,
                 "raw_inline": _t_raw_inline,
                 "format": _t_fmt,
-                "elapsed_ms": round((time.monotonic() - _tool_t0) * 1000, 1) if "_tool_t0" in dir() else None,
+                "elapsed_ms": round((time.monotonic() - _tool_t0) * 1000, 1),
             })
             await ls.rctx.emit_event("handoff_progress", {
                 "message": f"[{ls.node.id}] {_t_name}: 异步执行已启动",
@@ -1204,7 +1064,7 @@ async def _execute_real_tools(
                     "task_id": ls.rctx.task_id,
                     "upgraded_from": "sync_timeout",
                 }
-                asyncio.create_task(
+                _spawn_background(
                     _deliver_started_async_task(
                         _exec_task,
                         registry=ls.registry,
@@ -1217,6 +1077,7 @@ async def _execute_real_tools(
                         async_tool_id=_async_id,
                         started_at=_tool_t0,
                         node_id=ls.node.id,
+                        workspace_root=ls.rctx.workspace_root,
                     ),
                     name=f"async_upgrade_{_t_name}_{_async_id}",
                 )
@@ -1258,30 +1119,16 @@ async def _execute_real_tools(
                 continue
             _t_result = _exec_task.result()
         else:
-            _args_summary = _short(json.dumps(_t_args, ensure_ascii=False, default=str), 200)
-            with get_bus().span('tool.call', payload={'tool': _t_name, 'args_summary': _args_summary}):
-                _t_result = await ls.registry.execute(name=_t_name, arguments=_t_args, ctx=_tool_ctx)
-        # [硬取消-场景1] 工具返回 cancelled 时，仍将结果存入 _tool_entries 再 break。
-        # 确保 assistant 的 tool_use 有对应 tool_result 配对，
-        # 模型下次看到的是「我调了工具但被用户取消了」而非 tool_use 悬空无响应。
-        _t_cancelled = isinstance(_t_result, dict) and _t_result.get("cancelled")
+            _t_result = await _execute_registry_tool_with_span(ls.registry, _t_name, _t_args, _tool_ctx)
+        # 被取消的工具结果照样进 _tool_entries 再 break：tool_use 不能悬空没有结果
+        _t_outcome = tool_outcome(_t_result)
+        _t_cancelled = _t_outcome.status == TOOL_CANCELLED
 
-        # [AutoC 2026-07-11] Why: finish 硬校验需要知道本任务内每个真实工具
-        # 是否真的成功执行过，用于阻止“伪造工具调用”的假成功 finish。How: 判定
-        # 工具结果是否为成功（无 error 且未 cancelled，dict 时优先看 ok 字段）。
-        # Purpose: 让 FinishGuardHandler 能核对真实工具执行记录。
-        _t_is_error = False
-        if _t_cancelled:
-            _t_is_error = True
-        elif isinstance(_t_result, dict):
-            if _t_result.get("error"):
-                _t_is_error = True
-            elif _t_result.get("ok") is False:
-                _t_is_error = True
-        if _t_is_error:
-            ls.failed_real_tools.add(_t_name)
-        else:
+        # finish 硬校验靠这两份记录核对本任务里真实工具有没有成功执行过，防止编造工具结果的假成功
+        if _t_outcome.ok:
             ls.succeeded_real_tools.add(_t_name)
+        else:
+            ls.failed_real_tools.add(_t_name)
 
         # [summary-args 2026-05-19] Why: handoff_progress keeps the legacy
         # "[node] tool: summary" format, so argument detail must come from the
@@ -1310,27 +1157,19 @@ async def _execute_real_tools(
             "summary": _t_summary,
         })
 
-        # [WS tool events 2026-05-17] Why: clients should receive a structured
-        # completion event even when a tool reports an error dict or cancellation
-        # stops later progress messages. How: derive status from the tool result's
-        # error field and emit before any legacy handoff_progress path. Purpose:
-        # reconnecting clients can reconstruct completed tool calls from EventLog.
+        # 工具报错或被取消也要发结构化的结束事件，断线重连的客户端靠 EventLog 还原工具卡片
         await ls.rctx.emit_event("tool_call_end", {
             "node_id": ls.node.id,
             "task_id": ls.rctx.task_id,
             "tool_call_id": _rtc.get("id", ""),
             "tool_name": _t_name,
-            "status": "cancelled" if _t_cancelled else ("error" if (isinstance(_t_result, dict) and _t_result.get("error")) else "success"),
+            "status": _t_outcome.status,
             "summary": _t_summary,
-            # [WS tool result fields 2026-05-19] Why: SDKs and adapters need the
-            # complete returned object, not only a short summary. How: carry the
-            # original result plus the same formatted inline representation that is
-            # appended to the model transcript. Purpose: leave truncation decisions
-            # to consuming adapters while preserving the raw engine result here.
+            # 完整结果原样带上，截不截断由下游适配器决定
             "result": _t_result,
             "raw_inline": _t_raw_inline,
             "format": _t_fmt,
-            "elapsed_ms": round((time.monotonic() - _tool_t0) * 1000, 1) if "_tool_t0" in dir() else None,
+            "elapsed_ms": round((time.monotonic() - _tool_t0) * 1000, 1),
         })
 
         # [硬取消-场景1] 已取消的工具结果已存入 entries（上方 append），不处理附件和进度事件，
@@ -1414,6 +1253,8 @@ async def _execute_real_tools(
             ls.messages.append(_tool_att_msg)
             _shadow_write(ls, _tool_att_msg, message_type="tool_result_attachment")
 
+    # 一批工具结果在下一次推理前落盘，进程这时候挂了下一个 worker 恢复也看得到这批结果
+    await flush_conversation_writes(ls.rctx)
     return None
 
 
@@ -1664,7 +1505,11 @@ def _isolated_plugin_context(function):
             provider=getattr(provider, "provider_name", "") or getattr(provider, "name", ""),
             purpose="system" if node.id.startswith("system.") else "inference",
         ):
-            return await function(**kwargs)
+            try:
+                return await function(**kwargs)
+            finally:
+                # 结果交回 supervisor 之前本任务排队的对话写入必须全部落盘：合并分支、压缩都要读这份历史
+                await flush_conversation_writes(rctx)
     return run
 
 
@@ -1702,7 +1547,7 @@ async def run_ai_node(
 
     runtime_cfg = load_runtime_config(rctx.workspace_root)
     route_meta = routing_meta(rctx.task_context)
-    max_steps = get_int(runtime_cfg, "engine.max_steps", 32, min_value=1, max_value=200)
+    max_steps = get_int(runtime_cfg, "engine.max_steps", 64, min_value=1, max_value=200)
     # [fix 2026-07-17] 支持节点级 max_steps 覆盖：系统节点（压缩/摘要/读图等）是
     # 单轮一次性任务，不需要 32 步的大循环。压缩模型持续空响应/非法 JSON 时，若沿用
     # 全局 max_steps=32，会在同一坏模型上原地空转十几分钟拖垮整条会话（system.compactor
@@ -1725,27 +1570,10 @@ async def run_ai_node(
         collected_attachments.extend(attachments)
     if resume_data and isinstance(resume_data, dict):
         for e in (resume_data.get("tool_results") or resume_data.get("entries") or []):
-            if isinstance(e, dict):
-                # [AutoC 2026-05-31] Why: resumed tool entries may carry either the
-                # old top-level attachments list or the new data.attachments list.
-                # How: inspect the nested data dict before the legacy field.
-                # Purpose: avoid dropping generated files when resuming sessions.
-                e_data = e.get("data") if isinstance(e.get("data"), dict) else {}
-                e_atts = e_data.get("attachments") if isinstance(e_data.get("attachments"), list) else e.get("attachments")
-                if isinstance(e_atts, list):
-                    collected_attachments.extend(e_atts)
+            collected_attachments.extend(payload_attachments(e))
         if isinstance(resume_data.get("attachments"), list):
             collected_attachments.extend(resume_data["attachments"])
-        rd = resume_data.get("result")
-        if isinstance(rd, dict):
-            # [AutoC 2026-05-31] Why: final result payloads can also be migrated to
-            # data.attachments. How: prefer nested attachments and fall back to the
-            # old result.attachments list. Purpose: keep finish-time attachments
-            # selectable after a resume.
-            rd_data = rd.get("data") if isinstance(rd.get("data"), dict) else {}
-            rd_atts = rd_data.get("attachments") if isinstance(rd_data.get("attachments"), list) else rd.get("attachments")
-            if isinstance(rd_atts, list):
-                collected_attachments.extend(rd_atts)
+        collected_attachments.extend(payload_attachments(resume_data.get("result")))
 
     # ---- 恢复或新建消息历史 ----
     step_count = 0
@@ -1952,6 +1780,7 @@ async def run_ai_node(
         preempt_after_step=False,
         preempt_inject_info=None,
         use_stream=streaming,
+        resume_data=resume_data if isinstance(resume_data, dict) else None,
     )
 
     # ---- 推理循环 ----
@@ -2024,7 +1853,6 @@ async def run_ai_node(
         if _usage_ctx.response is not resp:
             resp = _usage_ctx.response
 
-        import sys as _ds2; _ds2.stderr.write(f"[DIAG-AISTEP] post-hook: ok={resp.ok} err={repr((resp.error or '')[:150])} text={repr((resp.text or '')[:80])} st={resp.status_code}\n"); _ds2.stderr.flush()
         if not resp.ok:
             return _build_failure_action(ls, resp, step)
 
@@ -2033,17 +1861,14 @@ async def run_ai_node(
             _parsed = formatter.parse_tool_calls(resp)
             if _parsed:
                 _clean_text = formatter.get_plain_text(resp)
-                resp = ProviderResponse(
-                    ok=True,
+                # 只换正文和工具调用，finish_reason 这类字段得留着：后面还要据此判断有没有被截断
+                resp = with_changes(
+                    resp,
                     text=_clean_text,
                     tool_calls=[
                         ToolCall(id=p.id, name=p.name, arguments=p.arguments)
                         for p in _parsed
                     ],
-                    # [refactor 2026-04-18] thinking → reasoning
-                    reasoning=resp.reasoning,
-                    status_code=resp.status_code,
-                    usage=resp.usage,
                 )
                 # [stream-clean 2026-05-31] Why: JSON tool mode mixes protocol
                 # markers (<<<TOOL_CALL>>>) into stream_delta output. The markers
@@ -2067,16 +1892,19 @@ async def run_ai_node(
                         "tool call parse failed; stripped protocol markers from plain text (node=%s)",
                         ls.node.id,
                     )
-                    resp = ProviderResponse(
-                        ok=True,
-                        text=_stripped,
-                        reasoning=resp.reasoning,
-                        status_code=resp.status_code,
-                        usage=resp.usage,
-                    )
+                    resp = with_changes(resp, text=_stripped)
 
         if resp.tool_calls:
             action = await _handle_tool_calls(ls, resp, step)
+            if action is not None:
+                return await _fire_task_end_hook_if_finish(ls, action, step + 1)
+            if is_truncated(resp):
+                # 截断点之后的调用已经丢了，告诉模型这轮没说完
+                _append_truncation_hint(ls)
+            continue
+
+        if is_truncated(resp):
+            action = _handle_truncated_response(ls, resp, step)
             if action is not None:
                 return await _fire_task_end_hook_if_finish(ls, action, step + 1)
             continue

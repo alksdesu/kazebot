@@ -5,6 +5,9 @@ import hashlib
 import json
 from typing import Any
 
+from engine.attachments import payload_attachments
+from engine.tool_step import tool_outcome
+
 logger = logging.getLogger(__name__)
 
 IMAGE_TOOLS = frozenset({"gpt_image_2", "gemini_image", "nai_generate", "nai_generate_from_plan"})
@@ -35,10 +38,10 @@ async def begin_image_generation(ctx: Any, name: str, arguments: dict) -> dict |
 
 
 async def persist_generated_images(ctx: Any, name: str, arguments: dict, result: Any, *, operation: dict | None = None) -> Any:
-    if name not in IMAGE_TOOLS or not isinstance(result, dict) or result.get("ok") is False:
+    if name not in IMAGE_TOOLS or not isinstance(result, dict) or not tool_outcome(result).ok:
         return result
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
-    attachments = data.get("attachments") or result.get("attachments") or []
+    attachments = payload_attachments(result)
     images = [item for item in attachments if isinstance(item, dict) and item.get("type") == "image" and item.get("path")]
     if not images or not getattr(ctx, "task_id", ""):
         return result

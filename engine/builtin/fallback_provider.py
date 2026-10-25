@@ -16,60 +16,23 @@ from typing import Any, Iterable
 import yaml
 
 import config_layout
-from clonoth_runtime import resolve_channel, resolve_env_ref
+from clonoth_runtime import parse_bool, resolve_channel, resolve_env_ref
 from plugin_runtime import PluginExecutionError, plugin_scope
 
-# [fix 2026-05-28] Import message formatting utilities so fallback calls go
-# through the same conversion pipeline as the primary call (llm_call.py L171-172).
-# Without this, internal fields like _meta/_ephemeral leak into provider requests.
-from engine.inference.llm_call import _build_messages_for_provider
-from engine.attachments import prepare_messages_for_llm
-from engine.compact import bounded_tool_result_view
-
-
-def _messages_contain_images(messages: list[dict[str, Any]]) -> bool:
-    """Return whether provider-ready messages contain multimodal image blocks."""
-    for message in messages:
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        if any(
-            isinstance(part, dict) and part.get("type") in {"image_url", "input_image", "image"}
-            for part in content
-        ):
-            return True
-    return False
-
-
-def _strip_image_blocks(messages: list[dict]) -> list[dict]:
-    """Remove image_url content blocks from all messages.
-
-    Why: fallback providers like DeepSeek don't support vision/multimodal.
-    How: for each message with list-type content, filter out image_url blocks.
-    If a message becomes empty after stripping, replace with placeholder text.
-    """
-    result = []
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            result.append(msg)
-            continue
-        filtered = [p for p in content if not (isinstance(p, dict) and p.get("type") == "image_url")]
-        if not filtered:
-            new_msg = {**msg, "content": "[image content removed]"}
-        elif len(filtered) == 1 and isinstance(filtered[0], dict) and filtered[0].get("type") == "text":
-            new_msg = {**msg, "content": filtered[0].get("text", "")}
-        elif len(filtered) == len(content):
-            result.append(msg)
-            continue
-        else:
-            new_msg = {**msg, "content": filtered}
-        result.append(new_msg)
-    return result
+from engine.attachments import contains_image_blocks
+from engine.inference.llm_call import (
+    _node_strips_images,
+    cancelled_action,
+    provider_messages,
+    record_response_usage,
+    request_view,
+    wait_provider_call,
+)
+from engine.inference.llm_outcome import error_kind, should_fallback
+from .result import hook_result
+from .usage_tracker import accumulate_usage
 
 logger = logging.getLogger(__name__)
-
-_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 PLUGIN_META = {
     "handler_class": "FallbackProviderHandler",
@@ -138,10 +101,7 @@ def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) ->
     supports_vision_raw = fb_cfg.get("supports_vision")
     if supports_vision_raw is None:
         supports_vision_raw = provider_block.get("supports_vision", False)
-    if isinstance(supports_vision_raw, str):
-        supports_vision = supports_vision_raw.strip().lower() in {"1", "true", "yes", "on"}
-    else:
-        supports_vision = bool(supports_vision_raw)
+    supports_vision = bool(parse_bool(supports_vision_raw, False))
 
     # 备选的 provider 类型往往和主渠道不同，参数键名不通用，所以不继承主渠道的
     # options，只从同名 provider 块继承，再让条目自己覆盖。
@@ -202,39 +162,21 @@ def _select_fallbacks_for_node(
     return full_cfg.get("fallbacks", []) or []
 
 
-def _is_retryable(status_code: int | None, error: str | None = None) -> bool:
-    """Check if the error is worth retrying on a different provider.
+def _live_loop_state(ls: Any) -> bool:
+    """hook 拿到的 loop_state 是不是真在跑的那份（能发事件），测试和精简调用方只给一个 formatter。"""
+    return callable(getattr(getattr(ls, "rctx", None), "emit_event", None))
 
-    Covers both HTTP-level errors (429/5xx) and upstream provider errors
-    that arrive as ok=False with HTTP 200 (e.g. content_filter, safety
-    blocks, rate limits, empty responses via SSE error objects).
-    """
-    # Any response marked ok=False that reaches us is worth retrying,
-    # unless it's a definitive client error (4xx other than 429).
-    if status_code is None:
-        return True  # unknown / connection-level error
-    if status_code in _RETRYABLE_STATUS_CODES:
-        return True
-    # HTTP 200 but ok=False → upstream signaled error through body/SSE
-    # (content_filter, safety block, quota via SSE error object, etc.)
-    if status_code == 200 and error:
-        return True
-    # 4xx (except 429 and certain content moderation 403s) are client errors — don't retry
-    # 403 can be either a true auth rejection or a content moderation refusal (safeguards).
-    # Content moderation refusals are worth retrying on a different provider (e.g., Claude
-    # cyber safeguard → fallback to DeepSeek); auth rejections are not.
-    _CONTENT_MODERATION_KEYWORDS = {
-        'safeguard', 'content_filter', 'refused', 'safety', 'cyber',
-        'not allowed', 'community guidelines', 'moderation',
-    }
-    if status_code == 403 and error:
-        err_lower = error.lower()
-        if any(kw in err_lower for kw in _CONTENT_MODERATION_KEYWORDS):
-            return True  # content moderation → retryable on different provider
-        return False  # auth/permissions rejection → don't retry
-    if 400 <= status_code < 500:
-        return False
-    return True  # anything else (1xx, 3xx, unknown) → try fallback
+
+async def _account_usage(ls: Any, rctx: Any, resp: Any, messages: list[dict[str, Any]], tools: Any) -> None:
+    """备用渠道这次请求的用量照样记账：任务用量统计和压缩阈值都按它校准。"""
+    usage = getattr(resp, "usage", None)
+    if not isinstance(usage, dict):
+        return
+    total = getattr(rctx, "total_usage", None)
+    if isinstance(total, dict):
+        accumulate_usage(total, usage)
+    if _live_loop_state(ls):
+        await record_response_usage(ls, resp, messages, tools)
 
 
 def _create_fallback_provider(
@@ -339,11 +281,10 @@ class FallbackProviderHandler:
             return None  # success or no response, don't intervene
 
         status_code = getattr(resp, "status_code", None)
-        original_error = getattr(resp, "error", None) or ""
-        if not _is_retryable(status_code, original_error):
+        if not should_fallback(resp):
             logger.debug(
-                "fallback_provider: skipping non-retryable error (status=%s)",
-                status_code,
+                "fallback_provider: skipping error not worth a fallback (status=%s kind=%s)",
+                status_code, error_kind(resp),
             )
             return None
 
@@ -366,16 +307,13 @@ class FallbackProviderHandler:
             return None
 
         original_error = getattr(resp, "error", "unknown")
-        messages, _ = bounded_tool_result_view(ctx.messages)
+        view = request_view(ctx.messages)
         tools = ctx.tools
         original_provider = ctx.provider
-        has_image_input = _messages_contain_images(messages)
+        node_strips_images = _node_strips_images(_node)
+        has_image_input = not node_strips_images and contains_image_blocks(view)
         original_model = getattr(original_provider, "model", "unknown")
-
-        # [fix 2026-05-28] Retrieve formatter from loop_state so we can run the
-        # same message format conversion that llm_call.py does before provider.chat().
-        # Why: without this, messages with _meta/_ephemeral fields are sent raw to
-        # the fallback provider, causing "missing field type" errors on DS etc.
+        step = int(getattr(ctx, "step", 0) or 0)
         _ls = ctx.extra.get("loop_state")
         _formatter = getattr(_ls, 'formatter', None) if _ls else None
 
@@ -442,26 +380,11 @@ class FallbackProviderHandler:
                     i, fb_base_url[:40], fb_model,
                 )
 
-                # [fix 2026-05-28] Format messages for this specific fallback
-                # provider before calling chat(). Mirrors llm_call.py L171-172:
-                #   1. _build_messages_for_provider: L2 formatter / bypass based
-                #      on provider type (e.g. Responses/Gemini skip L2)
-                #   2. prepare_messages_for_llm: resolve file:// image refs → base64
-                # The third arg MUST be fb_provider (not original_provider) because
-                # different providers need different format conversion paths.
-                _fb_formatted = _build_messages_for_provider(
-                    messages, _formatter, fb_provider,
+                # 格式转换按备用渠道自己的 provider 走：Responses/Gemini 绕过 L2，其余经 formatter
+                _fb_messages = provider_messages(
+                    view, formatter=_formatter, provider=fb_provider, workspace_root=workspace_root,
+                    strip_images=node_strips_images or not fb_supports_vision,
                 )
-                _fb_messages = prepare_messages_for_llm(
-                    _fb_formatted, workspace_root,
-                ) if workspace_root else _fb_formatted
-
-                # Only text-only fallbacks may strip image blocks. Multimodal
-                # requests are filtered above unless the entry explicitly opts in
-                # with supports_vision=true, in which case the original image
-                # blocks must reach the fallback provider unchanged.
-                if not fb_supports_vision:
-                    _fb_messages = _strip_image_blocks(_fb_messages)
 
                 t0 = time.monotonic()
                 fb_provider.plugin_channel = fb_channel
@@ -469,11 +392,14 @@ class FallbackProviderHandler:
                     workspace_root=workspace_root, node_id=_node_id,
                     task_id=getattr(rctx, "task_id", ""), channel=fb_channel, purpose="fallback",
                 ):
-                    new_resp = await fb_provider.chat(
-                        messages=_fb_messages,
-                        tools=tools,
+                    new_resp = await wait_provider_call(
+                        _ls, fb_provider.chat(messages=_fb_messages, tools=tools), step,
                     )
                 elapsed = round((time.monotonic() - t0) * 1000, 1)
+                if new_resp is None:
+                    logger.info("fallback_provider: task cancelled while waiting on fallback[%d]", i)
+                    return hook_result(action=cancelled_action(_ls))
+                await _account_usage(_ls, rctx, new_resp, _fb_messages, tools)
 
                 if new_resp.ok:
                     logger.warning(

@@ -24,6 +24,8 @@ PLUGIN_META = {
     "priority": 0,
 }
 
+TRUNCATED_NOTICE = "（回复超出长度上限，后面的内容被截断了）"
+
 
 class PlaintextRetryHandler:
     """Handle model responses that contain no tool calls."""
@@ -58,7 +60,7 @@ class PlaintextRetryHandler:
             ))
 
         if getattr(ls.node, "output_mode", "tool_only") == "hybrid":
-            return hook_result(action=_build_implicit_finish(ctx, ls, resp, text))
+            return hook_result(action=build_implicit_finish(ls, resp, text, step=ctx.step))
 
         ls.plaintext_retry_count += 1
         if ls.plaintext_retry_count <= ls.plaintext_retry_max:
@@ -75,18 +77,18 @@ class PlaintextRetryHandler:
         # 表现为用户侧“回复无了”）。低智商模型反复不会调 finish 工具时，
         # 把裸正文包装为隐式 finish 正常投递给用户（对齐 hybrid 模式行为），
         # result 中标记 implicit_finish=True 与 plaintext_recovery=True 供事件/管理区分。
-        return hook_result(action=_build_implicit_finish(
-            ctx, ls, resp, text, plaintext_recovery=True,
+        return hook_result(action=build_implicit_finish(
+            ls, resp, text, step=ctx.step, plaintext_recovery=True,
         ))
 
 
-def _build_implicit_finish(
-    ctx: Any, ls: Any, resp: Any, text: str, *, plaintext_recovery: bool = False,
+def build_implicit_finish(
+    ls: Any, resp: Any, text: str, *, step: int, plaintext_recovery: bool = False, truncated: bool = False,
 ) -> TaskAction:
     """Build the same implicit finish action used by hybrid output mode.
 
     plaintext_recovery=True 表示 tool_only 模式重试耗尽后的裸文本兜底投递，
-    额外在 result 中打 plaintext_recovery 标记，便于事件日志区分。
+    truncated=True 表示截断重试用完后把残文照发，正文末尾注明被截断；两者都在 result 里打标记，便于事件日志区分。
     """
     from engine.inference.ai_step import _shadow_write
     from engine.conversation_routing import concise_text, short_reply
@@ -94,6 +96,9 @@ def _build_implicit_finish(
     concise = short_reply(getattr(ls.rctx, "task_context", {}) or {})
     if concise:
         text = concise_text(text)
+    if truncated:
+        # 放在缩写之后，免得说明本身被截掉
+        text = f"{text}\n\n{TRUNCATED_NOTICE}"
 
     assistant_msg = ls.formatter.build_assistant_message(resp, text, [])
     provider_name = getattr(ls.provider, "name", "") or "unknown"
@@ -112,7 +117,7 @@ def _build_implicit_finish(
     ls.messages.append(assistant_msg)
     _shadow_write(ls, assistant_msg, MessageType.ASSISTANT)
 
-    ctx_ref = _persist_ctx(ls, ctx.step + 1)
+    ctx_ref = _persist_ctx(ls, step + 1)
     return TaskAction(
         action=ACTION_FINISH,
         node_id=ls.node.id,
@@ -121,6 +126,7 @@ def _build_implicit_finish(
             "attachments": [] if concise else list(ls.tool_produced_attachments),
             "implicit_finish": True,
             **({"plaintext_recovery": True} if plaintext_recovery else {}),
+            **({"truncated": True} if truncated else {}),
         },
         context_ref=ctx_ref,
         summary=_short(text, 240),

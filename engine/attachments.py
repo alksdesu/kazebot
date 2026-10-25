@@ -43,6 +43,8 @@ _JPEG_QUALITY = 85
 
 # 没有哪家 provider 收矢量图，发出去整轮请求会 400。压缩层也转不了它——PIL 读不了 SVG。
 _UNSENDABLE_IMAGE_MIMES = frozenset({"image/svg+xml"})
+# 内部格式只有 image_url；另两种是各家 provider 转换后的写法
+IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
 # 超过这个大小只给路径，让模型用 read_file 自己取，别把上下文窗口撑爆。
 _TEXT_FILE_MAX_BYTES = 102400  # 100KB
 
@@ -172,6 +174,48 @@ def is_allowed_attachment_path(rel_path: str) -> bool:
     return len(parts) > 1 and parts[0] == _ALLOWED_DIR and ".." not in parts
 
 
+def resolve_attachment_file(workspace_root: Path, rel_path: str) -> Path | None:
+    """附件读盘前的唯一一道门：路径写法在 data/ 下，解析到底也还在 data/ 下的现成文件。
+
+    共享表情包库经受信链接认回 data/stickers；data/ 里随手建的软链指到别处一律不认。
+    """
+    if not is_allowed_attachment_path(rel_path):
+        return None
+    try:
+        resolved = (Path(workspace_root) / rel_path).resolve()
+    except (OSError, RuntimeError):
+        return None
+    logical = config_layout.workspace_logical_path(workspace_root, resolved)
+    if logical is None or not is_allowed_attachment_path(logical):
+        return None
+    return resolved if resolved.is_file() else None
+
+
+def payload_attachments(payload: Any) -> list[Any]:
+    """工具或子节点结果里的附件列表：新格式在 data.attachments，旧格式在顶层。"""
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    nested = data.get("attachments") if isinstance(data.get("attachments"), list) else []
+    legacy = payload.get("attachments") if isinstance(payload.get("attachments"), list) else []
+    return list(nested or legacy)
+
+
+def screen_attachments(workspace_root: Path, attachments: list[Any]) -> list[dict[str, Any]]:
+    """工具产出的附件进上下文、外发之前过同一道门，过不去的丢掉。"""
+    kept: list[dict[str, Any]] = []
+    refused: list[str] = []
+    for attachment in attachments:
+        path = str(attachment.get("path") or "").strip() if isinstance(attachment, dict) else ""
+        if path and resolve_attachment_file(workspace_root, path) is not None:
+            kept.append(attachment)
+        else:
+            refused.append(path or repr(attachment)[:120])
+    if refused:
+        _logger.warning("dropped tool attachments outside data/ or missing: %s", refused)
+    return kept
+
+
 def save_attachment(
     workspace_root: Path,
     session_id: str,
@@ -232,18 +276,20 @@ def attachments_to_content_parts(
 
         att_type = str(att.get("type") or "").strip()
 
-        # [2026-04-22] Text files: read content inline if <=100KB, otherwise metadata-only.
-        # 之前只注入一行元数据引用，LLM 无法直接看到文件内容，需要额外调用 read_file。
-        # 改为：小文件直接注入完整内容到上下文，减少不必要的工具调用轮次。
-        # 大文件（>100KB）保持 metadata-only，避免撑爆上下文窗口。
+        # 小文件直接注入正文，省一轮 read_file；超过 100KB 只给路径，免得撑爆上下文。
         if att_type == "file":
             name = att.get("name") or Path(path).name
             mime = att.get("mime_type") or "text/plain"
             metadata = f"[Attached file: {name} | type: {mime} | path: {path}]"
 
-            # 尝试读取文件内容（需要 workspace_root 来解析相对路径）
             if workspace_root is not None:
-                full_path = workspace_root / path
+                full_path = resolve_attachment_file(workspace_root, path)
+                if full_path is None:
+                    parts.append({
+                        "type": "text",
+                        "text": f"{metadata}\n(File not found or not readable.)",
+                    })
+                    continue
                 try:
                     file_size = full_path.stat().st_size
                     if file_size <= _TEXT_FILE_MAX_BYTES:
@@ -277,13 +323,13 @@ def attachments_to_content_parts(
                             ),
                         })
                 except Exception as exc:
-                    # 读取失败（文件不存在、权限等）：metadata-only + 错误提示
                     _logger.warning("failed to read attached file %s: %s", path, exc)
+                    # 异常原文带着绝对路径，不给模型看
                     parts.append({
                         "type": "text",
                         "text": (
                             f"{metadata}\n"
-                            f"(Failed to read file content: {exc})"
+                            f"(Failed to read file content: {type(exc).__name__})"
                         ),
                     })
             else:
@@ -326,20 +372,41 @@ def build_multimodal_content(
     return parts
 
 
-def _strip_image_parts_for_assistant(content: list[dict[str, Any]]) -> list[dict[str, Any]] | str:
-    """从 assistant 消息的 content 中剥掉所有 image_url 部分。
+def _is_image_part(part: Any) -> bool:
+    return isinstance(part, dict) and part.get("type") in IMAGE_PART_TYPES
 
-    Claude API 不允许 assistant turn 包含 image block，会报：
-    'image' blocks are not permitted within assistant turns.
-    """
-    text_parts = [p for p in content if isinstance(p, dict) and p.get("type") != "image_url"]
-    if not text_parts:
-        # 全是图片，返回占位文本
-        return "[image attachment]"
-    if len(text_parts) == 1 and text_parts[0].get("type") == "text":
-        # 只剩一个 text part，展平为纯字符串
-        return text_parts[0].get("text", "")
-    return text_parts
+
+def _without_image_parts(content: list[Any], placeholder: str) -> list[Any] | str:
+    """剥掉图片块；剥空了给占位文本，只剩一段文字就展平成字符串。"""
+    kept = [part for part in content if not _is_image_part(part)]
+    if not kept:
+        return placeholder
+    if len(kept) == 1 and isinstance(kept[0], dict) and kept[0].get("type") == "text":
+        return kept[0].get("text", "")
+    return kept
+
+
+def contains_image_blocks(messages: list[dict[str, Any]]) -> bool:
+    return any(
+        isinstance(message.get("content"), list) and any(_is_image_part(part) for part in message["content"])
+        for message in messages
+    )
+
+
+def strip_image_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """发给收不了图的模型之前剥掉全部图片块，原列表不动。"""
+    result: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list) and any(_is_image_part(part) for part in content):
+            message = {**message, "content": _without_image_parts(content, "[image content removed]")}
+        result.append(message)
+    return result
+
+
+def _strip_image_parts_for_assistant(content: list[dict[str, Any]]) -> list[dict[str, Any]] | str:
+    """Claude API 不收带图片块的 assistant turn（'image' blocks are not permitted within assistant turns）。"""
+    return _without_image_parts(content, "[image attachment]")
 
 
 def prepare_messages_for_llm(
@@ -373,10 +440,7 @@ def prepare_messages_for_llm(
 
         # --- assistant 消息：剥掉所有 image_url 部分 ---
         if role == "assistant":
-            has_image = any(
-                isinstance(p, dict) and p.get("type") == "image_url"
-                for p in content
-            )
+            has_image = any(_is_image_part(p) for p in content)
             if has_image:
                 new_msg = dict(msg)
                 new_msg["content"] = _strip_image_parts_for_assistant(content)
@@ -502,18 +566,8 @@ def _resolve_file_url(url: str, workspace_root: Path) -> str | None:
     Images are automatically compressed / resized for LLM consumption.
     """
     rel_path = url[len(_FILE_SCHEME):]
-
-    if not is_allowed_attachment_path(rel_path):
-        return None
-
-    p = (workspace_root / rel_path).resolve()
-
-    # 解析到底之后还得落在 data/ 下：共享表情包库经受信链接认回 data/stickers；data/ 里随手建的软链指到别处一律不发。
-    logical = config_layout.workspace_logical_path(workspace_root, p)
-    if logical is None or not is_allowed_attachment_path(logical):
-        return None
-
-    if not p.exists() or not p.is_file():
+    p = resolve_attachment_file(workspace_root, rel_path)
+    if p is None:
         return None
 
     try:

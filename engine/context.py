@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 import uuid
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,22 @@ import httpx
 
 # 桥接信号系统：让所有 emit_event 调用自动走 SignalBus
 from engine.signals import Signal, get_bus
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TaskLease:
+    """worker 对一个任务的领取凭据。心跳被 supervisor 拒绝后，本地按用户取消同样的路径收手。"""
+
+    task_id: str
+    worker_id: str
+    claim_id: str = ""
+    lost_reason: str = ""
+
+    @property
+    def lost(self) -> bool:
+        return bool(self.lost_reason)
 
 
 @dataclass
@@ -52,6 +69,11 @@ class RunContext:
     # frontend reducers can replace the exact card that produced the request.
     current_llm_request_id: str = ""
     llm_request_index: int = 0
+    lease: TaskLease | None = None
+
+    @property
+    def claim_id(self) -> str:
+        return self.lease.claim_id if self.lease is not None else ""
 
     def begin_llm_request(self) -> str:
         """Start a new request-scoped id for one provider call."""
@@ -64,25 +86,17 @@ class RunContext:
         self.current_llm_request_id = f"{base}:llm:{self.llm_request_index}:{uuid.uuid4().hex[:8]}"
         return self.current_llm_request_id
 
-    async def emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
+    async def emit_event(self, event_type: str, payload: dict[str, Any]) -> bool:
+        """把事件交给 supervisor，返回它有没有收下。"""
         from .conversation_routing import routing_meta
         for key, value in routing_meta(self.task_context).items():
             payload.setdefault(key, value)
         if self.source_inbound_seq is not None:
             payload.setdefault("source_inbound_seq", self.source_inbound_seq)
         if self.current_llm_request_id:
-            # [AutoC 2026-06-04] Why: realtime stream/tool events and the later
-            # outbound_message must share a request-level identity. How: attach the
-            # current LLM request id unless a caller supplied a more specific value.
-            # Purpose: frontend replacement targets the exact streaming card.
+            # 实时流、工具事件和之后的 outbound_message 靠它对上同一次模型请求
             payload.setdefault("llm_request_id", self.current_llm_request_id)
-        # [Fork/Merge 2026-05-12] Events are delivered through the parent session
-        # when this task is running on an entry branch. Why: SDK session maps are
-        # keyed by the user-facing parent session, while self.session_id remains
-        # the branch used for ConversationStore reads/writes. How: post to
-        # parent_session_id when present and annotate the payload with both IDs.
-        # Purpose: preserve exact SDK routing without writing branch events to an
-        # unmapped internal session.
+        # 入口分支上跑的任务，事件发到父会话：SDK 的会话映射只认面向用户的那个
         route_session_id = self.parent_session_id or self.session_id
         if self.parent_session_id and self.parent_session_id != self.session_id:
             payload.setdefault("parent_session_id", self.parent_session_id)
@@ -90,24 +104,29 @@ class RunContext:
         # Bridge emit_event → SignalBus，用 dict(payload) 复制避免后续修改影响信号订阅方
         get_bus().emit(Signal(name=event_type, payload=dict(payload)))
         try:
-            await self.http.post(
+            response = await self.http.post(
                 f"{self.supervisor_url}/v1/sessions/{route_session_id}/events",
                 json={"type": event_type, "payload": payload},
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("event %s not delivered: %s", event_type, exc)
+            return False
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int) and 200 <= status < 300:
+            return True
+        logger.debug("event %s rejected by supervisor: HTTP %s", event_type, status)
+        return False
 
     async def check_cancelled(self) -> bool:
-        # [硬取消] 显式 2s 超时，防止 supervisor 无响应时拖延 cancel 检测。
-        # 工具执行和 LLM 流式轮询每 0.2-0.3s 调用一次 check_cancelled，
-        # 如果 HTTP 请求无超时限制，单次调用可能阻塞数十秒，导致 cancel 响应延迟。
-        # 超时后 except 兜底返回 False，下次轮询再试。
+        if self.lease is not None and self.lease.lost:
+            return True
+        # 显式 2s 超时：轮询每 0.2-0.3s 一次，supervisor 卡住时不能把取消检测拖上几十秒，超时当没取消、下次再问
         try:
             if self.task_id:
-                r = await self.http.get(
-                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/cancelled",
-                    timeout=2.0,
-                )
+                options: dict[str, Any] = {"timeout": 2.0}
+                if self.claim_id:
+                    options["params"] = {"claim_id": self.claim_id}
+                r = await self.http.get(f"{self.supervisor_url}/v1/tasks/{self.task_id}/cancelled", **options)
                 if r.status_code == 200:
                     return bool(r.json().get("cancelled", False))
             else:

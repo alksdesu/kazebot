@@ -9,20 +9,7 @@ from typing import Any
 
 import config_layout
 
-from ..attachments import build_multimodal_content
-
-
-def _attachments_from_payload(payload: Any) -> list[Any]:
-    # [AutoC 2026-05-31] Why: resume reconstruction can receive tool or child
-    # payloads from before and after the ok/data/error migration. How: prefer
-    # data.attachments and fall back to the legacy top-level attachments list.
-    # Purpose: keep generated files visible after a task resumes.
-    if not isinstance(payload, dict):
-        return []
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    nested = data.get("attachments") if isinstance(data.get("attachments"), list) else []
-    legacy = payload.get("attachments") if isinstance(payload.get("attachments"), list) else []
-    return list(nested or legacy)
+from ..attachments import build_multimodal_content, payload_attachments
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +61,7 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
         result = resume_data.get("result") or {}
         summary = str(result.get("summary") or "")
         text = str(result.get("text") or "")
-        child_atts = _attachments_from_payload(result)
+        child_atts = payload_attachments(result)
         lines = [f"下游节点 {from_node} 已完成。" if from_node else "下游节点已完成。"]
         if summary:
             lines.append(f"摘要：{summary}")
@@ -141,7 +128,7 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
                 _name = e.get("name", "unknown")
                 _raw = e.get("raw_inline", "")
                 msgs.append({"role": "user", "content": f'Tool result for "{_name}":\n{_raw}'})
-                atts = _attachments_from_payload(e)
+                atts = payload_attachments(e)
                 if atts:
                     all_atts.extend(atts)
             if all_atts:
@@ -181,7 +168,7 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
                             lines.append(f"结果：\n{_text}")
                         msgs.append({"role": "user", "content": "\n".join(lines)})
 
-                atts = _attachments_from_payload(e)
+                atts = payload_attachments(e)
                 if atts:
                     all_atts.extend(atts)
             if all_atts:
@@ -204,12 +191,13 @@ def _select_attachments(
 ) -> list[dict[str, Any]]:
     """Select attachments by path from collected, or read from disk as fallback.
 
+    Returns only what was named and found; an empty or unmatched selection gives [].
     Disk fallback is restricted to paths under workspace_root for security.
     It still reads any file in the workspace, so model-supplied paths must go
     through screen_model_attachment_paths first.
     """
     if not isinstance(selected_paths, list) or not selected_paths:
-        return collected
+        return []
 
     path_set = {str(p).strip() for p in selected_paths if isinstance(p, str) and str(p).strip()}
     selected = [a for a in collected if a.get("path") in path_set]
@@ -239,4 +227,5 @@ def _select_attachments(
             att = save_attachment(workspace_root, session_id, data_bytes, filename=p.name)
             selected.append(att)
 
-    return selected if selected else collected
+    # 点名的一个都没找到就是什么都不发，不能退回把收集到的附件全发出去
+    return selected

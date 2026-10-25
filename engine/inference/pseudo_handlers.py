@@ -117,6 +117,18 @@ def _reject_already_sent_dispatch_paths(ls: _LoopState, selected_paths: Any) -> 
     return []
 
 
+def _http_failure(response: Any) -> str:
+    """supervisor 应答不是 2xx 时给出原因；拿不到状态码的按成功算。"""
+    status = getattr(response, "status_code", None)
+    if not isinstance(status, int) or 200 <= status < 300:
+        return ""
+    try:
+        detail = response.json().get("detail")
+    except Exception:
+        detail = None
+    return f"HTTP {status}: {detail}" if detail else f"HTTP {status}"
+
+
 def _refusal_note(refused: list[RefusedAttachment]) -> str:
     detail = "；".join(f"{item.path}（{item.reason}）" for item in refused)
     return f"以下附件没有发出：{detail}"
@@ -201,13 +213,19 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                     session_id=ls.rctx.session_id,
                 )
         if reply_text or selected_atts:
-            await ls.rctx.emit_event("intermediate_reply", {
+            delivered = await ls.rctx.emit_event("intermediate_reply", {
                 "node_id": ls.node.id,
                 "task_id": ls.rctx.task_id,
                 "text": reply_text,
                 "attachments": selected_atts,
             })
-            _emit_pseudo_tool_result(ls, pseudo_call, _ok_with_refusals(refused))
+            if delivered is False:
+                _emit_pseudo_tool_result(
+                    ls, pseudo_call,
+                    "Error: 这条 reply 没有送到 supervisor，用户没有收到。可以稍后再发一次，或把内容放进 finish。",
+                )
+            else:
+                _emit_pseudo_tool_result(ls, pseudo_call, _ok_with_refusals(refused))
         elif refused:
             _emit_pseudo_tool_result(ls, pseudo_call, _refusal_note(refused))
         return None
@@ -294,18 +312,27 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
 
     # switch_node 也需要 ctx_ref，单独计算
     if pseudo_call.name == "switch_node":
-        _emit_pseudo_tool_result(ls, pseudo_call, "ok")
-        ctx_ref = _persist_ctx(ls, step + 1)
         switch_target = str(args.get("target") or "").strip()
         switch_text = str(args.get("text") or "").strip()
         route_session_id = getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id
         try:
-            await ls.rctx.http.post(
+            response = await ls.rctx.http.post(
                 f"{ls.rctx.supervisor_url}/v1/sessions/{route_session_id}/switch_node",
                 json={"target_node_id": switch_target},
             )
-        except Exception:
-            pass
+            failure = _http_failure(response)
+        except Exception as error:
+            failure = f"{type(error).__name__}: {error}"
+        if failure:
+            # 没切成就别结束本轮：会话还在当前节点手里，让模型知道并接着处理
+            logger.warning("switch_node to %r failed: %s", switch_target, failure)
+            _emit_pseudo_tool_result(
+                ls, pseudo_call,
+                f"Error: 切换节点失败（{failure}），会话仍由当前节点处理，请继续完成本轮任务。",
+            )
+            return None
+        _emit_pseudo_tool_result(ls, pseudo_call, "ok")
+        ctx_ref = _persist_ctx(ls, step + 1)
         await ls.rctx.emit_event("node_switch", {
             "target_node_id": switch_target,
             "node_id": ls.node.id,

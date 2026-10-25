@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import Any
+
+from engine.attachments import payload_attachments, screen_attachments
 # Why: engine.builtin handlers must not depend on the hook package after relocation.
 # How: return a local HookResult-compatible shape instead. Purpose: avoid
 # cycles while keeping the existing hook registry duck-typed.
@@ -38,15 +40,11 @@ class AttachmentCollector:
         if not isinstance(tool_result, dict):
             return None
 
-        # [AutoC 2026-05-31] Why: generated media tools now place structured
-        # fields under data, including data.attachments, while older tools still
-        # expose top-level attachments. How: prefer data.attachments and fall back
-        # to the legacy top-level list. Purpose: keep final attachment delivery
-        # working during the ok/data/error response migration.
-        data = tool_result.get("data") if isinstance(tool_result.get("data"), dict) else {}
-        nested_attachments = data.get("attachments") if isinstance(data.get("attachments"), list) else []
-        legacy_attachments = tool_result.get("attachments") if isinstance(tool_result.get("attachments"), list) else []
-        attachments = list(nested_attachments or legacy_attachments)
+        attachments = payload_attachments(tool_result)
+        workspace_root = getattr(ctx.rctx, "workspace_root", None)
+        if attachments and workspace_root is not None:
+            # 收进来的附件后面不再过策略（模型点名时直接放行、finish 时自动外发），所以进门这一下要把住
+            attachments = screen_attachments(workspace_root, attachments)
         if not attachments:
             return None
 

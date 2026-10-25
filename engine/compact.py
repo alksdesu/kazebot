@@ -83,16 +83,23 @@ def total_content_chars(messages: list[Any]) -> int:
 
 
 _TOOL_RESULT_PLACEHOLDER = "[tool result truncated for context budget]"
+TEXT_TOOL_RESULT_PREFIX = 'Tool result for "'
+# 压缩摘要消息的开头；supervisor 落盘摘要时用同一句
+COMPACT_SUMMARY_PREFIX = "[以下是之前对话的结构化摘要，原始上下文已被压缩]\n\n"
 
 
-def _is_tool_result(message: dict[str, Any]) -> bool:
-    meta = message.get("_meta") or {}
-    if isinstance(meta, dict) and meta.get("message_type") == "tool_result":
+def is_tool_result_message(message: Any) -> bool:
+    """运行期 dict（_meta）、落盘 dict（meta）和 fake-native 文本结果，认法只有这一处。"""
+    if not isinstance(message, dict):
+        return False
+    if message.get("role") == "tool" or message.get("message_type") == "tool_result":
         return True
-    if message.get("role") == "tool":
-        return True
+    for key in ("_meta", "meta"):
+        meta = message.get(key)
+        if isinstance(meta, dict) and meta.get("message_type") == "tool_result":
+            return True
     content = message.get("content")
-    return isinstance(content, str) and content.startswith('Tool result for "')
+    return isinstance(content, str) and content.startswith(TEXT_TOOL_RESULT_PREFIX)
 
 
 def _bounded_content(content: Any, max_chars: int) -> Any:
@@ -134,7 +141,7 @@ def bounded_tool_result_view(
     larger bound than older results.
     """
     result = [dict(message) for message in messages]
-    tool_indices = [index for index, message in enumerate(result) if _is_tool_result(message)]
+    tool_indices = [index for index, message in enumerate(result) if is_tool_result_message(message)]
     if not tool_indices:
         return result, 0
 
@@ -157,12 +164,63 @@ def bounded_tool_result_view(
 
 
 # ---------------------------------------------------------------------------
-#  P1 Microcompact — time-based tool_result cleanup
+#  Microcompact — time-based tool_result cleanup
 #  When last assistant message is older than gap_minutes (cache expired),
 #  clear old tool_result contents, keeping only the most recent ones.
 # ---------------------------------------------------------------------------
 
 _MICROCOMPACT_PLACEHOLDER = "[tool result cleared — cache expired]"
+
+
+def _cleared_tool_result(content: str) -> str:
+    # 保留工具名那一行，正文换成占位
+    return content.split("\n", 1)[0] + "\n" + _MICROCOMPACT_PLACEHOLDER
+
+
+def last_assistant_time(messages: list[dict[str, Any]]):
+    from datetime import datetime, timezone
+
+    for msg in reversed(messages):
+        meta = msg.get("_meta", {})
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("message_type") == "assistant" or msg.get("role") == "assistant":
+            try:
+                stamp = datetime.fromisoformat(str(meta.get("timestamp") or ""))
+            except ValueError:
+                return None
+            return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=timezone.utc)
+    return None
+
+
+def microcompact_targets(
+    messages: list[dict[str, Any]],
+    *,
+    gap_minutes: int = 60,
+    keep_recent: int = 5,
+    min_tool_results: int = 3,
+) -> list[int]:
+    """空闲超过 gap_minutes（provider 的 prompt 缓存多半已过期）时，该清空正文的旧工具结果下标。
+
+    最近 keep_recent 条保留；已经清过的不再算。
+    """
+    from datetime import datetime, timezone
+
+    last_assistant = last_assistant_time(messages)
+    if last_assistant is None:
+        return []
+    gap = (datetime.now(timezone.utc) - last_assistant).total_seconds() / 60.0
+    if gap < gap_minutes:
+        return []
+    indices = [index for index, message in enumerate(messages) if is_tool_result_message(message)]
+    if len(indices) < min_tool_results:
+        return []
+    older = indices[:-keep_recent] if keep_recent > 0 else indices
+    return [
+        index for index in older
+        if isinstance(messages[index].get("content"), str)
+        and messages[index]["content"] != _cleared_tool_result(messages[index]["content"])
+    ]
 
 
 def microcompact_messages(
@@ -172,74 +230,21 @@ def microcompact_messages(
     keep_recent: int = 5,
     min_tool_results: int = 3,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Time-based microcompact: clear old tool_result contents.
-
-    Triggered when the last assistant message is older than gap_minutes,
-    indicating the provider's prompt cache has likely expired.
-    Clears tool_result content for all but the most recent `keep_recent` results.
-
-    Returns (messages, cleared_count). Messages are modified in-place.
-    """
-    from datetime import datetime, timezone
-
-    # Find last assistant message timestamp
-    last_assistant_ts = None
-    for msg in reversed(messages):
-        meta = msg.get("_meta", {})
-        if isinstance(meta, dict):
-            mt = meta.get("message_type", "")
-            if mt == "assistant" or msg.get("role") == "assistant":
-                ts_str = meta.get("timestamp", "")
-                if ts_str:
-                    try:
-                        last_assistant_ts = datetime.fromisoformat(ts_str)
-                        if last_assistant_ts.tzinfo is None:
-                            last_assistant_ts = last_assistant_ts.replace(tzinfo=timezone.utc)
-                    except Exception:
-                        pass
-                break
-
-    if last_assistant_ts is None:
-        return messages, 0
-
-    now = datetime.now(timezone.utc)
-    gap = (now - last_assistant_ts).total_seconds() / 60.0
-    if gap < gap_minutes:
-        return messages, 0
-
-    # Collect tool_result indices
-    tr_indices: list[int] = []
-    for i, msg in enumerate(messages):
-        meta = msg.get("_meta", {})
-        is_tr = False
-        if isinstance(meta, dict) and meta.get("message_type") == "tool_result":
-            is_tr = True
-        elif isinstance(msg.get("content"), str) and msg["content"].startswith('Tool result for "'):
-            is_tr = True
-        if is_tr:
-            tr_indices.append(i)
-
-    if len(tr_indices) < min_tool_results:
-        return messages, 0
-
-    # Clear all but the last `keep_recent` tool results
-    to_clear = tr_indices[:-keep_recent] if keep_recent > 0 else tr_indices
-    cleared = 0
-    for idx in to_clear:
-        content = messages[idx].get("content", "")
-        if isinstance(content, str) and content != _MICROCOMPACT_PLACEHOLDER:
-            # Preserve the tool name header, clear the body
-            first_line = content.split("\n", 1)[0]
-            messages[idx]["content"] = first_line + "\n" + _MICROCOMPACT_PLACEHOLDER
-            cleared += 1
-
+    """按 microcompact_targets 清空旧工具结果的正文，原地修改，返回 (messages, 清掉的条数)。"""
+    targets = microcompact_targets(
+        messages, gap_minutes=gap_minutes, keep_recent=keep_recent, min_tool_results=min_tool_results,
+    )
+    cleared = clear_tool_results(messages, targets)
     if cleared:
-        logger.info(
-            "microcompact: cleared %d/%d tool_results (gap=%.0fmin, kept=%d recent)",
-            cleared, len(tr_indices), gap, keep_recent,
-        )
-
+        logger.info("microcompact: cleared %d tool_results (kept=%d recent)", cleared, keep_recent)
     return messages, cleared
+
+
+def clear_tool_results(messages: list[dict[str, Any]], targets: list[int]) -> int:
+    """把 targets 指向的工具结果正文换成占位，原地修改，返回清掉的条数。"""
+    for index in targets:
+        messages[index]["content"] = _cleared_tool_result(messages[index]["content"])
+    return len(targets)
 
 
 # ---------------------------------------------------------------------------
@@ -468,9 +473,7 @@ def apply_compact_summary(
 
     summary_msg: dict[str, Any] = {
         "role": "user",
-        "content": (
-            "[以下是之前对话的结构化摘要，原始上下文已被压缩]\n\n" + summary
-        ),
+        "content": COMPACT_SUMMARY_PREFIX + summary,
         "_meta": {
             "source_task_id": "compact_summary",
             "compressed_task_ids": list(_compressed_tids),

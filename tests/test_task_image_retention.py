@@ -27,11 +27,9 @@ from engine.builtin.finish_guard import (  # noqa: E402
     FinishGuardHandler,
     _has_unresolved_vision_failure,
 )
-from engine.inference.ai_step import (  # noqa: E402
-    _async_tool_failure,
-    _build_async_result_payload,
-    _run_async_deliver,
-)
+from engine.inference.ai_step import _run_async_deliver  # noqa: E402
+from engine.inference.async_delivery import build_async_result_payload  # noqa: E402
+from engine.tool_step import tool_outcome  # noqa: E402
 from tools.read_image import SPEC as READ_IMAGE_SPEC  # noqa: E402
 
 
@@ -199,16 +197,17 @@ def test_recent_image_policy_never_crosses_sender() -> None:
 
 def test_read_image_is_synchronous_and_failed_envelope_is_detected() -> None:
     assert READ_IMAGE_SPEC["async_mode"] is False
-    assert _async_tool_failure({
+    failed = tool_outcome({
         "ok": False,
         "error": "API HTTP 500",
         "data": {"result": "ERROR: API HTTP 500", "must_not_guess": True},
-    }) == "API HTTP 500"
-    assert _async_tool_failure({"ok": True, "data": {"result": "description"}}) == ""
+    })
+    assert failed.ok is False and failed.error == "API HTTP 500"
+    assert tool_outcome({"ok": True, "data": {"result": "description"}}).ok is True
 
 
 def test_async_result_payload_carries_structured_failure_metadata() -> None:
-    payload = _build_async_result_payload(
+    payload = build_async_result_payload(
         message="failed",
         tool_name="read_image",
         task_id="task-1",

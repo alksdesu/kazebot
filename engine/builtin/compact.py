@@ -1,25 +1,34 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections import OrderedDict
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
 from engine.compact import (
+    clear_tool_results,
     count_real_task_segments,
     estimate_message_tokens,
-    microcompact_messages,
+    last_assistant_time,
+    microcompact_targets,
     should_compact,
 )
 # Why: engine.builtin handlers must not depend on the hook package after relocation.
 # How: return a local HookResult-compatible shape instead. Purpose: avoid
 # cycles while keeping the existing hook registry duck-typed.
 from .result import hook_result
-from engine.inference.loop_state import _persist_ctx, compact_target_session_id
+from engine.inference.llm_call import request_view
+from engine.inference.loop_state import _persist_ctx, compact_target_session_id, flush_conversation_writes
 from engine.protocol import ACTION_DISPATCH, TaskAction
 from engine.context_archive import ContextArchiveStore
 
 logger = logging.getLogger(__name__)
+
+# 同步压缩失败过的任务：任务被派发子节点后再恢复会换一个新的 loop state，靠这里记住
+_HARD_COMPACT_FAILED_TASKS: OrderedDict[str, None] = OrderedDict()
+_HARD_COMPACT_FAILED_LIMIT = 1024
 
 # Why: the built-in loader discovers handlers from per-file metadata.
 # How: declare the handler class, hook methods, and priority in one place.
@@ -40,28 +49,19 @@ class CompactChecker:
     priority = 50
 
     async def handle(self, ctx: Any) -> Any | None:
-        """Apply the legacy microcompact, proactive snip, and compact checks.
-
-        Why: ai_step.py contained several context pressure checks inline. How:
-        read loop state from HookContext.extra, run the same first-step cleanup,
-        then dispatch the system compactor when the threshold is exceeded.
-        Purpose: keep context management behavior unchanged while moving it into
-        a before_step handler.
-        """
+        """首步做空闲清理，之后每步检查要不要压缩。"""
         ls = ctx.extra.get("loop_state")
         if ls is None:
             return None
 
+        _note_compact_outcome(ls)
         modified = False
         step_count = int(ctx.extra.get("step_count", 0) or 0)
         if ctx.step == step_count:
             modified = await _run_idle_cleanup(ctx, ls) or modified
 
         action = await _check_and_compact(ctx, ls)
-        # Why: snip-based compaction mutates messages but intentionally does not
-        # dispatch the LLM compactor. How: _check_and_compact marks this in
-        # ctx.extra, and the handler folds it into the returned HookResult.
-        # Purpose: callers can observe non-terminal compaction mutations.
+        # snip 改了消息却不派发 compactor，靠 extra 里的标记把 modified 带出来
         modified = bool(ctx.extra.pop("compact_modified", False)) or modified
         if action is not None:
             return hook_result(action=action, modified=modified)
@@ -70,20 +70,44 @@ class CompactChecker:
         return None
 
 
-async def _run_idle_cleanup(ctx: Any, ls: Any) -> bool:
-    """Run first-step microcompact and proactive snip cleanup.
+def _task_key(ls: Any) -> str:
+    return str(getattr(getattr(ls, "rctx", None), "task_id", "") or "")
 
-    Why: these operations reduce stale context before the next model call. How:
-    copy the old first-iteration logic from ai_step.py into this helper. Purpose:
-    preserve the old trigger timing while keeping CompactChecker readable.
-    """
+
+def _note_compact_outcome(ls: Any) -> None:
+    """读恢复数据里的 compact_done：同步压缩失败过，本任务内不再挂起当轮去压。"""
+    resume = getattr(ls, "resume_data", None)
+    task_key = _task_key(ls)
+    failed = (
+        isinstance(resume, dict)
+        and str(resume.get("type") or "") == "compact_done"
+        and resume.get("success", True) is False
+    )
+    if failed and task_key:
+        _HARD_COMPACT_FAILED_TASKS[task_key] = None
+        _HARD_COMPACT_FAILED_TASKS.move_to_end(task_key)
+        while len(_HARD_COMPACT_FAILED_TASKS) > _HARD_COMPACT_FAILED_LIMIT:
+            _HARD_COMPACT_FAILED_TASKS.popitem(last=False)
+    if failed or (task_key and task_key in _HARD_COMPACT_FAILED_TASKS):
+        if not getattr(ls, "hard_compact_disabled", False):
+            logger.warning("hard compaction disabled for task %s after a failed compaction", task_key or "?")
+        ls.hard_compact_disabled = True
+
+
+async def _run_idle_cleanup(ctx: Any, ls: Any) -> bool:
+    """任务第一步：空闲太久就清空旧工具结果的正文，再按空闲时长剪掉更早的任务。"""
     modified = False
     try:
-        compacted, cleared = microcompact_messages(deepcopy(ls.messages))
-        if cleared:
-            ContextArchiveStore(ls.rctx.workspace_root).archive(
-                compact_target_session_id(ls), ls.messages, reason="microcompact",
+        targets = microcompact_targets(ls.messages)
+        if targets:
+            # 只归档要清空的那几条原文；历史每个任务都从存储重载，同一条会被反复清，归档按内容去重
+            originals = [deepcopy(ls.messages[index]) for index in targets]
+            await asyncio.to_thread(
+                ContextArchiveStore(ls.rctx.workspace_root).archive_each,
+                compact_target_session_id(ls), originals, reason="microcompact",
             )
+            compacted = deepcopy(ls.messages)
+            cleared = clear_tool_results(compacted, targets)
             ls.messages = compacted
             ctx.messages = compacted
             logger.info("microcompact: cleared %d tool_results", cleared)
@@ -94,30 +118,14 @@ async def _run_idle_cleanup(ctx: Any, ls: Any) -> bool:
     try:
         from engine.task_record import load_task_records, snip_history
 
-        last_ts = None
-        for msg in reversed(ls.messages):
-            meta = msg.get("_meta", {})
-            if isinstance(meta, dict) and (meta.get("message_type") == "assistant" or msg.get("role") == "assistant"):
-                ts_str = meta.get("timestamp", "")
-                if ts_str:
-                    try:
-                        last_ts = datetime.fromisoformat(ts_str)
-                        if last_ts.tzinfo is None:
-                            last_ts = last_ts.replace(tzinfo=timezone.utc)
-                    except Exception:
-                        pass
-                break
+        last_ts = last_assistant_time(ls.messages)
         if last_ts is not None:
             gap_hours = (datetime.now(timezone.utc) - last_ts).total_seconds() / 3600.0
             if gap_hours >= 1.0:
                 proactive_max = max(int(gap_hours) * 2, 2)
-                # [AutoC 2026-05-13] Why: proactive L2 cleanup used to snip the
-                # branch copy when child_session_id/session_id pointed at a fork.
-                # How: use the same parent-first compact target helper as the
-                # threshold path. Purpose: all persisted snips affect the durable
-                # parent session.
+                # 落盘的 snip 一律改父会话，不改入口分支的副本
                 snip_sid = compact_target_session_id(ls)
-                snip_records = load_task_records(ls.rctx.workspace_root, snip_sid)
+                snip_records = await asyncio.to_thread(load_task_records, ls.rctx.workspace_root, snip_sid)
                 if snip_records:
                     snipped, snip_count, snipped_ids = snip_history(
                         ls.messages,
@@ -165,14 +173,21 @@ async def _apply_snip(ctx: Any, ls: Any, session_id: str, records: list, message
         ctx.messages = messages
         return count
     store = getattr(ls.rctx, "conversation_store", None)
-    original = store.load(session_id) if store is not None else ls.messages
+    if store is not None:
+        # 本任务排队中的写入得先落盘，不然 replace_all 的指纹比对拿的是旧文件
+        await flush_conversation_writes(ls.rctx)
+        original = list(await asyncio.to_thread(store.load, session_id))
+    else:
+        original = ls.messages
     actual = safe_snip_task_ids(original, safe_snip_task_ids(ls.messages, task_ids))
     messages, _, actual = snip_history_tasks(ls.messages, records, actual)
     if not actual:
         raise RuntimeError("Task summaries would split a tool call and its result")
-    ContextArchiveStore(ls.rctx.workspace_root).archive(session_id, original, reason=reason)
+    await asyncio.to_thread(
+        ContextArchiveStore(ls.rctx.workspace_root).archive, session_id, original, reason=reason,
+    )
     if store is not None:
-        store.replace_all(session_id, snip_store(original, records, actual))
+        await asyncio.to_thread(store.replace_all, session_id, snip_store(original, records, actual))
     ls.messages = messages
     ctx.messages = messages
     return len(actual)
@@ -237,32 +252,29 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
     # 熔断判定归 supervisor：压缩失败几乎全在那一侧记账，而 engine 是多个独立 worker 进程，
     # 各自的计数器既读不到对方也读不到 supervisor 的。后台压缩会被 compact-async 拒回，
     # 硬阈值 dispatch 会被 supervisor 换成应急截断。
-    if not should_compact(ls.messages, ls.compact_threshold, ls.last_prompt_tokens):
+    view = request_view(ls.messages)
+    if not should_compact(view, ls.compact_threshold, ls.last_prompt_tokens):
         return None
 
     # 软阈值只说明「该压了」，不该让用户等：先在后台起一个压缩任务，当轮继续推理，
     # 下一轮才吃到压缩后的历史。只有顶到硬阈值才挂起当轮同步压，否则供应商会拒。
     hard_threshold = int(getattr(ls, "compact_hard_threshold", 0) or 0)
-    over_hard = hard_threshold > 0 and should_compact(ls.messages, hard_threshold, ls.last_prompt_tokens)
+    over_hard = hard_threshold > 0 and should_compact(view, hard_threshold, ls.last_prompt_tokens)
     if not over_hard:
         await _request_background_compact(ctx, ls, compact_sid)
         return None
+    if getattr(ls, "hard_compact_disabled", False) or _task_key(ls) in _HARD_COMPACT_FAILED_TASKS:
+        # 同步压缩已经失败过一次，再挂起只会原样再失败；交给后台压缩，供应商真拒了还有被动压缩兜底
+        await _request_background_compact(ctx, ls, compact_sid)
+        return None
 
-    # ---------------------------------------------------------------
-    # Pre-check: count task segments in ConversationStore. If there
-    # are not enough segments to compress (≤ keep_recent), skip the
-    # LLM compactor call entirely to avoid wasting API calls.
-    # ---------------------------------------------------------------
+    # 历史里可压的任务段不超过 keep_recent 时直接跳过，省一次 compactor 调用
     try:
         _conv_store = getattr(ls.rctx, 'conversation_store', None)
         if _conv_store:
-            _stored_msgs = _conv_store.load(compact_sid)
-            # [2026-05-17] Why: compact_summary is already compressed history,
-            # not a real task segment, so counting it can trigger an endless
-            # LLM compactor loop. How: use the shared counter that skips old
-            # compact summaries and only counts consecutive real task ids.
-            # Purpose: builtin compact and legacy ai_step compact make the same
-            # dispatch decision before asking the compactor LLM to summarize.
+            await flush_conversation_writes(ls.rctx)
+            _stored_msgs = await asyncio.to_thread(_conv_store.load, compact_sid)
+            # 旧的 compact_summary 已经是压过的历史，算成一段会让 compactor 反复被派发
             _seg_count = count_real_task_segments(_stored_msgs)
             if not getattr(ls, "compact_keep_recent_tokens", 0) and _seg_count <= ls.compact_keep_recent:
                 logger.info(
@@ -280,12 +292,9 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
             snip_history,
         )
 
-        # [AutoC 2026-05-13] Why: L2 persisted snips must affect the parent
-        # ConversationStore, not an entry branch fork. How: reuse compact_sid for
-        # transcripts and store replacement. Purpose: the next fork starts from
-        # already-snipped durable history.
+        # 落盘的 snip 改父会话，下一次分叉直接从已经剪过的历史开始
         snip_sid = compact_sid
-        snip_records = load_task_records(ls.rctx.workspace_root, snip_sid)
+        snip_records = await asyncio.to_thread(load_task_records, ls.rctx.workspace_root, snip_sid)
         if snip_records:
             snipped, snip_count, snipped_ids = snip_history(ls.messages, snip_records)
             if snip_count > 0:

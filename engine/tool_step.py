@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 from .tool_result_formatters import (
@@ -14,6 +15,40 @@ from .tool_result_formatters import (
 
 def _sanitize(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", (s or "x").strip() or "x")[:80]
+
+
+TOOL_SUCCESS = "success"
+TOOL_ERROR = "error"
+TOOL_CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True)
+class ToolOutcome:
+    status: str
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == TOOL_SUCCESS
+
+
+def tool_outcome(result: Any) -> ToolOutcome:
+    """工具结果算成功、失败还是被取消；所有判定都走这一处。"""
+    if not isinstance(result, dict):
+        return ToolOutcome(TOOL_SUCCESS)
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    error = str(result.get("error") or "").strip()
+    # registry 归一化 ok=false 的结果时会把顶层 cancelled 挪进 data
+    if result.get("cancelled") or data.get("cancelled"):
+        return ToolOutcome(TOOL_CANCELLED, error or "task cancelled")
+    # 带 ok 的结果以 ok 为准；没有 ok 的旧格式靠 error 判
+    failed = result.get("ok") is False if "ok" in result else bool(error)
+    if not failed:
+        return ToolOutcome(TOOL_SUCCESS)
+    rendered = str(data.get("result") or "").strip()
+    if rendered.upper().startswith("ERROR:"):
+        rendered = rendered[6:].strip()
+    return ToolOutcome(TOOL_ERROR, error or rendered or "tool returned ok=false")
 
 
 
@@ -145,12 +180,9 @@ def summarize_result(tool_name: str, result: Any, *, args: dict | None = None) -
     # data dict once and let every summary branch consult it before old fields.
     # Purpose: keep progress summaries compatible through the response migration.
     result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
-    if result.get("ok") is False:
-        # [AutoC 2026-05-31] Why: failure payloads may expose only data.result as
-        # readable history text. How: fall back from error to data.result before the
-        # generic unknown marker. Purpose: avoid opaque failure summaries.
-        err_text = result.get("error") or result_data.get("result") or "unknown"
-        return _summary_line(f"失败: {err_text}")
+    outcome = tool_outcome(result)
+    if not outcome.ok:
+        return _summary_line(f"失败: {outcome.error}")
     if tool_name == "read_file":
         data = result.get("data")
         if isinstance(data, dict):
