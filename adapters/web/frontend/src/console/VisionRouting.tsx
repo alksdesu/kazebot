@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react';
 
 import { getRuntimeFile } from '../api/supervisorClient';
+import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Desc, Empty, ErrorText, Facts, Field, SaveBar, Select } from './components';
@@ -49,24 +50,24 @@ export const VisionRouting = () => {
   const [note, setNote] = useState('');
   const [error, setError] = useState('');
   const confirmDiscard = useUnsavedChanges(mode !== saved, '带图路由尚未保存，确定离开或丢弃吗？');
+  const requests = useRequestGuard();
 
   useEffect(() => {
     if (!token) return;
-    let cancelled = false;
+    const request = requests.begin('runtime');
     setRaw(null);
     void getRuntimeFile(token).then(({ content: text }) => {
-      if (cancelled) return;
+      if (!request.isCurrent()) return;
       const current = readMode(text);
       setRaw(text);
       setMode(current);
       setSaved(current);
     }).catch((caught) => {
-      if (cancelled) return;
+      if (!request.isCurrent()) return;
       setError(errorMessage(caught));
       setRaw(null);
     });
-    return () => { cancelled = true; };
-  }, [token]);
+  }, [requests, token]);
 
   const save = async () => {
     if (!token || raw === null || busy) return;

@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { usePageNotice } from '../../../hooks/usePageNotice';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
 
 import { deleteNodeFile, getNodeFileRaw, getNodeFiles, updateNodeFileRaw, type NodeFileInfo } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
@@ -49,32 +50,33 @@ const NodeFilesSettingsPageEditor = () => {
   // 编辑器里的内容是基于哪一版改的，保存时交回：中途被共享组里别的实例改过就报冲突。
   const [base, setBase] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
-  const requestVersion = useRef(0);
+  // 读列表和切文件走同一路：后发的那次说了算。
+  const requests = useRequestGuard();
   const confirmDiscard = useUnsavedChanges(content !== saved, '当前文件还有未保存修改，确定离开或重新加载吗？');
 
   const visibleFiles = useMemo(() => files.filter((file) => matchesFilter(file, filter)), [files, filter]);
 
   const loadFiles = async () => {
     if (!adminToken || !isAuthenticated) return;
-    const version = ++requestVersion.current;
+    const request = requests.begin('file');
     setLoading(true); setLoaded(false);
     try {
       const list = await getNodeFiles(adminToken);
-      if (version !== requestVersion.current) return;
+      if (!request.isCurrent()) return;
       setFiles(list);
       const nextSelected = selected && list.some(file => file.name === selected) ? selected : (list.find(file => file.name === 'qq.orchestrator.yaml')?.name || list[0]?.name || '');
       setSelected(nextSelected);
       setContent(''); setSaved(''); setBase(null);
       const file = nextSelected ? await getNodeFileRaw(adminToken, nextSelected) : null;
-      if (version !== requestVersion.current) return;
+      if (!request.isCurrent()) return;
       const body = file?.content ?? '';
       setContent(body); setSaved(body); setBase(file?.hash ?? null); setLoaded(Boolean(nextSelected));
       setLoadError('');
     } catch (error) {
-      if (version !== requestVersion.current) return;
+      if (!request.isCurrent()) return;
       setLoadError(errorMessage(error, '加载节点文件失败'));
     } finally {
-      if (version === requestVersion.current) setLoading(false);
+      if (request.isCurrent()) setLoading(false);
     }
   };
 
@@ -85,24 +87,24 @@ const NodeFilesSettingsPageEditor = () => {
     await loadFiles();
   };
 
-  useEffect(() => { void loadFiles(); return () => { ++requestVersion.current; }; }, [adminToken, isAuthenticated]);
+  useEffect(() => { void loadFiles(); }, [requests]);
 
   const selectFile = async (filename: string) => {
     if (!adminToken || saving || filename === selected || !confirmDiscard()) return;
-    const version = ++requestVersion.current;
+    const request = requests.begin('file');
     setSelected(filename);
     setContent(''); setSaved(''); setBase(null); setLoading(true); setLoaded(false);
     // 换了文件，上一份的保存结果和读取失败都跟这份无关。
     clearNotice();
     try {
       const file = await getNodeFileRaw(adminToken, filename);
-      if (version !== requestVersion.current) return;
+      if (!request.isCurrent()) return;
       setContent(file.content); setSaved(file.content); setBase(file.hash); setLoaded(true);
     } catch (error) {
-      if (version !== requestVersion.current) return;
+      if (!request.isCurrent()) return;
       setLoadError(errorMessage(error, '读取文件失败'));
     } finally {
-      if (version === requestVersion.current) setLoading(false);
+      if (request.isCurrent()) setLoading(false);
     }
   };
 

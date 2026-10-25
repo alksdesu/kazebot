@@ -15,7 +15,8 @@ import {
   type WorkerHealth,
 } from '../../../api/supervisorClient';
 import { usePageNotice } from '../../../hooks/usePageNotice';
-import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
+import { useSettingsStore } from '../../../store/settingsStore';
 import { startPolling } from '../../../utils/polling';
 import { Block, Button, Empty, Facts, Footnote, List, PageShell, Pip, Row, StatusText } from './settingsControls';
 import { errorMessage } from '../../../api/request';
@@ -136,29 +137,31 @@ const LogViewer = ({ token }: { token: string }) => {
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
   const box = useRef<HTMLPreElement>(null);
-  // 连着点两个文件时只认后点的那个，先点的慢回来不能把别的文件内容摆到这个文件名底下。
-  const generation = useRef(0);
+  const requests = useRequestGuard();
 
   const loadList = useCallback(async () => {
+    const request = requests.begin('files');
     try {
       const rows = await listLogFiles(token);
+      if (!request.isCurrent()) return;
       setFiles(rows);
       setPicked((current) => current || rows[0]?.name || '');
     } catch (error) {
-      setNote(errorMessage(error));
+      if (request.isCurrent()) setNote(errorMessage(error));
     }
-  }, [token]);
+  }, [requests, token]);
 
   useEffect(() => { void loadList(); }, [loadList]);
 
   const loadTail = useCallback(async (name: string) => {
     if (!name) return;
-    const version = ++generation.current;
+    // 连着点两个文件时只认后点的那个，先点的慢回来不能把别的文件内容摆到这个文件名底下。
+    const request = requests.begin('tail');
     setBusy(true);
     setNote('');
     try {
       const result = await readLogTail(token, name, TAIL_LINES);
-      if (version !== generation.current) return;
+      if (!request.isCurrent()) return;
       setText(result.text);
       setTruncated(result.truncated);
       // 日志是往下追加的，打开就该看到最新那几行。
@@ -166,11 +169,11 @@ const LogViewer = ({ token }: { token: string }) => {
         if (box.current) box.current.scrollTop = box.current.scrollHeight;
       });
     } catch (error) {
-      if (version === generation.current) setNote(errorMessage(error));
+      if (request.isCurrent()) setNote(errorMessage(error));
     } finally {
-      if (version === generation.current) setBusy(false);
+      if (request.isCurrent()) setBusy(false);
     }
-  }, [token]);
+  }, [requests, token]);
 
   useEffect(() => { void loadTail(picked); }, [picked, loadTail]);
 
@@ -230,27 +233,26 @@ const RuntimeSettingsPageBody = () => {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const { notice, setMessage, setLoadError } = usePageNotice();
   const [retrying, setRetrying] = useState(false);
-  // 轮询和重试后的重读会撞在一起，只认最后发出的那次。
-  const generation = useRef(0);
+  const requests = useRequestGuard();
 
   // 轮询只动读取那一半提示：重试失败的原因要留到下一次重试，不能五秒后就被冲掉。
   const load = useCallback(async () => {
     if (!adminToken) return;
-    const version = ++generation.current;
+    // 轮询和重试后的重读会撞在一起，只认最后发出的那次。
+    const request = requests.begin('status');
     try {
       const next = await getRuntimeStatus(adminToken);
-      if (version !== generation.current) return;
+      if (!request.isCurrent()) return;
       setStatus(next);
       setLoadError('');
     } catch (error) {
-      if (version === generation.current) setLoadError(errorMessage(error));
+      if (request.isCurrent()) setLoadError(errorMessage(error));
     }
-  }, [adminToken, setLoadError]);
+  }, [requests, adminToken, setLoadError]);
 
   useEffect(() => {
     if (!adminToken) return;
-    const stop = startPolling(load, POLL_MS, { first: load });
-    return () => { stop(); generation.current += 1; };
+    return startPolling(load, POLL_MS, { first: load });
   }, [adminToken, load]);
 
   const onRetry = async () => {
@@ -259,10 +261,10 @@ const RuntimeSettingsPageBody = () => {
     setMessage('');
     try {
       await retryEngine(adminToken);
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       await load();
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error));
     } finally {
       setRetrying(false);

@@ -14,9 +14,8 @@ import {
   type ShareGroupChange,
   type ShareGroupOverview,
 } from '../api/supervisorClient';
-import { useRequestScope } from '../features/asyncState';
+import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
-import { useSettingsStore } from '../store/settingsStore';
 import { appendSentence } from '../utils/sentence';
 import { Block, Button, Facts, Footnote, Input, ItemTitle, List, Panel, Row, Tag } from './components';
 import { errorMessage } from '../api/request';
@@ -53,25 +52,23 @@ export const ConfigShareGroups = ({ token }: { token: string }) => {
   const [note, setNote] = useState('');
   const [problem, setProblem] = useState('');
   const mutation = useRef(false);
-  const sequence = useRef(0);
-  const identity = useRequestScope(token);
-  const isCurrent = () => identity.isCurrent() && useSettingsStore.getState().adminToken === token;
+  const requests = useRequestGuard();
   useUnsavedChanges(Boolean(newName), '新组还没建，切换或离开会丢掉填好的组名，确定继续吗？');
 
   const refresh = useCallback(async () => {
-    const request = ++sequence.current;
+    const request = requests.begin('overview');
     setLoading(true);
     try {
       const next = await getShareGroups(token);
-      if (!identity.isCurrent() || request !== sequence.current) return;
+      if (!request.isCurrent()) return;
       setOverview(next); setError('');
     } catch (failure) {
-      if (identity.isCurrent() && request === sequence.current) setError(errorMessage(failure));
+      if (request.isCurrent()) setError(errorMessage(failure));
     } finally {
-      if (identity.isCurrent() && request === sequence.current) setLoading(false);
+      if (request.isCurrent()) setLoading(false);
     }
-  }, [token]);
-  useEffect(() => { void refresh(); return () => { sequence.current++; }; }, [refresh]);
+  }, [requests, token]);
+  useEffect(() => { void refresh(); }, [refresh]);
 
   // 手动刷新才清掉上一次操作留下的结果和报错；读取失败之后也靠它重来。
   const reload = () => {
@@ -83,31 +80,31 @@ export const ConfigShareGroups = ({ token }: { token: string }) => {
   const current = overview?.current ?? null;
 
   const run = async (action: Action, change: () => Promise<ShareGroupChange>, done: (result: ShareGroupChange) => string) => {
-    if (!isCurrent() || mutation.current) return;
+    if (!requests.isCurrent() || mutation.current) return;
     mutation.current = true; setBusy(true); setNote(''); setProblem('');
     try {
       const result = await change();
-      if (!isCurrent()) return;
-      // 结果里带着切换后的全貌，不必再读一遍；手里的请求序号作废，免得慢回来的旧读取盖掉它。
-      sequence.current++;
+      if (!requests.isCurrent()) return;
+      // 结果里带着切换后的全貌，不必再读一遍；还没回来的旧读取作废，免得它盖掉这份。
+      requests.drop('overview');
       setOverview(result.overview);
       setLoading(false);
       const message = done(result);
       if (action === 'delete') { setNote(message); return; }
       try {
         const restart = await restartEngine(token, ACTION_REASON[action]);
-        if (!isCurrent()) return;
+        if (!requests.isCurrent()) return;
         setNote(appendSentence(message, restart.scheduled
           ? 'engine 正在重启，工具和节点会换成新配置。'
           : `但 engine 没排上重启（${restart.reason || '已有重启在进行'}），稍后在「运行」里手动重启一次。`));
       } catch (failure) {
-        if (isCurrent()) setNote(appendSentence(message, `但重启 engine 失败：${errorMessage(failure)}。稍后在「运行」里手动重启一次。`));
+        if (requests.isCurrent()) setNote(appendSentence(message, `但重启 engine 失败：${errorMessage(failure)}。稍后在「运行」里手动重启一次。`));
       }
     } catch (failure) {
-      if (isCurrent()) setProblem(errorMessage(failure));
+      if (requests.isCurrent()) setProblem(errorMessage(failure));
     } finally {
       mutation.current = false;
-      if (isCurrent()) setBusy(false);
+      if (requests.isCurrent()) setBusy(false);
     }
   };
 

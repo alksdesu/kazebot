@@ -6,11 +6,12 @@ import { usePageNotice } from '../../../hooks/usePageNotice';
 // list configured nodes, support template-based creation and deletion, and keep the
 // raw YAML editor in the independent Settings right panel. Purpose: the center page
 // stays focused on selection and operations while the right rail owns editing.
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { createNode, deleteNode, getNodes, type AdminNode } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
-import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { useSettingsStore } from '../../../store/settingsStore';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { overlaySourceLabel, removalFor } from '../../../utils/overlaySource';
 import { describeEnvRef } from '../../../utils/envRef';
 import { Block, Button, Field, Input, PageShell, Select, StatusText } from './settingsControls';
@@ -40,25 +41,25 @@ export const AgentsSettingsPage = () => {
   const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const { busy, run } = useExclusiveAction();
-  const generation = useRef(0);
+  const requests = useRequestGuard();
 
   const loadNodes = async (): Promise<AdminNode[] | undefined> => {
     if (!adminToken || !isAuthenticated) return undefined;
-    const version = ++generation.current;
+    const request = requests.begin('nodes');
     setLoading(true);
     try {
       const items = await getNodes(adminToken);
-      if (version !== generation.current) return undefined;
+      if (!request.isCurrent()) return undefined;
       setNodes(items);
       if (selectedNode && !items.some((item) => item.id === selectedNode.id)) setSelectedNode(null);
       setLoadError('');
       return items;
     } catch (error) {
-      if (version !== generation.current) return undefined;
+      if (!request.isCurrent()) return undefined;
       setLoadError(errorMessage(error, '加载节点失败'));
       return undefined;
     } finally {
-      if (version === generation.current) setLoading(false);
+      if (request.isCurrent()) setLoading(false);
     }
   };
 
@@ -68,7 +69,7 @@ export const AgentsSettingsPage = () => {
     await loadNodes();
   };
 
-  useEffect(() => { void refresh(); return () => { generation.current += 1; }; }, [adminToken, isAuthenticated]);
+  useEffect(() => { void refresh(); }, [requests]);
 
   useEffect(() => {
     // [2026-06-02] Refresh the list after the right panel saves raw YAML. Why: the
@@ -78,7 +79,7 @@ export const AgentsSettingsPage = () => {
     const handler = () => { void loadNodes(); };
     window.addEventListener('settings:nodes-updated', handler);
     return () => window.removeEventListener('settings:nodes-updated', handler);
-  }, [adminToken, isAuthenticated, selectedNode?.id]);
+  }, [requests, selectedNode?.id]);
 
   const create = () => run(async () => {
     if (!adminToken) return;
@@ -87,14 +88,14 @@ export const AgentsSettingsPage = () => {
     if (!confirmNavigation()) return;
     try {
       const result = await createNode(adminToken, { id, content: nodeTemplate(id, template) });
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setNewId('');
       setMessage(savedMessage('节点已创建，请在右栏继续编辑 YAML。', '', result.warnings));
       await loadNodes();
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setSelectedNode({ id, name: id, type: template === 'tool' ? 'tool' : 'ai', model: '', description: '通过设置页面创建的节点。', delegate_targets: [] } as AdminNode);
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error, '创建节点失败'));
     }
   });
@@ -107,16 +108,16 @@ export const AgentsSettingsPage = () => {
     const nodeId = selectedNode.id;
     try {
       await deleteNode(adminToken, nodeId);
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       // 先清掉选中：恢复默认后 id 没变，右栏要看到选中换过一次才会重读成仓库那份。
       setSelectedNode(null);
       setMessage(removal.done);
       const items = await loadNodes();
-      if (tokenChanged(adminToken) || !removal.restores) return;
+      if (!requests.isCurrent() || !removal.restores) return;
       const restored = items?.find((item) => item.id === nodeId);
       if (restored) setSelectedNode(restored);
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error, `${removal.label}失败`));
     }
   });

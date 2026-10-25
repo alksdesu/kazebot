@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { errorMessage } from '../../api/request';
 import { getConversations } from '../../api/supervisorClient';
+import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { useSettingsStore } from '../../store/settingsStore';
 import { startPolling } from '../../utils/polling';
 import { featureRequest } from '../client';
@@ -10,33 +11,32 @@ import { readExecutionPlans, type ExecutionPlan } from './types';
 
 export function ConversationPlans({ sessionId }: { sessionId: string }) {
   const token = useSettingsStore(state => state.adminToken);
+  const requests = useRequestGuard(sessionId);
   const [plans, setPlans] = useState<ExecutionPlan[]>([]);
   const [scope, setScope] = useState('');
   const [error, setError] = useState('');
   useEffect(() => {
-    let alive = true;
     let currentScope = '';
-    let generation = 0;
     setPlans([]); setScope(''); setError('');
     if (!sessionId || !token) return;
     async function refresh() {
-      const request = ++generation;
+      const request = requests.begin('plans');
       try {
         if (!currentScope) currentScope = (await getConversations(token || '')).find(row => row.session_id === sessionId)?.conversation_key || '';
         if (!currentScope) return;
-        const data = await featureRequest<unknown>('/v1/execution/plans', { scope: currentScope });
-        if (alive && request === generation) {
+        const data = await featureRequest<unknown>('/v1/execution/plans', { scope: currentScope, signal: request.signal });
+        if (request.isCurrent()) {
           setScope(currentScope);
           setPlans(readExecutionPlans(data).filter(plan => !['cancelled', 'completed'].includes(plan.status)).slice(0, 5));
           setError('');
         }
-      } catch (failure) { if (alive && request === generation) setError(errorMessage(failure)); }
+      } catch (failure) { if (request.isCurrent()) setError(errorMessage(failure)); }
     }
     const stop = startPolling(refresh, 5000, { first: refresh });
     const update = () => void refresh();
     window.addEventListener('clonoth:execution-updated', update);
-    return () => { alive = false; stop(); window.removeEventListener('clonoth:execution-updated', update); };
-  }, [sessionId, token]);
+    return () => { stop(); window.removeEventListener('clonoth:execution-updated', update); };
+  }, [requests, sessionId, token]);
   if (!plans.length && !error) return null;
   return <details className="min-w-0 max-h-80 overflow-y-auto [overflow-wrap:anywhere] border-t border-[var(--duties-border)] p-3" open>
     <summary className="cursor-pointer text-sm font-semibold">本会话的计划 · {error ? plans.length ? `上次读取有 ${plans.length} 项，状态待更新` : '暂时无法读取' : `${plans.length}项待处理`}</summary>

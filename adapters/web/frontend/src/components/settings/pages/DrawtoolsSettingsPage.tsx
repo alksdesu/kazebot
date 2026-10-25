@@ -23,8 +23,9 @@ import { usePageNotice } from '../../../hooks/usePageNotice';
 import { savedMessage } from '../../../utils/sentence';
 import { commitYamlKeys } from '../../../console/yamlCommit';
 import { parseYamlMapping, sameData, type YamlKeyEdit } from '../../../console/yamlRewrite';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
-import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { useSettingsStore } from '../../../store/settingsStore';
 import { Block, Button, ErrorText, Field, Input, PageShell, Select, StatusText } from './settingsControls';
 
 const presetTextAreaClass = 'w-full resize-y overflow-hidden border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-sm leading-5 text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]';
@@ -201,7 +202,7 @@ export const DrawtoolsSettingsPage = () => {
   const [nodeError, setNodeError] = useState('');
   const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
-  const loadVersion = useRef(0);
+  const requests = useRequestGuard();
   const [presetsExpanded, setPresetsExpanded] = useState(false);
   const [characterQuery, setCharacterQuery] = useState('');
   const [editingCharacterIndex, setEditingCharacterIndex] = useState<number | null>(null);
@@ -225,21 +226,21 @@ export const DrawtoolsSettingsPage = () => {
   /** 重读绘图配置。只动读取那一半提示：保存之后紧接着读，刚写下的「已保存」不能被冲掉。 */
   const load = async () => {
     if (!adminToken || !isAuthenticated) return;
-    const version = ++loadVersion.current;
+    const request = requests.begin('bundle');
     setLoading(true);
     try {
       const [data, node] = await Promise.all([getDrawtoolsBundle(adminToken), readPlannerNode(adminToken)]);
-      if (version !== loadVersion.current) return;
+      if (!request.isCurrent()) return;
       setBundle(data);
       setNodeFile({ content: node.content, hash: node.hash });
       setNodeError(node.error);
       setEditor(section === 'node' ? node.content : getSectionContent(data, section));
       setLoadError('');
     } catch (error) {
-      if (version !== loadVersion.current) return;
+      if (!request.isCurrent()) return;
       setLoadError(errorMessage(error, '加载绘图配置失败'));
     } finally {
-      if (version === loadVersion.current) setLoading(false);
+      if (request.isCurrent()) setLoading(false);
     }
   };
 
@@ -249,7 +250,7 @@ export const DrawtoolsSettingsPage = () => {
     await load();
   };
 
-  useEffect(() => { void refresh(); return () => { loadVersion.current += 1; }; }, [adminToken, isAuthenticated]);
+  useEffect(() => { void refresh(); }, [requests]);
 
   const sourceText = section === 'node' ? nodeRaw : getSectionContent(bundle, section);
   const editorDirty = bundle !== null && editor !== sourceText;
@@ -268,11 +269,11 @@ export const DrawtoolsSettingsPage = () => {
         : section === 'characters' ? await updateDrawtoolsCharactersRaw(adminToken, editor, base)
           : section === 'node' ? await updateNodeRaw(adminToken, PLANNER_NODE, editor, base)
             : await updateDrawtoolsPromptRaw(adminToken, section, editor, base);
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(savedMessage('已保存。用户配置文件会写入非 example 文件，后续更新不会覆盖。', '', result.warnings));
       await load();
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error, '保存失败'));
     }
   };
@@ -281,11 +282,11 @@ export const DrawtoolsSettingsPage = () => {
     if (!adminToken) return;
     try {
       const result = await initDrawtoolsConfigs(adminToken);
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(result.created.length ? `已创建：${result.created.join('、')}` : '用户配置已存在，无需创建。');
       await load();
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error, '初始化失败'));
     }
   };
@@ -306,13 +307,13 @@ export const DrawtoolsSettingsPage = () => {
         write: (content, hash) => target.write(adminToken, content, hash),
         edits: changedSections(loaded, next),
         loaded,
-        proceed: () => !tokenChanged(adminToken),
+        proceed: requests.isCurrent,
       });
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(savedMessage(okText, note, result.warnings));
       await load();
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error, failText));
     }
   };
@@ -350,10 +351,10 @@ export const DrawtoolsSettingsPage = () => {
     if (!window.confirm('立即清理 data/attachments/novelai？过期文件会被删除，超出容量上限时还会删掉最旧的那些。')) return;
     try {
       const result = await cleanupDrawtoolsAttachments(adminToken);
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(`清理完成：删除 ${result.deleted_count ?? 0} 个文件，释放 ${result.deleted_mb ?? 0} MB；剩余 ${result.remaining_count ?? 0} 个文件 / ${result.remaining_mb ?? 0} MB`);
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error, '清理失败'));
     }
   };

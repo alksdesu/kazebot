@@ -2,9 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { errorMessage, isEditConflict } from '../../api/request';
 import { featureRequest } from '../client';
 import { ScopeSelect } from '../execution/ScopeSelect';
+import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
-import { useSettingsStore } from '../../store/settingsStore';
-import { useActorRequestScope } from '../useActorRequestScope';
 import { INSTANCE_DEFAULTS_TARGET, useScopePicker } from '../useScopePicker';
 import { actionClass, controlClass, EmptyState, FeatureFeedback, FeaturePage, primaryClass, sectionClass } from '../ui';
 import { CONVERSATION_POLICY_KEYS, type ConversationPolicy, type ConversationPolicyKey } from './types';
@@ -21,12 +20,10 @@ const displayValue = (value: boolean | number) => typeof value === 'boolean' ? v
 
 export function ConversationSettings({ scope: initialScope }: { scope?: string }) {
   const [scope, setScope] = useState(initialScope === undefined ? INSTANCE_DEFAULTS_TARGET : initialScope);
-  const token = useSettingsStore(state => state.adminToken);
   const picker = useScopePicker('policy', scope);
   const global = scope === INSTANCE_DEFAULTS_TARGET;
-  const identity = useActorRequestScope(JSON.stringify([scope, token]));
-  const viewKey = identity.key;
-  const isCurrent = () => identity.isCurrent() && useSettingsStore.getState().adminToken === token;
+  const requests = useRequestGuard(scope);
+  const viewKey = requests.key;
   const [snapshot, setSnapshot] = useState<{ key: string; value: PolicySnapshot } | null>(null);
   const baseline = snapshot?.key === viewKey ? snapshot.value : null;
   const baselineRef = useRef(baseline); baselineRef.current = baseline;
@@ -40,8 +37,6 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
   const [readBlocked, setReadBlocked] = useState(true);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
-  const requestSequence = useRef(0);
-  const mutationSequence = useRef(0);
   const mutating = useRef(false);
   const dirty = Boolean(baseline && draftIdentity(draft) !== draftIdentity(policyDraft(global ? baseline.settings : baseline.overrides)));
   const dirtyRef = useRef(dirty); dirtyRef.current = dirty;
@@ -69,49 +64,47 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
       setError('服务端设置已变化，未覆盖你的草稿。请核对后重新载入设置。');
     }
   };
-  const refresh = useCallback(async (signal?: AbortSignal, resetDraft = false) => {
-    if (!picker.valid || !isCurrent()) return;
-    const request = ++requestSequence.current;
+  const refresh = useCallback(async (resetDraft = false) => {
+    if (!picker.valid || !requests.isCurrent()) return;
+    const request = requests.begin('policy');
     setReadBlocked(true);
     try {
       const [current, logs] = global
-        ? [await featureRequest<unknown>('/v1/community/settings/defaults', { signal }), null]
+        ? [await featureRequest<unknown>('/v1/community/settings/defaults', { signal: request.signal }), null]
         : await Promise.all([
-          featureRequest<unknown>('/v1/community/state', { scope, signal }),
-          featureRequest<{ items: Decision[] }>('/v1/community/decisions', { scope, signal }),
+          featureRequest<unknown>('/v1/community/state', { scope, signal: request.signal }),
+          featureRequest<{ items: Decision[] }>('/v1/community/decisions', { scope, signal: request.signal }),
         ]);
-      if (signal?.aborted || !isCurrent() || request !== requestSequence.current) return;
+      if (!request.isCurrent()) return;
       const next = readPolicySnapshot(current, global);
       if (!global && next.community?.scope !== scope) throw new Error('服务端返回的会话不匹配，未启用保存。');
       accept(next, resetDraft);
       setDecisions(logs?.items || []);
       setLoading(false);
     } catch (reason) {
-      if (signal?.aborted || !isCurrent() || request !== requestSequence.current) return;
-      throw reason;
+      if (request.isCurrent()) throw reason;
     }
-  }, [viewKey, picker.valid]);
+  }, [requests, scope, global, picker.valid]);
   useEffect(() => {
-    mutationSequence.current++; mutating.current = false; baselineRef.current = null; dirtyRef.current = false;
+    mutating.current = false; baselineRef.current = null; dirtyRef.current = false;
     setSnapshot(null); setLatest(null); setDraft({}); setDecisions([]); setBusy(false); setError(''); setNotice(''); setConflict(false); setReadBlocked(true);
-    return () => { requestSequence.current++; };
   }, [viewKey]);
   useEffect(() => {
-    const controller = new AbortController(); setLoading(picker.valid);
-    if (picker.valid) void refresh(controller.signal).catch(reason => { if (!controller.signal.aborted && isCurrent()) { setError(errorMessage(reason)); setLoading(false); } });
-    return () => { controller.abort(); requestSequence.current++; };
-  }, [refresh]);
+    setLoading(picker.valid);
+    if (picker.valid) void refresh().catch(reason => { if (requests.isCurrent()) { setError(errorMessage(reason)); setLoading(false); } });
+    return () => { requests.drop('policy'); };
+  }, [requests, refresh, picker.valid]);
 
   const run = async (action: () => Promise<unknown>, message = '') => {
-    if (!picker.valid || !isCurrent() || mutating.current) return;
-    mutating.current = true; const mutation = ++mutationSequence.current; requestSequence.current++;
+    if (!picker.valid || !requests.isCurrent() || mutating.current) return;
+    mutating.current = true; requests.drop('policy');
     setBusy(true); setError(''); setNotice('');
-    try { await action(); if (isCurrent() && message) setNotice(message); }
-    catch (reason) { if (isCurrent()) { setError(errorMessage(reason)); if (isEditConflict(reason)) setConflict(true); } }
-    finally { if (mutation === mutationSequence.current && isCurrent()) { mutating.current = false; setBusy(false); setLoading(false); } }
+    try { await action(); if (requests.isCurrent() && message) setNotice(message); }
+    catch (reason) { if (requests.isCurrent()) { setError(errorMessage(reason)); if (isEditConflict(reason)) setConflict(true); } }
+    finally { if (requests.isCurrent()) { mutating.current = false; setBusy(false); setLoading(false); } }
   };
   const reload = () => {
-    if (confirmDiscard()) void run(() => refresh(undefined, true));
+    if (confirmDiscard()) void run(() => refresh(true));
   };
   const save = () => {
     if (!baseline || !effective || !dirty || conflict || readBlocked) return;
@@ -120,7 +113,7 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
     const body = { values, reset_fields: global ? [] : CONVERSATION_POLICY_KEYS.filter(key => !Object.prototype.hasOwnProperty.call(draft, key)), expected_revision: baseline.revision, ...(global ? {} : { expected_defaults_revision: baseline.defaultsRevision }) };
     void run(async () => {
       const response = await featureRequest<unknown>(global ? '/v1/community/settings/defaults' : '/v1/community/settings/overrides', { ...(global ? {} : { scope }), method: 'PATCH', body });
-      if (!isCurrent()) return;
+      if (!requests.isCurrent()) return;
       setReadBlocked(true);
       const next = readPolicySnapshot(response, global);
       if (!global && next.community?.scope !== scope) throw new Error('服务端返回的会话不匹配，请重新载入确认保存结果。');
@@ -167,7 +160,7 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
           <p>{latest.community.quiet.mode ? `${latest.community.quiet.mode === 'listen' ? '旁听' : '完全安静'}，到 ${new Date((latest.community.quiet.expires_at || 0) * 1000).toLocaleString()} 自动恢复` : '正常回应'}</p>
           <p>仅作用于当前会话。旁听仍接明确 @、引用和命令；完全安静暂停普通对话与通知，恢复、状态和取消等控制命令仍可使用。</p>
           <label className="block max-w-sm">分钟数<input aria-label="安静分钟数" type="number" min={1} max={10080} className={controlClass} value={minutes} onChange={event => setMinutes(event.target.value)} /></label>
-          <div className="flex flex-wrap gap-3">{(['listen', 'silent', 'off'] as const).map(mode => <button className={actionClass} disabled={busy || (mode !== 'off' && !validMinutes)} key={mode} onClick={() => void run(async () => { await featureRequest('/v1/community/quiet', { scope, method: 'POST', body: { mode, duration_sec: mode === 'off' ? 0 : Number(minutes) * 60 } }); if (isCurrent()) await refresh(); })}>{mode === 'listen' ? '旁听' : mode === 'silent' ? '完全安静' : '恢复'}</button>)}</div>
+          <div className="flex flex-wrap gap-3">{(['listen', 'silent', 'off'] as const).map(mode => <button className={actionClass} disabled={busy || (mode !== 'off' && !validMinutes)} key={mode} onClick={() => void run(async () => { await featureRequest('/v1/community/quiet', { scope, method: 'POST', body: { mode, duration_sec: mode === 'off' ? 0 : Number(minutes) * 60 } }); if (requests.isCurrent()) await refresh(); })}>{mode === 'listen' ? '旁听' : mode === 'silent' ? '完全安静' : '恢复'}</button>)}</div>
         </section>
         <section className={sectionClass}><h2 className="font-semibold">最近接话判定</h2><button className={actionClass} disabled={busy} onClick={() => void run(() => refresh())}>刷新判定</button>
           {!decisions.length && <EmptyState>启用策略并收到消息后，这里会显示当前会话的实际判定。</EmptyState>}

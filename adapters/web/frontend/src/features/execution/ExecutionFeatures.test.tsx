@@ -9,7 +9,10 @@ import { downloadFeature, featureRequest } from '../client';
 vi.mock('../client', () => ({ featureRequest: vi.fn(), downloadFeature: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('./ScopeSelect', () => ({ ScopeSelect: ({ value, onChange }: { value: string; onChange: (value: string) => void }) => <select aria-label="所属会话" value={value} onChange={event => onChange(event.target.value)}><option value="web:console">控制台</option><option value="qq_group:other">其他群</option></select> }));
 vi.mock('../../api/supervisorClient', () => ({ uploadAttachment: vi.fn() }));
-vi.mock('../../store/settingsStore', () => ({ useSettingsStore: (selector: (state: { adminToken: string }) => unknown) => selector({ adminToken: 'token' }) }));
+vi.mock('../../store/settingsStore', () => {
+  const state = { adminToken: 'token' };
+  return { useSettingsStore: Object.assign((selector: (value: typeof state) => unknown) => selector(state), { getState: () => state, subscribe: () => () => {} }) };
+});
 
 const initial = (): ExecutionPlan => ({
   id: 'P123456789abc', goal: '保存报表', work_scope: '仅写入指定文件', scope: 'web:console', revision: 1, version: 1, status: 'draft',

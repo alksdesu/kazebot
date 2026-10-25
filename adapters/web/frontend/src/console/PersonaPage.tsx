@@ -1,5 +1,6 @@
 // 人格：人设、模型与补充 System。各块各自保存，写的是节点文件。
 import { useEffect, useId, useState } from 'react';
+import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
 import {
@@ -99,16 +100,17 @@ const PromptFragmentEditor = ({ fragment, onReload }: { fragment: PromptFragment
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [note, setNote] = useState('正在读取…');
+  const requests = useRequestGuard(fragment.filename);
   const confirmDiscard = useUnsavedChanges(text !== saved, `${fragment.label}有未保存修改，确定离开或丢弃吗？`);
 
   useEffect(() => {
     if (!token) return;
-    let cancelled = false;
+    const request = requests.begin('fragment');
     setLoaded(false);
     void (async () => {
       try {
         const file = await readPromptFragment(token, fragment.filename);
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         setSaved(file?.content ?? '');
         setText(file?.content ?? '');
         setBase(file ? file.hash : '');
@@ -116,14 +118,13 @@ const PromptFragmentEditor = ({ fragment, onReload }: { fragment: PromptFragment
         setNote('');
         setLoaded(true);
       } catch (error) {
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         setMissing(false);
         setLoaded(false);
         setNote(errorMessage(error));
       }
     })();
-    return () => { cancelled = true; };
-  }, [token, fragment.filename]);
+  }, [requests, token, fragment.filename]);
 
   const save = async () => {
     if (!token || busy || !loaded) return;

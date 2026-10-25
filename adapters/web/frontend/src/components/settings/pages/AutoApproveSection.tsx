@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from 'react';
 
 import { getAllToolNames } from '../../../api/supervisorClient';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import {
   isAutoApproveToolEnabled,
   TOOL_APPROVAL_OPERATIONS,
@@ -84,20 +85,20 @@ export const AutoApproveSection = () => {
   const [loadFailed, setLoadFailed] = useState(false);
   const [query, setQuery] = useState('');
   const [showAll, setShowAll] = useState(false);
+  const requests = useRequestGuard();
 
   useEffect(() => {
-    let active = true;
+    const request = requests.begin('tools');
     getAllToolNames(adminToken || '')
       .then((names) => {
-        if (!active) return;
+        if (!request.isCurrent()) return;
         setFetchedToolNames(Array.isArray(names) ? names : []);
         setLoadFailed(false);
       })
       .catch(() => {
-        if (active) setLoadFailed(true);
+        if (request.isCurrent()) setLoadFailed(true);
       });
-    return () => { active = false; };
-  }, [adminToken]);
+  }, [requests, adminToken]);
 
   const recommended = useMemo(
     () => KNOWN_TOOL_RULES.map((rule): ToolRule => ({ ...rule, risk: inferToolRisk(rule.toolName) })),

@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react';
 
 import { getConfig, getNodes } from '../../../api/supervisorClient';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { type TitleGenerationMode, useClientPrefsStore } from '../../../store/clientPrefsStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import type { NodeDef } from '../../../types';
@@ -52,19 +53,20 @@ export const ClientSettingsPage = () => {
   } = useClientPrefsStore();
   const { adminToken, entryNodeId, setEntryNodeId } = useSettingsStore();
   const [entryNodes, setEntryNodes] = useState<NodeDef[]>([]);
+  const requests = useRequestGuard();
 
   useEffect(() => {
     if (!adminToken) {
       setEntryNodes([]);
       return;
     }
-    let cancelled = false;
+    const request = requests.begin('nodes');
     Promise.all([
       getNodes(adminToken),
       getConfig().catch(() => null),
     ])
       .then(([nodes, config]) => {
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         const parsedNodes = parseNodeList(nodes);
         setEntryNodes(parsedNodes);
         const configured = configuredEntryNodeId(config, entryNodeId);
@@ -80,12 +82,9 @@ export const ClientSettingsPage = () => {
         }
       })
       .catch(() => {
-        if (!cancelled) setEntryNodes([]);
+        if (request.isCurrent()) setEntryNodes([]);
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [adminToken, setEntryNodeId]);
+  }, [requests, adminToken, setEntryNodeId]);
 
   return (
     <PageShell

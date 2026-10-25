@@ -3,7 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({ conversations: vi.fn(), request: vi.fn() }));
 vi.mock('../../api/supervisorClient', () => ({ getConversations: mocks.conversations }));
-vi.mock('../../store/settingsStore', () => ({ useSettingsStore: (select: (value: unknown) => unknown) => select({ adminToken: 'fixture-token' }) }));
+vi.mock('../../store/settingsStore', () => {
+  const state = { adminToken: 'fixture-token' };
+  return { useSettingsStore: Object.assign((select: (value: typeof state) => unknown) => select(state), { getState: () => state, subscribe: () => () => {} }) };
+});
 vi.mock('../client', () => ({ featureRequest: mocks.request }));
 vi.mock('../ui', () => ({ actionClass: '' }));
 vi.mock('./ExecutionProgressCard', () => ({ ExecutionProgressCard: () => null }));

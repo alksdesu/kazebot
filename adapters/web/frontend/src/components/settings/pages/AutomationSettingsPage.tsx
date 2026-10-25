@@ -6,7 +6,8 @@ import { getSchedulesRaw, updateSchedulesRaw } from '../../../api/supervisorClie
 import { commitYamlKeys } from '../../../console/yamlCommit';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
-import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { useSettingsStore } from '../../../store/settingsStore';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
 import { savedMessage } from '../../../utils/sentence';
 import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
@@ -33,23 +34,23 @@ export const AutomationSettingsPage = () => {
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const mutation = useRef(false);
-  const generation = useRef(0);
+  const requests = useRequestGuard();
 
   const load = async () => {
     if (!adminToken || !isAuthenticated) return;
-    const version = ++generation.current;
+    const request = requests.begin('schedules');
     setLoading(true);
     try {
       const parsed = parseSchedules((await getSchedulesRaw(adminToken)).content);
-      if (version !== generation.current) return;
+      if (!request.isCurrent()) return;
       setSchedules(parsed);
       if (selectedScheduleId && !parsed.some((schedule) => schedule.id === selectedScheduleId)) setSelectedScheduleId(null);
       setLoadError('');
     } catch (error) {
-      if (version !== generation.current) return;
+      if (!request.isCurrent()) return;
       setLoadError(errorMessage(error, '加载定时任务失败'));
     } finally {
-      if (version === generation.current) setLoading(false);
+      if (request.isCurrent()) setLoading(false);
     }
   };
 
@@ -59,7 +60,7 @@ export const AutomationSettingsPage = () => {
     await load();
   };
 
-  useEffect(() => { void refresh(); return () => { generation.current += 1; }; }, [adminToken, isAuthenticated]);
+  useEffect(() => { void refresh(); }, [requests]);
 
   useEffect(() => {
     // [2026-06-02] Refresh schedule rows after the right-panel form saves. Why: the
@@ -68,7 +69,7 @@ export const AutomationSettingsPage = () => {
     const handler = () => { void load(); };
     window.addEventListener('settings:schedules-updated', handler);
     return () => window.removeEventListener('settings:schedules-updated', handler);
-  }, [adminToken, isAuthenticated, selectedScheduleId]);
+  }, [requests, selectedScheduleId]);
 
   const create = async () => {
     if (!adminToken || mutation.current || loading) return;
@@ -81,17 +82,17 @@ export const AutomationSettingsPage = () => {
         read: () => getSchedulesRaw(adminToken),
         write: (content, hash) => updateSchedulesRaw(adminToken, content, hash),
         edits: (base) => scheduleCreateEdits(base, emptySchedule(id)),
-        proceed: () => !tokenChanged(adminToken),
+        proceed: requests.isCurrent,
       });
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setNewId('');
       setMessage(savedMessage('任务已创建但尚未启用，请在右栏填写内容后启用。', note, result.warnings));
       await load();
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setSelectedScheduleId(id);
       setRightPanelOpen(true);
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error, '创建定时任务失败'));
     } finally { mutation.current = false; setBusy(false); }
   };
@@ -106,14 +107,14 @@ export const AutomationSettingsPage = () => {
         read: () => getSchedulesRaw(adminToken),
         write: (content, hash) => updateSchedulesRaw(adminToken, content, hash),
         edits: (base) => scheduleRemoveEdits(base, selectedScheduleId),
-        proceed: () => !tokenChanged(adminToken),
+        proceed: requests.isCurrent,
       });
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setSelectedScheduleId(null);
       setMessage(savedMessage('定时任务已删除', note, result.warnings));
       await load();
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error, '删除定时任务失败'));
     } finally { mutation.current = false; setBusy(false); }
   };

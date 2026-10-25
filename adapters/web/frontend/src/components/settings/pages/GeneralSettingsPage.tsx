@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { activeProviderConfig, checkHealth, getProviders } from '../../../api/supervisorClient';
+import type { RequestTicket } from '../../../api/requestGuard';
+import { activeProviderConfig, checkHealth, getProviders, HEALTH_TIMEOUT_MS } from '../../../api/supervisorClient';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
 import { useChatStore } from '../../../store/chatStore';
 import { useSettingsStore } from '../../../store/settingsStore';
@@ -11,54 +13,41 @@ export const GeneralSettingsPage = () => {
   const { adminToken, isAuthenticated, isConnected, storageWarning, setConnected, setModelConfig } = useSettingsStore();
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState('');
-  const mounted = useRef(false);
-  const healthRequest = useRef<AbortController | null>(null);
-  const healthTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 健康检查是公开端点，换登录不作废；模型配置跟着登录走。
+  const health = useRequestGuard('', { anonymous: true });
+  const requests = useRequestGuard();
+  const healthCheck = useRef<RequestTicket | null>(null);
 
   const refreshHealth = useCallback(async () => {
-    if (healthRequest.current) return;
-    const controller = new AbortController();
-    healthRequest.current = controller;
-    const timeout = setTimeout(() => controller.abort(), 10000);
-    healthTimeout.current = timeout;
+    if (healthCheck.current?.isCurrent()) return;
+    const request = health.begin('health');
+    healthCheck.current = request;
     setChecking(true); setError('');
     try {
-      await checkHealth(controller.signal);
-      if (mounted.current && healthRequest.current === controller) setConnected(true);
+      await checkHealth(request.signal, HEALTH_TIMEOUT_MS);
+      if (request.isCurrent()) setConnected(true);
     } catch {
-      if (mounted.current && healthRequest.current === controller) {
+      if (request.isCurrent()) {
         setConnected(false);
         setError('无法连接调度器。请检查服务是否运行，再刷新连接状态。');
       }
     } finally {
-      clearTimeout(timeout);
-      if (healthTimeout.current === timeout) healthTimeout.current = null;
-      if (healthRequest.current === controller) {
-        healthRequest.current = null;
-        if (mounted.current) setChecking(false);
+      if (healthCheck.current === request) {
+        healthCheck.current = null;
+        if (request.isCurrent()) setChecking(false);
       }
     }
-  }, [setConnected]);
+  }, [health, setConnected]);
 
-  useEffect(() => {
-    mounted.current = true;
-    void refreshHealth();
-    return () => {
-      mounted.current = false; healthRequest.current?.abort(); healthRequest.current = null;
-      if (healthTimeout.current) clearTimeout(healthTimeout.current);
-      healthTimeout.current = null;
-    };
-  }, [refreshHealth]);
+  useEffect(() => { void refreshHealth(); }, [refreshHealth]);
 
   useEffect(() => {
     if (!adminToken || !isAuthenticated) return;
-    let active = true;
+    const request = requests.begin('providers');
     void getProviders(adminToken).then(providers => {
-      const current = useSettingsStore.getState();
-      if (active && current.isAuthenticated && current.adminToken === adminToken) setModelConfig(activeProviderConfig(providers));
+      if (request.isCurrent()) setModelConfig(activeProviderConfig(providers));
     }).catch(() => {});
-    return () => { active = false; };
-  }, [adminToken, isAuthenticated, setModelConfig]);
+  }, [requests, adminToken, isAuthenticated, setModelConfig]);
 
   const handleLogout = () => {
     if (!confirmNavigation()) return;

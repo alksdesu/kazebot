@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { errorMessage } from '../../api/request';
 import { featureRequest } from '../client';
+import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { startPolling } from '../../utils/polling';
-import { useRequestScope } from '../asyncState';
 import { actionClass, controlClass, EmptyState, FeatureFeedback, FeaturePage, primaryClass, sectionClass } from '../ui';
 import { ScopeSelect } from './ScopeSelect';
 
@@ -39,30 +39,28 @@ export function RemindersPage({ scope: initialScope = 'web:console', embedded = 
   const [minutes, setMinutes] = useState('10');
   const [filter, setFilter] = useState('open');
   const [query, setQuery] = useState('');
-  const sequence = useRef(0);
   const mutating = useRef(false);
-  const identity = useRequestScope(scope);
+  const requests = useRequestGuard(scope);
   const confirmDiscard = useUnsavedChanges(Boolean(text || due));
   const refresh = useCallback(async () => {
-    const request = ++sequence.current;
+    const request = requests.begin('reminders');
     try {
-      const result = await featureRequest<unknown>('/v1/reminders', { scope });
-      if (!identity.isCurrent() || request !== sequence.current) return;
+      const result = await featureRequest<unknown>('/v1/reminders', { scope, signal: request.signal });
+      if (!request.isCurrent()) return;
       setItems(readReminders(result)); setReadError('');
-    } catch (reason) { if (identity.isCurrent() && request === sequence.current) setReadError(errorMessage(reason)); }
-    finally { if (identity.isCurrent() && request === sequence.current) setLoading(false); }
-  }, [scope]);
+    } catch (reason) { if (request.isCurrent()) setReadError(errorMessage(reason)); }
+    finally { if (request.isCurrent()) setLoading(false); }
+  }, [requests, scope]);
   useEffect(() => {
     setItems([]); setLoading(true); setError(''); setReadError(''); setNotice('');
-    const stop = startPolling(async () => { if (!mutating.current) await refresh(); }, 5000, { first: refresh });
-    return () => { stop(); sequence.current++; };
+    return startPolling(async () => { if (!mutating.current) await refresh(); }, 5000, { first: refresh });
   }, [refresh]);
   const run = async (action: () => Promise<unknown>, message: string) => {
     if (mutating.current) return;
-    mutating.current = true; sequence.current++; setBusy(true); setError(''); setNotice('');
-    try { await action(); if (identity.isCurrent()) { setNotice(message); await refresh(); } }
-    catch (reason) { if (identity.isCurrent()) setError(errorMessage(reason)); }
-    finally { mutating.current = false; if (identity.isCurrent()) setBusy(false); }
+    mutating.current = true; requests.drop('reminders'); setBusy(true); setError(''); setNotice('');
+    try { await action(); if (requests.isCurrent()) { setNotice(message); await refresh(); } }
+    catch (reason) { if (requests.isCurrent()) setError(errorMessage(reason)); }
+    finally { mutating.current = false; if (requests.isCurrent()) setBusy(false); }
   };
   const validMinutes = /^\d+$/.test(minutes) && Number(minutes) >= 1 && Number(minutes) <= 525600;
   const act = (item: Reminder, action: string) => run(() => featureRequest(`/v1/reminders/${item.id}/${action}`, {
@@ -74,7 +72,7 @@ export function RemindersPage({ scope: initialScope = 'web:console', embedded = 
     <FeatureFeedback error={error || readError} notice={notice} retry={() => void refresh()} />
     <form className={sectionClass} onSubmit={event => { event.preventDefault(); void run(async () => {
       await featureRequest('/v1/reminders', { scope, method: 'POST', body: { text, due_at: due, timezone: zone } });
-      if (identity.isCurrent()) { setText(''); setDue(''); }
+      if (requests.isCurrent()) { setText(''); setDue(''); }
     }, '提醒已创建。'); }}>
       <fieldset disabled={busy} className="min-w-0 space-y-4"><legend className="font-semibold">新提醒</legend>
         <label className="block space-y-1">提醒内容<textarea aria-label="提醒内容" required maxLength={4000} rows={3} className={controlClass} value={text} onChange={event => setText(event.target.value)} /></label>

@@ -1,6 +1,7 @@
 import { createContext, createElement, useCallback, useContext, useEffect, useState, type PropsWithChildren } from 'react';
 
 import { getInstanceDirectory, MOUNT, type InstanceDirectoryEntry } from '../../api/supervisorClient';
+import { useRequestGuard } from '../../hooks/useRequestGuard';
 
 interface DirectoryState {
   status: 'loading' | 'ready' | 'error';
@@ -15,18 +16,19 @@ function useDirectoryRequest(enabled: boolean) {
   const [state, setState] = useState<DirectoryState>(initialState);
   const [revision, setRevision] = useState(0);
   const retry = useCallback(() => setRevision(value => value + 1), []);
+  const requests = useRequestGuard('', { anonymous: true });
 
   useEffect(() => {
     if (!enabled) return;
-    const controller = new AbortController();
+    const request = requests.begin('directory');
     setState(initialState);
-    void getInstanceDirectory(controller.signal).then(result => {
-      if (!controller.signal.aborted) setState({ status: 'ready', currentPath: result.current_path, instances: result.instances });
+    void getInstanceDirectory(request.signal).then(result => {
+      if (request.isCurrent()) setState({ status: 'ready', currentPath: result.current_path, instances: result.instances });
     }).catch(() => {
-      if (!controller.signal.aborted) setState({ ...initialState, status: 'error' });
+      if (request.isCurrent()) setState({ ...initialState, status: 'error' });
     });
-    return () => controller.abort();
-  }, [enabled, revision]);
+    return () => requests.drop('directory');
+  }, [requests, enabled, revision]);
 
   return { ...state, retry };
 }

@@ -1,26 +1,25 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { getConversations, type ConversationRow } from '../api/supervisorClient';
+import { useRequestGuard } from '../hooks/useRequestGuard';
 import { isConversationScope, platformForScope } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
-import { useActorRequestScope } from './useActorRequestScope';
 import { featureRequest } from './client';
 import type { PolicyScope } from './community/types';
 
 export function useConversationDirectory(includePolicies = false) {
   const token = useSettingsStore(state => state.adminToken);
-  const identity = useActorRequestScope(includePolicies ? 'policy-directory' : 'conversation-directory');
-  const sequence = useRef(0);
-  const [snapshot, setSnapshot] = useState<{ key: string; rows: ConversationRow[]; policyOnlyScopes: string[]; error: string; loading: boolean }>({ key: identity.key, rows: [], policyOnlyScopes: [], error: '', loading: false });
+  const requests = useRequestGuard(includePolicies ? 'policy-directory' : 'conversation-directory');
+  const [snapshot, setSnapshot] = useState<{ key: string; rows: ConversationRow[]; policyOnlyScopes: string[]; error: string; loading: boolean }>({ key: requests.key, rows: [], policyOnlyScopes: [], error: '', loading: false });
   const reload = useCallback(async () => {
-    const request = ++sequence.current;
-    setSnapshot({ key: identity.key, rows: [], policyOnlyScopes: [], error: '', loading: Boolean(token) });
+    const request = requests.begin('directory');
+    setSnapshot({ key: requests.key, rows: [], policyOnlyScopes: [], error: '', loading: Boolean(token) });
     if (!token) return;
     try {
       const [result, policies] = await Promise.all([
         getConversations(token),
-        includePolicies ? featureRequest<{ items: PolicyScope[] }>('/v1/community/settings/scopes') : Promise.resolve(null),
+        includePolicies ? featureRequest<{ items: PolicyScope[] }>('/v1/community/settings/scopes', { signal: request.signal }) : Promise.resolve(null),
       ]);
-      if (request !== sequence.current || !identity.isCurrent()) return;
+      if (!request.isCurrent()) return;
       if (!Array.isArray(result)) throw new Error('invalid conversations');
       let rows = result.filter(row => row && typeof row.conversation_key === 'string');
       const policyOnlyScopes: string[] = [];
@@ -39,11 +38,12 @@ export function useConversationDirectory(includePolicies = false) {
         }
         rows = [...merged.values()];
       }
-      setSnapshot({ key: identity.key, rows, policyOnlyScopes, error: '', loading: false });
+      setSnapshot({ key: requests.key, rows, policyOnlyScopes, error: '', loading: false });
     } catch {
-      if (request === sequence.current && identity.isCurrent()) setSnapshot({ key: identity.key, rows: [], policyOnlyScopes: [], error: '会话列表读取失败，仍可操作当前会话。', loading: false });
+      if (request.isCurrent()) setSnapshot({ key: requests.key, rows: [], policyOnlyScopes: [], error: '会话列表读取失败，仍可操作当前会话。', loading: false });
     }
-  }, [token, identity.key, includePolicies]);
-  useEffect(() => { void reload(); return () => { sequence.current++; }; }, [reload]);
-  return { rows: snapshot.key === identity.key ? snapshot.rows : [], policyOnlyScopes: snapshot.key === identity.key ? snapshot.policyOnlyScopes : [], error: snapshot.key === identity.key ? snapshot.error : '', loading: snapshot.key === identity.key ? snapshot.loading : Boolean(token), reload };
+  }, [requests, token, includePolicies]);
+  useEffect(() => { void reload(); }, [reload]);
+  const current = snapshot.key === requests.key;
+  return { rows: current ? snapshot.rows : [], policyOnlyScopes: current ? snapshot.policyOnlyScopes : [], error: current ? snapshot.error : '', loading: current ? snapshot.loading : Boolean(token), reload };
 }

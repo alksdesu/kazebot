@@ -10,8 +10,9 @@ import {
   type PolicyDoc,
   type PolicyRule,
 } from '../../../api/supervisorClient';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
-import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { useSettingsStore } from '../../../store/settingsStore';
 import { firstMatchIndex } from '../../../utils/globMatch';
 import { Button, DangerPanel, SaveBar, ScopeBadge } from './settingsControls';
 import { errorMessage } from '../../../api/request';
@@ -453,6 +454,7 @@ const EMPTY_COMMAND: NonNullable<PolicyDoc['execute_command']> = { default: 'app
 
 export const PolicyRulesSection = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
+  const requests = useRequestGuard();
   const [doc, setDoc] = useState<PolicyDoc | null>(null);
   const [saved, setSaved] = useState('');
   // 这份策略出自哪一版文件，保存时交回：共享组里别的实例中途改过就不写，免得整份盖掉。
@@ -468,10 +470,10 @@ export const PolicyRulesSection = () => {
 
   useEffect(() => {
     if (!adminToken || !isAuthenticated) return undefined;
-    let alive = true;
+    const request = requests.begin('policy');
     getPolicy(adminToken)
       .then(({ policy: next, hash }) => {
-        if (!alive) return;
+        if (!request.isCurrent()) return;
         setDoc(next);
         setSaved(JSON.stringify(next));
         setBase(hash);
@@ -480,10 +482,10 @@ export const PolicyRulesSection = () => {
         setCodeWriteRequested(false);
       })
       .catch((error) => {
-        if (alive) setMessage(errorMessage(error, '读取策略失败'));
+        if (request.isCurrent()) setMessage(errorMessage(error, '读取策略失败'));
       });
-    return () => { alive = false; };
-  }, [adminToken, isAuthenticated, generation]);
+    return () => { requests.drop('policy'); };
+  }, [requests, adminToken, isAuthenticated, generation]);
 
   const dirty = Boolean(doc) && JSON.stringify(doc) !== saved;
   const confirmDiscard = useUnsavedChanges(dirty, '「服务端策略」还有未保存修改，确定离开或丢弃吗？');
@@ -495,7 +497,7 @@ export const PolicyRulesSection = () => {
     setMessage('');
     try {
       const next = await updatePolicy(adminToken, doc, base);
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setDoc(next.policy);
       setSaved(JSON.stringify(next.policy));
       setBase(next.hash);
@@ -505,15 +507,15 @@ export const PolicyRulesSection = () => {
       if (enableCodeWriteAfterSave) {
         try {
           await enableCodeWrite(adminToken);
-          setMessage('策略已保存，已提交 /opt/kazebot 写入权限并重启 miaomiao');
+          if (requests.isCurrent()) setMessage('策略已保存，已提交 /opt/kazebot 写入权限并重启 miaomiao');
         } catch (error) {
-          setMessage(`策略已保存，但代码目录写权限未启用：${errorMessage(error, '宿主机操作失败')}`);
+          if (requests.isCurrent()) setMessage(`策略已保存，但代码目录写权限未启用：${errorMessage(error, '宿主机操作失败')}`);
         }
       } else {
         setMessage('已保存，立即生效，不用重启');
       }
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(isEditConflict(error)
         ? '策略在打开之后被别处改过，没有保存：点「丢弃」读入最新内容，再把改动重做一遍。'
         : errorMessage(error, '保存失败'));

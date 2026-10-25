@@ -34,14 +34,19 @@ beforeEach(() => {
 afterEach(() => { useChatStore.setState(originalActions); useChatStore.getState().resetState(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe('应用动作的目标与失败反馈', () => {
-  it('健康检查超时取消且允许后续重试，卸载中止当前探测', async () => {
-    vi.useFakeTimers(); const signals: AbortSignal[] = [];
-    vi.mocked(api.checkHealth).mockImplementation(signal => new Promise((_, reject) => {
-      signals.push(signal!); signal!.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+  it('健康检查带十秒时限，超时后照常重试，卸载中止当前探测', async () => {
+    vi.useFakeTimers(); const signals: AbortSignal[] = []; const deadlines: Array<number | undefined> = [];
+    // 时限由请求层兑现：这里照着传进来的时限到点拒绝，和真请求超时一样。
+    vi.mocked(api.checkHealth).mockImplementation((signal, timeoutMs) => new Promise((_, reject) => {
+      signals.push(signal!); deadlines.push(timeoutMs);
+      setTimeout(() => reject(new Error('timed out')), timeoutMs);
+      signal!.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
     }));
+    useSettingsStore.setState({ isConnected: true });
     const view = render(<App />); expect(signals).toHaveLength(1);
     await act(async () => { await vi.advanceTimersByTimeAsync(20000); });
-    expect(signals[0].aborted).toBe(true); expect(signals.length).toBeGreaterThan(1);
+    expect(deadlines[0]).toBe(api.HEALTH_TIMEOUT_MS); expect(signals.length).toBeGreaterThan(1);
+    expect(useSettingsStore.getState().isConnected).toBe(false);
     const last = signals[signals.length - 1]; view.unmount(); expect(last.aborted).toBe(true);
   });
   it('发送时读取当前会话的节点，绝不消费其他会话的缓存', async () => {

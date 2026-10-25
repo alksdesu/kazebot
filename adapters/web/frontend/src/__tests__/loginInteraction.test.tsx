@@ -22,7 +22,7 @@ vi.mock('../api/supervisorClient', () => ({
 vi.mock('../components/auth/loadEntryNodes', () => ({ loadEntryNodes: mocks.loadNodes, TOKEN_SOURCE_HINT: '从服务启动信息中获取管理员令牌。' }));
 vi.mock('../store/settingsStore', () => {
   const getState = () => ({ ...mocks.state, setAdminToken: mocks.setToken, setAuthenticated: mocks.setAuthenticated, setAvailableNodes: mocks.setAvailableNodes, setEntryNodeId: mocks.setEntryNodeId });
-  return { LS_KEY_NODE: 'fixture-node', useSettingsStore: Object.assign(() => getState(), { getState }) };
+  return { LS_KEY_NODE: 'fixture-node', useSettingsStore: Object.assign(() => getState(), { getState, subscribe: () => () => {} }) };
 });
 
 import { LoginPage } from '../components/auth/LoginPage';

@@ -3,6 +3,7 @@
 // 读到的是脱敏视图，密钥只回来一个星号串，所以留空表示不改而不是清空。
 // 新建的渠道先留在本地，保存时才建块 —— 后端认不出空块，先建会让它从列表里消失。
 import { useEffect, useId, useMemo, useState, type ReactNode } from 'react';
+import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
 import {
@@ -263,24 +264,25 @@ const ProvidersEditor = () => {
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
   const [error, setError] = useState('');
+  const requests = useRequestGuard();
 
   useEffect(() => {
     if (!token) return;
-    let cancelled = false;
+    const request = requests.begin('providers');
     void (async () => {
       try {
         const resp = await getProviders(token);
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         setData(resp);
         setDrafts(fromResponse(resp));
         setPinned(fromResponse(resp));
       } catch (caught) {
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         setError(errorMessage(caught));
       }
       try {
         const list = await getNodes(token);
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         setOverrides(
           list
             .map((node) => ({ id: String(node.id || ''), provider: String(node.provider || '') }))
@@ -291,13 +293,12 @@ const ProvidersEditor = () => {
       }
       try {
         const received = await getProviderProfiles(token);
-        if (!cancelled) setProfiles(received);
+        if (request.isCurrent()) setProfiles(received);
       } catch {
         // 同上：认不出域名就是不提示。
       }
     })();
-    return () => { cancelled = true; };
-  }, [token]);
+  }, [requests, token]);
 
   const storedBy = useMemo(
     () => new Map(pinned.map((draft) => [draft.name, draft])),

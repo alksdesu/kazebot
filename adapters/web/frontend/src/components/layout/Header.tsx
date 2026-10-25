@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 
 import { getActiveNode, getAppConfig, getNodes, getSessionProviderOverride } from '../../api/supervisorClient';
+import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { confirmNavigation, useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../store/settingsStore';
 import { describeEnvRef } from '../../utils/envRef';
@@ -30,6 +31,7 @@ export const Header = ({ title, sessionId, isGenerating, isCancelling = false, o
   const [draftTitle, setDraftTitle] = useState(title);
   const [nodeError, setNodeError] = useState('');
   const [refresh, setRefresh] = useState(0);
+  const requests = useRequestGuard();
   const confirmDiscardTitle = useUnsavedChanges(configModalFocus === 'title' && draftTitle.trim() !== title, '对话标题尚未保存，确定放弃修改吗？');
   const sid = sessionId === 'no-session' ? '' : sessionId;
   const nodeResolved = !sid || activeNodeSessionId === sid;
@@ -42,35 +44,34 @@ export const Header = ({ title, sessionId, isGenerating, isCancelling = false, o
   useEffect(() => { setDraftTitle(title); }, [title]);
   useEffect(() => { setConfigModalFocus(null); }, [sessionId]);
   useEffect(() => {
-    let active = true;
+    const request = requests.begin('session');
     setNodeError('');
     if (sid) {
       getActiveNode(sid).then(result => {
-        if (active) setActiveNode(result.node_id, result.is_override, result.default_node_id, sid);
-      }).catch(() => { if (active) setNodeError('节点状态读取失败'); });
+        if (request.isCurrent()) setActiveNode(result.node_id, result.is_override, result.default_node_id, sid);
+      }).catch(() => { if (request.isCurrent()) setNodeError('节点状态读取失败'); });
     }
     if (sid && adminToken) {
       getSessionProviderOverride(sid, adminToken).then(result => {
-        if (active) setSessionProviderOverride(result, sid);
-      }).catch(() => { if (active) setSessionProviderOverride(null, sid); });
+        if (request.isCurrent()) setSessionProviderOverride(result, sid);
+      }).catch(() => { if (request.isCurrent()) setSessionProviderOverride(null, sid); });
     }
-    return () => { active = false; };
-  }, [sid, adminToken, refresh, setActiveNode, setSessionProviderOverride]);
+    return () => { requests.drop('session'); };
+  }, [requests, sid, adminToken, refresh, setActiveNode, setSessionProviderOverride]);
   useEffect(() => {
-    let active = true;
+    const request = requests.begin('config');
     getAppConfig().then(result => {
-      if (active) setGlobalConfig(result.openai?.model || '', result.openai?.base_url || '');
+      if (request.isCurrent()) setGlobalConfig(result.openai?.model || '', result.openai?.base_url || '');
     }).catch(() => {});
-    return () => { active = false; };
-  }, [setGlobalConfig]);
+  }, [requests, setGlobalConfig]);
   useEffect(() => {
     if (availableNodes.length > 0 || !adminToken) return;
-    let active = true;
+    const request = requests.begin('nodes');
     getNodes(adminToken).then(nodes => {
-      if (active) setAvailableNodes(nodes.filter(node => node.type === 'ai' && !node.id.startsWith('system.')));
+      if (request.isCurrent()) setAvailableNodes(nodes.filter(node => node.type === 'ai' && !node.id.startsWith('system.')));
     }).catch(() => {});
-    return () => { active = false; };
-  }, [adminToken, availableNodes.length, setAvailableNodes]);
+    return () => { requests.drop('nodes'); };
+  }, [requests, adminToken, availableNodes.length, setAvailableNodes]);
 
   const closeConfig = () => {
     if (configModalFocus === 'title' ? !confirmDiscardTitle() : !confirmNavigation()) return;

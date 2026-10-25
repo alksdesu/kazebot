@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import yaml from 'js-yaml';
 import { getRuntimeFile, isEditConflict, type RuntimeFile } from '../api/supervisorClient';
-import { useActorRequestScope } from '../features/useActorRequestScope';
+import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Button, ErrorText, Footnote, Input } from './components';
@@ -35,63 +35,62 @@ type Snapshot = ReturnType<typeof readSnapshot>;
 
 export function ContextArchiveSettings() {
   const token = useSettingsStore(state => state.adminToken);
-  const identity = useActorRequestScope(token || '');
+  const requests = useRequestGuard();
   const [snapshot, setSnapshot] = useState<{ key: string; value: Snapshot } | null>(null);
-  const baseline = snapshot?.key === identity.key ? snapshot.value : null;
+  const baseline = snapshot?.key === requests.key ? snapshot.value : null;
   const [draft, setDraft] = useState('');
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [conflict, setConflict] = useState(false);
-  const sequence = useRef(0);
   const mutating = useRef(false);
   const dirty = Boolean(baseline && draft !== String(baseline.days));
   const confirmDiscard = useUnsavedChanges(dirty, '归档保留设置尚未保存，确定丢弃草稿并继续吗？');
   const valid = /^\d+$/.test(draft) && Number(draft) >= 1 && Number(draft) <= MAX_RETENTION;
 
+  // 保存和读取走同一路：保存一开始，还没回来的读取就作废。
   const load = useCallback(async () => {
-    if (!token || !identity.isCurrent() || mutating.current) return;
-    const request = ++sequence.current;
+    if (!token || !requests.isCurrent() || mutating.current) return;
+    const request = requests.begin('archive');
     setLoading(true); setError(''); setNotice('');
     try {
       const file = await getRuntimeFile(token);
-      if (!identity.isCurrent() || request !== sequence.current) return;
+      if (!request.isCurrent()) return;
       const next = readSnapshot(file);
-      setSnapshot({ key: identity.key, value: next });
+      setSnapshot({ key: requests.key, value: next });
       setDraft(String(next.days)); setConflict(false);
     } catch (reason) {
-      if (identity.isCurrent() && request === sequence.current) setError(errorMessage(reason));
+      if (request.isCurrent()) setError(errorMessage(reason));
     } finally {
-      if (identity.isCurrent() && request === sequence.current) setLoading(false);
+      if (request.isCurrent()) setLoading(false);
     }
-  }, [identity.key, token]);
+  }, [requests, token]);
 
   useEffect(() => {
     setSnapshot(null); setDraft(''); setError(''); setNotice(''); setConflict(false); setSaving(false);
     mutating.current = false;
     void load();
-    return () => { sequence.current++; };
   }, [load]);
 
   const save = async () => {
-    if (!token || !baseline || !valid || !dirty || loading || conflict || mutating.current || !identity.isCurrent()) return;
+    if (!token || !baseline || !valid || !dirty || loading || conflict || mutating.current || !requests.isCurrent()) return;
     mutating.current = true;
-    const request = ++sequence.current;
+    const request = requests.begin('archive');
     setSaving(true); setError(''); setNotice('');
     try {
       const days = Number(draft);
       // 只写这一个键，落在本实例那层；读回来时这个键已被别处改过就不覆盖。
       const { content, result } = await commitRuntimeKeys(token, [{ path: RETENTION_PATH, value: days }], {
         loaded: baseline.content,
-        proceed: () => identity.isCurrent() && request === sequence.current,
+        proceed: request.isCurrent,
       });
-      if (!identity.isCurrent() || request !== sequence.current) return;
+      if (!request.isCurrent()) return;
       if (!result.ok || typeof result.hash !== 'string') throw new Error('未能确认保存版本，请重新载入归档设置核对；草稿已保留。');
-      setSnapshot({ key: identity.key, value: { ...baseline, content, hash: result.hash, source: 'override', days } });
+      setSnapshot({ key: requests.key, value: { ...baseline, content, hash: result.hash, source: 'override', days } });
       setDraft(String(days)); setNotice(savedMessage('归档保留设置已保存。', '', result.warnings));
     } catch (reason) {
-      if (identity.isCurrent() && request === sequence.current) {
+      if (request.isCurrent()) {
         if (reason instanceof StaleKeysError) {
           setConflict(true); setError(CONFLICT_MESSAGE);
         } else if (isEditConflict(reason)) {
@@ -99,7 +98,7 @@ export function ContextArchiveSettings() {
         } else setError(errorMessage(reason));
       }
     } finally {
-      if (identity.isCurrent() && request === sequence.current) {
+      if (request.isCurrent()) {
         mutating.current = false; setSaving(false);
       }
     }

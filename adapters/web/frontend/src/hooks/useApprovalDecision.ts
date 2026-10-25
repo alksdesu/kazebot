@@ -1,9 +1,10 @@
 // 审批决定只从这里提交：同一条审批同时只发一次，服务端回执的状态和本次决定对得上才算生效。
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 
 import { decideApproval, type ApprovalDecision } from '../api/supervisorClient';
 import { errorMessage } from '../api/request';
-import { tokenChanged, useSettingsStore } from '../store/settingsStore';
+import { useSettingsStore } from '../store/settingsStore';
+import { useRequestGuard } from './useRequestGuard';
 
 export type { ApprovalDecision } from '../api/supervisorClient';
 
@@ -64,14 +65,9 @@ export interface ApprovalDecisionControls {
 
 export function useApprovalDecision(): ApprovalDecisionControls {
   const pending = useRef(new Set<string>());
-  const mounted = useRef(true);
+  const requests = useRequestGuard();
   const [busy, setBusy] = useState<ReadonlySet<string>>(() => new Set());
   const [messages, setMessages] = useState<Readonly<Record<string, string>>>({});
-
-  useEffect(() => {
-    mounted.current = true;
-    return () => { mounted.current = false; };
-  }, []);
 
   const remember = useCallback((approvalId: string, text: string) => {
     setMessages((current) => ((current[approvalId] || '') === text ? current : { ...current, [approvalId]: text }));
@@ -80,7 +76,7 @@ export function useApprovalDecision(): ApprovalDecisionControls {
   const decide = useCallback(async (approvalId: string, decision: ApprovalDecision, comment = '') => {
     if (pending.current.has(approvalId)) return null;
     const token = useSettingsStore.getState().adminToken;
-    const current = () => mounted.current && !tokenChanged(token);
+    const request = requests.begin();
     pending.current.add(approvalId);
     setBusy(new Set(pending.current));
     remember(approvalId, '');
@@ -92,12 +88,12 @@ export function useApprovalDecision(): ApprovalDecisionControls {
       outcome = { applied: false, status: '', failed: true, message: errorMessage(failure, '提交审批失败，请重试') };
     } finally {
       pending.current.delete(approvalId);
-      if (mounted.current) setBusy(new Set(pending.current));
+      setBusy(new Set(pending.current));
     }
-    if (!current()) return null;
+    if (!request.isCurrent()) return null;
     remember(approvalId, outcome.message);
     return outcome;
-  }, [remember]);
+  }, [requests, remember]);
 
   return {
     decide,

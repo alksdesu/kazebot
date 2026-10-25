@@ -5,6 +5,7 @@ import { useSettingsStore } from '../store/settingsStore';
 const mocks = vi.hoisted(() => ({ health: vi.fn(), providers: vi.fn(), verify: vi.fn(), confirm: vi.fn(), disconnect: vi.fn() }));
 vi.mock('../api/supervisorClient', () => ({
   MOUNT: '',
+  HEALTH_TIMEOUT_MS: 10_000,
   checkHealth: mocks.health,
   getProviders: mocks.providers,
   verifyAdminAuth: mocks.verify,

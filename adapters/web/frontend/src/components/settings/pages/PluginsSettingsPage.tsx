@@ -8,8 +8,9 @@ import {
 } from '../../../api/supervisorClient';
 import { useExclusiveAction } from '../../../hooks/useExclusiveAction';
 import { usePageNotice } from '../../../hooks/usePageNotice';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { confirmNavigation, useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
-import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { useSettingsStore } from '../../../store/settingsStore';
 import { useBrowserPlugins } from '../../../plugins/status';
 import { refreshFrontendPlugins } from '../../../plugins/runtime';
 import {
@@ -166,26 +167,28 @@ function PluginDetail({ plugin, token, choices, runtime, changed, busy, run, onU
   const [sourceReadable, setSourceReadable] = useState(false);
   const [sourceAttempt, setSourceAttempt] = useState(0);
   const [message, setMessage] = useState('');
+  // 只管详情自己的读取。保存类操作看 current（工作区那一层）：换选别的插件、详情卸掉了，已发出的保存照样要写回列表。
+  const requests = useRequestGuard(plugin.id);
   const configDirty = json({ enabled, config, selectors }) !== savedConfig;
   const sourceDirty = source !== savedSource;
   useUnsavedChanges(configDirty || sourceDirty);
 
   useEffect(() => {
     if (plugin.kind === 'package') { setSourceLoading(false); return; }
-    let cancelled = false;
+    const request = requests.begin('source');
     setSourceLoading(true);
     setSourceError('');
     void getPluginSource(token, plugin.id).then((result) => {
-      if (cancelled || !current()) return;
+      if (!request.isCurrent()) return;
       setSource(result.content);
       setSavedSource(result.content);
       setSourceHash(result.hash);
       setSourceReadable(true);
     }).catch((error: unknown) => {
-      if (!cancelled && current()) setSourceError(errorMessage(error));
-    }).finally(() => { if (!cancelled && current()) setSourceLoading(false); });
-    return () => { cancelled = true; };
-  }, [token, plugin.id, plugin.kind, sourceAttempt]);
+      if (request.isCurrent()) setSourceError(errorMessage(error));
+    }).finally(() => { if (request.isCurrent()) setSourceLoading(false); });
+    return () => { requests.drop('source'); };
+  }, [requests, token, plugin.id, plugin.kind, sourceAttempt]);
 
   let parsed: Record<string, unknown> | null = null;
   let validation = '';
@@ -376,37 +379,35 @@ function PluginsWorkspace({ token }: { token: string }) {
   const [query, setQuery] = useState('');
   const [file, setFile] = useState<File | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
-  const mounted = useRef(true);
-  const loadVersion = useRef(0);
-  const pollRequest = useRef<AbortController | null>(null);
+  const requests = useRequestGuard();
   const { busy, run: runExclusive } = useExclusiveAction();
   const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
-  const current = () => mounted.current && !tokenChanged(token) && useSettingsStore.getState().isAuthenticated;
+  // 操作开始前先作废还在等的进程状态轮询，免得它慢回来盖掉操作的结果。
   const run: Action = (action) => runExclusive(async () => {
-    pollRequest.current?.abort();
+    requests.drop('runtime');
     await action();
   });
 
   const load = async (reset = false) => {
-    const version = ++loadVersion.current;
+    const request = requests.begin('catalog');
     setLoading(true);
     try {
       const result = await getPlugins(token);
-      if (!current() || version !== loadVersion.current) return;
+      if (!request.isCurrent()) return;
       setData(result);
       setChangedPlugins([]);
       setSelectedId((id) => result.plugins.some((plugin) => plugin.id === id) ? id : result.plugins[0]?.id || '');
       if (reset) setDetailVersion((value) => value + 1);
       setLoadError('', 'catalog');
-    } catch (error) { if (current() && version === loadVersion.current) setLoadError(errorMessage(error), 'catalog'); }
-    finally { if (current() && version === loadVersion.current) setLoading(false); }
+    } catch (error) { if (request.isCurrent()) setLoadError(errorMessage(error), 'catalog'); }
+    finally { if (request.isCurrent()) setLoading(false); }
   };
 
   useEffect(() => {
-    mounted.current = true;
     void load();
+    const request = requests.begin('choices');
     void Promise.allSettled([getNodes(token), getProviders(token)]).then(([nodes, providers]) => {
-      if (!current()) return;
+      if (!request.isCurrent()) return;
       setChoices({
         nodes: nodes.status === 'fulfilled' ? nodes.value.map((node) => node.id) : [],
         channels: providers.status === 'fulfilled' ? Object.keys(providers.value.providers || {}) : [],
@@ -416,25 +417,23 @@ function PluginsWorkspace({ token }: { token: string }) {
       const failures = [nodes, providers].filter((result) => result.status === 'rejected');
       if (failures.length) setLoadError('部分作用范围候选项加载失败，可手动输入标识。', 'choices');
     });
-    return () => { mounted.current = false; loadVersion.current += 1; };
-  }, [token]);
+  }, [requests, token]);
 
   useEffect(() => {
     if (!data || busy || loading || !runtimePending(data, changedPlugins)) return;
-    const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      pollRequest.current = controller;
-      void getPlugins(token, controller.signal).then((result) => {
-        if (controller.signal.aborted || !current()) return;
+      const request = requests.begin('runtime');
+      void getPlugins(token, request.signal).then((result) => {
+        if (!request.isCurrent()) return;
         setData((previous) => previous ? { ...previous, runtime: result.runtime } : previous);
         setChangedPlugins(changedPluginIds(data.plugins, result.plugins));
         setLoadError('', 'runtime');
       }).catch((error: unknown) => {
-        if (!controller.signal.aborted && current()) setLoadError(errorMessage(error), 'runtime');
-      }).finally(() => { if (pollRequest.current === controller) pollRequest.current = null; });
+        if (request.isCurrent()) setLoadError(errorMessage(error), 'runtime');
+      });
     }, 3000);
-    return () => { window.clearTimeout(timer); controller.abort(); };
-  }, [token, data, busy, loading, changedPlugins]);
+    return () => { window.clearTimeout(timer); requests.drop('runtime'); };
+  }, [requests, token, data, busy, loading, changedPlugins]);
 
   const update = (plugin: AdminPlugin) => {
     setChangedPlugins((previous) => previous.filter((id) => id !== plugin.id));
@@ -444,52 +443,52 @@ function PluginsWorkspace({ token }: { token: string }) {
     } : previous);
   };
   const upload = () => run(async () => {
-    if (!file || !current() || !confirmNavigation()) return;
+    if (!file || !requests.isCurrent() || !confirmNavigation()) return;
     if (!/\.(py|zip)$/i.test(file.name)) { setMessage('请选择 .py 插件文件或 .zip 插件包'); return; }
     try {
       const content = /\.py$/i.test(file.name) ? await file.text() : '';
-      if (!current()) return;
-      const result = /\.zip$/i.test(file.name) ? await installPluginPackage(token, file, undefined, current) : await installPlugin(token, file.name, content);
-      if (!current()) return;
+      if (!requests.isCurrent()) return;
+      const result = /\.zip$/i.test(file.name) ? await installPluginPackage(token, file, undefined, requests.isCurrent) : await installPlugin(token, file.name, content);
+      if (!requests.isCurrent()) return;
       update(result);
       setSelectedId(result.id);
       setFile(null);
       if (fileInput.current) fileInput.current.value = '';
       setMessage('插件已导入，默认停用。检查参数和作用范围后启用并保存，运行进程会自动更新。');
-    } catch (error) { if (current()) setMessage(errorMessage(error)); }
+    } catch (error) { if (requests.isCurrent()) setMessage(errorMessage(error)); }
   });
   const remove = (plugin: AdminPlugin) => run(async () => {
     if (!confirmNavigation() || !window.confirm(`确定删除插件「${plugin.name}」及其配置吗？`)) return;
     try {
       await deletePlugin(token, plugin.id, plugin.desired_hash);
-      if (!current()) return;
+      if (!requests.isCurrent()) return;
       setData((previous) => previous ? { ...previous, plugins: previous.plugins.filter((item) => item.id !== plugin.id) } : previous);
       setChangedPlugins((previous) => previous.filter((id) => id !== plugin.id));
       setSelectedId('');
       setMessage('插件已删除，运行进程会自动卸载；正在进行的请求会使用原版本完成。');
       void refreshFrontendPlugins();
-    } catch (error) { if (current()) setMessage(errorMessage(error)); }
+    } catch (error) { if (requests.isCurrent()) setMessage(errorMessage(error)); }
   });
   const apply = () => run(async () => {
-    if (!current()) return;
+    if (!requests.isCurrent()) return;
     try {
       const result = await applyPlugins(token);
-      if (!current()) return;
+      if (!requests.isCurrent()) return;
       setData((previous) => previous ? { ...previous, generation: result.generation, runtime: result.runtime } : previous);
       setMessage(result.message || '已发出应用请求，请刷新进程状态确认结果。');
       void refreshFrontendPlugins();
-    } catch (error) { if (current()) setMessage(errorMessage(error)); }
+    } catch (error) { if (requests.isCurrent()) setMessage(errorMessage(error)); }
   });
   const refreshRuntime = () => run(async () => {
     void refreshFrontendPlugins();
     try {
       const result = await getPlugins(token);
-      if (current()) {
+      if (requests.isCurrent()) {
         setData((previous) => previous ? { ...previous, runtime: result.runtime } : previous);
         setChangedPlugins(data ? changedPluginIds(data.plugins, result.plugins) : []);
         setLoadError('', 'runtime');
       }
-    } catch (error) { if (current()) setLoadError(errorMessage(error), 'runtime'); }
+    } catch (error) { if (requests.isCurrent()) setLoadError(errorMessage(error), 'runtime'); }
   });
   const selected = data?.plugins.find((plugin) => plugin.id === selectedId);
   const keyword = query.trim().toLowerCase();
@@ -526,7 +525,7 @@ function PluginsWorkspace({ token }: { token: string }) {
           ))}
         </div>
       </Block>
-      {selected && <PluginDetail busy={locked} changed={changedPlugins.includes(selected.id)} choices={choices} current={current} key={`${selected.id}-${detailVersion}`} onDelete={remove} onUpdate={update} plugin={selected} run={run} runtime={data?.runtime || []} token={token} />}
+      {selected && <PluginDetail busy={locked} changed={changedPlugins.includes(selected.id)} choices={choices} current={requests.isCurrent} key={`${selected.id}-${detailVersion}`} onDelete={remove} onUpdate={update} plugin={selected} run={run} runtime={data?.runtime || []} token={token} />}
     </PageShell>
   );
 }

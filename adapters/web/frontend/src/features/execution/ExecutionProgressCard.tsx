@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { errorMessage } from '../../api/request';
+import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { startPolling } from '../../utils/polling';
 import { downloadFeature, featureRequest } from '../client';
-import { useRequestScope } from '../asyncState';
 import { actionClass, FeatureFeedback, primaryClass } from '../ui';
 import { readExecutionPlan, statusLabel, type ExecutionPlan } from './types';
 
@@ -12,26 +12,24 @@ export function ExecutionProgressCard({ planId, scope }: { planId: string; scope
   const [busy, setBusy] = useState(false);
   const [readError, setReadError] = useState('');
   const [retry, setRetry] = useState(0);
-  const identity = useRequestScope(`${planId}|${scope || ''}`);
-  const sequence = useRef(0);
+  const requests = useRequestGuard([planId, scope || '']);
   const mutating = useRef(false);
   useEffect(() => {
-    let alive = true;
     setPlan(null); setError(''); setReadError(''); setBusy(false); mutating.current = false;
     const refresh = async () => {
       if (mutating.current) return;
-      const request = ++sequence.current;
-      try { const value = await featureRequest<unknown>(`/v1/execution/plans/${planId}`, { scope }); if (alive && request === sequence.current) { setPlan(readExecutionPlan(value)); setReadError(''); } }
-      catch (reason) { if (alive && request === sequence.current) setReadError(errorMessage(reason)); }
+      const request = requests.begin('plan');
+      try { const value = await featureRequest<unknown>(`/v1/execution/plans/${planId}`, { scope, signal: request.signal }); if (request.isCurrent()) { setPlan(readExecutionPlan(value)); setReadError(''); } }
+      catch (reason) { if (request.isCurrent()) setReadError(errorMessage(reason)); }
     };
     const stop = startPolling(refresh, 3000, { first: refresh });
-    return () => { alive = false; sequence.current++; stop(); };
-  }, [planId, scope, retry]);
+    return () => { requests.drop('plan'); stop(); };
+  }, [requests, planId, scope, retry]);
   if (!plan || plan.id !== planId || (scope && plan.scope !== scope)) return readError ? <FeatureFeedback error={readError} retry={() => setRetry(current => current + 1)} /> : <p role="status">正在读取计划进度…</p>;
   const action = async (name: string) => {
     if (mutating.current) return;
-    mutating.current = true; sequence.current++; setBusy(true);
-    try { setError(''); const next = readExecutionPlan(await featureRequest<unknown>(`/v1/execution/plans/${planId}/${name}`, { scope, method: 'POST', body: { expected_revision: plan.revision, step_ids: [] } })); if (identity.isCurrent()) setPlan(next); } catch (reason) { if (identity.isCurrent()) setError(errorMessage(reason)); } finally { if (identity.isCurrent()) { mutating.current = false; setBusy(false); } }
+    mutating.current = true; requests.drop('plan'); setBusy(true);
+    try { setError(''); const next = readExecutionPlan(await featureRequest<unknown>(`/v1/execution/plans/${planId}/${name}`, { scope, method: 'POST', body: { expected_revision: plan.revision, step_ids: [] } })); if (requests.isCurrent()) setPlan(next); } catch (reason) { if (requests.isCurrent()) setError(errorMessage(reason)); } finally { if (requests.isCurrent()) { mutating.current = false; setBusy(false); } }
   };
   return <section className="min-w-0 space-y-3 border border-[var(--duties-border)] p-3 text-sm [overflow-wrap:anywhere]" aria-label="计划步骤进度">
     <h3 className="font-semibold">{plan.goal} · {statusLabel[plan.status]}</h3><p className="text-sm">{plan.id} · 版本 {plan.revision} · {plan.work_scope}</p>

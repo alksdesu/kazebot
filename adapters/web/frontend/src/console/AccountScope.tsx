@@ -1,8 +1,9 @@
 // 账号作用域搬迁。换号之后同一个群会各记各的，这里把旧号名下的会话与记忆整批划给新号。
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { getAccountScope, migrateAccountScope, type ScopeStatus, type ScopeStoreCount } from '../api/supervisorClient';
 import { usePageNotice } from '../hooks/usePageNotice';
+import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Button, Footnote, Input } from './components';
 import { usePlatform } from './platformContext';
@@ -32,24 +33,24 @@ export const AccountScope = () => {
   const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [busy, setBusy] = useState(false);
   const [previewTarget, setPreviewTarget] = useState('');
-  const requestVersion = useRef(0);
+  const requests = useRequestGuard(platformId);
 
   const load = async (withTarget = '', withSource?: string) => {
     if (!adminToken) return;
-    const version = ++requestVersion.current;
+    const request = requests.begin('scope');
     setPreviewTarget('');
     setBusy(true);
     try {
       const result = await getAccountScope(adminToken, platformId, withTarget, withSource);
-      if (version !== requestVersion.current) return;
+      if (!request.isCurrent()) return;
       setStatus(result);
       setPreviewTarget(withTarget);
       setLoadError('');
-    } catch (error) { if (version === requestVersion.current) setLoadError(errorMessage(error)); }
-    finally { if (version === requestVersion.current) setBusy(false); }
+    } catch (error) { if (request.isCurrent()) setLoadError(errorMessage(error)); }
+    finally { if (request.isCurrent()) setBusy(false); }
   };
 
-  useEffect(() => { void load(); return () => { requestVersion.current += 1; }; }, [adminToken, platformId]);
+  useEffect(() => { void load(); }, [requests]);
 
   const preview = async (source?: string) => {
     if (busy || !target.trim()) return;
@@ -67,9 +68,10 @@ export const AccountScope = () => {
     try {
       // 按预览认定的源账号搬：预览之后盘上多出别的账号的会话，也不会换成搬另一批。
       const result = await migrateAccountScope(adminToken, platformId, to, from);
+      if (!requests.isCurrent()) return;
       setMessage(`已搬迁 ${result.moved_memory_dirs} 份记忆、${result.sessions_changed} 个会话。备份在 ${result.backup_dir}`);
       await load();
-    } catch (error) { setMessage(errorMessage(error)); } finally { setBusy(false); }
+    } catch (error) { if (requests.isCurrent()) setMessage(errorMessage(error)); } finally { if (requests.isCurrent()) setBusy(false); }
   };
 
   const current = previewTarget && previewTarget === target.trim();

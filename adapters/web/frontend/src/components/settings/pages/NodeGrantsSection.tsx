@@ -1,7 +1,7 @@
 // 节点授权：这个节点自己能调哪些工具。
 // 勾选一律表示「能调用」。底下 allowlist 存 allow、all 存 deny，含义正相反，
 // 让复选框直接绑名单，同一个勾在两种模式下就是两个意思 —— 点一次「全选」能把工具全关掉。
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 
 import {
   getAllToolNames,
@@ -14,8 +14,9 @@ import {
 } from '../../../api/supervisorClient';
 import { commitYamlKeys } from '../../../console/yamlCommit';
 import type { YamlKeyEdit } from '../../../console/yamlRewrite';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
-import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskLabel } from '../../../utils/toolRisk';
 import { Block, Button, Check, Empty, ErrorText, Facts, Footnote, Input, Item, ItemTitle, List, SaveBar, Segmented, StatusText, Tag } from './settingsControls';
 import { savedMessage } from '../../../utils/sentence';
@@ -179,6 +180,7 @@ const NodeRow = ({ node, tools, onSaved }: {
   onSaved: () => void;
 }) => {
   const { adminToken } = useSettingsStore();
+  const requests = useRequestGuard();
   const saved = useMemo(() => readAccess(node), [node]);
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState<Mode>(saved.mode);
@@ -199,16 +201,16 @@ const NodeRow = ({ node, tools, onSaved }: {
   // 勾了不等于能用，展开时才去问，避免为折叠着的节点白跑一趟。
   useEffect(() => {
     if (!open || !adminToken) return;
-    let alive = true;
+    const request = requests.begin('effective');
     void getEffectiveTools(adminToken, node.id)
       .then((data) => {
-        if (!alive) return;
+        if (!request.isCurrent()) return;
         setEffective(Object.fromEntries(data.tools.map((item) => [item.name, item])));
         setDeadNames(data.dead_names || []);
       })
       .catch(() => undefined);
-    return () => { alive = false; };
-  }, [open, adminToken, node.id, saved]);
+    return () => { requests.drop('effective'); };
+  }, [requests, open, adminToken, node.id, saved]);
 
   const dirty = mode !== saved.mode || !sameList(allow, saved.allow) || !sameList(deny, saved.deny);
   const confirmDiscard = useUnsavedChanges(dirty, `节点「${node.id}」的授权还有未保存修改，确定离开或丢弃吗？`);
@@ -263,13 +265,13 @@ const NodeRow = ({ node, tools, onSaved }: {
         read: () => getNodeRaw(adminToken, node.id),
         write: (content, hash) => updateNodeRaw(adminToken, node.id, content, hash),
         edits,
-        proceed: () => !tokenChanged(adminToken),
+        proceed: requests.isCurrent,
       });
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(savedMessage('已保存，下一个任务即生效。', note, result.warnings));
       onSaved();
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error, '保存失败'));
     } finally {
       setBusy(false);
@@ -379,28 +381,28 @@ export const NodeGrantsSection = () => {
   const [nodes, setNodes] = useState<AdminNode[]>([]);
   const [tools, setTools] = useState<string[]>([]);
   const [message, setMessage] = useState('');
-  // 每行保存完都会重读；两行接连保存时先发的那次慢回来，会把后存的那行打回保存前的样子。
-  const generation = useRef(0);
+  const requests = useRequestGuard();
 
   const load = async () => {
     if (!adminToken || !isAuthenticated) return;
-    const version = ++generation.current;
+    // 每行保存完都会重读；两行接连保存时先发的那次慢回来，会把后存的那行打回保存前的样子。
+    const request = requests.begin('nodes');
     try {
       const [nodeList, toolNames] = await Promise.all([
         getNodes(adminToken),
         getAllToolNames(adminToken),
       ]);
-      if (version !== generation.current) return;
+      if (!request.isCurrent()) return;
       // 模板和示例文件派发不到，摆在授权页里只会让人配一份永远不生效的权限。
       setNodes(nodeList.filter((node) => node.active !== false));
       setTools(toolNames);
       setMessage('');
     } catch (error) {
-      if (version === generation.current) setMessage(errorMessage(error, '读取节点失败'));
+      if (request.isCurrent()) setMessage(errorMessage(error, '读取节点失败'));
     }
   };
 
-  useEffect(() => { void load(); return () => { generation.current += 1; }; }, [adminToken, isAuthenticated]);
+  useEffect(() => { void load(); }, [requests]);
 
   return (
     <Block frame="boxed"

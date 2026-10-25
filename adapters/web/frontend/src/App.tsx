@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 
-import { checkHealth, getActiveNode, MOUNT, resetConversation } from './api/supervisorClient';
+import { checkHealth, getActiveNode, HEALTH_TIMEOUT_MS, MOUNT, resetConversation } from './api/supervisorClient';
 import { LoginPage } from './components/auth/LoginPage';
 import { Icon, Modal } from './components/common';
 import { PageBoundary } from './components/common/PageBoundary';
 import { AppLayout } from './components/layout';
 import { useChat } from './hooks/useChat';
+import { useRequestGuard } from './hooks/useRequestGuard';
 import { usePlatformRegistry } from './platforms/usePlatformRegistry';
+import { startPolling } from './utils/polling';
 import { selectVisibleHistory, useChatStore } from './store/chatStore';
 import { selectToolsForMessages } from './store/eventSelectors';
 import { useClientPrefsStore } from './store/clientPrefsStore';
@@ -63,21 +65,15 @@ const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
     return () => useChatStore.getState().resetState();
   }, []);
   const setConnected = useSettingsStore(state => state.setConnected);
+  const health = useRequestGuard('', { anonymous: true });
   useEffect(() => {
-    let active = true; let checking = false;
-    let request: AbortController | null = null;
     const check = async () => {
-      if (checking) return;
-      checking = true;
-      const controller = new AbortController(); request = controller;
-      const timeout = setTimeout(() => controller.abort(), 10000);
-      try { await checkHealth(controller.signal); if (active) setConnected(true); }
-      catch { if (active) setConnected(false); }
-      finally { clearTimeout(timeout); checking = false; if (request === controller) request = null; }
+      const request = health.begin('health');
+      try { await checkHealth(request.signal, HEALTH_TIMEOUT_MS); if (request.isCurrent()) setConnected(true); }
+      catch { if (request.isCurrent()) setConnected(false); }
     };
-    void check(); const timer = setInterval(() => void check(), 10000);
-    return () => { active = false; clearInterval(timer); request?.abort(); };
-  }, [setConnected]);
+    return startPolling(check, 10000, { first: check });
+  }, [health, setConnected]);
 
   const handleSend = async (text: string, attachments?: Attachment[]) => {
     const original = useChatStore.getState();

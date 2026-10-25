@@ -1,6 +1,7 @@
 // 模型参数：各家 provider 的可调项。清单由 provider 类自己声明、后端公布，这一页只渲染和写回。
 // 全局写 runtime.yaml 的 providers.<类型>.options，节点写节点文件的 provider_options，节点优先。
 import { useEffect, useMemo, useState } from 'react';
+import { useRequestGuard } from '../hooks/useRequestGuard';
 import { confirmNavigation, useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
 import {
@@ -73,6 +74,7 @@ const ModelsPageEditor = () => {
   const [note, setNote] = useState('');
   // 清单和原文是两条独立的加载线，共用一个提示位时后到的成功会把先到的失败抹掉。
   const [catalogError, setCatalogError] = useState('');
+  const requests = useRequestGuard();
 
   useEffect(() => {
     if (!token) return;
@@ -96,25 +98,25 @@ const ModelsPageEditor = () => {
   // 换作用域要重新取那一份原文，草稿一并丢掉——它属于上一个文件。
   useEffect(() => {
     if (!token) return;
-    let cancelled = false;
+    const request = requests.begin('raw');
     setEdits({});
     setRaw(''); setLoading(true);
     void (async () => {
       try {
         const file = await readScope(token, scope);
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         setRaw(file.content);
         setNote('');
       } catch (error) {
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         setRaw('');
         setNote(errorMessage(error));
       } finally {
-        if (!cancelled) setLoading(false);
+        if (request.isCurrent()) setLoading(false);
       }
     })();
-    return () => { cancelled = true; };
-  }, [token, scope]);
+    return () => { requests.drop('raw'); };
+  }, [requests, token, scope]);
 
   const providerNames = useMemo(() => Object.keys(catalog).sort(), [catalog]);
   const activeProvider = providers?.active_provider || 'openai';

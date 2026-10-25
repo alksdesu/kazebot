@@ -4,7 +4,7 @@
 // combines session identity, connection status, node switching, and provider
 // override editing in the 60% upper section of the right panel. Purpose: Header
 // text clicks and the default right panel all operate on the current session.
-import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 
 import {
   activeProviderConfig,
@@ -19,6 +19,7 @@ import {
   updateSessionProviderOverride,
 } from '../../api/supervisorClient';
 import { useChatStore } from '../../store/chatStore';
+import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
@@ -158,9 +159,9 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
   } = useSettingsStore();
   const activeNodeId = activeNodeSessionId === sid ? cachedNodeId : '';
   const sessionProviderOverride = sessionProviderOverrideSessionId === sid ? cachedOverride : null;
-  const scopeKey = `${sid}\0${adminToken || ''}`;
-  const currentScope = useRef(scopeKey);
-  currentScope.current = scopeKey;
+  // 节点清单和渠道候选跟着登录走；会话覆盖、切节点跟着会话走，换会话就作废。
+  const requests = useRequestGuard();
+  const session = useRequestGuard(sid);
   const setSettingsTab = useViewStore(state => state.setSettingsTab);
 
   const [copyMsg, setCopyMsg] = useState('');
@@ -198,26 +199,27 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
   const hasSessionOverride = Boolean(sessionProviderOverride && Object.keys(sessionProviderOverride).length > 0);
 
   useEffect(() => {
+    const request = requests.begin('config');
     getAppConfig()
-      .then(r => setGlobalConfig(r.openai?.model || '', r.openai?.base_url || ''))
+      .then(r => { if (request.isCurrent()) setGlobalConfig(r.openai?.model || '', r.openai?.base_url || ''); })
       .catch(() => {});
-  }, [setGlobalConfig]);
+  }, [requests, setGlobalConfig]);
 
   // 节点清单和全局渠道都不随会话变，跟着 sid 重拉只会让面板白闪一次。
   useEffect(() => {
     if (!adminToken) return;
     // 读当前值而不是列进依赖：列进去就会被本 effect 自己的 setAvailableNodes 触发重跑。
     if (useSettingsStore.getState().availableNodes.length === 0) {
+      const request = requests.begin('nodes');
       getNodes(adminToken)
-        .then(nodes => { if (useSettingsStore.getState().adminToken === adminToken) setAvailableNodes(nodes.filter((n: NodeDef) => n.type === 'ai' && !n.id.startsWith('system.'))); })
+        .then(nodes => { if (request.isCurrent()) setAvailableNodes(nodes.filter((n: NodeDef) => n.type === 'ai' && !n.id.startsWith('system.'))); })
         .catch(() => {});
     }
-  }, [adminToken, setAvailableNodes]);
+  }, [requests, adminToken, setAvailableNodes]);
 
   useEffect(() => {
-    // 换会话先清掉上一个会话的覆盖再拉新的。cancelled 挡住乱序响应：慢的那个回来时
-    // 面板可能已经指向别的会话了。
-    let cancelled = false;
+    // 换会话先清掉上一个会话的覆盖再拉新的。上一个会话慢回来的响应由按会话换代的守卫挡掉。
+    const request = session.begin('override');
     setSessionProviderOverride(null, sid);
     setNodeSaving(false); setModelSaving(false); setModelLoaded(false); setModelMsg(sid ? '' : '没有活动会话'); setNodeMsg('');
     setEdit({ provider: '', model: '', base_url: '', api_key: '' });
@@ -226,13 +228,13 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
 
     if (sid) {
       getActiveNode(sid)
-        .then(r => { if (!cancelled) setActiveNode(r.node_id, r.is_override, r.default_node_id, sid); })
+        .then(r => { if (request.isCurrent()) setActiveNode(r.node_id, r.is_override, r.default_node_id, sid); })
         .catch(() => {});
     }
     if (sid && adminToken) {
       getSessionProviderOverride(sid, adminToken)
         .then(override => {
-          if (cancelled) return;
+          if (!request.isCurrent()) return;
           setSessionProviderOverride(override, sid);
           setModelLoaded(true);
           setEdit({
@@ -250,10 +252,9 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
           // 只认会话自己那把钥匙：全局配了 key 不代表这个会话有专属覆盖。
           setApiKeyPresent(Boolean(override.api_key));
         })
-        .catch(error => { if (!cancelled) setModelMsg(errorMessage(error, '会话模型读取失败，请重新打开面板重试')); });
+        .catch(error => { if (request.isCurrent()) setModelMsg(errorMessage(error, '会话模型读取失败，请重新打开面板重试')); });
     }
-    return () => { cancelled = true; };
-  }, [adminToken, setActiveNode, setSessionProviderOverride, sid]);
+  }, [session, adminToken, setActiveNode, setSessionProviderOverride, sid]);
 
   // 候选只来自渠道配置：会话覆盖原样送上游，节点那套 $ENV{} 展开在这条路上不生效。
   useEffect(() => {
@@ -263,9 +264,10 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
       setInheritedProvider('');
       return;
     }
+    const request = requests.begin('providers');
     getProviders(adminToken)
       .then(providers => {
-        if (useSettingsStore.getState().adminToken !== adminToken) return;
+        if (!request.isCurrent()) return;
         setModelChoices(literalModelsOnly(mergeModelChoices(modelsFromProviders(providers))));
         // 已配渠道排前面：它们带着地址密钥，裸线格式还得自己填。
         const choices = channelChoices(providers);
@@ -273,8 +275,8 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
         setInheritedProvider(providers.active_provider || '');
         setModelConfig(activeProviderConfig(providers));
       })
-      .catch(() => { if (useSettingsStore.getState().adminToken === adminToken) { setModelChoices([]); setProviderChoices([]); setInheritedProvider(''); } });
-  }, [adminToken, setModelConfig]);
+      .catch(() => { if (request.isCurrent()) { setModelChoices([]); setProviderChoices([]); setInheritedProvider(''); } });
+  }, [requests, adminToken, setModelConfig]);
 
   const handleCopySessionId = async () => {
     if (!sid) return;
@@ -299,7 +301,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
     setNodeSaving(true);
     try {
       const result = await switchNode(sid, targetId);
-      if (currentScope.current !== scopeKey) return;
+      if (!session.isCurrent()) return;
       if (result?.ok) {
         setActiveNode(result.target_node_id, result.is_override, result.default_node_id || '', sid);
         setNodeMsg('已保存');
@@ -307,10 +309,10 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
         setNodeMsg('切换失败');
       }
     } catch (err) {
-      if (currentScope.current !== scopeKey) return;
+      if (!session.isCurrent()) return;
       setNodeMsg(errorMessage(err, '切换失败'));
     } finally {
-      if (currentScope.current === scopeKey) setNodeSaving(false);
+      if (session.isCurrent()) setNodeSaving(false);
     }
   };
 
@@ -331,7 +333,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
       if (edit.api_key.trim()) next.api_key = edit.api_key.trim();
 
       const saved = await updateSessionProviderOverride(sid, adminToken, next);
-      if (currentScope.current !== scopeKey) return;
+      if (!session.isCurrent()) return;
       setSessionProviderOverride(saved, sid);
       setEdit({
         provider: stringField(saved, 'provider') || stringField(saved, 'provider_type'),
@@ -348,10 +350,10 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
       setApiKeyPresent(Boolean(saved.api_key));
       setModelMsg('已保存');
     } catch (err) {
-      if (currentScope.current !== scopeKey) return;
+      if (!session.isCurrent()) return;
       setModelMsg(errorMessage(err, '保存失败'));
     } finally {
-      if (currentScope.current === scopeKey) setModelSaving(false);
+      if (session.isCurrent()) setModelSaving(false);
     }
   };
 
@@ -364,17 +366,17 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
     setModelSaving(true);
     try {
       const cleared = await clearSessionProviderOverride(sid, adminToken);
-      if (currentScope.current !== scopeKey) return;
+      if (!session.isCurrent()) return;
       setSessionProviderOverride(cleared, sid);
       setEdit({ provider: '', model: '', base_url: '', api_key: '' });
     setSavedEdit({ provider: '', model: '', base_url: '', api_key: '' });
       setApiKeyPresent(false);
       setModelMsg('已清除');
     } catch (err) {
-      if (currentScope.current !== scopeKey) return;
+      if (!session.isCurrent()) return;
       setModelMsg(errorMessage(err, '清除失败'));
     } finally {
-      if (currentScope.current === scopeKey) setModelSaving(false);
+      if (session.isCurrent()) setModelSaving(false);
     }
   };
 

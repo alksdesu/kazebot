@@ -3,6 +3,7 @@
 import { useEffect, useSyncExternalStore } from 'react';
 
 import { getPlatforms, type PlatformSummary } from '../api/supervisorClient';
+import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useSettingsStore } from '../store/settingsStore';
 import {
   adoptPlatforms,
@@ -35,20 +36,20 @@ export function toDescriptor(row: PlatformSummary): PlatformDescriptor | null {
 
 export function usePlatformRegistry(): void {
   const token = useSettingsStore((state) => state.adminToken);
+  const requests = useRequestGuard();
 
   useEffect(() => {
     if (!token) return;
-    let alive = true;
+    const request = requests.begin('platforms');
     void getPlatforms(token)
       .then(({ platforms, current }) => {
-        if (!alive) return;
+        if (!request.isCurrent()) return;
         adoptPlatforms(platforms.map(toDescriptor).filter((row): row is PlatformDescriptor => row !== null), current);
       })
       .catch(() => {
-        if (alive) settlePlatforms();
+        if (request.isCurrent()) settlePlatforms();
       });
-    return () => { alive = false; };
-  }, [token]);
+  }, [requests, token]);
 }
 
 /** 平台清单和它到没到。清单换了才重画。 */

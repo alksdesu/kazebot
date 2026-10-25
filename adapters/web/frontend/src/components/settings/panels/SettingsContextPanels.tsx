@@ -1,10 +1,11 @@
 // 设置页右栏：跟着当前选中的节点、工具、技能、MCP Client 和定时任务显示详情，并就地编辑。
-import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useMemo, useState, type ReactNode } from 'react';
 
 import { errorMessage } from '../../../api/request';
 import { channelChoices, getMcpClientsRaw, getNodeRaw, getNodes, getProviders, getSchedulesRaw, getSkillRaw, getToolRaw, isEditConflict, listUpstreamModels, reloadTools, updateMcpClientsRaw, updateNodeRaw, updateSchedulesRaw, updateSkillRaw, updateToolRaw, type AdminSkill, type ChannelChoice, type OverlaySource, type ToolOrigin } from '../../../api/supervisorClient';
 import { commitYamlKeys } from '../../../console/yamlCommit';
 import { unsavableReason, useRawForm, type RawFormCodec } from '../../../hooks/useRawForm';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
@@ -154,6 +155,7 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
   const [nodeMessage, setNodeMessage] = useState('');
   const confirmDiscard = useUnsavedChanges(nodeYamlEditable && source.dirty);
   const reload = () => { if (confirmDiscard()) onReload(); };
+  const requests = useRequestGuard();
   const [modelChoices, setModelChoices] = useState<string[]>([]);
   const [channels, setChannels] = useState<ChannelChoice[]>([]);
   const [wires, setWires] = useState<string[]>([]);
@@ -166,8 +168,8 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [modelFetchNote, setModelFetchNote] = useState('');
-  const selectedProvider = useRef(nodeConfigForm.provider);
-  selectedProvider.current = nodeConfigForm.provider;
+  // 拉回来时选的渠道已经换了，这份候选就不认。
+  const modelFetch = useRequestGuard(nodeConfigForm.provider);
   const modelListId = useId();
   // 刚从上游拉回来的排前面：那才是这个渠道真有的。
   const modelOptions = useMemo(
@@ -178,62 +180,63 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
   const fetchModels = async () => {
     const provider = nodeConfigForm.provider.trim();
     if (!adminToken || !provider || fetchingModels) return;
+    const request = modelFetch.begin('models');
     setFetchingModels(true);
     setModelFetchNote('');
     try {
       // 地址和密钥后端按渠道名自己取，这里不该也没必要碰它们。
       const models = await listUpstreamModels(adminToken, provider, {});
-      if (selectedProvider.current !== provider) return;
+      if (!request.isCurrent()) return;
       setFetchedModels(models);
       setModelFetchNote(`拉到 ${models.length} 个模型。`);
     } catch (error) {
-      if (selectedProvider.current === provider) setModelFetchNote(errorMessage(error, '拉取模型失败'));
+      if (request.isCurrent()) setModelFetchNote(errorMessage(error, '拉取模型失败'));
     } finally {
       setFetchingModels(false);
     }
   };
 
   useEffect(() => {
-    let cancelled = false;
-    if (!node) return () => { cancelled = true; };
+    if (!node) return undefined;
     if (!adminToken) {
       setNodeMessage('缺少管理员令牌，无法加载节点配置。');
-      return () => { cancelled = true; };
+      return undefined;
     }
+    const request = requests.begin('node');
     setNodeYamlLoading(true);
     getNodeRaw(adminToken, node.id)
       .then(({ content, hash }) => {
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         resetSource(content);
         setNodeBase(hash);
         setNodeYamlEditable(true);
       })
       .catch((error) => {
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         setNodeMessage(errorMessage(error, '节点配置加载失败，请重试'));
         setNodeYamlEditable(false);
       })
       .finally(() => {
-        if (!cancelled) setNodeYamlLoading(false);
+        if (request.isCurrent()) setNodeYamlLoading(false);
       });
-    return () => { cancelled = true; };
-  }, [adminToken, node?.id, resetSource]);
+    return () => { requests.drop('node'); };
+  }, [requests, adminToken, node?.id, resetSource]);
 
   // 候选与选中的节点无关，只跟令牌走。写的是节点文件的 model，所以别的节点那些 $ENV{...}
   // 也是有效候选 —— 节点路径会经 resolve_env_ref 展开。
   useEffect(() => {
-    let cancelled = false;
     if (!adminToken) {
       setModelChoices([]);
       setChannels([]);
       setWires([]);
-      return () => { cancelled = true; };
+      return undefined;
     }
+    const request = requests.begin('choices');
     Promise.all([
       getProviders(adminToken).catch(() => undefined),
       getNodes(adminToken).catch(() => undefined),
     ]).then(([providers, nodes]) => {
-      if (cancelled) return;
+      if (!request.isCurrent()) return;
       setModelChoices(mergeModelChoices(
         modelsFromProviders(providers),
         modelsFromNodes(nodes, node?.id || ''),
@@ -242,8 +245,8 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
       setChannels(choices.channels);
       setWires(choices.wires);
     });
-    return () => { cancelled = true; };
-  }, [adminToken, node?.id]);
+    return () => { requests.drop('choices'); };
+  }, [requests, adminToken, node?.id]);
 
   const saveNode = async () => {
     if (!adminToken || !node || !nodeYamlEditable || nodeYamlSaving) return;
@@ -424,20 +427,21 @@ const ToolsEditor = ({ onReload }: EditorProps) => {
   const [toolMessage, setToolMessage] = useState('');
   const confirmToolDiscard = useUnsavedChanges(toolScriptLoaded && toolScript !== toolBaseline);
   const reload = () => { if (confirmToolDiscard()) onReload(); };
+  const requests = useRequestGuard();
 
   useEffect(() => {
-    let cancelled = false;
     setToolScript('');
     setToolBase(null);
     setToolScriptLoaded(false);
     setToolMessage('');
-    if (!tool) return () => { cancelled = true; };
+    if (!tool) return undefined;
     // 内置和插件工具没有源码文件，请求只会换回一句 409。
-    if (!tool.editable) return () => { cancelled = true; };
+    if (!tool.editable) return undefined;
     if (!adminToken) {
       setToolMessage('缺少管理员令牌，无法加载工具脚本。');
-      return () => { cancelled = true; };
+      return undefined;
     }
+    const request = requests.begin('script');
     setToolScriptLoading(true);
     // [2026-06-02] Load the raw Python script for the selected tool.
     // Why: the Tools right panel must support direct edits while keeping the current
@@ -446,22 +450,22 @@ const ToolsEditor = ({ onReload }: EditorProps) => {
     // users can update one tool implementation without leaving the context panel.
     getToolRaw(adminToken, tool.name)
       .then(({ content: raw, hash }) => {
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         setToolScript(raw);
         setToolBaseline(raw);
         setToolBase(hash);
         setToolScriptLoaded(true);
       })
       .catch((error) => {
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         setToolMessage(errorMessage(error, '加载工具脚本失败'));
         setToolScriptLoaded(false);
       })
       .finally(() => {
-        if (!cancelled) setToolScriptLoading(false);
+        if (request.isCurrent()) setToolScriptLoading(false);
       });
-    return () => { cancelled = true; };
-  }, [adminToken, tool?.name]);
+    return () => { requests.drop('script'); };
+  }, [requests, adminToken, tool?.name]);
 
   const saveToolScript = async () => {
     if (!adminToken || !tool || !toolScriptLoaded || toolScriptSaving || toolReloading) return;
@@ -593,22 +597,23 @@ const SkillsEditor = ({ onReload }: EditorProps) => {
   const [message, setMessage] = useState('');
   const confirmDiscard = useUnsavedChanges(loaded && source.dirty);
   const reload = () => { if (confirmDiscard()) onReload(); };
+  const requests = useRequestGuard();
 
   useEffect(() => {
-    let cancelled = false;
-    if (!adminToken || !skill) return () => { cancelled = true; };
+    if (!adminToken || !skill) return undefined;
+    const request = requests.begin('skill');
     setLoading(true);
     getSkillRaw(adminToken, skill.name)
       .then(({ content, hash }) => {
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         resetSource(content);
         setSkillBase(hash);
         setLoaded(true);
       })
-      .catch((error) => { if (!cancelled) { setLoaded(false); setMessage(errorMessage(error, '加载技能失败')); } })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
-  }, [adminToken, skill?.name, resetSource]);
+      .catch((error) => { if (request.isCurrent()) { setLoaded(false); setMessage(errorMessage(error, '加载技能失败')); } })
+      .finally(() => { if (request.isCurrent()) setLoading(false); });
+    return () => { requests.drop('skill'); };
+  }, [requests, adminToken, skill?.name, resetSource]);
 
   const save = async () => {
     if (!adminToken || !skill || !loaded || saving) return;
@@ -740,18 +745,19 @@ const McpEditor = ({ onReload }: EditorProps) => {
   const [message, setMessage] = useState('');
   const confirmDiscard = useUnsavedChanges(Boolean(form) && JSON.stringify(form) !== JSON.stringify(opened));
   const reload = () => { if (confirmDiscard()) onReload(); };
+  const requests = useRequestGuard();
 
   useEffect(() => {
-    let cancelled = false;
-    if (!client) return () => { cancelled = true; };
+    if (!client) return undefined;
     if (!adminToken) {
       setMessage('缺少管理员令牌，无法加载 MCP Client。');
-      return () => { cancelled = true; };
+      return undefined;
     }
+    const request = requests.begin('client');
     setLoading(true);
     getMcpClientsRaw(adminToken)
       .then(({ content: raw }) => {
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         const selected = parseMcpClients(raw).find((item) => item.id === client.id) || null;
         if (!selected) {
           setMessage('未在 MCP YAML 中找到此 Client。');
@@ -762,14 +768,14 @@ const McpEditor = ({ onReload }: EditorProps) => {
         setForm(shown);
       })
       .catch((error) => {
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         setMessage(errorMessage(error, '加载 MCP Client 失败'));
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (request.isCurrent()) setLoading(false);
       });
-    return () => { cancelled = true; };
-  }, [adminToken, client?.id]);
+    return () => { requests.drop('client'); };
+  }, [requests, adminToken, client?.id]);
 
   const save = async () => {
     if (!adminToken || !client || !form || !opened || saving) return;
@@ -883,32 +889,33 @@ const AutomationEditor = ({ onReload }: EditorProps) => {
   const [message, setMessage] = useState('');
   const confirmDiscard = useUnsavedChanges(Boolean(form) && JSON.stringify(form) !== JSON.stringify(opened));
   const reload = () => { if (confirmDiscard()) onReload(); };
+  const requests = useRequestGuard();
 
   useEffect(() => {
-    let cancelled = false;
-    if (!selectedScheduleId) return () => { cancelled = true; };
+    if (!selectedScheduleId) return undefined;
     if (!adminToken) {
       setMessage('缺少管理员令牌，无法加载定时任务。');
-      return () => { cancelled = true; };
+      return undefined;
     }
+    const request = requests.begin('schedule');
     setLoading(true);
     getSchedulesRaw(adminToken)
       .then(({ content: raw }) => {
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         const selected = parseSchedules(raw).find((item) => item.id === selectedScheduleId) || null;
         setOpened(selected);
         setForm(selected);
         if (!selected) setMessage('未在 schedules.yaml 中找到此定时任务。');
       })
       .catch((error) => {
-        if (cancelled) return;
+        if (!request.isCurrent()) return;
         setMessage(errorMessage(error, '加载定时任务失败'));
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (request.isCurrent()) setLoading(false);
       });
-    return () => { cancelled = true; };
-  }, [adminToken, selectedScheduleId]);
+    return () => { requests.drop('schedule'); };
+  }, [requests, adminToken, selectedScheduleId]);
 
   const save = async () => {
     if (!adminToken || !selectedScheduleId || !form || !opened || saving) return;

@@ -2,12 +2,13 @@ import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
 import { useExclusiveAction } from '../../../hooks/useExclusiveAction';
 // Tools and permissions: which tools exist, which node may call them, and what needs approval.
 // The three answers used to live on three unrelated pages, so they are stacked here instead.
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { createTool, deleteTool, getTools, reloadTools, type AdminTool } from '../../../api/supervisorClient';
 import { usePageNotice } from '../../../hooks/usePageNotice';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
-import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { useSettingsStore } from '../../../store/settingsStore';
 import { removalFor, toolOriginLabel } from '../../../utils/overlaySource';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
 import { AutoApproveSection } from './AutoApproveSection';
@@ -59,27 +60,27 @@ const ToolInventorySection = () => {
   const { busy, run } = useExclusiveAction();
   const [query, setQuery] = useState('');
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all');
-  const generation = useRef(0);
+  const requests = useRequestGuard();
 
   const load = async (): Promise<AdminTool[] | undefined> => {
     if (!adminToken || !isAuthenticated) return undefined;
-    const version = ++generation.current;
+    const request = requests.begin('tools');
     setLoading(true);
     try {
       // 授权页那份名单和这里同源，拉一次就够。
       const items = await getTools(adminToken);
-      if (version !== generation.current) return undefined;
+      if (!request.isCurrent()) return undefined;
       setTools(items);
       setAllToolNames(items.map((item) => item.name));
       if (selectedTool && !items.some((item) => item.name === selectedTool.name)) setSelectedTool(null);
       setLoadError('');
       return items;
     } catch (error) {
-      if (version !== generation.current) return undefined;
+      if (!request.isCurrent()) return undefined;
       setLoadError(errorMessage(error, '加载工具失败'));
       return undefined;
     } finally {
-      if (version === generation.current) setLoading(false);
+      if (request.isCurrent()) setLoading(false);
     }
   };
 
@@ -89,7 +90,7 @@ const ToolInventorySection = () => {
     await load();
   };
 
-  useEffect(() => { void refresh(); return () => { generation.current += 1; }; }, [adminToken, isAuthenticated]);
+  useEffect(() => { void refresh(); }, [requests]);
 
   useEffect(() => {
     // [2026-06-02] Let the right-panel editor refresh parsed tool metadata after save.
@@ -99,7 +100,7 @@ const ToolInventorySection = () => {
     const handler = () => { void load(); };
     window.addEventListener('settings:tools-updated', handler);
     return () => window.removeEventListener('settings:tools-updated', handler);
-  }, [adminToken, isAuthenticated, selectedTool?.name]);
+  }, [requests, selectedTool?.name]);
 
   const create = () => run(async () => {
     if (!adminToken) return;
@@ -108,14 +109,14 @@ const ToolInventorySection = () => {
     if (!confirmNavigation()) return;
     try {
       const result = await createTool(adminToken, { id: name, content: defaultToolScript(name) });
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setNewName('');
       setMessage(savedMessage('工具已创建，请在右栏编辑 Python 脚本。', '', result.warnings));
       await load();
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setSelectedTool({ name, source: 'external', editable: true, description: '通过设置页面创建的工具。', input_schema: { type: 'object', properties: {} }, timeout_sec: 30, has_spec: true, origin: 'custom' });
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error, '创建工具失败'));
     }
   });
@@ -128,16 +129,16 @@ const ToolInventorySection = () => {
     const toolName = selectedTool.name;
     try {
       await deleteTool(adminToken, toolName);
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       // 先清掉选中：恢复默认后名字没变，右栏要看到选中换过一次才会重读成仓库那份脚本。
       setSelectedTool(null);
       setMessage(`${removal.done}，重载工具后生效`);
       const items = await load();
-      if (tokenChanged(adminToken) || !removal.restores) return;
+      if (!requests.isCurrent() || !removal.restores) return;
       const restored = items?.find((item) => item.name === toolName);
       if (restored) setSelectedTool(restored);
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error, `${removal.label}失败`));
     }
   });
@@ -146,11 +147,11 @@ const ToolInventorySection = () => {
     if (!confirmNavigation()) return;
     try {
       const result = await reloadTools(adminToken);
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(`工具已重载，序号 ${result.seq ?? '未知'}`);
       await load();
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error, '重载工具失败'));
     }
   });

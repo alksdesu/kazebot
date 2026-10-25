@@ -7,6 +7,7 @@ import { submitApprovalDecision } from '../hooks/useApprovalDecision';
 
 import { connectGlobalWS, disconnectGlobalWS } from '../api';
 import { errorMessage, isNotFound } from '../api/request';
+import { RequestScope, type RequestTicket } from '../api/requestGuard';
 import {
   cancelActiveTasks,
   deleteSession,
@@ -162,13 +163,14 @@ const LS_KEY_TITLES = scopedKey('clonoth_conversation_titles');
 const LS_KEY_AUTO_APPROVED = scopedKey('clonoth_auto_approved_ids');
 
 let startupLoaded = false;
-let startupGeneration = 0;
+// Session-list reads and deletes belong to one startup; resetState voids whatever is still in flight.
+const startupRequests = new RequestScope();
 let sessionOffset = 0;
 const autoApprovedApprovalIds = loadAutoApproved();
 // Outside zustand on purpose: they change with every page or frame and nothing renders them.
 const historyCaches = new Map<string, HistoryCache>();
-const historyRequests = new Map<string, { generation: number; controller: AbortController }>();
-let historyGeneration = 0;
+// One lane per view: a newer request for the same view aborts the older one; only the newest response may land.
+const historyRequests = new RequestScope();
 // Bumped per view whenever a live event changes its messages / its task lifecycle.
 const realtimeRevisions = new Map<string, number>();
 const lifecycleRevisions = new Map<string, number>();
@@ -223,8 +225,7 @@ function saveAutoApproved(ids: Set<string>) {
 }
 
 function forgetHistory(viewKey: string) {
-  historyRequests.get(viewKey)?.controller.abort();
-  historyRequests.delete(viewKey);
+  historyRequests.drop(viewKey);
   historyCaches.delete(viewKey);
   realtimeRevisions.delete(viewKey);
   lifecycleRevisions.delete(viewKey);
@@ -234,8 +235,7 @@ function forgetHistory(viewKey: string) {
 // Only a full reset closes the stream; switching conversations or finishing a task keeps it open.
 function stopRealtimeAndHistory() {
   disconnectGlobalWS();
-  for (const request of historyRequests.values()) request.controller.abort();
-  historyRequests.clear();
+  historyRequests.reset();
   historyCaches.clear();
   realtimeRevisions.clear();
   lifecycleRevisions.clear();
@@ -1189,21 +1189,6 @@ function withoutHistoryView(views: Readonly<Record<string, HistoryView>>, viewKe
   return next;
 }
 
-// A newer request for the same view aborts the older one; only the newest response may land.
-function beginHistoryRequest(viewKey: string): { generation: number; signal: AbortSignal } {
-  historyRequests.get(viewKey)?.controller.abort();
-  const controller = new AbortController();
-  historyGeneration += 1;
-  historyRequests.set(viewKey, { generation: historyGeneration, controller });
-  return { generation: historyGeneration, signal: controller.signal };
-}
-
-function finishHistoryRequest(viewKey: string, generation: number): boolean {
-  if (historyRequests.get(viewKey)?.generation !== generation) return false;
-  historyRequests.delete(viewKey);
-  return true;
-}
-
 function applyHistoryPage<S extends ChatState>(
   state: S,
   viewKey: string,
@@ -1284,19 +1269,19 @@ function missedApprovals(
 async function syncConversation(conversationId: string, set: StoreSetter, get: StoreGetter, settling = false): Promise<void> {
   const sessionId = get().conversations.find((item) => item.id === conversationId)?.sessionId;
   if (!sessionId) return;
-  const { generation, signal } = beginHistoryRequest(conversationId);
+  const request = historyRequests.begin(conversationId);
   const revision = realtimeRevisions.get(conversationId) || 0;
   const lifecycleRevision = lifecycleRevisions.get(conversationId) || 0;
   const token = useSettingsStore.getState().adminToken;
   patchHistoryView(set, conversationId, { loading: true, error: '', loadingOlder: false, olderError: '' });
 
   const [history, children, running, admin] = await Promise.allSettled([
-    getSessionHistory(sessionId, { limit: HISTORY_PAGE_SIZE, signal }),
+    getSessionHistory(sessionId, { limit: HISTORY_PAGE_SIZE, signal: request.signal }),
     getSessionChildren(sessionId),
     getSessionRunningTasks(sessionId),
     token ? getAdminState(token) : Promise.resolve(null),
   ]);
-  if (!finishHistoryRequest(conversationId, generation)) return;
+  if (!request.isCurrent()) return;
 
   // A session the server no longer knows runs nothing; any other failure leaves the flag as it is.
   const runningTasks = running.status === 'fulfilled' ? running.value : isNotFound(running.reason) ? [] : null;
@@ -1354,12 +1339,12 @@ async function syncConversation(conversationId: string, set: StoreSetter, get: S
 
 async function loadChildHistory(childSessionId: string, set: StoreSetter, get: StoreGetter): Promise<void> {
   const viewKey = getChildConversationId(childSessionId);
-  const { generation, signal } = beginHistoryRequest(viewKey);
+  const request = historyRequests.begin(viewKey);
   const revision = realtimeRevisions.get(viewKey) || 0;
   patchHistoryView(set, viewKey, { loading: true, error: '' });
   try {
-    const page = await getSessionHistory(childSessionId, { limit: HISTORY_PAGE_SIZE, taskId: childViewTaskIds.get(childSessionId), signal });
-    if (!finishHistoryRequest(viewKey, generation)) return;
+    const page = await getSessionHistory(childSessionId, { limit: HISTORY_PAGE_SIZE, taskId: childViewTaskIds.get(childSessionId), signal: request.signal });
+    if (!request.isCurrent()) return;
     set((state) => {
       const keepLive = (realtimeRevisions.get(viewKey) || 0) !== revision;
       const { chat } = applyHistoryPage(state, viewKey, childSessionId, page, 'latest', keepLive);
@@ -1375,7 +1360,7 @@ async function loadChildHistory(childSessionId: string, set: StoreSetter, get: S
       };
     });
   } catch (error) {
-    if (!finishHistoryRequest(viewKey, generation)) return;
+    if (!request.isCurrent()) return;
     patchHistoryView(set, viewKey, { loading: false, error: errorMessage(error, '子会话历史加载失败') });
   }
 }
@@ -1416,14 +1401,13 @@ function mergeSessionPage(set: StoreSetter, rows: readonly SessionListItem[]) {
   });
 }
 
-async function loadStartupSessions(set: StoreSetter, get: StoreGetter) {
+async function loadStartupSessions(set: StoreSetter, get: StoreGetter, request: RequestTicket) {
   if (startupLoaded) return;
   startupLoaded = true;
-  const generation = startupGeneration;
   set({ startupError: '', sessionPaging: { hasMore: false, loading: true, error: '' } });
 
   const rows = await listSessions('web', SESSION_PAGE_SIZE, 0);
-  if (generation !== startupGeneration) return;
+  if (!request.isCurrent()) return;
   sessionOffset = rows.length;
   mergeSessionPage(set, rows);
   set((state) => ({
@@ -1445,7 +1429,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
   resetState: () => {
     stopRealtimeAndHistory();
     startupLoaded = false;
-    startupGeneration += 1;
+    startupRequests.reset();
     sessionOffset = 0;
     autoApprovedApprovalIds.clear();
     saveAutoApproved(autoApprovedApprovalIds);
@@ -1524,14 +1508,14 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     if (get().deletingByConversation[id]) throw new Error('会话正在删除，请稍候');
     const conversation = get().conversations.find((item) => item.id === id);
     if (!conversation) return;
-    const generation = startupGeneration;
+    const request = startupRequests.begin();
     set(state => ({ deletingByConversation: { ...state.deletingByConversation, [id]: true } }));
     try {
       if (conversation.sessionId) {
         await deleteSession(conversation.sessionId);
       }
 
-      if (generation !== startupGeneration || get().conversations.find(item => item.id === id)?.sessionId !== conversation.sessionId) {
+      if (!request.isCurrent() || get().conversations.find(item => item.id === id)?.sessionId !== conversation.sessionId) {
         throw new Error('原会话已删除，但当前会话已变更；新上下文未移除');
       }
       forgetHistory(id);
@@ -1569,7 +1553,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         };
       });
     } finally {
-      if (generation === startupGeneration) set(state => ({ deletingByConversation: { ...state.deletingByConversation, [id]: false } }));
+      if (request.isCurrent()) set(state => ({ deletingByConversation: { ...state.deletingByConversation, [id]: false } }));
     }
   }),
 
@@ -1780,9 +1764,9 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
   },
 
   loadStartup: () => {
-    const generation = startupGeneration;
-    void loadStartupSessions(set, get).catch(error => {
-      if (generation !== startupGeneration) return;
+    const request = startupRequests.begin();
+    void loadStartupSessions(set, get, request).catch(error => {
+      if (!request.isCurrent()) return;
       startupLoaded = false;
       set({
         startupError: errorMessage(error, '加载会话失败，请重试'),
@@ -1794,16 +1778,16 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
   loadMoreConversations: async () => {
     const paging = get().sessionPaging;
     if (paging.loading || !paging.hasMore) return;
-    const generation = startupGeneration;
+    const request = startupRequests.begin();
     set({ sessionPaging: { ...paging, loading: true, error: '' } });
     try {
       const rows = await listSessions('web', SESSION_PAGE_SIZE, sessionOffset);
-      if (generation !== startupGeneration) return;
+      if (!request.isCurrent()) return;
       sessionOffset += rows.length;
       mergeSessionPage(set, rows);
       set({ sessionPaging: { hasMore: rows.length >= SESSION_PAGE_SIZE, loading: false, error: '' } });
     } catch (error) {
-      if (generation !== startupGeneration) return;
+      if (!request.isCurrent()) return;
       set((state) => ({ sessionPaging: { ...state.sessionPaging, loading: false, error: errorMessage(error, '更多对话加载失败') } }));
     }
   },
@@ -1819,11 +1803,11 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     if (!sessionId || cached?.sessionId !== sessionId || !cached.window.hasMore || typeof before !== 'number') return;
     if (view.loading || view.loadingOlder) return;
 
-    const { generation, signal } = beginHistoryRequest(conversationId);
+    const request = historyRequests.begin(conversationId);
     patchHistoryView(set, conversationId, { loadingOlder: true, olderError: '' });
     try {
-      const page = await getSessionHistory(sessionId, { limit: HISTORY_PAGE_SIZE, before, signal });
-      if (!finishHistoryRequest(conversationId, generation)) return;
+      const page = await getSessionHistory(sessionId, { limit: HISTORY_PAGE_SIZE, before, signal: request.signal });
+      if (!request.isCurrent()) return;
       set((current) => {
         if (current.conversations.find((item) => item.id === conversationId)?.sessionId !== sessionId) {
           return { historyByConversation: withHistoryView(current.historyByConversation, conversationId, { loadingOlder: false }) };
@@ -1832,7 +1816,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         return { ...chat, historyByConversation: withHistoryView(current.historyByConversation, conversationId, { loadingOlder: false, hasMore }) };
       });
     } catch (error) {
-      if (!finishHistoryRequest(conversationId, generation)) return;
+      if (!request.isCurrent()) return;
       patchHistoryView(set, conversationId, { loadingOlder: false, olderError: errorMessage(error, '更早的消息加载失败') });
     }
   },

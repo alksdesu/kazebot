@@ -3,9 +3,9 @@ import { errorMessage } from '../../api/request';
 import { uploadAttachment } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
 import { featureRequest, downloadFeature } from '../client';
+import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { startPolling } from '../../utils/polling';
-import { useRequestScope } from '../asyncState';
 import { actionClass, controlClass, EmptyState, FeatureFeedback, FeaturePage, primaryClass, sectionClass } from '../ui';
 import { ScopeSelect } from './ScopeSelect';
 import { StepEditor } from './StepEditor';
@@ -31,46 +31,46 @@ export function ExecutionPage({ scope: initialScope = 'web:console' }: { scope?:
   const [stepsValid, setStepsValid] = useState(true);
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
-  const sequence = useRef(0);
   const mutating = useRef(false);
-  const identity = useRequestScope(scope);
+  const requests = useRequestGuard(scope);
   const token = useSettingsStore(state => state.adminToken);
   const refresh = useCallback(async () => {
-    const request = ++sequence.current;
+    const request = requests.begin('plans');
     try {
-      const response = await featureRequest<unknown>('/v1/execution/plans', { scope });
-      if (!identity.isCurrent() || request !== sequence.current) return;
+      const response = await featureRequest<unknown>('/v1/execution/plans', { scope, signal: request.signal });
+      if (!request.isCurrent()) return;
       const plans = readExecutionPlans(response);
       setPlans(plans); setReadError('');
       setSelected(current => current ? plans.find(plan => plan.id === current.id) || current : null);
-    } catch (reason) { if (identity.isCurrent() && request === sequence.current) setReadError(errorMessage(reason)); }
-    finally { if (identity.isCurrent() && request === sequence.current) setLoading(false); }
-  }, [scope]);
+    } catch (reason) { if (request.isCurrent()) setReadError(errorMessage(reason)); }
+    finally { if (request.isCurrent()) setLoading(false); }
+  }, [requests, scope]);
   useEffect(() => {
     setLoading(true); setReadError(''); setTools([]);
     const stop = startPolling(async () => { if (!mutating.current) await refresh(); }, 3000, { first: refresh });
-    void featureRequest<{ tools: ToolOption[] }>('/v1/execution/tools', { scope }).then(result => { if (identity.isCurrent()) setTools(Array.isArray(result?.tools) ? result.tools : []); }).catch(reason => { if (identity.isCurrent()) setError(`工具列表读取失败：${errorMessage(reason)}`); });
-    return () => { stop(); sequence.current++; };
-  }, [refresh, scope]);
+    const request = requests.begin('tools');
+    void featureRequest<{ tools: ToolOption[] }>('/v1/execution/tools', { scope, signal: request.signal }).then(result => { if (request.isCurrent()) setTools(Array.isArray(result?.tools) ? result.tools : []); }).catch(reason => { if (request.isCurrent()) setError(`工具列表读取失败：${errorMessage(reason)}`); });
+    return stop;
+  }, [requests, refresh, scope]);
   const choose = (plan: ExecutionPlan | null) => {
     setSelected(plan); setEditRevision(plan?.revision ?? null); setGoal(plan?.goal || ''); setWorkScope(plan?.work_scope || ''); setSources(plan?.inputs || []); setSteps(plan?.steps || []); setFailedIds([]); setSourceText(''); setError(''); setNotice(''); setStepsValid(true);
   };
   const run = async (action: () => Promise<void>) => {
     if (mutating.current) return;
-    mutating.current = true; sequence.current++; setBusy(true); setError(''); setNotice('');
-    try { await action(); if (identity.isCurrent()) { await refresh(); setNotice('操作已完成。'); } } catch (reason) { if (identity.isCurrent()) setError(errorMessage(reason)); } finally { mutating.current = false; if (identity.isCurrent()) setBusy(false); }
+    mutating.current = true; requests.drop('plans'); setBusy(true); setError(''); setNotice('');
+    try { await action(); if (requests.isCurrent()) { await refresh(); setNotice('操作已完成。'); } } catch (reason) { if (requests.isCurrent()) setError(errorMessage(reason)); } finally { mutating.current = false; if (requests.isCurrent()) setBusy(false); }
   };
   const preview = () => run(async () => {
     const body = { goal, work_scope: workScope, inputs: sources, steps };
     const plan = readExecutionPlan(await featureRequest<unknown>(selected ? `/v1/execution/plans/${selected.id}` : '/v1/execution/plans', {
       scope, method: selected ? 'PATCH' : 'POST', body: selected ? { ...body, expected_revision: editRevision } : body,
     }));
-    if (identity.isCurrent()) choose(plan);
+    if (requests.isCurrent()) choose(plan);
   });
   const action = (name: string, body: unknown = {}) => run(async () => {
     if (!selected) return;
     const updated = readExecutionPlan(await featureRequest<unknown>(`/v1/execution/plans/${selected.id}/${name}`, { scope, method: 'POST', body }));
-    if (identity.isCurrent()) setSelected(updated);
+    if (requests.isCurrent()) setSelected(updated);
   });
   const editable = !selected || selected.status === 'draft';
   const staleDraft = selected?.status === 'draft' && editRevision !== selected.revision;
@@ -92,7 +92,7 @@ export function ExecutionPage({ scope: initialScope = 'web:console' }: { scope?:
       <button className={actionClass} type="button" onClick={() => { if (sourceText.trim()) { setSources([...sources, { kind: /^https?:\/\//.test(sourceText.trim()) ? 'url' : 'text', value: sourceText.trim(), label: `资料 ${sources.length + 1}` }]); setSourceText(''); setSteps([]); } }}>加入输入清单</button>
       <label className="block min-w-0">选择文件<input aria-label="选择文件" className="block max-w-full" type="file" multiple onChange={event => {
         const files = Array.from(event.target.files || []);
-        void run(async () => { const uploaded = await Promise.all(files.map(file => uploadAttachment(file, scope, token || ''))); identity.check(); setSources(current => [...current, ...uploaded.map((file, index): PlanInput => ({ kind: 'file', value: file.path, label: files[index].name }))]); setSteps([]); });
+        void run(async () => { const uploaded = await Promise.all(files.map(file => uploadAttachment(file, scope, token || ''))); requests.check(); setSources(current => [...current, ...uploaded.map((file, index): PlanInput => ({ kind: 'file', value: file.path, label: files[index].name }))]); setSteps([]); });
       }} /></label>
       <ul>{sources.map((source, index) => <li className="flex min-w-0 flex-wrap justify-between gap-3 border-b py-2 [overflow-wrap:anywhere]" key={`${index}-${source.value}`}>{source.label}: {source.kind === 'text' ? source.value.slice(0, 100) : source.value}<button type="button" onClick={() => { setSources(sources.filter((_, at) => at !== index)); setSteps([]); }}>移除</button></li>)}</ul>
       <StepEditor steps={steps} tools={tools} onChange={setSteps} onValidityChange={setStepsValid} />

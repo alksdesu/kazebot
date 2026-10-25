@@ -1,6 +1,7 @@
 // 长期记忆与会话上下文。这一页直接对文件动手，改动立即生效。
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { usePageNotice } from '../hooks/usePageNotice';
+import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
 import {
@@ -21,7 +22,6 @@ import { sizeText } from './format';
 import { useConversationDirectory } from '../features/useConversationDirectory';
 import { useConversationNames } from '../features/useConversationNames';
 import { scopeIdentity } from '../features/conversationNames';
-import { useRequestScope } from '../features/asyncState';
 import { ContextArchiveSettings } from './ContextArchiveSettings';
 import { errorMessage } from '../api/request';
 
@@ -76,9 +76,7 @@ const MemoryBlock = () => {
   const [loading, setLoading] = useState(false);
   const [overviewLoading, setOverviewLoading] = useState(true);
   const [entriesScope, setEntriesScope] = useState('');
-  const selectedRef = useRef(selected);
-  selectedRef.current = selected;
-  const entryVersion = useRef(0);
+  const requests = useRequestGuard();
   const confirmDiscard = useUnsavedChanges(JSON.stringify(draft) !== JSON.stringify(EMPTY_DRAFT), '记忆草稿尚未保存，确定切换来源或离开吗？');
   const [query, setQuery] = useState('');
   const [sourceOffset, setSourceOffset] = useState(0);
@@ -89,27 +87,36 @@ const MemoryBlock = () => {
 
   const loadOverview = async () => {
     if (!adminToken) return;
+    const request = requests.begin('overview');
     setOverviewLoading(true);
-    try { setNamespaces(await getMemoryOverview(adminToken)); setLoadError('', 'overview'); } catch (error) { setLoadError(errorMessage(error), 'overview'); } finally { setOverviewLoading(false); }
+    try {
+      const result = await getMemoryOverview(adminToken);
+      if (!request.isCurrent()) return;
+      setNamespaces(result); setLoadError('', 'overview');
+    } catch (error) {
+      if (request.isCurrent()) setLoadError(errorMessage(error), 'overview');
+    } finally {
+      if (request.isCurrent()) setOverviewLoading(false);
+    }
   };
 
   const loadEntries = async (namespace: string) => {
-    const version = ++entryVersion.current;
+    const request = requests.begin('entries');
     if (!adminToken || !namespace) { setEntries([]); setLoadError('', 'entries'); return; }
     setLoading(true);
     try {
       const result = await getMemoryEntries(adminToken, namespace);
-      if (version !== entryVersion.current || selectedRef.current !== namespace) return;
+      if (!request.isCurrent()) return;
       setEntries(result); setEntriesScope(namespace); setLoadError('', 'entries');
     } catch (error) {
-      if (version === entryVersion.current && selectedRef.current === namespace) setLoadError(errorMessage(error), 'entries');
+      if (request.isCurrent()) setLoadError(errorMessage(error), 'entries');
     } finally {
-      if (version === entryVersion.current) setLoading(false);
+      if (request.isCurrent()) setLoading(false);
     }
   };
 
-  useEffect(() => { void loadOverview(); }, [adminToken]);
-  useEffect(() => { setEntries([]); setEntriesScope(''); void loadEntries(selected); setEntryOffset(0); return () => { ++entryVersion.current; }; }, [selected, adminToken]);
+  useEffect(() => { void loadOverview(); }, [requests]);
+  useEffect(() => { setEntries([]); setEntriesScope(''); void loadEntries(selected); setEntryOffset(0); return () => { requests.drop('entries'); }; }, [requests, selected]);
 
   // 固定按 BUCKETS 的顺序排，拍平成一条序列再分页 —— 按组各自分页会在一栏
   // 里挂出三个分页器。组标题在每页按需重新出现，翻页不会丢掉这一项属于哪一档。
@@ -320,30 +327,27 @@ const MemoryBlock = () => {
 const ContextBlock = () => {
   const adminToken = useSettingsStore((state) => state.adminToken);
   const { rows, error: directoryError, loading: directoryLoading, reload: load } = useConversationDirectory();
-  const identity = useRequestScope(adminToken || '');
+  const requests = useRequestGuard();
   const names = useConversationNames(rows.map(row => ({ scope: row.conversation_key || `session:${row.session_id}`, owner: row.owner, current_account: row.current_account })));
   const labelFor = (row: ConversationRow) => names.get(scopeIdentity(row.conversation_key || `session:${row.session_id}`)) || '会话（名称暂不可用）';
   const [preview, setPreview] = useState<{ id: string; total: number; messages: Array<Record<string, any>> } | null>(null);
   const [note, setNote] = useState('');
   const [offset, setOffset] = useState(0);
-  const previewVersion = useRef(0);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
 
-  useEffect(() => () => { previewVersion.current += 1; }, [adminToken]);
-
   const open = async (row: ConversationRow) => {
     if (!adminToken || busy) return;
-    const version = ++previewVersion.current;
+    const request = requests.begin('preview');
     if (preview?.id === row.session_id) { setPreview(null); setLoading(false); return; }
     setPreview(null);
     setLoading(true);
     setNote('');
     try {
       const result = await getConversationMessages(adminToken, row.session_id, 100);
-      if (identity.isCurrent() && version === previewVersion.current) setPreview({ id: row.session_id, ...result });
-    } catch (error) { if (identity.isCurrent() && version === previewVersion.current) setNote(errorMessage(error)); }
-    finally { if (identity.isCurrent() && version === previewVersion.current) setLoading(false); }
+      if (request.isCurrent()) setPreview({ id: row.session_id, ...result });
+    } catch (error) { if (request.isCurrent()) setNote(errorMessage(error)); }
+    finally { if (request.isCurrent()) setLoading(false); }
   };
 
   const drop = async (row: ConversationRow) => {
@@ -351,16 +355,16 @@ const ContextBlock = () => {
     const name = labelFor(row);
     if (!window.confirm(`删除「${name}」的上下文？聊天记录清空，之后重新积累。长期记忆不受影响。`)) return;
     setBusy(true);
-    previewVersion.current += 1;
+    requests.drop('preview');
     setLoading(false);
     try {
       await resetConversationBySession(adminToken, row.session_id);
-      if (!identity.isCurrent()) return;
+      if (!requests.isCurrent()) return;
       setPreview(null);
       await load();
-      if (!identity.isCurrent()) return;
+      if (!requests.isCurrent()) return;
       setNote('已删除，下一条消息开始重新积累');
-    } catch (error) { if (identity.isCurrent()) setNote(errorMessage(error)); } finally { if (identity.isCurrent()) setBusy(false); }
+    } catch (error) { if (requests.isCurrent()) setNote(errorMessage(error)); } finally { if (requests.isCurrent()) setBusy(false); }
   };
 
   const entry = (row: ConversationRow) => (

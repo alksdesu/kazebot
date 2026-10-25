@@ -17,8 +17,9 @@ import {
 } from '../api/supervisorClient';
 import { AuthorizedImage } from '../components/common/AuthorizedImage';
 import { usePageNotice } from '../hooks/usePageNotice';
+import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
-import { tokenChanged, useSettingsStore } from '../store/settingsStore';
+import { useSettingsStore } from '../store/settingsStore';
 import {
   Block,
   Button,
@@ -95,8 +96,7 @@ const LibraryBlock = () => {
   const [importPath, setImportPath] = useState('');
   const [importAccept, setImportAccept] = useState(false);
   const filePicker = useRef<HTMLInputElement>(null);
-  // 切页签、翻页、搜索接连触发时只认最后发出的那次，慢回来的旧结果不能盖掉眼前这一页。
-  const generation = useRef(0);
+  const requests = useRequestGuard();
 
   const confirmDiscard = useUnsavedChanges(
     editing !== '' && JSON.stringify(draft) !== editBaseline,
@@ -105,19 +105,20 @@ const LibraryBlock = () => {
 
   const load = async () => {
     if (!adminToken) return;
-    const version = ++generation.current;
+    // 切页签、翻页、搜索接连触发时只认最后发出的那次，慢回来的旧结果不能盖掉眼前这一页。
+    const request = requests.begin('page');
     try {
       const page = await listStickers(adminToken, {
         state: tab, search, limit: PAGE_SIZE, offset,
       });
-      if (version !== generation.current) return;
+      if (!request.isCurrent()) return;
       setItems(page.items);
       setCounts(page.counts);
       setLoadError('');
-    } catch (error) { if (version === generation.current) setLoadError(errorMessage(error)); }
+    } catch (error) { if (request.isCurrent()) setLoadError(errorMessage(error)); }
   };
 
-  useEffect(() => { void load(); return () => { generation.current += 1; }; }, [adminToken, tab, search, offset]);
+  useEffect(() => { void load(); }, [requests, tab, search, offset]);
 
   // 每敲一个字查一次会让 LIKE 全表扫打满，停手再查。
   useEffect(() => {
@@ -136,12 +137,12 @@ const LibraryBlock = () => {
     setMessage('');
     try {
       const done = await job(adminToken);
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       await load();
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(done);
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error));
     } finally {
       setBusy(false);

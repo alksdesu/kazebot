@@ -4,9 +4,9 @@ import { downloadFile } from '../../api/blobs';
 import { errorMessage, requestJson } from '../../api/request';
 import { AuthorizedImage } from '../../components/common/AuthorizedImage';
 import { featureRequest, featureUrl } from '../client';
+import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { startPolling } from '../../utils/polling';
-import { useRequestScope } from '../asyncState';
 import { EmptyState, FeatureFeedback, FeaturePage, actionClass } from '../ui';
 import { Block, Button, Check, Desc, ErrorText, Input, Panel, Select, Textarea } from '../../console/components';
 import type { MaterialScope } from '../../api/supervisorClient';
@@ -91,9 +91,6 @@ export function MaterialsPage() {
   const [searched, setSearched] = useState(false);
   const [chatSearched, setChatSearched] = useState(false);
   const [savedGeneration, setSavedGeneration] = useState('');
-  const refreshSequence = useRef(0);
-  const artifactSequence = useRef(0);
-  const operationSequence = useRef(0);
   const runningOperation = useRef(false);
   const token = useSettingsStore(state => state.adminToken);
   const scopes = scopeSnapshot.token === token ? scopeSnapshot.rows : [];
@@ -101,24 +98,25 @@ export function MaterialsPage() {
   const selectedScope = scopeIdentity(scope, botScope);
   if (!options.has(selectedScope)) options.set(selectedScope, { scope, bot_scope: botScope });
   const scopeNames = useConversationNames([...options.values()], scopeSnapshot.token === token, scopes.map(item => item.scope));
-  const identity = useRequestScope(JSON.stringify([scope, botScope, token]));
+  // 会话清单和渲染能力跟着登录走，不随所选会话作废。
+  const catalog = useRequestGuard();
+  const requests = useRequestGuard([scope, botScope]);
   const generationDraft = JSON.stringify({ title, format, content });
   const confirmDiscard = useUnsavedChanges(Object.keys(corrections).length > 0 || Boolean((title || content) && generationDraft !== savedGeneration));
   const version = artifact?.versions.find(item => item.id === selectedVersion);
   const generationActive = Boolean(job && ['queued', 'running'].includes(job.status));
-  const api = async <T,>(path: string, method = 'GET', body?: unknown, params: Record<string, string | number | boolean> = {}) => {
-    identity.check();
-    const result = await featureRequest<T>('/v1/materials' + path, { method, body, params: { ...params, bot_scope: botScope }, scope });
-    identity.check(); return result;
+  const api = async <T,>(path: string, method = 'GET', body?: unknown, params: Record<string, string | number | boolean> = {}, signal?: AbortSignal) => {
+    requests.check();
+    const result = await featureRequest<T>('/v1/materials' + path, { method, body, params: { ...params, bot_scope: botScope }, scope, signal });
+    requests.check(); return result;
   };
 
   async function perform(action: () => Promise<void>) {
     if (runningOperation.current) return;
     runningOperation.current = true;
-    const operation = ++operationSequence.current;
     setBusy(true); setError(''); setNotice('');
-    try { await action(); } catch (reason) { if (identity.isCurrent()) setError(errorMessage(reason)); }
-    finally { if (operation === operationSequence.current) { runningOperation.current = false; if (identity.isCurrent()) setBusy(false); } }
+    try { await action(); } catch (reason) { if (requests.isCurrent()) setError(errorMessage(reason)); }
+    finally { if (requests.isCurrent()) { runningOperation.current = false; setBusy(false); } }
   }
 
   function changeScope(nextScope: string, nextBot: string | null = botScope) {
@@ -128,66 +126,76 @@ export function MaterialsPage() {
   }
 
   async function refresh() {
-    const request = ++refreshSequence.current;
-    const [newSources, newArtifacts, newExtractions, settings, jobs] = await Promise.all([
-      api<Source[]>('/sources'), api<{ id: string; name: string }[]>('/artifacts'),
-      api<Extraction[]>('/extractions'), api<{ journal_enabled: boolean }>('/settings'),
-      api<Job[]>('/jobs'),
-    ]);
-    if (!identity.isCurrent() || request !== refreshSequence.current) return;
-    setLoading(false); setSources(newSources); setArtifacts(newArtifacts); setExtractions(newExtractions); setJournal(settings.journal_enabled); setRecentJobs(jobs);
-    setJob(current => current && ['queued', 'running'].includes(current.status) ? current : jobs.find(item => ['queued', 'running'].includes(item.status)) || current);
+    const request = requests.begin('refresh');
+    try {
+      const [newSources, newArtifacts, newExtractions, settings, jobs] = await Promise.all([
+        api<Source[]>('/sources', 'GET', undefined, {}, request.signal), api<{ id: string; name: string }[]>('/artifacts', 'GET', undefined, {}, request.signal),
+        api<Extraction[]>('/extractions', 'GET', undefined, {}, request.signal), api<{ journal_enabled: boolean }>('/settings', 'GET', undefined, {}, request.signal),
+        api<Job[]>('/jobs', 'GET', undefined, {}, request.signal),
+      ]);
+      if (!request.isCurrent()) return;
+      setLoading(false); setSources(newSources); setArtifacts(newArtifacts); setExtractions(newExtractions); setJournal(settings.journal_enabled); setRecentJobs(jobs);
+      setJob(current => current && ['queued', 'running'].includes(current.status) ? current : jobs.find(item => ['queued', 'running'].includes(item.status)) || current);
+    } catch (reason) {
+      if (request.isCurrent()) throw reason;
+    }
   }
 
   async function openArtifact(id: string, preferred = '') {
-    const request = ++artifactSequence.current;
-    const item = await api<Artifact>(`/artifacts/${encodeURIComponent(id)}`);
-    if (!identity.isCurrent() || request !== artifactSequence.current) return;
-    setArtifact(item); setSelectedVersion(preferred || item.current_version); setCompareVersion('');
+    const request = requests.begin('artifact');
+    try {
+      const item = await api<Artifact>(`/artifacts/${encodeURIComponent(id)}`, 'GET', undefined, {}, request.signal);
+      if (!request.isCurrent()) return;
+      setArtifact(item); setSelectedVersion(preferred || item.current_version); setCompareVersion('');
+    } catch (reason) {
+      if (request.isCurrent()) throw reason;
+    }
   }
 
   useEffect(() => {
-    let active = true;
     setScopeSnapshot({ token, rows: [] }); setScopeError(''); setCapabilities(null);
     if (!token) return;
-    featureRequest<MaterialScope[]>('/v1/materials/scopes').then(items => {
-      if (active && useSettingsStore.getState().adminToken === token) setScopeSnapshot({ token, rows: Array.isArray(items) ? items.filter(item => item && typeof item.scope === 'string' && typeof item.bot_scope === 'string') : [] });
-    }).catch(() => { if (active) setScopeError('资料会话名称读取失败，仍可操作当前范围。'); });
-    featureRequest<{ office_renderer: boolean; modules: Record<string, boolean> }>('/v1/materials/capabilities').then(item => { if (active) setCapabilities(item); }).catch(reason => { if (active) setError(errorMessage(reason)); });
-    return () => { active = false; };
-  }, [token, scopeRetry]);
+    const scopeList = catalog.begin('scopes');
+    featureRequest<MaterialScope[]>('/v1/materials/scopes', { signal: scopeList.signal }).then(items => {
+      if (scopeList.isCurrent()) setScopeSnapshot({ token, rows: Array.isArray(items) ? items.filter(item => item && typeof item.scope === 'string' && typeof item.bot_scope === 'string') : [] });
+    }).catch(() => { if (scopeList.isCurrent()) setScopeError('资料会话名称读取失败，仍可操作当前范围。'); });
+    const renderers = catalog.begin('capabilities');
+    featureRequest<{ office_renderer: boolean; modules: Record<string, boolean> }>('/v1/materials/capabilities', { signal: renderers.signal }).then(item => { if (renderers.isCurrent()) setCapabilities(item); }).catch(reason => { if (renderers.isCurrent()) setError(errorMessage(reason)); });
+  }, [catalog, token, scopeRetry]);
 
   useEffect(() => {
-    operationSequence.current++; runningOperation.current = false; setBusy(false); refreshSequence.current++; artifactSequence.current++;
+    runningOperation.current = false; setBusy(false);
     setSources([]); setArtifacts([]); setExtractions([]); setJournal(false); setLoading(true); setScopeDraft(scope); setSearched(false); setChatSearched(false);
     setArtifact(null); setSelectedVersion(''); setSourceId(''); setSpans([]); setChatResults([]); setCorrections({}); setJob(null); setRecentJobs([]);
-    if (scope.trim()) void perform(async () => { try { await refresh(); } finally { if (identity.isCurrent()) setLoading(false); } });
-  }, [scope, botScope, token]);
+    if (scope.trim()) void perform(async () => { try { await refresh(); } finally { if (requests.isCurrent()) setLoading(false); } });
+  }, [requests, scope]);
 
   useEffect(() => { setInspected(false); setLoadedPages([]); }, [selectedVersion]);
 
   useEffect(() => {
     if (!job || !['queued', 'running'].includes(job.status)) return;
-    let active = true;
-    const check = () => api<Job>(`/jobs/${job.id}`).then(next => {
-      if (!active) return;
-      setJob(next);
-      if (next.status === 'preview_ready') {
-        void perform(async () => { await refresh(); await openArtifact(next.artifact_id, next.version_id); });
-      } else if (next.status === 'failed') setError(next.error || '生成失败，未发送成品。');
-    }).catch(reason => { if (active) setError(errorMessage(reason)); });
+    const check = () => {
+      const request = requests.begin('job');
+      return api<Job>(`/jobs/${job.id}`, 'GET', undefined, {}, request.signal).then(next => {
+        if (!request.isCurrent()) return;
+        setJob(next);
+        if (next.status === 'preview_ready') {
+          void perform(async () => { await refresh(); await openArtifact(next.artifact_id, next.version_id); });
+        } else if (next.status === 'failed') setError(next.error || '生成失败，未发送成品。');
+      }).catch(reason => { if (request.isCurrent()) setError(errorMessage(reason)); });
+    };
     const stop = startPolling(check, 2000);
-    return () => { active = false; stop(); };
-  }, [job?.id, job?.status, scope, botScope]);
+    return () => { requests.drop('job'); stop(); };
+  }, [requests, job?.id, job?.status]);
 
   async function upload(file: File) {
     const form = new FormData(); form.append('file', file);
-    identity.check();
+    requests.check();
     const source = await requestJson<Source>(featureUrl('/v1/materials/sources/upload', { scope, params: { bot_scope: botScope } }), {
       method: 'POST', body: form,
     });
-    identity.check();
-    await refresh(); identity.check(); setSourceId(source.id); setNotice(`已登记 ${source.name}。`);
+    requests.check();
+    await refresh(); requests.check(); setSourceId(source.id); setNotice(`已登记 ${source.name}。`);
   }
 
   async function generate(event: FormEvent) {
@@ -282,7 +290,7 @@ export function MaterialsPage() {
       {job && ['failed', 'interrupted', 'cancelled'].includes(job.status) && <Button disabled={busy} onClick={() => void perform(async () => { setJob(await api<Job>(`/jobs/${job.id}/retry`, 'POST')); await refresh(); })}>重试本地生成</Button>}
     </Block></div>
     <div id="version-section" className="scroll-mt-4"><Block title="作品版本与预览确认">
-      <Select width="wide" disabled={busy} aria-label="选择作品" value={artifact?.id || ''} onChange={event => { if (event.target.value) void perform(() => openArtifact(event.target.value)); else { artifactSequence.current++; setArtifact(null); setSelectedVersion(''); setCompareVersion(''); } }}><option value="">选择作品</option>{artifacts.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</Select>
+      <Select width="wide" disabled={busy} aria-label="选择作品" value={artifact?.id || ''} onChange={event => { if (event.target.value) void perform(() => openArtifact(event.target.value)); else { requests.drop('artifact'); setArtifact(null); setSelectedVersion(''); setCompareVersion(''); } }}><option value="">选择作品</option>{artifacts.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</Select>
       {!loading && !artifacts.length && <EmptyState>尚无作品。生成成品，或在 QQ 完成图片创作后，可在这里预览和管理版本。</EmptyState>}
       {artifact && <>
         <h3 className="font-semibold">{artifact.name}</h3>

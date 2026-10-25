@@ -32,9 +32,11 @@ import { nameBetween } from './format';
 import { InstanceLink, InstanceSwitch } from './InstanceSwitch';
 import { usePlatform } from './platformContext';
 import { usePageNotice } from '../hooks/usePageNotice';
+import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
-import { useRequestScope } from '../features/asyncState';
+import { startPolling } from '../utils/polling';
 import { errorMessage } from '../api/request';
+import type { RequestTicket } from '../api/requestGuard';
 
 type Stage = 'idle' | 'restarting' | 'scanning';
 
@@ -65,22 +67,21 @@ const AccountWorkspace = ({ token }: { token: string }) => {
   const [instances, setInstances] = useState<ConsoleInstance[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const sequence = useRef(0);
-  const identity = useRequestScope(token);
+  const requests = useRequestGuard();
   const refresh = useCallback(async () => {
-    const request = ++sequence.current;
+    const request = requests.begin('instances');
     setLoading(true);
     try {
       const next = await getInstances(token);
-      if (!identity.isCurrent() || request !== sequence.current || useSettingsStore.getState().adminToken !== token) return;
+      if (!request.isCurrent()) return;
       setInstances(next); setError('');
     } catch (failure) {
-      if (identity.isCurrent() && request === sequence.current && useSettingsStore.getState().adminToken === token) setError(errorMessage(failure));
+      if (request.isCurrent()) setError(errorMessage(failure));
     } finally {
-      if (identity.isCurrent() && request === sequence.current && useSettingsStore.getState().adminToken === token) setLoading(false);
+      if (request.isCurrent()) setLoading(false);
     }
-  }, [token]);
-  useEffect(() => { void refresh(); return () => { sequence.current++; }; }, [refresh]);
+  }, [requests, token]);
+  useEffect(() => { void refresh(); }, [refresh]);
   return <>
     <InstanceManagement token={token} instances={instances} loading={loading} error={error} refresh={refresh} />
     <ConfigShareGroups token={token} />
@@ -109,8 +110,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
   const [progressError, setProgressError] = useState('');
   const [progressTransient, setProgressTransient] = useState(false);
   const mutation = useRef(false);
-  const identity = useRequestScope(token);
-  const isCurrent = () => identity.isCurrent() && useSettingsStore.getState().adminToken === token;
+  const requests = useRequestGuard();
   const running = job !== null && !job.finished;
   const locked = busy || running || loading || Boolean(error);
   useUnsavedChanges(Boolean(newId || newLabel || newAccount), '新实例还没建立，切换或离开会丢失填好的信息，确定继续吗？');
@@ -122,31 +122,29 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
     setJobAction(restored.action || 'create');
   }, [instances, job?.id]);
 
+  const jobId = job?.id;
+  // 只随任务换代：依赖整个 job 的话，每读回一次进度就重开轮询并立刻再读一次，间隔形同虚设。
   useEffect(() => {
-    if (!job || job.finished) return;
-    let alive = true;
-    let polling = false;
+    if (!jobId || !running) return undefined;
     const poll = () => {
-      if (polling || !alive || !isCurrent()) return;
-      polling = true;
-      void getInstanceProgress(token, job.id).then(async next => {
-        if (!alive || !isCurrent()) return;
+      const request = requests.begin('progress');
+      return getInstanceProgress(token, jobId).then(async next => {
+        if (!request.isCurrent()) return;
         setJob(next); setProgressError(''); setProgressTransient(false);
         if (next.finished) await refresh();
       }).catch(failure => {
-        if (!alive || !isCurrent()) return;
+        if (!request.isCurrent()) return;
         const transient = isTransientApiError(failure);
         setProgressTransient(transient);
         setProgressError(transient ? '部署连接短暂中断，任务仍在后台运行，将自动重试。' : `读取进度失败，将自动重试：${errorMessage(failure)}`);
-      }).finally(() => { polling = false; });
+      });
     };
-    void poll();
-    const timer = window.setInterval(poll, 2500);
-    return () => { alive = false; window.clearInterval(timer); };
-  }, [token, job, refresh]);
+    const stop = startPolling(poll, 2500, { first: poll });
+    return () => { requests.drop('progress'); stop(); };
+  }, [requests, token, jobId, running, refresh]);
 
   const addInstance = async () => {
-    if (!isCurrent() || mutation.current || locked) return;
+    if (!requests.isCurrent() || mutation.current || locked) return;
     const id = newId.trim();
     const account = newAccount.trim();
     if (!isValidInstanceId(id)) { setNote('实例名要以小写字母开头，只用小写字母、数字和下划线，2-32 位'); return; }
@@ -155,32 +153,32 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
     if (owner) { setNote(`${nameBetween('这个', platform.shortName, '号已经归实例')}「${owner.label}」管了，请直接切换到它的控制台。`); return; }
     const login = account ? `扫码登录 ${account}` : '扫码登录';
     if (!window.confirm(`建一个新 bot「${id}」？\n\n会新建 NapCat 容器、systemd 服务和域名路由，约一两分钟。\n建好后要去它自己的控制台${login}，当前这个实例不受影响。`)) return;
-    if (!isCurrent()) return;
+    if (!requests.isCurrent()) return;
     mutation.current = true; setBusy(true); setNote(''); setProgressError(''); setProgressTransient(false);
     try {
       const plan = await createInstance(token, id, newLabel.trim(), platform.id, account);
-      if (!isCurrent()) return;
+      if (!requests.isCurrent()) return;
       setNewId(''); setNewLabel(''); setNewAccount(''); setJobAction('create');
       setJob({ id: plan.id, lines: ['已请求建实例，等 root 侧接手…'], finished: false, ok: false, detail: '' });
       void refresh();
-    } catch (failure) { if (isCurrent()) setNote(errorMessage(failure)); }
-    finally { mutation.current = false; if (isCurrent()) setBusy(false); }
+    } catch (failure) { if (requests.isCurrent()) setNote(errorMessage(failure)); }
+    finally { mutation.current = false; if (requests.isCurrent()) setBusy(false); }
   };
 
   const dropInstance = async (row: ConsoleInstance) => {
-    if (!isCurrent() || mutation.current || locked || row.current || row.idx === 0) return;
+    if (!requests.isCurrent() || mutation.current || locked || row.current || row.idx === 0) return;
     const typed = window.prompt(`归档实例 ${row.label}（${row.id}）？\n\n它的进程会停掉，NapCat 容器会被移除，工作区和聊天记录改名归档，不会直接删除。\n确认无误后可自行在服务器上清理。\n\n输入这个实例名确认：`);
     if (typed === null) return;
     if (typed.trim() !== row.id) { setNote('输入的实例名对不上，没有执行'); return; }
-    if (!isCurrent()) return;
+    if (!requests.isCurrent()) return;
     mutation.current = true; setBusy(true); setNote(''); setProgressError(''); setProgressTransient(false);
     try {
       await deleteInstance(token, row.id);
-      if (!isCurrent()) return;
+      if (!requests.isCurrent()) return;
       setJobAction('remove');
       setJob({ id: row.id, lines: ['已请求停服与归档…'], finished: false, ok: false, detail: '' });
-    } catch (failure) { if (isCurrent()) setNote(errorMessage(failure)); }
-    finally { mutation.current = false; if (isCurrent()) setBusy(false); }
+    } catch (failure) { if (requests.isCurrent()) setNote(errorMessage(failure)); }
+    finally { mutation.current = false; if (requests.isCurrent()) setBusy(false); }
   };
 
   return <Block title="多开实例" hint="会话、记忆、渠道、人格默认按实例独立，要共用配置见下面的「共享配置」；切换后自动读取该实例的内容。">
@@ -236,12 +234,10 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
 
 const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: string; instances: ConsoleInstance[]; ownershipReady: boolean }) => {
   const platformId = usePlatform().id;
-  const identity = useRequestScope(token);
-  const isCurrent = () => identity.isCurrent() && useSettingsStore.getState().adminToken === token;
+  const requests = useRequestGuard(platformId);
   const mutation = useRef(false);
-  const refreshSequence = useRef(0);
-  // 还没回来的那次读取的序号，0 表示没有在读。
-  const pendingLoad = useRef(0);
+  // 还没回来的那次读取，null 表示没有在读。
+  const pendingLoad = useRef<RequestTicket | null>(null);
   const [status, setStatus] = useState<AccountStatus | null>(null);
   const [stage, setStage] = useState<Stage>('idle');
   const [qrImage, setQrImage] = useState('');
@@ -256,25 +252,25 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
 
   // quiet：后台轮询的读取不锁按钮。NapCat 慢的时候一轮要读十几秒，锁着的话按钮几乎一直是灰的。
   const load = useCallback(async (quiet = false): Promise<AccountStatus | null> => {
-    if (!isCurrent()) return null;
-    const request = ++refreshSequence.current;
+    if (!requests.isCurrent()) return null;
+    const request = requests.begin('account');
     pendingLoad.current = request;
     if (!quiet) setLoading(true);
     try {
       const next = await getPlatformAccount(token, platformId);
-      if (!isCurrent() || request !== refreshSequence.current) return null;
+      if (!request.isCurrent()) return null;
       setStatus(next);
       setLoadError('');
       return next;
     } catch (error) {
       // 只有网络层或鉴权失败才到这里。NapCat 没起来是正常响应，由 reachable 表达。
-      if (isCurrent() && request === refreshSequence.current) setLoadError(errorMessage(error));
+      if (request.isCurrent()) setLoadError(errorMessage(error));
       return null;
     } finally {
-      if (pendingLoad.current === request) pendingLoad.current = 0;
-      if (!quiet && isCurrent() && request === refreshSequence.current) setLoading(false);
+      if (pendingLoad.current === request) pendingLoad.current = null;
+      if (!quiet && request.isCurrent()) setLoading(false);
     }
-  }, [token, platformId, setLoadError]);
+  }, [requests, token, platformId, setLoadError]);
 
   // 只有手动刷新清提示：换号失败后那次重读、扫码阶段的轮询都不能冲掉刚写下的原因和进展。
   const refresh = async () => {
@@ -283,10 +279,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
     await load();
   };
 
-  useEffect(() => {
-    void load();
-    return () => { refreshSequence.current++; };
-  }, [load]);
+  useEffect(() => { void load(); }, [load]);
 
   // 没登录上就一直盯着：等容器应答、等二维码、等扫码结果。首次部署进页面就是
   // 这个状态，早先只在换号时才轮询，于是第一次进来只能靠人反复手点。
@@ -294,15 +287,16 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
 
   useEffect(() => {
     if (!token || paused || (stage === 'idle' && !watching)) return undefined;
-    let alive = true;
+    // 这一轮盯梢的有效期：阶段一变，上一轮还没走完的步骤就停在原地。
+    const watch = requests.begin('watch');
     let polling = false;
     const timer = window.setInterval(() => {
       void (async () => {
-        if (!alive || !isCurrent() || mutation.current) return;
+        if (!watch.isCurrent() || mutation.current) return;
         // 只给重启计时：到了扫码这一步 NapCat 已经起来了，扫多久都不算超时。
         if (stage === 'restarting' && Date.now() - stageStartedAt.current > RESTART_TIMEOUT_MS) {
           // 上一轮的读取可能挂着不回来：丢掉它，放开被它锁住的按钮。
-          refreshSequence.current++;
+          requests.drop('account');
           setLoading(false);
           setStage('idle');
           setPaused(true);
@@ -311,11 +305,11 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
         }
         if (polling) return;
         // 手动刷新那次还没回来就先不发：后发的会把它作废，按钮得跟着多锁一轮。被换号、超时丢掉的那次不算。
-        if (pendingLoad.current !== 0 && pendingLoad.current === refreshSequence.current) return;
+        if (pendingLoad.current?.isCurrent()) return;
         polling = true;
         try {
           const next = await load(true);
-          if (!alive || !isCurrent() || !next) return;
+          if (!watch.isCurrent() || !next) return;
 
           if (next.reachable === false) {
             setMessage('NapCat 还没应答，等它起来…');
@@ -327,11 +321,11 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
             setStage('idle');
             try {
               const { rosterError: reason } = await pinPlatformAccount(token, platformId);
-              if (!isCurrent()) return;
+              if (!requests.isCurrent()) return;
               setRosterError(reason);
               setMessage(`已登录 ${next.nick || next.account}，并设为重启后自动登录。`);
             } catch (error) {
-              if (isCurrent()) setMessage(`已登录 ${next.nick || next.account}，但设置自动登录失败：${errorMessage(error)}`);
+              if (requests.isCurrent()) setMessage(`已登录 ${next.nick || next.account}，但设置自动登录失败：${errorMessage(error)}`);
             }
             return;
           }
@@ -340,24 +334,24 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
             try {
               // CheckLoginStatus 在等扫码时就带着二维码，能省一次请求。
               const raw = next.qrcode || (await getPlatformLoginQrcode(token, platformId)).qrcode;
-              if (!raw || !alive || !isCurrent()) return;
+              if (!raw || !watch.isCurrent()) return;
               const image = await QRCode.toDataURL(raw, { width: 240, margin: 1 });
-              if (!alive || !isCurrent()) return;
+              if (!watch.isCurrent()) return;
               setQrImage(image);
               setStage('scanning');
               setMessage('用要登录的那个 QQ 扫码。二维码会过期，过期就点一下「刷新二维码」。');
             } catch (error) {
-              if (alive && isCurrent()) setMessage(errorMessage(error));
+              if (watch.isCurrent()) setMessage(errorMessage(error));
             }
           }
         } finally { polling = false; }
       })();
     }, POLL_MS);
-    return () => { alive = false; window.clearInterval(timer); };
-  }, [stage, token, platformId, qrImage, load, watching, paused]);
+    return () => { requests.drop('watch'); window.clearInterval(timer); };
+  }, [requests, stage, token, platformId, qrImage, load, watching, paused]);
 
   const startRelogin = async () => {
-    if (!isCurrent() || mutation.current || stage !== 'idle' || !status?.configured) return;
+    if (!requests.isCurrent() || mutation.current || stage !== 'idle' || !status?.configured) return;
     const current = status?.nick || status?.account || '当前账号';
     if (!window.confirm(
       `确定要换号吗？\n\n${current} 会立刻下线，NapCat 容器重启后停在等扫码状态，`
@@ -366,65 +360,65 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
       + '用本页的「记忆归属」搬迁；换回来时旧数据会自动回来。\n\n'
       + '如果只是想让两个号同时在线，要的是多开而不是换号——见本页「多开实例」。',
     )) return;
-    if (!isCurrent()) return;
-    mutation.current = true; refreshSequence.current++; setLoading(false); setBusy(true);
+    if (!requests.isCurrent()) return;
+    mutation.current = true; requests.drop('account'); setLoading(false); setBusy(true);
     setQrImage('');
     setPaused(false);
     setMessage('正在重启 NapCat…');
     try {
       await enterPlatformLoginMode(token, platformId);
-      if (!isCurrent()) return;
+      if (!requests.isCurrent()) return;
       stageStartedAt.current = Date.now();
       setStage('restarting');
     } catch (error) {
-      if (isCurrent()) setMessage(errorMessage(error));
+      if (requests.isCurrent()) setMessage(errorMessage(error));
     } finally {
       mutation.current = false;
-      if (isCurrent()) setBusy(false);
+      if (requests.isCurrent()) setBusy(false);
     }
   };
 
   const switchTo = async (target: QuickLoginTarget) => {
-    if (!isCurrent() || mutation.current || !ownershipReady || stage !== 'idle' || target.available === false || target.account === status?.account || ownedByAnotherInstance(platformId, target.account, instances)) return;
+    if (!requests.isCurrent() || mutation.current || !ownershipReady || stage !== 'idle' || target.available === false || target.account === status?.account || ownedByAnotherInstance(platformId, target.account, instances)) return;
     const who = target.nick ? `${target.nick}（${target.account}）` : target.account;
     if (!window.confirm(`切换到 ${who}？当前账号会下线，会话和长期记忆各号各算。`)) return;
-    if (!isCurrent()) return;
-    mutation.current = true; refreshSequence.current++; setLoading(false); setBusy(true);
+    if (!requests.isCurrent()) return;
+    mutation.current = true; requests.drop('account'); setLoading(false); setBusy(true);
     setPaused(false);
     try {
       const { rosterError: reason } = await switchPlatformAccount(token, platformId, target.account);
-      if (!isCurrent()) return;
+      if (!requests.isCurrent()) return;
       setRosterError(reason);
       stageStartedAt.current = Date.now();
       setStage('restarting');
       setMessage('已请求切换，等它上线…');
     } catch (error) {
-      if (!isCurrent()) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error));
       // 切失败会把这个号记成死号，刷一次列表让它立刻置灰。
       void load(true);
     } finally {
       mutation.current = false;
-      if (isCurrent()) setBusy(false);
+      if (requests.isCurrent()) setBusy(false);
     }
   };
 
   const refreshQrcode = async () => {
-    if (!isCurrent() || mutation.current) return;
+    if (!requests.isCurrent() || mutation.current) return;
     mutation.current = true; setBusy(true);
     try {
       const { qrcode, reachable } = await getPlatformLoginQrcode(token, platformId);
-      if (!isCurrent()) return;
+      if (!requests.isCurrent()) return;
       const image = qrcode ? await QRCode.toDataURL(qrcode, { width: 240, margin: 1 }) : '';
-      if (!isCurrent()) return;
+      if (!requests.isCurrent()) return;
       setQrImage(image);
       if (qrcode) setMessage('');
       else setMessage(reachable ? '拿不到二维码，可能已经登录上了。' : 'NapCat 还没应答，等它起来…');
     } catch (error) {
-      if (isCurrent()) setMessage(errorMessage(error));
+      if (requests.isCurrent()) setMessage(errorMessage(error));
     } finally {
       mutation.current = false;
-      if (isCurrent()) setBusy(false);
+      if (requests.isCurrent()) setBusy(false);
     }
   };
 

@@ -6,7 +6,8 @@ import { useEffect, useState } from 'react';
 
 import { cancelTask, fetchActiveTasks, type ActiveTask } from '../../api/supervisorClient';
 import { usePageNotice } from '../../hooks/usePageNotice';
-import { tokenChanged, useSettingsStore } from '../../store/settingsStore';
+import { useRequestGuard } from '../../hooks/useRequestGuard';
+import { useSettingsStore } from '../../store/settingsStore';
 import { useChatStore, type TaskActivity } from '../../store/chatStore';
 import { useViewStore } from '../../store/viewStore';
 import { startPolling } from '../../utils/polling';
@@ -99,6 +100,7 @@ function taskTitle(task: ActiveTask): string {
 
 export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
   const adminToken = useSettingsStore(state => state.adminToken);
+  const requests = useRequestGuard();
   const taskActivities = useChatStore(state => state.taskActivities);
   const [tasks, setTasks] = useState<ActiveTask[]>([]);
   const [loading, setLoading] = useState(false);
@@ -111,15 +113,12 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
 
   useEffect(() => {
     if (!open) return undefined;
-    let cancelled = false;
-    // A slow poll that returns after a newer one must not put the older list back.
-    let latest = 0;
 
     const load = async () => {
-      const request = ++latest;
-      const isLatest = () => !cancelled && request === latest;
+      // A slow poll that returns after a newer one must not put the older list back.
+      const request = requests.begin('tasks');
       if (!adminToken) {
-        if (isLatest()) {
+        if (request.isCurrent()) {
           setTasks([]);
           setLoadError('需要管理员令牌才能读取活跃任务。');
           setLoading(false);
@@ -130,25 +129,25 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
       try {
         setLoading(true);
         const nextTasks = await fetchActiveTasks(adminToken);
-        if (isLatest()) {
+        if (request.isCurrent()) {
           setTasks(nextTasks);
           setLoadError('');
         }
       } catch (loadError) {
-        if (isLatest()) {
+        if (request.isCurrent()) {
           setLoadError(errorMessage(loadError, '活跃任务刷新失败。'));
         }
       } finally {
-        if (isLatest()) setLoading(false);
+        if (request.isCurrent()) setLoading(false);
       }
     };
 
     const stop = startPolling(load, 5000, { first: load });
     return () => {
-      cancelled = true;
+      requests.drop('tasks');
       stop();
     };
-  }, [adminToken, open, refreshTick]);
+  }, [requests, adminToken, open, refreshTick]);
 
   const handleCancel = async (task: ActiveTask) => {
     if (!adminToken || task.cancel_requested || cancellingTaskIds[task.task_id]) return;
@@ -160,10 +159,10 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
     setMessage('');
     try {
       await cancelTask(adminToken, task.task_id);
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setRefreshTick(value => value + 1);
     } catch (cancelError) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(cancelError, '任务取消失败。'));
     } finally {
       setCancellingTaskIds(current => {

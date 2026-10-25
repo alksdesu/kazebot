@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import type { RequestTicket } from '../../api/requestGuard';
 import { verifyAdminAuth } from '../../api/supervisorClient';
+import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { useSettingsStore } from '../../store/settingsStore';
 import { loadEntryNodes, TOKEN_SOURCE_HINT } from './loadEntryNodes';
 import { Button } from '../settings/pages/settingsControls';
@@ -15,32 +17,30 @@ export const LoginPage = ({ embedded = false }: { embedded?: boolean }) => {
   const initialToken = useRef(urlToken || adminToken);
   const inputRef = useRef<HTMLInputElement>(null);
   const focusInput = useRef(false);
-  const sequence = useRef(0);
-  const request = useRef<{ controller: AbortController; timer: ReturnType<typeof setTimeout> } | null>(null);
+  // 验证通过本身就会换登录，所以这次验证不跟着登录作废。
+  const requests = useRequestGuard('', { anonymous: true });
+  const pending = useRef<RequestTicket | null>(null);
   const [tokenInput, setTokenInput] = useState(urlToken);
   const [error, setError] = useState('');
   const [verifying, setVerifying] = useState<VerificationMode | null>(null);
 
   const verify = useCallback(async (value: string, mode: VerificationMode) => {
-    if (request.current) return;
+    if (pending.current?.isCurrent()) return;
     const token = value.trim();
     if (!token) { setError('请输入管理员令牌。'); inputRef.current?.focus(); return; }
-    const id = ++sequence.current;
-    const controller = new AbortController();
+    const request = requests.begin('verify');
+    pending.current = request;
     const timer = setTimeout(() => {
-      if (sequence.current !== id) return;
-      controller.abort();
-      request.current = null;
-      sequence.current++;
+      if (!request.isCurrent()) return;
+      requests.drop('verify');
       setVerifying(null);
       setError('连接超时。请检查服务是否运行，然后重新登录；已保存的令牌未删除。');
     }, AUTH_TIMEOUT_MS);
-    request.current = { controller, timer };
     setError('');
     setVerifying(mode);
     try {
-      const ok = await verifyAdminAuth(token, controller.signal);
-      if (sequence.current !== id || controller.signal.aborted) return;
+      const ok = await verifyAdminAuth(token, request.signal);
+      if (!request.isCurrent()) return;
       if (!ok) {
         if (mode !== 'manual' && useSettingsStore.getState().adminToken === token) setAdminToken(null);
         setError('令牌无效或已过期，请检查后重试。');
@@ -48,19 +48,17 @@ export const LoginPage = ({ embedded = false }: { embedded?: boolean }) => {
       }
       setAdminToken(token);
       setAuthenticated(true);
-      void loadEntryNodes(token, () => {
-        const current = useSettingsStore.getState();
-        return current.isAuthenticated && current.adminToken === token;
-      });
+      void loadEntryNodes(token);
     } catch {
-      if (sequence.current === id && !controller.signal.aborted) {
+      if (request.isCurrent()) {
         setError('暂时无法验证登录。请检查服务和网络后重试；已保存的令牌未删除。');
       }
     } finally {
       clearTimeout(timer);
-      if (sequence.current === id) { request.current = null; setVerifying(null); }
+      if (request.isCurrent()) setVerifying(null);
+      if (pending.current === request) pending.current = null;
     }
-  }, [setAdminToken, setAuthenticated]);
+  }, [requests, setAdminToken, setAuthenticated]);
 
   useEffect(() => {
     const url = new URL(window.location.href);
@@ -69,10 +67,6 @@ export const LoginPage = ({ embedded = false }: { embedded?: boolean }) => {
       window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
     }
     if (initialToken.current) void verify(initialToken.current, urlToken ? 'link' : 'saved');
-    return () => {
-      sequence.current++;
-      if (request.current) { request.current.controller.abort(); clearTimeout(request.current.timer); request.current = null; }
-    };
   }, [urlToken, verify]);
 
   useEffect(() => {
@@ -80,8 +74,7 @@ export const LoginPage = ({ embedded = false }: { embedded?: boolean }) => {
   }, [verifying]);
 
   const useAnotherToken = () => {
-    sequence.current++;
-    if (request.current) { request.current.controller.abort(); clearTimeout(request.current.timer); request.current = null; }
+    requests.drop('verify');
     focusInput.current = true;
     setTokenInput('');
     setError('');

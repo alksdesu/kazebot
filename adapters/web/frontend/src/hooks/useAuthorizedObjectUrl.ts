@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 
 import { fetchBlob } from '../api/blobs';
 import { useSettingsStore } from '../store/settingsStore';
+import { useRequestGuard } from './useRequestGuard';
 
 export interface AuthorizedObjectUrl {
   url: string;
@@ -17,6 +18,7 @@ const IDLE: AuthorizedObjectUrl = { url: '', type: '', loading: false, error: nu
 /** source 为 null 或 enabled 为 false 时不取。 */
 export function useAuthorizedObjectUrl(source: string | null, enabled = true): AuthorizedObjectUrl {
   const token = useSettingsStore((state) => state.adminToken);
+  const requests = useRequestGuard();
   const [state, setState] = useState<AuthorizedObjectUrl>(IDLE);
 
   useEffect(() => {
@@ -24,23 +26,23 @@ export function useAuthorizedObjectUrl(source: string | null, enabled = true): A
       setState(IDLE);
       return undefined;
     }
-    const controller = new AbortController();
+    const request = requests.begin('blob');
     let objectUrl = '';
     setState({ ...IDLE, loading: true });
-    fetchBlob(source, { signal: controller.signal, token })
+    fetchBlob(source, { signal: request.signal, token })
       .then((blob) => {
-        if (controller.signal.aborted) return;
+        if (!request.isCurrent()) return;
         objectUrl = URL.createObjectURL(blob);
         setState({ url: objectUrl, type: blob.type, loading: false, error: null });
       })
       .catch((error: unknown) => {
-        if (!controller.signal.aborted) setState({ ...IDLE, error });
+        if (request.isCurrent()) setState({ ...IDLE, error });
       });
     return () => {
-      controller.abort();
+      requests.drop('blob');
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [source, enabled, token]);
+  }, [requests, source, enabled, token]);
 
   return state;
 }

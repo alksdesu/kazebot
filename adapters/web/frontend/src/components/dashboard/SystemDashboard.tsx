@@ -6,6 +6,7 @@
 import { useEffect, useMemo, useState } from 'react';
 
 import { checkHealth, getAdminState, type AdminState, type HealthState } from '../../api/supervisorClient';
+import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { useChatStore } from '../../store/chatStore';
 import { useSettingsStore } from '../../store/settingsStore';
 import { startPolling } from '../../utils/polling';
@@ -73,38 +74,34 @@ export const SystemDashboard = () => {
   const connectionStatus = useChatStore(state => state.connectionStatus);
   const [data, setData] = useState<DashboardData>({ adminState: null, health: null, error: '', loading: true });
   const [activeTasksOpen, setActiveTasksOpen] = useState(false);
+  const requests = useRequestGuard();
 
   useEffect(() => {
-    let cancelled = false;
-
     const load = async () => {
+      const request = requests.begin('dashboard');
       if (!adminToken) {
         // [2026-06-01] Why: /v1/admin/state is protected but /v1/health is public.
         // How: show health-only data when no token is configured. Purpose: the
         // dashboard remains useful before the user enters admin credentials.
         try {
           const health = await checkHealth();
-          if (!cancelled) setData({ adminState: null, health, error: '需要管理员令牌才能读取计数。', loading: false });
+          if (request.isCurrent()) setData({ adminState: null, health, error: '需要管理员令牌才能读取计数。', loading: false });
         } catch (error) {
-          if (!cancelled) setData({ adminState: null, health: null, error: errorMessage(error, '健康检查失败。'), loading: false });
+          if (request.isCurrent()) setData({ adminState: null, health: null, error: errorMessage(error, '健康检查失败。'), loading: false });
         }
         return;
       }
 
       try {
         const [adminState, health] = await Promise.all([getAdminState(adminToken), checkHealth()]);
-        if (!cancelled) setData({ adminState, health, error: '', loading: false });
+        if (request.isCurrent()) setData({ adminState, health, error: '', loading: false });
       } catch (error) {
-        if (!cancelled) setData((current) => ({ ...current, error: errorMessage(error, '仪表盘刷新失败。'), loading: false }));
+        if (request.isCurrent()) setData((current) => ({ ...current, error: errorMessage(error, '仪表盘刷新失败。'), loading: false }));
       }
     };
 
-    const stop = startPolling(load, 15000, { first: load });
-    return () => {
-      cancelled = true;
-      stop();
-    };
-  }, [adminToken]);
+    return startPolling(load, 15000, { first: load });
+  }, [requests, adminToken]);
 
   const pendingApprovals = data.adminState?.approvals?.pending ?? data.adminState?.pending_approvals?.length ?? 0;
   const activeTasks = countActiveTasks(data.adminState?.tasks);

@@ -3,11 +3,12 @@
 // list outside individual chat cards. How: read pending_approvals from admin state,
 // expose allow and deny actions, and mirror the selected approval into the right
 // panel. Purpose: approvals can be reviewed and decided from Settings.
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 import { getAdminState, type AdminApproval } from '../../../api/supervisorClient';
 import { useApprovalDecision, type ApprovalDecision } from '../../../hooks/useApprovalDecision';
 import { usePageNotice } from '../../../hooks/usePageNotice';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { Icon } from '../../common';
@@ -55,16 +56,16 @@ const ApprovalsSettingsPageBody = () => {
   const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const approvalDecision = useApprovalDecision();
-  // Polls and the reload after a decision can overlap; only the latest request may land.
-  const generation = useRef(0);
+  const requests = useRequestGuard();
 
   const load = useCallback(async (showSpinner = true) => {
     if (!adminToken || !isAuthenticated) return;
-    const version = ++generation.current;
+    // Polls and the reload after a decision can overlap; only the latest request may land.
+    const request = requests.begin('approvals');
     if (showSpinner) setLoading(true);
     try {
       const state = await getAdminState(adminToken);
-      if (version !== generation.current) return;
+      if (!request.isCurrent()) return;
       const pending = state.pending_approvals || [];
       setApprovals(pending);
       // Read the selection at call time: depending on it would tear down and restart the poll on every click.
@@ -72,12 +73,12 @@ const ApprovalsSettingsPageBody = () => {
       if (selected && !pending.some((item) => item.approval_id === selected.approval_id)) setSelectedApproval(null);
       setLoadError('');
     } catch (error) {
-      if (version !== generation.current) return;
+      if (!request.isCurrent()) return;
       setLoadError(errorMessage(error, '加载审批失败'));
     } finally {
       if (showSpinner) setLoading(false);
     }
-  }, [adminToken, isAuthenticated, setSelectedApproval, setLoadError]);
+  }, [requests, adminToken, isAuthenticated, setSelectedApproval, setLoadError]);
 
   // Clear the notice only on an explicit refresh: deciding reloads right after writing its result.
   const refresh = useCallback(async () => {
@@ -91,8 +92,7 @@ const ApprovalsSettingsPageBody = () => {
     // Why: approvals may be created or decided by other sessions while this tab is
     // open. How: poll the admin state quietly between manual refreshes. Purpose:
     // operators can make decisions from a current queue.
-    const stop = startPolling(() => load(false), 10000, { first: () => load() });
-    return () => { stop(); generation.current += 1; };
+    return startPolling(() => load(false), 10000, { first: () => load() });
   }, [adminToken, isAuthenticated, load]);
 
   const decide = async (approval: AdminApproval, decision: ApprovalDecision) => {

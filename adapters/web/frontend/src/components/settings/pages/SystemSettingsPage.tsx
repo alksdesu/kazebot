@@ -5,13 +5,14 @@ import { usePageNotice } from '../../../hooks/usePageNotice';
 // restart. How: combine existing health/admin endpoints with guarded action buttons
 // and a 15-second status refresh. Purpose: high-impact system controls stay visible
 // while still requiring admin auth and restart confirmation.
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { ActiveTasksModal } from '../../dashboard/ActiveTasksModal';
 
 import { checkHealth, getAdminState, reloadConfig, restartEngine, type AdminState, type HealthState } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
-import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
+import { useSettingsStore } from '../../../store/settingsStore';
 import { startPolling } from '../../../utils/polling';
 import { countActiveTasks, formatUptime, restartRefusal } from '../../../utils/systemStatus';
 import { Block, Button, PageShell, StatusText } from './settingsControls';
@@ -47,8 +48,7 @@ const SystemSettingsPageBody = () => {
   const { busy, run } = useExclusiveAction();
   const [activeTasksOpen, setActiveTasksOpen] = useState(false);
   const addSystemLog = useSettingsSelectionStore(state => state.addSystemLog);
-  // 轮询和重载配置后的重读会撞在一起，只认最后发出的那次。
-  const generation = useRef(0);
+  const requests = useRequestGuard();
 
   // 只记重载与重启，15 秒一次的状态轮询失败不进操作日志。
   const report = useCallback((text: string) => {
@@ -58,21 +58,22 @@ const SystemSettingsPageBody = () => {
 
   const load = useCallback(async (showSpinner = true) => {
     if (!adminToken || !isAuthenticated) return;
-    const version = ++generation.current;
+    // 轮询和重载配置后的重读会撞在一起，只认最后发出的那次。
+    const request = requests.begin('status');
     if (showSpinner) setLoading(true);
     try {
       const [state, healthState] = await Promise.all([getAdminState(adminToken), checkHealth()]);
-      if (version !== generation.current) return;
+      if (!request.isCurrent()) return;
       setAdminState(state);
       setHealth(healthState);
       setLoadError('');
     } catch (error) {
-      if (version !== generation.current) return;
+      if (!request.isCurrent()) return;
       setLoadError(errorMessage(error, '加载系统状态失败'));
     } finally {
       if (showSpinner) setLoading(false);
     }
-  }, [adminToken, isAuthenticated, setLoadError]);
+  }, [requests, adminToken, isAuthenticated, setLoadError]);
 
   // 手动刷新才清提示：重载配置写完结果紧接着就会重读。
   const refresh = useCallback(async () => {
@@ -86,8 +87,7 @@ const SystemSettingsPageBody = () => {
     // Why: sessions, approvals, running tasks, workers, and uptime can change while
     // operators keep this tab open. How: run a quiet refresh without replacing the
     // manual button with a spinner. Purpose: the status cards remain current.
-    const stop = startPolling(() => load(false), 15000, { first: () => load() });
-    return () => { stop(); generation.current += 1; };
+    return startPolling(() => load(false), 15000, { first: () => load() });
   }, [adminToken, isAuthenticated, load]);
 
   const engineInfo = useMemo(() => {
@@ -107,11 +107,11 @@ const SystemSettingsPageBody = () => {
     if (!adminToken) return;
     try {
       await reloadConfig(adminToken);
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       report('配置已重载');
       await load(false);
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       report(errorMessage(error, '配置重载失败'));
     }
   });
@@ -120,11 +120,11 @@ const SystemSettingsPageBody = () => {
     if (!window.confirm('确认要重启引擎吗？运行中的任务会全部中断，调度器与本页面的连接不受影响。')) return;
     try {
       const result = await restartEngine(adminToken);
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       // 没说排上就当没排上：报成功会让人白等。
       report(result?.scheduled ? '已请求重启引擎' : `未能重启：${restartRefusal(result)}`);
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       report(errorMessage(error, '重启失败'));
     }
   });

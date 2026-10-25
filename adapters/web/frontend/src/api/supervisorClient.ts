@@ -167,8 +167,11 @@ export interface HealthState {
   uptime_seconds?: number;
 }
 
-export async function checkHealth(signal?: AbortSignal): Promise<HealthState> {
-  const resp = await apiFetch('/health', { signal, anonymous: true });
+/** 连接状态灯的健康检查：十秒没应答就算断开，不等读请求默认的那一分钟。 */
+export const HEALTH_TIMEOUT_MS = 10_000;
+
+export async function checkHealth(signal?: AbortSignal, timeoutMs?: number): Promise<HealthState> {
+  const resp = await apiFetch('/health', { signal, anonymous: true, timeoutMs });
   return resp.json();
 }
 

@@ -5,12 +5,13 @@ import { useExclusiveAction } from '../../../hooks/useExclusiveAction';
 // How: list parsed skill metadata and support create/delete actions here, while the
 // full frontmatter form and Markdown editor live in the Settings right panel. Purpose:
 // skill maintenance is split into a clean list and a focused editor.
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { createSkill, deleteSkill, getSkills, type AdminSkill } from '../../../api/supervisorClient';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
-import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { useSettingsStore } from '../../../store/settingsStore';
+import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
 import { savedMessage } from '../../../utils/sentence';
 import { errorMessage } from '../../../api/request';
@@ -35,23 +36,23 @@ export const SkillsSettingsPage = () => {
   const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const { busy, run } = useExclusiveAction();
-  const generation = useRef(0);
+  const requests = useRequestGuard();
 
   const load = async () => {
     if (!adminToken || !isAuthenticated) return;
-    const version = ++generation.current;
+    const request = requests.begin('skills');
     setLoading(true);
     try {
       const items = await getSkills(adminToken);
-      if (version !== generation.current) return;
+      if (!request.isCurrent()) return;
       setSkills(items);
       if (selectedSkill && !items.some((item) => item.name === selectedSkill.name)) setSelectedSkill(null);
       setLoadError('');
     } catch (error) {
-      if (version !== generation.current) return;
+      if (!request.isCurrent()) return;
       setLoadError(errorMessage(error, '加载技能失败'));
     } finally {
-      if (version === generation.current) setLoading(false);
+      if (request.isCurrent()) setLoading(false);
     }
   };
 
@@ -61,7 +62,7 @@ export const SkillsSettingsPage = () => {
     await load();
   };
 
-  useEffect(() => { void refresh(); return () => { generation.current += 1; }; }, [adminToken, isAuthenticated]);
+  useEffect(() => { void refresh(); }, [requests]);
 
   useEffect(() => {
     // [2026-06-02] Refresh parsed skill metadata after the right-panel editor saves.
@@ -71,7 +72,7 @@ export const SkillsSettingsPage = () => {
     const handler = () => { void load(); };
     window.addEventListener('settings:skills-updated', handler);
     return () => window.removeEventListener('settings:skills-updated', handler);
-  }, [adminToken, isAuthenticated, selectedSkill?.name]);
+  }, [requests, selectedSkill?.name]);
 
   const create = () => run(async () => {
     if (!adminToken) return;
@@ -80,14 +81,14 @@ export const SkillsSettingsPage = () => {
     if (!confirmNavigation()) return;
     try {
       const result = await createSkill(adminToken, { id: name, content: defaultSkillMarkdown(name) });
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setNewName('');
       setMessage(savedMessage('技能已创建，请在右栏编辑 frontmatter 和正文。', '', result.warnings));
       await load();
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setSelectedSkill({ name, description: '通过设置页面创建的技能。', enabled: true, strategy: 'normal', keywords: [] });
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error, '创建技能失败'));
     }
   });
@@ -97,12 +98,12 @@ export const SkillsSettingsPage = () => {
     if (!confirmNavigation()) return;
     try {
       await deleteSkill(adminToken, selectedSkill.name);
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setSelectedSkill(null);
       setMessage('技能已删除');
       await load();
     } catch (error) {
-      if (tokenChanged(adminToken)) return;
+      if (!requests.isCurrent()) return;
       setMessage(errorMessage(error, '删除技能失败'));
     }
   });
