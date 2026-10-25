@@ -15,6 +15,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import config_layout  # noqa: E402
 from platforms.descriptor import (  # noqa: E402
     CHANNEL_GROUP,
     ChannelDescriptor,
@@ -836,7 +837,7 @@ def test_a_single_instance_deployment_is_not_given_a_roster_lock(tmp_path: Path)
     path = instances_file(tmp_path)
     assert record_account(tmp_path, prefix="", platform_id="qq", account="1000000001") is False
     assert not path.exists()
-    assert not path.with_name(f"{path.name}.lock").exists()
+    assert not config_layout.lock_path(path).exists()
 
 
 # ── 摘掉实例 ───────────────────────────────

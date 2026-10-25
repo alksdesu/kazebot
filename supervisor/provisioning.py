@@ -6,8 +6,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
-import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,11 +27,15 @@ from platforms.registry import (
 from platforms.wording import name_with
 
 from .instances import (
+    INSTANCE_ID_PATTERN,
     MAX_INDEX,
+    RESERVED_IDS,
+    InstanceDirectoryError,
     NoFreeIndex,
     account_owner_in,
     allocate_index,
     instances_file,
+    is_instance_id,
     load_instances,
     normalize_prefix,
     ports_for,
@@ -40,15 +44,12 @@ from .instances import (
     save_instance,
 )
 
-# 实例名会一路传进 root 侧的 systemd 单元名，宽一格都是提权面。纯数字那支认改造前按 QQ 号开的实例。
-INSTANCE_ID_PATTERN = r"[a-z][a-z0-9_]{1,31}|[1-9][0-9]{4,10}"
-_INSTANCE_ID_RE = re.compile(rf"^(?:{INSTANCE_ID_PATTERN})$")
-# 数据根下已有的共享目录：表情包库和共享配置组。实例叫这个名字，工作区就和它是同一个目录。
-RESERVED_IDS = frozenset({"stickers", config_layout.SHARED_DIR})
 # 工作区里这几个名字必须解析到代码：workspace_root 直接拼接它们找 dist、system_nodes、工具和仓库默认。
 _LINKED = config_layout.CODE_LINKS
 # 磁盘每个实例每月涨 4G 左右，留不出这么多就别开新实例了。
 _MIN_FREE_BYTES = 8 * 1024**3
+# 只有 kazebot 自己能读：里面有 OneBot 的访问令牌。
+_ENV_FILE_MODE = 0o600
 
 CREATE_UNIT = "kazebot-provision@{instance_id}.service"
 REMOVE_UNIT = "kazebot-deprovision@{instance_id}.service"
@@ -74,7 +75,7 @@ class Plan:
 
 def validate_instance_id(raw: str) -> str:
     instance_id = str(raw or "").strip()
-    if not _INSTANCE_ID_RE.match(instance_id) or instance_id in RESERVED_IDS:
+    if not is_instance_id(instance_id):
         raise ProvisionError(
             f"实例名要以小写字母开头、只含小写字母数字和下划线，2-32 位（不能叫 {'、'.join(sorted(RESERVED_IDS))}）；"
             "按 QQ 号开的老实例是 5-11 位数字"
@@ -158,6 +159,18 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _unreadable_roster(workspace_root: Path) -> ProvisionError:
+    return ProvisionError(f"实例清单 {instances_file(workspace_root)} 读不懂，先在服务器上修好它")
+
+
+def _roster(workspace_root: Path) -> list[dict[str, Any]]:
+    """要拿来分配序号、查重名的清单。读不懂就停下：当成没有别的实例，会分到正在跑的实例的端口。"""
+    try:
+        return load_instances(workspace_root, required=True)
+    except InstanceDirectoryError as error:
+        raise _unreadable_roster(workspace_root) from error
+
+
 def plan_instance(
     workspace_root: Path,
     *,
@@ -170,7 +183,7 @@ def plan_instance(
     instance_id = validate_instance_id(instance_id)
     platform = platform or resolve_platform(None)
     account = normalize_account(platform, account)
-    rows = load_instances(workspace_root)
+    rows = _roster(workspace_root)
     if any(row["id"] == instance_id for row in rows):
         raise ProvisionError(f"{instance_id} 已经在清单里了")
     owner = account_owner_in(rows, platform.id, account)
@@ -182,7 +195,12 @@ def plan_instance(
     if target.exists():
         raise ProvisionError(f"{target} 已存在，先在服务器上确认它不是还在跑的实例")
 
-    free = shutil.disk_usage(root if root.exists() else root.parent).free
+    existing = root if root.exists() else root.parent
+    # 多开实例的 systemd 沙箱只放开它自己的工作区，数据根是只读挂载；access 认得出只读挂载。
+    if not os.access(existing, os.W_OK):
+        raise ProvisionError(f"这个实例写不了 {existing}，到主实例的控制台去建")
+
+    free = shutil.disk_usage(existing).free
     if free < _MIN_FREE_BYTES:
         raise ProvisionError(f"磁盘只剩 {free / 1024**3:.1f}G，不够开新实例")
 
@@ -250,24 +268,26 @@ def scaffold(plan: Plan, workspace_root: Path) -> None:
 
     link_shared_stickers(plan.workspace, workspace_root)
 
-    env_file = plan.workspace / ".env"
-    if not env_file.exists():
-        env_file.write_text(_env_body(plan), encoding="utf-8")
-        env_file.chmod(0o600)
+    # 已经有的 .env 不动：重试建实例时 root 侧可能已经往里回填过 WebUI 令牌。
+    with contextlib.suppress(config_layout.ConfigConflict):
+        config_layout.write_config_text(plan.workspace / ".env", _env_body(plan), base_hash="", mode=_ENV_FILE_MODE)
 
     # 先由 kazebot 建出来，root 之后只 append —— 属主保持不变，控制台才读得到后续进度。
     log_path(workspace_root, plan.instance_id).write_text(
         "工作区就绪，等 root 侧接手…\n", encoding="utf-8",
     )
 
-    save_instance(
-        workspace_root,
-        instance_id=plan.instance_id,
-        label=plan.label,
-        idx=plan.idx,
-        platform=plan.platform,
-        account=plan.account,
-    )
+    try:
+        save_instance(
+            workspace_root,
+            instance_id=plan.instance_id,
+            label=plan.label,
+            idx=plan.idx,
+            platform=plan.platform,
+            account=plan.account,
+        )
+    except InstanceDirectoryError as error:
+        raise ProvisionError(f"实例清单 {instances_file(workspace_root)} 读不懂，没有登记 {plan.instance_id}") from error
 
 
 async def _systemctl(*args: str) -> tuple[int, str]:
@@ -300,10 +320,14 @@ def read_log(path: Path, *, limit: int = 200) -> list[str]:
 
 
 def progress(workspace_root: Path, instance_id: str) -> dict[str, Any]:
-    """给前端轮询。脚本最后一行写 DONE，据此判成败，不必去读 journal。"""
+    """给前端轮询。脚本最后一行写 DONE，据此判成败，不必去读 journal。
+
+    只认最后一行：重试删除时新进度接在上一次的 DONE fail 后面，往回找 DONE 会把上一次的失败当成这一次的结果。
+    """
     instance_id = validate_instance_id(instance_id)
     lines = read_log(log_path(workspace_root, instance_id))
-    done = next((line for line in reversed(lines) if line.startswith("DONE")), "")
+    last = next((line for line in reversed(lines) if line.strip()), "")
+    done = last if last.startswith("DONE") else ""
     payload: dict[str, Any] = {
         "id": instance_id,
         "lines": lines,
@@ -322,13 +346,16 @@ def progress(workspace_root: Path, instance_id: str) -> dict[str, Any]:
 
 def forget(workspace_root: Path, instance_id: str) -> None:
     """从清单摘掉。工作区由 root 侧改名归档，这里不碰文件。"""
-    remove_instance(workspace_root, validate_instance_id(instance_id))
+    try:
+        remove_instance(workspace_root, validate_instance_id(instance_id))
+    except InstanceDirectoryError as error:
+        raise _unreadable_roster(workspace_root) from error
 
 
 def guard_removable(workspace_root: Path, instance_id: str, *, current_prefix: str) -> dict[str, Any]:
     """不许删自己，也不许删清单外的实例 —— 后者意味着参数是猜出来的。"""
     instance_id = validate_instance_id(instance_id)
-    rows = load_instances(workspace_root)
+    rows = _roster(workspace_root)
     row = next((r for r in rows if r["id"] == instance_id), None)
     if row is None:
         raise ProvisionError(f"{instance_id} 不在清单里")

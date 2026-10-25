@@ -177,10 +177,10 @@ class TestSharedSecrets:
 
 class TestTheLockFileName:
     def test_a_dotfile_does_not_get_a_second_dot(self, tmp_path: Path) -> None:
-        assert config_layout._lock_path(tmp_path / ".env").name == ".env.lock"
+        assert config_layout.lock_path(tmp_path / ".env").name == ".env.lock"
 
     def test_an_ordinary_file_gets_a_hidden_lock(self, tmp_path: Path) -> None:
-        assert config_layout._lock_path(tmp_path / "secrets.env").name == ".secrets.env.lock"
+        assert config_layout.lock_path(tmp_path / "secrets.env").name == ".secrets.env.lock"
 
 
 # ---------------------------------------------------------------------------

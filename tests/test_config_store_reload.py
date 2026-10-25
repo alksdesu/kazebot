@@ -312,7 +312,7 @@ class TestTheApiReportsABrokenFileAsFourHundred:
 class TestMutations:
     def test_the_read_happens_inside_the_file_lock(self, store: ConfigStore, models: Path) -> None:
         """锁外先读会丢掉别处刚写进去的块：拿到锁之后必须重读一遍。"""
-        holder = LockHolder(config_layout._lock_path(models))
+        holder = LockHolder(config_layout.lock_path(models))
         done = threading.Event()
 
         def edit() -> None:

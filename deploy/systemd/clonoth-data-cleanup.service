@@ -1,14 +1,24 @@
 [Unit]
 Description=Clonoth periodic data cleanup
 Documentation=file:/opt/Clonoth/engine/data_cleanup.py
-Wants=clonoth.service
 After=local-fs.target
 
 [Service]
 Type=oneshot
+# 换成实际跑 supervisor、拥有 /opt/Clonoth 的账号。以 root 跑的话，agent 写得动的 .env 和 .venv 就成了 root 执行的东西
+User=clonoth
+Group=clonoth
 WorkingDirectory=/opt/Clonoth
+Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=-/opt/Clonoth/.env
-ExecStart=/opt/Clonoth/.venv/bin/python -m engine.data_cleanup
+# NapCat 容器里的缓存归 root，这里删不动，交给宿主清理（kazebot-host-cleanup）
+ExecStart=/opt/Clonoth/.venv/bin/python -m engine.data_cleanup --scope workspace
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
+
+ProtectSystem=strict
+ReadWritePaths=/opt/Clonoth/data
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

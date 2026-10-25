@@ -12,6 +12,8 @@ Group=kazebot
 WorkingDirectory=/opt/kazebot-data/%i
 Environment=PYTHONPATH=/opt/kazebot
 Environment=CLONOTH_WORKSPACE=/opt/kazebot-data/%i
+# 和 kazebot@ 同一个清单位置：数据根按它认，共享表情包库和共享组的配置才算工作区里的受信链接
+Environment=CLONOTH_INSTANCES_FILE=/opt/kazebot-data/instances.yaml
 Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=-/opt/kazebot-data/%i/.env
 ExecStart=/opt/kazebot/.venv/bin/python /opt/kazebot/bot.py

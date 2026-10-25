@@ -205,7 +205,8 @@ class TestPromptIncludes:
 
 class TestRuntimeOverlay:
     def test_without_any_file_the_code_defaults_are_used(self, ws: Path, code_root: Path) -> None:
-        assert clonoth_runtime.load_runtime_config(ws)["engine"]["max_steps"] == 32
+        expected = clonoth_runtime.DEFAULT_RUNTIME_CONFIG["engine"]["max_steps"]
+        assert clonoth_runtime.load_runtime_config(ws)["engine"]["max_steps"] == expected
 
     def test_the_bundled_runtime_overrides_the_code_defaults(self, ws: Path, code_root: Path) -> None:
         _write(config_layout.default_runtime_path(), "engine:\n  max_steps: 40\n")

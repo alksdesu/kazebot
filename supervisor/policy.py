@@ -4,6 +4,7 @@ import contextlib
 import copy
 import fnmatch
 import ipaddress
+import logging
 import re
 import shlex
 import threading
@@ -20,6 +21,8 @@ from platforms.protection import policy_floor
 from platforms.registry import all_platforms
 
 from .types import SafetyLevel
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,8 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "config/mcp.yaml", "decision": "approval_required", "reason": "mcp clients may carry tokens in env or headers"},
                 {"pattern": "config/policy.yaml", "decision": "approval_required", "reason": "policy exposes the shape of every guard"},
                 {"pattern": "config/drawtools/settings.yaml", "decision": "approval_required", "reason": "drawtools settings may hold the NovelAI api key"},
+                {"pattern": "config/plugins.yaml", "decision": "approval_required", "reason": "plugin settings may hold passwords and tokens"},
+                {"pattern": "config/plugins/**", "decision": "approval_required", "reason": "installed plugin packages may bundle credentials"},
                 # data/ 下有平台密钥、.admin_token、会话与事件流。落到 default:auto
                 # 等于任何人问一句就能把密钥读出来。
                 {"pattern": "data/**", "decision": "approval_required", "reason": "runtime data may contain secrets or private context"},
@@ -100,6 +105,9 @@ def _default_policy_dict() -> dict[str, Any]:
                 # stdio 客户端的 command 会在 reload 后被启动，等价于 config/tools/** 的代码执行风险。
                 {"pattern": "config/mcp.yaml", "decision": "approval_required", "reason": "mcp stdio clients execute local commands"},
                 {"pattern": "config/tools/**", "decision": "approval_required", "reason": "creating/updating tools requires approval"},
+                # 插件包在 supervisor 和控制台里当代码跑，配置里还有插件的密码类参数。
+                {"pattern": "config/plugins/**", "decision": "approval_required", "reason": "plugin packages run as code once loaded"},
+                {"pattern": "config/plugins.yaml", "decision": "approval_required", "reason": "plugin settings hold credentials and switch plugins on"},
                 # skill 正文直接进系统提示词，和 config/nodes/** 是同一类影响。
                 # 注意副作用：dream 想把高频记忆提升成 skill 会被这条挡下 —— scheduler
                 # 会话遇到 sensitive 决策是直接拒绝而非转审批。要那个功能就在
@@ -241,6 +249,8 @@ _STRICTNESS: dict[SafetyLevel, int] = {
 # 策略暴露的是整套防护面的形状，同机其他用户没有理由读到。
 _POLICY_FILE_MODE = 0o600
 
+_SECRET_FLOOR_REASON = "config file holds plaintext secrets"
+
 
 def _validate_rules_section(name: str, section: Any) -> dict[str, Any]:
     if not isinstance(section, dict):
@@ -366,13 +376,62 @@ def _is_public_http_url(raw: str) -> bool:
     return True
 
 
-def _load_policy_bytes(raw: bytes) -> dict[str, Any] | None:
-    """解析读到的那份字节：指纹也按这份字节算，内容和指纹才出自同一版。"""
+# 每一段认哪些键。写错的键运行期被静默忽略，以为加上的规则其实从没生效。
+_POLICY_KEYS: dict[str, frozenset[str]] = {
+    "": frozenset({"version", "extra_roots", "read_file", "write_file", "execute_command", "restart"}),
+    "read_file": frozenset({"default", "rules"}),
+    "write_file": frozenset({"default", "rules"}),
+    "execute_command": frozenset({"default", "deny_patterns", "sensitive_patterns", "sensitive_path_patterns"}),
+    "restart": frozenset({"default"}),
+}
+_RULE_KEYS = frozenset({"pattern", "decision", "reason"})
+
+
+def _unknown_policy_keys(data: dict[str, Any]) -> list[str]:
+    """策略里没有任何地方读的键，按点分路径写。"""
+    unknown = [str(key) for key in data if key not in _POLICY_KEYS[""]]
+    for section, known in _POLICY_KEYS.items():
+        body = data.get(section) if section else None
+        if not isinstance(body, dict):
+            continue
+        unknown.extend(f"{section}.{key}" for key in body if key not in known)
+        rules = body.get("rules") if section in {"read_file", "write_file"} else None
+        for index, rule in enumerate(rules if isinstance(rules, list) else []):
+            if isinstance(rule, dict):
+                unknown.extend(f"{section}.rules[{index}].{key}" for key in rule if key not in _RULE_KEYS)
+    return unknown
+
+
+def load_policy_text(text: str) -> dict[str, Any]:
+    """policy 原文解析成映射。解析不了、顶层不是映射（空文件也算）都抛 ValueError。"""
     try:
-        data = yaml.safe_load(raw.decode("utf-8"))
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"YAML 解析失败：{exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("policy 顶层必须是映射（key: value）")
+    return data
+
+
+def _unknown_keys_note(unknown: list[str]) -> str:
+    return f"这些键没有任何地方读，写在那里的规则不会生效：{', '.join(unknown)}"
+
+
+def check_policy_text(text: str) -> list[str]:
+    """原文编辑器保存前的校验，和运行期重读是同一套：解析不了、结构不对抛 ValueError；没人读的键照存，返回提醒。"""
+    data = load_policy_text(text)
+    _validate_policy_dict(data)
+    unknown = _unknown_policy_keys(data)
+    return [_unknown_keys_note(unknown)] if unknown else []
+
+
+def _load_policy_bytes(raw: bytes) -> dict[str, Any]:
+    """解析读到的那份字节：指纹也按这份字节算，内容和指纹才出自同一版。用不了抛 ValueError。"""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"不是 UTF-8 文本：{exc}") from exc
+    return load_policy_text(text)
 
 
 class PolicyEngine:
@@ -388,14 +447,18 @@ class PolicyEngine:
     def __init__(self, *, workspace_root: Path, policy_path: Path | None = None):
         self._root = workspace_root
         self._policy_path = policy_path or config_layout.policy_path(workspace_root)
+        self._policy_name = config_layout.logical_path(workspace_root, self._policy_path)
 
         self._cached_stamp: tuple[int, int, int] | None = None
         # 生效的这份策略出自哪一版文件，按内容算；文件不在是空串。编辑器保存时交回比对。
         self._cfg_hash = ""
+        # 文件现在有什么问题；空串表示生效的就是文件里那份。
+        self._load_error = ""
         # 重读和导出都在锁里：交给编辑器的内容和指纹必须出自同一版文件。
         self._lock = threading.RLock()
 
-        self._cfg: dict[str, Any] = _default_policy_dict()
+        # 第一次读文件就读坏时，生效的是这份内置默认。
+        self._cfg: dict[str, Any] = _validate_policy_dict(_default_policy_dict())
 
         self._extra_roots: list[Path] = []
 
@@ -410,6 +473,7 @@ class PolicyEngine:
         self._sensitive_command_patterns: list[re.Pattern[str]] = []
         self._sensitive_path_patterns: list[tuple[re.Pattern[str], SafetyLevel, str]] = []
 
+        self._compile()
         self._ensure_policy_file_exists()
         self._reload_if_needed(force=True)
 
@@ -446,9 +510,8 @@ class PolicyEngine:
     def replace_config(self, data: Any, *, base_hash: str | None = None) -> tuple[dict[str, Any], str]:
         """整份替换并落盘，返回落盘后的内容和指纹。
 
-        校验不过就抛 ValueError 且不写盘：一份解析不了的 yaml 会让 _reload_if_needed
-        静默退回内置默认，策略被换掉却看不出任何迹象。给了 base_hash 而文件已被别处改过，
-        抛 config_layout.ConfigConflict，同样不写。
+        校验不过就抛 ValueError 且不写盘：坏的那份落下去，运行期只能沿用上一份，界面上却显示保存成功。
+        给了 base_hash 而文件已被别处改过，抛 config_layout.ConfigConflict，同样不写。
         """
         validated = _validate_policy_dict(data)
         text = yaml.safe_dump(validated, sort_keys=False, allow_unicode=True)
@@ -459,6 +522,13 @@ class PolicyEngine:
         self._reload_if_needed(force=True)
         return self.export_versioned()
 
+    @property
+    def load_error(self) -> str:
+        """策略文件现在有什么问题、生效的是哪一份；空串表示生效的就是文件里写的那份。健康检查报这个。"""
+        with self._lock:
+            self._reload_if_needed()
+            return self._load_error
+
     def _reload_if_needed(self, *, force: bool = False) -> None:
         # 共享组里别的实例也改这份文件：按 file_stamp 比，同一刻写进的新规则也认得出来。
         stamp = config_layout.file_stamp(self._policy_path)
@@ -467,6 +537,7 @@ class PolicyEngine:
                 # 文件被删了：规则照旧用上一份，指纹记成「不存在」，编辑器保存时把它重新建出来。
                 self._cfg_hash = ""
                 self._cached_stamp = None
+                self._load_error = f"{self._policy_name} 不见了，沿用上一份策略；在控制台保存一次就会重新建出来"
                 return
 
             if not force and stamp == self._cached_stamp:
@@ -476,13 +547,22 @@ class PolicyEngine:
                 raw = self._policy_path.read_bytes()
             except OSError:
                 return
-            data = _load_policy_bytes(raw)
-            if not isinstance(data, dict):
-                data = _default_policy_dict()
-
-            self._cfg = data
-            self._cfg_hash = config_layout.bytes_hash(raw)
             self._cached_stamp = stamp
+            # 写坏了指纹也按这一版算：编辑器拿生效的那份存一次，坏文件就被盖掉了。
+            self._cfg_hash = config_layout.bytes_hash(raw)
+            try:
+                data = _load_policy_bytes(raw)
+                cfg = _validate_policy_dict(data)
+            except ValueError as exc:
+                # 不退回内置默认：写坏一个字，自定义的 deny 规则就会静默消失。
+                self._load_error = f"{self._policy_name} 用不了，沿用上一份能用的策略：{exc}"
+                _log.warning("%s", self._load_error)
+                return
+            unknown = _unknown_policy_keys(data)
+            self._load_error = f"{self._policy_name} 里{_unknown_keys_note(unknown)}" if unknown else ""
+            if unknown:
+                _log.warning("%s", self._load_error)
+            self._cfg = cfg
             self._compile()
 
     def _compile_rules(self, section: dict[str, Any]) -> tuple[SafetyLevel, list[tuple[str, SafetyLevel, str]]]:
@@ -555,6 +635,8 @@ class PolicyEngine:
         read_floor, write_floor = policy_floor(workspace=self._root)
         self._read_rules = [(rule.pattern, SafetyLevel.deny, rule.reason) for rule in read_floor] + self._read_rules
         self._write_rules = [(rule.pattern, SafetyLevel.deny, rule.reason) for rule in write_floor] + self._write_rules
+        self._read_rules = self._secret_floor(self._read_rules, self._read_default) + self._read_rules
+        self._write_rules = self._secret_floor(self._write_rules, self._write_default) + self._write_rules
 
         cmd_sec = self._cfg.get("execute_command")
         if isinstance(cmd_sec, dict):
@@ -590,6 +672,24 @@ class PolicyEngine:
             self._restart_default = _to_safety_level(str(restart_sec.get("default", "approval_required")))
         else:
             self._restart_default = SafetyLevel.approval_required
+
+    @classmethod
+    def _secret_floor(
+        cls, rules: list[tuple[str, SafetyLevel, str]], default: SafetyLevel,
+    ) -> list[tuple[str, SafetyLevel, str]]:
+        """装着明文密钥的配置每个名字一条，最低是审批，排在所有规则前面。
+
+        清单只认 config_layout 那一份：老部署的 policy.yaml 没写到的新密钥文件（比如 config/plugins.yaml）
+        也落不到 default:auto 上。按 rules 算出来已经够严的，档次和理由原样留着。
+        """
+        floor: list[tuple[str, SafetyLevel, str]] = []
+        least = SafetyLevel.approval_required
+        for name in config_layout.secret_bearing_names():
+            verdict = cls._first_match(name, rules, default)
+            level = verdict.safety_level if _STRICTNESS[verdict.safety_level] >= _STRICTNESS[least] else least
+            reason = verdict.reason if verdict.sensitive and level == verdict.safety_level else _SECRET_FLOOR_REASON
+            floor.append((name, level, reason))
+        return floor
 
     def _resolve_relpath(self, path_str: str) -> tuple[Path | None, str, bool]:
         return classify_path(self._root, self._extra_roots, path_str)
@@ -657,9 +757,10 @@ class PolicyEngine:
 
         # read_file 拦得住 read_file config/models.yaml，拦不住 cat config/models.yaml。
         # 命令提到敏感路径时按同一档处理，否则管理员免审批那条快车道等于给凭据开了后门。
-        for path_pat, level, literal in self._sensitive_path_patterns:
-            if not path_pat.search(cmd):
-                continue
+        # 一条命令可能同时点到好几个，取最严的那个：按排列顺序取第一个的话，前面一条审批会盖住后面的拒绝。
+        touched = [(level, literal) for path_pat, level, literal in self._sensitive_path_patterns if path_pat.search(cmd)]
+        if touched:
+            level, literal = max(touched, key=lambda item: _STRICTNESS[item[0]])
             if level == SafetyLevel.deny:
                 return PolicyDecision(
                     SafetyLevel.deny, f"command touches denied path: {literal}",

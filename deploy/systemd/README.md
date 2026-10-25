@@ -58,6 +58,8 @@ journalctl -u kazebot-host-cleanup.service -n 100 --no-pager
 
 `clonoth-data-cleanup.timer` runs `engine.data_cleanup` periodically. The cleanup script rotates large event logs and removes expired temporary files, artifacts, child-session files, node-context files, and files under `data/attachments/`.
 
+The service runs as `clonoth` in a sandbox that can only write `/opt/Clonoth/data`. Change `User=` and `Group=` to the account that owns `/opt/Clonoth` and runs the supervisor before installing it: as root, the `.env` and `.venv` the agent can write would run as root. It passes `--scope workspace`, so it leaves the QQ/NapCat cache alone; containers keep that cache as root, and `kazebot-host-cleanup.timer` above cleans it.
+
 Default retention is defined in `engine/data_cleanup.py`:
 
 - `data/events.jsonl`: rotate at 50 MiB and keep 3 backups
@@ -98,6 +100,7 @@ CLONOTH_MEMORY_ENTRY_MAX_AGE_SECONDS=1209600
 
 ```bash
 cd /opt/Clonoth
+# Set User= / Group= in the unit to the account that owns /opt/Clonoth first.
 sudo cp deploy/systemd/clonoth-data-cleanup.service /etc/systemd/system/
 sudo cp deploy/systemd/clonoth-data-cleanup.timer /etc/systemd/system/
 sudo systemctl daemon-reload

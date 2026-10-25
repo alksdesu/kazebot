@@ -29,7 +29,23 @@ LOG="$DATA_ROOT/provision-$INSTANCE.log"
 
 say() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 fail() { printf 'DONE fail: %s\n' "$*" >>"$LOG"; echo "$*" >&2; exit 1; }
-trap 'fail "第 $LINENO 行执行失败"' ERR
+# 不加 -E 的话 do_create/do_remove 里出错时 trap 不跟进函数，日志里没有 DONE，控制台就一直显示「进行中」。
+# 在 $(...) 里调过 fail 的，结果已经写下了，不再补一行笼统的盖住它。
+on_error() {
+  [[ "$(tail -n 1 "$LOG" 2>/dev/null)" == DONE* ]] || fail "第 $1 行执行失败"
+  exit 1
+}
+set -E
+trap 'on_error $LINENO' ERR
+
+# 没装 cloudflared（走别的反代、或者只在内网用）时跳过：实例照样起得来，只是外网入口要自己配。
+cf_edit() {
+  if [ ! -f "$CF_CONF" ]; then
+    say "没有 $CF_CONF，跳过 cloudflared；外网要访问的话自己在反代里把 /i/$INSTANCE 转给它"
+    return 0
+  fi
+  "$PY" "$CF_EDIT" "$@" | tee -a "$LOG"
+}
 
 # 只取需要的键，并且逐个按形状校验 —— .env 是 kazebot 可写的，当脚本输入而非代码看待。
 env_get() {
@@ -128,7 +144,7 @@ PY
   systemctl daemon-reload
 
   say "接入 cloudflared"
-  "$PY" "$CF_EDIT" add --config "$CF_CONF" --instance "$INSTANCE" --port "$sup_port" | tee -a "$LOG"
+  cf_edit add --config "$CF_CONF" --instance "$INSTANCE" --port "$sup_port"
 
   say "启动服务"
   chown -R "$OWNER:$OWNER" "$WS"
@@ -152,9 +168,9 @@ PY
 do_remove() {
   # 纵深防御：supervisor 侧已挡过一次，这里再确认删的不是主实例。
   [ "$WS" != "$REPO" ] || fail "拒绝操作代码目录"
-  [ -d "$WS" ] || fail "工作区 $WS 不存在"
   local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
 
+  # 每一步都能重跑：上次停在半路的话，控制台里那条还在，再点一次删除就接着做，做完的步骤自己跳过。
   say "停服务"
   systemctl disable --now "kazebot@$INSTANCE" "kazebot-qq@$INSTANCE" "kazebot-cleanup@$INSTANCE.timer" 2>&1 | tee -a "$LOG" || true
 
@@ -165,42 +181,50 @@ do_remove() {
   fi
 
   say "摘掉 cloudflared 规则"
-  "$PY" "$CF_EDIT" remove --config "$CF_CONF" --instance "$INSTANCE" | tee -a "$LOG"
+  cf_edit remove --config "$CF_CONF" --instance "$INSTANCE"
 
-  # 由完成方摘清单，不由发起方乐观预摘：root 这边失败的话，控制台里那条还在，
-  # 至少不会出现「清单查无此号、进程却还在跑」的幽灵。
-  # 锁的是 supervisor 侧用的同一个文件，否则两边同时改会丢条目。
+  # 归档而不是删除：这个脚本里不存在递归删除，被骗着跑一次也丢不了数据。
+  if [ -d "$WS" ]; then
+    say "工作区归档为 $WS.deleted-$stamp"
+    mv "$WS" "$WS.deleted-$stamp"
+  else
+    say "工作区 $WS 已经不在（上次已归档），跳过"
+  fi
+  if [ -d "$NC_HOME" ]; then
+    mv "$NC_HOME" "$NC_HOME.deleted-$stamp"
+  fi
+
+  # 清单最后摘，由完成方摘、不由发起方乐观预摘：前面哪一步失败，控制台里那条都还在，可以再点删除接着做，
+  # 也不会出现「清单查无此号、进程却还在跑」的幽灵。
+  # 锁的是 supervisor 侧 config_layout.lock_path 给的同一个锁文件，否则两边同时改会丢条目。
   say "从清单摘掉 $INSTANCE"
-  flock "$DATA_ROOT/instances.yaml.lock" "$PY" - "$DATA_ROOT/instances.yaml" "$INSTANCE" <<'PY'
+  flock "$DATA_ROOT/.instances.yaml.lock" "$PY" - "$DATA_ROOT/instances.yaml" "$INSTANCE" <<'PY'
 import pathlib, sys, yaml
 path, instance = pathlib.Path(sys.argv[1]), sys.argv[2]
 try:
-    doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-except OSError:
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+except FileNotFoundError:
     sys.exit(0)
-rows = doc.get("instances") if isinstance(doc, dict) else None
+rows = doc.get("instances") if isinstance(doc, dict) else doc
+if rows is None:
+    sys.exit(0)
 if not isinstance(rows, list):
-    sys.exit(0)
+    sys.exit("实例清单读不懂，没有摘；修好后再点一次删除")
 def row_id(row):
     # 和 supervisor.instances 读清单时一样认：先 id，空的退回改造前条目的 uin，两边都去空白。
     return str(row.get("id") or "").strip() or str(row.get("uin") or "").strip()
 
 kept = [r for r in rows if not (isinstance(r, dict) and row_id(r) == instance)]
+if len(kept) == len(rows):
+    sys.exit(0)
 tmp = path.with_name(path.name + ".tmp")
 tmp.write_text(yaml.safe_dump({"instances": kept}, allow_unicode=True, sort_keys=False), encoding="utf-8")
 tmp.replace(path)
 PY
   # flock 可能刚以 root 建出锁文件，不还回去 supervisor 下次就锁不上了。
-  chown "$OWNER:$OWNER" "$DATA_ROOT/instances.yaml" "$DATA_ROOT/instances.yaml.lock" 2>/dev/null || true
+  chown "$OWNER:$OWNER" "$DATA_ROOT/instances.yaml" "$DATA_ROOT/.instances.yaml.lock" 2>/dev/null || true
 
-  # 归档而不是删除：这个脚本里不存在递归删除，被骗着跑一次也丢不了数据。
-  say "工作区归档为 $WS.deleted-$stamp"
-  mv "$WS" "$WS.deleted-$stamp"
-  if [ -d "$NC_HOME" ]; then
-    mv "$NC_HOME" "$NC_HOME.deleted-$stamp"
-  fi
-
-  say "完成。数据留在 .deleted-$stamp，确认无误后自行清理。"
+  say "完成。数据归档在 $DATA_ROOT 下的 $INSTANCE.deleted-*，确认无误后自行清理。"
   printf 'DONE ok\n' >>"$LOG"
 }
 

@@ -10,6 +10,8 @@ Group=kazebot
 WorkingDirectory=/opt/kazebot-data/%i
 Environment=PYTHONPATH=/opt/kazebot
 Environment=CLONOTH_WORKSPACE=/opt/kazebot-data/%i
+# 和 kazebot@ 同一个清单位置：数据根按它认，data/stickers 这类链到数据根的目录才算工作区里的
+Environment=CLONOTH_INSTANCES_FILE=/opt/kazebot-data/instances.yaml
 Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=-/opt/kazebot-data/%i/.env
 # NapCat 容器里的缓存归 root，这里删不动，交给宿主清理（kazebot-host-cleanup）

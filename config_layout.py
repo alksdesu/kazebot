@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import yaml
 
@@ -45,6 +45,8 @@ DRAWTOOLS_DIR = f"{CONFIG_DIR}/drawtools"
 PLATFORM_SECRETS_FILE = "data/platform_secrets.yaml"
 # 能跟着 config/ 一起共享的 API 密钥。端口、地址、平台令牌这类实例身份留在各自的 .env，同名时 .env 的算数。
 SHARED_SECRETS_FILE = f"{CONFIG_DIR}/secrets.env"
+# 本实例眼下登的是哪个号。多开实例写不了数据根下的清单，只能记在自己的工作区里，读清单的人再叠上去。
+INSTANCE_ACCOUNT_FILE = "data/instance_account.yaml"
 
 # 多开时清单文件放在几个实例共用的数据根下，数据根就按它的位置认。单实例部署不设它。
 INSTANCES_FILE_ENV = "CLONOTH_INSTANCES_FILE"
@@ -183,6 +185,10 @@ def shared_secrets_path(workspace_root: Path | str) -> Path:
     return Path(workspace_root) / SHARED_SECRETS_FILE
 
 
+def instance_account_path(workspace_root: Path | str) -> Path:
+    return Path(workspace_root) / INSTANCE_ACCOUNT_FILE
+
+
 def example_name(name: str) -> str:
     """模板的文件名：settings.yaml → settings.example.yaml，prompts/a.md → prompts/a.example.md。"""
     path = Path(name)
@@ -283,7 +289,11 @@ def is_secret_bearing(rel_path: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def data_root() -> Path | None:
-    """几个实例共用的数据根：清单文件所在的目录。单实例部署没配清单，也就没有数据根。"""
+    """几个实例共用的数据根：清单文件所在的目录。单实例部署没配清单，也就没有数据根。
+
+    受信链接按它认，所以同一个实例的 supervisor、适配器和清理单元都得设同一个清单位置：
+    少设一个，共享表情包库和共享组的配置在那个进程眼里就成了工作区外面。
+    """
     raw = str(os.environ.get(INSTANCES_FILE_ENV) or "").strip()
     return Path(raw).expanduser().parent if raw else None
 
@@ -516,6 +526,14 @@ def policy_names(rel_path: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(names))
 
 
+def secret_bearing_names() -> tuple[str, ...]:
+    """装着明文密钥的配置在 policy 眼里的全部名字，policy 的兜底按它生成。
+
+    挪走之前的旧位置也在里面：搬家只复制不删，旧文件里是同一把密钥。
+    """
+    return tuple(sorted({name for rel in _SECRET_BEARING for name in policy_names(rel)}))
+
+
 def policy_literal_aliases(literal: str) -> tuple[str, ...]:
     """命令行里查敏感路径用的字面片段，按旧名字写的规则也要认出新位置：data/ 连带 config/models.yaml 这几份。"""
     text = str(literal or "").strip()
@@ -565,7 +583,8 @@ def file_stamp(path: Path) -> tuple[int, int, int] | None:
     return info.st_mtime_ns, info.st_size, info.st_ino
 
 
-def _lock_path(path: Path) -> Path:
+def lock_path(path: Path) -> Path:
+    """改 path 这份文件的人一律拿的锁文件。root 侧脚本用 flock 改清单时锁的也是它，两边的名字不能各写各的。"""
     # .env 这类本来就以点开头的，不再叠一个点。
     name = path.name
     return path.with_name(f"{name}.lock" if name.startswith(".") else f".{name}.lock")
@@ -573,8 +592,8 @@ def _lock_path(path: Path) -> Path:
 
 @contextlib.contextmanager
 def locked(path: Path):
-    """独占写这份配置。锁文件挨着它放：共享组里几个实例改同一份，拿的是同一把锁。"""
-    with exclusive_lock(_lock_path(path)):
+    """独占写这份文件。锁文件挨着它放：共享组里几个实例改同一份，拿的是同一把锁。"""
+    with exclusive_lock(lock_path(path)):
         yield
 
 
@@ -610,14 +629,19 @@ def write_locked(
             shutil.copy2(path, path.with_name(f"{path.name}.bak"))
         except OSError as exc:
             raise ConfigBackupError(f"备份 {path.name} 失败，未写入：{exc}") from exc
+    target_mode = existing_mode if existing_mode is not None else mode
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
     try:
+        # 建出来就是目标权限：先按 umask 建再 chmod 的话，中间那一瞬同机别的用户读得到明文密钥。
+        fd = os.open(
+            tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o666 if target_mode is None else target_mode,
+        )
         # 在写句柄上 fsync：Windows 对只读句柄做 fsync 会报 EBADF。
-        with open(tmp, "wb") as stream:
+        with os.fdopen(fd, "wb") as stream:
             stream.write(encode_as(content, newline_of(path)))
             stream.flush()
             os.fsync(stream.fileno())
-        target_mode = existing_mode if existing_mode is not None else mode
         if target_mode is not None:
             with contextlib.suppress(OSError):
                 os.chmod(tmp, target_mode)
@@ -672,6 +696,15 @@ def remove_config_file(path: Path, *, base_hash: str | None = None) -> bool:
 #  搬家：改造前的位置 → config/
 # ---------------------------------------------------------------------------
 
+# 搬家按这几步的顺序做。哪一步当时做不成就记成待办，下次启动只接着做它，做完的不重跑。
+_STEP_MODELS = "models"
+_STEP_POLICY = "policy"
+_STEP_MCP = "mcp"
+_STEP_SKILLS = "skills"
+_STEP_DRAWTOOLS = "drawtools"
+_STEP_CUSTOM_TOOLS = "custom_tools"
+
+
 @dataclass
 class LayoutReport:
     """启动时那次搬家做了什么。写进 data/.config_layout.json，健康检查据此报告。"""
@@ -682,7 +715,15 @@ class LayoutReport:
     warnings: list[str] = field(default_factory=list)
     # 搬家那一刻代码目录 tools/ 里不随仓库发布的脚本，相对 tools/ 写。旧文件留着给退回旧版本用，新版本不再认它们。
     legacy_tools: list[str] = field(default_factory=list)
+    # 没做成、下次启动接着做的步骤 → 原因。原因同时记进 warnings，健康检查照常报出来。
+    pending: dict[str, str] = field(default_factory=dict)
+    # 第一次搬的那一刻工作区是不是改造前的。接着做的时候 data/events.jsonl 早就有了，不能再现判。
+    legacy_workspace: bool = False
     skipped: bool = False
+
+    def defer(self, step: str, reason: str) -> None:
+        self.pending[step] = reason
+        self.warnings.append(reason)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -691,7 +732,25 @@ class LayoutReport:
             "copied": list(self.copied),
             "warnings": list(self.warnings),
             "legacy_tools": list(self.legacy_tools),
+            "pending": dict(self.pending),
+            "legacy_workspace": self.legacy_workspace,
         }
+
+    @classmethod
+    def resumed(cls, marker: Mapping[str, Any]) -> LayoutReport:
+        """接着上一次没做完的那几步：上次的记录留着，那几步当时留下的原因去掉，重做的结果会重新记上。"""
+        stale = set(_pending_steps(marker).values())
+        return cls(
+            migrated_at=str(marker.get("migrated_at") or ""),
+            copied=_text_items(marker.get("copied")),
+            warnings=[line for line in _text_items(marker.get("warnings")) if line not in stale],
+            legacy_tools=_text_items(marker.get("legacy_tools")),
+            legacy_workspace=marker.get("legacy_workspace") is True,
+        )
+
+
+def _text_items(raw: Any) -> list[str]:
+    return [item for item in raw if isinstance(item, str)] if isinstance(raw, list) else []
 
 
 def _marker(workspace_root: Path) -> Path:
@@ -706,10 +765,17 @@ def read_layout_marker(workspace_root: Path | str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _marker_version(workspace_root: Path) -> int:
-    data = read_layout_marker(workspace_root) or {}
-    version = data.get("version")
+def _version_of(marker: Mapping[str, Any] | None) -> int:
+    version = (marker or {}).get("version")
     return version if isinstance(version, int) and not isinstance(version, bool) else 0
+
+
+def _pending_steps(marker: Mapping[str, Any] | None) -> dict[str, str]:
+    """标记里记着的待办步骤。改造之后头一版写的标记没有这一项，那就是全做完了。"""
+    raw = (marker or {}).get("pending")
+    if not isinstance(raw, dict):
+        return {}
+    return {str(step): str(reason) for step, reason in raw.items() if step in _LAYOUT_STEPS}
 
 
 def _rel(workspace_root: Path, path: Path) -> str:
@@ -719,12 +785,40 @@ def _rel(workspace_root: Path, path: Path) -> str:
         return path.as_posix()
 
 
+def _copy_atomically(source: Path, target: Path, *, mode: int | None) -> None:
+    """先抄进同目录的临时文件再换上：直接往新位置抄，断在半路留下的半份会被下次启动当成已经搬过。"""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    try:
+        fd = os.open(
+            tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o666 if mode is None else mode,
+        )
+        with os.fdopen(fd, "wb") as stream, open(source, "rb") as origin:
+            shutil.copyfileobj(origin, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if mode is None:
+            shutil.copystat(source, tmp)
+        else:
+            # 只抄时间不抄权限：copystat 会把旧文件的 644 带过来，换回 600 之前那一瞬谁都读得到密钥。
+            info = os.stat(source)
+            os.utime(tmp, ns=(info.st_atime_ns, info.st_mtime_ns))
+            with contextlib.suppress(OSError):
+                os.chmod(tmp, mode)
+        os.replace(tmp, target)
+    finally:
+        # copystat 可能把只读属性一起抄过来，Windows 上删不掉只读文件。
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+    _fsync_dir(target.parent)
+
+
 def _copy_file(workspace_root: Path, source: Path, target: Path, report: LayoutReport) -> None:
-    """新位置已经有了就不动：那是搬过之后改的，比旧文件新。"""
+    """新位置已经有了就不动：那是搬过之后改的，比旧文件新。装密钥的那几份照新建的规矩只给属主读写。"""
     if target.exists() or not source.is_file():
         return
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
+    _copy_atomically(source, target, mode=private_mode_for(workspace_root, target))
     report.copied.append(f"{_rel(workspace_root, source)} → {_rel(workspace_root, target)}")
 
 
@@ -777,6 +871,27 @@ def split_platform_secrets(text: str) -> tuple[str, dict[str, Any] | None]:
     return yaml.safe_dump(data, sort_keys=False, allow_unicode=True), section
 
 
+def _yaml_document(path: Path) -> Any:
+    """文件解析出来的东西；读不了或解析不了是 None。"""
+    try:
+        return yaml.safe_load(path.read_bytes().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return None
+
+
+def _migrate_platform_secrets(workspace_root: Path, section: dict[str, Any], report: LayoutReport) -> None:
+    secrets_file = platform_secrets_path(workspace_root)
+    if secrets_file.exists():
+        # 上一次搬到一半时写下的就是这一段，接着搬不算撞车。
+        if _yaml_document(secrets_file) == section:
+            return
+        report.warnings.append(f"{LEGACY_MODELS_FILE} 里有 platforms 段，但 {PLATFORM_SECRETS_FILE} 已经在了，没有覆盖，请手动核对")
+        return
+    body = yaml.safe_dump(section, sort_keys=False, allow_unicode=True)
+    write_config_text(secrets_file, body, mode=_PRIVATE_MODE)
+    report.copied.append(f"{LEGACY_MODELS_FILE} 的 platforms 段 → {PLATFORM_SECRETS_FILE}")
+
+
 def _migrate_models(workspace_root: Path, report: LayoutReport) -> None:
     source = workspace_root / LEGACY_MODELS_FILE
     target = models_path(workspace_root)
@@ -785,32 +900,45 @@ def _migrate_models(workspace_root: Path, report: LayoutReport) -> None:
     # 按字节解码：read_text 会把 CRLF 折成 LF，搬过去的文件换行就跟原文件不一样了。
     text = source.read_bytes().decode("utf-8")
     remaining, section = split_platform_secrets(text)
+    # 平台令牌先落盘：models.yaml 一在，下次启动就不会回来摘这一段，两步之间断掉的话令牌再也迁不出来。
+    if section is not None:
+        _migrate_platform_secrets(workspace_root, section, report)
     write_config_text(target, remaining, mode=_PRIVATE_MODE)
     report.copied.append(f"{LEGACY_MODELS_FILE} → {MODELS_FILE}")
-    if section is None:
-        return
-    secrets_file = platform_secrets_path(workspace_root)
-    if secrets_file.exists():
-        report.warnings.append(f"{LEGACY_MODELS_FILE} 里有 platforms 段，但 {PLATFORM_SECRETS_FILE} 已经在了，没有覆盖，请手动核对")
-        return
-    body = yaml.safe_dump(section, sort_keys=False, allow_unicode=True)
-    write_config_text(secrets_file, body, mode=_PRIVATE_MODE)
-    report.copied.append(f"{LEGACY_MODELS_FILE} 的 platforms 段 → {PLATFORM_SECRETS_FILE}")
+
+
+def _migrate_policy(workspace_root: Path, report: LayoutReport) -> None:
+    _copy_file(workspace_root, workspace_root / LEGACY_POLICY_FILE, policy_path(workspace_root), report)
+
+
+def _migrate_mcp(workspace_root: Path, report: LayoutReport) -> None:
+    _copy_file(workspace_root, workspace_root / LEGACY_MCP_FILE, mcp_path(workspace_root), report)
+
+
+def _migrate_skills(workspace_root: Path, report: LayoutReport) -> None:
+    _copy_tree(workspace_root, workspace_root / LEGACY_SKILLS_DIR, skills_dir(workspace_root), report)
+
+
+def _migrate_drawtools(workspace_root: Path, report: LayoutReport) -> None:
+    for name in DRAWTOOLS_FILES:
+        _copy_file(workspace_root, drawtools_code_dir() / name, drawtools_file(workspace_root, name), report)
 
 
 def _untracked_bundled_tools(report: LayoutReport) -> list[Path] | None:
-    """代码目录 tools/ 下不随仓库发布的 .py：控制台和 agent 以前都把新工具写在那里，几个实例共用。认不出来返回 None。"""
+    """代码目录 tools/ 下不随仓库发布的 .py：控制台和 agent 以前都把新工具写在那里，几个实例共用。
+
+    认不出来返回 None。
+    """
     try:
         result = subprocess.run(
             ["git", "-C", str(CODE_ROOT), "ls-files", "--others", "--exclude-standard", "-z", "--", LEGACY_TOOLS_DIR],
             capture_output=True, timeout=15, check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        report.warnings.append(f"看不出代码目录 tools/ 下哪些是自己加的工具（{exc}），没有搬，请手动挪进 {TOOLS_DIR}/")
+        _record_unknown_custom_tools(report, str(exc))
         return None
     if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", "replace").strip() or f"git 退出码 {result.returncode}"
-        report.warnings.append(f"看不出代码目录 tools/ 下哪些是自己加的工具（{detail}），没有搬，请手动挪进 {TOOLS_DIR}/")
+        _record_unknown_custom_tools(report, result.stderr.decode("utf-8", "replace").strip() or f"git 退出码 {result.returncode}")
         return None
     found: list[Path] = []
     for raw in result.stdout.split(b"\0"):
@@ -823,18 +951,41 @@ def _untracked_bundled_tools(report: LayoutReport) -> list[Path] | None:
     return found
 
 
+def _record_unknown_custom_tools(report: LayoutReport, detail: str) -> None:
+    """git 检出的代码目录记成待办下次启动再问：一时问不到不该让这批工具永远留在原地。
+    不是检出的再问也问不出来，只提醒这一次，不然每次启动都重试、健康检查一直挂着这条。
+    """
+    head = f"看不出代码目录 {LEGACY_TOOLS_DIR}/ 下哪些是自己加的工具（{detail}）"
+    if (CODE_ROOT / ".git").exists():
+        report.defer(_STEP_CUSTOM_TOOLS, f"{head}，这次没有搬，下次启动再试；等不及就手动挪进 {TOOLS_DIR}/")
+    else:
+        report.warnings.append(f"{head}，代码目录不是 git 检出，没法再认，没有搬；要用的话手动挪进 {TOOLS_DIR}/")
+
+
 def _is_legacy_workspace(workspace_root: Path) -> bool:
     return any((workspace_root / rel).exists() for rel in _LEGACY_WORKSPACE_MARKS)
 
 
 def _migrate_custom_tools(workspace_root: Path, report: LayoutReport) -> None:
     """改造前的工作区把那批工具抄进自己的 config/tools/；改造后新建的实例默认全隔离，不继承别人的工具。"""
-    found = _untracked_bundled_tools(report) or []
+    found = _untracked_bundled_tools(report)
+    if found is None:
+        return
     report.legacy_tools = sorted(path.relative_to(bundled_tools_dir()).as_posix() for path in found)
-    if not _is_legacy_workspace(workspace_root):
+    if not report.legacy_workspace:
         return
     for path in found:
         _copy_file(workspace_root, path, custom_tools_dir(workspace_root) / path.relative_to(bundled_tools_dir()), report)
+
+
+_LAYOUT_STEPS: dict[str, Callable[[Path, LayoutReport], None]] = {
+    _STEP_MODELS: _migrate_models,
+    _STEP_POLICY: _migrate_policy,
+    _STEP_MCP: _migrate_mcp,
+    _STEP_SKILLS: _migrate_skills,
+    _STEP_DRAWTOOLS: _migrate_drawtools,
+    _STEP_CUSTOM_TOOLS: _migrate_custom_tools,
+}
 
 
 def legacy_tool_rels(workspace_root: Path | str) -> frozenset[str]:
@@ -854,26 +1005,35 @@ def ensure_layout(workspace_root: Path | str) -> LayoutReport:
     """把改造前散在 data/、skills/、代码目录里的配置搬进 config/，每个工作区只搬一次。
 
     只复制不删：旧文件原样留着，退回旧版本时还能用；新位置已有的一概不覆盖。几个进程同时启动时只有一个在搬。
+    有哪一步当时做不成（比如问不到 git），标记里记成待办，下次启动只接着做那一步。
+    中途抛错就不写标记：每一步都能重来，下次启动从头再搬一遍。
     """
     root = Path(workspace_root)
     check_config_dir(root)
     (root / "data").mkdir(parents=True, exist_ok=True)
     with exclusive_lock(root / _LAYOUT_LOCK):
-        if _marker_version(root) >= LAYOUT_VERSION:
+        marker = read_layout_marker(root)
+        version = _version_of(marker)
+        pending = _pending_steps(marker)
+        if version > LAYOUT_VERSION or (version == LAYOUT_VERSION and not pending):
             return LayoutReport(skipped=True)
-        report = LayoutReport(migrated_at=datetime.now(timezone.utc).isoformat())
+        if version == LAYOUT_VERSION:
+            report = LayoutReport.resumed(marker or {})
+            steps = [name for name in _LAYOUT_STEPS if name in pending]
+        else:
+            report = LayoutReport(
+                migrated_at=datetime.now(timezone.utc).isoformat(),
+                legacy_workspace=_is_legacy_workspace(root),
+            )
+            steps = list(_LAYOUT_STEPS)
+        copied_before, warned_before = len(report.copied), len(report.warnings)
         config_dir(root).mkdir(parents=True, exist_ok=True)
-        _migrate_models(root, report)
-        _copy_file(root, root / LEGACY_POLICY_FILE, policy_path(root), report)
-        _copy_file(root, root / LEGACY_MCP_FILE, mcp_path(root), report)
-        _copy_tree(root, root / LEGACY_SKILLS_DIR, skills_dir(root), report)
-        for name in DRAWTOOLS_FILES:
-            _copy_file(root, drawtools_code_dir() / name, drawtools_file(root, name), report)
-        _migrate_custom_tools(root, report)
+        for name in steps:
+            _LAYOUT_STEPS[name](root, report)
         _write_marker(root, report)
-    for line in report.copied:
+    for line in report.copied[copied_before:]:
         _log.info("配置搬到新位置：%s", line)
-    for line in report.warnings:
+    for line in report.warnings[warned_before:]:
         _log.warning("配置搬家：%s", line)
     return report
 
@@ -890,7 +1050,10 @@ def _legacy_pairs(workspace_root: Path) -> list[tuple[Path, Path]]:
 
 
 def layout_status(workspace_root: Path | str) -> dict[str, Any]:
-    """健康检查用：搬过没有、搬家时留下的提醒，以及搬完之后旧位置又被改过的文件（多半是退回旧版本那阵子改的）。"""
+    """健康检查用：搬过没有、搬家时留下的提醒、哪几步等着下次启动接着做。
+
+    另报搬完之后旧位置又被改过的文件，多半是退回旧版本那阵子改的。
+    """
     root = Path(workspace_root)
     marker = read_layout_marker(root)
     stale: list[str] = []
@@ -901,8 +1064,9 @@ def layout_status(workspace_root: Path | str) -> dict[str, Any]:
         except OSError:
             continue
     return {
-        "migrated": marker is not None and _marker_version(root) >= LAYOUT_VERSION,
+        "migrated": marker is not None and _version_of(marker) >= LAYOUT_VERSION,
         "migrated_at": (marker or {}).get("migrated_at", ""),
         "warnings": [str(item) for item in (marker or {}).get("warnings", []) if str(item).strip()],
+        "pending": sorted(_pending_steps(marker)),
         "stale_legacy": stale,
     }

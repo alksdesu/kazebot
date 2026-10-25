@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import stat
 import sys
@@ -193,12 +194,14 @@ class TestWhenTheDiskSaysNo:
 
         assert _CONSOLE + "?token=" + token in capsys.readouterr().out
 
-    def test_it_does_not_claim_to_have_written_the_file(self, blocked: Path, capsys) -> None:
-        admin_api.init_admin_token(blocked)
+    def test_it_does_not_claim_to_have_written_the_file(self, blocked: Path, capsys, caplog) -> None:
+        with caplog.at_level(logging.ERROR, logger="supervisor.admin_api"):
+            admin_api.init_admin_token(blocked)
         out = capsys.readouterr().out
 
         assert "已生成并写入" not in out
-        assert "401" in out
+        # 后果要说清：engine 和各适配器读不到令牌，它们的请求都会是 401。
+        assert any("401" in record.getMessage() for record in caplog.records)
 
     def test_no_temporary_file_is_left_behind(self, blocked: Path) -> None:
         admin_api.init_admin_token(blocked)
@@ -209,11 +212,11 @@ class TestWhenTheDiskSaysNo:
 class TestTheWriteIsAtomic:
     def test_the_token_is_never_written_in_place(self) -> None:
         # 撕裂读在单进程里测不出来，落到适配器身上只是一次没头没尾的 401。
-        # 退一步钉住写法：内容先进 tmp，再整体换上去。
+        # 退一步钉住写法：走 config_layout 的同目录临时文件整体替换，不原地写。
         source = Path(admin_api.__file__).read_text(encoding="utf-8")
         body = source[source.index("def _persist_token"):source.index("def init_admin_token")]
 
-        assert "os.replace(tmp, path)" in body
+        assert "config_layout.write_locked(path" in body
         assert "path.write_text" not in body
 
 

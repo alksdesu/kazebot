@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import logging
 import os
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -24,10 +25,11 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 
+# defaults/runtime.yaml 读不了时的兜底。以那份文件为准：同名键的值必须和它一致。
 DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "version": 1,
     "engine": {
-        "max_steps": 32,
+        "max_steps": 64,
         "streaming": True,
         "poll_interval_sec": 1.0,
         "http": {"client_timeout_sec": 60.0},
@@ -43,12 +45,7 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     },
     "providers": {
         "openai": {
-            "timeout_sec": 60.0,
-            # [AutoC 2026-06-01] Why: provider_options previously existed only on
-            # node YAML, so provider-wide defaults had no documented global home.
-            # How: add an empty options dict under the OpenAI provider defaults.
-            # Purpose: runner can merge providers.<type>.options with node-level
-            # provider_options while keeping old runtime.yaml files compatible.
+            "timeout_sec": 600.0,
             "options": {},
         }
     },
@@ -56,12 +53,9 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
         "execute_command": {
             "default_timeout_sec": 90.0,
             "max_output_chars": 12000,
-            # [2026-07-14] 长任务自动转异步：同步等待超过
-            # threshold_sec（且小于 timeout_sec）时，把 execute_command 转为后台
-            # 异步交付，不阻塞推理循环；timeout_sec 仍是硬 kill 上限。
             "async_upgrade": {
                 "enabled": True,
-                "threshold_sec": 60.0,
+                "threshold_sec": 60,
             },
         },
         "git": {"diff_max_chars": 600000},
@@ -87,8 +81,9 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "supervisor": {
         "process_manager": {
             "stop_wait_timeout_sec": 5.0,
-            "shell_new_console": None,
+            "shell_new_console": False,
             "engine_workers": 2,
+            "spawn_shell_cli": False,
         },
     },
 }
@@ -147,6 +142,9 @@ def runtime_config_path(workspace_root: Path) -> Path:
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     out = copy.deepcopy(base)
     for k, v in (override or {}).items():
+        # 段名底下的键全注释掉时 yaml 读出来是 null：那是没写，不是把整段换成 null。
+        if v is None and isinstance(out.get(k), dict):
+            continue
         if isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = _deep_merge(out[k], v)
         else:
@@ -154,37 +152,136 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return out
 
 
-def _read_runtime_layer(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
+class RuntimeConfigError(ValueError):
+    """runtime 原文用不了：解析不了，或者该写一整段的地方写成了别的。"""
+
+
+def _misplaced_sections(data: Mapping[str, Any], shape: Mapping[str, Any], prefix: str = "") -> list[str]:
+    """默认值里是一整段、data 里却写成标量或列表的那些键。照样盖上去，读它底下的键的地方全都会崩。"""
+    found: list[str] = []
+    for key, value in data.items():
+        expected = shape.get(key)
+        if not isinstance(expected, dict) or value is None:
+            continue
+        dotted = f"{prefix}{key}"
+        if isinstance(value, dict):
+            found.extend(_misplaced_sections(value, expected, f"{dotted}."))
+        else:
+            found.append(dotted)
+    return found
+
+
+def parse_runtime_text(text: str, shape: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """runtime 原文解析成映射，抛 RuntimeConfigError 说明哪里不对。shape 是该有哪些段，不给就按代码里的默认值。"""
     try:
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except Exception:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise RuntimeConfigError(f"YAML 解析失败：{exc}") from exc
+    if data is None:
         return {}
-    return loaded if isinstance(loaded, dict) else {}
+    if not isinstance(data, dict):
+        raise RuntimeConfigError("顶层必须是映射（key: value）")
+    misplaced = _misplaced_sections(data, DEFAULT_RUNTIME_CONFIG if shape is None else shape)
+    if misplaced:
+        raise RuntimeConfigError(f"这几项底下应当是一整段配置（key: value），写成了别的：{', '.join(misplaced)}")
+    return data
+
+
+@dataclass(frozen=True)
+class _RuntimeLayer:
+    """runtime 的一层按某一版文件读出来的样子。文件写坏时 data 停在上一份能用的，error 说明为什么。"""
+
+    stamp: tuple[int, int, int] | None
+    data: dict[str, Any]
+    error: str = ""
+
+
+_LAYERS: dict[str, _RuntimeLayer] = {}
+_LAYERS_LOCK = threading.Lock()
+
+
+def _read_runtime_layer(path: Path, shape: Mapping[str, Any]) -> dict[str, Any]:
+    """这一层文件现在的内容。读不了、用不了都抛 RuntimeConfigError。"""
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeConfigError(f"读不了：{exc}") from exc
+    return parse_runtime_text(text, shape)
+
+
+def _runtime_layer(path: Path, shape: Mapping[str, Any]) -> _RuntimeLayer:
+    """按 file_stamp 认出改动；新的那版用不了时记日志、沿用上一份能用的，和 qq.yaml、features.yaml 的做法一样。"""
+    stamp = config_layout.file_stamp(path)
+    key = str(path)
+    with _LAYERS_LOCK:
+        cached = _LAYERS.get(key)
+        if cached is not None and cached.stamp == stamp:
+            return cached
+        if stamp is None:
+            layer = _RuntimeLayer(None, {})
+        else:
+            try:
+                layer = _RuntimeLayer(stamp, _read_runtime_layer(path, shape))
+            except RuntimeConfigError as exc:
+                kept = cached.data if cached is not None else {}
+                _log.warning("%s 用不了，%s：%s", path, "沿用上一份能用的" if kept else "这一层按没写算", exc)
+                layer = _RuntimeLayer(stamp, kept, str(exc))
+        _LAYERS[key] = layer
+        return layer
+
+
+def _instance_shape(default_layer: _RuntimeLayer) -> dict[str, Any]:
+    """实例那份按「代码默认 + 仓库默认」认哪些键底下是一整段：仓库默认新加的段也算。"""
+    return _deep_merge(DEFAULT_RUNTIME_CONFIG, default_layer.data)
+
+
+def _runtime_layers(workspace_root: Path) -> tuple[tuple[Path, _RuntimeLayer], tuple[Path, _RuntimeLayer]]:
+    default_path, own_path = config_layout.runtime_layers(workspace_root)
+    default_layer = _runtime_layer(default_path, DEFAULT_RUNTIME_CONFIG)
+    own_layer = _runtime_layer(own_path, _instance_shape(default_layer))
+    return (default_path, default_layer), (own_path, own_layer)
 
 
 def load_runtime_config(workspace_root: Path) -> dict[str, Any]:
     """代码里的默认值 ← 仓库的 defaults/runtime.yaml ← 实例改过的 config/runtime.yaml，逐键往上盖。
 
     实例那份只盖它写了的键：发版给默认 runtime 加的新键，改过 runtime 的实例也照样拿得到。
+    哪一层写坏了就沿用它上一份能用的，原因见 runtime_config_error。
     """
-    default_path, own_path = config_layout.runtime_layers(workspace_root)
+    (default_path, default_layer), (own_path, own_layer) = _runtime_layers(workspace_root)
     # 共享组里别的实例也改 config/runtime.yaml：按 file_stamp 比，同一刻写进的改动也认得出来。
-    stamp = (config_layout.file_stamp(default_path), config_layout.file_stamp(own_path))
+    stamp = (default_layer.stamp, own_layer.stamp)
 
     key = str(own_path.resolve())
     cached = _CACHE.get(key)
     if cached is not None and cached[0] == stamp:
         return copy.deepcopy(cached[1])
 
-    default_cfg = _read_runtime_layer(default_path)
-    user_cfg = _read_runtime_layer(own_path)
-    _warn_retired_keys(default_path, default_cfg)
-    _warn_retired_keys(own_path, user_cfg)
-    merged = _deep_merge(_deep_merge(DEFAULT_RUNTIME_CONFIG, default_cfg), user_cfg)
+    _warn_retired_keys(default_path, default_layer.data)
+    _warn_retired_keys(own_path, own_layer.data)
+    merged = _deep_merge(_deep_merge(DEFAULT_RUNTIME_CONFIG, default_layer.data), own_layer.data)
     _CACHE[key] = (stamp, merged)
     return copy.deepcopy(merged)
+
+
+def runtime_config_error(workspace_root: Path) -> str:
+    """runtime 哪一层现在用不了、在用的是什么；空串表示两层都按文件里写的在跑。健康检查报这个。"""
+    problems: list[str] = []
+    for path, layer in _runtime_layers(workspace_root):
+        if layer.error:
+            fallback = "沿用上一份能用的" if layer.data else "这一层按没写算"
+            problems.append(f"{config_layout.logical_path(workspace_root, path)} 用不了，{fallback}：{layer.error}")
+    return "；".join(problems)
+
+
+def check_runtime_text(text: str) -> list[str]:
+    """原文编辑器保存实例那份之前的校验：用不了就抛 RuntimeConfigError。返回保存之后该提醒的事。"""
+    default_layer = _runtime_layer(config_layout.default_runtime_path(), DEFAULT_RUNTIME_CONFIG)
+    data = parse_runtime_text(text, _instance_shape(default_layer))
+    return [
+        f"{key} 已经没有代码读取，{RETIRED_RUNTIME_KEYS[key] or '可以删掉'}"
+        for key in retired_runtime_keys(data)
+    ]
 
 
 def get_str(data: dict[str, Any], dotted_key: str, default: str = "") -> str:
@@ -222,11 +319,29 @@ def get_float(data: dict[str, Any], dotted_key: str, default: float, *, min_valu
     return val
 
 
+_TRUE_WORDS = frozenset({"1", "true", "yes", "y", "on"})
+_FALSE_WORDS = frozenset({"0", "false", "no", "n", "off"})
+
+
+def parse_bool(raw: Any, default: bool | None = None) -> bool | None:
+    """配置和环境变量里的开关。认不出的（包括空）给 default，和 get_int、get_float 读坏值时一样。"""
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw if raw is not None else "").strip().lower()
+    if text in _TRUE_WORDS:
+        return True
+    if text in _FALSE_WORDS:
+        return False
+    return default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    """环境变量当开关读。没设或写了认不出的值，照 default。"""
+    return bool(parse_bool(os.environ.get(name), default))
+
+
 def get_bool(data: dict[str, Any], dotted_key: str, default: bool = False) -> bool:
-    raw = get_str(data, dotted_key, "")
-    if not raw:
-        return bool(default)
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(parse_bool(get_str(data, dotted_key, ""), bool(default)))
 
 
 DEFAULT_TASK_MAX_RUNNING_SECONDS = 3600.0
@@ -282,37 +397,47 @@ def shared_env_value(key: str) -> str:
     return config_layout.shared_secrets(root).get(key, "")
 
 
-def _resolve_env_names(names: str, extra: Mapping[str, str] | None = None) -> str:
-    """Resolve a ``|``-separated list of env var names with fallback.
+def _resolve_env_names(
+    names: str,
+    extra: Mapping[str, str] | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """``A|B`` 这样的变量名列表，取第一个有值的，都没有是空串。
 
-    Why: config wants "new var wins, fall back to old var" without duplicating
-    node YAML. How: split on ``|``; return the first name whose value is a
-    non-empty string, reading the process environment before ``extra`` (a
-    parsed .env mapping), then the shared secrets file; otherwise "". Purpose: e.g.
-    ``DRAW_TAG_MODEL|DRAW_PLANNER_MODEL`` prefers the new name but stays
-    backward compatible with the old one.
+    每个名字依次查：进程环境（给了 environ 就用它代替进程环境）、extra（解析好的 .env）、共享密钥文件。
+    ``DRAW_TAG_MODEL|DRAW_PLANNER_MODEL`` 这种写法让新名字优先，旧名字照样认。
     """
+    source = os.environ if environ is None else environ
     for name in names.split("|"):
         key = name.strip()
         if not key:
             continue
         # 共享密钥垫在最底下：实例 .env 的同名项优先；不灌进 os.environ，组里别的实例改了它这边下一次取值就生效。
-        val = os.getenv(key, "") or (extra.get(key, "") if extra else "") or shared_env_value(key)
+        val = str(source.get(key, "") or "") or (extra.get(key, "") if extra else "") or shared_env_value(key)
         # 返回 strip 后的值：.env 在 CRLF 仓库里解析出来常带尾随 \r，原样送上游会 400。
         if val and val.strip():
             return val.strip()
     return ""
 
 
-def resolve_env_ref(text: str, extra: Mapping[str, str] | None = None) -> str:
+def env_value(names: str) -> str:
+    """``A|B`` 这样的变量名列表取第一个有值的：进程环境优先，再看共享密钥文件。都没有是空串。"""
+    return _resolve_env_names(names)
+
+
+def resolve_env_ref(
+    text: str,
+    extra: Mapping[str, str] | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """``${VAR}`` 和 ``$ENV{NEW|OLD}`` 换成变量的值，别的原样返回。查找顺序同 _resolve_env_names。"""
     s = str(text or "")
-    # Supports single names and ``|``-separated fallback lists, e.g.
-    #   $ENV{NEW_VAR}                 -> os.getenv("NEW_VAR")
-    #   $ENV{NEW_VAR|OLD_VAR}         -> NEW_VAR if set (non-empty) else OLD_VAR
     if s.startswith("$ENV{") and s.endswith("}"):
-        return _resolve_env_names(s[5:-1], extra)
+        return _resolve_env_names(s[5:-1], extra, environ=environ)
     if s.startswith("${") and s.endswith("}") and len(s) > 3:
-        return _resolve_env_names(s[2:-1], extra)
+        return _resolve_env_names(s[2:-1], extra, environ=environ)
     return s
 
 
@@ -598,11 +723,11 @@ def _platform_section(secrets: Mapping[str, Any], platform_id: str) -> Mapping[s
     return block if isinstance(block, dict) else {}
 
 
-def _secret_text(raw: Any, extra: Mapping[str, str] | None = None) -> str:
+def _secret_text(raw: Any, environ: Mapping[str, str] | None = None) -> str:
     # YAML 会把纯数字的令牌读成 int；布尔、列表、映射当成没配，免得 True 被当成令牌 "True"。
     if isinstance(raw, bool) or not isinstance(raw, (str, int)):
         return ""
-    return resolve_env_ref(str(raw).strip(), extra)
+    return resolve_env_ref(str(raw).strip(), environ=environ)
 
 
 def platform_secret(
@@ -617,7 +742,7 @@ def platform_secret(
 
     和系统槽位一样文件优先：运维改的是文件，一行早就忘了的 env 不该顶掉它。文件里可以写
     ${VAR} 引用 .env。自动生成的密钥文件由平台自己管，不在这里读。secrets 给了就不再读文件；
-    environ 给了就拿它代替进程环境，供要每次重读 .env 文件的调用方用。
+    environ 给了就拿它代替进程环境，声明的变量和 ${VAR} 引用一样，供要每次重读 .env 文件的调用方用。
     """
     spec = platform.secret(name)
     data = load_platform_secrets(workspace_root) if secrets is None else secrets
@@ -633,15 +758,15 @@ def platform_secret(
 
 # 离线工具不给工作区、env 里也没设时退回代码目录，和 bot.py、supervisor 一样。
 _CODE_ROOT = Path(__file__).resolve().parent
-# 工作区里没有 .env 时退回代码目录那份，和 bot.py 找不到 cwd 下那份时一样。
+# 没设工作区时从这份认工作区，和 bot.py 找不到 cwd 下那份时一样。
 _CODE_ENV_FILE = _CODE_ROOT / ".env"
 
 
 def load_workspace_env(workspace_root: Path | str, *, override: bool = False) -> Path | None:
-    """认定本进程的工作区是 workspace_root 并灌它的 .env：工作区那份优先，没有就用代码目录那份。返回灌的是哪份。
+    """认定本进程的工作区是 workspace_root 并灌它的 .env，返回灌的是哪份；工作区里没有就什么也不灌。
 
     路径覆盖和平台密钥常常只写在 .env 里，不灌进来的话读到的是另一份文件、另一把密钥。
-    override 只对工作区自己那份生效：代码目录那份是几个实例共用的兜底，只补缺，不能盖掉进程拿到的值。
+    不借代码目录那份：多开时那是主实例的 .env，借过来这个实例就挂到主实例的端口、拿主实例的令牌。
     灌完把工作区变量钉回 workspace_root：从别的实例整份抄来的 .env 带着那个实例的 CLONOTH_WORKSPACE，
     不钉的话这个进程用的是这里，拉起的 engine 却认到那边。
     """
@@ -650,9 +775,6 @@ def load_workspace_env(workspace_root: Path | str, *, override: bool = False) ->
     if own.is_file():
         load_dotenv(own, override=override)
         loaded = own
-    elif _CODE_ENV_FILE.is_file():
-        load_dotenv(_CODE_ENV_FILE, override=False)
-        loaded = _CODE_ENV_FILE
     pin_workspace_env(workspace_root)
     return loaded
 
@@ -663,17 +785,20 @@ def _settle_workspace(explicit: Path | str | None, *, override: bool) -> Path:
     没给工作区、env 里也没设时，先灌 cwd 下或代码目录那份 .env 再从里面认，和 bot.py 一样。
     env 里设了就不碰 cwd 那份：在代码目录里跑别的实例，读进来的会是主实例的端口和密钥。
     """
+    seed: Path | None = None
     if explicit is not None and str(explicit).strip():
         root = Path(explicit).expanduser().resolve()
     else:
         root = workspace_env_root()
         if root is None:
             local = Path.cwd() / ".env"
-            bot_env = local if local.is_file() else _CODE_ENV_FILE
-            if bot_env.is_file():
-                load_dotenv(bot_env, override=False)
+            candidate = local if local.is_file() else _CODE_ENV_FILE
+            if candidate.is_file():
+                load_dotenv(candidate, override=False)
+                seed = candidate
             root = resolve_workspace_root(_CODE_ROOT)
-    load_workspace_env(root, override=override)
+    if load_workspace_env(root, override=override) is None and seed is None:
+        _log.warning("%s 下没有 .env：端口、令牌这些实例身份只剩进程环境里那些", root)
     return root
 
 
@@ -746,16 +871,14 @@ def resolve_system_model(
             block = raw_block
 
     def _pick(field: str, env_suffix: str, fallback: str) -> str:
-        # 1) config/models.yaml 字段（支持 ${VAR}）
         v = resolve_env_ref(str(block.get(field) or "").strip())
         if v:
             return v
-        # 2) slot 专属环境变量
+        # 槽位变量和 ${VAR} 走同一套查找：manage_secret 把它写进 config/secrets.env 时，进程环境里没有它。
         if prefix:
-            v = os.getenv(f"{prefix}_{env_suffix}", "").strip()
+            v = _resolve_env_names(f"{prefix}_{env_suffix}")
             if v:
                 return v
-        # 3) 主渠道兜底
         return fallback
 
     return SystemModel(

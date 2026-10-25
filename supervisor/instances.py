@@ -5,23 +5,32 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import socket
+import threading
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
 import config_layout
-from file_lock import exclusive_lock
 from platforms.builtin import QQ_NAPCAT
 from platforms.descriptor import InstancePort, normalize_name
 from platforms.registry import DEFAULT_PLATFORM_ID, all_platforms
 
+_log = logging.getLogger(__name__)
+
 _ENV_FILE = config_layout.INSTANCES_FILE_ENV
 _ENV_PREFIX = "CLONOTH_URL_PREFIX"
+
+# 实例名会一路传进 root 侧的 systemd 单元名，宽一格都是提权面。纯数字那支认改造前按 QQ 号开的实例。
+INSTANCE_ID_PATTERN = r"[a-z][a-z0-9_]{1,31}|[1-9][0-9]{4,10}"
+_INSTANCE_ID_RE = re.compile(rf"(?:{INSTANCE_ID_PATTERN})")
+# 数据根下已有的共享目录：表情包库和共享配置组。实例叫这个名字，工作区就和它是同一个目录。
+RESERVED_IDS = frozenset({"stickers", config_layout.SHARED_DIR})
 
 # 核心自己的端口。平台进程要的端口由平台描述的 instance_ports 声明，序号 0 落在单实例部署原有的那一组上。
 _CORE_PORTS: tuple[InstancePort, ...] = (InstancePort("supervisor", 8765, 10),)
@@ -45,6 +54,11 @@ def port_table() -> tuple[InstancePort, ...]:
                 raise ValueError(f"序号 {idx} 的 {port.name} 端口 {number} 和{owners[number]}撞了")
             owners[number] = f"序号 {idx} 的 {port.name}"
     return ports
+
+
+def is_instance_id(name: Any) -> bool:
+    text = name if isinstance(name, str) else ""
+    return bool(_INSTANCE_ID_RE.fullmatch(text)) and text not in RESERVED_IDS
 
 
 def ports_for(idx: int) -> dict[str, int]:
@@ -160,24 +174,46 @@ def _navigation_prefix(raw: Any) -> str:
     return path
 
 
-def _read(path: Path, *, strict: bool = False) -> list[dict[str, Any]]:
+_ReadMode = Literal["tolerant", "required", "strict"]
+
+# 已经为哪个文件版本记过「读不懂」：清单每次请求都重读，不去重的话坏文件每次刷一条。
+_unreadable_stamps: dict[Path, tuple[int, int, int] | None] = {}
+_unreadable_lock = threading.Lock()
+
+
+def _report_unreadable(path: Path, error: Exception) -> None:
+    stamp = config_layout.file_stamp(path)
+    with _unreadable_lock:
+        if path in _unreadable_stamps and _unreadable_stamps[path] == stamp:
+            return
+        _unreadable_stamps[path] = stamp
+    _log.warning("实例清单 %s 读不懂，按没有别的实例算，修好之前拦不住双登：%s", path, error)
+
+
+def _read(path: Path, *, mode: _ReadMode = "tolerant") -> list[dict[str, Any]]:
+    """清单原样读出来洗一遍。
+
+    tolerant 读不懂就当成空表，只为展示读的一方用。required 是写入方用的：文件读不懂就抛，
+    拿空表写回去，别的实例就全从清单里消失了。strict 连单条写坏了也抛，给逐条信任清单的导航接口用。
+    """
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return []
-    except (OSError, yaml.YAMLError) as error:
-        if strict:
-            raise InstanceDirectoryError("实例目录暂时不可用") from error
-        return []
-    except UnicodeError as error:
-        if not strict:
-            raise
+    except (OSError, UnicodeError, yaml.YAMLError) as error:
+        if mode == "tolerant":
+            _report_unreadable(path, error)
+            return []
         raise InstanceDirectoryError("实例目录暂时不可用") from error
     rows = raw.get("instances") if isinstance(raw, dict) else raw
+    if rows is None and mode != "strict":
+        rows = []
     if not isinstance(rows, list):
-        if strict:
-            raise InstanceDirectoryError("实例目录格式无效")
-        return []
+        if mode == "tolerant":
+            _report_unreadable(path, InstanceDirectoryError("实例目录格式无效"))
+            return []
+        raise InstanceDirectoryError("实例目录格式无效")
+    strict = mode == "strict"
     seen: set[str] = set()
     cleaned: list[dict[str, Any]] = []
     for entry in rows:
@@ -198,9 +234,61 @@ def _read(path: Path, *, strict: bool = False) -> list[dict[str, Any]]:
     return cleaned
 
 
-def load_instances(workspace_root: Path, *, strict: bool = False) -> list[dict[str, Any]]:
-    """读共享清单。文件不存在就是单实例部署，空表让前端不必渲染切换器。"""
-    return _read(instances_file(workspace_root), strict=strict)
+def instance_workspace(workspace_root: Path, row: dict[str, Any]) -> Path | None:
+    """清单里这个实例的工作区：本实例就是 workspace_root；序号 0 是代码目录里的主实例；其余在数据根下按实例名放。
+
+    实例名不合规的不认：清单手改得动，拿任意字符串拼出来的路径可能落在数据根外面。
+    """
+    if row["path"] == url_prefix():
+        return Path(workspace_root)
+    if row["idx"] == 0:
+        return config_layout.CODE_ROOT
+    data = config_layout.data_root()
+    if data is None or not is_instance_id(row["id"]):
+        return None
+    return data / row["id"]
+
+
+def _account_report(workspace: Path) -> dict[str, str] | None:
+    """实例自己上报的平台和账号。没有、读不懂、缺字段都是 None，回去用清单里记的。"""
+    path = config_layout.instance_account_path(workspace)
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, yaml.YAMLError) as error:
+        _log.debug("跳过读不懂的账号上报 %s：%s", path, error)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    report = {
+        "id": str(raw.get("id") or "").strip(),
+        "platform": normalize_name(raw.get("platform")),
+        "account": str(raw.get("account") or "").strip(),
+    }
+    return report if all(report.values()) else None
+
+
+def _with_reported_accounts(workspace_root: Path, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """叠上各实例自己上报的账号：多开实例写不了数据根下的清单，换号只记在自己的工作区里，它说的才是现在登着的号。"""
+    for row in rows:
+        workspace = instance_workspace(workspace_root, row)
+        report = _account_report(workspace) if workspace is not None else None
+        # 名字对不上的不认：代码目录里那份可能是改名之前的主实例留下的。
+        if report is not None and report["id"] == row["id"]:
+            row["platform"], row["account"] = report["platform"], report["account"]
+    return rows
+
+
+def load_instances(
+    workspace_root: Path, *, strict: bool = False, required: bool = False,
+) -> list[dict[str, Any]]:
+    """读共享清单，叠上各实例自己上报的账号。文件不存在就是单实例部署，空表让前端不必渲染切换器。
+
+    required 时清单读不懂抛 InstanceDirectoryError：要拿结果去分配序号、查重名的一方不能把坏文件当成没有别的实例。
+    """
+    mode: _ReadMode = "strict" if strict else "required" if required else "tolerant"
+    return _with_reported_accounts(workspace_root, _read(instances_file(workspace_root), mode=mode))
 
 
 def load_instance_directory(workspace_root: Path) -> dict[str, Any]:
@@ -281,15 +369,15 @@ def allocate_index(
 
 
 def _locked(path: Path) -> AbstractContextManager[None]:
-    """跨实例互斥。几个 supervisor 各自的进程锁管不到彼此，得落到文件上。"""
-    return exclusive_lock(path.with_name(f"{path.name}.lock"))
+    """跨实例互斥。几个 supervisor 各自的进程锁管不到彼此，得落到文件上；root 侧删实例时 flock 的也是这个锁文件。"""
+    return config_layout.locked(path)
 
 
 def _write(path: Path, rows: list[dict[str, Any]]) -> None:
-    body = yaml.safe_dump({"instances": [_stored(row) for row in rows]}, allow_unicode=True, sort_keys=False)
-    tmp = path.with_name(f"{path.name}.tmp")
-    tmp.write_text(body, encoding="utf-8")
-    os.replace(tmp, path)
+    """调用方已经拿着 _locked(path)。"""
+    config_layout.write_locked(
+        path, yaml.safe_dump({"instances": [_stored(row) for row in rows]}, allow_unicode=True, sort_keys=False),
+    )
 
 
 def save_instance(
@@ -301,7 +389,10 @@ def save_instance(
     platform: str = DEFAULT_PLATFORM_ID,
     account: str = "",
 ) -> list[dict[str, Any]]:
-    """登记一个实例。同名视为改写，不会留下两条；没给账号时留着原来记下的那个，平台换了就不留。"""
+    """登记一个实例。同名视为改写，不会留下两条；没给账号时留着原来记下的那个，平台换了就不留。
+
+    清单读不懂时抛 InstanceDirectoryError，一个字节都不写。
+    """
     instance_id = str(instance_id or "").strip()
     if not instance_id:
         raise ValueError("实例名不能为空")
@@ -311,7 +402,7 @@ def save_instance(
     platform_id = normalize_name(platform) or DEFAULT_PLATFORM_ID
     path = instances_file(workspace_root)
     with _locked(path):
-        rows = _read(path)
+        rows = _read(path, mode="required")
         previous = next((r for r in rows if r["id"] == instance_id), None)
         kept = previous["account"] if previous and previous["platform"] == platform_id else ""
         row = {
@@ -329,29 +420,60 @@ def save_instance(
         return rows
 
 
+def _write_account_report(workspace_root: Path, instance_id: str, platform_id: str, account: str) -> None:
+    config_layout.write_config_text(
+        config_layout.instance_account_path(workspace_root),
+        yaml.safe_dump(
+            {"id": instance_id, "platform": platform_id, "account": account}, allow_unicode=True, sort_keys=False,
+        ),
+    )
+
+
+def _mirror_account(path: Path, where: str, platform_id: str, account: str) -> None:
+    """清单写得动时把上报同步进去，直接读文件的人也看得到。没同步上不要紧：读清单的人会叠上报。"""
+    try:
+        with _locked(path):
+            rows = _read(path, mode="required")
+            row = next((r for r in rows if r["path"] == where), None)
+            if row is None or (row["platform"], row["account"]) == (platform_id, account):
+                return
+            row["platform"], row["account"] = platform_id, account
+            _write(path, rows)
+    except (OSError, InstanceDirectoryError) as error:
+        _log.warning("账号已记进本实例的上报文件，同步进清单 %s 失败：%s", path, error)
+
+
 def record_account(workspace_root: Path, *, prefix: str, platform_id: str, account: str) -> bool:
-    """本实例在它的平台上换了号，记进清单，别的实例据此拦着同一个号双登。单实例部署没有清单，什么也不做。"""
+    """本实例在它的平台上换了号，记下来，别的实例据此拦着同一个号双登。返回记下的号变没变。
+
+    记在自己工作区的上报文件里：多开实例的 systemd 沙箱只放开它自己的工作区，数据根下的清单它写不了，
+    读清单的人会把上报叠上去。清单写得动（主实例）时顺带同步一份。单实例部署没有清单，什么也不做。
+    上报写不进去抛 OSError，清单读不懂抛 InstanceDirectoryError：那就是真没记上，调用方得告诉人。
+    """
     path = instances_file(workspace_root)
     key, value = normalize_name(platform_id), str(account or "").strip()
     if not key or not value or not path.is_file():
         return False
     where = normalize_prefix(prefix)
-    with _locked(path):
-        rows = _read(path)
-        row = next((r for r in rows if r["path"] == where), None)
-        if row is None or (row["platform"] == key and row["account"] == value):
-            return False
-        # 清单里的平台是建实例时声明的；上报的对不上时以实例实际在跑的那个为准。
-        row["platform"], row["account"] = key, value
-        _write(path, rows)
-        return True
+    rows = _with_reported_accounts(workspace_root, _read(path, mode="required"))
+    row = next((r for r in rows if r["path"] == where), None)
+    if row is None:
+        return False
+    # 清单里的平台是建实例时声明的；上报的对不上时以实例实际在跑的那个为准。
+    changed = (row["platform"], row["account"]) != (key, value)
+    if changed:
+        _write_account_report(workspace_root, row["id"], key, value)
+    # 只读挂载上 access 也报不可写，免得去拿一把建不出来的锁。
+    if os.access(path.parent, os.W_OK):
+        _mirror_account(path, where, key, value)
+    return changed
 
 
 def remove_instance(workspace_root: Path, instance_id: str) -> list[dict[str, Any]]:
-    """摘掉一个实例。不碰它的数据目录，那是 root 侧的事。"""
+    """摘掉一个实例。不碰它的数据目录，那是 root 侧的事。清单读不懂时抛 InstanceDirectoryError，一个字节都不写。"""
     key = str(instance_id or "").strip()
     path = instances_file(workspace_root)
     with _locked(path):
-        rows = [r for r in _read(path) if r["id"] != key]
+        rows = [r for r in _read(path, mode="required") if r["id"] != key]
         _write(path, rows)
         return rows

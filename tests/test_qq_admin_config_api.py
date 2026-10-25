@@ -187,18 +187,20 @@ class TestWriteRaw:
         self, client: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """bot 进程随时在读，直接覆写会让它读到半截 yaml —— 那等于整份配置塌掉。"""
-        replaced: list[str] = []
+        replaced: list[Path] = []
         real_replace = admin_api.os.replace
 
-        def spy(src: Any, dst: Any) -> Any:
-            replaced.append(str(dst))
-            return real_replace(src, dst)
+        def spy(src: Any, dst: Any, **kwargs: Any) -> Any:
+            replaced.append(Path(dst))
+            return real_replace(src, dst, **kwargs)
 
         monkeypatch.setattr(admin_api.os, "replace", spy)
 
         client("PUT", f"{_BASE}/raw", headers=_AUTH, json={"content": _VALID})
 
-        assert replaced == [str(_config_path(tmp_path))]
+        # 同一次请求里别处也会经 os.replace 落盘自己的文件，这里只看 qq.yaml 所在的目录。
+        target = _config_path(tmp_path)
+        assert [dst for dst in replaced if dst.parent == target.parent] == [target]
 
     def test_an_unconsumed_key_is_rejected_when_the_schema_is_known(
         self, client: Any, tmp_path: Path,

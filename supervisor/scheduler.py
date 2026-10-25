@@ -11,7 +11,9 @@ import contextlib
 import copy
 import json
 import logging
+import math
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -22,11 +24,12 @@ from typing import Any, Callable, TYPE_CHECKING
 
 import yaml
 
+import config_layout
+from clonoth_runtime import parse_bool
 from engine.context_store import cleanup_old_contexts
 from engine.conversation_migration import ConversationRekey, RekeyCount
 from engine.cron import cron_match
-from file_lock import exclusive_lock
-from toolbox.text_files import newline_of, write_text_as
+from toolbox._common import safe_subprocess_env
 
 
 if TYPE_CHECKING:
@@ -36,6 +39,13 @@ log = logging.getLogger(__name__)
 
 # 记录创建平台之前，只有 QQ 适配器会写 created_by。
 _LEGACY_CREATOR_PLATFORM = "qq"
+
+_SCRIPT_TIMEOUT_DEFAULT_SEC = 30.0
+_SCRIPT_TIMEOUT_MIN_SEC = 1.0
+_SCRIPT_TIMEOUT_MAX_SEC = 3600.0
+# 杀掉之后最多再等这么久收管道：自己另开会话逃出进程组的孙进程会一直攥着它。
+_SCRIPT_REAP_GRACE_SEC = 5.0
+_TICK_OFFSET_SEC = 1.0
 
 
 def _creator_fields(schedule: dict) -> dict[str, str]:
@@ -54,15 +64,18 @@ def schedules_path(workspace_root: Path) -> Path:
 
 
 def load_schedules(workspace_root: Path) -> list[dict[str, Any]]:
+    """只读的调用方用：读不懂当成没有定时任务，调度线程不至于崩掉。同一份坏文件只记一次日志。"""
+    path = schedules_path(workspace_root)
     try:
-        return _read_schedule_file(schedules_path(workspace_root))
-    except Exception:
+        return _read_schedule_file(path)
+    except Exception as exc:
+        _report_unreadable(path, exc)
         return []
 
 
 def save_schedules(workspace_root: Path, schedules: list[dict[str, Any]]) -> None:
     path = schedules_path(workspace_root)
-    with exclusive_lock(_schedule_lock_path(path)):
+    with config_layout.locked(path):
         _write_schedule_file(path, schedules)
 
 
@@ -74,8 +87,34 @@ def update_schedules(
 
 
 def schedules_lock(workspace_root: Path) -> contextlib.AbstractContextManager[None]:
-    """整份改写定时任务文件的人拿这把锁，和 update_schedules 排队。"""
-    return exclusive_lock(_schedule_lock_path(schedules_path(workspace_root)))
+    """整份改写定时任务文件的人拿这把锁，和 update_schedules 排队；控制台原文编辑器写入时拿的也是它。"""
+    return config_layout.locked(schedules_path(workspace_root))
+
+
+def check_schedules_text(text: str) -> list[str]:
+    """控制台原文编辑器保存前的校验：结构不对抛 ValueError，调度时会被跳过的条目只提醒。"""
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"YAML 解析失败：{exc}") from exc
+    warnings: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(_schedule_entries(data, "data/schedules.yaml"), 1):
+        if not isinstance(item, dict):
+            warnings.append(f"第 {index} 条不是映射，调度时会跳过")
+            continue
+        sid = str(item.get("id") or "").strip()
+        if not sid:
+            warnings.append(f"第 {index} 条没有 id，调度时会跳过")
+            continue
+        if sid in seen:
+            warnings.append(f"id {sid} 重复，同一分钟只有第一条会触发")
+        seen.add(sid)
+        if len(str(item.get("cron") or "").split()) != 5:
+            warnings.append(f"{sid} 的 cron 不是「分 时 日 月 周」五段，不会触发")
+        if str(item.get("type") or "message").strip() == "script" and not str(item.get("command") or "").strip():
+            warnings.append(f"{sid} 是 script 类型却没写 command，不会执行")
+    return warnings
 
 
 def rekey_schedules(path: Path, rekey: ConversationRekey, *, apply: bool) -> RekeyCount:
@@ -100,39 +139,49 @@ def rekey_schedules(path: Path, rekey: ConversationRekey, *, apply: bool) -> Rek
     return RekeyCount(moved)
 
 
-def _schedule_lock_path(path: Path) -> Path:
-    return path.with_name(f"{path.name}.lock")
+# 已经为哪个文件版本记过「读不懂」：调度线程每分钟都读，不去重的话坏文件每分钟刷一条。
+_unreadable_stamps: dict[Path, tuple[int, int, int] | None] = {}
+_unreadable_lock = threading.Lock()
+
+
+def _report_unreadable(path: Path, exc: Exception) -> None:
+    stamp = config_layout.file_stamp(path)
+    with _unreadable_lock:
+        if path in _unreadable_stamps and _unreadable_stamps[path] == stamp:
+            return
+        _unreadable_stamps[path] = stamp
+    log.warning("[scheduler] %s 读不懂，修好之前一条定时任务都不会触发：%s", path, exc)
+
+
+def _schedule_entries(data: Any, where: str) -> list[Any]:
+    """文件内容里的 schedules 列表，原样返回。空文件算没有定时任务。"""
+    if data is None:
+        return []
+    if not isinstance(data, dict):
+        raise ValueError(f"{where} 顶层要写成映射（schedules: [...]），现在是 {type(data).__name__}")
+    items = data.get("schedules") or []
+    if not isinstance(items, list):
+        raise ValueError(f"{where} 里的 schedules 要写成列表，现在是 {type(items).__name__}")
+    return items
 
 
 def _read_schedule_file(path: Path) -> list[dict[str, Any]]:
     """文件在但读不懂就抛：读坏当成空表再写回去，全部定时任务就没了。"""
     if not path.exists():
         return []
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    if not isinstance(data, dict):
-        raise ValueError(f"schedules file root is {type(data).__name__}, expected a mapping: {path}")
-    items = data.get("schedules") or []
-    if not isinstance(items, list):
-        raise ValueError(f"schedules in {path} is {type(items).__name__}, expected a list")
+    items = _schedule_entries(yaml.safe_load(path.read_text(encoding="utf-8")), str(path))
     return [item for item in items if isinstance(item, dict)]
 
 
 def _write_schedule_file(path: Path, schedules: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = yaml.safe_dump({"schedules": schedules}, sort_keys=False, allow_unicode=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    try:
-        write_text_as(tmp, text, newline_of(path))
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    """调用方已经拿着 config_layout.locked(path)。"""
+    config_layout.write_locked(path, yaml.safe_dump({"schedules": schedules}, sort_keys=False, allow_unicode=True))
 
 
 def _update_schedule_file(
     path: Path, change: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
-    with exclusive_lock(_schedule_lock_path(path)):
+    with config_layout.locked(path):
         current = _read_schedule_file(path)
         updated = change(copy.deepcopy(current))
         if updated != current:
@@ -144,15 +193,49 @@ def _update_schedule_file(
 #  调度线程
 # ---------------------------------------------------------------------------
 
+def _until_next_minute(now: float) -> float:
+    """睡到下一分钟开头稍后一点。固定睡 60 秒的话每轮自己的耗时会累积，迟早整整跳过一分钟，那一分钟的 cron 就不响了。"""
+    return 60.0 - now % 60.0 + _TICK_OFFSET_SEC
+
+
+def _script_timeout(raw: Any) -> float:
+    """脚本的超时秒数。写坏的按默认，压在上下限之间：写错的一条不该一直占着一个线程。"""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _SCRIPT_TIMEOUT_DEFAULT_SEC
+    if not math.isfinite(value) or value <= 0:
+        return _SCRIPT_TIMEOUT_DEFAULT_SEC
+    return min(max(value, _SCRIPT_TIMEOUT_MIN_SEC), _SCRIPT_TIMEOUT_MAX_SEC)
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """连同脚本拉起的子孙一起杀：只杀 shell 的话，孙进程攥着管道，communicate 永远等不到头。"""
+    if os.name == "nt":
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=_SCRIPT_REAP_GRACE_SEC,
+            )
+    else:
+        # start_new_session 让脚本自成一个进程组，组号就是它的 pid；shell 先退了，组里的孙进程照样杀得到。
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        proc.kill()
+
+
 class SchedulerThread:
-    """后台线程。每 60 秒检查一次 schedules.yaml，匹配的注入 inbound。"""
+    """后台线程。每分钟开头检查一次 schedules.yaml，匹配的注入 inbound。"""
 
     def __init__(self, *, state: "SupervisorState", workspace_root: Path) -> None:
         self._state = state
         self._workspace_root = workspace_root
         self._last_fired: dict[str, str] = {}  # schedule_id -> "YYYY-MM-DD HH:MM"
         self._thread: threading.Thread | None = None
-        self._running_scripts: set[str] = set()  # 防重入
+        # 还在跑的脚本任务，防重入；脚本在各自的线程里结束，所以要加锁。
+        self._running_scripts: set[str] = set()
+        self._scripts_lock = threading.Lock()
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, daemon=True, name="scheduler")
@@ -170,19 +253,15 @@ class SchedulerThread:
             # 每 30 分钟清理一次旧上下文快照（30 ticks × 60s = 30min）
             if tick_count % 30 == 0:
                 self._cleanup()
-            time.sleep(60)
+            time.sleep(_until_next_minute(time.time()))
 
     def _tick(self) -> None:
         now = datetime.now(timezone.utc)
         now_key = now.strftime("%Y-%m-%d %H:%M")
 
-        schedules = load_schedules(self._workspace_root)
-
-        for s in schedules:
+        for s in load_schedules(self._workspace_root):
             sid = str(s.get("id") or "").strip()
-            if not sid:
-                continue
-            if not s.get("enabled", True):
+            if not sid or not parse_bool(s.get("enabled"), True):
                 continue
 
             cron_expr = str(s.get("cron") or "").strip()
@@ -196,27 +275,16 @@ class SchedulerThread:
             if not cron_match(cron_expr, now):
                 continue
 
-            # 匹配成功
             self._last_fired[sid] = now_key
-            once = bool(s.get("once", False))
-            stype = str(s.get("type") or "message").strip()
-
-            if stype == "script":
-                fired = self._fire_script(s, sid)
-            else:
-                fired = self._fire_message(s, sid)
-
-            # 注入失败还照删，这条一次性提醒就再也不会响；留着等下次 cron 匹配重试。
-            if once and fired:
+            once = bool(parse_bool(s.get("once"), False))
+            if str(s.get("type") or "message").strip() == "script":
+                self._start_script(s, sid, once)
+            elif self._fire_message(s, sid) and once:
+                # 注入失败还照删，这条一次性提醒就再也不会响；留着等下次 cron 匹配重试。
                 self._remove_schedule(sid)
 
-        # Why: system-level scheduled features now live in engine.builtin
-        # supervisor hook handlers. How: emit a dream schedule tick with a
-        # callback-only context under the state's re-entrant lock. Purpose: keep
-        # SchedulerThread generic while avoiding direct handler access to state.
-        # handler 按 schedule_type 自己过滤，所以每种系统级定时特性 fire 一次。
-        # 这些 handler 必须立即返回：整个循环都在 state 锁里，一个慢 handler 会把
-        # 所有用户定时任务一起卡住。
+        # handler 按 schedule_type 自己过滤，每种系统级定时特性 fire 一次。
+        # 它们在 state 锁里同步跑，必须立即返回：慢了会拖住下一分钟的定时任务。
         for schedule_type in ("dream", "data_cleanup"):
             with self._state._lock:
                 self._state.hook_registry.fire(
@@ -279,66 +347,106 @@ class SchedulerThread:
         entry_node_id = str(s.get("entry_node_id") or "").strip()
         return self._inject_inbound(sid, text, conv_key, entry_node_id, **_creator_fields(s))
 
+    def _start_script(self, s: dict, sid: str, once: bool) -> None:
+        """脚本各跑各的线程：在调度线程里等它跑完，这期间到点的定时任务全得跟着等，等过了那一分钟就再也不响。"""
+        with self._scripts_lock:
+            if sid in self._running_scripts:
+                log.warning("[scheduler] script %s: still running, skipping", sid)
+                return
+            self._running_scripts.add(sid)
+        worker = threading.Thread(
+            target=self._run_script, args=(copy.deepcopy(s), sid, once),
+            daemon=True, name=f"scheduler-script:{sid}",
+        )
+        try:
+            worker.start()
+        except BaseException:
+            self._finish_script(sid)
+            raise
+
+    def _run_script(self, s: dict, sid: str, once: bool) -> None:
+        try:
+            if self._fire_script(s, sid) and once:
+                self._remove_schedule(sid)
+        except Exception:
+            log.exception("[scheduler] script %s: unexpected error", sid)
+        finally:
+            self._finish_script(sid)
+
+    def _finish_script(self, sid: str) -> None:
+        with self._scripts_lock:
+            self._running_scripts.discard(sid)
+
     def _fire_script(self, s: dict, sid: str) -> bool:
         """type=script：执行脚本，stdout JSON 解析后注入 inbound。返回是否真的注入成功。"""
         command = str(s.get("command") or "").strip()
         if not command:
-            log.error(f"[scheduler] script {sid}: missing 'command' field")
+            log.error("[scheduler] script %s: missing 'command' field", sid)
             return False
-        if sid in self._running_scripts:
-            log.warning(f"[scheduler] script {sid}: still running, skipping")
+        stdout = self._run_command(sid, command, _script_timeout(s.get("timeout")))
+        if stdout is None:
             return False
-        self._running_scripts.add(sid)
+        text_prefix = str(s.get("text") or "").strip()
+        conv_key = str(s.get("conversation_key") or f"scheduler:{sid}").strip()
+        entry_node_id = str(s.get("entry_node_id") or "").strip()
+        stdout = stdout.strip()
+        if not stdout:
+            if parse_bool(s.get("silent"), True):
+                log.debug("[scheduler] script %s: empty stdout, silent skip", sid)
+                return False
+            if not text_prefix:
+                return False
+            log.info("[scheduler] script %s: empty stdout, injecting prefix", sid)
+            return self._inject_inbound(sid, text_prefix, conv_key, entry_node_id, **_creator_fields(s))
         try:
-            timeout = int(s.get("timeout") or 30)
-            silent = bool(s.get("silent", True))
-            text_prefix = str(s.get("text") or "").strip()
-            conv_key = str(s.get("conversation_key") or f"scheduler:{sid}").strip()
-            entry_node_id = str(s.get("entry_node_id") or "").strip()
-            result = subprocess.run(
-                command, shell=True, capture_output=True, text=True,
-                timeout=timeout, cwd=str(self._workspace_root),
+            data = json.loads(stdout)
+        except json.JSONDecodeError as e:
+            log.error("[scheduler] script %s: invalid JSON output: %s", sid, e)
+            return False
+        if not isinstance(data, dict):
+            log.error("[scheduler] script %s: JSON output must be an object, got %s", sid, type(data).__name__)
+            return False
+        body_text = str(data.get("text") or "").strip()
+        if not body_text:
+            log.error("[scheduler] script %s: JSON missing 'text' field", sid)
+            return False
+        if text_prefix:
+            body_text = text_prefix + "\n" + body_text
+        attachments = data.get("attachments") or None
+        return self._inject_inbound(
+            sid, body_text, conv_key, entry_node_id, attachments, **_creator_fields(s),
+        )
+
+    def _run_command(self, sid: str, command: str, timeout: float) -> str | None:
+        """跑一条脚本命令，成功返回 stdout；起不来、超时、非零退出都记日志返回 None。"""
+        try:
+            proc = subprocess.Popen(
+                command, shell=True, cwd=str(self._workspace_root),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding="utf-8", errors="replace",
+                # 和 execute_command 一样剥掉模型密钥、管理令牌和平台令牌：命令是人写进文件的，跑在 supervisor 的身份下。
+                env=safe_subprocess_env(),
+                start_new_session=True,
             )
-            if result.stderr and result.stderr.strip():
-                log.warning(f"[scheduler] script {sid} stderr: {result.stderr.strip()[:500]}")
-            if result.returncode != 0:
-                log.error(f"[scheduler] script {sid} exited with rc={result.returncode}")
-                return False
-            stdout = (result.stdout or "").strip()
-            if not stdout:
-                if silent:
-                    log.debug(f"[scheduler] script {sid}: empty stdout, silent skip")
-                    return False
-                log.info(f"[scheduler] script {sid}: empty stdout, injecting prefix")
-                if not text_prefix:
-                    return False
-                return self._inject_inbound(
-                    sid, text_prefix, conv_key, entry_node_id, **_creator_fields(s),
-                )
-            # 解析 JSON
-            try:
-                data = json.loads(stdout)
-            except json.JSONDecodeError as e:
-                log.error(f"[scheduler] script {sid}: invalid JSON output: {e}")
-                return False
-            body_text = str(data.get("text") or "").strip()
-            if not body_text:
-                log.error(f"[scheduler] script {sid}: JSON missing 'text' field")
-                return False
-            if text_prefix:
-                body_text = text_prefix + "\n" + body_text
-            attachments = data.get("attachments") or None
-            return self._inject_inbound(
-                sid, body_text, conv_key, entry_node_id, attachments, **_creator_fields(s),
-            )
+        except (OSError, ValueError) as e:
+            log.error("[scheduler] script %s: failed to start: %s", sid, e)
+            return None
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            log.error(f"[scheduler] script {sid}: timed out after {s.get('timeout', 30)}s")
-            return False
-        except Exception as e:
-            log.error(f"[scheduler] script {sid}: unexpected error: {e}")
-            return False
-        finally:
-            self._running_scripts.discard(sid)
+            _kill_tree(proc)
+            try:
+                proc.communicate(timeout=_SCRIPT_REAP_GRACE_SEC)
+            except subprocess.TimeoutExpired:
+                log.warning("[scheduler] script %s: a child left the process group and still holds the pipes", sid)
+            log.error("[scheduler] script %s: timed out after %gs, killed", sid, timeout)
+            return None
+        if stderr and stderr.strip():
+            log.warning("[scheduler] script %s stderr: %s", sid, stderr.strip()[:500])
+        if proc.returncode != 0:
+            log.error("[scheduler] script %s exited with rc=%s", sid, proc.returncode)
+            return None
+        return stdout or ""
 
     def _remove_schedule(self, sid: str) -> None:
         try:

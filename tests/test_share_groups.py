@@ -249,7 +249,8 @@ class TestCreatingAGroup:
 
     @pytest.fixture
     def swap_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """只让「把链接换成 config/」那一下失败，前面建组目录的那次改名照常。"""
+        """只让「把链接换成 config/」那一下失败，前面建组目录的那次改名照常。走的是不支持对调时的两步改名。"""
+        monkeypatch.setattr(share_groups, "_exchange", lambda *_args: False)
         real = os.replace
 
         def fail_on_config(src: Any, dst: Any, **kwargs: Any) -> Any:

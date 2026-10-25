@@ -17,6 +17,7 @@ from clonoth_runtime import (
     SYSTEM_MODEL_SLOTS,
     image_tool_available,
     is_channel_block,
+    parse_bool,
     resolve_env_ref,
 )
 import config_layout
@@ -49,12 +50,31 @@ def _resolve_env_value(value: str) -> str:
 
 def _tristate(value: Any) -> bool | None:
     """yaml 里的可选布尔。没配返回 None —— 和「配了个 false」不是一回事。"""
-    if value is None:
-        return None
-    if isinstance(value, str):
-        text = value.strip().lower()
-        return text in {"1", "true", "yes", "on"} if text else None
-    return bool(value)
+    return parse_bool(value)
+
+
+def _parse_models_text(text: str) -> dict[str, Any]:
+    """models.yaml 原文解析成 dict。空的按空配置算；解析不了、顶层不是映射抛 ConfigUnreadable。"""
+    if not text.strip():
+        return dict(_EMPTY_CONFIG)
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ConfigUnreadable(f"{config_layout.MODELS_FILE} 解析失败：{exc}") from exc
+    if data is None:
+        return dict(_EMPTY_CONFIG)
+    if not isinstance(data, dict):
+        raise ConfigUnreadable(f"{config_layout.MODELS_FILE} 顶层必须是映射（key: value）")
+    return data
+
+
+def check_models_text(text: str) -> list[str]:
+    """原文编辑器保存前的校验，和运行期读文件是同一套：这里不过的，存下去运行期也只能沿用上一份。"""
+    try:
+        AppConfigSecret.model_validate(_parse_models_text(text))
+    except ValidationError as exc:
+        raise ValueError(f"{config_layout.MODELS_FILE} 字段不合法：{exc}") from exc
+    return []
 
 
 def _redact_api_key(api_key: str) -> tuple[bool, str]:
@@ -104,17 +124,7 @@ class ConfigStore:
             return dict(_EMPTY_CONFIG)
         except (OSError, UnicodeDecodeError) as exc:
             raise ConfigUnreadable(f"读不了 {config_layout.MODELS_FILE}：{exc}") from exc
-        if not text.strip():
-            return dict(_EMPTY_CONFIG)
-        try:
-            data = yaml.safe_load(text)
-        except yaml.YAMLError as exc:
-            raise ConfigUnreadable(f"{config_layout.MODELS_FILE} 解析失败：{exc}") from exc
-        if data is None:
-            return dict(_EMPTY_CONFIG)
-        if not isinstance(data, dict):
-            raise ConfigUnreadable(f"{config_layout.MODELS_FILE} 顶层必须是映射（key: value）")
-        return data
+        return _parse_models_text(text)
 
     def _load_locked(self) -> None:
         """按文件现状重读，从不写回。解析不了或字段不合法时留着上一份能用的，文件原样不动，等人去修。"""

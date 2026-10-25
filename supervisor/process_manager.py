@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from clonoth_runtime import get_bool, get_float, get_int, load_runtime_config
+from clonoth_runtime import env_bool, get_bool, get_float, get_int, load_runtime_config
 
 
 def _timestamp() -> str:
@@ -93,30 +93,16 @@ class ProcessManager:
             max_value=8,
         )
 
-        # 默认 False：TUI 在原终端前台运行（supervisor 输出已重定向到日志文件）
-        platform_default_new_console = False
-        cfg_new_console = runtime_cfg.get("supervisor", {}).get("process_manager", {}).get("shell_new_console", None)
-        shell_new_console = get_bool(runtime_cfg, "supervisor.process_manager.shell_new_console", platform_default_new_console)
-        if cfg_new_console is None:
-            shell_new_console = platform_default_new_console
-
-        env_raw = os.getenv("CLONOTH_SHELL_NEW_CONSOLE", "").strip().lower()
-        if env_raw in {"1", "true", "yes"}:
-            shell_new_console = True
-        elif env_raw in {"0", "false", "no"}:
-            shell_new_console = False
-
-        self.shell_new_console = shell_new_console
-        # shell TUI 不是核心组件，默认不自动拉起；config 可开启，
-        # env CLONOTH_SPAWN_SHELL_CLI 覆盖 config（1/true/yes to
-        # enable, 0/false/no to disable).
-        # Purpose: production no longer crashes on the optional shell TUI.
-        self.spawn_shell_cli = get_bool(runtime_cfg, "supervisor.process_manager.spawn_shell_cli", False)
-        _spawn_shell_env = os.getenv("CLONOTH_SPAWN_SHELL_CLI", "").strip().lower()
-        if _spawn_shell_env in {"1", "true", "yes"}:
-            self.spawn_shell_cli = True
-        elif _spawn_shell_env in {"0", "false", "no"}:
-            self.spawn_shell_cli = False
+        # 默认 False：TUI 在原终端前台运行（supervisor 输出已重定向到日志文件）。环境变量设了就盖过配置。
+        self.shell_new_console = env_bool(
+            "CLONOTH_SHELL_NEW_CONSOLE",
+            get_bool(runtime_cfg, "supervisor.process_manager.shell_new_console", False),
+        )
+        # shell TUI 不是核心组件，默认不拉起；配置可以打开，环境变量设了就盖过配置。
+        self.spawn_shell_cli = env_bool(
+            "CLONOTH_SPAWN_SHELL_CLI",
+            get_bool(runtime_cfg, "supervisor.process_manager.spawn_shell_cli", False),
+        )
 
         # 注册清理：supervisor 退出时杀掉所有子进程
         atexit.register(self._cleanup)

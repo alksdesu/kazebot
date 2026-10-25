@@ -29,6 +29,21 @@ fail() { printf '\n\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
 as_owner() { sudo -u "$OWNER" "$@"; }
 
+MIN_PYTHON='(3, 11)'
+PYTHON=python3
+
+pick_python() {
+  local candidate
+  for candidate in python3 python3.13 python3.12 python3.11; do
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if "$candidate" -c "import sys; sys.exit(0 if sys.version_info >= $MIN_PYTHON else 1)" 2>/dev/null; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # ---------------------------------------------------------------- 前置检查
 
 preflight() {
@@ -56,15 +71,17 @@ install_packages() {
   say "装系统依赖"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
+  # python3-yaml 给 root 侧用：建删实例的脚本和 cloudflared_ingress.py 只认系统解释器，不碰 kazebot 可写的 .venv。
   apt-get install -y -qq \
-    python3 python3-venv python3-pip \
+    python3 python3-venv python3-pip python3-yaml \
     git curl ca-certificates openssl >/dev/null
 
-  local pyver
-  pyver="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
-  python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
-    || fail "Python $pyver 太老，至少要 3.10（推荐 3.11+）"
-  info "Python $pyver"
+  # 系统自带的 python3 不够新（Ubuntu 22.04 是 3.10）时退到同机装的新版本，还没有就试着装一个。
+  PYTHON="$(pick_python)" || {
+    apt-get install -y -qq python3.11 python3.11-venv >/dev/null 2>&1 || true
+    PYTHON="$(pick_python)"
+  } || fail "Python $(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])') 太老，至少要 3.11；装上 python3.11 和 python3.11-venv 再重跑"
+  info "Python $("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')（$PYTHON）"
 
   # 控制台是配置和扫码的唯一入口，dist 编不出来这台机器就没法用 —— Node 不是可选项
   command -v npm >/dev/null 2>&1 || apt-get install -y -qq nodejs npm >/dev/null
@@ -109,8 +126,11 @@ setup_venv() {
   if [ -x "$REPO/.venv/bin/python" ]; then
     skip ".venv 已存在"
   else
-    as_owner python3 -m venv "$REPO/.venv"
+    as_owner "$PYTHON" -m venv "$REPO/.venv"
   fi
+  # 上次用旧解释器建出来的 .venv 不会自己升级。
+  "$REPO/.venv/bin/python" -c "import sys; sys.exit(0 if sys.version_info >= $MIN_PYTHON else 1)" \
+    || fail "$REPO/.venv 的 Python 不到 3.11，删掉它（rm -r $REPO/.venv）再重跑"
   as_owner "$REPO/.venv/bin/pip" install -q --upgrade pip
   as_owner "$REPO/.venv/bin/pip" install -q -r "$REPO/requirements.txt"
   info "依赖装好了（含 nonebot2 与 onebot 适配器）"

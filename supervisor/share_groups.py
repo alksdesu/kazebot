@@ -6,19 +6,26 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import errno
+import functools
 import json
+import logging
 import os
 import secrets
 import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import config_layout
 from file_lock import exclusive_lock
 from platforms.protection import is_instance_env
 
-from .instances import load_instances, url_prefix
+from .instances import instance_workspace, load_instances, url_prefix
+
+_log = logging.getLogger(__name__)
 
 # 记建组信息的文件和组的 config/ 并排放，不跟着配置走。
 _GROUP_META = "group.json"
@@ -27,6 +34,11 @@ _GROUPS_LOCK = ".groups.lock"
 # 抄配置时不带锁文件、写到一半的临时文件和字节码。
 _COPY_IGNORE = shutil.ignore_patterns("*.lock", "*.tmp", "__pycache__")
 ARCHIVE_PREFIX = "config.archived-"
+# 切换 config/ 的空档里别的进程新建出来的 config/，回滚前挪到这个名字下。
+INTERRUPTED_PREFIX = "config.interrupted-"
+
+_AT_FDCWD = -100
+_RENAME_EXCHANGE = 2
 
 
 class ShareGroupError(RuntimeError):
@@ -57,17 +69,12 @@ def _locked_groups(root: Path):
 
 
 def _instance_workspaces(workspace_root: Path) -> list[tuple[dict[str, Any], Path]]:
-    """清单里每个实例的工作区：本实例就是 workspace_root；序号 0 是代码目录里的主实例；其余都在数据根下按实例名放。"""
-    prefix = url_prefix()
-    data = config_layout.data_root()
+    """清单里每个找得到工作区的实例，连同它的工作区。"""
     found: list[tuple[dict[str, Any], Path]] = []
     for row in load_instances(workspace_root):
-        if row["path"] == prefix:
-            found.append((row, Path(workspace_root)))
-        elif row["idx"] == 0:
-            found.append((row, config_layout.CODE_ROOT))
-        elif data is not None:
-            found.append((row, data / row["id"]))
+        workspace = instance_workspace(workspace_root, row)
+        if workspace is not None:
+            found.append((row, workspace))
     return found
 
 
@@ -161,19 +168,87 @@ def _remove_link(link: Path) -> None:
         os.unlink(link)
 
 
-def _free_archive_path(workspace_root: Path) -> Path:
-    base = Path(workspace_root) / "data" / f"{ARCHIVE_PREFIX}{_now_stamp()}"
+def _present(path: Path) -> bool:
+    """有东西占着这个名字，悬空的链接也算。"""
+    return path.exists() or path.is_symlink()
+
+
+def _free_data_path(workspace_root: Path, prefix: str) -> Path:
+    base = Path(workspace_root) / "data" / f"{prefix}{_now_stamp()}"
     candidate, serial = base, 1
-    while candidate.exists() or candidate.is_symlink():
+    while _present(candidate):
         serial += 1
         candidate = base.with_name(f"{base.name}-{serial}")
     return candidate
 
 
+def _free_archive_path(workspace_root: Path) -> Path:
+    return _free_data_path(workspace_root, ARCHIVE_PREFIX)
+
+
+@functools.cache
+def _renameat2() -> Callable[..., int] | None:
+    """libc 里的 renameat2。不是 Linux、或者 libc 老得没有这个函数，返回 None。"""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        func = ctypes.CDLL(None, use_errno=True).renameat2
+    except (OSError, AttributeError):
+        return None
+    func.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    func.restype = ctypes.c_int
+    return func
+
+
+def _exchange(first: Path, second: Path) -> bool:
+    """一次系统调用对调两个路径上的东西，中间没有哪一瞬两个名字缺一个。系统或文件系统不支持时返回 False，调用方退回两步改名。"""
+    func = _renameat2()
+    if func is None:
+        return False
+    if func(_AT_FDCWD, os.fsencode(first), _AT_FDCWD, os.fsencode(second), _RENAME_EXCHANGE) == 0:
+        return True
+    code = ctypes.get_errno()
+    # 内核早于 3.15 是 ENOSYS；文件系统不认 RENAME_EXCHANGE 是 EINVAL，有的 FUSE 报 EOPNOTSUPP。
+    if code in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+        return False
+    raise OSError(code, os.strerror(code), str(first), None, str(second))
+
+
+def _set_aside(workspace: Path, path: Path) -> Path:
+    """切换 config/ 的空档里有进程（bot 写配置时会顺手建目录）新建了它：挪到 data/ 下，原来那份才放得回去。"""
+    stray = _free_data_path(workspace, INTERRUPTED_PREFIX)
+    stray.parent.mkdir(parents=True, exist_ok=True)
+    os.rename(path, stray)
+    _log.warning("切换 config/ 时有进程新建了 %s，已挪到 %s，确认没用后自行清理", path, stray)
+    return stray
+
+
+def _restore_config(workspace: Path, config: Path, saved: Path) -> None:
+    """两步改名的第二步没成：把挪开的那份放回 config/。"""
+    if config_layout.is_dir_link(config):
+        _remove_link(config)
+    elif _present(config):
+        _set_aside(workspace, config)
+    os.rename(saved, config)
+
+
+def _archive_exchanged(config: Path, staged: Path, archive: Path) -> None:
+    """对调之后旧目录在暂存名上，改名归档。归档不下去就再对调回来，等于什么都没发生。"""
+    try:
+        os.rename(staged, archive)
+    except BaseException:
+        try:
+            _exchange(staged, config)
+        except OSError as error:
+            _log.error("归档 %s 失败，换回原来的 config/ 也失败了，旧配置留在 %s：%s", config, staged, error)
+        raise
+
+
 def _link_config(workspace_root: Path, target: Path) -> str:
     """把本实例的 config/ 换成指向 target 的链接，原来那份改名归档进 data/，返回归档到哪（相对工作区）。
 
-    新链接先在旁边建好再改名换上：换的那一下 bot 可能正在读配置，最多撞上两次改名之间那一瞬的空档。
+    新链接先在旁边建好再对调上去：换的那一下 bot 可能正在读配置。不支持对调的系统退回两次改名，
+    空档里别的进程新建的 config/ 在回滚时挪到一边。
     """
     root = Path(workspace_root)
     config = config_layout.config_dir(root)
@@ -181,19 +256,25 @@ def _link_config(workspace_root: Path, target: Path) -> str:
         raise ShareGroupError("本实例的 config/ 已经是一个链接，先退出现在的组")
     staged = root / f".config.{secrets.token_hex(6)}.link"
     _make_dir_link(staged, target)
-    archive: Path | None = None
     try:
-        if config.exists():
-            archive = _free_archive_path(root)
-            archive.parent.mkdir(parents=True, exist_ok=True)
+        if not _present(config):
+            os.replace(staged, config)
+            return ""
+        archive = _free_archive_path(root)
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        if _exchange(staged, config):
+            _archive_exchanged(config, staged, archive)
+        else:
             os.rename(config, archive)
-        os.replace(staged, config)
-    except BaseException:
-        if archive is not None and not (config.exists() or config.is_symlink()):
-            os.rename(archive, config)
+            try:
+                os.replace(staged, config)
+            except BaseException:
+                _restore_config(root, config, archive)
+                raise
+        return archive.relative_to(root).as_posix()
+    finally:
+        # 链接还在暂存名上说明没换上去；换下来的旧目录不是链接，这里不会碰它。
         _remove_link(staged)
-        raise
-    return archive.relative_to(root).as_posix() if archive is not None else ""
 
 
 def _shareable_env(workspace_root: Path) -> dict[str, str]:
@@ -285,14 +366,32 @@ def leave_group(workspace_root: Path) -> dict[str, Any]:
         staged = workspace / f".config.{secrets.token_hex(6)}.leaving"
         try:
             shutil.copytree(source, staged, ignore=_COPY_IGNORE)
+            exchanged = _exchange(staged, link)
+        except BaseException:
+            shutil.rmtree(staged, ignore_errors=True)
+            raise
+        if exchanged:
+            # 对调下来的是指向组的链接，删它不碰组里的内容；删不掉也只是留下一个没人用的链接。
+            with contextlib.suppress(OSError):
+                _remove_link(staged)
+            return {"group": group}
+        try:
             _remove_link(link)
             os.rename(staged, link)
         except BaseException:
-            if not (link.exists() or link.is_symlink()):
-                _make_dir_link(link, source)
+            _relink_config(workspace, link, source)
             shutil.rmtree(staged, ignore_errors=True)
             raise
     return {"group": group}
+
+
+def _relink_config(workspace: Path, link: Path, source: Path) -> None:
+    """退组没换成：config/ 换回指向组的链接。空档里别的进程新建的 config/ 先挪到一边。"""
+    if config_layout.is_dir_link(link):
+        return
+    if _present(link):
+        _set_aside(workspace, link)
+    _make_dir_link(link, source)
 
 
 def delete_group(workspace_root: Path, raw_name: Any) -> dict[str, Any]:
@@ -314,6 +413,7 @@ def delete_group(workspace_root: Path, raw_name: Any) -> dict[str, Any]:
 
 __all__ = [
     "ARCHIVE_PREFIX",
+    "INTERRUPTED_PREFIX",
     "ShareGroupError",
     "create_group",
     "delete_group",

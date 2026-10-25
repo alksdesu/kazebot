@@ -14,7 +14,7 @@ import uvicorn
 from fastapi import FastAPI
 
 import config_layout
-from clonoth_runtime import TASK_REAP_INTERVAL_SECONDS, process_workspace
+from clonoth_runtime import TASK_REAP_INTERVAL_SECONDS, env_bool, process_workspace
 from platforms.registry import PLATFORM_ENV, UnknownPlatform, current_platform
 from workspace import CONFIG_ERROR_EXIT_CODE
 
@@ -217,8 +217,7 @@ def main() -> None:
 
     app = _mount_instance(app, url_prefix())
 
-    env_access_log = (os.getenv("CLONOTH_ACCESS_LOG") or "").strip().lower() in {"1", "true", "yes", "y"}
-    access_log = bool(args.access_log or env_access_log)
+    access_log = bool(args.access_log or env_bool("CLONOTH_ACCESS_LOG", False))
 
     # TUI 子进程退出时自动关停 supervisor
     if process_manager and process_manager.shell_cli:

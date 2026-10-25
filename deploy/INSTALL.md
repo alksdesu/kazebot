@@ -14,7 +14,7 @@ sudo /opt/kazebot/deploy/bootstrap.sh
 ## 它做了什么
 
 ```
-1  装系统依赖        python3 / git / curl / docker / nodejs
+1  装系统依赖        python3（至少 3.11，系统自带的不够新会补装 python3.11）/ python3-yaml / git / curl / docker / nodejs
 2  建用户与目录      kazebot 系统用户（nologin），/opt/kazebot 与 /opt/kazebot-data 归它
 3  建 venv           pip install -r requirements.txt
 4  写 .env           只放机器相关的：端口、随机生成的 Bridge token 和会话摘要盐

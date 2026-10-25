@@ -17,7 +17,13 @@ import yaml
 import config_layout
 from providers import registry
 from plugin_runtime import plugin_scope
-from clonoth_runtime import load_platform_secrets, platform_secret, resolve_env_ref, stray_platforms_section
+from clonoth_runtime import (
+    load_platform_secrets,
+    platform_secret,
+    resolve_env_ref,
+    runtime_config_error,
+    stray_platforms_section,
+)
 from platforms.descriptor import PlatformDescriptor
 from platforms.registry import all_platforms, current_platform, platform_config_path
 from supervisor.config_store import ConfigStore
@@ -235,6 +241,12 @@ class OperationsService:
             add("存储空间", "passed" if disk.free > 512 * 1024 * 1024 else "warning",
                 f"可用 {disk.free // (1024 * 1024)} MiB")
             self._layout_check(add)
+            policy_error = getattr(getattr(self.state, "policy", None), "load_error", "")
+            if policy_error:
+                add("策略文件", "warning", policy_error, f"在原文编辑器里修好 {config_layout.POLICY_FILE}")
+            runtime_error = runtime_config_error(self.root)
+            if runtime_error:
+                add("运行参数文件", "warning", runtime_error, f"在原文编辑器里修好 {config_layout.RUNTIME_FILE}")
             store = getattr(self.state, "feature_config_store", None) or ConfigStore(
                 path=config_layout.models_path(self.root), workspace_root=self.root,
             )

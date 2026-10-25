@@ -39,7 +39,9 @@
 | `account` | 登录的账号，比如 `"1000000002"`；还没登录过是空串 |
 | `uin` | QQ 实例另记的一份账号，只给退回改造前的版本时读 |
 
-`account` 建实例时可以先填；之后在控制台快速切换、扫码登录成功，本实例的 supervisor 会把新号记进自己那一条。别的实例据此拦着同一个号双登 —— 同一个号两边登，会互相把对方踢下线，数据也会分成两份。前端置灰之外，supervisor 的切号接口也会拒绝。比的是平台加账号：同机的 QQ 实例和别的平台的实例，号长得一样也互不相干。
+`account` 建实例时可以先填；之后在控制台快速切换、扫码登录成功，本实例的 supervisor 会把新号记下来。别的实例据此拦着同一个号双登 —— 同一个号两边登，会互相把对方踢下线，数据也会分成两份。前端置灰之外，supervisor 的切号接口也会拒绝。比的是平台加账号：同机的 QQ 实例和别的平台的实例，号长得一样也互不相干。
+
+新号先记在本实例自己的 `data/instance_account.yaml`（实例名、平台、账号）：`kazebot@` 的沙箱只放开实例自己的工作区，数据根下的 `instances.yaml` 它写不了。谁读清单都会把各实例的这份叠上去，以它为准；主实例写得动清单，会顺带同步进自己那一条。两处都没记上时，切号的响应里带 `roster_error`，号照样换成了，只是别的实例拦不住它。
 
 改造前的两种写法照样认：只有 `uin` 的老条目，和一个实例挂几个平台时的 `accounts` 映射（认其中 QQ 那一项）。下次改写清单时会换成上面的写法。
 
@@ -51,9 +53,9 @@
 sudo /opt/kazebot/deploy/install_provision.sh <主实例名> <主实例QQ号>
 ```
 
-它会装好 root 侧组件与 polkit 规则、建 `/opt/kazebot-data`、用 drop-in 放开主实例对它的写权限，并把主实例登记进清单；宿主清理的定时任务也在这一步装上，见下面「宿主清理」。装完控制台的「账号 → 多开实例」里就能直接建实例。老写法 `install_provision.sh <主实例QQ号>` 照旧能用：实例名和 QQ 号都是那个号。
+它会装好 root 侧组件与 polkit 规则（系统解释器缺 PyYAML 时顺带装 `python3-yaml`，root 侧脚本只认它）、建 `/opt/kazebot-data`、用 drop-in 放开主实例对它的写权限、给主实例的 supervisor 和 QQ 适配器都补上清单路径，并把主实例登记进清单；宿主清理的定时任务也在这一步装上，见下面「宿主清理」。装完控制台的「账号 → 多开实例」里就能直接建实例。老写法 `install_provision.sh <主实例QQ号>` 照旧能用：实例名和 QQ 号都是那个号。
 
-**改过 `provision_instance.sh`、`cloudflared_ingress.py`、polkit 规则或 `deploy/systemd/` 里的模板之后要重跑一次** —— git 更新的是 `/opt/kazebot` 里的源，不会自动同步到 `/usr/local/lib` 和 `/etc`。实例改按 bot 命名这一次就要重跑：老 polkit 规则只放行纯数字的实例名，老的删实例脚本也只按 `uin` 摘清单。
+**改过 `provision_instance.sh`、`cloudflared_ingress.py`、polkit 规则或 `deploy/systemd/` 里的模板之后要重跑一次** —— git 更新的是 `/opt/kazebot` 里的源，不会自动同步到 `/usr/local/lib` 和 `/etc`。实例改按 bot 命名这一次就要重跑：老 polkit 规则只放行纯数字的实例名，老的删实例脚本也只按 `uin` 摘清单。清单的锁文件改名成 `.instances.yaml.lock` 这一次也要重跑：老的删实例脚本锁的还是 `instances.yaml.lock`，和 supervisor 锁不到一起，同时改清单会丢条目。
 
 ## 建实例
 
@@ -71,6 +73,8 @@ tail -f /opt/kazebot-data/provision-<实例名>.log
 ## 删实例
 
 控制台里点「停用并归档」，手打实例名确认。**数据不会真删**：工作区和 NapCat 目录改名成 `.deleted-<时间戳>`，确认无误后自己清理。序号 0 和当前正在看的实例删不掉。
+
+删到一半失败（进度里是 `DONE fail`）的，控制台里那条还在，再点一次就接着删：停服务、删容器、摘 cloudflared 规则、归档都能重跑，做过的自己跳过；清单最后才摘。机器上没有 `/etc/cloudflared/config.yml` 时建、删实例都跳过 cloudflared 这一步，外网入口自己在反代里配。
 
 ## 为什么 root 侧要单独一套
 
@@ -128,7 +132,7 @@ journalctl -u kazebot-host-cleanup -n 100 --no-pager
 - **序号 0 的 NapCat 容器不要重建。** 现有容器跑 `--network host`，第二个 host 容器会抢 6099 以及 QQ NT 自己占的 4001/4301。新实例一律用 bridge 网络加 `-p 127.0.0.1:<端口>:6099`。
 - bridge 网络下 NoneBot 不能只监听 `127.0.0.1`，且必须配 `ONEBOT_ACCESS_TOKEN` —— 这两条 QQ 的 `instance_env` 会按序号自动写进 `.env`。
 - **附件目录必须挂成同一个绝对路径**（NapCat 靠路径发图），所以每个实例挂自己那份 `data/attachments`。
-- 几个实例共用一个域名，靠 `CLONOTH_URL_PREFIX` 分流。cloudflared 那条 path 规则由建实例脚本自动加，**它会先备份再 `ingress validate`，不过就回滚** —— 同一条 tunnel 上还挂着别的站点。
+- 几个实例共用一个域名，靠 `CLONOTH_URL_PREFIX` 分流。cloudflared 那条 path 规则由建实例脚本自动加，**它会先备份再 `ingress validate`，不过就回滚** —— 同一条 tunnel 上还挂着别的站点。没装 cloudflared 的机器跳过这一步。
 - 前端 `dist` 只有一份，build 一次即可。
 
 ## 隔离到什么程度
@@ -168,7 +172,7 @@ journalctl -u kazebot-host-cleanup -n 100 --no-pager
 
 升级时还需要完成以下步骤，再在控制台建组或加入：
 
-1. 备份并核对现有单元的本机修改，把新版 `kazebot@.service`、`kazebot-qq@.service` 安装到 `/etc/systemd/system/`；保留本机所需的 drop-in。
+1. 备份并核对现有单元的本机修改，把新版 `kazebot@.service`、`kazebot-qq@.service`、`kazebot-cleanup@.service` 安装到 `/etc/systemd/system/`；保留本机所需的 drop-in。
 2. 执行 `systemctl daemon-reload`，在维护窗口重启主实例 `kazebot-qq.service`，以及本次升级的各实例 `kazebot@<实例名>.service`、`kazebot-qq@<实例名>.service`。只重启 engine 不会重建 supervisor 或 bot 的 systemd 文件系统沙箱。
 3. 用 `systemctl show <单元名> -p ReadWritePaths` 核对共享目录权限，并检查服务状态与日志。主 supervisor 的权限来自 `10-instances.conf`，主 QQ 的权限来自 `20-shared-config.conf`，多实例的权限来自新版模板。
 4. 给旧实例工作区补上指向 `/opt/kazebot/defaults` 的 `defaults` 软链；若同名位置已有内容，先核对并保留，不能直接覆盖。
@@ -180,6 +184,6 @@ journalctl -u kazebot-host-cleanup -n 100 --no-pager
 | `CLONOTH_WORKSPACE` | 工作区根。不设时回落到代码目录，行为与改造前一致。实例的工作区由 systemd 单元给，实例 `.env` 里别写这一行：`EnvironmentFile=` 的值总是盖过单元里的 `Environment=`，整份抄主实例的 `.env` 过来，这个实例就落到了主实例的目录 |
 | `CLONOTH_URL_PREFIX` | 控制台与 API 挂载的路径前缀，留空为根 |
 | `CLONOTH_MAINTENANCE_SCOPE` | 定期清理管到哪：`workspace` 只清本工作区，不设就是 `all`，连宿主级的一起。装了宿主清理的机器，单元里已经写成 `workspace` |
-| `CLONOTH_INSTANCES_FILE` | 共享清单位置，默认 `<工作区>/config/instances.yaml` |
+| `CLONOTH_INSTANCES_FILE` | 共享清单位置，默认 `<工作区>/config/instances.yaml`。数据根按它认，同一个实例的 supervisor、QQ 适配器和清理单元必须设成同一个：少设一个，共享表情包库和共享组的配置在那个进程眼里就在工作区外面 |
 | `NAPCAT_WEBUI_URL` | 本实例对应的 NapCat WebUI，默认 `http://127.0.0.1:6099` |
 | `CLONOTH_PORT` / `PORT` / `ONEBOT_FORWARD_BRIDGE_PORT` | 三个监听端口 |

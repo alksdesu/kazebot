@@ -26,7 +26,7 @@ from platforms.wording import name_with
 
 from .admin_api import verify_admin_token
 from .conversation_stores import ConversationStoreError, store_counts_payload
-from .instances import account_owner, record_account, url_prefix
+from .instances import InstanceDirectoryError, account_owner, record_account, url_prefix
 from .platform_api import resolve_platform
 from .state import SupervisorState
 from .types import AccountSwitchIn, QqQuickLoginIn
@@ -84,13 +84,15 @@ async def account_status(ops: AccountOps) -> dict[str, Any]:
         raise _refusal(exc) from exc
 
 
-def _remember_account(state: SupervisorState, platform: PlatformDescriptor, account: Any) -> None:
-    """记进实例清单，别的实例据此拦着同一个号双登。记不上不影响已经切成的号。"""
+def _remember_account(state: SupervisorState, platform: PlatformDescriptor, account: Any) -> dict[str, str]:
+    """记进实例清单，别的实例据此拦着同一个号双登。记不上不影响已经切成的号，但要随响应告诉人。"""
     text = str(account or "").strip()
     try:
         record_account(state.workspace_root, prefix=url_prefix(), platform_id=platform.id, account=text)
-    except OSError as exc:
+    except (OSError, InstanceDirectoryError) as exc:
         _log.warning("实例清单没记上 %s 的新账号 %s：%s", platform.id, text, exc)
+        return {"roster_error": f"号已经换上，但没记进实例清单，别的实例拦不住同一个号重复登录：{exc}"}
+    return {}
 
 
 async def switch_account(
@@ -107,8 +109,7 @@ async def switch_account(
         raise _refusal(exc) from exc
     # 换号等于换掉 bot 的身份，出事时必须查得到是谁在什么时候换的。
     _audit(state, "platform_account_switched", platform, account=result.get("account"), pinned=result.get("pinned"))
-    _remember_account(state, platform, result.get("account"))
-    return result
+    return {**result, **_remember_account(state, platform, result.get("account"))}
 
 
 async def login_qrcode(ops: AccountOps) -> dict[str, Any]:
@@ -137,8 +138,7 @@ async def pin_account(state: SupervisorState, platform: PlatformDescriptor, ops:
     except AccountOpsError as exc:
         raise _refusal(exc) from exc
     # 扫码登上的号只有这里说得清是哪个：控制台见到登录成功就来钉自动登录。
-    _remember_account(state, platform, account)
-    return {"ok": True, "account": account}
+    return {"ok": True, "account": account, **_remember_account(state, platform, account)}
 
 
 def scope_migration() -> ModuleType:

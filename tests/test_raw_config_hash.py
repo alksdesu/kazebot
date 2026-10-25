@@ -172,7 +172,7 @@ class TestWriteRaw:
 
         config_files.write_raw(path, _QQ_TEXT)
 
-        assert config_layout._lock_path(path).exists()
+        assert config_layout.lock_path(path).exists()
         assert not (path.parent / f"{path.name}.rotate.lock").exists()
         assert not list(path.parent.glob("*.tmp"))
 
@@ -423,7 +423,7 @@ class TestLiveConfigSave:
 
         config.save(config.document_from({"enabled": True}))
 
-        assert config_layout._lock_path(path).exists()
+        assert config_layout.lock_path(path).exists()
 
     def test_an_existing_files_newline_is_kept(self, tmp_path: Path) -> None:
         path = tmp_path / "config" / "qq.yaml"

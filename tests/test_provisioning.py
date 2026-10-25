@@ -48,6 +48,7 @@ NEW_INSTANCE = REPO_ROOT / "deploy" / "new_instance.sh"
 CLOUDFLARED = REPO_ROOT / "deploy" / "cloudflared_ingress.py"
 POLKIT = REPO_ROOT / "deploy" / "polkit" / "49-kazebot-provision.rules"
 INSTALL_DOC = REPO_ROOT / "deploy" / "INSTALL.md"
+MULTI_ACCOUNT_DOC = REPO_ROOT / "deploy" / "MULTI-ACCOUNT.md"
 BOOTSTRAP = REPO_ROOT / "deploy" / "bootstrap.sh"
 README = REPO_ROOT / "README.md"
 README_EN = REPO_ROOT / "README.en.md"
@@ -857,13 +858,7 @@ _ZH_STALE = "<第一个号的QQ号>"
 @pytest.mark.parametrize(("path", "usage", "stale"), [
     pytest.param(INSTALL_DOC, _ZH_USAGE, _ZH_STALE, id="INSTALL.md"),
     pytest.param(BOOTSTRAP, _ZH_USAGE, _ZH_STALE, id="bootstrap.sh"),
-    pytest.param(README, _ZH_USAGE, _ZH_STALE, id="README.md"),
-    pytest.param(
-        README_EN,
-        "install_provision.sh <main instance name> <main instance QQ number>",
-        "<first account's QQ number>",
-        id="README.en.md",
-    ),
+    pytest.param(MULTI_ACCOUNT_DOC, _ZH_USAGE, _ZH_STALE, id="MULTI-ACCOUNT.md"),
 ])
 def test_the_multi_instance_hint_asks_for_the_instance_name_first(
     path: Path, usage: str, stale: str,
@@ -875,18 +870,23 @@ def test_the_multi_instance_hint_asks_for_the_instance_name_first(
     assert stale not in body
 
 
-@pytest.mark.parametrize(("path", "workspace", "stale"), [
-    pytest.param(README, "<实例名>/", "<QQ号>/", id="README.md"),
-    pytest.param(README_EN, "<instance>/", "<uin>/", id="README.en.md"),
-])
-def test_the_layout_names_the_extra_workspaces_by_instance(
-    path: Path, workspace: str, stale: str,
-) -> None:
+def test_the_layout_names_the_extra_workspaces_by_instance() -> None:
     # 工作区目录按实例名建，示意图画成 QQ 号的话，多开之后照着找目录只会扑空。
+    body = MULTI_ACCOUNT_DOC.read_text(encoding="utf-8")
+
+    assert "<实例名>/" in body
+    assert "<QQ号>/" not in body
+
+
+@pytest.mark.parametrize(("path", "stale"), [
+    pytest.param(README, (_ZH_STALE, "<QQ号>/"), id="README.md"),
+    pytest.param(README_EN, ("<first account's QQ number>", "<uin>/"), id="README.en.md"),
+])
+def test_the_readmes_carry_no_stale_multi_instance_hint(path: Path, stale: tuple[str, ...]) -> None:
+    # README 不讲多开的细节，交给 deploy/ 下的两份文档；留着旧写法的话，照抄的人会把 QQ 号当成实例名。
     body = path.read_text(encoding="utf-8")
 
-    assert workspace in body
-    assert stale not in body
+    assert not [text for text in stale if text in body]
 
 
 def test_the_installer_registers_the_main_instance_through_the_shared_validators() -> None:

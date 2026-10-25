@@ -8,6 +8,7 @@ from __future__ import annotations
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
+from clonoth_runtime import parse_bool
 from platforms.descriptor import HOOK_TRIGGER_POLICY, PlatformDescriptor
 from platforms.ids import normalize_id
 from platforms.registry import platform_hook
@@ -24,14 +25,6 @@ def config_from_values(policy: ModuleType, values: dict[str, Any]) -> Any:
     三态开关回落旧 group_mode 的那套推导因此也只有一份实现。
     """
     return policy.TriggerConfig.from_live(SimpleNamespace(**values))
-
-
-def _as_bool(raw: Any, default: bool = False) -> bool:
-    if isinstance(raw, bool):
-        return raw
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def dry_run(
@@ -57,8 +50,8 @@ def dry_run(
             text=str(item.get("text") or ""),
             group_id=normalize_id(item.get("group_id")),
             user_id=normalize_id(item.get("user_id")),
-            at_me=_as_bool(item.get("at_me")),
-            reply_to_bot=_as_bool(item.get("reply_to_bot")),
+            at_me=bool(parse_bool(item.get("at_me"), False)),
+            reply_to_bot=bool(parse_bool(item.get("reply_to_bot"), False)),
             # 默认「每条间隔一秒依次到达」，冷却窗口的效果才看得出来。
             now=float(item.get("at_sec") if item.get("at_sec") is not None else index),
         )

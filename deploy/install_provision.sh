@@ -21,6 +21,13 @@ case "$MAIN" in stickers|shared) echo "实例名不能叫 $MAIN" >&2; exit 2 ;; 
 if [[ -z "$MAIN_QQ" && "$MAIN" =~ ^[0-9]+$ ]]; then MAIN_QQ="$MAIN"; fi
 [[ -z "$MAIN_QQ" || "$MAIN_QQ" =~ ^[0-9]+$ ]] || { echo "QQ 号必须是数字" >&2; exit 2; }
 
+# 建删实例的脚本和 cloudflared_ingress.py 以 root 跑系统解释器，要系统自带的 PyYAML。
+if ! /usr/bin/python3 -c 'import yaml' >/dev/null 2>&1; then
+  echo "==> 装系统 PyYAML（python3-yaml）"
+  { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-yaml >/dev/null; } \
+    || { echo "装不上 python3-yaml，先手动装好再重跑" >&2; exit 1; }
+fi
+
 echo "==> 安装 root 侧组件到 $LIB"
 install -d -m 0755 -o root -g root "$LIB" "$LIB/units"
 install -m 0755 -o root -g root "$REPO/deploy/provision_instance.sh" "$LIB/provision_instance.sh"
@@ -88,6 +95,11 @@ EOF
 cat >/etc/systemd/system/kazebot-qq.service.d/20-shared-config.conf <<EOF
 [Service]
 ReadWritePaths=-$DATA_ROOT/shared
+EOF
+# bot 和 supervisor 要按同一个数据根认受信链接：少了它，共享表情包库和共享组的配置在 bot 眼里就在工作区外面。
+cat >/etc/systemd/system/kazebot-qq.service.d/10-instances.conf <<EOF
+[Service]
+Environment=CLONOTH_INSTANCES_FILE=$DATA_ROOT/instances.yaml
 EOF
 
 systemctl daemon-reload

@@ -106,7 +106,7 @@ class TestLoadWorkspaceEnv:
         assert clonoth_runtime.load_workspace_env(root, override=True) == root / ".env"
         assert os.environ[_NAME] == "from-workspace"
 
-    def test_override_does_not_reach_the_code_directory_fallback(
+    def test_override_never_reaches_the_code_directory_file(
         self, tmp_path: Path, code_root: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # 代码目录那份是几个实例共用的，拿它盖掉本实例继承来的值就换成了主实例的端口和密钥。
@@ -114,16 +114,17 @@ class TestLoadWorkspaceEnv:
         (code_root / ".env").write_text(f"{_NAME}=from-code\n{_OTHER}=only-in-code\n", encoding="utf-8")
         root = _dir(tmp_path, "workspace")
 
-        assert clonoth_runtime.load_workspace_env(root, override=True) == code_root / ".env"
+        assert clonoth_runtime.load_workspace_env(root, override=True) is None
         assert os.environ[_NAME] == "from-process"
-        assert os.environ[_OTHER] == "only-in-code"
+        assert _OTHER not in os.environ
 
-    def test_the_code_directory_file_is_the_fallback(self, tmp_path: Path, code_root: Path) -> None:
+    def test_the_code_directory_file_is_not_a_fallback(self, tmp_path: Path, code_root: Path) -> None:
+        # 多开实例自己没有 .env 时借主实例那份，就挂到主实例的端口、拿主实例的令牌。
         (code_root / ".env").write_text(f"{_NAME}=from-code\n", encoding="utf-8")
         root = _dir(tmp_path, "workspace")
 
-        assert clonoth_runtime.load_workspace_env(root) == code_root / ".env"
-        assert os.environ[_NAME] == "from-code"
+        assert clonoth_runtime.load_workspace_env(root) is None
+        assert _NAME not in os.environ
 
     def test_nothing_to_load_is_not_fatal(self, tmp_path: Path, code_root: Path) -> None:
         root = _dir(tmp_path, "workspace")
@@ -147,13 +148,15 @@ class TestPinningTheWorkspaceRoot:
         assert os.environ["CLONOTH_WORKSPACE"] == str(root.resolve())
         assert resolve_workspace_root(code_root) == root.resolve()
 
-    def test_the_code_directory_fallback_pins_the_workspace_not_itself(
+    def test_a_code_directory_file_does_not_move_the_pin(
         self, tmp_path: Path, code_root: Path,
     ) -> None:
-        (code_root / ".env").write_text(f"{_NAME}=from-code\n", encoding="utf-8")
+        (code_root / ".env").write_text(
+            f"{_NAME}=from-code\nCLONOTH_WORKSPACE={code_root.as_posix()}\n", encoding="utf-8",
+        )
         root = _dir(tmp_path, "workspace")
 
-        assert clonoth_runtime.load_workspace_env(root) == code_root / ".env"
+        assert clonoth_runtime.load_workspace_env(root) is None
         assert os.environ["CLONOTH_WORKSPACE"] == str(root.resolve())
 
     def test_it_pins_even_when_there_is_nothing_to_load(self, tmp_path: Path, code_root: Path) -> None:
@@ -336,15 +339,16 @@ class TestProcessWorkspace:
         assert clonoth_runtime.process_workspace() == root.resolve()
         assert resolve_workspace_root(code_root) == other.resolve()
 
-    def test_a_workspace_without_an_env_file_keeps_the_inherited_values(
+    def test_a_workspace_without_an_env_file_borrows_nothing_from_the_code_directory(
         self, tmp_path: Path, code_root: Path, cwd: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # 回落到共用的代码目录那份时只补缺：systemd Environment= 给的端口不能被别人的 .env 顶掉。
+        # 多开时代码目录那份是主实例的 .env：借过来就挂到主实例的端口、拿主实例的令牌。
         (code_root / ".env").write_text(f"{_PORT}=8765\n{_OTHER}=only-in-code\n", encoding="utf-8")
         root = _dir(tmp_path, "workspace")
         monkeypatch.setenv("CLONOTH_WORKSPACE", str(root))
         monkeypatch.setenv(_PORT, "8801")
+        monkeypatch.delenv(_OTHER, raising=False)
 
         assert clonoth_runtime.process_workspace() == root.resolve()
         assert os.environ[_PORT] == "8801"
-        assert os.environ[_OTHER] == "only-in-code"
+        assert _OTHER not in os.environ

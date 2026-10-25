@@ -217,8 +217,8 @@ class TestTheRuntimeCache:
         _same_tick_replace(own, "engine:\n  max_steps: 51\n")
 
         assert clonoth_runtime.load_runtime_config(runtime_workspace)["engine"]["max_steps"] == 51
-        # 两层各读一次。
-        assert calls == [2]
+        # 每层按自己的指纹缓存：只有改了的实例那份重读，仓库默认那份不动。
+        assert calls == [1]
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ _TESTS = Path(__file__).resolve().parent
 if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
+import config_layout  # noqa: E402
 from _lock_holder import WAIT_SEC, LockHolder  # noqa: E402
 from file_lock import exclusive_lock, try_exclusive_lock  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
@@ -199,7 +200,7 @@ class TestMsvcrt:
 class TestCallers:
     def test_the_instance_list_waits_for_another_supervisor(self, tmp_path: Path, hold) -> None:
         path = instances_file(tmp_path)
-        holder = hold(path.with_name(f"{path.name}.lock"))
+        holder = hold(config_layout.lock_path(path))
 
         thread, done = _in_thread(lambda: save_instance(tmp_path, instance_id="10001", label="a", idx=1))
         assert not done.wait(0.5)

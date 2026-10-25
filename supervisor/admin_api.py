@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import shutil
 import secrets
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -15,10 +17,17 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import config_layout
+from clonoth_runtime import check_runtime_text
+from engine.memory_namespace import ROOT_NAMESPACE_SENTINEL
 from engine.node import node_file
 
-from .scheduler import schedules_lock, schedules_path
+from . import config_files
+from .config_store import check_models_text
+from .policy import check_policy_text
+from .scheduler import check_schedules_text, schedules_path
 from .tool_catalog import ToolEntry, tool_catalog, tool_names
+
+_log = logging.getLogger(__name__)
 
 class RawContent(BaseModel):
     content: str
@@ -44,10 +53,13 @@ def _token_file(workspace_root: Path) -> Path:
     return workspace_root / "data" / ".admin_token"
 
 
+# 这个令牌能改 policy、编辑节点、重启引擎，同机其他用户没有理由读到它。
+_TOKEN_FILE_MODE = 0o600
+
+
 def _harden(path: Path) -> None:
-    # 这个令牌能改 policy、编辑节点、重启引擎，同机其他用户没有理由读到它。
     with contextlib.suppress(OSError):
-        os.chmod(path, 0o600)
+        os.chmod(path, _TOKEN_FILE_MODE)
 
 
 def _read_token(path: Path) -> str:
@@ -59,21 +71,20 @@ def _read_token(path: Path) -> str:
 
 
 def _persist_token(path: Path, token: str) -> bool:
-    """落盘失败不阻断启动：令牌在内存里，控制台照常能进，只有适配器读不到。"""
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    """落盘失败不阻断启动：令牌在内存里，控制台照常能进，只有适配器读不到。
+
+    同目录临时文件替换：适配器每次请求都重读这个文件，读到写了一半的就是一次 401。
+    """
+    # 替换时临时文件沿用旧文件的权限，老部署留下的多半是 644：先收紧它，新令牌才不会跟着谁都能读。
+    if path.is_file():
+        _harden(path)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # 同目录 tmp + replace：适配器每次请求都重读这个文件，读到写了一半的就是一次 401。
-        tmp.write_text(token, encoding="utf-8")
-        _harden(tmp)
-        os.replace(tmp, path)
-        return True
+        # 只有本实例的 supervisor 启动时写它，不跨进程加锁。
+        config_layout.write_locked(path, token, mode=_TOKEN_FILE_MODE)
     except OSError as exc:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        print(f"[admin] 令牌写入 {path} 失败：{exc}", flush=True)
-        print("[admin] engine 与各适配器将读不到令牌，它们发起的请求会返回 401", flush=True)
+        _log.error("令牌写入 %s 失败，engine 与各适配器读不到令牌，它们发起的请求会返回 401：%s", path, exc)
         return False
+    return True
 
 
 def init_admin_token(workspace_root: Path, *, console_url: str = "") -> str:
@@ -219,14 +230,26 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
         return {"content": text, "hash": config_layout.bytes_hash(data), "path": _rel(p), **extra}
 
-    def _write_overlay(target: Path, shown: Path, content: str, base_hash: str | None) -> dict[str, Any]:
+    def _write_overlay(
+        target: Path,
+        shown: Path,
+        content: str,
+        base_hash: str | None,
+        *,
+        check: Callable[[str], list[str]] | None = None,
+    ) -> dict[str, Any]:
         """整份覆盖写入 target，覆盖前留一份 .bak。
 
         target 还不存在时编辑器里显示的是 shown（仓库默认或模板），指纹按那份比。
-        这一层不解析、不校验，上游表单出一次 bug 就能把 163 行的 runtime.yaml 截成三行，
-        而覆盖不可逆。备份失败就不写：没有退路的覆盖比保存失败危险得多。
-        raw 配置端点共用这个函数，所以保险加在这里而不是逐个端点。
+        check 不过就 400、一个字节都不写：写坏的文件运行期只能沿用旧的或当成空的，界面上却显示保存成功。它返回的提醒随响应带回。
+        备份失败也不写：上游表单出一次 bug 就能把整份配置截成三行，没有退路的覆盖比保存失败危险得多。
         """
+        warnings: list[str] = []
+        if check is not None:
+            try:
+                warnings = check(content)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
             with config_layout.locked(target):
                 current = target if target.exists() else shown
@@ -241,14 +264,34 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"写入 {target.name} 失败，原文件没动：{exc}") from exc
-        return {"ok": True, "hash": new_hash, "path": _rel(target)}
+        result: dict[str, Any] = {"ok": True, "hash": new_hash, "path": _rel(target)}
+        if warnings:
+            result["warnings"] = warnings
+        return result
 
-    def _write_text(p: Path, content: str, base_hash: str | None = None) -> dict[str, Any]:
-        return _write_overlay(p, p, content, base_hash)
+    def _write_text(
+        p: Path, content: str, base_hash: str | None = None, *, check: Callable[[str], list[str]] | None = None,
+    ) -> dict[str, Any]:
+        return _write_overlay(p, p, content, base_hash, check=check)
 
-    def _create_text(p: Path, content: str) -> dict[str, Any]:
+    def _create_text(p: Path, content: str, *, check: Callable[[str], list[str]] | None = None) -> dict[str, Any]:
         """只在文件还不存在时写：检查和落盘之间被别处抢先建了，照样按冲突报。"""
-        return _write_overlay(p, p, content, "")
+        return _write_overlay(p, p, content, "", check=check)
+
+    def _yaml_mapping(content: str) -> list[str]:
+        """读这份文件的一方只认一个映射：写坏了它只能沿用旧的，或者整份当成空的。"""
+        config_files.parse_mapping(content)
+        return []
+
+    def _yaml_check_for(path: Path) -> Callable[[str], list[str]] | None:
+        """节点目录和绘图配置里混着 Markdown 片段，只有 YAML 那几份要校验。"""
+        return _yaml_mapping if path.suffix in {".yaml", ".yml"} else None
+
+    def _mcp_check(content: str) -> list[str]:
+        clients = config_files.parse_mapping(content).get("clients")
+        if clients is not None and not isinstance(clients, (dict, list)):
+            raise ValueError("clients 要写成「客户端 id: 配置」的映射")
+        return []
 
     def _remove(p: Path) -> bool:
         try:
@@ -365,7 +408,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     @router.put("/nodes/{node_id}/raw")
     def update_node_raw(node_id: str, payload: RawContent) -> dict[str, Any]:
         target, default = _node_targets(node_id)
-        return _write_overlay(target, default, payload.content, payload.base_hash)
+        return _write_overlay(target, default, payload.content, payload.base_hash, check=_yaml_mapping)
 
     @router.post("/nodes")
     def create_node(payload: NodeCreate) -> dict[str, Any]:
@@ -379,7 +422,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 status_code=409,
                 detail=f"{payload.id} 已经指向 {_rel(taken_by)}，新建的文件不会被加载",
             )
-        return _create_text(p, payload.content)
+        return _create_text(p, payload.content, check=_yaml_mapping)
 
     @router.delete("/nodes/{node_id}")
     def delete_node(node_id: str) -> dict[str, Any]:
@@ -455,7 +498,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     @router.put("/node-files/{filename}/raw")
     def update_node_file_raw(filename: str, payload: RawContent) -> dict[str, Any]:
         own, default = _node_file_targets(filename)
-        return _write_overlay(own, default, payload.content, payload.base_hash)
+        return _write_overlay(own, default, payload.content, payload.base_hash, check=_yaml_check_for(own))
 
     @router.delete("/node-files/{filename}")
     def delete_node_file(filename: str) -> dict[str, Any]:
@@ -492,7 +535,9 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     def _drawtools_write(name: str, payload: RawContent) -> dict[str, Any]:
         path = config_layout.drawtools_file(workspace_root, name)
-        return _write_overlay(path, config_layout.drawtools_example(name), payload.content, payload.base_hash)
+        return _write_overlay(
+            path, config_layout.drawtools_example(name), payload.content, payload.base_hash, check=_yaml_check_for(path),
+        )
 
     def _drawtools_prompt(name: str) -> str:
         if name not in _DRAWTOOLS_PROMPTS:
@@ -552,7 +597,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     @router.put("/config/raw")
     def update_config_raw(payload: RawContent) -> dict[str, Any]:
-        return _write_text(config_layout.models_path(workspace_root), payload.content, payload.base_hash)
+        return _write_text(config_layout.models_path(workspace_root), payload.content, payload.base_hash, check=check_models_text)
 
     # ----- Runtime -----
     # 编辑的是实例那份；还没改过时显示仓库默认，保存后落成实例那份，运行时逐键盖在默认上面。
@@ -566,7 +611,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     @router.put("/runtime/raw")
     def update_runtime(payload: RawContent) -> dict[str, Any]:
         default, own = config_layout.runtime_layers(workspace_root)
-        return _write_overlay(own, default, payload.content, payload.base_hash)
+        return _write_overlay(own, default, payload.content, payload.base_hash, check=check_runtime_text)
 
     @router.delete("/runtime/raw")
     def reset_runtime() -> dict[str, Any]:
@@ -602,11 +647,13 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     @router.put("/policy/raw")
     def update_policy(payload: RawContent) -> dict[str, Any]:
+        # 原文照存，注释留着；校验和运行期重读是同一套：结构不对拒掉，没人读的键随响应提醒。
         return _write_overlay(
             config_layout.policy_path(workspace_root),
             config_layout.default_template(config_layout.POLICY_TEMPLATE),
             payload.content,
             payload.base_hash,
+            check=check_policy_text,
         )
 
     # ----- Schedules -----
@@ -620,8 +667,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     @router.put("/schedules/raw")
     def update_schedules(payload: RawContent) -> dict[str, Any]:
-        with schedules_lock(workspace_root):
-            return _write_text(schedules_path(workspace_root), payload.content, payload.base_hash)
+        # 和 scheduler.update_schedules 拿的是同一把锁，_write_text 里已经拿了，这里再拿一次会死锁。
+        return _write_text(schedules_path(workspace_root), payload.content, payload.base_hash, check=check_schedules_text)
 
     # ----- Skills -----
     def _skills_dir() -> Path:
@@ -758,7 +805,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     @router.put("/mcp-clients/raw")
     def update_mcp_clients_raw(payload: RawContent) -> dict[str, Any]:
-        return _write_text(config_layout.mcp_path(workspace_root), payload.content, payload.base_hash)
+        return _write_text(config_layout.mcp_path(workspace_root), payload.content, payload.base_hash, check=_mcp_check)
 
     # ----- All tool names -----
     @router.get("/all-tool-names")
@@ -834,10 +881,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     # ----- Memory -----
     # data/memory 根目录是 conversation_key 缺失时的落点，URL 里没法用空串表示。
-    _ROOT_NAMESPACE = "__root__"
-
     def _namespace_arg(namespace: str) -> str:
-        return "" if namespace == _ROOT_NAMESPACE else namespace
+        return "" if namespace == ROOT_NAMESPACE_SENTINEL else namespace
 
     def _memory_call(fn, *args):
         from engine.memory_admin import MemoryAdminError
@@ -866,7 +911,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 }
             rows.append({
                 **row,
-                "key": namespace or _ROOT_NAMESPACE,
+                "key": namespace or ROOT_NAMESPACE_SENTINEL,
                 # 认不出归属的目录多半是用完即弃的子代理会话，堆着没人清。
                 "owner": described or {"kind": "unknown", "label": "未知来源"},
             })

@@ -9,6 +9,7 @@
 #
 # 各平台声明的密钥文件（读写都拒）和平台自己维护的状态文件（拒写）不用写在这里：
 # supervisor 按平台描述把它们排在所有规则前面，改这份文件也放不开。
+# 装着明文密钥的配置（模型渠道、MCP、插件设置、policy 本身等）读写至少要审批，这里写成 auto 也放不开。
 # 挪进 config/ 的几份配置在判定时还认原来的名字：给 data/config.yaml、skills/** 这些旧路径
 # 写的规则照样护住 config/models.yaml、config/skills/**，几个名字取最严的那条。
 
@@ -61,6 +62,12 @@ read_file:
     - pattern: "config/drawtools/settings.yaml"
       decision: approval_required
       reason: "drawtools settings may hold the NovelAI api key"
+    - pattern: "config/plugins.yaml"
+      decision: approval_required
+      reason: "plugin settings may hold passwords and tokens"
+    - pattern: "config/plugins/**"
+      decision: approval_required
+      reason: "installed plugin packages may bundle credentials"
     # data/ 下有平台密钥、.admin_token、会话与事件流。落到 default:auto 等于任何人问一句就能把密钥读出来。
     - pattern: "data/**"
       decision: approval_required
@@ -104,6 +111,13 @@ write_file:
     - pattern: "config/tools/**"
       decision: approval_required
       reason: "creating/updating tools requires approval"
+    # 插件包在 supervisor 和控制台里当代码跑，配置里还有插件的密码类参数。
+    - pattern: "config/plugins/**"
+      decision: approval_required
+      reason: "plugin packages run as code once loaded"
+    - pattern: "config/plugins.yaml"
+      decision: approval_required
+      reason: "plugin settings hold credentials and switch plugins on"
     # skill 正文直接进系统提示词。dream 想把高频记忆提升成 skill 会被这条挡下，
     # 要那个功能就把这条连同下面的 skills/** 一起放宽。
     - pattern: "config/skills/**"

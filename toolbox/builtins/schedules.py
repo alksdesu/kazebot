@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from clonoth_runtime import parse_bool
 from platforms.registry import is_platform_conversation
 from platforms.sources import classify_source_name, is_external_platform
 
@@ -170,8 +171,9 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         _op, err = await request_guard(ctx, "write_file", {"path": "data/schedules.yaml", "schedule_id": sid})
         if err is not None:
             return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
-    enabled = bool(args.get("enabled", True))
-    once = bool(args.get("once", False))
+    # 模型常把开关写成字符串，bool("false") 是真
+    enabled = bool(parse_bool(args.get("enabled"), True))
+    once = bool(parse_bool(args.get("once"), False))
 
     if stype == "script":
         # scheduler 执行 script 走 subprocess.run(shell=True)，等于一条定时的
@@ -200,7 +202,7 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         entry["command"] = command
         timeout = int(args.get("timeout") or 30)
         entry["timeout"] = max(5, min(timeout, 300))
-        entry["silent"] = bool(args.get("silent", True))
+        entry["silent"] = bool(parse_bool(args.get("silent"), True))
         if text:
             entry["text"] = text
     else:
