@@ -6,6 +6,7 @@ import type { Attachment } from '../../types';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { Icon } from '../common';
 import { Button } from '../settings/pages/settingsControls';
+import { errorMessage } from '../../api/request';
 
 interface ChatInputProps {
   disabled?: boolean;
@@ -77,7 +78,7 @@ export const ChatInput = ({ disabled = false, onSend, conversationId = 'new' }: 
       for (const attachment of currentAttachments) if (attachment.url?.startsWith('blob:')) URL.revokeObjectURL(attachment.url);
     } catch (failure) {
       const target = scope === 'new' && newConversation.current ? newConversation.current : scope;
-      setDrafts(all => ({ ...all, [target]: { ...(all[target] || { text, attachments: currentAttachments }), error: failure instanceof Error ? failure.message : '发送失败，请重试' } }));
+      setDrafts(all => ({ ...all, [target]: { ...(all[target] || { text, attachments: currentAttachments }), error: errorMessage(failure, '发送失败，请重试') } }));
     } finally {
       const target = scope === 'new' && newConversation.current ? newConversation.current : scope;
       pending.current.delete(scope); pending.current.delete(target);

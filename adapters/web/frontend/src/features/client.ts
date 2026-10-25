@@ -1,6 +1,6 @@
-import { fetchWithDeadline } from '../api/requestDeadline';
-import { MOUNT } from '../api/supervisorClient';
-import { useSettingsStore } from '../store/settingsStore';
+import { downloadFile } from '../api/blobs';
+import { requestJson } from '../api/request';
+import { MOUNT } from '../instances/paths';
 
 export interface FeatureRequestOptions {
   method?: string;
@@ -20,34 +20,14 @@ export function featureUrl(path: string, options: Pick<FeatureRequestOptions, 'p
   return `${MOUNT}${path}${suffix ? `?${suffix}` : ''}`;
 }
 
-export async function featureRequest<T>(path: string, options: FeatureRequestOptions = {}): Promise<T> {
-  const token = useSettingsStore.getState().adminToken;
-  const response = await fetchWithDeadline(featureUrl(path, options), {
-    method: options.method || 'GET', signal: options.signal,
-    headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(options.body === undefined ? {} : { 'Content-Type': 'application/json' }),
-    },
-    ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
+export function featureRequest<T>(path: string, options: FeatureRequestOptions = {}): Promise<T> {
+  return requestJson<T>(featureUrl(path, options), {
+    method: options.method || 'GET',
+    signal: options.signal,
+    ...(options.body === undefined ? {} : { json: options.body }),
   });
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    const detail = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail || data.error || '请求失败');
-    throw new Error(`${response.status} ${detail}`);
-  }
-  return response.json() as Promise<T>;
 }
 
-export async function downloadFeature(path: string, filename: string, scope?: string): Promise<void> {
-  const token = useSettingsStore.getState().adminToken;
-  const response = await fetchWithDeadline(featureUrl(path, { scope }), {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  });
-  if (!response.ok) throw new Error(`下载失败：${response.status}`);
-  const url = URL.createObjectURL(await response.blob());
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = filename;
-  link.click();
-  setTimeout(() => URL.revokeObjectURL(url), 0);
+export function downloadFeature(path: string, filename: string, scope?: string): Promise<void> {
+  return downloadFile(featureUrl(path, { scope }), filename);
 }

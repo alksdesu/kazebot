@@ -1,13 +1,24 @@
 // 带图消息交给主模型还是绕去视觉入口节点。写的是 runtime.yaml，不走顶部那条 qq.yaml 状态条。
 import { useEffect, useState } from 'react';
 
-import { getRuntimeRaw, updateRuntimeRaw } from '../api/supervisorClient';
+import { getRuntimeFile } from '../api/supervisorClient';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Desc, Empty, ErrorText, Facts, Field, SaveBar, Select } from './components';
-import { readYamlScalar, upsertYamlNested } from './nodeYaml';
+import { commitRuntimeKeys } from './yamlCommit';
+import { parseYamlMapping, readYamlPath } from './yamlRewrite';
+import { savedMessage } from '../utils/sentence';
+import { errorMessage } from '../api/request';
 
 const PATH = ['routing', 'vision', 'enabled'];
+
+const readMode = (content: string): string => {
+  const value = readYamlPath(parseYamlMapping(content), PATH);
+  return normalizeMode(value === undefined || value === null ? '' : String(value));
+};
+
+// 「自动」是字符串，另两档写成布尔，和手写 yaml 的读法一致。
+const yamlValueOf = (mode: string): boolean | string => (mode === 'true' ? true : mode === 'false' ? false : 'auto');
 
 const MODES = [
   { value: 'auto', label: '看不了图才绕' },
@@ -29,8 +40,6 @@ export const normalizeMode = (raw: string): string => {
   return 'auto';
 };
 
-const say = (error: unknown): string => (error instanceof Error ? error.message : String(error));
-
 export const VisionRouting = () => {
   const token = useSettingsStore((state) => state.adminToken);
   const [raw, setRaw] = useState<string | null>(null);
@@ -45,33 +54,33 @@ export const VisionRouting = () => {
     if (!token) return;
     let cancelled = false;
     setRaw(null);
-    void getRuntimeRaw(token).then(({ content: text }) => {
+    void getRuntimeFile(token).then(({ content: text }) => {
       if (cancelled) return;
+      const current = readMode(text);
       setRaw(text);
-      const current = normalizeMode(readYamlScalar(text, PATH));
       setMode(current);
       setSaved(current);
     }).catch((caught) => {
       if (cancelled) return;
-      setError(say(caught));
+      setError(errorMessage(caught));
       setRaw(null);
     });
     return () => { cancelled = true; };
   }, [token]);
 
   const save = async () => {
-    if (!token || !raw || busy) return;
+    if (!token || raw === null || busy) return;
     setBusy(true);
     setError('');
     try {
-      const latest = await getRuntimeRaw(token);
-      const next = upsertYamlNested(latest.content, PATH, mode);
-      await updateRuntimeRaw(token, next, latest.hash);
-      setRaw(next);
+      // 只写这一个键，落在本实例那层；读和写之间被改过由后端回 409。
+      const { content, note: rewriteNote, result } = await commitRuntimeKeys(token, [{ path: PATH, value: yamlValueOf(mode) }]);
+      setRaw(content);
       setSaved(mode);
-      setNote('已保存。下一条带图消息就按新规矩走。');
+      const saved = rewriteNote ? `已保存。${rewriteNote}。下一条带图消息就按新规矩走。` : '已保存。下一条带图消息就按新规矩走。';
+      setNote(savedMessage(saved, '', result.warnings));
     } catch (caught) {
-      setError(say(caught));
+      setError(errorMessage(caught));
     }
     setBusy(false);
   };
@@ -82,7 +91,7 @@ export const VisionRouting = () => {
     <Block hint="带图消息交给主渠道还是绕去视觉入口节点" title="带图消息">
       <Field label="路由方式">
         <Select
-          disabled={busy || !raw}
+          disabled={busy}
           aria-label="带图消息路由"
           onChange={(event) => setMode(event.target.value)}
           value={mode}

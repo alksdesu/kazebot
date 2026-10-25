@@ -165,7 +165,7 @@ describe('建组、加入、退出、删组', () => {
     await deleteShareGroup(TOKEN, 'alpha');
     expect(fetchMock()).toHaveBeenCalledExactlyOnceWith('/v1/share-groups/alpha', {
       method: 'DELETE',
-      headers: WRITE_HEADERS,
+      headers: AUTH,
     });
   });
 

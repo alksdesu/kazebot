@@ -1,44 +1,42 @@
-// [2026-05-31] Reducer-backed chat store for the Step 2A frontend refactor.
-// Why: the legacy store mixes WebSocket transport, stream previews, and rendered
-// messages in one mutable path. How: keep conversation/session actions here while
-// every SupervisorEvent is replayed through eventReducer into ChatState. Purpose:
-// let the new message model run beside the old store until the UI migration is done.
+// Chat store: sidebar conversations, the global realtime stream, and history sync.
+// Every SupervisorEvent goes through eventReducer; /history pages are merged by historyHydration.
 import { create } from 'zustand';
 import { commandAction } from '../plugins/commands';
 import { confirmNavigation } from '../hooks/useUnsavedChanges';
+import { submitApprovalDecision } from '../hooks/useApprovalDecision';
 
 import { connectGlobalWS, disconnectGlobalWS } from '../api';
+import { errorMessage, isNotFound } from '../api/request';
 import {
   cancelActiveTasks,
-  decideApproval,
   deleteSession,
-
+  getAdminState,
   getSessionChildren,
   getSessionHistory,
+  getSessionRunningTasks,
   listSessions,
   postInbound,
   uploadAttachment,
+  type AdminApproval,
   type ChildSessionInfo,
+  type SessionListItem,
+  type SessionRunningTask,
   type StructuredMessage,
-  type StructuredThinkingBlock,
 } from '../api/supervisorClient';
 import type { SupervisorEvent } from '../types/chat';
-import type {
-  Attachment,
-  ChatState,
-  MessageStatus,
-  RenderBlock,
-  TextBlock,
-  ThinkingBlock,
-  ToolBlock,
-  ToolExecution,
-  ToolStatus,
-  WsMessage,
-} from '../types/message';
+import type { Attachment, ChatState, WsMessage } from '../types/message';
 import { shouldAutoApproveToolCall, useClientPrefsStore, type ApprovalMatch } from './clientPrefsStore';
 import { useSettingsStore } from './settingsStore';
 import { scopedKey } from './storageKey';
 import { createInitialChatState, findToolByCallId, reduceChatEvent } from './eventReducer';
+import {
+  buildHistoryEntries,
+  historyRowKey,
+  mergeHistoryEntries,
+  mergeLatestHistoryPage,
+  mergeOlderHistoryPage,
+  type HistoryWindow,
+} from './historyHydration';
 
 export interface ConversationMeta {
   id: string;
@@ -74,6 +72,21 @@ export interface ChildNodeState {
   completedAt?: string;
 }
 
+/** History of one view: a parent conversation, or `child:<sessionId>` while a child session is open. */
+export interface HistoryView {
+  loading: boolean;
+  error: string;
+  hasMore: boolean;
+  loadingOlder: boolean;
+  olderError: string;
+}
+
+export interface SessionPaging {
+  hasMore: boolean;
+  loading: boolean;
+  error: string;
+}
+
 export interface ChatStoreState extends ChatState {
   conversations: ConversationMeta[];
   activeConversationId: string | null;
@@ -87,6 +100,8 @@ export interface ChatStoreState extends ChatState {
   viewingChildSessionId: string | null;
   childSessionMessages: Readonly<Record<string, WsMessage[]>>;
   taskActivities: Readonly<Record<string, TaskActivity>>;
+  historyByConversation: Readonly<Record<string, HistoryView>>;
+  sessionPaging: SessionPaging;
 
   selectConversation: (id: string) => void;
   selectChildNodes: (conversationId: string) => ChildNodeState[];
@@ -101,42 +116,35 @@ export interface ChatStoreState extends ChatState {
   viewChildSession: (sessionId: string, taskId?: string) => void;
   exitChildSession: () => void;
   loadStartup: () => void;
+  loadMoreConversations: () => Promise<void>;
+  /** Pages older history into the open parent conversation. */
+  loadOlderHistory: () => Promise<void>;
+  /** Reloads whatever history is on screen: the open conversation or the open child session. */
+  retryHistory: () => void;
 }
 
 type StoreSetter = (
   partial:
+    | ChatStoreState
     | Partial<ChatStoreState>
-    | ((state: ChatStoreState) => Partial<ChatStoreState>),
+    | ((state: ChatStoreState) => ChatStoreState | Partial<ChatStoreState>),
 ) => void;
 type StoreGetter = () => ChatStoreState;
 
-type HistoryToolResult = {
-  status: 'success' | 'error';
-  result?: string;
-  rawInline?: string;
-  rejected?: boolean;
-  isAutoResult?: boolean;
+type HistoryCache = {
+  sessionId: string;
+  window: HistoryWindow;
+  anchors: ReadonlyMap<string, string>;
 };
 
-type HistoryToolCall = {
-  id?: string;
-  name: string;
-  arguments?: Record<string, unknown>;
-};
-
-type HistoryThinkingSegment = {
-  text: string;
-  startedAt?: string;
-  endedAt?: string;
-};
-
-// Why: ask is also a control tool that ends the assistant turn by requesting
-// additional input. How: keep it with finish/reply/switch_node for history summaries
-// and automatic result hiding. Purpose: historical ask calls do not appear as noisy
-// ordinary tool executions.
-const CONTROL_TOOL_NAMES = new Set(['finish', 'reply', 'switch_node', 'ask']);
-const INTERNAL_USER_MESSAGE_TYPES = new Set(['tool_result', 'system', 'summary']);
+const HISTORY_PAGE_SIZE = 200;
+const SESSION_PAGE_SIZE = 50;
+// Stream deltas arrive dozens per second; an unchanged phase is re-stamped at most once per interval.
+const TASK_ACTIVITY_REFRESH_MS = 1000;
+const IDLE_HISTORY: HistoryView = { loading: false, error: '', hasMore: false, loadingOlder: false, olderError: '' };
 const TERMINAL_TASK_EVENTS = new Set(['task_completed', 'task_cancelled', 'task_failed']);
+// Only these move a conversation's sidebar timestamp; stream deltas would re-render the sidebar every frame.
+const SIDEBAR_ACTIVITY_EVENTS = new Set(['inbound_message', 'outbound_message', 'intermediate_reply', ...TERMINAL_TASK_EVENTS]);
 const CHILD_NODE_ACTIVE_STATUSES = new Set<ChildNodeStatus>(['running', 'awaiting_approval']);
 const CHILD_NODE_STATUS_BY_EVENT: Readonly<Record<string, ChildNodeStatus | undefined>> = {
   // [2026-06-03] Why: child-agent lifecycle events arrive on the global websocket
@@ -155,8 +163,18 @@ const LS_KEY_AUTO_APPROVED = scopedKey('clonoth_auto_approved_ids');
 
 let startupLoaded = false;
 let startupGeneration = 0;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let sessionOffset = 0;
 const autoApprovedApprovalIds = loadAutoApproved();
+// Outside zustand on purpose: they change with every page or frame and nothing renders them.
+const historyCaches = new Map<string, HistoryCache>();
+const historyRequests = new Map<string, { generation: number; controller: AbortController }>();
+let historyGeneration = 0;
+// Bumped per view whenever a live event changes its messages / its task lifecycle.
+const realtimeRevisions = new Map<string, number>();
+const lifecycleRevisions = new Map<string, number>();
+// Conversations whose live cards were kept over history; they get one more sync once their task ends.
+const unsettledConversations = new Set<string>();
+const childViewTaskIds = new Map<string, string | undefined>();
 
 function loadTitleCache(): Record<string, string> {
   // [2026-06-02] Why: backend session metadata does not carry frontend-generated
@@ -204,24 +222,25 @@ function saveAutoApproved(ids: Set<string>) {
   } catch {}
 }
 
-function clearReconnectTimer() {
-  // [2026-06-03] Why: global WebSocket reconnect timers are module-level so they
-  // survive Zustand state updates. How: clear the pending retry before an explicit
-  // full teardown or a fresh connection attempt. Purpose: resetState cannot leave a
-  // stale timer that silently opens another all-session socket.
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
+function forgetHistory(viewKey: string) {
+  historyRequests.get(viewKey)?.controller.abort();
+  historyRequests.delete(viewKey);
+  historyCaches.delete(viewKey);
+  realtimeRevisions.delete(viewKey);
+  lifecycleRevisions.delete(viewKey);
+  unsettledConversations.delete(viewKey);
 }
 
-function stopGlobalRealtimeConnection() {
-  // [2026-06-03] Why: task completion, cancellation, and conversation switching must
-  // not close realtime delivery anymore. How: reserve this cleanup for full store
-  // reset and test teardown only. Purpose: the long-lived /v1/ws stream continues
-  // receiving events for every web session during normal chat lifecycle changes.
-  clearReconnectTimer();
+// Only a full reset closes the stream; switching conversations or finishing a task keeps it open.
+function stopRealtimeAndHistory() {
   disconnectGlobalWS();
+  for (const request of historyRequests.values()) request.controller.abort();
+  historyRequests.clear();
+  historyCaches.clear();
+  realtimeRevisions.clear();
+  lifecycleRevisions.clear();
+  unsettledConversations.clear();
+  childViewTaskIds.clear();
 }
 
 function createConversationId(): string {
@@ -237,7 +256,11 @@ function createConversationMeta(id = createConversationId(), sessionId = ''): Co
   return { id, sessionId, title: '新对话', updatedAt: timestamp };
 }
 
-function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus' | 'startupError' | 'generatingBySession' | 'sendingByConversation' | 'deletingByConversation' | 'childNodes' | 'viewingChildSessionId' | 'childSessionMessages' | 'taskActivities'> {
+type StoreBaseKeys = 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus' | 'startupError'
+  | 'generatingBySession' | 'sendingByConversation' | 'deletingByConversation' | 'childNodes' | 'viewingChildSessionId'
+  | 'childSessionMessages' | 'taskActivities' | 'historyByConversation' | 'sessionPaging';
+
+function createStoreBase(): Pick<ChatStoreState, StoreBaseKeys> {
   return {
     conversations: [],
     activeConversationId: null,
@@ -247,20 +270,12 @@ function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConver
     generatingBySession: {},
     sendingByConversation: {},
     deletingByConversation: {},
-    // [2026-06-03] Why: child-node state is frontend-only routing metadata, not part
-    // of reducer ChatState. How: initialize it beside other store-owned maps.
-    // Purpose: resetState and startup create a clean child session tracker.
     childNodes: {},
-    // [2026-06-03] Why: Phase 3 can temporarily show a child session's independent
-    // chat stream while the parent conversation remains selected. How: keep the
-    // viewed child id and normalized message cache outside reducer ChatState. Purpose:
-    // switching in and out of child streams does not mutate the sidebar conversation.
     viewingChildSessionId: null,
     childSessionMessages: {},
-    // [AutoC 2026-06-04] Why: task activity is a browser-local live overlay on top
-    // of the polled active-task list. How: reset it with the rest of store-owned
-    // metadata. Purpose: page refresh or reset never shows stale task phases.
     taskActivities: {},
+    historyByConversation: {},
+    sessionPaging: { hasMore: false, loading: false, error: '' },
   };
 }
 
@@ -376,24 +391,27 @@ function normalizeChildNodeStatus(status: string | undefined): ChildNodeStatus {
   return 'running';
 }
 
+function sameChildNode(left: ChildNodeState, right: ChildNodeState): boolean {
+  return left.nodeId === right.nodeId
+    && left.parentConversationId === right.parentConversationId
+    && left.status === right.status
+    && left.taskId === right.taskId
+    && left.startedAt === right.startedAt
+    && left.completedAt === right.completedAt;
+}
+
 function mergeChildNodesFromSessionChildren(
   state: ChatStoreState,
   conversationId: string,
   children: readonly ChildSessionInfo[],
 ): Readonly<Record<string, ChildNodeState>> {
-  // [2026-06-03] Why: browser refresh loses childNodes but the supervisor registry
-  // still knows child sessions. How: merge registry rows into the normalized child map
-  // while preserving fresher WebSocket timestamps already present in memory. Purpose:
-  // history loading rebuilds child panels without erasing live status updates.
-  if (children.length === 0) return state.childNodes;
-
-  let changed = false;
-  const next = { ...state.childNodes };
+  // A start time already seen live is more precise than the registry's.
+  let next: Record<string, ChildNodeState> | null = null;
   for (const child of children) {
     const sessionId = getStringValue(child.session_id);
     if (!sessionId) continue;
-    const previous = next[sessionId];
-    next[sessionId] = {
+    const previous = (next || state.childNodes)[sessionId];
+    const merged: ChildNodeState = {
       sessionId,
       nodeId: getStringValue(child.node_id) || previous?.nodeId || 'unknown',
       parentConversationId: conversationId,
@@ -402,88 +420,53 @@ function mergeChildNodesFromSessionChildren(
       startedAt: previous?.startedAt || getStringValue(child.started_at) || getStringValue(child.updated_at),
       completedAt: getStringValue(child.completed_at) || previous?.completedAt,
     };
-    changed = true;
+    if (previous && sameChildNode(previous, merged)) continue;
+    next = next || { ...state.childNodes };
+    next[sessionId] = merged;
   }
-
-  return changed ? next : state.childNodes;
-}
-
-function isDispatchResultHistoryMessage(message: StructuredMessage, _text: string): boolean {
-  // [AutoC 2026-06-03] Why: dispatch-result recognition belongs to backend-owned
-  // structured metadata, not localized notification text. How: check the new
-  // message_type contract, with only async_dispatch: as a legacy protocol-id fallback
-  // for stored rows created before message_type existed. Purpose: remove brittle
-  // frontend text and dispatch_origin id heuristics while preserving old history.
-  const messageType = getStringValue(message.message_type);
-  return messageType === 'dispatch_result'
-    || message.id.startsWith('async_dispatch:');
-}
-
-function shouldPreserveConversationMessagesDuringHistoryLoad(
-  state: ChatStoreState,
-  conversationId: string,
-  sessionId: string,
-): boolean {
-  // [2026-06-03] Why: the WebSocket is now global and always open, so socket
-  // presence no longer means this conversation is actively streaming. How: preserve
-  // existing cards only when this session is marked generating, or while the active
-  // composer still has an optimistic send pending. Purpose: normal history loads can
-  // replace stale data, but in-flight streams are not erased by a late fetch.
-  return Boolean(state.generatingBySession[sessionId]) || (state.isGenerating && state.activeConversationId === conversationId);
+  return next || state.childNodes;
 }
 
 function getLastEventConversationId(state: ChatState, event: SupervisorEvent, fallbackConversationId: string): string {
   const eventId = event.event_id || `${event.session_id}:${event.seq}:${event.type}`;
-  const logEntry = state.eventLog.find((entry) => entry.eventId === eventId);
+  // The reducer appends the row for this event last; scanning the whole log costs O(3000) per frame.
+  const last = state.eventLog[state.eventLog.length - 1];
+  const logEntry = last?.eventId === eventId ? last : state.eventLog.find((entry) => entry.eventId === eventId);
   return logEntry?.conversationId || fallbackConversationId;
 }
 
+function isDefaultTitle(title: string | undefined): boolean {
+  return title === '新对话' || title === 'New conversation';
+}
+
 function syncConversationsAfterEvent(
-  conversations: readonly ConversationMeta[],
+  conversations: ConversationMeta[],
   nextChatState: ChatState,
   event: SupervisorEvent,
   fallbackConversationId: string,
 ): ConversationMeta[] {
-  // Why: ChatState intentionally stores only normalized render data, not sidebar
-  // metadata. How: after reducer replay, mirror the event's conversation/session into
-  // ConversationMeta. Purpose: the new store keeps the old session list behavior while
-  // message content remains fully reducer-owned.
   const conversationId = getLastEventConversationId(nextChatState, event, fallbackConversationId);
-  const payload = event.payload || {};
-  const isInbound = event.type === 'inbound_message';
   const existing = conversations.find((conversation) => conversation.id === conversationId);
+  // Branch and child sessions reduce under their own ids; only known rows (or the routed one) reach the sidebar.
+  if (!existing && conversationId !== fallbackConversationId) return conversations;
 
-  if (!existing && conversationId !== fallbackConversationId) {
-    // Why: branch sessions and child-agent sessions can emit reducer events under their
-    // own session ids. How: only allow metadata updates for conversations the sidebar
-    // already knows about, or for the active fallback conversation that initiated the
-    // WebSocket. Purpose: internal sessions can still hydrate reducer state without
-    // polluting the user-facing conversation list.
-    return [...conversations];
-  }
-
-  const inboundText = typeof payload.text === 'string' ? payload.text : '';
-  // [2026-06-03] Fix: use undefined instead of null/empty for non-inbound events
-  // so that upsertConversationMeta preserves the existing title via its
-  // `patch.title !== undefined` guard. Previously, passing existing?.title
-  // (which could be undefined for brand-new conversations) would overwrite
-  // the default '新对话' with undefined.
-  const title = isInbound && inboundText && (!existing || existing.title === '新对话' || existing.title === 'New conversation')
+  const payload = event.payload || {};
+  const inboundText = event.type === 'inbound_message' && typeof payload.text === 'string' ? payload.text : '';
+  const title = inboundText && (!existing || isDefaultTitle(existing.title))
     ? getInitialTitleFromClientPrefs(inboundText, existing?.title)
-    : undefined; // let upsertConversationMeta keep the existing title
-  const sessionIdForSidebar = existing?.sessionId && existing.sessionId !== event.session_id
-    ? existing.sessionId
-    : event.session_id;
+    : undefined;
+  // A branch session must not replace the parent session the sidebar loads history from.
+  const sessionId = existing?.sessionId && existing.sessionId !== event.session_id ? existing.sessionId : event.session_id;
+  if (existing
+    && !SIDEBAR_ACTIVITY_EVENTS.has(event.type)
+    && sessionId === existing.sessionId
+    && (title === undefined || title === existing.title)) {
+    return conversations;
+  }
 
   return upsertConversationMeta(conversations, {
     id: conversationId,
-    // [2026-06-03] Why: the global WebSocket can route branch-session events into
-    // their parent web conversation, and those branch ids must not replace the
-    // visible parent session in the sidebar. How: preserve an existing sidebar
-    // session id unless this event is already from that same session or the row is
-    // brand new. Purpose: child or branch task streams remain visible without
-    // breaking future history loads for the real web session.
-    sessionId: sessionIdForSidebar,
+    sessionId,
     title,
     updatedAt: event.ts || new Date().toISOString(),
   });
@@ -510,6 +493,9 @@ function getApprovalMatch(state: ChatStoreState, event: SupervisorEvent): Approv
 
 function maybeAutoApproveApprovalRequest(event: SupervisorEvent, get: StoreGetter) {
   if (event.type !== 'approval_requested') return;
+  const token = useSettingsStore.getState().adminToken;
+  // Without a token the decision is a guaranteed 401 that also counts toward the auth-failure backoff.
+  if (!token) return;
   const payload = event.payload || {};
   const approvalId = typeof payload.approval_id === 'string' ? payload.approval_id : '';
   if (!approvalId || autoApprovedApprovalIds.has(approvalId)) return;
@@ -520,12 +506,8 @@ function maybeAutoApproveApprovalRequest(event: SupervisorEvent, get: StoreGette
 
   autoApprovedApprovalIds.add(approvalId);
   saveAutoApproved(autoApprovedApprovalIds);
-  // [2026-06-01] Why: frontend auto-approval should behave like a local click, not
-  // a backend policy change. How: submit the normal approval decision endpoint and
-  // ignore transport errors so the pending card remains available for manual action.
-  // Purpose: low-risk local rules can proceed while high-risk tools still need users.
-  const token = useSettingsStore.getState().adminToken || '';
-  void decideApproval(token, approvalId, 'allow', 'auto-approved by client preference').catch(() => {
+  // A failed submission leaves the card pending so the user can still decide by hand.
+  void submitApprovalDecision(approvalId, 'allow', 'auto-approved by client preference', token).catch(() => {
     autoApprovedApprovalIds.delete(approvalId);
     saveAutoApproved(autoApprovedApprovalIds);
   });
@@ -594,27 +576,22 @@ function getTaskActivityPhase(event: SupervisorEvent, payload: Record<string, un
   return null;
 }
 
+/** Returns `current` itself when nothing visible changes, so subscribers are not notified. */
 function updateTaskActivitiesByEvent(
   current: Readonly<Record<string, TaskActivity>>,
   event: SupervisorEvent,
-): Record<string, TaskActivity> {
+): Readonly<Record<string, TaskActivity>> {
   const payload = getEventPayload(event);
   const keys = getTaskActivityKeys(event, payload);
-  if (keys.length === 0) return { ...current };
+  if (keys.length === 0) return current;
 
-  const isTerminal = event.type === 'task_completed' || event.type === 'task_cancelled' || event.type === 'task_failed';
-  const hasTaskId = Boolean(getStringValue(payload.task_id));
+  const isTerminal = isTerminalTaskEvent(event);
   const phase = getTaskActivityPhase(event, payload);
-  if (!isTerminal && !phase) return { ...current };
+  if (!isTerminal && !phase) return current;
 
-  const next = { ...current };
-  const lastEventAt = getTaskActivityTimestamp(event);
-
-  if (isTerminal && hasTaskId) {
-    // [AutoC 2026-06-04] Why: completed or cancelled tasks should disappear from
-    // the realtime overlay once the authoritative active-task list catches up. How:
-    // delete all known keys when task_id is present. Purpose: stale live labels do
-    // not outlive terminal task events.
+  if (isTerminal && getStringValue(payload.task_id)) {
+    if (!keys.some((key) => key in current)) return current;
+    const next = { ...current };
     for (const key of keys) delete next[key];
     return next;
   }
@@ -622,8 +599,17 @@ function updateTaskActivitiesByEvent(
   const activity: TaskActivity = {
     phase: isTerminal ? 'idle' : phase || 'idle',
     detail: isTerminal ? '' : getTaskActivityDetail(event, payload),
-    lastEventAt,
+    lastEventAt: getTaskActivityTimestamp(event),
   };
+  const unchanged = keys.every((key) => {
+    const previous = current[key];
+    return previous
+      && previous.phase === activity.phase
+      && previous.detail === activity.detail
+      && activity.lastEventAt - previous.lastEventAt < TASK_ACTIVITY_REFRESH_MS;
+  });
+  if (unchanged) return current;
+  const next = { ...current };
   for (const key of keys) next[key] = activity;
   return next;
 }
@@ -878,10 +864,7 @@ function updateChildNodesByEvent(
   event: SupervisorEvent,
   conversationId: string,
 ): Readonly<Record<string, ChildNodeState>> {
-  // [2026-06-03] Why: Phase 1 needs data-layer child-session status before adding
-  // sidebar or floating UI. How: only update childNodes for events proven to have
-  // routed from an agent:* key to a web:* parent through structured metadata.
-  // Purpose: parent conversations can expose child-agent activity without backend work.
+  // Only events routed from an agent:* key to this web parent through structured metadata count.
   const payload = getEventPayload(event);
   if (!isAgentEventRoutedToConversation(state, payload, conversationId)) return state.childNodes;
 
@@ -893,40 +876,17 @@ function updateChildNodesByEvent(
 
   const previous = state.childNodes[sessionId];
   const isTerminal = status === 'completed' || status === 'failed' || status === 'cancelled';
-  return {
-    ...state.childNodes,
-    [sessionId]: {
-      sessionId,
-      nodeId: getChildNodeId(payload, previous),
-      parentConversationId: conversationId,
-      status,
-      taskId: getStringValue(payload.task_id) || previous?.taskId,
-      startedAt: previous?.startedAt || event.ts,
-      completedAt: isTerminal ? event.ts : previous?.completedAt,
-    },
+  const next: ChildNodeState = {
+    sessionId,
+    nodeId: getChildNodeId(payload, previous),
+    parentConversationId: conversationId,
+    status,
+    taskId: getStringValue(payload.task_id) || previous?.taskId,
+    startedAt: previous?.startedAt || event.ts,
+    completedAt: isTerminal ? event.ts : previous?.completedAt,
   };
-}
-
-function createReducerEventForConversation(
-  event: SupervisorEvent,
-  payload: Record<string, unknown>,
-  conversationId: string,
-  isAgentChildRoute: boolean,
-): SupervisorEvent {
-  // [2026-06-03] Why: eventReducer intentionally has no agent-route fallback and
-  // prefers payload.conversation_key when present. How: for routed child events only,
-  // pass a shallow event copy whose visible conversation_key is the resolved web
-  // parent while preserving the raw child key. Purpose: keep eventReducer unchanged
-  // and prevent agent:* conversation ids from polluting normalized chat state.
-  if (!isAgentChildRoute) return event;
-  return {
-    ...event,
-    payload: {
-      ...event.payload,
-      conversation_key: `web:${conversationId}`,
-      child_conversation_key: getEventConversationKey(payload),
-    },
-  };
+  if (previous && sameChildNode(previous, next)) return state.childNodes;
+  return { ...state.childNodes, [sessionId]: next };
 }
 
 function createReducerEventForChildSession(
@@ -1028,16 +988,23 @@ function updateGeneratingByEvent(
   state: ChatStoreState,
   event: SupervisorEvent,
   conversationId: string,
-): Record<string, boolean> {
+): Readonly<Record<string, boolean>> {
   const shouldMarkActive = ACTIVE_TASK_EVENTS.has(event.type);
   const shouldMarkDone = isTerminalTaskEvent(event);
-  if (!shouldMarkActive && !shouldMarkDone) return { ...state.generatingBySession };
+  if (!shouldMarkActive && !shouldMarkDone) return state.generatingBySession;
 
-  const next = { ...state.generatingBySession };
+  const value = shouldMarkActive && !shouldMarkDone;
+  let next: Record<string, boolean> | null = null;
   for (const sessionId of getAffectedSessionIds(state, event, conversationId)) {
-    next[sessionId] = shouldMarkActive && !shouldMarkDone;
+    if (Boolean(state.generatingBySession[sessionId]) === value) continue;
+    next = next || { ...state.generatingBySession };
+    next[sessionId] = value;
   }
-  return next;
+  return next || state.generatingBySession;
+}
+
+function isSessionGenerating(state: Pick<ChatStoreState, 'generatingBySession' | 'sendingByConversation'>, conversation: ConversationMeta): boolean {
+  return Boolean(state.sendingByConversation[conversation.id] || (conversation.sessionId && state.generatingBySession[conversation.sessionId]));
 }
 
 function isConversationGenerating(
@@ -1052,375 +1019,129 @@ function isConversationGenerating(
   return active?.sessionId ? Boolean(generatingBySession[active.sessionId]) : fallback;
 }
 
-function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
-  clearReconnectTimer();
-  if (get().connectionStatus !== 'open') {
-    set({ connectionStatus: 'connecting' });
+function bump(revisions: Map<string, number>, viewKey: string) {
+  revisions.set(viewKey, (revisions.get(viewKey) || 0) + 1);
+}
+
+function bumpRealtimeRevision(viewKey: string) {
+  bump(realtimeRevisions, viewKey);
+}
+
+function withChildMessages(
+  current: Readonly<Record<string, WsMessage[]>>,
+  childSessionId: string,
+  messages: WsMessage[],
+): Readonly<Record<string, WsMessage[]>> {
+  const previous = current[childSessionId];
+  if (previous && previous.length === messages.length && previous.every((message, index) => message === messages[index])) return current;
+  return { ...current, [childSessionId]: messages };
+}
+
+// Child-agent events never render in the parent chat: the parent keeps an audit row, and the
+// open child view (if it is this child) gets a replay under its own child:* conversation.
+function applyAgentChildEvent(
+  state: ChatStoreState,
+  event: SupervisorEvent,
+  payload: Record<string, unknown>,
+  conversationId: string,
+): ChatStoreState {
+  const logged = appendAgentRouteEventLog(state, event, conversationId);
+  const childSessionId = getChildNodeSessionId(event, payload);
+  if (!childSessionId || state.viewingChildSessionId !== childSessionId) return logged;
+  const childConversationId = getChildConversationId(childSessionId);
+  const reduced = reduceChatEvent(logged, createReducerEventForChildSession(event, payload, childSessionId));
+  if (reduced === logged) return logged;
+  bumpRealtimeRevision(childConversationId);
+  return {
+    ...(reduced as ChatStoreState),
+    // The replay maps the runtime session to child:*; parent routing keeps its own table.
+    conversationIdsBySession: logged.conversationIdsBySession,
+    childSessionMessages: withChildMessages(logged.childSessionMessages, childSessionId, selectOrderedMessagesFromState(reduced, childConversationId)),
+  };
+}
+
+function applyRealtimeEvent(event: SupervisorEvent, set: StoreSetter, get: StoreGetter) {
+  if (event.type === 'execution_updated') {
+    window.dispatchEvent(new CustomEvent('clonoth:execution-updated', { detail: event.payload }));
   }
+  let finishedConversationId = '';
 
-  // [2026-06-03] Why: WS is now a pure live-forward stream with no replay.
-  // The backend no longer sends historical events on connect. All events
-  // received are real-time, so auto-approve runs unconditionally.
-  connectGlobalWS(
-    0,
-    (event) => {
-      if (event.type === 'execution_updated') {
-        window.dispatchEvent(new CustomEvent('clonoth:execution-updated', { detail: event.payload }));
-      }
-      let terminalConversationId = '';
-      let terminalSessionId = '';
+  // Returning the untouched state skips the store notification entirely.
+  set((state) => {
+    const taskActivities = updateTaskActivitiesByEvent(state.taskActivities, event);
+    const base = taskActivities === state.taskActivities ? state : { ...state, taskActivities };
+    const conversationId = resolveEventConversationId(base, event);
+    if (!conversationId) return base;
 
-      set((state) => {
-        const taskActivities = updateTaskActivitiesByEvent(state.taskActivities, event);
-        // [AutoC 2026-06-04] Why: active-task activity should update for every
-        // global WebSocket frame, including sessions that are not currently routed
-        // to a visible chat. How: merge taskActivities before normal conversation
-        // routing and preserve it through reducer returns. Purpose: the System modal
-        // can show live phases independent of selected conversation state.
-        const stateWithTaskActivity = { ...state, taskActivities };
-        const conversationId = resolveEventConversationId(stateWithTaskActivity, event);
-        if (!conversationId) {
-          return { connectionStatus: 'open', taskActivities };
-        }
+    const payload = getEventPayload(event);
+    const routed = seedConversationRouteForEvent(base, event, conversationId);
+    if (isAgentEventRoutedToConversation(routed, payload, conversationId)) {
+      const childNodes = updateChildNodesByEvent(routed, event, conversationId);
+      return applyAgentChildEvent(childNodes === routed.childNodes ? routed : { ...routed, childNodes }, event, payload, conversationId);
+    }
 
-        const payload = getEventPayload(event);
-        const isAgentChildRoute = isAgentEventRoutedToConversation(stateWithTaskActivity, payload, conversationId);
-        const reducerEvent = createReducerEventForConversation(event, payload, conversationId, isAgentChildRoute);
-        const routedState = seedConversationRouteForEvent(stateWithTaskActivity, event, conversationId);
-        const childNodes = updateChildNodesByEvent(routedState, event, conversationId);
+    const reduced = reduceChatEvent(routed, event) as ChatStoreState;
+    if (reduced === routed) return routed;
+    bumpRealtimeRevision(conversationId);
+    if (ACTIVE_TASK_EVENTS.has(event.type) || isTerminalTaskEvent(event)) bump(lifecycleRevisions, conversationId);
+    const conversations = syncConversationsAfterEvent(state.conversations, reduced, event, conversationId);
+    const generatingBySession = updateGeneratingByEvent({ ...state, conversations }, event, conversationId);
+    if (isTerminalTaskEvent(event)) finishedConversationId = conversationId;
+    return {
+      ...reduced,
+      conversations,
+      generatingBySession,
+      isGenerating: isConversationGenerating(conversations, state.activeConversationId, generatingBySession, state.isGenerating, state.sendingByConversation),
+    };
+  });
 
-        // [2026-06-03] Why: child-agent events (agent:*) routed to a parent conversation
-        // must NOT be rendered as chat messages in the parent's message list. Their
-        // inbound/outbound would otherwise appear as "你" messages or assistant cards
-        // mixed into the parent stream. How: keep an audit log for the parent and, only
-        // when the user is viewing that child session, replay a cloned event into the
-        // child message cache. Purpose: parent chat stays clean while child navigation
-        // still receives live streaming updates.
-        if (isAgentChildRoute) {
-          const childSessionId = getChildNodeSessionId(event, payload);
-          let nextState = appendAgentRouteEventLog({ ...routedState, childNodes }, event, conversationId);
-          if (childSessionId && state.viewingChildSessionId === childSessionId) {
-            const childConversationId = getChildConversationId(childSessionId);
-            const childEvent = createReducerEventForChildSession(event, payload, childSessionId);
-            const reducedChildState = reduceChatEvent(nextState, childEvent);
-            nextState = {
-              ...(reducedChildState as ChatStoreState),
-              // [2026-06-03] Why: child-view reducer replay may map a branch runtime
-              // session to child:*, but parent routing should keep using the route map
-              // built above. How: restore the parent route table after extracting child
-              // messages. Purpose: later branch events cannot escape parent routing.
-              conversationIdsBySession: nextState.conversationIdsBySession,
-              childSessionMessages: {
-                ...nextState.childSessionMessages,
-                [childSessionId]: selectOrderedMessagesFromState(reducedChildState, childConversationId),
-              },
-            };
-          }
-          return {
-            ...nextState,
-            taskActivities,
-            connectionStatus: 'open' as const,
-          };
-        }
+  maybeAutoApproveApprovalRequest(event, get);
+  if (finishedConversationId) afterTaskFinished(finishedConversationId, set, get);
+}
 
-        const reducedState = reduceChatEvent(routedState, reducerEvent);
-        const conversations = syncConversationsAfterEvent(state.conversations, reducedState, reducerEvent, conversationId);
-        const generatingBySession = updateGeneratingByEvent({ ...state, conversations }, reducerEvent, conversationId);
-        const isGenerating = isConversationGenerating(
-          conversations,
-          state.activeConversationId,
-          generatingBySession,
-          state.isGenerating,
-          state.sendingByConversation,
-        );
+function afterTaskFinished(conversationId: string, set: StoreSetter, get: StoreGetter) {
+  set((state) => {
+    const sorted = sortConversationsByRecency(state.conversations);
+    return sorted.every((conversation, index) => conversation === state.conversations[index]) ? state : { conversations: sorted };
+  });
+  if (!unsettledConversations.has(conversationId)) return;
+  const state = get();
+  const conversation = state.conversations.find((item) => item.id === conversationId);
+  if (conversation && !isSessionGenerating(state, conversation)) void syncConversation(conversationId, set, get, true);
+}
 
-        if (isTerminalTaskEvent(event)) {
-          const conversation = conversations.find((item) => item.id === conversationId);
-          const historySessionId = conversation?.sessionId || getEventParentSessionId(getEventPayload(event)) || event.session_id;
-          terminalConversationId = conversationId;
-          terminalSessionId = historySessionId;
-        }
-
-        return {
-          ...reducedState,
-          conversations,
-          generatingBySession,
-          childNodes,
-          taskActivities,
-          connectionStatus: 'open',
-          isGenerating,
-        };
-      });
-
-      maybeAutoApproveApprovalRequest(event, get);
-
-      if (terminalConversationId && terminalSessionId) {
-        // [AutoC 2026-06-04] Why: each LLM request card is finalized in place when
-        // stream_end/outbound_message arrives, so task completion must not clear and
-        // rebuild the whole conversation from /history. How: keep only the sidebar
-        // recency sort on terminal events and leave the reducer-owned messages intact.
-        // Purpose: completing a task no longer causes visible card jumps.
-        set((state) => ({ conversations: sortConversationsByRecency(state.conversations) }));
-      }
-    },
-    () => {
-      // [2026-06-03] Why: connectionStatus now describes the global event stream,
-      // not a selected task. How: mark open as soon as /v1/ws accepts the cursor.
-      // Purpose: switching conversations does not make transport status ambiguous.
+function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
+  if (get().connectionStatus !== 'open') set({ connectionStatus: 'connecting' });
+  connectGlobalWS({
+    onEvent: (event) => applyRealtimeEvent(event, set, get),
+    onOpen: ({ reconnected }) => {
       set({ connectionStatus: 'open' });
+      // The stream only carries events from now on; anything that happened while it was down is fetched again.
+      if (reconnected) void resyncAfterReconnect(set, get);
     },
-    () => {
-      // [2026-06-03] Why: the global WS should remain alive for all sessions. How:
-      // reconnect after unexpected close regardless of task state. Purpose: task
-      // completion and cancellation no longer control realtime lifetime.
-      set({ connectionStatus: 'reconnecting' });
-      reconnectTimer = setTimeout(() => startGlobalWebSocket(set, get), 2000);
-    },
-  );
+    onClose: () => set({ connectionStatus: 'reconnecting' }),
+  });
+}
+
+async function resyncAfterReconnect(set: StoreSetter, get: StoreGetter) {
+  const state = get();
+  const targets = new Set<string>();
+  if (state.activeConversationId) targets.add(state.activeConversationId);
+  for (const conversation of state.conversations) {
+    if (isSessionGenerating(state, conversation) || selectHasActiveChildNodesFromState(state, conversation.id)) targets.add(conversation.id);
+  }
+  const childSessionId = state.viewingChildSessionId;
+  await Promise.all([
+    ...[...targets].map((conversationId) => syncConversation(conversationId, set, get)),
+    ...(childSessionId ? [loadChildHistory(childSessionId, set, get)] : []),
+  ]);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function stringifyContent(value: unknown): string {
-  if (typeof value === 'string') return value;
-  if (value == null) return '';
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
-
-function collapseForPreview(value: string): string {
-  return value.replace(/\s+/g, ' ').trim();
-}
-
-function truncateForPreview(value: string, limit: number): string {
-  const chars = Array.from(value);
-  return chars.length > limit ? `${chars.slice(0, limit).join('')}…` : value;
-}
-
-function summarizeArguments(toolName: string, args: Record<string, unknown> | undefined): string {
-  if (!args || Object.keys(args).length === 0) return '';
-  if (CONTROL_TOOL_NAMES.has(toolName) && typeof args.text === 'string') return '';
-
-  return Object.entries(args)
-    .slice(0, 3)
-    .map(([key, value]) => `${key}: ${truncateForPreview(collapseForPreview(stringifyContent(value)), 80)}`)
-    .join(', ');
-}
-
-function buildHistoryToolResultIndex(messages: readonly StructuredMessage[]): Map<string, HistoryToolResult> {
-  const resultIndex = new Map<string, HistoryToolResult>();
-
-  for (const message of messages) {
-    if (message.role !== 'tool' || !message.tool_call_id) continue;
-
-    const toolName = message.tool_name || message.name || '';
-    const rawContent = stringifyContent(message.content);
-    const trimmed = rawContent.trim();
-    // [2026-06-01] Why: old tool result history can start with a cross-mark emoji,
-    // but the migrated frontend should not generate emoji-prefixed results. How:
-    // preserve legacy detection while accepting plain rejected text. Purpose: Material
-    // Symbols migration remains compatible with existing stored conversations.
-    const rejected = /^\s*(?:❌\s*)?REJECTED(?:\b|:)/i.test(trimmed);
-    const status: HistoryToolResult['status'] = rejected || /^ERROR(?:\b|:)/i.test(trimmed) ? 'error' : 'success';
-    const isAutoResult = status === 'success' && CONTROL_TOOL_NAMES.has(toolName) && trimmed.toLowerCase() === 'ok';
-
-    resultIndex.set(message.tool_call_id, {
-      status,
-      rawInline: rawContent,
-      rejected: rejected || undefined,
-      isAutoResult: isAutoResult || undefined,
-      result: isAutoResult
-        ? undefined
-        : status === 'error'
-          ? rawContent
-          : truncateForPreview(collapseForPreview(rawContent), 120) || undefined,
-    });
-  }
-
-  return resultIndex;
-}
-
-function normalizeHistoryToolCalls(value: StructuredMessage['tool_calls']): HistoryToolCall[] {
-  if (!Array.isArray(value)) return [];
-
-  return value.map((toolCall, index) => ({
-    id: toolCall.id || `history-tool-${index}`,
-    name: toolCall.name || 'unknown',
-    arguments: isRecord(toolCall.arguments) ? toolCall.arguments : undefined,
-  }));
-}
-
-function normalizeHistoryThinkingSegments(message: StructuredMessage): HistoryThinkingSegment[] {
-  const normalizeBlock = (block: StructuredThinkingBlock): HistoryThinkingSegment | null => {
-    const text = typeof block.text === 'string' ? block.text : '';
-    if (!text.trim()) return null;
-    return {
-      text,
-      // [AutoC 2026-06-04] Why: /history has used both snake_case and camelCase
-      // timestamp keys during the streaming refactor. How: normalize both shapes into
-      // the render block fields. Purpose: refreshed thinking blocks show elapsed time
-      // instead of the character-count fallback.
-      startedAt: typeof block.started_at === 'string' ? block.started_at : typeof block.startedAt === 'string' ? block.startedAt : undefined,
-      endedAt: typeof block.ended_at === 'string' ? block.ended_at : typeof block.endedAt === 'string' ? block.endedAt : undefined,
-    };
-  };
-
-  const structuredBlocks = Array.isArray(message.thinking_blocks)
-    ? message.thinking_blocks.map(normalizeBlock).filter((block): block is HistoryThinkingSegment => Boolean(block))
-    : [];
-  if (structuredBlocks.length > 0) return structuredBlocks;
-
-  if (isRecord(message.thinking)) {
-    const normalized = normalizeBlock(message.thinking as StructuredThinkingBlock);
-    return normalized ? [normalized] : [];
-  }
-
-  const text = typeof message.thinking === 'string' ? message.thinking : message.thinking_text || '';
-  if (!text.trim()) return [];
-
-  // [AutoC 2026-06-04] Why: older /history rows exposed reasoning as a flat string
-  // plus optional top-level timestamps. How: normalize that legacy shape into the
-  // same segment model used by thinking_blocks. Purpose: hydration has one path and
-  // can keep elapsed-time metadata whenever the backend provides it.
-  return [{
-    text,
-    startedAt: message.reasoning_started_at,
-    endedAt: message.reasoning_ended_at,
-  }];
-}
-
-function extractControlToolText(toolCalls: readonly HistoryToolCall[]): { text: string; toolName?: string } {
-  for (const toolCall of toolCalls) {
-    if (!CONTROL_TOOL_NAMES.has(toolCall.name)) continue;
-    const text = typeof toolCall.arguments?.text === 'string' ? toolCall.arguments.text : '';
-    if (text) return { text, toolName: toolCall.name };
-  }
-  return { text: '' };
-}
-
-function historyToolStatus(result: HistoryToolResult | undefined): ToolStatus {
-  if (!result) return 'success';
-  return result.status;
-}
-
-function createHistoryToolExecutions(
-  toolCalls: readonly HistoryToolCall[],
-  resultIndex: Map<string, HistoryToolResult>,
-  messageId: string,
-  createdAt: string,
-  sessionId: string,
-  nodeId?: string,
-): ToolExecution[] {
-  return toolCalls.map((toolCall, index) => {
-    const result = toolCall.id ? resultIndex.get(toolCall.id) : undefined;
-    const stableId = `${messageId}|history-tool:${toolCall.id || index}`;
-    return {
-      stableId,
-      messageId,
-      id: toolCall.id,
-      index,
-      name: toolCall.name,
-      status: historyToolStatus(result),
-      arguments: toolCall.arguments,
-      argumentsText: toolCall.arguments ? JSON.stringify(toolCall.arguments) : undefined,
-      summary: summarizeArguments(toolCall.name, toolCall.arguments),
-      result: result?.result,
-      rawInline: result?.rawInline,
-      rejected: result?.rejected,
-      // [2026-06-02] Why: rejected control tools explain why a final action failed
-      // and must not be treated like the automatic successful "ok" result. How: keep
-      // the existing auto-result hiding but exclude rejected tool results. Purpose:
-      // historical rejected finish/reply/ask calls remain visible in the tool list.
-      hidden: CONTROL_TOOL_NAMES.has(toolCall.name) && result?.isAutoResult && !result?.rejected,
-      nodeId,
-      createdAt,
-      updatedAt: createdAt,
-      eventIds: [`history:${sessionId}:${messageId}:tool:${index}`],
-    } satisfies ToolExecution;
-  });
-}
-
-function createTextBlock(
-  id: string,
-  createdAt: string,
-  text: string,
-  delivery: TextBlock['delivery'] = 'history',
-): TextBlock {
-  return {
-    id,
-    kind: 'text',
-    text,
-    // [2026-06-02] Why: hydrated reply and finish messages need the same delivery
-    // metadata as live reducer messages. How: keep history as the default while
-    // allowing callers to pass intermediate for reply and final for finish. Purpose:
-    // refresh and reconnect rebuilds preserve the visual reply and finish semantics.
-    delivery,
-    streaming: false,
-    createdAt,
-    updatedAt: createdAt,
-    eventIds: [`${id}:history`],
-  };
-}
-
-function createThinkingBlock(
-  id: string,
-  createdAt: string,
-  text: string,
-  startedAt?: string,
-  endedAt?: string,
-): ThinkingBlock {
-  return {
-    id,
-    kind: 'thinking',
-    text,
-    streaming: false,
-    startedAt,
-    endedAt,
-    createdAt,
-    updatedAt: createdAt,
-    eventIds: [`${id}:history`],
-  };
-}
-
-function createToolBlock(id: string, createdAt: string, toolIds: readonly string[]): ToolBlock {
-  return {
-    id,
-    kind: 'tool',
-    toolIds: [...toolIds],
-    createdAt,
-    updatedAt: createdAt,
-    eventIds: [`${id}:history`],
-  };
-}
-
-function appendHistoryMessage(state: ChatState, message: WsMessage, tools: readonly ToolExecution[]): ChatState {
-  const order = state.messageOrderByConversation[message.conversationId] || [];
-  const nextToolExecutionsById = { ...state.toolExecutionsById };
-  const nextToolExecutionOrder = [...state.toolExecutionOrder];
-
-  for (const tool of tools) {
-    nextToolExecutionsById[tool.stableId] = tool;
-    if (!nextToolExecutionOrder.includes(tool.stableId)) nextToolExecutionOrder.push(tool.stableId);
-  }
-
-  return {
-    ...state,
-    messagesById: { ...state.messagesById, [message.id]: message },
-    messageOrderByConversation: {
-      ...state.messageOrderByConversation,
-      [message.conversationId]: order.includes(message.id) ? order : [...order, message.id],
-    },
-    toolExecutionsById: nextToolExecutionsById,
-    toolExecutionOrder: nextToolExecutionOrder,
-  };
-}
-
-function removeConversationMessages(state: ChatState, conversationId: string): ChatState {
+function removeConversationMessages<S extends ChatState>(state: S, conversationId: string): S {
   const removedMessageIds = new Set(state.messageOrderByConversation[conversationId] || []);
   if (removedMessageIds.size === 0) return state;
 
@@ -1443,382 +1164,255 @@ function removeConversationMessages(state: ChatState, conversationId: string): C
   return { ...state, messagesById, messageOrderByConversation, toolExecutionsById, toolExecutionOrder };
 }
 
-function getHistoryEventId(sessionId: string, sourceMessageId: string | undefined, messageId: string): string {
-  // [2026-06-02] Why: active history hydration now compares persisted rows against
-  // live WebSocket messages. How: keep the exact synthetic source id in one helper so
-  // dedupe checks and hydrated messages use the same value. Purpose: repeated history
-  // loads cannot create a second card for an already-hydrated source message.
-  return `history:${sessionId}:${sourceMessageId || messageId}`;
+function withHistoryView(
+  views: Readonly<Record<string, HistoryView>>,
+  viewKey: string,
+  patch: Partial<HistoryView>,
+): Readonly<Record<string, HistoryView>> {
+  const current = views[viewKey];
+  const next = { ...(current || IDLE_HISTORY), ...patch };
+  if (current && (Object.keys(next) as Array<keyof HistoryView>).every((key) => next[key] === current[key])) return views;
+  return { ...views, [viewKey]: next };
 }
 
-function getMessageTextForHistoryDedupe(message: WsMessage): string {
-  // [2026-06-02] Why: live messages do not share ConversationStore UUIDs with
-  // structured history rows. How: compare only rendered text blocks and leave tool-only
-  // rows to source-id matching. Purpose: stream cards and history cards with the same
-  // visible text do not render twice during active-session races.
-  return message.blocks
-    .filter((block): block is TextBlock => block.kind === 'text')
-    .map((block) => block.text)
-    .join('\n');
-}
-
-function createHistoryContentSignature(role: WsMessage['role'], text: string): string | undefined {
-  // [2026-06-02] Why: content dedupe must not collapse user and assistant messages
-  // that happen to contain the same text. How: normalize whitespace and include the
-  // role in the signature. Purpose: matching stays narrow while catching stream/history
-  // duplicates that differ only in delivery metadata.
-  const compact = collapseForPreview(text);
-  return compact ? `${role}:${compact}` : undefined;
-}
-
-function hydrateStructuredHistory(
-  state: ChatState,
-  sessionId: string,
-  conversationId: string,
-  history: readonly StructuredMessage[],
-  preserveExistingMessages = false,
-): ChatState {
-  // Why: /history returns persisted ConversationStore messages, not SupervisorEvent
-  // records. How: convert that structured history into the same WsMessage blocks and
-  // ToolExecution tables used by the reducer. Purpose: cold startup can show existing
-  // sessions while live WebSocket events continue to use reduceChatEvent only.
-  const resultIndex = buildHistoryToolResultIndex(history);
-  // Why: normal cold-start hydration should replace stale history, but an active
-  // generation may already have live WebSocket messages in this conversation. How:
-  // the caller can skip the removal step for active sessions. Purpose: late history
-  // responses do not erase in-flight stream or tool blocks.
-  let nextState = preserveExistingMessages ? state : removeConversationMessages(state, conversationId);
-  const existingSourceIds = new Set<string>();
-  const existingMessageIds = new Set<string>();
-  const existingContentSignatures = new Set<string>();
-
-  if (preserveExistingMessages) {
-    // [2026-06-02] Why: preserving live WebSocket messages avoids deleting active
-    // streams, but appending every persisted history row creates duplicate cards. How:
-    // collect source ids, generated message ids, and role-scoped visible text from the
-    // current conversation before hydration. Purpose: late history responses can add
-    // missing old rows without duplicating messages that are already visible.
-    for (const id of nextState.messageOrderByConversation[conversationId] || []) {
-      const existingMessage = nextState.messagesById[id];
-      if (!existingMessage) continue;
-      existingMessageIds.add(existingMessage.id);
-      for (const eventId of existingMessage.eventIds || []) {
-        // [AutoC 2026-06-03] Why: history:{sessionId}:{rowId} is the store's own
-        // source-id namespace. How: compare only that generated protocol prefix.
-        // Purpose: dedupe history rows without inspecting user-visible content.
-        if (eventId.startsWith(`history:${sessionId}:`)) existingSourceIds.add(eventId);
-      }
-      const signature = createHistoryContentSignature(existingMessage.role, getMessageTextForHistoryDedupe(existingMessage));
-      if (signature) existingContentSignatures.add(signature);
-    }
-  }
-
-  const shouldSkipPreservedHistoryMessage = (
-    sourceEventId: string,
-    messageId: string,
-    role: WsMessage['role'],
-    text: string,
-  ): boolean => {
-    if (!preserveExistingMessages) return false;
-    if (existingSourceIds.has(sourceEventId) || existingMessageIds.has(messageId)) return true;
-    const signature = createHistoryContentSignature(role, text);
-    return Boolean(signature && existingContentSignatures.has(signature));
-  };
-
-  const rememberHydratedHistoryMessage = (sourceEventId: string, messageId: string) => {
-    // [2026-06-02] Why: a malformed or replayed history response can contain the same
-    // persisted source more than once. How: record source and generated ids as each row
-    // is accepted, without adding content signatures that would collapse legitimate
-    // repeated text inside one history payload. Purpose: preserve duplicate human text
-    // while still avoiding duplicate source rows.
-    if (!preserveExistingMessages) return;
-    existingSourceIds.add(sourceEventId);
-    existingMessageIds.add(messageId);
-  };
-
-  let accumulatedThinking: HistoryThinkingSegment[] = [];
-  let accumulatedTools: ToolExecution[] = [];
-  let accumulatedCreatedAt = '';
-
-  const resetAccumulatedAssistant = () => {
-    accumulatedThinking = [];
-    accumulatedTools = [];
-    accumulatedCreatedAt = '';
-  };
-
-  const pushAssistantMessage = (
-    sourceMessage: StructuredMessage,
-    text: string,
-    currentTools: readonly ToolExecution[],
-    completionType?: WsMessage['completionType'],
-  ) => {
-    const createdAt = sourceMessage.created_at || accumulatedCreatedAt || new Date().toISOString();
-    const messageId = `message:${conversationId}:history:${sourceMessage.id || nextState.messageOrderByConversation[conversationId]?.length || 0}`;
-    const historyEventId = getHistoryEventId(sessionId, sourceMessage.id, messageId);
-    if (shouldSkipPreservedHistoryMessage(historyEventId, messageId, 'assistant', text)) {
-      resetAccumulatedAssistant();
-      return;
-    }
-    const thinkingSegments = [
-      ...accumulatedThinking,
-      ...normalizeHistoryThinkingSegments(sourceMessage),
-    ].filter((item) => item.text.trim());
-    const tools = [...accumulatedTools, ...currentTools].map((tool) => ({
-      ...tool,
-      // Why: a tool-only assistant history entry may be merged into a later visible
-      // assistant message. How: keep the stable tool id from its source entry but
-      // update messageId to the visible message that owns the rendered tool block.
-      // Purpose: avoid duplicate ids while preserving selector lookups for tools.
-      messageId,
-    }));
-    const blocks: RenderBlock[] = [];
-
-    for (const [index, thinking] of thinkingSegments.entries()) {
-      // [AutoC 2026-06-04] Why: backend history can now return multiple structured
-      // reasoning blocks, each with its own timing. How: create one ThinkingBlock per
-      // segment instead of flattening everything into a string separated by markers.
-      // Purpose: refreshed history keeps the same elapsed-time display model as live
-      // streaming cards.
-      blocks.push(createThinkingBlock(
-        `${messageId}|block:thinking:history:${index}`,
-        createdAt,
-        thinking.text,
-        thinking.startedAt,
-        thinking.endedAt,
-      ));
-    }
-    if (tools.length > 0) {
-      const blockId = `${messageId}|block:tool:history`;
-      blocks.push(createToolBlock(blockId, createdAt, tools.map((tool) => tool.stableId)));
-      tools.forEach((tool, index) => { tools[index] = { ...tool, blockId }; });
-    }
-    const textDelivery: TextBlock['delivery'] = completionType === 'reply'
-      ? 'intermediate'
-      : completionType === 'finish'
-        ? 'final'
-        : 'history';
-    if (text) {
-      // [2026-06-02] Why: rebuilt control-tool messages lost their reply/finish
-      // delivery after refresh because every history text block used history. How:
-      // derive the text delivery from completionType before creating the block.
-      // Purpose: reply rebuilds as intermediate and finish rebuilds as final.
-      blocks.push(createTextBlock(`${messageId}|block:text:history`, createdAt, text, textDelivery));
-    }
-
-    const status: MessageStatus = 'completed';
-    const message: WsMessage = {
-      id: messageId,
-      conversationId,
-      sessionId,
-      role: 'assistant',
-      status,
-      createdAt,
-      updatedAt: createdAt,
-      source: {
-        // [AutoC 2026-06-04] Why: request-scoped live cards can later be compared
-        // with hydrated assistant rows. How: preserve llm_request_id from /history
-        // when the backend provides it. Purpose: task-level metadata is no longer the
-        // only way to identify a historical assistant card.
-        llmRequestId: sourceMessage.llm_request_id || undefined,
-        taskId: sourceMessage.source_task_id || undefined,
-        nodeId: sourceMessage.source_node_id || undefined,
-      },
-      blocks,
-      eventIds: [historyEventId],
-      hydratedFromHistory: true,
-      ...(completionType && { completionType }),
-    };
-
-    nextState = appendHistoryMessage(nextState, message, tools.map((tool) => ({
-      ...tool,
-      eventIds: [`history:${sessionId}:${messageId}:tool:${tool.index ?? 0}`],
-    })));
-    rememberHydratedHistoryMessage(historyEventId, messageId);
-    resetAccumulatedAssistant();
-  };
-
-  const flushDanglingAssistant = () => {
-    if (accumulatedThinking.length === 0 && accumulatedTools.length === 0) return;
-    // Why: ConversationStore can end or switch turns after a tool-only assistant
-    // entry. How: emit an empty assistant message carrying the accumulated thinking
-    // and tool blocks before processing the next user row. Purpose: preserve history
-    // that would otherwise disappear during cold startup hydration.
-    pushAssistantMessage({
-      id: `dangling-${nextState.messageOrderByConversation[conversationId]?.length || 0}`,
-      role: 'assistant',
-      content: '',
-      created_at: accumulatedCreatedAt || new Date().toISOString(),
-    }, '', []);
-  };
-
-  for (const message of history) {
-    if (message.role === 'user') {
-      flushDanglingAssistant();
-      if (INTERNAL_USER_MESSAGE_TYPES.has(message.message_type || '')) continue;
-
-      const createdAt = message.created_at || new Date().toISOString();
-      const messageId = `message:${conversationId}:history:${message.id || `user-${nextState.messageOrderByConversation[conversationId]?.length || 0}`}`;
-      const historyEventId = getHistoryEventId(sessionId, message.id, messageId);
-      const text = stringifyContent(message.content);
-      // [AutoC 2026-06-03] Why: dispatch-result history rows are backend callback
-      // notifications rather than generic system notices. How: map the structured
-      // message_type to the dedicated dispatch_callback role. Purpose: refreshed
-      // history uses the same label, purple styling, and child-session action as live
-      // WebSocket delivery.
-      const hydratedRole: WsMessage['role'] = isDispatchResultHistoryMessage(message, text) ? 'dispatch_callback' : 'user';
-      if (shouldSkipPreservedHistoryMessage(historyEventId, messageId, hydratedRole, text)) continue;
-      const wsMessage: WsMessage = {
-        id: messageId,
-        conversationId,
-        sessionId,
-        role: hydratedRole,
-        status: 'completed',
-        createdAt,
-        updatedAt: createdAt,
-        source: {
-          // [AutoC 2026-06-04] Why: history rows now expose child_* callback metadata
-          // in addition to legacy dispatch_* fields. How: prefer child_node_id and
-          // child_task_id, then fall back to old names and generic source ids. Purpose:
-          // refreshed dispatch cards use the same structured source as live events.
-          nodeId: message.child_node_id || message.dispatch_node_id || message.source_node_id || undefined,
-          childNodeId: message.child_node_id || message.dispatch_node_id || undefined,
-          taskId: message.child_task_id || message.dispatch_task_id || message.source_task_id || undefined,
-          childTaskId: message.child_task_id || message.dispatch_task_id || undefined,
-          callerNodeId: message.caller_node_id || undefined,
-          summary: message.summary || undefined,
-          // [AutoC 2026-06-03] Why: the dispatch callback button needs a stable
-          // child-session target after refresh. How: read child_session_id from the
-          // structured history row emitted by the backend. Purpose: the renderer does
-          // not need to infer the child session from localized text or child-node names.
-          childSessionId: message.child_session_id || undefined,
-        },
-        // [2026-06-03] Why: dispatch-result inbound rows are control notifications,
-        // not human input. How: they keep their text block but use the structured
-        // callback role computed above. Purpose: refreshed history no longer labels
-        // them as "你" or as a generic system notice.
-        blocks: [createTextBlock(`${messageId}|block:text:history`, createdAt, text)],
-        eventIds: [historyEventId],
-        hydratedFromHistory: true,
-      };
-      nextState = appendHistoryMessage(nextState, wsMessage, []);
-      rememberHydratedHistoryMessage(historyEventId, messageId);
-      continue;
-    }
-
-    if (message.role !== 'assistant') continue;
-
-    const pendingMessageId = `message:${conversationId}|history-pending:${message.id || 'assistant'}`;
-    const toolCalls = normalizeHistoryToolCalls(message.tool_calls);
-    const currentTools = createHistoryToolExecutions(toolCalls, resultIndex, pendingMessageId, message.created_at || new Date().toISOString(), sessionId, message.source_node_id);
-    const controlText = extractControlToolText(toolCalls);
-    const contentText = stringifyContent(message.content);
-    const displayText = contentText.trim() ? contentText : controlText.text;
-    const hasControlTool = toolCalls.some((toolCall) => CONTROL_TOOL_NAMES.has(toolCall.name));
-
-    if (hasControlTool && controlText.text) {
-      // Why: finish/reply/ask/switch_node are persisted as standalone assistant tool
-      // calls by the backend control-tool guard. How: flush any accumulated tool-only
-      // assistant history before rendering the visible control text. Purpose: final
-      // control-tool output cannot merge into the previous tool card during hydration.
-      flushDanglingAssistant();
-      // Determine completionType from the control tool name
-      const ctName = controlText.toolName;
-      const ctType: WsMessage['completionType'] =
-        ctName === 'finish' ? 'finish' : ctName === 'ask' ? 'ask' : ctName === 'reply' ? 'reply' : undefined;
-      // [2026-06-03] Why: free prose (content) duplicates or precedes the reply/finish
-      // text but has no user-facing value. How: always prefer the control tool text over
-      // the raw content when a control tool is present. Purpose: the card shows the
-      // authoritative reply/finish text, not the internal LLM reasoning.
-      pushAssistantMessage(message, controlText.text, currentTools, ctType);
-      continue;
-    }
-
-    if (!displayText && !hasControlTool) {
-      accumulatedThinking.push(...normalizeHistoryThinkingSegments(message));
-      if (currentTools.length > 0) accumulatedTools.push(...currentTools);
-      if (!accumulatedCreatedAt) accumulatedCreatedAt = message.created_at || '';
-      continue;
-    }
-
-    pushAssistantMessage(message, displayText, currentTools);
-  }
-
-  flushDanglingAssistant();
-  return {
-    ...nextState,
-    conversationIdsBySession: {
-      ...nextState.conversationIdsBySession,
-      [sessionId]: conversationId,
-    },
-  };
-}
-
-async function loadSessionHistoryIntoStore(conversationId: string, sessionId: string, set: StoreSetter, get: StoreGetter) {
-  // [2026-06-03] Why: the old event ring buffer is fragile and size-limited for
-  // history rebuilds. How: reconstruct only from getSessionHistory, backed by
-  // persistent JSONL. Purpose: final cards use backend-authoritative history while
-  // WebSocket sequence cursors remain transport bookkeeping only.
-  let history: StructuredMessage[] = [];
-  let children: ChildSessionInfo[] = [];
-
-  try {
-    [history, children] = await Promise.all([
-      getSessionHistory(sessionId, 200),
-      getSessionChildren(sessionId),
-    ]);
-  } catch {
-    return;
-  }
-
+function patchHistoryView(set: StoreSetter, viewKey: string, patch: Partial<HistoryView>) {
   set((state) => {
-    if (state.conversations.find(item => item.id === conversationId)?.sessionId !== sessionId) return {};
-    const preserveExistingMessages = shouldPreserveConversationMessagesDuringHistoryLoad(state, conversationId, sessionId);
-    const hydrated = history.length > 0
-      ? hydrateStructuredHistory(state, sessionId, conversationId, history, preserveExistingMessages)
-      : state;
-    const hydratedStore = hydrated as ChatStoreState;
-    const childNodes = mergeChildNodesFromSessionChildren(hydratedStore, conversationId, children);
-    return {
-      ...hydrated,
-      childNodes,
-      conversations: upsertConversationMeta(state.conversations, {
-        id: conversationId,
-        sessionId,
-        updatedAt: new Date().toISOString(),
-      }),
-    };
+    const historyByConversation = withHistoryView(state.historyByConversation, viewKey, patch);
+    return historyByConversation === state.historyByConversation ? state : { historyByConversation };
   });
 }
 
-async function loadChildSessionHistoryIntoStore(sessionId: string, set: StoreSetter, taskId?: string) {
-  let history: StructuredMessage[] = [];
-  try {
-    history = await getSessionHistory(sessionId, 200, taskId);
-  } catch {
-    return;
-  }
+function withoutHistoryView(views: Readonly<Record<string, HistoryView>>, viewKey: string): Readonly<Record<string, HistoryView>> {
+  if (!(viewKey in views)) return views;
+  const next = { ...views };
+  delete next[viewKey];
+  return next;
+}
 
+// A newer request for the same view aborts the older one; only the newest response may land.
+function beginHistoryRequest(viewKey: string): { generation: number; signal: AbortSignal } {
+  historyRequests.get(viewKey)?.controller.abort();
+  const controller = new AbortController();
+  historyGeneration += 1;
+  historyRequests.set(viewKey, { generation: historyGeneration, controller });
+  return { generation: historyGeneration, signal: controller.signal };
+}
+
+function finishHistoryRequest(viewKey: string, generation: number): boolean {
+  if (historyRequests.get(viewKey)?.generation !== generation) return false;
+  historyRequests.delete(viewKey);
+  return true;
+}
+
+function applyHistoryPage<S extends ChatState>(
+  state: S,
+  viewKey: string,
+  sessionId: string,
+  page: readonly StructuredMessage[],
+  kind: 'latest' | 'older',
+  keepLive: boolean,
+): { chat: S; hasMore: boolean } {
+  const previous = historyCaches.get(viewKey);
+  const cached = previous?.sessionId === sessionId ? previous : undefined;
+  let window: HistoryWindow;
+  let freshRowIds: Set<string>;
+  if (kind === 'older' && cached) {
+    window = mergeOlderHistoryPage(cached.window, page);
+    // Older rows predate everything live, so none of them can be a live message's persisted copy.
+    freshRowIds = new Set();
+  } else {
+    window = mergeLatestHistoryPage(cached?.window, page);
+    const known = new Set(cached?.window.rows.map(historyRowKey) || []);
+    freshRowIds = new Set(page.map(historyRowKey).filter((key) => key && !known.has(key)));
+  }
+  const merged = mergeHistoryEntries(state, viewKey, buildHistoryEntries(window.rows, sessionId, viewKey), {
+    keepLive: keepLive || kind === 'older',
+    freshRowIds,
+    anchors: cached?.anchors || new Map(),
+  });
+  historyCaches.set(viewKey, { sessionId, window, anchors: merged.anchors });
+  return { chat: merged.state, hasMore: window.hasMore };
+}
+
+function seedBranchRoutes(
+  routes: Readonly<Record<string, string>>,
+  conversationId: string,
+  tasks: readonly SessionRunningTask[],
+): Readonly<Record<string, string>> {
+  let next: Record<string, string> | null = null;
+  for (const task of tasks) {
+    const branchSessionId = task.branch_session_id;
+    if (!branchSessionId || routes[branchSessionId] === conversationId) continue;
+    next = next || { ...routes };
+    next[branchSessionId] = conversationId;
+  }
+  return next || routes;
+}
+
+function syntheticApprovalEvent(approval: AdminApproval, conversationId: string): SupervisorEvent {
+  return {
+    seq: 0,
+    event_id: `approval-sync:${approval.approval_id}`,
+    ts: approval.requested_at || new Date().toISOString(),
+    session_id: approval.session_id || '',
+    type: 'approval_requested',
+    component: 'supervisor',
+    payload: { ...approval, conversation_key: `web:${conversationId}` },
+  };
+}
+
+// Approvals live only in the event stream; one requested while the stream was down never reached this page.
+function missedApprovals(
+  state: ChatStoreState,
+  approvals: readonly AdminApproval[],
+  conversationId: string,
+  sessionIds: ReadonlySet<string>,
+): AdminApproval[] {
+  return approvals.filter((approval) => {
+    const sessionId = approval.session_id || '';
+    if (approval.status && approval.status !== 'pending') return false;
+    if (state.approvalBlockById[approval.approval_id]) return false;
+    return sessionIds.has(sessionId) || state.conversationIdsBySession[sessionId] === conversationId;
+  });
+}
+
+/**
+ * Re-reads one conversation from the server: history, child sessions, running tasks and
+ * pending approvals. Live messages are kept when events arrived during the request or a task
+ * is still running; otherwise the history replaces them.
+ */
+async function syncConversation(conversationId: string, set: StoreSetter, get: StoreGetter, settling = false): Promise<void> {
+  const sessionId = get().conversations.find((item) => item.id === conversationId)?.sessionId;
+  if (!sessionId) return;
+  const { generation, signal } = beginHistoryRequest(conversationId);
+  const revision = realtimeRevisions.get(conversationId) || 0;
+  const lifecycleRevision = lifecycleRevisions.get(conversationId) || 0;
+  const token = useSettingsStore.getState().adminToken;
+  patchHistoryView(set, conversationId, { loading: true, error: '', loadingOlder: false, olderError: '' });
+
+  const [history, children, running, admin] = await Promise.allSettled([
+    getSessionHistory(sessionId, { limit: HISTORY_PAGE_SIZE, signal }),
+    getSessionChildren(sessionId),
+    getSessionRunningTasks(sessionId),
+    token ? getAdminState(token) : Promise.resolve(null),
+  ]);
+  if (!finishHistoryRequest(conversationId, generation)) return;
+
+  // A session the server no longer knows runs nothing; any other failure leaves the flag as it is.
+  const runningTasks = running.status === 'fulfilled' ? running.value : isNotFound(running.reason) ? [] : null;
+  let replay: AdminApproval[] = [];
+  let keepLive = false;
+  let busy = false;
   set((state) => {
-    const conversationId = getChildConversationId(sessionId);
-    // [AutoC 2026-06-04] Why: hydrateStructuredHistory writes sessionId into
-    // conversationIdsBySession, which causes WS events for child sessions to be
-    // routed into the sidebar via syncConversationsAfterEvent, creating ghost
-    // entries with empty titles. How: hydrate into a temporary copy, extract only
-    // the message data we need (messagesById, messageOrderByConversation,
-    // toolExecutionsById), and discard the polluted conversationIdsBySession.
-    // Purpose: virtual child session view never contaminates the sidebar.
-    const hydrated = hydrateStructuredHistory(state, sessionId, conversationId, history, false);
-    const messages = selectOrderedMessagesFromState(hydrated, conversationId);
+    if (state.conversations.find((item) => item.id === conversationId)?.sessionId !== sessionId) {
+      return { historyByConversation: withHistoryView(state.historyByConversation, conversationId, { loading: false }) };
+    }
+    const realtimeMoved = (realtimeRevisions.get(conversationId) || 0) !== revision;
+    // A task event that arrived meanwhile is newer than this snapshot of the running tasks.
+    const lifecycleMoved = (lifecycleRevisions.get(conversationId) || 0) !== lifecycleRevision;
+    const running = runningTasks && !lifecycleMoved ? runningTasks.length > 0 : Boolean(state.generatingBySession[sessionId]);
+    busy = Boolean(state.sendingByConversation[conversationId]) || running;
+    keepLive = realtimeMoved || busy;
+
+    const generatingBySession = Boolean(state.generatingBySession[sessionId]) === running
+      ? state.generatingBySession
+      : { ...state.generatingBySession, [sessionId]: running };
+
+    let chat: ChatStoreState = state;
+    const view: Partial<HistoryView> = { loading: false, error: '' };
+    if (history.status === 'fulfilled') {
+      const applied = applyHistoryPage(state, conversationId, sessionId, history.value, 'latest', keepLive);
+      chat = applied.chat;
+      view.hasMore = applied.hasMore;
+      if (keepLive) unsettledConversations.add(conversationId);
+      else unsettledConversations.delete(conversationId);
+    } else {
+      view.error = errorMessage(history.reason, '历史消息加载失败');
+    }
+
+    let conversationIdsBySession = runningTasks ? seedBranchRoutes(chat.conversationIdsBySession, conversationId, runningTasks) : chat.conversationIdsBySession;
+    if (conversationIdsBySession[sessionId] !== conversationId) conversationIdsBySession = { ...conversationIdsBySession, [sessionId]: conversationId };
+    const routedState = { ...chat, conversationIdsBySession };
+    if (admin.status === 'fulfilled' && admin.value) {
+      const sessionIds = new Set([sessionId, ...(runningTasks || []).map((task) => task.branch_session_id).filter(Boolean)]);
+      replay = missedApprovals(routedState, admin.value.pending_approvals || [], conversationId, sessionIds);
+    }
+
     return {
-      // Only take message-level state, NOT conversationIdsBySession or conversations
-      messagesById: hydrated.messagesById,
-      messageOrderByConversation: hydrated.messageOrderByConversation,
-      toolExecutionsById: hydrated.toolExecutionsById,
-      childSessionMessages: {
-        ...state.childSessionMessages,
-        [sessionId]: messages,
-      },
+      ...routedState,
+      childNodes: children.status === 'fulfilled' ? mergeChildNodesFromSessionChildren(state, conversationId, children.value) : state.childNodes,
+      generatingBySession,
+      isGenerating: isConversationGenerating(state.conversations, state.activeConversationId, generatingBySession, state.isGenerating, state.sendingByConversation),
+      historyByConversation: withHistoryView(state.historyByConversation, conversationId, view),
     };
+  });
+
+  for (const approval of replay) applyRealtimeEvent(syntheticApprovalEvent(approval, conversationId), set, get);
+  // Live cards were kept although nothing runs any more: read once more so history becomes the source of truth.
+  if (keepLive && !busy && !settling) void syncConversation(conversationId, set, get, true);
+}
+
+async function loadChildHistory(childSessionId: string, set: StoreSetter, get: StoreGetter): Promise<void> {
+  const viewKey = getChildConversationId(childSessionId);
+  const { generation, signal } = beginHistoryRequest(viewKey);
+  const revision = realtimeRevisions.get(viewKey) || 0;
+  patchHistoryView(set, viewKey, { loading: true, error: '' });
+  try {
+    const page = await getSessionHistory(childSessionId, { limit: HISTORY_PAGE_SIZE, taskId: childViewTaskIds.get(childSessionId), signal });
+    if (!finishHistoryRequest(viewKey, generation)) return;
+    set((state) => {
+      const keepLive = (realtimeRevisions.get(viewKey) || 0) !== revision;
+      const { chat } = applyHistoryPage(state, viewKey, childSessionId, page, 'latest', keepLive);
+      // Only message tables: a child view must not register routes that would surface it in the sidebar.
+      return {
+        messagesById: chat.messagesById,
+        messageOrderByConversation: chat.messageOrderByConversation,
+        toolExecutionsById: chat.toolExecutionsById,
+        toolExecutionOrder: chat.toolExecutionOrder,
+        childSessionMessages: withChildMessages(state.childSessionMessages, childSessionId, selectOrderedMessagesFromState(chat, viewKey)),
+        // Child views are filtered by task, so they are never paged.
+        historyByConversation: withHistoryView(state.historyByConversation, viewKey, { loading: false, error: '', hasMore: false }),
+      };
+    });
+  } catch (error) {
+    if (!finishHistoryRequest(viewKey, generation)) return;
+    patchHistoryView(set, viewKey, { loading: false, error: errorMessage(error, '子会话历史加载失败') });
+  }
+}
+
+function sessionRowsToConversations(rows: readonly SessionListItem[]): ConversationMeta[] {
+  const titleCache = loadTitleCache();
+  const seen = new Set<string>();
+  const conversations: ConversationMeta[] = [];
+  for (const session of rows) {
+    // Entry branches are temporary runtime sessions of a parent conversation.
+    if (isEntryBranchSessionId(session.session_id)) continue;
+    const conversationId = normalizeConversationKey(session.conversation_key) || session.session_id;
+    // A bad runtime list can carry the parent and an internal row for the same conversation.
+    if (seen.has(conversationId)) continue;
+    seen.add(conversationId);
+    conversations.push({
+      id: conversationId,
+      sessionId: session.session_id,
+      // Generated titles exist only in this browser; the server only knows the conversation key.
+      title: titleCache[conversationId] || titleFromSession(session.conversation_key, session.session_id),
+      updatedAt: session.updated_at || session.created_at || new Date().toISOString(),
+    });
+  }
+  return conversations;
+}
+
+function mergeSessionPage(set: StoreSetter, rows: readonly SessionListItem[]) {
+  const incoming = sessionRowsToConversations(rows);
+  set((state) => {
+    const known = new Set(state.conversations.map((item) => item.id));
+    const added = incoming.filter((item) => !known.has(item.id));
+    if (added.length === 0) return state;
+    const conversationIdsBySession = { ...state.conversationIdsBySession };
+    for (const conversation of added) {
+      if (conversation.sessionId) conversationIdsBySession[conversation.sessionId] = conversation.id;
+    }
+    return { conversations: sortConversationsByRecency([...state.conversations, ...added]), conversationIdsBySession };
   });
 }
 
@@ -1826,80 +1420,22 @@ async function loadStartupSessions(set: StoreSetter, get: StoreGetter) {
   if (startupLoaded) return;
   startupLoaded = true;
   const generation = startupGeneration;
-  set({ startupError: '' });
+  set({ startupError: '', sessionPaging: { hasMore: false, loading: true, error: '' } });
 
-  const serverSessions = await listSessions('web', 50);
+  const rows = await listSessions('web', SESSION_PAGE_SIZE, 0);
   if (generation !== startupGeneration) return;
-  const userSessions = (serverSessions || []).filter((session) => !isEntryBranchSessionId(session.session_id));
-  if (userSessions.length === 0) {
-    startGlobalWebSocket(set, get);
-    return;
-  }
+  sessionOffset = rows.length;
+  mergeSessionPage(set, rows);
+  set((state) => ({
+    activeConversationId: state.activeConversationId || state.conversations[0]?.id || null,
+    // The server marks the last page by returning fewer rows than asked for.
+    sessionPaging: { hasMore: rows.length >= SESSION_PAGE_SIZE, loading: false, error: '' },
+  }));
 
-  const titleCache = loadTitleCache();
-  const seenConversationIds = new Set<string>();
-  const conversations = userSessions.flatMap((session): ConversationMeta[] => {
-    const conversationId = normalizeConversationKey(session.conversation_key) || session.session_id;
-    if (seenConversationIds.has(conversationId)) {
-      // [2026-06-03] Why: a bad runtime list can contain both parent and internal
-      // rows for the same web conversation. How: keep the first sorted row only.
-      // Purpose: the sidebar cannot render duplicate conversations for one session.
-      return [];
-    }
-    seenConversationIds.add(conversationId);
-    return [{
-      id: conversationId,
-      sessionId: session.session_id,
-      // [2026-06-02] Why: listSessions cannot return frontend-only generated
-      // titles. How: prefer the browser cache before falling back to session ids.
-      // Purpose: refresh keeps the user's readable sidebar title.
-      title: titleCache[conversationId] || titleFromSession(session.conversation_key, session.session_id),
-      updatedAt: session.updated_at || session.created_at || new Date().toISOString(),
-    }];
-  });
-
-  // [2026-06-03] Defensive title re-save: after building the conversations list
-  // from titleCache + server sessions, write the cache back. This ensures any
-  // titles that were restored from cache survive even if a subsequent WS event
-  // temporarily replaces the conversation list before user interaction.
-  const restoredCache = loadTitleCache();
-  let cacheUpdated = false;
-  for (const conv of conversations) {
-    if (conv.title && conv.title !== '新对话' && conv.title !== 'New conversation' && restoredCache[conv.id] !== conv.title) {
-      restoredCache[conv.id] = conv.title;
-      cacheUpdated = true;
-    }
-  }
-  if (cacheUpdated) saveTitleCache(restoredCache);
-
-  // [2026-06-03] Sort once on initial load so the sidebar opens with the most
-  // recently updated conversations on top, regardless of backend list order.
-  const sortedConversations = sortConversationsByRecency(conversations);
-  set((state) => {
-    const merged = sortConversationsByRecency([
-      ...state.conversations,
-      ...sortedConversations.filter(item => !state.conversations.some(current => current.id === item.id)),
-    ]);
-    return {
-      conversations: merged,
-      activeConversationId: state.activeConversationId || merged[0]?.id || null,
-      conversationIdsBySession: merged.reduce<Record<string, string>>((acc, conversation) => {
-        if (conversation.sessionId) acc[conversation.sessionId] = conversation.id;
-        return acc;
-      }, { ...state.conversationIdsBySession }),
-    };
-  });
-
-  // [2026-06-03] Why: realtime is now an all-session subscription that should
-  // exist as soon as the web app starts. How: open /v1/ws after session metadata
-  // has seeded session routing. Purpose: existing and future sessions can receive
-  // events without waiting for a selected task.
+  // Open the stream before reading history so nothing that happens during the read is lost.
   startGlobalWebSocket(set, get);
-
-  const first = sortedConversations[0];
-  if (first?.sessionId) {
-    await loadSessionHistoryIntoStore(first.id, first.sessionId, set, get);
-  }
+  const active = getActiveConversation(get());
+  if (active?.sessionId) await syncConversation(active.id, set, get);
 }
 
 export const useChatStore = create<ChatStoreState>((set, get) => ({
@@ -1907,9 +1443,10 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
   ...createStoreBase(),
 
   resetState: () => {
-    stopGlobalRealtimeConnection();
+    stopRealtimeAndHistory();
     startupLoaded = false;
     startupGeneration += 1;
+    sessionOffset = 0;
     autoApprovedApprovalIds.clear();
     saveAutoApproved(autoApprovedApprovalIds);
     set({
@@ -1922,23 +1459,13 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     if (id !== get().activeConversationId && !confirmNavigation()) return;
     const target = get().conversations.find((conversation) => conversation.id === id);
     set((state) => ({
-      // [2026-06-03] Why: multiple sessions can generate concurrently, so the
-      // composer lock must follow the selected session rather than a single global
-      // active task. How: recompute isGenerating from generatingBySession when the
-      // user switches chats. Purpose: switching away from a running session does not
-      // incorrectly disable another conversation.
+      // Several sessions can run at once; the composer lock follows the selected one.
       activeConversationId: id,
       viewingChildSessionId: null,
       isGenerating: Boolean(state.sendingByConversation[id]) || (target?.sessionId ? Boolean(state.generatingBySession[target.sessionId]) : false),
     }));
-    if (target?.sessionId) {
-      // [2026-06-03] Why: selecting a conversation is a view action, not a
-      // transport lifecycle action. How: load only the selected session history here
-      // and leave the long-lived global WebSocket to startup, sendMessage, and reset.
-      // Purpose: switching chats cannot accidentally create, replace, or recover a
-      // realtime connection outside the global connection lifecycle.
-      void loadSessionHistoryIntoStore(target.id, target.sessionId, set, get);
-    }
+    // Selecting only reads; the global stream is owned by startup, sending and reset.
+    if (target?.sessionId) void syncConversation(target.id, set, get);
   }),
 
   selectChildNodes: (conversationId) => {
@@ -1959,20 +1486,16 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     const trimmed = sessionId.trim();
     if (!trimmed) return;
     if (trimmed !== get().viewingChildSessionId && !confirmNavigation()) return;
-    // [AutoC 2026-06-04] Why: this is a virtual temporary session overlay — it must
-    // not pollute the sidebar conversation list or leave stale state from a previous
-    // virtual session. How: immediately set the new viewingChildSessionId and clear
-    // any cached messages for the new target so the UI shows a loading state while
-    // history is fetched. Purpose: switching between tasks in the monitor modal
-    // correctly replaces the chat stream.
+    const viewKey = getChildConversationId(trimmed);
+    // The task monitor reopens the same child with another task filter; start the view over instead of merging.
+    forgetHistory(viewKey);
+    childViewTaskIds.set(trimmed, taskId?.trim() || undefined);
     set((state) => ({
+      ...removeConversationMessages(state, viewKey),
       viewingChildSessionId: trimmed,
-      childSessionMessages: {
-        ...state.childSessionMessages,
-        [trimmed]: [],  // clear target to avoid showing stale data
-      },
+      childSessionMessages: { ...state.childSessionMessages, [trimmed]: [] },
     }));
-    void loadChildSessionHistoryIntoStore(trimmed, set, taskId?.trim() || undefined);
+    void loadChildHistory(trimmed, set, get);
   },
 
   exitChildSession: commandAction('session.exitChild', () => {
@@ -2011,21 +1534,16 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       if (generation !== startupGeneration || get().conversations.find(item => item.id === id)?.sessionId !== conversation.sessionId) {
         throw new Error('原会话已删除，但当前会话已变更；新上下文未移除');
       }
+      forgetHistory(id);
       set((state) => {
         const conversations = state.conversations.filter((item) => item.id !== id);
         const activeConversationId = state.activeConversationId === id ? conversations[0]?.id || null : state.activeConversationId;
         const nextChatState = removeConversationMessages(state, id);
+        // Branch and child sessions route to the parent too; a stale route would revive the deleted conversation.
         const conversationIdsBySession = Object.fromEntries(
-          // [2026-06-03] Why: child and branch sessions can be registered to the same
-          // parent conversation. How: remove every session route whose value is the
-          // deleted conversation id. Purpose: later global events cannot revive a
-          // deleted parent conversation through stale child-session mappings.
           Object.entries(nextChatState.conversationIdsBySession).filter(([, conversationId]) => conversationId !== id),
         );
         const childNodes = Object.fromEntries(
-          // [2026-06-03] Why: childNodes is keyed independently from conversations.
-          // How: drop entries grouped under the deleted parent conversation. Purpose:
-          // selectors cannot report stale scout/smith work after a chat is removed.
           Object.entries(state.childNodes).filter(([, child]) => child.parentConversationId !== id),
         );
 
@@ -2046,10 +1564,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
           generatingBySession,
           sendingByConversation,
           childNodes,
-          // [2026-06-03] Why: generation is tracked per session now. How: after a
-          // deletion chooses a new active conversation, derive the composer lock from
-          // that conversation's session flag. Purpose: deleting a running or old chat
-          // cannot leave the next selected chat incorrectly disabled.
+          historyByConversation: withoutHistoryView(state.historyByConversation, id),
           isGenerating: isConversationGenerating(conversations, activeConversationId, generatingBySession, false, sendingByConversation),
         };
       });
@@ -2059,6 +1574,8 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
   }),
 
   resetConversationView: (id, previousSessionId) => {
+    if (get().conversations.find(item => item.id === id)?.sessionId !== previousSessionId) return;
+    forgetHistory(id);
     set(state => {
       if (state.conversations.find(item => item.id === id)?.sessionId !== previousSessionId) return {};
       const conversations = state.conversations.map(item => item.id === id ? { ...item, sessionId: '' } : item);
@@ -2069,6 +1586,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         ...removeConversationMessages(state, id), conversations, childNodes, generatingBySession, sendingByConversation,
         conversationIdsBySession: Object.fromEntries(Object.entries(state.conversationIdsBySession).filter(([, conversationId]) => conversationId !== id)),
         viewingChildSessionId: state.viewingChildSessionId && state.childNodes[state.viewingChildSessionId]?.parentConversationId === id ? null : state.viewingChildSessionId,
+        historyByConversation: withoutHistoryView(state.historyByConversation, id),
         isGenerating: isConversationGenerating(conversations, state.activeConversationId, generatingBySession, false, sendingByConversation),
       };
     });
@@ -2121,13 +1639,13 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
 
     let sessionId = '';
     try {
-      // Upload files that have a raw File object, then collect server paths
+      // Files picked in this browser are uploaded first; the inbound message carries their workspace paths.
       let uploadedAttachments: { name: string; size: number; type?: string; path?: string; mime_type?: string }[] | undefined;
       if (attachments && attachments.length > 0) {
         const uploaded = await Promise.all(
           attachments.map(async (attachment: Attachment) => {
             if (attachment.file) {
-              const result = await uploadAttachment(attachment.file, conversationKey, useSettingsStore.getState().adminToken || '');
+              const result = await uploadAttachment(attachment.file, conversationKey);
               return {
                 name: result.name,
                 size: result.size,
@@ -2156,20 +1674,14 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         entry_node_id: entryNodeId,
       });
       sessionId = result.session_id;
-      // [2026-06-03] Optimistic user message injection. Why: the global WS may
-      // take a moment to deliver the inbound_message event, leaving the chat
-      // visually empty after the user presses send. How: construct a WsMessage
-      // with the same ID format that applyInboundMessage would use, then upsert
-      // it into the store immediately. Purpose: when the real inbound_message
-      // arrives via WS, the existing-branch merge (L201-209 in eventReducer)
-      // will update the message in place without duplication.
+      // Shown before the inbound_message echo; the id matches the reducer's, so the echo updates it in place.
       const inboundSeq = result.inbound_seq;
       if (inboundSeq != null) {
         const optimisticId = `message:${conversationId}:user:inbound:${inboundSeq}`;
         const now = new Date().toISOString();
         set((current) => {
-          // Skip if reducer already processed the real event
           if (current.messagesById[optimisticId]) return current;
+          bumpRealtimeRevision(conversationId);
           return {
             ...current,
             messagesById: {
@@ -2193,7 +1705,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
                   updatedAt: now,
                   eventIds: [],
                 }],
-                attachments: (uploadedAttachments || []).map(a => ({ name: a.name, url: a.path || '' })),
+                attachments: (uploadedAttachments || []).map(({ name, size, type, path, mime_type }) => ({ name, size, type, path, mime_type })),
                 eventIds: [],
               },
             },
@@ -2212,10 +1724,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         });
       }
     } catch (error) {
-      // [2026-06-03] Why: an inbound HTTP failure is not proof that the global
-      // WebSocket is closed. How: clear only the optimistic generating flag and keep
-      // an already-open realtime status intact. Purpose: one failed send cannot make
-      // the all-session event stream look disconnected.
+      // A failed send says nothing about the global stream; an open connection stays marked open.
       set((current) => ({
         isGenerating: isConversationGenerating(current.conversations, current.activeConversationId, current.generatingBySession, false, { ...current.sendingByConversation, [conversationId]: false }),
         sendingByConversation: { ...current.sendingByConversation, [conversationId]: false },
@@ -2246,10 +1755,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       isGenerating: isConversationGenerating(current.conversations.map(item => item.id === conversationId ? { ...item, sessionId } : item), current.activeConversationId, { ...current.generatingBySession, [sessionId]: true }, false, { ...current.sendingByConversation, [conversationId]: false }),
     }));
 
-    // [2026-06-03] Why: sending a message should not replace another session's
-    // realtime listener. How: keep the existing global /v1/ws connection or open it
-    // if this is the first message in the tab. Purpose: multiple sessions can run
-    // concurrently through one event stream.
+    // Keeps the one global stream, or opens it if this is the tab's first message.
     startGlobalWebSocket(set, get);
   },
 
@@ -2278,7 +1784,71 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     void loadStartupSessions(set, get).catch(error => {
       if (generation !== startupGeneration) return;
       startupLoaded = false;
-      set({ startupError: error instanceof Error ? error.message : '加载会话失败，请重试' });
+      set({
+        startupError: errorMessage(error, '加载会话失败，请重试'),
+        sessionPaging: { hasMore: false, loading: false, error: '' },
+      });
     });
   },
+
+  loadMoreConversations: async () => {
+    const paging = get().sessionPaging;
+    if (paging.loading || !paging.hasMore) return;
+    const generation = startupGeneration;
+    set({ sessionPaging: { ...paging, loading: true, error: '' } });
+    try {
+      const rows = await listSessions('web', SESSION_PAGE_SIZE, sessionOffset);
+      if (generation !== startupGeneration) return;
+      sessionOffset += rows.length;
+      mergeSessionPage(set, rows);
+      set({ sessionPaging: { hasMore: rows.length >= SESSION_PAGE_SIZE, loading: false, error: '' } });
+    } catch (error) {
+      if (generation !== startupGeneration) return;
+      set((state) => ({ sessionPaging: { ...state.sessionPaging, loading: false, error: errorMessage(error, '更多对话加载失败') } }));
+    }
+  },
+
+  loadOlderHistory: async () => {
+    const state = get();
+    const conversationId = state.activeConversationId;
+    if (!conversationId || state.viewingChildSessionId) return;
+    const sessionId = state.conversations.find((item) => item.id === conversationId)?.sessionId;
+    const cached = historyCaches.get(conversationId);
+    const view = state.historyByConversation[conversationId] || IDLE_HISTORY;
+    const before = cached?.window.rows[0]?.cursor;
+    if (!sessionId || cached?.sessionId !== sessionId || !cached.window.hasMore || typeof before !== 'number') return;
+    if (view.loading || view.loadingOlder) return;
+
+    const { generation, signal } = beginHistoryRequest(conversationId);
+    patchHistoryView(set, conversationId, { loadingOlder: true, olderError: '' });
+    try {
+      const page = await getSessionHistory(sessionId, { limit: HISTORY_PAGE_SIZE, before, signal });
+      if (!finishHistoryRequest(conversationId, generation)) return;
+      set((current) => {
+        if (current.conversations.find((item) => item.id === conversationId)?.sessionId !== sessionId) {
+          return { historyByConversation: withHistoryView(current.historyByConversation, conversationId, { loadingOlder: false }) };
+        }
+        const { chat, hasMore } = applyHistoryPage(current, conversationId, sessionId, page, 'older', true);
+        return { ...chat, historyByConversation: withHistoryView(current.historyByConversation, conversationId, { loadingOlder: false, hasMore }) };
+      });
+    } catch (error) {
+      if (!finishHistoryRequest(conversationId, generation)) return;
+      patchHistoryView(set, conversationId, { loadingOlder: false, olderError: errorMessage(error, '更早的消息加载失败') });
+    }
+  },
+
+  retryHistory: () => {
+    const state = get();
+    if (state.viewingChildSessionId) {
+      void loadChildHistory(state.viewingChildSessionId, set, get);
+      return;
+    }
+    if (state.activeConversationId) void syncConversation(state.activeConversationId, set, get);
+  },
 }));
+
+/** History state of whatever the message list currently shows. */
+export function selectVisibleHistory(state: ChatStoreState): HistoryView {
+  const viewKey = state.viewingChildSessionId ? getChildConversationId(state.viewingChildSessionId) : state.activeConversationId;
+  return (viewKey && state.historyByConversation[viewKey]) || IDLE_HISTORY;
+}

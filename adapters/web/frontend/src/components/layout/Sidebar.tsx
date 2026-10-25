@@ -11,6 +11,7 @@ import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
 import { getChildNodeStatusLabel, Icon, StatusDot } from '../common';
 import { Button } from '../settings/pages/settingsControls';
+import { errorMessage } from '../../api/request';
 
 interface SidebarProps {
   conversations: ConversationMeta[];
@@ -26,6 +27,20 @@ const formatTime = (isoDate: string) => {
   return Number.isNaN(date.getTime()) ? '时间未知' : new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(date);
 };
 
+// A finished child stays in the tree this long so its final status can still be seen.
+const CHILD_ROW_LINGER_MS = 30_000;
+
+function nextChildRowExpiry(childNodes: Readonly<Record<string, ChildNodeState>>, now: number): number | null {
+  let next: number | null = null;
+  for (const child of Object.values(childNodes)) {
+    if (!child.completedAt) continue;
+    const expiry = new Date(child.completedAt).getTime() + CHILD_ROW_LINGER_MS;
+    if (Number.isNaN(expiry) || expiry <= now) continue;
+    if (next === null || expiry < next) next = expiry;
+  }
+  return next;
+}
+
 function groupChildNodesByConversation(
   childNodes: Readonly<Record<string, ChildNodeState>>,
   conversations: ConversationMeta[],
@@ -40,11 +55,10 @@ function groupChildNodesByConversation(
 
   Object.values(childNodes).forEach((child) => {
     if (!knownConversationIds.has(child.parentConversationId)) return;
-    // [AutoC 2026-06-04] Filter out system nodes and stale terminal nodes.
     if (child.nodeId.startsWith('system.')) return;
     if (child.completedAt) {
       const elapsed = now - new Date(child.completedAt).getTime();
-      if (elapsed > 30_000) return;
+      if (elapsed > CHILD_ROW_LINGER_MS) return;
     }
     grouped[child.parentConversationId] = [...(grouped[child.parentConversationId] || []), child];
   });
@@ -67,21 +81,26 @@ export const Sidebar = ({
   const viewChildSession = useChatStore(state => state.viewChildSession);
   const startupError = useChatStore(state => state.startupError);
   const loadStartup = useChatStore(state => state.loadStartup);
+  const sessionPaging = useChatStore(state => state.sessionPaging);
+  const loadMoreConversations = useChatStore(state => state.loadMoreConversations);
   const [now, setNow] = useState(Date.now);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const deleting = useRef(false);
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
+  // One timer for the next finished child to drop out of the tree, instead of re-rendering every second.
   useEffect(() => {
-    if (!Object.values(childNodeMap).some(child => child.completedAt)) return;
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, [childNodeMap]);
+    const current = Date.now();
+    const expiry = nextChildRowExpiry(childNodeMap, current);
+    if (expiry === null) return undefined;
+    const timer = setTimeout(() => setNow(Date.now()), expiry - current);
+    return () => clearTimeout(timer);
+  }, [childNodeMap, now]);
   const remove = async (conversation: ConversationMeta) => {
     if (deleting.current || !window.confirm(`删除“${conversation.title}”及其上下文？此操作无法撤销。`)) return;
     deleting.current = true; setPendingDelete(conversation.id); setError('');
     try { await onDeleteConversation(conversation.id); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : '删除失败，请重试。'); }
+    catch (reason) { setError(errorMessage(reason, '删除失败，请重试。')); }
     finally { deleting.current = false; setPendingDelete(null); }
   };
   const visible = conversations.filter(conversation => conversation.title.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()));
@@ -116,7 +135,9 @@ export const Sidebar = ({
           <Button tone="quiet" className="w-full" onClick={loadStartup}>重试加载</Button>
         </div>}
         {visible.length === 0 && !startupError && (
-          <p className="p-3 text-center text-xs text-[var(--duties-tertiary)]">{search ? '没有匹配的对话' : '暂无对话'}</p>
+          <p className="p-3 text-center text-xs text-[var(--duties-tertiary)]">
+            {search ? (sessionPaging.hasMore ? '已加载的对话里没有匹配的，可以先加载更多对话' : '没有匹配的对话') : '暂无对话'}
+          </p>
         )}
         {visible.map((conv) => {
           const isActive = conv.id === activeConversationId;
@@ -198,6 +219,14 @@ export const Sidebar = ({
             </div>
           );
         })}
+        {(sessionPaging.hasMore || sessionPaging.error) && <div className="mx-3 my-3 space-y-2">
+          {sessionPaging.error && <p className="break-words text-sm text-[var(--duties-danger)]" role="alert">{sessionPaging.error}</p>}
+          {sessionPaging.hasMore && (
+            <Button tone="quiet" className="w-full" loading={sessionPaging.loading} onClick={() => void loadMoreConversations()}>
+              加载更多对话
+            </Button>
+          )}
+        </div>}
       </nav>
 
       {/* Bottom — connection status + settings */}

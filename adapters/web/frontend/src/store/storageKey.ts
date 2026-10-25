@@ -1,5 +1,5 @@
 // localStorage 按实例分家：多开时几个号共用一个域名，也就共用同一份 localStorage。
-import { MOUNT } from '../api/supervisorClient';
+import { MOUNT } from '../instances/paths';
 
 /**
  * 给 key 打上实例烙印。单实例时 MOUNT 为空，key 逐字不变，老数据照常读得到。

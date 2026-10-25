@@ -216,17 +216,24 @@ describe('服务端策略也按指纹保存', () => {
 });
 
 describe('认出编辑冲突', () => {
-  it.each(['409', '409 config.yaml 已被别处改过，刷新后再改'])('以 409 打头才算：%s', message => {
-    expect(api.isEditConflict(new Error(message))).toBe(true);
+  // 判错只看响应的状态码：报错文字里恰好带着 409 的（网关拼错、上游转述）都不算。
+  it('服务器回 409 才算', () => {
+    expect(api.isEditConflict(new api.ApiError(409, 'config.yaml 已被别处改过，刷新后再改'))).toBe(true);
+    expect(api.isEditConflict(new api.ApiError(409, ''))).toBe(true);
   });
 
-  it.each(['4090 网关把状态码拼错了', '409500', '500 上游返回 409', 'Upload failed: 409'])('%s 不算', message => {
+  it.each(['409', '409 config.yaml 已被别处改过，刷新后再改', '4090 网关把状态码拼错了', '500 上游返回 409'])('只是文字里带着 409 不算：%s', message => {
     expect(api.isEditConflict(new Error(message))).toBe(false);
+  });
+
+  it('别的状态码不算', () => {
+    expect(api.isEditConflict(new api.ApiError(500, '上游返回 409'))).toBe(false);
+    expect(api.isEditConflict(new api.ApiError(404, ''))).toBe(false);
   });
 
   it('不是 Error 的一律不算', () => {
     expect(api.isEditConflict('409')).toBe(false);
-    expect(api.isEditConflict({ message: '409' })).toBe(false);
+    expect(api.isEditConflict({ status: 409 })).toBe(false);
     expect(api.isEditConflict(null)).toBe(false);
   });
 
@@ -237,7 +244,31 @@ describe('认出编辑冲突', () => {
     const failure = await api.updateConfigRaw(TOKEN, 'a: 2\n', 'h1').catch(error => error);
 
     expect(api.isEditConflict(failure)).toBe(true);
+    expect(failure).toMatchObject({ status: 409, detail: 'config.yaml 已被别处改过，刷新后再改' });
     expect(String(failure.message)).toBe('409 config.yaml 已被别处改过，刷新后再改');
+  });
+
+  it('保存校验不过的 400 原样带回原因，什么都没写', async () => {
+    statuses[key('PUT', `/v1${RUNTIME}`)] = 400;
+    routes[key('PUT', `/v1${RUNTIME}`)] = { detail: 'engine 要写成映射' };
+
+    const failure = await api.updateRuntimeRaw(TOKEN, 'engine: 1\n', 'r1').catch(error => error);
+
+    expect(failure).toMatchObject({ status: 400, detail: 'engine 要写成映射', message: '400 engine 要写成映射' });
+  });
+
+  it('保存通过但带着提醒时，回执里一条不少', async () => {
+    serveWrite('/admin/config/schedules/raw', { ok: true, hash: 's2', warnings: ['第 3 条没有 id，调度时会跳过'] });
+
+    await expect(api.updateSchedulesRaw(TOKEN, 'schedules: []\n', 's1'))
+      .resolves.toEqual({ ok: true, hash: 's2', warnings: ['第 3 条没有 id，调度时会跳过'] });
+  });
+
+  it('新建节点的回执也带着提醒', async () => {
+    routes[key('POST', '/v1/admin/config/nodes')] = { ok: true, hash: 'n1', path: 'config/nodes/x.yaml', warnings: ['这些键没有任何地方读：foo'] };
+
+    await expect(api.createNode(TOKEN, { id: 'x', content: 'id: x\nfoo: 1\n' }))
+      .resolves.toEqual({ ok: true, hash: 'n1', warnings: ['这些键没有任何地方读：foo'] });
   });
 });
 

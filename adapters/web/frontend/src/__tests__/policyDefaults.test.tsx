@@ -148,7 +148,7 @@ describe('实例默认与逐项继承的读写合同', () => {
   });
   it('409保留草稿与旧版本，重载可取消，确认后才获取新快照', async () => {
     const original = vi.mocked(featureRequest).getMockImplementation()!;
-    vi.mocked(featureRequest).mockImplementation(async (path, options) => { if (options?.method === 'PATCH') throw Error('409 设置版本已变化'); return original(path, options); });
+    vi.mocked(featureRequest).mockImplementation(async (path, options) => { if (options?.method === 'PATCH') throw new api.ApiError(409, '设置版本已变化'); return original(path, options); });
     render(<ConversationSettings scope={group} />); await screen.findByLabelText(windowLabel); custom(windowLabel);
     fireEvent.change(screen.getByLabelText(windowLabel), { target: { value: '2.5' } });
     fireEvent.click(screen.getByRole('button', { name: '保存会话覆盖' }));
@@ -167,6 +167,25 @@ describe('实例默认与逐项继承的读写合同', () => {
     custom(windowLabel); fireEvent.change(screen.getByLabelText(windowLabel), { target: { value: '2' } });
     fireEvent.click(screen.getByRole('button', { name: '保存会话覆盖' })); await screen.findByText('会话覆盖已保存。');
     expect(mutations().at(-1)?.[1]?.body).toMatchObject({ expected_defaults_revision: 9 });
+  });
+  // 只有服务端回 409 才是版本冲突；校验不过的 422 原因里恰好写着"冲突"，改完照样能再存，不用重新载入丢草稿。
+  it('等待值校验不过的422不当成版本冲突，草稿留着可以直接重存', async () => {
+    const original = vi.mocked(featureRequest).getMockImplementation()!; let first = true;
+    const rejected = '实例默认会与 2 个会话的等待时间覆盖冲突，请先调整相关覆盖，或同时修改两个等待值；此次修改未保存';
+    vi.mocked(featureRequest).mockImplementation(async (path, options) => {
+      if (first && options?.method === 'PATCH') { first = false; throw new api.ApiError(422, rejected); }
+      return original(path, options);
+    });
+    render(<ConversationSettings />);
+    fireEvent.change(await screen.findByLabelText(windowLabel), { target: { value: '3' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存实例默认配置' }));
+    expect(await screen.findByText(`422 ${rejected}`)).toBeInTheDocument();
+    expect(screen.getByLabelText(windowLabel)).toHaveValue('3');
+    expect(screen.getByRole('button', { name: '保存实例默认配置' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: '保存实例默认配置' }));
+    await screen.findByText('实例默认配置已保存；已有会话覆盖保持不变。');
+    expect(mutations()).toHaveLength(2);
+    expect(defaults.values).toEqual({ merge_window_sec: 3 });
   });
   it('刷新判定发现默认版本变化时保留草稿并禁保存，不悄悄rebase', async () => {
     render(<ConversationSettings scope={group} />); await screen.findByLabelText(windowLabel); custom(windowLabel);

@@ -12,15 +12,14 @@ import {
   type EffectiveTool,
   updateNodeRaw,
 } from '../../../api/supervisorClient';
-import {
-  NodeYamlShapeError,
-  upsertYamlList,
-  upsertYamlNested,
-} from '../../../console/nodeYaml';
+import { commitYamlKeys } from '../../../console/yamlCommit';
+import type { YamlKeyEdit } from '../../../console/yamlRewrite';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskLabel } from '../../../utils/toolRisk';
 import { Block, Button, Check, Empty, ErrorText, Facts, Footnote, Input, Item, ItemTitle, List, SaveBar, Segmented, StatusText, Tag } from './settingsControls';
+import { savedMessage } from '../../../utils/sentence';
+import { errorMessage } from '../../../api/request';
 
 type Mode = 'none' | 'all' | 'allowlist';
 
@@ -256,22 +255,22 @@ const NodeRow = ({ node, tools, onSaved }: {
     setBusy(true);
     setMessage('');
     try {
-      const file = await getNodeRaw(adminToken, node.id);
+      // 另一半名单（allowlist 下的 deny、all 下的 allow）不动：换回那个模式时它还在。
+      const edits: YamlKeyEdit[] = [{ path: ['tool_access', 'mode'], value: mode }];
+      if (mode === 'allowlist') edits.push({ path: ['tool_access', 'allow'], value: allow });
+      if (mode === 'all') edits.push({ path: ['tool_access', 'deny'], value: deny });
+      const { note, result } = await commitYamlKeys({
+        read: () => getNodeRaw(adminToken, node.id),
+        write: (content, hash) => updateNodeRaw(adminToken, node.id, content, hash),
+        edits,
+        proceed: () => !tokenChanged(adminToken),
+      });
       if (tokenChanged(adminToken)) return;
-      let next = upsertYamlNested(file.content, ['tool_access', 'mode'], mode);
-      if (mode === 'allowlist') next = upsertYamlList(next, ['tool_access', 'allow'], allow);
-      if (mode === 'all') next = upsertYamlList(next, ['tool_access', 'deny'], deny);
-      await updateNodeRaw(adminToken, node.id, next, file.hash);
-      if (tokenChanged(adminToken)) return;
-      setMessage('已保存，下一个任务即生效');
+      setMessage(savedMessage('已保存，下一个任务即生效。', note, result.warnings));
       onSaved();
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(
-        error instanceof NodeYamlShapeError
-          ? `${error.message}（请到「节点文件」页改原文）`
-          : error instanceof Error ? error.message : '保存失败',
-      );
+      setMessage(errorMessage(error, '保存失败'));
     } finally {
       setBusy(false);
     }
@@ -397,7 +396,7 @@ export const NodeGrantsSection = () => {
       setTools(toolNames);
       setMessage('');
     } catch (error) {
-      if (version === generation.current) setMessage(error instanceof Error ? error.message : '读取节点失败');
+      if (version === generation.current) setMessage(errorMessage(error, '读取节点失败'));
     }
   };
 

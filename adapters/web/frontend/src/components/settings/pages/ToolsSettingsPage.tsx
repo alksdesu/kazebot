@@ -14,6 +14,8 @@ import { AutoApproveSection } from './AutoApproveSection';
 import { NodeGrantsSection } from './NodeGrantsSection';
 import { PolicyRulesSection } from './PolicyRulesSection';
 import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
+import { savedMessage } from '../../../utils/sentence';
+import { errorMessage } from '../../../api/request';
 
 function defaultToolScript(name: string): string {
   // [2026-06-02] Provide a safe external-tool starter file. Why: Supervisor expects
@@ -74,7 +76,7 @@ const ToolInventorySection = () => {
       return items;
     } catch (error) {
       if (version !== generation.current) return undefined;
-      setLoadError(error instanceof Error ? error.message : '加载工具失败');
+      setLoadError(errorMessage(error, '加载工具失败'));
       return undefined;
     } finally {
       if (version === generation.current) setLoading(false);
@@ -105,16 +107,16 @@ const ToolInventorySection = () => {
     if (!name) { setMessage('请输入工具名称'); return; }
     if (!confirmNavigation()) return;
     try {
-      await createTool(adminToken, { id: name, content: defaultToolScript(name) });
+      const result = await createTool(adminToken, { id: name, content: defaultToolScript(name) });
       if (tokenChanged(adminToken)) return;
       setNewName('');
-      setMessage('工具已创建，请在右栏编辑 Python 脚本。');
+      setMessage(savedMessage('工具已创建，请在右栏编辑 Python 脚本。', '', result.warnings));
       await load();
       if (tokenChanged(adminToken)) return;
       setSelectedTool({ name, source: 'external', editable: true, description: '通过设置页面创建的工具。', input_schema: { type: 'object', properties: {} }, timeout_sec: 30, has_spec: true, origin: 'custom' });
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '创建工具失败');
+      setMessage(errorMessage(error, '创建工具失败'));
     }
   });
   // 没声明来源的外部工具是老版本后端给的，那时它们都放在可以直接删的 tools/ 下。
@@ -136,7 +138,7 @@ const ToolInventorySection = () => {
       if (restored) setSelectedTool(restored);
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : `${removal.label}失败`);
+      setMessage(errorMessage(error, `${removal.label}失败`));
     }
   });
   const reload = () => run(async () => {
@@ -149,7 +151,7 @@ const ToolInventorySection = () => {
       await load();
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '重载工具失败');
+      setMessage(errorMessage(error, '重载工具失败'));
     }
   });
   const keyword = query.trim().toLowerCase();

@@ -7,11 +7,10 @@ import { useSettingsStore } from '../store/settingsStore';
 import { useViewStore } from '../store/viewStore';
 import { Block, Empty, ErrorText, Facts, LinkButton, Panel, ReadOnlyRow } from './components';
 import { SYSTEM_SLOTS_ANCHOR } from './SystemSlots';
+import { errorMessage } from '../api/request';
 
 const CHANNELS_TAB = 'providers';
 const SLOT_HREF = `?view=settings&tab=${CHANNELS_TAB}#${SYSTEM_SLOTS_ANCHOR}`;
-
-const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');
 
 export const VisionChannelBlock = () => {
   const adminToken = useSettingsStore((state) => state.adminToken);
@@ -26,7 +25,7 @@ export const VisionChannelBlock = () => {
       try {
         const data = await getSystemModels(adminToken);
         setSlot(data.slots.find((item) => item.key === 'image') || null);
-      } catch (caught) { setError(say(caught)); }
+      } catch (caught) { setError(errorMessage(caught)); }
       setLoaded(true);
     })();
   }, [adminToken]);

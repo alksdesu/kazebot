@@ -14,6 +14,7 @@ import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { firstMatchIndex } from '../../../utils/globMatch';
 import { Button, DangerPanel, SaveBar, ScopeBadge } from './settingsControls';
+import { errorMessage } from '../../../api/request';
 
 type RuleSectionKey = 'read_file' | 'write_file';
 type TabKey = RuleSectionKey | 'execute_command' | 'restart';
@@ -479,7 +480,7 @@ export const PolicyRulesSection = () => {
         setCodeWriteRequested(false);
       })
       .catch((error) => {
-        if (alive) setMessage(error instanceof Error ? error.message : '读取策略失败');
+        if (alive) setMessage(errorMessage(error, '读取策略失败'));
       });
     return () => { alive = false; };
   }, [adminToken, isAuthenticated, generation]);
@@ -506,7 +507,7 @@ export const PolicyRulesSection = () => {
           await enableCodeWrite(adminToken);
           setMessage('策略已保存，已提交 /opt/kazebot 写入权限并重启 miaomiao');
         } catch (error) {
-          setMessage(`策略已保存，但代码目录写权限未启用：${error instanceof Error ? error.message : '宿主机操作失败'}`);
+          setMessage(`策略已保存，但代码目录写权限未启用：${errorMessage(error, '宿主机操作失败')}`);
         }
       } else {
         setMessage('已保存，立即生效，不用重启');
@@ -515,7 +516,7 @@ export const PolicyRulesSection = () => {
       if (tokenChanged(adminToken)) return;
       setMessage(isEditConflict(error)
         ? '策略在打开之后被别处改过，没有保存：点「丢弃」读入最新内容，再把改动重做一遍。'
-        : error instanceof Error ? error.message : '保存失败');
+        : errorMessage(error, '保存失败'));
     } finally {
       setBusy(false);
     }

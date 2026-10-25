@@ -6,6 +6,7 @@ import { usePageNotice } from '../hooks/usePageNotice';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Button, Footnote, Input } from './components';
 import { usePlatform } from './platformContext';
+import { errorMessage } from '../api/request';
 
 const TEXT = 'mt-1.5 break-words text-xs leading-relaxed';
 const KW = 'mt-1 break-words font-mono text-mini text-[var(--duties-secondary)]';
@@ -16,7 +17,6 @@ const FIELD = 'flex items-center gap-2';
 const LABEL = 'w-14 flex-none text-xs text-[var(--duties-secondary)]';
 const ID = 'font-mono text-xs';
 
-const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');
 const scopeName = (scope: string): string => scope || '无归属';
 // 和后端 format_store_counts 同一个说法。
 const storeSummary = (stores: Record<string, ScopeStoreCount>): string => Object.values(stores)
@@ -45,7 +45,7 @@ export const AccountScope = () => {
       setStatus(result);
       setPreviewTarget(withTarget);
       setLoadError('');
-    } catch (error) { if (version === requestVersion.current) setLoadError(say(error)); }
+    } catch (error) { if (version === requestVersion.current) setLoadError(errorMessage(error)); }
     finally { if (version === requestVersion.current) setBusy(false); }
   };
 
@@ -69,7 +69,7 @@ export const AccountScope = () => {
       const result = await migrateAccountScope(adminToken, platformId, to, from);
       setMessage(`已搬迁 ${result.moved_memory_dirs} 份记忆、${result.sessions_changed} 个会话。备份在 ${result.backup_dir}`);
       await load();
-    } catch (error) { setMessage(say(error)); } finally { setBusy(false); }
+    } catch (error) { setMessage(errorMessage(error)); } finally { setBusy(false); }
   };
 
   const current = previewTarget && previewTarget === target.trim();

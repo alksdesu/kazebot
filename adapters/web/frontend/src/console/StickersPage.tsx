@@ -8,13 +8,14 @@ import {
   importStickers,
   listStickers,
   recaptionStickers,
-  stickerImageHref,
+  stickerImageUrl,
   updateSticker,
   uploadSticker,
   type Sticker,
   type StickerCounts,
   type StickerState,
 } from '../api/supervisorClient';
+import { AuthorizedImage } from '../components/common/AuthorizedImage';
 import { usePageNotice } from '../hooks/usePageNotice';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { tokenChanged, useSettingsStore } from '../store/settingsStore';
@@ -34,6 +35,7 @@ import {
 import { StandaloneFeatureSection, STICKER_LIBRARY_SECTION } from './FeatureSection';
 import { sizeText } from './format';
 import { VisionChannelBlock } from './VisionChannelBlock';
+import { errorMessage } from '../api/request';
 
 const PAGE_SIZE = 60;
 
@@ -68,8 +70,6 @@ const EMPTY_COUNTS: StickerCounts = {
 };
 
 const EMPTY_DRAFT = { name: '', tags: '', override: false };
-
-const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');
 
 const splitTags = (text: string): string[] =>
   text.split(/[,，]/).map((item) => item.trim()).filter(Boolean);
@@ -114,7 +114,7 @@ const LibraryBlock = () => {
       setItems(page.items);
       setCounts(page.counts);
       setLoadError('');
-    } catch (error) { if (version === generation.current) setLoadError(say(error)); }
+    } catch (error) { if (version === generation.current) setLoadError(errorMessage(error)); }
   };
 
   useEffect(() => { void load(); return () => { generation.current += 1; }; }, [adminToken, tab, search, offset]);
@@ -142,7 +142,7 @@ const LibraryBlock = () => {
       setMessage(done);
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(say(error));
+      setMessage(errorMessage(error));
     } finally {
       setBusy(false);
     }
@@ -226,11 +226,11 @@ const LibraryBlock = () => {
       key={row.sha256}
     >
       {/* 表情包长宽参差，定高加 contain 才对得成网格；底色衬出透明图的边界。 */}
-      <img
+      <AuthorizedImage
         alt={row.name || row.sha256.slice(0, 8)}
         className="h-[var(--duties-thumb-height)] w-full bg-[var(--duties-muted)] object-contain"
-        loading="lazy"
-        src={stickerImageHref(row.sha256, adminToken)}
+        lazy
+        source={stickerImageUrl(row.sha256)}
       />
       <figcaption className="flex min-w-0 flex-col gap-1">
         <span className="truncate text-xs font-medium">{row.name || '未命名'}</span>

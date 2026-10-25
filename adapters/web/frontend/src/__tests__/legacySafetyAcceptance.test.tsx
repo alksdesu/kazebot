@@ -6,8 +6,20 @@ import { ApprovalCard } from '../components/chat/ApprovalCard';
 import { ChatInput } from '../components/chat/ChatInput';
 import { NodeFilesSettingsPage } from '../components/settings/pages/NodeFilesSettingsPage';
 import { AgentsSettingsRightPanel, AutomationSettingsRightPanel } from '../components/settings/panels/SettingsContextPanels';
-import { hasLikelyYamlSyntaxIssue } from '../components/settings/settingsStructuredConfig';
-import { parseMcpClients, parseNodeConfig, parseSchedules, serializeMcpClients, serializeNodeConfig, serializeSchedules } from '../components/settings/settingsStructuredConfig';
+import { hasLikelyYamlSyntaxIssue, type ScheduleFormState } from '../components/settings/settingsStructuredConfig';
+import {
+  mcpClientCreateEdits,
+  mcpClientRemoveEdits,
+  mcpClientUpdateEdits,
+  parseMcpClients,
+  parseNodeConfig,
+  parseSchedules,
+  scheduleCreateEdits,
+  scheduleRemoveEdits,
+  scheduleUpdateEdits,
+  serializeNodeConfig,
+} from '../components/settings/settingsStructuredConfig';
+import { editYamlKeys } from '../console/yamlRewrite';
 import { platformScope } from '../console/configScope';
 import { confirmationNote, platformConsoleStore } from '../console/consoleStore';
 import { useSettingsSelectionStore } from '../store/settingsSelectionStore';
@@ -85,8 +97,9 @@ describe('composer and approval failure integrity', () => {
   });
 
   it('does not turn a failed approval request into a denial and permits retry', async () => {
-    const request = deferred<void>();
-    vi.mocked(api.decideApproval).mockReturnValueOnce(request.promise).mockResolvedValueOnce(undefined);
+    const request = deferred<api.AdminApproval>();
+    vi.mocked(api.decideApproval).mockReturnValueOnce(request.promise)
+      .mockResolvedValueOnce({ approval_id: 'approval', operation: 'synthetic', status: 'allowed' });
     render(<ApprovalCard approval={{ id: 'approval', status: 'pending', operation: 'synthetic', details: {} }} />);
     fireEvent.click(screen.getByRole('button', { name: '允许' }));
     expect(screen.getByRole('button', { name: '拒绝' })).toBeDisabled();
@@ -99,32 +112,50 @@ describe('composer and approval failure integrity', () => {
 });
 
 describe('configuration preservation', () => {
+  const blankSchedule = (id: string): ScheduleFormState => ({
+    id, cron: '0 0 * * *', type: 'message', text: '', command: '', enabled: false, once: false,
+    conversation_key: '', entry_node_id: '', workflow_id: '', timeout: '', silent: true,
+  });
+
   it('keeps schedule ownership, unknown root fields and untouched rows across an edit', () => {
     const raw = 'future_root: {keep: true}\nschedules:\n  - id: a\n    cron: "0 0 * * *"\n    created_by: qq:owner\n    custom: {x: [1, 2]}\n  - id: b\n    cron: "0 1 * * *"\n    created_by: other\n';
-    const rows = parseSchedules(raw); rows[0].text = 'changed';
-    expect(yaml.load(serializeSchedules(rows, raw))).toMatchObject({ future_root: { keep: true }, schedules: [
+    const [row] = parseSchedules(raw);
+    const { content } = editYamlKeys(raw, scheduleUpdateEdits(raw, row, { ...row, text: 'changed' }));
+    expect(yaml.load(content)).toMatchObject({ future_root: { keep: true }, schedules: [
       { id: 'a', created_by: 'qq:owner', custom: { x: [1, 2] }, text: 'changed' }, { id: 'b', created_by: 'other' },
     ] });
   });
   it('keeps unknown MCP fields while changing only the selected row', () => {
     const raw = 'future: x\nclients:\n  a:\n    transport: stdio\n    command: test\n    extra: {retry: 9}\n';
-    const rows = parseMcpClients(raw); rows[0].description = 'edited';
-    expect(yaml.load(serializeMcpClients(rows, raw))).toMatchObject({ future: 'x', clients: { a: { extra: { retry: 9 }, description: 'edited' } } });
+    const [row] = parseMcpClients(raw);
+    const { content } = editYamlKeys(raw, mcpClientUpdateEdits(raw, row, { ...row, description: 'edited' }));
+    expect(yaml.load(content)).toMatchObject({ future: 'x', clients: { a: { extra: { retry: 9 }, description: 'edited' } } });
   });
   it('roundtrips MCP arguments containing commas, newlines and significant whitespace', () => {
     const args = ['--python', 'print("a,b")', 'one\ntwo', ' leading space '];
     const raw = yaml.dump({ clients: { a: { transport: 'stdio', command: 'synthetic', args } } });
-    const rows = parseMcpClients(raw); rows[0].description = 'edited';
-    expect(yaml.load(serializeMcpClients(rows, raw))).toMatchObject({ clients: { a: { args } } });
-    expect(() => serializeMcpClients([{ ...rows[0], argsText: '[42]' }], raw)).toThrow('字符串数组');
+    const [row] = parseMcpClients(raw);
+    const { content } = editYamlKeys(raw, mcpClientUpdateEdits(raw, row, { ...row, description: 'edited' }));
+    expect(yaml.load(content)).toMatchObject({ clients: { a: { args } } });
+    expect(() => mcpClientUpdateEdits(raw, row, { ...row, argsText: '[42]' })).toThrow('字符串数组');
   });
   it.each(['schedules: text', 'schedules: {}', 'schedules: [null]', 'schedules: [{id: ok}, broken]', 'schedules: [{id: a, type: future}]', '- bad', 'schedules: ['])('refuses lossy schedule rewrite: %s', raw => {
     expect(() => parseSchedules(raw)).toThrow();
-    expect(() => serializeSchedules([], raw)).toThrow();
+    expect(() => scheduleCreateEdits(raw, blankSchedule('c'))).toThrow();
+    expect(() => scheduleRemoveEdits(raw, 'a')).toThrow();
   });
-  it.each(['clients: []', 'clients: text', 'clients: {a: null}', 'clients: {a: {transport: stdio}, b: broken}', 'clients: {a: {transport: future}}'])('refuses lossy MCP rewrite: %s', raw => {
+  it.each(['clients: []', 'clients: text', 'clients: {a: null}', 'clients: {a: {transport: stdio}, b: broken}'])('refuses lossy MCP rewrite: %s', raw => {
+    const [created] = parseMcpClients('clients: {c: {transport: stdio, command: x}}');
     expect(() => parseMcpClients(raw)).toThrow();
-    expect(() => serializeMcpClients([], raw)).toThrow();
+    expect(() => mcpClientCreateEdits(raw, created)).toThrow();
+    expect(() => mcpClientRemoveEdits(raw, 'a')).toThrow();
+  });
+  // toolbox/mcp_runtime.py 把认不出的传输方式当 stdio 起；表单照同一套读，也只在真改了传输方式时才写这个键。
+  it('reads an unknown MCP transport the way the runtime starts it, without rewriting it', () => {
+    const raw = 'clients:\n  a:\n    transport: future\n    command: test\n';
+    const [row] = parseMcpClients(raw);
+    expect(row.transport).toBe('stdio');
+    expect(editYamlKeys(raw, mcpClientUpdateEdits(raw, row, { ...row, description: 'edited' })).content).toContain('transport: future');
   });
   it('preserves structured node prompts instead of stringifying objects', () => {
     const raw = 'id: test\nprompt:\n  - role: system\n    content: hello\n';

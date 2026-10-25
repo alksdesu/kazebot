@@ -8,7 +8,7 @@ import {
   getNodes,
   getProviderProfiles,
   getProviders,
-  getRuntimeRaw,
+  getRuntimeFile,
   setActiveProvider,
   upsertProvider,
 } from '../api/supervisorClient';
@@ -21,7 +21,7 @@ vi.mock('../api/supervisorClient', async (importOriginal) => ({
   getNodes: vi.fn(),
   getProviderProfiles: vi.fn(),
   getProviders: vi.fn(),
-  getRuntimeRaw: vi.fn(),
+  getRuntimeFile: vi.fn(),
   setActiveProvider: vi.fn(),
   upsertProvider: vi.fn(),
 }));
@@ -71,7 +71,7 @@ beforeEach(() => {
   vi.mocked(getProviders).mockResolvedValue(structuredClone(PROVIDERS) as any);
   vi.mocked(getNodes).mockResolvedValue(structuredClone(NODES) as any);
   vi.mocked(getProviderProfiles).mockResolvedValue(structuredClone(PROFILES) as any);
-  vi.mocked(getRuntimeRaw).mockResolvedValue({ content: 'routing:\n  vision:\n    enabled: auto\n', hash: 'runtime-1' });
+  vi.mocked(getRuntimeFile).mockResolvedValue({ content: 'routing:\n  vision:\n    enabled: auto\n', hash: 'runtime-1', source: 'override', path: 'config/runtime.yaml' });
   vi.mocked(upsertProvider).mockResolvedValue(structuredClone(PROVIDERS) as any);
   vi.mocked(setActiveProvider).mockResolvedValue(structuredClone(PROVIDERS) as any);
   vi.mocked(deleteProvider).mockResolvedValue(structuredClone(PROVIDERS) as any);

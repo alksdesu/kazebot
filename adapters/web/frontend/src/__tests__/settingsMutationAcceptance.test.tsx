@@ -38,7 +38,7 @@ it.each([
   { Page: SkillsSettingsPage, action: '创建技能', label: '创建技能', mutate: 'createSkill' as const, load: 'getSkills' as const },
   { Page: ToolsSettingsPage, action: '创建工具', label: '创建工具', mutate: 'createTool' as const, load: 'getTools' as const },
 ])('$action freezes inputs and submits once, keeping the new name after failure', async ({ Page, action, label, mutate, load }) => {
-  const request = deferred<unknown>(); vi.mocked(api[mutate]).mockReturnValue(request.promise);
+  const request = deferred<api.RawSaveResult>(); vi.mocked(api[mutate]).mockReturnValue(request.promise);
   render(<Page />);
   await waitFor(() => expect(api[load]).toHaveBeenCalled());
   fireEvent.change(screen.getByLabelText(label), { target: { value: 'new_resource' } });
@@ -78,7 +78,8 @@ it('does not create over a structurally invalid schedules document', async () =>
   expect(api.updateSchedulesRaw).not.toHaveBeenCalled();
 });
 
-it('refreshes skill quick fields after raw save and preserves unknown frontmatter and Markdown', async () => {
+// 快捷字段和原文是同一份：原文一改快捷字段立刻跟着变，快捷字段再改也是在这份原文上改，保存的永远是原文。
+it('keeps the quick fields and the raw Markdown as one source and saves the raw text', async () => {
   vi.mocked(api.getSkillRaw).mockResolvedValue({ content: '---\nname: test\nstrategy: normal\nkeywords: []\n---\nbody\n', hash: 'skill-1' });
   vi.mocked(api.updateSkillRaw).mockResolvedValue({ ok: true, hash: 'skill-2' });
   useSettingsSelectionStore.setState({ selectedSkill: { name: 'test', enabled: true, strategy: 'normal', keywords: [] } });
@@ -87,14 +88,30 @@ it('refreshes skill quick fields after raw save and preserves unknown frontmatte
   await waitFor(() => expect((raw as HTMLTextAreaElement).value).toContain('name: test'));
   fireEvent.click(screen.getByText('Raw Markdown 编辑（高级）'));
   fireEvent.change(raw, { target: { value: '---\nname: test\nstrategy: constant\nkeywords: ["x,y"]\nunknown: keep\n---\nbody unchanged\n' } });
-  fireEvent.click(screen.getByRole('button', { name: '保存 Raw Markdown' }));
-  await waitFor(() => expect(screen.getByLabelText('策略')).toHaveValue('constant'));
+  expect(screen.getByLabelText('策略')).toHaveValue('constant');
   fireEvent.change(screen.getByLabelText('order'), { target: { value: '2' } });
-  fireEvent.click(screen.getByRole('button', { name: '保存快捷字段' }));
-  await waitFor(() => expect(api.updateSkillRaw).toHaveBeenCalledTimes(2));
-  const sent = vi.mocked(api.updateSkillRaw).mock.calls[1][2];
+  expect((raw as HTMLTextAreaElement).value).toContain('order: 2');
+  fireEvent.click(screen.getByRole('button', { name: '保存技能' }));
+  await waitFor(() => expect(api.updateSkillRaw).toHaveBeenCalledOnce());
+  const sent = vi.mocked(api.updateSkillRaw).mock.calls[0][2];
+  expect(sent).toBe('---\nname: test\nstrategy: constant\nkeywords: ["x,y"]\nunknown: keep\norder: 2\n---\nbody unchanged\n');
   expect(yaml.load(sent.split('---')[1])).toMatchObject({ keywords: ['x,y'] });
-  expect(sent).toContain('strategy: constant'); expect(sent).toContain('unknown: keep'); expect(sent).toContain('body unchanged');
+});
+
+// 以前点「保存 Raw Markdown」会拿原文把快捷字段里还没存的改动静默盖掉。
+it('does not drop a quick-field edit when the raw text is saved', async () => {
+  vi.mocked(api.getSkillRaw).mockResolvedValue({ content: '---\nname: test\nstrategy: normal\nkeywords: []\n---\nbody\n', hash: 'skill-1' });
+  vi.mocked(api.updateSkillRaw).mockResolvedValue({ ok: true, hash: 'skill-2' });
+  useSettingsSelectionStore.setState({ selectedSkill: { name: 'test', enabled: true, strategy: 'normal', keywords: [] } });
+  render(<SkillsSettingsRightPanel />);
+  const raw = await screen.findByLabelText('技能 Raw Markdown 编辑器');
+  fireEvent.change(screen.getByLabelText('策略'), { target: { value: 'constant' } });
+  fireEvent.change(raw, { target: { value: (raw as HTMLTextAreaElement).value.replace('body', 'body edited') } });
+  fireEvent.click(screen.getByRole('button', { name: '保存技能' }));
+  await waitFor(() => expect(api.updateSkillRaw).toHaveBeenCalledOnce());
+  const sent = vi.mocked(api.updateSkillRaw).mock.calls[0][2];
+  expect(sent).toContain('strategy: constant');
+  expect(sent).toContain('body edited');
 });
 
 it('keeps commas and newlines in MCP arguments when only description is edited', async () => {

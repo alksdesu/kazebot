@@ -26,14 +26,22 @@ import {
   SaveBar,
   Textarea,
 } from './components';
-import {
-  NodeYamlShapeError,
-  readYamlScalar,
-  upsertYamlScalar,
-  yamlString,
-} from './nodeYaml';
+import { commitYamlKeys } from './yamlCommit';
+import { parseYamlMapping, readYamlPath } from './yamlRewrite';
+import { savedMessage } from '../utils/sentence';
+import { errorMessage } from '../api/request';
 
 const NODE_ID = 'qq.orchestrator';
+
+/** 节点文件里写的 model；读不出来（文件坏了、没写）都当没写。 */
+function modelOf(content: string): string {
+  try {
+    const value = readYamlPath(parseYamlMapping(content), ['model']);
+    return value === undefined || value === null ? '' : String(value);
+  } catch {
+    return '';
+  }
+}
 
 interface PromptFragment {
   filename: string;
@@ -60,8 +68,6 @@ const PERSONA_TAIL: PromptFragment = {
   rows: 8,
   savedNote: '已保存，下一条消息就会使用新的补充 System。留空时不注入。',
 };
-
-const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');
 
 // 先查列表，避免尚未创建的可选片段在浏览器控制台留下 404。
 async function readPromptFragment(token: string, filename: string): Promise<RawText | null> {
@@ -113,7 +119,7 @@ const PromptFragmentEditor = ({ fragment, onReload }: { fragment: PromptFragment
         if (cancelled) return;
         setMissing(false);
         setLoaded(false);
-        setNote(say(error));
+        setNote(errorMessage(error));
       }
     })();
     return () => { cancelled = true; };
@@ -127,11 +133,11 @@ const PromptFragmentEditor = ({ fragment, onReload }: { fragment: PromptFragment
       setSaved(text);
       setBase(result.hash);
       setMissing(false);
-      setNote(fragment.savedNote);
+      setNote(savedMessage(fragment.savedNote, '', result.warnings));
     } catch (error) {
       setNote(isEditConflict(error)
         ? `${fragment.label}在打开之后被别处改过，没有保存：点「丢弃」读入最新内容，再把改动重做一遍。`
-        : say(error));
+        : errorMessage(error));
     }
     setBusy(false);
   };
@@ -181,7 +187,7 @@ const ModelChoiceEditor = () => {
 
   const adopt = (body: string) => {
     setRaw(body);
-    setModel(readYamlScalar(body, ['model']));
+    setModel(modelOf(body));
   };
 
   useEffect(() => {
@@ -191,7 +197,7 @@ const ModelChoiceEditor = () => {
         adopt((await getNodeRaw(token, NODE_ID)).content);
         setNote('');
       } catch (error) {
-        setNote(say(error));
+        setNote(errorMessage(error));
       }
       // 候选表拉不到不影响改模型，所以各自吞掉失败。
       void getNodes(token)
@@ -204,7 +210,7 @@ const ModelChoiceEditor = () => {
     })();
   }, [token]);
 
-  const dirty = model !== (raw ? readYamlScalar(raw, ['model']) : '');
+  const dirty = model !== (raw ? modelOf(raw) : '');
   const confirmDiscard = useUnsavedChanges(dirty, '节点模型还有未保存修改，确定离开或丢弃吗？');
 
   const save = async () => {
@@ -212,16 +218,19 @@ const ModelChoiceEditor = () => {
     setBusy(true);
     try {
       const value = model.trim();
-      // 只改 model 这一个键，合并到现读的这一版上：节点文件的其他改动留着。
-      const latest = await getNodeRaw(token, NODE_ID);
-      const next = upsertYamlScalar(latest.content, 'model', value && yamlString(value), 'type');
-      await updateNodeRaw(token, NODE_ID, next, latest.hash);
-      adopt(next);
-      setNote('已保存。节点文件每次任务都重新读，立刻生效。');
+      // 只改 model 这一个键，合并到现读的这一版上：节点文件的其他改动留着。留空就删掉这一行，跟随全局默认。
+      const { content, note: rewriteNote, result } = await commitYamlKeys({
+        read: () => getNodeRaw(token, NODE_ID),
+        write: (next, hash) => updateNodeRaw(token, NODE_ID, next, hash),
+        edits: [{ path: ['model'], value: value || undefined }],
+      });
+      adopt(content);
+      const saved = rewriteNote
+        ? `已保存。${rewriteNote}。节点文件每次任务都重新读，立刻生效。`
+        : '已保存。节点文件每次任务都重新读，立刻生效。';
+      setNote(savedMessage(saved, '', result.warnings));
     } catch (error) {
-      setNote(error instanceof NodeYamlShapeError
-        ? `${error.message}（没有写入，文件原样保留）`
-        : say(error));
+      setNote(errorMessage(error));
     }
     setBusy(false);
   };

@@ -18,6 +18,21 @@ export function selectToolExecutions(state: ChatState, toolIds: readonly string[
     .filter((tool): tool is ToolExecution => Boolean(tool) && !tool.hidden);
 }
 
+/** The tools the given messages' tool blocks point at, so streams in other conversations leave the result shallow-equal. */
+export function selectToolsForMessages(state: ChatState, messages: readonly WsMessage[]): Record<string, ToolExecution> {
+  const tools: Record<string, ToolExecution> = {};
+  for (const message of messages) {
+    for (const block of message.blocks) {
+      if (block.kind !== 'tool') continue;
+      for (const toolId of block.toolIds) {
+        const tool = state.toolExecutionsById[toolId];
+        if (tool) tools[toolId] = tool;
+      }
+    }
+  }
+  return tools;
+}
+
 export function selectEventLog(state: ChatState, sessionId: string, limit = 200): EventLogEntry[] {
   const filtered = state.eventLog.filter((entry) => entry.sessionId === sessionId);
   return limit > 0 ? filtered.slice(-limit) : filtered;

@@ -1,12 +1,6 @@
-// [2026-05-31] TextBlockView renders normalized text blocks for MessageCard v2.
-// Why: the new reducer stores final, intermediate, history, and streaming text in
-// RenderBlock objects instead of the old split message/preview fields. How: render
-// Markdown through ReactMarkdown and add small visual markers only from the block's
-// delivery metadata. Purpose: keep all text output in the unified MessageCard path.
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-
+// 消息卡片里的文字块：Markdown 渲染，流式输出时带一个光标。
 import type { TextBlock } from '../../../types/message';
+import { Markdown } from '../../common/Markdown';
 
 interface TextBlockViewProps {
   block: TextBlock;
@@ -41,7 +35,7 @@ export const TextBlockView = ({ block }: TextBlockViewProps) => {
 
   return (
     <div className={`markdown-body text-sm leading-6 text-[var(--duties-text)] ${getDeliveryClassName(block.delivery)}`}>
-      {displayText && <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayText}</ReactMarkdown>}
+      {displayText && <Markdown>{displayText}</Markdown>}
       {showCursor && (
         // [2026-06-01] Why: the streaming cursor used a block Unicode glyph.
         // How: draw the cursor as a small CSS rectangle instead. Purpose: live text

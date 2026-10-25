@@ -3,11 +3,9 @@
 // message surface. How: derive header, role styling, streaming indicator, ordered block
 // rendering, and attachments from WsMessage only. Purpose: make active and historical
 // messages follow the same UI contract before the app is rewired to v2.
-import type { Attachment, MessageRole, MessageStatus, TextBlock, ToolExecution, WsMessage } from '../../../types/message';
-import { attachmentHref } from '../../../api/supervisorClient';
+import type { MessageRole, MessageStatus, TextBlock, ToolExecution, WsMessage } from '../../../types/message';
 import { useChatStore } from '../../../store/chatStore';
-import { useSettingsStore } from '../../../store/settingsStore';
-import { Icon } from '../../common';
+import { AttachmentList } from '../AttachmentList';
 import { RenderBlockView } from './RenderBlockView';
 
 interface MessageCardProps {
@@ -103,28 +101,11 @@ function formatTime(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(date);
 }
 
-function getAttachmentHref(attachment: Attachment, token: string | null): string | undefined {
-  if (attachment.path) return attachmentHref(attachment.path, token);
-  return attachment.url;
-}
-
-function isImageAttachment(attachment: Attachment): boolean {
-  return attachment.type === 'image' || Boolean(attachment.mime_type?.startsWith('image/'));
-}
-
-function formatAttachmentMeta(attachment: Attachment): string {
-  if (!attachment.size) return attachment.name;
-  const kb = attachment.size / 1024;
-  const size = kb >= 1024 ? `${(kb / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(kb))} KB`;
-  return `${attachment.name} (${size})`;
-}
-
 export const MessageCard = ({ message, toolsById }: MessageCardProps) => {
   const roleStyle = ROLE_STYLES[message.role];
   const active = isActiveStatus(message.status);
   const blocksContainerClassName = getBlocksContainerClassName(message);
   const attachments = message.attachments ?? [];
-  const adminToken = useSettingsStore((state) => state.adminToken);
   // [AutoC 2026-06-03] Why: only dispatch callback cards can navigate to child
   // sessions. How: read the backend-provided source.childSessionId and leave normal
   // messages without an action. Purpose: navigation stays structured and does not
@@ -196,38 +177,7 @@ export const MessageCard = ({ message, toolsById }: MessageCardProps) => {
           </button>
         )}
 
-        {attachments.length > 0 && (
-          <footer className="mt-2 flex flex-wrap gap-2">
-            {attachments.map((attachment, index) => {
-              const href = getAttachmentHref(attachment, adminToken);
-              const key = `${attachment.name}-${index}`;
-
-              if (isImageAttachment(attachment) && href) {
-                return (
-                  <a key={key} href={href} target="_blank" rel="noopener noreferrer" className="block">
-                    <img src={href} alt={attachment.name} className="max-h-64 border border-[var(--duties-border)]" />
-                  </a>
-                );
-              }
-
-              return (
-                <a
-                  key={key}
-                  href={href}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className={`inline-flex items-center gap-1 border border-[var(--duties-border)] px-2 py-0.5 text-xs text-[var(--duties-secondary)] transition-colors hover:border-[var(--duties-text)] ${href ? '' : 'pointer-events-none opacity-70'}`}
-                >
-                  {/* [2026-06-01] Why: replace the attachment emoji with Material Symbols.
-                      How: render attach_file before the attachment metadata. Purpose:
-                      file links do not depend on platform emoji rendering. */}
-                  <Icon name="attach_file" size={14} />
-                  <span>{formatAttachmentMeta(attachment)}</span>
-                </a>
-              );
-            })}
-          </footer>
-        )}
+        <AttachmentList attachments={attachments} />
       </div>
     </article>
   );

@@ -23,6 +23,7 @@ import { EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields
 import { Block, Button, Empty, ErrorText, Facts, Footnote, Input, Item, ItemTitle, SaveBar, Select } from './components';
 import { SystemSlots } from './SystemSlots';
 import { VisionRouting } from './VisionRouting';
+import { errorMessage } from '../api/request';
 
 interface Draft {
   name: string;
@@ -45,8 +46,6 @@ interface Draft {
   /** 还没在 models.yaml 里建块。 */
   fresh: boolean;
 }
-
-const say = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 const toDraft = (name: string, block: ProviderConfigPublic): Draft => ({
   name,
@@ -277,7 +276,7 @@ const ProvidersEditor = () => {
         setPinned(fromResponse(resp));
       } catch (caught) {
         if (cancelled) return;
-        setError(say(caught));
+        setError(errorMessage(caught));
       }
       try {
         const list = await getNodes(token);
@@ -341,7 +340,7 @@ const ProvidersEditor = () => {
     try {
       absorb(await action(token), done, true);
     } catch (caught) {
-      setError(say(caught));
+      setError(errorMessage(caught));
     }
     setBusy(false);
   };
@@ -359,7 +358,7 @@ const ProvidersEditor = () => {
       }
       if (latest) absorb(latest, '已保存。engine 每个任务重新取一次密钥，下一条消息就用新的。');
     } catch (caught) {
-      setError(say(caught));
+      setError(errorMessage(caught));
     }
     setBusy(false);
   };

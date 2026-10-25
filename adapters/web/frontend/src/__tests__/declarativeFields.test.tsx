@@ -429,7 +429,7 @@ describe('schema 缓存', () => {
   });
 
   it('404 点名要重启 supervisor，下次加载会重试', async () => {
-    vi.mocked(api.getPlatformSchema).mockRejectedValueOnce(new Error('404 Not Found')).mockResolvedValueOnce(schema);
+    vi.mocked(api.getPlatformSchema).mockRejectedValueOnce(new api.ApiError(404, 'Not Found')).mockResolvedValueOnce(schema);
 
     await useSchemaStore.getState().load('fixture-token', platformScope('qq'));
     expect(useSchemaStore.getState().errors[platformScope('qq').id]).toMatch(/重启 supervisor/);
@@ -440,11 +440,20 @@ describe('schema 缓存', () => {
   });
 
   it('后端说明了原因的 404 照原话显示，不让人去重启 supervisor', async () => {
-    vi.mocked(api.getPlatformSchema).mockRejectedValueOnce(new Error('404 Telegram 没有控制台配置界面'));
+    vi.mocked(api.getPlatformSchema).mockRejectedValueOnce(new api.ApiError(404, 'Telegram 没有控制台配置界面'));
 
     await useSchemaStore.getState().load('fixture-token', platformScope('telegram'));
 
     expect(useSchemaStore.getState().errors[platformScope('telegram').id]).toBe('读不到控制台布局：Telegram 没有控制台配置界面');
+  });
+
+  // 判断看的是状态码，不是报错文字：网络断了这类不是服务器回的错，照原话说。
+  it('不是服务器回的错就照原话说，不当成路由缺失', async () => {
+    vi.mocked(api.getPlatformSchema).mockRejectedValueOnce(new Error('404 Not Found'));
+
+    await useSchemaStore.getState().load('fixture-token', platformScope('telegram'));
+
+    expect(useSchemaStore.getState().errors[platformScope('telegram').id]).toBe('读不到控制台布局：404 Not Found');
   });
 });
 

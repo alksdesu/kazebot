@@ -26,7 +26,7 @@ import {
 import { getPlatform } from '../platforms/registry';
 import { useSettingsStore } from '../store/settingsStore';
 import { AccountScope } from './AccountScope';
-import { Block, Button, Empty, Facts, Input, Panel, Pre } from './components';
+import { Block, Button, Empty, ErrorText, Facts, Input, Panel, Pre } from './components';
 import { ConfigShareGroups } from './ConfigShareGroups';
 import { nameBetween } from './format';
 import { InstanceLink, InstanceSwitch } from './InstanceSwitch';
@@ -34,6 +34,7 @@ import { usePlatform } from './platformContext';
 import { usePageNotice } from '../hooks/usePageNotice';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useRequestScope } from '../features/asyncState';
+import { errorMessage } from '../api/request';
 
 type Stage = 'idle' | 'restarting' | 'scanning';
 
@@ -45,8 +46,6 @@ const ROW = 'mt-1.5 flex min-w-0 flex-wrap items-center gap-2.5';
 const LABEL = 'w-9 flex-none text-xs text-[var(--duties-secondary)]';
 const BODY = 'flex min-w-0 flex-1 flex-wrap items-center gap-2';
 const DESC = 'text-xs text-[var(--duties-secondary)]';
-
-const say = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 // 一个实例只跑一个平台：写成「QQ 12345」，还没登录过的写成「QQ · 还没登录」。老后端不给平台时整行不写。
 const accountLine = (row: ConsoleInstance): string => {
@@ -76,7 +75,7 @@ const AccountWorkspace = ({ token }: { token: string }) => {
       if (!identity.isCurrent() || request !== sequence.current || useSettingsStore.getState().adminToken !== token) return;
       setInstances(next); setError('');
     } catch (failure) {
-      if (identity.isCurrent() && request === sequence.current && useSettingsStore.getState().adminToken === token) setError(say(failure));
+      if (identity.isCurrent() && request === sequence.current && useSettingsStore.getState().adminToken === token) setError(errorMessage(failure));
     } finally {
       if (identity.isCurrent() && request === sequence.current && useSettingsStore.getState().adminToken === token) setLoading(false);
     }
@@ -138,7 +137,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
         if (!alive || !isCurrent()) return;
         const transient = isTransientApiError(failure);
         setProgressTransient(transient);
-        setProgressError(transient ? '部署连接短暂中断，任务仍在后台运行，将自动重试。' : `读取进度失败，将自动重试：${say(failure)}`);
+        setProgressError(transient ? '部署连接短暂中断，任务仍在后台运行，将自动重试。' : `读取进度失败，将自动重试：${errorMessage(failure)}`);
       }).finally(() => { polling = false; });
     };
     void poll();
@@ -164,7 +163,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
       setNewId(''); setNewLabel(''); setNewAccount(''); setJobAction('create');
       setJob({ id: plan.id, lines: ['已请求建实例，等 root 侧接手…'], finished: false, ok: false, detail: '' });
       void refresh();
-    } catch (failure) { if (isCurrent()) setNote(say(failure)); }
+    } catch (failure) { if (isCurrent()) setNote(errorMessage(failure)); }
     finally { mutation.current = false; if (isCurrent()) setBusy(false); }
   };
 
@@ -180,7 +179,7 @@ const InstanceManagement = ({ token, instances, loading, error, refresh }: Insta
       if (!isCurrent()) return;
       setJobAction('remove');
       setJob({ id: row.id, lines: ['已请求停服与归档…'], finished: false, ok: false, detail: '' });
-    } catch (failure) { if (isCurrent()) setNote(say(failure)); }
+    } catch (failure) { if (isCurrent()) setNote(errorMessage(failure)); }
     finally { mutation.current = false; if (isCurrent()) setBusy(false); }
   };
 
@@ -247,6 +246,8 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
   const [stage, setStage] = useState<Stage>('idle');
   const [qrImage, setQrImage] = useState('');
   const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
+  // 号换上了却没记进实例清单：别的实例拦不住同一个号重复登录。下一次换号或钉号记上了才收掉。
+  const [rosterError, setRosterError] = useState('');
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   // 点过「停止等待」或等重启超时之后就不再自己盯着，等手动刷新、换号或快速切换再接着看。
@@ -267,7 +268,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
       return next;
     } catch (error) {
       // 只有网络层或鉴权失败才到这里。NapCat 没起来是正常响应，由 reachable 表达。
-      if (isCurrent() && request === refreshSequence.current) setLoadError(say(error));
+      if (isCurrent() && request === refreshSequence.current) setLoadError(errorMessage(error));
       return null;
     } finally {
       if (pendingLoad.current === request) pendingLoad.current = 0;
@@ -325,10 +326,12 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
             setQrImage('');
             setStage('idle');
             try {
-              await pinPlatformAccount(token, platformId);
-              if (isCurrent()) setMessage(`已登录 ${next.nick || next.account}，并设为重启后自动登录。`);
+              const { rosterError: reason } = await pinPlatformAccount(token, platformId);
+              if (!isCurrent()) return;
+              setRosterError(reason);
+              setMessage(`已登录 ${next.nick || next.account}，并设为重启后自动登录。`);
             } catch (error) {
-              if (isCurrent()) setMessage(`已登录 ${next.nick || next.account}，但设置自动登录失败：${say(error)}`);
+              if (isCurrent()) setMessage(`已登录 ${next.nick || next.account}，但设置自动登录失败：${errorMessage(error)}`);
             }
             return;
           }
@@ -344,7 +347,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
               setStage('scanning');
               setMessage('用要登录的那个 QQ 扫码。二维码会过期，过期就点一下「刷新二维码」。');
             } catch (error) {
-              if (alive && isCurrent()) setMessage(say(error));
+              if (alive && isCurrent()) setMessage(errorMessage(error));
             }
           }
         } finally { polling = false; }
@@ -374,7 +377,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
       stageStartedAt.current = Date.now();
       setStage('restarting');
     } catch (error) {
-      if (isCurrent()) setMessage(say(error));
+      if (isCurrent()) setMessage(errorMessage(error));
     } finally {
       mutation.current = false;
       if (isCurrent()) setBusy(false);
@@ -389,14 +392,15 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
     mutation.current = true; refreshSequence.current++; setLoading(false); setBusy(true);
     setPaused(false);
     try {
-      await switchPlatformAccount(token, platformId, target.account);
+      const { rosterError: reason } = await switchPlatformAccount(token, platformId, target.account);
       if (!isCurrent()) return;
+      setRosterError(reason);
       stageStartedAt.current = Date.now();
       setStage('restarting');
       setMessage('已请求切换，等它上线…');
     } catch (error) {
       if (!isCurrent()) return;
-      setMessage(say(error));
+      setMessage(errorMessage(error));
       // 切失败会把这个号记成死号，刷一次列表让它立刻置灰。
       void load(true);
     } finally {
@@ -417,7 +421,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
       if (qrcode) setMessage('');
       else setMessage(reachable ? '拿不到二维码，可能已经登录上了。' : 'NapCat 还没应答，等它起来…');
     } catch (error) {
-      if (isCurrent()) setMessage(say(error));
+      if (isCurrent()) setMessage(errorMessage(error));
     } finally {
       mutation.current = false;
       if (isCurrent()) setBusy(false);
@@ -488,6 +492,7 @@ const AccountConnectionPage = ({ token, instances, ownershipReady }: { token: st
               <span className={DESC}>会重启 NapCat，bot 期间不可用</span>
             </div>
           </div>
+          {rosterError && <ErrorText role="alert">{rosterError}</ErrorText>}
         </Panel>
       </Block>
 

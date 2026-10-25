@@ -18,11 +18,10 @@ import { usePageNotice } from '../../../hooks/usePageNotice';
 import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { startPolling } from '../../../utils/polling';
 import { Block, Button, Empty, Facts, Footnote, List, PageShell, Pip, Row, StatusText } from './settingsControls';
+import { errorMessage } from '../../../api/request';
 
 const POLL_MS = 5000;
 const TAIL_LINES = 500;
-
-const say = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 const duration = (seconds: number): string => {
   if (seconds < 60) return `${Math.round(seconds)} 秒`;
@@ -146,7 +145,7 @@ const LogViewer = ({ token }: { token: string }) => {
       setFiles(rows);
       setPicked((current) => current || rows[0]?.name || '');
     } catch (error) {
-      setNote(say(error));
+      setNote(errorMessage(error));
     }
   }, [token]);
 
@@ -167,7 +166,7 @@ const LogViewer = ({ token }: { token: string }) => {
         if (box.current) box.current.scrollTop = box.current.scrollHeight;
       });
     } catch (error) {
-      if (version === generation.current) setNote(say(error));
+      if (version === generation.current) setNote(errorMessage(error));
     } finally {
       if (version === generation.current) setBusy(false);
     }
@@ -244,7 +243,7 @@ const RuntimeSettingsPageBody = () => {
       setStatus(next);
       setLoadError('');
     } catch (error) {
-      if (version === generation.current) setLoadError(say(error));
+      if (version === generation.current) setLoadError(errorMessage(error));
     }
   }, [adminToken, setLoadError]);
 
@@ -264,7 +263,7 @@ const RuntimeSettingsPageBody = () => {
       await load();
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(say(error));
+      setMessage(errorMessage(error));
     } finally {
       setRetrying(false);
     }

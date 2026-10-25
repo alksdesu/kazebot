@@ -14,6 +14,8 @@ import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { overlaySourceLabel, removalFor } from '../../../utils/overlaySource';
 import { describeEnvRef } from '../../../utils/envRef';
 import { Block, Button, Field, Input, PageShell, Select, StatusText } from './settingsControls';
+import { savedMessage } from '../../../utils/sentence';
+import { errorMessage } from '../../../api/request';
 
 function nodeTemplate(id: string, template: string): string {
   // [2026-06-02] Build a minimal node YAML from the selected template type. Why: the
@@ -53,7 +55,7 @@ export const AgentsSettingsPage = () => {
       return items;
     } catch (error) {
       if (version !== generation.current) return undefined;
-      setLoadError(error instanceof Error ? error.message : '加载节点失败');
+      setLoadError(errorMessage(error, '加载节点失败'));
       return undefined;
     } finally {
       if (version === generation.current) setLoading(false);
@@ -84,16 +86,16 @@ export const AgentsSettingsPage = () => {
     if (!id) { setMessage('请输入节点 ID'); return; }
     if (!confirmNavigation()) return;
     try {
-      await createNode(adminToken, { id, content: nodeTemplate(id, template) });
+      const result = await createNode(adminToken, { id, content: nodeTemplate(id, template) });
       if (tokenChanged(adminToken)) return;
       setNewId('');
-      setMessage('节点已创建，请在右栏继续编辑 YAML。');
+      setMessage(savedMessage('节点已创建，请在右栏继续编辑 YAML。', '', result.warnings));
       await loadNodes();
       if (tokenChanged(adminToken)) return;
       setSelectedNode({ id, name: id, type: template === 'tool' ? 'tool' : 'ai', model: '', description: '通过设置页面创建的节点。', delegate_targets: [] } as AdminNode);
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '创建节点失败');
+      setMessage(errorMessage(error, '创建节点失败'));
     }
   });
   // 没声明来源的是老版本后端给的，那时列出来的都是实例自己的文件。
@@ -115,7 +117,7 @@ export const AgentsSettingsPage = () => {
       if (restored) setSelectedNode(restored);
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : `${removal.label}失败`);
+      setMessage(errorMessage(error, `${removal.label}失败`));
     }
   });
   return (

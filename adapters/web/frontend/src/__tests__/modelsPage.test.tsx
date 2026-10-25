@@ -9,9 +9,11 @@ import {
   getNodes,
   getProviderProfiles,
   getProviders,
+  getRuntimeFile,
   getRuntimeRaw,
   updateNodeRaw,
   updateRuntimeRaw,
+  type RuntimeFile,
 } from '../api/supervisorClient';
 import { SettingsPageHost } from '../components/settings/SettingsPageHost';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
@@ -26,6 +28,7 @@ vi.mock('../api/supervisorClient', async (importOriginal) => ({
   getNodes: vi.fn(),
   getProviderProfiles: vi.fn(),
   getProviders: vi.fn(),
+  getRuntimeFile: vi.fn(),
   getRuntimeRaw: vi.fn(),
   updateNodeRaw: vi.fn(),
   updateRuntimeRaw: vi.fn(),
@@ -43,6 +46,9 @@ const RUNTIME = [
 ].join('\n');
 
 const NODE_YAML = ['id: qq.vision', 'type: ai', 'provider: gemini', 'model: x', ''].join('\n');
+
+// 保存前现读的是本实例那一层：有自己的 config/runtime.yaml 就是它，没有时读到的是仓库默认。
+const instanceLayer = (content: string, hash: string): RuntimeFile => ({ content, hash, source: 'override', path: 'config/runtime.yaml' });
 
 const CATALOG = {
   openai: [
@@ -92,6 +98,7 @@ beforeEach(() => {
   vi.mocked(getProviders).mockResolvedValue(PROVIDERS as any);
   vi.mocked(getNodes).mockResolvedValue(NODES as any);
   vi.mocked(getRuntimeRaw).mockResolvedValue({ content: RUNTIME, hash: 'runtime-1' });
+  vi.mocked(getRuntimeFile).mockResolvedValue(instanceLayer(RUNTIME, 'runtime-1'));
   vi.mocked(getNodeRaw).mockResolvedValue({ content: NODE_YAML, hash: 'node-1' });
   vi.mocked(updateRuntimeRaw).mockResolvedValue({ ok: true, hash: 'runtime-2' });
   vi.mocked(updateNodeRaw).mockResolvedValue({ ok: true, hash: 'node-2' });
@@ -143,9 +150,7 @@ describe('模型参数页', () => {
   it('保存前现读一次，别处刚加的键不会被打开时那份旧原文盖掉', async () => {
     // 接在 providers 那一块后面：别的实例刚给 gemini 加了一段。
     const LATER = `${RUNTIME}  gemini:\n    timeout_sec: 300.0\n`;
-    vi.mocked(getRuntimeRaw)
-      .mockResolvedValueOnce({ content: RUNTIME, hash: 'runtime-1' })
-      .mockResolvedValue({ content: LATER, hash: 'runtime-9' });
+    vi.mocked(getRuntimeFile).mockResolvedValue(instanceLayer(LATER, 'runtime-9'));
     render(<ModelsPage />);
     fireEvent.click(await screen.findByRole('button', { name: '高' }));
     save();
@@ -158,6 +163,27 @@ describe('模型参数页', () => {
     });
     // 带的是刚读那一版的指纹，不是打开时那份。
     expect(base).toBe('runtime-9');
+  });
+
+  it('本实例还没有自己的 runtime.yaml 时只落改的那一个键，不把仓库默认抄过去', async () => {
+    vi.mocked(getRuntimeFile).mockResolvedValue({ content: RUNTIME, hash: 'defaults-1', source: 'default', path: 'defaults/runtime.yaml' });
+    render(<ModelsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: '高' }));
+    save();
+
+    await waitFor(() => expect(updateRuntimeRaw).toHaveBeenCalled());
+    expect(vi.mocked(updateRuntimeRaw).mock.calls[0]).toEqual([
+      'admin-token', 'providers:\n  openai:\n    options:\n      reasoning_effort: high\n', 'defaults-1',
+    ]);
+  });
+
+  it('保存通过但带着提醒时，提醒接在结果后面', async () => {
+    vi.mocked(updateRuntimeRaw).mockResolvedValue({ ok: true, hash: 'runtime-2', warnings: ['providers.openai.options.foo 没有任何地方读'] });
+    render(<ModelsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: '高' }));
+    save();
+
+    expect(await screen.findByText('已保存。runtime.yaml 每次任务重新读，下一条消息就用新参数。providers.openai.options.foo 没有任何地方读')).toBeTruthy();
   });
 
   it('节点作用域同样现读现合并', async () => {

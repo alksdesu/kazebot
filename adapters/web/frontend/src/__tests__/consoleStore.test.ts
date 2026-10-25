@@ -765,8 +765,8 @@ describe('save', () => {
   it('原文认不出、只能整份重写时接在警告后面交代一句', async () => {
     seedLive({ signal_name: false });
     platformConsoleStore('qq').getState().setDraft('signal_name', true);
-    // 父键是流式映射，往它下面加子键就只能整份重写。
-    const box = serveConfig({ signal_name: true }, { raw: 'trigger: {signals: {at: true}}\n' });
+    // 父键是流式映射，往它下面加子键就只能整份重写，上面那行注释跟着丢。
+    const box = serveConfig({ signal_name: true }, { raw: '# 触发条件\ntrigger: {signals: {at: true}}\n' });
     box.warnings = ['bot 没在跑，只校验了 YAML 语法'];
 
     const outcome = await platformConsoleStore('qq').getState().save('token', ['signal_name']);

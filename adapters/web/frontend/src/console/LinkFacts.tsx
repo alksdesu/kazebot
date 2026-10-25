@@ -13,6 +13,7 @@ import {
   ReadOnlyRow,
 } from './components';
 import { useLinkFacts, useLiveValue, useRuntime } from './consoleStore';
+import { errorMessage } from '../api/request';
 
 export const QueueFacts = () => {
   const runtime = useRuntime();
@@ -91,7 +92,7 @@ export const RestartEngine = () => {
       const result = await restartEngine(token, '用户从控制台请求重启引擎');
       setSaid(result?.scheduled ? '已排上重启，几秒后 worker 会重新起来。' : `没能重启：${restartRefusal(result)}。`);
     } catch (error) {
-      setSaid(error instanceof Error ? error.message : '请求失败');
+      setSaid(errorMessage(error, '请求失败'));
     }
     setArmed(false);
   };

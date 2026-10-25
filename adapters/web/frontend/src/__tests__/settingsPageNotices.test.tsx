@@ -332,9 +332,9 @@ beforeEach(() => {
   vi.mocked(api.getMcpClients).mockResolvedValue([EXISTING_CLIENT]);
   vi.mocked(api.getMcpClientsRaw).mockResolvedValue(rawFile(MCP_RAW));
   vi.mocked(api.getSchedulesRaw).mockResolvedValue(rawFile(SCHEDULES_RAW));
-  vi.mocked(api.createNode).mockResolvedValue({ ok: true });
-  vi.mocked(api.createSkill).mockResolvedValue({ ok: true });
-  vi.mocked(api.createTool).mockResolvedValue({ ok: true });
+  vi.mocked(api.createNode).mockResolvedValue({ ok: true, hash: null });
+  vi.mocked(api.createSkill).mockResolvedValue({ ok: true, hash: null });
+  vi.mocked(api.createTool).mockResolvedValue({ ok: true, hash: null });
   vi.mocked(api.deleteNode).mockResolvedValue({ ok: true, restored: false });
   vi.mocked(api.deleteSkill).mockResolvedValue({ ok: true });
   vi.mocked(api.deleteTool).mockResolvedValue({ ok: true, restored: false });

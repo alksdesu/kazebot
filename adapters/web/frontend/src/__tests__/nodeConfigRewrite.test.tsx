@@ -189,3 +189,71 @@ describe('节点面板的来源提示', () => {
     expect(screen.queryByText(/在节点管理页可以恢复默认/)).toBeNull();
   });
 });
+
+describe('表单和原文是同一份', () => {
+  const rawEditor = () => screen.getByLabelText('节点 YAML 编辑器') as HTMLTextAreaElement;
+  const loaded = async () => {
+    const field = await screen.findByLabelText('名称');
+    await waitFor(() => expect(field).toHaveValue('旧名字'));
+    return field;
+  };
+
+  it('表单改一处，原文立刻跟着变', async () => {
+    renderPanel(NODE_YAML);
+    fireEvent.change(await loaded(), { target: { value: '新名字' } });
+
+    expect(rawEditor().value).toBe(NODE_YAML.replace('name: 旧名字', 'name: 新名字'));
+  });
+
+  // 原文那边以前有自己的保存按钮，点它会拿原文把表单上还没存的改动静默盖掉。
+  it('两边都改过时，保存的是合在一起的那一份', async () => {
+    renderPanel(NODE_YAML);
+    fireEvent.change(await loaded(), { target: { value: '新名字' } });
+    fireEvent.change(rawEditor(), { target: { value: rawEditor().value.replace('    - read_file', '    - read_file\n    - write_file') } });
+
+    expect(screen.getByLabelText('名称')).toHaveValue('新名字');
+    expect(screen.getAllByRole('button', { name: /^保存/ }).map((button) => button.textContent)).toEqual(['保存节点配置']);
+    fireEvent.click(screen.getByRole('button', { name: '保存节点配置' }));
+
+    await waitFor(() => expect(api.updateNodeRaw).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.updateNodeRaw).mock.calls[0]).toEqual([
+      'admin-token',
+      'qq.orchestrator',
+      NODE_YAML.replace('name: 旧名字', 'name: 新名字').replace('    - read_file', '    - read_file\n    - write_file'),
+      'node-1',
+    ]);
+  });
+
+  it('原文改坏了表单就停用，保存被拦下并说明原因', async () => {
+    renderPanel(NODE_YAML);
+    await loaded();
+    fireEvent.change(rawEditor(), { target: { value: 'name: [\n' } });
+
+    expect(await screen.findByText(/^原文解析不了，表单先停用，在原文里修好再改：/)).toBeInTheDocument();
+    expect(screen.getByLabelText('名称')).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: '保存节点配置' }));
+
+    expect(await screen.findByText(/^没有保存：原文解析不了。/)).toBeInTheDocument();
+    expect(api.updateNodeRaw).not.toHaveBeenCalled();
+  });
+
+  it('保存通过但后端带着提醒时，每条都接在结果后面', async () => {
+    vi.mocked(api.updateNodeRaw).mockResolvedValue({ ok: true, hash: 'node-2', warnings: ['这些键没有任何地方读：foo', '委派目标 qq.search 不存在'] });
+    renderPanel(NODE_YAML);
+
+    await rename('新名字');
+
+    expect(await screen.findByText('节点配置已保存。这些键没有任何地方读：foo。委派目标 qq.search 不存在')).toBeInTheDocument();
+  });
+
+  it('校验不过的 400 把原因原样说出来，原文和表单都留着', async () => {
+    vi.mocked(api.updateNodeRaw).mockRejectedValue(new api.ApiError(400, 'tool_access.mode 只能是 all、allowlist 或 none'));
+    renderPanel(NODE_YAML);
+
+    await rename('新名字');
+
+    expect(await screen.findByText('400 tool_access.mode 只能是 all、allowlist 或 none')).toBeInTheDocument();
+    expect(screen.getByLabelText('名称')).toHaveValue('新名字');
+    expect(rawEditor().value).toBe(NODE_YAML.replace('name: 旧名字', 'name: 新名字'));
+  });
+});

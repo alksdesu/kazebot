@@ -1,13 +1,14 @@
-// Structured config helpers for Settings UI — powered by js-yaml.
-// Replaces the former hand-rolled regex/recursive-descent parser with
-// a proper YAML library while preserving every exported type and function
-// signature so that consuming components need zero changes.
+// 设置页表单和 yaml 原文之间的转换。写回只给出改动了的键，经 editYamlKeys 落到原文上，注释和其余原文照旧。
 import yaml from 'js-yaml';
 
-import { upsertYamlNested, yamlString } from '../../console/nodeYaml';
-import { rewriteYaml, type YamlRewrite } from '../../console/yamlRewrite';
-
-// ==================== Type Definitions ====================
+import { StaleKeysError } from '../../console/yamlCommit';
+import {
+  editYamlKeys,
+  parseYamlMapping,
+  readYamlPath,
+  type YamlKeyEdit,
+  type YamlRewrite,
+} from '../../console/yamlRewrite';
 
 export interface ScheduleFormState {
   original?: Record<string, unknown>;
@@ -38,16 +39,14 @@ export interface McpClientFormState {
   headersText: string;
 }
 
-export interface SkillFormState {
-  name: string;
-  description: string;
+/** 技能 frontmatter 里能在快捷表单上改的几项，全是输入框原样的文字。 */
+export interface SkillQuickFields {
   enabled: boolean;
-  strategy: 'normal' | 'constant';
-  keywordsText: string;
+  strategy: string;
+  keywords: string;
   order: string;
   priority: string;
   scan_depth: string;
-  body: string;
 }
 
 export type NodeConfigType = 'ai' | 'tool';
@@ -74,7 +73,8 @@ export interface NodeConfigFormState {
 
 export interface RuntimeConfigFormState {
   entry_node_id: string;
-  tool_mode: EngineToolMode;
+  /** 空串：本实例这层没写，跟随仓库默认。 */
+  tool_mode: EngineToolMode | '';
   max_workers: string;
   compact_threshold_tokens: string;
   compact_hard_threshold_tokens: string;
@@ -82,25 +82,7 @@ export interface RuntimeConfigFormState {
   compact_keep_recent: string;
 }
 
-// ==================== Core Helpers ====================
-
-// 不设 noCompatMode：这些文件都由 PyYAML（YAML 1.1）读回，裸写的 on/off/yes/no 会变成布尔、
-// 12:30 会变成 750。留着 js-yaml 的兼容引号，两侧才是同一个值。
-const DUMP_OPTS: yaml.DumpOptions = {
-  indent: 2,
-  lineWidth: -1,
-  noRefs: true,
-  sortKeys: false,
-  quotingType: '"',
-  forceQuotes: false,
-};
-
-function safeLoad(raw: string): Record<string, any> {
-  const result = yaml.load(raw);
-  if (result === undefined || result === null) return {};
-  if (typeof result !== 'object' || Array.isArray(result)) throw new Error('YAML 顶层必须是映射，原文件未修改');
-  return result as Record<string, any>;
-}
+const safeLoad = (raw: string): Record<string, any> => parseYamlMapping(raw) as Record<string, any>;
 
 function str(value: any, fallback = ''): string {
   if (value === null || value === undefined) return fallback;
@@ -112,15 +94,7 @@ function normalizeEngineToolMode(value: string, fallback: EngineToolMode = 'fake
   return normalized === 'native' || normalized === 'json' || normalized === 'fake-native' ? normalized : fallback;
 }
 
-/** 读嵌套路径，缺任一层返回 undefined。 */
-function nested(doc: Record<string, any>, path: readonly string[]): any {
-  let cur: any = doc;
-  for (const key of path) {
-    if (!cur || typeof cur !== 'object' || Array.isArray(cur)) return undefined;
-    cur = cur[key];
-  }
-  return cur;
-}
+const nested = (doc: Record<string, any>, path: readonly string[]): any => readYamlPath(doc, path);
 
 function normalizeNodeConfigType(value: string): NodeConfigType {
   return value === 'tool' ? value : 'ai';
@@ -154,11 +128,9 @@ function parseLooseKV(text: string): Record<string, string> {
 }
 
 /** 按项合并保存前核对：表单打开之后这一项在文件里变了，就不能拿旧表单盖掉；别的项照常合并。 */
-export function itemChangedSince(loaded: { original?: Record<string, unknown> }, latest: { original?: Record<string, unknown> }): boolean {
+function itemChangedSince(loaded: { original?: Record<string, unknown> }, latest: { original?: Record<string, unknown> }): boolean {
   return JSON.stringify(loaded.original ?? null) !== JSON.stringify(latest.original ?? null);
 }
-
-// ==================== Node Config ====================
 
 export function parseNodeConfig(raw: string, fallbackId = ''): NodeConfigFormState {
   const doc = safeLoad(raw);
@@ -177,30 +149,37 @@ export function parseNodeConfig(raw: string, fallbackId = ''): NodeConfigFormSta
   };
 }
 
-/** 节点文件满是手写的说明注释，prompt 常是上百行的块标量：只重写表单改了的键，其余原文照旧。 */
-export function serializeNodeConfig(raw: string, form: NodeConfigFormState): YamlRewrite {
-  const doc = safeLoad(raw);
-  doc.id = form.id.trim();
-  doc.name = form.name.trim();
-  doc.description = form.description.trim();
-  doc.type = form.type;
-  doc.model = form.model.trim();
-  if (form.provider.trim()) doc.provider = form.provider.trim(); else delete doc.provider;
-  if (form.memory_book.trim()) doc.memory_book = form.memory_book.trim(); else delete doc.memory_book;
-  doc.persistent = form.persistent;
-  if (form.prompt.trim()) {
-    if (form.promptIsStructured) {
-      const prompt = JSON.parse(form.prompt);
-      if (!Array.isArray(prompt)) throw new Error('结构化提示词必须是 JSON 数组，原文件未修改');
-      doc.prompt = prompt;
-    } else doc.prompt = form.prompt;
-  } else delete doc.prompt;
-  doc.delegate_targets = commaTextToItems(form.delegate_targetsText);
-  // tool_access 只能改 YAML 原文，表单不碰它：按 mode 重写会把对应不上的那半（allowlist 下的 deny）洗掉。
-  return rewriteYaml(raw, doc, DUMP_OPTS);
+function promptValue(form: NodeConfigFormState): unknown {
+  if (!form.prompt.trim()) return undefined;
+  if (!form.promptIsStructured) return form.prompt;
+  let prompt: unknown;
+  try {
+    prompt = JSON.parse(form.prompt);
+  } catch {
+    throw new Error('结构化提示词必须是 JSON 数组，原文件未修改');
+  }
+  if (!Array.isArray(prompt)) throw new Error('结构化提示词必须是 JSON 数组，原文件未修改');
+  return prompt;
 }
 
-// ==================== Runtime Config ====================
+/** 节点文件满是手写的说明注释，prompt 常是上百行的块标量：只写和原文不一样的字段，其余原文照旧。 */
+export function serializeNodeConfig(raw: string, form: NodeConfigFormState): YamlRewrite {
+  const current = parseNodeConfig(raw, form.id);
+  const changed = (key: keyof NodeConfigFormState) => form[key] !== current[key];
+  const edits: YamlKeyEdit[] = [];
+  if (changed('id')) edits.push({ path: ['id'], value: form.id.trim() });
+  if (changed('name')) edits.push({ path: ['name'], value: form.name.trim() });
+  if (changed('description')) edits.push({ path: ['description'], value: form.description.trim() });
+  if (changed('type')) edits.push({ path: ['type'], value: form.type });
+  if (changed('model')) edits.push({ path: ['model'], value: form.model.trim() });
+  if (changed('provider')) edits.push({ path: ['provider'], value: form.provider.trim() || undefined });
+  if (changed('memory_book')) edits.push({ path: ['memory_book'], value: form.memory_book.trim() || undefined });
+  if (changed('persistent')) edits.push({ path: ['persistent'], value: form.persistent });
+  if (changed('prompt') || changed('promptIsStructured')) edits.push({ path: ['prompt'], value: promptValue(form) });
+  if (changed('delegate_targetsText')) edits.push({ path: ['delegate_targets'], value: commaTextToItems(form.delegate_targetsText) });
+  // tool_access 只能改 YAML 原文，表单不碰它：按 mode 重写会把对应不上的那半（allowlist 下的 deny）洗掉。
+  return editYamlKeys(raw, edits);
+}
 
 // runtime.yaml 里这三项都在二级键下；曾经按顶层读写，于是表单永远空值，
 // 保存还会注入三个无人消费的顶层键。
@@ -212,23 +191,27 @@ const RUNTIME_COMPACT_HARD_THRESHOLD_PATH = ['engine', 'compact', 'hard_threshol
 const RUNTIME_COMPACT_KEEP_TOKENS_PATH = ['engine', 'compact', 'keep_recent_tokens'] as const;
 const RUNTIME_COMPACT_KEEP_SEGMENTS_PATH = ['engine', 'compact', 'keep_recent'] as const;
 
-/** 数字键读成输入框文本。缺键读空串，表示「不覆盖代码默认值」。 */
+/** 数字键读成输入框文本。缺键读空串，表示本实例不覆盖、跟随仓库默认。 */
 function numText(doc: Record<string, any>, path: readonly string[]): string {
   const value = nested(doc, path);
   return value === undefined || value === null ? '' : String(value);
 }
 
-/** 整数输入框回写成 yaml 标量。空串与非法值都返回 ''，由调用方当作删键。 */
-function intText(value: string, min = 0): string {
+/** 整数输入框回写成 yaml 的值。空串与非法值都是 undefined，也就是删掉这个键。 */
+function intValue(value: string, min = 0): number | undefined {
   const parsed = Number.parseInt(value.trim(), 10);
-  return Number.isFinite(parsed) && parsed >= min ? String(parsed) : '';
+  return Number.isFinite(parsed) && parsed >= min ? parsed : undefined;
 }
+
+const toolModeText = (value: unknown): EngineToolMode | '' => (
+  value === undefined || value === null || value === '' ? '' : normalizeEngineToolMode(String(value))
+);
 
 export function parseRuntimeConfig(raw: string): RuntimeConfigFormState {
   const doc = safeLoad(raw);
   return {
     entry_node_id: str(nested(doc, RUNTIME_ENTRY_NODE_PATH)),
-    tool_mode: normalizeEngineToolMode(str(nested(doc, RUNTIME_TOOL_MODE_PATH), 'fake-native')),
+    tool_mode: toolModeText(nested(doc, RUNTIME_TOOL_MODE_PATH)),
     max_workers: numText(doc, RUNTIME_MAX_WORKERS_PATH),
     compact_threshold_tokens: numText(doc, RUNTIME_COMPACT_THRESHOLD_PATH),
     compact_hard_threshold_tokens: numText(doc, RUNTIME_COMPACT_HARD_THRESHOLD_PATH),
@@ -237,169 +220,287 @@ export function parseRuntimeConfig(raw: string): RuntimeConfigFormState {
   };
 }
 
-export function serializeRuntimeConfig(raw: string, form: RuntimeConfigFormState): string {
-  // 空基底会让整份 runtime.yaml 被这几个键的输出替换掉，而 safeLoad 对空串是静默返回 {}。
-  if (!raw.trim()) throw new Error('尚未读入 runtime.yaml，拒绝用空内容覆盖');
-  // 逐键定点改写而不是 load/dump 一轮：runtime.yaml 里一百多行说明注释全靠原文留着。
-  safeLoad(raw);
-  let out = raw;
+/**
+ * 写进 runtime.yaml 本实例那一层（还没有时传空串）。只写和原文不一样的字段：
+ * 没动过的键留给仓库默认，原文里一百多行说明注释也照旧。
+ */
+export function serializeRuntimeConfig(raw: string, form: RuntimeConfigFormState): YamlRewrite {
+  const current = parseRuntimeConfig(raw);
+  const edits: YamlKeyEdit[] = [];
   const entryNode = form.entry_node_id.trim();
-  out = upsertYamlNested(out, [...RUNTIME_ENTRY_NODE_PATH], entryNode && yamlString(entryNode));
-  out = upsertYamlNested(out, [...RUNTIME_TOOL_MODE_PATH], normalizeEngineToolMode(form.tool_mode));
-  // 留空表示不覆盖默认值；写 0 会让 engine 一个 worker 都不起。
-  out = upsertYamlNested(out, [...RUNTIME_MAX_WORKERS_PATH], intText(form.max_workers, 1));
-  // 0 各有含义：软阈值 0 关掉自动压缩，硬阈值 0 取软阈值的 1.25 倍，保留量 0 改按段数算。
-  out = upsertYamlNested(out, [...RUNTIME_COMPACT_THRESHOLD_PATH], intText(form.compact_threshold_tokens));
-  out = upsertYamlNested(out, [...RUNTIME_COMPACT_HARD_THRESHOLD_PATH], intText(form.compact_hard_threshold_tokens));
-  out = upsertYamlNested(out, [...RUNTIME_COMPACT_KEEP_TOKENS_PATH], intText(form.compact_keep_recent_tokens));
-  out = upsertYamlNested(out, [...RUNTIME_COMPACT_KEEP_SEGMENTS_PATH], intText(form.compact_keep_recent, 2));
-  return out;
+  if (entryNode !== current.entry_node_id) edits.push({ path: RUNTIME_ENTRY_NODE_PATH, value: entryNode || undefined });
+  const toolMode = toolModeText(form.tool_mode);
+  if (toolMode !== current.tool_mode) edits.push({ path: RUNTIME_TOOL_MODE_PATH, value: toolMode || undefined });
+  const numbers: Array<[keyof RuntimeConfigFormState, readonly string[], number]> = [
+    // 留空表示不覆盖默认值；写 0 会让 engine 一个 worker 都不起。
+    ['max_workers', RUNTIME_MAX_WORKERS_PATH, 1],
+    // 0 各有含义：软阈值 0 关掉自动压缩，硬阈值 0 取软阈值的 1.25 倍，保留量 0 改按段数算。
+    ['compact_threshold_tokens', RUNTIME_COMPACT_THRESHOLD_PATH, 0],
+    ['compact_hard_threshold_tokens', RUNTIME_COMPACT_HARD_THRESHOLD_PATH, 0],
+    ['compact_keep_recent_tokens', RUNTIME_COMPACT_KEEP_TOKENS_PATH, 0],
+    ['compact_keep_recent', RUNTIME_COMPACT_KEEP_SEGMENTS_PATH, 2],
+  ];
+  for (const [field, path, min] of numbers) {
+    if (form[field].trim() !== current[field]) edits.push({ path, value: intValue(form[field], min) });
+  }
+  return editYamlKeys(raw, edits);
 }
 
-// ==================== Schedules ====================
-
-export function parseSchedules(raw: string): ScheduleFormState[] {
-  const doc = safeLoad(raw);
-  const list = doc.schedules === undefined ? [] : doc.schedules;
+/** 文件里的定时任务原样的那几项。schedules 没写或写成空值都算没有，和 supervisor/scheduler.py 一致。 */
+function scheduleList(raw: string): Record<string, any>[] {
+  const list = safeLoad(raw).schedules ?? [];
   if (!Array.isArray(list) || list.some(item => !item || typeof item !== 'object' || Array.isArray(item))) throw new Error('schedules 必须是对象数组，原文件未修改');
   if (list.some(item => item.type !== undefined && !['message', 'script'].includes(item.type))) throw new Error('存在不支持的定时任务类型，请用原文编辑');
-  return list
-    .map((item: Record<string, any>) => ({
-      original: { ...item },
-      id: str(item.id),
-      cron: str(item.cron),
-      type: (item.type === 'script' ? 'script' : 'message') as 'message' | 'script',
-      text: str(item.text),
-      command: str(item.command),
-      enabled: item.enabled !== false,
-      once: item.once === true,
-      conversation_key: str(item.conversation_key),
-      entry_node_id: str(item.entry_node_id),
-      workflow_id: str(item.workflow_id),
-      timeout: item.timeout === undefined ? '' : String(item.timeout),
-      silent: item.silent !== false,
-    }));
+  return list;
 }
 
-export function serializeSchedules(schedules: ScheduleFormState[], raw = ''): string {
-  parseSchedules(raw);
-  const items = schedules.map((s) => {
-    const obj: Record<string, any> = {
-      ...s.original,
-      id: s.id, cron: s.cron, type: s.type, text: s.text,
-      enabled: s.enabled, once: s.once,
-    };
-    for (const key of ['conversation_key', 'entry_node_id', 'workflow_id'] as const) {
-      if (s[key]) obj[key] = s[key]; else delete obj[key];
-    }
-    if (s.type === 'script') {
-      obj.command = s.command;
-      if (s.timeout) obj.timeout = Number(s.timeout) || s.timeout; else delete obj.timeout;
-      obj.silent = s.silent;
-    } else {
-      delete obj.command; delete obj.timeout; delete obj.silent;
-    }
-    return obj;
-  });
-  return yaml.dump({ ...safeLoad(raw), schedules: items }, DUMP_OPTS);
+function scheduleForm(item: Record<string, any>): ScheduleFormState {
+  return {
+    original: { ...item },
+    id: str(item.id),
+    cron: str(item.cron),
+    type: item.type === 'script' ? 'script' : 'message',
+    text: str(item.text),
+    command: str(item.command),
+    enabled: item.enabled !== false,
+    once: item.once === true,
+    conversation_key: str(item.conversation_key),
+    entry_node_id: str(item.entry_node_id),
+    workflow_id: str(item.workflow_id),
+    timeout: item.timeout === undefined ? '' : String(item.timeout),
+    silent: item.silent !== false,
+  };
 }
 
-// ==================== MCP Clients ====================
+export function parseSchedules(raw: string): ScheduleFormState[] {
+  return scheduleList(raw).map(scheduleForm);
+}
+
+const schedulesEdit = (items: readonly Record<string, unknown>[]): YamlKeyEdit => ({ path: ['schedules'], value: items });
+
+const scheduleTimeout = (text: string): unknown => Number(text) || text;
+
+/** 表单改过的字段写回这一项，没动的键（含表单不认识的）原样留着；换了类型才连带清掉另一种类型的键。 */
+function scheduleItem(original: Record<string, any>, form: ScheduleFormState): Record<string, unknown> {
+  const before = scheduleForm(original);
+  const item: Record<string, unknown> = { ...original };
+  const changed = (key: keyof ScheduleFormState) => form[key] !== before[key];
+  for (const key of ['cron', 'text', 'enabled', 'once'] as const) {
+    if (changed(key)) item[key] = form[key];
+  }
+  for (const key of ['conversation_key', 'entry_node_id', 'workflow_id'] as const) {
+    if (!changed(key)) continue;
+    if (form[key]) item[key] = form[key]; else delete item[key];
+  }
+  const switched = changed('type');
+  if (switched) item.type = form.type;
+  if (form.type === 'script') {
+    if (switched || changed('command')) item.command = form.command;
+    if (switched || changed('timeout')) {
+      if (form.timeout) item.timeout = scheduleTimeout(form.timeout); else delete item.timeout;
+    }
+    if (switched || changed('silent')) item.silent = form.silent;
+  } else if (switched) {
+    delete item.command; delete item.timeout; delete item.silent;
+  }
+  return item;
+}
+
+function newScheduleItem(form: ScheduleFormState): Record<string, unknown> {
+  const item: Record<string, unknown> = {
+    id: form.id, cron: form.cron, type: form.type, text: form.text, enabled: form.enabled, once: form.once,
+  };
+  for (const key of ['conversation_key', 'entry_node_id', 'workflow_id'] as const) {
+    if (form[key]) item[key] = form[key];
+  }
+  if (form.type === 'script') {
+    item.command = form.command;
+    if (form.timeout) item.timeout = scheduleTimeout(form.timeout);
+    item.silent = form.silent;
+  }
+  return item;
+}
+
+/** 改一项：它在打开之后被别处改过就报冲突；其余任务一字不动。 */
+export function scheduleUpdateEdits(raw: string, loaded: ScheduleFormState, form: ScheduleFormState): YamlKeyEdit[] {
+  const items = scheduleList(raw);
+  const index = items.findIndex((item) => str(item.id) === loaded.id);
+  if (index < 0) throw new Error('未在 schedules.yaml 中找到此定时任务。');
+  if (itemChangedSince(loaded, { original: items[index] })) throw new StaleKeysError([`schedules.${loaded.id}`]);
+  return [schedulesEdit(items.map((item, i) => (i === index ? scheduleItem(item, form) : item)))];
+}
+
+export function scheduleCreateEdits(raw: string, form: ScheduleFormState): YamlKeyEdit[] {
+  const items = scheduleList(raw);
+  if (items.some((item) => str(item.id) === form.id)) throw new Error('该任务 ID 已存在');
+  return [schedulesEdit([...items, newScheduleItem(form)])];
+}
+
+export function scheduleRemoveEdits(raw: string, id: string): YamlKeyEdit[] {
+  return [schedulesEdit(scheduleList(raw).filter((item) => str(item.id) !== id))];
+}
+
+type McpTransport = McpClientFormState['transport'];
+
+// 与 toolbox/mcp_runtime.py 的 _normalize_transport 一致：没写或认不出的都按 stdio 起。
+function normalizeMcpTransport(value: unknown): McpTransport {
+  const text = String(value || 'stdio').trim().toLowerCase().replace(/-/g, '_');
+  if (['streamablehttp', 'streamable_http', 'http', 'streamable'].includes(text)) return 'streamable_http';
+  return text === 'sse' ? 'sse' : 'stdio';
+}
+
+const isHttpTransport = (transport: McpTransport): boolean => transport !== 'stdio';
+
+/** 文件里的 clients 映射。没写或写成空值都算没有，和 toolbox/mcp_runtime.py 一致。 */
+function mcpClientMap(raw: string): Record<string, Record<string, any>> {
+  const clients = safeLoad(raw).clients ?? {};
+  if (typeof clients !== 'object' || Array.isArray(clients) || Object.values(clients).some(v => !v || typeof v !== 'object' || Array.isArray(v))) throw new Error('clients 必须是对象映射，原文件未修改');
+  return clients;
+}
+
+function mcpClientForm(id: string, spec: Record<string, any>): McpClientFormState {
+  return {
+    original: { ...spec },
+    id,
+    description: str(spec.description),
+    enabled: spec.enabled !== false,
+    transport: normalizeMcpTransport(spec.transport),
+    command: str(spec.command),
+    argsText: Array.isArray(spec.args) ? JSON.stringify(spec.args) : '[]',
+    envText: serializeLooseKV(spec.env),
+    url: str(spec.url),
+    headersText: serializeLooseKV(spec.headers),
+  };
+}
 
 export function parseMcpClients(raw: string): McpClientFormState[] {
-  const doc = safeLoad(raw);
-  const clients = doc.clients;
-  if (clients === undefined) return [];
-  if (!clients || typeof clients !== 'object' || Array.isArray(clients) || Object.values(clients).some(v => !v || typeof v !== 'object' || Array.isArray(v))) throw new Error('clients 必须是对象映射，原文件未修改');
-  return Object.entries(clients)
-    .map(([id, v]) => {
-      const c = v as Record<string, any>;
-      if (c.transport !== undefined && !['stdio', 'sse', 'streamable_http'].includes(c.transport)) throw new Error('存在不支持的 MCP 传输方式，请用原文编辑');
-      return {
-        original: { ...c },
-        id,
-        description: str(c.description),
-        enabled: c.enabled !== false,
-        transport: (c.transport === 'sse' ? 'sse' : c.transport === 'stdio' ? 'stdio' : 'streamable_http') as 'stdio' | 'sse' | 'streamable_http',
-        command: str(c.command),
-        argsText: Array.isArray(c.args) ? JSON.stringify(c.args) : '[]',
-        envText: serializeLooseKV(c.env),
-        url: str(c.url),
-        headersText: serializeLooseKV(c.headers),
-      };
-    });
+  return Object.entries(mcpClientMap(raw)).map(([id, spec]) => mcpClientForm(id, spec));
 }
 
-export function serializeMcpClients(clients: McpClientFormState[], raw = ''): string {
-  parseMcpClients(raw);
-  const obj: Record<string, any> = {};
-  for (const c of clients) {
-    const entry: Record<string, any> = {
-      ...c.original,
-      transport: c.transport,
-      enabled: c.enabled,
-      description: c.description,
-    };
-    if (c.transport === 'stdio') {
-      entry.command = c.command;
-      const args = c.argsText.trim().startsWith('[') ? JSON.parse(c.argsText) : c.argsText.split('\n').map(s => s.trim()).filter(Boolean);
-      if (!Array.isArray(args) || args.some(item => typeof item !== 'string')) throw new Error('MCP 启动参数必须是字符串数组');
-      entry.args = args;
-      entry.env = c.original && c.envText === serializeLooseKV(c.original.env) ? c.original.env : parseLooseKV(c.envText);
-      delete entry.url; delete entry.headers;
-    } else {
-      entry.url = c.url;
-      entry.headers = c.original && c.headersText === serializeLooseKV(c.original.headers) ? c.original.headers : parseLooseKV(c.headersText);
-      delete entry.command; delete entry.args; delete entry.env;
+function mcpArgs(text: string): string[] {
+  const trimmed = text.trim();
+  let args: unknown;
+  if (trimmed.startsWith('[')) {
+    try {
+      args = JSON.parse(trimmed);
+    } catch {
+      throw new Error('MCP 启动参数必须是 JSON 字符串数组');
     }
-    obj[c.id] = entry;
+  } else {
+    args = text.split('\n').map((item) => item.trim()).filter(Boolean);
   }
-  return yaml.dump({ version: 1, ...safeLoad(raw), clients: obj }, DUMP_OPTS);
+  if (!Array.isArray(args) || args.some((item) => typeof item !== 'string')) throw new Error('MCP 启动参数必须是字符串数组');
+  return args;
 }
 
-// ==================== Skills ====================
+const clientPath = (id: string, ...keys: string[]): string[] => ['clients', id, ...keys];
 
-export function parseSkillMarkdown(raw: string, fallbackName: string): SkillFormState {
-  let meta: Record<string, any> = {};
-  let body = raw;
-  if (raw.startsWith('---\n')) {
-    const end = raw.indexOf('\n---\n', 4);
-    if (end >= 0) {
-      try {
-        const parsed = yaml.load(raw.slice(4, end));
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) meta = parsed as Record<string, any>;
-      } catch { /* ignore frontmatter parse errors */ }
-      body = raw.slice(end + 5);
-    }
+function newMcpClientSpec(form: McpClientFormState): Record<string, unknown> {
+  const spec: Record<string, unknown> = { transport: form.transport, enabled: form.enabled };
+  if (form.description) spec.description = form.description;
+  if (isHttpTransport(form.transport)) {
+    spec.url = form.url;
+    spec.headers = parseLooseKV(form.headersText);
+  } else {
+    spec.command = form.command;
+    spec.args = mcpArgs(form.argsText);
+    spec.env = parseLooseKV(form.envText);
   }
-  const keywords = Array.isArray(meta.keywords) ? meta.keywords.map(String) : [];
+  return spec;
+}
+
+/** 只写和打开时不一样的字段；在 stdio 和 http 两类之间换了传输方式，才连带清掉另一类的键。 */
+function mcpClientFieldEdits(before: McpClientFormState, after: McpClientFormState): YamlKeyEdit[] {
+  const changed = (key: keyof McpClientFormState) => after[key] !== before[key];
+  const at = (key: string) => clientPath(after.id, key);
+  const crossed = isHttpTransport(after.transport) !== isHttpTransport(before.transport);
+  const edits: YamlKeyEdit[] = [];
+  if (changed('description')) edits.push({ path: at('description'), value: after.description || undefined });
+  if (changed('enabled')) edits.push({ path: at('enabled'), value: after.enabled });
+  if (changed('transport')) edits.push({ path: at('transport'), value: after.transport });
+  if (isHttpTransport(after.transport)) {
+    if (crossed || changed('url')) edits.push({ path: at('url'), value: after.url });
+    if (crossed || changed('headersText')) edits.push({ path: at('headers'), value: parseLooseKV(after.headersText) });
+    if (crossed) for (const key of ['command', 'args', 'env']) edits.push({ path: at(key), value: undefined });
+  } else {
+    if (crossed || changed('command')) edits.push({ path: at('command'), value: after.command });
+    if (crossed || changed('argsText')) edits.push({ path: at('args'), value: mcpArgs(after.argsText) });
+    if (crossed || changed('envText')) edits.push({ path: at('env'), value: parseLooseKV(after.envText) });
+    if (crossed) for (const key of ['url', 'headers']) edits.push({ path: at(key), value: undefined });
+  }
+  return edits;
+}
+
+/** 改一个 Client：它在打开之后被别处改过就报冲突；其余 Client 一字不动。 */
+export function mcpClientUpdateEdits(raw: string, loaded: McpClientFormState, form: McpClientFormState): YamlKeyEdit[] {
+  const spec = mcpClientMap(raw)[loaded.id];
+  if (!spec) throw new Error('未在 MCP YAML 中找到此 Client。');
+  if (itemChangedSince(loaded, { original: spec })) throw new StaleKeysError([`clients.${loaded.id}`]);
+  return mcpClientFieldEdits(loaded, form);
+}
+
+export function mcpClientCreateEdits(raw: string, form: McpClientFormState): YamlKeyEdit[] {
+  if (mcpClientMap(raw)[form.id]) throw new Error('该 MCP Client 已存在');
+  return [{ path: clientPath(form.id), value: newMcpClientSpec(form) }];
+}
+
+export function mcpClientRemoveEdits(raw: string, id: string): YamlKeyEdit[] {
+  mcpClientMap(raw);
+  return [{ path: clientPath(id), value: undefined }];
+}
+
+const FRONTMATTER = /^---(\r?\n)([\s\S]*?)\r?\n---(\r?\n|$)/;
+
+interface SkillParts {
+  eol: string;
+  meta: string;
+  /** 收尾那行「---」后面跟的换行，文件到此为止时是空串。 */
+  close: string;
+  body: string;
+}
+
+function splitFrontmatter(raw: string): SkillParts {
+  const match = raw.match(FRONTMATTER);
+  if (!match) throw new Error('技能文件缺少 YAML frontmatter，请修复后再保存。');
+  return { eol: match[1], meta: match[2], close: match[3], body: raw.slice(match[0].length) };
+}
+
+export function parseSkillQuickFields(raw: string): SkillQuickFields {
+  const { meta } = splitFrontmatter(raw);
+  const parsed = yaml.load(meta);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('技能 frontmatter 必须是对象。');
+  const value = parsed as Record<string, unknown>;
   return {
-    name: str(meta.name, fallbackName),
-    description: str(meta.description),
-    enabled: meta.enabled !== false,
-    strategy: meta.strategy === 'constant' ? 'constant' : 'normal',
-    keywordsText: keywords.join('\n'),
-    order: meta.order === undefined ? '0' : String(meta.order),
-    priority: meta.priority === undefined ? '0' : String(meta.priority),
-    scan_depth: meta.scan_depth === undefined ? '0' : String(meta.scan_depth),
-    body,
+    enabled: value.enabled !== false,
+    strategy: String(value.strategy || 'normal'),
+    keywords: Array.isArray(value.keywords) ? value.keywords.map(String).join(', ') : String(value.keywords || ''),
+    order: String(value.order ?? 0),
+    priority: String(value.priority ?? 0),
+    scan_depth: String(value.scan_depth ?? 0),
   };
 }
 
-export function serializeSkillMarkdown(form: SkillFormState): string {
-  const keywords = form.keywordsText.split('\n').map((s) => s.trim()).filter(Boolean);
-  const meta: Record<string, any> = {
-    name: form.name,
-    description: form.description,
-    enabled: form.enabled,
-    strategy: form.strategy,
-    keywords,
-    order: Number(form.order) || 0,
-    priority: Number(form.priority) || 0,
-    scan_depth: Number(form.scan_depth) || 0,
-  };
-  const frontmatter = yaml.dump(meta, DUMP_OPTS);
-  return `---\n${frontmatter}---\n\n${form.body.replace(/^\n+/, '')}`;
+/** 只改 frontmatter 里和原文不一样的那几项；别的键、注释和正文原样留着。 */
+export function serializeSkillQuickFields(raw: string, fields: SkillQuickFields): YamlRewrite {
+  const current = parseSkillQuickFields(raw);
+  const { eol, meta, close, body } = splitFrontmatter(raw);
+  const edits: YamlKeyEdit[] = [];
+  if (fields.enabled !== current.enabled) edits.push({ path: ['enabled'], value: fields.enabled });
+  if (fields.strategy !== current.strategy) edits.push({ path: ['strategy'], value: fields.strategy || 'normal' });
+  if (fields.keywords !== current.keywords) {
+    edits.push({ path: ['keywords'], value: fields.keywords.split(',').map((item) => item.trim()).filter(Boolean) });
+  }
+  for (const key of ['order', 'priority', 'scan_depth'] as const) {
+    if (fields[key] === current[key]) continue;
+    const value = Number(fields[key] || 0);
+    if (!Number.isFinite(value)) throw new Error(`${key} 必须是数字`);
+    edits.push({ path: [key], value });
+  }
+  if (!edits.length) return { content: raw, preserved: true, note: '' };
+  const rewritten = editYamlKeys(meta, edits);
+  // 整份重写的兜底会带一个结尾换行，收尾的「---」前那个换行由这里补。
+  const frontmatter = rewritten.content.replace(/\r?\n$/, '');
+  return { ...rewritten, content: `---${eol}${frontmatter}${eol}---${close}${body}` };
 }
 
 /** 原文编辑器的语法自检。返回空串表示能解析，否则是解析器给出的报错。 */

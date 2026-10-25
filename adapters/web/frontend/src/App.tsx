@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 
 import { checkHealth, getActiveNode, MOUNT, resetConversation } from './api/supervisorClient';
 import { LoginPage } from './components/auth/LoginPage';
@@ -7,7 +8,8 @@ import { PageBoundary } from './components/common/PageBoundary';
 import { AppLayout } from './components/layout';
 import { useChat } from './hooks/useChat';
 import { usePlatformRegistry } from './platforms/usePlatformRegistry';
-import { useChatStore } from './store/chatStore';
+import { selectVisibleHistory, useChatStore } from './store/chatStore';
+import { selectToolsForMessages } from './store/eventSelectors';
 import { useClientPrefsStore } from './store/clientPrefsStore';
 import { useSettingsStore } from './store/settingsStore';
 import { useViewStore, type ViewMode } from './store/viewStore';
@@ -23,6 +25,7 @@ import type { LayoutRenderer, SlotRenderer } from './plugins/sdk';
 import { InstanceDirectory } from './components/instances/InstanceDirectory';
 import { InstanceDirectoryProvider, useInstanceDirectory } from './components/instances/useInstanceDirectory';
 import { isInstanceEntry, rememberInstance } from './instances/navigation';
+import { errorMessage } from './api/request';
 
 const defaultLayout: LayoutRenderer = (props) => <AppLayout {...props} />;
 extensions.builtin('slots', 'app.layout', defaultLayout);
@@ -34,10 +37,14 @@ const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
     conversations, activeConversationId, activeConversation, messages, isGenerating,
     selectConversation, createConversation, deleteConversation, renameConversation, sendMessage, cancelCurrentTask,
   } = useChat();
-  const toolsById = useChatStore(state => state.toolExecutionsById);
+  // The tool table spans every session on the global stream; App re-renders only when the visible tools change.
+  const toolsById = useChatStore(useShallow(state => selectToolsForMessages(state, messages)));
+  const history = useChatStore(selectVisibleHistory);
   const viewingChildSessionId = useChatStore(state => state.viewingChildSessionId);
-  const childNodes = useChatStore(state => state.childNodes);
+  const viewingChildNode = useChatStore(state => (state.viewingChildSessionId ? state.childNodes[state.viewingChildSessionId] : undefined));
   const exitChildSession = useChatStore(state => state.exitChildSession);
+  const loadOlderHistory = useChatStore(state => state.loadOlderHistory);
+  const retryHistory = useChatStore(state => state.retryHistory);
   const activeSettingsTab = useViewStore(state => state.activeSettingsTab);
   const storageWarning = useSettingsStore(state => state.storageWarning);
   const preferenceWarning = useClientPrefsStore(state => state.storageWarning);
@@ -47,11 +54,14 @@ const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
   const [cancelling, setCancelling] = useState(false);
   const resetLock = useRef(false);
   const cancelLock = useRef(false);
-  const viewingChildNode = viewingChildSessionId ? childNodes[viewingChildSessionId] : undefined;
   const activeSessionId = viewingChildSessionId || activeConversation?.sessionId || '';
   const activeTitle = viewingChildSessionId ? `子节点: ${viewingChildNode?.nodeId || viewingChildSessionId}` : activeConversation?.title || '未选择对话';
 
-  useEffect(() => { void useChatStore.getState().loadStartup(); }, []);
+  // Leaving the console (logout) must not keep the global stream or the previous login's chats in memory.
+  useEffect(() => {
+    useChatStore.getState().loadStartup();
+    return () => useChatStore.getState().resetState();
+  }, []);
   const setConnected = useSettingsStore(state => state.setConnected);
   useEffect(() => {
     let active = true; let checking = false;
@@ -94,7 +104,7 @@ const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
     if (cancelLock.current || useChatStore.getState().viewingChildSessionId) return;
     cancelLock.current = true; setCancelling(true); setNotice(null);
     try { await cancelCurrentTask(); setNotice({ text: '已提交取消请求。' }); }
-    catch (error) { setNotice({ text: error instanceof Error ? error.message : '取消失败，请重试。', error: true }); }
+    catch (error) { setNotice({ text: errorMessage(error, '取消失败，请重试。'), error: true }); }
     finally { cancelLock.current = false; setCancelling(false); }
   };
   const confirmReset = async () => {
@@ -107,7 +117,7 @@ const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
       await resetConversation(`web:${target.id}`);
       useChatStore.getState().resetConversationView(target.id, target.sessionId);
       setResetTarget(null); setNotice({ text: `已重置“${target.title}”，下一条消息将开始新的上下文。` });
-    } catch (error) { setNotice({ text: error instanceof Error ? error.message : '重置失败，请重试。', error: true }); }
+    } catch (error) { setNotice({ text: errorMessage(error, '重置失败，请重试。'), error: true }); }
     finally { resetLock.current = false; setResetting(false); }
   };
 
@@ -122,7 +132,8 @@ const MainApp = ({ viewMode }: { viewMode: ViewMode }) => {
   bindCommands({ 'chat.send': handleSend, 'chat.cancel': handleCancel, 'chat.reset': requestReset, 'chat.reset.confirm': confirmReset });
   const viewContext: AppViewContext = {
     sessionId: activeSessionId, title: activeTitle, conversations, activeConversationId, messages,
-    toolsById, isGenerating, isCancelling: cancelling, viewingChildSessionId, viewingChildNodeId: viewingChildNode?.nodeId,
+    toolsById, history, onLoadOlderHistory: () => void loadOlderHistory(), onRetryHistory: retryHistory,
+    isGenerating, isCancelling: cancelling, viewingChildSessionId, viewingChildNodeId: viewingChildNode?.nodeId,
     activeSettingsTab, onExitChildSession: exitChildSession,
     onCreateConversation: createConversation,
     onSelectConversation: selectConversation, onDeleteConversation: deleteConversation,

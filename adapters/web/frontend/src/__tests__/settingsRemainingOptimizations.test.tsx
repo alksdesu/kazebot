@@ -109,8 +109,8 @@ describe('remaining Settings optimizations', () => {
     const nameInput = await screen.findByLabelText('名称');
     expect(nameInput).toHaveValue('EreunaMain');
     expect(screen.getByLabelText('节点 ID')).toHaveTextContent('ereuna_main');
-    // tool_access 只有 YAML 原文能改，结构化表单必须把人指过去。
-    expect(screen.getByText(/工具权限（tool_access）要在下面的高级 YAML 编辑里改/)).toBeInTheDocument();
+    // tool_access 只有 YAML 原文能改，结构化表单必须把人指过去；表单只动改过的字段，注释是保得住的。
+    expect(screen.getByText('工具权限（tool_access）在下面的 YAML 原文里改。表单只改动过的那几个字段，其余原文和注释照旧。')).toBeInTheDocument();
 
     fireEvent.change(nameInput, { target: { value: 'Ereuna' } });
     fireEvent.change(screen.getByLabelText('委派目标，使用英文逗号分隔'), { target: { value: 'smith, scout' } });
@@ -153,7 +153,7 @@ describe('remaining Settings optimizations', () => {
     expect(editor).toHaveValue(rawMarkdown);
 
     fireEvent.change(editor, { target: { value: `${rawMarkdown}\nExtra line\n` } });
-    fireEvent.click(within(details).getByRole('button', { name: '保存 Raw Markdown' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存技能' }));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/v1/admin/config/skills/skill_alpha/raw', expect.objectContaining({
       method: 'PUT',

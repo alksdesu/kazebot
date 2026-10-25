@@ -1,5 +1,4 @@
 // 热载配置的草稿态。每份配置文件一份：平台配置、不分平台的全局默认，可以同时攒着没写回的改动。
-import yaml from 'js-yaml';
 import { create, type StoreApi, type UseBoundStore } from 'zustand';
 
 import {
@@ -23,7 +22,9 @@ import {
 import { entrypointNote, getPlatform } from '../platforms/registry';
 import { FEATURES_SCOPE, platformScope, useConfigScope, type ConfigScope } from './configScope';
 import { joinNotes } from './format';
-import { rewriteYaml, type YamlRewrite } from './yamlRewrite';
+import { commitYamlKeys } from './yamlCommit';
+import { editYamlKeys, readYamlPath, setYamlPath, type YamlKeyEdit, type YamlRewrite } from './yamlRewrite';
+import { errorMessage } from '../api/request';
 
 /** 草稿按 live_config 的键名存（如 signal_at），不是 yaml 的点分路径。
  *
@@ -77,78 +78,27 @@ export interface ConsoleState {
   dismissNotice: () => void;
 }
 
-// 不设 noCompatMode：留着 js-yaml 的兼容引号，裸写的 on/off/yes/no 和 12:30 会被 YAML 1.1 读者当成布尔和 750。
-const DUMP_OPTIONS: yaml.DumpOptions = {
-  indent: 2,
-  lineWidth: -1,
-  noRefs: true,
-  sortKeys: false,
-  quotingType: '"',
-  forceQuotes: false,
-};
-
-function parseDocument(raw: string): Record<string, unknown> {
-  const loaded = yaml.load(raw);
-  if (loaded === undefined || loaded === null) return {};
-  if (typeof loaded !== 'object' || Array.isArray(loaded)) throw new Error('配置顶层必须是映射，请先修复 YAML，原文件未修改');
-  return loaded as Record<string, unknown>;
-}
-
-const isMapping = (value: unknown): value is Record<string, unknown> => (
-  Boolean(value) && typeof value === 'object' && !Array.isArray(value)
-);
-
 /** 把点分路径写进嵌套对象。undefined 表示删掉这个键，删空的上级段一并去掉。 */
 export function setByPath(doc: Record<string, unknown>, path: string, value: unknown): void {
-  const parts = path.split('.');
-  const leaf = parts[parts.length - 1];
-  if (value === undefined) {
-    const trail: Record<string, unknown>[] = [doc];
-    for (const key of parts.slice(0, -1)) {
-      const next = trail[trail.length - 1][key];
-      if (!isMapping(next)) return;
-      trail.push(next);
-    }
-    const parent = trail[trail.length - 1];
-    // 文件里本来就没有这个键：原样不动，用户自己留的空段也不替他收。
-    if (!Object.prototype.hasOwnProperty.call(parent, leaf)) return;
-    delete parent[leaf];
-    // 删完留下一串空段（trigger: {signals: {}}）看着像写坏了，从里往外收掉。
-    for (let depth = trail.length - 1; depth > 0 && !Object.keys(trail[depth]).length; depth -= 1) {
-      delete trail[depth - 1][parts[depth - 1]];
-    }
-    return;
-  }
-  let cursor: Record<string, unknown> = doc;
-  for (const key of parts.slice(0, -1)) {
-    const next = cursor[key];
-    if (next !== undefined && !isMapping(next)) throw new Error(`配置路径 ${key} 不是映射，原文件未修改`);
-    if (next === undefined) cursor[key] = {};
-    cursor = cursor[key] as Record<string, unknown>;
-  }
-  cursor[leaf] = value;
+  setYamlPath(doc, path.split('.'), value);
 }
 
 export function readByPath(doc: Record<string, unknown> | undefined, path: string): unknown {
-  let cursor: unknown = doc;
-  for (const key of path.split('.')) {
-    if (!isMapping(cursor)) return undefined;
-    cursor = cursor[key];
-  }
-  return cursor;
+  return readYamlPath(doc, path.split('.'));
 }
 
-/** 把草稿合进原文，返回要 PUT 上去的整份 yaml。只改草稿里那几个键，运营者手写的注释和空行照旧。
- *
- * paths 同时当白名单用：后端会拒绝无人消费的键，用它转换就不可能写出未知键。 */
-export function mergeDraft(raw: string, draft: Draft, paths: Record<string, string>): YamlRewrite {
-  const doc = parseDocument(raw);
-  for (const [name, value] of Object.entries(draft)) {
+/** 草稿换成按 yaml 路径的改动。paths 同时当白名单用：后端会拒绝无人消费的键，用它转换就不可能写出未知键。 */
+function draftEdits(draft: Draft, paths: Record<string, string>): YamlKeyEdit[] {
+  return Object.entries(draft).map(([name, value]) => {
     const path = paths[name];
     if (!path) throw new Error(`没有公布配置项 ${name}，拒绝写入`);
-    setByPath(doc, path, value === null ? undefined : value);
-  }
-  return rewriteYaml(raw, doc, DUMP_OPTIONS);
+    return { path: path.split('.'), value: value === null ? undefined : value };
+  });
+}
+
+/** 把草稿合进原文，返回要 PUT 上去的整份 yaml。只改草稿里那几个键，运营者手写的注释和空行照旧。 */
+export function mergeDraft(raw: string, draft: Draft, paths: Record<string, string>): YamlRewrite {
+  return editYamlKeys(raw, draftEdits(draft, paths));
 }
 
 const sleep = (ms: number) => new Promise((done) => { setTimeout(done, ms); });
@@ -291,14 +241,12 @@ const createConsoleState = (scope: ConfigScope) => (
 
   /** 把草稿合进磁盘上最新那份原文写回。返回写进去的原文和要交代的警告。 */
   const write = async (token: string, live: ConfigLiveState | null, subset: Draft) => {
-    const latest = await api.getRaw(token);
-    const merged = mergeDraft(latest.content, subset, live?.state?.paths || {});
-    // 合并的底子是刚读的这一版：读和写之间被共享组里别的实例改了，就报冲突，不拿旧底子盖掉。
-    const result = await api.putRaw(token, merged.content, latest.hash);
-    return {
-      content: merged.content,
-      warnings: merged.note ? [...result.warnings, merged.note] : result.warnings,
-    };
+    const { content, note, result } = await commitYamlKeys({
+      read: () => api.getRaw(token),
+      write: (merged, hash) => api.putRaw(token, merged, hash),
+      edits: draftEdits(subset, live?.state?.paths || {}),
+    });
+    return { content, warnings: note ? [...result.warnings, note] : result.warnings };
   };
 
   /** 探一次：文件还是不是写进去的那份，生效方换上没有。 */
@@ -391,7 +339,7 @@ const createConsoleState = (scope: ConfigScope) => (
       await confirm(token, { generation, content: saved.content, subset });
       return { ok: true, message: joinNotes(...saved.warnings) };
     } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : '写入失败' };
+      return { ok: false, message: errorMessage(error, '写入失败') };
     } finally {
       set({ saving: false });
     }
@@ -428,7 +376,7 @@ const createConsoleState = (scope: ConfigScope) => (
         });
       } catch (error) {
         if (version !== refreshVersions.get(scope.id)) return;
-        set({ loading: false, loadError: error instanceof Error ? error.message : '读取配置失败' });
+        set({ loading: false, loadError: errorMessage(error, '读取配置失败') });
       }
     },
 

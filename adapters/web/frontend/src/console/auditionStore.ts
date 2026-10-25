@@ -9,6 +9,7 @@ import {
 } from '../api/supervisorClient';
 import { FEATURES_SCOPE } from './configScope';
 import { configStore, effectiveValues, platformConsoleStore } from './consoleStore';
+import { errorMessage } from '../api/request';
 
 /** 两个发送者，因为「每人冷却」按 (群, 人) 分组 —— 只有一个人时它和「每群冷却」看不出区别。 */
 export const SENDERS = {
@@ -165,7 +166,7 @@ export const useAuditionStore = create<AuditionState>((set, get) => ({
       set({ result, resultIds: asked, loading: false });
     } catch (error) {
       if (mine !== issued) return;
-      set({ loading: false, error: error instanceof Error ? error.message : '试听失败' });
+      set({ loading: false, error: errorMessage(error, '试听失败') });
     }
   },
 }));

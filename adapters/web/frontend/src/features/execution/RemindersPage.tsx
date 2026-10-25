@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import { errorMessage } from '../../api/request';
 import { featureRequest } from '../client';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { startPolling } from '../../utils/polling';
@@ -48,7 +49,7 @@ export function RemindersPage({ scope: initialScope = 'web:console', embedded = 
       const result = await featureRequest<unknown>('/v1/reminders', { scope });
       if (!identity.isCurrent() || request !== sequence.current) return;
       setItems(readReminders(result)); setReadError('');
-    } catch (reason) { if (identity.isCurrent() && request === sequence.current) setReadError(String(reason)); }
+    } catch (reason) { if (identity.isCurrent() && request === sequence.current) setReadError(errorMessage(reason)); }
     finally { if (identity.isCurrent() && request === sequence.current) setLoading(false); }
   }, [scope]);
   useEffect(() => {
@@ -60,7 +61,7 @@ export function RemindersPage({ scope: initialScope = 'web:console', embedded = 
     if (mutating.current) return;
     mutating.current = true; sequence.current++; setBusy(true); setError(''); setNotice('');
     try { await action(); if (identity.isCurrent()) { setNotice(message); await refresh(); } }
-    catch (reason) { if (identity.isCurrent()) setError(String(reason)); }
+    catch (reason) { if (identity.isCurrent()) setError(errorMessage(reason)); }
     finally { mutating.current = false; if (identity.isCurrent()) setBusy(false); }
   };
   const validMinutes = /^\d+$/.test(minutes) && Number(minutes) >= 1 && Number(minutes) <= 525600;

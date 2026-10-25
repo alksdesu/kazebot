@@ -30,7 +30,7 @@ describe('独立实例入口', () => {
     expect(fetchMock).toHaveBeenNthCalledWith(2, `${mount}/v1/community/state?scope=qq_group%3Asynthetic`, expect.objectContaining({ headers: { Authorization: 'Bearer selected-token' } }));
     const socket = vi.fn();
     vi.stubGlobal('WebSocket', class { readyState = 0; constructor(url: string) { socket(url); } close() {} });
-    client.connectGlobalWS(0, () => {});
+    client.connectGlobalWS({ onEvent: () => {} });
     expect(socket).toHaveBeenCalledExactlyOnceWith(`ws://${window.location.host}${mount}/v1/ws`);
     client.disconnectGlobalWS();
     writeAlias('qq', '123', '本实例备注');

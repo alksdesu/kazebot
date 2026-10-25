@@ -1,6 +1,6 @@
 import { useLayoutEffect } from 'react';
-import { MOUNT } from '../api/supervisorClient';
-import { fetchWithDeadline } from '../api/requestDeadline';
+import { ApiError, send } from '../api/request';
+import { MOUNT } from '../instances/paths';
 import { useSettingsStore } from '../store/settingsStore';
 import { extensions } from './registry';
 import { createPluginSdk, type FrontendPluginModule, type PluginDisposer } from './sdk';
@@ -80,10 +80,8 @@ export class FrontendPluginRuntime {
     return task;
   }
   private async request(path: string, signal: AbortSignal) {
-    const response = await fetchWithDeadline(`${MOUNT}/v1/admin/plugins${path}`, {
-      headers: { Authorization: `Bearer ${this.token}` }, signal,
-    }, undefined, true);
-    if (!response.ok) throw new Error(`Plugin request failed (${response.status})`);
+    const response = await send(`${MOUNT}/v1/admin/plugins${path}`, { token: this.token, signal, bypassPlugins: true });
+    if (!response.ok) throw new ApiError(response.status, 'Plugin request failed');
     return response;
   }
   private async synchronize(epoch: number) {
@@ -193,10 +191,9 @@ export class FrontendPluginRuntime {
     const request = (path: string, init: RequestInit = {}) => {
       if (!valid()) throw new Error('Plugin generation has expired');
       if (!path.startsWith('/') || path.startsWith('//') || path.split(/[/?#]/).some((part) => decodeURIComponent(part) === '..')) throw new Error('SDK request path must be relative to this instance API');
-      const headers = new Headers(init.headers);
-      headers.set('Authorization', `Bearer ${this.token}`);
+      const { headers, ...rest } = init;
       const signal = init.signal ? AbortSignal.any([controller.signal, init.signal]) : controller.signal;
-      return fetchWithDeadline(`${MOUNT}/v1${path}`, { ...init, headers, signal });
+      return send(`${MOUNT}/v1${path}`, { ...rest, headers: headers ? Object.fromEntries(new Headers(headers)) : undefined, signal, token: this.token });
     };
     updateBrowserPlugin(plugin.id, { desiredHash: plugin.desired_hash, status: 'loading', errors: [] });
     try {

@@ -1,13 +1,11 @@
-// [2026-05-17] MessageBubble: Lim-Code-style tool rows over Clonoth's flat history model.
+// 平铺历史模型的聊天气泡：工具行、思考、审批与附件。
 import { useState } from 'react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
 
 import type { ChatMessage, ToolCall } from '../../types';
-import { attachmentHref } from '../../api/supervisorClient';
-import { useSettingsStore } from '../../store/settingsStore';
 import { Icon } from '../common';
+import { Markdown } from '../common/Markdown';
 import { ApprovalCard } from './ApprovalCard';
+import { AttachmentList } from './AttachmentList';
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -114,7 +112,6 @@ const ToolCallRow = ({ toolCall, index, expanded, onToggle }: ToolCallRowProps) 
 export const MessageBubble = ({ message }: MessageBubbleProps) => {
   const [thinkingOpen, setThinkingOpen] = useState(false);
   const [expandedToolIds, setExpandedToolIds] = useState<Set<string>>(new Set());
-  const adminToken = useSettingsStore((state) => state.adminToken);
 
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
@@ -228,37 +225,11 @@ export const MessageBubble = ({ message }: MessageBubbleProps) => {
         ) : message.content ? (
           /* Main content */
           <div className="markdown-body text-sm leading-6 text-[var(--duties-text)]">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+            <Markdown>{message.content}</Markdown>
           </div>
         ) : null}
 
-        {/* Attachments */}
-        {message.attachments && message.attachments.length > 0 && (
-          <div className="mt-2 flex flex-wrap gap-2">
-            {message.attachments.map((att, i) => {
-              const isImage = att.type === 'image' || att.mime_type?.startsWith('image/');
-              const href = att.path ? attachmentHref(att.path, adminToken) : att.url;
-              if (isImage && href) {
-                return <img key={i} src={href} alt={att.name} className="max-h-64 border border-[var(--duties-border)]" />;
-              }
-              return (
-                <a
-                  key={i}
-                  href={href}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1 border border-[var(--duties-border)] px-2 py-0.5 text-xs text-[var(--duties-secondary)] transition-colors hover:border-[var(--duties-text)]"
-                >
-                  {/* [2026-06-01] Why: replace the attachment emoji with Material Symbols.
-                      How: render attach_file before the file name. Purpose: attachment
-                      rows share the same icon font as message badges. */}
-                  <Icon name="attach_file" size={14} />
-                  <span>{att.name}</span>
-                </a>
-              );
-            })}
-          </div>
-        )}
+        {message.attachments && <AttachmentList attachments={message.attachments} />}
       </div>
     </div>
   );

@@ -6,6 +6,8 @@ import { deleteNodeFile, getNodeFileRaw, getNodeFiles, updateNodeFileRaw, type N
 import { useSettingsStore } from '../../../store/settingsStore';
 import { overlaySourceLabel, removalFor } from '../../../utils/overlaySource';
 import { Block, Button, Field, PageShell, Select, StatusText } from './settingsControls';
+import { savedMessage } from '../../../utils/sentence';
+import { errorMessage } from '../../../api/request';
 
 type FileFilter = 'all' | 'node' | 'fragment' | 'example' | 'changed';
 
@@ -70,7 +72,7 @@ const NodeFilesSettingsPageEditor = () => {
       setLoadError('');
     } catch (error) {
       if (version !== requestVersion.current) return;
-      setLoadError(error instanceof Error ? error.message : '加载节点文件失败');
+      setLoadError(errorMessage(error, '加载节点文件失败'));
     } finally {
       if (version === requestVersion.current) setLoading(false);
     }
@@ -98,7 +100,7 @@ const NodeFilesSettingsPageEditor = () => {
       setContent(file.content); setSaved(file.content); setBase(file.hash); setLoaded(true);
     } catch (error) {
       if (version !== requestVersion.current) return;
-      setLoadError(error instanceof Error ? error.message : '读取文件失败');
+      setLoadError(errorMessage(error, '读取文件失败'));
     } finally {
       if (version === requestVersion.current) setLoading(false);
     }
@@ -110,11 +112,11 @@ const NodeFilesSettingsPageEditor = () => {
     try {
       const result = await updateNodeFileRaw(adminToken, selected, content, base);
       setSaved(content); setBase(result.hash);
-      setMessage(`已保存 ${selected}`);
+      setMessage(savedMessage(`已保存 ${selected}`, '', result.warnings));
       // 保存仓库默认会在 config/nodes 下落一份本实例的，列表里的来源和路径跟着变。
       if (files.find(file => file.name === selected)?.source === 'default') await loadFiles();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '保存失败');
+      setMessage(errorMessage(error, '保存失败'));
     } finally {
       setSaving(false);
     }
@@ -136,7 +138,7 @@ const NodeFilesSettingsPageEditor = () => {
       setMessage(removal.done);
       await loadFiles();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : `${removal.label}失败`);
+      setMessage(errorMessage(error, `${removal.label}失败`));
     } finally {
       setSaving(false);
     }

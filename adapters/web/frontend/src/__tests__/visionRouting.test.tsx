@@ -3,13 +3,13 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { getRuntimeRaw, updateRuntimeRaw } from '../api/supervisorClient';
+import { ApiError, getRuntimeFile, updateRuntimeRaw, type RuntimeFile } from '../api/supervisorClient';
 import { VisionRouting, normalizeMode } from '../console/VisionRouting';
 import { useSettingsStore } from '../store/settingsStore';
 
 vi.mock('../api/supervisorClient', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../api/supervisorClient')>()),
-  getRuntimeRaw: vi.fn(),
+  getRuntimeFile: vi.fn(),
   updateRuntimeRaw: vi.fn(),
 }));
 
@@ -23,8 +23,8 @@ const RUNTIME = [
   '',
 ].join('\n');
 
-const setRuntime = (text: string, hash: string | null = 'runtime-1') =>
-  vi.mocked(getRuntimeRaw).mockResolvedValue({ content: text, hash });
+const setRuntime = (text: string, hash: string | null = 'runtime-1', source: RuntimeFile['source'] = 'override') =>
+  vi.mocked(getRuntimeFile).mockResolvedValue({ content: text, hash, source, path: source === 'override' ? 'config/runtime.yaml' : 'defaults/runtime.yaml' });
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -53,7 +53,7 @@ describe('归一化', () => {
 
 describe('读取', () => {
   it('读取失败时不允许用空配置覆盖 runtime.yaml', async () => {
-    vi.mocked(getRuntimeRaw).mockRejectedValue(new Error('synthetic offline'));
+    vi.mocked(getRuntimeFile).mockRejectedValue(new Error('synthetic offline'));
     render(<VisionRouting />);
     expect(await screen.findByText('synthetic offline')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '保存路由' })).not.toBeInTheDocument();
@@ -113,8 +113,30 @@ describe('保存', () => {
     expect(written).toContain('entry_node_id: qq.orchestrator');
   });
 
+  // 读到的是仓库默认时，写回从空的本实例层开始：默认全文抄过去，之后仓库默认再改就盖不过来了。
+  it('本实例还没有自己的 runtime.yaml 时只落这一个键', async () => {
+    setRuntime(RUNTIME, 'defaults-1', 'default');
+    render(<VisionRouting />);
+    await ready();
+    fireEvent.change(picker(), { target: { value: 'false' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存路由' }));
+
+    await waitFor(() => expect(updateRuntimeRaw).toHaveBeenCalled());
+    expect(vi.mocked(updateRuntimeRaw).mock.calls[0]).toEqual(['admin-token', 'routing:\n  vision:\n    enabled: false\n', 'defaults-1']);
+  });
+
+  it('保存通过但带着提醒时，提醒接在结果后面', async () => {
+    vi.mocked(updateRuntimeRaw).mockResolvedValue({ ok: true, hash: 'runtime-2', warnings: ['routing.vision.entry_node_id 指向的节点不存在'] });
+    render(<VisionRouting />);
+    await ready();
+    fireEvent.change(picker(), { target: { value: 'false' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存路由' }));
+
+    expect(await screen.findByText('已保存。下一条带图消息就按新规矩走。routing.vision.entry_node_id 指向的节点不存在')).toBeTruthy();
+  });
+
   it('写失败时说出来，不假装存上了', async () => {
-    vi.mocked(updateRuntimeRaw).mockRejectedValue(new Error('403 forbidden'));
+    vi.mocked(updateRuntimeRaw).mockRejectedValue(new ApiError(403, 'forbidden'));
     render(<VisionRouting />);
     await ready();
     fireEvent.change(picker(), { target: { value: 'false' } });

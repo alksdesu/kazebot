@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useSettingsStore } from '../store/settingsStore';
 
-const mocks = vi.hoisted(() => ({ health: vi.fn(), providers: vi.fn(), verify: vi.fn(), confirm: vi.fn() }));
+const mocks = vi.hoisted(() => ({ health: vi.fn(), providers: vi.fn(), verify: vi.fn(), confirm: vi.fn(), disconnect: vi.fn() }));
 vi.mock('../api/supervisorClient', () => ({
   MOUNT: '',
   checkHealth: mocks.health,
@@ -10,9 +10,11 @@ vi.mock('../api/supervisorClient', () => ({
   verifyAdminAuth: mocks.verify,
   getNodes: vi.fn().mockResolvedValue([]),
   activeProviderConfig: (value: unknown) => value,
+  disconnectGlobalWS: mocks.disconnect,
 }));
 vi.mock('../hooks/useUnsavedChanges', () => ({ confirmNavigation: mocks.confirm }));
 import { GeneralSettingsPage } from '../components/settings/pages/GeneralSettingsPage';
+import { useChatStore } from '../store/chatStore';
 
 function pending<T>() {
   let resolve!: (value: T) => void;
@@ -66,6 +68,19 @@ describe('通用设置', () => {
     fireEvent.click(screen.getByRole('button', { name: '退出登录' }));
     expect(useSettingsStore.getState().isAuthenticated).toBe(true);
     expect(useSettingsStore.getState().adminToken).toBe('fixture-token');
+    expect(mocks.disconnect).not.toHaveBeenCalled();
+  });
+
+  // 事件流还开着就会继续收旧账号的事件、拿空令牌去自动审批；内存里的对话也不该留给下一个登录的人。
+  it('退出登录先关掉全局事件流、清空内存里的对话，再丢令牌', () => {
+    useChatStore.setState({ conversations: [{ id: 'c1', sessionId: 's1', title: '旧对话', updatedAt: '2026-05-31T00:00:00.000Z' }], activeConversationId: 'c1', connectionStatus: 'open' });
+    render(<GeneralSettingsPage />);
+
+    fireEvent.click(screen.getByRole('button', { name: '退出登录' }));
+
+    expect(mocks.disconnect).toHaveBeenCalledOnce();
+    expect(useChatStore.getState()).toMatchObject({ conversations: [], activeConversationId: null, connectionStatus: 'idle' });
+    expect(useSettingsStore.getState()).toMatchObject({ adminToken: null, isAuthenticated: false });
   });
 
   it('独立未认证页面复用同一个可恢复的登录表单', async () => {

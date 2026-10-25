@@ -6,9 +6,8 @@
 // progress visible inside the same message timeline that owns the text output.
 import { useMemo, useState, type ReactNode } from 'react';
 
-import { decideApproval } from '../../../api/supervisorClient';
+import { useApprovalDecision, type ApprovalDecision } from '../../../hooks/useApprovalDecision';
 import { shouldAutoApproveToolCall, useClientPrefsStore } from '../../../store/clientPrefsStore';
-import { useSettingsStore } from '../../../store/settingsStore';
 import type { ToolExecution, ToolStatus } from '../../../types/message';
 import { Icon } from '../../common';
 
@@ -617,18 +616,15 @@ function renderResult(tool: ToolExecution): ReactNode {
 export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
   const toolResultsDefaultCollapsed = useClientPrefsStore(state => state.toolResultsDefaultCollapsed);
   const autoApproveTools = useClientPrefsStore(state => state.autoApproveTools);
-  const adminToken = useSettingsStore(state => state.adminToken);
+  const approvals = useApprovalDecision();
   // [2026-06-01] Tool detail expansion now follows clientPrefsStore.
   // Why: result disclosure was hard-coded as collapsed. How: initialize the local
   // disclosure state from the browser preference. Purpose: each frontend can choose
   // whether tool details start open without changing backend output.
   const [expanded, setExpanded] = useState(() => !toolResultsDefaultCollapsed);
-  // [AutoC 2026-05-31] Why: approval decisions are now submitted from inside the
-  // tool card. How: keep a local loading flag only for the clicked network request
-  // and let WebSocket replay update approvalStatus. Purpose: the UI avoids duplicate
-  // clicks without inventing a second source of truth for approval state.
-  const [approvalLoading, setApprovalLoading] = useState(false);
-  const [approvalError, setApprovalError] = useState('');
+  // 审批结果以 approval_decided 事件为准，这里只管提交中和提交后的那句话。
+  const approvalLoading = tool.approvalId ? approvals.isBusy(tool.approvalId) : false;
+  const approvalError = tool.approvalId ? approvals.messageOf(tool.approvalId) : '';
   const statusStyle = getStatusStyle(tool);
   const argumentsText = useMemo(() => getArgumentsText(tool), [tool]);
   const resultText = useMemo(() => getResultText(tool), [tool]);
@@ -648,20 +644,8 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
     && tool.approvalStatus === 'pending'
     && shouldAutoApproveToolCall({ toolName: tool.name, operation: approvalOperation }, autoApproveTools);
 
-  const handleApproval = async (approvalId: string, decision: 'allow' | 'deny') => {
-    // [AutoC 2026-05-31] Why: the same tool card now owns the approval action.
-    // How: call the existing supervisor client and rely on approval_decided events
-    // to update the reducer. Purpose: the button path stays compatible with the
-    // old ApprovalCard API while rendering from ToolExecution.
-    setApprovalLoading(true);
-    setApprovalError('');
-    try {
-      await decideApproval(adminToken || '', approvalId, decision, `${decision} via tool card`);
-    } catch (error) {
-      setApprovalError(error instanceof Error ? error.message : '提交审批决定失败。');
-    } finally {
-      setApprovalLoading(false);
-    }
+  const handleApproval = (approvalId: string, decision: ApprovalDecision) => {
+    void approvals.decide(approvalId, decision, `${decision} via tool card`);
   };
 
   if (tool.hidden) {

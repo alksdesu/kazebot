@@ -11,6 +11,7 @@ import { useSettingsStore } from '../../store/settingsStore';
 import { startPolling } from '../../utils/polling';
 import { countActiveTasks, formatUptime } from '../../utils/systemStatus';
 import { ActiveTasksModal } from './ActiveTasksModal';
+import { errorMessage } from '../../api/request';
 
 interface DashboardData {
   adminState: AdminState | null;
@@ -85,7 +86,7 @@ export const SystemDashboard = () => {
           const health = await checkHealth();
           if (!cancelled) setData({ adminState: null, health, error: '需要管理员令牌才能读取计数。', loading: false });
         } catch (error) {
-          if (!cancelled) setData({ adminState: null, health: null, error: error instanceof Error ? error.message : '健康检查失败。', loading: false });
+          if (!cancelled) setData({ adminState: null, health: null, error: errorMessage(error, '健康检查失败。'), loading: false });
         }
         return;
       }
@@ -94,7 +95,7 @@ export const SystemDashboard = () => {
         const [adminState, health] = await Promise.all([getAdminState(adminToken), checkHealth()]);
         if (!cancelled) setData({ adminState, health, error: '', loading: false });
       } catch (error) {
-        if (!cancelled) setData((current) => ({ ...current, error: error instanceof Error ? error.message : '仪表盘刷新失败。', loading: false }));
+        if (!cancelled) setData((current) => ({ ...current, error: errorMessage(error, '仪表盘刷新失败。'), loading: false }));
       }
     };
 

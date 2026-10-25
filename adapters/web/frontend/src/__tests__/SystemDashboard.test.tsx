@@ -105,10 +105,7 @@ describe('SystemDashboard', () => {
   });
 
   it('shows live task activity and calls the single-task cancel API', async () => {
-    // [AutoC 2026-06-04] Why: the modal should prefer transient WebSocket activity
-    // over the coarser polled task status. How: seed chatStore with a live tool-call
-    // status before opening the modal. Purpose: the row shows the operator what the
-    // task is doing right now while keeping the polling fallback.
+    // Live WebSocket activity wins over the polled task status.
     useChatStore.setState({
       taskActivities: {
         'task-alpha-123456': { phase: 'tool_call', detail: 'read_file', lastEventAt: Date.now() },
@@ -127,7 +124,7 @@ describe('SystemDashboard', () => {
 
     await waitFor(() => expect(fetch).toHaveBeenCalledWith('/v1/tasks/task-alpha-123456/cancel', {
       method: 'POST',
-      headers: { Authorization: 'Bearer admin-token', 'X-Admin-Token': 'admin-token' },
+      headers: { Authorization: 'Bearer admin-token' },
     }));
   });
 

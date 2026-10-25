@@ -18,7 +18,7 @@ import { SettingsPageHost } from '../components/settings/SettingsPageHost';
 import { SettingsRightPanel } from '../components/settings/SettingsRightPanel';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
 import { resolveSettingsTab } from '../components/settings/settingsTabs';
-import type { ConversationMeta } from '../store/chatStore';
+import type { ConversationMeta, HistoryView } from '../store/chatStore';
 import type { ViewMode } from '../store/viewStore';
 import type { Attachment } from '../types';
 import type { ToolExecution, WsMessage } from '../types/message';
@@ -30,7 +30,12 @@ export interface AppViewContext {
   conversations: ConversationMeta[];
   activeConversationId: string | null;
   messages: WsMessage[];
+  /** Only the tools that `messages` show. */
   toolsById: Record<string, ToolExecution>;
+  /** History state of what `messages` shows: the open conversation, or the open child session. */
+  history?: HistoryView;
+  onLoadOlderHistory?: () => void;
+  onRetryHistory?: () => void;
   isGenerating: boolean;
   isCancelling?: boolean;
   viewingChildSessionId?: string | null;
@@ -100,7 +105,13 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
     ),
     main: (ctx) => (
       <>
-        <MessageListV2 messages={ctx.messages} toolsById={ctx.toolsById} />
+        <MessageListV2
+          history={ctx.history}
+          messages={ctx.messages}
+          onLoadOlder={ctx.onLoadOlderHistory}
+          onRetryHistory={ctx.onRetryHistory}
+          toolsById={ctx.toolsById}
+        />
         {/* [2026-06-03] Mount child-node activity beside the active chat stream.
             Why: Phase 2 asks for a right-side floating panel without changing the
             backend or child-session navigation. How: pass only the active parent

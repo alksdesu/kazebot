@@ -5,14 +5,16 @@
 // panel. Purpose: approvals can be reviewed and decided from Settings.
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { decideApproval, getAdminState, type AdminApproval } from '../../../api/supervisorClient';
+import { getAdminState, type AdminApproval } from '../../../api/supervisorClient';
+import { useApprovalDecision, type ApprovalDecision } from '../../../hooks/useApprovalDecision';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
-import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
+import { useSettingsStore } from '../../../store/settingsStore';
 import { Icon } from '../../common';
 import { startPolling } from '../../../utils/polling';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
 import { Block, Button, PageShell, StatusText } from './settingsControls';
+import { errorMessage } from '../../../api/request';
 
 function detailString(approval: AdminApproval, key: string): string {
   // [2026-06-02] Read common approval detail fields from arbitrary backend payloads.
@@ -52,8 +54,7 @@ const ApprovalsSettingsPageBody = () => {
   const [approvals, setApprovals] = useState<AdminApproval[]>([]);
   const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
-  const pending = useRef(new Set<string>());
-  const [deciding, setDeciding] = useState<string[]>([]);
+  const approvalDecision = useApprovalDecision();
   // Polls and the reload after a decision can overlap; only the latest request may land.
   const generation = useRef(0);
 
@@ -72,7 +73,7 @@ const ApprovalsSettingsPageBody = () => {
       setLoadError('');
     } catch (error) {
       if (version !== generation.current) return;
-      setLoadError(error instanceof Error ? error.message : '加载审批失败');
+      setLoadError(errorMessage(error, '加载审批失败'));
     } finally {
       if (showSpinner) setLoading(false);
     }
@@ -94,18 +95,13 @@ const ApprovalsSettingsPageBody = () => {
     return () => { stop(); generation.current += 1; };
   }, [adminToken, isAuthenticated, load]);
 
-  const decide = async (approval: AdminApproval, decision: 'allow' | 'deny') => {
-    if (!adminToken || pending.current.has(approval.approval_id)) return;
-    pending.current.add(approval.approval_id); setDeciding([...pending.current]);
-    try {
-      await decideApproval(adminToken || '', approval.approval_id, decision, `settings ${decision}`);
-      if (tokenChanged(adminToken)) return;
-      setMessage(decision === 'allow' ? '已允许审批' : '已拒绝审批');
-      await load();
-    } catch (error) {
-      if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '审批操作失败');
-    } finally { pending.current.delete(approval.approval_id); setDeciding([...pending.current]); }
+  const decide = async (approval: AdminApproval, decision: ApprovalDecision) => {
+    if (!adminToken) return;
+    const outcome = await approvalDecision.decide(approval.approval_id, decision, `settings ${decision}`);
+    if (!outcome) return;
+    if (outcome.failed) { setMessage(outcome.message); return; }
+    setMessage(outcome.applied ? (decision === 'allow' ? '已允许审批' : '已拒绝审批') : outcome.message);
+    await load();
   };
 
   return (
@@ -153,8 +149,8 @@ const ApprovalsSettingsPageBody = () => {
                   </div>
                 </button>
                 <div className="mt-3 flex flex-wrap gap-2">
-                  <Button disabled={deciding.includes(approval.approval_id)} onClick={() => decide(approval, 'allow')}>允许</Button>
-                  <Button tone="danger" disabled={deciding.includes(approval.approval_id)} onClick={() => decide(approval, 'deny')}>拒绝</Button>
+                  <Button disabled={approvalDecision.isBusy(approval.approval_id)} onClick={() => void decide(approval, 'allow')}>允许</Button>
+                  <Button tone="danger" disabled={approvalDecision.isBusy(approval.approval_id)} onClick={() => void decide(approval, 'deny')}>拒绝</Button>
                 </div>
               </article>
             ))}

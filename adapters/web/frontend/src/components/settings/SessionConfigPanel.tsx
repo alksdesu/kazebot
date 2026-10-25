@@ -26,6 +26,7 @@ import type { NodeDef } from '../../types';
 import { describeEnvRef, envRefNames } from '../../utils/envRef';
 import { literalModelsOnly, mergeModelChoices, modelsFromProviders } from '../../utils/modelChoices';
 import { Button } from '../settings/pages/settingsControls';
+import { errorMessage } from '../../api/request';
 
 interface SessionConfigPanelProps {
   sessionId: string;
@@ -249,7 +250,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
           // 只认会话自己那把钥匙：全局配了 key 不代表这个会话有专属覆盖。
           setApiKeyPresent(Boolean(override.api_key));
         })
-        .catch(error => { if (!cancelled) setModelMsg(error instanceof Error ? error.message : '会话模型读取失败，请重新打开面板重试'); });
+        .catch(error => { if (!cancelled) setModelMsg(errorMessage(error, '会话模型读取失败，请重新打开面板重试')); });
     }
     return () => { cancelled = true; };
   }, [adminToken, setActiveNode, setSessionProviderOverride, sid]);
@@ -307,7 +308,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
       }
     } catch (err) {
       if (currentScope.current !== scopeKey) return;
-      setNodeMsg(err instanceof Error ? err.message : '切换失败');
+      setNodeMsg(errorMessage(err, '切换失败'));
     } finally {
       if (currentScope.current === scopeKey) setNodeSaving(false);
     }
@@ -348,7 +349,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
       setModelMsg('已保存');
     } catch (err) {
       if (currentScope.current !== scopeKey) return;
-      setModelMsg(err instanceof Error ? err.message : '保存失败');
+      setModelMsg(errorMessage(err, '保存失败'));
     } finally {
       if (currentScope.current === scopeKey) setModelSaving(false);
     }
@@ -371,7 +372,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
       setModelMsg('已清除');
     } catch (err) {
       if (currentScope.current !== scopeKey) return;
-      setModelMsg(err instanceof Error ? err.message : '清除失败');
+      setModelMsg(errorMessage(err, '清除失败'));
     } finally {
       if (currentScope.current === scopeKey) setModelSaving(false);
     }

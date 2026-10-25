@@ -25,6 +25,29 @@ export interface PluginResources {
   request: (path: string, init?: RequestInit) => Promise<Response>;
 }
 
+type SettingsSnapshot = ReturnType<typeof useSettingsStore.getState>;
+export type PluginSettingsState = Omit<SettingsSnapshot, 'adminToken'>;
+
+const redactedSettings = new WeakMap<SettingsSnapshot, PluginSettingsState>();
+
+function redactSettings(state: SettingsSnapshot): PluginSettingsState {
+  let view = redactedSettings.get(state);
+  if (!view) {
+    const { adminToken: _adminToken, ...rest } = state;
+    view = rest;
+    redactedSettings.set(state, view);
+  }
+  return view;
+}
+
+// 插件拿到的设置里没有管理员令牌：调本实例接口用 sdk.http.request，令牌由宿主在最内层补上。
+const pluginSettingsStore = {
+  getState: (): PluginSettingsState => redactSettings(useSettingsStore.getState()),
+  subscribe: (listener: (state: PluginSettingsState, previous: PluginSettingsState) => void) => (
+    useSettingsStore.subscribe((state, previous) => listener(redactSettings(state), redactSettings(previous)))
+  ),
+};
+
 export function createPluginSdk(
   identity: { id: string; generation: string; config: Record<string, unknown>; metadata: Record<string, unknown> },
   transaction: ReturnType<typeof extensions.transaction>, resources: PluginResources,
@@ -52,7 +75,7 @@ export function createPluginSdk(
     slots: registrations<SlotRenderer | LayoutRenderer>('slots'),
     commands: { ...registrations<Command>('commands'), execute: executeCommand },
     requests: { wrap: (wrapper: (next: RequestHandler) => RequestHandler, options?: RegistrationOptions) => transaction.wrap('transport', 'request', wrapper, options) },
-    state: { chat: store(useChatStore), settings: store(useSettingsStore), preferences: store(useClientPrefsStore), view: store(useViewStore) },
+    state: { chat: store(useChatStore), settings: store(pluginSettingsStore), preferences: store(useClientPrefsStore), view: store(useViewStore) },
     forms: { useUnsavedChanges, confirmNavigation },
     api, http: { request: resources.request }, assets: {
       fetch: resources.asset,

@@ -11,7 +11,7 @@ vi.mock('../api/supervisorClient', async importOriginal => ({
 }));
 const runtime = '# keep this comment\nengine:\n  tool_mode: native\n  max_workers: 4\nshell:\n  entry_node_id: entry.original\ncustom:\n  preserved: true\n';
 const runtimeFile = (
-  content = runtime, source: api.RuntimeFile['source'] = 'default', hash: string | null = 'runtime-1',
+  content = runtime, source: api.RuntimeFile['source'] = 'override', hash: string | null = 'runtime-1',
 ): api.RuntimeFile => ({
   content, hash, source, path: source === 'override' ? 'config/runtime.yaml' : 'defaults/runtime.yaml',
 });
@@ -29,11 +29,12 @@ function openSection(name: 'runtime' | 'policy') {
 async function loadRuntime() {
   render(<AdvancedSettingsPage />); const area = openSection('runtime');
   fireEvent.click(area.getByRole('button', { name: '加载' }));
-  await waitFor(() => expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.original'));
+  await waitFor(() => expect(screen.getByLabelText('入口节点 ID')).toBeEnabled());
   return area;
 }
 const rawEditor = () => screen.getByLabelText('runtime.yaml YAML 编辑器');
-const saveRuntime = () => fireEvent.click(within(section('runtime')).getByRole('button', { name: '保存运行时配置' }));
+const runtimeSave = () => within(section('runtime')).getByRole('button', { name: '保存运行时配置' });
+const saveRuntime = () => fireEvent.click(runtimeSave());
 
 beforeEach(() => {
   vi.resetAllMocks(); vi.spyOn(window, 'confirm').mockReturnValue(true);
@@ -56,27 +57,45 @@ describe('高级配置加载与提交边界', () => {
     fireEvent.click(area.getByRole('button', { name: '正在加载…' })); expect(api.getRuntimeFile).toHaveBeenCalledTimes(1);
     await act(async () => read.resolve(runtimeFile()));
     expect(screen.getByLabelText('入口节点 ID')).toBeEnabled(); expect(rawEditor()).not.toHaveAttribute('readonly');
+    expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.original');
   });
-  it.each(['engine: [', '- scalar-item\n', '   '])('坏原文 %j 不发生写入，错误被捕获且草稿保留', async invalid => {
+  it.each(['engine: [', '- scalar-item\n'])('原文 %j 解析不了：表单停用，保存被挡下，草稿保留', async invalid => {
     await loadRuntime(); fireEvent.change(rawEditor(), { target: { value: invalid } });
-    fireEvent.change(screen.getByLabelText('入口节点 ID'), { target: { value: 'entry.local' } });
+    expect(screen.getByLabelText('入口节点 ID')).toBeDisabled();
+    expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.original');
     saveRuntime();
-    await waitFor(() => expect(within(section('runtime')).getByRole('button', { name: '保存运行时配置' })).toBeEnabled());
     expect(api.updateRuntimeRaw).not.toHaveBeenCalled(); expect(rawEditor()).toHaveValue(invalid);
-    expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.local');
-    expect(within(section('runtime')).getAllByRole('status').some(node => node.textContent !== '有未保存修改')).toBe(true);
+    expect(within(section('runtime')).getAllByRole('alert').some(node => node.textContent?.startsWith('没有保存：原文解析不了。'))).toBe(true);
+  });
+  it('本实例这一层清空了就存不了，要回到仓库默认走「恢复默认」', async () => {
+    await loadRuntime(); fireEvent.change(rawEditor(), { target: { value: '   ' } });
+    expect(runtimeSave()).toBeDisabled();
+    expect(api.updateRuntimeRaw).not.toHaveBeenCalled();
   });
   it('提交失败保留草稿，保存期间冻结表单和原文，重试成功后清理dirty', async () => {
     const write = deferred<api.RawSaveResult>();
     vi.mocked(api.updateRuntimeRaw).mockReturnValueOnce(write.promise).mockResolvedValueOnce({ ok: true, hash: 'runtime-2' });
     await loadRuntime(); fireEvent.change(screen.getByLabelText('入口节点 ID'), { target: { value: 'entry.local' } });
     saveRuntime(); expect(screen.getByLabelText('入口节点 ID')).toBeDisabled(); expect(rawEditor()).toBeDisabled();
-    await act(async () => write.reject(Error('写入失败'))); await screen.findByText('写入失败');
+    await act(async () => write.reject(Error('写入失败'))); expect(await screen.findByText('写入失败')).toHaveAttribute('role', 'alert');
     expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.local'); expect((rawEditor() as HTMLTextAreaElement).value).toContain('entry.local');
     saveRuntime(); await screen.findByText('已保存');
-    expect(api.updateRuntimeRaw).toHaveBeenLastCalledWith('synthetic-auth', expect.stringContaining('# keep this comment'), 'runtime-1');
+    expect(api.updateRuntimeRaw).toHaveBeenLastCalledWith('synthetic-auth', runtime.replace('entry.original', 'entry.local'), 'runtime-1');
     expect(screen.queryByText('有未保存修改')).not.toBeInTheDocument(); vi.mocked(window.confirm).mockClear();
     expect(confirmNavigation()).toBe(true); expect(window.confirm).not.toHaveBeenCalled();
+  });
+  it('后端校验不过的 400 把原因原样摆出来，草稿留着', async () => {
+    vi.mocked(api.updateRuntimeRaw).mockRejectedValueOnce(new api.ApiError(400, 'engine 要写成映射'));
+    await loadRuntime(); fireEvent.change(screen.getByLabelText('入口节点 ID'), { target: { value: 'entry.local' } });
+    saveRuntime();
+    expect(await screen.findByText('400 engine 要写成映射')).toHaveAttribute('role', 'alert');
+    expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.local');
+  });
+  it('保存成功但后端有提醒时，每条都接在「已保存」后面', async () => {
+    vi.mocked(api.updateRuntimeRaw).mockResolvedValueOnce({ ok: true, hash: 'runtime-2', warnings: ['engine.max_steps 已经没有代码读取，可以删掉'] });
+    await loadRuntime(); fireEvent.change(screen.getByLabelText('入口节点 ID'), { target: { value: 'entry.local' } });
+    saveRuntime();
+    expect(await screen.findByText('已保存。engine.max_steps 已经没有代码读取，可以删掉')).toHaveAttribute('role', 'status');
   });
   it('拒绝重新加载和导航时保留未保存草稿，读取失败也不清空它', async () => {
     const area = await loadRuntime(); fireEvent.change(screen.getByLabelText('入口节点 ID'), { target: { value: 'entry.local' } });
@@ -105,6 +124,10 @@ describe('结构化与原文编辑一致性', () => {
     expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.local'); saveRuntime(); await screen.findByText('已保存');
     expect(api.updateRuntimeRaw).toHaveBeenCalledWith('synthetic-auth', combined, 'runtime-1');
   });
+  it('表单改一个字段只动原文里那一行，注释和别的键照旧', async () => {
+    await loadRuntime(); fireEvent.change(screen.getByLabelText('并发 task 处理数，留空使用默认值'), { target: { value: '8' } });
+    expect(rawEditor()).toHaveValue(runtime.replace('max_workers: 4', 'max_workers: 8'));
+  });
   it('只编辑原文时保留原文格式，并同步结构化字段与保存基准', async () => {
     await loadRuntime(); const raw = '# manual formatting\nshell: {entry_node_id: entry.from_raw}\nengine: {tool_mode: json, max_workers: 8}\n';
     fireEvent.change(rawEditor(), { target: { value: raw } }); expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.from_raw');
@@ -112,8 +135,12 @@ describe('结构化与原文编辑一致性', () => {
     expect(api.updateRuntimeRaw).toHaveBeenCalledWith('synthetic-auth', raw, 'runtime-1'); expect(rawEditor()).toHaveValue(raw);
     expect(screen.queryByText('有未保存修改')).not.toBeInTheDocument();
   });
+  it('工具调用格式可以退回跟随仓库默认，原文里那一行跟着删掉', async () => {
+    await loadRuntime(); fireEvent.change(screen.getByLabelText('工具调用格式'), { target: { value: '' } });
+    expect(rawEditor()).toHaveValue(runtime.replace('  tool_mode: native\n', ''));
+  });
   it('保存撞上冲突时按文件名说清楚，草稿留着重做', async () => {
-    vi.mocked(api.updatePolicyRaw).mockRejectedValueOnce(Error('409 policy.yaml 已被别处改过，刷新后再改'));
+    vi.mocked(api.updatePolicyRaw).mockRejectedValueOnce(new api.ApiError(409, 'policy.yaml 已被别处改过，刷新后再改'));
     render(<AdvancedSettingsPage />); const area = openSection('policy'); fireEvent.click(area.getByRole('button', { name: '加载' }));
     const editor = area.getByLabelText('policy.yaml YAML 编辑器'); await waitFor(() => expect(editor).toHaveValue('rules: []\n'));
     fireEvent.change(editor, { target: { value: 'rules: [a]\n' } });
@@ -134,17 +161,41 @@ describe('结构化与原文编辑一致性', () => {
 });
 
 describe('runtime 的来源与恢复默认', () => {
-  const DEFAULT_HINT = '现在用的是仓库默认。保存后会在 config/runtime.yaml 存一份本实例的，没写到的键仍跟随仓库默认。';
+  const DEFAULT_HINT = '本实例还没有自己的 config/runtime.yaml，下面的原文是空的本实例层：只写要改的键，其余跟随仓库默认。保存后存成 config/runtime.yaml。';
   const OVERRIDE_HINT = '本实例有自己的 config/runtime.yaml，逐键盖在仓库默认上面；没写到的键跟随仓库更新。';
   const RESET_CONFIRM = '删掉本实例的 config/runtime.yaml，全部参数恢复成仓库默认？';
   const overriding = '# instance copy\nengine:\n  tool_mode: json\n  max_workers: 9\nshell:\n  entry_node_id: entry.override\n';
   const resetButton = () => within(section('runtime')).getByRole('button', { name: '恢复默认' });
+  const usingDefaults = () => vi.mocked(api.getRuntimeFile).mockResolvedValue(runtimeFile(runtime, 'default'));
 
   it('读回仓库默认时提示按默认那套说，恢复默认点不动', async () => {
+    usingDefaults();
     await loadRuntime();
     expect(screen.getByText(DEFAULT_HINT)).toBeInTheDocument();
     expect(screen.queryByText(OVERRIDE_HINT)).not.toBeInTheDocument();
     expect(resetButton()).toBeDisabled();
+  });
+
+  // 以前原文编辑器摆的是仓库默认全文，改一个键就把整份默认抄成本实例那份，之后仓库改默认值这个实例就收不到了。
+  it('仓库默认在用时，原文编辑的是空的本实例层，默认值只摆在一旁给人看', async () => {
+    usingDefaults();
+    await loadRuntime();
+    expect(rawEditor()).toHaveValue('');
+    expect(screen.getByLabelText('入口节点 ID')).toHaveValue('');
+    expect(screen.getByLabelText('入口节点 ID')).toHaveAttribute('placeholder', '仓库默认 entry.original');
+    expect(screen.getByLabelText('工具调用格式')).toHaveValue('');
+    expect(screen.getByRole('option', { name: '跟随仓库默认（native）' })).toBeInTheDocument();
+    expect(screen.getByLabelText('仓库默认 runtime.yaml')).toHaveValue(runtime);
+    expect(runtimeSave()).toBeDisabled();
+  });
+
+  it('仓库默认在用时改一个键，存下去的只有那一个键', async () => {
+    usingDefaults();
+    await loadRuntime();
+    fireEvent.change(screen.getByLabelText('并发 task 处理数，留空使用默认值'), { target: { value: '8' } });
+    expect(rawEditor()).toHaveValue('engine:\n  max_workers: 8\n');
+    saveRuntime(); await screen.findByText('已保存');
+    expect(api.updateRuntimeRaw).toHaveBeenCalledWith('synthetic-auth', 'engine:\n  max_workers: 8\n', 'runtime-1');
   });
 
   it('读回本实例那份时提示换一套说法，恢复默认可点', async () => {
@@ -153,6 +204,7 @@ describe('runtime 的来源与恢复默认', () => {
     fireEvent.click(area.getByRole('button', { name: '加载' }));
     await waitFor(() => expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.override'));
     expect(screen.getByText(OVERRIDE_HINT)).toBeInTheDocument();
+    expect(screen.queryByLabelText('仓库默认 runtime.yaml')).not.toBeInTheDocument();
     expect(resetButton()).toBeEnabled();
   });
 
@@ -163,6 +215,7 @@ describe('runtime 的来源与恢复默认', () => {
   });
 
   it('保存一次就从仓库默认变成本实例那份，恢复默认跟着可点', async () => {
+    usingDefaults();
     await loadRuntime();
     fireEvent.change(screen.getByLabelText('入口节点 ID'), { target: { value: 'entry.local' } });
     saveRuntime(); await screen.findByText('已保存');
@@ -170,8 +223,8 @@ describe('runtime 的来源与恢复默认', () => {
     expect(resetButton()).toBeEnabled();
   });
 
-  it('恢复默认删掉本实例那份并重读，表单回到仓库默认', async () => {
-    vi.mocked(api.getRuntimeFile).mockResolvedValueOnce(runtimeFile(overriding, 'override')).mockResolvedValue(runtimeFile());
+  it('恢复默认删掉本实例那份并重读，表单回到跟随仓库默认', async () => {
+    vi.mocked(api.getRuntimeFile).mockResolvedValueOnce(runtimeFile(overriding, 'override')).mockResolvedValue(runtimeFile(runtime, 'default'));
     render(<AdvancedSettingsPage />); const area = openSection('runtime');
     fireEvent.click(area.getByRole('button', { name: '加载' }));
     await waitFor(() => expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.override'));
@@ -182,8 +235,9 @@ describe('runtime 的来源与恢复默认', () => {
     expect(window.confirm).toHaveBeenCalledWith(RESET_CONFIRM);
     expect(api.resetRuntime).toHaveBeenCalledWith('synthetic-auth');
     expect(api.getRuntimeFile).toHaveBeenCalledTimes(2);
-    expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.original');
-    expect(rawEditor()).toHaveValue(runtime);
+    expect(screen.getByLabelText('入口节点 ID')).toHaveValue('');
+    expect(screen.getByLabelText('入口节点 ID')).toHaveAttribute('placeholder', '仓库默认 entry.original');
+    expect(rawEditor()).toHaveValue('');
     expect(screen.getByText(DEFAULT_HINT)).toBeInTheDocument();
     expect(resetButton()).toBeDisabled();
     // 重读回来的那份就是新基准，恢复完不该还挂着未保存修改。
@@ -191,7 +245,7 @@ describe('runtime 的来源与恢复默认', () => {
   });
 
   it('未保存的草稿会一起丢掉，确认里先说清楚', async () => {
-    vi.mocked(api.getRuntimeFile).mockResolvedValueOnce(runtimeFile(overriding, 'override')).mockResolvedValue(runtimeFile());
+    vi.mocked(api.getRuntimeFile).mockResolvedValueOnce(runtimeFile(overriding, 'override')).mockResolvedValue(runtimeFile(runtime, 'default'));
     render(<AdvancedSettingsPage />); const area = openSection('runtime');
     fireEvent.click(area.getByRole('button', { name: '加载' }));
     await waitFor(() => expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.override'));
@@ -201,7 +255,7 @@ describe('runtime 的来源与恢复默认', () => {
     await screen.findByText('已恢复成仓库默认');
 
     expect(window.confirm).toHaveBeenCalledWith(`${RESET_CONFIRM}未保存的修改也会一起丢掉。`);
-    expect(screen.getByLabelText('入口节点 ID')).toHaveValue('entry.original');
+    expect(screen.getByLabelText('入口节点 ID')).toHaveValue('');
   });
 
   it('确认被拒绝就什么都不删', async () => {

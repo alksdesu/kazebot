@@ -12,6 +12,8 @@ import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
+import { savedMessage } from '../../../utils/sentence';
+import { errorMessage } from '../../../api/request';
 
 function defaultSkillMarkdown(name: string): string {
   // [2026-06-02] Provide a complete starter SKILL.md with frontmatter. Why: the
@@ -47,7 +49,7 @@ export const SkillsSettingsPage = () => {
       setLoadError('');
     } catch (error) {
       if (version !== generation.current) return;
-      setLoadError(error instanceof Error ? error.message : '加载技能失败');
+      setLoadError(errorMessage(error, '加载技能失败'));
     } finally {
       if (version === generation.current) setLoading(false);
     }
@@ -77,16 +79,16 @@ export const SkillsSettingsPage = () => {
     if (!name) { setMessage('请输入技能名称'); return; }
     if (!confirmNavigation()) return;
     try {
-      await createSkill(adminToken, { id: name, content: defaultSkillMarkdown(name) });
+      const result = await createSkill(adminToken, { id: name, content: defaultSkillMarkdown(name) });
       if (tokenChanged(adminToken)) return;
       setNewName('');
-      setMessage('技能已创建，请在右栏编辑 frontmatter 和正文。');
+      setMessage(savedMessage('技能已创建，请在右栏编辑 frontmatter 和正文。', '', result.warnings));
       await load();
       if (tokenChanged(adminToken)) return;
       setSelectedSkill({ name, description: '通过设置页面创建的技能。', enabled: true, strategy: 'normal', keywords: [] });
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '创建技能失败');
+      setMessage(errorMessage(error, '创建技能失败'));
     }
   });
   const remove = () => run(async () => {
@@ -101,7 +103,7 @@ export const SkillsSettingsPage = () => {
       await load();
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '删除技能失败');
+      setMessage(errorMessage(error, '删除技能失败'));
     }
   });
   return (

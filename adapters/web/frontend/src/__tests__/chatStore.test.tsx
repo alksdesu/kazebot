@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { EventLogPanel } from '../components/log/EventLogPanel';
 import { AppLayout } from '../components/layout/AppLayout';
+import type { SessionRunningTask } from '../api/supervisorClient';
 import { selectMessages } from '../store/eventSelectors';
 import { useChatStore } from '../store/chatStore';
 import { useClientPrefsStore } from '../store/clientPrefsStore';
@@ -68,6 +69,23 @@ function jsonResponse(value: unknown): Response {
     headers: { 'Content-Type': 'application/json' },
   });
 }
+
+// Whether a task still runs is the server's call: only then do live cards outlive a history read.
+function runningTask(sessionId: string): SessionRunningTask {
+  return {
+    task_id: `task-${sessionId}`,
+    node_id: 'ereuna_main',
+    status: 'running',
+    created_at: '2026-05-31T03:05:00.000Z',
+    caller_task_id: '',
+    is_user_entry: true,
+    source_inbound_seq: 1,
+    branch_session_id: '',
+    parent_session_id: sessionId,
+  };
+}
+
+const textOf = (message: WsMessage): string => message.blocks.map((block) => (block.kind === 'text' ? block.text : '')).join('');
 
 describe('chatStore', () => {
   beforeEach(() => {
@@ -730,6 +748,7 @@ describe('chatStore', () => {
           { id: 'old-user', role: 'user', content: 'old message', message_type: 'user_input', created_at: '2026-05-31T03:00:00.000Z' },
         ]);
       }
+      if (url.includes('/v1/sessions/sess-race/running_tasks')) return jsonResponse({ tasks: [runningTask('sess-race')] });
       return jsonResponse([]);
     }));
 
@@ -746,10 +765,7 @@ describe('chatStore', () => {
 
     useChatStore.getState().selectConversation('conv-race');
 
-    // Why: selecting a generating conversation can finish history loading after
-    // WebSocket stream blocks already exist. How: this assertion requires hydration
-    // to keep the live message while adding history. Purpose: avoid losing active
-    // output when an older history response arrives late.
+    // The task still runs, so the late history only fills gaps and the streaming card stays.
     await waitFor(() => expect(selectMessages(useChatStore.getState(), 'conv-race')).toHaveLength(2));
     expect(useChatStore.getState().messagesById[liveMessage.id]).toBeDefined();
     expect(selectMessages(useChatStore.getState(), 'conv-race').some((message) => message.id === liveMessage.id)).toBe(true);
@@ -806,6 +822,7 @@ describe('chatStore', () => {
           { id: 'hist-assistant-1', role: 'assistant', content: 'same answer', message_type: 'assistant', created_at: '2026-05-31T03:06:02.000Z' },
         ]);
       }
+      if (url.includes('/v1/sessions/sess-dupe/running_tasks')) return jsonResponse({ tasks: [runningTask('sess-dupe')] });
       return jsonResponse([]);
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -824,23 +841,122 @@ describe('chatStore', () => {
 
     useChatStore.getState().selectConversation('conv-dupe');
 
-    await waitFor(() => {
-      expect(useChatStore.getState().conversations.find((conversation) => conversation.id === 'conv-dupe')?.updatedAt).not.toBe(initialUpdatedAt);
-    });
+    await waitFor(() => expect(useChatStore.getState().historyByConversation['conv-dupe']).toMatchObject({ loading: false, error: '' }));
 
-    // Why: active history hydration preserves live stream cards instead of clearing
-    // the conversation. How: this regression fixture returns persisted rows that
-    // mirror existing live messages. Purpose: selecting back into a running session
-    // must not show both delivery=stream and delivery=history copies.
-    // [2026-06-03] Why: history loading now also asks the child-session registry to
-    // rebuild childNodes after refresh. How: assert the specific history endpoint was
-    // still called exactly once and allow the additional /children request. Purpose:
-    // this duplicate-history regression test remains focused on message dedupe.
+    // Persisted rows that mirror the live cards are claimed by them instead of showing up twice.
     expect(fetchMock.mock.calls.filter(([input]) => String(input).includes('/v1/sessions/sess-dupe/history'))).toHaveLength(1);
     expect(fetchMock.mock.calls.filter(([input]) => String(input).includes('/v1/sessions/sess-dupe/children'))).toHaveLength(1);
     const messages = selectMessages(useChatStore.getState(), 'conv-dupe');
     expect(messages).toHaveLength(2);
     expect(messages.map((message) => message.id)).toEqual([liveUser.id, liveAssistant.id]);
+    // Reading history is not activity: the sidebar keeps its order.
+    expect(useChatStore.getState().conversations.find((conversation) => conversation.id === 'conv-dupe')?.updatedAt).toBe(initialUpdatedAt);
+  });
+
+  it('lets history replace live cards once the server says nothing runs any more', async () => {
+    const stale: WsMessage = {
+      id: 'message:conv-stale:assistant:inbound:1',
+      conversationId: 'conv-stale',
+      sessionId: 'sess-stale',
+      role: 'assistant',
+      status: 'streaming',
+      createdAt: '2026-05-31T03:08:01.000Z',
+      updatedAt: '2026-05-31T03:08:02.000Z',
+      source: { inboundSeq: 1 },
+      blocks: [{
+        id: 'message:conv-stale:assistant:inbound:1|block:text:live',
+        kind: 'text',
+        text: 'half an ans',
+        delivery: 'stream',
+        streaming: true,
+        createdAt: '2026-05-31T03:08:01.000Z',
+        updatedAt: '2026-05-31T03:08:02.000Z',
+        eventIds: ['stale-stream-1'],
+      }],
+      eventIds: ['stale-stream-1'],
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/sessions/sess-stale/history')) {
+        return jsonResponse([
+          { id: 'hist-user', role: 'user', content: 'question', message_type: 'user_input', created_at: '2026-05-31T03:08:00.000Z' },
+          { id: 'hist-answer', role: 'assistant', content: 'the whole answer', message_type: 'assistant', created_at: '2026-05-31T03:08:09.000Z' },
+        ]);
+      }
+      if (url.includes('/v1/sessions/sess-stale/running_tasks')) return jsonResponse({ tasks: [] });
+      return jsonResponse([]);
+    }));
+    useChatStore.setState((state) => ({
+      ...state,
+      conversations: [{ id: 'conv-stale', sessionId: 'sess-stale', title: 'Stale', updatedAt: '2026-05-31T03:08:00.000Z' }],
+      activeConversationId: 'conv-stale',
+      isGenerating: true,
+      generatingBySession: { ...state.generatingBySession, 'sess-stale': true },
+      messagesById: { ...state.messagesById, [stale.id]: stale },
+      messageOrderByConversation: { ...state.messageOrderByConversation, 'conv-stale': [stale.id] },
+      conversationIdsBySession: { ...state.conversationIdsBySession, 'sess-stale': 'conv-stale' },
+    }));
+
+    useChatStore.getState().selectConversation('conv-stale');
+
+    await waitFor(() => expect(useChatStore.getState().generatingBySession['sess-stale']).toBe(false));
+    const state = useChatStore.getState();
+    expect(state.isGenerating).toBe(false);
+    expect(state.messagesById[stale.id]).toBeUndefined();
+    expect(selectMessages(state, 'conv-stale').map(textOf)).toEqual(['question', 'the whole answer']);
+  });
+
+  // Events sent while the stream was down are never replayed: a reconnect re-reads what is on screen.
+  it('re-reads the open conversation after the stream reconnects and drops a task that ended meanwhile', async () => {
+    let finished = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/sessions/sess-resync/history')) {
+        return jsonResponse([
+          { id: 'hist-user', role: 'user', content: 'question', message_type: 'user_input', created_at: '2026-05-31T03:09:00.000Z' },
+          ...(finished ? [{ id: 'hist-answer', role: 'assistant', content: 'final answer', message_type: 'assistant', created_at: '2026-05-31T03:09:05.000Z' }] : []),
+        ]);
+      }
+      if (url.includes('/v1/sessions/sess-resync/running_tasks')) return jsonResponse({ tasks: finished ? [] : [runningTask('sess-resync')] });
+      return jsonResponse([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    useChatStore.setState((state) => ({
+      ...state,
+      conversations: [{ id: 'conv-resync', sessionId: 'sess-resync', title: 'Resync', updatedAt: '2026-05-31T03:09:00.000Z' }],
+      activeConversationId: 'conv-resync',
+      isGenerating: true,
+      generatingBySession: { ...state.generatingBySession, 'sess-resync': true },
+      conversationIdsBySession: { ...state.conversationIdsBySession, 'sess-resync': 'conv-resync' },
+    }));
+    const historyReads = () => fetchMock.mock.calls.filter(([input]) => String(input).includes('/v1/sessions/sess-resync/history')).length;
+
+    useChatStore.getState().loadStartup();
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    FakeWebSocket.instances[0].open();
+    await waitFor(() => expect(useChatStore.getState().historyByConversation['conv-resync']).toMatchObject({ loading: false }));
+    expect(historyReads()).toBe(1);
+    expect(useChatStore.getState().isGenerating).toBe(true);
+
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      FakeWebSocket.instances[0].close();
+      expect(useChatStore.getState().connectionStatus).toBe('reconnecting');
+      finished = true;
+      vi.advanceTimersByTime(999);
+      expect(FakeWebSocket.instances).toHaveLength(1);
+      vi.advanceTimersByTime(1);
+      expect(FakeWebSocket.instances).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+    FakeWebSocket.instances[1].open();
+
+    await waitFor(() => expect(useChatStore.getState().generatingBySession['sess-resync']).toBe(false));
+    const state = useChatStore.getState();
+    expect(historyReads()).toBe(2);
+    expect(state).toMatchObject({ connectionStatus: 'open', isGenerating: false });
+    expect(selectMessages(state, 'conv-resync').map(textOf)).toEqual(['question', 'final answer']);
   });
 });
 

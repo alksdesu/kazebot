@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type TextareaHTMLAttributes } from 'react';
 import yaml from 'js-yaml';
 
+import { errorMessage } from '../../../api/request';
 import {
   cleanupDrawtoolsAttachments,
   getDrawtoolsBundle,
+  getDrawtoolsCharactersRaw,
+  getDrawtoolsSettingsRaw,
   getNodeRaw,
   initDrawtoolsConfigs,
   isNotFound,
@@ -17,8 +20,9 @@ import {
   type RawText,
 } from '../../../api/supervisorClient';
 import { usePageNotice } from '../../../hooks/usePageNotice';
-import { appendSentence } from '../../../utils/sentence';
-import { rewriteYaml } from '../../../console/yamlRewrite';
+import { savedMessage } from '../../../utils/sentence';
+import { commitYamlKeys } from '../../../console/yamlCommit';
+import { parseYamlMapping, sameData, type YamlKeyEdit } from '../../../console/yamlRewrite';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { Block, Button, ErrorText, Field, Input, PageShell, Select, StatusText } from './settingsControls';
@@ -137,14 +141,23 @@ function parseYamlObject(text: string): any {
   }
 }
 
-const DUMP_OPTIONS: yaml.DumpOptions = { lineWidth: 120, noRefs: true };
-
-/** 结构化字段改完写回原文：只重写改了的键，运营者写的注释留着。原文坏了 rewriteYaml 会抛 ——
- *  parseYamlObject 把坏文件读成空对象，照着它写回去整份配置就只剩改的那一项。 */
-function rewriteStructured(base: string, next: Record<string, unknown>, okText: string): { content: string; message: string } {
-  const { content, note } = rewriteYaml(base, next, DUMP_OPTIONS);
-  return { content, message: appendSentence(okText, note && `${note}。`) };
+/** 结构化字段一次只动一节：和读到的那份比，变了的顶层键才写，保存前逐节核对那之后有没有被别处改过。
+ *  原文坏了 parseYamlMapping 会抛 —— parseYamlObject 把坏文件读成空对象，照着它写回去整份配置就只剩改的那一项。 */
+function changedSections(loaded: string, next: Record<string, unknown>): YamlKeyEdit[] {
+  const before = parseYamlMapping(loaded);
+  return [...new Set([...Object.keys(before), ...Object.keys(next)])]
+    .filter((key) => !sameData(before[key], next[key]))
+    .map((key) => ({ path: [key], value: next[key] }));
 }
+
+interface StructuredFile {
+  read: (token: string) => Promise<RawText>;
+  write: (token: string, content: string, baseHash: string | null) => Promise<RawSaveResult>;
+}
+
+const SETTINGS_FILE: StructuredFile = { read: getDrawtoolsSettingsRaw, write: updateDrawtoolsSettingsRaw };
+
+const CHARACTERS_FILE: StructuredFile = { read: getDrawtoolsCharactersRaw, write: updateDrawtoolsCharactersRaw };
 
 function sectionFile(bundle: DrawtoolsBundle | null, key: SectionKey): DrawtoolsRawFile | undefined {
   if (!bundle || key === 'node') return undefined;
@@ -174,7 +187,7 @@ async function readPlannerNode(token: string): Promise<RawText & { error: string
   } catch (error) {
     // 指纹给空串：保存时要求文件仍然不存在，中途被别处建出来就报冲突。
     if (isNotFound(error)) return { content: '', hash: '', error: '' };
-    return { content: '', hash: null, error: error instanceof Error ? error.message : String(error) };
+    return { content: '', hash: null, error: errorMessage(error) };
   }
 }
 
@@ -224,7 +237,7 @@ export const DrawtoolsSettingsPage = () => {
       setLoadError('');
     } catch (error) {
       if (version !== loadVersion.current) return;
-      setLoadError(error instanceof Error ? error.message : '加载绘图配置失败');
+      setLoadError(errorMessage(error, '加载绘图配置失败'));
     } finally {
       if (version === loadVersion.current) setLoading(false);
     }
@@ -251,16 +264,16 @@ export const DrawtoolsSettingsPage = () => {
     if (!adminToken) return;
     try {
       const base = section === 'node' ? nodeFile.hash : sectionFile(bundle, section)?.hash ?? null;
-      if (section === 'settings') await updateDrawtoolsSettingsRaw(adminToken, editor, base);
-      else if (section === 'characters') await updateDrawtoolsCharactersRaw(adminToken, editor, base);
-      else if (section === 'node') await updateNodeRaw(adminToken, PLANNER_NODE, editor, base);
-      else await updateDrawtoolsPromptRaw(adminToken, section, editor, base);
+      const result = section === 'settings' ? await updateDrawtoolsSettingsRaw(adminToken, editor, base)
+        : section === 'characters' ? await updateDrawtoolsCharactersRaw(adminToken, editor, base)
+          : section === 'node' ? await updateNodeRaw(adminToken, PLANNER_NODE, editor, base)
+            : await updateDrawtoolsPromptRaw(adminToken, section, editor, base);
       if (tokenChanged(adminToken)) return;
-      setMessage('已保存。用户配置文件会写入非 example 文件，后续更新不会覆盖。');
+      setMessage(savedMessage('已保存。用户配置文件会写入非 example 文件，后续更新不会覆盖。', '', result.warnings));
       await load();
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '保存失败');
+      setMessage(errorMessage(error, '保存失败'));
     }
   };
 
@@ -273,7 +286,7 @@ export const DrawtoolsSettingsPage = () => {
       await load();
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '初始化失败');
+      setMessage(errorMessage(error, '初始化失败'));
     }
   };
 
@@ -281,29 +294,35 @@ export const DrawtoolsSettingsPage = () => {
   const saveStructured = async (
     file: DrawtoolsRawFile | undefined,
     next: Record<string, unknown>,
-    write: (token: string, content: string, baseHash: string | null) => Promise<RawSaveResult>,
+    target: StructuredFile,
     okText: string,
     failText: string,
   ) => {
     if (!adminToken || !confirmDiscard()) return;
     try {
-      const { content, message: done } = rewriteStructured(file?.content || '', next, okText);
-      await write(adminToken, content, file?.hash ?? null);
+      const loaded = file?.content || '';
+      const { note, result } = await commitYamlKeys({
+        read: () => target.read(adminToken),
+        write: (content, hash) => target.write(adminToken, content, hash),
+        edits: changedSections(loaded, next),
+        loaded,
+        proceed: () => !tokenChanged(adminToken),
+      });
       if (tokenChanged(adminToken)) return;
-      setMessage(done);
+      setMessage(savedMessage(okText, note, result.warnings));
       await load();
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : failText);
+      setMessage(errorMessage(error, failText));
     }
   };
 
   const saveSettingsObject = (next: any, okText: string) => saveStructured(
-    bundle?.settings, next, updateDrawtoolsSettingsRaw, okText, '保存设置失败',
+    bundle?.settings, next, SETTINGS_FILE, okText, '保存设置失败',
   );
 
   const saveCharacterObject = (next: any, okText: string) => saveStructured(
-    bundle?.character_tags, next, updateDrawtoolsCharactersRaw, okText, '保存角色标签库失败',
+    bundle?.character_tags, next, CHARACTERS_FILE, okText, '保存角色标签库失败',
   );
 
   const updateApiField = (key: string, value: string) => {
@@ -335,7 +354,7 @@ export const DrawtoolsSettingsPage = () => {
       setMessage(`清理完成：删除 ${result.deleted_count ?? 0} 个文件，释放 ${result.deleted_mb ?? 0} MB；剩余 ${result.remaining_count ?? 0} 个文件 / ${result.remaining_mb ?? 0} MB`);
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '清理失败');
+      setMessage(errorMessage(error, '清理失败'));
     }
   };
 

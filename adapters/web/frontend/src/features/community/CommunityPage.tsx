@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { errorMessage } from '../../api/request';
 import { featureRequest } from '../client';
 import { ScopeSelect } from '../execution/ScopeSelect';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
@@ -58,11 +59,11 @@ export function CommunityPage({ scope: initialScope = '' }: { scope?: string }) 
     setLoading(false);
   }, [viewKey, picker.valid]);
   useEffect(() => { mutationSequence.current++; mutating.current = false; setState(null); setLoadedKey(''); setItems([]); setGuide({}); setWelcome(false); setTitle(''); setOptions(''); setDeadline(''); setReminder(''); dirtyRef.current = false; setBusy(false); setError(''); setNotice(''); return () => { generation.current++; }; }, [viewKey]);
-  useEffect(() => { setLoading(picker.valid); if (picker.valid) void refresh().catch(reason => { if (isCurrent()) { setError(String(reason)); setLoading(false); } }); return () => { generation.current++; }; }, [refresh]);
+  useEffect(() => { setLoading(picker.valid); if (picker.valid) void refresh().catch(reason => { if (isCurrent()) { setError(errorMessage(reason)); setLoading(false); } }); return () => { generation.current++; }; }, [refresh]);
   const run = async (action: () => Promise<unknown>, message = '操作已完成。', resetDraft = false) => {
     if (!picker.valid || !isCurrent() || mutating.current) return; mutating.current = true; const mutation = ++mutationSequence.current;
     setBusy(true); setError(''); setNotice('');
-    try { await action(); if (isCurrent()) { await refresh(resetDraft); if (isCurrent()) setNotice(message); } } catch (reason) { if (isCurrent()) setError(String(reason)); } finally { if (mutation === mutationSequence.current) { mutating.current = false; if (isCurrent()) setBusy(false); } }
+    try { await action(); if (isCurrent()) { await refresh(resetDraft); if (isCurrent()) setNotice(message); } } catch (reason) { if (isCurrent()) setError(errorMessage(reason)); } finally { if (mutation === mutationSequence.current) { mutating.current = false; if (isCurrent()) setBusy(false); } }
   };
   const visible = items.filter(item => (filter === 'all' || item.status === filter) && `${item.title} ${item.id}`.toLowerCase().includes(query.toLowerCase()));
   return <FeaturePage title="群协作" description="先选择当前账号的群聊，再管理活动、投票和群指引。不会自动选群，也不会发布到控制台或私聊。">

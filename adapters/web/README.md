@@ -8,14 +8,21 @@
 adapters/web/
 └── frontend/
     ├── src/
+    │   ├── api/            # Supervisor API 客户端；request.ts 统一带令牌、超时和错误
     │   ├── components/     # React 组件
     │   │   ├── chat/       # 对话界面
-    │   │   └── settings/   # 设置面板（节点、工具、模型、MCP 等）
-    │   ├── api/            # Supervisor API 客户端
-    │   ├── stores/         # Zustand 状态管理
-    │   └── App.tsx         # 路由入口
+    │   │   └── settings/   # 设置面板（节点、工具、MCP、定时任务等）
+    │   ├── console/        # 控制台各页（人格、模型参数、记忆、平台配置等）
+    │   ├── features/       # 独立功能页（执行、资料、社区等）
+    │   ├── hooks/          # 共享 hooks
+    │   ├── instances/      # 多开实例：路径前缀与实例目录
+    │   ├── platforms/      # 平台清单（读后端公布的平台描述）
+    │   ├── plugins/        # 前端插件 SDK（说明见 plugins/README.md）
+    │   ├── store/          # Zustand 状态
+    │   ├── views/          # 工作区视图注册
+    │   └── App.tsx         # 应用外壳与视图切换
     ├── dist/               # 构建产物（由 Supervisor 挂载）
-    ├── vite.config.ts      # Vite 配置，base 路径为 /web/
+    ├── vite.config.ts      # Vite 配置，base 为相对路径 ./
     ├── package.json
     └── tsconfig.json
 ```
@@ -38,10 +45,10 @@ npm install
 
 ```bash
 npm run dev
-# 访问 http://localhost:5173/web/
+# 访问 http://localhost:5173/
 ```
 
-开发模式下，API 请求需要 Supervisor 在 `http://127.0.0.1:8765` 运行。可在 `src/api/supervisorClient.ts` 中修改默认地址。
+前端的 API 和 WebSocket 都发往页面所在源的 `/v1/`（多开时带实例前缀），开发服务器本身没有配置代理。要连真后端调试，请在 `vite.config.ts` 的 `server.proxy` 里把 `/v1` 转到 Supervisor（默认 `http://127.0.0.1:8765`，记得开 `ws: true`），或直接 `npm run build` 后用 Supervisor 挂载的 `/web/` 访问。
 
 ### 3. 生产构建
 
@@ -115,7 +122,7 @@ cp -r dist/ /path/to/production/adapters/web/frontend/dist/
 
 ### base 路径
 
-`vite.config.ts` 中 `base` 设置为 `/web/`，与 Supervisor 的挂载路径一致。如需修改挂载路径，需同步修改 `vite.config.ts` 中的 `base` 和 Supervisor 中的 `app.mount()` 路径。
+`vite.config.ts` 中 `base` 是相对路径 `./`：多开时每个实例挂在自己的路径前缀下（如 `/i/<实例>/web/`），同一份 `dist/` 的资源都跟着页面所在路径解析，不用为每个实例单独构建。API 与 WebSocket 的前缀由页面路径里最后一个 `/web/` 之前的部分推出（`src/instances/paths.ts` 的 `MOUNT`），所以 Supervisor 必须把控制台挂在以 `/web/` 结尾的路径上。
 
 ## 技术栈
 

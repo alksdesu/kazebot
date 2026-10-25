@@ -67,6 +67,8 @@ beforeEach(() => {
   vi.mocked(api.migrateAccountScope).mockResolvedValue({
     moved_memory_dirs: 2, sessions_changed: 3, backup_dir: '/srv/backup/scope-1',
   });
+  vi.mocked(api.switchPlatformAccount).mockResolvedValue({ rosterError: '' });
+  vi.mocked(api.pinPlatformAccount).mockResolvedValue({ rosterError: '' });
   vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('unexpected request')));
   window.history.replaceState(null, '', '/web/?view=settings&tab=qq-account');
   // 轮询在状态读回来之后才挂上，假定时器得先于 render 接管才推得动它。
@@ -493,7 +495,7 @@ describe('账号页的提示', () => {
 
   it('停止等待之后快速切换，又自己盯着了', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
-    vi.mocked(api.switchPlatformAccount).mockResolvedValue(undefined);
+    vi.mocked(api.switchPlatformAccount).mockResolvedValue({ rosterError: '' });
     vi.mocked(api.getPlatformAccount).mockResolvedValue(waitingWithBackup);
     await intoScanning();
     await click('停止等待');
@@ -505,6 +507,48 @@ describe('账号页的提示', () => {
     expect(api.getPlatformAccount).toHaveBeenCalledTimes(3);
     expect(screen.getByRole('img', { name: 'QQ 登录二维码' })).toBeInTheDocument();
     expect(screen.getByText(SCAN_HINT)).toBeInTheDocument();
+  });
+});
+
+// 多开时号换上了却没记进数据根下的实例清单：别的实例拦不住同一个号重复登录，这件事得让人看见。
+describe('实例清单没记上新号', () => {
+  const ROSTER = '号已经换上，但没记进实例清单，别的实例拦不住同一个号重复登录：Permission denied';
+
+  it('快速切换回来带着原因就摆出来，后面几轮轮询也冲不掉', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(api.switchPlatformAccount).mockResolvedValue({ rosterError: ROSTER });
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(waitingWithBackup);
+    await intoScanning();
+    await click('停止等待');
+
+    await click('切到这个号');
+    await tick();
+    await tick();
+
+    expect(screen.getByText(ROSTER)).toHaveAttribute('role', 'alert');
+  });
+
+  it('扫码登上后钉号时带着原因也摆出来', async () => {
+    vi.mocked(api.pinPlatformAccount).mockResolvedValue({ rosterError: ROSTER });
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(waitingScan);
+    await intoScanning();
+
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(online);
+    await tick();
+
+    expect(screen.getByText('已登录 当前机器人，并设为重启后自动登录。')).toBeInTheDocument();
+    expect(screen.getByText(ROSTER)).toHaveAttribute('role', 'alert');
+  });
+
+  it('记上了就什么都不多说', async () => {
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(waitingScan);
+    await intoScanning();
+
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(online);
+    await tick();
+
+    expect(screen.getByText('已登录 当前机器人，并设为重启后自动登录。')).toBeInTheDocument();
+    expect(screen.queryByText(/没记进实例清单/)).toBeNull();
   });
 });
 

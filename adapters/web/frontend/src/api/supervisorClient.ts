@@ -1,91 +1,21 @@
-// [2026-05-16] Real Supervisor API client — zero mock.
+// Supervisor 接口的薄封装：只管路径和请求体，鉴权、时限与报错交给 request。
 import type { NodeDef, SupervisorEvent } from '../types';
-import { fetchWithDeadline } from './requestDeadline';
 import { commandAction } from '../plugins/commands';
 import { isInstancePath, MOUNT } from '../instances/paths';
+import { ApiError, request, send, type RequestOptions } from './request';
 
 export { MOUNT, instanceConsoleHref } from '../instances/paths';
+export { ApiError, isEditConflict, isNotFound, isTransientApiError } from './request';
 
 const API = `${MOUNT}/v1`;
 
-// ── Helper ──
-
-const ERROR_BODY_LIMIT = 4000;
-
-export class ApiError extends Error {
-  readonly status: number;
-
-  constructor(status: number, message: string) {
-    super(`${status}${message ? ` ${message}` : ''}`);
-    this.name = 'ApiError';
-    this.status = status;
-  }
+function apiFetch(path: string, options?: RequestOptions): Promise<Response> {
+  return request(`${API}${path}`, options);
 }
 
-export function isTransientApiError(error: unknown): boolean {
-  return !(error instanceof ApiError) || [502, 503, 504, 530].includes(error.status);
-}
-
-const htmlErrorText = (body: string): string => body
-  .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-  .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-  .replace(/<[^>]*>/g, ' ')
-  .replace(/&nbsp;/gi, ' ')
-  .replace(/&amp;/gi, '&')
-  .replace(/&lt;/gi, '<')
-  .replace(/&gt;/gi, '>')
-  .replace(/&quot;/gi, '"')
-  .replace(/&#39;/gi, "'")
-  .replace(/\s+/g, ' ')
-  .trim();
-
-const errorDetail = async (resp: Response): Promise<string> => {
-  const body = await resp.text();
-  if (!body.trim()) return resp.statusText;
-  try {
-    const payload = JSON.parse(body);
-    const detail = payload?.detail ?? payload?.message ?? payload?.error;
-    if (typeof detail === 'string' && detail.trim()) return detail.trim();
-    if (detail && typeof detail === 'object') return JSON.stringify(detail);
-  } catch {
-    // Non-JSON responses include proxy and tunnel error pages.
-  }
-  return (resp.headers.get('content-type') || '').includes('text/html')
-    ? htmlErrorText(body).slice(0, ERROR_BODY_LIMIT)
-    : body.trim().slice(0, ERROR_BODY_LIMIT);
-};
-
-async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
-  const resp = await fetchWithDeadline(`${API}${path}`, init);
-  if (!resp.ok) {
-    const detail = await errorDetail(resp);
-    throw new ApiError(resp.status, detail);
-  }
-  return resp;
-}
-
-/** apiFetch 抛的错误信息以状态码打头，靠它认出「要的东西不存在」。 */
-export function isNotFound(error: unknown): boolean {
-  return error instanceof Error && /^404\b/.test(error.message);
-}
-
-/** 带着指纹写回时 409：打开之后这份配置被别处改过。别的写入的 409 另有含义（比如系统节点不让改），不能拿它判断。 */
-export function isEditConflict(error: unknown): boolean {
-  return error instanceof Error && /^409\b/.test(error.message);
-}
-
-function authHeaders(token: string): Record<string, string> {
-  return { Authorization: `Bearer ${token}` };
-}
-
-/**
- * 附件的可访问地址。path 是工作区相对路径，例如 data/attachments/xxx/yyy.png。
- *
- * token 走 query 而不是请求头：img 标签带不了 Authorization（后端两种都认）。
- */
-export function attachmentHref(path: string, token: string | null): string {
-  const safe = path.split('/').map(encodeURIComponent).join('/');
-  return `${API}/files/${safe}${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+/** 附件在本实例上的地址。path 是工作区相对路径，例如 data/attachments/xxx/yyy.png；令牌走请求头，不进地址。 */
+export function attachmentUrl(path: string): string {
+  return `${API}/files/${path.split('/').map(encodeURIComponent).join('/')}`;
 }
 
 // ── Attachment upload ──
@@ -101,20 +31,14 @@ export interface UploadedAttachment {
 export async function uploadAttachment(
   file: File,
   conversationKey: string,
-  token: string,
+  token?: string,
 ): Promise<UploadedAttachment> {
   const form = new FormData();
   form.append('file', file);
-  const resp = await fetchWithDeadline(
-    `${API}/attachments/upload?conversation_key=${encodeURIComponent(conversationKey)}`,
-    // 不手动设 Content-Type：浏览器要自己填 multipart boundary。
-    { method: 'POST', body: form, headers: authHeaders(token) },
-  );
-  if (!resp.ok) {
-    let detail = '';
-    try { const j = await resp.json(); detail = j.detail || ''; } catch { /* ignore */ }
-    throw new Error(`Upload failed: ${resp.status}${detail ? ` ${detail}` : ''}`);
-  }
+  // 不手动设 Content-Type：浏览器要自己填 multipart boundary。
+  const resp = await apiFetch(`/attachments/upload?conversation_key=${encodeURIComponent(conversationKey)}`, {
+    method: 'POST', body: form, token,
+  });
   return resp.json();
 }
 
@@ -129,126 +53,108 @@ export async function postInbound(params: {
 }): Promise<{ session_id: string; inbound_seq: number; accepted: boolean }> {
   const resp = await apiFetch('/inbound', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+    json: {
       channel: 'web',
       conversation_key: params.conversation_key,
       text: params.text,
       attachments: params.attachments ?? [],
       use_context: params.use_context ?? true,
       entry_node_id: params.entry_node_id,
-    }),
+    },
   });
   return resp.json();
 }
 
-// ── WebSocket events ──
+// ── 全局事件流 ──
 
-// [2026-06-03] Global Supervisor WebSocket replaces per-session polling.
-// Why: a browser tab can display several web sessions while more than one task is
-// running, so closing or replacing the socket per active session loses events from
-// the other sessions. How: keep one long-lived /v1/ws connection and let the store
-// route each SupervisorEvent by event.session_id. Purpose: realtime delivery no
-// longer depends on the fragile in-memory polling buffer or on the selected chat.
-let _globalWs: WebSocket | null = null;
-let _globalWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let _globalWsReconnectDelay = 1000;
+export interface GlobalStreamHandlers {
+  onEvent: (event: SupervisorEvent) => void;
+  /** reconnected：断开过又连上了。后端只推连上之后的新事件，断开期间的要调用方自己重拉。 */
+  onOpen?: (info: { reconnected: boolean }) => void;
+  /** retryInMs：多久之后自动重连，按断开次数指数退避。 */
+  onClose?: (info: { retryInMs: number }) => void;
+}
 
-export function connectGlobalWS(
-  lastSeq: number,
-  onEvent: (event: SupervisorEvent) => void,
-  onOpen?: () => void,
-  onDisconnect?: () => void,
-): void {
-  // [2026-06-03] Why: loadStartup and sendMessage can both request realtime setup.
-  // How: do not open a second socket while one is CONNECTING or OPEN. Purpose:
-  // global event delivery stays single-copy while the connection remains long-lived.
-  const readyState = _globalWs?.readyState;
-  if (readyState === 0 || readyState === 1) {
-    return;
-  }
+// 数值而不是 WebSocket.CONNECTING：测试和老浏览器替换的 WebSocket 上不一定挂着这些静态常量。
+const SOCKET_CONNECTING = 0;
+const SOCKET_OPEN = 1;
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 30_000;
 
-  disconnectGlobalWS();
+let globalSocket: WebSocket | null = null;
+let globalHandlers: GlobalStreamHandlers | null = null;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let reconnectDelay = RECONNECT_BASE_MS;
+let openedBefore = false;
 
+function clearReconnectTimer(): void {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+}
+
+function openGlobalSocket(): void {
+  clearReconnectTimer();
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${wsProtocol}//${window.location.host}${MOUNT}/v1/ws`;
-  const ws = new WebSocket(wsUrl);
-  _globalWs = ws;
+  const socket = new WebSocket(`${wsProtocol}//${window.location.host}${API}/ws`);
+  globalSocket = socket;
 
-  ws.onopen = () => {
-    // [2026-06-03] Why: /v1/ws uses a global sequence cursor, unlike the old
-    // per-session endpoint. How: send the latest known EventLog seq across all
-    // sessions once the socket opens. Purpose: reconnect catch-up covers every
-    // session without session event polling.
-    _globalWsReconnectDelay = 1000;
-    ws.send(JSON.stringify({ last_seq: Math.max(0, lastSeq || 0) }));
-    onOpen?.();
+  socket.onopen = () => {
+    if (globalSocket !== socket) return;
+    reconnectDelay = RECONNECT_BASE_MS;
+    // 后端要先收到一帧才开始推送；last_seq 不补发历史，补齐靠调用方重拉。
+    socket.send(JSON.stringify({ last_seq: 0 }));
+    const reconnected = openedBefore;
+    openedBefore = true;
+    globalHandlers?.onOpen?.({ reconnected });
   };
 
-  ws.onmessage = (msgEvent) => {
+  socket.onmessage = (message) => {
+    let data: unknown;
     try {
-      const data = JSON.parse(msgEvent.data);
-      if (data.type === 'ping') return;
-      onEvent(data as SupervisorEvent);
+      data = JSON.parse(message.data);
     } catch {
-      // [2026-06-03] Why: the global stream is append-only and should tolerate
-      // malformed frames. How: ignore the bad frame only. Purpose: one malformed
-      // payload cannot stop future session events.
+      return;
     }
+    if (!data || typeof data !== 'object' || (data as { type?: unknown }).type === 'ping') return;
+    globalHandlers?.onEvent(data as SupervisorEvent);
   };
 
-  ws.onclose = () => {
-    if (_globalWs === ws) _globalWs = null;
-    onDisconnect?.();
-    // [2026-06-03] Reconnect is handled by the store's onDisconnect callback
-    // (startGlobalWebSocket). The transport layer only tracks backoff delay.
-    _globalWsReconnectDelay = Math.min(_globalWsReconnectDelay * 2, 30000);
+  socket.onclose = () => {
+    if (globalSocket !== socket) return;
+    globalSocket = null;
+    const retryInMs = reconnectDelay;
+    reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+    reconnectTimer = setTimeout(openGlobalSocket, retryInMs);
+    globalHandlers?.onClose?.({ retryInMs });
   };
 
-  ws.onerror = () => {
-    // [2026-06-03] Why: network errors should share the same cleanup and reconnect
-    // callback as normal disconnects. How: close the socket and let onclose run.
-    // Purpose: the store has one recovery path for long-lived global realtime.
-    ws.close();
+  socket.onerror = () => {
+    socket.close();
   };
 }
 
+/** 订阅全部会话的事件。已连着就只换回调；正在等重连时立刻重试一次。断开后按指数退避自动重连。 */
+export function connectGlobalWS(handlers: GlobalStreamHandlers): void {
+  globalHandlers = handlers;
+  const readyState = globalSocket?.readyState;
+  if (readyState === SOCKET_CONNECTING || readyState === SOCKET_OPEN) return;
+  openGlobalSocket();
+}
+
+/** 彻底断开，不再重连。退出登录、重置状态时用。 */
 export function disconnectGlobalWS(): void {
-  // [2026-06-03] Why: resetState and tests still need an explicit cleanup point.
-  // How: clear the pending reconnect marker and close only the global socket.
-  // Purpose: ordinary task completion never calls this, but full teardown remains safe.
-  if (_globalWsReconnectTimer) { clearTimeout(_globalWsReconnectTimer); _globalWsReconnectTimer = null; }
-  if (_globalWs) {
-    _globalWs.onclose = null;
-    _globalWs.close();
-    _globalWs = null;
-  }
-}
-
-export function connectSessionWS(
-  sessionId: string,
-  lastSeq: number,
-  onEvent: (event: SupervisorEvent) => void,
-  onOpen?: () => void,
-  onDisconnect?: () => void,
-): void {
-  // [2026-06-03] Compatibility wrapper. Why: the legacy chatStore still imports the
-  // old per-session helper. How: route it through the global WebSocket and filter by
-  // session id at the client boundary. Purpose: avoid keeping two WebSocket designs
-  // while chatStore has moved to all-session realtime delivery.
-  connectGlobalWS(
-    lastSeq,
-    (event) => { if (event.session_id === sessionId) onEvent(event); },
-    onOpen,
-    onDisconnect,
-  );
-}
-
-export function disconnectSessionWS(): void {
-  // [2026-06-03] Compatibility wrapper. Why: existing legacy call sites still call
-  // disconnectSessionWS during teardown. How: delegate to the global cleanup helper.
-  // Purpose: reset paths remain functional without reintroducing per-session sockets.
-  disconnectGlobalWS();
+  clearReconnectTimer();
+  globalHandlers = null;
+  openedBefore = false;
+  reconnectDelay = RECONNECT_BASE_MS;
+  const socket = globalSocket;
+  globalSocket = null;
+  if (!socket) return;
+  socket.onopen = null;
+  socket.onmessage = null;
+  socket.onclose = null;
+  socket.onerror = null;
+  socket.close();
 }
 
 // ── Health ──
@@ -262,7 +168,7 @@ export interface HealthState {
 }
 
 export async function checkHealth(signal?: AbortSignal): Promise<HealthState> {
-  const resp = await apiFetch('/health', signal ? { signal } : undefined);
+  const resp = await apiFetch('/health', { signal, anonymous: true });
   return resp.json();
 }
 
@@ -394,88 +300,73 @@ export interface RawText {
 export interface RawSaveResult {
   ok: boolean;
   hash: string | null;
+  /** 后端保存前校验给的提醒：能存，但有该知道的事（比如某个键已经没人读了）。没有提醒时不带这一项。 */
+  warnings?: string[];
 }
+
+const warningsOf = (json: unknown): string[] => {
+  const warnings = (json as { warnings?: unknown } | null)?.warnings;
+  return Array.isArray(warnings) ? warnings.map(String) : [];
+};
+
+/** 写配置文件的回执：原文编辑器保存和新建文件回的是同一种。 */
+const saveResultOf = (json: unknown): RawSaveResult => {
+  const warnings = warningsOf(json);
+  return {
+    ok: (json as { ok?: unknown } | null)?.ok !== false,
+    hash: hashOf(json),
+    ...(warnings.length ? { warnings } : {}),
+  };
+};
 
 export function hashOf(json: unknown): string | null {
   const hash = (json as { hash?: unknown } | null)?.hash;
   return typeof hash === 'string' ? hash : null;
 }
 
-function rawWriteBody(content: string, baseHash: string | null): string {
-  return JSON.stringify(baseHash === null ? { content } : { content, base_hash: baseHash });
+function rawWriteFields(content: string, baseHash: string | null): { content: string; base_hash?: string } {
+  return baseHash === null ? { content } : { content, base_hash: baseHash };
 }
 
 async function readRawConfig(path: string, token: string): Promise<RawText> {
-  // [2026-06-02] Shared raw-config reader for the expanded Settings tabs.
-  // Why: nodes, tools, skills, MCP clients, schedules, policy, and runtime all expose
-  // the same {content:string} shape. How: centralize bearer auth and response
-  // unwrapping in one helper. Purpose: page code edits text without duplicating API
-  // response handling or accidentally returning the wrapper object.
-  const resp = await apiFetch(path, { headers: authHeaders(token) });
+  const resp = await apiFetch(path, { token });
   const json = await resp.json();
   return { content: typeof json.content === 'string' ? json.content : '', hash: hashOf(json) };
 }
 
 async function writeRawConfig(path: string, token: string, content: string, baseHash: string | null): Promise<RawSaveResult> {
-  // [2026-06-02] Shared raw-config writer for the expanded Settings tabs.
-  // Why: every raw editor saves through the same {content:string} backend model. How:
-  // send JSON with the admin bearer header in one helper. Purpose: the UI can add new
-  // raw-backed pages without reimplementing method, headers, and payload shape.
   const resp = await apiFetch(path, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: rawWriteBody(content, baseHash),
+    token,
+    json: rawWriteFields(content, baseHash),
   });
-  const json = await resp.json();
-  return { ok: json?.ok !== false, hash: hashOf(json) };
+  return saveResultOf(await resp.json());
 }
 
 const pathPart = (value: string): string => encodeURIComponent(value);
 
 export async function getAdminState(token: string): Promise<AdminState> {
-  // [2026-06-01] Fetch the protected Supervisor snapshot for the chat dashboard.
-  // Why: the new right rail needs session, approval, task, and engine worker counts.
-  // How: call /v1/admin/state with the existing bearer token helper. Purpose: keep
-  // dashboard polling inside the API client instead of scattering endpoint strings.
-  const resp = await apiFetch('/admin/state', { headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/state', { token });
   return resp.json();
 }
 
-export async function fetchActiveTasks(token = ''): Promise<ActiveTask[]> {
-  // [AutoC 2026-06-04] Why: the System dashboard task count now opens a detail
-  // modal. How: call the new protected summary endpoint with the same bearer-token
-  // helper used by other admin APIs. Purpose: task monitoring stays independent of
-  // chatStore and does not duplicate request construction in UI components.
-  const init = token ? { headers: authHeaders(token) } : undefined;
-  const resp = await fetchWithDeadline(`${API}/admin/tasks/active`, init);
-  if (!resp.ok) throw new Error(`Failed to fetch active tasks: ${resp.status}`);
+export async function fetchActiveTasks(token?: string): Promise<ActiveTask[]> {
+  const resp = await apiFetch('/admin/tasks/active', { token });
   return resp.json();
 }
 
-export async function cancelTask(adminToken: string, taskId: string): Promise<void> {
-  // [AutoC 2026-06-04] Why: ActiveTasksModal cancels one task at a time, while the
-  // existing cancelActiveTasks helper targets an entire session. How: call the
-  // public single-task endpoint and still include admin context headers for future
-  // backend hardening. Purpose: row-level cancel buttons remain precise and safe.
-  const headers = adminToken
-    ? { ...authHeaders(adminToken), 'X-Admin-Token': adminToken }
-    : {};
-  const resp = await fetchWithDeadline(`${API}/tasks/${encodeURIComponent(taskId)}/cancel`, {
-    method: 'POST',
-    headers,
-  });
-  if (!resp.ok) throw new Error(`Cancel failed: ${resp.status}`);
+/** 取消单个任务。cancelActiveTasks 管的是整个会话。 */
+export async function cancelTask(token: string, taskId: string): Promise<void> {
+  await apiFetch(`/tasks/${encodeURIComponent(taskId)}/cancel`, { method: 'POST', token });
 }
 
 // ── Admin auth ──
 
+/** 令牌被拒返回 false；服务端故障抛错，让调用方分清「令牌不对」和「验证不了」。 */
 export async function verifyAdminAuth(token: string, signal?: AbortSignal): Promise<boolean> {
-  const resp = await fetchWithDeadline(`${API}/admin/auth/check`, {
-    headers: authHeaders(token),
-    ...(signal ? { signal } : {}),
-  });
+  const resp = await send(`${API}/admin/auth/check`, { token, signal });
   if (resp.status === 401 || resp.status === 403) return false;
-  if (!resp.ok) throw new Error(`登录验证服务暂不可用（${resp.status}）`);
+  if (!resp.ok) throw new ApiError(resp.status, '登录验证服务暂不可用');
   return true;
 }
 
@@ -490,7 +381,7 @@ export async function checkAdminAuth(token: string): Promise<boolean> {
 // ── Nodes ──
 
 export async function getNodes(token: string): Promise<AdminNode[]> {
-  const resp = await apiFetch('/admin/config/nodes', { headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/config/nodes', { token });
   return resp.json();
 }
 
@@ -590,7 +481,7 @@ export function activeProviderConfig(
 }
 
 export async function getProviders(token: string): Promise<ProvidersResponse> {
-  const resp = await apiFetch('/config/providers', { headers: authHeaders(token) });
+  const resp = await apiFetch('/config/providers', { token });
   return resp.json();
 }
 
@@ -626,7 +517,7 @@ export interface ProviderProfiles {
 
 // 界面不硬编码各家支持什么参数、发哪种格式 —— provider 类自己声明，这里只搬运。
 export async function getProviderProfiles(token: string): Promise<ProviderProfiles> {
-  const resp = await apiFetch('/config/provider-options', { headers: authHeaders(token) });
+  const resp = await apiFetch('/config/provider-options', { token });
   const body = await resp.json();
   return {
     options: (body?.options || {}) as ProviderOptionsCatalog,
@@ -646,8 +537,8 @@ export async function listUpstreamModels(
 ): Promise<string[]> {
   const resp = await apiFetch(`/config/providers/${encodeURIComponent(name)}/models`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(data),
+    token,
+    json: data,
   });
   const body = await resp.json();
   return Array.isArray(body?.models) ? body.models.map(String) : [];
@@ -665,8 +556,8 @@ export async function upsertProvider(
 ): Promise<ProvidersResponse> {
   const resp = await apiFetch(`/config/providers/${encodeURIComponent(name)}`, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(data),
+    token,
+    json: data,
   });
   return resp.json();
 }
@@ -674,7 +565,7 @@ export async function upsertProvider(
 export async function deleteProvider(token: string, name: string): Promise<ProvidersResponse> {
   const resp = await apiFetch(`/config/providers/${encodeURIComponent(name)}`, {
     method: 'DELETE',
-    headers: authHeaders(token),
+    token,
   });
   return resp.json();
 }
@@ -710,7 +601,7 @@ export interface SystemModelsResponse {
 }
 
 export async function getSystemModels(token: string): Promise<SystemModelsResponse> {
-  const resp = await apiFetch('/config/system-models', { headers: authHeaders(token) });
+  const resp = await apiFetch('/config/system-models', { token });
   return resp.json();
 }
 
@@ -753,7 +644,7 @@ export interface PolicyFile {
 const policyFileOf = (data: any): PolicyFile => ({ policy: (data && data.policy) || {}, hash: hashOf(data) });
 
 export async function getPolicy(token: string): Promise<PolicyFile> {
-  const resp = await apiFetch('/config/policy', { headers: authHeaders(token) });
+  const resp = await apiFetch('/config/policy', { token });
   return policyFileOf(await resp.json());
 }
 
@@ -761,8 +652,8 @@ export async function getPolicy(token: string): Promise<PolicyFile> {
 export async function updatePolicy(token: string, policy: PolicyDoc, baseHash: string | null): Promise<PolicyFile> {
   const resp = await apiFetch('/config/policy', {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(baseHash === null ? { policy } : { policy, base_hash: baseHash }),
+    token,
+    json: baseHash === null ? { policy } : { policy, base_hash: baseHash },
   });
   return policyFileOf(await resp.json());
 }
@@ -821,10 +712,9 @@ export interface InstanceDirectory {
 }
 
 export async function getInstanceDirectory(signal?: AbortSignal): Promise<InstanceDirectory> {
-  const response = await fetchWithDeadline(`${API}/instance-directory`, {
-    signal, credentials: 'omit', cache: 'no-store',
-  }, 10_000, true);
-  if (!response.ok) throw new ApiError(response.status, await errorDetail(response));
+  const response = await apiFetch('/instance-directory', {
+    signal, credentials: 'omit', cache: 'no-store', anonymous: true, timeoutMs: 10_000, bypassPlugins: true,
+  });
   const data = await response.json();
   if (!data || data.current_path !== MOUNT || !Array.isArray(data.instances)) {
     throw new Error('实例列表与当前入口不一致，请检查服务配置');
@@ -868,7 +758,7 @@ export function ownedByAnotherInstance(
 }
 
 export async function getInstances(token: string): Promise<ConsoleInstance[]> {
-  const resp = await apiFetch('/instances', { headers: authHeaders(token) });
+  const resp = await apiFetch('/instances', { token });
   const data = await resp.json();
   return Array.isArray(data?.instances) ? data.instances : [];
 }
@@ -915,8 +805,8 @@ export async function createInstance(
 ): Promise<InstancePlan> {
   const resp = await apiFetch('/instances', {
     method: 'POST',
-    headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id, label, platform, account }),
+    token,
+    json: { id, label, platform, account },
   });
   return resp.json();
 }
@@ -926,7 +816,7 @@ export async function getInstanceProgress(
   id: string,
 ): Promise<InstanceProgress> {
   const resp = await apiFetch(`/instances/${encodeURIComponent(id)}/progress`, {
-    headers: authHeaders(token),
+    token,
   });
   return resp.json();
 }
@@ -934,7 +824,7 @@ export async function getInstanceProgress(
 export async function deleteInstance(token: string, id: string): Promise<void> {
   await apiFetch(`/instances/${encodeURIComponent(id)}`, {
     method: 'DELETE',
-    headers: authHeaders(token),
+    token,
   });
 }
 
@@ -994,8 +884,8 @@ const normalizeShareGroups = (raw: any): ShareGroupOverview => ({
   archives: Array.isArray(raw?.archives) ? raw.archives.map(String) : [],
 });
 
-async function changeShareGroup(path: string, token: string, init: RequestInit): Promise<ShareGroupChange> {
-  const resp = await apiFetch(path, { ...init, headers: { 'Content-Type': 'application/json', ...authHeaders(token) } });
+async function changeShareGroup(path: string, token: string, init: RequestOptions): Promise<ShareGroupChange> {
+  const resp = await apiFetch(path, { ...init, token });
   const json = await resp.json();
   return {
     group: String(json?.group ?? ''),
@@ -1006,20 +896,20 @@ async function changeShareGroup(path: string, token: string, init: RequestInit):
 }
 
 export async function getShareGroups(token: string): Promise<ShareGroupOverview> {
-  const resp = await apiFetch('/share-groups', { headers: authHeaders(token) });
+  const resp = await apiFetch('/share-groups', { token });
   return normalizeShareGroups(await resp.json());
 }
 
 export function createShareGroup(token: string, name: string): Promise<ShareGroupChange> {
-  return changeShareGroup('/share-groups', token, { method: 'POST', body: JSON.stringify({ name }) });
+  return changeShareGroup('/share-groups', token, { method: 'POST', json: { name } });
 }
 
 export function joinShareGroup(token: string, name: string): Promise<ShareGroupChange> {
-  return changeShareGroup(`/share-groups/${encodeURIComponent(name)}/join`, token, { method: 'POST', body: '{}' });
+  return changeShareGroup(`/share-groups/${encodeURIComponent(name)}/join`, token, { method: 'POST', json: {} });
 }
 
 export function leaveShareGroup(token: string): Promise<ShareGroupChange> {
-  return changeShareGroup('/share-groups/leave', token, { method: 'POST', body: '{}' });
+  return changeShareGroup('/share-groups/leave', token, { method: 'POST', json: {} });
 }
 
 export function deleteShareGroup(token: string, name: string): Promise<ShareGroupChange> {
@@ -1030,35 +920,48 @@ const platformAccountPath = (platformId: string, leaf = ''): string =>
   `/platforms/${encodeURIComponent(platformId)}/account${leaf}`;
 
 export async function getPlatformAccount(token: string, platformId: string): Promise<AccountStatus> {
-  const resp = await apiFetch(platformAccountPath(platformId), { headers: authHeaders(token) });
+  const resp = await apiFetch(platformAccountPath(platformId), { token });
   const data = await resp.json();
   return data || { configured: false };
 }
 
-export async function switchPlatformAccount(token: string, platformId: string, account: string): Promise<void> {
-  await apiFetch(platformAccountPath(platformId, '/switch'), {
+/** 换号、钉号的回执。 */
+export interface AccountChange {
+  /** 号已经换上，但没记进实例清单（多开时数据根下的清单写不了）时的原因；记上了是空串。 */
+  rosterError: string;
+}
+
+const accountChangeOf = (json: unknown): AccountChange => {
+  const reason = (json as { roster_error?: unknown } | null)?.roster_error;
+  return { rosterError: typeof reason === 'string' ? reason.trim() : '' };
+};
+
+export async function switchPlatformAccount(token: string, platformId: string, account: string): Promise<AccountChange> {
+  const resp = await apiFetch(platformAccountPath(platformId, '/switch'), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ account }),
+    token,
+    json: { account },
   });
+  return accountChangeOf(await resp.json());
 }
 
 /** 让平台停在等扫码的状态。QQ 在已登录状态下拒发二维码、也没有登出接口，只能清掉自动登录再重启容器。 */
 export async function enterPlatformLoginMode(token: string, platformId: string): Promise<void> {
   await apiFetch(platformAccountPath(platformId, '/relogin'), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: '{}',
+    token,
+    json: {},
   });
 }
 
 /** 把当前在线的号钉成自动登录，否则下次重启会停在等扫码。 */
-export async function pinPlatformAccount(token: string, platformId: string): Promise<void> {
-  await apiFetch(platformAccountPath(platformId, '/pin'), {
+export async function pinPlatformAccount(token: string, platformId: string): Promise<AccountChange> {
+  const resp = await apiFetch(platformAccountPath(platformId, '/pin'), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: '{}',
+    token,
+    json: {},
   });
+  return accountChangeOf(await resp.json());
 }
 
 export interface LoginQrcode {
@@ -1071,8 +974,8 @@ export interface LoginQrcode {
 export async function getPlatformLoginQrcode(token: string, platformId: string): Promise<LoginQrcode> {
   const resp = await apiFetch(platformAccountPath(platformId, '/qrcode'), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: '{}',
+    token,
+    json: {},
   });
   const data = await resp.json();
   return {
@@ -1090,8 +993,8 @@ export async function updateSystemModel(
 ): Promise<SystemModelsResponse> {
   const resp = await apiFetch(`/config/system-models/${encodeURIComponent(slot)}`, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(data),
+    token,
+    json: data,
   });
   return resp.json();
 }
@@ -1103,8 +1006,8 @@ export async function updateImageDefaultChannel(
 ): Promise<SystemModelsResponse> {
   const resp = await apiFetch('/config/image-default-channel', {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ default_channel: defaultChannel }),
+    token,
+    json: { default_channel: defaultChannel },
   });
   return resp.json();
 }
@@ -1112,8 +1015,8 @@ export async function updateImageDefaultChannel(
 export async function setActiveProvider(token: string, provider: string): Promise<ProvidersResponse> {
   const resp = await apiFetch('/config/active-provider', {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ provider }),
+    token,
+    json: { provider },
   });
   return resp.json();
 }
@@ -1124,8 +1027,8 @@ export async function updateFallbacks(
 ): Promise<ProvidersResponse> {
   const resp = await apiFetch('/config/fallbacks', {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ fallbacks }),
+    token,
+    json: { fallbacks },
   });
   return resp.json();
 }
@@ -1137,8 +1040,8 @@ export async function updateNodeFallbacks(
 ): Promise<ProvidersResponse> {
   const resp = await apiFetch(`/config/node-fallbacks/${encodeURIComponent(nodeId)}`, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ fallbacks }),
+    token,
+    json: { fallbacks },
   });
   return resp.json();
 }
@@ -1150,7 +1053,7 @@ export async function clearNodeFallbacks(
 ): Promise<ProvidersResponse> {
   const resp = await apiFetch(`/config/node-fallbacks/${encodeURIComponent(nodeId)}`, {
     method: 'DELETE',
-    headers: authHeaders(token),
+    token,
   });
   return resp.json();
 }
@@ -1166,7 +1069,7 @@ export interface RuntimeFile extends RawText {
 }
 
 export async function getRuntimeFile(token: string): Promise<RuntimeFile> {
-  const resp = await apiFetch('/admin/config/runtime/raw', { headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/config/runtime/raw', { token });
   const json = await resp.json();
   return {
     content: typeof json.content === 'string' ? json.content : '',
@@ -1180,7 +1083,7 @@ export async function getRuntimeFile(token: string): Promise<RuntimeFile> {
 export async function resetRuntime(token: string): Promise<ConfigRemoveResult> {
   const resp = await apiFetch('/admin/config/runtime/raw', {
     method: 'DELETE',
-    headers: authHeaders(token),
+    token,
   });
   return resp.json();
 }
@@ -1211,7 +1114,8 @@ export interface MemoryOwner {
 export interface MemoryNamespace {
   key: string;
   namespace: string;
-  kind: 'conversation' | 'subject' | 'orphan';
+  /** memory_book：节点在 memory_book 里自己命名的记忆库，不属于任何会话。 */
+  kind: 'conversation' | 'subject' | 'memory_book' | 'orphan';
   subject: string;
   entry_count: number;
   books: string[];
@@ -1235,13 +1139,13 @@ export interface MemoryEntry {
 }
 
 export async function getMemoryOverview(token: string): Promise<MemoryNamespace[]> {
-  const resp = await apiFetch('/admin/config/memory/overview', { headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/config/memory/overview', { token });
   return (await resp.json()).namespaces || [];
 }
 
 export async function getMemoryEntries(token: string, namespace: string): Promise<MemoryEntry[]> {
   const resp = await apiFetch(
-    `/admin/config/memory/${encodeURIComponent(namespace)}/entries`, { headers: authHeaders(token) },
+    `/admin/config/memory/${encodeURIComponent(namespace)}/entries`, { token },
   );
   return (await resp.json()).entries || [];
 }
@@ -1251,8 +1155,8 @@ export async function saveMemoryEntry(
 ): Promise<MemoryEntry> {
   const resp = await apiFetch(`/admin/config/memory/${encodeURIComponent(namespace)}/entries`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(entry),
+    token,
+    json: entry,
   });
   return (await resp.json()).entry;
 }
@@ -1262,13 +1166,13 @@ export async function deleteMemoryEntry(
 ): Promise<void> {
   await apiFetch(
     `/admin/config/memory/${encodeURIComponent(namespace)}/entries/${encodeURIComponent(book)}/${encodeURIComponent(entryId)}`,
-    { method: 'DELETE', headers: authHeaders(token) },
+    { method: 'DELETE', token },
   );
 }
 
 export async function clearMemoryNamespace(token: string, namespace: string): Promise<number> {
   const resp = await apiFetch(`/admin/config/memory/${encodeURIComponent(namespace)}`, {
-    method: 'DELETE', headers: authHeaders(token),
+    method: 'DELETE', token,
   });
   return (await resp.json()).removed || 0;
 }
@@ -1292,7 +1196,7 @@ export interface MaterialScope {
 }
 
 export async function getConversations(token: string): Promise<ConversationRow[]> {
-  const resp = await apiFetch('/admin/conversations', { headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/conversations', { token });
   return (await resp.json()).conversations || [];
 }
 
@@ -1301,14 +1205,14 @@ export async function getConversationMessages(
 ): Promise<{ total: number; messages: Array<Record<string, any>> }> {
   const resp = await apiFetch(
     `/admin/conversations/${encodeURIComponent(sessionId)}/messages?limit=${limit}`,
-    { headers: authHeaders(token) },
+    { token },
   );
   return resp.json();
 }
 
 export async function resetConversationBySession(token: string, sessionId: string): Promise<any> {
   const resp = await apiFetch(`/admin/conversations/${encodeURIComponent(sessionId)}/reset`, {
-    method: 'POST', headers: authHeaders(token),
+    method: 'POST', token,
   });
   return resp.json();
 }
@@ -1365,7 +1269,7 @@ export async function getAccountScope(
   if (source !== undefined) params.set('source', source);
   const query = params.toString();
   const resp = await apiFetch(`${platformAccountPath(platformId, '/scope')}${query ? `?${query}` : ''}`, {
-    headers: authHeaders(token),
+    token,
   });
   return resp.json();
 }
@@ -1378,8 +1282,8 @@ export async function migrateAccountScope(
 ): Promise<any> {
   const resp = await apiFetch(platformAccountPath(platformId, '/scope/migrate'), {
     method: 'POST',
-    headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
-    body: JSON.stringify(source === undefined ? { target } : { target, source }),
+    token,
+    json: source === undefined ? { target } : { target, source },
   });
   return resp.json();
 }
@@ -1432,10 +1336,9 @@ export interface StickerImportResult {
   skipped: number;
 }
 
-/** 预览图地址。token 走 query 而不是请求头：img 标签带不了 Authorization。 */
-export function stickerImageHref(sha256: string, token: string | null): string {
-  const query = token ? `?token=${encodeURIComponent(token)}` : '';
-  return `${API}/stickers/${encodeURIComponent(sha256)}/image${query}`;
+/** 预览图地址。带令牌取回再显示，令牌不进地址。 */
+export function stickerImageUrl(sha256: string): string {
+  return `${API}/stickers/${encodeURIComponent(sha256)}/image`;
 }
 
 export async function listStickers(
@@ -1448,7 +1351,7 @@ export async function listStickers(
     limit: String(params.limit ?? 60),
     offset: String(params.offset ?? 0),
   });
-  const resp = await apiFetch(`/stickers?${query}`, { headers: authHeaders(token) });
+  const resp = await apiFetch(`/stickers?${query}`, { token });
   return resp.json();
 }
 
@@ -1459,36 +1362,36 @@ export async function updateSticker(
 ): Promise<Sticker> {
   const resp = await apiFetch(`/stickers/${encodeURIComponent(sha256)}`, {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(patch),
+    token,
+    json: patch,
   });
   return resp.json();
 }
 
 export async function acceptSticker(token: string, sha256: string): Promise<Sticker> {
   const resp = await apiFetch(`/stickers/${encodeURIComponent(sha256)}/accept`, {
-    method: 'POST', headers: authHeaders(token),
+    method: 'POST', token,
   });
   return resp.json();
 }
 
 export async function discardSticker(token: string, sha256: string): Promise<void> {
   await apiFetch(`/stickers/${encodeURIComponent(sha256)}/discard`, {
-    method: 'POST', headers: authHeaders(token),
+    method: 'POST', token,
   });
 }
 
 export async function deleteSticker(token: string, sha256: string): Promise<void> {
   await apiFetch(`/stickers/${encodeURIComponent(sha256)}`, {
-    method: 'DELETE', headers: authHeaders(token),
+    method: 'DELETE', token,
   });
 }
 
 export async function recaptionStickers(token: string, onlyFailed: boolean): Promise<number> {
   const resp = await apiFetch('/stickers/recaption', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ only_failed: onlyFailed }),
+    token,
+    json: { only_failed: onlyFailed },
   });
   return (await resp.json()).queued || 0;
 }
@@ -1506,7 +1409,7 @@ export async function uploadSticker(
   });
   // 不手动设 Content-Type：浏览器要自己填 multipart boundary。
   const resp = await apiFetch(`/stickers/upload?${query}`, {
-    method: 'POST', body: form, headers: authHeaders(token),
+    method: 'POST', body: form, token,
   });
   return resp.json();
 }
@@ -1516,8 +1419,8 @@ export async function importStickers(
 ): Promise<StickerImportResult> {
   const resp = await apiFetch('/stickers/import', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ path, accept }),
+    token,
+    json: { path, accept },
   });
   return resp.json();
 }
@@ -1544,7 +1447,7 @@ export interface NodeFileInfo {
 }
 
 export async function getNodeFiles(token: string): Promise<NodeFileInfo[]> {
-  const resp = await apiFetch('/admin/config/node-files', { headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/config/node-files', { token });
   return resp.json();
 }
 
@@ -1560,7 +1463,7 @@ export function updateNodeFileRaw(token: string, filename: string, content: stri
 export async function deleteNodeFile(token: string, filename: string): Promise<ConfigRemoveResult> {
   const resp = await apiFetch(`/admin/config/node-files/${pathPart(filename)}`, {
     method: 'DELETE',
-    headers: authHeaders(token),
+    token,
   });
   return resp.json();
 }
@@ -1573,30 +1476,25 @@ export function updateNodeRaw(token: string, nodeId: string, yaml: string, baseH
   return writeRawConfig(`/admin/config/nodes/${pathPart(nodeId)}/raw`, token, yaml, baseHash);
 }
 
-export async function createNode(token: string, data: AdminCreatePayload): Promise<any> {
-  // [2026-06-02] Create raw-backed node files through the existing admin endpoint.
-  // Why: the backend currently accepts an id plus complete YAML content instead of a
-  // higher-level template object. How: keep the wrapper close to that contract while
-  // pages may build the content from a selected template. Purpose: node creation stays
-  // compatible with Supervisor without adding another server schema.
+export async function createNode(token: string, data: AdminCreatePayload): Promise<RawSaveResult> {
   const resp = await apiFetch('/admin/config/nodes', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(data),
+    token,
+    json: data,
   });
-  return resp.json();
+  return saveResultOf(await resp.json());
 }
 
 export async function deleteNode(token: string, nodeId: string): Promise<ConfigRemoveResult> {
   const resp = await apiFetch(`/admin/config/nodes/${pathPart(nodeId)}`, {
     method: 'DELETE',
-    headers: authHeaders(token),
+    token,
   });
   return resp.json();
 }
 
 export async function getTools(token: string): Promise<AdminTool[]> {
-  const resp = await apiFetch('/admin/config/tools', { headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/config/tools', { token });
   return resp.json();
 }
 
@@ -1608,19 +1506,19 @@ export function updateToolRaw(token: string, name: string, script: string, baseH
   return writeRawConfig(`/admin/config/tools/${pathPart(name)}/raw`, token, script, baseHash);
 }
 
-export async function createTool(token: string, data: AdminCreatePayload): Promise<any> {
+export async function createTool(token: string, data: AdminCreatePayload): Promise<RawSaveResult> {
   const resp = await apiFetch('/admin/config/tools', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(data),
+    token,
+    json: data,
   });
-  return resp.json();
+  return saveResultOf(await resp.json());
 }
 
 export async function deleteTool(token: string, name: string): Promise<ConfigRemoveResult> {
   const resp = await apiFetch(`/admin/config/tools/${pathPart(name)}`, {
     method: 'DELETE',
-    headers: authHeaders(token),
+    token,
   });
   return resp.json();
 }
@@ -1644,12 +1542,12 @@ export interface DrawtoolsBundle {
 }
 
 export async function getDrawtoolsBundle(token: string): Promise<DrawtoolsBundle> {
-  const resp = await apiFetch('/admin/config/drawtools', { headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/config/drawtools', { token });
   return resp.json();
 }
 
 export async function initDrawtoolsConfigs(token: string): Promise<{ ok: boolean; created: string[] }> {
-  const resp = await apiFetch('/admin/config/drawtools/init', { method: 'POST', headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/config/drawtools/init', { method: 'POST', token });
   return resp.json();
 }
 
@@ -1670,7 +1568,7 @@ export function updateDrawtoolsCharactersRaw(token: string, content: string, bas
 }
 
 export async function cleanupDrawtoolsAttachments(token: string): Promise<any> {
-  const resp = await apiFetch('/admin/config/drawtools/cleanup', { method: 'POST', headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/config/drawtools/cleanup', { method: 'POST', token });
   return resp.json();
 }
 
@@ -1683,7 +1581,7 @@ export function updateDrawtoolsPromptRaw(token: string, name: string, content: s
 }
 
 export async function getSkills(token: string): Promise<AdminSkill[]> {
-  const resp = await apiFetch('/admin/config/skills', { headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/config/skills', { token });
   return resp.json();
 }
 
@@ -1695,25 +1593,25 @@ export function updateSkillRaw(token: string, name: string, content: string, bas
   return writeRawConfig(`/admin/config/skills/${pathPart(name)}/raw`, token, content, baseHash);
 }
 
-export async function createSkill(token: string, data: AdminCreatePayload): Promise<any> {
+export async function createSkill(token: string, data: AdminCreatePayload): Promise<RawSaveResult> {
   const resp = await apiFetch('/admin/config/skills', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(data),
+    token,
+    json: data,
   });
-  return resp.json();
+  return saveResultOf(await resp.json());
 }
 
 export async function deleteSkill(token: string, name: string): Promise<any> {
   const resp = await apiFetch(`/admin/config/skills/${pathPart(name)}`, {
     method: 'DELETE',
-    headers: authHeaders(token),
+    token,
   });
   return resp.json();
 }
 
 export async function getMcpClients(token: string): Promise<McpClient[]> {
-  const resp = await apiFetch('/admin/config/mcp-clients', { headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/config/mcp-clients', { token });
   return resp.json();
 }
 
@@ -1742,27 +1640,21 @@ export async function restartEngine(
   // reason 进 eventlog，调用方不同就得说不同的话，否则事后查不出是从哪按的。
   reason = '用户从设置页面请求重启引擎',
 ): Promise<RestartResult> {
-  // [2026-06-02] Expose restart as an explicit engine-only wrapper for Settings.
-  // Why: the UI must not guess the RestartIn payload each time. How: send the
-  // backend-required target and a Chinese reason string with admin auth. Purpose: the
-  // dangerous action remains behind a confirm dialog while the API contract is fixed.
   const resp = await apiFetch('/admin/restart', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ target: 'engine', reason }),
+    token,
+    json: { target: 'engine', reason },
   });
   return resp.json();
 }
 
 export async function enableCodeWrite(token: string): Promise<void> {
   await apiFetch('/admin/runtime/code-write', {
-    method: 'POST', headers: authHeaders(token),
+    method: 'POST', token,
   });
 }
 
-// ================================================================
-//  热载配置（平台配置文件与全局默认 config/features.yaml）与平台清单
-// ================================================================
+// ── 热载配置（平台配置文件与全局默认 config/features.yaml）与平台清单 ──
 
 export interface ConfigRawFile extends RawText {
   /** false = 还没接管，控制台该显示「跟随 .env」而不是一份空配置。 */
@@ -2040,7 +1932,7 @@ export interface PlatformCatalog {
 }
 
 export async function getPlatforms(token: string): Promise<PlatformCatalog> {
-  const resp = await apiFetch('/platforms', { headers: authHeaders(token) });
+  const resp = await apiFetch('/platforms', { token });
   const json = await resp.json();
   return {
     platforms: Array.isArray(json.platforms) ? json.platforms : [],
@@ -2055,7 +1947,7 @@ const featuresConfigPath = (leaf: string): string => `/features/config/${leaf}`;
 // 不复用 readRawConfig：那个 helper 不给 exists，
 // 于是「还没接管」和「接管了但是空的」在界面上长得一样。
 async function readConfigFile(path: string, token: string): Promise<ConfigRawFile> {
-  const resp = await apiFetch(path, { headers: authHeaders(token) });
+  const resp = await apiFetch(path, { token });
   const json = await resp.json();
   return {
     content: typeof json.content === 'string' ? json.content : '',
@@ -2070,15 +1962,15 @@ async function writeConfigFile(
 ): Promise<ConfigSaveResult> {
   const resp = await apiFetch(path, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: rawWriteBody(content, baseHash),
+    token,
+    json: rawWriteFields(content, baseHash),
   });
   const json = await resp.json();
-  return { ok: Boolean(json.ok), hash: hashOf(json), warnings: Array.isArray(json.warnings) ? json.warnings : [] };
+  return { ok: Boolean(json.ok), hash: hashOf(json), warnings: warningsOf(json) };
 }
 
 async function readJson<T>(path: string, token: string): Promise<T> {
-  const resp = await apiFetch(path, { headers: authHeaders(token) });
+  const resp = await apiFetch(path, { token });
   return resp.json();
 }
 
@@ -2129,8 +2021,8 @@ export async function dryRunPlatformTrigger(
   if (options.cooldown === false) body.cooldown = false;
   const resp = await apiFetch(`/platforms/${encodeURIComponent(platformId)}/trigger/dry-run`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(body),
+    token,
+    json: body,
   });
   return resp.json();
 }
@@ -2138,7 +2030,7 @@ export async function dryRunPlatformTrigger(
 export async function reloadConfig(token: string): Promise<any> {
   const resp = await apiFetch('/config/reload', {
     method: 'POST',
-    headers: authHeaders(token),
+    token,
   });
   return resp.json();
 }
@@ -2146,13 +2038,13 @@ export async function reloadConfig(token: string): Promise<any> {
 export async function reloadTools(token: string): Promise<any> {
   const resp = await apiFetch('/tools/reload', {
     method: 'POST',
-    headers: authHeaders(token),
+    token,
   });
   return resp.json();
 }
 
 export async function getAllToolNames(token: string): Promise<string[]> {
-  const resp = await apiFetch('/admin/config/all-tool-names', { headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/config/all-tool-names', { token });
   return resp.json();
 }
 
@@ -2177,7 +2069,7 @@ export interface EffectiveTools {
 
 export async function getEffectiveTools(token: string, nodeId: string): Promise<EffectiveTools> {
   const resp = await apiFetch(`/admin/config/nodes/${encodeURIComponent(nodeId)}/effective-tools`, {
-    headers: authHeaders(token),
+    token,
   });
   return resp.json();
 }
@@ -2193,8 +2085,8 @@ export async function updateModelConfig(
 ): Promise<any> {
   const resp = await apiFetch('/config/openai', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(params),
+    token,
+    json: params,
   });
   return resp.json();
 }
@@ -2202,12 +2094,7 @@ export async function updateModelConfig(
 export type SessionProviderOverride = Record<string, unknown>;
 
 export async function getSessionProviderOverride(sessionId: string, token: string): Promise<SessionProviderOverride> {
-  // [2026-06-01] Fetch session-scoped provider overrides.
-  // Why: the right panel must show the effective session model/base_url instead of
-  // only the global OpenAI defaults. How: call Supervisor's admin-protected
-  // provider_override endpoint with the same bearer token used by config APIs.
-  // Purpose: model edits can affect only the selected session.
-  const resp = await apiFetch(`/sessions/${sessionId}/provider_override`, { headers: authHeaders(token) });
+  const resp = await apiFetch(`/sessions/${sessionId}/provider_override`, { token });
   return resp.json();
 }
 
@@ -2216,42 +2103,38 @@ export async function updateSessionProviderOverride(
   token: string,
   params: SessionProviderOverride,
 ): Promise<SessionProviderOverride> {
-  // [2026-06-01] Save session-scoped provider overrides.
-  // Why: global model updates are too broad for the requested session panel. How:
-  // PUT the complete override object, preserving fields the compact editor does not
-  // touch. Purpose: allow per-session model, provider, api_key, and base_url edits.
+  // 整份替换：编辑器没摆出来的字段也得原样带回来。
   const resp = await apiFetch(`/sessions/${sessionId}/provider_override`, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(params),
+    token,
+    json: params,
   });
   return resp.json();
 }
 
 export async function clearSessionProviderOverride(sessionId: string, token: string): Promise<SessionProviderOverride> {
-  // [2026-06-01] Clear session-scoped provider overrides.
-  // Why: the session panel needs a direct way back to node/global defaults. How:
-  // call DELETE on the same provider_override resource. Purpose: avoid saving empty
-  // model fields that would be hard to distinguish from inherited defaults.
   const resp = await apiFetch(`/sessions/${sessionId}/provider_override`, {
     method: 'DELETE',
-    headers: authHeaders(token),
+    token,
   });
   return resp.json();
 }
 
 // ── Approvals ──
 
+export type ApprovalDecision = 'allow' | 'deny';
+
+/** 提交审批决定。返回的是服务端当前那条审批：status 和本次决定对不上，说明它早已被别处处理过。 */
 export async function decideApproval(
-  token: string,
+  token: string | undefined,
   approvalId: string,
-  decision: 'allow' | 'deny',
+  decision: ApprovalDecision,
   comment = '',
-): Promise<any> {
-  const resp = await apiFetch(`/approvals/${approvalId}`, {
+): Promise<AdminApproval> {
+  const resp = await apiFetch(`/approvals/${encodeURIComponent(approvalId)}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ decision, comment: comment || `${decision} via web` }),
+    token,
+    json: { decision, comment: comment || `${decision} via web` },
   });
   return resp.json();
 }
@@ -2259,7 +2142,7 @@ export async function decideApproval(
 // ── Cancel ──
 
 export async function cancelActiveTasks(sessionId: string): Promise<any> {
-  const resp = await apiFetch(`/sessions/${sessionId}/cancel_active_tasks`, { method: 'POST' });
+  const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/cancel_active_tasks`, { method: 'POST' });
   return resp.json();
 }
 
@@ -2268,8 +2151,7 @@ export async function cancelActiveTasks(sessionId: string): Promise<any> {
 export async function resetConversation(conversationKey: string): Promise<any> {
   const resp = await apiFetch('/conversations/reset', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ conversation_key: conversationKey }),
+    json: { conversation_key: conversationKey },
   });
   return resp.json();
 }
@@ -2281,20 +2163,19 @@ export async function getActiveNode(sessionId: string): Promise<{
   is_override: boolean;
   default_node_id: string;
 }> {
-  const resp = await apiFetch(`/sessions/${sessionId}/active_node`);
+  const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/active_node`);
   return resp.json();
 }
 
 export const switchNode = commandAction('node.switch', async (sessionId: string, targetNodeId: string): Promise<any> => {
-  const resp = await apiFetch(`/sessions/${sessionId}/switch_node`, {
+  const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/switch_node`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ target_node_id: targetNodeId }),
+    json: { target_node_id: targetNodeId },
   });
   return resp.json();
 });
 
-// ── App config (public, no auth needed) ──
+// ── App config ──
 
 export interface AppConfigPublic {
   version?: number;
@@ -2306,21 +2187,12 @@ export interface AppConfigPublic {
 }
 
 export async function getConfig(): Promise<AppConfigPublic> {
-  // [2026-06-02] Expose the public config endpoint under its route name as well as
-  // getAppConfig. Why: the Client settings page needs to read the currently
-  // configured entry_node_id when the backend includes it, while older callers still
-  // use getAppConfig for model display. How: return the same /v1/config response with
-  // optional entry-node fields in the TypeScript shape. Purpose: selection state can
-  // prefer real Supervisor configuration without breaking existing config consumers.
   const resp = await apiFetch('/config');
   return resp.json();
 }
 
+/** getConfig 的旧名，Header 和会话面板还在用。 */
 export function getAppConfig(): Promise<AppConfigPublic> {
-  // [2026-06-02] Keep the historical helper as an alias to getConfig.
-  // Why: Header and session panels already call getAppConfig. How: delegate to the
-  // route-named wrapper instead of duplicating fetch logic. Purpose: both old and new
-  // settings code share one public config contract.
   return getConfig();
 }
 
@@ -2334,8 +2206,11 @@ export interface SessionListItem {
   updated_at: string;
 }
 
-export async function listSessions(channel = 'web', limit = 50): Promise<SessionListItem[]> {
-  const resp = await apiFetch(`/sessions?channel=${encodeURIComponent(channel)}&limit=${limit}`);
+/** 一页会话，按最近更新排在前。返回条数少于 limit 就是到底了。 */
+export async function listSessions(channel = 'web', limit = 50, offset = 0): Promise<SessionListItem[]> {
+  const query = new URLSearchParams({ channel, limit: String(limit) });
+  if (offset > 0) query.set('offset', String(offset));
+  const resp = await apiFetch(`/sessions?${query}`);
   const data = await resp.json();
   if (!Array.isArray(data)) throw new Error('会话列表响应格式无效');
   return data;
@@ -2353,13 +2228,8 @@ export async function deleteSession(sessionId: string): Promise<{ ok: boolean }>
 // ── Session messages (legacy, flat text) ──
 
 export async function getSessionMessages(sessionId: string, limit = 200): Promise<{ role: string; content: string }[]> {
-  try {
-    const resp = await fetchWithDeadline(`${API}/sessions/${sessionId}/messages?limit=${limit}`);
-    if (!resp.ok) return [];
-    return resp.json();
-  } catch {
-    return [];
-  }
+  const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/messages?limit=${limit}`);
+  return resp.json();
 }
 
 // ── Structured history (ConversationStore) ──
@@ -2368,45 +2238,29 @@ export interface StructuredThinkingBlock {
   text: string;
   started_at?: string;
   ended_at?: string;
-  // [AutoC 2026-06-04] Why: mixed backend versions may serialize structured
-  // thinking timestamps in camelCase. How: type both naming conventions. Purpose:
-  // history hydration keeps elapsed-time headers instead of falling back to length.
+  // 新旧后端的时间戳有下划线和驼峰两种写法。
   startedAt?: string;
   endedAt?: string;
 }
 
 export interface StructuredMessage {
   id: string;
+  /** 在完整历史里的位置，从 0 起。往前翻页时拿最早一条的 cursor 当 before。老后端不给。 */
+  cursor?: number;
   role: string;
   content: string;
   message_type?: string;
   created_at?: string;
   source_node_id?: string;
-  // [AutoC 2026-06-03] Why: dispatch-result history rows need the same structured
-  // child navigation metadata as realtime WebSocket payloads. How: expose the
-  // selected backend metadata fields returned by /history. Purpose: the UI can show
-  // a child-session jump button after page refresh without parsing callback text.
   source_task_id?: string;
-  // [AutoC 2026-06-04] Why: history rows may be correlated with live request cards
-  // after request-scoped streaming. How: type the optional backend request id.
-  // Purpose: future hydration can reconcile one persisted assistant row with one
-  // request card without falling back to task-level matching.
   llm_request_id?: string;
   child_session_id?: string;
-  // [AutoC 2026-06-04] Why: dispatch_result history now uses explicit child/caller
-  // metadata and summary. How: expose the new fields while keeping legacy dispatch_*
-  // fields typed for old rows. Purpose: TypeScript callers can render refreshed
-  // callback cards from structure instead of localized content text.
   child_task_id?: string;
   child_node_id?: string;
   caller_node_id?: string;
   summary?: string;
   dispatch_task_id?: string;
   dispatch_node_id?: string;
-  // [AutoC 2026-06-04] Why: historical reasoning needs the same timing metadata as
-  // live ThinkingBlock cards. How: accept the new backend thinking_blocks array while
-  // keeping flat string/object thinking for old rows. Purpose: refreshed history can
-  // render elapsed thinking time instead of falling back to character counts.
   thinking?: string | StructuredThinkingBlock;
   thinking_text?: string;
   thinking_blocks?: StructuredThinkingBlock[];
@@ -2415,15 +2269,11 @@ export interface StructuredMessage {
   tool_call_id?: string;
   tool_name?: string;
   name?: string;
-  // [thinking-time 2026-06-01] Precise reasoning timing from backend meta.
   reasoning_started_at?: string;
   reasoning_ended_at?: string;
 }
 
 export interface ChildSessionInfo {
-  // [2026-06-03] Why: child session rows come from sessions.json, not chat history.
-  // How: mirror the backend's snake_case response so chatStore can normalize it into
-  // ChildNodeState. Purpose: refresh can restore child-node status and navigation.
   session_id: string;
   parent_session_id?: string;
   route_parent_session_id?: string;
@@ -2437,30 +2287,48 @@ export interface ChildSessionInfo {
   completed_at?: string;
 }
 
-export async function getSessionHistory(sessionId: string, limit = 200, taskId?: string): Promise<StructuredMessage[]> {
-  try {
-    let url = `${API}/sessions/${sessionId}/history?limit=${limit}`;
-    if (taskId) url += `&task_id=${encodeURIComponent(taskId)}`;
-    const resp = await fetchWithDeadline(url);
-    if (!resp.ok) return [];
-    return resp.json();
-  } catch {
-    return [];
-  }
+export interface SessionHistoryQuery {
+  limit?: number;
+  /** 只要完整历史里位置在它之前的那些，取其中最后 limit 条。 */
+  before?: number;
+  /** 只要这个任务产生的消息。 */
+  taskId?: string;
+  signal?: AbortSignal;
+}
+
+export async function getSessionHistory(sessionId: string, query: SessionHistoryQuery = {}): Promise<StructuredMessage[]> {
+  const params = new URLSearchParams({ limit: String(query.limit ?? 200) });
+  if (query.before !== undefined) params.set('before', String(query.before));
+  if (query.taskId) params.set('task_id', query.taskId);
+  const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/history?${params}`, { signal: query.signal });
+  const data = await resp.json();
+  if (!Array.isArray(data)) throw new Error('历史消息响应格式无效');
+  return data;
 }
 
 export async function getSessionChildren(sessionId: string): Promise<ChildSessionInfo[]> {
-  try {
-    // [2026-06-03] Why: child-session metadata is stored in the supervisor registry,
-    // while /history only returns messages. How: call the dedicated read-only endpoint
-    // and tolerate missing older backends by returning an empty array. Purpose: the web
-    // app can be deployed independently while still restoring childNodes when possible.
-    const resp = await fetchWithDeadline(`${API}/sessions/${sessionId}/children`);
-    if (!resp.ok) return [];
-    return resp.json();
-  } catch {
-    return [];
-  }
+  const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/children`);
+  const data = await resp.json();
+  return Array.isArray(data) ? data : [];
+}
+
+/** 会话里（含入口分支）还在排队或在跑的任务。挂起等子任务的不算。 */
+export interface SessionRunningTask {
+  task_id: string;
+  node_id: string;
+  status: 'running' | 'pending';
+  created_at: string;
+  caller_task_id: string;
+  is_user_entry: boolean;
+  source_inbound_seq?: number | null;
+  branch_session_id: string;
+  parent_session_id: string;
+}
+
+export async function getSessionRunningTasks(sessionId: string): Promise<SessionRunningTask[]> {
+  const resp = await apiFetch(`/sessions/${encodeURIComponent(sessionId)}/running_tasks`);
+  const data = await resp.json();
+  return Array.isArray(data?.tasks) ? data.tasks : [];
 }
 
 // ── 运行诊断 ──
@@ -2494,12 +2362,12 @@ export interface LogFileInfo {
 }
 
 export async function getRuntimeStatus(token: string): Promise<RuntimeStatus> {
-  const resp = await apiFetch('/admin/runtime/status', { headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/runtime/status', { token });
   return resp.json();
 }
 
 export async function listLogFiles(token: string): Promise<LogFileInfo[]> {
-  const resp = await apiFetch('/admin/runtime/logs', { headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/runtime/logs', { token });
   return (await resp.json()).files || [];
 }
 
@@ -2508,13 +2376,13 @@ export async function readLogTail(
 ): Promise<{ text: string; truncated: boolean }> {
   const resp = await apiFetch(
     `/admin/runtime/logs/${encodeURIComponent(name)}?lines=${lines}`,
-    { headers: authHeaders(token) },
+    { token },
   );
   return resp.json();
 }
 
 export async function retryEngine(token: string): Promise<void> {
-  await apiFetch('/admin/runtime/engine/retry', { method: 'POST', headers: authHeaders(token) });
+  await apiFetch('/admin/runtime/engine/retry', { method: 'POST', token });
 }
 
 // ── Legacy compat exports ──
@@ -2590,19 +2458,19 @@ export interface PluginsResponse {
 }
 
 export async function getPlugins(token: string, signal?: AbortSignal): Promise<PluginsResponse> {
-  const resp = await apiFetch('/admin/plugins', { headers: authHeaders(token), signal });
+  const resp = await apiFetch('/admin/plugins', { token, signal });
   return resp.json();
 }
 
 export async function getPluginSource(token: string, id: string): Promise<{ content: string; hash: string }> {
-  const resp = await apiFetch(`/admin/plugins/${encodeURIComponent(id)}/source`, { headers: authHeaders(token) });
+  const resp = await apiFetch(`/admin/plugins/${encodeURIComponent(id)}/source`, { token });
   return resp.json();
 }
 
 export async function installPlugin(token: string, filename: string, content: string): Promise<AdminPlugin> {
   const resp = await apiFetch('/admin/plugins', {
-    method: 'POST', headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ filename, content }),
+    method: 'POST', token,
+    json: { filename, content },
   });
   return resp.json();
 }
@@ -2615,16 +2483,16 @@ export async function installPluginPackage(token: string, file: File, baseHash?:
   for (let offset = 0; offset < bytes.length; offset += 8192) binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
   if (!current()) throw new Error('登录状态已变化，请重新导入插件包');
   const resp = await apiFetch('/admin/plugins/packages', {
-    method: 'POST', headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ filename: file.name, content_base64: btoa(binary), ...(baseHash ? { base_hash: baseHash } : {}) }),
+    method: 'POST', token,
+    json: { filename: file.name, content_base64: btoa(binary), ...(baseHash ? { base_hash: baseHash } : {}) },
   });
   return resp.json();
 }
 
 export async function updatePluginSource(token: string, id: string, content: string, baseHash: string): Promise<AdminPlugin> {
   const resp = await apiFetch(`/admin/plugins/${encodeURIComponent(id)}/source`, {
-    method: 'PUT', headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content, base_hash: baseHash }),
+    method: 'PUT', token,
+    json: { content, base_hash: baseHash },
   });
   return resp.json();
 }
@@ -2634,19 +2502,19 @@ export async function updatePluginConfig(
   config: Pick<AdminPlugin, 'enabled' | 'config' | 'selectors'> & { base_hash: string },
 ): Promise<AdminPlugin> {
   const resp = await apiFetch(`/admin/plugins/${encodeURIComponent(id)}/config`, {
-    method: 'PUT', headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
-    body: JSON.stringify(config),
+    method: 'PUT', token,
+    json: config,
   });
   return resp.json();
 }
 
 export async function deletePlugin(token: string, id: string, baseHash: string): Promise<void> {
   await apiFetch(`/admin/plugins/${encodeURIComponent(id)}?base_hash=${encodeURIComponent(baseHash)}`, {
-    method: 'DELETE', headers: authHeaders(token),
+    method: 'DELETE', token,
   });
 }
 
 export async function applyPlugins(token: string): Promise<Pick<PluginsResponse, 'generation' | 'runtime'> & { message: string }> {
-  const resp = await apiFetch('/admin/plugins/apply', { method: 'POST', headers: authHeaders(token) });
+  const resp = await apiFetch('/admin/plugins/apply', { method: 'POST', token });
   return resp.json();
 }

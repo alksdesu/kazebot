@@ -1,31 +1,33 @@
-// [2026-06-02] Contextual right panels for expanded Settings tabs.
-// Why: the settings right rail is rendered independently from the selected page, but
-// new pages need contextual details such as logs, approval parameters, node delegates,
-// tool schemas, and MCP connection data. How: read snapshots from the settings
-// selection store and render small Chinese summaries. Purpose: each tab can keep its
-// main workflow focused while the right rail provides reference details.
+// 设置页右栏：跟着当前选中的节点、工具、技能、MCP Client 和定时任务显示详情，并就地编辑。
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 
-// [2026-06-02] Add raw MCP and schedule endpoints for the right-panel form editors.
-// Why: the second editable Settings batch saves selected MCP clients and schedules
-// through full raw YAML reloads. How: import only the existing raw read/write wrappers
-// alongside the earlier node, skill, and tool helpers. Purpose: the panel can update
-// one selected item without introducing new API contracts or touching other panels.
-import { channelChoices, getMcpClientsRaw, getNodeRaw, getNodes, getProviders, getSchedulesRaw, getSkillRaw, getToolRaw, listUpstreamModels, reloadTools, updateMcpClientsRaw, updateNodeRaw, updateSchedulesRaw, updateSkillRaw, updateToolRaw, type ChannelChoice, type OverlaySource, type ToolOrigin } from '../../../api/supervisorClient';
-// [2026-06-02] Use shared lightweight structured YAML helpers in the two requested panels.
-// Why: MCP clients and automation schedules already have parse and serialize helpers
-// that preserve the expected config shape. How: import the form state types and
-// parser/serializer functions from settingsStructuredConfig. Purpose: the new forms
-// can edit structured fields while writing valid raw YAML back to Supervisor.
-import { mergeModelChoices, modelsFromNodes, modelsFromProviders } from '../../../utils/modelChoices';
-import { itemChangedSince, parseMcpClients, parseNodeConfig, parseSchedules, serializeMcpClients, serializeNodeConfig, serializeSchedules, type McpClientFormState, type NodeConfigFormState, type NodeConfigType, type ScheduleFormState } from '../settingsStructuredConfig';
+import { errorMessage } from '../../../api/request';
+import { channelChoices, getMcpClientsRaw, getNodeRaw, getNodes, getProviders, getSchedulesRaw, getSkillRaw, getToolRaw, isEditConflict, listUpstreamModels, reloadTools, updateMcpClientsRaw, updateNodeRaw, updateSchedulesRaw, updateSkillRaw, updateToolRaw, type AdminSkill, type ChannelChoice, type OverlaySource, type ToolOrigin } from '../../../api/supervisorClient';
+import { commitYamlKeys } from '../../../console/yamlCommit';
+import { unsavableReason, useRawForm, type RawFormCodec } from '../../../hooks/useRawForm';
+import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { mergeModelChoices, modelsFromNodes, modelsFromProviders } from '../../../utils/modelChoices';
+import { savedMessage } from '../../../utils/sentence';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
-import { YamlEditor } from '../../common';
 import { Button } from '../pages/settingsControls';
-import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
-import yaml from 'js-yaml';
+import { RawFormStatus, RawSourceDetails } from '../RawSourceDetails';
+import {
+  mcpClientUpdateEdits,
+  parseMcpClients,
+  parseNodeConfig,
+  parseSchedules,
+  parseSkillQuickFields,
+  scheduleUpdateEdits,
+  serializeNodeConfig,
+  serializeSkillQuickFields,
+  type McpClientFormState,
+  type NodeConfigFormState,
+  type NodeConfigType,
+  type ScheduleFormState,
+  type SkillQuickFields,
+} from '../settingsStructuredConfig';
 
 const PanelShell = ({ title, eyebrow, disabled, children }: { title: string; eyebrow?: string; disabled?: boolean; children: ReactNode }) => (
   <section className="flex h-full min-h-0 flex-col overflow-y-auto p-3">
@@ -133,19 +135,24 @@ export const AgentsSettingsRightPanel = () => {
   return <AgentsEditor key={`${token}\0${id || ''}\0${generation}`} onReload={reload} />;
 };
 
+const nodeConfigCodec = (nodeId: string): RawFormCodec<NodeConfigFormState> => ({
+  parse: (raw) => parseNodeConfig(raw, nodeId),
+  serialize: serializeNodeConfig,
+});
+
 const AgentsEditor = ({ onReload }: EditorProps) => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const node = useSettingsSelectionStore(state => state.selectedNode);
-  const [nodeYaml, setNodeYaml] = useState('');
-  const [nodeBaseline, setNodeBaseline] = useState('');
-  // 表单和原文编辑器都基于这一版改，保存时交回：中途被别处改过就报冲突，不静默盖掉。
+  const codec = useMemo(() => nodeConfigCodec(node?.id || ''), [node?.id]);
+  const source = useRawForm(codec, { ...EMPTY_NODE_CONFIG_FORM, id: node?.id || '' });
+  const { form: nodeConfigForm, reset: resetSource, update: updateNodeConfigForm } = source;
+  // 保存时交回这一版的指纹：中途被别处改过就报冲突，不静默盖掉。
   const [nodeBase, setNodeBase] = useState<string | null>(null);
-  const [nodeConfigForm, setNodeConfigForm] = useState<NodeConfigFormState>(EMPTY_NODE_CONFIG_FORM);
   const [nodeYamlEditable, setNodeYamlEditable] = useState(false);
   const [nodeYamlLoading, setNodeYamlLoading] = useState(false);
   const [nodeYamlSaving, setNodeYamlSaving] = useState(false);
   const [nodeMessage, setNodeMessage] = useState('');
-  const confirmDiscard = useUnsavedChanges(nodeYamlEditable && JSON.stringify([nodeYaml, nodeConfigForm]) !== nodeBaseline);
+  const confirmDiscard = useUnsavedChanges(nodeYamlEditable && source.dirty);
   const reload = () => { if (confirmDiscard()) onReload(); };
   const [modelChoices, setModelChoices] = useState<string[]>([]);
   const [channels, setChannels] = useState<ChannelChoice[]>([]);
@@ -180,57 +187,37 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
       setFetchedModels(models);
       setModelFetchNote(`拉到 ${models.length} 个模型。`);
     } catch (error) {
-      if (selectedProvider.current === provider) setModelFetchNote(error instanceof Error ? error.message : '拉取模型失败');
+      if (selectedProvider.current === provider) setModelFetchNote(errorMessage(error, '拉取模型失败'));
     } finally {
       setFetchingModels(false);
     }
   };
 
-  const updateNodeConfigForm = (patch: Partial<NodeConfigFormState>) => {
-    // [2026-06-02] Apply small form patches instead of editing raw YAML directly.
-    // Why: the Agents panel now treats structured controls as the primary editor.
-    // How: merge individual field changes into the parsed form state. Purpose: saving
-    // can serialize the full form back into the selected node YAML.
-    setNodeConfigForm((current) => ({ ...current, ...patch }));
-  };
-
   useEffect(() => {
     let cancelled = false;
-    setNodeYaml('');
-    setNodeBase(null);
-    setNodeConfigForm({ ...EMPTY_NODE_CONFIG_FORM, id: node?.id || '' });
-    setNodeYamlEditable(false);
-    setNodeMessage('');
     if (!node) return () => { cancelled = true; };
     if (!adminToken) {
       setNodeMessage('缺少管理员令牌，无法加载节点配置。');
       return () => { cancelled = true; };
     }
     setNodeYamlLoading(true);
-    // [2026-06-02] Load raw node YAML and immediately parse it into form fields.
-    // Why: the right panel must be a structured form editor, not a raw YAML editor.
-    // How: fetch the selected file, store the raw fallback, and populate the form via
-    // parseNodeConfig. Purpose: users edit common node properties directly while the
-    // advanced YAML section remains available for unsupported fields.
     getNodeRaw(adminToken, node.id)
-      .then(({ content: raw, hash }) => {
+      .then(({ content, hash }) => {
         if (cancelled) return;
-        setNodeYaml(raw);
+        resetSource(content);
         setNodeBase(hash);
-        setNodeConfigForm(parseNodeConfig(raw, node.id));
-        setNodeBaseline(JSON.stringify([raw, parseNodeConfig(raw, node.id)]));
         setNodeYamlEditable(true);
       })
       .catch((error) => {
         if (cancelled) return;
-        setNodeMessage(error instanceof Error ? error.message : '节点配置加载失败，请重试');
+        setNodeMessage(errorMessage(error, '节点配置加载失败，请重试'));
         setNodeYamlEditable(false);
       })
       .finally(() => {
         if (!cancelled) setNodeYamlLoading(false);
       });
     return () => { cancelled = true; };
-  }, [adminToken, node?.id]);
+  }, [adminToken, node?.id, resetSource]);
 
   // 候选与选中的节点无关，只跟令牌走。写的是节点文件的 model，所以别的节点那些 $ENV{...}
   // 也是有效候选 —— 节点路径会经 resolve_env_ref 展开。
@@ -258,49 +245,24 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
     return () => { cancelled = true; };
   }, [adminToken, node?.id]);
 
-  const saveNodeConfig = async () => {
+  const saveNode = async () => {
     if (!adminToken || !node || !nodeYamlEditable || nodeYamlSaving) return;
-    setNodeYamlSaving(true);
-    setNodeMessage('正在保存…');
-    try {
-      // [2026-06-02] Serialize the structured node form into YAML before saving.
-      // Why: raw YAML is only an advanced fallback and must not be the primary save
-      // path. How: replace the edited fields in the loaded YAML, submit updateNodeRaw,
-      // and update the fallback editor with the exact saved content. Purpose: the
-      // panel writes valid YAML while keeping user edits to unrelated fields intact.
-      const { content: nextYaml, note } = serializeNodeConfig(nodeYaml, nodeConfigForm);
-      const result = await updateNodeRaw(adminToken, node.id, nextYaml, nodeBase);
-      setNodeYaml(nextYaml);
-      setNodeBase(result.hash);
-      setNodeConfigForm(parseNodeConfig(nextYaml, node.id));
-      setNodeBaseline(JSON.stringify([nextYaml, parseNodeConfig(nextYaml, node.id)]));
-      window.dispatchEvent(new Event('settings:nodes-updated'));
-      setNodeMessage(note ? `节点配置已保存。${note}。` : '节点配置已保存。');
-    } catch (error) {
-      setNodeMessage(error instanceof Error ? error.message : '保存节点配置失败');
-    } finally {
-      setNodeYamlSaving(false);
+    const blocked = unsavableReason(source);
+    if (blocked) {
+      setNodeMessage(blocked);
+      return;
     }
-  };
-
-  const saveNodeYaml = async () => {
-    if (!adminToken || !node || !nodeYamlEditable || nodeYamlSaving) return;
+    const { raw, note } = source;
     setNodeYamlSaving(true);
     setNodeMessage('正在保存…');
     try {
-      // [2026-06-02] Keep a raw YAML fallback inside the advanced details section.
-      // Why: uncommon node fields may not have dedicated form controls yet. How: save
-      // the controlled fallback editor and reparse it into the structured form after a
-      // successful write. Purpose: advanced edits remain possible without making raw
-      // YAML the default editing surface.
-      const result = await updateNodeRaw(adminToken, node.id, nodeYaml, nodeBase);
+      const result = await updateNodeRaw(adminToken, node.id, raw, nodeBase);
+      resetSource(raw);
       setNodeBase(result.hash);
-      setNodeConfigForm(parseNodeConfig(nodeYaml, node.id));
-      setNodeBaseline(JSON.stringify([nodeYaml, parseNodeConfig(nodeYaml, node.id)]));
       window.dispatchEvent(new Event('settings:nodes-updated'));
-      setNodeMessage('节点 YAML 已保存。');
+      setNodeMessage(savedMessage('节点配置已保存。', note, result.warnings));
     } catch (error) {
-      setNodeMessage(error instanceof Error ? error.message : '保存节点 YAML 失败');
+      setNodeMessage(errorMessage(error, '保存节点配置失败'));
     } finally {
       setNodeYamlSaving(false);
     }
@@ -321,7 +283,7 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
             </div>
           ) : (
             <>
-              <div className="space-y-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
+              <fieldset disabled={Boolean(source.parseError)} className="min-w-0 space-y-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
                 <div>
                   <span className={STRUCTURED_LABEL_CLASS}>节点 ID</span>
                   <p aria-label="节点 ID" className="font-mono text-xs">{nodeConfigForm.id}</p>
@@ -424,28 +386,16 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
                   <input className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ delegate_targetsText: event.target.value })} value={nodeConfigForm.delegate_targetsText} />
                 </label>
                 <p className="text-xs text-[var(--duties-tertiary)]">
-                  工具权限（tool_access）要在下面的高级 YAML 编辑里改。保存这里会重排 YAML
-                  并丢掉注释，想保留注释也走那边。
+                  工具权限（tool_access）在下面的 YAML 原文里改。表单只改动过的那几个字段，其余原文和注释照旧。
                 </p>
-                <div className="flex flex-wrap gap-2">
-                  <Button disabled={nodeYamlSaving} onClick={saveNodeConfig} size="sm">保存节点配置</Button>
-                  <Button disabled={nodeYamlSaving} onClick={reload} size="sm" tone="quiet">刷新</Button>
-                </div>
-                {nodeMessage && <p className="text-[var(--duties-tertiary)]">{nodeMessage}</p>}
+              </fieldset>
+              <RawFormStatus source={source} />
+              <RawSourceDetails height="16rem" label="节点 YAML 编辑器" source={source} summary="高级 YAML 编辑" />
+              <div className="flex flex-wrap gap-2">
+                <Button disabled={nodeYamlSaving} onClick={saveNode} size="sm">保存节点配置</Button>
+                <Button disabled={nodeYamlSaving} onClick={reload} size="sm" tone="quiet">刷新</Button>
               </div>
-              <details className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
-                <summary className="cursor-pointer font-mono text-xs font-semibold text-[var(--duties-tertiary)]">高级 YAML 编辑</summary>
-                <div className="mt-3 space-y-2">
-                  {/* [2026-06-02] Keep raw node YAML only as a collapsed fallback.
-                      Why: the task explicitly requires structured form editing as the
-                      main surface. How: render YamlEditor inside default-collapsed
-                      details and give it a separate YAML save button. Purpose: advanced
-                      users can recover unsupported fields without reverting the panel
-                      to a raw YAML editor. */}
-                  <YamlEditor aria-label="节点 YAML 编辑器" height="16rem" onChange={setNodeYaml} value={nodeYaml} />
-                  <Button disabled={nodeYamlSaving} onClick={saveNodeYaml} size="sm">保存 YAML</Button>
-                </div>
-              </details>
+              {nodeMessage && <p className="text-[var(--duties-tertiary)]">{nodeMessage}</p>}
             </>
           )}
         </div>
@@ -504,7 +454,7 @@ const ToolsEditor = ({ onReload }: EditorProps) => {
       })
       .catch((error) => {
         if (cancelled) return;
-        setToolMessage(error instanceof Error ? error.message : '加载工具脚本失败');
+        setToolMessage(errorMessage(error, '加载工具脚本失败'));
         setToolScriptLoaded(false);
       })
       .finally(() => {
@@ -527,9 +477,9 @@ const ToolsEditor = ({ onReload }: EditorProps) => {
       setToolBaseline(toolScript);
       setToolBase(result.hash);
       window.dispatchEvent(new Event('settings:tools-updated'));
-      setToolMessage('工具脚本已保存。');
+      setToolMessage(savedMessage('工具脚本已保存。', '', result.warnings));
     } catch (error) {
-      setToolMessage(error instanceof Error ? error.message : '保存工具脚本失败');
+      setToolMessage(errorMessage(error, '保存工具脚本失败'));
     } finally {
       setToolScriptSaving(false);
     }
@@ -548,7 +498,7 @@ const ToolsEditor = ({ onReload }: EditorProps) => {
       await reloadTools(adminToken);
       setToolMessage('工具已重载。');
     } catch (error) {
-      setToolMessage(error instanceof Error ? error.message : '重载工具失败');
+      setToolMessage(errorMessage(error, '重载工具失败'));
     } finally {
       setToolReloading(false);
     }
@@ -610,43 +560,19 @@ const ToolsEditor = ({ onReload }: EditorProps) => {
   );
 };
 
-interface SkillFrontmatterEdit {
-  enabled: boolean;
-  strategy: string;
-  keywords: string;
-  order: string;
-  priority: string;
-  scan_depth: string;
-}
+const SKILL_CODEC: RawFormCodec<SkillQuickFields> = { parse: parseSkillQuickFields, serialize: serializeSkillQuickFields };
 
-function parseSkillEdit(raw: string): SkillFrontmatterEdit {
-  const match = raw.replace(/\r\n/g, '\n').match(/^---\n([\s\S]*?)\n---(?:\n|$)/);
-  if (!match) throw new Error('技能文件缺少 YAML frontmatter，请修复后再保存。');
-  const parsed = yaml.load(match[1]);
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('技能 frontmatter 必须是对象。');
-  const value = parsed as Record<string, unknown>;
-  return {
-    enabled: value.enabled !== false, strategy: String(value.strategy || 'normal'),
-    keywords: Array.isArray(value.keywords) ? value.keywords.map(String).join(', ') : String(value.keywords || ''),
-    order: String(value.order ?? 0), priority: String(value.priority ?? 0), scan_depth: String(value.scan_depth ?? 0),
-  };
-}
+/** 原文读回来之前先按列表里那份摘要摆着，读回来再换成文件里的值。 */
+const skillSnapshotFields = (skill: AdminSkill | null): SkillQuickFields => ({
+  enabled: skill?.enabled !== false,
+  strategy: skill?.strategy || 'normal',
+  keywords: (skill?.keywords || []).join(', '),
+  order: '0',
+  priority: '0',
+  scan_depth: '0',
+});
 
-function applySkillFrontmatter(raw: string, edit: SkillFrontmatterEdit): string {
-  parseSkillEdit(raw);
-  const normalized = raw.replace(/\r\n/g, '\n');
-  const match = normalized.match(/^---\n([\s\S]*?)\n---(?:\n|$)/)!;
-  const meta = yaml.load(match[1]) as Record<string, unknown>;
-  const keywords = Array.isArray(meta.keywords) && edit.keywords === meta.keywords.map(String).join(', ')
-    ? meta.keywords : edit.keywords.split(',').map(item => item.trim()).filter(Boolean);
-  Object.assign(meta, { enabled: edit.enabled, strategy: edit.strategy || 'normal', keywords });
-  for (const key of ['order', 'priority', 'scan_depth'] as const) {
-    const value = Number(edit[key] || 0);
-    if (!Number.isFinite(value)) throw new Error(`${key} 必须是数字`);
-    meta[key] = value;
-  }
-  return `---\n${yaml.dump(meta, { lineWidth: -1 })}---\n${normalized.slice(match[0].length)}`;
-}
+const SKILL_INPUT_CLASS = 'w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono';
 
 export const SkillsSettingsRightPanel = () => {
   const id = useSettingsSelectionStore(state => state.selectedSkill?.name);
@@ -658,164 +584,103 @@ export const SkillsSettingsRightPanel = () => {
 const SkillsEditor = ({ onReload }: EditorProps) => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const skill = useSettingsSelectionStore(state => state.selectedSkill);
-  const [edit, setEdit] = useState<SkillFrontmatterEdit>({ enabled: true, strategy: 'normal', keywords: '', order: '0', priority: '0', scan_depth: '0' });
-  const [rawMarkdown, setRawMarkdown] = useState('');
-  const [skillBaseline, setSkillBaseline] = useState('');
+  const source = useRawForm(SKILL_CODEC, skillSnapshotFields(skill));
+  const { form: edit, reset: resetSource, update } = source;
   const [skillBase, setSkillBase] = useState<string | null>(null);
-  const [rawMarkdownLoaded, setRawMarkdownLoaded] = useState(false);
-  const [rawMarkdownLoading, setRawMarkdownLoading] = useState(false);
-  const [rawMarkdownSaving, setRawMarkdownSaving] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [loading, setLoading] = useState(Boolean(adminToken && skill));
+  const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
-  const confirmDiscard = useUnsavedChanges(rawMarkdownLoaded && JSON.stringify([rawMarkdown, edit]) !== skillBaseline);
+  const confirmDiscard = useUnsavedChanges(loaded && source.dirty);
   const reload = () => { if (confirmDiscard()) onReload(); };
 
   useEffect(() => {
     let cancelled = false;
-    const baseEdit: SkillFrontmatterEdit = {
-      enabled: skill?.enabled !== false,
-      strategy: skill?.strategy || 'normal',
-      keywords: (skill?.keywords || []).join(', '),
-      order: '0',
-      priority: '0',
-      scan_depth: '0',
-    };
-    setEdit(baseEdit);
-    setRawMarkdown('');
-    setSkillBase(null);
-    setRawMarkdownLoaded(false);
-    setMessage('');
     if (!adminToken || !skill) return () => { cancelled = true; };
-    setRawMarkdownLoading(true);
+    setLoading(true);
     getSkillRaw(adminToken, skill.name)
-      .then(({ content: raw, hash }) => {
+      .then(({ content, hash }) => {
         if (cancelled) return;
-        // [2026-06-02] Load the full skill Markdown beside the quick fields.
-        // Why: frontmatter editing remains convenient, but advanced users need the
-        // authoritative SKILL.md content in the same context panel. How: store the raw
-        // response for both scalar extraction and the collapsed Markdown textarea.
-        // Purpose: one fetch initializes quick metadata and the advanced raw editor.
-        setRawMarkdown(raw);
+        resetSource(content);
         setSkillBase(hash);
-        setRawMarkdownLoaded(true);
-        const parsed = parseSkillEdit(raw);
-        setEdit(parsed);
-        setSkillBaseline(JSON.stringify([raw, parsed]));
+        setLoaded(true);
       })
-      .catch((error) => { if (!cancelled) { setRawMarkdownLoaded(false); setMessage(error instanceof Error ? error.message : '加载技能失败'); } })
-      .finally(() => { if (!cancelled) setRawMarkdownLoading(false); });
+      .catch((error) => { if (!cancelled) { setLoaded(false); setMessage(errorMessage(error, '加载技能失败')); } })
+      .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [adminToken, skill?.name]);
+  }, [adminToken, skill?.name, resetSource]);
 
   const save = async () => {
-    if (!adminToken || !skill || !rawMarkdownLoaded || rawMarkdownSaving) return;
-    setRawMarkdownSaving(true);
-    try {
-      // [2026-06-02] Keep the quick frontmatter save in sync with the raw editor.
-      // Why: users may open the advanced Markdown section after saving quick fields.
-      // How: apply the frontmatter patch to the loaded raw Markdown when available,
-      // otherwise fetch it once as before. Purpose: both editors show the same saved
-      // content without requiring a full Settings refresh.
-      const source = rawMarkdownLoaded ? { content: rawMarkdown, hash: skillBase } : await getSkillRaw(adminToken, skill.name);
-      const next = applySkillFrontmatter(source.content, edit);
-      const result = await updateSkillRaw(adminToken, skill.name, next, source.hash);
-      setRawMarkdown(next);
-      setSkillBase(result.hash);
-      const parsed = parseSkillEdit(next);
-      setEdit(parsed);
-      setSkillBaseline(JSON.stringify([next, parsed]));
-      setRawMarkdownLoaded(true);
-      window.dispatchEvent(new Event('settings:skills-updated'));
-      setMessage('快捷字段已保存。请刷新技能列表查看解析结果。');
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : '保存快捷字段失败');
-    } finally { setRawMarkdownSaving(false); }
-  };
-
-  const saveRawMarkdown = async () => {
-    if (!adminToken || !skill || !rawMarkdownLoaded || rawMarkdownSaving) return;
-    setRawMarkdownSaving(true);
+    if (!adminToken || !skill || !loaded || saving) return;
+    const blocked = unsavableReason(source);
+    if (blocked) {
+      setMessage(blocked);
+      return;
+    }
+    const { raw, note } = source;
+    setSaving(true);
     setMessage('正在保存…');
     try {
-      // [2026-06-02] Save the complete SKILL.md content from the advanced editor.
-      // Why: some skill changes affect body text or complex frontmatter that the quick
-      // form cannot represent. How: write the controlled raw Markdown textarea through
-      // the existing skill raw endpoint and notify the list page to reload metadata.
-      // Purpose: advanced editing remains available while hidden until requested.
-      const parsed = parseSkillEdit(rawMarkdown);
-      const result = await updateSkillRaw(adminToken, skill.name, rawMarkdown, skillBase);
+      const result = await updateSkillRaw(adminToken, skill.name, raw, skillBase);
+      resetSource(raw);
       setSkillBase(result.hash);
-      setEdit(parsed);
-      setSkillBaseline(JSON.stringify([rawMarkdown, parsed]));
-      setRawMarkdownLoaded(true);
       window.dispatchEvent(new Event('settings:skills-updated'));
-      setMessage('Raw Markdown 已保存。');
+      setMessage(savedMessage('技能已保存。', note, result.warnings));
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '保存 Raw Markdown 失败');
+      setMessage(errorMessage(error, '保存技能失败'));
     } finally {
-      setRawMarkdownSaving(false);
+      setSaving(false);
     }
   };
 
   return (
-    <PanelShell disabled={rawMarkdownSaving || rawMarkdownLoading} eyebrow="技能" title="Frontmatter 快捷编辑">
+    <PanelShell disabled={saving || loading} eyebrow="技能" title="Frontmatter 快捷编辑">
       {!skill ? (
         <p className="text-xs leading-5 text-[var(--duties-secondary)]">选择一个技能后，这里会显示启用状态、策略和关键词。</p>
       ) : (
         <div className="space-y-3 text-xs leading-5">
           <p><span className="text-[var(--duties-tertiary)]">名称：</span><span className="font-mono">{skill.name}</span></p>
-          <label className="flex items-center justify-between gap-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
-            <span>启用</span>
-            <input checked={edit.enabled} onChange={(event) => setEdit((current) => ({ ...current, enabled: event.target.checked }))} type="checkbox" />
-          </label>
-          <label className="block">
-            <span className="mb-1 block text-[var(--duties-tertiary)]">策略</span>
-            <select className="w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono" onChange={(event) => setEdit((current) => ({ ...current, strategy: event.target.value }))} value={edit.strategy}>
-              <option value="normal">normal</option>
-              <option value="constant">constant</option>
-            </select>
-          </label>
-          <label className="block">
-            <span className="mb-1 block text-[var(--duties-tertiary)]">关键词，使用英文逗号分隔</span>
-            <input className="w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono" onChange={(event) => setEdit((current) => ({ ...current, keywords: event.target.value }))} value={edit.keywords} />
-          </label>
-          <div className="grid grid-cols-3 gap-2">
-            {(['order', 'priority', 'scan_depth'] as const).map((key) => (
-              <label className="block" key={key}>
-                <span className="mb-1 block text-[var(--duties-tertiary)]">{key}</span>
-                <input className="w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono" onChange={(event) => setEdit((current) => ({ ...current, [key]: event.target.value }))} value={edit[key]} />
-              </label>
-            ))}
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button onClick={save} size="sm">保存快捷字段</Button>
-            <Button disabled={rawMarkdownLoading || rawMarkdownSaving} onClick={reload} size="sm" tone="quiet">刷新</Button>
-          </div>
-          <details className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
-            <summary className="cursor-pointer font-mono text-xs font-semibold text-[var(--duties-tertiary)]">Raw Markdown 编辑（高级）</summary>
-            <div className="mt-3 space-y-2">
-              {/* [2026-06-02] Put full SKILL.md editing behind a collapsed details row.
-                  Why: the quick form should stay the primary workflow, while raw body
-                  edits are advanced and take more space. How: render a monospace
-                  controlled textarea with twelve rows only inside the opened details
-                  section. Purpose: users can edit the complete Markdown file without
-                  making the right panel noisy by default. */}
-              {rawMarkdownLoading && !rawMarkdownLoaded ? (
-                <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-[var(--duties-secondary)]">正在加载 Raw Markdown。</p>
-              ) : (
-                <textarea
-                  aria-label="技能 Raw Markdown 编辑器"
-                  className="w-full resize-y border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 font-mono text-xs leading-5 text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)] disabled:opacity-70"
-                  disabled={!rawMarkdownLoaded && rawMarkdownLoading}
-                  onChange={(event) => setRawMarkdown(event.target.value)}
-                  rows={12}
-                  spellCheck={false}
-                  value={rawMarkdown}
-                />
-              )}
-              <Button disabled={!rawMarkdownLoaded || rawMarkdownLoading || rawMarkdownSaving} onClick={saveRawMarkdown} size="sm">保存 Raw Markdown</Button>
+          {!loaded && !loading ? (
+            <div className="space-y-2">
+              <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-[var(--duties-secondary)]">{message || '技能没有读到。'}</p>
+              <Button onClick={reload} size="sm" tone="quiet">刷新</Button>
             </div>
-          </details>
-          {message && <p className="text-[var(--duties-tertiary)]">{message}</p>}
+          ) : (
+            <>
+              <fieldset disabled={!loaded || Boolean(source.parseError)} className="min-w-0 space-y-3">
+                <label className="flex items-center justify-between gap-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
+                  <span>启用</span>
+                  <input checked={edit.enabled} onChange={(event) => update({ enabled: event.target.checked })} type="checkbox" />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-[var(--duties-tertiary)]">策略</span>
+                  <select className={SKILL_INPUT_CLASS} onChange={(event) => update({ strategy: event.target.value })} value={edit.strategy}>
+                    <option value="normal">normal</option>
+                    <option value="constant">constant</option>
+                  </select>
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-[var(--duties-tertiary)]">关键词，使用英文逗号分隔</span>
+                  <input className={SKILL_INPUT_CLASS} onChange={(event) => update({ keywords: event.target.value })} value={edit.keywords} />
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  {(['order', 'priority', 'scan_depth'] as const).map((key) => (
+                    <label className="block" key={key}>
+                      <span className="mb-1 block text-[var(--duties-tertiary)]">{key}</span>
+                      <input className={SKILL_INPUT_CLASS} onChange={(event) => update({ [key]: event.target.value })} value={edit[key]} />
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+              <RawFormStatus source={source} />
+              <RawSourceDetails height="16rem" label="技能 Raw Markdown 编辑器" loading={!loaded} source={source} summary="Raw Markdown 编辑（高级）" />
+              <div className="flex flex-wrap gap-2">
+                <Button disabled={saving || !loaded} onClick={save} size="sm">保存技能</Button>
+                <Button disabled={loading || saving} onClick={reload} size="sm" tone="quiet">刷新</Button>
+              </div>
+              {message && <p className="text-[var(--duties-tertiary)]">{message}</p>}
+            </>
+          )}
         </div>
       )}
     </PanelShell>
@@ -861,48 +726,44 @@ export const McpSettingsRightPanel = () => {
   return <McpEditor key={`${token}\0${id || ''}\0${generation}`} onReload={reload} />;
 };
 
+/** 表单上 env 按 KEY=VALUE 一行一个显示，写回前换回解析器认的「key: value」。 */
+const mcpFormForYaml = (form: McpClientFormState): McpClientFormState => ({ ...form, envText: serializeEnvTextForYaml(form.envText) });
+
 const McpEditor = ({ onReload }: EditorProps) => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const client = useSettingsSelectionStore(state => state.selectedMcpClient);
+  // 打开时（和上次保存后）文件里这一项的样子：保存时拿它核对有没有被别处改过，也拿它比出改了哪些字段。
+  const [opened, setOpened] = useState<McpClientFormState | null>(null);
   const [form, setForm] = useState<McpClientFormState | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
-  const [baseline, setBaseline] = useState('');
-  const confirmDiscard = useUnsavedChanges(Boolean(form) && JSON.stringify(form) !== baseline);
+  const confirmDiscard = useUnsavedChanges(Boolean(form) && JSON.stringify(form) !== JSON.stringify(opened));
   const reload = () => { if (confirmDiscard()) onReload(); };
 
   useEffect(() => {
     let cancelled = false;
-    setForm(null);
-    setMessage('');
     if (!client) return () => { cancelled = true; };
     if (!adminToken) {
       setMessage('缺少管理员令牌，无法加载 MCP Client。');
       return () => { cancelled = true; };
     }
     setLoading(true);
-    // [2026-06-02] Reload raw MCP YAML whenever the selected client changes.
-    // Why: the form must edit the latest persisted YAML rather than only the list
-    // snapshot stored in selection state. How: fetch all raw clients, parse them, and
-    // copy the matching id into local component state with display-format conversions.
-    // Purpose: switching selections resets the editor and avoids saving stale fields.
     getMcpClientsRaw(adminToken)
       .then(({ content: raw }) => {
         if (cancelled) return;
         const selected = parseMcpClients(raw).find((item) => item.id === client.id) || null;
         if (!selected) {
           setMessage('未在 MCP YAML 中找到此 Client。');
-          setForm(null);
           return;
         }
-        const next = { ...selected, argsText: selected.argsText, envText: displayEnvText(selected.envText) };
-        setForm(next);
-        setBaseline(JSON.stringify(next));
+        const shown = { ...selected, envText: displayEnvText(selected.envText) };
+        setOpened(shown);
+        setForm(shown);
       })
       .catch((error) => {
         if (cancelled) return;
-        setMessage(error instanceof Error ? error.message : '加载 MCP Client 失败');
+        setMessage(errorMessage(error, '加载 MCP Client 失败'));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -911,32 +772,25 @@ const McpEditor = ({ onReload }: EditorProps) => {
   }, [adminToken, client?.id]);
 
   const save = async () => {
-    if (!adminToken || !client || !form || saving) return;
+    if (!adminToken || !client || !form || !opened || saving) return;
     setSaving(true);
     setMessage('正在保存…');
     try {
-      // [2026-06-02] Save one MCP client by replacing it inside the parsed raw list.
-      // Why: the backend stores one YAML file, so saving a single form must preserve
-      // the other clients. How: reload raw YAML, parse all forms, replace the selected
-      // id with the local form converted back to serializer format, serialize, save,
-      // and emit the settings:mcp-updated event. Purpose: the main MCP list can refresh
-      // after a successful edit without an engine restart.
-      const file = await getMcpClientsRaw(adminToken);
-      const forms = parseMcpClients(file.content);
-      const index = forms.findIndex((item) => item.id === client.id);
-      if (index < 0) throw new Error('未在 MCP YAML 中找到此 Client。');
-      if (itemChangedSince(form, forms[index])) throw new Error(staleItemMessage('这个 Client'));
-      forms[index] = { ...form, original: forms[index].original, argsText: form.argsText, envText: serializeEnvTextForYaml(form.envText) };
-      const content = serializeMcpClients(forms, file.content);
-      await updateMcpClientsRaw(adminToken, content, file.hash);
-      // 下一次保存要拿刚写下的这一版核对。
+      const before = mcpFormForYaml(opened);
+      const after = mcpFormForYaml(form);
+      const { content, note, result } = await commitYamlKeys({
+        read: () => getMcpClientsRaw(adminToken),
+        write: (next, hash) => updateMcpClientsRaw(adminToken, next, hash),
+        edits: (base) => mcpClientUpdateEdits(base, before, after),
+      });
       const original = parseMcpClients(content).find((item) => item.id === client.id)?.original;
-      setForm((current) => current && { ...current, original });
-      setBaseline(JSON.stringify({ ...form, original }));
+      const saved = { ...form, original };
+      setForm(saved);
+      setOpened(saved);
       window.dispatchEvent(new Event('settings:mcp-updated'));
-      setMessage('MCP Client 已保存。');
+      setMessage(savedMessage('MCP Client 已保存。', note, result.warnings));
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '保存 MCP Client 失败');
+      setMessage(isEditConflict(error) ? staleItemMessage('这个 Client') : errorMessage(error, '保存 MCP Client 失败'));
     } finally {
       setSaving(false);
     }
@@ -1021,40 +875,34 @@ export const AutomationSettingsRightPanel = () => {
 const AutomationEditor = ({ onReload }: EditorProps) => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const selectedScheduleId = useSettingsSelectionStore(state => state.selectedScheduleId);
+  // 打开时（和上次保存后）文件里这一项的样子：保存时拿它核对有没有被别处改过，也拿它比出改了哪些字段。
+  const [opened, setOpened] = useState<ScheduleFormState | null>(null);
   const [form, setForm] = useState<ScheduleFormState | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
-  const [baseline, setBaseline] = useState('');
-  const confirmDiscard = useUnsavedChanges(Boolean(form) && JSON.stringify(form) !== baseline);
+  const confirmDiscard = useUnsavedChanges(Boolean(form) && JSON.stringify(form) !== JSON.stringify(opened));
   const reload = () => { if (confirmDiscard()) onReload(); };
 
   useEffect(() => {
     let cancelled = false;
-    setForm(null);
-    setMessage('');
     if (!selectedScheduleId) return () => { cancelled = true; };
     if (!adminToken) {
       setMessage('缺少管理员令牌，无法加载定时任务。');
       return () => { cancelled = true; };
     }
     setLoading(true);
-    // [2026-06-02] Load the selected schedule from raw schedules.yaml.
-    // Why: the right rail only stores the selected id, and the editable form must
-    // reflect the latest persisted file. How: fetch raw YAML, parse all schedules,
-    // and copy the matching id into local state. Purpose: changing selected schedules
-    // resets fields and avoids editing an outdated list snapshot.
     getSchedulesRaw(adminToken)
       .then(({ content: raw }) => {
         if (cancelled) return;
         const selected = parseSchedules(raw).find((item) => item.id === selectedScheduleId) || null;
+        setOpened(selected);
         setForm(selected);
-        setBaseline(JSON.stringify(selected));
         if (!selected) setMessage('未在 schedules.yaml 中找到此定时任务。');
       })
       .catch((error) => {
         if (cancelled) return;
-        setMessage(error instanceof Error ? error.message : '加载定时任务失败');
+        setMessage(errorMessage(error, '加载定时任务失败'));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -1063,31 +911,25 @@ const AutomationEditor = ({ onReload }: EditorProps) => {
   }, [adminToken, selectedScheduleId]);
 
   const save = async () => {
-    if (!adminToken || !selectedScheduleId || !form || saving) return;
+    if (!adminToken || !selectedScheduleId || !form || !opened || saving) return;
     setSaving(true);
     setMessage('正在保存…');
     try {
-      // [2026-06-02] Save one automation schedule inside the raw YAML list.
-      // Why: schedules.yaml contains multiple tasks and the selected form should not
-      // overwrite unrelated entries. How: reload raw YAML, parse all schedules, replace
-      // the matching id, serialize the complete list, write it back, and emit the
-      // settings:schedules-updated event. Purpose: the Automation page refreshes after
-      // save while the operation stays limited to the requested right-panel editor.
-      const file = await getSchedulesRaw(adminToken);
-      const schedules = parseSchedules(file.content);
-      const index = schedules.findIndex((item) => item.id === selectedScheduleId);
-      if (index < 0) throw new Error('未在 schedules.yaml 中找到此定时任务。');
-      if (itemChangedSince(form, schedules[index])) throw new Error(staleItemMessage('这个定时任务'));
-      schedules[index] = { ...form, original: schedules[index].original };
-      const content = serializeSchedules(schedules, file.content);
-      await updateSchedulesRaw(adminToken, content, file.hash);
+      const before = opened;
+      const after = form;
+      const { content, note, result } = await commitYamlKeys({
+        read: () => getSchedulesRaw(adminToken),
+        write: (next, hash) => updateSchedulesRaw(adminToken, next, hash),
+        edits: (base) => scheduleUpdateEdits(base, before, after),
+      });
       const original = parseSchedules(content).find((item) => item.id === selectedScheduleId)?.original;
-      setForm((current) => current && { ...current, original });
-      setBaseline(JSON.stringify({ ...form, original }));
+      const saved = { ...form, original };
+      setForm(saved);
+      setOpened(saved);
       window.dispatchEvent(new Event('settings:schedules-updated'));
-      setMessage('定时任务已保存。');
+      setMessage(savedMessage('定时任务已保存。', note, result.warnings));
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '保存定时任务失败');
+      setMessage(isEditConflict(error) ? staleItemMessage('这个定时任务') : errorMessage(error, '保存定时任务失败'));
     } finally {
       setSaving(false);
     }

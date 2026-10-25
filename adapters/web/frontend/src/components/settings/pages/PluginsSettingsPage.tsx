@@ -16,6 +16,7 @@ import {
   Block, Button, Check, Chip, Chips, Empty, Field, Input, PageShell, Pre,
   ReadOnlyRow, Select, StatusBar, Tag, Textarea,
 } from './settingsControls';
+import { errorMessage } from '../../../api/request';
 
 type Choices = Record<keyof PluginSelectors, string[]>;
 type Action = (action: () => Promise<void>) => Promise<void>;
@@ -25,7 +26,6 @@ const SELECTOR_LABELS: Record<keyof PluginSelectors, string> = {
 };
 const STATUS_LABELS = { loaded: '已加载', disabled: '已停用', error: '运行异常', retiring: '等待在途请求结束', stopped: '进程已离线', not_applicable: '不在此进程运行' };
 const json = (value: unknown) => JSON.stringify(value, null, 2);
-const errorMessage = (error: unknown) => error instanceof Error ? error.message : '操作失败';
 
 function configObject(text: string): Record<string, unknown> {
   const parsed: unknown = JSON.parse(text);

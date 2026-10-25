@@ -1,6 +1,7 @@
 // 控制台 schema 的缓存。布局只随代码变，一个作用域拉一次就够；侧栏搜索和页面读的是同一份。
 import { create } from 'zustand';
 
+import { ApiError, errorMessage } from '../api/request';
 import { getFeaturesSchema, getPlatformSchema, type ConsoleSchema } from '../api/supervisorClient';
 import type { ConfigScope } from './configScope';
 
@@ -17,16 +18,16 @@ const fetchSchema = (token: string, scope: ConfigScope): Promise<ConsoleSchema> 
   scope.kind === 'features' ? getFeaturesSchema(token) : getPlatformSchema(token, scope.platformId)
 );
 
-// 路由不存在时 FastAPI 回的就是这一句：supervisor 还是旧版，没有这个接口。
-const ROUTE_MISSING = '404 Not Found';
+// 路由不存在时 FastAPI 回 404 加上它默认的这句：supervisor 还是旧版，没有这个接口。
+const ROUTE_MISSING = 'Not Found';
 
 const describe = (error: unknown): string => {
-  const message = error instanceof Error ? error.message : String(error);
-  if (message === ROUTE_MISSING) {
-    return `读不到控制台布局（${message}）。supervisor 可能还没更新到当前版本，重启 supervisor 之后再试。`;
+  if (!(error instanceof ApiError)) return `读不到控制台布局：${errorMessage(error)}`;
+  if (error.status === 404 && error.detail === ROUTE_MISSING) {
+    return `读不到控制台布局（${error.message}）。supervisor 可能还没更新到当前版本，重启 supervisor 之后再试。`;
   }
   // 别的错误带着后端给的原因（比如这个平台没有控制台配置界面），照原话说，状态码不念。
-  return `读不到控制台布局：${message.replace(/^\d{3} /, '')}`;
+  return `读不到控制台布局：${error.detail || error.message}`;
 };
 
 export const useSchemaStore = create<SchemaState>((set, get) => ({

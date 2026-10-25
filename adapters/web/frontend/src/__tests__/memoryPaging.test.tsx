@@ -210,6 +210,27 @@ describe('来源列表', () => {
     expect(screen.getByText('私聊')).toBeInTheDocument();
     expect(screen.getByText('人物')).toBeInTheDocument();
   });
+
+  it('节点自己命名的记忆库单独成组，用目录名当名字，不落进通用', async () => {
+    stub({
+      namespaces: [
+        namespace(1, '某群', 'group'),
+        {
+          ...namespace(2, '未知来源', 'group'),
+          namespace: 'research_notes',
+          key: 'research_notes',
+          kind: 'memory_book',
+          owner: { kind: 'unknown', label: '未知来源' },
+        },
+      ],
+    });
+    render(<MemoryPage />);
+
+    const library = await screen.findByRole('button', { name: /research_notes/ });
+    expect(screen.getByText('节点记忆库')).toBeInTheDocument();
+    expect(screen.queryByText('通用')).toBeNull();
+    expect(library.compareDocumentPosition(screen.getByText('节点记忆库')) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
+  });
 });
 
 describe('记忆条目', () => {

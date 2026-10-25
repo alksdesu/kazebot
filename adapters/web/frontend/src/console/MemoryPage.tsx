@@ -23,6 +23,7 @@ import { useConversationNames } from '../features/useConversationNames';
 import { scopeIdentity } from '../features/conversationNames';
 import { useRequestScope } from '../features/asyncState';
 import { ContextArchiveSettings } from './ContextArchiveSettings';
+import { errorMessage } from '../api/request';
 
 const EMPTY_DRAFT = { id: '', content: '', keywords: '', constant: false };
 
@@ -53,13 +54,12 @@ const BUCKET = 'font-mono text-mini text-[var(--duties-secondary)]';
 // 会话按登录账号分组时的小标题。只在换过号之后才出现。
 const GROUP = 'mb-1.5 mt-3.5 text-xs text-[var(--duties-secondary)]';
 
-const say = (error: unknown): string => (error instanceof Error ? error.message : '出错了');
-
-// 群聊、私聊和人物档案分开，认不出出处的归通用。
-const BUCKETS = ['群组', '私聊', '人物', '通用'] as const;
+// 群聊、私聊、人物档案和节点自己命名的记忆库分开，认不出出处的归通用。
+const BUCKETS = ['群组', '私聊', '人物', '节点记忆库', '通用'] as const;
 
 function bucketOf(row: MemoryNamespace): (typeof BUCKETS)[number] {
   if (row.kind === 'subject') return '人物';
+  if (row.kind === 'memory_book') return '节点记忆库';
   if (row.owner.kind === 'private') return '私聊';
   if (row.owner.kind === 'group' || row.owner.kind === 'agent') return '群组';
   return '通用';
@@ -83,13 +83,14 @@ const MemoryBlock = () => {
   const [query, setQuery] = useState('');
   const [sourceOffset, setSourceOffset] = useState(0);
   const [entryOffset, setEntryOffset] = useState(0);
-  const namespaceNames = useConversationNames(namespaces.map(row => ({ scope: row.owner.conversation_key || row.namespace || row.key, owner: row.owner })));
-  const describedNamespaces = useMemo(() => namespaces.map(row => ({ ...row, owner: { ...row.owner, label: namespaceNames.get(scopeIdentity(row.owner.conversation_key || row.namespace || row.key))! } })), [namespaces, namespaceNames]);
+  const namespaceNames = useConversationNames(namespaces.filter(row => row.kind !== 'memory_book').map(row => ({ scope: row.owner.conversation_key || row.namespace || row.key, owner: row.owner })));
+  // 节点记忆库不属于任何会话，目录名就是节点给它起的名字。
+  const describedNamespaces = useMemo(() => namespaces.map(row => ({ ...row, owner: { ...row.owner, label: row.kind === 'memory_book' ? row.namespace : namespaceNames.get(scopeIdentity(row.owner.conversation_key || row.namespace || row.key))! } })), [namespaces, namespaceNames]);
 
   const loadOverview = async () => {
     if (!adminToken) return;
     setOverviewLoading(true);
-    try { setNamespaces(await getMemoryOverview(adminToken)); setLoadError('', 'overview'); } catch (error) { setLoadError(say(error), 'overview'); } finally { setOverviewLoading(false); }
+    try { setNamespaces(await getMemoryOverview(adminToken)); setLoadError('', 'overview'); } catch (error) { setLoadError(errorMessage(error), 'overview'); } finally { setOverviewLoading(false); }
   };
 
   const loadEntries = async (namespace: string) => {
@@ -101,7 +102,7 @@ const MemoryBlock = () => {
       if (version !== entryVersion.current || selectedRef.current !== namespace) return;
       setEntries(result); setEntriesScope(namespace); setLoadError('', 'entries');
     } catch (error) {
-      if (version === entryVersion.current && selectedRef.current === namespace) setLoadError(say(error), 'entries');
+      if (version === entryVersion.current && selectedRef.current === namespace) setLoadError(errorMessage(error), 'entries');
     } finally {
       if (version === entryVersion.current) setLoading(false);
     }
@@ -110,7 +111,7 @@ const MemoryBlock = () => {
   useEffect(() => { void loadOverview(); }, [adminToken]);
   useEffect(() => { setEntries([]); setEntriesScope(''); void loadEntries(selected); setEntryOffset(0); return () => { ++entryVersion.current; }; }, [selected, adminToken]);
 
-  // 固定按「群组 / 私聊 / 人物 / 通用」排，拍平成一条序列再分页 —— 按组各自分页会在一栏
+  // 固定按 BUCKETS 的顺序排，拍平成一条序列再分页 —— 按组各自分页会在一栏
   // 里挂出三个分页器。组标题在每页按需重新出现，翻页不会丢掉这一项属于哪一档。
   const sources = useMemo(() => {
     const wanted = query.trim().toLowerCase();
@@ -154,7 +155,7 @@ const MemoryBlock = () => {
       await loadOverview();
       setMessage('已添加');
     } catch (error) {
-      setMessage(say(error));
+      setMessage(errorMessage(error));
     } finally {
       setBusy(false);
     }
@@ -167,7 +168,7 @@ const MemoryBlock = () => {
       await deleteMemoryEntry(adminToken, selected, entry.book, entry.id);
       await loadEntries(selected);
       await loadOverview();
-    } catch (error) { setMessage(say(error)); } finally { setBusy(false); }
+    } catch (error) { setMessage(errorMessage(error)); } finally { setBusy(false); }
   };
 
   const clearAll = async () => {
@@ -180,7 +181,7 @@ const MemoryBlock = () => {
       setDraft(EMPTY_DRAFT);
       await loadOverview();
       setMessage(`已清空 ${removed} 条`);
-    } catch (error) { setMessage(say(error)); } finally { setBusy(false); }
+    } catch (error) { setMessage(errorMessage(error)); } finally { setBusy(false); }
   };
 
   return (
@@ -341,7 +342,7 @@ const ContextBlock = () => {
     try {
       const result = await getConversationMessages(adminToken, row.session_id, 100);
       if (identity.isCurrent() && version === previewVersion.current) setPreview({ id: row.session_id, ...result });
-    } catch (error) { if (identity.isCurrent() && version === previewVersion.current) setNote(say(error)); }
+    } catch (error) { if (identity.isCurrent() && version === previewVersion.current) setNote(errorMessage(error)); }
     finally { if (identity.isCurrent() && version === previewVersion.current) setLoading(false); }
   };
 
@@ -359,7 +360,7 @@ const ContextBlock = () => {
       await load();
       if (!identity.isCurrent()) return;
       setNote('已删除，下一条消息开始重新积累');
-    } catch (error) { if (identity.isCurrent()) setNote(say(error)); } finally { if (identity.isCurrent()) setBusy(false); }
+    } catch (error) { if (identity.isCurrent()) setNote(errorMessage(error)); } finally { if (identity.isCurrent()) setBusy(false); }
   };
 
   const entry = (row: ConversationRow) => (

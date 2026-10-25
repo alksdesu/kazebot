@@ -1,15 +1,7 @@
 // provider 参数的控件。清单由后端按 provider 类公布，这里只负责把一条 spec 变成一行界面。
-// 两个作用域共用：全局与节点存的是 yaml 标量文本，备选链存的是 JSON 值，靠下面两组转换对齐。
+// 全局、节点和备选链都按值读写：界面字符串和 yaml / JSON 里的值靠下面这组转换对齐。
 import type { ProviderOptionSpec } from '../api/supervisorClient';
 import { Input, Segmented } from './components';
-
-/** 界面字符串 → yaml 标量写法。空串表示删掉这一行。 */
-export function toYamlScalar(spec: ProviderOptionSpec, shown: string): string {
-  const text = shown.trim();
-  if (!text) return '';
-  if (spec.kind === 'text') return JSON.stringify(text);
-  return text;
-}
 
 /** JSON 值 → 界面字符串。 */
 export function shownFromValue(value: unknown): string {

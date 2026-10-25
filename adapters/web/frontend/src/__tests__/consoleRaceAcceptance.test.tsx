@@ -9,7 +9,7 @@ import { useSettingsStore } from '../store/settingsStore';
 
 vi.mock('../api/supervisorClient', async importOriginal => ({
   ...(await importOriginal<typeof import('../api/supervisorClient')>()),
-  getProviderProfiles: vi.fn(), getProviders: vi.fn(), getNodes: vi.fn(), getRuntimeRaw: vi.fn(), getNodeRaw: vi.fn(),
+  getProviderProfiles: vi.fn(), getProviders: vi.fn(), getNodes: vi.fn(), getRuntimeRaw: vi.fn(), getRuntimeFile: vi.fn(), getNodeRaw: vi.fn(),
   updateRuntimeRaw: vi.fn(), updateNodeRaw: vi.fn(), upsertProvider: vi.fn(), setActiveProvider: vi.fn(), deleteProvider: vi.fn(),
   getMemoryOverview: vi.fn(), getMemoryEntries: vi.fn(), saveMemoryEntry: vi.fn(), deleteMemoryEntry: vi.fn(), clearMemoryNamespace: vi.fn(),
   getConversations: vi.fn(), getConversationMessages: vi.fn(), resetConversationBySession: vi.fn(), getAccountScope: vi.fn(), migrateAccountScope: vi.fn(),
@@ -68,6 +68,8 @@ beforeEach(() => {
   vi.mocked(api.getProviders).mockResolvedValue(providers());
   vi.mocked(api.getNodes).mockResolvedValue([{ id: 'node.a', provider: 'relay' }, { id: 'node.b', provider: 'relay' }] as api.AdminNode[]);
   vi.mocked(api.getRuntimeRaw).mockResolvedValue({ content: runtime, hash: 'runtime-1' });
+  // 全局参数写的是本实例那一层，保存前现读的就是它。
+  vi.mocked(api.getRuntimeFile).mockResolvedValue({ content: runtime, hash: 'runtime-1', source: 'override', path: 'config/runtime.yaml' });
   vi.mocked(api.getNodeRaw).mockImplementation(async (_auth, id) => nodeRaw(id, id === 'node.a' ? 0.4 : 0.7));
   vi.mocked(api.updateRuntimeRaw).mockResolvedValue({ ok: true, hash: 'runtime-2' });
   vi.mocked(api.updateNodeRaw).mockResolvedValue({ ok: true, hash: 'node-2' });

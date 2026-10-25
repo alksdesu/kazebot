@@ -15,6 +15,7 @@ import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { startPolling } from '../../../utils/polling';
 import { countActiveTasks, formatUptime, restartRefusal } from '../../../utils/systemStatus';
 import { Block, Button, PageShell, StatusText } from './settingsControls';
+import { errorMessage } from '../../../api/request';
 
 const Stat = ({ label, value, detail, onClick }: { label: string; value: string | number; detail?: string; onClick?: () => void }) => {
   const content = (
@@ -67,7 +68,7 @@ const SystemSettingsPageBody = () => {
       setLoadError('');
     } catch (error) {
       if (version !== generation.current) return;
-      setLoadError(error instanceof Error ? error.message : '加载系统状态失败');
+      setLoadError(errorMessage(error, '加载系统状态失败'));
     } finally {
       if (showSpinner) setLoading(false);
     }
@@ -111,7 +112,7 @@ const SystemSettingsPageBody = () => {
       await load(false);
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      report(error instanceof Error ? error.message : '配置重载失败');
+      report(errorMessage(error, '配置重载失败'));
     }
   });
   const handleRestart = () => run(async () => {
@@ -124,7 +125,7 @@ const SystemSettingsPageBody = () => {
       report(result?.scheduled ? '已请求重启引擎' : `未能重启：${restartRefusal(result)}`);
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      report(error instanceof Error ? error.message : '重启失败');
+      report(errorMessage(error, '重启失败'));
     }
   });
   return (

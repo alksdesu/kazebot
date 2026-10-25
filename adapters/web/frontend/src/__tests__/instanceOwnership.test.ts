@@ -3,7 +3,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  attachmentHref,
+  attachmentUrl,
   instanceConsoleHref,
   instanceOwning,
   isValidInstanceId,
@@ -123,19 +123,18 @@ describe('instanceConsoleHref', () => {
   });
 });
 
-describe('attachmentHref', () => {
+describe('attachmentUrl', () => {
   it('把工作区相对路径挂到附件端点下', () => {
-    expect(attachmentHref('data/attachments/g/a.png', '')).toBe('/v1/files/data/attachments/g/a.png');
+    expect(attachmentUrl('data/attachments/g/a.png')).toBe('/v1/files/data/attachments/g/a.png');
   });
 
-  it('带 token 时走 query —— img 标签带不了请求头', () => {
-    expect(attachmentHref('data/attachments/a.png', 'tok en')).toBe(
-      '/v1/files/data/attachments/a.png?token=tok%20en',
-    );
+  // 令牌进了地址就会进历史、书签和代理日志；附件一律用 fetch 带请求头去取。
+  it('地址里从不带令牌', () => {
+    expect(attachmentUrl('data/attachments/a.png')).not.toContain('token');
   });
 
   it('逐段转义，斜杠保持为路径分隔符', () => {
-    expect(attachmentHref('data/attachments/g 1/a b.png', '')).toBe(
+    expect(attachmentUrl('data/attachments/g 1/a b.png')).toBe(
       '/v1/files/data/attachments/g%201/a%20b.png',
     );
   });

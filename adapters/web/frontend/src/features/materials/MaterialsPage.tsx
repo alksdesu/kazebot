@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useSettingsStore } from '../../store/settingsStore';
-import { fetchWithDeadline } from '../../api/requestDeadline';
+import { downloadFile } from '../../api/blobs';
+import { errorMessage, requestJson } from '../../api/request';
+import { AuthorizedImage } from '../../components/common/AuthorizedImage';
 import { featureRequest, featureUrl } from '../client';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { startPolling } from '../../utils/polling';
@@ -38,25 +40,20 @@ export function buildMaterialSpec(format: string, title: string, text: string): 
 export function MaterialImage({ path, scope, botScope, alt, onReady }: {
   path: string; scope: string; botScope: string | null; alt: string; onReady?: () => void;
 }) {
-  const token = useSettingsStore(state => state.adminToken);
-  const [url, setUrl] = useState('');
-  const [error, setError] = useState('');
-  useEffect(() => {
-    const controller = new AbortController();
-    let objectUrl = '';
-    setUrl(''); setError('');
-    fetchWithDeadline(featureUrl(path, { scope, params: { bot_scope: botScope } }), {
-      signal: controller.signal, headers: token ? { Authorization: `Bearer ${token}` } : {},
-    }).then(async response => {
-      if (!response.ok) throw new Error(`预览加载失败：${response.status}`);
-      objectUrl = URL.createObjectURL(await response.blob());
-      if (!controller.signal.aborted) setUrl(objectUrl);
-      else URL.revokeObjectURL(objectUrl);
-    }).catch(reason => { if (!controller.signal.aborted) setError(String(reason)); });
-    return () => { controller.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [path, scope, botScope, token]);
-  if (error) return <ErrorText>{error}</ErrorText>;
-  return url ? <img src={url} alt={alt} className="max-w-full" onLoad={onReady} onError={() => setError('预览图片无法显示，请刷新后重试。')} /> : <p>正在读取预览…</p>;
+  const source = featureUrl(path, { scope, params: { bot_scope: botScope } });
+  const [undecodable, setUndecodable] = useState('');
+  if (undecodable === source) return <ErrorText>预览图片无法显示，请刷新后重试。</ErrorText>;
+  return (
+    <AuthorizedImage
+      alt={alt}
+      className="max-w-full"
+      fallback={reason => <ErrorText>{`预览加载失败：${errorMessage(reason)}`}</ErrorText>}
+      onError={() => setUndecodable(source)}
+      onLoad={onReady}
+      placeholder={<p>正在读取预览…</p>}
+      source={source}
+    />
+  );
 }
 
 export function MaterialsPage() {
@@ -120,7 +117,7 @@ export function MaterialsPage() {
     runningOperation.current = true;
     const operation = ++operationSequence.current;
     setBusy(true); setError(''); setNotice('');
-    try { await action(); } catch (reason) { if (identity.isCurrent()) setError(String(reason)); }
+    try { await action(); } catch (reason) { if (identity.isCurrent()) setError(errorMessage(reason)); }
     finally { if (operation === operationSequence.current) { runningOperation.current = false; if (identity.isCurrent()) setBusy(false); } }
   }
 
@@ -156,7 +153,7 @@ export function MaterialsPage() {
     featureRequest<MaterialScope[]>('/v1/materials/scopes').then(items => {
       if (active && useSettingsStore.getState().adminToken === token) setScopeSnapshot({ token, rows: Array.isArray(items) ? items.filter(item => item && typeof item.scope === 'string' && typeof item.bot_scope === 'string') : [] });
     }).catch(() => { if (active) setScopeError('资料会话名称读取失败，仍可操作当前范围。'); });
-    featureRequest<{ office_renderer: boolean; modules: Record<string, boolean> }>('/v1/materials/capabilities').then(item => { if (active) setCapabilities(item); }).catch(reason => { if (active) setError(String(reason)); });
+    featureRequest<{ office_renderer: boolean; modules: Record<string, boolean> }>('/v1/materials/capabilities').then(item => { if (active) setCapabilities(item); }).catch(reason => { if (active) setError(errorMessage(reason)); });
     return () => { active = false; };
   }, [token, scopeRetry]);
 
@@ -178,7 +175,7 @@ export function MaterialsPage() {
       if (next.status === 'preview_ready') {
         void perform(async () => { await refresh(); await openArtifact(next.artifact_id, next.version_id); });
       } else if (next.status === 'failed') setError(next.error || '生成失败，未发送成品。');
-    }).catch(reason => { if (active) setError(String(reason)); });
+    }).catch(reason => { if (active) setError(errorMessage(reason)); });
     const stop = startPolling(check, 2000);
     return () => { active = false; stop(); };
   }, [job?.id, job?.status, scope, botScope]);
@@ -186,11 +183,10 @@ export function MaterialsPage() {
   async function upload(file: File) {
     const form = new FormData(); form.append('file', file);
     identity.check();
-    const response = await fetchWithDeadline(featureUrl('/v1/materials/sources/upload', { scope, params: { bot_scope: botScope } }), {
-      method: 'POST', headers: token ? { Authorization: `Bearer ${token}` } : {}, body: form,
+    const source = await requestJson<Source>(featureUrl('/v1/materials/sources/upload', { scope, params: { bot_scope: botScope } }), {
+      method: 'POST', body: form,
     });
-    if (!response.ok) throw new Error((await response.text()).slice(0, 500));
-    const source: Source = await response.json(); identity.check();
+    identity.check();
     await refresh(); identity.check(); setSourceId(source.id); setNotice(`已登记 ${source.name}。`);
   }
 
@@ -203,13 +199,7 @@ export function MaterialsPage() {
   }
 
   async function downloadVersion(item: Version, name: string) {
-    const response = await fetchWithDeadline(featureUrl(`/v1/materials/versions/${item.id}/download`, { scope, params: { bot_scope: botScope } }), {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    });
-    if (!response.ok) throw new Error(`下载失败：${response.status}`);
-    const url = URL.createObjectURL(await response.blob());
-    const link = document.createElement('a'); link.href = url; link.download = `${name}.${item.format}`; link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    await downloadFile(featureUrl(`/v1/materials/versions/${item.id}/download`, { scope, params: { bot_scope: botScope } }), `${name}.${item.format}`);
   }
 
   return <FeaturePage title="资料与创作" description="查找文件依据与原消息，校对截图，生成并管理作品。所有内容按会话隔离，成品先预览、确认，再下载或发送。">

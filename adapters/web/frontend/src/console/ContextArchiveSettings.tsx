@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import yaml from 'js-yaml';
-import { getRuntimeRaw, isEditConflict, updateRuntimeRaw, type RawText } from '../api/supervisorClient';
+import { getRuntimeFile, isEditConflict, type RuntimeFile } from '../api/supervisorClient';
 import { useActorRequestScope } from '../features/useActorRequestScope';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Button, ErrorText, Footnote, Input } from './components';
-import { upsertYamlNested } from './nodeYaml';
+import { commitRuntimeKeys, StaleKeysError } from './yamlCommit';
+import { savedMessage } from '../utils/sentence';
+import { errorMessage } from '../api/request';
 
 const RETENTION_PATH = ['engine', 'context_archive', 'retention_days'];
 const DEFAULT_RETENTION = 7;
@@ -24,13 +26,12 @@ function retentionDays(content: string): number {
   return value;
 }
 
-function readSnapshot(raw: RawText) {
-  if (typeof raw.hash !== 'string') throw new Error('服务端未返回配置版本，无法安全保存，请更新服务后重试。');
-  return { ...raw, days: retentionDays(raw.content) };
+function readSnapshot(file: RuntimeFile) {
+  if (typeof file.hash !== 'string') throw new Error('服务端未返回配置版本，无法安全保存，请更新服务后重试。');
+  return { ...file, days: retentionDays(file.content) };
 }
 
 type Snapshot = ReturnType<typeof readSnapshot>;
-const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 export function ContextArchiveSettings() {
   const token = useSettingsStore(state => state.adminToken);
@@ -54,9 +55,9 @@ export function ContextArchiveSettings() {
     const request = ++sequence.current;
     setLoading(true); setError(''); setNotice('');
     try {
-      const raw = await getRuntimeRaw(token);
+      const file = await getRuntimeFile(token);
       if (!identity.isCurrent() || request !== sequence.current) return;
-      const next = readSnapshot(raw);
+      const next = readSnapshot(file);
       setSnapshot({ key: identity.key, value: next });
       setDraft(String(next.days)); setConflict(false);
     } catch (reason) {
@@ -79,23 +80,21 @@ export function ContextArchiveSettings() {
     const request = ++sequence.current;
     setSaving(true); setError(''); setNotice('');
     try {
-      const raw = await getRuntimeRaw(token);
-      if (!identity.isCurrent() || request !== sequence.current) return;
-      const latest = readSnapshot(raw);
-      if (latest.days !== baseline.days) {
-        setConflict(true); setError(CONFLICT_MESSAGE);
-        return;
-      }
       const days = Number(draft);
-      const content = upsertYamlNested(latest.content, RETENTION_PATH, String(days));
-      const result = await updateRuntimeRaw(token, content, latest.hash);
+      // 只写这一个键，落在本实例那层；读回来时这个键已被别处改过就不覆盖。
+      const { content, result } = await commitRuntimeKeys(token, [{ path: RETENTION_PATH, value: days }], {
+        loaded: baseline.content,
+        proceed: () => identity.isCurrent() && request === sequence.current,
+      });
       if (!identity.isCurrent() || request !== sequence.current) return;
       if (!result.ok || typeof result.hash !== 'string') throw new Error('未能确认保存版本，请重新载入归档设置核对；草稿已保留。');
-      setSnapshot({ key: identity.key, value: { content, hash: result.hash, days } });
-      setDraft(String(days)); setNotice('归档保留设置已保存。');
+      setSnapshot({ key: identity.key, value: { ...baseline, content, hash: result.hash, source: 'override', days } });
+      setDraft(String(days)); setNotice(savedMessage('归档保留设置已保存。', '', result.warnings));
     } catch (reason) {
       if (identity.isCurrent() && request === sequence.current) {
-        if (isEditConflict(reason)) {
+        if (reason instanceof StaleKeysError) {
+          setConflict(true); setError(CONFLICT_MESSAGE);
+        } else if (isEditConflict(reason)) {
           setConflict(true); setError('运行时配置在保存期间发生变化，草稿已保留。请重新载入归档设置后重试。');
         } else setError(errorMessage(reason));
       }

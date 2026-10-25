@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { activeProviderConfig, checkHealth, getProviders } from '../../../api/supervisorClient';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
+import { useChatStore } from '../../../store/chatStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { LoginPage } from '../../auth/LoginPage';
 import { Block, Button, PageShell } from './settingsControls';
@@ -61,6 +62,8 @@ export const GeneralSettingsPage = () => {
 
   const handleLogout = () => {
     if (!confirmNavigation()) return;
+    // 先关掉全局事件流、清掉这次登录留在内存里的对话，再丢令牌。
+    useChatStore.getState().resetState();
     const settings = useSettingsStore.getState();
     settings.setAdminToken(null);
     settings.setAuthenticated(false);

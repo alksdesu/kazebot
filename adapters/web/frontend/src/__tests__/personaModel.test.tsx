@@ -1,10 +1,11 @@
 // 人格页的模型字段。model 是上游 API 的字面量，前端无从校验 ——
 // 候选只能当提示，输入框必须继续收任意值，否则节点里在用的 $ENV{...} 会被界面挡死。
-// 连带覆盖 isNotFound：只有以 404 打头的错误才算「文件还没建」。
+// 连带覆盖 isNotFound：只有服务器回 404 才算「文件还没建」，报错文字里带着 404 的不算。
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  ApiError,
   getAllToolNames,
   getNodeFileRaw,
   getNodeFiles,
@@ -96,25 +97,22 @@ beforeEach(() => {
 });
 
 describe('认出「不存在」', () => {
-  it('以 404 打头才算', () => {
-    expect(isNotFound(new Error('404'))).toBe(true);
-    expect(isNotFound(new Error('404 Not Found'))).toBe(true);
-    expect(isNotFound(new Error('404 节点文件不存在'))).toBe(true);
+  it('服务器回 404 才算', () => {
+    expect(isNotFound(new ApiError(404, ''))).toBe(true);
+    expect(isNotFound(new ApiError(404, 'Not Found'))).toBe(true);
+    expect(isNotFound(new ApiError(404, '节点文件不存在'))).toBe(true);
   });
 
-  it('数字还没断开就不算，免得 4040 被当成 404', () => {
+  it('只是报错文字里带着 404 不算', () => {
+    expect(isNotFound(new Error('404 Not Found'))).toBe(false);
     expect(isNotFound(new Error('4040 网关把状态码拼错了'))).toBe(false);
-    expect(isNotFound(new Error('404500'))).toBe(false);
-  });
-
-  it('404 出现在别处不算', () => {
-    expect(isNotFound(new Error('Upload failed: 404'))).toBe(false);
-    expect(isNotFound(new Error('500 上游返回 404'))).toBe(false);
+    expect(isNotFound(new ApiError(500, '上游返回 404'))).toBe(false);
   });
 
   it('不是 Error 的一律不算', () => {
     expect(isNotFound('404 Not Found')).toBe(false);
     expect(isNotFound({ message: '404 Not Found' })).toBe(false);
+    expect(isNotFound({ status: 404 })).toBe(false);
     expect(isNotFound(null)).toBe(false);
     expect(isNotFound(undefined)).toBe(false);
   });
@@ -140,7 +138,7 @@ describe('人设文件', () => {
   });
 
   it('查到了读的时候却 404，一样按还没建算，不报错', async () => {
-    vi.mocked(getNodeFileRaw).mockRejectedValue(new Error('404 Not Found'));
+    vi.mocked(getNodeFileRaw).mockRejectedValue(new ApiError(404, 'Not Found'));
     render(<PersonaPage />);
 
     expect(await screen.findByText(isOnlyExample)).toBeInTheDocument();
@@ -148,7 +146,7 @@ describe('人设文件', () => {
   });
 
   it('其它错误照实说，不冒充成还没建', async () => {
-    vi.mocked(getNodeFiles).mockRejectedValue(new Error('500 读不到节点文件清单'));
+    vi.mocked(getNodeFiles).mockRejectedValue(new ApiError(500, '读不到节点文件清单'));
     render(<PersonaPage />);
 
     expect(await screen.findAllByText('500 读不到节点文件清单')).toHaveLength(2);
@@ -156,11 +154,11 @@ describe('人设文件', () => {
     expect(screen.getByRole('textbox', { name: '人设内容' })).toBeDisabled();
   });
 
-  it('状态码只是开头几位碰上 404，照样按读失败算', async () => {
-    vi.mocked(getNodeFileRaw).mockRejectedValue(new Error('4040 网关把状态码拼错了'));
+  it('报错文字以 404 打头却不是服务器回的 404，照样按读失败算', async () => {
+    vi.mocked(getNodeFileRaw).mockRejectedValue(new Error('404 Not Found'));
     render(<PersonaPage />);
 
-    expect(await screen.findByText('4040 网关把状态码拼错了')).toBeInTheDocument();
+    expect(await screen.findByText('404 Not Found')).toBeInTheDocument();
     expect(screen.queryByText(isOnlyExample)).toBeNull();
     expect(screen.getByRole('textbox', { name: '人设内容' })).toBeDisabled();
   });
@@ -340,7 +338,7 @@ describe('人设正文的保存基准', () => {
   });
 
   it('指纹对不上时说清楚没保存，草稿留在手里', async () => {
-    vi.mocked(updateNodeFileRaw).mockRejectedValue(new Error('409 _persona.md 已被别处改过，刷新后再改'));
+    vi.mocked(updateNodeFileRaw).mockRejectedValue(new ApiError(409, '_persona.md 已被别处改过，刷新后再改'));
     await ready();
 
     fireEvent.change(editor(), { target: { value: '改了一版' } });
@@ -352,7 +350,7 @@ describe('人设正文的保存基准', () => {
   });
 
   it('别的失败照实说，不冒充成冲突', async () => {
-    vi.mocked(updateNodeFileRaw).mockRejectedValue(new Error('500 磁盘满了'));
+    vi.mocked(updateNodeFileRaw).mockRejectedValue(new ApiError(500, '磁盘满了'));
     await ready();
 
     fireEvent.change(editor(), { target: { value: '改了一版' } });

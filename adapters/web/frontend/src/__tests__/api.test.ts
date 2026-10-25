@@ -1,7 +1,9 @@
-// [2026-05-16] Updated: tests for real Supervisor API client signatures.
+// Supervisor API client: endpoint shapes, which requests carry the admin token, and how server errors read.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, createInstance, decideApproval, deleteInstance, getAllToolNames, fetchActiveTasks, cancelTask, enterPlatformLoginMode, getAccountScope, getInstanceProgress, getPlatformAccount, getPlatformLoginQrcode, getPlatforms, migrateAccountScope, pinPlatformAccount, switchPlatformAccount } from '../api/supervisorClient';
+import { postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, createInstance, decideApproval, deleteInstance, getAllToolNames, fetchActiveTasks, cancelTask, enterPlatformLoginMode, getAccountScope, getInstanceDirectory, getInstanceProgress, getPlatformAccount, getPlatformLoginQrcode, getPlatforms, migrateAccountScope, pinPlatformAccount, switchPlatformAccount } from '../api/supervisorClient';
+import { MOUNT } from '../instances/paths';
+import { useSettingsStore } from '../store/settingsStore';
 
 function stubFetch(body: unknown = {}) {
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(body), {
@@ -100,11 +102,8 @@ describe('Supervisor API client', () => {
     });
   });
 
-  it('cancels a single task with admin context headers', async () => {
-    // [AutoC 2026-06-04] Why: the cancel endpoint is public today, but the System
-    // modal should still send the configured admin context. How: verify both the
-    // normal bearer header and the explicit X-Admin-Token header. Purpose: future
-    // backend hardening can accept the same client call without changing the UI.
+  it('cancels a single task with the admin bearer token', async () => {
+    // The backend reads only Authorization; a second token header would just copy the secret into one more place.
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
@@ -114,7 +113,7 @@ describe('Supervisor API client', () => {
     await expect(cancelTask('secret-token', 'task-abc')).resolves.toBeUndefined();
     expect(fetchMock).toHaveBeenCalledWith('/v1/tasks/task-abc/cancel', {
       method: 'POST',
-      headers: { Authorization: 'Bearer secret-token', 'X-Admin-Token': 'secret-token' },
+      headers: { Authorization: 'Bearer secret-token' },
     });
   });
 
@@ -135,6 +134,44 @@ describe('Supervisor API client', () => {
       headers: { Authorization: 'Bearer secret-token' },
       signal: expect.any(AbortSignal),
     });
+  });
+});
+
+describe('Admin token on requests', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    useSettingsStore.setState({ adminToken: '' });
+  });
+
+  const authorization = (init?: RequestInit): string | null => new Headers(init?.headers).get('Authorization');
+
+  it('sends the signed-in token with requests that do not pass one', async () => {
+    useSettingsStore.setState({ adminToken: 'secret-token' });
+    const fetchMock = stubFetch({ session_id: 'web:a', inbound_seq: 1, accepted: true });
+
+    await postInbound({ conversation_key: 'web:a', text: 'hi' });
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/v1/inbound');
+    expect(authorization(fetchMock.mock.calls[0][1])).toBe('Bearer secret-token');
+  });
+
+  it('keeps the token off the public health check and instance directory', async () => {
+    useSettingsStore.setState({ adminToken: 'secret-token' });
+    const fetchMock = stubFetch({ current_path: MOUNT, instances: [{ label: '本实例', path: MOUNT }] });
+
+    await checkHealth();
+    await getInstanceDirectory();
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(['/v1/health', '/v1/instance-directory']);
+    expect(fetchMock.mock.calls.map(([, init]) => authorization(init))).toEqual([null, null]);
+  });
+
+  it('sends nothing extra when nobody is signed in', async () => {
+    const fetchMock = stubFetch({ session_id: 'web:a', inbound_seq: 1, accepted: true });
+
+    await postInbound({ conversation_key: 'web:a', text: 'hi' });
+
+    expect(authorization(fetchMock.mock.calls[0][1])).toBeNull();
   });
 });
 

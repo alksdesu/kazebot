@@ -11,24 +11,43 @@ import {
   getProviders,
   getRuntimeRaw,
   updateNodeRaw,
-  updateRuntimeRaw,
   type ProviderOptionsCatalog,
   type ProvidersResponse,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { Block, Empty, Facts, Footnote, Panel, SaveBar, Segmented } from './components';
 import { FallbackChain } from './FallbackChain';
-import { NodeYamlShapeError, readYamlScalar, upsertYamlNested } from './nodeYaml';
-import { OptionRow, toYamlScalar, visibleSpecs } from './optionFields';
+import { OptionRow, shownFromValue, valueFromShown, visibleSpecs } from './optionFields';
 import { wireOf } from './channelFields';
+import { commitRuntimeKeys, commitYamlKeys } from './yamlCommit';
+import { parseYamlMapping, readYamlPath, type YamlKeyEdit } from './yamlRewrite';
+import { savedMessage } from '../utils/sentence';
+import { errorMessage } from '../api/request';
 
 const GLOBAL = '__global__';
-
-const say = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 const readScope = (token: string, scope: string) => (
   scope === GLOBAL ? getRuntimeRaw(token) : getNodeRaw(token, scope)
 );
+
+// 全局写 runtime.yaml 本实例那一层；节点写节点文件。两边都只改这次动过的键。
+const commitScope = (token: string, scope: string, edits: readonly YamlKeyEdit[]) => (
+  scope === GLOBAL
+    ? commitRuntimeKeys(token, edits)
+    : commitYamlKeys({
+      read: () => getNodeRaw(token, scope),
+      write: (content, hash) => updateNodeRaw(token, scope, content, hash),
+      edits,
+    })
+);
+
+const parseOrNull = (raw: string): Record<string, unknown> | null => {
+  try {
+    return parseYamlMapping(raw);
+  } catch {
+    return null;
+  }
+};
 
 interface NodeChoice {
   id: string;
@@ -62,7 +81,7 @@ const ModelsPageEditor = () => {
         setCatalog((await getProviderProfiles(token)).options);
         setCatalogError('');
       } catch (error) {
-        setCatalogError(say(error));
+        setCatalogError(errorMessage(error));
       }
       void getProviders(token).then(setProviders).catch(() => undefined);
       void getNodes(token)
@@ -89,7 +108,7 @@ const ModelsPageEditor = () => {
       } catch (error) {
         if (cancelled) return;
         setRaw('');
-        setNote(say(error));
+        setNote(errorMessage(error));
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -101,13 +120,14 @@ const ModelsPageEditor = () => {
   const activeProvider = providers?.active_provider || 'openai';
   const channels = channelChoices(providers || undefined).channels;
   const activeWire = wireOf(activeProvider, channels);
+  const doc = useMemo(() => (raw ? parseOrNull(raw) : null), [raw]);
 
   // 节点没写 provider 就跟随全局活跃渠道，和 engine 的解析顺序一致。
   const scopeProvider = useMemo(() => {
     if (scope === GLOBAL) return '';
     const hit = nodes.find((item) => item.id === scope);
-    return hit?.provider || readYamlScalar(raw, ['provider']) || activeProvider;
-  }, [scope, nodes, raw, activeProvider]);
+    return hit?.provider || shownFromValue(readYamlPath(doc, ['provider'])) || activeProvider;
+  }, [scope, nodes, doc, activeProvider]);
 
   const selected = scope === GLOBAL
     ? (provider || activeWire)
@@ -126,7 +146,7 @@ const ModelsPageEditor = () => {
     scope === GLOBAL ? ['providers', selected, 'options', key] : ['provider_options', key]
   );
 
-  const stored = (key: string): string => (raw ? readYamlScalar(raw, pathFor(key)) : '');
+  const stored = (key: string): string => shownFromValue(readYamlPath(doc, pathFor(key)));
   const shownOf = (key: string): string => (key in edits ? edits[key] : stored(key));
 
   const visible = visibleSpecs(specs, shownOf);
@@ -139,23 +159,18 @@ const ModelsPageEditor = () => {
     setBusy(true);
     try {
       // 只写改过的键，合并到现读的这一版上：别处改的其他键留着，读和写之间又被改了才报冲突。
-      const latest = await readScope(token, scope);
-      let next = latest.content;
-      for (const spec of specs) {
-        if (!(spec.key in edits)) continue;
-        next = upsertYamlNested(next, pathFor(spec.key), toYamlScalar(spec, edits[spec.key]));
-      }
-      if (scope === GLOBAL) await updateRuntimeRaw(token, next, latest.hash);
-      else await updateNodeRaw(token, scope, next, latest.hash);
-      setRaw(next);
+      const changes: YamlKeyEdit[] = specs
+        .filter((spec) => spec.key in edits)
+        .map((spec) => ({ path: pathFor(spec.key), value: valueFromShown(spec, edits[spec.key]) ?? undefined }));
+      const { content, note: rewriteNote, result } = await commitScope(token, scope, changes);
+      setRaw(content);
       setEdits({});
-      setNote(scope === GLOBAL
+      const saved = scope === GLOBAL
         ? '已保存。runtime.yaml 每次任务重新读，下一条消息就用新参数。'
-        : '已保存。节点文件每次任务重新读，立刻生效。');
+        : '已保存。节点文件每次任务重新读，立刻生效。';
+      setNote(savedMessage(saved, rewriteNote, result.warnings));
     } catch (error) {
-      setNote(error instanceof NodeYamlShapeError
-        ? `${error.message}（没有写入，文件原样保留）`
-        : say(error));
+      setNote(errorMessage(error));
     }
     setBusy(false);
   };

@@ -20,14 +20,13 @@ import { useSettingsStore } from '../store/settingsStore';
 import { ChannelOptions, wireOf } from './channelFields';
 import { Block, Button, Check, Desc, Empty, Facts, Input, Item, Panel, SaveBar, Segmented, Select } from './components';
 import { OptionRow, shownFromValue, valueFromShown, visibleSpecs } from './optionFields';
+import { errorMessage } from '../api/request';
 
 /** 编辑态。api_key 单独存：空串表示不改，不是清空。 */
 interface Draft extends FallbackEntryPublic {
   origin: number | null;
   apiKeyInput: string;
 }
-
-const say = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 const toDraft = (entry: FallbackEntryPublic, index: number): Draft => ({
   ...entry,
@@ -263,7 +262,7 @@ export const FallbackChain = ({
       onSaved(await action(token));
       setNote({ scope, text: done });
     } catch (error) {
-      setNote({ scope, text: say(error) });
+      setNote({ scope, text: errorMessage(error) });
     }
     setBusy(false);
   };

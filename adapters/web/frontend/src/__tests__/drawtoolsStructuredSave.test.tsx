@@ -16,6 +16,8 @@ vi.mock('../api/supervisorClient', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../api/supervisorClient')>()),
   cleanupDrawtoolsAttachments: vi.fn(),
   getDrawtoolsBundle: vi.fn(),
+  getDrawtoolsCharactersRaw: vi.fn(),
+  getDrawtoolsSettingsRaw: vi.fn(),
   getNodeRaw: vi.fn(),
   initDrawtoolsConfigs: vi.fn(),
   updateDrawtoolsCharactersRaw: vi.fn(),
@@ -94,13 +96,20 @@ const bundle = (settings = SETTINGS_YAML, characters = CHARACTERS_YAML): Drawtoo
   prompts: {},
 });
 
-const serve = (data: DrawtoolsBundle): void => { vi.mocked(api.getDrawtoolsBundle).mockResolvedValue(data); };
+/** 结构化字段保存前按单份接口重读最新那份；没被别处改过时它和整包里的一样。 */
+const serveRaw = (data: DrawtoolsBundle): void => {
+  vi.mocked(api.getDrawtoolsSettingsRaw).mockResolvedValue({ content: data.settings.content, hash: data.settings.hash ?? null });
+  vi.mocked(api.getDrawtoolsCharactersRaw).mockResolvedValue({ content: data.character_tags.content, hash: data.character_tags.hash ?? null });
+};
+
+const serve = (data: DrawtoolsBundle): void => { vi.mocked(api.getDrawtoolsBundle).mockResolvedValue(data); serveRaw(data); };
 
 /** 首读照常给，保存之后那一次由测试自己决定什么时候回来。 */
 function holdReload(first = bundle()): { resolve: (data: DrawtoolsBundle) => void; reject: (reason: unknown) => void } {
   let handles!: { resolve: (data: DrawtoolsBundle) => void; reject: (reason: unknown) => void };
   const held = new Promise<DrawtoolsBundle>((resolve, reject) => { handles = { resolve, reject }; });
   vi.mocked(api.getDrawtoolsBundle).mockResolvedValueOnce(first).mockReturnValueOnce(held);
+  serveRaw(first);
   return handles;
 }
 
@@ -202,7 +211,7 @@ describe('绘图设置的结构化写回', () => {
 
   it('提示本身没句号时补一个，两句不会粘成一句', async () => {
     serve(bundle(
-      'params: {selected_preset_id: soft, presets: [{id: soft, name: 柔光}, {id: hard, name: 硬光}]}\n',
+      '# 默认预设\nparams: {selected_preset_id: soft, presets: [{id: soft, name: 柔光}, {id: hard, name: 硬光}]}\n',
     ));
 
     render(<DrawtoolsSettingsPage />);
@@ -232,6 +241,43 @@ describe('绘图设置的结构化写回', () => {
       '',
     ].join('\n'));
     expect(await statusText()).toBe(`已保存角色字段：aliases。${BLOCK_COMMENTS_DROPPED}。`);
+  });
+
+  // 写之前重读最新那份：别处只动了别的节，这次的改动合进去，交回的是最新的指纹。
+  it('别处改了别的节，这次的改动合进最新那份', async () => {
+    const latest = SETTINGS_YAML.replace('request_delay_sec: 0', 'request_delay_sec: 3');
+    vi.mocked(api.getDrawtoolsSettingsRaw).mockResolvedValue({ content: latest, hash: 'settings-9' });
+    render(<DrawtoolsSettingsPage />);
+    await waitFor(() => expect(baseUrlBox()).toHaveValue('https://image.novelai.net'));
+
+    fireEvent.blur(baseUrlBox(), { target: { value: 'https://relay.example' } });
+
+    await waitFor(() => expect(api.updateDrawtoolsSettingsRaw).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.updateDrawtoolsSettingsRaw).mock.calls[0].slice(1)).toEqual([
+      latest.replace('"https://image.novelai.net"', 'https://relay.example'),
+      'settings-9',
+    ]);
+  });
+
+  it('别处改了同一节就不写，说清是哪一节', async () => {
+    vi.mocked(api.getDrawtoolsSettingsRaw).mockResolvedValue({ content: SETTINGS_YAML.replace('NOVELAI_API_KEY', 'OTHER_KEY'), hash: 'settings-9' });
+    render(<DrawtoolsSettingsPage />);
+    await waitFor(() => expect(baseUrlBox()).toHaveValue('https://image.novelai.net'));
+
+    fireEvent.blur(baseUrlBox(), { target: { value: 'https://relay.example' } });
+
+    expect(await statusText()).toBe('409 api 在打开之后被别处改过，没有覆盖');
+    expect(api.updateDrawtoolsSettingsRaw).not.toHaveBeenCalled();
+  });
+
+  it('保存通过但后端带着提醒，每条都接在结果后面', async () => {
+    vi.mocked(api.updateDrawtoolsSettingsRaw).mockResolvedValue({ ok: true, hash: 'settings-2', warnings: ['这些键没有任何地方读：api.extra'] });
+    render(<DrawtoolsSettingsPage />);
+    await waitFor(() => expect(baseUrlBox()).toHaveValue('https://image.novelai.net'));
+
+    fireEvent.blur(baseUrlBox(), { target: { value: 'https://relay.example' } });
+
+    expect(await statusText()).toBe('API 配置已保存。这些键没有任何地方读：api.extra');
   });
 });
 
@@ -417,7 +463,7 @@ describe('分析节点那一栏', () => {
   const settled = () => waitFor(() => expect(rawEditor()).toHaveValue(SETTINGS_YAML));
 
   it('节点文件还没建就按空文件编辑，保存把它建出来', async () => {
-    vi.mocked(api.getNodeRaw).mockRejectedValue(new Error('404 Not Found'));
+    vi.mocked(api.getNodeRaw).mockRejectedValue(new api.ApiError(404, 'Not Found'));
     render(<DrawtoolsSettingsPage />);
     await settled();
 
@@ -436,7 +482,7 @@ describe('分析节点那一栏', () => {
   });
 
   it('别的读失败就锁住这一栏，说清为什么不让改', async () => {
-    vi.mocked(api.getNodeRaw).mockRejectedValue(new Error(NODE_FAILURE));
+    vi.mocked(api.getNodeRaw).mockRejectedValue(new api.ApiError(503, '读不到节点文件'));
     render(<DrawtoolsSettingsPage />);
     await settled();
 

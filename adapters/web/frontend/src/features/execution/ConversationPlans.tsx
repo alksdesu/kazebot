@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { errorMessage } from '../../api/request';
 import { getConversations } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
 import { startPolling } from '../../utils/polling';
@@ -29,7 +30,7 @@ export function ConversationPlans({ sessionId }: { sessionId: string }) {
           setPlans(readExecutionPlans(data).filter(plan => !['cancelled', 'completed'].includes(plan.status)).slice(0, 5));
           setError('');
         }
-      } catch (failure) { if (alive && request === generation) setError(String(failure)); }
+      } catch (failure) { if (alive && request === generation) setError(errorMessage(failure)); }
     }
     const stop = startPolling(refresh, 5000, { first: refresh });
     const update = () => void refresh();

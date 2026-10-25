@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { errorMessage, isEditConflict } from '../../api/request';
 import { featureRequest } from '../client';
 import { ScopeSelect } from '../execution/ScopeSelect';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
@@ -97,7 +98,7 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
   }, [viewKey]);
   useEffect(() => {
     const controller = new AbortController(); setLoading(picker.valid);
-    if (picker.valid) void refresh(controller.signal).catch(reason => { if (!controller.signal.aborted && isCurrent()) { setError(String(reason)); setLoading(false); } });
+    if (picker.valid) void refresh(controller.signal).catch(reason => { if (!controller.signal.aborted && isCurrent()) { setError(errorMessage(reason)); setLoading(false); } });
     return () => { controller.abort(); requestSequence.current++; };
   }, [refresh]);
 
@@ -106,7 +107,7 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
     mutating.current = true; const mutation = ++mutationSequence.current; requestSequence.current++;
     setBusy(true); setError(''); setNotice('');
     try { await action(); if (isCurrent() && message) setNotice(message); }
-    catch (reason) { if (isCurrent()) { setError(String(reason)); if (/409|版本|冲突/.test(String(reason))) setConflict(true); } }
+    catch (reason) { if (isCurrent()) { setError(errorMessage(reason)); if (isEditConflict(reason)) setConflict(true); } }
     finally { if (mutation === mutationSequence.current && isCurrent()) { mutating.current = false; setBusy(false); setLoading(false); } }
   };
   const reload = () => {

@@ -1,17 +1,16 @@
-// [2026-06-02] MCP client settings page.
-// Why: MCP clients are configured in one YAML file but operators need a parsed list
-// and a field editor. How: show only the client list and selection actions in the
-// center page, then let the Settings right panel edit and save the selected client.
-// Purpose: MCP configuration is easier to scan while raw writeback remains available.
+// MCP Client 列表页：中间列出各个 Client，新建和删除在这里，选中的那个在右栏编辑。
 import { useEffect, useRef, useState } from 'react';
 
+import { errorMessage } from '../../../api/request';
 import { getMcpClients, getMcpClientsRaw, updateMcpClientsRaw, type McpClient } from '../../../api/supervisorClient';
+import { commitYamlKeys } from '../../../console/yamlCommit';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
+import { savedMessage } from '../../../utils/sentence';
 import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
-import { parseMcpClients, serializeMcpClients, type McpClientFormState } from '../settingsStructuredConfig';
+import { mcpClientCreateEdits, mcpClientRemoveEdits, type McpClientFormState } from '../settingsStructuredConfig';
 
 function emptyMcpClient(id: string): McpClientFormState {
   // [2026-06-02] Create a valid MCP client draft for the form writer. Why: the
@@ -48,7 +47,7 @@ export const McpSettingsPage = () => {
       setLoadError('');
     } catch (error) {
       if (version !== generation.current) return;
-      setLoadError(error instanceof Error ? error.message : '加载 MCP 配置失败');
+      setLoadError(errorMessage(error, '加载 MCP 配置失败'));
     } finally {
       if (version === generation.current) setLoading(false);
     }
@@ -79,22 +78,22 @@ export const McpSettingsPage = () => {
     if (!confirmNavigation()) return;
     mutation.current = true; setBusy(true);
     try {
-      const file = await getMcpClientsRaw(adminToken);
-      if (tokenChanged(adminToken)) return;
-      const forms = parseMcpClients(file.content);
-      if (forms.some((client) => client.id === id)) { setMessage('该 MCP Client 已存在'); return; }
-      const nextForms = [...forms, emptyMcpClient(id)];
-      await updateMcpClientsRaw(adminToken, serializeMcpClients(nextForms, file.content), file.hash);
+      const { note, result } = await commitYamlKeys({
+        read: () => getMcpClientsRaw(adminToken),
+        write: (content, hash) => updateMcpClientsRaw(adminToken, content, hash),
+        edits: (base) => mcpClientCreateEdits(base, emptyMcpClient(id)),
+        proceed: () => !tokenChanged(adminToken),
+      });
       if (tokenChanged(adminToken)) return;
       setNewId('');
-      setMessage('Client 已创建但尚未启用，请在右栏填写连接信息后启用。');
+      setMessage(savedMessage('Client 已创建但尚未启用，请在右栏填写连接信息后启用。', note, result.warnings));
       await load();
       if (tokenChanged(adminToken)) return;
       setSelectedMcpClient({ id, enabled: false, transport: 'streamable_http', description: '通过设置页面创建的 MCP Client。' });
       setRightPanelOpen(true);
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '创建 MCP Client 失败');
+      setMessage(errorMessage(error, '创建 MCP Client 失败'));
     } finally { mutation.current = false; setBusy(false); }
   };
 
@@ -104,17 +103,19 @@ export const McpSettingsPage = () => {
     if (!confirmNavigation()) return;
     mutation.current = true; setBusy(true);
     try {
-      const file = await getMcpClientsRaw(adminToken);
-      if (tokenChanged(adminToken)) return;
-      const nextForms = parseMcpClients(file.content).filter((client) => client.id !== selectedMcpClient.id);
-      await updateMcpClientsRaw(adminToken, serializeMcpClients(nextForms, file.content), file.hash);
+      const { note, result } = await commitYamlKeys({
+        read: () => getMcpClientsRaw(adminToken),
+        write: (content, hash) => updateMcpClientsRaw(adminToken, content, hash),
+        edits: (base) => mcpClientRemoveEdits(base, selectedMcpClient.id),
+        proceed: () => !tokenChanged(adminToken),
+      });
       if (tokenChanged(adminToken)) return;
       setSelectedMcpClient(null);
-      setMessage('MCP Client 已删除');
+      setMessage(savedMessage('MCP Client 已删除', note, result.warnings));
       await load();
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '删除 MCP Client 失败');
+      setMessage(errorMessage(error, '删除 MCP Client 失败'));
     } finally { mutation.current = false; setBusy(false); }
   };
 

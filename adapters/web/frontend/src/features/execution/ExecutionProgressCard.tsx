@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { errorMessage } from '../../api/request';
 import { startPolling } from '../../utils/polling';
 import { downloadFeature, featureRequest } from '../client';
 import { useRequestScope } from '../asyncState';
@@ -21,7 +22,7 @@ export function ExecutionProgressCard({ planId, scope }: { planId: string; scope
       if (mutating.current) return;
       const request = ++sequence.current;
       try { const value = await featureRequest<unknown>(`/v1/execution/plans/${planId}`, { scope }); if (alive && request === sequence.current) { setPlan(readExecutionPlan(value)); setReadError(''); } }
-      catch (reason) { if (alive && request === sequence.current) setReadError(String(reason)); }
+      catch (reason) { if (alive && request === sequence.current) setReadError(errorMessage(reason)); }
     };
     const stop = startPolling(refresh, 3000, { first: refresh });
     return () => { alive = false; sequence.current++; stop(); };
@@ -30,7 +31,7 @@ export function ExecutionProgressCard({ planId, scope }: { planId: string; scope
   const action = async (name: string) => {
     if (mutating.current) return;
     mutating.current = true; sequence.current++; setBusy(true);
-    try { setError(''); const next = readExecutionPlan(await featureRequest<unknown>(`/v1/execution/plans/${planId}/${name}`, { scope, method: 'POST', body: { expected_revision: plan.revision, step_ids: [] } })); if (identity.isCurrent()) setPlan(next); } catch (reason) { if (identity.isCurrent()) setError(String(reason)); } finally { if (identity.isCurrent()) { mutating.current = false; setBusy(false); } }
+    try { setError(''); const next = readExecutionPlan(await featureRequest<unknown>(`/v1/execution/plans/${planId}/${name}`, { scope, method: 'POST', body: { expected_revision: plan.revision, step_ids: [] } })); if (identity.isCurrent()) setPlan(next); } catch (reason) { if (identity.isCurrent()) setError(errorMessage(reason)); } finally { if (identity.isCurrent()) { mutating.current = false; setBusy(false); } }
   };
   return <section className="min-w-0 space-y-3 border border-[var(--duties-border)] p-3 text-sm [overflow-wrap:anywhere]" aria-label="计划步骤进度">
     <h3 className="font-semibold">{plan.goal} · {statusLabel[plan.status]}</h3><p className="text-sm">{plan.id} · 版本 {plan.revision} · {plan.work_scope}</p>
@@ -45,6 +46,6 @@ export function ExecutionProgressCard({ planId, scope }: { planId: string; scope
     <div className="flex flex-wrap gap-2">{plan.status === 'draft' && <button disabled={busy} className={primaryClass} onClick={() => void action('confirm')}>确认此版本执行</button>}
       {!['completed', 'cancelled'].includes(plan.status) && <button disabled={busy} className={actionClass} onClick={() => void action('cancel')}>停止</button>}
       {['partial', 'failed'].includes(plan.status) && <button disabled={busy} className={actionClass} onClick={() => void action('retry')}>只重试失败步骤</button>}
-      {plan.artifacts.map(artifact => <button disabled={busy} className={actionClass} key={artifact.id} onClick={() => void downloadFeature(`/v1/execution/artifacts/${artifact.id}`, artifact.name, scope).catch(reason => setError(String(reason)))}>下载 {artifact.name}</button>)}</div>
+      {plan.artifacts.map(artifact => <button disabled={busy} className={actionClass} key={artifact.id} onClick={() => void downloadFeature(`/v1/execution/artifacts/${artifact.id}`, artifact.name, scope).catch(reason => setError(errorMessage(reason)))}>下载 {artifact.name}</button>)}</div>
   </section>;
 }

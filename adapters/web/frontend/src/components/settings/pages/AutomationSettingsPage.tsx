@@ -1,17 +1,16 @@
-// [2026-06-02] Automation settings page for schedules.yaml.
-// Why: scheduled tasks are operational automation and should be visible as parsed
-// rows rather than only raw YAML. How: parse schedules.yaml into a list, keep create
-// and delete actions here, and render the selected task form in the Settings right
-// panel. Purpose: common schedule edits become safer while raw YAML fallback remains.
+// 定时任务列表页：中间列出 schedules.yaml 里的任务，新建和删除在这里，选中的那个在右栏编辑。
 import { useEffect, useRef, useState } from 'react';
 
+import { errorMessage } from '../../../api/request';
 import { getSchedulesRaw, updateSchedulesRaw } from '../../../api/supervisorClient';
+import { commitYamlKeys } from '../../../console/yamlCommit';
 import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { tokenChanged, useSettingsStore } from '../../../store/settingsStore';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
+import { savedMessage } from '../../../utils/sentence';
 import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
-import { parseSchedules, serializeSchedules, type ScheduleFormState } from '../settingsStructuredConfig';
+import { parseSchedules, scheduleCreateEdits, scheduleRemoveEdits, type ScheduleFormState } from '../settingsStructuredConfig';
 
 function emptySchedule(id: string): ScheduleFormState {
   // [2026-06-02] Provide a normalized schedule draft. Why: the backend exposes only
@@ -48,7 +47,7 @@ export const AutomationSettingsPage = () => {
       setLoadError('');
     } catch (error) {
       if (version !== generation.current) return;
-      setLoadError(error instanceof Error ? error.message : '加载定时任务失败');
+      setLoadError(errorMessage(error, '加载定时任务失败'));
     } finally {
       if (version === generation.current) setLoading(false);
     }
@@ -78,22 +77,22 @@ export const AutomationSettingsPage = () => {
     if (!confirmNavigation()) return;
     mutation.current = true; setBusy(true);
     try {
-      const file = await getSchedulesRaw(adminToken);
-      if (tokenChanged(adminToken)) return;
-      const current = parseSchedules(file.content);
-      if (current.some((schedule) => schedule.id === id)) { setMessage('该任务 ID 已存在'); return; }
-      const next = [...current, emptySchedule(id)];
-      await updateSchedulesRaw(adminToken, serializeSchedules(next, file.content), file.hash);
+      const { note, result } = await commitYamlKeys({
+        read: () => getSchedulesRaw(adminToken),
+        write: (content, hash) => updateSchedulesRaw(adminToken, content, hash),
+        edits: (base) => scheduleCreateEdits(base, emptySchedule(id)),
+        proceed: () => !tokenChanged(adminToken),
+      });
       if (tokenChanged(adminToken)) return;
       setNewId('');
-      setMessage('任务已创建但尚未启用，请在右栏填写内容后启用。');
+      setMessage(savedMessage('任务已创建但尚未启用，请在右栏填写内容后启用。', note, result.warnings));
       await load();
       if (tokenChanged(adminToken)) return;
       setSelectedScheduleId(id);
       setRightPanelOpen(true);
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '创建定时任务失败');
+      setMessage(errorMessage(error, '创建定时任务失败'));
     } finally { mutation.current = false; setBusy(false); }
   };
 
@@ -103,17 +102,19 @@ export const AutomationSettingsPage = () => {
     if (!confirmNavigation()) return;
     mutation.current = true; setBusy(true);
     try {
-      const file = await getSchedulesRaw(adminToken);
-      if (tokenChanged(adminToken)) return;
-      const next = parseSchedules(file.content).filter((schedule) => schedule.id !== selectedScheduleId);
-      await updateSchedulesRaw(adminToken, serializeSchedules(next, file.content), file.hash);
+      const { note, result } = await commitYamlKeys({
+        read: () => getSchedulesRaw(adminToken),
+        write: (content, hash) => updateSchedulesRaw(adminToken, content, hash),
+        edits: (base) => scheduleRemoveEdits(base, selectedScheduleId),
+        proceed: () => !tokenChanged(adminToken),
+      });
       if (tokenChanged(adminToken)) return;
       setSelectedScheduleId(null);
-      setMessage('定时任务已删除');
+      setMessage(savedMessage('定时任务已删除', note, result.warnings));
       await load();
     } catch (error) {
       if (tokenChanged(adminToken)) return;
-      setMessage(error instanceof Error ? error.message : '删除定时任务失败');
+      setMessage(errorMessage(error, '删除定时任务失败'));
     } finally { mutation.current = false; setBusy(false); }
   };
 

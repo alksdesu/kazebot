@@ -1,7 +1,4 @@
-// [2026-06-01] Auto-approval tests for browser-local tool rules.
-// Why: frontend builds can allow selected low-risk tools without changing backend policy.
-// How: replay an approval event through chatStore and assert decideApproval is called.
-// Purpose: approval automation remains tied to clientPrefsStore and visible tool cards.
+// Browser-local auto-approval: approval events replayed through chatStore decide the configured tools.
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -9,6 +6,7 @@ import { ToolCallCard } from '../components/chat/v2';
 import * as supervisorClient from '../api/supervisorClient';
 import { useClientPrefsStore } from '../store/clientPrefsStore';
 import { useChatStore } from '../store/chatStore';
+import { useSettingsStore } from '../store/settingsStore';
 import type { SupervisorEvent } from '../types/chat';
 import type { ToolExecution } from '../types/message';
 
@@ -50,6 +48,10 @@ class FakeWebSocket {
 
 const now = '2026-06-01T14:10:00.000Z';
 
+const TOKEN = 'admin-token';
+
+const allowed = (approvalId: string): supervisorClient.AdminApproval => ({ approval_id: approvalId, operation: 'read_file', status: 'allowed' });
+
 function event(seq: number, type: string, payload: Record<string, unknown>): SupervisorEvent {
   return { seq, event_id: `auto-${seq}`, ts: now, session_id: 'sess-auto', type, payload };
 }
@@ -80,18 +82,20 @@ describe('client auto-approval', () => {
     localStorage.clear();
     useClientPrefsStore.getState().resetClientPrefs();
     useChatStore.getState().resetState();
+    useSettingsStore.setState({ adminToken: TOKEN, isAuthenticated: true });
     vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket);
   });
 
   afterEach(() => {
     useChatStore.getState().resetState();
     useClientPrefsStore.getState().resetClientPrefs();
+    useSettingsStore.setState({ adminToken: '', isAuthenticated: false });
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
   it('automatically allows configured approval requests from the WebSocket stream', async () => {
-    const approvalSpy = vi.spyOn(supervisorClient, 'decideApproval').mockResolvedValue({ ok: true });
+    const approvalSpy = vi.spyOn(supervisorClient, 'decideApproval').mockResolvedValue(allowed('approval-auto'));
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       if (String(input).endsWith('/v1/inbound')) {
         return new Response(JSON.stringify({ session_id: 'sess-auto', inbound_seq: 1, accepted: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -107,13 +111,34 @@ describe('client auto-approval', () => {
     ws.receive(event(2, 'tool_call_start', { source_inbound_seq: 1, tool_call_id: 'call-auto', tool_name: 'read_file', arguments: { path: 'README.md' } }));
     ws.receive(event(3, 'approval_requested', { source_inbound_seq: 1, approval_id: 'approval-auto', tool_call_id: 'call-auto', operation: 'read_file', details: { path: 'README.md' }, status: 'pending' }));
 
-    await waitFor(() => expect(approvalSpy).toHaveBeenCalledWith('', 'approval-auto', 'allow', 'auto-approved by client preference'));
+    await waitFor(() => expect(approvalSpy).toHaveBeenCalledWith(TOKEN, 'approval-auto', 'allow', 'auto-approved by client preference'));
 
-    // [2026-06-02] Why: auto-approved ids used to be module-only state and were lost
-    // after a browser refresh. How: assert the dedicated localStorage cache receives
-    // the id when the store submits an automatic approval. Purpose: refreshed clients
-    // keep treating the same pending request as already handled locally.
+    // 刷新页面之后同一条待审批不能再自动放一次，记过的 id 要落到 localStorage。
     expect(JSON.parse(localStorage.getItem('clonoth_auto_approved_ids') || '[]')).toContain('approval-auto');
+  });
+
+  // 退出登录之后令牌是空的：发出去也是一个必然的 401，还会算进鉴权失败的退避里。
+  it('leaves approvals alone when nobody is logged in', async () => {
+    useSettingsStore.setState({ adminToken: '', isAuthenticated: false });
+    const approvalSpy = vi.spyOn(supervisorClient, 'decideApproval').mockResolvedValue(allowed('approval-auto'));
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/v1/inbound')) {
+        return new Response(JSON.stringify({ session_id: 'sess-auto', inbound_seq: 1, accepted: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+
+    const conversationId = useChatStore.getState().createConversation();
+    await useChatStore.getState().sendMessage('read file', undefined, 'ereuna_main');
+    const ws = FakeWebSocket.instances[0];
+    ws.open();
+    ws.receive(event(1, 'inbound_message', { conversation_key: `web:${conversationId}`, text: 'read file' }));
+    ws.receive(event(2, 'tool_call_start', { source_inbound_seq: 1, tool_call_id: 'call-auto', tool_name: 'read_file', arguments: { path: 'README.md' } }));
+    ws.receive(event(3, 'approval_requested', { source_inbound_seq: 1, approval_id: 'approval-auto', tool_call_id: 'call-auto', operation: 'read_file', details: { path: 'README.md' }, status: 'pending' }));
+
+    await Promise.resolve();
+    expect(approvalSpy).not.toHaveBeenCalled();
+    expect(JSON.parse(localStorage.getItem('clonoth_auto_approved_ids') || '[]')).not.toContain('approval-auto');
   });
 
   it('removes a failed automatic approval id from localStorage', async () => {
@@ -133,7 +158,7 @@ describe('client auto-approval', () => {
     ws.receive(event(2, 'tool_call_start', { source_inbound_seq: 1, tool_call_id: 'call-auto', tool_name: 'read_file', arguments: { path: 'README.md' } }));
     ws.receive(event(3, 'approval_requested', { source_inbound_seq: 1, approval_id: 'approval-auto', tool_call_id: 'call-auto', operation: 'read_file', details: { path: 'README.md' }, status: 'pending' }));
 
-    await waitFor(() => expect(approvalSpy).toHaveBeenCalledWith('', 'approval-auto', 'allow', 'auto-approved by client preference'));
+    await waitFor(() => expect(approvalSpy).toHaveBeenCalledWith(TOKEN, 'approval-auto', 'allow', 'auto-approved by client preference'));
     await waitFor(() => expect(JSON.parse(localStorage.getItem('clonoth_auto_approved_ids') || '[]')).not.toContain('approval-auto'));
   });
 
@@ -158,7 +183,7 @@ describe('client auto-approval', () => {
   it('does not auto-approve another tool that reports the same policy operation', async () => {
     // apply_diff 送审时报的 op 就是 write_file，勾 write_file 不该把它一起放掉。
     useClientPrefsStore.getState().setAutoApproveTool('write_file', true);
-    const approvalSpy = vi.spyOn(supervisorClient, 'decideApproval').mockResolvedValue({ ok: true });
+    const approvalSpy = vi.spyOn(supervisorClient, 'decideApproval').mockResolvedValue(allowed('approval-diff'));
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       if (String(input).endsWith('/v1/inbound')) {
         return new Response(JSON.stringify({ session_id: 'sess-auto', inbound_seq: 1, accepted: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -181,7 +206,7 @@ describe('client auto-approval', () => {
 
   it('does not auto-approve a read-only tool that switches to a write operation', async () => {
     // search_in_files 的 replace 模式报 write_file，而 search_in_files 是默认勾上的。
-    const approvalSpy = vi.spyOn(supervisorClient, 'decideApproval').mockResolvedValue({ ok: true });
+    const approvalSpy = vi.spyOn(supervisorClient, 'decideApproval').mockResolvedValue(allowed('approval-replace'));
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       if (String(input).endsWith('/v1/inbound')) {
         return new Response(JSON.stringify({ session_id: 'sess-auto', inbound_seq: 1, accepted: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -203,7 +228,7 @@ describe('client auto-approval', () => {
 
   it('auto-approves a tool whose policy operation is not its own name', async () => {
     // list_dir 报的是 read_file，改用工具名匹配之后这个默认勾选才第一次真正生效。
-    const approvalSpy = vi.spyOn(supervisorClient, 'decideApproval').mockResolvedValue({ ok: true });
+    const approvalSpy = vi.spyOn(supervisorClient, 'decideApproval').mockResolvedValue(allowed('approval-list'));
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       if (String(input).endsWith('/v1/inbound')) {
         return new Response(JSON.stringify({ session_id: 'sess-auto', inbound_seq: 1, accepted: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -219,11 +244,11 @@ describe('client auto-approval', () => {
     ws.receive(event(2, 'tool_call_start', { source_inbound_seq: 1, tool_call_id: 'call-list', tool_name: 'list_dir', arguments: { path: 'src' } }));
     ws.receive(event(3, 'approval_requested', { source_inbound_seq: 1, approval_id: 'approval-list', tool_call_id: 'call-list', operation: 'read_file', details: { path: 'src' }, status: 'pending' }));
 
-    await waitFor(() => expect(approvalSpy).toHaveBeenCalledWith('', 'approval-list', 'allow', 'auto-approved by client preference'));
+    await waitFor(() => expect(approvalSpy).toHaveBeenCalledWith(TOKEN, 'approval-list', 'allow', 'auto-approved by client preference'));
   });
 
   it('stays manual when the approval cannot be traced back to a tool card', async () => {
-    const approvalSpy = vi.spyOn(supervisorClient, 'decideApproval').mockResolvedValue({ ok: true });
+    const approvalSpy = vi.spyOn(supervisorClient, 'decideApproval').mockResolvedValue(allowed('approval-orphan'));
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       if (String(input).endsWith('/v1/inbound')) {
         return new Response(JSON.stringify({ session_id: 'sess-auto', inbound_seq: 1, accepted: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });

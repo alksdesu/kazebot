@@ -75,6 +75,11 @@ const withApproval = (): AdminState => adminState({ pending_approvals: [approval
 
 const withApprovals = (...items: AdminApproval[]): AdminState => adminState({ pending_approvals: items });
 
+/** 服务端照这次的决定落下之后回的那条审批。 */
+const decided = async (_token: string | undefined, approvalId: string, decision: 'allow' | 'deny'): Promise<AdminApproval> => (
+  { approval_id: approvalId, operation: 'execute_command', status: decision === 'allow' ? 'allowed' : 'denied' }
+);
+
 /** 当前选中那条的 id，没选就是 null。 */
 const selectedId = (): string | null => useSettingsSelectionStore.getState().selectedApproval?.approval_id ?? null;
 
@@ -101,7 +106,7 @@ beforeEach(() => {
   useSettingsStore.setState({ adminToken: 'admin-token', isAuthenticated: true });
   useSettingsSelectionStore.setState({ selectedApproval: null, systemLogs: [] });
   vi.mocked(api.checkHealth).mockResolvedValue({ status: 'ok', uptime_seconds: 60 });
-  vi.mocked(api.decideApproval).mockResolvedValue({ ok: true });
+  vi.mocked(api.decideApproval).mockImplementation(decided);
   vi.mocked(api.reloadConfig).mockResolvedValue({ ok: true });
   vi.mocked(api.restartEngine).mockResolvedValue({ scheduled: true, target: 'engine' });
 });
@@ -229,7 +234,7 @@ describe('审批页两次读取撞车', () => {
 describe('审批页写完发现换了人', () => {
   it('允许之后既不写提示，也不拿旧 token 重读', async () => {
     vi.mocked(api.getAdminState).mockResolvedValue(withApproval());
-    vi.mocked(api.decideApproval).mockImplementation(async () => { swapToken(); return { ok: true }; });
+    vi.mocked(api.decideApproval).mockImplementation(async (token, id, decision) => { swapToken(); return decided(token, id, decision); });
     render(<ApprovalsSettingsPage />);
     await tick();
 
@@ -244,7 +249,7 @@ describe('审批页写完发现换了人', () => {
 
   it('拒绝之后既不写提示，也不拿旧 token 重读', async () => {
     vi.mocked(api.getAdminState).mockResolvedValue(withApproval());
-    vi.mocked(api.decideApproval).mockImplementation(async () => { swapToken(); return { ok: true }; });
+    vi.mocked(api.decideApproval).mockImplementation(async (token, id, decision) => { swapToken(); return decided(token, id, decision); });
     render(<ApprovalsSettingsPage />);
     await tick();
 

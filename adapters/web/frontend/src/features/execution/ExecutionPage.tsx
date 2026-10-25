@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { errorMessage } from '../../api/request';
 import { uploadAttachment } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
 import { featureRequest, downloadFeature } from '../client';
@@ -42,13 +43,13 @@ export function ExecutionPage({ scope: initialScope = 'web:console' }: { scope?:
       const plans = readExecutionPlans(response);
       setPlans(plans); setReadError('');
       setSelected(current => current ? plans.find(plan => plan.id === current.id) || current : null);
-    } catch (reason) { if (identity.isCurrent() && request === sequence.current) setReadError(String(reason)); }
+    } catch (reason) { if (identity.isCurrent() && request === sequence.current) setReadError(errorMessage(reason)); }
     finally { if (identity.isCurrent() && request === sequence.current) setLoading(false); }
   }, [scope]);
   useEffect(() => {
     setLoading(true); setReadError(''); setTools([]);
     const stop = startPolling(async () => { if (!mutating.current) await refresh(); }, 3000, { first: refresh });
-    void featureRequest<{ tools: ToolOption[] }>('/v1/execution/tools', { scope }).then(result => { if (identity.isCurrent()) setTools(Array.isArray(result?.tools) ? result.tools : []); }).catch(reason => { if (identity.isCurrent()) setError(`工具列表读取失败：${String(reason)}`); });
+    void featureRequest<{ tools: ToolOption[] }>('/v1/execution/tools', { scope }).then(result => { if (identity.isCurrent()) setTools(Array.isArray(result?.tools) ? result.tools : []); }).catch(reason => { if (identity.isCurrent()) setError(`工具列表读取失败：${errorMessage(reason)}`); });
     return () => { stop(); sequence.current++; };
   }, [refresh, scope]);
   const choose = (plan: ExecutionPlan | null) => {
@@ -57,7 +58,7 @@ export function ExecutionPage({ scope: initialScope = 'web:console' }: { scope?:
   const run = async (action: () => Promise<void>) => {
     if (mutating.current) return;
     mutating.current = true; sequence.current++; setBusy(true); setError(''); setNotice('');
-    try { await action(); if (identity.isCurrent()) { await refresh(); setNotice('操作已完成。'); } } catch (reason) { if (identity.isCurrent()) setError(String(reason)); } finally { mutating.current = false; if (identity.isCurrent()) setBusy(false); }
+    try { await action(); if (identity.isCurrent()) { await refresh(); setNotice('操作已完成。'); } } catch (reason) { if (identity.isCurrent()) setError(errorMessage(reason)); } finally { mutating.current = false; if (identity.isCurrent()) setBusy(false); }
   };
   const preview = () => run(async () => {
     const body = { goal, work_scope: workScope, inputs: sources, steps };

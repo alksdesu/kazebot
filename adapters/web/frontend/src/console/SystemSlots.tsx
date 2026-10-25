@@ -18,6 +18,7 @@ import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
 import { ChannelOptions, EnvHint, FieldRow, HostMismatchHint, ModelField } from './channelFields';
 import { Block, Empty, ErrorText, Facts, Input, Item, ItemTitle, List, SaveBar, Select } from './components';
+import { errorMessage } from '../api/request';
 
 /** 深链锚点。看图渠道等槽位在别的页面只回显，改要回到这里。 */
 export const SYSTEM_SLOTS_ANCHOR = 'system-slots';
@@ -29,8 +30,6 @@ interface Draft {
   provider: string;
   apiKeyInput: string;
 }
-
-const say = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 const toDraft = (slot: SystemModelSlot): Draft => ({
   slot,
@@ -216,7 +215,7 @@ export const SystemSlots = ({ channels, wires, profiles, activeProvider }: {
   useEffect(() => {
     if (!token) return;
     void getSystemModels(token).then(absorb).catch((caught) => {
-      setError(say(caught));
+      setError(errorMessage(caught));
       setLoaded(true);
     });
   }, [token]);
@@ -247,7 +246,7 @@ export const SystemSlots = ({ channels, wires, profiles, activeProvider }: {
         setNote('已保存。下一个任务就用新配置。');
       }
     } catch (caught) {
-      setError(say(caught));
+      setError(errorMessage(caught));
     }
     setBusy(false);
   };

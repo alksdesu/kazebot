@@ -19,10 +19,9 @@ import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
 import { appendSentence } from '../utils/sentence';
 import { Block, Button, Facts, Footnote, Input, ItemTitle, List, Panel, Row, Tag } from './components';
+import { errorMessage } from '../api/request';
 
 const DESC = 'text-xs text-[var(--duties-secondary)]';
-
-const say = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 type Action = 'create' | 'join' | 'leave' | 'delete';
 
@@ -67,7 +66,7 @@ export const ConfigShareGroups = ({ token }: { token: string }) => {
       if (!identity.isCurrent() || request !== sequence.current) return;
       setOverview(next); setError('');
     } catch (failure) {
-      if (identity.isCurrent() && request === sequence.current) setError(say(failure));
+      if (identity.isCurrent() && request === sequence.current) setError(errorMessage(failure));
     } finally {
       if (identity.isCurrent() && request === sequence.current) setLoading(false);
     }
@@ -102,10 +101,10 @@ export const ConfigShareGroups = ({ token }: { token: string }) => {
           ? 'engine 正在重启，工具和节点会换成新配置。'
           : `但 engine 没排上重启（${restart.reason || '已有重启在进行'}），稍后在「运行」里手动重启一次。`));
       } catch (failure) {
-        if (isCurrent()) setNote(appendSentence(message, `但重启 engine 失败：${say(failure)}。稍后在「运行」里手动重启一次。`));
+        if (isCurrent()) setNote(appendSentence(message, `但重启 engine 失败：${errorMessage(failure)}。稍后在「运行」里手动重启一次。`));
       }
     } catch (failure) {
-      if (isCurrent()) setProblem(say(failure));
+      if (isCurrent()) setProblem(errorMessage(failure));
     } finally {
       mutation.current = false;
       if (isCurrent()) setBusy(false);

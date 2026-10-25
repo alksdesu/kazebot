@@ -2,3 +2,5 @@ export { Icon } from './Icon';
 export { StatusDot, getChildNodeStatusLabel } from './StatusDot';
 export { YamlEditor, hasSuspiciousYamlTabs } from './YamlEditor';
 export { Modal } from './Modal';
+export { Markdown } from './Markdown';
+export { AuthorizedImage } from './AuthorizedImage';

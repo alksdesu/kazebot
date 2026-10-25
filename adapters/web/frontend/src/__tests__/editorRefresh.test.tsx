@@ -182,10 +182,10 @@ describe('工具与技能编辑器', () => {
     await waitFor(() => expect(screen.getByLabelText('策略')).toHaveValue('normal'));
 
     fireEvent.change(screen.getByLabelText('order'), { target: { value: '3' } });
-    fireEvent.click(screen.getByRole('button', { name: '保存快捷字段' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存技能' }));
     await waitFor(() => expect(api.updateSkillRaw).toHaveBeenCalledOnce());
     fireEvent.change(screen.getByLabelText('order'), { target: { value: '4' } });
-    fireEvent.click(screen.getByRole('button', { name: '保存快捷字段' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存技能' }));
     await waitFor(() => expect(api.updateSkillRaw).toHaveBeenCalledTimes(2));
 
     expect(vi.mocked(api.updateSkillRaw).mock.calls.map(call => call[3])).toEqual(['skill-1', 'skill-2']);

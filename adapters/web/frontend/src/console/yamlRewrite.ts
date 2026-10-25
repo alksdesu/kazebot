@@ -33,11 +33,28 @@ export interface YamlRewrite {
 export const WHOLE_FILE_REWRITTEN = '原文里有认不出的写法，这次按整份重写，文件里的注释和空行没能保留';
 export const BLOCK_COMMENTS_DROPPED = '改动的那几项是整块重写的，块里原有的注释没能保留';
 
+/** 控制台写回 yaml 用的唯一一套渲染选项。不设 noCompatMode：这些文件都由 PyYAML（YAML 1.1）读回，
+ *  裸写的 on/off/yes/no 会变成布尔、12:30 会变成 750，留着 js-yaml 的兼容引号两边才是同一个值。 */
+export const YAML_DUMP_OPTIONS: yaml.DumpOptions = {
+  indent: 2,
+  lineWidth: -1,
+  noRefs: true,
+  sortKeys: false,
+  quotingType: '"',
+  forceQuotes: false,
+};
+
 type Mapping = Record<string, unknown>;
 
 export type YamlEdit =
   | { op: 'set'; path: string[]; value: unknown; before?: unknown }
   | { op: 'delete'; path: string[] };
+
+/** 表单对一个键的改动。value 为 undefined 表示删掉这个键。 */
+export interface YamlKeyEdit {
+  path: readonly string[];
+  value: unknown;
+}
 
 /** 改完的行，和整块替换时连带丢掉的注释行数。 */
 interface Step {
@@ -378,7 +395,7 @@ function applyEdits(lines: readonly string[], prev: Mapping, next: Mapping, opti
 }
 
 /** 原文解析成映射。原文坏了就不写：照着坏文件合出来的结果谁也说不准。 */
-function parseMapping(raw: string): Mapping {
+export function parseYamlMapping(raw: string): Mapping {
   let loaded: unknown;
   try {
     loaded = yaml.load(raw);
@@ -399,11 +416,26 @@ function reparsesTo(text: string, next: Mapping): boolean {
   }
 }
 
+/** 整份重写会丢的东西：注释，以及内容前面和中间的空行。原文里一样都没有，整份重写就什么也没丢。 */
+function hasLayoutToLose(lines: readonly string[]): boolean {
+  const lastContent = lines.reduce((last, line, index) => (isContent(line) ? index : last), -1);
+  return lines.some((line, index) => {
+    const bare = line.trim();
+    if (!bare) return index < lastContent;
+    return bare.startsWith('#') || commentAfter(line) !== '';
+  });
+}
+
 /** 把 raw 改写成解析结果等于 next 的原文。options 用于渲染改动的值，也用于整份重写的兜底。 */
-export function rewriteYaml(raw: string, next: Mapping, options: yaml.DumpOptions): YamlRewrite {
-  const prev = parseMapping(raw);
-  const whole = (): YamlRewrite => ({ content: yaml.dump(next, options), preserved: false, note: WHOLE_FILE_REWRITTEN });
+export function rewriteYaml(raw: string, next: Mapping, options: yaml.DumpOptions = YAML_DUMP_OPTIONS): YamlRewrite {
+  const prev = parseYamlMapping(raw);
   const { lines, eol } = splitLines(raw);
+  const whole = (): YamlRewrite => {
+    const content = yaml.dump(next, options);
+    return hasLayoutToLose(lines)
+      ? { content, preserved: false, note: WHOLE_FILE_REWRITTEN }
+      : { content, preserved: true, note: '' };
+  };
   let step: Step;
   try {
     step = applyEdits(lines, prev, next, options);
@@ -416,4 +448,52 @@ export function rewriteYaml(raw: string, next: Mapping, options: yaml.DumpOption
   return step.dropped
     ? { content, preserved: false, note: BLOCK_COMMENTS_DROPPED }
     : { content, preserved: true, note: '' };
+}
+
+/** 沿路径读值，中途不是映射就是 undefined。 */
+export function readYamlPath(doc: unknown, path: readonly string[]): unknown {
+  let cursor: unknown = doc;
+  for (const key of path) {
+    if (!isMapping(cursor)) return undefined;
+    cursor = cursor[key];
+  }
+  return cursor;
+}
+
+/** 沿路径写值，缺的上级建出来。undefined 表示删掉这个键，删空的上级段一并去掉。 */
+export function setYamlPath(doc: Mapping, path: readonly string[], value: unknown): void {
+  const parents = path.slice(0, -1);
+  const leaf = path[path.length - 1];
+  if (value === undefined) {
+    const trail: Mapping[] = [doc];
+    for (const key of parents) {
+      const next = trail[trail.length - 1][key];
+      if (!isMapping(next)) return;
+      trail.push(next);
+    }
+    const parent = trail[trail.length - 1];
+    // 文件里本来就没有这个键：原样不动，用户自己留的空段也不替他收。
+    if (!has(parent, leaf)) return;
+    delete parent[leaf];
+    // 删完留下一串空段（trigger: {signals: {}}）看着像写坏了，从里往外收掉。
+    for (let depth = trail.length - 1; depth > 0 && !Object.keys(trail[depth]).length; depth -= 1) {
+      delete trail[depth - 1][parents[depth - 1]];
+    }
+    return;
+  }
+  let cursor = doc;
+  for (const key of parents) {
+    const next = cursor[key];
+    if (next !== undefined && next !== null && !isMapping(next)) throw new Error(`配置路径 ${key} 不是映射，原文件未修改`);
+    if (!isMapping(next)) cursor[key] = {};
+    cursor = cursor[key] as Mapping;
+  }
+  cursor[leaf] = value;
+}
+
+/** 只改这几个键，其余原文照旧。原文坏了或路径上挡着非映射的值就抛，不写。 */
+export function editYamlKeys(raw: string, edits: readonly YamlKeyEdit[]): YamlRewrite {
+  const doc = parseYamlMapping(raw);
+  for (const edit of edits) setYamlPath(doc, edit.path, edit.value);
+  return rewriteYaml(raw, doc);
 }

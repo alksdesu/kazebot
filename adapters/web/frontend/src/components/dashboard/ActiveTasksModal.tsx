@@ -11,6 +11,7 @@ import { useChatStore, type TaskActivity } from '../../store/chatStore';
 import { useViewStore } from '../../store/viewStore';
 import { startPolling } from '../../utils/polling';
 import { Modal } from '../common';
+import { errorMessage } from '../../api/request';
 
 interface ActiveTasksModalProps {
   open: boolean;
@@ -135,7 +136,7 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
         }
       } catch (loadError) {
         if (isLatest()) {
-          setLoadError(loadError instanceof Error ? loadError.message : '活跃任务刷新失败。');
+          setLoadError(errorMessage(loadError, '活跃任务刷新失败。'));
         }
       } finally {
         if (isLatest()) setLoading(false);
@@ -163,7 +164,7 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
       setRefreshTick(value => value + 1);
     } catch (cancelError) {
       if (tokenChanged(adminToken)) return;
-      setMessage(cancelError instanceof Error ? cancelError.message : '任务取消失败。');
+      setMessage(errorMessage(cancelError, '任务取消失败。'));
     } finally {
       setCancellingTaskIds(current => {
         const next = { ...current };

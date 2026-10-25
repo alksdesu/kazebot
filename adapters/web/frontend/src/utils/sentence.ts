@@ -10,3 +10,8 @@ export function appendSentence(current: string, next: string): string {
   if (sentencesOf(next).every((sentence) => said.has(sentence))) return current;
   return `${/[。！？]$/.test(current) ? current : `${current}。`}${next}`;
 }
+
+/** 保存成功的那句话，后面接上注释没保住的交代和后端校验给的提醒。 */
+export function savedMessage(done: string, note = '', warnings: readonly string[] = []): string {
+  return [note && `${note}。`, ...warnings].reduce(appendSentence, done);
+}

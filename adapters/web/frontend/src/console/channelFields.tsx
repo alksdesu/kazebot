@@ -4,6 +4,7 @@ import { useMemo, useState, type ReactNode } from 'react';
 import { listUpstreamModels, type ChannelChoice, type ProviderProfiles } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
 import { Button, ErrorText, Input } from './components';
+import { errorMessage } from '../api/request';
 
 // FieldRow 的两列尺寸。旁注靠这两个值缩进，才能和输入框左边缘对齐。
 const LABEL_COL = '3em';
@@ -166,7 +167,7 @@ export const ModelField = ({
       setPulled(models);
       setNote(models.length + ' 个模型，点输入框选');
     } catch (caught) {
-      setNote(caught instanceof Error ? caught.message : String(caught));
+      setNote(errorMessage(caught));
     }
     setBusy(false);
   };
