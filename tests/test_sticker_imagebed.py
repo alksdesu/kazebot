@@ -22,6 +22,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from stickers import files as sf
 from stickers import imagebed as ib
 from stickers import store as ss
 
@@ -562,7 +563,7 @@ def _sync(cfg, store, root: Path, bucket: Bucket, **kwargs: Any):
 
     async def scenario():
         async with _client(cfg, recorder) as client:
-            return await ib.sync_once(cfg, store, root=root, client=client, **kwargs)
+            return await ib.sync_once(cfg, store, workspace_root=root, client=client, **kwargs)
 
     return _run(scenario()), recorder
 
@@ -577,6 +578,8 @@ class TestSync:
         assert {row.source for row in rows} == {ss.SOURCE_IMAGEBED}
         assert {row.width for row in rows} == {64}
         for row in rows:
+            # rel_path 和其他来源一样相对工作区根目录，发送、预览、打标的根目录校验才认得它。
+            assert row.rel_path.startswith("data/stickers/pending/")
             assert (tmp_path / row.rel_path).is_file()
             assert row.origin.startswith("s3://memes/")
 
@@ -594,7 +597,7 @@ class TestSync:
         stats, _recorder = _sync(_config(), store, tmp_path, Bucket({"a.png": payload}))
         assert (stats.added, stats.known) == (0, 1)
         assert len(store.browse()) == 1
-        assert not (tmp_path / ib.PENDING_DIR).exists()
+        assert not (sf.sticker_root(tmp_path) / ib.PENDING_DIR).exists()
 
     def test_a_discarded_digest_stays_discarded(self, store, tmp_path: Path) -> None:
         payload = _png((7, 7, 7))

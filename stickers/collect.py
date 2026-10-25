@@ -15,6 +15,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from .files import (
+    LIBRARY_DIR,
+    PENDING_DIR,
+    SWEEP_INTERVAL_SEC,
+    place,
+    safe_suffix,
+    sticker_file,
+    sticker_root,
+    store_path,
+    suffix_for,
+    sweep_stale,
+)
 from .filter import decide, read_shape
 from .store import (
     SOURCE_GROUP,
@@ -26,16 +38,9 @@ from .store import (
 
 logger = logging.getLogger(__name__)
 
-PENDING_DIR = "pending"
-LIBRARY_DIR = "library"
-
 # 队列只是给突发流量削峰的，攒太多说明 worker 跟不上，那时候丢比堆着好。
 _QUEUE_MAX = 32
 _HEADER_BYTES = 64 * 1024
-
-_EXT_BY_FMT = {
-    "png": ".png", "gif": ".gif", "jpeg": ".jpg", "webp": ".webp", "bmp": ".bmp",
-}
 
 
 @dataclass(frozen=True)
@@ -63,7 +68,10 @@ def accept_pending(workspace_root: Path, store: StickerStore, sha256: str) -> bo
     row = store.get(sha256)
     if row is None or row.state != STATE_PENDING:
         return False
-    source = Path(workspace_root) / row.rel_path
+    source = sticker_file(workspace_root, row.rel_path)
+    if source is None:
+        logger.warning("表情包落点不在库里，不转正: %s", row.rel_path)
+        return False
     target_dir = sticker_root(workspace_root) / LIBRARY_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / source.name
@@ -79,19 +87,14 @@ def accept_pending(workspace_root: Path, store: StickerStore, sha256: str) -> bo
 def drop_sticker_file(workspace_root: Path, rel_path: str) -> None:
     if not rel_path:
         return
+    path = sticker_file(workspace_root, rel_path)
+    if path is None:
+        logger.warning("表情包落点不在库里，不删: %s", rel_path)
+        return
     try:
-        (Path(workspace_root) / rel_path).unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
     except OSError:
         logger.debug("表情包文件删不掉: %s", rel_path)
-
-
-def sticker_root(workspace_root: Path) -> Path:
-    """多开时这个目录是指向共享库的软链，各实例看到同一份图。"""
-    return Path(workspace_root) / "data" / "stickers"
-
-
-def store_path(workspace_root: Path) -> Path:
-    return sticker_root(workspace_root) / "stickers.sqlite3"
 
 
 def digest_of(data: bytes) -> str:
@@ -114,6 +117,7 @@ class StickerCollector:
         self._store: StickerStore | None = None
         self._dropped = 0
         self._last_sweep = 0.0
+        self._tidied_at: float | None = None
 
     def _default_store(self) -> StickerStore | None:
         if self._store is None:
@@ -208,6 +212,7 @@ class StickerCollector:
         store = self._open_store()
         if store is None or not config.enabled:
             return
+        self._tidy()
         try:
             raw = job.path.read_bytes()
         except OSError:
@@ -234,17 +239,15 @@ class StickerCollector:
             return
 
         fmt = shape.fmt if shape else ""
-        target_dir = sticker_root(self.workspace_root) / (
-            LIBRARY_DIR if state == STATE_LIBRARY else PENDING_DIR
-        )
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / f"{sha}{_EXT_BY_FMT.get(fmt, job.path.suffix or '.bin')}"
-        if not target.exists():
-            shutil.copyfile(job.path, target)
-
-        row = store.add(
+        folder = LIBRARY_DIR if state == STATE_LIBRARY else PENDING_DIR
+        suffix = suffix_for(fmt, fallback=safe_suffix(job.path.suffix, default=".bin"))
+        # 落盘用算过哈希的那份字节：回头再从附件路径复制，文件中途被换掉时库里的图就和哈希对不上了。
+        place(
+            self.workspace_root,
+            store,
+            raw,
+            location=f"{folder}/{sha}{suffix}",
             sha256=sha,
-            rel_path=target.relative_to(self.workspace_root).as_posix(),
             source=SOURCE_GROUP,
             state=state,
             width=shape.width if shape else 0,
@@ -255,9 +258,14 @@ class StickerCollector:
             from_group=job.source,
             from_user=job.contributor,
         )
-        if row is None:
-            # 抢先一步的并发写已经登记过了，刚复制的副本没人认领。
-            target.unlink(missing_ok=True)
+
+    def _tidy(self) -> None:
+        """崩溃留下的半成品。收图 worker 是这一侧唯一常驻碰图库的后台，顺手在这里清。"""
+        now = time.monotonic()
+        if self._tidied_at is not None and now - self._tidied_at < SWEEP_INTERVAL_SEC:
+            return
+        self._tidied_at = now
+        sweep_stale(self.workspace_root)
 
     def _sweep(self, store: StickerStore, config: CollectConfig) -> None:
         """过期待审和超额部分。每分钟最多一次，别让每张图都触发全表扫描。"""

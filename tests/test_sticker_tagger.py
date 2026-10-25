@@ -101,7 +101,7 @@ def test_empty_input_stays_empty() -> None:
 @pytest.fixture()
 def bench(tmp_path: Path):
     store = ss.StickerStore(tmp_path / "stickers.sqlite3")
-    (tmp_path / "data" / "stickers").mkdir(parents=True)
+    (tmp_path / "data" / "stickers" / "library").mkdir(parents=True)
     holder = {"config": st.TaggerConfig(min_interval=0.0)}
     tagger = st.StickerTagger(
         tmp_path, config=lambda: holder["config"], open_store=lambda: store,
@@ -132,7 +132,7 @@ def _lock_free(store) -> bool:
 
 
 def _seed(bench, digest: str = "a" * 64) -> str:
-    path = bench.root / "data" / "stickers" / f"{digest}.png"
+    path = bench.root / "data" / "stickers" / "library" / f"{digest}.png"
     path.write_bytes(b"fake png bytes")
     bench.store.add(
         sha256=digest,
@@ -309,7 +309,7 @@ class _Sink(list):
 
 
 def _seed_real_png(bench, digest: str = "c" * 64) -> Path:
-    path = bench.root / "data" / "stickers" / f"{digest}.png"
+    path = bench.root / "data" / "stickers" / "library" / f"{digest}.png"
     # 只看文件头认格式，不解码整图，所以这几个字节就够。
     path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"junk")
     bench.store.add(
@@ -539,12 +539,12 @@ async def test_two_taggers_past_the_lock_never_describe_the_same_image(
     # 锁之外还有原子领取兜底：升级过渡期还没换新的 bot 照旧自己打标，不认这把锁。
     import asyncio
 
-    (tmp_path / "data" / "stickers").mkdir(parents=True)
+    (tmp_path / "data" / "stickers" / "library").mkdir(parents=True)
     path = tmp_path / "stickers.sqlite3"
     first, second = ss.StickerStore(path), ss.StickerStore(path)
     for index in range(4):
         digest = str(index) * 64
-        image = tmp_path / "data" / "stickers" / f"{digest}.png"
+        image = tmp_path / "data" / "stickers" / "library" / f"{digest}.png"
         image.write_bytes(b"fake png bytes")
         first.add(sha256=digest, rel_path=image.relative_to(tmp_path).as_posix(),
                   source=ss.SOURCE_GROUP, state=ss.STATE_LIBRARY, name="待标")
@@ -610,12 +610,12 @@ async def test_a_sweep_sits_out_while_another_process_tags_the_library(
 async def test_a_second_tagger_in_one_process_sits_out_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import asyncio
 
-    (tmp_path / "data" / "stickers").mkdir(parents=True)
+    (tmp_path / "data" / "stickers" / "library").mkdir(parents=True)
     path = tmp_path / "stickers.sqlite3"
     first_store, second_store = ss.StickerStore(path), ss.StickerStore(path)
     for index in range(2):
         digest = str(index) * 64
-        image = tmp_path / "data" / "stickers" / f"{digest}.png"
+        image = tmp_path / "data" / "stickers" / "library" / f"{digest}.png"
         image.write_bytes(b"fake png bytes")
         first_store.add(sha256=digest, rel_path=image.relative_to(tmp_path).as_posix(),
                         source=ss.SOURCE_GROUP, state=ss.STATE_LIBRARY, name="待标")

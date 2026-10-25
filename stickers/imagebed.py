@@ -4,12 +4,10 @@
 """
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import hmac
 import json
 import logging
-import os
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -23,6 +21,7 @@ import httpx
 
 from clonoth_runtime import resolve_env_ref
 
+from .files import PENDING_DIR, place, write_atomic
 from .filter import read_shape
 from .store import SOURCE_IMAGEBED, STATE_PENDING, StickerStore
 
@@ -42,8 +41,6 @@ DEFAULT_REGION = "auto"
 DEFAULT_MAX_OBJECT_SIZE = 8 * 1024 * 1024
 DEFAULT_MAX_KEYS = 1000
 DEFAULT_TIMEOUT = 30.0
-
-PENDING_DIR = "pending"
 
 _EXTENSIONS = {"jpeg": "jpg", "png": "png", "gif": "gif", "webp": "webp", "bmp": "bmp"}
 _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
@@ -462,20 +459,8 @@ def load_progress(path: Path | None) -> SyncProgress:
     )
 
 
-def _write_atomic(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_bytes(payload)
-        os.replace(tmp, path)
-    except OSError:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        raise
-
-
 def save_progress(path: Path, progress: SyncProgress) -> None:
-    _write_atomic(
+    write_atomic(
         Path(path),
         json.dumps(progress.to_dict(), ensure_ascii=False, indent=2).encode("utf-8"),
     )
@@ -495,7 +480,7 @@ class SyncStats:
 
 
 def relative_path(sha256: str, fmt: str) -> str:
-    """库内相对路径。两级散列目录，免得一个目录下堆几万个文件。"""
+    """相对 data/stickers 的落点。两级散列目录，免得一个目录下堆几万个文件。"""
     return f"{PENDING_DIR}/{sha256[:2]}/{sha256}.{_EXTENSIONS.get(fmt, 'bin')}"
 
 
@@ -507,7 +492,7 @@ async def _ingest(
     client: ImagebedClient,
     cfg: ImagebedConfig,
     store: StickerStore,
-    root: Path,
+    workspace_root: Path,
     obj: RemoteObject,
 ) -> str:
     if not _supported_suffix(obj.key):
@@ -528,12 +513,12 @@ async def _ingest(
     if shape is None:
         return _OUTCOME_UNSUPPORTED
 
-    rel_path = relative_path(digest, shape.fmt)
-    target = Path(root) / rel_path
-    _write_atomic(target, data)
-    record = store.add(
+    record = place(
+        workspace_root,
+        store,
+        data,
+        location=relative_path(digest, shape.fmt),
         sha256=digest,
-        rel_path=rel_path,
         source=SOURCE_IMAGEBED,
         state=STATE_PENDING,
         name=Path(obj.key).stem,
@@ -544,11 +529,7 @@ async def _ingest(
         size=len(data),
         origin=f"s3://{cfg.bucket}/{obj.key}",
     )
-    if record is None:
-        with contextlib.suppress(OSError):
-            target.unlink()
-        return _OUTCOME_KNOWN
-    return _OUTCOME_ADDED
+    return _OUTCOME_KNOWN if record is None else _OUTCOME_ADDED
 
 
 def _save(path: Path | None, cfg: ImagebedConfig, last_key: str, passes: int) -> None:
@@ -570,12 +551,12 @@ async def sync_once(
     cfg: ImagebedConfig,
     store: StickerStore,
     *,
-    root: Path,
+    workspace_root: Path,
     progress_path: Path | None = None,
     limit: int = 0,
     client: ImagebedClient | None = None,
 ) -> SyncStats:
-    """跑一趟远端 → 本地。limit 为一趟最多处理多少个对象，0 表示不限。"""
+    """跑一趟远端 → 本地，图落进工作区的表情包库。limit 为一趟最多处理多少个对象，0 表示不限。"""
     handle = client or ImagebedClient(cfg)
     counter: Counter[str] = Counter()
     progress = load_progress(progress_path)
@@ -591,7 +572,7 @@ async def sync_once(
             for obj in page.objects:
                 counter["listed"] += 1
                 try:
-                    counter[await _ingest(handle, cfg, store, root, obj)] += 1
+                    counter[await _ingest(handle, cfg, store, Path(workspace_root), obj)] += 1
                 except (ImagebedError, httpx.HTTPError, OSError, ValueError) as exc:
                     # 单个对象坏掉不该停下整趟；进度照样越过它，下一趟再碰。
                     logger.warning("图床同步跳过对象 %s: %s", obj.key, exc)

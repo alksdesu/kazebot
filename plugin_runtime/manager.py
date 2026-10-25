@@ -12,10 +12,11 @@ import os
 import re
 import sys
 import threading
+import time
 import traceback
 import types
 import uuid
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,6 +27,9 @@ from plugin_sdk import PluginAPI, PluginExecutionError, RequestContext
 
 logger = logging.getLogger(__name__)
 RUNTIME_STALE_SECONDS = 30  # 15 missed 2s heartbeats → process is dead
+_PRUNE_INTERVAL_SECONDS = 10
+_PACKAGE_SWEEP_INTERVAL_SECONDS = 600
+_STATUS_TEMPORARY = re.compile(r"\.\d+\.\d+\.tmp")
 _scope: ContextVar[dict[str, Any]] = ContextVar("plugin_scope", default={})
 _loading: ContextVar[bool] = ContextVar("plugin_loading", default=False)
 _managers: dict[tuple[int, str], "PluginManager"] = {}
@@ -82,8 +86,15 @@ def runtime_stale(updated_at: str, *, now: float | None = None) -> bool:
         return True
 
 
-def _prune_runtime_dir(directory: Path, *, keep: Path) -> None:
-    now = datetime.now(timezone.utc).timestamp()
+def _prune_runtime_dir(directory: Path, *, keep: Path, now: float | None = None) -> None:
+    now = datetime.now(timezone.utc).timestamp() if now is None else now
+    for path in directory.glob(".*.tmp"):
+        if path.is_symlink() or not _STATUS_TEMPORARY.fullmatch(path.name):
+            continue
+        # A status temp lives only until its replace; one this old belongs to a writer that died mid-write.
+        with suppress(OSError):
+            if path.stat().st_mtime < now - RUNTIME_STALE_SECONDS:
+                path.unlink()
     for path in directory.glob("*.json"):
         if path == keep or path.is_symlink():
             continue
@@ -169,6 +180,8 @@ class PluginManager:
         self.process = "engine"
         self._file_versions = None
         self._configuration_error: dict | None = None
+        self._pruned_at: float | None = None
+        self._packages_swept_at: float | None = None
 
     def _file_stamps(self) -> tuple:
         from config_layout import file_stamp
@@ -284,6 +297,8 @@ class PluginManager:
         stamps = self._file_stamps()
         with self._lock:
             if stamps == self._file_versions:
+                # Versions retired by an uninstall can still record errors while they wind down.
+                self._forget_removed_locked()
                 return
         try:
             definitions = self.store.definitions()
@@ -298,7 +313,6 @@ class PluginManager:
             return
         with self._lock:
             self._configuration_error = None
-        current_ids = {entry["id"] for entry in definitions}
         by_id = {entry["id"]: entry for entry in definitions}
         for plugin_id, version in list(self._versions.items()):
             definition = by_id.get(plugin_id)
@@ -352,11 +366,8 @@ class PluginManager:
                     self._error_details[plugin_id] = detail
                 logger.warning("Plugin %s failed to load (%s)", plugin_id, type(exc).__name__)
         with self._lock:
-            for plugin_id in self._attempted.keys() - current_ids:
-                self._attempted.pop(plugin_id, None)
-                self._errors.pop(plugin_id, None)
-                self._error_details.pop(plugin_id, None)
             self._definitions = definitions
+            self._forget_removed_locked()
             self._file_versions = stamps
             self.desired_generation = desired
             applied = [(key, value.definition["desired_hash"]) for key, value in sorted(self._versions.items())]
@@ -365,6 +376,12 @@ class PluginManager:
                            for definition in definitions)
             self.applied_generation = desired if complete else hashlib.sha256(json.dumps(applied).encode()).hexdigest()
             self._write_status_locked()
+
+    def _forget_removed_locked(self) -> None:
+        current = {definition["id"] for definition in self._definitions}
+        for table in (self._attempted, self._errors, self._error_details, self._retired_errors):
+            for plugin_id in table.keys() - current:
+                del table[plugin_id]
 
     def _applies(self, definition: dict) -> bool:
         return self.process in definition.get("metadata", {}).get("processes", ["engine", "supervisor"])
@@ -453,18 +470,41 @@ class PluginManager:
         self.refresh()
         with self._lock:
             self._write_status_locked()
+        self._sweep_packages()
+
+    def _sweep_packages(self) -> None:
+        # Plugin files are managed by the supervisor; engines sweeping too would only contend for the settings lock.
+        if self.process != "supervisor":
+            return
+        now = time.monotonic()
+        if self._packages_swept_at is not None and now - self._packages_swept_at < _PACKAGE_SWEEP_INTERVAL_SECONDS:
+            return
+        self._packages_swept_at = now
+        with self._lock:
+            loaded = {(version.definition["id"], version.definition.get("package_hash") or "")
+                      for version in [*self._versions.values(), *self._retired]}
+        try:
+            self.store.sweep_packages(in_use={item for item in loaded if item[1]})
+        except Exception:
+            logger.warning("Plugin package sweep failed", exc_info=True)
 
     def _write_status_locked(self) -> None:
         directory = self.workspace_root / "data" / "plugin_runtime"
+        path = directory / f"{os.getpid()}.json"
+        temporary = directory / f".{os.getpid()}.{threading.get_ident()}.tmp"
         try:
             directory.mkdir(parents=True, exist_ok=True)
-            path = directory / f"{os.getpid()}.json"
-            temporary = directory / f".{os.getpid()}.{threading.get_ident()}.tmp"
             temporary.write_text(json.dumps(self._status_locked(), ensure_ascii=False), encoding="utf-8")
             os.replace(temporary, path)
-            _prune_runtime_dir(directory, keep=path)
+            now = time.monotonic()
+            # Every finished request rewrites the status; pruning other processes' files need not keep that pace.
+            if self._pruned_at is None or now - self._pruned_at >= _PRUNE_INTERVAL_SECONDS:
+                self._pruned_at = now
+                _prune_runtime_dir(directory, keep=path)
         except OSError:
             logger.warning("Could not write plugin runtime status")
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
 
     def close(self) -> None:
         if self.host is not None and self.host.on_loop():

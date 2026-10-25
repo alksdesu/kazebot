@@ -2,18 +2,23 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
 import json
+import logging
 import math
+import os
 import re
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Collection
 
 import yaml
 
 from . import packages
 
 import config_layout
+
+logger = logging.getLogger(__name__)
 
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_CONFIG_BYTES = 128 * 1024
@@ -420,9 +425,44 @@ class PluginStore:
                         if retired is not None:
                             retired.rename(manual)
                         raise
+                    if retired is not None:
+                        # 改名不刷新目录自己的 mtime，回收按年龄算，得从卸载这一刻起算。
+                        with contextlib.suppress(OSError):
+                            os.utime(retired)
                 self._write_settings_with(doc, remove_package)
+                self._reclaim_locked()
             else:
                 self._write_settings_with(doc, lambda: config_layout.remove_config_file(item["path"], base_hash=item["source_hash"]))
+
+    def sweep_packages(self, *, in_use: Collection[tuple[str, str]] = ()) -> list[Path]:
+        """回收不再被引用的插件包版本和卸载、安装中断留下的目录。in_use 是本进程还在跑的 (插件, 版本)。"""
+        self._check_paths()
+        if not self.directory.is_dir():
+            return []
+        with config_layout.locked(self.settings_path):
+            return self._sweep_packages_locked(in_use)
+
+    def _sweep_packages_locked(self, in_use: Collection[tuple[str, str]] = ()) -> list[Path]:
+        # 持着配置锁读引用：安装换版本指针、卸载删指针都在这把锁里，读到的引用不会是半截状态。
+        referenced, unsure = set(in_use), set()
+        for item in self.definitions():
+            if item["kind"] != "package":
+                continue
+            if item["package_hash"]:
+                referenced.add((item["id"], item["package_hash"]))
+            else:
+                unsure.add(item["id"])
+        removed = packages.sweep(self.directory, referenced=referenced, unsure=unsure)
+        if removed:
+            logger.info("回收了 %d 个不再使用的插件包目录", len(removed))
+        return removed
+
+    def _reclaim_locked(self) -> None:
+        """卸载后马上给它的版本记上没人引用的时刻；卸载本身已经成功，回收出错只记日志。"""
+        try:
+            self._sweep_packages_locked()
+        except (OSError, ValueError) as exc:
+            logger.warning("卸载后回收插件包目录失败: %s", exc)
 
     def install_package(self, filename: str, content: bytes, base_hash: str | None = None) -> dict[str, Any]:
         if Path(filename).name != filename or "/" in filename or "\\" in filename or not filename.lower().endswith(".zip"):

@@ -1,22 +1,31 @@
 """插件包静态校验和不可变版本目录。"""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import secrets
+import shutil
 import stat
+import time
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Collection
+
+logger = logging.getLogger(__name__)
 
 MAX_ARCHIVE_BYTES = 16 * 1024 * 1024
 MAX_PACKAGE_BYTES = 32 * 1024 * 1024
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_PACKAGE_FILES = 512
+# 换下来的版本可能还被别的进程、共享组里别的实例或长连接请求用着，放满一天才回收。
+RETENTION_SECONDS = 24 * 3600
 _HASH = re.compile(r"[a-f0-9]{64}\Z")
+_ORPHAN_SUFFIX = ".orphaned"
 _WEB_EXTENSIONS = {".js", ".mjs", ".css", ".json", ".html", ".txt", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".woff", ".woff2", ".ttf", ".otf", ".mp3", ".wav", ".mp4", ".webm"}
 
 
@@ -243,8 +252,129 @@ def materialize(directory: Path, files: dict[str, bytes], package: dict[str, Any
                 raise
     finally:
         if staging.exists():
-            import shutil
-
             checked_directory(staging, directory)
             shutil.rmtree(staging)
     return target
+
+
+def sweep(
+    directory: Path,
+    *,
+    referenced: Collection[tuple[str, str]],
+    unsure: Collection[str] = (),
+    now: float | None = None,
+    retention: float = RETENTION_SECONDS,
+) -> list[Path]:
+    """回收 .packages 下没人引用的旧版本、安装中断留下的 .pending-*、卸载留下的 .removed-*，返回删掉了什么。
+
+    版本第一次被看到没人引用时只记个标记，标记放满 retention 才删；期间重新被引用就撤掉标记。
+    unsure 里的插件（版本指针或手工目录读不出来）一个版本都不动。
+    """
+    moment = time.time() if now is None else now
+    cutoff = moment - retention
+    removed: list[Path] = []
+    base = directory / ".packages"
+    if base.is_dir() and not is_link(base):
+        for plugin_dir in sorted(base.iterdir()):
+            if plugin_dir.is_dir() and not is_link(plugin_dir):
+                removed.extend(_sweep_versions(
+                    directory, plugin_dir, referenced=referenced, unsure=unsure, moment=moment, cutoff=cutoff,
+                ))
+    entries = sorted(directory.iterdir()) if directory.is_dir() else []
+    for path in entries:
+        name = path.name
+        if is_link(path):
+            continue
+        if name.startswith(".removed-") and path.is_dir():
+            if _last_touched(path) < cutoff:
+                removed.extend(_rmtree(directory, path))
+        elif name.startswith(".") and name.endswith(".tmp") and path.is_file():
+            # 写配置用的同目录临时文件，进程死在替换之前才会留下。
+            if _last_touched(path) < cutoff:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                    removed.append(path)
+    return removed
+
+
+def _sweep_versions(
+    directory: Path,
+    plugin_dir: Path,
+    *,
+    referenced: Collection[tuple[str, str]],
+    unsure: Collection[str],
+    moment: float,
+    cutoff: float,
+) -> list[Path]:
+    plugin_id = plugin_dir.name
+    removed: list[Path] = []
+    for path in sorted(plugin_dir.iterdir()):
+        name = path.name
+        if is_link(path):
+            continue
+        if name.startswith(".pending-"):
+            if path.is_dir() and _last_touched(path) < cutoff:
+                removed.extend(_rmtree(directory, path))
+            continue
+        if _HASH.fullmatch(name) and path.is_dir():
+            if plugin_id not in unsure:
+                removed.extend(_age_version(directory, path, referenced=(plugin_id, name) in referenced,
+                                            moment=moment, cutoff=cutoff))
+            continue
+        if name.startswith(".") and name.endswith(_ORPHAN_SUFFIX) and path.is_file():
+            if not (plugin_dir / name[1:-len(_ORPHAN_SUFFIX)]).exists():
+                with contextlib.suppress(OSError):
+                    path.unlink()
+    with contextlib.suppress(OSError):
+        # 只有空目录删得掉：卸载的插件最后一个版本回收之后，把它的版本目录也收掉。
+        plugin_dir.rmdir()
+    return removed
+
+
+def _age_version(
+    directory: Path, version: Path, *, referenced: bool, moment: float, cutoff: float,
+) -> list[Path]:
+    # 标记的 mtime 记的是第一次发现没人引用的时刻；版本目录自己的 mtime 是解包时间，说明不了什么。
+    mark = version.with_name(f".{version.name}{_ORPHAN_SUFFIX}")
+    try:
+        if referenced:
+            mark.unlink(missing_ok=True)
+            return []
+        if not mark.exists():
+            mark.touch()
+            os.utime(mark, (moment, moment))
+            return []
+        if mark.stat().st_mtime >= cutoff:
+            return []
+    except OSError as exc:
+        logger.warning("插件旧版本标记写不了 %s: %s", mark, exc)
+        return []
+    deleted = _rmtree(directory, version)
+    if deleted:
+        with contextlib.suppress(OSError):
+            mark.unlink()
+    return deleted
+
+
+def _last_touched(path: Path) -> float:
+    """目录取自己和直接子项里最新的 mtime：往里写文件时目录本身的 mtime 不一定动。"""
+    try:
+        newest = path.lstat().st_mtime
+    except OSError:
+        return float("inf")
+    if path.is_dir() and not is_link(path):
+        with contextlib.suppress(OSError):
+            for child in path.iterdir():
+                with contextlib.suppress(OSError):
+                    newest = max(newest, child.lstat().st_mtime)
+    return newest
+
+
+def _rmtree(directory: Path, path: Path) -> list[Path]:
+    try:
+        checked_directory(path, directory)
+        shutil.rmtree(path)
+    except (OSError, ValueError) as exc:
+        logger.warning("插件旧版本目录删不掉 %s: %s", path, exc)
+        return []
+    return [path]

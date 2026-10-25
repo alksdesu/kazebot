@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import shutil
 import threading
 from pathlib import Path
 from typing import Any
@@ -14,14 +13,8 @@ from typing import Any
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 
-from stickers.collect import (
-    LIBRARY_DIR,
-    PENDING_DIR,
-    accept_pending,
-    drop_sticker_file,
-    sticker_root,
-    store_path,
-)
+from stickers.collect import accept_pending, drop_sticker_file
+from stickers.files import LIBRARY_DIR, PENDING_DIR, place, sticker_file, store_path, suffix_for
 from stickers.filter import read_shape
 from stickers.store import (
     STATE_LIBRARY,
@@ -36,7 +29,6 @@ from .admin_api import verify_admin_token
 logger = logging.getLogger("clonoth.supervisor")
 
 _UPLOAD_MAX_BYTES = 8 * 1024 * 1024
-_EXT_BY_FMT = {"png": ".png", "gif": ".gif", "jpeg": ".jpg", "webp": ".webp", "bmp": ".bmp"}
 _MIME_BY_FMT = {
     "png": "image/png", "gif": "image/gif", "jpeg": "image/jpeg",
     "webp": "image/webp", "bmp": "image/bmp",
@@ -122,10 +114,9 @@ def create_sticker_router(workspace_root: Path) -> APIRouter:
         _store_handle, row = _row(sha256)
         if not row.rel_path:
             raise HTTPException(status_code=404, detail="这张图已经没有文件了")
-        root = sticker_root(workspace_root).resolve()
-        target = (workspace_root / row.rel_path).resolve()
-        # resolve 之后再比：'..'、绝对路径和软链都会在这一步现形。
-        if root not in target.parents or not target.is_file():
+        # 只认待审和在库两个目录：库文件、备份包和锁都在 data/stickers 里，边界放到那一层就能被当图读走。
+        target = sticker_file(workspace_root, row.rel_path)
+        if target is None or not target.is_file():
             raise HTTPException(status_code=404, detail="文件不在库里")
         return FileResponse(target, media_type=_MIME_BY_FMT.get(row.fmt, "image/png"))
 
@@ -202,16 +193,13 @@ def create_sticker_router(workspace_root: Path) -> APIRouter:
             raise HTTPException(status_code=409, detail="这张图库里已经有了")
 
         state = STATE_LIBRARY if accept else STATE_PENDING
-        target_dir = sticker_root(workspace_root) / (
-            LIBRARY_DIR if accept else PENDING_DIR
-        )
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / f"{digest}{_EXT_BY_FMT.get(shape.fmt, '.bin')}"
-        target.write_bytes(content)
-
-        row = store.add(
+        folder = LIBRARY_DIR if accept else PENDING_DIR
+        row = place(
+            workspace_root,
+            store,
+            content,
+            location=f"{folder}/{digest}{suffix_for(shape.fmt)}",
             sha256=digest,
-            rel_path=target.relative_to(workspace_root).as_posix(),
             source="upload",
             state=state,
             name=name or Path(file.filename or "").stem,
@@ -223,7 +211,6 @@ def create_sticker_router(workspace_root: Path) -> APIRouter:
             origin=str(file.filename or ""),
         )
         if row is None:
-            target.unlink(missing_ok=True)
             raise HTTPException(status_code=409, detail="这张图库里已经有了")
         return _as_json(row)
 
@@ -241,8 +228,7 @@ def create_sticker_router(workspace_root: Path) -> APIRouter:
 
         store = library_store(workspace_root)
         state = STATE_LIBRARY if accept else STATE_PENDING
-        target_dir = sticker_root(workspace_root) / (LIBRARY_DIR if accept else PENDING_DIR)
-        target_dir.mkdir(parents=True, exist_ok=True)
+        folder = LIBRARY_DIR if accept else PENDING_DIR
         stats = {"scanned": 0, "added": 0, "known": 0, "skipped": 0}
         for path in sorted(source.rglob("*")):
             if not path.is_file():
@@ -264,11 +250,13 @@ def create_sticker_router(workspace_root: Path) -> APIRouter:
             if store.known(digest):
                 stats["known"] += 1
                 continue
-            target = target_dir / f"{digest}{_EXT_BY_FMT.get(shape.fmt, '.bin')}"
-            shutil.copyfile(path, target)
-            row = store.add(
+            # 落盘用算过哈希的那份字节：回头再从源路径复制，文件中途被换掉时库里的图就和哈希对不上了。
+            row = place(
+                workspace_root,
+                store,
+                content,
+                location=f"{folder}/{digest}{suffix_for(shape.fmt)}",
                 sha256=digest,
-                rel_path=target.relative_to(workspace_root).as_posix(),
                 source="import",
                 state=state,
                 name=path.stem,
@@ -280,7 +268,6 @@ def create_sticker_router(workspace_root: Path) -> APIRouter:
                 origin=str(path.relative_to(source)),
             )
             if row is None:
-                target.unlink(missing_ok=True)
                 stats["known"] += 1
             else:
                 stats["added"] += 1

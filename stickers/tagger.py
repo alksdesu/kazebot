@@ -15,6 +15,7 @@ from typing import Any, Callable, Sequence
 
 from file_lock import try_exclusive_lock
 
+from .files import SWEEP_INTERVAL_SEC, sticker_file, sweep_stale
 from .store import CAPTION_PROMPT_VERSION, CaptionClaim, StickerStore
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,7 @@ class StickerTagger:
         self._open_store = open_store
         self._task: asyncio.Task[None] | None = None
         self._last_call = 0.0
+        self._tidied_at: float | None = None
         # 渠道没配好时每轮都喊一遍就把日志刷没了，只在状态变化时说。
         self._last_channel_error = ""
 
@@ -156,6 +158,7 @@ class StickerTagger:
         while True:
             done = 0
             idle = _IDLE_SLEEP
+            await self._tidy()
             try:
                 # 开关要读配置文件，读取出错也只是跳过这一轮，不能让循环整个死掉。
                 config = self._config()
@@ -166,6 +169,17 @@ class StickerTagger:
                 logger.warning("表情包打标出错", exc_info=True)
             # 有活就立刻接着干，没活才睡；不然新收的图要等一整轮。
             await asyncio.sleep(0.0 if done else max(idle, 1.0))
+
+    async def _tidy(self) -> None:
+        """崩溃留下的半成品。打标循环是 supervisor 里唯一常驻碰图库的后台，打标关着也照转，顺手在这里清。"""
+        now = asyncio.get_running_loop().time()
+        if self._tidied_at is not None and now - self._tidied_at < SWEEP_INTERVAL_SEC:
+            return
+        self._tidied_at = now
+        try:
+            await asyncio.to_thread(sweep_stale, self.workspace_root)
+        except Exception:
+            logger.warning("表情包库清理临时文件出错", exc_info=True)
 
     async def _sweep(self, config: TaggerConfig) -> int:
         # 开库可能要等十几秒（WAL 重试、迁移），放进线程，别卡住宿主的事件循环。
@@ -213,9 +227,11 @@ class StickerTagger:
         self, store: StickerStore, vision: Any, config: TaggerConfig, claim: CaptionClaim,
     ) -> bool:
         row = claim.sticker
-        path = self.workspace_root / row.rel_path
-        if not row.rel_path or not path.is_file():
-            store.fail_caption(claim, error="文件不在了", max_attempts=_MAX_ATTEMPTS, final=True)
+        path = sticker_file(self.workspace_root, row.rel_path)
+        if path is None or not path.is_file():
+            # 落点越出库外照样判死：读出来就是把库外的文件发给看图渠道。
+            error = "文件不在库里" if row.rel_path and path is None else "文件不在了"
+            store.fail_caption(claim, error=error, max_attempts=_MAX_ATTEMPTS, final=True)
             return False
         gap = config.min_interval - (asyncio.get_running_loop().time() - self._last_call)
         if gap > 0:

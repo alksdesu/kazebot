@@ -14,16 +14,25 @@ import shutil
 import sqlite3
 import stat
 import time
-import uuid
 import zipfile
 import zlib
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Sequence
 
-from .collect import LIBRARY_DIR, PENDING_DIR, sticker_root, store_path
+from .files import (
+    BACKUP_DIR,
+    media_roots,
+    pure_relative,
+    replacing,
+    safe_suffix,
+    staging_dir,
+    sticker_file,
+    sticker_root,
+    store_path,
+)
 from .store import TRANSIENT_COLUMNS, ensure_receipt_schema, normalize_name
 
 logger = logging.getLogger(__name__)
@@ -37,22 +46,32 @@ MODES = (MODE_MERGE, MODE_REPLACE)
 
 MANIFEST_NAME = "manifest.json"
 IMAGE_DIR = "images"
-BACKUP_DIR = "backups"
 
 DEFAULT_KEEP = 5
 DEFAULT_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_MAX_ENTRIES = 200_000
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_SUFFIX = re.compile(r"^\.[a-z0-9]{1,8}$")
 _ARCHIVE_NAME = re.compile(r"^stickers-(\d{8}-\d{6}-\d{6})\.zip$")
 _CHUNK = 1024 * 1024
+_REPORT_LIMIT = 10
 
 Progress = Callable[[str, int, int], None]
 
 
+@dataclass(frozen=True)
+class Rejection:
+    sha256: str
+    rel_path: str
+    reason: str
+
+
 class BackupError(RuntimeError):
-    """备份包不可信或不可用。"""
+    """备份包不可信或不可用。rejected 逐条列出落点不合格的条目，有一条就整包不认。"""
+
+    def __init__(self, message: str, *, rejected: Sequence[Rejection] = ()) -> None:
+        super().__init__(message)
+        self.rejected: tuple[Rejection, ...] = tuple(rejected)
 
 
 @dataclass(frozen=True)
@@ -95,35 +114,18 @@ def backup_dir(workspace_root: Path | str) -> Path:
     return sticker_root(Path(workspace_root)) / BACKUP_DIR
 
 
-def _media_roots(workspace_root: Path) -> tuple[Path, ...]:
-    """恢复只许往待审/在库两个目录写。库文件和历史备份都在同级，写歪一步就覆盖它们。"""
-    root = sticker_root(workspace_root)
-    return tuple((root / name).resolve() for name in (PENDING_DIR, LIBRARY_DIR))
+def _landing_key(rel: str) -> str:
+    return os.path.normcase(rel)
 
 
-def _safe_member(name: str) -> str:
-    """只接受纯相对路径。不可信来源的条目能靠 .. 、绝对路径或盘符写到库外面去。"""
-    raw = str(name or "")
-    if not raw or raw != raw.strip() or raw.startswith("/") or raw.endswith("/"):
-        return ""
-    if "\\" in raw or ":" in raw:
-        return ""
-    if any(part in ("", ".", "..") for part in raw.split("/")):
-        return ""
-    return raw
-
-
-def _within(roots: tuple[Path, ...], workspace_root: Path, rel: str) -> Path | None:
-    # 多开时 data/stickers 是指向共享库的软链，解析之后才谈得上比对。
-    target = (workspace_root / rel).resolve()
-    return target if any(base in target.parents for base in roots) else None
-
-
-def _resolve(roots: tuple[Path, ...], workspace_root: Path, rel: str) -> Path:
-    target = _within(roots, workspace_root, rel)
-    if target is None:
-        raise BackupError(f"备份条目落点越界: {rel!r}")
-    return target
+def _refuse(rejected: Sequence[Rejection]) -> None:
+    if not rejected:
+        return
+    shown = "；".join(
+        f"{item.sha256[:12]} {item.rel_path!r} {item.reason}" for item in rejected[:_REPORT_LIMIT]
+    )
+    more = f" 等 {len(rejected)} 条" if len(rejected) > _REPORT_LIMIT else ""
+    raise BackupError(f"备份条目落点不合格，整包不导入：{shown}{more}", rejected=rejected)
 
 
 # ── 库连接 ──
@@ -243,27 +245,32 @@ def export_library(
         finally:
             db.execute("COMMIT")
 
+    roots = media_roots(root)
     entries: list[dict[str, Any]] = []
+    sources: list[Path | None] = []
     for row in rows:
         record = {name: row[name] for name in columns}
         rel = str(record.get("rel_path") or "")
-        suffix = Path(rel).suffix.lower()
+        # 落点越出库外的行照样导出记录，但不带图：否则库外的任何文件都能被打进备份带走。
+        source = sticker_file(root, rel, roots=roots)
+        if source is not None and not source.is_file():
+            source = None
         member = ""
-        if rel and (root / rel).is_file():
-            member = f"{IMAGE_DIR}/{record['sha256']}{suffix if _SUFFIX.match(suffix) else ''}"
+        if source is not None:
+            member = f"{IMAGE_DIR}/{record['sha256']}{safe_suffix(Path(rel).suffix)}"
         entries.append({"row": record, "image": member})
+        sources.append(source)
 
     path = _next_archive_path(target_dir)
-    tmp = target_dir / f".{path.name}.{uuid.uuid4().hex}.tmp"
     total = len(entries)
     images = 0
-    try:
+    with replacing(path) as tmp:
         with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
-            for index, entry in enumerate(entries, 1):
+            for index, (entry, source) in enumerate(zip(entries, sources), 1):
                 member = str(entry["image"])
-                if member:
+                if member and source is not None:
                     try:
-                        zf.write(root / str(entry["row"]["rel_path"]), member)
+                        zf.write(source, member)
                         images += 1
                     except OSError as exc:
                         logger.warning("表情包备份跳过读不了的图 %s: %s", member, exc)
@@ -297,12 +304,6 @@ def export_library(
                 },
                 ensure_ascii=False,
             ))
-        with tmp.open("rb+") as stream:
-            os.fsync(stream.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
 
     logger.info("表情包备份已导出 %s: %d 条 %d 图", path.name, total, images)
     return ExportResult(
@@ -330,7 +331,7 @@ def _collect_members(
     declared = 0
     for info in infos:
         raw = info.filename
-        name = _safe_member(raw[:-1] if info.is_dir() else raw)
+        name = pure_relative(raw[:-1] if info.is_dir() else raw)
         if not name:
             raise BackupError(f"备份里有越界的路径条目: {raw!r}")
         if stat.S_ISLNK(info.external_attr >> 16):
@@ -389,8 +390,6 @@ def _plan(
             raise BackupError(f"备份条目哈希重复: {digest}")
         seen.add(digest)
         rel = str(row.get("rel_path") or "")
-        if rel and not _safe_member(rel):
-            raise BackupError(f"备份条目路径越界: {rel!r}")
         member = str(item.get("image") or "")
         if member and member not in members:
             raise BackupError(f"备份缺少图片: {member}")
@@ -436,6 +435,61 @@ def _plan(
         send_receipts=list(send_receipts.values()),
         exported_at=_as_int(manifest.get("exported_at")),
     )
+
+
+def _landings(plan: _Plan, workspace_root: Path) -> tuple[dict[str, Path], list[Rejection]]:
+    """每条落点都得是库内相对路径、解析后在待审或在库目录下，备份内也不许两张图共用一个落点。
+
+    无图的条目一样要过：落点会原样进库，之后清理、转正、打标都照着它删、搬、读。
+    """
+    roots = media_roots(workspace_root)
+    targets: dict[str, Path] = {}
+    claimed: dict[str, str] = {}
+    rejected: list[Rejection] = []
+    for entry in plan.entries:
+        if not entry.rel_path:
+            continue
+        if not pure_relative(entry.rel_path):
+            rejected.append(Rejection(entry.digest, entry.rel_path, "不是库内相对路径"))
+            continue
+        target = sticker_file(workspace_root, entry.rel_path, roots=roots)
+        if target is None:
+            rejected.append(Rejection(entry.digest, entry.rel_path, "不在待审或在库目录下"))
+            continue
+        owner = claimed.setdefault(_landing_key(entry.rel_path), entry.digest)
+        if owner != entry.digest:
+            rejected.append(Rejection(entry.digest, entry.rel_path, f"和备份里的 {owner[:12]} 共用落点"))
+            continue
+        targets[entry.digest] = target
+    return targets, rejected
+
+
+def _guarded(plan: _Plan, mode: str) -> list[_Entry]:
+    """哪些条目不许落到库里别的图的文件上。
+
+    replace 会清掉旧行，带图的条目覆盖旧文件正是替换本意；只有无图条目会把留下的旧文件认成自己的。
+    """
+    if mode == MODE_REPLACE:
+        return [entry for entry in plan.entries if not entry.member]
+    return list(plan.entries)
+
+
+def _occupied(
+    db: sqlite3.Connection, entries: Sequence[_Entry], targets: dict[str, Path],
+) -> list[Rejection]:
+    """库里别的图占着的落点不许再指过去：写下去会换掉那张图，日后删这一条也会连带删掉它。"""
+    owners = {
+        _landing_key(str(row[1])): str(row[0])
+        for row in db.execute("SELECT sha256,rel_path FROM stickers WHERE rel_path<>''").fetchall()
+    }
+    rejected: list[Rejection] = []
+    for entry in entries:
+        if entry.digest not in targets:
+            continue
+        owner = owners.get(_landing_key(entry.rel_path), entry.digest)
+        if owner != entry.digest:
+            rejected.append(Rejection(entry.digest, entry.rel_path, f"已被库里的 {owner[:12]} 占用"))
+    return rejected
 
 
 def _stage(
@@ -492,13 +546,13 @@ def _apply(
     db: sqlite3.Connection,
     plan: _Plan,
     staged: dict[str, Path],
+    targets: dict[str, Path],
     *,
     workspace_root: Path,
     mode: str,
     columns: list[str],
     progress: Progress | None,
 ) -> ImportResult:
-    roots = _media_roots(workspace_root)
     placed: list[Path] = []
     stale: set[Path] = set()
     imported = skipped = removed = renamed = 0
@@ -510,6 +564,8 @@ def _apply(
 
     db.execute("BEGIN IMMEDIATE")
     try:
+        # 校验之后到拿到写锁之前，别的进程可能刚登记了占着同一落点的图。
+        _refuse(_occupied(db, _guarded(plan, mode), targets))
         ensure_receipt_schema(db)
         db.executemany(
             "INSERT INTO send_receipts(delivery_id,sha256,conversation_key,sent_at) VALUES(?,?,?,?)"
@@ -517,14 +573,11 @@ def _apply(
             plan.send_receipts,
         )
         if mode == MODE_REPLACE:
-            keeping = {
-                _resolve(roots, workspace_root, entry.rel_path)
-                for entry in plan.entries if entry.rel_path
-            }
+            roots = media_roots(workspace_root)
+            keeping = set(targets.values())
             for row in db.execute("SELECT sha256,rel_path FROM stickers").fetchall():
                 removed += 1
-                rel = str(row["rel_path"] or "")
-                old = _within(roots, workspace_root, rel) if rel else None
+                old = sticker_file(workspace_root, str(row["rel_path"] or ""), roots=roots)
                 if old is not None and old not in keeping:
                     stale.add(old)
             # 恢复旧库不能抹掉本机已确认投递的去重回执。
@@ -545,13 +598,7 @@ def _apply(
             db.execute(insert, [row[column] for column in columns])
             source = staged.get(entry.digest)
             if source is not None:
-                # 落点被别的哈希占着就整包不认：写下去等于把在库的那张图悄悄换掉。
-                if db.execute(
-                    "SELECT 1 FROM stickers WHERE rel_path=? AND sha256<>?",
-                    (entry.rel_path, entry.digest),
-                ).fetchone():
-                    raise BackupError(f"备份条目的落点已被别的图占用: {entry.rel_path}")
-                target = _resolve(roots, workspace_root, entry.rel_path)
+                target = targets[entry.digest]
                 target.parent.mkdir(parents=True, exist_ok=True)
                 fresh = not target.exists()
                 os.replace(source, target)
@@ -602,7 +649,7 @@ def import_library(
     if mode not in MODES:
         raise BackupError(f"未知导入模式: {mode!r}")
     root = Path(workspace_root)
-    staging = sticker_root(root) / f".import.{uuid.uuid4().hex}"
+    staging = staging_dir(root)
 
     with _connect(store_path(root)) as db:
         columns = _columns(db)
@@ -616,13 +663,15 @@ def import_library(
                     max_total_bytes=max_total_bytes,
                     max_entries=max_entries,
                 )
+                targets, rejected = _landings(plan, root)
+                _refuse(rejected + _occupied(db, _guarded(plan, mode), targets))
                 try:
                     staged = _stage(
                         zf, plan, staging,
                         max_total_bytes=max_total_bytes, progress=progress,
                     )
                     result = _apply(
-                        db, plan, staged,
+                        db, plan, staged, targets,
                         workspace_root=root, mode=mode, columns=columns, progress=progress,
                     )
                 finally:
