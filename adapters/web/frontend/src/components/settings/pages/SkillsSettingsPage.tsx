@@ -12,7 +12,7 @@ import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
-import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
+import { Block, Button, Feedback, Field, Input, PageShell } from './settingsControls';
 import { savedMessage } from '../../../utils/sentence';
 import { errorMessage } from '../../../api/request';
 
@@ -33,7 +33,7 @@ export const SkillsSettingsPage = () => {
   const { selectedSkill, setSelectedSkill } = useSettingsSelectionStore();
   const [skills, setSkills] = useState<AdminSkill[]>([]);
   const [newName, setNewName] = useState('');
-  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
+  const { notice, error, setMessage, setError, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const { busy, run } = useExclusiveAction();
   const requests = useRequestGuard();
@@ -48,9 +48,9 @@ export const SkillsSettingsPage = () => {
       setSkills(items);
       if (selectedSkill && !items.some((item) => item.name === selectedSkill.name)) setSelectedSkill(null);
       setLoadError('');
-    } catch (error) {
+    } catch (caught) {
       if (!request.isCurrent()) return;
-      setLoadError(errorMessage(error, '加载技能失败'));
+      setLoadError(errorMessage(caught, '加载技能失败'));
     } finally {
       if (request.isCurrent()) setLoading(false);
     }
@@ -77,7 +77,7 @@ export const SkillsSettingsPage = () => {
   const create = () => run(async () => {
     if (!adminToken) return;
     const name = newName.trim();
-    if (!name) { setMessage('请输入技能名称'); return; }
+    if (!name) { setError('请输入技能名称'); return; }
     if (!confirmNavigation()) return;
     try {
       const result = await createSkill(adminToken, { id: name, content: defaultSkillMarkdown(name) });
@@ -87,9 +87,9 @@ export const SkillsSettingsPage = () => {
       await load();
       if (!requests.isCurrent()) return;
       setSelectedSkill({ name, description: '通过设置页面创建的技能。', enabled: true, strategy: 'normal', keywords: [] });
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, '创建技能失败'));
+      setError(errorMessage(caught, '创建技能失败'));
     }
   });
   const remove = () => run(async () => {
@@ -102,9 +102,9 @@ export const SkillsSettingsPage = () => {
       setSelectedSkill(null);
       setMessage('技能已删除');
       await load();
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, '删除技能失败'));
+      setError(errorMessage(caught, '删除技能失败'));
     }
   });
   return (
@@ -129,7 +129,7 @@ export const SkillsSettingsPage = () => {
             <Button className="mt-2" disabled={busy} onClick={create}>创建技能</Button>
           </Field>
         </div>
-        <StatusText message={notice} />
+        <Feedback error={error} notice={notice} />
       </Block>
     </PageShell>
   );

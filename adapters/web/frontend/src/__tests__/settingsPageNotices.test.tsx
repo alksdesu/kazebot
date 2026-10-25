@@ -1,6 +1,6 @@
 // 技能 / 工具 / 定时任务 / MCP / 节点五个列表页的提示：写操作紧接着就重读列表，
 // 刚写下的那句不能被这一次重读冲掉，也不能被右栏保存引起的后台重读冲掉；
-// 重读失败时原因接在它后面，下一次读成功只去掉原因，只有点「刷新」两样一起清；
+// 出错的原因另起一行报错，不和结果拼成一句，下一次读成功只去掉原因，只有点「刷新」两样一起清；
 // 页面只认最后发出的那次读，写完发现 token 换了就不再替旧会话收尾。
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { ComponentType } from 'react';
@@ -46,6 +46,15 @@ const actualApi = await vi.importActual<typeof import('../api/supervisorClient')
 /** 没有消息时整个 StatusText 不渲染，只能等它出现。 */
 const statusText = async (): Promise<string> => (await screen.findByRole('status')).textContent || '';
 
+/** 出错的原因单占一行，用 alert 念。 */
+const alertText = async (): Promise<string> => (await screen.findByRole('alert')).textContent || '';
+
+/** 结果和原因两行都不在。 */
+const expectSilent = () => {
+  expect(screen.queryByRole('status')).toBeNull();
+  expect(screen.queryByRole('alert')).toBeNull();
+};
+
 const click = (name: string) => fireEvent.click(screen.getByRole('button', { name }));
 
 const fill = (label: string, value: string) => fireEvent.change(screen.getByLabelText(label), { target: { value } });
@@ -55,7 +64,7 @@ const settled = (refreshLabel: string) => waitFor(() => expect(screen.getByRole(
 
 const expectCleared = async (refreshLabel: string) => {
   click(refreshLabel);
-  await waitFor(() => expect(screen.queryByRole('status')).toBeNull());
+  await waitFor(expectSilent);
 };
 
 interface Deferred<T> {
@@ -457,17 +466,19 @@ for (const page of PAGES) describe(`${page.title}的提示`, () => {
     expect(screen.getByRole('status').textContent).toBe(page.createdText);
   });
 
-  it('重读失败时原因接在结果后面，下一次读成功只去掉原因', async () => {
+  it('重读失败的原因另起一行报错，下一次读成功只去掉原因', async () => {
     failWriteReload();
     render(<Page />);
     await ready();
 
     page.create();
     await written();
-    expect(await statusText()).toBe(`${page.createdText}${READ_FAILURE}`);
+    expect(await statusText()).toBe(page.createdText);
+    expect(await alertText()).toBe(READ_FAILURE);
 
     await backgroundReload();
     expect(screen.getByRole('status').textContent).toBe(page.createdText);
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 
   it('点刷新把结果和读失败的原因一起清掉', async () => {
@@ -477,9 +488,22 @@ for (const page of PAGES) describe(`${page.title}的提示`, () => {
 
     page.create();
     await written();
-    expect(await statusText()).toBe(`${page.createdText}${READ_FAILURE}`);
+    expect(await statusText()).toBe(page.createdText);
+    expect(await alertText()).toBe(READ_FAILURE);
 
     await expectCleared(page.refreshLabel);
+  });
+
+  it('新建失败的原因报成错误，不当成提示', async () => {
+    page.createWriter.mockRejectedValueOnce(new Error(WRITE_FAILURE));
+    render(<Page />);
+    await ready();
+
+    page.create();
+    await settled(page.refreshLabel);
+
+    expect(await alertText()).toBe(WRITE_FAILURE);
+    expect(screen.queryByRole('status')).toBeNull();
   });
 
   it('换了 token 重新进页面，提示清空', async () => {
@@ -500,7 +524,7 @@ for (const page of PAGES) describe(`${page.title}的提示`, () => {
 
     await act(async () => { stale.reject(new Error(READ_FAILURE)); });
 
-    expect(screen.queryByRole('status')).toBeNull();
+    expectSilent();
     expect(screen.getByText(page.listName)).toBeInTheDocument();
     await settled(page.refreshLabel);
   });
@@ -553,7 +577,7 @@ for (const page of PAGES) describe(`${page.title}的提示`, () => {
     await rotateThenFail(page.createWriter, write);
 
     expect(screen.queryByText(WRITE_FAILURE)).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expectSilent();
   });
 
   it('删除失败时 token 已经换掉，不把失败原因写到新会话', async () => {
@@ -566,7 +590,7 @@ for (const page of PAGES) describe(`${page.title}的提示`, () => {
     await rotateThenFail(page.deleteWriter, write);
 
     expect(screen.queryByText(WRITE_FAILURE)).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expectSilent();
   });
 
   it('新建之后那次重读回来，选中项落到刚建的那个上', async () => {
@@ -620,7 +644,8 @@ for (const page of PAGES) describe(`${page.title}的提示`, () => {
 
       raw.createExisting();
 
-      expect(await statusText()).toBe(raw.existsText);
+      expect(await alertText()).toBe(raw.existsText);
+      expect(screen.queryByRole('status')).toBeNull();
       expect(page.createWriter).not.toHaveBeenCalled();
     });
 
@@ -633,7 +658,7 @@ for (const page of PAGES) describe(`${page.title}的提示`, () => {
       await finishRawRead(read);
 
       expect(screen.queryByText(raw.existsText)).toBeNull();
-      expect(screen.queryByRole('status')).toBeNull();
+      expectSilent();
       expect(page.createWriter).not.toHaveBeenCalled();
     });
 
@@ -694,7 +719,7 @@ describe('技能页读请求挂住', () => {
 
     await act(async () => { await vi.advanceTimersByTimeAsync(READ_DEADLINE_MS); });
 
-    expect(screen.getByRole('status').textContent).toBe(TIMEOUT_REASON);
+    expect(screen.getByRole('alert').textContent).toBe(TIMEOUT_REASON);
     expect(screen.getByRole('button', { name: '刷新技能' })).toBeEnabled();
   });
 });
@@ -713,7 +738,7 @@ describe('工具页重载之后的提示', () => {
     await expectCleared('刷新工具');
   });
 
-  it('序号提示没有句号，接读失败原因时补一个', async () => {
+  it('重载的序号提示和紧跟那次重读失败的原因各占一行', async () => {
     vi.mocked(api.getTools).mockResolvedValueOnce([EXISTING_TOOL]).mockRejectedValueOnce(new Error(READ_FAILURE));
     render(<ToolsSettingsPage />);
     await waitFor(() => expect(api.getTools).toHaveBeenCalledOnce());
@@ -722,7 +747,8 @@ describe('工具页重载之后的提示', () => {
 
     await waitFor(() => expect(api.getTools).toHaveBeenCalledTimes(2));
     await settled('刷新工具');
-    expect(await statusText()).toBe(`工具已重载，序号 7。${READ_FAILURE}`);
+    expect(await statusText()).toBe('工具已重载，序号 7');
+    expect(await alertText()).toBe(READ_FAILURE);
   });
 
   it('重载完 token 已经换掉，不写序号也不用旧 token 重读', async () => {
@@ -759,7 +785,7 @@ describe('工具页重载之后的提示', () => {
     await settled('刷新工具');
 
     expect(screen.queryByText(WRITE_FAILURE)).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expectSilent();
   });
 });
 

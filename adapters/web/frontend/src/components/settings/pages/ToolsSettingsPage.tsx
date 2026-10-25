@@ -14,7 +14,7 @@ import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk
 import { AutoApproveSection } from './AutoApproveSection';
 import { NodeGrantsSection } from './NodeGrantsSection';
 import { PolicyRulesSection } from './PolicyRulesSection';
-import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
+import { Block, Button, Feedback, Field, Input, PageShell } from './settingsControls';
 import { savedMessage } from '../../../utils/sentence';
 import { errorMessage } from '../../../api/request';
 
@@ -55,7 +55,7 @@ const ToolInventorySection = () => {
   const { selectedTool, setAllToolNames, setSelectedTool } = useSettingsSelectionStore();
   const [tools, setTools] = useState<AdminTool[]>([]);
   const [newName, setNewName] = useState('');
-  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
+  const { notice, error, setMessage, setError, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const { busy, run } = useExclusiveAction();
   const [query, setQuery] = useState('');
@@ -75,9 +75,9 @@ const ToolInventorySection = () => {
       if (selectedTool && !items.some((item) => item.name === selectedTool.name)) setSelectedTool(null);
       setLoadError('');
       return items;
-    } catch (error) {
+    } catch (caught) {
       if (!request.isCurrent()) return undefined;
-      setLoadError(errorMessage(error, '加载工具失败'));
+      setLoadError(errorMessage(caught, '加载工具失败'));
       return undefined;
     } finally {
       if (request.isCurrent()) setLoading(false);
@@ -105,7 +105,7 @@ const ToolInventorySection = () => {
   const create = () => run(async () => {
     if (!adminToken) return;
     const name = newName.trim();
-    if (!name) { setMessage('请输入工具名称'); return; }
+    if (!name) { setError('请输入工具名称'); return; }
     if (!confirmNavigation()) return;
     try {
       const result = await createTool(adminToken, { id: name, content: defaultToolScript(name) });
@@ -115,9 +115,9 @@ const ToolInventorySection = () => {
       await load();
       if (!requests.isCurrent()) return;
       setSelectedTool({ name, source: 'external', editable: true, description: '通过设置页面创建的工具。', input_schema: { type: 'object', properties: {} }, timeout_sec: 30, has_spec: true, origin: 'custom' });
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, '创建工具失败'));
+      setError(errorMessage(caught, '创建工具失败'));
     }
   });
   // 没声明来源的外部工具是老版本后端给的，那时它们都放在可以直接删的 tools/ 下。
@@ -137,9 +137,9 @@ const ToolInventorySection = () => {
       if (!requests.isCurrent() || !removal.restores) return;
       const restored = items?.find((item) => item.name === toolName);
       if (restored) setSelectedTool(restored);
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, `${removal.label}失败`));
+      setError(errorMessage(caught, `${removal.label}失败`));
     }
   });
   const reload = () => run(async () => {
@@ -150,9 +150,9 @@ const ToolInventorySection = () => {
       if (!requests.isCurrent()) return;
       setMessage(`工具已重载，序号 ${result.seq ?? '未知'}`);
       await load();
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, '重载工具失败'));
+      setError(errorMessage(caught, '重载工具失败'));
     }
   });
   const keyword = query.trim().toLowerCase();
@@ -236,7 +236,7 @@ const ToolInventorySection = () => {
               <Button className="mt-2" disabled={busy} onClick={create}>创建工具</Button>
             </Field>
           </div>
-          <StatusText message={notice} />
+          <Feedback error={error} notice={notice} />
       </>
     </Block>
   );

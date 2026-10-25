@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { errorMessage } from '../../api/request';
-import { Block, Button, StatusText } from '../../components/settings/pages/settingsControls';
+import { Block, Button, ErrorText } from '../../components/settings/pages/settingsControls';
 import { downloadFeature, featureRequest } from '../client';
 
 interface Check { name: string; status: string; detail: string; action: string; latency_ms?: number }
@@ -34,7 +34,7 @@ export function DiagnosticsPanel() {
       <Button disabled={busy} onClick={() => void run()}>{busy ? '正在检查…' : '开始诊断'}</Button>
       {report && <Button tone="quiet" disabled={busy} onClick={() => void downloadFeature(`/v1/operations/diagnostics/${report.id}/export`, `diagnostics-${report.id}.json`).catch(failure => setError(errorMessage(failure)))}>导出报告</Button>}
     </div>
-    <StatusText message={error} />
+    {error && <ErrorText role="alert">{error}</ErrorText>}
     {stale && <p role="status">下方保留的是上一份诊断报告；本次诊断{busy ? '仍在进行' : '未完成'}。</p>}
     {report && <div aria-live="polite" className="space-y-3">
       <p className="text-xs text-[var(--duties-secondary)]">本报告：{options.testModel ? '包含最小模型请求' : '未请求模型'} · {options.includeLogs ? '附带脱敏日志' : '未附日志'}</p>

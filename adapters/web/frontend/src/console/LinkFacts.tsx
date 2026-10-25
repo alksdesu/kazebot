@@ -2,12 +2,14 @@
 import { useState } from 'react';
 
 import { restartEngine } from '../api/supervisorClient';
+import { usePageNotice } from '../hooks/usePageNotice';
 import { useSettingsStore } from '../store/settingsStore';
 import { restartRefusal } from '../utils/systemStatus';
 import {
   Button,
   DangerPanel,
   Desc,
+  ErrorText,
   Facts,
   Panel,
   ReadOnlyRow,
@@ -83,16 +85,17 @@ export const Environment = () => {
 export const RestartEngine = () => {
   const token = useSettingsStore((state) => state.adminToken);
   const [armed, setArmed] = useState(false);
-  const [said, setSaid] = useState('');
+  const { notice, error, setMessage, setError } = usePageNotice();
 
   const fire = async () => {
     if (!token) return;
-    setSaid('正在请求…');
+    setMessage('正在请求…');
     try {
       const result = await restartEngine(token, '用户从控制台请求重启引擎');
-      setSaid(result?.scheduled ? '已排上重启，几秒后 worker 会重新起来。' : `没能重启：${restartRefusal(result)}。`);
-    } catch (error) {
-      setSaid(errorMessage(error, '请求失败'));
+      if (result?.scheduled) setMessage('已排上重启，几秒后 worker 会重新起来。');
+      else setError(`没能重启：${restartRefusal(result)}。`);
+    } catch (caught) {
+      setError(errorMessage(caught, '请求失败'));
     }
     setArmed(false);
   };
@@ -113,7 +116,8 @@ export const RestartEngine = () => {
       ) : (
         <Button onClick={() => setArmed(true)} tone="danger">重启</Button>
       )}
-      {said && <Facts className="basis-full">{said}</Facts>}
+      {error && <ErrorText className="basis-full" role="alert">{error}</ErrorText>}
+      {notice && <Facts className="basis-full" role="status">{notice}</Facts>}
     </DangerPanel>
   );
 };

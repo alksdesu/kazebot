@@ -17,6 +17,7 @@ import {
 import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { appendSentence } from '../utils/sentence';
+import { restartRefusal } from '../utils/systemStatus';
 import { Block, Button, Facts, Footnote, Input, ItemTitle, List, Panel, Row, Tag } from './components';
 import { errorMessage } from '../api/request';
 
@@ -36,6 +37,8 @@ const memberLine = (group: ShareGroup): string => (
     ? group.members.map(member => (member.current ? `${member.label}（当前实例）` : member.label)).join('、')
     : '还没有成员'
 );
+
+const restartMissed = (reason: string): string => `没能重启 engine：${reason}。新配置要等它重启才生效，到「运行」里手动重启一次。`;
 
 const createdLine = (group: ShareGroup): string => {
   const when = group.created_at ? new Date(group.created_at).toLocaleString() : '';
@@ -91,14 +94,21 @@ export const ConfigShareGroups = ({ token }: { token: string }) => {
       setLoading(false);
       const message = done(result);
       if (action === 'delete') { setNote(message); return; }
+      // 配置已经换掉是成功的那半句，照常交代；没重启上是另一回事，单独报错。
       try {
         const restart = await restartEngine(token, ACTION_REASON[action]);
         if (!requests.isCurrent()) return;
-        setNote(appendSentence(message, restart.scheduled
-          ? 'engine 正在重启，工具和节点会换成新配置。'
-          : `但 engine 没排上重启（${restart.reason || '已有重启在进行'}），稍后在「运行」里手动重启一次。`));
+        if (restart.scheduled) {
+          setNote(appendSentence(message, 'engine 正在重启，工具和节点会换成新配置。'));
+        } else {
+          setNote(message);
+          setProblem(restartMissed(restartRefusal(restart)));
+        }
       } catch (failure) {
-        if (requests.isCurrent()) setNote(appendSentence(message, `但重启 engine 失败：${errorMessage(failure)}。稍后在「运行」里手动重启一次。`));
+        if (requests.isCurrent()) {
+          setNote(message);
+          setProblem(restartMissed(errorMessage(failure)));
+        }
       }
     } catch (failure) {
       if (requests.isCurrent()) setProblem(errorMessage(failure));

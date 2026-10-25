@@ -26,6 +26,7 @@ import {
   Check,
   Chip,
   Empty,
+  ErrorText,
   Facts,
   Footnote,
   Input,
@@ -87,7 +88,7 @@ const LibraryBlock = () => {
   const [draft, setDraft] = useState(EMPTY_DRAFT);
   const [editBaseline, setEditBaseline] = useState('');
   const [onlyFailed, setOnlyFailed] = useState(false);
-  const { notice, setMessage, setLoadError } = usePageNotice();
+  const { notice, error, setMessage, setError, setLoadError } = usePageNotice();
   const [busy, setBusy] = useState(false);
 
   const [file, setFile] = useState<File | null>(null);
@@ -115,7 +116,7 @@ const LibraryBlock = () => {
       setItems(page.items);
       setCounts(page.counts);
       setLoadError('');
-    } catch (error) { if (request.isCurrent()) setLoadError(errorMessage(error)); }
+    } catch (caught) { if (request.isCurrent()) setLoadError(errorMessage(caught)); }
   };
 
   useEffect(() => { void load(); }, [requests, tab, search, offset]);
@@ -141,9 +142,9 @@ const LibraryBlock = () => {
       await load();
       if (!requests.isCurrent()) return;
       setMessage(done);
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error));
+      setError(errorMessage(caught));
     } finally {
       setBusy(false);
     }
@@ -205,7 +206,7 @@ const LibraryBlock = () => {
   };
 
   const upload = () => run(async (token) => {
-    if (!file) return '先选一个文件';
+    if (!file) throw new Error('先选一个文件');
     const row = await uploadSticker(token, file, { name: uploadName.trim(), accept: uploadAccept });
     setFile(null);
     setUploadName('');
@@ -348,6 +349,7 @@ const LibraryBlock = () => {
         )}
 
         <Pager offset={offset} onOffset={setOffset} pageSize={PAGE_SIZE} total={total} unit="张" />
+        {error && <ErrorText role="alert">{error}</ErrorText>}
         {notice && <Footnote>{notice}</Footnote>}
       </Block>
 

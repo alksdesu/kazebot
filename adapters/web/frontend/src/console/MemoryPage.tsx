@@ -17,7 +17,7 @@ import {
   type MemoryNamespace,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
-import { Block, Button, Check, Empty, Footnote, Input, Pager, Tag } from './components';
+import { Block, Button, Check, Empty, ErrorText, Footnote, Input, Pager, Tag } from './components';
 import { sizeText } from './format';
 import { useConversationDirectory } from '../features/useConversationDirectory';
 import { useConversationNames } from '../features/useConversationNames';
@@ -71,7 +71,7 @@ const MemoryBlock = () => {
   const [selected, setSelected] = useState('');
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
   const [draft, setDraft] = useState(EMPTY_DRAFT);
-  const { notice, setMessage, setLoadError } = usePageNotice();
+  const { notice, error, setMessage, setError, setLoadError } = usePageNotice();
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
   const [overviewLoading, setOverviewLoading] = useState(true);
@@ -93,8 +93,8 @@ const MemoryBlock = () => {
       const result = await getMemoryOverview(adminToken);
       if (!request.isCurrent()) return;
       setNamespaces(result); setLoadError('', 'overview');
-    } catch (error) {
-      if (request.isCurrent()) setLoadError(errorMessage(error), 'overview');
+    } catch (caught) {
+      if (request.isCurrent()) setLoadError(errorMessage(caught), 'overview');
     } finally {
       if (request.isCurrent()) setOverviewLoading(false);
     }
@@ -108,8 +108,8 @@ const MemoryBlock = () => {
       const result = await getMemoryEntries(adminToken, namespace);
       if (!request.isCurrent()) return;
       setEntries(result); setEntriesScope(namespace); setLoadError('', 'entries');
-    } catch (error) {
-      if (request.isCurrent()) setLoadError(errorMessage(error), 'entries');
+    } catch (caught) {
+      if (request.isCurrent()) setLoadError(errorMessage(caught), 'entries');
     } finally {
       if (request.isCurrent()) setLoading(false);
     }
@@ -161,8 +161,8 @@ const MemoryBlock = () => {
       await loadEntries(selected);
       await loadOverview();
       setMessage('已添加');
-    } catch (error) {
-      setMessage(errorMessage(error));
+    } catch (caught) {
+      setError(errorMessage(caught));
     } finally {
       setBusy(false);
     }
@@ -175,7 +175,7 @@ const MemoryBlock = () => {
       await deleteMemoryEntry(adminToken, selected, entry.book, entry.id);
       await loadEntries(selected);
       await loadOverview();
-    } catch (error) { setMessage(errorMessage(error)); } finally { setBusy(false); }
+    } catch (caught) { setError(errorMessage(caught)); } finally { setBusy(false); }
   };
 
   const clearAll = async () => {
@@ -188,12 +188,12 @@ const MemoryBlock = () => {
       setDraft(EMPTY_DRAFT);
       await loadOverview();
       setMessage(`已清空 ${removed} 条`);
-    } catch (error) { setMessage(errorMessage(error)); } finally { setBusy(false); }
+    } catch (caught) { setError(errorMessage(caught)); } finally { setBusy(false); }
   };
 
   return (
     <Block hint="模型聊天时自己攒下来的。手动加的不会被自动清理" title="长期记忆">
-      {overviewLoading ? <Empty>正在读取记忆来源…</Empty> : namespaces.length === 0 && <Empty>{notice || '还没有任何记忆。'}</Empty>}
+      {overviewLoading ? <Empty>正在读取记忆来源…</Empty> : namespaces.length === 0 && !error && <Empty>还没有任何记忆。</Empty>}
       <div className="grid grid-cols-1 items-start gap-3.5 md:grid-cols-[var(--duties-split-columns)]">
         <div className="flex flex-col gap-1">
           <Input
@@ -319,6 +319,7 @@ const MemoryBlock = () => {
           )}
         </div>
       </div>
+      {error && <ErrorText role="alert">{error}</ErrorText>}
       {notice && <Footnote>{notice}</Footnote>}
     </Block>
   );
@@ -331,7 +332,7 @@ const ContextBlock = () => {
   const names = useConversationNames(rows.map(row => ({ scope: row.conversation_key || `session:${row.session_id}`, owner: row.owner, current_account: row.current_account })));
   const labelFor = (row: ConversationRow) => names.get(scopeIdentity(row.conversation_key || `session:${row.session_id}`)) || '会话（名称暂不可用）';
   const [preview, setPreview] = useState<{ id: string; total: number; messages: Array<Record<string, any>> } | null>(null);
-  const [note, setNote] = useState('');
+  const { notice, error, setMessage, setError } = usePageNotice();
   const [offset, setOffset] = useState(0);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -342,11 +343,11 @@ const ContextBlock = () => {
     if (preview?.id === row.session_id) { setPreview(null); setLoading(false); return; }
     setPreview(null);
     setLoading(true);
-    setNote('');
+    setMessage('');
     try {
       const result = await getConversationMessages(adminToken, row.session_id, 100);
       if (request.isCurrent()) setPreview({ id: row.session_id, ...result });
-    } catch (error) { if (request.isCurrent()) setNote(errorMessage(error)); }
+    } catch (caught) { if (request.isCurrent()) setError(errorMessage(caught)); }
     finally { if (request.isCurrent()) setLoading(false); }
   };
 
@@ -363,8 +364,8 @@ const ContextBlock = () => {
       setPreview(null);
       await load();
       if (!requests.isCurrent()) return;
-      setNote('已删除，下一条消息开始重新积累');
-    } catch (error) { if (requests.isCurrent()) setNote(errorMessage(error)); } finally { if (requests.isCurrent()) setBusy(false); }
+      setMessage('已删除，下一条消息开始重新积累');
+    } catch (caught) { if (requests.isCurrent()) setError(errorMessage(caught)); } finally { if (requests.isCurrent()) setBusy(false); }
   };
 
   const entry = (row: ConversationRow) => (
@@ -421,7 +422,7 @@ const ContextBlock = () => {
     <Block hint="删除会连带清掉 bot 侧的消息缓存与附件；长期记忆另算" title="会话上下文">
       {loading && <Footnote>正在读取会话…</Footnote>}
       {directoryLoading && <Footnote>正在读取会话名称…</Footnote>}
-      {directoryError && <Footnote>{directoryError} <Button onClick={() => void load()} tone="quiet">重试会话列表</Button></Footnote>}
+      {directoryError && <ErrorText role="alert">{directoryError} <Button onClick={() => void load()} tone="quiet">重试会话列表</Button></ErrorText>}
       {!directoryLoading && !directoryError && rows.length === 0 && <Empty>还没有任何会话。</Empty>}
       {/* 空的那一段拍平后不留痕迹，可「这个号一条都没有」正是要说的话，所以单拎出来。 */}
       {stale.length > 0 && mine.length === 0 && (
@@ -439,7 +440,8 @@ const ContextBlock = () => {
         </Fragment>
       ))}
       <Pager offset={offset} onOffset={setOffset} pageSize={CONV_PAGE} total={listed.length} unit="个" />
-      {note && <Footnote>{note}</Footnote>}
+      {error && <ErrorText role="alert">{error}</ErrorText>}
+      {notice && <Footnote>{notice}</Footnote>}
     </Block>
   );
 };

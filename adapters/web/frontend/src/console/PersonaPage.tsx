@@ -1,5 +1,6 @@
 // 人格：人设、模型与补充 System。各块各自保存，写的是节点文件。
 import { useEffect, useId, useState } from 'react';
+import { usePageNotice } from '../hooks/usePageNotice';
 import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
@@ -99,7 +100,7 @@ const PromptFragmentEditor = ({ fragment, onReload }: { fragment: PromptFragment
   const [missing, setMissing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
-  const [note, setNote] = useState('正在读取…');
+  const { notice, error, setMessage, setError, setLoadError } = usePageNotice();
   const requests = useRequestGuard(fragment.filename);
   const confirmDiscard = useUnsavedChanges(text !== saved, `${fragment.label}有未保存修改，确定离开或丢弃吗？`);
 
@@ -115,16 +116,16 @@ const PromptFragmentEditor = ({ fragment, onReload }: { fragment: PromptFragment
         setText(file?.content ?? '');
         setBase(file ? file.hash : '');
         setMissing(file === null);
-        setNote('');
+        setLoadError('');
         setLoaded(true);
-      } catch (error) {
+      } catch (caught) {
         if (!request.isCurrent()) return;
         setMissing(false);
         setLoaded(false);
-        setNote(errorMessage(error));
+        setLoadError(errorMessage(caught));
       }
     })();
-  }, [requests, token, fragment.filename]);
+  }, [requests, token, fragment.filename, setLoadError]);
 
   const save = async () => {
     if (!token || busy || !loaded) return;
@@ -134,11 +135,11 @@ const PromptFragmentEditor = ({ fragment, onReload }: { fragment: PromptFragment
       setSaved(text);
       setBase(result.hash);
       setMissing(false);
-      setNote(savedMessage(fragment.savedNote, '', result.warnings));
-    } catch (error) {
-      setNote(isEditConflict(error)
+      setMessage(savedMessage(fragment.savedNote, '', result.warnings));
+    } catch (caught) {
+      setError(isEditConflict(caught)
         ? `${fragment.label}在打开之后被别处改过，没有保存：点「丢弃」读入最新内容，再把改动重做一遍。`
-        : errorMessage(error));
+        : errorMessage(caught));
     }
     setBusy(false);
   };
@@ -163,10 +164,11 @@ const PromptFragmentEditor = ({ fragment, onReload }: { fragment: PromptFragment
         busy={busy}
         dirty={loaded && text !== saved}
         label={`保存${fragment.label}`}
-        note={note}
+        note={notice || (loaded || error ? '' : '正在读取…')}
         onReset={() => { if (confirmDiscard()) onReload(); }}
         onSave={() => void save()}
       />
+      {error && <ErrorText role="alert">{error}</ErrorText>}
     </>
   );
 };
@@ -184,7 +186,8 @@ const ModelChoiceEditor = () => {
   const [providerModels, setProviderModels] = useState<string[]>([]);
   const [nodeModels, setNodeModels] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState('正在读取…');
+  const [loaded, setLoaded] = useState(false);
+  const { notice, error, setMessage, setError, setLoadError } = usePageNotice();
 
   const adopt = (body: string) => {
     setRaw(body);
@@ -196,9 +199,10 @@ const ModelChoiceEditor = () => {
     void (async () => {
       try {
         adopt((await getNodeRaw(token, NODE_ID)).content);
-        setNote('');
-      } catch (error) {
-        setNote(errorMessage(error));
+        setLoadError('');
+        setLoaded(true);
+      } catch (caught) {
+        setLoadError(errorMessage(caught));
       }
       // 候选表拉不到不影响改模型，所以各自吞掉失败。
       void getNodes(token)
@@ -209,7 +213,7 @@ const ModelChoiceEditor = () => {
         .then((data) => setProviderModels(modelsFromProviders(data)))
         .catch(() => undefined);
     })();
-  }, [token]);
+  }, [token, setLoadError]);
 
   const dirty = model !== (raw ? modelOf(raw) : '');
   const confirmDiscard = useUnsavedChanges(dirty, '节点模型还有未保存修改，确定离开或丢弃吗？');
@@ -229,9 +233,9 @@ const ModelChoiceEditor = () => {
       const saved = rewriteNote
         ? `已保存。${rewriteNote}。节点文件每次任务都重新读，立刻生效。`
         : '已保存。节点文件每次任务都重新读，立刻生效。';
-      setNote(savedMessage(saved, '', result.warnings));
-    } catch (error) {
-      setNote(errorMessage(error));
+      setMessage(savedMessage(saved, '', result.warnings));
+    } catch (caught) {
+      setError(errorMessage(caught));
     }
     setBusy(false);
   };
@@ -258,7 +262,8 @@ const ModelChoiceEditor = () => {
         任意模型 id 都能填；也可以写 <code>$ENV{'{VAR}'}</code>，从环境变量取。
       </Facts>
 
-      <SaveBar busy={busy} dirty={dirty && Boolean(raw)} label="保存模型" note={note} onReset={() => { if (confirmDiscard()) adopt(raw); }} onSave={() => void save()} />
+      <SaveBar busy={busy} dirty={dirty && Boolean(raw)} label="保存模型" note={notice || (loaded || error ? '' : '正在读取…')} onReset={() => { if (confirmDiscard()) adopt(raw); }} onSave={() => void save()} />
+      {error && <ErrorText role="alert">{error}</ErrorText>}
     </>
   );
 };

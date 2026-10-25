@@ -15,7 +15,7 @@ import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { startPolling } from '../../../utils/polling';
 import { countActiveTasks, formatUptime, restartRefusal } from '../../../utils/systemStatus';
-import { Block, Button, PageShell, StatusText } from './settingsControls';
+import { Block, Button, Feedback, PageShell } from './settingsControls';
 import { errorMessage } from '../../../api/request';
 
 const Stat = ({ label, value, detail, onClick }: { label: string; value: string | number; detail?: string; onClick?: () => void }) => {
@@ -43,7 +43,7 @@ const SystemSettingsPageBody = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const [adminState, setAdminState] = useState<AdminState | null>(null);
   const [health, setHealth] = useState<HealthState | null>(null);
-  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
+  const { notice, error, setMessage, setError, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const { busy, run } = useExclusiveAction();
   const [activeTasksOpen, setActiveTasksOpen] = useState(false);
@@ -55,6 +55,10 @@ const SystemSettingsPageBody = () => {
     setMessage(text);
     addSystemLog(text);
   }, [addSystemLog, setMessage]);
+  const reportFailure = useCallback((text: string) => {
+    setError(text);
+    addSystemLog(text);
+  }, [addSystemLog, setError]);
 
   const load = useCallback(async (showSpinner = true) => {
     if (!adminToken || !isAuthenticated) return;
@@ -67,9 +71,9 @@ const SystemSettingsPageBody = () => {
       setAdminState(state);
       setHealth(healthState);
       setLoadError('');
-    } catch (error) {
+    } catch (caught) {
       if (!request.isCurrent()) return;
-      setLoadError(errorMessage(error, '加载系统状态失败'));
+      setLoadError(errorMessage(caught, '加载系统状态失败'));
     } finally {
       if (showSpinner) setLoading(false);
     }
@@ -110,9 +114,9 @@ const SystemSettingsPageBody = () => {
       if (!requests.isCurrent()) return;
       report('配置已重载');
       await load(false);
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      report(errorMessage(error, '配置重载失败'));
+      reportFailure(errorMessage(caught, '配置重载失败'));
     }
   });
   const handleRestart = () => run(async () => {
@@ -122,10 +126,11 @@ const SystemSettingsPageBody = () => {
       const result = await restartEngine(adminToken);
       if (!requests.isCurrent()) return;
       // 没说排上就当没排上：报成功会让人白等。
-      report(result?.scheduled ? '已请求重启引擎' : `未能重启：${restartRefusal(result)}`);
-    } catch (error) {
+      if (result?.scheduled) report('已请求重启引擎');
+      else reportFailure(`未能重启：${restartRefusal(result)}`);
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      report(errorMessage(error, '重启失败'));
+      reportFailure(errorMessage(caught, '重启失败'));
     }
   });
   return (
@@ -153,7 +158,7 @@ const SystemSettingsPageBody = () => {
             <Button disabled={busy} onClick={handleReload}>重载配置</Button>
             <Button tone="danger" disabled={busy} onClick={handleRestart}>重启引擎</Button>
           </div>
-          <StatusText message={notice} />
+          <Feedback error={error} notice={notice} />
         </Block>
       </>
     </PageShell>

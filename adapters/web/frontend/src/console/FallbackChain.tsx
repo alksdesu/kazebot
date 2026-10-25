@@ -18,7 +18,7 @@ import {
 import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../store/settingsStore';
 import { ChannelOptions, wireOf } from './channelFields';
-import { Block, Button, Check, Desc, Empty, Facts, Input, Item, Panel, SaveBar, Segmented, Select } from './components';
+import { Block, Button, Check, Desc, Empty, ErrorText, Facts, Input, Item, Panel, SaveBar, Segmented, Select } from './components';
 import { OptionRow, shownFromValue, valueFromShown, visibleSpecs } from './optionFields';
 import { errorMessage } from '../api/request';
 
@@ -224,8 +224,10 @@ export const FallbackChain = ({
   const token = useSettingsStore((state) => state.adminToken);
   const [busy, setBusy] = useState(false);
   // 提示记着是写给哪条链的：换了节点就不显示，保存后数据重读也冲不掉。
-  const [note, setNote] = useState({ scope, text: '' });
-  const noteText = note.scope === scope ? note.text : '';
+  const [note, setNote] = useState({ scope, text: '', failed: false });
+  const shown = note.scope === scope ? note : null;
+  const noteText = shown && !shown.failed ? shown.text : '';
+  const noteError = shown?.failed ? shown.text : '';
 
   const { channels, wires } = useMemo(() => channelChoices(data), [data]);
   // 新建的一条默认指向第一个已配渠道 —— 那才是马上能用的，裸线格式还得再填地址密钥。
@@ -260,9 +262,9 @@ export const FallbackChain = ({
     setBusy(true);
     try {
       onSaved(await action(token));
-      setNote({ scope, text: done });
-    } catch (error) {
-      setNote({ scope, text: errorMessage(error) });
+      setNote({ scope, text: done, failed: false });
+    } catch (caught) {
+      setNote({ scope, text: errorMessage(caught), failed: true });
     }
     setBusy(false);
   };
@@ -343,6 +345,7 @@ export const FallbackChain = ({
           />
         </>
       )}
+      {noteError && <ErrorText role="alert">{noteError}</ErrorText>}
       </fieldset>
     </Block>
   );

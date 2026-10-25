@@ -14,7 +14,7 @@ import { useSettingsStore } from '../../../store/settingsStore';
 import { Icon } from '../../common';
 import { startPolling } from '../../../utils/polling';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
-import { Block, Button, PageShell, StatusText } from './settingsControls';
+import { Block, Button, Feedback, PageShell } from './settingsControls';
 import { errorMessage } from '../../../api/request';
 
 function detailString(approval: AdminApproval, key: string): string {
@@ -53,7 +53,7 @@ const ApprovalsSettingsPageBody = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const { selectedApproval, setSelectedApproval } = useSettingsSelectionStore();
   const [approvals, setApprovals] = useState<AdminApproval[]>([]);
-  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
+  const { notice, error, setMessage, setError, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const approvalDecision = useApprovalDecision();
   const requests = useRequestGuard();
@@ -72,9 +72,9 @@ const ApprovalsSettingsPageBody = () => {
       const selected = useSettingsSelectionStore.getState().selectedApproval;
       if (selected && !pending.some((item) => item.approval_id === selected.approval_id)) setSelectedApproval(null);
       setLoadError('');
-    } catch (error) {
+    } catch (caught) {
       if (!request.isCurrent()) return;
-      setLoadError(errorMessage(error, '加载审批失败'));
+      setLoadError(errorMessage(caught, '加载审批失败'));
     } finally {
       if (showSpinner) setLoading(false);
     }
@@ -99,7 +99,7 @@ const ApprovalsSettingsPageBody = () => {
     if (!adminToken) return;
     const outcome = await approvalDecision.decide(approval.approval_id, decision, `settings ${decision}`);
     if (!outcome) return;
-    if (outcome.failed) { setMessage(outcome.message); return; }
+    if (outcome.failed) { setError(outcome.message); return; }
     setMessage(outcome.applied ? (decision === 'allow' ? '已允许审批' : '已拒绝审批') : outcome.message);
     await load();
   };
@@ -156,7 +156,7 @@ const ApprovalsSettingsPageBody = () => {
             ))}
           </div>
         )}
-        <StatusText message={notice} />
+        <Feedback error={error} notice={notice} />
       </Block>
     </PageShell>
   );

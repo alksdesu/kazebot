@@ -10,11 +10,12 @@ import {
   type PolicyDoc,
   type PolicyRule,
 } from '../../../api/supervisorClient';
+import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { firstMatchIndex } from '../../../utils/globMatch';
-import { Button, DangerPanel, SaveBar, ScopeBadge } from './settingsControls';
+import { Button, DangerPanel, ErrorText, SaveBar, ScopeBadge } from './settingsControls';
 import { errorMessage } from '../../../api/request';
 
 type RuleSectionKey = 'read_file' | 'write_file';
@@ -462,7 +463,7 @@ export const PolicyRulesSection = () => {
   // 「丢弃」重读服务器上现在那一份，保存报冲突之后靠它换成最新内容。
   const [generation, setGeneration] = useState(0);
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState('');
+  const { notice, error, setMessage, setError, setLoadError } = usePageNotice();
   const [tab, setTab] = useState<TabKey>('write_file');
   const [fullAutoPending, setFullAutoPending] = useState(false);
   const [fullAutoOriginal, setFullAutoOriginal] = useState<PolicyDoc | null>(null);
@@ -480,12 +481,13 @@ export const PolicyRulesSection = () => {
         setFullAutoPending(false);
         setFullAutoOriginal(null);
         setCodeWriteRequested(false);
+        setLoadError('');
       })
-      .catch((error) => {
-        if (request.isCurrent()) setMessage(errorMessage(error, '读取策略失败'));
+      .catch((caught) => {
+        if (request.isCurrent()) setLoadError(errorMessage(caught, '读取策略失败'));
       });
     return () => { requests.drop('policy'); };
-  }, [requests, adminToken, isAuthenticated, generation]);
+  }, [requests, adminToken, isAuthenticated, generation, setLoadError]);
 
   const dirty = Boolean(doc) && JSON.stringify(doc) !== saved;
   const confirmDiscard = useUnsavedChanges(dirty, '「服务端策略」还有未保存修改，确定离开或丢弃吗？');
@@ -508,17 +510,17 @@ export const PolicyRulesSection = () => {
         try {
           await enableCodeWrite(adminToken);
           if (requests.isCurrent()) setMessage('策略已保存，已提交 /opt/kazebot 写入权限并重启 miaomiao');
-        } catch (error) {
-          if (requests.isCurrent()) setMessage(`策略已保存，但代码目录写权限未启用：${errorMessage(error, '宿主机操作失败')}`);
+        } catch (caught) {
+          if (requests.isCurrent()) setMessage('策略已保存。', `代码目录写权限没能启用：${errorMessage(caught, '宿主机操作失败')}`);
         }
       } else {
         setMessage('已保存，立即生效，不用重启');
       }
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(isEditConflict(error)
+      setError(isEditConflict(caught)
         ? '策略在打开之后被别处改过，没有保存：点「丢弃」读入最新内容，再把改动重做一遍。'
-        : errorMessage(error, '保存失败'));
+        : errorMessage(caught, '保存失败'));
     } finally {
       setBusy(false);
     }
@@ -599,7 +601,7 @@ export const PolicyRulesSection = () => {
       </div>
 
       {!doc ? (
-        <p className="text-xs text-[var(--duties-tertiary)]">{message || '正在读取…'}</p>
+        error ? <ErrorText role="alert">{error}</ErrorText> : <p className="text-xs text-[var(--duties-tertiary)]">{notice || '正在读取…'}</p>
       ) : (
         <div className="space-y-3">
           <div className="flex flex-wrap gap-1 border-b border-[var(--duties-border)] pb-2">
@@ -659,10 +661,11 @@ export const PolicyRulesSection = () => {
             busy={busy}
             dirty={dirty}
             label="保存策略"
-            note={message || (dirty ? '有未保存的改动' : '与服务器一致')}
+            note={notice || (dirty ? '有未保存的改动' : '与服务器一致')}
             onReset={() => { if (saved && confirmDiscard()) { setMessage(''); setGeneration((value) => value + 1); } }}
             onSave={() => void save()}
           />
+          {error && <ErrorText role="alert">{error}</ErrorText>}
         </div>
       )}
     </section>

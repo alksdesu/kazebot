@@ -5,7 +5,7 @@ import { getAccountScope, migrateAccountScope, type ScopeStatus, type ScopeStore
 import { usePageNotice } from '../hooks/usePageNotice';
 import { useRequestGuard } from '../hooks/useRequestGuard';
 import { useSettingsStore } from '../store/settingsStore';
-import { Block, Button, Footnote, Input } from './components';
+import { Block, Button, ErrorText, Footnote, Input } from './components';
 import { usePlatform } from './platformContext';
 import { errorMessage } from '../api/request';
 
@@ -30,7 +30,7 @@ export const AccountScope = () => {
   const platformId = usePlatform().id;
   const [status, setStatus] = useState<ScopeStatus | null>(null);
   const [target, setTarget] = useState('');
-  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
+  const { notice, error, setMessage, setError, setLoadError, clearNotice } = usePageNotice();
   const [busy, setBusy] = useState(false);
   const [previewTarget, setPreviewTarget] = useState('');
   const requests = useRequestGuard(platformId);
@@ -46,7 +46,7 @@ export const AccountScope = () => {
       setStatus(result);
       setPreviewTarget(withTarget);
       setLoadError('');
-    } catch (error) { if (request.isCurrent()) setLoadError(errorMessage(error)); }
+    } catch (caught) { if (request.isCurrent()) setLoadError(errorMessage(caught)); }
     finally { if (request.isCurrent()) setBusy(false); }
   };
 
@@ -71,7 +71,7 @@ export const AccountScope = () => {
       if (!requests.isCurrent()) return;
       setMessage(`已搬迁 ${result.moved_memory_dirs} 份记忆、${result.sessions_changed} 个会话。备份在 ${result.backup_dir}`);
       await load();
-    } catch (error) { if (requests.isCurrent()) setMessage(errorMessage(error)); } finally { if (requests.isCurrent()) setBusy(false); }
+    } catch (caught) { if (requests.isCurrent()) setError(errorMessage(caught)); } finally { if (requests.isCurrent()) setBusy(false); }
   };
 
   const current = previewTarget && previewTarget === target.trim();
@@ -158,6 +158,7 @@ export const AccountScope = () => {
           )}
         </div>
       )}
+      {error && <ErrorText role="alert">{error}</ErrorText>}
       {notice && <Footnote>{notice}</Footnote>}
     </Block>
   );

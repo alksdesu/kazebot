@@ -110,8 +110,8 @@ export const Item = ({ children, className = '' }: { children: ReactNode; classN
 );
 
 /** role 给页面开着时才冒出来的错误用：读屏不会自己去看新长出来的一行字。 */
-export const ErrorText = ({ children, role }: { children: ReactNode; role?: 'alert' }) => (
-  <p className="mt-2.5 text-xs leading-5 text-[var(--duties-danger)]" role={role}>{children}</p>
+export const ErrorText = ({ children, className = '', role }: { children: ReactNode; className?: string; role?: 'alert' }) => (
+  <p className={`mt-2.5 text-xs leading-5 text-[var(--duties-danger)] ${className}`} role={role}>{children}</p>
 );
 
 export const Footnote = ({ children }: { children: ReactNode }) => (
@@ -120,6 +120,14 @@ export const Footnote = ({ children }: { children: ReactNode }) => (
 
 export const StatusText = ({ message }: { message: string }) => (
   message ? <p role="status" aria-live="polite" className="mt-2 text-sm leading-6 text-[var(--duties-secondary)]">{message}</p> : null
+);
+
+/** 操作和读取的交代：出错的原因单占一行、用 alert 立刻念出来，成功的结果用 status 排队念。 */
+export const Feedback = ({ error, notice }: { error: string; notice: string }) => (
+  <>
+    {error && <ErrorText role="alert">{error}</ErrorText>}
+    <StatusText message={notice} />
+  </>
 );
 
 /** role 同 ErrorText：操作结果这类中途出现的交代要让读屏念出来。 */

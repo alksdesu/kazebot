@@ -14,7 +14,7 @@ import { useSettingsStore } from '../../../store/settingsStore';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { overlaySourceLabel, removalFor } from '../../../utils/overlaySource';
 import { describeEnvRef } from '../../../utils/envRef';
-import { Block, Button, Field, Input, PageShell, Select, StatusText } from './settingsControls';
+import { Block, Button, Feedback, Field, Input, PageShell, Select } from './settingsControls';
 import { savedMessage } from '../../../utils/sentence';
 import { errorMessage } from '../../../api/request';
 
@@ -38,7 +38,7 @@ export const AgentsSettingsPage = () => {
   const [nodes, setNodes] = useState<AdminNode[]>([]);
   const [newId, setNewId] = useState('');
   const [template, setTemplate] = useState('ai');
-  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
+  const { notice, error, setMessage, setError, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const { busy, run } = useExclusiveAction();
   const requests = useRequestGuard();
@@ -54,9 +54,9 @@ export const AgentsSettingsPage = () => {
       if (selectedNode && !items.some((item) => item.id === selectedNode.id)) setSelectedNode(null);
       setLoadError('');
       return items;
-    } catch (error) {
+    } catch (caught) {
       if (!request.isCurrent()) return undefined;
-      setLoadError(errorMessage(error, '加载节点失败'));
+      setLoadError(errorMessage(caught, '加载节点失败'));
       return undefined;
     } finally {
       if (request.isCurrent()) setLoading(false);
@@ -84,7 +84,7 @@ export const AgentsSettingsPage = () => {
   const create = () => run(async () => {
     if (!adminToken) return;
     const id = newId.trim();
-    if (!id) { setMessage('请输入节点 ID'); return; }
+    if (!id) { setError('请输入节点 ID'); return; }
     if (!confirmNavigation()) return;
     try {
       const result = await createNode(adminToken, { id, content: nodeTemplate(id, template) });
@@ -94,9 +94,9 @@ export const AgentsSettingsPage = () => {
       await loadNodes();
       if (!requests.isCurrent()) return;
       setSelectedNode({ id, name: id, type: template === 'tool' ? 'tool' : 'ai', model: '', description: '通过设置页面创建的节点。', delegate_targets: [] } as AdminNode);
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, '创建节点失败'));
+      setError(errorMessage(caught, '创建节点失败'));
     }
   });
   // 没声明来源的是老版本后端给的，那时列出来的都是实例自己的文件。
@@ -116,9 +116,9 @@ export const AgentsSettingsPage = () => {
       if (!requests.isCurrent() || !removal.restores) return;
       const restored = items?.find((item) => item.id === nodeId);
       if (restored) setSelectedNode(restored);
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, `${removal.label}失败`));
+      setError(errorMessage(caught, `${removal.label}失败`));
     }
   });
   return (
@@ -167,7 +167,7 @@ export const AgentsSettingsPage = () => {
             <Button className="mt-2" disabled={busy} onClick={create}>创建节点</Button>
           </Field>
         </div>
-        <StatusText message={notice} />
+        <Feedback error={error} notice={notice} />
       </Block>
     </PageShell>
   );

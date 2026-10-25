@@ -6,7 +6,7 @@ import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { deleteNodeFile, getNodeFileRaw, getNodeFiles, updateNodeFileRaw, type NodeFileInfo } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { overlaySourceLabel, removalFor } from '../../../utils/overlaySource';
-import { Block, Button, Field, PageShell, Select, StatusText } from './settingsControls';
+import { Block, Button, Feedback, Field, PageShell, Select } from './settingsControls';
 import { savedMessage } from '../../../utils/sentence';
 import { errorMessage } from '../../../api/request';
 
@@ -43,7 +43,7 @@ const NodeFilesSettingsPageEditor = () => {
   const [selected, setSelected] = useState('');
   const [content, setContent] = useState('');
   const [filter, setFilter] = useState<FileFilter>('all');
-  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
+  const { notice, error, setMessage, setError, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState('');
@@ -72,9 +72,9 @@ const NodeFilesSettingsPageEditor = () => {
       const body = file?.content ?? '';
       setContent(body); setSaved(body); setBase(file?.hash ?? null); setLoaded(Boolean(nextSelected));
       setLoadError('');
-    } catch (error) {
+    } catch (caught) {
       if (!request.isCurrent()) return;
-      setLoadError(errorMessage(error, '加载节点文件失败'));
+      setLoadError(errorMessage(caught, '加载节点文件失败'));
     } finally {
       if (request.isCurrent()) setLoading(false);
     }
@@ -100,9 +100,9 @@ const NodeFilesSettingsPageEditor = () => {
       const file = await getNodeFileRaw(adminToken, filename);
       if (!request.isCurrent()) return;
       setContent(file.content); setSaved(file.content); setBase(file.hash); setLoaded(true);
-    } catch (error) {
+    } catch (caught) {
       if (!request.isCurrent()) return;
-      setLoadError(errorMessage(error, '读取文件失败'));
+      setLoadError(errorMessage(caught, '读取文件失败'));
     } finally {
       if (request.isCurrent()) setLoading(false);
     }
@@ -117,8 +117,8 @@ const NodeFilesSettingsPageEditor = () => {
       setMessage(savedMessage(`已保存 ${selected}`, '', result.warnings));
       // 保存仓库默认会在 config/nodes 下落一份本实例的，列表里的来源和路径跟着变。
       if (files.find(file => file.name === selected)?.source === 'default') await loadFiles();
-    } catch (error) {
-      setMessage(errorMessage(error, '保存失败'));
+    } catch (caught) {
+      setError(errorMessage(caught, '保存失败'));
     } finally {
       setSaving(false);
     }
@@ -139,8 +139,8 @@ const NodeFilesSettingsPageEditor = () => {
       setSaved(content);
       setMessage(removal.done);
       await loadFiles();
-    } catch (error) {
-      setMessage(errorMessage(error, `${removal.label}失败`));
+    } catch (caught) {
+      setError(errorMessage(caught, `${removal.label}失败`));
     } finally {
       setSaving(false);
     }
@@ -185,7 +185,7 @@ const NodeFilesSettingsPageEditor = () => {
           <Button disabled={!selected || !loaded || loading || saving || content === saved} onClick={save}>{saving ? '正在保存…' : '保存当前文件'}</Button>
           <Button tone={removal?.restores ? 'quiet' : 'danger'} disabled={!removal || loading || saving} onClick={() => void remove()}>{removal?.label ?? '恢复默认'}</Button>
         </div>
-        <StatusText message={notice} />
+        <Feedback error={error} notice={notice} />
       </Block>
     </PageShell>
   );

@@ -450,12 +450,13 @@ describe('换完配置之后的那次重启', () => {
     await act(async () => { fireEvent.click(within(rowOf('alpha')).getByRole('button', { name: '加入' })); });
   };
 
-  it('没排上重启时说出后端给的原因，并让人自己去「运行」里补一次', async () => {
-    vi.mocked(api.restartEngine).mockResolvedValue({ scheduled: false, target: 'engine', reason: '上一次重启还没收尾' });
+  it('没排上重启时另起一行说出原因，并让人自己去「运行」里补一次', async () => {
+    vi.mocked(api.restartEngine).mockResolvedValue({ scheduled: false, target: 'engine', reason: 'restart already in progress' });
     await joinAlpha();
 
-    expect(screen.getByRole('status')).toHaveTextContent(
-      '已加入「alpha」。但 engine 没排上重启（上一次重启还没收尾），稍后在「运行」里手动重启一次。',
+    expect(screen.getByRole('status')).toHaveTextContent(/^已加入「alpha」。$/);
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      '没能重启 engine：上一次重启还没收尾，稍后再试。新配置要等它重启才生效，到「运行」里手动重启一次。',
     );
   });
 
@@ -463,16 +464,16 @@ describe('换完配置之后的那次重启', () => {
     vi.mocked(api.restartEngine).mockResolvedValue({ scheduled: false, target: 'engine' });
     await joinAlpha();
 
-    expect(screen.getByRole('status')).toHaveTextContent('但 engine 没排上重启（已有重启在进行），稍后在「运行」里手动重启一次。');
+    expect(screen.getByRole('alert')).toHaveTextContent('没能重启 engine：调度器没有排上这次重启。新配置要等它重启才生效，到「运行」里手动重启一次。');
   });
 
-  it('重启请求本身失败时，配置已经换掉这件事照样得说清楚', async () => {
+  it('重启请求本身失败时，配置已经换掉这件事照样得说清楚，失败原因另起一行报错', async () => {
     vi.mocked(api.restartEngine).mockRejectedValue(new Error('调度器没应答'));
     await joinAlpha();
 
-    expect(screen.getByRole('status')).toHaveTextContent(
-      '已加入「alpha」。但重启 engine 失败：调度器没应答。稍后在「运行」里手动重启一次。',
+    expect(screen.getByRole('status')).toHaveTextContent(/^已加入「alpha」。$/);
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      '没能重启 engine：调度器没应答。新配置要等它重启才生效，到「运行」里手动重启一次。',
     );
-    expect(screen.queryByRole('alert')).toBeNull();
   });
 });

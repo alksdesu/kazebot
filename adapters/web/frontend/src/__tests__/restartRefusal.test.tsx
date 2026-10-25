@@ -107,7 +107,7 @@ describe('被拒的重启在界面上', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/v1/admin/state', readInit));
     fireEvent.click(screen.getByRole('button', { name: '重启引擎' }));
 
-    expect(await screen.findByRole('status')).toHaveTextContent('未能重启：上一次重启还没收尾，稍后再试');
+    expect(await screen.findByRole('alert')).toHaveTextContent('未能重启：上一次重启还没收尾，稍后再试');
   });
 
   it('系统设置页把正在跑的那次和它的开始时间一起说出来', async () => {
@@ -118,7 +118,7 @@ describe('被拒的重启在界面上', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/v1/admin/state', readInit));
     fireEvent.click(screen.getByRole('button', { name: '重启引擎' }));
 
-    expect(await screen.findByRole('status'))
+    expect(await screen.findByRole('alert'))
       .toHaveTextContent(`未能重启：上一次全量重启（${at(SINCE)} 开始）还没收尾，稍后再试`);
   });
 
@@ -131,7 +131,7 @@ describe('被拒的重启在界面上', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/v1/admin/state', readInit));
     fireEvent.click(screen.getByRole('button', { name: '重启引擎' }));
 
-    expect(await screen.findByRole('status')).toHaveTextContent('未能重启：调度器没有排上这次重启');
+    expect(await screen.findByRole('alert')).toHaveTextContent('未能重启：调度器没有排上这次重启');
   });
 
   it('系统设置页排上了就不提原因', async () => {

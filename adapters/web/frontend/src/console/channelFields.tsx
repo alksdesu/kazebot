@@ -2,6 +2,7 @@
 import { useMemo, useState, type ReactNode } from 'react';
 
 import { listUpstreamModels, type ChannelChoice, type ProviderProfiles } from '../api/supervisorClient';
+import { usePageNotice } from '../hooks/usePageNotice';
 import { useSettingsStore } from '../store/settingsStore';
 import { Button, ErrorText, Input } from './components';
 import { errorMessage } from '../api/request';
@@ -10,9 +11,11 @@ import { errorMessage } from '../api/request';
 const LABEL_COL = '3em';
 const COL_GAP = '10px';
 
-const ChanNote = ({ children }: { children: ReactNode }) => (
+/** failed 的旁注报的是出错原因：标红，并且冒出来时让读屏立刻念。 */
+const ChanNote = ({ children, failed = false }: { children: ReactNode; failed?: boolean }) => (
   <p
-    className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]"
+    className={`mt-1 text-xs leading-5 ${failed ? 'text-[var(--duties-danger)]' : 'text-[var(--duties-secondary)]'}`}
+    role={failed ? 'alert' : undefined}
     style={{ marginLeft: `calc(${LABEL_COL} + ${COL_GAP})` }}
   >
     {children}
@@ -146,7 +149,7 @@ export const ModelField = ({
   const token = useSettingsStore((state) => state.adminToken);
   const [pulled, setPulled] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState('');
+  const { notice, error, setMessage, setError } = usePageNotice();
 
   // 拉到的排前面：那是这家真有的，比从别处抄来的名字可信。
   const options = useMemo(
@@ -157,7 +160,7 @@ export const ModelField = ({
   const pull = async () => {
     if (!token) return;
     setBusy(true);
-    setNote('');
+    setMessage('');
     try {
       const models = await listUpstreamModels(token, provider, {
         base_url: baseUrl,
@@ -165,9 +168,9 @@ export const ModelField = ({
         ...(slot ? { slot } : {}),
       });
       setPulled(models);
-      setNote(models.length + ' 个模型，点输入框选');
+      setMessage(models.length + ' 个模型，点输入框选');
     } catch (caught) {
-      setNote(errorMessage(caught));
+      setError(errorMessage(caught));
     }
     setBusy(false);
   };
@@ -198,7 +201,8 @@ export const ModelField = ({
           {busy ? '正在拉取…' : '拉取'}
         </Button>
       </FieldRow>
-      {note && <ChanNote>{note}</ChanNote>}
+      {error && <ChanNote failed>{error}</ChanNote>}
+      {notice && <ChanNote>{notice}</ChanNote>}
     </>
   );
 };

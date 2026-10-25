@@ -18,7 +18,7 @@ import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { startPolling } from '../../../utils/polling';
-import { Block, Button, Empty, Facts, Footnote, List, PageShell, Pip, Row, StatusText } from './settingsControls';
+import { Block, Button, Empty, ErrorText, Facts, Footnote, List, PageShell, Pip, Row } from './settingsControls';
 import { errorMessage } from '../../../api/request';
 
 const POLL_MS = 5000;
@@ -134,7 +134,7 @@ const LogViewer = ({ token }: { token: string }) => {
   const [picked, setPicked] = useState('');
   const [text, setText] = useState('');
   const [truncated, setTruncated] = useState(false);
-  const [note, setNote] = useState('');
+  const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const box = useRef<HTMLPreElement>(null);
   const requests = useRequestGuard();
@@ -146,8 +146,8 @@ const LogViewer = ({ token }: { token: string }) => {
       if (!request.isCurrent()) return;
       setFiles(rows);
       setPicked((current) => current || rows[0]?.name || '');
-    } catch (error) {
-      if (request.isCurrent()) setNote(errorMessage(error));
+    } catch (caught) {
+      if (request.isCurrent()) setError(errorMessage(caught));
     }
   }, [requests, token]);
 
@@ -158,7 +158,7 @@ const LogViewer = ({ token }: { token: string }) => {
     // 连着点两个文件时只认后点的那个，先点的慢回来不能把别的文件内容摆到这个文件名底下。
     const request = requests.begin('tail');
     setBusy(true);
-    setNote('');
+    setError('');
     try {
       const result = await readLogTail(token, name, TAIL_LINES);
       if (!request.isCurrent()) return;
@@ -168,8 +168,8 @@ const LogViewer = ({ token }: { token: string }) => {
       requestAnimationFrame(() => {
         if (box.current) box.current.scrollTop = box.current.scrollHeight;
       });
-    } catch (error) {
-      if (request.isCurrent()) setNote(errorMessage(error));
+    } catch (caught) {
+      if (request.isCurrent()) setError(errorMessage(caught));
     } finally {
       if (request.isCurrent()) setBusy(false);
     }
@@ -214,7 +214,7 @@ const LogViewer = ({ token }: { token: string }) => {
               {text || '（空）'}
             </pre>
             {truncated && <Facts>只显示了尾部，前面的内容请到服务器上看完整文件。</Facts>}
-            <StatusText message={note} />
+            {error && <ErrorText role="alert">{error}</ErrorText>}
           </div>
         </div>
       )}
@@ -231,7 +231,7 @@ export const RuntimeSettingsPage = () => {
 const RuntimeSettingsPageBody = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
-  const { notice, setMessage, setLoadError } = usePageNotice();
+  const { error, setError, setLoadError } = usePageNotice();
   const [retrying, setRetrying] = useState(false);
   const requests = useRequestGuard();
 
@@ -245,8 +245,8 @@ const RuntimeSettingsPageBody = () => {
       if (!request.isCurrent()) return;
       setStatus(next);
       setLoadError('');
-    } catch (error) {
-      if (request.isCurrent()) setLoadError(errorMessage(error));
+    } catch (caught) {
+      if (request.isCurrent()) setLoadError(errorMessage(caught));
     }
   }, [requests, adminToken, setLoadError]);
 
@@ -258,14 +258,14 @@ const RuntimeSettingsPageBody = () => {
   const onRetry = async () => {
     if (!adminToken) return;
     setRetrying(true);
-    setMessage('');
+    setError('');
     try {
       await retryEngine(adminToken);
       if (!requests.isCurrent()) return;
       await load();
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error));
+      setError(errorMessage(caught));
     } finally {
       setRetrying(false);
     }
@@ -302,7 +302,7 @@ const RuntimeSettingsPageBody = () => {
               任务队列：等待 {status.tasks.queued} 个，执行中 {status.tasks.running} 个。
             </Facts>
           )}
-          <StatusText message={notice} />
+          {error && <ErrorText role="alert">{error}</ErrorText>}
         </Block>
 
         {adminToken && <LogViewer token={adminToken} />}

@@ -166,7 +166,7 @@ function PluginDetail({ plugin, token, choices, runtime, changed, busy, run, onU
   const [sourceError, setSourceError] = useState('');
   const [sourceReadable, setSourceReadable] = useState(false);
   const [sourceAttempt, setSourceAttempt] = useState(0);
-  const [message, setMessage] = useState('');
+  const { notice, error, setMessage, setError } = usePageNotice();
   // 只管详情自己的读取。保存类操作看 current（工作区那一层）：换选别的插件、详情卸掉了，已发出的保存照样要写回列表。
   const requests = useRequestGuard(plugin.id);
   const configDirty = json({ enabled, config, selectors }) !== savedConfig;
@@ -184,15 +184,15 @@ function PluginDetail({ plugin, token, choices, runtime, changed, busy, run, onU
       setSavedSource(result.content);
       setSourceHash(result.hash);
       setSourceReadable(true);
-    }).catch((error: unknown) => {
-      if (request.isCurrent()) setSourceError(errorMessage(error));
+    }).catch((caught: unknown) => {
+      if (request.isCurrent()) setSourceError(errorMessage(caught));
     }).finally(() => { if (request.isCurrent()) setSourceLoading(false); });
     return () => { requests.drop('source'); };
   }, [requests, token, plugin.id, plugin.kind, sourceAttempt]);
 
   let parsed: Record<string, unknown> | null = null;
   let validation = '';
-  try { parsed = configObject(config); validation = enabled ? validateParams(parsed, plugin.params_schema) : ''; } catch (error) { validation = errorMessage(error); }
+  try { parsed = configObject(config); validation = enabled ? validateParams(parsed, plugin.params_schema) : ''; } catch (caught) { validation = errorMessage(caught); }
   const setParam = (key: string, value: unknown) => {
     if (parsed) setConfig(json({ ...parsed, [key]: value }));
   };
@@ -209,8 +209,8 @@ function PluginDetail({ plugin, token, choices, runtime, changed, busy, run, onU
       setSavedConfig(json({ enabled: result.enabled, config: json(result.config), selectors: result.selectors }));
       setMessage('配置已保存，运行进程会自动更新；可立即应用并查看状态。');
       void refreshFrontendPlugins();
-    } catch (error) {
-      if (current()) setMessage(isEditConflict(error) ? '插件已被其他页面修改。草稿已保留，请复制后刷新并核对。' : errorMessage(error));
+    } catch (caught) {
+      if (current()) setError(isEditConflict(caught) ? '插件已被其他页面修改。草稿已保留，请复制后刷新并核对。' : errorMessage(caught));
     }
   });
   const saveSource = () => run(async () => {
@@ -233,25 +233,25 @@ function PluginDetail({ plugin, token, choices, runtime, changed, busy, run, onU
       setMessage(configDirty && nextConfig !== savedConfig
         ? '源码已保存，但参数定义或配置已变化。运行进程会自动更新；配置草稿已保留，请复制后刷新并核对，再保存配置。'
         : '源码已保存，运行进程会自动更新；可立即应用并查看状态。');
-    } catch (error) {
-      if (current()) setMessage(isEditConflict(error) ? '源码已被其他页面修改。草稿已保留，请复制后刷新并核对。' : errorMessage(error));
+    } catch (caught) {
+      if (current()) setError(isEditConflict(caught) ? '源码已被其他页面修改。草稿已保留，请复制后刷新并核对。' : errorMessage(caught));
     }
   });
   const replaceFile = (file: File | undefined) => {
     if (!file) return;
     void run(async () => {
-      if (!/\.py$/i.test(file.name)) { setMessage('请选择 .py 插件文件'); return; }
+      if (!/\.py$/i.test(file.name)) { setError('请选择 .py 插件文件'); return; }
       if (sourceDirty && !window.confirm('替换文件会覆盖尚未保存的源码，确定继续吗？')) return;
       try {
         const content = await file.text();
         if (current()) { setSource(content); setSourceError(''); setMessage('替换的源码尚未保存。'); }
-      } catch (error) { if (current()) setMessage(errorMessage(error)); }
+      } catch (caught) { if (current()) setError(errorMessage(caught)); }
     });
   };
   const replacePackage = (file: File | undefined) => {
     if (!file) return;
     void run(async () => {
-      if (!/\.zip$/i.test(file.name)) { setMessage('请选择 .zip 插件包'); return; }
+      if (!/\.zip$/i.test(file.name)) { setError('请选择 .zip 插件包'); return; }
       if (!current() || !confirmNavigation()) return;
       try {
         const result = await installPluginPackage(token, file, configHash, current);
@@ -262,7 +262,7 @@ function PluginDetail({ plugin, token, choices, runtime, changed, busy, run, onU
         setSavedConfig(json({ enabled: result.enabled, config: json(result.config), selectors: result.selectors }));
         setMessage('插件包已替换，浏览器和运行进程会分别应用新版本。');
         void refreshFrontendPlugins();
-      } catch (error) { if (current()) setMessage(errorMessage(error)); }
+      } catch (caught) { if (current()) setError(errorMessage(caught)); }
     });
   };
 
@@ -276,7 +276,8 @@ function PluginDetail({ plugin, token, choices, runtime, changed, busy, run, onU
         <ReadOnlyRow name="插件标识" value={plugin.id} />
         {plugin.error && <p className="mt-2 whitespace-pre-wrap break-words text-[var(--duties-danger)]" role="alert">{plugin.error}</p>}
       </Block>
-      {message && <p className="whitespace-pre-wrap break-words text-[var(--duties-secondary)]" role="status">{message}</p>}
+      {error && <p className="whitespace-pre-wrap break-words text-[var(--duties-danger)]" role="alert">{error}</p>}
+      {notice && <p className="whitespace-pre-wrap break-words text-[var(--duties-secondary)]" role="status">{notice}</p>}
       <Block title="启用与参数" hint="保存后运行进程会自动更新；启用状态与下方进程实际加载状态分别展示。">
         <fieldset className="min-w-0 space-y-4" disabled={busy}>
           <Check checked={enabled} onChange={setEnabled}>启用插件</Check>
@@ -358,7 +359,7 @@ function PluginDetail({ plugin, token, choices, runtime, changed, busy, run, onU
               <p className="text-xs text-[var(--duties-secondary)]">{entry?.desired_hash === plugin.desired_hash ? '当前保存版本' : '与当前保存版本不同'} · 上报于 {process.updated_at || '未知'}</p>
               {!!entry?.active_requests && <p className="text-xs text-[var(--duties-secondary)]">{entry.active_requests} 个请求仍在使用此插件</p>}
               {entry?.error && <Pre>{entry.error}</Pre>}
-              {entry?.errors?.map((error, index) => <Pre key={index}>{`${error.at} · ${error.phase}\n${error.message}`}</Pre>)}
+              {entry?.errors?.map((failure, index) => <Pre key={index}>{`${failure.at} · ${failure.phase}\n${failure.message}`}</Pre>)}
             </div>
           );
         })}
@@ -381,7 +382,7 @@ function PluginsWorkspace({ token }: { token: string }) {
   const fileInput = useRef<HTMLInputElement>(null);
   const requests = useRequestGuard();
   const { busy, run: runExclusive } = useExclusiveAction();
-  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
+  const { notice, error, setMessage, setError, setLoadError, clearNotice } = usePageNotice();
   // 操作开始前先作废还在等的进程状态轮询，免得它慢回来盖掉操作的结果。
   const run: Action = (action) => runExclusive(async () => {
     requests.drop('runtime');
@@ -399,7 +400,7 @@ function PluginsWorkspace({ token }: { token: string }) {
       setSelectedId((id) => result.plugins.some((plugin) => plugin.id === id) ? id : result.plugins[0]?.id || '');
       if (reset) setDetailVersion((value) => value + 1);
       setLoadError('', 'catalog');
-    } catch (error) { if (request.isCurrent()) setLoadError(errorMessage(error), 'catalog'); }
+    } catch (caught) { if (request.isCurrent()) setLoadError(errorMessage(caught), 'catalog'); }
     finally { if (request.isCurrent()) setLoading(false); }
   };
 
@@ -428,8 +429,8 @@ function PluginsWorkspace({ token }: { token: string }) {
         setData((previous) => previous ? { ...previous, runtime: result.runtime } : previous);
         setChangedPlugins(changedPluginIds(data.plugins, result.plugins));
         setLoadError('', 'runtime');
-      }).catch((error: unknown) => {
-        if (request.isCurrent()) setLoadError(errorMessage(error), 'runtime');
+      }).catch((caught: unknown) => {
+        if (request.isCurrent()) setLoadError(errorMessage(caught), 'runtime');
       });
     }, 3000);
     return () => { window.clearTimeout(timer); requests.drop('runtime'); };
@@ -444,7 +445,7 @@ function PluginsWorkspace({ token }: { token: string }) {
   };
   const upload = () => run(async () => {
     if (!file || !requests.isCurrent() || !confirmNavigation()) return;
-    if (!/\.(py|zip)$/i.test(file.name)) { setMessage('请选择 .py 插件文件或 .zip 插件包'); return; }
+    if (!/\.(py|zip)$/i.test(file.name)) { setError('请选择 .py 插件文件或 .zip 插件包'); return; }
     try {
       const content = /\.py$/i.test(file.name) ? await file.text() : '';
       if (!requests.isCurrent()) return;
@@ -455,7 +456,7 @@ function PluginsWorkspace({ token }: { token: string }) {
       setFile(null);
       if (fileInput.current) fileInput.current.value = '';
       setMessage('插件已导入，默认停用。检查参数和作用范围后启用并保存，运行进程会自动更新。');
-    } catch (error) { if (requests.isCurrent()) setMessage(errorMessage(error)); }
+    } catch (caught) { if (requests.isCurrent()) setError(errorMessage(caught)); }
   });
   const remove = (plugin: AdminPlugin) => run(async () => {
     if (!confirmNavigation() || !window.confirm(`确定删除插件「${plugin.name}」及其配置吗？`)) return;
@@ -467,7 +468,7 @@ function PluginsWorkspace({ token }: { token: string }) {
       setSelectedId('');
       setMessage('插件已删除，运行进程会自动卸载；正在进行的请求会使用原版本完成。');
       void refreshFrontendPlugins();
-    } catch (error) { if (requests.isCurrent()) setMessage(errorMessage(error)); }
+    } catch (caught) { if (requests.isCurrent()) setError(errorMessage(caught)); }
   });
   const apply = () => run(async () => {
     if (!requests.isCurrent()) return;
@@ -477,7 +478,7 @@ function PluginsWorkspace({ token }: { token: string }) {
       setData((previous) => previous ? { ...previous, generation: result.generation, runtime: result.runtime } : previous);
       setMessage(result.message || '已发出应用请求，请刷新进程状态确认结果。');
       void refreshFrontendPlugins();
-    } catch (error) { if (requests.isCurrent()) setMessage(errorMessage(error)); }
+    } catch (caught) { if (requests.isCurrent()) setError(errorMessage(caught)); }
   });
   const refreshRuntime = () => run(async () => {
     void refreshFrontendPlugins();
@@ -488,14 +489,14 @@ function PluginsWorkspace({ token }: { token: string }) {
         setChangedPlugins(data ? changedPluginIds(data.plugins, result.plugins) : []);
         setLoadError('', 'runtime');
       }
-    } catch (error) { if (requests.isCurrent()) setLoadError(errorMessage(error), 'runtime'); }
+    } catch (caught) { if (requests.isCurrent()) setLoadError(errorMessage(caught), 'runtime'); }
   });
   const selected = data?.plugins.find((plugin) => plugin.id === selectedId);
   const keyword = query.trim().toLowerCase();
   const visible = data?.plugins.filter((plugin) => [plugin.id, plugin.name, plugin.description, plugin.filename].some((value) => value.toLowerCase().includes(keyword))) || [];
   const locked = busy || loading;
   return (
-    <PageShell title="插件" description="导入 Python 插件或系统插件包，设置参数与作用范围，查看各进程和浏览器实际加载的版本。" notice={notice} bar={
+    <PageShell title="插件" description="导入 Python 插件或系统插件包，设置参数与作用范围，查看各进程和浏览器实际加载的版本。" error={error} notice={notice} bar={
       <StatusBar status={busy ? '正在处理…' : loading ? '正在读取…' : `${data?.plugins.length || 0} 个插件`} tone={data ? 'live' : 'idle'}>
         <Button disabled={locked} onClick={() => void refreshRuntime()} size="sm" tone="quiet">刷新进程状态</Button>
         <Button disabled={locked || !data} onClick={() => void apply()} size="sm">应用已保存的更改</Button>

@@ -52,17 +52,21 @@ function stub({
   entries = [] as any[],
   conversations = [] as any[],
   removed = 0,
-  replies = {} as { overview?: Reply[]; entries?: Reply[] },
+  replies = {} as { overview?: Reply[]; entries?: Reply[]; save?: Reply[] },
 } = {}) {
-  // 总览和条目各读各的，得能单排某一路第几次读的成败：按调用顺序取，null 是这一次照常回。
-  const queued = { overview: [...(replies.overview || [])], entries: [...(replies.entries || [])] };
-  const take = (key: 'overview' | 'entries', body: unknown) =>
+  // 总览、条目、写入各走各的，得能单排某一路第几次的成败：按调用顺序取，null 是这一次照常回。
+  const queued = {
+    overview: [...(replies.overview || [])],
+    entries: [...(replies.entries || [])],
+    save: [...(replies.save || [])],
+  };
+  const take = (key: keyof typeof queued, body: unknown) =>
     (queued[key].length ? queued[key].shift() : null)?.() ?? jsonResponse(body);
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (url.includes('/memory/overview')) return take('overview', { namespaces });
     if (url.includes('/entries')) {
-      return (init?.method || 'GET') === 'GET' ? take('entries', { entries }) : jsonResponse({ entry: {} });
+      return (init?.method || 'GET') === 'GET' ? take('entries', { entries }) : take('save', { entry: {} });
     }
     if (url.includes('/admin/config/memory/')) return jsonResponse({ removed });
     if (url.includes('/admin/config/runtime/raw')) return jsonResponse({ content: '', hash: '' });
@@ -320,14 +324,14 @@ describe('记忆页的那一句提示', () => {
     render(<MemoryPage />);
 
     await pickSource('甲群');
-    expect(await screen.findByText('503 条目读不回来')).toBeInTheDocument();
+    expect(await screen.findByText('503 条目读不回来')).toHaveAttribute('role', 'alert');
 
     await pickSource('乙群');
 
     await waitFor(() => expect(screen.queryByText('503 条目读不回来')).toBeNull());
   });
 
-  it('「已添加」不被紧跟那次重读的失败盖掉，两路的原因各接一句', async () => {
+  it('「已添加」不被紧跟那次重读的失败盖掉，两路的原因合成一句另起一行报错', async () => {
     stub({
       namespaces: sources,
       replies: { entries: [null, fails('条目读不回来')], overview: [null, fails('总览读不回来')] },
@@ -337,10 +341,22 @@ describe('记忆页的那一句提示', () => {
 
     await addEntry();
 
-    expect(await screen.findByText('已添加。503 条目读不回来。503 总览读不回来')).toBeInTheDocument();
+    expect(await screen.findByText('已添加')).toBeInTheDocument();
+    expect(screen.getByText('503 条目读不回来。503 总览读不回来')).toHaveAttribute('role', 'alert');
   });
 
-  it('「已清空 N 条」不被紧跟那次重读的失败盖掉，合成一句', async () => {
+  it('添加失败的原因报成错误，不当成提示', async () => {
+    stub({ namespaces: sources, replies: { save: [fails('记忆目录只读')] } });
+    render(<MemoryPage />);
+    await pickSource('甲群');
+
+    await addEntry();
+
+    expect(await screen.findByText('503 记忆目录只读')).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText('已添加')).toBeNull();
+  });
+
+  it('「已清空 N 条」不被紧跟那次重读的失败盖掉，失败的原因另起一行报错', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     stub({ namespaces: sources, removed: 7, replies: { overview: [null, fails('总览读不回来')] } });
     render(<MemoryPage />);
@@ -349,7 +365,30 @@ describe('记忆页的那一句提示', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '清空' }));
 
-    expect(await screen.findByText('已清空 7 条。503 总览读不回来')).toBeInTheDocument();
+    expect(await screen.findByText('已清空 7 条')).toBeInTheDocument();
+    expect(screen.getByText('503 总览读不回来')).toHaveAttribute('role', 'alert');
+  });
+
+  it('清空了最后一份，空栏说没有记忆，结果只在底下交代一次', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    stub({ namespaces: [namespace(1, '甲群', 'group')], removed: 3 });
+    render(<MemoryPage />);
+    await pickSource('甲群');
+    await waitFor(() => expect(screen.getByRole('button', { name: '清空' })).toBeEnabled());
+    stub({ namespaces: [], removed: 3 });
+
+    fireEvent.click(screen.getByRole('button', { name: '清空' }));
+
+    expect(await screen.findByText('还没有任何记忆。')).toBeInTheDocument();
+    expect(screen.getAllByText('已清空 3 条')).toHaveLength(1);
+  });
+
+  it('总览读不回来就不说「还没有任何记忆」，只报读失败的原因', async () => {
+    stub({ replies: { overview: [fails('总览读不回来')] } });
+    render(<MemoryPage />);
+
+    expect(await screen.findByText('503 总览读不回来')).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText('还没有任何记忆。')).toBeNull();
   });
 
   it('点另一个来源：操作结果和条目那一路的失败都清掉，总览那一路的留着', async () => {
@@ -360,10 +399,13 @@ describe('记忆页的那一句提示', () => {
     render(<MemoryPage />);
     await pickSource('甲群');
     await addEntry();
-    await screen.findByText('已添加。503 条目读不回来。503 总览读不回来');
+    await screen.findByText('已添加');
+    expect(screen.getByText('503 条目读不回来。503 总览读不回来')).toHaveAttribute('role', 'alert');
 
     await pickSource('乙群');
 
-    expect(await screen.findByText('503 总览读不回来')).toBeInTheDocument();
+    expect(await screen.findByText('503 总览读不回来')).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText('已添加')).toBeNull();
+    expect(screen.queryByText(/条目读不回来/)).toBeNull();
   });
 });

@@ -4,6 +4,7 @@ import { useEffect, useId, useMemo, useState, type ReactNode } from 'react';
 import { errorMessage } from '../../../api/request';
 import { channelChoices, getMcpClientsRaw, getNodeRaw, getNodes, getProviders, getSchedulesRaw, getSkillRaw, getToolRaw, isEditConflict, listUpstreamModels, reloadTools, updateMcpClientsRaw, updateNodeRaw, updateSchedulesRaw, updateSkillRaw, updateToolRaw, type AdminSkill, type ChannelChoice, type OverlaySource, type ToolOrigin } from '../../../api/supervisorClient';
 import { commitYamlKeys } from '../../../console/yamlCommit';
+import { usePageNotice } from '../../../hooks/usePageNotice';
 import { unsavableReason, useRawForm, type RawFormCodec } from '../../../hooks/useRawForm';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
@@ -152,7 +153,7 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
   const [nodeYamlEditable, setNodeYamlEditable] = useState(false);
   const [nodeYamlLoading, setNodeYamlLoading] = useState(false);
   const [nodeYamlSaving, setNodeYamlSaving] = useState(false);
-  const [nodeMessage, setNodeMessage] = useState('');
+  const { notice: nodeNotice, error: nodeError, setMessage: setNodeMessage, setError: setNodeError } = usePageNotice();
   const confirmDiscard = useUnsavedChanges(nodeYamlEditable && source.dirty);
   const reload = () => { if (confirmDiscard()) onReload(); };
   const requests = useRequestGuard();
@@ -167,7 +168,7 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
   );
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [fetchingModels, setFetchingModels] = useState(false);
-  const [modelFetchNote, setModelFetchNote] = useState('');
+  const { notice: modelFetchNote, error: modelFetchError, setMessage: setModelFetchNote, setError: setModelFetchError } = usePageNotice();
   // 拉回来时选的渠道已经换了，这份候选就不认。
   const modelFetch = useRequestGuard(nodeConfigForm.provider);
   const modelListId = useId();
@@ -189,8 +190,8 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
       if (!request.isCurrent()) return;
       setFetchedModels(models);
       setModelFetchNote(`拉到 ${models.length} 个模型。`);
-    } catch (error) {
-      if (request.isCurrent()) setModelFetchNote(errorMessage(error, '拉取模型失败'));
+    } catch (caught) {
+      if (request.isCurrent()) setModelFetchError(errorMessage(caught, '拉取模型失败'));
     } finally {
       setFetchingModels(false);
     }
@@ -199,7 +200,7 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
   useEffect(() => {
     if (!node) return undefined;
     if (!adminToken) {
-      setNodeMessage('缺少管理员令牌，无法加载节点配置。');
+      setNodeError('缺少管理员令牌，无法加载节点配置。');
       return undefined;
     }
     const request = requests.begin('node');
@@ -211,9 +212,9 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
         setNodeBase(hash);
         setNodeYamlEditable(true);
       })
-      .catch((error) => {
+      .catch((caught) => {
         if (!request.isCurrent()) return;
-        setNodeMessage(errorMessage(error, '节点配置加载失败，请重试'));
+        setNodeError(errorMessage(caught, '节点配置加载失败，请重试'));
         setNodeYamlEditable(false);
       })
       .finally(() => {
@@ -252,7 +253,7 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
     if (!adminToken || !node || !nodeYamlEditable || nodeYamlSaving) return;
     const blocked = unsavableReason(source);
     if (blocked) {
-      setNodeMessage(blocked);
+      setNodeError(blocked);
       return;
     }
     const { raw, note } = source;
@@ -264,8 +265,8 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
       setNodeBase(result.hash);
       window.dispatchEvent(new Event('settings:nodes-updated'));
       setNodeMessage(savedMessage('节点配置已保存。', note, result.warnings));
-    } catch (error) {
-      setNodeMessage(errorMessage(error, '保存节点配置失败'));
+    } catch (caught) {
+      setNodeError(errorMessage(caught, '保存节点配置失败'));
     } finally {
       setNodeYamlSaving(false);
     }
@@ -281,7 +282,9 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
             <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-[var(--duties-secondary)]">正在加载节点配置。</p>
           ) : !nodeYamlEditable ? (
             <div className="space-y-2">
-              <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-[var(--duties-secondary)]">{nodeMessage || '系统内建节点不可编辑'}</p>
+              {nodeError
+                ? <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-[var(--duties-danger)]" role="alert">{nodeError}</p>
+                : <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-[var(--duties-secondary)]">系统内建节点不可编辑</p>}
               <Button onClick={reload} size="sm" tone="quiet">刷新</Button>
             </div>
           ) : (
@@ -367,6 +370,9 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
                       {modelOptions.map((choice) => <option key={choice} value={choice} />)}
                     </datalist>
                   )}
+                  {modelFetchError && (
+                    <p className="mt-1 text-xs text-[var(--duties-danger)]" role="alert">{modelFetchError}</p>
+                  )}
                   {modelFetchNote && (
                     <p className="mt-1 text-xs text-[var(--duties-tertiary)]">{modelFetchNote}</p>
                   )}
@@ -398,7 +404,8 @@ const AgentsEditor = ({ onReload }: EditorProps) => {
                 <Button disabled={nodeYamlSaving} onClick={saveNode} size="sm">保存节点配置</Button>
                 <Button disabled={nodeYamlSaving} onClick={reload} size="sm" tone="quiet">刷新</Button>
               </div>
-              {nodeMessage && <p className="text-[var(--duties-tertiary)]">{nodeMessage}</p>}
+              {nodeError && <p className="text-[var(--duties-danger)]" role="alert">{nodeError}</p>}
+              {nodeNotice && <p className="text-[var(--duties-tertiary)]">{nodeNotice}</p>}
             </>
           )}
         </div>
@@ -424,7 +431,7 @@ const ToolsEditor = ({ onReload }: EditorProps) => {
   const [toolScriptLoading, setToolScriptLoading] = useState(false);
   const [toolScriptSaving, setToolScriptSaving] = useState(false);
   const [toolReloading, setToolReloading] = useState(false);
-  const [toolMessage, setToolMessage] = useState('');
+  const { notice: toolNotice, error: toolError, setMessage: setToolMessage, setError: setToolError } = usePageNotice();
   const confirmToolDiscard = useUnsavedChanges(toolScriptLoaded && toolScript !== toolBaseline);
   const reload = () => { if (confirmToolDiscard()) onReload(); };
   const requests = useRequestGuard();
@@ -438,7 +445,7 @@ const ToolsEditor = ({ onReload }: EditorProps) => {
     // 内置和插件工具没有源码文件，请求只会换回一句 409。
     if (!tool.editable) return undefined;
     if (!adminToken) {
-      setToolMessage('缺少管理员令牌，无法加载工具脚本。');
+      setToolError('缺少管理员令牌，无法加载工具脚本。');
       return undefined;
     }
     const request = requests.begin('script');
@@ -456,9 +463,9 @@ const ToolsEditor = ({ onReload }: EditorProps) => {
         setToolBase(hash);
         setToolScriptLoaded(true);
       })
-      .catch((error) => {
+      .catch((caught) => {
         if (!request.isCurrent()) return;
-        setToolMessage(errorMessage(error, '加载工具脚本失败'));
+        setToolError(errorMessage(caught, '加载工具脚本失败'));
         setToolScriptLoaded(false);
       })
       .finally(() => {
@@ -482,8 +489,8 @@ const ToolsEditor = ({ onReload }: EditorProps) => {
       setToolBase(result.hash);
       window.dispatchEvent(new Event('settings:tools-updated'));
       setToolMessage(savedMessage('工具脚本已保存。', '', result.warnings));
-    } catch (error) {
-      setToolMessage(errorMessage(error, '保存工具脚本失败'));
+    } catch (caught) {
+      setToolError(errorMessage(caught, '保存工具脚本失败'));
     } finally {
       setToolScriptSaving(false);
     }
@@ -501,8 +508,8 @@ const ToolsEditor = ({ onReload }: EditorProps) => {
       // engine restart.
       await reloadTools(adminToken);
       setToolMessage('工具已重载。');
-    } catch (error) {
-      setToolMessage(errorMessage(error, '重载工具失败'));
+    } catch (caught) {
+      setToolError(errorMessage(caught, '重载工具失败'));
     } finally {
       setToolReloading(false);
     }
@@ -551,7 +558,8 @@ const ToolsEditor = ({ onReload }: EditorProps) => {
                 <Button disabled={toolScriptLoading || toolScriptSaving || toolReloading} onClick={reload} size="sm" tone="quiet">刷新</Button>
                 <Button disabled={!adminToken || toolReloading} onClick={reloadToolRegistry} size="sm" tone="quiet">重载工具</Button>
               </div>
-              {toolMessage && <p className="text-[var(--duties-tertiary)]">{toolMessage}</p>}
+              {toolError && <p className="text-[var(--duties-danger)]" role="alert">{toolError}</p>}
+              {toolNotice && <p className="text-[var(--duties-tertiary)]">{toolNotice}</p>}
             </div>
             )}
           </div>
@@ -594,7 +602,7 @@ const SkillsEditor = ({ onReload }: EditorProps) => {
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(Boolean(adminToken && skill));
   const [saving, setSaving] = useState(false);
-  const [message, setMessage] = useState('');
+  const { notice, error, setMessage, setError } = usePageNotice();
   const confirmDiscard = useUnsavedChanges(loaded && source.dirty);
   const reload = () => { if (confirmDiscard()) onReload(); };
   const requests = useRequestGuard();
@@ -610,7 +618,7 @@ const SkillsEditor = ({ onReload }: EditorProps) => {
         setSkillBase(hash);
         setLoaded(true);
       })
-      .catch((error) => { if (request.isCurrent()) { setLoaded(false); setMessage(errorMessage(error, '加载技能失败')); } })
+      .catch((caught) => { if (request.isCurrent()) { setLoaded(false); setError(errorMessage(caught, '加载技能失败')); } })
       .finally(() => { if (request.isCurrent()) setLoading(false); });
     return () => { requests.drop('skill'); };
   }, [requests, adminToken, skill?.name, resetSource]);
@@ -619,7 +627,7 @@ const SkillsEditor = ({ onReload }: EditorProps) => {
     if (!adminToken || !skill || !loaded || saving) return;
     const blocked = unsavableReason(source);
     if (blocked) {
-      setMessage(blocked);
+      setError(blocked);
       return;
     }
     const { raw, note } = source;
@@ -631,8 +639,8 @@ const SkillsEditor = ({ onReload }: EditorProps) => {
       setSkillBase(result.hash);
       window.dispatchEvent(new Event('settings:skills-updated'));
       setMessage(savedMessage('技能已保存。', note, result.warnings));
-    } catch (error) {
-      setMessage(errorMessage(error, '保存技能失败'));
+    } catch (caught) {
+      setError(errorMessage(caught, '保存技能失败'));
     } finally {
       setSaving(false);
     }
@@ -647,7 +655,9 @@ const SkillsEditor = ({ onReload }: EditorProps) => {
           <p><span className="text-[var(--duties-tertiary)]">名称：</span><span className="font-mono">{skill.name}</span></p>
           {!loaded && !loading ? (
             <div className="space-y-2">
-              <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-[var(--duties-secondary)]">{message || '技能没有读到。'}</p>
+              {error
+                ? <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-[var(--duties-danger)]" role="alert">{error}</p>
+                : <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-[var(--duties-secondary)]">技能没有读到。</p>}
               <Button onClick={reload} size="sm" tone="quiet">刷新</Button>
             </div>
           ) : (
@@ -683,7 +693,8 @@ const SkillsEditor = ({ onReload }: EditorProps) => {
                 <Button disabled={saving || !loaded} onClick={save} size="sm">保存技能</Button>
                 <Button disabled={loading || saving} onClick={reload} size="sm" tone="quiet">刷新</Button>
               </div>
-              {message && <p className="text-[var(--duties-tertiary)]">{message}</p>}
+              {error && <p className="text-[var(--duties-danger)]" role="alert">{error}</p>}
+              {notice && <p className="text-[var(--duties-tertiary)]">{notice}</p>}
             </>
           )}
         </div>
@@ -742,7 +753,7 @@ const McpEditor = ({ onReload }: EditorProps) => {
   const [form, setForm] = useState<McpClientFormState | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [message, setMessage] = useState('');
+  const { notice, error, setMessage, setError } = usePageNotice();
   const confirmDiscard = useUnsavedChanges(Boolean(form) && JSON.stringify(form) !== JSON.stringify(opened));
   const reload = () => { if (confirmDiscard()) onReload(); };
   const requests = useRequestGuard();
@@ -750,7 +761,7 @@ const McpEditor = ({ onReload }: EditorProps) => {
   useEffect(() => {
     if (!client) return undefined;
     if (!adminToken) {
-      setMessage('缺少管理员令牌，无法加载 MCP Client。');
+      setError('缺少管理员令牌，无法加载 MCP Client。');
       return undefined;
     }
     const request = requests.begin('client');
@@ -760,16 +771,16 @@ const McpEditor = ({ onReload }: EditorProps) => {
         if (!request.isCurrent()) return;
         const selected = parseMcpClients(raw).find((item) => item.id === client.id) || null;
         if (!selected) {
-          setMessage('未在 MCP YAML 中找到此 Client。');
+          setError('未在 MCP YAML 中找到此 Client。');
           return;
         }
         const shown = { ...selected, envText: displayEnvText(selected.envText) };
         setOpened(shown);
         setForm(shown);
       })
-      .catch((error) => {
+      .catch((caught) => {
         if (!request.isCurrent()) return;
-        setMessage(errorMessage(error, '加载 MCP Client 失败'));
+        setError(errorMessage(caught, '加载 MCP Client 失败'));
       })
       .finally(() => {
         if (request.isCurrent()) setLoading(false);
@@ -795,8 +806,8 @@ const McpEditor = ({ onReload }: EditorProps) => {
       setOpened(saved);
       window.dispatchEvent(new Event('settings:mcp-updated'));
       setMessage(savedMessage('MCP Client 已保存。', note, result.warnings));
-    } catch (error) {
-      setMessage(isEditConflict(error) ? staleItemMessage('这个 Client') : errorMessage(error, '保存 MCP Client 失败'));
+    } catch (caught) {
+      setError(isEditConflict(caught) ? staleItemMessage('这个 Client') : errorMessage(caught, '保存 MCP Client 失败'));
     } finally {
       setSaving(false);
     }
@@ -810,7 +821,9 @@ const McpEditor = ({ onReload }: EditorProps) => {
         <p className="text-xs leading-5 text-[var(--duties-secondary)]">正在加载 MCP Client。</p>
       ) : !form ? (
         <div className="space-y-2">
-          <p className="text-xs leading-5 text-[var(--duties-secondary)]">{message || '未找到可编辑的 MCP Client。'}</p>
+          {error
+            ? <p className="text-xs leading-5 text-[var(--duties-danger)]" role="alert">{error}</p>
+            : <p className="text-xs leading-5 text-[var(--duties-secondary)]">未找到可编辑的 MCP Client。</p>}
           <Button onClick={reload} size="sm" tone="quiet">刷新</Button>
         </div>
       ) : (
@@ -864,7 +877,8 @@ const McpEditor = ({ onReload }: EditorProps) => {
             <Button disabled={saving} onClick={save} size="sm">保存</Button>
             <Button disabled={saving} onClick={reload} size="sm" tone="quiet">刷新</Button>
           </div>
-          {message && <p className="text-[var(--duties-tertiary)]">{message}</p>}
+          {error && <p className="text-[var(--duties-danger)]" role="alert">{error}</p>}
+          {notice && <p className="text-[var(--duties-tertiary)]">{notice}</p>}
         </div>
       )}
     </PanelShell>
@@ -886,7 +900,7 @@ const AutomationEditor = ({ onReload }: EditorProps) => {
   const [form, setForm] = useState<ScheduleFormState | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [message, setMessage] = useState('');
+  const { notice, error, setMessage, setError } = usePageNotice();
   const confirmDiscard = useUnsavedChanges(Boolean(form) && JSON.stringify(form) !== JSON.stringify(opened));
   const reload = () => { if (confirmDiscard()) onReload(); };
   const requests = useRequestGuard();
@@ -894,7 +908,7 @@ const AutomationEditor = ({ onReload }: EditorProps) => {
   useEffect(() => {
     if (!selectedScheduleId) return undefined;
     if (!adminToken) {
-      setMessage('缺少管理员令牌，无法加载定时任务。');
+      setError('缺少管理员令牌，无法加载定时任务。');
       return undefined;
     }
     const request = requests.begin('schedule');
@@ -905,11 +919,11 @@ const AutomationEditor = ({ onReload }: EditorProps) => {
         const selected = parseSchedules(raw).find((item) => item.id === selectedScheduleId) || null;
         setOpened(selected);
         setForm(selected);
-        if (!selected) setMessage('未在 schedules.yaml 中找到此定时任务。');
+        if (!selected) setError('未在 schedules.yaml 中找到此定时任务。');
       })
-      .catch((error) => {
+      .catch((caught) => {
         if (!request.isCurrent()) return;
-        setMessage(errorMessage(error, '加载定时任务失败'));
+        setError(errorMessage(caught, '加载定时任务失败'));
       })
       .finally(() => {
         if (request.isCurrent()) setLoading(false);
@@ -935,8 +949,8 @@ const AutomationEditor = ({ onReload }: EditorProps) => {
       setOpened(saved);
       window.dispatchEvent(new Event('settings:schedules-updated'));
       setMessage(savedMessage('定时任务已保存。', note, result.warnings));
-    } catch (error) {
-      setMessage(isEditConflict(error) ? staleItemMessage('这个定时任务') : errorMessage(error, '保存定时任务失败'));
+    } catch (caught) {
+      setError(isEditConflict(caught) ? staleItemMessage('这个定时任务') : errorMessage(caught, '保存定时任务失败'));
     } finally {
       setSaving(false);
     }
@@ -950,7 +964,9 @@ const AutomationEditor = ({ onReload }: EditorProps) => {
         <p className="text-xs leading-5 text-[var(--duties-secondary)]">正在加载定时任务。</p>
       ) : !form ? (
         <div className="space-y-2">
-          <p className="text-xs leading-5 text-[var(--duties-secondary)]">{message || '未找到可编辑的定时任务。'}</p>
+          {error
+            ? <p className="text-xs leading-5 text-[var(--duties-danger)]" role="alert">{error}</p>
+            : <p className="text-xs leading-5 text-[var(--duties-secondary)]">未找到可编辑的定时任务。</p>}
           <Button onClick={reload} size="sm" tone="quiet">刷新</Button>
         </div>
       ) : (
@@ -1010,7 +1026,8 @@ const AutomationEditor = ({ onReload }: EditorProps) => {
             <Button disabled={saving} onClick={save} size="sm">保存</Button>
             <Button disabled={saving} onClick={reload} size="sm" tone="quiet">刷新</Button>
           </div>
-          {message && <p className="text-[var(--duties-tertiary)]">{message}</p>}
+          {error && <p className="text-[var(--duties-danger)]" role="alert">{error}</p>}
+          {notice && <p className="text-[var(--duties-tertiary)]">{notice}</p>}
         </div>
       )}
     </PanelShell>

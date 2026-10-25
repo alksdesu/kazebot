@@ -1,5 +1,5 @@
 // 绘图页的结构化字段写回：只重写改了的键，运营者手写的注释留着；原文坏了一个字节都不写。
-// 保存的提示要活过紧跟着的那次重载，只有「刷新」清得掉。
+// 保存的提示要活过紧跟着的那次重载，重载失败的原因另起一行报错；只有「刷新」清得掉。
 // 分析节点那一栏：404 才当空文件，别的读失败要锁住；接连重读只认最后发出的那次。
 // 写出去之后换了 token，这一趟的结果不能落到新会话的页面上。
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
@@ -124,6 +124,15 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reje
 /** 没有消息时整个 StatusText 不渲染，只能等它出现。 */
 const statusText = async (): Promise<string> => (await screen.findByRole('status')).textContent || '';
 
+/** 失败的原因单占一行，用 alert 报出来。 */
+const alertText = async (): Promise<string> => (await screen.findByRole('alert')).textContent || '';
+
+/** 结果和报错都不在页面上。 */
+const expectSilent = () => {
+  expect(screen.queryByRole('status')).toBeNull();
+  expect(screen.queryByRole('alert')).toBeNull();
+};
+
 const baseUrlBox = () => screen.getByPlaceholderText('https://image.novelai.net');
 
 // 页上好几处都有 textarea 和「丢弃」，原始编辑器只能连着它那一块一起找。
@@ -192,7 +201,8 @@ describe('绘图设置的结构化写回', () => {
 
     fireEvent.blur(baseUrlBox(), { target: { value: 'https://relay.example' } });
 
-    expect(await statusText()).toBe(`原文不是合法的 YAML，请先修好再改，原文件未修改：${reason}`);
+    expect(await alertText()).toBe(`原文不是合法的 YAML，请先修好再改，原文件未修改：${reason}`);
+    expect(screen.queryByRole('status')).toBeNull();
     expect(api.updateDrawtoolsSettingsRaw).not.toHaveBeenCalled();
   });
 
@@ -266,7 +276,7 @@ describe('绘图设置的结构化写回', () => {
 
     fireEvent.blur(baseUrlBox(), { target: { value: 'https://relay.example' } });
 
-    expect(await statusText()).toBe('409 api 在打开之后被别处改过，没有覆盖');
+    expect(await alertText()).toBe('409 api 在打开之后被别处改过，没有覆盖');
     expect(api.updateDrawtoolsSettingsRaw).not.toHaveBeenCalled();
   });
 
@@ -302,10 +312,10 @@ describe('绘图设置的提示存活', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '刷新' }));
 
-    await waitFor(() => expect(screen.queryByRole('status')).toBeNull());
+    await waitFor(expectSilent);
   });
 
-  it('重载失败时把原因接在已有提示后面', async () => {
+  it('重载失败的原因另起一行报错，已有的提示照常留着', async () => {
     const reload = holdReload();
     render(<DrawtoolsSettingsPage />);
     await waitFor(() => expect(baseUrlBox()).toHaveValue('https://image.novelai.net'));
@@ -315,7 +325,20 @@ describe('绘图设置的提示存活', () => {
     expect(screen.getByRole('status').textContent).toBe('API 配置已保存。');
     await act(async () => { reload.reject(new Error(RELOAD_FAILURE)); });
 
-    expect(screen.getByRole('status').textContent).toBe(`API 配置已保存。${RELOAD_FAILURE}`);
+    expect(screen.getByRole('status').textContent).toBe('API 配置已保存。');
+    expect(screen.getByRole('alert').textContent).toBe(RELOAD_FAILURE);
+  });
+
+  it('保存失败的原因报成错误，不当成提示', async () => {
+    vi.mocked(api.updateDrawtoolsSettingsRaw).mockRejectedValue(new Error('503 写不进用户配置'));
+    render(<DrawtoolsSettingsPage />);
+    await waitFor(() => expect(rawEditor()).toHaveValue(SETTINGS_YAML));
+
+    fireEvent.change(rawEditor(), { target: { value: EDITED_SETTINGS_YAML } });
+    fireEvent.click(rawButton('保存当前文件'));
+
+    expect(await alertText()).toBe('503 写不进用户配置');
+    expect(screen.queryByRole('status')).toBeNull();
   });
 
   it('新增角色之后紧接着的重载不会把提示吃掉', async () => {
@@ -352,12 +375,14 @@ describe('绘图设置的提示存活', () => {
     fireEvent.blur(baseUrlBox(), { target: { value: 'https://relay.example' } });
     await waitFor(() => expect(api.getDrawtoolsBundle).toHaveBeenCalledTimes(2));
     await act(async () => { reload.reject(new Error(RELOAD_FAILURE)); });
-    expect(screen.getByRole('status').textContent).toBe(`API 配置已保存。${RELOAD_FAILURE}`);
+    expect(screen.getByRole('status').textContent).toBe('API 配置已保存。');
+    expect(screen.getByRole('alert').textContent).toBe(RELOAD_FAILURE);
 
     fireEvent.click(screen.getByRole('button', { name: '从 Example 初始化用户配置' }));
 
     await waitFor(() => expect(api.getDrawtoolsBundle).toHaveBeenCalledTimes(3));
     await waitFor(() => expect(screen.getByRole('status').textContent).toBe('用户配置已存在，无需创建。'));
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 
   it('点「刷新」把结果和读失败的原因一起清掉', async () => {
@@ -368,11 +393,12 @@ describe('绘图设置的提示存活', () => {
     fireEvent.blur(baseUrlBox(), { target: { value: 'https://relay.example' } });
     await waitFor(() => expect(api.getDrawtoolsBundle).toHaveBeenCalledTimes(2));
     await act(async () => { reload.reject(new Error(RELOAD_FAILURE)); });
-    expect(screen.getByRole('status').textContent).toBe(`API 配置已保存。${RELOAD_FAILURE}`);
+    expect(screen.getByRole('status').textContent).toBe('API 配置已保存。');
+    expect(screen.getByRole('alert').textContent).toBe(RELOAD_FAILURE);
 
     fireEvent.click(screen.getByRole('button', { name: '刷新' }));
 
-    await waitFor(() => expect(screen.queryByRole('status')).toBeNull());
+    await waitFor(expectSilent);
   });
 
   it('换了 token 重新进页面，提示清空', async () => {
@@ -384,7 +410,7 @@ describe('绘图设置的提示存活', () => {
     act(() => { useSettingsStore.setState({ adminToken: 'another-token' }); });
 
     await waitFor(() => expect(api.getDrawtoolsBundle).toHaveBeenCalledTimes(3));
-    await waitFor(() => expect(screen.queryByRole('status')).toBeNull());
+    await waitFor(expectSilent);
   });
 });
 
@@ -571,7 +597,7 @@ describe('接连重读只认最后发出的那次', () => {
 
     await act(async () => { first.reject(new Error(RELOAD_FAILURE)); });
 
-    expect(screen.queryByRole('status')).toBeNull();
+    expectSilent();
     expect(rawEditor()).toHaveValue(SETTINGS_YAML);
     expect(screen.getByRole('button', { name: '刷新' })).toBeEnabled();
   });
@@ -608,7 +634,7 @@ describe('写出去之后换了 token', () => {
     await act(async () => { write.resolve({ ok: true, hash: 'settings-2' }); });
 
     expect(loadTokens()).toEqual(['admin-token', ROTATED]);
-    expect(screen.queryByRole('status')).toBeNull();
+    expectSilent();
   });
 
   it('保存当前文件失败之前换了 token，不摆出这一趟的报错', async () => {
@@ -622,7 +648,7 @@ describe('写出去之后换了 token', () => {
     await rotate();
     await act(async () => { write.reject(new Error(WRITE_FAILURE)); });
 
-    expect(screen.queryByRole('status')).toBeNull();
+    expectSilent();
   });
 
   it('初始化建完文件才换 token，不提示也不拿旧 token 重读', async () => {
@@ -637,7 +663,7 @@ describe('写出去之后换了 token', () => {
     await act(async () => { init.resolve({ ok: true, created: ['settings.yaml'] }); });
 
     expect(loadTokens()).toEqual(['admin-token', ROTATED]);
-    expect(screen.queryByRole('status')).toBeNull();
+    expectSilent();
   });
 
   it('初始化失败之前换了 token，不摆出这一趟的报错', async () => {
@@ -651,7 +677,7 @@ describe('写出去之后换了 token', () => {
     await rotate();
     await act(async () => { init.reject(new Error(WRITE_FAILURE)); });
 
-    expect(screen.queryByRole('status')).toBeNull();
+    expectSilent();
   });
 
   it('结构化字段写完才换 token，不提示也不拿旧 token 重读', async () => {
@@ -666,7 +692,7 @@ describe('写出去之后换了 token', () => {
     await act(async () => { write.resolve({ ok: true, hash: 'settings-2' }); });
 
     expect(loadTokens()).toEqual(['admin-token', ROTATED]);
-    expect(screen.queryByRole('status')).toBeNull();
+    expectSilent();
   });
 
   it('结构化字段写失败之前换了 token，不摆出这一趟的报错', async () => {
@@ -680,7 +706,7 @@ describe('写出去之后换了 token', () => {
     await rotate();
     await act(async () => { write.reject(new Error(WRITE_FAILURE)); });
 
-    expect(screen.queryByRole('status')).toBeNull();
+    expectSilent();
   });
 
   it('清理跑完才换 token，删了几个文件不报到新会话', async () => {
@@ -696,7 +722,7 @@ describe('写出去之后换了 token', () => {
       cleanup.resolve({ deleted_count: 3, deleted_mb: 12, remaining_count: 8, remaining_mb: 40 });
     });
 
-    expect(screen.queryByRole('status')).toBeNull();
+    expectSilent();
   });
 
   it('清理失败之前换了 token，不摆出这一趟的报错', async () => {
@@ -710,6 +736,6 @@ describe('写出去之后换了 token', () => {
     await rotate();
     await act(async () => { cleanup.reject(new Error(WRITE_FAILURE)); });
 
-    expect(screen.queryByRole('status')).toBeNull();
+    expectSilent();
   });
 });

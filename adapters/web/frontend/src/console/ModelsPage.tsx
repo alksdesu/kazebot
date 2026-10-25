@@ -1,6 +1,7 @@
 // 模型参数：各家 provider 的可调项。清单由 provider 类自己声明、后端公布，这一页只渲染和写回。
 // 全局写 runtime.yaml 的 providers.<类型>.options，节点写节点文件的 provider_options，节点优先。
 import { useEffect, useMemo, useState } from 'react';
+import { usePageNotice } from '../hooks/usePageNotice';
 import { useRequestGuard } from '../hooks/useRequestGuard';
 import { confirmNavigation, useUnsavedChanges } from '../hooks/useUnsavedChanges';
 
@@ -16,7 +17,7 @@ import {
   type ProvidersResponse,
 } from '../api/supervisorClient';
 import { useSettingsStore } from '../store/settingsStore';
-import { Block, Empty, Facts, Footnote, Panel, SaveBar, Segmented } from './components';
+import { Block, Empty, ErrorText, Facts, Footnote, Panel, SaveBar, Segmented } from './components';
 import { FallbackChain } from './FallbackChain';
 import { OptionRow, shownFromValue, valueFromShown, visibleSpecs } from './optionFields';
 import { wireOf } from './channelFields';
@@ -71,7 +72,7 @@ const ModelsPageEditor = () => {
   const [edits, setEdits] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [note, setNote] = useState('');
+  const { notice, error, setMessage, setError, setLoadError } = usePageNotice();
   // 清单和原文是两条独立的加载线，共用一个提示位时后到的成功会把先到的失败抹掉。
   const [catalogError, setCatalogError] = useState('');
   const requests = useRequestGuard();
@@ -82,8 +83,8 @@ const ModelsPageEditor = () => {
       try {
         setCatalog((await getProviderProfiles(token)).options);
         setCatalogError('');
-      } catch (error) {
-        setCatalogError(errorMessage(error));
+      } catch (caught) {
+        setCatalogError(errorMessage(caught));
       }
       void getProviders(token).then(setProviders).catch(() => undefined);
       void getNodes(token)
@@ -101,22 +102,23 @@ const ModelsPageEditor = () => {
     const request = requests.begin('raw');
     setEdits({});
     setRaw(''); setLoading(true);
+    setMessage('');
     void (async () => {
       try {
         const file = await readScope(token, scope);
         if (!request.isCurrent()) return;
         setRaw(file.content);
-        setNote('');
-      } catch (error) {
+        setLoadError('');
+      } catch (caught) {
         if (!request.isCurrent()) return;
         setRaw('');
-        setNote(errorMessage(error));
+        setLoadError(errorMessage(caught));
       } finally {
         if (request.isCurrent()) setLoading(false);
       }
     })();
     return () => { requests.drop('raw'); };
-  }, [requests, token, scope]);
+  }, [requests, token, scope, setMessage, setLoadError]);
 
   const providerNames = useMemo(() => Object.keys(catalog).sort(), [catalog]);
   const activeProvider = providers?.active_provider || 'openai';
@@ -170,9 +172,9 @@ const ModelsPageEditor = () => {
       const saved = scope === GLOBAL
         ? '已保存。runtime.yaml 每次任务重新读，下一条消息就用新参数。'
         : '已保存。节点文件每次任务重新读，立刻生效。';
-      setNote(savedMessage(saved, rewriteNote, result.warnings));
-    } catch (error) {
-      setNote(errorMessage(error));
+      setMessage(savedMessage(saved, rewriteNote, result.warnings));
+    } catch (caught) {
+      setError(errorMessage(caught));
     }
     setBusy(false);
   };
@@ -221,10 +223,11 @@ const ModelsPageEditor = () => {
           busy={busy}
           dirty={dirty && Boolean(raw) && !loading}
           label="保存参数"
-          note={note}
+          note={notice}
           onReset={() => { if (confirmDiscard()) setEdits({}); }}
           onSave={() => void save()}
         />
+        {error && <ErrorText role="alert">{error}</ErrorText>}
       </Block>
 
       <FallbackChain

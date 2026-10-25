@@ -104,7 +104,7 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
   const taskActivities = useChatStore(state => state.taskActivities);
   const [tasks, setTasks] = useState<ActiveTask[]>([]);
   const [loading, setLoading] = useState(false);
-  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
+  const { error, setError, setLoadError, clearNotice } = usePageNotice();
   const [refreshTick, setRefreshTick] = useState(0);
   const [cancellingTaskIds, setCancellingTaskIds] = useState<Record<string, boolean>>({});
 
@@ -156,14 +156,14 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
     // call the precise cancel endpoint, then trigger an immediate list refresh.
     // Purpose: users get fast feedback and cannot double-submit the same task cancel.
     setCancellingTaskIds(current => ({ ...current, [task.task_id]: true }));
-    setMessage('');
+    setError('');
     try {
       await cancelTask(adminToken, task.task_id);
       if (!requests.isCurrent()) return;
       setRefreshTick(value => value + 1);
     } catch (cancelError) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(cancelError, '任务取消失败。'));
+      setError(errorMessage(cancelError, '任务取消失败。'));
     } finally {
       setCancellingTaskIds(current => {
         const next = { ...current };
@@ -183,9 +183,9 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
       title="活跃任务详情"
     >
       <div className="p-3">
-        {notice && (
-          <div className="mb-3 border border-orange-200 bg-orange-50 px-2.5 py-2 text-[0.65rem] text-orange-700">
-            {notice}
+        {error && (
+          <div className="mb-3 border border-orange-200 bg-orange-50 px-2.5 py-2 text-[0.65rem] text-orange-700" role="alert">
+            {error}
           </div>
         )}
 

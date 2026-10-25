@@ -1,5 +1,5 @@
 // 审批 / 系统 / 节点文件三页的提示：操作结果熬得过紧接着的重读和后台轮询，
-// 轮询失败把原因接在后面，下一次读成功只去掉原因，手动刷新才两样都清；
+// 出错的原因另起一行报错，下一次读成功只去掉读取失败，手动刷新才两样都清；
 // 换人登录整页重来，上一个会话留下的提示一句都不带进新会话。
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -39,7 +39,15 @@ const click = (name: string) => fireEvent.click(screen.getByRole('button', { nam
 /** 没有提示时整个 StatusText 不渲染。 */
 const statusText = (): string => screen.getByRole('status').textContent || '';
 
+/** 出错的原因单占一行，用 alert 念。 */
+const alertText = (): string => screen.getByRole('alert').textContent || '';
+
 const expectNoStatus = () => expect(screen.queryByRole('status')).toBeNull();
+
+const expectNoAlert = () => expect(screen.queryByRole('alert')).toBeNull();
+
+/** 结果和原因两行都不在。 */
+const expectSilent = () => { expectNoStatus(); expectNoAlert(); };
 
 const OTHER_TOKEN = 'another-admin-token';
 
@@ -143,7 +151,7 @@ describe('审批页审批之后的提示', () => {
     expect(statusText()).toBe('已允许审批');
   });
 
-  it('轮询失败把原因接在「已拒绝审批」后面，下一次读成功只去掉原因', async () => {
+  it('轮询失败的原因另起一行报错，「已拒绝审批」留着，下一次读成功只去掉原因', async () => {
     vi.mocked(api.getAdminState)
       .mockResolvedValueOnce(withApproval())
       .mockResolvedValueOnce(withApproval())
@@ -158,10 +166,25 @@ describe('审批页审批之后的提示', () => {
     expect(statusText()).toBe('已拒绝审批');
 
     await tick(APPROVALS_POLL_MS);
-    expect(statusText()).toBe('已拒绝审批。503 待审批列表拉不到');
+    expect(statusText()).toBe('已拒绝审批');
+    expect(alertText()).toBe('503 待审批列表拉不到');
 
     await tick(APPROVALS_POLL_MS);
     expect(statusText()).toBe('已拒绝审批');
+    expectNoAlert();
+  });
+
+  it('审批失败的原因报成错误，不当成提示', async () => {
+    vi.mocked(api.getAdminState).mockResolvedValue(withApproval());
+    vi.mocked(api.decideApproval).mockRejectedValue(new Error('审批接口不通：502'));
+    render(<ApprovalsSettingsPage />);
+    await tick();
+
+    click('允许');
+    await tick();
+
+    expect(alertText()).toContain('审批接口不通：502');
+    expectNoStatus();
   });
 
   it('点「刷新列表」把结果和原因一起清掉', async () => {
@@ -176,13 +199,14 @@ describe('审批页审批之后的提示', () => {
     click('允许');
     await tick();
     await tick(APPROVALS_POLL_MS);
-    expect(statusText()).toBe('已允许审批。503 待审批列表拉不到');
+    expect(statusText()).toBe('已允许审批');
+    expect(alertText()).toBe('503 待审批列表拉不到');
 
     click('刷新列表');
     await tick();
 
     expect(api.getAdminState).toHaveBeenCalledTimes(4);
-    expectNoStatus();
+    expectSilent();
   });
 });
 
@@ -226,7 +250,7 @@ describe('审批页两次读取撞车', () => {
 
     await act(async () => { slow.reject(new Error('503 待审批列表拉不到')); });
 
-    expectNoStatus();
+    expectSilent();
     expect(screen.getByRole('button', { name: '刷新列表' })).not.toBeDisabled();
   });
 });
@@ -272,7 +296,7 @@ describe('审批页写完发现换了人', () => {
 
     expect(api.decideApproval).toHaveBeenCalledWith('admin-token', 'approval-1', 'allow', 'settings allow');
     expect(screen.queryByText('审批已过期：410')).toBeNull();
-    expectNoStatus();
+    expectSilent();
     expect(stateTokens()).toEqual(['admin-token', OTHER_TOKEN]);
   });
 
@@ -287,7 +311,7 @@ describe('审批页写完发现换了人', () => {
 
     expect(api.decideApproval).toHaveBeenCalledWith('admin-token', 'approval-1', 'deny', 'settings deny');
     expect(screen.queryByText('审批已过期：410')).toBeNull();
-    expectNoStatus();
+    expectSilent();
     expect(stateTokens()).toEqual(['admin-token', OTHER_TOKEN]);
   });
 });
@@ -319,7 +343,7 @@ describe('系统页重载之后的提示', () => {
     expect(statusText()).toBe('配置已重载');
   });
 
-  it('轮询失败只接在提示后面，不进操作日志', async () => {
+  it('轮询失败的原因另起一行报错，不进操作日志', async () => {
     vi.mocked(api.getAdminState)
       .mockResolvedValueOnce(adminState())
       .mockResolvedValueOnce(adminState())
@@ -333,7 +357,8 @@ describe('系统页重载之后的提示', () => {
     expect(statusText()).toBe('配置已重载');
 
     await tick(SYSTEM_POLL_MS);
-    expect(statusText()).toBe('配置已重载。503 系统状态拉不到');
+    expect(statusText()).toBe('配置已重载');
+    expect(alertText()).toBe('503 系统状态拉不到');
 
     const logs = useSettingsSelectionStore.getState().systemLogs;
     expect(logs).toHaveLength(1);
@@ -341,7 +366,24 @@ describe('系统页重载之后的提示', () => {
 
     await tick(SYSTEM_POLL_MS);
     expect(statusText()).toBe('配置已重载');
+    expectNoAlert();
     expect(useSettingsSelectionStore.getState().systemLogs).toHaveLength(1);
+  });
+
+  it('重载失败的原因报成错误，照样进操作日志', async () => {
+    vi.mocked(api.getAdminState).mockResolvedValue(adminState());
+    vi.mocked(api.reloadConfig).mockRejectedValue(new Error('503 配置重载失败'));
+    render(<SystemSettingsPage />);
+    await tick();
+
+    click('重载配置');
+    await tick();
+
+    expect(alertText()).toBe('503 配置重载失败');
+    expectNoStatus();
+    const logs = useSettingsSelectionStore.getState().systemLogs;
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatch(/ 503 配置重载失败$/);
   });
 
   it('点「刷新状态」把结果和原因一起清掉', async () => {
@@ -356,13 +398,14 @@ describe('系统页重载之后的提示', () => {
     click('重载配置');
     await tick();
     await tick(SYSTEM_POLL_MS);
-    expect(statusText()).toBe('配置已重载。503 系统状态拉不到');
+    expect(statusText()).toBe('配置已重载');
+    expect(alertText()).toBe('503 系统状态拉不到');
 
     click('刷新状态');
     await tick();
 
     expect(api.getAdminState).toHaveBeenCalledTimes(4);
-    expectNoStatus();
+    expectSilent();
   });
 });
 
@@ -407,7 +450,7 @@ describe('系统页两次读取撞车', () => {
 
     await act(async () => { slow.reject(new Error('503 系统状态拉不到')); });
 
-    expectNoStatus();
+    expectSilent();
     expect(screen.getByRole('button', { name: '刷新状态' })).not.toBeDisabled();
   });
 });
@@ -799,7 +842,7 @@ describe('系统页写完发现换了人', () => {
 
     expect(api.reloadConfig).toHaveBeenCalledWith('admin-token');
     expect(screen.queryByText('503 配置重载失败')).toBeNull();
-    expectNoStatus();
+    expectSilent();
     expect(useSettingsSelectionStore.getState().systemLogs).toEqual([]);
     expect(stateTokens()).toEqual(['admin-token', OTHER_TOKEN]);
   });
@@ -816,7 +859,7 @@ describe('系统页写完发现换了人', () => {
 
     expect(api.restartEngine).toHaveBeenCalledWith('admin-token');
     expect(screen.queryByText('503 重启接口不通')).toBeNull();
-    expectNoStatus();
+    expectSilent();
     expect(useSettingsSelectionStore.getState().systemLogs).toEqual([]);
     expect(stateTokens()).toEqual(['admin-token', OTHER_TOKEN]);
   });
@@ -847,12 +890,12 @@ describe('换人登录之后', () => {
     });
     render(<ApprovalsSettingsPage />);
     await tick();
-    expect(statusText()).toBe('503 待审批列表拉不到');
+    expect(alertText()).toBe('503 待审批列表拉不到');
 
     await act(async () => { swapToken(); });
     await tick();
 
-    expectNoStatus();
+    expectSilent();
     await act(async () => { slow.resolve(adminState()); });
   });
 
@@ -883,12 +926,12 @@ describe('换人登录之后', () => {
 
     click('重启引擎');
     await tick();
-    expect(statusText()).toBe('未能重启：调度器没有在管理引擎进程');
+    expect(alertText()).toBe('未能重启：调度器没有在管理引擎进程');
 
     await act(async () => { swapToken(); });
     await tick();
 
-    expectNoStatus();
+    expectSilent();
   });
 });
 
@@ -920,7 +963,7 @@ describe('节点文件页的提示', () => {
     expect(window.confirm).toHaveBeenCalledTimes(1);
   });
 
-  it('恢复默认后重读失败把原因接在后面，点「刷新列表」两样都清', async () => {
+  it('恢复默认后重读失败的原因另起一行报错，点「刷新列表」两样都清', async () => {
     vi.mocked(api.getNodeFiles)
       .mockResolvedValueOnce([nodeFile('qq.orchestrator.yaml')])
       .mockRejectedValueOnce(new Error('503 节点文件列表拉不到'))
@@ -930,16 +973,17 @@ describe('节点文件页的提示', () => {
 
     click('恢复默认');
     await tick();
-    expect(statusText()).toBe('文件 qq.orchestrator.yaml已恢复成仓库默认。503 节点文件列表拉不到');
+    expect(statusText()).toBe('文件 qq.orchestrator.yaml已恢复成仓库默认');
+    expect(alertText()).toBe('503 节点文件列表拉不到');
 
     click('刷新列表');
     await tick();
 
     expect(api.getNodeFiles).toHaveBeenCalledTimes(3);
-    expectNoStatus();
+    expectSilent();
   });
 
-  it('有未保存修改时刷新被取消就什么都不动，提示也留着', async () => {
+  it('有未保存修改时刷新被取消就什么都不动，报错也留着', async () => {
     vi.mocked(api.updateNodeFileRaw).mockRejectedValue(new Error('写不进去：403'));
     render(<NodeFilesSettingsPage />);
     await tick();
@@ -947,7 +991,8 @@ describe('节点文件页的提示', () => {
     fireEvent.change(screen.getByLabelText('文件内容'), { target: { value: 'id: qq\nname: 改过' } });
     click('保存当前文件');
     await tick();
-    expect(statusText()).toBe('写不进去：403');
+    expect(alertText()).toBe('写不进去：403');
+    expectNoStatus();
 
     vi.mocked(window.confirm).mockReturnValue(false);
     click('刷新列表');
@@ -955,7 +1000,7 @@ describe('节点文件页的提示', () => {
 
     expect(window.confirm).toHaveBeenCalledWith('当前文件还有未保存修改，确定离开或重新加载吗？');
     expect(api.getNodeFiles).toHaveBeenCalledTimes(1);
-    expect(statusText()).toBe('写不进去：403');
+    expect(alertText()).toBe('写不进去：403');
     expect(screen.getByLabelText('文件内容')).toHaveValue('id: qq\nname: 改过');
 
     vi.mocked(window.confirm).mockReturnValue(true);
@@ -963,7 +1008,7 @@ describe('节点文件页的提示', () => {
     await tick();
 
     expect(api.getNodeFiles).toHaveBeenCalledTimes(2);
-    expectNoStatus();
+    expectSilent();
     expect(screen.getByLabelText('文件内容')).toHaveValue('id: qq');
   });
 
@@ -982,9 +1027,10 @@ describe('节点文件页的提示', () => {
     expect(statusText()).toBe('已保存 a.yaml');
 
     fireEvent.change(screen.getByLabelText('当前文件'), { target: { value: 'b.yaml' } });
-    expectNoStatus();
+    expectSilent();
 
     await act(async () => { second.reject(new Error('读不到 b.yaml：404')); });
-    expect(statusText()).toBe('读不到 b.yaml：404');
+    expect(alertText()).toBe('读不到 b.yaml：404');
+    expectNoStatus();
   });
 });

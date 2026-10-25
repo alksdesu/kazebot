@@ -26,7 +26,7 @@ import { parseYamlMapping, sameData, type YamlKeyEdit } from '../../../console/y
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../../store/settingsStore';
-import { Block, Button, ErrorText, Field, Input, PageShell, Select, StatusText } from './settingsControls';
+import { Block, Button, ErrorText, Feedback, Field, Input, PageShell, Select } from './settingsControls';
 
 const presetTextAreaClass = 'w-full resize-y overflow-hidden border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-sm leading-5 text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]';
 
@@ -200,7 +200,7 @@ export const DrawtoolsSettingsPage = () => {
   const [nodeFile, setNodeFile] = useState<RawText>({ content: '', hash: null });
   const nodeRaw = nodeFile.content;
   const [nodeError, setNodeError] = useState('');
-  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
+  const { notice, error, setMessage, setError, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const requests = useRequestGuard();
   const [presetsExpanded, setPresetsExpanded] = useState(false);
@@ -236,9 +236,9 @@ export const DrawtoolsSettingsPage = () => {
       setNodeError(node.error);
       setEditor(section === 'node' ? node.content : getSectionContent(data, section));
       setLoadError('');
-    } catch (error) {
+    } catch (caught) {
       if (!request.isCurrent()) return;
-      setLoadError(errorMessage(error, '加载绘图配置失败'));
+      setLoadError(errorMessage(caught, '加载绘图配置失败'));
     } finally {
       if (request.isCurrent()) setLoading(false);
     }
@@ -272,9 +272,9 @@ export const DrawtoolsSettingsPage = () => {
       if (!requests.isCurrent()) return;
       setMessage(savedMessage('已保存。用户配置文件会写入非 example 文件，后续更新不会覆盖。', '', result.warnings));
       await load();
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, '保存失败'));
+      setError(errorMessage(caught, '保存失败'));
     }
   };
 
@@ -285,9 +285,9 @@ export const DrawtoolsSettingsPage = () => {
       if (!requests.isCurrent()) return;
       setMessage(result.created.length ? `已创建：${result.created.join('、')}` : '用户配置已存在，无需创建。');
       await load();
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, '初始化失败'));
+      setError(errorMessage(caught, '初始化失败'));
     }
   };
 
@@ -312,9 +312,9 @@ export const DrawtoolsSettingsPage = () => {
       if (!requests.isCurrent()) return;
       setMessage(savedMessage(okText, note, result.warnings));
       await load();
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, failText));
+      setError(errorMessage(caught, failText));
     }
   };
 
@@ -353,9 +353,9 @@ export const DrawtoolsSettingsPage = () => {
       const result = await cleanupDrawtoolsAttachments(adminToken);
       if (!requests.isCurrent()) return;
       setMessage(`清理完成：删除 ${result.deleted_count ?? 0} 个文件，释放 ${result.deleted_mb ?? 0} MB；剩余 ${result.remaining_count ?? 0} 个文件 / ${result.remaining_mb ?? 0} MB`);
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, '清理失败'));
+      setError(errorMessage(caught, '清理失败'));
     }
   };
 
@@ -397,14 +397,14 @@ export const DrawtoolsSettingsPage = () => {
   };
 
   const renameSelectedPreset = () => {
-    if (!selectedPreset?.id) { setMessage('请先选择一个预设'); return; }
+    if (!selectedPreset?.id) { setError('请先选择一个预设'); return; }
     const name = window.prompt('预设新名称：', String(selectedPreset.name || selectedPreset.id));
     if (!name) return;
     updateSelectedPresetField('name', name.trim() || String(selectedPreset.id));
   };
 
   const deleteSelectedPreset = () => {
-    if (!selectedPreset?.id) { setMessage('请先选择一个预设'); return; }
+    if (!selectedPreset?.id) { setError('请先选择一个预设'); return; }
     if (!window.confirm(`确定删除预设「${selectedPreset.name || selectedPreset.id}」？`)) return;
     const next = parseYamlObject(bundle?.settings?.content || '');
     const list = Array.isArray(next?.params?.presets) ? next.params.presets : [];
@@ -418,7 +418,7 @@ export const DrawtoolsSettingsPage = () => {
     const next = parseYamlObject(bundle?.settings?.content || '');
     const list = Array.isArray(next?.params?.presets) ? next.params.presets : [];
     const idx = list.findIndex((preset: any) => String(preset?.id || '') === effectiveSelectedPresetId);
-    if (idx < 0) { setMessage('请先选择一个预设'); return; }
+    if (idx < 0) { setError('请先选择一个预设'); return; }
     const numeric = typeof value === 'string' ? Number(value) : NaN;
     list[idx] = {
       ...list[idx],
@@ -435,7 +435,7 @@ export const DrawtoolsSettingsPage = () => {
     const next = parseYamlObject(bundle?.settings?.content || '');
     const list = Array.isArray(next?.params?.presets) ? next.params.presets : [];
     const idx = list.findIndex((preset: any) => String(preset?.id || '') === effectiveSelectedPresetId);
-    if (idx < 0) { setMessage('请先选择一个预设'); return; }
+    if (idx < 0) { setError('请先选择一个预设'); return; }
     list[idx] = { ...list[idx], [key]: value };
     next.params = { ...(next.params || {}), presets: list };
     void saveSettingsObject(next, `已保存预设字段：${key}`);
@@ -529,7 +529,7 @@ export const DrawtoolsSettingsPage = () => {
             <Button tone="quiet" disabled={loading} onClick={() => void refresh()}>{loading ? '正在刷新…' : '刷新'}</Button>
             <Button onClick={initConfigs}>从 Example 初始化用户配置</Button>
           </div>
-          <StatusText message={notice} />
+          <Feedback error={error} notice={notice} />
         </Block>
 
         <Block frame="boxed" title="API 配置" hint="API Key 推荐使用环境变量 NOVELAI_API_KEY；如必须写入文件，可在下方保存。">

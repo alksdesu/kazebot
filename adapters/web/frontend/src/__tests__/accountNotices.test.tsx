@@ -211,6 +211,23 @@ describe('账号页的提示', () => {
     expect(screen.queryByRole('img', { name: 'QQ 登录二维码' })).not.toBeInTheDocument();
   });
 
+  it('扫码登上了、自动登录没设上：登上的照常交代，没设上的另起一行报错', async () => {
+    vi.mocked(api.pinPlatformAccount).mockRejectedValue(new Error('503 写不进 NapCat 配置'));
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(waitingScan);
+    await intoScanning();
+
+    vi.mocked(api.getPlatformAccount).mockResolvedValue(online);
+    await tick();
+
+    expect(screen.getByText('已登录 当前机器人。')).toBeInTheDocument();
+    expect(screen.getByText('没能设为重启后自动登录：503 写不进 NapCat 配置')).toHaveAttribute('role', 'alert');
+
+    await tick();
+
+    expect(screen.getByText('已登录 当前机器人。')).toBeInTheDocument();
+    expect(screen.getByText('没能设为重启后自动登录：503 写不进 NapCat 配置')).toHaveAttribute('role', 'alert');
+  });
+
   it('谁也没点，光靠自己盯着进的扫码，每一轮都不会被判超时', async () => {
     vi.mocked(api.getPlatformAccount).mockResolvedValue(waitingScan);
     await intoScanning();
@@ -449,14 +466,16 @@ describe('账号页的提示', () => {
     await intoScanning();
 
     await tick();
-    expect(screen.getByText(`${SCAN_HINT}${READ_FAILED}`)).toBeInTheDocument();
+    expect(screen.getByText(SCAN_HINT)).toBeInTheDocument();
+    expect(screen.getByText(READ_FAILED)).toHaveAttribute('role', 'alert');
 
     await click('停止等待');
     const reads = vi.mocked(api.getPlatformAccount).mock.calls.length;
     await tick();
     await tick();
 
-    expect(screen.getByText(`${PAUSED_HINT}${READ_FAILED}`)).toBeInTheDocument();
+    expect(screen.getByText(PAUSED_HINT)).toBeInTheDocument();
+    expect(screen.getByText(READ_FAILED)).toHaveAttribute('role', 'alert');
     expect(screen.queryByRole('heading', { name: '扫码登录' })).not.toBeInTheDocument();
     expect(screen.queryByRole('img', { name: 'QQ 登录二维码' })).not.toBeInTheDocument();
     expect(api.getPlatformAccount).toHaveBeenCalledTimes(reads);
@@ -562,7 +581,7 @@ describe('记忆归属的提示', () => {
     await click('执行搬迁');
   };
 
-  it('搬迁的结果熬得过紧接着那次重读，读失败的原因接在后面', async () => {
+  it('搬迁的结果熬得过紧接着那次重读，读失败的原因另起一行报错', async () => {
     vi.mocked(api.getAccountScope)
       .mockResolvedValueOnce(scopeIdle)
       .mockResolvedValueOnce(scopePlan)
@@ -571,7 +590,18 @@ describe('记忆归属的提示', () => {
     await migrateThenFailRead();
 
     expect(api.migrateAccountScope).toHaveBeenCalledWith('admin-token', 'qq', '2000002', '1000001');
-    expect(screen.getByText(`${MIGRATED}。${SCOPE_FAILED}`)).toBeInTheDocument();
+    expect(screen.getByText(MIGRATED)).toBeInTheDocument();
+    expect(screen.getByText(SCOPE_FAILED)).toHaveAttribute('role', 'alert');
+  });
+
+  it('搬迁失败的原因报成错误，不当成提示', async () => {
+    vi.mocked(api.getAccountScope).mockResolvedValueOnce(scopeIdle).mockResolvedValue(scopePlan);
+    vi.mocked(api.migrateAccountScope).mockRejectedValue(new Error('目标号的记忆目录被占用'));
+
+    await migrateThenFailRead();
+
+    expect(screen.getByText('目标号的记忆目录被占用')).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText(MIGRATED)).not.toBeInTheDocument();
   });
 
   it('再点预览把搬迁的结果和读失败的原因一起清掉', async () => {
@@ -581,11 +611,11 @@ describe('记忆归属的提示', () => {
       .mockRejectedValueOnce(new Error(SCOPE_FAILED))
       .mockResolvedValue(scopePlan);
     await migrateThenFailRead();
-    expect(screen.getByText(`${MIGRATED}。${SCOPE_FAILED}`)).toBeInTheDocument();
+    expect(screen.getByText(MIGRATED)).toBeInTheDocument();
+    expect(screen.getByText(SCOPE_FAILED)).toHaveAttribute('role', 'alert');
 
     await click('预览');
 
-    expect(screen.queryByText(`${MIGRATED}。${SCOPE_FAILED}`)).not.toBeInTheDocument();
     expect(screen.queryByText(MIGRATED)).not.toBeInTheDocument();
     expect(screen.queryByText(SCOPE_FAILED)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '执行搬迁' })).toBeEnabled();

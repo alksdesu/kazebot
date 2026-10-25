@@ -10,7 +10,7 @@ import { useSettingsStore } from '../../../store/settingsStore';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
 import { savedMessage } from '../../../utils/sentence';
-import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
+import { Block, Button, Feedback, Field, Input, PageShell } from './settingsControls';
 import { mcpClientCreateEdits, mcpClientRemoveEdits, type McpClientFormState } from '../settingsStructuredConfig';
 
 function emptyMcpClient(id: string): McpClientFormState {
@@ -30,7 +30,7 @@ export const McpSettingsPage = () => {
   const { selectedMcpClient, setSelectedMcpClient } = useSettingsSelectionStore();
   const [clients, setClients] = useState<McpClient[]>([]);
   const [newId, setNewId] = useState('');
-  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
+  const { notice, error, setMessage, setError, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const mutation = useRef(false);
@@ -46,9 +46,9 @@ export const McpSettingsPage = () => {
       setClients(items);
       if (selectedMcpClient && !items.some((item) => item.id === selectedMcpClient.id)) setSelectedMcpClient(null);
       setLoadError('');
-    } catch (error) {
+    } catch (caught) {
       if (!request.isCurrent()) return;
-      setLoadError(errorMessage(error, '加载 MCP 配置失败'));
+      setLoadError(errorMessage(caught, '加载 MCP 配置失败'));
     } finally {
       if (request.isCurrent()) setLoading(false);
     }
@@ -75,7 +75,7 @@ export const McpSettingsPage = () => {
   const create = async () => {
     if (!adminToken || mutation.current || loading) return;
     const id = newId.trim();
-    if (!id) { setMessage('请输入 MCP Client ID'); return; }
+    if (!id) { setError('请输入 MCP Client ID'); return; }
     if (!confirmNavigation()) return;
     mutation.current = true; setBusy(true);
     try {
@@ -92,9 +92,9 @@ export const McpSettingsPage = () => {
       if (!requests.isCurrent()) return;
       setSelectedMcpClient({ id, enabled: false, transport: 'streamable_http', description: '通过设置页面创建的 MCP Client。' });
       setRightPanelOpen(true);
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, '创建 MCP Client 失败'));
+      setError(errorMessage(caught, '创建 MCP Client 失败'));
     } finally { mutation.current = false; setBusy(false); }
   };
 
@@ -114,9 +114,9 @@ export const McpSettingsPage = () => {
       setSelectedMcpClient(null);
       setMessage(savedMessage('MCP Client 已删除', note, result.warnings));
       await load();
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, '删除 MCP Client 失败'));
+      setError(errorMessage(caught, '删除 MCP Client 失败'));
     } finally { mutation.current = false; setBusy(false); }
   };
 
@@ -146,7 +146,7 @@ export const McpSettingsPage = () => {
             <Button className="mt-2" disabled={busy || loading || !newId.trim()} onClick={create}>创建 Client</Button>
           </Field>
         </div>
-        <StatusText message={notice} />
+        <Feedback error={error} notice={notice} />
       </Block>
     </PageShell>
   );

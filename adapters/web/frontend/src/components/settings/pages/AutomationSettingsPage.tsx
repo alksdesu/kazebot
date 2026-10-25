@@ -10,7 +10,7 @@ import { useSettingsStore } from '../../../store/settingsStore';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { confirmNavigation } from '../../../hooks/useUnsavedChanges';
 import { savedMessage } from '../../../utils/sentence';
-import { Block, Button, Field, Input, PageShell, StatusText } from './settingsControls';
+import { Block, Button, Feedback, Field, Input, PageShell } from './settingsControls';
 import { parseSchedules, scheduleCreateEdits, scheduleRemoveEdits, type ScheduleFormState } from '../settingsStructuredConfig';
 
 function emptySchedule(id: string): ScheduleFormState {
@@ -30,7 +30,7 @@ export const AutomationSettingsPage = () => {
   const { selectedScheduleId, setSelectedScheduleId } = useSettingsSelectionStore();
   const [schedules, setSchedules] = useState<ScheduleFormState[]>([]);
   const [newId, setNewId] = useState('');
-  const { notice, setMessage, setLoadError, clearNotice } = usePageNotice();
+  const { notice, error, setMessage, setError, setLoadError, clearNotice } = usePageNotice();
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const mutation = useRef(false);
@@ -46,9 +46,9 @@ export const AutomationSettingsPage = () => {
       setSchedules(parsed);
       if (selectedScheduleId && !parsed.some((schedule) => schedule.id === selectedScheduleId)) setSelectedScheduleId(null);
       setLoadError('');
-    } catch (error) {
+    } catch (caught) {
       if (!request.isCurrent()) return;
-      setLoadError(errorMessage(error, '加载定时任务失败'));
+      setLoadError(errorMessage(caught, '加载定时任务失败'));
     } finally {
       if (request.isCurrent()) setLoading(false);
     }
@@ -74,7 +74,7 @@ export const AutomationSettingsPage = () => {
   const create = async () => {
     if (!adminToken || mutation.current || loading) return;
     const id = newId.trim();
-    if (!id) { setMessage('请输入任务 ID'); return; }
+    if (!id) { setError('请输入任务 ID'); return; }
     if (!confirmNavigation()) return;
     mutation.current = true; setBusy(true);
     try {
@@ -91,9 +91,9 @@ export const AutomationSettingsPage = () => {
       if (!requests.isCurrent()) return;
       setSelectedScheduleId(id);
       setRightPanelOpen(true);
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, '创建定时任务失败'));
+      setError(errorMessage(caught, '创建定时任务失败'));
     } finally { mutation.current = false; setBusy(false); }
   };
 
@@ -113,9 +113,9 @@ export const AutomationSettingsPage = () => {
       setSelectedScheduleId(null);
       setMessage(savedMessage('定时任务已删除', note, result.warnings));
       await load();
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, '删除定时任务失败'));
+      setError(errorMessage(caught, '删除定时任务失败'));
     } finally { mutation.current = false; setBusy(false); }
   };
 
@@ -141,7 +141,7 @@ export const AutomationSettingsPage = () => {
             <Button className="mt-2" disabled={busy || loading || !newId.trim()} onClick={create}>创建任务</Button>
           </Field>
         </div>
-        <StatusText message={notice} />
+        <Feedback error={error} notice={notice} />
       </Block>
     </PageShell>
   );

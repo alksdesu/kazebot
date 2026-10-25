@@ -14,11 +14,12 @@ import {
 } from '../../../api/supervisorClient';
 import { commitYamlKeys } from '../../../console/yamlCommit';
 import type { YamlKeyEdit } from '../../../console/yamlRewrite';
+import { usePageNotice } from '../../../hooks/usePageNotice';
 import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { inferToolRisk, riskLabel } from '../../../utils/toolRisk';
-import { Block, Button, Check, Empty, ErrorText, Facts, Footnote, Input, Item, ItemTitle, List, SaveBar, Segmented, StatusText, Tag } from './settingsControls';
+import { Block, Button, Check, Empty, ErrorText, Facts, Footnote, Input, Item, ItemTitle, List, SaveBar, Segmented, Tag } from './settingsControls';
 import { savedMessage } from '../../../utils/sentence';
 import { errorMessage } from '../../../api/request';
 
@@ -188,7 +189,7 @@ const NodeRow = ({ node, tools, onSaved }: {
   const [deny, setDeny] = useState<string[]>(saved.deny);
   const [filter, setFilter] = useState('');
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState('');
+  const { notice, error, setMessage, setError } = usePageNotice();
   const [effective, setEffective] = useState<Record<string, EffectiveTool>>({});
   const [deadNames, setDeadNames] = useState<string[]>([]);
 
@@ -270,9 +271,9 @@ const NodeRow = ({ node, tools, onSaved }: {
       if (!requests.isCurrent()) return;
       setMessage(savedMessage('已保存，下一个任务即生效。', note, result.warnings));
       onSaved();
-    } catch (error) {
+    } catch (caught) {
       if (!requests.isCurrent()) return;
-      setMessage(errorMessage(error, '保存失败'));
+      setError(errorMessage(caught, '保存失败'));
     } finally {
       setBusy(false);
     }
@@ -360,7 +361,7 @@ const NodeRow = ({ node, tools, onSaved }: {
             busy={busy}
             dirty={dirty}
             label="保存授权"
-            note={message || (dirty ? '有未保存的改动' : '与服务器一致')}
+            note={notice || (dirty ? '有未保存的改动' : '与服务器一致')}
             onReset={() => {
               if (!confirmDiscard()) return;
               setMode(saved.mode);
@@ -370,6 +371,7 @@ const NodeRow = ({ node, tools, onSaved }: {
             }}
             onSave={() => void save()}
           />
+          {error && <ErrorText role="alert">{error}</ErrorText>}
         </div>
       )}
     </Item>
@@ -380,7 +382,7 @@ export const NodeGrantsSection = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const [nodes, setNodes] = useState<AdminNode[]>([]);
   const [tools, setTools] = useState<string[]>([]);
-  const [message, setMessage] = useState('');
+  const [loadError, setLoadError] = useState('');
   const requests = useRequestGuard();
 
   const load = async () => {
@@ -396,9 +398,9 @@ export const NodeGrantsSection = () => {
       // 模板和示例文件派发不到，摆在授权页里只会让人配一份永远不生效的权限。
       setNodes(nodeList.filter((node) => node.active !== false));
       setTools(toolNames);
-      setMessage('');
-    } catch (error) {
-      if (request.isCurrent()) setMessage(errorMessage(error, '读取节点失败'));
+      setLoadError('');
+    } catch (caught) {
+      if (request.isCurrent()) setLoadError(errorMessage(caught, '读取节点失败'));
     }
   };
 
@@ -411,19 +413,19 @@ export const NodeGrantsSection = () => {
       title="节点授权"
     >
       <DefaultsNotice nodes={nodes} />
-      {nodes.length === 0 ? <Empty>{message || '正在读取…'}</Empty> : (
+      {nodes.length === 0 ? !loadError && <Empty>正在读取…</Empty> : (
         <List>
           {nodes.map((node) => (
             <NodeRow key={node.id} node={node} onSaved={() => void load()} tools={tools} />
           ))}
         </List>
       )}
+      {loadError && <ErrorText role="alert">{loadError}</ErrorText>}
       <Footnote>
         能派活给谁是另一条线，由节点 YAML 的 delegate_targets 决定，和这里的白名单同时生效：
         这里没给 execute_command，它照样可以把命令交给 delegate_targets 里列出的下游节点，
         由下游按下游自己那份 tool_access 去执行。想堵死这条路，得把下游一起收紧。
       </Footnote>
-      <StatusText message={nodes.length ? message : ''} />
     </Block>
   );
 };

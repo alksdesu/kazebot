@@ -157,7 +157,7 @@ describe('图库的那一句提示', () => {
       .mockResolvedValue(page(['在库图']));
 
     render(<StickersPage />);
-    expect(await screen.findByText(LIST_FAILURE)).toBeInTheDocument();
+    expect(await screen.findByText(LIST_FAILURE)).toHaveAttribute('role', 'alert');
 
     click('在库 0');
 
@@ -182,11 +182,11 @@ describe('图库的那一句提示', () => {
     vi.mocked(api.acceptSticker).mockRejectedValueOnce(new Error('转正没成'));
     click('转正');
 
-    expect(await screen.findByText('转正没成')).toBeInTheDocument();
+    expect(await screen.findByText('转正没成')).toHaveAttribute('role', 'alert');
     expect(screen.queryByText('已转正，进候选了')).toBeNull();
   });
 
-  it('操作完那次重读失败，结果和原因合成一句', async () => {
+  it('操作完那次重读失败，结果照常交代，原因另起一行报错', async () => {
     vi.mocked(api.listStickers)
       .mockResolvedValueOnce(page(['待审图']))
       .mockRejectedValue(new Error(LIST_FAILURE));
@@ -197,7 +197,8 @@ describe('图库的那一句提示', () => {
 
     click('转正');
 
-    expect(await screen.findByText(`已转正，进候选了。${LIST_FAILURE}`)).toBeInTheDocument();
+    expect(await screen.findByText(LIST_FAILURE)).toHaveAttribute('role', 'alert');
+    expect(screen.getByText('已转正，进候选了')).toBeInTheDocument();
   });
 
   it('操作做到一半换了号：不拿旧号的 token 重读，也不报这一次的结果', async () => {

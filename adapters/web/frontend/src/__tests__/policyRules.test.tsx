@@ -66,13 +66,13 @@ function deferred<T>(): Deferred<T> {
 let lastPut: any = null;
 let codeWriteCalls = 0;
 
-function stubPolicy(policy = POLICY) {
+function stubPolicy(policy = POLICY, codeWrite: () => Response = () => jsonResponse({ ok: true })) {
   lastPut = null;
   codeWriteCalls = 0;
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     if (String(input).includes('/runtime/code-write')) {
       codeWriteCalls += 1;
-      return jsonResponse({ ok: true });
+      return codeWrite();
     }
     if (init?.method === 'PUT') {
       lastPut = JSON.parse(String(init.body)).policy;
@@ -82,8 +82,8 @@ function stubPolicy(policy = POLICY) {
   }));
 }
 
-async function renderPolicy(policy = POLICY) {
-  stubPolicy(policy);
+async function renderPolicy(policy = POLICY, codeWrite?: () => Response) {
+  stubPolicy(policy, codeWrite);
   render(<PolicyRulesSection />);
   await screen.findByRole('button', { name: /写入/ });
 }
@@ -249,6 +249,18 @@ describe('服务端策略', () => {
     });
   });
 
+  it('策略存上了、代码目录写权限没开成：存上的照常交代，没开成的另起一行报错', async () => {
+    await renderPolicy(POLICY, () => errorResponse(503, '宿主机拒绝了'));
+
+    fireEvent.click(screen.getByRole('button', { name: '一键全自动放行' }));
+    fireEvent.click(screen.getByLabelText(/同时开放 \/opt\/kazebot/));
+    fireEvent.click(screen.getByRole('button', { name: '确认并保存全自动放行' }));
+
+    expect(await screen.findByText('代码目录写权限没能启用：503 宿主机拒绝了')).toHaveAttribute('role', 'alert');
+    expect(screen.getByRole('status')).toHaveTextContent('策略已保存。');
+    expect(codeWriteCalls).toBe(1);
+  });
+
   it('保存整份文档，没显示的字段不会被吞掉', async () => {
     // PUT 是整份替换：漏带 deny_patterns 等于把 12 条硬拦截规则悄悄删了。
     await renderPolicy();
@@ -369,7 +381,7 @@ describe('服务端策略', () => {
       edit();
       fireEvent.click(saveButton());
 
-      expect(await screen.findByText(CONFLICT)).toBeInTheDocument();
+      expect(await screen.findByText(CONFLICT)).toHaveAttribute('role', 'alert');
       expect(puts).toHaveLength(1);
       // 草稿还在手里，重做一遍之前不能被清掉。
       expect(screen.getByLabelText('兜底档位')).toHaveValue('deny');
