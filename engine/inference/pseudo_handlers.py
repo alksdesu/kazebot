@@ -7,14 +7,20 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes as _mimetypes
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from clonoth_runtime import parse_bool
 
 from .resume_builder import _select_attachments
 from .attachment_access import RefusedAttachment, screen_model_attachment_paths
 from ..attachments import is_allowed_attachment_path
 from ..compaction_plan import build_compaction_plan
+from ..conversation_routing import short_reply as _is_short_reply
+from ..dispatch_batch import MAX_DISPATCH_BATCH_ITEMS
 from ..protocol import TaskAction, ACTION_ASK, ACTION_DISPATCH, ACTION_FINISH
+from ..todo_list import TODO_TOOL_NAME, TodoListError, parse_todo_items, render_update_result
 from .loop_state import _LoopState, _persist_ctx, _short, compact_target_session_id
 # 【Fix 3】reply 工具结果统一走 formatter.format_tool_result，需要 ParsedToolCall 构造、
 # MessageMeta 标注 message_type、MessageType 影子写入。延迟导入 _shadow_write 避免循环依赖。
@@ -237,6 +243,9 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     # preempt_task: 非终止，软打断子任务
     if pseudo_call.name == "preempt_task":
         return await _handle_pseudo_preempt_task(ls, pseudo_call, args)
+
+    if pseudo_call.name == TODO_TOOL_NAME:
+        return await _handle_pseudo_update_todos(ls, pseudo_call, args)
 
     _fixed_dispatch_target = _dispatch_target_from_tool_name(pseudo_call.name)
     if _fixed_dispatch_target:
@@ -506,18 +515,24 @@ def _target_is_persistent(ls: _LoopState, target: str) -> bool:
         return False
 
 
-async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> None:
-    """处理 dispatch:{target_id} 动态伪工具。始终返回 None（非终止）。
+@dataclass(frozen=True)
+class DispatchRequest:
+    """一次委派调用校验过的参数：异步和 wait 两条路用同一套目标、上下文模式和附件规则。"""
 
-    [2026-05-28] 所有异步 dispatch 统一走 inbound 路径。
-    为什么：让异步子节点复用现有的 session / entry-branch / conversation 机制，
-    而不是用单独的 dispatch-async 端点。
-    怎么改：构造 inbound payload（含 dispatch_origin 回调信息），POST /v1/inbound。
-    目的：统一生命周期管理，为 persistent node 支持铺路。
-    """
+    target: str
+    instruction: str
+    context_mode: str
+    context_key: str
+    attachments: list[dict[str, Any]]
+    refused_attachments: list[RefusedAttachment]
+
+
+async def _resolve_dispatch_request(
+    ls: _LoopState, args: dict, pseudo_call: Any,
+) -> tuple[DispatchRequest | None, str]:
+    """校验委派参数，返回 (请求, 拒绝原因)；目标不在委派清单里时请求为 None。"""
     # 委派清单加载时已换成现在的 id；模型照着旧历史写出旧 id，也换过来再比
     target = canonical_node_id(Path(ls.rctx.workspace_root), str(args.get("target") or ""))
-    instr = str(args.get("instruction") or "").strip()
 
     # 目标是从工具名反查出来的，而反查表 _DISPATCH_TOOL_REVERSE 是进程内全局的，
     # 别的节点注册过的目标这里一样查得到，查不到还会原样退回字符串。
@@ -528,14 +543,10 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
             "node %s attempted dispatch to non-delegate target: %s (allowed: %s)",
             ls.node.id, target, sorted(ls.allowed_dispatch_targets),
         )
-        _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
-            "success": False,
-            "error": (
-                f"'{target}' is not in this node's delegate_targets. "
-                f"Allowed: {sorted(ls.allowed_dispatch_targets) or '(none)'}"
-            ),
-        }, ensure_ascii=False))
-        return None
+        return None, (
+            f"'{target}' is not in this node's delegate_targets. "
+            f"Allowed: {sorted(ls.allowed_dispatch_targets) or '(none)'}"
+        )
 
     # [AutoC 2026-07-09] Why: dispatch 的默认 context_mode 原先写死 accumulate，
     # 导致所有未显式指定模式的子节点都长期复用 child session（历史污染 / 成本上升）。
@@ -548,11 +559,41 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         ctx_mode = str(_raw_ctx_mode).strip()
     else:
         ctx_mode = "accumulate" if _target_is_persistent(ls, target) else "fresh"
-    ctx_key = str(args.get("context_key") or "").strip() or None
     attachment_paths, refused_attachments = await screen_model_attachment_paths(
         ls, pseudo_call, args.get("attachment_paths") or [], data_dir_only=True,
     )
-    attachments = _paths_to_attachments(attachment_paths, ls.rctx.workspace_root)
+    return DispatchRequest(
+        target=target,
+        instruction=str(args.get("instruction") or "").strip(),
+        context_mode=ctx_mode,
+        context_key=str(args.get("context_key") or "").strip(),
+        attachments=_paths_to_attachments(attachment_paths, ls.rctx.workspace_root),
+        refused_attachments=list(refused_attachments),
+    ), ""
+
+
+async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> None:
+    """处理 dispatch:{target_id} 动态伪工具。始终返回 None（非终止）。
+
+    [2026-05-28] 所有异步 dispatch 统一走 inbound 路径。
+    为什么：让异步子节点复用现有的 session / entry-branch / conversation 机制，
+    而不是用单独的 dispatch-async 端点。
+    怎么改：构造 inbound payload（含 dispatch_origin 回调信息），POST /v1/inbound。
+    目的：统一生命周期管理，为 persistent node 支持铺路。
+    """
+    request, refusal = await _resolve_dispatch_request(ls, args, pseudo_call)
+    if request is None:
+        _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
+            "success": False,
+            "error": refusal,
+        }, ensure_ascii=False))
+        return None
+    target = request.target
+    instr = request.instruction
+    ctx_mode = request.context_mode
+    ctx_key = request.context_key or None
+    attachments = request.attachments
+    refused_attachments = request.refused_attachments
 
     # 获取父 session 信息
     parent_session_id = getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id
@@ -636,4 +677,143 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     if refused_attachments:
         dispatch_result["refused_attachments"] = [item.as_dict() for item in refused_attachments]
     _emit_pseudo_tool_result(ls, pseudo_call, json.dumps(dispatch_result, ensure_ascii=False))
+    return None
+
+
+WAIT_DISPATCHED = "dispatched"
+WAIT_INTERCEPTED = "intercepted"
+WAIT_PREEMPTED = "preempted"
+WAIT_CANCELLED = "cancelled"
+WAIT_ABORTED = "aborted"
+
+_WAIT_NOT_SENT = {
+    WAIT_INTERCEPTED: "没有派出：用户刚发来了新消息。先看新消息，还需要的话再重新委派。",
+    WAIT_PREEMPTED: "没有派出：任务被打断了。",
+    WAIT_CANCELLED: "没有派出：任务已取消。",
+    WAIT_ABORTED: "没有派出：这一轮提前结束了，还需要的话重新委派。",
+}
+
+
+def is_wait_dispatch(call: Any) -> bool:
+    """带 wait=true 的委派调用：不当场派出，等本轮其它调用跑完再成批同步派出。"""
+    if not _dispatch_target_from_tool_name(str(getattr(call, "name", "") or "")):
+        return False
+    arguments = getattr(call, "arguments", None)
+    return isinstance(arguments, dict) and bool(parse_bool(arguments.get("wait"), False))
+
+
+def _wait_refusal(error: str) -> str:
+    return json.dumps({"success": False, "error": error}, ensure_ascii=False)
+
+
+@dataclass
+class WaitDispatch:
+    """一个通过校验、等着和同轮其它 wait 委派一起派出的调用。"""
+
+    call: Any
+    target: str
+    item: dict[str, Any]
+    refused_attachments: list[RefusedAttachment] = field(default_factory=list)
+
+    def result_text(self, outcome: str) -> str:
+        """这次调用的工具结果：派出去了就是占位，真正的结果在恢复后的下一条消息里；没派出去说明原因。"""
+        if outcome == WAIT_DISPATCHED:
+            payload: dict[str, Any] = {
+                "success": True,
+                "status": "waiting",
+                "message": f"已派出给 {self.target}，正在等待结果；结果会在下一条消息给出。",
+            }
+        else:
+            payload = {"success": False, "error": _WAIT_NOT_SENT.get(outcome, _WAIT_NOT_SENT[WAIT_ABORTED])}
+        if self.refused_attachments:
+            payload["refused_attachments"] = [item.as_dict() for item in self.refused_attachments]
+        return json.dumps(payload, ensure_ascii=False)
+
+
+@dataclass
+class WaitDispatchPlan:
+    items: list[WaitDispatch] = field(default_factory=list)
+    rejected: list[tuple[Any, str]] = field(default_factory=list)
+
+
+async def prepare_wait_dispatches(ls: _LoopState, calls: list[Any]) -> WaitDispatchPlan:
+    """校验本轮的 wait 委派并组成批次项，目标、上下文模式和附件的规则与异步委派共用。
+
+    简短回应和系统任务里的、超出每轮上限的、参数不合格的调用都进 rejected，带着给模型看的原因。
+    """
+    plan = WaitDispatchPlan()
+    task_context = getattr(ls.rctx, "task_context", None) or {}
+    if _is_short_reply(task_context):
+        plan.rejected.extend((call, _wait_refusal("本轮为简短回应，请仅调用 finish。")) for call in calls)
+        return plan
+    if task_context.get("is_system_task"):
+        plan.rejected.extend(
+            (call, _wait_refusal("没有派出：系统任务不能挂起等待子节点的结果；不需要结果就去掉 wait 异步派出。"))
+            for call in calls
+        )
+        return plan
+    shared_contexts: set[tuple[str, str]] = set()
+    for index, call in enumerate(calls):
+        if index >= MAX_DISPATCH_BATCH_ITEMS:
+            plan.rejected.append((call, _wait_refusal(
+                f"没有派出：同一轮最多 {MAX_DISPATCH_BATCH_ITEMS} 个 wait 委派，这一个超出了；等这批结果回来后再派。"
+            )))
+            continue
+        arguments = dict(getattr(call, "arguments", None) or {})
+        target = _dispatch_target_from_tool_name(str(getattr(call, "name", "") or ""))
+        request, refusal = await _resolve_dispatch_request(ls, {**arguments, "target": target}, call)
+        if request is None:
+            plan.rejected.append((call, _wait_refusal(refusal)))
+            continue
+        if not request.instruction:
+            plan.rejected.append((call, _wait_refusal("没有派出：instruction 不能为空，写清楚要目标节点做什么。")))
+            continue
+        # fresh / fork 每项各开一个子会话；其余模式同一目标同一 context_key 共用一个，同时跑会写乱它
+        if request.context_mode not in ("fresh", "fork"):
+            shared = (request.target, request.context_key)
+            if shared in shared_contexts:
+                plan.rejected.append((call, _wait_refusal(
+                    f"没有派出：同一轮已经有一个用同一份上下文的 {request.target} 委派，两个同时跑会写乱这份上下文；"
+                    "等结果回来后再派，或者改用 fresh、换一个 context_key。"
+                )))
+                continue
+            shared_contexts.add(shared)
+        item: dict[str, Any] = {
+            "kind": "node",
+            "target": request.target,
+            "instruction": request.instruction,
+            "context_mode": request.context_mode,
+        }
+        if request.context_key:
+            item["context_key"] = request.context_key
+        if request.attachments:
+            item["attachments"] = [dict(attachment) for attachment in request.attachments]
+        call_id = str(getattr(call, "id", "") or "").strip()
+        if call_id:
+            item["call_id"] = call_id
+        plan.items.append(WaitDispatch(
+            call=call, target=request.target, item=item,
+            refused_attachments=list(request.refused_attachments),
+        ))
+    return plan
+
+
+async def _handle_pseudo_update_todos(ls: _LoopState, pseudo_call: Any, args: dict) -> None:
+    """update_todos：整份替换本任务的待办清单，结果里回显清单，并发 todo_updated 事件。始终返回 None。"""
+    if not getattr(ls, "todo_enabled", False):
+        _emit_pseudo_tool_result(ls, pseudo_call, "Error: 这个节点没有启用待办清单，不能调用 update_todos。")
+        return None
+    try:
+        items = parse_todo_items(args.get("items"))
+    except TodoListError as error:
+        _emit_pseudo_tool_result(ls, pseudo_call, f"Error: {error}")
+        return None
+    ls.todos = items
+    ls.todos_restored = True
+    _emit_pseudo_tool_result(ls, pseudo_call, render_update_result(items))
+    await ls.rctx.emit_event("todo_updated", {
+        "node_id": ls.node.id,
+        "task_id": ls.rctx.task_id,
+        "items": [dict(item) for item in items],
+    })
     return None

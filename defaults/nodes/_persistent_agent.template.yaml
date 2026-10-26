@@ -6,6 +6,8 @@
 # 关键约定：
 # - persistent: true  → 被 dispatch 时默认 context_mode=accumulate（长期累积上下文，
 #   触发轮摘要 / 压缩 / 记忆提取），不再像一次性节点那样默认 fresh。
+#   调用方设 wait: true 同步等它时，子会话随调用方那次任务结束清理，accumulate 只在那次任务里延续；
+#   要长期累积，调用方用默认的异步委派。
 # - memory_book        → 独立记忆命名空间，物理落在 data/memory/{memory_book}/，
 #   与其他节点/会话的记忆文件隔离，避免逸散与串扰。每个长期方向一个节点一个 book。
 #

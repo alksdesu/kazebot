@@ -9,6 +9,9 @@ from typing import Any, TYPE_CHECKING
 
 from toolbox.tool_names import DISPATCH_TOOL_PREFIX
 
+from ..dispatch_batch import MAX_DISPATCH_BATCH_ITEMS
+from ..todo_list import MAX_TODO_CONTENT_CHARS, MAX_TODO_ITEMS, TODO_STATUSES, TODO_TOOL_NAME
+
 if TYPE_CHECKING:
     from ..node import Node
 
@@ -70,35 +73,54 @@ def _is_control_tool_name(name: str) -> bool:
 # default context behavior in schema. Purpose: keep execution compatible with the
 # existing supervisor dispatch API while making each delegate target visible as a
 # first-class tool.
-def _dispatch_delegate_parameters() -> dict[str, Any]:
+def _dispatch_delegate_parameters(*, allow_wait: bool = True) -> dict[str, Any]:
+    context_mode_description = (
+        "子节点上下文模式。fresh=每次从零无历史（一次性搜索/一次性工程执行/审查/debug 推荐）；"
+        "fork=继承父节点对话历史（需要当前上下文但不污染长期子节点时用）；"
+        "accumulate=首次从零、后续恢复自己的长期上下文（长期人格/专属助手/立项长期维护 agent 用）。"
+        "不填时按目标节点是否为持久节点自动选择：持久节点默认 accumulate，其余默认 fresh。"
+    )
+    if allow_wait:
+        context_mode_description += (
+            "wait=true 时子节点的会话随本任务结束清理，accumulate 只在这次任务里延续；要跨任务长期累积，用 wait=false。"
+        )
+    properties: dict[str, Any] = {
+        "instruction": {
+            "type": "string",
+            "description": "给目标节点的清晰、具体、可执行的指令。说明要做什么、为什么、你已经知道什么。",
+        },
+        "context_mode": {
+            "type": "string",
+            "enum": ["fresh", "fork", "accumulate"],
+            "description": context_mode_description,
+        },
+        "context_key": {
+            "type": "string",
+            "description": "上下文继承标识（仅 accumulate 模式有效）。同一 context_key 的历次任务共享同一条上下文链，不同 context_key 之间文件隔离——用于长期研究员按主题/项目分开积累。不填则按目标节点 ID 查找。",
+        },
+        "attachment_paths": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "File paths (relative to workspace root) to attach to the child node's initial context. Images are injected as multimodal content; other files as references the child can read_file.",
+        },
+    }
+    if allow_wait:
+        properties["wait"] = {
+            "type": "boolean",
+            "description": (
+                "true：挂起当前任务，等目标节点做完、把结果交回来再继续；同一轮发出的多个 wait 委派并行执行，"
+                "全部完成后结果一起在下一条消息里给出。false（默认）：异步派出，结果稍后作为一条新消息送达。"
+            ),
+        }
     return {
         "type": "object",
-        "properties": {
-            "instruction": {
-                "type": "string",
-                "description": "给目标节点的清晰、具体、可执行的指令。说明要做什么、为什么、你已经知道什么。",
-            },
-            "context_mode": {
-                "type": "string",
-                "enum": ["fresh", "fork", "accumulate"],
-                "description": "子节点上下文模式。fresh=每次从零无历史（一次性搜索/一次性工程执行/审查/debug 推荐）；fork=继承父节点对话历史（需要当前上下文但不污染长期子节点时用）；accumulate=首次从零、后续恢复自己的长期上下文（长期人格/专属助手/立项长期维护 agent 用）。不填时按目标节点是否为持久节点自动选择：持久节点默认 accumulate，其余默认 fresh。",
-            },
-            "context_key": {
-                "type": "string",
-                "description": "上下文继承标识（仅 accumulate 模式有效）。同一 context_key 的历次任务共享同一条上下文链，不同 context_key 之间文件隔离——用于长期研究员按主题/项目分开积累。不填则按目标节点 ID 查找。",
-            },
-            "attachment_paths": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "File paths (relative to workspace root) to attach to the child node's initial context. Images are injected as multimodal content; other files as references the child can read_file.",
-            },
-        },
+        "properties": properties,
         "required": ["instruction"],
     }
 
 
-def _dispatch_delegate_spec(target_id: str, info: dict[str, str] | None = None) -> dict:
-    """Build one dispatch:{target_id} pseudo-tool spec."""
+def _dispatch_delegate_spec(target_id: str, info: dict[str, str] | None = None, *, allow_wait: bool = True) -> dict:
+    """Build one dispatch_to_<target> pseudo-tool spec; allow_wait=False leaves out the wait parameter."""
     target = str(target_id or "").strip()
     node_name = str((info or {}).get("name") or target).strip() or target
     node_description = str((info or {}).get("description") or node_name or target).strip()
@@ -106,22 +128,41 @@ def _dispatch_delegate_spec(target_id: str, info: dict[str, str] | None = None) 
         f"将任务委派给固定目标节点 {node_name}（{target}）。",
         node_description,
         "",
-        "目标节点在自己的会话里异步执行；本工具立即返回，返回值只表示「已派出」，不含执行结果。",
-        "结果稍后会作为一条新消息送达，那时再向用户汇报；本轮不要臆测结果，也不要承诺完成时间。",
-        "参数中不再提供 target；该工具名已经固定了目标节点。",
-        "需要并行委派时，可以在同一轮并行调用多个 dispatch:{target_id} 工具。",
+        "目标节点在自己的会话里执行。参数中不再提供 target，该工具名已经固定了目标节点。",
     ]
+    if allow_wait:
+        desc_parts += [
+            "两种用法：",
+            "- wait: true（等结果）：当前任务挂起，目标节点做完后把结果交回来，你接着往下做。"
+            "后续步骤要用到它的结果时用这种，例如要看命令输出、要拿读到的内容继续处理。"
+            "本工具当轮只返回「已派出」，结果在下一条消息里给出；同一轮的多个 wait 委派并行执行，全部完成后一起返回。",
+            "- wait: false（默认，异步）：立即返回「已派出」，不含执行结果；结果稍后作为一条新消息送达，那时再向用户汇报。"
+            "不需要结果，或者要跑很久（例如生图）时用这种。本轮不要臆测结果，也不要承诺完成时间。",
+            f"同一轮最多 {MAX_DISPATCH_BATCH_ITEMS} 个 wait 委派。和 wait 委派同一轮调用的 finish/ask 不会执行，"
+            "结果回来之后再单独调用 finish。",
+        ]
+    else:
+        desc_parts += [
+            "本工具立即返回，返回值只表示「已派出」，不含执行结果。",
+            "结果稍后会作为一条新消息送达，那时再向用户汇报；本轮不要臆测结果，也不要承诺完成时间。",
+        ]
+    desc_parts.append("需要并行委派时，可以在同一轮调用多个委派工具。")
     return {
         "type": "function",
         "function": {
             "name": _dispatch_tool_name(target),
             "description": "\n".join(part for part in desc_parts if part is not None),
-            "parameters": _dispatch_delegate_parameters(),
+            "parameters": _dispatch_delegate_parameters(allow_wait=allow_wait),
         },
     }
 
 
-def _dispatch_delegate_specs(targets: list[str], downstream_info: list[dict[str, str]] | None = None) -> list[dict]:
+def _dispatch_delegate_specs(
+    targets: list[str],
+    downstream_info: list[dict[str, str]] | None = None,
+    *,
+    allow_wait: bool = True,
+) -> list[dict]:
     """Build dynamic dispatch pseudo-tools for all delegate targets."""
     info_by_id = {
         str(info.get("id") or "").strip(): info
@@ -135,7 +176,7 @@ def _dispatch_delegate_specs(targets: list[str], downstream_info: list[dict[str,
         if not target or target in seen:
             continue
         seen.add(target)
-        result.append(_dispatch_delegate_spec(target, info_by_id.get(target)))
+        result.append(_dispatch_delegate_spec(target, info_by_id.get(target), allow_wait=allow_wait))
     return result
 
 def _finish_spec() -> dict:
@@ -221,6 +262,9 @@ def _ask_spec() -> dict:
                 "- You want to confirm your approach before investing effort.\n\n"
                 "The upstream will see your question and can respond, which will create a new "
                 "task for you to continue working.\n\n"
+                "Call ask on its own (reply may accompany it). If you call ask in the same turn as other tools, "
+                "including a dispatch tool, those other tools still run but ask is ignored and does not end the node: "
+                "read their results first, then call ask again on its own.\n\n"
                 "Parameters:\n"
                 "- text: Your specific question or request for information.\n"
                 "- summary: Brief summary (optional) for the upstream node."
@@ -354,6 +398,53 @@ def _preempt_task_spec() -> dict:
     }
 
 
+def _update_todos_spec() -> dict:
+    """伪工具：维护本任务的待办清单，只注入给声明了 todo: true 的节点。"""
+    statuses = " / ".join(TODO_STATUSES)
+    return {
+        "type": "function",
+        "function": {
+            "name": TODO_TOOL_NAME,
+            "description": (
+                "维护本任务的待办清单，帮你跟踪多步任务的进度。每次传入完整清单，会整体替换上一份。\n\n"
+                "用法：\n"
+                "- 多步任务开始时先列出要做的步骤，全部是 pending。\n"
+                "- 开始做某一项时把它标成 in_progress，同一时间一般只有一项 in_progress；做完立刻标成 completed。\n"
+                "- 中途发现新步骤就加进去，不再需要的删掉；传空数组表示清空清单。\n"
+                "- 一两步就能做完的简单任务不用建清单。\n\n"
+                f"最多 {MAX_TODO_ITEMS} 项，每项不超过 {MAX_TODO_CONTENT_CHARS} 字，status 取 {statuses}。"
+                "清单上还有没做完的项时，系统每步都会提醒你。\n"
+                "本工具不结束任务：清单全部完成后另起一步单独调用 finish，和 finish 同一轮调用时 finish 不会执行。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "完整的待办清单，按执行顺序排列。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {
+                                    "type": "string",
+                                    "description": "这一项要做什么，一句话说清楚。",
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": list(TODO_STATUSES),
+                                    "description": "pending=还没开始；in_progress=正在做；completed=已经做完。",
+                                },
+                            },
+                            "required": ["content", "status"],
+                        },
+                    },
+                },
+                "required": ["items"],
+            },
+        },
+    }
+
+
 def _switch_node_spec(targets: list[str], switch_info: list[dict[str, str]] | None = None, *, current_node_id: str = "", current_node_name: str = "") -> dict:
     """构建 switch_node 伪工具定义——切换 session 的对话节点。"""
     desc_parts = [
@@ -441,12 +532,32 @@ def _to_openai_tools(specs: list[dict]) -> list[dict]:
     return result
 
 
-def tool_allowed(node: "Node", name: str) -> bool:
+def _normalized_mode(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def edit_mode_satisfied(current: Any, required: Any) -> bool:
+    """节点写的 edit_mode 满不满足工具要求的 requires_edit_mode；工具没要求时总是满足。"""
+    wanted = _normalized_mode(required)
+    return not wanted or _normalized_mode(current) == wanted
+
+
+def edit_mode_matches(node: "Node", spec: dict[str, Any] | None) -> bool:
+    """spec 声明了 requires_edit_mode 时，只有节点 extra 里的 edit_mode 与它相同才给这个工具。"""
+    required = spec.get("requires_edit_mode") if isinstance(spec, dict) else ""
+    extra = getattr(node, "extra", None)
+    current = extra.get("edit_mode") if isinstance(extra, dict) else ""
+    return edit_mode_satisfied(current, required)
+
+
+def tool_allowed(node: "Node", name: str, spec: dict[str, Any] | None = None) -> bool:
     """这个节点能不能调这个工具。
 
     授权语义只此一份：列表过滤和单名校验都走它，不然两处迟早漂移成两套规则。
-    未知 mode 落 none —— 配错了宁可什么都不给。
+    未知 mode 落 none —— 配错了宁可什么都不给。手里有 spec 的调用方要把它传进来，requires_edit_mode 也在这里判。
     """
+    if not edit_mode_matches(node, spec):
+        return False
     mode = (node.tool_access.mode or "none").lower()
     if mode == "all":
         return name not in set(node.tool_access.deny)
@@ -456,4 +567,4 @@ def tool_allowed(node: "Node", name: str) -> bool:
 
 
 def _filter_tool_specs(node: "Node", all_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [s for s in all_specs if tool_allowed(node, s.get("name") or "")]
+    return [s for s in all_specs if tool_allowed(node, s.get("name") or "", s)]

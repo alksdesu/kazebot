@@ -171,6 +171,12 @@ class _LoopState:
     # 为后续 snapshot 瘦身（不再存完整 messages 数组）做准备。
     last_shadow_message_id: str = ""
 
+    # ---- 待办清单：节点 yaml 声明 todo: true、且不是系统任务时才启用 ----
+    todo_enabled: bool = False
+    todos: list = field(default_factory=list)
+    # 恢复后的第一步要从本任务的调用记录重建一次清单，之后不再重建
+    todos_restored: bool = False
+
 
 def conversation_writer(rctx: Any) -> ConversationWriter | None:
     """本任务的对话写入器，挂着 conversation_store 才有。"""

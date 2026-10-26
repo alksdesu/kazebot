@@ -25,6 +25,7 @@ from .branch_finalize_store import BranchClaim
 from .compact_breaker import MAX_TASK_CONSECUTIVE_FAILURES
 from .reply_intent import result_from_task as reply_intent_result_from_task
 from engine.compact import COMPACT_SUMMARY_PREFIX
+from engine.dispatch_batch import MAX_DISPATCH_BATCH_ITEMS, batch_item_attachments
 from engine.output_guide import OUTPUT_GUIDE_KEY
 
 from .types import RouteStatus, Task, TaskKind, TaskStatus
@@ -1357,6 +1358,69 @@ class TaskRouterMixin:
             return _m
         return "accumulate" if self._node_is_persistent(node_id) else "fresh"
 
+    def _dispatch_batch_refusal_locked(
+        self, task: Task, batch: list[Any], *, has_single_target: bool = False,
+    ) -> str:
+        """同步批次能不能派：系统任务不许挂起等子任务，一次的项数有上限。返回拒绝原因，能派时为空串。"""
+        context = task.input.get("task_context")
+        if task.input.get("_system_task") or (isinstance(context, dict) and context.get("is_system_task")):
+            return "同步委派被拒绝：系统任务不能挂起等待子任务的结果。"
+        if len(batch) > MAX_DISPATCH_BATCH_ITEMS:
+            return f"同步委派被拒绝：一次最多派出 {MAX_DISPATCH_BATCH_ITEMS} 个子任务，这次有 {len(batch)} 个。"
+        if not has_single_target and not any(
+            isinstance(item, dict) and str(item.get("target") or "").strip() for item in batch
+        ):
+            # 一个子任务都没建出来的话 caller 会停在 completed，既不挂起也不路由
+            return "同步委派被拒绝：批次里没有一项写了 target，没有可派出的子任务。"
+        return ""
+
+    def _batch_child_task_context_locked(
+        self,
+        caller: Task,
+        *,
+        target: str,
+        context_mode: str,
+        context_key: str,
+        child_session_id: str,
+    ) -> dict[str, Any]:
+        """批次子节点的 task_context：身份、渠道、路由提示和根会话的键照异步委派那样从发起方带过来。
+
+        不带的话子节点没有 conversation_key，记忆读写会落到无归属的公共目录，功能接口也认不出发起人。
+        """
+        raw_context = caller.input.get("task_context")
+        caller_context = raw_context if isinstance(raw_context, dict) else {}
+        _origin, platform_auth = self._platform_auth_origin_locked(caller)
+        route_hints = caller_context.get("route_hints")
+        session_info = self.sessions.get(self._route_session_id_for_task_locked(caller))
+        context: dict[str, Any] = {
+            "channel": str(caller_context.get("channel") or getattr(session_info, "channel", "") or "").strip(),
+            "platform_auth": platform_auth,
+            "route_hints": dict(route_hints) if isinstance(route_hints, dict) else {},
+            "session_generation": caller.session_generation,
+            "is_system_task": False,
+            "dispatch_context_mode": context_mode,
+        }
+        root_key = str(
+            caller_context.get("route_conversation_key")
+            or caller_context.get("conversation_key")
+            or getattr(session_info, "conversation_key", "")
+            or ""
+        ).strip()
+        if not root_key:
+            return context
+        if context_mode in ("fresh", "fork"):
+            conversation_key = f"agent:{target}:{root_key}:{child_session_id}"
+        elif context_key:
+            conversation_key = f"agent:{target}:{context_key}:{root_key}"
+        else:
+            conversation_key = f"agent:{target}:{root_key}"
+        context.update({
+            "conversation_key": conversation_key,
+            "parent_conversation_key": root_key,
+            "route_conversation_key": root_key,
+        })
+        return context
+
     def _route_dispatch_locked(self, task: Task, action: dict[str, Any]) -> None:
         target = str(action.get("target_node") or "").strip()
         dispatch_input = action.get("dispatch_input") if isinstance(action.get("dispatch_input"), dict) else {}
@@ -1402,10 +1466,19 @@ class TaskRouterMixin:
 
         # ---- 批量委派（node 或 tool 均可） ----
         if isinstance(dispatch_batch, list) and dispatch_batch:
+            refusal = self._dispatch_batch_refusal_locked(task, dispatch_batch, has_single_target=bool(target))
+            if refusal:
+                log.warning("dispatch batch refused for task %s: %s", task.task_id[:12], refusal)
+                # 只改判这次完成的结果，外层接着按失败路由：有 caller 的交给 caller，否则把错误发给用户
+                self._apply_failure_locked(task, refusal)
+                self._event_task_snapshot("task_completed", task, component="supervisor")
+                return
             batch_id = next(
                 (child.batch_id for child in existing_children.values() if child.batch_id), None,
             ) or str(uuid.uuid4())
             for idx, item in enumerate(dispatch_batch):
+                if not isinstance(item, dict):
+                    continue
                 item_kind = str(item.get("kind") or "node").strip()
                 item_target = str(item.get("target") or "").strip()
                 if not item_target:
@@ -1469,7 +1542,23 @@ class TaskRouterMixin:
                     _batch_input["context_mode"] = _batch_ctx_mode
                     _batch_input["use_context"] = False
                     if _batch_ctx_mode == "fork":
-                        _batch_input["fork_from_session_id"] = task.session_id
+                        # 批次里的子节点再派批次时 session_id 还是祖先的，它自己的对话在它的 child session 里
+                        _batch_input["fork_from_session_id"] = str(
+                            task.input.get("child_session_id") or task.session_id
+                        )
+                    _batch_attachments = batch_item_attachments(item.get("attachments"))
+                    if _batch_attachments:
+                        _batch_input["attachments"] = _batch_attachments
+                    _batch_call_id = str(item.get("call_id") or "").strip()
+                    if _batch_call_id:
+                        _batch_input["_dispatch_call_id"] = _batch_call_id
+                    _batch_input["task_context"] = self._batch_child_task_context_locked(
+                        task,
+                        target=item_target,
+                        context_mode=_batch_ctx_mode,
+                        context_key=_batch_ctx_key or "",
+                        child_session_id=_b_child_sid,
+                    )
                     if delivery_key:
                         _batch_input["_dispatch_delivery_id"] = delivery_key
 
@@ -1737,6 +1826,11 @@ class TaskRouterMixin:
                 entry["node_id"] = str(t.node_id or "")
                 entry["instruction"] = str(t.input.get("instruction") or "")
                 entry["text"] = str(tr.get("text") or "")
+                entry["child_task_id"] = t.task_id
+                for source_key, entry_key in (("child_session_id", "child_session_id"), ("_dispatch_call_id", "call_id")):
+                    value = str(t.input.get(source_key) or "").strip()
+                    if value:
+                        entry[entry_key] = value
             elif t.kind == TaskKind.tool:
                 entry["name"] = str(t.tool_name or tr.get("tool_name") or "")
                 entry["args"] = dict(tr.get("arguments") or t.input.get("arguments") or {})

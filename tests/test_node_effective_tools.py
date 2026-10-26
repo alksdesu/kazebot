@@ -220,3 +220,29 @@ def test_requires_the_admin_token(client, workspace: Path) -> None:
     _write_node(workspace, "qq.intent", "id: qq.intent\ntool_access: none\n")
 
     assert client("GET", f"{_BASE}/qq.intent/effective-tools").status_code == 401
+
+
+def test_a_tool_needing_another_edit_mode_is_marked_as_dropped(client, workspace: Path) -> None:
+    # edit_lines 只给 edit_mode: hashline 的节点；勾了却没开模式的，构建工具表时会被摘掉
+    _write_node(workspace, "plain.coder", """
+id: plain.coder
+type: ai
+tool_access:
+  mode: allowlist
+  allow: [edit_lines, read_file]
+""")
+    _write_node(workspace, "hash.coder", """
+id: hash.coder
+type: ai
+edit_mode: hashline
+tool_access:
+  mode: allowlist
+  allow: [edit_lines, read_file]
+""")
+
+    plain = {row["name"]: row for row in client("GET", f"{_BASE}/plain.coder/effective-tools", headers=_AUTH).json()["tools"]}
+    hashed = {row["name"]: row for row in client("GET", f"{_BASE}/hash.coder/effective-tools", headers=_AUTH).json()["tools"]}
+
+    assert "hashline" in plain["edit_lines"]["gated"]
+    assert plain["read_file"]["gated"] == ""
+    assert hashed["edit_lines"]["gated"] == ""

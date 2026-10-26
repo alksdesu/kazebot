@@ -32,6 +32,8 @@ class ToolEntry:
     rel: str | None = None
     plugin_id: str | None = None
     plugin_version: str | None = None
+    # 节点 edit_mode 不同时构建工具表会把它摘掉，例如 edit_lines 要 hashline
+    requires_edit_mode: str = ""
 
     @property
     def editable(self) -> bool:
@@ -56,6 +58,8 @@ class ToolEntry:
         if self.plugin_id:
             out["plugin_id"] = self.plugin_id
             out["plugin_version"] = self.plugin_version
+        if self.requires_edit_mode:
+            out["requires_edit_mode"] = self.requires_edit_mode
         return out
 
 
@@ -170,4 +174,5 @@ def _from_spec(
         rel=rel,
         plugin_id=plugin_id,
         plugin_version=plugin_version,
+        requires_edit_mode=str(spec.get("requires_edit_mode") or "").strip(),
     )

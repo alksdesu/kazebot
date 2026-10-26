@@ -844,7 +844,9 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
             if spec and isinstance(spec.get("name"), str) and spec["name"] not in external:
                 external[spec["name"]] = isinstance(spec.get("guard"), dict)
 
-        known = {entry.name for entry in _catalog()}
+        catalog = _catalog()
+        known = {entry.name for entry in catalog}
+        required_modes = {entry.name: entry.requires_edit_mode for entry in catalog if entry.requires_edit_mode}
 
         # 报的是「这个节点实际能调什么」，两种模式算法不同但答案同质。
         # 只报 deny 名单的话，最宽的那些节点反而什么注解都看不到。
@@ -865,9 +867,19 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         except Exception:
             gated = set()
 
+        from engine.inference.pseudo_tools import edit_mode_satisfied
+
+        node_edit_mode = data.get("edit_mode")
         rows: list[dict[str, Any]] = []
         for name in names:
             is_external = name in external
+            required_mode = required_modes.get(name, "")
+            if name in gated:
+                gate_note = "渠道未配置 model，构建工具表时会被摘掉"
+            elif not edit_mode_satisfied(node_edit_mode, required_mode):
+                gate_note = f"节点没有开 {required_mode} 编辑模式（edit_mode: {required_mode}），构建工具表时会被摘掉"
+            else:
+                gate_note = ""
             rows.append({
                 "name": name,
                 "registered": name in known,
@@ -875,7 +887,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 # 内置工具走不走 request_guard 得看源码，这里不猜；只有外部脚本
                 # 能从 SPEC.guard 得到确定答案。None = 不下结论。
                 "guarded": external.get(name) if is_external else None,
-                "gated": "渠道未配置 model，构建工具表时会被摘掉" if name in gated else "",
+                "gated": gate_note,
             })
         return {"node_id": node_id, "mode": mode, "dead_names": dead, "tools": rows}
 

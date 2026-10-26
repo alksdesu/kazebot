@@ -10,6 +10,8 @@ from typing import Any
 import config_layout
 
 from ..attachments import build_multimodal_content, payload_attachments
+from ..conversation_store import MessageType
+from .loop_state import TOOL_RESULT_ATTACHMENT_TYPE
 
 
 # ---------------------------------------------------------------------------
@@ -19,6 +21,20 @@ from ..attachments import build_multimodal_content, payload_attachments
 _CHILD_RESUME_TYPES = frozenset(
     {"child_result", "child_ask", "child_failed", "child_cancelled", "child_preempted"}
 )
+
+# 和异步委派回调落盘时用同一个类型，前端按它画成子任务回调卡片
+DISPATCH_RESULT_TYPE = "dispatch_result"
+
+# 批次里子节点的结局对上单个子任务恢复时的类型，读图失败判定之类按 resume_type 认结果的逻辑才认得出
+_BATCH_NODE_RESUME_TYPES = {
+    "": "child_result",
+    "finish": "child_result",
+    "ask": "child_ask",
+    "fail": "child_failed",
+    "cancelled": "child_cancelled",
+    "preempted": "child_preempted",
+}
+_BATCH_INSTRUCTION_PREVIEW = 200
 
 
 def resume_outcome(message: Any) -> tuple[str, str]:
@@ -52,6 +68,88 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
     return messages
 
 
+def _child_message(content: Any, from_node: str) -> dict[str, Any]:
+    meta: dict[str, Any] = {"message_type": DISPATCH_RESULT_TYPE}
+    if from_node:
+        meta["child_node_id"] = from_node
+    return {"role": "user", "content": content, "_meta": meta}
+
+
+def _tool_message(content: str) -> dict[str, Any]:
+    return {"role": "user", "content": content, "_meta": {"message_type": MessageType.TOOL_RESULT}}
+
+
+def _attachments_message(text: str, attachments: list[Any]) -> dict[str, Any]:
+    return {
+        "role": "user",
+        "content": build_multimodal_content(text, attachments),
+        "_meta": {"message_type": TOOL_RESULT_ATTACHMENT_TYPE},
+    }
+
+
+def _preview(text: str, limit: int) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[:limit] + "…"
+
+
+def _batch_node_message(entry: dict[str, Any]) -> dict[str, Any]:
+    """批次里一个子节点的结果：先说清对应哪次调用、哪条指令、结局如何，失败、取消、打断都明说没有结果。"""
+    node = str(entry.get("node_id") or "unknown")
+    status = str(entry.get("status") or "").strip()
+    text = str(entry.get("text") or "")
+    summary = str(entry.get("summary") or "").strip()
+    error = str(entry.get("error") or "").strip()
+    labels: list[str] = []
+    call_id = str(entry.get("call_id") or "").strip()
+    if call_id:
+        labels.append(f"调用 {call_id}")
+    instruction = _preview(str(entry.get("instruction") or ""), _BATCH_INSTRUCTION_PREVIEW)
+    if instruction:
+        labels.append(f"指令：{instruction}")
+    where = f"（{'；'.join(labels)}）" if labels else " "
+
+    if status in ("", "finish"):
+        lines = [f"子节点 {node}{where}已完成。"]
+        if summary:
+            lines.append(f"摘要：{summary}")
+        if text:
+            lines.append(f"结果：\n{text}")
+        if not summary and not text:
+            lines.append("它没有返回结果文本。")
+    elif status == "ask":
+        lines = [
+            f"子节点 {node}{where}没有做完，需要补充信息：",
+            text.strip() or summary or "（它没有说明需要什么）",
+            "它这一程已经结束；补齐信息后要重新委派。",
+        ]
+    elif status == "fail":
+        lines = [f"子节点 {node}{where}执行失败：{error or '未知错误'}", "它没有给出结果，不要臆测它的输出。"]
+    elif status == "cancelled":
+        lines = [f"子节点 {node}{where}已被取消，没有结果。"]
+        if error:
+            lines.append(f"原因：{error}")
+    elif status == "preempted":
+        lines = [f"子节点 {node}{where}被打断，没有做完，也没有结果。"]
+        if summary:
+            lines.append(f"打断前的摘要：{summary}")
+    else:
+        lines = [f"子节点 {node}{where}结束了，但没有拿到结果（状态：{status}）。"]
+        if error:
+            lines.append(f"原因：{error}")
+
+    meta: dict[str, Any] = {"message_type": DISPATCH_RESULT_TYPE, "child_node_id": node}
+    resume_type = _BATCH_NODE_RESUME_TYPES.get(status)
+    if resume_type:
+        meta.update({"resume_type": resume_type, "resume_from_node": node})
+    if summary:
+        meta["summary"] = summary
+    for key in ("child_task_id", "child_session_id"):
+        value = str(entry.get(key) or "").strip()
+        if value:
+            meta[key] = value
+    return {"role": "user", "content": "\n".join(lines), "_meta": meta}
+
+
 def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
     rtype = str(resume_data.get("type") or "").strip()
 
@@ -70,8 +168,8 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
             lines.append(text)
         content_text = "\n".join(lines).strip()
         if isinstance(child_atts, list) and child_atts:
-            return [{"role": "user", "content": build_multimodal_content(content_text, child_atts)}]
-        return [{"role": "user", "content": content_text}]
+            return [_child_message(build_multimodal_content(content_text, child_atts), from_node)]
+        return [_child_message(content_text, from_node)]
 
     # v2: child_ask
     if rtype == "child_ask":
@@ -86,20 +184,20 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
             content = f"下游节点 {from_node} 需要补充信息。"
         else:
             content = "下游节点需要补充信息。"
-        return [{"role": "user", "content": content}]
+        return [_child_message(content, from_node)]
 
     # v2: child_failed
     if rtype == "child_failed":
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
         error = str(resume_data.get("error") or "未知错误")
         prefix = f"下游节点 {from_node} 执行失败：" if from_node else "下游节点执行失败："
-        return [{"role": "user", "content": f"{prefix}{error}"}]
+        return [_child_message(f"{prefix}{error}", from_node)]
 
     # v2: child_cancelled
     if rtype == "child_cancelled":
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
         text = f"下游节点 {from_node} 已被取消。" if from_node else "下游节点已被取消。"
-        return [{"role": "user", "content": text}]
+        return [_child_message(text, from_node)]
 
     # v2: child_preempted
     if rtype == "child_preempted":
@@ -108,7 +206,7 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
         prefix = f"下游节点 {from_node} 被打断，上下文已保存。" if from_node else "下游节点被打断，上下文已保存。"
         if ctx_ref:
             prefix += f"（context_ref: {ctx_ref}）"
-        return [{"role": "user", "content": prefix}]
+        return [_child_message(prefix, from_node)]
 
     # v2: compact_done (compactor 子 task 完成后恢复)
     if rtype == "compact_done":
@@ -123,16 +221,16 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
             entries = resume_data.get("entries")
         if isinstance(entries, list) and entries:
             msgs: list[dict[str, Any]] = []
-            all_atts: list[dict[str, Any]] = [] 
+            all_atts: list[dict[str, Any]] = []
             for e in entries:
                 _name = e.get("name", "unknown")
                 _raw = e.get("raw_inline", "")
-                msgs.append({"role": "user", "content": f'Tool result for "{_name}":\n{_raw}'})
+                msgs.append(_tool_message(f'Tool result for "{_name}":\n{_raw}'))
                 atts = payload_attachments(e)
                 if atts:
                     all_atts.extend(atts)
             if all_atts:
-                msgs.append({"role": "user", "content": build_multimodal_content("以上工具执行产生了以下图片结果：", all_atts)})
+                msgs.append(_attachments_message("以上工具执行产生了以下图片结果：", all_atts))
             return msgs
         return []
 
@@ -143,6 +241,8 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
             msgs: list[dict[str, Any]] = []
             all_atts: list[dict[str, Any]] = []
             for e in entries:
+                if not isinstance(e, dict):
+                    continue
                 _kind = str(e.get("kind") or "node")
                 _status = str(e.get("status") or "")
 
@@ -150,29 +250,19 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
                     _name = e.get("name", "unknown")
                     _raw = e.get("raw_inline", "")
                     if _status == "fail":
-                        msgs.append({"role": "user", "content": f'Tool "{_name}" 执行失败：{e.get("error", "")}'})    
+                        msgs.append(_tool_message(f'Tool "{_name}" 执行失败：{e.get("error", "")}'))
                     else:
-                        msgs.append({"role": "user", "content": f'Tool result for "{_name}":\n{_raw}'})
+                        msgs.append(_tool_message(f'Tool result for "{_name}":\n{_raw}'))
                 else:
-                    _node = str(e.get("node_id") or "unknown")
-                    _instr = str(e.get("instruction") or "")
-                    _text = str(e.get("text") or "")
-                    _summary = str(e.get("summary") or "")
-                    if _status == "fail":
-                        msgs.append({"role": "user", "content": f"子节点 {_node} 执行失败：{e.get('error', '')}"})    
-                    else:
-                        lines = [f"子节点 {_node}（指令：{_instr[:100]}）已完成。"]
-                        if _summary:
-                            lines.append(f"摘要：{_summary}")
-                        if _text:
-                            lines.append(f"结果：\n{_text}")
-                        msgs.append({"role": "user", "content": "\n".join(lines)})
+                    msgs.append(_batch_node_message(e))
 
                 atts = payload_attachments(e)
                 if atts:
                     all_atts.extend(atts)
             if all_atts:
-                msgs.append({"role": "user", "content": build_multimodal_content("批量执行产生了以下图片结果：", all_atts)})
+                msgs.append(_attachments_message(
+                    "以上子任务产生了以下附件；finish 时不写 attachment_paths，它们会随最终回复一起发出：", all_atts,
+                ))
             return msgs
         return []
 

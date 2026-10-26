@@ -1407,7 +1407,7 @@ async def _run_tool_task(
     kctx.origin_node_id = _origin_node_id
     kctx._context_archive_session_id = str(input_data.get("_context_archive_session_id") or session_id)
     _origin_node = load_node(ws_root, _origin_node_id) if _origin_node_id else None
-    if _origin_node is None or not tool_allowed(_origin_node, tool_name):
+    if _origin_node is None or not tool_allowed(_origin_node, tool_name, registry.get_spec(tool_name)):
         _why = (
             f"发起节点 {_origin_node_id!r} 不存在或未指定"
             if _origin_node is None

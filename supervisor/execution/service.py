@@ -137,7 +137,7 @@ class ExecutionService:
             node = load_node(self.root, node_id)
             specs = self._available_tool_specs()
             for step in tool_steps:
-                if node is None or not tool_allowed(node, step.operation) or step.operation not in specs:
+                if node is None or step.operation not in specs or not tool_allowed(node, step.operation, specs[step.operation]):
                     raise PermissionError(f"发起节点无权使用工具：{step.operation}")
 
     def _available_tool_specs(self) -> dict[str, dict]:
@@ -155,7 +155,7 @@ class ExecutionService:
         node = load_node(self.root, node_id)
         if node is None:
             return []
-        return [{"name": spec["name"], "description": spec.get("description", ""), "input_schema": spec.get("input_schema", {}), "effect": "read" if spec["name"] in READ_ONLY_TOOLS else "external"} for spec in self._available_tool_specs().values() if tool_allowed(node, spec["name"])]
+        return [{"name": spec["name"], "description": spec.get("description", ""), "input_schema": spec.get("input_schema", {}), "effect": "read" if spec["name"] in READ_ONLY_TOOLS else "external"} for spec in self._available_tool_specs().values() if tool_allowed(node, spec["name"], spec)]
 
     def create(self, actor: FeatureActor, draft: PlanDraft) -> dict:
         if not actor.scope:

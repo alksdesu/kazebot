@@ -5,8 +5,11 @@ import re
 
 TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
-# Handled by the engine's pseudo-tool layer and injected next to the registry tools on every step.
-PSEUDO_TOOL_NAMES = frozenset({"finish", "ask", "reply", "switch_node", "compact_context", "preempt_task"})
+# Handled by the engine's pseudo-tool layer and injected next to the registry tools on every step;
+# update_todos only for nodes that declare todo: true, but the name stays reserved for every tool.
+PSEUDO_TOOL_NAMES = frozenset({
+    "finish", "ask", "reply", "switch_node", "compact_context", "preempt_task", "update_todos",
+})
 
 # One dispatch_to_<target> tool per delegate target; the names can't be enumerated, so match the prefix.
 DISPATCH_TOOL_PREFIX = "dispatch_to_"

@@ -21,7 +21,7 @@ _NODES = _ROOT / "defaults" / "nodes"
 _SHARED = "_orchestrator.md"
 _QQ = "_platform_qq.md"
 _ENTRIES = ("qq.orchestrator", "qq.orchestrator.example")
-_PSEUDO_TOOLS = frozenset({"finish", "ask", "dispatch_node", "switch_node"})
+_PSEUDO_TOOLS = frozenset({"finish", "ask", "switch_node"})
 # 共享规则教模型去调的工具，两个入口的白名单都得有。只被提到的（read_image）不算。
 _TAUGHT_TOOLS = frozenset({
     "web_search", "read_web", "stocktool_quote", "stocktool_history",

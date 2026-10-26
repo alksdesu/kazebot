@@ -23,6 +23,7 @@ from .pseudo_tools import (
     _compact_context_spec,
     _preempt_task_spec,
     _switch_node_spec,
+    _update_todos_spec,
     _to_openai_tools,
     _filter_tool_specs,
 )
@@ -43,7 +44,17 @@ from .loop_state import (
 from .llm_call import _call_llm_with_retry, _build_failure_action
 from .llm_outcome import is_truncated, with_changes
 from .async_delivery import async_result_tool_status, build_async_result_payload, deliver_async_result
-from .pseudo_handlers import _handle_pseudo_tool
+from .pseudo_handlers import (
+    WAIT_ABORTED,
+    WAIT_CANCELLED,
+    WAIT_DISPATCHED,
+    WAIT_INTERCEPTED,
+    WAIT_PREEMPTED,
+    WaitDispatch,
+    _handle_pseudo_tool,
+    is_wait_dispatch,
+    prepare_wait_dispatches,
+)
 
 from ..context_store import load_context_snapshot
 from ..attachments import build_multimodal_content, payload_attachments, screen_attachments
@@ -62,6 +73,7 @@ from ..protocol import (
 )
 from ..tool_step import TOOL_CANCELLED, TOOL_ERROR, result_to_raw, summarize_result, tool_outcome
 from ..tool_outputs import READ_TOOL_OUTPUT, inline_tool_output, tool_output_limits
+from ..todo_list import unfinished_summary
 from clonoth_runtime import get_int, get_float, get_bool, load_runtime_config, parse_bool
 from toolbox.context import ToolContext
 # build_llm_messages: 反序列化方向的格式转换，在 llm_call.py 中实际调用。
@@ -220,6 +232,9 @@ TOOL_BLOCKED = "blocked"
 TOOL_ASYNC_STARTED = "async_started"
 
 _SUPERSEDED_TERMINAL_MESSAGE = "{tool} 没有执行：同一轮调用了多个 finish/ask，只执行最后一个。"
+_WAIT_TERMINAL_MESSAGE = (
+    "{tool} 没有执行：同一轮发出了等结果的委派（wait=true），它们的结果在下一条消息回来；看完结果再单独调用 {tool}。"
+)
 _FINAL_STEP_REJECT_MESSAGE = "{tool} 没有执行：这是本任务允许的最后一步，只能调用 finish。"
 _FINAL_STEP_HINT = (
     "[SYSTEM] 这是本任务允许的最后一步（已用 {used}/{total} 步）。不要再调用其它工具，直接调用 finish："
@@ -247,6 +262,57 @@ def _flush_tool_errors(ls: _LoopState, pending: list[tuple[Any, str]]) -> None:
     while pending:
         tool_call, text = pending.pop(0)
         _append_tool_error(ls, tool_call, text)
+
+
+def _append_attachment_message(ls: _LoopState, message: dict[str, Any]) -> None:
+    ls.messages.append(message)
+    _shadow_write(ls, message, message_type=TOOL_RESULT_ATTACHMENT_TYPE)
+
+
+def _flush_round_tail(
+    ls: _LoopState,
+    tool_calls: list,
+    late_errors: list[tuple[Any, str]],
+    wait_pending: list[WaitDispatch],
+    outcome: str,
+    attachment_messages: list[dict[str, Any]],
+) -> bool:
+    """补本轮最后的结果：排在后面的不执行调用，加上按 outcome 写的 wait 委派结果，按调用原顺序写，最后才写工具产出图片的消息。
+
+    图片消息是 user 消息，夹在工具结果中间会被配对修复当成新一轮的开始，排在它后面的结果就成了孤儿。
+    三个列表写完就清空，重复调用不会写两遍；返回这次有没有写东西。
+    """
+    tail = list(late_errors) + [(item.call, item.result_text(outcome)) for item in wait_pending]
+    late_errors.clear()
+    wait_pending.clear()
+    deferred = list(attachment_messages)
+    attachment_messages.clear()
+    if tail:
+        position = {id(call): index for index, call in enumerate(tool_calls)}
+        tail.sort(key=lambda item: position.get(id(item[0]), len(tool_calls)))
+        _flush_tool_errors(ls, tail)
+    for message in deferred:
+        _append_attachment_message(ls, message)
+    return bool(tail or deferred)
+
+
+async def _dispatch_wait_batch(ls: _LoopState, items: list[WaitDispatch], step: int) -> TaskAction:
+    """本轮的 wait 委派交给 supervisor 成批派出：本任务挂起，子任务全部结束后带着结果恢复。"""
+    targets = "、".join(item.target for item in items)
+    await ls.rctx.emit_event("handoff_progress", {
+        "message": f"[{ls.node.id}] 等待 {len(items)} 个子节点：{targets}",
+        "node_id": ls.node.id,
+        "task_id": ls.rctx.task_id,
+    })
+    # 恢复时历史从会话里重新读，挂起前占位结果必须已经落盘
+    await flush_conversation_writes(ls.rctx)
+    return TaskAction(
+        action=ACTION_DISPATCH,
+        node_id=ls.node.id,
+        dispatch_batch=[dict(item.item) for item in items],
+        context_ref=_persist_ctx(ls, step + 1),
+        summary=_short(f"等待 {len(items)} 个子节点：{targets}", 240),
+    )
 
 
 def _rejected_terminal_calls(hook_ctx: HookContext, pseudo_calls: list) -> list[tuple[Any, str]]:
@@ -465,11 +531,10 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int, *, final_step: boo
     # 把模型本轮输出的自由文本当作隐式 finish 直接交付，而不再回到循环空转。
     # 目的：让摘要/压缩结果能落地（或快速失败），避免无意义重试。
     # ---------------------------------------------------------------
-    _has_finish = any(_pc.name in TERMINAL_TOOLS for _pc in pseudo_calls)
     if (
         _unauthorized_names
         and not real_tool_calls
-        and not _has_finish
+        and not pseudo_calls
         and not ls.allowed_real_tools
     ):
         _plain = (resp.text or "").strip()
@@ -502,6 +567,22 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int, *, final_step: boo
     # so it must share finish's delayed execution and preempt-intercept path. How:
     # store either terminal call in one slot and execute it after real tools.
     # Purpose: preserve existing finish semantics while introducing action="ask".
+    # wait=true 的委派不当场派出：本轮其它调用跑完后成批交给 supervisor，本任务挂起等结果
+    _wait_calls = [_pc for _pc in pseudo_calls if is_wait_dispatch(_pc)]
+    _wait_plan = await prepare_wait_dispatches(ls, _wait_calls) if _wait_calls else None
+    _wait_items = list(_wait_plan.items) if _wait_plan is not None else []
+    _wait_rejected = list(_wait_plan.rejected) if _wait_plan is not None else []
+    if _wait_calls:
+        _wait_call_ids = {id(_pc) for _pc in _wait_calls}
+        pseudo_calls = [_pc for _pc in pseudo_calls if id(_pc) not in _wait_call_ids]
+    if _wait_items:
+        # 结果下一条消息才回来，同轮的 finish/ask 不能先把任务结束掉
+        _already_rejected = {id(_call) for _call, _ in _rejected_terminals}
+        _rejected_terminals = _rejected_terminals + [
+            (_pc, _WAIT_TERMINAL_MESSAGE.format(tool=_pc.name))
+            for _pc in pseudo_calls
+            if _pc.name in TERMINAL_TOOLS and id(_pc) not in _already_rejected
+        ]
     _rejected_ids = {id(_call) for _call, _ in _rejected_terminals}
     pseudo_calls = [_pc for _pc in pseudo_calls if id(_pc) not in _rejected_ids]
     _terminal_calls = [_pc for _pc in pseudo_calls if _pc.name in TERMINAL_TOOLS]
@@ -512,8 +593,16 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int, *, final_step: boo
     _executed_ids = _real_call_ids | {id(_pc) for _pc in pseudo_calls if _pc.name not in TERMINAL_TOOLS}
     if _terminal_call is not None:
         _executed_ids.add(id(_terminal_call))
-    _early_errors, _late_errors = _split_by_position(resp.tool_calls, _skipped_terminals, _executed_ids)
+    # wait 委派的结果在本轮最后才补：排位时把它们当成会执行的调用，排在后面的不执行调用跟着留到最后，顺序才对得上
+    _anchor_ids = _executed_ids | {id(_item.call) for _item in _wait_items}
+    _early_errors, _late_errors = _split_by_position(
+        resp.tool_calls, _skipped_terminals + _wait_rejected, _anchor_ids,
+    )
     _flush_tool_errors(ls, _early_errors)
+    _wait_pending = list(_wait_items)
+    _wait_outcome = WAIT_ABORTED
+    _attachment_messages: list[dict[str, Any]] = []
+    _tail_written = False
 
     try:
         for _pc in pseudo_calls:
@@ -527,21 +616,54 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int, *, final_step: boo
 
         # 处理真实工具
         if real_tool_calls:
-            action = await _execute_real_tools(ls, real_tool_calls, step)
+            action = await _execute_real_tools(ls, real_tool_calls, step, attachment_messages=_attachment_messages)
             if action is not None:
                 return action
             ls.use_stream = ls.streaming
 
             if ls.preempt_after_step:
-                _flush_tool_errors(ls, _late_errors)
+                _flush_round_tail(
+                    ls, resp.tool_calls, _late_errors, _wait_pending, WAIT_PREEMPTED, _attachment_messages,
+                )
                 ctx_ref = _persist_ctx(ls, step + 1)
                 return TaskAction(
                     action=ACTION_PREEMPTED, node_id=ls.node.id,
                     context_ref=ctx_ref, summary="任务被软打断，上下文已保存。",
                 )
+
+        if _wait_pending:
+            # 一挂起就要等子任务全部结束，派出前最后看一眼取消和抢占
+            _cancelled = await _check_preempt_and_cancel(ls, step)
+            if _cancelled is not None:
+                _flush_round_tail(
+                    ls, resp.tool_calls, _late_errors, _wait_pending, WAIT_CANCELLED, _attachment_messages,
+                )
+                return _cancelled
+            if ls.preempt_after_step:
+                _flush_round_tail(
+                    ls, resp.tool_calls, _late_errors, _wait_pending, WAIT_PREEMPTED, _attachment_messages,
+                )
+                return TaskAction(
+                    action=ACTION_PREEMPTED, node_id=ls.node.id,
+                    context_ref=_persist_ctx(ls, step + 1), summary="任务被软打断，上下文已保存。",
+                )
+            # 用户刚发来新消息：不挂起，下一步先把新消息注入，和拦截 finish 一样
+            _wait_outcome = WAIT_INTERCEPTED if ls.preempt_inject_info is not None else WAIT_DISPATCHED
     finally:
-        # 提前退出或抛错也要给不执行的终止调用补上结果
-        _flush_tool_errors(ls, _late_errors)
+        # 提前退出或抛错也要给不执行的终止调用、没派出的 wait 委派补上结果
+        _tail_written = _flush_round_tail(
+            ls, resp.tool_calls, _late_errors, _wait_pending, _wait_outcome, _attachment_messages,
+        )
+
+    if _tail_written:
+        # 补在最后的结果和图片消息也要在下一次推理前落盘
+        await flush_conversation_writes(ls.rctx)
+
+    if _wait_items:
+        ls.use_stream = ls.streaming
+        if _wait_outcome == WAIT_DISPATCHED:
+            return await _dispatch_wait_batch(ls, _wait_items, step)
+        return None
 
     # finish/ask 最后执行（同轮真实工具已完成）
     if _terminal_call:
@@ -841,6 +963,35 @@ async def _resume_data_for_context(resume_data: dict[str, Any], rctx: Any, runti
             changed = True
         copied[key] = replaced
     return copied if changed else resume_data
+
+
+def _record_resumed_messages(ls: _LoopState, messages: list[dict[str, Any]]) -> None:
+    """恢复时带回来的结果也写进会话历史：之后再挂起恢复、或者下一轮对话，历史里都还看得到。"""
+    for message in messages:
+        meta = message.get("_meta") if isinstance(message.get("_meta"), dict) else {}
+        _shadow_write(ls, message, message_type=str(meta.get("message_type") or MessageType.USER_INPUT))
+
+
+def _adopt_resumed_attachments(ls: _LoopState, resume_data: dict[str, Any]) -> None:
+    """同步委派回来的子任务附件算本任务产出的：finish 没点名附件时，和工具产出的附件一样随最终回复发出。"""
+    if str(resume_data.get("type") or "").strip() != "batch_results":
+        return
+    found = [
+        attachment
+        for entry in resume_data.get("entries") or []
+        if isinstance(entry, dict)
+        for attachment in payload_attachments(entry)
+        if isinstance(attachment, dict)
+    ]
+    if not found:
+        return
+    known = {str(item.get("path") or "") for item in ls.tool_produced_attachments if isinstance(item, dict)}
+    # 自动外发的附件之后不再过策略，进门这一下要把住
+    for attachment in screen_attachments(ls.rctx.workspace_root, found):
+        path = str(attachment.get("path") or "")
+        if path and path not in known:
+            known.add(path)
+            ls.tool_produced_attachments.append(attachment)
 
 
 async def _async_result_message(
@@ -1367,11 +1518,16 @@ async def _run_sequential_call(
 
 
 async def _execute_real_tools(
-    ls: _LoopState, real_tool_calls: list[dict[str, Any]], step: int,
+    ls: _LoopState,
+    real_tool_calls: list[dict[str, Any]],
+    step: int,
+    *,
+    attachment_messages: list[dict[str, Any]] | None = None,
 ) -> TaskAction | None:
     """批量执行真实工具调用，将结果追加到 messages。
 
     连续的只读调用成组并发执行，其余一个个顺序执行；hook、事件、成败记录和结果都按模型给出的顺序。
+    传了 attachment_messages 时，工具产出图片的那条 user 消息放进它里面，由调用方等本轮结果全部补完再写。
     """
     tool_names = [str(call.get("name") or call.get("tool_name") or "").strip() for call in real_tool_calls]
     tool_names = [name for name in tool_names if name]
@@ -1468,8 +1624,10 @@ async def _execute_real_tools(
                 # 运行期也要认得出这不是新的用户输入：重复调用检测按它决定要不要接着往前数
                 "_meta": {"message_type": TOOL_RESULT_ATTACHMENT_TYPE},
             }
-            ls.messages.append(_tool_att_msg)
-            _shadow_write(ls, _tool_att_msg, message_type=TOOL_RESULT_ATTACHMENT_TYPE)
+            if attachment_messages is not None:
+                attachment_messages.append(_tool_att_msg)
+            else:
+                _append_attachment_message(ls, _tool_att_msg)
 
     # 一批工具结果在下一次推理前落盘，进程这时候挂了下一个 worker 恢复也看得到这批结果
     await flush_conversation_writes(ls.rctx)
@@ -1618,10 +1776,14 @@ def _handle_plaintext_response(ls: _LoopState, resp, step: int) -> TaskAction | 
 
 
 def _append_final_step_hint(ls: _LoopState, step: int, max_steps: int) -> None:
+    content = _FINAL_STEP_HINT.format(used=step, total=max_steps)
+    pending = unfinished_summary(list(getattr(ls, "todos", None) or []))
+    if pending:
+        content += f"\n{pending}\n在 finish 里逐项交代这些待办做到哪一步、为什么没做完。"
     # 只在运行期存在：发给模型，不落盘
     ls.messages.append({
         "role": "user",
-        "content": _FINAL_STEP_HINT.format(used=step, total=max_steps),
+        "content": content,
         "_retry_hint": True,
     })
 
@@ -1638,17 +1800,22 @@ def _finish_only_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _step_limit_summary(ls: _LoopState) -> str:
-    """模型最后一步什么也没交代时，按本任务调用过的工具说明做到了哪。"""
+    """模型最后一步什么也没交代时，按本任务调用过的工具和没做完的待办说明做到了哪。"""
     names = [
         str(entry.get("name") or "")
         for entry in getattr(ls.rctx, "tool_call_log", None) or []
         if isinstance(entry, dict) and entry.get("name")
     ]
-    if not names:
+    pending = unfinished_summary(list(getattr(ls, "todos", None) or []))
+    if not names and not pending:
         return ""
-    counts = Counter(names)
-    used = "、".join(f"{name} ×{count}" if count > 1 else name for name, count in counts.items())
-    return f"任务还没有完成。已经执行过的工具：{used}。剩下的部分尚未完成，需要继续处理。"
+    if names:
+        counts = Counter(names)
+        used = "、".join(f"{name} ×{count}" if count > 1 else name for name, count in counts.items())
+        summary = f"任务还没有完成。已经执行过的工具：{used}。剩下的部分尚未完成，需要继续处理。"
+    else:
+        summary = "任务还没有完成，剩下的部分需要继续处理。"
+    return f"{summary}\n{pending}" if pending else summary
 
 
 def _step_limit_finish(ls: _LoopState, text: str, step: int, *, notice: bool, truncated: bool = False) -> TaskAction:
@@ -1924,6 +2091,7 @@ async def run_ai_node(
         _is_block_mode = bool(_prompt_ctx.extra.get("is_block_mode", _is_block_mode))
 
     # ---- 追加恢复消息 ----
+    resumed_messages: list[dict[str, Any]] = []
     if resume_data:
         resumed_messages = _build_resume_messages(await _resume_data_for_context(resume_data, rctx, runtime_cfg))
         for message in resumed_messages:
@@ -1991,16 +2159,19 @@ async def run_ai_node(
             logger.info("image_gen_gating: removed delegate targets %s (no channel configured, node=%s)", sorted(_disabled_nodes), node.id)
     except Exception as _exc:  # noqa: BLE001
         logger.warning("image_gen_gating delegate filter skipped: %s", _exc)
+    _is_system_task = bool((rctx.task_context or {}).get("is_system_task"))
     if delegate_targets:
         # [2026-05-04] Register one dynamic dispatch tool per delegate target.
         # Why: target selection should happen through tool choice, not through an
         # aggregate dispatch schema. How: expand node.delegate_targets into only
         # dispatch:{target_id} specs. Purpose: keep dynamic dispatch intact while
         # removing the old aggregate dispatch tools from the model-visible list.
-        openai_tools.extend(_dispatch_delegate_specs(delegate_targets, downstream_info))
+        # 系统任务不许挂起等子任务（supervisor 也会拒），不给它 wait 参数
+        openai_tools.extend(_dispatch_delegate_specs(
+            delegate_targets, downstream_info, allow_wait=not _is_system_task,
+        ))
 
     # switch_node 仅对非系统节点注入（系统节点如 memory_extractor 不应切换入口）
-    _is_system_task = bool((rctx.task_context or {}).get("is_system_task"))
     if not _is_system_task:
         _sw_targets = [info["id"] for info in (switch_info or [])]
         openai_tools.append(_switch_node_spec(_sw_targets, switch_info, current_node_id=node.id, current_node_name=node.name))
@@ -2014,11 +2185,15 @@ async def run_ai_node(
     openai_tools.append(_reply_spec())
     openai_tools.append(_compact_context_spec())
     openai_tools.append(_preempt_task_spec())
+    _todo_enabled = not _is_system_task and bool(parse_bool((getattr(node, "extra", None) or {}).get("todo"), False))
+    if _todo_enabled:
+        openai_tools.append(_update_todos_spec())
 
     if short_reply(rctx.task_context):
         max_steps = min(max_steps, 2)
         _allowed_real_tools = set()
         delegate_targets = []
+        _todo_enabled = False
         openai_tools = [_finish_spec()]
         messages.append({
             "role": "system",
@@ -2078,7 +2253,12 @@ async def run_ai_node(
         preempt_inject_info=None,
         use_stream=streaming,
         resume_data=resume_data if isinstance(resume_data, dict) else None,
+        todo_enabled=_todo_enabled,
     )
+    if resumed_messages:
+        _record_resumed_messages(ls, resumed_messages)
+    if isinstance(resume_data, dict):
+        _adopt_resumed_attachments(ls, resume_data)
 
     # 步数太少的节点（含简短回应）和系统任务不做收尾，维持原逻辑
     _wrapup_enabled = not _is_system_task and max_steps >= 3

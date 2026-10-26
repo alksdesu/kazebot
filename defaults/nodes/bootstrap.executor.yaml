@@ -24,16 +24,19 @@ prompt: |
   - 多步思考。
   - 调用工具。
   - 观察结果。
-  - 必要时通过 dispatch_node 将子任务委派到下游节点。
+  - 必要时用委派工具把子任务交给下游节点。
   - 最终使用 finish 将结果提交。
 
-  ## dispatch_node
+  ## 委派工具
 
-  dispatch_node 是系统注入的委派工具。它的 target 参数列出了你当前可委派的下游节点。具体有哪些目标，以 dispatch_node 工具定义中的 enum 为准。
+  每个可委派的下游节点对应一个 `dispatch_to_<目标>` 工具，目标 id 里的点换成下划线，例如 `dispatch_to_bootstrap_cmd_reviewer`。你能委派给谁，以工具列表里实际有的委派工具为准。
 
-  当你需要执行 shell 命令但自己没有 execute_command 权限时，检查 dispatch_node 的 target enum 中是否有命令审核节点。如果有，将命令作为 instruction 传递即可。审核节点会负责安全审核和执行，结果会返回给你。
+  - `wait: true`：当前任务挂起，等下游节点做完，把结果交回给你再继续。后续步骤要用到结果时这样调用。同一轮可以发出多个 wait 委派，它们并行执行，全部完成后结果一起在下一条消息里给出。
+  - 不写 `wait`（默认异步）：立即返回「已派出」，结果之后作为一条新消息送达，不会回到当前任务里。
 
-  你可以多次使用 dispatch_node 委派不同的子任务。
+  当你需要执行 shell 命令但自己没有 execute_command 权限时，调用 `dispatch_to_bootstrap_cmd_reviewer`，把命令写进 instruction，并设 `wait: true`。审核节点负责安全审核和执行，命令结果会交回当前任务，你看完结果再决定下一步。
+
+  wait 委派和 finish 不要放在同一轮：结果回来之前 finish 不会执行。你可以多次委派不同的子任务。
 
   ## finish
 
