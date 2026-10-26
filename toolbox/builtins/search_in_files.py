@@ -1,7 +1,8 @@
 """search_in_files — search (and replace) text in workspace files.
 
 ripgrep (when installed) finds the files that match, otherwise a Python walk does; both honour .gitignore like ripgrep's
-defaults, and line/column/context are always rendered by the same Python code. Replace mode writes through the edit journal."""
+defaults, and line/column/context are always rendered by the same Python code. Replace mode claims each file with the
+supervisor and writes through the edit journal."""
 from __future__ import annotations
 
 import asyncio
@@ -32,7 +33,7 @@ from .._common import (
 from ..ignore_rules import DEFAULT_IGNORED_DIRS, MAX_WALK_FILES, GlobError, gitignore_applies, glob_regex, walk_files
 from ..syntax_check import EditChecks, run_edit_checks
 from ..text_files import BOM, normalize_newlines
-from ._edit_flow import transact_text
+from ._edit_flow import settle_transaction, transact_text
 
 logger = logging.getLogger(__name__)
 
@@ -661,7 +662,6 @@ class _MatchingFiles:
 
 
 _TX_REASONS = {
-    "stale": file_state.STALE_MESSAGE,
     "missing": "文件已经不存在",
     "not_text": "文件不是 UTF-8 文本",
 }
@@ -676,6 +676,9 @@ class _ReplaceReport:
     notes: list[str] = field(default_factory=list)
     check_failures: list[str] = field(default_factory=list)
     checks_passed: int = 0
+    unstamped: list[str] = field(default_factory=list)
+    # supervisor 连不上时后面的文件一个也认领不了，停下来，不再一个个等超时
+    halted: str = ""
 
     @property
     def total_replacements(self) -> int:
@@ -687,7 +690,6 @@ class _ReplaceReport:
 
 async def _replace_one(
     ctx: ToolContext,
-    scope: edit_journal.JournalScope,
     path: Path,
     display: str,
     apply: Callable[[str], _ReplaceOutcome],
@@ -698,17 +700,31 @@ async def _replace_one(
         report.skip(display, edit_journal.JOURNAL_REFUSED_MESSAGE)
         return
     try:
+        grant = await file_state.begin_edit(ctx, path, display)
+    except file_state.EditBlocked as blocked:
+        report.skip(display, blocked.message)
+        if blocked.unavailable:
+            report.halted = blocked.message
+        return
+    scope = edit_journal.JournalScope.of(ctx, session=grant.journal_session)
+    try:
         tx = await asyncio.to_thread(
-            transact_text, scope, path, apply, max_size=max_size, tool=_REPLACE_TOOL, display=display,
+            transact_text, scope, path, apply, grant=grant, max_size=max_size, tool=_REPLACE_TOOL, display=display,
         )
     except file_state.ConcurrentEdit as exc:
+        await file_state.abandon_edit(ctx, grant)
         report.skip(display, str(exc))
         return
     except OSError as exc:
+        await file_state.abandon_edit(ctx, grant)
         report.skip(display, f"读写文件失败：{exc}")
         return
+    tx = await settle_transaction(ctx, grant, tx)
     if tx.status == "too_large":
         report.skip(display, f"文件太大（{tx.size} 字节），最多改 {max_size} 字节的文件")
+        return
+    if tx.status == "stale":
+        report.skip(display, tx.gate.stale_message)
         return
     if tx.status in _TX_REASONS:
         report.skip(display, _TX_REASONS[tx.status])
@@ -724,6 +740,9 @@ async def _replace_one(
         entry.update(tx.journal.to_data())
         if tx.journal.message:
             report.notes.append(f"{display}：{tx.journal.message}")
+    if not tx.stamp_recorded:
+        entry["stampRecorded"] = False
+        report.unstamped.append(display)
     checks: EditChecks = await run_edit_checks(ctx, path, outcome.content, tool_name=_REPLACE_TOOL)
     entry.update(checks.to_data())
     if checks.failed:
@@ -748,11 +767,17 @@ def _replace_result_text(report: _ReplaceReport, limited: str) -> str:
         lines.append("改后检查没通过（改动已经写入，没有回滚）：")
         lines.extend(f"  {line}" for line in report.check_failures)
     lines.extend(report.notes)
+    if report.unstamped:
+        lines.append(
+            f"改后的版本没能登记到 supervisor：{'、'.join(report.unstamped[:10])}；再改这些文件之前先 read_file。"
+        )
     if report.unchanged:
         lines.append(f"{len(report.unchanged)} 个文件有命中，但替换后内容不变，没有写盘：{'、'.join(report.unchanged[:10])}")
     if report.skipped:
         lines.append(f"跳过了 {len(report.skipped)} 个有命中的文件：")
         lines.extend(f"  {item['file']}：{item['reason']}" for item in report.skipped)
+    if report.halted:
+        lines.append("连不上 supervisor，后面还有命中的文件没有处理。")
     if limited:
         lines.append(_limit_note(limited))
     return "\n".join(lines)
@@ -771,6 +796,8 @@ def _replace_data(report: _ReplaceReport, text: str, searcher: str, limited: str
         data["skipped"] = report.skipped
     if report.unchanged:
         data["unchanged"] = report.unchanged
+    if report.halted:
+        data["halted"] = report.halted
     if limited:
         data["scanLimited"] = limited
     return data
@@ -797,9 +824,8 @@ async def _do_replace(
         return _error_response("task cancelled", cancelled=True)
     reader = _Reader(candidates, request.max_file_size)
     matching = _MatchingFiles(reader, request.regex)
-    scope = edit_journal.JournalScope.of(ctx)
     report = _ReplaceReport()
-    while len(report.modified) < max_files and not matching.exhausted:
+    while len(report.modified) < max_files and not matching.exhausted and not report.halted:
         batch = await asyncio.to_thread(matching.take, max_files - len(report.modified))
         for path, display in batch:
             if await ctx.check_cancelled():
@@ -808,10 +834,14 @@ async def _do_replace(
                     "task cancelled", cancelled=True, filesModified=len(report.modified), results=report.modified,
                 )
             await _replace_one(
-                ctx, scope, path, display, _replace_apply(request.regex, replacement, display),
+                ctx, path, display, _replace_apply(request.regex, replacement, display),
                 request.max_file_size, report,
             )
-    limited = "" if len(report.modified) >= max_files else reader.limit_reason
+            if report.halted:
+                break
+    if report.halted and not report.modified:
+        return _error_response(report.halted, unavailable=True, skipped=report.skipped)
+    limited = "" if len(report.modified) >= max_files or report.halted else reader.limit_reason
     text = _replace_result_text(report, limited)
     return {
         "ok": True,

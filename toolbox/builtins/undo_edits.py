@@ -1,13 +1,13 @@
-"""undo_edits：按任务撤销 write_file / apply_diff / edit_lines 的改动，或者列出本会话的编辑记录。
+"""undo_edits：按任务撤销编辑工具的改动，或者列出本会话（含派出去的子任务）的编辑记录；不给 task_id 只撤当前任务。
 
-一个文件现在的内容还是那个任务最后写下的版本，才放回改之前的样子（原来没有的文件就删掉）；
-之后又被改过的跳过并说明原因，force 才盖掉。每个文件写回之前都走 write_file 的策略和审批。"""
+一个文件现在的内容还是那个任务最后写下的版本，才放回改之前的样子（原来没有的文件就删掉）；之后又被改过的跳过并说明原因，force 才盖掉。
+每个文件写回之前先认领，再走 write_file 的策略和审批。"""
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,6 +23,7 @@ from ..syntax_check import command_path
 
 _LIST_TASKS = 20
 _LIST_FILES = 30
+_CANDIDATE_FILES = 5
 _TASK_PREFIX_MIN = 8
 _FORCE_HINT = "确认要盖掉之后的改动就加 force=true"
 
@@ -32,6 +33,8 @@ ALREADY = "already"
 SKIPPED = "skipped"
 DENIED = "denied"
 CANCELLED = "cancelled"
+BLOCKED = "blocked"
+HALTED = "halted"
 _DONE = frozenset({RESTORED, DELETED, ALREADY})
 
 
@@ -53,10 +56,15 @@ class _Plan:
 
 @dataclass(frozen=True)
 class _FileOutcome:
+    """stamp：写回之后的新戳，锁外登记到当前任务名下；holder：挡住这次撤销的那个任务。"""
+
     entry: JournalEntry
     action: str
     reason: str = ""
     forced: bool = False
+    stamp: file_state.Stamp | None = None
+    holder: dict[str, Any] | None = None
+    unstamped: bool = False
 
     @property
     def done(self) -> bool:
@@ -65,8 +73,9 @@ class _FileOutcome:
     def line(self) -> str:
         display = self.entry.display
         forced = "（加了 force，盖掉了之后的改动）" if self.forced else ""
+        unstamped = "（恢复后的版本没能登记到 supervisor，再改它之前先 read_file）" if self.unstamped else ""
         if self.action == RESTORED:
-            return f"- 已恢复 {display}{forced}"
+            return f"- 已恢复 {display}{forced}{unstamped}"
         if self.action == DELETED:
             return f"- 已删除 {display}（这个任务新建的文件）{forced}"
         if self.action == ALREADY:
@@ -81,6 +90,10 @@ class _FileOutcome:
             data["reason"] = self.reason
         if self.forced:
             data["forced"] = True
+        if self.holder:
+            data["claimedBy"] = dict(self.holder)
+        if self.unstamped:
+            data["stampRecorded"] = False
         return data
 
 
@@ -145,7 +158,9 @@ def _list_response(tasks: list[TaskJournal], current_task: str, retention_days: 
             "data": {"result": text, "action": "list", "tasks": [], "totalTasks": 0, "retentionDays": retention_days},
         }
     shown = tasks[:_LIST_TASKS]
-    lines = [f"本会话的编辑记录（共 {len(tasks)} 个任务，最近改过文件的在前；记录保留 {retention_days} 天）："]
+    lines = [
+        f"本会话（含派出去的子任务）的编辑记录（共 {len(tasks)} 个任务，最近改过文件的在前；记录保留 {retention_days} 天）：",
+    ]
     rows: list[dict[str, Any]] = []
     for number, task in enumerate(shown, 1):
         node = f" · {task.node_id}" if task.node_id else ""
@@ -170,7 +185,10 @@ def _list_response(tasks: list[TaskJournal], current_task: str, retention_days: 
         })
     if len(tasks) > len(shown):
         lines.append(f"更早的 {len(tasks) - len(shown)} 个任务没有列出。")
-    lines.append("不带 task_id 的 undo 撤最近一个还有改动没撤的任务；带 task_id 撤指定的任务，paths 只撤其中几个文件。")
+    lines.append(
+        "不带 task_id 的 undo 只撤当前任务，而且要本会话里只剩当前任务有改动没撤；"
+        "否则用 task_id 指明撤哪个任务，paths 只撤其中几个文件。"
+    )
     return {
         "ok": True,
         "data": {
@@ -203,20 +221,68 @@ def _find_task(tasks: list[TaskJournal], ref: str) -> tuple[TaskJournal | None, 
     return None, f"本会话没有任务 {ref} 的编辑记录（不是这个会话的任务，或者已经过了保留期）；用 action=list 看有哪些"
 
 
-def _latest_task(tasks: list[TaskJournal]) -> tuple[TaskJournal | None, list[TaskJournal]]:
-    """最近一个还有改动能撤的任务，和比它新、却只剩不可撤销改动的任务（报给模型，不悄悄跳过）。"""
-    passed: list[TaskJournal] = []
-    for task in tasks:
-        if any(entry.pending for entry in task.entries):
-            return task, passed
-        if any(entry.undone is None for entry in task.entries):
-            passed.append(task)
-    return None, passed
-
-
-def _passed_reasons(task: TaskJournal) -> str:
+def _leftover_reasons(task: TaskJournal) -> str:
     reasons = sorted({entry.pre.reason or "没有记下原文件" for entry in task.entries if entry.undone is None})
     return "；".join(reasons)
+
+
+def _nothing_left(tasks: list[TaskJournal]) -> str:
+    if not tasks:
+        return "本会话没有编辑记录，没有可撤销的改动"
+    leftovers = [task for task in tasks if any(entry.undone is None for entry in task.entries)]
+    if leftovers:
+        reasons = "；".join(f"{task.task_id}（{_leftover_reasons(task)}）" for task in leftovers)
+        return f"本会话已经没有能撤销的改动；剩下的都不可撤销：{reasons}"
+    return "本会话的改动都已经撤销过了"
+
+
+def _candidates_error(head: str, pending: list[TaskJournal], current_task: str) -> dict[str, Any]:
+    lines = [f"ERROR: {head}。还有改动没撤的任务（最近改过文件的在前）："]
+    rows: list[dict[str, Any]] = []
+    for task in pending[:_LIST_TASKS]:
+        files = [entry.display for entry in _latest_per_path(task) if entry.pending]
+        shown = "、".join(files[:_CANDIDATE_FILES])
+        if len(files) > _CANDIDATE_FILES:
+            shown += f" 等 {len(files)} 个文件"
+        node = f" · {task.node_id}" if task.node_id else ""
+        lines.append(f"- {_task_label(task, current_task)}{node}：{shown}")
+        rows.append({
+            "taskId": task.task_id,
+            "nodeId": task.node_id,
+            "changedAt": _when(task.changed_at),
+            "current": task.task_id == current_task,
+            "files": files,
+        })
+    if len(pending) > _LIST_TASKS:
+        lines.append(f"更早的 {len(pending) - _LIST_TASKS} 个任务没有列出，用 action=list 查看。")
+    return {
+        "ok": False,
+        "error": head,
+        "data": {"result": "\n".join(lines), "action": "undo", "needTaskId": True, "candidates": rows},
+    }
+
+
+def _default_task(tasks: list[TaskJournal], current_task: str) -> tuple[TaskJournal | None, dict[str, Any] | None]:
+    """不给 task_id 时只撤当前任务；本会话里还有别的任务的改动没撤，就列出候选、要求指明，不替模型挑。
+
+    同一会话里并行的另一个任务也记在这里，按「最近一个」去撤会撤到别人正在做的改动。
+    """
+    pending = [task for task in tasks if any(entry.pending for entry in task.entries)]
+    mine = next((task for task in pending if task.task_id == current_task), None)
+    if mine is not None and len(pending) == 1:
+        return mine, None
+    if not pending:
+        return None, _error(_nothing_left(tasks))
+    if mine is None:
+        own = next((task for task in tasks if task.task_id == current_task), None)
+        reasons = _leftover_reasons(own) if own is not None else ""
+        head = "当前任务没有可撤销的改动"
+        if reasons:
+            head += f"（剩下的不可撤销：{reasons}）"
+        head += f"；本会话里还有 {len(pending)} 个任务的改动没撤，要撤哪一个请用 task_id 指明"
+    else:
+        head = f"本会话里有 {len(pending)} 个任务的改动没撤，不给 task_id 时不替你挑；要撤哪一个请用 task_id 指明，撤当前任务也要写明"
+    return None, _candidates_error(head, pending, current_task)
 
 
 def _targets(
@@ -287,7 +353,7 @@ def _probe(
 
 
 def _restore_locked(path: Path, data: bytes, snapshot: file_state.FileSnapshot, mode: int | None) -> file_state.Stamp:
-    """整份原子写回原文件的字节，换行符和 BOM 就在字节里。调用方持有 file_state.edit_lock(path)。"""
+    """整份原子写回原文件的字节，换行符和 BOM 就在字节里。调用方持有 file_state.edit_lock(path, 工作区)。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     if snapshot.exists or mode is None or os.name == "nt":
         return file_state.commit_locked(path, data, expected=snapshot)
@@ -308,7 +374,7 @@ def _restore_locked(path: Path, data: bytes, snapshot: file_state.FileSnapshot, 
 
 
 def _delete_locked(path: Path, expected: file_state.FileSnapshot) -> None:
-    """确认还是比对过的那一版再删。进程内靠 edit_lock 排队，这里再比一次，挡的是别的进程。"""
+    """确认还是比对过的那一版再删。engine worker 之间靠 edit_lock 排队，这里再比一次，挡的是不走这把锁的写入方。"""
     current = file_state.take_snapshot(path)
     if not current.exists:
         return
@@ -330,11 +396,16 @@ def _remove_created_dirs(path: Path, created_dirs: tuple[str, ...]) -> None:
 
 
 def _undo_locked(
-    journal: EditJournal, scope: JournalScope, task_id: str, entry: JournalEntry, data: bytes | None, force: bool,
+    journal: EditJournal,
+    scope: JournalScope,
+    task: TaskJournal,
+    entry: JournalEntry,
+    data: bytes | None,
+    force: bool,
 ) -> _FileOutcome:
     path = Path(entry.path)
-    with file_state.edit_lock(path):
-        current = journal.entry(scope.session, task_id, entry.id)
+    with file_state.edit_lock(path, journal.workspace_root):
+        current = journal.entry(task.session, task.task_id, entry.id)
         if current is None:
             return _FileOutcome(entry, SKIPPED, "编辑日志里已经没有这条记录")
         if current.undone is not None:
@@ -343,10 +414,10 @@ def _undo_locked(
         plan = _plan(current, snapshot, force=force)
         if plan.action == "skip":
             return _FileOutcome(entry, SKIPPED, f"比对之后文件又变了：{plan.skip_reason()}")
+        stamp: file_state.Stamp | None = None
         if plan.action == "restore":
-            original = data if data is not None else journal.load_pre_image(scope.session, task_id, current)
+            original = data if data is not None else journal.load_pre_image(task.session, task.task_id, current)
             stamp = _restore_locked(path, original, snapshot, current.pre.mode)
-            file_state.remember(scope.session, path, stamp, revealable=current.pre.revealable)
             action = RESTORED
         elif plan.action == "delete":
             _delete_locked(path, snapshot)
@@ -354,8 +425,8 @@ def _undo_locked(
             action = DELETED
         else:
             action = ALREADY
-        journal.mark_undone(scope.session, task_id, entry.id, by_task=scope.task_id, action=action, forced=plan.forced)
-        return _FileOutcome(current, action, forced=plan.forced)
+        journal.mark_undone(task.session, task.task_id, entry.id, by_task=scope.task_id, action=action, forced=plan.forced)
+        return _FileOutcome(current, action, forced=plan.forced, stamp=stamp)
 
 
 def _guard_parameters(ctx: ToolContext, task: TaskJournal, entry: JournalEntry, plan: _Plan) -> dict[str, Any]:
@@ -375,25 +446,11 @@ def _guard_parameters(ctx: ToolContext, task: TaskJournal, entry: JournalEntry, 
     }
 
 
-async def _undo_entry(
-    ctx: ToolContext, journal: EditJournal, scope: JournalScope, task: TaskJournal, entry: JournalEntry, *, force: bool,
+async def _apply_undo(
+    journal: EditJournal, scope: JournalScope, task: TaskJournal, entry: JournalEntry, data: bytes | None, force: bool,
 ) -> _FileOutcome:
-    if not entry.undoable:
-        return _FileOutcome(entry, SKIPPED, f"{entry.pre.reason or '改之前没有记下原文件'}，撤不了")
-    # 编辑工具从不往日志目录里写，记着这种路径只能是 manifest 被改过
-    if inside_journal(ctx.workspace_root, Path(entry.path)):
-        return _FileOutcome(entry, SKIPPED, "日志里记的路径落在编辑日志目录里，不能当撤销的目标")
-    plan, data = await asyncio.to_thread(_probe, journal, scope.session, task.task_id, entry, force)
-    if plan.action == "skip":
-        return _FileOutcome(entry, SKIPPED, plan.skip_reason())
-    if plan.action in {"restore", "delete"}:
-        _op, err = await request_guard(ctx, "write_file", _guard_parameters(ctx, task, entry, plan))
-        if err is not None:
-            if err.get("cancelled"):
-                return _FileOutcome(entry, CANCELLED, "任务已取消")
-            return _FileOutcome(entry, DENIED, f"审批没有通过（{err.get('error') or 'denied'}）")
     try:
-        return await asyncio.to_thread(_undo_locked, journal, scope, task.task_id, entry, data, force)
+        return await asyncio.to_thread(_undo_locked, journal, scope, task, entry, data, force)
     except file_state.ConcurrentEdit:
         return _FileOutcome(entry, SKIPPED, "文件在比对和写入之间被别处改过，没有动它")
     except JournalCorrupt as exc:
@@ -404,8 +461,54 @@ async def _undo_entry(
         return _FileOutcome(entry, SKIPPED, f"读写文件失败（{exc}）")
 
 
+async def _settle(ctx: ToolContext, grant: file_state.EditGrant, outcome: _FileOutcome) -> _FileOutcome:
+    """写回了就把新版本记到当前任务名下，认领留到任务结束；没动文件就还回这次才拿的认领。"""
+    if outcome.action == RESTORED:
+        recorded = await file_state.finish_edit(ctx, grant, outcome.stamp, revealable=outcome.entry.pre.revealable)
+        return outcome if recorded else replace(outcome, unstamped=True)
+    if outcome.action == DELETED:
+        await file_state.finish_edit(ctx, grant, None, revealable=False)
+        return outcome
+    await file_state.abandon_edit(ctx, grant)
+    return outcome
+
+
+async def _undo_entry(
+    ctx: ToolContext, journal: EditJournal, scope: JournalScope, task: TaskJournal, entry: JournalEntry, *, force: bool,
+) -> _FileOutcome:
+    if not entry.undoable:
+        return _FileOutcome(entry, SKIPPED, f"{entry.pre.reason or '改之前没有记下原文件'}，撤不了")
+    # 编辑工具从不往日志目录里写，记着这种路径只能是 manifest 被改过
+    if inside_journal(ctx.workspace_root, Path(entry.path)):
+        return _FileOutcome(entry, SKIPPED, "日志里记的路径落在编辑日志目录里，不能当撤销的目标")
+    plan, data = await asyncio.to_thread(_probe, journal, task.session, task.task_id, entry, force)
+    if plan.action == "skip":
+        return _FileOutcome(entry, SKIPPED, plan.skip_reason())
+    if plan.action not in {"restore", "delete"}:
+        return await _apply_undo(journal, scope, task, entry, data, force)
+    try:
+        grant = await file_state.begin_edit(ctx, Path(entry.path), entry.display)
+    except file_state.EditBlocked as blocked:
+        holder = blocked.data.get("claimedBy")
+        return _FileOutcome(
+            entry, HALTED if blocked.unavailable else BLOCKED, blocked.message,
+            holder=holder if isinstance(holder, dict) else None,
+        )
+    _op, err = await request_guard(ctx, "write_file", _guard_parameters(ctx, task, entry, plan))
+    if err is not None:
+        await file_state.abandon_edit(ctx, grant)
+        if err.get("cancelled"):
+            return _FileOutcome(entry, CANCELLED, "任务已取消")
+        return _FileOutcome(entry, DENIED, f"审批没有通过（{err.get('error') or 'denied'}）")
+    outcome = await _apply_undo(journal, scope, task, entry, data, force)
+    return await _settle(ctx, grant, outcome)
+
+
 def _counts(outcomes: list[_FileOutcome]) -> str:
-    labels = ((RESTORED, "恢复"), (DELETED, "删除"), (ALREADY, "本来就是原样"), (SKIPPED, "跳过"), (DENIED, "审批没过"))
+    labels = (
+        (RESTORED, "恢复"), (DELETED, "删除"), (ALREADY, "本来就是原样"), (SKIPPED, "跳过"),
+        (BLOCKED, "别的任务正在改"), (DENIED, "审批没过"),
+    )
     parts = [
         f"{label} {count} 个"
         for action, label in labels
@@ -419,21 +522,18 @@ def _undo_response(
     outcomes: list[_FileOutcome],
     missing: list[str],
     settled: list[str],
-    passed: list[TaskJournal],
     *,
     cancelled: bool,
+    halted: str,
     current_task: str,
 ) -> dict[str, Any]:
-    finished = [outcome for outcome in outcomes if outcome.action != CANCELLED]
+    finished = [outcome for outcome in outcomes if outcome.action not in {CANCELLED, HALTED}]
     lines = [f"撤销{_task_label(task, current_task)}的改动：{_counts(finished)}。"]
     lines.extend(outcome.line() for outcome in finished)
     lines.extend(f"- 这个任务没有改过 {raw}" for raw in missing)
     lines.extend(f"- {raw} 在这个任务里的改动已经撤销过了" for raw in settled)
-    if passed:
-        lines.append(
-            f"比它新的 {len(passed)} 个任务里剩下的改动都不可撤销，已略过："
-            + "；".join(f"{item.task_id}（{_passed_reasons(item)}）" for item in passed)
-        )
+    if halted:
+        lines.append(f"{halted}，后面的文件没有处理。")
     if cancelled:
         lines.append("任务被取消，后面的文件没有处理。")
     done = [outcome for outcome in finished if outcome.done]
@@ -451,25 +551,19 @@ def _undo_response(
         data["notInTask"] = list(missing)
     if settled:
         data["alreadyUndone"] = list(settled)
-    if passed:
-        data["passedTasks"] = [item.task_id for item in passed]
+    if halted:
+        data["halted"] = halted
     if cancelled:
         data["cancelled"] = True
         return {"ok": False, "error": "task cancelled", "cancelled": True, "data": data}
     if not done:
         first = next((outcome for outcome in finished if outcome.reason), None)
-        error = f"没有撤销任何文件：{first.entry.display} {first.reason}" if first else "没有撤销任何文件"
+        if first is not None:
+            error = f"没有撤销任何文件：{first.entry.display} {first.reason}"
+        else:
+            error = f"没有撤销任何文件：{halted}" if halted else "没有撤销任何文件"
         return {"ok": False, "error": error, "data": data}
     return {"ok": True, "data": data}
-
-
-def _nothing_left(tasks: list[TaskJournal], passed: list[TaskJournal]) -> str:
-    if not tasks:
-        return "本会话没有编辑记录，没有可撤销的改动"
-    if passed:
-        reasons = "；".join(f"{item.task_id}（{_passed_reasons(item)}）" for item in passed)
-        return f"本会话已经没有能撤销的改动；剩下的都不可撤销：{reasons}"
-    return "本会话的改动都已经撤销过了"
 
 
 async def undo_edits(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -479,9 +573,14 @@ async def undo_edits(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     scope = JournalScope.of(ctx)
     if not scope.session.strip():
         return _error("没有会话号，找不到编辑记录")
+    try:
+        root = await file_state.journal_session(ctx)
+    except file_state.EditBlocked as blocked:
+        return _error(blocked.message, **blocked.data)
     journal = EditJournal(ctx.workspace_root)
     try:
-        tasks = await asyncio.to_thread(journal.tasks, scope.session)
+        # accumulate 子节点自己的会话下也可能有保留期内的记录，一并列出
+        tasks = await asyncio.to_thread(journal.tasks_in, (root, scope.session))
     except OSError as exc:
         return _error(f"编辑日志读不出来（{exc}）")
 
@@ -495,15 +594,14 @@ async def undo_edits(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         return _error(str(exc))
     force = bool(parse_bool(args.get("force"), False))
     ref = str(args.get("task_id") or "").strip()
-    passed: list[TaskJournal] = []
     if ref:
         task, problem = _find_task(tasks, ref)
         if task is None:
             return _error(problem)
     else:
-        task, passed = _latest_task(tasks)
+        task, refusal = _default_task(tasks, scope.task_id)
         if task is None:
-            return _error(_nothing_left(tasks, passed))
+            return refusal or _error(_nothing_left(tasks))
 
     entries, missing, settled = await asyncio.to_thread(_targets, task, requested, ctx.workspace_root)
     if not entries:
@@ -514,10 +612,16 @@ async def undo_edits(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
     outcomes: list[_FileOutcome] = []
     cancelled = False
+    halted = ""
     for entry in entries:
         outcome = await _undo_entry(ctx, journal, scope, task, entry, force=force)
         outcomes.append(outcome)
         if outcome.action == CANCELLED:
             cancelled = True
             break
-    return _undo_response(task, outcomes, missing, settled, passed, cancelled=cancelled, current_task=scope.task_id)
+        if outcome.action == HALTED:
+            halted = outcome.reason
+            break
+    return _undo_response(
+        task, outcomes, missing, settled, cancelled=cancelled, halted=halted, current_task=scope.task_id,
+    )

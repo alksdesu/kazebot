@@ -46,14 +46,14 @@ def seed(path: Path, data: bytes) -> Path:
 
 
 def begin(target: JournalScope, path: Path, *, tool: str = "apply_diff", revealable: bool = True) -> PendingEdit:
-    with file_state.edit_lock(path):
+    with file_state.edit_lock(path, target.workspace_root):
         snapshot = file_state.take_snapshot(path)
         return record_pre_image(target, path, snapshot, tool=tool, display=path.name, revealable=revealable)
 
 
 def change(target: JournalScope, path: Path, data: bytes, *, tool: str = "apply_diff") -> JournalNote:
     """照写文件工具的顺序：锁里记原文件、写盘、记改后的版本。"""
-    with file_state.edit_lock(path):
+    with file_state.edit_lock(path, target.workspace_root):
         snapshot = file_state.take_snapshot(path)
         pending = record_pre_image(target, path, snapshot, tool=tool, display=path.name, revealable=True)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -165,7 +165,8 @@ class TestRecording:
 
         assert pending.note.undoable is False
         assert "任务号" in pending.note.message
-        assert not (tmp_path / "data" / "edit_journal").exists()
+        # 只有改文件的锁，没有建会话目录
+        assert [child.name for child in edit_journal.journal_root(tmp_path).iterdir()] == [file_state.LOCK_SUBDIR]
 
     def test_hostile_session_and_task_ids_stay_inside_the_journal(self, tmp_path: Path) -> None:
         journal = EditJournal(tmp_path)
@@ -250,7 +251,8 @@ class TestFailures:
 
     def test_an_unwritable_journal_does_not_block_the_edit_and_says_so(self, tmp_path: Path) -> None:
         path = seed(tmp_path / "f.txt", b"one\n")
-        blocker = seed(tmp_path / "data" / "edit_journal", b"not a directory")
+        # 挡在会话目录上：改文件的锁也在编辑日志目录里，整个目录都用不了时拿不到锁，改动不会写
+        blocker = seed(EditJournal(tmp_path).session_dir("sess-j"), b"not a directory")
 
         note = change(scope(tmp_path), path, b"two\n")
 

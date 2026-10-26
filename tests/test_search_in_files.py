@@ -21,8 +21,12 @@ import yaml
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+_TESTS = Path(__file__).resolve().parent
+if str(_TESTS) not in sys.path:
+    sys.path.insert(0, str(_TESTS))
 
 import config_layout  # noqa: E402
+from _file_edits_fake import FakeFileEdits, FakeSupervisor  # noqa: E402
 from toolbox import edit_journal, file_state, ignore_rules  # noqa: E402
 from toolbox.builtins.apply_diff import apply_diff  # noqa: E402
 from toolbox.builtins.read_file import read_file  # noqa: E402
@@ -37,8 +41,8 @@ _match_pattern = sif._match_pattern
 _BOM = b"\xef\xbb\xbf"
 
 
-class _Ctx(ToolContext):
-    """离线 ToolContext：按 op 名给出预设的 safety_level，没写的一律 auto；记下每次送审。"""
+class _Ctx(FakeFileEdits, ToolContext):
+    """离线 ToolContext：按 op 名给出预设的 safety_level，没写的一律 auto；记下每次送审。认领和读戳交给 FakeSupervisor。"""
 
     def __init__(
         self,
@@ -726,7 +730,7 @@ class TestReplaceMode:
         _read(ctx, "a.txt")
 
         _search(ctx, query="old", mode="replace", replace="new")
-        entry = file_state.recall(file_state.session_key(ctx), path.resolve())
+        entry = ctx.supervisor.stamp(file_state.session_key(ctx), "task-1", path.resolve()).entry
         follow_up = asyncio.run(apply_diff({"path": "a.txt", "diffs": [{"search": "beta", "replace": "gamma"}]}, ctx))
 
         assert entry is not None and entry.stamp.sha256 == _sha(b"alpha new\nbeta\n")
@@ -758,6 +762,51 @@ class TestReplaceMode:
         assert {"file": "data/edit_journal/planted.txt", "reason": edit_journal.JOURNAL_REFUSED_MESSAGE} in (
             result["data"]["skipped"]
         )
+
+    def test_a_file_another_running_task_is_editing_is_skipped_and_the_task_named(self, tmp_path: Path) -> None:
+        held = _write(tmp_path / "a.txt", "old\nmore\n")
+        free = _write(tmp_path / "b.txt", "old\n")
+        other = _Ctx(tmp_path, task="task-other")
+        other.supervisor.start("task-other", node="bootstrap.coder")
+        edited = asyncio.run(apply_diff({"path": "a.txt", "diffs": [{"search": "more", "replace": "MORE"}]}, other))
+        assert edited["ok"] is True, edited
+
+        result = _search(_Ctx(tmp_path), query="old", mode="replace", replace="new")
+
+        assert held.read_bytes() == b"old\nMORE\n"
+        assert free.read_bytes() == b"new\n"
+        [skip] = result["data"]["skipped"]
+        assert skip["file"] == "a.txt"
+        assert "task-other" in skip["reason"] and "bootstrap.coder" in skip["reason"]
+        assert result["data"]["filesModified"] == 1
+        assert FakeSupervisor.of(tmp_path).holders(held.resolve()) == ["task-other"]
+
+    def test_the_file_is_free_again_once_that_task_ends(self, tmp_path: Path) -> None:
+        held = _write(tmp_path / "a.txt", "old\nmore\n")
+        other = _Ctx(tmp_path, task="task-other")
+        other.supervisor.start("task-other", node="bootstrap.coder")
+        asyncio.run(apply_diff({"path": "a.txt", "diffs": [{"search": "more", "replace": "MORE"}]}, other))
+        other.supervisor.end("task-other")
+
+        result = _search(_Ctx(tmp_path), query="old", mode="replace", replace="new")
+
+        assert result["data"]["filesModified"] == 1, result
+        assert held.read_bytes() == b"new\nMORE\n"
+
+    def test_an_unreachable_supervisor_stops_the_replace_before_writing(self, tmp_path: Path) -> None:
+        for name in ("a.txt", "b.txt"):
+            _write(tmp_path / name, "old\n")
+        ctx = _Ctx(tmp_path)
+        ctx.supervisor.down = True
+
+        result = _search(ctx, query="old", mode="replace", replace="new")
+
+        assert result["ok"] is False and result["data"]["unavailable"] is True
+        assert "连不上 supervisor" in result["error"]
+        assert (tmp_path / "a.txt").read_bytes() == b"old\n"
+        assert (tmp_path / "b.txt").read_bytes() == b"old\n"
+        # 第一个文件认领不了就停下，不再一个个去试
+        assert len(result["data"]["skipped"]) == 1
 
     def test_a_syntax_problem_after_the_change_is_reported_not_rolled_back(self, tmp_path: Path) -> None:
         path = _write(tmp_path / "a.py", "value = (old)\n")

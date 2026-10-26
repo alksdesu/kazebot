@@ -21,11 +21,13 @@ import yaml
 
 _ROOT = Path(__file__).resolve().parents[1]
 _DRAWTOOLS = _ROOT / "tools" / "drawtools"
-for _p in (str(_ROOT), str(_DRAWTOOLS)):
+_TESTS = Path(__file__).resolve().parent
+for _p in (str(_ROOT), str(_DRAWTOOLS), str(_TESTS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
 import config_layout  # noqa: E402
+from _file_edits_fake import FakeFileEdits  # noqa: E402
 import supervisor.admin_api as admin_api  # noqa: E402
 import toolbox.mcp_runtime as mcp_runtime  # noqa: E402
 from adapters._shared.live_config import BOOL, LiveConfig, LiveKey, int_in  # noqa: E402
@@ -136,8 +138,8 @@ def supervisor_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return call
 
 
-class _Ctx(ToolContext):
-    """离线 ToolContext：不连 supervisor，按预设 safety_level 直接放行。"""
+class _Ctx(FakeFileEdits, ToolContext):
+    """离线 ToolContext：按预设 safety_level 直接放行，认领和读戳交给 FakeSupervisor。"""
 
     def __init__(self, workspace_root: Path, *, safety: str = "auto") -> None:
         super().__init__(

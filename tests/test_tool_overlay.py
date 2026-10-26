@@ -19,8 +19,12 @@ import yaml
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+_TESTS = Path(__file__).resolve().parent
+if str(_TESTS) not in sys.path:
+    sys.path.insert(0, str(_TESTS))
 
 import config_layout  # noqa: E402
+from _file_edits_fake import FakeFileEdits  # noqa: E402
 import supervisor.admin_api as admin_api  # noqa: E402
 import toolbox.mcp_runtime as mcp_runtime  # noqa: E402
 from supervisor.admin_api import create_admin_router  # noqa: E402
@@ -105,8 +109,8 @@ def admin(ws: Path, code_root: Path, bundled: Path, monkeypatch: pytest.MonkeyPa
     return call
 
 
-class _Ctx(ToolContext):
-    """离线 ToolContext：不连 supervisor，策略一律放行。"""
+class _Ctx(FakeFileEdits, ToolContext):
+    """离线 ToolContext：认领和读戳交给 FakeSupervisor，策略一律放行。"""
 
     def __init__(self, workspace_root: Path, registry: Any = None) -> None:
         super().__init__(

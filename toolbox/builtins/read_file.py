@@ -358,7 +358,7 @@ async def _read_single_file(
         return _Section(entry, f"── {path_str} ── [binary: {len(snapshot.data)} bytes]")
 
     # Even a partial read stamps the whole file: edits are checked against what was on disk.
-    file_state.remember(file_state.session_key(ctx), p, snapshot.stamp, revealable=True)
+    await file_state.record_stamp(ctx, p, snapshot.stamp, revealable=True)
     return _text_section(path_str, text, start_line, end_line, budget, hashline=hashline)
 
 

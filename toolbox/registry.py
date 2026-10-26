@@ -633,7 +633,10 @@ class ToolRegistry:
                 "Create a text file, or replace an existing one with complete new content, under workspace root. "
                 "Prefer apply_diff for changing part of an existing file. "
                 "An existing file keeps its line endings (LF/CRLF), UTF-8 BOM and permissions, and is replaced atomically. "
-                "If you read the file in this conversation and it has changed since, the write is refused: read it again first. "
+                "If this task read the file and it has changed since, or another task of this conversation changed it after "
+                "this task started, the write is refused: read it again first. "
+                "While another task that has not ended is editing the same file (any conversation), the write is refused and "
+                "the result names that task and its node. "
                 "Overwriting a file you have not read is allowed and noted in the result. "
                 "After writing, .py/.json/.yaml/.yml/.toml files are syntax-checked and the commands configured under edit_checks run; "
                 "problems are reported at the end of the result and the write is not rolled back. Policy+approval guarded.",
@@ -693,7 +696,9 @@ class ToolRegistry:
                 "with line numbers and 2 lines of context, and a failure shows the closest matching snippet, when this "
                 "conversation has read the current version of the file or the read policy lets it be read without approval; "
                 "otherwise only line numbers are given and no read approval is asked for, so use read_file to see the text. "
-                "Refused if the file changed after you last read it. Line endings, UTF-8 BOM and permissions are preserved and the "
+                "Refused if the file changed after you last read it (or another task of this conversation changed it after "
+                "this task started), and while another task that has not ended is editing it; that error names the task and "
+                "its node. Line endings, UTF-8 BOM and permissions are preserved and the "
                 "write is atomic. After writing, the same syntax check and edit_checks commands as write_file run. "
                 "Policy+approval guarded.",
                 {
@@ -743,7 +748,9 @@ class ToolRegistry:
                 "Edits may not overlap: replaced or deleted ranges may not share lines, two inserts may not go to the same place, "
                 "and an insert may not fall inside a replaced or deleted range. They are applied bottom-up and written atomically. "
                 "content is the new lines without anchors; a trailing newline is optional. "
-                "Refused if the file changed after you last read it. Line endings, UTF-8 BOM and permissions are preserved; "
+                "Refused if the file changed after you last read it (or another task of this conversation changed it after "
+                "this task started), and while another task that has not ended is editing it; that error names the task and "
+                "its node. Line endings, UTF-8 BOM and permissions are preserved; "
                 "after writing, the same syntax check and edit_checks commands as write_file run, and the change can be undone "
                 "with undo_edits. The result echoes the edited regions with fresh anchors when this conversation has read the "
                 "current version of the file or the read policy lets it be read without approval; otherwise it gives line "
@@ -787,11 +794,15 @@ class ToolRegistry:
                 "Undo file changes made by write_file, apply_diff, edit_lines and search_in_files' replace mode, one task at a time. "
                 "Before a task first changes a file its original content is saved; undoing puts it back "
                 "(a file the task created is deleted, together with directories created for it that are now empty). "
-                "action=list shows this conversation's recent tasks, the files each changed and whether they were undone. "
-                "action=undo (default) undoes one task: the one named by task_id (a unique prefix of at least 8 characters works), "
-                "otherwise the most recent task that still has changes not undone, the current task included. "
+                "Changes made by sub-agents this conversation dispatched are recorded here too, so they can be undone from here. "
+                "action=list shows this conversation's recent tasks (sub-agents included), the files each changed and whether "
+                "they were undone. "
+                "action=undo (default) undoes one task: the one named by task_id (a unique prefix of at least 8 characters works). "
+                "Without task_id it undoes the current task only, and only when no other task of this conversation has changes "
+                "left to undo; otherwise nothing is undone and the result lists the candidate tasks, so pass task_id. "
                 "paths limits it to some of that task's files. A file changed again after that task, by anything, is skipped "
-                "with the reason unless force=true. Each file goes through the same approval as write_file. "
+                "with the reason unless force=true; a file another task that has not ended is editing is skipped and that task "
+                "is named. Each file goes through the same approval as write_file. "
                 "A change can be undone only once. "
                 f"Files over {edit_journal.MAX_FILE_BYTES // _MIB}MB and changes past a task's "
                 f"{edit_journal.MAX_TASK_BYTES // _MIB}MB journal limit are not saved and cannot be undone; "
@@ -803,8 +814,8 @@ class ToolRegistry:
                         "action": {"type": "string", "enum": ["undo", "list"], "description": "undo (default) or list."},
                         "task_id": {
                             "type": "string",
-                            "description": "Task whose changes to undo, as action=list shows it. Default: the most recent task "
-                            "that still has changes not undone.",
+                            "description": "Task whose changes to undo, as action=list shows it. Default: the current task, "
+                            "refused while another task of this conversation also has changes left to undo.",
                         },
                         "paths": {
                             "type": "array",
@@ -873,7 +884,8 @@ class ToolRegistry:
                 "Replace mode (mode='replace') needs replace, and an empty string deletes the matches. With isRegex=true, "
                 "$1, ${name}, $& and $0 refer to groups and $$ is a literal $; Python's \\1 and \\g<name> work too. With "
                 "isRegex=false, replace is inserted verbatim. It changes up to maxFiles files (default 50) after one "
-                "write_file approval, skips a file that changed after you read it, keeps line endings, UTF-8 BOM and "
+                "write_file approval, skips a file that changed after you read it or that another task that has not ended "
+                "is editing (the skip names that task), keeps line endings, UTF-8 BOM and "
                 "permissions, writes atomically, runs the same syntax check and edit_checks commands as write_file, and the "
                 "changes can be undone with undo_edits. Files under data/edit_journal/ are never changed. In nodes with "
                 "search_replace: false, replace mode is refused before any approval.",

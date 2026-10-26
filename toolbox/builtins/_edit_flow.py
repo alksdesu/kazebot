@@ -1,10 +1,10 @@
-"""apply_diff / edit_lines 共用的改文本流程：送审，在文件锁里读、比戳、改、记编辑日志、原子写入，回显改动处。"""
+"""apply_diff / edit_lines 共用的改文本流程：认领、送审，在文件锁里读、比戳、改、记编辑日志、原子写入，回显改动处。"""
 from __future__ import annotations
 
 import asyncio
 import os
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -91,27 +91,51 @@ def journal_target_refusal(ctx: Any, path: str) -> dict[str, Any] | None:
     return None
 
 
+@dataclass(frozen=True)
+class EditTarget:
+    """认领和送审都过了的目标：解析到底的路径，和 supervisor 给的准许（比对用的戳、编辑日志的会话）。"""
+
+    resolved: Path
+    grant: file_state.EditGrant
+
+
+async def claim_or_refuse(ctx: Any, resolved: Path, path: str) -> file_state.EditGrant:
+    """向 supervisor 认领要改的文件；别的任务在改、supervisor 连不上，都换成工具结果抛 EditRefused。"""
+    try:
+        return await file_state.begin_edit(ctx, resolved, path)
+    except file_state.EditBlocked as blocked:
+        raise EditRefused(edit_error_response(blocked.message, path, **blocked.data)) from None
+
+
 async def guard_and_resolve(
     ctx: Any, path: str, *, tool_name: str, preview: str, what: str, **cancel_fields: Any,
-) -> Path:
-    """过 write_file 的策略和审批，再把路径解析到允许的根下；要改的文件必须已经存在。"""
+) -> EditTarget:
+    """把路径解析到允许的根下，先认领再过 write_file 的策略和审批；要改的文件必须已经存在。
+
+    先认领：别的任务正在改的文件不必为它弹一张注定白批的审批卡。没走到写盘就把这次才拿的认领还回去。
+    """
     refusal = journal_target_refusal(ctx, path)
     if refusal is not None:
         raise EditRefused(refusal)
-    _op, err = await request_guard(
-        ctx,
-        "write_file",
-        {"path": path, "content_preview": preview, "content_len": 0, "tool_name": tool_name},
-    )
-    if err is not None:
-        raise EditRefused(guard_error_response(err, path, what=what, **cancel_fields))
     try:
         resolved = resolve_under_allowed_roots(ctx.workspace_root, path)
     except ValueError as exc:
         raise EditRefused(edit_error_response(str(exc), path)) from None
-    if not resolved.exists() or not resolved.is_file():
-        raise EditRefused(edit_error_response(f"文件不存在：{path}", path))
-    return resolved
+    grant = await claim_or_refuse(ctx, resolved, path)
+    try:
+        _op, err = await request_guard(
+            ctx,
+            "write_file",
+            {"path": path, "content_preview": preview, "content_len": 0, "tool_name": tool_name},
+        )
+        if err is not None:
+            raise EditRefused(guard_error_response(err, path, what=what, **cancel_fields))
+        if not resolved.exists() or not resolved.is_file():
+            raise EditRefused(edit_error_response(f"文件不存在：{path}", path))
+    except Exception:
+        await file_state.abandon_edit(ctx, grant)
+        raise
+    return EditTarget(resolved, grant)
 
 
 class EditOutcome(Protocol):
@@ -127,7 +151,10 @@ class EditOutcome(Protocol):
 
 @dataclass(frozen=True)
 class TextTransaction:
-    """status：written / unchanged / failed / stale / missing / not_text / too_large。"""
+    """status：written / unchanged / failed / stale / missing / not_text / too_large。
+
+    stamp_recorded：写成的新版本有没有记到本任务名下；没记上的话下次改这个文件会被要求重读。
+    """
 
     status: str
     gate: file_state.Gate
@@ -136,6 +163,7 @@ class TextTransaction:
     byte_count: int = 0
     size: int = 0
     journal: edit_journal.JournalNote | None = None
+    stamp_recorded: bool = True
 
 
 def transact_text(
@@ -143,12 +171,13 @@ def transact_text(
     resolved: Path,
     apply: Callable[[str], EditOutcome],
     *,
+    grant: file_state.EditGrant,
     max_size: int,
     tool: str,
     display: str,
 ) -> TextTransaction:
-    """在文件锁里读出 LF 文本交给 apply；全部改成了、内容也真变了，才记编辑日志并原子写入。"""
-    with file_state.edit_lock(resolved):
+    """在文件锁里读出 LF 文本交给 apply；全部改成了、内容也真变了，才记编辑日志并原子写入。新戳由调用方锁外登记。"""
+    with file_state.edit_lock(resolved, scope.workspace_root):
         try:
             size = os.stat(resolved).st_size
         except FileNotFoundError:
@@ -158,7 +187,7 @@ def transact_text(
         snapshot = file_state.take_snapshot(resolved)
         if not snapshot.exists:
             return TextTransaction("missing", file_state.Gate(None))
-        gate = file_state.inspect(scope.session, resolved, snapshot)
+        gate = grant.gate(snapshot)
         if gate.stale:
             return TextTransaction("stale", gate)
         if len(snapshot.data) > max_size:
@@ -181,14 +210,27 @@ def transact_text(
         except BaseException:
             pending.discard()
             raise
-        file_state.remember(scope.session, resolved, stamp, revealable=gate.revealable)
         note = pending.record_post_image(stamp)
         return TextTransaction("written", gate, outcome, stamp, len(data), journal=note)
 
 
+def stale_fields(gate: file_state.Gate) -> dict[str, Any]:
+    """读后被改过时并进结果 data 的字段：被同一会话里别的任务改过的另外标出来。"""
+    return {"stale": True, "changedByOtherTask": True} if gate.foreign else {"stale": True}
+
+
+async def settle_transaction(ctx: Any, grant: file_state.EditGrant, tx: TextTransaction) -> TextTransaction:
+    """写成了就把新版本记到本任务名下；没写成就还回这次才拿的认领。"""
+    if tx.status != "written":
+        await file_state.abandon_edit(ctx, grant)
+        return tx
+    recorded = await file_state.finish_edit(ctx, grant, tx.stamp, revealable=tx.gate.revealable)
+    return tx if recorded else replace(tx, stamp_recorded=False)
+
+
 async def run_text_edit(
     ctx: Any,
-    resolved: Path,
+    target: EditTarget,
     path: str,
     apply: Callable[[str], EditOutcome],
     *,
@@ -196,19 +238,23 @@ async def run_text_edit(
     max_size: int,
 ) -> TextTransaction:
     """跑 transact_text；文件没了、读后被改过、太大、不是文本、写入时撞上并发改动，都换成工具结果抛 EditRefused。"""
-    scope = edit_journal.JournalScope.of(ctx)
+    scope = edit_journal.JournalScope.of(ctx, session=target.grant.journal_session)
     try:
         tx = await asyncio.to_thread(
-            transact_text, scope, resolved, apply, max_size=max_size, tool=tool_name, display=path,
+            transact_text, scope, target.resolved, apply,
+            grant=target.grant, max_size=max_size, tool=tool_name, display=path,
         )
     except file_state.ConcurrentEdit as exc:
+        await file_state.abandon_edit(ctx, target.grant)
         raise EditRefused(edit_error_response(str(exc), path, conflict=True)) from None
     except OSError as exc:
+        await file_state.abandon_edit(ctx, target.grant)
         raise EditRefused(edit_error_response(f"读写文件失败：{exc}", path)) from None
+    tx = await settle_transaction(ctx, target.grant, tx)
     if tx.status == "missing":
         raise EditRefused(edit_error_response(f"文件不存在：{path}", path))
     if tx.status == "stale":
-        raise EditRefused(edit_error_response(file_state.STALE_MESSAGE, path, stale=True))
+        raise EditRefused(edit_error_response(tx.gate.stale_message, path, **stale_fields(tx.gate)))
     if tx.status == "too_large":
         raise EditRefused(edit_error_response(
             f"文件太大（{tx.size} 字节），{tool_name} 最多改 {max_size} 字节的文件。",

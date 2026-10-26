@@ -201,6 +201,7 @@ def _success_response(
     checks: EditChecks | None,
     style: LineStyle,
     journal: edit_journal.JournalNote | None = None,
+    stamp_recorded: bool = True,
 ) -> dict[str, Any]:
     summary_lines, entries = _diff_summaries(outcome)
     if written:
@@ -210,6 +211,8 @@ def _success_response(
     lines = [head, *summary_lines]
     if journal is not None:
         lines.extend(journal.lines())
+    if not stamp_recorded:
+        lines.append(file_state.STAMP_NOT_RECORDED_NOTE)
     if written:
         lines.extend(
             echo_lines(outcome.content, _echo_spans(outcome), style) if reveal
@@ -231,6 +234,8 @@ def _success_response(
     }
     if written:
         data["bytes"] = byte_count
+    if not stamp_recorded:
+        data["stampRecorded"] = False
     if journal is not None:
         data.update(journal.to_data())
     if checks is not None:
@@ -273,7 +278,7 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     #  Policy + approval guard (same flow as write_file), then read + match + write as one locked transaction
     # ------------------------------------------------------------------
     try:
-        resolved = await guard_and_resolve(
+        target = await guard_and_resolve(
             ctx,
             path_str,
             tool_name="apply_diff",
@@ -284,12 +289,13 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             failedCount=0,
         )
         tx = await run_text_edit(
-            ctx, resolved, path_str, lambda text: apply_diffs(text, requests),
+            ctx, target, path_str, lambda text: apply_diffs(text, requests),
             tool_name="apply_diff", max_size=_MAX_FILE_SIZE,
         )
     except EditRefused as refused:
         return refused.response
 
+    resolved = target.resolved
     style = line_style(ctx)
     outcome: DiffOutcome = tx.outcome
     if tx.status == "failed":
@@ -307,4 +313,5 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     return _success_response(
         path_str, outcome, len(diffs),
         written=True, byte_count=tx.byte_count, reveal=reveal, checks=checks, style=style, journal=tx.journal,
+        stamp_recorded=tx.stamp_recorded,
     )

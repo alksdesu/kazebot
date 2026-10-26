@@ -21,6 +21,7 @@ if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
 from _engine_loop_fixture import NodeRun, ScriptedRegistry, call, echo, stored, turn  # noqa: E402
+from _file_edits_fake import FakeFileEdits  # noqa: E402
 from engine.builtin import knowledge_inject, output_rules  # noqa: E402
 from engine.builtin.knowledge_inject import (  # noqa: E402
     build_knowledge_context,
@@ -483,8 +484,8 @@ class TestTheSkillCatalog:
         assert output_rule_problem({"trigger": "x", "scope": "tool_args", "max_fires": 2}) == ""
 
 
-class _Ctx(ToolContext):
-    """离线 ToolContext：写 skill 走 write_file 的送审，这里一律放行。"""
+class _Ctx(FakeFileEdits, ToolContext):
+    """离线 ToolContext：写 skill 走 write_file 的认领和送审，认领交给 FakeSupervisor，送审一律放行。"""
 
     def __init__(self, workspace_root: Path) -> None:
         super().__init__(

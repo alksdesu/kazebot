@@ -48,6 +48,14 @@ def _supervisor(*, cancelled: bool = False) -> httpx.MockTransport:
             return httpx.Response(200, json={"cancelled": cancelled})
         if request.url.path == "/v1/admin/restart":
             return httpx.Response(200, json={"scheduled": True, "target": "engine"})
+        if request.url.path == "/v1/file_edits/begin":
+            return httpx.Response(200, json={
+                "ok": True, "new_claim": True, "journal_session": "", "stamp": None, "stamp_layer": "", "foreign": False,
+            })
+        if request.url.path == "/v1/file_edits/stamp":
+            return httpx.Response(200, json={"ok": True, "layer": "task"})
+        if request.url.path == "/v1/file_edits/release":
+            return httpx.Response(200, json={"ok": True, "released": True})
         return httpx.Response(200, json={})
 
     return httpx.MockTransport(handle)

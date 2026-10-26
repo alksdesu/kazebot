@@ -13,8 +13,12 @@ import yaml
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+_TESTS = Path(__file__).resolve().parent
+if str(_TESTS) not in sys.path:
+    sys.path.insert(0, str(_TESTS))
 
 import config_layout  # noqa: E402
+from _file_edits_fake import FakeFileEdits  # noqa: E402
 from engine.builtin.agent_manage import create_agent  # noqa: E402
 from engine.builtin.knowledge_inject import create_or_update_skill, save_memory  # noqa: E402
 from engine.memory_namespace import conversation_namespace  # noqa: E402
@@ -49,8 +53,8 @@ _CASES = [
 ]
 
 
-class _Ctx(ToolContext):
-    """离线 ToolContext：送审一律放行。"""
+class _Ctx(FakeFileEdits, ToolContext):
+    """离线 ToolContext：送审一律放行，认领和读戳交给 FakeSupervisor。"""
 
     def __init__(self, workspace_root: Path, **context: Any) -> None:
         super().__init__(

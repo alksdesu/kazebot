@@ -23,6 +23,7 @@ from file_lock import exclusive_lock
 from ._helpers import _now
 from .branch_finalize_store import BranchClaim
 from .compact_breaker import MAX_TASK_CONSECUTIVE_FAILURES
+from .file_claims import release_if_ended_locked
 from .reply_intent import result_from_task as reply_intent_result_from_task
 from engine.compact import COMPACT_SUMMARY_PREFIX
 from engine.dispatch_batch import MAX_DISPATCH_BATCH_ITEMS, batch_item_attachments
@@ -1157,6 +1158,7 @@ class TaskRouterMixin:
 
     def _route_completed_task_locked(self, task: Task) -> None:
         """Route one completion once, persisting success or retryable failure."""
+        release_if_ended_locked(self, task)
         action = str((task.result or {}).get("action") or "").strip()
         if (
             action in _TASK_END_ACTIONS
@@ -1861,6 +1863,7 @@ class TaskRouterMixin:
 
     def _settle_cancelled_task_locked(self, task: Task, *, finalize_branch: bool = True) -> None:
         """supervisor 直接终结的取消：收束分支、拆临时会话，并像正常完成一样结算调用方。"""
+        release_if_ended_locked(self, task)
         if finalize_branch:
             self._schedule_cancelled_task_teardown_locked(task)
         if not (task.caller_task_id or "").strip():

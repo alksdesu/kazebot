@@ -1,7 +1,7 @@
 """编辑日志：改文件的工具在同一个任务里第一次改某个文件之前记下原文件，undo_edits 按任务把它放回去。
 
 存在 data/edit_journal/<会话目录>/<任务目录>/：manifest.json 记每个文件改前、改后的哈希，原文件内容 gzip 后另存。
-会话键和 file_state 是同一个；写 manifest 都在这个会话的跨进程锁里做。"""
+会话是 supervisor 给的发起链根会话，派出去的子任务也记在那里；写 manifest 都在这个会话的跨进程锁里做。"""
 from __future__ import annotations
 
 import contextlib
@@ -16,7 +16,7 @@ import threading
 import time
 import zlib
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -42,7 +42,8 @@ SKIP_ERROR = "error"
 
 _MANIFEST = "manifest.json"
 _MANIFEST_VERSION = 1
-_LOCK_DIR = ".locks"
+# 改文件的锁（edit-*.lock）也在这个目录里，清理时不动它
+_LOCK_DIR = file_state.LOCK_SUBDIR
 # 按会话目录名散列到固定数量的锁文件：锁文件个数不随会话增长，清理时手里只有目录名也算得出是哪一把
 _LOCK_STRIPE_CHARS = 2
 # Windows 上整条路径超过 260 个字符就写不进去，原文件按 sha256 的前 32 位起名
@@ -51,7 +52,7 @@ _BLOB_NAME_HEX = 32
 _BLOB_SUFFIX = ".gz"
 # 写原文件时持着这个文件的改动锁，压缩取最快的一档
 _COMPRESS_LEVEL = 1
-_PRIVATE_DIR_MODE = 0o700
+_PRIVATE_DIR_MODE = file_state.PRIVATE_DIR_MODE
 _SECONDS_PER_DAY = 86400
 _MIB = 1024 * 1024
 _UNRECORDED_LIMIT = 4096
@@ -61,7 +62,7 @@ JOURNAL_REFUSED_MESSAGE = "data/edit_journal/ 只由编辑工具自己记录，�
 
 
 def journal_root(workspace_root: Path | str) -> Path:
-    return Path(workspace_root) / "data" / "edit_journal"
+    return Path(workspace_root) / file_state.JOURNAL_DIR
 
 
 def inside_journal(workspace_root: Path | str, path: Path | str) -> bool:
@@ -83,7 +84,7 @@ class JournalCorrupt(ValueError):
 
 @dataclass(frozen=True)
 class JournalScope:
-    """谁在记：工作区、会话键（和 file_state 同一个）、任务号。"""
+    """谁在记：工作区、日志记在哪个会话、任务号。"""
 
     workspace_root: Path
     session: str
@@ -91,13 +92,13 @@ class JournalScope:
     node_id: str = ""
 
     @classmethod
-    def of(cls, ctx: Any) -> "JournalScope":
+    def of(cls, ctx: Any, *, session: str = "") -> "JournalScope":
+        """session 是 supervisor 给的发起链根会话；不给（没有任务号、离线）就用 file_state 的会话键。"""
         # 推理循环和独立工具任务都会填 task_id；没有时退到 run_id，它在推理循环里也先取任务号
         task_id = str(getattr(ctx, "task_id", "") or getattr(ctx, "run_id", "") or "").strip()
         return cls(
             workspace_root=Path(getattr(ctx, "workspace_root")),
-            # 原样用 file_state 的会话键：读后改前的戳也按它存，差一个字符就对不上
-            session=file_state.session_key(ctx),
+            session=str(session or "").strip() or file_state.session_key(ctx),
             task_id=task_id,
             node_id=str(getattr(ctx, "node_id", "") or ""),
         )
@@ -292,7 +293,8 @@ def _task_from(manifest: dict[str, Any], session: str) -> TaskJournal | None:
         return None
     entries = tuple(entry for raw in manifest["entries"] if (entry := _entry_from(raw)) is not None)
     return TaskJournal(
-        session=str(manifest.get("session") or session),
+        # 撤销时按它找回任务目录，得用列出这个目录的会话，不能信 manifest 里记的
+        session=session,
         task_id=task_id,
         node_id=str(manifest.get("node_id") or ""),
         created_at=_as_float(manifest.get("created_at")),
@@ -597,6 +599,21 @@ class EditJournal:
         journals.sort(key=lambda journal: journal.changed_at, reverse=True)
         return journals
 
+    def tasks_in(self, sessions: Iterable[str]) -> list[TaskJournal]:
+        """几个会话的编辑记录合在一起，最近改过文件的在前；同一个任务号只取先列出的会话里的那份。"""
+        seen: set[str] = set()
+        merged: list[TaskJournal] = []
+        for session in dict.fromkeys(str(item or "").strip() for item in sessions):
+            if not session:
+                continue
+            for journal in self.tasks(session):
+                if journal.task_id in seen:
+                    continue
+                seen.add(journal.task_id)
+                merged.append(journal)
+        merged.sort(key=lambda journal: journal.changed_at, reverse=True)
+        return merged
+
     def entry(self, session: str, task_id: str, entry_id: int) -> JournalEntry | None:
         manifest = self._load_manifest(self.task_dir(session, task_id))
         raw = _entry_by_id(manifest, entry_id) if manifest is not None else None
@@ -747,7 +764,7 @@ def record_pre_image(
 ) -> PendingEdit:
     """改文件之前记下原文件，同一个任务里同一个文件只记第一次。写文件的工具都走这里。
 
-    target 是 ToolContext 或 JournalScope。调用方须持有 file_state.edit_lock(resolved)，snapshot 传写盘比对用的那一份，
+    target 是 ToolContext 或 JournalScope。调用方须持有 file_state.edit_lock(resolved, 工作区)，snapshot 传写盘比对用的那一份，
     记下的才是这次改之前的版本。日志写不进去不拦这次改动，只在返回的结论里注明不可撤销。
     """
     scope = target if isinstance(target, JournalScope) else JournalScope.of(target)

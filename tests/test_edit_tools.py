@@ -18,8 +18,12 @@ import yaml
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+_TESTS = Path(__file__).resolve().parent
+if str(_TESTS) not in sys.path:
+    sys.path.insert(0, str(_TESTS))
 
 import config_layout  # noqa: E402
+from _file_edits_fake import FakeFileEdits  # noqa: E402
 from engine.tool_step import summarize_result  # noqa: E402
 from toolbox import file_state  # noqa: E402
 from toolbox.builtins.apply_diff import apply_diff  # noqa: E402
@@ -35,8 +39,11 @@ _BOM = b"\xef\xbb\xbf"
 _PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (1).to_bytes(4, "big") * 2 + b"\x08\x02\x00\x00\x00"
 
 
-class _Ctx(ToolContext):
-    """离线 ToolContext：记下每次送审和只问结论的 op；按 op 名给出预设的 safety_level，没写的一律 auto。"""
+class _Ctx(FakeFileEdits, ToolContext):
+    """离线 ToolContext：记下每次送审和只问结论的 op；按 op 名给出预设的 safety_level，没写的一律 auto。
+
+    没有任务号，读戳直接记在会话层；认领和读戳交给本工作区的 FakeSupervisor。
+    """
 
     def __init__(self, workspace_root: Path, *, session: str = "sess-edit", **decisions: str) -> None:
         super().__init__(

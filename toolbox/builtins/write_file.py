@@ -12,6 +12,7 @@ from ..context import ToolContext
 from .._common import request_guard, resolve_under_allowed_roots
 from ..syntax_check import run_edit_checks
 from ..text_files import NEW_FILE, TextLayout, encode_text
+from ._edit_flow import stale_fields
 
 
 def _error_response(message: Any, *, cancelled: bool = False, **data_fields: Any) -> dict[str, Any]:
@@ -37,11 +38,13 @@ class _Written:
     journal: edit_journal.JournalNote | None = None
 
 
-def _commit(scope: edit_journal.JournalScope, resolved: Path, content: str, display: str) -> _Written:
-    """Write under the per-file edit lock; ``stamp`` stays None when the stamp check refuses."""
-    with file_state.edit_lock(resolved):
+def _commit(
+    scope: edit_journal.JournalScope, resolved: Path, content: str, display: str, grant: file_state.EditGrant,
+) -> _Written:
+    """Write under the cross-process edit lock; ``stamp`` stays None when the stamp check refuses."""
+    with file_state.edit_lock(resolved, scope.workspace_root):
         snapshot = file_state.take_snapshot(resolved)
-        gate = file_state.inspect(scope.session, resolved, snapshot)
+        gate = grant.gate(snapshot)
         if gate.stale:
             return _Written(gate)
         layout = TextLayout.of_bytes(snapshot.data) if snapshot.exists else NEW_FILE
@@ -56,8 +59,6 @@ def _commit(scope: edit_journal.JournalScope, resolved: Path, content: str, disp
         except BaseException:
             pending.discard()
             raise
-        # The model wrote every byte of this version, so echoing it later reveals nothing new.
-        file_state.remember(scope.session, resolved, stamp, revealable=True)
         note = pending.record_post_image(stamp)
         return _Written(gate, not snapshot.exists, len(data), stamp, note)
 
@@ -71,11 +72,17 @@ async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     content = _content_text(args["content"])
 
     try:
-        target = resolve_under_allowed_roots(ctx.workspace_root, path)
-    except ValueError:
-        target = None
-    if target is not None and edit_journal.inside_journal(ctx.workspace_root, target):
+        resolved = resolve_under_allowed_roots(ctx.workspace_root, path)
+    except ValueError as exc:
+        return _error_response(str(exc), path=path)
+    if edit_journal.inside_journal(ctx.workspace_root, resolved):
         return _error_response(edit_journal.JOURNAL_REFUSED_MESSAGE, path=path)
+
+    # Claim before asking: a file another task is editing should not raise an approval that is doomed anyway.
+    try:
+        grant = await file_state.begin_edit(ctx, resolved, path)
+    except file_state.EditBlocked as blocked:
+        return _error_response(blocked.message, path=path, **blocked.data)
 
     _op, err = await request_guard(
         ctx,
@@ -87,24 +94,27 @@ async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         },
     )
     if err is not None:
+        await file_state.abandon_edit(ctx, grant)
         error_text = str(err.get("error", "denied")) if isinstance(err, dict) else str(err)
         return _error_response(error_text, cancelled=bool(isinstance(err, dict) and err.get("cancelled")))
-
-    try:
-        resolved = resolve_under_allowed_roots(ctx.workspace_root, path)
-    except ValueError as exc:
-        return _error_response(str(exc), path=path)
     if resolved.is_dir():
+        await file_state.abandon_edit(ctx, grant)
         return _error_response(f"{path} 是目录，不能当文件写", path=path)
 
+    scope = edit_journal.JournalScope.of(ctx, session=grant.journal_session)
     try:
-        written = await asyncio.to_thread(_commit, edit_journal.JournalScope.of(ctx), resolved, content, path)
+        written = await asyncio.to_thread(_commit, scope, resolved, content, path, grant)
     except file_state.ConcurrentEdit as exc:
+        await file_state.abandon_edit(ctx, grant)
         return _error_response(str(exc), path=path, conflict=True)
     except OSError as exc:
+        await file_state.abandon_edit(ctx, grant)
         return _error_response(f"写入失败：{exc}", path=path)
     if written.stamp is None:
-        return _error_response(file_state.STALE_MESSAGE, path=path, stale=True)
+        await file_state.abandon_edit(ctx, grant)
+        return _error_response(written.gate.stale_message, path=path, **stale_fields(written.gate))
+    # The model wrote every byte of this version, so echoing it later reveals nothing new.
+    stamp_recorded = await file_state.finish_edit(ctx, grant, written.stamp, revealable=True)
 
     gate = written.gate
     unread_overwrite = not written.created and gate.unread
@@ -115,6 +125,8 @@ async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         lines.append("注意：这个文件在你上次读取之后被删掉了，这次按新文件写入。")
     if written.journal is not None:
         lines.extend(written.journal.lines())
+    if not stamp_recorded:
+        lines.append(file_state.STAMP_NOT_RECORDED_NOTE)
 
     checks = await run_edit_checks(ctx, resolved, content, tool_name="write_file")
     lines.extend(checks.lines())
@@ -128,4 +140,6 @@ async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     }
     if unread_overwrite:
         data["unreadOverwrite"] = True
+    if not stamp_recorded:
+        data["stampRecorded"] = False
     return {"ok": True, "data": data}

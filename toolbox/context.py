@@ -15,6 +15,8 @@ _CANCEL_PROBE_TIMEOUT_SEC = 2.0
 _APPROVAL_RENEW_INTERVAL_SEC = 30.0
 _APPROVAL_RENEW_LEASE_SEC = 300.0
 _RENEW_TIMEOUT_SEC = 5.0
+# 认领和读戳的接口就在本机：几秒还不回就按 supervisor 不可用处理，改文件那边宁可拒绝也不一直挂着
+_FILE_EDITS_TIMEOUT_SEC = 10.0
 
 
 @dataclass
@@ -76,6 +78,44 @@ class ToolContext:
         r = await self.http.post(f"{self.supervisor_url}/v1/ops/evaluate", json=self._op_body(op, parameters))
         r.raise_for_status()
         return r.json()
+
+    @staticmethod
+    def _file_edits_reply(response: Any, action: str) -> dict[str, Any]:
+        response.raise_for_status()
+        reply = response.json()
+        if not isinstance(reply, dict):
+            raise ValueError(f"/v1/file_edits/{action} 回的不是 JSON 对象")
+        return reply
+
+    async def _post_file_edits(self, action: str, body: dict[str, Any]) -> dict[str, Any]:
+        r = await self.http.post(
+            f"{self.supervisor_url}/v1/file_edits/{action}", json=body, timeout=_FILE_EDITS_TIMEOUT_SEC,
+        )
+        return self._file_edits_reply(r, action)
+
+    async def begin_file_edit(self, path: str, *, display: str, session: str) -> dict[str, Any]:
+        """认领要改的文件，取回本任务比对用的戳和编辑日志该记的会话。path 是规范化之后的绝对路径。"""
+        return await self._post_file_edits("begin", {
+            "task_id": self.task_id or "", "session": session, "path": path, "display": display,
+        })
+
+    async def record_file_stamp(
+        self, path: str, *, session: str, stamp: dict[str, Any], revealable: bool,
+    ) -> dict[str, Any]:
+        return await self._post_file_edits("stamp", {
+            "task_id": self.task_id or "", "session": session, "path": path,
+            "stamp": stamp, "revealable": revealable,
+        })
+
+    async def release_file_claim(self, path: str) -> dict[str, Any]:
+        return await self._post_file_edits("release", {"task_id": self.task_id or "", "path": path})
+
+    async def file_edit_scope(self) -> dict[str, Any]:
+        r = await self.http.get(
+            f"{self.supervisor_url}/v1/file_edits/scope",
+            params={"task_id": self.task_id or ""}, timeout=_FILE_EDITS_TIMEOUT_SEC,
+        )
+        return self._file_edits_reply(r, "scope")
 
     async def check_cancelled(self) -> bool:
         try:

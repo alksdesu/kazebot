@@ -1,6 +1,7 @@
 """undo_edits：按任务把 write_file / apply_diff 改过的文件放回改之前的样子，新建的文件删掉。
 
-文件之后又被改过的跳过并说明原因，force 才盖掉；每个文件写回之前都走 write_file 的审批；一处改动只能撤一次。
+文件之后又被改过的跳过并说明原因，force 才盖掉；每个文件写回之前先认领，再走 write_file 的审批；一处改动只能撤一次。
+不给 task_id 只撤当前任务；会话里别的任务也有改动没撤时要求指明。派出去的子任务的改动记在发起链的根会话下。
 """
 from __future__ import annotations
 
@@ -16,9 +17,12 @@ from typing import Any
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+_TESTS = Path(__file__).resolve().parent
+for _p in (str(_ROOT), str(_TESTS)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
+from _file_edits_fake import FakeFileEdits, FakeSupervisor  # noqa: E402
 from toolbox import edit_journal  # noqa: E402
 from toolbox.builtins.apply_diff import apply_diff  # noqa: E402
 from toolbox.builtins.read_file import read_file  # noqa: E402
@@ -29,8 +33,11 @@ from toolbox.context import ToolContext  # noqa: E402
 _BOM = b"\xef\xbb\xbf"
 
 
-class _Ctx(ToolContext):
-    """离线 ToolContext：同一个会话里换 task 就是另一个任务；按 op 名给出预设的 safety_level，没写的一律 auto。"""
+class _Ctx(FakeFileEdits, ToolContext):
+    """离线 ToolContext：同一个会话里换 task 就是另一个任务；按 op 名给出预设的 safety_level，没写的一律 auto。
+
+    认领和读戳交给这个工作区的 FakeSupervisor；没摆过的任务第一次露面就算正在跑，别的任务要撤它的改动得先 end 它。
+    """
 
     def __init__(self, workspace_root: Path, *, task: str = "task-1", session: str = "sess-undo", **decisions: str) -> None:
         super().__init__(
@@ -249,19 +256,33 @@ class TestUndo:
         assert latest["ok"] is False and "已经撤销过" in latest["error"]
         assert path.read_bytes() == b"one\n"
 
-    def test_the_most_recent_task_with_changes_left_goes_first(self, tmp_path: Path) -> None:
+    def test_without_task_id_earlier_tasks_are_listed_not_picked(self, tmp_path: Path) -> None:
         a = seed(tmp_path / "a.txt", b"a1\n")
         b = seed(tmp_path / "b.txt", b"b1\n")
-        later = _Ctx(tmp_path, task="task-3")
         diff(_Ctx(tmp_path, task="task-1"), "a.txt", "a1", "a2")
         diff(_Ctx(tmp_path, task="task-2"), "b.txt", "b1", "b2")
+        later = _Ctx(tmp_path, task="task-3")
+        later.supervisor.end("task-1")
+        later.supervisor.end("task-2")
 
-        first = undo(later)
+        refused = undo(later)
 
-        assert first["data"]["taskId"] == "task-2"
+        assert refused["ok"] is False and refused["data"]["needTaskId"] is True
+        assert "当前任务没有可撤销的改动" in refused["error"] and "task_id" in refused["error"]
+        candidates = refused["data"]["candidates"]
+        assert [row["taskId"] for row in candidates] == ["task-2", "task-1"]
+        assert [row["files"] for row in candidates] == [["b.txt"], ["a.txt"]]
+        assert all(row["current"] is False for row in candidates)
+        assert "task-2" in refused["data"]["result"] and "task-1" in refused["data"]["result"]
+        assert a.read_bytes() == b"a2\n" and b.read_bytes() == b"b2\n"
+        assert later.undo_requests() == []
+
+        first = undo(later, task_id="task-2")
+
+        assert first["ok"] is True and first["data"]["taskId"] == "task-2"
         assert b.read_bytes() == b"b1\n" and a.read_bytes() == b"a2\n"
         assert "当前任务" not in first["data"]["result"]
-        second = undo(later)
+        second = undo(later, task_id="task-1")
         assert second["data"]["taskId"] == "task-1"
         assert a.read_bytes() == b"a1\n"
 
@@ -271,6 +292,8 @@ class TestUndo:
         diff(_Ctx(tmp_path, task="3f2a9c11-aaaa"), "a.txt", "a", "A")
         diff(_Ctx(tmp_path, task="3f2a9c11-bbbb"), "b.txt", "b", "B")
         ctx = _Ctx(tmp_path, task="77777777-cccc")
+        ctx.supervisor.end("3f2a9c11-aaaa")
+        ctx.supervisor.end("3f2a9c11-bbbb")
 
         ambiguous = undo(ctx, task_id="3f2a9c11")
         too_short = undo(ctx, task_id="3f2a")
@@ -284,12 +307,16 @@ class TestUndo:
 
     def test_the_task_of_another_session_is_not_found(self, tmp_path: Path) -> None:
         seed(tmp_path / "a.txt", b"a\n")
-        diff(_Ctx(tmp_path, session="sess-other"), "a.txt", "a", "A")
+        other = _Ctx(tmp_path, session="sess-other", task="task-other")
+        diff(other, "a.txt", "a", "A")
+        other.supervisor.end("task-other")
 
-        result = undo(_Ctx(tmp_path), task_id="task-1")
+        result = undo(_Ctx(tmp_path), task_id="task-other")
+        listed = undo(_Ctx(tmp_path), action="list")
 
-        assert result["ok"] is False
+        assert result["ok"] is False and "没有任务 task-other" in result["error"]
         assert (tmp_path / "a.txt").read_bytes() == b"A\n"
+        assert listed["data"]["tasks"] == []
 
     def test_a_cancelled_task_stops_the_undo(self, tmp_path: Path) -> None:
         path = seed(tmp_path / "f.txt", b"old\n")
@@ -378,21 +405,29 @@ class TestUnrecorded:
         assert result["ok"] is False and "不可撤销" in result["error"]
         assert path.read_bytes() == b"abcd456789\n"
 
-    def test_a_newer_task_with_nothing_undoable_is_named_when_passed_over(
+    def test_a_current_task_with_nothing_undoable_does_not_fall_through_to_an_older_one(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(edit_journal, "MAX_FILE_BYTES", 6)
         small = seed(tmp_path / "small.txt", b"abc\n")
         seed(tmp_path / "big.txt", b"0123456789\n")
-        diff(_Ctx(tmp_path, task="task-1"), "small.txt", "abc", "xyz")
+        older = _Ctx(tmp_path, task="task-1")
+        diff(older, "small.txt", "abc", "xyz")
+        older.supervisor.end("task-1")
         newer = _Ctx(tmp_path, task="task-2")
         diff(newer, "big.txt", "0123", "abcd")
 
         result = undo(newer)
 
-        assert result["ok"] is True and result["data"]["taskId"] == "task-1"
-        assert result["data"]["passedTasks"] == ["task-2"]
-        assert "task-2" in result["data"]["result"] and "不可撤销" in result["data"]["result"]
+        assert result["ok"] is False and result["data"]["needTaskId"] is True
+        assert "当前任务没有可撤销的改动" in result["error"] and "不可撤销" in result["error"]
+        assert [row["taskId"] for row in result["data"]["candidates"]] == ["task-1"]
+        assert small.read_bytes() == b"xyz\n"
+        assert newer.undo_requests() == []
+
+        explicit = undo(newer, task_id="task-1")
+
+        assert explicit["ok"] is True
         assert small.read_bytes() == b"abc\n"
 
     def test_edits_are_marked_undoable_in_their_results(self, tmp_path: Path) -> None:
@@ -456,10 +491,11 @@ class TestList:
         seed(tmp_path / "b.txt", b"b\n")
         second = _Ctx(tmp_path, task="task-2")
         diff(_Ctx(tmp_path, task="task-1"), "a.txt", "a", "A")
+        second.supervisor.end("task-1")
         write(second, "new.txt", "x\n")
         diff(second, "b.txt", "b", "B")
         diff(second, "b.txt", "B", "BB")
-        undo(second, task_id="task-1")
+        assert undo(second, task_id="task-1")["ok"] is True
 
         result = undo(second, action="list")
 
@@ -500,6 +536,190 @@ class TestList:
 
         assert result["ok"] is False
         assert (tmp_path / "a.txt").read_bytes() == b"A\n"
+
+
+class TestTasksOfOneConversation:
+    """同一会话里并行的任务、派出去的子任务，和认领、supervisor 连不上时的撤销。"""
+
+    def test_without_task_id_a_parallel_task_is_never_undone(self, tmp_path: Path) -> None:
+        mine = seed(tmp_path / "mine.txt", b"m1\n")
+        theirs = seed(tmp_path / "theirs.txt", b"t1\n")
+        ctx = _Ctx(tmp_path, task="task-1")
+        parallel = _Ctx(tmp_path, task="task-2")
+        diff(ctx, "mine.txt", "m1", "m2")
+        diff(parallel, "theirs.txt", "t1", "t2")
+
+        refused = undo(ctx)
+
+        assert refused["ok"] is False and refused["data"]["needTaskId"] is True
+        assert "撤当前任务也要写明" in refused["error"]
+        rows = {row["taskId"]: row for row in refused["data"]["candidates"]}
+        assert set(rows) == {"task-1", "task-2"}
+        assert rows["task-1"]["current"] is True and rows["task-2"]["current"] is False
+        assert "当前任务" in refused["data"]["result"]
+        assert mine.read_bytes() == b"m2\n" and theirs.read_bytes() == b"t2\n"
+        assert ctx.undo_requests() == []
+
+        own = undo(ctx, task_id="task-1")
+
+        assert own["ok"] is True and own["data"]["changedPaths"] == ["mine.txt"]
+        assert mine.read_bytes() == b"m1\n" and theirs.read_bytes() == b"t2\n"
+
+    def test_tasks_whose_changes_are_all_undone_are_not_candidates(self, tmp_path: Path) -> None:
+        a = seed(tmp_path / "a.txt", b"a1\n")
+        b = seed(tmp_path / "b.txt", b"b1\n")
+        earlier = _Ctx(tmp_path, task="task-1")
+        diff(earlier, "a.txt", "a1", "a2")
+        assert undo(earlier)["ok"] is True
+        earlier.supervisor.end("task-1")
+        ctx = _Ctx(tmp_path, task="task-2")
+        diff(ctx, "b.txt", "b1", "b2")
+
+        result = undo(ctx)
+
+        assert result["ok"] is True and result["data"]["taskId"] == "task-2"
+        assert a.read_bytes() == b"a1\n" and b.read_bytes() == b"b1\n"
+
+    def test_a_file_a_running_task_is_editing_is_not_undone_under_it(self, tmp_path: Path) -> None:
+        path = seed(tmp_path / "f.txt", b"one\n")
+        owner = _Ctx(tmp_path, task="task-1")
+        owner.supervisor.start("task-1", session="sess-undo", node="bootstrap.coder")
+        diff(owner, "f.txt", "one", "two")
+        other = _Ctx(tmp_path, task="task-2")
+
+        blocked = undo(other, task_id="task-1")
+
+        assert blocked["ok"] is False
+        assert path.read_bytes() == b"two\n"
+        [row] = blocked["data"]["files"]
+        assert row["action"] == "blocked"
+        assert row["claimedBy"]["taskId"] == "task-1" and row["claimedBy"]["nodeId"] == "bootstrap.coder"
+        assert "task-1" in blocked["error"] and "bootstrap.coder" in blocked["error"]
+        # 认领在送审之前：注定写不了的文件不弹审批卡
+        assert other.undo_requests() == []
+
+        owner.supervisor.end("task-1")
+        again = undo(other, task_id="task-1")
+
+        assert again["ok"] is True
+        assert path.read_bytes() == b"one\n"
+
+    def test_the_task_that_undid_a_file_holds_it_afterwards(self, tmp_path: Path) -> None:
+        path = seed(tmp_path / "f.txt", b"one\n")
+        earlier = _Ctx(tmp_path, task="task-1")
+        diff(earlier, "f.txt", "one", "two")
+        earlier.supervisor.end("task-1")
+        ctx = _Ctx(tmp_path, task="task-2")
+
+        assert undo(ctx, task_id="task-1")["ok"] is True
+
+        assert ctx.supervisor.holders(path.resolve()) == ["task-2"]
+        late = _Ctx(tmp_path, task="task-3")
+        refused = asyncio.run(apply_diff({"path": "f.txt", "diffs": [{"search": "one", "replace": "ONE"}]}, late))
+        assert refused["ok"] is False and refused["data"]["claimedBy"]["taskId"] == "task-2"
+
+    def test_the_parent_undoes_what_a_fresh_child_changed(self, tmp_path: Path) -> None:
+        path = seed(tmp_path / "f.txt", b"one\n")
+        fake = FakeSupervisor.of(tmp_path)
+        child_session = "agent:bootstrap.code_fixer:sess-undo"
+        fake.start("task-parent", session="sess-undo", node="bootstrap.coder")
+        fake.start(
+            "task-child", session=child_session, node="bootstrap.code_fixer",
+            caller="task-parent", journal_root="sess-undo",
+        )
+        fake.suspend("task-parent")
+        diff(_Ctx(tmp_path, task="task-child", session=child_session), "f.txt", "one", "two")
+        fake.end("task-child")
+        fake.resume("task-parent")
+        parent = _Ctx(tmp_path, task="task-parent")
+
+        listed = undo(parent, action="list")
+        refused = undo(parent)
+        result = undo(parent, task_id="task-child")
+
+        assert [row["taskId"] for row in listed["data"]["tasks"]] == ["task-child"]
+        assert "含派出去的子任务" in listed["data"]["result"]
+        assert refused["ok"] is False and [row["taskId"] for row in refused["data"]["candidates"]] == ["task-child"]
+        assert result["ok"] is True and result["data"]["taskId"] == "task-child"
+        assert path.read_bytes() == b"one\n"
+        journal = edit_journal.EditJournal(tmp_path)
+        assert [task.task_id for task in journal.tasks("sess-undo")] == ["task-child"]
+        assert journal.tasks(child_session) == []
+
+    def test_records_left_under_a_child_session_are_still_listed(self, tmp_path: Path) -> None:
+        # 问不到根会话时记录落在子节点自己的会话下，保留期内的这类记录也要列得出、撤得了
+        a = seed(tmp_path / "a.txt", b"a1\n")
+        b = seed(tmp_path / "b.txt", b"b1\n")
+        fake = FakeSupervisor.of(tmp_path)
+        child_session = "agent:bootstrap.code_fixer:sess-undo"
+        fake.start("task-old", session=child_session)
+        diff(_Ctx(tmp_path, task="task-old", session=child_session), "a.txt", "a1", "a2")
+        fake.end("task-old")
+        fake.start("task-new", session=child_session, journal_root="sess-undo")
+        child = _Ctx(tmp_path, task="task-new", session=child_session)
+        diff(child, "b.txt", "b1", "b2")
+
+        listed = undo(child, action="list")
+        old = undo(child, task_id="task-old")
+
+        journal = edit_journal.EditJournal(tmp_path)
+        assert [task.task_id for task in journal.tasks(child_session)] == ["task-old"]
+        assert [task.task_id for task in journal.tasks("sess-undo")] == ["task-new"]
+        assert [row["taskId"] for row in listed["data"]["tasks"]] == ["task-new", "task-old"]
+        assert old["ok"] is True
+        assert a.read_bytes() == b"a1\n" and b.read_bytes() == b"b2\n"
+
+    def test_an_unreachable_supervisor_refuses_the_undo_and_the_list(self, tmp_path: Path) -> None:
+        path = seed(tmp_path / "f.txt", b"one\n")
+        ctx = _Ctx(tmp_path)
+        diff(ctx, "f.txt", "one", "two")
+        ctx.supervisor.down = True
+
+        result = undo(ctx)
+        listed = undo(ctx, action="list")
+
+        assert result["ok"] is False and result["data"]["unavailable"] is True
+        assert "连不上 supervisor" in result["error"]
+        assert listed["ok"] is False and listed["data"]["unavailable"] is True
+        assert path.read_bytes() == b"two\n"
+        assert ctx.undo_requests() == []
+
+    def test_losing_the_supervisor_midway_stops_before_the_next_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        a = seed(tmp_path / "a.txt", b"a1\n")
+        b = seed(tmp_path / "b.txt", b"b1\n")
+        ctx = _Ctx(tmp_path)
+        diff(ctx, "a.txt", "a1", "a2")
+        diff(ctx, "b.txt", "b1", "b2")
+        fake = ctx.supervisor
+        real_begin = fake.begin
+        claimed: list[str] = []
+
+        def begin_then_drop(task_id: str, path: str, display: str, session: str) -> dict[str, Any]:
+            claimed.append(display)
+            if len(claimed) > 1:
+                fake.down = True
+            return real_begin(task_id, path, display, session)
+
+        monkeypatch.setattr(fake, "begin", begin_then_drop)
+
+        result = undo(ctx)
+
+        # 后改的先撤：b.txt 撤成了，轮到 a.txt 时连不上
+        assert claimed == ["b.txt", "a.txt"]
+        assert result["ok"] is True and result["data"]["restoredCount"] == 1
+        assert "连不上 supervisor" in result["data"]["halted"]
+        assert "后面的文件没有处理" in result["data"]["result"]
+        assert [row["path"] for row in result["data"]["files"]] == ["b.txt"]
+        assert b.read_bytes() == b"b1\n" and a.read_bytes() == b"a2\n"
+
+        fake.down = False
+        monkeypatch.setattr(fake, "begin", real_begin)
+        rest = undo(ctx)
+
+        assert rest["ok"] is True and rest["data"]["changedPaths"] == ["a.txt"]
+        assert a.read_bytes() == b"a1\n"
 
 
 def ctx_free_of_approvals(ctx: _Ctx) -> bool:

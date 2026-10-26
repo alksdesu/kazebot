@@ -1,7 +1,7 @@
 """edit_lines：按 read_file 在 hashline 模式下给出的「行号:哈希」锚点改行（策略 + 审批）。
 
 锚点都指改动前的文件。有一个对不上就整体拒绝、不写盘，结果里给出锚点附近的最新内容；锚点不会自动挪到别的行。
-写盘流程和 apply_diff 是同一条：送审、读后改前比戳、记编辑日志、原子写入、改后检查。"""
+写盘流程和 apply_diff 是同一条：认领、送审、读后改前比戳、记编辑日志、原子写入、改后检查。"""
 from __future__ import annotations
 
 from typing import Any
@@ -212,6 +212,7 @@ def _success_response(
     reveal: bool,
     checks: EditChecks | None,
     journal: edit_journal.JournalNote | None = None,
+    stamp_recorded: bool = True,
 ) -> dict[str, Any]:
     count = len(edits)
     if written:
@@ -222,6 +223,8 @@ def _success_response(
     lines = [head, *summary_lines]
     if journal is not None:
         lines.extend(journal.lines())
+    if not stamp_recorded:
+        lines.append(file_state.STAMP_NOT_RECORDED_NOTE)
     if written:
         lines.extend(
             echo_lines(outcome.content, _echo_spans(outcome), HASHLINED) if reveal
@@ -243,6 +246,8 @@ def _success_response(
     }
     if written:
         data["bytes"] = byte_count
+    if not stamp_recorded:
+        data["stampRecorded"] = False
     if journal is not None:
         data.update(journal.to_data())
     if checks is not None:
@@ -271,7 +276,7 @@ async def edit_lines(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         )
 
     try:
-        resolved = await guard_and_resolve(
+        target = await guard_and_resolve(
             ctx,
             path_str,
             tool_name="edit_lines",
@@ -282,12 +287,13 @@ async def edit_lines(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             failedCount=0,
         )
         tx = await run_text_edit(
-            ctx, resolved, path_str, lambda text: apply_line_edits(text, edits),
+            ctx, target, path_str, lambda text: apply_line_edits(text, edits),
             tool_name="edit_lines", max_size=_MAX_FILE_SIZE,
         )
     except EditRefused as refused:
         return refused.response
 
+    resolved = target.resolved
     outcome: LineEditOutcome = tx.outcome
     if tx.status == "failed":
         reveal = await file_state.reveal_allowed(ctx, tx.gate, path_str)
@@ -300,4 +306,5 @@ async def edit_lines(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     return _success_response(
         path_str, outcome, edits,
         written=True, byte_count=tx.byte_count, reveal=reveal, checks=checks, journal=tx.journal,
+        stamp_recorded=tx.stamp_recorded,
     )

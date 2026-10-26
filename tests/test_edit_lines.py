@@ -14,7 +14,11 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+_TESTS = Path(__file__).resolve().parent
+if str(_TESTS) not in sys.path:
+    sys.path.insert(0, str(_TESTS))
 
+from _file_edits_fake import FakeFileEdits  # noqa: E402
 from toolbox.builtins.apply_diff import apply_diff  # noqa: E402
 from toolbox.builtins.edit_lines import edit_lines  # noqa: E402
 from toolbox.builtins.read_file import read_file  # noqa: E402
@@ -28,8 +32,8 @@ from toolbox.text_files import decode_text, normalize_newlines, split_lines  # n
 _BOM = b"\xef\xbb\xbf"
 
 
-class _Ctx(ToolContext):
-    """离线 ToolContext：节点 extra 里的 edit_mode 默认是 hashline；按 op 名给出预设的 safety_level。"""
+class _Ctx(FakeFileEdits, ToolContext):
+    """离线 ToolContext：节点 extra 里的 edit_mode 默认是 hashline；按 op 名给出预设的 safety_level。认领和读戳交给 FakeSupervisor。"""
 
     def __init__(self, workspace_root: Path, *, hashline: bool = True, task: str = "task-1", **decisions: str) -> None:
         super().__init__(

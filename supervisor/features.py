@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 import asyncio
 import logging
 
-from . import community, execution, materials_api, operations, reminders, sticker_tagging
+from . import community, execution, file_claims, materials_api, operations, reminders, sticker_tagging
 from .sticker_api import close_stores
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ def register_features(app, state, process_manager, config_store, features_config
         for name, service in (("state", state), ("config_store", config_store), ("process_manager", process_manager),
                               ("eventlog", state.eventlog), ("hooks", state.hook_registry)):
             host.register_base(name, service)
-    for module in (execution, reminders, community, materials_api, operations):
+    for module in (execution, reminders, community, materials_api, operations, file_claims):
         app.include_router(module.create_router(state))
 
 

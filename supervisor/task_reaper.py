@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from clonoth_runtime import task_max_running_seconds
 
+from .file_claims import release_if_ended_locked
 from .types import ApprovalStatus, Task, TaskStatus
 
 if TYPE_CHECKING:
@@ -187,6 +188,7 @@ def _fail_locked(state: "SupervisorState", task: Task, *, reason: str, now: date
     """回收即取消：置 cancel_requested 让还在跑的 worker 从续租和取消查询里得知停手，再按失败走完成路由。"""
     log.warning("reaping %s task %s (node=%s): %s", task.status.value, task.task_id[:12], task.node_id, reason)
     state._fail_task_locked(task, error=reason, now=now)
+    release_if_ended_locked(state, task)
 
 
 def _lifetime_reason(lifetime_sec: float, limit_sec: float) -> str:
