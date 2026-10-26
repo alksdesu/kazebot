@@ -2455,37 +2455,6 @@ class TaskRouterMixin:
         return self._find_entry_task_by_status_locked(session_id, {TaskStatus.suspended})
 
     # ------------------------------------------------------------------ #
-    #  child session 清理
-    # ------------------------------------------------------------------ #
-
-    def _cleanup_task_child_session_if_needed(self, task: Task) -> None:
-        """统一清理 task 关联的 child session（非 accumulate 模式）。
-
-        [AutoC 2026-05-30] Why: child session 清理逻辑原先散落在 10+ 个
-        return 路径中，每新增路径都要记得补清理，容易遗漏导致 sessions.json
-        堆积。How: 在 _route_completed_task_locked 的 finally 中统一调用。
-        Purpose: 单一出口，防止泄漏。
-        """
-        child_sid = str(task.input.get("child_session_id") or "").strip()
-        if not child_sid:
-            return
-
-        # 避免 finally 在挂起路径误删仍活跃的 child session。
-        if not self._task_terminal(task):
-            return
-
-        # 优先读取registry，缺失时才回退 task.input。避免误删 accumulate 会话。
-        entry = self._session_store.get_entry(child_sid)
-        registry_mode = str(entry.get("context_mode") or "").strip() if isinstance(entry, dict) else ""
-        input_mode = str(task.input.get("context_mode") or "").strip()
-        ctx_mode = registry_mode or input_mode
-
-        if ctx_mode == "accumulate":
-            return
-
-        self._expire_child_session(child_sid)
-
-    # ------------------------------------------------------------------ #
     #  压缩 dispatch 结果处理
     # ------------------------------------------------------------------ #
 

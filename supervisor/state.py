@@ -19,7 +19,9 @@ from .branch_finalize_store import BranchFinalizeClaimStore
 from .compact_breaker import CompactBreaker
 from .reply_intent import IntentRegistry
 from .eventlog import EventLog, SYSTEM_SESSION_ID
+from clonoth_runtime import load_runtime_config
 from engine.builtin.loader import auto_discover_and_register
+from engine.child_session_retention import child_session_ttl_hours, is_retained_child_row
 from engine.conversation_migration import ConversationRekey, RekeyCount
 from engine.hooks import HookRegistry
 from platforms.sources import classify_operation_source
@@ -846,39 +848,22 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if str(sid).startswith("branch_"):
                 mark_stale(sid)
 
-        # 3. 清理非 accumulate 的 child session。
-        # [AutoC 2026-05-30] 与 _cleanup_stale_sessions_locked 保持一致：
+        # 3. 清理非 accumulate 的 child session，和 _cleanup_stale_sessions_locked 同一套规则：
         #   - accumulate: 永久保留
         #   - 无 context_mode（历史遗留）: 直接清理，不等 TTL
-        #   - fresh/fork: 24h 无活动后清理
-        stale_threshold = datetime.now(timezone.utc) - timedelta(hours=24)
+        #   - fresh/fork: 空闲超过 engine.child_session.ttl_hours 后清理
+        stale_threshold = datetime.now(timezone.utc) - self._child_session_ttl()
         for sid, entry in self._session_store.items_snapshot():
             if sid in seen_stale or not isinstance(entry, dict):
                 continue
-            if not entry.get("is_child"):
-                continue
-            ctx_mode = str(entry.get("context_mode") or "").strip()
-            if ctx_mode == "accumulate":
+            if not entry.get("is_child") or is_retained_child_row(entry):
                 continue
             # 无 context_mode 的历史 child session 直接清理
-            if not ctx_mode:
+            if not str(entry.get("context_mode") or "").strip():
                 mark_stale(sid)
                 continue
-            # fresh/fork: 正常 TTL 检查
-            updated_str = (
-                entry.get("last_active_at")
-                or entry.get("updated_at")
-                or entry.get("created_at")
-                or ""
-            )
-            try:
-                updated_at = datetime.fromisoformat(str(updated_str))
-                if updated_at.tzinfo is None:
-                    updated_at = updated_at.replace(tzinfo=timezone.utc)
-                if updated_at < stale_threshold:
-                    mark_stale(sid)
-            except Exception:
-                pass
+            if self._child_row_idle_before(entry, stale_threshold):
+                mark_stale(sid)
 
         # 执行清理。
         for sid in stale_sids:
@@ -1329,10 +1314,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             node_id=node_id,
             context_key=context_key,
         )
-        # [AutoC 2026-05-30] Why: 24h TTL 清理需要知道 child session 的
-        # context_mode，才能删除 fresh/fork 并永久保留 accumulate。How: child
-        # 创建后立即补写 context_mode 到持久 registry 并落盘。Purpose: 重启后
-        # stale cleanup 仍能按模式执行正确清理。
+        # context_mode 必须落盘：重启后的过期清理和另一个进程里的 data_cleanup 都靠它认出要永久保留的 accumulate。
         self._session_store.set_entry_field(
             child_sid, "context_mode", str(context_mode or "").strip(),
         )
@@ -1343,79 +1325,50 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         )
         return child_sid
 
+    def _child_session_ttl(self) -> timedelta:
+        """fresh / fork 子会话空闲多久算过期。派发时的懒过期、启动清理、定期清理都从这里取。"""
+        return timedelta(hours=child_session_ttl_hours(load_runtime_config(self.workspace_root)))
+
+    @staticmethod
+    def _child_row_idle_before(entry: dict[str, Any], threshold: datetime) -> bool:
+        """子会话这一行最后一次活动早于 threshold。时间读不出来的不算：判不清就不删。"""
+        stamp = str(entry.get("last_active_at") or entry.get("updated_at") or entry.get("created_at") or "")
+        try:
+            last_active = datetime.fromisoformat(stamp)
+        except ValueError:
+            return False
+        if last_active.tzinfo is None:
+            last_active = last_active.replace(tzinfo=timezone.utc)
+        return last_active < threshold
+
     def _is_child_session_expired(self, child_session_id: str) -> bool:
         """检查 child session 是否已超过 TTL。
 
         Child Session 隔离（Phase A）：从 sessions.json 的 last_active_at 字段
         判定是否过期。如果记录不存在或已 reset，视为过期。
         """
-        from clonoth_runtime import get_int, load_runtime_config
-        runtime_cfg = load_runtime_config(self.workspace_root)
-        ttl_hours = get_int(runtime_cfg, "engine.child_session.ttl_hours", 24, min_value=1)
-
         entry = self._session_store.get_entry(child_session_id)
         if entry is None or entry.get("reset"):
             return True
-        # [AutoC 2026-05-30] Why: accumulate child session 是长期上下文，老大要求
-        # 永久保留，不能再按 24h TTL 失效。How: 在 TTL 判断前直接保留明确标记
-        # 为 accumulate 的记录。Purpose: get_or_create_child_session 不会因时间流逝
-        # 创建新的 accumulate 会话并留下旧记录。
-        if str(entry.get("context_mode") or "").strip() == "accumulate":
+        # accumulate 是长期上下文，不按 TTL 失效：失效了就会另开一个 accumulate 会话，旧历史从此接不上。
+        if is_retained_child_row(entry):
             return False
         last_active_str = entry.get("last_active_at", "")
         if not last_active_str:
             return True
         try:
             last_active = datetime.fromisoformat(last_active_str)
-            age_hours = (_now() - last_active).total_seconds() / 3600
-            return age_hours > ttl_hours
+            return _now() - last_active > self._child_session_ttl()
         except (ValueError, TypeError):
             return True
-
-    def _expire_child_session(self, child_session_id: str) -> None:
-        """删除一个过期的 child session。
-
-        Child Session 隔离（Phase A）：删除 JSONL 文件、从映射表移除、物理删除 registry 条目。
-        """
-        # 1. 删除运行期文件（对话历史 + 任务转写）
-        self.purge_session_files(child_session_id)
-
-        # 2. 从映射表移除
-        key_to_remove = None
-        for key, cid in self.child_session_map.items():
-            if cid == child_session_id:
-                key_to_remove = key
-                break
-        if key_to_remove:
-            del self.child_session_map[key_to_remove]
-            parent_sid = key_to_remove[0]
-            if parent_sid in self.parent_children:
-                self.parent_children[parent_sid].discard(child_session_id)
-
-        # [AutoC 2026-05-30] Why: fresh/fork child session 过期后应从
-        # sessions.json 物理删除。How: 删除 registry 条目而不是写 reset=true。
-        # Purpose: 让完成或过期的临时 child session 不再堆积。
-        self.sessions.pop(child_session_id, None)
-        self.session_generations.pop(child_session_id, None)
-        self._cancelled_sessions.discard(child_session_id)
-        self._session_context_usage.pop(child_session_id, None)
-        self._session_store.remove_session(child_session_id)
-
-        logger.info("child session expired: %s", child_session_id)
 
     def _cleanup_stale_sessions_locked(self) -> None:
         """清理 sessions.json 中已无用的 branch 和 child session 记录。
 
-        [AutoC 2026-05-30] Why: 历史上 branch/child session 只标记 reset 不删除，
-        导致 sessions.json 无限膨胀。
-        How: 遍历 registry，删除所有 reset=true 的条目，以及超过 24h 无活动的
-        非 accumulate child session。
-        Purpose: 定期清理积累的历史记录。
+        branch/child session 只标 reset 不删的话，sessions.json 会无限膨胀。这里删掉所有 reset=true 的条目、
+        没有任务在用的入口分支，以及空闲超过 engine.child_session.ttl_hours 的非 accumulate child session。
         """
-        from datetime import timedelta
-
-        now = datetime.now(timezone.utc)
-        stale_threshold = now - timedelta(hours=24)
+        stale_threshold = datetime.now(timezone.utc) - self._child_session_ttl()
         to_remove: list[str] = []
         purge_files: list[str] = []
 
@@ -1434,41 +1387,16 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     to_remove.append(sid)
                     purge_files.append(sid)
                 continue
-            # [AutoC 2026-05-30] Why: fresh/fork child session 只用于一次性或
-            # 隔离上下文，24h 无活动后应释放；accumulate 是长期上下文，必须保留。
-            # How: 读取 context_mode 和 last_active_at，超过阈值才加入删除列表。
-            # Purpose: 同时满足 TTL 清理和 accumulate 永久保留规则。
+            # fresh/fork 只用于一次性或隔离上下文，空闲过了 TTL 就释放；accumulate 是长期上下文，永久保留。
             if info.get("is_child"):
-                ctx_mode = str(info.get("context_mode") or "").strip()
-                # [AutoC 2026-05-30] 条件从 in ("fresh", "fork") 改为 != "accumulate"，
-                # 因为历史系统节点（turn_summarizer/compactor）创建的 child session
-                # 没有 context_mode 字段（空字符串），旧条件无法匹配，导致堆积。
-                if ctx_mode == "accumulate" or self._session_files_in_use_locked(sid):
+                # 按「不是 accumulate」判而不是「是 fresh/fork」：系统节点留下的老 child session 没有 context_mode。
+                if is_retained_child_row(info) or self._session_files_in_use_locked(sid):
                     continue
-                # [AutoC 2026-05-30] Why: 没有 context_mode 的历史 child session
-                # 是旧代码遗留，运行时清理对它们无效（旧 task 已消失）。
-                # How: 无 context_mode 的直接清理，不等 24h TTL。
-                # Purpose: 一次性清除历史堆积。
-                if not ctx_mode:
+                # 没有 context_mode 的是旧代码遗留，运行时清理对它们无效（旧 task 已消失），不等 TTL 直接清。
+                legacy = not str(info.get("context_mode") or "").strip()
+                if legacy or self._child_row_idle_before(info, stale_threshold):
                     to_remove.append(sid)
                     purge_files.append(sid)
-                    continue
-                # fresh/fork: 正常 TTL 检查
-                updated_str = str(
-                    info.get("last_active_at")
-                    or info.get("updated_at")
-                    or info.get("created_at")
-                    or ""
-                )
-                try:
-                    updated_at = datetime.fromisoformat(updated_str)
-                    if updated_at.tzinfo is None:
-                        updated_at = updated_at.replace(tzinfo=timezone.utc)
-                    if updated_at < stale_threshold:
-                        to_remove.append(sid)
-                        purge_files.append(sid)
-                except Exception:
-                    pass
 
         if purge_files:
             # 调用方持着全局锁，删文件放到锁外

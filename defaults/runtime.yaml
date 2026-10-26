@@ -29,7 +29,7 @@ engine:
 
   # Child Session 隔离：dispatch 子节点使用独立 session，替代 node_contexts snapshot 机制
   child_session:
-    ttl_hours: 24              # child session 不活跃超过此时间后过期
+    ttl_hours: 24              # 只管 fresh / fork 子会话：空闲超过这么多小时，登记和对话历史一起清掉（最少 1）；accumulate 永久保留
     # Step 2（2026-04-16）：主节点是否也走 ConversationStore，替代 node_contexts snapshot。
     # true  = 主节点入口 task 不再注入 context_ref，history 从 data/conversations/{session_id}.jsonl 加载，
     #        _persist_ctx 不写 snapshot，compact 直接操作 ConversationStore。

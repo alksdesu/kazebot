@@ -1,6 +1,6 @@
 """子会话拆除必须删完一整组运行期文件。
 
-拆除路径有六条，删 data/transcripts/ 的只有启动时的 reconcile 那一条 —— 于是每个
+拆除路径有五条，删 data/transcripts/ 的只有启动时的 reconcile 那一条 —— 于是每个
 dispatch 出去的子节点都在磁盘上留一份转写，进程内没有任何清理者。不报错、不影响功能，
 只是无声增长，直到有人去看那个目录。
 """
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -120,16 +121,23 @@ class TestPurgeHelper:
 
 
 class TestEveryTeardownPathPurgesBoth:
-    def test_expiring_a_child_session_removes_its_transcript(self, tmp_path: Path) -> None:
+    def test_the_housekeeping_sweep_removes_both_for_an_idle_child(self, tmp_path: Path) -> None:
         state = _state(tmp_path)
         parent = state.get_or_create_session(channel="test", conversation_key="test:expire")
         child, _ = state.get_or_create_child_session(parent, "child.node", "case", "fresh")
         conv, transcript = _seed(tmp_path, child)
-
-        state._expire_child_session(child)
+        with state._lock:
+            state._session_store.set_entry_field(child, "last_active_at", "2020-01-01T00:00:00+00:00")
+            state._cleanup_stale_sessions_locked()
+        # 删文件放在锁外的后台线程里
+        for thread in threading.enumerate():
+            if thread.name == "stale-session-purge":
+                thread.join(timeout=10)
 
         assert not conv.exists()
         assert not transcript.exists()
+        assert child not in state.sessions
+        assert child not in state.child_session_map.values()
 
     def test_resetting_a_conversation_removes_child_transcripts(self, tmp_path: Path) -> None:
         state = _state(tmp_path)
@@ -218,7 +226,6 @@ class TestNoTeardownPathHandRollsPaths:
     _TEARDOWN_FUNCTIONS = {
         ("supervisor/session.py", "_cleanup_branch_locked"),
         ("supervisor/session.py", "reset_session"),
-        ("supervisor/state.py", "_expire_child_session"),
         ("supervisor/state.py", "_reconcile_after_restart"),
         ("supervisor/task_router.py", "_execute_post_cleanup"),
         ("supervisor/state.py", "_purge_stale_session_files"),

@@ -12,6 +12,8 @@ import threading
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
+
 # Why: the test checkout is executed directly, not installed as a package.
 # How: prepend the repository root to sys.path. Purpose: import the edited
 # supervisor modules and verify the real persistence code path.
@@ -326,6 +328,141 @@ def test_route_cleanup_prefers_registry_context_mode_over_task_input(tmp_path: P
     registry = _registry(tmp_path)
     assert child_sid in registry
     assert registry[child_sid]["context_mode"] == "accumulate"
+
+
+def _write_child_ttl(workspace: Path, raw: str) -> None:
+    config = workspace / "config" / "runtime.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(f"engine:\n  child_session:\n    ttl_hours: {raw}\n", encoding="utf-8")
+
+
+def _idle_child(state: SupervisorState, parent: str, mode: str, *, idle_hours: float) -> str:
+    child_sid, _ = state.get_or_create_child_session(parent, f"{mode}.node", "ttl", mode)
+    idle_since = (_now() - timedelta(hours=idle_hours)).isoformat()
+    state._session_store.set_entry_field(child_sid, "last_active_at", idle_since)
+    return child_sid
+
+
+# (ttl_hours, 空闲小时数, 是否过期)
+_CHILD_TTL_CASES = [
+    pytest.param("2", 3, True, id="short-ttl-expired"),
+    pytest.param("2", 1, False, id="short-ttl-alive"),
+    pytest.param("48", 25, False, id="long-ttl-outlives-the-old-24h"),
+    pytest.param("48", 49, True, id="long-ttl-expired"),
+]
+
+
+@pytest.mark.parametrize("raw,idle_hours,expired", _CHILD_TTL_CASES)
+def test_periodic_sweep_follows_the_configured_child_ttl(
+    tmp_path: Path, raw: str, idle_hours: float, expired: bool,
+) -> None:
+    _write_child_ttl(tmp_path, raw)
+    state = _make_state(tmp_path)
+    parent = state.get_or_create_session(channel="test", conversation_key="test:ttl-sweep")
+    fresh_sid = _idle_child(state, parent, "fresh", idle_hours=idle_hours)
+
+    with state._lock:
+        state._cleanup_stale_sessions_locked()
+
+    assert (fresh_sid not in _registry(tmp_path)) is expired
+
+
+@pytest.mark.parametrize("raw,idle_hours,expired", _CHILD_TTL_CASES)
+def test_startup_reconcile_follows_the_configured_child_ttl(
+    tmp_path: Path, raw: str, idle_hours: float, expired: bool,
+) -> None:
+    _write_child_ttl(tmp_path, raw)
+    state = _make_state(tmp_path)
+    parent = state.get_or_create_session(channel="test", conversation_key="test:ttl-reconcile")
+    fork_sid = _idle_child(state, parent, "fork", idle_hours=idle_hours)
+    conv_path = tmp_path / "data" / "conversations" / f"{fork_sid}.jsonl"
+    conv_path.parent.mkdir(parents=True, exist_ok=True)
+    conv_path.write_text("", encoding="utf-8")
+
+    _make_state(tmp_path)
+
+    assert (fork_sid not in _registry(tmp_path)) is expired
+    assert conv_path.exists() is not expired
+
+
+@pytest.mark.parametrize("raw,idle_hours,expired", _CHILD_TTL_CASES)
+def test_lazy_expiry_follows_the_configured_child_ttl(
+    tmp_path: Path, raw: str, idle_hours: float, expired: bool,
+) -> None:
+    _write_child_ttl(tmp_path, raw)
+    state = _make_state(tmp_path)
+    parent = state.get_or_create_session(channel="test", conversation_key="test:ttl-lazy")
+    fresh_sid = _idle_child(state, parent, "fresh", idle_hours=idle_hours)
+
+    assert state._is_child_session_expired(fresh_sid) is expired
+
+
+@pytest.mark.parametrize("raw,hours", [
+    pytest.param("0", 1, id="zero-clamps-to-one"),
+    pytest.param("-5", 1, id="negative-clamps-to-one"),
+    pytest.param("abc", 24, id="not-a-number"),
+    pytest.param("null", 24, id="null"),
+    pytest.param('"12"', 12, id="quoted-number"),
+])
+def test_an_odd_child_ttl_is_clamped_or_falls_back(tmp_path: Path, raw: str, hours: int) -> None:
+    _write_child_ttl(tmp_path, raw)
+    state = _make_state(tmp_path)
+
+    assert state._child_session_ttl() == timedelta(hours=hours)
+
+
+def test_without_a_configured_child_ttl_the_default_is_24_hours(tmp_path: Path) -> None:
+    state = _make_state(tmp_path)
+
+    assert state._child_session_ttl() == timedelta(hours=24)
+
+
+def test_a_zero_child_ttl_still_gives_fresh_children_an_hour(tmp_path: Path) -> None:
+    _write_child_ttl(tmp_path, "0")
+    state = _make_state(tmp_path)
+    parent = state.get_or_create_session(channel="test", conversation_key="test:ttl-zero")
+    recent_sid = _idle_child(state, parent, "fresh", idle_hours=0.5)
+    stale_sid = _idle_child(state, parent, "fork", idle_hours=2)
+
+    with state._lock:
+        state._cleanup_stale_sessions_locked()
+
+    registry = _registry(tmp_path)
+    assert recent_sid in registry
+    assert stale_sid not in registry
+
+
+@pytest.mark.parametrize("row,idle", [
+    pytest.param({"last_active_at": "2020-01-01T00:00:00+00:00"}, True, id="aware-and-old"),
+    pytest.param({"last_active_at": "2020-01-01T00:00:00"}, True, id="naive-counts-as-utc"),
+    pytest.param({"created_at": "2020-01-01T00:00:00+00:00"}, True, id="legacy-row-falls-back-to-created-at"),
+    pytest.param(
+        {"last_active_at": "not a time", "created_at": "2020-01-01T00:00:00+00:00"}, False,
+        id="unparseable-is-never-judged-stale",
+    ),
+    pytest.param({}, False, id="no-timestamp-is-never-judged-stale"),
+    pytest.param({"last_active_at": _now().isoformat()}, False, id="recent"),
+])
+def test_both_sweeps_judge_an_idle_child_row_the_same_way(row: dict, idle: bool) -> None:
+    threshold = _now() - timedelta(hours=24)
+
+    assert SupervisorState._child_row_idle_before(row, threshold) is idle
+
+
+def test_an_accumulate_child_outlives_any_child_ttl(tmp_path: Path) -> None:
+    _write_child_ttl(tmp_path, "1")
+    state = _make_state(tmp_path)
+    parent = state.get_or_create_session(channel="test", conversation_key="test:ttl-accumulate")
+    accumulate_sid = _idle_child(state, parent, "accumulate", idle_hours=24 * 40)
+
+    with state._lock:
+        state._cleanup_stale_sessions_locked()
+    restarted = _make_state(tmp_path)
+
+    assert accumulate_sid in _registry(tmp_path)
+    assert restarted._is_child_session_expired(accumulate_sid) is False
+    reused = restarted.get_or_create_child_session(parent, "accumulate.node", "ttl", "accumulate")
+    assert reused == (accumulate_sid, False)
 
 
 def test_session_store_out_of_order_snapshot_never_overwrites_newer_generation(tmp_path: Path) -> None:

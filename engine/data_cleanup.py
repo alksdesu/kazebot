@@ -19,6 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 try:
     # Normal package import when launched from the repository root/runtime.
@@ -29,6 +30,12 @@ except ModuleNotFoundError:  # pragma: no cover - direct ``python engine/data_cl
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:  # 直接 ``python engine/data_cleanup.py`` 时项目根不在路径上
     sys.path.insert(0, str(_REPO_ROOT))
+from clonoth_runtime import load_runtime_config  # noqa: E402
+from engine.child_session_retention import (  # noqa: E402
+    DEFAULT_CHILD_SESSION_TTL_HOURS,
+    child_session_ttl_hours,
+    is_retained_child_row,
+)
 from engine.conversation_store import ConversationStore  # noqa: E402
 from engine.builtin.knowledge_inject import (  # noqa: E402
     MemoryBookUnreadable,
@@ -75,15 +82,14 @@ TEMP_GLOBS = [
     "chat_dump_*", "chat_chunk_*", "chat_compact_*", "chat_messages_*",
 ]
 
-# Child Session 隔离（Phase C）：过期 child session 的 JSONL 文件清理
-# child_*.jsonl 超过此时间未修改则删除。与 runtime.yaml 中 child_session.ttl_hours 对齐。
-CHILD_SESSION_MAX_AGE = 24 * 3600     # 24 h（与默认 TTL 一致）
+# child_*.jsonl 的保留期和 supervisor 判子会话过期读同一个 engine.child_session.ttl_hours。
+# 入口分支 branch_*.jsonl 是进程崩在半路留下的副本，和子会话 TTL 无关，固定 24 小时。
+BRANCH_CONVERSATION_MAX_AGE = 24 * 3600
 # dream 的整理任务会话。留 7 天够回溯几轮整理做了什么，再久没有价值。
 TASK_CONVERSATION_MAX_AGE = float(
     os.getenv("CLONOTH_TASK_CONVERSATION_MAX_AGE_SECONDS", str(7 * 24 * 3600)))
 
-# Phase D：node_contexts 目录清理。child session 已替代 snapshot 机制，
-# 保留 48h 宽裕期后清理旧文件（比 child session TTL 长一倍，确保兼容期充分）。
+# node_contexts 的快照机制已被子会话替代，留 48 小时宽裕期再清。
 NODE_CONTEXTS_MAX_AGE = 48 * 3600     # 48 h
 
 # TaskRecord 转写目录 data/transcripts/。文件形如 {session_id}.jsonl 与 child_*.jsonl，
@@ -460,28 +466,111 @@ def purge_temp_globs():
 
 
 # ── Child Session JSONL cleanup ───────────────
+class _SessionRegistryUnreadable(Exception):
+    """data/sessions.json 在，却读不了，或者不是以 session_id 为键的对象。"""
+
+
+def _load_session_registry() -> dict[str, Any] | None:
+    """supervisor 的会话登记表，以 session_id 为键；文件不存在返回 None，读不懂抛 _SessionRegistryUnreadable。"""
+    path = DATA_DIR / "sessions.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        raise _SessionRegistryUnreadable(str(exc)) from exc
+    if not isinstance(raw, dict):
+        raise _SessionRegistryUnreadable(f"root is {type(raw).__name__}, expected an object keyed by session_id")
+    return raw
+
+
+def _retained_child_sessions(registry: dict[str, Any]) -> set[str]:
+    """登记表里历史要永久保留的子会话 id。行的键和 session_id 字段都算：哪个对上文件名都不删。"""
+    retained: set[str] = set()
+    for key, row in registry.items():
+        if not is_retained_child_row(row):
+            continue
+        retained.add(str(key))
+        session_id = str(row.get("session_id") or "").strip()
+        if session_id:
+            retained.add(session_id)
+    return retained
+
+
+def _child_session_ttl_hours() -> int:
+    """本工作区的 engine.child_session.ttl_hours。runtime 读不了就按默认 TTL：清理照常跑，只是认不出改过的值。"""
+    try:
+        return child_session_ttl_hours(load_runtime_config(DATA_DIR.parent))
+    except Exception as exc:
+        logging.warning(
+            "[child_sessions] runtime config unreadable, falling back to the default %dh ttl: %s",
+            DEFAULT_CHILD_SESSION_TTL_HOURS, exc,
+        )
+        return DEFAULT_CHILD_SESSION_TTL_HOURS
+
+
+def _expired_files(directory: Path, pattern: str, cutoff: float) -> list[Path]:
+    """directory 下匹配 pattern、最后一次修改早于 cutoff 的文件，按文件名排序。"""
+    expired: list[Path] = []
+    for path in sorted(directory.glob(pattern)):
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                expired.append(path)
+        except OSError:
+            continue
+    return expired
+
+
+def _delete_idle_conversation(path: Path, cutoff: float, label: str) -> bool:
+    try:
+        return _unlink_idle_conversation(path, cutoff)
+    except Exception as exc:
+        logging.info("[%s] failed to delete %s: %s", label, path, exc)
+        return False
+
+
 def purge_expired_child_sessions():
-    """清理过期的 child session JSONL 文件。
+    """清理空闲过期的子会话和入口分支 JSONL。
 
-    Child Session 隔离（Phase C）：扫描 data/conversations/ 下所有 child_*.jsonl，
-    按文件修改时间判断是否超过 CHILD_SESSION_MAX_AGE。超期则删除文件。
-    映射表的清理由 supervisor 侧在 dispatch 时懒过期处理。
+    child_*.jsonl 空闲超过 engine.child_session.ttl_hours 就删，sessions.json 里没 reset 的 accumulate
+    子会话除外：supervisor 永久留着它的登记，下次委派过去要接着这份历史。没登记的（dream、记忆提取这类
+    系统子会话）、fresh / fork、已 reset 的照旧按时间删；登记表在却读不懂时，这一轮一个子会话都不删。
 
-    入口分支同理：merge 后由 supervisor 删，但进程崩在半路就会留下一个 fork 自
-    父会话的全量副本，没有别的清理者。
+    入口分支 merge 后由 supervisor 删，但进程崩在半路就会留下一个 fork 自父会话的全量副本，没有别的清理者。
     """
     conv_dir = DATA_DIR / "conversations"
     if not conv_dir.exists():
         return
-    cutoff = time.time() - CHILD_SESSION_MAX_AGE
-    deleted = 0
-    for p in [*conv_dir.glob("child_*.jsonl"), *conv_dir.glob("branch_*.jsonl")]:
+    now = time.time()
+    ttl_hours = _child_session_ttl_hours()
+    child_cutoff = now - ttl_hours * 3600
+    expired_children = _expired_files(conv_dir, "child_*.jsonl", child_cutoff)
+    retained: set[str] | None = set()
+    if expired_children:
         try:
-            if p.is_file() and p.stat().st_mtime < cutoff and _unlink_idle_conversation(p, cutoff):
-                deleted += 1
-        except Exception:
-            pass
-    logging.info("[child_sessions] deleted %d expired files", deleted)
+            registry = _load_session_registry()
+        except _SessionRegistryUnreadable as exc:
+            retained = None
+            logging.warning(
+                "[child_sessions] sessions.json unreadable, keeping every child_*.jsonl this round: %s", exc,
+            )
+        else:
+            retained = _retained_child_sessions(registry) if registry is not None else set()
+
+    deleted = kept = 0
+    for path in expired_children:
+        if retained is None or path.stem in retained:
+            kept += 1
+        elif _delete_idle_conversation(path, child_cutoff, "child_sessions"):
+            deleted += 1
+    branch_cutoff = now - BRANCH_CONVERSATION_MAX_AGE
+    for path in _expired_files(conv_dir, "branch_*.jsonl", branch_cutoff):
+        if _delete_idle_conversation(path, branch_cutoff, "child_sessions"):
+            deleted += 1
+    logging.info(
+        "[child_sessions] deleted %d expired files, kept %d child sessions past the ttl, ttl_hours=%d",
+        deleted, kept, ttl_hours,
+    )
 
 
 # ── 内部任务会话 JSONL cleanup ───────────────
@@ -496,19 +585,19 @@ def purge_expired_task_conversations():
         logging.info("[task_conversations] cleanup disabled")
         return
     conv_dir = DATA_DIR / "conversations"
-    sessions_path = DATA_DIR / "sessions.json"
-    if not conv_dir.exists() or not sessions_path.exists():
+    if not conv_dir.exists():
         return
     try:
-        raw = json.loads(sessions_path.read_text(encoding="utf-8"))
-    except Exception as exc:
+        registry = _load_session_registry()
+    except _SessionRegistryUnreadable as exc:
         logging.info("[task_conversations] sessions.json unreadable: %s", exc)
         return
+    if registry is None:
+        return
 
-    rows = raw.values() if isinstance(raw, dict) else raw
     session_ids = {
         str(row.get("session_id") or "").strip()
-        for row in rows
+        for row in registry.values()
         if isinstance(row, dict) and is_namespace_conversation_key(row.get("conversation_key"))
     }
     cutoff = time.time() - TASK_CONVERSATION_MAX_AGE
