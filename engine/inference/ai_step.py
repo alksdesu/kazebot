@@ -1285,13 +1285,16 @@ async def _gather_bounded(factories: list[Any], limit: int) -> list[Any]:
 
 
 async def _emit_tool_call_start(ls: _LoopState, rtc: dict[str, Any]) -> None:
+    # 事件只供展示：write_file 之类的长参数只带摘录，工具执行拿的仍是原参数
+    event_arguments, clipped = bounded_for_event(rtc["arguments"])
     # 断线重连的客户端靠 EventLog 里这条结构化事件还原工具卡片
     await ls.rctx.emit_event("tool_call_start", {
         "node_id": ls.node.id,
         "task_id": ls.rctx.task_id,
         "tool_call_id": rtc.get("id", ""),
         "tool_name": rtc["name"],
-        "arguments": rtc["arguments"],
+        "arguments": event_arguments,
+        **({"truncated_for_event": True} if clipped else {}),
     })
 
 

@@ -1,6 +1,6 @@
-"""工具输出进事件时的体积：tool_call_end 和工具任务快照只带摘录，WS 推送超限时截副本、不动事件日志里的那份。
+"""工具参数和输出进事件时的体积：tool_call_start、tool_call_end 和工具任务快照只带摘录，WS 推送超限时截副本、不动事件日志里的那份。
 
-进上下文的工具结果不受影响，那边由 engine 落盘、给带 ref 的预览。
+进上下文的工具结果和工具实际拿到的参数不受影响，结果那边由 engine 落盘、给带 ref 的预览。
 """
 from __future__ import annotations
 
@@ -176,6 +176,38 @@ class TestToolCallEndEvent:
         assert end["result"] == {"ok": True, "data": {"result": "fine"}}
 
 
+class TestToolCallStartEvent:
+    def test_long_arguments_are_excerpted_while_the_tool_gets_them_whole(self, tmp_path: Path) -> None:
+        text = _lines(20000)
+        received: list[dict[str, Any]] = []
+
+        async def write(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            received.append(args)
+            return {"ok": True, "data": {"result": "written"}}
+
+        ls = make_loop_state(tmp_path, ScriptedRegistry(tools={"write": write}))
+
+        asyncio.run(_execute_real_tools(ls, real_calls(call("write", {"path": "a.txt", "content": text}, call_id="w")), step=1))
+
+        [start] = ls.rctx.events.of("tool_call_start")
+        assert start["truncated_for_event"] is True
+        assert start["arguments"]["path"] == "a.txt"
+        assert len(start["arguments"]["content"]) <= EVENT_TEXT_CHARS + _SLACK
+        assert received[0]["content"] == text
+
+    def test_short_arguments_are_sent_untouched_and_unmarked(self, tmp_path: Path) -> None:
+        async def small(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            return {"ok": True, "data": {"result": "fine"}}
+
+        ls = make_loop_state(tmp_path, ScriptedRegistry(tools={"small": small}))
+
+        asyncio.run(_execute_real_tools(ls, real_calls(call("small", {"path": "a.txt"}, call_id="s")), step=1))
+
+        [start] = ls.rctx.events.of("tool_call_start")
+        assert "truncated_for_event" not in start
+        assert start["arguments"] == {"path": "a.txt"}
+
+
 def _state(tmp_path: Path) -> SupervisorState:
     state = SupervisorState(
         workspace_root=tmp_path,
@@ -284,3 +316,22 @@ class TestWebSocketSend:
         asyncio.run(api_module._send_ws_json(socket, event))
 
         assert json.loads(socket.sent[0]) == event
+
+    def test_oversized_arguments_stay_an_object_with_short_strings(self) -> None:
+        # 工具卡片按对象读 arguments，截成字符串卡片上就什么参数都没有了
+        event = {
+            "seq": 8,
+            "type": "tool_call_start",
+            "payload": {"tool_name": "write_file", "arguments": {"path": "a.txt", "content": "c" * 100_000}},
+        }
+        before = json.dumps(event)
+        socket = _Socket()
+
+        asyncio.run(api_module._send_ws_json(socket, event))
+
+        [sent] = socket.sent
+        arguments = json.loads(sent)["payload"]["arguments"]
+        assert arguments["path"] == "a.txt"
+        assert len(arguments["content"]) <= api_module._WS_CLIPPED_FIELD_CHARS + _SLACK
+        assert len(sent.encode("utf-8")) <= api_module._WS_MAX_EVENT_BYTES
+        assert json.dumps(event) == before

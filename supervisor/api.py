@@ -23,6 +23,7 @@ from starlette.concurrency import run_in_threadpool
 import config_layout
 from clonoth_runtime import load_workspace_env
 from engine.attachments import blocked_file_reject_reason
+from engine.tool_outputs import bounded_for_event
 from platforms.registry import conversation_key_prefix, features_module
 
 from . import provisioning, share_groups
@@ -185,8 +186,8 @@ _WS_HEARTBEAT_SEC = 30.0
 _WS_INITIAL_MESSAGE_TIMEOUT_SEC = 0.5
 
 _WS_MAX_EVENT_BYTES = 65_536  # 64 KiB soft cap for individual WS events
-# 超了上限按这个顺序截：工具卡片先读 result 里的正文，读不到再退回 raw_inline
-_WS_CLIPPED_FIELDS = ("result", "raw_inline")
+# 超了上限按这个顺序截：工具卡片先读 result 里的正文，读不到再退回 raw_inline；arguments 是 tool_call_start 带的参数
+_WS_CLIPPED_FIELDS = ("result", "raw_inline", "arguments")
 _WS_CLIPPED_FIELD_CHARS = 2000
 _OUTBOUND_REPLAY_PAGE_SIZE = 200
 _OUTBOUND_REPLAY_SCAN_SIZE = 5000
@@ -247,11 +248,18 @@ async def _send_ws_json(websocket: WebSocket, payload: dict[str, Any]) -> None:
         clipped = dict(inner)
         for key in _WS_CLIPPED_FIELDS:
             if key in clipped:
-                clipped[key] = str(clipped[key])[:_WS_CLIPPED_FIELD_CHARS] + "... [truncated for WS]"
+                clipped[key] = _clip_ws_field(key, clipped[key])
                 text = json.dumps({**payload, "payload": clipped}, ensure_ascii=False, default=str)
                 if len(text.encode("utf-8")) <= _WS_MAX_EVENT_BYTES:
                     break
     await websocket.send_text(text)
+
+
+def _clip_ws_field(key: str, value: Any) -> Any:
+    # 工具卡片按对象读 arguments，变成字符串就整块不显示了，所以只截里面的长字符串
+    if key == "arguments" and isinstance(value, (dict, list)):
+        return bounded_for_event(value, _WS_CLIPPED_FIELD_CHARS)[0]
+    return str(value)[:_WS_CLIPPED_FIELD_CHARS] + "... [truncated for WS]"
 
 
 def create_app(
