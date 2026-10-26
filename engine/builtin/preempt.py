@@ -3,7 +3,7 @@ import logging
 from copy import deepcopy
 from datetime import datetime, timezone
 from uuid import uuid4
-from engine.conversation_routing import routing_meta
+from engine.conversation_routing import render_user_input, routing_meta
 
 from typing import Any
 
@@ -154,19 +154,16 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
         })
 
     if new_attachments:
-        ls.messages.append({
-            "role": "user",
-            "content": build_multimodal_content(
-                new_instruction,
-                new_attachments,
-                workspace_root=ls.rctx.workspace_root,
-            ),
-        })
+        content: Any = build_multimodal_content(
+            new_instruction,
+            new_attachments,
+            workspace_root=ls.rctx.workspace_root,
+        )
     else:
-        ls.messages.append({"role": "user", "content": new_instruction})
+        content = new_instruction
     message_id = str(uuid4())
     timestamp = datetime.now(timezone.utc).isoformat()
-    ls.messages[-1]["_meta"] = {
+    meta = {
         **routing_meta(task_context),
         "message_id": message_id,
         "timestamp": timestamp,
@@ -174,6 +171,8 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
         "source_task_id": getattr(ls.rctx, "task_id", ""),
         **({"attachments": list(new_attachments)} if new_attachments else {}),
     }
+    # 短答要求和组装当轮输入时一样按 meta 接上，落盘的是原文：重载时同样按 meta 接，前后才一字不差
+    ls.messages.append({"role": "user", "content": render_user_input(content, meta), "_meta": meta})
 
     # 抢占注入的用户消息也要落盘，分支任务恢复或合并回主会话时才不会丢这一条
     if new_instruction or new_attachments:
@@ -188,8 +187,8 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
                     Message(
                         id=message_id,
                         role="user",
-                        # 落盘的和发给模型的是同一份内容，带图时同任务内恢复还看得到图
-                        content=deepcopy(ls.messages[-1]["content"]),
+                        # 落盘原文，带图时同任务内恢复还看得到图
+                        content=deepcopy(content),
                         message_type=MessageType.USER_INPUT,
                         created_at=timestamp,
                         meta={

@@ -62,7 +62,7 @@ from ..attachments import build_multimodal_content, payload_attachments, screen_
 from ..conversation_store import Message, MessageType
 from ..node import Node
 from .message_assembly import assemble_initial_messages
-from ..conversation_routing import concise_text, routing_meta, short_reply
+from ..conversation_routing import concise_text, render_user_input, routing_meta, short_reply, turn_input_meta
 from ..protocol import (
     TaskAction,
     ACTION_DISPATCH,
@@ -248,6 +248,9 @@ _FINAL_STEP_HINT = (
     "说明已经完成的工作、没完成的部分和原因、建议的下一步。"
 )
 STEP_LIMIT_NOTICE = "（已达到最大步数，任务到此停止）"
+# 第一步调了别的工具被拒，还剩一步改用 finish
+_SHORT_REPLY_MAX_STEPS = 2
+_SHORT_REPLY_REJECT_MESSAGE = "{tool} 没有执行：本轮是简短回应，不调用工具，要回应就直接用 finish 给出那一句。"
 
 
 def _append_tool_error(ls: _LoopState, tool_call: Any, text: str, *, tool_status: str = TOOL_BLOCKED) -> None:
@@ -390,13 +393,17 @@ def _handle_truncated_response(ls: _LoopState, resp: Any, step: int) -> TaskActi
     )
 
 
-async def _handle_tool_calls(ls: _LoopState, resp, step: int, *, final_step: bool = False) -> TaskAction | None:
+async def _handle_tool_calls(
+    ls: _LoopState, resp, step: int, *, final_step: bool = False, more_steps: bool = False,
+) -> TaskAction | None:
     """处理 tool_calls（伪工具 + 真工具）。
 
     返回 TaskAction 则退出循环；返回 None 则 continue 到下一轮。
     final_step 为真时是本任务的最后一步：finish/ask 之外的调用都不执行，只补错误结果。
+    more_steps 为真时这一步之后还有下一步：短答里只调了被拒工具的这一轮不当场收尾，留给下一步改用 finish。
     """
     ls.last_round_blocked = False
+    _short_reply_turn = short_reply(getattr(ls.rctx, "task_context", {}) or {})
     # 【方案 A 重构】伪工具改为列表按序执行，不再是 last-wins
     # 原本单标量 `pseudo_call = tc` 会导致同轮多伪工具只有最后一个生效，
     # 在 Fix 2（JSON 自由正文反向包装为 reply）后尤其危险——
@@ -423,15 +430,19 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int, *, final_step: boo
         if is_pseudo_tool_name(tc.name):
             pseudo_calls.append(tc)
         elif tc.name not in ls.allowed_real_tools:
-            logger.warning("node %s attempted unauthorized tool call: %s (allowed: %s)",
-                           ls.node.id, tc.name, ls.allowed_real_tools)
             _unauthorized_names.append(tc.name)
-            _rejected_calls.append((
-                tc,
-                f"Error: Tool '{tc.name}' is not in this node's allowed tool list. "
-                f"Use finish() to provide your output directly.",
-                TOOL_BLOCKED,
-            ))
+            if _short_reply_turn:
+                # 短答的工具表和普通任务一样完整，模型看得见这个工具：得说清是这一轮不能用，不是节点没有
+                logger.info("node %s refused tool call %s in a short reply", ls.node.id, tc.name)
+                _reject_text = _SHORT_REPLY_REJECT_MESSAGE.format(tool=tc.name)
+            else:
+                logger.warning("node %s attempted unauthorized tool call: %s (allowed: %s)",
+                               ls.node.id, tc.name, ls.allowed_real_tools)
+                _reject_text = (
+                    f"Error: Tool '{tc.name}' is not in this node's allowed tool list. "
+                    f"Use finish() to provide your output directly."
+                )
+            _rejected_calls.append((tc, _reject_text, TOOL_BLOCKED))
         else:
             real_tool_calls.append({
                 "id": tc.id,
@@ -535,6 +546,8 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int, *, final_step: boo
         and not real_tool_calls
         and not pseudo_calls
         and not ls.allowed_real_tools
+        # 短答清空的只是执行许可，模型看到的工具表是完整的：还有下一步就让它看着拒绝结果改用 finish
+        and not (_short_reply_turn and more_steps)
     ):
         _plain = (resp.text or "").strip()
         if _plain:
@@ -2126,10 +2139,12 @@ async def run_ai_node(
         _async_tool_status = async_result_tool_status(rctx.task_context)
         if _async_tool_status:
             _instruction_meta["tool_status"] = _async_tool_status
+        # 短答的当轮输入组装时接上了要求，得按发出去的样子认：认不出它就标不上本任务的 meta，还会往前错标别的输入
+        _shown_instruction = render_user_input(instruction, turn_input_meta(rctx.task_context))
         for message in reversed(messages):
             if message.get("role") == "user" and not message.get("_dynamic"):
                 content = message.get("content")
-                if content == instruction or isinstance(content, list):
+                if content == instruction or content == _shown_instruction or isinstance(content, list):
                     message.setdefault("_meta", {}).update(_instruction_meta)
                     break
 
@@ -2197,16 +2212,13 @@ async def run_ai_node(
     if _todo_enabled:
         openai_tools.append(_update_todos_spec())
 
-    if short_reply(rctx.task_context):
-        max_steps = min(max_steps, 2)
+    _short_reply_task = short_reply(rctx.task_context)
+    if _short_reply_task:
+        # 工具表和 system 跟普通任务一字不差，前缀缓存才接得上：只接一句的要求在当轮 user 消息里，这里只收执行许可
+        max_steps = min(max_steps, _SHORT_REPLY_MAX_STEPS)
         _allowed_real_tools = set()
         delegate_targets = []
         _todo_enabled = False
-        openai_tools = [_finish_spec()]
-        messages.append({
-            "role": "system",
-            "content": "本轮只接一句自然的简短回应，最多240字。无需工具或委派，直接用finish给出回复；不展开任务、不连续发消息。",
-        })
 
     # ---- 工具定义注入（formatter 统一处理 native/json 差异）----
     formatter = create_tool_formatter(node.tool_mode)
@@ -2268,8 +2280,8 @@ async def run_ai_node(
     if isinstance(resume_data, dict):
         _adopt_resumed_attachments(ls, resume_data)
 
-    # 步数太少的节点（含简短回应）和系统任务不做收尾，维持原逻辑
-    _wrapup_enabled = not _is_system_task and max_steps >= 3
+    # 步数太少的节点和系统任务不做收尾，维持原逻辑；短答也不做：收尾那一步会把工具表收窄成只剩 finish，前缀缓存就断了
+    _wrapup_enabled = not _is_system_task and not _short_reply_task and max_steps >= 3
 
     # ---- 推理循环 ----
     for step in range(step_count, max_steps):
@@ -2402,7 +2414,9 @@ async def run_ai_node(
                     resp = with_changes(resp, text=_stripped)
 
         if resp.tool_calls:
-            action = await _handle_tool_calls(ls, resp, step, final_step=_final_step)
+            action = await _handle_tool_calls(
+                ls, resp, step, final_step=_final_step, more_steps=step + 1 < max_steps,
+            )
             if action is None and _final_step:
                 # 整轮被 hook 拦下时（比如 finish 声称成功却没真调过工具），这一轮的正文不能当结论交付
                 action = _step_limit_wrapup(

@@ -91,8 +91,11 @@ def test_knowledge_inject_sets_existing_extra_keys_and_rebuilds_prompt(tmp_path:
 
     assert result is not None
     assert result.modified is True
-    assert ctx.extra["skill_static_messages"] == []
+    # 技能清单在静态段，命不命中都列着；命中的正文才进动态段
+    [skill_index] = ctx.extra["skill_static_messages"]
+    assert skill_index["content"].startswith("[SKILLS:INDEX]") and "- name: demo" in skill_index["content"]
     assert ctx.extra["skill_dynamic_messages"]
+    assert "Demo skill body." in ctx.extra["skill_dynamic_messages"][0]["content"]
     assert ctx.extra["memory_static_messages"]
     assert ctx.extra["memory_dynamic_messages"] == []
 

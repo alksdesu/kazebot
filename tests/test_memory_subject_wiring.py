@@ -301,12 +301,14 @@ class TestEndToEndInjection:
 
         assert not any("张三是后端负责人" in str(m.get("content") or "") for m in dynamic)
 
-    def test_a_constant_archive_entry_lands_in_the_static_block(self, tmp_path: Path) -> None:
+    def test_a_constant_archive_entry_lands_in_the_active_block(self, tmp_path: Path) -> None:
+        # 档案跟着本轮涉及的人变：进静态块的话，群里每换一个人说话，后面整段前缀缓存都失效
         self._archive(tmp_path, "UserA", [{"id": "m1", "content": "永远用中文", "constant": True}])
 
-        static, _dynamic = self._build(tmp_path, "hello", ["UserA"])
+        static, dynamic = self._build(tmp_path, "hello", ["UserA"])
 
-        assert any("永远用中文" in str(m.get("content") or "") for m in static)
+        assert any("永远用中文" in str(m.get("content") or "") for m in dynamic)
+        assert not any("永远用中文" in str(m.get("content") or "") for m in static)
 
     def test_two_peoples_archives_both_arrive(self, tmp_path: Path) -> None:
         self._archive(tmp_path, "UserA", [{"id": "a1", "content": "甲的偏好"}])

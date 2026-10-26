@@ -9,6 +9,7 @@ import pytest
 
 from engine.builtin.plaintext import PlaintextRetryHandler
 from engine.context import RunContext
+from engine.conversation_routing import with_short_reply_hint
 from engine.conversation_store import ConversationStore
 from engine.hooks.registry import HookRegistry
 from engine.inference import ai_step
@@ -50,13 +51,19 @@ def loop(monkeypatch, tmp_path):
     return SimpleNamespace(run=run, rctx=rctx, node=node, hooks=hooks, snapshots=snapshots)
 
 
-def test_hybrid_short_reply_restricts_real_loop_output_and_tools(loop):
+def test_hybrid_short_reply_restricts_real_loop_output_and_permissions(loop):
     result = asyncio.run(loop.run(ProviderResponse(ok=True, text="自然接话。" * 100)))
     assert result.action == "finish"
     assert len(result.result["text"]) <= 240
     assert result.result["attachments"] == []
-    assert [item["function"]["name"] for item in loop.snapshots[0]["tools"]] == ["finish"]
     assert not loop.snapshots[0]["allowed"] and not loop.snapshots[0]["dispatch"]
+
+    # 工具表和普通任务一字不差，前缀缓存才接得上；收掉的只是执行许可
+    loop.rctx.task_context = {"route_hints": {"topic_id": "books"}}
+    asyncio.run(loop.run(ProviderResponse(ok=True, text="普通回复")))
+    assert loop.snapshots[0]["tools"] == loop.snapshots[1]["tools"]
+    assert {"dangerous_tool", "dispatch_to_helper", "finish"} <= {item["function"]["name"] for item in loop.snapshots[0]["tools"]}
+    assert loop.snapshots[1]["allowed"] == {"dangerous_tool"} and loop.snapshots[1]["dispatch"] == {"helper"}
 
 
 def test_short_finish_does_not_send_old_generated_attachments(loop):
@@ -125,4 +132,6 @@ def test_actual_loop_keeps_all_session_topics_and_tool_pairs(loop, monkeypatch, 
     assert "shared summary" in content and "current dynamic memory" in content
     assert any(message.get("tool_call_id") == "lookup" for message in seen)
     assert any(call.get("id") == "lookup" for message in seen for call in message.get("tool_calls", []))
-    assert any(message.get("content") == "current" and message.get("_meta", {}).get("source_task_id") == "current" for message in seen)
+    # 重新组装时短答要求接在当轮输入后面；快照里的那条照原样用
+    current = "current" if snapshot else with_short_reply_hint("current")
+    assert any(message.get("content") == current and message.get("_meta", {}).get("source_task_id") == "current" for message in seen)

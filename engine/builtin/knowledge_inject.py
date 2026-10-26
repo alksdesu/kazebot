@@ -775,7 +775,8 @@ def normalize_memory_entries(
     """Map memory catalog entries to the unified knowledge-entry dictionary.
 
     *always_active* 用于按人加载的档案：那批条目的召回理由是「这轮提到了这个人」，
-    不该再要求关键词命中，也不该因为没写关键词就被丢掉。
+    不该再要求关键词命中，也不该因为没写关键词就被丢掉。写成 constant 的也进动态块，
+    预算裁剪时照样整条收下（见 _always_injected）。
     """
     # Why: memory injection should use the same pipeline as skills, but memory
     # has no discovery INDEX. How: map constant memories to constant entries,
@@ -794,10 +795,12 @@ def normalize_memory_entries(
             continue
 
         keywords = _as_string_list(raw.get("keywords"))
-        if bool(raw.get("constant", False)):
-            strategy = "constant"
-        elif always_active:
+        constant = memory_entry_constant(raw)
+        if always_active:
+            # 档案跟着本轮涉及的人变：进静态块的话，群里每换一个人说话，后面整段前缀缓存都失效
             strategy = "subject"
+        elif constant:
+            strategy = "constant"
         elif keywords:
             strategy = "keyword"
         else:
@@ -808,6 +811,7 @@ def normalize_memory_entries(
             "kind": "memory",
             "content": content,
             "strategy": strategy,
+            "constant": constant,
             "keywords": keywords,
             "compiled_keywords": list(raw.get("compiled_keywords") or []),
             "priority": _as_int(raw.get("priority"), 0),
@@ -920,10 +924,15 @@ def _classify_and_match_entries(
         # 按人加载的档案：召回理由是「这轮提到了这个人」，无需再命中关键词。
         if strategy == "subject" and kind == "memory":
             buckets["memory_active"].append(entry)
-            matched_memories.append(entry)
+            # constant 的本来就总是注入，和全局 constant 一样不记命中
+            if not _always_injected(entry):
+                matched_memories.append(entry)
             continue
 
         if strategy == "keyword":
+            # 技能清单不看本轮命中：命中的照样列着，正文另进 ACTIVE
+            if kind == "skill":
+                buckets["skill_index"].append(entry)
             scan_text = build_scan_text(instruction_text, history, int(entry.get("scan_depth") or 0))
             if match_keywords(list(entry.get("compiled_keywords") or []), scan_text):
                 if kind == "skill":
@@ -931,8 +940,6 @@ def _classify_and_match_entries(
                 elif kind == "memory":
                     buckets["memory_active"].append(entry)
                     matched_memories.append(entry)
-            elif kind == "skill":
-                buckets["skill_index"].append(entry)
             continue
 
         if strategy == "index" and kind == "skill":
@@ -944,56 +951,81 @@ def _classify_and_match_entries(
     return buckets
 
 
+def _skill_render_key(entry: dict[str, Any]) -> tuple[int, str]:
+    return int(entry.get("order") or 0), str(entry.get("id") or "")
+
+
+def _memory_render_key(entry: dict[str, Any]) -> tuple[str, str, str]:
+    # 不同人的档案可能用同一个 id：再按人、按书排，同一组人不管谁先开口都渲染成一样
+    return str(entry.get("id") or ""), str(entry.get("subject") or ""), str(entry.get("book") or "")
+
+
 def _sort_render_buckets(buckets: dict[str, list[dict[str, Any]]]) -> None:
     """Sort buckets exactly as the legacy renderers did before budgeting."""
     # Why: prompt cache stability depends on deterministic ordering. How: sort
     # skills by (order, id) and memories by id, matching the old builders.
     # Purpose: keep render order stable after moving logic into one module.
     for key in ("skill_constant", "skill_active", "skill_index"):
-        buckets[key].sort(key=lambda entry: (int(entry.get("order") or 0), str(entry.get("id") or "")))
+        buckets[key].sort(key=_skill_render_key)
     for key in ("memory_constant", "memory_active"):
-        buckets[key].sort(key=lambda entry: str(entry.get("id") or ""))
+        buckets[key].sort(key=_memory_render_key)
+
+
+def _content_chars(entries: Iterable[dict[str, Any]]) -> int:
+    return sum(len(str(entry.get("content") or "")) for entry in entries)
+
+
+def _always_injected(entry: dict[str, Any]) -> bool:
+    """按人档案里写成 constant 的条目：渲染在 [MEMORY:ACTIVE]，预算裁剪时和 constant 一样整条收下。"""
+    return entry.get("strategy") == "subject" and bool(entry.get("constant"))
+
+
+# constant 吃光预算时仍留给召回条目（命中的技能、按关键词或按人召回的记忆）的最低额度。没有这条，
+# 一条超长的常驻记忆就能让「@ 某人加载他的档案」整个功能失效，而外部只看到 bot 不记得人。
+_RECALL_FLOOR_RATIO = 0.25
+
+
+def _recall_budget(max_budget_chars: int, constant_chars: int, scope: str) -> int:
+    """constant 条目无条件收下之后留给召回条目的预算，不低于保底额度。
+
+    constant 写的是「总是注入」，让它们参与淘汰等于说话不算数；skills、memory、knowledge 三种预算都这么算。
+    """
+    budget = max(max_budget_chars - constant_chars, int(max_budget_chars * _RECALL_FLOOR_RATIO))
+    if constant_chars > max_budget_chars:
+        # 配置问题而不是运行时波动：常驻条目总量本身就超了预算，注入量注定越界。
+        logger.warning(
+            "%s budget: constant entries alone need %d chars of a %d budget; "
+            "recalled entries keep a %d char floor",
+            scope, constant_chars, max_budget_chars, budget,
+        )
+    return budget
 
 
 def _apply_skill_budget(buckets: dict[str, list[dict[str, Any]]], max_budget_chars: int) -> None:
-    """Apply the legacy skill-only budget to skill injectable buckets."""
-    # Why: knowledge.max_budget_chars=0 must use the old independent skill
-    # budget. How: select constant and active skills by priority and append
-    # rejected skills to INDEX. Purpose: preserve both injected content and
-    # discovery behavior for existing configs.
+    """skills.max_budget_chars：constant 技能整条收下，剩下的预算按 priority 分给本轮命中的技能。
+
+    挤掉的技能不再挪进索引：静态段的技能清单本来就列着它，模型需要时照样能读全文。
+    """
     if max_budget_chars <= 0:
         return
 
-    all_injectable: list[tuple[str, dict[str, Any]]] = []
-    for entry in buckets["skill_constant"]:
-        all_injectable.append(("skill_constant", entry))
-    for entry in buckets["skill_active"]:
-        all_injectable.append(("skill_active", entry))
-    all_injectable.sort(key=lambda item: int(item[1].get("priority") or 0), reverse=True)
-
-    kept_constant: list[dict[str, Any]] = []
+    recall_budget = _recall_budget(max_budget_chars, _content_chars(buckets["skill_constant"]), "skill")
     kept_active: list[dict[str, Any]] = []
     used = 0
-    for origin, entry in all_injectable:
+    for entry in sorted(buckets["skill_active"], key=lambda e: int(e.get("priority") or 0), reverse=True):
         body_len = len(str(entry.get("content") or ""))
-        if used + body_len <= max_budget_chars:
+        if used + body_len <= recall_budget:
             used += body_len
-            if origin == "skill_constant":
-                kept_constant.append(entry)
-            else:
-                kept_active.append(entry)
-        else:
-            buckets["skill_index"].append(entry)
+            kept_active.append(entry)
 
-    buckets["skill_constant"] = kept_constant
-    buckets["skill_active"] = kept_active
-    buckets["skill_constant"].sort(key=lambda entry: (int(entry.get("order") or 0), str(entry.get("id") or "")))
-    buckets["skill_active"].sort(key=lambda entry: (int(entry.get("order") or 0), str(entry.get("id") or "")))
-
-
-# constant 吃光预算时仍留给召回条目的最低额度。没有这条，一条超长的常驻记忆
-# 就能让「@ 某人加载他的档案」整个功能失效，而外部只看到 bot 不记得人。
-_MEMORY_ACTIVE_FLOOR_RATIO = 0.25
+    dropped = len(buckets["skill_active"]) - len(kept_active)
+    if dropped:
+        logger.info(
+            "skill budget dropped %d of %d matched skills (budget=%d chars)",
+            dropped, len(buckets["skill_active"]), recall_budget,
+        )
+    buckets["skill_constant"].sort(key=_skill_render_key)
+    buckets["skill_active"] = sorted(kept_active, key=_skill_render_key)
 
 
 def _subject_scores(subjects: list[str] | None) -> dict[str, int]:
@@ -1034,49 +1066,36 @@ def _apply_memory_budget(
     if max_budget_chars <= 0:
         return
 
-    # constant 条目的工具描述写的是「总是注入」，让它们参与淘汰等于说话不算数，
-    # 所以先无条件收下，剩下的预算才给按关键词/按人召回的条目分。
-    kept_constant = list(buckets["memory_constant"])
-    constant_chars = sum(len(str(entry.get("content") or "")) for entry in kept_constant)
-    active_budget = max(
-        max_budget_chars - constant_chars,
-        int(max_budget_chars * _MEMORY_ACTIVE_FLOOR_RATIO),
+    # constant 条目（含按人档案里写成 constant、渲染在 ACTIVE 的）先无条件收下，
+    # 剩下的预算才给按关键词/按人召回的条目分。
+    pinned = [entry for entry in buckets["memory_active"] if _always_injected(entry)]
+    candidates = [entry for entry in buckets["memory_active"] if not _always_injected(entry)]
+    active_budget = _recall_budget(
+        max_budget_chars, _content_chars(buckets["memory_constant"]) + _content_chars(pinned), "memory",
     )
-    if constant_chars > max_budget_chars:
-        # 配置问题而不是运行时波动：常驻记忆总量本身就超了预算，注入量注定越界。
-        logger.warning(
-            "memory budget: constant entries alone need %d chars of a %d budget; "
-            "recalled entries keep a %d char floor",
-            constant_chars, max_budget_chars, active_budget,
-        )
 
     scores = _subject_scores(subjects)
     kept_active: list[dict[str, Any]] = []
     used = 0
-    dropped = 0
     # 按优先级降序、装不下即停：旧实现是 first-fit（跳过装不下的继续往后找），
     # 于是一条高优先级的长记忆会被丢掉，换三条无关紧要的短记忆进来。
-    for entry in sorted(
-        buckets["memory_active"], key=lambda e: _memory_budget_rank(e, scores), reverse=True,
-    ):
+    for entry in sorted(candidates, key=lambda e: _memory_budget_rank(e, scores), reverse=True):
         body_len = len(str(entry.get("content") or ""))
         if used + body_len > active_budget:
-            dropped = len(buckets["memory_active"]) - len(kept_active)
             break
         used += body_len
         kept_active.append(entry)
 
+    dropped = len(candidates) - len(kept_active)
     if dropped:
         # 记忆没有 INDEX 兜底，被丢掉就是彻底隐形，至少让日志能对上账。
         logger.info(
             "memory budget dropped %d of %d active entries (budget=%d chars)",
-            dropped, len(buckets["memory_active"]), active_budget,
+            dropped, len(candidates), active_budget,
         )
 
-    buckets["memory_constant"] = kept_constant
-    buckets["memory_active"] = kept_active
-    buckets["memory_constant"].sort(key=lambda entry: str(entry.get("id") or ""))
-    buckets["memory_active"].sort(key=lambda entry: str(entry.get("id") or ""))
+    buckets["memory_constant"].sort(key=_memory_render_key)
+    buckets["memory_active"] = sorted([*pinned, *kept_active], key=_memory_render_key)
 
 
 def _apply_global_budget(
@@ -1084,7 +1103,11 @@ def _apply_global_budget(
     max_budget_chars: int,
     subjects: list[str] | None = None,
 ) -> None:
-    """Apply one priority-sorted budget pool across skills and memories."""
+    """Apply one priority-sorted budget pool across skills and memories.
+
+    constant 的技能和记忆（含按人档案里的 constant）和独立预算一样先整条收下，
+    剩下的召回条目在同一个池子里竞争；挤掉的技能不再挪进索引，静态段的技能清单本来就列着它。
+    """
     # Why: Phase 3 requires high-priority memories and skills to compete in one
     # pool. How: rank all injectable entries by priority while remembering their
     # render bucket, then restore kept entries to their original labels. Purpose:
@@ -1092,57 +1115,64 @@ def _apply_global_budget(
     if max_budget_chars <= 0:
         return
 
-    all_injectable: list[tuple[str, dict[str, Any]]] = []
+    pinned = [entry for entry in buckets["memory_active"] if _always_injected(entry)]
+    recall_budget = _recall_budget(
+        max_budget_chars,
+        _content_chars(buckets["skill_constant"]) + _content_chars(buckets["memory_constant"]) + _content_chars(pinned),
+        "knowledge",
+    )
+
+    candidates: list[tuple[str, dict[str, Any]]] = []
     # Why: equal-priority ties need deterministic behavior. How: start from the
     # prompt render order before the stable priority sort. Purpose: avoid random
     # output while still making priority the only cross-kind ranking key.
-    for bucket_name in ("skill_constant", "memory_constant", "skill_active", "memory_active"):
-        for entry in buckets[bucket_name]:
-            all_injectable.append((bucket_name, entry))
+    for entry in buckets["skill_active"]:
+        candidates.append(("skill_active", entry))
+    for entry in buckets["memory_active"]:
+        if not _always_injected(entry):
+            candidates.append(("memory_active", entry))
     scores = _subject_scores(subjects)
-    # constant 排在同优先级的 active 之前，再按本轮涉及谁、最后按新旧 —— 与独立
-    # memory 预算用同一套判据，两条路径不能对「谁该留」给出不同答案。
-    all_injectable.sort(
-        key=lambda item: (
-            int(item[1].get("priority") or 0),
-            1 if item[0].endswith("_constant") else 0,
-            *_memory_budget_rank(item[1], scores)[1:],
-        ),
-        reverse=True,
-    )
+    # 按优先级、本轮涉及谁、新旧排 —— 与独立 memory 预算用同一套判据，两条路径不能对「谁该留」给出不同答案。
+    candidates.sort(key=lambda item: _memory_budget_rank(item[1], scores), reverse=True)
 
-    kept: dict[str, list[dict[str, Any]]] = {
-        "skill_constant": [],
-        "skill_active": [],
-        "memory_constant": [],
-        "memory_active": [],
-    }
+    kept: dict[str, list[dict[str, Any]]] = {"skill_active": [], "memory_active": list(pinned)}
     used = 0
-    for origin, entry in all_injectable:
+    kept_count = 0
+    for origin, entry in candidates:
         body_len = len(str(entry.get("content") or ""))
-        if used + body_len <= max_budget_chars:
+        if used + body_len <= recall_budget:
             used += body_len
             kept[origin].append(entry)
-        elif origin.startswith("skill_"):
-            # Why: over-budget skill bodies used to remain discoverable through
-            # SKILLS:INDEX. How: append rejected injectable skills to the index
-            # bucket. Purpose: global budgeting does not hide skill metadata.
-            buckets["skill_index"].append(entry)
+            kept_count += 1
 
-    for bucket_name, entries in kept.items():
-        buckets[bucket_name] = entries
-    buckets["skill_constant"].sort(key=lambda entry: (int(entry.get("order") or 0), str(entry.get("id") or "")))
-    buckets["skill_active"].sort(key=lambda entry: (int(entry.get("order") or 0), str(entry.get("id") or "")))
-    buckets["memory_constant"].sort(key=lambda entry: str(entry.get("id") or ""))
-    buckets["memory_active"].sort(key=lambda entry: str(entry.get("id") or ""))
+    dropped = len(candidates) - kept_count
+    if dropped:
+        logger.info(
+            "knowledge budget dropped %d of %d recalled entries (budget=%d chars)",
+            dropped, len(candidates), recall_budget,
+        )
+    buckets["skill_constant"].sort(key=_skill_render_key)
+    buckets["memory_constant"].sort(key=_memory_render_key)
+    buckets["skill_active"] = sorted(kept["skill_active"], key=_skill_render_key)
+    buckets["memory_active"] = sorted(kept["memory_active"], key=_memory_render_key)
+
+
+SKILL_INDEX_NOTE = (
+    "以下是可按需读取的 skill。本轮命中的正文会出现在 [SKILLS:ACTIVE] 里；"
+    "没出现而当前任务需要的，可通过 read_file 读取对应 path 的全文。"
+)
 
 
 def _render_skill_messages(
     constant_skills: list[dict[str, Any]],
     dynamic_skills: list[dict[str, Any]],
-    index_only_skills: list[dict[str, Any]],
+    index_skills: list[dict[str, Any]],
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    """Render skill buckets using the legacy SKILLS tags."""
+    """constant 技能的正文和技能清单进静态段，本轮命中的正文进动态段。
+
+    清单列这个节点能用的全部 normal 技能，不看本轮命中也不看预算，只随技能文件和节点的
+    skills 访问规则变：静态段这样才能逐字节稳定，留在缓存前缀里。
+    """
     # Why: callers and tests depend on exact SKILLS tag names and section
     # structure. How: copy the old renderer's joins and header strings while
     # reading unified entry fields. Purpose: make the refactor output-compatible.
@@ -1157,28 +1187,21 @@ def _render_skill_messages(
         parts.append("\n[/SKILLS:CONSTANT]")
         static_msgs.append({"role": "system", "content": "\n".join(parts)})
 
-    dynamic_parts: list[str] = []
+    if index_skills:
+        index_parts: list[str] = ["[SKILLS:INDEX]", SKILL_INDEX_NOTE]
+        for entry in index_skills:
+            index_parts.append(f"- name: {entry['id']}")
+            index_parts.append(f"  description: {_short_text(str(entry.get('description') or ''))}")
+            index_parts.append(f"  path: {entry.get('path') or ''}")
+        index_parts.append("[/SKILLS:INDEX]")
+        static_msgs.append({"role": "system", "content": "\n".join(index_parts)})
+
     if dynamic_skills:
-        dynamic_parts.append("[SKILLS:ACTIVE]")
+        dynamic_parts: list[str] = ["[SKILLS:ACTIVE]"]
         for entry in dynamic_skills:
             dynamic_parts.append(f"\n## Skill: {entry['id']}\n")
             dynamic_parts.append(str(entry.get("content") or ""))
         dynamic_parts.append("\n[/SKILLS:ACTIVE]")
-
-    if index_only_skills:
-        if dynamic_parts:
-            dynamic_parts.append("")
-        dynamic_parts.append("[SKILLS:INDEX]")
-        dynamic_parts.append(
-            "以下 skill 未被激活。如果当前任务需要，可通过 read_file 读取对应 path 的全文。"
-        )
-        for entry in index_only_skills:
-            dynamic_parts.append(f"- name: {entry['id']}")
-            dynamic_parts.append(f"  description: {_short_text(str(entry.get('description') or ''))}")
-            dynamic_parts.append(f"  path: {entry.get('path') or ''}")
-        dynamic_parts.append("[/SKILLS:INDEX]")
-
-    if dynamic_parts:
         dynamic_msgs.append({"role": "system", "content": "\n".join(dynamic_parts)})
 
     return static_msgs, dynamic_msgs
@@ -2222,9 +2245,11 @@ def _rebuild_prompt_messages(ctx: Any) -> None:
     call in the unified module and read the unchanged ctx.extra key names.
     Purpose: preserve the existing prompt layout while removing the old modules.
     """
+    from engine.conversation_routing import turn_input_meta
     from engine.inference.message_assembly import assemble_messages_with_injections
     from engine.output_guide import OUTPUT_GUIDE_KEY
 
+    task_context = getattr(ctx.rctx, "task_context", None) or {}
     rebuilt, is_block_mode = assemble_messages_with_injections(
         workspace_root=ctx.rctx.workspace_root,
         system_prompt=list(ctx.extra.get("system_prompt") or []),
@@ -2235,7 +2260,8 @@ def _rebuild_prompt_messages(ctx: Any) -> None:
         skill_dynamic=list(ctx.extra.get("skill_dynamic_messages") or []),
         memory_static=list(ctx.extra.get("memory_static_messages") or []),
         memory_dynamic=list(ctx.extra.get("memory_dynamic_messages") or []),
-        output_guide=(getattr(ctx.rctx, "task_context", None) or {}).get(OUTPUT_GUIDE_KEY),
+        output_guide=task_context.get(OUTPUT_GUIDE_KEY),
+        turn_meta=turn_input_meta(task_context),
     )
     ctx.messages[:] = rebuilt
     ctx.extra["is_block_mode"] = is_block_mode

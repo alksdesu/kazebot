@@ -1,6 +1,16 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
+
+from .conversation_store import MessageType
+
+SHORT_REPLY = "short_reply"
+SHORT_REPLY_MAX_CHARS = 240
+# 和适配层的插话尾句同在一条 user 消息里：只说怎么交付，不替模型决定开不开口
+SHORT_REPLY_HINT = (
+    f"（本轮是简短回应：要说就只接一句自然的话，最多 {SHORT_REPLY_MAX_CHARS} 字，直接用 finish 给出；"
+    "不展开任务，不调用工具查资料，不委派，也不连续发消息。）"
+)
 
 
 def routing_meta(context: dict[str, Any]) -> dict[str, Any]:
@@ -24,10 +34,57 @@ def topic_history(history: list[dict[str, Any]], topic_id: str, *, current_task_
 
 
 def short_reply(context: dict[str, Any]) -> bool:
-    return routing_meta(context).get("response_action") == "short_reply"
+    return routing_meta(context).get("response_action") == SHORT_REPLY
 
 
-def concise_text(text: str, limit: int = 240) -> str:
+def turn_input_meta(context: dict[str, Any] | None) -> dict[str, Any]:
+    """当轮用户输入落盘时带的 meta 里决定它怎么渲染的那几项，取法和 runner 落盘时一致。"""
+    ctx = context if isinstance(context, dict) else {}
+    meta = routing_meta(ctx)
+    meta["message_type"] = str(ctx.get("inbound_message_type") or "").strip() or MessageType.USER_INPUT
+    return meta
+
+
+def is_short_reply_input(meta: Any) -> bool:
+    """短答任务里的那句用户输入。同一任务的助手消息和工具结果也带着这个路由标记，所以只认 user_input。"""
+    if not isinstance(meta, Mapping):
+        return False
+    return meta.get("response_action") == SHORT_REPLY and meta.get("message_type") == MessageType.USER_INPUT
+
+
+def with_short_reply_hint(content: Any) -> Any:
+    """在用户输入末尾接上短答要求；已经接过的原样返回，同一条消息渲染几次都只有一份。"""
+    if isinstance(content, str):
+        if content.endswith(SHORT_REPLY_HINT):
+            return content
+        return f"{content}\n\n{SHORT_REPLY_HINT}" if content.strip() else SHORT_REPLY_HINT
+    if isinstance(content, list):
+        last = content[-1] if content else None
+        if isinstance(last, dict) and last.get("type") == "text" and last.get("text") == SHORT_REPLY_HINT:
+            return content
+        return [*content, {"type": "text", "text": SHORT_REPLY_HINT}]
+    return content
+
+
+def render_user_input(content: Any, meta: Any) -> Any:
+    """用户输入发给模型的样子只由正文和它落盘的 meta 决定：当轮发出去的和之后从存储重载的逐字相同。"""
+    return with_short_reply_hint(content) if is_short_reply_input(meta) else content
+
+
+def render_history_inputs(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按各自的 meta 渲染历史里的用户输入；要改的换成浅拷贝，传进来的消息不动。"""
+    rendered: list[dict[str, Any]] = []
+    for message in history:
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
+            shown = render_user_input(content, message.get("_meta"))
+            if shown is not content:
+                message = {**message, "content": shown}
+        rendered.append(message)
+    return rendered
+
+
+def concise_text(text: str, limit: int = SHORT_REPLY_MAX_CHARS) -> str:
     text = text.strip()
     if len(text) <= limit:
         return text

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from ..attachments import build_multimodal_content
+from ..conversation_routing import render_history_inputs, render_user_input, turn_input_meta
 from ..node import Node
 from ..output_guide import OUTPUT_GUIDE_KEY, static_guide_messages, turn_guide_parts
 from ..prompt import assemble_prompt
@@ -36,6 +37,22 @@ def _conversational_history(history: list[dict[str, Any]]) -> list[dict[str, Any
     return result
 
 
+def _turn_input_message(
+    workspace_root: Path,
+    instruction: str,
+    attachments: list[dict[str, Any]] | None,
+    turn_meta: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """当轮用户输入，按它落盘时会带的 meta 渲染；instruction 和附件都为空时没有这一条。"""
+    if attachments:
+        content: Any = build_multimodal_content(instruction, attachments, workspace_root=workspace_root)
+    elif instruction:
+        content = instruction
+    else:
+        return None
+    return {"role": "user", "content": render_user_input(content, turn_meta)}
+
+
 def assemble_messages_with_injections(
     *,
     workspace_root: Path,
@@ -48,6 +65,7 @@ def assemble_messages_with_injections(
     memory_static: list[dict[str, Any]] | None = None,
     memory_dynamic: list[dict[str, Any]] | None = None,
     output_guide: dict[str, Any] | None = None,
+    turn_meta: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Lay out prompt messages using precomputed skill and memory injections.
 
@@ -57,6 +75,9 @@ def assemble_messages_with_injections(
     placement rules in this shared helper and pass precomputed static/dynamic
     injection messages into it. Purpose: allow before_prompt_build hooks to own
     skill and memory construction while preserving byte-level prompt layout.
+
+    turn_meta 是当轮输入落盘时会带的 meta（turn_input_meta 算出）。历史里的用户输入按各自的 meta、
+    当轮输入按它渲染，同一条输入当轮发出去的和之后重载的才一字不差。
     """
     skill_static = list(skill_static or [])
     skill_dynamic = list(skill_dynamic or [])
@@ -64,6 +85,7 @@ def assemble_messages_with_injections(
     memory_dynamic = list(memory_dynamic or [])
     guide_static = static_guide_messages(output_guide)
     guide_turn = turn_guide_parts(output_guide)
+    rendered_history = render_history_inputs(history)
 
     # ---- Prompt cache friendly layout ----
     # Detect block list mode: assemble_prompt returns blocks with {role: history}
@@ -109,7 +131,7 @@ def assemble_messages_with_injections(
         messages.extend(guide_static)
 
         # --- Conversation history ---
-        messages.extend(history)
+        messages.extend(rendered_history)
 
         # 如果 history 末尾就是当前 instruction，先 pop 掉（后面统一追加在 dynamic 之后）
         _last = history[-1] if history else None
@@ -147,10 +169,9 @@ def assemble_messages_with_injections(
         # Step 2（2026-04-16）：主节点 ConversationStore resume 场景下 runner 会把
         # instruction 和 attachments 清空，此时不追加末尾 user 消息，避免与 JSONL
         # 中已有的原 instruction 重复。
-        if attachments:
-            messages.append({"role": "user", "content": build_multimodal_content(instruction, attachments, workspace_root=workspace_root)})
-        elif instruction:
-            messages.append({"role": "user", "content": instruction})
+        _turn_input = _turn_input_message(workspace_root, instruction, attachments, turn_meta)
+        if _turn_input is not None:
+            messages.append(_turn_input)
 
         # --- Depth blocks (insert from highest depth to lowest) ---
         if _depth_blocks:
@@ -177,7 +198,7 @@ def assemble_messages_with_injections(
         messages.extend(guide_static)
 
         # --- history ---
-        messages.extend(history)
+        messages.extend(rendered_history)
 
         # 如果 history 末尾就是当前 instruction，先 pop 掉（后面统一追加在 dynamic 之后）
         _last = history[-1] if history else None
@@ -213,10 +234,9 @@ def assemble_messages_with_injections(
         # Step 2（2026-04-16）：主节点 ConversationStore resume 场景下 runner 会把
         # instruction 和 attachments 清空，此时不追加末尾 user 消息，避免与 JSONL
         # 中已有的原 instruction 重复。
-        if attachments:
-            messages.append({"role": "user", "content": build_multimodal_content(instruction, attachments, workspace_root=workspace_root)})
-        elif instruction:
-            messages.append({"role": "user", "content": instruction})
+        _turn_input = _turn_input_message(workspace_root, instruction, attachments, turn_meta)
+        if _turn_input is not None:
+            messages.append(_turn_input)
 
     return messages, _is_block_mode
 
@@ -251,5 +271,6 @@ def assemble_initial_messages(
         instruction=instruction,
         attachments=attachments,
         output_guide=(task_context or {}).get(OUTPUT_GUIDE_KEY),
+        turn_meta=turn_input_meta(task_context),
     )
     return messages, is_block_mode, system_prompt

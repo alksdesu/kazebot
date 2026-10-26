@@ -408,13 +408,14 @@ class TestSubjectMemoryLoading:
 
         assert [e["subject"] for e in entries] == ["UserB", "UserA"]
 
-    def test_constant_entries_keep_their_strategy(self, tmp_path: Path) -> None:
+    def test_constant_entries_load_as_pinned_subject_entries(self, tmp_path: Path) -> None:
+        # 进动态块、预算里不淘汰：档案随说话的人换，进静态块会让前缀缓存失效
         _enroll(tmp_path, "UserA")
         _write_subject_memory(tmp_path, "UserA", [_entry("m1", constant=True)])
 
         entries = _load_subject_memory_entries(tmp_path, {"memory_hints": {"subjects": ["UserA"]}})
 
-        assert [e["strategy"] for e in entries] == ["constant"]
+        assert [(e["strategy"], e["constant"]) for e in entries] == [("subject", True)]
 
 
 class TestScanDepthDefault:

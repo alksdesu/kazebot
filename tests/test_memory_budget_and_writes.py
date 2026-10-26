@@ -208,7 +208,8 @@ class TestGlobalBudgetAgrees:
         assert [e["id"] for e in buckets["memory_constant"]] == ["always"]
         assert buckets["memory_active"] == []
 
-    def test_priority_remains_the_top_level_key(self) -> None:
+    def test_a_constant_is_kept_even_against_a_higher_priority_entry(self) -> None:
+        # 和独立 memory 预算一样：constant 写的是「总是注入」，不参与淘汰
         buckets = self._global(
             memory_constant=[_entry("always", 150, priority=0)],
             memory_active=[_entry("urgent", 150, priority=9)],
@@ -216,8 +217,18 @@ class TestGlobalBudgetAgrees:
 
         _apply_global_budget(buckets, 200, None)
 
+        assert [e["id"] for e in buckets["memory_constant"]] == ["always"]
+        assert buckets["memory_active"] == []
+
+    def test_priority_remains_the_top_level_key_among_recalled_entries(self) -> None:
+        buckets = self._global(memory_active=[
+            _entry("low", 150, priority=0, subject="UserA"),
+            _entry("urgent", 150, priority=9),
+        ])
+
+        _apply_global_budget(buckets, 200, ["UserA"])
+
         assert [e["id"] for e in buckets["memory_active"]] == ["urgent"]
-        assert buckets["memory_constant"] == []
 
 
 class TestMemoryOwner:
