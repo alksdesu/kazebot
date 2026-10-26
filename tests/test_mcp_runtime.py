@@ -52,16 +52,16 @@ def test_call_tool_spills_large_mcp_image_content_to_attachment_path(tmp_path: P
             assert arguments == {"prompt": "cat"}
             return fake_result
 
-    @asynccontextmanager
-    async def fake_open_session(workspace_root: Path, client_id: str):
-        # Why: call_tool normally opens a network or subprocess session. How:
-        # replace it with a local async context manager. Purpose: test only the
-        # wrapper behavior that owns attachment creation.
-        assert workspace_root == tmp_path
-        assert client_id == "grok-bailai"
-        yield FakeSession()
+    # call_tool goes through the session pool, which reads the client config and connects via _connect.
+    mcp_runtime.upsert_client(tmp_path, {"id": "grok-bailai", "transport": "stdio", "command": "fake-mcp-server"})
 
-    monkeypatch.setattr(mcp_runtime, "open_session", fake_open_session)
+    @asynccontextmanager
+    async def fake_connect(plan):
+        assert plan.key == mcp_runtime._pool_key(tmp_path, "grok-bailai")
+        assert plan.client_id == "grok-bailai"
+        yield mcp_runtime._Connection(session=FakeSession())
+
+    monkeypatch.setattr(mcp_runtime, "_connect", fake_connect)
 
     result = asyncio.run(mcp_runtime.call_tool(
         tmp_path,

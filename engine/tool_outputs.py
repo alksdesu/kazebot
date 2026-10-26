@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import bisect
 import hashlib
+import json
 import logging
 import os
 import re
@@ -47,6 +48,12 @@ _UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
 _SECONDS_PER_DAY = 86400
 # 最近一轮超出保护预算时请求视图只给它的工具结果留这么多字，预览或分页再长，尾部连同下一页的位置都会被截掉
 LATEST_ROUND_VIEW_CHARS = 8000
+# 事件写进事件日志、推给控制台，只供展示：超长的字符串换成摘录，单条事件不至于带上几 MB 的工具输出
+EVENT_TEXT_CHARS = 16_000
+# 逐个字符串截完，一条工具结果在事件里按 JSON 算还超过这么多字的，是条目多的结构化结果，只留正文摘录
+EVENT_RESULT_CHARS = 64_000
+_EVENT_MAX_DEPTH = 16
+_EVENT_RESULT_KEYS = ("ok", "success", "error", "cancelled", "status")
 
 
 @dataclass(frozen=True)
@@ -361,6 +368,56 @@ def excerpt_text(text: str, budget: int) -> str:
         index, kept = pins[0]
         return f"{kept}{_cut_marker(len(text) - len(parts[index]))}"
     return _head_only(text, budget)
+
+
+def bounded_for_event(value: Any, limit: int = EVENT_TEXT_CHARS) -> tuple[Any, bool]:
+    """value 放进事件用的样子：超过 limit 字的字符串换成摘录，其余原样；没截过就是原对象。第二项表示截没截过。"""
+    return _bounded(value, limit, 0)
+
+
+def _bounded(value: Any, limit: int, depth: int) -> tuple[Any, bool]:
+    if isinstance(value, str):
+        return (excerpt_text(value, limit), True) if len(value) > limit else (value, False)
+    if not isinstance(value, (dict, list, tuple)):
+        return value, False
+    if depth >= _EVENT_MAX_DEPTH:
+        # 嵌套这么深已经没法逐层截，整段转成文本再看长短
+        dumped = json.dumps(value, ensure_ascii=False, default=str)
+        return (excerpt_text(dumped, limit), True) if len(dumped) > limit else (value, False)
+    changed = False
+    if isinstance(value, dict):
+        out: dict[Any, Any] = {}
+        for key, item in value.items():
+            out[key], clipped = _bounded(item, limit, depth + 1)
+            changed = changed or clipped
+        return (out, True) if changed else (value, False)
+    items: list[Any] = []
+    for item in value:
+        bounded, clipped = _bounded(item, limit, depth + 1)
+        items.append(bounded)
+        changed = changed or clipped
+    if not changed:
+        return value, False
+    return (tuple(items) if isinstance(value, tuple) else items), True
+
+
+def tool_result_for_event(result: Any) -> tuple[Any, bool]:
+    """工具结果放进 tool_call_end 事件用的样子：先逐个截长字符串；整体还超过 EVENT_RESULT_CHARS，
+    就只留成败标记、报错、data.result 正文和附件，结构化的条目（递归列出的目录项之类）不进事件。"""
+    bounded, clipped = bounded_for_event(result)
+    if len(json.dumps(bounded, ensure_ascii=False, default=str)) <= EVENT_RESULT_CHARS:
+        return bounded, clipped
+    if not isinstance(bounded, dict):
+        return excerpt_text(json.dumps(bounded, ensure_ascii=False, default=str), EVENT_TEXT_CHARS), True
+    data = bounded.get("data") if isinstance(bounded.get("data"), dict) else {}
+    slim: dict[str, Any] = {key: bounded[key] for key in _EVENT_RESULT_KEYS if key in bounded}
+    slim_data: dict[str, Any] = {key: data[key] for key in ("result", "attachments") if key in data}
+    slim_data["omittedForEvent"] = True
+    slim["data"] = slim_data
+    if len(json.dumps(slim, ensure_ascii=False, default=str)) > EVENT_RESULT_CHARS:
+        # 附件清单本身就超了：正文已经截过，附件只能不带
+        slim_data.pop("attachments", None)
+    return slim, True
 
 
 def inline_tool_output(

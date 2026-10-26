@@ -54,7 +54,7 @@ const DECISION_FILTERS: Array<{ value: DecisionFilter; label: string }> = [
 ];
 
 const TAB_META: Record<TabKey, { title: string; hint: string }> = {
-  read_file: { title: '读取', hint: 'read_file / list_dir / search_in_files 共用这一档。' },
+  read_file: { title: '读取', hint: 'read_file / list_dir / glob / search_in_files 共用这一档。' },
   write_file: { title: '写入', hint: 'write_file / apply_diff 共用这一档。' },
   execute_command: { title: '命令', hint: 'execute_command。先过硬拦截，再看这条命令碰了哪些路径。' },
   restart: { title: '重启', hint: 'request_restart。重启会打断所有在跑的任务。' },

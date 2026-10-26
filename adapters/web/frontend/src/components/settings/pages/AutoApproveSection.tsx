@@ -24,6 +24,7 @@ const KNOWN_TOOL_RULES: Array<Omit<ToolRule, 'risk'>> = [
   { toolName: 'read_file', label: 'read_file', description: '读取项目文件。只读操作，默认自动放行。' },
   { toolName: 'search_in_files', label: 'search_in_files', description: '搜索源码文件。只读那一半自动放行；replace 模式算写入，仍然要人点。' },
   { toolName: 'list_dir', label: 'list_dir', description: '列出目录内容。只读操作，默认自动放行。' },
+  { toolName: 'glob', label: 'glob', description: '按文件名或路径模式找文件。只读操作，默认自动放行；以前关掉过 list_dir 的，这一项跟着关。' },
   { toolName: 'execute_command', label: 'execute_command', description: '执行 Shell 命令。可能影响系统，默认需要审批。' },
   { toolName: 'write_file', label: 'write_file', description: '创建或覆盖文件。只管这一个工具，改 diff、定时任务、MCP 客户端各有各的开关。' },
   { toolName: 'apply_diff', label: 'apply_diff', description: '修改现有文件。会修改工作区，默认需要审批。' },

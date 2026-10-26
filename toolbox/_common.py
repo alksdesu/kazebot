@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+import config_layout
 from clonoth_runtime import classify_path, load_policy_config, parse_extra_roots
 from platforms.protection import secret_env_names
 
@@ -17,6 +18,8 @@ from .context import ToolContext
 _READ_CHUNK_BYTES = 64 * 1024
 # 杀掉进程组后管道应当很快关上；漏网的孙进程还攥着管道时最多再等这么久，别为它卡死。
 _KILL_GRACE_SEC = 5.0
+# 按预算截取输出时开头占的比例：报错和总结通常在结尾，结尾多留
+OUTPUT_HEAD_SHARE = 0.4
 
 
 def kill_process_group(proc: "asyncio.subprocess.Process") -> None:
@@ -40,34 +43,224 @@ def kill_process_group(proc: "asyncio.subprocess.Process") -> None:
         pass
 
 
+@dataclass(frozen=True)
+class StreamCapture:
+    """一路输出留下来的开头和结尾。dropped 是夹在中间没留的字节数，dropped_newlines 是其中的换行数。
+
+    只留开头时 tail 为空，dropped 就是开头之后的全部；head 和 tail 之间 dropped 为 0 时两段是连着的。"""
+
+    head: bytes = b""
+    tail: bytes = b""
+    dropped: int = 0
+    dropped_newlines: int = 0
+
+    @property
+    def overflow(self) -> bool:
+        return self.dropped > 0
+
+    @property
+    def data(self) -> bytes:
+        """开头和结尾直接接上；中间丢过东西时要用 join_outputs 才看得出缺口在哪。"""
+        return self.head + self.tail
+
+
 @dataclass
 class ProcessOutcome:
-    """一次子进程运行的结果。超出保留上限的输出边读边扔，只留下是否溢出的标记。"""
+    """一次子进程运行的结果。超出保留上限的输出边读边扔，只记下丢了多少。"""
 
     returncode: int | None
-    stdout: bytes = b""
-    stderr: bytes = b""
-    stdout_overflow: bool = False
-    stderr_overflow: bool = False
+    stdout_capture: StreamCapture = field(default_factory=StreamCapture)
+    stderr_capture: StreamCapture = field(default_factory=StreamCapture)
     timed_out: bool = False
     cancelled: bool = False
 
+    @property
+    def stdout(self) -> bytes:
+        return self.stdout_capture.data
 
-async def _drain(stream: asyncio.StreamReader | None, keep: int) -> tuple[bytes, bool]:
-    """读到 EOF，只留前 keep 字节。多出来的照读照扔：不读走的话子进程写满管道就会卡住。"""
+    @property
+    def stderr(self) -> bytes:
+        return self.stderr_capture.data
+
+    @property
+    def stdout_overflow(self) -> bool:
+        return self.stdout_capture.overflow
+
+    @property
+    def stderr_overflow(self) -> bool:
+        return self.stderr_capture.overflow
+
+
+def _incomplete_utf8_suffix(data: bytes) -> int:
+    """data 末尾被截成半个的 UTF-8 字符占几个字节；末尾完整时是 0。"""
+    for back in range(1, min(4, len(data)) + 1):
+        byte = data[-back]
+        if byte & 0xC0 == 0x80:
+            continue
+        if byte < 0x80:
+            return 0
+        if byte & 0xE0 == 0xC0:
+            need = 2
+        elif byte & 0xF0 == 0xE0:
+            need = 3
+        elif byte & 0xF8 == 0xF0:
+            need = 4
+        else:
+            return 0
+        return back if need > back else 0
+    return 0
+
+
+def _leading_continuations(data: bytes) -> int:
+    count = 0
+    while count < min(3, len(data)) and data[count] & 0xC0 == 0x80:
+        count += 1
+    return count
+
+
+async def _drain(stream: asyncio.StreamReader | None, head_limit: int, tail_limit: int = 0) -> StreamCapture:
+    """读到 EOF，留前 head_limit 和后 tail_limit 字节。中间的照读照扔：不读走的话子进程写满管道就会卡住。
+
+    中间丢过东西时，开头末尾和结尾开头被截成半个的 UTF-8 字符也算进丢掉的部分，两段各自都能干净地解码。"""
     if stream is None:
-        return b"", False
-    kept = bytearray()
-    overflow = False
+        return StreamCapture()
+    head = bytearray()
+    tail = bytearray()
+    dropped = 0
+    dropped_newlines = 0
     while True:
         chunk = await stream.read(_READ_CHUNK_BYTES)
         if not chunk:
-            return bytes(kept), overflow
-        room = keep - len(kept)
+            break
+        room = head_limit - len(head)
         if room > 0:
-            kept.extend(chunk[:room])
-        if len(chunk) > room:
-            overflow = True
+            head.extend(chunk[:room])
+            chunk = chunk[room:]
+        if not chunk:
+            continue
+        if tail_limit <= 0:
+            dropped += len(chunk)
+            dropped_newlines += chunk.count(b"\n")
+            continue
+        tail.extend(chunk)
+        excess = len(tail) - tail_limit
+        if excess > 0:
+            dropped += excess
+            dropped_newlines += tail.count(b"\n", 0, excess)
+            del tail[:excess]
+    if dropped and tail_limit > 0:
+        cut = _incomplete_utf8_suffix(head)
+        if cut:
+            del head[-cut:]
+            dropped += cut
+        skip = _leading_continuations(tail)
+        if skip:
+            del tail[:skip]
+            dropped += skip
+    return StreamCapture(bytes(head), bytes(tail), dropped, dropped_newlines)
+
+
+@dataclass(frozen=True)
+class _Gap:
+    """拼好的输出里一处「读取时丢了中间一段」的标记：在文本里的起止位置，以及丢了多少字节、几个换行。"""
+
+    start: int
+    end: int
+    dropped: int
+    newlines: int
+
+
+@dataclass(frozen=True)
+class JoinedOutput:
+    """stdout 后接 stderr 拼成的文本；读取时丢过的地方换成了一行标记，gaps 记着这些标记的位置。"""
+
+    text: str
+    gaps: tuple[_Gap, ...] = ()
+
+    @property
+    def dropped(self) -> int:
+        return sum(gap.dropped for gap in self.gaps)
+
+
+def _gap_marker(dropped: int, newlines: int) -> str:
+    return f"[……输出太长，中间 {dropped} 字节（{newlines} 行）没有保留；要看全部就把输出重定向到文件再分段读……]"
+
+
+def join_outputs(stdout: StreamCapture, stderr: StreamCapture) -> JoinedOutput:
+    """stdout 在前、stderr 在后，中间隔一个换行；stderr 为空时只有 stdout。按 UTF-8 解码，坏字节换成替换符。"""
+    parts: list[str] = []
+    gaps: list[_Gap] = []
+    length = 0
+
+    def append(capture: StreamCapture) -> None:
+        nonlocal length
+        if not capture.dropped:
+            piece = capture.data.decode("utf-8", errors="replace")
+            parts.append(piece)
+            length += len(piece)
+            return
+        head = capture.head.decode("utf-8", errors="replace")
+        parts.append(head)
+        length += len(head)
+        prefix = "" if not head or head.endswith("\n") else "\n"
+        marker = prefix + _gap_marker(capture.dropped, capture.dropped_newlines) + "\n"
+        gaps.append(_Gap(length, length + len(marker), capture.dropped, capture.dropped_newlines))
+        parts.append(marker)
+        length += len(marker)
+        tail = capture.tail.decode("utf-8", errors="replace")
+        parts.append(tail)
+        length += len(tail)
+
+    append(stdout)
+    if stderr.head or stderr.tail or stderr.dropped:
+        parts.append("\n")
+        length += 1
+        append(stderr)
+    return JoinedOutput("".join(parts), tuple(gaps))
+
+
+def _budget_marker(budget: int, chars: int, lines: int, dropped: int, dropped_lines: int) -> str:
+    extra = f"；读取时另丢了 {dropped} 字节（{dropped_lines} 行）" if dropped else ""
+    return f"[……按 {budget} 字符截取，中间省略了 {chars} 字符（{lines} 行）{extra}……]"
+
+
+def fit_output(output: JoinedOutput, budget: int, *, head_share: float = OUTPUT_HEAD_SHARE) -> tuple[str, int]:
+    """超过 budget 字符时只留开头约 head_share、结尾其余的部分，尽量在行边界切开，中间换成一行说明。
+
+    返回 (文本, 省略的字符数)；没超时原样返回、省略数为 0。读取时丢过的标记落进省略部分的，丢的量并进说明里。"""
+    text = output.text
+    if budget <= 0 or len(text) <= budget:
+        return text, 0
+    # 说明里每个数都按可能的最大值占位；读取时丢掉的行数可以比留下的字符还多
+    dropped_lines = max(len(text), sum(gap.newlines for gap in output.gaps))
+    reserve = len(_budget_marker(budget, len(text), len(text), output.dropped, dropped_lines)) + 2
+    body = max(2, budget - reserve)
+    head_budget = max(1, int(body * head_share))
+    tail_budget = max(1, body - head_budget)
+    newline = text.rfind("\n", 0, head_budget)
+    head_end = newline + 1 if newline + 1 >= head_budget // 2 else head_budget
+    window = len(text) - tail_budget
+    newline = text.find("\n", window)
+    tail_start = newline + 1 if newline != -1 and len(text) - newline - 1 >= tail_budget // 2 else window
+    tail_start = max(tail_start, head_end)
+    for gap in output.gaps:
+        if gap.start < head_end < gap.end:
+            head_end = gap.start
+        if gap.start < tail_start < gap.end:
+            tail_start = gap.end
+    tail_start = max(tail_start, head_end)
+    inside = [gap for gap in output.gaps if head_end <= gap.start and gap.end <= tail_start]
+    marker_chars = sum(gap.end - gap.start for gap in inside)
+    marker_newlines = sum(text.count("\n", gap.start, gap.end) for gap in inside)
+    omitted = tail_start - head_end - marker_chars
+    lines = text.count("\n", head_end, tail_start) - marker_newlines
+    marker = _budget_marker(
+        budget, omitted, lines, sum(gap.dropped for gap in inside), sum(gap.newlines for gap in inside),
+    )
+    head = text[:head_end]
+    if head and not head.endswith("\n"):
+        head += "\n"
+    return f"{head}{marker}\n{text[tail_start:]}", omitted
 
 
 async def _feed_and_collect(
@@ -103,16 +296,20 @@ async def run_process(
     timeout_sec: float,
     keep_stdout: int,
     keep_stderr: int,
+    tail_stdout: int = 0,
+    tail_stderr: int = 0,
     stdin: bytes | None = None,
     is_cancelled: Callable[[], Awaitable[bool]] | None = None,
     poll_interval: float = 0.2,
 ) -> ProcessOutcome:
-    """等进程跑完、收齐输出。
+    """等进程跑完、收齐输出：每一路留开头 keep_* 字节，tail_* 大于 0 时再留结尾这么多字节。
 
     超时、任务被取消，以及等待本身被取消（CancelledError）时都会杀掉整个进程组，
     所以调用方须以 start_new_session=True 启动进程。
     """
-    readers = asyncio.gather(_drain(proc.stdout, keep_stdout), _drain(proc.stderr, keep_stderr))
+    readers = asyncio.gather(
+        _drain(proc.stdout, keep_stdout, tail_stdout), _drain(proc.stderr, keep_stderr, tail_stderr),
+    )
     finished = asyncio.ensure_future(_feed_and_collect(proc, stdin, readers))
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(float(timeout_sec), 0.0)
@@ -120,18 +317,17 @@ async def run_process(
     async def stop(**flags: bool) -> ProcessOutcome:
         kill_process_group(proc)
         try:
-            outputs = await asyncio.wait_for(asyncio.shield(finished), timeout=_KILL_GRACE_SEC)
+            stdout, stderr = await asyncio.wait_for(asyncio.shield(finished), timeout=_KILL_GRACE_SEC)
         except Exception:
-            outputs = ((b"", False), (b"", False))
-        (stdout, stdout_overflow), (stderr, stderr_overflow) = outputs
-        return ProcessOutcome(proc.returncode, stdout, stderr, stdout_overflow, stderr_overflow, **flags)
+            stdout, stderr = StreamCapture(), StreamCapture()
+        return ProcessOutcome(proc.returncode, stdout, stderr, **flags)
 
     try:
         while True:
             done, _pending = await asyncio.wait({finished}, timeout=poll_interval)
             if finished in done:
-                (stdout, stdout_overflow), (stderr, stderr_overflow) = finished.result()
-                return ProcessOutcome(proc.returncode, stdout, stderr, stdout_overflow, stderr_overflow)
+                stdout, stderr = finished.result()
+                return ProcessOutcome(proc.returncode, stdout, stderr)
             if await _cancel_requested(is_cancelled):
                 return await stop(cancelled=True)
             if loop.time() >= deadline:
@@ -179,6 +375,21 @@ def safe_subprocess_env() -> dict[str, str]:
             env.pop(k, None)
             continue
     return env
+
+
+def display_namer(root: Path, workspace_root: Path) -> Callable[[str], str]:
+    """root 下的相对路径（/ 分隔，空串是 root 本身）在结果里怎么写：工作区里的写工作区相对路径，工作区外的写绝对路径。"""
+    # root 已经解析到底；共享组配置、多开实例的代码目录经受信链接通到工作区外，只算一次它在工作区里叫什么。
+    base = config_layout.workspace_logical_path(workspace_root, root)
+
+    def name(walk_rel: str) -> str:
+        if base is None:
+            return (root / walk_rel).as_posix() if walk_rel else root.as_posix()
+        if not walk_rel:
+            return base
+        return walk_rel if base == "." else f"{base}/{walk_rel}"
+
+    return name
 
 
 def resolve_under_root(root: Path, rel_path: str) -> Path:

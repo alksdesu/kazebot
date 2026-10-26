@@ -413,9 +413,9 @@ describe('MCP clients are edited client by client', () => {
     '',
   ].join('\n');
 
-  const created = (id: string): McpClientFormState => ({
-    id, description: '通过设置页面创建的 MCP Client。', enabled: false, transport: 'streamable_http',
-    command: '', argsText: '', envText: '', url: '', headersText: '',
+  const created = (id: string, over: Partial<McpClientFormState> = {}): McpClientFormState => ({
+    id, description: '通过设置页面创建的 MCP Client。', enabled: false, share_sessions: false, transport: 'streamable_http',
+    command: '', argsText: '', envText: '', url: '', headersText: '', ...over,
   });
 
   // 后端没写 transport 按 stdio 起，http / streamable-http 都算 streamable_http；表单跟着同一套认。
@@ -513,6 +513,65 @@ describe('MCP clients are edited client by client', () => {
     const { content } = editYamlKeys(raw, mcpClientUpdateEdits(raw, local, { ...local, envText: 'STRICT: no\nMODE: on\nWINDOW: 12:30\nNAME: 早安' }));
 
     expect(content).toBe(`${raw}    env:\n      STRICT: "no"\n      MODE: "on"\n      WINDOW: "12:30"\n      NAME: 早安\n`);
+  });
+
+  // 文件里没有 share_sessions 就是按对话隔离；后端只在为真时写这个键。
+  describe('share_sessions', () => {
+    const shares = (value: string): boolean => (
+      parseMcpClients(`clients:\n  a:\n    command: x\n    share_sessions: ${value}\n`)[0].share_sessions
+    );
+
+    // 和 clonoth_runtime.parse_bool 认同一套写法，认不出的、没写的都算不共用。
+    it('reads the value the way the backend parses switches', () => {
+      for (const value of ['true', 'True', 'yes', 'on', 'Y', '1', '"TRUE"', '" On "']) expect(shares(value)).toBe(true);
+      for (const value of ['false', 'no', 'off', '0', 'sometimes', '""', '~']) expect(shares(value)).toBe(false);
+      expect(parseMcpClients('clients:\n  a:\n    command: x\n')[0].share_sessions).toBe(false);
+    });
+
+    it('writes share_sessions: true when the box is ticked and leaves the rest of the file as it was', () => {
+      const [fs] = parseMcpClients(CLIENTS);
+
+      const edits = mcpClientUpdateEdits(CLIENTS, fs, { ...fs, share_sessions: true });
+      const { content, preserved } = editYamlKeys(CLIENTS, edits);
+
+      expect(edits).toEqual([{ path: ['clients', 'fs', 'share_sessions'], value: true }]);
+      expect(content).toBe(CLIENTS.replace('    args: ["-y", "server-fs"]\n', '    args: ["-y", "server-fs"]\n    share_sessions: true\n'));
+      expect(preserved).toBe(true);
+    });
+
+    // 取消勾选删掉这个键，不留一个 false；表单不认识的键原样留着。
+    it('removes the key when the box is unticked and keeps keys the form does not know', () => {
+      const raw = 'version: 1\nclients:\n  fs:\n    command: npx\n    share_sessions: yes   # 无状态的服务才共用\n    restart_hint: weekly\n';
+      const [fs] = parseMcpClients(raw);
+      expect(fs.share_sessions).toBe(true);
+
+      const edits = mcpClientUpdateEdits(raw, fs, { ...fs, share_sessions: false });
+
+      expect(edits).toHaveLength(1);
+      expect(edits[0].path).toEqual(['clients', 'fs', 'share_sessions']);
+      expect(edits[0].value).toBeUndefined();
+      expect(editYamlKeys(raw, edits).content).toBe('version: 1\nclients:\n  fs:\n    command: npx\n    restart_hint: weekly\n');
+    });
+
+    it('leaves a hand-written value alone when another field is edited', () => {
+      const raw = 'version: 1\nclients:\n  fs:\n    command: npx\n    share_sessions: on\n';
+      const [fs] = parseMcpClients(raw);
+
+      const edits = mcpClientUpdateEdits(raw, fs, { ...fs, description: '文件系统' });
+
+      expect(edits).toEqual([{ path: ['clients', 'fs', 'description'], value: '文件系统' }]);
+      expect(editYamlKeys(raw, edits).content).toBe(`${raw}    description: 文件系统\n`);
+    });
+
+    it('writes nothing for a new client unless the box is ticked', () => {
+      const plain = mcpClientCreateEdits(CLIENTS, created('new'));
+      const shared = mcpClientCreateEdits(CLIENTS, created('shared', { share_sessions: true }));
+
+      expect(plain[0].value).not.toHaveProperty('share_sessions');
+      expect(editYamlKeys(CLIENTS, shared).content).toBe(
+        `${CLIENTS}  shared:\n    transport: streamable_http\n    enabled: false\n    share_sessions: true\n    description: 通过设置页面创建的 MCP Client。\n    url: ""\n    headers: {}\n`,
+      );
+    });
   });
 });
 

@@ -52,20 +52,22 @@ export const DEFAULT_AUTO_APPROVE_TOOLS: Record<string, boolean> = {
   read_file: true,
   search_in_files: true,
   list_dir: true,
+  glob: true,
   execute_command: false,
   write_file: false,
   apply_diff: false,
   request_restart: false,
 };
 
-// Backend tools do not send approvals under their own name: list_dir and
-// search_in_files both request `read_file`, apply_diff requests `write_file`, and
+// Backend tools do not send approvals under their own name: list_dir, glob and
+// search_in_files all request `read_file`, apply_diff requests `write_file`, and
 // request_restart requests `restart`. A checkbox therefore only covers the operations
 // listed here, so enabling search_in_files cannot auto-allow its replace-mode write.
 // An unlisted operation always falls through to manual approval.
 export const TOOL_APPROVAL_OPERATIONS: Record<string, readonly string[]> = {
   read_file: ['read_file'],
   list_dir: ['read_file'],
+  glob: ['read_file'],
   search_in_files: ['read_file'],
   execute_command: ['execute_command'],
   write_file: ['write_file'],
@@ -142,6 +144,20 @@ function readStoredPrefs(): { stored: Partial<ClientPrefs>; migrated: boolean } 
   }
 }
 
+// A tool added to the defaults after a user saved rules starts out like the tool it resembles, so someone who
+// switched list_dir to manual approval does not find glob silently auto-approved after an upgrade.
+const INHERITED_AUTO_APPROVE_TOOLS: Readonly<Record<string, string>> = Object.freeze({ glob: 'list_dir' });
+
+export function withInheritedAutoApproveRules(stored: Record<string, boolean>): Record<string, boolean> {
+  const rules = { ...stored };
+  for (const [toolName, source] of Object.entries(INHERITED_AUTO_APPROVE_TOOLS)) {
+    if (!Object.prototype.hasOwnProperty.call(rules, toolName) && Object.prototype.hasOwnProperty.call(rules, source)) {
+      rules[toolName] = rules[source] === true;
+    }
+  }
+  return rules;
+}
+
 function mergePrefs(stored: Partial<ClientPrefs>): ClientPrefs {
   const valid = Object.fromEntries(Object.entries(stored).filter(([, value]) => value !== undefined));
   return {
@@ -149,7 +165,7 @@ function mergePrefs(stored: Partial<ClientPrefs>): ClientPrefs {
     ...valid,
     autoApproveTools: {
       ...DEFAULT_AUTO_APPROVE_TOOLS,
-      ...(stored.autoApproveTools || {}),
+      ...(stored.autoApproveTools ? withInheritedAutoApproveRules(stored.autoApproveTools) : {}),
     },
   };
 }

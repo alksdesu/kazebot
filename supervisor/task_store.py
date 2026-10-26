@@ -10,6 +10,7 @@ from typing import Any
 
 from clonoth_runtime import get_str, load_runtime_config, parse_bool
 from engine.output_guide import OUTPUT_GUIDE_KEY
+from engine.tool_outputs import bounded_for_event
 from platforms.registry import find_platform
 
 from ._helpers import _now
@@ -246,6 +247,11 @@ class TaskStoreMixin:
             slim_result.pop("dispatch_input", None)
             slim_result["dispatch_input_omitted"] = True
             payload["result"] = slim_result
+        if payload.get("kind") == TaskKind.tool.value and isinstance(payload.get("result"), dict):
+            # 工具任务结果带着整份输出（可达几 MB），快照里只存摘录：路由读活 Task 对象，只有重启回放才拿到摘录
+            bounded_result, clipped = bounded_for_event(payload["result"])
+            if clipped:
+                payload["result"] = {**bounded_result, "_event_text_clipped": True}
         # [2026-07-16] Why: task_started/task_completed/task_suspended/
         # task_resumed 等事件重复写入与 task_created 相同的 input（实测每条
         # ~1KB）How: 除 task_created 外，把 input 替换为只

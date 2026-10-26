@@ -18,7 +18,7 @@ function emptyMcpClient(id: string): McpClientFormState {
   // backend has only raw YAML endpoints for MCP clients. How: append a normalized
   // streamable_http client with empty URL and headers. Purpose: new clients can be
   // created from the list page and then completed in the right panel.
-  return { id, description: '通过设置页面创建的 MCP Client。', enabled: false, transport: 'streamable_http', command: '', argsText: '', envText: '', url: '', headersText: '' };
+  return { id, description: '通过设置页面创建的 MCP Client。', enabled: false, share_sessions: false, transport: 'streamable_http', command: '', argsText: '', envText: '', url: '', headersText: '' };
 }
 
 export const McpSettingsPage = () => {

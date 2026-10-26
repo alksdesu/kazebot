@@ -18,6 +18,7 @@ from fastapi import HTTPException
 import config_layout
 from clonoth_runtime import get_int, load_yaml_dict
 from engine.output_guide import OUTPUT_GUIDE_KEY
+from engine.tool_outputs import excerpt_text
 from supervisor.feature_auth import FeatureActor
 from supervisor.types import TaskKind
 from .inputs import fetch_url, read_document
@@ -25,6 +26,11 @@ from .models import PlanDraft, READ_ONLY_TOOLS, TERMINAL_STEPS
 from .store import ConflictError, PlanStore, plans_path
 
 log = logging.getLogger(__name__)
+
+# 读入的资料和步骤结果共用的上限：它们都会整段拼进后续处理步骤的指令
+_STEP_TEXT_MAX_CHARS = 200_000
+# 报错随每次计划更新事件发出去，留够看清原因就行
+_STEP_ERROR_MAX_CHARS = 2000
 
 
 def now() -> str:
@@ -441,8 +447,8 @@ class ExecutionService:
                     result = read_document(path, self.max_bytes, self.root)
                 else:
                     result = item["value"]
-                if not result.strip() or len(result) > 200000:
-                    raise ValueError("未提取到文字或文字超过 200000 字符，请缩小输入范围")
+                if not result.strip() or len(result) > _STEP_TEXT_MAX_CHARS:
+                    raise ValueError(f"未提取到文字或文字超过 {_STEP_TEXT_MAX_CHARS} 字符，请缩小输入范围")
                 self._set_step(plan["id"], step["id"], status="succeeded", result=result, finished_at=now())
                 return
             if step["kind"] == "artifact":
@@ -524,7 +530,13 @@ class ExecutionService:
             status = "outcome_unknown" if failed and mutating and not known_unapplied else "failed" if failed else "succeeded"
             if task_status == "cancelled" and not mutating:
                 status = "cancelled" if plan["cancel_requested"] else "failed"
-            step.update(status=status, error=error if failed else "", result=text, finished_at=now())
+            # 工具步骤的结果没经过 engine 落盘，原样存下会整段拼进后续处理步骤的指令
+            step.update(
+                status=status,
+                error=excerpt_text(error, _STEP_ERROR_MAX_CHARS) if failed else "",
+                result=excerpt_text(text, _STEP_TEXT_MAX_CHARS),
+                finished_at=now(),
+            )
             if not failed:
                 step["effect_receipt"] = {"status": "succeeded", "key": step.get("effect_key"), "task_id": task_id, "at": now()}
         self._event(self.store.mutate(plan_id, change))

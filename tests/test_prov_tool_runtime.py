@@ -6,6 +6,7 @@ import asyncio
 import importlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -26,7 +27,7 @@ if str(_ROOT) not in sys.path:
 from toolbox._common import run_process, safe_subprocess_env  # noqa: E402
 from toolbox.builtins import system as system_tool  # noqa: E402
 from toolbox.context import ToolContext  # noqa: E402
-from toolbox.registry import ToolRegistry  # noqa: E402
+from toolbox.registry import _SCRIPT_RESULT_LIMIT_CHARS, ToolRegistry  # noqa: E402
 
 
 async def _spawn(code: str, *, with_stdin: bool = False) -> asyncio.subprocess.Process:
@@ -90,6 +91,16 @@ def _write_script(root: Path, name: str, main: str, *, timeout_sec: float | None
 
 def _shell(*argv: str) -> str:
     return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+
+
+_TRUNCATED_NOTE = re.compile(r"\n\.\.\.<truncated (\d+) chars>\Z")
+
+
+def _clipped(text: str) -> tuple[str, int]:
+    """截过的 data.result 拆成 (留下的开头, 说明里写的省略字数)。"""
+    match = _TRUNCATED_NOTE.search(text)
+    assert match is not None, text[-200:]
+    return text[:match.start()], int(match.group(1))
 
 
 class TestRunProcess:
@@ -205,30 +216,37 @@ class TestScriptToolOutput:
     @pytest.mark.asyncio
     async def test_a_long_result_is_clipped_after_parsing_and_keeps_its_attachments(self, tmp_path: Path) -> None:
         # 先截 stdout 再解析的话，长结果整份解析失败、退化成纯文本，附件跟着丢。
+        size = _SCRIPT_RESULT_LIMIT_CHARS + 4000
         _write_script(tmp_path, "long_result", """
             import json, sys
             json.load(sys.stdin)
-            print(json.dumps({"ok": True, "data": {"result": "x" * 20000, "attachments": [{"path": "out.png"}]}}))
-        """)
+            print(json.dumps({"ok": True, "data": {"result": "x" * __SIZE__, "attachments": [{"path": "out.png"}]}}))
+        """.replace("__SIZE__", str(size)))
 
         result = await _execute(_registry(tmp_path), "long_result")
 
         assert result["ok"] is True
         assert result["data"]["attachments"] == [{"path": "out.png"}]
-        assert result["data"]["result"] == "x" * 16000 + "\n...<truncated 4000 chars>"
+        kept, omitted = _clipped(result["data"]["result"])
+        assert kept == "x" * len(kept)
+        assert omitted == size - len(kept)
+        assert len(result["data"]["result"]) <= _SCRIPT_RESULT_LIMIT_CHARS
 
     @pytest.mark.asyncio
     async def test_a_long_failure_stays_a_failure(self, tmp_path: Path) -> None:
+        size = _SCRIPT_RESULT_LIMIT_CHARS + 4000
         _write_script(tmp_path, "long_failure", """
             import json
-            print(json.dumps({"ok": False, "error": "quota exceeded", "data": {"result": "ERROR: " + "y" * 20000}}))
-        """)
+            print(json.dumps({"ok": False, "error": "quota exceeded", "data": {"result": "ERROR: " + "y" * __SIZE__}}))
+        """.replace("__SIZE__", str(size)))
 
         result = await _execute(_registry(tmp_path), "long_failure")
 
         assert result["ok"] is False
         assert result["error"] == "quota exceeded"
-        assert result["data"]["result"].endswith("<truncated 4007 chars>")
+        kept, omitted = _clipped(result["data"]["result"])
+        assert kept.startswith("ERROR: yyy")
+        assert omitted == len("ERROR: ") + size - len(kept)
 
     @pytest.mark.asyncio
     async def test_half_written_json_is_an_error_rather_than_a_plain_text_success(self, tmp_path: Path) -> None:
@@ -401,14 +419,15 @@ class TestToolFailuresStayInsideTheCall:
 
 class TestExecuteCommand:
     @pytest.mark.asyncio
-    async def test_large_output_is_truncated(self, tmp_path: Path) -> None:
+    async def test_large_output_is_returned_whole_for_the_engine_to_spill(self, tmp_path: Path) -> None:
         command = _shell(sys.executable, "-c", "print('x' * 200000)")
 
         result = await _execute(_registry(tmp_path), "execute_command", {"command": command, "timeout_sec": 60})
 
         assert result["ok"] is True
         assert result["data"]["returncode"] == 0
-        assert result["data"]["output"] == "x" * 12000 + "\n...<truncated>"
+        assert result["data"]["output"].rstrip("\r\n") == "x" * 200000
+        assert "truncated" not in result["data"]
 
     @pytest.mark.asyncio
     async def test_a_command_past_its_timeout_is_stopped(self, tmp_path: Path) -> None:
@@ -445,11 +464,12 @@ class TestListDirRecursive:
         assert result["ok"] is True
         section = result["data"]["results"][0]
         assert section["entries"] == [
+            {"name": ".git/", "type": "directory", "ignored": True},
             {"name": "sub/", "type": "directory"},
             {"name": "a.py", "type": "file"},
             {"name": "sub/b.py", "type": "file"},
         ]
-        assert (section["fileCount"], section["dirCount"]) == (2, 1)
+        assert (section["fileCount"], section["dirCount"]) == (2, 2)
 
     @pytest.mark.asyncio
     async def test_the_walk_runs_off_the_event_loop(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

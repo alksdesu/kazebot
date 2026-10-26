@@ -115,7 +115,8 @@ routing:
 meta:
   execute_command:
     default_timeout_sec: 90.0
-    max_output_chars: 12000
+    # 模型没传 max_output_chars 时按多少字截（开头约 40%、结尾约 60%）；0 = 不截，超长的由 engine 落盘、只给预览
+    max_output_chars: 0
     # [2026-07-14] shell 命令超过模型等待预算时应在
     # execute_command 自身的 timeout_sec 下继续运行，而不阻塞推理循环。
     # ai_step 最多等待 threshold_sec（封顶为 timeout_sec 的 80%），随后仅
@@ -202,7 +203,7 @@ supervisor:
 
 # write_file / apply_diff 写盘成功之后，按 glob 匹配改动的文件再跑的检查命令（.py/.json/.yaml/.toml 的语法检查另外内置）。
 # 每条命令和 execute_command 走同一套审批；{path} 换成工作区里的相对路径，已按 shell 转义。
-# timeout_sec 默认 30、上限 300；输出只留前 4000 字符。检查不通过只把结果附在工具结果末尾，不回滚。
+# timeout_sec 默认 30、上限 300；输出超过 4000 字符时只留开头和结尾。检查不通过只把结果附在工具结果末尾，不回滚。
 # 例：
 #   commands:
 #     - glob: "**/*.py"

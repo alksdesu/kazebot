@@ -184,6 +184,9 @@ _WS_HEARTBEAT_SEC = 30.0
 _WS_INITIAL_MESSAGE_TIMEOUT_SEC = 0.5
 
 _WS_MAX_EVENT_BYTES = 65_536  # 64 KiB soft cap for individual WS events
+# 超了上限按这个顺序截：工具卡片先读 result 里的正文，读不到再退回 raw_inline
+_WS_CLIPPED_FIELDS = ("result", "raw_inline")
+_WS_CLIPPED_FIELD_CHARS = 2000
 _OUTBOUND_REPLAY_PAGE_SIZE = 200
 _OUTBOUND_REPLAY_SCAN_SIZE = 5000
 _OUTBOUND_EVENT_TYPES = frozenset({"outbound_message", "intermediate_reply"})
@@ -237,12 +240,16 @@ async def _send_ws_json(websocket: WebSocket, payload: dict[str, Any]) -> None:
     # same explicit json.dumps path for events and ping frames. Purpose: make the
     # wire shape predictable and resilient to harmless non-string values.
     text = json.dumps(payload, ensure_ascii=False, default=str)
-    if len(text) > _WS_MAX_EVENT_BYTES:
-        # Truncate the result field in tool_call_end events to stay under the cap.
-        inner = payload.get("payload")
-        if isinstance(inner, dict) and "result" in inner:
-            inner["result"] = str(inner["result"])[:2000] + "... [truncated for WS]"
-            text = json.dumps(payload, ensure_ascii=False, default=str)
+    inner = payload.get("payload")
+    if len(text.encode("utf-8")) > _WS_MAX_EVENT_BYTES and isinstance(inner, dict):
+        # 同一个事件对象还在 EventLog 缓存和别的订阅者队列里，截断只能改副本
+        clipped = dict(inner)
+        for key in _WS_CLIPPED_FIELDS:
+            if key in clipped:
+                clipped[key] = str(clipped[key])[:_WS_CLIPPED_FIELD_CHARS] + "... [truncated for WS]"
+                text = json.dumps({**payload, "payload": clipped}, ensure_ascii=False, default=str)
+                if len(text.encode("utf-8")) <= _WS_MAX_EVENT_BYTES:
+                    break
     await websocket.send_text(text)
 
 

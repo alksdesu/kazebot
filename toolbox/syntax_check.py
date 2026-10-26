@@ -22,7 +22,7 @@ import yaml
 import config_layout
 from clonoth_runtime import load_runtime_config
 
-from ._common import request_guard, run_process, safe_subprocess_env
+from ._common import fit_output, join_outputs, request_guard, run_process, safe_subprocess_env
 from .text_files import BOM, normalize_newlines
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ _DEFAULT_COMMAND_TIMEOUT_SEC = 30.0
 _MAX_COMMAND_TIMEOUT_SEC = 300.0
 _MIN_COMMAND_TIMEOUT_SEC = 1.0
 _COMMAND_OUTPUT_CHARS = 4000
-# UTF-8 一个字符最多 4 字节：每路输出留够截到 _COMMAND_OUTPUT_CHARS 的量，多出来的边读边扔
+# UTF-8 一个字符最多 4 字节：每路输出的开头和结尾各留够截到 _COMMAND_OUTPUT_CHARS 的量，中间的边读边扔
 _BYTES_PER_CHAR = 4
 _MAX_COMMANDS_PER_EDIT = 8
 # cmd.exe 在双引号里照样展开 %VAR% 和 !VAR!，这几个字符没法安全转义
@@ -228,7 +228,7 @@ class CommandResult:
             else f"外部检查未通过：{self.command}（退出码 {self.returncode}）"
         )
         body = self.output.rstrip()
-        tail = "\n…（输出过长，已截断）" if self.truncated else ""
+        tail = "\n…（输出过长，只留了开头和结尾）" if self.truncated else ""
         return f"{head}\n{body}{tail}" if body else f"{head}{tail}"
 
 
@@ -325,17 +325,22 @@ async def _run_command(ctx: Any, spec: CheckCommand, rendered: str, *, tool_name
             start_new_session=True,
         )
         outcome = await run_process(
-            proc, timeout_sec=spec.timeout_sec, keep_stdout=keep, keep_stderr=keep, is_cancelled=ctx.check_cancelled,
+            proc,
+            timeout_sec=spec.timeout_sec,
+            keep_stdout=keep,
+            keep_stderr=keep,
+            tail_stdout=keep,
+            tail_stderr=keep,
+            is_cancelled=ctx.check_cancelled,
         )
     except Exception as exc:
         return CommandResult(spec.glob, rendered, "error", reason=f"{type(exc).__name__}: {exc}")
     if outcome.cancelled:
         return CommandResult(spec.glob, rendered, "cancelled", reason="task cancelled")
-    stdout = outcome.stdout.decode("utf-8", errors="replace")
-    stderr = outcome.stderr.decode("utf-8", errors="replace")
-    output = stdout + ("\n" + stderr if stderr else "")
-    truncated = len(output) > _COMMAND_OUTPUT_CHARS or outcome.stdout_overflow or outcome.stderr_overflow
-    output = output[:_COMMAND_OUTPUT_CHARS]
+    # 检查命令的结论和报错汇总多在结尾，超长时留头尾、去中间
+    joined = join_outputs(outcome.stdout_capture, outcome.stderr_capture)
+    output, omitted = fit_output(joined, _COMMAND_OUTPUT_CHARS)
+    truncated = bool(omitted or joined.dropped)
     if outcome.timed_out:
         return CommandResult(
             spec.glob, rendered, "timeout", output=output, truncated=truncated, timeout_sec=spec.timeout_sec,

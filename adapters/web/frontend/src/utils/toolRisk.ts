@@ -8,7 +8,7 @@ import { TONE_BOX } from '../styles/tones';
 export type RiskLevel = 'low' | 'medium' | 'high';
 
 export function inferToolRisk(toolName: string): RiskLevel {
-  if (/^(read_|list_|search_|get_|mcp_)/.test(toolName)) return 'low';
+  if (/^(read_|list_|search_|get_|mcp_)/.test(toolName) || toolName === 'glob') return 'low';
   if (/^(execute_|restart_|remote_|request_restart)/.test(toolName)) return 'high';
   if (/^(write_|apply_|delete_|create_)/.test(toolName)) return 'medium';
   return 'medium';

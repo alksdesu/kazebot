@@ -52,7 +52,7 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "meta": {
         "execute_command": {
             "default_timeout_sec": 90.0,
-            "max_output_chars": 12000,
+            "max_output_chars": 0,
             "async_upgrade": {
                 "enabled": True,
                 "threshold_sec": 60,

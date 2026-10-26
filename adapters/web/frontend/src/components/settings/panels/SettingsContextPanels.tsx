@@ -757,6 +757,7 @@ const McpEditor = ({ onReload }: EditorProps) => {
   const confirmDiscard = useUnsavedChanges(Boolean(form) && JSON.stringify(form) !== JSON.stringify(opened));
   const reload = () => { if (confirmDiscard()) onReload(); };
   const requests = useRequestGuard();
+  const shareHintId = useId();
 
   useEffect(() => {
     if (!client) return undefined;
@@ -837,6 +838,13 @@ const McpEditor = ({ onReload }: EditorProps) => {
             <input checked={form.enabled} onChange={(event) => setForm((current) => current && ({ ...current, enabled: event.target.checked }))} type="checkbox" />
             <span>enabled</span>
           </label>
+          <div className="space-y-1">
+            <label className="flex items-center gap-2">
+              <input aria-describedby={shareHintId} checked={form.share_sessions} onChange={(event) => setForm((current) => current && ({ ...current, share_sessions: event.target.checked }))} type="checkbox" />
+              <span>share_sessions：所有对话共用会话</span>
+            </label>
+            <p className="text-xs text-[var(--duties-secondary)]" id={shareHintId}>勾上后所有对话共用这个 Client 的会话，适合无状态、启动又慢的服务；有状态的服务（浏览器、记忆等）会把一个对话的状态带到别的对话。不勾时每个对话各用各的会话。改动保存后，这个 Client 已经开着的会话会全部重开。</p>
+          </div>
           <label className="block">
             <span className={labelClass}>transport</span>
             <select className={fieldClass} onChange={(event) => setForm((current) => current && ({ ...current, transport: event.target.value as McpClientFormState['transport'] }))} value={form.transport}>

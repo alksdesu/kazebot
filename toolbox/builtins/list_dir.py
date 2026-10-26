@@ -1,9 +1,7 @@
-"""list_dir — list one or more directories under workspace root.
+"""list_dir — list one or more directories under workspace root (batch ``paths``, optional recursion).
 
-Supports batch listing via ``paths`` array, optional recursive mode.
-Directories are listed first, then files, each group sorted by name.
-Ignores ``.git`` by default.
-"""
+Directories first, then files, each sorted by name; dependency, cache and build directories
+(``ignore_rules.DEFAULT_IGNORED_DIRS``) are listed by name only unless ``include_ignored`` is true."""
 from __future__ import annotations
 
 import asyncio
@@ -11,12 +9,18 @@ import os
 from pathlib import Path
 from typing import Any
 
+from clonoth_runtime import parse_bool
+
 from ..context import ToolContext
 from .._common import request_guard, resolve_and_classify, guard_external_read
+from ..ignore_rules import DEFAULT_IGNORED_DIRS
+
+IGNORED_NOTE = "（内容已省略）"
 
 
 def _list_dir_result_text(results: list[dict[str, Any]], total_files: int, total_dirs: int) -> str:
     parts: list[str] = []
+    ignored_count = 0
     for section in results:
         path = section.get("path", "?")
         fc = section.get("fileCount", 0)
@@ -31,11 +35,21 @@ def _list_dir_result_text(results: list[dict[str, Any]], total_files: int, total
                 continue
             name = entry.get("name", "")
             if entry.get("type") == "directory":
-                parts.append(f"  📁 {name if str(name).endswith('/') else str(name) + '/'}")
+                shown = name if str(name).endswith("/") else str(name) + "/"
+                if entry.get("ignored"):
+                    ignored_count += 1
+                    parts.append(f"  📁 {shown} {IGNORED_NOTE}")
+                else:
+                    parts.append(f"  📁 {shown}")
             else:
                 parts.append(f"  📄 {name}")
         parts.append("")
     parts.append(f"Total: {total_files} files, {total_dirs} dirs")
+    if ignored_count:
+        parts.append(
+            f"{ignored_count} 个依赖、缓存或构建目录只列了名字，没有展开；要看里面的内容就传 include_ignored=true，"
+            "或者直接列那个目录。"
+        )
     return "\n".join(parts)
 
 
@@ -49,15 +63,23 @@ def _empty_error_response(message: Any) -> dict[str, Any]:
     }
 
 
-_DEFAULT_IGNORE_DIRS = frozenset({".git"})
+_DEFAULT_IGNORE_DIRS = DEFAULT_IGNORED_DIRS
+_NO_IGNORED_DIRS: frozenset[str] = frozenset()
+
+
+def _directory_entry(name: str, ignored: bool) -> dict[str, Any]:
+    entry: dict[str, Any] = {"name": name, "type": "directory"}
+    if ignored:
+        entry["ignored"] = True
+    return entry
 
 
 def _list_entries_flat(
     base: Path,
     ignore_dirs: frozenset[str],
-) -> tuple[list[dict[str, str]], int, int]:
+) -> tuple[list[dict[str, Any]], int, int]:
     """Non-recursive: list immediate children. Returns (entries, fileCount, dirCount)."""
-    dirs: list[str] = []
+    dirs: list[tuple[str, bool]] = []
     files: list[str] = []
 
     try:
@@ -66,16 +88,12 @@ def _list_entries_flat(
         children = []
 
     for child in children:
-        if child.name in ignore_dirs:
-            continue
         if child.is_dir():
-            dirs.append(child.name + "/")
+            dirs.append((child.name + "/", child.name in ignore_dirs))
         elif child.is_file():
             files.append(child.name)
 
-    entries: list[dict[str, str]] = []
-    for d in dirs:
-        entries.append({"name": d, "type": "directory"})
+    entries: list[dict[str, Any]] = [_directory_entry(name, ignored) for name, ignored in dirs]
     for f in files:
         entries.append({"name": f, "type": "file"})
 
@@ -85,25 +103,27 @@ def _list_entries_flat(
 def _list_entries_recursive(
     base: Path,
     ignore_dirs: frozenset[str],
-) -> tuple[list[dict[str, str]], int, int]:
+) -> tuple[list[dict[str, Any]], int, int]:
     """Recursive: walk tree. Returns (entries, fileCount, dirCount)."""
-    dirs: list[str] = []
+    dirs: list[tuple[str, bool]] = []
     files: list[str] = []
 
-    # 边走边剪掉忽略的目录：先整棵树遍历再过滤的话，.git 里成千上万个对象也要挨个过一遍。
+    # 忽略的目录边走边剪：列出名字但不进去，先整棵树遍历再过滤的话 .git、node_modules 里成千上万个文件也要挨个过一遍。
     for root, dirnames, filenames in os.walk(base):
-        dirnames[:] = [name for name in dirnames if name not in ignore_dirs]
         rel_root = Path(root).relative_to(base)
+        kept: list[str] = []
         for name in dirnames:
-            dirs.append((rel_root / name).as_posix() + "/")
+            ignored = name in ignore_dirs
+            dirs.append(((rel_root / name).as_posix() + "/", ignored))
+            if not ignored:
+                kept.append(name)
+        dirnames[:] = kept
         for name in filenames:
-            if name in ignore_dirs or not os.path.isfile(os.path.join(root, name)):
+            if not os.path.isfile(os.path.join(root, name)):
                 continue
             files.append((rel_root / name).as_posix())
 
-    entries: list[dict[str, str]] = []
-    for d in sorted(dirs):
-        entries.append({"name": d, "type": "directory"})
+    entries: list[dict[str, Any]] = [_directory_entry(name, ignored) for name, ignored in sorted(dirs)]
     for f in sorted(files):
         entries.append({"name": f, "type": "file"})
 
@@ -122,7 +142,7 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         return _empty_error_response("no paths specified")
 
     recursive = bool(args.get("recursive", False))
-    ignore_dirs = _DEFAULT_IGNORE_DIRS
+    ignore_dirs = _NO_IGNORED_DIRS if parse_bool(args.get("include_ignored"), False) else _DEFAULT_IGNORE_DIRS
 
     # 工作区外的路径整批只送审一次。
     _external_paths: list[str] = []

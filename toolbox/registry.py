@@ -18,11 +18,15 @@ from clonoth_runtime import get_float, load_runtime_config, parse_bool
 
 from . import builtins as _builtins
 from . import edit_journal
-from ._common import ProcessOutcome, run_process
+from ._common import OUTPUT_HEAD_SHARE, ProcessOutcome, run_process
 from ._common import request_guard as _request_guard
 from ._common import safe_subprocess_env as _safe_subprocess_env
 from . import mcp_runtime
+from .builtins.execute_command import CAPTURE_HEAD_BYTES, CAPTURE_TAIL_BYTES, MAX_OUTPUT_CHARS, MIN_OUTPUT_CHARS
+from .builtins.glob_files import DEFAULT_MAX_RESULTS as _GLOB_DEFAULT_RESULTS
+from .builtins.glob_files import MAX_RESULTS_LIMIT as _GLOB_MAX_RESULTS
 from .hashline import HASHLINE
+from .ignore_rules import DEFAULT_IGNORED_DIRS, MAX_WALK_FILES
 from .tool_names import is_engine_owned_name
 
 
@@ -38,12 +42,16 @@ _MIB = 1024 * 1024
 
 # 生图工具要在调用前登记素材版本、调用后归档产物。
 _IMAGE_TOOLS = frozenset({"gpt_image_2", "gemini_image", "nai_generate", "nai_generate_from_plan"})
-# 交给模型的 data.result 上限；截的是解析出来的正文，不是 stdout，JSON 结构和附件不受影响。
-_SCRIPT_RESULT_LIMIT_CHARS = 16000
+# data.result 的保险上限：进上下文前 engine 会把超长结果落盘、只给预览，这里只防一份结果撑爆内存和事件日志。
+# 截的是解析出来的正文，不是 stdout，JSON 结构和附件不受影响。
+_SCRIPT_RESULT_LIMIT_CHARS = 1_000_000
 # 脚本 stdout 最多收这么多字节再解析；超了就整份不认，半截 JSON 解析不出来也不该当文本成功交出去。
 _SCRIPT_OUTPUT_LIMIT_BYTES = 4 * 1024 * 1024
 _SCRIPT_STDERR_LIMIT_BYTES = 64 * 1024
 _DIAGNOSTIC_CHARS = 2000
+
+_IGNORED_DIR_NAMES = ", ".join(sorted(DEFAULT_IGNORED_DIRS))
+_HEAD_PERCENT = round(OUTPUT_HEAD_SHARE * 100)
 
 
 def _describe_exception(error: BaseException) -> str:
@@ -328,14 +336,34 @@ def _with_python_path(env: dict[str, str], extra: tuple[str, ...]) -> dict[str, 
     return env
 
 
+def _truncated_note(omitted: int) -> str:
+    return f"\n...<truncated {omitted} chars>"
+
+
+def _clip_text(text: str, limit: int) -> str:
+    """超过 limit 字符时只留开头，连同末尾的截断说明一共不超过 limit；limit 连说明都放不下时只截不说明。"""
+    if len(text) <= limit:
+        return text
+    # 省略的字数不会多于全文，说明按全文长度的位数占位
+    keep = limit - len(_truncated_note(len(text)))
+    if keep < 0:
+        return text[:max(0, limit)]
+    return text[:keep] + _truncated_note(len(text) - keep)
+
+
 def _clip_result(response: dict[str, Any], limit: int = _SCRIPT_RESULT_LIMIT_CHARS) -> dict[str, Any]:
-    """只截 data.result 这段给模型看的正文，其余字段（附件、引用）原样保留。"""
+    """只截 data.result 这段给模型看的正文，其余字段（附件、引用）原样保留；data.output 是同一份正文时一起截。"""
     data = response.get("data")
     text = data.get("result") if isinstance(data, dict) else None
     if not isinstance(text, str) or len(text) <= limit:
         return response
+    shortened = _clip_text(text, limit)
+    clipped_data = {**data, "result": shortened}
+    # 纯文本脚本把同一份正文再放进 output 给旧读法用，只截 result 的话工具事件里照样带着整份
+    if data.get("output") == text:
+        clipped_data["output"] = shortened
     clipped = dict(response)
-    clipped["data"] = {**data, "result": f"{text[:limit]}\n...<truncated {len(text) - limit} chars>"}
+    clipped["data"] = clipped_data
     return clipped
 
 
@@ -533,7 +561,13 @@ class ToolRegistry:
         builtins: list[_BuiltinEntry] = [
             (
                 "list_dir",
-                "List one or more directories under workspace root. Supports batch listing and recursive mode. Ignores .git by default.",
+                "List one or more directories under workspace root (batch listing via paths, optional recursive mode). "
+                "Directories come first, then files, each sorted by name. "
+                f"Dependency, cache and build directories ({_IGNORED_DIR_NAMES}) are listed by name and marked as "
+                "omitted, without their contents, and recursive mode does not enter them; pass include_ignored=true to "
+                "list them like any other directory, or list such a directory directly. .gitignore is not applied here. "
+                "To find files by name or path pattern use glob; to search file contents use search_in_files. "
+                "Policy guarded like read_file.",
                 {
                     "type": "object",
                     "properties": {
@@ -545,6 +579,11 @@ class ToolRegistry:
                         "recursive": {
                             "type": "boolean",
                             "description": "Whether to list subdirectories recursively. Default false.",
+                        },
+                        "include_ignored": {
+                            "type": "boolean",
+                            "description": "Also list the contents of the dependency, cache and build directories that are "
+                            "otherwise shown by name only. Default false.",
                         },
                         "path": {"type": "string", "description": "(Legacy) Single directory path."},
                     },
@@ -563,7 +602,8 @@ class ToolRegistry:
                 "When a file is not shown in full, its header tells the startLine to continue from. "
                 "Images come back as multimodal attachments, binary files as their size. "
                 "Reading a text file remembers its version for this conversation: write_file, apply_diff and edit_lines refuse "
-                "to change it if it was modified after the read. Policy+approval guarded.",
+                "to change it, and search_in_files' replace mode skips it, if it was modified after the read. "
+                "Policy+approval guarded.",
                 {
                     "type": "object",
                     "properties": {
@@ -739,7 +779,7 @@ class ToolRegistry:
             ),
             (
                 "undo_edits",
-                "Undo file changes made by write_file, apply_diff and edit_lines, one task at a time. "
+                "Undo file changes made by write_file, apply_diff, edit_lines and search_in_files' replace mode, one task at a time. "
                 "Before a task first changes a file its original content is saved; undoing puts it back "
                 "(a file the task created is deleted, together with directories created for it that are now empty). "
                 "action=list shows this conversation's recent tasks, the files each changed and whether they were undone. "
@@ -777,12 +817,32 @@ class ToolRegistry:
             ),
             (
                 "execute_command",
-                "Execute a shell command in workspace root (policy+approval guarded; secrets are stripped from env).",
+                "Execute a shell command in workspace root (policy+approval guarded; secrets are stripped from env). "
+                "The result is 'returncode=N', then stdout, then stderr; a non-zero exit code is still a successful call. "
+                f"Each stream keeps its first {CAPTURE_HEAD_BYTES // 1024}KB and last {CAPTURE_TAIL_BYTES // 1024}KB and drops "
+                "the middle, with a note saying how many bytes and lines were dropped there. "
+                "Without max_output_chars everything kept is returned and the engine stores a long result, showing its head "
+                "and tail with a ref that read_tool_output pages through or searches (an instance may set a default budget in "
+                "meta.execute_command.max_output_chars). With max_output_chars the output is cut to about that many "
+                f"characters: about {_HEAD_PERCENT}% from the start and {100 - _HEAD_PERCENT}% from the end, where errors and "
+                "summaries usually are, with a note in between. timeout_sec (default meta.execute_command.default_timeout_sec, "
+                "90) is a hard limit that kills the command. When timeout_sec is longer than about a minute, the engine stops "
+                "waiting after about 60 seconds (meta.execute_command.async_upgrade): the command keeps running in the "
+                "background and its result arrives later as a new message.",
                 {
                     "type": "object",
                     "properties": {
-                        "command": {"type": "string"},
-                        "timeout_sec": {"type": "number"},
+                        "command": {"type": "string", "description": "Command line, run by the system shell in workspace root."},
+                        "timeout_sec": {
+                            "type": "number",
+                            "description": "Hard time limit in seconds; the command is killed when it is reached. Default 90.",
+                        },
+                        "max_output_chars": {
+                            "type": "integer",
+                            "description": f"Cut the returned output to about this many characters ({MIN_OUTPUT_CHARS}-"
+                            f"{MAX_OUTPUT_CHARS}), keeping about {_HEAD_PERCENT}% from the start and {100 - _HEAD_PERCENT}% "
+                            "from the end. Omit it to get everything kept; long results are stored by the engine and previewed.",
+                        },
                     },
                     "required": ["command"],
                 },
@@ -790,32 +850,109 @@ class ToolRegistry:
             ),
             (
                 "search_in_files",
-                "Search substring in files under workspace root.",
+                "Search file contents under workspace root, or replace text in them. path is a directory or a single file "
+                "(default '.'). Uses ripgrep when it is installed and a Python scan otherwise; both give the same results. "
+                "Search is case-insensitive; replace is case-sensitive. query is literal text unless isRegex=true, which "
+                "takes Python regular expression syntax. "
+                "pattern is a file glob matched against the workspace-relative path (the absolute path outside the "
+                "workspace), not against a path relative to path: without '/' it matches the file name at any depth "
+                "('*.py'); with '/' it is matched from the workspace root ('engine/**/*.py'). "
+                "Skipped: files ignored by .gitignore inside a git work tree (includeIgnored=true searches them; list_dir "
+                "spells it include_ignored and both spellings work here); dependency, cache, build and runtime data "
+                "directories such as node_modules, .venv, dist, build, conversations and logs; binary files; compiled, "
+                "database, .log, .jsonl and .min.js files; files over meta.search.max_file_size_bytes (3MB by default). "
+                "A file named in path is searched even when the rules above would skip it, unless it is binary or over "
+                "the size limit. "
+                "Search mode returns '<N> results found:' then 'file:line | match' with one line of context on each side, "
+                "at most maxResults matches (default 100) and about 50000 characters; a long scan stops early with a note. "
+                "Replace mode (mode='replace') needs replace, and an empty string deletes the matches. With isRegex=true, "
+                "$1, ${name}, $& and $0 refer to groups and $$ is a literal $; Python's \\1 and \\g<name> work too. With "
+                "isRegex=false, replace is inserted verbatim. It changes up to maxFiles files (default 50) after one "
+                "write_file approval, skips a file that changed after you read it, keeps line endings, UTF-8 BOM and "
+                "permissions, writes atomically, runs the same syntax check and edit_checks commands as write_file, and the "
+                "changes can be undone with undo_edits. Files under data/edit_journal/ are never changed. In nodes with "
+                "search_replace: false, replace mode is refused before any approval.",
                 {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string"},
+                        "query": {"type": "string", "description": "Text to find, or a regular expression when isRegex=true."},
                         "path": {"type": "string", "description": "Directory or file path to search in (relative or absolute). Supports single file. Default '.'"},
                         "mode": {"type": "string", "description": "search (default) or replace", "enum": ["search", "replace"]},
-                        "pattern": {"type": "string", "description": "file glob pattern, e.g. '*.py', '**/*.js'. Default '**/*'"},
-                        "isRegex": {"type": "boolean", "description": "treat query as regex. Default false"},
-                        "maxResults": {"type": "integer", "description": "max matches for search mode. Default 100"},
-                        "replace": {"type": "string", "description": "replacement string for replace mode. Supports $1 $2 capture groups"},
-                        "maxFiles": {"type": "integer", "description": "max files to modify in replace mode. Default 50"},
+                        "pattern": {
+                            "type": "string",
+                            "description": "File glob matched against the workspace-relative path, not relative to path: "
+                            "'*.py' (file name, any depth) or 'engine/**/*.py'. Default '**/*'",
+                        },
+                        "isRegex": {"type": "boolean", "description": "Treat query as a Python regular expression. Default false."},
+                        "includeIgnored": {
+                            "type": "boolean",
+                            "description": "Also search files ignored by .gitignore; include_ignored is accepted too. Default false.",
+                        },
+                        "maxResults": {"type": "integer", "description": "Max matches in search mode. Default 100."},
+                        "replace": {
+                            "type": "string",
+                            "description": "Replacement for replace mode, required there; an empty string deletes the matches. "
+                            "Regex mode: $1, ${name}, $&, $0 refer to groups, $$ is a literal $. Literal mode: inserted verbatim.",
+                        },
+                        "maxFiles": {"type": "integer", "description": "Max files to change in replace mode. Default 50."},
                     },
                     "required": ["query"],
                 },
                 _builtins.search_in_files,
             ),
             (
+                "glob",
+                "Find files by name or path pattern under a directory, newest first (by modification time). "
+                "Use glob to locate files by name, search_in_files to search inside files, and list_dir to see what a "
+                "directory holds. pattern is relative to path: without '/' it matches file names at any depth ('*.py'); "
+                "with '/' it matches the whole path from path ('src/**/*.ts'). '*', '?' and '[...]' stay within one "
+                "directory level, '**' spans any number of levels, '{a,b}' matches either, and a trailing '/' means every "
+                "file under that directory. Files ignored by .gitignore inside a git work tree and dependency, cache and "
+                "build directories (node_modules, .venv, dist, build, ...) are skipped and symbolic links are not followed; "
+                "the directory named in path is searched even when it is one of those, so point path into it to look inside. "
+                f"Returns at most max_results paths (default {_GLOB_DEFAULT_RESULTS}, at most {_GLOB_MAX_RESULTS}) and stops "
+                f"after walking {MAX_WALK_FILES} files. Policy guarded like read_file and list_dir.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob such as '**/*.py', '*.md' or 'src/**/test_*.py', relative to path.",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Directory to search (relative to workspace root, or absolute). Default '.'",
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": f"Max paths to return, newest first. Default {_GLOB_DEFAULT_RESULTS}, at most "
+                            f"{_GLOB_MAX_RESULTS}.",
+                        },
+                    },
+                    "required": ["pattern"],
+                },
+                _builtins.glob_files,
+            ),
+            (
                 "create_or_update_mcp_client",
-                "Create or update an MCP client config in config/mcp.yaml. Supports stdio, sse, and streamable_http transports.",
+                "Create or update an MCP client config in config/mcp.yaml. Supports stdio, sse, and streamable_http transports. "
+                "The client's entry is replaced as a whole: omitted fields go back to their defaults, except share_sessions, "
+                "which keeps its current value. Saving closes the client's open sessions in every conversation (a call in "
+                "progress finishes first), so the next call starts a new session; call reload_tools to pick up a changed tool list.",
                 {
                     "type": "object",
                     "properties": {
                         "id": {"type": "string"},
                         "description": {"type": "string"},
                         "enabled": {"type": "boolean"},
+                        "share_sessions": {
+                            "type": "boolean",
+                            "description": "true: every conversation uses the same sessions of this client. "
+                            "Default false: each conversation gets its own sessions, so a stateful server "
+                            "(browser, memory) never carries one conversation's state into another. "
+                            "Set true only for stateless servers that are slow to start. "
+                            "Omit to keep the current setting.",
+                        },
                         "transport": {"type": "string", "enum": ["stdio", "sse", "streamable_http", "streamable-http", "http"]},
                         "command": {"type": "string"},
                         "args": {"type": "array", "items": {"type": "string"}},
@@ -1138,6 +1275,8 @@ class ToolRegistry:
         """Scan enabled MCP clients and register their tools as first-class tools.
 
         整批重登：删掉或停用的客户端，它的工具这一轮就摘掉。
+        已有的 MCP 会话先全部退役（正在用的等调用结束再关），工具表从新会话里取：
+        配置没变、服务端程序改了的 stdio 服务也得换新进程才看得到。
         """
         for mcp_name, mcp_spec in self._mcp_specs.items():
             if self._tool_specs.get(mcp_name) is mcp_spec:
@@ -1145,6 +1284,10 @@ class ToolRegistry:
                 self._tool_funcs.pop(mcp_name, None)
         self._mcp_specs, self._mcp_funcs = {}, {}
         count = 0
+        try:
+            await mcp_runtime.retire_sessions(self.workspace_root)
+        except Exception:
+            log.warning("[registry] retiring MCP sessions before the rescan failed", exc_info=True)
         try:
             clients = mcp_runtime.list_clients(self.workspace_root)
         except Exception:
@@ -1192,6 +1335,10 @@ class ToolRegistry:
                     "description": f"[MCP:{cid}] {desc}" if desc else f"[MCP:{cid}] {raw_name}",
                     "input_schema": schema,
                 }
+                annotations = tool.get("annotations")
+                # 只读提示是服务端自报的；engine 按 parallel_safe 让同一轮里的这类调用并发
+                if isinstance(annotations, dict) and parse_bool(annotations.get("readOnlyHint"), False):
+                    mcp_spec["parallel_safe"] = True
                 mcp_func = _make_mcp_tool(self.workspace_root, cid, raw_name)
                 self._mcp_specs[reg_name] = mcp_spec
                 self._mcp_funcs[reg_name] = mcp_func
@@ -1223,7 +1370,38 @@ async def _call_plugin_tool(func: Any, arguments: dict[str, Any], ctx: Any) -> A
 def _make_mcp_tool(workspace_root: Path, client_id: str, tool_name: str) -> ToolFunc:
     async def _call(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         try:
-            return await mcp_runtime.call_tool(workspace_root, client_id, tool_name, args)
+            response = await mcp_runtime.call_tool(
+                workspace_root, client_id, tool_name, args, scope=mcp_runtime.session_scope(ctx),
+            )
         except Exception as e:
-            return _error_tool_response(str(e), mcp_client=client_id, mcp_tool=tool_name)
+            # 会话断开一类的异常常常没有消息文本，只给 str(e) 模型会拿到一句空的 ERROR
+            return _error_tool_response(_describe_exception(e), mcp_client=client_id, mcp_tool=tool_name)
+        return _clip_mcp_response(response)
     return _call
+
+
+def _clip_mcp_response(response: dict[str, Any]) -> dict[str, Any]:
+    """和脚本工具一样经 _clip_result 截 data.result。
+
+    同一份正文在 error（isError 时）和 data.mcp_result 的文本块里还各有一份，工具结束事件会把整份结果带上，所以一起截。
+    """
+    clipped = _clip_result(response)
+    before = response.get("data") if isinstance(response.get("data"), dict) else {}
+    after = clipped.get("data") if isinstance(clipped.get("data"), dict) else {}
+    original = before.get("result")
+    if clipped is response or not isinstance(original, str) or after.get("result") == original:
+        return clipped
+    if clipped.get("error") == original:
+        clipped["error"] = after["result"]
+    mcp_result = after.get("mcp_result")
+    if isinstance(mcp_result, dict) and isinstance(mcp_result.get("content"), list):
+        after["mcp_result"] = {**mcp_result, "content": [_clip_mcp_text_part(part) for part in mcp_result["content"]]}
+    return clipped
+
+
+def _clip_mcp_text_part(part: Any) -> Any:
+    text = part.get("text") if isinstance(part, dict) else None
+    if not isinstance(text, str):
+        return part
+    shortened = _clip_result({"data": {"result": text}})["data"]["result"]
+    return part if shortened == text else {**part, "text": shortened}

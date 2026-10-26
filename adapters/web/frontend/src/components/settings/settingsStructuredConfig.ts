@@ -31,6 +31,8 @@ export interface McpClientFormState {
   id: string;
   description: string;
   enabled: boolean;
+  /** 勾上时所有对话共用这个 Client 的会话；不勾时每个对话各用各的。 */
+  share_sessions: boolean;
   transport: 'stdio' | 'sse' | 'streamable_http';
   command: string;
   argsText: string;
@@ -351,6 +353,15 @@ function normalizeMcpTransport(value: unknown): McpTransport {
 
 const isHttpTransport = (transport: McpTransport): boolean => transport !== 'stdio';
 
+// 与 clonoth_runtime.parse_bool 认同一套写法：手写的 yes、on、1 都算开，认不出的算没开。
+const PARSE_BOOL_TRUE_WORDS = new Set(['1', 'true', 'yes', 'y', 'on']);
+
+function parseBoolFlag(value: unknown): boolean {
+  if (typeof value === 'boolean') return value;
+  if (value === null || value === undefined) return false;
+  return PARSE_BOOL_TRUE_WORDS.has(String(value).trim().toLowerCase());
+}
+
 /** 文件里的 clients 映射。没写或写成空值都算没有，和 toolbox/mcp_runtime.py 一致。 */
 function mcpClientMap(raw: string): Record<string, Record<string, any>> {
   const clients = safeLoad(raw).clients ?? {};
@@ -364,6 +375,7 @@ function mcpClientForm(id: string, spec: Record<string, any>): McpClientFormStat
     id,
     description: str(spec.description),
     enabled: spec.enabled !== false,
+    share_sessions: parseBoolFlag(spec.share_sessions),
     transport: normalizeMcpTransport(spec.transport),
     command: str(spec.command),
     argsText: Array.isArray(spec.args) ? JSON.stringify(spec.args) : '[]',
@@ -397,6 +409,8 @@ const clientPath = (id: string, ...keys: string[]): string[] => ['clients', id, 
 
 function newMcpClientSpec(form: McpClientFormState): Record<string, unknown> {
   const spec: Record<string, unknown> = { transport: form.transport, enabled: form.enabled };
+  // 只在勾上时写，和后端 upsert_client 一致：文件里没有这个键就是按对话隔离
+  if (form.share_sessions) spec.share_sessions = true;
   if (form.description) spec.description = form.description;
   if (isHttpTransport(form.transport)) {
     spec.url = form.url;
@@ -417,6 +431,8 @@ function mcpClientFieldEdits(before: McpClientFormState, after: McpClientFormSta
   const edits: YamlKeyEdit[] = [];
   if (changed('description')) edits.push({ path: at('description'), value: after.description || undefined });
   if (changed('enabled')) edits.push({ path: at('enabled'), value: after.enabled });
+  // 取消勾选就删掉这个键，不留一个 false
+  if (changed('share_sessions')) edits.push({ path: at('share_sessions'), value: after.share_sessions ? true : undefined });
   if (changed('transport')) edits.push({ path: at('transport'), value: after.transport });
   if (isHttpTransport(after.transport)) {
     if (crossed || changed('url')) edits.push({ path: at('url'), value: after.url });

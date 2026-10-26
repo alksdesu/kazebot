@@ -166,6 +166,7 @@ describe('tool risk helpers', () => {
   it('infers risk levels and returns the shared Chinese labels and badge classes', () => {
     expect(inferToolRisk('read_file')).toBe('low');
     expect(inferToolRisk('mcp_github_search_code')).toBe('low');
+    expect(inferToolRisk('glob')).toBe('low');
     expect(inferToolRisk('execute_command')).toBe('high');
     expect(inferToolRisk('request_restart')).toBe('high');
     expect(inferToolRisk('write_file')).toBe('medium');

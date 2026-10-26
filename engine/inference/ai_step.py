@@ -72,7 +72,13 @@ from ..protocol import (
     ACTION_PREEMPTED,
 )
 from ..tool_step import TOOL_CANCELLED, TOOL_ERROR, result_to_raw, summarize_result, tool_outcome
-from ..tool_outputs import READ_TOOL_OUTPUT, inline_tool_output, tool_output_limits
+from ..tool_outputs import (
+    READ_TOOL_OUTPUT,
+    bounded_for_event,
+    inline_tool_output,
+    tool_output_limits,
+    tool_result_for_event,
+)
 from ..todo_list import unfinished_summary
 from clonoth_runtime import get_int, get_float, get_bool, load_runtime_config, parse_bool
 from toolbox.context import ToolContext
@@ -1010,15 +1016,18 @@ async def _async_result_message(
 
     回传正文会注入 session_id 这个会话，超长结果也存在它名下，那边的任务才读得回来。
     """
+    limits = tool_output_limits(load_runtime_config(workspace_root) if workspace_root is not None else {})
+    # 报错也是整段进回传那一轮的上下文，超长的一样落盘换成带 ref 的预览
     if error is not None:
         failure = str(error) or type(error).__name__
-        return _async_failure_message(tool_name, async_tool_id, failure), failure, []
+        shown = await _context_tool_text(workspace_root, session_id, tool_name, failure, limits)
+        return _async_failure_message(tool_name, async_tool_id, shown), failure, []
     outcome = tool_outcome(result)
     if not outcome.ok:
-        return _async_failure_message(tool_name, async_tool_id, outcome.error, elapsed), outcome.error, []
+        shown = await _context_tool_text(workspace_root, session_id, tool_name, outcome.error, limits)
+        return _async_failure_message(tool_name, async_tool_id, shown, elapsed), outcome.error, []
     summary = summarize_result(tool_name, result, args=tool_args)
     _fmt, raw = result_to_raw(tool_name, result, tool_spec=registry.get_spec(tool_name))
-    limits = tool_output_limits(load_runtime_config(workspace_root) if workspace_root is not None else {})
     # 只换结果正文，开头的状态行要留着：finish_guard 按它认异步结果
     raw = await _context_tool_text(workspace_root, session_id, tool_name, raw, limits)
     message = (
@@ -1198,6 +1207,9 @@ async def _record_tool_result(
         "status": outcome.status,
     }
 
+    # 事件写进事件日志、推给控制台，只供展示：超长的正文只带摘录，进上下文的 entry 仍是全文
+    event_result, result_clipped = tool_result_for_event(result)
+    event_raw, raw_clipped = bounded_for_event(raw)
     # 工具报错或被取消也要发结构化的结束事件，断线重连的客户端靠 EventLog 还原工具卡片
     await ls.rctx.emit_event("tool_call_end", {
         "node_id": ls.node.id,
@@ -1206,11 +1218,11 @@ async def _record_tool_result(
         "tool_name": name,
         "status": outcome.status,
         "summary": summary,
-        # 完整结果原样带上，截不截断由下游适配器决定
-        "result": result,
-        "raw_inline": raw,
+        "result": event_result,
+        "raw_inline": event_raw,
         "format": fmt,
         "elapsed_ms": elapsed_ms,
+        **({"truncated_for_event": True} if result_clipped or raw_clipped else {}),
     })
 
     # 已取消的工具不处理附件和进度事件

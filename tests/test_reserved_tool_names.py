@@ -252,7 +252,7 @@ def test_list_active_tasks_is_gone_everywhere() -> None:
 
     assert not hasattr(tasks_module, "list_active_tasks")
     assert "list_active_tasks" not in READ_ONLY_TOOLS
-    assert READ_ONLY_TOOLS == frozenset({"read_file", "list_dir", "search_in_files", "get_context_window"})
+    assert READ_ONLY_TOOLS == frozenset({"read_file", "list_dir", "search_in_files", "glob", "get_context_window"})
 
 
 def test_no_registry_still_advertises_list_active_tasks(tmp_path: Path) -> None:

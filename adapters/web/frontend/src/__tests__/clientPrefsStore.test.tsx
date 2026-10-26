@@ -18,12 +18,12 @@ vi.mock('../api/supervisorClient', async (importOriginal) => ({
   getAllToolNames: vi.fn(),
 }));
 
-// 后端实际会返回的量级：25 个内置 + cancel_active_tasks + 外部脚本工具。
+// 后端实际会返回的量级：26 个内置 + cancel_active_tasks + 外部脚本工具。
 const BUILTIN_TOOL_NAMES = [
   'apply_diff', 'cancel_active_tasks', 'create_agent', 'create_or_update_mcp_client',
   'create_or_update_skill', 'create_or_update_tool', 'create_schedule', 'delete_memory',
   'delete_mcp_client', 'delete_schedule', 'delete_skill', 'execute_command', 'get_context_window',
-  'list_dir', 'list_memories', 'list_mcp_clients', 'list_schedules', 'list_skills',
+  'glob', 'list_dir', 'list_memories', 'list_mcp_clients', 'list_schedules', 'list_skills',
   'manage_secret', 'read_file', 'reload_tools', 'request_restart', 'save_memory',
   'search_in_files', 'write_file',
 ];
@@ -51,6 +51,9 @@ describe('client preferences store and page', () => {
     expect(shouldAutoApproveToolCall({ toolName: 'read_file', operation: 'read_file' }, {})).toBe(true);
     expect(shouldAutoApproveToolCall({ toolName: 'search_in_files', operation: 'read_file' }, {})).toBe(true);
     expect(shouldAutoApproveToolCall({ toolName: 'list_dir', operation: 'read_file' }, {})).toBe(true);
+    expect(shouldAutoApproveToolCall({ toolName: 'glob', operation: 'read_file' }, {})).toBe(true);
+    // glob 只报 read_file，别的操作借不了它的勾
+    expect(shouldAutoApproveToolCall({ toolName: 'glob', operation: 'write_file' }, {})).toBe(false);
     expect(shouldAutoApproveToolCall({ toolName: 'execute_command', operation: 'execute_command' }, {})).toBe(false);
     expect(shouldAutoApproveToolCall({ toolName: 'unknown_tool', operation: 'unknown_tool' }, {})).toBe(false);
     expect(shouldAutoApproveToolCall({ toolName: '', operation: 'read_file' }, {})).toBe(false);
@@ -159,6 +162,34 @@ describe('client preferences store and page', () => {
     expect(fresh.useClientPrefsStore.getState().autoApproveTools.list_dir).toBe(true);
   });
 
+  it('starts glob out like list_dir for rules saved before glob existed', async () => {
+    // 关掉过 list_dir 自动放行的人，升级后不该发现新来的 glob 自己放行了
+    localStorage.setItem('clonoth_client_prefs', JSON.stringify({
+      autoApproveTools: { read_file: true, list_dir: false },
+      version: 2,
+    }));
+
+    vi.resetModules();
+    const fresh = await import('../store/clientPrefsStore');
+
+    expect(fresh.useClientPrefsStore.getState().autoApproveTools.glob).toBe(false);
+    expect(fresh.withInheritedAutoApproveRules({ list_dir: true })).toEqual({ list_dir: true, glob: true });
+    // 自己存过 glob 的照自己的；连 list_dir 都没存过的走默认值
+    expect(fresh.withInheritedAutoApproveRules({ list_dir: false, glob: true })).toEqual({ list_dir: false, glob: true });
+    expect(fresh.withInheritedAutoApproveRules({ read_file: true })).toEqual({ read_file: true });
+  });
+
+  it('carries a list_dir switched off by the version 1 migration over to glob', async () => {
+    localStorage.setItem('clonoth_client_prefs', JSON.stringify({ autoApproveTools: { read_file: false, list_dir: true } }));
+
+    vi.resetModules();
+    const fresh = await import('../store/clientPrefsStore');
+    const rules = fresh.useClientPrefsStore.getState().autoApproveTools;
+
+    expect(rules.list_dir).toBe(false);
+    expect(rules.glob).toBe(false);
+  });
+
   it('persists changed auto-approval rules and title settings in localStorage', () => {
     useClientPrefsStore.getState().setAutoApproveTool('execute_command', true);
     useClientPrefsStore.getState().setTitleGeneration('manual');
@@ -213,11 +244,11 @@ describe('client preferences store and page', () => {
     expect(screen.getByText(/勾 write_file 不会连带放行它们/)).toBeInTheDocument();
   });
 
-  it('lists every backend tool, not just the curated seven', async () => {
+  it('lists every backend tool, not just the curated eight', async () => {
     render(<AutoApproveSection />);
 
-    // 推荐那七个单独排在上面，剩下的全归「其他工具」。
-    await screen.findByText(`其他工具 ${ALL_TOOL_NAMES.length - 7} 个`);
+    // 推荐那八个单独排在上面，剩下的全归「其他工具」。
+    await screen.findByText(`其他工具 ${ALL_TOOL_NAMES.length - 8} 个`);
     fireEvent.click(screen.getByRole('button', { name: '展开' }));
 
     for (const toolName of ALL_TOOL_NAMES) {
@@ -234,10 +265,10 @@ describe('client preferences store and page', () => {
     // 用户之前根本没见过这些工具，列出来不等于放行。
     for (const toolName of ALL_TOOL_NAMES) {
       const box = screen.getByLabelText(`自动放行 ${toolName}`);
-      if (['read_file', 'search_in_files', 'list_dir'].includes(toolName)) expect(box).toBeChecked();
+      if (['read_file', 'search_in_files', 'list_dir', 'glob'].includes(toolName)) expect(box).toBeChecked();
       else expect(box).not.toBeChecked();
     }
-    expect(screen.getByText('已放行 3 项')).toBeInTheDocument();
+    expect(screen.getByText('已放行 4 项')).toBeInTheDocument();
   });
 
   it('filters the full catalog from the search box', async () => {

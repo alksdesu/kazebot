@@ -484,8 +484,8 @@ function getApprovalMatch(state: ChatStoreState, event: SupervisorEvent): Approv
   const operation = typeof payload.operation === 'string' ? payload.operation : '';
   const toolCallId = typeof payload.tool_call_id === 'string' ? payload.tool_call_id : '';
 
-  // The payload only carries the policy operation, and several tools share one: list_dir
-  // and search_in_files both report read_file, apply_diff reports write_file. Resolving the
+  // The payload only carries the policy operation, and several tools share one: list_dir,
+  // glob and search_in_files all report read_file, apply_diff reports write_file. Resolving the
   // ToolExecution is the only way to learn which tool the user actually ticked; an approval
   // with no matching tool card stays manual.
   return { toolName: findToolByCallId(state, toolCallId)?.name || '', operation };
