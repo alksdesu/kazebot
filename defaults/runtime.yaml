@@ -18,6 +18,14 @@ engine:
     hard_threshold_tokens: 0   # 硬阈值：超过此值挂起当轮同步压缩，避免顶爆上下文窗口；0 = 取软阈值的 1.25 倍
     keep_recent_tokens: 30000  # 压缩时保留的原文 token 量，更早的内容压成摘要；0 = 改按 keep_recent 的段数保留
     keep_recent: 6             # keep_recent_tokens 为 0 时生效：保留最近 N 个完整 task 段
+    # 查得到模型的上下文窗口时（节点 yaml 的 context_window > 下面的 context_windows > 内置的常见模型表），
+    # 软阈值收紧到 (窗口 - 输出预留) × 0.85、硬阈值收紧到 窗口 - 输出预留；查不到就按上面配的值
+    context_windows: {}               # 模型名 glob → 窗口 token 数，按书写顺序先匹配的生效；0 = 这个模型不按窗口调整。例：{"my-relay/claude-*": 200000}
+    output_reserve_tokens: 20000      # 输出预留：渠道或节点配了回复上限（max_tokens 等）就用它，没配用这个值（0-1000000）
+    tool_result_protect_tokens: 40000 # 发给模型时从最新往前这么多 token 的工具结果保留原文，更早的只留开头和结尾；最多占软阈值的 40%（0-2000000；0 = 不保护）
+    supersede_reads: true             # read_file 读过的文件之后被重读（行范围盖住了旧的）或成功改写后，旧的读取结果发给模型时换成一行说明
+    task_digest_trigger_ratio: 0.5    # 单个任务自己的消息超过 软阈值 × 此比例 时，把它较早的完整轮次换成一条进展摘要（0-0.95；0 = 关闭）
+    task_keep_recent_tokens: 20000    # 任务进度摘要保留最近这么多 token 的原文不摘要，最多取触发线的一半（0-1000000）
 
   # Child Session 隔离：dispatch 子节点使用独立 session，替代 node_contexts snapshot 机制
   child_session:

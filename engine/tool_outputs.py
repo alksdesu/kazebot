@@ -39,10 +39,13 @@ _MIN_SEARCH_LINE_CHARS = 40
 
 _HEAD_SHARE = 0.6
 _MIN_PREVIEW_BODY = 200
+_MIN_EXCERPT_BODY = 120
+_MAX_PINNED_LINE = 400
 _REF = re.compile(r"to_[0-9a-f]{24}\Z")
+_REF_MENTION = re.compile(r"ref=to_[0-9a-f]{24}")
 _UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
 _SECONDS_PER_DAY = 86400
-# 请求视图只给最近一轮的工具结果留这么多字，预览或分页再长，尾部连同下一页的位置都会被截掉
+# 最近一轮超出保护预算时请求视图只给它的工具结果留这么多字，预览或分页再长，尾部连同下一页的位置都会被截掉
 LATEST_ROUND_VIEW_CHARS = 8000
 
 
@@ -277,6 +280,87 @@ def preview_text(text: str, view_chars: int, *, saved: SavedOutput | None) -> st
     last = _line_number(starts, tail_start - 1)
     marker = _omitted_marker(first, last, last - first + 1, tail_start - head_end)
     return f"{header}\n{_ended(text[:head_end])}{marker}\n{_ended(text[tail_start:])}{footer}"
+
+
+def _ref_pins(parts: list[str]) -> list[tuple[int, str]]:
+    """截短时必须留下的 ref 行：(行号, 落进省略部分时另外补上的文字)，取第一处和最后一处。
+
+    这一行本身很长（比如单行 JSON 里提到 ref）时只补 ref 本身，不然整行补回去等于没截。
+    """
+    hits = [index for index, part in enumerate(parts) if _REF_MENTION.search(part)]
+    pins: list[tuple[int, str]] = []
+    for index in dict.fromkeys(hits[:1] + hits[-1:]):
+        line = parts[index]
+        if len(line) > _MAX_PINNED_LINE:
+            line = "[" + "，".join(dict.fromkeys(_REF_MENTION.findall(line))) + "]"
+        pins.append((index, _ended(line)))
+    return pins
+
+
+def _inside_windows(starts: list[int], parts: list[str], index: int, head_end: int, tail_start: int) -> bool:
+    begin = starts[index]
+    return begin + len(parts[index]) <= head_end or begin >= tail_start
+
+
+def _cut_marker(chars: int) -> str:
+    return f"[……后面还有 {chars} 字符没有显示……]"
+
+
+def _head_only(text: str, budget: int) -> str:
+    keep = max(0, budget - len(_cut_marker(len(text))) - 1)
+    if keep <= 0:
+        return text[:max(0, budget)]
+    return f"{text[:keep]}\n{_cut_marker(len(text) - keep)}"
+
+
+def _excerpt_with(
+    text: str, parts: list[str], starts: list[int], body: int, pins: list[tuple[int, str]],
+) -> str | None:
+    total = len(text)
+    reserved = 0
+    # 给落进中间的 ref 行让出位置后窗口变小，可能又有一行掉进中间，最多重算到每行都让过一次
+    for _attempt in range(len(pins) + 1):
+        room = body - reserved
+        if room < _MIN_EXCERPT_BODY:
+            return None
+        head_budget = int(room * _HEAD_SHARE)
+        head_end = _head_end(parts, head_budget)
+        tail_start = max(head_end, _tail_start(parts, total, room - head_budget))
+        stranded = [pin for pin in pins if not _inside_windows(starts, parts, pin[0], head_end, tail_start)]
+        needed = sum(len(kept) for _index, kept in stranded)
+        if needed <= reserved:
+            break
+        reserved = needed
+    else:
+        return None
+    first = _line_number(starts, head_end)
+    last = _line_number(starts, tail_start - 1)
+    marker = _omitted_marker(first, last, last - first + 1, tail_start - head_end)
+    head = text[:head_end]
+    kept = "".join(kept for _index, kept in stranded)
+    return f"{_ended(head) if head else ''}{kept}{marker}\n{text[tail_start:]}"
+
+
+def excerpt_text(text: str, budget: int) -> str:
+    """长文本截到 budget 字左右：开头约 60%、结尾约 40%，尽量在行边界切开，中间写明省略了哪些行。
+
+    带 ref 的落盘提示行（第一处和最后一处）一定留下，读回全文只能靠它；预算小到放不下一段开头时只截开头。
+    """
+    if len(text) <= budget:
+        return text
+    parts = text.splitlines(keepends=True)
+    starts = _line_starts(parts)
+    marker_room = len(_omitted_marker(len(parts), len(parts), len(parts), len(text))) + 3
+    pins = _ref_pins(parts)
+    for keep in ([pins, pins[:1]] if len(pins) > 1 else [pins]):
+        excerpt = _excerpt_with(text, parts, starts, budget - marker_room, keep)
+        if excerpt is not None:
+            return excerpt
+    if pins:
+        # 预算连 ref 提示行带一段开头都放不下：宁可超出预算也不能把读回全文的入口截掉
+        index, kept = pins[0]
+        return f"{kept}{_cut_marker(len(text) - len(parts[index]))}"
+    return _head_only(text, budget)
 
 
 def inline_tool_output(

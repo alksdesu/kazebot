@@ -15,14 +15,28 @@ from engine.compact import (
     microcompact_targets,
     should_compact,
 )
+from engine.context_window import (
+    KEEP_RECENT_SHARE_OF_THRESHOLD,
+    context_window_for,
+    effective_thresholds,
+    output_reserve_tokens,
+)
 # Why: engine.builtin handlers must not depend on the hook package after relocation.
 # How: return a local HookResult-compatible shape instead. Purpose: avoid
 # cycles while keeping the existing hook registry duck-typed.
 from .result import hook_result
-from engine.inference.llm_call import request_view
+from engine.inference.llm_call import (
+    cancelled_action,
+    digest_provider_call,
+    request_view,
+    tool_result_view,
+    view_settings,
+)
 from engine.inference.loop_state import _persist_ctx, compact_target_session_id, flush_conversation_writes
 from engine.protocol import ACTION_DISPATCH, TaskAction
 from engine.context_archive import ContextArchiveStore
+from engine.task_digest import THRESHOLD_REASON, DigestOutcome, digest_settings, restore_task_digest, run_task_digest
+from plugin_runtime import PluginExecutionError
 
 logger = logging.getLogger(__name__)
 
@@ -43,26 +57,31 @@ PLUGIN_META = {
 
 
 class CompactChecker:
-    """Run idle cleanup and automatic context compaction before each step."""
+    """Run idle cleanup, automatic context compaction and in-task progress digests before each step."""
 
     name = "compact_checker"
     priority = 50
 
     async def handle(self, ctx: Any) -> Any | None:
-        """首步做空闲清理，之后每步检查要不要压缩。"""
+        """首步按模型窗口定阈值、做空闲清理、读回挂起前的进度摘要，之后每步检查要不要压缩、要不要摘要本任务。"""
         ls = ctx.extra.get("loop_state")
         if ls is None:
             return None
 
         _note_compact_outcome(ls)
+        _apply_context_window(ls)
         modified = False
         step_count = int(ctx.extra.get("step_count", 0) or 0)
         if ctx.step == step_count:
             modified = await _run_idle_cleanup(ctx, ls) or modified
+        # 空闲清理会改掉旧工具结果的正文，摘要的指纹要按清理之后的消息校验
+        await _restore_task_digest(ls)
 
         action = await _check_and_compact(ctx, ls)
         # snip 改了消息却不派发 compactor，靠 extra 里的标记把 modified 带出来
         modified = bool(ctx.extra.pop("compact_modified", False)) or modified
+        if action is None:
+            action = await _check_task_digest(ctx, ls)
         if action is not None:
             return hook_result(action=action, modified=modified)
         if modified:
@@ -92,6 +111,77 @@ def _note_compact_outcome(ls: Any) -> None:
         if not getattr(ls, "hard_compact_disabled", False):
             logger.warning("hard compaction disabled for task %s after a failed compaction", task_key or "?")
         ls.hard_compact_disabled = True
+
+
+def _apply_context_window(ls: Any) -> None:
+    """每个 loop state 只算一次：知道模型窗口时把压缩阈值收紧到窗口放得下的范围，写回 loop state。"""
+    if getattr(ls, "context_window_checked", False):
+        return
+    ls.context_window_checked = True
+    try:
+        provider = getattr(ls, "provider", None)
+        model = str(getattr(provider, "model", "") or "")
+        runtime_cfg = getattr(ls, "runtime_cfg", None)
+        window = context_window_for(model, runtime_cfg=runtime_cfg, node=getattr(ls, "node", None))
+        ls.context_window = window
+        if window is None:
+            return
+        soft = int(getattr(ls, "compact_threshold", 0) or 0)
+        hard = int(getattr(ls, "compact_hard_threshold", 0) or 0)
+        result = effective_thresholds(window, soft=soft, hard=hard, reserve=output_reserve_tokens(provider, runtime_cfg))
+        ls.compact_threshold = result.soft
+        ls.compact_hard_threshold = result.hard
+        keep = int(getattr(ls, "compact_keep_recent_tokens", 0) or 0)
+        keep_ceiling = int(result.soft * KEEP_RECENT_SHARE_OF_THRESHOLD)
+        if keep > 0 and result.soft > 0 and keep > keep_ceiling:
+            ls.compact_keep_recent_tokens = keep_ceiling
+        logger.info(
+            "context window %d tokens for model %s (node %s, output reserve %d): compact thresholds %d/%d -> %d/%d",
+            window, model or "?", getattr(getattr(ls, "node", None), "id", "?"), result.reserve,
+            soft, hard, result.soft, result.hard,
+        )
+    except Exception:
+        logger.warning("resolving the model context window failed; keeping the configured thresholds", exc_info=True)
+
+
+async def _restore_task_digest(ls: Any) -> None:
+    if getattr(ls, "task_digest_restored", False):
+        return
+    ls.task_digest_restored = True
+    if getattr(ls, "task_digest", None) is not None:
+        return
+    try:
+        await restore_task_digest(ls)
+    except Exception:
+        logger.warning("restoring the task digest failed: task=%s", _task_key(ls) or "?", exc_info=True)
+
+
+async def _check_task_digest(ctx: Any, ls: Any) -> TaskAction | None:
+    """本任务自己的消息在请求视图里超过 软阈值 × 触发比例 时，把较早的完整轮次摘要掉；被取消时返回取消动作。"""
+    settings = digest_settings(getattr(ls, "runtime_cfg", None))
+    soft = int(getattr(ls, "compact_threshold", 0) or 0)
+    trigger = settings.trigger_tokens(soft)
+    # 软打断后这一步跑完就交出去，花这次摘要调用没有意义
+    if trigger <= 0 or getattr(ls, "preempt_after_step", False):
+        return None
+    try:
+        view_cfg = view_settings(ls)
+        outcome = await run_task_digest(
+            ls,
+            step=ctx.step,
+            view=tool_result_view(ls.messages, ls, settings=view_cfg),
+            chars_per_token=view_cfg.chars_per_token,
+            trigger_tokens=trigger,
+            keep_tokens=settings.keep_tokens(soft),
+            call=digest_provider_call(ls, ctx.step),
+            reason=THRESHOLD_REASON,
+        )
+    except PluginExecutionError:
+        raise
+    except Exception:
+        logger.warning("task digest failed: task=%s", _task_key(ls) or "?", exc_info=True)
+        return None
+    return cancelled_action(ls) if outcome is DigestOutcome.CANCELLED else None
 
 
 async def _run_idle_cleanup(ctx: Any, ls: Any) -> bool:
@@ -252,7 +342,7 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
     # 熔断判定归 supervisor：压缩失败几乎全在那一侧记账，而 engine 是多个独立 worker 进程，
     # 各自的计数器既读不到对方也读不到 supervisor 的。后台压缩会被 compact-async 拒回，
     # 硬阈值 dispatch 会被 supervisor 换成应急截断。
-    view = request_view(ls.messages)
+    view = request_view(ls.messages, ls)
     if not should_compact(view, ls.compact_threshold, ls.last_prompt_tokens):
         return None
 

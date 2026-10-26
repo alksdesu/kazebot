@@ -6,16 +6,32 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from contextvars import ContextVar
+from dataclasses import dataclass
 from functools import wraps
 from typing import Any
 
-from clonoth_runtime import parse_bool
+from clonoth_runtime import get_bool, get_int, parse_bool
 
 from .stream_buffer import _StreamBuffer
 from ..attachments import prepare_messages_for_llm, strip_image_blocks
-from ..compact import bounded_tool_result_view, total_content_chars
+from ..compact import (
+    DEFAULT_CHARS_PER_TOKEN,
+    TOOL_RESULT_VIEW_CHARS,
+    bounded_tool_result_view,
+    observed_chars_per_token,
+    total_content_chars,
+)
+from ..context_window import threshold_report
+from ..task_digest import (
+    OVERFLOW_REASON,
+    DigestOutcome,
+    apply_task_digest,
+    digest_settings,
+    run_task_digest,
+)
 from ..prompt import finalize_system_tail
 from ..protocol import TaskAction, ACTION_CANCELLED, ACTION_FAIL
 from .loop_state import _LoopState, _persist_ctx, _short
@@ -31,9 +47,10 @@ from .llm_outcome import RETRYABLE_STATUS_CODES as _RETRYABLE_STATUS_CODES  # no
 from .tool_format import build_llm_messages, sanitize_control_tool_history
 from engine.signals import Signal, get_bus
 from engine.signals.types import make_span_id
-from plugin_runtime import plugin_scope
+from plugin_runtime import PluginExecutionError, plugin_scope
 from plugin_runtime.manager import current_scope
 
+logger = logging.getLogger(__name__)
 
 _llm_child_tasks: ContextVar[list[asyncio.Task] | None] = ContextVar("llm_child_tasks", default=None)
 _POLL_INTERVAL_SEC = 0.3
@@ -125,10 +142,92 @@ def _create_llm_task(coroutine):
     return task
 
 
-def request_view(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """发给模型的那份消息视图：较早的大块工具结果截短，持久历史不动。压缩阈值也按它估，两边口径一致。"""
-    view, _ = bounded_tool_result_view(messages)
+# 小窗口模型上配置的保护预算可能比整个窗口还大，最多只占软阈值的这个百分比
+_PROTECT_PERCENT_OF_THRESHOLD = 40
+
+
+@dataclass(frozen=True)
+class ViewSettings:
+    protect_tokens: int = 0
+    supersede: bool = False
+    chars_per_token: float = DEFAULT_CHARS_PER_TOKEN
+    workspace_root: Any = None
+
+
+def loop_chars_per_token(ls: Any) -> float:
+    """本任务上一次请求实测的字符/token 比，没有真实用量时回落默认值。"""
+    return observed_chars_per_token(
+        int(getattr(ls, "last_prompt_chars", 0) or 0), getattr(ls, "last_prompt_tokens", None),
+    )
+
+
+def view_settings(ls: Any) -> ViewSettings:
+    """请求视图按 loop state 取的设置：保护预算、读后让位开关和校准过的字符/token 比。"""
+    if ls is None:
+        return ViewSettings()
+    cfg = getattr(ls, "runtime_cfg", None)
+    cfg = cfg if isinstance(cfg, dict) else {}
+    protect = get_int(cfg, "engine.compact.tool_result_protect_tokens", 40_000, min_value=0, max_value=2_000_000)
+    threshold = int(getattr(ls, "compact_threshold", 0) or 0)
+    if threshold > 0:
+        protect = min(protect, threshold * _PROTECT_PERCENT_OF_THRESHOLD // 100)
+    return ViewSettings(
+        protect_tokens=protect,
+        supersede=get_bool(cfg, "engine.compact.supersede_reads", True),
+        chars_per_token=loop_chars_per_token(ls),
+        workspace_root=getattr(getattr(ls, "rctx", None), "workspace_root", None),
+    )
+
+
+def tool_result_view(
+    messages: list[dict[str, Any]], ls: Any = None, *, settings: ViewSettings | None = None,
+) -> list[dict[str, Any]]:
+    """和 messages 逐条对应的视图：保护预算内的工具结果保留原文，更早的截短，过时的 read_file 结果让位。"""
+    settings = settings or view_settings(ls)
+    view, _ = bounded_tool_result_view(
+        messages,
+        protect_tokens=settings.protect_tokens,
+        chars_per_token=settings.chars_per_token,
+        supersede=settings.supersede,
+        workspace_root=settings.workspace_root,
+    )
     return view
+
+
+def with_task_digest(messages: list[dict[str, Any]], view: list[dict[str, Any]], ls: Any) -> list[dict[str, Any]]:
+    """本任务有进度摘要、且它覆盖的消息指纹全部对得上时，把那些消息换成一条摘要；对不上就原样返回。"""
+    digest = getattr(ls, "task_digest", None)
+    task_id = str(getattr(getattr(ls, "rctx", None), "task_id", "") or "")
+    if digest is None or not task_id:
+        return view
+    applied = apply_task_digest(messages, view, task_id, digest)
+    return view if applied is None else applied
+
+
+def request_view(messages: list[dict[str, Any]], ls: Any = None) -> list[dict[str, Any]]:
+    """发给模型的那份消息视图，持久历史不动。压缩阈值也按它估，两边口径一致。
+
+    给了 loop state 就按它的设置保护最近的工具结果、让过时的读取结果让位、换入任务进度摘要；
+    不给只按固定上限截短旧工具结果。
+    """
+    if ls is None:
+        view, _ = bounded_tool_result_view(messages)
+        return view
+    return with_task_digest(messages, tool_result_view(messages, ls), ls)
+
+
+def overflow_view(messages: list[dict[str, Any]], ls: Any) -> list[dict[str, Any]]:
+    """供应商报上下文溢出后重试用的视图：不再保护，最近一轮也截到普通上限。"""
+    settings = view_settings(ls)
+    view, _ = bounded_tool_result_view(
+        messages,
+        max_chars=TOOL_RESULT_VIEW_CHARS,
+        keep_latest_round=False,
+        chars_per_token=settings.chars_per_token,
+        supersede=settings.supersede,
+        workspace_root=settings.workspace_root,
+    )
+    return with_task_digest(messages, view, ls)
 
 
 def provider_messages(
@@ -194,11 +293,15 @@ async def wait_provider_call(ls: Any, coroutine: Any, step: int) -> Any:
 
 
 async def record_response_usage(ls: Any, resp: Any, llm_messages: list[dict[str, Any]], tools_arg: Any) -> None:
-    """记下这次请求的真实 prompt 用量，压缩阈值和 supervisor 的字符预算都按它校准。"""
+    """记下这次请求的真实 prompt 用量，压缩阈值、请求视图的保护预算和 supervisor 的字符预算都按它校准。"""
     usage = getattr(resp, "usage", None)
     if not isinstance(usage, dict) or not isinstance(usage.get("prompt_tokens"), int):
         return
+    prompt_chars = total_content_chars(llm_messages) + (
+        len(json.dumps(tools_arg, ensure_ascii=False, default=str)) if tools_arg else 0
+    )
     ls.last_prompt_tokens = usage["prompt_tokens"]
+    ls.last_prompt_chars = prompt_chars
     ls.last_usage = dict(usage)
     ls.compacted = False
     await ls.rctx.emit_event("context_usage", {
@@ -207,10 +310,85 @@ async def record_response_usage(ls: Any, resp: Any, llm_messages: list[dict[str,
         "usage": usage,
         # 配上真实 token 数，supervisor 侧的字符预算才能按本会话的实际比例裁剪；
         # 硬编码 3 字符/token 是按英文定的，中文会把预算放大两三倍。
-        "prompt_chars": total_content_chars(llm_messages) + (
-            len(json.dumps(tools_arg, ensure_ascii=False, default=str)) if tools_arg else 0
-        ),
+        "prompt_chars": prompt_chars,
+        # get_context_window 报的阈值得是按模型窗口收紧后真正生效的这一份
+        **threshold_report(ls),
     })
+
+
+def digest_provider_call(ls: Any, step: int) -> Any:
+    """任务进度摘要用的那次请求：节点自己的 provider，不带工具，等待期间照常响应取消和抢占。"""
+    async def call(messages: list[dict[str, Any]]) -> Any:
+        prepared = provider_messages(
+            messages, formatter=ls.formatter, provider=ls.provider,
+            workspace_root=ls.rctx.workspace_root, strip_images=True,
+        )
+        return await wait_provider_call(ls, ls.provider.chat(messages=prepared, tools=None), step)
+
+    return call
+
+
+async def _overflow_digest(ls: Any, step: int) -> DigestOutcome:
+    settings = digest_settings(getattr(ls, "runtime_cfg", None))
+    if not settings.enabled:
+        return DigestOutcome.SKIPPED
+    view_cfg = view_settings(ls)
+    threshold = int(getattr(ls, "compact_threshold", 0) or 0)
+    return await run_task_digest(
+        ls,
+        step=step,
+        view=tool_result_view(ls.messages, ls, settings=view_cfg),
+        chars_per_token=view_cfg.chars_per_token,
+        trigger_tokens=0,
+        keep_tokens=settings.keep_tokens(threshold),
+        call=digest_provider_call(ls, step),
+        reason=OVERFLOW_REASON,
+        require_no_digest=True,
+    )
+
+
+_RETRY_CANCELLED = object()
+
+
+async def _overflow_retry_messages(ls: Any, step: int, resp: Any, strip_images: bool) -> Any:
+    """上下文溢出后重发的消息：本任务还没有进度摘要就先摘要，摘要不了或摘要后还溢出再截短旧工具结果。
+
+    两条路各只走一次；都走不通返回 None，被取消返回 _RETRY_CANCELLED。
+    """
+    if not getattr(ls, "_reactive_digest_done", False):
+        ls._reactive_digest_done = True
+        try:
+            outcome = await _overflow_digest(ls, step)
+        except PluginExecutionError:
+            raise
+        except Exception:
+            # 摘要这条路出了问题也不能连截短重试一起丢掉
+            logger.warning("task digest after a context overflow failed: task=%s", ls.rctx.task_id, exc_info=True)
+            outcome = DigestOutcome.SKIPPED
+        if outcome is DigestOutcome.CANCELLED:
+            return _RETRY_CANCELLED
+        if outcome is DigestOutcome.CREATED:
+            return provider_messages(
+                request_view(ls.messages, ls), formatter=ls.formatter, provider=ls.provider,
+                workspace_root=ls.rctx.workspace_root, strip_images=strip_images,
+            )
+    if getattr(ls, "_reactive_compact_done", False):
+        return None
+    ls._reactive_compact_done = True
+    # 刚才那次请求已经按 request_view 截过旧结果，这里连最近一轮也一起截；比它短不了就不必再发
+    sent_view = request_view(ls.messages, ls)
+    retry_view = overflow_view(ls.messages, ls)
+    cleared = sum(1 for sent, retry in zip(sent_view, retry_view) if sent.get("content") != retry.get("content"))
+    if not cleared:
+        return None
+    await ls.rctx.emit_event("reactive_compact", {
+        "node_id": ls.node.id, "step": step,
+        "cleared": cleared, "error": resp.error or "",
+    })
+    return provider_messages(
+        retry_view, formatter=ls.formatter, provider=ls.provider,
+        workspace_root=ls.rctx.workspace_root, strip_images=strip_images,
+    )
 
 
 @_llm_plugin_context
@@ -226,7 +404,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     # ls.messages 是运行时状态，只在副本上转换；build_llm_messages 跳过 _ephemeral，保留 _dynamic
     strip_images = _node_strips_images(ls.node)
     llm_messages = provider_messages(
-        request_view(ls.messages), formatter=ls.formatter, provider=ls.provider,
+        request_view(ls.messages, ls), formatter=ls.formatter, provider=ls.provider,
         workspace_root=ls.rctx.workspace_root, strip_images=strip_images,
     )
 
@@ -389,32 +567,14 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
         elif _is_empty_ok and _retry_attempt >= ls.retry_max:
             resp = with_changes(resp, ok=False, error=f"empty_response (retried {_retry_attempt} times)")
 
-        # 请求超出上下文窗口：截短旧工具结果再试一次，只试一次
-        if (
-            not resp.ok
-            and not _is_retryable_error(resp)
-            and is_context_overflow(resp)
-            and not getattr(ls, '_reactive_compact_done', False)
-        ):
-            ls._reactive_compact_done = True
-            # 刚才那次请求已经按 request_view 截过旧结果，这里连最近一轮也一起截；比它短不了就不必再发
-            _sent_view = request_view(ls.messages)
-            _request_messages, _ = bounded_tool_result_view(
-                ls.messages, max_chars=2_000, keep_latest_round=False,
-            )
-            _rc_cleared = sum(
-                1 for _sent, _bounded in zip(_sent_view, _request_messages)
-                if _sent.get("content") != _bounded.get("content")
-            )
-            if _rc_cleared:
-                await ls.rctx.emit_event("reactive_compact", {
-                    "node_id": ls.node.id, "step": step,
-                    "cleared": _rc_cleared, "error": resp.error or "",
-                })
-                llm_messages = provider_messages(
-                    _request_messages, formatter=ls.formatter, provider=ls.provider,
-                    workspace_root=ls.rctx.workspace_root, strip_images=strip_images,
-                )
+        # 请求超出上下文窗口：先摘要本任务较早的轮次，再不行截短旧工具结果，各重试一次
+        if not resp.ok and not _is_retryable_error(resp) and is_context_overflow(resp):
+            _retry_messages = await _overflow_retry_messages(ls, step, resp, strip_images)
+            if _retry_messages is _RETRY_CANCELLED:
+                _emit_call_end(cancelled=True)
+                return cancelled_action(ls)
+            if _retry_messages is not None:
+                llm_messages = _retry_messages
                 resp = None
                 continue
 

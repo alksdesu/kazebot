@@ -27,6 +27,7 @@ from platforms.registry import conversation_key_prefix, features_module
 
 from . import provisioning, share_groups
 from .config_store import ConfigStore
+from .context_window_report import remember_engine_thresholds, with_engine_thresholds
 from .sticker_api import create_sticker_router
 from .tool_watch import ToolTreeWatch
 from .instances import InstanceDirectoryError, load_instance_directory, load_instances, url_prefix
@@ -1225,6 +1226,7 @@ def create_app(
             st.record_outbound_message_event(evt)
         if ev.type == "context_usage":
             st.update_context_usage(session_id, dict(ev.payload or {}))
+            remember_engine_thresholds(st, session_id, ev.payload)
         # [AutoC 2026-06-03] Why: scheduler stale-task reaper checks task.updated_at
         # but the engine heartbeat (renew_lease) only refreshes lease_expires_at,
         # causing live tasks to be falsely reaped after 10 min of no state mutation.
@@ -1580,7 +1582,10 @@ def create_app(
             route_session_id = st._route_session_id_for_session_locked(session_id)
             if route_session_id not in st.sessions:
                 raise HTTPException(status_code=404, detail="session not found")
-        return st.get_session_context_usage(route_session_id)
+        report = st.get_session_context_usage(route_session_id)
+        with st._lock:
+            recorded = dict(st._session_context_usage.get(route_session_id) or {})
+        return with_engine_thresholds(report, recorded)
 
     @app.post("/v1/approvals/request", response_model=Approval)
     async def approval_request(inp: ApprovalRequestIn, request: Request) -> Approval:

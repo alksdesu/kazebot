@@ -177,6 +177,16 @@ class _LoopState:
     # 恢复后的第一步要从本任务的调用记录重建一次清单，之后不再重建
     todos_restored: bool = False
 
+    # ---- 上下文管理 ----
+    # 和 last_prompt_tokens 同一次请求的字符数，请求视图按两者的比例估 token
+    last_prompt_chars: int = 0
+    # 模型的上下文窗口（查不到为 None）；第一次 before_step 时按它收紧压缩阈值，每个 loop state 只算一次
+    context_window: int | None = None
+    context_window_checked: bool = False
+    # 本任务较早轮次的进度摘要（engine.task_digest.TaskDigest），只换请求视图；挂起后恢复时从磁盘读回一次
+    task_digest: Any = None
+    task_digest_restored: bool = False
+
 
 def conversation_writer(rctx: Any) -> ConversationWriter | None:
     """本任务的对话写入器，挂着 conversation_store 才有。"""

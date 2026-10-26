@@ -17,6 +17,7 @@ import re
 from typing import Any
 
 from .prompt import SYSTEM_TAIL_KEY
+from .tool_outputs import LATEST_ROUND_VIEW_CHARS, excerpt_text
 
 logger = logging.getLogger(__name__)
 
@@ -106,10 +107,7 @@ def _bounded_content(content: Any, max_chars: int) -> Any:
     if max_chars <= 0:
         return _TOOL_RESULT_PLACEHOLDER
     if isinstance(content, str):
-        if len(content) <= max_chars:
-            return content
-        keep = max(0, max_chars - len(_TOOL_RESULT_PLACEHOLDER) - 1)
-        return content[:keep] + "\n" + _TOOL_RESULT_PLACEHOLDER
+        return excerpt_text(content, max_chars)
     if isinstance(content, list):
         remaining = max_chars
         bounded: list[Any] = []
@@ -128,39 +126,104 @@ def _bounded_content(content: Any, max_chars: int) -> Any:
     return content
 
 
+# 最近一轮超出保护预算时的保底字数是普通上限的这么多倍，乘出来正是 read_tool_output 分页依赖的 LATEST_ROUND_VIEW_CHARS
+LATEST_ROUND_FACTOR = 4
+TOOL_RESULT_VIEW_CHARS = LATEST_ROUND_VIEW_CHARS // LATEST_ROUND_FACTOR
+
+
+def _content_text_chars(content: Any) -> int:
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        return sum(len(part["text"]) for part in content if isinstance(part, dict) and isinstance(part.get("text"), str))
+    return 0
+
+
+def _is_tool_round(message: dict[str, Any]) -> bool:
+    """一条 assistant 消息是不是一轮工具调用：存储层结构化的 tool_calls，或旧消息 meta 里记下的调用 id。"""
+    if message.get("role") != "assistant":
+        return False
+    calls = message.get("tool_calls")
+    if isinstance(calls, list) and calls:
+        return True
+    for key in ("_meta", "meta"):
+        meta = message.get(key)
+        ids = meta.get("tool_call_ids") if isinstance(meta, dict) else None
+        if isinstance(ids, list) and any(ids):
+            return True
+    return False
+
+
+def _protected_results(
+    messages: list[dict[str, Any]], tool_indices: list[int], protect_tokens: int, chars_per_token: float,
+) -> set[int]:
+    """从最新的工具结果往前累计估算 token，累计值没超出 protect_tokens 的这些保留原文。"""
+    if protect_tokens <= 0:
+        return set()
+    divisor = chars_per_token if chars_per_token > 0 else DEFAULT_CHARS_PER_TOKEN
+    used = 0.0
+    protected: set[int] = set()
+    for index in reversed(tool_indices):
+        used += _content_text_chars(messages[index].get("content")) / divisor
+        if used > protect_tokens:
+            break
+        protected.add(index)
+    return protected
+
+
 def bounded_tool_result_view(
     messages: list[dict[str, Any]],
     *,
-    max_chars: int = 2_000,
+    max_chars: int = TOOL_RESULT_VIEW_CHARS,
     keep_latest_round: bool = True,
+    protect_tokens: int = 0,
+    chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
+    supersede: bool = False,
+    workspace_root: Any = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Return a request-only view with old tool results bounded.
 
-    The durable message list is never mutated. The latest assistant tool-call
-    round keeps its native call/result pairing while its content still gets a
-    larger bound than older results.
+    The durable message list is never mutated, and the view keeps every message
+    and every call/result pairing: only content changes. With *supersede*, a
+    read_file result whose files were read again or rewritten later becomes a
+    one-line note. Counting back from the newest result, results that fit in
+    *protect_tokens* stay verbatim; the rest are cut to their head and tail, the
+    latest round to ``max_chars * LATEST_ROUND_FACTOR`` and older ones to
+    *max_chars*. Defaults keep the old behaviour: nothing protected or superseded.
     """
     result = [dict(message) for message in messages]
     tool_indices = [index for index, message in enumerate(result) if is_tool_result_message(message)]
     if not tool_indices:
         return result, 0
 
+    changed: set[int] = set()
+    if supersede:
+        # tool_history 要用本模块的 is_tool_result_message，放到模块顶部会循环导入
+        from .tool_history import superseded_read_notes
+
+        for index, note in superseded_read_notes(result, workspace_root=workspace_root).items():
+            if result[index].get("content") != note:
+                result[index]["content"] = note
+                changed.add(index)
+
     latest_round_start = -1
     if keep_latest_round:
-        for index, message in enumerate(result):
-            if message.get("role") == "assistant" and message.get("tool_calls"):
-                latest_round_start = index
-
-    latest_limit = max_chars * 4 if latest_round_start >= 0 and keep_latest_round else max_chars
-    changed = 0
+        latest_round_start = next(
+            (index for index in range(len(result) - 1, -1, -1) if _is_tool_round(result[index])), -1,
+        )
+    latest_limit = max_chars * LATEST_ROUND_FACTOR
+    protected = _protected_results(result, tool_indices, protect_tokens, chars_per_token)
     for index in tool_indices:
+        if index in protected:
+            continue
         message = result[index]
-        limit = latest_limit if latest_round_start >= 0 and index > latest_round_start else max_chars
-        bounded = _bounded_content(message.get("content", ""), limit)
-        if bounded != message.get("content", ""):
+        limit = latest_limit if 0 <= latest_round_start < index else max_chars
+        content = message.get("content", "")
+        bounded = _bounded_content(content, limit)
+        if bounded != content:
             message["content"] = bounded
-            changed += 1
-    return result, changed
+            changed.add(index)
+    return result, len(changed)
 
 
 # ---------------------------------------------------------------------------

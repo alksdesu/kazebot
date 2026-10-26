@@ -49,8 +49,37 @@ async def cancel_active_tasks(args: dict[str, Any], ctx: ToolContext) -> dict[st
         return _err(e)
 
 
+def _positive(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return int(value)
+
+
+def _context_window_text(payload: dict[str, Any]) -> str:
+    # data.result is the only part of a tool result the model reads, so the numbers have to be in it
+    tokens = payload.get("effective_tokens")
+    source = "reported by the model" if payload.get("source") == "llm_usage" else "estimated from the stored messages"
+    lines = [f"Context in use: {tokens if tokens is not None else 'unknown'} tokens ({source})."]
+    threshold = _positive(payload.get("compact_threshold"))
+    if threshold is None:
+        lines.append("Automatic compaction is off.")
+        return " ".join(lines)
+    hard = _positive(payload.get("compact_hard_threshold"))
+    window = _positive(payload.get("context_window"))
+    detail = f"Background compaction starts at {threshold} tokens"
+    if hard is not None:
+        detail += f", and at {hard} tokens the turn waits for compaction"
+    if window is not None:
+        detail += f"; the model's context window is {window} tokens"
+    lines.append(detail + ".")
+    utilization = payload.get("utilization")
+    if isinstance(utilization, (int, float)) and not isinstance(utilization, bool):
+        lines.append(f"{utilization:.1%} of the compaction threshold is used.")
+    return " ".join(lines)
+
+
 async def get_context_window(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    """Get current context window token usage for the session."""
+    """Get current context window token usage and the compaction thresholds in effect for the session."""
     try:
         # [Fork/Merge 2026-05-17] Why: context usage events are emitted to the
         # parent route session, not to branch storage sessions. How: query the
@@ -64,7 +93,7 @@ async def get_context_window(args: dict[str, Any], ctx: ToolContext) -> dict[str
             return _err(r.text)
         payload = r.json()
         if isinstance(payload, dict):
-            return _ok("Context window retrieved", **payload)
+            return _ok(_context_window_text(payload), **payload)
         return _ok("Context window retrieved", value=payload)
     except Exception as e:
         return _err(e)

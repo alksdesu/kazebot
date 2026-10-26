@@ -10,6 +10,7 @@ from unittest.mock import ANY, AsyncMock
 import pytest
 
 from engine.builtin.plaintext import TRUNCATED_NOTICE, PlaintextRetryHandler
+from engine.compact import TOOL_RESULT_VIEW_CHARS
 from engine.context import RunContext
 from engine.conversation_store import ConversationStore
 from engine.hooks.registry import HookRegistry
@@ -131,7 +132,9 @@ def test_context_overflow_retries_once_with_the_latest_round_cut_as_well(tmp_pat
 
     assert response.ok and len(provider.requests) == 2
     first, second = (len(request[-1]["content"]) for request in provider.requests)
-    assert second < first < 20_000
+    # 第一次在保护预算内原样发出；溢出后不再保护，最近一轮也截到普通上限
+    assert first == 20_000
+    assert second <= TOOL_RESULT_VIEW_CHARS
     loop.rctx.emit_event.assert_any_await("reactive_compact", ANY)
     assert len(messages[-1]["content"]) == 20_000
 

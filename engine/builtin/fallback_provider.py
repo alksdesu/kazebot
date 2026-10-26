@@ -307,14 +307,15 @@ class FallbackProviderHandler:
             return None
 
         original_error = getattr(resp, "error", "unknown")
-        view = request_view(ctx.messages)
+        _ls = ctx.extra.get("loop_state")
+        # 备用渠道收到的得是主渠道那一份：同样的保护预算、读后让位和任务进度摘要
+        view = request_view(ctx.messages, _ls)
         tools = ctx.tools
         original_provider = ctx.provider
         node_strips_images = _node_strips_images(_node)
         has_image_input = not node_strips_images and contains_image_blocks(view)
         original_model = getattr(original_provider, "model", "unknown")
         step = int(getattr(ctx, "step", 0) or 0)
-        _ls = ctx.extra.get("loop_state")
         _formatter = getattr(_ls, 'formatter', None) if _ls else None
 
         logger.warning(
