@@ -179,3 +179,14 @@ supervisor:
     shell_new_console: false
     engine_workers: 2
     spawn_shell_cli: false    # supervisor 启动时顺带拉起 shell；环境变量 CLONOTH_SPAWN_SHELL_CLI 优先
+
+# write_file / apply_diff 写盘成功之后，按 glob 匹配改动的文件再跑的检查命令（.py/.json/.yaml/.toml 的语法检查另外内置）。
+# 每条命令和 execute_command 走同一套审批；{path} 换成工作区里的相对路径，已按 shell 转义。
+# timeout_sec 默认 30、上限 300；输出只留前 4000 字符。检查不通过只把结果附在工具结果末尾，不回滚。
+# 例：
+#   commands:
+#     - glob: "**/*.py"
+#       command: "ruff check {path}"
+#       timeout_sec: 30
+edit_checks:
+  commands: []

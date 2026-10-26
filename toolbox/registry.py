@@ -531,13 +531,20 @@ class ToolRegistry:
             ),
             (
                 "read_file",
-                "Read one or more files under workspace root. Supports text files (with optional line range), images (returned as multimodal), and binary files. Policy+approval guarded.",
+                "Read one or more files under workspace root. "
+                "Text comes back with line numbers ('  12 | code'); each file's header gives its total line count and the range shown. "
+                "Without a line range at most 500 lines are shown; a line longer than 2000 characters is cut and marked; "
+                "one call returns about 50KB of text at most and files past that are listed as not read. "
+                "When a file is not shown in full, its header tells the startLine to continue from. "
+                "Images come back as multimodal attachments, binary files as their size. "
+                "Reading a text file remembers its version for this conversation: write_file and apply_diff refuse to change it "
+                "if it was modified after the read. Policy+approval guarded.",
                 {
                     "type": "object",
                     "properties": {
                         "files": {
                             "type": "array",
-                            "description": "Array of file objects. Each has: path (required), startLine (optional, 1-based), endLine (optional, 1-based inclusive). MUST be an array even for single file.",
+                            "description": "Array of file objects. Each has: path (required), startLine (optional, 1-based), endLine (optional, 1-based inclusive). MUST be an array even for single file. Give a line range for large files.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -558,10 +565,22 @@ class ToolRegistry:
             ),
             (
                 "write_file",
-                "Write a text file under workspace root (policy+approval guarded).",
+                "Create a text file, or replace an existing one with complete new content, under workspace root. "
+                "Prefer apply_diff for changing part of an existing file. "
+                "An existing file keeps its line endings (LF/CRLF), UTF-8 BOM and permissions, and is replaced atomically. "
+                "If you read the file in this conversation and it has changed since, the write is refused: read it again first. "
+                "Overwriting a file you have not read is allowed and noted in the result. "
+                "After writing, .py/.json/.yaml/.yml/.toml files are syntax-checked and the commands configured under edit_checks run; "
+                "problems are reported at the end of the result and the write is not rolled back. Policy+approval guarded.",
                 {
                     "type": "object",
-                    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                    "properties": {
+                        "path": {"type": "string", "description": "File path relative to workspace root."},
+                        "content": {
+                            "type": "string",
+                            "description": "The complete file content. Pass an empty string to write an empty file.",
+                        },
+                    },
                     "required": ["path", "content"],
                 },
                 _builtins.write_file,
@@ -596,11 +615,19 @@ class ToolRegistry:
             ),
             (
                 "apply_diff",
-                "Apply sequential search/replace diffs to a file. "
-                "Each diff specifies an exact 'search' string and a 'replace' string. "
-                "The search must match 100% exactly (including whitespace and indentation). "
-                "Multiple diffs are applied in order; each operates on the result of the previous. "
-                "If 'start_line' is omitted and search matches multiple locations, the diff is rejected. "
+                "Edit a file with search/replace diffs, applied in order; each diff operates on the result of the previous ones. "
+                "All diffs are matched in memory first: if any of them cannot be applied, nothing is written and the result lists "
+                "every failing diff with its reason and the candidate line numbers; fix those and send all diffs again. "
+                "Matching levels, tried in order, the first that finds anything decides: exact; same text with different overall "
+                "indentation (replace is re-indented to the target); each line trimmed of leading/trailing whitespace; runs of "
+                "whitespace collapsed; \\n, \\t, \\\", \\\\ escapes in search and replace taken as the real characters; leading/trailing "
+                "blank lines of search ignored; anchor block (first and last lines equal after trimming, middle lines similar). "
+                "A level counts only when it matches one place; with several matches start_line picks the first one at or after "
+                "that line, otherwise the diff fails with the candidate lines. A fuzzy match spanning far more text than search is rejected. "
+                "The result reports the level used for each diff and the edited line ranges; for a file you read in this conversation it also "
+                "echoes the edited regions with line numbers and 2 lines of context, and a failure shows the closest matching snippet. "
+                "Refused if the file changed after you last read it. Line endings, UTF-8 BOM and permissions are preserved and the "
+                "write is atomic. After writing, the same syntax check and edit_checks commands as write_file run. "
                 "Policy+approval guarded.",
                 {
                     "type": "object",
@@ -617,15 +644,15 @@ class ToolRegistry:
                                 "properties": {
                                     "search": {
                                         "type": "string",
-                                        "description": "Exact text to find. Must match 100% including whitespace and indentation.",
+                                        "description": "Text to find, copied from the file without the line-number prefix. Exact text works best; whitespace and indentation differences are tolerated.",
                                     },
                                     "replace": {
                                         "type": "string",
-                                        "description": "Replacement text.",
+                                        "description": "Replacement text. When the match was found at a different indentation, it is re-indented to the target.",
                                     },
                                     "start_line": {
                                         "type": "integer",
-                                        "description": "(Recommended) 1-based line number to start searching from. Required when search matches multiple locations. Note: line numbers refer to content AFTER previous diffs in the array have been applied.",
+                                        "description": "1-based line number in the file as you read it, before any diff of this call (line shifts from earlier diffs are compensated). Only used when search matches more than one place: the first match at or after this line is taken. Ignored when search matches exactly one place.",
                                     },
                                 },
                                 "required": ["search", "replace"],

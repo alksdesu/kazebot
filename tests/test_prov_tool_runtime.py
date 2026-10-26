@@ -360,13 +360,13 @@ class TestToolFailuresStayInsideTheCall:
 
     @pytest.mark.asyncio
     async def test_writing_over_a_directory_fails_the_call_not_the_task(self, tmp_path: Path) -> None:
-        # Linux 上是 IsADirectoryError，Windows 上是 PermissionError；两种都只能是一次失败的工具调用。
+        # write_file 写之前先认出目标是目录，两个平台给同一句报错，只是一次失败的工具调用。
         (tmp_path / "data").mkdir()
 
         result = await _execute(_registry(tmp_path), "write_file", {"path": "data", "content": "x"})
 
         assert result["ok"] is False
-        assert result["error"].startswith("tool write_file failed: ")
+        assert "是目录" in result["error"]
         assert result["data"]["result"] == f"ERROR: {result['error']}"
         assert (tmp_path / "data").is_dir()
 

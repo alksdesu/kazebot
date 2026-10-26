@@ -130,7 +130,8 @@ def test_read_file_without_range_auto_truncates_large_text_file(tmp_path: Path) 
     assert entry["truncated"] is True
     assert entry["totalLines"] == 600
     assert entry["shownLines"] == 500
-    assert "Use startLine/endLine" in entry["hint"]
+    assert entry["nextStartLine"] == 501
+    assert "继续读用 startLine=501" in entry["hint"]
     assert "line-500" in entry["content"]
     assert "line-501" not in entry["content"]
 

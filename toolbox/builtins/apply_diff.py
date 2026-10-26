@@ -1,19 +1,22 @@
 """apply_diff — apply sequential search/replace diffs to a file (policy + approval guarded).
 
-Each diff in the array is applied in order. The search string must match exactly
-(including whitespace and indentation). If start_line is omitted and the search
-string appears more than once, the diff is rejected.
-
-After diffs[0] is applied, diffs[1] operates on the *resulting* content, and so on.
-"""
+All diffs are matched in memory first (see ``toolbox.edit_match``); the file is written only
+when every one of them applies. diffs[1] operates on the result of diffs[0], and so on."""
 from __future__ import annotations
 
+import asyncio
+import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .. import file_state
 from ..context import ToolContext
 from .._common import request_guard, resolve_under_allowed_roots
-from ..text_files import rewrite_text
+from ..edit_match import DiffOutcome, DiffRequest, FailedDiff, apply_diffs, line_range
+from ..syntax_check import EditChecks, run_edit_checks
+from ..text_files import TextLayout, decode_text, encode_text, normalize_newlines, split_lines
+from .read_file import number_prefix, render_lines
 
 
 # ---------------------------------------------------------------------------
@@ -21,6 +24,14 @@ from ..text_files import rewrite_text
 # ---------------------------------------------------------------------------
 
 _MAX_FILE_SIZE = 1024 * 1024 * 64  # 64 MiB — generous but bounded
+ECHO_CONTEXT_LINES = 2
+ECHO_MAX_CHARS = 6000
+_ECHO_REGION_MAX_LINES = 40
+_ECHO_REGION_HEAD_LINES = 25
+_ECHO_REGION_TAIL_LINES = 10
+_ECHO_LINE_CHARS = 500
+_SNIPPET_MAX_LINES = 12
+_SNIPPET_LINE_CHARS = 300
 
 
 # ---------------------------------------------------------------------------
@@ -28,117 +39,8 @@ _MAX_FILE_SIZE = 1024 * 1024 * 64  # 64 MiB — generous but bounded
 # ---------------------------------------------------------------------------
 
 
-def _find_match_lines(content: str, search: str, limit: int = 20) -> list[int]:
-    """找出 search 在 content 中所有匹配位置的起始行号(1-based)。
-
-    改进2辅助函数：在多匹配场景下，提供每个匹配的行号候选列表，
-    帮助 AI 快速定位正确的 start_line，而不是只返回匹配数量。
-    """
-    lines: list[int] = []
-    start = 0
-    while len(lines) < limit:
-        idx = content.find(search, start)
-        if idx == -1:
-            break
-        line_no = content[:idx].count('\n') + 1
-        lines.append(line_no)
-        start = idx + max(1, len(search))
-    return lines
-
-
-def _find_and_replace(
-    content: str,
-    search: str,
-    replace: str,
-    start_line: int | None,
-) -> tuple[str, str | None, list[int] | None]:
-    """Apply a single search/replace on *content*.
-
-    Returns (new_content, error_message | None, candidate_lines | None).
-    error_message is None on success.
-    candidate_lines is populated when multiple matches exist without a valid start_line.
-    """
-    if not search:
-        return content, "Empty search string is not allowed.", None
-
-    # 改进1 & 2: 先做全局计数，用于唯一匹配优先判断和候选行号收集
-    count = content.count(search)
-
-    if start_line is not None:
-        # 改进1: 唯一匹配时忽略 start_line —— 即使 AI 给了过期的行号，
-        # 只要 search 内容在文件中唯一，就直接替换，不因行号偏移而失败。
-        if count == 1:
-            new_content = content.replace(search, replace, 1)
-            return new_content, None, None
-
-        if count == 0:
-            return content, (
-                "No exact match found. "
-                "Please verify the content matches exactly."
-            ), None
-
-        # count > 1: 多匹配场景，使用 start_line 定位（原有逻辑）
-        lines = content.split("\n")
-        if start_line < 1 or start_line > len(lines):
-            return content, (
-                f"start_line {start_line} is out of range "
-                f"(file has {len(lines)} lines)."
-            ), None
-
-        # Build the prefix (lines before start_line) and the search region.
-        prefix = "\n".join(lines[: start_line - 1])
-        region = "\n".join(lines[start_line - 1:])
-
-        idx = region.find(search)
-        if idx == -1:
-            return content, (
-                "No exact match found starting from line "
-                f"{start_line}. Please verify the content matches exactly."
-            ), None
-
-        # Replace the *first* occurrence in region.
-        new_region = region[:idx] + replace + region[idx + len(search):]
-        separator = "\n" if prefix else ""
-        new_content = prefix + separator + new_region
-        return new_content, None, None
-
-    # Global search: require unique match.
-    if count == 0:
-        return content, (
-            "No exact match found. "
-            "Please verify the content matches exactly."
-        ), None
-    if count > 1:
-        # 改进2: 多匹配时返回候选行号，帮助 AI 快速定位正确位置
-        candidate_lines = _find_match_lines(content, search)
-        return content, (
-            f"Multiple matches found ({count}). "
-            "Please provide 'start_line' parameter to specify which match to use. "
-            f"Candidate match lines: {', '.join(str(l) for l in candidate_lines)}."
-        ), candidate_lines
-
-    new_content = content.replace(search, replace, 1)
-    return new_content, None, None
-
-
-# ---------------------------------------------------------------------------
-#  Main entry point
-# ---------------------------------------------------------------------------
-
-
-def _apply_diff_result_text(path: str, applied: int, failed: int) -> str:
-    # [AutoC 2026-05-31] Why: apply_diff now needs a canonical readable transcript
-    # in data.result. How: use the same compact path/applied/rejected summary that
-    # existing formatter tests expect. Purpose: keep tool history stable while the
-    # structured payload moves under data.
-    return f"apply_diff on {path}: {applied} applied, {failed} rejected"
-
-
 def _apply_diff_error_response(error: Any, path: str = "", **data_fields: Any) -> dict[str, Any]:
-    # [AutoC 2026-05-31] Why: every apply_diff failure should include ok=false and
-    # data.result, including validation and policy failures that occur before counts
-    # exist. How: normalize the error and add any known path/count details under
-    # data. Purpose: make failed diffs readable and schema-consistent.
+    # Every failure carries ok=false and data.result; data_fields may override data.result with a fuller report.
     text = str(error)
     data: dict[str, Any] = {"result": f"ERROR: {text}"}
     if path:
@@ -147,18 +49,317 @@ def _apply_diff_error_response(error: Any, path: str = "", **data_fields: Any) -
     return {"ok": False, "success": False, "error": text, "data": data}
 
 
+def _start_line(raw: Any) -> int | None:
+    """``start_line`` as an int; raises ValueError for anything that is not a whole number."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        raise ValueError(raw)
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(raw) from exc
+
+
+def _parse_diffs(diffs: list[Any]) -> tuple[list[DiffRequest], list[tuple[int, str]]]:
+    requests: list[DiffRequest] = []
+    problems: list[tuple[int, str]] = []
+    for index, entry in enumerate(diffs):
+        if not isinstance(entry, dict):
+            problems.append((index, "diff 必须是对象，含 search 和 replace"))
+            continue
+        search = entry.get("search")
+        replace = entry.get("replace")
+        if search is None:
+            problems.append((index, "缺少 search"))
+            continue
+        if replace is None:
+            problems.append((index, "缺少 replace"))
+            continue
+        search_text = search if isinstance(search, str) else str(search)
+        if search_text == "":
+            problems.append((index, "search 是空的；要在文件里插入内容，就把插入点附近的一段原文连同新内容一起写进 replace"))
+            continue
+        try:
+            start_line = _start_line(entry.get("start_line"))
+        except ValueError:
+            problems.append((index, f"start_line 必须是整数，收到 {type(entry.get('start_line')).__name__}"))
+            continue
+        requests.append(DiffRequest(index, search_text, replace if isinstance(replace, str) else str(replace), start_line))
+    return requests, problems
+
+
+@dataclass(frozen=True)
+class _Transaction:
+    """status: written / unchanged / failed / stale / missing / not_text / too_large."""
+
+    status: str
+    gate: file_state.Gate
+    outcome: DiffOutcome | None = None
+    stamp: file_state.Stamp | None = None
+    byte_count: int = 0
+    size: int = 0
+
+
+def _transact(session: str, resolved: Path, requests: list[DiffRequest]) -> _Transaction:
+    """Read, check the stamp, apply every diff in memory and write only if all of them applied."""
+    with file_state.edit_lock(resolved):
+        try:
+            size = os.stat(resolved).st_size
+        except FileNotFoundError:
+            return _Transaction("missing", file_state.Gate(None))
+        if size > _MAX_FILE_SIZE:
+            return _Transaction("too_large", file_state.Gate(None), size=size)
+        snapshot = file_state.take_snapshot(resolved)
+        if not snapshot.exists:
+            return _Transaction("missing", file_state.Gate(None))
+        gate = file_state.inspect(session, resolved, snapshot)
+        if gate.stale:
+            return _Transaction("stale", gate)
+        if len(snapshot.data) > _MAX_FILE_SIZE:
+            return _Transaction("too_large", gate, size=len(snapshot.data))
+        try:
+            text = decode_text(snapshot.data)
+        except UnicodeDecodeError:
+            return _Transaction("not_text", gate)
+        outcome = apply_diffs(normalize_newlines(text), requests)
+        if not outcome.ok:
+            return _Transaction("failed", gate, outcome)
+        if not outcome.changed:
+            return _Transaction("unchanged", gate, outcome)
+        data = encode_text(outcome.content, TextLayout.of_bytes(snapshot.data))
+        stamp = file_state.commit_locked(resolved, data, expected=snapshot)
+        file_state.remember(session, resolved, stamp, revealable=gate.revealable)
+        return _Transaction("written", gate, outcome, stamp, len(data))
+
+
+def _closest_lines(failed: FailedDiff) -> list[str]:
+    closest = failed.failure.closest
+    if closest is None:
+        return []
+    # Shown in the numbering start_line uses: the file as read, before the earlier diffs of this call.
+    first_shown = closest.first + 1 - failed.line_delta
+    last_shown = closest.last + 1 - failed.line_delta
+    out = [f"  最接近的是第 {first_shown}-{last_shown} 行（相似度 {closest.similarity:.2f}）："]
+    window = split_lines(failed.content)[closest.first:closest.last + 1]
+    prefix = number_prefix(max(4, len(str(last_shown))))
+    rendered = render_lines(window[:_SNIPPET_MAX_LINES], first_shown, prefix, limit=_SNIPPET_LINE_CHARS)
+    out.extend("    " + line for line, _clipped in rendered)
+    if len(window) > _SNIPPET_MAX_LINES:
+        out.append(f"    …（还有 {len(window) - _SNIPPET_MAX_LINES} 行没有列出）")
+    return out
+
+
+def _failure_response(path_str: str, outcome: DiffOutcome, diff_count: int, *, reveal: bool) -> dict[str, Any]:
+    failed = sorted(outcome.failed, key=lambda item: item.index)
+    first_reason = failed[0].failure.message
+    error = f"{len(failed)} 个 diff 没能应用，文件没有改动：diffs[{failed[0].index}] {first_reason}"
+    lines = [
+        f"ERROR: apply_diff 没有修改 {path_str}：{diff_count} 个 diff 中有 {len(failed)} 个没能应用，文件保持原样。"
+        "修正后把全部 diff 一起重新提交。",
+    ]
+    failed_entries: list[dict[str, Any]] = []
+    for item in failed:
+        failure = item.failure
+        lines.append(f"diffs[{item.index}] 没能应用：{failure.message}")
+        entry: dict[str, Any] = {"index": item.index, "reason": failure.reason, "error": failure.message}
+        if failure.level is not None:
+            entry["level"] = failure.level.key
+        if failure.via is not None:
+            entry["via"] = failure.via.key
+        if failure.candidate_lines:
+            entry["candidateLines"] = list(failure.candidate_lines)
+        if failure.total:
+            entry["totalMatches"] = failure.total
+        if failure.closest is not None:
+            if reveal:
+                lines.extend(_closest_lines(item))
+                entry["closest"] = {
+                    "startLine": failure.closest.first + 1 - item.line_delta,
+                    "endLine": failure.closest.last + 1 - item.line_delta,
+                    "similarity": round(failure.closest.similarity, 2),
+                }
+            else:
+                lines.append("  （本会话没有读过这个文件的当前版本，不提供相近的片段；先 read_file 再改）")
+        failed_entries.append(entry)
+    matched_entries = []
+    for applied in sorted(outcome.applied, key=lambda item: item.index):
+        lines.append(f"diffs[{applied.index}] 可以应用（{applied.match.label}），因为有 diff 失败没有写入")
+        matched_entries.append({"index": applied.index, "level": applied.match.level.key})
+    return _apply_diff_error_response(
+        error,
+        path_str,
+        result="\n".join(lines),
+        message=f"{path_str} 没有改动：{len(failed)} 个 diff 没能应用",
+        failedDiffs=failed_entries,
+        matchedDiffs=matched_entries,
+        appliedCount=0,
+        matchedCount=len(matched_entries),
+        failedCount=len(failed_entries),
+        diffCount=diff_count,
+        totalCount=diff_count,
+    )
+
+
+def _diff_summaries(outcome: DiffOutcome) -> tuple[list[str], list[dict[str, Any]]]:
+    lines: list[str] = []
+    entries: list[dict[str, Any]] = []
+    for applied in sorted(outcome.applied, key=lambda item: item.index):
+        match = applied.match
+        start, end = outcome.spans.get(applied.index, (match.start, match.start + len(match.replacement)))
+        first, last = line_range(outcome.content, start, end)
+        if start == end:
+            where = f"删掉了内容，原处在改后的第 {first} 行"
+        elif first == last:
+            where = f"改动后在第 {first} 行"
+        else:
+            where = f"改动后在第 {first}-{last} 行"
+        text = f"diffs[{applied.index}] {match.label}，{where}"
+        if match.notes:
+            text += "；" + "；".join(match.notes)
+        lines.append(text)
+        entry: dict[str, Any] = {
+            "index": applied.index, "level": match.level.key, "label": match.label,
+            "startLine": first, "endLine": last,
+        }
+        if match.via is not None:
+            entry["via"] = match.via.key
+        if match.notes:
+            entry["notes"] = list(match.notes)
+        if match.similarity is not None:
+            entry["similarity"] = round(match.similarity, 2)
+        entries.append(entry)
+    return lines, entries
+
+
+def _echo_regions(outcome: DiffOutcome, total_lines: int) -> list[tuple[int, int, list[int]]]:
+    """Line windows (1-based, inclusive) around every edit, merged when they touch."""
+    regions: list[tuple[int, int, list[int]]] = []
+    for index, (start, end) in sorted(outcome.spans.items(), key=lambda item: item[1]):
+        first, last = line_range(outcome.content, start, end)
+        low = max(1, first - ECHO_CONTEXT_LINES)
+        high = min(total_lines, last + ECHO_CONTEXT_LINES)
+        if regions and low <= regions[-1][1] + 1:
+            prev_low, prev_high, indexes = regions[-1]
+            regions[-1] = (prev_low, max(prev_high, high), indexes + [index])
+        else:
+            regions.append((low, high, [index]))
+    return regions
+
+
+def _region_block(lines: list[str], low: int, high: int, indexes: list[int]) -> list[str]:
+    names = "、".join(f"diffs[{index}]" for index in sorted(indexes))
+    block = [f"── 第 {low}-{high} 行（{names}）──"]
+    numbers = list(range(low, high + 1))
+    if len(numbers) > _ECHO_REGION_MAX_LINES:
+        skipped = len(numbers) - _ECHO_REGION_HEAD_LINES - _ECHO_REGION_TAIL_LINES
+        numbers = numbers[:_ECHO_REGION_HEAD_LINES] + [0] + numbers[-_ECHO_REGION_TAIL_LINES:]
+    else:
+        skipped = 0
+    prefix = number_prefix(max(4, len(str(high))))
+    for line_no in numbers:
+        if line_no == 0:
+            block.append(f"…（中间 {skipped} 行没有列出）")
+            continue
+        rendered, _clipped = render_lines([lines[line_no - 1]], line_no, prefix, limit=_ECHO_LINE_CHARS)[0]
+        block.append(rendered)
+    return block
+
+
+def _echo_lines(outcome: DiffOutcome) -> list[str]:
+    lines = split_lines(outcome.content)
+    if not lines:
+        return ["改动后文件是空的。"]
+    out = [f"改动后的内容（按改后的行号，前后各带 {ECHO_CONTEXT_LINES} 行）："]
+    used = 0
+    regions = [region for region in _echo_regions(outcome, len(lines)) if region[0] <= region[1]]
+    for position, (low, high, indexes) in enumerate(regions):
+        for line in _region_block(lines, low, high, indexes):
+            if used + len(line) + 1 > ECHO_MAX_CHARS:
+                rest = regions[position:]
+                names = "、".join(f"diffs[{index}]" for _low, _high, idx in rest for index in sorted(idx))
+                spans = "、".join(f"{rest_low}-{rest_high}" for rest_low, rest_high, _idx in rest)
+                out.append(
+                    f"…回显超过 {ECHO_MAX_CHARS} 字符已截断：{names} 的改动没有完整显示，需要时用 read_file 看第 {spans} 行。"
+                )
+                return out
+            out.append(line)
+            used += len(line) + 1
+    return out
+
+
+def _success_response(
+    path_str: str,
+    outcome: DiffOutcome,
+    diff_count: int,
+    *,
+    written: bool,
+    byte_count: int,
+    reveal: bool,
+    checks: EditChecks | None,
+) -> dict[str, Any]:
+    summary_lines, entries = _diff_summaries(outcome)
+    if written:
+        head = f"已修改 {path_str}：{diff_count} 个 diff 全部应用并保存（{byte_count} 字节）。"
+    else:
+        head = f"{path_str} 没有变化：{diff_count} 个 diff 都匹配上了，但应用后的内容和原文件相同，没有写盘。"
+    lines = [head, *summary_lines]
+    if written:
+        lines.extend(
+            _echo_lines(outcome) if reveal
+            else ["（本会话没有读过这个文件的当前版本，不回显改动处的原文；需要时用 read_file 查看上面列出的行）"]
+        )
+    if checks is not None:
+        lines.extend(checks.lines())
+    data: dict[str, Any] = {
+        "result": "\n".join(lines),
+        "file": path_str,
+        "message": head,
+        "status": "accepted",
+        "diffCount": diff_count,
+        "appliedCount": diff_count,
+        "failedCount": 0,
+        "changed": written,
+        "diffs": entries,
+        "echoed": bool(written and reveal),
+    }
+    if written:
+        data["bytes"] = byte_count
+    if checks is not None:
+        data.update(checks.to_data())
+    return {"ok": True, "success": True, "data": data}
+
+
+# ---------------------------------------------------------------------------
+#  Main entry point
+# ---------------------------------------------------------------------------
+
+
 async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     path_str = str(args.get("path") or "").strip()
     diffs = args.get("diffs")
 
     # ------------------------------------------------------------------
-    #  Basic validation
+    #  Basic validation (before the guard: a malformed call should not raise an approval)
     # ------------------------------------------------------------------
     if not path_str:
         return _apply_diff_error_response("'path' is required.")
 
     if not isinstance(diffs, list) or len(diffs) == 0:
         return _apply_diff_error_response("'diffs' must be a non-empty array.", path_str)
+
+    requests, problems = _parse_diffs(diffs)
+    if problems:
+        detail = "；".join(f"diffs[{index}] {problem}" for index, problem in problems)
+        return _apply_diff_error_response(
+            f"diff 参数有误，文件没有改动：{detail}",
+            path_str,
+            failedDiffs=[{"index": index, "reason": "invalid", "error": problem} for index, problem in problems],
+            appliedCount=0,
+            failedCount=len(problems),
+            diffCount=len(diffs),
+            totalCount=len(diffs),
+        )
 
     # ------------------------------------------------------------------
     #  Policy + approval guard (same flow as write_file)
@@ -191,7 +392,7 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         return _apply_diff_error_response(err.get("error", "denied"), path_str)
 
     # ------------------------------------------------------------------
-    #  Resolve & read file
+    #  Resolve, then read + match + write as one locked transaction
     # ------------------------------------------------------------------
     try:
         resolved = resolve_under_allowed_roots(ctx.workspace_root, path_str)
@@ -199,152 +400,45 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         return _apply_diff_error_response(str(exc), path_str)
 
     if not resolved.exists() or not resolved.is_file():
-        return _apply_diff_error_response(f"File not found: {path_str}", path_str)
+        return _apply_diff_error_response(f"文件不存在：{path_str}", path_str)
 
-    file_size = resolved.stat().st_size
-    if file_size > _MAX_FILE_SIZE:
+    session = file_state.session_key(ctx)
+    try:
+        tx = await asyncio.to_thread(_transact, session, resolved, requests)
+    except file_state.ConcurrentEdit as exc:
+        return _apply_diff_error_response(str(exc), path_str, conflict=True)
+    except OSError as exc:
+        return _apply_diff_error_response(f"读写文件失败：{exc}", path_str)
+
+    if tx.status == "missing":
+        return _apply_diff_error_response(f"文件不存在：{path_str}", path_str)
+    if tx.status == "stale":
+        return _apply_diff_error_response(file_state.STALE_MESSAGE, path_str, stale=True)
+    if tx.status == "too_large":
         return _apply_diff_error_response(
-            f"File is too large ({file_size} bytes). Maximum editable size is {_MAX_FILE_SIZE} bytes.",
+            f"文件太大（{tx.size} 字节），apply_diff 最多改 {_MAX_FILE_SIZE} 字节的文件。",
             path_str,
-            fileSize=file_size,
+            fileSize=tx.size,
             maxFileSize=_MAX_FILE_SIZE,
         )
+    if tx.status == "not_text":
+        return _apply_diff_error_response("文件不是 UTF-8 文本，apply_diff 改不了。", path_str)
 
-    try:
-        content = resolved.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return _apply_diff_error_response("File is not valid UTF-8 text.", path_str)
-    except Exception as exc:
-        return _apply_diff_error_response(f"Failed to read file: {exc}", path_str)
+    outcome = tx.outcome
+    if outcome is None:
+        return _apply_diff_error_response(f"apply_diff 没有得到匹配结果（{tx.status}）", path_str)
+    if tx.status == "failed":
+        needs_reveal = any(item.failure.closest is not None for item in outcome.failed)
+        reveal = needs_reveal and file_state.reveal_allowed(tx.gate)
+        return _failure_response(path_str, outcome, len(diffs), reveal=reveal)
 
-    # ------------------------------------------------------------------
-    #  Apply diffs sequentially
-    # ------------------------------------------------------------------
-    applied_count = 0
-    failed_count = 0
-    failed_diffs: list[dict[str, Any]] = []
-
-    # 改进3: lineDelta 行号偏移维护 —— 前面的 diff 增删行后，后续 diff
-    # 的 start_line 需要相应调整，避免因行号漂移导致定位失败。
-    line_delta = 0
-
-    for i, diff_entry in enumerate(diffs):
-        if not isinstance(diff_entry, dict):
-            failed_count += 1
-            failed_diffs.append({"index": i, "error": "diff entry must be an object."})
-            continue
-
-        search = diff_entry.get("search")
-        replace = diff_entry.get("replace")
-
-        if search is None:
-            failed_count += 1
-            failed_diffs.append({"index": i, "error": "'search' is required."})
-            continue
-        if replace is None:
-            failed_count += 1
-            failed_diffs.append({"index": i, "error": "'replace' is required."})
-            continue
-
-        search = str(search)
-        replace = str(replace)
-
-        start_line_raw = diff_entry.get("start_line")
-        start_line: int | None = None
-        if start_line_raw is not None:
-            try:
-                start_line = int(start_line_raw)
-            except (TypeError, ValueError):
-                failed_count += 1
-                failed_diffs.append({
-                    "index": i,
-                    "error": f"'start_line' must be an integer, got {type(start_line_raw).__name__}.",
-                })
-                continue
-
-        # 改进3: 用累积的 line_delta 调整 start_line，补偿前序 diff 的行数增减
-        adjusted_start_line = start_line
-        if start_line is not None:
-            adjusted_start_line = start_line + line_delta
-
-        new_content, error, candidate_lines = _find_and_replace(
-            content, search, replace, adjusted_start_line,
-        )
-        if error is not None:
-            failed_count += 1
-            fail_entry: dict[str, Any] = {"index": i, "error": error}
-            # 改进2: 在 failed_diffs 条目中附带候选行号，方便 AI 重试时选择正确行
-            if candidate_lines is not None:
-                fail_entry["candidateLines"] = candidate_lines
-            failed_diffs.append(fail_entry)
-            # Don't update content — skip this diff and continue with next.
-            continue
-
-        # 改进3: 计算本次 diff 的行数变化并累加到 line_delta
-        old_line_count = search.count('\n') + 1
-        new_line_count = replace.count('\n') + 1
-        line_delta += new_line_count - old_line_count
-
-        content = new_content
-        applied_count += 1
-
-    diff_count = len(diffs)
-
-    # ------------------------------------------------------------------
-    #  All diffs failed → return error, do NOT write
-    # ------------------------------------------------------------------
-    if applied_count == 0:
-        first_error = failed_diffs[0]["error"] if failed_diffs else "unknown"
-        return _apply_diff_error_response(
-            f"Failed to apply any diffs: {first_error}",
-            path_str,
-            message=f"Failed to apply any diffs to {path_str}.",
-            failedDiffs=failed_diffs,
-            appliedCount=0,
-            totalCount=diff_count,
-            failedCount=failed_count,
+    if tx.status == "unchanged":
+        return _success_response(
+            path_str, outcome, len(diffs), written=False, byte_count=0, reveal=False, checks=None,
         )
 
-    # ------------------------------------------------------------------
-    #  At least one diff succeeded → write result to disk
-    # ------------------------------------------------------------------
-    try:
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        rewrite_text(resolved, content)
-    except Exception as exc:
-        return _apply_diff_error_response(
-            f"Failed to write file: {exc}",
-            path_str,
-            appliedCount=applied_count,
-            failedCount=failed_count,
-        )
-
-    # ------------------------------------------------------------------
-    #  Build response
-    # ------------------------------------------------------------------
-    if failed_count == 0:
-        message = f"Diff applied and saved to {path_str}"
-    else:
-        message = (
-            f"Partially applied diffs to {path_str}: "
-            f"{applied_count} succeeded, {failed_count} failed. "
-            f"Saved successfully."
-        )
-
-    data: dict[str, Any] = {
-        "result": _apply_diff_result_text(path_str, applied_count, failed_count),
-        "file": path_str,
-        "message": message,
-        "status": "accepted",
-        "diffCount": diff_count,
-        "appliedCount": applied_count,
-        "failedCount": failed_count,
-    }
-    if failed_diffs:
-        data["failedDiffs"] = failed_diffs
-
-    # [AutoC 2026-05-31] Why: successful apply_diff results should expose ok=true
-    # and data.result like all other tools. How: keep the legacy success flag while
-    # adding the unified ok field. Purpose: preserve compatibility and schema
-    # consistency during migration.
-    return {"ok": True, "success": True, "data": data}
+    reveal = file_state.reveal_allowed(tx.gate)
+    checks = await run_edit_checks(ctx, resolved, outcome.content, tool_name="apply_diff")
+    return _success_response(
+        path_str, outcome, len(diffs), written=True, byte_count=tx.byte_count, reveal=reveal, checks=checks,
+    )

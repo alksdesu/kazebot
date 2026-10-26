@@ -152,6 +152,17 @@ def _dispatch_target(tool_name: str, args: dict) -> str:
     return _clip_one_line(args.get("target_node") or args.get("target") or suffix, 40)
 
 
+def _edit_check_suffix(result_data: dict) -> str:
+    """write_file / apply_diff 写成了但改后检查没过：进度行里也得看得出来。"""
+    syntax = result_data.get("syntaxCheck")
+    if isinstance(syntax, dict) and syntax.get("ok") is False:
+        return "，语法检查未通过"
+    checks = result_data.get("externalChecks")
+    if isinstance(checks, list) and any(isinstance(check, dict) and check.get("ok") is False for check in checks):
+        return "，外部检查未通过"
+    return ""
+
+
 def summarize_result(tool_name: str, result: Any, *, args: dict | None = None) -> str:
     """生成简短的工具结果摘要。"""
     # [summary-args 2026-05-19] Why: approval events already carry full details,
@@ -188,13 +199,15 @@ def summarize_result(tool_name: str, result: Any, *, args: dict | None = None) -
         if isinstance(data, dict):
             sc = data.get("successCount", 0)
             fc = data.get("failCount", 0)
+            oc = data.get("omittedCount", 0)
             tc = data.get("totalCount", 0)
             if tc == 1 and sc == 1:
                 rs = data.get("results", [])
                 p = rs[0].get("path", "") if rs else result.get("path", "")
                 return _summary_line(f"已读取 {p}")
-            if fc > 0:
-                return _summary_line(f"读取 {tc} 个文件: {sc} 成功, {fc} 失败")
+            if fc > 0 or oc > 0:
+                skipped = f", {oc} 个超出单次上限未读" if oc else ""
+                return _summary_line(f"读取 {tc} 个文件: {sc} 成功, {fc} 失败{skipped}")
             return _summary_line(f"已读取 {sc} 个文件")
         return _summary_line(f"已读取 {result.get('path', '') or safe_args.get('path', '')}")
     if tool_name == "execute_command":
@@ -208,7 +221,8 @@ def summarize_result(tool_name: str, result: Any, *, args: dict | None = None) -
         # [AutoC 2026-05-31] Why: write_file now stores path under data. How: prefer
         # data.path while preserving legacy top-level path and argument fallback.
         # Purpose: keep file-write progress readable through the migration.
-        return _summary_line(f"已写入 {result_data.get('path', '') or result.get('path', '') or safe_args.get('path', '')}")
+        written = result_data.get('path', '') or result.get('path', '') or safe_args.get('path', '')
+        return _summary_line(f"已写入 {written}{_edit_check_suffix(result_data)}")
     if tool_name == "search_in_files":
         q = _clip_one_line(safe_args.get("query", ""), 30)
         p = _clip_one_line(safe_args.get("path", "."), 40)
@@ -219,7 +233,8 @@ def summarize_result(tool_name: str, result: Any, *, args: dict | None = None) -
         p = _clip_one_line(safe_args.get("path", ""), 60)
         diffs = safe_args.get("diffs", [])
         n = len(diffs) if isinstance(diffs, list) else 0
-        return _summary_line(f"差异应用 {p} ({n} 处修改)")
+        unchanged = "，内容无变化" if result_data.get("changed") is False else ""
+        return _summary_line(f"差异应用 {p} ({n} 处修改{unchanged}){_edit_check_suffix(result_data)}")
     if tool_name == "save_memory":
         memory_id = _clip_one_line(safe_args.get("id", ""), 40)
         book = _clip_one_line(safe_args.get("book", "default"), 40)
