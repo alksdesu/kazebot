@@ -403,6 +403,7 @@ class ClonothClient:
         comment: str | None = None,
         approver: PlatformAuth | Mapping[str, Any] | None = None,
         grant_minutes: int | None = None,
+        grant_permanent: bool = False,
     ) -> ApprovalDecision:
         """提交审批决策并带回 supervisor 的回执，对应 POST /v1/approvals/{approval_id}。
 
@@ -411,7 +412,10 @@ class ClonothClient:
 
         approver 是作决定的人：他就是这条请求的发起人时，同意会顺带给他一段免审授权。
         grant_minutes 为 None 按策略默认时长，0 只同意这一次；超过策略上限按上限截断。
+        grant_permanent 要永久授权，和 grant_minutes 不能同时给；够不上时 supervisor 按时长上限给限时的。
         """
+        if grant_permanent and grant_minutes is not None:
+            raise ValueError("decide_approval takes grant_permanent or grant_minutes, not both")
         body: dict[str, Any] = {"decision": decision}
         if comment is not None:
             body["comment"] = comment
@@ -420,6 +424,8 @@ class ClonothClient:
             body["approver"] = identity
         if grant_minutes is not None:
             body["grant_minutes"] = max(0, int(grant_minutes))
+        if grant_permanent:
+            body["grant_permanent"] = True
         resp = await self._http().post(
             f"{self._base_url}/v1/approvals/{_path_id(approval_id)}", json=body,
         )

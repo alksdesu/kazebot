@@ -277,13 +277,14 @@ class TangQiuCallbacks:
             common.logger.warning("approval review pending but no QQ bot available: id=%s operation=%s", approval_id, operation)
             return
 
-        summary = approval._approval_summary(approval_id, operation, details or {})
         delivered = 0
         for admin_id in live.admin_users:
             try:
                 approval_context = proactive._request_send_context(
                     "approval-admin", f"{approval_id}:{admin_id}", conversation_key,
                 )
+                # 每人一份：发起人本人的那张多一句永久授权的说明。
+                summary = approval._approval_summary(approval_id, operation, details or {}, recipient=admin_id)
                 sent_mid = await sending._send_qq_message(
                     bot, {"type": "private", "user_id": int(admin_id)}, summary,
                     send_context=approval_context,

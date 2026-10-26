@@ -284,7 +284,10 @@ class ApproverIdentity(BaseModel):
 
 
 class ApprovalGrant(BaseModel):
-    """同意审批时给审批人本人的授权：until 之前他发起的任务里，原本要审批的操作直接放行。"""
+    """同意审批时给审批人本人的授权：until 之前他发起的任务里，原本要审批的操作直接放行。
+
+    永久授权 until 为空、minutes 为 0，只给管理员名单里的人，收回之前一直有效。
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -292,10 +295,12 @@ class ApprovalGrant(BaseModel):
     platform: str
     user_id: str
     bot_scope: str = ""
-    until: datetime
+    # 必须写出来：缺了这一项不能当成永久。
+    until: datetime | None
     minutes: int
     approval_id: str
     issued_at: datetime | None = None
+    permanent: bool = False
 
     @field_validator("until", "issued_at")
     @classmethod
@@ -305,6 +310,13 @@ class ApprovalGrant(BaseModel):
             return value.replace(tzinfo=timezone.utc)
         return value
 
+    @model_validator(mode="after")
+    def _permanent_has_no_until(self) -> "ApprovalGrant":
+        # 两项对不上的一律不认：until 写成空不能就此变成永久，标了永久的也不能带着到期时间。
+        if self.permanent != (self.until is None):
+            raise ValueError("a permanent grant has no until, a timed grant needs one")
+        return self
+
 
 class ApprovalDecisionIn(BaseModel):
     decision: Literal["allow", "deny"]
@@ -313,6 +325,14 @@ class ApprovalDecisionIn(BaseModel):
     approver: ApproverIdentity | None = None
     # None 按 policy 的 approval_grant.default_minutes；0 只同意这一次。
     grant_minutes: int | None = Field(default=None, ge=0)
+    # 要永久授权。够不上（不在管理员名单里、策略关了）就按时长上限给限时的。
+    grant_permanent: bool = False
+
+    @model_validator(mode="after")
+    def _one_duration(self) -> "ApprovalDecisionIn":
+        if self.grant_permanent and self.grant_minutes is not None:
+            raise ValueError("grant_permanent and grant_minutes cannot be given together")
+        return self
 
 
 class ApprovalGrantRevokeIn(BaseModel):
@@ -353,7 +373,8 @@ class Approval(BaseModel):
     # 旧事件里没有这三项，按没有授权处理。
     approver: ApproverIdentity | None = None
     grant: ApprovalGrant | None = None
-    # 同意了却没生成授权时的原因：once / disabled / not_requester / no_requester / no_approver。
+    # 同意了却没生成授权的原因：once / disabled / not_requester / no_requester / no_approver；
+    # 要了永久却只给了限时的原因：permanent_not_admin / permanent_disabled。
     grant_note: str | None = None
 
 

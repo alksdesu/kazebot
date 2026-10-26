@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 import yaml
 
 import config_layout
-from clonoth_runtime import classify_path, parse_extra_roots
+from clonoth_runtime import classify_path, parse_bool, parse_extra_roots
 from platforms.protection import policy_floor
 from platforms.registry import all_platforms
 
@@ -43,10 +43,11 @@ APPROVAL_GRANT_MINUTES_CEILING = 365 * 24 * 60
 
 @dataclass(frozen=True)
 class ApprovalGrantSettings:
-    """同意审批时给审批人本人授权多久。"""
+    """同意审批时给审批人本人授权多久；permanent_for_admins 为真时管理员名单里的人可以要永久授权。"""
 
     default_minutes: int = APPROVAL_GRANT_DEFAULT_MINUTES
     max_minutes: int = APPROVAL_GRANT_MAX_MINUTES
+    permanent_for_admins: bool = True
 
     def minutes_for(self, requested: int | None) -> int:
         """没指定按默认，指定了按指定的，都不超过上限；0 表示不授权。"""
@@ -213,6 +214,7 @@ def _default_policy_dict() -> dict[str, Any]:
         "approval_grant": {
             "default_minutes": APPROVAL_GRANT_DEFAULT_MINUTES,
             "max_minutes": APPROVAL_GRANT_MAX_MINUTES,
+            "permanent_for_admins": True,
         },
     }
 
@@ -350,7 +352,7 @@ def _grant_minutes_field(section: dict[str, Any], key: str, fallback: int) -> in
     return value
 
 
-def _validate_approval_grant_section(section: Any) -> dict[str, int]:
+def _validate_approval_grant_section(section: Any) -> dict[str, Any]:
     if not isinstance(section, dict):
         raise ValueError("approval_grant 必须是一个映射")
     max_minutes = _grant_minutes_field(section, "max_minutes", APPROVAL_GRANT_MAX_MINUTES)
@@ -359,7 +361,15 @@ def _validate_approval_grant_section(section: Any) -> dict[str, int]:
             f"approval_grant.max_minutes 要在 1 到 {APPROVAL_GRANT_MINUTES_CEILING}（365 天）之间，收到 {max_minutes}"
         )
     default_minutes = _grant_minutes_field(section, "default_minutes", APPROVAL_GRANT_DEFAULT_MINUTES)
-    return {"default_minutes": min(default_minutes, max_minutes), "max_minutes": max_minutes}
+    raw_permanent = section.get("permanent_for_admins")
+    permanent_for_admins = True if raw_permanent is None else parse_bool(raw_permanent)
+    if permanent_for_admins is None:
+        raise ValueError(f"approval_grant.permanent_for_admins 只能是 true 或 false，收到 {raw_permanent!r}")
+    return {
+        "default_minutes": min(default_minutes, max_minutes),
+        "max_minutes": max_minutes,
+        "permanent_for_admins": permanent_for_admins,
+    }
 
 
 def _validate_policy_dict(data: Any) -> dict[str, Any]:
@@ -433,7 +443,7 @@ _POLICY_KEYS: dict[str, frozenset[str]] = {
     "write_file": frozenset({"default", "rules"}),
     "execute_command": frozenset({"default", "deny_patterns", "sensitive_patterns", "sensitive_path_patterns"}),
     "restart": frozenset({"default"}),
-    "approval_grant": frozenset({"default_minutes", "max_minutes"}),
+    "approval_grant": frozenset({"default_minutes", "max_minutes", "permanent_for_admins"}),
 }
 _RULE_KEYS = frozenset({"pattern", "decision", "reason"})
 
@@ -559,7 +569,11 @@ class PolicyEngine:
         if cmd.get("sensitive_path_patterns") is None:
             cmd["sensitive_path_patterns"] = list(_DEFAULT_SENSITIVE_PATH_LITERALS)
         # 没写这一段时运行期用的是代码默认值，界面上要看到、存回去也不能丢。
-        cfg["approval_grant"] = {"default_minutes": grant.default_minutes, "max_minutes": grant.max_minutes}
+        cfg["approval_grant"] = {
+            "default_minutes": grant.default_minutes,
+            "max_minutes": grant.max_minutes,
+            "permanent_for_admins": grant.permanent_for_admins,
+        }
         return cfg, digest
 
     def replace_config(self, data: Any, *, base_hash: str | None = None) -> tuple[dict[str, Any], str]:
@@ -733,6 +747,7 @@ class PolicyEngine:
             self._approval_grant = ApprovalGrantSettings(
                 default_minutes=int(grant_sec["default_minutes"]),
                 max_minutes=int(grant_sec["max_minutes"]),
+                permanent_for_admins=bool(grant_sec["permanent_for_admins"]),
             )
         else:
             self._approval_grant = ApprovalGrantSettings()
@@ -917,7 +932,7 @@ class PolicyEngine:
         return _is_public_http_url(urls[0])
 
     def approval_grant_settings(self) -> ApprovalGrantSettings:
-        """同意审批时授权的默认时长和上限，按当前生效的那份策略。"""
+        """同意审批时授权的默认时长、上限和能不能要永久的，按当前生效的那份策略。"""
         self._reload_if_needed()
         return self._approval_grant
 

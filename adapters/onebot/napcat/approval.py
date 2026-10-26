@@ -14,9 +14,12 @@ from clonoth_sdk.types import (
     GRANT_NOTE_NO_REQUESTER,
     GRANT_NOTE_NOT_REQUESTER,
     GRANT_NOTE_ONCE,
+    GRANT_NOTE_PERMANENT_DISABLED,
+    GRANT_NOTE_PERMANENT_NOT_ADMIN,
     ApprovalDecision,
 )
 from platforms.builtin import QQ_NAPCAT
+from platforms.ids import normalize_id, same_id
 from ..live_config import live
 from ..segments import normalize_message_id
 
@@ -72,12 +75,16 @@ _APPROVAL_REPLY_UNRESOLVED_HINT = (
 
 _GRANT_DURATION_HINT = (
     "时长写法不对，这条审批没有处理。时长跟在审批 ID 后面，只认整数加单位："
-    "30m、2h、1d、45分钟、2小时；只批这一次写「单次」。\n"
+    "30m、2h、1d、45分钟、2小时；只批这一次写「单次」，一直免审到收回写「永久」。\n"
     "例：/审批 同意 <ID> 2h"
 )
 
 
 _REVOKE_HINT = "提前收回：私聊发送 /审批 收回"
+
+
+# 卡片发给发起这条请求的管理员本人时多这一句：永久授权只有他能拿到。
+_PERMANENT_CARD_HINT = "这条是你自己发起的：回「同意 永久」，以后你发起的操作都不再审批，直到私聊发 /审批 收回。"
 
 
 _GRANT_NOTE_TEXT: Mapping[str, str] = MappingProxyType({
@@ -86,6 +93,15 @@ _GRANT_NOTE_TEXT: Mapping[str, str] = MappingProxyType({
     GRANT_NOTE_NOT_REQUESTER: "这条请求不是你发起的，只同意了这一次，没有生成授权。",
     GRANT_NOTE_NO_REQUESTER: "查不到这条请求是谁发起的，只同意了这一次，没有生成授权。",
     GRANT_NOTE_NO_APPROVER: "认不出审批人的身份，只同意了这一次，没有生成授权。",
+    GRANT_NOTE_PERMANENT_NOT_ADMIN: "永久授权只给管理员名单里的人，只同意了这一次，没有生成授权。",
+    GRANT_NOTE_PERMANENT_DISABLED: "策略关掉了永久授权，只同意了这一次，没有生成授权。",
+})
+
+
+# 要了永久、退成限时授权时补的一句，{minutes} 是实际给的时长。
+_PERMANENT_FALLBACK_TEXT: Mapping[str, str] = MappingProxyType({
+    GRANT_NOTE_PERMANENT_NOT_ADMIN: "永久授权只给管理员名单里的人，这次按上限 {minutes}授权。",
+    GRANT_NOTE_PERMANENT_DISABLED: "策略关掉了永久授权，这次按上限 {minutes}授权。",
 })
 
 
@@ -161,8 +177,10 @@ async def _resolve_approval_reply_target(bot: Bot, event: Event) -> approvals.Ap
     return approvals.ApprovalReplyTarget()
 
 
-def _approval_summary(approval_id: str, operation: str, details: Dict[str, Any]) -> str:
-    """生成发给 QQ 管理员的审批摘要，限制长度并避免刷屏。"""
+def _approval_summary(
+    approval_id: str, operation: str, details: Dict[str, Any], *, recipient: Any = None,
+) -> str:
+    """生成发给 QQ 管理员 recipient 的审批摘要，限制长度并避免刷屏；请求是他本人发起的，多一句永久授权的说明。"""
     lines = [
         _APPROVAL_SUMMARY_HEADER,
         f"ID: {approval_id}",
@@ -179,10 +197,26 @@ def _approval_summary(approval_id: str, operation: str, details: Dict[str, Any])
         "",
         "【快捷审批】直接引用(回复)本消息，发送“同意”或“拒绝”即可。",
         "同意时可带时长，如「同意 2h」：你自己发起的请求，这段时间里免审批；不带按默认时长，「同意 单次」只批这一次。",
+    ])
+    if recipient is not None and _requested_by(details, recipient):
+        lines.append(_PERMANENT_CARD_HINT)
+    lines.extend([
         f"或手动发送：/审批 同意 {approval_id}",
         f"　　　　　/审批 拒绝 {approval_id}",
     ])
     return sending._truncate_qq_text("\n".join(lines))
+
+
+def _requested_by(details: Mapping[str, Any], admin_id: Any) -> bool:
+    """这条审批是不是 admin_id 以管理员身份自己发起的。按 supervisor 写进 details 的发起人认，认法和它发永久授权时一致。"""
+    auth = details.get("platform_auth")
+    if not isinstance(auth, Mapping) or not bool(auth.get("is_admin")):
+        return False
+    me = _approver(admin_id)
+    if str(auth.get("platform") or "").strip().lower() != me["platform"] or not same_id(auth.get("user_id"), me["user_id"]):
+        return False
+    theirs, mine = normalize_id(auth.get("bot_scope")), normalize_id(me["bot_scope"])
+    return not (theirs and mine) or theirs == mine
 
 
 def _parse_approval_command(text: str) -> Optional[approvals.ApprovalIntent]:
@@ -243,13 +277,24 @@ def _local_time(moment: datetime) -> str:
     return moment.astimezone(common._CST).strftime("%Y-%m-%d %H:%M")
 
 
-def _grant_receipt(result: ApprovalDecision, requested_minutes: Optional[int]) -> str:
-    """同意之后授权的交代：生成了就写到期时间和怎么收回，没生成就说为什么。"""
+def _grant_receipt(
+    result: ApprovalDecision, requested_minutes: Optional[int], requested_permanent: bool = False,
+) -> str:
+    """同意之后授权的交代：生成了就写到期时间（或永久）和怎么收回，没生成、没按要的给就说为什么。"""
     grant = result.grant
+    if grant is not None and grant.permanent:
+        lines = ["已授权：以后你发起的操作都不再审批，敏感操作也一样，直到收回；移出管理员名单后自动失效。"]
+        if not requested_permanent:
+            lines.append("你原有的是永久授权，照旧有效。")
+        lines.append(_REVOKE_HINT)
+        return "\n".join(lines)
     if grant is None or grant.until is None:
         return _GRANT_NOTE_TEXT.get(result.grant_note, "")
     lines = [f"已授权到 {_local_time(grant.until)}：这段时间里你发起的操作免审批，敏感操作也一样。"]
-    if requested_minutes is not None and grant.minutes < requested_minutes:
+    fallback = _PERMANENT_FALLBACK_TEXT.get(result.grant_note) if requested_permanent else None
+    if fallback:
+        lines.append(fallback.format(minutes=_minutes_text(grant.minutes)))
+    elif requested_minutes is not None and grant.minutes < requested_minutes:
         lines.append(f"要的时长超过了上限，按上限 {_minutes_text(grant.minutes)}授权。")
     if grant.issued_at is not None and grant.until > grant.issued_at + timedelta(minutes=grant.minutes):
         lines.append("你原有的授权到期更晚，到期时间沿用原来的。")
@@ -258,14 +303,19 @@ def _grant_receipt(result: ApprovalDecision, requested_minutes: Optional[int]) -
 
 
 def _decision_receipt(
-    approval_id: str, decision: str, operation: Any, result: ApprovalDecision, requested_minutes: Optional[int],
+    approval_id: str,
+    decision: str,
+    operation: Any,
+    result: ApprovalDecision,
+    requested_minutes: Optional[int],
+    requested_permanent: bool = False,
 ) -> str:
     lines = [
         f"已{('同意' if decision == approvals.DECISION_ALLOW else '拒绝')}审批：{approval_id}",
         f"操作：{operation or 'unknown'}",
     ]
     if decision == approvals.DECISION_ALLOW:
-        grant_text = _grant_receipt(result, requested_minutes)
+        grant_text = _grant_receipt(result, requested_minutes, requested_permanent)
         if grant_text:
             lines.append(grant_text)
     return "\n".join(lines)

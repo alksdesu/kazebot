@@ -14,7 +14,14 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 from ._helpers import SessionInfo, _now
-from .approval_grants import ApprovalGrantBook, GrantIdentity, grant_verdict, model_or_none, operation_target
+from .approval_grants import (
+    ApprovalGrantBook,
+    ApprovalGrantFile,
+    GrantIdentity,
+    grant_verdict,
+    model_or_none,
+    operation_target,
+)
 from .branch_finalize_store import BranchFinalizeClaimStore
 from .compact_breaker import CompactBreaker
 from .reply_intent import IntentRegistry
@@ -61,6 +68,11 @@ def _decided(level: SafetyLevel, reason: str) -> _OperationVerdict:
     return _OperationVerdict(OpRequestOut(safety_level=level, reason=reason, approval_id=None))
 
 
+def _auth_is_admin(platform_auth: dict[str, Any]) -> bool:
+    """platform_auth 记的是不是管理员名单里的人。逐条免审和永久授权按同一个判法。"""
+    return bool(platform_auth.get("is_admin"))
+
+
 class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
     """Supervisor 核心状态。管理会话、inbound 记录、task 队列与审批。"""
 
@@ -80,6 +92,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
         self.approvals: dict[str, Approval] = {}
         self.approval_grants = ApprovalGrantBook()
+        self._approval_grant_file = ApprovalGrantFile(workspace_root / "data" / "approval_grants.json")
 
         self.tasks: dict[str, Task] = {}
         self._task_order: list[str] = []
@@ -188,7 +201,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._restore_post_completion_work_from_events()
         self._restore_branch_finalize_claims_from_events()
         self._restore_memory_extract_intents_from_events()
-        self._restore_approval_grants_from_events()
+        self._restore_approval_grants()
         self._restore_recoverable_routes_from_events()
         self.recover_pending_completion_routes()
         self._reconcile_after_restart()
@@ -1449,9 +1462,16 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
     #  审批
     # ------------------------------------------------------------------ #
 
-    def _restore_approval_grants_from_events(self) -> int:
-        """按 approval_decided 里记下的授权和之后的 approval_grant_revoked 重建生效中的授权。"""
+    def _restore_approval_grants(self) -> int:
+        """读回落盘的授权，再按保留的事件重放 approval_decided 里的授权和 approval_grant_revoked，最后重写那份文件。
+
+        事件日志只从最旧的一头轮转，留下的总是连续的一段，所以在文件读回的结果上整段重放，和从头重放的结论一样。
+        """
+        saved = self._approval_grant_file.read()
         with self._lock:
+            now = _now()
+            for grant in saved or ():
+                self.approval_grants.store(grant, now=now)
             for event in self.eventlog.iter_persisted_events():
                 event_type = event.get("type")
                 payload = event.get("payload")
@@ -1461,12 +1481,24 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     self._apply_approval_decided(payload)
                 elif event_type == "approval_grant_revoked":
                     self._apply_approval_grant_revoked(payload)
-            restored = len(self.approval_grants.active(now=_now()))
+            restored = len(self.approval_grants.active(now=now))
+            self._save_approval_grants_locked()
         logger.info(
             "approval grants restored",
-            extra={"event": "approval_grant_restore", "active_count": restored},
+            extra={
+                "event": "approval_grant_restore",
+                "active_count": restored,
+                "from_file": saved is not None,
+            },
         )
         return restored
+
+    def _save_approval_grants_locked(self) -> None:
+        """生效中的授权整份落盘。写不进去只记一条：事件日志里还留着，轮转掉之前重启都重建得回来。"""
+        try:
+            self._approval_grant_file.write(self.approval_grants.active(now=_now()))
+        except OSError:
+            logger.exception("approval grants file write failed: %s", self._approval_grant_file.path)
 
     def _apply_approval_requested(self, payload: dict[str, Any]) -> None:
         try:
@@ -1560,8 +1592,9 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         comment: str | None = None,
         approver: dict[str, Any] | None = None,
         grant_minutes: int | None = None,
+        grant_permanent: bool = False,
     ) -> Approval | None:
-        """定案一条待审批。approver 是审批人本人、又是请求发起人时，同意顺带给他一段授权。"""
+        """定案一条待审批。approver 是审批人本人、又是请求发起人时，同意顺带给他一段授权；grant_permanent 要的是永久授权。"""
         grant_settings = self.policy.approval_grant_settings() if decision == "allow" else None
         with self._lock:
             a = self.approvals.get(approval_id)
@@ -1569,7 +1602,10 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 return a
             self._decide_approval_locked(
                 a, decision, comment,
-                approver=approver, grant_minutes=grant_minutes, grant_settings=grant_settings,
+                approver=approver,
+                grant_minutes=grant_minutes,
+                grant_permanent=grant_permanent,
+                grant_settings=grant_settings,
             )
             return a
 
@@ -1581,6 +1617,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         *,
         approver: dict[str, Any] | None = None,
         grant_minutes: int | None = None,
+        grant_permanent: bool = False,
         grant_settings: ApprovalGrantSettings | None = None,
     ) -> None:
         now = _now()
@@ -1588,16 +1625,26 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         grant: ApprovalGrant | None = None
         grant_note: str | None = None
         if decision == "allow":
+            settings = grant_settings or ApprovalGrantSettings()
+            requester_auth = self._approval_requester_auth_locked(a)
             verdict = grant_verdict(
                 approver=approver_identity,
-                requester=self._approval_requester_locked(a),
-                minutes=(grant_settings or ApprovalGrantSettings()).minutes_for(grant_minutes),
-                requested=grant_minutes,
+                requester=GrantIdentity.from_auth(requester_auth),
+                # 永久授权给不了时退成限时的，按上限给。
+                minutes=settings.max_minutes if grant_permanent else settings.minutes_for(grant_minutes),
+                requested=None if grant_permanent else grant_minutes,
+                permanent=grant_permanent,
+                permanent_enabled=settings.permanent_for_admins,
+                requester_is_admin=_auth_is_admin(requester_auth),
             )
             grant_note = verdict.note
             if verdict.identity is not None:
                 grant = self.approval_grants.draft(
-                    verdict.identity, minutes=verdict.minutes, approval_id=a.approval_id, now=now,
+                    verdict.identity,
+                    minutes=verdict.minutes,
+                    permanent=verdict.permanent,
+                    approval_id=a.approval_id,
+                    now=now,
                 )
         a.status = ApprovalStatus.allowed if decision == "allow" else ApprovalStatus.denied
         a.decision = decision
@@ -1627,19 +1674,20 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # 事件落盘之后才生效：重启后按事件重建，没记下的授权不能先在内存里放行。
         if grant is not None:
             self.approval_grants.store(grant, now=now)
+            self._save_approval_grants_locked()
 
-    def _approval_requester_locked(self, approval: Approval) -> GrantIdentity | None:
-        """审批请求的发起人：优先用 supervisor 按任务写进 details 的身份，取不到再按 task_id 回溯。"""
+    def _approval_requester_auth_locked(self, approval: Approval) -> dict[str, Any]:
+        """审批请求发起人的 platform_auth：优先用 supervisor 按任务写进 details 的，认不出人再按 task_id 回溯，都查不到是空的。"""
         # 没有 task_id 的审批，details 里的 platform_auth 是调用方自报的。
         if not approval.task_id:
-            return None
-        identity = GrantIdentity.from_auth((approval.details or {}).get("platform_auth"))
-        if identity is not None:
-            return identity
+            return {}
+        recorded = (approval.details or {}).get("platform_auth")
+        if isinstance(recorded, dict) and GrantIdentity.from_auth(recorded) is not None:
+            return dict(recorded)
         task = self.tasks.get(approval.task_id)
         if task is None:
-            return None
-        return GrantIdentity.from_auth(self._platform_auth_origin_locked(task)[1])
+            return {}
+        return self._platform_auth_origin_locked(task)[1]
 
     def list_approval_grants(self) -> list[ApprovalGrant]:
         """生效中的授权，按到期时间排。"""
@@ -1676,6 +1724,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                         "ts": now.isoformat(),
                     },
                 )
+                self._save_approval_grants_locked()
         if revoked:
             logger.info(
                 "approval grants revoked",
@@ -1789,7 +1838,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             channel=channel,
             platform=platform_auth.get("platform"),
         )
-        is_admin = bool(platform_auth.get("is_admin"))
+        is_admin = _auth_is_admin(platform_auth)
 
         if source.external and not is_admin:
             verdict = self._external_non_admin_verdict(op, parameters, source.label)
@@ -1838,6 +1887,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
         granted = self._approval_grant_verdict(
             identity=grant_identity,
+            # 永久授权只在发起人眼下还在管理员名单里、策略也还开着时算数：不用等谁想起来收回。
+            permanent_ok=is_admin and self.policy.approval_grant_settings().permanent_for_admins,
             session_id=session_id,
             op=op,
             parameters=parameters,
@@ -1856,6 +1907,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self,
         *,
         identity: GrantIdentity | None,
+        permanent_ok: bool,
         session_id: str,
         op: str,
         parameters: dict[str, Any],
@@ -1866,11 +1918,11 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         node_id: str,
         record_audit: bool,
     ) -> OpRequestOut | None:
-        """任务发起人名下有生效中的授权时直接放行；record_audit 为真时记一条 approval_grant_used 备查。"""
+        """任务发起人名下有生效中的授权时直接放行，permanent_ok 为假时永久授权不算；record_audit 为真时记一条 approval_grant_used 备查。"""
         if identity is None:
             return None
         with self._lock:
-            grant = self.approval_grants.active_for(identity, now=_now())
+            grant = self.approval_grants.active_for(identity, now=_now(), permanent_ok=permanent_ok)
             if grant is None:
                 return None
             if record_audit:
@@ -1887,7 +1939,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                         "platform": grant.platform,
                         "user_id": grant.user_id,
                         "bot_scope": grant.bot_scope,
-                        "until": grant.until.isoformat(),
+                        "until": grant.until.isoformat() if grant.until is not None else None,
+                        "permanent": grant.permanent,
                         "reason": policy_reason,
                         "sensitive": sensitive,
                         "target": operation_target(op, parameters),
@@ -1895,9 +1948,10 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                         "node_id": node_id,
                     },
                 )
+        span = "until revoked" if grant.until is None else f"until {grant.until.isoformat()}"
         return OpRequestOut(
             safety_level=SafetyLevel.auto,
-            reason=f"auto-approved: approval grant {grant.grant_id} until {grant.until.isoformat()} ({policy_reason})",
+            reason=f"auto-approved: approval grant {grant.grant_id} {span} ({policy_reason})",
             approval_id=None,
         )
 

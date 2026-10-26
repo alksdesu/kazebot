@@ -627,6 +627,8 @@ export interface PolicyRuleSection {
 export interface ApprovalGrantSettings {
   default_minutes: number;
   max_minutes: number;
+  /** 管理员名单里的人能不能要永久授权；没给按开着算。 */
+  permanent_for_admins?: boolean;
 }
 
 export interface PolicyDoc {

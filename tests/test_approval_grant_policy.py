@@ -1,4 +1,4 @@
-"""策略里的 approval_grant 段：同意审批时授权的默认时长和上限。
+"""策略里的 approval_grant 段：同意审批时授权的默认时长、上限，以及管理员能不能要永久授权。
 
 没写这一段按代码默认；写错整份拒绝、运行期沿用上一份；控制台和原文编辑器存回去都不能把它丢掉。
 """
@@ -48,6 +48,9 @@ _INVALID_SECTIONS = [
     pytest.param("approval_grant:\n  max_minutes: 0\n", id="zero-ceiling"),
     pytest.param("approval_grant:\n  max_minutes: -10\n", id="negative-ceiling"),
     pytest.param(f"approval_grant:\n  max_minutes: {APPROVAL_GRANT_MINUTES_CEILING + 1}\n", id="ceiling-past-a-year"),
+    pytest.param("approval_grant:\n  permanent_for_admins: maybe\n", id="permanent-not-a-switch"),
+    pytest.param("approval_grant:\n  permanent_for_admins: 2\n", id="permanent-a-number"),
+    pytest.param("approval_grant:\n  permanent_for_admins: ''\n", id="permanent-empty-text"),
 ]
 
 
@@ -65,6 +68,11 @@ def _section(default_minutes: int | None = None, max_minutes: int | None = None)
     if max_minutes is not None:
         lines.append(f"  max_minutes: {max_minutes}")
     return "\n".join(lines) + "\n"
+
+
+def _grant_section(default_minutes: int, max_minutes: int, *, permanent_for_admins: bool = True) -> dict[str, Any]:
+    """规范化之后的整段：三项都写出来。"""
+    return {"default_minutes": default_minutes, "max_minutes": max_minutes, "permanent_for_admins": permanent_for_admins}
 
 
 def _settings(engine: PolicyEngine) -> tuple[int, int]:
@@ -103,6 +111,7 @@ class TestTheSettings:
 
     def test_the_code_defaults(self) -> None:
         assert (ApprovalGrantSettings().default_minutes, ApprovalGrantSettings().max_minutes) == (30, 1440)
+        assert ApprovalGrantSettings().permanent_for_admins is True
         assert APPROVAL_GRANT_MINUTES_CEILING == 365 * 24 * 60
 
 
@@ -194,29 +203,57 @@ class TestTheSection:
 
         assert "approval_grant" not in engine.load_error
 
+    @pytest.mark.parametrize(("raw", "expected"), [
+        ("true", True), ("false", False), ("off", False), ("no", False), ("'false'", False), ("'on'", True), ("", True),
+    ])
+    def test_permanent_for_admins_reads_as_a_switch(self, tmp_path: Path, raw: str, expected: bool) -> None:
+        engine = _engine(tmp_path, _BASE + f"approval_grant:\n  permanent_for_admins: {raw}\n")
+
+        assert engine.approval_grant_settings().permanent_for_admins is expected
+        assert engine.load_error == ""
+
+    def test_permanent_for_admins_is_on_without_the_key(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path, _BASE + _section(45, 600))
+
+        assert engine.approval_grant_settings().permanent_for_admins is True
+
+    def test_permanent_for_admins_is_a_known_key(self) -> None:
+        assert check_policy_text(_BASE + "approval_grant:\n  permanent_for_admins: false\n") == []
+
 
 class TestTheEditor:
     def test_the_export_fills_in_the_code_defaults(self, tmp_path: Path) -> None:
         # 没写时运行期用的是代码默认，界面上要看得到；照着存一次也不会变成别的值。
         engine = _engine(tmp_path, _BASE)
 
-        assert engine.export_config()["approval_grant"] == {
-            "default_minutes": APPROVAL_GRANT_DEFAULT_MINUTES,
-            "max_minutes": APPROVAL_GRANT_MAX_MINUTES,
-        }
+        assert engine.export_config()["approval_grant"] == _grant_section(*_CODE_DEFAULTS)
 
     def test_the_export_shows_the_values_in_force(self, tmp_path: Path) -> None:
         engine = _engine(tmp_path, _BASE + _section(2000, 60))
 
-        assert engine.export_config()["approval_grant"] == {"default_minutes": 60, "max_minutes": 60}
+        assert engine.export_config()["approval_grant"] == _grant_section(60, 60)
+
+    def test_the_export_shows_permanent_switched_off(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path, _BASE + "approval_grant:\n  permanent_for_admins: 'off'\n")
+
+        assert engine.export_config()["approval_grant"] == _grant_section(*_CODE_DEFAULTS, permanent_for_admins=False)
+
+    def test_switching_permanent_off_is_saved_and_in_force(self, tmp_path: Path) -> None:
+        engine = _engine(tmp_path, _BASE)
+
+        saved, _ = engine.replace_config(_policy(approval_grant={"permanent_for_admins": False}))
+
+        assert saved["approval_grant"] == _grant_section(*_CODE_DEFAULTS, permanent_for_admins=False)
+        assert _on_disk(tmp_path)["approval_grant"]["permanent_for_admins"] is False
+        assert engine.approval_grant_settings().permanent_for_admins is False
 
     def test_saving_keeps_the_section_on_disk_and_in_force(self, tmp_path: Path) -> None:
         engine = _engine(tmp_path, _BASE)
 
         saved, digest = engine.replace_config(_policy(approval_grant={"default_minutes": 120, "max_minutes": 480}))
 
-        assert saved["approval_grant"] == {"default_minutes": 120, "max_minutes": 480}
-        assert _on_disk(tmp_path)["approval_grant"] == {"default_minutes": 120, "max_minutes": 480}
+        assert saved["approval_grant"] == _grant_section(120, 480)
+        assert _on_disk(tmp_path)["approval_grant"] == _grant_section(120, 480)
         assert digest == config_layout.file_hash(config_layout.policy_path(tmp_path))
         assert _settings(engine) == (120, 480)
 
@@ -225,15 +262,15 @@ class TestTheEditor:
 
         saved, _ = engine.replace_config(_policy(approval_grant={"default_minutes": 2000, "max_minutes": 60}))
 
-        assert saved["approval_grant"] == {"default_minutes": 60, "max_minutes": 60}
-        assert _on_disk(tmp_path)["approval_grant"] == {"default_minutes": 60, "max_minutes": 60}
+        assert saved["approval_grant"] == _grant_section(60, 60)
+        assert _on_disk(tmp_path)["approval_grant"] == _grant_section(60, 60)
 
     def test_saving_a_partial_section_writes_both_values(self, tmp_path: Path) -> None:
         engine = _engine(tmp_path, _BASE)
 
         engine.replace_config(_policy(approval_grant={"max_minutes": 15}))
 
-        assert _on_disk(tmp_path)["approval_grant"] == {"default_minutes": 15, "max_minutes": 15}
+        assert _on_disk(tmp_path)["approval_grant"] == _grant_section(15, 15)
 
     def test_editing_something_else_keeps_the_section(self, tmp_path: Path) -> None:
         # 控制台存的是整份：读出来改别的段再存回去，这一段原样跟着回来。
@@ -244,7 +281,7 @@ class TestTheEditor:
         saved, _ = engine.replace_config(exported)
 
         assert saved["extra_roots"] == ["/srv/shared"]
-        assert saved["approval_grant"] == {"default_minutes": 120, "max_minutes": 480}
+        assert saved["approval_grant"] == _grant_section(120, 480)
         assert _settings(engine) == (120, 480)
 
     def test_saving_the_export_of_a_file_without_the_section_writes_the_defaults(self, tmp_path: Path) -> None:
@@ -252,10 +289,7 @@ class TestTheEditor:
 
         engine.replace_config(engine.export_config())
 
-        assert _on_disk(tmp_path)["approval_grant"] == {
-            "default_minutes": APPROVAL_GRANT_DEFAULT_MINUTES,
-            "max_minutes": APPROVAL_GRANT_MAX_MINUTES,
-        }
+        assert _on_disk(tmp_path)["approval_grant"] == _grant_section(*_CODE_DEFAULTS)
         assert _settings(engine) == _CODE_DEFAULTS
 
     def test_saving_without_the_section_returns_to_the_code_defaults(self, tmp_path: Path) -> None:
@@ -264,10 +298,7 @@ class TestTheEditor:
         saved, _ = engine.replace_config(_policy())
 
         assert "approval_grant" not in _on_disk(tmp_path)
-        assert saved["approval_grant"] == {
-            "default_minutes": APPROVAL_GRANT_DEFAULT_MINUTES,
-            "max_minutes": APPROVAL_GRANT_MAX_MINUTES,
-        }
+        assert saved["approval_grant"] == _grant_section(*_CODE_DEFAULTS)
         assert _settings(engine) == _CODE_DEFAULTS
 
     @pytest.mark.parametrize("bad", [
@@ -277,6 +308,9 @@ class TestTheEditor:
         pytest.param({"default_minutes": True}, id="boolean-default"),
         pytest.param({"max_minutes": 0}, id="zero-ceiling"),
         pytest.param({"max_minutes": APPROVAL_GRANT_MINUTES_CEILING + 1}, id="ceiling-past-a-year"),
+        pytest.param({"permanent_for_admins": "maybe"}, id="permanent-not-a-switch"),
+        pytest.param({"permanent_for_admins": 2}, id="permanent-a-number"),
+        pytest.param({"permanent_for_admins": [True]}, id="permanent-a-list"),
     ])
     def test_an_invalid_section_writes_nothing(self, tmp_path: Path, bad: Any) -> None:
         engine = _engine(tmp_path, _BASE + _section(45, 600))
@@ -290,7 +324,7 @@ class TestTheEditor:
 
     def test_the_example_and_the_built_in_default_carry_the_section(self) -> None:
         example = yaml.safe_load((_ROOT / "defaults" / "policy.example.yaml").read_text(encoding="utf-8"))
-        expected = {"default_minutes": APPROVAL_GRANT_DEFAULT_MINUTES, "max_minutes": APPROVAL_GRANT_MAX_MINUTES}
+        expected = _grant_section(*_CODE_DEFAULTS)
 
         assert example["approval_grant"] == expected
         assert _default_policy_dict()["approval_grant"] == expected
@@ -298,10 +332,7 @@ class TestTheEditor:
     def test_a_fresh_instance_writes_the_section(self, tmp_path: Path) -> None:
         engine = PolicyEngine(workspace_root=tmp_path)
 
-        assert _on_disk(tmp_path)["approval_grant"] == {
-            "default_minutes": APPROVAL_GRANT_DEFAULT_MINUTES,
-            "max_minutes": APPROVAL_GRANT_MAX_MINUTES,
-        }
+        assert _on_disk(tmp_path)["approval_grant"] == _grant_section(*_CODE_DEFAULTS)
         assert engine.load_error == ""
 
 
@@ -341,10 +372,7 @@ class TestThePolicyEndpoints:
         response = api("GET", "/v1/config/policy")
 
         assert response.status_code == 200, response.text
-        assert response.json()["policy"]["approval_grant"] == {
-            "default_minutes": APPROVAL_GRANT_DEFAULT_MINUTES,
-            "max_minutes": APPROVAL_GRANT_MAX_MINUTES,
-        }
+        assert response.json()["policy"]["approval_grant"] == _grant_section(*_CODE_DEFAULTS)
 
     def test_a_save_lands_and_takes_effect(self, api: Any, state: SupervisorState) -> None:
         policy = api("GET", "/v1/config/policy").json()["policy"]
@@ -353,9 +381,19 @@ class TestThePolicyEndpoints:
         response = api("PUT", "/v1/config/policy", json={"policy": policy})
 
         assert response.status_code == 200, response.text
-        assert response.json()["policy"]["approval_grant"] == {"default_minutes": 90, "max_minutes": 300}
+        assert response.json()["policy"]["approval_grant"] == _grant_section(90, 300)
         assert api("GET", "/v1/config/policy").json()["policy"]["approval_grant"]["default_minutes"] == 90
         assert _settings(state.policy) == (90, 300)
+
+    def test_switching_permanent_off_through_the_console(self, api: Any, state: SupervisorState) -> None:
+        policy = api("GET", "/v1/config/policy").json()["policy"]
+        policy["approval_grant"]["permanent_for_admins"] = False
+
+        response = api("PUT", "/v1/config/policy", json={"policy": policy})
+
+        assert response.status_code == 200, response.text
+        assert response.json()["policy"]["approval_grant"]["permanent_for_admins"] is False
+        assert state.policy.approval_grant_settings().permanent_for_admins is False
 
     def test_an_invalid_section_is_four_hundred_and_writes_nothing(
         self, api: Any, state: SupervisorState, tmp_path: Path,

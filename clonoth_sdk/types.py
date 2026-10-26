@@ -201,12 +201,14 @@ APPROVAL_MISSING = "missing"
 APPROVAL_EXPIRED = "expired"
 _STATUS_OF_DECISION = {"allow": APPROVAL_ALLOWED, "deny": APPROVAL_DENIED}
 
-# 同意了却没生成授权的原因，和 supervisor/approval_grants.py 里的同名常量一致。
+# 同意了却没生成授权、或者要了永久只给了限时的原因，和 supervisor/approval_grants.py 里的同名常量一致。
 GRANT_NOTE_ONCE = "once"
 GRANT_NOTE_DISABLED = "disabled"
 GRANT_NOTE_NOT_REQUESTER = "not_requester"
 GRANT_NOTE_NO_REQUESTER = "no_requester"
 GRANT_NOTE_NO_APPROVER = "no_approver"
+GRANT_NOTE_PERMANENT_NOT_ADMIN = "permanent_not_admin"
+GRANT_NOTE_PERMANENT_DISABLED = "permanent_disabled"
 
 
 def _parse_time(raw: Any) -> datetime | None:
@@ -230,7 +232,7 @@ def _non_negative_int(raw: Any) -> int:
 
 @dataclass(frozen=True)
 class ApprovalGrant:
-    """同意审批时给审批人本人的授权：until 之前他发起的操作免审批。"""
+    """同意审批时给审批人本人的授权：until 之前他发起的操作免审批。permanent 为真是永久授权，没有 until，收回前一直有效。"""
 
     grant_id: str
     platform: str
@@ -240,6 +242,7 @@ class ApprovalGrant:
     minutes: int = 0
     approval_id: str = ""
     issued_at: datetime | None = None
+    permanent: bool = False
 
     @classmethod
     def from_dict(cls, data: Any) -> "ApprovalGrant | None":
@@ -258,6 +261,7 @@ class ApprovalGrant:
             minutes=_non_negative_int(data.get("minutes")),
             approval_id=str(data.get("approval_id") or "").strip(),
             issued_at=_parse_time(data.get("issued_at")),
+            permanent=data.get("permanent") is True,
         )
 
 
@@ -265,7 +269,7 @@ class ApprovalGrant:
 class ApprovalDecision:
     """POST /v1/approvals/{id} 的回执。返回的状态与本次决定一致才算这次决定生效。
 
-    grant 是这次同意生成的授权；没生成时 grant_note 说明原因，旧版 supervisor 两项都是空的。
+    grant 是这次同意生成的授权；没生成、或者要了永久只给了限时的，grant_note 说明原因。旧版 supervisor 两项都是空的。
     """
 
     approval_id: str

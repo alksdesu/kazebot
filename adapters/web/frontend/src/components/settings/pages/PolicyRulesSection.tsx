@@ -16,7 +16,7 @@ import { useRequestGuard } from '../../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../../hooks/useUnsavedChanges';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { firstMatchIndex } from '../../../utils/globMatch';
-import { Button, DangerPanel, ErrorText, SaveBar, ScopeBadge } from './settingsControls';
+import { Button, Check, DangerPanel, ErrorText, SaveBar, ScopeBadge } from './settingsControls';
 import { errorMessage } from '../../../api/request';
 
 type RuleSectionKey = 'read_file' | 'write_file';
@@ -60,7 +60,7 @@ const TAB_META: Record<TabKey, { title: string; hint: string }> = {
   restart: { title: '重启', hint: 'request_restart。重启会打断所有在跑的任务。' },
   approval_grant: {
     title: '审批授权',
-    hint: '管理员在 QQ 上同意自己发起的审批时，顺带给自己一段免审时间。同意别人发起的请求不生成授权。',
+    hint: '管理员在 QQ 上同意自己发起的审批时，顺带给自己一段免审时间，也可以要永久的。同意别人发起的请求不生成授权。',
   },
 };
 
@@ -68,7 +68,7 @@ const GRANT_DEFAULTS: ApprovalGrantSettings = { default_minutes: 30, max_minutes
 // 和服务端校验的上限一致：再长就等于永久免审。
 const GRANT_MINUTES_CEILING = 525600;
 
-type GrantField = keyof ApprovalGrantSettings;
+type GrantField = 'default_minutes' | 'max_minutes';
 
 const GRANT_FIELDS: Array<{ key: GrantField; label: string; hint: string; min: number }> = [
   {
@@ -538,8 +538,18 @@ const GrantPanel = ({
           默认时长比上限还长，保存后按上限 {section.max_minutes} 分钟算。
         </p>
       )}
+      <Check
+        align="start"
+        checked={section.permanent_for_admins !== false}
+        onChange={(checked) => onChange({ ...section, permanent_for_admins: checked })}
+        tone="muted"
+      >
+        管理员名单里的人可以要永久授权：同意自己发起的审批时回「同意 永久」，一直免审到收回，移出名单后自动失效。
+        关掉之后要「永久」按时长上限给，已经发出去的永久授权也先不算数，再打开照旧有效。
+      </Check>
       <p className="text-micro leading-5 text-[var(--duties-tertiary)]">
-        在 QQ 私聊里同意时可以带时长：「同意 2h」「/审批 同意 &lt;ID&gt; 30m」，「同意 单次」只批这一次；发「/审批 收回」提前收回。
+        在 QQ 私聊里同意时可以带时长：「同意 2h」「/审批 同意 &lt;ID&gt; 30m」，「同意 单次」只批这一次，「同意 永久」到收回为止；
+        发「/审批 收回」提前收回。
         授权期间你发起的任务（连同派出去的子任务）原本要审批的操作直接放行，敏感操作也算；
         拒绝规则、群成员的硬拒绝和定时任务的敏感拒绝不受影响。
       </p>
@@ -670,7 +680,7 @@ export const PolicyRulesSection = () => {
         <p className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]">
           同一条规则，谁触发结果不同：QQ 群里的非管理员一律拒绝，不看规则；QQ 管理员碰到
           「需审批」但没命中任何一条具体规则时会直接执行；定时任务没人点审批，需审批即拒绝。
-          QQ 管理员同意自己发起的审批后，一段时间里他发起的操作免审批，时长在「审批授权」里设。
+          QQ 管理员同意自己发起的审批后，一段时间里他发起的操作免审批，也可以要永久的直到收回，在「审批授权」里设。
         </p>
         <DangerPanel>
           <div className="min-w-0 flex-1">

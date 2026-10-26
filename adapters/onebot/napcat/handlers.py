@@ -531,19 +531,25 @@ _private_matcher = on_message(rule=Rule(permissions._private_message_rule), prio
 
 
 async def _finish_approval_decision(
-    user_id: int, approval_id: str, decision: str, *, grant_minutes: int | None = None,
+    user_id: int,
+    approval_id: str,
+    decision: str,
+    *,
+    grant_minutes: int | None = None,
+    grant_permanent: bool = False,
 ) -> None:
     """提交审批决策并结束当前私聊处理（末尾总会抛出 FinishedException）。
 
     同时服务于“引用回复审批”“手输审批命令”和裸动词唯一匹配三个入口，避免重复代码。
-    grant_minutes 是同意时带的时长：None 按策略默认，0 只批这一次。
+    grant_minutes 是同意时带的时长：None 按策略默认，0 只批这一次；grant_permanent 是同意时要了永久授权。
     """
     book = state._adapter.approvals
     # 先摘走再提交：多个管理员同时决策时只有抢到的人能提交。
     info = await book.claim(approval_id, user_id, decision)
     if info is None:
         await _private_matcher.finish(approval._settled_approval_notice(approval_id))
-    requested_minutes = grant_minutes if decision == DECISION_ALLOW else None
+    requested_permanent = grant_permanent and decision == DECISION_ALLOW
+    requested_minutes = grant_minutes if decision == DECISION_ALLOW and not requested_permanent else None
     try:
         result = await state._adapter.client.decide_approval(
             approval_id,
@@ -551,6 +557,7 @@ async def _finish_approval_decision(
             comment=f"QQ admin {user_id} {decision}ed via private message.",
             approver=approval._approver(user_id),
             grant_minutes=requested_minutes,
+            grant_permanent=requested_permanent,
         )
     except Exception as exc:
         await book.release(approval_id, info)
@@ -572,7 +579,9 @@ async def _finish_approval_decision(
         approval_id, decision, user_id, result.grant.grant_id if result.grant else result.grant_note or "-",
     )
     await _private_matcher.finish(
-        approval._decision_receipt(approval_id, decision, info.get("operation"), result, requested_minutes)
+        approval._decision_receipt(
+            approval_id, decision, info.get("operation"), result, requested_minutes, requested_permanent,
+        )
     )
 
 
@@ -619,6 +628,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
                     await _finish_approval_decision(
                         user_id, target.approval_id, reply_intent.decision,
                         grant_minutes=reply_intent.grant_minutes,
+                        grant_permanent=reply_intent.grant_permanent,
                     )
                 await _private_matcher.finish(approval._APPROVAL_REPLY_UNRESOLVED_HINT)
 
@@ -640,7 +650,9 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
             if not approval_id:
                 await _private_matcher.finish(error)
             await _finish_approval_decision(
-                user_id, approval_id, approval_command.decision, grant_minutes=approval_command.grant_minutes,
+                user_id, approval_id, approval_command.decision,
+                grant_minutes=approval_command.grant_minutes,
+                grant_permanent=approval_command.grant_permanent,
             )
 
     if approval._is_revoke_command(user_text):
@@ -664,7 +676,9 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
             unique_id = state._adapter.approvals.unique_pending_for(user_id)
             if unique_id:
                 await _finish_approval_decision(
-                    user_id, unique_id, bare_intent.decision, grant_minutes=bare_intent.grant_minutes,
+                    user_id, unique_id, bare_intent.decision,
+                    grant_minutes=bare_intent.grant_minutes,
+                    grant_permanent=bare_intent.grant_permanent,
                 )
         if pending_count > 0:
             await _private_matcher.finish(

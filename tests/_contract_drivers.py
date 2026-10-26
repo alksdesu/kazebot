@@ -82,11 +82,13 @@ class FakeClonoth:
         comment: str | None = None,
         approver: Mapping[str, Any] | None = None,
         grant_minutes: int | None = None,
+        grant_permanent: bool = False,
     ) -> ApprovalDecision:
         """带回执的那条提交路径：提交被拒和 approve 返回 False 一样，是一次 HTTP 错误。"""
         self.decisions.append({
             "approval_id": approval_id, "decision": decision, "comment": comment,
             "approver": dict(approver) if approver is not None else None, "grant_minutes": grant_minutes,
+            "grant_permanent": grant_permanent,
         })
         if not self.approve_result:
             url = f"http://clonoth.test/v1/approvals/{approval_id}"

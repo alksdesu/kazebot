@@ -134,17 +134,35 @@ def approve(
     *,
     approver: dict[str, Any] | None = None,
     minutes: int | None = None,
+    permanent: bool = False,
 ) -> Approval | None:
     return state.decide_approval(
-        approval_id=approval_id, decision="allow", comment="ok", approver=approver, grant_minutes=minutes,
+        approval_id=approval_id, decision="allow", comment="ok", approver=approver,
+        grant_minutes=minutes, grant_permanent=permanent,
     )
 
 
-def grant_for(state: SupervisorState, *, user_id: str = ADMIN, minutes: int | None = None) -> ApprovalGrant:
-    """user_id 同意自己发起的一条请求，返回由此生成的授权。"""
-    approval = approve(state, pending_approval(state, user_id), approver=qq_approver(user_id), minutes=minutes)
+def grant_for(
+    state: SupervisorState, *, user_id: str = ADMIN, minutes: int | None = None, permanent: bool = False,
+) -> ApprovalGrant:
+    """user_id 同意自己发起的一条请求，返回由此生成的授权；permanent 为真时要的是永久授权。"""
+    approval = approve(
+        state, pending_approval(state, user_id), approver=qq_approver(user_id), minutes=minutes, permanent=permanent,
+    )
     assert approval is not None and approval.grant is not None, approval
     return approval.grant
+
+
+def grants_file(workspace: Path) -> Path:
+    return workspace / "data" / "approval_grants.json"
+
+
+def drop_event_logs(workspace: Path) -> None:
+    """事件日志连同轮转出来的备份一起没了：轮转把记着授权的那几段挤掉、或者有人清了日志，都是这样。"""
+    active = events_path(workspace)
+    for path in active.parent.glob(f"{active.name}*"):
+        if path == active or path.name.removeprefix(f"{active.name}.").isdigit():
+            path.unlink()
 
 
 def logged_events(workspace: Path, type_: str) -> list[dict[str, Any]]:

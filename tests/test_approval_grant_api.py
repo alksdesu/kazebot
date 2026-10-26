@@ -1,4 +1,4 @@
-"""审批授权的 HTTP 接口和 SDK：同意时带上审批人和时长，列出、收回授权都要管理员令牌；不带新字段的旧客户端照旧能用。"""
+"""审批授权的 HTTP 接口和 SDK：同意时带上审批人和时长（或要永久授权），列出、收回授权都要管理员令牌；不带新字段的旧客户端照旧能用。"""
 from __future__ import annotations
 
 import asyncio
@@ -31,6 +31,7 @@ from _approval_grant_fixture import (  # noqa: E402
     qq_approver,
     qq_auth,
     start_task,
+    write_policy,
 )
 import supervisor.admin_api as admin_api  # noqa: E402
 from clonoth_sdk.client import ClonothClient  # noqa: E402
@@ -38,6 +39,7 @@ from clonoth_sdk.types import (  # noqa: E402
     GRANT_NOTE_NO_APPROVER,
     GRANT_NOTE_NOT_REQUESTER,
     GRANT_NOTE_ONCE,
+    GRANT_NOTE_PERMANENT_DISABLED,
     ApprovalDecision,
     ApprovalGrant,
     PlatformAuth,
@@ -138,6 +140,38 @@ class TestTheDecisionEndpoint:
 
         assert body["status"] == "allowed"
         assert body["grant"] is None and body["grant_note"] == GRANT_NOTE_ONCE
+
+    def test_an_admin_asking_for_permanent_gets_it_back(self, api: Any, state: SupervisorState) -> None:
+        approval_id = pending_approval(state)
+
+        response = _decide(api, approval_id, approver=qq_approver(), grant_permanent=True)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["status"] == "allowed" and body["grant_note"] is None
+        grant = body["grant"]
+        assert grant["permanent"] is True and grant["until"] is None and grant["minutes"] == 0
+        assert grant["approval_id"] == approval_id
+        assert [item.grant_id for item in state.list_approval_grants()] == [grant["grant_id"]]
+
+    @pytest.mark.parametrize("minutes", [0, 30])
+    def test_permanent_and_minutes_together_are_refused(self, api: Any, state: SupervisorState, minutes: int) -> None:
+        approval_id = pending_approval(state)
+
+        response = _decide(api, approval_id, approver=qq_approver(), grant_minutes=minutes, grant_permanent=True)
+
+        assert response.status_code == 422
+        assert state.approvals[approval_id].status == ApprovalStatus.pending
+        assert state.list_approval_grants() == []
+
+    @pytest.mark.parametrize("value", ["maybe", 2, None, [True]])
+    def test_a_permanent_flag_that_is_not_a_switch_is_refused(self, api: Any, state: SupervisorState, value: Any) -> None:
+        approval_id = pending_approval(state)
+
+        response = _decide(api, approval_id, approver=qq_approver(), grant_permanent=value)
+
+        assert response.status_code == 422
+        assert state.approvals[approval_id].status == ApprovalStatus.pending
         assert state.list_approval_grants() == []
 
     def test_an_old_client_without_an_approver_still_decides(self, api: Any, state: SupervisorState) -> None:
@@ -209,6 +243,27 @@ class TestTheDecisionEndpoint:
 
 
 class TestTheGrantEndpoints:
+    def test_listing_shows_a_permanent_grant_without_an_expiry(self, api: Any, state: SupervisorState) -> None:
+        grant = grant_for(state, permanent=True)
+
+        response = api("GET", "/v1/approval-grants")
+
+        assert response.status_code == 200, response.text
+        [listed] = response.json()["grants"]
+        assert listed["grant_id"] == grant.grant_id
+        assert listed["permanent"] is True and listed["until"] is None
+
+    def test_revoking_a_permanent_grant(self, api: Any, state: SupervisorState) -> None:
+        grant = grant_for(state, permanent=True)
+
+        response = api("POST", "/v1/approval-grants/revoke", json={"identity": qq_approver()})
+
+        assert response.status_code == 200, response.text
+        assert response.json()["count"] == 1
+        assert response.json()["revoked"][0]["grant_id"] == grant.grant_id
+        assert response.json()["revoked"][0]["permanent"] is True
+        assert state.list_approval_grants() == []
+
     def test_listing_shows_the_active_grants(self, api: Any, state: SupervisorState) -> None:
         grant = grant_for(state, minutes=45)
 
@@ -375,6 +430,44 @@ class TestTheSdkAgainstTheSupervisor:
 
         assert result.grant is None and result.grant_note == GRANT_NOTE_ONCE
 
+    def test_asking_for_permanent(self, app: Any, state: SupervisorState) -> None:
+        approval_id = pending_approval(state)
+
+        result: ApprovalDecision = _run_sdk(
+            _sdk_over(app),
+            lambda client: client.decide_approval(
+                approval_id, decision="allow", approver=qq_approver(), grant_permanent=True,
+            ),
+        )
+
+        assert result.effective and result.grant_note == ""
+        assert result.grant is not None and result.grant.permanent
+        assert result.grant.until is None and result.grant.minutes == 0
+
+    def test_a_refused_permanent_comes_back_timed_with_its_reason(
+        self, app: Any, state: SupervisorState, tmp_path: Path,
+    ) -> None:
+        write_policy(tmp_path, {"permanent_for_admins": False})
+        approval_id = pending_approval(state)
+
+        result: ApprovalDecision = _run_sdk(
+            _sdk_over(app),
+            lambda client: client.decide_approval(
+                approval_id, decision="allow", approver=qq_approver(), grant_permanent=True,
+            ),
+        )
+
+        assert result.grant is not None and not result.grant.permanent
+        assert result.grant.minutes == 1440 and result.grant.until == START + timedelta(minutes=1440)
+        assert result.grant_note == GRANT_NOTE_PERMANENT_DISABLED
+
+    def test_listing_a_permanent_grant(self, app: Any, state: SupervisorState) -> None:
+        grant = grant_for(state, permanent=True)
+
+        [listed] = _run_sdk(_sdk_over(app), lambda client: client.list_approval_grants())
+
+        assert listed.grant_id == grant.grant_id and listed.permanent and listed.until is None
+
     def test_listing_and_revoking(self, app: Any, state: SupervisorState) -> None:
         grant = grant_for(state)
 
@@ -447,6 +540,24 @@ class TestTheSdkOnTheWire:
         _run_sdk(_sdk_mock(handler), lambda client: client.decide_approval("a-1", decision="allow", comment="ok"))
 
         assert json.loads(seen[0].content) == {"decision": "allow", "comment": "ok"}
+
+    def test_permanent_is_sent_as_a_flag(self) -> None:
+        seen, handler = _recording({"approval_id": "a-1", "status": "allowed"})
+
+        _run_sdk(_sdk_mock(handler), lambda client: client.decide_approval("a-1", decision="allow", grant_permanent=True))
+
+        assert json.loads(seen[0].content) == {"decision": "allow", "grant_permanent": True}
+
+    @pytest.mark.parametrize("minutes", [0, 30])
+    def test_permanent_and_minutes_together_send_nothing(self, minutes: int) -> None:
+        seen, handler = _recording({"approval_id": "a-1", "status": "allowed"})
+
+        with pytest.raises(ValueError):
+            _run_sdk(_sdk_mock(handler), lambda client: client.decide_approval(
+                "a-1", decision="allow", grant_minutes=minutes, grant_permanent=True,
+            ))
+
+        assert seen == []
 
     @pytest.mark.parametrize(("given", "sent"), [(0, 0), (-3, 0), (90, 90)])
     def test_the_duration_is_never_sent_negative(self, given: int, sent: int) -> None:
@@ -554,6 +665,23 @@ class TestTheGrantShape:
         grant = ApprovalGrant.from_dict({**_GRANT_REPLY, "minutes": raw})
 
         assert grant is not None and grant.minutes == expected
+
+    @pytest.mark.parametrize(("raw", "expected"), [
+        (True, True), (False, False), ("true", False), (1, False), (None, False), ("yes", False),
+    ])
+    def test_permanent_takes_only_a_real_true(self, raw: Any, expected: bool) -> None:
+        grant = ApprovalGrant.from_dict({**_GRANT_REPLY, "until": None, "minutes": 0, "permanent": raw})
+
+        assert grant is not None and grant.permanent is expected
+
+    def test_a_permanent_grant_in_the_reply_is_parsed(self) -> None:
+        reply = {**_GRANT_REPLY, "until": None, "minutes": 0, "permanent": True}
+        _seen, handler = _recording({"approval_id": "a-1", "status": "allowed", "grant": reply})
+
+        result = _run_sdk(_sdk_mock(handler), lambda client: client.decide_approval("a-1", decision="allow"))
+
+        assert result.grant is not None
+        assert result.grant.permanent and result.grant.until is None and result.grant.minutes == 0
 
     def test_the_decision_can_still_be_built_positionally(self) -> None:
         # 调用方按位置构造回执的写法要继续成立：新字段都排在最后、带默认值。

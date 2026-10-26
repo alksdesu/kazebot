@@ -28,6 +28,8 @@ DENY_VERBS = frozenset({
 COMMAND_PREFIXES = ("审批", "approval")
 # 同意时只批这一次、不生成授权的写法。
 GRANT_ONCE_WORDS = frozenset({"单次", "once"})
+# 同意时要永久授权、一直到收回的写法；给不给由 supervisor 定，只给管理员名单里的人。
+GRANT_PERMANENT_WORDS = frozenset({"永久", "permanent", "forever"})
 REVOKE_WORDS = frozenset({"收回", "收回授权", "revoke"})
 _VERB_STRIP = " 　。，、！!.~"
 # 形状与 approval_id（uuid4）绑定：裸动词命令只在 token 像 id 时才当审批，避免劫持普通私聊。
@@ -67,7 +69,8 @@ def approval_verb(token: str) -> str | None:
 class ApprovalIntent:
     """一条审批决定。token 是审批 ID 或前缀，没指明是哪条时为空串。
 
-    grant_minutes 只对同意有意义：None 按策略的默认时长授权，0 只同意这一次。
+    grant_minutes 和 grant_permanent 只对同意有意义：grant_minutes 为 None 按策略的默认时长授权，0 只同意这一次；
+    grant_permanent 为真是要永久授权，这时 grant_minutes 总是 None。
     duration_error 表示带了时长但写法不对，这条决定不该提交。
     """
 
@@ -75,6 +78,7 @@ class ApprovalIntent:
     token: str = ""
     grant_minutes: int | None = None
     duration_error: bool = False
+    grant_permanent: bool = False
 
 
 def grant_minutes_of(text: str) -> int | None:
@@ -91,6 +95,26 @@ def grant_minutes_of(text: str) -> int | None:
         return None
     seconds = int(match[1]) * _GRANT_UNIT_SECONDS[match[2]]
     return -(-seconds // 60)
+
+
+@dataclass(frozen=True)
+class GrantAsk:
+    """同意后面跟的授权要求：permanent 为真是永久授权，否则 minutes 是分钟数，0 只批这一次。"""
+
+    minutes: int | None = None
+    permanent: bool = False
+
+
+def grant_ask_of(text: str) -> GrantAsk | None:
+    """同意后面那一段：「永久」「permanent」是永久授权，其余按 grant_minutes_of 读成分钟数，都不是返回 None。"""
+    if str(text or "").strip().rstrip(_VERB_STRIP).lower() in GRANT_PERMANENT_WORDS:
+        return GrantAsk(permanent=True)
+    minutes = grant_minutes_of(text)
+    return None if minutes is None else GrantAsk(minutes=minutes)
+
+
+def _allow(token: str, ask: GrantAsk) -> ApprovalIntent:
+    return ApprovalIntent(DECISION_ALLOW, token, grant_minutes=ask.minutes, grant_permanent=ask.permanent)
 
 
 def _command_parts(body: str) -> tuple[str, str, list[str]] | None:
@@ -122,10 +146,10 @@ def parse_command(body: str) -> tuple[str, str] | None:
 
 
 def parse_decision_command(body: str) -> ApprovalIntent | None:
-    """parse_command 加上时长：「审批 同意 <ID> 2h」「同意 <ID> 单次」。
+    """parse_command 加上时长：「审批 同意 <ID> 2h」「同意 <ID> 单次」「审批 同意 <ID> 永久」。
 
     时长只跟在 ID 后面、只对同意解析；拒绝后面的词照旧不看。ID 那一格连同后面的词整段是个时长，
-    而这一格不可能是审批 ID（「审批 同意 2h」）、或者剩下的词单独不成时长（「审批 同意 45 分钟」）的，
+    而这一格不可能是审批 ID（「审批 同意 2h」「审批 同意 永久」）、或者剩下的词单独不成时长（「审批 同意 45 分钟」）的，
     是没指明哪一条：返回 None 交给裸动词的唯一匹配。「300d」这种两边都说得通的按 ID 查。
     """
     parts = _command_parts(body)
@@ -135,15 +159,15 @@ def parse_decision_command(body: str) -> ApprovalIntent | None:
     if decision != DECISION_ALLOW:
         return ApprovalIntent(decision, token)
     tail = " ".join(rest).strip()
-    tail_minutes = grant_minutes_of(tail) if tail else None
-    names_no_approval = not _ID_CHARS_RE.fullmatch(token) or (bool(tail) and tail_minutes is None)
-    if names_no_approval and grant_minutes_of(" ".join([token, *rest])) is not None:
+    tail_ask = grant_ask_of(tail) if tail else None
+    names_no_approval = not _ID_CHARS_RE.fullmatch(token) or (bool(tail) and tail_ask is None)
+    if names_no_approval and grant_ask_of(" ".join([token, *rest])) is not None:
         return None
     if not tail:
         return ApprovalIntent(decision, token)
-    if tail_minutes is None:
+    if tail_ask is None:
         return ApprovalIntent(decision, token, duration_error=True)
-    return ApprovalIntent(decision, token, grant_minutes=tail_minutes)
+    return _allow(token, tail_ask)
 
 
 def parse_revoke_command(body: str) -> bool:
@@ -165,9 +189,9 @@ def parse_reply_verb(text: str) -> str | None:
 
 
 def parse_reply_decision(text: str) -> ApprovalIntent | None:
-    """不带 ID 的审批决定（引用卡片回复、裸动词）：整句是一个动词，同意后面还可以跟一个时长。
+    """不带 ID 的审批决定（引用卡片回复、裸动词）：整句是一个动词，同意后面还可以跟一个时长或「永久」。
 
-    「同意 1h」「审批 同意 45 分钟」「同意单次」照收；「同意吧，快点」「同意 1.5h」都不是审批决定，照旧当普通聊天。
+    「同意 1h」「审批 同意 45 分钟」「同意单次」「同意 永久」照收；「同意吧，快点」「同意 1.5h」都不是审批决定，照旧当普通聊天。
     """
     verb = parse_reply_verb(text)
     if verb is not None:
@@ -180,8 +204,8 @@ def parse_reply_decision(text: str) -> ApprovalIntent | None:
     body = body.lstrip(_VERB_STRIP)
     for word in _ALLOW_VERBS_LONGEST_FIRST:
         if body.startswith(word):
-            minutes = grant_minutes_of(body[len(word):])
-            return None if minutes is None else ApprovalIntent(DECISION_ALLOW, grant_minutes=minutes)
+            ask = grant_ask_of(body[len(word):])
+            return None if ask is None else _allow("", ask)
     return None
 
 

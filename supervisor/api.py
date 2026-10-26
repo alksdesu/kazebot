@@ -1641,6 +1641,7 @@ def create_app(
             comment=body.comment,
             approver=body.approver.model_dump() if body.approver is not None else None,
             grant_minutes=body.grant_minutes,
+            grant_permanent=body.grant_permanent,
         )
         if a is None:
             raise HTTPException(status_code=404, detail="approval not found")

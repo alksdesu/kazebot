@@ -1,4 +1,4 @@
-"""QQ 私聊里的审批授权：三条审批入口带上时长和审批人，回执写清授权到几点、怎么收回，/审批 收回 只给有审批权的人。"""
+"""QQ 私聊里的审批授权：三条审批入口带上时长（或「永久」）和审批人，回执写清授权到几点、怎么收回，/审批 收回 只给有审批权的人。"""
 from __future__ import annotations
 
 import asyncio
@@ -29,12 +29,15 @@ from clonoth_sdk.types import (  # noqa: E402
     GRANT_NOTE_NO_REQUESTER,
     GRANT_NOTE_NOT_REQUESTER,
     GRANT_NOTE_ONCE,
+    GRANT_NOTE_PERMANENT_DISABLED,
+    GRANT_NOTE_PERMANENT_NOT_ADMIN,
     ApprovalDecision,
     ApprovalGrant,
 )
 from supervisor.approval_grants import GrantIdentity  # noqa: E402
 
 ADMIN_QQ = 10001
+OTHER_ADMIN_QQ = 10002
 FRIEND_QQ = 30003
 BOT_SCOPE = "90001"
 CARD_REF = 555
@@ -69,6 +72,13 @@ def _grant(approval_id: str, minutes: int, *, until: datetime | None = None, gra
     )
 
 
+def _permanent_grant(approval_id: str) -> ApprovalGrant:
+    return ApprovalGrant(
+        grant_id="g-forever", platform="qq", user_id=str(ADMIN_QQ), bot_scope=BOT_SCOPE,
+        until=None, minutes=0, approval_id=approval_id, issued_at=NOW, permanent=True,
+    )
+
+
 class _Supervisor:
     """假的 supervisor 客户端：记下审批决定和收回请求。同意时按要的时长回一条授权，上限 max_minutes。"""
 
@@ -88,14 +98,18 @@ class _Supervisor:
         comment: str | None = None,
         approver: dict[str, Any] | None = None,
         grant_minutes: int | None = None,
+        grant_permanent: bool = False,
     ) -> ApprovalDecision:
         self.decisions.append({
             "approval_id": approval_id, "decision": decision, "approver": approver, "grant_minutes": grant_minutes,
+            "grant_permanent": grant_permanent,
         })
         if decision != "allow":
             return ApprovalDecision(approval_id, decision, APPROVAL_DENIED)
         if self.grant_note:
             return ApprovalDecision(approval_id, decision, APPROVAL_ALLOWED, grant_note=self.grant_note)
+        if grant_permanent:
+            return ApprovalDecision(approval_id, decision, APPROVAL_ALLOWED, grant=_permanent_grant(approval_id))
         minutes = min(30 if grant_minutes is None else grant_minutes, self.max_minutes)
         if minutes <= 0:
             return ApprovalDecision(approval_id, decision, APPROVAL_ALLOWED, grant_note=GRANT_NOTE_ONCE)
@@ -171,6 +185,21 @@ def _decided(chat: _Chat) -> list[tuple[str, str, int | None]]:
     return [(item["approval_id"], item["decision"], item["grant_minutes"]) for item in chat.supervisor.decisions]
 
 
+def _asked_permanent(chat: _Chat) -> list[tuple[str, str, int | None, bool]]:
+    return [
+        (item["approval_id"], item["decision"], item["grant_minutes"], item["grant_permanent"])
+        for item in chat.supervisor.decisions
+    ]
+
+
+_PERMANENT_RECEIPT = "\n".join([
+    f"已同意审批：{AID}",
+    "操作：write_file",
+    "已授权：以后你发起的操作都不再审批，敏感操作也一样，直到收回；移出管理员名单后自动失效。",
+    "提前收回：私聊发送 /审批 收回",
+])
+
+
 class TestTheQuotedCard:
     def test_a_duration_after_the_verb_goes_with_the_decision(self, chat: _Chat) -> None:
         chat.pending()
@@ -178,7 +207,7 @@ class TestTheQuotedCard:
         reply = chat.send("同意 2h", reply_to=CARD_REF)
 
         assert chat.supervisor.decisions == [
-            {"approval_id": AID, "decision": "allow", "approver": APPROVER, "grant_minutes": 120},
+            {"approval_id": AID, "decision": "allow", "approver": APPROVER, "grant_minutes": 120, "grant_permanent": False},
         ]
         assert reply == "\n".join([
             f"已同意审批：{AID}",
@@ -234,7 +263,7 @@ class TestTheCommand:
         reply = chat.send(text)
 
         assert chat.supervisor.decisions == [
-            {"approval_id": AID, "decision": "allow", "approver": APPROVER, "grant_minutes": minutes},
+            {"approval_id": AID, "decision": "allow", "approver": APPROVER, "grant_minutes": minutes, "grant_permanent": False},
         ]
         assert f"已授权到 {until}" in reply and "/审批 收回" in reply
 
@@ -347,6 +376,70 @@ class TestTheBareVerb:
         assert chat.supervisor.decisions == []
 
 
+class TestAskingForPermanent:
+    @pytest.mark.parametrize("text", ["同意 永久", "同意永久", "同意 permanent", "审批 同意 永久", "同意 永久。", "批准 forever"])
+    def test_on_the_quoted_card(self, chat: _Chat, text: str) -> None:
+        chat.pending()
+
+        reply = chat.send(text, reply_to=CARD_REF)
+
+        assert chat.supervisor.decisions == [
+            {"approval_id": AID, "decision": "allow", "approver": APPROVER, "grant_minutes": None, "grant_permanent": True},
+        ]
+        assert reply == _PERMANENT_RECEIPT
+        assert AID not in chat.book.pending
+
+    @pytest.mark.parametrize("text", [f"/审批 同意 {AID} 永久", f"/同意 {AID[:8]} forever", f"/approval approve {AID} permanent"])
+    def test_after_the_id_in_a_command(self, chat: _Chat, text: str) -> None:
+        chat.pending()
+
+        reply = chat.send(text)
+
+        assert _asked_permanent(chat) == [(AID, "allow", None, True)]
+        assert reply == _PERMANENT_RECEIPT
+
+    @pytest.mark.parametrize("text", ["/审批 同意 永久", "同意 永久", "/同意 永久"])
+    def test_without_an_id_on_the_only_pending_approval(self, chat: _Chat, text: str) -> None:
+        chat.pending()
+
+        chat.send(text)
+
+        assert _asked_permanent(chat) == [(AID, "allow", None, True)]
+
+    def test_without_an_id_and_two_pending_it_asks_which(self, chat: _Chat) -> None:
+        chat.pending(A1, card_ref=101)
+        chat.pending(A2, card_ref=102)
+
+        assert "无法安全确定目标" in chat.send("同意 永久")
+        assert chat.supervisor.decisions == []
+
+    def test_a_deny_ignores_it(self, chat: _Chat) -> None:
+        chat.pending()
+
+        chat.send(f"/审批 拒绝 {AID} 永久")
+
+        assert _asked_permanent(chat) == [(AID, "deny", None, False)]
+
+    @pytest.mark.parametrize("text", ["永久", "同意 永久吧", "同意 永久 2h", "同意 永远", "拒绝 永久"])
+    def test_anything_looser_stays_chat(self, chat: _Chat, text: str) -> None:
+        chat.pending()
+
+        assert chat.send(text, reply_to=CARD_REF) == PASSED_THROUGH
+        assert chat.supervisor.decisions == []
+
+    def test_a_command_with_something_else_after_permanent_decides_nothing(self, chat: _Chat) -> None:
+        chat.pending()
+
+        assert chat.send(f"/审批 同意 {AID} 永久 2h") == chat.runtime.approval._GRANT_DURATION_HINT
+        assert chat.supervisor.decisions == []
+
+    def test_someone_without_the_capability_is_not_intercepted(self, chat: _Chat) -> None:
+        chat.pending()
+
+        assert chat.send("同意 永久", user_id=FRIEND_QQ, sub_type="friend") == PASSED_THROUGH
+        assert chat.supervisor.decisions == []
+
+
 class TestRevoking:
     @pytest.mark.parametrize("text", ["/审批 收回", "/审批 收回授权", "/approval revoke", "/审批 收回。", "／审批 收回"])
     def test_the_approver_revokes_his_own_grants(self, chat: _Chat, text: str) -> None:
@@ -456,6 +549,8 @@ class TestTheReceipt:
         (GRANT_NOTE_NO_REQUESTER, "查不到这条请求是谁发起的，只同意了这一次，没有生成授权。"),
         (GRANT_NOTE_NO_APPROVER, "认不出审批人的身份，只同意了这一次，没有生成授权。"),
         (GRANT_NOTE_DISABLED, "策略的默认时长是 0"),
+        (GRANT_NOTE_PERMANENT_NOT_ADMIN, "永久授权只给管理员名单里的人，只同意了这一次，没有生成授权。"),
+        (GRANT_NOTE_PERMANENT_DISABLED, "策略关掉了永久授权，只同意了这一次，没有生成授权。"),
     ])
     def test_no_grant_says_why(self, runtime: Any, note: str, text: str) -> None:
         result = ApprovalDecision(AID, "allow", APPROVAL_ALLOWED, grant_note=note)
@@ -463,6 +558,46 @@ class TestTheReceipt:
         receipt = runtime.approval._decision_receipt(AID, "allow", "write_file", result, None)
 
         assert text in receipt and "已授权到" not in receipt
+
+    def test_a_permanent_grant_says_until_revoked(self, runtime: Any) -> None:
+        result = ApprovalDecision(AID, "allow", APPROVAL_ALLOWED, grant=_permanent_grant(AID))
+
+        assert runtime.approval._decision_receipt(AID, "allow", "write_file", result, None, True) == _PERMANENT_RECEIPT
+
+    @pytest.mark.parametrize("requested", [None, 30])
+    def test_a_timed_request_keeps_an_existing_permanent_grant(self, runtime: Any, requested: int | None) -> None:
+        result = ApprovalDecision(AID, "allow", APPROVAL_ALLOWED, grant=_permanent_grant(AID))
+
+        receipt = runtime.approval._decision_receipt(AID, "allow", "write_file", result, requested)
+
+        assert "你原有的是永久授权，照旧有效。" in receipt
+        assert "已授权到" not in receipt and "上限" not in receipt
+
+    @pytest.mark.parametrize(("note", "text"), [
+        (GRANT_NOTE_PERMANENT_NOT_ADMIN, "永久授权只给管理员名单里的人，这次按上限 1 天授权。"),
+        (GRANT_NOTE_PERMANENT_DISABLED, "策略关掉了永久授权，这次按上限 1 天授权。"),
+    ])
+    def test_a_refused_permanent_says_why_and_what_was_given(self, runtime: Any, note: str, text: str) -> None:
+        result = ApprovalDecision(AID, "allow", APPROVAL_ALLOWED, grant=_grant(AID, 1440), grant_note=note)
+
+        receipt = runtime.approval._decision_receipt(AID, "allow", "write_file", result, None, True)
+
+        assert receipt == "\n".join([
+            f"已同意审批：{AID}",
+            "操作：write_file",
+            "已授权到 2026-10-27 16:00：这段时间里你发起的操作免审批，敏感操作也一样。",
+            text,
+            "提前收回：私聊发送 /审批 收回",
+        ])
+
+    def test_a_refused_permanent_after_the_flow(self, chat: _Chat) -> None:
+        chat.supervisor.grant_note = GRANT_NOTE_PERMANENT_NOT_ADMIN
+        chat.pending()
+
+        reply = chat.send("同意 永久", reply_to=CARD_REF)
+
+        assert _asked_permanent(chat) == [(AID, "allow", None, True)]
+        assert "永久授权只给管理员名单里的人" in reply
 
     def test_every_note_the_supervisor_can_send_has_a_text(self, runtime: Any) -> None:
         notes = {value for name, value in vars(sdk_types).items() if name.startswith("GRANT_NOTE_")}
@@ -511,10 +646,69 @@ class TestTheCardAndTheHelp:
         assert "/审批 同意 <ID> 2h" in runtime.approval._GRANT_DURATION_HINT
         assert runtime.approval._REVOKE_HINT == "提前收回：私聊发送 /审批 收回"
 
+    def test_the_duration_hint_names_permanent(self, runtime: Any) -> None:
+        assert "「永久」" in runtime.approval._GRANT_DURATION_HINT
+
     def test_the_help_lists_durations_and_revoking_for_an_approver(self, runtime: Any) -> None:
         text = runtime.commands._help_text(SimpleNamespace(user_id=ADMIN_QQ))
 
         assert "/审批 同意 <ID> [时长]" in text and "/审批 收回" in text
+        assert "永久" in text
+
+
+def _requested_by_admin(**overrides: Any) -> dict[str, Any]:
+    """supervisor 按任务写进审批 details 的发起人：默认是 ADMIN_QQ 本人、在管理员名单里。"""
+    auth = {"platform": "qq", "user_id": str(ADMIN_QQ), "bot_scope": BOT_SCOPE, "is_admin": True, **overrides}
+    return {"path": "engine/runner.py", "platform_auth": auth}
+
+
+class TestThePermanentLineOnTheCard:
+    @pytest.mark.parametrize("overrides", [
+        pytest.param({}, id="same-account"),
+        pytest.param({"bot_scope": ""}, id="request-without-account"),
+        pytest.param({"platform": "QQ"}, id="platform-case"),
+    ])
+    def test_the_requesters_own_card_offers_it(self, runtime: Any, overrides: dict[str, Any]) -> None:
+        card = runtime.approval._approval_summary(AID, "write_file", _requested_by_admin(**overrides), recipient=ADMIN_QQ)
+
+        assert runtime.approval._PERMANENT_CARD_HINT in card
+        assert "「同意 永久」" in card and "/审批 收回" in card
+        # 多了一句之后，引用时照样取得出是哪条审批。
+        assert runtime.approval._extract_approval_id_from_text(card) == AID
+
+    @pytest.mark.parametrize(("recipient", "details"), [
+        pytest.param(OTHER_ADMIN_QQ, _requested_by_admin(), id="another-admins-copy"),
+        pytest.param(ADMIN_QQ, _requested_by_admin(is_admin=False), id="requested-outside-the-list"),
+        pytest.param(ADMIN_QQ, _requested_by_admin(bot_scope="90002"), id="another-bot-account"),
+        pytest.param(ADMIN_QQ, _requested_by_admin(platform="telegram"), id="another-platform"),
+        pytest.param(ADMIN_QQ, {"path": "engine/runner.py"}, id="requester-unknown"),
+        pytest.param(ADMIN_QQ, {"path": "engine/runner.py", "platform_auth": "qq:10001"}, id="malformed-requester"),
+        pytest.param(None, _requested_by_admin(), id="no-recipient"),
+    ])
+    def test_nobody_else_is_offered_it(self, runtime: Any, recipient: Any, details: dict[str, Any]) -> None:
+        card = runtime.approval._approval_summary(AID, "write_file", details, recipient=recipient)
+
+        assert runtime.approval._PERMANENT_CARD_HINT not in card
+        assert "同意 2h" in card
+
+    def test_each_admin_gets_a_copy_of_their_own(self, runtime: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        set_live_config(runtime, admin_users=frozenset({ADMIN_QQ, OTHER_ADMIN_QQ}))
+        sent: dict[int, str] = {}
+
+        async def send(_bot: Any, target: dict[str, Any], text: str, **_kwargs: Any) -> int:
+            sent[int(target["user_id"])] = text
+            return next(_MESSAGE_IDS)
+
+        monkeypatch.setattr(runtime.state._adapter, "client", object(), raising=False)
+        monkeypatch.setattr(runtime.queueing, "_get_fallback_bot", lambda: object())
+        monkeypatch.setattr(runtime.queueing, "_target_from_conversation_key", lambda _key: None)
+        monkeypatch.setattr(runtime.sending, "_send_qq_message", send)
+
+        asyncio.run(runtime.callbacks.TangQiuCallbacks().show_approval_ui(AID, "write_file", _requested_by_admin()))
+
+        assert set(sent) == {ADMIN_QQ, OTHER_ADMIN_QQ}
+        assert runtime.approval._PERMANENT_CARD_HINT in sent[ADMIN_QQ]
+        assert runtime.approval._PERMANENT_CARD_HINT not in sent[OTHER_ADMIN_QQ]
 
     def test_others_do_not_see_them(self, runtime: Any) -> None:
         assert "/审批" not in runtime.commands._help_text(SimpleNamespace(user_id=FRIEND_QQ))

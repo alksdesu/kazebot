@@ -237,6 +237,7 @@ class TestFinishDecision:
 
         async def decide_approval(
             aid: str, *, decision: str, comment: str = "", approver: Any = None, grant_minutes: int | None = None,
+            grant_permanent: bool = False,
         ) -> ApprovalDecision:
             calls.append((aid, decision))
             effective = "allowed" if decision == "allow" else "denied"
@@ -254,6 +255,7 @@ class TestFinishDecision:
 
             async def decide_approval(
                 aid: str, *, decision: str, comment: str = "", approver: Any = None, grant_minutes: int | None = None,
+                grant_permanent: bool = False,
             ) -> ApprovalDecision:
                 calls.append((aid, decision))
                 await gate.wait()
@@ -278,6 +280,7 @@ class TestFinishDecision:
 
         async def decide_approval(
             aid: str, *, decision: str, comment: str = "", approver: Any = None, grant_minutes: int | None = None,
+            grant_permanent: bool = False,
         ) -> ApprovalDecision:
             raise RuntimeError("boom")
 

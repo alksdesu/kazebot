@@ -436,6 +436,7 @@ describe('服务端策略', () => {
       fireEvent.change(screen.getByLabelText(label), { target: { value } })
     );
     const saveButton = () => screen.getByRole('button', { name: '保存策略' });
+    const permanentSwitch = () => screen.getByRole('checkbox', { name: /管理员名单里的人可以要永久授权/ });
 
     it('读到的两个时长摆在「审批授权」页签里', async () => {
       await renderPolicy(GRANTED_POLICY);
@@ -463,6 +464,47 @@ describe('服务端策略', () => {
       expect(lastPut.write_file.rules).toHaveLength(2);
       expect(lastPut.restart.default).toBe('approval_required');
       expect(await screen.findByText('已保存，立即生效，不用重启')).toBeInTheDocument();
+    });
+
+    it('永久授权开关：服务端没给就按开着显示，不动它就不往回写', async () => {
+      await renderPolicy(GRANTED_POLICY);
+      openGrantTab();
+
+      expect(permanentSwitch()).toBeChecked();
+
+      setMinutes(DEFAULT_LABEL, '45');
+      fireEvent.click(saveButton());
+
+      await waitFor(() => expect(lastPut).not.toBeNull());
+      expect(lastPut.approval_grant).toEqual({ default_minutes: 45, max_minutes: 1440 });
+    });
+
+    it('关掉永久授权随整份策略保存', async () => {
+      await renderPolicy(GRANTED_POLICY);
+      openGrantTab();
+
+      fireEvent.click(permanentSwitch());
+      expect(permanentSwitch()).not.toBeChecked();
+      fireEvent.click(saveButton());
+
+      await waitFor(() => expect(lastPut).not.toBeNull());
+      expect(lastPut.approval_grant).toEqual({ default_minutes: 30, max_minutes: 1440, permanent_for_admins: false });
+    });
+
+    it('服务端给的是关着：照样显示关着，改别的段原样带回去', async () => {
+      const switchedOff = { default_minutes: 30, max_minutes: 1440, permanent_for_admins: false };
+      const switchedOffPolicy = { ...POLICY, approval_grant: switchedOff };
+      await renderPolicy(switchedOffPolicy);
+      openGrantTab();
+
+      expect(permanentSwitch()).not.toBeChecked();
+
+      fireEvent.click(screen.getByRole('button', { name: /写入/ }));
+      fireEvent.change(screen.getByLabelText('兜底档位'), { target: { value: 'deny' } });
+      fireEvent.click(saveButton());
+
+      await waitFor(() => expect(lastPut).not.toBeNull());
+      expect(lastPut.approval_grant).toEqual(switchedOff);
     });
 
     it('改别的段再保存，读到的时长原样带回去', async () => {
