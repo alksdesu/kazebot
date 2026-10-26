@@ -36,7 +36,7 @@ from .context import RunContext, TaskLease
 from .model import resolve_provider
 from .context_store import load_context_snapshot
 from .inference.async_delivery import async_result_tool_status, flush_async_result_outbox
-from .inference.loop_state import conversation_writer, flush_conversation_writes
+from .inference.loop_state import attach_node_scope, conversation_writer, flush_conversation_writes
 from .inference.pseudo_tools import tool_allowed
 from .inference.tool_format import sanitize_control_tool_history
 
@@ -1415,6 +1415,8 @@ async def _run_tool_task(
         )
         logger.warning("tool task refused: %s (task=%s)", _why, task_id)
         return {"action": "error", "node_id": tool_name, "summary": f"拒绝执行：{_why}"}
+    # node_id 留给审批记录写工具名；search_replace、edit_mode 这些节点开关和记忆去向照发起节点算
+    attach_node_scope(kctx, _origin_node, _task_ctx)
 
     await kctx.emit_event("handoff_progress", {
         "message": f"[tool] 开始执行 {tool_name}",

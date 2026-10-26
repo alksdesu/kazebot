@@ -260,10 +260,16 @@ def build_tool_context(ls: _LoopState, *, tool_call_id: str = "") -> ToolContext
         node_id=ls.node.id,
         claim_id=str(getattr(ls.rctx, "claim_id", "") or ""),
     )
-    # 插件（如 save_memory）从 node.extra 读节点级配置，不必再读一遍 yaml
-    ctx._node_id = ls.node.id  # type: ignore[attr-defined]
-    ctx._node_extra = ls.node.extra  # type: ignore[attr-defined]
+    attach_node_scope(ctx, ls.node, task_context)
     ctx._context_archive_session_id = compact_target_session_id(ls)
+    return ctx
+
+
+def attach_node_scope(ctx: ToolContext, node: Node, task_context: dict[str, Any]) -> None:
+    """工具替哪个节点跑就挂哪个节点的配置和记忆去向；节点自己调用和替它跑的独立工具任务共用。"""
+    # 插件（如 save_memory）从 node.extra 读节点级配置，不必再读一遍 yaml
+    ctx._node_id = node.id  # type: ignore[attr-defined]
+    ctx._node_extra = node.extra  # type: ignore[attr-defined]
     # 注入了谁的跨会话档案，就得让记忆工具够得着那份档案 —— 否则模型只改 content
     # 的一次更新会在会话 namespace 里新长一条，读的时候又被档案那份去重盖掉。
     ctx._memory_subjects = list(  # type: ignore[attr-defined]
@@ -273,7 +279,6 @@ def build_tool_context(ls: _LoopState, *, tool_call_id: str = "") -> ToolContext
     # 记忆工具要落到发起会话的 namespace，和注入侧算出同一个答案。
     ctx._route_conversation_key = str(task_context.get("route_conversation_key") or "")  # type: ignore[attr-defined]
     ctx._parent_conversation_key = str(task_context.get("parent_conversation_key") or "")  # type: ignore[attr-defined]
-    return ctx
 
 
 def _persist_ctx(ls: _LoopState, step_count: int) -> str:

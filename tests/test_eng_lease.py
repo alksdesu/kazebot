@@ -220,7 +220,7 @@ class _ToolRegistry:
 
 
 def _run_tool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, registry: _ToolRegistry) -> dict:
-    monkeypatch.setattr(runner, "load_node", lambda root, node_id: SimpleNamespace(id=node_id))
+    monkeypatch.setattr(runner, "load_node", lambda root, node_id: SimpleNamespace(id=node_id, extra={}))
     monkeypatch.setattr(runner, "tool_allowed", lambda node, name, spec=None: True)
     task = {"task_id": "task-1", "tool_name": "demo", "input": {"origin_node_id": "origin", "arguments": {}}}
     return asyncio.run(runner._run_tool_task(
