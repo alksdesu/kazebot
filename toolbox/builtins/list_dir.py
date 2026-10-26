@@ -141,7 +141,7 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if not dir_paths:
         return _empty_error_response("no paths specified")
 
-    recursive = bool(args.get("recursive", False))
+    recursive = parse_bool(args.get("recursive"), False)
     ignore_dirs = _NO_IGNORED_DIRS if parse_bool(args.get("include_ignored"), False) else _DEFAULT_IGNORE_DIRS
 
     # 工作区外的路径整批只送审一次。

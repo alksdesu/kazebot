@@ -219,7 +219,7 @@ def _shares_sessions(spec: dict[str, Any], previous: Any) -> bool:
 def upsert_client(workspace_root: Path, spec: dict[str, Any]) -> dict[str, Any]:
     cid = _normalize_client_id(spec.get("id"))
     transport = _normalize_transport(spec.get("transport"))
-    enabled = bool(spec.get("enabled", True))
+    enabled = bool(parse_bool(spec.get("enabled"), True))
     description = str(spec.get("description") or "").strip()
 
     connection: dict[str, Any]

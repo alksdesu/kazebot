@@ -12,7 +12,7 @@ from typing import Any, Iterable
 import yaml
 
 import config_layout
-from clonoth_runtime import get_int
+from clonoth_runtime import get_int, parse_bool
 from engine.memory_namespace import (
     InvalidMemoryNamespace,
     memory_dir,
@@ -1445,7 +1445,7 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
     name = str(args.get("name", "")).strip()
     description = str(args.get("description", "")).strip()
     content = args.get("content")
-    enabled = bool(args.get("enabled", True))
+    enabled = parse_bool(args.get("enabled"), True)
 
     strategy = str(args.get("strategy", "")).strip().lower() or None
     raw_keywords = args.get("keywords")
@@ -1751,8 +1751,8 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     elif isinstance(raw_keywords, str) and raw_keywords.strip():
         keywords = [raw_keywords.strip()]
 
-    constant = bool(args.get("constant", False))
-    enabled = bool(args.get("enabled", True))
+    constant = parse_bool(args.get("constant"), False)
+    enabled = parse_bool(args.get("enabled"), True)
 
     # Why: existing memory tools accepted node_ids as a list or comma-separated
     # string. How: preserve both forms. Purpose: node-scoped memory entries keep

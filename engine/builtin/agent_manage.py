@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 
 import config_layout
+from clonoth_runtime import parse_bool
 from engine.memory_namespace import InvalidMemoryNamespace, memory_book_error, memory_dir
 from engine.node import node_file
 from toolbox._common import request_guard
@@ -103,7 +104,7 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     display_name = str(args.get("display_name", "")).strip() or name
     description = str(args.get("description", "")).strip()
     memory_book = str(args.get("memory_book", "")).strip() or name
-    persistent = bool(args.get("persistent", True))
+    persistent = parse_bool(args.get("persistent"), True)
     provider = str(args.get("provider", "")).strip()
     caller_node_id = str(args.get("caller_node_id", "")).strip()
 
