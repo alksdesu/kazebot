@@ -555,6 +555,14 @@ def purge_expired_tool_outputs():
     logging.info("[tool_outputs] expired=%d retention_days=%d dry_run=%s", expired, store.retention_days, DRY_RUN)
 
 
+def purge_expired_edit_journals():
+    from toolbox.edit_journal import EditJournal
+
+    journal = EditJournal(DATA_DIR.parent)
+    expired = journal.purge(dry_run=DRY_RUN)
+    logging.info("[edit_journal] expired=%d retention_days=%d dry_run=%s", expired, journal.retention_days, DRY_RUN)
+
+
 # ── logs cleanup ─────────────────────
 def _newest_spawn_logs(log_dir: Path) -> set[str]:
     """每个子进程系列里最新的那份：进程可能还开着它写，删了输出就进了已删的文件。"""
@@ -668,6 +676,7 @@ def main(argv: list[str] | None = None):
         (purge_expired_transcripts, {}),
         (purge_expired_context_archives, {}),
         (purge_expired_tool_outputs, {}),
+        (purge_expired_edit_journals, {}),
         (purge_old_logs, {}),
         (purge_dir, dict(directory=DATA_DIR / "llm_error_snapshots",
                          max_age=LLM_ERROR_SNAPSHOT_MAX_AGE, label="llm_error_snapshots",

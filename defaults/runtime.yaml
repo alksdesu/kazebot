@@ -202,3 +202,8 @@ supervisor:
 #       timeout_sec: 30
 edit_checks:
   commands: []
+
+# write_file / apply_diff / edit_lines 在一个任务里第一次改某个文件之前记下原文件（data/edit_journal/），undo_edits 按任务放回去。
+# 单个文件超过 20MB 不记，一个任务最多记 100MB；过了保留期由 data_cleanup 清掉，会话被清掉时一起删。
+edit_journal:
+  retention_days: 3           # 记录保留几天（1-3650）

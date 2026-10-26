@@ -19,3 +19,5 @@ from .system import request_restart  # noqa: F401
 from .schedules import create_schedule, list_schedules, delete_schedule  # noqa: F401
 from .tasks import cancel_active_tasks, get_context_window  # noqa: F401
 from .apply_diff import apply_diff  # noqa: F401
+from .edit_lines import edit_lines  # noqa: F401
+from .undo_edits import undo_edits  # noqa: F401

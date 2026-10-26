@@ -11,22 +11,30 @@ import sys
 from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterator, Literal
+from typing import Any, Awaitable, Callable, Iterator, Literal, Mapping
 
 import config_layout
 from clonoth_runtime import get_float, load_runtime_config, parse_bool
 
 from . import builtins as _builtins
+from . import edit_journal
 from ._common import ProcessOutcome, run_process
 from ._common import request_guard as _request_guard
 from ._common import safe_subprocess_env as _safe_subprocess_env
 from . import mcp_runtime
+from .hashline import HASHLINE
 from .tool_names import is_engine_owned_name
 
 
 log = logging.getLogger(__name__)
 
 ToolFunc = Callable[[dict[str, Any], Any], Awaitable[dict[str, Any]]]
+_BuiltinEntry = (
+    tuple[str, str, dict[str, Any], ToolFunc]
+    | tuple[str, str, dict[str, Any], ToolFunc, dict[str, Any]]
+)
+_CORE_SPEC_KEYS = frozenset({"name", "description", "input_schema"})
+_MIB = 1024 * 1024
 
 # 生图工具要在调用前登记素材版本、调用后归档产物。
 _IMAGE_TOOLS = frozenset({"gpt_image_2", "gemini_image", "nai_generate", "nai_generate_from_plan"})
@@ -482,8 +490,18 @@ class ToolRegistry:
         if load_external:
             self.reload()
 
-    def register_builtin_tool(self, name: str, description: str, input_schema: dict[str, Any], func: ToolFunc) -> None:
-        """Register one builtin tool declared by a built-in plugin."""
+    def register_builtin_tool(
+        self,
+        name: str,
+        description: str,
+        input_schema: dict[str, Any],
+        func: ToolFunc,
+        extra_spec: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Register one builtin tool declared by a built-in plugin.
+
+        extra_spec adds fields such as requires_edit_mode to the spec; it may not override name, description or input_schema.
+        """
         clean_name = str(name or "").strip()
         if not clean_name:
             raise ValueError("builtin tool name is required")
@@ -491,11 +509,16 @@ class ToolRegistry:
             input_schema = {"type": "object", "properties": {}, "required": []}
         if not callable(func):
             raise TypeError(f"builtin tool function is not callable: {clean_name}")
+        extra = dict(extra_spec or {})
+        overridden = sorted(_CORE_SPEC_KEYS & extra.keys())
+        if overridden:
+            raise ValueError(f"extra spec fields of {clean_name} may not override {', '.join(overridden)}")
 
         spec = {
             "name": clean_name,
             "description": str(description or ""),
             "input_schema": input_schema,
+            **extra,
         }
         self._tool_specs[clean_name] = spec
         self._tool_funcs[clean_name] = func
@@ -507,7 +530,7 @@ class ToolRegistry:
             self._builtin_funcs[clean_name] = func
 
     def _load_builtin_meta_tools(self) -> None:
-        builtins: list[tuple[str, str, dict[str, Any], ToolFunc]] = [
+        builtins: list[_BuiltinEntry] = [
             (
                 "list_dir",
                 "List one or more directories under workspace root. Supports batch listing and recursive mode. Ignores .git by default.",
@@ -533,12 +556,14 @@ class ToolRegistry:
                 "read_file",
                 "Read one or more files under workspace root. "
                 "Text comes back with line numbers ('  12 | code'); each file's header gives its total line count and the range shown. "
+                "In nodes with edit_mode: hashline each line comes back as 'LINE:HASH|code' instead (e.g. '12:a3f|code'): "
+                "'LINE:HASH' is the anchor edit_lines takes, and the lines apply_diff shows use the same form. "
                 "Without a line range at most 500 lines are shown; a line longer than 2000 characters is cut and marked; "
                 "one call returns about 50KB of text at most and files past that are listed as not read. "
                 "When a file is not shown in full, its header tells the startLine to continue from. "
                 "Images come back as multimodal attachments, binary files as their size. "
-                "Reading a text file remembers its version for this conversation: write_file and apply_diff refuse to change it "
-                "if it was modified after the read. Policy+approval guarded.",
+                "Reading a text file remembers its version for this conversation: write_file, apply_diff and edit_lines refuse "
+                "to change it if it was modified after the read. Policy+approval guarded.",
                 {
                     "type": "object",
                     "properties": {
@@ -662,6 +687,93 @@ class ToolRegistry:
                     "required": ["path", "diffs"],
                 },
                 _builtins.apply_diff,
+            ),
+            (
+                "edit_lines",
+                "Edit a file by line anchors. In hashline mode read_file shows each line as 'LINE:HASH|content', "
+                "e.g. '12:a3f|    return x'; the 'LINE:HASH' part ('12:a3f') is the anchor. "
+                "Each edit is {op, start, end, content}: replace puts content in place of lines start..end (end defaults to start); "
+                "delete removes lines start..end; insert_after / insert_before put content after / before line start (no end). "
+                "All anchors refer to the file as you read it, before any edit of this call. "
+                "Every anchor's hash must match that line now: if any does not, nothing is written and the result shows the "
+                "current lines around it with fresh anchors; an anchor is never moved to another line. "
+                "Edits may not overlap: replaced or deleted ranges may not share lines, two inserts may not go to the same place, "
+                "and an insert may not fall inside a replaced or deleted range. They are applied bottom-up and written atomically. "
+                "content is the new lines without anchors; a trailing newline is optional. "
+                "Refused if the file changed after you last read it. Line endings, UTF-8 BOM and permissions are preserved; "
+                "after writing, the same syntax check and edit_checks commands as write_file run, and the change can be undone "
+                "with undo_edits. The result echoes the edited regions with fresh anchors; lines below an edit shift, so take "
+                "the next anchors from that echo or read the file again. Policy+approval guarded.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path relative to workspace root."},
+                        "edits": {
+                            "type": "array",
+                            "description": "Edits applied together; every anchor refers to the file before any of them.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "op": {"type": "string", "enum": ["replace", "insert_after", "insert_before", "delete"]},
+                                    "start": {
+                                        "type": "string",
+                                        "description": "Anchor 'LINE:HASH' of the first line, copied from read_file, e.g. '12:a3f'.",
+                                    },
+                                    "end": {
+                                        "type": "string",
+                                        "description": "Anchor of the last line, for replace and delete only; defaults to start.",
+                                    },
+                                    "content": {
+                                        "type": "string",
+                                        "description": "New lines for replace / insert_after / insert_before, without anchors. Omit for delete.",
+                                    },
+                                },
+                                "required": ["op", "start"],
+                            },
+                        },
+                    },
+                    "required": ["path", "edits"],
+                },
+                _builtins.edit_lines,
+                {"requires_edit_mode": HASHLINE},
+            ),
+            (
+                "undo_edits",
+                "Undo file changes made by write_file, apply_diff and edit_lines, one task at a time. "
+                "Before a task first changes a file its original content is saved; undoing puts it back "
+                "(a file the task created is deleted, together with directories created for it that are now empty). "
+                "action=list shows this conversation's recent tasks, the files each changed and whether they were undone. "
+                "action=undo (default) undoes one task: the one named by task_id (a unique prefix of at least 8 characters works), "
+                "otherwise the most recent task that still has changes not undone, the current task included. "
+                "paths limits it to some of that task's files. A file changed again after that task, by anything, is skipped "
+                "with the reason unless force=true. Each file goes through the same approval as write_file. "
+                "A change can be undone only once. "
+                f"Files over {edit_journal.MAX_FILE_BYTES // _MIB}MB and changes past a task's "
+                f"{edit_journal.MAX_TASK_BYTES // _MIB}MB journal limit are not saved and cannot be undone; "
+                "the edit's own result says so. Records are kept for edit_journal.retention_days days "
+                f"(default {edit_journal.DEFAULT_RETENTION_DAYS}). Policy+approval guarded.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["undo", "list"], "description": "undo (default) or list."},
+                        "task_id": {
+                            "type": "string",
+                            "description": "Task whose changes to undo, as action=list shows it. Default: the most recent task "
+                            "that still has changes not undone.",
+                        },
+                        "paths": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Only undo these files of that task, written as you passed them to the edit tools.",
+                        },
+                        "force": {
+                            "type": "boolean",
+                            "description": "Also restore files changed again after that task, discarding the later changes. Default false.",
+                        },
+                    },
+                    "required": [],
+                },
+                _builtins.undo_edits,
             ),
             (
                 "execute_command",
@@ -837,8 +949,8 @@ class ToolRegistry:
             ),
         ]
 
-        for name, desc, schema, func in builtins:
-            self.register_builtin_tool(name, desc, schema, func)
+        for name, desc, schema, func, *extra in builtins:
+            self.register_builtin_tool(name, desc, schema, func, extra[0] if extra else None)
 
         from .builtins import community, context_archive, execution_plans, materials, reminders
         for module in (community, context_archive, execution_plans, materials, reminders):

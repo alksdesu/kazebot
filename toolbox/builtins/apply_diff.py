@@ -4,49 +4,41 @@ All diffs are matched in memory first (see ``toolbox.edit_match``); the file is 
 when every one of them applies. diffs[1] operates on the result of diffs[0], and so on."""
 from __future__ import annotations
 
-import asyncio
-import os
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
-from .. import file_state
+from .. import edit_journal, file_state
 from ..context import ToolContext
-from .._common import request_guard, resolve_under_allowed_roots
 from ..edit_match import DiffOutcome, DiffRequest, FailedDiff, apply_diffs, line_range
 from ..syntax_check import EditChecks, run_edit_checks
-from ..text_files import TextLayout, decode_text, encode_text, normalize_newlines, split_lines
-from .read_file import number_prefix, render_lines
+from ..text_files import split_lines
+from ._edit_flow import (
+    MAX_TEXT_EDIT_BYTES,
+    SNIPPET_LINE_CHARS,
+    EchoSpan,
+    EditRefused,
+    LineStyle,
+    echo_lines,
+    edit_error_response,
+    guard_and_resolve,
+    line_style,
+    run_text_edit,
+)
+from .read_file import render_lines
 
 
 # ---------------------------------------------------------------------------
 #  Constants
 # ---------------------------------------------------------------------------
 
-_MAX_FILE_SIZE = 1024 * 1024 * 64  # 64 MiB — generous but bounded
-ECHO_CONTEXT_LINES = 2
-ECHO_MAX_CHARS = 6000
-_ECHO_REGION_MAX_LINES = 40
-_ECHO_REGION_HEAD_LINES = 25
-_ECHO_REGION_TAIL_LINES = 10
-_ECHO_LINE_CHARS = 500
+_MAX_FILE_SIZE = MAX_TEXT_EDIT_BYTES
 _SNIPPET_MAX_LINES = 12
-_SNIPPET_LINE_CHARS = 300
 
 
 # ---------------------------------------------------------------------------
 #  Helpers
 # ---------------------------------------------------------------------------
 
-
-def _apply_diff_error_response(error: Any, path: str = "", **data_fields: Any) -> dict[str, Any]:
-    # Every failure carries ok=false and data.result; data_fields may override data.result with a fuller report.
-    text = str(error)
-    data: dict[str, Any] = {"result": f"ERROR: {text}"}
-    if path:
-        data["file"] = path
-    data.update(data_fields)
-    return {"ok": False, "success": False, "error": text, "data": data}
+_apply_diff_error_response = edit_error_response
 
 
 def _start_line(raw: Any) -> int | None:
@@ -89,51 +81,7 @@ def _parse_diffs(diffs: list[Any]) -> tuple[list[DiffRequest], list[tuple[int, s
     return requests, problems
 
 
-@dataclass(frozen=True)
-class _Transaction:
-    """status: written / unchanged / failed / stale / missing / not_text / too_large."""
-
-    status: str
-    gate: file_state.Gate
-    outcome: DiffOutcome | None = None
-    stamp: file_state.Stamp | None = None
-    byte_count: int = 0
-    size: int = 0
-
-
-def _transact(session: str, resolved: Path, requests: list[DiffRequest]) -> _Transaction:
-    """Read, check the stamp, apply every diff in memory and write only if all of them applied."""
-    with file_state.edit_lock(resolved):
-        try:
-            size = os.stat(resolved).st_size
-        except FileNotFoundError:
-            return _Transaction("missing", file_state.Gate(None))
-        if size > _MAX_FILE_SIZE:
-            return _Transaction("too_large", file_state.Gate(None), size=size)
-        snapshot = file_state.take_snapshot(resolved)
-        if not snapshot.exists:
-            return _Transaction("missing", file_state.Gate(None))
-        gate = file_state.inspect(session, resolved, snapshot)
-        if gate.stale:
-            return _Transaction("stale", gate)
-        if len(snapshot.data) > _MAX_FILE_SIZE:
-            return _Transaction("too_large", gate, size=len(snapshot.data))
-        try:
-            text = decode_text(snapshot.data)
-        except UnicodeDecodeError:
-            return _Transaction("not_text", gate)
-        outcome = apply_diffs(normalize_newlines(text), requests)
-        if not outcome.ok:
-            return _Transaction("failed", gate, outcome)
-        if not outcome.changed:
-            return _Transaction("unchanged", gate, outcome)
-        data = encode_text(outcome.content, TextLayout.of_bytes(snapshot.data))
-        stamp = file_state.commit_locked(resolved, data, expected=snapshot)
-        file_state.remember(session, resolved, stamp, revealable=gate.revealable)
-        return _Transaction("written", gate, outcome, stamp, len(data))
-
-
-def _closest_lines(failed: FailedDiff) -> list[str]:
+def _closest_lines(failed: FailedDiff, style: LineStyle) -> list[str]:
     closest = failed.failure.closest
     if closest is None:
         return []
@@ -142,15 +90,18 @@ def _closest_lines(failed: FailedDiff) -> list[str]:
     last_shown = closest.last + 1 - failed.line_delta
     out = [f"  最接近的是第 {first_shown}-{last_shown} 行（相似度 {closest.similarity:.2f}）："]
     window = split_lines(failed.content)[closest.first:closest.last + 1]
-    prefix = number_prefix(max(4, len(str(last_shown))))
-    rendered = render_lines(window[:_SNIPPET_MAX_LINES], first_shown, prefix, limit=_SNIPPET_LINE_CHARS)
+    rendered = render_lines(
+        window[:_SNIPPET_MAX_LINES], first_shown, style.prefix(last_shown), limit=SNIPPET_LINE_CHARS,
+    )
     out.extend("    " + line for line, _clipped in rendered)
     if len(window) > _SNIPPET_MAX_LINES:
         out.append(f"    …（还有 {len(window) - _SNIPPET_MAX_LINES} 行没有列出）")
     return out
 
 
-def _failure_response(path_str: str, outcome: DiffOutcome, diff_count: int, *, reveal: bool) -> dict[str, Any]:
+def _failure_response(
+    path_str: str, outcome: DiffOutcome, diff_count: int, *, reveal: bool, style: LineStyle,
+) -> dict[str, Any]:
     failed = sorted(outcome.failed, key=lambda item: item.index)
     first_reason = failed[0].failure.message
     error = f"{len(failed)} 个 diff 没能应用，文件没有改动：diffs[{failed[0].index}] {first_reason}"
@@ -173,7 +124,7 @@ def _failure_response(path_str: str, outcome: DiffOutcome, diff_count: int, *, r
             entry["totalMatches"] = failure.total
         if failure.closest is not None:
             if reveal:
-                lines.extend(_closest_lines(item))
+                lines.extend(_closest_lines(item, style))
                 entry["closest"] = {
                     "startLine": failure.closest.first + 1 - item.line_delta,
                     "endLine": failure.closest.last + 1 - item.line_delta,
@@ -232,60 +183,11 @@ def _diff_summaries(outcome: DiffOutcome) -> tuple[list[str], list[dict[str, Any
     return lines, entries
 
 
-def _echo_regions(outcome: DiffOutcome, total_lines: int) -> list[tuple[int, int, list[int]]]:
-    """Line windows (1-based, inclusive) around every edit, merged when they touch."""
-    regions: list[tuple[int, int, list[int]]] = []
-    for index, (start, end) in sorted(outcome.spans.items(), key=lambda item: item[1]):
-        first, last = line_range(outcome.content, start, end)
-        low = max(1, first - ECHO_CONTEXT_LINES)
-        high = min(total_lines, last + ECHO_CONTEXT_LINES)
-        if regions and low <= regions[-1][1] + 1:
-            prev_low, prev_high, indexes = regions[-1]
-            regions[-1] = (prev_low, max(prev_high, high), indexes + [index])
-        else:
-            regions.append((low, high, [index]))
-    return regions
-
-
-def _region_block(lines: list[str], low: int, high: int, indexes: list[int]) -> list[str]:
-    names = "、".join(f"diffs[{index}]" for index in sorted(indexes))
-    block = [f"── 第 {low}-{high} 行（{names}）──"]
-    numbers = list(range(low, high + 1))
-    if len(numbers) > _ECHO_REGION_MAX_LINES:
-        skipped = len(numbers) - _ECHO_REGION_HEAD_LINES - _ECHO_REGION_TAIL_LINES
-        numbers = numbers[:_ECHO_REGION_HEAD_LINES] + [0] + numbers[-_ECHO_REGION_TAIL_LINES:]
-    else:
-        skipped = 0
-    prefix = number_prefix(max(4, len(str(high))))
-    for line_no in numbers:
-        if line_no == 0:
-            block.append(f"…（中间 {skipped} 行没有列出）")
-            continue
-        rendered, _clipped = render_lines([lines[line_no - 1]], line_no, prefix, limit=_ECHO_LINE_CHARS)[0]
-        block.append(rendered)
-    return block
-
-
-def _echo_lines(outcome: DiffOutcome) -> list[str]:
-    lines = split_lines(outcome.content)
-    if not lines:
-        return ["改动后文件是空的。"]
-    out = [f"改动后的内容（按改后的行号，前后各带 {ECHO_CONTEXT_LINES} 行）："]
-    used = 0
-    regions = [region for region in _echo_regions(outcome, len(lines)) if region[0] <= region[1]]
-    for position, (low, high, indexes) in enumerate(regions):
-        for line in _region_block(lines, low, high, indexes):
-            if used + len(line) + 1 > ECHO_MAX_CHARS:
-                rest = regions[position:]
-                names = "、".join(f"diffs[{index}]" for _low, _high, idx in rest for index in sorted(idx))
-                spans = "、".join(f"{rest_low}-{rest_high}" for rest_low, rest_high, _idx in rest)
-                out.append(
-                    f"…回显超过 {ECHO_MAX_CHARS} 字符已截断：{names} 的改动没有完整显示，需要时用 read_file 看第 {spans} 行。"
-                )
-                return out
-            out.append(line)
-            used += len(line) + 1
-    return out
+def _echo_spans(outcome: DiffOutcome) -> list[EchoSpan]:
+    return [
+        EchoSpan(index, f"diffs[{index}]", *line_range(outcome.content, start, end))
+        for index, (start, end) in outcome.spans.items()
+    ]
 
 
 def _success_response(
@@ -297,6 +199,8 @@ def _success_response(
     byte_count: int,
     reveal: bool,
     checks: EditChecks | None,
+    style: LineStyle,
+    journal: edit_journal.JournalNote | None = None,
 ) -> dict[str, Any]:
     summary_lines, entries = _diff_summaries(outcome)
     if written:
@@ -304,9 +208,11 @@ def _success_response(
     else:
         head = f"{path_str} 没有变化：{diff_count} 个 diff 都匹配上了，但应用后的内容和原文件相同，没有写盘。"
     lines = [head, *summary_lines]
+    if journal is not None:
+        lines.extend(journal.lines())
     if written:
         lines.extend(
-            _echo_lines(outcome) if reveal
+            echo_lines(outcome.content, _echo_spans(outcome), style) if reveal
             else ["（本会话没有读过这个文件的当前版本，不回显改动处的原文；需要时用 read_file 查看上面列出的行）"]
         )
     if checks is not None:
@@ -325,6 +231,8 @@ def _success_response(
     }
     if written:
         data["bytes"] = byte_count
+    if journal is not None:
+        data.update(journal.to_data())
     if checks is not None:
         data.update(checks.to_data())
     return {"ok": True, "success": True, "data": data}
@@ -362,83 +270,41 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         )
 
     # ------------------------------------------------------------------
-    #  Policy + approval guard (same flow as write_file)
-    # ------------------------------------------------------------------
-    _op, err = await request_guard(
-        ctx,
-        "write_file",
-        {
-            "path": path_str,
-            "content_preview": f"apply_diff: {len(diffs)} diff(s)",
-            "content_len": 0,
-            "tool_name": "apply_diff",
-        },
-    )
-    if err is not None:
-        cancelled = err.get("cancelled", False)
-        if cancelled:
-            response = _apply_diff_error_response(
-                "Diff was cancelled by user",
-                path_str,
-                message=f"Diff for {path_str} was cancelled by user.",
-                status="rejected",
-                diffCount=len(diffs),
-                appliedCount=0,
-                failedCount=0,
-            )
-            response["cancelled"] = True
-            response["data"]["cancelled"] = True
-            return response
-        return _apply_diff_error_response(err.get("error", "denied"), path_str)
-
-    # ------------------------------------------------------------------
-    #  Resolve, then read + match + write as one locked transaction
+    #  Policy + approval guard (same flow as write_file), then read + match + write as one locked transaction
     # ------------------------------------------------------------------
     try:
-        resolved = resolve_under_allowed_roots(ctx.workspace_root, path_str)
-    except ValueError as exc:
-        return _apply_diff_error_response(str(exc), path_str)
-
-    if not resolved.exists() or not resolved.is_file():
-        return _apply_diff_error_response(f"文件不存在：{path_str}", path_str)
-
-    session = file_state.session_key(ctx)
-    try:
-        tx = await asyncio.to_thread(_transact, session, resolved, requests)
-    except file_state.ConcurrentEdit as exc:
-        return _apply_diff_error_response(str(exc), path_str, conflict=True)
-    except OSError as exc:
-        return _apply_diff_error_response(f"读写文件失败：{exc}", path_str)
-
-    if tx.status == "missing":
-        return _apply_diff_error_response(f"文件不存在：{path_str}", path_str)
-    if tx.status == "stale":
-        return _apply_diff_error_response(file_state.STALE_MESSAGE, path_str, stale=True)
-    if tx.status == "too_large":
-        return _apply_diff_error_response(
-            f"文件太大（{tx.size} 字节），apply_diff 最多改 {_MAX_FILE_SIZE} 字节的文件。",
+        resolved = await guard_and_resolve(
+            ctx,
             path_str,
-            fileSize=tx.size,
-            maxFileSize=_MAX_FILE_SIZE,
+            tool_name="apply_diff",
+            preview=f"apply_diff: {len(diffs)} diff(s)",
+            what="Diff",
+            diffCount=len(diffs),
+            appliedCount=0,
+            failedCount=0,
         )
-    if tx.status == "not_text":
-        return _apply_diff_error_response("文件不是 UTF-8 文本，apply_diff 改不了。", path_str)
+        tx = await run_text_edit(
+            ctx, resolved, path_str, lambda text: apply_diffs(text, requests),
+            tool_name="apply_diff", max_size=_MAX_FILE_SIZE,
+        )
+    except EditRefused as refused:
+        return refused.response
 
-    outcome = tx.outcome
-    if outcome is None:
-        return _apply_diff_error_response(f"apply_diff 没有得到匹配结果（{tx.status}）", path_str)
+    style = line_style(ctx)
+    outcome: DiffOutcome = tx.outcome
     if tx.status == "failed":
         needs_reveal = any(item.failure.closest is not None for item in outcome.failed)
         reveal = needs_reveal and file_state.reveal_allowed(tx.gate)
-        return _failure_response(path_str, outcome, len(diffs), reveal=reveal)
+        return _failure_response(path_str, outcome, len(diffs), reveal=reveal, style=style)
 
     if tx.status == "unchanged":
         return _success_response(
-            path_str, outcome, len(diffs), written=False, byte_count=0, reveal=False, checks=None,
+            path_str, outcome, len(diffs), written=False, byte_count=0, reveal=False, checks=None, style=style,
         )
 
     reveal = file_state.reveal_allowed(tx.gate)
     checks = await run_edit_checks(ctx, resolved, outcome.content, tool_name="apply_diff")
     return _success_response(
-        path_str, outcome, len(diffs), written=True, byte_count=tx.byte_count, reveal=reveal, checks=checks,
+        path_str, outcome, len(diffs),
+        written=True, byte_count=tx.byte_count, reveal=reveal, checks=checks, style=style, journal=tx.journal,
     )

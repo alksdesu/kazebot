@@ -15,6 +15,7 @@ from typing import Any, Callable, Sequence
 from .. import file_state
 from ..context import ToolContext
 from .._common import request_guard, resolve_under_allowed_roots
+from ..hashline import hashline_enabled, hashline_prefix
 from ..text_files import decode_text, normalize_newlines, split_lines
 
 
@@ -230,7 +231,7 @@ def _read_image(p: Path, path_str: str, workspace_root: Path) -> tuple[dict[str,
 
 
 def _text_section(
-    path_str: str, text: str, start_line: Any, end_line: Any, budget: _Budget,
+    path_str: str, text: str, start_line: Any, end_line: Any, budget: _Budget, *, hashline: bool = False,
 ) -> _Section:
     lines = split_lines(normalize_newlines(text))
     total = len(lines)
@@ -253,7 +254,8 @@ def _text_section(
         last = DEFAULT_MAX_LINES
 
     selected = lines[first - 1:last]
-    rendered = render_lines(selected, first, number_prefix(max(4, len(str(last)))))
+    prefix = hashline_prefix if hashline else number_prefix(max(4, len(str(last))))
+    rendered = render_lines(selected, first, prefix)
     available = budget.remaining - _HEADER_RESERVE_BYTES
     used = 0
     shown = 0
@@ -309,6 +311,8 @@ async def _read_single_file(
     end_line: Any,
     ctx: ToolContext,
     budget: _Budget,
+    *,
+    hashline: bool = False,
 ) -> _Section:
     if not path_str:
         return _error_section("", "路径为空")
@@ -355,7 +359,7 @@ async def _read_single_file(
 
     # Even a partial read stamps the whole file: edits are checked against what was on disk.
     file_state.remember(file_state.session_key(ctx), p, snapshot.stamp, revealable=True)
-    return _text_section(path_str, text, start_line, end_line, budget)
+    return _text_section(path_str, text, start_line, end_line, budget, hashline=hashline)
 
 
 # ---------------------------------------------------------------------------
@@ -408,12 +412,13 @@ async def read_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         return _empty_response("empty files list")
 
     budget = _Budget()
+    hashline = hashline_enabled(ctx)
     sections: list[_Section] = []
     for fe in file_entries:
         path_str = str(fe.get("path", "")).strip()
         sl = fe.get("startLine") if fe.get("startLine") is not None else fe.get("start_line")
         el = fe.get("endLine") if fe.get("endLine") is not None else fe.get("end_line")
-        section = await _read_single_file(path_str, sl, el, ctx, budget)
+        section = await _read_single_file(path_str, sl, el, ctx, budget, hashline=hashline)
         budget.spend(section.text)
         sections.append(section)
 

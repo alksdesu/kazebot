@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .. import file_state
+from .. import edit_journal, file_state
 from ..context import ToolContext
 from .._common import request_guard, resolve_under_allowed_roots
 from ..syntax_check import run_edit_checks
@@ -34,22 +34,32 @@ class _Written:
     created: bool = False
     byte_count: int = 0
     stamp: file_state.Stamp | None = None
+    journal: edit_journal.JournalNote | None = None
 
 
-def _commit(session: str, resolved: Path, content: str) -> _Written:
+def _commit(scope: edit_journal.JournalScope, resolved: Path, content: str, display: str) -> _Written:
     """Write under the per-file edit lock; ``stamp`` stays None when the stamp check refuses."""
     with file_state.edit_lock(resolved):
         snapshot = file_state.take_snapshot(resolved)
-        gate = file_state.inspect(session, resolved, snapshot)
+        gate = file_state.inspect(scope.session, resolved, snapshot)
         if gate.stale:
             return _Written(gate)
         layout = TextLayout.of_bytes(snapshot.data) if snapshot.exists else NEW_FILE
         data = encode_text(content, layout)
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        stamp = file_state.commit_locked(resolved, data, expected=snapshot)
+        # Recorded before the directories are created, so undoing a new file can remove them again.
+        pending = edit_journal.record_pre_image(
+            scope, resolved, snapshot, tool="write_file", display=display, revealable=gate.revealable,
+        )
+        try:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            stamp = file_state.commit_locked(resolved, data, expected=snapshot)
+        except BaseException:
+            pending.discard()
+            raise
         # The model wrote every byte of this version, so echoing it later reveals nothing new.
-        file_state.remember(session, resolved, stamp, revealable=True)
-        return _Written(gate, not snapshot.exists, len(data), stamp)
+        file_state.remember(scope.session, resolved, stamp, revealable=True)
+        note = pending.record_post_image(stamp)
+        return _Written(gate, not snapshot.exists, len(data), stamp, note)
 
 
 async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -59,6 +69,13 @@ async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if args.get("content") is None:
         return _error_response("'content' is required; pass an empty string to write an empty file.", path=path)
     content = _content_text(args["content"])
+
+    try:
+        target = resolve_under_allowed_roots(ctx.workspace_root, path)
+    except ValueError:
+        target = None
+    if target is not None and edit_journal.inside_journal(ctx.workspace_root, target):
+        return _error_response(edit_journal.JOURNAL_REFUSED_MESSAGE, path=path)
 
     _op, err = await request_guard(
         ctx,
@@ -81,7 +98,7 @@ async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         return _error_response(f"{path} 是目录，不能当文件写", path=path)
 
     try:
-        written = await asyncio.to_thread(_commit, file_state.session_key(ctx), resolved, content)
+        written = await asyncio.to_thread(_commit, edit_journal.JournalScope.of(ctx), resolved, content, path)
     except file_state.ConcurrentEdit as exc:
         return _error_response(str(exc), path=path, conflict=True)
     except OSError as exc:
@@ -96,6 +113,8 @@ async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         lines.append("注意：本会话之前没有读过这个文件，原内容已被整份覆盖。")
     if written.created and gate.vanished:
         lines.append("注意：这个文件在你上次读取之后被删掉了，这次按新文件写入。")
+    if written.journal is not None:
+        lines.extend(written.journal.lines())
 
     checks = await run_edit_checks(ctx, resolved, content, tool_name="write_file")
     lines.extend(checks.lines())
@@ -104,6 +123,7 @@ async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         "path": path,
         "bytes": written.byte_count,
         "created": written.created,
+        **(written.journal.to_data() if written.journal is not None else {}),
         **checks.to_data(),
     }
     if unread_overwrite:
