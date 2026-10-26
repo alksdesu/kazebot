@@ -21,6 +21,7 @@ from clonoth_runtime import (
     get_float,
     get_int,
     load_runtime_config,
+    main_session_enabled,
     normalize_openai_secret,
     resolve_channel,
     resolve_system_model,
@@ -1094,9 +1095,7 @@ async def _run_node_task(
     # 加载 history，与 child session 同源；_persist_ctx 不写 snapshot。
     # flag 关闭时回退到旧 snapshot 机制（context_ref + load_context_snapshot）。
     _runtime_cfg_main = load_runtime_config(ws_root)
-    _main_conv_enabled = bool(
-        _runtime_cfg_main.get("engine", {}).get("child_session", {}).get("main_session_enabled", True)
-    )
+    _main_conv_enabled = main_session_enabled(_runtime_cfg_main)
 
     if child_session_id:
         # ---- Child Session 模式（新路径）----
@@ -1262,7 +1261,7 @@ async def _run_node_task(
     # 读取 runtime.yaml 中的 signals.enabled 配置决定是否启用。
     _signals_cfg = runtime_cfg.get("engine", {}).get("signals", {})
     _sig_bus = get_bus()
-    _sig_bus.enabled = bool(_signals_cfg.get("enabled", True))
+    _sig_bus.enabled = get_bool(runtime_cfg, "engine.signals.enabled", True)
     _bridge_patterns = _signals_cfg.get("bridge_patterns")
     _bridge_exclude_patterns = _signals_cfg.get("bridge_exclude_patterns")
     install_event_bridge(

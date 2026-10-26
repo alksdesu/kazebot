@@ -676,6 +676,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
 
     @router.get("/skills")
     def list_skills() -> list[dict[str, Any]]:
+        from engine.builtin.knowledge_inject import skill_enabled
+
         skills_dir = _skills_dir()
         if not skills_dir.is_dir():
             return []
@@ -687,7 +689,7 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 res.append({
                     "name": str(meta.get("name") or skill_md.parent.name),
                     "description": str(meta.get("description") or ""),
-                    "enabled": bool(meta.get("enabled", True)),
+                    "enabled": skill_enabled(meta),
                     "strategy": str(meta.get("strategy") or "normal"),
                     "keywords": [str(k) for k in (meta.get("keywords") or []) if isinstance(k, str)],
                     "body_preview": body.strip()[:200] if body else "",

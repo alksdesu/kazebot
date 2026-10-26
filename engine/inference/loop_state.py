@@ -302,9 +302,9 @@ def _persist_ctx(ls: _LoopState, step_count: int) -> str:
         return ""  # 不产生 context_ref
     # Step 2：主节点 ConversationStore 模式也跳过 snapshot
     try:
-        from clonoth_runtime import load_runtime_config
+        from clonoth_runtime import load_runtime_config, main_session_enabled
         _rc = load_runtime_config(ls.rctx.workspace_root)
-        if bool(_rc.get("engine", {}).get("child_session", {}).get("main_session_enabled", True)):
+        if main_session_enabled(_rc):
             return ""
     except Exception:
         pass

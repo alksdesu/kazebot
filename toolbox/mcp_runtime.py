@@ -159,7 +159,7 @@ def _normalize_public_spec(client_id: str, spec: dict[str, Any]) -> dict[str, An
     transport = _normalize_transport(spec.get("transport"))
     out: dict[str, Any] = {
         "id": client_id,
-        "enabled": bool(spec.get("enabled", True)),
+        "enabled": bool(parse_bool(spec.get("enabled"), True)),
         "share_sessions": bool(parse_bool(spec.get("share_sessions"), False)),
         "transport": transport,
     }

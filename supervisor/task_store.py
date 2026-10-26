@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any
 
-from clonoth_runtime import get_str, load_runtime_config, parse_bool
+from clonoth_runtime import get_str, load_runtime_config, main_session_enabled, parse_bool
 from engine.output_guide import OUTPUT_GUIDE_KEY
 from engine.tool_outputs import bounded_for_event
 from platforms.registry import find_platform
@@ -637,7 +637,7 @@ class TaskStoreMixin:
         # 加载 history，不再依赖 node_contexts snapshot。
         # flag 关闭时走旧路径，调用 _find_last_context_ref_locked 注入 snapshot ref。
         # _find_last_context_ref_locked 本体保留（兼容期回退路径仍需要）。
-        main_use_conv = bool(cfg.get("engine", {}).get("child_session", {}).get("main_session_enabled", True))
+        main_use_conv = main_session_enabled(cfg)
         if main_use_conv:
             last_ctx_ref = ""
         else:

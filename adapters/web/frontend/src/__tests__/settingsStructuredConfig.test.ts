@@ -7,6 +7,7 @@ import {
   mcpClientCreateEdits,
   mcpClientRemoveEdits,
   mcpClientUpdateEdits,
+  parseBoolFlag,
   parseMcpClients,
   parseNodeConfig,
   parseRuntimeConfig,
@@ -616,5 +617,78 @@ describe('skill quick fields only touch the frontmatter keys they changed', () =
 
   it('refuses a file without frontmatter', () => {
     expect(() => parseSkillQuickFields('# 没有 frontmatter\n')).toThrow('技能文件缺少 YAML frontmatter，请修复后再保存。');
+  });
+});
+
+// 手写成字符串的开关要和引擎的 parse_bool 读出同一个结论，不然 "false" 在表单上显示的和引擎实际做的相反
+describe('hand-written switches read like the engine reads them', () => {
+  it.each([
+    [true, false, true],
+    [false, true, false],
+    ['true', false, true],
+    ['Yes', false, true],
+    ['on', false, true],
+    ['y', false, true],
+    [1, false, true],
+    ['false', true, false],
+    ['No', true, false],
+    ['off', true, false],
+    ['n', true, false],
+    [0, true, false],
+    ['maybe', false, false],
+    ['maybe', true, true],
+    ['', true, true],
+    [null, true, true],
+    [undefined, false, false],
+  ])('parseBoolFlag(%j, fallback %s) is %s', (value, fallback, expected) => {
+    expect(parseBoolFlag(value, fallback)).toBe(expected);
+  });
+
+  it('reads persistent on a node', () => {
+    expect(parseNodeConfig('id: a\npersistent: "false"\n').persistent).toBe(false);
+    expect(parseNodeConfig('id: a\npersistent: "yes"\n').persistent).toBe(true);
+    expect(parseNodeConfig('id: a\npersistent: true\n').persistent).toBe(true);
+    expect(parseNodeConfig('id: a\n').persistent).toBe(false);
+  });
+
+  it('reads enabled, once and silent on a schedule', () => {
+    const [quoted, bare] = parseSchedules([
+      'schedules:',
+      '  - id: quoted',
+      '    cron: "0 8 * * *"',
+      '    type: script',
+      '    command: run.py',
+      '    enabled: "false"',
+      '    once: "yes"',
+      '    silent: "off"',
+      '  - id: bare',
+      '    cron: "0 9 * * *"',
+      '    text: 早',
+      '',
+    ].join('\n'));
+
+    expect(quoted).toMatchObject({ enabled: false, once: true, silent: false });
+    expect(bare).toMatchObject({ enabled: true, once: false, silent: true });
+  });
+
+  it('leaves a quoted switch alone when another field of the schedule is edited', () => {
+    const raw = 'schedules:\n  - id: quoted\n    cron: "0 8 * * *"\n    text: 早\n    enabled: "false"\n';
+    const [quoted] = parseSchedules(raw);
+
+    const { content } = editYamlKeys(raw, scheduleUpdateEdits(raw, quoted, { ...quoted, text: '早安' }));
+
+    expect(content).toBe(raw.replace('text: 早\n', 'text: 早安\n'));
+  });
+
+  it('reads enabled on an MCP client', () => {
+    const [off, on] = parseMcpClients('clients:\n  off:\n    command: a\n    enabled: "no"\n  on:\n    command: b\n');
+
+    expect(off.enabled).toBe(false);
+    expect(on.enabled).toBe(true);
+  });
+
+  it('reads enabled on a skill', () => {
+    expect(parseSkillQuickFields('---\nname: s\nenabled: "false"\n---\n正文\n').enabled).toBe(false);
+    expect(parseSkillQuickFields('---\nname: s\n---\n正文\n').enabled).toBe(true);
   });
 });

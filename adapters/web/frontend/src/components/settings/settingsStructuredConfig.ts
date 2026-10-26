@@ -91,6 +91,19 @@ function str(value: any, fallback = ''): string {
   return String(value);
 }
 
+// 与 clonoth_runtime.parse_bool 认同一套写法：手写的 yes、on、1 算开，no、off、0 算关，认不出的照 fallback，和引擎读出同一个结论
+const PARSE_BOOL_TRUE_WORDS = new Set(['1', 'true', 'yes', 'y', 'on']);
+const PARSE_BOOL_FALSE_WORDS = new Set(['0', 'false', 'no', 'n', 'off']);
+
+export function parseBoolFlag(value: unknown, fallback = false): boolean {
+  if (typeof value === 'boolean') return value;
+  if (value === null || value === undefined) return fallback;
+  const text = String(value).trim().toLowerCase();
+  if (PARSE_BOOL_TRUE_WORDS.has(text)) return true;
+  if (PARSE_BOOL_FALSE_WORDS.has(text)) return false;
+  return fallback;
+}
+
 function normalizeEngineToolMode(value: string, fallback: EngineToolMode = 'fake-native'): EngineToolMode {
   const normalized = value.trim().toLowerCase().replace(/_/g, '-');
   return normalized === 'native' || normalized === 'json' || normalized === 'fake-native' ? normalized : fallback;
@@ -144,7 +157,7 @@ export function parseNodeConfig(raw: string, fallbackId = ''): NodeConfigFormSta
     model: str(doc.model),
     provider: str(doc.provider),
     memory_book: str(doc.memory_book),
-    persistent: doc.persistent === true,
+    persistent: parseBoolFlag(doc.persistent),
     prompt: Array.isArray(doc.prompt) ? JSON.stringify(doc.prompt, null, 2) : str(doc.prompt),
     promptIsStructured: Array.isArray(doc.prompt),
     delegate_targetsText: Array.isArray(doc.delegate_targets) ? doc.delegate_targets.map(String).join(', ') : '',
@@ -264,13 +277,13 @@ function scheduleForm(item: Record<string, any>): ScheduleFormState {
     type: item.type === 'script' ? 'script' : 'message',
     text: str(item.text),
     command: str(item.command),
-    enabled: item.enabled !== false,
-    once: item.once === true,
+    enabled: parseBoolFlag(item.enabled, true),
+    once: parseBoolFlag(item.once),
     conversation_key: str(item.conversation_key),
     entry_node_id: str(item.entry_node_id),
     workflow_id: str(item.workflow_id),
     timeout: item.timeout === undefined ? '' : String(item.timeout),
-    silent: item.silent !== false,
+    silent: parseBoolFlag(item.silent, true),
   };
 }
 
@@ -353,15 +366,6 @@ function normalizeMcpTransport(value: unknown): McpTransport {
 
 const isHttpTransport = (transport: McpTransport): boolean => transport !== 'stdio';
 
-// 与 clonoth_runtime.parse_bool 认同一套写法：手写的 yes、on、1 都算开，认不出的算没开。
-const PARSE_BOOL_TRUE_WORDS = new Set(['1', 'true', 'yes', 'y', 'on']);
-
-function parseBoolFlag(value: unknown): boolean {
-  if (typeof value === 'boolean') return value;
-  if (value === null || value === undefined) return false;
-  return PARSE_BOOL_TRUE_WORDS.has(String(value).trim().toLowerCase());
-}
-
 /** 文件里的 clients 映射。没写或写成空值都算没有，和 toolbox/mcp_runtime.py 一致。 */
 function mcpClientMap(raw: string): Record<string, Record<string, any>> {
   const clients = safeLoad(raw).clients ?? {};
@@ -374,7 +378,7 @@ function mcpClientForm(id: string, spec: Record<string, any>): McpClientFormStat
     original: { ...spec },
     id,
     description: str(spec.description),
-    enabled: spec.enabled !== false,
+    enabled: parseBoolFlag(spec.enabled, true),
     share_sessions: parseBoolFlag(spec.share_sessions),
     transport: normalizeMcpTransport(spec.transport),
     command: str(spec.command),
@@ -487,7 +491,7 @@ export function parseSkillQuickFields(raw: string): SkillQuickFields {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('技能 frontmatter 必须是对象。');
   const value = parsed as Record<string, unknown>;
   return {
-    enabled: value.enabled !== false,
+    enabled: parseBoolFlag(value.enabled, true),
     strategy: String(value.strategy || 'normal'),
     keywords: Array.isArray(value.keywords) ? value.keywords.map(String).join(', ') : String(value.keywords || ''),
     order: String(value.order ?? 0),

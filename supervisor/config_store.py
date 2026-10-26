@@ -363,7 +363,7 @@ class ConfigStore:
             public.pop(derived, None)
         public["provider"] = provider_name
         # 这两项引擎真在读：漏了它们，编辑器存一次就会把「支持图片」和请求参数抹掉。
-        public["supports_vision"] = bool(entry.get("supports_vision", False))
+        public["supports_vision"] = bool(_tristate(entry.get("supports_vision")))
         # 条目指的可能是个自定义渠道名，得先问出它是哪家才知道有哪些参数可公布。
         public["options"] = self._public_options(self._type_of(provider_name), entry.get("options"))
         return public

@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
+from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config, main_session_enabled
 from file_lock import exclusive_lock
 
 from ._helpers import _now
@@ -2716,7 +2716,7 @@ class TaskRouterMixin:
         from engine.conversation_store import ConversationStore
 
         config = load_runtime_config(self.workspace_root)
-        use_store = bool(config.get("engine", {}).get("child_session", {}).get("main_session_enabled", True))
+        use_store = main_session_enabled(config)
         if use_store or not context_ref:
             messages = ConversationStore(self.workspace_root / "data" / "conversations").load(session_id)
             storage = "conversation"

@@ -20,6 +20,8 @@ from engine.builtin.knowledge_inject import (
     _load_book,
     _memory_write_lock,
     _save_book,
+    memory_entry_constant,
+    memory_entry_enabled,
 )
 from engine.memory_namespace import (
     InvalidMemoryNamespace,
@@ -160,6 +162,9 @@ def list_entries(workspace_root: Path, namespace: str) -> list[dict[str, Any]]:
                 continue
             item = dict(entry)
             item["book"] = book
+            # 控制台按真假显示常驻：手写成字符串的开关先读成和注入侧一样的结论
+            item["constant"] = memory_entry_constant(entry)
+            item["enabled"] = memory_entry_enabled(entry)
             item.setdefault("scan_depth", _DEFAULT_SCAN_DEPTH)
             result.append(item)
     return result
@@ -180,7 +185,7 @@ def upsert_entry(
         raise MemoryAdminError(f"记忆内容超过 {_MAX_CONTENT_LEN} 字")
 
     keywords = _clean_keywords(payload.get("keywords"))
-    constant = bool(payload.get("constant"))
+    constant = memory_entry_constant(payload)
     subject = str(payload.get("subject") or "").strip() or subject_from_namespace(namespace)
     if subject and not is_valid_subject(subject):
         raise MemoryAdminError(f"非法的 subject: {subject}")
@@ -207,7 +212,7 @@ def upsert_entry(
             "content": content,
             "keywords": keywords,
             "constant": constant,
-            "enabled": bool(payload.get("enabled", True)),
+            "enabled": memory_entry_enabled(payload),
             "priority": int(payload.get("priority") or 0),
             "scan_depth": int(payload.get("scan_depth") or _DEFAULT_SCAN_DEPTH),
         }

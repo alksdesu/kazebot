@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import config_layout
+from clonoth_runtime import parse_bool
 
 from .node import Node
 
@@ -160,7 +161,7 @@ def _assemble_block_prompt(
             continue
 
         # Skip disabled blocks
-        if block.get("enabled") is False:
+        if not parse_bool(block.get("enabled"), True):
             continue
 
         role = str(block.get("role") or "").strip()

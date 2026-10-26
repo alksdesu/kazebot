@@ -35,6 +35,7 @@ from engine.builtin.knowledge_inject import (  # noqa: E402
     _load_book,
     _memory_write_lock,
     _save_book,
+    memory_entry_constant,
 )
 from engine.memory_namespace import (  # noqa: E402
     SUBJECT_PREFIX,
@@ -321,7 +322,7 @@ _HitLookup = Callable[[dict, str, str], str]
 def _memory_entry_expired(
     entry: object, namespace: str, cutoff: float, hit_cache: dict, hit_lookup: _HitLookup,
 ) -> bool:
-    if not isinstance(entry, dict) or bool(entry.get("constant", False)):
+    if not isinstance(entry, dict) or memory_entry_constant(entry):
         return False
     # 只清自动提取写的条目。没有 source 的条目里有人手写的，一律当手工记忆保护，
     # 判成 auto 就会删掉一批本该只有人能删的东西。

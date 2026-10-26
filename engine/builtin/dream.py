@@ -19,6 +19,7 @@ from clonoth_runtime import (
     task_max_running_seconds,
 )
 from engine.cron import cron_match
+from engine.builtin.knowledge_inject import memory_entry_constant
 from engine.builtin.memory_extract import _format_transcript_for_extract
 from engine import memory_subjects
 from engine.memory_namespace import (
@@ -997,7 +998,7 @@ class DreamHandler:
                         "content_chars": len(content),
                         "keywords": keywords,
                         "keyword_set": set(keywords),
-                        "constant": bool(entry.get("constant", False)),
+                        "constant": memory_entry_constant(entry),
                         "source": str(entry.get("source") or ""),
                         # 提示词按 created_at 判 30 天过期、7 天提升，按 priority 挑重激活候选，
                         # 按 content 长度判该不该提升成 skill —— 不发这几个字段，那几条约束就只能靠猜。

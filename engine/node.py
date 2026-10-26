@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import config_layout
-from clonoth_runtime import load_yaml_dict, load_runtime_config, resolve_env_ref
+from clonoth_runtime import load_yaml_dict, load_runtime_config, parse_bool, resolve_env_ref
 
 logger = logging.getLogger(__name__)
 
@@ -291,10 +291,8 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         canonical_node_id(workspace_root, x) for x in dt_raw if isinstance(x, str) and x.strip()
     )) if isinstance(dt_raw, list) else []
 
-    # [2026-05-27] persistent 字段解析：从 node yaml 读取 persistent 布尔值。
-    # 为什么：支持节点级别的持久化声明，用于控制 context_mode 默认值和自动压缩。
-    # 怎么改：解析 yaml 中的 persistent 字段，非布尔值均视为 False。
-    persistent = bool(data.get("persistent", False))
+    # 决定 dispatch 默认的 context_mode；手写成 "false"、no 的也算关，和控制台的读法一致
+    persistent = bool(parse_bool(data.get("persistent"), False))
 
     # [2026-05-27] extra dict：收集 yaml 中 core 不认识的字段（如 memory_book），
     # 供插件层通过 ToolContext._node_extra 零 IO 读取。

@@ -207,6 +207,11 @@ def skill_strategy(meta: dict[str, Any]) -> str:
     return strategy if strategy in SKILL_STRATEGIES else "normal"
 
 
+def skill_enabled(meta: dict[str, Any]) -> bool:
+    """frontmatter 里的 enabled；手写的 "false"、no 也算关，没写或认不出的按开。"""
+    return bool(parse_bool(meta.get("enabled"), True))
+
+
 def _whole_number(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -332,7 +337,7 @@ def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list
             meta, body = parse_skill_frontmatter(text)
             name = str(meta.get("name") or skill_md.parent.name).strip() or skill_md.parent.name
             description = str(meta.get("description") or "").strip()
-            enabled = bool(meta.get("enabled", True))
+            enabled = skill_enabled(meta)
             path = config_layout.logical_path(workspace_root, skill_md)
 
             strategy = skill_strategy(meta)
@@ -537,6 +542,15 @@ def _is_tool_writable(entry: dict[str, Any]) -> bool:
     return str(entry.get("source") or "").strip() == _AUTO_SOURCE
 
 
+# 记忆本是 yaml，手改时开关可能写成字符串：一律按 parse_bool 读，注入、列表、清理、删除保护才得出同一个结论
+def memory_entry_enabled(entry: dict[str, Any]) -> bool:
+    return bool(parse_bool(entry.get("enabled"), True))
+
+
+def memory_entry_constant(entry: dict[str, Any]) -> bool:
+    return bool(parse_bool(entry.get("constant"), False))
+
+
 def load_memory_catalog(
     workspace_root: Path,
     *,
@@ -578,7 +592,7 @@ def load_memory_catalog(
                 eid = str(entry.get("id") or "").strip()
                 if not eid:
                     continue
-                if not entry.get("enabled", True):
+                if not memory_entry_enabled(entry):
                     continue
 
                 content = str(entry.get("content") or "").strip()
@@ -596,7 +610,7 @@ def load_memory_catalog(
                 elif isinstance(raw_kw, str) and raw_kw.strip():
                     keywords = [raw_kw.strip()]
 
-                constant = bool(entry.get("constant", False))
+                constant = memory_entry_constant(entry)
                 priority = 0
                 if isinstance(entry.get("priority"), (int, float)):
                     priority = int(entry["priority"])
@@ -1572,7 +1586,7 @@ async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             item: dict[str, Any] = {
                 "name": str(meta.get("name") or skill_md.parent.name),
                 "description": str(meta.get("description") or ""),
-                "enabled": bool(meta.get("enabled", True)),
+                "enabled": skill_enabled(meta),
                 "strategy": strategy,
                 "keywords": kw_list,
                 "order": item_order,
@@ -1856,7 +1870,7 @@ def _save_memory_locked(
         if not _is_tool_writable(old):
             return _tool_err(f"cannot modify manually authored memory: {mid}")
         # constant 卸不掉：卸得掉就能先解锁再 delete，绕开那边的 constant 守卫。
-        if bool(old.get("constant", False)) and "constant" in args and not constant:
+        if memory_entry_constant(old) and "constant" in args and not constant:
             return _tool_err(f"cannot clear constant flag: {mid}")
         new_entry["created_at"] = str(old.get("created_at") or "").strip() or _now_iso
         new_entry["source"] = _AUTO_SOURCE
@@ -1920,8 +1934,8 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
                     "id": str(e.get("id") or ""),
                     "content": str(e.get("content") or "")[:200],
                     "keywords": e.get("keywords", []),
-                    "constant": bool(e.get("constant", False)),
-                    "enabled": bool(e.get("enabled", True)),
+                    "constant": memory_entry_constant(e),
+                    "enabled": memory_entry_enabled(e),
                     "priority": int(e.get("priority") or 0),
                     "scan_depth": int(e.get("scan_depth") or 0),
                     "node_ids": e.get("node_ids", []),
@@ -1982,7 +1996,7 @@ def _delete_memory_locked(
     # the old refusal before filtering entries. Purpose: prevent accidental removal
     # of always-injected memory through the tool API.
     target = entries[found_index]
-    if bool(target.get("constant", False)):
+    if memory_entry_constant(target):
         return _tool_err(f"cannot delete constant memory: {mid}")
 
     # 手工记忆只能由人删。与 save_memory 共用一个判据，避免两套标准。

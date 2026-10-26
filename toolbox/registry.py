@@ -1140,7 +1140,7 @@ class ToolRegistry:
                 "name": name,
                 "description": description,
                 "input_schema": input_schema,
-                "async_mode": bool(spec.get("async_mode", False)),
+                "async_mode": bool(parse_bool(spec.get("async_mode"), False)),
             }
             result_format = spec.get("result_format")
             if isinstance(result_format, str) and result_format.strip():

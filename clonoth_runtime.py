@@ -344,6 +344,11 @@ def get_bool(data: dict[str, Any], dotted_key: str, default: bool = False) -> bo
     return bool(parse_bool(get_str(data, dotted_key, ""), bool(default)))
 
 
+def main_session_enabled(config: dict[str, Any]) -> bool:
+    """主节点的历史从 data/conversations 读；关掉时退回旧的 context 快照。supervisor 和 engine 两边得读出同一个结论。"""
+    return get_bool(config, "engine.child_session.main_session_enabled", True)
+
+
 DEFAULT_TASK_MAX_RUNNING_SECONDS = 3600.0
 _MIN_TASK_MAX_RUNNING_SECONDS = 300.0
 # supervisor 每隔这么久检查一次卡死的 running 任务；dream 要据此留足等待余量，所以放在两边都能导入的地方
