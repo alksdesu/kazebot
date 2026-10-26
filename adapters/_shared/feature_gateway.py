@@ -20,6 +20,7 @@ from adapters._shared import community_commands
 from adapters._shared.burst_store import BurstStore
 from adapters._shared.conversation_coordinator import BurstItem, ConversationCoordinator
 from adapters._shared.send_guard import SendError
+from adapters._shared.trigger_policy import EXPLICIT_SIGNALS
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +241,7 @@ class FeatureGateway:
             result["raw_text"] = text
             result["actor"] = actor
             result["direct"] = bool(not facts.conversation.is_group or self.host.is_direct_bot_interaction(event, bot, text)
-                                    or self.host.group_trigger_decision_once(event, bot, text).signal in {"name", "reply", "at", "prefix"})
+                                    or self.host.group_trigger_decision_once(event, bot, text).signal in EXPLICIT_SIGNALS)
             journal = await self.record_inbound(facts, actor)
             result["journal_recorded"] = bool((journal or {}).get("recorded"))
             return result
@@ -327,6 +328,7 @@ class FeatureGateway:
                 "memory_user_ids": item.memory_user_ids, "actor": actor, "refs": refs,
                 "route_hints": item.platform_updates.get("_route_hints", {}),
                 "response_purpose": item.platform_updates.get("_response_purpose", "direct"),
+                "trigger_source": item.platform_updates.get("_trigger_source", ""),
                 **self.host.staged_event_fields(event),
                 "facts": facts.to_dict()}
         self.burst_store.save(item.stable_conversation_key, actor["message_id"], actor["bot_scope"], data)

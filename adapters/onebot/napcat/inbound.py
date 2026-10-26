@@ -21,11 +21,18 @@ from ..config import (
 )
 from adapters._shared import capability
 from adapters._shared.trigger_policy import (
+    PRESENCE_ABSENT,
+    PRESENCE_PRESENT,
+    SIGNAL_LLM_INTENT,
+    QuietWait,
     TriggerConfig,
     TriggerDecision,
     TriggerInput,
+    accept as trigger_accept,
     evaluate as trigger_evaluate,
     matched_prefix,
+    observe as trigger_observe,
+    with_group_settings,
 )
 from ..live_config import live
 from ..segments import any_marked_segment
@@ -277,13 +284,103 @@ def _trigger_input(event: GroupMessageEvent, bot: Bot, text: str) -> TriggerInpu
     )
 
 
+def _group_policy_settings(event: Any, bot: Any) -> Mapping[str, Any]:
+    """这个群的社区设置。功能服务没接上、或这条消息还没准备过时为空。"""
+    features = state._adapter.features
+    if not features.available:
+        return {}
+    metadata = features.coordinator.metadata(features.actor(bot, event))
+    settings = (metadata.get("policy") or {}).get("settings") if isinstance(metadata, Mapping) else None
+    return settings if isinstance(settings, Mapping) else {}
+
+
+def _group_trigger_config(event: Any, bot: Any) -> TriggerConfig:
+    """这个群此刻的判定配置：热载配置叠上社区的按群设置（回复策略、在场开关、离场概率）。"""
+    return with_group_settings(TriggerConfig.from_live(live), _group_policy_settings(event, bot))
+
+
 def _group_trigger_decision(event: GroupMessageEvent, bot: Bot, text: str) -> TriggerDecision:
     """群消息的完整判定。命中信号与被否决的原因都带回来，供后续记账与试听对照。"""
     return trigger_evaluate(
         _trigger_input(event, bot, text),
-        TriggerConfig.from_live(live),
+        _group_trigger_config(event, bot),
         state._adapter.trigger_cooldown,
+        presence=state._adapter.trigger_presence,
     )
+
+
+def _remember_accepted_trigger(event: Any, decision: TriggerDecision, stamp: float | None) -> None:
+    """显式信号那条 rule 接下的消息：触发来源和主动回复戳先存着，handler 接过去带进这一轮。
+
+    接手的结论不进判定缓存，rule 和 handler 之间又没有别的通道，只能按消息身份存一小会儿。
+    """
+    accepted = state._adapter.accepted_triggers
+    accepted[_event_identity(event)] = models.AcceptedTrigger(source=decision.source, proactive_stamp=stamp)
+    while len(accepted) > _TRIGGER_DECISION_CACHE_MAX:
+        accepted.popitem(last=False)
+
+
+def _take_accepted_trigger(event: Any) -> models.AcceptedTrigger:
+    """取走 rule 记下的那一份；取过就没了，同一条消息不会被用两次。没有记过的给空的。"""
+    return state._adapter.accepted_triggers.pop(_event_identity(event), None) or models.AcceptedTrigger()
+
+
+def _group_trigger_source(event: GroupMessageEvent, bot: Bot, text: str) -> str:
+    """没带判定结论进来的那几条路（连发续接、旧调用方）照判定规则补算触发来源。判定本身没有副作用。"""
+    return _group_trigger_decision(event, bot, text).source
+
+
+def _prefix_marks_trigger(event: GroupMessageEvent, bot: Bot, text: str) -> bool:
+    """句首的前缀此刻是不是触发标记：这个群开着前缀信号，原文又正以其中一个开头。"""
+    config = _group_trigger_config(event, bot)
+    return config.prefix and bool(matched_prefix(text, config.prefix_words))
+
+
+def _refund_proactive(group_id: Any, stamp: float | None) -> None:
+    """这一轮最后没交出去：撤销记下的那一笔主动回复。"""
+    if stamp is not None:
+        state._adapter.trigger_presence.refund_proactive(group_id, stamp)
+
+
+def _observe_group_decision(event: GroupMessageEvent, bot: Bot, text: str, decision: TriggerDecision) -> None:
+    """判过的群消息都过一遍：被直接叫到就让 bot 进场，不管这一轮最后回没回。"""
+    trigger_observe(_trigger_input(event, bot, text), decision, state._adapter.trigger_presence)
+
+
+def _accept_group_trigger(event: GroupMessageEvent, bot: Bot, text: str, decision: TriggerDecision) -> float | None:
+    """一条群消息确定要回：记冷却、作废在等的安静等待、记一次主动回复。返回那一笔的时间戳，没发出去时撤销用。"""
+    stamp = trigger_accept(
+        _trigger_input(event, bot, text), decision,
+        cooldown=state._adapter.trigger_cooldown, presence=state._adapter.trigger_presence,
+    )
+    state._adapter.quiet_waits.cancel(event.group_id)
+    return stamp
+
+
+async def _wait_until_quiet(event: GroupMessageEvent, bot: Bot) -> QuietWait | None:
+    """进这个群的安静等待。到点时这条还是最后一条才拿到这一轮，否则是 None。"""
+    config = _group_trigger_config(event, bot)
+    return await state._adapter.quiet_waits.join(
+        event.group_id, wait_sec=config.quiet_wait_sec, max_wait_sec=config.quiet_max_wait_sec,
+    )
+
+
+def _intent_situation(event: GroupMessageEvent, bot: Bot, *, source: str, merged: int) -> Dict[str, Any]:
+    """判断模型看到的此刻状态：在不在场、bot 多久没说话、这次合并了几条、最近主动插了几次话、怎么触发的。"""
+    config = _group_trigger_config(event, bot)
+    presence = state._adapter.trigger_presence
+    group_id = event.group_id
+    now = time.time()
+    since = presence.since_bot_spoke(group_id, now)
+    return {
+        "presence": PRESENCE_PRESENT if presence.is_present(group_id, now, config.presence_window_sec) else PRESENCE_ABSENT,
+        "since_bot_spoke_sec": None if since is None else round(since, 1),
+        "merged_messages": max(1, int(merged)),
+        "proactive_recent": presence.proactive_count(group_id, now, config.proactive_window_sec),
+        "proactive_window_sec": config.proactive_window_sec,
+        "proactive_limit": config.proactive_max_replies,
+        "trigger_source": source or SIGNAL_LLM_INTENT,
+    }
 
 
 def _group_trigger_decision_once(event: GroupMessageEvent, bot: Bot, text: str) -> TriggerDecision:
@@ -312,17 +409,31 @@ def _group_should_trigger(event: GroupMessageEvent, bot: Bot, text: str) -> bool
     return _group_trigger_decision(event, bot, text).triggered
 
 
-async def _judge_llm_intent(bot: Bot, event: GroupMessageEvent, text: str) -> IntentVerdict:
+# 安静等待合并的条数再多，带给判断模型的群聊也就这么多行。
+_INTENT_CONTEXT_MAX = 100
+
+
+async def _judge_llm_intent(
+    bot: Bot,
+    event: GroupMessageEvent,
+    text: str,
+    *,
+    source: str = "",
+    merged: int = 1,
+    exclude_seq: int = 0,
+) -> IntentVerdict:
     """问 supervisor：这条群消息是不是在跟 bot 说话。
 
     送过去的全是匿名化之后的文本 —— 群号和 QQ 号本来就不该进模型上下文，判定这条
-    新链路没有理由成为例外。
+    新链路没有理由成为例外。安静等待到点时这条已经记进群历史，exclude_seq 把它从上下文里
+    摘掉，合并进来的那几条照样都带上。
     """
     if state._adapter.client is None:
         return IntentVerdict(error="client not ready")
     group_id = int(event.group_id)
-    limit = int(live.llm_intent_context_messages)
-    context_lines = [entry.text for entry in list(state._adapter.group_history[group_id])[-limit:]] if limit > 0 else []
+    limit = min(_INTENT_CONTEXT_MAX, int(live.llm_intent_context_messages) + max(0, int(merged) - 1))
+    lines = [entry for entry in list(state._adapter.group_history[group_id]) if not exclude_seq or entry.seq != exclude_seq]
+    context_lines = [entry.text for entry in lines[-limit:]] if limit > 0 else []
     metadata = state._adapter.features.coordinator.metadata(state._adapter.features.actor(bot, event)) if state._adapter.features.available else {}
     if metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled"):
         reactions = output_guide._reaction_section(CHANNEL_GROUP)
@@ -339,6 +450,7 @@ async def _judge_llm_intent(bot: Bot, event: GroupMessageEvent, text: str) -> In
         node_id=live.llm_intent_node_id,
         timeout_sec=float(live.llm_intent_timeout_sec),
         max_inflight=int(live.llm_intent_max_inflight),
+        situation=_intent_situation(event, bot, source=source, merged=merged),
     )
 
 
@@ -465,6 +577,14 @@ async def _auto_like_user(bot: Bot, user_id: int) -> None:
 
 
 _REPLY_REQUEST = "请根据以上上下文，执行当前用户的指令并给出回复。"
+# 主动插话的尾句。只说「没人叫你」，字数和交付方式由 engine 在同一条消息末尾补上，这里再写会和它打架。
+_INTERJECT_REQUEST = "没人叫你，这是你在群里看到的一句。想搭话就自然接一句短的。"
+
+
+def _as_direct_request(text: str) -> str:
+    """排队时插话那件并进了正式请求：最后那句换回执行指令。"""
+    head, found, tail = text.rpartition(_INTERJECT_REQUEST)
+    return f"{head}{_REPLY_REQUEST}{tail}" if found else text
 
 
 def _quote_block(reply_context: str) -> List[str]:
@@ -484,11 +604,13 @@ async def _build_inbound_text(
     attachments: List[Dict[str, Any]],
     *,
     exclude_seq: int = 0,
+    ambient: bool = False,
 ) -> models.InboundText:
     """组装提交给 tangqiu_main 的群聊 inbound 文本，并匿名化 QQ 群号/用户号。
 
     covered_seq 是本次带出的最大历史序号，提交成功后据此推进水位。exclude_seq 是
-    当前这条触发消息的序号，它由【当前用户指令】带出，不再进历史块。
+    当前这条触发消息的序号，它由【当前用户指令】带出，不再进历史块。ambient 是没人叫 bot、
+    由它自己决定要不要插话的那种，尾句换成插话版。
     """
     group_id = int(event.group_id)
     pending = state._adapter.group_history.pending(group_id)
@@ -529,7 +651,7 @@ async def _build_inbound_text(
         "【当前用户指令】",
         instruction,
         "",
-        _REPLY_REQUEST,
+        _INTERJECT_REQUEST if ambient else _REPLY_REQUEST,
     ])
     return models.InboundText("\n".join(parts), _merge_text(quote, instruction), covered_seq)
 

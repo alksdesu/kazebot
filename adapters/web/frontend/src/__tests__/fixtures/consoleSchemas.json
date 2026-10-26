@@ -134,6 +134,72 @@
           },
           {
             "kind": "block",
+            "title": "在场与插话",
+            "hint": "只对开了「让模型判断」或社区回复策略的群起作用",
+            "children": [
+              {
+                "kind": "grid",
+                "children": [
+                  {
+                    "kind": "field",
+                    "key": "presence_enabled",
+                    "children": [
+                      {
+                        "kind": "field",
+                        "key": "presence_window_sec"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "absent_judge_probability"
+                      },
+                      {
+                        "kind": "desc",
+                        "text": "被直接叫到或 bot 刚在群里说过话算进场。离场时随机插话也并进这道概率门，掷中了同样先问模型。"
+                      }
+                    ]
+                  },
+                  {
+                    "kind": "fixed",
+                    "label": "安静等待",
+                    "children": [
+                      {
+                        "kind": "desc",
+                        "text": "在场时不逐条判断：每来一条重新计时，安静下来或等满上限，才把最后一条交给模型。"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "quiet_wait_sec"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "quiet_max_wait_sec"
+                      }
+                    ]
+                  },
+                  {
+                    "kind": "fixed",
+                    "label": "主动回复密度",
+                    "children": [
+                      {
+                        "kind": "desc",
+                        "text": "没人叫 bot 时最多回几次，被叫到不受限。开了在场的群用这一项，不再用社区的每分钟回应上限。"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "proactive_max_replies"
+                      },
+                      {
+                        "kind": "field",
+                        "key": "proactive_window_sec"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "kind": "block",
             "title": "冷却",
             "hint": "命中之后仍可能不说话",
             "children": [
@@ -218,6 +284,7 @@
         "note": "回复时引不引用原消息，以及群历史里每条留多长。",
         "paths": [
           "output.reply_to_trigger",
+          "output.reply_to_trigger_sources",
           "output.history_text_limit"
         ],
         "nodes": [
@@ -231,7 +298,17 @@
                 "children": [
                   {
                     "kind": "field",
-                    "key": "reply_to_trigger"
+                    "key": "reply_to_trigger",
+                    "children": [
+                      {
+                        "kind": "field",
+                        "key": "reply_to_trigger_sources"
+                      },
+                      {
+                        "kind": "desc",
+                        "text": "只有这些来源触发的回复才引用并 @ 对方。默认是被 @、被回复、带前缀、点名；主动插话不引用。"
+                      }
+                    ]
                   },
                   {
                     "kind": "fixed",
@@ -789,6 +866,85 @@
         ],
         "default": 8.0
       },
+      "presence_enabled": {
+        "kind": "bool",
+        "label": "在场 / 离场",
+        "desc": "被叫到或刚说过话就算在场。在场时等群里安静下来只判最后一条；离场时先过概率门，掷中了才问模型。",
+        "path": "trigger.presence.enabled",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": false
+      },
+      "presence_window_sec": {
+        "kind": "number",
+        "label": "在场持续",
+        "unit": "秒",
+        "step": 10,
+        "path": "trigger.presence.window_sec",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 90.0
+      },
+      "absent_judge_probability": {
+        "kind": "percent",
+        "label": "离场时去问模型",
+        "path": "trigger.presence.absent_judge_probability",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 0.1
+      },
+      "quiet_wait_sec": {
+        "kind": "number",
+        "label": "安静多久算停",
+        "unit": "秒",
+        "step": 0.5,
+        "path": "trigger.quiet.wait_sec",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 4.0
+      },
+      "quiet_max_wait_sec": {
+        "kind": "number",
+        "label": "最长等",
+        "unit": "秒",
+        "path": "trigger.quiet.max_wait_sec",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 20.0
+      },
+      "proactive_max_replies": {
+        "kind": "number",
+        "label": "主动回复最多",
+        "unit": "次",
+        "path": "trigger.proactive.max_replies",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 3
+      },
+      "proactive_window_sec": {
+        "kind": "number",
+        "label": "统计时长",
+        "unit": "秒",
+        "step": 30,
+        "path": "trigger.proactive.window_sec",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": 300.0
+      },
       "cooldown_group_sec": {
         "kind": "number",
         "label": "每群",
@@ -854,6 +1010,18 @@
           "platform"
         ],
         "default": true
+      },
+      "reply_to_trigger_sources": {
+        "kind": "words",
+        "label": "这些来源才引用",
+        "empty": "一个来源都没有，群里触发的回复都不引用",
+        "placeholder": "输入来源名，回车添加",
+        "path": "output.reply_to_trigger_sources",
+        "layers": [
+          "global",
+          "platform"
+        ],
+        "default": "at,reply,prefix,name"
       },
       "history_text_limit": {
         "kind": "number",
@@ -1421,6 +1589,72 @@
             },
             {
               "kind": "block",
+              "title": "在场与插话",
+              "hint": "只对开了「让模型判断」或社区回复策略的群起作用",
+              "children": [
+                {
+                  "kind": "grid",
+                  "children": [
+                    {
+                      "kind": "field",
+                      "key": "presence_enabled",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "presence_window_sec"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "absent_judge_probability"
+                        },
+                        {
+                          "kind": "desc",
+                          "text": "被直接叫到或 bot 刚在群里说过话算进场。离场时随机插话也并进这道概率门，掷中了同样先问模型。"
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "fixed",
+                      "label": "安静等待",
+                      "children": [
+                        {
+                          "kind": "desc",
+                          "text": "在场时不逐条判断：每来一条重新计时，安静下来或等满上限，才把最后一条交给模型。"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "quiet_wait_sec"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "quiet_max_wait_sec"
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "fixed",
+                      "label": "主动回复密度",
+                      "children": [
+                        {
+                          "kind": "desc",
+                          "text": "没人叫 bot 时最多回几次，被叫到不受限。开了在场的群用这一项，不再用社区的每分钟回应上限。"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "proactive_max_replies"
+                        },
+                        {
+                          "kind": "field",
+                          "key": "proactive_window_sec"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "kind": "block",
               "title": "冷却",
               "hint": "命中之后仍可能不说话",
               "children": [
@@ -1677,7 +1911,17 @@
                   "children": [
                     {
                       "kind": "field",
-                      "key": "reply_to_trigger"
+                      "key": "reply_to_trigger",
+                      "children": [
+                        {
+                          "kind": "field",
+                          "key": "reply_to_trigger_sources"
+                        },
+                        {
+                          "kind": "desc",
+                          "text": "只有这些来源触发的回复才引用并 @ 对方。默认是被 @、被回复、带前缀、点名；主动插话不引用。"
+                        }
+                      ]
                     },
                     {
                       "kind": "field",
@@ -2331,6 +2575,85 @@
           ],
           "default": 8.0
         },
+        "presence_enabled": {
+          "kind": "bool",
+          "label": "在场 / 离场",
+          "desc": "被叫到或刚说过话就算在场。在场时等群里安静下来只判最后一条；离场时先过概率门，掷中了才问模型。",
+          "path": "trigger.presence.enabled",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": false
+        },
+        "presence_window_sec": {
+          "kind": "number",
+          "label": "在场持续",
+          "unit": "秒",
+          "step": 10,
+          "path": "trigger.presence.window_sec",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 90.0
+        },
+        "absent_judge_probability": {
+          "kind": "percent",
+          "label": "离场时去问模型",
+          "path": "trigger.presence.absent_judge_probability",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 0.1
+        },
+        "quiet_wait_sec": {
+          "kind": "number",
+          "label": "安静多久算停",
+          "unit": "秒",
+          "step": 0.5,
+          "path": "trigger.quiet.wait_sec",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 4.0
+        },
+        "quiet_max_wait_sec": {
+          "kind": "number",
+          "label": "最长等",
+          "unit": "秒",
+          "path": "trigger.quiet.max_wait_sec",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 20.0
+        },
+        "proactive_max_replies": {
+          "kind": "number",
+          "label": "主动回复最多",
+          "unit": "次",
+          "path": "trigger.proactive.max_replies",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 3
+        },
+        "proactive_window_sec": {
+          "kind": "number",
+          "label": "统计时长",
+          "unit": "秒",
+          "step": 30,
+          "path": "trigger.proactive.window_sec",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": 300.0
+        },
         "cooldown_group_sec": {
           "kind": "number",
           "label": "每群",
@@ -2572,6 +2895,18 @@
             "platform"
           ],
           "default": true
+        },
+        "reply_to_trigger_sources": {
+          "kind": "words",
+          "label": "这些来源才引用",
+          "empty": "一个来源都没有，群里触发的回复都不引用",
+          "placeholder": "输入来源名，回车添加",
+          "path": "output.reply_to_trigger_sources",
+          "layers": [
+            "global",
+            "platform"
+          ],
+          "default": "at,reply,prefix,name"
         },
         "strip_asterisk_styles": {
           "kind": "bool",

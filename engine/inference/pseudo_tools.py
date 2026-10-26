@@ -406,6 +406,38 @@ def _preempt_task_spec() -> dict:
     }
 
 
+STAY_SILENT_TOOL_NAME = "stay_silent"
+# 不发言结束的任务在结果里带这个标记：supervisor 照它把出站消息标成不发言，适配层见到就什么也不发。
+NO_REPLY_MARKER = "no_reply"
+
+
+def _stay_silent_spec() -> dict:
+    """伪工具：这一轮不发言。只注入给声明了 stay_silent: true 的节点，只在主动插话的任务里生效。"""
+    return {
+        "type": "function",
+        "function": {
+            "name": STAY_SILENT_TOOL_NAME,
+            "description": (
+                "这一轮不发言，直接结束，群里什么也不会收到。\n\n"
+                "只在没人叫你、是你自己看到群聊在想要不要插话的时候用：话题和你无关、插进去显得突兀、"
+                "刚说过话不想刷屏，就调用它。\n"
+                "有人 @ 你、回复你、点你的名或者用前缀叫你的时候不能用，调用会被拒绝，照常回答。\n"
+                "调用它就不要再调 finish；想说话就用 finish 正常回复。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "一句话说明为什么不接，只记进日志，不会发出去。",
+                    },
+                },
+                "required": [],
+            },
+        },
+    }
+
+
 def _update_todos_spec() -> dict:
     """伪工具：维护本任务的待办清单，只注入给声明了 todo: true 的节点。"""
     statuses = " / ".join(TODO_STATUSES)

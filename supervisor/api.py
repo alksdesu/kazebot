@@ -2047,6 +2047,7 @@ def create_app(
             context_lines=context_lines,
             bot_names=bot_names,
             speaker=str(body.get("speaker") or ""),
+            situation=body.get("situation"),
         )
         # 判定复用这个群的会话：conversation_key 和真实消息用的是同一个，所以第一条
         # 消息判 no 也只是提前建了个空会话，不会多出一条平行会话。

@@ -8,7 +8,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -142,17 +145,86 @@ def result_from_task(task: Any) -> IntentResult:
     return parse_intent_text(str(inner.get("text") or ""))
 
 
+# 状态里的触发来源 → 给模型看的说法。认不出的不渲染：不让调用方往判断模型的输入里塞任意文本。
+_SOURCE_PHRASES = MappingProxyType({
+    "at": "有人 @ 了 bot",
+    "reply": "有人回复了 bot 的消息",
+    "name": "有人点了 bot 的名字",
+    "prefix": "有人用触发前缀叫了 bot",
+    "keyword": "提到了 bot 关注的关键词",
+    "random": "随机抽中的一条",
+    "llm_intent": "没人直接叫 bot，是群里的普通发言",
+    "all": "全量回应模式，每条都会问",
+})
+
+
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _ago(seconds: float) -> str:
+    if seconds < 90:
+        return f"{int(seconds)} 秒前"
+    if seconds < 90 * 60:
+        return f"{int(seconds // 60)} 分钟前"
+    return f"{int(seconds // 3600)} 小时前"
+
+
+def _span(seconds: float) -> str:
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{int(seconds // 60)} 分钟"
+    return f"{seconds:g} 秒"
+
+
+def situation_lines(situation: Any) -> list[str]:
+    """【当前状态】那一节的各行。字段逐个核对类型，坏的跳过：状态只是提示，缺几行也照样能判。"""
+    if not isinstance(situation, Mapping):
+        return []
+    lines: list[str] = []
+    presence = situation.get("presence")
+    if presence == "present":
+        lines.append("bot 现在在场：刚被叫过或刚说过话，群里可能还在接着和它聊。")
+    elif presence == "absent":
+        lines.append("bot 现在离场：这一阵没人找它，它也没说话。")
+    since = _number(situation.get("since_bot_spoke_sec"))
+    if since is not None:
+        lines.append(f"bot 上次在这个群说话是 {_ago(since)}。")
+    elif "since_bot_spoke_sec" in situation and situation.get("since_bot_spoke_sec") is None:
+        lines.append("bot 最近没在这个群说过话。")
+    merged = _number(situation.get("merged_messages"))
+    if merged is not None and merged > 1:
+        lines.append(
+            f"这是等群里安静下来才判断的：这段时间有 {int(merged)} 条新消息，前面几条在群聊记录里，只判最后这一条。"
+        )
+    recent = _number(situation.get("proactive_recent"))
+    if recent is not None:
+        window = _number(situation.get("proactive_window_sec"))
+        limit = _number(situation.get("proactive_limit"))
+        span = f"最近 {_span(window)}里" if window else "最近"
+        cap = f"（上限 {int(limit)} 次）" if limit else ""
+        lines.append(f"{span} bot 主动插话 {int(recent)} 次{cap}。")
+    source = situation.get("trigger_source")
+    if isinstance(source, str) and source in _SOURCE_PHRASES:
+        lines.append(f"触发来源：{_SOURCE_PHRASES[source]}。")
+    return lines
+
+
 def build_instruction(
     *,
     text: str,
     context_lines: list[str],
     bot_names: list[str],
     speaker: str = "",
+    situation: Any = None,
 ) -> str:
     """组装判定用的 instruction。
 
     只放已匿名化的群历史行和昵称，不放群号和账号 —— 匿名化整套机制就是为了不让真实
-    号码进模型上下文，判定这条新链路没有理由成为例外。
+    号码进模型上下文，判定这条新链路没有理由成为例外。situation 是适配层报来的此刻状态，
+    只认几个已知字段，渲染成【当前状态】一节。
     """
     parts: list[str] = []
     names = [n for n in (str(x).strip() for x in bot_names) if n]
@@ -160,6 +232,9 @@ def build_instruction(
         parts.append(f"群里这个 bot 平时被叫作：{'、'.join(names)}")
     if context_lines:
         parts.append("【最近的群聊】\n" + "\n".join(str(line) for line in context_lines))
+    status = situation_lines(situation)
+    if status:
+        parts.append("【当前状态】\n" + "\n".join(f"- {line}" for line in status))
     speaker_label = str(speaker or "").strip()
     current = str(text or "").strip() or "（空消息）"
     parts.append(f"【待判定的这一条】\n{speaker_label + ': ' if speaker_label else ''}{current}")

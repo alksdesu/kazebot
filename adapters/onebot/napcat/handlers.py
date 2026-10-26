@@ -18,7 +18,7 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.rule import Rule
 from adapters._shared.approvals import DECISION_ALLOW, parse_reply_decision
 from adapters._shared.echo_policy import EchoEntry, detect_echo, is_echoable_text
-from adapters._shared.trigger_policy import TriggerConfig, resolve_llm_intent
+from adapters._shared.trigger_policy import BLOCKED_BY_DENSITY, EXPLICIT_SIGNALS, resolve_llm_intent
 from ..echo_rules import QQ_ECHO_RULES
 from ..live_config import live, refresh as refresh_live_config
 from clonoth_sdk import IntentVerdict
@@ -110,32 +110,51 @@ async def _record_non_trigger_message(bot: Bot, event: GroupMessageEvent) -> Non
     """
     message_text._remember_message_for_reply_context(event)
     if str(event.user_id) != str(getattr(bot, "self_id", "")):
-        expanded_text = await message_text._event_text_with_forward(bot, event)
-        # QQ 客户端经常把“问图文本 + 图片”拆成两条事件；第二条纯图片
-        # 通常不会 @bot，因此不会进入 agent matcher。这里在低优先级历史
-        # matcher 中把非触发附件也下载并写入近期缓存，让后续自然语言转发
-        # 和图片提问能选到对应内容。
-        real_conversation_key = f"qq_group:{int(event.group_id)}"
-        stable_conversation_key = routing._stable_conversation_key(real_conversation_key)
-        # 不回复的消息只扫顶层。下钻是为了让模型看见卡片里的图，而这条根本不会进模型；
-        # 真被人引用时 _build_reply_context 会再下钻一次，那时候才值得付这几次下载。
-        attachments, errors = await media._collect_qq_attachments(
-            bot, event, stable_conversation_key, expand_forward=False,
-        )
-        media._remember_recent_images(stable_conversation_key, event, attachments)
-        await state._adapter.features.register_attachments(bot, event, attachments)
-        facts = inbound._inbound_facts(bot, event, text=expanded_text or None, attachments=attachments)
-        emotes._collect_stickers(facts)
-        history._record_group_message(facts, attachment_errors=errors)
-        metadata = await state._adapter.features.prepare(bot, event)
-        if state._adapter.features.blocked(metadata) or metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled"):
-            return
-        await _maybe_echo_group_message(bot, event, expanded_text)
-        await emotes._maybe_join_sticker_combat(
-            bot, event,
-            has_image=any(item.get("type") == "image" for item in attachments),
-            text=expanded_text,
-        )
+        recorded = await _record_group_inbound(bot, event)
+        await _after_non_trigger_message(bot, event, recorded)
+
+
+async def _record_group_inbound(bot: Bot, event: GroupMessageEvent) -> models.RecordedInbound:
+    """把一条群消息连同附件写进群历史，带回它的序号和附件；回不回由调用方再定。"""
+    expanded_text = await message_text._event_text_with_forward(bot, event)
+    # QQ 客户端经常把“问图文本 + 图片”拆成两条事件；第二条纯图片
+    # 通常不会 @bot，因此不会进入 agent matcher。这里在低优先级历史
+    # matcher 中把非触发附件也下载并写入近期缓存，让后续自然语言转发
+    # 和图片提问能选到对应内容。
+    real_conversation_key = f"qq_group:{int(event.group_id)}"
+    stable_conversation_key = routing._stable_conversation_key(real_conversation_key)
+    # 不回复的消息只扫顶层。下钻是为了让模型看见卡片里的图，而这条根本不会进模型；
+    # 真被人引用时 _build_reply_context 会再下钻一次，那时候才值得付这几次下载。
+    attachments, errors = await media._collect_qq_attachments(
+        bot, event, stable_conversation_key, expand_forward=False,
+    )
+    media._remember_recent_images(stable_conversation_key, event, attachments)
+    await state._adapter.features.register_attachments(bot, event, attachments)
+    facts = inbound._inbound_facts(bot, event, text=expanded_text or None, attachments=attachments)
+    emotes._collect_stickers(facts)
+    seq = history._record_group_message(facts, attachment_errors=errors)
+    return models.RecordedInbound(seq=seq, text=expanded_text, attachments=list(attachments), errors=list(errors))
+
+
+async def _after_non_trigger_message(bot: Bot, event: GroupMessageEvent, recorded: models.RecordedInbound) -> None:
+    """一条记过的群消息最后没有回：轮到复读和表情包接龙。安静期间、回复策略开着时都不做。"""
+    metadata = await state._adapter.features.prepare(bot, event)
+    if state._adapter.features.blocked(metadata) or metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled"):
+        return
+    await _maybe_echo_group_message(bot, event, recorded.text)
+    await emotes._maybe_join_sticker_combat(
+        bot, event,
+        has_image=any(item.get("type") == "image" for item in recorded.attachments),
+        text=recorded.text,
+    )
+
+
+async def _settle_declined(bot: Bot, event: GroupMessageEvent, recorded: models.RecordedInbound | None) -> None:
+    """判成不接话的收尾：没记过的现在补记，安静等待时已经记过的只做记完之后那一步。"""
+    if recorded is None:
+        await _record_non_trigger_message(bot, event)
+    else:
+        await _after_non_trigger_message(bot, event, recorded)
 
 
 def _echo_key_for_message(message: Any, text: str) -> str:
@@ -283,9 +302,15 @@ _agent_matcher = on_message(rule=Rule(permissions._agent_group_rule), priority=1
 @_agent_matcher.handle()
 async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
     """把当前 QQ 群请求提交给 ClonothZX。"""
+    accepted = inbound._take_accepted_trigger(event)
     if not inbound._first_delivery(bot, event):
+        # 重复投递的那一遍在 rule 里也记了一笔主动回复，它不会有回复。
+        inbound._refund_proactive(event.group_id, accepted.proactive_stamp)
         return
-    await _process_group_message(bot, event, _agent_matcher)
+    await _process_group_message(
+        bot, event, _agent_matcher,
+        trigger_source=accepted.source, proactive_stamp=accepted.proactive_stamp,
+    )
 
 
 async def _finish_local_command(
@@ -296,14 +321,17 @@ async def _finish_local_command(
     user_text: str,
     attachments: List[Dict[str, Any]],
     reply: str,
+    already_recorded: bool = False,
 ) -> None:
     """回掉一条本地命令，并把命令行与回复一起写进群历史（末尾总会抛出 FinishedException）。
 
     本地命令不经 engine，也已经被 agent matcher block 掉了 priority=99 的历史 matcher：
     不在这里记，整段交互在群历史里就消失，后面的对话看不到「刚才有人改过模型」。
+    安静等待到点的那条已经记过，already_recorded 时只补 bot 的回复。
     """
     await _check_local_group_send(bot, event)
-    history._record_group_message(inbound._inbound_facts(bot, event, text=user_text or None, attachments=attachments))
+    if not already_recorded:
+        history._record_group_message(inbound._inbound_facts(bot, event, text=user_text or None, attachments=attachments))
     history._record_bot_reply(int(event.group_id), reply)
     await matcher.finish(reply)
 
@@ -325,17 +353,38 @@ def _coordinated_response_action(verdict: IntentVerdict, metadata: Dict[str, Any
     return action
 
 
-async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: Any) -> None:
+def _response_budget_allows(event: GroupMessageEvent, bot: Bot, metadata: Dict[str, Any], *, direct: bool) -> bool:
+    """社区回复策略的每分钟回应上限。开了在场的群由主动回复密度管着，两道限额不叠。"""
+    if inbound._group_trigger_config(event, bot).presence_active:
+        return True
+    return state._adapter.features.coordinator.allow_response(
+        metadata["actor"]["scope"], metadata["policy"]["settings"], direct=direct,
+    )
+
+
+async def _process_group_message(
+    bot: Bot,
+    event: GroupMessageEvent,
+    matcher: Any,
+    *,
+    trigger_source: str = "",
+    recorded: models.RecordedInbound | None = None,
+    proactive_stamp: float | None = None,
+) -> None:
     """一条已判定要回的群消息的完整处理。
 
     matcher 由调用方传进来：显式信号和意愿判断走两个不同优先级的 matcher，
     但从本地命令到 inbound 提交的整条链路必须是同一份，否则两条路会各自长歪。
+    trigger_source 是判定时认出的触发来源，引用、点赞、插话尾句都看它；recorded 是安静等待
+    时已经写进群历史的那份，直接用，不再重记、重下附件；proactive_stamp 是这一轮记下的主动回复，
+    最后没交出去时撤销。
     """
     state._adapter.last_bot = bot
     # on_bot_connect 已经认过一次，这里是兜底：漏认一次就是记忆分叉，代价不对等。
     routing._adopt_bot_scope(bot)
 
     if state._adapter.client is None or state._adapter.session_state is None:
+        inbound._refund_proactive(event.group_id, proactive_stamp)
         await _check_local_group_send(bot, event)
         await matcher.finish("Clonoth Agent 尚未初始化，请稍后重试。")
 
@@ -346,58 +395,77 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
     raw_user_text = (await message_text._event_text_with_forward(bot, event)).strip() or "你好"
     # 前缀判定必须在剥前缀之前做，否则 all 模式下所有人都会被当成主动找 bot。
     direct_interaction = inbound._is_direct_bot_interaction(event, bot, raw_user_text)
-    user_text = inbound._strip_trigger_prefix(raw_user_text)
+    source = trigger_source or inbound._group_trigger_source(event, bot, raw_user_text)
+    # 前缀信号关着时句首的「！」是语气，不剥；不只看 source：「@bot ！xx」报的是排在前面的 at，「！」照样是触发标记。
+    prefixed = inbound._prefix_marks_trigger(event, bot, raw_user_text)
+    user_text = inbound._strip_trigger_prefix(raw_user_text) if prefixed else raw_user_text
     metadata = await state._adapter.features.prepare(bot, event)
     if metadata and state._adapter.features.coordinator.can_continue(metadata["actor"], metadata.get("reply_ref", "")):
         pending = state._adapter.features.coordinator.bursts[metadata["actor"]["scope"]].item
         metadata["direct"] = metadata.get("direct", False) or pending.platform_updates.get("_response_purpose") == "direct"
+        if source not in EXPLICIT_SIGNALS:
+            source = pending.platform_updates.get("_trigger_source") or source
         await state._adapter.features.decision(bot, event, pending.platform_updates.get("_route_hints", {}).get("response_action", "task"), "同一用户正在补充当前请求")
+    direct = direct_interaction or source in EXPLICIT_SIGNALS or bool(metadata.get("direct"))
     if metadata.get("policy", {}).get("settings", {}).get("response_policy_enabled") and not metadata.get("classified") and not user_text.startswith(("/", "／")):
-        verdict = await inbound._judge_llm_intent(bot, event, user_text)
+        verdict = await inbound._judge_llm_intent(bot, event, user_text, source=source)
         action = _coordinated_response_action(verdict, metadata)
-        if action != "ignore" and not state._adapter.features.coordinator.allow_response(metadata["actor"]["scope"], metadata["policy"]["settings"], direct=metadata.get("direct", False)):
+        if action != "ignore" and not _response_budget_allows(event, bot, metadata, direct=metadata.get("direct", False)):
             action = "ignore"
         await state._adapter.features.decision(bot, event, action, verdict.reason)
         if action == "react" and getattr(verdict, "reaction_id", "") in common._REACT_MODEL_EMOJIS:
             if await outbound_attachments._set_message_react(bot, event, verdict.reaction_id, True):
-                history._record_group_message(inbound._inbound_facts(bot, event, text=user_text or None))
+                if recorded is None:
+                    history._record_group_message(inbound._inbound_facts(bot, event, text=user_text or None))
+                inbound._refund_proactive(group_id, proactive_stamp)
                 await matcher.finish()
             await state._adapter.features.decision(bot, event, "short_reply", "表态未送达，改为短答")
         if action == "ignore":
-            await _record_non_trigger_message(bot, event)
+            await _settle_declined(bot, event, recorded)
+            inbound._refund_proactive(group_id, proactive_stamp)
             await matcher.finish()
-    if not identity._anonymous_identity(event):
+    # 没人叫 bot 的插话不点赞：对方根本没在找它。
+    if direct and not identity._anonymous_identity(event):
         asyncio.create_task(inbound._auto_like_user(bot, int(event.user_id)))
 
-    attachments, attachment_errors = await media._collect_qq_attachments(bot, event, stable_conversation_key)
-    media._remember_recent_images(stable_conversation_key, event, attachments)
-    await state._adapter.features.register_attachments(bot, event, attachments)
+    if recorded is None:
+        attachments, attachment_errors = await media._collect_qq_attachments(bot, event, stable_conversation_key)
+        media._remember_recent_images(stable_conversation_key, event, attachments)
+        await state._adapter.features.register_attachments(bot, event, attachments)
+    else:
+        # 记历史时已经收过一遍：再收一遍，群文件会被去重吞掉，图片会重下一份。
+        attachments, attachment_errors = list(recorded.attachments), list(recorded.errors)
+
+    async def finish_local(reply: str) -> None:
+        await _finish_local_command(
+            matcher, bot, event, user_text=user_text, attachments=attachments, reply=reply,
+            already_recorded=recorded is not None,
+        )
+
     help_reply = await commands._maybe_handle_help_command(event=event, user_text=user_text)
     if help_reply is not None:
-        await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=help_reply)
+        await finish_local(help_reply)
     private_only_reply = await commands._maybe_handle_private_only_in_group(event=event, user_text=user_text)
     if private_only_reply is not None:
-        await _finish_local_command(
-            matcher, bot, event, user_text=user_text, attachments=attachments, reply=private_only_reply,
-        )
+        await finish_local(private_only_reply)
     clear_mem_reply = await commands._maybe_handle_clear_group_memory_command(
         bot=bot,
         event=event,
         user_text=user_text,
     )
     if clear_mem_reply is not None:
-        await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=clear_mem_reply)
+        await finish_local(clear_mem_reply)
     dream_reply = await commands._maybe_handle_dream_command(
         event=event, user_text=user_text, conversation_key=stable_conversation_key,
     )
     if dream_reply is not None:
-        await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=dream_reply)
+        await finish_local(dream_reply)
     model_reply = await commands._maybe_handle_model_command(event=event, user_text=user_text)
     if model_reply is not None:
-        await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=model_reply)
+        await finish_local(model_reply)
     drawtools_reply = await commands._maybe_handle_drawtools_command(event=event, user_text=user_text)
     if drawtools_reply is not None:
-        await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=drawtools_reply)
+        await finish_local(drawtools_reply)
     custom_face_reply = await commands._maybe_handle_custom_face_command(
         bot=bot,
         event=event,
@@ -406,10 +474,10 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
         current_attachments=attachments,
     )
     if custom_face_reply is not None:
-        await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=custom_face_reply)
+        await finish_local(custom_face_reply)
     sticker_reply = await commands._maybe_handle_sticker_command(event=event, user_text=user_text)
     if sticker_reply is not None:
-        await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=sticker_reply)
+        await finish_local(sticker_reply)
     proactive_reply = await proactive._maybe_handle_proactive_command(
         bot=bot,
         event=event,
@@ -418,13 +486,14 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
         current_attachments=attachments,
     )
     if proactive_reply is not None:
-        await _finish_local_command(matcher, bot, event, user_text=user_text, attachments=attachments, reply=proactive_reply)
-    draw_direct_prompt = inbound._parse_direct_draw_command(user_text)
+        await finish_local(proactive_reply)
+    # /生图 只认直接找 bot 的：插话接住的那句不是在叫 bot 画图，不该绕过入口节点直接开画。
+    draw_direct_prompt = inbound._parse_direct_draw_command(user_text) if direct else None
     if draw_direct_prompt is None:
         # /生图 不吃历史图：混进来的图会把这一轮拽到视觉节点。
         await media._merge_recent_attachments_after_text(event=event, conversation_key=stable_conversation_key, user_text=user_text, attachments=attachments)
     facts = inbound._inbound_facts(bot, event, text=user_text or None, attachments=attachments)
-    current_seq = history._record_group_message(facts)
+    current_seq = recorded.seq if recorded is not None else history._record_group_message(facts)
     entry_node_id = common.DRAW_NODE_ID if draw_direct_prompt is not None else ""
     if draw_direct_prompt is not None:
         if attachments:
@@ -435,7 +504,7 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
         built = await inbound._build_draw_direct_inbound_text(event, draw_direct_prompt, False)
     else:
         built = (await inbound._build_inbound_text(
-            event, bot, user_text, stable_conversation_key, attachments, exclude_seq=current_seq,
+            event, bot, user_text, stable_conversation_key, attachments, exclude_seq=current_seq, ambient=not direct,
         )).map(lambda text: inbound._apply_attachment_hints(text, user_text, attachments, attachment_errors))
 
     # 不登记触发者的 QQ 号：会话目标会落盘、会被后来的人复用，发起人身份只能来自任务本身。
@@ -446,7 +515,11 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
         "group_id": group_id,
         "conversation_key": stable_conversation_key,
         "_source_attachments": [dict(att) for att in attachments if isinstance(att, dict)],
+        "_trigger_source": source,
+        "_response_purpose": "direct" if direct else "ambient",
     }
+    if proactive_stamp is not None:
+        platform_updates["_proactive_stamp"] = proactive_stamp
     ok = False
     try:
         ok = await queueing._enqueue_or_submit_inbound(models.QueuedInbound(
@@ -469,10 +542,18 @@ async def _process_group_message(bot: Bot, event: GroupMessageEvent, matcher: An
         ))
     except Exception as exc:
         common.logger.exception("submit inbound failed")
+        inbound._refund_proactive(group_id, proactive_stamp)
+        if not direct:
+            # 没人叫 bot 的插话交不出去就算了，不该冒出一句没人问过的报错。
+            await matcher.finish()
         await _check_local_group_send(bot, event)
         await matcher.finish(f"无法连接到 Clonoth Agent：{exc}")
 
     if not ok:
+        inbound._refund_proactive(group_id, proactive_stamp)
+        if not direct:
+            common.logger.warning("ambient interjection not accepted for group %s", group_id)
+            await matcher.finish()
         await _check_local_group_send(bot, event)
         await matcher.finish("Clonoth Agent 未接受本次请求。")
     await matcher.finish()
@@ -485,45 +566,66 @@ _intent_matcher = on_message(rule=Rule(permissions._intent_group_rule), priority
 
 @_intent_matcher.handle()
 async def _handle_intent(bot: Bot, event: GroupMessageEvent) -> None:
-    """问一次模型再决定这条群消息要不要接。"""
+    """问一次模型再决定这条群消息要不要接。在场时先等群里安静下来，到点只拿最后一条去问。"""
     if not inbound._first_delivery(bot, event):
         return
     text = await permissions._group_trigger_text(bot, event)
-    verdict = await inbound._judge_llm_intent(bot, event, text)
+    judged = inbound._group_trigger_decision_once(event, bot, text)
+    recorded: models.RecordedInbound | None = None
+    merged = 1
+    if judged.awaits_quiet() and str(event.user_id) != str(getattr(bot, "self_id", "")):
+        # 等待期间这条照常进群历史，到点被拿去判时不再重记。被后来的盖过就当不接话收尾。
+        message_text._remember_message_for_reply_context(event)
+        recorded = await _record_group_inbound(bot, event)
+        wait = await inbound._wait_until_quiet(event, bot)
+        if wait is None:
+            await _after_non_trigger_message(bot, event, recorded)
+            return
+        merged = wait.count
+    verdict = await inbound._judge_llm_intent(
+        bot, event, text, source=judged.source, merged=merged,
+        exclude_seq=recorded.seq if recorded is not None else 0,
+    )
+    inp = inbound._trigger_input(event, bot, text)
+    decision = resolve_llm_intent(
+        inp, inbound._group_trigger_config(event, bot), state._adapter.trigger_cooldown,
+        presence=state._adapter.trigger_presence, agreed=verdict.agreed, reason=verdict.reason,
+    )
     metadata = await state._adapter.features.prepare(bot, event)
     settings = metadata.get("policy", {}).get("settings", {})
     if settings.get("response_policy_enabled"):
         action = _coordinated_response_action(verdict, metadata)
-        if action != "ignore" and not state._adapter.features.coordinator.allow_response(metadata["actor"]["scope"], settings, direct=metadata.get("direct", False)):
+        # 表态不算开口说话，主动回复满了也照样能贴。
+        if action not in ("ignore", "react") and decision.blocked_by == BLOCKED_BY_DENSITY:
+            action = "ignore"
+        if action != "ignore" and not _response_budget_allows(event, bot, metadata, direct=metadata.get("direct", False)):
             action = "ignore"
         await state._adapter.features.decision(bot, event, action, verdict.reason)
         if action == "react":
             if await outbound_attachments._set_message_react(bot, event, verdict.reaction_id, True):
-                await _record_non_trigger_message(bot, event)
+                await _settle_declined(bot, event, recorded)
                 return
             await state._adapter.features.decision(bot, event, "short_reply", "表态未送达，改为短答")
         if action == "ignore":
-            await _record_non_trigger_message(bot, event)
+            await _settle_declined(bot, event, recorded)
             return
-    inp = inbound._trigger_input(event, bot, text)
-    decision = resolve_llm_intent(
-        inp, TriggerConfig.from_live(live), state._adapter.trigger_cooldown,
-        agreed=verdict.agreed, reason=verdict.reason,
-    )
     if not decision.triggered:
         common.logger.debug(
             "QQ intent declined group=%s decided=%s error=%s blocked_by=%s reason=%s",
             getattr(event, "group_id", None), verdict.decided, verdict.error,
             decision.blocked_by, decision.reason,
         )
-        await _record_non_trigger_message(bot, event)
+        await _settle_declined(bot, event, recorded)
         return
-    state._adapter.trigger_cooldown.record(inp)
+    stamp = inbound._accept_group_trigger(event, bot, text, decision)
     common.logger.info(
-        "QQ intent accepted group=%s reason=%s",
-        getattr(event, "group_id", None), decision.reason,
+        "QQ intent accepted group=%s merged=%s reason=%s",
+        getattr(event, "group_id", None), merged, decision.reason,
     )
-    await _process_group_message(bot, event, _intent_matcher)
+    await _process_group_message(
+        bot, event, _intent_matcher,
+        trigger_source=decision.source, recorded=recorded, proactive_stamp=stamp,
+    )
 
 
 # 私聊入口 matcher。私聊不需要 @Bot，直接阻断后续 matcher，避免重复响应。

@@ -74,6 +74,9 @@ def _purge_conversation_side_state(conversation_key: str, target: Dict[str, Any]
         state._adapter.group_content_records.pop(int(group_id), None)
         # 清了会话还让它继续静默没有道理：运营者刚说「重新开始」，下一句就该有人应。
         state._adapter.trigger_cooldown.forget_group(group_id)
+        # 在场也一起清：重置之后从离场开始，在等的那一轮按被盖过处理。
+        state._adapter.quiet_waits.cancel(group_id)
+        state._adapter.trigger_presence.forget_group(group_id)
     _remove_conversation_attachment_dir(conversation_key)
 
 
@@ -181,10 +184,16 @@ def _record_group_message(facts: InboundFacts, *, attachment_errors: List[str] |
     return 0
 
 
+def _note_bot_spoke(group_id: Any) -> None:
+    """bot 在这个群发出了消息：算一次进场，判断模型也要知道它上次说话是多久前。"""
+    state._adapter.trigger_presence.bot_spoke(group_id, time.time())
+
+
 def _record_bot_reply(group_id: int, text: str) -> None:
-    """把 Bot 最终回复写回群历史，保持后续对话连续性。"""
+    """把 Bot 最终回复写回群历史，保持后续对话连续性；顺带记一次 bot 发言，在场从这一刻算起。"""
     if not text:
         return
+    _note_bot_spoke(group_id)
     text = strip_output_markers(
         text,
         strip_asterisk_styles=live.strip_asterisk_styles,

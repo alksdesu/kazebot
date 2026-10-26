@@ -69,6 +69,8 @@ tool_access:
     - sci_calc
 skills:
   mode: none
+# 常驻「不发言」工具 stay_silent：没人叫 bot 的主动插话可以选择不接，有人直接找它时调用会被拒。
+stay_silent: true
 prompt: |
   {{include:_persona.md}}
   {{include:_shared.md}}

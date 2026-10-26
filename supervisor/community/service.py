@@ -22,13 +22,19 @@ LEGACY_POLICY_DEFAULTS = {
     "merge_max_wait_sec": 4.0,
     "reply_budget_per_minute": 6,
 }
+# 按群的主动插话覆盖。None = 跟随平台配置（trigger.presence.*），所以出厂值只能是 None，迁移旧库也不冻结。
+INTERJECT_POLICY_DEFAULTS = {
+    "interject_presence": None,
+    "interject_absent_probability": None,
+}
 POLICY_DEFAULTS = {
     **LEGACY_POLICY_DEFAULTS,
     "merge_window_sec": 8.0,
     "merge_max_wait_sec": 10.0,
+    **INTERJECT_POLICY_DEFAULTS,
 }
 POLICY_FIELDS = tuple(POLICY_DEFAULTS)
-DEFAULT_SETTINGS = {**LEGACY_POLICY_DEFAULTS, "welcome_enabled": False}
+DEFAULT_SETTINGS = {**LEGACY_POLICY_DEFAULTS, **INTERJECT_POLICY_DEFAULTS, "welcome_enabled": False}
 _SCOPED_TABLES: tuple[tuple[str, tuple[str, ...] | None], ...] = (
     ("groups", ()),
     ("activities", None),
@@ -213,7 +219,10 @@ class CommunityService:
         return settings
 
     @classmethod
-    def _parse_values(cls, values: dict, *, policy_only: bool = True, legacy: bool = False) -> dict:
+    def _parse_values(
+        cls, values: dict, *, policy_only: bool = True, legacy: bool = False, drop_unset: bool = False,
+    ) -> dict:
+        """校验设置值。插话覆盖项写 None 就是不覆盖：drop_unset 时直接略过，否则报错，要恢复跟随用 reset_fields。"""
         if not isinstance(values, dict):
             raise ValueError("设置值必须是对象")
         parsed = {}
@@ -223,7 +232,13 @@ class CommunityService:
                 continue
             if key not in allowed:
                 raise ValueError(f"未知对话设置：{key}")
-            if isinstance(DEFAULT_SETTINGS[key], bool):
+            if key in INTERJECT_POLICY_DEFAULTS:
+                if value is None:
+                    if drop_unset or legacy:
+                        continue
+                    raise ValueError(f"{key} 不能设为空；要恢复跟随平台配置，请把它放进 reset_fields")
+                parsed[key] = cls._interject_value(key, value, legacy=legacy)
+            elif isinstance(DEFAULT_SETTINGS[key], bool):
                 if type(value) is not bool:
                     raise ValueError(f"{key} 必须是开关")
                 parsed[key] = value
@@ -241,6 +256,21 @@ class CommunityService:
                     raise ValueError("合并等待时间应为 0～10 秒的有限数值")
                 parsed[key] = float(value)
         return parsed
+
+    @staticmethod
+    def _interject_value(key: str, value: Any, *, legacy: bool = False) -> bool | float:
+        if key == "interject_presence":
+            if type(value) is not bool:
+                raise ValueError("interject_presence 必须是开关")
+            return value
+        if legacy and isinstance(value, str):
+            try:
+                value = float(value)
+            except ValueError as error:
+                raise ValueError("离场时去问模型的概率应为 0～1 的有限数值") from error
+        if type(value) not in {int, float} or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError("离场时去问模型的概率应为 0～1 的有限数值")
+        return float(value)
 
     @staticmethod
     def _validate_pair(settings: dict) -> None:
@@ -268,7 +298,7 @@ class CommunityService:
     @classmethod
     def _defaults_in(cls, db) -> dict:
         row = db.execute("SELECT settings,revision FROM conversation_defaults WHERE id=1").fetchone()
-        values = cls._parse_values(cls._stored_settings(row["settings"]))
+        values = cls._parse_values(cls._stored_settings(row["settings"]), drop_unset=True)
         settings = {**POLICY_DEFAULTS, **values}
         cls._validate_pair(settings)
         return {"settings": settings, "values": values, "revision": row["revision"]}
@@ -276,7 +306,7 @@ class CommunityService:
     @classmethod
     def _migrate_defaults(cls, db) -> None:
         row = db.execute("SELECT settings,revision FROM conversation_defaults WHERE id=1").fetchone()
-        values = cls._parse_values(cls._stored_settings(row["settings"])) if row else {}
+        values = cls._parse_values(cls._stored_settings(row["settings"]), drop_unset=True) if row else {}
         settings = {**LEGACY_POLICY_DEFAULTS, **values}
         cls._validate_pair(settings)
         if row is None:
@@ -292,7 +322,7 @@ class CommunityService:
     @classmethod
     def _local_settings(cls, row) -> dict:
         settings = cls._stored_settings(row["settings"]) if row else {}
-        return cls._parse_values(settings, policy_only=False)
+        return cls._parse_values(settings, policy_only=False, drop_unset=True)
 
     def _state_in(self, db, scope: str) -> dict[str, Any]:
         defaults = self._defaults_for_scope(db, scope)
@@ -335,7 +365,9 @@ class CommunityService:
             if not self._inherits_defaults(row["scope"]):
                 continue
             settings = self._stored_settings(row["settings"])
-            if set(settings) & set(POLICY_FIELDS):
+            # 插话覆盖存成 null 等于没写，和 _local_settings 的读法一致，不算这个会话有覆盖。
+            written = {key for key, value in settings.items() if value is not None or key not in INTERJECT_POLICY_DEFAULTS}
+            if written & set(POLICY_FIELDS):
                 scopes.append(row["scope"])
         return scopes
 

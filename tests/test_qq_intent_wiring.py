@@ -24,6 +24,7 @@ if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
 from _onebot_harness import load_runtime, set_live_config, patch_imported, adapter_source  # noqa: E402
+from adapters._shared.trigger_policy import TriggerConfig  # noqa: E402
 
 
 class _Sender:
@@ -158,7 +159,7 @@ class TestAfterTheModelAnswers:
         async def _judge(*_args: Any, **_kwargs: Any):
             return verdict
 
-        async def _process(bot, evt, matcher):
+        async def _process(bot, evt, matcher, **kwargs):
             seen["processed"].append(evt)
 
         async def _record(bot, evt):
@@ -210,7 +211,7 @@ class TestAfterTheModelAnswers:
         decision = runtime.inbound._group_trigger_decision(event, _bot(), "再来一句")
         assert runtime.state._adapter.trigger_cooldown.remaining(
             runtime.inbound._trigger_input(event, _bot(), "再来一句"),
-            runtime.permissions.TriggerConfig.from_live(runtime.state.live),
+            TriggerConfig.from_live(runtime.state.live),
         )[0] > 0
         assert decision.signal  # 判定链路仍然可用，只是被冷却挡住
 
@@ -223,7 +224,7 @@ class TestAfterTheModelAnswers:
         event = _Event(runtime, "再来一句")
         assert runtime.state._adapter.trigger_cooldown.remaining(
             runtime.inbound._trigger_input(event, _bot(), "再来一句"),
-            runtime.permissions.TriggerConfig.from_live(runtime.state.live),
+            TriggerConfig.from_live(runtime.state.live),
         )[0] == 0
 
 

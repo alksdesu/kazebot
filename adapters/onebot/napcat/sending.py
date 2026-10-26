@@ -597,6 +597,18 @@ async def _send_planned_sticker_message(
     )
 
 
+def _quotes_trigger(target: Dict[str, Any]) -> bool:
+    """第一条回复要不要引用触发消息并 @ 对方。
+
+    只有 output.reply_to_trigger_sources 里那几种来源触发的才引用：主动插话也引用并 @ 的话，像是在点名回人家。
+    目标里没记来源的是旧路径（主动推送、重启前的触发），照旧只看总开关。
+    """
+    if not live.reply_to_trigger or not target.get("reply_message_id"):
+        return False
+    source = str(target.get("_trigger_source") or "")
+    return not source or source in live.reply_to_trigger_sources
+
+
 async def _send_split_parts(
     bot: Bot,
     target: Dict[str, Any],
@@ -617,7 +629,7 @@ async def _send_split_parts(
                 strip_underscore_styles=live.strip_underscore_styles,
                 lookup=outbound.emoji_lookup(live.sticker_lookup_order),
             )
-            if segments and live.reply_to_trigger and not sent_any and target.get("reply_message_id"):
+            if segments and not sent_any and _quotes_trigger(target):
                 prefix = [{"type": "reply", "message_id": target["reply_message_id"]}]
                 if target.get("reply_sender_id"):
                     prefix.extend([

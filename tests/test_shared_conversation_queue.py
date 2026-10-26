@@ -98,6 +98,78 @@ class TestPut:
         assert seen == ["a1", "a2"]
         assert _texts(queue) == [["a1", "a2"]]
 
+    def test_put_reports_true_for_queued_and_merged_items(self) -> None:
+        queue: ConversationQueue[_Item] = ConversationQueue()
+
+        async def scenario() -> list[bool]:
+            return [
+                await queue.put("room", _item("a1"), identity_of=_as("alice"), merge=_merge),
+                await queue.put("room", _item("a2"), identity_of=_as("alice"), merge=_merge),
+            ]
+
+        assert asyncio.run(scenario()) == [True, True]
+
+
+class TestDiscard:
+    def test_a_discarded_item_is_neither_queued_nor_merged(self) -> None:
+        queue: ConversationQueue[_Item] = ConversationQueue()
+
+        async def scenario() -> list[bool]:
+            kept = await queue.put("room", _item("request"), identity_of=_as("alice"), merge=_merge)
+            dropped = await queue.put(
+                "room", _item("chat"), identity_of=_as("alice"), merge=_merge,
+                discard=lambda queued, item: True,
+            )
+            return [kept, dropped]
+
+        assert asyncio.run(scenario()) == [True, False]
+        assert _texts(queue) == [["request"]]
+
+    def test_only_items_of_the_same_conversation_are_weighed(self) -> None:
+        queue: ConversationQueue[_Item] = ConversationQueue()
+        weighed: list[tuple[str, str]] = []
+
+        def discard(queued: _Item, item: _Item) -> bool:
+            weighed.append((queued.texts[0], item.texts[0]))
+            return True
+
+        async def scenario() -> bool:
+            await _put(queue, "room-a", _item("a"))
+            return await queue.put("room-b", _item("b"), identity_of=_as(None), merge=_merge, discard=discard)
+
+        assert asyncio.run(scenario()) is True
+        assert weighed == []
+        assert _texts(queue) == [["a"], ["b"]]
+
+    def test_every_waiting_item_is_weighed_not_only_the_merge_target(self) -> None:
+        # 正式请求后面又排了别人的一件，合并入口已经换成那件；插话照样得让给排在前面的正式请求。
+        queue: ConversationQueue[_Item] = ConversationQueue()
+
+        async def scenario() -> bool:
+            await _put(queue, "room", _item("request"), "alice")
+            await _put(queue, "room", _item("other"), "bob")
+            return await queue.put(
+                "room", _item("chat"), identity_of=_as("bob"), merge=_merge,
+                discard=lambda queued, item: queued.texts == ["request"],
+            )
+
+        assert asyncio.run(scenario()) is False
+        assert _texts(queue) == [["request"], ["other"]]
+
+    def test_an_item_already_taken_no_longer_counts(self) -> None:
+        queue: ConversationQueue[_Item] = ConversationQueue()
+
+        async def scenario() -> bool:
+            await _put(queue, "room", _item("request"))
+            await queue.take(lambda: False)
+            return await queue.put(
+                "room", _item("chat"), identity_of=_as(None), merge=_merge,
+                discard=lambda queued, item: True,
+            )
+
+        assert asyncio.run(scenario()) is True
+        assert _texts(queue) == [["chat"]]
+
 
 class TestTake:
     def test_a_busy_conversation_is_skipped_until_released(self) -> None:
@@ -221,6 +293,24 @@ class TestPreemptCandidates:
     def test_response_action_must_match_but_legacy_topics_are_ignored(
         self, previous: dict[str, str], current: dict[str, str], accepted: bool,
     ) -> None:
+        result = _candidates([_task("t1")], {"t1": _trigger(1, **previous)}, **current)
+
+        assert result == (["t1"] if accepted else [])
+
+    @pytest.mark.parametrize(
+        ("previous", "current", "accepted"),
+        [
+            ({"delivery_purpose": "ambient"}, {}, False),
+            ({"delivery_purpose": "ambient"}, {"delivery_purpose": "direct"}, False),
+            ({"delivery_purpose": "ambient"}, {"delivery_purpose": "ambient"}, True),
+            ({"delivery_purpose": "direct"}, {"delivery_purpose": "ambient"}, True),
+            ({}, {"delivery_purpose": "direct"}, True),
+        ],
+    )
+    def test_a_running_interjection_never_takes_a_direct_request(
+        self, previous: dict[str, str], current: dict[str, str], accepted: bool,
+    ) -> None:
+        # 那一轮 engine 仍当它是插话，可能选择不发言，接进去的正式请求就没人回了。
         result = _candidates([_task("t1")], {"t1": _trigger(1, **previous)}, **current)
 
         assert result == (["t1"] if accepted else [])

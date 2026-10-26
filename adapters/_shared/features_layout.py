@@ -47,6 +47,31 @@ LLM_INTENT = block(
     hint="前面全不命中时才问模型",
 )
 
+PRESENCE = block(
+    "在场与插话",
+    grid(
+        field(
+            "presence_enabled",
+            field("presence_window_sec"),
+            field("absent_judge_probability"),
+            paragraph("被直接叫到或 bot 刚在群里说过话算进场。离场时随机插话也并进这道概率门，掷中了同样先问模型。"),
+        ),
+        fixed(
+            "安静等待",
+            paragraph("在场时不逐条判断：每来一条重新计时，安静下来或等满上限，才把最后一条交给模型。"),
+            field("quiet_wait_sec"),
+            field("quiet_max_wait_sec"),
+        ),
+        fixed(
+            "主动回复密度",
+            paragraph("没人叫 bot 时最多回几次，被叫到不受限。开了在场的群用这一项，不再用社区的每分钟回应上限。"),
+            field("proactive_max_replies"),
+            field("proactive_window_sec"),
+        ),
+    ),
+    hint="只对开了「让模型判断」或社区回复策略的群起作用",
+)
+
 COOLDOWN = block(
     "冷却",
     grid(
@@ -82,7 +107,11 @@ APPROVAL = block(
     hint="审批卡片怎么认回来",
 )
 
-REPLY_TO_TRIGGER = field("reply_to_trigger")
+REPLY_TO_TRIGGER = field(
+    "reply_to_trigger",
+    field("reply_to_trigger_sources"),
+    paragraph("只有这些来源触发的回复才引用并 @ 对方。默认是被 @、被回复、带前缀、点名；主动插话不引用。"),
+)
 HISTORY_TEXT_LIMIT = field("history_text_limit")
 
 PREEMPT = field("enable_preempt")
@@ -178,7 +207,7 @@ def history_block(*extra: Node) -> Block:
 FEATURE_SECTIONS = (
     section(
         "trigger", "触发时机",
-        TRIGGER_CONDITIONS, LLM_INTENT, COOLDOWN,
+        TRIGGER_CONDITIONS, LLM_INTENT, PRESENCE, COOLDOWN,
         icon="timer",
         note="平台页没单独设时的开口规则。平台页的「触发时机」可以单独改其中任意一项，试听也在那里。",
         paths=("trigger",),
@@ -202,7 +231,7 @@ FEATURE_SECTIONS = (
         ),
         icon="format_align_left",
         note="回复时引不引用原消息，以及群历史里每条留多长。",
-        paths=("output.reply_to_trigger", "output.history_text_limit"),
+        paths=("output.reply_to_trigger", "output.reply_to_trigger_sources", "output.history_text_limit"),
     ),
     section(
         "interaction", "群互动",

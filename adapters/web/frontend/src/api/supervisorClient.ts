@@ -1872,11 +1872,36 @@ export interface PlatformDryRunVerdict {
   /** 随机插话与模型意愿判断取决于运行时，试听不给结论。 */
   undetermined: boolean;
   cooldown_remaining: number;
+  /** 以下是在场判断带出来的状态，旧服务端不返回；没开在场判断的群里多为空串。 */
+  at_sec?: number;
+  source?: string;
+  presence?: '' | 'present' | 'absent';
+  /** 安静等待里这条的去向：在等、被后来的盖过、到点由它问模型、被显式触发接走。 */
+  quiet?: '' | 'waiting' | 'merged' | 'due' | 'cancelled';
+  quiet_due_at?: number;
+  quiet_merged?: number;
+  gate?: '' | 'pending' | 'passed' | 'missed';
+  gate_probability?: number;
+  /** 主动回复还剩几次；null 是不限或不适用。 */
+  density_left?: number | null;
+  present_until?: number | null;
+}
+
+/** 试听用的在场判断配置。active 为假时在场、安静等待和主动回复密度都不参与判定。 */
+export interface PlatformDryRunPresence {
+  active: boolean;
+  window_sec: number;
+  absent_judge_probability: number;
+  quiet_wait_sec: number;
+  quiet_max_wait_sec: number;
+  density_limit: number;
+  density_window_sec: number;
 }
 
 export interface PlatformDryRunResult {
   enabled_signals: string[];
   cooldown_applied: boolean;
+  presence?: PlatformDryRunPresence;
   results: PlatformDryRunVerdict[];
 }
 

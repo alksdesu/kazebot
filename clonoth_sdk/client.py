@@ -256,6 +256,7 @@ class ClonothClient:
         node_id: str = "",
         timeout_sec: float = 8.0,
         max_inflight: int = 1,
+        situation: Mapping[str, Any] | None = None,
     ) -> IntentVerdict:
         """问一次模型：这条群消息是不是在跟 bot 说话。
 
@@ -267,6 +268,9 @@ class ClonothClient:
             context_lines: 最近几条群聊，必须是已匿名化的文本行。
             bot_names: bot 在群里被叫的名字，判定「有没有在点名」要用。
             timeout_sec: 等模型的上限。HTTP 侧多给 2 秒，让服务端先超时并取消任务。
+            situation: 此刻的状态，原样转给判断模型：presence（present / absent）、since_bot_spoke_sec、
+                merged_messages、proactive_recent、proactive_window_sec、proactive_limit、trigger_source。
+                只能放数字和短标识，不能放号码和正文。
         """
         payload: dict[str, Any] = {
             "conversation_key": conversation_key,
@@ -284,6 +288,8 @@ class ClonothClient:
             payload["speaker"] = speaker
         if node_id:
             payload["node_id"] = node_id
+        if situation:
+            payload["situation"] = dict(situation)
 
         try:
             resp = await self._http().post(

@@ -641,6 +641,8 @@ async def _send_text_and_attachments(
         common.logger.info("skip context write-back for group %s: delivery predates the reset", target.get("group_id"))
     # 2026-05-01 修改原因：私聊没有群历史缓存，不应写入 _group_history；群聊
     # 仍保留原来的 Bot 回复入库逻辑，维持后续 @Bot 请求的上下文连续性。
+    group_id = target.get("group_id") if target.get("type") == "group" else None
+    recorded = False
     if text:
         if await sending._send_split_text(
             bot,
@@ -648,10 +650,9 @@ async def _send_text_and_attachments(
             text,
             source_attachments=source_attachments,
             send_context=send_context,
-        ) and target.get("type") == "group":
-            group_id = target.get("group_id")
-            if group_id is not None and not stale:
-                history._record_bot_reply(int(group_id), text)
+        ) and group_id is not None and not stale:
+            history._record_bot_reply(int(group_id), text)
+            recorded = True
     if attachments:
         # Delivery completion means the platform-confirmed final attachment send,
         # not merely scheduling a background task.  Failures propagate to the SDK
@@ -659,6 +660,9 @@ async def _send_text_and_attachments(
         await _send_attachments_confirmed(
             bot, target, attachments, send_context=send_context
         )
+        if group_id is not None and not stale and not recorded:
+            # 只发出了图也是 bot 在群里说了话，在场照样从这一刻算起。
+            history._note_bot_spoke(group_id)
         return
 
 

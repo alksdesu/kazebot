@@ -12,6 +12,7 @@ from ..config import ENTRY_NODE_ID
 from adapters._shared import capability
 from adapters._shared.feature_gateway import TargetConversation
 from adapters._shared.preemption import preempt_candidates
+from adapters._shared.trigger_policy import SIGNAL_LLM_INTENT
 from ..live_config import live, pinned as pinned_live_config
 from ..attachment_policy import source_attachments_from_merged
 from ..segments import at_segment_user_ids
@@ -269,7 +270,12 @@ def _merge_queued_inbound(existing: models.QueuedInbound, item: models.QueuedInb
     水位留在前一条：后来那条带出的新历史行没有拼进来，推过去它们就再也不会发给模型。
     """
     previous_hints = dict(existing.platform_updates.get("_route_hints") or {})
-    direct_response = "direct" in {existing.platform_updates.get("_response_purpose", "direct"), item.platform_updates.get("_response_purpose", "direct")}
+    previous_purpose = existing.platform_updates.get("_response_purpose", "direct")
+    previous_stamp = existing.platform_updates.get("_proactive_stamp")
+    direct_response = "direct" in {previous_purpose, item.platform_updates.get("_response_purpose", "direct")}
+    if direct_response and previous_purpose == "ambient":
+        # 插话那件并进了正式请求，这一轮是在回人家的话，尾句换回执行指令。
+        existing.text = inbound._as_direct_request(existing.text)
     correction = re.match(r"^(?:更正|纠正|刚才(?:说|写)错|不对[,，]|不是.+[，,])", item.user_text.strip())
     heading = "同一用户更正此前输入，以这条更正为准；已完成的外部操作不能据此假定已撤销" if correction else "排队期间追加消息"
     appended = f"【{heading}】\n{item.merge_segment}"
@@ -293,23 +299,66 @@ def _merge_queued_inbound(existing: models.QueuedInbound, item: models.QueuedInb
     hints["response_action"] = "task" if "task" in actions else "reply" if "reply" in actions else "short_reply"
     existing.platform_updates["_response_purpose"] = "direct" if direct_response else "ambient"
     hints["delivery_purpose"] = existing.platform_updates["_response_purpose"]
+    if previous_stamp is not None and existing.platform_updates.get("_proactive_stamp") != previous_stamp:
+        # 两件并成一轮只会有一次回复，前一件记下的那笔主动回复退回去。
+        inbound._refund_proactive(existing.platform_updates.get("group_id"), previous_stamp)
     existing.user_text = f"{existing.user_text}\n{item.user_text}"
     if state._adapter.features.available and source_refs:
         state._adapter.features.stage_burst(existing)
 
 
+def _purpose_of(item: models.QueuedInbound) -> str:
+    return str(item.platform_updates.get("_response_purpose") or "direct")
+
+
+def _yields_to_queued(queued: models.QueuedInbound, incoming: models.QueuedInbound) -> bool:
+    """同会话里已经有正式请求在排队，插话就不再排：等它轮到，正式请求的回复已经把话接过去了。
+
+    合进正式请求也不行：后来那件的引用和来源会盖掉前一件，正式请求的回复就成了在回插话那条。
+    """
+    return _purpose_of(incoming) == "ambient" and _purpose_of(queued) == "direct"
+
+
+def _drop_yielded_inbound(item: models.QueuedInbound) -> None:
+    """让给正式请求的插话：撤销它记下的主动回复，连发暂存里的那几行也删掉，重启后不再恢复。"""
+    common.logger.info(
+        "QQ soft trigger dropped: a direct request is already queued in conversation=%s",
+        item.real_conversation_key,
+    )
+    inbound._refund_proactive(item.platform_updates.get("group_id"), item.platform_updates.get("_proactive_stamp"))
+    if state._adapter.features.available:
+        refs = item.platform_updates.get("_route_hints", {}).get("source_message_refs", [])
+        if refs:
+            state._adapter.features.burst_store.remove(item.stable_conversation_key, refs)
+
+
+def _ensure_delivery_purpose(item: models.QueuedInbound) -> None:
+    """没有社区功能的部署也要把这一轮是直接找 bot 还是主动插话带下去：engine 和发送那一步都按它分。"""
+    purpose = "ambient" if _purpose_of(item) == "ambient" else "direct"
+    item.platform_updates["_response_purpose"] = purpose
+    hints = item.platform_updates.get("_route_hints")
+    if not isinstance(hints, dict):
+        hints = {}
+        item.platform_updates["_route_hints"] = hints
+    hints.setdefault("delivery_purpose", purpose)
+
+
 async def _enqueue_or_submit_inbound(item: models.QueuedInbound) -> bool:
     if not state._adapter.features.available:
+        _ensure_delivery_purpose(item)
         return await _queue_or_submit_ready(item)
     metadata = await state._adapter.features.prepare(item.bot, item.event)
     if not metadata:
+        _ensure_delivery_purpose(item)
         return await _queue_or_submit_ready(item)
     item.platform_updates["_route_hints"] = {
         "response_action": metadata.get("action", "reply"),
         "source_message_refs": [str(getattr(item.event, "message_id", ""))],
         "reply_message_id": str(getattr(item.event, "message_id", "")),
     }
-    item.platform_updates["_response_purpose"] = "direct" if metadata.get("direct") else "ambient"
+    # 两边算的是同一件事（被 @、回复 bot、带前缀、显式信号），取并集只为旧调用方没带 _response_purpose 时也不降级。
+    direct = metadata.get("direct") or item.platform_updates.get("_response_purpose") == "direct"
+    item.platform_updates["_response_purpose"] = "direct" if direct else "ambient"
     item.platform_updates["_feature_actor"] = metadata["actor"]
     item.platform_updates["_route_hints"]["delivery_purpose"] = item.platform_updates["_response_purpose"]
     message = item.event.get_message() if hasattr(item.event, "get_message") else []
@@ -342,10 +391,13 @@ async def _queue_or_submit_ready(item: models.QueuedInbound) -> bool:
 
     message = item.event.get_message() if hasattr(item.event, "get_message") else []
     item.memory_user_ids = tuple(dict.fromkeys((*item.memory_user_ids, *at_segment_user_ids(message))))
-    await state._adapter.qq_queue.put(
+    queued = await state._adapter.qq_queue.put(
         item.stable_conversation_key, item,
-        identity_of=_queue_merge_identity, merge=_merge_queued_inbound,
+        identity_of=_queue_merge_identity, merge=_merge_queued_inbound, discard=_yields_to_queued,
     )
+    if not queued:
+        # 让出去不算没收下：调用方据返回值决定要不要在群里报错，这里不该报。
+        _drop_yielded_inbound(item)
     return True
 
 
@@ -478,6 +530,8 @@ def _target_from_platform_data(platform_data: Dict[str, Any]) -> Optional[Dict[s
         t = {"type": "group", "group_id": int(platform_data["group_id"])}
         if "_response_purpose" in platform_data:
             t["_response_purpose"] = platform_data["_response_purpose"]
+        if platform_data.get("_trigger_source"):
+            t["_trigger_source"] = platform_data["_trigger_source"]
         if "_feature_actor" in platform_data:
             t["_feature_actor"] = platform_data["_feature_actor"]
         if conversation_key:
@@ -491,6 +545,8 @@ def _target_from_platform_data(platform_data: Dict[str, Any]) -> Optional[Dict[s
         return t
     if platform_data.get("group_id") is not None:
         t = {"type": "group", "group_id": int(platform_data["group_id"])}
+        if platform_data.get("_trigger_source"):
+            t["_trigger_source"] = platform_data["_trigger_source"]
         if conversation_key:
             t["conversation_key"] = conversation_key
         if msg_id is not None:
@@ -532,6 +588,12 @@ def _restore_staged_inbound(
                 "conversation_key": data["scope"], "_route_hints": data.get("route_hints") or {"source_message_refs": data["refs"]},
                 "_response_purpose": data.get("response_purpose", "direct"), "_feature_actor": actor,
                 "_source_attachments": data["attachments"]}
+    # 旧暂存行没记来源：插话那种按模型判断算，不引用；直接找 bot 的留空，照旧引用。
+    source = str(data.get("trigger_source") or "")
+    if not source and platform["_response_purpose"] == "ambient":
+        source = SIGNAL_LLM_INTENT
+    if source:
+        platform["_trigger_source"] = source
     if data["is_dm"]:
         platform["user_id"] = event.user_id
     if data["group_id"] is not None:

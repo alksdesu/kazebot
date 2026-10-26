@@ -22,6 +22,7 @@ from .pseudo_tools import (
     _reply_spec,
     _compact_context_spec,
     _preempt_task_spec,
+    _stay_silent_spec,
     _switch_node_spec,
     _update_todos_spec,
     _to_openai_tools,
@@ -2211,6 +2212,9 @@ async def run_ai_node(
     _todo_enabled = not _is_system_task and bool(parse_bool((getattr(node, "extra", None) or {}).get("todo"), False))
     if _todo_enabled:
         openai_tools.append(_update_todos_spec())
+    # 开了就每个任务都注入，不随直接找 bot 还是插话变：工具表一变，前缀缓存整段失效。
+    if not _is_system_task and parse_bool((getattr(node, "extra", None) or {}).get("stay_silent"), False):
+        openai_tools.append(_stay_silent_spec())
 
     _short_reply_task = short_reply(rctx.task_context)
     if _short_reply_task:

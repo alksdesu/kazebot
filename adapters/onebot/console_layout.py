@@ -25,6 +25,7 @@ from adapters._shared.features_layout import (
     IMAGE_INPUT,
     LLM_INTENT,
     PREEMPT,
+    PRESENCE,
     REPLY_TO_TRIGGER,
     STICKER_CANDIDATES,
     STICKER_COMBAT,
@@ -63,6 +64,7 @@ SECTIONS = (
         "trigger", "触发时机",
         TRIGGER_CONDITIONS,
         LLM_INTENT,
+        PRESENCE,
         COOLDOWN,
         block("试听", custom("audition"), hint="判定由 bot 那份代码算，不是界面自己猜的"),
         note(

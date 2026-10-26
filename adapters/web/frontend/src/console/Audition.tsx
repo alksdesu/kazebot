@@ -14,13 +14,31 @@ import {
 import { Button, Check, ErrorText, Input, Tag } from './components';
 import { useConsoleStore } from './consoleStore';
 import { usePlatform } from './platformContext';
-import { blockerLabel, showSignalTag, signalLabel } from './signals';
+import {
+  blockerLabel,
+  presenceSummary,
+  secondsText,
+  showSignalTag,
+  signalLabel,
+  type StatusTone,
+  verdictStatus,
+} from './signals';
 
 const VERDICT =
   'mt-1.5 ml-[var(--duties-audition-indent)] flex flex-wrap items-baseline gap-1.5 text-xs max-md:ml-0'
   + ' motion-safe:animate-verdict-flip';
 
+const STATUS =
+  'mt-1 ml-[var(--duties-audition-indent)] flex flex-wrap items-baseline gap-1.5 text-xs max-md:ml-0';
+
 const SIG = 'bg-[var(--duties-muted)] px-1.5 font-mono text-mini';
+
+const STATUS_TONE: Record<StatusTone, string> = {
+  live: 'text-[var(--duties-live)]',
+  plain: 'text-[var(--duties-text)]',
+  muted: 'text-[var(--duties-secondary)]',
+  danger: 'text-[var(--duties-danger)]',
+};
 
 const FLAG =
   'w-6 flex-none border border-[var(--duties-border)] bg-[var(--duties-panel)] py-0.5'
@@ -56,6 +74,24 @@ const Verdict = ({ verdict }: { verdict: PlatformDryRunVerdict | undefined }) =>
   );
 };
 
+/** 状态列：开了在场判断才有。时间都按试听时间线上的秒数算，和每条的 at_sec 对得上。 */
+const Status = ({ verdict }: { verdict: PlatformDryRunVerdict | undefined }) => {
+  const chips = verdict ? verdictStatus(verdict) : [];
+  if (!verdict || !chips.length) return null;
+  return (
+    <p aria-label="在场状态" className={STATUS}>
+      {typeof verdict.at_sec === 'number' && (
+        <span className="font-mono text-mini text-[var(--duties-secondary)]">
+          时刻 {secondsText(verdict.at_sec)}
+        </span>
+      )}
+      {chips.map((chip) => (
+        <span className={`${SIG} ${STATUS_TONE[chip.tone]}`} key={chip.text}>{chip.text}</span>
+      ))}
+    </p>
+  );
+};
+
 export const Audition = () => {
   const platform = usePlatform();
   const token = useSettingsStore((state) => state.adminToken);
@@ -73,6 +109,7 @@ export const Audition = () => {
 
   const byId = alignVerdicts(resultIds, result?.results);
   const listening = result?.enabled_signals || [];
+  const presence = presenceSummary(result?.presence);
 
   return (
     <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)]">
@@ -84,6 +121,9 @@ export const Audition = () => {
             ? listening.map((name) => signalLabel(name)).join(' · ')
             : '没有开着的信号'}
         </span>
+        {presence && (
+          <span className="text-xs text-[var(--duties-secondary)]">在场判断：{presence}</span>
+        )}
         <span className="flex-1" />
         {loading && (
           <span className="font-mono text-mini text-[var(--duties-secondary)]">正在重算…</span>
@@ -161,6 +201,7 @@ export const Audition = () => {
               </button>
             </div>
             <Verdict verdict={byId.get(message.id)} />
+            {presence && <Status verdict={byId.get(message.id)} />}
           </li>
         ))}
       </ol>

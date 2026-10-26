@@ -42,6 +42,10 @@ class IntentVerdict:
     topic_ref: str = ""
 
 
+# 出站消息的 action_type：任务选择了不发言。和 supervisor/task_router.py 的同名常量一致。
+OUTBOUND_NO_REPLY = "no_reply"
+
+
 @dataclass(frozen=True)
 class DeliveryContext:
     """Immutable identity/audit context for one adapter callback delivery.
@@ -50,6 +54,10 @@ class DeliveryContext:
     ``idempotency_key``. Adapters must use that key (not only ``event_id``), so an
     operator-requested replay intentionally bypasses the prior platform ``sent``
     claim while ordinary retries remain deduplicated.
+
+    ``action_type`` is the terminal action of the task that produced the message
+    (finish / ask / fail / no_reply ...); ``no_reply`` means the task chose not to
+    speak, so the adapter sends nothing but still settles the trigger.
     """
 
     event_id: str = ""
@@ -65,6 +73,11 @@ class DeliveryContext:
     feature_delivery_id: str = ""
     topic_id: str = ""
     reply_message_id: str = ""
+    action_type: str = ""
+
+    @property
+    def no_reply(self) -> bool:
+        return self.action_type == OUTBOUND_NO_REPLY
 
     def child(self, identity: str) -> "DeliveryContext":
         """Derive a stable logical-message context without mutating the parent."""

@@ -80,10 +80,36 @@ trigger:
     # 被 @ 时无视冷却。关掉会让用户直接叫 bot 却被静默忽略，体验最差。
     exempt_at: true
 
+  presence:
+    # 在场 / 离场，只对开了 llm_intent 或社区回复策略的群起作用；社区设置里还能按群改开关和离场概率。
+    # 被直接叫到（@、回复 bot、点名、前缀）或 bot 刚在群里说过话算进场，window_sec 内没有新的进场就离场。
+    # 离场时非显式消息先过概率门，掷中了才问模型；随机插话开着时并进这道门，取两个概率里大的。
+    enabled: false
+    window_sec: 90.0
+    absent_judge_probability: 0.1
+
+  quiet:
+    # 在场时不逐条问模型：每来一条重新计时，wait_sec 内没人说话（或等满 max_wait_sec）才拿最后一条去问。
+    wait_sec: 4.0
+    max_wait_sec: 20.0
+
+  proactive:
+    # 没人叫 bot 时的回复次数上限，被叫到不受限。0 = 不限。
+    # 开了在场的群用这一项，社区回复策略的每分钟回应上限不再叠加。
+    max_replies: 3
+    window_sec: 300.0
+
 # ── 回复 ──────────────────────────────────────
 output:
   # 回复时引用触发那条消息。
   reply_to_trigger: true
+  # 只有这些来源触发的回复才引用并 @ 对方。可选 at、reply、prefix、name、keyword、random、llm_intent、all；
+  # 主动插话（关键词、随机、模型判断）默认不引用，免得像在点名回别人。
+  reply_to_trigger_sources:
+    - at
+    - reply
+    - prefix
+    - name
   # 群历史里每条消息压成一行，最多留这么多字，超出的截掉。
   history_text_limit: 400
 

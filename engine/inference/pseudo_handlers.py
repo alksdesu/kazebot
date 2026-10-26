@@ -25,7 +25,7 @@ from .loop_state import _LoopState, _persist_ctx, _short, compact_target_session
 # 【Fix 3】reply 工具结果统一走 formatter.format_tool_result，需要 ParsedToolCall 构造、
 # MessageMeta 标注 message_type、MessageType 影子写入。延迟导入 _shadow_write 避免循环依赖。
 from .tool_format import ParsedToolCall
-from .pseudo_tools import _dispatch_target_from_tool_name
+from .pseudo_tools import NO_REPLY_MARKER, STAY_SILENT_TOOL_NAME, _dispatch_target_from_tool_name
 from .message_model import MessageMeta, set_message_meta
 from ..conversation_store import MessageType
 from ..node import canonical_node_id
@@ -196,8 +196,11 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     args = pseudo_call.arguments or {}
     from ..conversation_routing import concise_text, short_reply
     if short_reply(getattr(ls.rctx, "task_context", {}) or {}):
+        # 短答只给 finish，不发言除外：插话的短答本来就可以选择不接。
+        if pseudo_call.name == STAY_SILENT_TOOL_NAME:
+            return await _handle_pseudo_stay_silent(ls, pseudo_call, step)
         if pseudo_call.name != "finish":
-            _emit_pseudo_tool_result(ls, pseudo_call, "本轮为简短回应，请仅调用 finish。")
+            _emit_pseudo_tool_result(ls, pseudo_call, _short_reply_only_finish(ls))
             return None
         args = {**args, "text": concise_text(str(args.get("text") or "")), "attachment_paths": []}
 
@@ -246,6 +249,9 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
 
     if pseudo_call.name == TODO_TOOL_NAME:
         return await _handle_pseudo_update_todos(ls, pseudo_call, args)
+
+    if pseudo_call.name == STAY_SILENT_TOOL_NAME:
+        return await _handle_pseudo_stay_silent(ls, pseudo_call, step)
 
     _fixed_dispatch_target = _dispatch_target_from_tool_name(pseudo_call.name)
     if _fixed_dispatch_target:
@@ -806,3 +812,63 @@ async def _handle_pseudo_update_todos(ls: _LoopState, pseudo_call: Any, args: di
         "items": [dict(item) for item in items],
     })
     return None
+
+
+def _stay_silent_enabled(ls: _LoopState) -> bool:
+    """和工具表注入同一个条件：节点声明了 stay_silent: true，且不是系统任务。"""
+    if (getattr(ls.rctx, "task_context", {}) or {}).get("is_system_task"):
+        return False
+    return bool(parse_bool((getattr(ls.node, "extra", None) or {}).get("stay_silent"), False))
+
+
+def _ambient_turn(ls: _LoopState) -> bool:
+    """这一轮是没人叫 bot、由它自己决定插不插话的那种。"""
+    from ..conversation_routing import routing_meta
+
+    return routing_meta(getattr(ls.rctx, "task_context", {}) or {}).get("delivery_purpose") == "ambient"
+
+
+def _short_reply_only_finish(ls: _LoopState) -> str:
+    if _stay_silent_enabled(ls) and _ambient_turn(ls):
+        return f"本轮为简短回应：要说就调用 finish，不想接话就调用 {STAY_SILENT_TOOL_NAME}。"
+    return "本轮为简短回应，请仅调用 finish。"
+
+
+async def _handle_pseudo_stay_silent(ls: _LoopState, pseudo_call: Any, step: int) -> TaskAction | None:
+    """不发言：只在主动插话的任务里生效，任务照常结束但不产出回复，结果带不发言标记一路传到适配层。
+
+    有人直接找 bot 的任务调用它会被拒，结果告诉模型照常回答，任务继续。
+    """
+    if not _stay_silent_enabled(ls):
+        _emit_pseudo_tool_result(ls, pseudo_call, "Error: 这个节点不能选择不发言，请用 finish 正常回复。")
+        return None
+    if not _ambient_turn(ls):
+        _emit_pseudo_tool_result(
+            ls, pseudo_call,
+            "Error: 这一轮是有人在直接找你（@、回复、点名或前缀），不能选择不发言，请正常回答并用 finish 交付。",
+        )
+        return None
+    # 和 finish 一样先看有没有新消息要注入：直接结束的话，刚进来的那条就没人看了。
+    if ls.preempt_inject_info is None and not ls.preempt_after_step:
+        pending = await ls.rctx.check_preempted()
+        if pending.get("preempted"):
+            if pending.get("message"):
+                ls.preempt_inject_info = pending
+            else:
+                ls.preempt_after_step = True
+    if ls.preempt_inject_info is not None:
+        _emit_pseudo_tool_result(ls, pseudo_call, "刚有新消息进来，这次不发言没有生效；先看新消息再决定。")
+        return None
+    reason = str((pseudo_call.arguments or {}).get("reason") or "").strip()
+    logger.info("node %s stays silent: %s", ls.node.id, _short(reason, 120) if reason else "-")
+    _emit_pseudo_tool_result(ls, pseudo_call, "好的，这一轮不发言。")
+    ctx_ref = _persist_ctx(ls, step + 1)
+    return TaskAction(
+        action=ACTION_FINISH,
+        node_id=ls.node.id,
+        # text 和 summary 都得是空的：supervisor 交付时 text 为空会拿 summary 顶上。
+        result={"summary": "", "text": "", "attachments": [], NO_REPLY_MARKER: True},
+        context_ref=ctx_ref,
+        summary="不发言",
+        llm_request_id=getattr(ls.rctx, "current_llm_request_id", ""),
+    )

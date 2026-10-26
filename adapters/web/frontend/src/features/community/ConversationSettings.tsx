@@ -1,22 +1,53 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { errorMessage, isEditConflict } from '../../api/request';
+import { asPercent } from '../../console/format';
 import { featureRequest } from '../client';
 import { ScopeSelect } from '../execution/ScopeSelect';
 import { useRequestGuard } from '../../hooks/useRequestGuard';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { INSTANCE_DEFAULTS_TARGET, useScopePicker } from '../useScopePicker';
 import { actionClass, controlClass, EmptyState, FeatureFeedback, FeaturePage, primaryClass, sectionClass } from '../ui';
-import { CONVERSATION_POLICY_KEYS, type ConversationPolicy, type ConversationPolicyKey } from './types';
-import { booleanPolicyKeys, draftIdentity, effectivePolicy, policyDraft, readPolicySnapshot, samePolicy, type PolicyDraft, type PolicySnapshot } from './policyForm';
+import { type ConversationPolicy, type ConversationPolicyKey } from './types';
+import { booleanPolicyKeys, draftIdentity, draftValue, effectivePolicy, nullablePolicyKeys, percentPolicyKeys, policyDraft, policyPatch, readPolicySnapshot, samePolicy, type PolicyDraft, type PolicySnapshot, type PolicyValue } from './policyForm';
 
 const labels: Record<ConversationPolicyKey, string> = {
   response_policy_enabled: '统一选择忽略、表态、短答和办事',
   reply_budget_per_minute: '每分钟自主回应上限',
   merge_window_sec: '同人短句等待秒数',
   merge_max_wait_sec: '连续追加最长等待秒数',
+  interject_presence: '在场 / 离场',
+  interject_absent_probability: '离场时去问模型的概率（%）',
 };
 interface Decision { message_id: string; action: string; reason: string }
-const displayValue = (value: boolean | number) => typeof value === 'boolean' ? value ? '开启' : '关闭' : String(value);
+const displayValue = (key: ConversationPolicyKey, value: PolicyValue | undefined) => {
+  if (value === null || value === undefined) return '跟随平台配置';
+  if (typeof value === 'boolean') return value ? '开启' : '关闭';
+  return percentPolicyKeys.has(key) ? `${asPercent(value)}%` : String(value);
+};
+
+function PolicyControl({ policyKey, value, custom, global, onChange }: {
+  policyKey: ConversationPolicyKey;
+  value: string | boolean | undefined;
+  custom: boolean;
+  global: boolean;
+  onChange: (value: string | boolean) => void;
+}) {
+  const id = `policy-${policyKey}`;
+  const label = labels[policyKey];
+  // 跟随只在实例默认里能选；会话自定义要写值，想跟随就用继承。
+  const unsetLabel = global || !custom ? '跟随平台配置' : '请选择';
+  if (booleanPolicyKeys.has(policyKey) && nullablePolicyKeys.has(policyKey)) {
+    return <select id={id} aria-label={label} disabled={!custom} className={controlClass} value={typeof value === 'boolean' ? value ? 'on' : 'off' : ''} onChange={event => onChange(event.target.value === '' ? '' : event.target.value === 'on')}>
+      <option value="" disabled={!global}>{unsetLabel}</option>
+      <option value="on">开启</option>
+      <option value="off">关闭</option>
+    </select>;
+  }
+  if (booleanPolicyKeys.has(policyKey)) {
+    return <label className="flex min-h-10 items-center gap-2"><input id={id} aria-label={label} type="checkbox" disabled={!custom} checked={Boolean(value)} onChange={event => onChange(event.target.checked)} />{value ? '开启' : '关闭'}</label>;
+  }
+  return <input id={id} aria-label={label} disabled={!custom} inputMode={policyKey === 'reply_budget_per_minute' ? 'numeric' : 'decimal'} placeholder={nullablePolicyKeys.has(policyKey) ? unsetLabel : undefined} className={controlClass} value={String(value ?? '')} onChange={event => onChange(event.target.value)} />;
+}
 
 export function ConversationSettings({ scope: initialScope }: { scope?: string }) {
   const [scope, setScope] = useState(initialScope === undefined ? INSTANCE_DEFAULTS_TARGET : initialScope);
@@ -43,7 +74,7 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
   const confirmDiscard = useUnsavedChanges(dirty);
   let validation = '';
   let effective: ConversationPolicy | null = null;
-  if (baseline) { try { effective = effectivePolicy(baseline.defaults, draft); } catch (reason) { validation = (reason as Error).message; } }
+  if (baseline) { try { effective = effectivePolicy(baseline.defaults, draft, global); } catch (reason) { validation = (reason as Error).message; } }
   const validMinutes = /^\d+$/.test(minutes) && Number(minutes) >= 1 && Number(minutes) <= 10080;
 
   const accept = (next: PolicySnapshot, resetDraft: boolean) => {
@@ -109,8 +140,7 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
   const save = () => {
     if (!baseline || !effective || !dirty || conflict || readBlocked) return;
     const clearingOrphan = !global && picker.policyOnlyScopes.includes(scope) && !Object.keys(draft).length;
-    const values = Object.fromEntries(CONVERSATION_POLICY_KEYS.filter(key => global ? effective[key] !== baseline.settings[key] : Object.prototype.hasOwnProperty.call(draft, key)).map(key => [key, effective[key]]));
-    const body = { values, reset_fields: global ? [] : CONVERSATION_POLICY_KEYS.filter(key => !Object.prototype.hasOwnProperty.call(draft, key)), expected_revision: baseline.revision, ...(global ? {} : { expected_defaults_revision: baseline.defaultsRevision }) };
+    const body = { ...policyPatch(baseline, draft, effective, global), expected_revision: baseline.revision, ...(global ? {} : { expected_defaults_revision: baseline.defaultsRevision }) };
     void run(async () => {
       const response = await featureRequest<unknown>(global ? '/v1/community/settings/defaults' : '/v1/community/settings/overrides', { ...(global ? {} : { scope }), method: 'PATCH', body });
       if (!requests.isCurrent()) return;
@@ -132,21 +162,20 @@ export function ConversationSettings({ scope: initialScope }: { scope?: string }
           <legend className="font-semibold">{global ? '实例默认接话策略' : '会话接话策略'}{dirty ? ' · 有未保存修改' : ''}</legend>
           <p className="text-[var(--duties-secondary)]">{global ? '这里设置实例默认回应策略，不会让所有会话进入安静，也不会修改群欢迎词。' : '使用默认的字段会跟随实例配置；自定义字段只影响当前会话。切换来源后请保存。'}</p>
           <div className="divide-y divide-[var(--duties-border)]">
-            {CONVERSATION_POLICY_KEYS.map(key => {
+            {baseline.keys.map(key => {
               const custom = global || Object.prototype.hasOwnProperty.call(draft, key);
-              const value = custom ? draft[key] : baseline.defaults[key];
+              const value = custom ? draft[key] : draftValue(key, baseline.defaults[key]);
               return <div key={key} className="grid min-w-0 gap-3 py-4 sm:grid-cols-2 sm:items-center">
-                <div className="space-y-1"><label htmlFor={`policy-${key}`} className="font-medium">{labels[key]}</label><p className="text-xs text-[var(--duties-secondary)]">当前生效：{displayValue((latest || baseline).settings[key])} · {global ? '实例默认' : Object.prototype.hasOwnProperty.call((latest || baseline).overrides, key) ? '本会话自定义' : '继承实例默认'}</p></div>
+                <div className="space-y-1"><label htmlFor={`policy-${key}`} className="font-medium">{labels[key]}</label><p className="text-xs text-[var(--duties-secondary)]">当前生效：{displayValue(key, (latest || baseline).settings[key])} · {global ? '实例默认' : Object.prototype.hasOwnProperty.call((latest || baseline).overrides, key) ? '本会话自定义' : '继承实例默认'}</p></div>
                 <div className="min-w-0 space-y-2">
-                  {!global && <select aria-label={`${labels[key]}来源`} className={controlClass} value={custom ? 'custom' : 'inherit'} onChange={event => setDraft(current => { const next = { ...current }; if (event.target.value === 'inherit') delete next[key]; else next[key] = typeof baseline.defaults[key] === 'boolean' ? baseline.defaults[key] as boolean : String(baseline.defaults[key]); return next; })}><option value="inherit">使用默认（{displayValue(baseline.defaults[key])}）</option><option value="custom">自定义</option></select>}
-                  {booleanPolicyKeys.has(key)
-                    ? <label className="flex min-h-10 items-center gap-2"><input id={`policy-${key}`} aria-label={labels[key]} type="checkbox" disabled={!custom} checked={Boolean(value)} onChange={event => setDraft(current => ({ ...current, [key]: event.target.checked }))} />{value ? '开启' : '关闭'}</label>
-                    : <input id={`policy-${key}`} aria-label={labels[key]} disabled={!custom} inputMode={key === 'reply_budget_per_minute' ? 'numeric' : 'decimal'} className={controlClass} value={String(value ?? '')} onChange={event => setDraft(current => ({ ...current, [key]: event.target.value }))} />}
+                  {!global && <select aria-label={`${labels[key]}来源`} className={controlClass} value={custom ? 'custom' : 'inherit'} onChange={event => setDraft(current => { const next = { ...current }; if (event.target.value === 'inherit') delete next[key]; else next[key] = draftValue(key, baseline.defaults[key]); return next; })}><option value="inherit">使用默认（{displayValue(key, baseline.defaults[key])}）</option><option value="custom">自定义</option></select>}
+                  <PolicyControl policyKey={key} value={value} custom={custom} global={global} onChange={next => setDraft(current => ({ ...current, [key]: next }))} />
                 </div>
               </div>;
             })}
           </div>
           <p className="text-xs text-[var(--duties-secondary)]">回应上限为 1～60 的整数；等待时间为 0～10 秒，0 表示关闭短句等待，最长等待不能短于短句窗口。</p>
+          {baseline.keys.some(key => nullablePolicyKeys.has(key)) && <p className="text-xs text-[var(--duties-secondary)]">在场 / 离场与离场概率只对群聊起作用，且这个群要开着功能页的「让模型判断」或本页的统一接话；概率填 0～100 的百分数。跟随平台配置即沿用功能页「在场 / 离场」那几项。</p>}
           {validation && <p role="alert" className="text-[var(--duties-danger)]">{validation}</p>}
           <div className="flex flex-wrap gap-3">
             <button className={primaryClass} disabled={busy || !dirty || Boolean(validation) || conflict || readBlocked}>{busy ? '正在保存…' : global ? '保存实例默认配置' : '保存会话覆盖'}</button>

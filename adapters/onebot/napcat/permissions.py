@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
 from types import MappingProxyType
 from typing import Any
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, PrivateMessageEvent
 from platforms.ids import normalize_id
 from adapters._shared import capability
-from adapters._shared.trigger_policy import TriggerConfig, evaluate as trigger_evaluate
 from ..live_config import live, refresh as refresh_live_config
 
 from . import common, identity, inbound, message_text, state
@@ -164,11 +162,14 @@ async def _agent_group_rule(bot: Bot, event: Event) -> bool:
             "QQ trigger suppressed group=%s signal=%s by=%s",
             getattr(event, "group_id", None), decision.signal, decision.blocked_by,
         )
+    # 每条群消息只在这里判一遍，被直接叫到的进场也只能在这里记。
+    inbound._observe_group_decision(event, bot, text, decision)
     if decision.triggered:
-        # 在这里记冷却而不是等真的发出去：rule 返回 True 就意味着这条消息会被当成一轮
+        # 在这里记账而不是等真的发出去：rule 返回 True 就意味着这条消息会被当成一轮
         # bot 发言处理（本地命令拦截也会产出回复）。handler 中途异常时会多冷却一轮，
         # 而「多等一会儿」是这两个方向里安全的那一个。
-        state._adapter.trigger_cooldown.record(inbound._trigger_input(event, bot, text))
+        stamp = inbound._accept_group_trigger(event, bot, text, decision)
+        inbound._remember_accepted_trigger(event, decision, stamp)
     return decision.triggered
 
 
@@ -176,7 +177,8 @@ async def _intent_group_rule(bot: Bot, event: Event) -> bool:
     """匹配「显式信号都不命中、但开了意愿判断」的群消息。
 
     只判要不要问模型，不在这里问：rule 里做一次几秒的往返，会把同一条消息后面的
-    matcher 连同群历史记录一起卡住整整那么久。
+    matcher 连同群历史记录一起卡住整整那么久。在场时要进安静等待的也归这里，等待在 handler 里。
+    社区回复策略开着的群在判定配置里已经算作开了意愿判断，和显式信号那条 rule 用同一份结论。
     """
     if not isinstance(event, GroupMessageEvent):
         return False
@@ -190,10 +192,8 @@ async def _intent_group_rule(bot: Bot, event: Event) -> bool:
     if not live.llm_intent_enabled and not coordinated:
         return False
     text = await _group_trigger_text(bot, event)
-    if coordinated:
-        config = replace(TriggerConfig.from_live(live), llm_intent=True)
-        return trigger_evaluate(inbound._trigger_input(event, bot, text), config, state._adapter.trigger_cooldown).awaits_llm_intent()
-    return inbound._group_trigger_decision_once(event, bot, text).awaits_llm_intent()
+    decision = inbound._group_trigger_decision_once(event, bot, text)
+    return decision.awaits_llm_intent() or decision.awaits_quiet()
 
 
 async def _private_message_rule(event: Event) -> bool:

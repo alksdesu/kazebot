@@ -15,11 +15,17 @@ from supervisor.community.service import CommunityService, DEFAULT_SETTINGS, POL
 from supervisor.feature_auth import FeatureActor
 
 
+# 插话覆盖的出厂值是「没写」：跟随平台配置，迁移旧库时也不冻结进实例默认。
+INTERJECT = {
+    "interject_presence": None,
+    "interject_absent_probability": None,
+}
 FACTORY = {
     "response_policy_enabled": False,
     "merge_window_sec": 8.0,
     "merge_max_wait_sec": 10.0,
     "reply_budget_per_minute": 6,
+    **INTERJECT,
 }
 LEGACY = {
     "response_policy_enabled": False,
@@ -27,6 +33,8 @@ LEGACY = {
     "merge_max_wait_sec": 4.0,
     "reply_budget_per_minute": 6,
 }
+# 旧库冻结下来的是 LEGACY 那四项；生效值里另有两项插话覆盖，留空跟随平台配置。
+LEGACY_SETTINGS = {**LEGACY, **INTERJECT}
 NO_TABLE = object()
 NO_ROW = object()
 
@@ -87,7 +95,7 @@ def test_fresh_database_inherits_factory_values_without_persisting_overrides(tmp
                 db.execute("INSERT INTO unrelated VALUES ('synthetic')")
     service = CommunityService(tmp_path)
     assert POLICY_DEFAULTS == FACTORY
-    assert DEFAULT_SETTINGS == {**LEGACY, "welcome_enabled": False}
+    assert DEFAULT_SETTINGS == {**LEGACY_SETTINGS, "welcome_enabled": False}
     assert service.defaults(admin) == {"settings": FACTORY, "values": {}, "revision": 0}
     for scope in ("qq_group:fresh", "qq_private:fresh"):
         state = service.state(replace(admin, scope=scope))
@@ -145,8 +153,8 @@ def test_non_qq_scopes_keep_legacy_baseline_before_and_after_default_edits(tmp_p
     service = CommunityService(tmp_path)
     actor = replace(admin, scope=scope)
     before = service.state(actor)
-    assert before["settings"] == {**LEGACY, "welcome_enabled": False}
-    assert before["defaults"] == LEGACY
+    assert before["settings"] == {**LEGACY_SETTINGS, "welcome_enabled": False}
+    assert before["defaults"] == LEGACY_SETTINGS
     assert service.ingest(actor, {"message_id": "1", "text": "not a QQ topic"}) == {"topic_id": "", "context": []}
     service.update_defaults(admin, {
         "values": {"response_policy_enabled": True, "merge_window_sec": 2},
@@ -177,11 +185,11 @@ def test_legacy_migration_freezes_effective_defaults_and_preserves_every_group_b
     expected = {**LEGACY, **explicit}
     revision = 0 if before_default is None else 7 + (set(explicit) != set(LEGACY))
     service = CommunityService(tmp_path)
-    assert service.defaults(admin) == {"values": expected, "settings": expected, "revision": revision}
+    assert service.defaults(admin) == {"values": expected, "settings": {**expected, **INTERJECT}, "revision": revision}
     for scope, local in groups.items():
         state = service.state(replace(admin, scope=scope))
         inherited = LEGACY if scope.startswith("web:") else expected
-        assert state["settings"] == {**inherited, "welcome_enabled": False, **local}
+        assert state["settings"] == {**inherited, **INTERJECT, "welcome_enabled": False, **local}
         assert state["revision"] == 9
         assert state["defaults_revision"] == (0 if scope.startswith("web:") else revision)
         assert state["guide"] == {"rules": "synthetic rules"}
@@ -200,7 +208,7 @@ def test_legacy_migration_freezes_effective_defaults_and_preserves_every_group_b
 def test_versioned_legacy_database_without_tables_is_not_treated_as_fresh(tmp_path, admin, version):
     with sqlite3.connect(database_path(tmp_path)) as db:
         db.execute(f"PRAGMA user_version={version}")
-    assert CommunityService(tmp_path).defaults(admin) == {"values": LEGACY, "settings": LEGACY, "revision": 0}
+    assert CommunityService(tmp_path).defaults(admin) == {"values": LEGACY, "settings": LEGACY_SETTINGS, "revision": 0}
 
 
 @pytest.mark.parametrize("raw", [
@@ -222,7 +230,7 @@ def test_damaged_legacy_group_remains_local_to_that_group_after_migration(tmp_pa
     with sqlite3.connect(path) as db:
         before_groups = db.execute("SELECT * FROM groups ORDER BY scope").fetchall()
     service = CommunityService(tmp_path)
-    assert service.state(replace(admin, scope="qq_group:healthy"))["settings"] == {**LEGACY, "welcome_enabled": False}
+    assert service.state(replace(admin, scope="qq_group:healthy"))["settings"] == {**LEGACY_SETTINGS, "welcome_enabled": False}
     with pytest.raises(ValueError):
         service.state(replace(admin, scope="qq_group:damaged"))
     with sqlite3.connect(path) as db:
@@ -281,9 +289,9 @@ def test_concurrent_initializers_agree_and_migrate_only_once(tmp_path, admin, in
 
     with ThreadPoolExecutor(max_workers=6) as pool:
         results = list(pool.map(initialize, range(6)))
-    expected = {**LEGACY, "response_policy_enabled": True} if initial == "legacy" else FACTORY
+    values = {**LEGACY, "response_policy_enabled": True} if initial == "legacy" else {}
     revision = 8 if initial == "legacy" else 0
-    assert results == [{"settings": expected, "values": expected if initial == "legacy" else {}, "revision": revision}] * 6
+    assert results == [{"settings": {**FACTORY, **values}, "values": values, "revision": revision}] * 6
     assert database_snapshot(database_path(tmp_path))[0] == 3
 
 
@@ -291,11 +299,11 @@ def test_old_and_new_instances_keep_independent_values_across_migration_and_rest
     legacy_database(tmp_path / "old", 2, {"response_policy_enabled": False, "merge_window_sec": 0})
     old = CommunityService(tmp_path / "old")
     fresh = CommunityService(tmp_path / "fresh")
-    assert old.defaults(admin)["settings"] == LEGACY
+    assert old.defaults(admin)["settings"] == LEGACY_SETTINGS
     assert fresh.defaults(admin)["settings"] == FACTORY
     fresh.update_defaults(admin, {"values": {"response_policy_enabled": False}, "expected_revision": 0})
     old.update_defaults(admin, {"values": {"response_policy_enabled": True}, "expected_revision": 8})
-    assert CommunityService(tmp_path / "old").defaults(admin)["settings"] == {**LEGACY, "response_policy_enabled": True}
+    assert CommunityService(tmp_path / "old").defaults(admin)["settings"] == {**LEGACY_SETTINGS, "response_policy_enabled": True}
     assert CommunityService(tmp_path / "fresh").defaults(admin)["settings"] == {**FACTORY, "response_policy_enabled": False}
 
 
@@ -327,7 +335,7 @@ def test_retired_topic_fields_do_not_change_active_values_or_legacy_group_bytes(
     with sqlite3.connect(path) as db:
         original_group = db.execute("SELECT * FROM groups").fetchone()
     service = CommunityService(tmp_path)
-    assert service.defaults(admin)["settings"] == LEGACY
+    assert service.defaults(admin)["settings"] == LEGACY_SETTINGS
     state = service.state(replace(admin, scope="qq_group:kept"))
     assert state["overrides"] == {"response_policy_enabled": True}
     assert state["revision"] == 9 and "topic_enabled" not in state["settings"]
@@ -374,7 +382,7 @@ def test_single_field_reset_does_not_create_an_invalid_pair_in_migrated_defaults
         service.update_defaults(admin, {"reset_fields": ["merge_window_sec"], "expected_revision": 8})
     assert database_snapshot(path) == before
     reset = service.update_defaults(admin, {"reset_fields": ["merge_window_sec", "merge_max_wait_sec"], "expected_revision": 8})
-    assert reset["settings"] == {**LEGACY, "merge_window_sec": 8, "merge_max_wait_sec": 10}
+    assert reset["settings"] == {**LEGACY_SETTINGS, "merge_window_sec": 8, "merge_max_wait_sec": 10}
 
 
 class InitializationClock:

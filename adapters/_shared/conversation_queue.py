@@ -39,12 +39,19 @@ class ConversationQueue(Generic[Item]):
         *,
         identity_of: Callable[[Item], Hashable | None],
         merge: Callable[[Item, Item], None],
-    ) -> None:
-        """排进队尾；同会话里还没开始的那件合并身份相同，就合进那件。
+        discard: Callable[[Item, Item], bool] | None = None,
+    ) -> bool:
+        """排进队尾；同会话里还没开始的那件合并身份相同，就合进那件。返回 False 表示这件被丢弃了。
 
         身份持锁现算：它可能读权限这类随时会变的状态，得和合并判定落在同一刻。身份为 None 不参与合并。
+        discard(排着的那件, 新来的) 对同会话里任何一件还没开始的说真，新来的就不排也不合并；判定同样持锁，
+        和合并看到的是同一份队列。
         """
         async with self._condition:
+            if discard is not None and any(
+                queued_key == key and discard(queued, item) for queued_key, queued in self._items
+            ):
+                return False
             identity = identity_of(item)
             entry = self._open.get(key)
             if entry is not None and identity is not None and entry[1] == identity:
@@ -53,6 +60,7 @@ class ConversationQueue(Generic[Item]):
                 self._items.append((key, item))
                 self._open[key] = (item, identity)
             self._condition.notify()
+            return True
 
     async def take(self, should_exit: Callable[[], bool]) -> tuple[Hashable, Item] | None:
         """取最早一件会话空闲的并把会话标成处理中。should_exit 持锁判定，为真返回 None。"""

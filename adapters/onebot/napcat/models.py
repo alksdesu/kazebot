@@ -126,6 +126,27 @@ class QueueReplyWaiter:
 
 
 @dataclass(frozen=True)
+class AcceptedTrigger:
+    """一条群消息被接下时的来源和主动回复戳。戳是 None 表示没记主动回复（被直接叫到的不记）。"""
+
+    source: str = ""
+    proactive_stamp: float | None = None
+
+
+@dataclass(frozen=True)
+class RecordedInbound:
+    """一条已经写进群历史的群消息。安静等待到点后要回它时直接用这份，不再重记一遍、重下一遍附件。
+
+    seq 是它在群历史里的序号，0 表示正文为空没有记。
+    """
+
+    seq: int
+    text: str
+    attachments: List[Dict[str, Any]]
+    errors: List[str]
+
+
+@dataclass(frozen=True)
 class ForwardSource:
     """一张转发卡片的来源。forward_id 要调接口拉，inline 是上报里直接内嵌的子消息。"""
 

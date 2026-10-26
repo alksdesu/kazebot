@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 from pathlib import Path
 from types import MappingProxyType
@@ -27,6 +28,7 @@ from .live_config import (
     SOURCE_GLOBAL,
     TRIGGER_MODE,
     TRISTATE_BOOL,
+    WORD_INPUT_RULE,
     WORD_LIST,
     Coercer,
     LiveConfig,
@@ -34,7 +36,9 @@ from .live_config import (
     float_in,
     int_in,
 )
-from .trigger_policy import LEGACY_ALL_MODES, LEGACY_PREFIX_MODES
+from .trigger_policy import LEGACY_ALL_MODES, LEGACY_PREFIX_MODES, TRIGGER_SOURCE_NAMES
+
+logger = logging.getLogger(__name__)
 
 FEATURES_CONFIG_PATH = "config/features.yaml"
 # 测试和非常规部署改位置用，和各平台配置文件的路径覆盖一个意思。
@@ -50,6 +54,25 @@ def _overridable(name: str, path: str, coerce: Coercer, default: Any, **extra: A
 def _global_only(name: str, path: str, coerce: Coercer, default: Any, **extra: Any) -> LiveKey:
     # 图库这台机器上的实例共用一份，平台页各设一个上限说不通。
     return LiveKey(name, path, coerce, default, layers=GLOBAL_ONLY, **extra)
+
+
+def _known_sources(words: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(word.lower() for word in words if word.lower() in TRIGGER_SOURCE_NAMES))
+
+
+def _coerce_trigger_sources(raw: Any, default: Any) -> tuple[str, ...]:
+    """触发来源列表。认不出的词丢掉并告警；整张表都认不出多半是写错了，退回默认值。"""
+    words = WORD_LIST(raw, default)
+    known = _known_sources(words)
+    unknown = [word for word in words if word.lower() not in TRIGGER_SOURCE_NAMES]
+    if unknown:
+        logger.warning("live config: unknown trigger sources %s ignored", unknown)
+        if not known:
+            return _known_sources(WORD_LIST(default, default))
+    return known
+
+
+TRIGGER_SOURCE_LIST = Coercer(_coerce_trigger_sources, input_rule=WORD_INPUT_RULE)
 
 
 FEATURE_KEYS: tuple[LiveKey, ...] = (
@@ -160,10 +183,58 @@ FEATURE_KEYS: tuple[LiveKey, ...] = (
         note="被 @ 时无视冷却；关掉会让用户直接叫 bot 却被静默忽略",
         ui=toggle("被 @ 时无视冷却", "有人直接叫 bot，就不该被静默忽略。"),
     ),
+    # 在场 / 离场。只对开了意愿判断或社区回复策略的群起作用，社区设置里还能按群改开关和离场概率。
+    _overridable(
+        "presence_enabled", "trigger.presence.enabled", BOOL, False,
+        note="被叫到或刚说过话算在场：在场时等群里安静了只判最后一条，离场时先过概率门再问模型",
+        ui=toggle(
+            "在场 / 离场",
+            "被叫到或刚说过话就算在场。在场时等群里安静下来只判最后一条；离场时先过概率门，掷中了才问模型。",
+        ),
+    ),
+    _overridable(
+        "presence_window_sec", "trigger.presence.window_sec", float_in(min_value=0.0, max_value=3600.0), 90.0,
+        note="最后一次进场之后这么久没有新的进场事件就离场。0 = 一直离场",
+        ui=number("在场持续", step=10, unit="秒"),
+    ),
+    _overridable(
+        "absent_judge_probability", "trigger.presence.absent_judge_probability",
+        float_in(min_value=0.0, max_value=1.0), 0.1,
+        note="离场时每条非显式消息去问模型的概率；随机插话开着时取两者里大的",
+        ui=percent("离场时去问模型"),
+    ),
+    _overridable(
+        "quiet_wait_sec", "trigger.quiet.wait_sec", float_in(min_value=0.0, max_value=120.0), 4.0,
+        note="在场时每来一条重新计时，这么久没人说话就把最后一条交给模型",
+        ui=number("安静多久算停", step=0.5, unit="秒"),
+    ),
+    _overridable(
+        "quiet_max_wait_sec", "trigger.quiet.max_wait_sec", float_in(min_value=0.0, max_value=600.0), 20.0,
+        note="群里一直有人说话时最长等这么久",
+        ui=number("最长等", unit="秒"),
+    ),
+    _overridable(
+        "proactive_max_replies", "trigger.proactive.max_replies", int_in(min_value=0, max_value=100), 3,
+        note="没人叫 bot 时的回复次数上限，被叫到不受限。0 = 不限",
+        ui=number("主动回复最多", unit="次"),
+    ),
+    _overridable(
+        "proactive_window_sec", "trigger.proactive.window_sec", float_in(min_value=1.0, max_value=86400.0), 300.0,
+        ui=number("统计时长", step=30, unit="秒"),
+    ),
     # 输出
     _overridable(
         "reply_to_trigger", "output.reply_to_trigger", BOOL, True,
         ui=toggle("引用原消息", "回复时引用触发它的那条消息，群里热闹时能看清在回谁。"),
+    ),
+    _overridable(
+        "reply_to_trigger_sources", "output.reply_to_trigger_sources", TRIGGER_SOURCE_LIST, "at,reply,prefix,name",
+        note="哪些触发来源的回复要引用并 @ 对方：at、reply、prefix、name、keyword、random、llm_intent、all",
+        ui=word_list(
+            "这些来源才引用",
+            empty="一个来源都没有，群里触发的回复都不引用",
+            placeholder="输入来源名，回车添加",
+        ),
     ),
     _overridable(
         "history_text_limit", "output.history_text_limit", int_in(min_value=50), 400,

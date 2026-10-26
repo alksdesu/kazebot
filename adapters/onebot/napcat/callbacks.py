@@ -10,7 +10,7 @@ from ..live_config import live
 from adapters._shared.send_guard import OutboundSendContext, SendContractError, context_from_sources
 from clonoth_sdk import ChildTaskState, MainTaskState, TriggerInfo
 
-from . import approval, common, history, outbound_attachments, permissions, proactive, queueing, routing, sending, state
+from . import approval, common, history, inbound, outbound_attachments, permissions, proactive, queueing, routing, sending, state
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
@@ -33,6 +33,9 @@ class TangQiuCallbacks:
     ) -> None:
         """发送主节点最终回复。"""
         platform_data = trigger.platform_data
+        if getattr(delivery_context, "no_reply", False):
+            self._settle_no_reply(trigger)
+            return
         bot = platform_data.get("bot") or queueing._get_fallback_bot()
         target = queueing._target_from_platform_data(platform_data) or queueing._target_from_conversation_key(trigger.conversation_key)
         if not bot:
@@ -69,6 +72,19 @@ class TangQiuCallbacks:
             source_attachments=source_attachments,
             send_context=send_context,
         )
+        sending._mark_qq_reply_finished(trigger.inbound_seq)
+
+    @staticmethod
+    def _settle_no_reply(trigger: TriggerInfo) -> None:
+        """模型选择了不发言：什么也不发，不记 bot 回复也不算进场。
+
+        记下的那笔主动回复退回去；队列里等这一轮回复的照常放行，不能干等到超时。
+        """
+        platform_data = trigger.platform_data
+        platform_data["_qq_final_reply_sent"] = True
+        if platform_data.get("type") == "group" and platform_data.get("group_id") is not None:
+            inbound._refund_proactive(platform_data["group_id"], platform_data.get("_proactive_stamp"))
+        common.logger.info("QQ reply skipped: the task chose not to speak conversation=%s", trigger.conversation_key)
         sending._mark_qq_reply_finished(trigger.inbound_seq)
 
     async def send_reply_attachment(self, session_id: str, path: str, *args: Any, **kwargs: Any) -> None:

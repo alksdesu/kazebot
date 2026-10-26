@@ -15,9 +15,10 @@ from adapters._shared.aliases import AliasBook
 from adapters._shared.approvals import ApprovalBook
 from adapters._shared.conversation_queue import ConversationQueue
 from adapters._shared.history_window import ClearBarriers, HistoryWindows
+from adapters._shared.quiet_wait import QuietWaitScheduler
 from adapters._shared.recent_keys import RecentKeys
 from adapters._shared.sticker_delivery import ConversationLocks
-from adapters._shared.trigger_policy import CooldownState, TriggerDecision
+from adapters._shared.trigger_policy import CooldownState, PresenceState, TriggerDecision
 from adapters._shared.user_profiles import ProfileFile
 from platforms.builtin import QQ_NAPCAT
 from stickers.combat import CombatTracker
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
     from adapters._shared.feature_gateway import FeatureGateway
     from .napcat.callbacks import TangQiuCallbacks
     from .napcat.models import (
+        AcceptedTrigger,
         GroupContentRecord,
         QueuedInbound,
         QueueReplyWaiter,
@@ -188,7 +190,12 @@ class OneBotAdapter:
         # ---- 触发判定 ----
         # 触发冷却。进程内内存：重启之后继续静默毫无道理，窗口本来就是秒级的。
         self.trigger_cooldown = CooldownState()
+        # 在场 / 离场、主动回复次数和安静等待，同样只放内存。
+        self.trigger_presence = PresenceState()
+        self.quiet_waits = QuietWaitScheduler(self.trigger_presence)
         self.trigger_decisions: "OrderedDict[tuple[str, ...], TriggerDecision]" = OrderedDict()
+        # 显式信号那条 rule 接下的消息：触发来源和主动回复戳，handler 按消息身份取走。
+        self.accepted_triggers: "OrderedDict[tuple[str, ...], AcceptedTrigger]" = OrderedDict()
         self.auto_like_today: Dict[int, str] = {}
         # (账号, 会话, message_id)：OneBot 重连补发的同一条消息只处理一次。
         self.delivered_messages: RecentKeys[tuple[str, str, str]] = RecentKeys(

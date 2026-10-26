@@ -430,3 +430,35 @@ class TestNamingAndChannel:
 
         session_id = state.conversation_map["tg_group:abc"]
         assert state.sessions[session_id].channel == "tg_group"
+
+
+class TestTheSituation:
+    """适配层报来的此刻状态渲染成【当前状态】一节，放在待判定那一条前面；没报或报坏了就和原来一样。"""
+
+    @staticmethod
+    def _instruction(tmp_path: Path, **extra: Any) -> str:
+        state = _make_state(tmp_path)
+        response = _judge(_app(state, tmp_path), state, _body(**extra))
+        assert response.status_code == 200, response.text
+        return next(t for t in state.tasks.values() if t.input.get("_reply_intent")).input["instruction"]
+
+    def test_the_situation_reaches_the_instruction(self, tmp_path: Path) -> None:
+        instruction = self._instruction(tmp_path, situation={
+            "presence": "present", "since_bot_spoke_sec": 30, "merged_messages": 3,
+            "proactive_recent": 1, "proactive_window_sec": 300, "proactive_limit": 3, "trigger_source": "llm_intent",
+        })
+
+        assert "【当前状态】" in instruction
+        assert instruction.index("【最近的群聊】") < instruction.index("【当前状态】") < instruction.index("【待判定的这一条】")
+        assert "bot 现在在场" in instruction
+        assert "30 秒前" in instruction
+        assert "3 条新消息" in instruction
+        assert "主动插话 1 次（上限 3 次）" in instruction
+        assert "没人直接叫 bot" in instruction
+
+    def test_without_a_situation_the_instruction_is_unchanged(self, tmp_path: Path) -> None:
+        assert "【当前状态】" not in self._instruction(tmp_path)
+
+    @pytest.mark.parametrize("situation", ["在场", ["present"], {"presence": "maybe", "trigger_source": "teleport"}])
+    def test_a_malformed_situation_is_left_out(self, tmp_path: Path, situation: Any) -> None:
+        assert "【当前状态】" not in self._instruction(tmp_path, situation=situation)

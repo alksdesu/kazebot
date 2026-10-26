@@ -25,9 +25,11 @@ def preempt_candidates(
 
     trigger_of 只能给这条任务自己登记的触发：查不到就不接，拿会话里别的触发顶上等于把消息注进别人的任务。
     群聊里多人共用一个会话键：确认不了是同一个人发的就不接，免得一个人打断另一个人的任务。
-    响应方式变了也不接，那是另一件事。
+    响应方式变了也不接，那是另一件事。主动插话的那件也不接直接找 bot 的消息：那一轮 engine 仍当它是插话，
+    可以选择不发言，接进去的正式请求就没人回了。
     """
     current_action = route_hints.get("response_action", "reply")
+    current_purpose = route_hints.get("delivery_purpose", "direct")
     for task in running_tasks:
         if not task.task_id or not task.is_user_entry:
             continue
@@ -36,5 +38,7 @@ def preempt_candidates(
             continue
         previous = route_hints_of(trigger)
         if previous.get("response_action", "reply") != current_action:
+            continue
+        if previous.get("delivery_purpose", "direct") == "ambient" and current_purpose != "ambient":
             continue
         yield task, trigger

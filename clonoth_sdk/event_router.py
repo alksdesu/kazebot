@@ -259,6 +259,7 @@ class EventRouter:
             purpose=EventRouter._delivery_purpose(payload),
             feature_delivery_id=str(payload.get("delivery_id") or ""),
             reply_message_id=str(payload.get("reply_message_id") or ""),
+            action_type=str(payload.get("action_type") or ""),
         )
 
     async def _invoke_callback(
@@ -640,6 +641,7 @@ class EventRouter:
                 purpose=self._delivery_purpose(event.payload),
                 feature_delivery_id=str(event.payload.get("delivery_id") or ""),
                 reply_message_id=str(event.payload.get("reply_message_id") or ""),
+                action_type=str(event.payload.get("action_type") or ""),
             )
             if reminder_delivery:
                 status = await self._client.request_feature(
@@ -1107,6 +1109,7 @@ class EventRouter:
             idempotency_key=OutboundStore.stable_key(
                 event.event_id, event.seq, event.type,
             ),
+            action_type=str(p.get("action_type") or ""),
         )
         text = strip_protocol_markers((p.get("text") or "").strip())
         attachments = p.get("attachments") if isinstance(p.get("attachments"), list) else []

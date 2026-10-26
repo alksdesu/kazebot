@@ -39,7 +39,7 @@ def registry(tmp_path: Path) -> ToolRegistry:
 
 def test_the_pseudo_tool_roster_is_the_one_the_engine_injects() -> None:
     assert PSEUDO_TOOL_NAMES == frozenset(
-        {"finish", "ask", "reply", "switch_node", "compact_context", "preempt_task", "update_todos"}
+        {"finish", "ask", "reply", "switch_node", "compact_context", "preempt_task", "update_todos", "stay_silent"}
     )
     assert DISPATCH_TOOL_PREFIX == "dispatch_to_"
 
@@ -193,6 +193,7 @@ def _create_tool(registry: ToolRegistry, workspace_root: Path, name: str) -> dic
     ("read_file", _BUILTIN_REASON),
     ("create_reminder", _BUILTIN_REASON),
     ("finish", _PSEUDO_REASON),
+    ("stay_silent", _PSEUDO_REASON),
     ("dispatch_to_scout", _PSEUDO_REASON),
     ("dispatch_to_", _PSEUDO_REASON),
 ])

@@ -35,6 +35,8 @@ log = logging.getLogger(__name__)
 
 # 让任务就此结束的动作。dispatch 不在其中：派出去的子任务回来后同一个任务还会接着跑。
 _TASK_END_ACTIONS = frozenset({"finish", "ask", "fail", "cancelled", "preempted"})
+# 和 engine/inference/pseudo_tools.py 的 NO_REPLY_MARKER 一致；在这里导入 engine.inference 会把整个推理循环拉进来
+OUTBOUND_NO_REPLY = "no_reply"
 
 
 class BranchFinalizeDeferred(RuntimeError):
@@ -1947,7 +1949,8 @@ class TaskRouterMixin:
             session_id=_route_sid, text=text,
             attachments=atts, source_inbound_seq=task.source_inbound_seq,
             node_id=task.node_id,
-            action_type=action_type,
+            # engine 的不发言结果只有这个标记，出站消息照它标出来，适配层据此什么也不发
+            action_type=OUTBOUND_NO_REPLY if fallback_result.get(OUTBOUND_NO_REPLY) is True else action_type,
             llm_request_id=str(task.result.get("llm_request_id") or "").strip(),
             delivery_id=task.delivery_id,
             route_hints=(task.input.get("task_context") or {}).get("route_hints"),

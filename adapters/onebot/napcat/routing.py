@@ -37,6 +37,8 @@ def _purge_account_scoped_caches() -> None:
     state._adapter.echo_last.clear()
     state._adapter.group_member_cache.clear()
     state._adapter.trigger_cooldown.forget_all()
+    state._adapter.quiet_waits.cancel_all()
+    state._adapter.trigger_presence.forget_all()
 
 
 def _adopt_bot_scope(bot: Any) -> None:

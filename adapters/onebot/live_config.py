@@ -177,6 +177,13 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
     adopt("cooldown_group_sec"),
     adopt("cooldown_user_sec"),
     adopt("cooldown_exempt_at"),
+    adopt("presence_enabled"),
+    adopt("presence_window_sec"),
+    adopt("absent_judge_probability"),
+    adopt("quiet_wait_sec"),
+    adopt("quiet_max_wait_sec"),
+    adopt("proactive_max_replies"),
+    adopt("proactive_window_sec"),
     # 输出格式
     LiveKey(
         "strip_asterisk_styles", "output.strip_asterisk_styles", BOOL, True,
@@ -191,6 +198,7 @@ LIVE_KEYS: tuple[LiveKey, ...] = (
         ui=toggle("去掉下划线强调", "下划线同理。但代码和文件名里常有下划线，默认不动。"),
     ),
     adopt("reply_to_trigger", env=("ONEBOT_REPLY_TO_TRIGGER",)),
+    adopt("reply_to_trigger_sources"),
     LiveKey(
         "message_limit", "output.message_limit", int_in(min_value=500), 4300,
         env=("ONEBOT_QQ_MESSAGE_LIMIT",),
