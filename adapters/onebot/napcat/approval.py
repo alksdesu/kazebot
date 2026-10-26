@@ -1,16 +1,26 @@
-"""审批卡片的渲染与反查、引用快捷审批的入口、审批命令与回执的措辞。"""
+"""审批卡片的渲染与反查、引用快捷审批的入口、审批命令与回执的措辞、免审授权的回执与收回。"""
 from __future__ import annotations
 
 import re
+from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional
 from nonebot.adapters.onebot.v11 import Bot, Event
 from adapters._shared import approvals
 from clonoth_sdk import APPROVAL_ALLOWED, APPROVAL_DENIED, APPROVAL_EXPIRED, APPROVAL_MISSING, APPROVAL_PENDING
+from clonoth_sdk.types import (
+    GRANT_NOTE_DISABLED,
+    GRANT_NOTE_NO_APPROVER,
+    GRANT_NOTE_NO_REQUESTER,
+    GRANT_NOTE_NOT_REQUESTER,
+    GRANT_NOTE_ONCE,
+    ApprovalDecision,
+)
+from platforms.builtin import QQ_NAPCAT
 from ..live_config import live
 from ..segments import normalize_message_id
 
-from . import common, message_text, permissions, sending, state
+from . import common, identity, message_text, permissions, routing, sending, state
 
 
 # 没人定案、由系统按拒绝收掉的审批（toolbox 等待超时、任务先结束了）附言里的固定说法；结构化字段里没有这一项。
@@ -56,8 +66,27 @@ _APPROVAL_UUID_RE = re.compile(
 # 引用了审批卡片但反查不出可决策目标时的回执：区别于“这就是一句普通聊天”。
 _APPROVAL_REPLY_UNRESOLVED_HINT = (
     "这条审批已不在待处理列表（可能已被处理或已超时）。"
-    "要处理其它审批请手动发送：审批 同意 <ID>。"
+    "要处理其它审批请手动发送：/审批 同意 <ID>。"
 )
+
+
+_GRANT_DURATION_HINT = (
+    "时长写法不对，这条审批没有处理。时长跟在审批 ID 后面，只认整数加单位："
+    "30m、2h、1d、45分钟、2小时；只批这一次写「单次」。\n"
+    "例：/审批 同意 <ID> 2h"
+)
+
+
+_REVOKE_HINT = "提前收回：私聊发送 /审批 收回"
+
+
+_GRANT_NOTE_TEXT: Mapping[str, str] = MappingProxyType({
+    GRANT_NOTE_ONCE: "只同意了这一次，没有生成授权。",
+    GRANT_NOTE_DISABLED: "只同意了这一次：策略的默认时长是 0，不带时长不授权；要授权就带上时长，例如「同意 30m」。",
+    GRANT_NOTE_NOT_REQUESTER: "这条请求不是你发起的，只同意了这一次，没有生成授权。",
+    GRANT_NOTE_NO_REQUESTER: "查不到这条请求是谁发起的，只同意了这一次，没有生成授权。",
+    GRANT_NOTE_NO_APPROVER: "认不出审批人的身份，只同意了这一次，没有生成授权。",
+})
 
 
 def _settled_approval_notice(approval_id: str) -> str:
@@ -149,21 +178,30 @@ def _approval_summary(approval_id: str, operation: str, details: Dict[str, Any])
     lines.extend([
         "",
         "【快捷审批】直接引用(回复)本消息，发送“同意”或“拒绝”即可。",
-        f"或手动发送：审批 同意 {approval_id}",
-        f"　　　　　审批 拒绝 {approval_id}",
+        "同意时可带时长，如「同意 2h」：你自己发起的请求，这段时间里免审批；不带按默认时长，「同意 单次」只批这一次。",
+        f"或手动发送：/审批 同意 {approval_id}",
+        f"　　　　　/审批 拒绝 {approval_id}",
     ])
     return sending._truncate_qq_text("\n".join(lines))
 
 
-def _parse_approval_command(text: str) -> Optional[tuple[str, str]]:
-    """解析管理员私聊审批命令，返回 (decision, approval_id_or_prefix)。
+def _parse_approval_command(text: str) -> Optional[approvals.ApprovalIntent]:
+    """解析管理员私聊审批命令：/审批 同意 <ID> [时长]、/同意 <ID 前缀> [时长]。
 
     引用审批卡片回一个词那条路径不经过这里，仍然免斜杠 —— 卡片在，指向就是唯一的。
     """
-    return approvals.parse_command(common._strip_command_prefix(text))
+    return approvals.parse_decision_command(common._strip_command_prefix(text))
 
 
-def _resolve_pending_approval_id(token: str) -> tuple[Optional[str], str]:
+def _is_revoke_command(text: str) -> bool:
+    """/审批 收回：收回自己名下生效中的免审授权。和审批命令一样要带斜杠。"""
+    return approvals.parse_revoke_command(common._strip_command_prefix(text))
+
+
+_DAYS_LIKE_ID_RE = re.compile(r"([0-9]+)[dD]")
+
+
+def _resolve_pending_approval_id(token: str, *, decision: str = "") -> tuple[Optional[str], str]:
     """允许管理员用完整 approval_id 或唯一前缀审批；命中已处理条目时告知而非误批。"""
     lookup = state._adapter.approvals.lookup(token)
     if lookup.outcome == approvals.LOOKUP_FOUND:
@@ -174,4 +212,77 @@ def _resolve_pending_approval_id(token: str) -> tuple[Optional[str], str]:
         return None, f"审批 ID 前缀不唯一：{lookup.token}"
     if lookup.outcome == approvals.LOOKUP_SETTLED:
         return None, _settled_approval_notice(lookup.approval_id)
+    days = _DAYS_LIKE_ID_RE.fullmatch(lookup.token)
+    if days and decision == approvals.DECISION_ALLOW:
+        # 「1d」「300d」既像 ID 前缀又像时长，按 ID 查过了；查不到就把时长该怎么写说清楚。
+        return None, (
+            f"没有找到待审批 ID：{lookup.token}。要带时长就写在 ID 后面：/审批 同意 <ID> {lookup.token}；"
+            f"不指定 ID 时把单位写成「天」，例如「同意 {days[1]}天」。"
+        )
     return None, f"没有找到待审批 ID：{lookup.token}"
+
+
+def _approver(user_id: Any) -> Dict[str, str]:
+    """提交审批决定时报给 supervisor 的审批人，认法和入站 platform_auth 一致，两边才对得上。"""
+    return {
+        "platform": QQ_NAPCAT.id,
+        "user_id": identity._verified_user_id(user_id),
+        "bot_scope": routing._active_bot_scope(),
+    }
+
+
+def _minutes_text(minutes: int) -> str:
+    if minutes and minutes % 1440 == 0:
+        return f"{minutes // 1440} 天"
+    if minutes and minutes % 60 == 0:
+        return f"{minutes // 60} 小时"
+    return f"{minutes} 分钟"
+
+
+def _local_time(moment: datetime) -> str:
+    return moment.astimezone(common._CST).strftime("%Y-%m-%d %H:%M")
+
+
+def _grant_receipt(result: ApprovalDecision, requested_minutes: Optional[int]) -> str:
+    """同意之后授权的交代：生成了就写到期时间和怎么收回，没生成就说为什么。"""
+    grant = result.grant
+    if grant is None or grant.until is None:
+        return _GRANT_NOTE_TEXT.get(result.grant_note, "")
+    lines = [f"已授权到 {_local_time(grant.until)}：这段时间里你发起的操作免审批，敏感操作也一样。"]
+    if requested_minutes is not None and grant.minutes < requested_minutes:
+        lines.append(f"要的时长超过了上限，按上限 {_minutes_text(grant.minutes)}授权。")
+    if grant.issued_at is not None and grant.until > grant.issued_at + timedelta(minutes=grant.minutes):
+        lines.append("你原有的授权到期更晚，到期时间沿用原来的。")
+    lines.append(_REVOKE_HINT)
+    return "\n".join(lines)
+
+
+def _decision_receipt(
+    approval_id: str, decision: str, operation: Any, result: ApprovalDecision, requested_minutes: Optional[int],
+) -> str:
+    lines = [
+        f"已{('同意' if decision == approvals.DECISION_ALLOW else '拒绝')}审批：{approval_id}",
+        f"操作：{operation or 'unknown'}",
+    ]
+    if decision == approvals.DECISION_ALLOW:
+        grant_text = _grant_receipt(result, requested_minutes)
+        if grant_text:
+            lines.append(grant_text)
+    return "\n".join(lines)
+
+
+def _revoke_receipt(count: int) -> str:
+    if count:
+        return f"已收回你名下 {count} 条生效中的授权，之后你发起的操作照常审批。"
+    return "你名下没有生效中的授权。"
+
+
+async def _revoke_own_grants(user_id: Any) -> str:
+    """收回本人名下生效中的授权，返回回执。"""
+    try:
+        revoked = await state._adapter.client.revoke_approval_grants(identity=_approver(user_id))
+    except Exception as exc:
+        common.logger.exception("revoke approval grants on QQ failed: admin=%s", user_id)
+        return f"收回授权失败：{exc}"
+    common.logger.info("approval grants revoked on QQ: admin=%s count=%s", user_id, len(revoked))
+    return _revoke_receipt(len(revoked))

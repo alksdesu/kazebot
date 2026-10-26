@@ -41,6 +41,9 @@ from .types import (
     AppConfigPublic,
     Approval,
     ApprovalDecisionIn,
+    ApprovalGrantListOut,
+    ApprovalGrantRevokeIn,
+    ApprovalGrantRevokeOut,
     ApprovalRequestIn,
     ConfigReloadOut,
     Event,
@@ -1610,10 +1613,37 @@ def create_app(
         # 这个端点能批准写源码、改 policy、重启；:8765 只绑回环不等于同机进程都可信。
         verify_admin_token(request)
         st: SupervisorState = app.state.state
-        a = st.decide_approval(approval_id=approval_id, decision=body.decision, comment=body.comment)
+        a = await run_in_threadpool(
+            st.decide_approval,
+            approval_id=approval_id,
+            decision=body.decision,
+            comment=body.comment,
+            approver=body.approver.model_dump() if body.approver is not None else None,
+            grant_minutes=body.grant_minutes,
+        )
         if a is None:
             raise HTTPException(status_code=404, detail="approval not found")
         return a
+
+    @app.get("/v1/approval-grants", response_model=ApprovalGrantListOut)
+    async def approval_grants_list(request: Request) -> ApprovalGrantListOut:
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        return ApprovalGrantListOut(grants=await run_in_threadpool(st.list_approval_grants))
+
+    @app.post("/v1/approval-grants/revoke", response_model=ApprovalGrantRevokeOut)
+    async def approval_grants_revoke(body: ApprovalGrantRevokeIn, request: Request) -> ApprovalGrantRevokeOut:
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        try:
+            revoked = await run_in_threadpool(
+                st.revoke_approval_grants,
+                grant_id=body.grant_id or "",
+                identity=body.identity.model_dump() if body.identity is not None else None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return ApprovalGrantRevokeOut(revoked=revoked, count=len(revoked))
 
     @app.post("/v1/ops/request", response_model=OpRequestOut)
     def ops_request(inp: OpRequestIn, request: Request) -> OpRequestOut:

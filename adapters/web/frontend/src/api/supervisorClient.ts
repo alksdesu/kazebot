@@ -623,6 +623,12 @@ export interface PolicyRuleSection {
   rules: PolicyRule[];
 }
 
+/** 同意自己发起的审批时，给自己授权多久免审，单位分钟。 */
+export interface ApprovalGrantSettings {
+  default_minutes: number;
+  max_minutes: number;
+}
+
 export interface PolicyDoc {
   version?: number;
   extra_roots?: string[];
@@ -635,6 +641,7 @@ export interface PolicyDoc {
     sensitive_path_patterns?: string[];
   };
   restart?: { default: PolicyDecision };
+  approval_grant?: ApprovalGrantSettings;
 }
 
 /** 策略连同它出自的那一版文件的指纹。 */

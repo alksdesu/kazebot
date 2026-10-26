@@ -16,7 +16,7 @@ from nonebot.adapters.onebot.v11 import (
     PrivateMessageEvent,
 )
 from nonebot.rule import Rule
-from adapters._shared.approvals import parse_reply_verb
+from adapters._shared.approvals import DECISION_ALLOW, parse_reply_decision
 from adapters._shared.echo_policy import EchoEntry, detect_echo, is_echoable_text
 from adapters._shared.trigger_policy import TriggerConfig, resolve_llm_intent
 from ..echo_rules import QQ_ECHO_RULES
@@ -530,21 +530,27 @@ async def _handle_intent(bot: Bot, event: GroupMessageEvent) -> None:
 _private_matcher = on_message(rule=Rule(permissions._private_message_rule), priority=10, block=True)
 
 
-async def _finish_approval_decision(user_id: int, approval_id: str, decision: str) -> None:
+async def _finish_approval_decision(
+    user_id: int, approval_id: str, decision: str, *, grant_minutes: int | None = None,
+) -> None:
     """提交审批决策并结束当前私聊处理（末尾总会抛出 FinishedException）。
 
-    同时服务于“引用回复审批”和“手输审批命令”两个入口，避免重复代码。
+    同时服务于“引用回复审批”“手输审批命令”和裸动词唯一匹配三个入口，避免重复代码。
+    grant_minutes 是同意时带的时长：None 按策略默认，0 只批这一次。
     """
     book = state._adapter.approvals
     # 先摘走再提交：多个管理员同时决策时只有抢到的人能提交。
     info = await book.claim(approval_id, user_id, decision)
     if info is None:
         await _private_matcher.finish(approval._settled_approval_notice(approval_id))
+    requested_minutes = grant_minutes if decision == DECISION_ALLOW else None
     try:
         result = await state._adapter.client.decide_approval(
             approval_id,
             decision=decision,
             comment=f"QQ admin {user_id} {decision}ed via private message.",
+            approver=approval._approver(user_id),
+            grant_minutes=requested_minutes,
         )
     except Exception as exc:
         await book.release(approval_id, info)
@@ -562,11 +568,11 @@ async def _finish_approval_decision(user_id: int, approval_id: str, decision: st
         )
         await _private_matcher.finish(approval._decision_not_effective_notice(approval_id, result.status))
     common.logger.info(
-        "approval decided on QQ: id=%s decision=%s admin=%s", approval_id, decision, user_id,
+        "approval decided on QQ: id=%s decision=%s admin=%s grant=%s",
+        approval_id, decision, user_id, result.grant.grant_id if result.grant else result.grant_note or "-",
     )
     await _private_matcher.finish(
-        f"已{('同意' if decision == 'allow' else '拒绝')}审批：{approval_id}\n"
-        f"操作：{info.get('operation') or 'unknown'}"
+        approval._decision_receipt(approval_id, decision, info.get("operation"), result, requested_minutes)
     )
 
 
@@ -595,8 +601,8 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     user_text = (await message_text._event_text_with_forward(bot, event)).strip() or "你好"
 
     # 裸发“同意”不是审批意图：必须引用 bot 发出的审批卡片才认。
-    reply_verb = parse_reply_verb(user_text)
-    if reply_verb is not None:
+    reply_intent = parse_reply_decision(user_text)
+    if reply_intent is not None:
         target = await approval._resolve_approval_reply_target(bot, event)
         if target.matched():
             if not permissions._can("approval", event):
@@ -610,7 +616,10 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
                 if target.settled_id:
                     await _private_matcher.finish(approval._settled_approval_notice(target.settled_id))
                 if target.approval_id:
-                    await _finish_approval_decision(user_id, target.approval_id, reply_verb)
+                    await _finish_approval_decision(
+                        user_id, target.approval_id, reply_intent.decision,
+                        grant_minutes=reply_intent.grant_minutes,
+                    )
                 await _private_matcher.finish(approval._APPROVAL_REPLY_UNRESOLVED_HINT)
 
     approval_command = approval._parse_approval_command(user_text)
@@ -623,26 +632,44 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
                 await _private_matcher.finish(denial)
             # denial is None：当作没有这个命令，往下走普通聊天。
         else:
-            decision, approval_token = approval_command
-            approval_id, error = approval._resolve_pending_approval_id(approval_token)
+            if approval_command.duration_error:
+                await _private_matcher.finish(approval._GRANT_DURATION_HINT)
+            approval_id, error = approval._resolve_pending_approval_id(
+                approval_command.token, decision=approval_command.decision,
+            )
             if not approval_id:
                 await _private_matcher.finish(error)
-            await _finish_approval_decision(user_id, approval_id, decision)
+            await _finish_approval_decision(
+                user_id, approval_id, approval_command.decision, grant_minutes=approval_command.grant_minutes,
+            )
+
+    if approval._is_revoke_command(user_text):
+        if not permissions._can("approval", event):
+            denial = permissions._capability_denial(
+                "approval", event, "你不是 Clonoth 审批管理员，没有可收回的授权。",
+            )
+            if denial is not None:
+                await _private_matcher.finish(denial)
+            # denial is None：当作没有这个命令，往下走普通聊天。
+        else:
+            await _private_matcher.finish(await approval._revoke_own_grants(user_id))
 
     # 裸动词只有在本人确实有待审批时才拦截；没有待审批仍是普通聊天。
     # 关闭唯一匹配开关时也要给出明确提示，不能静默把「同意」送进普通 Agent。
     bare_text = common._strip_command_prefix(user_text) or user_text
-    bare_verb = parse_reply_verb(bare_text)
-    if bare_verb is not None and permissions._can("approval", event):
+    bare_intent = parse_reply_decision(bare_text)
+    if bare_intent is not None and permissions._can("approval", event):
         pending_count = state._adapter.approvals.pending_count_for(user_id)
         if live.approval_bare_verb_unique:
             unique_id = state._adapter.approvals.unique_pending_for(user_id)
             if unique_id:
-                await _finish_approval_decision(user_id, unique_id, bare_verb)
+                await _finish_approval_decision(
+                    user_id, unique_id, bare_intent.decision, grant_minutes=bare_intent.grant_minutes,
+                )
         if pending_count > 0:
             await _private_matcher.finish(
                 "这条私聊有待审批，但无法安全确定目标。请引用审批卡片回复，"
-                "或发送：/审批 同意 <ID>。"
+                "或发送：/审批 同意 <ID>（后面可以加时长，如 2h）。"
             )
 
     # 命令顺序与群侧一致：清记忆 / 死信 / 切模型在私聊里只有名单能用，而名单恒过闸门。

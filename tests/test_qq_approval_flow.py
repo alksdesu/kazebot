@@ -92,14 +92,14 @@ class TestApprovalVerb:
 
     def test_one_table_feeds_both_entries(self, runtime: Any) -> None:
         for verb in approvals.ALLOW_VERBS:
-            assert runtime.approval._parse_approval_command(f"/审批 {verb} {AID}") == ("allow", AID)
+            assert runtime.approval._parse_approval_command(f"/审批 {verb} {AID}") == approvals.ApprovalIntent("allow", AID)
         for verb in approvals.DENY_VERBS:
-            assert runtime.approval._parse_approval_command(f"/审批 {verb} {AID}") == ("deny", AID)
+            assert runtime.approval._parse_approval_command(f"/审批 {verb} {AID}") == approvals.ApprovalIntent("deny", AID)
 
     def test_bare_verb_needs_id_shaped_token(self, runtime: Any) -> None:
         assert runtime.approval._parse_approval_command("/通过 微信发给我") is None
-        assert runtime.approval._parse_approval_command(f"/同意 {AID[:8]}") == ("allow", AID[:8])
-        assert runtime.approval._parse_approval_command(f"/审批 同意 {AID}") == ("allow", AID)
+        assert runtime.approval._parse_approval_command(f"/同意 {AID[:8]}") == approvals.ApprovalIntent("allow", AID[:8])
+        assert runtime.approval._parse_approval_command(f"/审批 同意 {AID}") == approvals.ApprovalIntent("allow", AID)
 
     def test_a_command_without_the_slash_is_ordinary_chat(self, runtime: Any) -> None:
         # 引用卡片那条路径仍然免斜杠，走的是 parse_reply_verb。
@@ -235,7 +235,9 @@ class TestFinishDecision:
         """supervisor 的审批回执带当前状态；status 为 None 时照这次决定生效。"""
         calls: list[tuple[str, str]] = []
 
-        async def decide_approval(aid: str, *, decision: str, comment: str = "") -> ApprovalDecision:
+        async def decide_approval(
+            aid: str, *, decision: str, comment: str = "", approver: Any = None, grant_minutes: int | None = None,
+        ) -> ApprovalDecision:
             calls.append((aid, decision))
             effective = "allowed" if decision == "allow" else "denied"
             return ApprovalDecision(aid, decision, status or effective, comment=note)
@@ -250,7 +252,9 @@ class TestFinishDecision:
         async def scenario() -> list[Any]:
             gate = asyncio.Event()
 
-            async def decide_approval(aid: str, *, decision: str, comment: str = "") -> ApprovalDecision:
+            async def decide_approval(
+                aid: str, *, decision: str, comment: str = "", approver: Any = None, grant_minutes: int | None = None,
+            ) -> ApprovalDecision:
                 calls.append((aid, decision))
                 await gate.wait()
                 return ApprovalDecision(aid, decision, "allowed" if decision == "allow" else "denied")
@@ -272,7 +276,9 @@ class TestFinishDecision:
     def test_submit_exception_rolls_back(self, wired: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         wired.state._adapter.approvals.pending[AID] = {"operation": "read_file", "created_at": time.time()}
 
-        async def decide_approval(aid: str, *, decision: str, comment: str = "") -> ApprovalDecision:
+        async def decide_approval(
+            aid: str, *, decision: str, comment: str = "", approver: Any = None, grant_minutes: int | None = None,
+        ) -> ApprovalDecision:
             raise RuntimeError("boom")
 
         monkeypatch.setattr(wired.state._adapter, "client", SimpleNamespace(decide_approval=decide_approval))

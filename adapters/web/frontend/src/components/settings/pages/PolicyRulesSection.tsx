@@ -6,6 +6,7 @@ import {
   getPolicy,
   isEditConflict,
   updatePolicy,
+  type ApprovalGrantSettings,
   type PolicyDecision,
   type PolicyDoc,
   type PolicyRule,
@@ -19,7 +20,7 @@ import { Button, DangerPanel, ErrorText, SaveBar, ScopeBadge } from './settingsC
 import { errorMessage } from '../../../api/request';
 
 type RuleSectionKey = 'read_file' | 'write_file';
-type TabKey = RuleSectionKey | 'execute_command' | 'restart';
+type TabKey = RuleSectionKey | 'execute_command' | 'restart' | 'approval_grant';
 type DecisionFilter = PolicyDecision | 'all';
 /** execute_command 下三组名单，各自是一列字符串。 */
 type CommandListKey = 'deny_patterns' | 'sensitive_patterns' | 'sensitive_path_patterns';
@@ -57,7 +58,50 @@ const TAB_META: Record<TabKey, { title: string; hint: string }> = {
   write_file: { title: '写入', hint: 'write_file / apply_diff 共用这一档。' },
   execute_command: { title: '命令', hint: 'execute_command。先过硬拦截，再看这条命令碰了哪些路径。' },
   restart: { title: '重启', hint: 'request_restart。重启会打断所有在跑的任务。' },
+  approval_grant: {
+    title: '审批授权',
+    hint: '管理员在 QQ 上同意自己发起的审批时，顺带给自己一段免审时间。同意别人发起的请求不生成授权。',
+  },
 };
+
+const GRANT_DEFAULTS: ApprovalGrantSettings = { default_minutes: 30, max_minutes: 1440 };
+// 和服务端校验的上限一致：再长就等于永久免审。
+const GRANT_MINUTES_CEILING = 525600;
+
+type GrantField = keyof ApprovalGrantSettings;
+
+const GRANT_FIELDS: Array<{ key: GrantField; label: string; hint: string; min: number }> = [
+  {
+    key: 'default_minutes',
+    label: '默认时长（分钟）',
+    hint: '同意时没写时长就按它。填 0 表示默认不授权，要授权得在同意时带上时长。',
+    min: 0,
+  },
+  {
+    key: 'max_minutes',
+    label: '时长上限（分钟）',
+    hint: `写了更长的时长也按它截断。至少 1，最多 ${GRANT_MINUTES_CEILING}（365 天）。`,
+    min: 1,
+  },
+];
+
+/** 两个时长里第一处填得不对的地方；都能保存时是 null。 */
+const grantProblem = (grant: ApprovalGrantSettings): { field: GrantField; text: string } | null => {
+  // 大到不精确的数到 1e21 起会被 JSON 写成 1e+21，服务端当成小数拒掉。
+  if (!Number.isSafeInteger(grant.default_minutes) || grant.default_minutes < 0) {
+    return { field: 'default_minutes', text: '默认时长要填 0 或正整数（分钟）。' };
+  }
+  if (!Number.isSafeInteger(grant.max_minutes) || grant.max_minutes < 1) {
+    return { field: 'max_minutes', text: '时长上限要填正整数（分钟），至少 1。' };
+  }
+  if (grant.max_minutes > GRANT_MINUTES_CEILING) {
+    return { field: 'max_minutes', text: `时长上限最多 ${GRANT_MINUTES_CEILING} 分钟（365 天）。` };
+  }
+  return null;
+};
+
+// 清空的框记成 NaN 而不是 0：存成 0 等于悄悄关掉默认授权。
+const minutesOf = (raw: string): number => (raw.trim() === '' ? Number.NaN : Number(raw));
 
 const COMMAND_LISTS: Array<{ key: CommandListKey; title: string; hint: string; placeholder: string }> = [
   {
@@ -109,6 +153,8 @@ const allAutoPolicy = (policy: PolicyDoc): PolicyDoc => ({
 
 const INPUT_CLASS =
   'min-w-0 flex-1 border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-mini text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]';
+const NUMBER_INPUT_CLASS =
+  'w-[var(--duties-input-width)] border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono text-mini text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]';
 const GHOST_BUTTON_CLASS =
   'border border-[var(--duties-border)] px-2 py-1 font-mono text-mini text-[var(--duties-secondary)] transition-colors hover:border-[var(--duties-text)] hover:text-[var(--duties-text)] disabled:opacity-40';
 const ICON_BUTTON_CLASS =
@@ -451,6 +497,56 @@ const CommandPanel = ({
   </div>
 );
 
+const GrantPanel = ({
+  section, onChange,
+}: {
+  section: ApprovalGrantSettings;
+  onChange: (next: ApprovalGrantSettings) => void;
+}) => {
+  const problem = grantProblem(section);
+  const capped = !problem && section.default_minutes > section.max_minutes;
+
+  return (
+    <div className="space-y-3">
+      <p className="text-micro leading-5 text-[var(--duties-tertiary)]">{TAB_META.approval_grant.hint}</p>
+      {GRANT_FIELDS.map((field) => (
+        <div className="flex flex-wrap items-center gap-2" key={field.key}>
+          <label className="font-mono text-mini text-[var(--duties-secondary)]" htmlFor={`approval-grant-${field.key}`}>
+            {field.label}
+          </label>
+          <input
+            aria-describedby={`approval-grant-${field.key}-hint`}
+            aria-invalid={problem?.field === field.key}
+            className={NUMBER_INPUT_CLASS}
+            id={`approval-grant-${field.key}`}
+            inputMode="numeric"
+            max={GRANT_MINUTES_CEILING}
+            min={field.min}
+            onChange={(event) => onChange({ ...section, [field.key]: minutesOf(event.target.value) })}
+            step={1}
+            type="number"
+            value={Number.isFinite(section[field.key]) ? String(section[field.key]) : ''}
+          />
+          <span className="text-micro text-[var(--duties-tertiary)]" id={`approval-grant-${field.key}-hint`}>
+            {field.hint}
+          </span>
+        </div>
+      ))}
+      {problem && <p className="text-micro text-[var(--duties-danger)]" role="alert">{problem.text}</p>}
+      {capped && (
+        <p className="text-micro text-[var(--duties-secondary)]">
+          默认时长比上限还长，保存后按上限 {section.max_minutes} 分钟算。
+        </p>
+      )}
+      <p className="text-micro leading-5 text-[var(--duties-tertiary)]">
+        在 QQ 私聊里同意时可以带时长：「同意 2h」「/审批 同意 &lt;ID&gt; 30m」，「同意 单次」只批这一次；发「/审批 收回」提前收回。
+        授权期间你发起的任务（连同派出去的子任务）原本要审批的操作直接放行，敏感操作也算；
+        拒绝规则、群成员的硬拒绝和定时任务的敏感拒绝不受影响。
+      </p>
+    </div>
+  );
+};
+
 const EMPTY_COMMAND: NonNullable<PolicyDoc['execute_command']> = { default: 'approval_required' };
 
 export const PolicyRulesSection = () => {
@@ -494,6 +590,12 @@ export const PolicyRulesSection = () => {
 
   const save = async () => {
     if (!doc || !adminToken) return;
+    const grantError = doc.approval_grant ? grantProblem(doc.approval_grant) : null;
+    if (grantError) {
+      setTab('approval_grant');
+      setError(`没有保存：${grantError.text}`);
+      return;
+    }
     const enableCodeWriteAfterSave = fullAutoPending && codeWriteRequested;
     setBusy(true);
     setMessage('');
@@ -543,6 +645,7 @@ export const PolicyRulesSection = () => {
       0,
     ),
     restart: 0,
+    approval_grant: 0,
   };
 
   const prepareFullAuto = () => {
@@ -567,6 +670,7 @@ export const PolicyRulesSection = () => {
         <p className="mt-1 text-xs leading-5 text-[var(--duties-secondary)]">
           同一条规则，谁触发结果不同：QQ 群里的非管理员一律拒绝，不看规则；QQ 管理员碰到
           「需审批」但没命中任何一条具体规则时会直接执行；定时任务没人点审批，需审批即拒绝。
+          QQ 管理员同意自己发起的审批后，一段时间里他发起的操作免审批，时长在「审批授权」里设。
         </p>
         <DangerPanel>
           <div className="min-w-0 flex-1">
@@ -655,6 +759,13 @@ export const PolicyRulesSection = () => {
               </select>
               <span className="text-micro text-[var(--duties-tertiary)]">{TAB_META.restart.hint}</span>
             </div>
+          )}
+
+          {tab === 'approval_grant' && (
+            <GrantPanel
+              onChange={(next) => setDoc({ ...doc, approval_grant: next })}
+              section={doc.approval_grant || GRANT_DEFAULTS}
+            />
           )}
 
           <SaveBar

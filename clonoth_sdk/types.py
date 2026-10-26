@@ -7,6 +7,7 @@ Phase 1 (2026-04-17): 初始创建，从 bot_adapter.py 协议交互中提取。
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 import hashlib
 from typing import Any
 
@@ -200,15 +201,79 @@ APPROVAL_MISSING = "missing"
 APPROVAL_EXPIRED = "expired"
 _STATUS_OF_DECISION = {"allow": APPROVAL_ALLOWED, "deny": APPROVAL_DENIED}
 
+# 同意了却没生成授权的原因，和 supervisor/approval_grants.py 里的同名常量一致。
+GRANT_NOTE_ONCE = "once"
+GRANT_NOTE_DISABLED = "disabled"
+GRANT_NOTE_NOT_REQUESTER = "not_requester"
+GRANT_NOTE_NO_REQUESTER = "no_requester"
+GRANT_NOTE_NO_APPROVER = "no_approver"
+
+
+def _parse_time(raw: Any) -> datetime | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        moment = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
+def _non_negative_int(raw: Any) -> int:
+    if isinstance(raw, bool):
+        return 0
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+@dataclass(frozen=True)
+class ApprovalGrant:
+    """同意审批时给审批人本人的授权：until 之前他发起的操作免审批。"""
+
+    grant_id: str
+    platform: str
+    user_id: str
+    bot_scope: str = ""
+    until: datetime | None = None
+    minutes: int = 0
+    approval_id: str = ""
+    issued_at: datetime | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ApprovalGrant | None":
+        """supervisor 回的一条授权；没有、或者缺 grant_id 时返回 None。"""
+        if not isinstance(data, dict):
+            return None
+        grant_id = str(data.get("grant_id") or "").strip()
+        if not grant_id:
+            return None
+        return cls(
+            grant_id=grant_id,
+            platform=str(data.get("platform") or "").strip(),
+            user_id=str(data.get("user_id") or "").strip(),
+            bot_scope=str(data.get("bot_scope") or "").strip(),
+            until=_parse_time(data.get("until")),
+            minutes=_non_negative_int(data.get("minutes")),
+            approval_id=str(data.get("approval_id") or "").strip(),
+            issued_at=_parse_time(data.get("issued_at")),
+        )
+
 
 @dataclass(frozen=True)
 class ApprovalDecision:
-    """POST /v1/approvals/{id} 的回执。返回的状态与本次决定一致才算这次决定生效。"""
+    """POST /v1/approvals/{id} 的回执。返回的状态与本次决定一致才算这次决定生效。
+
+    grant 是这次同意生成的授权；没生成时 grant_note 说明原因，旧版 supervisor 两项都是空的。
+    """
 
     approval_id: str
     decision: str
     status: str
     comment: str = ""
+    grant: ApprovalGrant | None = None
+    grant_note: str = ""
 
     @property
     def effective(self) -> bool:

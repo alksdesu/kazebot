@@ -35,6 +35,25 @@ class PolicyDecision:
     sensitive: bool = False
 
 
+APPROVAL_GRANT_DEFAULT_MINUTES = 30
+APPROVAL_GRANT_MAX_MINUTES = 1440
+# 再长就等于永久免审。
+APPROVAL_GRANT_MINUTES_CEILING = 365 * 24 * 60
+
+
+@dataclass(frozen=True)
+class ApprovalGrantSettings:
+    """同意审批时给审批人本人授权多久。"""
+
+    default_minutes: int = APPROVAL_GRANT_DEFAULT_MINUTES
+    max_minutes: int = APPROVAL_GRANT_MAX_MINUTES
+
+    def minutes_for(self, requested: int | None) -> int:
+        """没指定按默认，指定了按指定的，都不超过上限；0 表示不授权。"""
+        wanted = self.default_minutes if requested is None else requested
+        return max(0, min(int(wanted), self.max_minutes))
+
+
 def _entrypoint_write_rules() -> list[dict[str, str]]:
     """平台进程的入口脚本，由各平台描述声明：新平台不用来这里加一行。"""
     return [
@@ -191,6 +210,10 @@ def _default_policy_dict() -> dict[str, Any]:
         "restart": {
             "default": "approval_required",
         },
+        "approval_grant": {
+            "default_minutes": APPROVAL_GRANT_DEFAULT_MINUTES,
+            "max_minutes": APPROVAL_GRANT_MAX_MINUTES,
+        },
     }
 
 
@@ -317,6 +340,28 @@ def _validate_command_section(section: Any) -> dict[str, Any]:
     return out
 
 
+def _grant_minutes_field(section: dict[str, Any], key: str, fallback: int) -> int:
+    value = section.get(key)
+    if value is None:
+        return fallback
+    # YAML 的 true 也是 int，不能当成 1 分钟收下。
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"approval_grant.{key} 必须是非负整数，收到 {value!r}")
+    return value
+
+
+def _validate_approval_grant_section(section: Any) -> dict[str, int]:
+    if not isinstance(section, dict):
+        raise ValueError("approval_grant 必须是一个映射")
+    max_minutes = _grant_minutes_field(section, "max_minutes", APPROVAL_GRANT_MAX_MINUTES)
+    if not 1 <= max_minutes <= APPROVAL_GRANT_MINUTES_CEILING:
+        raise ValueError(
+            f"approval_grant.max_minutes 要在 1 到 {APPROVAL_GRANT_MINUTES_CEILING}（365 天）之间，收到 {max_minutes}"
+        )
+    default_minutes = _grant_minutes_field(section, "default_minutes", APPROVAL_GRANT_DEFAULT_MINUTES)
+    return {"default_minutes": min(default_minutes, max_minutes), "max_minutes": max_minutes}
+
+
 def _validate_policy_dict(data: Any) -> dict[str, Any]:
     """整份校验并规范化。宁可整体拒绝，也不要落一份半对的策略。"""
     if not isinstance(data, dict):
@@ -341,6 +386,9 @@ def _validate_policy_dict(data: Any) -> dict[str, Any]:
         if value not in _SAFETY_NAMES:
             raise ValueError(f"restart.default 只能是 {_SAFETY_HINT}，收到 {value!r}")
         out["restart"] = {"default": value}
+    grant = data.get("approval_grant")
+    if grant is not None:
+        out["approval_grant"] = _validate_approval_grant_section(grant)
     return out
 
 
@@ -378,11 +426,14 @@ def _is_public_http_url(raw: str) -> bool:
 
 # 每一段认哪些键。写错的键运行期被静默忽略，以为加上的规则其实从没生效。
 _POLICY_KEYS: dict[str, frozenset[str]] = {
-    "": frozenset({"version", "extra_roots", "read_file", "write_file", "execute_command", "restart"}),
+    "": frozenset({
+        "version", "extra_roots", "read_file", "write_file", "execute_command", "restart", "approval_grant",
+    }),
     "read_file": frozenset({"default", "rules"}),
     "write_file": frozenset({"default", "rules"}),
     "execute_command": frozenset({"default", "deny_patterns", "sensitive_patterns", "sensitive_path_patterns"}),
     "restart": frozenset({"default"}),
+    "approval_grant": frozenset({"default_minutes", "max_minutes"}),
 }
 _RULE_KEYS = frozenset({"pattern", "decision", "reason"})
 
@@ -472,6 +523,7 @@ class PolicyEngine:
         self._deny_command_patterns: list[re.Pattern[str]] = []
         self._sensitive_command_patterns: list[re.Pattern[str]] = []
         self._sensitive_path_patterns: list[tuple[re.Pattern[str], SafetyLevel, str]] = []
+        self._approval_grant = ApprovalGrantSettings()
 
         self._compile()
         self._ensure_policy_file_exists()
@@ -499,12 +551,15 @@ class PolicyEngine:
             self._reload_if_needed()
             cfg = copy.deepcopy(self._cfg)
             digest = self._cfg_hash
+            grant = self._approval_grant
         cmd = cfg.get("execute_command")
         if not isinstance(cmd, dict):
             cmd = {"default": self._command_default.value}
             cfg["execute_command"] = cmd
         if cmd.get("sensitive_path_patterns") is None:
             cmd["sensitive_path_patterns"] = list(_DEFAULT_SENSITIVE_PATH_LITERALS)
+        # 没写这一段时运行期用的是代码默认值，界面上要看到、存回去也不能丢。
+        cfg["approval_grant"] = {"default_minutes": grant.default_minutes, "max_minutes": grant.max_minutes}
         return cfg, digest
 
     def replace_config(self, data: Any, *, base_hash: str | None = None) -> tuple[dict[str, Any], str]:
@@ -672,6 +727,15 @@ class PolicyEngine:
             self._restart_default = _to_safety_level(str(restart_sec.get("default", "approval_required")))
         else:
             self._restart_default = SafetyLevel.approval_required
+
+        grant_sec = self._cfg.get("approval_grant")
+        if isinstance(grant_sec, dict):
+            self._approval_grant = ApprovalGrantSettings(
+                default_minutes=int(grant_sec["default_minutes"]),
+                max_minutes=int(grant_sec["max_minutes"]),
+            )
+        else:
+            self._approval_grant = ApprovalGrantSettings()
 
     @classmethod
     def _secret_floor(
@@ -851,6 +915,11 @@ class PolicyEngine:
         if len(urls) != 1:
             return False
         return _is_public_http_url(urls[0])
+
+    def approval_grant_settings(self) -> ApprovalGrantSettings:
+        """同意审批时授权的默认时长和上限，按当前生效的那份策略。"""
+        self._reload_if_needed()
+        return self._approval_grant
 
     def evaluate_restart(self, *, target: str) -> PolicyDecision:
         self._reload_if_needed()

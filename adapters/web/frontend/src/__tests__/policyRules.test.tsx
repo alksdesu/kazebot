@@ -421,4 +421,197 @@ describe('服务端策略', () => {
       expect(puts).toHaveLength(0);
     });
   });
+
+  // 授权时长单独一个页签，保存仍是整份 PUT：读到的这一段要原样带回去，改了的要按数字带上。
+  describe('审批授权', () => {
+    const DEFAULT_LABEL = '默认时长（分钟）';
+    const MAX_LABEL = '时长上限（分钟）';
+    const GRANTED_POLICY = { ...POLICY, approval_grant: { default_minutes: 30, max_minutes: 1440 } };
+    const CUSTOM_GRANT = { default_minutes: 45, max_minutes: 600 };
+    const CUSTOM_GRANT_POLICY = { ...POLICY, approval_grant: CUSTOM_GRANT };
+    const CAP_BELOW_ONE = '时长上限要填正整数（分钟），至少 1。';
+
+    const openGrantTab = () => fireEvent.click(screen.getByRole('button', { name: /审批授权/ }));
+    const setMinutes = (label: string, value: string) => (
+      fireEvent.change(screen.getByLabelText(label), { target: { value } })
+    );
+    const saveButton = () => screen.getByRole('button', { name: '保存策略' });
+
+    it('读到的两个时长摆在「审批授权」页签里', async () => {
+      await renderPolicy(GRANTED_POLICY);
+
+      expect(screen.queryByLabelText(DEFAULT_LABEL)).toBeNull();
+      openGrantTab();
+
+      expect(screen.getByLabelText(DEFAULT_LABEL)).toHaveValue(30);
+      expect(screen.getByLabelText(MAX_LABEL)).toHaveValue(1440);
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it('改了的时长按数字随整份策略保存，别的段一条不少', async () => {
+      await renderPolicy(GRANTED_POLICY);
+      openGrantTab();
+
+      setMinutes(DEFAULT_LABEL, '120');
+      setMinutes(MAX_LABEL, '480');
+      fireEvent.click(saveButton());
+
+      await waitFor(() => expect(lastPut).not.toBeNull());
+      // 服务端只收整数：带成字符串 "120" 会被整份拒掉。
+      expect(lastPut.approval_grant).toEqual({ default_minutes: 120, max_minutes: 480 });
+      expect(lastPut.execute_command.deny_patterns).toEqual(['rm\\s+-rf\\s+/']);
+      expect(lastPut.write_file.rules).toHaveLength(2);
+      expect(lastPut.restart.default).toBe('approval_required');
+      expect(await screen.findByText('已保存，立即生效，不用重启')).toBeInTheDocument();
+    });
+
+    it('改别的段再保存，读到的时长原样带回去', async () => {
+      await renderPolicy(CUSTOM_GRANT_POLICY);
+
+      fireEvent.change(screen.getByLabelText('兜底档位'), { target: { value: 'deny' } });
+      fireEvent.click(saveButton());
+
+      await waitFor(() => expect(lastPut).not.toBeNull());
+      expect(lastPut.write_file.default).toBe('deny');
+      expect(lastPut.approval_grant).toEqual(CUSTOM_GRANT);
+    });
+
+    it('全自动放行只改四类档位，授权时长照旧', async () => {
+      await renderPolicy(CUSTOM_GRANT_POLICY);
+
+      fireEvent.click(screen.getByRole('button', { name: '一键全自动放行' }));
+      fireEvent.click(screen.getByRole('button', { name: '确认并保存全自动放行' }));
+
+      await waitFor(() => expect(lastPut).not.toBeNull());
+      expect(lastPut.restart.default).toBe('auto');
+      expect(lastPut.approval_grant).toEqual(CUSTOM_GRANT);
+    });
+
+    it('服务端没给这一段时按代码默认显示，不改就不往回写', async () => {
+      await renderPolicy();
+      openGrantTab();
+
+      expect(screen.getByLabelText(DEFAULT_LABEL)).toHaveValue(30);
+      expect(screen.getByLabelText(MAX_LABEL)).toHaveValue(1440);
+
+      fireEvent.click(screen.getByRole('button', { name: /写入/ }));
+      fireEvent.change(screen.getByLabelText('兜底档位'), { target: { value: 'deny' } });
+      fireEvent.click(saveButton());
+
+      await waitFor(() => expect(lastPut).not.toBeNull());
+      expect(lastPut).not.toHaveProperty('approval_grant');
+    });
+
+    it('服务端没给这一段时只改一项，另一项按代码默认补齐', async () => {
+      await renderPolicy();
+      openGrantTab();
+
+      setMinutes(MAX_LABEL, '60');
+      fireEvent.click(saveButton());
+
+      await waitFor(() => expect(lastPut).not.toBeNull());
+      expect(lastPut.approval_grant).toEqual({ default_minutes: 30, max_minutes: 60 });
+    });
+
+    it('默认时长填 0 是合法值：默认不授权，照样能存', async () => {
+      await renderPolicy(GRANTED_POLICY);
+      openGrantTab();
+
+      setMinutes(DEFAULT_LABEL, '0');
+
+      expect(screen.queryByRole('alert')).toBeNull();
+      expect(screen.getByLabelText(DEFAULT_LABEL)).toHaveAttribute('aria-invalid', 'false');
+      fireEvent.click(saveButton());
+      await waitFor(() => expect(lastPut?.approval_grant).toEqual({ default_minutes: 0, max_minutes: 1440 }));
+    });
+
+    it('默认时长比上限长时提示会按上限算，不拦保存', async () => {
+      await renderPolicy(GRANTED_POLICY);
+      openGrantTab();
+
+      setMinutes(DEFAULT_LABEL, '2000');
+
+      expect(screen.getByText('默认时长比上限还长，保存后按上限 1440 分钟算。')).toBeInTheDocument();
+      expect(screen.queryByRole('alert')).toBeNull();
+      fireEvent.click(saveButton());
+      await waitFor(() => expect(lastPut?.approval_grant).toEqual({ default_minutes: 2000, max_minutes: 1440 }));
+    });
+
+    it.each([
+      [DEFAULT_LABEL, '', '默认时长要填 0 或正整数（分钟）。'],
+      [DEFAULT_LABEL, '-1', '默认时长要填 0 或正整数（分钟）。'],
+      [DEFAULT_LABEL, '1.5', '默认时长要填 0 或正整数（分钟）。'],
+      [MAX_LABEL, '', CAP_BELOW_ONE],
+      [MAX_LABEL, '0', CAP_BELOW_ONE],
+      [MAX_LABEL, '525601', '时长上限最多 525600 分钟（365 天）。'],
+    ])('%s 填成「%s」：当场指出，保存被拦下、一个字节都不写', async (label, value, problem) => {
+      await renderPolicy(GRANTED_POLICY);
+      openGrantTab();
+
+      setMinutes(label, value);
+
+      expect(screen.getByRole('alert')).toHaveTextContent(problem);
+      expect(screen.getByLabelText(label)).toHaveAttribute('aria-invalid', 'true');
+      fireEvent.click(saveButton());
+
+      expect(await screen.findByText(`没有保存：${problem}`)).toHaveAttribute('role', 'alert');
+      expect(lastPut).toBeNull();
+      // 清空的框不能悄悄变成 0：存成 0 等于关掉默认授权。草稿照原样留着等人改。
+      expect(screen.getByLabelText(label)).toHaveValue(value === '' ? null : Number(value));
+    });
+
+    it('在别的页签点保存也会拦下，并切回「审批授权」', async () => {
+      await renderPolicy(GRANTED_POLICY);
+      openGrantTab();
+      setMinutes(MAX_LABEL, '0');
+      fireEvent.click(screen.getByRole('button', { name: /写入/ }));
+      expect(screen.queryByLabelText(MAX_LABEL)).toBeNull();
+
+      fireEvent.click(saveButton());
+
+      expect(await screen.findByText(`没有保存：${CAP_BELOW_ONE}`)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /审批授权/ })).toHaveAttribute('aria-pressed', 'true');
+      expect(screen.getByLabelText(MAX_LABEL)).toHaveValue(0);
+      expect(lastPut).toBeNull();
+    });
+
+    it('改对之后照常保存，拦下时的报错随之清掉', async () => {
+      await renderPolicy(GRANTED_POLICY);
+      openGrantTab();
+      setMinutes(MAX_LABEL, '0');
+      fireEvent.click(saveButton());
+      await screen.findByText(`没有保存：${CAP_BELOW_ONE}`);
+
+      setMinutes(MAX_LABEL, '60');
+      expect(screen.getByLabelText(MAX_LABEL)).toHaveAttribute('aria-invalid', 'false');
+      fireEvent.click(saveButton());
+
+      await waitFor(() => expect(lastPut?.approval_grant).toEqual({ default_minutes: 30, max_minutes: 60 }));
+      expect(await screen.findByText('已保存，立即生效，不用重启')).toBeInTheDocument();
+      expect(screen.queryByText(/没有保存/)).toBeNull();
+    });
+
+    it('保存后显示服务端生效的那份时长', async () => {
+      // 服务端会把超过上限的默认时长截到上限：界面要换成生效的值，不能还停在填的那个数上。
+      vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === 'PUT') {
+          const sent = JSON.parse(String(init.body)).policy;
+          return jsonResponse({ policy: { ...sent, approval_grant: { default_minutes: 60, max_minutes: 60 } }, hash: 'p2' });
+        }
+        return jsonResponse({ policy: GRANTED_POLICY, hash: 'p1' });
+      }));
+      render(<PolicyRulesSection />);
+      await screen.findByRole('button', { name: /写入/ });
+      openGrantTab();
+
+      setMinutes(DEFAULT_LABEL, '2000');
+      setMinutes(MAX_LABEL, '60');
+      fireEvent.click(saveButton());
+
+      expect(await screen.findByText('已保存，立即生效，不用重启')).toBeInTheDocument();
+      expect(screen.getByLabelText(DEFAULT_LABEL)).toHaveValue(60);
+      expect(screen.getByLabelText(MAX_LABEL)).toHaveValue(60);
+      expect(screen.queryByText(/默认时长比上限还长/)).toBeNull();
+    });
+  });
 });

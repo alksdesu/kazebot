@@ -13,6 +13,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 from ._helpers import SessionInfo, _now
+from .approval_grants import ApprovalGrantBook, GrantIdentity, grant_verdict, model_or_none, operation_target
 from .branch_finalize_store import BranchFinalizeClaimStore
 from .compact_breaker import CompactBreaker
 from .reply_intent import IntentRegistry
@@ -21,7 +22,7 @@ from engine.builtin.loader import auto_discover_and_register
 from engine.conversation_migration import ConversationRekey, RekeyCount
 from engine.hooks import HookRegistry
 from platforms.sources import classify_operation_source
-from .policy import PolicyEngine
+from .policy import ApprovalGrantSettings, PolicyEngine
 from .session import SessionMixin
 from .session_store import SessionStore, session_registry_path
 from .task_router import TaskRouterMixin
@@ -29,7 +30,9 @@ from .task_store import CancelEffect, TaskStoreMixin
 from .types import (
     AdminStateOut,
     Approval,
+    ApprovalGrant,
     ApprovalStatus,
+    ApproverIdentity,
     OpRequestOut,
     SafetyLevel,
     Task,
@@ -60,6 +63,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self.session_generations: dict[str, int] = {}
 
         self.approvals: dict[str, Approval] = {}
+        self.approval_grants = ApprovalGrantBook()
 
         self.tasks: dict[str, Task] = {}
         self._task_order: list[str] = []
@@ -168,6 +172,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._restore_post_completion_work_from_events()
         self._restore_branch_finalize_claims_from_events()
         self._restore_memory_extract_intents_from_events()
+        self._restore_approval_grants_from_events()
         self._restore_recoverable_routes_from_events()
         self.recover_pending_completion_routes()
         self._reconcile_after_restart()
@@ -955,6 +960,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 self._apply_approval_requested(payload)
             elif et == "approval_decided":
                 self._apply_approval_decided(payload)
+            elif et == "approval_grant_revoked":
+                self._apply_approval_grant_revoked(payload)
             elif et in {
                 "task_created", "task_started", "task_completed", "task_cancelled",
                 "task_cancel_requested", "task_requeued", "task_suspended",
@@ -1500,6 +1507,25 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
     #  审批
     # ------------------------------------------------------------------ #
 
+    def _restore_approval_grants_from_events(self) -> int:
+        """按 approval_decided 里记下的授权和之后的 approval_grant_revoked 重建生效中的授权。"""
+        with self._lock:
+            for event in self.eventlog.iter_persisted_events():
+                event_type = event.get("type")
+                payload = event.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if event_type == "approval_decided" and payload.get("grant"):
+                    self._apply_approval_decided(payload)
+                elif event_type == "approval_grant_revoked":
+                    self._apply_approval_grant_revoked(payload)
+            restored = len(self.approval_grants.active(now=_now()))
+        logger.info(
+            "approval grants restored",
+            extra={"event": "approval_grant_restore", "active_count": restored},
+        )
+        return restored
+
     def _apply_approval_requested(self, payload: dict[str, Any]) -> None:
         try:
             a = Approval.model_validate(payload)
@@ -1509,13 +1535,24 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
     def _apply_approval_decided(self, payload: dict[str, Any]) -> None:
         approval_id = payload.get("approval_id")
+        decision = payload.get("decision")
+        grant = model_or_none(ApprovalGrant, payload.get("grant")) if decision == "allow" else None
         if approval_id in self.approvals:
             a = self.approvals[approval_id]
-            decision = payload.get("decision")
             a.status = ApprovalStatus.allowed if decision == "allow" else ApprovalStatus.denied
             a.decision = decision
             a.comment = payload.get("comment")
             a.decided_at = _now()
+            a.approver = model_or_none(ApproverIdentity, payload.get("approver"))
+            a.grant = grant
+            a.grant_note = str(payload.get("grant_note") or "") or None
+        if grant is not None:
+            self.approval_grants.store(grant, now=_now())
+
+    def _apply_approval_grant_revoked(self, payload: dict[str, Any]) -> None:
+        grant_ids = payload.get("grant_ids")
+        if isinstance(grant_ids, list):
+            self.approval_grants.drop(str(grant_id) for grant_id in grant_ids)
 
     def create_approval(
         self,
@@ -1573,19 +1610,60 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             )
         return approval
 
-    def decide_approval(self, *, approval_id: str, decision: str, comment: str | None = None) -> Approval | None:
+    def decide_approval(
+        self,
+        *,
+        approval_id: str,
+        decision: str,
+        comment: str | None = None,
+        approver: dict[str, Any] | None = None,
+        grant_minutes: int | None = None,
+    ) -> Approval | None:
+        """定案一条待审批。approver 是审批人本人、又是请求发起人时，同意顺带给他一段授权。"""
+        grant_settings = self.policy.approval_grant_settings() if decision == "allow" else None
         with self._lock:
             a = self.approvals.get(approval_id)
             if a is None or a.status != ApprovalStatus.pending:
                 return a
-            self._decide_approval_locked(a, decision, comment)
+            self._decide_approval_locked(
+                a, decision, comment,
+                approver=approver, grant_minutes=grant_minutes, grant_settings=grant_settings,
+            )
             return a
 
-    def _decide_approval_locked(self, a: Approval, decision: str, comment: str | None) -> None:
+    def _decide_approval_locked(
+        self,
+        a: Approval,
+        decision: str,
+        comment: str | None,
+        *,
+        approver: dict[str, Any] | None = None,
+        grant_minutes: int | None = None,
+        grant_settings: ApprovalGrantSettings | None = None,
+    ) -> None:
+        now = _now()
+        approver_identity = GrantIdentity.from_auth(approver)
+        grant: ApprovalGrant | None = None
+        grant_note: str | None = None
+        if decision == "allow":
+            verdict = grant_verdict(
+                approver=approver_identity,
+                requester=self._approval_requester_locked(a),
+                minutes=(grant_settings or ApprovalGrantSettings()).minutes_for(grant_minutes),
+                requested=grant_minutes,
+            )
+            grant_note = verdict.note
+            if verdict.identity is not None:
+                grant = self.approval_grants.draft(
+                    verdict.identity, minutes=verdict.minutes, approval_id=a.approval_id, now=now,
+                )
         a.status = ApprovalStatus.allowed if decision == "allow" else ApprovalStatus.denied
         a.decision = decision
         a.comment = comment
-        a.decided_at = _now()
+        a.decided_at = now
+        a.approver = ApproverIdentity(**approver_identity.as_dict()) if approver_identity is not None else None
+        a.grant = grant
+        a.grant_note = grant_note
         self.eventlog.append(
             session_id=a.session_id,
             component="supervisor",
@@ -1599,8 +1677,69 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 "tool_call_id": a.tool_call_id,
                 "node_id": a.node_id,
                 "task_id": a.task_id,
+                "approver": a.approver.model_dump(mode="json") if a.approver is not None else None,
+                "grant": grant.model_dump(mode="json") if grant is not None else None,
+                "grant_note": grant_note,
             },
         )
+        # 事件落盘之后才生效：重启后按事件重建，没记下的授权不能先在内存里放行。
+        if grant is not None:
+            self.approval_grants.store(grant, now=now)
+
+    def _approval_requester_locked(self, approval: Approval) -> GrantIdentity | None:
+        """审批请求的发起人：优先用 supervisor 按任务写进 details 的身份，取不到再按 task_id 回溯。"""
+        # 没有 task_id 的审批，details 里的 platform_auth 是调用方自报的。
+        if not approval.task_id:
+            return None
+        identity = GrantIdentity.from_auth((approval.details or {}).get("platform_auth"))
+        if identity is not None:
+            return identity
+        task = self.tasks.get(approval.task_id)
+        if task is None:
+            return None
+        return GrantIdentity.from_auth(self._platform_auth_origin_locked(task)[1])
+
+    def list_approval_grants(self) -> list[ApprovalGrant]:
+        """生效中的授权，按到期时间排。"""
+        with self._lock:
+            return self.approval_grants.active(now=_now())
+
+    def revoke_approval_grants(
+        self, *, grant_id: str = "", identity: dict[str, Any] | None = None,
+    ) -> list[ApprovalGrant]:
+        """收回生效中的授权并记一条 approval_grant_revoked，重启回放时据此不让它复活。
+
+        给了 grant_id 只收那一条，给了身份收这个人名下的全部；两样都没给、或身份认不出，抛 ValueError。
+        """
+        who: GrantIdentity | None = None
+        if identity is not None:
+            who = GrantIdentity.from_auth(identity)
+            if who is None:
+                raise ValueError("身份要有 platform 和合法的 user_id")
+        key = str(grant_id or "").strip()
+        with self._lock:
+            now = _now()
+            revoked = self.approval_grants.revoke(now=now, grant_id=key, identity=who)
+            if revoked:
+                self.eventlog.append(
+                    session_id=SYSTEM_SESSION_ID,
+                    component="supervisor",
+                    type_="approval_grant_revoked",
+                    payload={
+                        "grant_ids": [grant.grant_id for grant in revoked],
+                        "grants": [grant.model_dump(mode="json") for grant in revoked],
+                        "by_grant_id": key,
+                        "by_identity": who.as_dict() if who is not None else None,
+                        "count": len(revoked),
+                        "ts": now.isoformat(),
+                    },
+                )
+        if revoked:
+            logger.info(
+                "approval grants revoked",
+                extra={"event": "approval_grant_revoked", "count": len(revoked)},
+            )
+        return revoked
 
     def _close_orphaned_approvals_locked(self) -> list[str]:
         """任务已经结束、或已不在内存里的待审批按拒绝收掉，返回收掉的 id。
@@ -1638,6 +1777,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             else:
                 caller_auth = parameters.get("platform_auth")
                 platform_auth = dict(caller_auth) if isinstance(caller_auth, dict) else {}
+        # 授权只认任务上记的身份：没有任务时 platform_auth 是调用方自报的。
+        grant_identity = GrantIdentity.from_auth(platform_auth) if task is not None else None
         if task_id and ("platform_auth" in parameters or platform_auth):
             parameters = {**parameters, "platform_auth": platform_auth}
         # 只认 conv_key 前缀的话，一旦某条路径把 key 换成 scheduler:/agent: 之类，
@@ -1702,6 +1843,20 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 approval_id=None,
             )
 
+        granted = self._approval_grant_verdict(
+            identity=grant_identity,
+            session_id=session_id,
+            op=op,
+            parameters=parameters,
+            policy_reason=decision.reason,
+            sensitive=bool(getattr(decision, "sensitive", False)),
+            task_id=task_id or "",
+            tool_call_id=tool_call_id or "",
+            node_id=node_id or "",
+        )
+        if granted is not None:
+            return granted
+
         # [AutoC 2026-05-31] Why: request_guard can now identify the active tool
         # call. How: forward that identity to create_approval. Purpose: the emitted
         # approval_requested event can be merged into the same ToolCallCard.
@@ -1714,6 +1869,53 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             task_id=task_id,
         )
         return OpRequestOut(safety_level=SafetyLevel.approval_required, reason=decision.reason, approval_id=approval.approval_id)
+
+    def _approval_grant_verdict(
+        self,
+        *,
+        identity: GrantIdentity | None,
+        session_id: str,
+        op: str,
+        parameters: dict[str, Any],
+        policy_reason: str,
+        sensitive: bool,
+        task_id: str,
+        tool_call_id: str,
+        node_id: str,
+    ) -> OpRequestOut | None:
+        """任务发起人名下有生效中的授权时直接放行，并记一条 approval_grant_used 备查。"""
+        if identity is None:
+            return None
+        with self._lock:
+            grant = self.approval_grants.active_for(identity, now=_now())
+            if grant is None:
+                return None
+            self.eventlog.append(
+                session_id=session_id,
+                component="supervisor",
+                type_="approval_grant_used",
+                payload={
+                    "op": op,
+                    "task_id": task_id,
+                    "session_id": session_id,
+                    "grant_id": grant.grant_id,
+                    "approval_id": grant.approval_id,
+                    "platform": grant.platform,
+                    "user_id": grant.user_id,
+                    "bot_scope": grant.bot_scope,
+                    "until": grant.until.isoformat(),
+                    "reason": policy_reason,
+                    "sensitive": sensitive,
+                    "target": operation_target(op, parameters),
+                    "tool_call_id": tool_call_id,
+                    "node_id": node_id,
+                },
+            )
+        return OpRequestOut(
+            safety_level=SafetyLevel.auto,
+            reason=f"auto-approved: approval grant {grant.grant_id} until {grant.until.isoformat()} ({policy_reason})",
+            approval_id=None,
+        )
 
     def _external_non_admin_verdict(
         self, op: str, parameters: dict[str, Any], label: str,

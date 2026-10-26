@@ -23,6 +23,7 @@ import asyncio
 import inspect
 import json
 import re
+from collections.abc import Mapping
 from typing import Any, AsyncGenerator
 from urllib.parse import quote
 
@@ -31,11 +32,13 @@ import httpx
 from .types import (
     APPROVAL_MISSING,
     ApprovalDecision,
+    ApprovalGrant,
     Event,
     HealthInfo,
     InboundResult,
     IntentVerdict,
     OpenAIConfig,
+    PlatformAuth,
     RunningTask,
     TaskOrigin,
 )
@@ -49,6 +52,26 @@ def _path_id(value: str) -> str:
     if not _PATH_ID_RE.fullmatch(text):
         raise ValueError(f"unsafe id for a supervisor path: {text[:40]!r}")
     return quote(text, safe="")
+
+
+def _identity_body(identity: PlatformAuth | Mapping[str, Any] | None) -> dict[str, str] | None:
+    """审批人或要收回授权的人：只报认人用的三项，is_admin 这类不往外带。"""
+    if identity is None:
+        return None
+    if isinstance(identity, PlatformAuth):
+        source: Mapping[str, Any] = {
+            "platform": identity.platform, "user_id": identity.user_id, "bot_scope": identity.bot_scope,
+        }
+    elif isinstance(identity, Mapping):
+        source = identity
+    else:
+        raise TypeError(f"identity must be PlatformAuth or a mapping, got {type(identity).__name__}")
+    return {key: str(source.get(key) or "").strip() for key in ("platform", "user_id", "bot_scope")}
+
+
+def _grants_of(items: Any) -> list[ApprovalGrant]:
+    grants = (ApprovalGrant.from_dict(item) for item in (items if isinstance(items, list) else []))
+    return [grant for grant in grants if grant is not None]
 
 
 class ClonothClient:
@@ -378,15 +401,25 @@ class ClonothClient:
         *,
         decision: str,
         comment: str | None = None,
+        approver: PlatformAuth | Mapping[str, Any] | None = None,
+        grant_minutes: int | None = None,
     ) -> ApprovalDecision:
         """提交审批决策并带回 supervisor 的回执，对应 POST /v1/approvals/{approval_id}。
 
         已经定案的审批照样返回 200，所以要看回执里的 status 才知道这次决定有没有生效
         （ApprovalDecision.effective）。审批不存在时 status 为 APPROVAL_MISSING；其余 HTTP 错误抛出。
+
+        approver 是作决定的人：他就是这条请求的发起人时，同意会顺带给他一段免审授权。
+        grant_minutes 为 None 按策略默认时长，0 只同意这一次；超过策略上限按上限截断。
         """
         body: dict[str, Any] = {"decision": decision}
         if comment is not None:
             body["comment"] = comment
+        identity = _identity_body(approver)
+        if identity is not None:
+            body["approver"] = identity
+        if grant_minutes is not None:
+            body["grant_minutes"] = max(0, int(grant_minutes))
         resp = await self._http().post(
             f"{self._base_url}/v1/approvals/{_path_id(approval_id)}", json=body,
         )
@@ -400,7 +433,39 @@ class ClonothClient:
             decision=decision,
             status=str(data.get("status") or ""),
             comment=str(data.get("comment") or ""),
+            grant=ApprovalGrant.from_dict(data.get("grant")),
+            grant_note=str(data.get("grant_note") or ""),
         )
+
+    async def list_approval_grants(self) -> list[ApprovalGrant]:
+        """生效中的审批授权，对应 GET /v1/approval-grants。"""
+        resp = await self._http().get(f"{self._base_url}/v1/approval-grants")
+        resp.raise_for_status()
+        data = resp.json()
+        return _grants_of(data.get("grants") if isinstance(data, dict) else None)
+
+    async def revoke_approval_grants(
+        self,
+        *,
+        grant_id: str = "",
+        identity: PlatformAuth | Mapping[str, Any] | None = None,
+    ) -> list[ApprovalGrant]:
+        """收回生效中的审批授权，返回收回了哪几条，对应 POST /v1/approval-grants/revoke。
+
+        给 grant_id 只收那一条，给 identity 收这个人名下的全部；两样都给时要同时对上。
+        """
+        body: dict[str, Any] = {}
+        if str(grant_id or "").strip():
+            body["grant_id"] = str(grant_id).strip()
+        who = _identity_body(identity)
+        if who is not None:
+            body["identity"] = who
+        if not body:
+            raise ValueError("revoke_approval_grants needs a grant_id or an identity")
+        resp = await self._http().post(f"{self._base_url}/v1/approval-grants/revoke", json=body)
+        resp.raise_for_status()
+        data = resp.json()
+        return _grants_of(data.get("revoked") if isinstance(data, dict) else None)
 
     async def approve(
         self,

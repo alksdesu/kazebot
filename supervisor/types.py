@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 OUTPUT_GUIDE_MAX_SECTIONS = 32
@@ -273,9 +273,62 @@ class QqQuickLoginIn(BaseModel):
     uin: str
 
 
+class ApproverIdentity(BaseModel):
+    """审批人的平台身份。和请求发起人是同一个人时，同意才会生成授权。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    platform: str = Field(default="", max_length=64)
+    user_id: str = Field(default="", max_length=128)
+    bot_scope: str = Field(default="", max_length=128)
+
+
+class ApprovalGrant(BaseModel):
+    """同意审批时给审批人本人的授权：until 之前他发起的任务里，原本要审批的操作直接放行。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    grant_id: str
+    platform: str
+    user_id: str
+    bot_scope: str = ""
+    until: datetime
+    minutes: int
+    approval_id: str
+    issued_at: datetime | None = None
+
+    @field_validator("until", "issued_at")
+    @classmethod
+    def _aware(cls, value: datetime | None) -> datetime | None:
+        # 到期判断拿带时区的当前时间比，不带时区的一比就抛 TypeError。
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
+
 class ApprovalDecisionIn(BaseModel):
     decision: Literal["allow", "deny"]
     comment: str | None = None
+    # 控制台、TUI 和旧客户端不带审批人，同意了也不生成授权。
+    approver: ApproverIdentity | None = None
+    # None 按 policy 的 approval_grant.default_minutes；0 只同意这一次。
+    grant_minutes: int | None = Field(default=None, ge=0)
+
+
+class ApprovalGrantRevokeIn(BaseModel):
+    """按 grant_id 收回一条，或按身份收回这个人名下全部生效中的；两样都给时要同时对上。"""
+
+    grant_id: str | None = Field(default=None, max_length=64)
+    identity: ApproverIdentity | None = None
+
+
+class ApprovalGrantListOut(BaseModel):
+    grants: list[ApprovalGrant] = Field(default_factory=list)
+
+
+class ApprovalGrantRevokeOut(BaseModel):
+    revoked: list[ApprovalGrant] = Field(default_factory=list)
+    count: int = 0
 
 
 class Approval(BaseModel):
@@ -297,6 +350,11 @@ class Approval(BaseModel):
     tool_call_id: str | None = None
     node_id: str | None = None
     task_id: str | None = None
+    # 旧事件里没有这三项，按没有授权处理。
+    approver: ApproverIdentity | None = None
+    grant: ApprovalGrant | None = None
+    # 同意了却没生成授权时的原因：once / disabled / not_requester / no_requester / no_approver。
+    grant_note: str | None = None
 
 
 class OpRequestIn(BaseModel):

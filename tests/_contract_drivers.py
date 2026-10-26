@@ -75,10 +75,19 @@ class FakeClonoth:
         return self.approve_result
 
     async def decide_approval(
-        self, approval_id: str, *, decision: str, comment: str | None = None,
+        self,
+        approval_id: str,
+        *,
+        decision: str,
+        comment: str | None = None,
+        approver: Mapping[str, Any] | None = None,
+        grant_minutes: int | None = None,
     ) -> ApprovalDecision:
         """带回执的那条提交路径：提交被拒和 approve 返回 False 一样，是一次 HTTP 错误。"""
-        self.decisions.append({"approval_id": approval_id, "decision": decision, "comment": comment})
+        self.decisions.append({
+            "approval_id": approval_id, "decision": decision, "comment": comment,
+            "approver": dict(approver) if approver is not None else None, "grant_minutes": grant_minutes,
+        })
         if not self.approve_result:
             url = f"http://clonoth.test/v1/approvals/{approval_id}"
             raise httpx.HTTPStatusError(

@@ -1,4 +1,4 @@
-"""审批从挂起到定案的流转：待决、已决、卡片锚点，以及管理员回复里的决策词。
+"""审批从挂起到定案的流转：待决、已决、卡片锚点，以及管理员回复里的决策词、授权时长和收回命令。
 
 卡片怎么渲染和发送、平台消息 ID 怎么归一化由适配器给；回执怎么措辞也由适配器按查询结果决定。
 """
@@ -9,6 +9,7 @@ import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Callable
 
 from platforms.ids import normalize_id
@@ -25,9 +26,20 @@ DENY_VERBS = frozenset({
     "拒绝", "驳回", "不同意", "不批准", "deny", "reject", "rejected",
 })
 COMMAND_PREFIXES = ("审批", "approval")
+# 同意时只批这一次、不生成授权的写法。
+GRANT_ONCE_WORDS = frozenset({"单次", "once"})
+REVOKE_WORDS = frozenset({"收回", "收回授权", "revoke"})
 _VERB_STRIP = " 　。，、！!.~"
 # 形状与 approval_id（uuid4）绑定：裸动词命令只在 token 像 id 时才当审批，避免劫持普通私聊。
 _TOKEN_RE = re.compile(r"^[0-9a-fA-F][0-9a-fA-F-]{3,}$")
+# 只由这些字符组成的词才可能是审批 ID 或它的前缀；1d、300d 这种也算，宁可当 ID 去查。
+_ID_CHARS_RE = re.compile(r"[0-9a-fA-F-]+")
+# 只认「整数 + 一个单位」：1.5h、一小时、1h30m 都不认，免得把一句闲聊猜成时长。
+_GRANT_DURATION_RE = re.compile(r"([0-9]{1,9})\s*(秒|分钟|分|小时|天|s|m|h|d)")
+_GRANT_UNIT_SECONDS = MappingProxyType({
+    "秒": 1, "s": 1, "分钟": 60, "分": 60, "m": 60, "小时": 3600, "h": 3600, "天": 86400, "d": 86400,
+})
+_ALLOW_VERBS_LONGEST_FIRST = tuple(sorted(ALLOW_VERBS, key=len, reverse=True))
 
 LOOKUP_FOUND = "found"
 LOOKUP_NO_TOKEN = "no_token"
@@ -51,11 +63,38 @@ def approval_verb(token: str) -> str | None:
     return None
 
 
-def parse_command(body: str) -> tuple[str, str] | None:
-    """解析已去掉命令引导符的审批命令，返回 (decision, approval_id 或前缀)。
+@dataclass(frozen=True)
+class ApprovalIntent:
+    """一条审批决定。token 是审批 ID 或前缀，没指明是哪条时为空串。
 
-    「审批 同意 <ID>」照收；省掉「审批」的裸动词命令，token 必须像 approval_id，否则「通过 微信发给我」会被当成审批。
+    grant_minutes 只对同意有意义：None 按策略的默认时长授权，0 只同意这一次。
+    duration_error 表示带了时长但写法不对，这条决定不该提交。
     """
+
+    decision: str
+    token: str = ""
+    grant_minutes: int | None = None
+    duration_error: bool = False
+
+
+def grant_minutes_of(text: str) -> int | None:
+    """「2h」「45 分钟」换成授权分钟数，「单次」「once」是 0；别的写法返回 None。
+
+    秒向上取整到分钟：「30s」不能变成不授权。
+    """
+    # 只去掉句末标点：左边去掉「.」会把「.5h」读成 5 小时。
+    value = str(text or "").strip().rstrip(_VERB_STRIP).lower()
+    if value in GRANT_ONCE_WORDS:
+        return 0
+    match = _GRANT_DURATION_RE.fullmatch(value)
+    if match is None:
+        return None
+    seconds = int(match[1]) * _GRANT_UNIT_SECONDS[match[2]]
+    return -(-seconds // 60)
+
+
+def _command_parts(body: str) -> tuple[str, str, list[str]] | None:
+    """审批命令拆成 (决定, ID 那一格, 其后的词)；不像审批命令返回 None。"""
     normalized = re.sub(r"\s+", " ", body or "")
     if not normalized:
         return None
@@ -63,18 +102,54 @@ def parse_command(body: str) -> tuple[str, str] | None:
     if len(parts) < 2:
         return None
     if parts[0] in COMMAND_PREFIXES and len(parts) >= 3:
-        decision = approval_verb(parts[1])
-        token = parts[2]
-        explicit_prefix = True
+        decision, token, rest, explicit_prefix = approval_verb(parts[1]), parts[2], parts[3:], True
     else:
-        decision = approval_verb(parts[0])
-        token = parts[1]
-        explicit_prefix = False
+        decision, token, rest, explicit_prefix = approval_verb(parts[0]), parts[1], parts[2:], False
     if decision is None:
         return None
     if not explicit_prefix and not _TOKEN_RE.match(token):
         return None
-    return decision, token
+    return decision, token, rest
+
+
+def parse_command(body: str) -> tuple[str, str] | None:
+    """解析已去掉命令引导符的审批命令，返回 (decision, approval_id 或前缀)，ID 后面的词不看。
+
+    「审批 同意 <ID>」照收；省掉「审批」的裸动词命令，token 必须像 approval_id，否则「通过 微信发给我」会被当成审批。
+    """
+    parts = _command_parts(body)
+    return None if parts is None else (parts[0], parts[1])
+
+
+def parse_decision_command(body: str) -> ApprovalIntent | None:
+    """parse_command 加上时长：「审批 同意 <ID> 2h」「同意 <ID> 单次」。
+
+    时长只跟在 ID 后面、只对同意解析；拒绝后面的词照旧不看。ID 那一格连同后面的词整段是个时长，
+    而这一格不可能是审批 ID（「审批 同意 2h」）、或者剩下的词单独不成时长（「审批 同意 45 分钟」）的，
+    是没指明哪一条：返回 None 交给裸动词的唯一匹配。「300d」这种两边都说得通的按 ID 查。
+    """
+    parts = _command_parts(body)
+    if parts is None:
+        return None
+    decision, token, rest = parts
+    if decision != DECISION_ALLOW:
+        return ApprovalIntent(decision, token)
+    tail = " ".join(rest).strip()
+    tail_minutes = grant_minutes_of(tail) if tail else None
+    names_no_approval = not _ID_CHARS_RE.fullmatch(token) or (bool(tail) and tail_minutes is None)
+    if names_no_approval and grant_minutes_of(" ".join([token, *rest])) is not None:
+        return None
+    if not tail:
+        return ApprovalIntent(decision, token)
+    if tail_minutes is None:
+        return ApprovalIntent(decision, token, duration_error=True)
+    return ApprovalIntent(decision, token, grant_minutes=tail_minutes)
+
+
+def parse_revoke_command(body: str) -> bool:
+    """已去掉命令引导符的「审批 收回」「审批 收回授权」「approval revoke」。"""
+    parts = re.sub(r"\s+", " ", body or "").strip().split(" ")
+    return len(parts) == 2 and parts[0] in COMMAND_PREFIXES and parts[1].strip(_VERB_STRIP).lower() in REVOKE_WORDS
 
 
 def parse_reply_verb(text: str) -> str | None:
@@ -87,6 +162,27 @@ def parse_reply_verb(text: str) -> str | None:
         if normalized.startswith(prefix):
             normalized = normalized[len(prefix):].lstrip(":：")
     return approval_verb(normalized)
+
+
+def parse_reply_decision(text: str) -> ApprovalIntent | None:
+    """不带 ID 的审批决定（引用卡片回复、裸动词）：整句是一个动词，同意后面还可以跟一个时长。
+
+    「同意 1h」「审批 同意 45 分钟」「同意单次」照收；「同意吧，快点」「同意 1.5h」都不是审批决定，照旧当普通聊天。
+    """
+    verb = parse_reply_verb(text)
+    if verb is not None:
+        return ApprovalIntent(verb)
+    # 时长按原样的空白切：把空白全去掉的话「1 0m」会被读成 10 分钟。
+    body = (text or "").strip().lower()
+    for prefix in COMMAND_PREFIXES:
+        if body.startswith(prefix):
+            body = body[len(prefix):].lstrip(":： \t\r\n　")
+    body = body.lstrip(_VERB_STRIP)
+    for word in _ALLOW_VERBS_LONGEST_FIRST:
+        if body.startswith(word):
+            minutes = grant_minutes_of(body[len(word):])
+            return None if minutes is None else ApprovalIntent(DECISION_ALLOW, grant_minutes=minutes)
+    return None
 
 
 @dataclass(frozen=True)
