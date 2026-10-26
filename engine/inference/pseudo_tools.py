@@ -378,14 +378,22 @@ def _preempt_task_spec() -> dict:
                 "- The user provided new information that the child task needs to incorporate.\n"
                 "- You want to steer an ongoing task in a different direction without restarting it.\n\n"
                 "This is non-terminating — your node keeps running after the call. "
-                "The child task continues with the injected message and returns results via the normal dispatch callback."
+                "The child task continues with the injected message and returns results via the normal dispatch callback.\n\n"
+                "Reachable tasks: those of the conversation this turn belongs to (entry branches included) and every "
+                "task dispatched from it, directly or through other children, including persistent agents running in "
+                "their own agent: sessions. Tasks of other conversations are never found. Tool tasks, system tasks and "
+                "tasks suspended while waiting for their own children cannot be steered."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "task_id": {
                         "type": "string",
-                        "description": "要追加指令的任务 ID（完整或前缀均可）。可从 dispatch 回调或 active_tasks 中获取。",
+                        "description": (
+                            "要追加指令的任务：一般填子节点名（如 bob），也可以填完整任务 ID 或至少 8 位的 ID 前缀。"
+                            "节点名对上多个任务时优先选你自己派出去的那个；仍分不出来、或 ID 前缀对上多个时会报错并列出"
+                            "候选 ID 前缀，换成其中一个再调用。"
+                        ),
                     },
                     "message": {
                         "type": "string",

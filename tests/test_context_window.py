@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import logging
 import sys
 from pathlib import Path
@@ -22,6 +23,7 @@ for _path in (_ROOT, _TESTS):
 from _engine_loop_fixture import ScriptedRegistry, make_loop_state  # noqa: E402
 from engine.builtin import compact  # noqa: E402
 from engine.context_window import (  # noqa: E402
+    BUILTIN_CONTEXT_WINDOWS,
     context_window_for,
     effective_thresholds,
     output_reserve_tokens,
@@ -85,15 +87,88 @@ class TestBuiltinTable:
         ("gemini-1.5-flash-8b", 1_048_576),
         ("models/gemini-2.5-flash", 1_048_576),
         ("gemini-3-pro-preview", 1_048_576),
-        ("deepseek-chat", 128_000),
-        ("deepseek-reasoner", 128_000),
+        ("deepseek-chat", 1_000_000),
+        ("deepseek-reasoner", 1_000_000),
     ])
     def test_known_families(self, model: str, expected: int) -> None:
         assert context_window_for(model) == expected
 
-    @pytest.mark.parametrize("model", ["deepseek-v4-pro", "qwen-max", "my-own-model", "", None])
+    @pytest.mark.parametrize("model", [
+        "deepseek-v3", "deepseek-coder", "qwen-max", "my-own-model", "gemini-4-pro", "", None,
+    ])
     def test_unknown_models_are_not_adjusted(self, model: Any) -> None:
         assert context_window_for(model) is None
+
+    @pytest.mark.parametrize("model", [
+        "deepseek-flash",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-vision-exp",
+        "deepseek-chat",
+        "deepseek-reasoner",
+    ])
+    def test_the_current_deepseek_models_and_their_aliases_have_a_1m_window(self, model: str) -> None:
+        assert context_window_for(model) == 1_000_000
+
+    @pytest.mark.parametrize("model, expected", [
+        ("gemini-4-argon", 1_048_576),
+        ("gemini-3.8-flash", 1_048_576),
+        ("gemini-3.6-flash", 1_048_576),
+        ("gemini-3.5-flash-lite", 1_048_576),
+        ("gemini-3.1-flash-lite", 1_048_576),
+        ("gemini-3-flash-preview", 1_048_576),
+        ("gemini-3.1-pro-preview", 1_048_576),
+        ("gemini-3.1-flash-image", 131_072),
+        ("gemini-3.1-flash-image-preview", 131_072),
+        ("gemini-nano-banana-2.1", 131_072),
+        ("gemini-3.1-flash-lite-image", 65_536),
+        ("gemini-3-pro-image", 65_536),
+        ("gemini-3-pro-image-preview", 65_536),
+        ("gemini-3.8-flash-tts", 8_192),
+        ("gemini-3.8-flash-lite-tts", 8_192),
+        ("gemini-3.1-flash-tts-preview", 8_192),
+    ])
+    def test_each_gemini_3_and_4_model_gets_its_own_window(self, model: str, expected: int) -> None:
+        assert context_window_for(model) == expected
+
+    @pytest.mark.parametrize("model", [
+        "gemini-3.8-live",
+        "gemini-3.8-live-extended-thinking",
+        "gemini-3.1-flash-live-preview",
+        "gemini-3.5-live-translate-preview",
+        "gemini-3.5-transcribe",
+        "gemini-omni-1.1-flash",
+    ])
+    def test_models_without_a_published_window_skip_the_family_glob(self, model: str) -> None:
+        assert context_window_for(model) is None
+
+    @pytest.mark.parametrize("model, expected", [
+        ("deepseek/deepseek-v4-pro", 1_000_000),
+        ("deepseek-ai/DeepSeek-V4-Pro", 1_000_000),
+        ("DeepSeek-Flash", 1_000_000),
+        ("openrouter/deepseek/deepseek-chat:free", 1_000_000),
+        ("deepseek-v4-flash@2026-04-24", 1_000_000),
+        ("models/gemini-3.1-flash-image-preview", 131_072),
+        ("google/gemini-3-pro-image-preview", 65_536),
+        ("publishers/google/models/gemini-4-argon", 1_048_576),
+        ("Gemini-3.8-Flash-TTS", 8_192),
+        ("gemini-3.8-flash-lite-tts@001", 8_192),
+        ("gemini-3-pro-image-preview-11-2025", 65_536),
+        ("gemini-3.1-flash-lite-image-001", 65_536),
+        ("gemini-3.8-flash-001", 1_048_576),
+        ("models/gemini-3.8-live-001", None),
+    ])
+    def test_vendor_prefixes_and_version_suffixes_still_resolve(self, model: str, expected: int | None) -> None:
+        assert context_window_for(model) == expected
+
+    def test_no_entry_is_shadowed_by_a_broader_one_above_it(self) -> None:
+        # 先匹配上的生效：宽的通配写在窄的前面，窄的那条就永远查不到
+        for pattern, tokens in BUILTIN_CONTEXT_WINDOWS:
+            stem = pattern.rstrip("*")
+            first_pattern, first_tokens = next(
+                (other, value) for other, value in BUILTIN_CONTEXT_WINDOWS if fnmatch.fnmatchcase(stem, other)
+            )
+            assert first_tokens == tokens, f"{pattern} is shadowed by {first_pattern}"
 
 
 class TestPriority:

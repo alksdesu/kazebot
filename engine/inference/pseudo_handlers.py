@@ -414,86 +414,78 @@ async def _handle_pseudo_compact(ls: _LoopState, pseudo_call, step: int) -> Task
     return None
 
 
-# [2026-05-28] 判断字符串是否像 UUID 或 hex 前缀（task_id 支持前缀匹配）。
-# 为什么：preempt_task 新增 node_id 支持，需要区分传入值是 task_id 还是 node_id。
-# 怎么判断：全 hex+连字符且长度≥8 视为 task_id/前缀，否则视为 node_id。
-import re as _re
-_UUID_FULL_PATTERN = _re.compile(r'^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$', _re.I)
-
-def _looks_like_task_id(s: str) -> bool:
-    """Return True if s looks like a UUID or hex prefix (for task_id prefix match)."""
-    if _UUID_FULL_PATTERN.fullmatch(s):
-        return True
-    # hex prefix: all hex chars (plus optional dashes), length >= 8
-    return len(s) >= 8 and all(c in '0123456789abcdef-' for c in s.lower())
-
-
 async def _handle_pseudo_preempt_task(ls: _LoopState, pseudo_call, args: dict) -> None:
-    """处理 preempt_task 伪工具。始终返回 None（非终止）。"""
-    _pt_tid = str(args.get("task_id") or "").strip()
-    _pt_msg = str(args.get("message") or "").strip()
-    if _pt_tid:
-        try:
-            # [2026-05-28] 支持按 node_id 查找活跃任务再 preempt。
-            # 为什么：调用方通常只知道子节点名（如 "bob"），不知道动态 task_id。
-            # 怎么改：如果传入值不像 UUID/hex 前缀，视为 node_id，先查出真实 task_id。
-            # 目的：简化 preempt 调用，无需事先查询 task_id。
-            real_task_id = _pt_tid
-            if not _looks_like_task_id(_pt_tid):
-                # 当作 node_id 处理，查询当前 session 中该节点的活跃任务
-                _route_sid = ls.rctx.parent_session_id or ls.rctx.session_id
-                _node_resp = await ls.rctx.http.get(
-                    f"{ls.rctx.supervisor_url}/v1/sessions/{_route_sid}/tasks/by-node/{_pt_tid}",
-                )
-                if _node_resp.status_code == 200:
-                    _node_data = _node_resp.json()
-                    real_task_id = _node_data.get("task_id", "")
-                elif _node_resp.status_code == 404:
-                    # [2026-05-28] fallback 到全局 by-node 查找。
-                    # 为什么：持久节点的任务运行在独立 session 上，
-                    #   session 内查找找不到。
-                    # 怎么改：404 时 fallback 到 /v1/tasks/active-by-node/{node_id}。
-                    # 目的：跨 session 支持 preempt 持久节点任务。
-                    _global_resp = await ls.rctx.http.get(
-                        f"{ls.rctx.supervisor_url}/v1/tasks/active-by-node/{_pt_tid}",
-                    )
-                    if _global_resp.status_code == 200:
-                        _global_data = _global_resp.json()
-                        real_task_id = _global_data.get("task_id", "")
-                    else:
-                        _pt_result = f"节点 '{_pt_tid}' 在当前 session 及全局范围内均无活跃任务"
-                        _emit_pseudo_tool_result(ls, pseudo_call, _pt_result)
-                        return None
-                else:
-                    _pt_result = f"查询节点 '{_pt_tid}' 的任务失败: HTTP {_node_resp.status_code}"
-                    _emit_pseudo_tool_result(ls, pseudo_call, _pt_result)
-                    return None
+    """处理 preempt_task 伪工具。始终返回 None（非终止）。
 
-            # [2026-05-23] Pass message to supervisor so preempt can inject
-            # additional instructions instead of just stopping the child.
-            _pt_body: dict[str, Any] = {}
-            if _pt_msg:
-                _pt_body["message"] = _pt_msg
-            _pt_resp = await ls.rctx.http.post(
-                f"{ls.rctx.supervisor_url}/v1/tasks/{real_task_id}/preempt",
-                json=_pt_body if _pt_body else None,
-            )
-            _display_id = _pt_tid if _looks_like_task_id(_pt_tid) else f"{_pt_tid}({real_task_id[:8]})"
-            if _pt_resp.status_code == 200:
-                if _pt_msg:
-                    _pt_result = f"已向 task {_display_id} 注入追加指令，子任务继续执行"
-                else:
-                    _pt_result = f"已标记 task {_display_id} 为 preempt，等待优雅退出"
-            elif _pt_resp.status_code == 404:
-                _pt_result = f"task {_display_id} 不存在或已结束"
-            else:
-                _pt_result = f"API 返回 {_pt_resp.status_code}"
-        except Exception as _pt_e:
-            _pt_result = f"调用失败 {_pt_e}"
-    else:
-        _pt_result = "task_id 不能为空"
-    _emit_pseudo_tool_result(ls, pseudo_call, _pt_result)
+    task_id 可以是完整 id、id 前缀或节点名，由 supervisor 只在调用方的会话家族里认。
+    """
+    result = await _preempt_in_family(
+        ls, str(args.get("task_id") or "").strip(), str(args.get("message") or "").strip(),
+    )
+    _emit_pseudo_tool_result(ls, pseudo_call, result)
     return None
+
+
+async def _preempt_in_family(ls: _LoopState, ref: str, message: str) -> str:
+    if not ref:
+        return "task_id 不能为空"
+    caller_task_id = str(getattr(ls.rctx, "task_id", "") or "").strip()
+    if not caller_task_id:
+        return "找不到发起这次调用的任务，没法确定该在哪些任务里找"
+    supervisor_url = ls.rctx.supervisor_url
+    try:
+        found = await ls.rctx.http.get(
+            f"{supervisor_url}/v1/tasks/{caller_task_id}/family/resolve", params={"ref": ref},
+        )
+        if found.status_code == 404:
+            return (
+                f"这段对话和它派出去的任务里没有能插话的 '{ref}'："
+                "不存在、已结束、正挂起等子任务，或者是工具任务、系统任务"
+            )
+        if found.status_code == 409:
+            return _ambiguous_preempt_target(ref, found)
+        if found.status_code != 200:
+            return f"查询任务 '{ref}' 失败: HTTP {found.status_code}"
+        target = found.json()
+        if not isinstance(target, dict):
+            target = {}
+        target_id = str(target.get("task_id") or "").strip()
+        if not target_id:
+            return f"查询任务 '{ref}' 失败: 没有返回任务 ID"
+        label = f"{target.get('node_id') or 'task'}({target_id[:8]})"
+        body: dict[str, Any] = {"caller_task_id": caller_task_id}
+        if message:
+            body["message"] = message
+        response = await ls.rctx.http.post(f"{supervisor_url}/v1/tasks/{target_id}/preempt", json=body)
+    except Exception as error:
+        return f"调用失败 {error}"
+    if response.status_code == 200:
+        if message:
+            return f"已向 task {label} 注入追加指令，子任务继续执行"
+        return f"已标记 task {label} 为 preempt，等待优雅退出"
+    if response.status_code == 404:
+        return f"task {label} 刚刚结束，或挂起去等子任务了，这次没有生效"
+    return f"API 返回 {response.status_code}"
+
+
+def _ambiguous_preempt_target(ref: str, response: Any) -> str:
+    """对上多个任务时列出候选，让模型换成其中一个 ID 前缀再调。"""
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        detail = None
+    detail = detail if isinstance(detail, dict) else {}
+    candidates = detail.get("candidates")
+    lines = [f"'{ref}' 对上了多个正在运行的任务，task_id 换成下面某一个 ID 前缀再调用："]
+    listed = 0
+    for item in candidates if isinstance(candidates, list) else []:
+        if isinstance(item, dict) and item.get("task_id"):
+            lines.append(f"- {item['task_id']}（{item.get('node_id') or '?'}，{item.get('status') or '?'}）")
+            listed += 1
+    total = detail.get("total")
+    if isinstance(total, int) and total > listed:
+        lines.append(f"一共 {total} 个，这里只列了 {listed} 个。")
+    return "\n".join(lines)
 
 
 def _target_is_persistent(ls: _LoopState, target: str) -> bool:
@@ -573,13 +565,10 @@ async def _resolve_dispatch_request(
 
 
 async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> None:
-    """处理 dispatch:{target_id} 动态伪工具。始终返回 None（非终止）。
+    """处理 dispatch:{target_id} 动态伪工具（异步委派）。始终返回 None（非终止）。
 
-    [2026-05-28] 所有异步 dispatch 统一走 inbound 路径。
-    为什么：让异步子节点复用现有的 session / entry-branch / conversation 机制，
-    而不是用单独的 dispatch-async 端点。
-    怎么改：构造 inbound payload（含 dispatch_origin 回调信息），POST /v1/inbound。
-    目的：统一生命周期管理，为 persistent node 支持铺路。
+    委派是一条带 dispatch_origin 回调信息的 inbound（POST /v1/inbound）：子节点在自己的 agent: 会话里跑，
+    和用户消息共用会话、入口分支和对话存储；做完后结果作为新消息注入回发起方会话。
     """
     request, refusal = await _resolve_dispatch_request(ls, args, pseudo_call)
     if request is None:

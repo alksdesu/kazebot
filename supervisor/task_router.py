@@ -1920,11 +1920,6 @@ class TaskRouterMixin:
             self._inject_dispatch_result_via_origin_locked(task, fallback_result)
             return
 
-        # 旧路径（向后兼容）：异步 dispatch 子任务完成 → 注入 inbound 通知入口节点
-        if task.input.get("_async_dispatch"):
-            self._inject_async_dispatch_result_locked(task, fallback_result)
-            return
-
         # 系统内部任务（如记忆提取）静默完成，不输出给用户
         if task.input.get("_system_task"):
             return
@@ -2020,148 +2015,20 @@ class TaskRouterMixin:
         return True
 
     # ------------------------------------------------------------------ #
-    #  异步 dispatch 结果注入
-    # ------------------------------------------------------------------ #
-
-    def _inject_async_dispatch_result_locked(
-        self, task: Task, fallback_result: dict[str, Any],
-    ) -> None:
-        """异步 dispatch 子任务完成后，将结果作为新 inbound 注入 session。
-
-        [Fork/Merge 2026-05-12] 不再自动 preempt running/suspended 入口 task。
-        原因：preempt 只能由 adapter 显式 API 触发；内部结果注入应 fork 新分支并发处理。
-        做法：始终走 inbound 创建路径。目的：避免内部事件破坏正在运行的入口分支。
-
-        此方法在 self._lock 内调用，不可调用会再次获取 _lock 的公开方法。
-        """
-
-        result_text = str(fallback_result.get("text") or "").strip()
-        result_summary = str(fallback_result.get("summary") or "").strip()
-        caller_node = str(task.input.get("_caller_node_id") or "").strip()
-
-        child_session_id = str(task.input.get("child_session_id") or "").strip()
-
-        result_atts = (
-            fallback_result.get("attachments")
-            if isinstance(fallback_result.get("attachments"), list)
-            else None
-        )
-
-
-        route_session_id = self._route_session_id_for_task_locked(task)
-        session_info = self.sessions.get(route_session_id)
-        if not session_info:
-            log.warning(
-                "async dispatch result dropped: session %s not found for task %s",
-                route_session_id[:12], task.task_id[:12],
-            )
-            return
-
-        # 等待期间用户又说了一句就会 bump generation，子节点结果随之丢弃；对用户表现为
-        # 「说了稍等然后再无下文」，不留声就无从查起。
-        current_gen = self._current_session_generation_locked(route_session_id)
-        if task.session_generation and current_gen and task.session_generation != current_gen:
-            log.warning(
-                "async dispatch result dropped: session %s generation %s != %s for task %s",
-                route_session_id[:12], task.session_generation, current_gen, task.task_id[:12],
-            )
-            return
-
-        if route_session_id in self._cancelled_sessions:
-            log.warning(
-                "async dispatch result dropped: session %s cancelled for task %s",
-                route_session_id[:12], task.task_id[:12],
-            )
-            return
-
-        # [Fork/Merge 2026-05-12] 异步 dispatch 结果不再自动 preempt 入口 task。
-        # 原因：新架构规定 preempt 只能由 adapter 显式调用 preempt API 触发，普通 inbound
-        # 或内部注入都应通过 fork 分支并发处理。做法：移除 running/suspended 入口任务的
-        # 自动 preempt 分支，直接创建 inbound。目的：同一 session 下多个入口分支可并行运行。
-
-        # ---- 创建 inbound → 新 branch task ----
-        conv_key = session_info.conversation_key
-        channel = session_info.channel
-        msg_id = f"async_dispatch:{task.task_id}"
-        attachments_outbound_sent = self._emit_dispatch_attachment_outbound_locked(
-            session_id=route_session_id,
-            conversation_key=conv_key,
-            task=task,
-            attachments=result_atts,
-        ) if result_atts else False
-
-        payload: dict[str, Any] = {
-            "channel": channel,
-            "conversation_key": conv_key,
-            "message_id": msg_id,
-
-            "text": result_text,
-            "summary": result_summary,
- 
-            "message_type": "dispatch_result",
-            "caller_node_id": caller_node,
-            "child_node_id": task.node_id,
-            "child_task_id": task.task_id,
-            "child_session_id": child_session_id,
-        }
-        # [2026-07-15] 同 _inject_dispatch_result_via_origin_locked：回调明确回
-        # 发起节点，避免回退到 session 上一次绑定的入口节点而错路。
-        if caller_node:
-            payload["entry_node_id"] = caller_node
-        if attachments_outbound_sent:
-            payload["attachments_outbound_sent"] = True
-        elif result_atts:
-            payload["attachments"] = result_atts
-
-        callback_delivery_id = (
-            f"{task.delivery_id}:caller-resume" if task.delivery_id else ""
-        )
-        if callback_delivery_id:
-            payload["delivery_id"] = callback_delivery_id
-            if self.eventlog.find_delivery_event(
-                callback_delivery_id, event_type="inbound_message",
-            ):
-                return
-
-        # eventlog 有独立锁，不会与 self._lock 死锁
-        evt = self.eventlog.append(
-            session_id=route_session_id,
-            component="supervisor",
-            type_="inbound_message",
-            payload=payload,
-        )
-        seq = int(evt.get("seq", 0))
-        self._apply_inbound_message(seq=seq, session_id=route_session_id, payload=payload)
-        self._create_entry_task_for_inbound_locked(
-            inbound_seq=seq, session_id=route_session_id, payload=payload,
-        )
-
-    # ------------------------------------------------------------------ #
-    #  [2026-05-28] 新路径：通过 dispatch_origin 回调结果
+    #  异步委派结果回调
     # ------------------------------------------------------------------ #
 
     def _inject_dispatch_result_via_origin_locked(
         self, task: Task, fallback_result: dict[str, Any],
     ) -> None:
-        """dispatch_origin 路径的回调注入。
+        """异步委派的子任务完成后，把结果作为新 inbound 注入 dispatch_origin 记的发起方会话。
 
-        [2026-05-28] 异步 dispatch 统一走 inbound 后，子任务完成时通过
-        task.input["_dispatch_origin"] 中记录的 parent_session_id 将结果
-        作为新 inbound 注入回调用方 session。
-
-        与 _inject_async_dispatch_result_locked 逻辑基本一致，区别在于：
-        - 从 task.input["_dispatch_origin"] 读取回调目标
-        - 目标是 dispatch_origin.parent_session_id（不是 task 自身的 route session）
-
+        回调目标是 dispatch_origin.parent_session_id，不是子任务自己的 route session。
         此方法在 self._lock 内调用。
         """
         origin = task.input.get("_dispatch_origin") or {}
         target_session_id = str(origin.get("parent_session_id") or "").strip()
         caller_node = str(origin.get("caller_node_id") or "").strip()
-        # [AutoC 2026-06-03] Why: dispatch_origin callbacks use the same visible
-        # callback card as legacy async dispatch. How: keep the child session id from
-        # the completed child task input. Purpose: both callback paths support the
-        # same structured web jump button.
         child_session_id = str(task.input.get("child_session_id") or "").strip()
 
         if not target_session_id:
@@ -2425,30 +2292,29 @@ class TaskRouterMixin:
         guide = context.get(OUTPUT_GUIDE_KEY) if isinstance(context, dict) else None
         return dict(guide) if isinstance(guide, dict) else None
 
-    def _find_entry_task_by_status_locked(self, session_id: str, statuses: set) -> Task | None:
-        """在 session 中查找指定状态的入口 task。
+    @staticmethod
+    def _is_user_entry_task(task: Task) -> bool:
+        """用户消息直接建出来的入口任务。
 
-        入口 task 定义：无 caller、非异步 dispatch 子任务、非系统任务。
+        派出去的子任务不算（同步委派有 caller，异步委派的执行体带 dispatch_origin），系统任务和定时任务也不算。
+        running_tasks 的 is_user_entry 用的也是这一份，适配器据它决定新消息抢占哪个任务。
+        """
+        task_input = task.input if isinstance(task.input, dict) else {}
+        return not (
+            (task.caller_task_id or "").strip()
+            or task_input.get("_dispatch_origin")
+            or task_input.get("_system_task")
+            or task_input.get("schedule_id")
+        )
+
+    def _find_entry_task_by_status_locked(self, session_id: str, statuses: set) -> Task | None:
+        """在 session 中查找指定状态的入口 task，口径同 _is_user_entry_task。
+
         若存在多个符合条件的 task（理论上不应发生），返回最早创建的。
         """
         candidate: Task | None = None
         for t in self.tasks.values():
-            if t.session_id != session_id:
-                continue
-            if t.status not in statuses:
-                continue
-            # 排除：有 caller 的子任务
-            if t.caller_task_id:
-                continue
-            # 排除：异步 dispatch 子任务自身（旧路径）
-            if t.input.get("_async_dispatch"):
-                continue
-            # [2026-05-28] 排除：通过 inbound dispatch_origin 创建的子任务。
-            # 为什么：这类任务是异步委派的执行体，不应被视为用户入口 task。
-            if t.input.get("_dispatch_origin"):
-                continue
-            # 排除：系统内部任务
-            if t.input.get("_system_task"):
+            if t.session_id != session_id or t.status not in statuses or not self._is_user_entry_task(t):
                 continue
             if candidate is None or t.created_at < candidate.created_at:
                 candidate = t

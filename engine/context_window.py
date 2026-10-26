@@ -23,8 +23,9 @@ _MIN_WINDOW_TOKENS = 1_000
 _MAX_WINDOW_TOKENS = 100_000_000
 _OUTPUT_LIMIT_OPTIONS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
 
-# 按顺序匹配规范化后的模型名，先匹配上的生效。值取各家文档写明的上下文长度；
-# GPT-5 系列取的是输入上限 272k（400k 总窗口里含 128k 输出），不是总窗口。
+# 按顺序匹配规范化后的模型名，先匹配上的生效，同一族里窗口不同的型号要写在通配前面。值取各家文档写明的上下文长度；
+# GPT-5 系列取的是输入上限 272k（400k 总窗口里含 128k 输出），不是总窗口；Gemini 的 TTS 型号同样取输入上限。
+# DeepSeek 文档只写「1M」，记成 1_000_000。值为 0 的型号官方没给窗口：不按窗口调整，也不会落进后面同族的通配。
 BUILTIN_CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
     ("claude-*", 200_000),
     ("gpt-4.1*", 1_047_576),
@@ -42,9 +43,26 @@ BUILTIN_CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
     ("gemini-1.5-*", 1_048_576),
     ("gemini-2.0-*", 1_048_576),
     ("gemini-2.5-*", 1_048_576),
+    ("gemini-3.1-flash-lite-image*", 65_536),
+    ("gemini-3.1-flash-image*", 131_072),
+    ("gemini-3-pro-image*", 65_536),
+    ("gemini-3.8-flash-lite-tts*", 8_192),
+    ("gemini-3.8-flash-tts*", 8_192),
+    ("gemini-3.1-flash-tts*", 8_192),
+    ("gemini-3.8-live*", 0),
+    ("gemini-3.1-flash-live*", 0),
+    ("gemini-3.5-live-translate*", 0),
+    ("gemini-3.5-transcribe*", 0),
     ("gemini-3*", 1_048_576),
-    ("deepseek-chat", 128_000),
-    ("deepseek-reasoner", 128_000),
+    ("gemini-4-argon*", 1_048_576),
+    ("gemini-nano-banana-2.1*", 131_072),
+    ("gemini-omni-1.1-flash*", 0),
+    ("deepseek-flash", 1_000_000),
+    ("deepseek-v4-pro", 1_000_000),
+    ("deepseek-v4-flash", 1_000_000),
+    ("deepseek-v4-flash-vision-exp", 1_000_000),
+    ("deepseek-chat", 1_000_000),
+    ("deepseek-reasoner", 1_000_000),
 )
 
 _SIZE_SUFFIX = re.compile(r"\[(?P<value>\d+(?:\.\d+)?)(?P<unit>[km])\]$")

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ._helpers import SessionInfo, _now
-from .types import ApprovalStatus, RouteStatus, TaskStatus
+from .types import ApprovalStatus, RouteStatus, Task, TaskKind, TaskStatus
 
 
 logger = logging.getLogger(__name__)
@@ -1210,3 +1210,179 @@ class SessionMixin:
         from engine.compact import DEFAULT_CHARS_PER_TOKEN, total_content_chars
 
         return int(total_content_chars(messages) / DEFAULT_CHARS_PER_TOKEN)
+
+    # ---- 会话家族 ----
+
+    # 任务 id 是 uuid4；不到 8 位的十六进制串更可能是节点名，不按 id 前缀认
+    _FAMILY_ID_PREFIX_MIN = 8
+    _FAMILY_ID_CHARS = frozenset("0123456789abcdef-")
+    _FAMILY_MAX_CANDIDATES = 10
+
+    def _session_parent_locked(self, session_id: str) -> str:
+        """登记在案的上级会话：入口分支和 child_* 子会话记着派出它的会话，主会话和 agent: 会话没有上级。"""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return ""
+        self._ensure_entry_branch_indexes_locked()
+        parent = self.entry_branch_parents.get(sid, "")
+        if parent:
+            return parent
+        entry = self._session_store.get_entry(sid)
+        if isinstance(entry, dict) and entry.get("is_child"):
+            parent = str(entry.get("parent_session_id") or "").strip()
+            if parent:
+                return parent
+        for (parent_sid, _node_id, _context_key), child_sid in self.child_session_map.items():
+            if child_sid == sid:
+                return parent_sid
+        for parent_sid, children in self.parent_children.items():
+            if sid in children:
+                return parent_sid
+        return ""
+
+    def _session_family_root_locked(self, session_id: str) -> str:
+        """从一个会话沿登记的上级一直往上，走到没有上级的那个会话。"""
+        current = str(session_id or "").strip()
+        seen: set[str] = set()
+        while current and current not in seen:
+            seen.add(current)
+            parent = self._session_parent_locked(current)
+            if not parent:
+                break
+            current = parent
+        return current
+
+    def _task_family_root_locked(self, task: Task) -> str:
+        """任务所属会话家族的根会话。
+
+        先沿发起链走到最上面的任务：同步派发看 caller，异步派发看发起任务，结果回调看产出结果的子任务。
+        再从那个任务所在的会话按登记往上找；链断在异步派发的执行体上时，从它 dispatch_origin 记的发起会话找起。
+        """
+        top = task
+        seen = {task.task_id}
+        while True:
+            parent = self.tasks.get(self._origin_parent_task_id(top))
+            if parent is None or parent.task_id in seen:
+                break
+            seen.add(parent.task_id)
+            top = parent
+        origin = top.input.get("_dispatch_origin")
+        start = str(origin.get("parent_session_id") or "").strip() if isinstance(origin, dict) else ""
+        return self._session_family_root_locked(start or self._route_session_id_for_task_locked(top))
+
+    def _in_caller_family_locked(self, caller_task_id: str, task: Task) -> bool:
+        """task 和调用方任务同属一个会话家族。调用方不存在或已结束时一律不算。"""
+        caller = self.tasks.get(str(caller_task_id or "").strip())
+        if caller is None or self._task_terminal(caller):
+            return False
+        root = self._task_family_root_locked(caller)
+        return bool(root) and root == self._task_family_root_locked(task)
+
+    def _family_target_locked(self, caller_task_id: str, task: Task) -> bool:
+        """模型经 engine 能打断的目标：调用方以外、能插话的节点任务，且和还在跑的调用方同属一个会话家族。"""
+        caller_id = str(caller_task_id or "").strip()
+        return (
+            task.task_id != caller_id
+            and self._family_preemptable(task)
+            and self._in_caller_family_locked(caller_id, task)
+        )
+
+    def resolve_family_task(self, caller_task_id: str, ref: str) -> dict[str, Any]:
+        """在调用方任务的会话家族里，按完整 id、id 前缀或节点名找一个能打断的节点任务。
+
+        能打断指 running / pending 的节点任务，系统任务和调用方自己除外。家族外的任务一律当作不存在。
+        节点名对上多个时只看调用方自己派出去的那些；前缀或节点名最后仍对上多个，就返回候选，不替调用方挑。
+        """
+        from engine.node import known_node_ids
+
+        text = str(ref or "").strip()
+        caller_id = str(caller_task_id or "").strip()
+        if not text or not caller_id:
+            return {"found": False, "reason": "not_found"}
+        # 认节点旧 id 要读节点文件，放在锁外
+        node_ids = {text, *known_node_ids(self.workspace_root, text)}
+        prefix = text.lower()
+        by_prefix = len(prefix) >= self._FAMILY_ID_PREFIX_MIN and set(prefix) <= self._FAMILY_ID_CHARS
+        with self._lock:
+            caller = self.tasks.get(caller_id)
+            if caller is None or self._task_terminal(caller):
+                return {"found": False, "reason": "caller_not_found"}
+            root = self._task_family_root_locked(caller)
+            if not root:
+                return {"found": False, "reason": "not_found"}
+
+            def in_family(task: Task) -> bool:
+                return self._task_family_root_locked(task) == root
+
+            exact = self.tasks.get(text)
+            if exact is not None and exact.task_id != caller.task_id and in_family(exact):
+                if self._family_preemptable(exact):
+                    return self._family_found(exact, "id")
+                return {"found": False, "reason": "not_found"}
+            live = [
+                task for task in self.tasks.values()
+                if task.task_id != caller.task_id and self._family_preemptable(task)
+            ]
+            if by_prefix:
+                matches = [task for task in live if task.task_id.lower().startswith(prefix) and in_family(task)]
+                if len(matches) == 1:
+                    return self._family_found(matches[0], "prefix")
+                if matches:
+                    return self._family_ambiguous(matches)
+            matches = [task for task in live if task.node_id in node_ids and in_family(task)]
+            if len(matches) == 1:
+                return self._family_found(matches[0], "node")
+            own = [task for task in matches if self._dispatched_by(task, caller.task_id)]
+            if len(own) == 1:
+                return self._family_found(own[0], "node")
+            if matches:
+                return self._family_ambiguous(own or matches)
+            return {"found": False, "reason": "not_found"}
+
+    @staticmethod
+    def _family_preemptable(task: Task) -> bool:
+        if task.kind != TaskKind.node or task.status not in (TaskStatus.running, TaskStatus.pending):
+            # 打断靠模型循环在步与步之间读标记，工具任务和挂起等子任务的任务都读不到
+            return False
+        context = task.input.get("task_context")
+        # 系统任务是压缩、记忆、轮摘要这类内部流程，插进去的话只会写坏它们的产出
+        return not (task.input.get("_system_task") or (isinstance(context, dict) and context.get("is_system_task")))
+
+    @staticmethod
+    def _dispatched_by(task: Task, caller_task_id: str) -> bool:
+        origin = task.input.get("_dispatch_origin")
+        return task.caller_task_id == caller_task_id or (
+            isinstance(origin, dict) and str(origin.get("caller_task_id") or "") == caller_task_id
+        )
+
+    @staticmethod
+    def _family_found(task: Task, matched_by: str) -> dict[str, Any]:
+        return {
+            "found": True,
+            "task_id": task.task_id,
+            "node_id": task.node_id or "",
+            "status": task.status.value,
+            "matched_by": matched_by,
+        }
+
+    def _family_ambiguous(self, tasks: list[Task]) -> dict[str, Any]:
+        ordered = sorted(tasks, key=lambda task: task.created_at)
+        width = self._distinct_id_width([task.task_id for task in ordered])
+        return {
+            "found": False,
+            "reason": "ambiguous",
+            "total": len(ordered),
+            "candidates": [
+                {"task_id": task.task_id[:width], "node_id": task.node_id or "", "status": task.status.value}
+                for task in ordered[:self._FAMILY_MAX_CANDIDATES]
+            ],
+        }
+
+    @classmethod
+    def _distinct_id_width(cls, task_ids: list[str]) -> int:
+        """候选 id 截到多长才互不相同，至少截到前缀能被认出来的长度。"""
+        longest = max((len(task_id) for task_id in task_ids), default=0)
+        width = min(cls._FAMILY_ID_PREFIX_MIN, longest)
+        while width < longest and len({task_id[:width].lower() for task_id in task_ids}) < len(task_ids):
+            width += 1
+        return width

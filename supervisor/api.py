@@ -699,7 +699,11 @@ def create_app(
 
     @app.post("/v1/tasks/{task_id}/preempt")
     async def task_preempt(task_id: str, request: Request) -> dict[str, Any]:
-        """Bot 调用：标记单个 task 为 preempt_requested。"""
+        """标记单个 task 为 preempt_requested。
+
+        适配器按自己会话的 running_tasks 选目标，不带 caller_task_id。engine 替模型打断时带上发起任务，
+        目标不在它的会话家族里、或不是能插话的节点任务，都和不存在一样回 404。
+        """
         body = {}
         try:
             body = await request.json()
@@ -707,6 +711,9 @@ def create_app(
             pass
         if not isinstance(body, dict):
             raise HTTPException(status_code=422, detail="body must be an object")
+        caller_task_id = body.get("caller_task_id")
+        if caller_task_id is not None and (not isinstance(caller_task_id, str) or not caller_task_id.strip()):
+            raise HTTPException(status_code=422, detail="caller_task_id must be a non-empty string")
         msg = body.get("message", "")
         atts = body.get("attachments", [])
         memory_hints = body.get("memory_hints")
@@ -729,6 +736,8 @@ def create_app(
             kwargs["memory_hints"] = memory_hints
         if output_guide is not None:
             kwargs["output_guide"] = output_guide
+        if caller_task_id is not None:
+            kwargs["caller_task_id"] = caller_task_id.strip()
         ok = await run_in_threadpool(st.preempt_task, task_id, **kwargs)
         if not ok:
             raise HTTPException(status_code=404, detail="task not found or not active")
@@ -814,9 +823,6 @@ def create_app(
                     continue
                 if task.status not in (TaskStatus.running, TaskStatus.pending):
                     continue
-                _is_async = bool(task.input.get("_async_dispatch"))
-                _is_system = bool(task.input.get("_system_task"))
-                _is_scheduled = bool(task.input.get("schedule_id"))
                 branch_session_id = str(task.input.get("branch_session_id") or "")
                 if not branch_session_id and task.session_id != session_id:
                     branch_session_id = task.session_id
@@ -826,59 +832,34 @@ def create_app(
                     "status": task.status.value,
                     "created_at": task.created_at.isoformat() if task.created_at else "",
                     "caller_task_id": task.caller_task_id or "",
-                    "is_user_entry": bool(not task.caller_task_id and not _is_async and not _is_system and not _is_scheduled),
+                    "is_user_entry": st._is_user_entry_task(task),
                     "source_inbound_seq": task.source_inbound_seq,
                     "branch_session_id": branch_session_id,
                     "parent_session_id": str(task.input.get("parent_session_id") or (session_id if branch_session_id else "")),
                 })
         return {"tasks": tasks}
 
-    # [2026-05-28] 全局按 node_id 查找活跃任务（跨 session）。
-    # 为什么：dispatch 到持久节点的任务运行在独立 session 上，调用方不知道目标 session_id。
-    # 怎么改：新增端点，遍历所有活跃 task，按 node_id 匹配返回第一个。
-    # 目的：支持 preempt_task 跨 session 查找持久节点任务。
-    @app.get("/v1/tasks/active-by-node/{node_id}")
-    def global_task_by_node(node_id: str) -> dict[str, Any]:
-        """[2026-05-28] 全局查找指定 node_id 的活跃任务（running/pending）。
+    @app.get("/v1/tasks/{task_id}/family/resolve")
+    def task_family_resolve(
+        task_id: str, request: Request, ref: str = Query(..., min_length=1, max_length=256),
+    ) -> dict[str, Any]:
+        """Engine 调用：在路径里这个调用方任务的会话家族里，按完整 id、id 前缀或节点名找一个能打断的任务。
 
-        遍历所有任务，不限定 session。用于跨 session 定位持久节点任务。
+        家族外的任务和不存在一样回 404；对上多个回 409，带着截短的候选 id。
         """
+        verify_admin_token(request)
         st: SupervisorState = app.state.state
-        with st._lock:
-            for task in st.tasks.values():
-                if task.node_id != node_id:
-                    continue
-                if task.status not in (TaskStatus.running, TaskStatus.pending):
-                    continue
-                return {
-                    "task_id": task.task_id,
-                    "session_id": task.session_id,
-                    "status": task.status.value,
-                }
-        raise HTTPException(status_code=404, detail=f"no active task for node '{node_id}'")
-
-    # [2026-05-28] 按 node_id 查找 session 中活跃任务。
-    # 为什么：preempt_task 原本只接受 task_id（UUID），调用者需知道精确 ID 才能操作。
-    # 怎么改：新增端点，遍历 session 内所有活跃 task，按 node_id 匹配返回第一个。
-    # 目的：允许 engine 侧用 node_id（如 "bob"）定位子节点任务再执行 preempt。
-    @app.get("/v1/sessions/{session_id}/tasks/by-node/{node_id}")
-    def session_task_by_node(session_id: str, node_id: str) -> dict[str, Any]:
-        """按 node_id 查找 session 中活跃（running/pending）的 task。"""
-        st: SupervisorState = app.state.state
-        if session_id not in st.sessions:
-            raise HTTPException(status_code=404, detail="session not found")
-        with st._lock:
-            # 与 running_tasks 端点一致，查询主 session 及其入口分支
-            session_ids = {session_id, *st._entry_branch_ids_for_parent_locked(session_id)}
-            for task in st.tasks.values():
-                if task.session_id not in session_ids:
-                    continue
-                if task.node_id != node_id:
-                    continue
-                if task.status not in (TaskStatus.running, TaskStatus.pending):
-                    continue
-                return {"task_id": task.task_id, "status": task.status.value}
-        raise HTTPException(status_code=404, detail=f"no active task for node '{node_id}'")
+        found = st.resolve_family_task(task_id, ref)
+        if found.get("found"):
+            return {key: found[key] for key in ("task_id", "node_id", "status", "matched_by")}
+        reason = found.get("reason")
+        if reason == "ambiguous":
+            raise HTTPException(status_code=409, detail={
+                "error": "ambiguous", "total": found["total"], "candidates": found["candidates"],
+            })
+        if reason == "caller_not_found":
+            raise HTTPException(status_code=404, detail="caller task not found or not active")
+        raise HTTPException(status_code=404, detail="no active task matches in this conversation")
 
     @app.post("/v1/tasks/{task_id}/renew_lease")
     def renew_lease(task_id: str, body: TaskLeaseRenewIn) -> dict[str, Any]:
@@ -2020,116 +2001,6 @@ def create_app(
             restart_gate.release()
             raise
         return RestartOut(scheduled=True, target="all")
-
-    # ---- 异步委派 API ----
-    @app.post("/v1/tasks/dispatch-async")
-    async def dispatch_async(request: Request) -> dict[str, Any]:
-        """异步委派子节点：创建子任务后立即返回 task_id，父任务不挂起。"""
-        st: SupervisorState = app.state.state
-        body = await request.json()
-
-        session_id = str(body.get("session_id") or "").strip()
-        session_generation = int(body.get("session_generation", 1))
-        node_id = str(body.get("node_id") or "").strip()
-        instruction = str(body.get("instruction") or "").strip()
-        # [AutoC 2026-07-09] Why: default no longer hardwired to accumulate; explicit
-        # arg wins, otherwise inferred from target node persistent declaration
-        # (persistent -> accumulate, else fresh).
-        _raw_ctx_mode = str(body.get("context_mode") or "").strip()
-        if _raw_ctx_mode:
-            context_mode = _raw_ctx_mode
-        else:
-            _node_persistent = False
-            if node_id:
-                try:
-                    from engine.node import load_node
-                    _tn = load_node(Path(st.workspace_root), node_id)
-                    _node_persistent = bool(_tn is not None and getattr(_tn, "persistent", False))
-                except Exception:
-                    _node_persistent = False
-            context_mode = "accumulate" if _node_persistent else "fresh"
-        context_key = str(body.get("context_key") or "").strip() or None
-        source_inbound_seq = body.get("source_inbound_seq")
-        caller_node_id = str(body.get("caller_node_id") or "").strip()
-        # [Fork/Merge 2026-05-17] Why: newer engine workers include the parent
-        # route session when an async dispatch is requested from a branch. How:
-        # read it as a fallback for branch index recovery. Purpose: async children
-        # are anchored to the durable conversation even if branch indexes are stale.
-        parent_session_id = str(body.get("parent_session_id") or "").strip()
-        # [2026-04-22] 读取父节点传来的附件列表，透传到 input_data 供 runner.py 消费
-        attachments = body.get("attachments")
-
-        if not session_id or not node_id:
-            raise HTTPException(status_code=400, detail="session_id and node_id required")
-        if session_id not in st.sessions:
-            raise HTTPException(status_code=404, detail="session not found")
-
-        input_data: dict[str, Any] = {
-            "instruction": instruction,
-            "_async_dispatch": True,
-            "_caller_node_id": caller_node_id,
-        }
-        # [2026-04-22] 将附件列表注入 input_data，runner.py L594 已支持读取 input_data["attachments"]
-        if attachments and isinstance(attachments, list):
-            input_data["attachments"] = attachments
-        if context_key:
-            input_data["_context_key"] = context_key
-
-        src_seq: int | None = None
-        if source_inbound_seq is not None:
-            try:
-                src_seq = int(source_inbound_seq)
-            except (ValueError, TypeError):
-                pass
-
-        with st._lock:
-            # [2026-05-14] 异步子任务应挂到 parent session 而非 caller 的 branch。
-            # 问题：caller 跑在 entry branch 上，caller finish 后 branch 被清理，
-            # 导致异步子任务被连带 cancelled。
-            # 修复：如果 session_id 是 entry branch，追溯到 parent session。
-            # 子任务完成后 _inject_async_dispatch_result_locked 会往 parent 注入
-            # inbound 并 fork 新 branch 处理结果，路径不受影响。
-            st._ensure_entry_branch_indexes_locked()
-            _task_session_id = session_id
-            _task_generation = session_generation
-            _parent_of_branch = st.entry_branch_parents.get(session_id)
-            if not _parent_of_branch and parent_session_id:
-                # [Fork/Merge 2026-05-17] Why: a restarted supervisor may have to
-                # infer branch ancestry from the request payload or sessions.json.
-                # How: trust parent_session_id only when the supplied session is an
-                # entry branch for that parent. Purpose: avoid misrouting ordinary
-                # child sessions while recovering branch async dispatch routing.
-                if st._is_entry_branch_session_locked(session_id, parent_session_id=parent_session_id):
-                    _parent_of_branch = parent_session_id
-            if _parent_of_branch:
-                _task_session_id = _parent_of_branch
-                _task_generation = st._current_session_generation_locked(_task_session_id) or 1
-
-            # Child Session 隔离（Phase B）：async dispatch 也走 child session
-            _child_sid, _is_new = st.get_or_create_child_session(
-                _task_session_id, node_id, context_key or "", context_mode,
-            )
-            input_data["child_session_id"] = _child_sid
-            input_data["context_mode"] = context_mode
-            input_data["use_context"] = False
-            if context_mode == "fork":
-                input_data["fork_from_session_id"] = _task_session_id
-            # 审计报告 Step 1（2026-04-16）：删除 async dispatch 的 accumulate fallback。
-            # engine/runner.py:514 在 child_session_id 非空时会无条件清空 context_ref，
-            # 此 fallback 注入永远不会被消费，属于兼容期死代码。
-
-            task = st._create_task_locked(
-                session_id=_task_session_id,
-                session_generation=_task_generation,
-                kind=TaskKind.node,
-                node_id=node_id,
-                input_data=input_data,
-                continuation={},
-                source_inbound_seq=src_seq,
-                caller_task_id=None,
-            )
-
-        return {"ok": True, "task_id": task.task_id}
 
     # 旧路径留给还没换新 SDK 的调用方。
     @app.post("/v1/qq/intent/judge")

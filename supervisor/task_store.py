@@ -267,7 +267,7 @@ class TaskStoreMixin:
                     "task_context", "_dispatch_origin", "dispatch_context_mode",
                     "parent_session_id", "branch_session_id", "base_count", "base_last_id",
                     "_route_session_id", "_branch_finalized", "child_session_id",
-                    "_compact_dispatch_pending", "_system_task", "_async_dispatch", "_session_reset",
+                    "_compact_dispatch_pending", "_system_task", "_session_reset",
                     "_compact_plan", "_compact_target_session_id", "_compact_keep_recent",
                     "_compact_keep_recent_tokens", "_compact_threshold_tokens", "_compact_failures",
                     "context_ref",
@@ -997,11 +997,19 @@ class TaskStoreMixin:
         self, task_id: str, message: str = "", attachments: list | None = None,
         memory_hints: dict[str, Any] | None = None,
         output_guide: OutputGuide | dict[str, Any] | None = None,
+        *,
+        caller_task_id: str | None = None,
     ) -> bool:
-        """标记单个 task 为 preempt_requested。不影响 session 状态。"""
+        """标记单个 task 为 preempt_requested。不影响 session 状态。
+
+        带 caller_task_id 的是任务里的模型经 engine 发起的：目标不在调用方的会话家族里，或不是能插话的节点任务
+        （工具任务、系统任务），都和不存在一样返回 False。适配器不带，它按自己会话的 running_tasks 选目标。
+        """
         with self._lock:
             task = self.tasks.get(task_id)
             if task is None or task.status not in (TaskStatus.running, TaskStatus.pending):
+                return False
+            if caller_task_id is not None and not self._family_target_locked(caller_task_id, task):
                 return False
             task.preempt_requested = True
             task.preempt_message = message

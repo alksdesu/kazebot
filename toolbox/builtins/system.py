@@ -18,6 +18,7 @@ _T = TypeVar("_T")
 
 # git 在线程池里跑，同时来的两次重启会并发 git add/commit 抢同一个 index.lock。
 _git_lock = threading.Lock()
+_HEAD_SHOWN_CHARS = 12
 
 
 def _ok(result_text: str, **fields: Any) -> dict[str, Any]:
@@ -171,6 +172,22 @@ async def _in_git_thread(func: Callable[..., _T], /, *args: Any, **kwargs: Any) 
     return await asyncio.to_thread(_locked_git, func, *args, **kwargs)
 
 
+def _checkpoint_note(commit_res: Any) -> str:
+    """告诉用户重启前那个提交能拿来做什么：重启流程本身不回退版本，新版本有问题要手动回退到它。"""
+    result = commit_res if isinstance(commit_res, dict) else {}
+    if not result.get("ok"):
+        reason = str(result.get("error") or "原因不明")
+        return f"（重启前没能留下 checkpoint 提交：{reason}。新版本有问题时没有现成的提交可退，只能手动排查）"
+    head = str(result.get("after_head") or result.get("before_head") or "").strip()[:_HEAD_SHOWN_CHARS]
+    commit = f" {head}" if head else ""
+    if result.get("committed"):
+        return f"（重启前已把工作区改动提交为 checkpoint{commit}；新版本有问题时可以手动回退到这个提交，重启不会自己回退）"
+    return (
+        f"（工作区没有未提交的改动，重启前的版本就是当前提交{commit}；"
+        "新版本有问题时可以手动回退到这个提交，重启不会自己回退）"
+    )
+
+
 async def request_restart(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     target = str(args.get("target", "engine"))
     reason = str(args.get("reason", ""))
@@ -202,7 +219,7 @@ async def request_restart(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         final_text = f"已请求重启：{target}。"
         if reason.strip():
             final_text += f"\n原因：{reason.strip()}"
-        final_text += "\n（系统已创建 checkpoint；若新版本启动失败将自动回滚）"
+        final_text += f"\n{_checkpoint_note(commit_res)}"
 
         try:
             await ctx.emit_event("intermediate_reply", {"text": final_text})
