@@ -244,7 +244,9 @@ class NodeRun:
         *responses: ProviderResponse,
         instruction: str = "do the work",
         resume_data: dict[str, Any] | None = None,
+        **loop_options: Any,
     ) -> TaskAction:
+        """loop_options 原样交给 run_ai_node，比如 steps_used、run_budget、carried_todos。"""
         queue = list(responses)
 
         async def provider_call(ls: Any, step: int) -> ProviderResponse:
@@ -264,6 +266,7 @@ class NodeRun:
             instruction=instruction,
             history=[],
             resume_data=resume_data,
+            **loop_options,
         ))
 
     def tool_names(self, request_index: int) -> list[str]:

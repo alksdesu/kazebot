@@ -9,12 +9,18 @@ from enum import Enum
 from typing import Any
 
 from clonoth_runtime import get_str, load_runtime_config, main_session_enabled, parse_bool
+from engine.dispatch_batch import CONTINUE_FROM_KEY
+from engine.dispatch_handle import parse_handle
 from engine.output_guide import OUTPUT_GUIDE_KEY
+from engine.run_budget import AUTO_CONTINUE_KEY, STEPS_USED_KEY
 from engine.tool_outputs import bounded_for_event
 from platforms.registry import find_platform
 
+from . import child_retention
 from ._helpers import _now
+from .auto_continue import chain_input
 from .context_calibration import calibrated_chars_per_token
+from .task_traits import REQUEUE_MARK
 from .types import OutputGuide, RouteStatus, Task, TaskKind, TaskStatus, output_guide_payload
 
 
@@ -270,7 +276,7 @@ class TaskStoreMixin:
                     "_compact_dispatch_pending", "_system_task", "_session_reset",
                     "_compact_plan", "_compact_target_session_id", "_compact_keep_recent",
                     "_compact_keep_recent_tokens", "_compact_threshold_tokens", "_compact_failures",
-                    "context_ref",
+                    "context_ref", STEPS_USED_KEY, REQUEUE_MARK,
                 ):
                     if _k in raw_input:
                         slim_input[_k] = raw_input[_k]
@@ -683,6 +689,16 @@ class TaskStoreMixin:
         if bool(payload.get("attachments_outbound_sent")):
 
             inbound_metadata["inbound_attachments_outbound_sent"] = True
+        _inbound_child_handle = str(payload.get("child_handle") or "").strip()
+        if _inbound_child_handle:
+            inbound_metadata["inbound_child_handle"] = _inbound_child_handle
+            if payload.get("child_continuable") is True:
+                inbound_metadata["inbound_child_continuable"] = True
+            _inbound_child_wrapup = str(payload.get("child_wrapup") or "").strip()
+            if _inbound_child_wrapup:
+                inbound_metadata["inbound_child_wrapup"] = _inbound_child_wrapup
+        # 自动续跑的那一轮带着续跑链：第几轮、链从哪一刻起算寿命、上一段留下的待办
+        _auto_continue = chain_input(payload.get("auto_continue"))
 
         # task_created 快照一产生就包含 SDK 路由所需字段。
         if _dispatch_origin:
@@ -744,11 +760,16 @@ class TaskStoreMixin:
                 "dispatch_context_mode": _dispatch_context_mode,
                 "_dispatch_origin": _dispatch_origin,
                 **inbound_metadata,
+                **({AUTO_CONTINUE_KEY: _auto_continue} if _auto_continue is not None else {}),
             },
             continuation={},
             source_inbound_seq=inbound_seq,
             caller_task_id=None,
         )
+        _continued = parse_handle(_dispatch_origin.get(CONTINUE_FROM_KEY)) if _dispatch_origin else None
+        if _continued is not None and _continued.session_id == session_id:
+            # 接着上一个子 agent 做：会话不再为接着做留着，这一程留不留看新任务自己的结局
+            child_retention.release_locked(self, session_id, task_id=_continued.task_id)
         # [2026-05-28/2026-05-29] dispatch_origin 透传：异步 dispatch 走 inbound 时
         # 将回调元数据写入 task.input。为什么：task 完成后 task_router 需要知道结果
         # 应发回哪个 session，同时 task_created 事件也必须携带 route 元数据。怎么改：
@@ -976,20 +997,29 @@ class TaskStoreMixin:
 
     # ---- orphaned task cleanup ----
 
-    def cancel_orphaned_tasks(self) -> int:
-        """Cancel all non-terminal tasks after a full restart.
+    def cancel_orphaned_tasks(self, *, claimed_before: datetime | None = None) -> int:
+        """engine 整个重启之后收拾旧进程手里的任务，返回重排和取消的个数之和。
 
-        After a full restart, engine workers are gone and LLM context is
-        not recoverable, so requeue is meaningless.  Call once during
-        startup after rebuild_from_events.
+        只动 claimed_before 之前领走、还在 running 的：排队的和挂起等子任务的留给新进程接着办，新进程已经领走的不碰。
+        声明了 auto_continue、已经有进展的节点任务重排一次，其余连同后代取消。
         """
+        from .task_requeue import ENGINE_RESTART, collect_orphans_locked, settle_orphans_locked, stored_steps
+
         with self._lock:
-            now = _now()
-            count = 0
-            for task in list(self.tasks.values()):
-                if self._cancel_task_locked(task, now, force=True, reason="引擎重启，任务已终止") is not CancelEffect.none:
-                    count += 1
-            return count
+            orphans = collect_orphans_locked(self, claimed_before=claimed_before)
+        if not orphans:
+            return 0
+        # 查进展要读对话文件，放在锁外；回到锁里时状态变了的任务不动
+        progress = stored_steps(self.workspace_root, orphans)
+        with self._lock:
+            requeued, cancelled = settle_orphans_locked(
+                self, orphans, progress, reason=ENGINE_RESTART, cancel_reason="引擎重启，任务已终止",
+            )
+        if requeued or cancelled:
+            logger.warning(
+                "engine restart: requeued %d and cancelled %d task(s) left by the old engine", requeued, cancelled,
+            )
+        return requeued + cancelled
 
     # ---- preempt ----
 
@@ -1206,8 +1236,11 @@ class TaskStoreMixin:
         claim = (claim_id or "").strip()
         if not tid or not wid:
             return None
+        from .task_requeue import requeue_after_shutdown_locked
+
         should_route = False
         cancelled_while_running = False
+        requeued = False
         with self._lock:
             task = self.tasks.get(tid)
             if task is None:
@@ -1231,6 +1264,8 @@ class TaskStoreMixin:
                     self._event_task_snapshot("task_cancelled", task, component="engine")
                     self._settle_cancelled_task_locked(task, finalize_branch=False)
                     cancelled_while_running = True
+                elif requeue_after_shutdown_locked(self, task, task.result):
+                    requeued = True
                 else:
                     act = str(task.result.get("action") or "").strip()
                     if act == "cancelled":
@@ -1269,6 +1304,7 @@ class TaskStoreMixin:
         elif should_route:
             self._route_completed_task(task)
         execution = getattr(self, "execution", None)
-        if execution is not None:
+        # 重排回队列的任务还没有结局，执行计划那一步等它真正结束再记
+        if execution is not None and not requeued:
             execution.on_task_completed(task)
         return TaskCompletion(task, outcome)

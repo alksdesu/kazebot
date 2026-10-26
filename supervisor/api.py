@@ -26,7 +26,7 @@ from engine.attachments import blocked_file_reject_reason
 from engine.tool_outputs import bounded_for_event
 from platforms.registry import conversation_key_prefix, features_module
 
-from . import provisioning, share_groups
+from . import continuation, provisioning, share_groups
 from .config_store import ConfigStore
 from .context_window_report import remember_engine_thresholds, with_engine_thresholds
 from .sticker_api import create_sticker_router
@@ -862,6 +862,22 @@ def create_app(
             raise HTTPException(status_code=404, detail="caller task not found or not active")
         raise HTTPException(status_code=404, detail="no active task matches in this conversation")
 
+    @app.get("/v1/tasks/{task_id}/continuation")
+    def task_continuation(
+        task_id: str,
+        request: Request,
+        handle: str = Query(..., min_length=1, max_length=320),
+        target: str = Query(..., min_length=1, max_length=256),
+        wait: bool = Query(False),
+    ) -> dict[str, Any]:
+        """Engine 调用：核对路径里这个调用方任务委派时带的 continue_from 句柄。
+
+        能接着做时给出子会话的信息；不能时 ok 为假，message 是给模型看的原因。
+        """
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        return continuation.resolve(st, task_id, handle, target, wait=wait)
+
     @app.post("/v1/tasks/{task_id}/renew_lease")
     def renew_lease(task_id: str, body: TaskLeaseRenewIn) -> dict[str, Any]:
         st: SupervisorState = app.state.state
@@ -880,7 +896,8 @@ def create_app(
         generation_id = str(body.get("generation_id") or "").strip()
         if not worker_id or not generation_id:
             raise HTTPException(status_code=400, detail="worker_id and generation_id required")
-        result = st.register_engine(worker_id, generation_id)
+        # 收拾旧进程留下的任务要读对话文件判断进展，不能卡住事件循环
+        result = await run_in_threadpool(st.register_engine, worker_id, generation_id)
         return result
 
     tool_watch = ToolTreeWatch(state.workspace_root)
@@ -1854,8 +1871,11 @@ def create_app(
                     )
 
             def _restart_and_report() -> None:
+                stopped_at = _now()
                 try:
                     pm.stop_engine()
+                    # 旧进程到这一刻已经停了：在这之前领走的任务都是它的，之后领走的归新进程
+                    stopped_at = _now()
                     time.sleep(1)  # 等待延迟信号消散
                     # 人工重启：看门狗上一轮的退避和停手一并清掉，否则新起的 engine 再崩时不会被拉起。
                     pm.clear_given_up()
@@ -1881,7 +1901,7 @@ def create_app(
                     return
                 # ---- 清理旧 engine 遗留的孤儿 task ----
                 try:
-                    _orphan_count = st.cancel_orphaned_tasks()
+                    _orphan_count = st.cancel_orphaned_tasks(claimed_before=stopped_at)
                 except Exception:
                     # engine 已经起来了，清理出错不算重启失败：记进日志，照常报完成。
                     log.exception("engine 重启后清理孤儿 task 失败")

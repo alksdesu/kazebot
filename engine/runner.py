@@ -25,6 +25,7 @@ from clonoth_runtime import (
     normalize_openai_secret,
     resolve_channel,
     resolve_system_model,
+    task_max_running_seconds,
 )
 from providers import registry as provider_registry
 from plugin_runtime import get_manager
@@ -46,6 +47,15 @@ from .node import Node, load_node, node_file, node_files
 from .tool_step import TOOL_CANCELLED, result_to_raw, summarize_result, tool_outcome
 from .conversation_store import ConversationStore, Message, MessageType
 from .conversation_routing import routing_meta
+from .interrupted_calls import INTERRUPTED_RESUME_TYPE, append_interrupted_results
+from .run_budget import (
+    AUTO_CONTINUE_KEY,
+    STEP_COUNT_RESULT_KEY,
+    WRAPUP_TIME,
+    RunBudget,
+    steps_used as task_steps_used,
+    wrapup_time_ratio,
+)
 from engine.signals import get_bus
 from engine.signals.bridge import install_event_bridge
 
@@ -850,9 +860,15 @@ async def _handle_task(
         else:
             result = {"action": "fail", "node_id": "", "error": f"未知 task kind: {kind}"}
     except asyncio.CancelledError:
-        # engine 优雅退出：先把终态报回去再走
+        # engine 优雅退出：先把终态报回去再走；带上做到了第几步，supervisor 据此决定重排还是取消
         logger.warning("task %s cancelled (engine shutdown)", task_id)
-        result = {"action": "cancelled", "node_id": str(item.get("node_id") or ""), "error": "engine graceful shutdown"}
+        result = {
+            "action": "cancelled",
+            "node_id": str(item.get("node_id") or ""),
+            "error": "engine graceful shutdown",
+            "interrupted": "engine_shutdown",
+            STEP_COUNT_RESULT_KEY: lease.steps_completed,
+        }
     except Exception as exc:
         logger.exception("task %s crashed", task_id)
         result = {"action": "fail", "node_id": str(item.get("node_id") or ""), "error": f"引擎内部错误: {exc}"}
@@ -968,6 +984,35 @@ def _build_task_context(input_data: dict[str, Any]) -> dict[str, Any]:
     if isinstance(inbound_attachments, list) and inbound_attachments:
         ctx["inbound_attachments"] = list(inbound_attachments)
     return ctx
+
+
+def _carried_todos(input_data: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """续跑任务从上一段带来的待办清单；不是续跑任务给 None。"""
+    chain = input_data.get(AUTO_CONTINUE_KEY)
+    todos = chain.get("todos") if isinstance(chain, dict) else None
+    return [dict(item) for item in todos if isinstance(item, dict)] if isinstance(todos, list) and todos else None
+
+
+def _dispatch_handle_lines(input_data: dict[str, Any], handle: str, node_id: str) -> list[str]:
+    """异步委派结果前缀里的句柄；子会话为接着做留着时，再说明怎么用 continue_from。"""
+    if not handle:
+        return []
+    lines = [f"Handle: {handle}"]
+    if not bool(input_data.get("inbound_child_continuable")):
+        return lines
+    target = node_id or "the same node"
+    wrapup = str(input_data.get("inbound_child_wrapup") or "").strip()
+    if wrapup:
+        limit = "run time" if wrapup == WRAPUP_TIME else "step"
+        lines.append(
+            f"It stopped at its {limit} limit before finishing. To let it continue, dispatch to {target} "
+            "again with continue_from set to this handle."
+        )
+    else:
+        lines.append(
+            f"To let it pick up where it stopped, dispatch to {target} again with continue_from set to this handle."
+        )
+    return lines
 
 
 async def _build_node_provider(
@@ -1086,6 +1131,10 @@ async def _run_node_task(
         task_context=_build_task_context(input_data),
         lease=lease,
     )
+    # 挂起前各段用掉的步数接着数；ai_step 里还会和快照记的取大
+    _steps_carried = task_steps_used(input_data)
+    rctx.completed_steps = _steps_carried
+    rctx.step_offset = _steps_carried
     _conv_store = ConversationStore(ws_root / "data" / "conversations")
     rctx.conversation_store = _conv_store  # type: ignore[attr-defined]
 
@@ -1101,6 +1150,18 @@ async def _run_node_task(
     fork_from = str(input_data.get("fork_from_session_id") or "").strip()
     context_ref = str(input_data.get("context_ref") or "").strip()
     use_context = bool(input_data.get("use_context", True))
+
+    if is_resume and str(resume_data_raw.get("type") or "").strip() == INTERRUPTED_RESUME_TYPE:
+        # 重启前最后一轮的工具调用没写结果：补成「中断，结果未知」再读历史，配对才完整
+        try:
+            _patched = await asyncio.to_thread(
+                append_interrupted_results, _conv_store, child_session_id or session_id, task_ids={task_id},
+            )
+        except Exception:
+            logger.exception("failed to mark interrupted tool calls: task=%s", task_id)
+        else:
+            if _patched:
+                logger.info("marked %d interrupted tool call(s) as unknown: task=%s", len(_patched), task_id)
 
     # Step 2（2026-04-16）：主节点切 ConversationStore 的 feature flag。
     # flag 开启时，主节点（无 child_session_id）从 data/conversations/{session_id}.jsonl
@@ -1215,6 +1276,7 @@ async def _run_node_task(
         or ""
     ).strip()
     _inbound_caller_node_id = str(input_data.get("inbound_caller_node_id") or "").strip()
+    _inbound_child_handle = str(input_data.get("inbound_child_handle") or "").strip()
     # dispatch_result 只带摘要、没有正文时也要留一条回调记录
     _should_write_user_input = bool(
         instruction
@@ -1241,6 +1303,8 @@ async def _run_node_task(
             _inbound_meta["child_node_id"] = _inbound_node_id
         if _inbound_caller_node_id:
             _inbound_meta["caller_node_id"] = _inbound_caller_node_id
+        if _inbound_child_handle:
+            _inbound_meta["child_handle"] = _inbound_child_handle
         _async_tool_status = async_result_tool_status(rctx.task_context)
         if _async_tool_status:
             _inbound_meta["tool_status"] = _async_tool_status
@@ -1263,6 +1327,7 @@ async def _run_node_task(
         # callback row has been stored. Purpose: storage remains pure while the caller
         # node receives an actionable instruction.
         _prefix_parts = [f"[Async task completed] Node {_inbound_node_id or 'unknown'} finished."]
+        _prefix_parts.extend(_dispatch_handle_lines(input_data, _inbound_child_handle, _inbound_node_id))
         if _inbound_summary:
             _prefix_parts.append(f"Summary: {_inbound_summary}")
         _prefix_parts.append(f"Result:\n{instruction}")
@@ -1283,6 +1348,9 @@ async def _run_node_task(
         exclude_patterns=_bridge_exclude_patterns,
     )
 
+    run_budget = RunBudget.for_task(
+        task, max_running_sec=task_max_running_seconds(), ratio=wrapup_time_ratio(runtime_cfg),
+    )
     try:
         action = await run_ai_node(
             rctx=rctx, provider=provider, registry=registry, node=node,
@@ -1293,6 +1361,9 @@ async def _run_node_task(
             switch_info=sw_info,
             streaming=bool(get_bool(runtime_cfg, "engine.streaming", False)),
             attachments=input_attachments,
+            steps_used=_steps_carried,
+            run_budget=run_budget,
+            carried_todos=_carried_todos(input_data),
         )
     finally:
         # 本轮的用户输入也走写入队列，结果交回 supervisor 前得落盘
@@ -1330,7 +1401,8 @@ async def _run_node_task(
             action=action.action,
             first_message_id=rctx.first_shadow_message_id,
             last_message_id=rctx.last_shadow_message_id,
-            step_count=rctx.completed_steps,
+            # 每段各记一条：只记本段走的步数，和 token_usage 一样不跨段累加
+            step_count=max(0, rctx.completed_steps - rctx.step_offset),
             tool_call_count=_tool_call_count,
             token_usage=dict(rctx.total_usage) if rctx.total_usage else {},
             outcome=action.summary or "",
@@ -1360,6 +1432,8 @@ async def _run_node_task(
     # 轮摘要节点化：传递 _tool_call_count 和 _total_tokens 给 supervisor 做门控判断
     _result["_tool_call_count"] = _tool_call_count
     _result["_total_tokens"] = _total_tokens
+    # 含挂起前各段的累计步数：supervisor 挂起时记到任务上，恢复后接着数
+    _result[STEP_COUNT_RESULT_KEY] = rctx.completed_steps
     # P3 记忆提取互斥：传递本轮使用的工具名列表，供 supervisor 判断是否跳过提取
     if rctx.tool_call_log:
         _result["_tool_names"] = list(set(tc["name"] for tc in rctx.tool_call_log))

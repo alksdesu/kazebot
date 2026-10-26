@@ -20,14 +20,22 @@ from typing import Any
 from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config, main_session_enabled
 from file_lock import exclusive_lock
 
+from . import auto_continue, child_retention, continuation
 from ._helpers import _now
 from .branch_finalize_store import BranchClaim
 from .compact_breaker import MAX_TASK_CONSECUTIVE_FAILURES
 from .file_claims import release_if_ended_locked
 from .reply_intent import result_from_task as reply_intent_result_from_task
 from engine.compact import COMPACT_SUMMARY_PREFIX
-from engine.dispatch_batch import MAX_DISPATCH_BATCH_ITEMS, batch_item_attachments
+from engine.dispatch_batch import (
+    CONTINUE_FROM_KEY,
+    MAX_DISPATCH_BATCH_ITEMS,
+    batch_item_attachments,
+    batch_item_continue_from,
+)
+from engine.dispatch_handle import parse_handle
 from engine.output_guide import OUTPUT_GUIDE_KEY
+from engine.run_budget import STEPS_USED_KEY, reported_step_count, steps_used
 
 from .types import RouteStatus, Task, TaskKind, TaskStatus
 
@@ -137,6 +145,8 @@ class BranchFinalizePlan:
     base_count: int
     merge: bool
     cleanup_session_ids: tuple[str, ...]
+    # 分支派生、还在保留期里的子会话：不删，改挂到父会话下
+    retained_session_ids: tuple[str, ...] = ()
 
 
 def _message_to_turn_summary_dict(message: Any) -> dict[str, Any]:
@@ -593,11 +603,13 @@ class TaskRouterMixin:
         task_ended = self._task_terminal(task)
         with self._lock:
             dispatch_info = self.sessions.get(dispatch_sid)
+            # 失败或到点收尾的子会话在保留期里，父节点可能还要接着派，到期由定期清理删
             cleanup_dispatch = bool(
                 task_ended
                 and context_mode in {"fresh", "fork"}
                 and dispatch_info is not None
                 and dispatch_info.conversation_key.startswith("agent:")
+                and not child_retention.is_held_locked(self, dispatch_sid)
             )
             dispatch_conv = dispatch_info.conversation_key if cleanup_dispatch else ""
             child_entry = self._session_store.get_entry(child_sid)
@@ -605,6 +617,7 @@ class TaskRouterMixin:
             cleanup_child = bool(
                 child_sid and task_ended
                 and (child_mode or str(task.input.get("context_mode") or "").strip()) != "accumulate"
+                and not child_retention.is_held_locked(self, child_sid)
             )
 
         # All potentially slow filesystem work is outside Supervisor._lock.
@@ -627,7 +640,7 @@ class TaskRouterMixin:
                 self._session_context_usage.pop(dispatch_sid, None)
                 registry_remove_ids.add(dispatch_sid)
             if cleanup_child:
-                self._remove_child_mapping_for_session_locked(child_sid)
+                child_retention.detach_locked(self, child_sid)
                 self.sessions.pop(child_sid, None)
                 self.session_generations.pop(child_sid, None)
                 self._cancelled_sessions.discard(child_sid)
@@ -811,16 +824,7 @@ class TaskRouterMixin:
             base_count = int(task.input.get("base_count") or route_context.get("base_count") or 0)
         except Exception:
             base_count = 0
-        cleanup_ids: list[str] = []
-        stack = [branch]
-        seen: set[str] = set()
-        while stack:
-            session_id = stack.pop()
-            if not session_id or session_id in seen:
-                continue
-            seen.add(session_id)
-            cleanup_ids.append(session_id)
-            stack.extend(sorted(self.parent_children.get(session_id, set())))
+        cleanup_ids, retained_ids = self._branch_cleanup_sessions_locked(branch)
         identity = f"{task.delivery_id or task.task_id}:branch-finalize:v1"
         plan = BranchFinalizePlan(
             identity=identity,
@@ -830,6 +834,7 @@ class TaskRouterMixin:
             base_count=base_count,
             merge=merge,
             cleanup_session_ids=tuple(cleanup_ids),
+            retained_session_ids=tuple(retained_ids),
         )
         self.eventlog.append(
             session_id=parent,
@@ -844,9 +849,29 @@ class TaskRouterMixin:
                 "base_count": base_count,
                 "merge": merge,
                 "cleanup_session_ids": cleanup_ids,
+                "retained_session_ids": retained_ids,
             },
         )
         return plan
+
+    def _branch_cleanup_sessions_locked(self, branch: str) -> tuple[list[str], list[str]]:
+        """分支收束时要删的会话（分支自己和它派生的子会话），以及还在保留期、要改挂到父会话下的子会话。"""
+        now = _now()
+        cleanup_ids: list[str] = []
+        retained_ids: list[str] = []
+        stack = [branch]
+        seen: set[str] = set()
+        while stack:
+            session_id = stack.pop()
+            if not session_id or session_id in seen:
+                continue
+            seen.add(session_id)
+            if session_id != branch and child_retention.is_held_locked(self, session_id, now=now):
+                retained_ids.append(session_id)
+                continue
+            cleanup_ids.append(session_id)
+            stack.extend(sorted(self.parent_children.get(session_id, set())))
+        return cleanup_ids, retained_ids
 
     def _execute_branch_finalize_io(self, plan: BranchFinalizePlan) -> int:
         """Serialize parent JSONL writes across threads/processes."""
@@ -910,6 +935,13 @@ class TaskRouterMixin:
     def _commit_branch_finalize_indexes_locked(self, plan: BranchFinalizePlan):
         now = _now()
         cleanup_ids = set(plan.cleanup_session_ids)
+        retained = False
+        for session_id in plan.retained_session_ids:
+            if session_id in cleanup_ids or self._session_store.get_entry(session_id) is None:
+                continue
+            # 分支要删了，保留着的子会话挂到父会话下，上级链才连得到用户会话
+            child_retention.reparent_locked(self, session_id, plan.parent_session_id, flush=False)
+            retained = True
         for candidate in list(self.tasks.values()):
             if candidate.session_id in cleanup_ids:
                 # 会话文件已经删掉，不等 worker 回报；分支收束就是本次 finalize
@@ -935,7 +967,10 @@ class TaskRouterMixin:
             children.discard(plan.branch_session_id)
             if not children:
                 self.parent_children.pop(plan.parent_session_id, None)
-        return self._session_store.remove_sessions(cleanup_ids, flush=False)
+        snapshot = self._session_store.remove_sessions(cleanup_ids, flush=False)
+        if snapshot is None and retained:
+            snapshot = self._session_store.snapshot()
+        return snapshot
 
     def _finalize_branch_task(
         self, task: Task, *, merge: bool, hold_claim: bool = False,
@@ -1318,6 +1353,10 @@ class TaskRouterMixin:
             # 同一任务的压缩连续失败到上限，这次 dispatch 已改判为失败，按失败继续路由
             action = task.result
             act = "fail"
+        if act in ("finish", "fail"):
+            # 结果交回父节点之前：失败或到点收尾的子会话记上保留，结果里引用的超长输出复制到父节点名下
+            child_retention.mark_locked(self, task)
+            child_retention.adopt(self.workspace_root, child_retention.adoption_locked(self, task))
         if task.batch_id:
             if act in _TASK_END_ACTIONS:
                 self._collect_batch_locked(task)
@@ -1530,10 +1569,28 @@ class TaskRouterMixin:
                         batch_index=idx,
                     )
                 else:
-                    _batch_ctx_mode = self._resolve_dispatch_context_mode(
+                    _continue_handle = parse_handle(batch_item_continue_from(item))
+                    _continued: dict[str, Any] = {}
+                    if _continue_handle is not None:
+                        # engine 派出前核对过；这期间子会话可能过了保留期或被别的任务接走，按当下的状态再核一遍
+                        _continued = continuation.resolve_locked(
+                            self, task.task_id, _continue_handle,
+                            continuation.target_ids(self.workspace_root, item_target),
+                            wait=True, require_live_caller=False,
+                        )
+                        if not _continued.get("ok"):
+                            refused = self._create_refused_batch_child_locked(
+                                task, item, target=item_target, batch_id=batch_id, index=idx,
+                                delivery_key=delivery_key,
+                                error=str(_continued.get("message") or "continue_from 被拒绝。"),
+                            )
+                            created_child_ids.append(refused.task_id)
+                            continue
+                    _batch_ctx_mode = str(_continued.get("context_mode") or "").strip() or self._resolve_dispatch_context_mode(
                         item_target, item.get("context_mode")
                     )
-                    _batch_ctx_key = str(item.get("context_key") or "").strip() or None
+                    # 接着的是那个子会话自己的历史，context_key 不再参与找会话
+                    _batch_ctx_key = None if _continued else (str(item.get("context_key") or "").strip() or None)
                     _batch_input: dict[str, Any] = {
                         "instruction": str(item.get("instruction") or "").strip(),
                     }
@@ -1546,14 +1603,19 @@ class TaskRouterMixin:
                     if _batch_ctx_key:
                         _batch_input["_context_key"] = _batch_ctx_key
 
-                    # Child Session 隔离（Phase B）：批量委派也走 child session
-                    _b_child_sid, _b_is_new = self.get_or_create_child_session(
-                        task.session_id, item_target, _batch_ctx_key or "", _batch_ctx_mode,
-                    )
+                    if _continued:
+                        _b_child_sid = str(_continued.get("session_id") or "")
+                        self._adopt_continued_child_session_locked(task, _b_child_sid)
+                        _batch_input[CONTINUE_FROM_KEY] = str(_continue_handle)
+                    else:
+                        # Child Session 隔离（Phase B）：批量委派也走 child session
+                        _b_child_sid, _b_is_new = self.get_or_create_child_session(
+                            task.session_id, item_target, _batch_ctx_key or "", _batch_ctx_mode,
+                        )
                     _batch_input["child_session_id"] = _b_child_sid
                     _batch_input["context_mode"] = _batch_ctx_mode
                     _batch_input["use_context"] = False
-                    if _batch_ctx_mode == "fork":
+                    if _batch_ctx_mode == "fork" and not _continued:
                         # 批次里的子节点再派批次时 session_id 还是祖先的，它自己的对话在它的 child session 里
                         _batch_input["fork_from_session_id"] = str(
                             task.input.get("child_session_id") or task.session_id
@@ -1648,10 +1710,72 @@ class TaskRouterMixin:
         # ---- 挂起当前 task ----
         if created_child_ids:
             task.status = TaskStatus.suspended
+            # 挂起期间不归哪个 worker：那个 worker 重新注册时不会把它当成自己没跑完的任务
+            task.worker_id = None
+            task.lease_expires_at = None
+            # engine 报的是含挂起前各段的累计步数，恢复后接着数
+            task.input[STEPS_USED_KEY] = max(steps_used(task.input), reported_step_count(task.result))
             task.waiting_for_batch_id = batch_id
             task.waiting_for_task_id = None if batch_id else created_child_ids[0]
             task.updated_at = _now()
             self._event_task_snapshot("task_suspended", task)
+            if batch_id:
+                children = [self.tasks[child_id] for child_id in created_child_ids if child_id in self.tasks]
+                # 一项都没真正派出去（比如 continue_from 全被拒），没有子任务的完成来唤醒它，这里直接交回结果
+                if children and all(self._task_terminal(child) for child in children):
+                    self._collect_batch_locked(children[0])
+
+    def _create_refused_batch_child_locked(
+        self,
+        caller: Task,
+        item: dict[str, Any],
+        *,
+        target: str,
+        batch_id: str | None,
+        index: int,
+        delivery_key: str,
+        error: str,
+    ) -> Task:
+        """批次里派不出去的一项：照样建出子任务、当场判失败，原因随批次结果交回，调用方那次调用才有下文。"""
+        child_input: dict[str, Any] = {
+            "instruction": str(item.get("instruction") or "").strip(),
+            "use_context": False,
+        }
+        call_id = str(item.get("call_id") or "").strip()
+        if call_id:
+            child_input["_dispatch_call_id"] = call_id
+        if delivery_key:
+            child_input["_dispatch_delivery_id"] = delivery_key
+        child = self._create_task_locked(
+            session_id=caller.session_id,
+            session_generation=caller.session_generation,
+            kind=TaskKind.node,
+            node_id=target,
+            input_data=child_input,
+            continuation={},
+            source_inbound_seq=caller.source_inbound_seq,
+            caller_task_id=caller.task_id,
+            batch_id=batch_id,
+            batch_index=index,
+        )
+        now = _now()
+        self._apply_failure_locked(child, error, now=now)
+        self._reset_task_route_state_locked(child)
+        # 没有 worker 跑过它，也没有要路由的东西：结果只等批次收齐时交回调用方
+        child.route_status = RouteStatus.routed
+        child.routed_at = now
+        self._event_task_snapshot("task_completed", child, component="supervisor")
+        log.warning("dispatch item %d of task %s refused: %s", index, caller.task_id[:12], error)
+        return child
+
+    def _adopt_continued_child_session_locked(self, caller: Task, child_session_id: str) -> None:
+        """continue_from 接着用一个保留着的子会话：挂到这次调用方的会话下，清掉保留记录，刷新活跃时间。
+
+        挂过来以后它跟着调用方的分支走：调用方结束时一起清，除非这一程又失败或到点收尾、再被留下。
+        """
+        child_retention.reparent_locked(self, child_session_id, caller.session_id, flush=False)
+        child_retention.release_locked(self, child_session_id)
+        self._session_store.update_last_active(child_session_id)
 
     def _existing_dispatch_children_locked(self, task: Task, delivery_key: str) -> dict[int, Task]:
         """同一次完成已经派出的子任务，按批次序号索引（单节点委派记 -1）。
@@ -1712,7 +1836,7 @@ class TaskRouterMixin:
     def _route_finish_locked(self, task: Task, action: dict[str, Any]) -> None:
         result = action.get("result") if isinstance(action.get("result"), dict) else {}
         action_type = str(action.get("action") or "finish").strip() or "finish"
-        self._resume_caller_or_output_locked(task, {
+        resume_data = {
             "type": "child_result",
             "child_node_id": str(task.node_id or task.tool_name or ""),
             "result": result,
@@ -1722,7 +1846,14 @@ class TaskRouterMixin:
             # leaving the result payload unchanged. Purpose: callers can tell ask
             # from finish without a separate route implementation yet.
             "action_type": action_type,
-        }, result, action_type=action_type)
+            **child_retention.continue_fields_locked(self, task),
+        }
+        # 用户会话里直接跑的任务到点收尾：交付时说明接下来自动接着做还是停在这里
+        plan = auto_continue.plan_locked(self, task, result, action_type)
+        delivered = auto_continue.with_note(result, plan.note) if plan is not None else result
+        self._resume_caller_or_output_locked(task, resume_data, delivered, action_type=action_type)
+        if plan is not None and plan.go:
+            auto_continue.start_locked(self, task, plan)
 
 
     def _route_fail_locked(self, task: Task, action: dict[str, Any]) -> None:
@@ -1731,6 +1862,7 @@ class TaskRouterMixin:
             "type": "child_failed",
             "child_node_id": str(task.node_id or task.tool_name or ""),
             "error": error,
+            **child_retention.continue_fields_locked(self, task),
         }, {"text": f"[错误] {error}"}, action_type="fail")
 
     # ------------------------------------------------------------------ #
@@ -1843,6 +1975,8 @@ class TaskRouterMixin:
                     value = str(t.input.get(source_key) or "").strip()
                     if value:
                         entry[entry_key] = value
+                if act in ("finish", "fail"):
+                    entry.update(child_retention.continue_fields_locked(self, t))
             elif t.kind == TaskKind.tool:
                 entry["name"] = str(t.tool_name or tr.get("tool_name") or "")
                 entry["args"] = dict(tr.get("arguments") or t.input.get("arguments") or {})
@@ -2117,6 +2251,12 @@ class TaskRouterMixin:
             payload["attachments_outbound_sent"] = True
         elif result_atts:
             payload["attachments"] = result_atts
+        continue_fields = child_retention.continue_fields_locked(self, task)
+        if continue_fields.get("handle"):
+            payload["child_handle"] = continue_fields["handle"]
+            payload["child_continuable"] = bool(continue_fields.get("continuable"))
+            if continue_fields.get("wrapup"):
+                payload["child_wrapup"] = continue_fields["wrapup"]
 
         callback_delivery_id = (
             f"{task.delivery_id}:caller-resume" if task.delivery_id else ""
@@ -2701,10 +2841,12 @@ class TaskRouterMixin:
         return prepared
 
     def _prepare_route_io(self, task: Task) -> None:
-        """在锁外先做这次完成要用的压缩 I/O：同步压缩 dispatch 的覆盖计划，或 compactor 摘要的落盘。
+        """在锁外先做这次完成要用的 I/O：子任务引用的超长输出复制到父节点名下，同步压缩 dispatch 的覆盖计划，
+        或 compactor 摘要的落盘。
 
         算不出来就什么也不留，路由时退回锁内现算，结果一致。
         """
+        self._adopt_child_outputs(task)
         try:
             with self._lock:
                 if task.route_status == RouteStatus.routed:
@@ -2732,6 +2874,20 @@ class TaskRouterMixin:
         except Exception:
             log.exception(
                 "route I/O preparation failed; routing computes it under the lock",
+                extra={"task_id": task.task_id},
+            )
+
+    def _adopt_child_outputs(self, task: Task) -> None:
+        """路由前在锁外复制子任务引用的超长输出；路由时锁内再走一遍只剩逐个确认已经在了。"""
+        try:
+            with self._lock:
+                if task.route_status == RouteStatus.routed:
+                    return
+                adoption = child_retention.adoption_locked(self, task)
+            child_retention.adopt(self.workspace_root, adoption)
+        except Exception:
+            log.exception(
+                "copying child tool outputs before routing failed; routing retries under the lock",
                 extra={"task_id": task.task_id},
             )
 

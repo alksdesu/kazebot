@@ -22,6 +22,8 @@ class TaskLease:
     worker_id: str
     claim_id: str = ""
     lost_reason: str = ""
+    # 含挂起前各段的累计步数；engine 优雅退出时带给 supervisor，判这个任务有没有进展
+    steps_completed: int = 0
 
     @property
     def lost(self) -> bool:
@@ -80,6 +82,8 @@ class RunContext:
     first_shadow_message_id: str = ""   # UUID of first message written to ConversationStore
     last_shadow_message_id: str = ""    # UUID of last message written to ConversationStore
     completed_steps: int = 0             # actual step count from ai_step loop
+    # 前几段挂起前已经用掉的步数：completed_steps 从它接着数，TaskRecord 只记本段的差值
+    step_offset: int = 0
     # 备用渠道顶上时答案不是节点 provider 出的，TaskRecord 按最后一次成功的那个记模型和渠道
     serving_provider: ServingProvider | None = None
     # [AutoC 2026-06-04] Why: one visible streaming card must map to one concrete LLM

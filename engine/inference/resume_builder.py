@@ -11,6 +11,8 @@ import config_layout
 
 from ..attachments import build_multimodal_content, payload_attachments
 from ..conversation_store import MessageType
+from ..interrupted_calls import INTERRUPTED_RESUME_TYPE
+from ..run_budget import WRAPUP_TIME
 from .loop_state import TOOL_RESULT_ATTACHMENT_TYPE
 
 
@@ -35,6 +37,12 @@ _BATCH_NODE_RESUME_TYPES = {
     "preempted": "child_preempted",
 }
 _BATCH_INSTRUCTION_PREVIEW = 200
+
+_INTERRUPTED_NOTICE = (
+    "[SYSTEM] 这个任务刚才被服务重启打断了，现在接着做。中断那一步的工具调用已经标成「中断，结果未知」："
+    "它们可能没执行、只执行了一部分，也可能已经执行完。先核对实际状态（重新读相关文件、查看命令的产物），"
+    "再决定要不要重做，然后继续完成任务。"
+)
 
 
 def resume_outcome(message: Any) -> tuple[str, str]:
@@ -92,6 +100,24 @@ def _preview(text: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
+def _continue_lines(source: dict[str, Any], node: str) -> list[str]:
+    """子任务的句柄；它的会话为接着做留着时，再说清怎么用 continue_from 接着派。"""
+    handle = str(source.get("handle") or "").strip()
+    if not handle:
+        return []
+    lines = [f"句柄：{handle}"]
+    if not source.get("continuable"):
+        return lines
+    target = node or "同一个节点"
+    wrapup = str(source.get("wrapup") or "").strip()
+    if wrapup:
+        limit = "运行时长" if wrapup == WRAPUP_TIME else "步数"
+        lines.append(f"它是到了{limit}上限停下的，还没做完；要它接着做，就再委派给 {target}，带上 continue_from 填这个句柄。")
+    else:
+        lines.append(f"要它从停下的地方接着做，就再委派给 {target}，带上 continue_from 填这个句柄。")
+    return lines
+
+
 def _batch_node_message(entry: dict[str, Any]) -> dict[str, Any]:
     """批次里一个子节点的结果：先说清对应哪次调用、哪条指令、结局如何，失败、取消、打断都明说没有结果。"""
     node = str(entry.get("node_id") or "unknown")
@@ -136,6 +162,7 @@ def _batch_node_message(entry: dict[str, Any]) -> dict[str, Any]:
         lines = [f"子节点 {node}{where}结束了，但没有拿到结果（状态：{status}）。"]
         if error:
             lines.append(f"原因：{error}")
+    lines.extend(_continue_lines(entry, node))
 
     meta: dict[str, Any] = {"message_type": DISPATCH_RESULT_TYPE, "child_node_id": node}
     resume_type = _BATCH_NODE_RESUME_TYPES.get(status)
@@ -143,7 +170,7 @@ def _batch_node_message(entry: dict[str, Any]) -> dict[str, Any]:
         meta.update({"resume_type": resume_type, "resume_from_node": node})
     if summary:
         meta["summary"] = summary
-    for key in ("child_task_id", "child_session_id"):
+    for key in ("child_task_id", "child_session_id", "handle"):
         value = str(entry.get(key) or "").strip()
         if value:
             meta[key] = value
@@ -166,6 +193,7 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
         if text:
             lines.append("结果：")
             lines.append(text)
+        lines.extend(_continue_lines(resume_data, from_node))
         content_text = "\n".join(lines).strip()
         if isinstance(child_atts, list) and child_atts:
             return [_child_message(build_multimodal_content(content_text, child_atts), from_node)]
@@ -191,7 +219,7 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
         error = str(resume_data.get("error") or "未知错误")
         prefix = f"下游节点 {from_node} 执行失败：" if from_node else "下游节点执行失败："
-        return [_child_message(f"{prefix}{error}", from_node)]
+        return [_child_message("\n".join([f"{prefix}{error}", *_continue_lines(resume_data, from_node)]), from_node)]
 
     # v2: child_cancelled
     if rtype == "child_cancelled":
@@ -207,6 +235,10 @@ def _resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
         if ctx_ref:
             prefix += f"（context_ref: {ctx_ref}）"
         return [_child_message(prefix, from_node)]
+
+    # 服务重启打断后重排的任务：缺结果的工具调用 runner 已补成「中断，结果未知」，这里只提醒先核对再接着做
+    if rtype == INTERRUPTED_RESUME_TYPE:
+        return [{"role": "user", "content": _INTERRUPTED_NOTICE, "_meta": {"message_type": MessageType.SYSTEM}}]
 
     # v2: compact_done (compactor 子 task 完成后恢复)
     if rtype == "compact_done":

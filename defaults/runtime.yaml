@@ -13,6 +13,12 @@ engine:
   poll_interval_sec: 1.0
   max_workers: 4               # 并发 task 处理数（默认 4）
 
+  wrapup:
+    time_ratio: 0.9            # 单段运行用到运行上限（CLONOTH_TASK_MAX_RUNNING_SECONDS）的这个比例就收尾：只给 finish，交代进度（0.5-0.99）
+
+  auto_continue:
+    max_rounds: 3              # 到步数或运行时长上限收尾后，同一会话最多自动接着做几轮（0-20；0 = 不自动续跑）；只对有没做完的待办或声明了 auto_continue 的节点生效，整条链仍受任务总寿命约束
+
   compact:
     threshold_tokens: 256000   # 软阈值：超过此值在后台静默压缩，当轮回复照常进行（优先用 LLM 返回的真实值，无则按字符估算）
     hard_threshold_tokens: 0   # 硬阈值：超过此值挂起当轮同步压缩，避免顶爆上下文窗口；0 = 取软阈值的 1.25 倍
@@ -38,6 +44,7 @@ engine:
   # Child Session 隔离：dispatch 子节点使用独立 session，替代 node_contexts snapshot 机制
   child_session:
     ttl_hours: 24              # 只管 fresh / fork 子会话：空闲超过这么多小时，登记和对话历史一起清掉（最少 1）；accumulate 永久保留
+    retain_grace_hours: 24     # 失败或到点收尾的子 agent 会话，发起它的任务结束后再留这么多小时，期间能用句柄 continue_from 接着派（最少 1）
     # Step 2（2026-04-16）：主节点是否也走 ConversationStore，替代 node_contexts snapshot。
     # true  = 主节点入口 task 不再注入 context_ref，history 从 data/conversations/{session_id}.jsonl 加载，
     #        _persist_ctx 不写 snapshot，compact 直接操作 ConversationStore。

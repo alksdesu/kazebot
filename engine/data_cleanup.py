@@ -34,6 +34,7 @@ from clonoth_runtime import load_runtime_config  # noqa: E402
 from engine.child_session_retention import (  # noqa: E402
     DEFAULT_CHILD_SESSION_TTL_HOURS,
     child_session_ttl_hours,
+    is_held_row,
     is_retained_child_row,
 )
 from engine.conversation_store import ConversationStore  # noqa: E402
@@ -484,17 +485,32 @@ def _load_session_registry() -> dict[str, Any] | None:
     return raw
 
 
-def _retained_child_sessions(registry: dict[str, Any]) -> set[str]:
-    """登记表里历史要永久保留的子会话 id。行的键和 session_id 字段都算：哪个对上文件名都不删。"""
+def _row_ids(key: Any, row: dict[str, Any]) -> set[str]:
+    """一行登记的会话 id：行的键和 session_id 字段都算，哪个对上文件名都认。"""
+    ids = {str(key)}
+    session_id = str(row.get("session_id") or "").strip()
+    if session_id:
+        ids.add(session_id)
+    return ids
+
+
+def _retained_child_sessions(registry: dict[str, Any], *, now: datetime | None = None) -> set[str]:
+    """登记表里历史要留着的子会话 id：accumulate 永久保留，失败或到点收尾的在保留期内保留。"""
+    moment = now or datetime.now(timezone.utc)
     retained: set[str] = set()
     for key, row in registry.items():
-        if not is_retained_child_row(row):
-            continue
-        retained.add(str(key))
-        session_id = str(row.get("session_id") or "").strip()
-        if session_id:
-            retained.add(session_id)
+        if is_retained_child_row(row) or is_held_row(row, now=moment):
+            retained |= _row_ids(key, row)
     return retained
+
+
+def _registered_sessions(registry: dict[str, Any]) -> set[str]:
+    """登记表里没 reset 的会话 id。入口分支还登记着，就是还有任务在用或等 supervisor 合并，归它管。"""
+    registered: set[str] = set()
+    for key, row in registry.items():
+        if isinstance(row, dict) and not row.get("reset"):
+            registered |= _row_ids(key, row)
+    return registered
 
 
 def _child_session_ttl_hours() -> int:
@@ -533,10 +549,12 @@ def purge_expired_child_sessions():
     """清理空闲过期的子会话和入口分支 JSONL。
 
     child_*.jsonl 空闲超过 engine.child_session.ttl_hours 就删，sessions.json 里没 reset 的 accumulate
-    子会话除外：supervisor 永久留着它的登记，下次委派过去要接着这份历史。没登记的（dream、记忆提取这类
-    系统子会话）、fresh / fork、已 reset 的照旧按时间删；登记表在却读不懂时，这一轮一个子会话都不删。
+    子会话、还在保留期里的失败或收尾的子会话除外：supervisor 留着它们的登记，之后委派过去要接着这份历史。
+    没登记的（dream、记忆提取这类系统子会话）、fresh / fork、已 reset 的照旧按时间删。
 
     入口分支 merge 后由 supervisor 删，但进程崩在半路就会留下一个 fork 自父会话的全量副本，没有别的清理者。
+    还登记着的分支归 supervisor 管：任务挂起、续跑都可能让它闲置超过一天，按时间删就丢了没合并的历史。
+    登记表在却读不懂时，这一轮子会话和分支一个都不删。
     """
     conv_dir = DATA_DIR / "conversations"
     if not conv_dir.exists():
@@ -544,32 +562,40 @@ def purge_expired_child_sessions():
     now = time.time()
     ttl_hours = _child_session_ttl_hours()
     child_cutoff = now - ttl_hours * 3600
+    branch_cutoff = now - BRANCH_CONVERSATION_MAX_AGE
     expired_children = _expired_files(conv_dir, "child_*.jsonl", child_cutoff)
+    expired_branches = _expired_files(conv_dir, "branch_*.jsonl", branch_cutoff)
     retained: set[str] | None = set()
-    if expired_children:
+    registered: set[str] | None = set()
+    if expired_children or expired_branches:
         try:
             registry = _load_session_registry()
         except _SessionRegistryUnreadable as exc:
-            retained = None
+            retained = registered = None
             logging.warning(
-                "[child_sessions] sessions.json unreadable, keeping every child_*.jsonl this round: %s", exc,
+                "[child_sessions] sessions.json unreadable, keeping every child_*.jsonl and branch_*.jsonl "
+                "this round: %s", exc,
             )
         else:
-            retained = _retained_child_sessions(registry) if registry is not None else set()
+            rows = registry if registry is not None else {}
+            retained = _retained_child_sessions(rows, now=datetime.fromtimestamp(now, timezone.utc))
+            registered = _registered_sessions(rows)
 
-    deleted = kept = 0
+    deleted = kept = kept_branches = 0
     for path in expired_children:
         if retained is None or path.stem in retained:
             kept += 1
         elif _delete_idle_conversation(path, child_cutoff, "child_sessions"):
             deleted += 1
-    branch_cutoff = now - BRANCH_CONVERSATION_MAX_AGE
-    for path in _expired_files(conv_dir, "branch_*.jsonl", branch_cutoff):
-        if _delete_idle_conversation(path, branch_cutoff, "child_sessions"):
+    for path in expired_branches:
+        if registered is None or path.stem in registered:
+            kept_branches += 1
+        elif _delete_idle_conversation(path, branch_cutoff, "child_sessions"):
             deleted += 1
     logging.info(
-        "[child_sessions] deleted %d expired files, kept %d child sessions past the ttl, ttl_hours=%d",
-        deleted, kept, ttl_hours,
+        "[child_sessions] deleted %d expired files, kept %d child sessions past the ttl and %d registered "
+        "branches, ttl_hours=%d",
+        deleted, kept, kept_branches, ttl_hours,
     )
 
 

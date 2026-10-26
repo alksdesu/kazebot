@@ -10,7 +10,7 @@ import logging
 import os
 import sys
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -212,9 +212,10 @@ class TestChildConversationRetention:
         pytest.param('[{"session_id": "child_tmp", "is_child": true, "context_mode": "fresh"}]', id="list-root"),
         pytest.param('"sessions"', id="string-root"),
     ])
-    def test_an_unreadable_registry_keeps_every_child_but_not_branches(
+    def test_an_unreadable_registry_keeps_every_child_and_every_branch(
         self, data: Path, caplog, broken: str,
     ) -> None:
+        # 认不出哪些分支还登记着，就分不清哪些还有没合并回去的历史
         children = [
             _conversation(data, "child_acc", idle_hours=24 * 30),
             _conversation(data, "child_tmp", idle_hours=25),
@@ -226,7 +227,7 @@ class TestChildConversationRetention:
             cleanup.purge_expired_child_sessions()
 
         assert all(path.exists() for path in children)
-        assert not branch.exists()
+        assert branch.exists()
         assert any("sessions.json unreadable" in r.getMessage() for r in caplog.records)
 
     def test_a_registry_that_cannot_be_opened_counts_as_unreadable(self, data: Path) -> None:
@@ -265,6 +266,169 @@ class TestChildConversationRetention:
         assert any("child_tmp.jsonl" in message for message in reported)
         assert any("branch_7.jsonl" in message for message in reported)
         assert not any("child_acc.jsonl" in message for message in reported)
+
+
+_NOW = datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def _held(session_id: str, mode: str = "fresh", **hold: Any) -> dict[str, Any]:
+    """失败或到点收尾后留着的子会话行：retain 里至少有产出它的任务 id。"""
+    row = _row(session_id, mode)
+    row[retention.RETAIN_FIELD] = {"task_id": "task-child", "parent_task_id": "task-caller", "until": "", **hold}
+    return row
+
+
+def _branch_row(session_id: str, *, reset: bool = False) -> dict[str, Any]:
+    return {
+        "session_id": session_id,
+        "channel": "internal",
+        "conversation_key": "",
+        "reset": reset,
+        "is_child": True,
+        "parent_session_id": "parent",
+        "node_id": "__entry_branch__",
+        "context_mode": "branch",
+    }
+
+
+class TestHoldRule:
+    @pytest.mark.parametrize("config,hours", [
+        pytest.param({}, 24, id="unset"),
+        pytest.param({"engine": {"child_session": {"retain_grace_hours": 6}}}, 6, id="configured"),
+        pytest.param({"engine": {"child_session": {"retain_grace_hours": "12"}}}, 12, id="quoted-number"),
+        pytest.param({"engine": {"child_session": {"retain_grace_hours": 0}}}, 1, id="zero-clamps-to-one"),
+        pytest.param({"engine": {"child_session": {"retain_grace_hours": "abc"}}}, 24, id="not-a-number"),
+    ])
+    def test_the_grace_period_reads_like_the_ttl(self, config: dict[str, Any], hours: int) -> None:
+        assert retention.retain_grace_hours(config) == hours
+
+    @pytest.mark.parametrize("row", [
+        pytest.param(None, id="none"),
+        pytest.param(_row("child_a", "fresh"), id="no-hold"),
+        pytest.param({**_held("child_a"), "reset": True}, id="reset"),
+        pytest.param({**_row("child_a", "fresh"), "retain": "yes"}, id="not-a-mapping"),
+        pytest.param({**_row("child_a", "fresh"), "retain": {"task_id": "  "}}, id="no-task-id"),
+        pytest.param({**_row("child_a", "fresh"), "retain": None}, id="released"),
+    ])
+    def test_rows_without_a_usable_hold(self, row: Any) -> None:
+        assert retention.retention_hold(row) is None
+        assert retention.is_held_row(row, now=_NOW) is False
+        assert retention.is_expired_hold(row, now=_NOW) is False
+
+    def test_a_hold_is_returned_as_a_copy(self) -> None:
+        row = _held("child_a", reason="failed")
+
+        hold = retention.retention_hold(row)
+        hold["task_id"] = "changed"
+
+        assert row["retain"]["task_id"] == "task-child"
+
+    def test_a_hold_whose_caller_has_not_ended_has_no_deadline(self) -> None:
+        row = _held("child_a")
+
+        assert retention.is_held_row(row, now=_NOW) is True
+        assert retention.is_expired_hold(row, now=_NOW) is False
+
+    def test_a_hold_lasts_until_its_deadline(self) -> None:
+        later = _held("child_a", until=(_NOW + timedelta(minutes=1)).isoformat())
+        due = _held("child_a", until=_NOW.isoformat())
+
+        assert retention.is_held_row(later, now=_NOW) is True
+        assert retention.is_expired_hold(later, now=_NOW) is False
+        assert retention.is_held_row(due, now=_NOW) is False
+        assert retention.is_expired_hold(due, now=_NOW) is True
+
+    def test_a_deadline_without_a_zone_is_utc(self) -> None:
+        row = _held("child_a", until="2026-03-01T11:59:00")
+
+        assert retention.retention_until(row["retain"]) == _NOW - timedelta(minutes=1)
+        assert retention.is_expired_hold(row, now=_NOW) is True
+
+    def test_an_unreadable_deadline_keeps_the_hold(self) -> None:
+        # 判不清就不删：留得久一点只占磁盘，删早了接着做时历史就没了
+        row = _held("child_a", until="next tuesday")
+
+        assert retention.retention_until(row["retain"]) is None
+        assert retention.is_held_row(row, now=_NOW) is True
+        assert retention.is_expired_hold(row, now=_NOW) is False
+
+
+class TestHeldChildrenAndRegisteredBranches:
+    @pytest.mark.parametrize("mode", ["fresh", "fork"])
+    def test_a_held_child_outlives_the_ttl(self, data: Path, mode: str) -> None:
+        kept = _conversation(data, "child_held", idle_hours=24 * 3)
+        _registry(data, {"child_held": _held("child_held", mode)})
+
+        cleanup.purge_expired_child_sessions()
+
+        assert kept.exists()
+
+    def test_a_held_child_is_kept_until_its_deadline(self, data: Path) -> None:
+        until = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        kept = _conversation(data, "child_held", idle_hours=25)
+        _registry(data, {"child_held": _held("child_held", until=until)})
+
+        cleanup.purge_expired_child_sessions()
+
+        assert kept.exists()
+
+    def test_an_expired_hold_goes_by_the_ttl_again(self, data: Path) -> None:
+        until = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        gone = _conversation(data, "child_held", idle_hours=25)
+        recent = _conversation(data, "child_recent", idle_hours=1)
+        _registry(data, {
+            "child_held": _held("child_held", until=until),
+            "child_recent": _held("child_recent", until=until),
+        })
+
+        cleanup.purge_expired_child_sessions()
+
+        assert not gone.exists()
+        assert recent.exists()
+
+    def test_a_reset_row_drops_its_hold(self, data: Path) -> None:
+        gone = _conversation(data, "child_held", idle_hours=25)
+        _registry(data, {"child_held": {**_held("child_held"), "reset": True}})
+
+        cleanup.purge_expired_child_sessions()
+
+        assert not gone.exists()
+
+    def test_a_registered_branch_is_left_to_the_supervisor(self, data: Path, caplog) -> None:
+        # 挂起等子任务、续跑都可能让分支闲置一天以上，它还没合并回父会话
+        registered = _conversation(data, "branch_7", idle_hours=24 * 3)
+        by_field = _conversation(data, "branch_8", idle_hours=24 * 3)
+        reset = _conversation(data, "branch_9", idle_hours=25)
+        unregistered = _conversation(data, "branch_10", idle_hours=25)
+        _registry(data, {
+            "branch_7": _branch_row("branch_7"),
+            "renamed": _branch_row("branch_8"),
+            "branch_9": _branch_row("branch_9", reset=True),
+        })
+
+        with caplog.at_level(logging.INFO):
+            cleanup.purge_expired_child_sessions()
+
+        assert registered.exists() and by_field.exists()
+        assert not reset.exists()
+        assert not unregistered.exists()
+        assert any("and 2 registered branches" in r.getMessage() for r in caplog.records)
+
+    def test_a_young_unregistered_branch_still_waits_for_its_age(self, data: Path) -> None:
+        young = _conversation(data, "branch_young", idle_hours=3)
+        _registry(data, {})
+
+        cleanup.purge_expired_child_sessions()
+
+        assert young.exists()
+
+    def test_the_registry_is_read_when_only_branches_have_expired(self, data: Path) -> None:
+        registered = _conversation(data, "branch_7", idle_hours=25)
+        _registry(data, {"branch_7": _branch_row("branch_7")})
+
+        cleanup.purge_expired_child_sessions()
+
+        assert registered.exists()
 
 
 class TestChildTtlInCleanup:

@@ -28,15 +28,24 @@ from .reply_intent import IntentRegistry
 from .eventlog import EventLog, SYSTEM_SESSION_ID
 from clonoth_runtime import load_runtime_config
 from engine.builtin.loader import auto_discover_and_register
-from engine.child_session_retention import child_session_ttl_hours, is_retained_child_row
+from engine.child_session_retention import child_session_ttl_hours, is_retained_child_row, retention_hold
 from engine.conversation_migration import ConversationRekey, RekeyCount
 from engine.hooks import HookRegistry
 from platforms.sources import classify_operation_source
+from . import branch_recovery, child_retention
 from .policy import ApprovalGrantSettings, PolicyEngine
 from .session import SessionMixin
 from .session_store import SessionStore, session_registry_path
+from .task_requeue import (
+    ENGINE_CRASH,
+    Orphan,
+    collect_orphans_locked,
+    release_stale_claims_locked,
+    settle_orphans_locked,
+    stored_steps,
+)
 from .task_router import TaskRouterMixin
-from .task_store import CancelEffect, TaskStoreMixin
+from .task_store import TaskStoreMixin
 from .types import (
     AdminStateOut,
     Approval,
@@ -856,18 +865,35 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if isinstance(entry, dict) and entry.get("reset"):
                 mark_stale(sid)
 
-        # 2. 清理 orphan branch session（重启后上一进程的 branch 不再有活跃任务）。
+        # 2. 上一进程留下的入口分支（重启后不再有活跃任务）：还有没合并回去的内容就补上缺的工具结果、
+        #    合并回父会话再删；没有内容或认不出合并起点的照旧整个删掉。
+        recovered = 0
         for sid in self._session_store.keys_snapshot():
-            if str(sid).startswith("branch_"):
-                mark_stale(sid)
+            if not str(sid).startswith("branch_") or sid in seen_stale:
+                continue
+            if branch_recovery.recover_orphan_branch(self, sid):
+                recovered += 1
+                continue
+            mark_stale(sid)
 
         # 3. 清理非 accumulate 的 child session，和 _cleanup_stale_sessions_locked 同一套规则：
         #   - accumulate: 永久保留
         #   - 无 context_mode（历史遗留）: 直接清理，不等 TTL
         #   - fresh/fork: 空闲超过 engine.child_session.ttl_hours 后清理
-        stale_threshold = datetime.now(timezone.utc) - self._child_session_ttl()
+        #   - 失败或到点收尾留着的：上一进程的任务都不在了，宽限期从现在起算，过了期才清
+        now = datetime.now(timezone.utc)
+        stale_threshold = now - self._child_session_ttl()
+        grace = child_retention.grace_period(self)
+        holds_changed = False
         for sid, entry in self._session_store.items_snapshot():
             if sid in seen_stale or not isinstance(entry, dict):
+                continue
+            hold = retention_hold(entry)
+            if hold is not None:
+                expired, changed = child_retention.sweep_hold_locked(self, sid, hold, now=now, grace=grace)
+                holds_changed = holds_changed or changed
+                if expired:
+                    mark_stale(sid)
                 continue
             if not entry.get("is_child") or is_retained_child_row(entry):
                 continue
@@ -890,10 +916,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 cleaned += 1
                 continue
 
-            self.sessions.pop(sid, None)
-            self.session_generations.pop(sid, None)
-            self._cancelled_sessions.discard(sid)
-            self._session_context_usage.pop(sid, None)
+            self._forget_session_locked(sid)
             self._remove_child_mapping_for_session_locked(sid)
             self.entry_branch_parents.pop(sid, None)
             for branches in self.parent_entry_branches.values():
@@ -915,14 +938,28 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if self._session_store.remove_sessions([sid], flush=False) is not None:
                 cleaned += 1
 
-        if cleaned:
+        if cleaned or holds_changed:
             self._session_store._flush()
+        if recovered:
+            logger.info("startup reconcile: merged %d interrupted entry branches back into their sessions", recovered)
+        if cleaned:
             logger.info(
                 "startup reconcile: cleaned %d stale sessions (reset/orphan-branch/expired-child)",
                 cleaned,
             )
         else:
             logger.info("startup reconcile: no stale sessions found")
+
+    def _forget_session_locked(self, session_id: str) -> None:
+        """会话从内存里的会话表拿掉。保留期过了的 agent: 会话是会话键直接指向的主会话，会话键映射一并摘掉。"""
+        info = self.sessions.pop(session_id, None)
+        if info is not None and self.conversation_map.get(info.conversation_key) == session_id:
+            self.conversation_map.pop(info.conversation_key, None)
+        self.session_generations.pop(session_id, None)
+        self._cancelled_sessions.discard(session_id)
+        self._session_context_usage.pop(session_id, None)
+        self.session_entry_overrides.pop(session_id, None)
+        self.session_last_entry_node.pop(session_id, None)
 
     # ------------------------------------------------------------------ #
     #  事件回放
@@ -1380,10 +1417,14 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
         branch/child session 只标 reset 不删的话，sessions.json 会无限膨胀。这里删掉所有 reset=true 的条目、
         没有任务在用的入口分支，以及空闲超过 engine.child_session.ttl_hours 的非 accumulate child session。
+        失败或到点收尾留着的子会话（含异步委派的 agent: 会话）不按空闲时长清：发起任务结束后再过宽限期才删。
         """
-        stale_threshold = datetime.now(timezone.utc) - self._child_session_ttl()
+        now = datetime.now(timezone.utc)
+        stale_threshold = now - self._child_session_ttl()
+        grace = child_retention.grace_period(self)
         to_remove: list[str] = []
         purge_files: list[str] = []
+        holds_changed = False
 
         for sid, info in self._session_store.items_snapshot():
             if not isinstance(info, dict):
@@ -1393,6 +1434,14 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             # reset 标记长期占用 sessions.json 的问题。
             if info.get("reset"):
                 to_remove.append(sid)
+                continue
+            hold = retention_hold(info)
+            if hold is not None:
+                expired, changed = child_retention.sweep_hold_locked(self, sid, hold, now=now, grace=grace)
+                holds_changed = holds_changed or changed
+                if expired:
+                    to_remove.append(sid)
+                    purge_files.append(sid)
                 continue
             # 分支是入口执行副本：还有任务在用或还没合并回父会话时保留，否则连同文件一起删
             if sid.startswith("branch_"):
@@ -1422,10 +1471,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         if to_remove:
             self._session_store.remove_sessions(set(to_remove), flush=False)
             for sid in to_remove:
-                self.sessions.pop(sid, None)
-                self.session_generations.pop(sid, None)
-                self._cancelled_sessions.discard(sid)
-                self._session_context_usage.pop(sid, None)
+                self._forget_session_locked(sid)
                 self._remove_child_mapping_for_session_locked(sid)
                 self.entry_branch_parents.pop(sid, None)
                 for branches in self.parent_entry_branches.values():
@@ -1436,6 +1482,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             self.parent_children = {pid: children for pid, children in self.parent_children.items() if children}
             self._session_store._flush()
             logger.info("stale session cleanup: removed %d sessions from registry", len(to_remove))
+        elif holds_changed:
+            self._session_store._flush()
 
     def _session_files_in_use_locked(self, session_id: str) -> bool:
         """还有任务在这个会话上没结束，或它是还没合并回父会话的入口分支。"""
@@ -2035,10 +2083,11 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
     # ------------------------------------------------------------------ #
 
     def register_engine(self, worker_id: str, generation_id: str) -> dict[str, Any]:
-        """Register an engine worker with its generation ID.
+        """登记 engine worker 这一次启动的代次。
 
-        Cancels any running/pending tasks from the same worker_id with a
-        different generation (orphans from a previous engine instance).
+        代次变了（或本进程第一次见到这个 worker），说明原来那个进程已经不在：它名下还在 running 的任务，
+        节点声明了 auto_continue 且已经有进展的重排一次，其余连同后代取消；排队和挂起的任务只清掉作废的领取信息，
+        留着接着办。查进展要读对话文件，放在锁外。
         """
         wid = (worker_id or "").strip()
         gid = (generation_id or "").strip()
@@ -2048,15 +2097,20 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         with self._lock:
             old_gen = self._engine_generations.get(wid)
             self._engine_generations[wid] = gid
+            orphans: list[Orphan] = []
+            if old_gen != gid:
+                orphans = collect_orphans_locked(self, worker_id=wid)
+                release_stale_claims_locked(self, wid)
+        progress = stored_steps(self.workspace_root, orphans) if orphans else {}
 
-            orphan_count = 0
-            if old_gen and old_gen != gid:
-                # Same worker restarted with new generation — cancel its old tasks
-                orphan_count = self._cancel_worker_orphans_locked(wid)
-            elif not old_gen:
-                # First registration of this worker — also clean up any tasks
-                # from a previous run where this worker_id was used
-                orphan_count = self._cancel_worker_orphans_locked(wid)
+        with self._lock:
+            requeued = cancelled = 0
+            if orphans:
+                requeued, cancelled = settle_orphans_locked(
+                    self, orphans, progress,
+                    reason=ENGINE_CRASH,
+                    cancel_reason=f"engine worker {wid} restarted (generation mismatch)",
+                )
 
             self.eventlog.append(
                 session_id=SYSTEM_SESSION_ID,
@@ -2066,7 +2120,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     "worker_id": wid,
                     "generation_id": gid,
                     "previous_generation_id": old_gen or "",
-                    "orphans_cancelled": orphan_count,
+                    "orphans_cancelled": cancelled,
+                    "orphans_requeued": requeued,
                     "ts": _now().isoformat(),
                 },
             )
@@ -2091,21 +2146,12 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     )
                     self.record_inbound_message_event(_restart_evt)
 
-            return {"ok": True, "orphans_cancelled": orphan_count, "generation_id": gid}
-
-    def _cancel_worker_orphans_locked(self, worker_id: str) -> int:
-        """Cancel all non-terminal tasks assigned to a specific worker_id."""
-        now = _now()
-        count = 0
-        reason = f"engine worker {worker_id} restarted (generation mismatch)"
-        for task in list(self.tasks.values()):
-            if self._task_terminal(task) or task.worker_id != worker_id:
-                continue
-            # 父在子前：子任务结算时父已是终态，不会被先唤醒再取消
-            for target in (task, *self._live_descendants_locked(task.task_id)):
-                if self._cancel_task_locked(target, now, force=True, reason=reason) is not CancelEffect.none:
-                    count += 1
-        return count
+            return {
+                "ok": True,
+                "orphans_cancelled": cancelled,
+                "orphans_requeued": requeued,
+                "generation_id": gid,
+            }
 
     def write_boot_event(self) -> dict[str, Any]:
         prev = self.eventlog.last_boot_run_id()

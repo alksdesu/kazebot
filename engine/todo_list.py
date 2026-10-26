@@ -47,6 +47,16 @@ def parse_todo_items(raw: Any) -> list[dict[str, str]]:
     return items
 
 
+def carried_todo_items(raw: Any) -> list[dict[str, str]]:
+    """续跑任务从上一段带过来的清单：按 update_todos 的规则校验，不合格的整份不要。"""
+    if not raw:
+        return []
+    try:
+        return parse_todo_items(raw)
+    except TodoListError:
+        return []
+
+
 def unfinished_items(items: list[dict[str, str]]) -> list[dict[str, str]]:
     return [item for item in items if item.get("status") != "completed"]
 

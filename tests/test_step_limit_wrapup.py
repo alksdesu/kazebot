@@ -71,12 +71,26 @@ class TestHint:
         action = run.run(_probe(0), _probe(1), _finish("all done"))
 
         assert action.action == ACTION_FINISH and action.result["text"] == "all done"
-        assert "step_limit_reached" not in action.result
+        # 听提示在最后一步 finish 也是被迫收尾：标记照打，正文不加说明
+        assert action.result["step_limit_reached"] is True
+        assert action.result["wrapup"] == {
+            "reason": "steps", "steps_used": 3, "max_steps": 3, "todos": [], "unfinished": 0,
+        }
         assert _hints(run) == [0, 0, 1]
         last = run.requests[2]["messages"][-1]
         assert last["role"] == "user" and last["_retry_hint"] is True
         assert last["content"].startswith("[SYSTEM] 这是本任务允许的最后一步（已用 2/3 步）。")
         assert not any(FINAL_HINT in str(message.content) for message in stored(tmp_path))
+
+    def test_a_finish_before_the_last_step_carries_no_wrap_up_marker(self, tmp_path: Path, monkeypatch: Any) -> None:
+        run = _node_run(monkeypatch, tmp_path)
+
+        action = run.run(_probe(0), _finish("early"))
+
+        assert action.action == ACTION_FINISH and action.result["text"] == "early"
+        assert "step_limit_reached" not in action.result
+        assert "time_limit_reached" not in action.result
+        assert "wrapup" not in action.result
 
     def test_native_mode_offers_only_finish_on_the_last_step(self, tmp_path: Path, monkeypatch: Any) -> None:
         run = _node_run(monkeypatch, tmp_path)

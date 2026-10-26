@@ -89,6 +89,19 @@ def is_valid_ref(ref: Any) -> bool:
     return isinstance(ref, str) and _REF.fullmatch(ref) is not None
 
 
+def mentioned_refs(*texts: Any) -> list[str]:
+    """文本里以 ref=to_… 引用到的超长输出，按第一次出现的顺序去重。"""
+    found: list[str] = []
+    for text in texts:
+        if not isinstance(text, str) or not text:
+            continue
+        for match in _REF_MENTION.finditer(text):
+            ref = match.group(0)[len("ref="):]
+            if ref not in found:
+                found.append(ref)
+    return found
+
+
 def session_dir_name(session_id: str) -> str:
     """会话键换成目录名：只留安全字符，再接一段原值的哈希，不同会话不会撞到同一个目录。"""
     sid = str(session_id or "").strip()
@@ -192,6 +205,39 @@ class ToolOutputStore:
             if not dry_run:
                 _remove_if_empty(directory)
         return expired
+
+    def adopt(self, source_session_id: str, target_session_id: str, ref: str) -> bool:
+        """把 source 会话名下的一份输出复制到 target 会话名下，ref 和修改时间不变，保留期照旧从原来那一刻算。
+
+        target 已经有了、source 里找不到或过了保留期都不复制，返回 target 名下现在有没有这份。
+        """
+        if not is_valid_ref(ref):
+            return False
+        try:
+            source = self.path_for(source_session_id, ref)
+            target = self.path_for(target_session_id, ref)
+        except ValueError:
+            return False
+        if source == target or target.exists():
+            return target.exists()
+        try:
+            if source.stat().st_mtime <= self._cutoff():
+                return False
+        except FileNotFoundError:
+            return False
+        target.parent.mkdir(parents=True, exist_ok=True)
+        handle, temporary = tempfile.mkstemp(dir=target.parent, prefix=".", suffix=".tmp")
+        os.close(handle)
+        try:
+            shutil.copy2(source, temporary)
+            os.replace(temporary, target)
+        except FileNotFoundError:
+            Path(temporary).unlink(missing_ok=True)
+            return False
+        except BaseException:
+            Path(temporary).unlink(missing_ok=True)
+            raise
+        return True
 
     def purge_session(self, session_id: str) -> int:
         """会话被拆掉时连同它名下的全部输出一起删，返回删掉的文件数。"""

@@ -5,11 +5,22 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from .attachments import is_allowed_attachment_path
+from .dispatch_handle import parse_handle
 
 MAX_DISPATCH_BATCH_ITEMS = 8
 MAX_ITEM_ATTACHMENTS = 32
+# 批次项里要接着哪个子 agent 干：值是委派结果给的句柄
+CONTINUE_FROM_KEY = "continue_from"
 
 _ATTACHMENT_TYPES = frozenset({"image", "file"})
+
+
+def batch_item_continue_from(item: Any) -> str:
+    """批次项带的 continue_from 句柄；没带或格式不对给空串。"""
+    if not isinstance(item, dict):
+        return ""
+    handle = parse_handle(item.get(CONTINUE_FROM_KEY))
+    return str(handle) if handle is not None else ""
 
 
 def _relative_attachment_path(raw: Any) -> str:

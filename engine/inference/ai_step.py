@@ -8,7 +8,7 @@ import uuid
 from collections import Counter
 from copy import deepcopy
 from functools import partial, wraps
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
@@ -16,6 +16,7 @@ from toolbox.registry import ToolRegistry
 from toolbox.tool_names import is_pseudo_tool_name
 
 from .pseudo_tools import (
+    NO_REPLY_MARKER,
     _dispatch_delegate_specs,
     _finish_spec,
     _ask_spec,
@@ -81,7 +82,17 @@ from ..tool_outputs import (
     tool_output_limits,
     tool_result_for_event,
 )
-from ..todo_list import unfinished_summary
+from ..todo_list import carried_todo_items, latest_todos_from_messages, unfinished_items, unfinished_summary
+from ..run_budget import (
+    STEP_LIMIT_FLAG,
+    STEP_LIMIT_NOTICE,
+    TIME_LIMIT_FLAG,
+    TIME_LIMIT_NOTICE,
+    WRAPUP_KEY,
+    WRAPUP_STEPS,
+    WRAPUP_TIME,
+    RunBudget,
+)
 from clonoth_runtime import get_int, get_float, get_bool, load_runtime_config, parse_bool
 from toolbox.context import ToolContext
 # build_llm_messages: 反序列化方向的格式转换，在 llm_call.py 中实际调用。
@@ -248,7 +259,12 @@ _FINAL_STEP_HINT = (
     "[SYSTEM] 这是本任务允许的最后一步（已用 {used}/{total} 步）。不要再调用其它工具，直接调用 finish："
     "说明已经完成的工作、没完成的部分和原因、建议的下一步。"
 )
-STEP_LIMIT_NOTICE = "（已达到最大步数，任务到此停止）"
+_TIME_LIMIT_HINT = (
+    "[SYSTEM] 本任务这一段的运行时间快到上限了（已运行约 {minutes} 分钟），这是最后一步。不要再调用其它工具，直接调用 finish："
+    "说明已经完成的工作、没完成的部分和原因、建议的下一步。"
+)
+# 到点收尾可能连着几步都是最后一步（抢占、空回复后重来），提示只留最新的一条
+_FINAL_STEP_HINT_KEY = "_final_step_hint"
 # 第一步调了别的工具被拒，还剩一步改用 finish
 _SHORT_REPLY_MAX_STEPS = 2
 _SHORT_REPLY_REJECT_MESSAGE = "{tool} 没有执行：本轮是简短回应，不调用工具，要回应就直接用 finish 给出那一句。"
@@ -1797,17 +1813,63 @@ def _handle_plaintext_response(ls: _LoopState, resp, step: int) -> TaskAction | 
     )
 
 
-def _append_final_step_hint(ls: _LoopState, step: int, max_steps: int) -> None:
-    content = _FINAL_STEP_HINT.format(used=step, total=max_steps)
+@dataclass(frozen=True)
+class _Wrapup:
+    """这一步为什么是最后一步：步数用完（steps），还是这一段的运行时间快到上限（time）。"""
+
+    reason: str
+    max_steps: int
+
+    @property
+    def notice(self) -> str:
+        return TIME_LIMIT_NOTICE if self.reason == WRAPUP_TIME else STEP_LIMIT_NOTICE
+
+
+def _append_final_step_hint(
+    ls: _LoopState, step: int, max_steps: int, *, reason: str = WRAPUP_STEPS, elapsed_minutes: int = 0,
+) -> None:
+    if reason == WRAPUP_TIME:
+        content = _TIME_LIMIT_HINT.format(minutes=max(0, int(elapsed_minutes)))
+    else:
+        content = _FINAL_STEP_HINT.format(used=step, total=max_steps)
     pending = unfinished_summary(list(getattr(ls, "todos", None) or []))
     if pending:
         content += f"\n{pending}\n在 finish 里逐项交代这些待办做到哪一步、为什么没做完。"
+    ls.messages[:] = [message for message in ls.messages if not message.get(_FINAL_STEP_HINT_KEY)]
     # 只在运行期存在：发给模型，不落盘
     ls.messages.append({
         "role": "user",
         "content": content,
         "_retry_hint": True,
+        _FINAL_STEP_HINT_KEY: True,
     })
+
+
+def _seed_carried_todos(ls: _LoopState, carried: Any) -> None:
+    """续跑任务接上上一段的待办；本任务自己改过清单（挂起再恢复的情形）就以自己改的为准。"""
+    restored = latest_todos_from_messages(ls.messages, str(getattr(ls.rctx, "task_id", "") or ""))
+    ls.todos = restored if restored is not None else carried_todo_items(carried)
+    ls.todos_restored = True
+
+
+def _mark_wrapup(ls: _LoopState, action: TaskAction, wrapup: _Wrapup, step: int) -> TaskAction:
+    """最后一步交付的 finish 打上收尾标记，带上用了几步和当时的待办：supervisor 据此决定要不要接着做。"""
+    if action.action != ACTION_FINISH:
+        return action
+    result = dict(action.result or {})
+    if result.get(NO_REPLY_MARKER) is True:
+        return action
+    todos = [dict(item) for item in getattr(ls, "todos", None) or [] if isinstance(item, dict)]
+    result[TIME_LIMIT_FLAG if wrapup.reason == WRAPUP_TIME else STEP_LIMIT_FLAG] = True
+    result[WRAPUP_KEY] = {
+        "reason": wrapup.reason,
+        "steps_used": step + 1,
+        "max_steps": wrapup.max_steps,
+        "todos": todos,
+        "unfinished": len(unfinished_items(todos)),
+    }
+    action.result = result
+    return action
 
 
 def _tool_spec_name(tool: Any) -> str:
@@ -1840,21 +1902,35 @@ def _step_limit_summary(ls: _LoopState) -> str:
     return f"{summary}\n{pending}" if pending else summary
 
 
-def _step_limit_finish(ls: _LoopState, text: str, step: int, *, notice: bool, truncated: bool = False) -> TaskAction:
-    """把收尾文本当隐式 finish 交付，result 里打上 step_limit_reached。"""
-    body = f"{text}\n\n{STEP_LIMIT_NOTICE}" if notice else text
+def _step_limit_finish(
+    ls: _LoopState,
+    text: str,
+    step: int,
+    *,
+    notice: bool,
+    truncated: bool = False,
+    wrapup: _Wrapup | None = None,
+) -> TaskAction:
+    """把收尾文本当隐式 finish 交付，result 里打上 step_limit_reached 或 time_limit_reached。"""
+    reason = wrapup or _Wrapup(reason=WRAPUP_STEPS, max_steps=step + 1)
+    body = f"{text}\n\n{reason.notice}" if notice else text
     # response 传 None：json 模式的 assistant 消息才会存这里拼好的文本，而不是从原响应里重新取
     action = build_implicit_finish(ls, None, body, step=step, truncated=truncated)
-    action.result = {**(action.result or {}), "step_limit_reached": True}
-    return action
+    return _mark_wrapup(ls, action, reason, step)
 
 
 def _step_limit_wrapup(
-    ls: _LoopState, step: int, *, text: str, notice: bool, truncated: bool = False,
+    ls: _LoopState,
+    step: int,
+    *,
+    text: str,
+    notice: bool,
+    truncated: bool = False,
+    wrapup: _Wrapup | None = None,
 ) -> TaskAction | None:
     """最后一步模型没有用 finish 收尾时怎么结束：有正文交付正文，没有就按 tool_call_log 交代做过什么。
 
-    notice 为真时正文末尾注明已达到最大步数；按调用记录生成的说明总是注明。
+    notice 为真时正文末尾注明到了步数或时长上限；按调用记录生成的说明总是注明。
     正文和调用记录都拿不到时返回 None，走原来的 FAIL。
     """
     if ls.preempt_after_step:
@@ -1870,8 +1946,12 @@ def _step_limit_wrapup(
         body, notice, truncated = _step_limit_summary(ls), True, False
     if not body:
         return None
-    logger.warning("node %s reached max_steps without finish; delivering a wrap-up (step=%d)", ls.node.id, step)
-    return _step_limit_finish(ls, body, step, notice=notice, truncated=truncated)
+    reason = wrapup or _Wrapup(reason=WRAPUP_STEPS, max_steps=step + 1)
+    logger.warning(
+        "node %s reached its %s limit without finish; delivering a wrap-up (step=%d)",
+        ls.node.id, "run time" if reason.reason == WRAPUP_TIME else "step", step,
+    )
+    return _step_limit_finish(ls, body, step, notice=notice, truncated=truncated, wrapup=reason)
 
 
 # ---------------------------------------------------------------------------
@@ -2007,6 +2087,9 @@ async def run_ai_node(
     downstream_info: list[dict[str, str]] | None = None,
     switch_info: list[dict[str, str]] | None = None,
     attachments: list[dict[str, Any]] | None = None,
+    steps_used: int = 0,
+    run_budget: RunBudget | None = None,
+    carried_todos: list[dict[str, Any]] | None = None,
 ) -> TaskAction:
     # Phase 3 Hook System：每次进入 AI 节点都注册内置 handler。
     # 原因：内置 handler 已统一迁入 engine.builtin，并通过 PLUGIN_META 声明
@@ -2287,7 +2370,21 @@ async def run_ai_node(
     # 步数太少的节点和系统任务不做收尾，维持原逻辑；短答也不做：收尾那一步会把工具表收窄成只剩 finish，前缀缓存就断了
     _wrapup_enabled = not _is_system_task and not _short_reply_task and max_steps >= 3
 
+    # 默认配置不写快照，挂起前用掉的步数由 supervisor 记在任务上带回来
+    step_count = max(step_count, max(0, int(steps_used or 0)))
+    if _wrapup_enabled and step_count >= max_steps:
+        # 步数上限在挂起期间被改小了：留最后一步交代进度，不直接判失败
+        step_count = max_steps - 1
+    rctx.completed_steps = step_count
+    rctx.step_offset = step_count
+    _lease = getattr(rctx, "lease", None)
+    if _lease is not None:
+        _lease.steps_completed = step_count
+    if _todo_enabled and carried_todos:
+        _seed_carried_todos(ls, carried_todos)
+
     # ---- 推理循环 ----
+    _time_wrapup = False
     for step in range(step_count, max_steps):
         # Phase 3 Hook System：循环顶部统一触发 before_step。
         # 原因：取消、preempt 注入、microcompact、proactive snip 和自动压缩都属于
@@ -2316,10 +2413,20 @@ async def run_ai_node(
         # Purpose: avoid knowledge injection imports in this loop while keeping the
         # migrated execution order visible.
 
-        _final_step = _wrapup_enabled and step == max_steps - 1
+        if _wrapup_enabled and not _time_wrapup and run_budget is not None and run_budget.due():
+            _time_wrapup = True
+            logger.info(
+                "node %s is close to its run time limit; wrapping up at step %d (task=%s)",
+                ls.node.id, step, getattr(ls.rctx, "task_id", ""),
+            )
+        _final_step = _wrapup_enabled and (_time_wrapup or step == max_steps - 1)
+        _wrapup = _Wrapup(reason=WRAPUP_TIME if _time_wrapup else WRAPUP_STEPS, max_steps=max_steps)
         _step_tools = ls.openai_tools
         if _final_step:
-            _append_final_step_hint(ls, step, max_steps)
+            _append_final_step_hint(
+                ls, step, max_steps, reason=_wrapup.reason,
+                elapsed_minutes=int(run_budget.elapsed_seconds() // 60) if run_budget is not None else 0,
+            )
             # json / fake-native 只靠提示；native 这一步只给 finish
             if formatter.mode == "native":
                 _step_tools = _finish_only_tools(ls.openai_tools) or ls.openai_tools
@@ -2343,6 +2450,8 @@ async def run_ai_node(
 
         # P0 Task 内核化：记录实际完成的步数
         ls.rctx.completed_steps = step + 1
+        if _lease is not None:
+            _lease.steps_completed = step + 1
 
         # Phase 3 Hook System：LLM 调用后的 usage 统计交给 UsageTracker。
         # 原因：token 累加是 after_llm_call 的典型横切逻辑。做法：传入响应和
@@ -2365,7 +2474,7 @@ async def run_ai_node(
         if _usage_result.skip_step:
             # 这次回复作废：工具不执行、回复不进历史，带着 hook 追加的提示进下一步；最后一步没有下一步，按收尾交付
             if _final_step:
-                action = _step_limit_wrapup(ls, step, text="", notice=True)
+                action = _step_limit_wrapup(ls, step, text="", notice=True, wrapup=_wrapup)
                 if action is not None:
                     return await _fire_task_end_hook_if_finish(ls, action, step + 1)
             continue
@@ -2424,8 +2533,11 @@ async def run_ai_node(
             if action is None and _final_step:
                 # 整轮被 hook 拦下时（比如 finish 声称成功却没真调过工具），这一轮的正文不能当结论交付
                 action = _step_limit_wrapup(
-                    ls, step, text="" if ls.last_round_blocked else (resp.text or ""), notice=True,
+                    ls, step, text="" if ls.last_round_blocked else (resp.text or ""), notice=True, wrapup=_wrapup,
                 )
+            elif action is not None and _final_step:
+                # 听提示在最后一步调了 finish 也是被迫收尾，标记照打，supervisor 才知道还没做完
+                action = _mark_wrapup(ls, action, _wrapup, step)
             if action is not None:
                 return await _fire_task_end_hook_if_finish(ls, action, step + 1)
             if is_truncated(resp):
@@ -2436,7 +2548,7 @@ async def run_ai_node(
         # 最后一步回了纯文本：没有下一步可以重试了，直接按隐式 finish 交付
         if _final_step:
             action = _step_limit_wrapup(
-                ls, step, text=resp.text or "", notice=False, truncated=is_truncated(resp),
+                ls, step, text=resp.text or "", notice=False, truncated=is_truncated(resp), wrapup=_wrapup,
             )
             if action is not None:
                 return await _fire_task_end_hook_if_finish(ls, action, step + 1)

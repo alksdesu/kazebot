@@ -261,6 +261,13 @@ class SessionMixin:
                 fork_meta.update({"copied": copied, "base_count": copied})
         except Exception as exc:
             fork_meta["error"] = str(exc)
+        # 合并起点也记进登记表：supervisor 重启后任务都不在了，合并没收束的分支只能从这里知道从哪条往后是新的
+        self._session_store.set_entry_field(
+            branch_session_id, "base_count", int(fork_meta.get("base_count") or 0), flush=False,
+        )
+        self._session_store.set_entry_field(
+            branch_session_id, "base_last_id", str(fork_meta.get("base_last_id") or ""),
+        )
 
         self.eventlog.append(
             session_id=parent,
@@ -333,6 +340,8 @@ class SessionMixin:
 
     def _cleanup_branch_locked(self, branch_session_id: str) -> None:
         """Delete one entry branch session and its derived child sessions."""
+        from . import child_retention
+
         self._ensure_entry_branch_indexes_locked()
         branch = str(branch_session_id or "").strip()
         if not branch:
@@ -347,9 +356,14 @@ class SessionMixin:
         # 是 branch。做法：删除 parent_children[branch] 下的所有 JSONL、映射和 registry 标记。
         # 目的：merge 后不会留下只能由已删除 branch 访问的悬挂上下文。
         derived_children = list(self.parent_children.pop(branch, set()))
+        keep_held = bool(parent) and not self._is_entry_branch_session_locked(parent)
         for child_sid in derived_children:
             if self._is_entry_branch_session_locked(child_sid, parent_session_id=branch):
                 self._cleanup_branch_locked(child_sid)
+                continue
+            if keep_held and child_retention.is_held_locked(self, child_sid):
+                # 失败或到点收尾留着的子会话不跟着分支删，挂到父会话下等保留期到了再清
+                child_retention.reparent_locked(self, child_sid, parent, flush=False)
                 continue
             self.purge_session_files(child_sid)
             self._remove_child_mapping_for_session_locked(child_sid)

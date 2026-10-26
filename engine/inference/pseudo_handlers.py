@@ -18,7 +18,8 @@ from .attachment_access import RefusedAttachment, screen_model_attachment_paths
 from ..attachments import is_allowed_attachment_path
 from ..compaction_plan import build_compaction_plan
 from ..conversation_routing import short_reply as _is_short_reply
-from ..dispatch_batch import MAX_DISPATCH_BATCH_ITEMS
+from ..dispatch_batch import CONTINUE_FROM_KEY, MAX_DISPATCH_BATCH_ITEMS
+from ..dispatch_handle import parse_handle
 from ..protocol import TaskAction, ACTION_ASK, ACTION_DISPATCH, ACTION_FINISH
 from ..todo_list import TODO_TOOL_NAME, TodoListError, parse_todo_items, render_update_result
 from .loop_state import _LoopState, _persist_ctx, _short, compact_target_session_id
@@ -515,7 +516,10 @@ def _target_is_persistent(ls: _LoopState, target: str) -> bool:
 
 @dataclass(frozen=True)
 class DispatchRequest:
-    """一次委派调用校验过的参数：异步和 wait 两条路用同一套目标、上下文模式和附件规则。"""
+    """一次委派调用校验过的参数：异步和 wait 两条路用同一套目标、上下文模式和附件规则。
+
+    continue_from 非空时 continuation 是 supervisor 核对句柄后给的子会话信息，子节点接着那份历史做。
+    """
 
     target: str
     instruction: str
@@ -523,12 +527,45 @@ class DispatchRequest:
     context_key: str
     attachments: list[dict[str, Any]]
     refused_attachments: list[RefusedAttachment]
+    continue_from: str = ""
+    continuation: dict[str, Any] = field(default_factory=dict)
+
+
+async def _resolve_continuation(
+    ls: _LoopState, raw_handle: str, target: str, *, wait: bool,
+) -> tuple[dict[str, Any], str]:
+    """请 supervisor 核对 continue_from 的句柄：属于调用方的会话家族、目标节点一致、此刻没在跑。返回 (子会话信息, 拒绝原因)。"""
+    handle = parse_handle(raw_handle)
+    if handle is None:
+        return {}, "continue_from 的句柄格式不对：要填委派结果里给的 task_id@session_id。"
+    caller_task_id = str(getattr(ls.rctx, "task_id", "") or "").strip()
+    if not caller_task_id:
+        return {}, "找不到发起这次委派的任务，没法核对 continue_from 的句柄。"
+    try:
+        response = await ls.rctx.http.get(
+            f"{ls.rctx.supervisor_url}/v1/tasks/{caller_task_id}/continuation",
+            params={"handle": str(handle), "target": target, "wait": "true" if wait else "false"},
+        )
+    except Exception as error:
+        return {}, f"continue_from 核对失败：{type(error).__name__}: {error}"
+    failure = _http_failure(response)
+    if failure:
+        return {}, f"continue_from 核对失败：{failure}"
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        return {}, "continue_from 核对失败：supervisor 没有给出结果。"
+    if not body.get("ok"):
+        return {}, str(body.get("message") or body.get("reason") or "continue_from 被拒绝。")
+    return body, ""
 
 
 async def _resolve_dispatch_request(
-    ls: _LoopState, args: dict, pseudo_call: Any,
+    ls: _LoopState, args: dict, pseudo_call: Any, *, wait: bool = False,
 ) -> tuple[DispatchRequest | None, str]:
-    """校验委派参数，返回 (请求, 拒绝原因)；目标不在委派清单里时请求为 None。"""
+    """校验委派参数，返回 (请求, 拒绝原因)；目标不在委派清单里、continue_from 的句柄不能用时请求为 None。"""
     # 委派清单加载时已换成现在的 id；模型照着旧历史写出旧 id，也换过来再比
     target = canonical_node_id(Path(ls.rctx.workspace_root), str(args.get("target") or ""))
 
@@ -557,6 +594,16 @@ async def _resolve_dispatch_request(
         ctx_mode = str(_raw_ctx_mode).strip()
     else:
         ctx_mode = "accumulate" if _target_is_persistent(ls, target) else "fresh"
+    context_key = str(args.get("context_key") or "").strip()
+    raw_continue = str(args.get(CONTINUE_FROM_KEY) or "").strip()
+    continuation: dict[str, Any] = {}
+    if raw_continue:
+        continuation, refusal = await _resolve_continuation(ls, raw_continue, target, wait=wait)
+        if not continuation:
+            return None, refusal
+        # 接着的是那个子会话自己的历史：模式沿用它当初的，context_key 不再参与找会话
+        ctx_mode = str(continuation.get("context_mode") or "").strip() or ctx_mode
+        context_key = ""
     attachment_paths, refused_attachments = await screen_model_attachment_paths(
         ls, pseudo_call, args.get("attachment_paths") or [], data_dir_only=True,
     )
@@ -564,9 +611,11 @@ async def _resolve_dispatch_request(
         target=target,
         instruction=str(args.get("instruction") or "").strip(),
         context_mode=ctx_mode,
-        context_key=str(args.get("context_key") or "").strip(),
+        context_key=context_key,
         attachments=_paths_to_attachments(attachment_paths, ls.rctx.workspace_root),
         refused_attachments=list(refused_attachments),
+        continue_from=str(parse_handle(raw_continue)) if continuation else "",
+        continuation=continuation,
     ), ""
 
 
@@ -612,7 +661,16 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         parent_route_hints = {}
 
     # 生成 conversation_key
-    if ctx_mode in ("fresh", "fork"):
+    if request.continuation:
+        # 接着上一个子 agent：投进它原来那个会话，入口分支会带着它的全部历史
+        conv_key = str(request.continuation.get("conversation_key") or "").strip()
+        if not conv_key:
+            _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
+                "success": False,
+                "error": "continue_from 指向的子会话找不到会话键，没法接着派；需要的话重新委派。",
+            }, ensure_ascii=False))
+            return None
+    elif ctx_mode in ("fresh", "fork"):
         import uuid as _uuid
         conv_key = f"agent:{target_node_id}:{parent_conv_key}:{_uuid.uuid4()}"
     else:  # accumulate
@@ -646,7 +704,9 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     if caller_task_id:
         # 结果回来时，转述它的那一轮靠这个找回发起任务的输出说明。
         inbound_payload["dispatch_origin"]["caller_task_id"] = caller_task_id
-    if ctx_mode == "fork":
+    if request.continue_from:
+        inbound_payload["dispatch_origin"][CONTINUE_FROM_KEY] = request.continue_from
+    elif ctx_mode == "fork":
         inbound_payload["dispatch_fork_from_session"] = parent_session_id
 
     try:
@@ -748,6 +808,7 @@ async def prepare_wait_dispatches(ls: _LoopState, calls: list[Any]) -> WaitDispa
         )
         return plan
     shared_contexts: set[tuple[str, str]] = set()
+    continued_sessions: set[str] = set()
     for index, call in enumerate(calls):
         if index >= MAX_DISPATCH_BATCH_ITEMS:
             plan.rejected.append((call, _wait_refusal(
@@ -756,15 +817,23 @@ async def prepare_wait_dispatches(ls: _LoopState, calls: list[Any]) -> WaitDispa
             continue
         arguments = dict(getattr(call, "arguments", None) or {})
         target = _dispatch_target_from_tool_name(str(getattr(call, "name", "") or ""))
-        request, refusal = await _resolve_dispatch_request(ls, {**arguments, "target": target}, call)
+        request, refusal = await _resolve_dispatch_request(ls, {**arguments, "target": target}, call, wait=True)
         if request is None:
             plan.rejected.append((call, _wait_refusal(refusal)))
             continue
         if not request.instruction:
             plan.rejected.append((call, _wait_refusal("没有派出：instruction 不能为空，写清楚要目标节点做什么。")))
             continue
+        if request.continue_from:
+            continued = str(request.continuation.get("session_id") or request.continue_from)
+            if continued in continued_sessions:
+                plan.rejected.append((call, _wait_refusal(
+                    "没有派出：同一轮已经有一个委派用 continue_from 接着这个子 agent，两个同时跑会写乱它的历史；等结果回来后再派。"
+                )))
+                continue
+            continued_sessions.add(continued)
         # fresh / fork 每项各开一个子会话；其余模式同一目标同一 context_key 共用一个，同时跑会写乱它
-        if request.context_mode not in ("fresh", "fork"):
+        elif request.context_mode not in ("fresh", "fork"):
             shared = (request.target, request.context_key)
             if shared in shared_contexts:
                 plan.rejected.append((call, _wait_refusal(
@@ -781,6 +850,8 @@ async def prepare_wait_dispatches(ls: _LoopState, calls: list[Any]) -> WaitDispa
         }
         if request.context_key:
             item["context_key"] = request.context_key
+        if request.continue_from:
+            item[CONTINUE_FROM_KEY] = request.continue_from
         if request.attachments:
             item["attachments"] = [dict(attachment) for attachment in request.attachments]
         call_id = str(getattr(call, "id", "") or "").strip()

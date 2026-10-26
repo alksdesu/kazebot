@@ -103,6 +103,14 @@ def _dispatch_delegate_parameters(*, allow_wait: bool = True) -> dict[str, Any]:
             "items": {"type": "string"},
             "description": "File paths (relative to workspace root) to attach to the child node's initial context. Images are injected as multimodal content; other files as references the child can read_file.",
         },
+        "continue_from": {
+            "type": "string",
+            "description": (
+                "接着上一个子 agent 干：填它的委派结果里给的句柄（task_id@session_id），目标节点要和上次一样。"
+                "子 agent 带着自己原来的对话历史继续，context_mode 和 context_key 不再生效；"
+                "当时用 wait 派的要用 wait 接着派，异步派的要异步接着派。"
+            ),
+        },
     }
     if allow_wait:
         properties["wait"] = {

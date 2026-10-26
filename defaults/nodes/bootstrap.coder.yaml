@@ -4,6 +4,9 @@ name: "编程助手"
 description: "编程节点。读写代码、搜索、执行命令，独立完成编程任务；改动较大时请代码审查节点复核。"
 tool_mode: native
 todo: true
+# 一段最多 150 步；到步数或运行时长上限收尾后，在同一会话自动接着做（轮数见 engine.auto_continue.max_rounds）
+max_steps: 150
+auto_continue: true
 delegate_targets:
   - bootstrap.code_reviewer
 # read_tool_output 由引擎给有真工具的节点自动加上；edit_lines 要 edit_mode: hashline 才可见，这里不开

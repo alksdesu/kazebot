@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from clonoth_runtime import task_max_running_seconds
+from engine.run_budget import TASK_LIFETIME_FACTOR, lifetime_origin
 
 from .file_claims import release_if_ended_locked
 from .types import ApprovalStatus, Task, TaskStatus
@@ -28,8 +29,6 @@ PENDING_QUEUE_LIMIT = timedelta(minutes=15)
 SUSPENDED_SILENCE_LIMIT = timedelta(minutes=20)
 # 子任务已终态但 caller 仍挂起时，给路由线程一小段完成收尾的时间。
 SUSPENDED_CHILD_GRACE = timedelta(minutes=5)
-# 单次运行按领取时刻计时，挂起再恢复会重新起算；总寿命再按运行上限的这个倍数兜底，防止派发、恢复无限循环
-TASK_LIFETIME_FACTOR = 6
 
 
 def _queued_since(task: Task) -> datetime:
@@ -54,9 +53,10 @@ def reap_reason(
     """该回收时返回写进 task.result 的原因，不该回收返回 None。
 
     waiting_* 描述挂起任务的等待目标（单个子任务或整个批次）：全部结束、找不到，或还有没结束的。
+    总寿命从续跑链第一个任务创建时算，一条链上的续跑任务不各自重新起算。
     """
     silence = now - task.updated_at
-    lifetime_sec = (now - task.created_at).total_seconds()
+    lifetime_sec = (now - lifetime_origin(task.created_at, task.input)).total_seconds()
     lifetime_limit = max_lifetime_sec if max_lifetime_sec is not None else max_running_sec * TASK_LIFETIME_FACTOR
     if task.status == TaskStatus.pending:
         if lifetime_sec > lifetime_limit:
