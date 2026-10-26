@@ -11,7 +11,7 @@
 # ===========================================================================
 # 【配置生效优先级】（重要）
 # ===========================================================================
-# 系统模型渠道（下方 system_models：compact / summary / image）的每个字段
+# 系统模型渠道（下方 system_models：compact / summary / intent / review / image 等）的每个字段
 # （model / base_url / api_key）都是“逐字段、独立”地按下面顺序取第一个非空值：
 #
 #   1) config.yaml 的 system_models.<slot>.<字段>   （最高优先）
@@ -70,24 +70,27 @@ openai:
 #   model: gemini-3-flash
 
 # ---------------------------------------------------------------------------
-# 系统模型渠道（压缩 / 轮摘要 / 读图 / 生图）
+# 系统模型渠道（压缩 / 轮摘要 / 接话意愿 / 代码审查 / 读图 / 生图）
 # ---------------------------------------------------------------------------
-# 压缩节点 system.compactor、轮摘要节点 system.turn_summarizer、read_image 工具，
-# 以及生图工具 gpt_image_2 / gemini_image，都不再硬编码模型。每个用途（slot）
-# 各自可单独配置 model/base_url/api_key，也可仅换模型名而 url/key 跟随主渠道。
+# 压缩节点 system.compactor、轮摘要节点 system.turn_summarizer、代码审查节点
+# bootstrap.code_reviewer、read_image 工具，以及生图工具 gpt_image_2 / gemini_image，
+# 都不再硬编码模型。每个用途（slot）各自可单独配置 model/base_url/api_key，
+# 也可仅换模型名而 url/key 跟随主渠道。
 #
 # 逐字段解析优先级见文件顶部【配置生效优先级】：
 #   config.yaml.system_models > CLONOTH_<SLOT>_* 环境变量 > 主渠道
 # slot 专属环境变量名：
 #   compact      -> CLONOTH_COMPACT_MODEL / CLONOTH_COMPACT_BASE_URL / CLONOTH_COMPACT_API_KEY
 #   summary      -> CLONOTH_SUMMARY_MODEL / CLONOTH_SUMMARY_BASE_URL / CLONOTH_SUMMARY_API_KEY
+#   intent       -> CLONOTH_INTENT_MODEL  / CLONOTH_INTENT_BASE_URL  / CLONOTH_INTENT_API_KEY    （群聊接话判断）
+#   review       -> CLONOTH_REVIEW_MODEL  / CLONOTH_REVIEW_BASE_URL  / CLONOTH_REVIEW_API_KEY    （代码审查节点）
 #   image        -> CLONOTH_IMAGE_MODEL   / CLONOTH_IMAGE_BASE_URL   / CLONOTH_IMAGE_API_KEY   （read_image 读图）
 #   image_gpt    -> CLONOTH_IMAGE_GPT_MODEL / CLONOTH_IMAGE_GPT_BASE_URL / CLONOTH_IMAGE_GPT_API_KEY   （gpt_image_2 生图）
 #   image_gemini -> CLONOTH_IMAGE_GEMINI_MODEL / CLONOTH_IMAGE_GEMINI_BASE_URL / CLONOTH_IMAGE_GEMINI_API_KEY   （gemini_image 生图）
 # 下面这些槽位都能在 QQ 控制台的「渠道」页里改，不必手写。
 #
 # 每个 slot 还可写 provider（或 CLONOTH_<SLOT>_PROVIDER），指定这一槽用哪套请求格式。
-# compact / summary / intent：改了 base_url 换家却不改它，就是拿主渠道那家的格式去打这个
+# compact / summary / intent / review：改了 base_url 换家却不改它，就是拿主渠道那家的格式去打这个
 # 地址 —— 换中转没事，换家必挂，日志里会有一行提醒。
 # image：四套格式都支持。三档规则 —— 全空跟随主渠道（连格式一起跟）；只填地址按 openai 算；
 # 写了 provider 就按它。地址写到哪一级也看它：OpenAI 系带 /v1，Claude 与 Gemini 不带。
@@ -114,6 +117,8 @@ openai:
 #     model: "${SUMMARY_MODEL}"
 #     base_url: "${SUMMARY_BASE_URL}"     # 也可单独指定渠道 url/key
 #     api_key: "${SUMMARY_API_KEY}"
+#   review:                               # 代码审查节点：换个擅长读代码的模型
+#     model: "claude-opus-5-5"
 #   image:                                # 读图：read_image 工具和表情包打标共用
 #     provider: "gemini"                  # 走 Gemini 原生；不写则按上面的三档规则
 #     model: "gemini-3.5-flash"

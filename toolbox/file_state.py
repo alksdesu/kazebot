@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import logging
 import os
 import threading
 import zlib
@@ -14,6 +15,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .text_files import replace_bytes
+
+logger = logging.getLogger(__name__)
 
 STALE_MESSAGE = "文件在你上次读取后被修改过，请重新 read_file 后再改"
 CONCURRENT_MESSAGE = "文件在这次读取和写入之间被别处改过，没有写入；请重新 read_file 后再改"
@@ -169,10 +172,20 @@ def commit_locked(path: Path, data: bytes, *, expected: FileSnapshot) -> Stamp:
     return stamp_of(data, mtime_ns)
 
 
-def reveal_allowed(gate: Gate) -> bool:
-    """结果里能不能带文件原文（候选片段、改动处的上下文）：只认本会话经读权限看过的这一版，否则只给行号。
+async def reveal_allowed(ctx: Any, gate: Gate, path: str) -> bool:
+    """结果里能不能带文件原文（候选片段、改动处的上下文），否则只给行号。
 
-    写权限不等于读权限：config/nodes/** 能批准改、却禁止读。也不另发读策略请求：data/** 这类读要审批的文件，
-    写入批准之后会为几行回显再弹一张审批卡，工具一直挂到有人处理或超时。
+    本会话经读权限看过这一版就放行；没看过就按 read_file 策略问一次，auto 才放行，approval_required 和 deny 都不放。
+    写权限不等于读权限：config/nodes/** 能批准改、却禁止读。只问结论不送审：为几行回显弹一张读审批卡，工具会一直挂到有人处理。
     """
-    return gate.revealable
+    if gate.revealable:
+        return True
+    evaluate = getattr(ctx, "evaluate_op", None)
+    if not callable(evaluate):
+        return False
+    try:
+        verdict = await evaluate("read_file", {"path": path})
+    except Exception as exc:
+        logger.warning("read policy check for echoing %s failed; showing line numbers only: %s", path, exc)
+        return False
+    return isinstance(verdict, dict) and str(verdict.get("safety_level") or "") == "auto"

@@ -2350,6 +2350,13 @@ async def run_ai_node(
         _usage_result = await hook_registry.afire("after_llm_call", _usage_ctx)
         if _usage_result.action is not None:
             return _usage_result.action
+        if _usage_result.skip_step:
+            # 这次回复作废：工具不执行、回复不进历史，带着 hook 追加的提示进下一步；最后一步没有下一步，按收尾交付
+            if _final_step:
+                action = _step_limit_wrapup(ls, step, text="", notice=True)
+                if action is not None:
+                    return await _fire_task_end_hook_if_finish(ls, action, step + 1)
+            continue
         # [2026-05-24] Allow after_llm_call hooks (e.g. fallback_provider) to
         # replace the response. Without this, a hook that sets ctx.response to
         # a successful fallback result would be ignored because the local `resp`

@@ -290,11 +290,12 @@ async def edit_lines(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
     outcome: LineEditOutcome = tx.outcome
     if tx.status == "failed":
-        return _mismatch_response(path_str, outcome, len(edits), reveal=file_state.reveal_allowed(tx.gate))
+        reveal = await file_state.reveal_allowed(ctx, tx.gate, path_str)
+        return _mismatch_response(path_str, outcome, len(edits), reveal=reveal)
     if tx.status == "unchanged":
         return _success_response(path_str, outcome, edits, written=False, byte_count=0, reveal=False, checks=None)
 
-    reveal = file_state.reveal_allowed(tx.gate)
+    reveal = await file_state.reveal_allowed(ctx, tx.gate, path_str)
     checks = await run_edit_checks(ctx, resolved, outcome.content, tool_name="edit_lines")
     return _success_response(
         path_str, outcome, edits,

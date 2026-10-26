@@ -121,7 +121,7 @@ def _now() -> datetime:
 def _audit_ops_caller(st: Any, request: Request, inp: Any) -> None:
     """观察期：只记录，不拦。
 
-    /v1/ops/request 是全部策略判定的入口，而 is_admin 由调用方自报，端点本身不认凭证 ——
+    /v1/ops/request 和 /v1/ops/evaluate 是全部策略判定的入口，而 is_admin 由调用方自报，端点本身不认凭证 ——
     能连上这个端口的进程都可以把 approval_required 换成 auto。改成拒绝之前先跑一段，
     确认日志里除了 engine 没有别的调用方，免得漏掉某条路径把工具调用全打死。
 
@@ -141,6 +141,7 @@ def _audit_ops_caller(st: Any, request: Request, inp: Any) -> None:
             type_="ops_request_unauthenticated",
             # 只记有没有带、带了多长，不记值本身。
             payload={
+                "endpoint": str(getattr(getattr(request, "url", None), "path", "") or ""),
                 "op": str(getattr(inp, "op", "") or ""),
                 "node_id": str(getattr(inp, "node_id", "") or ""),
                 "session_id": str(getattr(inp, "session_id", "") or ""),
@@ -1670,6 +1671,19 @@ def create_app(
             op=inp.op,
             parameters=inp.parameters,
             tool_call_id=inp.tool_call_id,
+            node_id=inp.node_id,
+            task_id=inp.task_id,
+        )
+
+    # 只问结论：和 /v1/ops/request 同一套判定，但不创建审批，回的只有 safety_level 和 reason
+    @app.post("/v1/ops/evaluate", response_model=OpRequestOut, response_model_exclude={"approval_id"})
+    def ops_evaluate(inp: OpRequestIn, request: Request) -> OpRequestOut:
+        st: SupervisorState = app.state.state
+        _audit_ops_caller(st, request, inp)
+        return st.evaluate_operation(
+            session_id=inp.session_id,
+            op=inp.op,
+            parameters=inp.parameters,
             node_id=inp.node_id,
             task_id=inp.task_id,
         )

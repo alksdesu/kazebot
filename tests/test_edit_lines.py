@@ -45,10 +45,15 @@ class _Ctx(ToolContext):
         self._node_extra = {"edit_mode": "hashline"} if hashline else {}
         self.decisions = dict(decisions)
         self.requested: list[tuple[str, dict[str, Any]]] = []
+        self.evaluated: list[tuple[str, dict[str, Any]]] = []
         self.cancelled = False
 
     async def request_op(self, op: str, parameters: dict[str, Any]) -> dict[str, Any]:
         self.requested.append((op, dict(parameters)))
+        return {"safety_level": self.decisions.get(op, "auto"), "reason": f"{op} decided by the test"}
+
+    async def evaluate_op(self, op: str, parameters: dict[str, Any]) -> dict[str, Any]:
+        self.evaluated.append((op, dict(parameters)))
         return {"safety_level": self.decisions.get(op, "auto"), "reason": f"{op} decided by the test"}
 
     async def check_cancelled(self) -> bool:
@@ -319,9 +324,10 @@ class TestAnchorsThatDoNotMatch:
         assert result["ok"] is False
         assert "用 write_file" in result["data"]["result"]
 
-    def test_no_current_lines_for_a_file_not_read_in_this_session(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("level", ["approval_required", "deny"])
+    def test_no_current_lines_for_an_unread_file_that_needs_more_than_auto(self, tmp_path: Path, level: str) -> None:
         seed(tmp_path / "f.txt", b"secret = 1\nother = 2\n")
-        ctx = _Ctx(tmp_path)
+        ctx = _Ctx(tmp_path, read_file=level)
 
         result = edit(ctx, "f.txt", {"op": "replace", "start": f"1:{other_hash('secret = 1')}", "content": "x"})
 
@@ -331,6 +337,19 @@ class TestAnchorsThatDoNotMatch:
         assert "secret" not in text and "other = 2" not in text
         assert "actual" not in result["data"]["failedEdits"][0]
         assert "read_file" not in ctx.ops
+        assert ctx.evaluated == [("read_file", {"path": "f.txt"})]
+
+    def test_an_unread_file_readable_without_approval_shows_its_current_lines(self, tmp_path: Path) -> None:
+        seed(tmp_path / "f.txt", b"secret = 1\nother = 2\n")
+        ctx = _Ctx(tmp_path)
+
+        result = edit(ctx, "f.txt", {"op": "replace", "start": f"1:{other_hash('secret = 1')}", "content": "x"})
+
+        assert result["ok"] is False
+        assert result["data"]["failedEdits"][0]["actual"] == f"1:{h('secret = 1')}"
+        assert f"2:{h('other = 2')}|other = 2" in result["data"]["result"]
+        assert ctx.ops == ["write_file"]
+        assert ctx.evaluated == [("read_file", {"path": "f.txt"})]
 
     def test_a_file_changed_after_reading_is_refused(self, tmp_path: Path) -> None:
         path = seed(tmp_path / "f.txt", b"one\ntwo\n")

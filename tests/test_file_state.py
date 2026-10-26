@@ -1,9 +1,10 @@
 """读后改前的戳：按「会话 + 路径」记、按内容比，LRU 有上限；写盘前最后一刻再比一次，挡住别的进程插进来的改动。
 
-回显原文只认本会话经读权限看过的这一版，不另发读策略请求。
+回显原文：本会话经读权限看过的这一版直接放行；没看过就只问一次读策略（不送审），auto 才放行。
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -185,18 +186,68 @@ class TestCommit:
         assert path.read_bytes() == b"created elsewhere\n"
 
 
+class _Evaluator:
+    """只认 evaluate_op 的上下文替身：按预设回结论，记下问过什么；request_op 一被调用就算错。"""
+
+    def __init__(self, level: str = "auto", *, error: Exception | None = None) -> None:
+        self.level = level
+        self.error = error
+        self.asked: list[tuple[str, dict]] = []
+
+    async def evaluate_op(self, op: str, parameters: dict) -> dict:
+        self.asked.append((op, dict(parameters)))
+        if self.error is not None:
+            raise self.error
+        return {"safety_level": self.level, "reason": "test"}
+
+    async def request_op(self, op: str, parameters: dict) -> dict:
+        raise AssertionError("回显只问结论，不能送审")
+
+
+def reveal(ctx: object, gate: Gate, path: str = "notes/a.txt") -> bool:
+    return asyncio.run(file_state.reveal_allowed(ctx, gate, path))
+
+
 class TestRevealAllowed:
-    def test_a_version_seen_through_read_file_is_revealed(self) -> None:
-        assert file_state.reveal_allowed(Gate(Entry(stamp_of(b"x", 1), True))) is True
+    def test_a_version_seen_through_read_file_is_revealed_without_asking(self) -> None:
+        ctx = _Evaluator("deny")
 
-    def test_an_unread_file_is_not_revealed(self) -> None:
-        assert file_state.reveal_allowed(Gate(None)) is False
+        assert reveal(ctx, Gate(Entry(stamp_of(b"x", 1), True))) is True
+        assert ctx.asked == []
 
-    def test_an_entry_written_without_a_read_is_not_revealed(self) -> None:
-        assert file_state.reveal_allowed(Gate(Entry(stamp_of(b"x", 1), False))) is False
+    def test_an_unread_file_is_revealed_when_reading_it_is_auto(self) -> None:
+        ctx = _Evaluator("auto")
 
-    def test_a_stale_or_vanished_version_is_not_revealed(self) -> None:
+        assert reveal(ctx, Gate(None), "src/app.py") is True
+        assert ctx.asked == [("read_file", {"path": "src/app.py"})]
+
+    @pytest.mark.parametrize("level", ["approval_required", "deny", "", "unknown"])
+    def test_an_unread_file_stays_hidden_unless_the_answer_is_auto(self, level: str) -> None:
+        ctx = _Evaluator(level)
+
+        assert reveal(ctx, Gate(None)) is False
+        assert len(ctx.asked) == 1
+
+    def test_an_entry_written_without_a_read_asks_the_policy(self) -> None:
+        assert reveal(_Evaluator("approval_required"), Gate(Entry(stamp_of(b"x", 1), False))) is False
+        assert reveal(_Evaluator("auto"), Gate(Entry(stamp_of(b"x", 1), False))) is True
+
+    def test_a_stale_or_vanished_version_needs_the_policy(self) -> None:
         entry = Entry(stamp_of(b"x", 1), True)
 
-        assert file_state.reveal_allowed(Gate(entry, stale=True)) is False
-        assert file_state.reveal_allowed(Gate(entry, vanished=True)) is False
+        assert reveal(_Evaluator("deny"), Gate(entry, stale=True)) is False
+        assert reveal(_Evaluator("deny"), Gate(entry, vanished=True)) is False
+        assert reveal(_Evaluator("auto"), Gate(entry, stale=True)) is True
+
+    def test_a_failed_policy_check_hides_the_text(self) -> None:
+        assert reveal(_Evaluator(error=RuntimeError("supervisor down")), Gate(None)) is False
+
+    def test_a_context_that_cannot_ask_hides_the_text(self) -> None:
+        assert reveal(SimpleNamespace(), Gate(None)) is False
+
+    def test_an_answer_that_is_not_a_mapping_hides_the_text(self) -> None:
+        class Odd(_Evaluator):
+            async def evaluate_op(self, op: str, parameters: dict) -> dict:
+                return "auto"  # type: ignore[return-value]
+
+        assert reveal(Odd(), Gate(None)) is False

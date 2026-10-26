@@ -235,3 +235,37 @@ describe('换家提示', () => {
     expect(within(rowFor('轮摘要')).queryByText(/这个地址是/)).toBeNull();
   });
 });
+
+describe('代码审查槽位', () => {
+  // 槽位清单由后端给，新加的槽位不用在前端登记就能配
+  const withReview = () => {
+    const slots = structuredClone(SLOTS);
+    slots.slots.splice(3, 0, slot({ key: 'review', label: '代码审查', supports_provider: true, env_prefix: 'CLONOTH_REVIEW' }));
+    return slots;
+  };
+
+  it('后端给了就摆出来，和别的引擎槽位一样能选渠道', async () => {
+    vi.mocked(getSystemModels).mockResolvedValue(withReview() as any);
+    render1();
+    await screen.findByText('系统槽位');
+
+    expect(rows()).toHaveLength(7);
+    expect(within(rowFor('代码审查')).getByLabelText('代码审查 渠道')).toBeTruthy();
+    expect((within(rowFor('代码审查')).getByLabelText('代码审查 模型') as HTMLInputElement).value).toBe('');
+  });
+
+  it('改了只提交这一个槽位', async () => {
+    vi.mocked(getSystemModels).mockResolvedValue(withReview() as any);
+    render1();
+    await screen.findByText('系统槽位');
+    fireEvent.change(within(rowFor('代码审查')).getByLabelText('代码审查 模型'), {
+      target: { value: 'review-model' },
+    });
+    save();
+
+    await waitFor(() => expect(updateSystemModel).toHaveBeenCalledTimes(1));
+    const [, key, body] = vi.mocked(updateSystemModel).mock.calls[0];
+    expect(key).toBe('review');
+    expect(body).toEqual({ model: 'review-model' });
+  });
+});

@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,19 @@ from .types import (
 
 # 没人定案、由系统按拒绝收掉的审批附言以 auto-denied 结尾，toolbox 的审批超时也是；适配器据此显示成「已失效」。
 ORPHANED_APPROVAL_COMMENT = "task ended before a decision; auto-denied"
+
+
+@dataclass(frozen=True)
+class _OperationVerdict:
+    """一次操作的判定。decided 不为空就是定论；为空表示要人审批，reason 是策略给的理由，details 是要记进审批的参数。"""
+
+    decided: OpRequestOut | None
+    reason: str = ""
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+def _decided(level: SafetyLevel, reason: str) -> _OperationVerdict:
+    return _OperationVerdict(OpRequestOut(safety_level=level, reason=reason, approval_id=None))
 
 
 class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
@@ -1768,6 +1782,65 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         node_id: str | None = None,
         task_id: str | None = None,
     ) -> OpRequestOut:
+        verdict = self._operation_verdict(
+            session_id=session_id,
+            op=op,
+            parameters=parameters,
+            tool_call_id=tool_call_id,
+            node_id=node_id,
+            task_id=task_id,
+            record_audit=True,
+        )
+        if verdict.decided is not None:
+            return verdict.decided
+        # [AutoC 2026-05-31] Why: request_guard can now identify the active tool
+        # call. How: forward that identity to create_approval. Purpose: the emitted
+        # approval_requested event can be merged into the same ToolCallCard.
+        approval = self.create_approval(
+            session_id=session_id,
+            operation=op,
+            details=verdict.details,
+            tool_call_id=tool_call_id,
+            node_id=node_id,
+            task_id=task_id,
+        )
+        return OpRequestOut(safety_level=SafetyLevel.approval_required, reason=verdict.reason, approval_id=approval.approval_id)
+
+    def evaluate_operation(
+        self,
+        *,
+        session_id: str,
+        op: str,
+        parameters: dict[str, Any],
+        node_id: str | None = None,
+        task_id: str | None = None,
+    ) -> OpRequestOut:
+        """和 request_operation 同一套判定，但不创建审批、不记审计事件，approval_id 总是空。"""
+        verdict = self._operation_verdict(
+            session_id=session_id,
+            op=op,
+            parameters=parameters,
+            tool_call_id=None,
+            node_id=node_id,
+            task_id=task_id,
+            record_audit=False,
+        )
+        if verdict.decided is not None:
+            return verdict.decided
+        return OpRequestOut(safety_level=SafetyLevel.approval_required, reason=verdict.reason, approval_id=None)
+
+    def _operation_verdict(
+        self,
+        *,
+        session_id: str,
+        op: str,
+        parameters: dict[str, Any],
+        tool_call_id: str | None,
+        node_id: str | None,
+        task_id: str | None,
+        record_audit: bool,
+    ) -> _OperationVerdict:
+        """按任务身份判定一次操作；record_audit 为假时定时任务拒绝和授权放行都不记事件。"""
         with self._lock:
             task = self.tasks.get(task_id) if task_id else None
             conv_key, channel = self._authorizing_origin_locked(session_id, task)
@@ -1793,17 +1866,17 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         if source.external and not is_admin:
             verdict = self._external_non_admin_verdict(op, parameters, source.label)
             if verdict is not None:
-                return verdict
+                return _OperationVerdict(verdict)
 
         decision = self.policy.evaluate(op=op, parameters=parameters)
         if decision.safety_level == SafetyLevel.auto:
-            return OpRequestOut(safety_level=SafetyLevel.auto, reason=decision.reason, approval_id=None)
+            return _decided(SafetyLevel.auto, decision.reason)
         # [AutoC 2026-06-04] Why: hard policy denials must not be converted into
         # human approval requests. How: return SafetyLevel.deny immediately before
         # any scheduler or approval handling. Purpose: destructive or invalid
         # operations stay blocked even when they come from unattended jobs.
         if decision.safety_level == SafetyLevel.deny:
-            return OpRequestOut(safety_level=SafetyLevel.deny, reason=decision.reason, approval_id=None)
+            return _decided(SafetyLevel.deny, decision.reason)
 
         # [AutoC 2026-06-04] Why: scheduler-triggered tasks have no source inbound
         # sequence, so their approval events cannot be routed to an adapter and would
@@ -1817,31 +1890,23 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             # 正是从"能建一个 schedule"走到"任意代码执行"的那几步。这类直接 deny 而不是
             # 转审批 —— 转审批只会让任务挂到硬上限被回收，排障方向还会被带偏。
             if getattr(decision, "sensitive", False):
-                self.eventlog.append(
-                    session_id=session_id,
-                    component="supervisor",
-                    type_="scheduler_sensitive_op_denied",
-                    payload={"op": op, "reason": decision.reason, "task_id": task_id or ""},
+                if record_audit:
+                    self.eventlog.append(
+                        session_id=session_id,
+                        component="supervisor",
+                        type_="scheduler_sensitive_op_denied",
+                        payload={"op": op, "reason": decision.reason, "task_id": task_id or ""},
+                    )
+                return _decided(
+                    SafetyLevel.deny,
+                    f"scheduler tasks cannot run sensitive operations unattended ({decision.reason})",
                 )
-                return OpRequestOut(
-                    safety_level=SafetyLevel.deny,
-                    reason=f"scheduler tasks cannot run sensitive operations unattended ({decision.reason})",
-                    approval_id=None,
-                )
-            return OpRequestOut(
-                safety_level=SafetyLevel.auto,
-                reason="auto-approved: scheduler task",
-                approval_id=None,
-            )
+            return _decided(SafetyLevel.auto, "auto-approved: scheduler task")
 
         # 外部平台管理员亲自触发的任务，普通命令和文件操作不再逐条审批；
         # 改源码、重启、动 config/nodes、data、工作区外部路径等敏感操作仍需人工确认。
         if source.external and is_admin and not getattr(decision, "sensitive", False):
-            return OpRequestOut(
-                safety_level=SafetyLevel.auto,
-                reason=f"auto-approved: {source.label} admin task ({decision.reason})",
-                approval_id=None,
-            )
+            return _decided(SafetyLevel.auto, f"auto-approved: {source.label} admin task ({decision.reason})")
 
         granted = self._approval_grant_verdict(
             identity=grant_identity,
@@ -1853,22 +1918,11 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             task_id=task_id or "",
             tool_call_id=tool_call_id or "",
             node_id=node_id or "",
+            record_audit=record_audit,
         )
         if granted is not None:
-            return granted
-
-        # [AutoC 2026-05-31] Why: request_guard can now identify the active tool
-        # call. How: forward that identity to create_approval. Purpose: the emitted
-        # approval_requested event can be merged into the same ToolCallCard.
-        approval = self.create_approval(
-            session_id=session_id,
-            operation=op,
-            details=parameters,
-            tool_call_id=tool_call_id,
-            node_id=node_id,
-            task_id=task_id,
-        )
-        return OpRequestOut(safety_level=SafetyLevel.approval_required, reason=decision.reason, approval_id=approval.approval_id)
+            return _OperationVerdict(granted)
+        return _OperationVerdict(None, reason=decision.reason, details=parameters)
 
     def _approval_grant_verdict(
         self,
@@ -1882,35 +1936,37 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         task_id: str,
         tool_call_id: str,
         node_id: str,
+        record_audit: bool,
     ) -> OpRequestOut | None:
-        """任务发起人名下有生效中的授权时直接放行，并记一条 approval_grant_used 备查。"""
+        """任务发起人名下有生效中的授权时直接放行；record_audit 为真时记一条 approval_grant_used 备查。"""
         if identity is None:
             return None
         with self._lock:
             grant = self.approval_grants.active_for(identity, now=_now())
             if grant is None:
                 return None
-            self.eventlog.append(
-                session_id=session_id,
-                component="supervisor",
-                type_="approval_grant_used",
-                payload={
-                    "op": op,
-                    "task_id": task_id,
-                    "session_id": session_id,
-                    "grant_id": grant.grant_id,
-                    "approval_id": grant.approval_id,
-                    "platform": grant.platform,
-                    "user_id": grant.user_id,
-                    "bot_scope": grant.bot_scope,
-                    "until": grant.until.isoformat(),
-                    "reason": policy_reason,
-                    "sensitive": sensitive,
-                    "target": operation_target(op, parameters),
-                    "tool_call_id": tool_call_id,
-                    "node_id": node_id,
-                },
-            )
+            if record_audit:
+                self.eventlog.append(
+                    session_id=session_id,
+                    component="supervisor",
+                    type_="approval_grant_used",
+                    payload={
+                        "op": op,
+                        "task_id": task_id,
+                        "session_id": session_id,
+                        "grant_id": grant.grant_id,
+                        "approval_id": grant.approval_id,
+                        "platform": grant.platform,
+                        "user_id": grant.user_id,
+                        "bot_scope": grant.bot_scope,
+                        "until": grant.until.isoformat(),
+                        "reason": policy_reason,
+                        "sensitive": sensitive,
+                        "target": operation_target(op, parameters),
+                        "tool_call_id": tool_call_id,
+                        "node_id": node_id,
+                    },
+                )
         return OpRequestOut(
             safety_level=SafetyLevel.auto,
             reason=f"auto-approved: approval grant {grant.grant_id} until {grant.until.isoformat()} ({policy_reason})",

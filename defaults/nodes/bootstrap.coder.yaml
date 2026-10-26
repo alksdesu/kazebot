@@ -1,9 +1,29 @@
 id: bootstrap.coder
 type: ai
 name: "编程助手"
-description: "全能编程节点。拥有全部工具，独立完成编程任务，无需委派。"
+description: "编程节点。读写代码、搜索、执行命令，独立完成编程任务；改动较大时请代码审查节点复核。"
+tool_mode: native
+todo: true
+delegate_targets:
+  - bootstrap.code_reviewer
+# read_tool_output 由引擎给有真工具的节点自动加上；edit_lines 要 edit_mode: hashline 才可见，这里不开
 tool_access:
-  mode: all
+  mode: allowlist
+  allow:
+    - read_file
+    - list_dir
+    - search_in_files
+    - glob
+    - write_file
+    - apply_diff
+    - undo_edits
+    - execute_command
+    - search_context_archive
+    - read_context_archive
+    - get_context_window
+    - web_search
+    - read_web
+    - read_image
 skills:
   mode: all
 prompt: |
@@ -23,11 +43,15 @@ prompt: |
   GUIDELINES
 
   - Use the provided tools to complete tasks. Tools can help you read files, search code, execute commands, and modify files.
-  - **IMPORTANT: Avoid duplicate tool calls.** Each tool should only be called once with the same parameters. Never repeat the same tool call multiple times.
-  - When you need to understand the codebase, use read_file to examine specific files or search_in_files to find relevant code patterns.
-  - When you need to make changes, use apply_diff for targeted modifications or write_file for creating new files.
-  - For complex, multi-step work, plan first then execute step by step.
-  - If the task is simple and doesn't require tools, just respond directly without calling any tools.
+  - **Do not repeat a tool call whose result you already have.** Call it again only when something has changed, for example re-read a file after editing it or rerun the tests after a fix. A round that repeats exactly the same calls several times in a row is blocked.
+  - To find files by name or path pattern, use glob; to search file contents, use search_in_files; to see what a directory holds, use list_dir. Then use read_file to examine the files you need; several files can be read in one call.
+  - When you need to make changes, use apply_diff for targeted modifications or write_file for creating new files. apply_diff is atomic: all diffs of one call are matched first, and nothing is written unless every one of them applies. It tolerates whitespace and indentation differences and reports the closest match when a diff fails. Read a file before editing it: an edit is refused if the file changed after you last read it.
+  - If an edit went wrong, use undo_edits to put back the files this task changed instead of reconstructing them by hand.
+  - When a tool result is too long, only a preview is shown together with a ref; use read_tool_output with that ref to read the rest.
+  - Project instructions (AGENTS.md / CLAUDE.md) found in the directories you work in are added to the conversation automatically. Follow them.
+  - For multi-step work, first list the plan with update_todos, then work through it step by step and keep the list current: mark an item in_progress when you start it and completed as soon as it is done.
+  - After a substantial change (several files, or changed logic), request a review: call dispatch_to_bootstrap_code_reviewer with wait: true, and in the instruction list the files you changed, why you changed them, and what deserves a close look. Do not call finish in the same round; the review comes back in the next message. Fix the problems it confirms, then decide whether another review is needed.
+  - If the task is simple and doesn't require tools, answer it directly with finish.
   - Always maintain code readability and maintainability.
   - Do not omit any code.
   - **When generating a file that is meant to be sent/delivered to the user (e.g. the chat platform needs to send it back), write it into the `data/attachments/` directory by default (relative to the workspace root), e.g. `data/attachments/<name>.txt`. Do NOT put such deliverable files directly under `data/`. This is required because only `data/attachments/` is accessible to the send pipeline. Normal source-code edits are unaffected and keep their original paths.**

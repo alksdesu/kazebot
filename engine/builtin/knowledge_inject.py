@@ -5,6 +5,7 @@ import re
 import shutil
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -39,6 +40,13 @@ logger = logging.getLogger(__name__)
 
 # Skill 名同时是 config/skills/<name>/ 目录名
 SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+# output 策略的 skill 不进提示词，只拿 trigger 去匹配模型的输出
+OUTPUT_STRATEGY = "output"
+SKILL_STRATEGIES = ("constant", "normal", OUTPUT_STRATEGY)
+OUTPUT_SCOPES = ("text", "tool_args", "both")
+DEFAULT_OUTPUT_SCOPE = "both"
+DEFAULT_OUTPUT_MAX_FIRES = 1
 
 
 # Why: skill and memory injection now share one before_prompt_build handler.
@@ -193,6 +201,85 @@ def parse_skill_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     return meta, body
 
 
+def skill_strategy(meta: dict[str, Any]) -> str:
+    """frontmatter 里的 strategy；认不出的按 normal。"""
+    strategy = str(meta.get("strategy") or "normal").strip().lower()
+    return strategy if strategy in SKILL_STRATEGIES else "normal"
+
+
+def _whole_number(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def output_rule_problem(meta: dict[str, Any]) -> str:
+    """output 策略的 trigger / scope / max_fires 哪里写得不对；都没问题返回空串。"""
+    trigger = meta.get("trigger")
+    if not isinstance(trigger, str) or not trigger.strip():
+        return "a skill with strategy output needs a non-empty trigger regex"
+    try:
+        re.compile(trigger)
+    except re.error as exc:
+        return f"trigger is not a valid regex: {exc}"
+    scope = meta.get("scope")
+    if scope is not None and str(scope).strip().lower() not in OUTPUT_SCOPES:
+        return f"scope must be one of {', '.join(OUTPUT_SCOPES)}, got {scope!r}"
+    max_fires = meta.get("max_fires")
+    if max_fires is not None and (_whole_number(max_fires) or 0) < 1:
+        return f"max_fires must be a whole number of at least 1, got {max_fires!r}"
+    return ""
+
+
+_WARNED_OUTPUT_RULES: OrderedDict[tuple[str, str], None] = OrderedDict()
+_WARNED_OUTPUT_RULES_LIMIT = 512
+_WARNED_OUTPUT_RULES_LOCK = threading.Lock()
+
+
+def _warn_output_rule_once(where: str, problem: str) -> None:
+    # 目录缓存两秒就重扫一次，同一条写错的规则不能每次都记一遍
+    key = (where, problem)
+    with _WARNED_OUTPUT_RULES_LOCK:
+        if key in _WARNED_OUTPUT_RULES:
+            return
+        _WARNED_OUTPUT_RULES[key] = None
+        while len(_WARNED_OUTPUT_RULES) > _WARNED_OUTPUT_RULES_LIMIT:
+            _WARNED_OUTPUT_RULES.popitem(last=False)
+    logger.warning("output rule %s: %s", where, problem)
+
+
+def parse_output_rule(meta: dict[str, Any], *, where: str) -> dict[str, Any]:
+    """output 策略的匹配设置。trigger 在这里编译，编译不过 pattern 为 None、这条规则不生效；scope、max_fires 写错按默认值。"""
+    trigger = meta.get("trigger")
+    pattern: re.Pattern[str] | None = None
+    if not isinstance(trigger, str) or not trigger.strip():
+        _warn_output_rule_once(where, "no trigger regex; the rule is skipped")
+        trigger = ""
+    else:
+        try:
+            pattern = re.compile(trigger)
+        except re.error as exc:
+            _warn_output_rule_once(where, f"trigger {trigger!r} is not a valid regex, the rule is skipped: {exc}")
+    raw_scope = meta.get("scope")
+    scope = str(raw_scope or DEFAULT_OUTPUT_SCOPE).strip().lower()
+    if scope not in OUTPUT_SCOPES:
+        _warn_output_rule_once(where, f"scope {raw_scope!r} is not one of {', '.join(OUTPUT_SCOPES)}; using {DEFAULT_OUTPUT_SCOPE}")
+        scope = DEFAULT_OUTPUT_SCOPE
+    raw_max = meta.get("max_fires")
+    max_fires = DEFAULT_OUTPUT_MAX_FIRES
+    if raw_max is not None:
+        number = _whole_number(raw_max)
+        if number is not None and number >= 1:
+            max_fires = number
+        else:
+            _warn_output_rule_once(where, f"max_fires {raw_max!r} is not a whole number of at least 1; using {DEFAULT_OUTPUT_MAX_FIRES}")
+    return {"trigger": trigger, "pattern": pattern, "scope": scope, "max_fires": max_fires}
+
+
 class _SkillCache:
     """Per-workspace skill catalog cache keyed on file mtimes."""
 
@@ -246,10 +333,9 @@ def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list
             name = str(meta.get("name") or skill_md.parent.name).strip() or skill_md.parent.name
             description = str(meta.get("description") or "").strip()
             enabled = bool(meta.get("enabled", True))
+            path = config_layout.logical_path(workspace_root, skill_md)
 
-            strategy = str(meta.get("strategy") or "normal").strip().lower()
-            if strategy not in ("constant", "normal"):
-                strategy = "normal"
+            strategy = skill_strategy(meta)
 
             raw_kw = meta.get("keywords")
             keywords: list[str] = []
@@ -279,7 +365,7 @@ def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list
                 "name": name,
                 "description": description,
                 "enabled": enabled,
-                "path": config_layout.logical_path(workspace_root, skill_md),
+                "path": path,
                 "strategy": strategy,
                 "keywords": keywords,
                 "compiled_keywords": [compile_keyword(k) for k in keywords],
@@ -288,6 +374,7 @@ def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list
                 "scan_depth": scan_depth,
                 "body": body.strip(),
                 "node_ids": node_ids,
+                "output_rule": parse_output_rule(meta, where=path) if strategy == OUTPUT_STRATEGY and enabled else None,
             })
         except Exception as load_error:
             logger.warning("skill %s skipped, unreadable: %s", skill_md.parent.name, load_error)
@@ -633,6 +720,9 @@ def normalize_skill_entries(catalog: list[dict[str, Any]]) -> list[dict[str, Any
 
         keywords = _as_string_list(raw.get("keywords"))
         raw_strategy = str(raw.get("strategy") or "normal").strip().lower()
+        # 输出规则只拿去匹配模型的输出，正文和索引都不进提示词
+        if raw_strategy == OUTPUT_STRATEGY:
+            continue
         if raw_strategy == "constant":
             strategy = "constant"
         elif keywords:
@@ -1288,6 +1378,39 @@ def build_knowledge_context(
     )
 
 
+def output_rule_skills(workspace_root: Path, node: Node) -> list[dict[str, Any]]:
+    """这个节点要守的输出规则：启用了、trigger 编译得过的 output 策略 skill。
+
+    可见性和注入同一套：skill 的 node_ids，加上节点 skills 的 mode / allow。
+    """
+    entries: list[dict[str, Any]] = []
+    for raw in load_skill_catalog(workspace_root):
+        rule = raw.get("output_rule") if isinstance(raw, dict) else None
+        if not isinstance(rule, dict) or rule.get("pattern") is None:
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            continue
+        entries.append({
+            **rule,
+            "id": name,
+            "kind": "skill",
+            "content": str(raw.get("body") or ""),
+            "description": str(raw.get("description") or ""),
+            "path": str(raw.get("path") or ""),
+            "node_ids": _as_string_list(raw.get("node_ids")),
+        })
+    access = getattr(node, "skill_access", None)
+    return _filter_entries(
+        entries,
+        node_id=str(getattr(node, "id", "") or ""),
+        node_aliases=getattr(node, "aliases", ()) or (),
+        skill_mode=str(getattr(access, "mode", "all") or "all"),
+        skill_allow=getattr(access, "allow", None),
+        memory_mode="none",
+    )
+
+
 
 # ---------------------------------------------------------------------------
 #  Skill CRUD tools
@@ -1349,6 +1472,19 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
         except (TypeError, ValueError):
             pass
 
+    rule_fields: dict[str, Any] = {}
+    if args.get("trigger") is not None:
+        if not isinstance(args["trigger"], str):
+            return _tool_err("trigger must be a regex string")
+        rule_fields["trigger"] = args["trigger"]
+    if args.get("scope") is not None:
+        rule_fields["scope"] = str(args["scope"]).strip().lower()
+    if args.get("max_fires") is not None:
+        try:
+            rule_fields["max_fires"] = int(args["max_fires"])
+        except (TypeError, ValueError):
+            return _tool_err(f"max_fires must be a whole number of at least 1, got {args['max_fires']!r}")
+
     if not name:
         return _tool_err("empty skill name")
     if not SKILL_NAME_RE.fullmatch(name):
@@ -1361,18 +1497,7 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
             "description": description,
             "enabled": enabled,
         }
-        if strategy:
-            meta["strategy"] = strategy
-        if keywords is not None:
-            meta["keywords"] = keywords
-        if order is not None:
-            meta["order"] = order
-        if priority is not None:
-            meta["priority"] = priority
-        if scan_depth is not None:
-            meta["scan_depth"] = scan_depth
         body = description or f"Skill {name}"
-        content = "---\n" + yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).strip() + "\n---\n\n" + body.strip() + "\n"
     else:
         meta, body = parse_skill_frontmatter(content)
         if not isinstance(meta, dict):
@@ -1383,17 +1508,25 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
         elif not isinstance(meta.get("description"), str):
             meta["description"] = ""
         meta["enabled"] = enabled
-        if strategy:
-            meta["strategy"] = strategy
-        if keywords is not None:
-            meta["keywords"] = keywords
-        if order is not None:
-            meta["order"] = order
-        if priority is not None:
-            meta["priority"] = priority
-        if scan_depth is not None:
-            meta["scan_depth"] = scan_depth
-        content = "---\n" + yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).strip() + "\n---\n\n" + str(body or "").strip() + "\n"
+    if strategy:
+        meta["strategy"] = strategy
+    if keywords is not None:
+        meta["keywords"] = keywords
+    if order is not None:
+        meta["order"] = order
+    if priority is not None:
+        meta["priority"] = priority
+    if scan_depth is not None:
+        meta["scan_depth"] = scan_depth
+    meta.update(rule_fields)
+    # 写错的规则加载时只会被跳过，在这里拒掉模型才知道要改
+    if skill_strategy(meta) == OUTPUT_STRATEGY:
+        problem = output_rule_problem(meta)
+        if problem:
+            return _tool_err(problem)
+    elif rule_fields:
+        return _tool_err("trigger, scope and max_fires only apply to a skill with strategy output")
+    content = "---\n" + yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).strip() + "\n---\n\n" + str(body or "").strip() + "\n"
 
     # Why: write_file already centralizes policy approval and path checks. How:
     # import it lazily from toolbox.builtins after moving this function out of that
@@ -1422,9 +1555,7 @@ async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             meta, _body = parse_skill_frontmatter(text)
             if not isinstance(meta, dict):
                 meta = {}
-            strategy = str(meta.get("strategy") or "normal").strip().lower()
-            if strategy not in ("constant", "normal"):
-                strategy = "normal"
+            strategy = skill_strategy(meta)
             raw_kw = meta.get("keywords")
             kw_list: list[str] = []
             if isinstance(raw_kw, list):
@@ -1438,19 +1569,27 @@ async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             item_scan_depth = 0
             if isinstance(meta.get("scan_depth"), (int, float)):
                 item_scan_depth = max(0, int(meta["scan_depth"]))
-            items.append(
-                {
-                    "name": str(meta.get("name") or skill_md.parent.name),
-                    "description": str(meta.get("description") or ""),
-                    "enabled": bool(meta.get("enabled", True)),
-                    "strategy": strategy,
-                    "keywords": kw_list,
-                    "order": item_order,
-                    "priority": item_priority,
-                    "scan_depth": item_scan_depth,
-                    "path": rel,
-                }
-            )
+            item: dict[str, Any] = {
+                "name": str(meta.get("name") or skill_md.parent.name),
+                "description": str(meta.get("description") or ""),
+                "enabled": bool(meta.get("enabled", True)),
+                "strategy": strategy,
+                "keywords": kw_list,
+                "order": item_order,
+                "priority": item_priority,
+                "scan_depth": item_scan_depth,
+                "path": rel,
+            }
+            if strategy == OUTPUT_STRATEGY:
+                rule = parse_output_rule(meta, where=rel)
+                problem = output_rule_problem(meta)
+                item.update({
+                    "trigger": rule["trigger"],
+                    "scope": rule["scope"],
+                    "max_fires": rule["max_fires"],
+                    **({"rule_error": problem} if problem else {}),
+                })
+            items.append(item)
         except Exception as e:
             items.append({"name": skill_md.parent.name, "path": config_layout.logical_path(ctx.workspace_root, skill_md), "error": str(e)})
 
@@ -1888,11 +2027,32 @@ PLUGIN_META["tools"] = [
                 "description": {"type": "string"},
                 "content": {"type": "string", "description": "full SKILL.md content (optional; frontmatter will be normalized)"},
                 "enabled": {"type": "boolean"},
-                "strategy": {"type": "string", "description": "constant (always injected) or normal (keyword-triggered); default normal", "enum": ["constant", "normal"]},
+                "strategy": {
+                    "type": "string",
+                    "description": "constant (always injected), normal (keyword-triggered) or output (never injected: "
+                    "when the model's reply matches trigger, the reply is discarded and the model is asked to answer "
+                    "again following the skill body as the rule); default normal",
+                    "enum": list(SKILL_STRATEGIES),
+                },
                 "keywords": {"type": "array", "items": {"type": "string"}, "description": "activation keywords; supports /regex/flags syntax"},
                 "order": {"type": "integer", "description": "injection order within the same block; higher values are placed later (closer to conversation)"},
                 "priority": {"type": "integer", "description": "budget priority; higher values are kept first when token budget is exceeded"},
                 "scan_depth": {"type": "integer", "description": "number of recent conversation rounds to scan for keyword matching; 0 = current message only"},
+                "trigger": {
+                    "type": "string",
+                    "description": "strategy output only, required there: Python regex searched in the model's reply; "
+                    "use (?i) for case-insensitive",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": list(OUTPUT_SCOPES),
+                    "description": "strategy output only: text = the reply's text, tool_args = the arguments of its tool "
+                    "calls (finish and reply included), both = either; default both",
+                },
+                "max_fires": {
+                    "type": "integer",
+                    "description": "strategy output only: how many times the rule may fire in one task; default 1",
+                },
             },
             "required": ["name"],
         },

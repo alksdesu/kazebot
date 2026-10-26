@@ -114,6 +114,25 @@ it('does not drop a quick-field edit when the raw text is saved', async () => {
   expect(sent).toContain('body edited');
 });
 
+// 选择框对不上任何一项时会显示成第一项：output 规则和别的策略得照实显示，切换后照样写回原文。
+it('shows the output strategy and any unknown strategy as written', async () => {
+  vi.mocked(api.getSkillRaw).mockResolvedValue({ content: '---\nname: rule\nstrategy: output\ntrigger: "foo"\n---\nbody\n', hash: 'skill-1' });
+  vi.mocked(api.updateSkillRaw).mockResolvedValue({ ok: true, hash: 'skill-2' });
+  useSettingsSelectionStore.setState({ selectedSkill: { name: 'rule', enabled: true, strategy: 'output', keywords: [] } });
+  render(<SkillsSettingsRightPanel />);
+  const raw = await screen.findByLabelText('技能 Raw Markdown 编辑器');
+  await waitFor(() => expect((raw as HTMLTextAreaElement).value).toContain('strategy: output'));
+  expect(screen.getByLabelText('策略')).toHaveValue('output');
+
+  fireEvent.change(raw, { target: { value: '---\nname: rule\nstrategy: legacy_mode\n---\nbody\n' } });
+  expect(screen.getByLabelText('策略')).toHaveValue('legacy_mode');
+
+  fireEvent.change(screen.getByLabelText('策略'), { target: { value: 'output' } });
+  fireEvent.click(screen.getByRole('button', { name: '保存技能' }));
+  await waitFor(() => expect(api.updateSkillRaw).toHaveBeenCalledOnce());
+  expect(vi.mocked(api.updateSkillRaw).mock.calls[0][2]).toContain('strategy: output');
+});
+
 it('keeps commas and newlines in MCP arguments when only description is edited', async () => {
   const args = ['one,two', 'three\nfour'];
   vi.mocked(api.getMcpClientsRaw).mockResolvedValue({

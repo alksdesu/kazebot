@@ -51,6 +51,9 @@ class _Ctx(ToolContext):
         self.requested.append((op, dict(parameters)))
         return {"safety_level": self.decisions.get(op, "auto"), "reason": f"{op} decided by the test"}
 
+    async def evaluate_op(self, op: str, parameters: dict[str, Any]) -> dict[str, Any]:
+        return {"safety_level": self.decisions.get(op, "auto"), "reason": f"{op} decided by the test"}
+
     async def check_cancelled(self) -> bool:
         return self.cancelled
 
@@ -312,8 +315,9 @@ class TestUndo:
         assert (tmp_path / "f.txt").read_bytes() == b"line 1\nline 2\nLINE 3\n"
 
     def test_a_file_never_read_does_not_become_revealable_by_an_undo(self, tmp_path: Path) -> None:
+        # 读策略要审批：回显只能靠本会话读过这一版，看的是撤销有没有把它错记成读过
         seed(tmp_path / "f.txt", b"a\nb\n")
-        ctx = _Ctx(tmp_path)
+        ctx = _Ctx(tmp_path, read_file="approval_required")
         diff(ctx, "f.txt", "a", "A")
         undo(ctx)
 

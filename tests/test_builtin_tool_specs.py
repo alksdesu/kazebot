@@ -1,5 +1,5 @@
 """内置工具的说明和实现对得上：glob 已登记、经注册表调得通；说明里点名的参数 schema 里都有，实现也真去读；
-说明里的数字跟着常量走。
+说明里的数字跟着常量走；apply_diff 和 edit_lines 写明什么时候回显原文。
 """
 from __future__ import annotations
 
@@ -213,3 +213,15 @@ class TestDescriptionsFollowTheCode:
         assert f"maxFiles files (default {sif._DEFAULT_MAX_FILES})" in description
         assert f"{sif.REPLACE_SWITCH}: false" in description
         assert "data/edit_journal/" in description
+
+
+class TestTheEchoRule:
+    @pytest.mark.parametrize("name", ["apply_diff", "edit_lines"])
+    def test_the_echo_follows_this_conversation_or_the_read_policy(self, registry: ToolRegistry, name: str) -> None:
+        description = _spec(registry, name)["description"]
+
+        assert "has read the current version of the file or the read policy lets it be read without approval" in description
+        assert "no read approval" in description
+
+    def test_apply_diff_does_not_tie_the_echo_to_files_read_here_alone(self, registry: ToolRegistry) -> None:
+        assert "for a file you read in this conversation" not in _spec(registry, "apply_diff")["description"]

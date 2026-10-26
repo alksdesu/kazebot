@@ -36,7 +36,7 @@ _PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (1).to_bytes(4, "big") * 2
 
 
 class _Ctx(ToolContext):
-    """离线 ToolContext：记下每次送审的 op；按 op 名给出预设的 safety_level，没写的一律 auto。"""
+    """离线 ToolContext：记下每次送审和只问结论的 op；按 op 名给出预设的 safety_level，没写的一律 auto。"""
 
     def __init__(self, workspace_root: Path, *, session: str = "sess-edit", **decisions: str) -> None:
         super().__init__(
@@ -50,9 +50,14 @@ class _Ctx(ToolContext):
         )
         self.decisions = decisions
         self.requested: list[tuple[str, dict[str, Any]]] = []
+        self.evaluated: list[tuple[str, dict[str, Any]]] = []
 
     async def request_op(self, op: str, parameters: dict[str, Any]) -> dict[str, Any]:
         self.requested.append((op, dict(parameters)))
+        return {"safety_level": self.decisions.get(op, "auto"), "reason": f"{op} decided by the test"}
+
+    async def evaluate_op(self, op: str, parameters: dict[str, Any]) -> dict[str, Any]:
+        self.evaluated.append((op, dict(parameters)))
         return {"safety_level": self.decisions.get(op, "auto"), "reason": f"{op} decided by the test"}
 
     async def check_cancelled(self) -> bool:
@@ -452,9 +457,10 @@ class TestApplyDiffIsAllOrNothing:
         assert "   4 | def sub(a, b):" in text
         assert result["data"]["failedDiffs"][0]["closest"]["startLine"] == 4
 
-    def test_no_snippet_for_a_file_not_read_in_this_session(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("level", ["deny", "approval_required"])
+    def test_no_snippet_for_an_unread_file_that_needs_more_than_auto(self, tmp_path: Path, level: str) -> None:
         # 写得了不等于读得了：apply_diff 的失败信息不能变成读文件的后门，也不为片段另弹读审批
-        ctx = _Ctx(tmp_path, read_file="deny")
+        ctx = _Ctx(tmp_path, read_file=level)
         seed(tmp_path / "calc.py", b"def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n")
 
         result = diff(ctx, "calc.py", edit("def sub(a, b):\n    return a - c\n", "x"))
@@ -464,6 +470,27 @@ class TestApplyDiffIsAllOrNothing:
         assert "def sub" not in text and "return a - b" not in text
         assert "closest" not in result["data"]["failedDiffs"][0]
         assert "read_file" not in ctx.ops
+        assert ctx.evaluated == [("read_file", {"path": "calc.py"})]
+
+    def test_an_unread_file_readable_without_approval_gets_the_snippet(self, ctx: _Ctx, tmp_path: Path) -> None:
+        seed(tmp_path / "calc.py", b"def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n")
+
+        result = diff(ctx, "calc.py", edit("def sub(a, b):\n    return a - c\n", "x"))
+
+        text = result["data"]["result"]
+        assert "最接近的是第 4-5 行" in text
+        assert result["data"]["failedDiffs"][0]["closest"]["startLine"] == 4
+        assert ctx.ops == ["write_file"]
+        assert ctx.evaluated == [("read_file", {"path": "calc.py"})]
+
+    def test_a_failure_without_a_close_match_does_not_ask_about_reading(self, tmp_path: Path) -> None:
+        ctx = _Ctx(tmp_path, read_file="deny")
+        seed(tmp_path / "f.txt", b"alpha\n")
+
+        result = diff(ctx, "f.txt", edit("completely different text that is nowhere", "x"))
+
+        assert result["ok"] is False
+        assert ctx.evaluated == []
 
     def test_malformed_diffs_are_rejected_before_asking_for_approval(self, ctx: _Ctx, tmp_path: Path) -> None:
         path = seed(tmp_path / "f.txt", b"x\n")
@@ -586,6 +613,7 @@ class TestApplyDiffWrites:
         assert "token=abc" not in text
         assert result["data"]["echoed"] is False
         assert "read_file" not in ctx.ops
+        assert ctx.evaluated == [("read_file", {"path": "secret.txt"})]
         assert path.read_bytes() == b"token=abc\nother=2\n"
 
     def test_a_file_read_first_needs_no_second_read_check(self, ctx: _Ctx, tmp_path: Path) -> None:
@@ -595,18 +623,45 @@ class TestApplyDiffWrites:
         diff(ctx, "f.txt", edit("a", "A"))
 
         assert ctx.ops == ["read_file", "write_file"]
+        assert ctx.evaluated == []
 
-    def test_an_unread_file_gets_line_numbers_but_no_echo_and_no_read_approval(self, ctx: _Ctx, tmp_path: Path) -> None:
+    def test_an_unread_file_that_needs_read_approval_gets_line_numbers_only(self, tmp_path: Path) -> None:
         # 读要审批的文件（data/** 之类）写入批准之后，不能为几行回显再弹一张读审批卡
+        ctx = _Ctx(tmp_path, read_file="approval_required")
         seed(tmp_path / "f.txt", b"a\nb\n")
 
         result = diff(ctx, "f.txt", edit("a", "A"))
 
         text = result["data"]["result"]
         assert ctx.ops == ["write_file"]
+        assert ctx.evaluated == [("read_file", {"path": "f.txt"})]
         assert result["data"]["echoed"] is False
         assert "改动后在第 1 行" in text
         assert "不回显改动处的原文" in text
+
+    def test_an_unread_file_readable_without_approval_is_echoed(self, ctx: _Ctx, tmp_path: Path) -> None:
+        seed(tmp_path / "f.txt", b"a\nb\n")
+
+        result = diff(ctx, "f.txt", edit("a", "A"))
+
+        text = result["data"]["result"]
+        assert ctx.ops == ["write_file"]
+        assert ctx.evaluated == [("read_file", {"path": "f.txt"})]
+        assert result["data"]["echoed"] is True
+        assert "   1 | A" in text
+
+    def test_a_failed_read_policy_check_only_costs_the_echo(self, tmp_path: Path) -> None:
+        class Unreachable(_Ctx):
+            async def evaluate_op(self, op: str, parameters: dict[str, Any]) -> dict[str, Any]:
+                raise RuntimeError("supervisor unreachable")
+
+        ctx = Unreachable(tmp_path)
+        path = seed(tmp_path / "f.txt", b"a\nb\n")
+
+        result = diff(ctx, "f.txt", edit("a", "A"))
+
+        assert result["ok"] is True and result["data"]["echoed"] is False
+        assert path.read_bytes() == b"A\nb\n"
 
     def test_external_checks_go_through_the_execute_command_approval(self, tmp_path: Path) -> None:
         ctx = _Ctx(tmp_path, execute_command="deny")

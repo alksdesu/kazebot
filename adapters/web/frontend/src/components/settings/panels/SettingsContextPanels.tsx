@@ -586,6 +586,19 @@ const skillSnapshotFields = (skill: AdminSkill | null): SkillQuickFields => ({
 
 const SKILL_INPUT_CLASS = 'w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1 font-mono';
 
+const SKILL_STRATEGIES: ReadonlyArray<{ value: string; label: string }> = [
+  { value: 'normal', label: 'normal' },
+  { value: 'constant', label: 'constant' },
+  { value: 'output', label: 'output（模型输出命中 trigger 时重答）' },
+];
+
+/** 文件里写的是别的策略时也列出来：选择框对不上任何一项会显示成第一项，看着像 normal。 */
+const skillStrategyOptions = (current: string) => (
+  SKILL_STRATEGIES.some((option) => option.value === current) || !current
+    ? SKILL_STRATEGIES
+    : [...SKILL_STRATEGIES, { value: current, label: current }]
+);
+
 export const SkillsSettingsRightPanel = () => {
   const id = useSettingsSelectionStore(state => state.selectedSkill?.name);
   const token = useSettingsStore(state => state.adminToken);
@@ -670,8 +683,9 @@ const SkillsEditor = ({ onReload }: EditorProps) => {
                 <label className="block">
                   <span className="mb-1 block text-[var(--duties-tertiary)]">策略</span>
                   <select className={SKILL_INPUT_CLASS} onChange={(event) => update({ strategy: event.target.value })} value={edit.strategy}>
-                    <option value="normal">normal</option>
-                    <option value="constant">constant</option>
+                    {skillStrategyOptions(edit.strategy).map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
                   </select>
                 </label>
                 <label className="block">

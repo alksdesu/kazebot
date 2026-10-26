@@ -294,7 +294,7 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     outcome: DiffOutcome = tx.outcome
     if tx.status == "failed":
         needs_reveal = any(item.failure.closest is not None for item in outcome.failed)
-        reveal = needs_reveal and file_state.reveal_allowed(tx.gate)
+        reveal = needs_reveal and await file_state.reveal_allowed(ctx, tx.gate, path_str)
         return _failure_response(path_str, outcome, len(diffs), reveal=reveal, style=style)
 
     if tx.status == "unchanged":
@@ -302,7 +302,7 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             path_str, outcome, len(diffs), written=False, byte_count=0, reveal=False, checks=None, style=style,
         )
 
-    reveal = file_state.reveal_allowed(tx.gate)
+    reveal = await file_state.reveal_allowed(ctx, tx.gate, path_str)
     checks = await run_edit_checks(ctx, resolved, outcome.content, tool_name="apply_diff")
     return _success_response(
         path_str, outcome, len(diffs),

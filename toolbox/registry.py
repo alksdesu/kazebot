@@ -689,8 +689,10 @@ class ToolRegistry:
                 "blank lines of search ignored; anchor block (first and last lines equal after trimming, middle lines similar). "
                 "A level counts only when it matches one place; with several matches start_line picks the first one at or after "
                 "that line, otherwise the diff fails with the candidate lines. A fuzzy match spanning far more text than search is rejected. "
-                "The result reports the level used for each diff and the edited line ranges; for a file you read in this conversation it also "
-                "echoes the edited regions with line numbers and 2 lines of context, and a failure shows the closest matching snippet. "
+                "The result reports the level used for each diff and the edited line ranges. It also echoes the edited regions "
+                "with line numbers and 2 lines of context, and a failure shows the closest matching snippet, when this "
+                "conversation has read the current version of the file or the read policy lets it be read without approval; "
+                "otherwise only line numbers are given and no read approval is asked for, so use read_file to see the text. "
                 "Refused if the file changed after you last read it. Line endings, UTF-8 BOM and permissions are preserved and the "
                 "write is atomic. After writing, the same syntax check and edit_checks commands as write_file run. "
                 "Policy+approval guarded.",
@@ -735,15 +737,18 @@ class ToolRegistry:
                 "Each edit is {op, start, end, content}: replace puts content in place of lines start..end (end defaults to start); "
                 "delete removes lines start..end; insert_after / insert_before put content after / before line start (no end). "
                 "All anchors refer to the file as you read it, before any edit of this call. "
-                "Every anchor's hash must match that line now: if any does not, nothing is written and the result shows the "
-                "current lines around it with fresh anchors; an anchor is never moved to another line. "
+                "Every anchor's hash must match that line now: if any does not, nothing is written and the result names the "
+                "anchors that failed, with the current lines around them and fresh anchors when the text may be shown (see "
+                "below); an anchor is never moved to another line. "
                 "Edits may not overlap: replaced or deleted ranges may not share lines, two inserts may not go to the same place, "
                 "and an insert may not fall inside a replaced or deleted range. They are applied bottom-up and written atomically. "
                 "content is the new lines without anchors; a trailing newline is optional. "
                 "Refused if the file changed after you last read it. Line endings, UTF-8 BOM and permissions are preserved; "
                 "after writing, the same syntax check and edit_checks commands as write_file run, and the change can be undone "
-                "with undo_edits. The result echoes the edited regions with fresh anchors; lines below an edit shift, so take "
-                "the next anchors from that echo or read the file again. Policy+approval guarded.",
+                "with undo_edits. The result echoes the edited regions with fresh anchors when this conversation has read the "
+                "current version of the file or the read policy lets it be read without approval; otherwise it gives line "
+                "numbers only and asks for no read approval, so read the file again for new anchors. Lines below an edit shift, "
+                "so take the next anchors from that echo or a fresh read. Policy+approval guarded.",
                 {
                     "type": "object",
                     "properties": {

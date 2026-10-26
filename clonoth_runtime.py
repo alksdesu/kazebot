@@ -502,7 +502,7 @@ def normalize_openai_secret(data: dict[str, Any]) -> MainChannel:
 
 
 # ---------------------------------------------------------------------------
-#  系统模型渠道解析（compact / summary / image / intent）
+#  系统模型渠道解析（compact / summary / intent / review / image）
 # ---------------------------------------------------------------------------
 # [2026-07-16] Why: 压缩/轮摘要/读图这三个系统用途，用户希望：
 #   1) 不填时跟随主渠道 url/key（只换模型名，甚至模型名也可留空跟随主模型）；
@@ -524,6 +524,7 @@ def normalize_openai_secret(data: dict[str, Any]) -> MainChannel:
 #   summary -> CLONOTH_SUMMARY_MODEL / CLONOTH_SUMMARY_BASE_URL / CLONOTH_SUMMARY_API_KEY
 #   image   -> CLONOTH_IMAGE_MODEL   / CLONOTH_IMAGE_BASE_URL   / CLONOTH_IMAGE_API_KEY
 #   intent  -> CLONOTH_INTENT_MODEL  / CLONOTH_INTENT_BASE_URL  / CLONOTH_INTENT_API_KEY
+#   review  -> CLONOTH_REVIEW_MODEL  / CLONOTH_REVIEW_BASE_URL  / CLONOTH_REVIEW_API_KEY
 
 @dataclass(frozen=True)
 class SlotSpec:
@@ -545,6 +546,7 @@ SYSTEM_MODEL_SLOTS: tuple[SlotSpec, ...] = (
     SlotSpec("compact", "上下文压缩", "对话太长时压缩历史。换个便宜模型最划算。", True),
     SlotSpec("summary", "轮摘要", "每轮结束后写一条摘要，供回忆和抽取用。", True),
     SlotSpec("intent", "接话意愿", "判断群里这句话要不要接。调用频繁，务必用便宜的。", True),
+    SlotSpec("review", "代码审查", "代码审查节点审改动用的模型。留空跟随主渠道。", True),
     SlotSpec("image", "读图", "给看不了图的模型描述图片内容。留空跟随主渠道。", False),
     SlotSpec("image_gpt", "生图（GPT）", "gpt_image_2 工具用的渠道。", False, supports_provider=False),
     SlotSpec(

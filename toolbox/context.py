@@ -56,19 +56,24 @@ class ToolContext:
             json={"type": type_, "payload": payload},
         )
 
+    def _op_body(self, op: str, parameters: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "session_id": self.route_session_id(),
+            "op": op,
+            "parameters": {**parameters, "platform_auth": dict(self.platform_auth or {})},
+            "tool_call_id": self.tool_call_id or "",
+            "node_id": self.node_id or getattr(self, "_node_id", "") or "",
+            "task_id": self.task_id or "",
+        }
+
     async def request_op(self, op: str, parameters: dict[str, Any]) -> dict[str, Any]:
-        route_session_id = self.route_session_id()
-        r = await self.http.post(
-            f"{self.supervisor_url}/v1/ops/request",
-            json={
-                "session_id": route_session_id,
-                "op": op,
-                "parameters": {**parameters, "platform_auth": dict(self.platform_auth or {})},
-                "tool_call_id": self.tool_call_id or "",
-                "node_id": self.node_id or getattr(self, "_node_id", "") or "",
-                "task_id": self.task_id or "",
-            },
-        )
+        r = await self.http.post(f"{self.supervisor_url}/v1/ops/request", json=self._op_body(op, parameters))
+        r.raise_for_status()
+        return r.json()
+
+    async def evaluate_op(self, op: str, parameters: dict[str, Any]) -> dict[str, Any]:
+        """和 request_op 同一套判定，但 supervisor 不创建审批：只回 safety_level 和 reason，绝不弹审批卡。"""
+        r = await self.http.post(f"{self.supervisor_url}/v1/ops/evaluate", json=self._op_body(op, parameters))
         r.raise_for_status()
         return r.json()
 

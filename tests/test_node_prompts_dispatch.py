@@ -21,7 +21,9 @@ from engine.inference.pseudo_tools import _ask_spec, _dispatch_tool_name, _finis
 _NODES = _ROOT / "defaults" / "nodes"
 # 用户自己在改的共享片段，不归这里管
 _EXCLUDED = frozenset({"_shared.md"})
-_DELEGATING = ("bootstrap.executor", "bootstrap.shell_orchestrator", "qq.orchestrator", "qq.orchestrator.example")
+_DELEGATING = (
+    "bootstrap.coder", "bootstrap.executor", "bootstrap.shell_orchestrator", "qq.orchestrator", "qq.orchestrator.example",
+)
 
 
 def _prompt_files() -> list[Path]:
