@@ -83,8 +83,9 @@ def _build_messages_for_provider(
     provider metadata.  FakeNativeToolFormatter would collapse that data into
     user text, and true NativeToolFormatter would strip provider metadata.
     Therefore the Responses provider bypasses L2 for both native and fake-native
-    modes, then performs its own final API conversion.  Other providers keep
-    the existing L2 formatter path.
+    modes, then performs its own final API conversion.  Anthropic bypasses L2 in
+    native mode only, for the signed thinking blocks kept in ``_meta``.  Other
+    providers keep the existing L2 formatter path.
     """
     messages = finalize_system_tail(messages)
     provider_name = getattr(provider, "name", "") or ""
@@ -93,7 +94,12 @@ def _build_messages_for_provider(
     # Bypass both true native and fake-native L2; fake-native would text-collapse,
     # while true native would strip provider metadata needed for raw_output replay.
     # Gemini also needs _meta for raw_parts (thoughtSignature + functionCall round-trip)
-    if provider_name in {"openai-responses", "gemini"} and formatter_mode in {"native", "fake-native"}:
+    # Anthropic 开着扩展思考时，工具循环里漏传上一轮带签名的 thinking 块就被拒；fake-native 不发 tool_use，照旧走 L2
+    keeps_provider_meta = (
+        (provider_name in {"openai-responses", "gemini"} and formatter_mode in {"native", "fake-native"})
+        or (provider_name == "anthropic" and formatter_mode == "native")
+    )
+    if keeps_provider_meta:
         # Keep storage-level tool_calls/_meta for the provider, but match
         # build_llm_messages by dropping ephemeral retry/control messages.
         # [2026-05-07] 旁路 provider 也必须执行控制流历史清洗。
@@ -424,6 +430,9 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     while True:
         # 每次真正发请求都换 request id，这一次的流式块在前端共用一张卡片
         request_id = ls.rctx.begin_llm_request()
+        # 思考计时只属于这一次请求：不流式或没有思考的那次，不能沿用上一次留下的值
+        ls._reasoning_started_iso = ""
+        ls._reasoning_ended_iso = ""
 
         # ---- 流式调用 ----
         if ls.use_stream:

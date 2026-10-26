@@ -20,6 +20,19 @@ log = logging.getLogger(__name__)
 _UNSUPPORTED = frozenset({"verbosity", "prompt_cache_key"})
 # 父类这两条规则靠清空回落到「不发」；DeepSeek 的思考档位默认值本身就要发，清空等于没改，得换成下面自己的规则。
 _REPLACED_RULES = frozenset({"去掉详尽度", "去掉思考档位"})
+# 思考模式带工具时思维链必须传回，不能像通用渠道那样被拒一次就不再回传。
+_REPLAY_REASONING_OPTION = "replay_reasoning"
+_DROPPED_RULES = frozenset({"不回传思维链"})
+# 存下来时就没有思维链的 assistant（换过模型、思考关着时产生的、旧数据）补这个。
+# 空串在 V4 上已被当成「没传」拒过，一个空格能过校验，又不编造推理内容。
+_REASONING_PLACEHOLDER = " "
+
+
+def _disable_thinking(options: OptionSet, error: str) -> bool:
+    # 缺思维链的 400 原文也带 thinking，但那是历史没传全，不是端点不支持思考；关掉只会让渠道从此静默不思考
+    if "must be passed back" in error:
+        return False
+    return options.override("thinking", False)
 
 
 class DeepSeekProvider(OpenAIProvider):
@@ -33,7 +46,7 @@ class DeepSeekProvider(OpenAIProvider):
 
     OPTIONS: tuple[OptionSpec, ...] = tuple(
         spec for spec in OpenAIProvider.OPTIONS
-        if spec.key not in _UNSUPPORTED and spec.key != "reasoning_effort"
+        if spec.key not in _UNSUPPORTED and spec.key not in ("reasoning_effort", _REPLAY_REASONING_OPTION)
     ) + (
         OptionSpec(
             key="thinking", label="思考模式", kind=BOOL, default=True,
@@ -48,7 +61,7 @@ class DeepSeekProvider(OpenAIProvider):
     )
 
     DEGRADE_RULES: tuple[DegradeRule, ...] = tuple(
-        rule for rule in OpenAIProvider.DEGRADE_RULES if rule.name not in _REPLACED_RULES
+        rule for rule in OpenAIProvider.DEGRADE_RULES if rule.name not in _REPLACED_RULES | _DROPPED_RULES
     ) + (
         DegradeRule(
             name="去掉思考档位",
@@ -59,7 +72,7 @@ class DeepSeekProvider(OpenAIProvider):
         DegradeRule(
             name="关掉思考模式",
             match=("thinking",),
-            apply=set_option("thinking", False),
+            apply=_disable_thinking,
             advice="这个模型或端点不支持思考模式。",
         ),
     )
@@ -104,9 +117,9 @@ class DeepSeekProvider(OpenAIProvider):
         stream: bool = False,
     ) -> dict[str, Any]:
         payload = super()._build_payload(messages, tools, stream=stream)
-        payload["messages"] = _keep_reasoning_content(payload["messages"])
-
         thinking = bool(self._options.get("thinking"))
+        payload["messages"] = _keep_reasoning_content(payload["messages"], require=thinking and bool(tools))
+
         payload["thinking"] = {"type": "enabled" if thinking else "disabled"}
         effort = self._options.get("reasoning_effort")
         if thinking and effort and effort != "default":
@@ -126,8 +139,12 @@ class DeepSeekProvider(OpenAIProvider):
         return payload
 
 
-def _keep_reasoning_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """多轮带工具调用时，assistant 的 reasoning_content 必须原样回传。"""
+def _keep_reasoning_content(messages: list[dict[str, Any]], *, require: bool) -> list[dict[str, Any]]:
+    """assistant 只留 content、reasoning_content、tool_calls，思维链原样回传。
+
+    require 时（思考模式且请求带 tools）之前每一条 assistant 都得带非空的 reasoning_content，
+    少一条整个请求就 400，所以缺了的补占位。不带 tools 时对面会忽略它，不用补。
+    """
     result: list[dict[str, Any]] = []
     for msg in messages:
         if msg.get("role") != "assistant":
@@ -138,5 +155,7 @@ def _keep_reasoning_content(messages: list[dict[str, Any]]) -> list[dict[str, An
             value = msg.get(key)
             if value is not None:
                 kept[key] = value
+        if require and not str(kept.get("reasoning_content") or "").strip():
+            kept["reasoning_content"] = _REASONING_PLACEHOLDER
         result.append(kept)
     return result

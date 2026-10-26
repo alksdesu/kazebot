@@ -12,7 +12,7 @@ from .assembly import ToolCallAssembler, conclude, int_field, new_call_id, parse
 from .base import BaseProvider, ProviderResponse, ToolCall, content_parts, content_text, tool_call_fields
 from .degrade import DegradeRule, degrade, set_option, unset_options
 from .failures import exception_failure, failed, read_error, upstream_failure
-from .options import ENUM, FLOAT, INT, TEXT, OptionSet, OptionSpec
+from .options import BOOL, ENUM, FLOAT, INT, TEXT, OptionSet, OptionSpec
 from .plugin_transport import iter_sse_events, wrap_client
 
 log = logging.getLogger(__name__)
@@ -119,6 +119,17 @@ def _chat_response(
     )
 
 
+# 端点反过来是要这个字段的说法（DeepSeek「必须传回」、Kimi「缺了」）：这时关掉回传只会更糟。
+_REASONING_WANTED = ("must be passed back", "missing", "required")
+
+
+def _stop_replaying_reasoning(options: OptionSet, error: str) -> bool:
+    """点名 reasoning_content 的 400 多是严格端点不收这个字段，说法各家不一，只排除要它的那几种。"""
+    if any(fragment in error for fragment in _REASONING_WANTED):
+        return False
+    return options.override("replay_reasoning", False)
+
+
 class OpenAIProvider(BaseProvider):
     """OpenAI-compatible provider implemented with raw HTTP (no SDK).
 
@@ -194,6 +205,11 @@ class OpenAIProvider(BaseProvider):
             desc="仅推理系模型支持。注意「不思考」在新版模型上会关掉工具调用。",
         ),
         OptionSpec(
+            key="replay_reasoning", label="回传思维链", kind=BOOL, default=True,
+            desc="把历史里模型的思维链（reasoning_content）随请求带回去，DeepSeek、Kimi 这类思考模型调工具时要用。"
+                 "个别严格的兼容端点不收这个字段，被拒一次后会自动关掉。",
+        ),
+        OptionSpec(
             key="verbosity", label="回复详尽度", kind=ENUM, default="default",
             choices=(("default", "不指定"), ("low", "简"), ("medium", "中"), ("high", "详")),
         ),
@@ -240,6 +256,12 @@ class OpenAIProvider(BaseProvider):
             match=("temperature", "top_p"),
             apply=unset_options("temperature", "top_p"),
             advice="推理系模型不接受采样参数，请把随机度和核采样留空。",
+        ),
+        DegradeRule(
+            name="不回传思维链",
+            match=("reasoning_content",),
+            apply=_stop_replaying_reasoning,
+            advice="这个端点不收历史消息里的 reasoning_content。",
         ),
     )
 
@@ -288,6 +310,12 @@ class OpenAIProvider(BaseProvider):
             "model": self.model,
             "messages": self._prepare_messages(messages),
         }
+        # 只在明确关掉时剥：不提供这一项的子类（DeepSeek）get 到的是 None，思维链照旧回传
+        if self._options.get("replay_reasoning") is False:
+            payload["messages"] = [
+                {key: value for key, value in message.items() if key != "reasoning_content"}
+                for message in payload["messages"]
+            ]
         if stream:
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}

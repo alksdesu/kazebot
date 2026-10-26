@@ -8,8 +8,8 @@ from engine.conversation_store import MessageType
 # How: return a local HookResult-compatible shape instead. Purpose: avoid
 # cycles while keeping the existing hook registry duck-typed.
 from .result import hook_result
-from engine.inference.loop_state import _persist_ctx, _short
-from engine.inference.message_model import MessageMeta, set_message_meta
+from engine.inference.loop_state import _persist_ctx, _reasoning_fields, _short
+from engine.inference.message_model import MessageMeta, apply_reasoning_content, set_message_meta
 from engine.protocol import ACTION_FINISH, ACTION_PREEMPTED, TaskAction
 
 
@@ -109,11 +109,11 @@ def build_implicit_finish(
         timestamp=datetime.now(timezone.utc).isoformat(),
         metadata={},
         tool_call_ids=[],
-        reasoning="",
-        has_reasoning=False,
         usage=dict(ls.last_usage) if ls.last_usage else {},
+        **_reasoning_fields(ls, resp),
     )
     set_message_meta(assistant_msg, implicit_meta)
+    apply_reasoning_content(assistant_msg)
     ls.messages.append(assistant_msg)
     _shadow_write(ls, assistant_msg, MessageType.ASSISTANT)
 

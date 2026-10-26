@@ -34,6 +34,7 @@ from .loop_state import (
     TOOL_RESULT_ATTACHMENT_TYPE,
     _LoopState,
     _persist_ctx,
+    _reasoning_fields,
     _short,
     build_tool_context,
     compact_target_session_id,
@@ -90,7 +91,7 @@ from .tool_format import (
     build_llm_messages,
     invalid_arguments,
 )
-from .message_model import MessageMeta, set_message_meta
+from .message_model import MessageMeta, apply_reasoning_content, set_message_meta
 from providers.base import BaseProvider, ToolCall
 # Phase 2 Signal System: 导入信号总线，用于发射 tool.call 和 task.error 信号。
 # get_bus() 返回全局单例 SignalBus，Signal 是不可变事件数据类。
@@ -457,20 +458,12 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int, *, final_step: boo
         llm_request_id=getattr(ls.rctx, "current_llm_request_id", ""),
         metadata={_provider_name: resp.provider_meta} if resp.provider_meta else {},
         tool_call_ids=[tc.id for tc in (resp.tool_calls or [])],
-        reasoning=resp.reasoning or "",
-        has_reasoning=bool(resp.reasoning),
         inline_data=resp.inline_data or [],
         usage=dict(ls.last_usage) if ls.last_usage else {},
-        # [thinking-time 2026-06-01] Persist precise reasoning timing from stream.
-        reasoning_started_at=getattr(ls, '_reasoning_started_iso', '') or '',
-        reasoning_ended_at=getattr(ls, '_reasoning_ended_iso', '') or '',
+        **_reasoning_fields(ls, resp),
     )
     set_message_meta(_assistant_msg, _tc_meta)
-    # [2026-05-07] Store reasoning_content at top level for API round-trip.
-    # DeepSeek V4 and similar models require this field in the message dict.
-    # _meta.reasoning is kept for internal use but top-level survives L2 stripping.
-    if resp.reasoning:
-        _assistant_msg["reasoning_content"] = resp.reasoning
+    apply_reasoning_content(_assistant_msg)
     ls.messages.append(_assistant_msg)
     # 含 finish 的 assistant 消息原样落盘：拆掉它后面的 tool_result 就没了配对来源
     _shadow_write(ls, _assistant_msg, MessageType.ASSISTANT)
@@ -1674,11 +1667,11 @@ def _build_unauthorized_implicit_finish(ls: _LoopState, resp, text: str, step: i
         timestamp=datetime.now(timezone.utc).isoformat(),
         metadata={},
         tool_call_ids=[],
-        reasoning="",
-        has_reasoning=False,
         usage=dict(ls.last_usage) if ls.last_usage else {},
+        **_reasoning_fields(ls, resp),
     )
     set_message_meta(_assistant_msg, _meta)
+    apply_reasoning_content(_assistant_msg)
     ls.messages.append(_assistant_msg)
     _shadow_write(ls, _assistant_msg, MessageType.ASSISTANT)
 
@@ -1725,11 +1718,11 @@ def _handle_plaintext_response(ls: _LoopState, resp, step: int) -> TaskAction | 
             timestamp=datetime.now(timezone.utc).isoformat(),
             metadata={},
             tool_call_ids=[],
-            reasoning="",
-            has_reasoning=False,
             usage=dict(ls.last_usage) if ls.last_usage else {},
+            **_reasoning_fields(ls, resp),
         )
         set_message_meta(_assistant_msg, _implicit_meta)
+        apply_reasoning_content(_assistant_msg)
         ls.messages.append(_assistant_msg)
         _shadow_write(ls, _assistant_msg, MessageType.ASSISTANT)
 
@@ -1768,11 +1761,11 @@ def _handle_plaintext_response(ls: _LoopState, resp, step: int) -> TaskAction | 
         timestamp=datetime.now(timezone.utc).isoformat(),
         metadata={},
         tool_call_ids=[],
-        reasoning="",
-        has_reasoning=False,
         usage=dict(ls.last_usage) if ls.last_usage else {},
+        **_reasoning_fields(ls, resp),
     )
     set_message_meta(_assistant_msg, _implicit_meta)
+    apply_reasoning_content(_assistant_msg)
     ls.messages.append(_assistant_msg)
     _shadow_write(ls, _assistant_msg, MessageType.ASSISTANT)
 

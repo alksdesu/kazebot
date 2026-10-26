@@ -236,6 +236,20 @@ def set_message_meta(message: dict[str, Any], meta: MessageMeta) -> None:
         del message["_meta"]
 
 
+def apply_reasoning_content(message: Any) -> Any:
+    """assistant 消息带思维链时放到顶层 reasoning_content，就地修改并返回同一条消息。
+
+    运行期和从存储、快照重载的消息都走这一处，形状才一致：L2 会剥掉 _meta，
+    DeepSeek 这类要求回传思维链的端点只认顶层这个键。已有顶层值、或 _meta 里没有思维链时不动。
+    """
+    if not isinstance(message, dict) or message.get("role") != "assistant" or message.get("reasoning_content"):
+        return message
+    reasoning = get_message_meta(message).reasoning
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    return message
+
+
 def strip_internal_fields(message: dict[str, Any]) -> dict[str, Any]:
     """剥离所有以 _ 开头的内部标记，返回可发送给 LLM 的干净消息。
 

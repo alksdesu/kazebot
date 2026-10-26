@@ -187,6 +187,24 @@ class _LoopState:
     task_digest: Any = None
     task_digest_restored: bool = False
 
+    # ---- 这一次请求的思考起止时间：流式里第一个思考 token、第一个正文 token；每次发请求前清空 ----
+    _reasoning_started_iso: str = ""
+    _reasoning_ended_iso: str = ""
+
+
+def _reasoning_fields(ls: _LoopState, resp: Any) -> dict[str, Any]:
+    """模型这次回复的思维链和思考计时，展开进 MessageMeta。
+
+    凡是把模型真实回复写进历史的路径都要带上：DeepSeek 思考模式带工具时，之后每次请求都要把它原样传回。
+    """
+    reasoning = str(getattr(resp, "reasoning", "") or "")
+    return {
+        "reasoning": reasoning,
+        "has_reasoning": bool(reasoning),
+        "reasoning_started_at": str(getattr(ls, "_reasoning_started_iso", "") or ""),
+        "reasoning_ended_at": str(getattr(ls, "_reasoning_ended_iso", "") or ""),
+    }
+
 
 def conversation_writer(rctx: Any) -> ConversationWriter | None:
     """本任务的对话写入器，挂着 conversation_store 才有。"""

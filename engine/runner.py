@@ -38,6 +38,7 @@ from .model import resolve_provider
 from .context_store import load_context_snapshot
 from .inference.async_delivery import async_result_tool_status, flush_async_result_outbox
 from .inference.loop_state import attach_node_scope, conversation_writer, flush_conversation_writes
+from .inference.message_model import apply_reasoning_content
 from .inference.pseudo_tools import tool_allowed
 from .inference.tool_format import sanitize_control_tool_history
 
@@ -385,7 +386,18 @@ def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict
         d["tool_call_id"] = msg.tool_call_id
     if getattr(msg, "name", ""):
         d["name"] = msg.name
-    return d
+    return apply_reasoning_content(d)
+
+
+def _rewrite_last(last: dict[str, Any], role: str, content: str) -> dict[str, Any]:
+    """改写历史最后一条的正文；改完仍是那条 assistant 时带上它的思维链，要求回传思维链的端点按条核对。
+
+    不带 _meta：里面存的 raw_parts 还是改写前那次伪工具调用，Gemini 会照着它原样回放。
+    """
+    rewritten: dict[str, Any] = {"role": role, "content": content}
+    if role == "assistant" and last.get("role") == "assistant" and last.get("reasoning_content"):
+        rewritten["reasoning_content"] = last["reasoning_content"]
+    return rewritten
 
 
 def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -433,14 +445,14 @@ def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str,
                     if finish_text:
                         combined = f"{pre_text}\n\n{finish_text}".strip() if pre_text else finish_text
                         # Always restore as assistant role (the finish text is the AI's final response)
-                        result[-1] = {"role": "assistant", "content": combined}
+                        result[-1] = _rewrite_last(last, "assistant", combined)
                         return result
                 except Exception:
                     pass
 
     # Other pseudo tools or parse failure: keep pre_text or drop the message.
     if pre_text:
-        result[-1] = {"role": role, "content": pre_text}
+        result[-1] = _rewrite_last(last, role, pre_text)
         return result
     return result[:-1]
 
