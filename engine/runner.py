@@ -1316,7 +1316,12 @@ async def _run_node_task(
     _total_tokens = (rctx.total_usage.get("total_tokens") or 0) if rctx.total_usage else 0
 
     try:
-        from engine.task_record import TaskRecord, write_task_record
+        from dataclasses import replace
+
+        from engine.context import ServingProvider
+        from engine.task_record import TaskRecord, record_timestamp, write_task_record
+        # 一次成功的请求都没有时拿不到实际出答案的那个，记节点自己的渠道
+        _served = rctx.serving_provider or ServingProvider.of(provider)
         # summary 留给轮摘要节点回写，L2 snip 只认它；这一轮的动作摘要放 outcome
         _record = TaskRecord(
             task_id=task_id,
@@ -1331,24 +1336,16 @@ async def _run_node_task(
             outcome=action.summary or "",
             error=action.error or "",
             child_session_id=child_session_id,
+            completed_at=record_timestamp(),
+            model=_served.model,
+            provider=_served.provider,
+            channel=_served.channel,
         )
         await asyncio.to_thread(write_task_record, ws_root, _record)
-        # persistent 子节点的轮摘要回写和 snip 都按 child_session_id 找记录，子会话那边也写一份
+        # persistent 子节点的轮摘要回写和 snip 都按 child_session_id 找记录，子会话那边也写一份。
+        # 两份只差 session_id：用量汇总靠这一点认出是同一段，只算一次。
         if child_session_id and child_session_id != session_id:
-            _child_record = TaskRecord(
-                task_id=task_id,
-                session_id=child_session_id,
-                node_id=node.id,
-                action=action.action,
-                first_message_id=rctx.first_shadow_message_id,
-                last_message_id=rctx.last_shadow_message_id,
-                step_count=rctx.completed_steps,
-                tool_call_count=_tool_call_count,
-                token_usage=dict(rctx.total_usage) if rctx.total_usage else {},
-                outcome=action.summary or "",
-                error=action.error or "",
-                child_session_id=child_session_id,
-            )
+            _child_record = replace(_record, session_id=child_session_id, token_usage=dict(_record.token_usage))
             await asyncio.to_thread(write_task_record, ws_root, _child_record)
     except Exception:
         logger.exception("failed to write task record: task=%s", task_id)

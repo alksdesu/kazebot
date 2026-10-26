@@ -109,6 +109,7 @@ from .feature_config_api import create_feature_config_router
 from .platform_accounts import PlatformAccounts, create_legacy_qq_account_router, create_platform_account_router
 from .platform_api import create_platform_router
 from .restart_gate import RestartGate
+from .usage_report import create_usage_router
 from .admin_api import init_admin_token, verify_admin_token
 
 
@@ -2249,6 +2250,7 @@ def create_app(
     admin_router = create_admin_router(workspace_root=state.workspace_root)
     app.include_router(admin_router, prefix="/v1/admin/config")
     app.include_router(create_plugin_router(state.workspace_root), prefix="/v1/admin/plugins")
+    app.include_router(create_usage_router(state.workspace_root), prefix="/v1/admin/usage")
     app.include_router(create_platform_router(workspace_root=state.workspace_root), prefix="/v1/platforms")
     app.include_router(create_platform_account_router(state, app.state.platform_accounts), prefix="/v1/platforms")
     app.include_router(create_legacy_qq_account_router(state, app.state.platform_accounts))

@@ -4,6 +4,7 @@ import { Empty } from '../components/settings/pages/settingsControls';
 import { DiagnosticsPanel } from '../features/operations/DiagnosticsPanel';
 import { PlainPage } from './components';
 import { AccountSettingsPage } from './AccountSettingsPage';
+import { CacheUsagePage } from './CacheUsagePage';
 import { FEATURES_SCOPE, type ConfigScope } from './configScope';
 import { ConnectionCard } from './ConnectionCard';
 import { DEFAULTS_PAGE_SECTIONS, STICKERS_PAGE_SECTIONS } from './FeatureSection';
@@ -83,7 +84,7 @@ export const BOT_PAGES: ConsolePageDefinition[] = [
   },
 ];
 
-/** 模型与渠道。写的是 config/models.yaml，和任何平台都无关。 */
+/** 模型与渠道：改 config/models.yaml 的两页，加上只读的缓存命中统计。和任何平台都无关。 */
 export const MODEL_PAGES: ConsolePageDefinition[] = [
   {
     id: 'providers',
@@ -98,6 +99,13 @@ export const MODEL_PAGES: ConsolePageDefinition[] = [
     icon: 'model_training',
     Page: ModelsPage,
     note: '发给模型的请求里带哪些参数。清单由各家 provider 自己声明，全局与节点分两层，节点优先。',
+  },
+  {
+    id: 'cache-usage',
+    label: '缓存命中',
+    icon: 'query_stats',
+    Page: CacheUsagePage,
+    note: '每个会话、节点、模型和渠道的提示缓存命中率，从任务记录里的用量算出来。升级前的旧记录当作改动前的基线。',
   },
 ];
 

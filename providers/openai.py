@@ -8,7 +8,9 @@ import httpx
 
 from plugin_sdk import PluginExecutionError
 
-from .assembly import ToolCallAssembler, conclude, int_field, new_call_id, parse_tool_arguments, usage_dict
+from .assembly import (
+    ToolCallAssembler, conclude, int_field, new_call_id, parse_tool_arguments, reported_int, usage_dict,
+)
 from .base import BaseProvider, ProviderResponse, ToolCall, content_parts, content_text, tool_call_fields
 from .degrade import DegradeRule, degrade, set_option, unset_options
 from .failures import exception_failure, failed, read_error, upstream_failure
@@ -49,6 +51,22 @@ _ABORTED_FINISH = {
 }
 
 
+def _cache_hit_tokens(usage: dict[str, Any]) -> int | None:
+    """缓存命中量。两处都没报是 None，报了 0 就是 0。"""
+    # 两家放的位置不同：OpenAI 嵌在 prompt_tokens_details 里，DeepSeek 平铺在 usage 上。
+    reported = [
+        value
+        for value in (
+            reported_int(usage, "prompt_tokens_details", "cached_tokens"),
+            reported_int(usage, "prompt_cache_hit_tokens"),
+        )
+        if value is not None
+    ]
+    if not reported:
+        return None
+    return next((value for value in reported if value), 0)
+
+
 def _extract_usage(data: Any) -> dict[str, int] | None:
     """Extract token usage dict from an OpenAI response/chunk."""
     usage = data.get("usage") if isinstance(data, dict) else None
@@ -56,13 +74,11 @@ def _extract_usage(data: Any) -> dict[str, int] | None:
         return None
     if not any(isinstance(usage.get(key), int) for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
         return None
-    # 缓存命中量两家放的位置不同：OpenAI 嵌在 prompt_tokens_details 里，DeepSeek 平铺在 usage 上。
-    cached = int_field(usage, "prompt_tokens_details", "cached_tokens") or int_field(usage, "prompt_cache_hit_tokens")
     return usage_dict(
         prompt=int_field(usage, "prompt_tokens"),
         completion=int_field(usage, "completion_tokens"),
         total=int_field(usage, "total_tokens"),
-        cache_read=cached,
+        cache_read=_cache_hit_tokens(usage),
         reasoning=int_field(usage, "completion_tokens_details", "reasoning_tokens"),
     )
 

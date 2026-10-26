@@ -670,6 +670,7 @@ def _parse_usage(um: Any) -> dict[str, int] | None:
         prompt=int_field(um, "promptTokenCount") + int_field(um, "toolUsePromptTokenCount"),
         completion=int_field(um, "candidatesTokenCount") + thoughts,
         total=int_field(um, "totalTokenCount"),
+        # proto3 JSON 不输出值为 0 的字段，没命中时这一项根本不出现：缺了就是 0
         cache_read=int_field(um, "cachedContentTokenCount"),
         reasoning=thoughts,
     )

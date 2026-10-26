@@ -30,7 +30,7 @@ from engine.inference.llm_call import (
 )
 from engine.inference.llm_outcome import error_kind, should_fallback
 from .result import hook_result
-from .usage_tracker import accumulate_usage
+from .usage_tracker import accumulate_usage, note_serving_provider
 
 logger = logging.getLogger(__name__)
 
@@ -410,6 +410,7 @@ class FallbackProviderHandler:
                     )
                     # Overwrite ctx.response so ai_step uses the new response
                     ctx.response = new_resp
+                    note_serving_provider(rctx, fb_provider)
 
                     # Emit signal if bus is available
                     try:

@@ -28,6 +28,23 @@ class TaskLease:
         return bool(self.lost_reason)
 
 
+@dataclass(frozen=True)
+class ServingProvider:
+    """实际出答案的那个 provider：模型名、provider 类型、渠道块名。"""
+
+    model: str = ""
+    provider: str = ""
+    channel: str = ""
+
+    @classmethod
+    def of(cls, provider: Any) -> "ServingProvider":
+        return cls(
+            model=str(getattr(provider, "model", "") or ""),
+            provider=str(getattr(provider, "name", "") or ""),
+            channel=str(getattr(provider, "plugin_channel", "") or ""),
+        )
+
+
 @dataclass
 class RunContext:
     """单个 task 执行片段的运行上下文。"""
@@ -63,6 +80,8 @@ class RunContext:
     first_shadow_message_id: str = ""   # UUID of first message written to ConversationStore
     last_shadow_message_id: str = ""    # UUID of last message written to ConversationStore
     completed_steps: int = 0             # actual step count from ai_step loop
+    # 备用渠道顶上时答案不是节点 provider 出的，TaskRecord 按最后一次成功的那个记模型和渠道
+    serving_provider: ServingProvider | None = None
     # [AutoC 2026-06-04] Why: one visible streaming card must map to one concrete LLM
     # request, not to the whole task. How: keep the current request id on RunContext
     # and let emit_event copy it into stream/tool/outbound-related payloads. Purpose:

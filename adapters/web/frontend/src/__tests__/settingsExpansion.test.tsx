@@ -69,6 +69,7 @@ describe('expanded settings registry', () => {
       // 模型与渠道从 QQ 页表里移出来，自成一组。
       'providers',
       'models',
+      'cache-usage',
       // 平台组：一个平台一页，分区在页内折叠。
       'platform-qq',
     ]);

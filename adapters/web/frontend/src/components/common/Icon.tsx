@@ -49,6 +49,7 @@ import { PhotoLibraryW400 } from '@material-symbols-svg/react/icons/photo-librar
 import { ProgressActivityW400 } from '@material-symbols-svg/react/icons/progress-activity';
 import { PsychologyW400 } from '@material-symbols-svg/react/icons/psychology';
 import { PublicW400 } from '@material-symbols-svg/react/icons/public';
+import { QueryStatsW400 } from '@material-symbols-svg/react/icons/query-stats';
 import { RefreshW400 } from '@material-symbols-svg/react/icons/refresh';
 import { ScheduleW400 } from '@material-symbols-svg/react/icons/schedule';
 import { SettingsW400 } from '@material-symbols-svg/react/icons/settings';
@@ -107,6 +108,7 @@ const ICON_MAP: Record<string, SvgIcon> = {
   progress_activity: ProgressActivityW400,
   psychology: PsychologyW400,
   public: PublicW400,
+  query_stats: QueryStatsW400,
   refresh: RefreshW400,
   schedule: ScheduleW400,
   settings: SettingsW400,

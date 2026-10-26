@@ -71,6 +71,7 @@ describe('Material Symbols SVG icon system', () => {
       'notifications_active',
       'hub',
       'model_training',
+      'query_stats',
       'inbox',
     ]);
 

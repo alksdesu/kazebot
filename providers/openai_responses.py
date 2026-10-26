@@ -17,7 +17,8 @@ import httpx
 from plugin_sdk import PluginExecutionError
 
 from .assembly import (
-    ToolCallAssembler, arguments_json, conclude, int_field, new_call_id, parse_tool_arguments, usage_dict,
+    ToolCallAssembler, arguments_json, conclude, int_field, new_call_id, parse_tool_arguments, reported_int,
+    usage_dict,
 )
 from .base import (
     BaseProvider, ProviderResponse, ToolCall, content_parts, content_text, image_part_url, provider_metadata,
@@ -84,7 +85,7 @@ def _parse_usage(usage: Any) -> dict[str, int] | None:
         prompt=int_field(usage, "input_tokens"),
         completion=int_field(usage, "output_tokens"),
         total=int_field(usage, "total_tokens"),
-        cache_read=int_field(usage, "input_tokens_details", "cached_tokens"),
+        cache_read=reported_int(usage, "input_tokens_details", "cached_tokens"),
         reasoning=int_field(usage, "output_tokens_details", "reasoning_tokens"),
     )
 

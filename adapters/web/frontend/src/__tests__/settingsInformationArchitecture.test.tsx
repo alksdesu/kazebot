@@ -24,7 +24,7 @@ describe('设置分组归属', () => {
   });
 
   it('渠道和模型不再登记在 QQ 页表里', () => {
-    expect(idsInGroup('models')).toEqual(['providers', 'models']);
+    expect(idsInGroup('models')).toEqual(['providers', 'models', 'cache-usage']);
     const sectionIds = QQ_SCHEMA.sections.map(section => section.id);
     expect(sectionIds).not.toContain('providers');
     expect(sectionIds).not.toContain('models');

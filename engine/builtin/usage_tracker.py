@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from typing import Any
+
+from engine.context import ServingProvider
+
 # Why: engine.builtin handlers must not depend on the hook package after relocation.
 # How: return a local HookResult-compatible shape instead. Purpose: avoid
 # cycles while keeping the existing hook registry duck-typed.
@@ -37,6 +40,12 @@ def accumulate_usage(total: dict, usage: dict) -> bool:
     return added
 
 
+def note_serving_provider(rctx: Any, provider: Any) -> None:
+    """记下这次出答案的 provider，任务结束时 TaskRecord 记最后一次的。"""
+    if rctx is not None:
+        rctx.serving_provider = ServingProvider.of(provider)
+
+
 class UsageTracker:
     """Accumulate provider token usage after each LLM call."""
 
@@ -51,8 +60,13 @@ class UsageTracker:
         to rctx.total_usage. Purpose: keep task-level usage records identical
         while making usage tracking pluggable.
         """
+        if ctx.rctx is None:
+            return None
+        # 只认成功的那次：主渠道失败、备用渠道顶上时由 fallback_provider 记它自己
+        if getattr(ctx.response, "ok", False):
+            note_serving_provider(ctx.rctx, ctx.provider)
         usage = getattr(ctx.response, "usage", None)
-        if not usage or not isinstance(usage, dict) or ctx.rctx is None:
+        if not usage or not isinstance(usage, dict):
             return None
         if accumulate_usage(ctx.rctx.total_usage, usage):
             return hook_result(modified=True)

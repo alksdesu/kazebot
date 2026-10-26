@@ -16,6 +16,7 @@ import json
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from engine.compaction_plan import _tool_call_ids, record_dict, record_meta, record_task_id
@@ -37,7 +38,7 @@ class TaskRecord:
     """Lightweight index for a single task execution.
 
     Points into data/conversations/{session_id}.jsonl via message IDs.
-    Time is derived from the pointed messages' created_at field.
+    completed_at marks when the run ended; other times come from the pointed messages' created_at.
     Content is retrieved by filtering conversations on source_task_id.
     """
     task_id: str
@@ -54,6 +55,10 @@ class TaskRecord:
     child_session_id: str = ""      # if this was a child session task
     compressed: bool = False         # marked True when task messages replaced by summary
     outcome: str = ""               # TaskAction.summary
+    completed_at: str = ""          # record_timestamp()；缺它的老记录在用量汇总里算基线
+    model: str = ""                 # 最后一次出答案的 provider，备用渠道顶上时记备用的
+    provider: str = ""
+    channel: str = ""
     version: int = TASK_RECORD_VERSION
 
     def to_dict(self) -> dict:
@@ -81,6 +86,14 @@ class TaskRecord:
             d["compressed"] = True
         if self.outcome:
             d["outcome"] = self.outcome
+        if self.completed_at:
+            d["completed_at"] = self.completed_at
+        if self.model:
+            d["model"] = self.model
+        if self.provider:
+            d["provider"] = self.provider
+        if self.channel:
+            d["channel"] = self.channel
         # 旧记录读进来时 summary 已清空，之后再出现的 summary 只可能是轮摘要回写的，按新版本写出才不会再被降级
         d["version"] = max(self.version, TASK_RECORD_VERSION) if self.summary else self.version
         return d
@@ -115,8 +128,28 @@ class TaskRecord:
             child_session_id=data.get("child_session_id", ""),
             compressed=data.get("compressed", False),
             outcome=outcome,
+            completed_at=str(data.get("completed_at") or ""),
+            model=str(data.get("model") or ""),
+            provider=str(data.get("provider") or ""),
+            channel=str(data.get("channel") or ""),
             version=version,
         )
+
+
+def record_timestamp() -> str:
+    """completed_at 的写法：带时区的 UTC ISO 8601。"""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_record_timestamp(value: object) -> datetime | None:
+    """completed_at 读回成带时区的时间；不带时区的按 UTC，读不出来是 None。"""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def snip_summaries(records: list["TaskRecord"]) -> dict[str, str]:

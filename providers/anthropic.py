@@ -16,7 +16,9 @@ import httpx
 from plugin_sdk import PluginExecutionError
 from tools._wire import WIRE_ANTHROPIC, headers as wire_headers
 
-from .assembly import ToolCallAssembler, conclude, int_field, new_call_id, parse_tool_arguments, usage_dict
+from .assembly import (
+    ToolCallAssembler, conclude, int_field, new_call_id, parse_tool_arguments, reported_int, usage_dict,
+)
 from .base import (
     BaseProvider, ProviderResponse, ToolCall, content_parts, content_text, image_part_url, provider_metadata,
     split_data_url, tool_call_fields,
@@ -391,10 +393,10 @@ def _parse_usage(data: Any) -> dict[str, int] | None:
         return None
     # input_tokens 只是未命中缓存的那部分，缓存读写要单独加回来，否则开了缓存
     # 之后 prompt_tokens 会突然掉一个数量级，看着像省钱其实是漏算。
-    cache_read = int_field(usage, "cache_read_input_tokens")
-    cache_write = int_field(usage, "cache_creation_input_tokens")
+    cache_read = reported_int(usage, "cache_read_input_tokens")
+    cache_write = reported_int(usage, "cache_creation_input_tokens")
     return usage_dict(
-        prompt=int_field(usage, "input_tokens") + cache_read + cache_write,
+        prompt=int_field(usage, "input_tokens") + (cache_read or 0) + (cache_write or 0),
         completion=int_field(usage, "output_tokens"),
         cache_read=cache_read,
         cache_write=cache_write,

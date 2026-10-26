@@ -394,7 +394,10 @@ def test_gemini_completion_tokens_include_thinking_like_everyone_else() -> None:
     body = body_with_text("gemini", "ok")
     body["usageMetadata"] = {"promptTokenCount": 10, "candidatesTokenCount": 5, "thoughtsTokenCount": 7, "totalTokenCount": 22}
     resp = call("gemini", answering(200, json=body), stream=False)
-    assert resp.usage == {"prompt_tokens": 10, "completion_tokens": 12, "total_tokens": 22, "reasoning_tokens": 7}
+    # 没命中时 Gemini 不出 cachedContentTokenCount，按 0 记
+    assert resp.usage == {
+        "prompt_tokens": 10, "completion_tokens": 12, "total_tokens": 22, "cache_read_tokens": 0, "reasoning_tokens": 7,
+    }
 
 
 def _openai_tool_stream(*deltas: dict[str, Any]) -> bytes:

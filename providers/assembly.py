@@ -41,12 +41,17 @@ def arguments_json(arguments: Any) -> str:
     return json.dumps({} if arguments is None else arguments, ensure_ascii=False, default=str)
 
 
-def int_field(holder: Any, *path: str) -> int:
-    """按路径取一个整数，任何一层缺了或类型不对都当 0。"""
+def reported_int(holder: Any, *path: str) -> int | None:
+    """按路径取一个上游报了的整数；任何一层缺了、是 null 或类型不对都是 None，和报了 0 分开。"""
     value = holder
     for key in path:
         value = value.get(key) if isinstance(value, dict) else None
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def int_field(holder: Any, *path: str) -> int:
+    """按路径取一个整数，任何一层缺了或类型不对都当 0。"""
+    return reported_int(holder, *path) or 0
 
 
 def usage_dict(
@@ -54,19 +59,22 @@ def usage_dict(
     prompt: int,
     completion: int,
     total: int = 0,
-    cache_read: int = 0,
-    cache_write: int = 0,
+    cache_read: int | None = None,
+    cache_write: int | None = None,
     reasoning: int = 0,
 ) -> dict[str, int]:
-    """统一的用量形状：prompt 含缓存读写，completion 含推理消耗，可选项只在非零时出现。"""
+    """统一的用量形状：prompt 含缓存读写，completion 含推理消耗。
+
+    缓存读写传 None 是上游没报，报了 0 照写 0：「这次没命中」和「这个渠道不报缓存」要分得开。推理量只在非零时出现。
+    """
     usage = {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": total or prompt + completion,
     }
-    if cache_read:
+    if cache_read is not None:
         usage["cache_read_tokens"] = cache_read
-    if cache_write:
+    if cache_write is not None:
         usage["cache_write_tokens"] = cache_write
     if reasoning:
         usage["reasoning_tokens"] = reasoning
