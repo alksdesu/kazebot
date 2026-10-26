@@ -8,17 +8,30 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections import OrderedDict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import httpx  # noqa: E402
+import pytest  # noqa: E402
+from supervisor import admin_api  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
 from supervisor.types import TaskStatus  # noqa: E402
+
+_TOKEN = "compact-async-token"
+_AUTH = {"Authorization": f"Bearer {_TOKEN}"}
+
+
+@pytest.fixture(autouse=True)
+def _admin_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", _TOKEN)
+    monkeypatch.setattr(admin_api, "_admin_token", "")
+    monkeypatch.setattr(admin_api, "_auth_failures", OrderedDict())
 
 
 def _make_state(workspace: Path) -> SupervisorState:
@@ -71,7 +84,7 @@ class TestAnchorResolution:
             assert state.anchor_session_for_locked("a") == ""
 
 
-def _post(app, body: dict) -> httpx.Response:
+def _post(app, body: dict, *, auth: bool = True) -> httpx.Response:
     from engine.conversation_store import ConversationStore, Message
     target = body.get("target_session_id", "")
     state = app.state.state
@@ -85,7 +98,7 @@ def _post(app, body: dict) -> httpx.Response:
     async def _run() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-            return await client.post("/v1/tasks/compact-async", json=body)
+            return await client.post("/v1/tasks/compact-async", json=body, headers=_AUTH if auth else {})
 
     return asyncio.run(_run())
 
@@ -141,6 +154,14 @@ class TestCompactAsyncEndpoint:
         app = _app(state, tmp_path)
 
         assert _post(app, self._body("no-such-session")).status_code == 404
+
+    def test_it_needs_the_admin_token(self, tmp_path: Path) -> None:
+        state = _make_state(tmp_path)
+        app = _app(state, tmp_path)
+        sid = state.get_or_create_session(channel="test", conversation_key="test:compact-auth")
+
+        assert _post(app, self._body(sid), auth=False).status_code == 401
+        assert not state.tasks
 
     def test_sizing_fields_reach_the_task(self, tmp_path: Path) -> None:
         state = _make_state(tmp_path)

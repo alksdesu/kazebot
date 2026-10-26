@@ -2092,6 +2092,7 @@ def create_app(
 
     @app.post("/v1/tasks/compact-snip")
     async def compact_snip(request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
         st: SupervisorState = app.state.state
         body = await request.json()
         target = body.get("target_session_id") if isinstance(body, dict) else None
@@ -2117,6 +2118,7 @@ def create_app(
         """入口分支上的任务把旧工具结果的截短、让位、清空标记写进父会话，再同步到各活跃分支。"""
         from engine.view_marks import parse_mark_requests
 
+        verify_admin_token(request)
         st: SupervisorState = app.state.state
         try:
             body = await request.json()
@@ -2157,6 +2159,7 @@ def create_app(
         LLM 调用。这个端点让软阈值触发的压缩在后台跑完，当轮继续用旧上下文回完话，
         下一轮才吃到压缩结果。
         """
+        verify_admin_token(request)
         st: SupervisorState = app.state.state
         body = await request.json()
         target_session_id = str(body.get("target_session_id") or "").strip()

@@ -9,6 +9,7 @@ import asyncio
 import dataclasses
 import json
 import sys
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,6 +68,7 @@ from engine.view_marks import (  # noqa: E402
 )
 from providers.openai import OpenAIProvider  # noqa: E402
 from providers.options import OptionSet  # noqa: E402
+from supervisor import admin_api  # noqa: E402
 from supervisor.api import create_app  # noqa: E402
 from supervisor.config_store import ConfigStore  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
@@ -78,6 +80,8 @@ from supervisor.types import TaskKind  # noqa: E402
 _TRUNCATED = {"kind": "truncated", "chars": TOOL_RESULT_VIEW_CHARS}
 _CLEARED = {"kind": "cleared"}
 _GOOD_MARK = {"message_id": "m1", "fingerprint": "a" * 64, "mark": {"kind": "cleared"}}
+_TOKEN = "view-marks-token"
+_AUTH = {"Authorization": f"Bearer {_TOKEN}"}
 
 
 def _ago(hours: float) -> str:
@@ -596,11 +600,17 @@ class TestSupervisorMarks:
 
 
 class TestViewMarksEndpoint:
+    @pytest.fixture(autouse=True)
+    def _admin_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", _TOKEN)
+        monkeypatch.setattr(admin_api, "_admin_token", "")
+        monkeypatch.setattr(admin_api, "_auth_failures", OrderedDict())
+
     def test_a_branch_task_s_marks_are_applied_and_confirmed(self, branch_case: SimpleNamespace) -> None:
         case = branch_case
         target = next(message for message in case.history if message.role == "tool")
 
-        response = _post(_app(case.state, case.state.workspace_root), "/v1/tasks/view-marks", json={
+        response = _post(_app(case.state, case.state.workspace_root), "/v1/tasks/view-marks", headers=_AUTH, json={
             "target_session_id": case.parent, "branch_session_id": case.branch, "reason": "idle_clear",
             "marks": [{"message_id": target.id, "fingerprint": mark_fingerprint(target), "mark": _CLEARED}],
         })
@@ -611,6 +621,21 @@ class TestViewMarksEndpoint:
         }
         prefix, _ = _branch_prefix(case)
         assert view_mark_of(next(message for message in prefix if message.id == target.id)) == _CLEARED
+
+    def test_it_needs_the_admin_token(self, branch_case: SimpleNamespace) -> None:
+        case = branch_case
+        target = next(message for message in case.history if message.role == "tool")
+        before = [message.to_dict() for message in case.store.load(case.parent)]
+
+        response = _post(_app(case.state, case.state.workspace_root), "/v1/tasks/view-marks", json={
+            "target_session_id": case.parent, "branch_session_id": case.branch, "reason": "idle_clear",
+            "marks": [{"message_id": target.id, "fingerprint": mark_fingerprint(target), "mark": _CLEARED}],
+        })
+
+        assert response.status_code == 401
+        assert [message.to_dict() for message in case.store.load(case.parent)] == before
+        prefix, _ = _branch_prefix(case)
+        assert view_mark_of(next(message for message in prefix if message.id == target.id)) is None
 
     @pytest.mark.parametrize("make_body", [
         lambda parent: [_GOOD_MARK],
@@ -628,20 +653,20 @@ class TestViewMarksEndpoint:
         state = _plain_state(tmp_path)
         parent = state.get_or_create_session(channel="test", conversation_key="test:view-marks-endpoint")
 
-        response = _post(_app(state, tmp_path), "/v1/tasks/view-marks", json=make_body(parent))
+        response = _post(_app(state, tmp_path), "/v1/tasks/view-marks", headers=_AUTH, json=make_body(parent))
 
         assert response.status_code == 400, response.text
 
     def test_a_body_that_is_not_json_is_rejected(self, tmp_path: Path) -> None:
         response = _post(
             _app(_plain_state(tmp_path), tmp_path), "/v1/tasks/view-marks",
-            content=b"{", headers={"content-type": "application/json"},
+            content=b"{", headers={**_AUTH, "content-type": "application/json"},
         )
 
         assert response.status_code == 400
 
     def test_an_unknown_session_is_not_found(self, tmp_path: Path) -> None:
-        response = _post(_app(_plain_state(tmp_path), tmp_path), "/v1/tasks/view-marks", json={
+        response = _post(_app(_plain_state(tmp_path), tmp_path), "/v1/tasks/view-marks", headers=_AUTH, json={
             "target_session_id": "no-such-session", "marks": [_GOOD_MARK],
         })
 

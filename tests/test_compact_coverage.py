@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import OrderedDict
 from copy import deepcopy
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from engine.context_archive import ContextArchiveStore
 from engine.context_store import load_context_snapshot, save_context_snapshot, write_context_snapshot
 from engine.conversation_store import ConversationStore, Message
 from engine.task_record import TaskRecord, snip_history, write_task_record
+from supervisor import admin_api
 from supervisor.api import create_app
 from supervisor.config_store import ConfigStore
 from supervisor.eventlog import EventLog
@@ -21,6 +23,15 @@ from supervisor.types import TaskKind, TaskStatus
 
 
 SUMMARY = "<summary>" + "Verified task history, decisions, constraints, and completed work. " * 8 + "</summary>"
+TOKEN = "compact-coverage-token"
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
+
+@pytest.fixture(autouse=True)
+def admin_token(monkeypatch):
+    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", TOKEN)
+    monkeypatch.setattr(admin_api, "_admin_token", "")
+    monkeypatch.setattr(admin_api, "_auth_failures", OrderedDict())
 
 
 @pytest.fixture
@@ -86,7 +97,7 @@ def background(state, session_id):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver",
         ) as client:
-            return await client.post("/v1/tasks/compact-async", json={
+            return await client.post("/v1/tasks/compact-async", headers=AUTH, json={
                 "target_session_id": session_id, "caller_node_id": "qq.orchestrator",
                 "instruction": "INCOMPLETE_TOPIC_ONLY_DO_NOT_TRUST",
                 "keep_recent": 2, "threshold_tokens": 100000,
@@ -340,7 +351,9 @@ def test_worker_snip_uses_supervisor_and_cannot_restore_old_branch_prefix(scenar
     caller_task(state, session_id, parent_session_id=session_id, child_session_id=child_id)
 
     async def run():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver", headers=AUTH,
+        ) as client:
             loop = SimpleNamespace(messages=history, rctx=SimpleNamespace(
                 workspace_root=state.workspace_root, session_id=branch_id,
                 parent_session_id=session_id, child_session_id="", supervisor_url="http://testserver",
@@ -533,10 +546,32 @@ def test_snip_api_rejects_invalid_targets_and_task_identifiers(scenario):
                 ({"target_session_id": session_id, "task_ids": "task"}, 400),
                 ({"target_session_id": "../unknown", "task_ids": ["task"]}, 404),
             ]:
-                response = await client.post("/v1/tasks/compact-snip", json=body)
+                response = await client.post("/v1/tasks/compact-snip", headers=AUTH, json=body)
                 assert response.status_code == expected, response.text
 
     asyncio.run(request())
+    assert record_list(store, session_id) == [message.to_dict() for message in original]
+
+
+def test_snip_api_needs_the_admin_token(scenario):
+    state, session_id, store, original = scenario
+    write_task_record(state.workspace_root, TaskRecord(
+        task_id=original[0].source_task_id, session_id=session_id, node_id="test", summary=SUMMARY,
+    ))
+    app = create_app(
+        state=state, process_manager=None,
+        config_store=ConfigStore(path=state.workspace_root / "config" / "models.yaml", workspace_root=state.workspace_root),
+    )
+
+    async def request():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver",
+        ) as client:
+            return await client.post("/v1/tasks/compact-snip", json={
+                "target_session_id": session_id, "task_ids": [original[0].source_task_id],
+            })
+
+    assert asyncio.run(request()).status_code == 401
     assert record_list(store, session_id) == [message.to_dict() for message in original]
 
 
