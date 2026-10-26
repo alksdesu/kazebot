@@ -5,8 +5,9 @@ import asyncio
 import logging
 import time
 import uuid
+from collections import Counter
 from copy import deepcopy
-from functools import wraps
+from functools import partial, wraps
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
@@ -27,17 +28,21 @@ from .pseudo_tools import (
 )
 from .resume_builder import _build_resume_messages
 from .loop_state import (
+    TERMINAL_TOOLS,
     TOOL_CONTEXT_EXTRA_ATTRS,
+    TOOL_RESULT_ATTACHMENT_TYPE,
     _LoopState,
     _persist_ctx,
     _short,
     build_tool_context,
+    compact_target_session_id,
+    context_archive_session_id,
     conversation_writer,
     flush_conversation_writes,
 )
 from .llm_call import _call_llm_with_retry, _build_failure_action
 from .llm_outcome import is_truncated, with_changes
-from .async_delivery import build_async_result_payload, deliver_async_result
+from .async_delivery import async_result_tool_status, build_async_result_payload, deliver_async_result
 from .pseudo_handlers import _handle_pseudo_tool
 
 from ..context_store import load_context_snapshot
@@ -55,8 +60,9 @@ from ..protocol import (
     ACTION_CANCELLED,
     ACTION_PREEMPTED,
 )
-from ..tool_step import TOOL_CANCELLED, result_to_raw, summarize_result, tool_outcome
-from clonoth_runtime import get_int, get_float, get_bool, load_runtime_config
+from ..tool_step import TOOL_CANCELLED, TOOL_ERROR, result_to_raw, summarize_result, tool_outcome
+from ..tool_outputs import READ_TOOL_OUTPUT, inline_tool_output, tool_output_limits
+from clonoth_runtime import get_int, get_float, get_bool, load_runtime_config, parse_bool
 from toolbox.context import ToolContext
 # build_llm_messages: 反序列化方向的格式转换，在 llm_call.py 中实际调用。
 # 此处导入供外部通过 ai_step 模块访问（如测试、调试）。
@@ -210,16 +216,67 @@ def _invalid_arguments_error(tool_name: str, raw_arguments: str) -> str:
     )
 
 
-def _append_tool_error(ls: _LoopState, tool_call: Any, text: str) -> None:
+TOOL_BLOCKED = "blocked"
+TOOL_ASYNC_STARTED = "async_started"
+
+_SUPERSEDED_TERMINAL_MESSAGE = "{tool} 没有执行：同一轮调用了多个 finish/ask，只执行最后一个。"
+_FINAL_STEP_REJECT_MESSAGE = "{tool} 没有执行：这是本任务允许的最后一步，只能调用 finish。"
+_FINAL_STEP_HINT = (
+    "[SYSTEM] 这是本任务允许的最后一步（已用 {used}/{total} 步）。不要再调用其它工具，直接调用 finish："
+    "说明已经完成的工作、没完成的部分和原因、建议的下一步。"
+)
+STEP_LIMIT_NOTICE = "（已达到最大步数，任务到此停止）"
+
+
+def _append_tool_error(ls: _LoopState, tool_call: Any, text: str, *, tool_status: str = TOOL_BLOCKED) -> None:
     """给一个没有执行的工具调用补上错误结果，保持调用与结果的配对。"""
     message = ls.formatter.format_tool_result(tool_call, text)
     # 结果带上当前 tool_mode，真 native 的 role=tool 消息下一轮才会被原样透传
     set_message_meta(message, MessageMeta(
         tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
         message_type="tool_result",
+        # 执行状态只对真工具有意义，伪工具的结果不记
+        tool_status="" if is_pseudo_tool_name(str(getattr(tool_call, "name", "") or "")) else tool_status,
     ))
     ls.messages.append(message)
     _shadow_write(ls, message, message_type=MessageType.TOOL_RESULT)
+
+
+def _flush_tool_errors(ls: _LoopState, pending: list[tuple[Any, str]]) -> None:
+    """按顺序写完排着的错误结果；写过的从列表里拿掉，重复调用不会写两遍。"""
+    while pending:
+        tool_call, text = pending.pop(0)
+        _append_tool_error(ls, tool_call, text)
+
+
+def _rejected_terminal_calls(hook_ctx: HookContext, pseudo_calls: list) -> list[tuple[Any, str]]:
+    """round 级 hook 放进 extra["rejected_terminal_calls"] 的终止调用，只认本轮伪工具里的 finish/ask。"""
+    pending = {id(call): call for call in pseudo_calls if call.name in TERMINAL_TOOLS}
+    rejected: list[tuple[Any, str]] = []
+    for item in hook_ctx.extra.get("rejected_terminal_calls") or []:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            continue
+        call, text = item
+        target = pending.pop(id(call), None)
+        if target is None:
+            call_id = str(getattr(call, "id", "") or "")
+            key = next((key for key, known in pending.items() if call_id and known.id == call_id), None)
+            target = pending.pop(key, None) if key is not None else None
+        if target is not None:
+            rejected.append((target, str(text or "") or f"{target.name} 没有执行。"))
+    return rejected
+
+
+def _split_by_position(
+    tool_calls: list, skipped: list[tuple[Any, str]], executed_ids: set[int],
+) -> tuple[list[tuple[Any, str]], list[tuple[Any, str]]]:
+    """不执行的调用里，排在本轮第一个会执行的调用之前的现在就写结果，其余等前面的结果写完再补，尽量贴着原顺序。"""
+    position = {id(call): index for index, call in enumerate(tool_calls)}
+    first_executed = min((position[key] for key in executed_ids if key in position), default=len(tool_calls))
+    ordered = sorted(skipped, key=lambda item: position.get(id(item[0]), len(tool_calls)))
+    early = [item for item in ordered if position.get(id(item[0]), len(tool_calls)) < first_executed]
+    late = [item for item in ordered if position.get(id(item[0]), len(tool_calls)) >= first_executed]
+    return early, late
 
 
 def _append_truncation_hint(ls: _LoopState) -> None:
@@ -260,11 +317,13 @@ def _handle_truncated_response(ls: _LoopState, resp: Any, step: int) -> TaskActi
     )
 
 
-async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | None:
+async def _handle_tool_calls(ls: _LoopState, resp, step: int, *, final_step: bool = False) -> TaskAction | None:
     """处理 tool_calls（伪工具 + 真工具）。
 
     返回 TaskAction 则退出循环；返回 None 则 continue 到下一轮。
+    final_step 为真时是本任务的最后一步：finish/ask 之外的调用都不执行，只补错误结果。
     """
+    ls.last_round_blocked = False
     # 【方案 A 重构】伪工具改为列表按序执行，不再是 last-wins
     # 原本单标量 `pseudo_call = tc` 会导致同轮多伪工具只有最后一个生效，
     # 在 Fix 2（JSON 自由正文反向包装为 reply）后尤其危险——
@@ -274,14 +333,18 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     # 返回 None 的（reply / compact_context / preempt_task）继续执行下一个。
     pseudo_calls: list = []
     real_tool_calls: list[dict[str, Any]] = []
+    _real_call_ids: set[int] = set()
     _unauthorized_names: list[str] = []
     # 不执行的调用等 assistant 消息进了历史再补错误结果：写在它前面的结果会被配对修复当孤儿删掉
-    _rejected_calls: list[tuple[Any, str]] = []
+    _rejected_calls: list[tuple[Any, str, str]] = []
     for tc in resp.tool_calls:
         _raw_arguments = invalid_arguments(tc.arguments)
         if _raw_arguments is not None:
             logger.warning("node %s tool call %s carried non-JSON arguments; not executed", ls.node.id, tc.name)
-            _rejected_calls.append((tc, _invalid_arguments_error(tc.name, _raw_arguments)))
+            _rejected_calls.append((tc, _invalid_arguments_error(tc.name, _raw_arguments), TOOL_ERROR))
+            continue
+        if final_step and tc.name not in TERMINAL_TOOLS:
+            _rejected_calls.append((tc, _FINAL_STEP_REJECT_MESSAGE.format(tool=tc.name), TOOL_BLOCKED))
             continue
         # dispatch:{target} 这类按委派目标生成的名字也是伪工具，不走真工具授权
         if is_pseudo_tool_name(tc.name):
@@ -294,6 +357,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
                 tc,
                 f"Error: Tool '{tc.name}' is not in this node's allowed tool list. "
                 f"Use finish() to provide your output directly.",
+                TOOL_BLOCKED,
             ))
         else:
             real_tool_calls.append({
@@ -301,6 +365,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
                 "name": tc.name,
                 "arguments": dict(tc.arguments or {}),
             })
+            _real_call_ids.add(id(tc))
             # P0 Task 内核化：记录工具调用摘要
             _args_str = str(tc.arguments or {})[:200]
             ls.rctx.tool_call_log.append({"name": tc.name, "args_summary": _args_str})
@@ -337,8 +402,8 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     ls.messages.append(_assistant_msg)
     # 含 finish 的 assistant 消息原样落盘：拆掉它后面的 tool_result 就没了配对来源
     _shadow_write(ls, _assistant_msg, MessageType.ASSISTANT)
-    for _rejected_call, _rejected_error in _rejected_calls:
-        _append_tool_error(ls, _rejected_call, _rejected_error)
+    for _rejected_call, _rejected_error, _rejected_status in _rejected_calls:
+        _append_tool_error(ls, _rejected_call, _rejected_error, tool_status=_rejected_status)
 
     # 正文处理策略（JSON / Fake Native / Native 模式统一）：
     # 工具调用伴随的自由正文不发送给用户，也不合成为 reply 工具调用。
@@ -361,53 +426,33 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         step=step,
         response=resp,
         tool_calls=list(resp.tool_calls or []),
-        extra={"pseudo_calls": pseudo_calls, "real_tool_calls": real_tool_calls, "loop_state": ls},
+        extra={
+            "pseudo_calls": pseudo_calls,
+            "real_tool_calls": real_tool_calls,
+            "loop_state": ls,
+            # doom_loop 从这条往前数历史轮次
+            "assistant_message": _assistant_msg,
+        },
     )
     _before_result = await hook_registry.afire("before_tool_call", _before_ctx)
     if _before_result.action is not None:
         return _before_result.action
-    if _before_result.block:
-        _reject_msg = (
-            _before_result.error_message
-            or _before_result.reason
-            or "Tool call blocked by before_tool_call hook."
+    # finish_guard 不拦整轮时，把和其它工具同轮的 finish/ask 交回这里，只拒它们
+    _rejected_terminals = _rejected_terminal_calls(_before_ctx, pseudo_calls)
+    if _before_result.block or _before_result.skip_step:
+        ls.last_round_blocked = True
+        _default_msg = (
+            "Tool call blocked by before_tool_call hook."
+            if _before_result.block else "Tool call skipped by before_tool_call hook."
         )
+        _reject_msg = _before_result.error_message or _before_result.reason or _default_msg
         # 拒绝结果按普通工具结果落盘：标成 ephemeral 的话下一轮 provider 会看到 tool_call 没有回复
-        _answered = {id(_call) for _call, _ in _rejected_calls}
+        _answered = {id(_call) for _call, *_ in _rejected_calls}
+        _terminal_msgs = {id(_call): _text for _call, _text in _rejected_terminals}
         for tc in resp.tool_calls:
             if id(tc) not in _answered:
-                _append_tool_error(ls, tc, _reject_msg)
+                _append_tool_error(ls, tc, _terminal_msgs.get(id(tc), _reject_msg))
         return None  # 不执行任何工具，回到主循环让 AI 重试
-    if _before_result.skip_step:
-        return None
-
-    # LEGACY: replaced by hook FinishGuardHandler in engine.builtin.finish_guard.
-    # 原因：保留原始硬编码判断，便于下一轮清理前核对行为。
-    # 做法：只注释旧逻辑，不再执行；hook 使用 pseudo_calls/real_tool_calls 复刻同一判断。
-    # 目的：迁移期间可快速回溯，不破坏当前 finish 并列拒绝语义。
-    # _has_finish = any(_pc.name == "finish" for _pc in pseudo_calls)
-    # _has_non_reply_others = bool(real_tool_calls) or any(
-    #     _pc.name not in ("finish", "reply") for _pc in pseudo_calls
-    # )
-    # if _has_finish and _has_non_reply_others:
-    #     _reject_msg = (
-    #         "\u274c REJECTED: finish() cannot be called alongside other tools "
-    #         "(except reply). Execute your other tools first, wait for their "
-    #         "results, then call finish() alone in a separate turn."
-    #     )
-    #     logger.warning(
-    #         "Rejected finish + other tools in same turn (node=%s, step=%d, tools=%s)",
-    #         ls.node.id, step, [tc.name for tc in resp.tool_calls],
-    #     )
-    #     for tc in resp.tool_calls:
-    #         _err = ls.formatter.format_tool_result(tc, _reject_msg)
-    #         set_message_meta(_err, MessageMeta(
-    #             tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
-    #             message_type="tool_result",
-    #         ))
-    #         ls.messages.append(_err)
-    #         _shadow_write(ls, _err, message_type="tool_result")
-    #     return None  # 不执行任何工具，回到主循环让 AI 重试
 
     # ---------------------------------------------------------------
     # [fix 2026-07-17] turn_summarizer/compactor 等 tool_access:none 的系统节点
@@ -420,7 +465,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     # 把模型本轮输出的自由文本当作隐式 finish 直接交付，而不再回到循环空转。
     # 目的：让摘要/压缩结果能落地（或快速失败），避免无意义重试。
     # ---------------------------------------------------------------
-    _has_finish = any(_pc.name in ("finish", "ask") for _pc in pseudo_calls)
+    _has_finish = any(_pc.name in TERMINAL_TOOLS for _pc in pseudo_calls)
     if (
         _unauthorized_names
         and not real_tool_calls
@@ -457,11 +502,22 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     # so it must share finish's delayed execution and preempt-intercept path. How:
     # store either terminal call in one slot and execute it after real tools.
     # Purpose: preserve existing finish semantics while introducing action="ask".
-    _terminal_call = None
-    if pseudo_calls:
+    _rejected_ids = {id(_call) for _call, _ in _rejected_terminals}
+    pseudo_calls = [_pc for _pc in pseudo_calls if id(_pc) not in _rejected_ids]
+    _terminal_calls = [_pc for _pc in pseudo_calls if _pc.name in TERMINAL_TOOLS]
+    _terminal_call = _terminal_calls[-1] if _terminal_calls else None
+    _skipped_terminals = _rejected_terminals + [
+        (_pc, _SUPERSEDED_TERMINAL_MESSAGE.format(tool=_pc.name)) for _pc in _terminal_calls[:-1]
+    ]
+    _executed_ids = _real_call_ids | {id(_pc) for _pc in pseudo_calls if _pc.name not in TERMINAL_TOOLS}
+    if _terminal_call is not None:
+        _executed_ids.add(id(_terminal_call))
+    _early_errors, _late_errors = _split_by_position(resp.tool_calls, _skipped_terminals, _executed_ids)
+    _flush_tool_errors(ls, _early_errors)
+
+    try:
         for _pc in pseudo_calls:
-            if _pc.name in ("finish", "ask"):
-                _terminal_call = _pc
+            if _pc.name in TERMINAL_TOOLS:
                 continue  # finish/ask 延后执行
             action = await _handle_pseudo_tool(ls, _pc, step)
             if action is not None:
@@ -469,19 +525,23 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
                 return action
             # 非终止型（reply / compact_context / preempt_task）继续
 
-    # 处理真实工具
-    if real_tool_calls:
-        action = await _execute_real_tools(ls, real_tool_calls, step)
-        if action is not None:
-            return action
-        ls.use_stream = ls.streaming
+        # 处理真实工具
+        if real_tool_calls:
+            action = await _execute_real_tools(ls, real_tool_calls, step)
+            if action is not None:
+                return action
+            ls.use_stream = ls.streaming
 
-        if ls.preempt_after_step:
-            ctx_ref = _persist_ctx(ls, step + 1)
-            return TaskAction(
-                action=ACTION_PREEMPTED, node_id=ls.node.id,
-                context_ref=ctx_ref, summary="任务被软打断，上下文已保存。",
-            )
+            if ls.preempt_after_step:
+                _flush_tool_errors(ls, _late_errors)
+                ctx_ref = _persist_ctx(ls, step + 1)
+                return TaskAction(
+                    action=ACTION_PREEMPTED, node_id=ls.node.id,
+                    context_ref=ctx_ref, summary="任务被软打断，上下文已保存。",
+                )
+    finally:
+        # 提前退出或抛错也要给不执行的终止调用补上结果
+        _flush_tool_errors(ls, _late_errors)
 
     # finish/ask 最后执行（同轮真实工具已完成）
     if _terminal_call:
@@ -736,7 +796,54 @@ def _async_failure_message(tool_name: str, async_tool_id: str, error: str, elaps
     )
 
 
-def _async_result_message(
+async def _context_tool_text(
+    workspace_root: Any, session_id: str, tool_name: str, text: Any, limits: Any,
+) -> Any:
+    """工具结果写进模型上下文的样子：超长的完整文本落盘，换成带 ref 的预览；事件里的原文不受影响。"""
+    if not isinstance(text, str) or len(text) <= limits.max_inline_chars:
+        return text
+    return await asyncio.to_thread(inline_tool_output, workspace_root, session_id, tool_name, text, limits)
+
+
+# 这两种恢复数据把独立 tool task 的 raw_inline 原样拼进上下文
+_RESUME_TOOL_RESULT_TYPES = frozenset({"tool_results", "batch_results"})
+
+
+async def _resume_data_for_context(resume_data: dict[str, Any], rctx: Any, runtime_cfg: Any) -> dict[str, Any]:
+    """恢复数据里超长的工具结果换成落盘后的预览，只给拼上下文用。
+
+    原数据不改：收附件和循环状态还要用它。
+    """
+    if str(resume_data.get("type") or "").strip() not in _RESUME_TOOL_RESULT_TYPES:
+        return resume_data
+    limits = tool_output_limits(runtime_cfg)
+    session_id = context_archive_session_id(rctx)
+    copied: dict[str, Any] = dict(resume_data)
+    changed = False
+    for key in ("tool_results", "entries"):
+        entries = resume_data.get(key)
+        if not isinstance(entries, list):
+            continue
+        replaced: list[Any] = []
+        for entry in entries:
+            raw = entry.get("raw_inline") if isinstance(entry, dict) else None
+            if (
+                not isinstance(raw, str)
+                or len(raw) <= limits.max_inline_chars
+                or str(entry.get("kind") or "tool") != "tool"
+            ):
+                replaced.append(entry)
+                continue
+            preview = await _context_tool_text(
+                rctx.workspace_root, session_id, str(entry.get("name") or ""), raw, limits,
+            )
+            replaced.append({**entry, "raw_inline": preview})
+            changed = True
+        copied[key] = replaced
+    return copied if changed else resume_data
+
+
+async def _async_result_message(
     *,
     registry: ToolRegistry,
     tool_name: str,
@@ -746,8 +853,12 @@ def _async_result_message(
     result: Any,
     error: Exception | None,
     workspace_root: Any,
+    session_id: str = "",
 ) -> tuple[str, str, list[str]]:
-    """返回 (回传正文, 失败原因, 附件路径)；失败原因为空表示成功。"""
+    """返回 (回传正文, 失败原因, 附件路径)；失败原因为空表示成功。
+
+    回传正文会注入 session_id 这个会话，超长结果也存在它名下，那边的任务才读得回来。
+    """
     if error is not None:
         failure = str(error) or type(error).__name__
         return _async_failure_message(tool_name, async_tool_id, failure), failure, []
@@ -756,6 +867,9 @@ def _async_result_message(
         return _async_failure_message(tool_name, async_tool_id, outcome.error, elapsed), outcome.error, []
     summary = summarize_result(tool_name, result, args=tool_args)
     _fmt, raw = result_to_raw(tool_name, result, tool_spec=registry.get_spec(tool_name))
+    limits = tool_output_limits(load_runtime_config(workspace_root) if workspace_root is not None else {})
+    # 只换结果正文，开头的状态行要留着：finish_guard 按它认异步结果
+    raw = await _context_tool_text(workspace_root, session_id, tool_name, raw, limits)
     message = (
         f'\u2705 Async tool "{tool_name}" (id: {async_tool_id}) completed in {elapsed:.1f}s.'
         f'\nSummary: {summary}\nResult:\n{raw}'
@@ -782,9 +896,10 @@ async def _run_async_deliver(
     """整形、记账并回传一个异步工具结果。session_id 是面向用户的路由会话，分支任务传父会话。"""
     elapsed = time.monotonic() - started_at
     try:
-        message, failure_error, attachments = _async_result_message(
+        message, failure_error, attachments = await _async_result_message(
             registry=registry, tool_name=tool_name, tool_args=tool_args, async_tool_id=async_tool_id,
             elapsed=elapsed, result=result, error=error, workspace_root=workspace_root,
+            session_id=session_id,
         )
     except Exception as format_error:
         logger.exception("formatting async tool result failed: tool=%s id=%s", tool_name, async_tool_id)
@@ -815,10 +930,449 @@ async def _run_async_deliver(
 #  真实工具执行
 # ---------------------------------------------------------------------------
 
+# 只读、互不依赖的内置工具：同一轮里连着出现时并发执行
+PARALLEL_SAFE_TOOLS = frozenset({
+    "read_file", "list_dir", "search_in_files", "glob", "get_context_window",
+    "search_context_archive", "read_context_archive", READ_TOOL_OUTPUT,
+})
+
+
+def _parallel_tools_limit(runtime_cfg: Any) -> int:
+    cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+    return get_int(cfg, "engine.parallel_tools.max_concurrency", 8, min_value=1, max_value=64)
+
+
+def _is_parallel_safe(name: str, arguments: dict[str, Any], spec: dict[str, Any] | None) -> bool:
+    # async_mode 和 execute_command 的自适应转异步要把调用挪到后台，只走顺序路径
+    if name == "execute_command" or (isinstance(spec, dict) and spec.get("async_mode")):
+        return False
+    # replace 模式会改文件
+    if name == "search_in_files" and str(arguments.get("mode") or "search").strip().lower() == "replace":
+        return False
+    if name in PARALLEL_SAFE_TOOLS:
+        return True
+    return isinstance(spec, dict) and bool(parse_bool(spec.get("parallel_safe"), False))
+
+
+def _execution_groups(
+    ls: _LoopState, real_tool_calls: list[dict[str, Any]], concurrency: int,
+) -> list[tuple[bool, list[dict[str, Any]]]]:
+    """(是否并发, 调用) 的分组：连续两个以上可并发的调用成一组，其余每个调用单独一组。"""
+    if concurrency <= 1 or len(real_tool_calls) < 2:
+        return [(False, [call]) for call in real_tool_calls]
+    groups: list[list[dict[str, Any]]] = []
+    flags: list[bool] = []
+    for call in real_tool_calls:
+        safe = _is_parallel_safe(call["name"], call["arguments"], ls.registry.get_spec(call["name"]))
+        if safe and flags and flags[-1]:
+            groups[-1].append(call)
+            continue
+        groups.append([call])
+        flags.append(safe)
+    return [(safe and len(group) > 1, group) for safe, group in zip(flags, groups)]
+
+
+async def _before_tool_hook(
+    ls: _LoopState,
+    rtc: dict[str, Any],
+    hook_calls: list[ParsedToolCall],
+    real_tool_calls: list[dict[str, Any]],
+    step: int,
+) -> tuple[ParsedToolCall, Any]:
+    """单个真工具的 before_tool_call：审批类 handler 以当前 tool_call 为粒度判断。"""
+    current = ParsedToolCall(
+        id=str(rtc.get("id") or ""),
+        name=str(rtc["name"]),
+        arguments=dict(rtc["arguments"] or {}),
+    )
+    hook_ctx = HookContext(
+        messages=ls.messages,
+        tools=ls.openai_tools,
+        node=ls.node,
+        provider=ls.provider,
+        rctx=ls.rctx,
+        step=step,
+        tool_call=current,
+        tool_calls=hook_calls,
+        extra={"real_tool_calls": real_tool_calls},
+    )
+    return current, await hook_registry.afire("before_tool_call", hook_ctx)
+
+
+def _blocked_entry(rtc: dict[str, Any], hook_result: Any) -> dict[str, Any]:
+    message = hook_result.error_message or hook_result.reason or "Tool call blocked by before_tool_call hook."
+    return {
+        "id": rtc.get("id", ""),
+        "name": rtc["name"],
+        "args": rtc["arguments"],
+        "format": "text",
+        "raw_inline": message,
+        "summary": message[:200],
+        "status": TOOL_BLOCKED,
+    }
+
+
+async def _record_tool_result(
+    ls: _LoopState,
+    rtc: dict[str, Any],
+    current_tool_call: ParsedToolCall,
+    result: Any,
+    *,
+    elapsed_ms: float,
+    step: int,
+    attachments: list[dict[str, Any]],
+) -> tuple[dict[str, Any], TaskAction | None, bool]:
+    """一个执行完的同步工具：记成败、发结束事件、收附件。返回 (结果条目, after_tool_call 给的终止动作, 是否被取消)。"""
+    name = rtc["name"]
+    args = rtc["arguments"]
+    outcome = tool_outcome(result)
+
+    # finish 硬校验靠这两份记录核对本任务里真实工具有没有成功执行过，防止编造工具结果的假成功
+    if outcome.ok:
+        ls.succeeded_real_tools.add(name)
+    else:
+        ls.failed_real_tools.add(name)
+
+    # 进度行沿用「[node] tool: summary」格式，命令、查询词这些参数只能靠 summary 带出去
+    summary = summarize_result(name, result, args=args)
+    # spec 里声明了 result_format 就按它格式化，没有才按结果结构猜
+    fmt, raw = result_to_raw(name, result, tool_spec=ls.registry.get_spec(name))
+    entry = {
+        "id": rtc.get("id", ""),
+        "name": name,
+        "args": args,
+        "format": fmt,
+        "raw_inline": raw,
+        "summary": summary,
+        "status": outcome.status,
+    }
+
+    # 工具报错或被取消也要发结构化的结束事件，断线重连的客户端靠 EventLog 还原工具卡片
+    await ls.rctx.emit_event("tool_call_end", {
+        "node_id": ls.node.id,
+        "task_id": ls.rctx.task_id,
+        "tool_call_id": rtc.get("id", ""),
+        "tool_name": name,
+        "status": outcome.status,
+        "summary": summary,
+        # 完整结果原样带上，截不截断由下游适配器决定
+        "result": result,
+        "raw_inline": raw,
+        "format": fmt,
+        "elapsed_ms": elapsed_ms,
+    })
+
+    # 已取消的工具不处理附件和进度事件
+    if outcome.status == TOOL_CANCELLED:
+        return entry, None, True
+
+    # 附件由 after_tool_call 上的 AttachmentCollector 收进 attachments 和 loop state
+    attachment_ctx = HookContext(
+        messages=ls.messages,
+        tools=ls.openai_tools,
+        node=ls.node,
+        provider=ls.provider,
+        rctx=ls.rctx,
+        step=step,
+        tool_call=current_tool_call,
+        extra={
+            "loop_state": ls,
+            "tool_result": result,
+            "tool_attachments": attachments,
+        },
+    )
+    attachment_result = await hook_registry.afire("after_tool_call", attachment_ctx)
+    if attachment_result.action is not None:
+        return entry, attachment_result.action, False
+
+    await ls.rctx.emit_event("handoff_progress", {
+        "message": f"[{ls.node.id}] {name}: {summary}",
+        "node_id": ls.node.id,
+        "task_id": ls.rctx.task_id,
+    })
+    return entry, None, False
+
+
+async def _timed_tool_call(ls: _LoopState, rtc: dict[str, Any], base_ctx: ToolContext) -> tuple[Any, float]:
+    # 每个调用一份自己的 ToolContext：并发时 tool_call_id 互不覆盖，审批卡片才对得上
+    tool_ctx = _snapshot_tool_context(base_ctx)
+    tool_ctx.tool_call_id = str(rtc.get("id") or "")
+    tool_ctx.node_id = ls.node.id
+    started = time.monotonic()
+    result = await _execute_registry_tool_with_span(ls.registry, rtc["name"], rtc["arguments"], tool_ctx)
+    return result, round((time.monotonic() - started) * 1000, 1)
+
+
+async def _gather_bounded(factories: list[Any], limit: int) -> list[Any]:
+    """最多 limit 个同时跑，结果按传入顺序返回；有一个抛错就取消其余的再往上抛。"""
+    semaphore = asyncio.Semaphore(max(1, limit))
+
+    async def bounded(factory: Any) -> Any:
+        async with semaphore:
+            return await factory()
+
+    tasks = [asyncio.create_task(bounded(factory)) for factory in factories]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+async def _emit_tool_call_start(ls: _LoopState, rtc: dict[str, Any]) -> None:
+    # 断线重连的客户端靠 EventLog 里这条结构化事件还原工具卡片
+    await ls.rctx.emit_event("tool_call_start", {
+        "node_id": ls.node.id,
+        "task_id": ls.rctx.task_id,
+        "tool_call_id": rtc.get("id", ""),
+        "tool_name": rtc["name"],
+        "arguments": rtc["arguments"],
+    })
+
+
+async def _run_parallel_group(
+    ls: _LoopState,
+    group: list[dict[str, Any]],
+    base_ctx: ToolContext,
+    hook_calls: list[ParsedToolCall],
+    real_tool_calls: list[dict[str, Any]],
+    step: int,
+    *,
+    concurrency: int,
+    attachments: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], TaskAction | None, bool]:
+    """一组连续的只读调用：hook 按顺序先全部跑完，放行的并发执行，再按原顺序记结果。
+
+    返回 (结果条目, 终止动作, 组内有没有被取消的)。
+    """
+    checked: list[tuple[dict[str, Any], ParsedToolCall, Any]] = []
+    for rtc in group:
+        current, hook_result = await _before_tool_hook(ls, rtc, hook_calls, real_tool_calls, step)
+        if hook_result.action is not None:
+            return [], hook_result.action, False
+        checked.append((rtc, current, hook_result))
+
+    runnable = [rtc for rtc, _current, hook_result in checked if not (hook_result.block or hook_result.skip_step)]
+    for rtc in runnable:
+        await _emit_tool_call_start(ls, rtc)
+    outcomes = iter(await _gather_bounded(
+        [partial(_timed_tool_call, ls, rtc, base_ctx) for rtc in runnable], concurrency,
+    ))
+
+    entries: list[dict[str, Any]] = []
+    cancelled = False
+    for rtc, current, hook_result in checked:
+        if hook_result.block or hook_result.skip_step:
+            entries.append(_blocked_entry(rtc, hook_result))
+            continue
+        result, elapsed_ms = next(outcomes)
+        entry, action, was_cancelled = await _record_tool_result(
+            ls, rtc, current, result, elapsed_ms=elapsed_ms, step=step, attachments=attachments,
+        )
+        entries.append(entry)
+        cancelled = cancelled or was_cancelled
+        if action is not None:
+            return entries, action, cancelled
+    return entries, None, cancelled
+
+
+async def _async_started_entry(
+    ls: _LoopState, rtc: dict[str, Any], *, summary: str, placeholder: str, started_at: float, progress: str,
+) -> dict[str, Any]:
+    """调用挪到后台后当轮先交的占位结果；结束事件照发，客户端看得到后台已经接手。"""
+    await ls.rctx.emit_event("tool_call_end", {
+        "node_id": ls.node.id,
+        "task_id": ls.rctx.task_id,
+        "tool_call_id": rtc.get("id", ""),
+        "tool_name": rtc["name"],
+        "status": TOOL_ASYNC_STARTED,
+        "summary": summary,
+        "result": None,
+        "raw_inline": placeholder,
+        "format": "text",
+        "elapsed_ms": round((time.monotonic() - started_at) * 1000, 1),
+    })
+    await ls.rctx.emit_event("handoff_progress", {
+        "message": f"[{ls.node.id}] {rtc['name']}: {progress}",
+        "node_id": ls.node.id,
+        "task_id": ls.rctx.task_id,
+    })
+    return {
+        "id": rtc.get("id", ""),
+        "name": rtc["name"],
+        "args": rtc["arguments"],
+        "format": "text",
+        "raw_inline": placeholder,
+        "summary": summary,
+        "status": TOOL_ASYNC_STARTED,
+    }
+
+
+async def _start_async_tool(ls: _LoopState, rtc: dict[str, Any], tool_ctx: ToolContext) -> dict[str, Any]:
+    """spec 标了 async_mode 的工具放到后台跑，结果经 async_tool_result 回传，当轮先交占位结果。"""
+    name = rtc["name"]
+    args = rtc["arguments"]
+    async_ctx = _snapshot_tool_context(tool_ctx)
+    prepare = getattr(ls.registry, "prepare", None)
+    if prepare is not None:
+        try:
+            await prepare(name=name, arguments=args, ctx=async_ctx)
+        except Exception as error:
+            message = f"工具准备失败，尚未执行：{error}"
+            ls.failed_real_tools.add(name)
+            return {
+                "id": rtc.get("id", ""), "name": name, "args": args,
+                "format": "text", "raw_inline": message,
+                "summary": message[:200], "status": TOOL_ERROR,
+            }
+    started_at = time.monotonic()
+    await _emit_tool_call_start(ls, rtc)
+    _cleanup_async_tracker()
+    async_id = uuid.uuid4().hex[:8]
+    _async_tool_tasks[async_id] = {
+        "tool_name": name,
+        "status": "running",
+        "started_at": started_at,
+        "task_id": ls.rctx.task_id,
+    }
+    _spawn_background(
+        _run_async_tool(
+            registry=ls.registry,
+            tool_name=name,
+            tool_args=args,
+            tool_ctx=async_ctx,
+            http=ls.rctx.http,
+            supervisor_url=ls.rctx.supervisor_url,
+            task_id=ls.rctx.task_id,
+            # 回传要落到 SDK 看得见的父会话，入口分支只装运行期历史
+            session_id=ls.rctx.parent_session_id or ls.rctx.session_id,
+            async_tool_id=async_id,
+            started_at=started_at,
+            node_id=ls.node.id,
+            workspace_root=ls.rctx.workspace_root,
+        ),
+        name=f"async_tool_{name}_{async_id}",
+    )
+    # 发起成功就算满足 finish_requires_tool：结果回传进的是新任务，模型在那边只需播报，不然 finish 会被反复拒绝
+    ls.succeeded_real_tools.add(name)
+    return await _async_started_entry(
+        ls, rtc,
+        summary=f"异步执行已启动 (id: {async_id})，结果将通过 preempt 自动回传",
+        placeholder=f'⏳ Async tool "{name}" started (id: {async_id}). Result will be delivered via preempt when ready.',
+        started_at=started_at,
+        progress="异步执行已启动",
+    )
+
+
+async def _execute_with_async_upgrade(
+    ls: _LoopState, rtc: dict[str, Any], tool_ctx: ToolContext, *, threshold: float, started_at: float,
+) -> tuple[Any, dict[str, Any] | None]:
+    """execute_command 照常执行、只等到阈值；到点没跑完就把还在跑的任务转后台，命令不重跑。
+
+    返回 (结果, None)；转了后台返回 (None, 占位结果条目)。命令自己的 timeout_sec 仍是硬上限。
+    """
+    name = rtc["name"]
+    args = rtc["arguments"]
+    exec_task = asyncio.create_task(
+        _execute_registry_tool_with_span(ls.registry, name, args, _snapshot_tool_context(tool_ctx)),
+        name=f"execute_command_adaptive_{str(rtc.get('id') or '')[:24] or 'call'}",
+    )
+    done, _pending = await asyncio.wait({exec_task}, timeout=float(threshold))
+    if exec_task in done:
+        return exec_task.result(), None
+    _cleanup_async_tracker()
+    async_id = uuid.uuid4().hex[:8]
+    _async_tool_tasks[async_id] = {
+        "tool_name": name,
+        "status": "running",
+        "started_at": started_at,
+        "task_id": ls.rctx.task_id,
+        "upgraded_from": "sync_timeout",
+    }
+    _spawn_background(
+        _deliver_started_async_task(
+            exec_task,
+            registry=ls.registry,
+            http=ls.rctx.http,
+            supervisor_url=ls.rctx.supervisor_url,
+            task_id=ls.rctx.task_id,
+            session_id=ls.rctx.parent_session_id or ls.rctx.session_id,
+            tool_name=name,
+            tool_args=args,
+            async_tool_id=async_id,
+            started_at=started_at,
+            node_id=ls.node.id,
+            workspace_root=ls.rctx.workspace_root,
+        ),
+        name=f"async_upgrade_{name}_{async_id}",
+    )
+    entry = await _async_started_entry(
+        ls, rtc,
+        summary=f"执行超过 {threshold:.1f}s，已自动转为异步 (id: {async_id})，结果将通过 preempt 自动回传",
+        placeholder=(
+            f'⏳ Tool "{name}" exceeded {threshold:.1f}s and was '
+            f'auto-upgraded to async (id: {async_id}). Result will be delivered via preempt when ready.'
+        ),
+        started_at=started_at,
+        progress="已自动转为异步执行",
+    )
+    return None, entry
+
+
+async def _run_sequential_call(
+    ls: _LoopState,
+    rtc: dict[str, Any],
+    tool_ctx: ToolContext,
+    hook_calls: list[ParsedToolCall],
+    real_tool_calls: list[dict[str, Any]],
+    step: int,
+    *,
+    attachments: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], TaskAction | None, bool]:
+    """顺序执行一个真工具调用：per-call hook，再按 async_mode 转后台、execute_command 自适应转异步或同步执行。
+
+    返回 (结果条目, 终止动作, 是否被取消)；hook 直接给出终止动作时没有结果条目。
+    """
+    # 顺序执行的调用共用一个 ToolContext，执行前换成这次调用的 id，审批卡片才挂得到对应的工具卡片上
+    tool_ctx.tool_call_id = str(rtc.get("id") or "")
+    tool_ctx.node_id = ls.node.id
+    current, hook_result = await _before_tool_hook(ls, rtc, hook_calls, real_tool_calls, step)
+    if hook_result.action is not None:
+        return [], hook_result.action, False
+    if hook_result.block or hook_result.skip_step:
+        return [_blocked_entry(rtc, hook_result)], None, False
+
+    spec = ls.registry.get_spec(rtc["name"])
+    if spec and spec.get("async_mode", False):
+        return [await _start_async_tool(ls, rtc, tool_ctx)], None, False
+
+    started_at = time.monotonic()
+    await _emit_tool_call_start(ls, rtc)
+    threshold = _execute_command_async_upgrade_threshold(rtc["name"], rtc["arguments"], ls.runtime_cfg)
+    if threshold is None:
+        result = await _execute_registry_tool_with_span(ls.registry, rtc["name"], rtc["arguments"], tool_ctx)
+    else:
+        result, upgraded = await _execute_with_async_upgrade(
+            ls, rtc, tool_ctx, threshold=threshold, started_at=started_at,
+        )
+        if upgraded is not None:
+            return [upgraded], None, False
+    entry, action, cancelled = await _record_tool_result(
+        ls, rtc, current, result,
+        elapsed_ms=round((time.monotonic() - started_at) * 1000, 1), step=step, attachments=attachments,
+    )
+    return [entry], action, cancelled
+
+
 async def _execute_real_tools(
     ls: _LoopState, real_tool_calls: list[dict[str, Any]], step: int,
 ) -> TaskAction | None:
-    """批量执行真实工具调用，将结果追加到 messages。"""
+    """批量执行真实工具调用，将结果追加到 messages。
+
+    连续的只读调用成组并发执行，其余一个个顺序执行；hook、事件、成败记录和结果都按模型给出的顺序。
+    """
     tool_names = [str(call.get("name") or call.get("tool_name") or "").strip() for call in real_tool_calls]
     tool_names = [name for name in tool_names if name]
     tool_names_text = "、".join(tool_names[:5])
@@ -834,7 +1388,7 @@ async def _execute_real_tools(
         "task_id": ls.rctx.task_id,
     })
 
-    # 整批共用一个实例，每次调用前在循环里刷新 tool_call_id
+    # 顺序执行的调用共用这一个实例，每次调用前刷新 tool_call_id；并发组里每个调用各拷一份
     _tool_ctx = build_tool_context(ls)
 
     _tool_entries: list[dict[str, Any]] = []
@@ -852,377 +1406,35 @@ async def _execute_real_tools(
         for _call in real_tool_calls
     ]
 
-    for _rtc in real_tool_calls:
+    _concurrency = _parallel_tools_limit(ls.runtime_cfg)
+    for _parallel, _group in _execution_groups(ls, real_tool_calls, _concurrency):
         if await ls.rctx.check_cancelled():
             break
-        _t_name = _rtc["name"]
-        _t_args = _rtc["arguments"]
-        # [AutoC 2026-05-31] Why: one ToolContext instance is reused for the whole
-        # batch, but approval guards run during each individual tool execution. How:
-        # refresh the active provider tool_call_id before hooks and registry.execute.
-        # Purpose: approvals can be merged into the exact ToolCallCard for this call.
-        _tool_ctx.tool_call_id = str(_rtc.get("id") or "")
-        _tool_ctx.node_id = ls.node.id
-
-        # Phase 3 Hook System：触发单个真实工具的 before_tool_call hook。
-        # 原因：审批类 handler 以当前 tool_call 为粒度，不能只看整轮工具列表。
-        # 做法：在实际执行工具前构造 HookContext；block/skip 时写入一个 tool_result 保持
-        # native 工具调用配对完整。目的：新增 hook 不破坏后续 LLM 消息格式。
-        _current_tool_call = ParsedToolCall(
-            id=str(_rtc.get("id") or ""),
-            name=str(_t_name),
-            arguments=dict(_t_args or {}),
-        )
-        _tool_hook_ctx = HookContext(
-            messages=ls.messages,
-            tools=ls.openai_tools,
-            node=ls.node,
-            provider=ls.provider,
-            rctx=ls.rctx,
-            step=step,
-            tool_call=_current_tool_call,
-            tool_calls=_hook_real_tool_calls,
-            extra={"real_tool_calls": real_tool_calls},
-        )
-        _tool_hook_result = await hook_registry.afire("before_tool_call", _tool_hook_ctx)
-        if _tool_hook_result.action is not None:
-            return _tool_hook_result.action
-        if _tool_hook_result.block or _tool_hook_result.skip_step:
-            _blocked_msg = (
-                _tool_hook_result.error_message
-                or _tool_hook_result.reason
-                or "Tool call blocked by before_tool_call hook."
+        if _parallel:
+            _entries, action, _cancelled = await _run_parallel_group(
+                ls, _group, _tool_ctx, _hook_real_tool_calls, real_tool_calls, step,
+                concurrency=_concurrency, attachments=_tool_atts,
             )
-            _tool_entries.append({
-                "id": _rtc.get("id", ""),
-                "name": _t_name,
-                "args": _t_args,
-                "format": "text",
-                "raw_inline": _blocked_msg,
-                "truncated": False,
-                "ref": "",
-                "summary": _blocked_msg[:200],
-            })
-            continue
-
-        # [2026-04-23] 异步工具分流：查询 spec 判断该工具是否为 async_mode。
-        # 若是，则在后台 asyncio.Task 中执行，不阻塞当前推理循环，
-        # 结果通过 preempt API 异步回传。从 commit 7d10197 恢复。
-        _spec = ls.registry.get_spec(_t_name)
-        _is_async = _spec.get("async_mode", False) if _spec else False
-
-        if _is_async:
-            _async_tool_ctx = _snapshot_tool_context(_tool_ctx)
-            prepare = getattr(ls.registry, "prepare", None)
-            if prepare is not None:
-                try:
-                    await prepare(name=_t_name, arguments=_t_args, ctx=_async_tool_ctx)
-                except Exception as error:
-                    _blocked_msg = f"工具准备失败，尚未执行：{error}"
-                    ls.failed_real_tools.add(_t_name)
-                    _tool_entries.append({
-                        "id": _rtc.get("id", ""), "name": _t_name, "args": _t_args,
-                        "format": "text", "raw_inline": _blocked_msg, "truncated": False,
-                        "ref": "", "summary": _blocked_msg[:200],
-                    })
-                    continue
-            # [WS tool result fields 2026-05-19] Why: tool_call_end now exposes
-            # elapsed_ms for both synchronous and async-started tools. How: capture
-            # a monotonic timestamp before the lifecycle start event is emitted.
-            # Purpose: downstream WebSocket consumers can show one consistent
-            # duration field without depending on SignalBus internals.
-            _tool_t0 = time.monotonic()
-            # [WS tool events 2026-05-17] Why: WebSocket clients need structured
-            # tool lifecycle events in the durable EventLog, not only localized
-            # handoff_progress text. How: emit a non-transient start event before
-            # the async tool is scheduled. Purpose: reconnecting clients can replay
-            # the tool start through the existing EventLog catch-up path.
-            await ls.rctx.emit_event("tool_call_start", {
-                "node_id": ls.node.id,
-                "task_id": ls.rctx.task_id,
-                "tool_call_id": _rtc.get("id", ""),
-                "tool_name": _t_name,
-                "arguments": _t_args,
-            })
-            _cleanup_async_tracker()
-            _async_id = uuid.uuid4().hex[:8]
-            _async_tool_tasks[_async_id] = {
-                "tool_name": _t_name,
-                "status": "running",
-                "started_at": _tool_t0,
-                "task_id": ls.rctx.task_id,
-            }
-            _spawn_background(
-                _run_async_tool(
-                    registry=ls.registry,
-                    tool_name=_t_name,
-                    tool_args=_t_args,
-                    tool_ctx=_async_tool_ctx,
-                    http=ls.rctx.http,
-                    supervisor_url=ls.rctx.supervisor_url,
-                    task_id=ls.rctx.task_id,
-                    # 回传要落到 SDK 看得见的父会话，入口分支只装运行期历史
-                    session_id=ls.rctx.parent_session_id or ls.rctx.session_id,
-                    async_tool_id=_async_id,
-                    started_at=_tool_t0,
-                    node_id=ls.node.id,
-                    workspace_root=ls.rctx.workspace_root,
-                ),
-                name=f"async_tool_{_t_name}_{_async_id}",
-            )
-            _async_summary = f"异步执行已启动 (id: {_async_id})，结果将通过 preempt 自动回传"
-            # [WS tool result fields 2026-05-19] Why: async-started calls have no
-            # final tool result yet, but clients still need the same result schema.
-            # How: define the same local variables used by the synchronous branch,
-            # with result=None and the immediate placeholder text as raw_inline.
-            # Purpose: tool_call_end consumers can parse sync and async lifecycle
-            # events without special-casing missing keys.
-            _t_result = None
-            _t_fmt = "text"
-            _t_raw_inline = f'\u23f3 Async tool "{_t_name}" started (id: {_async_id}). Result will be delivered via preempt when ready.'
-            # [2026-07-22] Why: 异步工具（如 nai_generate）成功启动后立即返回占位，
-            # 永远走不到下方同步分支的 succeeded_real_tools 登记，导致 finish_guard 的
-            # finish_requires_tool 硬校验永远判定“无成功工具”，画图节点因此陷入反复
-            # Rejected finish 死循环、回复迟迟发不出（现象：用户追问“图呢”）。
-            # How: 异步工具“成功发起”即视为满足 finish 前置——图片由工具子进程直发平台，
-            # 模型只需在结果回传后 finish 播报，不需要自己再发图。Purpose: 让异步生图
-            # 节点能正常 finish，不再空转。
-            ls.succeeded_real_tools.add(_t_name)
-            _tool_entries.append({
-                "id": _rtc.get("id", ""),
-                "name": _t_name,
-                "args": _t_args,
-                "format": _t_fmt,
-                "raw_inline": _t_raw_inline,
-                "truncated": False,
-                "ref": "",
-                "summary": _async_summary,
-            })
-            # [WS tool events 2026-05-17] Why: async tools return control before
-            # the real result exists, so clients still need a lifecycle closure for
-            # this immediate call. How: emit tool_call_end with async_started rather
-            # than success or error. Purpose: UIs can show that the background task
-            # was accepted while waiting for the later preempt-delivered result.
-            await ls.rctx.emit_event("tool_call_end", {
-                "node_id": ls.node.id,
-                "task_id": ls.rctx.task_id,
-                "tool_call_id": _rtc.get("id", ""),
-                "tool_name": _t_name,
-                "status": "async_started",
-                "summary": _async_summary,
-                "result": _t_result,
-                "raw_inline": _t_raw_inline,
-                "format": _t_fmt,
-                "elapsed_ms": round((time.monotonic() - _tool_t0) * 1000, 1),
-            })
-            await ls.rctx.emit_event("handoff_progress", {
-                "message": f"[{ls.node.id}] {_t_name}: 异步执行已启动",
-                "node_id": ls.node.id,
-                "task_id": ls.rctx.task_id,
-            })
-            continue
-
-        # ---- 同步工具：阻塞等待执行完成（原有逻辑）----
-        # [WS tool result fields 2026-05-19] Why: tool_call_end should include the
-        # tool execution duration. How: capture a monotonic start timestamp before
-        # emitting the structured start event and running the registry call. Purpose:
-        # expose elapsed_ms without changing SignalBus span behavior.
-        _tool_t0 = time.monotonic()
-        # [WS tool events 2026-05-17] Why: handoff_progress remains for legacy
-        # consumers, but the web UI needs structured lifecycle data. How: emit a
-        # durable tool_call_start immediately before the SignalBus span. Purpose:
-        # the EventLog can replay the exact tool name, call id, and arguments.
-        await ls.rctx.emit_event("tool_call_start", {
-            "node_id": ls.node.id,
-            "task_id": ls.rctx.task_id,
-            "tool_call_id": _rtc.get("id", ""),
-            "tool_name": _t_name,
-            "arguments": _t_args,
-        })
-        # Phase 2 Signal: tool.call span 包裹每个工具的执行过程。
-        # 自动发射 tool.call.start（含工具名和参数摘要）和 tool.call.end（含 elapsed_ms 和 error）。
-        # span 是同步 contextmanager，在 async 函数中直接 with 即可。
-        # [2026-07-14] execute_command 长任务自动转异步：
-        # 先照常发起 registry 执行，只等到自适应阈值；到点还没完成，则把
-        # 仍在运行的 task 转到后台，通过 async_tool_result 回传，给模型返回
-        # 「已转异步」占位结果。execute_command 自己的 timeout_sec 仍是硬 kill 上限。
-        _adaptive_threshold = _execute_command_async_upgrade_threshold(_t_name, _t_args, ls.runtime_cfg)
-        if _adaptive_threshold is not None:
-            _exec_tool_ctx = _snapshot_tool_context(_tool_ctx)
-            _exec_task = asyncio.create_task(
-                _execute_registry_tool_with_span(ls.registry, _t_name, _t_args, _exec_tool_ctx),
-                name=f"execute_command_adaptive_{str(_rtc.get('id') or '')[:24] or 'call'}",
-            )
-            _done, _pending = await asyncio.wait({_exec_task}, timeout=float(_adaptive_threshold))
-            if _exec_task not in _done:
-                _cleanup_async_tracker()
-                _async_id = uuid.uuid4().hex[:8]
-                _async_tool_tasks[_async_id] = {
-                    "tool_name": _t_name,
-                    "status": "running",
-                    "started_at": _tool_t0,
-                    "task_id": ls.rctx.task_id,
-                    "upgraded_from": "sync_timeout",
-                }
-                _spawn_background(
-                    _deliver_started_async_task(
-                        _exec_task,
-                        registry=ls.registry,
-                        http=ls.rctx.http,
-                        supervisor_url=ls.rctx.supervisor_url,
-                        task_id=ls.rctx.task_id,
-                        session_id=ls.rctx.parent_session_id or ls.rctx.session_id,
-                        tool_name=_t_name,
-                        tool_args=_t_args,
-                        async_tool_id=_async_id,
-                        started_at=_tool_t0,
-                        node_id=ls.node.id,
-                        workspace_root=ls.rctx.workspace_root,
-                    ),
-                    name=f"async_upgrade_{_t_name}_{_async_id}",
-                )
-                _async_summary = f"执行超过 {_adaptive_threshold:.1f}s，已自动转为异步 (id: {_async_id})，结果将通过 preempt 自动回传"
-                _t_result = None
-                _t_fmt = "text"
-                _t_raw_inline = (
-                    f'\u23f3 Tool "{_t_name}" exceeded {_adaptive_threshold:.1f}s and was '
-                    f'auto-upgraded to async (id: {_async_id}). Result will be delivered via preempt when ready.'
-                )
-                _t_elapsed_ms = round((time.monotonic() - _tool_t0) * 1000, 1)
-                _tool_entries.append({
-                    "id": _rtc.get("id", ""),
-                    "name": _t_name,
-                    "args": _t_args,
-                    "format": _t_fmt,
-                    "raw_inline": _t_raw_inline,
-                    "truncated": False,
-                    "ref": "",
-                    "summary": _async_summary,
-                })
-                await ls.rctx.emit_event("tool_call_end", {
-                    "node_id": ls.node.id,
-                    "task_id": ls.rctx.task_id,
-                    "tool_call_id": _rtc.get("id", ""),
-                    "tool_name": _t_name,
-                    "status": "async_started",
-                    "summary": _async_summary,
-                    "result": _t_result,
-                    "raw_inline": _t_raw_inline,
-                    "format": _t_fmt,
-                    "elapsed_ms": _t_elapsed_ms,
-                })
-                await ls.rctx.emit_event("handoff_progress", {
-                    "message": f"[{ls.node.id}] {_t_name}: 已自动转为异步执行",
-                    "node_id": ls.node.id,
-                    "task_id": ls.rctx.task_id,
-                })
-                continue
-            _t_result = _exec_task.result()
         else:
-            _t_result = await _execute_registry_tool_with_span(ls.registry, _t_name, _t_args, _tool_ctx)
-        # 被取消的工具结果照样进 _tool_entries 再 break：tool_use 不能悬空没有结果
-        _t_outcome = tool_outcome(_t_result)
-        _t_cancelled = _t_outcome.status == TOOL_CANCELLED
-
-        # finish 硬校验靠这两份记录核对本任务里真实工具有没有成功执行过，防止编造工具结果的假成功
-        if _t_outcome.ok:
-            ls.succeeded_real_tools.add(_t_name)
-        else:
-            ls.failed_real_tools.add(_t_name)
-
-        # [summary-args 2026-05-19] Why: handoff_progress keeps the legacy
-        # "[node] tool: summary" format, so argument detail must come from the
-        # summary itself. How: pass the parsed tool arguments alongside the result.
-        # Purpose: show commands, queries, and target paths without changing the
-        # event payload shape.
-        _t_summary = summarize_result(_t_name, _t_result, args=_t_args)
-        # [AutoC 2026-05-31] Why: structural result routing also supports an
-        # optional spec-level result_format override. How: read the spec from the
-        # active registry immediately after execution and pass it to result_to_raw.
-        # Purpose: keep external and built-in synchronous tool results formatted by
-        # metadata or by structure without hard-coded tool-name checks.
-        _t_spec = ls.registry.get_spec(_t_name)
-        _t_fmt, _t_raw = result_to_raw(_t_name, _t_result, tool_spec=_t_spec)
-        # [2026-04-17] 移除工具结果截断机制：不再截断、不再写 artifact，直接传完整结果。
-        _t_raw_inline = _t_raw
-
-        _tool_entries.append({
-            "id": _rtc.get("id", ""),
-            "name": _t_name,
-            "args": _t_args,
-            "format": _t_fmt,
-            "raw_inline": _t_raw_inline,
-            "truncated": False,  # [2026-04-17] 截断机制已移除，保留字段兼容 format_tool_trace
-            "ref": "",
-            "summary": _t_summary,
-        })
-
-        # 工具报错或被取消也要发结构化的结束事件，断线重连的客户端靠 EventLog 还原工具卡片
-        await ls.rctx.emit_event("tool_call_end", {
-            "node_id": ls.node.id,
-            "task_id": ls.rctx.task_id,
-            "tool_call_id": _rtc.get("id", ""),
-            "tool_name": _t_name,
-            "status": _t_outcome.status,
-            "summary": _t_summary,
-            # 完整结果原样带上，截不截断由下游适配器决定
-            "result": _t_result,
-            "raw_inline": _t_raw_inline,
-            "format": _t_fmt,
-            "elapsed_ms": round((time.monotonic() - _tool_t0) * 1000, 1),
-        })
-
-        # [硬取消-场景1] 已取消的工具结果已存入 entries（上方 append），不处理附件和进度事件，
-        # 直接退出循环。未执行的后续工具被跳过（循环顶部 check_cancelled），不产生 tool_result。
-        if _t_cancelled:
+            _entries, action, _cancelled = await _run_sequential_call(
+                ls, _group[0], _tool_ctx, _hook_real_tool_calls, real_tool_calls, step, attachments=_tool_atts,
+            )
+        _tool_entries.extend(_entries)
+        if action is not None:
+            return action
+        # 被取消的结果已经记下（tool_use 不能悬空没有结果），后面的调用不再执行，也不补结果
+        if _cancelled:
             break
 
-        # Phase 3 Hook System：工具附件收集交给 AttachmentCollector。
-        # 原因：附件收集是 after_tool_call 的副作用，不应散落在真实工具执行主体中。
-        # 做法：传入原始工具结果、局部附件列表和 loop state，由 handler 统一扩展。
-        # 目的：保持最终附件选择和多模态结果提示不变。
-        _attachment_ctx = HookContext(
-            messages=ls.messages,
-            tools=ls.openai_tools,
-            node=ls.node,
-            provider=ls.provider,
-            rctx=ls.rctx,
-            step=step,
-            tool_call=_current_tool_call,
-            extra={
-                "loop_state": ls,
-                "tool_result": _t_result,
-                "tool_attachments": _tool_atts,
-            },
-        )
-        _attachment_result = await hook_registry.afire("after_tool_call", _attachment_ctx)
-        if _attachment_result.action is not None:
-            return _attachment_result.action
-
-        # LEGACY: replaced by hook AttachmentCollector.
-        # if isinstance(_t_result, dict) and isinstance(_t_result.get("attachments"), list):
-        #     _tool_atts.extend(_t_result["attachments"])
-        #     ls.collected_attachments.extend(_t_result["attachments"])
-        #     ls.tool_produced_attachments.extend(_t_result["attachments"])
-
-        await ls.rctx.emit_event("handoff_progress", {
-            "message": f"[{ls.node.id}] {_t_name}: {_t_summary}",
-            "node_id": ls.node.id,
-            "task_id": ls.rctx.task_id,
-        })
-
     if _tool_entries:
+        _limits = tool_output_limits(ls.runtime_cfg)
+        # 和 context archive 同一个会话键：read_tool_output 按 ToolContext 的同一个键去找
+        _output_session = compact_target_session_id(ls)
         for _entry in _tool_entries:
-            _result_body = _entry["raw_inline"]
-            # [AutoC 2026-05-31] Why: MCP/tools 返回值无大小限制，几 MB 的 base64 或日志
-            # 全量塞进上下文导致 context_length_exceeded。
-            # How: 超过阈值时截断并附提示。
-            # Purpose: 防止单个 tool result 炸掉上下文。
-            _MAX_TOOL_RESULT_CHARS = 32000
-            if isinstance(_result_body, str) and len(_result_body) > _MAX_TOOL_RESULT_CHARS:
-                _original_len = len(_result_body)
-                _result_body = _result_body[:_MAX_TOOL_RESULT_CHARS] + f"\n\n...[truncated, showing {_MAX_TOOL_RESULT_CHARS:,} of {_original_len:,} chars. Use more specific parameters to get the full content.]"
-            # [2026-04-17] 截断机制已移除，不再追加 truncated 提示
+            # 超长结果的完整文本落盘，上下文里换成带 ref 的预览；tool_call_end 事件里还是原文
+            _result_body = await _context_tool_text(
+                ls.rctx.workspace_root, _output_session, str(_entry["name"]), _entry["raw_inline"], _limits,
+            )
             # [2026-05-01] 真实工具结果统一走 formatter.format_tool_result。
             # 原因：真 native 需要 role=tool + tool_call_id，而旧代码在这里手写 user 文本，
             # 会绕过新 NativeToolFormatter。fake-native/json 仍由各自 formatter 生成旧文本。
@@ -1237,6 +1449,7 @@ async def _execute_real_tools(
             set_message_meta(_tool_msg, MessageMeta(
                 tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
                 message_type="tool_result",
+                tool_status=str(_entry.get("status") or ""),
             ))
             ls.messages.append(_tool_msg)
             # Phase 1: 影子写入 tool_result 消息到 ConversationStore
@@ -1247,11 +1460,16 @@ async def _execute_real_tools(
             # from ConversationStore. How: keep the exact multimodal message in
             # a variable, append it, then shadow-write it. Purpose: persist tool
             # image results across task boundaries without changing prompt text.
-            _tool_att_msg = {"role": "user", "content": build_multimodal_content(
-                "以上工具执行产生了以下图片结果：", _tool_atts, workspace_root=ls.rctx.workspace_root,
-            )}
+            _tool_att_msg = {
+                "role": "user",
+                "content": build_multimodal_content(
+                    "以上工具执行产生了以下图片结果：", _tool_atts, workspace_root=ls.rctx.workspace_root,
+                ),
+                # 运行期也要认得出这不是新的用户输入：重复调用检测按它决定要不要接着往前数
+                "_meta": {"message_type": TOOL_RESULT_ATTACHMENT_TYPE},
+            }
             ls.messages.append(_tool_att_msg)
-            _shadow_write(ls, _tool_att_msg, message_type="tool_result_attachment")
+            _shadow_write(ls, _tool_att_msg, message_type=TOOL_RESULT_ATTACHMENT_TYPE)
 
     # 一批工具结果在下一次推理前落盘，进程这时候挂了下一个 worker 恢复也看得到这批结果
     await flush_conversation_writes(ls.rctx)
@@ -1397,6 +1615,74 @@ def _handle_plaintext_response(ls: _LoopState, resp, step: int) -> TaskAction | 
         context_ref=ctx_ref,
         summary=_short(text, 240),
     )
+
+
+def _append_final_step_hint(ls: _LoopState, step: int, max_steps: int) -> None:
+    # 只在运行期存在：发给模型，不落盘
+    ls.messages.append({
+        "role": "user",
+        "content": _FINAL_STEP_HINT.format(used=step, total=max_steps),
+        "_retry_hint": True,
+    })
+
+
+def _tool_spec_name(tool: Any) -> str:
+    if not isinstance(tool, dict):
+        return ""
+    function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+    return str(function.get("name") or tool.get("name") or "")
+
+
+def _finish_only_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [tool for tool in tools or [] if _tool_spec_name(tool) == "finish"]
+
+
+def _step_limit_summary(ls: _LoopState) -> str:
+    """模型最后一步什么也没交代时，按本任务调用过的工具说明做到了哪。"""
+    names = [
+        str(entry.get("name") or "")
+        for entry in getattr(ls.rctx, "tool_call_log", None) or []
+        if isinstance(entry, dict) and entry.get("name")
+    ]
+    if not names:
+        return ""
+    counts = Counter(names)
+    used = "、".join(f"{name} ×{count}" if count > 1 else name for name, count in counts.items())
+    return f"任务还没有完成。已经执行过的工具：{used}。剩下的部分尚未完成，需要继续处理。"
+
+
+def _step_limit_finish(ls: _LoopState, text: str, step: int, *, notice: bool, truncated: bool = False) -> TaskAction:
+    """把收尾文本当隐式 finish 交付，result 里打上 step_limit_reached。"""
+    body = f"{text}\n\n{STEP_LIMIT_NOTICE}" if notice else text
+    # response 传 None：json 模式的 assistant 消息才会存这里拼好的文本，而不是从原响应里重新取
+    action = build_implicit_finish(ls, None, body, step=step, truncated=truncated)
+    action.result = {**(action.result or {}), "step_limit_reached": True}
+    return action
+
+
+def _step_limit_wrapup(
+    ls: _LoopState, step: int, *, text: str, notice: bool, truncated: bool = False,
+) -> TaskAction | None:
+    """最后一步模型没有用 finish 收尾时怎么结束：有正文交付正文，没有就按 tool_call_log 交代做过什么。
+
+    notice 为真时正文末尾注明已达到最大步数；按调用记录生成的说明总是注明。
+    正文和调用记录都拿不到时返回 None，走原来的 FAIL。
+    """
+    if ls.preempt_after_step:
+        return TaskAction(
+            action=ACTION_PREEMPTED, node_id=ls.node.id,
+            context_ref=_persist_ctx(ls, step + 1), summary="任务被软打断，上下文已保存。",
+        )
+    # 带消息的抢占要到下一步才注入，最后一步之后没有下一步了：维持原来的结束方式
+    if ls.preempt_inject_info is not None:
+        return None
+    body = (text or "").strip()
+    if not body:
+        body, notice, truncated = _step_limit_summary(ls), True, False
+    if not body:
+        return None
+    logger.warning("node %s reached max_steps without finish; delivering a wrap-up (step=%d)", ls.node.id, step)
+    return _step_limit_finish(ls, body, step, notice=notice, truncated=truncated)
 
 
 # ---------------------------------------------------------------------------
@@ -1639,7 +1925,7 @@ async def run_ai_node(
 
     # ---- 追加恢复消息 ----
     if resume_data:
-        resumed_messages = _build_resume_messages(resume_data)
+        resumed_messages = _build_resume_messages(await _resume_data_for_context(resume_data, rctx, runtime_cfg))
         for message in resumed_messages:
             message.setdefault("_meta", {}).update({**route_meta, "source_task_id": rctx.task_id})
         messages.extend(resumed_messages)
@@ -1659,15 +1945,21 @@ async def run_ai_node(
             await rctx.emit_event("compact_done", _cd_payload)
 
     if instruction:
+        _instruction_meta = {**route_meta, "source_task_id": rctx.task_id}
+        # 异步工具结果回传进来的这条输入也是工具结果，和 runner 落盘的那份记同一个执行状态
+        _async_tool_status = async_result_tool_status(rctx.task_context)
+        if _async_tool_status:
+            _instruction_meta["tool_status"] = _async_tool_status
         for message in reversed(messages):
             if message.get("role") == "user" and not message.get("_dynamic"):
                 content = message.get("content")
                 if content == instruction or isinstance(content, list):
-                    message.setdefault("_meta", {}).update({**route_meta, "source_task_id": rctx.task_id})
+                    message.setdefault("_meta", {}).update(_instruction_meta)
                     break
 
     # ---- 构建工具列表 ----
-    tool_specs = _filter_tool_specs(node, registry.list_specs())
+    _registry_specs = registry.list_specs()
+    tool_specs = _filter_tool_specs(node, _registry_specs)
     # 跑不通的生图工具（gpt_image_2 / gemini_image）从可用工具列表里彻底移除，
     # 杜绝「未配置却被误调用、调完 404」。
     try:
@@ -1681,6 +1973,11 @@ async def run_ai_node(
                 logger.info("image_gen_gating: removed unconfigured image tools %s (node=%s)", sorted(_removed), node.id)
     except Exception as _exc:  # noqa: BLE001
         logger.warning("image_gen_gating tool filter skipped: %s", _exc)
+    # 超长输出的 ref 只能用 read_tool_output 读回；它只读本会话自己的产物，不受 tool_access 限制，没有真工具的节点不加
+    if tool_specs and not any(s.get("name") == READ_TOOL_OUTPUT for s in tool_specs):
+        _reader_spec = next((s for s in _registry_specs if s.get("name") == READ_TOOL_OUTPUT), None)
+        if _reader_spec is not None:
+            tool_specs.append(_reader_spec)
     _allowed_real_tools = {s.get("name") for s in tool_specs if s.get("name")}
     openai_tools = _to_openai_tools(tool_specs) if tool_specs else []
 
@@ -1783,6 +2080,9 @@ async def run_ai_node(
         resume_data=resume_data if isinstance(resume_data, dict) else None,
     )
 
+    # 步数太少的节点（含简短回应）和系统任务不做收尾，维持原逻辑
+    _wrapup_enabled = not _is_system_task and max_steps >= 3
+
     # ---- 推理循环 ----
     for step in range(step_count, max_steps):
         # Phase 3 Hook System：循环顶部统一触发 before_step。
@@ -1812,7 +2112,18 @@ async def run_ai_node(
         # Purpose: avoid knowledge injection imports in this loop while keeping the
         # migrated execution order visible.
 
-        result = await _call_llm_with_retry(ls, step)
+        _final_step = _wrapup_enabled and step == max_steps - 1
+        _step_tools = ls.openai_tools
+        if _final_step:
+            _append_final_step_hint(ls, step, max_steps)
+            # json / fake-native 只靠提示；native 这一步只给 finish
+            if formatter.mode == "native":
+                _step_tools = _finish_only_tools(ls.openai_tools) or ls.openai_tools
+        _full_tools, ls.openai_tools = ls.openai_tools, _step_tools
+        try:
+            result = await _call_llm_with_retry(ls, step)
+        finally:
+            ls.openai_tools = _full_tools
         if isinstance(result, TaskAction):
             return result
         # ---------------------------------------------------------------
@@ -1835,7 +2146,8 @@ async def run_ai_node(
         # 用量统计不变，同时从 ai_step.py 中抽出 bookkeeping。
         _usage_ctx = HookContext(
             messages=ls.messages,
-            tools=ls.openai_tools,
+            # 备用渠道按这份 tools 重发：最后一步得和主渠道一样只给 finish
+            tools=_step_tools,
             node=ls.node,
             provider=ls.provider,
             rctx=ls.rctx,
@@ -1895,13 +2207,26 @@ async def run_ai_node(
                     resp = with_changes(resp, text=_stripped)
 
         if resp.tool_calls:
-            action = await _handle_tool_calls(ls, resp, step)
+            action = await _handle_tool_calls(ls, resp, step, final_step=_final_step)
+            if action is None and _final_step:
+                # 整轮被 hook 拦下时（比如 finish 声称成功却没真调过工具），这一轮的正文不能当结论交付
+                action = _step_limit_wrapup(
+                    ls, step, text="" if ls.last_round_blocked else (resp.text or ""), notice=True,
+                )
             if action is not None:
                 return await _fire_task_end_hook_if_finish(ls, action, step + 1)
             if is_truncated(resp):
                 # 截断点之后的调用已经丢了，告诉模型这轮没说完
                 _append_truncation_hint(ls)
             continue
+
+        # 最后一步回了纯文本：没有下一步可以重试了，直接按隐式 finish 交付
+        if _final_step:
+            action = _step_limit_wrapup(
+                ls, step, text=resp.text or "", notice=False, truncated=is_truncated(resp),
+            )
+            if action is not None:
+                return await _fire_task_end_hook_if_finish(ls, action, step + 1)
 
         if is_truncated(resp):
             action = _handle_truncated_response(ls, resp, step)

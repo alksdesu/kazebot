@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterator, Literal
 
 import config_layout
-from clonoth_runtime import get_float, load_runtime_config
+from clonoth_runtime import get_float, load_runtime_config, parse_bool
 
 from . import builtins as _builtins
 from ._common import ProcessOutcome, run_process
@@ -891,6 +891,10 @@ class ToolRegistry:
             result_format = spec.get("result_format")
             if isinstance(result_format, str) and result_format.strip():
                 registered_spec["result_format"] = result_format.strip()
+            # engine 按这两个键决定同轮能不能并发、连续几轮同参数调用算不算空转
+            for flag in ("parallel_safe", "repeatable"):
+                if parse_bool(spec.get(flag), False):
+                    registered_spec[flag] = True
             self._tool_specs[name] = registered_spec
             guard = spec.get("guard")
             self._tool_funcs[name] = _make_script_tool(

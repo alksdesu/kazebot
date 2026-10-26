@@ -173,11 +173,13 @@ class SessionMixin:
         """
         from engine.context_archive import ContextArchiveStore
         from engine.conversation_store import ConversationStore
+        from engine.tool_outputs import ToolOutputStore
 
         sid = str(session_id or "").strip()
         if not sid:
             return
         ContextArchiveStore(self.workspace_root).purge_session(sid)
+        ToolOutputStore(self.workspace_root).purge_session(sid)
         # 走 ConversationStore.delete：它同时清掉本进程的内存缓存。
         ConversationStore(self.workspace_root / "data" / "conversations").delete(sid)
         for path in self.session_runtime_files(sid)[1:]:

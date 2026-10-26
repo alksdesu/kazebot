@@ -113,7 +113,7 @@ prompt: |
 
   ## 工具调用规则（严格遵守）
 
-  - **finish 必须单独调用**：finish 严禁与 save_memory、delete_memory、create_or_update_skill 或任何其他工具在同一轮次中调用。违反此规则会导致整轮操作被系统拒绝。
+  - **finish 必须单独调用**：finish 严禁与 save_memory、delete_memory、create_or_update_skill 或任何其他工具在同一轮次中调用。违反此规则时同轮的其它工具照常执行，但 finish 会被系统拒绝、任务不会结束，只能看完结果后再单独调用一次。
   - **正确流程**：先调用所有 save_memory/delete_memory 操作 → 等待全部返回 ok → 在下一轮单独调用 finish。
   - **输出格式**：只输出工具调用，不要输出 <analysis> 等标签或其他非工具文本。
 

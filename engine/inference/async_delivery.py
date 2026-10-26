@@ -14,6 +14,8 @@ from typing import Any
 
 from file_lock import try_exclusive_lock
 
+from ..tool_step import TOOL_ERROR, TOOL_SUCCESS
+
 logger = logging.getLogger(__name__)
 
 _RETRY_DELAYS_SEC = (1.0, 4.0, 15.0)
@@ -50,6 +52,18 @@ def build_async_result_payload(
     if attachments:
         payload["attachment_paths"] = list(attachments)
     return payload
+
+
+def async_result_tool_status(task_context: Any) -> str:
+    """回传的异步结果在新一轮里是一条输入消息，它的 tool_status；不是异步结果回传的任务返回空串。
+
+    supervisor 只把请求体里的 success 换成 route_hints.async_tool_success 带过来，取消和报错分不开，都记 error。
+    """
+    hints = task_context.get("route_hints") if isinstance(task_context, dict) else None
+    success = hints.get("async_tool_success") if isinstance(hints, dict) else None
+    if not isinstance(success, bool):
+        return ""
+    return TOOL_SUCCESS if success else TOOL_ERROR
 
 
 def outbox_dir(workspace_root: Path | str) -> Path:

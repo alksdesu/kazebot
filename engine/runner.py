@@ -35,7 +35,7 @@ from .attachments import build_multimodal_content, payload_attachments, screen_a
 from .context import RunContext, TaskLease
 from .model import resolve_provider
 from .context_store import load_context_snapshot
-from .inference.async_delivery import flush_async_result_outbox
+from .inference.async_delivery import async_result_tool_status, flush_async_result_outbox
 from .inference.loop_state import conversation_writer, flush_conversation_writes
 from .inference.pseudo_tools import tool_allowed
 from .inference.tool_format import sanitize_control_tool_history
@@ -1230,6 +1230,9 @@ async def _run_node_task(
             _inbound_meta["child_node_id"] = _inbound_node_id
         if _inbound_caller_node_id:
             _inbound_meta["caller_node_id"] = _inbound_caller_node_id
+        _async_tool_status = async_result_tool_status(rctx.task_context)
+        if _async_tool_status:
+            _inbound_meta["tool_status"] = _async_tool_status
         _user_msg = Message(
             id=str(uuid.uuid4()),
             role="user",

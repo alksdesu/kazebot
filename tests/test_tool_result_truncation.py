@@ -158,14 +158,11 @@ def test_read_file_explicit_range_is_not_auto_truncated(tmp_path: Path) -> None:
     assert "line-555" in entry["content"]
 
 
-def test_execute_real_tools_truncates_large_string_result_for_messages_and_store(tmp_path: Path, monkeypatch: Any) -> None:
-    """String tool results over 32,000 chars should be clipped before message storage."""
+def test_execute_real_tools_spills_large_string_result_and_keeps_a_preview(tmp_path: Path, monkeypatch: Any) -> None:
+    """超过阈值的字符串结果完整落盘，内存消息和对话存储里是同一份带 ref 的预览。"""
     monkeypatch.setattr(ai_step_module, "hook_registry", HookRegistry())
-    # [AutoC 2026-05-31] Why: result_to_raw now accepts optional tool_spec in
-    # production. How: keep this monkeypatch compatible with the expanded
-    # signature. Purpose: this truncation test remains focused on message storage,
-    # not formatter routing.
-    monkeypatch.setattr(ai_step_module, "result_to_raw", lambda tool_name, result, **kwargs: ("text", "x" * 33010))
+    full_text = "\n".join(f"line-{index:05d} " + "x" * 40 for index in range(1, 701))
+    monkeypatch.setattr(ai_step_module, "result_to_raw", lambda tool_name, result, **kwargs: ("text", full_text))
 
     async def _run() -> tuple[str, str]:
         ls, http, store = await _make_loop_state(tmp_path)
@@ -178,14 +175,17 @@ def test_execute_real_tools_truncates_large_string_result_for_messages_and_store
 
     message_content, stored_content = asyncio.run(_run())
 
-    # Why: the truncation point must feed both the formatter and shadow JSONL writer.
-    # How: compare the in-memory tool message with the ConversationStore content.
-    # Purpose: prevent a hidden full-size result from still being persisted.
+    assert len(full_text) > 32000
     assert message_content == stored_content
-    assert message_content.startswith("x" * 32000)
-    assert "...[truncated, showing 32,000 of 33,010 chars." in message_content
-    assert "Use more specific parameters" in message_content
-    assert len(message_content) < 33010
+    ref = message_content.split("ref=", 1)[1][:27]
+    saved = list((tmp_path / "data" / "tool_outputs").glob(f"*/{ref}.txt"))
+    assert len(saved) == 1
+    assert saved[0].read_text(encoding="utf-8") == full_text
+    # 请求视图只给最近一轮的工具结果留 8000 字，ref 写在第一行，较早的结果被截到只剩开头也还在
+    assert len(message_content) <= 8000
+    assert ref in message_content.splitlines()[0]
+    assert "line-00001" in message_content and "line-00700" in message_content
+    assert "read_tool_output" in message_content.splitlines()[-1]
 
 
 def test_execute_real_tools_does_not_truncate_non_string_result_body(tmp_path: Path, monkeypatch: Any) -> None:

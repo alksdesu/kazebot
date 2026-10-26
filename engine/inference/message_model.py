@@ -57,6 +57,8 @@ class MessageMeta:
     # 目的：存储层、快照层、L2 历史构造层可以一致跳过这类临时协议配对消息。
     control_tool_name: str = ""
     control_tool_status: str = ""
+    # 真工具结果的执行状态：success / error / cancelled / blocked / async_started；异步结果回传进来的那条输入只有 success / error
+    tool_status: str = ""
 
     # ── 提取层（bot/前端可读）──
     # [refactor 2026-04-18] thinking_text → reasoning, has_thinking → has_reasoning
@@ -101,6 +103,8 @@ class MessageMeta:
             d["control_tool_name"] = self.control_tool_name
         if self.control_tool_status:
             d["control_tool_status"] = self.control_tool_status
+        if self.tool_status:
+            d["tool_status"] = self.tool_status
         if self.reasoning:
             d["reasoning"] = self.reasoning
         if self.has_reasoning:
@@ -151,6 +155,7 @@ class MessageMeta:
             tool_call_ids=list(data.get("tool_call_ids") or []),
             control_tool_name=str(data.get("control_tool_name") or ""),
             control_tool_status=str(data.get("control_tool_status") or ""),
+            tool_status=str(data.get("tool_status") or ""),
             reasoning=reasoning,
             has_reasoning=has_reasoning,
             inline_data=list(data.get("inline_data") or []),

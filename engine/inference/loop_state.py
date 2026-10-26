@@ -25,6 +25,13 @@ if TYPE_CHECKING:
 #  辅助函数
 # ---------------------------------------------------------------------------
 
+# 终止型伪工具：同一轮里放到真工具之后执行，执行后任务结束
+TERMINAL_TOOLS = frozenset({"finish", "ask"})
+
+# 工具产出图片时补的那条 user 消息；运行期 _meta 和落盘 message_type 用同一个值，按它认出这不是新的用户输入
+TOOL_RESULT_ATTACHMENT_TYPE = "tool_result_attachment"
+
+
 def _short(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + "...<truncated>"
 
@@ -156,6 +163,9 @@ class _LoopState:
     succeeded_real_tools: set = field(default_factory=set)
     failed_real_tools: set = field(default_factory=set)
 
+    # 最近一轮工具调用被 before_tool_call 整轮拦下：步数用完收尾时，这一轮的正文不能当结论交付
+    last_round_blocked: bool = False
+
     # ---- Phase 3 (Session Conversation Store): 最近一次 shadow write 的 Message.id ----
     # 由 _shadow_write() 更新，_persist_ctx() 写入 snapshot 的 last_message_id 字段，
     # 为后续 snapshot 瘦身（不再存完整 messages 数组）做准备。
@@ -190,10 +200,18 @@ def compact_target_session_id(ls: _LoopState) -> str:
     自动压缩、手动 compact_context、L2 snip 必须用同一个答案 —— 少一处就会把子节点
     的摘要写进父会话，把父会话历史整段换成「子节点干了什么」。
     """
-    child_sid = str(getattr(ls.rctx, "child_session_id", "") or "").strip()
+    return context_archive_session_id(ls.rctx)
+
+
+def context_archive_session_id(rctx: Any) -> str:
+    """compact_target_session_id 的同一个答案，只要 RunContext：循环状态还没建起来的地方也要用它。
+
+    context archive、超长工具输出落盘和 read_tool_output 都按这个会话键存取。
+    """
+    child_sid = str(getattr(rctx, "child_session_id", "") or "").strip()
     if child_sid:
         return child_sid
-    return str(getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id or "").strip()
+    return str(getattr(rctx, "parent_session_id", "") or getattr(rctx, "session_id", "") or "").strip()
 
 
 # ToolContext 之外挂在实例上的节点级属性；后台快照要照这份清单一起复制

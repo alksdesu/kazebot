@@ -257,6 +257,18 @@ class TestTheRegistry:
 
         assert registry.get_spec("own") is not None
 
+    def test_engine_scheduling_flags_reach_the_registered_spec(self, ws: Path, bundled: Path) -> None:
+        # engine 按 parallel_safe 决定同轮能不能并发，按 repeatable 决定轮询类工具算不算空转
+        _write(config_layout.custom_tools_dir(ws) / "poll.py", _spec("poll", parallel_safe=True, repeatable="yes"))
+        _write(config_layout.custom_tools_dir(ws) / "plain.py", _spec("plain", parallel_safe=False))
+
+        registry = ToolRegistry(workspace_root=ws, tools_dir=bundled)
+
+        assert registry.get_spec("poll")["parallel_safe"] is True
+        assert registry.get_spec("poll")["repeatable"] is True
+        assert "parallel_safe" not in registry.get_spec("plain")
+        assert "repeatable" not in registry.get_spec("plain")
+
 
 class TestMcpToolsSurviveAScriptReload:
     def _clients(self, monkeypatch: pytest.MonkeyPatch, *ids: str) -> None:

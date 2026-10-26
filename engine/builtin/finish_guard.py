@@ -8,15 +8,14 @@ from typing import Any
 # How: return a local HookResult-compatible shape instead. Purpose: avoid
 # cycles while keeping the existing hook registry duck-typed.
 from .result import hook_result
+from engine.inference.loop_state import TERMINAL_TOOLS
 from engine.inference.resume_builder import resume_outcome
 from engine.node import known_node_ids
 
 logger = logging.getLogger(__name__)
 
-_REJECT_MESSAGE_TEMPLATE = (
-    "\u274c REJECTED: {tool}() cannot be called alongside other tools "
-    "(except reply). Execute your other tools first, wait for their "
-    "results, then call {tool}() alone in a separate turn."
+_COLOCATED_MESSAGE_TEMPLATE = (
+    "{tool} 没有执行：同一轮还有其它工具调用。先看这些工具的结果，再单独调用 {tool}。"
 )
 
 # [AutoC 2026-07-11] finish 硬校验拒绝文案。Why: 绘图/媒体节点的模型会“伪造
@@ -53,89 +52,52 @@ PLUGIN_META = {
 
 
 class FinishGuardHandler:
-    """Reject terminal finish()/ask() when colocated with non-reply tool calls."""
+    """finish()/ask() 和其它工具同轮时只拒终止调用；finish 单独出现时做读图失败与 finish_requires_tool 校验。"""
 
     name = "finish_guard"
     priority = 100
 
     async def handle(self, ctx: Any) -> Any | None:
-        """Apply the terminal finish/ask colocation guard.
-
-        Why: finish and ask terminate the task, so other same-turn tool results
-        would never be read by the model. How: prefer ai_step's already-filtered
-        legacy pseudo/real call lists when present, and otherwise fall back to raw
-        ctx.tool_calls for isolated tests. Purpose: move the guard out of
-        ai_step.py while applying the same protection to the Phase 0 ask tool.
+        """同轮还有别的工具时不拦整轮：被拒的终止调用连同原因放进 extra["rejected_terminal_calls"]，
+        由 ai_step 给它们写错误结果，其它调用照常执行。
         """
-        terminal_tools = {"finish", "ask"}
-        pseudo_calls = ctx.extra.get("pseudo_calls")
-        real_tool_calls = ctx.extra.get("real_tool_calls")
-
-        if pseudo_calls is not None or real_tool_calls is not None:
-            pseudo_list = list(pseudo_calls or [])
-            real_list = list(real_tool_calls or [])
-            terminal_call = next(
-                (call for call in pseudo_list if _tool_name(call) in terminal_tools),
-                None,
-            )
-            terminal_name = _tool_name(terminal_call) if terminal_call is not None else ""
-            has_terminal = bool(terminal_name)
-            has_non_reply_others = bool(real_list) or any(
-                _tool_name(call) not in (*terminal_tools, "reply") for call in pseudo_list
-            )
-        else:
-            calls = list(ctx.tool_calls or [])
-            terminal_call = next(
-                (call for call in calls if _tool_name(call) in terminal_tools),
-                None,
-            )
-            terminal_name = _tool_name(terminal_call) if terminal_call is not None else ""
-            has_terminal = bool(terminal_name)
-            has_non_reply_others = any(
-                _tool_name(call) not in (*terminal_tools, "reply") for call in calls
-            )
-
-        # [AutoC 2026-07-11] finish 硬校验：若节点声明 finish_requires_tool，且本轮
-        # 调用了终止工具（finish），则校验本任务内是否真正成功执行过要求的工具。
-        # 只对 finish 生效（ask 不受限，因为 ask 是向用户提问而非声称完成）。
-        _finish_terminal = terminal_name if 'terminal_name' in dir() else ""
-        if _finish_terminal == "finish":
-            if _has_unresolved_vision_failure_for_context(ctx):
-                finish_text = _finish_text(terminal_call)
-                if not _is_honest_vision_failure_text(finish_text):
-                    logger.warning(
-                        "Rejected ungrounded finish after vision failure (node=%s, step=%d)",
-                        getattr(ctx.node, "id", ""),
-                        ctx.step,
-                    )
-                    return hook_result(
-                        block=True,
-                        reason="vision_failure_ungrounded_finish",
-                        error_message=_VISION_FAILURE_REJECT_MESSAGE,
-                    )
-            _require_reject = self._check_finish_requires_tool(ctx)
-            if _require_reject is not None:
-                return _require_reject
-
-        if not (has_terminal and has_non_reply_others):
+        if getattr(ctx, "tool_call", None) is not None:
+            return None
+        terminal_calls, has_others = _terminal_calls(ctx)
+        if not terminal_calls:
             return None
 
-        # [AutoC 2026-05-31] Why: ask is terminal like finish, so the same
-        # colocated-tool rejection must name the offending terminal tool. How: use
-        # a shared template populated from the detected pseudo call. Purpose: keep
-        # model-facing retry guidance precise for both finish and ask.
-        logger.warning(
-            "Rejected %s + other tools in same turn (node=%s, step=%d, tools=%s)",
-            terminal_name or "terminal",
-            getattr(ctx.node, "id", ""),
-            ctx.step,
-            [_tool_name(call) for call in (ctx.tool_calls or [])],
-        )
-        return hook_result(
-            block=True,
-            reason=f"{terminal_name or 'terminal'}_colocated",
-            error_message=_REJECT_MESSAGE_TEMPLATE.format(tool=terminal_name or "finish"),
-        )
+        if has_others:
+            rejected = ctx.extra.setdefault("rejected_terminal_calls", [])
+            for call in terminal_calls:
+                rejected.append((call, _COLOCATED_MESSAGE_TEMPLATE.format(tool=_tool_name(call))))
+            logger.warning(
+                "Rejected %s alongside other tools; the other tools still run (node=%s, step=%s, tools=%s)",
+                [_tool_name(call) for call in terminal_calls],
+                getattr(getattr(ctx, "node", None), "id", ""),
+                getattr(ctx, "step", -1),
+                [_tool_name(call) for call in (getattr(ctx, "tool_calls", None) or [])],
+            )
+            return hook_result(modified=True)
+
+        # 同轮有多个终止调用时 ai_step 执行最后一个，校验也看那一个；ask 是提问不是声称完成，不校验
+        terminal_call = terminal_calls[-1]
+        if _tool_name(terminal_call) != "finish":
+            return None
+        if _has_unresolved_vision_failure_for_context(ctx):
+            finish_text = _finish_text(terminal_call)
+            if not _is_honest_vision_failure_text(finish_text):
+                logger.warning(
+                    "Rejected ungrounded finish after vision failure (node=%s, step=%s)",
+                    getattr(getattr(ctx, "node", None), "id", ""),
+                    getattr(ctx, "step", -1),
+                )
+                return hook_result(
+                    block=True,
+                    reason="vision_failure_ungrounded_finish",
+                    error_message=_VISION_FAILURE_REJECT_MESSAGE,
+                )
+        return self._check_finish_requires_tool(ctx)
 
     def _check_finish_requires_tool(self, ctx: Any) -> Any | None:
         """Reject a finish() that claims success without a real successful tool call.
@@ -340,6 +302,28 @@ def _has_unresolved_vision_failure(messages: Any, *, vision_nodes: frozenset[str
         if str(message.get("role") or "") == "user":
             return False
     return False
+
+
+def _terminal_calls(ctx: Any) -> tuple[list[Any], bool]:
+    """(本轮的 finish/ask 调用, 同轮有没有 reply 之外的其它调用)。
+
+    优先用 ai_step 已经分好类的伪工具/真工具列表（不含参数非法、未授权这些不会执行的调用），
+    单独测 handler 时退回 ctx.tool_calls。
+    """
+    extra = ctx.extra if isinstance(getattr(ctx, "extra", None), dict) else {}
+    pseudo_calls = extra.get("pseudo_calls")
+    real_tool_calls = extra.get("real_tool_calls")
+    if pseudo_calls is not None or real_tool_calls is not None:
+        pseudo_list = list(pseudo_calls or [])
+        terminals = [call for call in pseudo_list if _tool_name(call) in TERMINAL_TOOLS]
+        has_others = bool(list(real_tool_calls or [])) or any(
+            _tool_name(call) not in (*TERMINAL_TOOLS, "reply") for call in pseudo_list
+        )
+        return terminals, has_others
+    calls = list(getattr(ctx, "tool_calls", None) or [])
+    terminals = [call for call in calls if _tool_name(call) in TERMINAL_TOOLS]
+    has_others = any(_tool_name(call) not in (*TERMINAL_TOOLS, "reply") for call in calls)
+    return terminals, has_others
 
 
 def _finish_text(call: Any) -> str:

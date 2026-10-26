@@ -64,6 +64,18 @@ engine:
   output_mode: tool_only            # tool_only = 纯文本回复打回重试；hybrid = 纯文本直接投递给用户。节点 yaml 可覆盖
   plaintext_retry_max: 3            # tool_only 下模型回纯文本时最多重试几次（0-10），用完按隐式 finish 投递
 
+  # 单条工具结果超长时，完整内容存进 data/tool_outputs/，上下文里只放开头和结尾，模型用 read_tool_output 按 ref 读回
+  tool_output:
+    max_inline_chars: 32000         # 超过这个字数就落盘（2000-2000000）
+    view_chars: 8000                # 预览和 read_tool_output 每次返回的字数上限（1000-8000，且不超过 max_inline_chars；发给模型的最近一轮工具结果最多留 8000 字）
+    retention_days: 7               # 落盘的输出保留几天，过期由 data_cleanup 清掉
+
+  parallel_tools:
+    max_concurrency: 8              # 同一轮里连着的只读工具最多同时跑几个（1-64）；1 = 全部顺序执行
+
+  doom_loop:
+    threshold: 3                    # 连续几轮用完全相同的参数调用同一组工具就拦下这一轮（2-50）；0 = 关闭
+
 # 每个渠道发给模型的请求参数。options 下的键名由 provider 类自己声明，
 # 控制台「模型」页照那份清单渲染；节点 yaml 的 provider_options 会盖掉这里。
 providers:
