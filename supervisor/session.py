@@ -1103,21 +1103,66 @@ class SessionMixin:
     # ---- 上下文窗口用量 ----
 
     def update_context_usage(self, session_id: str, payload: dict[str, Any]) -> None:
-        """更新 session 的上下文窗口用量（由 engine 上报）。"""
+        """更新 session 的上下文窗口用量（由 engine 上报）。
+
+        入口分支、子节点和系统任务的用量都发到路由会话上：展示用的这几项照旧取最近一次，
+        校准字/token 比只认事件里 conversation_session_id 指明的那段对话自己的请求。
+        子节点的对话记在它自己的会话名下，没登记过的会话不记。
+        """
+        from .context_calibration import usage_calibration
+
         usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
         if not session_id or not usage:
             return
+        calibration = usage_calibration(usage, payload)
         with self._lock:
-            self._session_context_usage[session_id] = {
-                "prompt_tokens": usage.get("prompt_tokens"),
-                "completion_tokens": usage.get("completion_tokens"),
-                "total_tokens": usage.get("total_tokens"),
-                # 与 prompt_tokens 同一批消息的字符数，用来校准压缩时的字符/token 比。
-                "prompt_chars": payload.get("prompt_chars"),
-                "node_id": str(payload.get("node_id") or ""),
-                "task_id": str(payload.get("task_id") or ""),
-                "updated_at": _now().isoformat(),
-            }
+            entry = self._context_usage_entry(usage, payload)
+            previous = self._session_context_usage.get(session_id)
+            kept = previous.get("calibration") if isinstance(previous, dict) else None
+            conversation = self._usage_conversation_locked(session_id, payload)
+            if calibration is not None and conversation == session_id:
+                kept = calibration
+            elif calibration is not None and conversation:
+                own = self._context_usage_entry(usage, payload)
+                own["calibration"] = calibration
+                self._session_context_usage[conversation] = own
+            if kept is not None:
+                entry["calibration"] = kept
+            self._session_context_usage[session_id] = entry
+
+    @staticmethod
+    def _context_usage_entry(usage: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            # 与 prompt_tokens 同一批消息的字符数，用来校准压缩时的字符/token 比。
+            "prompt_chars": payload.get("prompt_chars"),
+            "node_id": str(payload.get("node_id") or ""),
+            "task_id": str(payload.get("task_id") or ""),
+            "updated_at": _now().isoformat(),
+        }
+
+    def _usage_conversation_locked(self, session_id: str, payload: dict[str, Any]) -> str:
+        """这次用量属于哪段对话：本会话自己（含它的入口分支）返回 session_id，登记过的子会话返回子会话 id，认不出返回空。
+
+        不带 conversation_session_id 的旧 engine 按本会话算，和以前一样。
+        """
+        raw = payload.get("conversation_session_id")
+        if not isinstance(raw, str) or not raw.strip():
+            return session_id
+        conversation = raw.strip()
+        if self._route_session_id_for_session_locked(conversation) == session_id:
+            return session_id
+        return conversation if self.anchor_session_for_locked(conversation) else ""
+
+    def session_calibration(self, session_id: str) -> dict[str, Any] | None:
+        """这段对话最近一次真实请求的字/token 校准记录；没有就是 None。"""
+        from .context_calibration import recorded_calibration
+
+        # 用量记录每次整条换掉、不原地改，不持锁读也不会读到半截
+        calibration = recorded_calibration(self._session_context_usage.get(session_id))
+        return dict(calibration) if calibration is not None else None
 
     def get_session_context_usage(self, session_id: str) -> dict[str, Any]:
         """获取 session 的上下文窗口用量，包含实际值、估算值和利用率。"""

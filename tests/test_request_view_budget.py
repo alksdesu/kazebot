@@ -13,6 +13,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from engine.builtin.compact import _mark_settings  # noqa: E402
 from engine.compact import LATEST_ROUND_FACTOR, TOOL_RESULT_VIEW_CHARS, bounded_tool_result_view  # noqa: E402
 from engine.inference.llm_call import overflow_view, request_view, view_settings  # noqa: E402
 from engine.inference.tool_format import (  # noqa: E402
@@ -22,6 +23,7 @@ from engine.inference.tool_format import (  # noqa: E402
 )
 from engine.tool_history import SUPERSEDED_READ_NOTE  # noqa: E402
 from engine.tool_outputs import LATEST_ROUND_VIEW_CHARS, SavedOutput, excerpt_text, preview_text  # noqa: E402
+from engine.view_marks import mark_settings, plan_view_marks, with_planned_marks  # noqa: E402
 
 _USER = {"role": "user", "content": "go"}
 
@@ -135,8 +137,10 @@ class TestProtectionBudget:
         }}})
 
         settings = view_settings(loop)
+        marks = _mark_settings(loop, settings)
 
-        assert settings.protect_tokens == 500
+        assert marks.protect_tokens == 500
+        assert marks.supersede is False
         assert settings.supersede is False
         assert settings.chars_per_token == pytest.approx(3.0)
         assert settings.workspace_root == tmp_path
@@ -155,7 +159,7 @@ class TestProtectionBudget:
             runtime_cfg={"engine": {"compact": {"tool_result_protect_tokens": configured}}},
         )
 
-        assert view_settings(loop).protect_tokens == expected
+        assert _mark_settings(loop, view_settings(loop)).protect_tokens == expected
 
     @pytest.mark.parametrize("chars, tokens, expected", [
         (12_000, 6_000, 2.0),
@@ -169,10 +173,37 @@ class TestProtectionBudget:
 
         assert view_settings(loop).chars_per_token == pytest.approx(expected)
 
-    def test_without_a_loop_state_the_request_view_keeps_the_fixed_bounds(self) -> None:
+    @pytest.mark.parametrize("raw, expected", [
+        (1.6, 1.6),
+        (2, 2.0),
+        (100.0, 6.0),
+        (0.2, 1.0),
+        (0, 3.0),
+        (-2.0, 3.0),
+        ("2.5", 3.0),
+        (True, 3.0),
+        (float("inf"), 3.0),
+        (float("nan"), 3.0),
+    ])
+    def test_before_its_own_measurement_a_task_uses_the_session_ratio(
+        self, tmp_path: Path, raw: Any, expected: float,
+    ) -> None:
+        loop = _loop(tmp_path)
+        loop.rctx.task_context = {"chars_per_token": raw}
+
+        assert view_settings(loop).chars_per_token == pytest.approx(expected)
+
+    def test_the_task_s_own_measurement_wins_over_the_session_ratio(self, tmp_path: Path) -> None:
+        loop = _loop(tmp_path, last_prompt_chars=12_000, last_prompt_tokens=6_000)
+        loop.rctx.task_context = {"chars_per_token": 1.2}
+
+        assert view_settings(loop).chars_per_token == pytest.approx(2.0)
+
+    def test_without_marks_the_request_view_sends_every_message_as_it_is(self, tmp_path: Path) -> None:
         messages = [_USER, *_round("a", "probe", "x" * 5000), *_round("b", "probe", "y" * 20000)]
 
-        assert request_view(messages) == bounded_tool_result_view(messages)[0]
+        assert request_view(messages) == messages
+        assert request_view(messages, _loop(tmp_path)) == messages
 
 
 class TestHeadAndTailCut:
@@ -449,11 +480,25 @@ class TestSupersededReads:
             *_round("w1", "write_file", "ok", {"path": "a.py", "content": "x"}),
         ]
 
-        on = request_view(messages, _loop(tmp_path))
-        off = request_view(messages, _loop(tmp_path, runtime_cfg={"engine": {"compact": {"supersede_reads": False}}}))
+        def marked(runtime_cfg: dict[str, Any]) -> list[dict[str, Any]]:
+            settings = mark_settings(runtime_cfg, compact_threshold=0, chars_per_token=3.0, workspace_root=tmp_path)
+            planned = plan_view_marks(messages, settings=settings, force=True)
+            return request_view(with_planned_marks(messages, planned)[0], _loop(tmp_path, runtime_cfg=runtime_cfg))
+
+        on = marked({})
+        off = marked({"engine": {"compact": {"supersede_reads": False}}})
 
         assert on[2]["content"] == SUPERSEDED_READ_NOTE.format(paths="a.py")
         assert off[2]["content"] == messages[2]["content"]
+
+    def test_superseding_is_not_worked_out_on_the_fly_in_the_request_view(self, tmp_path: Path) -> None:
+        messages = [
+            _USER,
+            *_round("r1", "read_file", _read_output("a.py", "共 10 行"), {"path": "a.py"}),
+            *_round("w1", "write_file", "ok", {"path": "a.py", "content": "x"}),
+        ]
+
+        assert request_view(messages, _loop(tmp_path))[2]["content"] == messages[2]["content"]
 
 
 class TestOverflowView:

@@ -5,15 +5,26 @@ import json
 from collections import Counter
 from typing import Any
 
-from engine.compact import DEFAULT_CHARS_PER_TOKEN, segments_within_token_budget
+from engine.compact import DEFAULT_CHARS_PER_TOKEN, VIEW_MARK_KEY, segments_within_token_budget
 
 
 def record_dict(message: Any) -> dict[str, Any]:
     return message.to_dict() if hasattr(message, "to_dict") else dict(message)
 
 
+def _without_view_mark(record: dict[str, Any]) -> dict[str, Any]:
+    for key in ("meta", "_meta"):
+        meta = record.get(key)
+        if isinstance(meta, dict) and VIEW_MARK_KEY in meta:
+            rest = {name: value for name, value in meta.items() if name != VIEW_MARK_KEY}
+            record = {**record, key: rest} if rest else {name: value for name, value in record.items() if name != key}
+    return record
+
+
 def record_fingerprint(message: Any) -> str:
-    value = json.dumps(record_dict(message), ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    # 截短、让位、清空的标记不改原文；压缩计划算好以后别的任务再打标记，计划照样认得这条消息
+    record = _without_view_mark(record_dict(message))
+    value = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
@@ -98,11 +109,13 @@ def _render(messages: list[Any]) -> str:
 def build_compaction_plan(
     messages: list[Any], *, keep_recent: int = 6, keep_recent_tokens: int = 0,
     threshold_tokens: int = 0, chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
-    max_chars: int = 300_000,
+    max_chars: int = 300_000, include_reasoning: bool = False,
 ) -> tuple[dict[str, Any], str]:
     summaries, segments = _segments(messages)
     if keep_recent_tokens > 0:
-        keep_recent = segments_within_token_budget(segments, keep_recent_tokens, chars_per_token)
+        keep_recent = segments_within_token_budget(
+            segments, keep_recent_tokens, chars_per_token, include_reasoning=include_reasoning,
+        )
     keep_recent = max(keep_recent, 1)
     selected = list(summaries)
     selected_chars = len(_render(selected))

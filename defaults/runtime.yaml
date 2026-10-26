@@ -22,8 +22,16 @@ engine:
     # 软阈值收紧到 (窗口 - 输出预留) × 0.85、硬阈值收紧到 窗口 - 输出预留；查不到就按上面配的值
     context_windows: {}               # 模型名 glob → 窗口 token 数，按书写顺序先匹配的生效；0 = 这个模型不按窗口调整。例：{"my-relay/claude-*": 200000}
     output_reserve_tokens: 20000      # 输出预留：渠道或节点配了回复上限（max_tokens 等）就用它，没配用这个值（0-1000000）
-    tool_result_protect_tokens: 40000 # 发给模型时从最新往前这么多 token 的工具结果保留原文，更早的只留开头和结尾；最多占软阈值的 40%（0-2000000；0 = 不保护）
-    supersede_reads: true             # read_file 读过的文件之后被重读（行范围盖住了旧的）或成功改写后，旧的读取结果发给模型时换成一行说明
+    tool_result_protect_tokens: 40000 # 从最新往前这么多 token 的旧工具结果保留原文，更早的在任务开始、空闲清理、snip、压缩这些时刻打上截短标记（原文不动，标记落盘，之后每次请求照标记发）；最多占软阈值的 40%（0-2000000；0 = 不保护）
+    tool_result_mark_trigger_ratio: 1.5 # 任务开始时，保护窗外还没打标记的旧工具结果越过 保护预算 × 此倍数 才推一次标记，免得每个任务都改动缓存前缀（1-10）
+    tool_result_mark_low_ratio: 1.0   # 推的时候一直推到 保护预算 × 此倍数 之外都打上标记；大于上一项时按上一项算（0-10）
+    supersede_reads: true             # 打标记时，读过又被重读（行范围盖住了旧的）或成功改写过的 read_file 结果换成一行说明
+    idle_clear_minutes: 60            # 距上次回复超过这么多分钟再开任务（缓存早过期了），把较早的工具结果标成已清空并落盘（0 = 关闭）
+    idle_clear_keep_results: 5        # 空闲清空时最近这么多条工具结果不动（0-10000）
+    idle_snip_hours: 1                # 空闲超过这么多小时再开任务，先用现成的轮摘要剪掉较早的任务，空闲越久剪得越多（0 = 关闭）
+    idle_snip_keep_tasks: 3           # 空闲 snip 至少留最近这么多个任务的原文（最少 1）
+    idle_overrides:                   # 上面四个 idle_ 项按 渠道块名 > provider 类型 > 全局 逐项覆盖
+      deepseek: {idle_clear_minutes: 1440, idle_snip_hours: 24} # DeepSeek 的缓存存得久，放宽到 24 小时
     task_digest_trigger_ratio: 0.5    # 单个任务自己的消息超过 软阈值 × 此比例 时，把它较早的完整轮次换成一条进展摘要（0-0.95；0 = 关闭）
     task_keep_recent_tokens: 20000    # 任务进度摘要保留最近这么多 token 的原文不摘要，最多取触发线的一半（0-1000000）
 

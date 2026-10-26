@@ -9,9 +9,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from engine.builtin import compact
+from engine.compact import view_mark_of
 from engine.context_archive import ContextArchiveStore
 from engine.conversation_store import ConversationStore, Message
 from engine.task_record import TaskRecord, snip_history, snip_store, write_task_record
+from engine.view_marks import render_view_marks
 
 
 def loop_state(tmp_path, messages, store=None, **overrides):
@@ -88,34 +90,38 @@ def all_archived_messages(tmp_path, session_id="session"):
     ]
 
 
-@pytest.mark.parametrize("fail_archive", [False, True])
-def test_microcompact_archives_original_before_mutating_nested_history(tmp_path, monkeypatch, fail_archive):
+@pytest.mark.parametrize("archive_broken", [False, True])
+def test_idle_clear_marks_old_results_and_keeps_the_original_text(tmp_path, monkeypatch, archive_broken):
     stamp = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     messages = idle_tool_history(stamp)
     original = deepcopy(messages)
     ctx, state = loop_state(tmp_path, messages)
-    if fail_archive:
-        monkeypatch.setattr(ContextArchiveStore, "archive_each", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("archive unavailable")))
+    if archive_broken:
+        def broken(*args, **kwargs):
+            raise OSError("archive unavailable")
+        monkeypatch.setattr(ContextArchiveStore, "archive_each", broken)
+        monkeypatch.setattr(ContextArchiveStore, "archive", broken)
     modified = asyncio.run(compact._run_idle_cleanup(ctx, state))
     assert messages == original
-    if fail_archive:
-        assert modified is False and state.messages is messages and ctx.messages is messages
-    else:
-        assert modified is True
-        assert "Original output 0" not in state.messages[1]["content"]
-        assert ctx.messages is state.messages
-        # only the two results that were cleared are archived, one archive per message
-        archived = sorted(all_archived_messages(tmp_path), key=lambda message: message["content"])
-        assert archived == [original[1], original[2]]
-        assert ContextArchiveStore(tmp_path).search("session", after=stamp)["matches"]
+    assert modified is True and ctx.messages is state.messages
+    assert [message["content"] for message in state.messages] == [message["content"] for message in original]
+    assert [view_mark_of(message) for message in state.messages[1:]] == [{"kind": "cleared"}] * 2 + [None] * 5
+    view = render_view_marks(state.messages)
+    assert "Original output 0" not in view[1]["content"] and "Original output 1" not in view[2]["content"]
+    assert view[3]["content"] == original[3]["content"]
+    # 原文还在消息里，不再另存归档
+    assert all_archived_messages(tmp_path) == []
 
 
-def test_microcompact_does_not_archive_the_same_original_twice(tmp_path):
+def test_idle_clear_on_a_fresh_copy_marks_the_same_results_again_without_archiving(tmp_path):
     stamp = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    marked = []
     for _ in range(2):
         ctx, state = loop_state(tmp_path, idle_tool_history(stamp))
         assert asyncio.run(compact._run_idle_cleanup(ctx, state)) is True
-    assert len(all_archived_messages(tmp_path)) == 2
+        marked.append([view_mark_of(message) for message in state.messages])
+    assert marked[0] == marked[1]
+    assert all_archived_messages(tmp_path) == []
 
 
 def test_microcompact_leaves_already_cleared_results_alone(tmp_path):

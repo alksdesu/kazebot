@@ -43,6 +43,9 @@ _SCHEMA_KEYS = {"version"}
 
 _GETTERS = {"get_str", "get_int", "get_float", "get_bool"}
 
+# 按渠道块名或 provider 类型分组的覆盖表：下一段是运行时才知道的名字，读取方按表名取、按叶子名读。
+_KEYED_OVERRIDE_TABLES = ("engine.compact.idle_overrides",)
+
 _RETIRED_DOC_HEADING = "### 已退役的键"
 
 
@@ -127,6 +130,16 @@ def _provider_option_leaf(dotted: str) -> tuple[str, str] | None:
     return None
 
 
+def _without_override_key(dotted: str) -> str:
+    """覆盖表里的键去掉表名下面那一段名字，剩下的才是读取方写成字面量的部分。"""
+    for table in _KEYED_OVERRIDE_TABLES:
+        prefix = f"{table}."
+        if dotted.startswith(prefix):
+            _name, _, leaf = dotted[len(prefix):].partition(".")
+            return f"{table}.{leaf}" if leaf else dotted
+    return dotted
+
+
 def _reader_files(dotted: str, sources: dict[str, str]) -> list[str]:
     """能算作读取方的文件。
 
@@ -176,7 +189,7 @@ def test_every_declared_key_has_a_reader(config: dict, sources: dict[str, str]) 
     for dotted in _leaf_paths(config):
         if dotted in _SCHEMA_KEYS or _provider_option_leaf(dotted) is not None:
             continue
-        if not _reader_files(dotted, sources):
+        if not _reader_files(_without_override_key(dotted), sources):
             dead.append(dotted)
 
     assert dead == [], f"声明了但没有任何读取方: {dead}"

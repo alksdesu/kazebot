@@ -90,6 +90,14 @@ class PreparedCompactApply:
     outcome: CompactApplyOutcome
 
 
+@dataclass(frozen=True)
+class BranchSync:
+    """父会话的改写同步到活跃入口分支的结果。branches 是前缀已经对齐的分支 → (前缀条数, 前缀最后一条 id)。"""
+
+    synchronized: bool
+    branches: dict[str, tuple[int, str]] = field(default_factory=dict)
+
+
 @dataclass
 class _RouteSlot:
     lock: threading.RLock = field(default_factory=threading.RLock)
@@ -2482,22 +2490,23 @@ class TaskRouterMixin:
         }
 
     def _session_chars_per_token(self, session_id: str, messages: list[Any]) -> float:
-        """本会话的字符/token 比，用 engine 上报的真实 prompt_tokens 校准。
+        """本会话的字符/token 比，用这段对话自己那次请求的真实 prompt_tokens 校准。
 
         少了这一步就按 3 字符/token 算，中文会把 keep_recent_tokens 的预算放大两三倍，
         压完仍超阈值，下一轮又压一次。engine 上报 usage 时会带同一批消息的字符数；
         拿不到时退而用 store 里的历史字符数比 —— 它少了 system 段，比例偏小、偏保守。
         """
-        from engine.compact import DEFAULT_CHARS_PER_TOKEN, observed_chars_per_token, total_content_chars
+        from engine.compact import DEFAULT_CHARS_PER_TOKEN
+        from .context_calibration import calibrated_chars_per_token
 
-        usage = self._session_context_usage.get(session_id) or {}
-        prompt_tokens = usage.get("prompt_tokens")
-        if not isinstance(prompt_tokens, int):
-            return DEFAULT_CHARS_PER_TOKEN
-        prompt_chars = usage.get("prompt_chars")
-        if not isinstance(prompt_chars, int) or prompt_chars <= 0:
-            prompt_chars = total_content_chars(messages)
-        return observed_chars_per_token(prompt_chars, prompt_tokens)
+        ratio = calibrated_chars_per_token(self.session_calibration(session_id), messages)
+        return DEFAULT_CHARS_PER_TOKEN if ratio is None else ratio
+
+    def _session_counts_reasoning(self, session_id: str) -> bool:
+        """校准那次请求把历史思维链发回去了：按这个比例估历史时思维链也得算进字数。"""
+        from .context_calibration import counts_reasoning
+
+        return counts_reasoning(self.session_calibration(session_id))
 
     def _apply_snip_via_conv_store(self, session_id: str, task_ids: set[str]) -> dict[str, Any]:
         """用 TaskRecord 摘要替换已结束任务的原文。不要求持锁，会话文件按 ConversationChangedError 乐观重试。"""
@@ -2576,6 +2585,97 @@ class TaskRouterMixin:
                 seen.add(task_id)
         return replaced
 
+    def _apply_view_marks_via_conv_store(
+        self,
+        target_session_id: str,
+        marks: dict[str, tuple[str, dict[str, Any]]],
+        *,
+        branch_session_id: str = "",
+        reason: str = "view_marks",
+    ) -> dict[str, Any]:
+        """把旧工具结果的截短、让位、清空标记合进父会话，再同步到各活跃入口分支的父历史前缀。
+
+        不要求持锁，会话文件按 ConversationChangedError 乐观重试。只改 meta、原文还在，不归档。
+        marks 是这些 id 合并后生效的标记；branch_synchronized 说的是 branch_session_id 那个分支
+        （没给就是全部活跃分支）的副本有没有补上同一批标记。
+        """
+        from engine.conversation_store import ConversationStore
+        from engine.view_marks import apply_view_marks_to_store, mark_counts, marked_prefix
+
+        store = ConversationStore(self.workspace_root / "data" / "conversations")
+        effective = apply_view_marks_to_store(store, target_session_id, marks)
+        if effective is None:
+            return {
+                "applied": False, "synchronized": False, "branch_synchronized": False, "marks": {},
+                "reason": "conversation changed during view marking",
+            }
+        synced = {
+            message_id: (marks[message_id][0], mark)
+            for message_id, mark in effective.items() if message_id in marks
+        }
+        if not synced:
+            return {"applied": False, "synchronized": True, "branch_synchronized": True, "marks": {}}
+        sync = self._sync_branch_prefixes(
+            target_session_id,
+            functools.partial(marked_prefix, marks=synced),
+            reason="branch_view_marks",
+            archive=False,
+        )
+        branch = str(branch_session_id or "").strip()
+        branch_synchronized = branch in sync.branches if branch else sync.synchronized
+        counts = mark_counts(effective.values())
+        log.info(
+            "view marks (%s) on %s: truncated=%d superseded=%d cleared=%d, branches synchronized=%s",
+            reason, target_session_id, counts["truncated"], counts["superseded"], counts["cleared"],
+            sync.synchronized,
+        )
+        return {
+            "applied": True, "synchronized": sync.synchronized,
+            "branch_synchronized": branch_synchronized, "marks": effective,
+        }
+
+    def _active_task_ids_for_session_locked(self, session_id: str) -> set[str]:
+        """还没结束、历史落在这个会话上的任务：直接跑在上面的、跑在它入口分支上的、把它当子会话的。"""
+        active: set[str] = set()
+        for task in self.tasks.values():
+            if self._task_terminal(task):
+                continue
+            homes = (
+                task.session_id, task.input.get("parent_session_id"),
+                task.input.get("branch_session_id"), task.input.get("child_session_id"),
+            )
+            if session_id in homes:
+                active.add(task.task_id)
+        return active
+
+    def _mark_compacted_history(self, target_session_id: str, *, threshold_tokens: int) -> None:
+        """LLM 压缩刚换掉父会话的前缀，缓存本来就整段不命中：顺带把留下的旧工具结果的标记推到底。
+
+        尽力而为，出错只记日志；还没结束的任务自己的消息不打标记。
+        """
+        from engine.compact import is_tool_result_message
+        from engine.conversation_store import ConversationStore
+        from engine.view_marks import keyed_marks, mark_settings, plan_view_marks
+
+        try:
+            store = ConversationStore(self.workspace_root / "data" / "conversations")
+            records = [message.to_dict() for message in store.load(target_session_id)]
+            if not any(is_tool_result_message(record) for record in records):
+                return
+            with self._lock:
+                active = self._active_task_ids_for_session_locked(target_session_id)
+            settings = mark_settings(
+                load_runtime_config(self.workspace_root),
+                compact_threshold=threshold_tokens,
+                chars_per_token=self._session_chars_per_token(target_session_id, records),
+                workspace_root=self.workspace_root,
+            )
+            marks = keyed_marks(plan_view_marks(records, settings=settings, exclude_task_ids=active, force=True))
+            if marks:
+                self._apply_view_marks_via_conv_store(target_session_id, marks, reason="llm_compaction")
+        except Exception:
+            log.exception("view marks after compaction failed: %s", target_session_id)
+
     def _active_branch_bases_locked(self, target_session_id: str) -> dict[str, int]:
         """target 下还在跑的入口分支 → 登记的父历史长度（分支文件里没有边界标记时兜底用）。"""
         bases: dict[str, int] = {}
@@ -2594,9 +2694,21 @@ class TaskRouterMixin:
         *,
         reason: str,
     ) -> bool:
-        """父会话上做过的改写同步到各活跃入口分支的父历史前缀，全部同步成功才返回 True。
+        """父会话上做过的改写同步到各活跃入口分支的父历史前缀，全部同步成功才返回 True。"""
+        return self._sync_branch_prefixes(target_session_id, rewrite, reason=reason).synchronized
 
-        分支文件在锁外读写，只有取分支清单和回写 base_count 时短暂持锁。rewrite 对不上前缀时返回 None。
+    def _sync_branch_prefixes(
+        self,
+        target_session_id: str,
+        rewrite: Callable[[list[Any]], list[Any] | None],
+        *,
+        reason: str,
+        archive: bool = True,
+    ) -> BranchSync:
+        """把父会话上做过的改写同步到各活跃入口分支的父历史前缀。
+
+        分支文件在锁外读写，只有取分支清单和回写 base_count 时短暂持锁。rewrite 对不上前缀时返回 None；
+        archive 为 False 用在只改 meta 的改写上，原文还在，不另存归档。
         """
         with self._lock:
             branches = self._active_branch_bases_locked(target_session_id)
@@ -2605,7 +2717,7 @@ class TaskRouterMixin:
         for branch_id, fallback_base in branches.items():
             try:
                 result = self._rewrite_branch_prefix(
-                    target_session_id, branch_id, fallback_base, rewrite, reason=reason,
+                    target_session_id, branch_id, fallback_base, rewrite, reason=reason, archive=archive,
                 )
             except Exception:
                 synchronized = False
@@ -2619,7 +2731,7 @@ class TaskRouterMixin:
             with self._lock:
                 if not self._commit_branch_bases_locked(target_session_id, rewritten):
                     synchronized = False
-        return synchronized
+        return BranchSync(synchronized=synchronized, branches=rewritten)
 
     def _rewrite_branch_prefix(
         self,
@@ -2629,6 +2741,7 @@ class TaskRouterMixin:
         rewrite: Callable[[list[Any]], list[Any] | None],
         *,
         reason: str,
+        archive: bool = True,
     ) -> tuple[int, str] | None:
         from engine.branch_history import branch_base_count, mark_branch_boundary, without_branch_boundary
         from engine.context_archive import ContextArchiveStore
@@ -2640,10 +2753,14 @@ class TaskRouterMixin:
             base_count = branch_base_count(messages, branch_id, fallback_base)
             if base_count <= 0 or base_count > len(messages):
                 return None
-            prefix = rewrite(without_branch_boundary(messages[:base_count], branch_id))
+            original = without_branch_boundary(messages[:base_count], branch_id)
+            prefix = rewrite(original)
             if prefix is None:
                 return None
-            ContextArchiveStore(self.workspace_root).archive(target_session_id, messages, reason=reason)
+            if len(prefix) == len(original) and all(new is old for new, old in zip(prefix, original)):
+                return len(prefix), (prefix[-1].id if prefix else "")
+            if archive:
+                ContextArchiveStore(self.workspace_root).archive(target_session_id, messages, reason=reason)
             try:
                 store.replace_all(
                     branch_id, mark_branch_boundary(prefix + messages[base_count:], branch_id, len(prefix)),
@@ -2666,7 +2783,10 @@ class TaskRouterMixin:
             branch_id = str(task.input.get("branch_session_id") or "")
             if branch_id not in rewritten:
                 continue
-            task.input["base_count"], task.input["base_last_id"] = rewritten[branch_id]
+            base = rewritten[branch_id]
+            if (int(task.input.get("base_count") or 0), str(task.input.get("base_last_id") or "")) == base:
+                continue
+            task.input["base_count"], task.input["base_last_id"] = base
             task.updated_at = now
             try:
                 self._event_task_snapshot("task_context_compacted", task)
@@ -2694,6 +2814,7 @@ class TaskRouterMixin:
             storage = "snapshot"
         plan, instruction = build_compaction_plan(
             messages, chars_per_token=self._session_chars_per_token(session_id, messages),
+            include_reasoning=self._session_counts_reasoning(session_id),
             **self._compact_sizing(source),
         )
         if plan:
@@ -2829,7 +2950,12 @@ class TaskRouterMixin:
         except Exception:
             log.exception("compact apply failed: %s", job.target_session_id)
             return CompactApplyOutcome(counts=None, success=False)
-        return CompactApplyOutcome(counts=counts, success=bool(counts and counts.get("applied")))
+        success = bool(counts and counts.get("applied"))
+        if success and job.storage != "snapshot":
+            self._mark_compacted_history(
+                job.target_session_id, threshold_tokens=int(job.sizing.get("threshold_tokens") or 0),
+            )
+        return CompactApplyOutcome(counts=counts, success=success)
 
     def _compact_apply_outcome_locked(self, task: Any, job: CompactApplyJob) -> CompactApplyOutcome:
         prepared = self._prepared_route_io().pop(getattr(task, "task_id", ""), None)

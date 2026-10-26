@@ -83,16 +83,29 @@ def test_a_successful_compaction_keeps_the_hard_threshold_armed(tmp_path: Path) 
     assert action is not None and action.target_node == "system.compactor"
 
 
-def test_the_threshold_is_estimated_on_the_view_the_model_actually_receives(tmp_path: Path) -> None:
-    messages = [
+def _read_history(meta: dict | None = None) -> list[dict]:
+    return [
         {"role": "user", "content": "read the log", "_meta": {"source_task_id": "t0"}},
         {"role": "assistant", "content": "", "tool_calls": [{"id": "read-1", "name": "read_file", "arguments": {}}],
          "_meta": {"source_task_id": "t0"}},
         {"role": "tool", "tool_call_id": "read-1", "name": "read_file", "content": "z" * 60_000,
-         "_meta": {"source_task_id": "t0", "message_type": "tool_result"}},
+         "_meta": {"source_task_id": "t0", "message_type": "tool_result", **(meta or {})}},
     ]
+
+
+def test_the_threshold_is_estimated_on_the_view_the_model_actually_receives(tmp_path: Path) -> None:
+    messages = _read_history({"view_mark": {"kind": "truncated", "chars": 2000}})
     ctx, state = _state(tmp_path, messages, soft=5_000, hard=6_000)
 
     assert should_compact(messages, 5_000) is True
     assert asyncio.run(compact._check_and_compact(ctx, state)) is None
     state.rctx.http.post.assert_not_awaited()
+
+
+def test_an_unmarked_result_is_estimated_in_full_because_it_is_sent_in_full(tmp_path: Path) -> None:
+    ctx, state = _state(tmp_path, _read_history(), soft=5_000, hard=6_000)
+
+    asyncio.run(compact._check_and_compact(ctx, state))
+
+    events = [call.args for call in state.rctx.emit_event.await_args_list]
+    assert ("compact_start", {"node_id": "entry", "step": 1, "mode": "blocking"}) in events

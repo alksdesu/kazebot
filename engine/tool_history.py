@@ -269,44 +269,58 @@ def command_text(arguments: dict[str, Any]) -> str:
 
 
 SUPERSEDED_READ_NOTE = "[这次读取的内容已省略：{paths} 之后又被读取或修改过，以后面的为准]"
-_NOTE_PATHS = 5
+NOTE_PATHS = 5
 
 
-def _superseded_note(entries: list[ReadEntry]) -> str:
-    paths = list(dict.fromkeys(entry.raw_path for entry in entries))
-    shown = "、".join(paths[:_NOTE_PATHS])
-    if len(paths) > _NOTE_PATHS:
-        shown += f" 等 {len(paths)} 个文件"
+def superseded_note(paths: list[str], files: int | None = None) -> str:
+    """让位说明：列出前 NOTE_PATHS 个路径，文件更多时补一句一共几个。"""
+    total = max(files or 0, len(paths))
+    shown = "、".join(paths[:NOTE_PATHS])
+    if total > NOTE_PATHS:
+        shown += f" 等 {total} 个文件"
     return SUPERSEDED_READ_NOTE.format(paths=shown)
 
 
-def _superseded(
+@dataclass(frozen=True)
+class Supersession:
+    """一条 read_file 结果为什么过时：读过的路径原文（去重、按读取顺序）和让它完全过时的那条消息的下标。"""
+
+    paths: tuple[str, ...]
+    by: int
+
+    @property
+    def note(self) -> str:
+        return superseded_note(list(self.paths))
+
+
+def _superseded_at(
     index: int,
     entry: ReadEntry,
     later_reads: dict[str, list[tuple[int, Span]]],
-    last_rewrite: dict[str, int],
-) -> bool:
+    rewrites: dict[str, list[int]],
+) -> int | None:
+    """这个文件在 index 之后最早被哪条消息取代：成功改写过，或重读的行范围盖住了旧的。"""
     if not entry.path:
-        return False
-    if last_rewrite.get(entry.path, -1) > index:
-        return True
+        return None
     earlier = entry.known_span
-    return any(
-        later > index and (earlier is None or span.covers(earlier))
-        for later, span in later_reads.get(entry.path, ())
+    candidates = [later for later in rewrites.get(entry.path, ()) if later > index]
+    candidates.extend(
+        later for later, span in later_reads.get(entry.path, ())
+        if later > index and (earlier is None or span.covers(earlier))
     )
+    return min(candidates) if candidates else None
 
 
-def superseded_read_notes(messages: list[Any], *, workspace_root: Any = None) -> dict[int, str]:
-    """哪些 read_file 结果已经过时，下标 → 换上去的那行说明。
+def superseded_reads(messages: list[Any], *, workspace_root: Any = None) -> dict[int, Supersession]:
+    """哪些 read_file 结果已经过时，下标 → 过时的原因。
 
     同一路径之后被成功改写过（以 meta 里的 tool_status 为准，没有这个字段的旧消息不算），
-    或之后又读过且新读的行范围盖住了旧的，就算过时；一次读了多个文件的，每个文件都过时才整条换掉。
+    或之后又读过且新读的行范围盖住了旧的，就算过时；一次读了多个文件的，每个文件都过时才算整条过时。
     """
     resolved = resolve_tool_results(messages)
     reads: list[tuple[int, list[ReadEntry]]] = []
     later_reads: dict[str, list[tuple[int, Span]]] = {}
-    last_rewrite: dict[str, int] = {}
+    rewrites: dict[str, list[int]] = {}
     for index, record in sorted(resolved.items()):
         message = messages[index]
         content = message.get("content")
@@ -322,9 +336,19 @@ def superseded_read_notes(messages: list[Any], *, workspace_root: Any = None) ->
             for raw_path in rewritten_paths(record.name, record.arguments, content):
                 path = normalize_path(raw_path, workspace_root)
                 if path:
-                    last_rewrite[path] = index
+                    rewrites.setdefault(path, []).append(index)
+    result: dict[int, Supersession] = {}
+    for index, entries in reads:
+        moments = [_superseded_at(index, entry, later_reads, rewrites) for entry in entries]
+        if all(moment is not None for moment in moments):
+            paths = tuple(dict.fromkeys(entry.raw_path for entry in entries))
+            result[index] = Supersession(paths=paths, by=max(moments))
+    return result
+
+
+def superseded_read_notes(messages: list[Any], *, workspace_root: Any = None) -> dict[int, str]:
+    """哪些 read_file 结果已经过时，下标 → 换上去的那行说明。"""
     return {
-        index: _superseded_note(entries)
-        for index, entries in reads
-        if all(_superseded(index, entry, later_reads, last_rewrite) for entry in entries)
+        index: supersession.note
+        for index, supersession in superseded_reads(messages, workspace_root=workspace_root).items()
     }

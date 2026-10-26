@@ -3,16 +3,16 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import OrderedDict
-from copy import deepcopy
-from datetime import datetime, timezone
 from typing import Any
 
+from clonoth_runtime import main_session_enabled
 from engine.compact import (
-    clear_tool_results,
     count_real_task_segments,
     estimate_message_tokens,
-    last_assistant_time,
+    idle_minutes,
+    idle_settings,
     microcompact_targets,
+    parse_view_mark,
     should_compact,
 )
 from engine.context_window import (
@@ -26,6 +26,7 @@ from engine.context_window import (
 # cycles while keeping the existing hook registry duck-typed.
 from .result import hook_result
 from engine.inference.llm_call import (
+    ViewSettings,
     cancelled_action,
     digest_provider_call,
     request_view,
@@ -36,6 +37,16 @@ from engine.inference.loop_state import _persist_ctx, compact_target_session_id,
 from engine.protocol import ACTION_DISPATCH, TaskAction
 from engine.context_archive import ContextArchiveStore
 from engine.task_digest import THRESHOLD_REASON, DigestOutcome, digest_settings, restore_task_digest, run_task_digest
+from engine.view_marks import (
+    PlannedMark,
+    apply_view_marks_to_store,
+    keyed_marks,
+    mark_counts,
+    mark_settings,
+    plan_view_marks,
+    with_effective_marks,
+    with_planned_marks,
+)
 from plugin_runtime import PluginExecutionError
 
 logger = logging.getLogger(__name__)
@@ -57,13 +68,13 @@ PLUGIN_META = {
 
 
 class CompactChecker:
-    """Run idle cleanup, automatic context compaction and in-task progress digests before each step."""
+    """Run idle cleanup, view marks, automatic context compaction and in-task progress digests before each step."""
 
     name = "compact_checker"
     priority = 50
 
     async def handle(self, ctx: Any) -> Any | None:
-        """首步按模型窗口定阈值、做空闲清理、读回挂起前的进度摘要，之后每步检查要不要压缩、要不要摘要本任务。"""
+        """首步按模型窗口定阈值、做空闲清理并批量推一次旧工具结果的标记、读回挂起前的进度摘要，之后每步检查要不要压缩、要不要摘要本任务。"""
         ls = ctx.extra.get("loop_state")
         if ls is None:
             return None
@@ -74,7 +85,6 @@ class CompactChecker:
         step_count = int(ctx.extra.get("step_count", 0) or 0)
         if ctx.step == step_count:
             modified = await _run_idle_cleanup(ctx, ls) or modified
-        # 空闲清理会改掉旧工具结果的正文，摘要的指纹要按清理之后的消息校验
         await _restore_task_digest(ls)
 
         action = await _check_and_compact(ctx, ls)
@@ -91,6 +101,18 @@ class CompactChecker:
 
 def _task_key(ls: Any) -> str:
     return str(getattr(getattr(ls, "rctx", None), "task_id", "") or "")
+
+
+def _current_task_ids(ls: Any) -> tuple[str, ...]:
+    task_id = _task_key(ls)
+    return (task_id,) if task_id else ()
+
+
+def _on_entry_branch(rctx: Any) -> bool:
+    """任务跑在入口分支上：落盘的改写要请 supervisor 改父会话，再同步到各活跃分支。"""
+    parent_id = str(getattr(rctx, "parent_session_id", "") or "")
+    child_id = str(getattr(rctx, "child_session_id", "") or "")
+    return bool(parent_id) and parent_id != getattr(rctx, "session_id", "") and not child_id
 
 
 def _note_compact_outcome(ls: Any) -> None:
@@ -169,8 +191,9 @@ async def _check_task_digest(ctx: Any, ls: Any) -> TaskAction | None:
         outcome = await run_task_digest(
             ls,
             step=ctx.step,
-            view=tool_result_view(ls.messages, ls, settings=view_cfg),
+            view=tool_result_view(ls.messages),
             chars_per_token=view_cfg.chars_per_token,
+            include_reasoning=view_cfg.include_reasoning,
             trigger_tokens=trigger,
             keep_tokens=settings.keep_tokens(soft),
             call=digest_provider_call(ls, ctx.step),
@@ -185,65 +208,177 @@ async def _check_task_digest(ctx: Any, ls: Any) -> TaskAction | None:
 
 
 async def _run_idle_cleanup(ctx: Any, ls: Any) -> bool:
-    """任务第一步：空闲太久就清空旧工具结果的正文，再按空闲时长剪掉更早的任务。"""
-    modified = False
-    try:
-        targets = microcompact_targets(ls.messages)
-        if targets:
-            # 只归档要清空的那几条原文；历史每个任务都从存储重载，同一条会被反复清，归档按内容去重
-            originals = [deepcopy(ls.messages[index]) for index in targets]
-            await asyncio.to_thread(
-                ContextArchiveStore(ls.rctx.workspace_root).archive_each,
-                compact_target_session_id(ls), originals, reason="microcompact",
-            )
-            compacted = deepcopy(ls.messages)
-            cleared = clear_tool_results(compacted, targets)
-            ls.messages = compacted
-            ctx.messages = compacted
-            logger.info("microcompact: cleared %d tool_results", cleared)
-            modified = True
-    except Exception as archive_error:
-        logger.warning("microcompact archive failed; keeping original messages: %s", archive_error)
+    """任务第一步的批量时刻：空闲太久先用轮摘要剪掉较早的任务，再把旧工具结果的标记推一次并落盘。
+
+    空闲过了清空阈值时把较早的工具结果标成已清空，整段缓存本来就不命中，截短和让位也一并推到底；
+    没到时只在保护窗外的旧结果越过滞回线才推。阈值按渠道块名、provider 类型、全局的顺序取。
+    """
+    provider = getattr(ls, "provider", None)
+    idle = idle_settings(
+        getattr(ls, "runtime_cfg", None),
+        channel=str(getattr(provider, "plugin_channel", "") or ""),
+        provider_type=str(getattr(provider, "name", "") or ""),
+    )
+    gap = idle_minutes(ls.messages)
+    snipped = False
+    if idle.snip_hours > 0 and gap is not None and gap >= idle.snip_hours * 60:
+        snipped = await _idle_snip(ctx, ls, gap / 60.0, keep_tasks=idle.snip_keep_tasks)
+    cold = idle.clear_minutes > 0 and gap is not None and gap >= idle.clear_minutes
+    cleared = microcompact_targets(
+        ls.messages,
+        gap_minutes=idle.clear_minutes,
+        keep_recent=idle.clear_keep_results,
+        exclude_task_ids=_current_task_ids(ls),
+    ) if cold else []
+    if cold:
+        reason = "idle_clear"
+    elif snipped:
+        reason = "proactive_snip"
+    else:
+        reason = "task_start"
+    marked = await _push_view_marks(ctx, ls, force=cold or snipped, cleared=cleared, reason=reason)
+    return snipped or marked
+
+
+async def _idle_snip(ctx: Any, ls: Any, gap_hours: float, *, keep_tasks: int) -> bool:
+    """空闲够久时用现成的轮摘要剪掉较早的任务，落盘改父会话；空闲越久一次剪得越多。"""
+    from engine.task_record import load_task_records, snip_history
 
     try:
-        from engine.task_record import load_task_records, snip_history
-
-        last_ts = last_assistant_time(ls.messages)
-        if last_ts is not None:
-            gap_hours = (datetime.now(timezone.utc) - last_ts).total_seconds() / 3600.0
-            if gap_hours >= 1.0:
-                proactive_max = max(int(gap_hours) * 2, 2)
-                # 落盘的 snip 一律改父会话，不改入口分支的副本
-                snip_sid = compact_target_session_id(ls)
-                snip_records = await asyncio.to_thread(load_task_records, ls.rctx.workspace_root, snip_sid)
-                if snip_records:
-                    snipped, snip_count, snipped_ids = snip_history(
-                        ls.messages,
-                        snip_records,
-                        keep_recent_tasks=3,
-                        max_snip=proactive_max,
-                    )
-                    if snip_count > 0:
-                        snip_count = await _apply_snip(ctx, ls, snip_sid, snip_records, snipped, snipped_ids, reason="proactive_snip")
-                        logger.info(
-                            "proactive snip: replaced %d tasks (gap=%.1fh, max=%d)",
-                            snip_count,
-                            gap_hours,
-                            proactive_max,
-                        )
-                        modified = True
+        # 落盘的 snip 一律改父会话，不改入口分支的副本
+        snip_sid = compact_target_session_id(ls)
+        snip_records = await asyncio.to_thread(load_task_records, ls.rctx.workspace_root, snip_sid)
+        if not snip_records:
+            return False
+        proactive_max = max(int(gap_hours) * 2, 2)
+        snipped, snip_count, snipped_ids = snip_history(
+            ls.messages, snip_records, keep_recent_tasks=keep_tasks, max_snip=proactive_max,
+        )
+        if snip_count <= 0:
+            return False
+        snip_count = await _apply_snip(ctx, ls, snip_sid, snip_records, snipped, snipped_ids, reason="proactive_snip")
+        logger.info(
+            "proactive snip: replaced %d tasks (gap=%.1fh, max=%d, keep=%d)",
+            snip_count, gap_hours, proactive_max, keep_tasks,
+        )
+        return snip_count > 0
     except Exception as snip_error:
         logger.warning("proactive snip failed: %s", snip_error)
+        return False
 
-    return modified
+
+def _mark_settings(ls: Any, view_cfg: ViewSettings) -> Any:
+    return mark_settings(
+        getattr(ls, "runtime_cfg", None),
+        compact_threshold=int(getattr(ls, "compact_threshold", 0) or 0),
+        chars_per_token=view_cfg.chars_per_token,
+        workspace_root=view_cfg.workspace_root,
+    )
+
+
+async def _push_view_marks(
+    ctx: Any, ls: Any, *, force: bool, reason: str, cleared: list[int] | tuple[int, ...] = (),
+) -> bool:
+    """算出这次该补的截短、让位、清空标记，落盘后同步到运行期消息；出错只记日志，消息原样不动。"""
+    try:
+        planned = plan_view_marks(
+            ls.messages,
+            settings=_mark_settings(ls, view_settings(ls)),
+            exclude_task_ids=_current_task_ids(ls),
+            force=force,
+            cleared=cleared,
+        )
+        if not planned:
+            return False
+        changed = await _persist_view_marks(ctx, ls, planned, reason=reason)
+    except Exception:
+        logger.warning("view marks not applied (%s): task=%s", reason, _task_key(ls) or "?", exc_info=True)
+        return False
+    if changed:
+        counts = mark_counts(item.mark for item in planned)
+        logger.info(
+            "view marks (%s): %d messages updated (planned truncated=%d superseded=%d cleared=%d)",
+            reason, changed, counts["truncated"], counts["superseded"], counts["cleared"],
+        )
+    return changed > 0
+
+
+def _store_backed(ls: Any) -> bool:
+    """历史从会话存储重载的任务：标记得先落盘才能用。旧的快照路径随快照落盘，直接打在运行期消息上。"""
+    rctx = ls.rctx
+    if getattr(rctx, "conversation_store", None) is None:
+        return False
+    if str(getattr(rctx, "child_session_id", "") or ""):
+        return True
+    runtime_cfg = getattr(ls, "runtime_cfg", None)
+    return main_session_enabled(runtime_cfg if isinstance(runtime_cfg, dict) else {})
+
+
+async def _persist_view_marks(ctx: Any, ls: Any, planned: list[PlannedMark], *, reason: str) -> int:
+    """标记写在压缩改写的那个会话上（入口分支时经 supervisor 写父会话再同步分支），返回运行期消息换了几条。"""
+    rctx = ls.rctx
+    if not _store_backed(ls):
+        messages, changed = with_planned_marks(ls.messages, planned)
+    else:
+        marks = keyed_marks(planned)
+        if not marks:
+            return 0
+        if _on_entry_branch(rctx):
+            effective = await _post_view_marks(ls, marks, reason=reason)
+        else:
+            # 本任务排队中的写入得先落盘，不然 replace_all 的指纹比对拿的是旧文件
+            await flush_conversation_writes(rctx)
+            effective = await asyncio.to_thread(
+                apply_view_marks_to_store, rctx.conversation_store, compact_target_session_id(ls), marks,
+            )
+        if not effective:
+            return 0
+        messages, changed = with_effective_marks(ls.messages, marks, effective)
+    if changed:
+        ls.messages = messages
+        ctx.messages = messages
+    return changed
+
+
+async def _post_view_marks(
+    ls: Any, marks: dict[str, tuple[str, dict[str, Any]]], *, reason: str,
+) -> dict[str, dict[str, Any]] | None:
+    """入口分支上的任务请 supervisor 把标记写进父会话并同步各活跃分支；本分支没同步上时返回 None。"""
+    rctx = ls.rctx
+    await flush_conversation_writes(rctx)
+    response = await rctx.http.post(
+        f"{rctx.supervisor_url}/v1/tasks/view-marks",
+        json={
+            "target_session_id": compact_target_session_id(ls),
+            "branch_session_id": str(getattr(rctx, "session_id", "") or ""),
+            "reason": reason,
+            "marks": [
+                {"message_id": message_id, "fingerprint": fingerprint, "mark": mark}
+                for message_id, (fingerprint, mark) in marks.items()
+            ],
+        },
+    )
+    response.raise_for_status()
+    payload = response.json()
+    # 本分支的副本没改成功时运行期消息也不动：当轮照旧发原样，挂起后从分支文件重载看到的和现在一样
+    if not isinstance(payload, dict) or not payload.get("branch_synchronized"):
+        logger.info("view marks (%s) were not synchronized to branch %s", reason, getattr(rctx, "session_id", "?"))
+        return None
+    raw = payload.get("marks")
+    if not isinstance(raw, dict):
+        return None
+    effective: dict[str, dict[str, Any]] = {}
+    for message_id, value in raw.items():
+        mark = parse_view_mark(value)
+        if isinstance(message_id, str) and message_id in marks and mark is not None:
+            effective[message_id] = mark
+    return effective
 
 
 async def _apply_snip(ctx: Any, ls: Any, session_id: str, records: list, messages: list[dict], task_ids: set[str], *, reason: str) -> int:
     from engine.task_record import safe_snip_task_ids, snip_history_tasks, snip_store
 
-    parent_id = str(getattr(ls.rctx, "parent_session_id", "") or "")
-    child_id = str(getattr(ls.rctx, "child_session_id", "") or "")
-    if parent_id and parent_id != ls.rctx.session_id and not child_id:
+    if _on_entry_branch(ls.rctx):
         response = await ls.rctx.http.post(
             f"{ls.rctx.supervisor_url}/v1/tasks/compact-snip",
             json={"target_session_id": session_id, "task_ids": sorted(task_ids)},
@@ -281,6 +416,23 @@ async def _apply_snip(ctx: Any, ls: Any, session_id: str, records: list, message
     ls.messages = messages
     ctx.messages = messages
     return len(actual)
+
+
+async def _threshold_snip(ctx: Any, ls: Any, compact_sid: str, *, reason: str) -> int:
+    """用现成的轮摘要 snip 较早的任务并落盘，成功后顺带把旧工具结果的标记推到底；返回剪掉的任务数。"""
+    from engine.task_record import load_task_records, snip_history
+
+    # 落盘的 snip 改父会话，下一次分叉直接从已经剪过的历史开始
+    snip_records = await asyncio.to_thread(load_task_records, ls.rctx.workspace_root, compact_sid)
+    if not snip_records:
+        return 0
+    snipped, snip_count, snipped_ids = snip_history(ls.messages, snip_records)
+    if snip_count <= 0:
+        return 0
+    snip_count = await _apply_snip(ctx, ls, compact_sid, snip_records, snipped, snipped_ids, reason=reason)
+    if snip_count > 0:
+        await _push_view_marks(ctx, ls, force=True, reason=reason)
+    return snip_count
 
 
 def _build_compactor_input(ctx: Any, ls: Any) -> str:
@@ -334,6 +486,32 @@ async def _request_background_compact(ctx: Any, ls: Any, compact_sid: str) -> No
     })
 
 
+def _over(view: list[dict[str, Any]], threshold: int, last_prompt_tokens: int | None, view_cfg: ViewSettings) -> bool:
+    return should_compact(
+        view, threshold, last_prompt_tokens, view_cfg.chars_per_token, include_reasoning=view_cfg.include_reasoning,
+    )
+
+
+async def _soft_snip(ctx: Any, ls: Any, compact_sid: str) -> bool:
+    """软阈值先用现成的轮摘要 snip，不花模型调用；没有可用的轮摘要或 snip 没成时返回 False。"""
+    try:
+        snip_count = await _threshold_snip(ctx, ls, compact_sid, reason="soft_snip")
+    except Exception as snip_error:
+        logger.warning("soft-threshold snip failed, falling back to background compaction: %s", snip_error)
+        return False
+    if snip_count <= 0:
+        return False
+    await ls.rctx.emit_event("snip_compact", {
+        "node_id": ls.node.id,
+        "step": ctx.step,
+        "snipped_tasks": snip_count,
+        "threshold": "soft",
+    })
+    logger.info("soft-threshold snip replaced %d tasks", snip_count)
+    ctx.extra["compact_modified"] = True
+    return True
+
+
 async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
     """Return a compactor dispatch action when the legacy threshold says so."""
     if ls.compacted or ls.compact_threshold <= 0:
@@ -342,15 +520,20 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
     # 熔断判定归 supervisor：压缩失败几乎全在那一侧记账，而 engine 是多个独立 worker 进程，
     # 各自的计数器既读不到对方也读不到 supervisor 的。后台压缩会被 compact-async 拒回，
     # 硬阈值 dispatch 会被 supervisor 换成应急截断。
+    view_cfg = view_settings(ls)
     view = request_view(ls.messages, ls)
-    if not should_compact(view, ls.compact_threshold, ls.last_prompt_tokens):
+    if not _over(view, ls.compact_threshold, ls.last_prompt_tokens, view_cfg):
         return None
 
-    # 软阈值只说明「该压了」，不该让用户等：先在后台起一个压缩任务，当轮继续推理，
-    # 下一轮才吃到压缩后的历史。只有顶到硬阈值才挂起当轮同步压，否则供应商会拒。
+    # 软阈值只说明「该压了」，不该让用户等：先用现成的轮摘要 snip，还超软阈值再在后台起一个压缩任务，
+    # 当轮继续推理，下一轮才吃到压缩后的历史。只有顶到硬阈值才挂起当轮同步压，否则供应商会拒。
     hard_threshold = int(getattr(ls, "compact_hard_threshold", 0) or 0)
-    over_hard = hard_threshold > 0 and should_compact(view, hard_threshold, ls.last_prompt_tokens)
+    over_hard = hard_threshold > 0 and _over(view, hard_threshold, ls.last_prompt_tokens, view_cfg)
     if not over_hard:
+        if not getattr(ls, "compact_async_requested", False) and await _soft_snip(ctx, ls, compact_sid):
+            # 上一次请求的实测用量是 snip 之前的，重新估算只看现在的消息
+            if not _over(request_view(ls.messages, ls), ls.compact_threshold, None, view_cfg):
+                return None
         await _request_background_compact(ctx, ls, compact_sid)
         return None
     if getattr(ls, "hard_compact_disabled", False) or _task_key(ls) in _HARD_COMPACT_FAILED_TASKS:
@@ -377,27 +560,18 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
         logger.warning("segment pre-check failed, proceeding with compact: %s", _seg_err)
 
     try:
-        from engine.task_record import (
-            load_task_records,
-            snip_history,
-        )
-
-        # 落盘的 snip 改父会话，下一次分叉直接从已经剪过的历史开始
-        snip_sid = compact_sid
-        snip_records = await asyncio.to_thread(load_task_records, ls.rctx.workspace_root, snip_sid)
-        if snip_records:
-            snipped, snip_count, snipped_ids = snip_history(ls.messages, snip_records)
-            if snip_count > 0:
-                snip_count = await _apply_snip(ctx, ls, snip_sid, snip_records, snipped, snipped_ids, reason="threshold_snip")
-                await ls.rctx.emit_event("snip_compact", {
-                    "node_id": ls.node.id,
-                    "step": ctx.step,
-                    "snipped_tasks": snip_count,
-                })
-                logger.info("snip_compact: replaced %d tasks, skipping LLM compact", snip_count)
-                ls.compacted = True
-                ctx.extra["compact_modified"] = True
-                return None
+        snip_count = await _threshold_snip(ctx, ls, compact_sid, reason="threshold_snip")
+        if snip_count > 0:
+            await ls.rctx.emit_event("snip_compact", {
+                "node_id": ls.node.id,
+                "step": ctx.step,
+                "snipped_tasks": snip_count,
+                "threshold": "hard",
+            })
+            logger.info("snip_compact: replaced %d tasks, skipping LLM compact", snip_count)
+            ls.compacted = True
+            ctx.extra["compact_modified"] = True
+            return None
     except Exception as snip_error:
         logger.warning("snip compact failed, falling through to LLM compact: %s", snip_error)
 

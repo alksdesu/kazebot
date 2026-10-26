@@ -2240,6 +2240,43 @@ def create_app(
 
         return await run_in_threadpool(snip)
 
+    @app.post("/v1/tasks/view-marks")
+    async def view_marks(request: Request) -> dict[str, Any]:
+        """入口分支上的任务把旧工具结果的截短、让位、清空标记写进父会话，再同步到各活跃分支。"""
+        from engine.view_marks import parse_mark_requests
+
+        st: SupervisorState = app.state.state
+        try:
+            body = await request.json()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="JSON object required")
+        target = body.get("target_session_id")
+        branch = body.get("branch_session_id", "")
+        reason = body.get("reason", "")
+        if not isinstance(target, str) or not target.strip():
+            raise HTTPException(status_code=400, detail="target_session_id required")
+        if not isinstance(branch, str) or len(branch) > 256:
+            raise HTTPException(status_code=400, detail="branch_session_id must be a session identifier")
+        if not isinstance(reason, str) or len(reason) > 64:
+            raise HTTPException(status_code=400, detail="reason must be a short string")
+        marks = parse_mark_requests(body.get("marks"))
+        if marks is None:
+            raise HTTPException(status_code=400, detail="marks must contain valid view marks")
+        target = target.strip()
+
+        def apply() -> dict[str, Any]:
+            with st._lock:
+                if not st.anchor_session_for_locked(target):
+                    raise HTTPException(status_code=404, detail="session not found")
+            # 整份读写会话历史和分支，不能占着全局锁
+            return st._apply_view_marks_via_conv_store(
+                target, marks, branch_session_id=branch.strip(), reason=reason.strip() or "view_marks",
+            )
+
+        return await run_in_threadpool(apply)
+
     @app.post("/v1/tasks/compact-async")
     async def compact_async(request: Request) -> dict[str, Any]:
         """Create a background compaction task that does not suspend the caller.

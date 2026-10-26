@@ -14,6 +14,7 @@ from engine.tool_outputs import bounded_for_event
 from platforms.registry import find_platform
 
 from ._helpers import _now
+from .context_calibration import calibrated_chars_per_token
 from .types import OutputGuide, RouteStatus, Task, TaskKind, TaskStatus, output_guide_payload
 
 
@@ -632,6 +633,7 @@ class TaskStoreMixin:
         route_hints = dict(payload.get("route_hints") or {}) if isinstance(payload.get("route_hints"), dict) else {}
         memory_hints = dict(payload.get("memory_hints") or {}) if isinstance(payload.get("memory_hints"), dict) else {}
         output_guide = output_guide_payload(payload.get(OUTPUT_GUIDE_KEY))
+        session_ratio = calibrated_chars_per_token(self.session_calibration(session_id))
         # Step 2（2026-04-16）：主节点切 ConversationStore。
         # flag 开启时不再注入 context_ref，engine 侧 runner.py 会从 data/conversations/{session_id}.jsonl
         # 加载 history，不再依赖 node_contexts snapshot。
@@ -729,6 +731,8 @@ class TaskStoreMixin:
                     "memory_hints": memory_hints,
                     # 平台输出说明，引擎渲染进提示词的缓存前缀和动态区，不写进对话历史。
                     **({OUTPUT_GUIDE_KEY: output_guide} if output_guide else {}),
+                    # 本任务第一次请求拿到实测比值之前，engine 按这段对话上一次的实测估 token
+                    **({"chars_per_token": round(session_ratio, 4)} if session_ratio is not None else {}),
                     # [2026-05-29 方案C第一步] 为什么：SDK 只读取 task_created
                     # 事件的 payload.input.task_context，不能依赖后续对 Task 的补写。
                     # 怎么改：把 dispatch 上下文模式和父频道 route key 写入

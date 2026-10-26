@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from functools import wraps
 from typing import Any
 
-from clonoth_runtime import get_bool, get_int, parse_bool
+from clonoth_runtime import get_bool, parse_bool
 
 from .stream_buffer import _StreamBuffer
 from ..attachments import prepare_messages_for_llm, strip_image_blocks
@@ -34,7 +34,8 @@ from ..task_digest import (
 )
 from ..prompt import finalize_system_tail
 from ..protocol import TaskAction, ACTION_CANCELLED, ACTION_FAIL
-from .loop_state import _LoopState, _persist_ctx, _short
+from ..view_marks import render_view_marks
+from .loop_state import _LoopState, _persist_ctx, _short, context_archive_session_id
 from .llm_outcome import (
     error_kind,
     is_context_overflow,
@@ -148,56 +149,82 @@ def _create_llm_task(coroutine):
     return task
 
 
-# 小窗口模型上配置的保护预算可能比整个窗口还大，最多只占软阈值的这个百分比
-_PROTECT_PERCENT_OF_THRESHOLD = 40
-
-
 @dataclass(frozen=True)
 class ViewSettings:
-    protect_tokens: int = 0
     supersede: bool = False
     chars_per_token: float = DEFAULT_CHARS_PER_TOKEN
     workspace_root: Any = None
+    # 渠道会不会把历史思维链发回去：会的话估 token 时思维链也算字数，和实测比值的口径一致
+    include_reasoning: bool = False
+
+
+_SESSION_RATIO_KEY = "chars_per_token"
+_RATIO_MIN = 1.0
+_RATIO_MAX = 6.0
+
+
+def session_chars_per_token(task_context: Any) -> float | None:
+    """supervisor 建任务时放进 task_context 的会话实测字符/token 比；没有或认不出时为 None。"""
+    raw = task_context.get(_SESSION_RATIO_KEY) if isinstance(task_context, dict) else None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not raw > 0 or raw == float("inf"):
+        return None
+    return min(max(float(raw), _RATIO_MIN), _RATIO_MAX)
 
 
 def loop_chars_per_token(ls: Any) -> float:
-    """本任务上一次请求实测的字符/token 比，没有真实用量时回落默认值。"""
-    return observed_chars_per_token(
-        int(getattr(ls, "last_prompt_chars", 0) or 0), getattr(ls, "last_prompt_tokens", None),
-    )
+    """本任务上一次请求实测的字符/token 比；本任务还没有实测值时用会话上次请求的比值，都没有才回落默认值。"""
+    tokens = getattr(ls, "last_prompt_tokens", None)
+    chars = int(getattr(ls, "last_prompt_chars", 0) or 0)
+    if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens > 0 and chars > 0:
+        return observed_chars_per_token(chars, tokens)
+    task_context = getattr(getattr(ls, "rctx", None), "task_context", None)
+    return session_chars_per_token(task_context) or DEFAULT_CHARS_PER_TOKEN
+
+
+def _provider_option(provider: Any, key: str) -> Any:
+    # provider 没有公开生效参数的接口，只能读它构造时合并好的 OptionSet（runtime < 渠道 < 节点）
+    getter = getattr(getattr(provider, "_options", None), "get", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter(key)
+    except Exception:
+        return None
+
+
+def replays_reasoning(provider: Any, formatter: Any = None) -> bool:
+    """这个渠道会不会把历史里的思维链随请求发回去。
+
+    DeepSeek 原样回传；通用 OpenAI 渠道没关「回传思维链」就回传；Anthropic 只在 native 模式回放带签名的
+    thinking 块，内容和思维链相当；Gemini、OpenAI Responses 和认不出的渠道按不发算。
+    """
+    name = str(getattr(provider, "name", "") or "").strip().lower()
+    if name == "deepseek":
+        return True
+    if name == "openai":
+        return _provider_option(provider, "replay_reasoning") is not False
+    if name == "anthropic":
+        return str(getattr(formatter, "mode", "") or "") == "native"
+    return False
 
 
 def view_settings(ls: Any) -> ViewSettings:
-    """请求视图按 loop state 取的设置：保护预算、读后让位开关和校准过的字符/token 比。"""
+    """请求视图按 loop state 取的设置：读后让位开关、校准过的字符/token 比和思维链算不算字数。"""
     if ls is None:
         return ViewSettings()
     cfg = getattr(ls, "runtime_cfg", None)
     cfg = cfg if isinstance(cfg, dict) else {}
-    protect = get_int(cfg, "engine.compact.tool_result_protect_tokens", 40_000, min_value=0, max_value=2_000_000)
-    threshold = int(getattr(ls, "compact_threshold", 0) or 0)
-    if threshold > 0:
-        protect = min(protect, threshold * _PROTECT_PERCENT_OF_THRESHOLD // 100)
     return ViewSettings(
-        protect_tokens=protect,
         supersede=get_bool(cfg, "engine.compact.supersede_reads", True),
         chars_per_token=loop_chars_per_token(ls),
         workspace_root=getattr(getattr(ls, "rctx", None), "workspace_root", None),
+        include_reasoning=replays_reasoning(getattr(ls, "provider", None), getattr(ls, "formatter", None)),
     )
 
 
-def tool_result_view(
-    messages: list[dict[str, Any]], ls: Any = None, *, settings: ViewSettings | None = None,
-) -> list[dict[str, Any]]:
-    """和 messages 逐条对应的视图：保护预算内的工具结果保留原文，更早的截短，过时的 read_file 结果让位。"""
-    settings = settings or view_settings(ls)
-    view, _ = bounded_tool_result_view(
-        messages,
-        protect_tokens=settings.protect_tokens,
-        chars_per_token=settings.chars_per_token,
-        supersede=settings.supersede,
-        workspace_root=settings.workspace_root,
-    )
-    return view
+def tool_result_view(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """和 messages 逐条对应的视图：打过标记的旧工具结果按标记截短、让位或清空，其余照原文。"""
+    return render_view_marks(messages)
 
 
 def with_task_digest(messages: list[dict[str, Any]], view: list[dict[str, Any]], ls: Any) -> list[dict[str, Any]]:
@@ -213,20 +240,18 @@ def with_task_digest(messages: list[dict[str, Any]], view: list[dict[str, Any]],
 def request_view(messages: list[dict[str, Any]], ls: Any = None) -> list[dict[str, Any]]:
     """发给模型的那份消息视图，持久历史不动。压缩阈值也按它估，两边口径一致。
 
-    给了 loop state 就按它的设置保护最近的工具结果、让过时的读取结果让位、换入任务进度摘要；
-    不给只按固定上限截短旧工具结果。
+    旧工具结果只按落了盘的标记渲染，请求时不再现算截短和让位，同一条消息每次发出去都一样；
+    给了 loop state 再换入本任务的进度摘要。
     """
-    if ls is None:
-        view, _ = bounded_tool_result_view(messages)
-        return view
-    return with_task_digest(messages, tool_result_view(messages, ls), ls)
+    view = tool_result_view(messages)
+    return view if ls is None else with_task_digest(messages, view, ls)
 
 
 def overflow_view(messages: list[dict[str, Any]], ls: Any) -> list[dict[str, Any]]:
-    """供应商报上下文溢出后重试用的视图：不再保护，最近一轮也截到普通上限。"""
+    """供应商报上下文溢出后重试用的视图：在标记之上现算截短，不再保护，最近一轮也截到普通上限，不落盘。"""
     settings = view_settings(ls)
     view, _ = bounded_tool_result_view(
-        messages,
+        render_view_marks(messages),
         max_chars=TOOL_RESULT_VIEW_CHARS,
         keep_latest_round=False,
         chars_per_token=settings.chars_per_token,
@@ -303,23 +328,30 @@ async def record_response_usage(ls: Any, resp: Any, llm_messages: list[dict[str,
     usage = getattr(resp, "usage", None)
     if not isinstance(usage, dict) or not isinstance(usage.get("prompt_tokens"), int):
         return
-    prompt_chars = total_content_chars(llm_messages) + (
+    include_reasoning = replays_reasoning(getattr(ls, "provider", None), getattr(ls, "formatter", None))
+    prompt_chars = total_content_chars(llm_messages, include_reasoning=include_reasoning) + (
         len(json.dumps(tools_arg, ensure_ascii=False, default=str)) if tools_arg else 0
     )
     ls.last_prompt_tokens = usage["prompt_tokens"]
     ls.last_prompt_chars = prompt_chars
     ls.last_usage = dict(usage)
     ls.compacted = False
-    await ls.rctx.emit_event("context_usage", {
+    payload: dict[str, Any] = {
         "node_id": ls.node.id,
         "task_id": ls.rctx.task_id,
         "usage": usage,
         # 配上真实 token 数，supervisor 侧的字符预算才能按本会话的实际比例裁剪；
         # 硬编码 3 字符/token 是按英文定的，中文会把预算放大两三倍。
         "prompt_chars": prompt_chars,
+        "reasoning_counted": include_reasoning,
         # get_context_window 报的阈值得是按模型窗口收紧后真正生效的这一份
         **threshold_report(ls),
-    })
+    }
+    # 子节点和系统任务的事件也发到路由会话，supervisor 靠它把比值记到这段对话自己名下
+    conversation = context_archive_session_id(getattr(ls, "rctx", None))
+    if conversation:
+        payload["conversation_session_id"] = conversation
+    await ls.rctx.emit_event("context_usage", payload)
 
 
 def digest_provider_call(ls: Any, step: int) -> Any:
@@ -343,8 +375,9 @@ async def _overflow_digest(ls: Any, step: int) -> DigestOutcome:
     return await run_task_digest(
         ls,
         step=step,
-        view=tool_result_view(ls.messages, ls, settings=view_cfg),
+        view=tool_result_view(ls.messages),
         chars_per_token=view_cfg.chars_per_token,
+        include_reasoning=view_cfg.include_reasoning,
         trigger_tokens=0,
         keep_tokens=settings.keep_tokens(threshold),
         call=digest_provider_call(ls, step),

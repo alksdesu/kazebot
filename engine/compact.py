@@ -14,12 +14,19 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Iterable
+
+from clonoth_runtime import get_float, get_int
 
 from .prompt import SYSTEM_TAIL_KEY
 from .tool_outputs import LATEST_ROUND_VIEW_CHARS, excerpt_text
 
 logger = logging.getLogger(__name__)
+
+# 截短、让位、清空的标记放在消息 meta 的这个键下，原文不动；请求视图按它渲染（engine.view_marks）
+VIEW_MARK_KEY = "view_mark"
 
 
 # ---------------------------------------------------------------------------
@@ -45,10 +52,34 @@ def observed_chars_per_token(total_chars: int, prompt_tokens: int | None) -> flo
     return min(max(total_chars / prompt_tokens, _CHARS_PER_TOKEN_MIN), _CHARS_PER_TOKEN_MAX)
 
 
-def total_content_chars(messages: list[Any]) -> int:
-    """统计消息集的文本和工具参数字符总数。"""
+def _reasoning_chars(message: Any) -> int:
+    """assistant 消息的思维链字数：运行期看顶层 reasoning_content，存储里的记录看 meta。"""
+    if isinstance(message, dict):
+        if message.get("role") != "assistant":
+            return 0
+        top = message.get("reasoning_content")
+        if isinstance(top, str) and top:
+            return len(top)
+        meta = message.get("_meta") or message.get("meta")
+    else:
+        if getattr(message, "role", "") != "assistant":
+            return 0
+        meta = getattr(message, "meta", None)
+    if not isinstance(meta, dict):
+        return 0
+    reasoning = meta.get("reasoning") or meta.get("thinking_text")
+    return len(reasoning) if isinstance(reasoning, str) else 0
+
+
+def total_content_chars(messages: list[Any], *, include_reasoning: bool = False) -> int:
+    """统计消息集的文本和工具参数字符总数。
+
+    include_reasoning 只在渠道会把历史思维链发回去时打开，字数和实测 token 才是同一批内容。
+    """
     total = 0
     for message in messages:
+        if include_reasoning:
+            total += _reasoning_chars(message)
         content = message.get("content", "") if isinstance(message, dict) else getattr(message, "content", "")
         tail = message.get(SYSTEM_TAIL_KEY) if isinstance(message, dict) else None
         if isinstance(message, dict) and message.get("role") == "system" and isinstance(tail, str):
@@ -103,7 +134,7 @@ def is_tool_result_message(message: Any) -> bool:
     return isinstance(content, str) and content.startswith(TEXT_TOOL_RESULT_PREFIX)
 
 
-def _bounded_content(content: Any, max_chars: int) -> Any:
+def bounded_content(content: Any, max_chars: int) -> Any:
     if max_chars <= 0:
         return _TOOL_RESULT_PLACEHOLDER
     if isinstance(content, str):
@@ -116,7 +147,7 @@ def _bounded_content(content: Any, max_chars: int) -> Any:
             if isinstance(part, dict) and isinstance(part.get("text"), str):
                 text = part["text"]
                 if len(text) > remaining:
-                    text = _bounded_content(text, remaining)
+                    text = bounded_content(text, remaining)
                     changed = True
                 remaining = max(0, remaining - len(text))
                 bounded.append({**part, "text": text})
@@ -219,30 +250,77 @@ def bounded_tool_result_view(
         message = result[index]
         limit = latest_limit if 0 <= latest_round_start < index else max_chars
         content = message.get("content", "")
-        bounded = _bounded_content(content, limit)
+        bounded = bounded_content(content, limit)
         if bounded != content:
             message["content"] = bounded
             changed.add(index)
     return result, len(changed)
 
 
+MARK_TRUNCATED = "truncated"
+MARK_SUPERSEDED = "superseded"
+MARK_CLEARED = "cleared"
+
+
+def _positive_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def parse_view_mark(raw: Any) -> dict[str, Any] | None:
+    """规整成标准形状的标记；认不出的一律当没有标记，照原文发。"""
+    if not isinstance(raw, dict):
+        return None
+    kind = raw.get("kind")
+    if kind == MARK_CLEARED:
+        return {"kind": MARK_CLEARED}
+    if kind == MARK_TRUNCATED:
+        chars = _positive_int(raw.get("chars"))
+        return {"kind": MARK_TRUNCATED, "chars": chars} if chars is not None else None
+    if kind != MARK_SUPERSEDED:
+        return None
+    paths = raw.get("paths")
+    if not isinstance(paths, list) or not paths or not all(isinstance(path, str) and path for path in paths):
+        return None
+    files = _positive_int(raw.get("files"))
+    mark: dict[str, Any] = {
+        "kind": MARK_SUPERSEDED,
+        "paths": list(paths),
+        "files": files if files is not None and files >= len(paths) else len(paths),
+    }
+    by = raw.get("by")
+    if isinstance(by, str) and by:
+        mark["by"] = by
+    return mark
+
+
+def view_mark_of(message: Any) -> dict[str, Any] | None:
+    """消息上的标记：运行期 dict 看 _meta，存储 dict 看 meta，ConversationStore 的 Message 看 .meta。"""
+    if isinstance(message, dict):
+        for key in ("_meta", "meta"):
+            meta = message.get(key)
+            if isinstance(meta, dict) and VIEW_MARK_KEY in meta:
+                return parse_view_mark(meta[VIEW_MARK_KEY])
+        return None
+    meta = getattr(message, "meta", None)
+    return parse_view_mark(meta.get(VIEW_MARK_KEY)) if isinstance(meta, dict) else None
+
+
 # ---------------------------------------------------------------------------
 #  Microcompact — time-based tool_result cleanup
 #  When last assistant message is older than gap_minutes (cache expired),
-#  clear old tool_result contents, keeping only the most recent ones.
+#  mark old tool_result contents as cleared, keeping only the most recent ones.
 # ---------------------------------------------------------------------------
 
-_MICROCOMPACT_PLACEHOLDER = "[tool result cleared — cache expired]"
+MICROCOMPACT_PLACEHOLDER = "[tool result cleared — cache expired]"
+MICROCOMPACT_MIN_RESULTS = 3
 
 
-def _cleared_tool_result(content: str) -> str:
+def cleared_tool_result(content: str) -> str:
     # 保留工具名那一行，正文换成占位
-    return content.split("\n", 1)[0] + "\n" + _MICROCOMPACT_PLACEHOLDER
+    return content.split("\n", 1)[0] + "\n" + MICROCOMPACT_PLACEHOLDER
 
 
 def last_assistant_time(messages: list[dict[str, Any]]):
-    from datetime import datetime, timezone
-
     for msg in reversed(messages):
         meta = msg.get("_meta", {})
         if not isinstance(meta, dict):
@@ -256,58 +334,85 @@ def last_assistant_time(messages: list[dict[str, Any]]):
     return None
 
 
+def idle_minutes(messages: list[dict[str, Any]], now: datetime | None = None) -> float | None:
+    """距最后一条 assistant 消息过了多少分钟；没有或时间戳认不出时为 None。"""
+    last_assistant = last_assistant_time(messages)
+    if last_assistant is None:
+        return None
+    return ((now or datetime.now(timezone.utc)) - last_assistant).total_seconds() / 60.0
+
+
+def _clearable(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    if not isinstance(content, str) or content == cleared_tool_result(content):
+        return False
+    mark = view_mark_of(message)
+    return mark is None or mark["kind"] == MARK_TRUNCATED
+
+
 def microcompact_targets(
     messages: list[dict[str, Any]],
     *,
     gap_minutes: int = 60,
     keep_recent: int = 5,
-    min_tool_results: int = 3,
+    min_tool_results: int = MICROCOMPACT_MIN_RESULTS,
+    exclude_task_ids: Iterable[str] = (),
 ) -> list[int]:
-    """空闲超过 gap_minutes（provider 的 prompt 缓存多半已过期）时，该清空正文的旧工具结果下标。
+    """空闲超过 gap_minutes 时该标成已清空的旧工具结果下标；gap_minutes 为 0 表示不做空闲清理。
 
-    最近 keep_recent 条保留；已经清过的不再算。
+    最近 keep_recent 条保留，exclude_task_ids 里任务自己的结果不动；已经清空或让位过的不再算，截短过的可以再清空。
     """
-    from datetime import datetime, timezone
-
-    last_assistant = last_assistant_time(messages)
-    if last_assistant is None:
+    if gap_minutes <= 0:
         return []
-    gap = (datetime.now(timezone.utc) - last_assistant).total_seconds() / 60.0
-    if gap < gap_minutes:
+    gap = idle_minutes(messages)
+    if gap is None or gap < gap_minutes:
         return []
-    indices = [index for index, message in enumerate(messages) if is_tool_result_message(message)]
+    excluded = {str(task_id) for task_id in exclude_task_ids if task_id}
+    indices = [
+        index for index, message in enumerate(messages)
+        if is_tool_result_message(message) and _source_task_id_from_message_like(message) not in excluded
+    ]
     if len(indices) < min_tool_results:
         return []
     older = indices[:-keep_recent] if keep_recent > 0 else indices
-    return [
-        index for index in older
-        if isinstance(messages[index].get("content"), str)
-        and messages[index]["content"] != _cleared_tool_result(messages[index]["content"])
-    ]
+    return [index for index in older if _clearable(messages[index])]
 
 
-def microcompact_messages(
-    messages: list[dict[str, Any]],
-    *,
-    gap_minutes: int = 60,
-    keep_recent: int = 5,
-    min_tool_results: int = 3,
-) -> tuple[list[dict[str, Any]], int]:
-    """按 microcompact_targets 清空旧工具结果的正文，原地修改，返回 (messages, 清掉的条数)。"""
-    targets = microcompact_targets(
-        messages, gap_minutes=gap_minutes, keep_recent=keep_recent, min_tool_results=min_tool_results,
+@dataclass(frozen=True)
+class IdleSettings:
+    """空闲清理（打已清空标记）和空闲 snip 的阈值，0 表示不做。"""
+
+    clear_minutes: int
+    clear_keep_results: int
+    snip_hours: float
+    snip_keep_tasks: int
+
+
+def _idle_layer(cfg: dict[str, Any], defaults: IdleSettings) -> IdleSettings:
+    return IdleSettings(
+        clear_minutes=get_int(cfg, "idle_clear_minutes", defaults.clear_minutes, min_value=0, max_value=10_000_000),
+        clear_keep_results=get_int(
+            cfg, "idle_clear_keep_results", defaults.clear_keep_results, min_value=0, max_value=10_000,
+        ),
+        snip_hours=get_float(cfg, "idle_snip_hours", defaults.snip_hours, min_value=0.0, max_value=100_000.0),
+        snip_keep_tasks=get_int(cfg, "idle_snip_keep_tasks", defaults.snip_keep_tasks, min_value=1, max_value=10_000),
     )
-    cleared = clear_tool_results(messages, targets)
-    if cleared:
-        logger.info("microcompact: cleared %d tool_results (kept=%d recent)", cleared, keep_recent)
-    return messages, cleared
 
 
-def clear_tool_results(messages: list[dict[str, Any]], targets: list[int]) -> int:
-    """把 targets 指向的工具结果正文换成占位，原地修改，返回清掉的条数。"""
-    for index in targets:
-        messages[index]["content"] = _cleared_tool_result(messages[index]["content"])
-    return len(targets)
+def idle_settings(runtime_cfg: Any, *, channel: str = "", provider_type: str = "") -> IdleSettings:
+    """engine.compact 下的空闲阈值，idle_overrides 里按渠道块名 > provider 类型 > 全局逐项覆盖。"""
+    cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+    engine = cfg.get("engine") if isinstance(cfg.get("engine"), dict) else {}
+    compact = engine.get("compact") if isinstance(engine.get("compact"), dict) else {}
+    settings = _idle_layer(compact, IdleSettings(clear_minutes=60, clear_keep_results=5, snip_hours=1.0, snip_keep_tasks=3))
+    overrides = compact.get("idle_overrides")
+    if not isinstance(overrides, dict):
+        return settings
+    for name in (provider_type, channel):
+        layer = overrides.get(name) if name else None
+        if isinstance(layer, dict):
+            settings = _idle_layer(layer, settings)
+    return settings
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +463,8 @@ def should_compact(
     threshold_tokens: int,
     last_prompt_tokens: int | None = None,
     chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
+    *,
+    include_reasoning: bool = False,
 ) -> bool:
     """Return True if estimated/actual token count exceeds *threshold_tokens*.
 
@@ -366,7 +473,7 @@ def should_compact(
     if threshold_tokens <= 0:
         return False
     divisor = chars_per_token if chars_per_token > 0 else DEFAULT_CHARS_PER_TOKEN
-    estimated_tokens = total_content_chars(messages) / divisor
+    estimated_tokens = total_content_chars(messages, include_reasoning=include_reasoning) / divisor
     if last_prompt_tokens is not None:
         estimated_tokens = max(estimated_tokens, last_prompt_tokens)
     return estimated_tokens > threshold_tokens
@@ -408,16 +515,20 @@ def count_real_task_segments(messages: list[Any]) -> int:
     return count
 
 
-def estimate_message_tokens(message: Any, chars_per_token: float = DEFAULT_CHARS_PER_TOKEN) -> int:
+def estimate_message_tokens(
+    message: Any, chars_per_token: float = DEFAULT_CHARS_PER_TOKEN, *, include_reasoning: bool = False,
+) -> int:
     """Estimate one message's token cost from its character count."""
     divisor = chars_per_token if chars_per_token > 0 else DEFAULT_CHARS_PER_TOKEN
-    return int(total_content_chars([message]) / divisor)
+    return int(total_content_chars([message], include_reasoning=include_reasoning) / divisor)
 
 
 def segments_within_token_budget(
     segments: list[list[Any]],
     keep_recent_tokens: int,
     chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
+    *,
+    include_reasoning: bool = False,
 ) -> int:
     """Return how many trailing segments fit into *keep_recent_tokens*.
 
@@ -430,7 +541,9 @@ def segments_within_token_budget(
     used = 0
     kept = 0
     for segment in reversed(segments):
-        segment_tokens = sum(estimate_message_tokens(m, chars_per_token) for m in segment)
+        segment_tokens = sum(
+            estimate_message_tokens(m, chars_per_token, include_reasoning=include_reasoning) for m in segment
+        )
         if used + segment_tokens > keep_recent_tokens:
             break
         used += segment_tokens
@@ -450,6 +563,7 @@ def apply_compact_summary(
     threshold_tokens: int = 0,
     keep_recent_tokens: int = 0,
     chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
+    include_reasoning: bool = False,
 ) -> list[dict[str, Any]]:
     """Apply a pre-generated summary to compress messages.
 
@@ -501,7 +615,9 @@ def apply_compact_summary(
 
     # keep_recent 现在是「保留最近 N 个完整 task segment」
     if keep_recent_tokens > 0:
-        keep_recent = segments_within_token_budget(segments, keep_recent_tokens, chars_per_token)
+        keep_recent = segments_within_token_budget(
+            segments, keep_recent_tokens, chars_per_token, include_reasoning=include_reasoning,
+        )
     keep_recent = max(keep_recent, 1)  # 至少保留当前活跃 task
     if len(segments) <= keep_recent:
         return messages

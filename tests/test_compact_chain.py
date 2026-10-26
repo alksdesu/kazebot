@@ -297,12 +297,16 @@ class TestSupervisorCalibration:
     SESSION = "sess-cal"
 
     def _router(self, tmp_path: Path, usage: dict[str, Any] | None):
+        from supervisor.session import SessionMixin
         from supervisor.task_router import TaskRouterMixin
 
-        class _Router(TaskRouterMixin):
+        class _Router(TaskRouterMixin, SessionMixin):
             def __init__(self) -> None:
                 self.workspace_root = tmp_path
-                self._session_context_usage = {TestSupervisorCalibration.SESSION: usage} if usage else {}
+                # SessionMixin 把这段对话自己那次请求的实测记在 calibration 下
+                self._session_context_usage = (
+                    {TestSupervisorCalibration.SESSION: {"calibration": usage}} if usage else {}
+                )
 
             def _sync_compact_to_branches(self, *args: Any) -> None:
                 return None

@@ -92,9 +92,9 @@ TASK_CONVERSATION_MAX_AGE = float(
 # node_contexts 的快照机制已被子会话替代，留 48 小时宽裕期再清。
 NODE_CONTEXTS_MAX_AGE = 48 * 3600     # 48 h
 
-# TaskRecord 转写目录 data/transcripts/。文件形如 {session_id}.jsonl 与 child_*.jsonl，
-# 是每个任务的执行转写，供事后分析/记忆提取使用。长期未更新即可回收。
-# 为什么：之前该目录从不清理，会无限累积（本例已 233 个）。
+# TaskRecord 目录 data/transcripts/。文件形如 {session_id}.jsonl 与 child_*.jsonl，记着每个任务的
+# 记录和轮摘要，snip 和轮摘要回写都读它。14 天没更新就删：空闲更久的会话没有轮摘要可 snip，
+# 到了压缩阈值只能走 LLM 压缩。
 TRANSCRIPTS_MAX_AGE = float(os.getenv("CLONOTH_TRANSCRIPTS_MAX_AGE_SECONDS", str(14 * 24 * 3600)))  # 14 d
 
 # engine/supervisor 进程日志 data/logs/*.log。重启/重连会产生大量空日志文件

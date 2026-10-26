@@ -348,8 +348,13 @@ def apply_task_digest(
     return result
 
 
-def _unit_tokens(view: list[dict[str, Any]], unit: TaskUnit, chars_per_token: float) -> int:
-    return sum(estimate_message_tokens(view[index], chars_per_token) for index in unit.indices)
+def _unit_tokens(
+    view: list[dict[str, Any]], unit: TaskUnit, chars_per_token: float, include_reasoning: bool = False,
+) -> int:
+    return sum(
+        estimate_message_tokens(view[index], chars_per_token, include_reasoning=include_reasoning)
+        for index in unit.indices
+    )
 
 
 def _coverable_units(layout: TaskLayout, tokens: list[int], keep_tokens: int) -> int:
@@ -376,11 +381,13 @@ def plan_task_digest(
     trigger_tokens: int,
     keep_tokens: int,
     require_no_digest: bool = False,
+    include_reasoning: bool = False,
 ) -> DigestPlan | None:
     """要不要摘要、摘要到第几段。
 
     本任务没被摘要覆盖的原文（含开头指令，不含摘要本身）超过 trigger_tokens、且保留区之外还有没覆盖的完整轮次才返回计划；
     只数原文，摘要完要再长出半条触发线才会再摘要。require_no_digest 时已有能用的摘要就不再摘要。
+    include_reasoning 时思维链也算字数，渠道会把它发回去时才打开。
     """
     if len(view) != len(messages):
         return None
@@ -391,10 +398,12 @@ def plan_task_digest(
     if covered and require_no_digest:
         return None
     covered = covered or 0
-    tokens = [_unit_tokens(view, unit, chars_per_token) for unit in layout.units]
+    tokens = [_unit_tokens(view, unit, chars_per_token, include_reasoning) for unit in layout.units]
     total = sum(tokens[covered:])
     if layout.instruction is not None:
-        total += estimate_message_tokens(view[layout.instruction], chars_per_token)
+        total += estimate_message_tokens(
+            view[layout.instruction], chars_per_token, include_reasoning=include_reasoning,
+        )
     if total <= trigger_tokens:
         return None
     target = _coverable_units(layout, tokens, keep_tokens)
@@ -711,6 +720,7 @@ async def run_task_digest(
     call: DigestCall,
     reason: str,
     require_no_digest: bool = False,
+    include_reasoning: bool = False,
 ) -> DigestOutcome:
     """该摘要时生成一份覆盖范围更大的新摘要，写进 loop state 并落盘，发 task_digest 事件。
 
@@ -727,6 +737,7 @@ async def run_task_digest(
     plan = plan_task_digest(
         messages, view, task_id=task_id, digest=current, chars_per_token=chars_per_token,
         trigger_tokens=trigger_tokens, keep_tokens=keep_tokens, require_no_digest=require_no_digest,
+        include_reasoning=include_reasoning,
     )
     if plan is None:
         return DigestOutcome.SKIPPED
