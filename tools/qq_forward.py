@@ -137,6 +137,8 @@ if __name__ == "__main__":
     import uuid
     from pathlib import Path
 
+    from _channel import parse_bool
+
     def _read_input():
         raw = (sys.stdin.read() or "{}").lstrip("\ufeff")
         try:
@@ -293,8 +295,8 @@ if __name__ == "__main__":
         payload["target_ref"] = str(args.get("target_ref") or "").strip()
         payload["query"] = str(args.get("query") or "").strip()
         payload["text"] = str(args.get("text") or "").strip()
-        payload["include_images"] = bool(args.get("include_images", True))
-        payload["include_files"] = bool(args.get("include_files", True))
+        payload["include_images"] = bool(parse_bool(args.get("include_images"), True))
+        payload["include_files"] = bool(parse_bool(args.get("include_files"), True))
         raw_refs = args.get("message_refs")
         message_refs = []
         if isinstance(raw_refs, list):
@@ -305,7 +307,7 @@ if __name__ == "__main__":
         payload["message_refs"] = message_refs
 
         # “最近生成/发出的图片”选择（如生图插件产出的图）。
-        use_recent = bool(args.get("use_recent", False))
+        use_recent = bool(parse_bool(args.get("use_recent"), False))
         recent_refs = []
         raw_recent = args.get("recent_refs")
         if isinstance(raw_recent, list):

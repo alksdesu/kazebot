@@ -98,6 +98,8 @@ if __name__ == "__main__":
         selected_preset,
         size_to_dimensions,
     )
+    # common 已把代码根放进 sys.path，工具目录不在里面，_channel 只能按包名找
+    from tools._channel import parse_bool
 
     def output(result):
         print(json.dumps(result, ensure_ascii=False))
@@ -137,9 +139,11 @@ if __name__ == "__main__":
     scheduler = str(args.get("scheduler") or params.get("scheduler") or params.get("noise_schedule") or "karras")
     steps = int(args.get("steps") or params.get("steps") or 28)
     scale = float(args.get("scale") if args.get("scale") is not None else params.get("scale", 6))
-    for bool_key in ("qualityToggle", "autoSmea", "variety_boost", "sm", "sm_dyn", "decrisper"):
-        if bool_key in args:
-            params[bool_key] = bool(args.get(bool_key))
+    # 预设、模型传的 params 和单独给的开关都可能写成字符串：合并后统一读成真假，单独给的认不出就留原来的
+    switch_defaults = {"qualityToggle": True, "autoSmea": False, "variety_boost": False, "sm": False, "sm_dyn": False, "decrisper": False}
+    for bool_key, default in switch_defaults.items():
+        configured = bool(parse_bool(params.get(bool_key), default))
+        params[bool_key] = bool(parse_bool(args.get(bool_key), configured)) if bool_key in args else configured
     for num_key in ("ucPreset", "cfg_rescale"):
         if num_key in args:
             params[num_key] = args.get(num_key)
@@ -191,16 +195,16 @@ if __name__ == "__main__":
                 "n_samples": 1,
                 "negative_prompt": all_negative,
                 "ucPreset": int(params.get("ucPreset", 0)),
-                "qualityToggle": bool(params.get("qualityToggle", True)),
-                "sm": bool(params.get("sm", False)),
-                "sm_dyn": bool(params.get("sm_dyn", False)),
-                "dynamic_thresholding": bool(params.get("decrisper", False)),
+                "qualityToggle": params["qualityToggle"],
+                "sm": params["sm"],
+                "sm_dyn": params["sm_dyn"],
+                "dynamic_thresholding": params["decrisper"],
             },
         }
     else:
         use_coords = any(cp.get("center") and (cp["center"].get("x") != 0.5 or cp["center"].get("y") != 0.5) for cp in clean_char_prompts)
         skip_cfg_above_sigma = None
-        if is_v45 and params.get("variety_boost"):
+        if is_v45 and params["variety_boost"]:
             skip_cfg_above_sigma = math.pow((width * height) / 1011712, 0.5) * 58
         char_captions = [{"char_caption": cp.get("prompt", ""), "centers": [cp.get("center") or {"x": 0.5, "y": 0.5}]} for cp in clean_char_prompts]
         neg_char_captions = [{"char_caption": cp.get("uc", ""), "centers": [cp.get("center") or {"x": 0.5, "y": 0.5}]} for cp in clean_char_prompts]
@@ -219,8 +223,8 @@ if __name__ == "__main__":
                 "steps": steps,
                 "n_samples": 1,
                 "ucPreset": int(params.get("ucPreset", 0)),
-                "qualityToggle": bool(params.get("qualityToggle", True)),
-                "autoSmea": bool(params.get("autoSmea", False)),
+                "qualityToggle": params["qualityToggle"],
+                "autoSmea": params["autoSmea"],
                 "cfg_rescale": float(params.get("cfg_rescale", 0) or 0),
                 "dynamic_thresholding": False,
                 "controlnet_strength": 1,

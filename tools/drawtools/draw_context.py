@@ -31,6 +31,8 @@ if __name__ == "__main__":
     from typing import Any
 
     from common import is_selected_preset, iter_presets, load_character_tags, load_settings
+    # common 已把代码根放进 sys.path，工具目录不在里面，_channel 只能按包名找
+    from tools._channel import parse_bool
 
     def output(result):
         print(json.dumps(result, ensure_ascii=False))
@@ -63,7 +65,7 @@ if __name__ == "__main__":
 
     args = json.loads(sys.stdin.read() or "{}")
     query = str(args.get("query") or "")
-    include_characters = bool(args.get("include_characters", True))
+    include_characters = bool(parse_bool(args.get("include_characters"), True))
     max_characters = int(args.get("max_characters") or 8)
     max_characters = max(1, min(50, max_characters))
 

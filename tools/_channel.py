@@ -1,4 +1,4 @@
-"""工具子进程共用的渠道与平台密钥解析。
+"""工具子进程共用的渠道、平台密钥和开关参数解析。
 
 工具是独立子进程、只吃标准库，导不了 clonoth_runtime，所以在这里放一份而不是各抄一遍。
 密钥只能从 .env 和 config/secrets.env 读：safe_subprocess_env() 会把 *_API_KEY 和平台声明的密钥变量从环境里剥掉。
@@ -16,6 +16,21 @@ OPENAI_COMPATIBLE = frozenset({"openai", "deepseek"})
 _MODELS_FILE = ("config", "models.yaml")
 _PLATFORM_SECRETS_FILE = ("data", "platform_secrets.yaml")
 _SHARED_SECRETS_FILE = ("config", "secrets.env")
+# 和 clonoth_runtime.parse_bool 认同一套写法（测试逐个比对两份）：模型和手写配置写成字符串的 "false"、no 也算关
+_TRUE_WORDS = frozenset({"1", "true", "yes", "y", "on"})
+_FALSE_WORDS = frozenset({"0", "false", "no", "n", "off"})
+
+
+def parse_bool(raw: object, default: bool | None = None) -> bool | None:
+    """工具参数和配置里的开关。认不出的（包括空）给 default。"""
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw if raw is not None else "").strip().lower()
+    if text in _TRUE_WORDS:
+        return True
+    if text in _FALSE_WORDS:
+        return False
+    return default
 
 
 class MainChannel(NamedTuple):

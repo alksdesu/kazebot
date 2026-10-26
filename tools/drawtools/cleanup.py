@@ -15,8 +15,15 @@ if __package__:
     from .common import WORKSPACE_ROOT, load_settings
 else:
     from common import WORKSPACE_ROOT, load_settings
+# 两种加载方式下代码根都已在 sys.path 里，工具目录不一定在，_channel 只能按包名找
+from tools._channel import parse_bool
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+def _cleanup_enabled(storage: dict[str, Any]) -> bool:
+    """settings.yaml 手写的开关：写成 "false"、no 的也算关，不然关了还照删。"""
+    return bool(parse_bool(storage.get("cleanup_enabled"), True))
 
 
 def novelai_attachments_dir() -> Path:
@@ -32,7 +39,7 @@ def _image_files(root: Path) -> list[Path]:
 def cleanup_novelai_attachments(settings: dict[str, Any] | None = None, *, force: bool = False) -> dict[str, Any]:
     settings = settings or load_settings()
     storage = settings.get("storage") if isinstance(settings.get("storage"), dict) else {}
-    if not force and not bool(storage.get("cleanup_enabled", True)):
+    if not force and not _cleanup_enabled(storage):
         return {"ok": True, "skipped": True, "reason": "cleanup disabled", "deleted_count": 0, "deleted_bytes": 0}
 
     root = novelai_attachments_dir()
@@ -109,7 +116,7 @@ def cleanup_novelai_attachments(settings: dict[str, Any] | None = None, *, force
 def maybe_cleanup_novelai_attachments(settings: dict[str, Any] | None = None) -> dict[str, Any]:
     settings = settings or load_settings()
     storage = settings.get("storage") if isinstance(settings.get("storage"), dict) else {}
-    if not bool(storage.get("cleanup_enabled", True)):
+    if not _cleanup_enabled(storage):
         return {"ok": True, "skipped": True, "reason": "cleanup disabled", "deleted_count": 0, "deleted_bytes": 0}
     interval = float(storage.get("cleanup_interval_sec", 3600) or 0)
     marker = WORKSPACE_ROOT / "data" / "temp" / "novelai" / "last_cleanup.txt"

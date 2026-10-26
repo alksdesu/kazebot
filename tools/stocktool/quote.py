@@ -54,6 +54,8 @@ def _run(args: dict) -> dict:
     from stocklib.formatter import format_result
     from stocklib.resolver import resolve_many
     from stocklib.sources import get_quote
+    # stocklib.cache 已把代码根放进 sys.path，工具目录不在里面，_channel 只能按包名找
+    from tools._channel import parse_bool
 
     raw_symbols = args.get("symbols")
     if isinstance(raw_symbols, list) and raw_symbols:
@@ -81,8 +83,8 @@ def _run(args: dict) -> dict:
         truncated_warning = ""
 
     market = str(args.get("market") or "auto")
-    refresh = bool(args.get("refresh", False))
-    include_raw = bool(args.get("include_raw", False))
+    refresh = bool(parse_bool(args.get("refresh"), False))
+    include_raw = bool(parse_bool(args.get("include_raw"), False))
 
     resolved, failures = resolve_many(inputs, market_hint=market)
     quotes = []
