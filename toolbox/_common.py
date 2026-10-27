@@ -416,8 +416,6 @@ def safe_subprocess_env(*, project_origin: Path | str | None = None) -> dict[str
         if ku in _ISOLATION_ENV_KEYS_UPPER:
             env.pop(k, None)
             continue
-        if ku == "NOVELAI_API_KEY":
-            continue
         if ku in _SENSITIVE_ENV_KEYS_UPPER:
             env.pop(k, None)
             continue

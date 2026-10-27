@@ -33,6 +33,7 @@ from clonoth_runtime import SwitchValueError, switch_refusal  # noqa: E402
 from toolbox.builtins.mcp_clients import create_or_update_mcp_client, delete_mcp_client, list_mcp_clients  # noqa: E402
 from toolbox.builtins.tool_manage import reload_tools  # noqa: E402
 from toolbox.context import ToolContext  # noqa: E402
+from toolbox.redaction import HIDDEN  # noqa: E402
 from toolbox.registry import ToolRegistry  # noqa: E402
 from toolbox.reload_seqs import ReloadSeqs  # noqa: E402
 
@@ -1427,6 +1428,107 @@ def test_saving_or_deleting_a_client_is_refused_before_approval_while_the_file_i
     assert path.read_bytes() == before
 
 
+class _DetailsCtx(_ApprovingCtx):
+    """放行一切，同时记下送审的 details。"""
+
+    def __init__(self, workspace_root: Path) -> None:
+        super().__init__(workspace_root)
+        self.requested: list[tuple[str, dict[str, Any]]] = []
+
+    async def request_op(self, op: str, parameters: dict[str, Any]) -> dict[str, Any]:
+        self.requested.append((op, dict(parameters)))
+        return {"safety_level": "auto"}
+
+
+def test_the_approval_shows_what_a_stdio_client_runs_with_its_secrets_hidden(ws: Path) -> None:
+    # 保存后每个 worker 都起这条命令，审批人得看见命令、参数和环境；令牌却会跟着 details 进事件流、控制台和调试工具。
+    ctx = _DetailsCtx(ws)
+    spec = {
+        "id": "gh", "transport": "stdio", "command": "npx",
+        "args": ["-y", "server-github", "--token=ghp_abcdefghijklmnopqrst"],
+        "env": {"GITHUB_TOKEN": "ghp_zyxwvutsrqponmlkjihg", "LD_PRELOAD": "/tmp/hook.so"},
+    }
+
+    saved = asyncio.run(create_or_update_mcp_client(spec, ctx))
+
+    assert saved["ok"] is True
+    [(op, details)] = ctx.requested
+    assert op == "write_file"
+    assert details["path"] == config_layout.MCP_FILE
+    assert details["mcp_client"] == "gh"
+    assert details["transport"] == "stdio"
+    assert details["command"] == "npx"
+    assert details["args"][:2] == ["-y", "server-github"]
+    # 不像密钥的照原样给：LD_PRELOAD 这种正是审批人要看的
+    assert details["env"] == {"GITHUB_TOKEN": HIDDEN, "LD_PRELOAD": "/tmp/hook.so"}
+    shown = json.dumps(details, ensure_ascii=False)
+    assert "abcdefghijklmnopqrst" not in shown
+    assert "zyxwvutsrqponmlkjihg" not in shown
+    stored = yaml.safe_load(config_layout.mcp_path(ws).read_text(encoding="utf-8"))["clients"]["gh"]
+    assert stored["env"]["GITHUB_TOKEN"] == "ghp_zyxwvutsrqponmlkjihg"
+    assert stored["args"][2] == "--token=ghp_abcdefghijklmnopqrst"
+
+
+def test_the_approval_shows_where_an_http_client_connects_with_its_secrets_hidden(ws: Path) -> None:
+    ctx = _DetailsCtx(ws)
+    spec = {
+        "id": "remote", "transport": "streamable_http",
+        "url": "https://user:hunter2@mcp.example/mcp?api_key=abcdef123456",
+        "headers": {"Authorization": "Bearer abcdef123456", "X-Trace": "on"},
+    }
+
+    saved = asyncio.run(create_or_update_mcp_client(spec, ctx))
+
+    assert saved["ok"] is True
+    [(_op, details)] = ctx.requested
+    assert details["transport"] == "streamable_http"
+    assert details["url"].startswith(f"https://{HIDDEN}@mcp.example/mcp?api_key=")
+    assert details["headers"] == {"Authorization": HIDDEN, "X-Trace": "on"}
+    shown = json.dumps(details, ensure_ascii=False)
+    assert "hunter2" not in shown
+    assert "abcdef123456" not in shown
+
+
+def test_a_numeric_password_in_the_environment_is_hidden_too(ws: Path) -> None:
+    # 纯数字的口令在模型给的 JSON 和 YAML 里都是数，照样不能进 details。
+    ctx = _DetailsCtx(ws)
+    spec = {
+        "id": "db", "transport": "stdio", "command": "db-mcp",
+        "env": {"DB_PASSWORD": 123456, "PGPASSWORD": 1234.5, "DB_PORT": 5432},
+    }
+
+    saved = asyncio.run(create_or_update_mcp_client(spec, ctx))
+
+    assert saved["ok"] is True
+    [(_op, details)] = ctx.requested
+    assert details["env"] == {"DB_PASSWORD": HIDDEN, "PGPASSWORD": HIDDEN, "DB_PORT": "5432"}
+    shown = json.dumps(details, ensure_ascii=False)
+    assert "123456" not in shown
+    assert "1234.5" not in shown
+    stored = yaml.safe_load(config_layout.mcp_path(ws).read_text(encoding="utf-8"))["clients"]["db"]
+    assert str(stored["env"]["DB_PASSWORD"]) == "123456"
+
+
+@pytest.mark.parametrize("spec", [
+    {"id": "fs2", "transport": "stdio"},
+    {"id": "fs2", "transport": "stdio", "command": "   "},
+    {"id": "remote", "transport": "sse"},
+    {"id": "bad id!", "transport": "stdio", "command": "fake-mcp-server"},
+    {"id": "fs2", "transport": "stdio", "command": "fake-mcp-server", "enabled": "maybe"},
+])
+def test_a_client_that_cannot_be_saved_is_refused_before_approval(ws: Path, spec: dict[str, Any]) -> None:
+    # 审批人批了也存不进去的配置不送审，免得白审一次。
+    path = config_layout.mcp_path(ws)
+    before = path.read_bytes()
+    ctx = _RecordingCtx(ws)
+
+    result = asyncio.run(create_or_update_mcp_client(spec, ctx))
+
+    assert result["ok"] is False
+    assert ctx.requested == []
+    assert path.read_bytes() == before
+
+
 def test_listing_clients_on_a_broken_file_says_why_and_shows_the_ones_in_use(ws: Path) -> None:
     mcp_runtime.list_clients(ws)
     _break_config(ws)
@@ -1893,7 +1995,7 @@ def test_stdio_sessions_inherit_the_engine_environment_and_get_no_read_timeout(
     assert result["data"]["result"] == "ok"
     params = seen["params"]
     assert (params.command, params.args) == ("fake-mcp-server", ["--stdio"])
-    # 子进程照旧继承 engine 的整份环境，再叠上配置里解析好的变量
+    # 子进程继承剥掉密钥后的 engine 环境，再叠上配置里解析好的变量
     assert params.env["FAKE_MCP_INHERITED"] == "from-the-engine"
     assert (params.env["TOKEN"], params.env["MODE"]) == ("secret-value", "plain")
     # 没有会话级读超时，单次调用也不带超时
@@ -1901,6 +2003,40 @@ def test_stdio_sessions_inherit_the_engine_environment_and_get_no_read_timeout(
     assert seen["calls"] == [("ping", (), {"arguments": {"a": 1}})]
     assert seen["initialized"] is True
     assert seen["exited"] is True
+
+
+def test_stdio_sessions_do_not_inherit_the_secrets_of_the_engine(ws: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 服务端是第三方程序：管理令牌、模型 key、平台令牌和工具子进程一样剥掉，它要用的写进 mcp.yaml 的 env。
+    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", "admin-secret")
+    monkeypatch.setenv("SOMEVENDOR_API_KEY", "sk-vendor")
+    monkeypatch.setenv("OTHERVENDOR_API_KEY", "sk-other")
+    monkeypatch.setenv("ONEBOT_ACCESS_TOKEN", "qq-token")
+    monkeypatch.setenv("FAKE_MCP_PLAIN", "kept")
+    mcp_runtime.upsert_client(ws, {**_SPEC, "env": {"SOMEVENDOR_API_KEY": "${SOMEVENDOR_API_KEY}"}})
+    seen: dict[str, Any] = {}
+
+    @asynccontextmanager
+    async def fake_stdio_client(params: Any):
+        seen["params"] = params
+        send, receive = anyio.create_memory_object_stream(0)
+        try:
+            yield receive, send
+        finally:
+            send.close()
+            receive.close()
+
+    monkeypatch.setattr(mcp_runtime, "stdio_client", fake_stdio_client)
+    monkeypatch.setattr(mcp_runtime, "ClientSession", _recording_client_session(seen))
+
+    asyncio.run(mcp_runtime.list_tools(ws, "fs"))
+
+    env = seen["params"].env
+    for name in ("CLONOTH_ADMIN_TOKEN", "OTHERVENDOR_API_KEY", "ONEBOT_ACCESS_TOKEN"):
+        assert name not in env
+    assert "admin-secret" not in env.values()
+    assert env["FAKE_MCP_PLAIN"] == "kept"
+    # 配置里点名要的照给
+    assert env["SOMEVENDOR_API_KEY"] == "sk-vendor"
 
 
 def test_a_streamable_http_client_made_for_headers_is_closed_with_its_session(

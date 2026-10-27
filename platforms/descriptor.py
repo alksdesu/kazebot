@@ -277,6 +277,9 @@ class PlatformDescriptor:
     capabilities: PlatformCapabilities = field(default_factory=PlatformCapabilities)
     # 平台自己的密钥：连接令牌、AppSecret 这类。读取顺序是 data/platform_secrets.yaml 的 <平台 id> 段 > env > 自动生成的文件。
     secrets: tuple[SecretField, ...] = ()
+    # 平台宿主库自己从环境变量读、没有 SecretField 的密钥，比如 NoneBot 适配器认的令牌别名。
+    # 工具子进程里照样剥掉；这些名字只认进程环境，manage_secret 不写、共享组不抄。
+    host_secret_env: tuple[str, ...] = ()
     # 其他夹着凭据的文件（glob，相对工作区），比如排队的账号操作里带着管理员令牌。
     # 和自动生成的密钥文件一样，agent 读、写、经聊天外传都拒绝。
     secret_files: tuple[str, ...] = ()
@@ -331,10 +334,14 @@ class PlatformDescriptor:
         self._check_movable_file("config", self.config_path, self.config_env)
         self._check_movable_file("profiles", self.profiles_path, self.profiles_env)
         self._check_state_files()
+        self._check_host_secret_env()
         object.__setattr__(self, "state_files", MappingProxyType(dict(self.state_files)))
         object.__setattr__(self, "state_env", MappingProxyType(dict(self.state_env)))
         object.__setattr__(self, "hooks", MappingProxyType(dict(self.hooks)))
-        for name in ("secrets", "secret_files", "owned_files", "private_files", "instance_ports", "instance_env", "entrypoints"):
+        for name in (
+            "secrets", "host_secret_env", "secret_files", "owned_files", "private_files",
+            "instance_ports", "instance_env", "entrypoints",
+        ):
             object.__setattr__(self, name, tuple(getattr(self, name)))
 
     def _check_movable_file(self, what: str, path: str, env: str) -> None:
@@ -358,6 +365,29 @@ class PlatformDescriptor:
         for env in self.state_env.values():
             if not _ENV_NAME.match(env):
                 raise ValueError(f"platform {self.id!r} state env name must be UPPER_SNAKE_CASE: {env!r}")
+
+    def _check_host_secret_env(self) -> None:
+        if isinstance(self.host_secret_env, str):
+            raise ValueError(f"platform {self.id!r} host_secret_env must list env names, not be a single string")
+        names = list(self.host_secret_env)
+        bad = [name for name in names if not isinstance(name, str) or not _ENV_NAME.match(name)]
+        if bad:
+            raise ValueError(f"platform {self.id!r} host secret env names must be UPPER_SNAKE_CASE: {bad}")
+        if len(names) != len(set(names)):
+            raise ValueError(f"duplicate host secret env names in platform {self.id!r}")
+        # env_scope 先判实例身份：两边都写的名字只会被当成实例身份，声明自相矛盾。
+        clash = sorted(set(names) & self.identity_env_names())
+        if clash:
+            raise ValueError(f"platform {self.id!r} declares host secret env names that are already instance identity: {clash}")
+
+    def identity_env_names(self) -> frozenset[str]:
+        """这个平台声明成实例身份的环境变量：instance_env、密钥和它自动文件的位置，挪配置、资料和状态文件用的那几个。"""
+        names = set(self.instance_env)
+        names.update(secret.env for secret in self.secrets if secret.env)
+        names.update(secret.file_env for secret in self.secrets if secret.file_env)
+        names.update(env for env in (self.config_env, self.profiles_env) if env)
+        names.update(self.state_env.values())
+        return frozenset(names)
 
     def names(self) -> frozenset[str]:
         return frozenset({self.id, *self.aliases, *(channel.name for channel in self.channels)})

@@ -221,13 +221,12 @@ def policy_floor(
 
 
 def secret_env_names(platforms: Iterable[PlatformDescriptor] | None = None) -> frozenset[str]:
-    """平台密钥的环境变量名。子进程里剥掉它们：agent 一句 echo 就能读到。"""
-    return frozenset(
-        secret.env
-        for platform in _platforms(platforms)
-        for secret in platform.secrets
-        if secret.env
-    )
+    """平台密钥的环境变量名，宿主库自己读的那几个也算。子进程里剥掉它们：agent 一句 echo 就能读到。"""
+    names: set[str] = set()
+    for platform in _platforms(platforms):
+        names.update(secret.env for secret in platform.secrets if secret.env)
+        names.update(platform.host_secret_env)
+    return frozenset(names)
 
 
 # 核心进程的实例身份：平台、端口、监听地址、URL 前缀、工作区、清单位置、管理令牌、数据清理范围。
@@ -333,21 +332,17 @@ def instance_env_names(platforms: Iterable[PlatformDescriptor] | None = None) ->
     """实例身份的环境变量名：只写在实例自己的 .env 里，共享密钥文件不收，建组时也不抄过去。"""
     names = set(_CORE_INSTANCE_ENV)
     for platform in _platforms(platforms):
-        names.update(_platform_instance_env(platform))
-    return frozenset(names)
-
-
-def _platform_instance_env(platform: PlatformDescriptor) -> frozenset[str]:
-    names = set(platform.instance_env)
-    names.update(secret.env for secret in platform.secrets if secret.env)
-    names.update(secret.file_env for secret in platform.secrets if secret.file_env)
-    names.update(env for env in (platform.config_env, platform.profiles_env) if env)
-    names.update(platform.state_env.values())
+        names.update(platform.identity_env_names())
     return frozenset(names)
 
 
 def _platform_process_env(platform: PlatformDescriptor) -> frozenset[str]:
-    """平台 process_env 钩子报的名字。没声明是空的；钩子坏了也按空的算，退回只认核心名单。"""
+    """平台进程只从进程环境读的名字：描述里声明的宿主密钥，加上 process_env 钩子报的。"""
+    return frozenset(platform.host_secret_env) | _hook_process_env(platform)
+
+
+def _hook_process_env(platform: PlatformDescriptor) -> frozenset[str]:
+    """平台 process_env 钩子报的名字。没声明是空的；钩子坏了也按空的算，退回核心名单和平台描述。"""
     try:
         return frozenset(str(name) for name in platform_hook(platform, HOOK_PROCESS_ENV).process_env_names())
     except MissingPlatformHook:
@@ -356,12 +351,12 @@ def _platform_process_env(platform: PlatformDescriptor) -> frozenset[str]:
         marker = (platform.id, repr(exc))
         if marker not in _warned_hooks:
             _warned_hooks.add(marker)
-            _log.warning("平台 %s 的 process_env 钩子用不了，只按核心名单判：%s", platform.id, exc)
+            _log.warning("平台 %s 的 process_env 钩子用不了，只按核心名单和平台描述判：%s", platform.id, exc)
         return frozenset()
 
 
 def process_env_names(platforms: Iterable[PlatformDescriptor] | None = None) -> frozenset[str]:
-    """只认进程环境的变量名：核心的设置、运行时注入的上下文、代理，加上各平台钩子报的。PYTHON* 按前缀另判。"""
+    """只认进程环境的变量名：核心的设置、运行时注入的上下文、代理，加上各平台声明的宿主密钥和钩子报的。PYTHON* 按前缀另判。"""
     names = set(_CORE_PROCESS_SETTINGS | _CORE_INJECTED_ENV | _PROXY_ENV)
     for platform in _platforms(platforms):
         names.update(_platform_process_env(platform))
@@ -382,7 +377,7 @@ def env_scope(name: str, platforms: Iterable[PlatformDescriptor] | None = None) 
     if key in _upper(_CORE_INSTANCE_ENV):
         return EnvScope(ENV_INSTANCE, BASIS_DECLARED)
     for platform in listed:
-        if key in _upper(_platform_instance_env(platform)):
+        if key in _upper(platform.identity_env_names()):
             return EnvScope(ENV_INSTANCE, BASIS_DECLARED, platform.id)
     if key.endswith(_PATH_ENV_SUFFIXES):
         return EnvScope(ENV_INSTANCE, BASIS_PATH)

@@ -25,12 +25,14 @@ from clonoth_runtime import (
 )
 from engine.model import create_llm_http_client
 from platforms.descriptor import PlatformDescriptor
+from platforms.protection import secret_env_names
 from platforms.registry import all_platforms, current_platform, platform_config_path
 from supervisor.config_store import ConfigStore
 from supervisor.instances import load_instances, url_prefix
-from supervisor.log_access import MIN_SECRET_CHARS, SENSITIVE_KEY, LogReader, assigned_values, redact
+from supervisor.log_access import LogReader
 from supervisor.platform_api import platform_health
 from toolbox import mcp_runtime
+from toolbox.redaction import HIDDEN, MIN_SECRET_CHARS, NUMERIC_SECRET_KEY, SENSITIVE_KEY, assigned_values, redact
 
 # 平台没声明自己的排查提示时用的说法。
 _CONNECTION_HINT = "检查平台账号登录和适配进程的连接配置"
@@ -111,17 +113,27 @@ class OperationsService:
     def _configured_secrets(self) -> tuple[str, ...]:
         values: set[str] = set()
 
-        def collect(item: Any, sensitive: bool = False) -> None:
+        def collect(item: Any, sensitive: bool = False, numeric: bool = False) -> None:
             if isinstance(item, dict):
                 for key, value in item.items():
-                    collect(value, sensitive or bool(SENSITIVE_KEY.search(str(key))))
+                    name = str(key)
+                    collect(
+                        value,
+                        sensitive or bool(SENSITIVE_KEY.search(name)),
+                        numeric or bool(NUMERIC_SECRET_KEY.search(name)),
+                    )
             elif isinstance(item, list):
                 for value in item:
-                    collect(value, sensitive)
+                    collect(value, sensitive, numeric)
             elif sensitive and isinstance(item, str):
                 resolved = resolve_env_ref(item)
                 if resolved:
                     values.add(resolved)
+            elif numeric and isinstance(item, (int, float)) and not isinstance(item, bool):
+                # 口令常是纯数字；太短的不收，按子串替换会把导出里不相干的数字也抹掉
+                digits = str(item)
+                if len(digits) >= MIN_SECRET_CHARS:
+                    values.add(digits)
 
         for path in self._secret_bearing_files():
             try:
@@ -138,8 +150,9 @@ class OperationsService:
         for platform in all_platforms():
             for spec in platform.secrets:
                 values.add(platform_secret(self.root, platform, spec.name, secrets=platform_secrets).value)
-                if spec.env:
-                    values.add(os.environ.get(spec.env, "").strip())
+        # 宿主库自己读的令牌别名不一定以 TOKEN/SECRET 结尾，按工具子进程剥掉的那份名单收。
+        for name in secret_env_names():
+            values.add(os.environ.get(name, "").strip())
         # 共享密钥文件不灌进进程环境，得单独收一遍。
         shared = config_layout.shared_secrets(self.root)
         for source in (os.environ, shared):
@@ -152,7 +165,7 @@ class OperationsService:
     def _clean(self, value: Any, secrets: tuple[str, ...] = ()) -> Any:
         if isinstance(value, dict):
             return {
-                self._clean(str(key), secrets): ("[已隐藏]" if SENSITIVE_KEY.search(str(key)) else self._clean(item, secrets))
+                self._clean(str(key), secrets): (HIDDEN if SENSITIVE_KEY.search(str(key)) else self._clean(item, secrets))
                 for key, item in value.items()
             }
         if isinstance(value, list):
@@ -161,8 +174,7 @@ class OperationsService:
             text = value.replace(str(self.root), "<workspace>")
             for secret in secrets:
                 if secret:
-                    text = text.replace(secret, "[已隐藏]")
-            text = re.sub(r"(?i)\b(https?://)[^/\s@]+@", r"\1[已隐藏]@", text)
+                    text = text.replace(secret, HIDDEN)
             return redact(text)
         return value
 

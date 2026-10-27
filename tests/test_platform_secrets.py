@@ -413,6 +413,23 @@ class TestDiagnosticsRedaction:
 
         assert {"pw-in-vault-config", "qq-webui-token"} <= secrets
 
+    def test_a_numeric_password_in_a_config_file_is_redacted_too(self, vault, tmp_path: Path) -> None:
+        # YAML 把纯数字的口令读成 int；收不到的话，它出现在日志里的那一处会原样进导出。
+        root = _workspace(tmp_path)
+        (root / "config").mkdir()
+        (root / "config" / "vault.yaml").write_text(
+            "webhook:\n  password: 31415926\n  api_key: 2718.2818\n  pin_password: 1234\n  max_tokens: 200000\n  enabled_secret: true\n",
+            encoding="utf-8",
+        )
+        service = OperationsService(SimpleNamespace(workspace_root=root))
+
+        secrets = set(service._configured_secrets())
+
+        assert {"31415926", "2718.2818"} <= secrets
+        # 太短的按子串替换会抹掉不相干的数字；token 那一档底下多是上限；开关不是口令
+        assert not {"1234", "200000", "True"} & secrets
+        assert "31415926" not in service._clean("login failed for 31415926", tuple(secrets))
+
     def test_auto_generated_secret_files_are_left_out(self, tmp_path: Path) -> None:
         # 里面可能只是模式标记，收进来会把日志里的这个词也抹成 [已隐藏]。
         root = _workspace(tmp_path)

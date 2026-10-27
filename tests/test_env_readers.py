@@ -20,14 +20,16 @@ if str(_ROOT) not in sys.path:
 
 from adapters.onebot import process_env as qq_process_env  # noqa: E402
 from platforms import protection  # noqa: E402
+from platforms.builtin import QQ_NAPCAT  # noqa: E402
 from platforms.protection import ENV_SHARED, env_scope  # noqa: E402
+from toolbox.redaction import SENSITIVE_KEY  # noqa: E402
 
 # .claude/worktrees 下是整仓副本，扫进来会把副本里的代码也算一遍。
 _SKIP_DIRS = {".venv", "venv", "__pycache__", "_research", "tests", "node_modules", ".git", ".claude"}
 # 仓库根下这几个不是仓库的代码：config/ 和 data/ 归实例，examples/ 是拷进 config/plugins 才加载的模板。
 _SKIP_TOP = {"config", "data", "examples"}
 # 先查进程环境、再查 dotenv 两层（本实例 .env 盖在共享密钥文件上）的读法，这几个文件里直接读到的名字共享文件服务得了。
-_LAYERED_TOOLS = ("tools/exa_search.py", "tools/web_search.py", "tools/x_search.py")
+_LAYERED_TOOLS = ("tools/exa_search.py", "tools/web_search.py", "tools/x_search.py", "tools/drawtools/common.py")
 _LAYERED = {"tools/_channel.py", *_LAYERED_TOOLS}
 _READ_METHODS = {"get", "pop", "setdefault"}
 
@@ -415,3 +417,13 @@ class TestTheBotHostSettings:
 
     def test_the_host_list_only_names_real_settings(self) -> None:
         assert qq_process_env.HOST_ENV <= _nonebot_config_names()
+
+    def test_the_declared_host_secrets_are_real_settings(self) -> None:
+        assert set(QQ_NAPCAT.host_secret_env) <= _nonebot_config_names()
+
+    def test_every_secret_the_bot_host_reads_is_stripped_from_tools(self) -> None:
+        # NoneBot 自己从环境读的令牌、签名密钥：平台描述漏一个，工具子进程里 echo 一下就出来了。
+        secrets = {name for name in _nonebot_config_names() if SENSITIVE_KEY.search(name)}
+
+        assert secrets
+        assert secrets <= protection.secret_env_names([QQ_NAPCAT])

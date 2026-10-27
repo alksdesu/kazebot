@@ -13,7 +13,7 @@ _REPO_ROOT = DRAWTOOLS_DIR.parents[1]
 if str(_REPO_ROOT) not in sys.path:  # 工具以子进程跑，sys.path 里只有自己那一级
     sys.path.insert(0, str(_REPO_ROOT))
 import config_layout  # noqa: E402
-from tools._channel import YamlDocument, read_yaml_document  # noqa: E402
+from tools._channel import YamlDocument, dotenv_values, read_yaml_document  # noqa: E402
 from workspace import resolve_workspace_root  # noqa: E402
 
 WORKSPACE_ROOT = resolve_workspace_root(_REPO_ROOT)
@@ -245,8 +245,8 @@ def resolve_api_key(settings: dict[str, Any]) -> str:
         value = os.environ.get(env_name, "").strip()
         if value:
             return value
-        # 进程环境里是本实例 .env 的值，没有再看共享密钥文件：共享组里别的实例配上的这边也用得上。
-        return config_layout.shared_secrets(WORKSPACE_ROOT).get(env_name, "")
+        # 工具子进程的环境里 *_API_KEY 被剥掉了，本实例 .env 和共享密钥文件得自己读；共享组里别的实例配上的这边也用得上。
+        return dotenv_values(WORKSPACE_ROOT).get(env_name, "")
     return ""
 
 

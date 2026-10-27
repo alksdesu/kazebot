@@ -4,11 +4,11 @@ from __future__ import annotations
 from typing import Any
 
 import config_layout
-from clonoth_runtime import SwitchValueError
 
 from ..context import ToolContext
 from .._common import request_guard
 from .. import mcp_runtime
+from ..redaction import mask_sensitive
 
 _CONFIG_PATH = config_layout.MCP_FILE
 
@@ -29,17 +29,27 @@ def _err(message: Any) -> dict[str, Any]:
     return {"ok": False, "error": text, "data": {"result": f"ERROR: {text}"}}
 
 
+def _approval_details(requested: mcp_runtime.RequestedClient) -> dict[str, Any]:
+    """送审的 details：审批人得看见要跑的命令或要连的地址。
+
+    这些字段一律打过码：env、headers 里是令牌，args 和 url 里也可能夹着，details 会进事件流、控制台和调试工具。
+    """
+    shown = mask_sensitive({"transport": requested.transport, **requested.connection})
+    return {"path": _CONFIG_PATH, "mcp_client": requested.client_id, **shown}
+
+
 async def create_or_update_mcp_client(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    # 开关写错、文件写坏着，都在送审前就拒，不让审批人批一份存不进去的配置
+    # id、开关、command 或 url 写错，文件写坏着，都在送审前就拒，不让审批人批一份存不进去的配置。
+    # 开关写错的 SwitchValueError、文件坏的 McpConfigError 都是 ValueError。
     try:
-        mcp_runtime.requested_switches(args)
+        requested = mcp_runtime.requested_client(args)
         mcp_runtime.editable_config(ctx.workspace_root)
-    except (SwitchValueError, mcp_runtime.McpConfigError) as exc:
+    except ValueError as exc:
         return _err(exc)
     # stdio client 的 command 保存后几秒内就由每个 worker 起子进程列工具表，写这份配置
     # 等价于创建可执行工具，因此必须与 write_file 同权限——upsert_client 会直接落盘，
     # 不经 write_file 工具，少了这道 guard 就是绕过 execute_command 限制的后门。
-    _op, err = await request_guard(ctx, "write_file", {"path": _CONFIG_PATH, "mcp_client": str(args.get("id") or "")})
+    _op, err = await request_guard(ctx, "write_file", _approval_details(requested))
     if err is not None:
         return _err(err.get("error", "denied"))
     try:

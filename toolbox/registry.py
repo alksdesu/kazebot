@@ -304,6 +304,44 @@ def _script_tool_env(ctx: Any) -> dict[str, str]:
     return env
 
 
+# guard.fixed 写不得的参数：工具名由这里填，platform_auth 由 ToolContext 按任务身份填。
+_RESERVED_GUARD_PARAMS = frozenset({"tool_name", "platform_auth"})
+
+
+def _guard_problem(guard: Mapping[str, Any]) -> str:
+    """guard 里的常量参数 fixed 能不能用，能用给空串。
+
+    fixed 是策略参数名到字符串的映射，送审时写在 params 映射出来的参数之后，同名的盖过映射值：
+    脚本自己要读的文件不随模型给的参数变，策略就得按那个固定的位置判。
+    """
+    fixed = guard.get("fixed")
+    if fixed is None:
+        return ""
+    if not isinstance(fixed, Mapping) or not fixed:
+        return "guard.fixed must be a non-empty object mapping policy parameter names to strings"
+    for key, value in fixed.items():
+        if not isinstance(key, str) or not key or key != key.strip():
+            return f"guard.fixed has an unusable parameter name: {key!r}"
+        if key in _RESERVED_GUARD_PARAMS:
+            return f"guard.fixed cannot set {key}: the engine fills it in"
+        if not isinstance(value, str) or not value or value != value.strip():
+            return f"guard.fixed.{key} must be a non-empty string without surrounding spaces"
+    return ""
+
+
+def _guard_parameters(guard: Mapping[str, Any], tool_name: str, args: Mapping[str, Any]) -> dict[str, Any]:
+    """送去策略判定的参数：工具名，params 从工具参数映射过来的值，最后是 fixed 的常量。"""
+    parameters: dict[str, Any] = {"tool_name": tool_name}
+    mapping = guard.get("params")
+    if isinstance(mapping, Mapping):
+        for policy_key, arg_key in mapping.items():
+            parameters[str(policy_key)] = args.get(str(arg_key), "")
+    fixed = guard.get("fixed")
+    if isinstance(fixed, Mapping):
+        parameters.update(fixed)
+    return parameters
+
+
 async def _script_guard_error(
     guard: dict[str, Any], tool_name: str, args: dict[str, Any], ctx: Any,
 ) -> dict[str, Any] | None:
@@ -314,14 +352,12 @@ async def _script_guard_error(
     op = str(guard.get("op") or "").strip()
     if not op:
         return None
+    problem = _guard_problem(guard)
+    if problem:
+        # 插件工具的 guard 注册时不过这道检查：常量参数写坏了不能当没写，按映射出来的参数去判就判错了对象。
+        return _error_tool_response(f"tool {tool_name} declares an unusable guard: {problem}")
 
-    parameters: dict[str, Any] = {"tool_name": tool_name}
-    mapping = guard.get("params")
-    if isinstance(mapping, dict):
-        for policy_key, arg_key in mapping.items():
-            parameters[str(policy_key)] = args.get(str(arg_key), "")
-
-    _op_res, err = await _request_guard(ctx, op, parameters)
+    _op_res, err = await _request_guard(ctx, op, _guard_parameters(guard, tool_name, args))
     if err is None:
         return None
     return _error_tool_response(
@@ -1191,6 +1227,12 @@ class ToolRegistry:
             if name in external_names:
                 log.warning("skipping external tool %s: name %r is already taken by another script", item.rel, name)
                 continue
+            guard = spec.get("guard")
+            guard_problem = _guard_problem(guard) if isinstance(guard, dict) else ""
+            if guard_problem:
+                # 声明了闸门却用不了的脚本不登记，不能让它在没闸门的情况下跑起来。
+                log.warning("skipping external tool %s: %s", item.rel, guard_problem)
+                continue
             external_names.add(name)
 
             description = str(spec.get("description", ""))
@@ -1213,7 +1255,6 @@ class ToolRegistry:
                 if parse_bool(spec.get(flag), False):
                     registered_spec[flag] = True
             self._tool_specs[name] = registered_spec
-            guard = spec.get("guard")
             self._tool_funcs[name] = _make_script_tool(
                 script_path=py.resolve(),
                 timeout_sec=timeout_sec,

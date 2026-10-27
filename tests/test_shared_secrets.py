@@ -33,7 +33,10 @@ _POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="Windows 上没有 POSI
 # 组里共用的那种密钥，实例身份那种，和只认进程环境那种。
 SHARED_KEY = "EXA_API_KEY"
 INSTANCE_KEYS = ("CLONOTH_PORT", "ONEBOT_ACCESS_TOKEN", "FOO_PATH")
-PROCESS_KEYS = ("CLONOTH_LOG_LEVEL", "CLONOTH_TASK_ID", "HTTPS_PROXY", "PYTHONPATH", "CLONOTH_ALLOWED_GROUPS", "LOG_LEVEL")
+PROCESS_KEYS = (
+    "CLONOTH_LOG_LEVEL", "CLONOTH_TASK_ID", "HTTPS_PROXY", "PYTHONPATH", "CLONOTH_ALLOWED_GROUPS", "LOG_LEVEL",
+    "ONEBOT_V11_ACCESS_TOKEN", "ONEBOT_SECRET",
+)
 
 
 def _workspace(tmp_path: Path, *, shared: str = "", dotenv: str = "") -> Path:

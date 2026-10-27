@@ -13,7 +13,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from supervisor.log_access import MAX_LINES, SENSITIVE_KEY, LogReader, assigned_values, redact  # noqa: E402
+from supervisor.log_access import MAX_LINES, LogReader  # noqa: E402
+from toolbox.redaction import SENSITIVE_KEY, assigned_values, redact  # noqa: E402
 
 
 class TestRedaction:
@@ -187,6 +188,13 @@ class TestTail:
         reader = self._reader(tmp_path, "[llm] key sk-abcdefghijklmnop ready\n")
         text, _ = reader.tail("a.log")
         assert "sk-abcdefghijklmnop" not in text
+
+    def test_a_password_in_a_logged_address_is_hidden(self, tmp_path: Path) -> None:
+        # 代理、数据库、中转站地址常带着账号密码进日志，连接失败的报错里整串照抄。
+        reader = self._reader(tmp_path, "[mcp] connect failed: redis://admin:s3cret-pass@cache:6379/0\n")
+        text, _ = reader.tail("a.log")
+        assert "s3cret-pass" not in text
+        assert "redis://[已隐藏]@cache:6379/0" in text
 
     def test_undecodable_bytes_do_not_blow_up(self, tmp_path: Path) -> None:
         tmp_path.mkdir(parents=True, exist_ok=True)

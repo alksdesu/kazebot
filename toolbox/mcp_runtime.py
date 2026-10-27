@@ -17,12 +17,14 @@ import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 import yaml
 
 import config_layout
 from clonoth_runtime import parse_bool, resolve_env_ref, switch_arg
+
+from ._common import safe_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -301,7 +303,22 @@ def _shares_sessions(requested: bool | None, previous: Any) -> bool:
     return requested
 
 
-def upsert_client(workspace_root: Path, spec: dict[str, Any]) -> dict[str, Any]:
+class RequestedClient(NamedTuple):
+    """保存客户端时要写进文件的那一条，还没落盘。
+
+    share_sessions 没写是 None，沿用文件里原来的值；connection 是 stdio 的 command、args、env，或者 url、headers。
+    """
+
+    client_id: str
+    transport: str
+    enabled: bool
+    share_sessions: bool | None
+    description: str
+    connection: dict[str, Any]
+
+
+def requested_client(spec: dict[str, Any]) -> RequestedClient:
+    """按保存时的规矩整理模型给的客户端，不碰文件。id、开关、command 或 url 不合格的抛 ValueError。"""
     cid = _normalize_client_id(spec.get("id"))
     transport = _normalize_transport(spec.get("transport"))
     enabled, share_sessions = requested_switches(spec)
@@ -328,6 +345,12 @@ def upsert_client(workspace_root: Path, spec: dict[str, Any]) -> dict[str, Any]:
             "url": url,
             "headers": {str(k): str(v) for k, v in headers.items()} if isinstance(headers, dict) else {},
         }
+    return RequestedClient(cid, transport, enabled, share_sessions, description, connection)
+
+
+def upsert_client(workspace_root: Path, spec: dict[str, Any]) -> dict[str, Any]:
+    requested = requested_client(spec)
+    cid = requested.client_id
 
     with config_layout.locked(_config_path(workspace_root)):
         cfg = editable_config(workspace_root)
@@ -336,15 +359,15 @@ def upsert_client(workspace_root: Path, spec: dict[str, Any]) -> dict[str, Any]:
             clients = {}
             cfg["clients"] = clients
         record: dict[str, Any] = {
-            "transport": transport,
-            "enabled": enabled,
+            "transport": requested.transport,
+            "enabled": requested.enabled,
         }
         # 只在为真时写进文件：默认按对话隔离，文件里不出现这个键
-        if _shares_sessions(share_sessions, clients.get(cid)):
+        if _shares_sessions(requested.share_sessions, clients.get(cid)):
             record["share_sessions"] = True
-        if description:
-            record["description"] = description
-        record.update(connection)
+        if requested.description:
+            record["description"] = requested.description
+        record.update(requested.connection)
         clients[cid] = record
         _save_raw_config(workspace_root, cfg)
     _retire_client_sessions(workspace_root, cid)
@@ -615,16 +638,24 @@ def _transport_streams(transport_obj: Any, label: str) -> tuple[Any, Any]:
     return transport_obj[0], transport_obj[1]
 
 
+def _stdio_env(plan: _LaunchPlan) -> dict[str, str]:
+    """stdio 服务子进程的环境：和工具起的子进程一样剥掉密钥，服务要用的写在 mcp.yaml 的 env 里（可以写 ${VAR}）。
+
+    服务端是第三方程序，原样继承 engine 的环境就连管理令牌一起交了出去。
+    """
+    env = safe_subprocess_env()
+    env.update(plan.env)
+    return env
+
+
 @asynccontextmanager
 async def _connect(plan: _LaunchPlan) -> AsyncIterator[_Connection]:
     """建连并完成 initialize。进出必须在同一个 task 里：SDK 的 anyio task group 不许换 task 退出。"""
     _ensure_sdk()
     async with AsyncExitStack() as stack:
         if plan.transport == "stdio":
-            env = os.environ.copy()
-            env.update(plan.env)
             read_stream, write_stream = await stack.enter_async_context(
-                stdio_client(StdioServerParameters(command=plan.command, args=list(plan.args), env=env))
+                stdio_client(StdioServerParameters(command=plan.command, args=list(plan.args), env=_stdio_env(plan)))
             )
         elif plan.transport == "sse":
             transport_obj = await stack.enter_async_context(sse_client(plan.url, headers=dict(plan.headers)))

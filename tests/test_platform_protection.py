@@ -19,6 +19,7 @@ from adapters.onebot.forward_authz import file_deny_reason  # noqa: E402
 from platforms.builtin import QQ_NAPCAT  # noqa: E402
 from platforms.descriptor import (  # noqa: E402
     CHANNEL_GROUP,
+    HOOK_PROCESS_ENV,
     ChannelDescriptor,
     PlatformDescriptor,
     SecretField,
@@ -54,6 +55,7 @@ VAULT = PlatformDescriptor(
             "signing_key", "签名密钥", env="VAULT_SIGNING", file="data/vault_signing_key", file_env="VAULT_SIGNING_FILE",
         ),
     ),
+    host_secret_env=("VAULT_SDK_TOKEN",),
     secret_files=("data/vault-session.*",),
     owned_files=("data/vault_cache/*",),
     private_files=("config/vault_people.yaml",),
@@ -72,6 +74,7 @@ OTHERCHAT = PlatformDescriptor(
 QQ_SECRET_ENVS = {
     "ONEBOT_ACCESS_TOKEN", "ONEBOT_FORWARD_BRIDGE_TOKEN", "ONEBOT_CONVERSATION_HASH_SECRET", "NAPCAT_WEBUI_TOKEN",
 }
+QQ_HOST_SECRET_ENVS = {"ONEBOT_V11_ACCESS_TOKEN", "ONEBOT_SECRET", "ONEBOT_V11_SECRET"}
 QQ_SECRET_FILES = {"data/napcat-account.*", "data/onebot_forward_bridge_token", "data/onebot_conversation_hash_secret"}
 
 PERMISSIVE_POLICY = "\n".join([
@@ -155,6 +158,40 @@ class TestDeclarationsAreChecked:
         with pytest.raises(ValueError):
             PlatformDescriptor(id="broken", display_name="Broken", short_name="B", **extra)
 
+    @pytest.mark.parametrize("extra", [
+        # 一个字符串会被当成一串单字母的名字
+        {"host_secret_env": "VAULT_SDK_TOKEN"},
+        {"host_secret_env": ("vault_sdk_token",)},
+        {"host_secret_env": ("VAULT-SDK-TOKEN",)},
+        {"host_secret_env": ("",)},
+        {"host_secret_env": ("VAULT_SDK_TOKEN", "VAULT_SDK_TOKEN")},
+        {"host_secret_env": ("VAULT_APP_SECRET",), "secrets": (SecretField("app_secret", "a", env="VAULT_APP_SECRET"),)},
+        {
+            "host_secret_env": ("VAULT_SIGNING_FILE",),
+            "secrets": (SecretField("signing_key", "s", file="data/vault_key", file_env="VAULT_SIGNING_FILE"),),
+        },
+        {"host_secret_env": ("VAULT_PORT",), "instance_env": ("VAULT_PORT",)},
+        {"host_secret_env": ("VAULT_CONFIG",), "config_path": "config/vault.yaml", "config_env": "VAULT_CONFIG"},
+    ])
+    def test_a_malformed_host_secret_declaration_is_refused(self, extra: dict) -> None:
+        # 实例身份先判：和身份重名的那一项永远轮不到按宿主密钥算，声明了也白写。
+        with pytest.raises(ValueError, match=r"host[ _]secret[ _]env"):
+            PlatformDescriptor(id="broken", display_name="Broken", short_name="B", **extra)
+
+    def test_host_secret_names_are_frozen_into_a_tuple(self) -> None:
+        platform = PlatformDescriptor(
+            id="listy", display_name="Listy", short_name="L", host_secret_env=["LISTY_SDK_TOKEN"],
+        )
+
+        assert platform.host_secret_env == ("LISTY_SDK_TOKEN",)
+        assert PlatformDescriptor(id="plain", display_name="Plain", short_name="P").host_secret_env == ()
+
+    def test_the_identity_names_cover_every_declared_place(self) -> None:
+        assert VAULT.identity_env_names() == {
+            "VAULT_APP_SECRET", "VAULT_SIGNING", "VAULT_SIGNING_FILE", "VAULT_CONFIG_PATH", "VAULT_PROFILES_PATH",
+        }
+        assert "VAULT_SDK_TOKEN" not in VAULT.identity_env_names()
+
     def test_a_malformed_entrypoint_says_which_field_it_came_from(self) -> None:
         # 四类文件声明共用一个报错，不点名的话只能挨个试是哪一项写歪了。
         with pytest.raises(ValueError, match="entrypoints"):
@@ -185,7 +222,12 @@ class TestDeclarationsAreChecked:
 class TestQqDeclarations:
     def test_the_env_names_are_the_ones_deployments_already_use(self) -> None:
         # 部署脚本和 .env.example 写的就是这些名字，改名等于存量部署的密钥全部失效。
-        assert secret_env_names([QQ_NAPCAT]) == QQ_SECRET_ENVS
+        assert {secret.env for secret in QQ_NAPCAT.secrets if secret.env} == QQ_SECRET_ENVS
+
+    def test_the_secrets_nonebot_reads_itself_are_declared_too(self) -> None:
+        # bot.py 不经手这几个，NoneBot 的 OneBot V11 适配器直接从环境读；令牌别名还盖过 bot.py 交进去的那把。
+        assert set(QQ_NAPCAT.host_secret_env) == QQ_HOST_SECRET_ENVS
+        assert secret_env_names([QQ_NAPCAT]) == QQ_SECRET_ENVS | QQ_HOST_SECRET_ENVS
 
     def test_the_auto_files_are_the_ones_the_adapter_already_writes(self) -> None:
         assert set(secret_file_patterns(QQ_NAPCAT, environ={})) == QQ_SECRET_FILES
@@ -569,6 +611,40 @@ class TestSubprocessEnvironment:
         assert "VAULT_SIGNING" not in env
         assert env["VAULT_SIGNING_FILE"] == "data/vault_signing_key"
 
+    @pytest.mark.parametrize("name", [*sorted(QQ_HOST_SECRET_ENVS), "onebot_v11_access_token", "Onebot_Secret"])
+    def test_the_secrets_the_bot_host_reads_itself_are_stripped(self, name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        # NoneBot 读环境变量不分大小写，小写那份一样是能连上 NapCat 的令牌。
+        monkeypatch.setenv(name, "do-not-leak")
+
+        env = safe_subprocess_env()
+
+        assert name.upper() not in {key.upper() for key in env}
+        assert "do-not-leak" not in env.values()
+
+    def test_a_newly_registered_platforms_host_secrets_are_stripped_too(
+        self, vault, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("VAULT_SDK_TOKEN", "do-not-leak")
+
+        assert "VAULT_SDK_TOKEN" not in safe_subprocess_env()
+
+    def test_host_secrets_are_stripped_even_when_the_process_env_hook_is_broken(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 钩子模块导不进来时判名字退回核心名单，剥密钥不能跟着退回去。
+        broken = PlatformDescriptor(
+            id="hooky", display_name="Hooky", short_name="H",
+            hooks={HOOK_PROCESS_ENV: "clonoth_no_such_process_env_module"},
+            host_secret_env=("HOOKY_SDK_TOKEN",),
+        )
+        register_platform(broken)
+        try:
+            monkeypatch.setenv("HOOKY_SDK_TOKEN", "do-not-leak")
+
+            assert "HOOKY_SDK_TOKEN" not in safe_subprocess_env()
+        finally:
+            unregister_platform(broken.id)
+
     def test_the_admin_token_is_stripped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # 拿着它能调整个管理接口，policy 也在里面，等于工具能自己批自己。
         monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", "admin-secret")
@@ -577,9 +653,10 @@ class TestSubprocessEnvironment:
 
     def test_the_existing_api_key_rules_still_apply(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SOMEVENDOR_API_KEY", "sk-x")
+        # 绘图工具自己从本实例 .env 和共享密钥文件取 NovelAI 的 key，用不着在子进程环境里给它留一份。
         monkeypatch.setenv("NOVELAI_API_KEY", "nai-x")
 
         env = safe_subprocess_env()
 
         assert "SOMEVENDOR_API_KEY" not in env
-        assert env["NOVELAI_API_KEY"] == "nai-x"
+        assert "NOVELAI_API_KEY" not in env

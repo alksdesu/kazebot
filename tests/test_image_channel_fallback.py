@@ -372,11 +372,20 @@ class TestNovelaiAvailability:
         assert novelai_available(root)
 
     def test_the_env_variable_counts(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # safe_subprocess_env 对 NOVELAI_API_KEY 开了白名单，这条回退是真的能用。
+        # 判定跑在灌过 .env 的 supervisor、engine 里；工具子进程那边剥掉了它，由 resolve_api_key 自己再读 .env。
         from clonoth_runtime import novelai_available
 
         monkeypatch.setenv("NOVELAI_API_KEY", "from-env")
         root = _drawtools_workspace(tmp_path, _GEMINI_MAIN, "api:\n  api_key: ''\n")
+
+        assert novelai_available(root)
+
+    @pytest.mark.parametrize("place", [".env", "config/secrets.env"])
+    def test_a_key_in_either_dotenv_layer_counts(self, tmp_path: Path, place: str) -> None:
+        from clonoth_runtime import novelai_available
+
+        root = _drawtools_workspace(tmp_path, _GEMINI_MAIN, "api:\n  api_key: ''\n")
+        (root / place).write_text("NOVELAI_API_KEY=from-file\n", encoding="utf-8")
 
         assert novelai_available(root)
 

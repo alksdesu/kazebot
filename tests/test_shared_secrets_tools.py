@@ -632,6 +632,42 @@ class TestDrawtoolsApiKey:
     def test_the_group_file_is_the_last_layer(self, root: Path) -> None:
         assert drawtools_common.resolve_api_key({}) == "k-shared"
 
+    def test_the_instance_dotenv_sits_between_the_environment_and_the_group_file(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        (root / ".env").write_text("NOVELAI_API_KEY=k-instance\n", encoding="utf-8")
+
+        assert drawtools_common.resolve_api_key({}) == "k-instance"
+
+        monkeypatch.setenv("NOVELAI_API_KEY", "k-env")
+
+        assert drawtools_common.resolve_api_key({}) == "k-env"
+
+    def test_a_key_only_in_the_instance_dotenv_reaches_the_tool_process(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 工具子进程的环境里 NOVELAI_API_KEY 和别的 *_API_KEY 一样被剥掉，supervisor 灌进来的那份到不了子进程。
+        (root / ".env").write_text("NOVELAI_API_KEY=k-instance\n", encoding="utf-8")
+        monkeypatch.setenv("NOVELAI_API_KEY", "k-env")
+        child_env = safe_subprocess_env()
+        child_env.update({"PYTHONIOENCODING": "utf-8", "CLONOTH_WORKSPACE": str(root)})
+        child_env.pop("ONEBOT_WORKSPACE_ROOT", None)
+        code = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(_DRAWTOOLS)!r})\n"
+            "import common\n"
+            "print(common.resolve_api_key({}))\n"
+        )
+
+        done = subprocess.run(
+            [sys.executable, "-c", code], text=True, encoding="utf-8",
+            capture_output=True, cwd=root, env=child_env, timeout=60, check=False,
+        )
+
+        assert "NOVELAI_API_KEY" not in child_env
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.strip() == "k-instance"
+
     def test_the_named_variable_is_looked_up_in_the_group_file_too(self, root: Path) -> None:
         assert drawtools_common.resolve_api_key({"api": {"api_key_env": "ALT_API_KEY"}}) == "k-shared-alt"
 

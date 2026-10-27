@@ -104,6 +104,8 @@ QQ_NAPCAT = PlatformDescriptor(
         # supervisor 转发控制台的扫码、切号时拿它登 NapCat WebUI。部署脚本在容器首启后把它回填进 .env。
         SecretField("napcat_webui_token", "NapCat WebUI 令牌", env="NAPCAT_WEBUI_TOKEN"),
     ),
+    # NoneBot 的 OneBot V11 适配器自己从环境读的令牌别名和上报签名密钥；别名还盖过 bot.py 交进去的连接令牌。
+    host_secret_env=("ONEBOT_V11_ACCESS_TOKEN", "ONEBOT_SECRET", "ONEBOT_V11_SECRET"),
     # 排队中的账号操作请求里带着 admin token，文件还会被 root 侧 runner 执行。
     secret_files=("data/napcat-account.*",),
     # 别名双向表、会话哈希到真实群号的路由、真实 sender_id 的附件索引都在 onebot_* 里，

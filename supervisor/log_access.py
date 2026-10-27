@@ -4,67 +4,15 @@
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from real_paths import real_path
+from toolbox.redaction import redact
 
 # 单次最多回多少行、多少字节。cleanup.log 已经 277KB 并且还在长。
 MAX_LINES = 2000
 MAX_BYTES = 512 * 1024
-
-_KEEP_TAIL = 4
-
-# 各家密钥的前缀。命中就整段打码，只留尾巴几位供人对号。
-_TOKEN_PATTERNS = (
-    re.compile(r"\b(sk-[A-Za-z0-9_\-]{8,})"),
-    re.compile(r"\b(AIza[A-Za-z0-9_\-]{10,})"),
-    re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{10,})"),
-    re.compile(r"\b(xox[baprs]-[A-Za-z0-9\-]{10,})"),
-)
-
-# 认得出是密钥的键名。日志按「键名=值」打码，诊断导出按配置里的键名收值、藏字段，用的是这同一张表。
-SENSITIVE_KEY_NAMES = r"api.?key|token|secret|password|passwd|authorization|bearer"
-SENSITIVE_KEY = re.compile(SENSITIVE_KEY_NAMES, re.IGNORECASE)
-
-# 短于这个长度的值不当密钥：诊断导出拿收到的值按子串替换，太短的会把不相干的字也抹掉。
-MIN_SECRET_CHARS = 6
-
-# 键值对写法。键名认得出就不管值长什么样 —— 中转站的 key 可以是任意串。
-_ASSIGN_PATTERN = re.compile(
-    rf"((?:{SENSITIVE_KEY_NAMES})\s*[=:]\s*)(['\"]?)([^\s'\",;)]{{{MIN_SECRET_CHARS},}})",
-    re.IGNORECASE,
-)
-
-# URL 里带的密钥，Gemini 那套 ?key= 就是这么传的。
-_QUERY_PATTERN = re.compile(
-    rf"([?&](?:key|api[_-]?key|access[_-]?token)=)([^\s&'\"]{{{MIN_SECRET_CHARS},}})",
-    re.IGNORECASE,
-)
-
-_AUTH_SCHEME_PATTERN = re.compile(r"\b((?:Bearer|Basic)\s+)([^\s'\",;]+)", re.IGNORECASE)
-
-
-def _mask(value: str) -> str:
-    if len(value) <= _KEEP_TAIL:
-        return "*" * len(value)
-    return "*" * 6 + value[-_KEEP_TAIL:]
-
-
-def redact(text: str) -> str:
-    """把看得出是密钥的东西打码。宁可多打，看日志的人不需要那几位。"""
-    text = _AUTH_SCHEME_PATTERN.sub(lambda match: match.group(1) + _mask(match.group(2)), text)
-    for pattern in _TOKEN_PATTERNS:
-        text = pattern.sub(lambda m: _mask(m.group(1)), text)
-    text = _ASSIGN_PATTERN.sub(lambda m: m.group(1) + m.group(2) + _mask(m.group(3)), text)
-    text = _QUERY_PATTERN.sub(lambda m: m.group(1) + _mask(m.group(2)), text)
-    return text
-
-
-def assigned_values(text: str) -> list[str]:
-    """按「敏感键名=值」认出来的值，按出现顺序。redact 按键名打码的就是这些。"""
-    return [match.group(3) for match in _ASSIGN_PATTERN.finditer(text)]
 
 
 @dataclass(frozen=True)

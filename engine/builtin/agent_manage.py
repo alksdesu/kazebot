@@ -8,17 +8,28 @@ from __future__ import annotations
 目的：一条工具调用完成子节点创建、记忆目录初始化、委派关系注册。
 """
 
+import logging
 import re
-from typing import Any
+from typing import Any, NamedTuple
 
 import yaml
 
 import config_layout
 from clonoth_runtime import SwitchValueError, switch_arg
+from clonoth_sdk.refusals import error_detail
 from engine.memory_namespace import InvalidMemoryNamespace, memory_book_error, memory_dir
-from engine.node import node_file, template_node_file, template_node_name
+from engine.node import (
+    missing_node_reason,
+    node_file,
+    read_node_definition,
+    template_node_file,
+    template_node_name,
+)
 from toolbox._common import request_guard
 from toolbox.context import ToolContext
+from toolbox.redaction import mask_sensitive
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 #  PLUGIN_META — loader auto-discovery 需要的元数据声明
@@ -51,6 +62,9 @@ class AgentManageHandler:
 # 但节点 ID 允许点号（如 bootstrap.coder），所以单独定义。
 _NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$")
 
+# 审批卡上的预览截这么多字，content_len 照报全长。
+_PREVIEW_CHARS = 200
+
 
 def _ok(result_text: str, **fields: Any) -> dict[str, Any]:
     # [AutoC 2026-05-31] Why: create_agent returns several structured paths and
@@ -75,6 +89,78 @@ def _guard_err(err: Any) -> dict[str, Any]:
     if isinstance(err, dict) and err.get("cancelled"):
         out["cancelled"] = True
     return out
+
+
+def _yaml_preview(definition: dict[str, Any]) -> str:
+    """节点定义送审时的预览：密钥键下的值换成 [已隐藏]，其余照原样。
+
+    模板和调用方节点是模型读不到的文件，审批 details 却会进事件流、控制台和调试工具。
+    """
+    masked = mask_sensitive(definition)
+    return yaml.safe_dump(masked, default_flow_style=False, allow_unicode=True)[:_PREVIEW_CHARS]
+
+
+class _CallerUpdate(NamedTuple):
+    """往调用方 delegate_targets 里加新节点的结果。updated 为真时调用方派得到新节点。"""
+
+    updated: bool = False
+    already_listed: bool = False
+    denied: str = ""
+    error: str = ""
+
+
+async def _add_delegate_target(ctx: ToolContext, caller_node_id: str, name: str) -> _CallerUpdate:
+    """把新节点加进调用方的 delegate_targets。改不成的原因只带位置和问题：节点文件里可能写着 api_key。"""
+    workspace_root = ctx.workspace_root
+    # 读的是调用者实际加载的那份文件：被系统节点顶掉的同名用户文件改了也不生效
+    caller_path = node_file(workspace_root, caller_node_id)
+    if caller_path is None:
+        return _CallerUpdate(error=missing_node_reason(workspace_root, caller_node_id))
+    where = config_layout.logical_path(workspace_root, caller_path)
+    caller_target = config_layout.node_edit_target(workspace_root, caller_path)
+    caller_rel = config_layout.logical_path(workspace_root, caller_target)
+    # 先取指纹再读：送审要等人，等的时候文件被改过就不写，免得盖掉那次改动。
+    base_hash = config_layout.file_hash(caller_target)
+    caller_data, problem = read_node_definition(caller_path)
+    if caller_data is None:
+        return _CallerUpdate(error=f"调用方节点 {caller_node_id}（{where}）：{problem}")
+    if problem:
+        return _CallerUpdate(error=f"调用方节点 {caller_node_id}（{where}）不是能用的节点定义：{problem}")
+    targets = caller_data.get("delegate_targets")
+    if targets is None:
+        targets = []
+    if not isinstance(targets, list):
+        return _CallerUpdate(error=f"调用方节点 {caller_node_id}（{where}）的 delegate_targets 不是列表，没有改它")
+    if name in targets:
+        return _CallerUpdate(updated=True, already_listed=True)
+    caller_data["delegate_targets"] = [*targets, name]
+    caller_yaml = yaml.safe_dump(caller_data, default_flow_style=False, allow_unicode=True)
+    try:
+        # 改的是别人的委派清单，等于给调用者开一条新的下派路径，
+        # 和写节点定义一样送策略，不能因为「只加一行」就免检。
+        _op, err = await request_guard(
+            ctx,
+            "write_file",
+            {
+                "path": caller_rel,
+                "content_preview": _yaml_preview(caller_data),
+                "content_len": len(caller_yaml),
+                "delegate_target_added": name,
+            },
+        )
+    except Exception as exc:
+        # 新节点已经落盘：异常往外抛，模型会以为整个没建成。
+        log.warning("create_agent: policy check for %s failed", caller_rel, exc_info=True)
+        return _CallerUpdate(error=f"{caller_rel} 送审没走完：{error_detail(exc) or type(exc).__name__}")
+    if err is not None:
+        return _CallerUpdate(denied=str(err.get("error", "denied")) if isinstance(err, dict) else str(err))
+    try:
+        config_layout.write_config_text(caller_target, caller_yaml, base_hash=base_hash)
+    except config_layout.ConfigConflict:
+        return _CallerUpdate(error=f"{caller_rel} 在等审批的时候被改过，没有写，免得盖掉那次改动")
+    except OSError as exc:
+        return _CallerUpdate(error=f"{caller_rel} 写不进去：{config_layout.config_error_text(exc)}")
+    return _CallerUpdate(updated=True)
 
 
 # ---------------------------------------------------------------------------
@@ -143,15 +229,14 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
             f"template not found: {template} (checked engine/system_nodes/, config/nodes/ and defaults/nodes/)"
         )
 
-    # Step 3: 解析模板 yaml
-    try:
-        tmpl_text = tmpl_path.read_text(encoding="utf-8")
-        tmpl_data = config_layout.load_yaml_text(tmpl_text)
-    except Exception as e:
-        # 节点文件里可能写着 api_key：交给模型的原因只带位置和问题。
-        return _err(f"failed to parse template: {config_layout.config_error_text(e)}")
-    if not isinstance(tmpl_data, dict):
-        return _err("template is not a valid YAML dict")
+    # Step 3: 解析模板 yaml。节点文件里可能写着 api_key：交给模型的原因只带位置和问题。
+    tmpl_where = config_layout.logical_path(workspace_root, tmpl_path)
+    tmpl_data, tmpl_problem = read_node_definition(tmpl_path)
+    if tmpl_data is None:
+        return _err(f"failed to read template {tmpl_where}: {tmpl_problem}")
+    if tmpl_problem:
+        # kind、type 写错的模板抄出来的节点一样加载不了。
+        return _err(f"template {tmpl_where} is not a usable node definition: {tmpl_problem}")
 
     # Step 4: 替换核心字段
     tmpl_data["id"] = name
@@ -175,9 +260,11 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
         "write_file",
         {
             "path": _rel_target,
-            "content_preview": _node_yaml[:200],
+            "content_preview": _yaml_preview(tmpl_data),
             "content_len": len(_node_yaml),
             "create_agent": True,
+            # 预览里的密钥打过码，审批人靠这一项知道抄的是哪份文件。
+            "template": tmpl_where,
             # 预览只截前 200 字，memory_book 常落在后面；审批人得看见新节点会读写哪个记忆库。
             "memory_book": memory_book,
         },
@@ -189,58 +276,27 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
 
     # Step 6: 更新调用者的 delegate_targets（如果指定了 caller_node_id）
     # 追加新节点到调用者的委派列表，使调用者可以 dispatch 到新节点
-    caller_updated = False
-    caller_denied = ""
-    # 读的是调用者实际加载的那份文件：被系统节点顶掉的同名用户文件改了也不生效
-    caller_path = node_file(workspace_root, caller_node_id) if caller_node_id else None
-    if caller_path is not None:
-        caller_target = config_layout.node_edit_target(workspace_root, caller_path)
-        try:
-            caller_data = yaml.safe_load(caller_path.read_text(encoding="utf-8"))
-            if isinstance(caller_data, dict):
-                targets = caller_data.get("delegate_targets", [])
-                if not isinstance(targets, list):
-                    targets = []
-                if name not in targets:
-                    targets.append(name)
-                    caller_data["delegate_targets"] = targets
-                    # 改的是别人的委派清单，等于给调用者开一条新的下派路径，
-                    # 和上面写节点定义一样送策略，不能因为「只加一行」就免检。
-                    _caller_rel = config_layout.logical_path(workspace_root, caller_target)
-                    _caller_yaml = yaml.safe_dump(
-                        caller_data, default_flow_style=False, allow_unicode=True,
-                    )
-                    _op, err = await request_guard(
-                        ctx,
-                        "write_file",
-                        {
-                            "path": _caller_rel,
-                            "content_preview": _caller_yaml[:200],
-                            "content_len": len(_caller_yaml),
-                            "delegate_target_added": name,
-                        },
-                    )
-                    if err is None:
-                        config_layout.write_config_text(caller_target, _caller_yaml)
-                        caller_updated = True
-                    else:
-                        caller_denied = str(err.get("error", "denied")) if isinstance(err, dict) else str(err)
-        except Exception:
-            pass  # 非致命：节点已创建但调用者更新失败
+    caller = await _add_delegate_target(ctx, caller_node_id, name) if caller_node_id else _CallerUpdate()
 
     # Step 7: 创建记忆 namespace 目录（mkdir -p）
     mem_dir.mkdir(parents=True, exist_ok=True)
 
+    summary = f"Agent created: {name}"
+    if caller.already_listed:
+        summary += f"; {caller_node_id} already lists it in delegate_targets"
+    elif caller_node_id and not caller.updated:
+        summary += f"; delegate_targets of {caller_node_id} not updated: {caller.denied or caller.error}"
     return _ok(
-        f"Agent created: {name}",
+        summary,
         node_id=name,
         config_path=_rel_target,
         memory_book=memory_book,
         memory_dir=f"data/memory/{memory_book}/",
         persistent=persistent,
-        caller_updated=caller_updated,
+        caller_updated=caller.updated,
         # 委派清单没改成要说出来，否则模型以为能 dispatch 到新节点，实际派不过去。
-        caller_denied=caller_denied,
+        caller_denied=caller.denied,
+        caller_error=caller.error,
         template=template,
     )
 
